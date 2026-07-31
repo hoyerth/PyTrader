@@ -338,3 +338,30 @@ class StateManager:
             VALUES (?, ?)
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
         """, [KEY_APP_SETTINGS, json.dumps(settings.to_dict())])
+
+    # =========================================================================
+    # Dialog-Geometrie (nicht-modale Dialoge, z. B. IndicatorSettingsDialog)
+    # -------------------------------------------------------------------------
+    # Speichert Position/Groesse eines nicht-modalen Dialogs in global_settings,
+    # damit er beim erneuten Oeffnen an der letzten Position erscheint.
+    # dialog_key: z. B. "indicator_settings" (gilt generisch fuer alle Indikatoren)
+    # =========================================================================
+    def save_dialog_geometry(self, dialog_key: str, x: int, y: int, width: int, height: int) -> None:
+        con = self._get_connection()
+        key = f"dialog_geometry_{dialog_key}"
+        con.execute("""
+            INSERT INTO global_settings (key, value)
+            VALUES (?, ?)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """, [key, json.dumps({"pos_x": x, "pos_y": y, "width": width, "height": height})])
+
+    def get_dialog_geometry(self, dialog_key: str) -> Optional[Dict[str, Any]]:
+        """Liest die gespeicherte Dialog-Geometrie eines dialog_key aus (oder None)."""
+        con = self._get_connection()
+        key = f"dialog_geometry_{dialog_key}"
+        row = con.execute("SELECT value FROM global_settings WHERE key = ?", [key]).fetchone()
+        if row and row[0]:
+            data = _parse_json_field(row[0])
+            if isinstance(data, dict):
+                return data
+        return None

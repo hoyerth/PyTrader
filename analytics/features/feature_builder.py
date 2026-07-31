@@ -1,10 +1,11 @@
 # analytics/features/feature_builder.py
 """
-Feature Builder – Lädt OHLCV aus market_data.duckdb, berechnet Basis-Features
-(ema_diff, atr_normalized) vektorisiert und schreibt sie per Bulk-Upsert in
-analytics.duckdb.
+Feature Builder – Lädt OHLCV aus market_data.duckdb, berechnet Features
+(ema_diff, atr_normalized, grid_levels) vektorisiert und schreibt sie per
+Bulk-Upsert in analytics.duckdb.
 
-Stabiler Basis-Stand ohne Phase-2.1-Zeitkontext-Erweiterungen.
+Stabiler Basis-Stand + Phase-11-Erweiterung: grid_levels (Y-Achsen-Grid-Levels
+und X-Achsen-Zeitfenster-Flags), gekapselt in analytics/features/definitions/.
 """
 
 from typing import Dict, List, Optional
@@ -14,6 +15,7 @@ from pathlib import Path
 from analytics.features.base_feature import BaseFeature
 from analytics.features.definitions.ema_diff import EMADiffFeature
 from analytics.features.definitions.atr_normalized import ATRNormalizedFeature
+from analytics.features.definitions.grid_levels import GridLevelsFeature
 from state_manager import StateManager
 from db_service import DbPool
 
@@ -27,11 +29,20 @@ class FeatureBuilder:
     """Orchestriert die Feature-Berechnung und persistiert sie im feature_store."""
 
     def __init__(self) -> None:
-        # Rueckbau auf stabilen Basis-Stand (nur EMADiff + ATRNormalized)
+        # Basis-Stand (EMADiff + ATRNormalized) + Phase 11: Grid-Levels
         self.features: Dict[str, BaseFeature] = {
             "ema_diff": EMADiffFeature(),
             "atr_normalized": ATRNormalizedFeature(),
+            "grid_levels": GridLevelsFeature(),
         }
+        # Spaltenname -> Feature-Modul-Name. Erlaubt calculate_features() auch
+        # Spaltennamen aus signal.required_features (z. B. 'grid_dist_pct')
+        # statt nur Modul-Namen zu uebernehmen.
+        self._column_to_feature: Dict[str, str] = {}
+        for fname, feat in self.features.items():
+            for col in feat.column_names:
+                self._column_to_feature[col] = fname
+            self._column_to_feature.setdefault(fname, fname)
         self._state_mgr = StateManager()
         self._settings = self._state_mgr.get_app_settings()
 
@@ -88,7 +99,9 @@ class FeatureBuilder:
         result = df[["bar_time"]].copy()
 
         for name in feature_names:
-            feature = self.features.get(name)
+            # Spaltenname -> Feature-Modul aufloesen (z. B. 'grid_dist_pct' -> 'grid_levels')
+            resolved = self._column_to_feature.get(name, name)
+            feature = self.features.get(resolved)
             if feature is None:
                 print(f"  [FeatureBuilder] Unbekanntes Feature: {name}")
                 continue

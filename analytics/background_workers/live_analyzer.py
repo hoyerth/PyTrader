@@ -120,6 +120,18 @@ class LiveAnalyzer(QThread):
             params["ema_diff"] = {"fast_period": 12, "slow_period": 26}
         if "atr_normalized" in feats:
             params["atr_normalized"] = {"period": 14}
+        # Grid-Spalten (grid_dist_pct / grid_nearest_level / grid_dist_abs /
+        # is_time_window_active) werden vom Modul 'grid_levels' erzeugt.
+        if any(f in feats for f in (
+            "grid_dist_pct", "grid_nearest_level", "grid_dist_abs", "is_time_window_active"
+        )):
+            params["grid_levels"] = {
+                "step_size": 0.5,
+                "steps_around": 4,
+                "custom_levels": [],
+                "time_window_mins": 5,
+                "use_time_filter": True,
+            }
         return params
 
     def run(self) -> None:
@@ -598,6 +610,17 @@ def fill_gaps_for_pair(symbol: str, timeframe: str, lookback_bars: int = 500) ->
         feat_params["ema_diff"] = {"fast_period": 12, "slow_period": 26}
     if "atr_normalized" in required:
         feat_params["atr_normalized"] = {"period": 14}
+    # Grid-Spalten werden vom Modul 'grid_levels' erzeugt
+    if any(f in required for f in (
+        "grid_dist_pct", "grid_nearest_level", "grid_dist_abs", "is_time_window_active"
+    )):
+        feat_params["grid_levels"] = {
+            "step_size": 0.5,
+            "steps_around": 4,
+            "custom_levels": [],
+            "time_window_mins": 5,
+            "use_time_filter": True,
+        }
 
     df_features = builder.calculate_features(
         df_ohlcv,

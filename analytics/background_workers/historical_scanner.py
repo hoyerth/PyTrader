@@ -36,7 +36,21 @@ class HistoricalScanner(QThread):
         self.feature_builder = FeatureBuilder()
 
         if self.grid_scan:
-            # Grid-Proximity Scan (Phase 11)
+            # Grid-Proximity Scan (Phase 11): Grid-Levels + ATR als Feature-
+            # Basis fuer grid_proximity_v1. Die Grid-Spalten werden zusaetzlich
+            # in den feature_store geschrieben (siehe run()).
+            self._feature_names: List[str] = ["atr_normalized", "grid_levels"]
+            self._feature_params: Dict[str, Dict[str, Any]] = {
+                "atr_normalized": {"period": 14},
+                "grid_levels": {
+                    "step_size": 0.5,
+                    "steps_around": 4,
+                    "custom_levels": [],
+                    "time_window_mins": 5,
+                    "use_time_filter": True,
+                },
+            }
+            self._source_id = "grid_proximity_v1"
             self.signals = {
                 "grid_proximity_v1": GridProximitySignal(),
             }
@@ -49,6 +63,12 @@ class HistoricalScanner(QThread):
             }
         else:
             # Standard-Scan (EMA + ATR)
+            self._feature_names = ["ema_diff", "atr_normalized"]
+            self._feature_params = {
+                "ema_diff": {"fast_period": 12, "slow_period": 26},
+                "atr_normalized": {"period": 14},
+            }
+            self._source_id = "ema_atr_set_v1"
             self.signals = {
                 "ema_trend_v1": EMATrendSignal(),
                 "atr_filter_v1": ATRFilterSignal(),
@@ -77,20 +97,9 @@ class HistoricalScanner(QThread):
         DB_ANALYTICS = str(BASE_DIR / "data" / "analytics.duckdb")
         DB_MARKET = str(BASE_DIR / "data" / "market_data.duckdb")
 
-        # Features + Signale je nach Scan-Typ
-        if self.grid_scan:
-            feature_names = ["atr_normalized"]
-            feature_params = {
-                "atr_normalized": {"period": 14},
-            }
-            source_id = "grid_proximity_v1"
-        else:
-            feature_names = ["ema_diff", "atr_normalized"]
-            feature_params = {
-                "ema_diff": {"fast_period": 12, "slow_period": 26},
-                "atr_normalized": {"period": 14},
-            }
-            source_id = "ema_atr_set_v1"
+        feature_names = self._feature_names
+        feature_params = self._feature_params
+        source_id = self._source_id
 
         total_signals = 0
         timeframes = list(get_timeframes().keys())
@@ -139,6 +148,14 @@ class HistoricalScanner(QThread):
                     feature_names=feature_names,
                     params=feature_params,
                 )
+
+                # 3b. Features in den feature_store schreiben (Grid-Scan:
+                # Grid-Levels & Zeitfenster-Flags fuer Signal & Chart-Overlay)
+                if self.grid_scan:
+                    try:
+                        self.feature_builder.store_features(self.symbol, tf, df_features)
+                    except Exception as e:
+                        self.log_message.emit(f"  {tf}: FEHLER beim Feature-Store: {e}")
 
                 # 4. Signal-Set auswerten
                 result = self.evaluator.evaluate_set(self.set_config, df_features)

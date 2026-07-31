@@ -24,20 +24,86 @@ function renderGridLines(lines) {
     });
 }
 
-// NOTE: _storedSignalMarkersData/_storedCircleMarkers sind getrennte Layer.
-// _applyAllMarkers() kombiniert BEIDE Caches und setzt sie via setMarkers –
-// damit kann ein Grid-Render die Signal-Marker nie verdrängen und umgekehrt.
+// NOTE: _storedSignalMarkersData (Signal-Layer) und die Proximity-Circles sind
+// getrennte Layer. Die Circles werden auf der ZUGEHOERIGEN LIQ-LINE geplottet:
+// Je Level-Preis wird eine UNSICHTBARE LineSeries erzeugt (lineVisible:false,
+// autoscaleInfoProvider:null, rechte Preisskala), deren Datenpunkte exakt auf
+// dem Level-Preis liegen. Die Circle-Marker (Standard-Marker der Engine, shape
+// 'circle') haengen an dieser Serie -> die Engine positioniert sie direkt auf
+// der Liq-Line. Das folgt Zoom/Scroll/Resize nativ (kein CSS-Overlay, kein
+// Redraw-Bug) und verdraengt die Signal-Marker nie.
 function clearGridCircles() {
-    _storedCircleMarkers = [];
-    _applyAllMarkers();
+    for (var i = 0; i < _circleSeries.length; i++) {
+        try { chart.removeSeries(_circleSeries[i]); } catch(e) {}
+    }
+    _circleSeries = [];
+    _circleMarkerPlugins = [];
 }
 
 function renderGridCircles(circles) {
-    if (!candleSeries || !circles) return;
+    if (!chart || !circles) return;
     var data = (typeof circles === 'string') ? JSON.parse(circles) : circles;
-    _storedCircleMarkers = data || [];
-    // Circles werden via _applyAllMarkers() mit den Signal-Markern kombiniert
-    _applyAllMarkers();
+    clearGridCircles();
+    if (!data || data.length === 0) return;
+
+    // Nach Level-Preis gruppieren: LWC-Serien brauchen eindeutige Zeiten,
+    // daher je Level eine Serie (im selben Level gibt es max. 1 Treffer/Bar).
+    var byLevel = {};
+    for (var i = 0; i < data.length; i++) {
+        var c = data[i];
+        if (!c || typeof c.time !== 'number' || isNaN(c.time) ||
+            typeof c.price !== 'number' || isNaN(c.price)) continue;
+        var key = String(c.price);
+        if (!byLevel[key]) byLevel[key] = [];
+        byLevel[key].push(c);
+    }
+
+    var keys = Object.keys(byLevel);
+    for (var j = 0; j < keys.length; j++) {
+        var levelCircles = byLevel[keys[j]];
+        // LWC v5: Markers und Serie brauchen NACH ZEIT SORTIERTE Daten.
+        levelCircles.sort(function(a, b) { return a.time - b.time; });
+
+        var series = null;
+        try {
+            series = chart.addSeries(LightweightCharts.LineSeries, {
+                lineVisible: false,
+                pointMarkersVisible: false,
+                lastValueVisible: false,
+                priceLineVisible: false,
+                crosshairMarkerVisible: false,
+                color: 'rgba(0,0,0,0)',
+                priceScaleId: 'right',
+                autoscaleInfoProvider: function() { return null; }
+            });
+        } catch(e) { continue; }
+
+        var sd = [];
+        var markers = [];
+        for (var k = 0; k < levelCircles.length; k++) {
+            var cc = levelCircles[k];
+            // Datenpunkt exakt auf dem Level-Preis -> Marker der Engine
+            // erscheint auf der zugehoerigen Liq-Line.
+            sd.push({ time: cc.time, value: cc.price });
+            markers.push({
+                time: cc.time,
+                position: 'inBar',
+                color: cc.color || '#E91E63',
+                shape: 'circle',
+                size: 1,
+                priority: 10
+            });
+        }
+        try { series.setData(sd); } catch(e) { continue; }
+
+        try {
+            var plugin = LightweightCharts.createSeriesMarkers(series, []);
+            plugin.setMarkers(markers);
+        } catch(e) { continue; }
+
+        _circleSeries.push(series);
+        _circleMarkerPlugins.push(plugin);
+    }
 }
 
 function applyRange(rangeFrom, rangeTo, priceFrom, priceTo) {
@@ -61,9 +127,9 @@ function applyRange(rangeFrom, rangeTo, priceFrom, priceTo) {
     }
 }
 
-// Signal-Marker + Circles: combined auf candleSeries.setMarkers()
-// _storedSignalMarkersData/_storedCircleMarkers sind IMMER Arrays (nie null),
-// damit _applyAllMarkers() beide Layer zuverlässig kombinieren kann.
+// Signal-Marker: eigenes Marker-Layer auf candleSeries. Die Proximity-Circles
+// liegen separat (unsichtbare LineSeries je Level auf der Liq-Line) und werden
+// NICHT mit den Signal-Markern gemischt.
 var _storedSignalMarkersData = [];
 
 function clearSignalMarkers() {
@@ -106,20 +172,9 @@ function _applyAllMarkers() {
             }
         }
 
-        // 2. Circle-Marker (aus dem Grid-Cache)
-        if (_storedCircleMarkers && _storedCircleMarkers.length > 0) {
-            for (var j = 0; j < _storedCircleMarkers.length; j++) {
-                var c = _storedCircleMarkers[j];
-                allMarkers.push({
-                    time: c.time,
-                    position: 'inBar',
-                    color: c.color || '#FFEB3B',
-                    shape: 'circle',
-                    size: 1,
-                    priority: (c.priority !== undefined && c.priority !== null) ? c.priority : 10
-                });
-            }
-        }
+        // 2. Proximity-Circles werden NICHT hier gerendert – sie liegen als
+        // unsichtbare LineSeries je Level-Preis direkt auf den Liq-Lines
+        // (siehe renderGridCircles) und sind eigenstaendige Engine-Serien.
 
         // LWC v5: candleSeries.setMarkers() wurde entfernt → SeriesMarkers-Plugin nutzen.
         // Das Plugin wird pro Chart-Instanz einmalig erzeugt (Reset in applyFullChartUpdate).
@@ -127,12 +182,12 @@ function _applyAllMarkers() {
         //  - Die interne Suche nach dem sichtbaren Bereich ist eine Binärsuche (unsortiert = falsche Grenzen).
         //  - Mehrere Marker DERSELBEN Kerze werden nur vertikal gestapelt, wenn sie im Array
         //    BENACHBART sind (Stack-Offset resettet bei jedem Zeitsprung). Unsortiert überdecken
-        //    sich Marker derselben Kerze exakt – Grid-Circles verdeckten so die EMA-Signale.
+        //    sich Marker derselben Kerze exakt.
         // Sortierung (stabil seit ES2019):
         //   1. Kriterium: Zeit (Pflicht für die Engine).
         //   2. Kriterium: priority (Stapel-Reihenfolge bei gleicher Kerze).
         //      Niedrige priority = näher an der Kerze, hohe = weiter oben.
-        //      Gleiche priority => Einfüge-Reihenfolge bleibt erhalten (Signale vor Circles).
+        //      Gleiche priority => Einfüge-Reihenfolge bleibt erhalten.
         allMarkers.sort(function(a, b) {
             if (a.time !== b.time) return a.time - b.time;
             var pa = (typeof a.priority === 'number') ? a.priority : 0;

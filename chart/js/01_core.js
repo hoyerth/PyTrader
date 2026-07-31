@@ -10,7 +10,11 @@ window.onerror = function(m, s, l, c, e) {
 let chart = null, candleSeries = null, pyBridge = null, isUpdatingChart = false;
 let currentTfInSeconds = 3600, lastClosePrice = null, activeTimer = null, countdownTimer = null;
 let rawCandleData = [], currentSymbol = null, currentTimeframe = null;
-let gridPriceLines = [], dayLinesSeries = [], _storedCircleMarkers = [];
+let gridPriceLines = [], dayLinesSeries = [];
+// Proximity-Circles: je Level-Preis eine unsichtbare LineSeries (Datenpunkte
+// exakt auf dem Level) + SeriesMarkers-Plugin -> Circles liegen auf den
+// Liq-Lines statt auf der Bar (native Engine-Positionierung, kein CSS-Overlay).
+let _circleSeries = [], _circleMarkerPlugins = [];
 let currentPriceLine = null, resizeTimeout = null;
 let currentPrecision = 2;
 let pendingRange = null;

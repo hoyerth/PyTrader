@@ -5,6 +5,7 @@ chart/indicator_dialog.py - Dynamic Universal Settings Dialog with Inline Layout
 from typing import Any, Dict, Callable, List
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+	QApplication,
 	QCheckBox,
 	QComboBox,
 	QDialog,
@@ -26,6 +27,10 @@ from state_manager import StateManager
 
 
 class IndicatorSettingsDialog(QDialog):
+
+	# Gemeinsamer Geometrie-Key fuer ALLE Indikator-Einstellungsdialoge
+	# (gilt damit automatisch fuer alle Indikatoren, aktuelle & zukuenftige).
+	DIALOG_GEOMETRY_KEY = "indicator_settings"
 
 	def __init__(
 		self,
@@ -50,6 +55,9 @@ class IndicatorSettingsDialog(QDialog):
 
 		self.param_controls: Dict[str, QWidget] = {}
 		self.init_ui()
+
+		# Nicht-modaler Dialog: letzte Position/Groesse wiederherstellen
+		self._restore_geometry()
 
 	def create_control_widget(self, key: str, val: Any) -> QWidget:
 		if key in self.indicator.param_options:
@@ -148,6 +156,53 @@ class IndicatorSettingsDialog(QDialog):
 		btn_close = QPushButton("Schließen")
 		btn_close.clicked.connect(self.accept)
 		main_layout.addWidget(btn_close)
+
+	def _restore_geometry(self) -> None:
+		"""Stellt die letzte Position/Groesse des nicht-modalen Dialogs wieder her."""
+		try:
+			geom = self.state_manager.get_dialog_geometry(self.DIALOG_GEOMETRY_KEY)
+			if not geom:
+				return
+
+			pos_x = geom.get("pos_x")
+			pos_y = geom.get("pos_y")
+			width = geom.get("width")
+			height = geom.get("height")
+
+			# Position validieren (Bildschirm-Bounds; sonst zuruecksetzen)
+			if pos_x is not None and pos_y is not None:
+				screen = QApplication.primaryScreen().availableGeometry()
+				if pos_x < screen.x() - 100 or pos_x > screen.right() or \
+				   pos_y < screen.y() - 100 or pos_y > screen.bottom():
+					pos_x = pos_y = None
+				else:
+					self.move(pos_x, pos_y)
+
+			# Groesse nur uebernehmen, wenn plausibel (min. Breite des Dialogs)
+			if width is not None and height is not None:
+				try:
+					self.resize(max(440, int(width)), max(100, int(height)))
+				except (ValueError, TypeError):
+					pass
+		except Exception as e:
+			print(f"⚠️ [IndicatorDialog] Geometrie-Restore fehlgeschlagen: {e}")
+
+	def _save_geometry(self) -> None:
+		"""Speichert die aktuelle Position/Groesse des Dialogs."""
+		try:
+			p = self.pos()
+			s = self.size()
+			self.state_manager.save_dialog_geometry(
+				self.DIALOG_GEOMETRY_KEY, p.x(), p.y(), s.width(), s.height()
+			)
+		except Exception as e:
+			print(f"⚠️ [IndicatorDialog] Geometrie-Save fehlgeschlagen: {e}")
+
+	def done(self, r: int) -> None:
+		"""Wird bei jedem Schliessen aufgerufen (accept/reject/Esc/X) ->
+		Geometrie vor dem Schliessen speichern."""
+		self._save_geometry()
+		super().done(r)
 
 	def refresh_preset_list(self) -> None:
 		self.combo_presets.blockSignals(True)

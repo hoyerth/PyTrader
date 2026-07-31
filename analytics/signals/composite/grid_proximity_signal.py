@@ -71,13 +71,14 @@ class GridProximitySignal(SignalDefinition):
 
     @property
     def required_features(self) -> List[str]:
+        # Nur Pflicht-Spalten. regime_volatility / regime_trend_score sind
+        # optional: evaluate() behandelt fehlende Regime-Spalten bereits mit
+        # Defaults (1.0 / 0.0), daher muessen sie nicht als Pflicht gelten.
         return [
             "grid_dist_pct",
             "grid_nearest_level",
             "is_time_window_active",
             "atr_normalized",
-            "regime_volatility",
-            "regime_trend_score",
         ]
 
     def evaluate(

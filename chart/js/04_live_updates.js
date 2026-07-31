@@ -220,7 +220,8 @@ function applyFullChartUpdate(data) {
         candleSeries = null;
         dayLinesSeries = [];
         gridPriceLines = [];
-        _storedCircleMarkers = [];
+        _circleSeries = [];
+        _circleMarkerPlugins = [];
         seriesMarkersPlugin = null;
         try { DaySeparator.clear(); } catch(e) {}
 
@@ -340,14 +341,14 @@ function applyFullChartUpdate(data) {
             console.warn('[applyFullChartUpdate] Schritt 5 (gridLines) fehlgeschlagen:', e.message || e);
         }
 
-        // Schritt 6: Grid-Circles (speichert nur, Marker setzen via setMarkers)
+        // Schritt 6: Grid-Circles – unsichtbare LineSeries je Level-Preis;
+        // Circle-Marker der Engine liegen damit direkt auf den Liq-Lines.
         try { if (data.gridCircles) renderGridCircles(data.gridCircles); } catch(e) {
             console.warn('[applyFullChartUpdate] Schritt 6 (gridCircles) fehlgeschlagen:', e.message || e);
         }
 
-        // Schritt 7: Signal-Marker + Circles (combined via candleSeries.setMarkers)
-        // _storedSignalMarkersData/_storedCircleMarkers sind getrennte Layer;
-        // _applyAllMarkers() kombiniert beide automatisch aus den Caches.
+        // Schritt 7: Signal-Marker (eigenes Marker-Layer auf candleSeries;
+        // Proximity-Circles liegen separat auf ihren Level-Serien).
         try {
             _storedSignalMarkersData = data.signalMarkers || [];
             _applyAllMarkers();

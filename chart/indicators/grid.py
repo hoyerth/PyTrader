@@ -177,12 +177,18 @@ class GridIndicator(BaseIndicator):
             # Native UTC-Minute ohne künstlichen Offset
             row_m = datetime.fromtimestamp(time_val, tz=dt_timezone.utc).minute
             row_in_time = (
-                (f_in_window_around(row_m, 0, time_window_mins) or f_in_window_around(row_m, 30, time_window_mins))
-                if use_time_filter
-                else True
+                f_in_window_around(row_m, 0, time_window_mins) or f_in_window_around(row_m, 30, time_window_mins)
             )
 
-            circle_color = "#FFEB3B" if row_in_time else "#E91E63" if use_time_filter else "#E91E63"
+            # Farblogik:
+            # - Zeitfilter INAKTIV (Checkbox aus): ALLE Proximity-Punkte im
+            #   Bereich einer Liq-Line werden gelb (#FFEB3B) geplottet.
+            # - Zeitfilter AKTIV (Checkbox an): Punkte im Zeitfenster werden
+            #   gelb (#FFEB3B), Punkte ausserhalb des Fensters fuchsia (#E91E63).
+            if use_time_filter and not row_in_time:
+                circle_color = "#E91E63"  # ausserhalb des Fensters -> fuchsia
+            else:
+                circle_color = "#FFEB3B"  # gelb (alle / im Fenster)
 
             for lvl in tracked_levels:
                 visit_min = lvl * (1.0 - visit_pct / 100.0)
