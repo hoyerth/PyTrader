@@ -1,0 +1,340 @@
+# state_manager.py
+
+"""
+state_manager.py - Persistence Manager with Symbol/TF Reset Support, Robust Schema Migration & Type Validation
+"""
+
+import json
+import os
+from typing import Any, Dict, List, Optional
+import duckdb
+import pandas as pd
+
+from db_service import _parse_json_field, DbPool
+from config.base_state_model import AbstractStateModel
+from config.app_settings import AppSettings
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_DB_PATH = os.path.join(BASE_DIR, "data", "app_data.duckdb")
+
+KEY_APP_SETTINGS = "app_settings"
+
+
+class StateManager:
+
+    def __init__(self, db_path: str = APP_DB_PATH) -> None:
+        self.db_path = db_path
+        self._init_db()
+
+    def _get_connection(self) -> duckdb.DuckDBPyConnection:
+        return DbPool.get(self.db_path)
+
+    def _init_db(self) -> None:
+        """Initialisiert die Tabellenstrukturen und f\u00fchrt eine saubere Schema-Migration durch."""
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        con = self._get_connection()
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS window_instances (
+                instance_id VARCHAR PRIMARY KEY,
+                preset_id VARCHAR,
+                window_title VARCHAR,
+                pos_x INTEGER,
+                pos_y INTEGER,
+                width INTEGER,
+                height INTEGER,
+                is_maximized BOOLEAN DEFAULT FALSE
+            );
+
+            CREATE TABLE IF NOT EXISTS instance_states (
+                instance_id VARCHAR PRIMARY KEY,
+                symbol VARCHAR NOT NULL,
+                timeframe VARCHAR NOT NULL,
+                visible_range_from BIGINT,
+                visible_range_to BIGINT,
+                visible_price_from DOUBLE,
+                visible_price_to DOUBLE,
+                indicators_state JSON,
+                measurement_state JSON,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS symbol_tf_states (
+                symbol VARCHAR NOT NULL,
+                timeframe VARCHAR NOT NULL,
+                visible_range_from BIGINT,
+                visible_range_to BIGINT,
+                visible_price_from DOUBLE,
+                visible_price_to DOUBLE,
+                indicators_state JSON,
+                measurement_state JSON,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (symbol, timeframe)
+            );
+
+            CREATE TABLE IF NOT EXISTS indicator_presets (
+                indicator_id VARCHAR NOT NULL,
+                preset_name VARCHAR NOT NULL,
+                params JSON NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (indicator_id, preset_name)
+            );
+
+            CREATE TABLE IF NOT EXISTS global_settings (
+                key VARCHAR PRIMARY KEY,
+                value JSON NOT NULL
+            );
+        """)
+
+        # Explicit Column Check via information_schema
+        tables_to_migrate = ["instance_states", "symbol_tf_states"]
+        columns_to_check = ["indicators_state", "measurement_state"]
+
+        for table in tables_to_migrate:
+            existing_cols = con.execute(f"""
+                SELECT LOWER(column_name)
+                FROM information_schema.columns
+                WHERE LOWER(table_name) = '{table.lower()}'
+            """).fetchall()
+            existing_col_names = [col[0] for col in existing_cols]
+
+            for col_name in columns_to_check:
+                if col_name.lower() not in existing_col_names:
+                    try:
+                        con.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} JSON")
+                        print(f"[MIGRATION] Spalte '{col_name}' (JSON) zur Tabelle '{table}' hinzugefuegt.")
+                    except Exception as e:
+                        print(f"[MIGRATION WARNUNG] Spalte '{col_name}' konnte nicht hinzugefuegt werden: {e}")
+
+    def get_next_instance_id(self) -> str:
+        con = self._get_connection()
+        res = con.execute("SELECT instance_id FROM window_instances").fetchall()
+        existing_ids = [r[0] for r in res]
+        count = 1
+        while f"win_{count}" in existing_ids:
+            count += 1
+        return f"win_{count}"
+
+    def delete_instance(self, instance_id: str) -> None:
+        con = self._get_connection()
+        con.execute("DELETE FROM instance_states WHERE instance_id = ?", [instance_id])
+        con.execute("DELETE FROM window_instances WHERE instance_id = ?", [instance_id])
+
+    def delete_symbol_tf_state(self, symbol: str, timeframe: str) -> None:
+        con = self._get_connection()
+        con.execute(
+            "DELETE FROM symbol_tf_states WHERE symbol = CAST(? AS VARCHAR) AND timeframe = CAST(? AS VARCHAR)",
+            [symbol, timeframe]
+        )
+
+    def save_instance_state(
+        self,
+        instance_id: str,
+        symbol: str,
+        timeframe: str,
+        visible_range_from: Optional[int] = None,
+        visible_range_to: Optional[int] = None,
+        visible_price_from: Optional[float] = None,
+        visible_price_to: Optional[float] = None,
+        indicators_state: Optional[Dict[str, Any]] = None,
+        measurement_state: Optional[Dict[str, Any]] = None
+    ) -> None:
+        con = self._get_connection()
+        ind_json = json.dumps(indicators_state) if indicators_state is not None else None
+        meas_json = json.dumps(measurement_state) if measurement_state is not None else None
+        con.execute("""
+            INSERT INTO instance_states (
+                instance_id, symbol, timeframe, visible_range_from, visible_range_to,
+                visible_price_from, visible_price_to, indicators_state, measurement_state, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT (instance_id) DO UPDATE SET
+                symbol = EXCLUDED.symbol,
+                timeframe = EXCLUDED.timeframe,
+                visible_range_from = EXCLUDED.visible_range_from,
+                visible_range_to = EXCLUDED.visible_range_to,
+                visible_price_from = EXCLUDED.visible_price_from,
+                visible_price_to = EXCLUDED.visible_price_to,
+                indicators_state = EXCLUDED.indicators_state,
+                measurement_state = EXCLUDED.measurement_state,
+                updated_at = EXCLUDED.updated_at;
+        """, [
+            instance_id, symbol, timeframe, visible_range_from, visible_range_to,
+            visible_price_from, visible_price_to, ind_json, meas_json
+        ])
+
+    def save_symbol_tf_state(
+        self,
+        symbol: str,
+        timeframe: str,
+        visible_range_from: Optional[int] = None,
+        visible_range_to: Optional[int] = None,
+        visible_price_from: Optional[float] = None,
+        visible_price_to: Optional[float] = None,
+        indicators_state: Optional[Dict[str, Any]] = None,
+        measurement_state: Optional[Dict[str, Any]] = None
+    ) -> None:
+        con = self._get_connection()
+        ind_json = json.dumps(indicators_state) if indicators_state is not None else None
+        meas_json = json.dumps(measurement_state) if measurement_state is not None else None
+        con.execute("""
+            INSERT INTO symbol_tf_states (
+                symbol, timeframe, visible_range_from, visible_range_to,
+                visible_price_from, visible_price_to, indicators_state, measurement_state, updated_at
+            ) VALUES (CAST(? AS VARCHAR), CAST(? AS VARCHAR), ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT (symbol, timeframe) DO UPDATE SET
+                visible_range_from = EXCLUDED.visible_range_from,
+                visible_range_to = EXCLUDED.visible_range_to,
+                visible_price_from = EXCLUDED.visible_price_from,
+                visible_price_to = EXCLUDED.visible_price_to,
+                indicators_state = EXCLUDED.indicators_state,
+                measurement_state = EXCLUDED.measurement_state,
+                updated_at = EXCLUDED.updated_at;
+        """, [
+            symbol, timeframe, visible_range_from, visible_range_to,
+            visible_price_from, visible_price_to, ind_json, meas_json
+        ])
+
+    def get_symbol_tf_state(self, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
+        con = self._get_connection()
+        res = con.execute("""
+            SELECT visible_range_from, visible_range_to, visible_price_from, visible_price_to, indicators_state, measurement_state
+            FROM symbol_tf_states
+            WHERE symbol = CAST(? AS VARCHAR) AND timeframe = CAST(? AS VARCHAR)
+        """, [symbol, timeframe]).fetchone()
+
+        if res:
+            v_from, v_to, p_from, p_to, ind_json, meas_json = res
+            ind_state = _parse_json_field(ind_json)
+            meas_state = _parse_json_field(meas_json)
+            return {
+                "visible_range_from": v_from,
+                "visible_range_to": v_to,
+                "visible_price_from": p_from,
+                "visible_price_to": p_to,
+                "indicators_state": ind_state,
+                "measurement_state": meas_state
+            }
+        return None
+
+    def save_window_geometry(
+        self,
+        instance_id: str,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        is_maximized: bool,
+        preset_id: Optional[str] = None
+    ) -> None:
+        con = self._get_connection()
+        con.execute("""
+            INSERT INTO window_instances (
+                instance_id, preset_id, window_title, pos_x, pos_y, width, height, is_maximized
+            ) VALUES (?, ?, 'PyTrader Window', ?, ?, ?, ?, ?)
+            ON CONFLICT (instance_id) DO UPDATE SET
+                pos_x = EXCLUDED.pos_x,
+                pos_y = EXCLUDED.pos_y,
+                width = EXCLUDED.width,
+                height = EXCLUDED.height,
+                is_maximized = EXCLUDED.is_maximized,
+                preset_id = EXCLUDED.preset_id;
+        """, [instance_id, preset_id, x, y, width, height, is_maximized])
+
+    def get_window_geometry(self, instance_id: str) -> Optional[Dict[str, Any]]:
+        """Liest die gespeicherte Fenstergeometrie einer spezifischen Instanz aus."""
+        con = self._get_connection()
+        res = con.execute("""
+            SELECT pos_x, pos_y, width, height, is_maximized
+            FROM window_instances
+            WHERE instance_id = ?
+        """, [instance_id]).fetchone()
+        if res and res[0] is not None:
+            return {
+                "pos_x": res[0],
+                "pos_y": res[1],
+                "width": res[2],
+                "height": res[3],
+                "is_maximized": bool(res[4])
+            }
+        return None
+
+    def load_all_instances(self) -> List[Dict[str, Any]]:
+        con = self._get_connection()
+        query = """
+            SELECT
+                w.instance_id, w.preset_id, w.pos_x, w.pos_y, w.width, w.height, w.is_maximized,
+                CAST(s.symbol AS VARCHAR) AS symbol,
+                CAST(s.timeframe AS VARCHAR) AS timeframe,
+                s.visible_range_from, s.visible_range_to,
+                s.visible_price_from, s.visible_price_to, s.indicators_state, s.measurement_state,
+                s.updated_at
+            FROM window_instances w
+            LEFT JOIN instance_states s ON w.instance_id = s.instance_id
+            ORDER BY s.updated_at ASC;
+        """
+        df = con.execute(query).df()
+        records = df.to_dict(orient="records")
+        for rec in records:
+            if "symbol" in rec and rec["symbol"] is not None and not isinstance(rec["symbol"], str):
+                rec["symbol"] = str(rec["symbol"]) if not pd.isna(rec["symbol"]) else None
+            if "timeframe" in rec and rec["timeframe"] is not None and not isinstance(rec["timeframe"], str):
+                rec["timeframe"] = str(rec["timeframe"]) if not pd.isna(rec["timeframe"]) else None
+        return records
+
+    def get_indicator_preset(self, indicator_id: str, preset_name: str) -> Optional[Dict[str, Any]]:
+        con = self._get_connection()
+        res = con.execute(
+            "SELECT params FROM indicator_presets WHERE indicator_id = ? AND preset_name = ?",
+            [indicator_id, preset_name]
+        ).fetchone()
+        if res and res[0]:
+            return _parse_json_field(res[0])
+        return None
+
+    def save_indicator_preset(self, indicator_id: str, preset_name: str, params: Dict[str, Any]) -> None:
+        con = self._get_connection()
+        con.execute("""
+            INSERT INTO indicator_presets (indicator_id, preset_name, params)
+            VALUES (?, ?, ?)
+            ON CONFLICT (indicator_id, preset_name) DO UPDATE SET
+                params = EXCLUDED.params;
+        """, [indicator_id, preset_name, json.dumps(params)])
+
+    def delete_indicator_preset(self, indicator_id: str, preset_name: str) -> None:
+        con = self._get_connection()
+        con.execute(
+            "DELETE FROM indicator_presets WHERE indicator_id = ? AND preset_name = ?",
+            [indicator_id, preset_name]
+        )
+
+    def list_indicator_presets(self, indicator_id: str) -> List[str]:
+        con = self._get_connection()
+        res = con.execute(
+            "SELECT preset_name FROM indicator_presets WHERE indicator_id = ? ORDER BY preset_name ASC",
+            [indicator_id]
+        ).fetchall()
+        presets = [r[0] for r in res]
+        if "Default" not in presets:
+            presets.insert(0, "Default")
+        return presets
+
+    def get_app_settings(self) -> AppSettings:
+        """L\u00e4dt AppSettings aus der DB oder gibt Defaults zur\u00fcck."""
+        con = self._get_connection()
+        row = con.execute(
+            "SELECT value FROM global_settings WHERE key = ?",
+            [KEY_APP_SETTINGS]
+        ).fetchone()
+        if row and row[0]:
+            raw = row[0]
+            data = _parse_json_field(raw)
+            return AppSettings.from_dict(data)
+        return AppSettings()
+
+    def save_app_settings(self, settings: AppSettings) -> None:
+        """Speichert AppSettings in der DB."""
+        con = self._get_connection()
+        con.execute("""
+            INSERT INTO global_settings (key, value)
+            VALUES (?, ?)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """, [KEY_APP_SETTINGS, json.dumps(settings.to_dict())])

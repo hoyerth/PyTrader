@@ -1,0 +1,453 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>StatisticsWindow</class>
+ <widget class="QMainWindow" name="StatisticsWindow">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>900</width>
+    <height>600</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>PyTrader - Signal-Statistik</string>
+  </property>
+  <widget class="QWidget" name="centralwidget">
+   <layout class="QVBoxLayout" name="verticalLayout_main">
+    <property name="spacing">
+     <number>8</number>
+    </property>
+    <property name="leftMargin">
+     <number>10</number>
+    </property>
+    <property name="topMargin">
+     <number>10</number>
+    </property>
+    <property name="rightMargin">
+     <number>10</number>
+    </property>
+    <property name="bottomMargin">
+     <number>10</number>
+    </property>
+    <item>
+     <layout class="QHBoxLayout" name="horizontalLayout_filter">
+      <property name="spacing">
+       <number>6</number>
+      </property>
+      <item>
+       <widget class="QLabel" name="label_symbol">
+        <property name="text">
+         <string>Symbol:</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QComboBox" name="combo_symbol_filter">
+        <property name="minimumSize">
+         <size>
+          <width>100</width>
+          <height>0</height>
+         </size>
+        </property>
+        <item>
+         <property name="text">
+          <string>ALLE</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>SILVER</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>GOLD</string>
+         </property>
+        </item>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLabel" name="label_timeframe">
+        <property name="text">
+         <string>Timeframe:</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QComboBox" name="combo_tf_filter">
+        <property name="minimumSize">
+         <size>
+          <width>80</width>
+          <height>0</height>
+         </size>
+        </property>
+        <item>
+         <property name="text">
+          <string>ALLE</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>M1</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>M5</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>M15</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>M30</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>H1</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>H4</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>D1</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>W1</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>MN1</string>
+         </property>
+        </item>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLabel" name="label_signal_set">
+        <property name="text">
+         <string>Signal-Set:</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QComboBox" name="combo_signal_filter">
+        <property name="minimumSize">
+         <size>
+          <width>140</width>
+          <height>0</height>
+         </size>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <spacer name="horizontalSpacer_filter">
+        <property name="orientation">
+         <enum>Qt::Orientation::Horizontal</enum>
+        </property>
+        <property name="sizeHint" stdset="0">
+         <size>
+          <width>40</width>
+          <height>20</height>
+         </size>
+        </property>
+       </spacer>
+      </item>
+      <item>
+       <widget class="QPushButton" name="btn_refresh_stats">
+        <property name="minimumSize">
+         <size>
+          <width>120</width>
+          <height>28</height>
+         </size>
+        </property>
+        <property name="text">
+         <string>⟳ Aktualisieren</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </item>
+    <item>
+     <layout class="QHBoxLayout" name="horizontalLayout_cards">
+      <property name="spacing">
+       <number>10</number>
+      </property>
+      <item>
+       <widget class="QFrame" name="card_total_signals">
+        <property name="styleSheet">
+         <string>QFrame { background-color: #1e222d; border: 1px solid #3d4450; border-radius: 6px; padding: 8px; }</string>
+        </property>
+        <property name="frameShape">
+         <enum>QFrame::Shape::StyledPanel</enum>
+        </property>
+        <layout class="QVBoxLayout" name="verticalLayout_card1">
+         <item>
+          <widget class="QLabel" name="label_total_signals_title">
+           <property name="styleSheet">
+            <string>color: #787b86; font-size: 11px;</string>
+           </property>
+           <property name="text">
+            <string>Signale Gesamt</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="label_total_signals">
+           <property name="styleSheet">
+            <string>color: #d1d4dc; font-size: 24px; font-weight: bold;</string>
+           </property>
+           <property name="text">
+            <string>0</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </widget>
+      </item>
+      <item>
+       <widget class="QFrame" name="card_avg_confidence">
+        <property name="styleSheet">
+         <string>QFrame { background-color: #1e222d; border: 1px solid #3d4450; border-radius: 6px; padding: 8px; }</string>
+        </property>
+        <property name="frameShape">
+         <enum>QFrame::Shape::StyledPanel</enum>
+        </property>
+        <layout class="QVBoxLayout" name="verticalLayout_card2">
+         <item>
+          <widget class="QLabel" name="label_avg_confidence_title">
+           <property name="styleSheet">
+            <string>color: #787b86; font-size: 11px;</string>
+           </property>
+           <property name="text">
+            <string>Ø Confidence</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="label_avg_confidence">
+           <property name="styleSheet">
+            <string>color: #d1d4dc; font-size: 24px; font-weight: bold;</string>
+           </property>
+           <property name="text">
+            <string>0.00</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </widget>
+      </item>
+      <item>
+       <widget class="QFrame" name="card_win_rate">
+        <property name="styleSheet">
+         <string>QFrame { background-color: #1e222d; border: 1px solid #3d4450; border-radius: 6px; padding: 8px; }</string>
+        </property>
+        <property name="frameShape">
+         <enum>QFrame::Shape::StyledPanel</enum>
+        </property>
+        <layout class="QVBoxLayout" name="verticalLayout_card3">
+         <item>
+          <widget class="QLabel" name="label_win_rate_title">
+           <property name="styleSheet">
+            <string>color: #787b86; font-size: 11px;</string>
+           </property>
+           <property name="text">
+            <string>Win-Rate (Forward)</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="label_win_rate">
+           <property name="styleSheet">
+            <string>color: #d1d4dc; font-size: 24px; font-weight: bold;</string>
+           </property>
+           <property name="text">
+            <string>0.0%</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </widget>
+      </item>
+      <item>
+       <widget class="QFrame" name="card_best_tf">
+        <property name="styleSheet">
+         <string>QFrame { background-color: #1e222d; border: 1px solid #3d4450; border-radius: 6px; padding: 8px; }</string>
+        </property>
+        <property name="frameShape">
+         <enum>QFrame::Shape::StyledPanel</enum>
+        </property>
+        <layout class="QVBoxLayout" name="verticalLayout_card4">
+         <item>
+          <widget class="QLabel" name="label_best_tf_title">
+           <property name="styleSheet">
+            <string>color: #787b86; font-size: 11px;</string>
+           </property>
+           <property name="text">
+            <string>Bester TF</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="label_best_tf">
+           <property name="styleSheet">
+            <string>color: #d1d4dc; font-size: 24px; font-weight: bold;</string>
+           </property>
+           <property name="text">
+            <string>-</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </widget>
+      </item>
+     </layout>
+    </item>
+    <item>
+     <widget class="QWidget" name="paging_bar" native="true">
+      <property name="fixedHeight" stdset="0">
+       <number>32</number>
+      </property>
+      <layout class="QHBoxLayout" name="horizontalLayout_paging">
+       <property name="spacing">
+        <number>6</number>
+       </property>
+       <property name="leftMargin">
+        <number>0</number>
+       </property>
+       <property name="topMargin">
+        <number>0</number>
+       </property>
+       <property name="rightMargin">
+        <number>0</number>
+       </property>
+       <property name="bottomMargin">
+        <number>0</number>
+       </property>
+       <item>
+        <widget class="QPushButton" name="btn_prev_page">
+         <property name="styleSheet">
+          <string>QPushButton { background-color: #2b5c8f; color: white; font-weight: bold; border-radius: 3px; } QPushButton:disabled { background-color: #37474f; color: #787b86; }</string>
+         </property>
+         <property name="text">
+          <string>◀ Zurück</string>
+         </property>
+         <property name="fixedSize" stdset="0">
+          <size>
+           <width>90</width>
+           <height>24</height>
+          </size>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="label_page_info">
+         <property name="styleSheet">
+          <string>color: #d1d4dc; font-weight: bold; font-size: 12px;</string>
+         </property>
+         <property name="text">
+          <string>Seite 0 / 0</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="btn_next_page">
+         <property name="styleSheet">
+          <string>QPushButton { background-color: #2b5c8f; color: white; font-weight: bold; border-radius: 3px; } QPushButton:disabled { background-color: #37474f; color: #787b86; }</string>
+         </property>
+         <property name="text">
+          <string>Weiter ▶</string>
+         </property>
+         <property name="fixedSize" stdset="0">
+          <size>
+           <width>90</width>
+           <height>24</height>
+          </size>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="horizontalSpacer_paging_right">
+         <property name="orientation">
+          <enum>Qt::Orientation::Horizontal</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>40</width>
+           <height>20</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+      </layout>
+     </widget>
+    </item>
+    <item>
+     <widget class="QTableWidget" name="table_signals">
+      <property name="styleSheet">
+       <string>QTableWidget { background-color: #131722; color: #d1d4dc; gridline-color: #2B2B43; border: 1px solid #2B2B43; }
+QHeaderView::section { background-color: #1e222d; color: #787b86; border: 1px solid #2B2B43; padding: 4px; font-weight: bold; }
+QTableWidget::item { padding: 4px; }
+QTableWidget::item:selected { background-color: #2b5c8f; }</string>
+      </property>
+      <property name="editTriggers">
+       <set>QAbstractItemView::EditTrigger::NoEditTriggers</set>
+      </property>
+      <property name="selectionBehavior">
+       <enum>QAbstractItemView::SelectionBehavior::SelectRows</enum>
+      </property>
+      <attribute name="horizontalHeaderStretchLastSection">
+       <bool>true</bool>
+      </attribute>
+      <attribute name="verticalHeaderVisible">
+       <bool>true</bool>
+      </attribute>
+      <column>
+       <property name="text">
+        <string>Time</string>
+       </property>
+      </column>
+      <column>
+       <property name="text">
+        <string>Symbol</string>
+       </property>
+      </column>
+      <column>
+       <property name="text">
+        <string>Timeframe</string>
+       </property>
+      </column>
+      <column>
+       <property name="text">
+        <string>Signal-Set</string>
+       </property>
+      </column>
+      <column>
+       <property name="text">
+        <string>Confidence</string>
+       </property>
+      </column>
+      <column>
+       <property name="text">
+        <string>Outcome</string>
+       </property>
+      </column>
+     </widget>
+    </item>
+   </layout>
+  </widget>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>

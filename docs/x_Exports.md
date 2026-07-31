@@ -1,0 +1,16790 @@
+# PROJEKT-ÜBERSICHT: PyTrader
+
+## 1. ORDNERSTRUKTUR
+```
+PyTrader/
+    db_service.py
+    main.py
+    persistent_win.py
+    properties_win.py
+    service_win.py
+    state_manager.py
+    statistic_win.py
+    .backup_A_generationsschutz/
+        01_core.js
+        04_live_updates.js
+        chart_win.py
+    .backup_B_zeitinvarianten/
+        01_core.js
+        02_time_utils.js
+        03_chart_rendering.js
+        04_live_updates.js
+        chart_win.py
+    .backup_C_dayseparator/
+        02_time_utils.js
+        03_chart_rendering.js
+        04_live_updates.js
+    .backup_D_markerlayers/
+        01_core.js
+        03_chart_rendering.js
+        04_live_updates.js
+        __init__.py
+        chart_basics.py
+        chart_win.py
+        check_marker_layers.js
+    analytics/
+        __init__.py
+        statistics_repository.py
+        background_workers/
+            __init__.py
+            historical_scanner.py
+            live_analyzer.py
+        engine/
+            __init__.py
+            base_definition.py
+            set_evaluator.py
+        features/
+            __init__.py
+            base_feature.py
+            feature_builder.py
+            definitions/
+                __init__.py
+                atr_normalized.py
+                ema_diff.py
+        signals/
+            __init__.py
+            composite/
+                __init__.py
+                grid_proximity_signal.py
+            experimental/
+                __init__.py
+                alternating_arrow_signal.py
+            heuristics/
+                __init__.py
+                atr_filter.py
+                ema_trend.py
+            machine_learning/
+                __init__.py
+                lightgbm_signal.py
+                xgboost_signal.py
+    chart/
+        __init__.py
+        chart_basics.py
+        chart_win.py
+        indicator_dialog.py
+        indicators/
+            __init__.py
+            base_indicator.py
+            grid.py
+        js/
+            01_core.js
+            02_time_utils.js
+            03_chart_rendering.js
+            04_live_updates.js
+        overlays/
+            __init__.py
+            signal_overlay.py
+    config/
+        __init__.py
+        app_settings.py
+        base_state_model.py
+    data/
+        analytics.duckdb.tmp/
+    docs/
+        Agents.md
+        export_project.py
+        x_Architektur.md
+        x_Roadmap.md
+    test/
+        build_cont_map.py
+        check_app_state.py
+        check_broker_tz.py
+        check_chart_data.py
+        check_generation_guard.py
+        check_html_template.py
+        check_m1_consistency.py
+        check_m1_midnight.py
+        check_marker_layers.js
+        check_mt5_m1_boundary.py
+        check_race_guard.js
+        check_resolve_realtime.js
+        check_time_constants.js
+        check_time_utils.js
+        simulate_chart_mapping.py
+        test.py
+        test_db_lock.py
+        tmp_cont_map.json
+    ui/
+        chart_win.ui
+        main_win.ui
+        service_win.ui
+        statistic_win.ui
+```
+
+## 2. QUELLCODE
+
+### DATEI: db_service.py
+```py
+# db_service.py
+"""
+db_service.py - MT5 Sync Service for PyTrader mit globaler Thread-Sperre, TIMESTAMPTZ & Native Upsert (INSERT OR REPLACE)
+"""
+
+import json
+import os
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Set, Tuple, Optional, List, Dict, Any
+import duckdb
+import pandas as pd
+
+# ==============================================================================
+# CONFIGURATION & THREAD SAFETY
+# ==============================================================================
+DATA_DIR = "data"
+DB_MARKET_DATA = os.path.join(DATA_DIR, "market_data.duckdb")
+DB_ANALYTICS = os.path.join(DATA_DIR, "analytics.duckdb")
+DB_APP_DATA = os.path.join(DATA_DIR, "app_data.duckdb")
+
+SYMBOLS = ["SILVER", "GOLD"]
+
+# TIMEFRAMES als Lazy-Initialisierung (vermeidet MT5-DLL-Load beim Import)
+_TIMEFRAMES_CACHE: Optional[Dict[str, int]] = None
+
+
+def get_timeframes() -> Dict[str, int]:
+    """Gibt das Timeframe-Mapping zurueck (lazy, importiert mt5 nur bei Bedarf)."""
+    global _TIMEFRAMES_CACHE
+    if _TIMEFRAMES_CACHE is None:
+        import MetaTrader5 as _mt5
+        _TIMEFRAMES_CACHE = {
+            "MN1": _mt5.TIMEFRAME_MN1,
+            "W1": _mt5.TIMEFRAME_W1,
+            "D1": _mt5.TIMEFRAME_D1,
+            "H4": _mt5.TIMEFRAME_H4,
+            "H1": _mt5.TIMEFRAME_H1,
+            "M30": _mt5.TIMEFRAME_M30,
+            "M15": _mt5.TIMEFRAME_M15,
+            "M10": _mt5.TIMEFRAME_M10,
+            "M5": _mt5.TIMEFRAME_M5,
+            "M2": _mt5.TIMEFRAME_M2,
+            "M1": _mt5.TIMEFRAME_M1,
+        }
+    return _TIMEFRAMES_CACHE
+
+TF_SECONDS_MAP: Dict[str, int] = {
+	"M1": 60,
+	"M2": 120,
+	"M5": 300,
+	"M10": 600,
+	"M15": 900,
+	"M30": 1800,
+	"H1": 3600,
+	"H4": 14400,
+	"D1": 86400,
+	"W1": 604800,
+	"MN1": 2592000,
+}
+
+MT5_LOCK = threading.Lock()
+
+# ==============================================================================
+# DB LOCK-FREIER CONNECTION-HELPER
+# ==============================================================================
+# DuckDB unterstützt Multiple Connections innerhalb eines Prozesses nativ.
+# Threading-Locks sind hier kontraproduktiv, da sie z. B. eine dauerhaft
+# offene Haupt-Connection (self.db in MainWindow) blockieren.
+# Cross-Prozess-Konflikte (IO Error: file is already open) werden durch
+# sauberes Beenden vorheriger Prozesse gelöst, nicht durch threading.Lock.
+
+
+def with_db_lock(db_path: str):
+    """No-op decorator (Lock-frei). Beibehalten für API-Kompatibilität."""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+# ==============================================================================
+# DB CONNECTION POOL (Thread-local Singleton) – eine Connection pro Thread & DB
+# ==============================================================================
+# Loest drei Kernprobleme unter Windows:
+#   1. "Can't open a connection with a different configuration" – immer gleiche Config
+#   2. "Cannot open file – file used by another process" – keine Open/Close-Zyklen
+#   3. DuckDB-Connections sind nicht thread-safe – eigenes Connection pro Thread
+#
+# Nutzung: DbPool.get(db_path) statt db_connect(db_path)
+# Connections werden automatisch via atexit geschlossen.
+
+_db_pool_lock = threading.Lock()
+_db_pool_global: Dict[str, int] = {}  # abs_path -> Referenzzähler (fuer atexit)
+
+
+class DbPool:
+    """Thread-sicherer Connection-Pool: eine persistente Connection pro Thread & DB-Datei."""
+
+    _local = threading.local()
+
+    @staticmethod
+    def get(db_path: str) -> duckdb.DuckDBPyConnection:
+        """Gibt eine persistente Connection zur DB-Datei zurueck (eine pro Thread).
+        Die Connection lebt bis Prozess-Ende und wird nie geschlossen."""
+        abs_path = os.path.abspath(db_path)
+        # Thread-local Storage: Jeder Thread hat seine eigenen Connections
+        if not hasattr(DbPool._local, 'conns'):
+            DbPool._local.conns = {}
+        if abs_path not in DbPool._local.conns:
+            DbPool._local.conns[abs_path] = duckdb.connect(abs_path)
+            # Globalen Referenzzähler erhöhen (für atexit)
+            with _db_pool_lock:
+                if _db_pool_global.get(abs_path, 0) == 0:
+                    import atexit
+                    atexit.register(lambda p=abs_path: DbPool._close_all_for(p))
+                _db_pool_global[abs_path] = _db_pool_global.get(abs_path, 0) + 1
+        return DbPool._local.conns[abs_path]
+
+    @staticmethod
+    def _close_all_for(abs_path: str) -> None:
+        """Schliesst ALLE Connections zu einer DB-Datei (fuer atexit)."""
+        # Kann nur die Connections des aktuellen Threads schliessen
+        if hasattr(DbPool._local, 'conns'):
+            con = DbPool._local.conns.pop(abs_path, None)
+            if con is not None:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def close_all() -> None:
+        """Schliesst ALLE Connections des aktuellen Threads."""
+        if hasattr(DbPool._local, 'conns'):
+            for abs_path in list(DbPool._local.conns.keys()):
+                try:
+                    DbPool._local.conns[abs_path].close()
+                except Exception:
+                    pass
+            DbPool._local.conns = {}
+
+
+class _LockedConnection:
+    """Wrapper um DuckDBPyConnection (LEGACY – nur noch fuer sync_market_data & MarketDataRepository).
+    Oeffnet/schliesst die Connection bei jedem Aufruf.
+    """
+
+    def __init__(self, con: duckdb.DuckDBPyConnection):
+        self._con = con
+
+    def __getattr__(self, name):
+        return getattr(self._con, name)
+
+    def close(self):
+        try:
+            self._con.close()
+        finally:
+            pass
+
+
+def db_connect(db_path: str, read_only: bool = False) -> _LockedConnection:
+    """LEGACY: Oeffnet eine neue Connection (wird geschlossen nach Gebrauch).
+    
+    Warnung: Nicht fuer haeufige Zugriffe verwenden!
+    Nutze stattdessen: DbPool.get(db_path)
+    """
+    con = duckdb.connect(db_path, read_only=read_only)
+    return _LockedConnection(con)
+
+
+# ==============================================================================
+# 1) DATENBANKEN PRÜFEN, ANLEGEN & MIGRIEREN
+# ==============================================================================
+def check_and_init_databases() -> None:
+	"""Prüft, initialisiert und migriert die Kern-Datenbanken bei Bedarf."""
+	print("🔍 [1/3] Prüfe und initialisiere Ordnerstruktur und Datenbanken...")
+	os.makedirs(DATA_DIR, exist_ok=True)
+
+	con_market = DbPool.get(DB_MARKET_DATA)
+	con_market.execute("""
+		CREATE TABLE IF NOT EXISTS ohlcv_bars (
+			symbol      VARCHAR NOT NULL,
+			timeframe   VARCHAR NOT NULL,
+			time        TIMESTAMPTZ NOT NULL,
+			open        DOUBLE NOT NULL,
+			high        DOUBLE NOT NULL,
+			low         DOUBLE NOT NULL,
+			close       DOUBLE NOT NULL,
+			tick_volume BIGINT,
+			spread      INTEGER,
+			real_volume BIGINT,
+			created_at  TIMESTAMP DEFAULT current_timestamp,
+			PRIMARY KEY (symbol, timeframe, time)
+		);
+	""")
+
+	try:
+		col_type_row = con_market.execute("""
+			SELECT data_type 
+			FROM information_schema.columns 
+			WHERE LOWER(table_name) = 'ohlcv_bars' AND LOWER(column_name) = 'time'
+		""").fetchone()
+
+		if col_type_row and col_type_row[0].upper() == "TIMESTAMP":
+			print("⚠️ [MIGRATION] Konvertiere 'time' Spalte in ohlcv_bars von TIMESTAMP zu TIMESTAMPTZ...")
+			con_market.execute("ALTER TABLE ohlcv_bars ALTER time TYPE TIMESTAMPTZ")
+			print("✅ [MIGRATION] Konvertierung erfolgreich abgeschlossen.")
+	except Exception as e:
+		print(f"⚠️ [MIGRATION WARNUNG] Migration konnte nicht durchgeführt werden: {e}")
+
+	con_analytics = DbPool.get(DB_ANALYTICS)
+	con_analytics.execute("""
+		CREATE TABLE IF NOT EXISTS analytics_metadata (
+			created_at TIMESTAMP DEFAULT current_timestamp,
+			info VARCHAR
+		);
+	""")
+
+	# Phase 1: Analytics-Tabellen für Signal-Engine
+	con_analytics.execute("""
+		CREATE TABLE IF NOT EXISTS feature_store (
+			symbol      VARCHAR NOT NULL,
+			timeframe   VARCHAR NOT NULL,
+			bar_time    TIMESTAMPTZ NOT NULL,
+			ema_diff    DOUBLE,
+			rsi_14      DOUBLE,
+			atr_normalized DOUBLE,
+			created_at  TIMESTAMP DEFAULT current_timestamp,
+			PRIMARY KEY (symbol, timeframe, bar_time)
+		);
+	""")
+
+	con_analytics.execute("""
+		CREATE TABLE IF NOT EXISTS signal_definitions (
+			signal_id   VARCHAR PRIMARY KEY,
+			category    VARCHAR NOT NULL,
+			version     VARCHAR,
+			params      JSON
+		);
+	""")
+	con_analytics.execute("""
+		CREATE TABLE IF NOT EXISTS signal_sets (
+			set_id          VARCHAR PRIMARY KEY,
+			configuration   JSON NOT NULL,
+			logic           VARCHAR NOT NULL
+		);
+	""")
+	con_analytics.execute("""
+		CREATE TABLE IF NOT EXISTS signal_results (
+			event_id        VARCHAR PRIMARY KEY,
+			symbol          VARCHAR NOT NULL,
+			timeframe       VARCHAR NOT NULL,
+			bar_time        TIMESTAMPTZ NOT NULL,
+			source_id       VARCHAR NOT NULL,
+			confidence      DOUBLE,
+			context_type    VARCHAR NOT NULL,
+			metadata_payload JSON,
+			created_at      TIMESTAMP DEFAULT current_timestamp
+		);
+	""")
+
+	con_app = DbPool.get(DB_APP_DATA)
+	con_app.execute("""
+		CREATE TABLE IF NOT EXISTS app_config (
+			key VARCHAR PRIMARY KEY,
+			value VARCHAR,
+			updated_at TIMESTAMP DEFAULT current_timestamp
+		);
+	""")
+	print(f"   ✅ Ordner '{DATA_DIR}/' und alle 3 DBs sind einsatzbereit.")
+
+
+# ==============================================================================
+# 2) MT5 VERBINDUNG PRÜFEN
+# ==============================================================================
+def check_mt5_connection() -> None:
+	"""Prüft die MT5-Verbindung mit abgesicherter Fehlerbehandlung (lazy mt5 import)."""
+	import MetaTrader5 as _mt5
+
+	print("\n🔗 [2/3] Prüfe MT5-Verbindung...")
+
+	with MT5_LOCK:
+		if not _mt5.initialize():
+			error_code = _mt5.last_error()
+			try:
+				_mt5.shutdown()
+			except Exception:
+				pass
+			raise SystemExit(
+				f"❌ KRITISCHER FEHLER: MT5-Verbindung fehlgeschlagen!\n"
+				f"   Fehlercode: {error_code}\n"
+				f"   Bitte stelle sicher, dass das MT5 Terminal geöffnet und eingeloggt ist."
+			)
+
+		account = _mt5.account_info()
+		if account is None:
+			try:
+				_mt5.shutdown()
+			except Exception:
+				pass
+			raise SystemExit("❌ KRITISCHER FEHLER: Im MT5-Terminal ist kein Konto eingeloggt!")
+
+		for symbol in SYMBOLS:
+			if not _mt5.symbol_select(symbol, True):
+				try:
+					_mt5.shutdown()
+				except Exception:
+					pass
+				raise SystemExit(f"❌ KRITISCHER FEHLER: Symbol '{symbol}' konnte im MT5 nicht aktiviert werden.")
+
+	print(f"   ✅ Verbunden mit Broker: {account.company} (Server: {account.server}, Login: {account.login})")
+
+
+# ==============================================================================
+# 3 & 4) DATEN HILFSFUNKTIONEN & IMPORT-SCHLEIFE
+# ==============================================================================
+def get_latest_timestamp(con: duckdb.DuckDBPyConnection, symbol: str, timeframe_str: str) -> Optional[datetime]:
+	res = con.execute("""
+		SELECT MAX(time) 
+		FROM ohlcv_bars 
+		WHERE symbol = ? AND timeframe = ?
+	""", [symbol, timeframe_str]).fetchone()
+
+	return res[0] if res and res[0] is not None else None
+
+
+def sync_market_data() -> Set[Tuple[str, str]]:
+	import MetaTrader5 as _mt5
+	timeframes = get_timeframes()
+
+	check_and_init_databases()
+	check_mt5_connection()
+
+	print(f"\n📥 [3/3] Starte Synchronisation für {', '.join(SYMBOLS)} über {len(timeframes)} Timeframes...")
+
+	start_time_total = time.perf_counter()
+	total_bars_downloaded = 0
+	updated_pairs: Set[Tuple[str, str]] = set()
+
+	for symbol in SYMBOLS:
+		print(f"\n--- Synchronisiere {symbol} ---")
+		# Connection pro Symbol öffnen/schließen, damit andere Threads (LiveTickWorker)
+		# zwischendurch ebenfalls auf die DB zugreifen können
+		con = db_connect(DB_MARKET_DATA)
+		try:
+			for tf_str, tf_mt5 in timeframes.items():
+				tf_start = time.perf_counter()
+
+				last_time = get_latest_timestamp(con, symbol, tf_str)
+
+				with MT5_LOCK:
+					if last_time is not None:
+						rates = _mt5.copy_rates_from_pos(symbol, tf_mt5, 0, 5_000)
+						update_type = "UPDATE"
+					else:
+						rates = _mt5.copy_rates_from_pos(symbol, tf_mt5, 0, 10_000_000)
+						update_type = "VOLLIMPORT"
+
+					if rates is None:
+						err = _mt5.last_error()
+						print(f"   [--] {tf_str:<4} | MT5 Fehler beim Abrufen der Kerzen: {err}")
+						continue
+
+				if len(rates) == 0:
+					print(f"   [--] {tf_str:<4} | Keine Kerzen von MT5 empfangen.")
+					continue
+
+				df = pd.DataFrame(rates)
+				df["symbol"] = symbol
+				df["timeframe"] = tf_str
+				df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+				df = df.drop_duplicates(subset=["time"], keep="last")
+
+				df_to_insert = df[
+					[
+						"symbol",
+						"timeframe",
+						"time",
+						"open",
+						"high",
+						"low",
+						"close",
+						"tick_volume",
+						"spread",
+						"real_volume",
+					]
+				]
+
+				con.register("df_temp", df_to_insert)
+
+				# NATIVE UPSERT VIA PRIMÄRSCHLÜSSEL (symbol, timeframe, time)
+				con.execute("""
+					INSERT OR REPLACE INTO ohlcv_bars (
+						symbol, timeframe, time, open, high, low, close, tick_volume, spread, real_volume
+					)
+					SELECT 
+						symbol, timeframe, "time", open, high, low, close, tick_volume, spread, real_volume 
+					FROM df_temp
+				""")
+
+				con.unregister("df_temp")
+
+				tf_elapsed = time.perf_counter() - tf_start
+				bars_count = len(df_to_insert)
+				total_bars_downloaded += bars_count
+
+				if bars_count > 0:
+					updated_pairs.add((symbol, tf_str))
+
+				print(f"   [✅] {tf_str:<4} | {update_type:<10} | {bars_count:>8,} Kerzen verarbeitet in {tf_elapsed:.2f}s")
+		finally:
+			con.close()
+
+	total_elapsed = time.perf_counter() - start_time_total
+
+	print("\n" + "=" * 60)
+	print("⏱️  ERGEBNIS & ZEITMESSUNG")
+	print("=" * 60)
+	print(f"Gesamtdauer Process:    {total_elapsed:.2f} Sekunden")
+	print(f"Gesamtanzahl Kerzen:    {total_bars_downloaded:,}")
+	print(f"Durchschnittliche Rate: {total_bars_downloaded / max(total_elapsed, 0.001):,.0f} Kerzen/Sekunde")
+	print("=" * 60)
+	return updated_pairs
+
+
+# ==============================================================================
+# HELPER: Einheitlicher Unix-Epoch-Konverter
+# ==============================================================================
+def _ensure_epoch(val: Any) -> int:
+    """DEPRECATED: Nutze stattdessen EXTRACT('epoch' FROM time)::BIGINT in SQL.
+    Diese Funktion zerstört die Zeitzone bei TIMESTAMPTZ (timetuple() verliert offset).
+    Nur noch für backward-compat in Test-Dateien."""
+    if isinstance(val, datetime):
+        import calendar
+        return calendar.timegm(val.timetuple())
+    return int(val)
+
+
+# ==============================================================================
+# HELPER: Sicheres JSON-Parsing (DuckDB liefert str oder dict je nach Treiber)
+# ==============================================================================
+def _parse_json_field(val: Any) -> Any:
+    """Wandelt JSON aus DuckDB in Python-Objekt um (str->dict, dict bleibt)."""
+    if isinstance(val, str):
+        return json.loads(val) if val else None
+    return val
+
+
+# ==============================================================================
+# 5) REPOSITORY MIT ROBUSTER STATISTISCHER PRECISION-ERMITTLUNG
+# ==============================================================================
+class MarketDataRepository:
+	"""Kapselt den exklusiven Lesezugriff auf die Marktdatenbank."""
+
+	def __init__(self, db_path: str = DB_MARKET_DATA) -> None:
+		self.db_path = db_path
+
+	def fetch_historical_candles(self, symbol: str, timeframe: str, limit: int = 3000) -> Tuple[List[Dict[str, Any]], int]:
+		candles: List[Dict[str, Any]] = []
+		precision: int = 2
+
+		if not os.path.exists(self.db_path):
+			return candles, precision
+
+		for attempt in range(3):
+			try:
+				con = db_connect(self.db_path)
+
+				precision_query = """
+					SELECT COALESCE(MAX(
+						CASE 
+							WHEN POSITION('.' IN CAST(ROUND(close, 5) AS VARCHAR)) > 0 
+							THEN LENGTH(RTRIM(CAST(ROUND(close, 5) AS VARCHAR), '0')) - POSITION('.' IN CAST(ROUND(close, 5) AS VARCHAR))
+							ELSE 0 
+						END
+					), 2) AS precision
+					FROM (
+						SELECT close 
+						FROM ohlcv_bars 
+						WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+						  AND close IS NOT NULL 
+						LIMIT 1000
+					);
+				"""
+				p_row = con.execute(precision_query, [symbol, timeframe]).fetchone()
+				if p_row and p_row[0] is not None:
+					precision = int(p_row[0])
+
+				query = """
+					SELECT EXTRACT('epoch' FROM "time")::BIGINT AS time_epoch,
+					       open, high, low, close 
+					FROM (
+						SELECT "time", open, high, low, close 
+						FROM ohlcv_bars 
+						WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+						  AND "time" IS NOT NULL 
+						  AND open IS NOT NULL 
+						  AND high IS NOT NULL 
+						  AND low IS NOT NULL 
+						  AND close IS NOT NULL
+						ORDER BY "time" DESC 
+						LIMIT ?
+					) 
+					ORDER BY "time" ASC;
+				"""
+				rows = con.execute(query, [symbol, timeframe, limit]).fetchall()
+				con.close()
+
+				for r in rows:
+					t_epoch = int(r[0])  # Bereits epoch-Integer aus DuckDB
+					candles.append({
+						"time": t_epoch,
+						"open": float(r[1]),
+						"high": float(r[2]),
+						"low": float(r[3]),
+						"close": float(r[4])
+					})
+				break
+
+			except Exception as e:
+				if attempt == 2:
+					print(f"❌ [Repository Error] Fehler beim Laden von {symbol} {timeframe}: {e}")
+				else:
+					time.sleep(0.1)
+
+		return candles, precision
+
+
+def main() -> None:
+	sync_market_data()
+
+
+if __name__ == "__main__":
+	main()
+```
+
+--------------------------------------------------
+
+### DATEI: main.py
+```py
+# main.py
+"""
+main.py - Haupt-Orchestrator für PyTrader mit Multi-Monitor-Sicherheitsprüfung, WebEngine Render-Fix & Main-Window Geometry Persistence
+"""
+
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Set, Tuple
+
+# CHROMIUM MULTI-MONITOR & OCCLUSION RENDER FIX (Vor QApplication Import setzen)
+os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
+    "--disable-features=CalculateNativeWinOcclusion "
+    "--enable-gpu-rasterization "
+    "--ignore-gpu-blocklist "
+    "--disable-backgrounding-occluded-windows "
+    "--disable-renderer-backgrounding "
+    "--num-raster-threads=4"
+)
+
+import MetaTrader5 as mt5
+import duckdb
+from PySide6.QtCore import QFile, QIODevice, QThread, QTimer, Signal, Slot, Qt
+from PySide6.QtGui import QScreen
+from PySide6.QtUiTools import QUiLoader
+from PySide6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
+)
+
+from chart.chart_win import PyTraderChartWindow
+from state_manager import StateManager
+from persistent_win import PersistentWindow
+from db_service import get_timeframes, TF_SECONDS_MAP, MT5_LOCK, DbPool
+import db_service
+from service_win import ServiceWindow
+from statistic_win import StatisticWindow
+from properties_win import PropertiesWindow
+from config.app_settings import AppSettings
+from analytics.background_workers.live_analyzer import LiveAnalyzer
+
+# ==============================================================================
+# KONSOLE: UTF-8 erzwingen – verhindert UnicodeEncodeError bei Emojis/Log-Ausgaben
+# unter Windows (CP1252). Ein solcher Fehler in kritischen Pfaden (z. B. Chart-Refresh)
+# kann den Chart dauerhaft blockieren, weil _is_loading_data nicht zurueckgesetzt wird.
+# ==============================================================================
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+class DataSyncWorker(QThread):
+    sync_completed = Signal(object)
+
+    def run(self) -> None:
+        """Führt den Hintergrund-Sync für alle historischen Daten aus."""
+        try:
+            updated_pairs: Set[Tuple[str, str]] = db_service.sync_market_data()
+            self.sync_completed.emit(updated_pairs)
+        except Exception as e:
+            print(f"❌ Fehler im DataSyncWorker: {e}")
+            self.sync_completed.emit(set())
+
+
+class LiveTickWorker(QThread):
+    ticks_ready = Signal(str)
+
+    def __init__(self, get_active_pairs_callback: Callable[[], Set[Tuple[str, str]]]) -> None:
+        super().__init__()
+        self.get_active_pairs: Callable[[], Set[Tuple[str, str]]] = get_active_pairs_callback
+        self._running: bool = True
+        self._last_bar_times: Dict[str, int] = {}  # Für Bar-Close-Erkennung
+        self._last_bar_data: Dict[str, Dict[str, Any]] = {}  # OHLCV der letzten abgeschlossenen Kerze
+
+    def stop(self) -> None:
+        self._running = False
+
+    def run(self) -> None:
+        """Kontinuierliche Polling-Schleife für MT5-Ticks mit try/finally Freigabe.
+        Erkennt Bar-Close-Events und schreibt abgeschlossene Kerzen in market_data.duckdb."""
+        try:
+            with MT5_LOCK:
+                if not mt5.initialize():
+                    # MT5 ist möglicherweise bereits von MainWindow initialisiert
+                    print("⚠️ [LiveTickWorker] mt5.initialize() war False, versuche trotzdem weiter...")
+
+            while self._running:
+                active_pairs: Set[Tuple[str, str]] = self.get_active_pairs()
+                if not active_pairs:
+                    self.msleep(200)
+                    continue
+
+                results: Dict[str, Dict[str, float | int]] = {}
+                try:
+                    for symbol, tf_str in active_pairs:
+                        mt5_tf: Optional[int] = get_timeframes().get(tf_str)
+                        if mt5_tf is None:
+                            continue
+
+                        with MT5_LOCK:
+                            tick = mt5.symbol_info_tick(symbol)
+                            rates = mt5.copy_rates_from_pos(symbol, mt5_tf, 0, 1)
+
+                        if tick and rates is not None and len(rates) > 0:
+                            rate = rates[0]
+                            key: str = f"{symbol}|{tf_str}"
+                            current_bar_time = int(rate['time'])
+
+                            # Bar-Close erkennen: neue Bar-Time != letzte Bar-Time
+                            last_bar = self._last_bar_times.get(key, 0)
+                            if last_bar > 0 and current_bar_time > last_bar:
+                                # Alte (abgeschlossene) Kerze aus dem Zwischenspeicher in DB schreiben
+                                last_data = self._last_bar_data.get(key)
+                                if last_data:
+                                    self._persist_bar(symbol, tf_str, last_bar, last_data)
+
+                            # Aktuelle Kerze zwischenspeichern (wird beim nächsten Bar-Close persistiert)
+                            self._last_bar_times[key] = current_bar_time
+                            self._last_bar_data[key] = {
+                                'open': float(rate[1]),  # open
+                                'high': float(rate[2]),  # high
+                                'low': float(rate[3]),   # low
+                                'close': float(rate[4]), # close
+                                'tick_volume': int(rate[5]) if len(rate) > 5 else 0,
+                                'spread': int(rate[6]) if len(rate) > 6 else 0,
+                                'real_volume': int(rate[7]) if len(rate) > 7 else 0,
+                            }
+
+                            # JEDEN Tick an die Charts senden (für Live-Candle-Updates)
+                            results[key] = {
+                                "time": current_bar_time,
+                                "open": float(rate['open']),
+                                "high": max(float(rate['high']), float(tick.bid)),
+                                "low": min(float(rate['low']), float(tick.bid)),
+                                "close": float(tick.bid)
+                            }
+                except Exception as e:
+                    print(f"⚠️ [LiveTickWorker] Fehler in Poll-Schleife: {e}")
+
+                if results:
+                    self.ticks_ready.emit(json.dumps(results))
+
+                self.msleep(500)
+
+        finally:
+            with MT5_LOCK:
+                try:
+                    mt5.shutdown()
+                except Exception:
+                    pass
+
+    def _persist_bar(self, symbol: str, tf_str: str, bar_time: int, bar_data: Dict[str, Any]) -> None:
+        """Schreibt eine abgeschlossene Kerze per INSERT OR REPLACE in market_data.duckdb."""
+        try:
+            from db_service import DB_MARKET_DATA, DbPool
+            con = DbPool.get(DB_MARKET_DATA)
+            con.execute("""
+                INSERT OR REPLACE INTO ohlcv_bars (symbol, timeframe, time, open, high, low, close, tick_volume, spread, real_volume)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, [
+                symbol,
+                tf_str,
+                datetime.fromtimestamp(bar_time, tz=timezone.utc),
+                bar_data['open'],
+                bar_data['high'],
+                bar_data['low'],
+                bar_data['close'],
+                bar_data['tick_volume'],
+                bar_data['spread'],
+                bar_data['real_volume'],
+            ])
+        except Exception as e:
+            print(f"⚠️ [LiveTickWorker] Fehler beim Persistieren von {symbol} {tf_str} @ {bar_time}: {e}")
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+
+        self.state_manager: StateManager = StateManager()
+        self.settings: AppSettings = self.state_manager.get_app_settings()
+        self.chart_windows: List[PyTraderChartWindow] = []
+        self.persistent_sub_windows: List[PersistentWindow] = []
+        self.sync_thread: Optional[DataSyncWorker] = None
+        self.pending_ticks_buffer: Dict[str, Dict[str, float | int]] = {}
+        self._pending_ticks_timer: QTimer = QTimer(self)
+        self._pending_ticks_timer.setSingleShot(True)
+        self._pending_ticks_timer.setInterval(30000)
+        self._pending_ticks_timer.timeout.connect(self._flush_pending_ticks)
+
+        ui_file_name: str = str(BASE_DIR / "ui" / "main_win.ui")
+        ui_file: QFile = QFile(ui_file_name)
+        if not ui_file.open(QIODevice.ReadOnly):
+            print(f"❌ Konnte UI nicht öffnen: {ui_file_name}")
+            sys.exit(1)
+
+        loader: QUiLoader = QUiLoader()
+        self.ui = loader.load(ui_file)
+        ui_file.close()
+
+        self.setCentralWidget(self.ui)
+        self.setWindowTitle("PyTrader - Trading Terminal")
+
+        self.btn_open_chart: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_open_chart")
+        if self.btn_open_chart:
+            self.btn_open_chart.clicked.connect(self.open_chart_window)
+
+        self.btn_refresh_db: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_refresh_db")
+        if self.btn_refresh_db:
+            self.btn_refresh_db.clicked.connect(self.trigger_background_sync)
+
+        self.btn_service: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_service")
+        if self.btn_service:
+            self.btn_service.clicked.connect(self.open_service_window)
+
+        self.btn_statistics: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_statistics")
+        if self.btn_statistics:
+            self.btn_statistics.clicked.connect(self.open_statistic_window)
+
+        self.btn_properties: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_properties")
+        if self.btn_properties:
+            self.btn_properties.clicked.connect(self.open_properties_window)
+
+        # Datenbanken initialisieren (Tabellen anlegen/updaten) bevor irgendetwas
+        # auf analytics.duckdb oder andere DBs zugreift.
+        db_service.check_and_init_databases()
+
+        db_service.check_mt5_connection()
+
+        self.db: duckdb.DuckDBPyConnection = DbPool.get(
+            str(BASE_DIR / "data" / "app_data.duckdb")
+        )
+        self.db.execute("CREATE TABLE IF NOT EXISTS kunden (id INT, name VARCHAR, umsatz DOUBLE)")
+
+        self.load_initial_table_data()
+
+        self.restore_main_window_geometry()
+
+        QTimer.singleShot(200, self.restore_all_windows)
+
+        self.sync_timer: QTimer = QTimer(self)
+        self.sync_timer.setInterval(45000)
+        self.sync_timer.timeout.connect(self.trigger_background_sync)
+        self.sync_timer.start()
+
+        self.tick_worker: LiveTickWorker = LiveTickWorker(self.get_currently_active_pairs)
+        self.tick_worker.ticks_ready.connect(self.on_ticks_ready)
+        self.tick_worker.start()
+
+        # LiveAnalyzer für SILVER M1 (Bar-Close-Analyse)
+        self.live_analyzer: LiveAnalyzer = LiveAnalyzer(
+            symbol="SILVER",
+            timeframe="M1",
+            lookback_bars=self.settings.feature_builder_limit,
+        )
+        self.live_analyzer.new_live_signal.connect(self.on_live_signal)
+        self.live_analyzer.log_message.connect(self._on_live_analyzer_log)
+        self.live_analyzer.start()
+
+        # Ersten Sync erst starten, wenn alle Charts geladen sind
+        QTimer.singleShot(2000, self.trigger_background_sync)
+
+    def load_initial_table_data(self) -> None:
+        table: Optional[QTableWidget] = self.ui.findChild(QTableWidget, "table_result")
+        if table:
+            data = self.db.execute("SELECT id, name, umsatz FROM kunden").fetchall()
+            table.setRowCount(len(data))
+            table.setColumnCount(3)
+            table.setHorizontalHeaderLabels(["ID", "Name", "Umsatz (€)"])
+            for row_idx, row_data in enumerate(data):
+                for col_idx, col_data in enumerate(row_data):
+                    table.setItem(row_idx, col_idx, QTableWidgetItem(str(col_data)))
+
+    def restore_main_window_geometry(self) -> None:
+        geom = self.state_manager.get_window_geometry("win_main")
+        if geom:
+            pos_x = geom.get("pos_x")
+            pos_y = geom.get("pos_y")
+            width = geom.get("width") or 1000
+            height = geom.get("height") or 600
+
+            screen_geo = QApplication.primaryScreen().availableGeometry()
+            if pos_x is not None and pos_y is not None:
+                if pos_x < screen_geo.x() - 100 or pos_x > screen_geo.right() or \
+                        pos_y < screen_geo.y() - 100 or pos_y > screen_geo.bottom():
+                    pos_x, pos_y = 100, 100
+
+            self.move(pos_x, pos_y)
+            self.resize(width, height)
+
+            if geom.get("is_maximized"):
+                self.showMaximized()
+        else:
+            self.resize(1000, 600)
+
+    def restore_all_windows(self) -> None:
+        """Stellt ALLE gespeicherten Fenster vollautomatisch und generisch wieder her.
+        
+        Nutzt die Klassen-Registry aus persistent_win.py, um ohne Hardcoding
+        zwischen PersistentWindow-Subklassen (Service, Statistik) und
+        dynamischen Chart-Fenstern zu unterscheiden.
+        """
+        all_instances: List[Dict[str, Any]] = self.state_manager.load_all_instances()
+        if not all_instances:
+            print("✨ Keine gespeicherten Instanzen vorhanden.")
+            return
+
+        print(f"🔄 Prüfe {len(all_instances)} gespeicherte Fenster-Einträge...")
+
+        for inst in all_instances:
+            inst_id = str(inst.get("instance_id", ""))
+            if not inst_id or inst_id == "win_main":
+                continue
+
+            # 1. Fall: Registrierte PersistentWindow-Subklasse (Service, Statistik, etc.)
+            window_cls = PersistentWindow.get_registered_class(inst_id)
+            if window_cls is not None:
+                if not PersistentWindow.should_auto_restore(inst_id):
+                    print(f"  → Überspringe {inst_id} ({window_cls.__name__}): auto_restore=False")
+                    continue
+                print(f"  → Öffne registriertes Fenster: {inst_id} ({window_cls.__name__})")
+                # WICHTIG: parent=self nur für state_manager-Zugriff, nicht als Qt-Parent!
+                # PersistentWindow.__init__() übergibt kein Parent an QMainWindow,
+                # damit das Fenster einen eigenen Taskleisten-Eintrag hat.
+                win = window_cls(parent=self)
+                self.persistent_sub_windows.append(win)
+                # Ohne Fokus anzeigen (damit MainWindow den Fokus behält)
+                win.setAttribute(Qt.WA_ShowWithoutActivating, True)
+                win.show()
+                win.setAttribute(Qt.WA_ShowWithoutActivating, False)
+                # Maximiert wiederherstellen (nach show(), ohne Fokus-Klau)
+                if getattr(win, '_restored_is_maximized', False):
+                    win.showMaximized()
+                continue
+
+            # 2. Fall: Dynamische Chart-Fenster (win_1, win_2, ...)
+            if inst_id.startswith("win_"):
+                print(f"  → Öffne Chart-Fenster: {inst_id}")
+                win = PyTraderChartWindow(
+                    instance_id=inst_id,
+                    symbol=inst.get("symbol") or "SILVER",
+                    timeframe=inst.get("timeframe") or "H1",
+                    visible_from=inst.get("visible_range_from"),
+                    visible_to=inst.get("visible_range_to"),
+                    state_manager=self.state_manager
+                )
+                win.closed_signal.connect(self.handle_chart_closed)
+
+                # Geometrie anwenden
+                screen_geo = QApplication.primaryScreen().availableGeometry()
+                pos_x, pos_y = inst.get("pos_x"), inst.get("pos_y")
+                width = inst.get("width") or 900
+                height = inst.get("height") or 600
+
+                if pos_x is not None and pos_y is not None:
+                    if pos_x < screen_geo.x() - 100 or pos_x > screen_geo.right() or \
+                       pos_y < screen_geo.y() - 100 or pos_y > screen_geo.bottom():
+                        pos_x, pos_y = 100, 100
+                    win.move(pos_x, pos_y)
+                    win.resize(width, height)
+
+                if inst.get("is_maximized"):
+                    win.showMaximized()
+                else:
+                    win.setAttribute(Qt.WA_ShowWithoutActivating, True)
+                    win.show()
+                    win.setAttribute(Qt.WA_ShowWithoutActivating, False)
+
+                self.chart_windows.append(win)
+
+        # MainWindow NICHT in den Vordergrund holen – die WA_ShowWithoutActivating-Logik
+        # bei den Sub-Fenstern verhindert bereits Fokus-Klau. Ein erzwungenes
+        # raise_() + activateWindow() würde nur stören, falls der User inzwischen
+        # eine andere Anwendung fokussiert hat.
+
+    def open_chart_window(self) -> None:
+        new_id: str = self.state_manager.get_next_instance_id()
+        win = PyTraderChartWindow(
+            instance_id=new_id,
+            symbol="SILVER",
+            timeframe="H1",
+            visible_from=None,
+            visible_to=None,
+            state_manager=self.state_manager
+        )
+        win.closed_signal.connect(self.handle_chart_closed)
+        win.show()
+        self.chart_windows.append(win)
+
+    @Slot(str)
+    def handle_chart_closed(self, instance_id: str) -> None:
+        app = QApplication.instance()
+        if getattr(app, '_is_quitting', False): return
+        self.chart_windows = [w for w in self.chart_windows if w.instance_id != instance_id]
+
+    def open_service_window(self) -> None:
+        # Singleton: Bestehendes Fenster in den Vordergrund holen
+        existing = ServiceWindow.get_existing_instance()
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
+        win = ServiceWindow(self)  # parent=self nur für state_manager-Zugriff
+        self.persistent_sub_windows.append(win)
+        win.show()
+
+    def open_statistic_window(self) -> None:
+        # Singleton: Bestehendes Fenster in den Vordergrund holen
+        existing = StatisticWindow.get_existing_instance()
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
+        win = StatisticWindow(self)  # parent=self nur für state_manager-Zugriff
+        self.persistent_sub_windows.append(win)
+        win.show()
+
+    def open_properties_window(self) -> None:
+        # Singleton: Bestehendes Fenster in den Vordergrund holen
+        existing = PropertiesWindow.get_existing_instance()
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
+        win = PropertiesWindow(self)
+        self.persistent_sub_windows.append(win)
+        win.show()
+
+    def open_chart_at_bar(self, symbol: str, timeframe: str, bar_time: int) -> None:
+        """Oeffnet oder fokussiert ein Chart-Fenster und scrollt zur angegebenen Bar-Position."""
+        # Bestehendes Chart-Fenster mit passendem Symbol/TF suchen
+        for win in self.chart_windows:
+            try:
+                if win.current_symbol == symbol and win.current_tf == timeframe and win.isVisible():
+                    win.raise_()
+                    win.activateWindow()
+                    # Chart zur Position scrollen
+                    win.visible_from = bar_time
+                    win.visible_to = None
+                    win.refresh_chart_data()
+                    return
+            except (RuntimeError, AttributeError):
+                pass
+
+        # Kein passendes Fenster gefunden -> neues oeffnen
+        from chart.chart_win import PyTraderChartWindow
+        new_id: str = self.state_manager.get_next_instance_id()
+        win = PyTraderChartWindow(
+            instance_id=new_id,
+            symbol=symbol,
+            timeframe=timeframe,
+            visible_from=bar_time,
+            visible_to=None,
+            state_manager=self.state_manager
+        )
+        win.closed_signal.connect(self.handle_chart_closed)
+        win.show()
+        self.chart_windows.append(win)
+
+    def get_currently_active_pairs(self) -> Set[Tuple[str, str]]:
+        active_pairs = set()
+        for win in list(self.chart_windows):
+            try:
+                if win.isVisible():
+                    active_pairs.add((win.current_symbol, win.current_tf))
+            except (RuntimeError, AttributeError):
+                pass
+        return active_pairs
+
+    def trigger_background_sync(self) -> None:
+        if self.sync_thread is not None and self.sync_thread.isRunning():
+            return
+        self.sync_thread = DataSyncWorker()
+        self.sync_thread.sync_completed.connect(self.on_sync_completed)
+        self.sync_thread.start()
+
+    def _dispatch_tick_map(self, ticks_map: Dict[str, Dict[str, float | int]]) -> None:
+        """Verteilt Ticks an alle geöffneten Chartfenster."""
+        for win in list(self.chart_windows):
+            try:
+                if win.isVisible():
+                    key = f"{win.current_symbol}|{win.current_tf}"
+                    if key in ticks_map:
+                        win.update_live_candle(ticks_map[key])
+            except (RuntimeError, AttributeError):
+                continue
+
+    def on_ticks_ready(self, ticks_json_str: str) -> None:
+        if not ticks_json_str: return
+
+        try:
+            ticks_map = json.loads(ticks_json_str)
+
+            # Falls gerade ein DB-Sync läuft, Ticks im Puffer zwischenspeichern statt verwerfen
+            if self.sync_thread is not None and self.sync_thread.isRunning():
+                self.pending_ticks_buffer.update(ticks_map)
+                self._pending_ticks_timer.start()  # Timeout als Fallback falls Sync fehlschlägt
+                return
+
+            self._dispatch_tick_map(ticks_map)
+        except Exception as e:
+            print(f"❌ Fehler bei on_ticks_ready: {e}")
+
+    def _flush_pending_ticks(self) -> None:
+        """Leert den Puffer als Fallback, falls der Sync nie completed."""
+        if self.pending_ticks_buffer:
+            self._dispatch_tick_map(self.pending_ticks_buffer)
+            self.pending_ticks_buffer.clear()
+
+    def on_sync_completed(self, updated_pairs: Set[Tuple[str, str]]) -> None:
+        # 1. Gepufferte Live-Ticks nach dem Sync an die Charts ausliefern
+        if self.pending_ticks_buffer:
+            self._dispatch_tick_map(self.pending_ticks_buffer)
+            self.pending_ticks_buffer.clear()
+
+        # 2. Charts nur refreshen, wenn sie nicht gerade interagiert werden (_is_loading_data)
+        #    Der Refresh passiert asynchron mit 2s Verzögerung, damit der Sync komplett abgeschlossen ist
+        if updated_pairs:
+            QTimer.singleShot(2000, lambda: self._refresh_updated_charts(updated_pairs))
+
+    def _refresh_updated_charts(self, updated_pairs: Set[Tuple[str, str]]) -> None:
+        """Aktualisiert Charts für die aktualisierten Symbol/TF-Paare."""
+        for win in list(self.chart_windows):
+            try:
+                if (win.isVisible() and win._page_loaded and 
+                    not win._is_loading_data and
+                    (win.current_symbol, win.current_tf) in updated_pairs):
+                    win.refresh_chart_data()
+            except (RuntimeError, AttributeError):
+                pass
+
+    # ==============================================================================
+    # LiveAnalyzer Integration
+    # ==============================================================================
+
+    @Slot(str, str, int, float, str)
+    def on_live_signal(self, symbol: str, timeframe: str, bar_time: int, confidence: float, source_id: str) -> None:
+        """Wird vom LiveAnalyzer emittiert, wenn ein neues Live-Signal erkannt wurde.
+        Aktualisiert das Chart-Overlay für das betroffene Symbol/TF."""
+        print(f"🔔 Live-Signal empfangen: {symbol} {timeframe} @ {bar_time} (conf={confidence:.2f})")
+
+        # Direkt an die Chart-Fenster weiterleiten (on_live_signal_received)
+        for win in list(self.chart_windows):
+            try:
+                if win.isVisible():
+                    win.on_live_signal_received(symbol, timeframe, bar_time, confidence, source_id)
+            except (RuntimeError, AttributeError):
+                pass
+
+    @Slot(str)
+    def _on_live_analyzer_log(self, message: str) -> None:
+        """Loggt Nachrichten des LiveAnalyzer."""
+        print(f"📡 [LiveAnalyzer] {message}")
+
+    def closeEvent(self, event) -> None:
+        print("🚪 Beende PyTrader...")
+        app = QApplication.instance()
+        setattr(app, '_is_quitting', True)
+
+        self.sync_timer.stop()
+        if hasattr(self, "tick_worker"):
+            self.tick_worker.stop()
+            self.tick_worker.wait(1000)
+
+        if hasattr(self, "live_analyzer"):
+            self.live_analyzer.stop()
+            self.live_analyzer.wait(2000)
+
+        p, s = self.pos(), self.size()
+        print("💾 Speichere Hauptfenster win_main...")
+        self.state_manager.save_window_geometry(
+            "win_main", p.x(), p.y(), s.width(), s.height(), self.isMaximized()
+        )
+
+        # Alle offenen PersistentWindow-Instanzen speichern und schliessen
+        # (ServiceWindow, StatisticWindow, etc. - haben keinen Qt-Parent mehr,
+        #  daher muessen sie explizit geschlossen werden)
+        from persistent_win import _open_windows as pw_open_windows
+        for sub_win in list(pw_open_windows):
+            try:
+                sub_win.save_state()
+                sub_win.close()
+            except Exception as e:
+                print(f"⚠️ Fehler beim Schliessen von Sub-Window: {e}")
+
+        # Chart-Fenster schliessen (die haben eigene save_state-Logik)
+        for win in list(self.chart_windows):
+            try:
+                win.close()
+            except Exception as e:
+                print(f"⚠️ Fehler beim Schliessen von Fenster {win.instance_id}: {e}")
+
+        event.accept()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
+```
+
+--------------------------------------------------
+
+### DATEI: persistent_win.py
+```py
+# persistent_win.py
+"""
+Basisklasse fuer Fenster mit automatischem State Persistence (Save/Restore).
+Jedes Fenster mit einer INSTANCE_ID erbt von PersistentWindow und
+bekommt automatisch:
+- Geometrie-Save/Restore (Position, Groesse, Maximiert)
+- Symbol/Timeframe-Save/Restore (fuer Filter)
+- Automatisches Speichern beim Schliessen
+- Zentrale Registry fuer MainWindow.closeEvent
+- Klassen-Registry fuer generische Wiederherstellung ohne Hardcoding
+"""
+
+from typing import Any, Dict, Optional, ClassVar, Set, Type
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QMainWindow, QApplication
+
+from state_manager import StateManager
+
+
+# Registry aller offenen PersistentWindow-Instanzen
+_open_windows: Set['PersistentWindow'] = set()
+
+# Klassen-Registry fuer automatische Wiederherstellung (instance_id -> Klasse)
+_window_registry: Dict[str, Type['PersistentWindow']] = {}
+
+
+def register_persistent_window(
+    auto_restore: bool = True,
+) -> callable:
+    """
+    Dekorator zur Registrierung von PersistentWindow-Subklassen.
+    
+    Args:
+        auto_restore: Ob das Fenster beim App-Start automatisch geöffnet werden soll.
+                      (z.B. ServiceWindow soll gespeichert, aber nicht automatisch geöffnet werden)
+    """
+    def decorator(cls: Type['PersistentWindow']) -> Type['PersistentWindow']:
+        if cls.INSTANCE_ID:
+            _window_registry[cls.INSTANCE_ID] = cls
+            cls._auto_restore = auto_restore
+        return cls
+    return decorator
+
+
+def save_all_persistent_windows():
+    """Speichert alle offenen PersistentWindow-Instanzen (wird von MainWindow.closeEvent gerufen)."""
+    for w in list(_open_windows):
+        try:
+            w.save_state()
+        except (RuntimeError, AttributeError):
+            pass
+
+
+class PersistentWindow(QMainWindow):
+    """Basisklasse fuer Fenster mit automatischem State Persistence."""
+
+    INSTANCE_ID: ClassVar[str] = ""
+    _auto_restore: ClassVar[bool] = True
+
+    def __init__(self, parent=None, state_manager: Optional[StateManager] = None):
+        # WICHTIG: KEIN Parent übergeben! Ein Fenster mit Parent (z.B. MainWindow)
+        # hat unter Windows keinen eigenen Taskleisten-Eintrag und bleibt immer
+        # über dem Parent-Fenster. Stattdessen wird parent nur für die Logik
+        # (Zugriff auf state_manager) verwendet.
+        super().__init__()
+        self._state_manager: StateManager = state_manager or getattr(parent, 'state_manager', None) or StateManager()
+        self._restored_is_maximized: bool = False
+
+        # In Registry eintragen
+        _open_windows.add(self)
+
+    @classmethod
+    def get_registered_class(cls, instance_id: str) -> Optional[Type['PersistentWindow']]:
+        """Gibt die registrierte Klasse fuer eine INSTANCE_ID zurueck (oder None)."""
+        return _window_registry.get(instance_id)
+
+    @classmethod
+    def should_auto_restore(cls, instance_id: str) -> bool:
+        """Ob ein Fenster mit dieser ID automatisch wiederhergestellt werden soll."""
+        cls_type = _window_registry.get(instance_id)
+        if cls_type is not None:
+            return getattr(cls_type, '_auto_restore', True)
+        return True
+
+    @classmethod
+    def get_existing_instance(cls) -> Optional['PersistentWindow']:
+        """Gibt die erste offene Instanz dieser Klasse zurueck (oder None).
+        
+        Ermoeglicht Singleton-Verhalten fuer Subklassen (z.B. ServiceWindow,
+        StatisticWindow): Statt ein neues Fenster zu oeffnen, wird die
+        bestehende Instanz in den Vordergrund geholt.
+        """
+        for w in list(_open_windows):
+            try:
+                if type(w) is cls and w.isVisible():
+                    return w
+            except (RuntimeError, AttributeError):
+                continue
+        return None
+
+    def _fix_window_flags(self) -> None:
+        """Stellt sicher, dass das Fenster als normales Top-Level-Fenster
+        (Qt.Window) konfiguriert ist und nicht als Tool/Dialog.
+        
+        Wichtig: Qt.Dialog | Qt.Tool sind bei QMainWindow immer gesetzt
+        und können nicht entfernt werden. Das ist normales Qt-Verhalten.
+        Ein Fenster ohne Parent hat automatisch einen Taskleisten-Eintrag.
+        """
+        # Nur prüfen, ob Qt.Window gesetzt ist (sollte immer der Fall sein)
+        if not (self.windowFlags() & Qt.Window):
+            self.setWindowFlags(self.windowFlags() | Qt.Window)
+
+    @property
+    def state_manager(self) -> StateManager:
+        return self._state_manager
+
+    def get_instance_id(self) -> str:
+        return self.INSTANCE_ID
+
+    def get_persistent_symbol(self) -> str:
+        """Ueberschreiben in Subklassen fuer Symbol-Filter-Restore."""
+        return ""
+
+    def get_persistent_timeframe(self) -> str:
+        """Ueberschreiben in Subklassen fuer Timeframe-Filter-Restore."""
+        return ""
+
+    def restore_state(self) -> None:
+        """Stellt Fenstergeometrie und Filter wieder her.
+        
+        Achtung: Ruft NICHT showMaximized() auf, da dies das Fenster in den
+        Vordergrund bringen wuerde. Der Aufrufer (z.B. restore_all_windows)
+        muss showMaximized() separat aufrufen, wenn is_maximized=True ist.
+        """
+        inst_id = self.get_instance_id()
+        if not inst_id:
+            return
+
+        # Window-Flags korrigieren (QUiLoader setzt oft Qt.Tool | Qt.Dialog,
+        # was Taskleisten-Eintrag unterdrückt und Fenster über Parent hält)
+        self._fix_window_flags()
+
+        # Geometrie
+        geom = self._state_manager.get_window_geometry(inst_id)
+        if geom:
+            pos_x = geom.get("pos_x")
+            pos_y = geom.get("pos_y")
+            width = geom.get("width") or self.width()
+            height = geom.get("height") or self.height()
+
+            screen_geo = QApplication.primaryScreen().availableGeometry()
+            if pos_x is not None and pos_y is not None:
+                if pos_x < screen_geo.x() - 100 or pos_x > screen_geo.right() or \
+                   pos_y < screen_geo.y() - 100 or pos_y > screen_geo.bottom():
+                    pos_x, pos_y = 100, 100
+                self.move(pos_x, pos_y)
+                self.resize(width, height)
+
+            # is_maximized wird NICHT hier ausgewertet, sondern vom Aufrufer
+            self._restored_is_maximized = geom.get("is_maximized", False)
+
+        # Symbol/Timeframe aus instance_states
+        all_inst = self._state_manager.load_all_instances()
+        matched = next((i for i in all_inst if i.get("instance_id") == inst_id), None)
+        if matched:
+            raw_symbol = matched.get("symbol")
+            raw_tf = matched.get("timeframe")
+            symbol = str(raw_symbol) if raw_symbol is not None else self.get_persistent_symbol()
+            tf = str(raw_tf) if raw_tf is not None else self.get_persistent_timeframe()
+            self._apply_persistent_filters(symbol, tf)
+
+    def _apply_persistent_filters(self, symbol: str, timeframe: str) -> None:
+        """Ueberschreiben in Subklassen um Filter anzuwenden."""
+        pass
+
+    def save_state(self) -> None:
+        """Speichert Fenstergeometrie (und ggf. Filter)."""
+        inst_id = self.get_instance_id()
+        if not inst_id:
+            return
+
+        p, s = self.pos(), self.size()
+        self._state_manager.save_window_geometry(
+            inst_id, p.x(), p.y(), s.width(), s.height(), self.isMaximized()
+        )
+
+        symbol = self.get_persistent_symbol()
+        tf = self.get_persistent_timeframe()
+        if symbol and tf:
+            self._state_manager.save_instance_state(
+                instance_id=inst_id,
+                symbol=symbol,
+                timeframe=tf,
+            )
+
+    def closeEvent(self, event) -> None:
+        """Beim manuellen Schliessen: State speichern, DB-Eintrag loeschen.
+        
+        Nur beim App-Beenden (_is_quitting) bleibt der Eintrag erhalten,
+        damit das Fenster beim naechsten Start wiederhergestellt wird.
+        """
+        self.save_state()
+
+        # DB-Eintrag nur loeschen, wenn die App NICHT insgesamt beendet wird
+        app = QApplication.instance()
+        is_quitting = getattr(app, '_is_quitting', False) if app else False
+        if not is_quitting:
+            inst_id = self.get_instance_id()
+            if inst_id:
+                try:
+                    self._state_manager.delete_instance(inst_id)
+                except Exception:
+                    pass
+
+        _open_windows.discard(self)
+        super().closeEvent(event)
+
+```
+
+--------------------------------------------------
+
+### DATEI: properties_win.py
+```py
+# properties_win.py
+"""
+Properties-Fenster für PyTrader – nicht-modale Konfiguration der App-Einstellungen.
+Mit automatischem State Persistence via PersistentWindow.
+"""
+
+from pathlib import Path
+from typing import Optional
+
+from PySide6.QtCore import QTimer, Slot
+from PySide6.QtWidgets import (
+    QFormLayout, QHBoxLayout, QLabel, QMainWindow,
+    QPushButton, QSpinBox, QVBoxLayout, QWidget,
+)
+
+from config.app_settings import AppSettings
+from persistent_win import PersistentWindow, register_persistent_window
+from state_manager import StateManager
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+@register_persistent_window()
+class PropertiesWindow(PersistentWindow):
+    INSTANCE_ID = "win_properties"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._state_mgr: StateManager = getattr(parent, 'state_manager', None) or StateManager()
+        self._settings: AppSettings = self._state_mgr.get_app_settings()
+
+        self.setWindowTitle("PyTrader - Optionen")
+        self.setMinimumWidth(420)
+
+        # Zentral-Widget
+        central = QWidget(self)
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+
+        # Form
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        self.spin_chart_limit = QSpinBox()
+        self.spin_chart_limit.setRange(100, 50000)
+        self.spin_chart_limit.setSingleStep(100)
+        self.spin_chart_limit.setValue(self._settings.chart_candle_limit)
+        form.addRow("Chart-Candles (max):", self.spin_chart_limit)
+
+        self.spin_feature_limit = QSpinBox()
+        self.spin_feature_limit.setRange(100, 50000)
+        self.spin_feature_limit.setSingleStep(100)
+        self.spin_feature_limit.setValue(self._settings.feature_builder_limit)
+        form.addRow("Feature-Builder Candles:", self.spin_feature_limit)
+
+        self.spin_scanner_limit = QSpinBox()
+        self.spin_scanner_limit.setRange(1000, 500000)
+        self.spin_scanner_limit.setSingleStep(1000)
+        self.spin_scanner_limit.setValue(self._settings.scanner_candle_limit)
+        form.addRow("Scanner Candles (max):", self.spin_scanner_limit)
+
+        self.spin_stats_limit = QSpinBox()
+        self.spin_stats_limit.setRange(100, 100000)
+        self.spin_stats_limit.setSingleStep(100)
+        self.spin_stats_limit.setValue(self._settings.statistics_signal_limit)
+        form.addRow("Statistik-Signale (max):", self.spin_stats_limit)
+
+        self.spin_marker_limit = QSpinBox()
+        self.spin_marker_limit.setRange(50, 5000)
+        self.spin_marker_limit.setSingleStep(50)
+        self.spin_marker_limit.setValue(self._settings.signal_marker_limit)
+        form.addRow("Chart-Marker (max):", self.spin_marker_limit)
+
+        self.spin_page_size = QSpinBox()
+        self.spin_page_size.setRange(10, 500)
+        self.spin_page_size.setSingleStep(10)
+        self.spin_page_size.setValue(self._settings.statistics_page_size)
+        form.addRow("Statistik-Seitengröße:", self.spin_page_size)
+
+        layout.addLayout(form)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_save = QPushButton("💾 Speichern")
+        btn_save.clicked.connect(self._save_settings)
+        btn_layout.addWidget(btn_save)
+
+        btn_close = QPushButton("Schließen")
+        btn_close.clicked.connect(self.close)
+        btn_layout.addWidget(btn_close)
+
+        layout.addLayout(btn_layout)
+        layout.addStretch()
+
+        # State asynchron wiederherstellen
+        QTimer.singleShot(0, self.restore_state)
+
+    def _save_settings(self) -> None:
+        self._settings = AppSettings(
+            chart_candle_limit=self.spin_chart_limit.value(),
+            feature_builder_limit=self.spin_feature_limit.value(),
+            scanner_candle_limit=self.spin_scanner_limit.value(),
+            statistics_signal_limit=self.spin_stats_limit.value(),
+            signal_marker_limit=self.spin_marker_limit.value(),
+            statistics_page_size=self.spin_page_size.value(),
+        )
+        self._state_mgr.save_app_settings(self._settings)
+        print(f"✅ Einstellungen gespeichert: {self._settings}")
+
+    def get_settings(self) -> AppSettings:
+        """Gibt die aktuell geladenen Einstellungen zurück."""
+        return self._settings
+
+    def closeEvent(self, event):
+        super().closeEvent(event)
+
+```
+
+--------------------------------------------------
+
+### DATEI: service_win.py
+```py
+# service_win.py
+"""
+Service-Kontrollfenster für PyTrader.
+Steuert den Historical Scanner (Full-Scan / Delta-Update) über ein separates Fenster.
+Mit automatischem State Persistence via PersistentWindow.
+"""
+
+from pathlib import Path
+from typing import Optional
+
+from PySide6.QtCore import QFile, QIODevice, QTimer, Slot
+from PySide6.QtUiTools import QUiLoader
+from PySide6.QtWidgets import (
+    QCheckBox, QComboBox, QLabel, QMainWindow,
+    QProgressBar, QPushButton, QTextEdit, QWidget,
+)
+
+from analytics.background_workers.historical_scanner import HistoricalScanner
+from persistent_win import PersistentWindow, register_persistent_window
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+@register_persistent_window(auto_restore=False)
+class ServiceWindow(PersistentWindow):
+    INSTANCE_ID = "win_service"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.scanner: Optional[HistoricalScanner] = None
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_seconds = 0
+        self._elapsed_timer.timeout.connect(self._update_elapsed)
+
+        # UI laden
+        ui_file = QFile(str(BASE_DIR / "ui" / "service_win.ui"))
+        if ui_file.open(QIODevice.ReadOnly):
+            loader = QUiLoader()
+            self.ui = loader.load(ui_file)
+            ui_file.close()
+            self.setCentralWidget(self.ui)
+        else:
+            self.ui = QWidget(self)
+            self.setCentralWidget(self.ui)
+
+        self.setWindowTitle("PyTrader - Service Kontrolle")
+
+        # Controls
+        self.combo_symbol: QComboBox = self.ui.findChild(QComboBox, "combo_symbol")
+        self.check_new_scan: QCheckBox = self.ui.findChild(QCheckBox, "check_new_scan")
+        self.check_grid_scan: QCheckBox = self.ui.findChild(QCheckBox, "check_grid_scan")
+        self.btn_start: QPushButton = self.ui.findChild(QPushButton, "btn_start_scan")
+        self.label_elapsed: QLabel = self.ui.findChild(QLabel, "label_elapsed_value")
+        self.progress_bar: QProgressBar = self.ui.findChild(QProgressBar, "progress_bar")
+        self.text_log: QTextEdit = self.ui.findChild(QTextEdit, "text_log")
+
+        if self.btn_start:
+            self.btn_start.clicked.connect(self.start_scan)
+
+        # Sofort speichern bei Symbol-Änderung
+        if self.combo_symbol:
+            self.combo_symbol.currentTextChanged.connect(self.save_state)
+
+        # State asynchron wiederherstellen (nach show(), damit move/resize vom Window-Manager akzeptiert werden)
+        QTimer.singleShot(0, self.restore_state)
+
+    # --- PersistentWindow-Interface ---
+
+    def get_persistent_symbol(self) -> str:
+        return self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
+
+    def get_persistent_timeframe(self) -> str:
+        return "H1"
+
+    def _apply_persistent_filters(self, symbol: str, timeframe: str) -> None:
+        if self.combo_symbol:
+            idx = self.combo_symbol.findText(symbol)
+            if idx >= 0:
+                self.combo_symbol.setCurrentIndex(idx)
+
+    # --- Scanner ---
+
+    @Slot()
+    def start_scan(self):
+        if self.scanner and self.scanner.isRunning():
+            self.log("Scan laeuft bereits.")
+            return
+
+        symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
+        new_scan = self.check_new_scan.isChecked() if self.check_new_scan else False
+        grid_scan = self.check_grid_scan.isChecked() if self.check_grid_scan else False
+
+        mode = "GRID PROXIMITY" if grid_scan else "EMA+ATR STANDARD"
+        self.log(f"Starte {mode}-Scan: {symbol}, New Scan = {new_scan}")
+        self.btn_start.setEnabled(False)
+        self._elapsed_seconds = 0
+        self.label_elapsed.setText("00:00:00")
+        self.progress_bar.setValue(0)
+        self._elapsed_timer.start(1000)
+
+        self.scanner = HistoricalScanner(symbol, new_scan, grid_scan)
+        self.scanner.progress_updated.connect(self.on_progress)
+        self.scanner.scan_finished.connect(self.on_finished)
+        self.scanner.log_message.connect(self.log)
+        self.scanner.start()
+
+    @Slot(str, int, int)
+    def on_progress(self, message: str, current: int, total: int):
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(current)
+        self.log(message)
+
+    @Slot(str, int)
+    def on_finished(self, symbol: str, count: int):
+        self._elapsed_timer.stop()
+        self.btn_start.setEnabled(True)
+        self.log(f"Scan für {symbol} beendet: {count} Signale geschrieben.")
+
+    @Slot(str)
+    def log(self, message: str):
+        if self.text_log:
+            self.text_log.append(message)
+
+    def _update_elapsed(self):
+        self._elapsed_seconds += 1
+        h = self._elapsed_seconds // 3600
+        m = (self._elapsed_seconds % 3600) // 60
+        s = self._elapsed_seconds % 60
+        self.label_elapsed.setText(f"{h:02d}:{m:02d}:{s:02d}")
+
+    def closeEvent(self, event):
+        # PersistentWindow.save_state() wird in super().closeEvent gerufen
+        if self.scanner and self.scanner.isRunning():
+            self.scanner.stop()
+            self.scanner.wait(2000)
+        self._elapsed_timer.stop()
+        super().closeEvent(event)
+
+```
+
+--------------------------------------------------
+
+### DATEI: state_manager.py
+```py
+# state_manager.py
+
+"""
+state_manager.py - Persistence Manager with Symbol/TF Reset Support, Robust Schema Migration & Type Validation
+"""
+
+import json
+import os
+from typing import Any, Dict, List, Optional
+import duckdb
+import pandas as pd
+
+from db_service import _parse_json_field, DbPool
+from config.base_state_model import AbstractStateModel
+from config.app_settings import AppSettings
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_DB_PATH = os.path.join(BASE_DIR, "data", "app_data.duckdb")
+
+KEY_APP_SETTINGS = "app_settings"
+
+
+class StateManager:
+
+    def __init__(self, db_path: str = APP_DB_PATH) -> None:
+        self.db_path = db_path
+        self._init_db()
+
+    def _get_connection(self) -> duckdb.DuckDBPyConnection:
+        return DbPool.get(self.db_path)
+
+    def _init_db(self) -> None:
+        """Initialisiert die Tabellenstrukturen und f\u00fchrt eine saubere Schema-Migration durch."""
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        con = self._get_connection()
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS window_instances (
+                instance_id VARCHAR PRIMARY KEY,
+                preset_id VARCHAR,
+                window_title VARCHAR,
+                pos_x INTEGER,
+                pos_y INTEGER,
+                width INTEGER,
+                height INTEGER,
+                is_maximized BOOLEAN DEFAULT FALSE
+            );
+
+            CREATE TABLE IF NOT EXISTS instance_states (
+                instance_id VARCHAR PRIMARY KEY,
+                symbol VARCHAR NOT NULL,
+                timeframe VARCHAR NOT NULL,
+                visible_range_from BIGINT,
+                visible_range_to BIGINT,
+                visible_price_from DOUBLE,
+                visible_price_to DOUBLE,
+                indicators_state JSON,
+                measurement_state JSON,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS symbol_tf_states (
+                symbol VARCHAR NOT NULL,
+                timeframe VARCHAR NOT NULL,
+                visible_range_from BIGINT,
+                visible_range_to BIGINT,
+                visible_price_from DOUBLE,
+                visible_price_to DOUBLE,
+                indicators_state JSON,
+                measurement_state JSON,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (symbol, timeframe)
+            );
+
+            CREATE TABLE IF NOT EXISTS indicator_presets (
+                indicator_id VARCHAR NOT NULL,
+                preset_name VARCHAR NOT NULL,
+                params JSON NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (indicator_id, preset_name)
+            );
+
+            CREATE TABLE IF NOT EXISTS global_settings (
+                key VARCHAR PRIMARY KEY,
+                value JSON NOT NULL
+            );
+        """)
+
+        # Explicit Column Check via information_schema
+        tables_to_migrate = ["instance_states", "symbol_tf_states"]
+        columns_to_check = ["indicators_state", "measurement_state"]
+
+        for table in tables_to_migrate:
+            existing_cols = con.execute(f"""
+                SELECT LOWER(column_name)
+                FROM information_schema.columns
+                WHERE LOWER(table_name) = '{table.lower()}'
+            """).fetchall()
+            existing_col_names = [col[0] for col in existing_cols]
+
+            for col_name in columns_to_check:
+                if col_name.lower() not in existing_col_names:
+                    try:
+                        con.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} JSON")
+                        print(f"[MIGRATION] Spalte '{col_name}' (JSON) zur Tabelle '{table}' hinzugefuegt.")
+                    except Exception as e:
+                        print(f"[MIGRATION WARNUNG] Spalte '{col_name}' konnte nicht hinzugefuegt werden: {e}")
+
+    def get_next_instance_id(self) -> str:
+        con = self._get_connection()
+        res = con.execute("SELECT instance_id FROM window_instances").fetchall()
+        existing_ids = [r[0] for r in res]
+        count = 1
+        while f"win_{count}" in existing_ids:
+            count += 1
+        return f"win_{count}"
+
+    def delete_instance(self, instance_id: str) -> None:
+        con = self._get_connection()
+        con.execute("DELETE FROM instance_states WHERE instance_id = ?", [instance_id])
+        con.execute("DELETE FROM window_instances WHERE instance_id = ?", [instance_id])
+
+    def delete_symbol_tf_state(self, symbol: str, timeframe: str) -> None:
+        con = self._get_connection()
+        con.execute(
+            "DELETE FROM symbol_tf_states WHERE symbol = CAST(? AS VARCHAR) AND timeframe = CAST(? AS VARCHAR)",
+            [symbol, timeframe]
+        )
+
+    def save_instance_state(
+        self,
+        instance_id: str,
+        symbol: str,
+        timeframe: str,
+        visible_range_from: Optional[int] = None,
+        visible_range_to: Optional[int] = None,
+        visible_price_from: Optional[float] = None,
+        visible_price_to: Optional[float] = None,
+        indicators_state: Optional[Dict[str, Any]] = None,
+        measurement_state: Optional[Dict[str, Any]] = None
+    ) -> None:
+        con = self._get_connection()
+        ind_json = json.dumps(indicators_state) if indicators_state is not None else None
+        meas_json = json.dumps(measurement_state) if measurement_state is not None else None
+        con.execute("""
+            INSERT INTO instance_states (
+                instance_id, symbol, timeframe, visible_range_from, visible_range_to,
+                visible_price_from, visible_price_to, indicators_state, measurement_state, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT (instance_id) DO UPDATE SET
+                symbol = EXCLUDED.symbol,
+                timeframe = EXCLUDED.timeframe,
+                visible_range_from = EXCLUDED.visible_range_from,
+                visible_range_to = EXCLUDED.visible_range_to,
+                visible_price_from = EXCLUDED.visible_price_from,
+                visible_price_to = EXCLUDED.visible_price_to,
+                indicators_state = EXCLUDED.indicators_state,
+                measurement_state = EXCLUDED.measurement_state,
+                updated_at = EXCLUDED.updated_at;
+        """, [
+            instance_id, symbol, timeframe, visible_range_from, visible_range_to,
+            visible_price_from, visible_price_to, ind_json, meas_json
+        ])
+
+    def save_symbol_tf_state(
+        self,
+        symbol: str,
+        timeframe: str,
+        visible_range_from: Optional[int] = None,
+        visible_range_to: Optional[int] = None,
+        visible_price_from: Optional[float] = None,
+        visible_price_to: Optional[float] = None,
+        indicators_state: Optional[Dict[str, Any]] = None,
+        measurement_state: Optional[Dict[str, Any]] = None
+    ) -> None:
+        con = self._get_connection()
+        ind_json = json.dumps(indicators_state) if indicators_state is not None else None
+        meas_json = json.dumps(measurement_state) if measurement_state is not None else None
+        con.execute("""
+            INSERT INTO symbol_tf_states (
+                symbol, timeframe, visible_range_from, visible_range_to,
+                visible_price_from, visible_price_to, indicators_state, measurement_state, updated_at
+            ) VALUES (CAST(? AS VARCHAR), CAST(? AS VARCHAR), ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT (symbol, timeframe) DO UPDATE SET
+                visible_range_from = EXCLUDED.visible_range_from,
+                visible_range_to = EXCLUDED.visible_range_to,
+                visible_price_from = EXCLUDED.visible_price_from,
+                visible_price_to = EXCLUDED.visible_price_to,
+                indicators_state = EXCLUDED.indicators_state,
+                measurement_state = EXCLUDED.measurement_state,
+                updated_at = EXCLUDED.updated_at;
+        """, [
+            symbol, timeframe, visible_range_from, visible_range_to,
+            visible_price_from, visible_price_to, ind_json, meas_json
+        ])
+
+    def get_symbol_tf_state(self, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
+        con = self._get_connection()
+        res = con.execute("""
+            SELECT visible_range_from, visible_range_to, visible_price_from, visible_price_to, indicators_state, measurement_state
+            FROM symbol_tf_states
+            WHERE symbol = CAST(? AS VARCHAR) AND timeframe = CAST(? AS VARCHAR)
+        """, [symbol, timeframe]).fetchone()
+
+        if res:
+            v_from, v_to, p_from, p_to, ind_json, meas_json = res
+            ind_state = _parse_json_field(ind_json)
+            meas_state = _parse_json_field(meas_json)
+            return {
+                "visible_range_from": v_from,
+                "visible_range_to": v_to,
+                "visible_price_from": p_from,
+                "visible_price_to": p_to,
+                "indicators_state": ind_state,
+                "measurement_state": meas_state
+            }
+        return None
+
+    def save_window_geometry(
+        self,
+        instance_id: str,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        is_maximized: bool,
+        preset_id: Optional[str] = None
+    ) -> None:
+        con = self._get_connection()
+        con.execute("""
+            INSERT INTO window_instances (
+                instance_id, preset_id, window_title, pos_x, pos_y, width, height, is_maximized
+            ) VALUES (?, ?, 'PyTrader Window', ?, ?, ?, ?, ?)
+            ON CONFLICT (instance_id) DO UPDATE SET
+                pos_x = EXCLUDED.pos_x,
+                pos_y = EXCLUDED.pos_y,
+                width = EXCLUDED.width,
+                height = EXCLUDED.height,
+                is_maximized = EXCLUDED.is_maximized,
+                preset_id = EXCLUDED.preset_id;
+        """, [instance_id, preset_id, x, y, width, height, is_maximized])
+
+    def get_window_geometry(self, instance_id: str) -> Optional[Dict[str, Any]]:
+        """Liest die gespeicherte Fenstergeometrie einer spezifischen Instanz aus."""
+        con = self._get_connection()
+        res = con.execute("""
+            SELECT pos_x, pos_y, width, height, is_maximized
+            FROM window_instances
+            WHERE instance_id = ?
+        """, [instance_id]).fetchone()
+        if res and res[0] is not None:
+            return {
+                "pos_x": res[0],
+                "pos_y": res[1],
+                "width": res[2],
+                "height": res[3],
+                "is_maximized": bool(res[4])
+            }
+        return None
+
+    def load_all_instances(self) -> List[Dict[str, Any]]:
+        con = self._get_connection()
+        query = """
+            SELECT
+                w.instance_id, w.preset_id, w.pos_x, w.pos_y, w.width, w.height, w.is_maximized,
+                CAST(s.symbol AS VARCHAR) AS symbol,
+                CAST(s.timeframe AS VARCHAR) AS timeframe,
+                s.visible_range_from, s.visible_range_to,
+                s.visible_price_from, s.visible_price_to, s.indicators_state, s.measurement_state,
+                s.updated_at
+            FROM window_instances w
+            LEFT JOIN instance_states s ON w.instance_id = s.instance_id
+            ORDER BY s.updated_at ASC;
+        """
+        df = con.execute(query).df()
+        records = df.to_dict(orient="records")
+        for rec in records:
+            if "symbol" in rec and rec["symbol"] is not None and not isinstance(rec["symbol"], str):
+                rec["symbol"] = str(rec["symbol"]) if not pd.isna(rec["symbol"]) else None
+            if "timeframe" in rec and rec["timeframe"] is not None and not isinstance(rec["timeframe"], str):
+                rec["timeframe"] = str(rec["timeframe"]) if not pd.isna(rec["timeframe"]) else None
+        return records
+
+    def get_indicator_preset(self, indicator_id: str, preset_name: str) -> Optional[Dict[str, Any]]:
+        con = self._get_connection()
+        res = con.execute(
+            "SELECT params FROM indicator_presets WHERE indicator_id = ? AND preset_name = ?",
+            [indicator_id, preset_name]
+        ).fetchone()
+        if res and res[0]:
+            return _parse_json_field(res[0])
+        return None
+
+    def save_indicator_preset(self, indicator_id: str, preset_name: str, params: Dict[str, Any]) -> None:
+        con = self._get_connection()
+        con.execute("""
+            INSERT INTO indicator_presets (indicator_id, preset_name, params)
+            VALUES (?, ?, ?)
+            ON CONFLICT (indicator_id, preset_name) DO UPDATE SET
+                params = EXCLUDED.params;
+        """, [indicator_id, preset_name, json.dumps(params)])
+
+    def delete_indicator_preset(self, indicator_id: str, preset_name: str) -> None:
+        con = self._get_connection()
+        con.execute(
+            "DELETE FROM indicator_presets WHERE indicator_id = ? AND preset_name = ?",
+            [indicator_id, preset_name]
+        )
+
+    def list_indicator_presets(self, indicator_id: str) -> List[str]:
+        con = self._get_connection()
+        res = con.execute(
+            "SELECT preset_name FROM indicator_presets WHERE indicator_id = ? ORDER BY preset_name ASC",
+            [indicator_id]
+        ).fetchall()
+        presets = [r[0] for r in res]
+        if "Default" not in presets:
+            presets.insert(0, "Default")
+        return presets
+
+    def get_app_settings(self) -> AppSettings:
+        """L\u00e4dt AppSettings aus der DB oder gibt Defaults zur\u00fcck."""
+        con = self._get_connection()
+        row = con.execute(
+            "SELECT value FROM global_settings WHERE key = ?",
+            [KEY_APP_SETTINGS]
+        ).fetchone()
+        if row and row[0]:
+            raw = row[0]
+            data = _parse_json_field(raw)
+            return AppSettings.from_dict(data)
+        return AppSettings()
+
+    def save_app_settings(self, settings: AppSettings) -> None:
+        """Speichert AppSettings in der DB."""
+        con = self._get_connection()
+        con.execute("""
+            INSERT INTO global_settings (key, value)
+            VALUES (?, ?)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """, [KEY_APP_SETTINGS, json.dumps(settings.to_dict())])
+
+```
+
+--------------------------------------------------
+
+### DATEI: statistic_win.py
+```py
+# statistic_win.py
+"""
+Statistik-Fenster für PyTrader – Nicht-modale Analyse-Umgebung
+mit dynamischer Filterung, Summary-Karten, Detail-Tabelle und Paging.
+Mit automatischem State Persistence via PersistentWindow.
+"""
+
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from PySide6.QtCore import QFile, QIODevice, QTimer, Slot
+from PySide6.QtGui import QColor
+from PySide6.QtUiTools import QUiLoader
+from PySide6.QtWidgets import (
+    QApplication, QComboBox, QHeaderView, QLabel, QMainWindow,
+    QPushButton, QTableWidget, QTableWidgetItem, QWidget,
+)
+
+from analytics.statistics_repository import StatisticsRepository
+from persistent_win import PersistentWindow, register_persistent_window
+from state_manager import StateManager
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+@register_persistent_window()
+class StatisticWindow(PersistentWindow):
+    INSTANCE_ID = "win_statistics"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.repo = StatisticsRepository()
+        self._state_mgr: StateManager = getattr(parent, 'state_manager', None) or StateManager()
+        self.settings = self._state_mgr.get_app_settings()
+
+        # Paging-State
+        self._all_signals: List[Dict[str, Any]] = []
+        self._current_page: int = 0
+        self._total_pages: int = 0
+
+        # UI laden
+        ui_file = QFile(str(BASE_DIR / "ui" / "statistic_win.ui"))
+        if ui_file.open(QIODevice.ReadOnly):
+            loader = QUiLoader()
+            self.ui = loader.load(ui_file)
+            ui_file.close()
+            self.setCentralWidget(self.ui)
+        else:
+            self.ui = QWidget(self)
+            self.setCentralWidget(self.ui)
+
+        self.setWindowTitle("PyTrader - Signal-Statistik")
+
+        # Controls
+        self.combo_symbol: QComboBox = self.ui.findChild(QComboBox, "combo_symbol_filter")
+        self.combo_tf: QComboBox = self.ui.findChild(QComboBox, "combo_tf_filter")
+        self.combo_signal: QComboBox = self.ui.findChild(QComboBox, "combo_signal_filter")
+        self.btn_refresh: QPushButton = self.ui.findChild(QPushButton, "btn_refresh_stats")
+
+        self.label_total: QLabel = self.ui.findChild(QLabel, "label_total_signals")
+        self.label_avg_conf: QLabel = self.ui.findChild(QLabel, "label_avg_confidence")
+        self.label_win_rate: QLabel = self.ui.findChild(QLabel, "label_win_rate")
+        self.label_best_tf: QLabel = self.ui.findChild(QLabel, "label_best_tf")
+
+        self.table: QTableWidget = self.ui.findChild(QTableWidget, "table_signals")
+
+        # Paging-Controls aus der UI
+        self.btn_prev: QPushButton = self.ui.findChild(QPushButton, "btn_prev_page")
+        self.btn_next: QPushButton = self.ui.findChild(QPushButton, "btn_next_page")
+        self.label_page: QLabel = self.ui.findChild(QLabel, "label_page_info")
+
+        # Signal-Sets laden
+        self._load_signal_sets()
+
+        # Events (nach restore_state, damit die gesetzten Filter keine refresh-Explosion auslösen)
+        if self.combo_symbol:
+            self.combo_symbol.currentTextChanged.connect(self._on_filter_changed)
+        if self.combo_tf:
+            self.combo_tf.currentTextChanged.connect(self._on_filter_changed)
+        if self.combo_signal:
+            self.combo_signal.currentTextChanged.connect(self.refresh)
+        if self.btn_refresh:
+            self.btn_refresh.clicked.connect(self.refresh)
+        if self.btn_prev:
+            self.btn_prev.clicked.connect(self._prev_page)
+        if self.btn_next:
+            self.btn_next.clicked.connect(self._next_page)
+        if self.table:
+            self.table.itemDoubleClicked.connect(self.on_item_double_clicked)
+
+        # State asynchron wiederherstellen (nach show(), damit move/resize vom Window-Manager akzeptiert werden)
+        QTimer.singleShot(0, self.restore_state)
+
+        # Initial laden
+        QTimer.singleShot(100, self.refresh)
+
+    # --- PersistentWindow-Interface ---
+
+    def get_persistent_symbol(self) -> str:
+        return self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
+
+    def get_persistent_timeframe(self) -> str:
+        return self.combo_tf.currentText() if self.combo_tf else "H1"
+
+    def _apply_persistent_filters(self, symbol: str, timeframe: str) -> None:
+        """Wird von PersistentWindow.restore_state() gerufen."""
+        self._restore_filters(symbol, timeframe)
+
+    def _on_filter_changed(self):
+        """Speichert sofort bei Filter-Änderung und löst refresh aus."""
+        self.save_state()
+        self.refresh()
+
+    def _restore_filters(self, symbol: Optional[str] = None, timeframe: Optional[str] = None):
+        """Setzt Filter aus gespeicherten Werten (blockiert Signale)."""
+        if self.combo_symbol:
+            self.combo_symbol.blockSignals(True)
+        if self.combo_tf:
+            self.combo_tf.blockSignals(True)
+
+        if symbol and self.combo_symbol:
+            idx = self.combo_symbol.findText(symbol)
+            if idx >= 0:
+                self.combo_symbol.setCurrentIndex(idx)
+        if timeframe and self.combo_tf:
+            idx = self.combo_tf.findText(timeframe)
+            if idx >= 0:
+                self.combo_tf.setCurrentIndex(idx)
+
+        if self.combo_symbol:
+            self.combo_symbol.blockSignals(False)
+        if self.combo_tf:
+            self.combo_tf.blockSignals(False)
+
+    # --- Paging ---
+
+    def _update_page_controls(self):
+        if not self.btn_prev or not self.btn_next or not self.label_page:
+            return
+        self.label_page.setText(f"Seite {self._current_page + 1} / {max(self._total_pages, 1)}")
+        self.btn_prev.setEnabled(self._current_page > 0)
+        self.btn_next.setEnabled(self._current_page < self._total_pages - 1)
+
+    @Slot()
+    def _prev_page(self):
+        if self._current_page > 0:
+            self._current_page -= 1
+            self._render_current_page()
+
+    @Slot()
+    def _next_page(self):
+        if self._current_page < self._total_pages - 1:
+            self._current_page += 1
+            self._render_current_page()
+
+    def _render_current_page(self):
+        page_size = self.settings.statistics_page_size
+        start = self._current_page * page_size
+        end = min(start + page_size, len(self._all_signals))
+        page_signals = self._all_signals[start:end]
+        self._populate_table(page_signals, start)
+        self._update_page_controls()
+
+    # --- Daten laden ---
+
+    def _load_signal_sets(self):
+        if not self.combo_signal:
+            return
+        self.combo_signal.blockSignals(True)
+        self.combo_signal.clear()
+        self.combo_signal.addItem("ALLE")
+        for s in self.repo.get_available_sets():
+            self.combo_signal.addItem(s)
+        self.combo_signal.blockSignals(False)
+
+    @Slot()
+    def refresh(self):
+        symbol = self.combo_symbol.currentText() if self.combo_symbol else "ALLE"
+        tf = self.combo_tf.currentText() if self.combo_tf else "ALLE"
+        source = self.combo_signal.currentText() if self.combo_signal else None
+        if source == "ALLE":
+            source = None
+
+        # Summary
+        summary = self.repo.get_summary(symbol, tf, source)
+        if self.label_total:
+            self.label_total.setText(str(summary["total_signals"]))
+        if self.label_avg_conf:
+            self.label_avg_conf.setText(f"{summary['avg_confidence']:.2f}")
+        if self.label_win_rate:
+            self.label_win_rate.setText(f"{summary['win_rate']:.1f}%")
+        if self.label_best_tf:
+            self.label_best_tf.setText(summary["best_tf"])
+
+        # Signale mit Paging
+        self._all_signals = self.repo.fetch_signals(symbol, tf, source, limit=self.settings.statistics_signal_limit)
+        self._total_pages = max(1, (len(self._all_signals) + self.settings.statistics_page_size - 1) // self.settings.statistics_page_size)
+        self._current_page = 0
+        self._render_current_page()
+
+    def _populate_table(self, signals: List[Dict[str, Any]], row_offset: int = 0):
+        if not self.table:
+            return
+
+        self.table.setUpdatesEnabled(False)
+        self.table.setRowCount(len(signals))
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels([
+            "Time", "Symbol", "Timeframe", "Signal-Set", "Confidence", "Outcome"
+        ])
+
+        for row_idx, sig in enumerate(signals):
+            global_row = row_offset + row_idx + 1
+            self.table.setVerticalHeaderItem(row_idx, QTableWidgetItem(str(global_row)))
+
+            dt = datetime.fromtimestamp(sig["time"])
+            self.table.setItem(row_idx, 0, QTableWidgetItem(dt.strftime("%Y-%m-%d %H:%M")))
+            self.table.setItem(row_idx, 1, QTableWidgetItem(sig["symbol"]))
+            self.table.setItem(row_idx, 2, QTableWidgetItem(sig["timeframe"]))
+            self.table.setItem(row_idx, 3, QTableWidgetItem(sig["source_id"]))
+
+            conf_item = QTableWidgetItem(f"{sig['confidence']:.2f}")
+            conf_item.setData(0, sig["confidence"])
+            self.table.setItem(row_idx, 4, conf_item)
+
+            outcome = sig.get("outcome", "N/A")
+            outcome_item = QTableWidgetItem(outcome)
+            if outcome == "Win":
+                outcome_item.setForeground(QColor("#26a69a"))
+            elif outcome == "Loss":
+                outcome_item.setForeground(QColor("#ef5350"))
+            self.table.setItem(row_idx, 5, outcome_item)
+
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+
+        self.table.setUpdatesEnabled(True)
+
+    # --- Jump-to-Bar ---
+
+    def on_item_double_clicked(self, item: QTableWidgetItem):
+        row = item.row()
+        if row < 0:
+            return
+
+        symbol_item = self.table.item(row, 1)
+        tf_item = self.table.item(row, 2)
+        time_item = self.table.item(row, 0)
+
+        if not symbol_item or not tf_item or not time_item:
+            return
+
+        symbol = symbol_item.text()
+        tf = tf_item.text()
+
+        try:
+            dt = datetime.strptime(time_item.text(), "%Y-%m-%d %H:%M")
+            bar_time = int(dt.timestamp())
+        except ValueError:
+            return
+
+        main_window = self._find_main_window()
+        if main_window and hasattr(main_window, 'open_chart_at_bar'):
+            main_window.open_chart_at_bar(symbol, tf, bar_time)
+        elif main_window and hasattr(main_window, 'open_chart_window'):
+            main_window.open_chart_window()
+
+    def _find_main_window(self):
+        app = QApplication.instance()
+        if not app:
+            return None
+        for widget in app.topLevelWidgets():
+            if widget.metaObject().className() == "MainWindow":
+                return widget
+        return None
+
+```
+
+--------------------------------------------------
+
+### DATEI: .backup_A_generationsschutz/01_core.js
+```js
+// chart/js/01_core.js
+// Kern-Variablen, WebChannel-Bridge, Fenster-Fokus-Event & Fehlerbehandlung
+
+window.onerror = function(m, s, l, c, e) {
+    if (m === "Script error." && !s) return true;
+    console.error(`[JS ERROR] ${m} | L${l}:${c}`);
+    return true;
+};
+
+let chart = null, candleSeries = null, pyBridge = null, isUpdatingChart = false;
+let currentTfInSeconds = 3600, lastClosePrice = null, activeTimer = null, countdownTimer = null;
+let rawCandleData = [], currentSymbol = null, currentTimeframe = null;
+let gridPriceLines = [], dayLinesSeries = [], _storedCircleMarkers = null;
+let currentPriceLine = null, resizeTimeout = null;
+let currentPrecision = 2;
+let pendingRange = null;
+let _updateId = 0;
+let _continuousTimeMap = {};  // { cont_time: real_epoch } für tickMarkFormatter
+let _continuousKeys = [];     // sortierte cont-Schlüssel für resolveRealTime()
+// LWC v5: setMarkers() auf der Serie existiert nicht mehr – SeriesMarkers-Plugin verwenden
+let seriesMarkersPlugin = null;
+
+let isWindowActive = true;
+let lastRenderedPrice = null;
+let lastRenderedTop = null;
+let lastFormattedPriceStr = "";
+let lastFormattedTimeStr = "";
+
+const TF_SECONDS_MAP = { 'M1': 60, 'M2': 120, 'M5': 300, 'M10': 600, 'M15': 900, 'M30': 1800, 'H1': 3600, 'H4': 14400, 'D1': 86400, 'W1': 604800, 'MN1': 2592000 };
+
+// =============================================================================
+// resolveRealTime(): kontinuierliche (Fake-)Zeit -> echte epoch
+// WICHTIG: Bei unbekannten Werten (Padding-Ticks ausserhalb des Datensatzes)
+// NIE die Fake-Zeit selbst zurueckgeben – sonst zeigt die Zeitachse
+// irrefuehrende Labels (z. B. "30.7.26 23:58" an der Tagesgrenze, weil die
+// Fake-Zeit der 00:59-Candle als Realzeit formatiert wird).
+// Stattdessen wird der naechstgelegene bekannte Zeitpunkt verwendet.
+// =============================================================================
+function resolveRealTime(ts) {
+    if (ts === null || ts === undefined || typeof ts !== 'number' || !isFinite(ts)) return ts;
+    var direct = _continuousTimeMap[ts];
+    if (direct !== undefined) return direct;
+    if (_continuousKeys.length === 0) return ts;
+    var n = _continuousKeys.length;
+    if (ts <= _continuousKeys[0]) return _continuousTimeMap[_continuousKeys[0]];
+    if (ts >= _continuousKeys[n - 1]) return _continuousTimeMap[_continuousKeys[n - 1]];
+    var lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        var mid = (lo + hi) >> 1;
+        if (_continuousKeys[mid] === ts) return _continuousTimeMap[_continuousKeys[mid]];
+        if (_continuousKeys[mid] < ts) lo = mid + 1; else hi = mid - 1;
+    }
+    // hi = letzter Key < ts, lo = erster Key > ts
+    var a = _continuousKeys[hi], b = _continuousKeys[lo];
+    return (ts - a <= b - ts) ? _continuousTimeMap[a] : _continuousTimeMap[b];
+}
+
+if (typeof qt !== 'undefined') {
+    new QWebChannel(qt.webChannelTransport, function(channel) {
+        pyBridge = channel.objects.pyBridge;
+    });
+}
+
+window.addEventListener('focus', () => { isWindowActive = true; if(lastClosePrice !== null) updateCountdownDisplay(); });
+window.addEventListener('blur', () => { isWindowActive = false; });
+document.addEventListener('visibilitychange', () => {
+    isWindowActive = !document.hidden;
+    if (isWindowActive && lastClosePrice !== null) updateCountdownDisplay();
+});
+
+```
+
+--------------------------------------------------
+
+### DATEI: .backup_A_generationsschutz/04_live_updates.js
+```js
+// chart/js/04_live_updates.js
+// Live-Tick-Updates, Countdown-Badge, Price-Badge, Range-Sync & Resize-Handling
+
+function syncRanges() {
+    if (!chart || !pyBridge || isUpdatingChart) return;
+    try {
+        var lr = chart.timeScale().getVisibleLogicalRange();
+        if (lr && lr.from !== null && lr.to !== null && !isNaN(lr.from) && !isNaN(lr.to)) {
+            pyBridge.onRangeChanged(Math.floor(lr.from), Math.floor(lr.to));
+        }
+        var pr = chart.priceScale('right').getVisibleRange();
+        if (pr && pr.from !== null && pr.to !== null && !isNaN(pr.from) && !isNaN(pr.to)) {
+            pyBridge.onPriceRangeChanged(pr.from, pr.to);
+        }
+    } catch(e) {}
+}
+
+function updateCountdownDisplay() {
+    if (isUpdatingChart || !candleSeries || !chart || lastClosePrice === null || lastClosePrice === undefined) return;
+    if (!isWindowActive || document.hidden) return;
+
+    try {
+        var priceBadge = document.getElementById('price-badge');
+        var countdownBadge = document.getElementById('countdown-badge');
+        if (!priceBadge || !countdownBadge) return;
+
+        var showCountdown = (currentTfInSeconds > 0 && currentTfInSeconds < 86400);
+
+        // PriceLine auf der candleSeries
+        if (!currentPriceLine) {
+            currentPriceLine = candleSeries.createPriceLine({
+                price: lastClosePrice,
+                color: '#2962FF',
+                lineWidth: 1,
+                lineStyle: LightweightCharts.LineStyle.Dotted,
+                axisLabelVisible: false,
+                title: ''
+            });
+            lastRenderedPrice = lastClosePrice;
+        } else if (lastRenderedPrice !== lastClosePrice) {
+            currentPriceLine.applyOptions({ price: lastClosePrice, title: '' });
+            lastRenderedPrice = lastClosePrice;
+        }
+
+        var y = candleSeries.priceToCoordinate(lastClosePrice);
+        if (y !== null && !isNaN(y)) {
+            var formattedPrice = lastClosePrice.toFixed(currentPrecision);
+            var topPos = (y - 9) + 'px';
+
+            if (lastFormattedPriceStr !== formattedPrice) {
+                priceBadge.innerText = formattedPrice;
+                lastFormattedPriceStr = formattedPrice;
+            }
+            if (lastRenderedTop !== topPos) {
+                priceBadge.style.top = topPos;
+                countdownBadge.style.top = topPos;
+                lastRenderedTop = topPos;
+            }
+            if (priceBadge.style.display !== 'block') {
+                priceBadge.style.display = 'block';
+            }
+
+            if (showCountdown) {
+                var now = Math.floor(Date.now() / 1000);
+                var rem = currentTfInSeconds - (now % currentTfInSeconds);
+                var formattedTime = String(Math.floor(rem/60)).padStart(2,'0') + ':' + String(rem%60).padStart(2,'0');
+                if (lastFormattedTimeStr !== formattedTime) {
+                    countdownBadge.innerText = formattedTime;
+                    lastFormattedTimeStr = formattedTime;
+                }
+                var priceWidth = priceBadge.offsetWidth || 50;
+                var rightPos = (priceWidth + 8) + 'px';
+                if (countdownBadge.style.right !== rightPos) {
+                    countdownBadge.style.right = rightPos;
+                }
+                if (countdownBadge.style.display !== 'block') {
+                    countdownBadge.style.display = 'block';
+                }
+            } else {
+                if (countdownBadge.style.display !== 'none') countdownBadge.style.display = 'none';
+            }
+        } else {
+            if (priceBadge.style.display !== 'none') priceBadge.style.display = 'none';
+            if (countdownBadge.style.display !== 'none') countdownBadge.style.display = 'none';
+        }
+    } catch(e) {
+        var p = document.getElementById('price-badge');
+        var c = document.getElementById('countdown-badge');
+        if (p && p.style.display !== 'none') p.style.display = 'none';
+        if (c && c.style.display !== 'none') c.style.display = 'none';
+    }
+}
+
+function updateLiveCandle(json) {
+    if (!candleSeries || isUpdatingChart) return;
+    try {
+        var c = JSON.parse(json);
+        if (!c || typeof c.time !== 'number' || isNaN(c.time)) return;
+        if (c.open === null || c.high === null || c.low === null || c.close === null) return;
+        if (rawCandleData.length > 0 && c.time < rawCandleData[rawCandleData.length-1].time) return;
+        candleSeries.update(c);
+        lastClosePrice = c.close;
+        updateCountdownDisplay();
+    } catch(e) {}
+}
+
+function fitChartContent() { if(chart) chart.timeScale().fitContent(); }
+
+// =============================================================================
+// RESIZE-HANDLING
+// =============================================================================
+function handleResize() {
+    if (!chart) return;
+    var container = document.getElementById('chart-container');
+    if (!container) return;
+    var w = container.clientWidth;
+    var h = container.clientHeight;
+    if (w > 0 && h > 0) {
+        chart.resize(w, h);
+        try { _updateDaySeparatorPositions(); } catch(e) {}
+    }
+}
+
+var _resizeObserver = null;
+function setupResizeObserver() {
+    var container = document.getElementById('chart-container');
+    if (!container) return;
+    if (_resizeObserver) _resizeObserver.disconnect();
+    _resizeObserver = new ResizeObserver(function() { handleResize(); });
+    _resizeObserver.observe(container);
+}
+
+// =============================================================================
+// applyFullChartUpdate – Hauptfunktion
+// =============================================================================
+function applyFullChartUpdate(data) {
+    var myId = ++_updateId;
+
+    try {
+        isUpdatingChart = true;
+
+        // TimeMap speichern (kontinuierliche Zeit -> echte epoch)
+        _continuousTimeMap = data.timeMap || {};
+        // Sortierte Schluessel fuer resolveRealTime() (naechster Zeitpunkt)
+        _continuousKeys = Object.keys(_continuousTimeMap).map(Number).sort(function(a, b) { return a - b; });
+
+        currentSymbol = data.symbol;
+        currentTimeframe = data.timeframe;
+        if (data.timeframe && TF_SECONDS_MAP[data.timeframe]) {
+            currentTfInSeconds = TF_SECONDS_MAP[data.timeframe];
+        }
+
+        var candles = (typeof data.candles === 'string') ? JSON.parse(data.candles) : (data.candles || []);
+
+        var validCandles = candles.filter(function(c) {
+            return c &&
+                typeof c.time === 'number' && !isNaN(c.time) && c.time > 0 &&
+                typeof c.open === 'number' && !isNaN(c.open) && c.open > 0 &&
+                typeof c.high === 'number' && !isNaN(c.high) && c.high > 0 &&
+                typeof c.low === 'number' && !isNaN(c.low) && c.low > 0 &&
+                typeof c.close === 'number' && !isNaN(c.close) && c.close > 0;
+        });
+
+        if (validCandles.length === 0) {
+            console.warn('[applyFullChartUpdate] Keine gueltigen Candles');
+            if (chart) chart.timeScale().fitContent();
+            isUpdatingChart = false;
+            return;
+        }
+
+        // Alte Resourcen entfernen
+        try { clearGridCircles(); } catch(e) {}
+        try { clearGridLines(); } catch(e) {}
+        try { clearSignalMarkers(); } catch(e) {}
+        if (currentPriceLine) {
+            try { if (candleSeries) candleSeries.removePriceLine(currentPriceLine); } catch(e) {}
+            currentPriceLine = null;
+        }
+        if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+
+        if (_resizeObserver) {
+            try { _resizeObserver.disconnect(); } catch(e) {}
+            _resizeObserver = null;
+        }
+
+        try {
+            if (chart) chart.remove();
+        } catch(e) {
+            console.warn('[applyFullChartUpdate] chart.remove() fehlgeschlagen:', e.message || e);
+        }
+        chart = null;
+        candleSeries = null;
+        dayLinesSeries = [];
+        gridPriceLines = [];
+        _storedCircleMarkers = null;
+        seriesMarkersPlugin = null;
+        try { _clearDaySeparatorOverlay(); } catch(e) {}
+
+        var container = document.getElementById('chart-container');
+        if (!container) {
+            isUpdatingChart = false;
+            return;
+        }
+        try { container.querySelectorAll('table, canvas').forEach(function(el) { el.remove(); }); } catch(e) {}
+
+        var isDailyOrHigher = (currentTfInSeconds >= 86400);
+
+        // Schritt 1: Chart erstellen
+        try {
+            chart = LightweightCharts.createChart(container, {
+                width: container.clientWidth || 800,
+                height: container.clientHeight || 600,
+                layout: { background: { type: 'solid', color: '#131722' }, textColor: '#d1d4dc' },
+                grid: { vertLines: { visible: false }, horzLines: { visible: false } },
+                crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+                rightPriceScale: { borderColor: '#2B2B43' },
+                timeScale: { 
+                    borderColor: '#2B2B43', 
+                    timeVisible: !isDailyOrHigher,
+                    secondsVisible: false,
+                    fixRightEdge: false,
+                    fixLeftEdge: false,
+                    shiftVisibleRangeOnNewBar: false,
+                    tickMarkFormatter: function(time, tickMarkType) {
+                        // time ist kontinuierlich (Fake-Zeit). Real-Epoch aus Map holen
+                        // (resolveRealTime statt raw-Map-Zugriff -> kein Fake-Label).
+                        var realTime = resolveRealTime(time);
+                        var p = getBerlinParts(realTime);
+                        if (isDailyOrHigher || tickMarkType <= 2) {
+                            return p.day + '.' + p.month + '.' + p.year.slice(-2);
+                        }
+                        return p.hour + ':' + p.minute;
+                    }
+                },
+                localization: { locale: 'de-DE', timeFormatter: function(t) { 
+                    // t ist bei Zeit-basierten Serien ein UTCTimestamp (Zahl),
+                    // NICHT ein Objekt mit .time – sonst laeuft formatDT ins Leere.
+                    var ts = (t !== null && typeof t === 'object') ? t.time : t;
+                    return formatDT(resolveRealTime(ts)); 
+                } }
+            });
+        } catch(e) {
+            console.error('[applyFullChartUpdate] Schritt 1 (createChart) fehlgeschlagen:', e.message || e);
+            isUpdatingChart = false;
+            return;
+        }
+
+        try { setupResizeObserver(); } catch(e) {}
+
+        var precision = (data.precision !== undefined && data.precision !== null) ? data.precision : currentPrecision;
+        currentPrecision = precision;
+        var minMove = (typeof precision === 'number' && precision > 0 && precision < 10) 
+            ? 1 / Math.pow(10, precision) 
+            : 0.01;
+
+        // Schritt 2: CandlestickSeries
+        try {
+            candleSeries = chart.addSeries(LightweightCharts.CandlestickSeries, {
+                upColor: '#26a69a', downColor: '#ef5350', borderVisible: false,
+                wickUpColor: '#26a69a', wickDownColor: '#ef5350', priceLineVisible: false, lastValueVisible: false,
+                priceFormat: { type: 'price', precision: precision, minMove: minMove }
+            });
+            if (!candleSeries) throw new Error('candleSeries ist null');
+        } catch(e) {
+            console.error('[applyFullChartUpdate] Schritt 2 (addSeries) fehlgeschlagen:', e.message || e);
+            isUpdatingChart = false;
+            return;
+        }
+
+        // Schritt 3: setData
+        try {
+            candleSeries.setData(validCandles);
+        } catch(e) {
+            console.error('[applyFullChartUpdate] Schritt 3 (setData) fehlgeschlagen:', e.message || e);
+            isUpdatingChart = false;
+            return;
+        }
+        rawCandleData = validCandles;
+        lastClosePrice = validCandles[validCandles.length - 1].close;
+
+        // Schritt 4: TimeScale Subscription
+        try {
+            chart.timeScale().subscribeVisibleLogicalRangeChange(function() { 
+                if(!isUpdatingChart) {
+                    try { syncRanges(); } catch(e) {}
+                    try { updateCountdownDisplay(); } catch(e) {}
+                    try { _updateDaySeparatorPositions(); } catch(e) {}
+                }
+            });
+        } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 4 (subscribe) fehlgeschlagen:', e.message || e);
+        }
+
+        // Countdown-Timer (1s Intervall)
+        if (countdownTimer) clearInterval(countdownTimer);
+        countdownTimer = setInterval(function() {
+            try { updateCountdownDisplay(); } catch(e) {}
+        }, 1000);
+
+        // Schritt 5: Grid-Linien
+        try { if (data.gridLines) renderGridLines(data.gridLines); } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 5 (gridLines) fehlgeschlagen:', e.message || e);
+        }
+
+        // Schritt 6: Grid-Circles (speichert nur, Marker setzen via setMarkers)
+        try { if (data.gridCircles) renderGridCircles(data.gridCircles); } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 6 (gridCircles) fehlgeschlagen:', e.message || e);
+        }
+
+        // Schritt 7: Signal-Marker + Circles (combined via candleSeries.setMarkers)
+        try {
+            _storedSignalMarkersData = data.signalMarkers || [];
+            _applyAllMarkers(_storedSignalMarkersData);
+        } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 7 (signalMarkers) fehlgeschlagen:', e.message || e);
+        }
+
+        // Schritt 8: Range
+        try {
+            if (data.rangeFrom !== undefined && data.rangeTo !== undefined &&
+                data.rangeFrom !== null && data.rangeTo !== null &&
+                data.rangeFrom !== data.rangeTo) {
+                pendingRange = { rangeFrom: data.rangeFrom, rangeTo: data.rangeTo, priceFrom: data.priceFrom, priceTo: data.priceTo };
+                applyRange(data.rangeFrom, data.rangeTo, data.priceFrom, data.priceTo);
+            } else {
+                if (chart) chart.timeScale().fitContent();
+            }
+        } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 8 (applyRange) fehlgeschlagen:', e.message || e);
+        }
+
+        // Schritt 9: Day Separators
+        try { updateDaySeparators(rawCandleData); } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 9 (daySeparators) fehlgeschlagen:', e.message || e);
+        }
+
+        // Fertig – isUpdatingChart freigeben + initialen sync
+        isUpdatingChart = false;
+        try { syncRanges(); } catch(e) {}
+        try { updateCountdownDisplay(); } catch(e) {}
+
+    } catch(e) {
+        console.error('[applyFullChartUpdate] GLOBAL Error:', e.message || e);
+        isUpdatingChart = false;
+    }
+}
+
+```
+
+--------------------------------------------------
+
+### DATEI: .backup_A_generationsschutz/chart_win.py
+```py
+# chart/chart_win.py
+# ==============================================================================
+# chart/chart_win.py - Exakter Restore für Fensterposition, Leerraum & Zoom
+# ==============================================================================
+
+import json
+import math
+import sys
+from datetime import datetime, timezone as dt_timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from chart.indicators.base_indicator import BaseIndicator
+
+file_path = Path(__file__).resolve()
+project_root = file_path.parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+from PySide6.QtCore import QFile, QIODevice, QObject, QThread, QTimer, QUrl, Signal, Slot, Qt, QEvent
+from PySide6.QtUiTools import QUiLoader
+from PySide6.QtWebChannel import QWebChannel
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebEngineCore import QWebEnginePage
+from PySide6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QMainWindow,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
+
+try:
+    from chart.chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, HTML_TEMPLATE
+    from chart.indicators.grid import GridIndicator
+    from chart.indicator_dialog import IndicatorSettingsDialog
+except ImportError:
+    from chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, HTML_TEMPLATE
+    from indicators.grid import GridIndicator
+    from indicator_dialog import IndicatorSettingsDialog
+
+try:
+    from state_manager import StateManager
+except ImportError:
+    from state_manager import StateManager
+
+from db_service import MarketDataRepository, _parse_json_field, TF_SECONDS_MAP
+
+from chart.overlays.signal_overlay import SignalOverlay
+from analytics.background_workers.live_analyzer import fill_gaps_for_pair
+
+
+def find_null_fields(obj, path=""):
+    """Sucht rekursiv nach None/null in Dictionaries und Listen."""
+    nulls = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            new_path = f"{path}.{k}" if path else k
+            if v is None:
+                nulls.append(new_path)
+            else:
+                nulls.extend(find_null_fields(v, new_path))
+    elif isinstance(obj, list):
+        for idx, item in enumerate(obj):
+            new_path = f"{path}[{idx}]"
+            nulls.extend(find_null_fields(item, new_path))
+    return nulls
+
+
+def _clean_nan(obj):
+    """Entfernt rekursiv alle NaN/Inf-Werte aus Dicts/Listen, damit json.dumps(allow_nan=False) nicht fehlschlaegt."""
+    if isinstance(obj, dict):
+        return {k: _clean_nan(v) for k, v in obj.items() if not (isinstance(v, float) and (math.isnan(v) or math.isinf(v)))}
+    elif isinstance(obj, list):
+        return [_clean_nan(item) for item in obj if not (isinstance(item, float) and (math.isnan(item) or math.isinf(item)))]
+    return obj
+
+
+class WebEngineConsolePage(QWebEnginePage):
+    def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID):
+        print(f"🌐 [JS Console L{lineNumber}]: {message}")
+
+
+class ChartBridge(QObject):
+    rangeChanged = Signal(float, float)
+    priceRangeChanged = Signal(float, float)
+    measurementChanged = Signal(str)
+
+    @Slot(float, float)
+    def onRangeChanged(self, f, t): self.rangeChanged.emit(f, t)
+
+    @Slot(float, float)
+    def onPriceRangeChanged(self, f, t): self.priceRangeChanged.emit(f, t)
+
+    @Slot(str)
+    def onMeasurementChanged(self, m): self.measurementChanged.emit(m)
+
+
+class ChartDataSerializer(QThread):
+    """Serialisiert Chart-Update-Pakete im Hintergrund-Thread (JSON-Encoding)."""
+    serialized = Signal(str)  # fertiges JSON
+
+    def __init__(self, update_package: dict, parent=None):
+        super().__init__(parent)
+        self.update_package = update_package
+
+    def run(self):
+        try:
+            payload = json.dumps(self.update_package, allow_nan=False)
+            self.serialized.emit(payload)
+        except (ValueError, TypeError) as e:
+            print(f"⚠️ [Serializer] JSON-Fehler: {e}")
+            self.serialized.emit("")
+
+
+class GridDataSerializer(QThread):
+    """Serialisiert Grid-Linien/Circles im Hintergrund-Thread."""
+    done = Signal(str, str)
+
+    def __init__(self, lines: list, circles: list, parent=None):
+        super().__init__(parent)
+        self.lines = lines
+        self.circles = circles
+
+    def run(self):
+        try:
+            lj = json.dumps(self.lines, allow_nan=False)
+            cj = json.dumps(self.circles, allow_nan=False)
+            self.done.emit(lj, cj)
+        except (ValueError, TypeError) as e:
+            print(f"⚠️ [GridSerializer] JSON-Fehler: {e}")
+            self.done.emit("", "")
+
+
+class PyTraderChartWindow(QMainWindow):
+    closed_signal = Signal(str)
+
+    def __init__(self, instance_id="win_1", symbol="SILVER", timeframe="H1", visible_from=None, visible_to=None,
+                 state_manager=None):
+        super().__init__()
+        self.instance_id = instance_id
+        self.current_symbol = symbol
+        self.current_tf = timeframe
+        self.visible_from = visible_from
+        self.visible_to = visible_to
+        self.visible_price_from = None
+        self.visible_price_to = None
+        self.measurement_state = None
+        self.indicators_state = {}
+
+        self.state_manager = state_manager or StateManager()
+        self.settings = self.state_manager.get_app_settings()
+        self.market_repo = MarketDataRepository()
+        self._is_loading_data = False
+        self.df_data = None
+
+        # Generische Indikator-Registry: indicator_id -> BaseIndicator
+        self.indicators: Dict[str, BaseIndicator] = {
+            "grid": GridIndicator(),
+        }
+        self._settings_dialog: Optional[QDialog] = None
+        self._page_loaded: bool = False
+
+        self.signal_overlay = SignalOverlay()
+        # Signal-Marker standardmaessig AUS, toggle via Button (📈)
+        self._signals_enabled: bool = False
+        self._grid_serializer: Optional[GridDataSerializer] = None
+        self._chart_serializer: Optional[ChartDataSerializer] = None
+        # Debounce-Timer für Chart-Refresh (verhindert Race-Conditions bei schnellen Wechseln)
+        self._debounce_timer: QTimer = QTimer(self)
+        self._debounce_timer.setSingleShot(True)
+        self._debounce_timer.setInterval(400)
+        self._debounce_timer.timeout.connect(self._safe_refresh_chart_data)
+        # Watchdog: setzt _is_loading_data automatisch zurueck, falls ein Refresh haengt
+        # (verhindert dauerhafte Blockade von TF-/Symbol-Wechsel)
+        self._loading_watchdog: QTimer = QTimer(self)
+        self._loading_watchdog.setSingleShot(True)
+        self._loading_watchdog.setInterval(15000)
+        self._loading_watchdog.timeout.connect(self._on_loading_watchdog)
+        # Mapping: kontinuierliche Zeit -> originale epoch (für JS tickMarkFormatter)
+        self._time_cont_to_real: Dict[int, int] = {}
+        self._time_real_to_cont: Dict[int, int] = {}
+
+                # 1. ZUERST versuchen, spezifischen Instanz-Status aus der DB zu laden
+        saved_inst_st = self.state_manager.load_all_instances()
+        matched_inst = next((i for i in saved_inst_st if i.get("instance_id") == self.instance_id), None)
+
+        if matched_inst:
+            raw_symbol = matched_inst.get("symbol")
+            raw_tf = matched_inst.get("timeframe")
+            self.current_symbol = str(raw_symbol) if raw_symbol is not None else self.current_symbol
+            self.current_tf = str(raw_tf) if raw_tf is not None else self.current_tf
+            if self.visible_from is None:
+                self.visible_from = matched_inst.get("visible_range_from")
+                self.visible_to = matched_inst.get("visible_range_to")
+            self.visible_price_from = matched_inst.get("visible_price_from")
+            self.visible_price_to = matched_inst.get("visible_price_to")
+
+            ind_st = matched_inst.get("indicators_state")
+            if ind_st is not None and not isinstance(ind_st, (int, float)):
+                self.indicators_state = _parse_json_field(ind_st) or {}
+
+        # 2. FALLBACK: Wenn keine Instanz da ist (z. B. neues manuelles Fenster), lade zuletzt gespeicherte Symbol:TF Combo
+        if not isinstance(self.indicators_state, dict) or not self.indicators_state or self.visible_from is None:
+            if not isinstance(self.indicators_state, dict):
+                self.indicators_state = {}
+            pair_st = self.state_manager.get_symbol_tf_state(self.current_symbol, self.current_tf)
+            if pair_st:
+                if self.visible_from is None:
+                    self.visible_from = pair_st.get("visible_range_from")
+                    self.visible_to = pair_st.get("visible_range_to")
+                if self.visible_price_from is None:
+                    self.visible_price_from = pair_st.get("visible_price_from")
+                    self.visible_price_to = pair_st.get("visible_price_to")
+                if pair_st.get("indicators_state") and not self.indicators_state:
+                    ind_st_pair = pair_st.get("indicators_state")
+                    if ind_st_pair is not None and not isinstance(ind_st_pair, (int, float)):
+                        self.indicators_state = _parse_json_field(ind_st_pair) or {}
+
+        # Sicherstellen, dass indicators_state ein dict ist
+        if not isinstance(self.indicators_state, dict):
+            self.indicators_state = {}
+
+        # Standard-Indikator-Setups ergänzen falls unvollständig
+        for ind_id, ind_plugin in self.indicators.items():
+            if ind_id not in self.indicators_state:
+                self.indicators_state[ind_id] = {
+                    "active": False,
+                    "preset": "Default",
+                    "params": dict(ind_plugin.default_params)
+                }
+            else:
+                # Fehlende Default-Parameter nachtragen (z. B. neue Farb-Parameter)
+                existing_params = self.indicators_state[ind_id].get("params", {})
+                merged = dict(ind_plugin.default_params)
+                merged.update(existing_params)
+                self.indicators_state[ind_id]["params"] = merged
+
+        # UI Laden aus .ui
+        base_dir = Path(__file__).resolve().parent.parent
+        ui_file = QFile(str(base_dir / "ui" / "chart_win.ui"))
+        if ui_file.open(QIODevice.ReadOnly):
+            loader = QUiLoader()
+            self.ui_widget = loader.load(ui_file)
+            ui_file.close()
+            self.setCentralWidget(self.ui_widget)
+        else:
+            self.ui_widget = QWidget(self)
+            self.setCentralWidget(self.ui_widget)
+
+        self.setWindowTitle(f"PyTrader Chart - {self.current_symbol} [{self.current_tf}] ({self.instance_id})")
+        self.resize(1000, 700)
+
+        self.symbol_combo = self.ui_widget.findChild(QComboBox, "combo_symbol")
+        self.tf_combo = self.ui_widget.findChild(QComboBox, "combo_tf")
+        self.btn_reset = self.ui_widget.findChild(QPushButton, "btn_reset_chart")
+        self.btn_indicator = self.ui_widget.findChild(QPushButton, "btn_indicator_grid")
+        self.btn_signal = self.ui_widget.findChild(QPushButton, "btn_signal_select")
+        self.chart_container = self.ui_widget.findChild(QWidget, "web_container")
+
+        if self.symbol_combo:
+            self.symbol_combo.setCurrentText(str(self.current_symbol) if self.current_symbol is not None else "SILVER")
+            self.symbol_combo.currentTextChanged.connect(self.on_symbol_changed)
+        if self.tf_combo:
+            self.tf_combo.setCurrentText(str(self.current_tf) if self.current_tf is not None else "H1")
+            self.tf_combo.currentTextChanged.connect(self.on_tf_changed)
+        if self.btn_reset:
+            self.btn_reset.clicked.connect(self.fit_chart)
+        if self.btn_indicator:
+            self.btn_indicator.setCheckable(True)
+            self.btn_indicator.clicked.connect(self.toggle_grid_lines)
+            self.btn_indicator.installEventFilter(self)
+            self.update_indicator_button_style()
+
+        if self.btn_signal:
+            self.btn_signal.setCheckable(True)
+            self.btn_signal.clicked.connect(self.on_signal_button_clicked)
+
+        self.web_view = QWebEngineView()
+        self.web_view.setPage(WebEngineConsolePage(self.web_view))
+        self.web_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        target = self.chart_container if self.chart_container else self.ui_widget
+        layout = target.layout()
+        if layout is None:
+            layout = QVBoxLayout(target)
+            layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.web_view, 1)
+
+        self.bridge = ChartBridge()
+        self.bridge.rangeChanged.connect(self.handle_range_changed)
+        self.bridge.priceRangeChanged.connect(self.handle_price_range_changed)
+        self.bridge.measurementChanged.connect(self.handle_measurement_changed)
+        self.channel = QWebChannel()
+        self.channel.registerObject("pyBridge", self.bridge)
+        self.web_view.page().setWebChannel(self.channel)
+        self.web_view.setHtml(HTML_TEMPLATE, QUrl("https://localhost"))
+        self.web_view.loadFinished.connect(self._on_page_loaded)
+
+    def _auto_init_signal_set(self) -> None:
+        """Nicht mehr verwendet - Testsignal ist deaktiviert."""
+        pass
+
+    def eventFilter(self, watched, event):
+        if self.btn_indicator is not None and watched == self.btn_indicator and event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton:
+            # Wenn Dialog offen, schliessen; sonst öffnen
+            if self._settings_dialog is not None and self._settings_dialog.isVisible():
+                self._settings_dialog.close()
+                self._settings_dialog = None
+            else:
+                self._open_indicator_settings("grid")
+            return True
+        return super().eventFilter(watched, event)
+
+    def _get_indicator_plugin(self, ind_id: str) -> Optional[BaseIndicator]:
+        """Gibt die Indikator-Instanz zur ID zurück (oder None)."""
+        return self.indicators.get(ind_id)
+
+    def update_indicator_button_style(self):
+        if not self.btn_indicator: return
+        is_active = self.indicators_state.get("grid", {}).get("active", False)
+        color = "#2e7d32" if is_active else "#37474f"
+        self.btn_indicator.setStyleSheet(
+            f"background-color: {color}; color: white; font-weight: bold; border-radius: 4px; padding: 3px 10px;")
+
+    def toggle_grid_lines(self):
+        self._toggle_indicator("grid")
+
+    def _toggle_indicator(self, ind_id: str) -> None:
+        """Schaltet einen Indikator an/aus."""
+        plugin = self._get_indicator_plugin(ind_id)
+        if plugin is None:
+            return
+        st = self.indicators_state.setdefault(ind_id, {
+            "active": False, "preset": "Default", "params": dict(plugin.default_params)
+        })
+        st["active"] = not st["active"]
+        self.update_indicator_button_style()
+        self.save_state()
+        self.render_indicators()
+
+    def _open_indicator_settings(self, ind_id: str) -> None:
+        """Öffnet den Einstellungs-Dialog für einen Indikator."""
+        plugin = self._get_indicator_plugin(ind_id)
+        if plugin is None:
+            return
+        st = self.indicators_state.setdefault(ind_id, {
+            "active": False, "preset": "Default", "params": dict(plugin.default_params)
+        })
+        dialog = IndicatorSettingsDialog(plugin, st["params"], st["preset"], self.state_manager,
+                                         lambda p, pr: self._on_indicator_params_updated(ind_id, p, pr), self)
+        self._settings_dialog = dialog
+        dialog.finished.connect(lambda: self._on_settings_closed(dialog))
+        dialog.show()
+
+    def _on_settings_closed(self, dialog):
+        if self._settings_dialog is dialog:
+            self._settings_dialog = None
+
+    def _on_page_loaded(self, ok: bool) -> None:
+        if ok:
+            self._page_loaded = True
+            # Initialer Refresh direkt (ohne Debounce), danach nur noch via Debounce
+            self._safe_refresh_chart_data()
+
+    def _safe_refresh_chart_data(self) -> None:
+        """Startet den Chart-Refresh mit Fehler-Schutz.
+        Stellt sicher, dass _is_loading_data bei einem Fehler zurueckgesetzt wird –
+        sonst bleibt der Chart dauerhaft blockiert (keine Charts, TF/Symbol-Wechsel tot)."""
+        try:
+            self._do_refresh_chart_data()
+        except Exception as e:
+            print(f"❌ [ChartRefresh] Fehler: {e}")
+            self._set_loading(False)
+
+    def _set_loading(self, loading: bool) -> None:
+        """Setzt _is_loading_data und startet/stoppt den Watchdog konsistent."""
+        self._is_loading_data = loading
+        if loading:
+            self._loading_watchdog.start()
+        else:
+            self._loading_watchdog.stop()
+
+    def _on_loading_watchdog(self) -> None:
+        """Watchdog-Timeout: Ein Chart-Refresh haengt zu lange (z. B. durch Fehler).
+        Setzt das Flag zurueck, damit TF-/Symbol-Wechsel wieder funktionieren."""
+        print(f"⚠️ [ChartRefresh] Watchdog: Refresh haengt ({self.current_symbol} {self.current_tf}), setze zurueck")
+        self._is_loading_data = False
+
+    def _on_indicator_params_updated(self, ind_id: str, params: Dict[str, Any], preset: str) -> None:
+        """Callback wenn ein Indikator-Parameter geändert wurde."""
+        self.indicators_state[ind_id] = {"active": True, "preset": preset, "params": params}
+        self.save_state()
+        self.render_indicators()
+
+    def render_indicators(self):
+        """Rendert alle aktiven Indikatoren via JS-Bridge."""
+        if self.df_data is None or self.df_data.empty:
+            return
+
+        # Zuerst alle Indikator-Layer clearen
+        try:
+            self.web_view.page().runJavaScript("if(window.clearGridLines) clearGridLines();")
+            self.web_view.page().runJavaScript("if(window.clearGridCircles) clearGridCircles();")
+        except (RuntimeError, AttributeError):
+            pass
+
+        for ind_id, plugin in self.indicators.items():
+            st = self.indicators_state.get(ind_id, {})
+            if not st.get("active"):
+                continue
+            try:
+                # Kontext setzen (Symbol/TF fuer DB-basierte Indikatoren)
+                if hasattr(plugin, "set_context"):
+                    plugin.set_context(self.current_symbol, self.current_tf)
+                res = plugin.calculate(self.df_data, st.get("params", {}))
+                # Grid-spezifische Render-Logik (aktuell der einzige Indikator)
+                if ind_id == "grid":
+                    lines = res.get("lines", [])
+                    circles = res.get("hit_circles", [])
+                    # Circle-Zeiten auf kontinuierlich mappen
+                    if circles and self._time_real_to_cont:
+                        for gc in circles:
+                            gc_t = gc.get("time")
+                            if gc_t is not None and int(gc_t) in self._time_real_to_cont:
+                                gc["time"] = self._time_real_to_cont[int(gc_t)]
+                    # JSON-Encoding im Hintergrund
+                    self._serialize_and_render_grid(lines, circles)
+            except (RuntimeError, AttributeError):
+                pass
+
+    def _serialize_and_render_grid(self, lines: list, circles: list) -> None:
+        """Serialisiert Grid-Daten im Hintergrund-Thread und rendert sie.
+        Alter Thread wird vor Neustart sauber beendet."""
+        # Alten Serializer cleanen falls noch aktiv
+        if self._grid_serializer is not None:
+            try:
+                self._grid_serializer.done.disconnect(self._apply_grid_render)
+            except (RuntimeError, TypeError):
+                pass
+            if self._grid_serializer.isRunning():
+                self._grid_serializer.quit()
+                self._grid_serializer.wait(500)
+            self._grid_serializer = None
+
+        self._grid_serializer = GridDataSerializer(lines, circles)
+        self._grid_serializer.done.connect(self._apply_grid_render)
+        self._grid_serializer.start()
+
+    def _apply_grid_render(self, lines_json: str, circles_json: str) -> None:
+        """Übergibt serialisierte Grid-Daten an JS (wird im GUI-Thread aufgerufen)."""
+        if not lines_json and not circles_json:
+            return
+        try:
+            if lines_json:
+                self.web_view.page().runJavaScript(
+                    f"if(window.renderGridLines) renderGridLines('{lines_json}');")
+            if circles_json:
+                self.web_view.page().runJavaScript(
+                    f"if(window.renderGridCircles) renderGridCircles('{circles_json}');")
+        except (RuntimeError, AttributeError):
+            pass
+
+    def refresh_chart_data(self) -> None:
+        """Debounced: Startet Chart-Refresh mit 400ms Verzögerung.
+        Bei schnellen Mehrfach-Aufrufen wird nur der letzte ausgeführt."""
+        if not self._page_loaded:
+            QTimer.singleShot(200, self.refresh_chart_data)
+            return
+        self._debounce_timer.start()
+
+    def _do_refresh_chart_data(self) -> None:
+        """Führt den tatsächlichen Chart-Refresh aus (nur via Debounce-Timer)."""
+        if self._is_loading_data:
+            self._debounce_timer.start()
+            return
+
+        self._set_loading(True)
+
+        print(f"📊 Lade Chart-Daten: {self.current_symbol} {self.current_tf}")
+        candles, precision = self.market_repo.fetch_historical_candles(self.current_symbol, self.current_tf, limit=self.settings.chart_candle_limit)
+        print(f"   → {len(candles)} Candles geladen, precision={precision}")
+
+        # NaN-Werte aus den Candles entfernen
+        clean_candles = []
+        if candles:
+            import math
+            for c in candles:
+                if (c.get("time") is not None and
+                    c.get("open") is not None and
+                    c.get("high") is not None and
+                    c.get("low") is not None and
+                    c.get("close") is not None):
+                    if (not math.isnan(c["open"]) and
+                        not math.isnan(c["high"]) and
+                        not math.isnan(c["low"]) and
+                        not math.isnan(c["close"])):
+                        clean_candles.append(c)
+
+            # ======================================================================
+            # Kontinuierliche Candle-Zeiten (keinerlei Lücken/Whitespace im Chart)
+            # Jede Candle bekommt: base_time + i * tf_sec
+            # Mapping cont -> real für JS tickMarkFormatter.
+            # ======================================================================
+            t_sec = TF_SECONDS_MAP.get(str(self.current_tf).upper(), 60)
+            self._time_cont_to_real = {}
+            self._time_real_to_cont = {}
+            continuous_candles = []
+            if clean_candles:
+                base_time = clean_candles[0]["time"]
+                for i, c in enumerate(clean_candles):
+                    cont_time = base_time + i * t_sec
+                    real_time = int(c["time"])
+                    self._time_cont_to_real[cont_time] = real_time
+                    self._time_real_to_cont[real_time] = cont_time
+                    dc = dict(c)
+                    dc["time"] = cont_time
+                    continuous_candles.append(dc)
+
+            import pandas as pd
+            self.df_data = pd.DataFrame(clean_candles)
+        else:
+            self.df_data = None
+            continuous_candles = []
+
+        grid_lines = []
+        grid_circles = []
+
+        if self.df_data is not None and not self.df_data.empty:
+            for ind_id, plugin in self.indicators.items():
+                st = self.indicators_state.get(ind_id, {})
+                if st.get("active") and ind_id == "grid":
+                    if hasattr(plugin, "set_context"):
+                        plugin.set_context(self.current_symbol, self.current_tf)
+                    res = plugin.calculate(self.df_data, st.get("params", {}))
+                    grid_lines = res.get("lines", [])
+                    grid_circles = res.get("hit_circles", [])
+                    # Circle-Zeiten auf kontinuierlich mappen
+                    if grid_circles and self._time_real_to_cont:
+                        for gc in grid_circles:
+                            gc_t = gc.get("time")
+                            if gc_t is not None and int(gc_t) in self._time_real_to_cont:
+                                gc["time"] = self._time_real_to_cont[int(gc_t)]
+
+        update_package = {
+            "symbol": self.current_symbol,
+            "timeframe": self.current_tf,
+            "candles": continuous_candles,
+            "precision": precision,
+            "gridLines": grid_lines,
+            "gridCircles": grid_circles,
+            "signalMarkers": self._get_signal_markers_for_update(),
+            "timeMap": self._time_cont_to_real,
+        }
+
+        # Nur hinzufügen, wenn echte Werte da sind – nie null/0 übergeben (sonst "Value is null" in JS)
+        if self.visible_from is not None and self.visible_to is not None:
+            update_package["rangeFrom"] = int(self.visible_from)
+            update_package["rangeTo"] = int(self.visible_to)
+
+        if self.visible_price_from is not None and self.visible_price_to is not None:
+            update_package["priceFrom"] = float(self.visible_price_from)
+            update_package["priceTo"] = float(self.visible_price_to)
+
+        # NaN/Inf-Werte aus dem gesamten Payload entfernen (sonst JSON-Fehler im Serializer)
+        update_package = _clean_nan(update_package)
+
+        # JSON-Encoding im Hintergrund-Thread, um GUI-Ruckler zu vermeiden
+        # Alten Serializer cleanen falls noch aktiv
+        if self._chart_serializer is not None:
+            try:
+                self._chart_serializer.serialized.disconnect(self._apply_chart_update)
+            except (RuntimeError, TypeError):
+                pass
+            if self._chart_serializer.isRunning():
+                self._chart_serializer.quit()
+                self._chart_serializer.wait(500)
+            self._chart_serializer = None
+
+        self._chart_serializer = ChartDataSerializer(update_package)
+        self._chart_serializer.serialized.connect(self._apply_chart_update)
+        self._chart_serializer.start()
+
+    def _apply_chart_update(self, payload: str) -> None:
+        """Empfängt fertiges JSON aus dem Serializer-Thread und prüft es auf nulls."""
+        if not payload:
+            self._set_loading(False)
+            return
+
+        # ======================================================================
+        # DEBUG-CHECK: Identifiziert das exakte null-Objekt in Python!
+        # ======================================================================
+        try:
+            import json as _json
+            data = _json.loads(payload)
+            null_paths = find_null_fields(data)
+            if null_paths:
+                print(f"🚨 [NULL DETECTED in {self.current_symbol} {self.current_tf}] Gefundene null-Pfade:")
+                for p in null_paths[:15]:  # Zeige die ersten 15 Treffer
+                    print(f"   -> {p}")
+        except Exception as debug_err:
+            print(f"⚠️ [NullCheck] Fehler: {debug_err}")
+        # ======================================================================
+
+        try:
+            if hasattr(self, "web_view") and self.web_view and self.web_view.page():
+                self.web_view.page().runJavaScript(
+                    f"if(window.applyFullChartUpdate) applyFullChartUpdate({payload});"
+                )
+        except (RuntimeError, AttributeError):
+            pass
+        finally:
+            QTimer.singleShot(500, self._unlock_tracking)
+
+    def _unlock_tracking(self):
+        try:
+            self._set_loading(False)
+            self.update_indicator_button_style()
+        except (RuntimeError, AttributeError):
+            pass
+
+    def update_live_candle(self, c: Dict[str, Any]) -> None:
+        if not c or self._is_loading_data: return
+        t_sec = TF_SECONDS_MAP.get(str(self.current_tf).upper(), 60)
+
+        # Sichere Typprüfung für das time-Feld
+        time_val = c.get("time", 0)
+        if isinstance(time_val, datetime):
+            raw_t = int(time_val.timestamp())
+        elif isinstance(time_val, (int, float)):
+            raw_t = int(time_val)
+        else:
+            raw_t = 0
+
+        c_copy = dict(c)
+        rounded_t = raw_t - (raw_t % t_sec)
+
+        # Auf kontinuierliche Zeit mappen (kein Leerraum im Chart)
+        if rounded_t in self._time_real_to_cont:
+            c_copy["time"] = self._time_real_to_cont[rounded_t]
+        elif self._time_cont_to_real:
+            # Neue Candle: an letzte kont. Zeit anhängen
+            last_cont = max(self._time_cont_to_real.keys())
+            c_copy["time"] = last_cont + t_sec
+            self._time_cont_to_real[c_copy["time"]] = rounded_t
+            self._time_real_to_cont[rounded_t] = c_copy["time"]
+        else:
+            c_copy["time"] = rounded_t
+
+        try:
+            self.web_view.page().runJavaScript(f"if(window.updateLiveCandle) updateLiveCandle('{json.dumps(c_copy, allow_nan=False)}');")
+        except (ValueError, TypeError) as e:
+            print(f"⚠️ [JSON] NaN in Live-Candle: {e}")
+        except (RuntimeError, AttributeError):
+            pass
+
+    def on_symbol_changed(self, s):
+        if s and s != self.current_symbol:
+            self.save_state()
+            self.current_symbol = s
+            self.df_data = None
+            pair_st = self.state_manager.get_symbol_tf_state(self.current_symbol, self.current_tf)
+            if pair_st:
+                self.visible_from = pair_st.get("visible_range_from")
+                self.visible_to = pair_st.get("visible_range_to")
+                self.visible_price_from = pair_st.get("visible_price_from")
+                self.visible_price_to = pair_st.get("visible_price_to")
+                if pair_st.get("indicators_state"):
+                    ind_st = pair_st.get("indicators_state")
+                    loaded_ind = _parse_json_field(ind_st) or {}
+                    # Merge statt ersetzen, damit Grid-Fallback erhalten bleibt
+                    self.indicators_state.update(loaded_ind)
+                    # Fehlende Default-Parameter nachtragen
+                    for ind_id, ind_plugin in self.indicators.items():
+                        if ind_id in self.indicators_state:
+                            existing = self.indicators_state[ind_id].get("params", {})
+                            merged = dict(ind_plugin.default_params)
+                            merged.update(existing)
+                            self.indicators_state[ind_id]["params"] = merged
+            else:
+                self.visible_from = self.visible_to = None
+                self.visible_price_from = self.visible_price_to = None
+
+            # Chart-Trigger: Luecken fuer live_op=True Signale fuellen
+            fill_gaps_for_pair(self.current_symbol, self.current_tf, self.settings.feature_builder_limit)
+            self.refresh_chart_data()
+
+    def on_tf_changed(self, t):
+        if t and t != self.current_tf:
+            self.save_state()
+            self.current_tf = t
+            self.df_data = None
+            pair_st = self.state_manager.get_symbol_tf_state(self.current_symbol, self.current_tf)
+            if pair_st:
+                self.visible_from = pair_st.get("visible_range_from")
+                self.visible_to = pair_st.get("visible_range_to")
+                self.visible_price_from = pair_st.get("visible_price_from")
+                self.visible_price_to = pair_st.get("visible_price_to")
+                if pair_st.get("indicators_state"):
+                    ind_st = pair_st.get("indicators_state")
+                    loaded_ind = _parse_json_field(ind_st) or {}
+                    # Merge statt ersetzen, damit Grid-Fallback erhalten bleibt
+                    self.indicators_state.update(loaded_ind)
+                    # Fehlende Default-Parameter nachtragen
+                    for ind_id, ind_plugin in self.indicators.items():
+                        if ind_id in self.indicators_state:
+                            existing = self.indicators_state[ind_id].get("params", {})
+                            merged = dict(ind_plugin.default_params)
+                            merged.update(existing)
+                            self.indicators_state[ind_id]["params"] = merged
+            else:
+                self.visible_from = self.visible_to = None
+                self.visible_price_from = self.visible_price_to = None
+
+            # Chart-Trigger: Luecken fuer live_op=True Signale fuellen
+            fill_gaps_for_pair(self.current_symbol, self.current_tf, self.settings.feature_builder_limit)
+            self.refresh_chart_data()
+
+    def on_signal_button_clicked(self):
+        """Schaltet ALLE Signal-Marker an/aus (Grid Proximity + EMA-Signale).
+        Testsignale (alternating_arrow_v1) bleiben deaktiviert.
+        Aktualisiert NUR die Signal-Marker, ohne Chart-Neubau."""
+        if not self.btn_signal:
+            return
+
+        self._signals_enabled = self.btn_signal.isChecked()
+        status = "AN" if self._signals_enabled else "AUS"
+        print(f"🔔 Signale: {status}")
+        self._update_signal_markers_only()
+
+    def _update_signal_markers_only(self) -> None:
+        """Aktualisiert NUR die Signal-Marker im Chart, OHNE kompletten Chart-Neubau.
+        Blockiert waerend _is_loading_data (Race-Condition-Schutz)."""
+        if not self._page_loaded or self.df_data is None or self.df_data.empty or self._is_loading_data:
+            return
+
+        markers = self._get_signal_markers_for_update()
+        markers_json = json.dumps(markers, allow_nan=False)
+
+        # ======================================================================
+        # DEBUG-CHECK für Marker-Updates
+        # ======================================================================
+        try:
+            null_paths = find_null_fields(markers)
+            if null_paths:
+                print(f"🚨 [NULL MARKER in {self.current_symbol} {self.current_tf}] Gefundene null-Pfade:")
+                for p in null_paths[:10]:
+                    print(f"   -> markers{p}")
+        except Exception:
+            pass
+        # ======================================================================
+
+        try:
+            self.web_view.page().runJavaScript(
+                f"if(window.renderSignalMarkers) renderSignalMarkers({markers_json});"
+            )
+        except (RuntimeError, AttributeError) as e:
+            print(f"⚠️ [SignalMarker] JS-Fehler: {e}")
+
+    # ==============================================================================
+    # Live-Signal Integration (wird von MainWindow.on_live_signal gerufen)
+    # ==============================================================================
+
+    def on_live_signal_received(self, symbol: str, timeframe: str, bar_time: int, confidence: float, source_id: str) -> None:
+        """Wird vom MainWindow bei neuem Live-Signal gerufen.
+        Aktualisiert NUR die Marker, kein Chart-Neubau.
+        Blockiert waerend _is_loading_data (verhindert JS-Race-Condition)."""
+        if symbol != self.current_symbol or timeframe != self.current_tf:
+            return
+        if self._is_loading_data or not self._page_loaded:
+            return
+        self._update_signal_markers_only()
+
+    @staticmethod
+    def _apply_marker_styles(markers: List[Dict[str, Any]], source_id: str) -> List[Dict[str, Any]]:
+        """Wendet visuelle Stile auf Marker basierend auf source_id an.
+        Ermoeglicht Unterscheidung verschiedener Signal-Typen im Chart."""
+        for m in markers:
+            if source_id == "alternating_arrow_v1":
+                # Alternierende Pfeile: Buy=arrowUp (oben), Sell=arrowDown (unten)
+                if m["time"] % 2 == 0:
+                    m["position"] = "belowBar"
+                    m["shape"] = "arrowUp"
+                    m["color"] = "#26a69a"  # Gruen
+                else:
+                    m["position"] = "aboveBar"
+                    m["shape"] = "arrowDown"
+                    m["color"] = "#ef5350"  # Rot
+            elif source_id == "grid_proximity_v1":
+                # Grid-Proximity: Kreise oberhalb
+                m["position"] = "aboveBar"
+                m["shape"] = "circle"
+                m["color"] = "#7B1FA2"  # Lila
+            elif source_id == "ema_atr_set_v1":
+                # EMA/ATR: Quadrate oberhalb
+                m["position"] = "aboveBar"
+                m["shape"] = "square"
+                m["color"] = "#FF9800"  # Orange
+        return markers
+
+    def _get_signal_markers_for_update(self) -> List[Dict[str, Any]]:
+        """Sammelt alle Signal-Marker fuer den Chart-Update-Payload.
+        - Testsignal (alternating_arrow_v1): DEAKTIVIERT
+        - Grid Proximity (grid_proximity_v1): nur wenn Signal-Button aktiv
+        - EMA-Signale (ema_atr_set_v1): nur wenn Signal-Button aktiv
+        Marker-Zeiten werden auf Candle-Grenzen gerundet (exakter Match mit candleSeries in LWC v5)."""
+        if self.df_data is None or self.df_data.empty:
+            return []
+
+        t_sec = TF_SECONDS_MAP.get(str(self.current_tf).upper(), 60)
+
+        # 1) Testsignal (alternating_arrow_v1) DEAKTIVIERT – keine automatischen Test-Signale
+        markers: List[Dict[str, Any]] = []
+
+        # 2) Grid Proximity + EMA-Signale NUR wenn der Signal-Button aktiv ist
+        if self._signals_enabled:
+            grid_markers = self._apply_marker_styles(
+                self.signal_overlay.fetch_markers(
+                    self.current_symbol, self.current_tf, "grid_proximity_v1"
+                ),
+                "grid_proximity_v1"
+            )
+            markers.extend(grid_markers)
+
+            ema_markers = self._apply_marker_styles(
+                self.signal_overlay.fetch_markers(
+                    self.current_symbol, self.current_tf, "ema_atr_set_v1"
+                ),
+                "ema_atr_set_v1"
+            )
+            markers.extend(ema_markers)
+
+        # Marker-Zeiten auf Candle-Grenzen runden + auf kontinuierliche Zeit mappen
+        if markers:
+            clean_markers = []
+            for m in markers:
+                mt = m.get("time")
+                if mt is None:
+                    continue
+                # Auf Candle-Timeframe-Grenze runden (z.B. H1: 3600er-Schritte)
+                rounded = int(mt) - (int(mt) % t_sec)
+                # Nur behalten + auf kontinuierliche Zeit mappen
+                if rounded in self._time_real_to_cont:
+                    m["time"] = self._time_real_to_cont[rounded]
+                    clean_markers.append(m)
+            markers = clean_markers
+            if markers:
+                print(f"   → Marker: {len(markers)} (kont. zeit, z.B. {markers[0]['time']})")
+            else:
+                print(f"   → KEINE Marker nach Filter! real_times samples={list(self._time_real_to_cont.keys())[:3]}")
+
+        return markers
+
+    def fit_chart(self):
+        try:
+            self.visible_from = self.visible_to = None
+            self.visible_price_from = self.visible_price_to = None
+            self.save_state()
+            self.web_view.page().runJavaScript("if(window.fitChartContent) fitChartContent();")
+        except (RuntimeError, AttributeError):
+            pass
+
+    def handle_range_changed(self, f, t):
+        if not self._is_loading_data:
+            self.visible_from, self.visible_to = f, t
+            self.save_state()
+
+    def handle_price_range_changed(self, f, t):
+        if not self._is_loading_data:
+            self.visible_price_from, self.visible_price_to = f, t
+            self.save_state()
+
+    def handle_measurement_changed(self, m):
+        if not self._is_loading_data:
+            self.measurement_state = json.loads(m) if m else None
+            self.save_state()
+
+    def save_state(self):
+        if not self.state_manager or self._is_loading_data: return
+        self.state_manager.save_instance_state(self.instance_id, self.current_symbol, self.current_tf,
+                                               self.visible_from, self.visible_to, self.visible_price_from,
+                                               self.visible_price_to, self.indicators_state, self.measurement_state)
+        self.state_manager.save_symbol_tf_state(self.current_symbol, self.current_tf, self.visible_from,
+                                                self.visible_to, self.visible_price_from, self.visible_price_to,
+                                                self.indicators_state, self.measurement_state)
+        p, s = self.pos(), self.size()
+        self.state_manager.save_window_geometry(self.instance_id, p.x(), p.y(), s.width(), s.height(),
+                                                self.isMaximized())
+
+    def closeEvent(self, event):
+        self.save_state()
+        if self.state_manager:
+            app = QApplication.instance()
+            if not getattr(app, "_is_quitting", False) and self.instance_id != "win_main":
+                self.state_manager.delete_instance(self.instance_id)
+        self.closed_signal.emit(self.instance_id)
+        event.accept()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = PyTraderChartWindow()
+    window.show()
+    sys.exit(app.exec())
+```
+
+--------------------------------------------------
+
+### DATEI: .backup_B_zeitinvarianten/01_core.js
+```js
+// chart/js/01_core.js
+// Kern-Variablen, WebChannel-Bridge, Fenster-Fokus-Event & Fehlerbehandlung
+
+window.onerror = function(m, s, l, c, e) {
+    if (m === "Script error." && !s) return true;
+    console.error(`[JS ERROR] ${m} | L${l}:${c}`);
+    return true;
+};
+
+let chart = null, candleSeries = null, pyBridge = null, isUpdatingChart = false;
+let currentTfInSeconds = 3600, lastClosePrice = null, activeTimer = null, countdownTimer = null;
+let rawCandleData = [], currentSymbol = null, currentTimeframe = null;
+let gridPriceLines = [], dayLinesSeries = [], _storedCircleMarkers = null;
+let currentPriceLine = null, resizeTimeout = null;
+let currentPrecision = 2;
+let pendingRange = null;
+let _updateId = 0;
+let _lastAppliedUpdateId = 0; // höchste akzeptierte updateId (Race-Guard)
+let _continuousTimeMap = {};  // { cont_time: real_epoch } für tickMarkFormatter
+let _continuousKeys = [];     // sortierte cont-Schlüssel für resolveRealTime()
+// LWC v5: setMarkers() auf der Serie existiert nicht mehr – SeriesMarkers-Plugin verwenden
+let seriesMarkersPlugin = null;
+
+let isWindowActive = true;
+let lastRenderedPrice = null;
+let lastRenderedTop = null;
+let lastFormattedPriceStr = "";
+let lastFormattedTimeStr = "";
+
+const TF_SECONDS_MAP = { 'M1': 60, 'M2': 120, 'M5': 300, 'M10': 600, 'M15': 900, 'M30': 1800, 'H1': 3600, 'H4': 14400, 'D1': 86400, 'W1': 604800, 'MN1': 2592000 };
+
+// =============================================================================
+// resolveRealTime(): kontinuierliche (Fake-)Zeit -> echte epoch
+// WICHTIG: Bei unbekannten Werten (Padding-Ticks ausserhalb des Datensatzes)
+// NIE die Fake-Zeit selbst zurueckgeben – sonst zeigt die Zeitachse
+// irrefuehrende Labels (z. B. "30.7.26 23:58" an der Tagesgrenze, weil die
+// Fake-Zeit der 00:59-Candle als Realzeit formatiert wird).
+// Stattdessen wird der naechstgelegene bekannte Zeitpunkt verwendet.
+// =============================================================================
+function resolveRealTime(ts) {
+    if (ts === null || ts === undefined || typeof ts !== 'number' || !isFinite(ts)) return ts;
+    var direct = _continuousTimeMap[ts];
+    if (direct !== undefined) return direct;
+    if (_continuousKeys.length === 0) return ts;
+    var n = _continuousKeys.length;
+    if (ts <= _continuousKeys[0]) return _continuousTimeMap[_continuousKeys[0]];
+    if (ts >= _continuousKeys[n - 1]) return _continuousTimeMap[_continuousKeys[n - 1]];
+    var lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        var mid = (lo + hi) >> 1;
+        if (_continuousKeys[mid] === ts) return _continuousTimeMap[_continuousKeys[mid]];
+        if (_continuousKeys[mid] < ts) lo = mid + 1; else hi = mid - 1;
+    }
+    // hi = letzter Key < ts, lo = erster Key > ts
+    var a = _continuousKeys[hi], b = _continuousKeys[lo];
+    return (ts - a <= b - ts) ? _continuousTimeMap[a] : _continuousTimeMap[b];
+}
+
+if (typeof qt !== 'undefined') {
+    new QWebChannel(qt.webChannelTransport, function(channel) {
+        pyBridge = channel.objects.pyBridge;
+    });
+}
+
+window.addEventListener('focus', () => { isWindowActive = true; if(lastClosePrice !== null) updateCountdownDisplay(); });
+window.addEventListener('blur', () => { isWindowActive = false; });
+document.addEventListener('visibilitychange', () => {
+    isWindowActive = !document.hidden;
+    if (isWindowActive && lastClosePrice !== null) updateCountdownDisplay();
+});
+
+```
+
+--------------------------------------------------
+
+### DATEI: .backup_B_zeitinvarianten/02_time_utils.js
+```js
+// chart/js/02_time_utils.js
+// Zeit-Formatierung für die Chart-Achsen (Wanduhrzeit direkt aus dem Epoch).
+//
+// WICHTIG (empirisch verifiziert via test/check_broker_tz.py, DB-Abgleich &
+// Live-Messung an MT5):
+// - MT5 liefert Zeiten als BERLIN-WANDUHR-encoded Epochs: Bei echter UTC 10:00
+//   ist tick.time bereits die Zahl "12:00" (diff = +7200s). Der User hat recht.
+// - sync_market_data() schreibt die Roh-Epochs via
+//   pd.to_datetime(..., unit="s", utc=True) 1:1 in die DB; EXTRACT(EPOCH) und
+//   fetch_historical_candles() geben exakt diese Roh-Epochs an den Chart.
+// => Eine zusätzliche Berlin-Offset-Umrechnung (+2h/+1h) wäre DOPPELT und
+//    würde alle Achsen-Labels 2h zu spät anzeigen.
+// => getBerlinParts formatiert den Epoch direkt über die UTC-Getter; der Wert
+//    IST bereits die gewünschte Wanduhrzeit. Das ist automatisch DST-robust
+//    (keine Saison-Logik nötig): Im Winter liefert der Broker CET-encoded
+//    Werte, die ebenfalls direkt korrekt dargestellt werden.
+
+function getBerlinParts(t) {
+    var weekdays = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
+    var pad = function(n) { return String(n).padStart(2, '0'); };
+    
+    // Ungueltige Eingaben abfangen (verhindert NaN-Ausgabe & Endlosschleifen)
+    if (typeof t !== 'number' || !isFinite(t)) {
+        return { weekday: '', day: '--', month: '--', year: '----', hour: '--', minute: '--', rawDayOfWeek: -1 };
+    }
+    
+    // Roh-Epoch = bereits Berliner Wanduhrzeit => direkt via UTC-Getter lesen.
+    var bd = new Date(t * 1000);
+    
+    return {
+        weekday: weekdays[bd.getUTCDay()],
+        day: pad(bd.getUTCDate()),
+        month: pad(bd.getUTCMonth() + 1),
+        year: String(bd.getUTCFullYear()),
+        hour: pad(bd.getUTCHours()),
+        minute: pad(bd.getUTCMinutes()),
+        rawDayOfWeek: bd.getUTCDay()
+    };
+}
+
+function formatDT(t) { 
+    var p = getBerlinParts(t); 
+    return p.weekday + ' ' + p.day + '.' + p.month + '.' + p.year.slice(-2) + ' ' + p.hour + ':' + p.minute; 
+}
+
+```
+
+--------------------------------------------------
+
+### DATEI: .backup_B_zeitinvarianten/03_chart_rendering.js
+```js
+// chart/js/03_chart_rendering.js
+// Chart-Initialisierung (leer – chart wird via applyFullChartUpdate aus Python erstellt),
+// Tages-Separatoren, Grid-Linien/Marker & Range-Steuerung
+
+function clearGridLines() {
+    if (!candleSeries) return;
+    gridPriceLines.forEach(function(l) { try { candleSeries.removePriceLine(l); } catch(e){} });
+    gridPriceLines = [];
+}
+
+function renderGridLines(lines) {
+    clearGridLines();
+    if (!candleSeries || !lines) return;
+    var data = (typeof lines === 'string') ? JSON.parse(lines) : lines;
+    (data || []).forEach(function(l) {
+        if (l && typeof l.price === 'number' && !isNaN(l.price)) {
+            var pl = candleSeries.createPriceLine({
+                price: l.price, color: l.color, lineWidth: l.width,
+                lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true,
+                title: l.is_custom ? '\u2605' : ''
+            });
+            gridPriceLines.push(pl);
+        }
+    });
+}
+
+function clearGridCircles() {
+    _storedCircleMarkers = null;
+}
+
+function renderGridCircles(circles) {
+    clearGridCircles();
+    if (!candleSeries || !circles) return;
+    var data = (typeof circles === 'string') ? JSON.parse(circles) : circles;
+    if (!data || data.length === 0) return;
+    _storedCircleMarkers = data;
+    // Circles werden via _applyAllMarkers() auf candleSeries gesetzt
+    _applyAllMarkers(_storedSignalMarkersData);
+}
+
+function applyRange(rangeFrom, rangeTo, priceFrom, priceTo) {
+    if (!chart) return;
+    var timeScale = chart.timeScale();
+    var priceScale = chart.priceScale('right');
+
+    if (rangeFrom && rangeTo && rangeFrom !== rangeTo) {
+        try {
+            timeScale.setVisibleLogicalRange({ from: Number(rangeFrom), to: Number(rangeTo) });
+        } catch(e) {
+            console.warn("[applyRange] Failed to set logical range:", e);
+            try { timeScale.fitContent(); } catch(e2) {}
+        }
+    } else {
+        try { timeScale.fitContent(); } catch(e) {}
+    }
+
+    if (priceFrom !== undefined && priceTo !== undefined && priceFrom !== priceTo) {
+        try { priceScale.setVisibleRange({ from: Number(priceFrom), to: Number(priceTo) }); } catch(e) {}
+    }
+}
+
+// Signal-Marker + Circles: combined auf candleSeries.setMarkers()
+var _storedSignalMarkersData = null;
+
+function clearSignalMarkers() {
+    _storedSignalMarkersData = null;
+    if (seriesMarkersPlugin) {
+        try { seriesMarkersPlugin.setMarkers([]); } catch(e) {}
+    }
+}
+
+function renderSignalMarkers(markers) {
+    var data = (typeof markers === 'string') ? JSON.parse(markers) : markers;
+    if (data && data.length > 0) {
+        _storedSignalMarkersData = data;
+    }
+    _applyAllMarkers(data || []);
+}
+
+function _applyAllMarkers(signalMarkers) {
+    if (!candleSeries) return;
+    try {
+        var allMarkers = [];
+
+        // 1. Signal-Marker
+        if (signalMarkers && signalMarkers.length > 0) {
+            for (var i = 0; i < signalMarkers.length; i++) {
+                var m = signalMarkers[i];
+                allMarkers.push({
+                    time: m.time,
+                    position: m.position || 'aboveBar',
+                    color: m.color || '#26a69a',
+                    shape: m.shape || 'arrowDown',
+                    size: (m.size !== undefined) ? m.size : 1,
+                    text: m.text || ''
+                });
+            }
+        }
+
+        // 2. Circle-Marker
+        if (_storedCircleMarkers && _storedCircleMarkers.length > 0) {
+            for (var j = 0; j < _storedCircleMarkers.length; j++) {
+                var c = _storedCircleMarkers[j];
+                allMarkers.push({
+                    time: c.time,
+                    position: 'inBar',
+                    color: c.color || '#FFEB3B',
+                    shape: 'circle',
+                    size: 1,
+                });
+            }
+        }
+
+        // LWC v5: candleSeries.setMarkers() wurde entfernt → SeriesMarkers-Plugin nutzen.
+        // Das Plugin wird pro Chart-Instanz einmalig erzeugt (Reset in applyFullChartUpdate).
+        if (!seriesMarkersPlugin) {
+            seriesMarkersPlugin = LightweightCharts.createSeriesMarkers(candleSeries, []);
+        }
+        seriesMarkersPlugin.setMarkers(allMarkers);
+    } catch(e) {
+        console.error('[setMarkers] Error:', e.message || e);
+    }
+}
+
+function reapplySignalMarkers() {
+    _applyAllMarkers(_storedSignalMarkersData);
+}
+
+// =============================================================================
+// Tages-Separatoren
+// -----------------------------------------------------------------------------
+// Früher: LineSeries mit 2 Extrem-Punkten (-1000/1000000). Bei LWC v5 rendert
+// eine fast senkrechte 2-Punkt-Linie den Dash NICHT zuverlässig (fällt auf
+// Solid zurück – deshalb war die Linie "durchgezogen").
+// Heute: rein additives CSS-Overlay (border-left: dashed). Garantiert
+// gestrichelt, keine Änderung der Zeitskala, keine Phantom-Index-Slots.
+// =============================================================================
+var daySeparatorContainer = null;
+var _storedDaySeparatorTimes = [];
+
+function _ensureDaySeparatorContainer() {
+    var container = document.getElementById('chart-container');
+    if (!container) return null;
+    if (!daySeparatorContainer) {
+        daySeparatorContainer = document.createElement('div');
+        daySeparatorContainer.style.position = 'absolute';
+        daySeparatorContainer.style.top = '0';
+        daySeparatorContainer.style.left = '0';
+        daySeparatorContainer.style.pointerEvents = 'none';
+        daySeparatorContainer.style.zIndex = '100';
+        container.appendChild(daySeparatorContainer);
+    }
+    return daySeparatorContainer;
+}
+
+function _clearDaySeparatorOverlay() {
+    if (daySeparatorContainer) {
+        daySeparatorContainer.innerHTML = '';
+    }
+    _storedDaySeparatorTimes = [];
+}
+
+function _updateDaySeparatorPositions() {
+    if (!chart || !daySeparatorContainer) return;
+    try {
+        var container = document.getElementById('chart-container');
+        var top = 0;
+        var width = container ? container.clientWidth : 800;
+        var height = container ? container.clientHeight : 600;
+        // Pane-Höhe = Container-Höhe minus Zeitachsen-Höhe (Zeitachse liegt unten)
+        var tsHeight = 0;
+        try { tsHeight = chart.timeScale().height() || 0; } catch(e) { tsHeight = 0; }
+        height = Math.max(0, height - tsHeight);
+
+        daySeparatorContainer.style.top = top + 'px';
+        daySeparatorContainer.style.left = '0px';
+        daySeparatorContainer.style.width = width + 'px';
+        daySeparatorContainer.style.height = height + 'px';
+
+        var children = daySeparatorContainer.children;
+        for (var i = 0; i < _storedDaySeparatorTimes.length && i < children.length; i++) {
+            var x = null;
+            try { x = chart.timeScale().timeToCoordinate(_storedDaySeparatorTimes[i]); } catch(e) { x = null; }
+            if (x === null || x === undefined || isNaN(x)) {
+                children[i].style.display = 'none';
+            } else {
+                children[i].style.display = 'block';
+                // pane.left ist hier 0 (keine linke Preisskala). Falls jemals
+                // eine linke Preisskala ergänzt wird: (x - pane.left) verwenden.
+                children[i].style.left = x + 'px';
+            }
+        }
+    } catch(e) {
+        console.warn("[_updateDaySeparatorPositions] Error:", e);
+    }
+}
+
+function updateDaySeparators(candleData) {
+    if (!chart) return;
+    try {
+        // Alte Separator-Serien (Legacy) entfernen + Overlay leeren
+        dayLinesSeries.forEach(function(s) { try { chart.removeSeries(s); } catch(e){} });
+        dayLinesSeries = [];
+        _clearDaySeparatorOverlay();
+        if (currentTfInSeconds >= 86400 || !candleData || candleData.length === 0) return;
+
+        var lastLineTime = 0;
+
+        for (var i = 1; i < candleData.length; i++) {
+            var prevTime = candleData[i - 1].time;
+            var currTime = candleData[i].time;
+
+            // Echte epoch für Wanduhr-Tag-Berechnung verwenden (resolveRealTime
+            // statt rohem Map-Zugriff -> nie Fake-Zeiten bei fehlendem Mapping).
+            // Die Roh-Epochs sind bereits Berlin-Wanduhr-encoded, daher ergibt
+            // Math.floor(real/86400) den Wanduhr-Tag (Wechsel um 00:00 Berlin).
+            var prevReal = resolveRealTime(prevTime);
+            var currReal = resolveRealTime(currTime);
+
+            var prevUtcDay = Math.floor(prevReal / 86400);
+            var currUtcDay = Math.floor(currReal / 86400);
+
+            var isUtcDayChange = (currUtcDay !== prevUtcDay);
+            var isWeekendGap = (currReal - prevReal > 43200);
+            var isTooCloseToPrevious = (lastLineTime > 0 && (currTime - lastLineTime) < 21600);
+
+            if ((isUtcDayChange || isWeekendGap) && !isTooCloseToPrevious) {
+                lastLineTime = currTime;
+                // 0:00 des neuen Tages = Zeit der ersten Kerze des neuen Tages
+                _storedDaySeparatorTimes.push(currTime);
+            }
+        }
+
+        // CSS-Overlay-Divs anlegen (garantiert gestrichelt via border-left)
+        var sepContainer = _ensureDaySeparatorContainer();
+        if (!sepContainer) return;
+        for (var j = 0; j < _storedDaySeparatorTimes.length; j++) {
+            var div = document.createElement('div');
+            div.style.position = 'absolute';
+            div.style.top = '0';
+            div.style.bottom = '0';
+            div.style.width = '0';
+            div.style.borderLeft = '1px dashed rgba(33, 150, 243, 0.55)';
+            div.style.pointerEvents = 'none';
+            sepContainer.appendChild(div);
+        }
+        _updateDaySeparatorPositions();
+    } catch(e) {
+        console.error("[updateDaySeparators] Error:", e);
+    }
+}
+
+```
+
+--------------------------------------------------
+
+### DATEI: .backup_B_zeitinvarianten/04_live_updates.js
+```js
+// chart/js/04_live_updates.js
+// Live-Tick-Updates, Countdown-Badge, Price-Badge, Range-Sync & Resize-Handling
+
+function syncRanges() {
+    if (!chart || !pyBridge || isUpdatingChart) return;
+    try {
+        var lr = chart.timeScale().getVisibleLogicalRange();
+        if (lr && lr.from !== null && lr.to !== null && !isNaN(lr.from) && !isNaN(lr.to)) {
+            pyBridge.onRangeChanged(Math.floor(lr.from), Math.floor(lr.to));
+        }
+        var pr = chart.priceScale('right').getVisibleRange();
+        if (pr && pr.from !== null && pr.to !== null && !isNaN(pr.from) && !isNaN(pr.to)) {
+            pyBridge.onPriceRangeChanged(pr.from, pr.to);
+        }
+    } catch(e) {}
+}
+
+function updateCountdownDisplay() {
+    if (isUpdatingChart || !candleSeries || !chart || lastClosePrice === null || lastClosePrice === undefined) return;
+    if (!isWindowActive || document.hidden) return;
+
+    try {
+        var priceBadge = document.getElementById('price-badge');
+        var countdownBadge = document.getElementById('countdown-badge');
+        if (!priceBadge || !countdownBadge) return;
+
+        var showCountdown = (currentTfInSeconds > 0 && currentTfInSeconds < 86400);
+
+        // PriceLine auf der candleSeries
+        if (!currentPriceLine) {
+            currentPriceLine = candleSeries.createPriceLine({
+                price: lastClosePrice,
+                color: '#2962FF',
+                lineWidth: 1,
+                lineStyle: LightweightCharts.LineStyle.Dotted,
+                axisLabelVisible: false,
+                title: ''
+            });
+            lastRenderedPrice = lastClosePrice;
+        } else if (lastRenderedPrice !== lastClosePrice) {
+            currentPriceLine.applyOptions({ price: lastClosePrice, title: '' });
+            lastRenderedPrice = lastClosePrice;
+        }
+
+        var y = candleSeries.priceToCoordinate(lastClosePrice);
+        if (y !== null && !isNaN(y)) {
+            var formattedPrice = lastClosePrice.toFixed(currentPrecision);
+            var topPos = (y - 9) + 'px';
+
+            if (lastFormattedPriceStr !== formattedPrice) {
+                priceBadge.innerText = formattedPrice;
+                lastFormattedPriceStr = formattedPrice;
+            }
+            if (lastRenderedTop !== topPos) {
+                priceBadge.style.top = topPos;
+                countdownBadge.style.top = topPos;
+                lastRenderedTop = topPos;
+            }
+            if (priceBadge.style.display !== 'block') {
+                priceBadge.style.display = 'block';
+            }
+
+            if (showCountdown) {
+                var now = Math.floor(Date.now() / 1000);
+                var rem = currentTfInSeconds - (now % currentTfInSeconds);
+                var formattedTime = String(Math.floor(rem/60)).padStart(2,'0') + ':' + String(rem%60).padStart(2,'0');
+                if (lastFormattedTimeStr !== formattedTime) {
+                    countdownBadge.innerText = formattedTime;
+                    lastFormattedTimeStr = formattedTime;
+                }
+                var priceWidth = priceBadge.offsetWidth || 50;
+                var rightPos = (priceWidth + 8) + 'px';
+                if (countdownBadge.style.right !== rightPos) {
+                    countdownBadge.style.right = rightPos;
+                }
+                if (countdownBadge.style.display !== 'block') {
+                    countdownBadge.style.display = 'block';
+                }
+            } else {
+                if (countdownBadge.style.display !== 'none') countdownBadge.style.display = 'none';
+            }
+        } else {
+            if (priceBadge.style.display !== 'none') priceBadge.style.display = 'none';
+            if (countdownBadge.style.display !== 'none') countdownBadge.style.display = 'none';
+        }
+    } catch(e) {
+        var p = document.getElementById('price-badge');
+        var c = document.getElementById('countdown-badge');
+        if (p && p.style.display !== 'none') p.style.display = 'none';
+        if (c && c.style.display !== 'none') c.style.display = 'none';
+    }
+}
+
+function updateLiveCandle(json) {
+    if (!candleSeries || isUpdatingChart) return;
+    try {
+        var c = JSON.parse(json);
+        if (!c || typeof c.time !== 'number' || isNaN(c.time)) return;
+        // Race-Guard: Live-Tick nur anwenden, wenn Symbol/TF noch zum Chart passen.
+        // Verhindert, dass ein verspaeteter Tick vom alten Symbol/TF nach einem
+        // schnellen Wechsel an den falschen Chart angehaengt wird.
+        if (c.symbol !== undefined && c.symbol !== null && c.symbol !== currentSymbol) return;
+        if (c.timeframe !== undefined && c.timeframe !== null && c.timeframe !== currentTimeframe) return;
+        if (c.open === null || c.high === null || c.low === null || c.close === null) return;
+        if (rawCandleData.length > 0 && c.time < rawCandleData[rawCandleData.length-1].time) return;
+        candleSeries.update(c);
+        lastClosePrice = c.close;
+        updateCountdownDisplay();
+    } catch(e) {}
+}
+
+function fitChartContent() { if(chart) chart.timeScale().fitContent(); }
+
+// =============================================================================
+// RESIZE-HANDLING
+// =============================================================================
+function handleResize() {
+    if (!chart) return;
+    var container = document.getElementById('chart-container');
+    if (!container) return;
+    var w = container.clientWidth;
+    var h = container.clientHeight;
+    if (w > 0 && h > 0) {
+        chart.resize(w, h);
+        try { _updateDaySeparatorPositions(); } catch(e) {}
+    }
+}
+
+var _resizeObserver = null;
+function setupResizeObserver() {
+    var container = document.getElementById('chart-container');
+    if (!container) return;
+    if (_resizeObserver) _resizeObserver.disconnect();
+    _resizeObserver = new ResizeObserver(function() { handleResize(); });
+    _resizeObserver.observe(container);
+}
+
+// =============================================================================
+// applyFullChartUpdate – Hauptfunktion
+// =============================================================================
+function applyFullChartUpdate(data) {
+    // =========================================================================
+    // RACE-GUARD: Python sendet eine monotone updateId mit jedem Refresh.
+    // Veraltete Payloads (z. B. langsamer Serializer-Thread aus einem frueheren
+    // Symbol/TF-Stand) werden sofort verworfen, bevor sie den Chart anfassen.
+    // =========================================================================
+    var myId = ++_updateId;
+    var updateId = (data && typeof data.updateId === 'number') ? data.updateId : myId;
+
+    if (updateId < _lastAppliedUpdateId) {
+        console.warn('[applyFullChartUpdate] Veraltetes Update verworfen (id=' + updateId + ' < letzte=' + _lastAppliedUpdateId + ')');
+        isUpdatingChart = false;
+        return;
+    }
+    _lastAppliedUpdateId = updateId;
+
+    try {
+        isUpdatingChart = true;
+
+        // TimeMap speichern (kontinuierliche Zeit -> echte epoch)
+        _continuousTimeMap = data.timeMap || {};
+        // Sortierte Schluessel fuer resolveRealTime() (naechster Zeitpunkt)
+        _continuousKeys = Object.keys(_continuousTimeMap).map(Number).sort(function(a, b) { return a - b; });
+
+        currentSymbol = data.symbol;
+        currentTimeframe = data.timeframe;
+        if (data.timeframe && TF_SECONDS_MAP[data.timeframe]) {
+            currentTfInSeconds = TF_SECONDS_MAP[data.timeframe];
+        }
+
+        var candles = (typeof data.candles === 'string') ? JSON.parse(data.candles) : (data.candles || []);
+
+        var validCandles = candles.filter(function(c) {
+            return c &&
+                typeof c.time === 'number' && !isNaN(c.time) && c.time > 0 &&
+                typeof c.open === 'number' && !isNaN(c.open) && c.open > 0 &&
+                typeof c.high === 'number' && !isNaN(c.high) && c.high > 0 &&
+                typeof c.low === 'number' && !isNaN(c.low) && c.low > 0 &&
+                typeof c.close === 'number' && !isNaN(c.close) && c.close > 0;
+        });
+
+        if (validCandles.length === 0) {
+            console.warn('[applyFullChartUpdate] Keine gueltigen Candles');
+            if (chart) chart.timeScale().fitContent();
+            isUpdatingChart = false;
+            return;
+        }
+
+        // Alte Resourcen entfernen
+        try { clearGridCircles(); } catch(e) {}
+        try { clearGridLines(); } catch(e) {}
+        try { clearSignalMarkers(); } catch(e) {}
+        if (currentPriceLine) {
+            try { if (candleSeries) candleSeries.removePriceLine(currentPriceLine); } catch(e) {}
+            currentPriceLine = null;
+        }
+        if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+
+        if (_resizeObserver) {
+            try { _resizeObserver.disconnect(); } catch(e) {}
+            _resizeObserver = null;
+        }
+
+        try {
+            if (chart) chart.remove();
+        } catch(e) {
+            console.warn('[applyFullChartUpdate] chart.remove() fehlgeschlagen:', e.message || e);
+        }
+        chart = null;
+        candleSeries = null;
+        dayLinesSeries = [];
+        gridPriceLines = [];
+        _storedCircleMarkers = null;
+        seriesMarkersPlugin = null;
+        try { _clearDaySeparatorOverlay(); } catch(e) {}
+
+        var container = document.getElementById('chart-container');
+        if (!container) {
+            isUpdatingChart = false;
+            return;
+        }
+        try { container.querySelectorAll('table, canvas').forEach(function(el) { el.remove(); }); } catch(e) {}
+
+        var isDailyOrHigher = (currentTfInSeconds >= 86400);
+
+        // Schritt 1: Chart erstellen
+        try {
+            chart = LightweightCharts.createChart(container, {
+                width: container.clientWidth || 800,
+                height: container.clientHeight || 600,
+                layout: { background: { type: 'solid', color: '#131722' }, textColor: '#d1d4dc' },
+                grid: { vertLines: { visible: false }, horzLines: { visible: false } },
+                crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+                rightPriceScale: { borderColor: '#2B2B43' },
+                timeScale: { 
+                    borderColor: '#2B2B43', 
+                    timeVisible: !isDailyOrHigher,
+                    secondsVisible: false,
+                    fixRightEdge: false,
+                    fixLeftEdge: false,
+                    shiftVisibleRangeOnNewBar: false,
+                    tickMarkFormatter: function(time, tickMarkType) {
+                        // time ist kontinuierlich (Fake-Zeit). Real-Epoch aus Map holen
+                        // (resolveRealTime statt raw-Map-Zugriff -> kein Fake-Label).
+                        var realTime = resolveRealTime(time);
+                        var p = getBerlinParts(realTime);
+                        if (isDailyOrHigher || tickMarkType <= 2) {
+                            return p.day + '.' + p.month + '.' + p.year.slice(-2);
+                        }
+                        return p.hour + ':' + p.minute;
+                    }
+                },
+                localization: { locale: 'de-DE', timeFormatter: function(t) { 
+                    // t ist bei Zeit-basierten Serien ein UTCTimestamp (Zahl),
+                    // NICHT ein Objekt mit .time – sonst laeuft formatDT ins Leere.
+                    var ts = (t !== null && typeof t === 'object') ? t.time : t;
+                    return formatDT(resolveRealTime(ts)); 
+                } }
+            });
+        } catch(e) {
+            console.error('[applyFullChartUpdate] Schritt 1 (createChart) fehlgeschlagen:', e.message || e);
+            isUpdatingChart = false;
+            return;
+        }
+
+        try { setupResizeObserver(); } catch(e) {}
+
+        var precision = (data.precision !== undefined && data.precision !== null) ? data.precision : currentPrecision;
+        currentPrecision = precision;
+        var minMove = (typeof precision === 'number' && precision > 0 && precision < 10) 
+            ? 1 / Math.pow(10, precision) 
+            : 0.01;
+
+        // Schritt 2: CandlestickSeries
+        try {
+            candleSeries = chart.addSeries(LightweightCharts.CandlestickSeries, {
+                upColor: '#26a69a', downColor: '#ef5350', borderVisible: false,
+                wickUpColor: '#26a69a', wickDownColor: '#ef5350', priceLineVisible: false, lastValueVisible: false,
+                priceFormat: { type: 'price', precision: precision, minMove: minMove }
+            });
+            if (!candleSeries) throw new Error('candleSeries ist null');
+        } catch(e) {
+            console.error('[applyFullChartUpdate] Schritt 2 (addSeries) fehlgeschlagen:', e.message || e);
+            isUpdatingChart = false;
+            return;
+        }
+
+        // Schritt 3: setData
+        try {
+            candleSeries.setData(validCandles);
+        } catch(e) {
+            console.error('[applyFullChartUpdate] Schritt 3 (setData) fehlgeschlagen:', e.message || e);
+            isUpdatingChart = false;
+            return;
+        }
+        rawCandleData = validCandles;
+        lastClosePrice = validCandles[validCandles.length - 1].close;
+
+        // Schritt 4: TimeScale Subscription
+        try {
+            chart.timeScale().subscribeVisibleLogicalRangeChange(function() { 
+                if(!isUpdatingChart) {
+                    try { syncRanges(); } catch(e) {}
+                    try { updateCountdownDisplay(); } catch(e) {}
+                    try { _updateDaySeparatorPositions(); } catch(e) {}
+                }
+            });
+        } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 4 (subscribe) fehlgeschlagen:', e.message || e);
+        }
+
+        // Countdown-Timer (1s Intervall)
+        if (countdownTimer) clearInterval(countdownTimer);
+        countdownTimer = setInterval(function() {
+            try { updateCountdownDisplay(); } catch(e) {}
+        }, 1000);
+
+        // Schritt 5: Grid-Linien
+        try { if (data.gridLines) renderGridLines(data.gridLines); } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 5 (gridLines) fehlgeschlagen:', e.message || e);
+        }
+
+        // Schritt 6: Grid-Circles (speichert nur, Marker setzen via setMarkers)
+        try { if (data.gridCircles) renderGridCircles(data.gridCircles); } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 6 (gridCircles) fehlgeschlagen:', e.message || e);
+        }
+
+        // Schritt 7: Signal-Marker + Circles (combined via candleSeries.setMarkers)
+        try {
+            _storedSignalMarkersData = data.signalMarkers || [];
+            _applyAllMarkers(_storedSignalMarkersData);
+        } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 7 (signalMarkers) fehlgeschlagen:', e.message || e);
+        }
+
+        // Schritt 8: Range
+        try {
+            if (data.rangeFrom !== undefined && data.rangeTo !== undefined &&
+                data.rangeFrom !== null && data.rangeTo !== null &&
+                data.rangeFrom !== data.rangeTo) {
+                pendingRange = { rangeFrom: data.rangeFrom, rangeTo: data.rangeTo, priceFrom: data.priceFrom, priceTo: data.priceTo };
+                applyRange(data.rangeFrom, data.rangeTo, data.priceFrom, data.priceTo);
+            } else {
+                if (chart) chart.timeScale().fitContent();
+            }
+        } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 8 (applyRange) fehlgeschlagen:', e.message || e);
+        }
+
+        // Schritt 9: Day Separators
+        try { updateDaySeparators(rawCandleData); } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 9 (daySeparators) fehlgeschlagen:', e.message || e);
+        }
+
+        // Fertig – isUpdatingChart freigeben + initialen sync
+        isUpdatingChart = false;
+        try { syncRanges(); } catch(e) {}
+        try { updateCountdownDisplay(); } catch(e) {}
+
+    } catch(e) {
+        console.error('[applyFullChartUpdate] GLOBAL Error:', e.message || e);
+        isUpdatingChart = false;
+    }
+}
+
+```
+
+--------------------------------------------------
+
+### DATEI: .backup_B_zeitinvarianten/chart_win.py
+```py
+# chart/chart_win.py
+# ==============================================================================
+# chart/chart_win.py - Exakter Restore für Fensterposition, Leerraum & Zoom
+# ==============================================================================
+
+import json
+import math
+import sys
+from datetime import datetime, timezone as dt_timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from chart.indicators.base_indicator import BaseIndicator
+
+file_path = Path(__file__).resolve()
+project_root = file_path.parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+from PySide6.QtCore import QFile, QIODevice, QObject, QThread, QTimer, QUrl, Signal, Slot, Qt, QEvent
+from PySide6.QtUiTools import QUiLoader
+from PySide6.QtWebChannel import QWebChannel
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebEngineCore import QWebEnginePage
+from PySide6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QMainWindow,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
+
+try:
+    from chart.chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, HTML_TEMPLATE
+    from chart.indicators.grid import GridIndicator
+    from chart.indicator_dialog import IndicatorSettingsDialog
+except ImportError:
+    from chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, HTML_TEMPLATE
+    from indicators.grid import GridIndicator
+    from indicator_dialog import IndicatorSettingsDialog
+
+try:
+    from state_manager import StateManager
+except ImportError:
+    from state_manager import StateManager
+
+from db_service import MarketDataRepository, _parse_json_field, TF_SECONDS_MAP
+
+from chart.overlays.signal_overlay import SignalOverlay
+from analytics.background_workers.live_analyzer import fill_gaps_for_pair
+
+
+def find_null_fields(obj, path=""):
+    """Sucht rekursiv nach None/null in Dictionaries und Listen."""
+    nulls = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            new_path = f"{path}.{k}" if path else k
+            if v is None:
+                nulls.append(new_path)
+            else:
+                nulls.extend(find_null_fields(v, new_path))
+    elif isinstance(obj, list):
+        for idx, item in enumerate(obj):
+            new_path = f"{path}[{idx}]"
+            nulls.extend(find_null_fields(item, new_path))
+    return nulls
+
+
+def _clean_nan(obj):
+    """Entfernt rekursiv alle NaN/Inf-Werte aus Dicts/Listen, damit json.dumps(allow_nan=False) nicht fehlschlaegt."""
+    if isinstance(obj, dict):
+        return {k: _clean_nan(v) for k, v in obj.items() if not (isinstance(v, float) and (math.isnan(v) or math.isinf(v)))}
+    elif isinstance(obj, list):
+        return [_clean_nan(item) for item in obj if not (isinstance(item, float) and (math.isnan(item) or math.isinf(item)))]
+    return obj
+
+
+class WebEngineConsolePage(QWebEnginePage):
+    def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID):
+        print(f"🌐 [JS Console L{lineNumber}]: {message}")
+
+
+class ChartBridge(QObject):
+    rangeChanged = Signal(float, float)
+    priceRangeChanged = Signal(float, float)
+    measurementChanged = Signal(str)
+
+    @Slot(float, float)
+    def onRangeChanged(self, f, t): self.rangeChanged.emit(f, t)
+
+    @Slot(float, float)
+    def onPriceRangeChanged(self, f, t): self.priceRangeChanged.emit(f, t)
+
+    @Slot(str)
+    def onMeasurementChanged(self, m): self.measurementChanged.emit(m)
+
+
+class ChartDataSerializer(QThread):
+    """Serialisiert Chart-Update-Pakete im Hintergrund-Thread (JSON-Encoding)."""
+    serialized = Signal(str, int)  # fertiges JSON, updateId
+
+    def __init__(self, update_package: dict, update_id: int, parent=None):
+        super().__init__(parent)
+        self.update_package = update_package
+        self.update_id = update_id
+
+    def run(self):
+        try:
+            payload = json.dumps(self.update_package, allow_nan=False)
+            self.serialized.emit(payload, self.update_id)
+        except (ValueError, TypeError) as e:
+            print(f"⚠️ [Serializer] JSON-Fehler: {e}")
+            self.serialized.emit("", self.update_id)
+
+
+class GridDataSerializer(QThread):
+    """Serialisiert Grid-Linien/Circles im Hintergrund-Thread."""
+    done = Signal(str, str, int)  # lines_json, circles_json, gridGen
+
+    def __init__(self, lines: list, circles: list, grid_gen: int, parent=None):
+        super().__init__(parent)
+        self.lines = lines
+        self.circles = circles
+        self.grid_gen = grid_gen
+
+    def run(self):
+        try:
+            lj = json.dumps(self.lines, allow_nan=False)
+            cj = json.dumps(self.circles, allow_nan=False)
+            self.done.emit(lj, cj, self.grid_gen)
+        except (ValueError, TypeError) as e:
+            print(f"⚠️ [GridSerializer] JSON-Fehler: {e}")
+            self.done.emit("", "", self.grid_gen)
+
+
+class PyTraderChartWindow(QMainWindow):
+    closed_signal = Signal(str)
+
+    def __init__(self, instance_id="win_1", symbol="SILVER", timeframe="H1", visible_from=None, visible_to=None,
+                 state_manager=None):
+        super().__init__()
+        self.instance_id = instance_id
+        self.current_symbol = symbol
+        self.current_tf = timeframe
+        self.visible_from = visible_from
+        self.visible_to = visible_to
+        self.visible_price_from = None
+        self.visible_price_to = None
+        self.measurement_state = None
+        self.indicators_state = {}
+
+        self.state_manager = state_manager or StateManager()
+        self.settings = self.state_manager.get_app_settings()
+        self.market_repo = MarketDataRepository()
+        self._is_loading_data = False
+        self.df_data = None
+
+        # Generische Indikator-Registry: indicator_id -> BaseIndicator
+        self.indicators: Dict[str, BaseIndicator] = {
+            "grid": GridIndicator(),
+        }
+        self._settings_dialog: Optional[QDialog] = None
+        self._page_loaded: bool = False
+
+        self.signal_overlay = SignalOverlay()
+        # Signal-Marker standardmaessig AUS, toggle via Button (📈)
+        self._signals_enabled: bool = False
+        self._grid_serializer: Optional[GridDataSerializer] = None
+        self._chart_serializer: Optional[ChartDataSerializer] = None
+        # Debounce-Timer für Chart-Refresh (verhindert Race-Conditions bei schnellen Wechseln)
+        self._debounce_timer: QTimer = QTimer(self)
+        self._debounce_timer.setSingleShot(True)
+        self._debounce_timer.setInterval(400)
+        self._debounce_timer.timeout.connect(self._safe_refresh_chart_data)
+        # Watchdog: setzt _is_loading_data automatisch zurueck, falls ein Refresh haengt
+        # (verhindert dauerhafte Blockade von TF-/Symbol-Wechsel)
+        self._loading_watchdog: QTimer = QTimer(self)
+        self._loading_watchdog.setSingleShot(True)
+        self._loading_watchdog.setInterval(15000)
+        self._loading_watchdog.timeout.connect(self._on_loading_watchdog)
+        # Mapping: kontinuierliche Zeit -> originale epoch (für JS tickMarkFormatter)
+        self._time_cont_to_real: Dict[int, int] = {}
+        self._time_real_to_cont: Dict[int, int] = {}
+        # Generations-Guard: monoton steigende Update-IDs für Chart- und Grid-Refresh.
+        # Veraltete Serializer-Ergebnisse (langsamer Thread aus einem frueheren
+        # Symbol/TF-Stand) werden in _apply_chart_update/_apply_grid_render verworfen.
+        self._update_generation: int = 0
+        self._grid_generation: int = 0
+
+                # 1. ZUERST versuchen, spezifischen Instanz-Status aus der DB zu laden
+        saved_inst_st = self.state_manager.load_all_instances()
+        matched_inst = next((i for i in saved_inst_st if i.get("instance_id") == self.instance_id), None)
+
+        if matched_inst:
+            raw_symbol = matched_inst.get("symbol")
+            raw_tf = matched_inst.get("timeframe")
+            self.current_symbol = str(raw_symbol) if raw_symbol is not None else self.current_symbol
+            self.current_tf = str(raw_tf) if raw_tf is not None else self.current_tf
+            if self.visible_from is None:
+                self.visible_from = matched_inst.get("visible_range_from")
+                self.visible_to = matched_inst.get("visible_range_to")
+            self.visible_price_from = matched_inst.get("visible_price_from")
+            self.visible_price_to = matched_inst.get("visible_price_to")
+
+            ind_st = matched_inst.get("indicators_state")
+            if ind_st is not None and not isinstance(ind_st, (int, float)):
+                self.indicators_state = _parse_json_field(ind_st) or {}
+
+        # 2. FALLBACK: Wenn keine Instanz da ist (z. B. neues manuelles Fenster), lade zuletzt gespeicherte Symbol:TF Combo
+        if not isinstance(self.indicators_state, dict) or not self.indicators_state or self.visible_from is None:
+            if not isinstance(self.indicators_state, dict):
+                self.indicators_state = {}
+            pair_st = self.state_manager.get_symbol_tf_state(self.current_symbol, self.current_tf)
+            if pair_st:
+                if self.visible_from is None:
+                    self.visible_from = pair_st.get("visible_range_from")
+                    self.visible_to = pair_st.get("visible_range_to")
+                if self.visible_price_from is None:
+                    self.visible_price_from = pair_st.get("visible_price_from")
+                    self.visible_price_to = pair_st.get("visible_price_to")
+                if pair_st.get("indicators_state") and not self.indicators_state:
+                    ind_st_pair = pair_st.get("indicators_state")
+                    if ind_st_pair is not None and not isinstance(ind_st_pair, (int, float)):
+                        self.indicators_state = _parse_json_field(ind_st_pair) or {}
+
+        # Sicherstellen, dass indicators_state ein dict ist
+        if not isinstance(self.indicators_state, dict):
+            self.indicators_state = {}
+
+        # Standard-Indikator-Setups ergänzen falls unvollständig
+        for ind_id, ind_plugin in self.indicators.items():
+            if ind_id not in self.indicators_state:
+                self.indicators_state[ind_id] = {
+                    "active": False,
+                    "preset": "Default",
+                    "params": dict(ind_plugin.default_params)
+                }
+            else:
+                # Fehlende Default-Parameter nachtragen (z. B. neue Farb-Parameter)
+                existing_params = self.indicators_state[ind_id].get("params", {})
+                merged = dict(ind_plugin.default_params)
+                merged.update(existing_params)
+                self.indicators_state[ind_id]["params"] = merged
+
+        # UI Laden aus .ui
+        base_dir = Path(__file__).resolve().parent.parent
+        ui_file = QFile(str(base_dir / "ui" / "chart_win.ui"))
+        if ui_file.open(QIODevice.ReadOnly):
+            loader = QUiLoader()
+            self.ui_widget = loader.load(ui_file)
+            ui_file.close()
+            self.setCentralWidget(self.ui_widget)
+        else:
+            self.ui_widget = QWidget(self)
+            self.setCentralWidget(self.ui_widget)
+
+        self.setWindowTitle(f"PyTrader Chart - {self.current_symbol} [{self.current_tf}] ({self.instance_id})")
+        self.resize(1000, 700)
+
+        self.symbol_combo = self.ui_widget.findChild(QComboBox, "combo_symbol")
+        self.tf_combo = self.ui_widget.findChild(QComboBox, "combo_tf")
+        self.btn_reset = self.ui_widget.findChild(QPushButton, "btn_reset_chart")
+        self.btn_indicator = self.ui_widget.findChild(QPushButton, "btn_indicator_grid")
+        self.btn_signal = self.ui_widget.findChild(QPushButton, "btn_signal_select")
+        self.chart_container = self.ui_widget.findChild(QWidget, "web_container")
+
+        if self.symbol_combo:
+            self.symbol_combo.setCurrentText(str(self.current_symbol) if self.current_symbol is not None else "SILVER")
+            self.symbol_combo.currentTextChanged.connect(self.on_symbol_changed)
+        if self.tf_combo:
+            self.tf_combo.setCurrentText(str(self.current_tf) if self.current_tf is not None else "H1")
+            self.tf_combo.currentTextChanged.connect(self.on_tf_changed)
+        if self.btn_reset:
+            self.btn_reset.clicked.connect(self.fit_chart)
+        if self.btn_indicator:
+            self.btn_indicator.setCheckable(True)
+            self.btn_indicator.clicked.connect(self.toggle_grid_lines)
+            self.btn_indicator.installEventFilter(self)
+            self.update_indicator_button_style()
+
+        if self.btn_signal:
+            self.btn_signal.setCheckable(True)
+            self.btn_signal.clicked.connect(self.on_signal_button_clicked)
+
+        self.web_view = QWebEngineView()
+        self.web_view.setPage(WebEngineConsolePage(self.web_view))
+        self.web_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        target = self.chart_container if self.chart_container else self.ui_widget
+        layout = target.layout()
+        if layout is None:
+            layout = QVBoxLayout(target)
+            layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.web_view, 1)
+
+        self.bridge = ChartBridge()
+        self.bridge.rangeChanged.connect(self.handle_range_changed)
+        self.bridge.priceRangeChanged.connect(self.handle_price_range_changed)
+        self.bridge.measurementChanged.connect(self.handle_measurement_changed)
+        self.channel = QWebChannel()
+        self.channel.registerObject("pyBridge", self.bridge)
+        self.web_view.page().setWebChannel(self.channel)
+        self.web_view.setHtml(HTML_TEMPLATE, QUrl("https://localhost"))
+        self.web_view.loadFinished.connect(self._on_page_loaded)
+
+    def _auto_init_signal_set(self) -> None:
+        """Nicht mehr verwendet - Testsignal ist deaktiviert."""
+        pass
+
+    def eventFilter(self, watched, event):
+        if self.btn_indicator is not None and watched == self.btn_indicator and event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton:
+            # Wenn Dialog offen, schliessen; sonst öffnen
+            if self._settings_dialog is not None and self._settings_dialog.isVisible():
+                self._settings_dialog.close()
+                self._settings_dialog = None
+            else:
+                self._open_indicator_settings("grid")
+            return True
+        return super().eventFilter(watched, event)
+
+    def _get_indicator_plugin(self, ind_id: str) -> Optional[BaseIndicator]:
+        """Gibt die Indikator-Instanz zur ID zurück (oder None)."""
+        return self.indicators.get(ind_id)
+
+    def update_indicator_button_style(self):
+        if not self.btn_indicator: return
+        is_active = self.indicators_state.get("grid", {}).get("active", False)
+        color = "#2e7d32" if is_active else "#37474f"
+        self.btn_indicator.setStyleSheet(
+            f"background-color: {color}; color: white; font-weight: bold; border-radius: 4px; padding: 3px 10px;")
+
+    def toggle_grid_lines(self):
+        self._toggle_indicator("grid")
+
+    def _toggle_indicator(self, ind_id: str) -> None:
+        """Schaltet einen Indikator an/aus."""
+        plugin = self._get_indicator_plugin(ind_id)
+        if plugin is None:
+            return
+        st = self.indicators_state.setdefault(ind_id, {
+            "active": False, "preset": "Default", "params": dict(plugin.default_params)
+        })
+        st["active"] = not st["active"]
+        self.update_indicator_button_style()
+        self.save_state()
+        self.render_indicators()
+
+    def _open_indicator_settings(self, ind_id: str) -> None:
+        """Öffnet den Einstellungs-Dialog für einen Indikator."""
+        plugin = self._get_indicator_plugin(ind_id)
+        if plugin is None:
+            return
+        st = self.indicators_state.setdefault(ind_id, {
+            "active": False, "preset": "Default", "params": dict(plugin.default_params)
+        })
+        dialog = IndicatorSettingsDialog(plugin, st["params"], st["preset"], self.state_manager,
+                                         lambda p, pr: self._on_indicator_params_updated(ind_id, p, pr), self)
+        self._settings_dialog = dialog
+        dialog.finished.connect(lambda: self._on_settings_closed(dialog))
+        dialog.show()
+
+    def _on_settings_closed(self, dialog):
+        if self._settings_dialog is dialog:
+            self._settings_dialog = None
+
+    def _on_page_loaded(self, ok: bool) -> None:
+        if ok:
+            self._page_loaded = True
+            # Initialer Refresh direkt (ohne Debounce), danach nur noch via Debounce
+            self._safe_refresh_chart_data()
+
+    def _safe_refresh_chart_data(self) -> None:
+        """Startet den Chart-Refresh mit Fehler-Schutz.
+        Stellt sicher, dass _is_loading_data bei einem Fehler zurueckgesetzt wird –
+        sonst bleibt der Chart dauerhaft blockiert (keine Charts, TF/Symbol-Wechsel tot)."""
+        try:
+            self._do_refresh_chart_data()
+        except Exception as e:
+            print(f"❌ [ChartRefresh] Fehler: {e}")
+            self._set_loading(False)
+
+    def _set_loading(self, loading: bool) -> None:
+        """Setzt _is_loading_data und startet/stoppt den Watchdog konsistent."""
+        self._is_loading_data = loading
+        if loading:
+            self._loading_watchdog.start()
+        else:
+            self._loading_watchdog.stop()
+
+    def _on_loading_watchdog(self) -> None:
+        """Watchdog-Timeout: Ein Chart-Refresh haengt zu lange (z. B. durch Fehler).
+        Setzt das Flag zurueck, damit TF-/Symbol-Wechsel wieder funktionieren."""
+        print(f"⚠️ [ChartRefresh] Watchdog: Refresh haengt ({self.current_symbol} {self.current_tf}), setze zurueck")
+        self._is_loading_data = False
+
+    def _on_indicator_params_updated(self, ind_id: str, params: Dict[str, Any], preset: str) -> None:
+        """Callback wenn ein Indikator-Parameter geändert wurde."""
+        self.indicators_state[ind_id] = {"active": True, "preset": preset, "params": params}
+        self.save_state()
+        self.render_indicators()
+
+    def render_indicators(self):
+        """Rendert alle aktiven Indikatoren via JS-Bridge."""
+        if self.df_data is None or self.df_data.empty:
+            return
+
+        # Zuerst alle Indikator-Layer clearen
+        try:
+            self.web_view.page().runJavaScript("if(window.clearGridLines) clearGridLines();")
+            self.web_view.page().runJavaScript("if(window.clearGridCircles) clearGridCircles();")
+        except (RuntimeError, AttributeError):
+            pass
+
+        for ind_id, plugin in self.indicators.items():
+            st = self.indicators_state.get(ind_id, {})
+            if not st.get("active"):
+                continue
+            try:
+                # Kontext setzen (Symbol/TF fuer DB-basierte Indikatoren)
+                if hasattr(plugin, "set_context"):
+                    plugin.set_context(self.current_symbol, self.current_tf)
+                res = plugin.calculate(self.df_data, st.get("params", {}))
+                # Grid-spezifische Render-Logik (aktuell der einzige Indikator)
+                if ind_id == "grid":
+                    lines = res.get("lines", [])
+                    circles = res.get("hit_circles", [])
+                    # Circle-Zeiten auf kontinuierlich mappen
+                    if circles and self._time_real_to_cont:
+                        for gc in circles:
+                            gc_t = gc.get("time")
+                            if gc_t is not None and int(gc_t) in self._time_real_to_cont:
+                                gc["time"] = self._time_real_to_cont[int(gc_t)]
+                    # JSON-Encoding im Hintergrund
+                    self._serialize_and_render_grid(lines, circles)
+            except (RuntimeError, AttributeError):
+                pass
+
+    def _serialize_and_render_grid(self, lines: list, circles: list) -> None:
+        """Serialisiert Grid-Daten im Hintergrund-Thread und rendert sie.
+        Alter Thread wird vor Neustart sauber beendet.
+        Generations-Guard: jede Render-Anforderung bekommt eine steigende ID;
+        veraltete Ergebnisse (langsamer Thread) werden verworfen."""
+        # Alten Serializer cleanen falls noch aktiv
+        if self._grid_serializer is not None:
+            try:
+                self._grid_serializer.done.disconnect(self._apply_grid_render)
+            except (RuntimeError, TypeError):
+                pass
+            if self._grid_serializer.isRunning():
+                self._grid_serializer.quit()
+                self._grid_serializer.wait(500)
+            self._grid_serializer = None
+
+        self._grid_generation += 1
+        grid_gen = self._grid_generation
+        self._grid_serializer = GridDataSerializer(lines, circles, grid_gen)
+        self._grid_serializer.done.connect(self._apply_grid_render)
+        self._grid_serializer.start()
+
+    def _apply_grid_render(self, lines_json: str, circles_json: str, grid_gen: int) -> None:
+        """Übergibt serialisierte Grid-Daten an JS (wird im GUI-Thread aufgerufen).
+        Verwirft veraltete Ergebnisse, falls inzwischen ein neuerer Render lief."""
+        if grid_gen < self._grid_generation:
+            print(f"⚠️ [GridRender] Veraltetes Ergebnis verworfen (gen={grid_gen} < {self._grid_generation})")
+            return
+        if not lines_json and not circles_json:
+            return
+        try:
+            if lines_json:
+                self.web_view.page().runJavaScript(
+                    f"if(window.renderGridLines) renderGridLines('{lines_json}');")
+            if circles_json:
+                self.web_view.page().runJavaScript(
+                    f"if(window.renderGridCircles) renderGridCircles('{circles_json}');")
+        except (RuntimeError, AttributeError):
+            pass
+
+    def refresh_chart_data(self) -> None:
+        """Debounced: Startet Chart-Refresh mit 400ms Verzögerung.
+        Bei schnellen Mehrfach-Aufrufen wird nur der letzte ausgeführt."""
+        if not self._page_loaded:
+            QTimer.singleShot(200, self.refresh_chart_data)
+            return
+        self._debounce_timer.start()
+
+    def _do_refresh_chart_data(self) -> None:
+        """Führt den tatsächlichen Chart-Refresh aus (nur via Debounce-Timer)."""
+        if self._is_loading_data:
+            self._debounce_timer.start()
+            return
+
+        self._set_loading(True)
+
+        print(f"📊 Lade Chart-Daten: {self.current_symbol} {self.current_tf}")
+        candles, precision = self.market_repo.fetch_historical_candles(self.current_symbol, self.current_tf, limit=self.settings.chart_candle_limit)
+        print(f"   → {len(candles)} Candles geladen, precision={precision}")
+
+        # NaN-Werte aus den Candles entfernen
+        clean_candles = []
+        if candles:
+            import math
+            for c in candles:
+                if (c.get("time") is not None and
+                    c.get("open") is not None and
+                    c.get("high") is not None and
+                    c.get("low") is not None and
+                    c.get("close") is not None):
+                    if (not math.isnan(c["open"]) and
+                        not math.isnan(c["high"]) and
+                        not math.isnan(c["low"]) and
+                        not math.isnan(c["close"])):
+                        clean_candles.append(c)
+
+            # ======================================================================
+            # Kontinuierliche Candle-Zeiten (keinerlei Lücken/Whitespace im Chart)
+            # Jede Candle bekommt: base_time + i * tf_sec
+            # Mapping cont -> real für JS tickMarkFormatter.
+            # ======================================================================
+            t_sec = TF_SECONDS_MAP.get(str(self.current_tf).upper(), 60)
+            self._time_cont_to_real = {}
+            self._time_real_to_cont = {}
+            continuous_candles = []
+            if clean_candles:
+                base_time = clean_candles[0]["time"]
+                for i, c in enumerate(clean_candles):
+                    cont_time = base_time + i * t_sec
+                    real_time = int(c["time"])
+                    self._time_cont_to_real[cont_time] = real_time
+                    self._time_real_to_cont[real_time] = cont_time
+                    dc = dict(c)
+                    dc["time"] = cont_time
+                    continuous_candles.append(dc)
+
+            import pandas as pd
+            self.df_data = pd.DataFrame(clean_candles)
+        else:
+            self.df_data = None
+            continuous_candles = []
+
+        grid_lines = []
+        grid_circles = []
+
+        if self.df_data is not None and not self.df_data.empty:
+            for ind_id, plugin in self.indicators.items():
+                st = self.indicators_state.get(ind_id, {})
+                if st.get("active") and ind_id == "grid":
+                    if hasattr(plugin, "set_context"):
+                        plugin.set_context(self.current_symbol, self.current_tf)
+                    res = plugin.calculate(self.df_data, st.get("params", {}))
+                    grid_lines = res.get("lines", [])
+                    grid_circles = res.get("hit_circles", [])
+                    # Circle-Zeiten auf kontinuierlich mappen
+                    if grid_circles and self._time_real_to_cont:
+                        for gc in grid_circles:
+                            gc_t = gc.get("time")
+                            if gc_t is not None and int(gc_t) in self._time_real_to_cont:
+                                gc["time"] = self._time_real_to_cont[int(gc_t)]
+
+        update_package = {
+            "symbol": self.current_symbol,
+            "timeframe": self.current_tf,
+            "candles": continuous_candles,
+            "precision": precision,
+            "gridLines": grid_lines,
+            "gridCircles": grid_circles,
+            "signalMarkers": self._get_signal_markers_for_update(),
+            "timeMap": self._time_cont_to_real,
+        }
+
+        # Generations-Guard: monotone Update-ID für Race-Schutz im JS.
+        # WICHTIG: Wird VOR dem Serializer-Start inkrementiert, damit jeder
+        # Refresh eine eindeutig hoehere ID als der vorherige erhaelt.
+        self._update_generation += 1
+        update_id = self._update_generation
+        update_package["updateId"] = update_id
+
+        # Nur hinzufügen, wenn echte Werte da sind – nie null/0 übergeben (sonst "Value is null" in JS)
+        if self.visible_from is not None and self.visible_to is not None:
+            update_package["rangeFrom"] = int(self.visible_from)
+            update_package["rangeTo"] = int(self.visible_to)
+
+        if self.visible_price_from is not None and self.visible_price_to is not None:
+            update_package["priceFrom"] = float(self.visible_price_from)
+            update_package["priceTo"] = float(self.visible_price_to)
+
+        # NaN/Inf-Werte aus dem gesamten Payload entfernen (sonst JSON-Fehler im Serializer)
+        update_package = _clean_nan(update_package)
+
+        # JSON-Encoding im Hintergrund-Thread, um GUI-Ruckler zu vermeiden
+        # Alten Serializer cleanen falls noch aktiv
+        if self._chart_serializer is not None:
+            try:
+                self._chart_serializer.serialized.disconnect(self._apply_chart_update)
+            except (RuntimeError, TypeError):
+                pass
+            if self._chart_serializer.isRunning():
+                self._chart_serializer.quit()
+                self._chart_serializer.wait(500)
+            self._chart_serializer = None
+
+        self._chart_serializer = ChartDataSerializer(update_package, update_id)
+        self._chart_serializer.serialized.connect(self._apply_chart_update)
+        self._chart_serializer.start()
+
+    def _apply_chart_update(self, payload: str, update_id: int) -> None:
+        """Empfängt fertiges JSON aus dem Serializer-Thread und prüft es auf nulls.
+        Generations-Guard: veraltete Payloads (langsamer Thread aus einem
+        frueheren Symbol/TF-Stand) werden verworfen, bevor sie JS erreichen."""
+        # Veraltetes Update verwerfen – ein neuerer Refresh hat bereits begonnen
+        if update_id < self._update_generation:
+            print(f"⚠️ [ChartUpdate] Veraltetes Update verworfen (id={update_id} < {self._update_generation})")
+            return
+        if not payload:
+            self._set_loading(False)
+            return
+
+        # ======================================================================
+        # DEBUG-CHECK: Identifiziert das exakte null-Objekt in Python!
+        # ======================================================================
+        try:
+            import json as _json
+            data = _json.loads(payload)
+            null_paths = find_null_fields(data)
+            if null_paths:
+                print(f"🚨 [NULL DETECTED in {self.current_symbol} {self.current_tf}] Gefundene null-Pfade:")
+                for p in null_paths[:15]:  # Zeige die ersten 15 Treffer
+                    print(f"   -> {p}")
+        except Exception as debug_err:
+            print(f"⚠️ [NullCheck] Fehler: {debug_err}")
+        # ======================================================================
+
+        try:
+            if hasattr(self, "web_view") and self.web_view and self.web_view.page():
+                self.web_view.page().runJavaScript(
+                    f"if(window.applyFullChartUpdate) applyFullChartUpdate({payload});"
+                )
+        except (RuntimeError, AttributeError):
+            pass
+        finally:
+            QTimer.singleShot(500, self._unlock_tracking)
+
+    def _unlock_tracking(self):
+        try:
+            self._set_loading(False)
+            self.update_indicator_button_style()
+        except (RuntimeError, AttributeError):
+            pass
+
+    def update_live_candle(self, c: Dict[str, Any]) -> None:
+        if not c or self._is_loading_data: return
+        t_sec = TF_SECONDS_MAP.get(str(self.current_tf).upper(), 60)
+
+        # Sichere Typprüfung für das time-Feld
+        time_val = c.get("time", 0)
+        if isinstance(time_val, datetime):
+            raw_t = int(time_val.timestamp())
+        elif isinstance(time_val, (int, float)):
+            raw_t = int(time_val)
+        else:
+            raw_t = 0
+
+        c_copy = dict(c)
+        # Symbol/TF mitliefern – der JS-Guard in updateLiveCandle() verwirft
+        # verspaetete Ticks, die nach einem schnellen Symbol/TF-Wechsel eintreffen.
+        c_copy["symbol"] = self.current_symbol
+        c_copy["timeframe"] = self.current_tf
+        rounded_t = raw_t - (raw_t % t_sec)
+
+        # Auf kontinuierliche Zeit mappen (kein Leerraum im Chart)
+        if rounded_t in self._time_real_to_cont:
+            c_copy["time"] = self._time_real_to_cont[rounded_t]
+        elif self._time_cont_to_real:
+            # Neue Candle: an letzte kont. Zeit anhängen
+            last_cont = max(self._time_cont_to_real.keys())
+            c_copy["time"] = last_cont + t_sec
+            self._time_cont_to_real[c_copy["time"]] = rounded_t
+            self._time_real_to_cont[rounded_t] = c_copy["time"]
+        else:
+            c_copy["time"] = rounded_t
+
+        try:
+            self.web_view.page().runJavaScript(f"if(window.updateLiveCandle) updateLiveCandle('{json.dumps(c_copy, allow_nan=False)}');")
+        except (ValueError, TypeError) as e:
+            print(f"⚠️ [JSON] NaN in Live-Candle: {e}")
+        except (RuntimeError, AttributeError):
+            pass
+
+    def on_symbol_changed(self, s):
+        if s and s != self.current_symbol:
+            self.save_state()
+            self.current_symbol = s
+            self.df_data = None
+            pair_st = self.state_manager.get_symbol_tf_state(self.current_symbol, self.current_tf)
+            if pair_st:
+                self.visible_from = pair_st.get("visible_range_from")
+                self.visible_to = pair_st.get("visible_range_to")
+                self.visible_price_from = pair_st.get("visible_price_from")
+                self.visible_price_to = pair_st.get("visible_price_to")
+                if pair_st.get("indicators_state"):
+                    ind_st = pair_st.get("indicators_state")
+                    loaded_ind = _parse_json_field(ind_st) or {}
+                    # Merge statt ersetzen, damit Grid-Fallback erhalten bleibt
+                    self.indicators_state.update(loaded_ind)
+                    # Fehlende Default-Parameter nachtragen
+                    for ind_id, ind_plugin in self.indicators.items():
+                        if ind_id in self.indicators_state:
+                            existing = self.indicators_state[ind_id].get("params", {})
+                            merged = dict(ind_plugin.default_params)
+                            merged.update(existing)
+                            self.indicators_state[ind_id]["params"] = merged
+            else:
+                self.visible_from = self.visible_to = None
+                self.visible_price_from = self.visible_price_to = None
+
+            # Chart-Trigger: Luecken fuer live_op=True Signale fuellen
+            fill_gaps_for_pair(self.current_symbol, self.current_tf, self.settings.feature_builder_limit)
+            self.refresh_chart_data()
+
+    def on_tf_changed(self, t):
+        if t and t != self.current_tf:
+            self.save_state()
+            self.current_tf = t
+            self.df_data = None
+            pair_st = self.state_manager.get_symbol_tf_state(self.current_symbol, self.current_tf)
+            if pair_st:
+                self.visible_from = pair_st.get("visible_range_from")
+                self.visible_to = pair_st.get("visible_range_to")
+                self.visible_price_from = pair_st.get("visible_price_from")
+                self.visible_price_to = pair_st.get("visible_price_to")
+                if pair_st.get("indicators_state"):
+                    ind_st = pair_st.get("indicators_state")
+                    loaded_ind = _parse_json_field(ind_st) or {}
+                    # Merge statt ersetzen, damit Grid-Fallback erhalten bleibt
+                    self.indicators_state.update(loaded_ind)
+                    # Fehlende Default-Parameter nachtragen
+                    for ind_id, ind_plugin in self.indicators.items():
+                        if ind_id in self.indicators_state:
+                            existing = self.indicators_state[ind_id].get("params", {})
+                            merged = dict(ind_plugin.default_params)
+                            merged.update(existing)
+                            self.indicators_state[ind_id]["params"] = merged
+            else:
+                self.visible_from = self.visible_to = None
+                self.visible_price_from = self.visible_price_to = None
+
+            # Chart-Trigger: Luecken fuer live_op=True Signale fuellen
+            fill_gaps_for_pair(self.current_symbol, self.current_tf, self.settings.feature_builder_limit)
+            self.refresh_chart_data()
+
+    def on_signal_button_clicked(self):
+        """Schaltet ALLE Signal-Marker an/aus (Grid Proximity + EMA-Signale).
+        Testsignale (alternating_arrow_v1) bleiben deaktiviert.
+        Aktualisiert NUR die Signal-Marker, ohne Chart-Neubau."""
+        if not self.btn_signal:
+            return
+
+        self._signals_enabled = self.btn_signal.isChecked()
+        status = "AN" if self._signals_enabled else "AUS"
+        print(f"🔔 Signale: {status}")
+        self._update_signal_markers_only()
+
+    def _update_signal_markers_only(self) -> None:
+        """Aktualisiert NUR die Signal-Marker im Chart, OHNE kompletten Chart-Neubau.
+        Blockiert waerend _is_loading_data (Race-Condition-Schutz)."""
+        if not self._page_loaded or self.df_data is None or self.df_data.empty or self._is_loading_data:
+            return
+
+        markers = self._get_signal_markers_for_update()
+        markers_json = json.dumps(markers, allow_nan=False)
+
+        # ======================================================================
+        # DEBUG-CHECK für Marker-Updates
+        # ======================================================================
+        try:
+            null_paths = find_null_fields(markers)
+            if null_paths:
+                print(f"🚨 [NULL MARKER in {self.current_symbol} {self.current_tf}] Gefundene null-Pfade:")
+                for p in null_paths[:10]:
+                    print(f"   -> markers{p}")
+        except Exception:
+            pass
+        # ======================================================================
+
+        try:
+            self.web_view.page().runJavaScript(
+                f"if(window.renderSignalMarkers) renderSignalMarkers({markers_json});"
+            )
+        except (RuntimeError, AttributeError) as e:
+            print(f"⚠️ [SignalMarker] JS-Fehler: {e}")
+
+    # ==============================================================================
+    # Live-Signal Integration (wird von MainWindow.on_live_signal gerufen)
+    # ==============================================================================
+
+    def on_live_signal_received(self, symbol: str, timeframe: str, bar_time: int, confidence: float, source_id: str) -> None:
+        """Wird vom MainWindow bei neuem Live-Signal gerufen.
+        Aktualisiert NUR die Marker, kein Chart-Neubau.
+        Blockiert waerend _is_loading_data (verhindert JS-Race-Condition)."""
+        if symbol != self.current_symbol or timeframe != self.current_tf:
+            return
+        if self._is_loading_data or not self._page_loaded:
+            return
+        self._update_signal_markers_only()
+
+    @staticmethod
+    def _apply_marker_styles(markers: List[Dict[str, Any]], source_id: str) -> List[Dict[str, Any]]:
+        """Wendet visuelle Stile auf Marker basierend auf source_id an.
+        Ermoeglicht Unterscheidung verschiedener Signal-Typen im Chart."""
+        for m in markers:
+            if source_id == "alternating_arrow_v1":
+                # Alternierende Pfeile: Buy=arrowUp (oben), Sell=arrowDown (unten)
+                if m["time"] % 2 == 0:
+                    m["position"] = "belowBar"
+                    m["shape"] = "arrowUp"
+                    m["color"] = "#26a69a"  # Gruen
+                else:
+                    m["position"] = "aboveBar"
+                    m["shape"] = "arrowDown"
+                    m["color"] = "#ef5350"  # Rot
+            elif source_id == "grid_proximity_v1":
+                # Grid-Proximity: Kreise oberhalb
+                m["position"] = "aboveBar"
+                m["shape"] = "circle"
+                m["color"] = "#7B1FA2"  # Lila
+            elif source_id == "ema_atr_set_v1":
+                # EMA/ATR: Quadrate oberhalb
+                m["position"] = "aboveBar"
+                m["shape"] = "square"
+                m["color"] = "#FF9800"  # Orange
+        return markers
+
+    def _get_signal_markers_for_update(self) -> List[Dict[str, Any]]:
+        """Sammelt alle Signal-Marker fuer den Chart-Update-Payload.
+        - Testsignal (alternating_arrow_v1): DEAKTIVIERT
+        - Grid Proximity (grid_proximity_v1): nur wenn Signal-Button aktiv
+        - EMA-Signale (ema_atr_set_v1): nur wenn Signal-Button aktiv
+        Marker-Zeiten werden auf Candle-Grenzen gerundet (exakter Match mit candleSeries in LWC v5)."""
+        if self.df_data is None or self.df_data.empty:
+            return []
+
+        t_sec = TF_SECONDS_MAP.get(str(self.current_tf).upper(), 60)
+
+        # 1) Testsignal (alternating_arrow_v1) DEAKTIVIERT – keine automatischen Test-Signale
+        markers: List[Dict[str, Any]] = []
+
+        # 2) Grid Proximity + EMA-Signale NUR wenn der Signal-Button aktiv ist
+        if self._signals_enabled:
+            grid_markers = self._apply_marker_styles(
+                self.signal_overlay.fetch_markers(
+                    self.current_symbol, self.current_tf, "grid_proximity_v1"
+                ),
+                "grid_proximity_v1"
+            )
+            markers.extend(grid_markers)
+
+            ema_markers = self._apply_marker_styles(
+                self.signal_overlay.fetch_markers(
+                    self.current_symbol, self.current_tf, "ema_atr_set_v1"
+                ),
+                "ema_atr_set_v1"
+            )
+            markers.extend(ema_markers)
+
+        # Marker-Zeiten auf Candle-Grenzen runden + auf kontinuierliche Zeit mappen
+        if markers:
+            clean_markers = []
+            for m in markers:
+                mt = m.get("time")
+                if mt is None:
+                    continue
+                # Auf Candle-Timeframe-Grenze runden (z.B. H1: 3600er-Schritte)
+                rounded = int(mt) - (int(mt) % t_sec)
+                # Nur behalten + auf kontinuierliche Zeit mappen
+                if rounded in self._time_real_to_cont:
+                    m["time"] = self._time_real_to_cont[rounded]
+                    clean_markers.append(m)
+            markers = clean_markers
+            if markers:
+                print(f"   → Marker: {len(markers)} (kont. zeit, z.B. {markers[0]['time']})")
+            else:
+                print(f"   → KEINE Marker nach Filter! real_times samples={list(self._time_real_to_cont.keys())[:3]}")
+
+        return markers
+
+    def fit_chart(self):
+        try:
+            self.visible_from = self.visible_to = None
+            self.visible_price_from = self.visible_price_to = None
+            self.save_state()
+            self.web_view.page().runJavaScript("if(window.fitChartContent) fitChartContent();")
+        except (RuntimeError, AttributeError):
+            pass
+
+    def handle_range_changed(self, f, t):
+        if not self._is_loading_data:
+            self.visible_from, self.visible_to = f, t
+            self.save_state()
+
+    def handle_price_range_changed(self, f, t):
+        if not self._is_loading_data:
+            self.visible_price_from, self.visible_price_to = f, t
+            self.save_state()
+
+    def handle_measurement_changed(self, m):
+        if not self._is_loading_data:
+            self.measurement_state = json.loads(m) if m else None
+            self.save_state()
+
+    def save_state(self):
+        if not self.state_manager or self._is_loading_data: return
+        self.state_manager.save_instance_state(self.instance_id, self.current_symbol, self.current_tf,
+                                               self.visible_from, self.visible_to, self.visible_price_from,
+                                               self.visible_price_to, self.indicators_state, self.measurement_state)
+        self.state_manager.save_symbol_tf_state(self.current_symbol, self.current_tf, self.visible_from,
+                                                self.visible_to, self.visible_price_from, self.visible_price_to,
+                                                self.indicators_state, self.measurement_state)
+        p, s = self.pos(), self.size()
+        self.state_manager.save_window_geometry(self.instance_id, p.x(), p.y(), s.width(), s.height(),
+                                                self.isMaximized())
+
+    def closeEvent(self, event):
+        self.save_state()
+        if self.state_manager:
+            app = QApplication.instance()
+            if not getattr(app, "_is_quitting", False) and self.instance_id != "win_main":
+                self.state_manager.delete_instance(self.instance_id)
+        self.closed_signal.emit(self.instance_id)
+        event.accept()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = PyTraderChartWindow()
+    window.show()
+    sys.exit(app.exec())
+```
+
+--------------------------------------------------
+
+### DATEI: .backup_C_dayseparator/02_time_utils.js
+```js
+// chart/js/02_time_utils.js
+// Zeit-Formatierung für die Chart-Achsen (Wanduhrzeit direkt aus dem Epoch) +
+// ZENTRALE Zeit-Konstanten & Zeit-Mapping-Helper (Single Source of Truth).
+//
+// WICHTIG (empirisch verifiziert via test/check_broker_tz.py, DB-Abgleich &
+// Live-Messung an MT5):
+// - MT5 liefert Zeiten als BERLIN-WANDUHR-encoded Epochs: Bei echter UTC 10:00
+//   ist tick.time bereits die Zahl "12:00" (diff = +7200s). Der User hat recht.
+// - sync_market_data() schreibt die Roh-Epochs via
+//   pd.to_datetime(..., unit="s", utc=True) 1:1 in die DB; EXTRACT(EPOCH) und
+//   fetch_historical_candles() geben exakt diese Roh-Epochs an den Chart.
+// => Eine zusätzliche Berlin-Offset-Umrechnung (+2h/+1h) wäre DOPPELT und
+//    würde alle Achsen-Labels 2h zu spät anzeigen.
+// => getBerlinParts formatiert den Epoch direkt über die UTC-Getter; der Wert
+//    IST bereits die gewünschte Wanduhrzeit. Das ist automatisch DST-robust
+//    (keine Saison-Logik nötig): Im Winter liefert der Broker CET-encoded
+//    Werte, die ebenfalls direkt korrekt dargestellt werden.
+
+// =============================================================================
+// ZENTRALE ZEIT-KONSTANTEN (keine magischen Zahlen im restlichen Code)
+// =============================================================================
+const SECONDS_PER_DAY = 86400;
+const WEEKEND_GAP_SECONDS = 43200;   // >12h Lücke ohne Kerzen = Wochenend-Gap
+const MIN_SEPARATOR_SPACING_SECONDS = 21600; // Mindestabstand zweier Trennlinien
+
+function getBerlinParts(t) {
+    var weekdays = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
+    var pad = function(n) { return String(n).padStart(2, '0'); };
+    
+    // Ungueltige Eingaben abfangen (verhindert NaN-Ausgabe & Endlosschleifen)
+    if (typeof t !== 'number' || !isFinite(t)) {
+        return { weekday: '', day: '--', month: '--', year: '----', hour: '--', minute: '--', rawDayOfWeek: -1 };
+    }
+    
+    // Roh-Epoch = bereits Berliner Wanduhrzeit => direkt via UTC-Getter lesen.
+    var bd = new Date(t * 1000);
+    
+    return {
+        weekday: weekdays[bd.getUTCDay()],
+        day: pad(bd.getUTCDate()),
+        month: pad(bd.getUTCMonth() + 1),
+        year: String(bd.getUTCFullYear()),
+        hour: pad(bd.getUTCHours()),
+        minute: pad(bd.getUTCMinutes()),
+        rawDayOfWeek: bd.getUTCDay()
+    };
+}
+
+function formatDT(t) { 
+    var p = getBerlinParts(t); 
+    return p.weekday + ' ' + p.day + '.' + p.month + '.' + p.year.slice(-2) + ' ' + p.hour + ':' + p.minute; 
+}
+
+// =============================================================================
+// ZEIT-MAPPING (kontinuierliche Fake-Zeit <-> echte epoch)
+// -----------------------------------------------------------------------------
+// Die Charts arbeiten auf kontinuierlicher Zeit (base_time + i*tf_sec), damit
+// keinerlei Lücken/Whitespace entstehen. Die _continuousTimeMap (cont->real)
+// wird aus Python mitgeliefert (data.timeMap). Diese Funktionen sind die
+// EINZIGE Schnittstelle zum Zeit-Mapping – kein roher Map-Zugriff im Rest.
+//
+// INVARIANTE: Das Mapping ist bijektiv (jede Candle hat genau eine cont-Zeit
+// und genau eine real-Epoch) und monoton steigend (cont & real wachsen
+// gemeinsam). Verletzungen erzeugen Fake-Labels an Tagesgrenzen.
+// =============================================================================
+let _realToContMap = {};  // { real_epoch: cont_time } – invers zu _continuousTimeMap
+
+function _rebuildTimeMaps(timeMap) {
+    // Setzt beide Maps aus der von Python gelieferten cont->real Map.
+    _continuousTimeMap = timeMap || {};
+    _continuousKeys = Object.keys(_continuousTimeMap).map(Number).sort(function(a, b) { return a - b; });
+    _realToContMap = {};
+    for (var i = 0; i < _continuousKeys.length; i++) {
+        var contKey = _continuousKeys[i];
+        _realToContMap[_continuousTimeMap[contKey]] = contKey;
+    }
+}
+
+// =============================================================================
+// resolveRealTime(): kontinuierliche (Fake-)Zeit -> echte epoch
+// WICHTIG: Bei unbekannten Werten (Padding-Ticks ausserhalb des Datensatzes)
+// NIE die Fake-Zeit selbst zurueckgeben – sonst zeigt die Zeitachse
+// irrefuehrende Labels (z. B. "30.7.26 23:58" an der Tagesgrenze, weil die
+// Fake-Zeit der 00:59-Candle als Realzeit formatiert wird).
+// Stattdessen wird der naechstgelegene bekannte Zeitpunkt verwendet.
+// =============================================================================
+function resolveRealTime(ts) {
+    if (ts === null || ts === undefined || typeof ts !== 'number' || !isFinite(ts)) return ts;
+    var direct = _continuousTimeMap[ts];
+    if (direct !== undefined) return direct;
+    if (_continuousKeys.length === 0) return ts;
+    var n = _continuousKeys.length;
+    if (ts <= _continuousKeys[0]) return _continuousTimeMap[_continuousKeys[0]];
+    if (ts >= _continuousKeys[n - 1]) return _continuousTimeMap[_continuousKeys[n - 1]];
+    var lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        var mid = (lo + hi) >> 1;
+        if (_continuousKeys[mid] === ts) return _continuousTimeMap[_continuousKeys[mid]];
+        if (_continuousKeys[mid] < ts) lo = mid + 1; else hi = mid - 1;
+    }
+    // hi = letzter Key < ts, lo = erster Key > ts
+    var a = _continuousKeys[hi], b = _continuousKeys[lo];
+    return (ts - a <= b - ts) ? _continuousTimeMap[a] : _continuousTimeMap[b];
+}
+
+// Alias mit sprechendem Namen – überall verwenden, wo echte Zeit gebraucht wird.
+function toReal(ts) { return resolveRealTime(ts); }
+
+// echte epoch -> kontinuierliche Zeit (inverse Zuordnung).
+// Liefert undefined, wenn die real-Epoch nicht im Datensatz liegt.
+function toCont(realEpoch) { return _realToContMap[realEpoch]; }
+
+```
+
+--------------------------------------------------
+
+### DATEI: .backup_C_dayseparator/03_chart_rendering.js
+```js
+// chart/js/03_chart_rendering.js
+// Chart-Initialisierung (leer – chart wird via applyFullChartUpdate aus Python erstellt),
+// Tages-Separatoren, Grid-Linien/Marker & Range-Steuerung
+
+function clearGridLines() {
+    if (!candleSeries) return;
+    gridPriceLines.forEach(function(l) { try { candleSeries.removePriceLine(l); } catch(e){} });
+    gridPriceLines = [];
+}
+
+function renderGridLines(lines) {
+    clearGridLines();
+    if (!candleSeries || !lines) return;
+    var data = (typeof lines === 'string') ? JSON.parse(lines) : lines;
+    (data || []).forEach(function(l) {
+        if (l && typeof l.price === 'number' && !isNaN(l.price)) {
+            var pl = candleSeries.createPriceLine({
+                price: l.price, color: l.color, lineWidth: l.width,
+                lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true,
+                title: l.is_custom ? '\u2605' : ''
+            });
+            gridPriceLines.push(pl);
+        }
+    });
+}
+
+function clearGridCircles() {
+    _storedCircleMarkers = null;
+}
+
+function renderGridCircles(circles) {
+    clearGridCircles();
+    if (!candleSeries || !circles) return;
+    var data = (typeof circles === 'string') ? JSON.parse(circles) : circles;
+    if (!data || data.length === 0) return;
+    _storedCircleMarkers = data;
+    // Circles werden via _applyAllMarkers() auf candleSeries gesetzt
+    _applyAllMarkers(_storedSignalMarkersData);
+}
+
+function applyRange(rangeFrom, rangeTo, priceFrom, priceTo) {
+    if (!chart) return;
+    var timeScale = chart.timeScale();
+    var priceScale = chart.priceScale('right');
+
+    if (rangeFrom && rangeTo && rangeFrom !== rangeTo) {
+        try {
+            timeScale.setVisibleLogicalRange({ from: Number(rangeFrom), to: Number(rangeTo) });
+        } catch(e) {
+            console.warn("[applyRange] Failed to set logical range:", e);
+            try { timeScale.fitContent(); } catch(e2) {}
+        }
+    } else {
+        try { timeScale.fitContent(); } catch(e) {}
+    }
+
+    if (priceFrom !== undefined && priceTo !== undefined && priceFrom !== priceTo) {
+        try { priceScale.setVisibleRange({ from: Number(priceFrom), to: Number(priceTo) }); } catch(e) {}
+    }
+}
+
+// Signal-Marker + Circles: combined auf candleSeries.setMarkers()
+var _storedSignalMarkersData = null;
+
+function clearSignalMarkers() {
+    _storedSignalMarkersData = null;
+    if (seriesMarkersPlugin) {
+        try { seriesMarkersPlugin.setMarkers([]); } catch(e) {}
+    }
+}
+
+function renderSignalMarkers(markers) {
+    var data = (typeof markers === 'string') ? JSON.parse(markers) : markers;
+    if (data && data.length > 0) {
+        _storedSignalMarkersData = data;
+    }
+    _applyAllMarkers(data || []);
+}
+
+function _applyAllMarkers(signalMarkers) {
+    if (!candleSeries) return;
+    try {
+        var allMarkers = [];
+
+        // 1. Signal-Marker
+        if (signalMarkers && signalMarkers.length > 0) {
+            for (var i = 0; i < signalMarkers.length; i++) {
+                var m = signalMarkers[i];
+                allMarkers.push({
+                    time: m.time,
+                    position: m.position || 'aboveBar',
+                    color: m.color || '#26a69a',
+                    shape: m.shape || 'arrowDown',
+                    size: (m.size !== undefined) ? m.size : 1,
+                    text: m.text || ''
+                });
+            }
+        }
+
+        // 2. Circle-Marker
+        if (_storedCircleMarkers && _storedCircleMarkers.length > 0) {
+            for (var j = 0; j < _storedCircleMarkers.length; j++) {
+                var c = _storedCircleMarkers[j];
+                allMarkers.push({
+                    time: c.time,
+                    position: 'inBar',
+                    color: c.color || '#FFEB3B',
+                    shape: 'circle',
+                    size: 1,
+                });
+            }
+        }
+
+        // LWC v5: candleSeries.setMarkers() wurde entfernt → SeriesMarkers-Plugin nutzen.
+        // Das Plugin wird pro Chart-Instanz einmalig erzeugt (Reset in applyFullChartUpdate).
+        if (!seriesMarkersPlugin) {
+            seriesMarkersPlugin = LightweightCharts.createSeriesMarkers(candleSeries, []);
+        }
+        seriesMarkersPlugin.setMarkers(allMarkers);
+    } catch(e) {
+        console.error('[setMarkers] Error:', e.message || e);
+    }
+}
+
+function reapplySignalMarkers() {
+    _applyAllMarkers(_storedSignalMarkersData);
+}
+
+// =============================================================================
+// Tages-Separatoren
+// -----------------------------------------------------------------------------
+// Früher: LineSeries mit 2 Extrem-Punkten (-1000/1000000). Bei LWC v5 rendert
+// eine fast senkrechte 2-Punkt-Linie den Dash NICHT zuverlässig (fällt auf
+// Solid zurück – deshalb war die Linie "durchgezogen").
+// Heute: rein additives CSS-Overlay (border-left: dashed). Garantiert
+// gestrichelt, keine Änderung der Zeitskala, keine Phantom-Index-Slots.
+// =============================================================================
+var daySeparatorContainer = null;
+var _storedDaySeparatorTimes = [];
+
+function _ensureDaySeparatorContainer() {
+    var container = document.getElementById('chart-container');
+    if (!container) return null;
+    if (!daySeparatorContainer) {
+        daySeparatorContainer = document.createElement('div');
+        daySeparatorContainer.style.position = 'absolute';
+        daySeparatorContainer.style.top = '0';
+        daySeparatorContainer.style.left = '0';
+        daySeparatorContainer.style.pointerEvents = 'none';
+        daySeparatorContainer.style.zIndex = '100';
+        container.appendChild(daySeparatorContainer);
+    }
+    return daySeparatorContainer;
+}
+
+function _clearDaySeparatorOverlay() {
+    if (daySeparatorContainer) {
+        daySeparatorContainer.innerHTML = '';
+    }
+    _storedDaySeparatorTimes = [];
+}
+
+function _updateDaySeparatorPositions() {
+    if (!chart || !daySeparatorContainer) return;
+    try {
+        var container = document.getElementById('chart-container');
+        var top = 0;
+        var width = container ? container.clientWidth : 800;
+        var height = container ? container.clientHeight : 600;
+        // Pane-Höhe = Container-Höhe minus Zeitachsen-Höhe (Zeitachse liegt unten)
+        var tsHeight = 0;
+        try { tsHeight = chart.timeScale().height() || 0; } catch(e) { tsHeight = 0; }
+        height = Math.max(0, height - tsHeight);
+
+        daySeparatorContainer.style.top = top + 'px';
+        daySeparatorContainer.style.left = '0px';
+        daySeparatorContainer.style.width = width + 'px';
+        daySeparatorContainer.style.height = height + 'px';
+
+        var children = daySeparatorContainer.children;
+        for (var i = 0; i < _storedDaySeparatorTimes.length && i < children.length; i++) {
+            var x = null;
+            try { x = chart.timeScale().timeToCoordinate(_storedDaySeparatorTimes[i]); } catch(e) { x = null; }
+            if (x === null || x === undefined || isNaN(x)) {
+                children[i].style.display = 'none';
+            } else {
+                children[i].style.display = 'block';
+                // pane.left ist hier 0 (keine linke Preisskala). Falls jemals
+                // eine linke Preisskala ergänzt wird: (x - pane.left) verwenden.
+                children[i].style.left = x + 'px';
+            }
+        }
+    } catch(e) {
+        console.warn("[_updateDaySeparatorPositions] Error:", e);
+    }
+}
+
+function updateDaySeparators(candleData) {
+    if (!chart) return;
+    try {
+        // Alte Separator-Serien (Legacy) entfernen + Overlay leeren
+        dayLinesSeries.forEach(function(s) { try { chart.removeSeries(s); } catch(e){} });
+        dayLinesSeries = [];
+        _clearDaySeparatorOverlay();
+        if (currentTfInSeconds >= SECONDS_PER_DAY || !candleData || candleData.length === 0) return;
+
+        var lastLineTime = 0;
+
+        for (var i = 1; i < candleData.length; i++) {
+            var prevTime = candleData[i - 1].time;
+            var currTime = candleData[i].time;
+
+            // Echte epoch für Wanduhr-Tag-Berechnung verwenden (toReal statt
+            // rohem Map-Zugriff -> nie Fake-Zeiten bei fehlendem Mapping).
+            // Die Roh-Epochs sind bereits Berlin-Wanduhr-encoded, daher ergibt
+            // Math.floor(real/SECONDS_PER_DAY) den Wanduhr-Tag (Wechsel 00:00).
+            var prevReal = toReal(prevTime);
+            var currReal = toReal(currTime);
+
+            var prevUtcDay = Math.floor(prevReal / SECONDS_PER_DAY);
+            var currUtcDay = Math.floor(currReal / SECONDS_PER_DAY);
+
+            var isUtcDayChange = (currUtcDay !== prevUtcDay);
+            var isWeekendGap = (currReal - prevReal > WEEKEND_GAP_SECONDS);
+            var isTooCloseToPrevious = (lastLineTime > 0 && (currTime - lastLineTime) < MIN_SEPARATOR_SPACING_SECONDS);
+
+            if ((isUtcDayChange || isWeekendGap) && !isTooCloseToPrevious) {
+                lastLineTime = currTime;
+                // 0:00 des neuen Tages = Zeit der ersten Kerze des neuen Tages
+                _storedDaySeparatorTimes.push(currTime);
+            }
+        }
+
+        // CSS-Overlay-Divs anlegen (garantiert gestrichelt via border-left)
+        var sepContainer = _ensureDaySeparatorContainer();
+        if (!sepContainer) return;
+        for (var j = 0; j < _storedDaySeparatorTimes.length; j++) {
+            var div = document.createElement('div');
+            div.style.position = 'absolute';
+            div.style.top = '0';
+            div.style.bottom = '0';
+            div.style.width = '0';
+            div.style.borderLeft = '1px dashed rgba(33, 150, 243, 0.55)';
+            div.style.pointerEvents = 'none';
+            sepContainer.appendChild(div);
+        }
+        _updateDaySeparatorPositions();
+    } catch(e) {
+        console.error("[updateDaySeparators] Error:", e);
+    }
+}
+
+```
+
+--------------------------------------------------
+
+### DATEI: .backup_C_dayseparator/04_live_updates.js
+```js
+// chart/js/04_live_updates.js
+// Live-Tick-Updates, Countdown-Badge, Price-Badge, Range-Sync & Resize-Handling
+
+function syncRanges() {
+    if (!chart || !pyBridge || isUpdatingChart) return;
+    try {
+        var lr = chart.timeScale().getVisibleLogicalRange();
+        if (lr && lr.from !== null && lr.to !== null && !isNaN(lr.from) && !isNaN(lr.to)) {
+            pyBridge.onRangeChanged(Math.floor(lr.from), Math.floor(lr.to));
+        }
+        var pr = chart.priceScale('right').getVisibleRange();
+        if (pr && pr.from !== null && pr.to !== null && !isNaN(pr.from) && !isNaN(pr.to)) {
+            pyBridge.onPriceRangeChanged(pr.from, pr.to);
+        }
+    } catch(e) {}
+}
+
+function updateCountdownDisplay() {
+    if (isUpdatingChart || !candleSeries || !chart || lastClosePrice === null || lastClosePrice === undefined) return;
+    if (!isWindowActive || document.hidden) return;
+
+    try {
+        var priceBadge = document.getElementById('price-badge');
+        var countdownBadge = document.getElementById('countdown-badge');
+        if (!priceBadge || !countdownBadge) return;
+
+        var showCountdown = (currentTfInSeconds > 0 && currentTfInSeconds < 86400);
+
+        // PriceLine auf der candleSeries
+        if (!currentPriceLine) {
+            currentPriceLine = candleSeries.createPriceLine({
+                price: lastClosePrice,
+                color: '#2962FF',
+                lineWidth: 1,
+                lineStyle: LightweightCharts.LineStyle.Dotted,
+                axisLabelVisible: false,
+                title: ''
+            });
+            lastRenderedPrice = lastClosePrice;
+        } else if (lastRenderedPrice !== lastClosePrice) {
+            currentPriceLine.applyOptions({ price: lastClosePrice, title: '' });
+            lastRenderedPrice = lastClosePrice;
+        }
+
+        var y = candleSeries.priceToCoordinate(lastClosePrice);
+        if (y !== null && !isNaN(y)) {
+            var formattedPrice = lastClosePrice.toFixed(currentPrecision);
+            var topPos = (y - 9) + 'px';
+
+            if (lastFormattedPriceStr !== formattedPrice) {
+                priceBadge.innerText = formattedPrice;
+                lastFormattedPriceStr = formattedPrice;
+            }
+            if (lastRenderedTop !== topPos) {
+                priceBadge.style.top = topPos;
+                countdownBadge.style.top = topPos;
+                lastRenderedTop = topPos;
+            }
+            if (priceBadge.style.display !== 'block') {
+                priceBadge.style.display = 'block';
+            }
+
+            if (showCountdown) {
+                var now = Math.floor(Date.now() / 1000);
+                var rem = currentTfInSeconds - (now % currentTfInSeconds);
+                var formattedTime = String(Math.floor(rem/60)).padStart(2,'0') + ':' + String(rem%60).padStart(2,'0');
+                if (lastFormattedTimeStr !== formattedTime) {
+                    countdownBadge.innerText = formattedTime;
+                    lastFormattedTimeStr = formattedTime;
+                }
+                var priceWidth = priceBadge.offsetWidth || 50;
+                var rightPos = (priceWidth + 8) + 'px';
+                if (countdownBadge.style.right !== rightPos) {
+                    countdownBadge.style.right = rightPos;
+                }
+                if (countdownBadge.style.display !== 'block') {
+                    countdownBadge.style.display = 'block';
+                }
+            } else {
+                if (countdownBadge.style.display !== 'none') countdownBadge.style.display = 'none';
+            }
+        } else {
+            if (priceBadge.style.display !== 'none') priceBadge.style.display = 'none';
+            if (countdownBadge.style.display !== 'none') countdownBadge.style.display = 'none';
+        }
+    } catch(e) {
+        var p = document.getElementById('price-badge');
+        var c = document.getElementById('countdown-badge');
+        if (p && p.style.display !== 'none') p.style.display = 'none';
+        if (c && c.style.display !== 'none') c.style.display = 'none';
+    }
+}
+
+function updateLiveCandle(json) {
+    if (!candleSeries || isUpdatingChart) return;
+    try {
+        var c = JSON.parse(json);
+        if (!c || typeof c.time !== 'number' || isNaN(c.time)) return;
+        // Race-Guard: Live-Tick nur anwenden, wenn Symbol/TF noch zum Chart passen.
+        // Verhindert, dass ein verspaeteter Tick vom alten Symbol/TF nach einem
+        // schnellen Wechsel an den falschen Chart angehaengt wird.
+        if (c.symbol !== undefined && c.symbol !== null && c.symbol !== currentSymbol) return;
+        if (c.timeframe !== undefined && c.timeframe !== null && c.timeframe !== currentTimeframe) return;
+        if (c.open === null || c.high === null || c.low === null || c.close === null) return;
+        if (rawCandleData.length > 0 && c.time < rawCandleData[rawCandleData.length-1].time) return;
+        candleSeries.update(c);
+        lastClosePrice = c.close;
+        updateCountdownDisplay();
+    } catch(e) {}
+}
+
+function fitChartContent() { if(chart) chart.timeScale().fitContent(); }
+
+// =============================================================================
+// RESIZE-HANDLING
+// =============================================================================
+function handleResize() {
+    if (!chart) return;
+    var container = document.getElementById('chart-container');
+    if (!container) return;
+    var w = container.clientWidth;
+    var h = container.clientHeight;
+    if (w > 0 && h > 0) {
+        chart.resize(w, h);
+        try { _updateDaySeparatorPositions(); } catch(e) {}
+    }
+}
+
+var _resizeObserver = null;
+function setupResizeObserver() {
+    var container = document.getElementById('chart-container');
+    if (!container) return;
+    if (_resizeObserver) _resizeObserver.disconnect();
+    _resizeObserver = new ResizeObserver(function() { handleResize(); });
+    _resizeObserver.observe(container);
+}
+
+// =============================================================================
+// applyFullChartUpdate – Hauptfunktion
+// =============================================================================
+function applyFullChartUpdate(data) {
+    // =========================================================================
+    // RACE-GUARD: Python sendet eine monotone updateId mit jedem Refresh.
+    // Veraltete Payloads (z. B. langsamer Serializer-Thread aus einem frueheren
+    // Symbol/TF-Stand) werden sofort verworfen, bevor sie den Chart anfassen.
+    // =========================================================================
+    var myId = ++_updateId;
+    var updateId = (data && typeof data.updateId === 'number') ? data.updateId : myId;
+
+    if (updateId < _lastAppliedUpdateId) {
+        console.warn('[applyFullChartUpdate] Veraltetes Update verworfen (id=' + updateId + ' < letzte=' + _lastAppliedUpdateId + ')');
+        isUpdatingChart = false;
+        return;
+    }
+    _lastAppliedUpdateId = updateId;
+
+    try {
+        isUpdatingChart = true;
+
+        // TimeMap speichern (kontinuierliche Zeit -> echte epoch)
+        // Zentral via _rebuildTimeMaps: baut auch die inverse real->cont Map auf.
+        _rebuildTimeMaps(data.timeMap || {});
+
+        // TF_SECONDS_MAP: Python ist die Single Source of Truth (tfSecondsMap im
+        // Payload). Die lokale Map in 01_core.js ist nur der Offline-Default.
+        if (data.tfSecondsMap && typeof data.tfSecondsMap === 'object') {
+            for (var tfKey in data.tfSecondsMap) {
+                if (Object.prototype.hasOwnProperty.call(data.tfSecondsMap, tfKey)) {
+                    TF_SECONDS_MAP[tfKey] = data.tfSecondsMap[tfKey];
+                }
+            }
+        }
+
+        currentSymbol = data.symbol;
+        currentTimeframe = data.timeframe;
+        if (data.timeframe && TF_SECONDS_MAP[data.timeframe]) {
+            currentTfInSeconds = TF_SECONDS_MAP[data.timeframe];
+        }
+
+        var candles = (typeof data.candles === 'string') ? JSON.parse(data.candles) : (data.candles || []);
+
+        var validCandles = candles.filter(function(c) {
+            return c &&
+                typeof c.time === 'number' && !isNaN(c.time) && c.time > 0 &&
+                typeof c.open === 'number' && !isNaN(c.open) && c.open > 0 &&
+                typeof c.high === 'number' && !isNaN(c.high) && c.high > 0 &&
+                typeof c.low === 'number' && !isNaN(c.low) && c.low > 0 &&
+                typeof c.close === 'number' && !isNaN(c.close) && c.close > 0;
+        });
+
+        if (validCandles.length === 0) {
+            console.warn('[applyFullChartUpdate] Keine gueltigen Candles');
+            if (chart) chart.timeScale().fitContent();
+            isUpdatingChart = false;
+            return;
+        }
+
+        // Alte Resourcen entfernen
+        try { clearGridCircles(); } catch(e) {}
+        try { clearGridLines(); } catch(e) {}
+        try { clearSignalMarkers(); } catch(e) {}
+        if (currentPriceLine) {
+            try { if (candleSeries) candleSeries.removePriceLine(currentPriceLine); } catch(e) {}
+            currentPriceLine = null;
+        }
+        if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+
+        if (_resizeObserver) {
+            try { _resizeObserver.disconnect(); } catch(e) {}
+            _resizeObserver = null;
+        }
+
+        try {
+            if (chart) chart.remove();
+        } catch(e) {
+            console.warn('[applyFullChartUpdate] chart.remove() fehlgeschlagen:', e.message || e);
+        }
+        chart = null;
+        candleSeries = null;
+        dayLinesSeries = [];
+        gridPriceLines = [];
+        _storedCircleMarkers = null;
+        seriesMarkersPlugin = null;
+        try { _clearDaySeparatorOverlay(); } catch(e) {}
+
+        var container = document.getElementById('chart-container');
+        if (!container) {
+            isUpdatingChart = false;
+            return;
+        }
+        try { container.querySelectorAll('table, canvas').forEach(function(el) { el.remove(); }); } catch(e) {}
+
+        var isDailyOrHigher = (currentTfInSeconds >= 86400);
+
+        // Schritt 1: Chart erstellen
+        try {
+            chart = LightweightCharts.createChart(container, {
+                width: container.clientWidth || 800,
+                height: container.clientHeight || 600,
+                layout: { background: { type: 'solid', color: '#131722' }, textColor: '#d1d4dc' },
+                grid: { vertLines: { visible: false }, horzLines: { visible: false } },
+                crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+                rightPriceScale: { borderColor: '#2B2B43' },
+                timeScale: { 
+                    borderColor: '#2B2B43', 
+                    timeVisible: !isDailyOrHigher,
+                    secondsVisible: false,
+                    fixRightEdge: false,
+                    fixLeftEdge: false,
+                    shiftVisibleRangeOnNewBar: false,
+                    tickMarkFormatter: function(time, tickMarkType) {
+                        // time ist kontinuierlich (Fake-Zeit). Real-Epoch via toReal()
+                        // (zentraler Helper statt raw-Map-Zugriff -> kein Fake-Label).
+                        var realTime = toReal(time);
+                        var p = getBerlinParts(realTime);
+                        if (isDailyOrHigher || tickMarkType <= 2) {
+                            return p.day + '.' + p.month + '.' + p.year.slice(-2);
+                        }
+                        return p.hour + ':' + p.minute;
+                    }
+                },
+                localization: { locale: 'de-DE', timeFormatter: function(t) { 
+                    // t ist bei Zeit-basierten Serien ein UTCTimestamp (Zahl),
+                    // NICHT ein Objekt mit .time – sonst laeuft formatDT ins Leere.
+                    var ts = (t !== null && typeof t === 'object') ? t.time : t;
+                    return formatDT(toReal(ts)); 
+                } }
+            });
+        } catch(e) {
+            console.error('[applyFullChartUpdate] Schritt 1 (createChart) fehlgeschlagen:', e.message || e);
+            isUpdatingChart = false;
+            return;
+        }
+
+        try { setupResizeObserver(); } catch(e) {}
+
+        var precision = (data.precision !== undefined && data.precision !== null) ? data.precision : currentPrecision;
+        currentPrecision = precision;
+        var minMove = (typeof precision === 'number' && precision > 0 && precision < 10) 
+            ? 1 / Math.pow(10, precision) 
+            : 0.01;
+
+        // Schritt 2: CandlestickSeries
+        try {
+            candleSeries = chart.addSeries(LightweightCharts.CandlestickSeries, {
+                upColor: '#26a69a', downColor: '#ef5350', borderVisible: false,
+                wickUpColor: '#26a69a', wickDownColor: '#ef5350', priceLineVisible: false, lastValueVisible: false,
+                priceFormat: { type: 'price', precision: precision, minMove: minMove }
+            });
+            if (!candleSeries) throw new Error('candleSeries ist null');
+        } catch(e) {
+            console.error('[applyFullChartUpdate] Schritt 2 (addSeries) fehlgeschlagen:', e.message || e);
+            isUpdatingChart = false;
+            return;
+        }
+
+        // Schritt 3: setData
+        try {
+            candleSeries.setData(validCandles);
+        } catch(e) {
+            console.error('[applyFullChartUpdate] Schritt 3 (setData) fehlgeschlagen:', e.message || e);
+            isUpdatingChart = false;
+            return;
+        }
+        rawCandleData = validCandles;
+        lastClosePrice = validCandles[validCandles.length - 1].close;
+
+        // Schritt 4: TimeScale Subscription
+        try {
+            chart.timeScale().subscribeVisibleLogicalRangeChange(function() { 
+                if(!isUpdatingChart) {
+                    try { syncRanges(); } catch(e) {}
+                    try { updateCountdownDisplay(); } catch(e) {}
+                    try { _updateDaySeparatorPositions(); } catch(e) {}
+                }
+            });
+        } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 4 (subscribe) fehlgeschlagen:', e.message || e);
+        }
+
+        // Countdown-Timer (1s Intervall)
+        if (countdownTimer) clearInterval(countdownTimer);
+        countdownTimer = setInterval(function() {
+            try { updateCountdownDisplay(); } catch(e) {}
+        }, 1000);
+
+        // Schritt 5: Grid-Linien
+        try { if (data.gridLines) renderGridLines(data.gridLines); } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 5 (gridLines) fehlgeschlagen:', e.message || e);
+        }
+
+        // Schritt 6: Grid-Circles (speichert nur, Marker setzen via setMarkers)
+        try { if (data.gridCircles) renderGridCircles(data.gridCircles); } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 6 (gridCircles) fehlgeschlagen:', e.message || e);
+        }
+
+        // Schritt 7: Signal-Marker + Circles (combined via candleSeries.setMarkers)
+        try {
+            _storedSignalMarkersData = data.signalMarkers || [];
+            _applyAllMarkers(_storedSignalMarkersData);
+        } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 7 (signalMarkers) fehlgeschlagen:', e.message || e);
+        }
+
+        // Schritt 8: Range
+        try {
+            if (data.rangeFrom !== undefined && data.rangeTo !== undefined &&
+                data.rangeFrom !== null && data.rangeTo !== null &&
+                data.rangeFrom !== data.rangeTo) {
+                pendingRange = { rangeFrom: data.rangeFrom, rangeTo: data.rangeTo, priceFrom: data.priceFrom, priceTo: data.priceTo };
+                applyRange(data.rangeFrom, data.rangeTo, data.priceFrom, data.priceTo);
+            } else {
+                if (chart) chart.timeScale().fitContent();
+            }
+        } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 8 (applyRange) fehlgeschlagen:', e.message || e);
+        }
+
+        // Schritt 9: Day Separators
+        try { updateDaySeparators(rawCandleData); } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 9 (daySeparators) fehlgeschlagen:', e.message || e);
+        }
+
+        // Fertig – isUpdatingChart freigeben + initialen sync
+        isUpdatingChart = false;
+        try { syncRanges(); } catch(e) {}
+        try { updateCountdownDisplay(); } catch(e) {}
+
+    } catch(e) {
+        console.error('[applyFullChartUpdate] GLOBAL Error:', e.message || e);
+        isUpdatingChart = false;
+    }
+}
+
+```
+
+--------------------------------------------------
+
+### DATEI: .backup_D_markerlayers/01_core.js
+```js
+// chart/js/01_core.js
+// Kern-Variablen, WebChannel-Bridge, Fenster-Fokus-Event & Fehlerbehandlung
+
+window.onerror = function(m, s, l, c, e) {
+    if (m === "Script error." && !s) return true;
+    console.error(`[JS ERROR] ${m} | L${l}:${c}`);
+    return true;
+};
+
+let chart = null, candleSeries = null, pyBridge = null, isUpdatingChart = false;
+let currentTfInSeconds = 3600, lastClosePrice = null, activeTimer = null, countdownTimer = null;
+let rawCandleData = [], currentSymbol = null, currentTimeframe = null;
+let gridPriceLines = [], dayLinesSeries = [], _storedCircleMarkers = [];
+let currentPriceLine = null, resizeTimeout = null;
+let currentPrecision = 2;
+let pendingRange = null;
+let _updateId = 0;
+let _lastAppliedUpdateId = 0; // höchste akzeptierte updateId (Race-Guard)
+let _continuousTimeMap = {};  // { cont_time: real_epoch } für tickMarkFormatter
+let _continuousKeys = [];     // sortierte cont-Schlüssel für resolveRealTime()
+// LWC v5: setMarkers() auf der Serie existiert nicht mehr – SeriesMarkers-Plugin verwenden
+let seriesMarkersPlugin = null;
+
+let isWindowActive = true;
+let lastRenderedPrice = null;
+let lastRenderedTop = null;
+let lastFormattedPriceStr = "";
+let lastFormattedTimeStr = "";
+
+const TF_SECONDS_MAP = { 'M1': 60, 'M2': 120, 'M5': 300, 'M10': 600, 'M15': 900, 'M30': 1800, 'H1': 3600, 'H4': 14400, 'D1': 86400, 'W1': 604800, 'MN1': 2592000 };
+// HINWEIS: TF_SECONDS_MAP wird bei jedem applyFullChartUpdate durch die von
+// Python mitgelieferte tfSecondsMap (Single Source of Truth) überschrieben.
+// Diese lokale Map ist nur der Offline-/Start-Default (Abwärtskompatibilität).
+
+// HINWEIS: resolveRealTime()/toReal()/toCont()/_rebuildTimeMaps() sind nach
+// 02_time_utils.js verschoben – das ist die EINZIGE Zeit-Mapping-Schnittstelle.
+
+if (typeof qt !== 'undefined') {
+    new QWebChannel(qt.webChannelTransport, function(channel) {
+        pyBridge = channel.objects.pyBridge;
+    });
+}
+
+window.addEventListener('focus', () => { isWindowActive = true; if(lastClosePrice !== null) updateCountdownDisplay(); });
+window.addEventListener('blur', () => { isWindowActive = false; });
+document.addEventListener('visibilitychange', () => {
+    isWindowActive = !document.hidden;
+    if (isWindowActive && lastClosePrice !== null) updateCountdownDisplay();
+});
+
+```
+
+--------------------------------------------------
+
+### DATEI: .backup_D_markerlayers/03_chart_rendering.js
+```js
+// chart/js/03_chart_rendering.js
+// Chart-Initialisierung (leer – chart wird via applyFullChartUpdate aus Python erstellt),
+// Tages-Separatoren, Grid-Linien/Marker & Range-Steuerung
+
+function clearGridLines() {
+    if (!candleSeries) return;
+    gridPriceLines.forEach(function(l) { try { candleSeries.removePriceLine(l); } catch(e){} });
+    gridPriceLines = [];
+}
+
+function renderGridLines(lines) {
+    clearGridLines();
+    if (!candleSeries || !lines) return;
+    var data = (typeof lines === 'string') ? JSON.parse(lines) : lines;
+    (data || []).forEach(function(l) {
+        if (l && typeof l.price === 'number' && !isNaN(l.price)) {
+            var pl = candleSeries.createPriceLine({
+                price: l.price, color: l.color, lineWidth: l.width,
+                lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true,
+                title: l.is_custom ? '\u2605' : ''
+            });
+            gridPriceLines.push(pl);
+        }
+    });
+}
+
+// NOTE: _storedSignalMarkersData/_storedCircleMarkers sind getrennte Layer.
+// _applyAllMarkers() kombiniert BEIDE Caches und setzt sie via setMarkers –
+// damit kann ein Grid-Render die Signal-Marker nie verdrängen und umgekehrt.
+function clearGridCircles() {
+    _storedCircleMarkers = [];
+    _applyAllMarkers();
+}
+
+function renderGridCircles(circles) {
+    if (!candleSeries || !circles) return;
+    var data = (typeof circles === 'string') ? JSON.parse(circles) : circles;
+    _storedCircleMarkers = data || [];
+    // Circles werden via _applyAllMarkers() mit den Signal-Markern kombiniert
+    _applyAllMarkers();
+}
+
+function applyRange(rangeFrom, rangeTo, priceFrom, priceTo) {
+    if (!chart) return;
+    var timeScale = chart.timeScale();
+    var priceScale = chart.priceScale('right');
+
+    if (rangeFrom && rangeTo && rangeFrom !== rangeTo) {
+        try {
+            timeScale.setVisibleLogicalRange({ from: Number(rangeFrom), to: Number(rangeTo) });
+        } catch(e) {
+            console.warn("[applyRange] Failed to set logical range:", e);
+            try { timeScale.fitContent(); } catch(e2) {}
+        }
+    } else {
+        try { timeScale.fitContent(); } catch(e) {}
+    }
+
+    if (priceFrom !== undefined && priceTo !== undefined && priceFrom !== priceTo) {
+        try { priceScale.setVisibleRange({ from: Number(priceFrom), to: Number(priceTo) }); } catch(e) {}
+    }
+}
+
+// Signal-Marker + Circles: combined auf candleSeries.setMarkers()
+// _storedSignalMarkersData/_storedCircleMarkers sind IMMER Arrays (nie null),
+// damit _applyAllMarkers() beide Layer zuverlässig kombinieren kann.
+var _storedSignalMarkersData = [];
+
+function clearSignalMarkers() {
+    // Nur das Signal-Layer leeren – Circles bleiben aus dem Cache erhalten.
+    // (Im Chart-Refresh wird das Plugin anschliessend ohnehin neu aufgebaut.)
+    _storedSignalMarkersData = [];
+    _applyAllMarkers();
+}
+
+function renderSignalMarkers(markers) {
+    var data = (typeof markers === 'string') ? JSON.parse(markers) : markers;
+    // Cache IMMER aktualisieren (auch bei leerer Liste) – verhindert, dass
+    // ein veralteter Cache nach dem Ausschalten der Signale wieder auftaucht.
+    _storedSignalMarkersData = data || [];
+    _applyAllMarkers();
+}
+
+function _applyAllMarkers() {
+    if (!candleSeries) return;
+    try {
+        var allMarkers = [];
+
+        // 1. Signal-Marker (aus dem Signal-Cache)
+        if (_storedSignalMarkersData && _storedSignalMarkersData.length > 0) {
+            for (var i = 0; i < _storedSignalMarkersData.length; i++) {
+                var m = _storedSignalMarkersData[i];
+                allMarkers.push({
+                    time: m.time,
+                    position: m.position || 'aboveBar',
+                    color: m.color || '#26a69a',
+                    shape: m.shape || 'arrowDown',
+                    size: (m.size !== undefined) ? m.size : 1,
+                    text: m.text || '',
+                    // priority steuert die Stapel-Reihenfolge bei gleicher Kerze
+                    // (niedriger = näher an der Kerze, höher = weiter oben).
+                    // Wird von der LWC-Engine ignoriert (explizite Feldliste) –
+                    // dient NUR unserer Sortierung.
+                    priority: (m.priority !== undefined && m.priority !== null) ? m.priority : 0
+                });
+            }
+        }
+
+        // 2. Circle-Marker (aus dem Grid-Cache)
+        if (_storedCircleMarkers && _storedCircleMarkers.length > 0) {
+            for (var j = 0; j < _storedCircleMarkers.length; j++) {
+                var c = _storedCircleMarkers[j];
+                allMarkers.push({
+                    time: c.time,
+                    position: 'inBar',
+                    color: c.color || '#FFEB3B',
+                    shape: 'circle',
+                    size: 1,
+                    priority: (c.priority !== undefined && c.priority !== null) ? c.priority : 10
+                });
+            }
+        }
+
+        // LWC v5: candleSeries.setMarkers() wurde entfernt → SeriesMarkers-Plugin nutzen.
+        // Das Plugin wird pro Chart-Instanz einmalig erzeugt (Reset in applyFullChartUpdate).
+        // WICHTIG (v5.2.0-Engine): setMarkers() erwartet ein NACH ZEIT SORTIERTES Array:
+        //  - Die interne Suche nach dem sichtbaren Bereich ist eine Binärsuche (unsortiert = falsche Grenzen).
+        //  - Mehrere Marker DERSELBEN Kerze werden nur vertikal gestapelt, wenn sie im Array
+        //    BENACHBART sind (Stack-Offset resettet bei jedem Zeitsprung). Unsortiert überdecken
+        //    sich Marker derselben Kerze exakt – Grid-Circles verdeckten so die EMA-Signale.
+        // Sortierung (stabil seit ES2019):
+        //   1. Kriterium: Zeit (Pflicht für die Engine).
+        //   2. Kriterium: priority (Stapel-Reihenfolge bei gleicher Kerze).
+        //      Niedrige priority = näher an der Kerze, hohe = weiter oben.
+        //      Gleiche priority => Einfüge-Reihenfolge bleibt erhalten (Signale vor Circles).
+        allMarkers.sort(function(a, b) {
+            if (a.time !== b.time) return a.time - b.time;
+            var pa = (typeof a.priority === 'number') ? a.priority : 0;
+            var pb = (typeof b.priority === 'number') ? b.priority : 0;
+            return pa - pb;
+        });
+
+        if (!seriesMarkersPlugin) {
+            seriesMarkersPlugin = LightweightCharts.createSeriesMarkers(candleSeries, []);
+        }
+        seriesMarkersPlugin.setMarkers(allMarkers);
+    } catch(e) {
+        console.error('[setMarkers] Error:', e.message || e);
+    }
+}
+
+function reapplySignalMarkers() {
+    _applyAllMarkers();
+}
+
+// =============================================================================
+// Tages-Separatoren – GEKAPSELTES MODUL (DaySeparator)
+// -----------------------------------------------------------------------------
+// API:
+//   DaySeparator.render(candleData)   – Trennlinien aus Candle-Daten berechnen
+//                                       und als CSS-Overlay zeichnen (0:00 der
+//                                       ersten Kerze des neuen Tages)
+//   DaySeparator.updatePositions()    – Positionen nach Scroll/Zoom/Resize neu
+//                                       berechnen (rein additiv, keine Änderung
+//                                       der Zeitskala)
+//   DaySeparator.clear()              – alle Trennlinien entfernen
+//
+// Warum gekapselt: Zukünftige Chart-Änderungen (linke Preisskala, Pane-Layout,
+// Zeitachse) berühren nur dieses Modul – der Rest des Codes kennt nur die API.
+//
+// Früher: LineSeries mit 2 Extrem-Punkten (-1000/1000000). Bei LWC v5 rendert
+// eine fast senkrechte 2-Punkt-Linie den Dash NICHT zuverlässig (fällt auf
+// Solid zurück – deshalb war die Linie "durchgezogen").
+// Heute: rein additives CSS-Overlay (border-left: dashed). Garantiert
+// gestrichelt, keine Änderung der Zeitskala, keine Phantom-Index-Slots.
+// =============================================================================
+var DaySeparator = (function() {
+    var container = null;      // Overlay-Div über dem Chart-Pane
+    var times = [];            // kontinuierliche Zeiten der Trennlinien (0:00)
+    var lines = [];            // erzeugte Div-Elemente
+
+    // Breite einer eventuellen linken Preisskala (aktuell keine im Chart,
+    // aber robust vorbereitet – C3)
+    function _leftPriceWidth() {
+        try {
+            var leftPS = chart.priceScale('left');
+            if (!leftPS) return 0;
+            var opts = leftPS.options();
+            if (opts && opts.visible) {
+                return leftPS.width() || 0;
+            }
+        } catch(e) {}
+        return 0;
+    }
+
+    function _ensureContainer() {
+        var host = document.getElementById('chart-container');
+        if (!host) return null;
+        if (!container) {
+            container = document.createElement('div');
+            container.style.position = 'absolute';
+            container.style.top = '0';
+            container.style.left = '0';
+            container.style.pointerEvents = 'none';
+            container.style.zIndex = '100';
+            host.appendChild(container);
+        }
+        return container;
+    }
+
+    function clear() {
+        if (container) container.innerHTML = '';
+        times = [];
+        lines = [];
+    }
+
+    // Kernlogik: Tageswechsel-Erkennung (pure Funktion, separat testbar)
+    function computeDaySeparatorTimes(candleData) {
+        var result = [];
+        if (!candleData || candleData.length === 0) return result;
+        var lastLineTime = 0;
+        for (var i = 1; i < candleData.length; i++) {
+            var prevTime = candleData[i - 1].time;
+            var currTime = candleData[i].time;
+
+            // Echte epoch für Wanduhr-Tag-Berechnung verwenden (toReal statt
+            // rohem Map-Zugriff -> nie Fake-Zeiten bei fehlendem Mapping).
+            // Die Roh-Epochs sind bereits Berlin-Wanduhr-encoded, daher ergibt
+            // Math.floor(real/SECONDS_PER_DAY) den Wanduhr-Tag (Wechsel 00:00).
+            var prevReal = toReal(prevTime);
+            var currReal = toReal(currTime);
+
+            var prevUtcDay = Math.floor(prevReal / SECONDS_PER_DAY);
+            var currUtcDay = Math.floor(currReal / SECONDS_PER_DAY);
+
+            var isUtcDayChange = (currUtcDay !== prevUtcDay);
+            var isWeekendGap = (currReal - prevReal > WEEKEND_GAP_SECONDS);
+            var isTooCloseToPrevious = (lastLineTime > 0 && (currTime - lastLineTime) < MIN_SEPARATOR_SPACING_SECONDS);
+
+            if ((isUtcDayChange || isWeekendGap) && !isTooCloseToPrevious) {
+                lastLineTime = currTime;
+                // 0:00 des neuen Tages = Zeit der ersten Kerze des neuen Tages
+                result.push(currTime);
+            }
+        }
+        return result;
+    }
+
+    function render(candleData) {
+        if (!chart) return;
+        clear();
+        if (currentTfInSeconds >= SECONDS_PER_DAY || !candleData || candleData.length === 0) return;
+
+        times = computeDaySeparatorTimes(candleData);
+
+        var sepContainer = _ensureContainer();
+        if (!sepContainer) return;
+        for (var j = 0; j < times.length; j++) {
+            var div = document.createElement('div');
+            div.style.position = 'absolute';
+            div.style.top = '0';
+            div.style.bottom = '0';
+            div.style.width = '0';
+            div.style.borderLeft = '1px dashed rgba(33, 150, 243, 0.55)';
+            div.style.pointerEvents = 'none';
+            sepContainer.appendChild(div);
+            lines.push(div);
+        }
+        updatePositions();
+    }
+
+    // Positionen nach Scroll/Zoom/Resize neu berechnen.
+    // - x = timeToCoordinate (relativ zum Chart-Pane) + linke Preisskala-Breite
+    // - Offscreen-Zeiten (null von timeToCoordinate) werden ausgeblendet (C4)
+    function updatePositions() {
+        if (!chart || !container) return;
+        try {
+            var host = document.getElementById('chart-container');
+            var leftW = _leftPriceWidth();
+            var width = host ? host.clientWidth : 800;
+            var height = host ? host.clientHeight : 600;
+            var tsHeight = 0;
+            try { tsHeight = chart.timeScale().height() || 0; } catch(e) { tsHeight = 0; }
+
+            container.style.left = leftW + 'px';
+            container.style.top = '0px';
+            container.style.width = Math.max(0, width - leftW) + 'px';
+            container.style.height = Math.max(0, height - tsHeight) + 'px';
+
+            for (var i = 0; i < times.length && i < lines.length; i++) {
+                var x = null;
+                try { x = chart.timeScale().timeToCoordinate(times[i]); } catch(e) { x = null; }
+                if (x === null || x === undefined || isNaN(x)) {
+                    lines[i].style.display = 'none';
+                } else {
+                    lines[i].style.display = 'block';
+                    lines[i].style.left = (x + leftW) + 'px';
+                }
+            }
+        } catch(e) {
+            console.warn('[DaySeparator.updatePositions] Error:', e);
+        }
+    }
+
+    return {
+        render: render,
+        updatePositions: updatePositions,
+        clear: clear,
+        computeDaySeparatorTimes: computeDaySeparatorTimes
+    };
+})();
+
+```
+
+--------------------------------------------------
+
+### DATEI: .backup_D_markerlayers/04_live_updates.js
+```js
+// chart/js/04_live_updates.js
+// Live-Tick-Updates, Countdown-Badge, Price-Badge, Range-Sync & Resize-Handling
+
+function syncRanges() {
+    if (!chart || !pyBridge || isUpdatingChart) return;
+    try {
+        var lr = chart.timeScale().getVisibleLogicalRange();
+        if (lr && lr.from !== null && lr.to !== null && !isNaN(lr.from) && !isNaN(lr.to)) {
+            pyBridge.onRangeChanged(Math.floor(lr.from), Math.floor(lr.to));
+        }
+        var pr = chart.priceScale('right').getVisibleRange();
+        if (pr && pr.from !== null && pr.to !== null && !isNaN(pr.from) && !isNaN(pr.to)) {
+            pyBridge.onPriceRangeChanged(pr.from, pr.to);
+        }
+    } catch(e) {}
+}
+
+function updateCountdownDisplay() {
+    if (isUpdatingChart || !candleSeries || !chart || lastClosePrice === null || lastClosePrice === undefined) return;
+    if (!isWindowActive || document.hidden) return;
+
+    try {
+        var priceBadge = document.getElementById('price-badge');
+        var countdownBadge = document.getElementById('countdown-badge');
+        if (!priceBadge || !countdownBadge) return;
+
+        var showCountdown = (currentTfInSeconds > 0 && currentTfInSeconds < 86400);
+
+        // PriceLine auf der candleSeries
+        if (!currentPriceLine) {
+            currentPriceLine = candleSeries.createPriceLine({
+                price: lastClosePrice,
+                color: '#2962FF',
+                lineWidth: 1,
+                lineStyle: LightweightCharts.LineStyle.Dotted,
+                axisLabelVisible: false,
+                title: ''
+            });
+            lastRenderedPrice = lastClosePrice;
+        } else if (lastRenderedPrice !== lastClosePrice) {
+            currentPriceLine.applyOptions({ price: lastClosePrice, title: '' });
+            lastRenderedPrice = lastClosePrice;
+        }
+
+        var y = candleSeries.priceToCoordinate(lastClosePrice);
+        if (y !== null && !isNaN(y)) {
+            var formattedPrice = lastClosePrice.toFixed(currentPrecision);
+            var topPos = (y - 9) + 'px';
+
+            if (lastFormattedPriceStr !== formattedPrice) {
+                priceBadge.innerText = formattedPrice;
+                lastFormattedPriceStr = formattedPrice;
+            }
+            if (lastRenderedTop !== topPos) {
+                priceBadge.style.top = topPos;
+                countdownBadge.style.top = topPos;
+                lastRenderedTop = topPos;
+            }
+            if (priceBadge.style.display !== 'block') {
+                priceBadge.style.display = 'block';
+            }
+
+            if (showCountdown) {
+                var now = Math.floor(Date.now() / 1000);
+                var rem = currentTfInSeconds - (now % currentTfInSeconds);
+                var formattedTime = String(Math.floor(rem/60)).padStart(2,'0') + ':' + String(rem%60).padStart(2,'0');
+                if (lastFormattedTimeStr !== formattedTime) {
+                    countdownBadge.innerText = formattedTime;
+                    lastFormattedTimeStr = formattedTime;
+                }
+                var priceWidth = priceBadge.offsetWidth || 50;
+                var rightPos = (priceWidth + 8) + 'px';
+                if (countdownBadge.style.right !== rightPos) {
+                    countdownBadge.style.right = rightPos;
+                }
+                if (countdownBadge.style.display !== 'block') {
+                    countdownBadge.style.display = 'block';
+                }
+            } else {
+                if (countdownBadge.style.display !== 'none') countdownBadge.style.display = 'none';
+            }
+        } else {
+            if (priceBadge.style.display !== 'none') priceBadge.style.display = 'none';
+            if (countdownBadge.style.display !== 'none') countdownBadge.style.display = 'none';
+        }
+    } catch(e) {
+        var p = document.getElementById('price-badge');
+        var c = document.getElementById('countdown-badge');
+        if (p && p.style.display !== 'none') p.style.display = 'none';
+        if (c && c.style.display !== 'none') c.style.display = 'none';
+    }
+}
+
+function updateLiveCandle(json) {
+    if (!candleSeries || isUpdatingChart) return;
+    try {
+        var c = JSON.parse(json);
+        if (!c || typeof c.time !== 'number' || isNaN(c.time)) return;
+        // Race-Guard: Live-Tick nur anwenden, wenn Symbol/TF noch zum Chart passen.
+        // Verhindert, dass ein verspaeteter Tick vom alten Symbol/TF nach einem
+        // schnellen Wechsel an den falschen Chart angehaengt wird.
+        if (c.symbol !== undefined && c.symbol !== null && c.symbol !== currentSymbol) return;
+        if (c.timeframe !== undefined && c.timeframe !== null && c.timeframe !== currentTimeframe) return;
+        if (c.open === null || c.high === null || c.low === null || c.close === null) return;
+        if (rawCandleData.length > 0 && c.time < rawCandleData[rawCandleData.length-1].time) return;
+        candleSeries.update(c);
+        lastClosePrice = c.close;
+        updateCountdownDisplay();
+    } catch(e) {}
+}
+
+function fitChartContent() { if(chart) chart.timeScale().fitContent(); }
+
+// =============================================================================
+// RESIZE-HANDLING
+// =============================================================================
+function handleResize() {
+    if (!chart) return;
+    var container = document.getElementById('chart-container');
+    if (!container) return;
+    var w = container.clientWidth;
+    var h = container.clientHeight;
+    if (w > 0 && h > 0) {
+        chart.resize(w, h);
+        try { DaySeparator.updatePositions(); } catch(e) {}
+    }
+}
+
+var _resizeObserver = null;
+function setupResizeObserver() {
+    var container = document.getElementById('chart-container');
+    if (!container) return;
+    if (_resizeObserver) _resizeObserver.disconnect();
+    _resizeObserver = new ResizeObserver(function() { handleResize(); });
+    _resizeObserver.observe(container);
+}
+
+// =============================================================================
+// applyFullChartUpdate – Hauptfunktion
+// =============================================================================
+function applyFullChartUpdate(data) {
+    // =========================================================================
+    // RACE-GUARD: Python sendet eine monotone updateId mit jedem Refresh.
+    // Veraltete Payloads (z. B. langsamer Serializer-Thread aus einem frueheren
+    // Symbol/TF-Stand) werden sofort verworfen, bevor sie den Chart anfassen.
+    // =========================================================================
+    var myId = ++_updateId;
+    var updateId = (data && typeof data.updateId === 'number') ? data.updateId : myId;
+
+    if (updateId < _lastAppliedUpdateId) {
+        console.warn('[applyFullChartUpdate] Veraltetes Update verworfen (id=' + updateId + ' < letzte=' + _lastAppliedUpdateId + ')');
+        isUpdatingChart = false;
+        return;
+    }
+    _lastAppliedUpdateId = updateId;
+
+    try {
+        isUpdatingChart = true;
+
+        // TimeMap speichern (kontinuierliche Zeit -> echte epoch)
+        // Zentral via _rebuildTimeMaps: baut auch die inverse real->cont Map auf.
+        _rebuildTimeMaps(data.timeMap || {});
+
+        // TF_SECONDS_MAP: Python ist die Single Source of Truth (tfSecondsMap im
+        // Payload). Die lokale Map in 01_core.js ist nur der Offline-Default.
+        if (data.tfSecondsMap && typeof data.tfSecondsMap === 'object') {
+            for (var tfKey in data.tfSecondsMap) {
+                if (Object.prototype.hasOwnProperty.call(data.tfSecondsMap, tfKey)) {
+                    TF_SECONDS_MAP[tfKey] = data.tfSecondsMap[tfKey];
+                }
+            }
+        }
+
+        currentSymbol = data.symbol;
+        currentTimeframe = data.timeframe;
+        if (data.timeframe && TF_SECONDS_MAP[data.timeframe]) {
+            currentTfInSeconds = TF_SECONDS_MAP[data.timeframe];
+        }
+
+        var candles = (typeof data.candles === 'string') ? JSON.parse(data.candles) : (data.candles || []);
+
+        var validCandles = candles.filter(function(c) {
+            return c &&
+                typeof c.time === 'number' && !isNaN(c.time) && c.time > 0 &&
+                typeof c.open === 'number' && !isNaN(c.open) && c.open > 0 &&
+                typeof c.high === 'number' && !isNaN(c.high) && c.high > 0 &&
+                typeof c.low === 'number' && !isNaN(c.low) && c.low > 0 &&
+                typeof c.close === 'number' && !isNaN(c.close) && c.close > 0;
+        });
+
+        if (validCandles.length === 0) {
+            console.warn('[applyFullChartUpdate] Keine gueltigen Candles');
+            if (chart) chart.timeScale().fitContent();
+            isUpdatingChart = false;
+            return;
+        }
+
+        // Alte Resourcen entfernen
+        try { clearGridCircles(); } catch(e) {}
+        try { clearGridLines(); } catch(e) {}
+        try { clearSignalMarkers(); } catch(e) {}
+        if (currentPriceLine) {
+            try { if (candleSeries) candleSeries.removePriceLine(currentPriceLine); } catch(e) {}
+            currentPriceLine = null;
+        }
+        if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+
+        if (_resizeObserver) {
+            try { _resizeObserver.disconnect(); } catch(e) {}
+            _resizeObserver = null;
+        }
+
+        try {
+            if (chart) chart.remove();
+        } catch(e) {
+            console.warn('[applyFullChartUpdate] chart.remove() fehlgeschlagen:', e.message || e);
+        }
+        chart = null;
+        candleSeries = null;
+        dayLinesSeries = [];
+        gridPriceLines = [];
+        _storedCircleMarkers = [];
+        seriesMarkersPlugin = null;
+        try { DaySeparator.clear(); } catch(e) {}
+
+        var container = document.getElementById('chart-container');
+        if (!container) {
+            isUpdatingChart = false;
+            return;
+        }
+        try { container.querySelectorAll('table, canvas').forEach(function(el) { el.remove(); }); } catch(e) {}
+
+        var isDailyOrHigher = (currentTfInSeconds >= 86400);
+
+        // Schritt 1: Chart erstellen
+        try {
+            chart = LightweightCharts.createChart(container, {
+                width: container.clientWidth || 800,
+                height: container.clientHeight || 600,
+                layout: { background: { type: 'solid', color: '#131722' }, textColor: '#d1d4dc' },
+                grid: { vertLines: { visible: false }, horzLines: { visible: false } },
+                crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+                rightPriceScale: { borderColor: '#2B2B43' },
+                timeScale: { 
+                    borderColor: '#2B2B43', 
+                    timeVisible: !isDailyOrHigher,
+                    secondsVisible: false,
+                    fixRightEdge: false,
+                    fixLeftEdge: false,
+                    shiftVisibleRangeOnNewBar: false,
+                    tickMarkFormatter: function(time, tickMarkType) {
+                        // time ist kontinuierlich (Fake-Zeit). Real-Epoch via toReal()
+                        // (zentraler Helper statt raw-Map-Zugriff -> kein Fake-Label).
+                        var realTime = toReal(time);
+                        var p = getBerlinParts(realTime);
+                        if (isDailyOrHigher || tickMarkType <= 2) {
+                            return p.day + '.' + p.month + '.' + p.year.slice(-2);
+                        }
+                        return p.hour + ':' + p.minute;
+                    }
+                },
+                localization: { locale: 'de-DE', timeFormatter: function(t) { 
+                    // t ist bei Zeit-basierten Serien ein UTCTimestamp (Zahl),
+                    // NICHT ein Objekt mit .time – sonst laeuft formatDT ins Leere.
+                    var ts = (t !== null && typeof t === 'object') ? t.time : t;
+                    return formatDT(toReal(ts)); 
+                } }
+            });
+        } catch(e) {
+            console.error('[applyFullChartUpdate] Schritt 1 (createChart) fehlgeschlagen:', e.message || e);
+            isUpdatingChart = false;
+            return;
+        }
+
+        try { setupResizeObserver(); } catch(e) {}
+
+        var precision = (data.precision !== undefined && data.precision !== null) ? data.precision : currentPrecision;
+        currentPrecision = precision;
+        var minMove = (typeof precision === 'number' && precision > 0 && precision < 10) 
+            ? 1 / Math.pow(10, precision) 
+            : 0.01;
+
+        // Schritt 2: CandlestickSeries
+        try {
+            candleSeries = chart.addSeries(LightweightCharts.CandlestickSeries, {
+                upColor: '#26a69a', downColor: '#ef5350', borderVisible: false,
+                wickUpColor: '#26a69a', wickDownColor: '#ef5350', priceLineVisible: false, lastValueVisible: false,
+                priceFormat: { type: 'price', precision: precision, minMove: minMove }
+            });
+            if (!candleSeries) throw new Error('candleSeries ist null');
+        } catch(e) {
+            console.error('[applyFullChartUpdate] Schritt 2 (addSeries) fehlgeschlagen:', e.message || e);
+            isUpdatingChart = false;
+            return;
+        }
+
+        // Schritt 3: setData
+        try {
+            candleSeries.setData(validCandles);
+        } catch(e) {
+            console.error('[applyFullChartUpdate] Schritt 3 (setData) fehlgeschlagen:', e.message || e);
+            isUpdatingChart = false;
+            return;
+        }
+        rawCandleData = validCandles;
+        lastClosePrice = validCandles[validCandles.length - 1].close;
+
+        // Schritt 4: TimeScale Subscription
+        try {
+            chart.timeScale().subscribeVisibleLogicalRangeChange(function() { 
+                if(!isUpdatingChart) {
+                    try { syncRanges(); } catch(e) {}
+                    try { updateCountdownDisplay(); } catch(e) {}
+                    try { DaySeparator.updatePositions(); } catch(e) {}
+                }
+            });
+
+            // C2: auch bei reinen Größenänderungen der Zeitskala (z. B. wenn
+            // der rechte Preisbereich sich ändert) die Trennlinien neu setzen.
+            chart.timeScale().subscribeSizeChange(function() {
+                if (!isUpdatingChart) {
+                    try { DaySeparator.updatePositions(); } catch(e) {}
+                }
+            });
+        } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 4 (subscribe) fehlgeschlagen:', e.message || e);
+        }
+
+        // Countdown-Timer (1s Intervall)
+        if (countdownTimer) clearInterval(countdownTimer);
+        countdownTimer = setInterval(function() {
+            try { updateCountdownDisplay(); } catch(e) {}
+        }, 1000);
+
+        // Schritt 5: Grid-Linien
+        try { if (data.gridLines) renderGridLines(data.gridLines); } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 5 (gridLines) fehlgeschlagen:', e.message || e);
+        }
+
+        // Schritt 6: Grid-Circles (speichert nur, Marker setzen via setMarkers)
+        try { if (data.gridCircles) renderGridCircles(data.gridCircles); } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 6 (gridCircles) fehlgeschlagen:', e.message || e);
+        }
+
+        // Schritt 7: Signal-Marker + Circles (combined via candleSeries.setMarkers)
+        // _storedSignalMarkersData/_storedCircleMarkers sind getrennte Layer;
+        // _applyAllMarkers() kombiniert beide automatisch aus den Caches.
+        try {
+            _storedSignalMarkersData = data.signalMarkers || [];
+            _applyAllMarkers();
+        } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 7 (signalMarkers) fehlgeschlagen:', e.message || e);
+        }
+
+        // Schritt 8: Range
+        try {
+            if (data.rangeFrom !== undefined && data.rangeTo !== undefined &&
+                data.rangeFrom !== null && data.rangeTo !== null &&
+                data.rangeFrom !== data.rangeTo) {
+                pendingRange = { rangeFrom: data.rangeFrom, rangeTo: data.rangeTo, priceFrom: data.priceFrom, priceTo: data.priceTo };
+                applyRange(data.rangeFrom, data.rangeTo, data.priceFrom, data.priceTo);
+            } else {
+                if (chart) chart.timeScale().fitContent();
+            }
+        } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 8 (applyRange) fehlgeschlagen:', e.message || e);
+        }
+
+        // Schritt 9: Day Separators (gekapseltes Modul, CSS-Overlay)
+        try { DaySeparator.render(rawCandleData); } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 9 (daySeparators) fehlgeschlagen:', e.message || e);
+        }
+
+        // Fertig – isUpdatingChart freigeben + initialen sync
+        isUpdatingChart = false;
+        try { syncRanges(); } catch(e) {}
+        try { updateCountdownDisplay(); } catch(e) {}
+
+    } catch(e) {
+        console.error('[applyFullChartUpdate] GLOBAL Error:', e.message || e);
+        isUpdatingChart = false;
+    }
+}
+
+```
+
+--------------------------------------------------
+
+### DATEI: .backup_D_markerlayers/__init__.py
+```py
+# chart/__init__.py
+from .chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, HTML_TEMPLATE, build_html_template
+from .chart_win import PyTraderChartWindow
+
+__all__ = [
+    "PyTraderChartWindow",
+    "HTML_TEMPLATE",
+    "build_html_template",
+    "COMBOBOX_STYLE",
+    "BUTTON_PRIMARY_STYLE",
+]
+```
+
+--------------------------------------------------
+
+### DATEI: .backup_D_markerlayers/chart_basics.py
+```py
+# chart/chart_basics.py
+"""
+chart/chart_basics.py - TradingView Lightweight Charts v5 HTML-Template
+Lädt JS-Module aus chart/js/ und baut das finale HTML dynamisch zusammen.
+"""
+
+from pathlib import Path
+from typing import Dict, List, TypeAlias
+
+OHLCVRecord: TypeAlias = Dict[str, float | int]
+CandleDataList: TypeAlias = List[OHLCVRecord]
+
+COMBOBOX_STYLE = """
+	QComboBox { background-color: #2b313e; color: white; border: 1px solid #3d4450; border-radius: 4px; padding: 3px 8px; font-weight: bold; }
+	QComboBox::drop-down { border: none; }
+	QComboBox QAbstractItemView { background-color: #1e222d; color: white; selection-background-color: #3d4450; }
+"""
+
+BUTTON_PRIMARY_STYLE = "background-color: #2b5c8f; color: white; font-weight: bold;"
+
+CSS_STYLE = """
+	html, body { margin: 0; padding: 0; width: 100%; height: 100%; background-color: #131722; overflow: hidden; font-family: sans-serif; user-select: none; }
+	#chart-container { width: 100%; height: 100%; position: relative; }
+	#measurement-region { display: none; position: absolute; background: rgba(41, 98, 255, 0.15); border: 1px dashed #2962FF; pointer-events: none; z-index: 999; }
+	#measurement-box { display: none; position: absolute; background: #1e222d; border: 1px solid #2962FF; border-radius: 6px; padding: 8px 12px; color: #d1d4dc; font-size: 12px; pointer-events: none; z-index: 1000; line-height: 1.5; white-space: nowrap; }
+	#price-badge { display: none; position: absolute; right: 2px; background: #2962FF; color: white; font-size: 11px; font-weight: bold; padding: 2px 6px; border-radius: 3px; pointer-events: none; z-index: 1000; will-change: transform, top; }
+	#countdown-badge { display: none; position: absolute; right: 62px; background: #1e222d; border: 1px solid #2962FF; color: #2962FF; font-size: 11px; font-weight: bold; padding: 2px 6px; border-radius: 3px; pointer-events: none; z-index: 1000; will-change: transform, top; }
+"""
+
+JS_DIR = Path(__file__).resolve().parent / "js"
+
+JS_FILES = [
+    "01_core.js",
+    "02_time_utils.js",
+    "03_chart_rendering.js",
+    "04_live_updates.js",
+]
+
+
+def _load_js_modules() -> str:
+    """Lädt alle JS-Dateien aus chart/js/ in der definierten Reihenfolge."""
+    parts: list[str] = []
+    for filename in JS_FILES:
+        filepath = JS_DIR / filename
+        try:
+            content = filepath.read_text(encoding="utf-8")
+            parts.append(f"// --- {filename} ---\n{content}")
+        except FileNotFoundError:
+            print(f"⚠️ [chart_basics] JS-Datei nicht gefunden: {filepath}")
+    return "\n\n".join(parts)
+
+
+def _build_html_template() -> str:
+    """Baut das finale HTML aus CSS, CDN-Links und den JS-Modulen zusammen."""
+    js_code = _load_js_modules()
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="utf-8">
+	<style>{CSS_STYLE}</style>
+	<script crossorigin="anonymous" src="https://unpkg.com/lightweight-charts@5.2.0/dist/lightweight-charts.standalone.production.js"></script>
+	<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+</head>
+<body>
+	<div id="chart-container">
+		<div id="measurement-region"></div>
+		<div id="measurement-box"></div>
+		<div id="price-badge"></div>
+		<div id="countdown-badge"></div>
+	</div>
+	<script>
+{js_code}
+	</script>
+</body>
+</html>"""
+
+
+def build_html_template() -> str:
+    """Baut das HTML-Template FRISCH aus den aktuellen JS-Dateien auf der Platte.
+
+    WICHTIG (Developer-Erfahrung): JS-Aenderungen in chart/js/ greifen sofort
+    bei jedem neuen Chart-Fenster – OHNE vollstaendigen App-Neustart.
+    Dafuer wird bei jedem Aufruf neu von der Platte gelesen (kein Modul-Cache).
+    """
+    return _build_html_template()
+
+
+# Abwaertskompatibilitaet: Konstante fuer Tests (check_html_template.py).
+HTML_TEMPLATE = _build_html_template()
+
+```
+
+--------------------------------------------------
+
+### DATEI: .backup_D_markerlayers/chart_win.py
+```py
+# chart/chart_win.py
+# ==============================================================================
+# chart/chart_win.py - Exakter Restore für Fensterposition, Leerraum & Zoom
+# ==============================================================================
+
+import json
+import math
+import sys
+from datetime import datetime, timezone as dt_timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from chart.indicators.base_indicator import BaseIndicator
+
+file_path = Path(__file__).resolve()
+project_root = file_path.parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+from PySide6.QtCore import QFile, QIODevice, QObject, QThread, QTimer, QUrl, Signal, Slot, Qt, QEvent
+from PySide6.QtUiTools import QUiLoader
+from PySide6.QtWebChannel import QWebChannel
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebEngineCore import QWebEnginePage
+from PySide6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QMainWindow,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
+
+try:
+    from chart.chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, HTML_TEMPLATE
+    from chart.indicators.grid import GridIndicator
+    from chart.indicator_dialog import IndicatorSettingsDialog
+except ImportError:
+    from chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, HTML_TEMPLATE
+    from indicators.grid import GridIndicator
+    from indicator_dialog import IndicatorSettingsDialog
+
+try:
+    from state_manager import StateManager
+except ImportError:
+    from state_manager import StateManager
+
+from db_service import MarketDataRepository, _parse_json_field, TF_SECONDS_MAP
+
+from chart.overlays.signal_overlay import SignalOverlay
+from analytics.background_workers.live_analyzer import fill_gaps_for_pair
+
+
+def find_null_fields(obj, path=""):
+    """Sucht rekursiv nach None/null in Dictionaries und Listen."""
+    nulls = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            new_path = f"{path}.{k}" if path else k
+            if v is None:
+                nulls.append(new_path)
+            else:
+                nulls.extend(find_null_fields(v, new_path))
+    elif isinstance(obj, list):
+        for idx, item in enumerate(obj):
+            new_path = f"{path}[{idx}]"
+            nulls.extend(find_null_fields(item, new_path))
+    return nulls
+
+
+def _clean_nan(obj):
+    """Entfernt rekursiv alle NaN/Inf-Werte aus Dicts/Listen, damit json.dumps(allow_nan=False) nicht fehlschlaegt."""
+    if isinstance(obj, dict):
+        return {k: _clean_nan(v) for k, v in obj.items() if not (isinstance(v, float) and (math.isnan(v) or math.isinf(v)))}
+    elif isinstance(obj, list):
+        return [_clean_nan(item) for item in obj if not (isinstance(item, float) and (math.isnan(item) or math.isinf(item)))]
+    return obj
+
+
+class WebEngineConsolePage(QWebEnginePage):
+    def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID):
+        print(f"🌐 [JS Console L{lineNumber}]: {message}")
+
+
+class ChartBridge(QObject):
+    rangeChanged = Signal(float, float)
+    priceRangeChanged = Signal(float, float)
+    measurementChanged = Signal(str)
+
+    @Slot(float, float)
+    def onRangeChanged(self, f, t): self.rangeChanged.emit(f, t)
+
+    @Slot(float, float)
+    def onPriceRangeChanged(self, f, t): self.priceRangeChanged.emit(f, t)
+
+    @Slot(str)
+    def onMeasurementChanged(self, m): self.measurementChanged.emit(m)
+
+
+class ChartDataSerializer(QThread):
+    """Serialisiert Chart-Update-Pakete im Hintergrund-Thread (JSON-Encoding)."""
+    serialized = Signal(str, int)  # fertiges JSON, updateId
+
+    def __init__(self, update_package: dict, update_id: int, parent=None):
+        super().__init__(parent)
+        self.update_package = update_package
+        self.update_id = update_id
+
+    def run(self):
+        try:
+            payload = json.dumps(self.update_package, allow_nan=False)
+            self.serialized.emit(payload, self.update_id)
+        except (ValueError, TypeError) as e:
+            print(f"⚠️ [Serializer] JSON-Fehler: {e}")
+            self.serialized.emit("", self.update_id)
+
+
+class GridDataSerializer(QThread):
+    """Serialisiert Grid-Linien/Circles im Hintergrund-Thread."""
+    done = Signal(str, str, int)  # lines_json, circles_json, gridGen
+
+    def __init__(self, lines: list, circles: list, grid_gen: int, parent=None):
+        super().__init__(parent)
+        self.lines = lines
+        self.circles = circles
+        self.grid_gen = grid_gen
+
+    def run(self):
+        try:
+            lj = json.dumps(self.lines, allow_nan=False)
+            cj = json.dumps(self.circles, allow_nan=False)
+            self.done.emit(lj, cj, self.grid_gen)
+        except (ValueError, TypeError) as e:
+            print(f"⚠️ [GridSerializer] JSON-Fehler: {e}")
+            self.done.emit("", "", self.grid_gen)
+
+
+class PyTraderChartWindow(QMainWindow):
+    closed_signal = Signal(str)
+
+    def __init__(self, instance_id="win_1", symbol="SILVER", timeframe="H1", visible_from=None, visible_to=None,
+                 state_manager=None):
+        super().__init__()
+        self.instance_id = instance_id
+        self.current_symbol = symbol
+        self.current_tf = timeframe
+        self.visible_from = visible_from
+        self.visible_to = visible_to
+        self.visible_price_from = None
+        self.visible_price_to = None
+        self.measurement_state = None
+        self.indicators_state = {}
+
+        self.state_manager = state_manager or StateManager()
+        self.settings = self.state_manager.get_app_settings()
+        self.market_repo = MarketDataRepository()
+        self._is_loading_data = False
+        self.df_data = None
+
+        # Generische Indikator-Registry: indicator_id -> BaseIndicator
+        self.indicators: Dict[str, BaseIndicator] = {
+            "grid": GridIndicator(),
+        }
+        self._settings_dialog: Optional[QDialog] = None
+        self._page_loaded: bool = False
+
+        self.signal_overlay = SignalOverlay()
+        # Signal-Marker standardmaessig AUS, toggle via Button (📈)
+        self._signals_enabled: bool = False
+        self._grid_serializer: Optional[GridDataSerializer] = None
+        self._chart_serializer: Optional[ChartDataSerializer] = None
+        # Debounce-Timer für Chart-Refresh (verhindert Race-Conditions bei schnellen Wechseln)
+        self._debounce_timer: QTimer = QTimer(self)
+        self._debounce_timer.setSingleShot(True)
+        self._debounce_timer.setInterval(400)
+        self._debounce_timer.timeout.connect(self._safe_refresh_chart_data)
+        # Watchdog: setzt _is_loading_data automatisch zurueck, falls ein Refresh haengt
+        # (verhindert dauerhafte Blockade von TF-/Symbol-Wechsel)
+        self._loading_watchdog: QTimer = QTimer(self)
+        self._loading_watchdog.setSingleShot(True)
+        self._loading_watchdog.setInterval(15000)
+        self._loading_watchdog.timeout.connect(self._on_loading_watchdog)
+        # Mapping: kontinuierliche Zeit -> originale epoch (für JS tickMarkFormatter)
+        self._time_cont_to_real: Dict[int, int] = {}
+        self._time_real_to_cont: Dict[int, int] = {}
+        # Generations-Guard: monoton steigende Update-IDs für Chart- und Grid-Refresh.
+        # Veraltete Serializer-Ergebnisse (langsamer Thread aus einem frueheren
+        # Symbol/TF-Stand) werden in _apply_chart_update/_apply_grid_render verworfen.
+        self._update_generation: int = 0
+        self._grid_generation: int = 0
+
+                # 1. ZUERST versuchen, spezifischen Instanz-Status aus der DB zu laden
+        saved_inst_st = self.state_manager.load_all_instances()
+        matched_inst = next((i for i in saved_inst_st if i.get("instance_id") == self.instance_id), None)
+
+        if matched_inst:
+            raw_symbol = matched_inst.get("symbol")
+            raw_tf = matched_inst.get("timeframe")
+            self.current_symbol = str(raw_symbol) if raw_symbol is not None else self.current_symbol
+            self.current_tf = str(raw_tf) if raw_tf is not None else self.current_tf
+            if self.visible_from is None:
+                self.visible_from = matched_inst.get("visible_range_from")
+                self.visible_to = matched_inst.get("visible_range_to")
+            self.visible_price_from = matched_inst.get("visible_price_from")
+            self.visible_price_to = matched_inst.get("visible_price_to")
+
+            ind_st = matched_inst.get("indicators_state")
+            if ind_st is not None and not isinstance(ind_st, (int, float)):
+                self.indicators_state = _parse_json_field(ind_st) or {}
+
+        # 2. FALLBACK: Wenn keine Instanz da ist (z. B. neues manuelles Fenster), lade zuletzt gespeicherte Symbol:TF Combo
+        if not isinstance(self.indicators_state, dict) or not self.indicators_state or self.visible_from is None:
+            if not isinstance(self.indicators_state, dict):
+                self.indicators_state = {}
+            pair_st = self.state_manager.get_symbol_tf_state(self.current_symbol, self.current_tf)
+            if pair_st:
+                if self.visible_from is None:
+                    self.visible_from = pair_st.get("visible_range_from")
+                    self.visible_to = pair_st.get("visible_range_to")
+                if self.visible_price_from is None:
+                    self.visible_price_from = pair_st.get("visible_price_from")
+                    self.visible_price_to = pair_st.get("visible_price_to")
+                if pair_st.get("indicators_state") and not self.indicators_state:
+                    ind_st_pair = pair_st.get("indicators_state")
+                    if ind_st_pair is not None and not isinstance(ind_st_pair, (int, float)):
+                        self.indicators_state = _parse_json_field(ind_st_pair) or {}
+
+        # Sicherstellen, dass indicators_state ein dict ist
+        if not isinstance(self.indicators_state, dict):
+            self.indicators_state = {}
+
+        # Standard-Indikator-Setups ergänzen falls unvollständig
+        for ind_id, ind_plugin in self.indicators.items():
+            if ind_id not in self.indicators_state:
+                self.indicators_state[ind_id] = {
+                    "active": False,
+                    "preset": "Default",
+                    "params": dict(ind_plugin.default_params)
+                }
+            else:
+                # Fehlende Default-Parameter nachtragen (z. B. neue Farb-Parameter)
+                existing_params = self.indicators_state[ind_id].get("params", {})
+                merged = dict(ind_plugin.default_params)
+                merged.update(existing_params)
+                self.indicators_state[ind_id]["params"] = merged
+
+        # UI Laden aus .ui
+        base_dir = Path(__file__).resolve().parent.parent
+        ui_file = QFile(str(base_dir / "ui" / "chart_win.ui"))
+        if ui_file.open(QIODevice.ReadOnly):
+            loader = QUiLoader()
+            self.ui_widget = loader.load(ui_file)
+            ui_file.close()
+            self.setCentralWidget(self.ui_widget)
+        else:
+            self.ui_widget = QWidget(self)
+            self.setCentralWidget(self.ui_widget)
+
+        self.setWindowTitle(f"PyTrader Chart - {self.current_symbol} [{self.current_tf}] ({self.instance_id})")
+        self.resize(1000, 700)
+
+        self.symbol_combo = self.ui_widget.findChild(QComboBox, "combo_symbol")
+        self.tf_combo = self.ui_widget.findChild(QComboBox, "combo_tf")
+        self.btn_reset = self.ui_widget.findChild(QPushButton, "btn_reset_chart")
+        self.btn_indicator = self.ui_widget.findChild(QPushButton, "btn_indicator_grid")
+        self.btn_signal = self.ui_widget.findChild(QPushButton, "btn_signal_select")
+        self.chart_container = self.ui_widget.findChild(QWidget, "web_container")
+
+        if self.symbol_combo:
+            self.symbol_combo.setCurrentText(str(self.current_symbol) if self.current_symbol is not None else "SILVER")
+            self.symbol_combo.currentTextChanged.connect(self.on_symbol_changed)
+        if self.tf_combo:
+            self.tf_combo.setCurrentText(str(self.current_tf) if self.current_tf is not None else "H1")
+            self.tf_combo.currentTextChanged.connect(self.on_tf_changed)
+        if self.btn_reset:
+            self.btn_reset.clicked.connect(self.fit_chart)
+        if self.btn_indicator:
+            self.btn_indicator.setCheckable(True)
+            self.btn_indicator.clicked.connect(self.toggle_grid_lines)
+            self.btn_indicator.installEventFilter(self)
+            self.update_indicator_button_style()
+
+        if self.btn_signal:
+            self.btn_signal.setCheckable(True)
+            self.btn_signal.clicked.connect(self.on_signal_button_clicked)
+
+        self.web_view = QWebEngineView()
+        self.web_view.setPage(WebEngineConsolePage(self.web_view))
+        self.web_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        target = self.chart_container if self.chart_container else self.ui_widget
+        layout = target.layout()
+        if layout is None:
+            layout = QVBoxLayout(target)
+            layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.web_view, 1)
+
+        self.bridge = ChartBridge()
+        self.bridge.rangeChanged.connect(self.handle_range_changed)
+        self.bridge.priceRangeChanged.connect(self.handle_price_range_changed)
+        self.bridge.measurementChanged.connect(self.handle_measurement_changed)
+        self.channel = QWebChannel()
+        self.channel.registerObject("pyBridge", self.bridge)
+        self.web_view.page().setWebChannel(self.channel)
+        self.web_view.setHtml(HTML_TEMPLATE, QUrl("https://localhost"))
+        self.web_view.loadFinished.connect(self._on_page_loaded)
+
+    def _auto_init_signal_set(self) -> None:
+        """Nicht mehr verwendet - Testsignal ist deaktiviert."""
+        pass
+
+    def eventFilter(self, watched, event):
+        if self.btn_indicator is not None and watched == self.btn_indicator and event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton:
+            # Wenn Dialog offen, schliessen; sonst öffnen
+            if self._settings_dialog is not None and self._settings_dialog.isVisible():
+                self._settings_dialog.close()
+                self._settings_dialog = None
+            else:
+                self._open_indicator_settings("grid")
+            return True
+        return super().eventFilter(watched, event)
+
+    def _get_indicator_plugin(self, ind_id: str) -> Optional[BaseIndicator]:
+        """Gibt die Indikator-Instanz zur ID zurück (oder None)."""
+        return self.indicators.get(ind_id)
+
+    def update_indicator_button_style(self):
+        if not self.btn_indicator: return
+        is_active = self.indicators_state.get("grid", {}).get("active", False)
+        color = "#2e7d32" if is_active else "#37474f"
+        self.btn_indicator.setStyleSheet(
+            f"background-color: {color}; color: white; font-weight: bold; border-radius: 4px; padding: 3px 10px;")
+
+    def toggle_grid_lines(self):
+        self._toggle_indicator("grid")
+
+    def _toggle_indicator(self, ind_id: str) -> None:
+        """Schaltet einen Indikator an/aus."""
+        plugin = self._get_indicator_plugin(ind_id)
+        if plugin is None:
+            return
+        st = self.indicators_state.setdefault(ind_id, {
+            "active": False, "preset": "Default", "params": dict(plugin.default_params)
+        })
+        st["active"] = not st["active"]
+        self.update_indicator_button_style()
+        self.save_state()
+        self.render_indicators()
+
+    def _open_indicator_settings(self, ind_id: str) -> None:
+        """Öffnet den Einstellungs-Dialog für einen Indikator."""
+        plugin = self._get_indicator_plugin(ind_id)
+        if plugin is None:
+            return
+        st = self.indicators_state.setdefault(ind_id, {
+            "active": False, "preset": "Default", "params": dict(plugin.default_params)
+        })
+        dialog = IndicatorSettingsDialog(plugin, st["params"], st["preset"], self.state_manager,
+                                         lambda p, pr: self._on_indicator_params_updated(ind_id, p, pr), self)
+        self._settings_dialog = dialog
+        dialog.finished.connect(lambda: self._on_settings_closed(dialog))
+        dialog.show()
+
+    def _on_settings_closed(self, dialog):
+        if self._settings_dialog is dialog:
+            self._settings_dialog = None
+
+    def _on_page_loaded(self, ok: bool) -> None:
+        if ok:
+            self._page_loaded = True
+            # Initialer Refresh direkt (ohne Debounce), danach nur noch via Debounce
+            self._safe_refresh_chart_data()
+
+    def _safe_refresh_chart_data(self) -> None:
+        """Startet den Chart-Refresh mit Fehler-Schutz.
+        Stellt sicher, dass _is_loading_data bei einem Fehler zurueckgesetzt wird –
+        sonst bleibt der Chart dauerhaft blockiert (keine Charts, TF/Symbol-Wechsel tot)."""
+        try:
+            self._do_refresh_chart_data()
+        except Exception as e:
+            print(f"❌ [ChartRefresh] Fehler: {e}")
+            self._set_loading(False)
+
+    def _set_loading(self, loading: bool) -> None:
+        """Setzt _is_loading_data und startet/stoppt den Watchdog konsistent."""
+        self._is_loading_data = loading
+        if loading:
+            self._loading_watchdog.start()
+        else:
+            self._loading_watchdog.stop()
+
+    def _on_loading_watchdog(self) -> None:
+        """Watchdog-Timeout: Ein Chart-Refresh haengt zu lange (z. B. durch Fehler).
+        Setzt das Flag zurueck, damit TF-/Symbol-Wechsel wieder funktionieren."""
+        print(f"⚠️ [ChartRefresh] Watchdog: Refresh haengt ({self.current_symbol} {self.current_tf}), setze zurueck")
+        self._is_loading_data = False
+
+    def _on_indicator_params_updated(self, ind_id: str, params: Dict[str, Any], preset: str) -> None:
+        """Callback wenn ein Indikator-Parameter geändert wurde."""
+        self.indicators_state[ind_id] = {"active": True, "preset": preset, "params": params}
+        self.save_state()
+        self.render_indicators()
+
+    def render_indicators(self):
+        """Rendert alle aktiven Indikatoren via JS-Bridge."""
+        if self.df_data is None or self.df_data.empty:
+            return
+
+        # Zuerst alle Indikator-Layer clearen
+        try:
+            self.web_view.page().runJavaScript("if(window.clearGridLines) clearGridLines();")
+            self.web_view.page().runJavaScript("if(window.clearGridCircles) clearGridCircles();")
+        except (RuntimeError, AttributeError):
+            pass
+
+        for ind_id, plugin in self.indicators.items():
+            st = self.indicators_state.get(ind_id, {})
+            if not st.get("active"):
+                continue
+            try:
+                # Kontext setzen (Symbol/TF fuer DB-basierte Indikatoren)
+                if hasattr(plugin, "set_context"):
+                    plugin.set_context(self.current_symbol, self.current_tf)
+                res = plugin.calculate(self.df_data, st.get("params", {}))
+                # Grid-spezifische Render-Logik (aktuell der einzige Indikator)
+                if ind_id == "grid":
+                    lines = res.get("lines", [])
+                    circles = res.get("hit_circles", [])
+                    # Circle-Zeiten auf kontinuierlich mappen
+                    if circles and self._time_real_to_cont:
+                        for gc in circles:
+                            gc_t = gc.get("time")
+                            if gc_t is not None and int(gc_t) in self._time_real_to_cont:
+                                gc["time"] = self._time_real_to_cont[int(gc_t)]
+                    # JSON-Encoding im Hintergrund
+                    self._serialize_and_render_grid(lines, circles)
+            except (RuntimeError, AttributeError):
+                pass
+
+    def _serialize_and_render_grid(self, lines: list, circles: list) -> None:
+        """Serialisiert Grid-Daten im Hintergrund-Thread und rendert sie.
+        Alter Thread wird vor Neustart sauber beendet.
+        Generations-Guard: jede Render-Anforderung bekommt eine steigende ID;
+        veraltete Ergebnisse (langsamer Thread) werden verworfen."""
+        # Alten Serializer cleanen falls noch aktiv
+        if self._grid_serializer is not None:
+            try:
+                self._grid_serializer.done.disconnect(self._apply_grid_render)
+            except (RuntimeError, TypeError):
+                pass
+            if self._grid_serializer.isRunning():
+                self._grid_serializer.quit()
+                self._grid_serializer.wait(500)
+            self._grid_serializer = None
+
+        self._grid_generation += 1
+        grid_gen = self._grid_generation
+        self._grid_serializer = GridDataSerializer(lines, circles, grid_gen)
+        self._grid_serializer.done.connect(self._apply_grid_render)
+        self._grid_serializer.start()
+
+    def _apply_grid_render(self, lines_json: str, circles_json: str, grid_gen: int) -> None:
+        """Übergibt serialisierte Grid-Daten an JS (wird im GUI-Thread aufgerufen).
+        Verwirft veraltete Ergebnisse, falls inzwischen ein neuerer Render lief.
+        Nach dem Grid-Render werden die Signal-Marker IMMER neu gesetzt –
+        so können aktive Signale (EMA, Grid-Proximity) durch den Grid-Render
+        nie verdrängt werden (Marker-Cache-Robustheit)."""
+        if grid_gen < self._grid_generation:
+            print(f"⚠️ [GridRender] Veraltetes Ergebnis verworfen (gen={grid_gen} < {self._grid_generation})")
+            return
+        if not lines_json and not circles_json:
+            return
+        try:
+            if lines_json:
+                self.web_view.page().runJavaScript(
+                    f"if(window.renderGridLines) renderGridLines('{lines_json}');")
+            if circles_json:
+                self.web_view.page().runJavaScript(
+                    f"if(window.renderGridCircles) renderGridCircles('{circles_json}');")
+            # Signale nach dem Grid-Render wiederherstellen (falls aktiv).
+            # Guard in _update_signal_markers_only verhindert Arbeit während
+            # eines laufenden Chart-Refreshes.
+            try:
+                self._update_signal_markers_only()
+            except Exception as e:
+                print(f"⚠️ [GridRender] Signal-Marker-Update fehlgeschlagen: {e}")
+        except (RuntimeError, AttributeError):
+            pass
+
+    def refresh_chart_data(self) -> None:
+        """Debounced: Startet Chart-Refresh mit 400ms Verzögerung.
+        Bei schnellen Mehrfach-Aufrufen wird nur der letzte ausgeführt."""
+        if not self._page_loaded:
+            QTimer.singleShot(200, self.refresh_chart_data)
+            return
+        self._debounce_timer.start()
+
+    def _do_refresh_chart_data(self) -> None:
+        """Führt den tatsächlichen Chart-Refresh aus (nur via Debounce-Timer)."""
+        if self._is_loading_data:
+            self._debounce_timer.start()
+            return
+
+        self._set_loading(True)
+
+        print(f"📊 Lade Chart-Daten: {self.current_symbol} {self.current_tf}")
+        candles, precision = self.market_repo.fetch_historical_candles(self.current_symbol, self.current_tf, limit=self.settings.chart_candle_limit)
+        print(f"   → {len(candles)} Candles geladen, precision={precision}")
+
+        # NaN-Werte aus den Candles entfernen
+        clean_candles = []
+        if candles:
+            import math
+            for c in candles:
+                if (c.get("time") is not None and
+                    c.get("open") is not None and
+                    c.get("high") is not None and
+                    c.get("low") is not None and
+                    c.get("close") is not None):
+                    if (not math.isnan(c["open"]) and
+                        not math.isnan(c["high"]) and
+                        not math.isnan(c["low"]) and
+                        not math.isnan(c["close"])):
+                        clean_candles.append(c)
+
+            # ======================================================================
+            # Kontinuierliche Candle-Zeiten (keinerlei Lücken/Whitespace im Chart)
+            # Jede Candle bekommt: base_time + i * tf_sec
+            # Mapping cont -> real für JS tickMarkFormatter.
+            # ======================================================================
+            t_sec = TF_SECONDS_MAP.get(str(self.current_tf).upper(), 60)
+            self._time_cont_to_real = {}
+            self._time_real_to_cont = {}
+            continuous_candles = []
+            if clean_candles:
+                base_time = clean_candles[0]["time"]
+                for i, c in enumerate(clean_candles):
+                    cont_time = base_time + i * t_sec
+                    real_time = int(c["time"])
+                    self._time_cont_to_real[cont_time] = real_time
+                    self._time_real_to_cont[real_time] = cont_time
+                    dc = dict(c)
+                    dc["time"] = cont_time
+                    continuous_candles.append(dc)
+
+            import pandas as pd
+            self.df_data = pd.DataFrame(clean_candles)
+        else:
+            self.df_data = None
+            continuous_candles = []
+
+        grid_lines = []
+        grid_circles = []
+
+        if self.df_data is not None and not self.df_data.empty:
+            for ind_id, plugin in self.indicators.items():
+                st = self.indicators_state.get(ind_id, {})
+                if st.get("active") and ind_id == "grid":
+                    if hasattr(plugin, "set_context"):
+                        plugin.set_context(self.current_symbol, self.current_tf)
+                    res = plugin.calculate(self.df_data, st.get("params", {}))
+                    grid_lines = res.get("lines", [])
+                    grid_circles = res.get("hit_circles", [])
+                    # Circle-Zeiten auf kontinuierlich mappen
+                    if grid_circles and self._time_real_to_cont:
+                        for gc in grid_circles:
+                            gc_t = gc.get("time")
+                            if gc_t is not None and int(gc_t) in self._time_real_to_cont:
+                                gc["time"] = self._time_real_to_cont[int(gc_t)]
+
+        update_package = {
+            "symbol": self.current_symbol,
+            "timeframe": self.current_tf,
+            "candles": continuous_candles,
+            "precision": precision,
+            "gridLines": grid_lines,
+            "gridCircles": grid_circles,
+            "signalMarkers": self._get_signal_markers_for_update(),
+            "timeMap": self._time_cont_to_real,
+            # TF_SECONDS_MAP: Python ist die Single Source of Truth. JS nutzt
+            # diesen Payload, statt sich auf seine eingebettete Offline-Map zu
+            # verlassen (kein Duplikat-Pflege-Problem mehr).
+            "tfSecondsMap": TF_SECONDS_MAP,
+        }
+
+        # Generations-Guard: monotone Update-ID für Race-Schutz im JS.
+        # WICHTIG: Wird VOR dem Serializer-Start inkrementiert, damit jeder
+        # Refresh eine eindeutig hoehere ID als der vorherige erhaelt.
+        self._update_generation += 1
+        update_id = self._update_generation
+        update_package["updateId"] = update_id
+
+        # Nur hinzufügen, wenn echte Werte da sind – nie null/0 übergeben (sonst "Value is null" in JS)
+        if self.visible_from is not None and self.visible_to is not None:
+            update_package["rangeFrom"] = int(self.visible_from)
+            update_package["rangeTo"] = int(self.visible_to)
+
+        if self.visible_price_from is not None and self.visible_price_to is not None:
+            update_package["priceFrom"] = float(self.visible_price_from)
+            update_package["priceTo"] = float(self.visible_price_to)
+
+        # NaN/Inf-Werte aus dem gesamten Payload entfernen (sonst JSON-Fehler im Serializer)
+        update_package = _clean_nan(update_package)
+
+        # JSON-Encoding im Hintergrund-Thread, um GUI-Ruckler zu vermeiden
+        # Alten Serializer cleanen falls noch aktiv
+        if self._chart_serializer is not None:
+            try:
+                self._chart_serializer.serialized.disconnect(self._apply_chart_update)
+            except (RuntimeError, TypeError):
+                pass
+            if self._chart_serializer.isRunning():
+                self._chart_serializer.quit()
+                self._chart_serializer.wait(500)
+            self._chart_serializer = None
+
+        self._chart_serializer = ChartDataSerializer(update_package, update_id)
+        self._chart_serializer.serialized.connect(self._apply_chart_update)
+        self._chart_serializer.start()
+
+    def _apply_chart_update(self, payload: str, update_id: int) -> None:
+        """Empfängt fertiges JSON aus dem Serializer-Thread und prüft es auf nulls.
+        Generations-Guard: veraltete Payloads (langsamer Thread aus einem
+        frueheren Symbol/TF-Stand) werden verworfen, bevor sie JS erreichen."""
+        # Veraltetes Update verwerfen – ein neuerer Refresh hat bereits begonnen
+        if update_id < self._update_generation:
+            print(f"⚠️ [ChartUpdate] Veraltetes Update verworfen (id={update_id} < {self._update_generation})")
+            return
+        if not payload:
+            self._set_loading(False)
+            return
+
+        # ======================================================================
+        # DEBUG-CHECK: Identifiziert das exakte null-Objekt in Python!
+        # ======================================================================
+        try:
+            import json as _json
+            data = _json.loads(payload)
+            null_paths = find_null_fields(data)
+            if null_paths:
+                print(f"🚨 [NULL DETECTED in {self.current_symbol} {self.current_tf}] Gefundene null-Pfade:")
+                for p in null_paths[:15]:  # Zeige die ersten 15 Treffer
+                    print(f"   -> {p}")
+        except Exception as debug_err:
+            print(f"⚠️ [NullCheck] Fehler: {debug_err}")
+        # ======================================================================
+
+        try:
+            if hasattr(self, "web_view") and self.web_view and self.web_view.page():
+                self.web_view.page().runJavaScript(
+                    f"if(window.applyFullChartUpdate) applyFullChartUpdate({payload});"
+                )
+        except (RuntimeError, AttributeError):
+            pass
+        finally:
+            QTimer.singleShot(500, self._unlock_tracking)
+
+    def _unlock_tracking(self):
+        try:
+            self._set_loading(False)
+            self.update_indicator_button_style()
+        except (RuntimeError, AttributeError):
+            pass
+
+    def update_live_candle(self, c: Dict[str, Any]) -> None:
+        if not c or self._is_loading_data: return
+        t_sec = TF_SECONDS_MAP.get(str(self.current_tf).upper(), 60)
+
+        # Sichere Typprüfung für das time-Feld
+        time_val = c.get("time", 0)
+        if isinstance(time_val, datetime):
+            raw_t = int(time_val.timestamp())
+        elif isinstance(time_val, (int, float)):
+            raw_t = int(time_val)
+        else:
+            raw_t = 0
+
+        c_copy = dict(c)
+        # Symbol/TF mitliefern – der JS-Guard in updateLiveCandle() verwirft
+        # verspaetete Ticks, die nach einem schnellen Symbol/TF-Wechsel eintreffen.
+        c_copy["symbol"] = self.current_symbol
+        c_copy["timeframe"] = self.current_tf
+        rounded_t = raw_t - (raw_t % t_sec)
+
+        # Auf kontinuierliche Zeit mappen (kein Leerraum im Chart)
+        if rounded_t in self._time_real_to_cont:
+            c_copy["time"] = self._time_real_to_cont[rounded_t]
+        elif self._time_cont_to_real:
+            # Neue Candle: an letzte kont. Zeit anhängen
+            last_cont = max(self._time_cont_to_real.keys())
+            c_copy["time"] = last_cont + t_sec
+            self._time_cont_to_real[c_copy["time"]] = rounded_t
+            self._time_real_to_cont[rounded_t] = c_copy["time"]
+        else:
+            c_copy["time"] = rounded_t
+
+        try:
+            self.web_view.page().runJavaScript(f"if(window.updateLiveCandle) updateLiveCandle('{json.dumps(c_copy, allow_nan=False)}');")
+        except (ValueError, TypeError) as e:
+            print(f"⚠️ [JSON] NaN in Live-Candle: {e}")
+        except (RuntimeError, AttributeError):
+            pass
+
+    def on_symbol_changed(self, s):
+        if s and s != self.current_symbol:
+            self.save_state()
+            self.current_symbol = s
+            self.df_data = None
+            pair_st = self.state_manager.get_symbol_tf_state(self.current_symbol, self.current_tf)
+            if pair_st:
+                self.visible_from = pair_st.get("visible_range_from")
+                self.visible_to = pair_st.get("visible_range_to")
+                self.visible_price_from = pair_st.get("visible_price_from")
+                self.visible_price_to = pair_st.get("visible_price_to")
+                if pair_st.get("indicators_state"):
+                    ind_st = pair_st.get("indicators_state")
+                    loaded_ind = _parse_json_field(ind_st) or {}
+                    # Merge statt ersetzen, damit Grid-Fallback erhalten bleibt
+                    self.indicators_state.update(loaded_ind)
+                    # Fehlende Default-Parameter nachtragen
+                    for ind_id, ind_plugin in self.indicators.items():
+                        if ind_id in self.indicators_state:
+                            existing = self.indicators_state[ind_id].get("params", {})
+                            merged = dict(ind_plugin.default_params)
+                            merged.update(existing)
+                            self.indicators_state[ind_id]["params"] = merged
+            else:
+                self.visible_from = self.visible_to = None
+                self.visible_price_from = self.visible_price_to = None
+
+            # Chart-Trigger: Luecken fuer live_op=True Signale fuellen
+            fill_gaps_for_pair(self.current_symbol, self.current_tf, self.settings.feature_builder_limit)
+            self.refresh_chart_data()
+
+    def on_tf_changed(self, t):
+        if t and t != self.current_tf:
+            self.save_state()
+            self.current_tf = t
+            self.df_data = None
+            pair_st = self.state_manager.get_symbol_tf_state(self.current_symbol, self.current_tf)
+            if pair_st:
+                self.visible_from = pair_st.get("visible_range_from")
+                self.visible_to = pair_st.get("visible_range_to")
+                self.visible_price_from = pair_st.get("visible_price_from")
+                self.visible_price_to = pair_st.get("visible_price_to")
+                if pair_st.get("indicators_state"):
+                    ind_st = pair_st.get("indicators_state")
+                    loaded_ind = _parse_json_field(ind_st) or {}
+                    # Merge statt ersetzen, damit Grid-Fallback erhalten bleibt
+                    self.indicators_state.update(loaded_ind)
+                    # Fehlende Default-Parameter nachtragen
+                    for ind_id, ind_plugin in self.indicators.items():
+                        if ind_id in self.indicators_state:
+                            existing = self.indicators_state[ind_id].get("params", {})
+                            merged = dict(ind_plugin.default_params)
+                            merged.update(existing)
+                            self.indicators_state[ind_id]["params"] = merged
+            else:
+                self.visible_from = self.visible_to = None
+                self.visible_price_from = self.visible_price_to = None
+
+            # Chart-Trigger: Luecken fuer live_op=True Signale fuellen
+            fill_gaps_for_pair(self.current_symbol, self.current_tf, self.settings.feature_builder_limit)
+            self.refresh_chart_data()
+
+    def on_signal_button_clicked(self):
+        """Schaltet ALLE Signal-Marker an/aus (Grid Proximity + EMA-Signale).
+        Testsignale (alternating_arrow_v1) bleiben deaktiviert.
+        Aktualisiert NUR die Signal-Marker, ohne Chart-Neubau."""
+        if not self.btn_signal:
+            return
+
+        self._signals_enabled = self.btn_signal.isChecked()
+        status = "AN" if self._signals_enabled else "AUS"
+        print(f"🔔 Signale: {status}")
+        self._update_signal_markers_only()
+
+    def _update_signal_markers_only(self) -> None:
+        """Aktualisiert NUR die Signal-Marker im Chart, OHNE kompletten Chart-Neubau.
+
+        HINWEIS: Bewusst KEIN _is_loading_data-Guard mehr. Der Grid-Render
+        (_apply_grid_render) ruft diese Funktion direkt nach dem Grid-Render
+        auf – waehrend eines laufenden Chart-Refreshes wuerde der Guard das
+        Signal-Update blockieren und die EMA-Marker waeren weg (Bug).
+        Die JS-seitige Marker-Kombination (Caches + _applyAllMarkers) ist
+        race-sicher, weil alle JS-Aufrufe sequenziell im Page-Thread laufen.
+        """
+        if not self._page_loaded or self.df_data is None or self.df_data.empty:
+            return
+
+        markers = self._get_signal_markers_for_update()
+        markers_json = json.dumps(markers, allow_nan=False)
+
+        # ======================================================================
+        # DEBUG-CHECK für Marker-Updates
+        # ======================================================================
+        try:
+            null_paths = find_null_fields(markers)
+            if null_paths:
+                print(f"🚨 [NULL MARKER in {self.current_symbol} {self.current_tf}] Gefundene null-Pfade:")
+                for p in null_paths[:10]:
+                    print(f"   -> markers{p}")
+        except Exception:
+            pass
+        # ======================================================================
+
+        try:
+            self.web_view.page().runJavaScript(
+                f"if(window.renderSignalMarkers) renderSignalMarkers({markers_json});"
+            )
+        except (RuntimeError, AttributeError) as e:
+            print(f"⚠️ [SignalMarker] JS-Fehler: {e}")
+
+    # ==============================================================================
+    # Live-Signal Integration (wird von MainWindow.on_live_signal gerufen)
+    # ==============================================================================
+
+    def on_live_signal_received(self, symbol: str, timeframe: str, bar_time: int, confidence: float, source_id: str) -> None:
+        """Wird vom MainWindow bei neuem Live-Signal gerufen.
+        Aktualisiert NUR die Marker, kein Chart-Neubau.
+        Blockiert waerend _is_loading_data (verhindert JS-Race-Condition)."""
+        if symbol != self.current_symbol or timeframe != self.current_tf:
+            return
+        if self._is_loading_data or not self._page_loaded:
+            return
+        self._update_signal_markers_only()
+
+    @staticmethod
+    def _apply_marker_styles(markers: List[Dict[str, Any]], source_id: str) -> List[Dict[str, Any]]:
+        """Wendet visuelle Stile auf Marker basierend auf source_id an.
+        Ermoeglicht Unterscheidung verschiedener Signal-Typen im Chart.
+        priority (int): Stapel-Reihenfolge bei gleicher Kerze in JS
+        (niedriger = näher an der Kerze, höher = weiter oben)."""
+        for m in markers:
+            if source_id == "alternating_arrow_v1":
+                # Alternierende Pfeile: Buy=arrowUp (oben), Sell=arrowDown (unten)
+                if m["time"] % 2 == 0:
+                    m["position"] = "belowBar"
+                    m["shape"] = "arrowUp"
+                    m["color"] = "#26a69a"  # Gruen
+                else:
+                    m["position"] = "aboveBar"
+                    m["shape"] = "arrowDown"
+                    m["color"] = "#ef5350"  # Rot
+                m["priority"] = 5
+            elif source_id == "grid_proximity_v1":
+                # Grid-Proximity: Kreise oberhalb
+                m["position"] = "aboveBar"
+                m["shape"] = "circle"
+                m["color"] = "#7B1FA2"  # Lila
+                m["priority"] = 10
+            elif source_id == "ema_atr_set_v1":
+                # EMA/ATR: Quadrate oberhalb
+                m["position"] = "aboveBar"
+                m["shape"] = "square"
+                m["color"] = "#FF9800"  # Orange
+                m["priority"] = 4
+            # Fuer neue Signalquellen hier einen eigenen Zweig ergaenzen.
+            # Ohne priority-Zweig gilt der JS-Default (0 = nahe an der Kerze).
+        return markers
+
+    def _get_signal_markers_for_update(self) -> List[Dict[str, Any]]:
+        """Sammelt alle Signal-Marker fuer den Chart-Update-Payload.
+        - Testsignal (alternating_arrow_v1): DEAKTIVIERT
+        - Grid Proximity (grid_proximity_v1): nur wenn Signal-Button aktiv
+        - EMA-Signale (ema_atr_set_v1): nur wenn Signal-Button aktiv
+        Marker-Zeiten werden auf Candle-Grenzen gerundet (exakter Match mit candleSeries in LWC v5)."""
+        if self.df_data is None or self.df_data.empty:
+            return []
+
+        t_sec = TF_SECONDS_MAP.get(str(self.current_tf).upper(), 60)
+
+        # 1) Testsignal (alternating_arrow_v1) DEAKTIVIERT – keine automatischen Test-Signale
+        markers: List[Dict[str, Any]] = []
+
+        # 2) Grid Proximity + EMA-Signale NUR wenn der Signal-Button aktiv ist
+        if self._signals_enabled:
+            grid_markers = self._apply_marker_styles(
+                self.signal_overlay.fetch_markers(
+                    self.current_symbol, self.current_tf, "grid_proximity_v1"
+                ),
+                "grid_proximity_v1"
+            )
+            markers.extend(grid_markers)
+
+            ema_markers = self._apply_marker_styles(
+                self.signal_overlay.fetch_markers(
+                    self.current_symbol, self.current_tf, "ema_atr_set_v1"
+                ),
+                "ema_atr_set_v1"
+            )
+            markers.extend(ema_markers)
+
+        # Marker-Zeiten auf Candle-Grenzen runden + auf kontinuierliche Zeit mappen
+        if markers:
+            clean_markers = []
+            for m in markers:
+                mt = m.get("time")
+                if mt is None:
+                    continue
+                # Auf Candle-Timeframe-Grenze runden (z.B. H1: 3600er-Schritte)
+                rounded = int(mt) - (int(mt) % t_sec)
+                # Nur behalten + auf kontinuierliche Zeit mappen
+                if rounded in self._time_real_to_cont:
+                    m["time"] = self._time_real_to_cont[rounded]
+                    clean_markers.append(m)
+            markers = clean_markers
+            if markers:
+                print(f"   → Marker: {len(markers)} (kont. zeit, z.B. {markers[0]['time']})")
+            else:
+                print(f"   → KEINE Marker nach Filter! real_times samples={list(self._time_real_to_cont.keys())[:3]}")
+
+        return markers
+
+    def fit_chart(self):
+        try:
+            self.visible_from = self.visible_to = None
+            self.visible_price_from = self.visible_price_to = None
+            self.save_state()
+            self.web_view.page().runJavaScript("if(window.fitChartContent) fitChartContent();")
+        except (RuntimeError, AttributeError):
+            pass
+
+    def handle_range_changed(self, f, t):
+        if not self._is_loading_data:
+            self.visible_from, self.visible_to = f, t
+            self.save_state()
+
+    def handle_price_range_changed(self, f, t):
+        if not self._is_loading_data:
+            self.visible_price_from, self.visible_price_to = f, t
+            self.save_state()
+
+    def handle_measurement_changed(self, m):
+        if not self._is_loading_data:
+            self.measurement_state = json.loads(m) if m else None
+            self.save_state()
+
+    def save_state(self):
+        if not self.state_manager or self._is_loading_data: return
+        self.state_manager.save_instance_state(self.instance_id, self.current_symbol, self.current_tf,
+                                               self.visible_from, self.visible_to, self.visible_price_from,
+                                               self.visible_price_to, self.indicators_state, self.measurement_state)
+        self.state_manager.save_symbol_tf_state(self.current_symbol, self.current_tf, self.visible_from,
+                                                self.visible_to, self.visible_price_from, self.visible_price_to,
+                                                self.indicators_state, self.measurement_state)
+        p, s = self.pos(), self.size()
+        self.state_manager.save_window_geometry(self.instance_id, p.x(), p.y(), s.width(), s.height(),
+                                                self.isMaximized())
+
+    def closeEvent(self, event):
+        self.save_state()
+        if self.state_manager:
+            app = QApplication.instance()
+            if not getattr(app, "_is_quitting", False) and self.instance_id != "win_main":
+                self.state_manager.delete_instance(self.instance_id)
+        self.closed_signal.emit(self.instance_id)
+        event.accept()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = PyTraderChartWindow()
+    window.show()
+    sys.exit(app.exec())
+```
+
+--------------------------------------------------
+
+### DATEI: .backup_D_markerlayers/check_marker_layers.js
+```js
+// test/check_marker_layers.js
+// Regressionstest: Signal-Marker und Grid-Circle-Marker sind getrennte Layer.
+// _applyAllMarkers() kombiniert beide Caches – ein Grid-Render darf die
+// EMA-Signale nie verdrängen (Bug: "EMA-Signale verschwinden bei Grid an").
+//
+// Laedt die ECHTE 03_chart_rendering.js mit Mock-Objekten (kein DOM/Chart).
+const fs = require('fs');
+const path = require('path');
+
+const rendering = fs.readFileSync(path.join(__dirname, '..', 'chart', 'js', '03_chart_rendering.js'), 'utf8');
+
+// --- Mock-Umgebung ---
+let pluginMarkers = []; // was "im Chart sichtbar" ist
+global._storedCircleMarkers = []; // in 01_core.js deklariert (nicht in 03 geladen)
+global.seriesMarkersPlugin = {
+    setMarkers: (markers) => { pluginMarkers = markers || []; },
+};
+global.candleSeries = { removePriceLine: () => {}, createPriceLine: () => ({}) };
+global.LightweightCharts = {
+    createSeriesMarkers: (series, initial) => ({ setMarkers: (m) => { pluginMarkers = m || []; } }),
+};
+global.document = {
+    getElementById: () => null, // DaySeparator wird nur definiert, nicht genutzt
+    createElement: () => ({ style: {} }),
+};
+global.chart = null;
+global.toReal = (t) => t;
+global.SECONDS_PER_DAY = 86400;
+global.WEEKEND_GAP_SECONDS = 43200;
+global.MIN_SEPARATOR_SPACING_SECONDS = 21600;
+global.currentTfInSeconds = 3600;
+
+eval(rendering);
+
+let failures = 0;
+function check(label, cond, extra) {
+    if (cond) {
+        console.log('OK   ' + label + (extra ? ' -> ' + extra : ''));
+    } else {
+        failures++;
+        console.error('FAIL ' + label);
+    }
+}
+function visibleShapes() {
+    return pluginMarkers.map(m => m.time + ':' + m.shape);
+}
+function has(shape) {
+    return pluginMarkers.some(m => m.shape === shape);
+}
+
+console.log('=== Marker-Layer: Signale + Circles bleiben getrennt ===');
+
+// --- Szenario 1: Signal an, Grid an -> EMA + Circles sichtbar ---
+renderSignalMarkers([{ time: 1001, shape: 'square', position: 'aboveBar', color: '#FF9800' }, { time: 1002, shape: 'square' }]);
+renderGridCircles([{ time: 1003 }, { time: 1004 }]);
+check('Signal an + Grid an -> Signale sichtbar', has('square'), JSON.stringify(visibleShapes()));
+check('Signal an + Grid an -> Circles sichtbar', has('circle'), JSON.stringify(visibleShapes()));
+
+// --- Szenario 2: Grid render_indicators (clearGridCircles + renderGridCircles) ---
+clearGridCircles();
+renderGridCircles([{ time: 1005 }]);
+check('clearGridCircles + renderGridCircles -> Signale bleiben', has('square'), JSON.stringify(visibleShapes()));
+check('clearGridCircles + renderGridCircles -> Circles aktualisiert', pluginMarkers.some(m => m.time === 1005 && m.shape === 'circle'), JSON.stringify(visibleShapes()));
+
+// --- Szenario 3: Signal AUS (renderSignalMarkers([])) + Grid an -> NUR Circles ---
+renderSignalMarkers([]);
+renderGridCircles([{ time: 1006 }]);
+check('Signal AUS + Grid an -> keine Signale', !has('square'), JSON.stringify(visibleShapes()));
+check('Signal AUS + Grid an -> Circles da', has('circle'), JSON.stringify(visibleShapes()));
+
+// --- Szenario 4: Grid AUS (clearGridCircles) bei aktiven Signalen -> EMA bleibt ---
+renderSignalMarkers([{ time: 1007, shape: 'square' }]);
+renderGridCircles([{ time: 1008 }]);
+clearGridCircles();
+check('Grid AUS -> EMA bleibt', has('square'), JSON.stringify(visibleShapes()));
+check('Grid AUS -> Circles weg', !has('circle'), JSON.stringify(visibleShapes()));
+
+// --- Szenario 5: clearSignalMarkers leert Signale, Circles bleiben ---
+renderSignalMarkers([{ time: 1009, shape: 'square' }]);
+renderGridCircles([{ time: 1010 }]);
+clearSignalMarkers();
+check('clearSignalMarkers -> Signale weg', !has('square'), JSON.stringify(visibleShapes()));
+check('clearSignalMarkers -> Circles bleiben', has('circle'), JSON.stringify(visibleShapes()));
+
+// --- Szenario 6: reapplySignalMarkers kombiniert aus Caches ---
+renderSignalMarkers([{ time: 1011, shape: 'square' }]);
+renderGridCircles([{ time: 1012 }]);
+clearSignalMarkers();
+renderSignalMarkers([{ time: 1011, shape: 'square' }]);
+check('reapplySignalMarkers -> Signale + Circles', has('square') && has('circle'), JSON.stringify(visibleShapes()));
+
+console.log('\\n=== Sortierung (Kern des Overlap-Fixes) ===');
+// LWC v5.2.0 setMarkers() erwartet ein nach Zeit SORTIERTES Array:
+//  - interne Binärsuche für den sichtbaren Bereich
+//  - Marker derselben Kerze müssen BENACHBART sein, sonst setzt der
+//    Stack-Offset zurück und der zweite überdeckt den ersten exakt.
+// Test: unsortierte Mischung (Signale [2002,2001], Circles [2003,2001])
+renderSignalMarkers([
+    { time: 2002, shape: 'square' },
+    { time: 2001, shape: 'square' },
+]);
+renderGridCircles([{ time: 2003 }, { time: 2001 }]);
+
+function isSorted(arr) {
+    for (let i = 1; i < arr.length; i++) {
+        if (arr[i].time < arr[i - 1].time) return false;
+    }
+    return true;
+}
+function sameTimeAdjacent(arr) {
+    // Marker mit gleicher Zeit muessen als Gruppe benachbart sein
+    for (let i = 0; i < arr.length; i++) {
+        const t = arr[i].time;
+        // finde letzten Index mit derselben Zeit
+        let j = i;
+        while (j + 1 < arr.length && arr[j + 1].time === t) j++;
+        // keine fremden Marker zwischen i und j -> Gruppe ist benachbart
+        for (let k = i; k <= j; k++) {
+            if (arr[k].time !== t) return false;
+        }
+        i = j;
+    }
+    return true;
+}
+check('Array nach Zeit sortiert', isSorted(pluginMarkers), JSON.stringify(visibleShapes()));
+check('Gleiche Zeit benachbart (Stacking)', sameTimeAdjacent(pluginMarkers), JSON.stringify(visibleShapes()));
+check('Beide Marker bei Zeit 2001 vorhanden (EMA + Circle)', pluginMarkers.filter(m => m.time === 2001).length === 2, JSON.stringify(visibleShapes()));
+
+console.log('\\n=== Prioritäts-Sortierung (Punkt 2: Stapel-Reihenfolge bei gleicher Kerze) ===');
+// Semantik: niedrige priority = näher an der Kerze (unten), hohe = weiter oben.
+// engine-ignoriert priority (explizite Feldliste) – dient NUR unserer Sortierung.
+renderSignalMarkers([
+    { time: 3001, shape: 'square', priority: 4 },  // EMA (nahe an Kerze)
+    { time: 3001, shape: 'circle', priority: 10 }, // Grid-Proximity (oben)
+    { time: 3001, shape: 'square', priority: 2 },  // niedrigste Prio -> ganz unten
+]);
+renderGridCircles([{ time: 3001 }]);               // Grid-Circle, Default-Prio 10
+const t3001 = pluginMarkers.filter(m => m.time === 3001);
+const prios3001 = t3001.map(m => m.priority);
+check('Priority aufsteigend sortiert [2,4,10,10]', JSON.stringify(prios3001) === JSON.stringify([2, 4, 10, 10]), JSON.stringify(prios3001));
+check('Gleiche priority (10) behält Einfüge-Reihenfolge (stabiler Sort)', t3001[2].shape === 'circle' && t3001[3].shape === 'circle', JSON.stringify(t3001.map(m => m.shape)));
+check('priority-Feld wird an Plugin durchgereicht (Engine ignoriert es)', pluginMarkers.some(m => m.priority === 2), JSON.stringify(prios3001));
+
+// Ohne explizite priority: Signal-Default 0, Circle-Default 10
+renderSignalMarkers([{ time: 3002, shape: 'square' }]); // kein priority
+renderGridCircles([{ time: 3002 }]);                    // Default-Prio 10
+const t3002 = pluginMarkers.filter(m => m.time === 3002);
+check('Default: Signal (0) vor Circle (10)', JSON.stringify(t3002.map(m => m.priority)) === JSON.stringify([0, 10]), JSON.stringify(t3002.map(m => m.priority)));
+
+console.log('\nRESULT: ' + (failures === 0 ? 'PASS' : 'FAIL (' + failures + ')'));
+process.exit(failures === 0 ? 0 : 1);
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/__init__.py
+```py
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/statistics_repository.py
+```py
+# analytics/statistics_repository.py
+"""
+Statistics Repository – SQL-Aggregations-Queries auf signal_results + Forward-Performance.
+"""
+
+from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+import duckdb
+import pandas as pd
+
+from db_service import db_connect
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+DB_ANALYTICS = str(BASE_DIR / "data" / "analytics.duckdb")
+DB_MARKET = str(BASE_DIR / "data" / "market_data.duckdb")
+
+
+class StatisticsRepository:
+    """Kapselt alle SQL-Zugriffe für das Statistik-Fenster."""
+
+    def get_available_sets(self) -> List[str]:
+        """Liefert alle verfuegbaren source_id Werte."""
+        if not Path(DB_ANALYTICS).exists():
+            return []
+        con = db_connect(DB_ANALYTICS, read_only=True)
+        try:
+            rows = con.execute("""
+                SELECT DISTINCT source_id FROM signal_results
+                ORDER BY source_id
+            """).fetchall()
+            return [r[0] for r in rows]
+        finally:
+            con.close()
+
+    def get_summary(
+        self,
+        symbol: Optional[str] = None,
+        timeframe: Optional[str] = None,
+        source_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Aggregierte Kennzahlen ueber signal_results.
+
+        Returns:
+            Dict mit total_signals, avg_confidence, win_rate, best_tf
+        """
+        if not Path(DB_ANALYTICS).exists():
+            return {"total_signals": 0, "avg_confidence": 0.0, "win_rate": 0.0, "best_tf": "-"}
+
+        conditions = []
+        params = []
+        if symbol and symbol != "ALLE":
+            conditions.append("sr.symbol = ?")
+            params.append(symbol)
+        if timeframe and timeframe != "ALLE":
+            conditions.append("sr.timeframe = ?")
+            params.append(timeframe)
+        if source_id:
+            conditions.append("sr.source_id = ?")
+            params.append(source_id)
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+
+        con = db_connect(DB_ANALYTICS, read_only=True)
+        try:
+            # Gesamtzahl und avg confidence
+            row = con.execute(f"""
+                SELECT
+                    COUNT(*) AS total,
+                    COALESCE(AVG(sr.confidence), 0.0) AS avg_conf
+                FROM signal_results sr
+                WHERE {where_clause}
+            """, params).fetchone()
+            total = int(row[0]) if row[0] else 0
+            avg_conf = float(row[1]) if row[1] else 0.0
+
+            # Bester Timeframe (meiste Signale)
+            row_tf = con.execute(f"""
+                SELECT sr.timeframe, COUNT(*) AS cnt
+                FROM signal_results sr
+                WHERE {where_clause}
+                GROUP BY sr.timeframe
+                ORDER BY cnt DESC
+                LIMIT 1
+            """, params).fetchone()
+            best_tf = str(row_tf[0]) if row_tf else "-"
+
+            # Win-Rate via Forward-Performance (naechste 10 Bars)
+            win_rate = self._calc_win_rate(con, where_clause, params)
+
+            return {
+                "total_signals": total,
+                "avg_confidence": round(avg_conf, 4),
+                "win_rate": round(win_rate, 1),
+                "best_tf": best_tf,
+            }
+        finally:
+            con.close()
+
+    def _calc_win_rate(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        where_clause: str,
+        params: List[Any],
+    ) -> float:
+        """
+        Berechnet exemplarische Win-Rate (vereinfacht, performant).
+        Nutzt den durchschnittlichen Confidence-Score als Proxy.
+        Ein Signal gilt als "Win", wenn confidence > 0.7.
+        """
+        try:
+            row = con.execute(f"""
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE sr.confidence >= 0.7) AS wins
+                FROM signal_results sr
+                WHERE {where_clause}
+            """, params).fetchone()
+
+            total = int(row[0]) if row[0] else 0
+            wins = int(row[1]) if row[1] else 0
+
+            if total == 0:
+                return 0.0
+            return (wins / total) * 100.0
+        except Exception as e:
+            print(f"⚠️ [StatisticsRepository] Win-Rate Fehler: {e}")
+            return 0.0
+
+    def fetch_signals(
+        self,
+        symbol: Optional[str] = None,
+        timeframe: Optional[str] = None,
+        source_id: Optional[str] = None,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        """
+        Detailierte Signalliste fuer die Tabelle.
+
+        Returns:
+            Liste von Dicts mit time, symbol, timeframe, source_id, confidence, outcome
+        """
+        if not Path(DB_ANALYTICS).exists():
+            return []
+
+        conditions = []
+        params = []
+        if symbol and symbol != "ALLE":
+            conditions.append("sr.symbol = ?")
+            params.append(symbol)
+        if timeframe and timeframe != "ALLE":
+            conditions.append("sr.timeframe = ?")
+            params.append(timeframe)
+        if source_id:
+            conditions.append("sr.source_id = ?")
+            params.append(source_id)
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+
+        con = db_connect(DB_ANALYTICS, read_only=True)
+        try:
+            rows = con.execute(f"""
+                SELECT
+                    sr.bar_time,
+                    sr.symbol,
+                    sr.timeframe,
+                    sr.source_id,
+                    sr.confidence
+                FROM signal_results sr
+                WHERE {where_clause}
+                ORDER BY sr.bar_time DESC
+                LIMIT ?
+            """, params + [limit]).fetchall()
+        except Exception as e:
+            print(f"⚠️ [StatisticsRepository] fetch_signals Fehler: {e}")
+            return []
+        finally:
+            con.close()
+
+        results = []
+        for row in rows:
+            bar_time = row[0]
+            symbol_val = str(row[1])
+            tf_val = str(row[2])
+            source = str(row[3])
+            confidence = float(row[4]) if row[4] is not None else 0.0
+
+            # Outcome basierend auf Confidence
+            if confidence >= 0.7:
+                outcome = "Win"
+            elif confidence >= 0.5:
+                outcome = "Neutral"
+            else:
+                outcome = "Loss"
+
+            # Zeitstempel
+            if hasattr(bar_time, 'timestamp'):
+                time_sec = int(bar_time.timestamp())
+            else:
+                time_sec = int(bar_time)
+
+            results.append({
+                "time": time_sec,
+                "symbol": symbol_val,
+                "timeframe": tf_val,
+                "source_id": source,
+                "confidence": confidence,
+                "outcome": outcome,
+            })
+
+        return results
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/background_workers/__init__.py
+```py
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/background_workers/historical_scanner.py
+```py
+# analytics/background_workers/historical_scanner.py
+"""
+Historical Scanner – QThread-Worker für Batch-Scans über historische Daten.
+Unterstützt Full-Scan (Delete + Re-Scan) und Delta-Update (fehlende Bars).
+"""
+
+import time
+from typing import Any, Dict, List, Optional, Set
+from PySide6.QtCore import QThread, Signal
+
+from analytics.features.feature_builder import FeatureBuilder
+from analytics.engine.set_evaluator import SetEvaluator
+from analytics.signals.heuristics.ema_trend import EMATrendSignal
+from analytics.signals.heuristics.atr_filter import ATRFilterSignal
+from analytics.signals.composite.grid_proximity_signal import GridProximitySignal
+from db_service import get_timeframes
+from state_manager import StateManager
+
+
+class HistoricalScanner(QThread):
+    """Scannt historische Daten für ein Symbol über alle Timeframes."""
+
+    progress_updated = Signal(str, int, int)  # message, current, total
+    scan_finished = Signal(str, int)          # symbol, total_signals_written
+    log_message = Signal(str)                 # log text
+
+    def __init__(self, symbol: str, new_scan: bool = False, grid_scan: bool = False, parent=None):
+        super().__init__(parent)
+        self.symbol = symbol
+        self.new_scan = new_scan
+        self.grid_scan = grid_scan
+        self._running = True
+        self._state_mgr = StateManager()
+        self._settings = self._state_mgr.get_app_settings()
+
+        self.feature_builder = FeatureBuilder()
+
+        if self.grid_scan:
+            # Grid-Proximity Scan (Phase 11)
+            self.signals = {
+                "grid_proximity_v1": GridProximitySignal(),
+            }
+            self.evaluator = SetEvaluator(self.signals)
+            self.set_config = {
+                "signals": [
+                    {"id": "grid_proximity_v1", "weight": 1.0, "params": {}},
+                ],
+                "threshold": 0.5,
+            }
+        else:
+            # Standard-Scan (EMA + ATR)
+            self.signals = {
+                "ema_trend_v1": EMATrendSignal(),
+                "atr_filter_v1": ATRFilterSignal(),
+            }
+            self.evaluator = SetEvaluator(self.signals)
+            self.set_config = {
+                "signals": [
+                    {"id": "ema_trend_v1", "weight": 0.7, "params": {"threshold_pct": 0.3, "max_confidence": 1.0, "direction": "both"}},
+                    {"id": "atr_filter_v1", "weight": 0.3, "params": {"threshold_pct": 0.8, "max_confidence": 1.0, "mode": "high_volatility"}},
+                ],
+                "threshold": 0.5,
+            }
+
+    def stop(self):
+        self._running = False
+
+    def run(self):
+        import duckdb
+        import pandas as pd
+        import uuid
+        from pathlib import Path
+
+        from db_service import DbPool
+
+        BASE_DIR = Path(__file__).resolve().parent.parent.parent
+        DB_ANALYTICS = str(BASE_DIR / "data" / "analytics.duckdb")
+        DB_MARKET = str(BASE_DIR / "data" / "market_data.duckdb")
+
+        # Features + Signale je nach Scan-Typ
+        if self.grid_scan:
+            feature_names = ["atr_normalized"]
+            feature_params = {
+                "atr_normalized": {"period": 14},
+            }
+            source_id = "grid_proximity_v1"
+        else:
+            feature_names = ["ema_diff", "atr_normalized"]
+            feature_params = {
+                "ema_diff": {"fast_period": 12, "slow_period": 26},
+                "atr_normalized": {"period": 14},
+            }
+            source_id = "ema_atr_set_v1"
+
+        total_signals = 0
+        timeframes = list(get_timeframes().keys())
+        num_tfs = len(timeframes)
+
+        self.log_message.emit(f"Starte Scan fuer {self.symbol} ueber {num_tfs} Timeframes...")
+        if self.new_scan:
+            self.log_message.emit("Modus: FULL SCAN (bestehende Signale werden geloescht)")
+        else:
+            self.log_message.emit("Modus: DELTA UPDATE (nur fehlende Bars)")
+
+        start_time = time.time()
+
+        for idx, tf in enumerate(timeframes):
+            if not self._running:
+                self.log_message.emit("Scan abgebrochen.")
+                return
+
+            self.progress_updated.emit(f"Verarbeite {tf}...", idx, num_tfs)
+
+            try:
+                # 1. OHLCV laden
+                df_ohlcv = self.feature_builder.load_ohlcv(self.symbol, tf, limit=self._settings.scanner_candle_limit)
+                if df_ohlcv.empty:
+                    self.log_message.emit(f"  {tf}: Keine OHLCV-Daten, ueberspringe")
+                    continue
+
+                # 2. Delta-Update: Nur neue Bars scannen
+                if not self.new_scan:
+                    con = DbPool.get(DB_ANALYTICS)
+                    last_signal = con.execute("""
+                        SELECT MAX(bar_time) FROM signal_results
+                        WHERE symbol = ? AND timeframe = ? AND source_id = ?
+                    """, [self.symbol, tf, source_id]).fetchone()[0]
+
+                    if last_signal is not None:
+                        df_ohlcv = df_ohlcv[df_ohlcv["bar_time"] > last_signal]
+                        if df_ohlcv.empty:
+                            self.log_message.emit(f"  {tf}: Keine neuen Bars seit letztem Scan")
+                            continue
+                        self.log_message.emit(f"  {tf}: {len(df_ohlcv)} neue Bars seit {last_signal}")
+
+                # 3. Features berechnen
+                df_features = self.feature_builder.calculate_features(
+                    df_ohlcv,
+                    feature_names=feature_names,
+                    params=feature_params,
+                )
+
+                # 4. Signal-Set auswerten
+                result = self.evaluator.evaluate_set(self.set_config, df_features)
+
+                # 5. Nur Bars mit binaerem Signal uebernehmen
+                signals = result[result["signal_binary"] == 1]
+                if signals.empty:
+                    self.log_message.emit(f"  {tf}: Keine Signale gefunden")
+                    continue
+
+                # 6. In signal_results schreiben
+                con = DbPool.get(DB_ANALYTICS)
+                # Bei Full-Scan: Alte Signale loeschen (nur fuer diese source_id)
+                if self.new_scan:
+                    con.execute("""
+                        DELETE FROM signal_results
+                        WHERE symbol = ? AND timeframe = ? AND source_id = ?
+                    """, [self.symbol, tf, source_id])
+
+                # Neue Signale vorbereiten
+                from datetime import timezone, datetime as _dt
+                rows_to_insert = []
+                for _, row in signals.iterrows():
+                    bt = row["bar_time"]
+                    # pandas Timestamp -> timezone-aware datetime UTC
+                    if hasattr(bt, "to_pydatetime"):
+                        bt_dt = bt.to_pydatetime().replace(tzinfo=timezone.utc)
+                    elif isinstance(bt, (int, float)):
+                        bt_dt = _dt.fromtimestamp(int(bt), tz=timezone.utc)
+                    else:
+                        bt_dt = bt
+                    rows_to_insert.append((
+                        str(uuid.uuid4()),
+                        self.symbol,
+                        tf,
+                        bt_dt,
+                        source_id,
+                        float(row["confidence_total"]),
+                        "historical_batch",
+                        '{}',
+                    ))
+
+                if rows_to_insert:
+                    con.executemany("""
+                        INSERT INTO signal_results (event_id, symbol, timeframe, bar_time, source_id, confidence, context_type, metadata_payload)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, rows_to_insert)
+
+                self.log_message.emit(f"  {tf}: {len(rows_to_insert)} Signale geschrieben")
+                total_signals += len(rows_to_insert)
+
+            except Exception as e:
+                self.log_message.emit(f"  {tf}: FEHLER: {e}")
+                import traceback
+                self.log_message.emit(f"    {traceback.format_exc()}")
+
+        elapsed = time.time() - start_time
+        elapsed_str = f"{int(elapsed // 3600):02d}:{int((elapsed % 3600) // 60):02d}:{int(elapsed % 60):02d}"
+        self.log_message.emit(f"Scan abgeschlossen in {elapsed_str}")
+        self.log_message.emit(f"Gesamt: {total_signals} Signale geschrieben")
+        self.progress_updated.emit("Fertig", num_tfs, num_tfs)
+        self.scan_finished.emit(self.symbol, total_signals)
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/background_workers/live_analyzer.py
+```py
+# analytics/background_workers/live_analyzer.py
+"""
+Live Analyzer – QThread-Worker für die Live-Analyse bei Bar-Close.
+Empfängt neue Ticks/Bar-Events, berechnet Features, evaluiert Signal-Sets
+und schreibt Ergebnisse in signal_results (context_type='live_stream').
+
+Architektur (Phase 6 Roadmap):
+    Tick -> Bar-Close -> Feature Store -> Signal-Engine -> signal_results -> UI-Overlay
+"""
+
+import json
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
+
+import pandas as pd
+from PySide6.QtCore import QThread, Signal
+
+from analytics.engine.set_evaluator import SetEvaluator
+from analytics.features.feature_builder import FeatureBuilder
+from analytics.signals.heuristics.ema_trend import EMATrendSignal
+from analytics.signals.heuristics.atr_filter import ATRFilterSignal
+from analytics.signals.experimental.alternating_arrow_signal import AlternatingArrowSignal
+from analytics.signals.composite.grid_proximity_signal import GridProximitySignal
+from db_service import DbPool
+
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+DB_ANALYTICS = str(BASE_DIR / "data" / "analytics.duckdb")
+DB_MARKET = str(BASE_DIR / "data" / "market_data.duckdb")
+
+
+class LiveAnalyzer(QThread):
+    """
+    Analysiert eine geschlossene Live-Kerze (Bar-Close Event):
+    1. Features berechnen und in feature_store schreiben
+    2. Signal-Set evaluieren
+    3. Ergebnisse in signal_results schreiben (context_type='live_stream')
+    4. Signal ans UI emittieren
+    """
+
+    # Emittiert, wenn ein neues Live-Signal erkannt wurde
+    new_live_signal = Signal(str, str, int, float, str)
+    # (symbol, timeframe, bar_time, confidence, source_id)
+
+    log_message = Signal(str)
+
+    def __init__(
+        self,
+        symbol: str = "SILVER",
+        timeframe: str = "M1",
+        lookback_bars: int = 500,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.symbol = symbol
+        self.timeframe = timeframe
+        self.lookback_bars = lookback_bars
+        self._running = True
+
+        # Feature Builder
+        self.feature_builder = FeatureBuilder()
+
+        # Verfügbare Signale (kann über set_active_signals() erweitert werden)
+        self.signals: Dict[str, Any] = {
+            "alternating_arrow_v1": AlternatingArrowSignal(),
+            "ema_trend_v1": EMATrendSignal(),
+            "atr_filter_v1": ATRFilterSignal(),
+            "grid_proximity_v1": GridProximitySignal(),
+        }
+        self.evaluator = SetEvaluator(self.signals)
+
+        # Aktive Set-Konfiguration (Testsignale DEAKTIVIERT – Signal-Liste leer).
+        # TODO: Automatische Testsignale (alternating_arrow_v1) spaeter hier reaktivieren.
+        self.set_config: Dict[str, Any] = {
+            "signals": [],
+            "threshold": 0.5,
+        }
+
+        # Letzte verarbeitete Bar-Time (für Duplikatserkennung)
+        self._last_processed_bar_time: Optional[int] = None
+
+    def stop(self) -> None:
+        self._running = False
+
+    def set_active_signals(self, signals: Dict[str, Any]) -> None:
+        """Ersetzt die Signal-Registry (z. B. um ML-Modelle zu ergänzen)."""
+        self.signals = signals
+        self.evaluator = SetEvaluator(self.signals)
+
+    def set_set_config(self, config: Dict[str, Any]) -> None:
+        """Setzt die aktive Set-Konfiguration."""
+        self.set_config = config
+
+    def get_required_features(self) -> List[str]:
+        """
+        Sammelt alle required_features aus den im aktiven set_config
+        verwendeten Signalen.
+        """
+        required = set()
+        for cfg in self.set_config.get("signals", []):
+            sid = cfg["id"]
+            sig = self.signals.get(sid)
+            if sig is not None:
+                for feat in sig.required_features:
+                    required.add(feat)
+        # Fallback: immer ema_diff + atr_normalized fuer Basis-Funktion
+        if not required:
+            required = {"ema_diff", "atr_normalized"}
+        return list(required)
+
+    def _get_feature_params(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Gibt optimierte Parameter fuer den FeatureBuilder zurueck,
+        basierend auf den benoetigten Features (Basis: ema_diff, atr_normalized).
+        """
+        feats = self.get_required_features()
+        params = {}
+        if "ema_diff" in feats:
+            params["ema_diff"] = {"fast_period": 12, "slow_period": 26}
+        if "atr_normalized" in feats:
+            params["atr_normalized"] = {"period": 14}
+        return params
+
+    def run(self) -> None:
+        """
+        Hauptschleife: Wartet auf Bar-Close-Events (Polling).
+        Fuehrt vor dem Live-Betrieb einen einmaligen Auto-Fill durch,
+        um Luecken seit dem letzten Signal in der DB zu schliessen.
+        """
+        self.log_message.emit(
+            f"LiveAnalyzer gestartet: {self.symbol} {self.timeframe}, "
+            f"lookback={self.lookback_bars}"
+        )
+
+        # Auto-Fill: Luecken schliessen bevor Live-Betrieb startet
+        self._fill_gaps()
+
+        while self._running:
+            try:
+                self._process_new_bars()
+            except Exception as e:
+                self.log_message.emit(f"❌ LiveAnalyzer Fehler: {e}")
+
+            # Polling-Intervall: 1 Sekunde (fuer M1 ausreichend)
+            self.msleep(1000)
+
+        self.log_message.emit("LiveAnalyzer gestoppt.")
+
+    def _get_live_signal_ids(self) -> List[str]:
+        """Ermittelt alle signal_ids aus set_config, deren live_op == True ist."""
+        live_ids = []
+        for cfg in self.set_config.get("signals", []):
+            sid = cfg["id"]
+            sig = self.signals.get(sid)
+            if sig is not None and getattr(sig, 'live_op', True):
+                live_ids.append(sid)
+        return live_ids
+
+    def _fill_gaps(self) -> None:
+        """
+        Schliesst Luecken zwischen dem letzten Signal in signal_results
+        und der aktuellsten Bar in market_data.duckdb.
+        Verarbeitet NUR Signale mit live_op == True.
+        """
+        live_ids = self._get_live_signal_ids()
+        if not live_ids:
+            self.log_message.emit("  -> Keine live_op=True Signale, Auto-Fill uebersprungen.")
+            return
+
+        # Letztes Signal in der DB fuer dieses Symbol/TF ermitteln
+        # EXTRACT(epoch) direkt in SQL fuer TIMESTAMPTZ-Korrektheit
+        con = DbPool.get(DB_ANALYTICS)
+        last_signal_ts = con.execute("""
+            SELECT EXTRACT('epoch' FROM MAX(bar_time))::BIGINT FROM signal_results
+            WHERE symbol = ? AND timeframe = ?
+        """, [self.symbol, self.timeframe]).fetchone()[0]
+
+        if last_signal_ts is None:
+            self.log_message.emit("  -> Keine historischen Signale vorhanden, Auto-Fill uebersprungen.")
+            return
+
+        last_signal_ts = int(last_signal_ts)
+
+        # Neueste Bar in market_data ermitteln
+        con = DbPool.get(DB_MARKET)
+        latest_bar_ts = con.execute("""
+            SELECT EXTRACT('epoch' FROM MAX("time"))::BIGINT FROM ohlcv_bars
+            WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+        """, [self.symbol, self.timeframe]).fetchone()[0]
+
+        if latest_bar_ts is None:
+            return
+
+        latest_bar_ts = int(latest_bar_ts)
+
+        # Pruefen ob Luecke existiert
+        if latest_bar_ts <= last_signal_ts:
+            self.log_message.emit("  -> Keine Luecken, Auto-Fill uebersprungen.")
+            self._last_processed_bar_time = latest_bar_ts
+            return
+
+        self.log_message.emit(
+            f"  -> Luecke erkannt! Letztes Signal: {last_signal_ts}, "
+            f"aktuellste Bar: {latest_bar_ts}, fuelle auf..."
+        )
+
+        # OHLCV ab letztem Signal laden
+        con = DbPool.get(DB_MARKET)
+        df_missing = con.execute("""
+            SELECT "time" AS bar_time, open, high, low, close
+            FROM ohlcv_bars
+            WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+              AND "time" > ? AND "time" <= ?
+              AND "time" IS NOT NULL
+              AND open IS NOT NULL AND high IS NOT NULL
+              AND low IS NOT NULL AND close IS NOT NULL
+            ORDER BY "time" ASC
+        """, [self.symbol, self.timeframe,
+              datetime.fromtimestamp(last_signal_ts, tz=timezone.utc),
+              datetime.fromtimestamp(latest_bar_ts, tz=timezone.utc)]).df()
+
+        if df_missing.empty:
+            self.log_message.emit("  -> Keine neuen Bars gefunden.")
+            self._last_processed_bar_time = latest_bar_ts
+            return
+
+        self.log_message.emit(f"  -> {len(df_missing)} neue Bars, berechne Signale...")
+
+        # Features fuer das gesamte Lookback berechnen
+        df_ohlcv = self.feature_builder.load_ohlcv(
+            self.symbol, self.timeframe, limit=self.lookback_bars
+        )
+        if df_ohlcv.empty:
+            return
+
+        df_features = self.feature_builder.calculate_features(
+            df_ohlcv,
+            feature_names=self.get_required_features(),
+            params=self._get_feature_params(),
+        )
+
+        # Features persistieren
+        self.feature_builder.store_features(self.symbol, self.timeframe, df_features)
+
+        # Signal-Set evaluieren
+        result = self.evaluator.evaluate_set(self.set_config, df_features)
+
+        # Nur die fehlenden Bars rausfiltern und Bulk-Insert
+        sigs = result[result["signal_binary"] == 1].copy()
+        if sigs.empty:
+            self.log_message.emit("  -> Keine Signale in den neuen Bars.")
+            self._last_processed_bar_time = latest_bar_ts
+            return
+
+        # Sicherstellen bar_time als int (value // 10**9 = epoch seconds, timezone-sicher)
+        sigs["bar_time_epoch"] = sigs["bar_time"].apply(lambda x: int(x.value // 10**9))
+
+        # Nur Bars nach dem letzten Signal nehmen
+        sigs = sigs[sigs["bar_time_epoch"] > last_signal_ts]
+
+        if sigs.empty:
+            self.log_message.emit("  -> Keine neuen Signale in den gefuellten Bars.")
+            self._last_processed_bar_time = latest_bar_ts
+            return
+
+        self._batch_write_signals(sigs)
+        self._last_processed_bar_time = latest_bar_ts
+        self.log_message.emit(f"  -> Auto-Fill abgeschlossen: {len(sigs)} Signale geschrieben.")
+
+    def _batch_write_signals(self, sigs_df: pd.DataFrame) -> None:
+        """Bulk-Insert fuer mehrere Signale mit DELETE-vor-INSERT pro Bar.
+        Schreibt Signale basierend auf den Quell-Source-IDs im Ergebnis-DataFrame."""
+        con = DbPool.get(DB_ANALYTICS)
+        # Bestimme source_id(s) aus den Ergebnis-Spalten (conf_*)
+        source_cols = [c for c in sigs_df.columns if c.startswith("conf_")]
+        if not source_cols:
+            self.log_message.emit("  [WARN] Keine conf_*-Spalten im Ergebnis.")
+            return
+
+        rows = []
+        for _, row in sigs_df.iterrows():
+            bt = row["bar_time_epoch"]
+            dt_val = datetime.fromtimestamp(int(bt), tz=timezone.utc)
+            for sc in source_cols:
+                source_id = sc.replace("conf_", "")
+                confidence = float(row[sc])
+                rows.append((
+                    str(uuid.uuid4()),
+                    self.symbol,
+                    self.timeframe,
+                    dt_val,
+                    source_id,
+                    confidence,
+                    "live_stream",
+                    json.dumps({"source": "LiveAnalyzerFill", "lookback": self.lookback_bars}),
+                ))
+                # Einzel-DELETE pro Bar
+                con.execute("""
+                    DELETE FROM signal_results
+                    WHERE symbol = ? AND timeframe = ? AND bar_time = ? AND source_id = ?
+                """, [self.symbol, self.timeframe, dt_val, source_id])
+
+        con.executemany("""
+            INSERT INTO signal_results (event_id, symbol, timeframe, bar_time, source_id, confidence, context_type, metadata_payload)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, rows)
+
+    def _process_new_bars(self) -> None:
+        """Lädt ALLE neuen Kerzen seit _last_processed_bar_time aus market_data.duckdb
+        und analysiert sie. EXTRACT(epoch) in SQL für TIMESTAMPTZ-Korrektheit."""
+        # Keine aktiven Signale in der Set-Konfiguration → keine Live-Analyse (Testsignale deaktiviert)
+        if not self.set_config.get("signals"):
+            return
+
+        # Neueste Zeit als Referenz holen
+        con = DbPool.get(DB_MARKET)
+        latest_bar_time = con.execute("""
+            SELECT EXTRACT('epoch' FROM MAX("time"))::BIGINT FROM ohlcv_bars
+            WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+              AND "time" IS NOT NULL
+        """, [self.symbol, self.timeframe]).fetchone()[0]
+
+        if latest_bar_time is None:
+            return
+
+        latest_bar_time = int(latest_bar_time)
+
+        # Keine neuen Bars
+        if self._last_processed_bar_time is not None and latest_bar_time <= self._last_processed_bar_time:
+            return
+
+        # Alle neuen Bars seit last_processed_bar_time laden
+        if self._last_processed_bar_time is not None:
+            con = DbPool.get(DB_MARKET)
+            rows = con.execute("""
+                SELECT EXTRACT('epoch' FROM "time")::BIGINT AS time_epoch,
+                       open, high, low, close
+                FROM ohlcv_bars
+                WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+                  AND "time" > ?::TIMESTAMPTZ AND "time" <= ?::TIMESTAMPTZ
+                  AND "time" IS NOT NULL
+                  AND open IS NOT NULL AND high IS NOT NULL
+                  AND low IS NOT NULL AND close IS NOT NULL
+                ORDER BY "time" ASC
+            """, [self.symbol, self.timeframe,
+                  datetime.fromtimestamp(self._last_processed_bar_time, tz=timezone.utc),
+                  datetime.fromtimestamp(latest_bar_time, tz=timezone.utc)]).fetchall()
+        else:
+            # Erstmaliger Start: nur neueste Bar nehmen
+            con = DbPool.get(DB_MARKET)
+            rows = con.execute("""
+                SELECT EXTRACT('epoch' FROM "time")::BIGINT AS time_epoch,
+                       open, high, low, close
+                FROM ohlcv_bars
+                WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+                  AND "time" IS NOT NULL
+                  AND open IS NOT NULL AND high IS NOT NULL
+                  AND low IS NOT NULL AND close IS NOT NULL
+                ORDER BY "time" DESC
+                LIMIT 1
+            """, [self.symbol, self.timeframe]).fetchall()
+
+        if not rows:
+            self._last_processed_bar_time = latest_bar_time
+            return
+
+        # Lookback-Daten für Feature-Berechnung laden (nur einmal!)
+        df_ohlcv = self.feature_builder.load_ohlcv(
+            self.symbol, self.timeframe, limit=self.lookback_bars
+        )
+        if df_ohlcv.empty:
+            return
+
+        df_features = self.feature_builder.calculate_features(
+            df_ohlcv,
+            feature_names=self.get_required_features(),
+            params=self._get_feature_params(),
+        )
+
+        self.feature_builder.store_features(self.symbol, self.timeframe, df_features)
+        result = self.evaluator.evaluate_set(self.set_config, df_features)
+
+        # Nur die letzten N Bars (neue) auswerten
+        result_new = result.iloc[-len(rows):].copy()
+
+        # Quell-Source-IDs aus den conf_-Spalten ermitteln
+        source_cols = [c for c in result_new.columns if c.startswith("conf_")]
+        if not source_cols:
+            source_cols = ["confidence_total"]
+
+        for _, row in result_new.iterrows():
+            bar_time = int(row["bar_time"].value // 10**9)
+            confidence = float(row["confidence_total"])
+            signal_binary = int(row["signal_binary"])
+
+            if signal_binary == 1:
+                # Erste Quell-Source-ID für UI-Event nehmen
+                src = source_cols[0]
+                source_id = src.replace("conf_", "") if src.startswith("conf_") else "grid_proximity_v1"
+                self._write_signal_result(bar_time, confidence, source_id)
+                self.new_live_signal.emit(
+                    self.symbol, self.timeframe, bar_time, confidence, source_id
+                )
+                self.log_message.emit(
+                    f"🔔 Live-Signal: {self.symbol} {self.timeframe} @ {bar_time} "
+                    f"(confidence={confidence:.2f})"
+                )
+
+        self._last_processed_bar_time = latest_bar_time
+
+    def _write_signal_result(self, bar_time: int, confidence: float, source_id: str = "grid_proximity_v1") -> None:
+        """Schreibt ein Live-Signal in signal_results.
+        Loescht vorher ein evtl. vorhandenes Signal fuer denselben (symbol, timeframe, bar_time, source_id),
+        damit es exakt 1 Signal pro Kerze gibt."""
+        con = DbPool.get(DB_ANALYTICS)
+        dt_val = datetime.fromtimestamp(bar_time, tz=timezone.utc)
+        # Vorhandenes Signal entfernen
+        con.execute("""
+            DELETE FROM signal_results
+            WHERE symbol = ? AND timeframe = ? AND bar_time = ? AND source_id = ?
+        """, [self.symbol, self.timeframe, dt_val, source_id])
+        # Neues Signal einfuegen
+        con.execute("""
+            INSERT INTO signal_results (event_id, symbol, timeframe, bar_time, source_id, confidence, context_type, metadata_payload)
+            VALUES (?, ?, ?, ?, ?, ?, 'live_stream', ?)
+        """, [
+            str(uuid.uuid4()),
+            self.symbol,
+            self.timeframe,
+            dt_val,
+            source_id,
+            confidence,
+            json.dumps({"source": "LiveAnalyzer", "lookback": self.lookback_bars}),
+        ])
+
+    def analyze_single_bar(
+        self,
+        symbol: str,
+        timeframe: str,
+        bar_time: int,
+        open_price: float,
+        high: float,
+        low: float,
+        close: float,
+    ) -> Optional[float]:
+        """
+        Analysiert eine einzelne Kerze (für externen Tick-Aggregator).
+        
+        Args:
+            symbol: Symbol-Name
+            timeframe: Timeframe
+            bar_time: Unix-Timestamp der Kerze
+            open_price, high, low, close: OHLC-Werte
+        
+        Returns:
+            Confidence-Score oder None wenn kein Signal
+        """
+        # Keine aktiven Signale → keine Analyse (Testsignale deaktiviert)
+        if not self.set_config.get("signals"):
+            return None
+
+        # Duplikatserkennung
+        if self._last_processed_bar_time is not None and bar_time <= self._last_processed_bar_time:
+            return None
+
+        self._last_processed_bar_time = bar_time
+
+        # Lookback-Daten laden
+        df_ohlcv = self.feature_builder.load_ohlcv(symbol, timeframe, limit=self.lookback_bars)
+        if df_ohlcv.empty:
+            return None
+
+        # Features berechnen (dynamisch aus set_config)
+        df_features = self.feature_builder.calculate_features(
+            df_ohlcv,
+            feature_names=self.get_required_features(),
+            params=self._get_feature_params(),
+        )
+
+        # Features persistieren
+        self.feature_builder.store_features(symbol, timeframe, df_features)
+
+        # Signal evaluieren
+        result = self.evaluator.evaluate_set(self.set_config, df_features)
+        last_row = result.iloc[-1]
+        confidence = float(last_row["confidence_total"])
+        signal_binary = int(last_row["signal_binary"])
+
+        # Quell-Source-ID aus conf_-Spalten ermitteln
+        source_cols = [c for c in result.columns if c.startswith("conf_")]
+        src = source_cols[0] if source_cols else "confidence_total"
+        source_id = src.replace("conf_", "") if src.startswith("conf_") else "grid_proximity_v1"
+
+        if signal_binary == 1:
+            self._write_signal_result(bar_time, confidence, source_id)
+            self.new_live_signal.emit(symbol, timeframe, bar_time, confidence, source_id)
+            return confidence
+
+        return None
+
+
+# ==============================================================================
+# Standalone-Funktion fuer Chart-Trigger (aufrufbar ohne LiveAnalyzer-Instanz)
+# ==============================================================================
+def fill_gaps_for_pair(symbol: str, timeframe: str, lookback_bars: int = 500) -> None:
+    """
+    Schliesst Datenluecken fuer ein beliebiges Symbol:Timeframe-Paar.
+    Nur Signale mit live_op=True werden verarbeitet.
+    Kann unabhaengig vom LiveAnalyzer-Thread aufgerufen werden (z. B. Chart-Trigger).
+    """
+    from analytics.engine.set_evaluator import SetEvaluator
+    from analytics.signals.heuristics.ema_trend import EMATrendSignal
+    from analytics.signals.heuristics.atr_filter import ATRFilterSignal
+    from analytics.signals.experimental.alternating_arrow_signal import AlternatingArrowSignal
+    from analytics.signals.composite.grid_proximity_signal import GridProximitySignal
+
+    signals: Dict[str, Any] = {
+        "alternating_arrow_v1": AlternatingArrowSignal(),
+        "ema_trend_v1": EMATrendSignal(),
+        "atr_filter_v1": ATRFilterSignal(),
+        "grid_proximity_v1": GridProximitySignal(),
+    }
+
+    set_config: Dict[str, Any] = {
+        "signals": [
+            {
+                "id": "alternating_arrow_v1",
+                "weight": 1.0,
+                "params": {"confidence_buy": 1.0, "confidence_sell": 1.0, "skip_first_bars": 1},
+            },
+        ],
+        "threshold": 0.5,
+    }
+
+    # Nur live_op=True Signale im Set behalten
+    filtered_signals = []
+    for cfg in set_config.get("signals", []):
+        sid = cfg["id"]
+        sig = signals.get(sid)
+        if sig is not None and getattr(sig, 'live_op', True):
+            filtered_signals.append(cfg)
+    if not filtered_signals:
+        print("  [Chart-Trigger] Keine live_op=True Signale, uebersprungen.")
+        return
+
+    set_config["signals"] = filtered_signals
+    evaluator = SetEvaluator(signals)
+    builder = FeatureBuilder()
+
+    # Letztes Signal in der DB (EXTRACT(epoch) direkt in SQL)
+    con = DbPool.get(DB_ANALYTICS)
+    last_signal_ts = con.execute("""
+        SELECT EXTRACT('epoch' FROM MAX(bar_time))::BIGINT FROM signal_results
+        WHERE symbol = ? AND timeframe = ?
+    """, [symbol, timeframe]).fetchone()[0]
+
+    if last_signal_ts is None:
+        print(f"  [Chart-Trigger] {symbol}:{timeframe} keine historischen Signale, uebersprungen.")
+        return
+
+    last_signal_ts = int(last_signal_ts)
+
+    # Neueste Bar (EXTRACT(epoch) direkt in SQL)
+    con = DbPool.get(DB_MARKET)
+    latest_bar_ts = con.execute("""
+        SELECT EXTRACT('epoch' FROM MAX("time"))::BIGINT FROM ohlcv_bars
+        WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+    """, [symbol, timeframe]).fetchone()[0]
+
+    if latest_bar_ts is None:
+        return
+
+    latest_bar_ts = int(latest_bar_ts)
+    if latest_bar_ts <= last_signal_ts:
+        return
+
+    print(f"  [Chart-Trigger] {symbol}:{timeframe} Luecke erkannt, fuelle auf...")
+
+    df_ohlcv = builder.load_ohlcv(symbol, timeframe, limit=lookback_bars)
+    if df_ohlcv.empty:
+        return
+
+    # Dynamisch benötigte Features aus den aktiven Signalen sammeln
+    required = set()
+    for cfg in set_config.get("signals", []):
+        sid = cfg["id"]
+        sig = signals.get(sid)
+        if sig is not None:
+            for feat in sig.required_features:
+                required.add(feat)
+    if not required:
+        required = {"ema_diff", "atr_normalized"}
+
+    # Feature-Parameter optimieren (Basis: ema_diff, atr_normalized)
+    feat_params = {}
+    if "ema_diff" in required:
+        feat_params["ema_diff"] = {"fast_period": 12, "slow_period": 26}
+    if "atr_normalized" in required:
+        feat_params["atr_normalized"] = {"period": 14}
+
+    df_features = builder.calculate_features(
+        df_ohlcv,
+        feature_names=list(required),
+        params=feat_params,
+    )
+
+    builder.store_features(symbol, timeframe, df_features)
+    result = evaluator.evaluate_set(set_config, df_features)
+    sigs = result[result["signal_binary"] == 1].copy()
+
+    if sigs.empty:
+        print(f"  [Chart-Trigger] {symbol}:{timeframe} keine neuen Signale.")
+        return
+
+    sigs["bar_time_epoch"] = sigs["bar_time"].apply(lambda x: int(x.value // 10**9))
+    sigs = sigs[sigs["bar_time_epoch"] > last_signal_ts]
+
+    if sigs.empty:
+        return
+
+    # Dynamische Source-IDs aus conf_-Spalten ermitteln
+    source_cols = [c for c in sigs.columns if c.startswith("conf_")]
+    if not source_cols:
+        print(f"  [Chart-Trigger] {symbol}:{timeframe} keine conf_-Spalten, uebersprungen.")
+        return
+
+    con = DbPool.get(DB_ANALYTICS)
+    rows = []
+    for _, row in sigs.iterrows():
+        bt = int(row["bar_time_epoch"])
+        dt_val = datetime.fromtimestamp(bt, tz=timezone.utc)
+        for sc in source_cols:
+            source_id = sc.replace("conf_", "")
+            confidence = float(row[sc])
+            rows.append((
+                str(uuid.uuid4()),
+                symbol,
+                timeframe,
+                dt_val,
+                source_id,
+                confidence,
+                "live_stream",
+                json.dumps({"source": "ChartTrigger"}),
+            ))
+            con.execute("""
+                DELETE FROM signal_results
+                WHERE symbol = ? AND timeframe = ? AND bar_time = ? AND source_id = ?
+            """, [symbol, timeframe, dt_val, source_id])
+
+    con.executemany("""
+        INSERT INTO signal_results (event_id, symbol, timeframe, bar_time, source_id, confidence, context_type, metadata_payload)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, rows)
+
+    print(f"  [Chart-Trigger] {symbol}:{timeframe} {len(rows)} Signale nachgetragen.")
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/engine/__init__.py
+```py
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/engine/base_definition.py
+```py
+# analytics/engine/base_definition.py
+"""
+Abstrakte Basisklasse für alle Signal-Definitionen.
+Jedes Signal (Regel, Pattern, ML) erbt von SignalDefinition und
+implementiert evaluate(), das einen Confidence-Score [0.0, 1.0] pro Bar liefert.
+"""
+
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Optional
+import pandas as pd
+
+
+class SignalDefinition(ABC):
+    """Abstrakte Basisklasse für Signal-Definitionen."""
+
+    @property
+    @abstractmethod
+    def signal_id(self) -> str:
+        """Eindeutige ID (z. B. 'ema_trend_v1')."""
+        pass
+
+    @property
+    @abstractmethod
+    def display_name(self) -> str:
+        """Anzeigename für UI/Logs."""
+        pass
+
+    @property
+    @abstractmethod
+    def version(self) -> str:
+        """Versionsstring (z. B. '1.0.0')."""
+        pass
+
+    @property
+    @abstractmethod
+    def default_params(self) -> Dict[str, Any]:
+        """Standard-Parameter für dieses Signal."""
+        pass
+
+    @property
+    def param_descriptions(self) -> Dict[str, str]:
+        """Optionale Beschreibungen der Parameter."""
+        return {}
+
+    @property
+    def live_op(self) -> bool:
+        """
+        Live-Betriebsmodus.
+        True (Default) → Dynamisch: wird bei Chart-Aufruf aktualisiert, Live-Tracking.
+        False → Statisch: dient als unveränderliche Benchmark-Historie für Statistiken.
+        """
+        return True
+
+    @property
+    def required_features(self) -> List[str]:
+        """
+        Liste der Feature-Namen, die für evaluate() benötigt werden.
+        Wird vom FeatureBuilder verwendet, um fehlende Features zu erkennen.
+        """
+        return []
+
+    @abstractmethod
+    def evaluate(self, df_features: pd.DataFrame, params: Optional[Dict[str, Any]] = None) -> pd.Series:
+        """
+        Berechnet den Confidence-Score [0.0, 1.0] für jede Bar.
+
+        Args:
+            df_features: DataFrame mit Feature-Spalten (bar_time + feature-Spalten).
+            params: Überschreibt default_params für diesen Aufruf.
+
+        Returns:
+            pd.Series mit Confidence-Werten [0.0, 1.0], gleicher Index wie df_features.
+        """
+        pass
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/engine/set_evaluator.py
+```py
+# analytics/engine/set_evaluator.py
+"""
+Set-Evaluator – Kombiniert mehrere Signale zu einem gewichteten Gesamt-Score.
+Unterstützt gewichtete Summen mit Schwellenwert (Threshold).
+"""
+
+from typing import Any, Dict, List, Optional, Tuple
+import pandas as pd
+import json
+
+from analytics.engine.base_definition import SignalDefinition
+
+
+class SetEvaluator:
+    """
+    Wertet Signal-Sets aus: Kombiniert Einzelsignale mit Gewichtung
+    zu einem Gesamt-Confidence-Score pro Bar.
+    """
+
+    def __init__(self, signals: Dict[str, SignalDefinition]) -> None:
+        """
+        Args:
+            signals: Dict aller verfügbarer Signale {signal_id: SignalDefinition}
+        """
+        self.signals = signals
+
+    def evaluate_set(
+        self,
+        set_config: Dict[str, Any],
+        df_features: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Wertet ein komplettes Signal-Set aus.
+
+        Args:
+            set_config: JSON-konforme Konfiguration {
+                "signals": [{"id": "ema_trend_v1", "weight": 0.6, "params": {...}}, ...],
+                "threshold": 0.5
+            }
+            df_features: DataFrame mit Feature-Spalten
+
+        Returns:
+            DataFrame mit Spalten: bar_time, confidence_total, sowie Einzel-Confidences
+        """
+        signal_configs = set_config.get("signals", [])
+        threshold = float(set_config.get("threshold", 0.5))
+
+        if not signal_configs:
+            raise ValueError("Set-Konfiguration enthält keine Signale")
+
+        result = df_features[["bar_time"]].copy()
+        total_weight = 0.0
+        weighted_sum = pd.Series(0.0, index=df_features.index)
+
+        for cfg in signal_configs:
+            signal_id = cfg["id"]
+            weight = float(cfg.get("weight", 1.0))
+            params = cfg.get("params", {})
+
+            if signal_id not in self.signals:
+                print(f"⚠️ [SetEvaluator] Unbekanntes Signal: {signal_id}")
+                continue
+
+            signal = self.signals[signal_id]
+
+            # Prüfen ob benötigte Features vorhanden sind
+            missing = [f for f in signal.required_features if f not in df_features.columns]
+            if missing:
+                print(f"⚠️ [SetEvaluator] Fehlende Features für {signal_id}: {missing}")
+                continue
+
+            confidence = signal.evaluate(df_features, params)
+            result[f"conf_{signal_id}"] = confidence.values
+
+            weighted_sum += confidence * weight
+            total_weight += weight
+
+        # Gewichteter Gesamt-Score
+        if total_weight > 0:
+            result["confidence_total"] = (weighted_sum / total_weight).values
+        else:
+            result["confidence_total"] = 0.0
+
+        # Binäres Signal (Threshold-Überschreitung)
+        result["signal_binary"] = (result["confidence_total"] >= threshold).astype(int)
+
+        return result
+
+    def evaluate_set_from_db(
+        self,
+        set_id: str,
+        set_configs: Dict[str, Dict[str, Any]],
+        df_features: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Lädt eine Set-Konfiguration anhand der set_id und wertet sie aus.
+
+        Args:
+            set_id: ID des Signal-Sets
+            set_configs: Dict aller verfügbarer Set-Konfigurationen
+            df_features: DataFrame mit Feature-Spalten
+
+        Returns:
+            DataFrame mit Ergebnissen
+        """
+        if set_id not in set_configs:
+            raise ValueError(f"Set-ID '{set_id}' nicht gefunden")
+
+        config = set_configs[set_id]
+        if isinstance(config.get("configuration"), str):
+            config["configuration"] = json.loads(config["configuration"])
+
+        return self.evaluate_set(config["configuration"], df_features)
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/features/__init__.py
+```py
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/features/base_feature.py
+```py
+# analytics/features/base_feature.py
+"""
+Basisklasse für alle Feature-Definitionen im Feature Store.
+Jedes Feature erbt von BaseFeature und implementiert calculate().
+Unterstützt Single-Spalten (pd.Series) und Multi-Spalten (pd.DataFrame) Rückgaben.
+"""
+
+from abc import ABC, abstractmethod
+from typing import Dict, List, Any, Union
+import pandas as pd
+
+
+class BaseFeature(ABC):
+    """Abstrakte Basisklasse für Feature-Berechnungen."""
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Eindeutiger Spaltenname im feature_store (z. B. 'ema_diff')."""
+        pass
+
+    @property
+    @abstractmethod
+    def description(self) -> str:
+        """Menschleserliche Beschreibung."""
+        pass
+
+    @property
+    def column_names(self) -> List[str]:
+        """
+        Gibt die Liste der Spaltennamen zurück, die dieses Feature erzeugt.
+        Default: [self.name] für Single-Spalten-Features.
+        Überschreiben für Multi-Spalten-Features.
+        """
+        return [self.name]
+
+    def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> Union[pd.Series, pd.DataFrame]:
+        """
+        Berechnet das Feature auf einem OHLCV-DataFrame.
+        
+        Kann entweder eine pd.Series (Single-Spalte) oder ein pd.DataFrame 
+        (Multi-Spalten) zurückgeben.
+        
+        Args:
+            df: OHLCV-DataFrame mit bar_time, open, high, low, close, tick_volume
+            params: Feature-spezifische Parameter
+        
+        Returns:
+            pd.Series oder pd.DataFrame mit demselben Index wie df
+        """
+        return self._calculate(df, params)
+
+    @abstractmethod
+    def _calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> Union[pd.Series, pd.DataFrame]:
+        """Interne Berechnungslogik. Subklassen implementieren diese Methode."""
+        pass
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/features/feature_builder.py
+```py
+# analytics/features/feature_builder.py
+"""
+Feature Builder – Lädt OHLCV aus market_data.duckdb, berechnet Basis-Features
+(ema_diff, atr_normalized) vektorisiert und schreibt sie per Bulk-Upsert in
+analytics.duckdb.
+
+Stabiler Basis-Stand ohne Phase-2.1-Zeitkontext-Erweiterungen.
+"""
+
+from typing import Dict, List, Optional
+import pandas as pd
+from pathlib import Path
+
+from analytics.features.base_feature import BaseFeature
+from analytics.features.definitions.ema_diff import EMADiffFeature
+from analytics.features.definitions.atr_normalized import ATRNormalizedFeature
+from state_manager import StateManager
+from db_service import DbPool
+
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+DATA_DIR = BASE_DIR / "data"
+DB_MARKET = str(DATA_DIR / "market_data.duckdb")
+DB_ANALYTICS = str(DATA_DIR / "analytics.duckdb")
+
+
+class FeatureBuilder:
+    """Orchestriert die Feature-Berechnung und persistiert sie im feature_store."""
+
+    def __init__(self) -> None:
+        # Rueckbau auf stabilen Basis-Stand (nur EMADiff + ATRNormalized)
+        self.features: Dict[str, BaseFeature] = {
+            "ema_diff": EMADiffFeature(),
+            "atr_normalized": ATRNormalizedFeature(),
+        }
+        self._state_mgr = StateManager()
+        self._settings = self._state_mgr.get_app_settings()
+
+    # -------------------------------------------------------------------------
+    # Public API
+    # -------------------------------------------------------------------------
+
+    def get_available_features(self) -> List[str]:
+        return list(self.features.keys())
+
+    def load_ohlcv(self, symbol: str, timeframe: str, limit: Optional[int] = None) -> pd.DataFrame:
+        """Laedt OHLCV-Daten aus market_data.duckdb (read-only via DbPool)."""
+        if limit is None:
+            limit = self._settings.feature_builder_limit
+        con = DbPool.get(DB_MARKET)
+        query = """
+            SELECT "time" AS bar_time, open, high, low, close, tick_volume
+            FROM ohlcv_bars
+            WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+              AND "time" IS NOT NULL
+              AND open IS NOT NULL
+              AND high IS NOT NULL
+              AND low IS NOT NULL
+              AND close IS NOT NULL
+            ORDER BY "time" DESC
+            LIMIT ?
+        """
+        df = con.execute(query, [symbol, timeframe, limit]).df()
+        return df.sort_values("bar_time").reset_index(drop=True)
+
+    def calculate_features(
+        self,
+        df: pd.DataFrame,
+        feature_names: Optional[List[str]] = None,
+        params: Optional[Dict[str, Dict[str, any]]] = None
+    ) -> pd.DataFrame:
+        """
+        Berechnet ausgewaehlte Features auf einem OHLCV-DataFrame.
+
+        Args:
+            df: OHLCV-DataFrame mit bar_time, open, high, low, close
+            feature_names: Liste der Feature-Namen (None = alle)
+            params: Dict mit Feature-spezifischen Parametern
+
+        Returns:
+            DataFrame mit bar_time + feature-Spalten
+        """
+        if feature_names is None:
+            feature_names = list(self.features.keys())
+
+        if params is None:
+            params = {}
+
+        result = df[["bar_time"]].copy()
+
+        for name in feature_names:
+            feature = self.features.get(name)
+            if feature is None:
+                print(f"  [FeatureBuilder] Unbekanntes Feature: {name}")
+                continue
+
+            feature_params = params.get(name, {})
+            try:
+                calculated = feature.calculate(df, feature_params)
+
+                if isinstance(calculated, pd.DataFrame):
+                    for col in calculated.columns:
+                        result[col] = calculated[col].values
+                else:
+                    result[feature.name] = calculated.values
+
+            except Exception as e:
+                print(f"  [FeatureBuilder] Fehler bei {name}: {e}")
+                for col in feature.column_names:
+                    result[col] = None
+
+        return result
+
+    def store_features(
+        self,
+        symbol: str,
+        timeframe: str,
+        features_df: pd.DataFrame,
+        con: Optional = None,
+    ) -> int:
+        """
+        Schreibt berechnete Features per Bulk-Upsert in analytics.duckdb.
+
+        Args:
+            symbol: Symbol-Name
+            timeframe: Timeframe-String
+            features_df: DataFrame mit bar_time + feature-Spalten
+            con: Optionale externe DB-Connection
+
+        Returns:
+            Anzahl der geschriebenen Zeilen
+        """
+        if features_df.empty:
+            return 0
+
+        df = features_df.copy()
+        df["symbol"] = symbol
+        df["timeframe"] = timeframe
+
+        own_connection = False
+        if con is None:
+            con = DbPool.get(DB_ANALYTICS)
+        else:
+            own_connection = True
+
+        try:
+            con.register("df_temp", df)
+
+            feature_cols = [c for c in df.columns if c not in ("bar_time", "symbol", "timeframe")]
+            if not feature_cols:
+                return 0
+
+            insert_cols = ", ".join(['"symbol"', '"timeframe"', '"bar_time"'] + [f'"{c}"' for c in feature_cols])
+            select_cols = ", ".join(['"symbol"', '"timeframe"', '"bar_time"'] + [f'"{c}"' for c in feature_cols])
+            set_clause = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in feature_cols])
+
+            sql = f"""
+                INSERT INTO feature_store ({insert_cols})
+                SELECT {select_cols}
+                FROM df_temp
+                ON CONFLICT (symbol, timeframe, bar_time) DO UPDATE SET
+                    {set_clause}
+            """
+            con.execute(sql)
+            con.unregister("df_temp")
+
+            return len(df)
+        finally:
+            if own_connection:
+                con.close()
+
+    def build(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: Optional[int] = None,
+        feature_names: Optional[List[str]] = None,
+        params: Optional[Dict[str, Dict[str, any]]] = None,
+    ) -> int:
+        """
+        Vollstaendiger Pipeline-Durchlauf: Laden -> Berechnen -> Speichern.
+
+        Args:
+            symbol: Symbol-Name
+            timeframe: Timeframe-String
+            limit: Maximale Anzahl Bars
+            feature_names: Liste der Feature-Namen (None = alle)
+            params: Feature-spezifische Parameter
+
+        Returns:
+            Anzahl der geschriebenen Zeilen
+        """
+        if limit is None:
+            limit = self._settings.feature_builder_limit
+
+        df_ohlcv = self.load_ohlcv(symbol, timeframe, limit)
+
+        if df_ohlcv.empty:
+            return 0
+
+        features_df = self.calculate_features(df_ohlcv, feature_names, params)
+        count = self.store_features(symbol, timeframe, features_df)
+        return count
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/features/definitions/__init__.py
+```py
+# analytics/features/definitions/__init__.py
+from analytics.features.definitions.ema_diff import EMADiffFeature
+from analytics.features.definitions.atr_normalized import ATRNormalizedFeature
+
+__all__ = [
+    "EMADiffFeature",
+    "ATRNormalizedFeature",
+]
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/features/definitions/atr_normalized.py
+```py
+# analytics/features/definitions/atr_normalized.py
+"""
+Feature: Normalisierter ATR (atr_normalized)
+Berechnet den Average True Range, normalisiert auf den Schlusskurs in Prozent.
+"""
+
+from typing import Any, Dict
+import pandas as pd
+import numpy as np
+from analytics.features.base_feature import BaseFeature
+
+
+class ATRNormalizedFeature(BaseFeature):
+    @property
+    def name(self) -> str:
+        return "atr_normalized"
+
+    @property
+    def description(self) -> str:
+        return "Average True Range, normalisiert auf close in Prozent"
+
+    def _calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> pd.Series:
+        period = params.get("period", 14)
+
+        high = df["high"].values
+        low = df["low"].values
+        close = df["close"].values
+
+        # True Range
+        prev_close = np.roll(close, 1)
+        prev_close[0] = close[0]
+
+        tr1 = high - low
+        tr2 = np.abs(high - prev_close)
+        tr3 = np.abs(low - prev_close)
+        tr = np.maximum(np.maximum(tr1, tr2), tr3)
+
+        # ATR als EMA der True Range
+        atr = pd.Series(tr).ewm(span=period, adjust=False).mean()
+
+        # Normalisierung auf close in Prozent
+        normalized = (atr / df["close"]) * 100.0
+
+        return normalized
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/features/definitions/ema_diff.py
+```py
+# analytics/features/definitions/ema_diff.py
+"""
+Feature: EMA-Differenz (ema_diff)
+Berechnet die normalisierte Differenz zwischen zwei EMAs (schnell - langsam).
+"""
+
+from typing import Any, Dict
+import pandas as pd
+from analytics.features.base_feature import BaseFeature
+
+
+class EMADiffFeature(BaseFeature):
+    @property
+    def name(self) -> str:
+        return "ema_diff"
+
+    @property
+    def description(self) -> str:
+        return "Normalisierte Differenz zwischen schnellem und langsamem EMA"
+
+    def _calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> pd.Series:
+        fast_period = params.get("fast_period", 12)
+        slow_period = params.get("slow_period", 26)
+
+        ema_fast = df["close"].ewm(span=fast_period, adjust=False).mean()
+        ema_slow = df["close"].ewm(span=slow_period, adjust=False).mean()
+
+        diff = ema_fast - ema_slow
+        # Normalisierung auf close-Preis (Prozentuale Abweichung)
+        normalized = (diff / df["close"]) * 100.0
+
+        return normalized
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/signals/__init__.py
+```py
+# analytics/signals/__init__.py
+from analytics.signals.heuristics.ema_trend import EMATrendSignal
+from analytics.signals.heuristics.atr_filter import ATRFilterSignal
+from analytics.signals.experimental.alternating_arrow_signal import AlternatingArrowSignal
+from analytics.signals.composite.grid_proximity_signal import GridProximitySignal
+
+__all__ = [
+    "EMATrendSignal",
+    "ATRFilterSignal",
+    "AlternatingArrowSignal",
+    "GridProximitySignal",
+]
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/signals/composite/__init__.py
+```py
+# analytics/signals/composite/__init__.py
+from analytics.signals.composite.grid_proximity_signal import GridProximitySignal
+
+__all__ = ["GridProximitySignal"]
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/signals/composite/grid_proximity_signal.py
+```py
+# analytics/signals/composite/grid_proximity_signal.py
+"""
+Composite Signal: Grid Proximity Signal (Phase 11)
+Verknuepft multidimensionale Features aus dem feature_store:
+  - Y-Achse: grid_dist_pct (Preisabstand zum naechsten Grid-Level)
+  - X-Achse: is_time_window_active (Zeitfenster-Filter)
+  - Volatilitaet: atr_normalized / regime_volatility (Markt-Regime)
+
+Signal-Logik:
+  Buy  (confidence > 0.5): Preis nahe Grid-Level + aktives Zeitfenster + niedrige Vola
+  Sell (confidence < -0.5): Preis fern von Grid-Level + aktives Zeitfenster + hohe Vola
+  Neutral (confidence = 0.0): Zeitfenster geschlossen oder keine klare Signallage
+"""
+
+from typing import Any, Dict, List, Optional
+import pandas as pd
+import numpy as np
+from analytics.engine.base_definition import SignalDefinition
+
+
+class GridProximitySignal(SignalDefinition):
+    """
+    Composite Signal: Grid-Proximity mit multidimensionaler Verknuepfung.
+    Nutzt feature_store-Spalten: grid_dist_pct, is_time_window_active,
+    atr_normalized, regime_volatility.
+    """
+
+    @property
+    def signal_id(self) -> str:
+        return "grid_proximity_v1"
+
+    @property
+    def display_name(self) -> str:
+        return "Grid Proximity (Composite)"
+
+    @property
+    def version(self) -> str:
+        return "1.0.0"
+
+    @property
+    def default_params(self) -> Dict[str, Any]:
+        return {
+            "proximity_threshold_pct": 0.1,       # max. Abstand in % zum Level fuer "nahe"
+            "confidence_high": 0.8,                 # Confidence bei starkem Signal
+            "confidence_low": 0.3,                  # Confidence bei schwachem Signal
+            "vola_regime_threshold": 1.2,           # regime_volatility >= x = "hohe Vola"
+            "atr_filter_enabled": True,             # ATR-Filter aktivieren
+            "atr_percentile": 0.7,                  # ATR-Perzentil-Schwelle (0-1)
+            "time_window_must": True,               # Nur Signale in aktiven Zeitfenstern
+            "min_bars_since_pivot": 3,              # Mindestbars seit letztem Pivot-Hit
+            "use_regime_filter": True,              # Regime-Filter aktivieren
+        }
+
+    @property
+    def param_descriptions(self) -> Dict[str, str]:
+        return {
+            "proximity_threshold_pct": "Max. Abstand in % vom naechsten Grid-Level",
+            "confidence_high": "Confidence bei starkem Signal (Level-Touch im Fenster)",
+            "confidence_low": "Confidence bei schwachem Signal (Level-nahe, normale Vola)",
+            "vola_regime_threshold": "Schwelle fuer 'hohe Volatilitaet' (regime_volatility)",
+            "atr_filter_enabled": "ATR-Filter fuer Ausbruchsbestaetigung aktiv",
+            "atr_percentile": "ATR-Perzentil-Schwelle (0-1)",
+            "time_window_must": "Nur Signale in aktiven Zeitfenstern (is_time_window_active=1)",
+            "min_bars_since_pivot": "Mindestbars seit letztem Pivot-Hit",
+            "use_regime_filter": "Regime-Filter (Trend/Volatility) aktivieren",
+        }
+
+    @property
+    def live_op(self) -> bool:
+        return True  # Dynamisch: wird bei Chart-Aufruf aktualisiert
+
+    @property
+    def required_features(self) -> List[str]:
+        return [
+            "grid_dist_pct",
+            "grid_nearest_level",
+            "is_time_window_active",
+            "atr_normalized",
+            "regime_volatility",
+            "regime_trend_score",
+        ]
+
+    def evaluate(
+        self,
+        df_features: pd.DataFrame,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> pd.Series:
+        """
+        Berechnet Confidence-Score [0.0, 1.0] basierend auf Grid-Proximity.
+
+        Args:
+            df_features: DataFrame mit Feature-Spalten aus feature_store.
+                         Benoetigt: grid_dist_pct, is_time_window_active,
+                         atr_normalized, regime_volatility, regime_trend_score
+            params: Ueberschreibt default_params
+
+        Returns:
+            pd.Series mit Confidence-Werten [0.0, 1.0]
+        """
+        p = {**self.default_params, **(params or {})}
+        prox_threshold = float(p["proximity_threshold_pct"])
+        conf_high = float(p["confidence_high"])
+        conf_low = float(p["confidence_low"])
+        vola_thresh = float(p["vola_regime_threshold"])
+        atr_enabled = bool(p["atr_filter_enabled"])
+        atr_pctile = float(p["atr_percentile"])
+        time_must = bool(p["time_window_must"])
+        min_bars = int(p["min_bars_since_pivot"])
+        use_regime = bool(p["use_regime_filter"])
+
+        n = len(df_features)
+        confidence = np.zeros(n, dtype=float)
+
+        if n < 2:
+            return pd.Series(confidence, index=df_features.index)
+
+        # --- Feature-Spalten extrahieren (mit Fallback auf NaN) ---
+        dist_pct = df_features.get("grid_dist_pct", pd.Series(np.nan, index=df_features.index)).values.astype(float)
+        nearest_level = df_features.get("grid_nearest_level", pd.Series(np.nan, index=df_features.index)).values.astype(float)
+        time_active = df_features.get("is_time_window_active", pd.Series(1, index=df_features.index)).values.astype(int)
+        atr_norm = df_features.get("atr_normalized", pd.Series(np.nan, index=df_features.index)).values.astype(float)
+        regime_vol = df_features.get("regime_volatility", pd.Series(1.0, index=df_features.index)).values.astype(float)
+        regime_score = df_features.get("regime_trend_score", pd.Series(0.0, index=df_features.index)).values.astype(float)
+
+        # close fuer Level-Berechnung (Fallback wenn keine grid_dist_pct)
+        close = df_features.get("close", pd.Series(np.nan, index=df_features.index)).values.astype(float)
+
+        # --- Hilfsvektoren ---
+        # Ist das Zeitfenster aktiv?
+        window_ok = time_active == 1 if time_must else np.ones(n, dtype=bool)
+
+        # Ist der Preis nahe einem Grid-Level?
+        # dist_pct < threshold bedeutet "nahe dran"
+        # NaN-Werte als "nicht nahe" behandeln
+        is_near = np.where(np.isfinite(dist_pct), dist_pct < prox_threshold, False)
+
+        # Ist der Preis genau AUF einem Level? (dist_pct extrem klein)
+        is_on_level = np.where(np.isfinite(dist_pct), dist_pct < prox_threshold * 0.1, False)
+
+        # Volatilitaets-Regime
+        low_vola = np.where(np.isfinite(regime_vol), regime_vol < vola_thresh, True)
+        high_vola = np.where(np.isfinite(regime_vol), regime_vol >= vola_thresh, False)
+
+        # ATR-Perzentil (dynamische Schwelle)
+        if atr_enabled:
+            atr_valid = atr_norm[np.isfinite(atr_norm)]
+            if len(atr_valid) > 10:
+                atr_threshold = np.percentile(atr_valid, atr_pctile * 100)
+                atr_high = atr_norm >= atr_threshold
+                atr_low = atr_norm < atr_threshold
+            else:
+                atr_high = np.zeros(n, dtype=bool)
+                atr_low = np.ones(n, dtype=bool)
+        else:
+            atr_high = np.ones(n, dtype=bool)
+            atr_low = np.ones(n, dtype=bool)
+
+        # --- Signallogik vektorisiert ---
+        for i in range(n):
+            if not window_ok[i]:
+                # Zeitfenster geschlossen -> neutral
+                confidence[i] = 0.0
+                continue
+
+            if np.isnan(dist_pct[i]) or np.isnan(nearest_level[i]):
+                # Keine Grid-Daten verfuegbar -> neutral
+                confidence[i] = 0.0
+                continue
+
+            # === Starkes Signal: Level-Touch (direkt auf Level) ===
+            if is_on_level[i]:
+                if use_regime and regime_score[i] > 0.3:
+                    # Level-Touch im Aufwaertstrend -> Bestaetigung
+                    confidence[i] = conf_high * 1.0
+                elif use_regime and regime_score[i] < -0.3:
+                    # Level-Touch im Abwaertstrend -> Abschwaechung
+                    confidence[i] = conf_high * 0.7
+                else:
+                    # Neutraler Trend -> mittel
+                    confidence[i] = conf_high * 0.85
+
+                # Vola-Boost: Level-Touch mit hoher Vola = staerkeres Signal
+                if high_vola[i] and atr_high[i]:
+                    confidence[i] = min(1.0, confidence[i] * 1.2)
+
+            # === Mittleres Signal: Preis nahe Level ===
+            elif is_near[i]:
+                base = conf_low
+                # Vola-Boost: Bei niedriger Vola ist Level-Naehe relevanter
+                if low_vola[i]:
+                    base *= 1.3
+                # Trend-Boost: In Trendrichtung
+                if use_regime and regime_score[i] > 0.3:
+                    base *= 1.2
+                confidence[i] = min(conf_high, base)
+
+            # === Schwaches Signal: Weit weg vom Level ===
+            else:
+                # Nur wenn Regime stark genug fuer "Ablehnung"
+                if use_regime and abs(regime_score[i]) > 0.6:
+                    confidence[i] = 0.1  # Sehr niedrig, aber nicht 0
+                else:
+                    confidence[i] = 0.0
+
+        # --- Glatttung: min_bars_since_pivot ---
+        # Nach einem starken Signal (confidence > 0.5) keine neuen Signale
+        # fuer min_bars Bars
+        if min_bars > 0:
+            for i in range(1, n):
+                lookback_start = max(0, i - min_bars)
+                lookback = confidence[lookback_start:i]
+                if np.any(lookback > 0.5):
+                    # Nur ueberschreiben wenn aktuelles Signal schwaecher
+                    if confidence[i] > 0.0 and confidence[i] < 0.5:
+                        confidence[i] = 0.0
+
+        return pd.Series(confidence, index=df_features.index)
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/signals/experimental/__init__.py
+```py
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/signals/experimental/alternating_arrow_signal.py
+```py
+# analytics/signals/experimental/alternating_arrow_signal.py
+"""
+Experimental Signal: Alternating Arrow Signal
+Erzeugt deterministisch alternierende Buy/Sell-Signale basierend auf dem
+bar_time-Index. Dient als Test-Signal für die Live-Pipeline (Tick -> Bar-Close
+-> Feature Store -> Signal-Engine -> Persistence -> UI-Overlay).
+
+Signal-Logik:
+- Gerader bar_time-Index (bar_time % 2 == 0) -> Buy (confidence=1.0)
+- Ungerader bar_time-Index (bar_time % 2 == 1) -> Sell (confidence=1.0)
+- Erste Bar immer neutral (confidence=0.0)
+"""
+
+from typing import Any, Dict, Optional
+import pandas as pd
+import numpy as np
+from analytics.engine.base_definition import SignalDefinition
+
+
+class AlternatingArrowSignal(SignalDefinition):
+    """Erzeugt alternierende Buy/Sell-Pfeile für Testzwecke."""
+
+    @property
+    def signal_id(self) -> str:
+        return "alternating_arrow_v1"
+
+    @property
+    def display_name(self) -> str:
+        return "Alternating Arrow (Test)"
+
+    @property
+    def version(self) -> str:
+        return "1.0.0"
+
+    @property
+    def default_params(self) -> Dict[str, Any]:
+        return {
+            "confidence_buy": 1.0,
+            "confidence_sell": 1.0,
+            "skip_first_bars": 1,
+        }
+
+    @property
+    def param_descriptions(self) -> Dict[str, str]:
+        return {
+            "confidence_buy": "Confidence-Wert für Buy-Signale",
+            "confidence_sell": "Confidence-Wert für Sell-Signale",
+            "skip_first_bars": "Anzahl der ersten Bars ohne Signal",
+        }
+
+    @property
+    def required_features(self) -> list:
+        return []
+
+    @property
+    def live_op(self) -> bool:
+        """Testsignal ist deaktiviert (keine automatischen Test-Signale in der Live-Pipeline)."""
+        return False
+
+    def evaluate(self, df_features: pd.DataFrame, params: Optional[Dict[str, Any]] = None) -> pd.Series:
+        p = {**self.default_params, **(params or {})}
+        conf_buy = float(p["confidence_buy"])
+        conf_sell = float(p["confidence_sell"])
+        skip = int(p["skip_first_bars"])
+
+        n = len(df_features)
+        confidence = np.zeros(n, dtype=float)
+
+        if n <= skip:
+            return pd.Series(confidence, index=df_features.index)
+
+        # Alternierend: gerader Index = Buy, ungerader Index = Sell
+        for i in range(skip, n):
+            bar_time = df_features.iloc[i].get("bar_time", i)
+            # Nutze bar_time als Seed für deterministische Alternierung
+            if isinstance(bar_time, (int, float)):
+                idx_val = int(bar_time)
+            else:
+                idx_val = i
+
+            if idx_val % 2 == 0:
+                confidence[i] = conf_buy
+            else:
+                confidence[i] = conf_sell
+
+        return pd.Series(confidence, index=df_features.index)
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/signals/heuristics/__init__.py
+```py
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/signals/heuristics/atr_filter.py
+```py
+# analytics/signals/heuristics/atr_filter.py
+"""
+Signal: ATR-Filter
+Bewertet die Volatilitätssituation anhand des normalisierten ATR.
+- Hoher ATR (> Schwellwert) → hoher Confidence (Ausbruch/Volatilität)
+- Niedriger ATR → niedriger Confidence (Seitwärts/Konsolidierung)
+"""
+
+from typing import Any, Dict, Optional
+import pandas as pd
+import numpy as np
+from analytics.engine.base_definition import SignalDefinition
+
+
+class ATRFilterSignal(SignalDefinition):
+    @property
+    def signal_id(self) -> str:
+        return "atr_filter_v1"
+
+    @property
+    def display_name(self) -> str:
+        return "ATR Volatility Filter"
+
+    @property
+    def version(self) -> str:
+        return "1.0.0"
+
+    @property
+    def default_params(self) -> Dict[str, Any]:
+        return {
+            "threshold_pct": 0.8,       # ATR-Schwellwert in Prozent
+            "max_confidence": 1.0,       # Maximaler Confidence
+            "mode": "high_volatility",   # 'high_volatility' oder 'low_volatility'
+        }
+
+    @property
+    def param_descriptions(self) -> Dict[str, str]:
+        return {
+            "threshold_pct": "ATR-Schwellwert: ATR > threshold ergibt Confidence > 0",
+            "max_confidence": "Maximaler Confidence-Wert",
+            "mode": "Modus: 'high_volatility' oder 'low_volatility'",
+        }
+
+    @property
+    def required_features(self) -> list:
+        return ["atr_normalized"]
+
+    @property
+    def live_op(self) -> bool:
+        return False
+
+    def evaluate(self, df_features: pd.DataFrame, params: Optional[Dict[str, Any]] = None) -> pd.Series:
+        p = {**self.default_params, **(params or {})}
+        threshold = float(p["threshold_pct"])
+        max_conf = float(p["max_confidence"])
+        mode = str(p["mode"])
+
+        if "atr_normalized" not in df_features.columns:
+            raise ValueError("ATR-Filter Signal benötigt 'atr_normalized' im Feature-Store")
+
+        atr = df_features["atr_normalized"].values
+
+        if mode == "high_volatility":
+            # Hoher ATR → hoher Confidence
+            confidence = np.clip((atr - threshold) / (3 * threshold - threshold), 0.0, 1.0)
+        else:
+            # Niedriger ATR → hoher Confidence
+            confidence = np.clip((threshold - atr) / (threshold - 0.1), 0.0, 1.0)
+
+        confidence = confidence * max_conf
+        return pd.Series(confidence, index=df_features.index)
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/signals/heuristics/ema_trend.py
+```py
+# analytics/signals/heuristics/ema_trend.py
+"""
+Signal: EMA-Trend
+Bewertet die Trendstärke anhand der EMA-Differenz (ema_diff).
+- Stark positiv (> Schwellwert) → hoher Confidence für Aufwärtstrend
+- Stark negativ (< -Schwellwert) → hoher Confidence für Abwärtstrend
+- Nah an 0 → niedriger Confidence (kein klarer Trend)
+"""
+
+from typing import Any, Dict, Optional
+import pandas as pd
+import numpy as np
+from analytics.engine.base_definition import SignalDefinition
+
+
+class EMATrendSignal(SignalDefinition):
+    @property
+    def signal_id(self) -> str:
+        return "ema_trend_v1"
+
+    @property
+    def display_name(self) -> str:
+        return "EMA Trend Signal"
+
+    @property
+    def version(self) -> str:
+        return "1.0.0"
+
+    @property
+    def default_params(self) -> Dict[str, Any]:
+        return {
+            "threshold_pct": 0.3,       # Schwellwert in Prozent (absolut)
+            "max_confidence": 1.0,       # Maximaler Confidence bei starkem Trend
+            "direction": "both",         # 'long', 'short', 'both'
+        }
+
+    @property
+    def param_descriptions(self) -> Dict[str, str]:
+        return {
+            "threshold_pct": "Schwellwert: |ema_diff| > threshold ergibt Confidence > 0",
+            "max_confidence": "Maximaler Confidence-Wert bei sehr starkem Trend",
+            "direction": "Richtung: 'long', 'short' oder 'both'",
+        }
+
+    @property
+    def required_features(self) -> list:
+        return ["ema_diff"]
+
+    @property
+    def live_op(self) -> bool:
+        return False
+
+    def evaluate(self, df_features: pd.DataFrame, params: Optional[Dict[str, Any]] = None) -> pd.Series:
+        p = {**self.default_params, **(params or {})}
+        threshold = float(p["threshold_pct"])
+        max_conf = float(p["max_confidence"])
+        direction = str(p["direction"])
+
+        if "ema_diff" not in df_features.columns:
+            raise ValueError("EMA-Trend Signal benötigt 'ema_diff' im Feature-Store")
+
+        ema = df_features["ema_diff"].values
+        abs_ema = np.abs(ema)
+
+        # Confidence linear von 0 bei threshold bis max_conf bei 3*threshold
+        confidence = np.clip((abs_ema - threshold) / (3 * threshold - threshold), 0.0, 1.0)
+        confidence = confidence * max_conf
+
+        # Richtungsfilter
+        if direction == "long":
+            confidence[ema < 0] = 0.0
+        elif direction == "short":
+            confidence[ema > 0] = 0.0
+
+        return pd.Series(confidence, index=df_features.index)
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/signals/machine_learning/__init__.py
+```py
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/signals/machine_learning/lightgbm_signal.py
+```py
+# analytics/signals/machine_learning/lightgbm_signal.py
+"""
+ML-Signal: LightGBM Inferenz
+Lädt ein trainiertes LightGBM-Modell dynamisch über params['model_file']
+und führt Inferenz auf dem Feature-Store aus.
+
+Modell-Namenskonvention:
+    model_lgb_<symbol>_<timeframe>_<created_YYYYMMDD>_<updated_YYYYMMDD>.txt
+
+Abhängigkeit: lightgbm (pip install lightgbm)
+"""
+
+from typing import Any, Dict, Optional
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+from analytics.engine.base_definition import SignalDefinition
+
+
+class LightGBMSignal(SignalDefinition):
+    """LightGBM-Modell-Inferenz als Signal."""
+
+    @property
+    def signal_id(self) -> str:
+        return "lightgbm_v1"
+
+    @property
+    def display_name(self) -> str:
+        return "LightGBM ML Signal"
+
+    @property
+    def version(self) -> str:
+        return "1.0.0"
+
+    @property
+    def default_params(self) -> Dict[str, Any]:
+        return {
+            "model_file": "",           # Relativer Pfad zur .txt-Datei
+            "feature_columns": [],       # Liste der Feature-Spaltennamen
+            "threshold": 0.5,           # Schwellwert für binäre Klassifikation
+        }
+
+    @property
+    def param_descriptions(self) -> Dict[str, str]:
+        return {
+            "model_file": "Pfad zur LightGBM-Modelldatei (.txt)",
+            "feature_columns": "Liste der Feature-Spalten für die Inferenz",
+            "threshold": "Schwellwert für die binäre Klassifikation",
+        }
+
+    @property
+    def required_features(self) -> list:
+        return self._params.get("feature_columns", []) if hasattr(self, '_params') else []
+
+    def __init__(self):
+        super().__init__()
+        self._model = None
+        self._params = {}
+
+    def _load_model(self, model_path: str) -> None:
+        """Lädt das LightGBM-Modell (Booster) aus einer Datei."""
+        path = Path(model_path)
+        if not path.exists():
+            raise FileNotFoundError(f"LightGBM-Modell nicht gefunden: {model_path}")
+
+        try:
+            import lightgbm as lgb
+            self._model = lgb.Booster(model_file=str(path))
+            print(f"✅ LightGBM-Modell geladen: {path.name}")
+        except ImportError:
+            raise ImportError(
+                "LightGBM ist nicht installiert. "
+                "Installiere es mit: pip install lightgbm"
+            )
+
+    def evaluate(self, df_features: pd.DataFrame, params: Optional[Dict[str, Any]] = None) -> pd.Series:
+        p = {**self.default_params, **(params or {})}
+        self._params = p
+        model_file = str(p.get("model_file", ""))
+        feature_cols = list(p.get("feature_columns", []))
+        threshold = float(p.get("threshold", 0.5))
+
+        if not model_file:
+            raise ValueError("LightGBMSignal: 'model_file' ist nicht gesetzt")
+
+        if not feature_cols:
+            raise ValueError("LightGBMSignal: 'feature_columns' ist leer")
+
+        # Prüfen ob alle benötigten Features vorhanden sind
+        missing = [f for f in feature_cols if f not in df_features.columns]
+        if missing:
+            raise ValueError(f"LightGBMSignal: Fehlende Features: {missing}")
+
+        # Modell laden (cached)
+        if self._model is None:
+            self._load_model(model_file)
+
+        # Feature-Matrix erstellen
+        X = df_features[feature_cols].values
+
+        # Inferenz
+        try:
+            y_pred = self._model.predict(X)
+        except Exception as e:
+            raise RuntimeError(f"LightGBM-Inferenz fehlgeschlagen: {e}")
+
+        # Confidence = predicted probability (für binäre Klassifikation)
+        if y_pred.ndim > 1 and y_pred.shape[1] > 1:
+            # Multi-Class: nimm Wahrscheinlichkeit der positiven Klasse
+            confidence = y_pred[:, 1]
+        else:
+            confidence = y_pred.flatten()
+
+        # Clipping auf [0, 1]
+        confidence = np.clip(confidence, 0.0, 1.0)
+
+        return pd.Series(confidence, index=df_features.index)
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/signals/machine_learning/xgboost_signal.py
+```py
+# analytics/signals/machine_learning/xgboost_signal.py
+"""
+ML-Signal: XGBoost Inferenz
+Lädt ein trainiertes XGBoost-Modell dynamisch über params['model_file']
+und führt Inferenz auf dem Feature-Store aus.
+
+Modell-Namenskonvention:
+    model_xgb_<symbol>_<timeframe>_<created_YYYYMMDD>_<updated_YYYYMMDD>.json
+
+Abhängigkeit: xgboost (pip install xgboost)
+"""
+
+from typing import Any, Dict, Optional
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+from analytics.engine.base_definition import SignalDefinition
+
+
+class XGBoostSignal(SignalDefinition):
+    """XGBoost-Modell-Inferenz als Signal."""
+
+    @property
+    def signal_id(self) -> str:
+        return "xgboost_v1"
+
+    @property
+    def display_name(self) -> str:
+        return "XGBoost ML Signal"
+
+    @property
+    def version(self) -> str:
+        return "1.0.0"
+
+    @property
+    def default_params(self) -> Dict[str, Any]:
+        return {
+            "model_file": "",           # Relativer Pfad zur .json-Datei
+            "feature_columns": [],       # Liste der Feature-Spaltennamen
+            "threshold": 0.5,           # Schwellwert für binäre Klassifikation
+        }
+
+    @property
+    def param_descriptions(self) -> Dict[str, str]:
+        return {
+            "model_file": "Pfad zur XGBoost-Modelldatei (.json)",
+            "feature_columns": "Liste der Feature-Spalten für die Inferenz",
+            "threshold": "Schwellwert für die binäre Klassifikation",
+        }
+
+    @property
+    def required_features(self) -> list:
+        return self._params.get("feature_columns", []) if hasattr(self, '_params') else []
+
+    def __init__(self):
+        super().__init__()
+        self._model = None
+        self._params = {}
+
+    def _load_model(self, model_path: str) -> None:
+        """Lädt das XGBoost-Modell aus einer JSON-Datei."""
+        path = Path(model_path)
+        if not path.exists():
+            raise FileNotFoundError(f"XGBoost-Modell nicht gefunden: {model_path}")
+
+        try:
+            import xgboost as xgb
+            self._model = xgb.XGBClassifier()
+            self._model.load_model(str(path))
+            print(f"✅ XGBoost-Modell geladen: {path.name}")
+        except ImportError:
+            raise ImportError(
+                "XGBoost ist nicht installiert. "
+                "Installiere es mit: pip install xgboost"
+            )
+
+    def evaluate(self, df_features: pd.DataFrame, params: Optional[Dict[str, Any]] = None) -> pd.Series:
+        p = {**self.default_params, **(params or {})}
+        self._params = p
+        model_file = str(p.get("model_file", ""))
+        feature_cols = list(p.get("feature_columns", []))
+        threshold = float(p.get("threshold", 0.5))
+
+        if not model_file:
+            raise ValueError("XGBoostSignal: 'model_file' ist nicht gesetzt")
+
+        if not feature_cols:
+            raise ValueError("XGBoostSignal: 'feature_columns' ist leer")
+
+        # Prüfen ob alle benötigten Features vorhanden sind
+        missing = [f for f in feature_cols if f not in df_features.columns]
+        if missing:
+            raise ValueError(f"XGBoostSignal: Fehlende Features: {missing}")
+
+        # Modell laden (cached)
+        if self._model is None:
+            self._load_model(model_file)
+
+        # Feature-Matrix erstellen
+        X = df_features[feature_cols].values
+
+        # Inferenz
+        try:
+            y_pred = self._model.predict_proba(X)
+        except Exception as e:
+            raise RuntimeError(f"XGBoost-Inferenz fehlgeschlagen: {e}")
+
+        # Confidence = predicted probability der positiven Klasse
+        if y_pred.ndim > 1 and y_pred.shape[1] > 1:
+            confidence = y_pred[:, 1]
+        else:
+            confidence = y_pred.flatten()
+
+        # Clipping auf [0, 1]
+        confidence = np.clip(confidence, 0.0, 1.0)
+
+        return pd.Series(confidence, index=df_features.index)
+
+```
+
+--------------------------------------------------
+
+### DATEI: chart/__init__.py
+```py
+# chart/__init__.py
+from .chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, HTML_TEMPLATE, build_html_template
+from .chart_win import PyTraderChartWindow
+
+__all__ = [
+    "PyTraderChartWindow",
+    "HTML_TEMPLATE",
+    "build_html_template",
+    "COMBOBOX_STYLE",
+    "BUTTON_PRIMARY_STYLE",
+]
+```
+
+--------------------------------------------------
+
+### DATEI: chart/chart_basics.py
+```py
+# chart/chart_basics.py
+"""
+chart/chart_basics.py - TradingView Lightweight Charts v5 HTML-Template
+Lädt JS-Module aus chart/js/ und baut das finale HTML dynamisch zusammen.
+"""
+
+from pathlib import Path
+from typing import Dict, List, TypeAlias
+
+OHLCVRecord: TypeAlias = Dict[str, float | int]
+CandleDataList: TypeAlias = List[OHLCVRecord]
+
+COMBOBOX_STYLE = """
+	QComboBox { background-color: #2b313e; color: white; border: 1px solid #3d4450; border-radius: 4px; padding: 3px 8px; font-weight: bold; }
+	QComboBox::drop-down { border: none; }
+	QComboBox QAbstractItemView { background-color: #1e222d; color: white; selection-background-color: #3d4450; }
+"""
+
+BUTTON_PRIMARY_STYLE = "background-color: #2b5c8f; color: white; font-weight: bold;"
+
+CSS_STYLE = """
+	html, body { margin: 0; padding: 0; width: 100%; height: 100%; background-color: #131722; overflow: hidden; font-family: sans-serif; user-select: none; }
+	#chart-container { width: 100%; height: 100%; position: relative; }
+	#measurement-region { display: none; position: absolute; background: rgba(41, 98, 255, 0.15); border: 1px dashed #2962FF; pointer-events: none; z-index: 999; }
+	#measurement-box { display: none; position: absolute; background: #1e222d; border: 1px solid #2962FF; border-radius: 6px; padding: 8px 12px; color: #d1d4dc; font-size: 12px; pointer-events: none; z-index: 1000; line-height: 1.5; white-space: nowrap; }
+	#price-badge { display: none; position: absolute; right: 2px; background: #2962FF; color: white; font-size: 11px; font-weight: bold; padding: 2px 6px; border-radius: 3px; pointer-events: none; z-index: 1000; will-change: transform, top; }
+	#countdown-badge { display: none; position: absolute; right: 62px; background: #1e222d; border: 1px solid #2962FF; color: #2962FF; font-size: 11px; font-weight: bold; padding: 2px 6px; border-radius: 3px; pointer-events: none; z-index: 1000; will-change: transform, top; }
+"""
+
+JS_DIR = Path(__file__).resolve().parent / "js"
+
+JS_FILES = [
+    "01_core.js",
+    "02_time_utils.js",
+    "03_chart_rendering.js",
+    "04_live_updates.js",
+]
+
+
+def _load_js_modules() -> str:
+    """Lädt alle JS-Dateien aus chart/js/ in der definierten Reihenfolge."""
+    parts: list[str] = []
+    for filename in JS_FILES:
+        filepath = JS_DIR / filename
+        try:
+            content = filepath.read_text(encoding="utf-8")
+            parts.append(f"// --- {filename} ---\n{content}")
+        except FileNotFoundError:
+            print(f"⚠️ [chart_basics] JS-Datei nicht gefunden: {filepath}")
+    return "\n\n".join(parts)
+
+
+def _build_html_template() -> str:
+    """Baut das finale HTML aus CSS, CDN-Links und den JS-Modulen zusammen."""
+    js_code = _load_js_modules()
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="utf-8">
+	<style>{CSS_STYLE}</style>
+	<script crossorigin="anonymous" src="https://unpkg.com/lightweight-charts@5.2.0/dist/lightweight-charts.standalone.production.js"></script>
+	<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+</head>
+<body>
+	<div id="chart-container">
+		<div id="measurement-region"></div>
+		<div id="measurement-box"></div>
+		<div id="price-badge"></div>
+		<div id="countdown-badge"></div>
+	</div>
+	<script>
+{js_code}
+	</script>
+</body>
+</html>"""
+
+
+def build_html_template() -> str:
+    """Baut das HTML-Template FRISCH aus den aktuellen JS-Dateien auf der Platte.
+
+    WICHTIG (Developer-Erfahrung): JS-Aenderungen in chart/js/ greifen sofort
+    bei jedem neuen Chart-Fenster – OHNE vollstaendigen App-Neustart.
+    Dafuer wird bei jedem Aufruf neu von der Platte gelesen (kein Modul-Cache).
+    """
+    return _build_html_template()
+
+
+# Abwaertskompatibilitaet: Konstante fuer Tests (check_html_template.py).
+HTML_TEMPLATE = _build_html_template()
+
+```
+
+--------------------------------------------------
+
+### DATEI: chart/chart_win.py
+```py
+# chart/chart_win.py
+# ==============================================================================
+# chart/chart_win.py - Exakter Restore für Fensterposition, Leerraum & Zoom
+# ==============================================================================
+
+import json
+import math
+import sys
+from datetime import datetime, timezone as dt_timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from chart.indicators.base_indicator import BaseIndicator
+
+file_path = Path(__file__).resolve()
+project_root = file_path.parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+from PySide6.QtCore import QFile, QIODevice, QObject, QThread, QTimer, QUrl, Signal, Slot, Qt, QEvent
+from PySide6.QtUiTools import QUiLoader
+from PySide6.QtWebChannel import QWebChannel
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebEngineCore import QWebEnginePage
+from PySide6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QMainWindow,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
+
+try:
+    from chart.chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, HTML_TEMPLATE
+    from chart.indicators.grid import GridIndicator
+    from chart.indicator_dialog import IndicatorSettingsDialog
+except ImportError:
+    from chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, HTML_TEMPLATE
+    from indicators.grid import GridIndicator
+    from indicator_dialog import IndicatorSettingsDialog
+
+try:
+    from state_manager import StateManager
+except ImportError:
+    from state_manager import StateManager
+
+from db_service import MarketDataRepository, _parse_json_field, TF_SECONDS_MAP
+
+from chart.overlays.signal_overlay import SignalOverlay
+from analytics.background_workers.live_analyzer import fill_gaps_for_pair
+
+
+def find_null_fields(obj, path=""):
+    """Sucht rekursiv nach None/null in Dictionaries und Listen."""
+    nulls = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            new_path = f"{path}.{k}" if path else k
+            if v is None:
+                nulls.append(new_path)
+            else:
+                nulls.extend(find_null_fields(v, new_path))
+    elif isinstance(obj, list):
+        for idx, item in enumerate(obj):
+            new_path = f"{path}[{idx}]"
+            nulls.extend(find_null_fields(item, new_path))
+    return nulls
+
+
+def _clean_nan(obj):
+    """Entfernt rekursiv alle NaN/Inf-Werte aus Dicts/Listen, damit json.dumps(allow_nan=False) nicht fehlschlaegt."""
+    if isinstance(obj, dict):
+        return {k: _clean_nan(v) for k, v in obj.items() if not (isinstance(v, float) and (math.isnan(v) or math.isinf(v)))}
+    elif isinstance(obj, list):
+        return [_clean_nan(item) for item in obj if not (isinstance(item, float) and (math.isnan(item) or math.isinf(item)))]
+    return obj
+
+
+class WebEngineConsolePage(QWebEnginePage):
+    def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID):
+        print(f"🌐 [JS Console L{lineNumber}]: {message}")
+
+
+class ChartBridge(QObject):
+    rangeChanged = Signal(float, float)
+    priceRangeChanged = Signal(float, float)
+    measurementChanged = Signal(str)
+
+    @Slot(float, float)
+    def onRangeChanged(self, f, t): self.rangeChanged.emit(f, t)
+
+    @Slot(float, float)
+    def onPriceRangeChanged(self, f, t): self.priceRangeChanged.emit(f, t)
+
+    @Slot(str)
+    def onMeasurementChanged(self, m): self.measurementChanged.emit(m)
+
+
+class ChartDataSerializer(QThread):
+    """Serialisiert Chart-Update-Pakete im Hintergrund-Thread (JSON-Encoding)."""
+    serialized = Signal(str, int)  # fertiges JSON, updateId
+
+    def __init__(self, update_package: dict, update_id: int, parent=None):
+        super().__init__(parent)
+        self.update_package = update_package
+        self.update_id = update_id
+
+    def run(self):
+        try:
+            payload = json.dumps(self.update_package, allow_nan=False)
+            self.serialized.emit(payload, self.update_id)
+        except (ValueError, TypeError) as e:
+            print(f"⚠️ [Serializer] JSON-Fehler: {e}")
+            self.serialized.emit("", self.update_id)
+
+
+class GridDataSerializer(QThread):
+    """Serialisiert Grid-Linien/Circles im Hintergrund-Thread."""
+    done = Signal(str, str, int)  # lines_json, circles_json, gridGen
+
+    def __init__(self, lines: list, circles: list, grid_gen: int, parent=None):
+        super().__init__(parent)
+        self.lines = lines
+        self.circles = circles
+        self.grid_gen = grid_gen
+
+    def run(self):
+        try:
+            lj = json.dumps(self.lines, allow_nan=False)
+            cj = json.dumps(self.circles, allow_nan=False)
+            self.done.emit(lj, cj, self.grid_gen)
+        except (ValueError, TypeError) as e:
+            print(f"⚠️ [GridSerializer] JSON-Fehler: {e}")
+            self.done.emit("", "", self.grid_gen)
+
+
+class PyTraderChartWindow(QMainWindow):
+    closed_signal = Signal(str)
+
+    def __init__(self, instance_id="win_1", symbol="SILVER", timeframe="H1", visible_from=None, visible_to=None,
+                 state_manager=None):
+        super().__init__()
+        self.instance_id = instance_id
+        self.current_symbol = symbol
+        self.current_tf = timeframe
+        self.visible_from = visible_from
+        self.visible_to = visible_to
+        self.visible_price_from = None
+        self.visible_price_to = None
+        self.measurement_state = None
+        self.indicators_state = {}
+
+        self.state_manager = state_manager or StateManager()
+        self.settings = self.state_manager.get_app_settings()
+        self.market_repo = MarketDataRepository()
+        self._is_loading_data = False
+        self.df_data = None
+
+        # Generische Indikator-Registry: indicator_id -> BaseIndicator
+        self.indicators: Dict[str, BaseIndicator] = {
+            "grid": GridIndicator(),
+        }
+        self._settings_dialog: Optional[QDialog] = None
+        self._page_loaded: bool = False
+
+        self.signal_overlay = SignalOverlay()
+        # Signal-Marker standardmaessig AUS, toggle via Button (📈)
+        self._signals_enabled: bool = False
+        self._grid_serializer: Optional[GridDataSerializer] = None
+        self._chart_serializer: Optional[ChartDataSerializer] = None
+        # Debounce-Timer für Chart-Refresh (verhindert Race-Conditions bei schnellen Wechseln)
+        self._debounce_timer: QTimer = QTimer(self)
+        self._debounce_timer.setSingleShot(True)
+        self._debounce_timer.setInterval(400)
+        self._debounce_timer.timeout.connect(self._safe_refresh_chart_data)
+        # Watchdog: setzt _is_loading_data automatisch zurueck, falls ein Refresh haengt
+        # (verhindert dauerhafte Blockade von TF-/Symbol-Wechsel)
+        self._loading_watchdog: QTimer = QTimer(self)
+        self._loading_watchdog.setSingleShot(True)
+        self._loading_watchdog.setInterval(15000)
+        self._loading_watchdog.timeout.connect(self._on_loading_watchdog)
+        # Mapping: kontinuierliche Zeit -> originale epoch (für JS tickMarkFormatter)
+        self._time_cont_to_real: Dict[int, int] = {}
+        self._time_real_to_cont: Dict[int, int] = {}
+        # Generations-Guard: monoton steigende Update-IDs für Chart- und Grid-Refresh.
+        # Veraltete Serializer-Ergebnisse (langsamer Thread aus einem frueheren
+        # Symbol/TF-Stand) werden in _apply_chart_update/_apply_grid_render verworfen.
+        self._update_generation: int = 0
+        self._grid_generation: int = 0
+
+                # 1. ZUERST versuchen, spezifischen Instanz-Status aus der DB zu laden
+        saved_inst_st = self.state_manager.load_all_instances()
+        matched_inst = next((i for i in saved_inst_st if i.get("instance_id") == self.instance_id), None)
+
+        if matched_inst:
+            raw_symbol = matched_inst.get("symbol")
+            raw_tf = matched_inst.get("timeframe")
+            self.current_symbol = str(raw_symbol) if raw_symbol is not None else self.current_symbol
+            self.current_tf = str(raw_tf) if raw_tf is not None else self.current_tf
+            if self.visible_from is None:
+                self.visible_from = matched_inst.get("visible_range_from")
+                self.visible_to = matched_inst.get("visible_range_to")
+            self.visible_price_from = matched_inst.get("visible_price_from")
+            self.visible_price_to = matched_inst.get("visible_price_to")
+
+            ind_st = matched_inst.get("indicators_state")
+            if ind_st is not None and not isinstance(ind_st, (int, float)):
+                self.indicators_state = _parse_json_field(ind_st) or {}
+
+        # 2. FALLBACK: Wenn keine Instanz da ist (z. B. neues manuelles Fenster), lade zuletzt gespeicherte Symbol:TF Combo
+        if not isinstance(self.indicators_state, dict) or not self.indicators_state or self.visible_from is None:
+            if not isinstance(self.indicators_state, dict):
+                self.indicators_state = {}
+            pair_st = self.state_manager.get_symbol_tf_state(self.current_symbol, self.current_tf)
+            if pair_st:
+                if self.visible_from is None:
+                    self.visible_from = pair_st.get("visible_range_from")
+                    self.visible_to = pair_st.get("visible_range_to")
+                if self.visible_price_from is None:
+                    self.visible_price_from = pair_st.get("visible_price_from")
+                    self.visible_price_to = pair_st.get("visible_price_to")
+                if pair_st.get("indicators_state") and not self.indicators_state:
+                    ind_st_pair = pair_st.get("indicators_state")
+                    if ind_st_pair is not None and not isinstance(ind_st_pair, (int, float)):
+                        self.indicators_state = _parse_json_field(ind_st_pair) or {}
+
+        # Sicherstellen, dass indicators_state ein dict ist
+        if not isinstance(self.indicators_state, dict):
+            self.indicators_state = {}
+
+        # Standard-Indikator-Setups ergänzen falls unvollständig
+        for ind_id, ind_plugin in self.indicators.items():
+            if ind_id not in self.indicators_state:
+                self.indicators_state[ind_id] = {
+                    "active": False,
+                    "preset": "Default",
+                    "params": dict(ind_plugin.default_params)
+                }
+            else:
+                # Fehlende Default-Parameter nachtragen (z. B. neue Farb-Parameter)
+                existing_params = self.indicators_state[ind_id].get("params", {})
+                merged = dict(ind_plugin.default_params)
+                merged.update(existing_params)
+                self.indicators_state[ind_id]["params"] = merged
+
+        # UI Laden aus .ui
+        base_dir = Path(__file__).resolve().parent.parent
+        ui_file = QFile(str(base_dir / "ui" / "chart_win.ui"))
+        if ui_file.open(QIODevice.ReadOnly):
+            loader = QUiLoader()
+            self.ui_widget = loader.load(ui_file)
+            ui_file.close()
+            self.setCentralWidget(self.ui_widget)
+        else:
+            self.ui_widget = QWidget(self)
+            self.setCentralWidget(self.ui_widget)
+
+        self.setWindowTitle(f"PyTrader Chart - {self.current_symbol} [{self.current_tf}] ({self.instance_id})")
+        self.resize(1000, 700)
+
+        self.symbol_combo = self.ui_widget.findChild(QComboBox, "combo_symbol")
+        self.tf_combo = self.ui_widget.findChild(QComboBox, "combo_tf")
+        self.btn_reset = self.ui_widget.findChild(QPushButton, "btn_reset_chart")
+        self.btn_indicator = self.ui_widget.findChild(QPushButton, "btn_indicator_grid")
+        self.btn_signal = self.ui_widget.findChild(QPushButton, "btn_signal_select")
+        self.chart_container = self.ui_widget.findChild(QWidget, "web_container")
+
+        if self.symbol_combo:
+            self.symbol_combo.setCurrentText(str(self.current_symbol) if self.current_symbol is not None else "SILVER")
+            self.symbol_combo.currentTextChanged.connect(self.on_symbol_changed)
+        if self.tf_combo:
+            self.tf_combo.setCurrentText(str(self.current_tf) if self.current_tf is not None else "H1")
+            self.tf_combo.currentTextChanged.connect(self.on_tf_changed)
+        if self.btn_reset:
+            self.btn_reset.clicked.connect(self.fit_chart)
+        if self.btn_indicator:
+            self.btn_indicator.setCheckable(True)
+            self.btn_indicator.clicked.connect(self.toggle_grid_lines)
+            self.btn_indicator.installEventFilter(self)
+            self.update_indicator_button_style()
+
+        if self.btn_signal:
+            self.btn_signal.setCheckable(True)
+            self.btn_signal.clicked.connect(self.on_signal_button_clicked)
+
+        self.web_view = QWebEngineView()
+        self.web_view.setPage(WebEngineConsolePage(self.web_view))
+        self.web_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        target = self.chart_container if self.chart_container else self.ui_widget
+        layout = target.layout()
+        if layout is None:
+            layout = QVBoxLayout(target)
+            layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.web_view, 1)
+
+        self.bridge = ChartBridge()
+        self.bridge.rangeChanged.connect(self.handle_range_changed)
+        self.bridge.priceRangeChanged.connect(self.handle_price_range_changed)
+        self.bridge.measurementChanged.connect(self.handle_measurement_changed)
+        self.channel = QWebChannel()
+        self.channel.registerObject("pyBridge", self.bridge)
+        self.web_view.page().setWebChannel(self.channel)
+        self.web_view.setHtml(HTML_TEMPLATE, QUrl("https://localhost"))
+        self.web_view.loadFinished.connect(self._on_page_loaded)
+
+    def _auto_init_signal_set(self) -> None:
+        """Nicht mehr verwendet - Testsignal ist deaktiviert."""
+        pass
+
+    def eventFilter(self, watched, event):
+        if self.btn_indicator is not None and watched == self.btn_indicator and event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton:
+            # Wenn Dialog offen, schliessen; sonst öffnen
+            if self._settings_dialog is not None and self._settings_dialog.isVisible():
+                self._settings_dialog.close()
+                self._settings_dialog = None
+            else:
+                self._open_indicator_settings("grid")
+            return True
+        return super().eventFilter(watched, event)
+
+    def _get_indicator_plugin(self, ind_id: str) -> Optional[BaseIndicator]:
+        """Gibt die Indikator-Instanz zur ID zurück (oder None)."""
+        return self.indicators.get(ind_id)
+
+    def update_indicator_button_style(self):
+        if not self.btn_indicator: return
+        is_active = self.indicators_state.get("grid", {}).get("active", False)
+        color = "#2e7d32" if is_active else "#37474f"
+        self.btn_indicator.setStyleSheet(
+            f"background-color: {color}; color: white; font-weight: bold; border-radius: 4px; padding: 3px 10px;")
+
+    def toggle_grid_lines(self):
+        self._toggle_indicator("grid")
+
+    def _toggle_indicator(self, ind_id: str) -> None:
+        """Schaltet einen Indikator an/aus."""
+        plugin = self._get_indicator_plugin(ind_id)
+        if plugin is None:
+            return
+        st = self.indicators_state.setdefault(ind_id, {
+            "active": False, "preset": "Default", "params": dict(plugin.default_params)
+        })
+        st["active"] = not st["active"]
+        self.update_indicator_button_style()
+        self.save_state()
+        self.render_indicators()
+
+    def _open_indicator_settings(self, ind_id: str) -> None:
+        """Öffnet den Einstellungs-Dialog für einen Indikator."""
+        plugin = self._get_indicator_plugin(ind_id)
+        if plugin is None:
+            return
+        st = self.indicators_state.setdefault(ind_id, {
+            "active": False, "preset": "Default", "params": dict(plugin.default_params)
+        })
+        dialog = IndicatorSettingsDialog(plugin, st["params"], st["preset"], self.state_manager,
+                                         lambda p, pr: self._on_indicator_params_updated(ind_id, p, pr), self)
+        self._settings_dialog = dialog
+        dialog.finished.connect(lambda: self._on_settings_closed(dialog))
+        dialog.show()
+
+    def _on_settings_closed(self, dialog):
+        if self._settings_dialog is dialog:
+            self._settings_dialog = None
+
+    def _on_page_loaded(self, ok: bool) -> None:
+        if ok:
+            self._page_loaded = True
+            # Initialer Refresh direkt (ohne Debounce), danach nur noch via Debounce
+            self._safe_refresh_chart_data()
+
+    def _safe_refresh_chart_data(self) -> None:
+        """Startet den Chart-Refresh mit Fehler-Schutz.
+        Stellt sicher, dass _is_loading_data bei einem Fehler zurueckgesetzt wird –
+        sonst bleibt der Chart dauerhaft blockiert (keine Charts, TF/Symbol-Wechsel tot)."""
+        try:
+            self._do_refresh_chart_data()
+        except Exception as e:
+            print(f"❌ [ChartRefresh] Fehler: {e}")
+            self._set_loading(False)
+
+    def _set_loading(self, loading: bool) -> None:
+        """Setzt _is_loading_data und startet/stoppt den Watchdog konsistent."""
+        self._is_loading_data = loading
+        if loading:
+            self._loading_watchdog.start()
+        else:
+            self._loading_watchdog.stop()
+
+    def _on_loading_watchdog(self) -> None:
+        """Watchdog-Timeout: Ein Chart-Refresh haengt zu lange (z. B. durch Fehler).
+        Setzt das Flag zurueck, damit TF-/Symbol-Wechsel wieder funktionieren."""
+        print(f"⚠️ [ChartRefresh] Watchdog: Refresh haengt ({self.current_symbol} {self.current_tf}), setze zurueck")
+        self._is_loading_data = False
+
+    def _on_indicator_params_updated(self, ind_id: str, params: Dict[str, Any], preset: str) -> None:
+        """Callback wenn ein Indikator-Parameter geändert wurde."""
+        self.indicators_state[ind_id] = {"active": True, "preset": preset, "params": params}
+        self.save_state()
+        self.render_indicators()
+
+    def render_indicators(self):
+        """Rendert alle aktiven Indikatoren via JS-Bridge."""
+        if self.df_data is None or self.df_data.empty:
+            return
+
+        # Zuerst alle Indikator-Layer clearen
+        try:
+            self.web_view.page().runJavaScript("if(window.clearGridLines) clearGridLines();")
+            self.web_view.page().runJavaScript("if(window.clearGridCircles) clearGridCircles();")
+        except (RuntimeError, AttributeError):
+            pass
+
+        for ind_id, plugin in self.indicators.items():
+            st = self.indicators_state.get(ind_id, {})
+            if not st.get("active"):
+                continue
+            try:
+                # Kontext setzen (Symbol/TF fuer DB-basierte Indikatoren)
+                if hasattr(plugin, "set_context"):
+                    plugin.set_context(self.current_symbol, self.current_tf)
+                res = plugin.calculate(self.df_data, st.get("params", {}))
+                # Grid-spezifische Render-Logik (aktuell der einzige Indikator)
+                if ind_id == "grid":
+                    lines = res.get("lines", [])
+                    circles = res.get("hit_circles", [])
+                    # Circle-Zeiten auf kontinuierlich mappen
+                    if circles and self._time_real_to_cont:
+                        for gc in circles:
+                            gc_t = gc.get("time")
+                            if gc_t is not None and int(gc_t) in self._time_real_to_cont:
+                                gc["time"] = self._time_real_to_cont[int(gc_t)]
+                    # JSON-Encoding im Hintergrund
+                    self._serialize_and_render_grid(lines, circles)
+            except (RuntimeError, AttributeError):
+                pass
+
+    def _serialize_and_render_grid(self, lines: list, circles: list) -> None:
+        """Serialisiert Grid-Daten im Hintergrund-Thread und rendert sie.
+        Alter Thread wird vor Neustart sauber beendet.
+        Generations-Guard: jede Render-Anforderung bekommt eine steigende ID;
+        veraltete Ergebnisse (langsamer Thread) werden verworfen."""
+        # Alten Serializer cleanen falls noch aktiv
+        if self._grid_serializer is not None:
+            try:
+                self._grid_serializer.done.disconnect(self._apply_grid_render)
+            except (RuntimeError, TypeError):
+                pass
+            if self._grid_serializer.isRunning():
+                self._grid_serializer.quit()
+                self._grid_serializer.wait(500)
+            self._grid_serializer = None
+
+        self._grid_generation += 1
+        grid_gen = self._grid_generation
+        self._grid_serializer = GridDataSerializer(lines, circles, grid_gen)
+        self._grid_serializer.done.connect(self._apply_grid_render)
+        self._grid_serializer.start()
+
+    def _apply_grid_render(self, lines_json: str, circles_json: str, grid_gen: int) -> None:
+        """Übergibt serialisierte Grid-Daten an JS (wird im GUI-Thread aufgerufen).
+        Verwirft veraltete Ergebnisse, falls inzwischen ein neuerer Render lief.
+        Nach dem Grid-Render werden die Signal-Marker IMMER neu gesetzt –
+        so können aktive Signale (EMA, Grid-Proximity) durch den Grid-Render
+        nie verdrängt werden (Marker-Cache-Robustheit)."""
+        if grid_gen < self._grid_generation:
+            print(f"⚠️ [GridRender] Veraltetes Ergebnis verworfen (gen={grid_gen} < {self._grid_generation})")
+            return
+        if not lines_json and not circles_json:
+            return
+        try:
+            if lines_json:
+                self.web_view.page().runJavaScript(
+                    f"if(window.renderGridLines) renderGridLines('{lines_json}');")
+            if circles_json:
+                self.web_view.page().runJavaScript(
+                    f"if(window.renderGridCircles) renderGridCircles('{circles_json}');")
+            # Signale nach dem Grid-Render wiederherstellen (falls aktiv).
+            # Guard in _update_signal_markers_only verhindert Arbeit während
+            # eines laufenden Chart-Refreshes.
+            try:
+                self._update_signal_markers_only()
+            except Exception as e:
+                print(f"⚠️ [GridRender] Signal-Marker-Update fehlgeschlagen: {e}")
+        except (RuntimeError, AttributeError):
+            pass
+
+    def refresh_chart_data(self) -> None:
+        """Debounced: Startet Chart-Refresh mit 400ms Verzögerung.
+        Bei schnellen Mehrfach-Aufrufen wird nur der letzte ausgeführt."""
+        if not self._page_loaded:
+            QTimer.singleShot(200, self.refresh_chart_data)
+            return
+        self._debounce_timer.start()
+
+    def _do_refresh_chart_data(self) -> None:
+        """Führt den tatsächlichen Chart-Refresh aus (nur via Debounce-Timer)."""
+        if self._is_loading_data:
+            self._debounce_timer.start()
+            return
+
+        self._set_loading(True)
+
+        print(f"📊 Lade Chart-Daten: {self.current_symbol} {self.current_tf}")
+        candles, precision = self.market_repo.fetch_historical_candles(self.current_symbol, self.current_tf, limit=self.settings.chart_candle_limit)
+        print(f"   → {len(candles)} Candles geladen, precision={precision}")
+
+        # NaN-Werte aus den Candles entfernen
+        clean_candles = []
+        if candles:
+            import math
+            for c in candles:
+                if (c.get("time") is not None and
+                    c.get("open") is not None and
+                    c.get("high") is not None and
+                    c.get("low") is not None and
+                    c.get("close") is not None):
+                    if (not math.isnan(c["open"]) and
+                        not math.isnan(c["high"]) and
+                        not math.isnan(c["low"]) and
+                        not math.isnan(c["close"])):
+                        clean_candles.append(c)
+
+            # ======================================================================
+            # Kontinuierliche Candle-Zeiten (keinerlei Lücken/Whitespace im Chart)
+            # Jede Candle bekommt: base_time + i * tf_sec
+            # Mapping cont -> real für JS tickMarkFormatter.
+            # ======================================================================
+            t_sec = TF_SECONDS_MAP.get(str(self.current_tf).upper(), 60)
+            self._time_cont_to_real = {}
+            self._time_real_to_cont = {}
+            continuous_candles = []
+            if clean_candles:
+                base_time = clean_candles[0]["time"]
+                for i, c in enumerate(clean_candles):
+                    cont_time = base_time + i * t_sec
+                    real_time = int(c["time"])
+                    self._time_cont_to_real[cont_time] = real_time
+                    self._time_real_to_cont[real_time] = cont_time
+                    dc = dict(c)
+                    dc["time"] = cont_time
+                    continuous_candles.append(dc)
+
+            import pandas as pd
+            self.df_data = pd.DataFrame(clean_candles)
+        else:
+            self.df_data = None
+            continuous_candles = []
+
+        grid_lines = []
+        grid_circles = []
+
+        if self.df_data is not None and not self.df_data.empty:
+            for ind_id, plugin in self.indicators.items():
+                st = self.indicators_state.get(ind_id, {})
+                if st.get("active") and ind_id == "grid":
+                    if hasattr(plugin, "set_context"):
+                        plugin.set_context(self.current_symbol, self.current_tf)
+                    res = plugin.calculate(self.df_data, st.get("params", {}))
+                    grid_lines = res.get("lines", [])
+                    grid_circles = res.get("hit_circles", [])
+                    # Circle-Zeiten auf kontinuierlich mappen
+                    if grid_circles and self._time_real_to_cont:
+                        for gc in grid_circles:
+                            gc_t = gc.get("time")
+                            if gc_t is not None and int(gc_t) in self._time_real_to_cont:
+                                gc["time"] = self._time_real_to_cont[int(gc_t)]
+
+        update_package = {
+            "symbol": self.current_symbol,
+            "timeframe": self.current_tf,
+            "candles": continuous_candles,
+            "precision": precision,
+            "gridLines": grid_lines,
+            "gridCircles": grid_circles,
+            "signalMarkers": self._get_signal_markers_for_update(),
+            "timeMap": self._time_cont_to_real,
+            # TF_SECONDS_MAP: Python ist die Single Source of Truth. JS nutzt
+            # diesen Payload, statt sich auf seine eingebettete Offline-Map zu
+            # verlassen (kein Duplikat-Pflege-Problem mehr).
+            "tfSecondsMap": TF_SECONDS_MAP,
+        }
+
+        # Generations-Guard: monotone Update-ID für Race-Schutz im JS.
+        # WICHTIG: Wird VOR dem Serializer-Start inkrementiert, damit jeder
+        # Refresh eine eindeutig hoehere ID als der vorherige erhaelt.
+        self._update_generation += 1
+        update_id = self._update_generation
+        update_package["updateId"] = update_id
+
+        # Nur hinzufügen, wenn echte Werte da sind – nie null/0 übergeben (sonst "Value is null" in JS)
+        if self.visible_from is not None and self.visible_to is not None:
+            update_package["rangeFrom"] = int(self.visible_from)
+            update_package["rangeTo"] = int(self.visible_to)
+
+        if self.visible_price_from is not None and self.visible_price_to is not None:
+            update_package["priceFrom"] = float(self.visible_price_from)
+            update_package["priceTo"] = float(self.visible_price_to)
+
+        # NaN/Inf-Werte aus dem gesamten Payload entfernen (sonst JSON-Fehler im Serializer)
+        update_package = _clean_nan(update_package)
+
+        # JSON-Encoding im Hintergrund-Thread, um GUI-Ruckler zu vermeiden
+        # Alten Serializer cleanen falls noch aktiv
+        if self._chart_serializer is not None:
+            try:
+                self._chart_serializer.serialized.disconnect(self._apply_chart_update)
+            except (RuntimeError, TypeError):
+                pass
+            if self._chart_serializer.isRunning():
+                self._chart_serializer.quit()
+                self._chart_serializer.wait(500)
+            self._chart_serializer = None
+
+        self._chart_serializer = ChartDataSerializer(update_package, update_id)
+        self._chart_serializer.serialized.connect(self._apply_chart_update)
+        self._chart_serializer.start()
+
+    def _apply_chart_update(self, payload: str, update_id: int) -> None:
+        """Empfängt fertiges JSON aus dem Serializer-Thread und prüft es auf nulls.
+        Generations-Guard: veraltete Payloads (langsamer Thread aus einem
+        frueheren Symbol/TF-Stand) werden verworfen, bevor sie JS erreichen."""
+        # Veraltetes Update verwerfen – ein neuerer Refresh hat bereits begonnen
+        if update_id < self._update_generation:
+            print(f"⚠️ [ChartUpdate] Veraltetes Update verworfen (id={update_id} < {self._update_generation})")
+            return
+        if not payload:
+            self._set_loading(False)
+            return
+
+        # ======================================================================
+        # DEBUG-CHECK: Identifiziert das exakte null-Objekt in Python!
+        # ======================================================================
+        try:
+            import json as _json
+            data = _json.loads(payload)
+            null_paths = find_null_fields(data)
+            if null_paths:
+                print(f"🚨 [NULL DETECTED in {self.current_symbol} {self.current_tf}] Gefundene null-Pfade:")
+                for p in null_paths[:15]:  # Zeige die ersten 15 Treffer
+                    print(f"   -> {p}")
+        except Exception as debug_err:
+            print(f"⚠️ [NullCheck] Fehler: {debug_err}")
+        # ======================================================================
+
+        try:
+            if hasattr(self, "web_view") and self.web_view and self.web_view.page():
+                self.web_view.page().runJavaScript(
+                    f"if(window.applyFullChartUpdate) applyFullChartUpdate({payload});"
+                )
+        except (RuntimeError, AttributeError):
+            pass
+        finally:
+            QTimer.singleShot(500, self._unlock_tracking)
+
+    def _unlock_tracking(self):
+        try:
+            self._set_loading(False)
+            self.update_indicator_button_style()
+        except (RuntimeError, AttributeError):
+            pass
+
+    def update_live_candle(self, c: Dict[str, Any]) -> None:
+        if not c or self._is_loading_data: return
+        t_sec = TF_SECONDS_MAP.get(str(self.current_tf).upper(), 60)
+
+        # Sichere Typprüfung für das time-Feld
+        time_val = c.get("time", 0)
+        if isinstance(time_val, datetime):
+            raw_t = int(time_val.timestamp())
+        elif isinstance(time_val, (int, float)):
+            raw_t = int(time_val)
+        else:
+            raw_t = 0
+
+        c_copy = dict(c)
+        # Symbol/TF mitliefern – der JS-Guard in updateLiveCandle() verwirft
+        # verspaetete Ticks, die nach einem schnellen Symbol/TF-Wechsel eintreffen.
+        c_copy["symbol"] = self.current_symbol
+        c_copy["timeframe"] = self.current_tf
+        rounded_t = raw_t - (raw_t % t_sec)
+
+        # Auf kontinuierliche Zeit mappen (kein Leerraum im Chart)
+        if rounded_t in self._time_real_to_cont:
+            c_copy["time"] = self._time_real_to_cont[rounded_t]
+        elif self._time_cont_to_real:
+            # Neue Candle: an letzte kont. Zeit anhängen
+            last_cont = max(self._time_cont_to_real.keys())
+            c_copy["time"] = last_cont + t_sec
+            self._time_cont_to_real[c_copy["time"]] = rounded_t
+            self._time_real_to_cont[rounded_t] = c_copy["time"]
+        else:
+            c_copy["time"] = rounded_t
+
+        try:
+            self.web_view.page().runJavaScript(f"if(window.updateLiveCandle) updateLiveCandle('{json.dumps(c_copy, allow_nan=False)}');")
+        except (ValueError, TypeError) as e:
+            print(f"⚠️ [JSON] NaN in Live-Candle: {e}")
+        except (RuntimeError, AttributeError):
+            pass
+
+    def on_symbol_changed(self, s):
+        if s and s != self.current_symbol:
+            self.save_state()
+            self.current_symbol = s
+            self.df_data = None
+            pair_st = self.state_manager.get_symbol_tf_state(self.current_symbol, self.current_tf)
+            if pair_st:
+                self.visible_from = pair_st.get("visible_range_from")
+                self.visible_to = pair_st.get("visible_range_to")
+                self.visible_price_from = pair_st.get("visible_price_from")
+                self.visible_price_to = pair_st.get("visible_price_to")
+                if pair_st.get("indicators_state"):
+                    ind_st = pair_st.get("indicators_state")
+                    loaded_ind = _parse_json_field(ind_st) or {}
+                    # Merge statt ersetzen, damit Grid-Fallback erhalten bleibt
+                    self.indicators_state.update(loaded_ind)
+                    # Fehlende Default-Parameter nachtragen
+                    for ind_id, ind_plugin in self.indicators.items():
+                        if ind_id in self.indicators_state:
+                            existing = self.indicators_state[ind_id].get("params", {})
+                            merged = dict(ind_plugin.default_params)
+                            merged.update(existing)
+                            self.indicators_state[ind_id]["params"] = merged
+            else:
+                self.visible_from = self.visible_to = None
+                self.visible_price_from = self.visible_price_to = None
+
+            # Chart-Trigger: Luecken fuer live_op=True Signale fuellen
+            fill_gaps_for_pair(self.current_symbol, self.current_tf, self.settings.feature_builder_limit)
+            self.refresh_chart_data()
+
+    def on_tf_changed(self, t):
+        if t and t != self.current_tf:
+            self.save_state()
+            self.current_tf = t
+            self.df_data = None
+            pair_st = self.state_manager.get_symbol_tf_state(self.current_symbol, self.current_tf)
+            if pair_st:
+                self.visible_from = pair_st.get("visible_range_from")
+                self.visible_to = pair_st.get("visible_range_to")
+                self.visible_price_from = pair_st.get("visible_price_from")
+                self.visible_price_to = pair_st.get("visible_price_to")
+                if pair_st.get("indicators_state"):
+                    ind_st = pair_st.get("indicators_state")
+                    loaded_ind = _parse_json_field(ind_st) or {}
+                    # Merge statt ersetzen, damit Grid-Fallback erhalten bleibt
+                    self.indicators_state.update(loaded_ind)
+                    # Fehlende Default-Parameter nachtragen
+                    for ind_id, ind_plugin in self.indicators.items():
+                        if ind_id in self.indicators_state:
+                            existing = self.indicators_state[ind_id].get("params", {})
+                            merged = dict(ind_plugin.default_params)
+                            merged.update(existing)
+                            self.indicators_state[ind_id]["params"] = merged
+            else:
+                self.visible_from = self.visible_to = None
+                self.visible_price_from = self.visible_price_to = None
+
+            # Chart-Trigger: Luecken fuer live_op=True Signale fuellen
+            fill_gaps_for_pair(self.current_symbol, self.current_tf, self.settings.feature_builder_limit)
+            self.refresh_chart_data()
+
+    def on_signal_button_clicked(self):
+        """Schaltet ALLE Signal-Marker an/aus (Grid Proximity + EMA-Signale).
+        Testsignale (alternating_arrow_v1) bleiben deaktiviert.
+        Aktualisiert NUR die Signal-Marker, ohne Chart-Neubau."""
+        if not self.btn_signal:
+            return
+
+        self._signals_enabled = self.btn_signal.isChecked()
+        status = "AN" if self._signals_enabled else "AUS"
+        print(f"🔔 Signale: {status}")
+        self._update_signal_markers_only()
+
+    def _update_signal_markers_only(self) -> None:
+        """Aktualisiert NUR die Signal-Marker im Chart, OHNE kompletten Chart-Neubau.
+
+        HINWEIS: Bewusst KEIN _is_loading_data-Guard mehr. Der Grid-Render
+        (_apply_grid_render) ruft diese Funktion direkt nach dem Grid-Render
+        auf – waehrend eines laufenden Chart-Refreshes wuerde der Guard das
+        Signal-Update blockieren und die EMA-Marker waeren weg (Bug).
+        Die JS-seitige Marker-Kombination (Caches + _applyAllMarkers) ist
+        race-sicher, weil alle JS-Aufrufe sequenziell im Page-Thread laufen.
+        """
+        if not self._page_loaded or self.df_data is None or self.df_data.empty:
+            return
+
+        markers = self._get_signal_markers_for_update()
+        markers_json = json.dumps(markers, allow_nan=False)
+
+        # ======================================================================
+        # DEBUG-CHECK für Marker-Updates
+        # ======================================================================
+        try:
+            null_paths = find_null_fields(markers)
+            if null_paths:
+                print(f"🚨 [NULL MARKER in {self.current_symbol} {self.current_tf}] Gefundene null-Pfade:")
+                for p in null_paths[:10]:
+                    print(f"   -> markers{p}")
+        except Exception:
+            pass
+        # ======================================================================
+
+        try:
+            self.web_view.page().runJavaScript(
+                f"if(window.renderSignalMarkers) renderSignalMarkers({markers_json});"
+            )
+        except (RuntimeError, AttributeError) as e:
+            print(f"⚠️ [SignalMarker] JS-Fehler: {e}")
+
+    # ==============================================================================
+    # Live-Signal Integration (wird von MainWindow.on_live_signal gerufen)
+    # ==============================================================================
+
+    def on_live_signal_received(self, symbol: str, timeframe: str, bar_time: int, confidence: float, source_id: str) -> None:
+        """Wird vom MainWindow bei neuem Live-Signal gerufen.
+        Aktualisiert NUR die Marker, kein Chart-Neubau.
+        Blockiert waerend _is_loading_data (verhindert JS-Race-Condition)."""
+        if symbol != self.current_symbol or timeframe != self.current_tf:
+            return
+        if self._is_loading_data or not self._page_loaded:
+            return
+        self._update_signal_markers_only()
+
+    @staticmethod
+    def _apply_marker_styles(markers: List[Dict[str, Any]], source_id: str) -> List[Dict[str, Any]]:
+        """Wendet visuelle Stile auf Marker basierend auf source_id an.
+        Ermoeglicht Unterscheidung verschiedener Signal-Typen im Chart.
+        priority (int): Stapel-Reihenfolge bei gleicher Kerze in JS
+        (niedriger = näher an der Kerze, höher = weiter oben)."""
+        for m in markers:
+            if source_id == "alternating_arrow_v1":
+                # Alternierende Pfeile: Buy=arrowUp (oben), Sell=arrowDown (unten)
+                if m["time"] % 2 == 0:
+                    m["position"] = "belowBar"
+                    m["shape"] = "arrowUp"
+                    m["color"] = "#26a69a"  # Gruen
+                else:
+                    m["position"] = "aboveBar"
+                    m["shape"] = "arrowDown"
+                    m["color"] = "#ef5350"  # Rot
+                m["priority"] = 5
+            elif source_id == "grid_proximity_v1":
+                # Grid-Proximity: Kreise oberhalb
+                m["position"] = "aboveBar"
+                m["shape"] = "circle"
+                m["color"] = "#7B1FA2"  # Lila
+                m["priority"] = 10
+            elif source_id == "ema_atr_set_v1":
+                # EMA/ATR: Quadrate oberhalb
+                m["position"] = "aboveBar"
+                m["shape"] = "square"
+                m["color"] = "#FF9800"  # Orange
+                m["priority"] = 4
+            # Fuer neue Signalquellen hier einen eigenen Zweig ergaenzen.
+            # Ohne priority-Zweig gilt der JS-Default (0 = nahe an der Kerze).
+        return markers
+
+    def _get_signal_markers_for_update(self) -> List[Dict[str, Any]]:
+        """Sammelt alle Signal-Marker fuer den Chart-Update-Payload.
+        - Testsignal (alternating_arrow_v1): DEAKTIVIERT
+        - Grid Proximity (grid_proximity_v1): nur wenn Signal-Button aktiv
+        - EMA-Signale (ema_atr_set_v1): nur wenn Signal-Button aktiv
+        Marker-Zeiten werden auf Candle-Grenzen gerundet (exakter Match mit candleSeries in LWC v5)."""
+        if self.df_data is None or self.df_data.empty:
+            return []
+
+        t_sec = TF_SECONDS_MAP.get(str(self.current_tf).upper(), 60)
+
+        # 1) Testsignal (alternating_arrow_v1) DEAKTIVIERT – keine automatischen Test-Signale
+        markers: List[Dict[str, Any]] = []
+
+        # 2) Grid Proximity + EMA-Signale NUR wenn der Signal-Button aktiv ist
+        if self._signals_enabled:
+            grid_markers = self._apply_marker_styles(
+                self.signal_overlay.fetch_markers(
+                    self.current_symbol, self.current_tf, "grid_proximity_v1"
+                ),
+                "grid_proximity_v1"
+            )
+            markers.extend(grid_markers)
+
+            ema_markers = self._apply_marker_styles(
+                self.signal_overlay.fetch_markers(
+                    self.current_symbol, self.current_tf, "ema_atr_set_v1"
+                ),
+                "ema_atr_set_v1"
+            )
+            markers.extend(ema_markers)
+
+        # Marker-Zeiten auf Candle-Grenzen runden + auf kontinuierliche Zeit mappen
+        if markers:
+            clean_markers = []
+            for m in markers:
+                mt = m.get("time")
+                if mt is None:
+                    continue
+                # Auf Candle-Timeframe-Grenze runden (z.B. H1: 3600er-Schritte)
+                rounded = int(mt) - (int(mt) % t_sec)
+                # Nur behalten + auf kontinuierliche Zeit mappen
+                if rounded in self._time_real_to_cont:
+                    m["time"] = self._time_real_to_cont[rounded]
+                    clean_markers.append(m)
+            markers = clean_markers
+            if markers:
+                print(f"   → Marker: {len(markers)} (kont. zeit, z.B. {markers[0]['time']})")
+            else:
+                print(f"   → KEINE Marker nach Filter! real_times samples={list(self._time_real_to_cont.keys())[:3]}")
+
+        return markers
+
+    def fit_chart(self):
+        try:
+            self.visible_from = self.visible_to = None
+            self.visible_price_from = self.visible_price_to = None
+            self.save_state()
+            self.web_view.page().runJavaScript("if(window.fitChartContent) fitChartContent();")
+        except (RuntimeError, AttributeError):
+            pass
+
+    def handle_range_changed(self, f, t):
+        if not self._is_loading_data:
+            self.visible_from, self.visible_to = f, t
+            self.save_state()
+
+    def handle_price_range_changed(self, f, t):
+        if not self._is_loading_data:
+            self.visible_price_from, self.visible_price_to = f, t
+            self.save_state()
+
+    def handle_measurement_changed(self, m):
+        if not self._is_loading_data:
+            self.measurement_state = json.loads(m) if m else None
+            self.save_state()
+
+    def save_state(self):
+        if not self.state_manager or self._is_loading_data: return
+        self.state_manager.save_instance_state(self.instance_id, self.current_symbol, self.current_tf,
+                                               self.visible_from, self.visible_to, self.visible_price_from,
+                                               self.visible_price_to, self.indicators_state, self.measurement_state)
+        self.state_manager.save_symbol_tf_state(self.current_symbol, self.current_tf, self.visible_from,
+                                                self.visible_to, self.visible_price_from, self.visible_price_to,
+                                                self.indicators_state, self.measurement_state)
+        p, s = self.pos(), self.size()
+        self.state_manager.save_window_geometry(self.instance_id, p.x(), p.y(), s.width(), s.height(),
+                                                self.isMaximized())
+
+    def closeEvent(self, event):
+        self.save_state()
+        if self.state_manager:
+            app = QApplication.instance()
+            if not getattr(app, "_is_quitting", False) and self.instance_id != "win_main":
+                self.state_manager.delete_instance(self.instance_id)
+        self.closed_signal.emit(self.instance_id)
+        event.accept()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = PyTraderChartWindow()
+    window.show()
+    sys.exit(app.exec())
+```
+
+--------------------------------------------------
+
+### DATEI: chart/indicator_dialog.py
+```py
+"""
+chart/indicator_dialog.py - Dynamic Universal Settings Dialog with Inline Layout Support & Strict Type Validation
+"""
+
+from typing import Any, Dict, Callable, List
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+	QCheckBox,
+	QComboBox,
+	QDialog,
+	QDoubleSpinBox,
+	QFormLayout,
+	QHBoxLayout,
+	QInputDialog,
+	QLabel,
+	QLineEdit,
+	QMessageBox,
+	QPushButton,
+	QSpinBox,
+	QWidget,
+	QVBoxLayout,
+)
+
+from chart.indicators.base_indicator import BaseIndicator
+from state_manager import StateManager
+
+
+class IndicatorSettingsDialog(QDialog):
+
+	def __init__(
+		self,
+		indicator: BaseIndicator,
+		current_params: Dict[str, Any],
+		current_preset_name: str,
+		state_manager: StateManager,
+		on_params_changed_callback: Callable[[Dict[str, Any], str], None],
+		parent=None
+	) -> None:
+		super().__init__(parent)
+
+		self.indicator = indicator
+		self.params = dict(current_params)
+		self.current_preset_name = current_preset_name
+		self.state_manager = state_manager
+		self.on_params_changed_callback = on_params_changed_callback
+
+		self.setWindowTitle(f"Einstellungen - {self.indicator.display_name}")
+		self.setMinimumWidth(440)
+		self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+
+		self.param_controls: Dict[str, QWidget] = {}
+		self.init_ui()
+
+	def create_control_widget(self, key: str, val: Any) -> QWidget:
+		if key in self.indicator.param_options:
+			combo = QComboBox()
+			options = [str(opt) for opt in self.indicator.param_options[key]]
+			combo.addItems(options)
+			combo.setCurrentText(str(val))
+			combo.currentTextChanged.connect(self.on_param_control_changed)
+			return combo
+
+		elif isinstance(val, bool):
+			chk = QCheckBox()
+			chk.setChecked(val)
+			chk.toggled.connect(self.on_param_control_changed)
+			return chk
+
+		elif isinstance(val, int):
+			spin = QSpinBox()
+			spin.setRange(-100000, 100000)
+			spin.setValue(val)
+			spin.editingFinished.connect(self.on_param_control_changed)
+			return spin
+
+		elif isinstance(val, float):
+			spin_f = QDoubleSpinBox()
+			spin_f.setRange(-100000.0, 100000.0)
+			spin_f.setDecimals(4)
+			spin_f.setSingleStep(0.01)
+			spin_f.setValue(val)
+			spin_f.editingFinished.connect(self.on_param_control_changed)
+			return spin_f
+
+		else:
+			txt = QLineEdit()
+			txt.setText(str(val))
+			txt.editingFinished.connect(self.on_param_control_changed)
+			return txt
+
+	def init_ui(self) -> None:
+		main_layout = QVBoxLayout(self)
+		form_layout = QFormLayout()
+
+		layout_schema = self.indicator.param_layout
+
+		if not layout_schema:
+			layout_schema = list(self.params.keys())
+
+		for item in layout_schema:
+			if isinstance(item, str):
+				key = item
+				if key in self.params:
+					label_text = self.indicator.param_labels.get(key, key.replace("_", " ").title())
+					ctrl = self.create_control_widget(key, self.params[key])
+					self.param_controls[key] = ctrl
+					form_layout.addRow(label_text, ctrl)
+
+			elif isinstance(item, tuple) and len(item) == 2:
+				row_label, keys = item
+				row_layout = QHBoxLayout()
+				row_layout.setSpacing(6)
+
+				for i, key in enumerate(keys):
+					if key in self.params:
+						# Sub-Label nur ab 2. Key, da row_label den ersten abdeckt
+						if i > 0:
+							sub_label = self.indicator.param_labels.get(key, "")
+							if sub_label:
+								row_layout.addWidget(QLabel(sub_label))
+						ctrl = self.create_control_widget(key, self.params[key])
+						self.param_controls[key] = ctrl
+						row_layout.addWidget(ctrl)
+
+				form_layout.addRow(row_label, row_layout)
+
+		main_layout.addLayout(form_layout)
+
+		# Preset-Verwaltungszeile
+		preset_layout = QHBoxLayout()
+		preset_layout.addWidget(QLabel("Preset:"))
+
+		self.combo_presets = QComboBox()
+		self.refresh_preset_list()
+		self.combo_presets.currentTextChanged.connect(self.on_preset_selected)
+		preset_layout.addWidget(self.combo_presets)
+
+		btn_save_preset = QPushButton("💾 Speichern")
+		btn_save_preset.clicked.connect(self.save_current_preset)
+		preset_layout.addWidget(btn_save_preset)
+
+		btn_delete_preset = QPushButton("❌ Löschen")
+		btn_delete_preset.clicked.connect(self.delete_current_preset)
+		preset_layout.addWidget(btn_delete_preset)
+
+		main_layout.addLayout(preset_layout)
+
+		btn_close = QPushButton("Schließen")
+		btn_close.clicked.connect(self.accept)
+		main_layout.addWidget(btn_close)
+
+	def refresh_preset_list(self) -> None:
+		self.combo_presets.blockSignals(True)
+		self.combo_presets.clear()
+		presets = self.state_manager.list_indicator_presets(self.indicator.indicator_id)
+		self.combo_presets.addItems(presets)
+
+		if self.current_preset_name in presets:
+			self.combo_presets.setCurrentText(self.current_preset_name)
+		else:
+			self.combo_presets.setCurrentText("Default")
+
+		self.combo_presets.blockSignals(False)
+
+	def collect_params_from_ui(self) -> Dict[str, Any]:
+		# Mit default_params starten, damit Keys ohne UI-Control erhalten bleiben
+		new_params = dict(self.indicator.default_params)
+
+		for key, ctrl in self.param_controls.items():
+			if isinstance(ctrl, QCheckBox):
+				new_params[key] = ctrl.isChecked()
+			elif isinstance(ctrl, QSpinBox):
+				new_params[key] = ctrl.value()
+			elif isinstance(ctrl, QDoubleSpinBox):
+				new_params[key] = ctrl.value()
+			elif isinstance(ctrl, QComboBox):
+				raw_val = ctrl.currentText()
+				default_val = self.indicator.default_params.get(key)
+
+				# Typsicheres Casten anhand des Ursprungstyps im Indikator
+				if isinstance(default_val, bool):
+					new_params[key] = raw_val.lower() in ("true", "1", "yes")
+				elif isinstance(default_val, int):
+					try:
+						new_params[key] = int(raw_val)
+					except ValueError:
+						new_params[key] = default_val
+				elif isinstance(default_val, float):
+					try:
+						new_params[key] = float(raw_val)
+					except ValueError:
+						new_params[key] = default_val
+				else:
+					new_params[key] = raw_val
+			elif isinstance(ctrl, QLineEdit):
+				new_params[key] = ctrl.text()
+		return new_params
+
+	def update_ui_from_params(self, params_dict: Dict[str, Any]) -> None:
+		for key, val in params_dict.items():
+			if key in self.param_controls:
+				ctrl = self.param_controls[key]
+				ctrl.blockSignals(True)
+
+				if isinstance(ctrl, QCheckBox) and isinstance(val, bool):
+					ctrl.setChecked(val)
+				elif isinstance(ctrl, (QSpinBox, QDoubleSpinBox)) and isinstance(val, (int, float)):
+					ctrl.setValue(val)
+				elif isinstance(ctrl, QComboBox):
+					ctrl.setCurrentText(str(val))
+				elif isinstance(ctrl, QLineEdit) and isinstance(val, str):
+					ctrl.setText(val)
+
+				ctrl.blockSignals(False)
+
+	def on_param_control_changed(self) -> None:
+		self.params = self.collect_params_from_ui()
+		self.on_params_changed_callback(self.params, self.current_preset_name)
+
+	def on_preset_selected(self, preset_name: str) -> None:
+		if not preset_name:
+			return
+
+		self.current_preset_name = preset_name
+
+		if preset_name == "Default":
+			self.params = dict(self.indicator.default_params)
+		else:
+			loaded = self.state_manager.get_indicator_preset(self.indicator.indicator_id, preset_name)
+			if loaded:
+				self.params = loaded
+
+		self.update_ui_from_params(self.params)
+		self.on_params_changed_callback(self.params, self.current_preset_name)
+
+	def save_current_preset(self) -> None:
+		self.params = self.collect_params_from_ui()
+
+		name, ok = QInputDialog.getText(
+			self, "Preset speichern",
+			"Name für das Parameter-Set:",
+			text=self.current_preset_name if self.current_preset_name != "Default" else ""
+		)
+		if not ok or not name.strip():
+			return
+
+		clean_name = name.strip()
+		if clean_name.lower() == "default":
+			QMessageBox.warning(self, "Fehler", "Das 'Default'-Preset kann nicht überschrieben werden.")
+			return
+
+		# Prüfen ob bereits ein Preset mit diesem Namen existiert
+		existing_presets = self.state_manager.list_indicator_presets(self.indicator.indicator_id)
+		if clean_name in existing_presets:
+			reply = QMessageBox.question(
+				self, "Überschreiben bestätigen",
+				f"Das Preset '{clean_name}' existiert bereits.\nMöchtest du es überschreiben?",
+				QMessageBox.Yes | QMessageBox.No
+			)
+			if reply != QMessageBox.Yes:
+				return
+
+		self.state_manager.save_indicator_preset(self.indicator.indicator_id, clean_name, self.params)
+		self.current_preset_name = clean_name
+		self.refresh_preset_list()
+		self.on_params_changed_callback(self.params, self.current_preset_name)
+
+	def delete_current_preset(self) -> None:
+		if self.current_preset_name == "Default":
+			QMessageBox.warning(self, "Fehler", "Das 'Default'-Preset kann nicht gelöscht werden.")
+			return
+
+		reply = QMessageBox.question(
+			self, "Löschen bestätigen",
+			f"Möchtest du das Preset '{self.current_preset_name}' wirklich löschen?",
+			QMessageBox.Yes | QMessageBox.No
+		)
+
+		if reply == QMessageBox.Yes:
+			self.state_manager.delete_indicator_preset(self.indicator.indicator_id, self.current_preset_name)
+
+			# Nächstes verfügbares Preset auswählen, sonst Default
+			remaining = self.state_manager.list_indicator_presets(self.indicator.indicator_id)
+			remaining = [p for p in remaining if p != "Default"]
+
+			if remaining:
+				next_preset = remaining[0]
+			else:
+				next_preset = "Default"
+
+			self.current_preset_name = next_preset
+			self.refresh_preset_list()
+			self.on_preset_selected(next_preset)
+```
+
+--------------------------------------------------
+
+### DATEI: chart/indicators/__init__.py
+```py
+# ==============================================================================
+# chart/indicators/__init__.py
+# ==============================================================================
+
+try:
+	from .grid import GridIndicator
+except (ImportError, ValueError):
+	from grid import GridIndicator
+
+__all__ = ["GridIndicator"]
+```
+
+--------------------------------------------------
+
+### DATEI: chart/indicators/base_indicator.py
+```py
+"""
+chart/indicators/base_indicator.py - Base Class for all PyTrader Indicators
+"""
+
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Optional
+import pandas as pd
+
+
+class BaseIndicator(ABC):
+
+	def __init__(self) -> None:
+		pass
+
+	@property
+	@abstractmethod
+	def indicator_id(self) -> str:
+		"""Eindeutige ID des Indikators (z. B. 'grid')."""
+		pass
+
+	@property
+	@abstractmethod
+	def display_name(self) -> str:
+		"""Anzeigename für UI & Button-Tooltips."""
+		pass
+
+	@property
+	@abstractmethod
+	def default_params(self) -> Dict[str, Any]:
+		"""Standard-Parameter mit Werten."""
+		pass
+
+	@property
+	def param_options(self) -> Dict[str, List[Any]]:
+		"""Optional: Dropdown-Optionen für bestimmte Schlüssel."""
+		return {}
+
+	@property
+	def param_labels(self) -> Dict[str, str]:
+		"""Optional: Benutzerdefinierte Label für Parameter (key → Anzeigename)."""
+		return {}
+
+	@property
+	def param_layout(self) -> Optional[List[Any]]:
+		"""Optional: Layout-Struktur für mehrspaltige Parameter-Zeilen."""
+		return None
+
+	@abstractmethod
+	def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
+		"""Führt die mathematische Berechnung auf dem DataFrame aus und liefert Zeichnungsdaten zurück."""
+		pass
+```
+
+--------------------------------------------------
+
+### DATEI: chart/indicators/grid.py
+```py
+# chart/indicators/grid.py
+"""
+Grid & Proximity Indicator Plugin
+Restaurierter, stabiler Stand ohne Zeitzonen-Offsets (basierend auf Agents2.md)
+"""
+
+import math
+from datetime import datetime, timezone as dt_timezone
+from typing import Any, Dict, List, Optional
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+from .base_indicator import BaseIndicator
+from db_service import DbPool
+
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+DB_ANALYTICS = str(BASE_DIR / "data" / "analytics.duckdb")
+
+
+def f_round_to_custom_step(price: float, step: float) -> float:
+    if step <= 0:
+        return price
+    inv_step = 1.0 / step
+    return round(price * inv_step) / inv_step
+
+
+def f_strip_trailing_zeros(val: float) -> str:
+    s = f"{val:.6f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
+
+
+def f_in_window_around(minute_val: int, center: int, span: int) -> bool:
+    lower = center - span
+    upper = center + span
+    if lower < 0:
+        return minute_val >= (60 + lower) or minute_val <= upper
+    elif upper > 59:
+        return minute_val >= lower or minute_val <= (upper - 60)
+    else:
+        return lower <= minute_val <= upper
+
+
+class GridIndicator(BaseIndicator):
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._symbol: Optional[str] = None
+        self._timeframe: Optional[str] = None
+
+    def set_context(self, symbol: str, timeframe: str) -> None:
+        self._symbol = symbol
+        self._timeframe = timeframe
+
+    @property
+    def indicator_id(self) -> str:
+        return "grid"
+
+    @property
+    def display_name(self) -> str:
+        return "Grid & Proximity Liq Lines"
+
+    @property
+    def default_params(self) -> Dict[str, Any]:
+        return {
+            "prox_enableMaster": True,
+            "prox_level1": 0.0,
+            "prox_level2": 0.0,
+            "prox_level3": 0.0,
+            "prox_level4": 0.0,
+            "prox_level5": 0.0,
+            "prox_level6": 0.0,
+            "prox_visitPct": 0.05,
+            "prox_stepsAround": 4,
+            "prox_stepSize": 0.5,
+            "prox_useTimeFilter": True,
+            "prox_timeWindowMins": 5,
+            "prox_showLines": True,
+            "prox_showCircles": True,
+        }
+
+    @property
+    def param_options(self) -> Dict[str, List[Any]]:
+        return {}
+
+    @property
+    def param_layout(self) -> Optional[List[Any]]:
+        return [
+            "prox_enableMaster",
+            ("Zusatz-Levels 1 - 3", ["prox_level1", "prox_level2", "prox_level3"]),
+            ("Zusatz-Levels 4 - 6", ["prox_level4", "prox_level5", "prox_level6"]),
+            "prox_visitPct",
+            ("Grid (Steps / Size $)", ["prox_stepsAround", "prox_stepSize"]),
+            ("Time Filter (Aktiv / Mins)", ["prox_useTimeFilter", "prox_timeWindowMins"]),
+            "prox_showLines",
+            "prox_showCircles",
+        ]
+
+    def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
+        if df.empty or not params.get("prox_enableMaster", True):
+            return {
+                "lines": [],
+                "hit_circles": [],
+                "status_info": {"in_time_window": False, "active_hits": []},
+            }
+
+        step_size = float(params.get("prox_stepSize", 0.5))
+        steps_around = int(params.get("prox_stepsAround", 4))
+        visit_pct = float(params.get("prox_visitPct", 0.05))
+
+        use_time_filter_raw = params.get("prox_useTimeFilter", True)
+        if isinstance(use_time_filter_raw, str):
+            use_time_filter = use_time_filter_raw.lower() in ("true", "1", "yes")
+        else:
+            use_time_filter = bool(use_time_filter_raw)
+
+        time_window_mins = int(params.get("prox_timeWindowMins", 5))
+
+        show_lines_raw = params.get("prox_showLines", True)
+        show_lines = show_lines_raw.lower() in ("true", "1", "yes") if isinstance(show_lines_raw, str) else bool(
+            show_lines_raw)
+
+        show_circles_raw = params.get("prox_showCircles", True)
+        show_circles = show_circles_raw.lower() in ("true", "1", "yes") if isinstance(show_circles_raw, str) else bool(
+            show_circles_raw)
+
+        custom_levels = [
+            float(params.get("prox_level1", 0.0)),
+            float(params.get("prox_level2", 0.0)),
+            float(params.get("prox_level3", 0.0)),
+            float(params.get("prox_level4", 0.0)),
+            float(params.get("prox_level5", 0.0)),
+            float(params.get("prox_level6", 0.0)),
+        ]
+        valid_custom_levels = [lvl for lvl in custom_levels if lvl > 0.0]
+
+        last_row = df.iloc[-1]
+        last_close = float(last_row["close"])
+
+        # 1. GRID LEVEL ARRAY ZUSAMMENSTELLEN
+        center_price = f_round_to_custom_step(last_close, step_size)
+        grid_levels = set()
+
+        for i in range(-steps_around, steps_around + 1):
+            grid_levels.add(round(center_price + (i * step_size), 6))
+
+        for c_lvl in valid_custom_levels:
+            grid_levels.add(round(c_lvl, 6))
+
+        sorted_levels = sorted(list(grid_levels), reverse=True)
+
+        # 2. ZEITFENSTER-FILTER (REINES NATIVE UTC DER KERZENZEIT)
+        if "time" in df.columns:
+            last_ts = int(last_row["time"])
+            m = datetime.fromtimestamp(last_ts, tz=dt_timezone.utc).minute
+        else:
+            m = datetime.now(dt_timezone.utc).minute
+
+        full_win = f_in_window_around(m, 0, time_window_mins)
+        half_win = f_in_window_around(m, 30, time_window_mins)
+        in_time_window_raw = full_win or half_win
+        in_time_window = in_time_window_raw if use_time_filter else True
+
+        # 3. PROXIMITY & HIT LOGIK ÜBER HISTORIE
+        hit_circles = []
+        active_hits = []
+
+        tracked_levels = sorted_levels if show_lines else []
+
+        for idx, row in df.iterrows():
+            time_val = int(row["time"])
+            c_high = float(row["high"])
+            c_low = float(row["low"])
+
+            # Native UTC-Minute ohne künstlichen Offset
+            row_m = datetime.fromtimestamp(time_val, tz=dt_timezone.utc).minute
+            row_in_time = (
+                (f_in_window_around(row_m, 0, time_window_mins) or f_in_window_around(row_m, 30, time_window_mins))
+                if use_time_filter
+                else True
+            )
+
+            circle_color = "#FFEB3B" if row_in_time else "#E91E63" if use_time_filter else "#E91E63"
+
+            for lvl in tracked_levels:
+                visit_min = lvl * (1.0 - visit_pct / 100.0)
+                visit_max = lvl * (1.0 + visit_pct / 100.0)
+
+                touch_high = visit_min <= c_high <= visit_max
+                touch_low = visit_min <= c_low <= visit_max
+                pierce = c_low <= lvl and c_high >= lvl
+
+                near = touch_high or touch_low or pierce
+
+                if near:
+                    if show_circles:
+                        hit_circles.append({
+                            "time": time_val,
+                            "price": lvl,
+                            "color": circle_color,
+                        })
+                    if idx == df.index[-1]:
+                        active_hits.append(f_strip_trailing_zeros(lvl))
+
+        # 4. LINES PAYLOAD
+        lines_payload = []
+        if show_lines:
+            for lvl in sorted_levels:
+                is_custom = any(abs(lvl - c_lvl) < 0.0001 for c_lvl in valid_custom_levels)
+
+                lines_payload.append({
+                    "price": lvl,
+                    "color": "rgba(33, 150, 243, 0.9)" if is_custom else "rgba(33, 150, 243, 0.5)",
+                    "width": 1 if is_custom else 3,
+                    "style": "Solid",
+                    "is_custom": is_custom,
+                })
+
+        return {
+            "lines": lines_payload,
+            "hit_circles": hit_circles,
+            "status_info": {
+                "in_time_window": in_time_window,
+                "active_hits": active_hits,
+            },
+        }
+
+    @staticmethod
+    def _get_custom_levels(params: Dict[str, Any]) -> List[float]:
+        levels = []
+        for i in range(1, 7):
+            try:
+                v = float(params.get(f"custom_level_{i}", 0.0))
+                if v > 0:
+                    levels.append(round(v, 6))
+            except (ValueError, TypeError):
+                pass
+        return levels
+
+    def _get_level_at_time(self, con, ts: int) -> Optional[float]:
+        try:
+            dt = datetime.fromtimestamp(ts, tz=dt_timezone.utc)
+            row = con.execute("""
+                SELECT grid_nearest_level
+                FROM feature_store
+                WHERE symbol = ? AND timeframe = ? AND bar_time = ?
+                  AND grid_nearest_level IS NOT NULL AND grid_nearest_level > 0
+            """, [self._symbol, self._timeframe, dt]).fetchone()
+            if row and row[0] is not None:
+                v = float(row[0])
+                if not math.isnan(v) and v > 0:
+                    return v
+        except Exception:
+            pass
+        return None
+```
+
+--------------------------------------------------
+
+### DATEI: chart/js/01_core.js
+```js
+// chart/js/01_core.js
+// Kern-Variablen, WebChannel-Bridge, Fenster-Fokus-Event & Fehlerbehandlung
+
+window.onerror = function(m, s, l, c, e) {
+    if (m === "Script error." && !s) return true;
+    console.error(`[JS ERROR] ${m} | L${l}:${c}`);
+    return true;
+};
+
+let chart = null, candleSeries = null, pyBridge = null, isUpdatingChart = false;
+let currentTfInSeconds = 3600, lastClosePrice = null, activeTimer = null, countdownTimer = null;
+let rawCandleData = [], currentSymbol = null, currentTimeframe = null;
+let gridPriceLines = [], dayLinesSeries = [], _storedCircleMarkers = [];
+let currentPriceLine = null, resizeTimeout = null;
+let currentPrecision = 2;
+let pendingRange = null;
+let _updateId = 0;
+let _lastAppliedUpdateId = 0; // höchste akzeptierte updateId (Race-Guard)
+let _continuousTimeMap = {};  // { cont_time: real_epoch } für tickMarkFormatter
+let _continuousKeys = [];     // sortierte cont-Schlüssel für resolveRealTime()
+// LWC v5: setMarkers() auf der Serie existiert nicht mehr – SeriesMarkers-Plugin verwenden
+let seriesMarkersPlugin = null;
+
+let isWindowActive = true;
+let lastRenderedPrice = null;
+let lastRenderedTop = null;
+let lastFormattedPriceStr = "";
+let lastFormattedTimeStr = "";
+
+const TF_SECONDS_MAP = { 'M1': 60, 'M2': 120, 'M5': 300, 'M10': 600, 'M15': 900, 'M30': 1800, 'H1': 3600, 'H4': 14400, 'D1': 86400, 'W1': 604800, 'MN1': 2592000 };
+// HINWEIS: TF_SECONDS_MAP wird bei jedem applyFullChartUpdate durch die von
+// Python mitgelieferte tfSecondsMap (Single Source of Truth) überschrieben.
+// Diese lokale Map ist nur der Offline-/Start-Default (Abwärtskompatibilität).
+
+// HINWEIS: resolveRealTime()/toReal()/toCont()/_rebuildTimeMaps() sind nach
+// 02_time_utils.js verschoben – das ist die EINZIGE Zeit-Mapping-Schnittstelle.
+
+if (typeof qt !== 'undefined') {
+    new QWebChannel(qt.webChannelTransport, function(channel) {
+        pyBridge = channel.objects.pyBridge;
+    });
+}
+
+window.addEventListener('focus', () => { isWindowActive = true; if(lastClosePrice !== null) updateCountdownDisplay(); });
+window.addEventListener('blur', () => { isWindowActive = false; });
+document.addEventListener('visibilitychange', () => {
+    isWindowActive = !document.hidden;
+    if (isWindowActive && lastClosePrice !== null) updateCountdownDisplay();
+});
+
+```
+
+--------------------------------------------------
+
+### DATEI: chart/js/02_time_utils.js
+```js
+// chart/js/02_time_utils.js
+// Zeit-Formatierung für die Chart-Achsen (Wanduhrzeit direkt aus dem Epoch) +
+// ZENTRALE Zeit-Konstanten & Zeit-Mapping-Helper (Single Source of Truth).
+//
+// WICHTIG (empirisch verifiziert via test/check_broker_tz.py, DB-Abgleich &
+// Live-Messung an MT5):
+// - MT5 liefert Zeiten als BERLIN-WANDUHR-encoded Epochs: Bei echter UTC 10:00
+//   ist tick.time bereits die Zahl "12:00" (diff = +7200s). Der User hat recht.
+// - sync_market_data() schreibt die Roh-Epochs via
+//   pd.to_datetime(..., unit="s", utc=True) 1:1 in die DB; EXTRACT(EPOCH) und
+//   fetch_historical_candles() geben exakt diese Roh-Epochs an den Chart.
+// => Eine zusätzliche Berlin-Offset-Umrechnung (+2h/+1h) wäre DOPPELT und
+//    würde alle Achsen-Labels 2h zu spät anzeigen.
+// => getBerlinParts formatiert den Epoch direkt über die UTC-Getter; der Wert
+//    IST bereits die gewünschte Wanduhrzeit. Das ist automatisch DST-robust
+//    (keine Saison-Logik nötig): Im Winter liefert der Broker CET-encoded
+//    Werte, die ebenfalls direkt korrekt dargestellt werden.
+
+// =============================================================================
+// ZENTRALE ZEIT-KONSTANTEN (keine magischen Zahlen im restlichen Code)
+// =============================================================================
+const SECONDS_PER_DAY = 86400;
+const WEEKEND_GAP_SECONDS = 43200;   // >12h Lücke ohne Kerzen = Wochenend-Gap
+const MIN_SEPARATOR_SPACING_SECONDS = 21600; // Mindestabstand zweier Trennlinien
+
+function getBerlinParts(t) {
+    var weekdays = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
+    var pad = function(n) { return String(n).padStart(2, '0'); };
+    
+    // Ungueltige Eingaben abfangen (verhindert NaN-Ausgabe & Endlosschleifen)
+    if (typeof t !== 'number' || !isFinite(t)) {
+        return { weekday: '', day: '--', month: '--', year: '----', hour: '--', minute: '--', rawDayOfWeek: -1 };
+    }
+    
+    // Roh-Epoch = bereits Berliner Wanduhrzeit => direkt via UTC-Getter lesen.
+    var bd = new Date(t * 1000);
+    
+    return {
+        weekday: weekdays[bd.getUTCDay()],
+        day: pad(bd.getUTCDate()),
+        month: pad(bd.getUTCMonth() + 1),
+        year: String(bd.getUTCFullYear()),
+        hour: pad(bd.getUTCHours()),
+        minute: pad(bd.getUTCMinutes()),
+        rawDayOfWeek: bd.getUTCDay()
+    };
+}
+
+function formatDT(t) { 
+    var p = getBerlinParts(t); 
+    return p.weekday + ' ' + p.day + '.' + p.month + '.' + p.year.slice(-2) + ' ' + p.hour + ':' + p.minute; 
+}
+
+// =============================================================================
+// ZEIT-MAPPING (kontinuierliche Fake-Zeit <-> echte epoch)
+// -----------------------------------------------------------------------------
+// Die Charts arbeiten auf kontinuierlicher Zeit (base_time + i*tf_sec), damit
+// keinerlei Lücken/Whitespace entstehen. Die _continuousTimeMap (cont->real)
+// wird aus Python mitgeliefert (data.timeMap). Diese Funktionen sind die
+// EINZIGE Schnittstelle zum Zeit-Mapping – kein roher Map-Zugriff im Rest.
+//
+// INVARIANTE: Das Mapping ist bijektiv (jede Candle hat genau eine cont-Zeit
+// und genau eine real-Epoch) und monoton steigend (cont & real wachsen
+// gemeinsam). Verletzungen erzeugen Fake-Labels an Tagesgrenzen.
+// =============================================================================
+let _realToContMap = {};  // { real_epoch: cont_time } – invers zu _continuousTimeMap
+
+function _rebuildTimeMaps(timeMap) {
+    // Setzt beide Maps aus der von Python gelieferten cont->real Map.
+    _continuousTimeMap = timeMap || {};
+    _continuousKeys = Object.keys(_continuousTimeMap).map(Number).sort(function(a, b) { return a - b; });
+    _realToContMap = {};
+    for (var i = 0; i < _continuousKeys.length; i++) {
+        var contKey = _continuousKeys[i];
+        _realToContMap[_continuousTimeMap[contKey]] = contKey;
+    }
+}
+
+// =============================================================================
+// resolveRealTime(): kontinuierliche (Fake-)Zeit -> echte epoch
+// WICHTIG: Bei unbekannten Werten (Padding-Ticks ausserhalb des Datensatzes)
+// NIE die Fake-Zeit selbst zurueckgeben – sonst zeigt die Zeitachse
+// irrefuehrende Labels (z. B. "30.7.26 23:58" an der Tagesgrenze, weil die
+// Fake-Zeit der 00:59-Candle als Realzeit formatiert wird).
+// Stattdessen wird der naechstgelegene bekannte Zeitpunkt verwendet.
+// =============================================================================
+function resolveRealTime(ts) {
+    if (ts === null || ts === undefined || typeof ts !== 'number' || !isFinite(ts)) return ts;
+    var direct = _continuousTimeMap[ts];
+    if (direct !== undefined) return direct;
+    if (_continuousKeys.length === 0) return ts;
+    var n = _continuousKeys.length;
+    if (ts <= _continuousKeys[0]) return _continuousTimeMap[_continuousKeys[0]];
+    if (ts >= _continuousKeys[n - 1]) return _continuousTimeMap[_continuousKeys[n - 1]];
+    var lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        var mid = (lo + hi) >> 1;
+        if (_continuousKeys[mid] === ts) return _continuousTimeMap[_continuousKeys[mid]];
+        if (_continuousKeys[mid] < ts) lo = mid + 1; else hi = mid - 1;
+    }
+    // hi = letzter Key < ts, lo = erster Key > ts
+    var a = _continuousKeys[hi], b = _continuousKeys[lo];
+    return (ts - a <= b - ts) ? _continuousTimeMap[a] : _continuousTimeMap[b];
+}
+
+// Alias mit sprechendem Namen – überall verwenden, wo echte Zeit gebraucht wird.
+function toReal(ts) { return resolveRealTime(ts); }
+
+// echte epoch -> kontinuierliche Zeit (inverse Zuordnung).
+// Liefert undefined, wenn die real-Epoch nicht im Datensatz liegt.
+function toCont(realEpoch) { return _realToContMap[realEpoch]; }
+
+```
+
+--------------------------------------------------
+
+### DATEI: chart/js/03_chart_rendering.js
+```js
+// chart/js/03_chart_rendering.js
+// Chart-Initialisierung (leer – chart wird via applyFullChartUpdate aus Python erstellt),
+// Tages-Separatoren, Grid-Linien/Marker & Range-Steuerung
+
+function clearGridLines() {
+    if (!candleSeries) return;
+    gridPriceLines.forEach(function(l) { try { candleSeries.removePriceLine(l); } catch(e){} });
+    gridPriceLines = [];
+}
+
+function renderGridLines(lines) {
+    clearGridLines();
+    if (!candleSeries || !lines) return;
+    var data = (typeof lines === 'string') ? JSON.parse(lines) : lines;
+    (data || []).forEach(function(l) {
+        if (l && typeof l.price === 'number' && !isNaN(l.price)) {
+            var pl = candleSeries.createPriceLine({
+                price: l.price, color: l.color, lineWidth: l.width,
+                lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true,
+                title: l.is_custom ? '\u2605' : ''
+            });
+            gridPriceLines.push(pl);
+        }
+    });
+}
+
+// NOTE: _storedSignalMarkersData/_storedCircleMarkers sind getrennte Layer.
+// _applyAllMarkers() kombiniert BEIDE Caches und setzt sie via setMarkers –
+// damit kann ein Grid-Render die Signal-Marker nie verdrängen und umgekehrt.
+function clearGridCircles() {
+    _storedCircleMarkers = [];
+    _applyAllMarkers();
+}
+
+function renderGridCircles(circles) {
+    if (!candleSeries || !circles) return;
+    var data = (typeof circles === 'string') ? JSON.parse(circles) : circles;
+    _storedCircleMarkers = data || [];
+    // Circles werden via _applyAllMarkers() mit den Signal-Markern kombiniert
+    _applyAllMarkers();
+}
+
+function applyRange(rangeFrom, rangeTo, priceFrom, priceTo) {
+    if (!chart) return;
+    var timeScale = chart.timeScale();
+    var priceScale = chart.priceScale('right');
+
+    if (rangeFrom && rangeTo && rangeFrom !== rangeTo) {
+        try {
+            timeScale.setVisibleLogicalRange({ from: Number(rangeFrom), to: Number(rangeTo) });
+        } catch(e) {
+            console.warn("[applyRange] Failed to set logical range:", e);
+            try { timeScale.fitContent(); } catch(e2) {}
+        }
+    } else {
+        try { timeScale.fitContent(); } catch(e) {}
+    }
+
+    if (priceFrom !== undefined && priceTo !== undefined && priceFrom !== priceTo) {
+        try { priceScale.setVisibleRange({ from: Number(priceFrom), to: Number(priceTo) }); } catch(e) {}
+    }
+}
+
+// Signal-Marker + Circles: combined auf candleSeries.setMarkers()
+// _storedSignalMarkersData/_storedCircleMarkers sind IMMER Arrays (nie null),
+// damit _applyAllMarkers() beide Layer zuverlässig kombinieren kann.
+var _storedSignalMarkersData = [];
+
+function clearSignalMarkers() {
+    // Nur das Signal-Layer leeren – Circles bleiben aus dem Cache erhalten.
+    // (Im Chart-Refresh wird das Plugin anschliessend ohnehin neu aufgebaut.)
+    _storedSignalMarkersData = [];
+    _applyAllMarkers();
+}
+
+function renderSignalMarkers(markers) {
+    var data = (typeof markers === 'string') ? JSON.parse(markers) : markers;
+    // Cache IMMER aktualisieren (auch bei leerer Liste) – verhindert, dass
+    // ein veralteter Cache nach dem Ausschalten der Signale wieder auftaucht.
+    _storedSignalMarkersData = data || [];
+    _applyAllMarkers();
+}
+
+function _applyAllMarkers() {
+    if (!candleSeries) return;
+    try {
+        var allMarkers = [];
+
+        // 1. Signal-Marker (aus dem Signal-Cache)
+        if (_storedSignalMarkersData && _storedSignalMarkersData.length > 0) {
+            for (var i = 0; i < _storedSignalMarkersData.length; i++) {
+                var m = _storedSignalMarkersData[i];
+                allMarkers.push({
+                    time: m.time,
+                    position: m.position || 'aboveBar',
+                    color: m.color || '#26a69a',
+                    shape: m.shape || 'arrowDown',
+                    size: (m.size !== undefined) ? m.size : 1,
+                    text: m.text || '',
+                    // priority steuert die Stapel-Reihenfolge bei gleicher Kerze
+                    // (niedriger = näher an der Kerze, höher = weiter oben).
+                    // Wird von der LWC-Engine ignoriert (explizite Feldliste) –
+                    // dient NUR unserer Sortierung.
+                    priority: (m.priority !== undefined && m.priority !== null) ? m.priority : 0
+                });
+            }
+        }
+
+        // 2. Circle-Marker (aus dem Grid-Cache)
+        if (_storedCircleMarkers && _storedCircleMarkers.length > 0) {
+            for (var j = 0; j < _storedCircleMarkers.length; j++) {
+                var c = _storedCircleMarkers[j];
+                allMarkers.push({
+                    time: c.time,
+                    position: 'inBar',
+                    color: c.color || '#FFEB3B',
+                    shape: 'circle',
+                    size: 1,
+                    priority: (c.priority !== undefined && c.priority !== null) ? c.priority : 10
+                });
+            }
+        }
+
+        // LWC v5: candleSeries.setMarkers() wurde entfernt → SeriesMarkers-Plugin nutzen.
+        // Das Plugin wird pro Chart-Instanz einmalig erzeugt (Reset in applyFullChartUpdate).
+        // WICHTIG (v5.2.0-Engine): setMarkers() erwartet ein NACH ZEIT SORTIERTES Array:
+        //  - Die interne Suche nach dem sichtbaren Bereich ist eine Binärsuche (unsortiert = falsche Grenzen).
+        //  - Mehrere Marker DERSELBEN Kerze werden nur vertikal gestapelt, wenn sie im Array
+        //    BENACHBART sind (Stack-Offset resettet bei jedem Zeitsprung). Unsortiert überdecken
+        //    sich Marker derselben Kerze exakt – Grid-Circles verdeckten so die EMA-Signale.
+        // Sortierung (stabil seit ES2019):
+        //   1. Kriterium: Zeit (Pflicht für die Engine).
+        //   2. Kriterium: priority (Stapel-Reihenfolge bei gleicher Kerze).
+        //      Niedrige priority = näher an der Kerze, hohe = weiter oben.
+        //      Gleiche priority => Einfüge-Reihenfolge bleibt erhalten (Signale vor Circles).
+        allMarkers.sort(function(a, b) {
+            if (a.time !== b.time) return a.time - b.time;
+            var pa = (typeof a.priority === 'number') ? a.priority : 0;
+            var pb = (typeof b.priority === 'number') ? b.priority : 0;
+            return pa - pb;
+        });
+
+        if (!seriesMarkersPlugin) {
+            seriesMarkersPlugin = LightweightCharts.createSeriesMarkers(candleSeries, []);
+        }
+        seriesMarkersPlugin.setMarkers(allMarkers);
+    } catch(e) {
+        console.error('[setMarkers] Error:', e.message || e);
+    }
+}
+
+function reapplySignalMarkers() {
+    _applyAllMarkers();
+}
+
+// =============================================================================
+// Tages-Separatoren – GEKAPSELTES MODUL (DaySeparator)
+// -----------------------------------------------------------------------------
+// API:
+//   DaySeparator.render(candleData)   – Trennlinien aus Candle-Daten berechnen
+//                                       und als CSS-Overlay zeichnen (0:00 der
+//                                       ersten Kerze des neuen Tages)
+//   DaySeparator.updatePositions()    – Positionen nach Scroll/Zoom/Resize neu
+//                                       berechnen (rein additiv, keine Änderung
+//                                       der Zeitskala)
+//   DaySeparator.clear()              – alle Trennlinien entfernen
+//
+// Warum gekapselt: Zukünftige Chart-Änderungen (linke Preisskala, Pane-Layout,
+// Zeitachse) berühren nur dieses Modul – der Rest des Codes kennt nur die API.
+//
+// Früher: LineSeries mit 2 Extrem-Punkten (-1000/1000000). Bei LWC v5 rendert
+// eine fast senkrechte 2-Punkt-Linie den Dash NICHT zuverlässig (fällt auf
+// Solid zurück – deshalb war die Linie "durchgezogen").
+// Heute: rein additives CSS-Overlay (border-left: dashed). Garantiert
+// gestrichelt, keine Änderung der Zeitskala, keine Phantom-Index-Slots.
+// =============================================================================
+var DaySeparator = (function() {
+    var container = null;      // Overlay-Div über dem Chart-Pane
+    var times = [];            // kontinuierliche Zeiten der Trennlinien (0:00)
+    var lines = [];            // erzeugte Div-Elemente
+
+    // Breite einer eventuellen linken Preisskala (aktuell keine im Chart,
+    // aber robust vorbereitet – C3)
+    function _leftPriceWidth() {
+        try {
+            var leftPS = chart.priceScale('left');
+            if (!leftPS) return 0;
+            var opts = leftPS.options();
+            if (opts && opts.visible) {
+                return leftPS.width() || 0;
+            }
+        } catch(e) {}
+        return 0;
+    }
+
+    function _ensureContainer() {
+        var host = document.getElementById('chart-container');
+        if (!host) return null;
+        if (!container) {
+            container = document.createElement('div');
+            container.style.position = 'absolute';
+            container.style.top = '0';
+            container.style.left = '0';
+            container.style.pointerEvents = 'none';
+            container.style.zIndex = '100';
+            host.appendChild(container);
+        }
+        return container;
+    }
+
+    function clear() {
+        if (container) container.innerHTML = '';
+        times = [];
+        lines = [];
+    }
+
+    // Kernlogik: Tageswechsel-Erkennung (pure Funktion, separat testbar)
+    function computeDaySeparatorTimes(candleData) {
+        var result = [];
+        if (!candleData || candleData.length === 0) return result;
+        var lastLineTime = 0;
+        for (var i = 1; i < candleData.length; i++) {
+            var prevTime = candleData[i - 1].time;
+            var currTime = candleData[i].time;
+
+            // Echte epoch für Wanduhr-Tag-Berechnung verwenden (toReal statt
+            // rohem Map-Zugriff -> nie Fake-Zeiten bei fehlendem Mapping).
+            // Die Roh-Epochs sind bereits Berlin-Wanduhr-encoded, daher ergibt
+            // Math.floor(real/SECONDS_PER_DAY) den Wanduhr-Tag (Wechsel 00:00).
+            var prevReal = toReal(prevTime);
+            var currReal = toReal(currTime);
+
+            var prevUtcDay = Math.floor(prevReal / SECONDS_PER_DAY);
+            var currUtcDay = Math.floor(currReal / SECONDS_PER_DAY);
+
+            var isUtcDayChange = (currUtcDay !== prevUtcDay);
+            var isWeekendGap = (currReal - prevReal > WEEKEND_GAP_SECONDS);
+            var isTooCloseToPrevious = (lastLineTime > 0 && (currTime - lastLineTime) < MIN_SEPARATOR_SPACING_SECONDS);
+
+            if ((isUtcDayChange || isWeekendGap) && !isTooCloseToPrevious) {
+                lastLineTime = currTime;
+                // 0:00 des neuen Tages = Zeit der ersten Kerze des neuen Tages
+                result.push(currTime);
+            }
+        }
+        return result;
+    }
+
+    function render(candleData) {
+        if (!chart) return;
+        clear();
+        if (currentTfInSeconds >= SECONDS_PER_DAY || !candleData || candleData.length === 0) return;
+
+        times = computeDaySeparatorTimes(candleData);
+
+        var sepContainer = _ensureContainer();
+        if (!sepContainer) return;
+        for (var j = 0; j < times.length; j++) {
+            var div = document.createElement('div');
+            div.style.position = 'absolute';
+            div.style.top = '0';
+            div.style.bottom = '0';
+            div.style.width = '0';
+            div.style.borderLeft = '1px dashed rgba(33, 150, 243, 0.55)';
+            div.style.pointerEvents = 'none';
+            sepContainer.appendChild(div);
+            lines.push(div);
+        }
+        updatePositions();
+    }
+
+    // Positionen nach Scroll/Zoom/Resize neu berechnen.
+    // - x = timeToCoordinate (relativ zum Chart-Pane) + linke Preisskala-Breite
+    // - Offscreen-Zeiten (null von timeToCoordinate) werden ausgeblendet (C4)
+    function updatePositions() {
+        if (!chart || !container) return;
+        try {
+            var host = document.getElementById('chart-container');
+            var leftW = _leftPriceWidth();
+            var width = host ? host.clientWidth : 800;
+            var height = host ? host.clientHeight : 600;
+            var tsHeight = 0;
+            try { tsHeight = chart.timeScale().height() || 0; } catch(e) { tsHeight = 0; }
+
+            container.style.left = leftW + 'px';
+            container.style.top = '0px';
+            container.style.width = Math.max(0, width - leftW) + 'px';
+            container.style.height = Math.max(0, height - tsHeight) + 'px';
+
+            for (var i = 0; i < times.length && i < lines.length; i++) {
+                var x = null;
+                try { x = chart.timeScale().timeToCoordinate(times[i]); } catch(e) { x = null; }
+                if (x === null || x === undefined || isNaN(x)) {
+                    lines[i].style.display = 'none';
+                } else {
+                    lines[i].style.display = 'block';
+                    lines[i].style.left = (x + leftW) + 'px';
+                }
+            }
+        } catch(e) {
+            console.warn('[DaySeparator.updatePositions] Error:', e);
+        }
+    }
+
+    return {
+        render: render,
+        updatePositions: updatePositions,
+        clear: clear,
+        computeDaySeparatorTimes: computeDaySeparatorTimes
+    };
+})();
+
+```
+
+--------------------------------------------------
+
+### DATEI: chart/js/04_live_updates.js
+```js
+// chart/js/04_live_updates.js
+// Live-Tick-Updates, Countdown-Badge, Price-Badge, Range-Sync & Resize-Handling
+
+function syncRanges() {
+    if (!chart || !pyBridge || isUpdatingChart) return;
+    try {
+        var lr = chart.timeScale().getVisibleLogicalRange();
+        if (lr && lr.from !== null && lr.to !== null && !isNaN(lr.from) && !isNaN(lr.to)) {
+            pyBridge.onRangeChanged(Math.floor(lr.from), Math.floor(lr.to));
+        }
+        var pr = chart.priceScale('right').getVisibleRange();
+        if (pr && pr.from !== null && pr.to !== null && !isNaN(pr.from) && !isNaN(pr.to)) {
+            pyBridge.onPriceRangeChanged(pr.from, pr.to);
+        }
+    } catch(e) {}
+}
+
+function updateCountdownDisplay() {
+    if (isUpdatingChart || !candleSeries || !chart || lastClosePrice === null || lastClosePrice === undefined) return;
+    if (!isWindowActive || document.hidden) return;
+
+    try {
+        var priceBadge = document.getElementById('price-badge');
+        var countdownBadge = document.getElementById('countdown-badge');
+        if (!priceBadge || !countdownBadge) return;
+
+        var showCountdown = (currentTfInSeconds > 0 && currentTfInSeconds < 86400);
+
+        // PriceLine auf der candleSeries
+        if (!currentPriceLine) {
+            currentPriceLine = candleSeries.createPriceLine({
+                price: lastClosePrice,
+                color: '#2962FF',
+                lineWidth: 1,
+                lineStyle: LightweightCharts.LineStyle.Dotted,
+                axisLabelVisible: false,
+                title: ''
+            });
+            lastRenderedPrice = lastClosePrice;
+        } else if (lastRenderedPrice !== lastClosePrice) {
+            currentPriceLine.applyOptions({ price: lastClosePrice, title: '' });
+            lastRenderedPrice = lastClosePrice;
+        }
+
+        var y = candleSeries.priceToCoordinate(lastClosePrice);
+        if (y !== null && !isNaN(y)) {
+            var formattedPrice = lastClosePrice.toFixed(currentPrecision);
+            var topPos = (y - 9) + 'px';
+
+            if (lastFormattedPriceStr !== formattedPrice) {
+                priceBadge.innerText = formattedPrice;
+                lastFormattedPriceStr = formattedPrice;
+            }
+            if (lastRenderedTop !== topPos) {
+                priceBadge.style.top = topPos;
+                countdownBadge.style.top = topPos;
+                lastRenderedTop = topPos;
+            }
+            if (priceBadge.style.display !== 'block') {
+                priceBadge.style.display = 'block';
+            }
+
+            if (showCountdown) {
+                var now = Math.floor(Date.now() / 1000);
+                var rem = currentTfInSeconds - (now % currentTfInSeconds);
+                var formattedTime = String(Math.floor(rem/60)).padStart(2,'0') + ':' + String(rem%60).padStart(2,'0');
+                if (lastFormattedTimeStr !== formattedTime) {
+                    countdownBadge.innerText = formattedTime;
+                    lastFormattedTimeStr = formattedTime;
+                }
+                var priceWidth = priceBadge.offsetWidth || 50;
+                var rightPos = (priceWidth + 8) + 'px';
+                if (countdownBadge.style.right !== rightPos) {
+                    countdownBadge.style.right = rightPos;
+                }
+                if (countdownBadge.style.display !== 'block') {
+                    countdownBadge.style.display = 'block';
+                }
+            } else {
+                if (countdownBadge.style.display !== 'none') countdownBadge.style.display = 'none';
+            }
+        } else {
+            if (priceBadge.style.display !== 'none') priceBadge.style.display = 'none';
+            if (countdownBadge.style.display !== 'none') countdownBadge.style.display = 'none';
+        }
+    } catch(e) {
+        var p = document.getElementById('price-badge');
+        var c = document.getElementById('countdown-badge');
+        if (p && p.style.display !== 'none') p.style.display = 'none';
+        if (c && c.style.display !== 'none') c.style.display = 'none';
+    }
+}
+
+function updateLiveCandle(json) {
+    if (!candleSeries || isUpdatingChart) return;
+    try {
+        var c = JSON.parse(json);
+        if (!c || typeof c.time !== 'number' || isNaN(c.time)) return;
+        // Race-Guard: Live-Tick nur anwenden, wenn Symbol/TF noch zum Chart passen.
+        // Verhindert, dass ein verspaeteter Tick vom alten Symbol/TF nach einem
+        // schnellen Wechsel an den falschen Chart angehaengt wird.
+        if (c.symbol !== undefined && c.symbol !== null && c.symbol !== currentSymbol) return;
+        if (c.timeframe !== undefined && c.timeframe !== null && c.timeframe !== currentTimeframe) return;
+        if (c.open === null || c.high === null || c.low === null || c.close === null) return;
+        if (rawCandleData.length > 0 && c.time < rawCandleData[rawCandleData.length-1].time) return;
+        candleSeries.update(c);
+        lastClosePrice = c.close;
+        updateCountdownDisplay();
+    } catch(e) {}
+}
+
+function fitChartContent() { if(chart) chart.timeScale().fitContent(); }
+
+// =============================================================================
+// RESIZE-HANDLING
+// =============================================================================
+function handleResize() {
+    if (!chart) return;
+    var container = document.getElementById('chart-container');
+    if (!container) return;
+    var w = container.clientWidth;
+    var h = container.clientHeight;
+    if (w > 0 && h > 0) {
+        chart.resize(w, h);
+        try { DaySeparator.updatePositions(); } catch(e) {}
+    }
+}
+
+var _resizeObserver = null;
+function setupResizeObserver() {
+    var container = document.getElementById('chart-container');
+    if (!container) return;
+    if (_resizeObserver) _resizeObserver.disconnect();
+    _resizeObserver = new ResizeObserver(function() { handleResize(); });
+    _resizeObserver.observe(container);
+}
+
+// =============================================================================
+// applyFullChartUpdate – Hauptfunktion
+// =============================================================================
+function applyFullChartUpdate(data) {
+    // =========================================================================
+    // RACE-GUARD: Python sendet eine monotone updateId mit jedem Refresh.
+    // Veraltete Payloads (z. B. langsamer Serializer-Thread aus einem frueheren
+    // Symbol/TF-Stand) werden sofort verworfen, bevor sie den Chart anfassen.
+    // =========================================================================
+    var myId = ++_updateId;
+    var updateId = (data && typeof data.updateId === 'number') ? data.updateId : myId;
+
+    if (updateId < _lastAppliedUpdateId) {
+        console.warn('[applyFullChartUpdate] Veraltetes Update verworfen (id=' + updateId + ' < letzte=' + _lastAppliedUpdateId + ')');
+        isUpdatingChart = false;
+        return;
+    }
+    _lastAppliedUpdateId = updateId;
+
+    try {
+        isUpdatingChart = true;
+
+        // TimeMap speichern (kontinuierliche Zeit -> echte epoch)
+        // Zentral via _rebuildTimeMaps: baut auch die inverse real->cont Map auf.
+        _rebuildTimeMaps(data.timeMap || {});
+
+        // TF_SECONDS_MAP: Python ist die Single Source of Truth (tfSecondsMap im
+        // Payload). Die lokale Map in 01_core.js ist nur der Offline-Default.
+        if (data.tfSecondsMap && typeof data.tfSecondsMap === 'object') {
+            for (var tfKey in data.tfSecondsMap) {
+                if (Object.prototype.hasOwnProperty.call(data.tfSecondsMap, tfKey)) {
+                    TF_SECONDS_MAP[tfKey] = data.tfSecondsMap[tfKey];
+                }
+            }
+        }
+
+        currentSymbol = data.symbol;
+        currentTimeframe = data.timeframe;
+        if (data.timeframe && TF_SECONDS_MAP[data.timeframe]) {
+            currentTfInSeconds = TF_SECONDS_MAP[data.timeframe];
+        }
+
+        var candles = (typeof data.candles === 'string') ? JSON.parse(data.candles) : (data.candles || []);
+
+        var validCandles = candles.filter(function(c) {
+            return c &&
+                typeof c.time === 'number' && !isNaN(c.time) && c.time > 0 &&
+                typeof c.open === 'number' && !isNaN(c.open) && c.open > 0 &&
+                typeof c.high === 'number' && !isNaN(c.high) && c.high > 0 &&
+                typeof c.low === 'number' && !isNaN(c.low) && c.low > 0 &&
+                typeof c.close === 'number' && !isNaN(c.close) && c.close > 0;
+        });
+
+        if (validCandles.length === 0) {
+            console.warn('[applyFullChartUpdate] Keine gueltigen Candles');
+            if (chart) chart.timeScale().fitContent();
+            isUpdatingChart = false;
+            return;
+        }
+
+        // Alte Resourcen entfernen
+        try { clearGridCircles(); } catch(e) {}
+        try { clearGridLines(); } catch(e) {}
+        try { clearSignalMarkers(); } catch(e) {}
+        if (currentPriceLine) {
+            try { if (candleSeries) candleSeries.removePriceLine(currentPriceLine); } catch(e) {}
+            currentPriceLine = null;
+        }
+        if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+
+        if (_resizeObserver) {
+            try { _resizeObserver.disconnect(); } catch(e) {}
+            _resizeObserver = null;
+        }
+
+        try {
+            if (chart) chart.remove();
+        } catch(e) {
+            console.warn('[applyFullChartUpdate] chart.remove() fehlgeschlagen:', e.message || e);
+        }
+        chart = null;
+        candleSeries = null;
+        dayLinesSeries = [];
+        gridPriceLines = [];
+        _storedCircleMarkers = [];
+        seriesMarkersPlugin = null;
+        try { DaySeparator.clear(); } catch(e) {}
+
+        var container = document.getElementById('chart-container');
+        if (!container) {
+            isUpdatingChart = false;
+            return;
+        }
+        try { container.querySelectorAll('table, canvas').forEach(function(el) { el.remove(); }); } catch(e) {}
+
+        var isDailyOrHigher = (currentTfInSeconds >= 86400);
+
+        // Schritt 1: Chart erstellen
+        try {
+            chart = LightweightCharts.createChart(container, {
+                width: container.clientWidth || 800,
+                height: container.clientHeight || 600,
+                layout: { background: { type: 'solid', color: '#131722' }, textColor: '#d1d4dc' },
+                grid: { vertLines: { visible: false }, horzLines: { visible: false } },
+                crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+                rightPriceScale: { borderColor: '#2B2B43' },
+                timeScale: { 
+                    borderColor: '#2B2B43', 
+                    timeVisible: !isDailyOrHigher,
+                    secondsVisible: false,
+                    fixRightEdge: false,
+                    fixLeftEdge: false,
+                    shiftVisibleRangeOnNewBar: false,
+                    tickMarkFormatter: function(time, tickMarkType) {
+                        // time ist kontinuierlich (Fake-Zeit). Real-Epoch via toReal()
+                        // (zentraler Helper statt raw-Map-Zugriff -> kein Fake-Label).
+                        var realTime = toReal(time);
+                        var p = getBerlinParts(realTime);
+                        if (isDailyOrHigher || tickMarkType <= 2) {
+                            return p.day + '.' + p.month + '.' + p.year.slice(-2);
+                        }
+                        return p.hour + ':' + p.minute;
+                    }
+                },
+                localization: { locale: 'de-DE', timeFormatter: function(t) { 
+                    // t ist bei Zeit-basierten Serien ein UTCTimestamp (Zahl),
+                    // NICHT ein Objekt mit .time – sonst laeuft formatDT ins Leere.
+                    var ts = (t !== null && typeof t === 'object') ? t.time : t;
+                    return formatDT(toReal(ts)); 
+                } }
+            });
+        } catch(e) {
+            console.error('[applyFullChartUpdate] Schritt 1 (createChart) fehlgeschlagen:', e.message || e);
+            isUpdatingChart = false;
+            return;
+        }
+
+        try { setupResizeObserver(); } catch(e) {}
+
+        var precision = (data.precision !== undefined && data.precision !== null) ? data.precision : currentPrecision;
+        currentPrecision = precision;
+        var minMove = (typeof precision === 'number' && precision > 0 && precision < 10) 
+            ? 1 / Math.pow(10, precision) 
+            : 0.01;
+
+        // Schritt 2: CandlestickSeries
+        try {
+            candleSeries = chart.addSeries(LightweightCharts.CandlestickSeries, {
+                upColor: '#26a69a', downColor: '#ef5350', borderVisible: false,
+                wickUpColor: '#26a69a', wickDownColor: '#ef5350', priceLineVisible: false, lastValueVisible: false,
+                priceFormat: { type: 'price', precision: precision, minMove: minMove }
+            });
+            if (!candleSeries) throw new Error('candleSeries ist null');
+        } catch(e) {
+            console.error('[applyFullChartUpdate] Schritt 2 (addSeries) fehlgeschlagen:', e.message || e);
+            isUpdatingChart = false;
+            return;
+        }
+
+        // Schritt 3: setData
+        try {
+            candleSeries.setData(validCandles);
+        } catch(e) {
+            console.error('[applyFullChartUpdate] Schritt 3 (setData) fehlgeschlagen:', e.message || e);
+            isUpdatingChart = false;
+            return;
+        }
+        rawCandleData = validCandles;
+        lastClosePrice = validCandles[validCandles.length - 1].close;
+
+        // Schritt 4: TimeScale Subscription
+        try {
+            chart.timeScale().subscribeVisibleLogicalRangeChange(function() { 
+                if(!isUpdatingChart) {
+                    try { syncRanges(); } catch(e) {}
+                    try { updateCountdownDisplay(); } catch(e) {}
+                    try { DaySeparator.updatePositions(); } catch(e) {}
+                }
+            });
+
+            // C2: auch bei reinen Größenänderungen der Zeitskala (z. B. wenn
+            // der rechte Preisbereich sich ändert) die Trennlinien neu setzen.
+            chart.timeScale().subscribeSizeChange(function() {
+                if (!isUpdatingChart) {
+                    try { DaySeparator.updatePositions(); } catch(e) {}
+                }
+            });
+        } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 4 (subscribe) fehlgeschlagen:', e.message || e);
+        }
+
+        // Countdown-Timer (1s Intervall)
+        if (countdownTimer) clearInterval(countdownTimer);
+        countdownTimer = setInterval(function() {
+            try { updateCountdownDisplay(); } catch(e) {}
+        }, 1000);
+
+        // Schritt 5: Grid-Linien
+        try { if (data.gridLines) renderGridLines(data.gridLines); } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 5 (gridLines) fehlgeschlagen:', e.message || e);
+        }
+
+        // Schritt 6: Grid-Circles (speichert nur, Marker setzen via setMarkers)
+        try { if (data.gridCircles) renderGridCircles(data.gridCircles); } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 6 (gridCircles) fehlgeschlagen:', e.message || e);
+        }
+
+        // Schritt 7: Signal-Marker + Circles (combined via candleSeries.setMarkers)
+        // _storedSignalMarkersData/_storedCircleMarkers sind getrennte Layer;
+        // _applyAllMarkers() kombiniert beide automatisch aus den Caches.
+        try {
+            _storedSignalMarkersData = data.signalMarkers || [];
+            _applyAllMarkers();
+        } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 7 (signalMarkers) fehlgeschlagen:', e.message || e);
+        }
+
+        // Schritt 8: Range
+        try {
+            if (data.rangeFrom !== undefined && data.rangeTo !== undefined &&
+                data.rangeFrom !== null && data.rangeTo !== null &&
+                data.rangeFrom !== data.rangeTo) {
+                pendingRange = { rangeFrom: data.rangeFrom, rangeTo: data.rangeTo, priceFrom: data.priceFrom, priceTo: data.priceTo };
+                applyRange(data.rangeFrom, data.rangeTo, data.priceFrom, data.priceTo);
+            } else {
+                if (chart) chart.timeScale().fitContent();
+            }
+        } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 8 (applyRange) fehlgeschlagen:', e.message || e);
+        }
+
+        // Schritt 9: Day Separators (gekapseltes Modul, CSS-Overlay)
+        try { DaySeparator.render(rawCandleData); } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 9 (daySeparators) fehlgeschlagen:', e.message || e);
+        }
+
+        // Fertig – isUpdatingChart freigeben + initialen sync
+        isUpdatingChart = false;
+        try { syncRanges(); } catch(e) {}
+        try { updateCountdownDisplay(); } catch(e) {}
+
+    } catch(e) {
+        console.error('[applyFullChartUpdate] GLOBAL Error:', e.message || e);
+        isUpdatingChart = false;
+    }
+}
+
+```
+
+--------------------------------------------------
+
+### DATEI: chart/overlays/__init__.py
+```py
+
+```
+
+--------------------------------------------------
+
+### DATEI: chart/overlays/signal_overlay.py
+```py
+# chart/overlays/signal_overlay.py
+"""
+Signal-Overlay – Liest Signal-Ergebnisse aus analytics.duckdb und bereitet
+sie als Lightweight Charts Marker-Daten für das Chart-Fenster auf.
+"""
+
+from typing import Any, Dict, List, Optional
+import duckdb
+from pathlib import Path
+
+from db_service import DbPool
+from state_manager import StateManager
+
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+DB_ANALYTICS = str(BASE_DIR / "data" / "analytics.duckdb")
+
+
+class SignalOverlay:
+    """
+    Liest gefilterte Signale aus signal_results und erstellt Marker-Daten
+    für die Darstellung im Lightweight Charts Chart.
+    """
+
+    def __init__(self):
+        self._current_set_id: Optional[str] = None
+        self._state_mgr = StateManager()
+        self._settings = self._state_mgr.get_app_settings()
+
+    @property
+    def current_set_id(self) -> Optional[str]:
+        return self._current_set_id
+
+    def get_available_sets(self) -> List[str]:
+        """Liefert alle verfügbaren source_id Werte aus signal_results."""
+        if not Path(DB_ANALYTICS).exists():
+            return []
+        con = DbPool.get(DB_ANALYTICS)
+        rows = con.execute("""
+            SELECT DISTINCT source_id FROM signal_results
+            ORDER BY source_id
+        """).fetchall()
+        return [r[0] for r in rows]
+
+    def set_active_set(self, set_id: str):
+        self._current_set_id = set_id
+
+    def fetch_markers(
+        self,
+        symbol: str,
+        timeframe: str,
+        set_id: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Holt Signale aus signal_results und formatiert sie als Marker.
+
+        Args:
+            symbol: Symbol-Name
+            timeframe: Timeframe
+            set_id: source_id (optional, sonst current_set_id)
+            limit: Maximale Anzahl Marker
+
+        Returns:
+            Liste von Marker-Dicts für Lightweight Charts:
+            [{time, position, color, shape, size, text}, ...]
+        """
+        if set_id is None:
+            set_id = self._current_set_id
+        if set_id is None:
+            return []
+
+        if limit is None:
+            limit = self._settings.signal_marker_limit
+
+        if not Path(DB_ANALYTICS).exists():
+            return []
+
+        con = DbPool.get(DB_ANALYTICS)
+        # WICHTIG: Subquery mit DESC + äußeres ASC für Lightweight Charts
+        # EXTRACT(epoch) direkt in SQL, damit DuckDB TIMESTAMPTZ korrekt verarbeitet
+        rows = con.execute("""
+            SELECT EXTRACT('epoch' FROM bar_time)::BIGINT AS time_epoch,
+                   confidence, metadata_payload
+            FROM (
+                SELECT bar_time, confidence, metadata_payload
+                FROM signal_results
+                WHERE symbol = ? AND timeframe = ? AND source_id = ?
+                ORDER BY bar_time DESC
+                LIMIT ?
+            )
+            ORDER BY bar_time ASC
+        """, [symbol, timeframe, set_id, limit]).fetchall()
+
+        markers = []
+        for row in rows:
+            time_sec = row[0]
+            if time_sec is None or time_sec <= 0:
+                continue
+
+            confidence = float(row[1]) if row[1] is not None else 0.5
+
+            # Farbe basierend auf Confidence
+            if confidence >= 0.8:
+                color = "#26a69a"  # Grün (stark)
+            elif confidence >= 0.5:
+                color = "#FFEB3B"  # Gelb (mittel)
+            else:
+                color = "#ef5350"  # Rot (schwach)
+
+            markers.append({
+                "time": time_sec,
+                "position": "aboveBar",
+                "color": color,
+                "shape": "arrowDown",
+                "size": 1,
+                "text": f"{confidence:.0%}",
+            })
+
+        return markers
+
+```
+
+--------------------------------------------------
+
+### DATEI: config/__init__.py
+```py
+
+```
+
+--------------------------------------------------
+
+### DATEI: config/app_settings.py
+```py
+# config/app_settings.py
+"""
+AppSettings – typsichere Data-Class für anwendungsweite Konfiguration.
+Alle Werte haben sinnvolle Defaults und werden in app_data.duckdb persistiert.
+Erbt von AbstractStateModel für einheitliches Serialisieren/Deserialisieren.
+"""
+
+from dataclasses import dataclass
+from typing import Any, Dict
+
+from config.base_state_model import AbstractStateModel
+
+
+@dataclass
+class AppSettings(AbstractStateModel):
+    # Chart: Maximale Anzahl Candles beim Laden
+    chart_candle_limit: int = 3000
+
+    # Feature-Builder: Default-Limit beim Laden von OHLCV
+    feature_builder_limit: int = 3000
+
+    # Historical Scanner: Maximale Candles pro Timeframe beim Scan
+    scanner_candle_limit: int = 100_000
+
+    # Statistik: Maximale Signale für die Detail-Tabelle
+    statistics_signal_limit: int = 10_000
+
+    # Signal-Overlay: Maximale Marker im Chart
+    signal_marker_limit: int = 500
+
+    # Statistik: Zeilen pro Seite in der Tabelle
+    statistics_page_size: int = 100
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "chart_candle_limit": self.chart_candle_limit,
+            "feature_builder_limit": self.feature_builder_limit,
+            "scanner_candle_limit": self.scanner_candle_limit,
+            "statistics_signal_limit": self.statistics_signal_limit,
+            "signal_marker_limit": self.signal_marker_limit,
+            "statistics_page_size": self.statistics_page_size,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "AppSettings":
+        return cls(
+            chart_candle_limit=int(data.get("chart_candle_limit", 3000)),
+            feature_builder_limit=int(data.get("feature_builder_limit", 3000)),
+            scanner_candle_limit=int(data.get("scanner_candle_limit", 100_000)),
+            statistics_signal_limit=int(data.get("statistics_signal_limit", 10_000)),
+            signal_marker_limit=int(data.get("signal_marker_limit", 500)),
+            statistics_page_size=int(data.get("statistics_page_size", 100)),
+        )
+
+```
+
+--------------------------------------------------
+
+### DATEI: config/base_state_model.py
+```py
+# config/base_state_model.py
+"""
+AbstractStateModel – Abstrakte Basisklasse für typsichere State-Modelle.
+Ermöglicht einheitliches Serialisieren/Deserialisieren für DuckDB-Persistierung.
+"""
+
+from abc import ABC, abstractmethod
+from typing import Any, Dict
+
+
+class AbstractStateModel(ABC):
+    """Abstrakte Basisklasse für persistierbare State-Modelle."""
+
+    @abstractmethod
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialisiert das Modell in ein JSON-kompatibles Dict."""
+        pass
+
+    @classmethod
+    @abstractmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "AbstractStateModel":
+        """Deserialisiert ein Dict zurück in eine Modell-Instanz."""
+        pass
+
+```
+
+--------------------------------------------------
+
+### DATEI: docs/Agents.md
+```md
+# SYSTEM-INSTRUKTIONEN & PROJEKT-REGELN FOR DIE IDE-AI
+
+Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukturen und Logiken mit neu erdachtem KI-Code, damit die Originalsourcen erhalten bleiben. Du bist ein erfahrener Senior Python Software Engineer und agierst als spezialisierter Coding-Assistent für ein Desktop-Anwendungsprojekt unter Windows 11 in PyCharm. Verwende für Tests immer die Datei `../test/test.py`, um es übersichtlich zu halten. **Alle neuen Test-Python-Dateien und Test-Datenbanken (z. B. `*.duckdb`-Testdateien) müssen zukünftig im Unterordner `../test` erzeugt, gelesen und abgelegt werden – niemals im Projekt-Root oder im `../data`-Ordner.**
+
+---
+
+### 1. ROLLE & ARCHITEKTUR-FOKUS
+- Dein Hauptfokus liegt auf sauberer, modularer Python-Entwicklung (Typische Stacks: PySide6/Qt, DuckDB, AsyncIO/APIs, Clean Code Architecture).
+- Halte Code strukturiert, performant und wartbar. Vermeide monolithische Skripte; nutze eine klare Trennung von Logik, Daten und Benutzeroberfläche (z. B. MVC / MVVM).
+
+---
+
+### 2. GOLDENE REGELN DER OBJEKTORIENTIERUNG (OOP) & SYSTEM-ENTKOPPLUNG
+
+1. **Abstraktion durch Abstrakte Basisklassen (ABC & Polymorphie):**
+   * Keine isolierten Funktionen oder ad-hoc Klassen für Business-Logik.
+   * Jede Kern-Komponente (z. B. Signale, Features, Fenster, Indikatoren) **muss** von ihrer jeweiligen abstrakten Basisklasse erben (`SignalDefinition`, `BaseFeature`, `PersistentWindow`, `BaseIndicator`).
+   * Die aufrufende Engine interagiert **ausschließlich** mit dem abstrakten Interface, niemals mit konkreten Implementierungen.
+
+2. **Vollständige Entkopplung & Inversion of Control (IoC):**
+   * **Keine Zirkulären Abhängigkeiten:** Sub-Module (z. B. Worker oder Dialoge) dürfen niemals Kenntnis von konkreten Orchestratoren (wie `MainWindow`) haben.
+   * **Kommunikation über Signals/Slots & Repositories:** UI-Komponenten und Datenverarbeiter kommunizieren strikt asynchron über PyQt-Signals oder Read-Only-Datenbankabfragen.
+   * **Verboten:** Hardcoded Klassennamen-Checks (z. B. `if name == "win_statistics"`) in zentralen Repositories. Fenstertypen müssen sich generisch/dynamisch über Dekoratoren oder Registrys registrieren.
+
+3. **Single Responsibility Principle (SRP - Eine Aufgabe pro Klasse):**
+   * **UI-Klassen (`PySide6`):** Verantwortlich *nur* für Event-Handling und Rendering. Keine Berechnungen, Indikator-Logik oder direkte DB-Verbindungsaufbauten.
+   * **Worker/Engine-Klassen:** Verantwortlich *nur* für Datenverarbeitung und mathematische Evaluierung. Absolut kein UI-Import oder GUI-Code.
+   * **Repository-Klassen:** Kapseln den Datenbank-Zugriff exklusiv (SQL-Abfragen, Connection-Handling).
+
+4. **Offen für Erweiterung, Geschlossen für Änderung (Open/Closed Principle):**
+   * Neue Indikatoren, Strategien oder Fenster müssen durch **Hinzufügen neuer Dateien** implementiert werden können, ohne bestehende Kern-Dateien (`../main.py`, `set_evaluator.py`, `feature_builder.py`) modifizieren zu müssen.
+
+5. **Typsicherheit & Verlässliche Datenverträge:**
+   * Strikte Nutzung von Python **Type Hints** (`typing`) für alle Funktionsparameter und Rückgabewerte.
+   * Keine impliziten Dictionaries als Datenverträge zwischen Modulen; Datenströme nutzen definierte Dataframes, Primitive oder Typ-Aliase.
+
+---
+
+### 3. CODE- & ANTWORT-FORMATIERUNG
+- **Prägnanz & Effizienz:** Verzicht auf lange theoretische Vorgeplänkel oder Höflichkeitsfloskeln. Biete direkt die funktionierende Lösung.
+- **Vollständigkeit bei neuen Dateien:** Wenn eine neue Datei oder Klasse erstellt wird, liefere den vollständigen, ausführbaren Code.
+- **Gezielte Refactorings:** Bei Änderungen an bestehendem Code zeige exakt die geänderten Abschnitte oder Methoden mit klaren Hinweisen, wo sie einzufügen sind, statt hunderte Zeilen unveränderten Code zu wiederholen.
+- **Code-Blöcke:** Gib jeden Code-Block mit der expliziten Sprachauszeichnung an (`python ... `) und nenne in der ersten Zeile als Kommentar den relativen Dateipfad (z. B. `# src/database/db_manager.py`).
+- **Dateipfade:** Verwende für Windows-Pfade ausschließlich `pathlib.Path` oder Raw-Strings (`r"..."`), um Pfad-Probleme unter Windows 11 zu vermeiden.
+
+### 4. KEINE UI-TESTS (HARTE REGEL)
+- **Führe KEINE UI-Tests (PySide6/Qt/WebEngine) aus.** Sie sind viel zu zeitaufwändig.
+- Diese Regel gilt **automatisch und immer** – ohne Rückfrage, ohne Ausnahme.
+- Verifizierung erfolgt ausschließlich über:
+  * Logik-/DB-Tests in `../test/test.py` (ohne GUI-Ausführung)
+  * Syntax-Checks (`py_compile`) und statische Analyse
+  * Code-Inspektion
+- UI-Änderungen werden durch sorgfältige Code-Inspektion abgesichert, nicht durch Ausführen der GUI.
+
+---
+
+### 5. PROJEKT-KONTEXT & ERKENNTNISSE (Stand 31.07.2026)
+
+**SILVER M1 – Datenbasis & Zeitachse:**
+- Die M1-Daten in `data/market_data.duckdb` sind konsistent mit der MT5-Ground-Truth: **keine leeren Candles, keine Lückenfüller, keine Duplikate, keine ungültigen Candles.**
+- **Zeitkonvention (Wanduhr):** MT5 liefert Zeiten als **Berlin-Wanduhr-encoded Epochs** (empirisch: bei echter UTC 10:00 ist `tick.time` bereits die Zahl „12:00", diff ≈ +7200 s). `sync_market_data()` schreibt sie via `pd.to_datetime(..., unit="s", utc=True)` **1:1** in die DB; `EXTRACT(EPOCH)` und `fetch_historical_candles()` geben genau diese Wanduhr-Epochs an den Chart. ⇒ **Der Chart muss die Epochs DIREKT als Wanduhr formatieren – KEIN Berlin-Offset (+2h/+1h) in `getBerlinParts`, sonst sind alle Labels 2h zu spät.** Das ist automatisch DST-robust (Sommer CEST-encoded / Winter CET-encoded, jeweils direkt korrekt).
+- **Handelspause:** SILVER (XAG) handelt 24/5. Die einzige tägliche Pause ist **Wanduhr 23:00–23:59** (Pause = 3720 s: letzte Bar 22:59 → erste 00:01). Zusätzlich Wochenend-Lücke (Fr 23:00 → So/Mo 00:00 Wanduhr).
+- **Kontext-Regel:** „Keine leeren Candles/Lückenfüller in M1 – Zeitachse muss lückenlos sein außer Handelspause."
+
+**Chart-Leerstelle „30.7.26 23:58" an der Tagesgrenze – GEFIXT (31.07.2026):**
+- **Ursache:** `updateDaySeparators` (chart/js/03_chart_rendering.js) zeichnete Tageslinien mit **gebrochenen Zeiten** (`currTime - 0.5` / `currTime + 0.5`). LWC v5 fügt diese als **Phantom-Index-Slots** in die Timescale ein → sichtbare Leerstelle zwischen zwei Candles. Der Label-Fallback `_continuousTimeMap[ts] || ts` formatierte die Fake-Zeit → „Do 30.07.26 23:58" (Beweis: `test/check_resolve_realtime.js`).
+- **Fix (4 Änderungen):**
+  1. `03_chart_rendering.js`: Separator nutzt jetzt **echte Candle-Zeiten** `prevTime`/`currTime` (statt `±0.5`) → keine Phantom-Slots.
+  2. `01_core.js`: Neue Funktion **`resolveRealTime(ts)`** (Binary-Search auf sortierten `_continuousKeys`) → liefert bei unbekannten Werten den **nächstgelegenen realen Zeitpunkt**, nie die Fake-Zeit.
+  3. `04_live_updates.js`: `tickMarkFormatter`/`timeFormatter` und `updateDaySeparators`-Tag-Berechnung nutzen `resolveRealTime()`; `_continuousKeys` wird bei jedem `applyFullChartUpdate` neu aufgebaut.
+  4. `02_time_utils.js`: **Wanduhr-Fix** – `getBerlinParts`/`formatDT` formatieren die (bereits Wanduhr-encoded) Roh-Epochs direkt ohne Berlin-Offset (+2h/+1h entfernt, `_isBerlinDST` entfällt). Pause = Wanduhr 23:00–23:59 (22:59 → 00:01).
+- **Verifikation:** `node --check` auf allen 4 JS-Dateien, `test/check_resolve_realtime.js` (PASS: 3000/3000 exakte Treffer, Phantom-Zeit → „Fr 31.07.26 00:01" statt „Do 30.07.26 23:58"; Pausen-Grenze 22:59 → 00:01), `test/check_time_utils.js` (PASS), `test/check_html_template.py` (PASS), `test/check_broker_tz.py` (bestätigt: MT5 = Wanduhr-encoded).
+
+**Testdateien in `test/` (regelkonform, keine UI):**
+`test.py`, `check_chart_data.py`, `test_db_lock.py`, `check_time_utils.js`, `check_html_template.py`, `check_m1_consistency.py` (Pausen-Erkennung Wanduhr 23:00–23:59), `simulate_chart_mapping.py`, `check_m1_midnight.py`, `check_mt5_m1_boundary.py`, `check_broker_tz.py` (MT5 = Wanduhr-encoded), `check_app_state.py`, `build_cont_map.py` (erzeugt `tmp_cont_map.json`), `check_resolve_realtime.js`.
+```
+
+--------------------------------------------------
+
+### DATEI: docs/export_project.py
+```py
+# docs/export_project.py
+"""
+export_project.py - Exportiert ALLE Projekt-Quellen nach docs/x_Exports.md
+
+- Projekt-Root wird stabil ueber __file__ bestimmt (unabhaengig vom CWD).
+- Ausgabe erfolgt IMMER in den docs-Ordner.
+- Inkludiert alle Quellen: .py, .js, .ui, .sql, .json, .yaml/.yml, .toml, .md
+  sowie den kompletten docs-Ordner.
+- Ausnahme: x_Exports.md selbst wird NICHT inkludiert.
+"""
+
+import os
+from pathlib import Path
+
+# Projekt-Root: Elternverzeichnis von docs/ (stabil, unabhaengig vom Arbeitsverzeichnis)
+PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
+
+# Ausgabedatei: immer im docs-Ordner
+OUTPUT_PATH: Path = Path(__file__).resolve().parent / "x_Exports.md"
+
+# Dateiendungen, die in den Export aufgenommen werden (inkl. .js und .md)
+ALLOWED_EXTENSIONS = {
+    '.py', '.js', '.ui', '.sql', '.json', '.yaml', '.yml', '.toml', '.md',
+}
+
+# Ordner, die ignoriert werden sollen (keine Quellen)
+IGNORE_DIRS = {
+    '.git', '.idea', '__pycache__', 'venv', 'env', 'build', 'dist', '.venv',
+    'node_modules', '.pytest_cache',
+}
+
+# Dateien, die ignoriert werden sollen (Ausnahme: x_Exports.md selbst)
+IGNORE_FILES = {'x_Exports.md'}
+
+
+def _collect_files() -> list:
+    """Sammelt alle zu exportierenden Dateien (relativer Pfad) in fester Reihenfolge."""
+    collected = []
+    for root, dirs, files in os.walk(PROJECT_ROOT):
+        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+        for file in files:
+            if file in IGNORE_FILES:
+                continue
+            ext = Path(file).suffix.lower()
+            if ext not in ALLOWED_EXTENSIONS:
+                continue
+            full_path = Path(root) / file
+            collected.append(full_path.relative_to(PROJECT_ROOT))
+    # Sortiert nach (Ordner, Dateiname) fuer eine stabile, reproduzierbare Ausgabe
+    collected.sort(key=lambda p: (p.parent.as_posix().lower(), p.name.lower()))
+    return collected
+
+
+def build_project_export() -> None:
+    output_path: Path = OUTPUT_PATH
+
+    with open(output_path, 'w', encoding='utf-8') as out_file:
+        out_file.write(f"# PROJEKT-ÜBERSICHT: {PROJECT_ROOT.name}\n\n")
+
+        # 1. Dateibaum generieren (nur Dateien mit erlaubten Endungen)
+        out_file.write("## 1. ORDNERSTRUKTUR\n```\n")
+        for root, dirs, files in os.walk(PROJECT_ROOT):
+            dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+            level = len(Path(root).relative_to(PROJECT_ROOT).parts)
+            indent = ' ' * 4 * level
+            out_file.write(f"{indent}{Path(root).name}/\n")
+            sub_indent = ' ' * 4 * (level + 1)
+            for f in sorted(files, key=str.lower):
+                if f not in IGNORE_FILES and Path(f).suffix.lower() in ALLOWED_EXTENSIONS:
+                    out_file.write(f"{sub_indent}{f}\n")
+        out_file.write("```\n\n")
+
+        # 2. Dateiinhalte anhängen
+        out_file.write("## 2. QUELLCODE\n\n")
+        files = _collect_files()
+        for rel_path in files:
+            full_path = PROJECT_ROOT / rel_path
+            ext = rel_path.suffix.lower()
+
+            # Sprachbezeichnung für Markdown-Codeblock (.ui ist XML)
+            lang = "xml" if ext == ".ui" else ext.replace(".", "")
+
+            out_file.write(f"### DATEI: {rel_path.as_posix()}\n")
+            out_file.write(f"```{lang}\n")
+
+            try:
+                with open(full_path, 'r', encoding='utf-8') as src_file:
+                    out_file.write(src_file.read())
+            except Exception as e:
+                out_file.write(f"# Fehler beim Lesen der Datei: {e}\n")
+
+            out_file.write("\n```\n\n" + "-" * 50 + "\n\n")
+
+    print(f"Fertig! x_Exports.md erfolgreich erstellt unter:\n{output_path}")
+    print(f"Inkludierte Dateien: {len(files)}")
+
+
+if __name__ == '__main__':
+    build_project_export()
+
+```
+
+--------------------------------------------------
+
+### DATEI: docs/x_Architektur.md
+```md
+# Architektur-Dokumentation: Einheitliche Signal- und ML-Engine für PyTrader
+
+## 1. Executive Summary
+
+Dieses Dokument beschreibt die Architektur-Richtlinien für die Erweiterung des PyTrader-Systems um Mustererkennung und Machine-Learning-gestützte Signalanalyse. Das Kernziel ist die Schaffung einer hochperformanten, entkoppelten Desktop-Architektur (Python/PySide6), die historische Analysen, Live-Marktüberwachung und Statistik-Auswertungen ohne redundante Code-Basis ermöglicht.
+
+Der Lösungsansatz basiert auf einer **einheitlichen Signal-Engine** mit einem vorgeschalteten **Feature Store** und einer strikten **Trennung von Berechnung und Visualisierung** über DuckDB als Kommunikationsschicht.
+
+---
+
+## 2. Architektonische Grundprinzipien
+
+### 2.1. Entkopplung von Berechnung und UI (Datenbank als Brücke)
+Die UI (Chart-Ansicht, Statistik-Fenster) darf unter keinen Umständen blockiert werden. Daher berechnen Indikatoren im Chart keine eigenen Signale.
+*   **Backend (Worker-Prozesse):** Analysieren historische Daten oder Live-Ticks und schreiben alle gefundenen Ereignisse (Patterns, Trends, ML-Signale) kontinuierlich in eine Analytics-Datenbank.
+*   **Frontend (PySide6 / Lightweight Charts):** Die Chart-Overlays und Statistik-Widgets greifen ausschließlich *lesend (read-only)* auf diese Datenbank zu und visualisieren fertige Ergebnisse.
+
+### 2.2. Einheitliche Signal-Engine (`SignalDefinition`)
+Es gibt keine architektonische Trennung zwischen "klassischen Indikator-Regeln", "Chart-Mustern" oder "Machine Learning".
+*   Alle Analyse-Methoden implementieren dieselbe abstrakte Basisklasse (`SignalDefinition`).
+*   Für das System macht es keinen Unterschied, ob ein Signal durch einen gleitenden Durchschnitt (Heuristik) oder durch ein Gradient-Boosting-Modell (ML) generiert wird.
+*   Signale können beliebig in **Signal-Sets** gebündelt und gewichtet werden.
+
+### 2.3. Der Feature Store als Fundament
+Um die Rechenlast im Desktop-Betrieb zu minimieren und das ML-Training zu optimieren, werden Rohdaten (OHLCV) vorab in strukturierte Features transformiert.
+*   Die Feature-Extraktion (z. B. Momentum, Volatilität, Swing-Strukturen, gleitende Durchschnitte) erfolgt nur *einmal*.
+*   Diese berechneten Merkmale werden dauerhaft im *Feature Store* gespeichert.
+*   Sowohl deterministische Regeln als auch ML-Modelle greifen zur Evaluation ausschließlich auf den Feature Store zu, nicht auf rohe Kerzendaten.
+
+### 2.4. Lokale Execution First
+In der Initialphase werden alle Berechnungen lokal innerhalb der nativen Python-Desktop-Umgebung ausgeführt. Komplexe ML-Modelle werden über performante lokale Runtimes eingebunden. Ein ausgelagerter Microservice (z.B. FastAPI/Docker) wird nur bei zukünftigen Skalierungsanforderungen (z.B. massive GPU-Nutzung) in Betracht gezogen.
+
+---
+
+## 3. Datenbank-Architektur (DuckDB)
+
+Die bestehende `market_data.duckdb` (für OHLCV-Rohdaten) wird um eine spezifische `analytics.duckdb` erweitert.
+
+### Tabellen-Struktur (analytics.duckdb)
+
+**1. `feature_store`** (Persistente Speicherung der vorberechneten Merkmale)
+*   `symbol` (VARCHAR)
+*   `timeframe` (VARCHAR)
+*   `bar_time` (TIMESTAMPTZ)
+*   `ema_diff` (DOUBLE), `rsi_14` (DOUBLE), `atr_normalized` (DOUBLE) ... (weitere Features)
+
+**2. `signal_definitions`** (Metadaten zu allen verfügbaren Algorithmen)
+*   `signal_id` (VARCHAR) - Primärschlüssel (z.B. 'trend_ema_cross_v1')
+*   `category` (VARCHAR) - 'rule', 'pattern', 'ml'
+*   `version` (VARCHAR)
+*   `params` (JSON) - Standard-Parameter
+
+**3. `signal_sets`** (Dynamische JSON-Konfiguration kombinierter Signale)
+*   `set_id` (VARCHAR) - Primärschlüssel
+*   `configuration` (JSON) - Enthält die IDs und Gewichtungen der Signale
+*   `logic` (VARCHAR) - 'AND', 'OR', 'WEIGHTED'
+
+**4. `signal_results`** (Zentrale Tabelle für alle erkannten Events – Historie & Live)
+*   `event_id` (VARCHAR) - Primärschlüssel
+*   `symbol` (VARCHAR)
+*   `timeframe` (VARCHAR)
+*   `bar_time` (TIMESTAMPTZ)
+*   `source_id` (VARCHAR) - Verweis auf `signal_id` oder `set_id`
+*   `confidence` (DOUBLE) - Wahrscheinlichkeit / Stärke des Signals
+*   `context_type` (VARCHAR) - 'historical_batch' oder 'live_stream'
+*   `metadata_payload` (JSON) - Zusätzliche Kontextdaten
+
+---
+
+## 4. Software-Struktur & Ordner-Layout
+
+Das Projekt (PyTrader) sollte in eine klare Domain-Struktur unterteilt werden:
+
+```text
+PyTrader/
+├── analytics/
+│   ├── engine/                     # Kernlogik der Analyse
+│   │   ├── signal_runtime.py       # Orchestrierung (Tick/Bar -> Features -> Signals -> DB)
+│   │   ├── set_evaluator.py        # Kombinationslogik für Signal-Sets
+│   │   └── base_definition.py      # Abstrakte Klasse SignalDefinition
+│   ├── features/                   # Logik zur Generierung des Feature Stores
+│   │   ├── feature_builder.py
+│   │   └── definitions/            # (z.B. volatility.py, momentum.py, structure.py)
+│   ├── signals/                    # Die konkreten Algorithmen (Implementierungen)
+│   │   ├── heuristics/             # (z.B. ema_crossover.py)
+│   │   ├── patterns/               # (z.B. pullback.py)
+│   │   └── machine_learning/       # (Inferenz, z.B. xgboost_model.py)
+│   └── background_workers/         # QThread Prozesse
+│       ├── historical_scanner.py   # Batch-Verarbeitung über Historie
+│       └── live_analyzer.py        # Polling/Event-Listener für neue Bars
+├── ui/                             # PySide6 Frontend
+│   ├── chart/                      
+│   │   └── overlays/               # Indikatoren, die aus `signal_results` lesen
+│   └── statistics/                 # Fenster für DuckDB SQL-Aggregationsabfragen
+└── data/                           # Lokale DuckDB Dateien
+
+## 5. Kernprozesse
+
+### 5.1. Historischer Backtest & Scanner
+1. Ein User triggert einen Scan für ein bestimmtes Signal-Set.
+2. Der `historical_scanner` Worker lädt OHLCV-Daten.
+3. Die `feature_builder` Logik berechnet fehlende Features und speichert sie im `feature_store`.
+4. Die `signal_runtime` evaluiert alle Signale des Sets anhand der Features.
+5. Ergebnisse werden via *Bulk-Insert* als 'historical_batch' in `signal_results` geschrieben.
+
+### 5.2. Live-Erkennung
+1. Neue Ticks aggregieren zu einer abgeschlossenen Kerze (Bar-Close).
+2. Der `live_analyzer` Worker extrahiert nur für diese *neue* Kerze die Features.
+3. Die Features werden an die aktive `signal_runtime` übergeben.
+4. Identifizierte Signale werden in `signal_results` als 'live_stream' geschrieben.
+5. Über einen PyQt-Signal-Slot-Mechanismus wird das Chart-Fenster benachrichtigt, die neuen Overlays aus der Datenbank zu laden.
+
+---
+
+## 6. Richtlinien für die KI-gestützte Weiterentwicklung
+
+Wenn Sie diese Dokumentation nutzen, um mit verschiedenen KIs Teilkomponenten auszuarbeiten, beachten Sie folgende Anweisungen für den Prompt-Kontext:
+
+*   **Keine Logik-Vermischung:** Weisen Sie die KI an, Logik für UI-Aktualisierungen strikt von der Signal-Evaluation zu trennen.
+*   **Fokus auf DuckDB:** Fordern Sie effiziente vektorisierte Pandas/Numpy-Operationen, die gut mit DuckDB harmonieren.
+*   **Abstrakte Vererbung:** Bestehen Sie darauf, dass neue Signale zwingend von der `SignalDefinition` Basisklasse erben müssen.
+*   **Desktop-Kompatibilität:** Schließen Sie Lösungen aus, die komplexe verteilte Systeme (Kafka, Redis, Kubernetes) fordern, solange es sich um eine Desktop-Anwendung (Windows 11) handelt.
+
+## 7. Goldene Regeln der Objektorientierung & System-Entkopplung (OOP Principles)
+
+Jede Code-Generierung und Refactoring-Aufgabe durch KI-Assistenten muss strikt den folgenden objektorientierten Design-Prinzipien folgen:
+
+1. **Abstraktion durch Abstrakte Basisklassen (ABC & Polymorphie):**
+   * Keine isolierten Funktionen oder ad-hoc Klassen für Business-Logik.
+   * Jede Kern-Komponente (z. B. Signale, Features, Fenster, Indikatoren) **muss** von ihrer jeweiligen abstrakten Basisklasse erben (`SignalDefinition`, `BaseFeature`, `PersistentWindow`, `BaseIndicator`).
+   * Die aufrufende Engine interagiert **ausschließlich** mit dem abstrakten Interface, niemals mit konkreten Implementierungen[cite: 3].
+
+2. **Vollständige Entkopplung & Inversion of Control (IoC):**
+   * **Keine Zirkulären Abhängigkeiten:** Sub-Module (z. B. Worker oder Dialoge) dürfen niemal Kenntnis von konkreten Orchestratoren (wie `MainWindow`) haben.
+   * **Kommunikation über Signals/Sockets & Repositories:** UI-Komponenten und Datenverarbeiter kommunizieren strikt asynchron über PyQt-Signals oder Read-Only-Datenbankabfragen[cite: 3].
+   * Verboten: Hardcoded Klassennamen-Checks (z. B. `if name == "win_statistics"`) in zentralen Repositories. Fenstertypen müssen sich generisch/dynamisch über Dekoratoren oder Registrys registrieren.
+
+3. **Single Responsibility Principle (SRP - Eine Aufgabe pro Klasse):**
+   * **UI-Klassen (`PySide6`):** Verantwortlich *nur* für Event-Handling und Rendering[cite: 3]. Keine Berechnungen, Indikator-Logik oder direkte DB-Verbindungsaufbauten.
+   * **Worker/Engine-Klassen:** Verantwortlich *nur* für Datenverarbeitung und mathematische Evaluierung[cite: 3]. Absolut kein UI-Import oder GUI-Code.
+   * **Repository-Klassen:** Kapseln den Datenbank-Zugriff exklusiv (SQL-Abfragen, Connection-Handling)[cite: 3].
+
+4. **Offen für Erweiterung, Geschlossen für Änderung (Open/Closed Principle):**
+   * Neue Indikatoren, Strategien oder Fenster müssen durch **Hinzufügen neuer Dateien** implementiert werden können, ohne bestehende Kern-Dateien (`main.py`, `set_evaluator.py`, `feature_builder.py`) modifizieren zu müssen[cite: 3].
+
+5. **Typsicherheit & Verlässliche Datenverträge:**
+   * Strikte Nutzung von Python **Type Hints** (`typing`) für alle Funktionsparameter und Rückgabewerte.
+   * Keine impliziten Dictionaries als Datenverträge zwischen Modulen; Datenströme nutzen definierte Dataframes, Primitive oder Typ-Aliase[cite: 3].
+```
+
+--------------------------------------------------
+
+### DATEI: docs/x_Roadmap.md
+```md
+# Implementierungs-Roadmap: PyTrader Signal- & ML-Engine
+
+## Phase 1: Datenbankschema & Ordnerstruktur
+**Ziel:** Die infrastrukturelle Grundlage schaffen.
+* [ ] Erstellen der neuen Ordnerstruktur (`../analytics`, `../analytics/engine`, `../analytics/features`, `../analytics/signals`, `../analytics/background_workers`).
+* [ ] Erstellen/Initialisieren der `analytics.duckdb`[cite: 3].
+* [ ] Anlegen der SQL-Tabellen[cite: 3]:
+  * `feature_store`[cite: 3]
+  * `signal_definitions`[cite: 3]
+  * `signal_sets`[cite: 3]
+  * `signal_results`[cite: 3]
+
+---
+
+## Phase 2: Feature Store Builder
+**Ziel:** Vektorisierte Merkmalsextraktion aus OHLCV-Rohdaten in `market_data.duckdb`[cite: 3].
+* [ ] Implementierung der Basisklasse für Features.
+* [ ] Erstellung erster Standard-Features (z. B. EMA-Steigungen, ATR-Normierung, RSI, Swing Highs/Lows).
+* [ ] Aufbau des `feature_builder.py`: Liest OHLCV aus `market_data.duckdb`, berechnet Features vektorisiert (via Pandas/Numpy) und schreibt sie per Bulk-Insert in `analytics.duckdb` (`feature_store`)[cite: 3].
+
+---
+docs ordner
+## Phase 2.1: Multi-Dimensionale Feature Store Erweiterung (Grid, Levels & Kontext)
+
+Ziel: Erweiterung des feature_builder.py zur vektorisierten Berechnung und Speicherung multidimensionaler Markt-Merkmale (Y-Achse / Price Levels, X-Achse / Zeit-Sessions, Markt-Regimes und Cross-Symbol-Kontext) direkt auf der bar_time-Zeitachse im feature_store.
+
+### 1. Dimensionen-Architektur im feature_store
+
+Neben klassischen Indikator-Features (EMA, ATR) berechnet der FeatureBuilder nun vier spezialisierte Merkmal-Kategorien, die als Spalten in analytics.duckdb (feature_store) abgelegt werden:
+
+    Y-Achsen Level-Features (Preis & Zonen):
+    * Grid-Raster-Levels (grid_nearest_level, grid_dist_abs).
+    * Pivot Highs/Lows, Liquidity Pool Zonen.
+    * Perioden-Ankerpunkte (Session / Daily / Weekly High, Low, POC, VAH, VAL).
+
+    X-Achsen & Zeit-Features (Sessions & Zonen):
+    * Session-Klassifizierung (session_type: Asia, London, NY Overlap).
+    * Tageszeit-Indikatoren (tod_minute: 0–1439 Mins).
+    * Zeitfenster-Flags (is_time_window_active: Volle/Halbe Stunde Filter).
+
+    Markt-Regime-Features (Phasen-Score):
+    * Trend- vs. Range-Identifikation (regime_trend_score).
+    * Volatilitäts-Expansions-Klassifizierung (regime_volatility).
+
+    Cross-Symbol & Multi-Timeframe-Features:
+    * Zeitreihengenaue Joins paralleler Symbole (z. B. gold_m1_close, gold_m1_diff auf SILVER M1).
+    * Übergeordnete Trend-Biases (z. B. h4_ema_trend, d1_bias).
+
+### 2. Datenfluss & Entkopplung (Features vs. Overlay vs. Signal)
+
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ 1. BERECHNUNG & STORE (analytics/features/definitions/)                    │
+ │    FeatureBuilder berechnet Y/X-Level, Regimes & Cross-Data vektorisiert    │
+ │    und speichert sie als Spalten in analytics.duckdb (feature_store).        │
+ └──────────────────────────────────────┬──────────────────────────────────────┘
+                                        │
+             ┌──────────────────────────┴──────────────────────────┐
+             ▼                                                     ▼
+ ┌───────────────────────────────────────┐   ┌─────────────────────────────────┐
+ │ 2. DYNAMISCHES OVERLAY (Frontend)     │   │ 3. COMPOSITE SIGNALS (Engine)   │
+ │    GridIndicator & Visual Plugins     │   │    CompositeSignals laden die   │
+ │    berechnen/zeichnen Linien & Zonen │   │    Kontext-Matrix, evaluieren   │
+ │    on-demand im Chart-Window.         │   │    Proximity/Touches & schreiben │
+ └───────────────────────────────────────┘   │    in signal_results.           │
+                                             └─────────────────────────────────┘
+### Aufgaben-Checkliste Phase 2.1
+
+* [ ] Erweiterung der Feature-Basisklasse (analytics/features/base_feature.py):
+* Unterstützung für Multi-Spalten-Rückgaben (DataFrames) aus einzelnen Feature-Modulen.
+* [ ] Implementierung von Level-Features (analytics/features/definitions/grid_levels.py):
+* Vektorisiertes Berechnen von nächstgelegenen Grid-Levels, Abständen und zeitlichen Fenster-Flags (is_time_window_active).
+* [ ] Implementierung von Zeit- & Session-Features (analytics/features/definitions/time_context.py):
+* Extraktion von Handels-Sessions (Asia/London/NY) und Time-of-Day-Minuten aus TIMESTAMPTZ.
+* [ ] Implementierung von Cross-Symbol-Joins im FeatureBuilder (analytics/features/feature_builder.py):
+* Vektorisiertes Mergen von Datenreihen anderer Symbole/Timeframes auf exakte bar_time-Timestamps.
+* [ ] Anpassung der Bulk-Upsert-Logik (feature_builder.py):
+* Erweiterung der dynamischen SQL-Generierung (INSERT INTO feature_store) für erweiterte Schema-Spalten.
+* [ ] Integrationstest für multidimensionale Feature-Stores (test.py / test_core_logic.py):
+* Validierung der korrekten Berechnung von Grid-Abständen, Zeit-Flags und Cross-Symbol-Zuordnungen.
+
+---
+
+## Phase 3: Signal Engine & Erste Regel-Signale (Heuristiken)
+**Ziel:** Ein klares, einheitliches Interface für alle Signale definieren, gewichtete Signal-Sets unterstützen und erste Regeln auf Basis von EMA und ATR testen (ohne ML)[cite: 3].
+
+### Getroffene Architekturentscheidungen
+1. **Signal-Rückgabe (Option A):** Die `SignalDefinition` liefert primär schlanke Zeitreihen mit einem `confidence`-Score ($0.0$ bis $1.0$)[cite: 3]. Zusätzliche Preisdaten (High/Low/Close) werden bei Bedarf direkt aus der DuckDB nachgeladen[cite: 3].
+2. **Kombinationslogik (`WEIGHTED`):** Der `set_evaluator.py` nutzt gewichtete Summen zur Auswertung von Signal-Sets (inkl. Schwellenwert/Threshold)[cite: 3]. Damit lassen sich klassische `AND`/`OR`-Bedingungen abbilden und spätere ML-Wahrscheinlichkeiten nahtlos integrieren[cite: 3].
+3. **Erste Test-Signale:** Umsetzung von `ema_trend.py` (Trendrichtung/Steigung) und `atr_filter.py` (Volatilität/Abstand) als Referenz-Implementierungen.
+
+### Aufgaben-Checkliste
+* [ ] **Implementierung der Basisklasse (`../analytics/engine/base_definition.py`):**
+  * Abstrakte Klasse `SignalDefinition` definieren (`signal_id`, `version`, `params`)[cite: 3].
+  * Abstrakte Methode `evaluate(df_features)` erzwingen, die eine Pandas Series/DataFrame mit `confidence`-Scores zurückgibt[cite: 3].
+* [ ] **Erstellung der ersten Regel-Signale:**
+  * `../analytics/signals/heuristics/ema_trend.py`: Nimmt `ema_20`, `ema_50` oder `ema_slope` aus dem Feature Store und bewertet die Trendstärke[cite: 3].
+  * `../analytics/signals/heuristics/atr_filter.py`: Evaluierte `atr_norm` zur Bestimmung relevanter Volatilitäts- bzw. Ausbruchszustände[cite: 3].
+* [ ] **Aufbau des Set-Evaluators (`../analytics/engine/set_evaluator.py`):**
+  * Einlesen von JSON-Konfigurationen für `signal_sets`[cite: 3].
+  * Berechnung des gewichteten Gesamt-Scores pro Bar:
+    $$\text{Score}_{\text{gesamt}} = \sum (\text{confidence}_i \times \text{weight}_i)$$
+  * Evaluierung gegen den definierten Schwellenwert (`threshold`)[cite: 3].
+* [ ] **Stand-Alone Integrationstest (`test_signal_engine.py`):**
+  * Laden der vorberechneten Merkmale aus `feature_store`[cite: 3].
+  * Ausführen des `set_evaluator.py` mit einem Test-Set aus EMA + ATR[cite: 3].
+  * Überprüfung der korrekten Score-Berechnung in der Konsole.
+
+---
+
+## Phase 4: Historischer Scanner & Chart-Overlay
+**Ziel:** Das System End-to-End über historische Daten im Chart sichtbar machen. Die Steuerung erfolgt entkoppelt über ein Service-Kontrollfenster, während das Rendering über einen dynamischen Signal-Button im Chart gestartet wird[cite: 3].
+
+### Getroffene Architekturentscheidungen
+1. **Service-Steuerung (Main Window):** 
+   * Ein "Service"-Button im Hauptfenster öffnet das Service-Fenster (`service_window.ui`).
+   * **Symbol-Auswahl:** Dropdown-Auswahl für Symbole (aktuell `SILVER` und `GOLD`).
+   * **Timeframe-Strategie:** Ein Scan verarbeitet immer automatisch *alle* verfügbaren Timeframes für das gewählte Symbol.
+   * **Scan-Modus (Checkbox "New Scan"):**
+     * **Aktiviert (`Checked`):** Löscht bestehende Signale für das Symbol/TF in `signal_results` komplett und führt einen vollständigen Re-Scan über die gesamte Historie durch.
+     * **Deaktiviert (`Unchecked` / Update-Modus):** Prüft die Zeitstempel vorhandener Signale und scannt nur den fehlenden Zeitraum ab dem letzten Signalstempel bis zur neuesten verfügbaren Kerze in `market_data.duckdb`.
+   * **Performance-Anzeige:** Echtzeit-Zeitmessung (Laufzeit-Timer / *Elapsed Time*) während des Scans.
+2. **Chart-Integration ("Signale"-Button):** 
+   * Ein "Signale"-Button im Chart-Fenster (`chart_window.ui`) öffnet einen Auswahl-Dialog/Dropdown.
+   * Der User kann gezielt auswählen, *welches* konfigurierte `signal_set_id` im aktuellen Chart gerendert werden soll (ideal zum Vergleichen und Testen neuer Signale).
+3. **Chart-Rendering (Phase 4):**
+   * **Initial-Phase (Option A):** Verwendung der nativen Standard-Marker von Lightweight Charts (z. B. Pfeile/Shapes oben und unten an der Kerze) über die JavaScript-Bridge.
+   * **Ausblick (Zukunft):** Vorbereitung der Architektur darauf, später benutzerspezifische Visualisierungen (Custom Shapes, Zonen, Boxen) außerhalb der Standard-Chart-Objekte pro Signal-Typ zu unterstützen.
+4. **Qt Designer Integration:** Alle Fenster und Dialoge werden strikt als `.ui`-Dateien erstellt und dynamisch über PySide6 geladen[cite: 3].
+
+### Aufgaben-Checkliste
+
+* [ ] **Erstellung des Service-Kontrollfensters (`ui/service_window.ui` & `../service_win.py`):**
+  * QComboBox für Symbol (`SILVER`, `GOLD`).
+  * QCheckBox ("New Scan").
+  * QLabel für die Laufzeitanzeige (*Elapsed Time*) & QProgressBar.
+  * Anbindung des "Service"-Buttons im `main_window.ui`.
+
+* [ ] **Implementierung des Background-Scanners (`../analytics/background_workers/historical_scanner.py`):**
+  * `QThread`-Worker mit Stoppuhr-Timer[cite: 3].
+  * Logik für **Delete & Re-Scan** vs. **Delta-Update** (Zeitstempel-Abgleich zwischen `ohlcv_bars` und `signal_results`).
+  * Schleife über alle Timeframes für das ausgewählte Symbol.
+  * Ausführung von `feature_builder` und `set_evaluator`[cite: 3].
+  * Schreiben in `signal_results` (`analytics.duckdb`)[cite: 3].
+
+* [ ] **Erweiterung des Chart-Fensters (`ui/chart_window.ui` & `chart_win.py`):**
+  * Hinzufügen des "Signale"-Buttons in die Chart-UI.
+  * Öffnen eines Auswahl-Dialogs zur Selektion des gewünschten `signal_set_id`.
+
+* [ ] **Implementierung des Signal-Indikators (`ui/chart/overlays/signal_overlay.py`):**
+  * Liest gefiltert aus `signal_results` für Symbol, Timeframe & gewähltes `set_id`[cite: 3].
+  * Übergabe der Daten als Standard-Marker an Lightweight Charts.
+
+* [ ] **End-to-End Integrationstest:**
+  1. Testlauf Update-Scan vs. Full-Scan für `SILVER` (Zeitmessung prüfen).
+  2. Chart für `SILVER` öffnen -> Klick auf "Signale" -> Signal-Set auswählen -> Marker im Chart prüfen.
+
+---
+
+## Phase 5: Statistikfenster & SQL-Auswertung
+**Ziel:** Schaffung einer entkoppelten, nicht-modalen Analyse-Umgebung zur Auswertung historischer Signal-Treffer, Forward-Performances und Signal-Verteilungen über direkte DuckDB-SQL-Abfragen[cite: 3].
+
+### Getroffene Architekturentscheidungen
+1. **Fenster-Architektur (Nicht-Modales QMainWindow):** 
+   * Aufruf über den neuen Button **"Statistik"** (Icon: 📊) im Hauptfenster (`main_window.ui`).
+   * Das Fenster läuft völlig unabhängig vom Chart-Betrieb (nicht-modal), um den aktiven Trading-Workflow nicht zu blockieren und die freie Platzierung auf mehreren Monitoren zu ermöglichen.
+2. **Entwicklungs-Fokus (Interface & Exemplarische Analyse):**
+   * **Stufe 1 (Interface):** Aufbau des vollständigen UI-Layouts inklusive dynamischer Filterung und Auswertungs-Karten.
+   * **Stufe 2 (Exemplarische Forward-Analyse):** Implementierung einer ersten Beispiel-Auswertung, die für jedes Signal prüft, wie sich der Kurs $N$ Kerzen in die Zukunft (aus `market_data.duckdb`) entwickelt hat (z.B. Erreichen eines $1.5 \times \text{ATR}$-Ziels).
+3. **Interaktivität ("Jump-to-Bar"):** Ein Doppelklick auf eine Signal-Zeile in der Statistik-Tabelle fokussiert oder öffnet das entsprechende Chart-Fenster exakt an der Position des gewählten Zeitstempels (`bar_time`).
+4. **Qt Designer Integration:** Das Fenster-Layout wird strikt als `.ui`-Datei (`statistics_window.ui`) angelegt und dynamisch geladen[cite: 3].
+
+### Aufgaben-Checkliste
+
+* [ ] **Erstellung des UI-Layouts (`ui/statistics_window.ui` & `ui/statistics_window.py`):**
+  * **Filter-Header:**
+    * `QComboBox` für Symbol-Filter (`SILVER`, `GOLD`, `ALLE`).
+    * `QComboBox` für Timeframe-Filter (`H1`, `M5`, `ALLE`).
+    * `QComboBox` für `source_id` (Auswahl des Signal-Sets).
+  * **Summary Cards (Kennzahlen-Karten):**
+    * Quick-Stats: *Gesamtzahl Signale*, *Ø Confidence*, *Trefferquote (Win-Rate %)*, *Bester Timeframe*.
+  * **Detail-Tabelle (`QTableWidget`):**
+    * Spalten: `Time`, `Symbol`, `Timeframe`, `Signal-Set`, `Confidence`, `Outcome (Win/Loss)`.
+  * **Anbindung im Hauptfenster:** Hinzufügen des Buttons "Statistik" in `main_window.ui` und Verknüpfung mit der Instanziierung von `StatisticsWindow`.
+
+* [ ] **Implementierung des Statistik-Repositorys (`../analytics/statistics_repository.py`):**
+  * **Aggregations-Queries:** SQL-Abfragen auf `signal_results` in `analytics.duckdb` für Signalanordnungen, Häufigkeiten und Confidence-Mittelwerte[cite: 3].
+  * **Exemplarische Forward-Performance-Engine:**
+    * Verknüpfung von `signal_results` (`analytics.duckdb`) mit `ohlcv_bars` (`market_data.duckdb`) über `bar_time`[cite: 3].
+    * Bestimmung der Kursveränderung nach $N$ Bars (z. B. $N=10$) zur Berechnung einer beispielhaften Erfolgsquote.
+
+* [ ] **Implementierung der "Jump-to-Bar"-Schnittstelle:**
+  * Event-Handler für `itemDoubleClicked` auf der Signal-Tabelle.
+  * Senden eines Signals an das Hauptfenster, um das passende Chart (`PyTraderChartWindow`) auf das Symbol/TF umzustellen und zum exakten Timestamp zu scrollen (`visible_range`).
+
+* [ ] **Integrationstest Phase 5:**
+  1. Klick auf "Statistik" im Main-Window -> Nicht-modales Fenster öffnet sich parallel.
+  2. Filter auf `SILVER` / `H1` setzen -> Tabelle und Summary-Karten aktualisieren sich ohne Verzögerung.
+  3. Doppelklick auf einen Tabelleneintrag -> Chart-Fenster springt zur entsprechenden Kerze.
+
+---
+
+# Phase 6: Live-Erkennung, ML-Integration & Property-Steuerung
+
+## 1. Übersicht & Zielsetzung
+In Phase 6 wird das PyTrader-System um die **Live-Analyse bei Kerzenschluss (Bar-Close Event)** und die **Integration von ML-Inferenzmodellen (XGBoost / LightGBM)** erweitert. Zudem wird eine globale Eigenschafts-Steuerung über ein neues, nicht-modales **Properties-Fenster** geschaffen, deren Einstellungen konsistent über den erweiterten `StateManager` in der Tabelle `app_config` (`app_data.duckdb`) persistenziert werden.
+
+Als Prototyp und Funktionstest dient ein dynamisches, experimentelles **Test-Signal (Alternierende Pfeile)** auf **SILVER (M1)**, um die gesamte Pipeline (Tick $\rightarrow$ Bar-Close $\rightarrow$ Feature Store $\rightarrow$ ML/Signal-Engine $\rightarrow$ Persistence $\rightarrow$ UI-Overlay) ohne Hardcoding auf Lauffähigkeit zu prüfen.
+
+
+## 2. Architektonische Vorgaben & Festlegungen
+
+### 2.1. Konsistente Property-Persistierung (`AppSettings` & `StateManager`)
+1. **Kein Regelbruch / Keine Redundanz:** Anstatt ein neues Repository zu erfinden, wird der bestehende `StateManager` (`../state_manager.py`) als zentraler I/O-Verwalter für `app_data.duckdb` genutzt. Er wird um die Methoden `get_app_settings()` und `save_app_settings()` erweitert, die auf die bestehende Tabelle `app_config` zugreifen.
+2. **Klassenmodell (`AbstractStateModel` & `AppSettings`):**
+   * Erstellung der typsicheren Data-Class `AppSettings` (`../config/app_settings.py`), die von einer abstrakten Basisklasse `AbstractStateModel` erbt (implementiert `to_dict()` und `from_dict()`).
+   * Bündelt globale Anwendungs-Defaults (z. B. `lookback_warmup_bars: int = 500`).
+3. **Properties-Button & Nicht-modales Fenster (`PropertiesWindow`):**
+   * Im Hauptfenster (`win_main`) wird ein Button "Properties" mit dem Icon `settings` (oder `gear`/`sliders`) integriert.
+   * Das Fenster erbt von `PersistentWindow` (`win_properties`), öffnet sich nicht-modal (`show()`) und registriert sich über den `@register_persistent_window`-Dekorator in `persistent_window.py`.
+   * Ändert der User Werte im Properties-Fenster, werden sie direkt über `StateManager.save_app_settings()` in `app_data.duckdb` geschrieben.
+4. **Zwei-Ebenen-Hierarchie (App-Defaults vs. Chart-Instanz):**
+   * `AppSettings.lookback_warmup_bars` dient als **globaler Standardwert** (Default = 500).
+   * Jedes `PyTraderChartWindow` liest bei seiner Erstellung diesen Wert in eine eigene Instanz-Variable (`self.lookback_warmup_bars`) ein. Spätere chart-spezifische Optionensdialoge können diesen Instanzwert überschreiben.
+   * Der `live_analyzer` Worker erhält seinen Lookback-Wert per **Dependency Injection** direkt aus der Instanz-Variable des aufrufenden Chart-Fensters.
+
+### 2.2. Feature Store Persistierung (Option A: Sofort-Persistierung)
+1. Sobald eine Live-Kerze schließt, berechnet der `live_analyzer` deren Features via `FeatureBuilder`.
+2. Die Zeile wird **sofort** per `INSERT` in die Tabelle `feature_store` (`analytics.duckdb`) geschrieben.
+3. **Latenz- & Duplikatsschutz:** Da unter Windows 11 / System-Events kurze Latenz-Spitzen auftreten können, wird die Datenbank-Integrität über ein Eindeutigkeits-Constraint geschützt:
+   * Unique Key: `(symbol, timeframe, bar_time)`
+   * Bei Time-Collision greift `INSERT OR REPLACE` bzw. `ON CONFLICT DO NOTHING`.
+   *(Hinweis: Sollte sich der DB-I/O im Live-Betrieb künftig als Flaschenhals erweisen, kann die Evaluierung auf RAM-Only umgestellt werden).*
+
+### 2.3. ML-Modell-Nomenklatur & ONNX-Perspektive
+1. **Modell-Namenskonvention:** Modell-Dateien folgen strikt dem Schema:
+   `model_<algo>_<symbol>_<timeframe>_<created_YYYYMMDD>_<updated_YYYYMMDD>.<ext>`
+   * *Beispiel:* `model_lgb_SILVER_M1_20260730_20260730.json`
+2. **Inferenz-Klassen:** 
+   * `LightGBMSignal` und `XGBoostSignal` erben von `SignalDefinition` (`../analytics/signals/machine_learning`).
+   * Die zu ladende Modell-Datei wird dynamisch über den `params`-Block im JSON-Signal-Set definiert.
+3. **Zukunfts-Option (ONNX):** Für die Initialphase werden die nativen Python-APIs (`lightgbm` / `xgboost`) genutzt. Bei sehr großen Datenmengen oder extremen Taktzeiten kann die Inferenzklasse intern transparent auf `onnxruntime` umgestellt werden, ohne den Anwendungscode oder die Signal-Sets anzupassen.
+
+
+## 3. Test-Signal (Experimental Signal) & Live-Ticker Anbindung
+
+1. **Kein Hardcoding / Kein simples EMA-Cross:** Da einfache EMAs im M1-Chart zu wenige Signale generieren, wird ein experimentelles Test-Signal implementiert (`../analytics/signals/experimental/alternating_arrow_signal.py`).
+2. **Signal-Logik:**
+   * Erbt von `SignalDefinition`.
+   * Bewertet die geschlossene Kerze im `live_analyzer` und liefert wechselnde Signale (`+1.0` für Buy/Pfeil oben, `-1.0` für Sell/Pfeil unten).
+3. **Live-Ticker Kaskade bei Bar-Close:**
+   * Der Live-Ticker / Feed erkennt das Bar-Close-Event der M1-Kerze auf `SILVER`.
+   * Triggert den `live_analyzer` Worker-Thread.
+   * `live_analyzer` $\rightarrow$ Berechnet Features $\rightarrow$ Schreibt in `feature_store` $\rightarrow$ Invoziert Signal-Engine/ML $\rightarrow$ Schreibt Resultat in `signal_results` (`context_type = 'live_stream'`) $\rightarrow$ Emittiert PyQt-Signal.
+   * Das Chart-Overlay empfängt das Signal, liest den neuen Eintrag aus `analytics.duckdb` und rendert den neuen Pfeil über/unter der aktuellen Kerze.
+
+## Phase 3.1: Signal-Aktualisierung & Betriebsmodi (`liveOp`)
+
+**Ziel:** Erfassung und Aktualisierung von Signalen bei Lücken (Offline-Phasen, geschlossene Charts) sowie die strikte Trennung zwischen dynamisch zu aktualisierenden Live-Signalen und statischen Modellen für historische Untersuchungen.
+
+### 1. Modell-Klassifizierung (`liveOp`)
+
+Jede `SignalDefinition` erhält eine explizite Konfigurationseinstellung `live_op: bool` (Default = `True`), um das Verhalten bei der Signalverarbeitung festzulegen:
+
+*   **`liveOp = True` (Dynamischer Live-Modus, z. B. `AlternatingArrowSignal`):**
+    *   Signale werden kontinuierlich im Live-Betrieb verarbeitet und aktualisiert.
+    *   Beim Öffnen oder Wechseln eines Symbol:Timeframe-Pärchens im Chartfenster wird das Signal für dieses Pärchen automatisch geprüft und auf den neuesten Stand gebracht.
+*   **`liveOp = False` (Statischer Benchmark-Modus, z. B. `EMATrendSignal`):**
+    *   Signale dienen ausschließlich als unveränderliche historische Datengrundlage für statistische Auswertungen und Backtests.
+    *   Es erfolgt kein automatisches Tracking oder Update beim Aufruf im Chartfenster.
+
+---
+
+### 2. Aktualisierungs-Pfade (Automatik vs. Manuell)
+
+Die Schließung von Datenlücken in `analytics.duckdb` erfolgt über zwei klar getrennte Pfade ohne die Notwendigkeit eines dauerhaften 24/7-Hintergrunddienstes:
+
+
+                          ┌───────────────────────────────────────┐
+                          │         Signal-Aktualisierung         │
+                          └───────────────────┬───────────────────┘
+                                              │
+                      ┌───────────────────────┴───────────────────────┐
+                      ▼                                               ▼
+             [ AUTOMATISCH ]                                     [ MANUELL ]
+    (Chart-Aufruf mit liveOp = True)                    (ServiceWindow / Service-Call)
+                      │                                               │
+ - Reagiert auf aktives Chartfenster.            - Manueller Trigger im Service-Fenster.
+ - Aktualisiert gewähltes Symbol/TF-Pärchen.     - Verarbeitet beliebige Symbol/TF-Pärchen
+ - Ausgeführt über den LiveAnalyzer.              unabhängig von geöffneten Charts.
+ 
+ 
+ 3. **Automatisch (Chart-Trigger):**
+   * Sobald ein Chart für ein Symbol:Timeframe-Pärchen geöffnet wird, prüft das System, ob aktive Signal-Sets den Modus `liveOp = True` besitzen.
+   * Fehlende Signale seit dem letzten DB-Zeitstempel werden direkt für dieses Pärchen neu berechnet und nachgeführt.
+4. **Manuell (Service-Trigger):**
+   * Über das `ServiceWindow` (`../service_win.py`) und den `HistoricalScanner` können beliebige Datenreihen manuell aktualisiert werden – sowohl für inaktive Charts als auch für Modelle mit `liveOp = False`.
+5. **Optionaler Background-Service (Zukunfts-Option):**
+   * Ein vollautomatischer 24/7-Background-Service für geschlossene Charts kann zu einem späteren Zeitpunkt als eigener Worker nachgerüstet werden, nutzt aber dieselbe Schnittstelle wie der manuelle Service-Trigger.
+
+
+### Aufgaben-Checkliste Phase 3.1
+
+6. **Erweiterung der Signal-Basisklasse (`../analytics/engine/base_definition.py`):**
+   * Hinzufügen des Property `live_op: bool` zur Klasse `SignalDefinition`.
+7. **Anpassung der Live-Engine (`../analytics/background_workers/live_analyzer.py`):**
+   * Filtern der zu evaluierenden Signale vor der Ausführung: Nur Signale mit `live_op == True` werden im Live-Pipeline-Durchlauf verarbeitet.
+8. **Chart-Trigger-Integration (`../chart/chart_win.py`):**
+   * Beim Wechsel von Symbol oder Timeframe automatischen Update-Check anstoßen, sofern für das Pärchen `liveOp = True` gesetzt ist.
+
+
+## 4. Aufgaben-Checkliste für die IDE AI
+
+* [ ] **1. Settings-Klassenstruktur & StateManager-Erweiterung:**
+  * Erstellung von `../config/base_state_model.py` (`AbstractStateModel` ABC).
+  * Erstellung von `../config/app_settings.py` (`AppSettings` Data-Class erbt von `AbstractStateModel`, `lookback_warmup_bars: int = 500`).
+  * Erweiterung von `../state_manager.py` um `get_app_settings()` und `save_app_settings()` (nutzt die bestehende Tabelle `app_config` in `app_data.duckdb`).
+
+* [ ] **2. UI & Properties-Steuerung:**
+  * Erstellung / Anpassung von `ui/properties_win.ui` und `properties_window.py` (erbt von `PersistentWindow`).
+  * Hinzufügen des Dekorators `@register_persistent_window` zur Klasse `PropertiesWindow`.
+  * Integration des "Properties"-Buttons mit Icon (`settings`) im Hauptfenster `win_main`.
+  * Einbau der Interaktion: SpinBox für `lookback_warmup_bars` liest über `state_manager.get_app_settings()` und speichert Änderungen direkt über `state_manager.save_app_settings()`.
+
+* [ ] **3. Integration in `PyTraderChartWindow`:**
+  * Liest bei Initialisierung `app_settings.lookback_warmup_bars` in die Instanz-Variable `self.lookback_warmup_bars`.
+  * Injiziert `self.lookback_warmup_bars` über den Konstruktor an den `live_analyzer` Worker.
+
+* [ ] **4. Experimental Signal (`../analytics/signals/experimental/alternating_arrow_signal.py`):**
+  * Erstellung der Klasse `AlternatingArrowSignal` (erbt von `SignalDefinition`).
+  * Implementierung der `evaluate()`-Methode mit deterministisch alternierendem Status basierend auf dem `bar_time`-Index oder State.
+
+* [ ] **5. ML Inferenz-Klassen (`../analytics/signals/machine_learning`):**
+  * Erstellung von `lightgbm_signal.py` und `xgboost_signal.py` (erben von `SignalDefinition`).
+  * Dynamisches Laden der Modell-Datei aus `params['model_file']` unter Beachtung der neuen Datums-Nomenklatur.
+
+* [ ] **6. Worker-Thread `live_analyzer.py` (`../analytics/background_workers`):**
+  * Empfängt `lookback_warmup_bars` im Konstruktor.
+  * Bar-Close Event Handling für `SILVER` `M1`.
+  * Feature-Berechnung und sofortiger `INSERT OR REPLACE`-Write in `feature_store` (`analytics.duckdb`).
+  * Signal-Evaluierung über die geladenen Signal-Sets (`SetEvaluator`).
+  * Insert der Treffer in `signal_results` (`context_type = 'live_stream'`) und Auslösen des PyQt-Signals `new_live_signal_emitted`.
+
+* [ ] **7. Live-Integration & Chart-Drawing Test:**
+  * Anbindung des PyQt-Signals an das Chart-Overlay in `PyTraderChartWindow`.
+  * Simulation/Durchlauf auf `SILVER M1`: Verifizieren, dass nach jedem Bar-Close vollautomatisch ein Pfeil über/unter der geschlossenen Kerze erscheint, ohne dass das UI einfriert.
+
+
+## Phase 7: System- & Logic-Testing
+**Ziel:** Absicherung der mathematischen Kernkomponenten, Indikator-Features und Datenbank-Mengenoperationen über token-schonende, isolierte Unit-Tests.
+
+### Getroffene Architekturentscheidungen
+1. **Pragmatische Testing-Strategie (Slim Core-Testing):**
+   * Strikter Verzicht auf GUI- oder MT5-Live-Tests zur Minimierung der Prompt-Länge und des Token-Verbrauchs.
+   * Konsolidierte, isolierte Unit-Tests ausschließlich für mathematische Kernkomponenten (`BaseFeature`, `SignalDefinition`, `SetEvaluator` und DuckDB-Queries) in schlanken Testskripten (`test_core_logic.py`).
+
+### Aufgaben-Checkliste
+
+* [ ] **Aufbau des mathematischen Core-Testings (`test_core_logic.py`):**
+  * Unit-Tests für `FeatureBuilder`: Prüfen der Korrektheit vektorisierter Indikatorberechnungen (z. B. `ema_diff`, `atr_normalized`) auf festen synthetischen Arrays.
+  * Unit-Tests für `SetEvaluator`: Evaluierung der gewichteten Score-Berechnung und Threshold-Schwellen.
+  * Integrationstest für DuckDB-Mengenoperationen und Zeitstempel-Sortierungen (`signal_results` / `feature_store`).
+
+---
+
+## Phase 8: Erweiterte Statistik-Visualisierung (Signals & Zones)
+**Ziel:** Erweiterung des Statistik-Moduls um visuelle Grafiken (Zeitzonen-Heatmaps & Parameter-Grid-Surfaces) zur reinen Signal- und Performance-Analyse (ohne finanzielle Equity-Bewertung)[cite: 3].
+
+### Getroffene Architekturentscheidungen
+1. **Visuelle Analyse-Modi (Statistik-Subtabs):**
+   * Einbindung von Subtabs im `StatisticsWindow` (`../ui/statistic_win.ui`) für grafische Auswertungen über Highcharts/Chart.js (via `QWebEngineView`) oder Seaborn/Matplotlib-Rendition.
+2. **Visualisierungs-Fokus (Pure Signal Stats):**
+   * **Handelszeiten-Heatmap:** Signal-Trefferquote & Dichte-Matrix nach Wochentagen (Mo–Fr) $\times$ Tagesstunden (0–23 Uhr).
+   * **Parameter-Grid-Surface:** 2D-Heatmap zur Evaluierung von Reihen-Tests / Grid-Search (Sichtbarmachung von Sweet-Spots & Vermeidung von Curve-Fitting).
+   * *Hinweis:* Finanzielle Metriken (Kontostand, Drawdowns) sind explizit ausgeklammert und folgen in späteren Phasen.
+
+### Aufgaben-Checkliste
+
+* [ ] **Erweiterung des Statistik-Repositorys (`../analytics/statistics_repository.py`):**
+  * SQL-Abfrage für Stunden-/Wochentags-Aggregationen (Tageszeit-Heatmap) auf `signal_results` in `analytics.duckdb`.
+  * Aggregations-Query für Parameter-Grid-Matrizen aus Reihen-Tests (Grid-Search).
+
+* [ ] **Erweiterung des Statistik-UI (`../ui/statistic_win.ui` & `statistic_window.py`):**
+  * Integration von Subtabs (z. B. `Tab 1: Tabelle`, `Tab 2: Zeitzonen-Heatmap`, `Tab 3: Grid-Search Surface`).
+  * Einbau eines `QWebEngineView`-Widgets zur Darstellung interaktiver HTML/JS-Grafiken (oder Rendering statischer Seaborn-Heatmaps).
+
+
+## Phase 9: Automatisierte Reihen-Tests & Grid-Search Engine
+**Ziel:** Vollautomatische Evaluierung von Parameter-Bandbreiten (Grid-Search) über historische Daten, um optimale Parameter-Kombinationen sowie ideale Handelszeiten (Green/Red Zones) datengetrieben ohne manuelle Eingriffe zu ermitteln.
+
+### Getroffene Architekturentscheidungen
+1. **Parameter-Matrix (Grid-Search Schema):**
+   * Übergabe von Parameter-Bandbreiten (Start, Ende, Schrittweite) in der JSON-Set-Konfiguration anstelle von Einzelwerten.
+   * Der `historical_scanner` generiert aus der Matrix alle möglichen Parameter-Kombinationen.
+2. **Vektorisierte Batch-Evaluierung (High Performance):**
+   * Die mathematischen Features werden pro Symbol/TF **nur ein einziges Mal** aus dem `feature_store` geladen.
+   * Der `set_evaluator` rechnet alle Parameter-Variationen im Arbeitsspeicher vektorisiert durch und schreibt die Ergebnisse mit variierten `source_id`-Kennungen (oder spezifischer `run_id`) in `signal_results` (`analytics.duckdb`).
+3. **Automatisierte Zonen-Generierung:**
+   * Nach Abschluss eines Reihen-Tests analysiert eine SQL-Aggregationslogik die Trefferverteilung nach Wochentagen und Tagesstunden.
+   * Erzeugung eines dynamischen Time-of-Day-Filters (Ausschluss von Red/Filter-Zones mit hoher Fehlsignal-Quote), der direkt als JSON-Regel in das optimierte Signal-Set zurückgespeichert werden kann.
+
+### Aufgaben-Checkliste
+
+* [ ] **Erweiterung des Historical Scanners (`../analytics/background_workers/historical_scanner.py`):**
+  * Parser für Parameter-Grid-Konfigurationen (Erzeugung der Kombinations-Matrix via `itertools.product`).
+  * Iterative Ausführung von `set_evaluator` über die geladenen Features.
+  * Speicherung der Testreihen-Ergebnisse mit Zuordnung zur jeweiligen Testlauf-ID (`run_id`).
+
+* [ ] **Erweiterung der Service-Steuerung (`ui/service_window.ui` & `service_window.py`):**
+  * Checkbox / Umschalter für "Reihen-Test (Grid-Search)".
+  * Eingabemaske oder JSON-Ladefunktion für Parameter-Bandbreiten.
+  * Fortschrittsanzeige für die verarbeiteten Parameter-Kombinationen.
+
+* [ ] **Implementierung der Zonen-Analyse Engine (`analytics/engine/zone_analyzer.py`):**
+  * SQL-gestützte Auswertung der Reihen-Tests nach Win-Rate pro Stunde (0–23 Uhr) und Wochentag.
+  * Automatische Extraktion signifikanter "Green Zones" (hohe Trefferquote) und "Red Zones" (Sperrzeiten).
+  * Export-Funktion zur Aktualisierung der `active_time_windows` in der `signal_sets`-Tabelle.
+
+* [ ] **Integrationstest Phase 9:**
+  1. Start eines Reihen-Tests über `SILVER` / `H1` mit 20 Parameter-Variationen im Service-Fenster.
+  2. Überprüfung der geschriebenen Signale in `signal_results`.
+  3. Ausführung des Zonen-Analyzers und Generierung des optimierten Signal-Sets mit integriertem Zeitfenster-Filter.
+
+## Phase 10: Signal- & Rule-Management Engine (Set-Editor & Ruling)
+**Ziel:** Schaffung einer flexible Verknüpfungs- und Verwaltungslogik (Ruling) für Einzelsignale und komposite Signal-Sets über einen Hybrid-Ansatz aus Python-Regelmodulen und JSON-Regelschemata.
+
+### Getroffene Architekturentscheidungen
+1. **Hybrid-Ruling-Architektur:**
+   * **Komplexe Bedingungslogik (`../analytics/signals/composite`):** Wenn-Dann-Abfragen, Prozent-Abweichungen, Multi-Bar-Rückblicke und Abhängigkeiten zwischen verschiedenen Indikatoren/Signalen werden sauber in entkoppelten Python-Klassen (erben von `SignalDefinition`) umgesetzt.
+   * **Dynamische Parameter & Gewichtung (JSON):** Schwellenwerte, Signal-Gewichtungen (`WEIGHTED`), Richtungs-Filter und aktive Handelszeitfenster (`active_time_windows`) werden in JSON-Regelschemata in `analytics.duckdb` (`signal_sets`) gespeichert.
+2. **Kombinations- & Auswertungs-Logik (`SetEvaluator`):**
+   * Vektorisierte Auswertung aller im Set definierten Signale.
+   * Berechnung des gewichteten Gesamt-Confidence-Scores pro Kerze.
+   * Harte zeitliche Sperren (Red-Zone Filter) setzen den Confidence-Score außerhalb der erlaubten Zeitfenster automatisch auf `0.0`.
+3. **Persistenz & Entkopplung:**
+   * Das Ruling-System arbeitet vollständig entkoppelt vom Chart-Window. Modifikationen an Regeln oder Sets können über eine UI oder JSON-Dateien vorgenommen werden, ohne bestehende Kern-Systeme zu verändern (Open/Closed Principle).
+
+---
+
+### Aufgaben-Checkliste
+
+* [ ] **Aufbau der Composite-Signal-Struktur (`../analytics/signals/composite`):**
+  * Erstellung komplexer Regel-Klassen (z. B. `trend_pullback_rule.py`), die mehrere Features (z. B. `ema_diff`, `atr_normalized`, `close`) verknüpfen und logische Sequenzen über mehrere Kerzen auswerten.
+
+* [ ] **Erweiterung des Set-Evaluators (`../analytics/engine/set_evaluator.py`):**
+  * Einbau der Time-of-Day- und Wochentags-Sperrfilter (`active_time_windows`).
+  * Unterstützung komplexer Regelverknüpfungen (z. B. Mindest-Confidence einzelner Teilsignale als Bedingung für das Gesamt-Set).
+
+* [ ] **Erstellung des Signal-Set-Management-Repositorys (`analytics/rule_repository.py`):**
+  * CRUD-Operationen (Erstellen, Lesen, Aktualisieren, Löschen) für `signal_definitions` und `signal_sets` in `analytics.duckdb`.
+  * JSON-Validierung von Set-Konfigurationen beim Speichern.
+
+* [ ] **Integrationstest Phase 10:**
+  1. Erstellen eines komplexen Hybrid-Sets aus Python-Composite-Signal + Heuristiken mit JSON-Gewichtung.
+  2. Ausführung der Evaluierung über `SetEvaluator` und Validierung der zeitlichen und logischen Sperrfilter.
+
+
+## Phase 11: Refactoring Grid-Indikator & Multi-Dimensional Composite Signal
+
+Ziel: Vollständige Transformation des bestehenden GridIndicator aus dem Prototypen-Status in das neue multidimensionale Architektur-Muster (Trennung in Feature-Berechnung, Frontend-Overlay und Composite-Signal).
+
+### 1. Entkoppelte Grid-Architektur
+
+    Feature Module (analytics/features/definitions/grid_levels.py):
+        Berechnet Y-Achsen-Grid-Levels, Preisabstände und X-Achsen-Zeitfenster (is_time_window_active).
+        Wird vom FeatureBuilder in den feature_store geschrieben.
+
+    Chart Overlay (chart/indicators/grid.py):
+        Verbleibt als leichtgewichtiges Rendering-Plugin für Lightweight Charts.
+        Zeichnet Linien und Proximity-Circles weiterhin dynamisch on-demand auf dem Canvas.
+
+    Composite Signal (analytics/signals/composite/grid_proximity_signal.py):
+        Neues Signalmodell (erbt von SignalDefinition).
+        Verknüpft Y-Abstand, X-Zeitfenster und Volatilitäts-Regime (atr_normalized) aus dem feature_store.
+        Evaluiert Proximity-Touches und schreibt Ergebnisse mit Confidence-Score in signal_results.
+
+Aufgaben-Checkliste Phase 11
+
+    [ ] Erstellung des Grid-Level-Features (analytics/features/definitions/grid_levels.py):
+        Vektorisierte Berechnung von Raster-Preisen und zeitlichen Aktivitäts-Flags.
+        Einbindung in den FeatureBuilder (Phase 2.1).
+
+    [ ] Refactoring des Chart-Indikators (chart/indicators/grid.py):
+        Bereinigung der reinen Visualisierungslogik (Entkopplung von DB-Schreibzugriffen).
+        Optimierte On-Demand-Vektor-Berechnung für das Front-End-Rendering.
+
+    [ ] Implementierung des Signalmodells (analytics/signals/composite/grid_proximity_signal.py):
+        Erstellung der Klasse GridProximitySignal (ABC SignalDefinition).
+        Implementierung der evaluate()-Methode mit multi-dimensionaler Verknüpfung (Preis-Abstand + Zeitfenster + ATR-Regime).
+
+    [ ] Integrationstest & Service-Scan:
+        Durchlauf eines Scans im ServiceWindow über grid_proximity_v1.
+        Auswertung der Trefferquote und Verteilung im StatisticWindow (statistic_win.py)
+```
+
+--------------------------------------------------
+
+### DATEI: test/build_cont_map.py
+```py
+# test/build_cont_map.py
+"""Baut die kontinuierliche cont->real Map fuer die letzten 3000 SILVER M1 Bars
+(exakt wie chart_win._do_refresh_chart_data) und schreibt sie als JSON,
+damit der Node-Test die resolveRealTime-Logik mit echten Daten pruefen kann.
+KEIN UI-Test."""
+import json
+import sys
+from datetime import datetime, timezone
+
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+import duckdb
+
+con = duckdb.connect("data/market_data.duckdb", read_only=True)
+rows = con.execute("""
+    SELECT EXTRACT(epoch FROM "time")::BIGINT AS e
+    FROM ohlcv_bars
+    WHERE LOWER(symbol)='silver' AND LOWER(timeframe)='m1'
+      AND "time" IS NOT NULL AND open IS NOT NULL AND high IS NOT NULL AND low IS NOT NULL AND close IS NOT NULL
+    ORDER BY "time" DESC LIMIT 3000
+""").fetchall()
+con.close()
+
+reals = [int(r[0]) for r in rows][::-1]
+base_time = reals[0]
+cont_to_real = {}
+for i, r in enumerate(reals):
+    cont_to_real[str(base_time + i * 60)] = r  # JSON keys muessen Strings sein
+
+out = {
+    "base_time": base_time,
+    "count": len(reals),
+    "map": cont_to_real,
+}
+with open("test/tmp_cont_map.json", "w", encoding="utf-8") as f:
+    json.dump(out, f)
+
+print(f"Map geschrieben: {len(cont_to_real)} Eintraege, base={base_time}")
+# Roh-Epochs sind Berlin-Wanduhr-encoded -> fromtimestamp(e, utc) direkt
+for probe in [base_time, base_time + 2307 * 60, base_time + 2308 * 60]:
+    b = datetime.fromtimestamp(int(cont_to_real[str(probe)]), tz=timezone.utc)
+    print(f"  cont={probe} -> real={cont_to_real[str(probe)]} (Wanduhr {b.strftime('%d.%m %H:%M')})")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_app_state.py
+```py
+# test/check_app_state.py
+"""Liest den gespeicherten App-State (visible ranges, Instanzen) fuer die Diagnose
+der Chart-Leerstelle. KEIN UI-Test."""
+import sys
+
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+import duckdb
+
+con = duckdb.connect("data/app_data.duckdb", read_only=True)
+
+print("=== window_instances ===")
+try:
+    rows = con.execute("SELECT * FROM window_instances").fetchall()
+    cols = [d[0] for d in con.description]
+    for r in rows:
+        print("  " + ", ".join(f"{c}={v}" for c, v in zip(cols, r)))
+except Exception as e:
+    print("  Fehler:", e)
+
+print("\n=== instance_states ===")
+try:
+    rows = con.execute("SELECT * FROM instance_states").fetchall()
+    cols = [d[0] for d in con.description]
+    for r in rows:
+        print("  " + ", ".join(f"{c}={v}" for c, v in zip(cols, r)))
+except Exception as e:
+    print("  Fehler:", e)
+
+print("\n=== symbol_tf_states ===")
+try:
+    rows = con.execute("SELECT * FROM symbol_tf_states").fetchall()
+    cols = [d[0] for d in con.description]
+    for r in rows:
+        print("  " + ", ".join(f"{c}={v}" for c, v in zip(cols, r)))
+except Exception as e:
+    print("  Fehler:", e)
+
+print("\n=== global_settings ===")
+try:
+    rows = con.execute("SELECT * FROM global_settings").fetchall()
+    for r in rows:
+        print("  ", r)
+except Exception as e:
+    print("  Fehler:", e)
+
+con.close()
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_broker_tz.py
+```py
+# test/check_broker_tz.py
+"""Klaert die Zeitzonen-Frage empirisch:
+1) MT5-Tick-Zeit vs. Systemzeit -> Offset des Broker-Timestamps
+   - diff ~ 0     -> Broker-Timestamp ist echte UTC (Chart muesste +DST rechnen)
+   - diff ~ +7200 -> Broker-Timestamp kodiert BEREITS Berlin/CEST-Wanduhr
+2) Vergleicht MT5-M1-Roh-Epoch mit dem DB-Epoch (speichert die DB Rohwerte?)
+3) Prueft DuckDB-EXTRACT(epoch)-Verhalten.
+Ergebnis (31.07.2026, empirisch): diff = +7200s -> MT5 liefert Berlin-Wanduhr.
+sync_market_data() schreibt die Roh-Epochs via pd.to_datetime(unit='s', utc=True)
+1:1 in die DB; EXTRACT(EPOCH) liefert exakt diese Wanduhr-encoded Epochs.
+=> Der Chart muss diese Epochs DIREKT als Wanduhr formatieren (KEIN +2h).
+KEIN UI-Test."""
+import sys
+import time
+from datetime import datetime, timezone
+
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+import MetaTrader5 as mt5
+import duckdb
+
+print("=== 1) Broker-Timestamp vs Systemzeit ===")
+if not mt5.initialize():
+    print(f"MT5 init fehlgeschlagen: {mt5.last_error()}")
+    sys.exit(1)
+
+tick = mt5.symbol_info_tick("SILVER")
+now = time.time()
+if tick is None:
+    print(f"Kein Tick fuer SILVER: {mt5.last_error()}")
+else:
+    diff = tick.time - int(now)
+    print(f"  tick.time    = {tick.time}  -> als UTC gedeutet: {datetime.fromtimestamp(tick.time, tz=timezone.utc)}")
+    print(f"  time.time()  = {int(now)} -> als UTC gedeutet: {datetime.fromtimestamp(now, tz=timezone.utc)}")
+    print(f"  Diff (tick.time - time.time()) = {diff} s")
+    if diff > 1000:
+        print(f"  >>> Broker-Timestamp ist {diff/3600:.1f}h VOR der echten UTC")
+        print(f"  >>> D.h. der Broker liefert BEREITS Berlin/CEST-Wanduhrzeit (Wanduhr-encoded)")
+    elif diff < -1000:
+        print(f"  >>> Broker-Timestamp ist {diff/3600:.1f}h HINTER der echten UTC")
+    else:
+        print(f"  >>> Broker-Timestamp ist die echte UTC (Diff ~ 0)")
+
+print("\n=== 2) Letzte MT5-M1-Roh-Bars (raw epoch) ===")
+rates = mt5.copy_rates_from_pos("SILVER", mt5.TIMEFRAME_M1, 0, 5)
+if rates is None or len(rates) == 0:
+    print("  Keine Rates:", mt5.last_error())
+else:
+    for r in rates[-5:]:
+        print(f"  MT5 raw time={r['time']}  -> als UTC gedeutet: {datetime.fromtimestamp(int(r['time']), tz=timezone.utc)}  close={r['close']}")
+
+print("\n=== 3) DB-Epoch der letzten SILVER M1 Bars ===")
+con = duckdb.connect("data/market_data.duckdb", read_only=True)
+rows = con.execute("""
+    SELECT "time", EXTRACT(EPOCH FROM "time")::BIGINT AS e, close
+    FROM ohlcv_bars
+    WHERE LOWER(symbol)='silver' AND LOWER(timeframe)='m1'
+    ORDER BY "time" DESC LIMIT 5
+""").fetchall()
+for t, e, c in rows:
+    print(f"  DB time={t}  epoch={e}  (als Wanduhr gedeutet: {datetime.fromtimestamp(int(e), tz=timezone.utc)})  close={c}")
+con.close()
+
+print("\n=== 4) DuckDB-EXTRACT-Verhalten mit explizitem TIMESTAMPTZ-Literal ===")
+con2 = duckdb.connect()
+r = con2.execute("SELECT EXTRACT(EPOCH FROM TIMESTAMPTZ '2026-07-31 13:32:00+02:00') AS e").fetchone()
+print(f"  EXTRACT(EPOCH FROM '2026-07-31 13:32:00+02:00') = {r[0]}")
+print(f"  (Instanz 13:32+02:00 = 11:32 UTC, dessen korrektes UTC-Epoch = 1785497520)")
+r2 = con2.execute("SELECT EXTRACT(EPOCH FROM TIMESTAMPTZ '2026-07-31 13:32:00') AS e").fetchone()
+print(f"  EXTRACT(EPOCH FROM '2026-07-31 13:32:00' [ohne Offset]) = {r2[0]}")
+con2.close()
+
+mt5.shutdown()
+print("\nFazit:")
+print("  - MT5 liefert Wanduhr-encoded Epochs (diff ~ +7200).")
+print("  - sync_market_data() schreibt sie via pd.to_datetime(unit='s', utc=True) 1:1.")
+print("  - fetch_historical_candles() liefert diese Wanduhr-Epochs an den Chart.")
+print("  - getBerlinParts/formatDT muessen DIREKT formatieren (KEIN +2h-Offset).")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_chart_data.py
+```py
+# test/check_chart_data.py
+"""Kurzer Check: Verifiziert die DB-Queries, die das Chart-Fenster nutzt, fuer alle Symbol/TF-Kombos."""
+import duckdb
+from pathlib import Path
+
+MARKET = Path(r"F:\Python\PyTrader\data\market_data.duckdb")
+ANALYTICS = Path(r"F:\Python\PyTrader\data\analytics.duckdb")
+
+con = duckdb.connect(str(MARKET), read_only=True)
+pairs = [
+    ("SILVER", "H1"), ("SILVER", "M5"), ("SILVER", "M15"), ("SILVER", "D1"), ("SILVER", "W1"), ("SILVER", "MN1"),
+    ("GOLD", "H1"), ("GOLD", "M5"), ("GOLD", "M15"), ("GOLD", "D1"), ("GOLD", "W1"), ("GOLD", "MN1"),
+]
+
+for sym, tf in pairs:
+    try:
+        rows = con.execute("""
+            SELECT EXTRACT(epoch FROM "time")::BIGINT AS time_epoch, open, high, low, close
+            FROM (SELECT "time", open, high, low, close FROM ohlcv_bars
+                  WHERE LOWER(symbol)=LOWER(?) AND LOWER(timeframe)=LOWER(?)
+                  AND "time" IS NOT NULL AND open IS NOT NULL AND high IS NOT NULL
+                  AND low IS NOT NULL AND close IS NOT NULL
+                  ORDER BY "time" DESC LIMIT 3000) ORDER BY "time" ASC""", [sym, tf]).fetchall()
+        ok = len(rows) > 0 and all(r[0] > 0 and r[1] > 0 and r[2] > 0 and r[3] > 0 and r[4] > 0 for r in rows)
+        print(f"{sym:7s} {tf:4s} -> {len(rows):>5d} candles  valid={ok}")
+    except Exception as e:
+        print(f"{sym:7s} {tf:4s} -> ERROR: {e}")
+
+# Marker-Query (SignalOverlay.fetch_markers)
+acon = duckdb.connect(str(ANALYTICS), read_only=True)
+print("\n--- fetch_markers queries ---")
+for sym, tf, sid in [("SILVER", "H1", "grid_proximity_v1"), ("SILVER", "M5", "grid_proximity_v1"),
+                     ("GOLD", "H1", "grid_proximity_v1")]:
+    try:
+        rows = acon.execute("""
+            SELECT EXTRACT(epoch FROM bar_time)::BIGINT AS time_epoch, confidence, metadata_payload
+            FROM (SELECT bar_time, confidence, metadata_payload FROM signal_results
+                  WHERE symbol = ? AND timeframe = ? AND source_id = ?
+                  ORDER BY bar_time DESC LIMIT 500) ORDER BY bar_time ASC""", [sym, tf, sid]).fetchall()
+        print(f"{sym:7s} {tf:4s} {sid:20s} -> {len(rows)} markers")
+    except Exception as e:
+        print(f"{sym:7s} {tf:4s} {sid:20s} -> ERROR: {e}")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_generation_guard.py
+```py
+# test/check_generation_guard.py
+# Verifiziert die Generations-Guard-Logik aus chart_win.py (_apply_chart_update /
+# _apply_grid_render): Veraltete Serializer-Ergebnisse werden verworfen,
+# aktuelle werden durchgelassen. Kein UI-Test - reine Logik-Pruefung.
+
+class FakeWin:
+    """Simuliert die relevanten Attribute/Methoden von PyTraderChartWindow."""
+    def __init__(self):
+        self._update_generation = 0
+        self._grid_generation = 0
+        self.applied_chart = []
+        self.applied_grid = []
+        self.loading_reset = 0
+        self.passed = True
+
+    def _set_loading(self, loading):
+        if loading is False:
+            self.loading_reset += 1
+
+    # Kernlogik aus _apply_chart_update (Guard-Teil)
+    def apply_chart_update(self, payload, update_id):
+        if update_id < self._update_generation:
+            self.passed = self.passed and False  # darf nicht passieren (wird abgefangen)
+            return 'DISCARDED-STALE-CHECK'
+        if update_id > self._update_generation:
+            # aktuelle Generation noch nicht erhöht -> sollte nicht vorkommen
+            return 'FUTURE'
+        if not payload:
+            self._set_loading(False)
+            return 'EMPTY'
+        self.applied_chart.append((update_id, payload))
+        return 'APPLIED'
+
+    # Kernlogik aus _apply_grid_render (Guard-Teil)
+    def apply_grid_render(self, lines_json, circles_json, grid_gen):
+        if grid_gen < self._grid_generation:
+            return 'DISCARDED'
+        if not lines_json and not circles_json:
+            return 'EMPTY'
+        self.applied_grid.append((grid_gen, lines_json))
+        return 'APPLIED'
+
+
+win = FakeWin()
+
+print('=== Szenario 1: Normale Reihenfolge ===')
+win._update_generation = 1
+assert win.apply_chart_update('{"a":1}', 1) == 'APPLIED', "aktuelles Update muss angewendet werden"
+assert win.applied_chart == [(1, '{"a":1}')]
+print('  OK: aktuelles Update (id=1) angewendet')
+
+print('=== Szenario 2: Veralteter Serializer-Thread ===')
+# Refresh B (id=2) startet -> _update_generation=2
+win._update_generation = 2
+# Der alte Thread von Refresh A (id=1) liefert NACH B sein Ergebnis -> verwerfen
+win.apply_chart_update('{"stale":true}', 1)  # sollte verworfen werden
+assert len(win.applied_chart) == 1, "veraltetes Update darf nicht angewendet werden"
+print('  OK: veraltetes Update (id=1 < 2) verworfen')
+
+print('=== Szenario 3: Grid-Render Veraltet ===')
+win._grid_generation = 5
+r = win.apply_grid_render('[]', '[]', 3)  # alt
+assert r == 'DISCARDED', "altes Grid-Render muss verworfen werden"
+assert len(win.applied_grid) == 0
+win._grid_generation = 6
+r = win.apply_grid_render('[1]', '', 6)  # aktuell
+assert r == 'APPLIED' and len(win.applied_grid) == 1
+print('  OK: altes Grid-Render verworfen, aktuelles angewendet')
+
+print('=== Szenario 4: Leeres Payload nach Guard ===')
+win._update_generation = 3
+r = win.apply_chart_update('', 3)
+assert r == 'EMPTY' and win.loading_reset == 1, "leeres Payload muss loading zuruecksetzen"
+print('  OK: leeres Payload setzt loading zurueck')
+
+print('\nRESULT: PASS')
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_html_template.py
+```py
+# test/check_html_template.py
+"""Verifiziert, dass das gebaute Chart-HTML-Template die JS-Fixes enthaelt."""
+import sys
+import os
+
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from chart.chart_basics import HTML_TEMPLATE
+
+checks = {
+    "Guard getBerlinParts": "day: '--'" in HTML_TEMPLATE,
+    "Kein Berlin-Offset (+2h)": "t + offset" not in HTML_TEMPLATE and "t + 7200" not in HTML_TEMPLATE,
+    "Kein _isBerlinDST mehr": "_isBerlinDST" not in HTML_TEMPLATE,
+    "Fix timeFormatter": "typeof t === 'object'" in HTML_TEMPLATE,
+    "createSeriesMarkers (v5)": "createSeriesMarkers" in HTML_TEMPLATE,
+}
+
+all_ok = True
+for name, ok in checks.items():
+    print(("OK  " if ok else "FAIL") + " " + name)
+    all_ok = all_ok and ok
+
+print("HTML-Template-Laenge:", len(HTML_TEMPLATE))
+sys.exit(0 if all_ok else 1)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_m1_consistency.py
+```py
+# test/check_m1_consistency.py
+"""Prueft die SILVER M1-Daten auf Konsistenz: Luecken, Handelspause,
+Tagesgrenzen, ungueltige Candles. Kein UI-Test - nur DB-Logik.
+HINWEIS Handelspause: SILVER (XAG) handelt 24/5. Die einzige taegliche Pause
+ist Berlin-Wanduhr 23:00-23:59. Die DB-Roh-Epochs sind Wanduhr-encoded
+(MT5 liefert Wanduhr-Zeiten, sync_market_data schreibt sie via
+pd.to_datetime(unit='s', utc=True) 1:1) - deshalb liefert
+t.astimezone(timezone.utc) exakt diese Wanduhrzeit. Zusaetzlich
+Wochenend-Luecken (Fr 23:00 Wanduhr -> So/Mo 00:00 Wanduhr)."""
+import sys
+import os
+from datetime import datetime, timezone
+
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+import duckdb
+
+DB = r"F:\Python\PyTrader\data\market_data.duckdb"
+SYMBOL = "SILVER"
+TF = "M1"
+
+con = duckdb.connect(DB, read_only=True)
+
+# 1) Zeitbereich letzte Tage
+print("=== Zeitbereich SILVER M1 (letzte 5 Tage) ===")
+rows = con.execute("""
+    SELECT EXTRACT(epoch FROM "time")::BIGINT AS e, "time" AS t, open, high, low, close
+    FROM ohlcv_bars
+    WHERE LOWER(symbol)=LOWER(?) AND LOWER(timeframe)=LOWER(?)
+    ORDER BY "time" DESC
+    LIMIT 5
+""", [SYMBOL, TF]).fetchall()
+for r in rows:
+    print(f"  {r[1]}  O={r[2]} H={r[3]} L={r[4]} C={r[5]}")
+
+# 2) Alle Bars ab 29.07. laden und Luecken pruefen
+print("\n=== Luecken-Analyse ab 2026-07-29 (Handelspause Wanduhr 23:00-23:59 erlaubt) ===")
+rows = con.execute("""
+    SELECT EXTRACT(epoch FROM "time")::BIGINT AS e, "time" AS t, open, high, low, close
+    FROM ohlcv_bars
+    WHERE LOWER(symbol)=LOWER(?) AND LOWER(timeframe)=LOWER(?)
+      AND "time" >= '2026-07-29 00:00:00+02:00'
+      AND "time" IS NOT NULL
+      AND open IS NOT NULL AND high IS NOT NULL AND low IS NOT NULL AND close IS NOT NULL
+    ORDER BY "time" ASC
+""", [SYMBOL, TF]).fetchall()
+
+print(f"Anzahl Bars: {len(rows)}")
+if rows:
+    print(f"Erste Bar: {rows[0][1]}")
+    print(f"Letzte Bar: {rows[-1][1]}")
+
+# Luecken finden (Differenz > 60s), Handelspause ignorieren
+gaps = []
+for i in range(1, len(rows)):
+    prev_e, prev_t = rows[i-1][0], rows[i-1][1]
+    curr_e, curr_t = rows[i][0], rows[i][1]
+    diff = curr_e - prev_e
+    if diff > 60:
+        # Pruefen ob die Luecke die Handelspause 23:00-23:59 abdeckt
+        prev_dt = prev_t.astimezone(timezone.utc)
+        curr_dt = curr_t.astimezone(timezone.utc)
+        gaps.append((prev_t, curr_t, diff, prev_dt, curr_dt))
+
+print(f"\nLuecken > 60s: {len(gaps)}")
+for prev_t, curr_t, diff, prev_dt, curr_dt in gaps[:40]:
+    # Handelspause-Erkennung: letzte Bar 22:xx Wanduhr, naechste 00:xx Wanduhr
+    # (Pause = Wanduhr 23:00-23:59; astimezone(utc) == Wanduhrzeit der DB-Epochs)
+    prev_hour = prev_dt.hour
+    curr_hour = curr_dt.hour
+    pause = (prev_hour >= 22 and curr_hour < 1)
+    print(f"  {prev_t} -> {curr_t}  diff={diff}s  (Wanduhr {prev_dt.hour}:{prev_dt.minute:02d} -> {curr_dt.hour}:{curr_dt.minute:02d}) {'[PAUSE]' if pause else '[!!! LUEKE]'}")
+
+# 3) Handelspausen genauer: pro Tag fehlt die Wanduhr-Stunde 23 (23:00-23:59).
+#    WICHTIG: Die Pause liegt bei Wanduhr 23:00-23:59 (keine Berlin-Offset-
+#    Umrechnung noetig - die DB-Epochs sind bereits Wanduhr-encoded).
+print("\n=== Handelspausen (Wanduhr 23:00-23:59) in den letzten Tagen ===")
+pause_rows = con.execute("""
+    SELECT "time", open, high, low, close
+    FROM ohlcv_bars
+    WHERE LOWER(symbol)=LOWER(?) AND LOWER(timeframe)=LOWER(?)
+      AND "time" >= '2026-07-28 00:00:00+02:00'
+      AND "time" <= '2026-07-31 23:59:59+02:00'
+    ORDER BY "time" ASC
+""", [SYMBOL, TF]).fetchall()
+
+from collections import defaultdict
+by_day = defaultdict(list)
+for t, o, h, l, c in pause_rows:
+    wall = t.astimezone(timezone.utc)  # == Wanduhrzeit der DB-Epochs
+    by_day[wall.date()].append((wall, o, h, l, c))
+
+for day in sorted(by_day.keys()):
+    bars = by_day[day]
+    first, last = bars[0][0], bars[-1][0]
+    # Bars mit Wanduhr-Stunde 23 (die Pausen-Stunde) - sollten 0 sein
+    in_pause = [b for b in bars if b[0].hour == 23]
+    # Letzte Bar vor der Pause (Wanduhr <= 22:59) und erste danach (00:xx)
+    last_before = None
+    first_after = None
+    for b in bars:
+        if b[0].hour == 22 and b[0].minute >= 55:
+            last_before = b
+        if b[0].hour == 0 and b[0].minute < 5:
+            first_after = b
+    print(f"  {day} (Wanduhr): erste={first.strftime('%H:%M')} letzte={last.strftime('%H:%M')} "
+          f"bars_in_Wanduhr23={len(in_pause)} "
+          f"letzte_vorPause={last_before[0].strftime('%H:%M') if last_before else '?'} "
+          f"erste_nachPause={first_after[0].strftime('%H:%M') if first_after else '?'}")
+
+# 4) Ungueltige Candles (open<=0, high<low, close ausserhalb, NaN)
+print("\n=== Ungueltige Candles (ab 29.07.) ===")
+invalid = con.execute("""
+    SELECT COUNT(*)
+    FROM ohlcv_bars
+    WHERE LOWER(symbol)=LOWER(?) AND LOWER(timeframe)=LOWER(?)
+      AND "time" >= '2026-07-29 00:00:00+02:00'
+      AND (open IS NULL OR high IS NULL OR low IS NULL OR close IS NULL
+           OR open <= 0 OR high <= 0 OR low <= 0 OR close <= 0
+           OR high < low OR close < low OR close > high)
+""", [SYMBOL, TF]).fetchone()[0]
+print(f"  Ungueltige Candles: {invalid}")
+
+# 5) Duplikate pruefen
+print("\n=== Duplikate (PRIMARY KEY verhindert, trotzdem pruefen) ===")
+dups = con.execute("""
+    SELECT COUNT(*) FROM (
+        SELECT symbol, timeframe, "time", COUNT(*) c
+        FROM ohlcv_bars
+        WHERE LOWER(symbol)=LOWER(?) AND LOWER(timeframe)=LOWER(?)
+        GROUP BY symbol, timeframe, "time"
+        HAVING COUNT(*) > 1
+    )
+""", [SYMBOL, TF]).fetchone()[0]
+print(f"  Duplikate: {dups}")
+
+con.close()
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_m1_midnight.py
+```py
+# test/check_m1_midnight.py
+"""Prueft direkt, welche SILVER M1-Bars in der DB um Mitternacht 30.07->31.07 liegen.
+Die DB-Roh-Epochs (EXTRACT) sind Berlin-Wanduhr-encoded - datetime.fromtimestamp(e, tz=utc)
+liefert daher direkt die Wanduhrzeit (keine +2h-Umrechnung noetig).
+KEIN UI-Test."""
+import sys
+from datetime import datetime, timezone
+
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+import duckdb
+
+con = duckdb.connect("data/market_data.duckdb", read_only=True)
+rows = con.execute("""
+    SELECT "time", open, high, low, close, EXTRACT(epoch FROM "time")::BIGINT AS e
+    FROM ohlcv_bars
+    WHERE LOWER(symbol)='silver' AND LOWER(timeframe)='m1'
+      AND "time" >= '2026-07-30 20:30:00+00:00'
+      AND "time" <= '2026-07-31 02:30:00+00:00'
+    ORDER BY "time" ASC
+""").fetchall()
+print(f"Bars gefunden: {len(rows)}")
+for t, o, h, l, c, e in rows:
+    wall = datetime.fromtimestamp(int(e), tz=timezone.utc)
+    print(f"  e={e}  Wanduhr={wall.strftime('%d.%m %H:%M')}  raw={t}  O={o} H={h} L={l} C={c}")
+
+# Jetzt ohne OHLC-Filter: gibt es Bars mit NULL/0 in dem Bereich?
+print("\nOhne OHLC-Filter:")
+rows2 = con.execute("""
+    SELECT "time", open, high, low, close, EXTRACT(epoch FROM "time")::BIGINT AS e
+    FROM ohlcv_bars
+    WHERE LOWER(symbol)='silver' AND LOWER(timeframe)='m1'
+      AND "time" >= '2026-07-30 20:30:00+00:00'
+      AND "time" <= '2026-07-31 02:30:00+00:00'
+    ORDER BY "time" ASC
+""").fetchall()
+print(f"Bars gefunden: {len(rows2)}")
+for t, o, h, l, c, e in rows2:
+    wall = datetime.fromtimestamp(int(e), tz=timezone.utc)
+    print(f"  e={e}  Wanduhr={wall.strftime('%d.%m %H:%M')}  raw={t}  O={o} H={h} L={l} C={c}")
+con.close()
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_marker_layers.js
+```js
+// test/check_marker_layers.js
+// Regressionstest: Signal-Marker und Grid-Circle-Marker sind getrennte Layer.
+// _applyAllMarkers() kombiniert beide Caches – ein Grid-Render darf die
+// EMA-Signale nie verdrängen (Bug: "EMA-Signale verschwinden bei Grid an").
+//
+// Laedt die ECHTE 03_chart_rendering.js mit Mock-Objekten (kein DOM/Chart).
+const fs = require('fs');
+const path = require('path');
+
+const rendering = fs.readFileSync(path.join(__dirname, '..', 'chart', 'js', '03_chart_rendering.js'), 'utf8');
+
+// --- Mock-Umgebung ---
+let pluginMarkers = []; // was "im Chart sichtbar" ist
+global._storedCircleMarkers = []; // in 01_core.js deklariert (nicht in 03 geladen)
+global.seriesMarkersPlugin = {
+    setMarkers: (markers) => { pluginMarkers = markers || []; },
+};
+global.candleSeries = { removePriceLine: () => {}, createPriceLine: () => ({}) };
+global.LightweightCharts = {
+    createSeriesMarkers: (series, initial) => ({ setMarkers: (m) => { pluginMarkers = m || []; } }),
+};
+global.document = {
+    getElementById: () => null, // DaySeparator wird nur definiert, nicht genutzt
+    createElement: () => ({ style: {} }),
+};
+global.chart = null;
+global.toReal = (t) => t;
+global.SECONDS_PER_DAY = 86400;
+global.WEEKEND_GAP_SECONDS = 43200;
+global.MIN_SEPARATOR_SPACING_SECONDS = 21600;
+global.currentTfInSeconds = 3600;
+
+eval(rendering);
+
+let failures = 0;
+function check(label, cond, extra) {
+    if (cond) {
+        console.log('OK   ' + label + (extra ? ' -> ' + extra : ''));
+    } else {
+        failures++;
+        console.error('FAIL ' + label);
+    }
+}
+function visibleShapes() {
+    return pluginMarkers.map(m => m.time + ':' + m.shape);
+}
+function has(shape) {
+    return pluginMarkers.some(m => m.shape === shape);
+}
+
+console.log('=== Marker-Layer: Signale + Circles bleiben getrennt ===');
+
+// --- Szenario 1: Signal an, Grid an -> EMA + Circles sichtbar ---
+renderSignalMarkers([{ time: 1001, shape: 'square', position: 'aboveBar', color: '#FF9800' }, { time: 1002, shape: 'square' }]);
+renderGridCircles([{ time: 1003 }, { time: 1004 }]);
+check('Signal an + Grid an -> Signale sichtbar', has('square'), JSON.stringify(visibleShapes()));
+check('Signal an + Grid an -> Circles sichtbar', has('circle'), JSON.stringify(visibleShapes()));
+
+// --- Szenario 2: Grid render_indicators (clearGridCircles + renderGridCircles) ---
+clearGridCircles();
+renderGridCircles([{ time: 1005 }]);
+check('clearGridCircles + renderGridCircles -> Signale bleiben', has('square'), JSON.stringify(visibleShapes()));
+check('clearGridCircles + renderGridCircles -> Circles aktualisiert', pluginMarkers.some(m => m.time === 1005 && m.shape === 'circle'), JSON.stringify(visibleShapes()));
+
+// --- Szenario 3: Signal AUS (renderSignalMarkers([])) + Grid an -> NUR Circles ---
+renderSignalMarkers([]);
+renderGridCircles([{ time: 1006 }]);
+check('Signal AUS + Grid an -> keine Signale', !has('square'), JSON.stringify(visibleShapes()));
+check('Signal AUS + Grid an -> Circles da', has('circle'), JSON.stringify(visibleShapes()));
+
+// --- Szenario 4: Grid AUS (clearGridCircles) bei aktiven Signalen -> EMA bleibt ---
+renderSignalMarkers([{ time: 1007, shape: 'square' }]);
+renderGridCircles([{ time: 1008 }]);
+clearGridCircles();
+check('Grid AUS -> EMA bleibt', has('square'), JSON.stringify(visibleShapes()));
+check('Grid AUS -> Circles weg', !has('circle'), JSON.stringify(visibleShapes()));
+
+// --- Szenario 5: clearSignalMarkers leert Signale, Circles bleiben ---
+renderSignalMarkers([{ time: 1009, shape: 'square' }]);
+renderGridCircles([{ time: 1010 }]);
+clearSignalMarkers();
+check('clearSignalMarkers -> Signale weg', !has('square'), JSON.stringify(visibleShapes()));
+check('clearSignalMarkers -> Circles bleiben', has('circle'), JSON.stringify(visibleShapes()));
+
+// --- Szenario 6: reapplySignalMarkers kombiniert aus Caches ---
+renderSignalMarkers([{ time: 1011, shape: 'square' }]);
+renderGridCircles([{ time: 1012 }]);
+clearSignalMarkers();
+renderSignalMarkers([{ time: 1011, shape: 'square' }]);
+check('reapplySignalMarkers -> Signale + Circles', has('square') && has('circle'), JSON.stringify(visibleShapes()));
+
+console.log('\\n=== Sortierung (Kern des Overlap-Fixes) ===');
+// LWC v5.2.0 setMarkers() erwartet ein nach Zeit SORTIERTES Array:
+//  - interne Binärsuche für den sichtbaren Bereich
+//  - Marker derselben Kerze müssen BENACHBART sein, sonst setzt der
+//    Stack-Offset zurück und der zweite überdeckt den ersten exakt.
+// Test: unsortierte Mischung (Signale [2002,2001], Circles [2003,2001])
+renderSignalMarkers([
+    { time: 2002, shape: 'square' },
+    { time: 2001, shape: 'square' },
+]);
+renderGridCircles([{ time: 2003 }, { time: 2001 }]);
+
+function isSorted(arr) {
+    for (let i = 1; i < arr.length; i++) {
+        if (arr[i].time < arr[i - 1].time) return false;
+    }
+    return true;
+}
+function sameTimeAdjacent(arr) {
+    // Marker mit gleicher Zeit muessen als Gruppe benachbart sein
+    for (let i = 0; i < arr.length; i++) {
+        const t = arr[i].time;
+        // finde letzten Index mit derselben Zeit
+        let j = i;
+        while (j + 1 < arr.length && arr[j + 1].time === t) j++;
+        // keine fremden Marker zwischen i und j -> Gruppe ist benachbart
+        for (let k = i; k <= j; k++) {
+            if (arr[k].time !== t) return false;
+        }
+        i = j;
+    }
+    return true;
+}
+check('Array nach Zeit sortiert', isSorted(pluginMarkers), JSON.stringify(visibleShapes()));
+check('Gleiche Zeit benachbart (Stacking)', sameTimeAdjacent(pluginMarkers), JSON.stringify(visibleShapes()));
+check('Beide Marker bei Zeit 2001 vorhanden (EMA + Circle)', pluginMarkers.filter(m => m.time === 2001).length === 2, JSON.stringify(visibleShapes()));
+
+console.log('\\n=== Prioritäts-Sortierung (Punkt 2: Stapel-Reihenfolge bei gleicher Kerze) ===');
+// Semantik: niedrige priority = näher an der Kerze (unten), hohe = weiter oben.
+// engine-ignoriert priority (explizite Feldliste) – dient NUR unserer Sortierung.
+renderSignalMarkers([
+    { time: 3001, shape: 'square', priority: 4 },  // EMA (nahe an Kerze)
+    { time: 3001, shape: 'circle', priority: 10 }, // Grid-Proximity (oben)
+    { time: 3001, shape: 'square', priority: 2 },  // niedrigste Prio -> ganz unten
+]);
+renderGridCircles([{ time: 3001 }]);               // Grid-Circle, Default-Prio 10
+const t3001 = pluginMarkers.filter(m => m.time === 3001);
+const prios3001 = t3001.map(m => m.priority);
+check('Priority aufsteigend sortiert [2,4,10,10]', JSON.stringify(prios3001) === JSON.stringify([2, 4, 10, 10]), JSON.stringify(prios3001));
+check('Gleiche priority (10) behält Einfüge-Reihenfolge (stabiler Sort)', t3001[2].shape === 'circle' && t3001[3].shape === 'circle', JSON.stringify(t3001.map(m => m.shape)));
+check('priority-Feld wird an Plugin durchgereicht (Engine ignoriert es)', pluginMarkers.some(m => m.priority === 2), JSON.stringify(prios3001));
+
+// Ohne explizite priority: Signal-Default 0, Circle-Default 10
+renderSignalMarkers([{ time: 3002, shape: 'square' }]); // kein priority
+renderGridCircles([{ time: 3002 }]);                    // Default-Prio 10
+const t3002 = pluginMarkers.filter(m => m.time === 3002);
+check('Default: Signal (0) vor Circle (10)', JSON.stringify(t3002.map(m => m.priority)) === JSON.stringify([0, 10]), JSON.stringify(t3002.map(m => m.priority)));
+
+console.log('\nRESULT: ' + (failures === 0 ? 'PASS' : 'FAIL (' + failures + ')'));
+process.exit(failures === 0 ? 0 : 1);
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_mt5_m1_boundary.py
+```py
+# test/check_mt5_m1_boundary.py
+"""Holt SILVER M1-Daten direkt von MT5 (Ground Truth) und analysiert die
+Tagesgrenzen der letzten Tage.
+WICHTIG: MT5 liefert Zeiten als BERLIN-WANDUHR-encoded Epochs (empirisch
+verifiziert: tick.time liegt bei echter UTC 10:00 bereits bei der Zahl "12:00").
+datetime.fromtimestamp(e, tz=utc) liefert daher direkt die Wanduhrzeit -
+eine zusaetzliche +2h-Umrechnung waere doppelt.
+KEIN UI-Test - nur Datenabruf + Logik."""
+import sys
+from datetime import datetime, timezone
+
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+import MetaTrader5 as mt5
+
+print("Initialisiere MT5...")
+if not mt5.initialize():
+    print(f"MT5 initialize fehlgeschlagen: {mt5.last_error()}")
+    sys.exit(1)
+
+info = mt5.account_info()
+if info:
+    print(f"Konto: {info.company} | Server: {info.server} | Login: {info.login}")
+else:
+    print("Kein Konto (oder Fehler):", mt5.last_error())
+
+SYMBOL = "SILVER"
+N_BARS = 20000
+
+print(f"\n=== SILVER M1: letzte {N_BARS} Bars von MT5 ===")
+rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M1, 0, N_BARS)
+if rates is None:
+    print(f"copy_rates_from_pos Fehler: {mt5.last_error()}")
+    mt5.shutdown()
+    sys.exit(1)
+
+print(f"Bars erhalten: {len(rates)}")
+
+# rates ist numpy-Struktur. Felder: time, open, high, low, close, tick_volume, spread, real_volume
+import numpy as np
+
+t = rates["time"]  # Roh-Epoch (bereits Berlin-Wanduhr-encoded)
+o = rates["open"]
+h = rates["high"]
+l = rates["low"]
+c = rates["close"]
+
+def fmt_epoch(epoch):
+    wall = datetime.fromtimestamp(int(epoch), tz=timezone.utc)  # == Wanduhrzeit
+    return f"{wall.strftime('%d.%m.%y %H:%M')} (Wanduhr)"
+
+print(f"\n=== Erste/Letzte Bar ===")
+print(f"  Erste: {fmt_epoch(t[0])}")
+print(f"  Letzte: {fmt_epoch(t[-1])}")
+
+# Tagesgrenzen finden: Wanduhr-Tag wechselt
+print(f"\n=== Tagesgrenzen (Wanduhr) in den letzten Tagen ===")
+prev_day = None
+for i in range(len(t)):
+    wall = datetime.fromtimestamp(int(t[i]), tz=timezone.utc)
+    day = wall.date()
+    if prev_day is not None and day != prev_day:
+        # i ist die erste Bar des neuen Tages
+        j = i - 1
+        while j >= 0:
+            prev_wall = datetime.fromtimestamp(int(t[j]), tz=timezone.utc)
+            if prev_wall.date() == prev_day:
+                break
+            j -= 1
+        # letzten 3 Bars des Vortags und erste 3 Bars des neuen Tags
+        print(f"\n--- Grenze {prev_day} -> {day} ---")
+        for k in range(max(0, j - 2), min(len(t), j + 4)):
+            label = "VORTAG " if k <= j else "NEU-TAG"
+            print(f"  [{label}] idx={k} {fmt_epoch(t[k])}  O={o[k]:.3f} H={h[k]:.3f} L={l[k]:.3f} C={c[k]:.3f}")
+    prev_day = day
+
+# Luecken-Analyse (Differenz > 60s), letzte 3000 Bars
+print(f"\n=== Luecken > 60s (letzte 3000 Bars) ===")
+start_idx = max(0, len(t) - 3000)
+gaps = []
+for i in range(start_idx + 1, len(t)):
+    diff = int(t[i]) - int(t[i - 1])
+    if diff > 60:
+        prev_w = datetime.fromtimestamp(int(t[i - 1]), tz=timezone.utc)
+        curr_w = datetime.fromtimestamp(int(t[i]), tz=timezone.utc)
+        # Handelspause: letzte Bar 22:xx Wanduhr, naechste 00:xx Wanduhr
+        # (Pause = Wanduhr 23:00-23:59), diff = 3720s
+        is_pause = (prev_w.hour >= 22 and curr_w.hour <= 0 and curr_w.minute < 10) or diff > 3600
+        gaps.append((prev_w, curr_w, diff, is_pause))
+
+for prev_w, curr_w, diff, is_pause in gaps:
+    tag = "[PAUSE 23-24]" if is_pause else "[!!! LUEKE]"
+    print(f"  {prev_w.strftime('%d.%m %H:%M')} -> {curr_w.strftime('%d.%m %H:%M')}  diff={diff}s {tag}")
+
+print(f"\nLuecken gesamt: {len(gaps)}")
+
+# Bars in der Zeit 23:00-23:59 Wanduhr (innerhalb der Pause) - sollten 0 sein
+print(f"\n=== Bars zwischen Wanduhr 23:00-23:59 (innerhalb Pause?) ===")
+in_pause = 0
+for i in range(len(t)):
+    wall = datetime.fromtimestamp(int(t[i]), tz=timezone.utc)
+    if wall.hour == 23 and t[i] >= t[-3000] if len(t) >= 3000 else True:
+        in_pause += 1
+print(f"  Bars mit Wanduhr-Stunde 23: {in_pause} (in letzten {min(3000, len(t))} Bars)")
+
+mt5.shutdown()
+print("\nFertig.")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_race_guard.js
+```js
+// test/check_race_guard.js
+// Verifiziert die Race-Guard-Kernlogik aus 01_core.js / 04_live_updates.js:
+// 1) applyFullChartUpdate: veraltete Payloads werden verworfen (stale updateId)
+// 2) updateLiveCandle: verspaetete Ticks vom alten Symbol/TF werden verworfen
+// Kein UI-Test - reine Logik-Pruefung.
+
+let _updateId = 0;
+let _lastAppliedUpdateId = 0;
+let currentSymbol = 'SILVER';
+let currentTimeframe = 'H1';
+let appliedUpdates = [];
+let appliedTicks = [];
+
+// --- 1) Race-Guard applyFullChartUpdate (identische Kernlogik) ---
+function applyFullChartUpdate(data) {
+    var myId = ++_updateId;
+    var updateId = (data && typeof data.updateId === 'number') ? data.updateId : myId;
+    if (updateId < _lastAppliedUpdateId) {
+        return 'DISCARDED';
+    }
+    _lastAppliedUpdateId = updateId;
+    appliedUpdates.push(updateId);
+    return 'APPLIED';
+}
+
+console.log('=== 1) applyFullChartUpdate Race-Guard ===');
+// Szenario: Refresh B (neu, id=2) startet und kommt ZUERST an; A (alt, id=1) kommt spaeter.
+let rB = applyFullChartUpdate({ updateId: 2, symbol: 'GOLD', timeframe: 'M1' });
+let rA = applyFullChartUpdate({ updateId: 1, symbol: 'SILVER', timeframe: 'H1' });
+console.log('  B (neu, zuerst):', rB);
+console.log('  A (alt, spaeter):', rA);
+console.log('  angewendet:', JSON.stringify(appliedUpdates));
+let guardOk = (rB === 'APPLIED' && rA === 'DISCARDED' && appliedUpdates.length === 1 && appliedUpdates[0] === 2);
+
+// Fallback ohne updateId (JS-interner Counter)
+let rNoId = applyFullChartUpdate({});
+console.log('  ohne updateId (Fallback-Counter):', rNoId, '(id=' + appliedUpdates[appliedUpdates.length - 1] + ')');
+
+// --- 2) updateLiveCandle Symbol/TF-Guard (identische Kernlogik) ---
+function updateLiveCandle(json) {
+    var c = JSON.parse(json);
+    if (c.symbol !== undefined && c.symbol !== null && c.symbol !== currentSymbol) return 'DISCARDED';
+    if (c.timeframe !== undefined && c.timeframe !== null && c.timeframe !== currentTimeframe) return 'DISCARDED';
+    appliedTicks.push(c.time);
+    return 'APPLIED';
+}
+
+console.log('\n=== 2) updateLiveCandle Symbol/TF-Guard ===');
+console.log('  Match (SILVER/H1):', updateLiveCandle('{"time":100,"symbol":"SILVER","timeframe":"H1"}'));
+currentSymbol = 'GOLD';
+console.log('  Stale SILVER-Tick nach Wechsel:', updateLiveCandle('{"time":101,"symbol":"SILVER","timeframe":"H1"}'));
+console.log('  Ohne symbol-Feld (andere Aufrufer):', updateLiveCandle('{"time":102}'));
+let tickOk = JSON.stringify(appliedTicks) === '[100,102]';
+
+console.log('\nRESULT:', (guardOk && tickOk) ? 'PASS' : 'FAIL');
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_resolve_realtime.js
+```js
+// test/check_resolve_realtime.js
+// Beweist den Fix fuer die "Leerstelle 30.7.26 23:58" (Wanduhr-Zeitachse):
+// 1) Laedt die echte cont->real Map (test/tmp_cont_map.json)
+// 2) Nutzt die ECHTEN Funktionen aus chart/js/02_time_utils.js (resolveRealTime,
+//    _rebuildTimeMaps, toReal/toCont) – Single Source of Truth, kein Duplikat.
+// 3) Zeigt den FIX: resolveRealTime(1785448739.5) -> naechste reale Candle
+//    -> formatDT -> "Fr 31.07.26 00:01" (erste reale Candle nach der Pause)
+// Hintergrund (empirisch verifiziert): Die Roh-Epochs sind bereits Berlin-
+// Wanduhr-encoded (MT5 liefert Wanduhr, sync_market_data schreibt 1:1 via
+// pd.to_datetime(unit="s", utc=True)). formatDT/getBerlinParts formatieren
+// deshalb OHNE Berlin-Offset direkt – sonst waeren alle Labels 2h zu spaet.
+// KEIN UI-Test - reine Logik-Pruefung.
+// Kein 'use strict' - sonst bleiben eval-deklarierte Funktionen lokal.
+const fs = require('fs');
+const path = require('path');
+
+// 02_time_utils.js ist self-contained (kein window/document) -> direkt laden
+const timeUtilsSrc = fs.readFileSync(path.join(__dirname, '..', 'chart', 'js', '02_time_utils.js'), 'utf8');
+eval(timeUtilsSrc);
+
+const mapData = JSON.parse(fs.readFileSync(path.join(__dirname, 'tmp_cont_map.json'), 'utf8'));
+
+// ECHTE _rebuildTimeMaps aus 02_time_utils.js verwenden (setzt beide Maps
+// inkl. inverser real->cont Map). Kein manuelles Map-Befüllen im Test.
+_rebuildTimeMaps(mapData.map);
+
+// Die Phantom-Zeit, die durch currTime-0.5 entsteht (Separator bei der 00:01-Candle)
+const PHANTOM_TS = 1785448739.5;
+const CANDLE_2307 = 1785448680; // cont der 22:59-Candle (i=2307, real 1785452340)
+const CANDLE_2308 = 1785448740; // cont der 00:01-Candle (i=2308, real 1785456060)
+
+console.log('=== BUG-Reproduktion (altes Verhalten: _continuousTimeMap[ts] || ts) ===');
+const oldReal = mapData.map[PHANTOM_TS] || PHANTOM_TS;
+const oldLabel = formatDT(oldReal);
+console.log(`  ts=${PHANTOM_TS} -> Fallback=${oldReal} -> Label="${oldLabel}"`);
+console.log(`  ${oldLabel === 'Do 30.07.26 21:58' ? '>>> BUG: Fake-Zeit (21:58 existiert nicht; echte letzte Candle = 22:59)' : '  (kein Match)'}`);
+
+console.log('\n=== FIX (resolveRealTime aus 02_time_utils.js) ===');
+const newReal = resolveRealTime(PHANTOM_TS);
+const newLabel = formatDT(newReal);
+console.log(`  ts=${PHANTOM_TS} -> real=${newReal} -> Label="${newLabel}"`);
+console.log(`  ${newReal === 1785456060 ? '>>> KORREKT: naechste reale Candle (31.07 00:01 Wanduhr, erste nach Pause 23:00-23:59)' : '  (andere reale Zeit)'}`);
+console.log(`  ${newLabel === 'Fr 31.07.26 00:01' ? '>>> KORREKT: Wanduhr-Label OHNE Berlin-Offset (+2h) ' : '  (Label weicht ab)'}`);
+
+console.log('\n=== toReal() = resolveRealTime() (Alias) ===');
+console.log(`  toReal(1785448739.5) -> ${toReal(PHANTOM_TS)} (muss 1785456060 sein)`);
+
+console.log('\n=== toCont() (inverse Zuordnung, real->cont) ===');
+const contOfReal = toCont(1785456060);
+console.log(`  toCont(1785456060) -> ${contOfReal} (muss 1785448740 sein)`);
+console.log(`  toCont(999999999) -> ${toCont(999999999)} (muss undefined sein)`);
+
+console.log('\n=== Genauigkeit: alle 3000 Candle-Zeiten muessen exakt matchen ===');
+let ok = 0, bad = 0;
+const keys = Object.keys(mapData.map).map(Number).sort((a, b) => a - b);
+for (const k of keys) {
+    const kNum = Number(k);
+    const r = resolveRealTime(kNum);
+    if (r === mapData.map[k]) ok++; else { bad++; if (bad < 5) console.log(`  MISMATCH cont=${kNum} -> ${r} erwartet ${mapData.map[k]}`); }
+}
+console.log(`  exakte Treffer: ${ok}, Mismatch: ${bad}`);
+
+console.log('\n=== Padding-Ticks (ausserhalb des Datensatzes) ===');
+const lastCont = keys[keys.length - 1];
+const padReal = resolveRealTime(lastCont + 3600);
+const padLabel = formatDT(padReal);
+console.log(`  ts=${lastCont + 3600} -> real=${padReal} -> Label="${padLabel}" (clamped auf letzte Candle)`);
+const firstCont = keys[0];
+const firstLabel = formatDT(resolveRealTime(firstCont - 3600));
+console.log(`  ts=${firstCont - 3600} -> Label="${firstLabel}" (clamped auf erste Candle)`);
+
+console.log('\n=== Pausen-Grenze (Wanduhr 22:59 -> 00:01, Pause = 23:00-23:59) ===');
+console.log(`  letzte vor Pause:  real=1785452340 -> Label="${formatDT(1785452340)}"`);
+console.log(`  erste nach Pause:  real=1785456060 -> Label="${formatDT(1785456060)}"`);
+
+console.log('\n=== Ungueltige Eingaben ===');
+console.log(`  undefined -> ${resolveRealTime(undefined)}`);
+console.log(`  NaN -> ${resolveRealTime(NaN)}`);
+console.log(`  null -> ${resolveRealTime(null)}`);
+
+console.log('\nRESULT:', (ok === 3000 && newReal === 1785456060 && newLabel === 'Fr 31.07.26 00:01' && formatDT(1785452340) === 'Do 30.07.26 22:59' && contOfReal === 1785448740) ? 'PASS' : 'FAIL');
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_time_constants.js
+```js
+// test/check_time_constants.js
+// Verifiziert Punkt B4: die zentralen Zeit-Konstanten aus 02_time_utils.js.
+// Zusaetzlich (Punkt C/D): die Tageswechsel-Erkennung wird NICHT mehr dupliziert,
+// sondern direkt aus dem gekapselten Modul getestet:
+//   DaySeparator.computeDaySeparatorTimes(candleData)
+// (pure Funktion in chart/js/03_chart_rendering.js - ohne DOM/Chart).
+// Kein UI-Test - reine Logik-Pruefung (laeuft ohne Chart/DOM).
+//
+// Hinweis: const-Deklarationen sind im eval-Scope nicht von aussen sichtbar,
+// deshalb wird der Testcode in denselben eval-Kontext eingebettet.
+const fs = require('fs');
+const path = require('path');
+
+const utils = fs.readFileSync(path.join(__dirname, '..', 'chart', 'js', '02_time_utils.js'), 'utf8');
+const rendering = fs.readFileSync(path.join(__dirname, '..', 'chart', 'js', '03_chart_rendering.js'), 'utf8');
+
+const testBody = `
+let failures = 0;
+function assert(label, cond, extra) {
+    if (cond) {
+        console.log('OK   ' + label + (extra ? ' -> ' + extra : ''));
+    } else {
+        failures++;
+        console.error('FAIL ' + label);
+    }
+}
+
+console.log('=== B4: Zentrale Zeit-Konstanten ===');
+assert('SECONDS_PER_DAY = 86400', SECONDS_PER_DAY === 86400, String(SECONDS_PER_DAY));
+assert('WEEKEND_GAP_SECONDS = 43200', WEEKEND_GAP_SECONDS === 43200, String(WEEKEND_GAP_SECONDS));
+assert('MIN_SEPARATOR_SPACING_SECONDS = 21600', MIN_SEPARATOR_SPACING_SECONDS === 21600, String(MIN_SEPARATOR_SPACING_SECONDS));
+
+console.log('\\n=== C/D: DaySeparator.computeDaySeparatorTimes (echtes Modul, keine Duplikation) ===');
+assert('DaySeparator-Modul geladen', typeof DaySeparator === 'object' && typeof DaySeparator.computeDaySeparatorTimes === 'function');
+
+// Simulierte Candles (kontinuierliche Zeiten), real via _rebuildTimeMaps gesetzt
+_rebuildTimeMaps({
+    1000: 1785452340, // Do 30.07.26 22:59 Wanduhr (letzte vor Pause)
+    1001: 1785456060, // Fr 31.07.26 00:01 Wanduhr (erste nach Pause) -> Tagwechsel
+    1002: 1785459660, // Fr 31.07.26 01:01 -> gleicher Tag, kein Wechsel
+    1003: 1785463260, // Fr 31.07.26 02:01 -> gleicher Tag
+});
+
+const candles = [
+    { time: 1000 }, // Do 22:59
+    { time: 1001 }, // Fr 00:01  -> Tagwechsel -> Linie
+    { time: 1002 }, // Fr 01:01  -> kein Wechsel
+    { time: 1003 }, // Fr 02:01  -> kein Wechsel
+];
+const detected = DaySeparator.computeDaySeparatorTimes(candles);
+assert('Tagwechsel bei 1001 erkannt', detected.length === 1 && detected[0] === 1001, JSON.stringify(detected));
+
+// Weekend-Gap: Luecke > 12h ohne Tagwechsel -> Linie
+const gapCandles = [
+    { time: 2000 }, // real 1785452340 (Do 22:59)
+    { time: 2001 }, // real 1785452340 + 50000 (> WEEKEND_GAP_SECONDS) -> Gap
+];
+_rebuildTimeMaps({ 2000: 1785452340, 2001: 1785452340 + 50000 });
+const gapLines = DaySeparator.computeDaySeparatorTimes(gapCandles);
+assert('Weekend-Gap erkannt', gapLines.length === 1, JSON.stringify(gapLines));
+
+// Zu dicht aufeinanderfolgende Linien werden gefiltert (< MIN_SEPARATOR_SPACING_SECONDS cont)
+const closeCandles = [
+    { time: 1000 }, // Linie 1
+    { time: 1001 }, // wuerde Linie 2 -> aber Abstand < MIN -> gefiltert
+];
+_rebuildTimeMaps({ 1000: 1785452340, 1001: 1785456060 });
+const closeLines = DaySeparator.computeDaySeparatorTimes(closeCandles);
+assert('Dichte Folge wird gefiltert', closeLines.length === 1, JSON.stringify(closeLines));
+
+// Leere / ungueltige Eingaben -> leeres Array, kein Crash
+assert('Leere Eingabe -> []', JSON.stringify(DaySeparator.computeDaySeparatorTimes([])) === '[]', JSON.stringify(DaySeparator.computeDaySeparatorTimes([])));
+assert('null Eingabe -> []', JSON.stringify(DaySeparator.computeDaySeparatorTimes(null)) === '[]', JSON.stringify(DaySeparator.computeDaySeparatorTimes(null)));
+
+// Wichtiger Testwert: einzelne Candle -> keine Linie (braucht Vorgaenger)
+assert('Einzelne Candle -> []', JSON.stringify(DaySeparator.computeDaySeparatorTimes([{ time: 1000 }])) === '[]');
+
+console.log('\\nRESULT: ' + (failures === 0 ? 'PASS' : 'FAIL (' + failures + ')'));
+if (failures !== 0) process.exit(1);
+`;
+
+eval(utils + '\n' + rendering + '\n' + testBody);
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_time_utils.js
+```js
+// test/check_time_utils.js
+// Verifiziert: keine Endlosschleife bei ungueltigen Eingaben in getBerlinParts/formatDT
+// (Root Cause: timeFormatter erhielt UTCTimestamp-Zahl, Code griff auf t.time zu -> undefined
+//  -> formatDT(undefined) -> Endlosschleife im alten DST-Check -> Chart-Hang, kein Crosshair/Panning)
+// Hinweis: Seit dem Wanduhr-Fix gibt es keinen _isBerlinDST-Check mehr –
+// getBerlinParts formatiert die (bereits Wanduhr-encoded) Roh-Epochs direkt.
+const fs = require('fs');
+const path = require('path');
+
+// Gefixte Zeit-Utils laden
+const utils = fs.readFileSync(path.join(__dirname, '..', 'chart', 'js', '02_time_utils.js'), 'utf-8');
+eval(utils);
+
+let failures = 0;
+
+function check(label, fn, expectThrowFree) {
+    try {
+        const result = fn();
+        if (expectThrowFree) {
+            console.log(`OK   ${label} -> ${JSON.stringify(result)}`);
+        }
+    } catch (e) {
+        failures++;
+        console.error(`FAIL ${label} -> Exception: ${e.message}`);
+    }
+}
+
+console.log('--- Szenario 1: timeFormatter mit Zahl (der Bug-Fall, t.time = undefined) ---');
+check('formatDT mit Zahl (kein .time)', () => {
+    const t = 1770192000; // UTCTimestamp-Zahl
+    const ts = (t !== null && typeof t === 'object') ? t.time : t; // gefixter Zugriff
+    const realT = ({}[ts] || ts); // leere _continuousTimeMap
+    return formatDT(realT);
+}, true);
+
+console.log('--- Szenario 2: formatDT(undefined) (absoluter Crash-Fall) ---');
+check('formatDT(undefined)', () => formatDT(undefined), true);
+
+console.log('--- Szenario 3: valider Timestamp (normaler Betrieb) ---');
+check('formatDT(1770192000)', () => formatDT(1770192000), true);
+check('getBerlinParts(1770192000)', () => getBerlinParts(1770192000), true);
+
+console.log('--- Szenario 4: Wanduhr-Formatierung (kein Berlin-Offset) ---');
+// Roh-Epoch 1785456060 = erste Candle nach der Pause (Wanduhr 00:01 am 31.07.)
+// Ohne Berlin-Offset wird direkt "Fr 31.07.26 00:01" erwartet.
+check('formatDT(1785456060) Wanduhr 00:01', () => {
+    const lbl = formatDT(1785456060);
+    if (lbl !== 'Fr 31.07.26 00:01') throw new Error(`erwartet Fr 31.07.26 00:01, war ${lbl}`);
+    return lbl;
+}, true);
+// Letzte Candle vor der Pause: Wanduhr 22:59 am 30.07. (Pause = 23:00-23:59)
+check('formatDT(1785452340) Wanduhr 22:59', () => {
+    const lbl = formatDT(1785452340);
+    if (lbl !== 'Do 30.07.26 22:59') throw new Error(`erwartet Do 30.07.26 22:59, war ${lbl}`);
+    return lbl;
+}, true);
+
+if (failures === 0) {
+    console.log('\nALLE TESTS OK - KEINE ENDLOSSCHLEIFE');
+    process.exit(0);
+} else {
+    console.error(`\n${failures} TEST(S) FEHLGESCHLAGEN`);
+    process.exit(1);
+}
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/simulate_chart_mapping.py
+```py
+# test/simulate_chart_mapping.py
+"""Simuliert exakt den Chart-Mapping-Pfad aus chart_win._do_refresh_chart_data:
+1) laedt die letzten 3000 SILVER M1-Candles aus der DB
+2) baut kontinuierliche Zeiten (base + i*60)
+3) erzeugt timeMap cont->real
+4) berechnet, welche Labels der Chart anzeigen wuerde (Wanduhrzeit)
+5) sucht nach diskontinuitaeten / falschen Labels / Tagesseparator-Positionen.
+WICHTIG: Die DB-Epochs (EXTRACT) sind Berlin-Wanduhr-encoded -
+datetime.fromtimestamp(e, tz=utc) liefert direkt die Wanduhrzeit (keine +2h).
+KEIN UI-Test."""
+import sys
+from datetime import datetime, timezone
+
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+import duckdb
+
+DB = r"F:\Python\PyTrader\data\market_data.duckdb"
+LIMIT = 3000
+TF_SEC = 60
+
+con = duckdb.connect(DB, read_only=True)
+rows = con.execute("""
+    SELECT EXTRACT(epoch FROM "time")::BIGINT AS e, "time"
+    FROM ohlcv_bars
+    WHERE LOWER(symbol)='silver' AND LOWER(timeframe)='m1'
+      AND "time" IS NOT NULL AND open IS NOT NULL AND high IS NOT NULL AND low IS NOT NULL AND close IS NOT NULL
+    ORDER BY "time" DESC LIMIT ?
+""", [LIMIT]).fetchall()
+con.close()
+
+# aufsteigend sortieren (wie fetch_historical_candles)
+rows = list(reversed(rows))
+reals = [int(r[0]) for r in rows]
+print(f"Candles: {len(rows)}")
+print(f"  erste real: {datetime.fromtimestamp(reals[0], tz=timezone.utc)} (Wanduhr)")
+print(f"  letzte real: {datetime.fromtimestamp(reals[-1], tz=timezone.utc)} (Wanduhr)")
+
+# Kontinuierliches Mapping exakt wie in chart_win.py
+base_time = reals[0]
+cont_to_real = {}
+real_to_cont = {}
+cont_candles = []
+for i, c in enumerate(rows):
+    cont_time = base_time + i * TF_SEC
+    real_time = int(c[0])
+    cont_to_real[cont_time] = real_time
+    real_to_cont[real_time] = cont_time
+    cont_candles.append(cont_time)
+
+print(f"\nKontinuierliche Zeit: base={base_time} ({datetime.fromtimestamp(base_time, tz=timezone.utc)} Wanduhr)")
+print(f"  cont-Minimum={cont_candles[0]}  cont-Maximum={cont_candles[-1]}")
+
+# Pruefen: kontinuierlich?
+issues = 0
+for i in range(1, len(cont_candles)):
+    if cont_candles[i] - cont_candles[i-1] != TF_SEC:
+        print(f"  [!!!] cont-Luecke bei i={i}: {cont_candles[i-1]} -> {cont_candles[i]}")
+        issues += 1
+print(f"  cont-Luecken: {issues}")
+
+# Zeitbereich um die Tagesgrenze 30.07->31.07 (Wanduhr) ausgeben
+print("\n=== Bars im Bereich 30.07 23:40 Wanduhr bis 31.07 02:10 Wanduhr ===")
+t0 = datetime(2026, 7, 30, 23, 40, tzinfo=timezone.utc)
+t1 = datetime(2026, 7, 31, 2, 10, tzinfo=timezone.utc)
+for i, e in enumerate(reals):
+    wall = datetime.fromtimestamp(e, tz=timezone.utc)
+    if t0 <= wall <= t1:
+        cont = cont_candles[i]
+        # Label, das der Chart anzeigen wuerde
+        realT = cont_to_real.get(cont, cont)
+        b = datetime.fromtimestamp(realT, tz=timezone.utc)
+        label = f"{b.strftime('%w')} {b.strftime('%d.%m.%y %H:%M')}"
+        # Wochenende/Wanduhr-Tag-Wechsel?
+        prev_real = reals[i-1] if i > 0 else None
+        sep = ""
+        if prev_real is not None and (int(prev_real)//86400 != e//86400):
+            sep = "  <== WANDUHR-TAGWECHSEL"
+        print(f"  i={i:4d} real={wall.strftime('%d.%m %H:%M')}  cont={cont}  label={label}{sep}")
+
+# Tagesseparator-Positionen (wie DaySeparator.computeDaySeparatorTimes in
+# chart/js/03_chart_rendering.js - reine Logik-Referenz, kein UI-Test)
+print("\n=== Tagesseparatoren (Wanduhr-Tagwechsel) im Fenster ===")
+last_line_time = 0
+for i in range(1, len(reals)):
+    prevReal = cont_to_real.get(cont_candles[i-1], cont_candles[i-1])
+    currReal = cont_to_real.get(cont_candles[i], cont_candles[i])
+    prevUtcDay = int(prevReal) // 86400
+    currUtcDay = int(currReal) // 86400
+    isUtcDayChange = currUtcDay != prevUtcDay
+    isWeekendGap = currReal - prevReal > 43200
+    isTooClose = (last_line_time > 0 and (cont_candles[i] - last_line_time) < 21600)
+    if (isUtcDayChange or isWeekendGap) and not isTooClose:
+        last_line_time = cont_candles[i]
+        wall = datetime.fromtimestamp(int(currReal), tz=timezone.utc)
+        print(f"  Separator bei cont={cont_candles[i]}  (real Wanduhr {wall.strftime('%d.%m.%y %H:%M')})  currTime-0.5={cont_candles[i]-0.5}  currTime+0.5={cont_candles[i]+0.5}")
+
+# Fallback-Labels: kontinuierliche Zeit ohne Real-Mapping? (tickMarkFormatter-Fallback)
+print("\n=== Tick-Labels: kontinuierliche Zeiten OHNE Real-Mapping? ===")
+# Tickmarken, die LWC bei jedem vollen cont-stunde generieren wuerde
+missing = 0
+for tick in range(cont_candles[0] - cont_candles[0] % 3600, cont_candles[-1], 3600):
+    if tick in cont_to_real:
+        realT = cont_to_real[tick]
+        b = datetime.fromtimestamp(realT, tz=timezone.utc)
+        print(f"  Tick {tick} -> real {b.strftime('%d.%m.%y %H:%M')} OK")
+    else:
+        missing += 1
+        print(f"  Tick {tick} -> [FALLBACK fake] {tick}  => label {datetime.fromtimestamp(tick, tz=timezone.utc)}")
+print(f"  Ticks ohne Mapping: {missing}")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/test.py
+```py
+import duckdb
+
+con = duckdb.connect(r'F:/Python/PyTrader/trading_data.duckdb')
+tables = con.execute("SHOW TABLES").fetchall()
+print("Tables:", tables)
+
+# Try listing schemas
+schemas = con.execute("SELECT * FROM information_schema.schemata").fetchall()
+print("Schemata:", schemas)
+
+# Try a direct query on sih1_candles
+try:
+    r = con.execute("SELECT count(*) FROM sih1_candles").fetchall()
+    print("sih1_candles count:", r)
+except Exception as e:
+    print("sih1_candles error:", e)
+
+# Try to find ANY table with candle in name
+try:
+    r = con.execute("SELECT table_name, table_type FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'pg_catalog')").fetchall()
+    print("User tables:", r)
+except Exception as e:
+    print("User tables error:", e)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/test_db_lock.py
+```py
+# test/test_db_lock.py
+"""Test: Kann ein paralleler Schreiber (INSERT-Loop) neue Lese-Verbindungen blockieren?
+Simuliert DataSyncWorker (schreibt) vs. MarketDataRepository (liest via db_connect)."""
+import os
+import sys
+import threading
+import time
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+
+import duckdb
+
+DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "locktest.duckdb")
+if os.path.exists(DB):
+    os.remove(DB)
+
+con = duckdb.connect(DB)
+con.execute("CREATE TABLE t (id INT, val DOUBLE)")
+con.execute("INSERT INTO t SELECT i, i*1.0 FROM range(100000) r(i)")
+con.close()
+
+failures = []
+stop = threading.Event()
+
+def writer():
+    wc = duckdb.connect(DB)
+    i = 0
+    while not stop.is_set():
+        wc.execute("INSERT INTO t SELECT ? + i, i*1.0 FROM range(1000) r(i)", [i])
+        i += 1000
+        wc.execute("DELETE FROM t WHERE id < ?", [i])
+    wc.close()
+
+t = threading.Thread(target=writer, daemon=True)
+t.start()
+
+# Reader: wiederholt neue Verbindung oeffnen und lesen (wie db_connect)
+attempts = 0
+errors = 0
+time.sleep(0.2)
+for _ in range(50):
+    try:
+        rc = duckdb.connect(DB)
+        row = rc.execute("SELECT COUNT(*) FROM t").fetchone()
+        rc.close()
+        if row is None:
+            errors += 1
+    except Exception as e:
+        errors += 1
+        failures.append(str(e))
+    attempts += 1
+    time.sleep(0.05)
+
+stop.set()
+t.join(timeout=2)
+
+print(f"Attempts: {attempts}, Errors: {errors}")
+if failures:
+    print("Erste Fehler:")
+    for f in failures[:5]:
+        print("  ", f)
+
+os.remove(DB)
+print("LOCKTEST FERTIG")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/tmp_cont_map.json
+```json
+{"base_time": 1785310260, "count": 3000, "map": {"1785310260": 1785310260, "1785310320": 1785310320, "1785310380": 1785310380, "1785310440": 1785310440, "1785310500": 1785310500, "1785310560": 1785310560, "1785310620": 1785310620, "1785310680": 1785310680, "1785310740": 1785310740, "1785310800": 1785310800, "1785310860": 1785310860, "1785310920": 1785310920, "1785310980": 1785310980, "1785311040": 1785311040, "1785311100": 1785311100, "1785311160": 1785311160, "1785311220": 1785311220, "1785311280": 1785311280, "1785311340": 1785311340, "1785311400": 1785311400, "1785311460": 1785311460, "1785311520": 1785311520, "1785311580": 1785311580, "1785311640": 1785311640, "1785311700": 1785311700, "1785311760": 1785311760, "1785311820": 1785311820, "1785311880": 1785311880, "1785311940": 1785311940, "1785312000": 1785312000, "1785312060": 1785312060, "1785312120": 1785312120, "1785312180": 1785312180, "1785312240": 1785312240, "1785312300": 1785312300, "1785312360": 1785312360, "1785312420": 1785312420, "1785312480": 1785312480, "1785312540": 1785312540, "1785312600": 1785312600, "1785312660": 1785312660, "1785312720": 1785312720, "1785312780": 1785312780, "1785312840": 1785312840, "1785312900": 1785312900, "1785312960": 1785312960, "1785313020": 1785313020, "1785313080": 1785313080, "1785313140": 1785313140, "1785313200": 1785313200, "1785313260": 1785313260, "1785313320": 1785313320, "1785313380": 1785313380, "1785313440": 1785313440, "1785313500": 1785313500, "1785313560": 1785313560, "1785313620": 1785313620, "1785313680": 1785313680, "1785313740": 1785313740, "1785313800": 1785313800, "1785313860": 1785313860, "1785313920": 1785313920, "1785313980": 1785313980, "1785314040": 1785314040, "1785314100": 1785314100, "1785314160": 1785314160, "1785314220": 1785314220, "1785314280": 1785314280, "1785314340": 1785314340, "1785314400": 1785314400, "1785314460": 1785314460, "1785314520": 1785314520, "1785314580": 1785314580, "1785314640": 1785314640, "1785314700": 1785314700, "1785314760": 1785314760, "1785314820": 1785314820, "1785314880": 1785314880, "1785314940": 1785314940, "1785315000": 1785315000, "1785315060": 1785315060, "1785315120": 1785315120, "1785315180": 1785315180, "1785315240": 1785315240, "1785315300": 1785315300, "1785315360": 1785315360, "1785315420": 1785315420, "1785315480": 1785315480, "1785315540": 1785315540, "1785315600": 1785315600, "1785315660": 1785315660, "1785315720": 1785315720, "1785315780": 1785315780, "1785315840": 1785315840, "1785315900": 1785315900, "1785315960": 1785315960, "1785316020": 1785316020, "1785316080": 1785316080, "1785316140": 1785316140, "1785316200": 1785316200, "1785316260": 1785316260, "1785316320": 1785316320, "1785316380": 1785316380, "1785316440": 1785316440, "1785316500": 1785316500, "1785316560": 1785316560, "1785316620": 1785316620, "1785316680": 1785316680, "1785316740": 1785316740, "1785316800": 1785316800, "1785316860": 1785316860, "1785316920": 1785316920, "1785316980": 1785316980, "1785317040": 1785317040, "1785317100": 1785317100, "1785317160": 1785317160, "1785317220": 1785317220, "1785317280": 1785317280, "1785317340": 1785317340, "1785317400": 1785317400, "1785317460": 1785317460, "1785317520": 1785317520, "1785317580": 1785317580, "1785317640": 1785317640, "1785317700": 1785317700, "1785317760": 1785317760, "1785317820": 1785317820, "1785317880": 1785317880, "1785317940": 1785317940, "1785318000": 1785318000, "1785318060": 1785318060, "1785318120": 1785318120, "1785318180": 1785318180, "1785318240": 1785318240, "1785318300": 1785318300, "1785318360": 1785318360, "1785318420": 1785318420, "1785318480": 1785318480, "1785318540": 1785318540, "1785318600": 1785318600, "1785318660": 1785318660, "1785318720": 1785318720, "1785318780": 1785318780, "1785318840": 1785318840, "1785318900": 1785318900, "1785318960": 1785318960, "1785319020": 1785319020, "1785319080": 1785319080, "1785319140": 1785319140, "1785319200": 1785319200, "1785319260": 1785319260, "1785319320": 1785319320, "1785319380": 1785319380, "1785319440": 1785319440, "1785319500": 1785319500, "1785319560": 1785319560, "1785319620": 1785319620, "1785319680": 1785319680, "1785319740": 1785319740, "1785319800": 1785319800, "1785319860": 1785319860, "1785319920": 1785319920, "1785319980": 1785319980, "1785320040": 1785320040, "1785320100": 1785320100, "1785320160": 1785320160, "1785320220": 1785320220, "1785320280": 1785320280, "1785320340": 1785320340, "1785320400": 1785320400, "1785320460": 1785320460, "1785320520": 1785320520, "1785320580": 1785320580, "1785320640": 1785320640, "1785320700": 1785320700, "1785320760": 1785320760, "1785320820": 1785320820, "1785320880": 1785320880, "1785320940": 1785320940, "1785321000": 1785321000, "1785321060": 1785321060, "1785321120": 1785321120, "1785321180": 1785321180, "1785321240": 1785321240, "1785321300": 1785321300, "1785321360": 1785321360, "1785321420": 1785321420, "1785321480": 1785321480, "1785321540": 1785321540, "1785321600": 1785321600, "1785321660": 1785321660, "1785321720": 1785321720, "1785321780": 1785321780, "1785321840": 1785321840, "1785321900": 1785321900, "1785321960": 1785321960, "1785322020": 1785322020, "1785322080": 1785322080, "1785322140": 1785322140, "1785322200": 1785322200, "1785322260": 1785322260, "1785322320": 1785322320, "1785322380": 1785322380, "1785322440": 1785322440, "1785322500": 1785322500, "1785322560": 1785322560, "1785322620": 1785322620, "1785322680": 1785322680, "1785322740": 1785322740, "1785322800": 1785322800, "1785322860": 1785322860, "1785322920": 1785322920, "1785322980": 1785322980, "1785323040": 1785323040, "1785323100": 1785323100, "1785323160": 1785323160, "1785323220": 1785323220, "1785323280": 1785323280, "1785323340": 1785323340, "1785323400": 1785323400, "1785323460": 1785323460, "1785323520": 1785323520, "1785323580": 1785323580, "1785323640": 1785323640, "1785323700": 1785323700, "1785323760": 1785323760, "1785323820": 1785323820, "1785323880": 1785323880, "1785323940": 1785323940, "1785324000": 1785324000, "1785324060": 1785324060, "1785324120": 1785324120, "1785324180": 1785324180, "1785324240": 1785324240, "1785324300": 1785324300, "1785324360": 1785324360, "1785324420": 1785324420, "1785324480": 1785324480, "1785324540": 1785324540, "1785324600": 1785324600, "1785324660": 1785324660, "1785324720": 1785324720, "1785324780": 1785324780, "1785324840": 1785324840, "1785324900": 1785324900, "1785324960": 1785324960, "1785325020": 1785325020, "1785325080": 1785325080, "1785325140": 1785325140, "1785325200": 1785325200, "1785325260": 1785325260, "1785325320": 1785325320, "1785325380": 1785325380, "1785325440": 1785325440, "1785325500": 1785325500, "1785325560": 1785325560, "1785325620": 1785325620, "1785325680": 1785325680, "1785325740": 1785325740, "1785325800": 1785325800, "1785325860": 1785325860, "1785325920": 1785325920, "1785325980": 1785325980, "1785326040": 1785326040, "1785326100": 1785326100, "1785326160": 1785326160, "1785326220": 1785326220, "1785326280": 1785326280, "1785326340": 1785326340, "1785326400": 1785326400, "1785326460": 1785326460, "1785326520": 1785326520, "1785326580": 1785326580, "1785326640": 1785326640, "1785326700": 1785326700, "1785326760": 1785326760, "1785326820": 1785326820, "1785326880": 1785326880, "1785326940": 1785326940, "1785327000": 1785327000, "1785327060": 1785327060, "1785327120": 1785327120, "1785327180": 1785327180, "1785327240": 1785327240, "1785327300": 1785327300, "1785327360": 1785327360, "1785327420": 1785327420, "1785327480": 1785327480, "1785327540": 1785327540, "1785327600": 1785327600, "1785327660": 1785327660, "1785327720": 1785327720, "1785327780": 1785327780, "1785327840": 1785327840, "1785327900": 1785327900, "1785327960": 1785327960, "1785328020": 1785328020, "1785328080": 1785328080, "1785328140": 1785328140, "1785328200": 1785328200, "1785328260": 1785328260, "1785328320": 1785328320, "1785328380": 1785328380, "1785328440": 1785328440, "1785328500": 1785328500, "1785328560": 1785328560, "1785328620": 1785328620, "1785328680": 1785328680, "1785328740": 1785328740, "1785328800": 1785328800, "1785328860": 1785328860, "1785328920": 1785328920, "1785328980": 1785328980, "1785329040": 1785329040, "1785329100": 1785329100, "1785329160": 1785329160, "1785329220": 1785329220, "1785329280": 1785329280, "1785329340": 1785329340, "1785329400": 1785329400, "1785329460": 1785329460, "1785329520": 1785329520, "1785329580": 1785329580, "1785329640": 1785329640, "1785329700": 1785329700, "1785329760": 1785329760, "1785329820": 1785329820, "1785329880": 1785329880, "1785329940": 1785329940, "1785330000": 1785330000, "1785330060": 1785330060, "1785330120": 1785330120, "1785330180": 1785330180, "1785330240": 1785330240, "1785330300": 1785330300, "1785330360": 1785330360, "1785330420": 1785330420, "1785330480": 1785330480, "1785330540": 1785330540, "1785330600": 1785330600, "1785330660": 1785330660, "1785330720": 1785330720, "1785330780": 1785330780, "1785330840": 1785330840, "1785330900": 1785330900, "1785330960": 1785330960, "1785331020": 1785331020, "1785331080": 1785331080, "1785331140": 1785331140, "1785331200": 1785331200, "1785331260": 1785331260, "1785331320": 1785331320, "1785331380": 1785331380, "1785331440": 1785331440, "1785331500": 1785331500, "1785331560": 1785331560, "1785331620": 1785331620, "1785331680": 1785331680, "1785331740": 1785331740, "1785331800": 1785331800, "1785331860": 1785331860, "1785331920": 1785331920, "1785331980": 1785331980, "1785332040": 1785332040, "1785332100": 1785332100, "1785332160": 1785332160, "1785332220": 1785332220, "1785332280": 1785332280, "1785332340": 1785332340, "1785332400": 1785332400, "1785332460": 1785332460, "1785332520": 1785332520, "1785332580": 1785332580, "1785332640": 1785332640, "1785332700": 1785332700, "1785332760": 1785332760, "1785332820": 1785332820, "1785332880": 1785332880, "1785332940": 1785332940, "1785333000": 1785333000, "1785333060": 1785333060, "1785333120": 1785333120, "1785333180": 1785333180, "1785333240": 1785333240, "1785333300": 1785333300, "1785333360": 1785333360, "1785333420": 1785333420, "1785333480": 1785333480, "1785333540": 1785333540, "1785333600": 1785333600, "1785333660": 1785333660, "1785333720": 1785333720, "1785333780": 1785333780, "1785333840": 1785333840, "1785333900": 1785333900, "1785333960": 1785333960, "1785334020": 1785334020, "1785334080": 1785334080, "1785334140": 1785334140, "1785334200": 1785334200, "1785334260": 1785334260, "1785334320": 1785334320, "1785334380": 1785334380, "1785334440": 1785334440, "1785334500": 1785334500, "1785334560": 1785334560, "1785334620": 1785334620, "1785334680": 1785334680, "1785334740": 1785334740, "1785334800": 1785334800, "1785334860": 1785334860, "1785334920": 1785334920, "1785334980": 1785334980, "1785335040": 1785335040, "1785335100": 1785335100, "1785335160": 1785335160, "1785335220": 1785335220, "1785335280": 1785335280, "1785335340": 1785335340, "1785335400": 1785335400, "1785335460": 1785335460, "1785335520": 1785335520, "1785335580": 1785335580, "1785335640": 1785335640, "1785335700": 1785335700, "1785335760": 1785335760, "1785335820": 1785335820, "1785335880": 1785335880, "1785335940": 1785335940, "1785336000": 1785336000, "1785336060": 1785336060, "1785336120": 1785336120, "1785336180": 1785336180, "1785336240": 1785336240, "1785336300": 1785336300, "1785336360": 1785336360, "1785336420": 1785336420, "1785336480": 1785336480, "1785336540": 1785336540, "1785336600": 1785336600, "1785336660": 1785336660, "1785336720": 1785336720, "1785336780": 1785336780, "1785336840": 1785336840, "1785336900": 1785336900, "1785336960": 1785336960, "1785337020": 1785337020, "1785337080": 1785337080, "1785337140": 1785337140, "1785337200": 1785337200, "1785337260": 1785337260, "1785337320": 1785337320, "1785337380": 1785337380, "1785337440": 1785337440, "1785337500": 1785337500, "1785337560": 1785337560, "1785337620": 1785337620, "1785337680": 1785337680, "1785337740": 1785337740, "1785337800": 1785337800, "1785337860": 1785337860, "1785337920": 1785337920, "1785337980": 1785337980, "1785338040": 1785338040, "1785338100": 1785338100, "1785338160": 1785338160, "1785338220": 1785338220, "1785338280": 1785338280, "1785338340": 1785338340, "1785338400": 1785338400, "1785338460": 1785338460, "1785338520": 1785338520, "1785338580": 1785338580, "1785338640": 1785338640, "1785338700": 1785338700, "1785338760": 1785338760, "1785338820": 1785338820, "1785338880": 1785338880, "1785338940": 1785338940, "1785339000": 1785339000, "1785339060": 1785339060, "1785339120": 1785339120, "1785339180": 1785339180, "1785339240": 1785339240, "1785339300": 1785339300, "1785339360": 1785339360, "1785339420": 1785339420, "1785339480": 1785339480, "1785339540": 1785339540, "1785339600": 1785339600, "1785339660": 1785339660, "1785339720": 1785339720, "1785339780": 1785339780, "1785339840": 1785339840, "1785339900": 1785339900, "1785339960": 1785339960, "1785340020": 1785340020, "1785340080": 1785340080, "1785340140": 1785340140, "1785340200": 1785340200, "1785340260": 1785340260, "1785340320": 1785340320, "1785340380": 1785340380, "1785340440": 1785340440, "1785340500": 1785340500, "1785340560": 1785340560, "1785340620": 1785340620, "1785340680": 1785340680, "1785340740": 1785340740, "1785340800": 1785340800, "1785340860": 1785340860, "1785340920": 1785340920, "1785340980": 1785340980, "1785341040": 1785341040, "1785341100": 1785341100, "1785341160": 1785341160, "1785341220": 1785341220, "1785341280": 1785341280, "1785341340": 1785341340, "1785341400": 1785341400, "1785341460": 1785341460, "1785341520": 1785341520, "1785341580": 1785341580, "1785341640": 1785341640, "1785341700": 1785341700, "1785341760": 1785341760, "1785341820": 1785341820, "1785341880": 1785341880, "1785341940": 1785341940, "1785342000": 1785342000, "1785342060": 1785342060, "1785342120": 1785342120, "1785342180": 1785342180, "1785342240": 1785342240, "1785342300": 1785342300, "1785342360": 1785342360, "1785342420": 1785342420, "1785342480": 1785342480, "1785342540": 1785342540, "1785342600": 1785342600, "1785342660": 1785342660, "1785342720": 1785342720, "1785342780": 1785342780, "1785342840": 1785342840, "1785342900": 1785342900, "1785342960": 1785342960, "1785343020": 1785343020, "1785343080": 1785343080, "1785343140": 1785343140, "1785343200": 1785343200, "1785343260": 1785343260, "1785343320": 1785343320, "1785343380": 1785343380, "1785343440": 1785343440, "1785343500": 1785343500, "1785343560": 1785343560, "1785343620": 1785343620, "1785343680": 1785343680, "1785343740": 1785343740, "1785343800": 1785343800, "1785343860": 1785343860, "1785343920": 1785343920, "1785343980": 1785343980, "1785344040": 1785344040, "1785344100": 1785344100, "1785344160": 1785344160, "1785344220": 1785344220, "1785344280": 1785344280, "1785344340": 1785344340, "1785344400": 1785344400, "1785344460": 1785344460, "1785344520": 1785344520, "1785344580": 1785344580, "1785344640": 1785344640, "1785344700": 1785344700, "1785344760": 1785344760, "1785344820": 1785344820, "1785344880": 1785344880, "1785344940": 1785344940, "1785345000": 1785345000, "1785345060": 1785345060, "1785345120": 1785345120, "1785345180": 1785345180, "1785345240": 1785345240, "1785345300": 1785345300, "1785345360": 1785345360, "1785345420": 1785345420, "1785345480": 1785345480, "1785345540": 1785345540, "1785345600": 1785345600, "1785345660": 1785345660, "1785345720": 1785345720, "1785345780": 1785345780, "1785345840": 1785345840, "1785345900": 1785345900, "1785345960": 1785345960, "1785346020": 1785346020, "1785346080": 1785346080, "1785346140": 1785346140, "1785346200": 1785346200, "1785346260": 1785346260, "1785346320": 1785346320, "1785346380": 1785346380, "1785346440": 1785346440, "1785346500": 1785346500, "1785346560": 1785346560, "1785346620": 1785346620, "1785346680": 1785346680, "1785346740": 1785346740, "1785346800": 1785346800, "1785346860": 1785346860, "1785346920": 1785346920, "1785346980": 1785346980, "1785347040": 1785347040, "1785347100": 1785347100, "1785347160": 1785347160, "1785347220": 1785347220, "1785347280": 1785347280, "1785347340": 1785347340, "1785347400": 1785347400, "1785347460": 1785347460, "1785347520": 1785347520, "1785347580": 1785347580, "1785347640": 1785347640, "1785347700": 1785347700, "1785347760": 1785347760, "1785347820": 1785347820, "1785347880": 1785347880, "1785347940": 1785347940, "1785348000": 1785348000, "1785348060": 1785348060, "1785348120": 1785348120, "1785348180": 1785348180, "1785348240": 1785348240, "1785348300": 1785348300, "1785348360": 1785348360, "1785348420": 1785348420, "1785348480": 1785348480, "1785348540": 1785348540, "1785348600": 1785348600, "1785348660": 1785348660, "1785348720": 1785348720, "1785348780": 1785348780, "1785348840": 1785348840, "1785348900": 1785348900, "1785348960": 1785348960, "1785349020": 1785349020, "1785349080": 1785349080, "1785349140": 1785349140, "1785349200": 1785349200, "1785349260": 1785349260, "1785349320": 1785349320, "1785349380": 1785349380, "1785349440": 1785349440, "1785349500": 1785349500, "1785349560": 1785349560, "1785349620": 1785349620, "1785349680": 1785349680, "1785349740": 1785349740, "1785349800": 1785349800, "1785349860": 1785349860, "1785349920": 1785349920, "1785349980": 1785349980, "1785350040": 1785350040, "1785350100": 1785350100, "1785350160": 1785350160, "1785350220": 1785350220, "1785350280": 1785350280, "1785350340": 1785350340, "1785350400": 1785350400, "1785350460": 1785350460, "1785350520": 1785350520, "1785350580": 1785350580, "1785350640": 1785350640, "1785350700": 1785350700, "1785350760": 1785350760, "1785350820": 1785350820, "1785350880": 1785350880, "1785350940": 1785350940, "1785351000": 1785351000, "1785351060": 1785351060, "1785351120": 1785351120, "1785351180": 1785351180, "1785351240": 1785351240, "1785351300": 1785351300, "1785351360": 1785351360, "1785351420": 1785351420, "1785351480": 1785351480, "1785351540": 1785351540, "1785351600": 1785351600, "1785351660": 1785351660, "1785351720": 1785351720, "1785351780": 1785351780, "1785351840": 1785351840, "1785351900": 1785351900, "1785351960": 1785351960, "1785352020": 1785352020, "1785352080": 1785352080, "1785352140": 1785352140, "1785352200": 1785352200, "1785352260": 1785352260, "1785352320": 1785352320, "1785352380": 1785352380, "1785352440": 1785352440, "1785352500": 1785352500, "1785352560": 1785352560, "1785352620": 1785352620, "1785352680": 1785352680, "1785352740": 1785352740, "1785352800": 1785352800, "1785352860": 1785352860, "1785352920": 1785352920, "1785352980": 1785352980, "1785353040": 1785353040, "1785353100": 1785353100, "1785353160": 1785353160, "1785353220": 1785353220, "1785353280": 1785353280, "1785353340": 1785353340, "1785353400": 1785353400, "1785353460": 1785353460, "1785353520": 1785353520, "1785353580": 1785353580, "1785353640": 1785353640, "1785353700": 1785353700, "1785353760": 1785353760, "1785353820": 1785353820, "1785353880": 1785353880, "1785353940": 1785353940, "1785354000": 1785354000, "1785354060": 1785354060, "1785354120": 1785354120, "1785354180": 1785354180, "1785354240": 1785354240, "1785354300": 1785354300, "1785354360": 1785354360, "1785354420": 1785354420, "1785354480": 1785354480, "1785354540": 1785354540, "1785354600": 1785354600, "1785354660": 1785354660, "1785354720": 1785354720, "1785354780": 1785354780, "1785354840": 1785354840, "1785354900": 1785354900, "1785354960": 1785354960, "1785355020": 1785355020, "1785355080": 1785355080, "1785355140": 1785355140, "1785355200": 1785355200, "1785355260": 1785355260, "1785355320": 1785355320, "1785355380": 1785355380, "1785355440": 1785355440, "1785355500": 1785355500, "1785355560": 1785355560, "1785355620": 1785355620, "1785355680": 1785355680, "1785355740": 1785355740, "1785355800": 1785355800, "1785355860": 1785355860, "1785355920": 1785355920, "1785355980": 1785355980, "1785356040": 1785356040, "1785356100": 1785356100, "1785356160": 1785356160, "1785356220": 1785356220, "1785356280": 1785356280, "1785356340": 1785356340, "1785356400": 1785356400, "1785356460": 1785356460, "1785356520": 1785356520, "1785356580": 1785356580, "1785356640": 1785356640, "1785356700": 1785356700, "1785356760": 1785356760, "1785356820": 1785356820, "1785356880": 1785356880, "1785356940": 1785356940, "1785357000": 1785357000, "1785357060": 1785357060, "1785357120": 1785357120, "1785357180": 1785357180, "1785357240": 1785357240, "1785357300": 1785357300, "1785357360": 1785357360, "1785357420": 1785357420, "1785357480": 1785357480, "1785357540": 1785357540, "1785357600": 1785357600, "1785357660": 1785357660, "1785357720": 1785357720, "1785357780": 1785357780, "1785357840": 1785357840, "1785357900": 1785357900, "1785357960": 1785357960, "1785358020": 1785358020, "1785358080": 1785358080, "1785358140": 1785358140, "1785358200": 1785358200, "1785358260": 1785358260, "1785358320": 1785358320, "1785358380": 1785358380, "1785358440": 1785358440, "1785358500": 1785358500, "1785358560": 1785358560, "1785358620": 1785358620, "1785358680": 1785358680, "1785358740": 1785358740, "1785358800": 1785358800, "1785358860": 1785358860, "1785358920": 1785358920, "1785358980": 1785358980, "1785359040": 1785359040, "1785359100": 1785359100, "1785359160": 1785359160, "1785359220": 1785359220, "1785359280": 1785359280, "1785359340": 1785359340, "1785359400": 1785359400, "1785359460": 1785359460, "1785359520": 1785359520, "1785359580": 1785359580, "1785359640": 1785359640, "1785359700": 1785359700, "1785359760": 1785359760, "1785359820": 1785359820, "1785359880": 1785359880, "1785359940": 1785359940, "1785360000": 1785360000, "1785360060": 1785360060, "1785360120": 1785360120, "1785360180": 1785360180, "1785360240": 1785360240, "1785360300": 1785360300, "1785360360": 1785360360, "1785360420": 1785360420, "1785360480": 1785360480, "1785360540": 1785360540, "1785360600": 1785360600, "1785360660": 1785360660, "1785360720": 1785360720, "1785360780": 1785360780, "1785360840": 1785360840, "1785360900": 1785360900, "1785360960": 1785360960, "1785361020": 1785361020, "1785361080": 1785361080, "1785361140": 1785361140, "1785361200": 1785361200, "1785361260": 1785361260, "1785361320": 1785361320, "1785361380": 1785361380, "1785361440": 1785361440, "1785361500": 1785361500, "1785361560": 1785361560, "1785361620": 1785361620, "1785361680": 1785361680, "1785361740": 1785361740, "1785361800": 1785361800, "1785361860": 1785361860, "1785361920": 1785361920, "1785361980": 1785361980, "1785362040": 1785362040, "1785362100": 1785362100, "1785362160": 1785362160, "1785362220": 1785362220, "1785362280": 1785362280, "1785362340": 1785362340, "1785362400": 1785362400, "1785362460": 1785362460, "1785362520": 1785362520, "1785362580": 1785362580, "1785362640": 1785362640, "1785362700": 1785362700, "1785362760": 1785362760, "1785362820": 1785362820, "1785362880": 1785362880, "1785362940": 1785362940, "1785363000": 1785363000, "1785363060": 1785363060, "1785363120": 1785363120, "1785363180": 1785363180, "1785363240": 1785363240, "1785363300": 1785363300, "1785363360": 1785363360, "1785363420": 1785363420, "1785363480": 1785363480, "1785363540": 1785363540, "1785363600": 1785363600, "1785363660": 1785363660, "1785363720": 1785363720, "1785363780": 1785363780, "1785363840": 1785363840, "1785363900": 1785363900, "1785363960": 1785363960, "1785364020": 1785364020, "1785364080": 1785364080, "1785364140": 1785364140, "1785364200": 1785364200, "1785364260": 1785364260, "1785364320": 1785364320, "1785364380": 1785364380, "1785364440": 1785364440, "1785364500": 1785364500, "1785364560": 1785364560, "1785364620": 1785364620, "1785364680": 1785364680, "1785364740": 1785364740, "1785364800": 1785364800, "1785364860": 1785364860, "1785364920": 1785364920, "1785364980": 1785364980, "1785365040": 1785365040, "1785365100": 1785365100, "1785365160": 1785365160, "1785365220": 1785365220, "1785365280": 1785365280, "1785365340": 1785365340, "1785365400": 1785365400, "1785365460": 1785365460, "1785365520": 1785365520, "1785365580": 1785365580, "1785365640": 1785365640, "1785365700": 1785365700, "1785365760": 1785365760, "1785365820": 1785365820, "1785365880": 1785365880, "1785365940": 1785365940, "1785366000": 1785369660, "1785366060": 1785369720, "1785366120": 1785369780, "1785366180": 1785369840, "1785366240": 1785369900, "1785366300": 1785369960, "1785366360": 1785370020, "1785366420": 1785370080, "1785366480": 1785370140, "1785366540": 1785370200, "1785366600": 1785370260, "1785366660": 1785370320, "1785366720": 1785370380, "1785366780": 1785370440, "1785366840": 1785370500, "1785366900": 1785370560, "1785366960": 1785370620, "1785367020": 1785370680, "1785367080": 1785370740, "1785367140": 1785370800, "1785367200": 1785370860, "1785367260": 1785370920, "1785367320": 1785370980, "1785367380": 1785371040, "1785367440": 1785371100, "1785367500": 1785371160, "1785367560": 1785371220, "1785367620": 1785371280, "1785367680": 1785371340, "1785367740": 1785371400, "1785367800": 1785371460, "1785367860": 1785371520, "1785367920": 1785371580, "1785367980": 1785371640, "1785368040": 1785371700, "1785368100": 1785371760, "1785368160": 1785371820, "1785368220": 1785371880, "1785368280": 1785371940, "1785368340": 1785372000, "1785368400": 1785372060, "1785368460": 1785372120, "1785368520": 1785372180, "1785368580": 1785372240, "1785368640": 1785372300, "1785368700": 1785372360, "1785368760": 1785372420, "1785368820": 1785372480, "1785368880": 1785372540, "1785368940": 1785372600, "1785369000": 1785372660, "1785369060": 1785372720, "1785369120": 1785372780, "1785369180": 1785372840, "1785369240": 1785372900, "1785369300": 1785372960, "1785369360": 1785373020, "1785369420": 1785373080, "1785369480": 1785373140, "1785369540": 1785373200, "1785369600": 1785373260, "1785369660": 1785373320, "1785369720": 1785373380, "1785369780": 1785373440, "1785369840": 1785373500, "1785369900": 1785373560, "1785369960": 1785373620, "1785370020": 1785373680, "1785370080": 1785373740, "1785370140": 1785373800, "1785370200": 1785373860, "1785370260": 1785373920, "1785370320": 1785373980, "1785370380": 1785374040, "1785370440": 1785374100, "1785370500": 1785374160, "1785370560": 1785374220, "1785370620": 1785374280, "1785370680": 1785374340, "1785370740": 1785374400, "1785370800": 1785374460, "1785370860": 1785374520, "1785370920": 1785374580, "1785370980": 1785374640, "1785371040": 1785374700, "1785371100": 1785374760, "1785371160": 1785374820, "1785371220": 1785374880, "1785371280": 1785374940, "1785371340": 1785375000, "1785371400": 1785375060, "1785371460": 1785375120, "1785371520": 1785375180, "1785371580": 1785375240, "1785371640": 1785375300, "1785371700": 1785375360, "1785371760": 1785375420, "1785371820": 1785375480, "1785371880": 1785375540, "1785371940": 1785375600, "1785372000": 1785375660, "1785372060": 1785375720, "1785372120": 1785375780, "1785372180": 1785375840, "1785372240": 1785375900, "1785372300": 1785375960, "1785372360": 1785376020, "1785372420": 1785376080, "1785372480": 1785376140, "1785372540": 1785376200, "1785372600": 1785376260, "1785372660": 1785376320, "1785372720": 1785376380, "1785372780": 1785376440, "1785372840": 1785376500, "1785372900": 1785376560, "1785372960": 1785376620, "1785373020": 1785376680, "1785373080": 1785376740, "1785373140": 1785376800, "1785373200": 1785376860, "1785373260": 1785376920, "1785373320": 1785376980, "1785373380": 1785377040, "1785373440": 1785377100, "1785373500": 1785377160, "1785373560": 1785377220, "1785373620": 1785377280, "1785373680": 1785377340, "1785373740": 1785377400, "1785373800": 1785377460, "1785373860": 1785377520, "1785373920": 1785377580, "1785373980": 1785377640, "1785374040": 1785377700, "1785374100": 1785377760, "1785374160": 1785377820, "1785374220": 1785377880, "1785374280": 1785377940, "1785374340": 1785378000, "1785374400": 1785378060, "1785374460": 1785378120, "1785374520": 1785378180, "1785374580": 1785378240, "1785374640": 1785378300, "1785374700": 1785378360, "1785374760": 1785378420, "1785374820": 1785378480, "1785374880": 1785378540, "1785374940": 1785378600, "1785375000": 1785378660, "1785375060": 1785378720, "1785375120": 1785378780, "1785375180": 1785378840, "1785375240": 1785378900, "1785375300": 1785378960, "1785375360": 1785379020, "1785375420": 1785379080, "1785375480": 1785379140, "1785375540": 1785379200, "1785375600": 1785379260, "1785375660": 1785379320, "1785375720": 1785379380, "1785375780": 1785379440, "1785375840": 1785379500, "1785375900": 1785379560, "1785375960": 1785379620, "1785376020": 1785379680, "1785376080": 1785379740, "1785376140": 1785379800, "1785376200": 1785379860, "1785376260": 1785379920, "1785376320": 1785379980, "1785376380": 1785380040, "1785376440": 1785380100, "1785376500": 1785380160, "1785376560": 1785380220, "1785376620": 1785380280, "1785376680": 1785380340, "1785376740": 1785380400, "1785376800": 1785380460, "1785376860": 1785380520, "1785376920": 1785380580, "1785376980": 1785380640, "1785377040": 1785380700, "1785377100": 1785380760, "1785377160": 1785380820, "1785377220": 1785380880, "1785377280": 1785380940, "1785377340": 1785381000, "1785377400": 1785381060, "1785377460": 1785381120, "1785377520": 1785381180, "1785377580": 1785381240, "1785377640": 1785381300, "1785377700": 1785381360, "1785377760": 1785381420, "1785377820": 1785381480, "1785377880": 1785381540, "1785377940": 1785381600, "1785378000": 1785381660, "1785378060": 1785381720, "1785378120": 1785381780, "1785378180": 1785381840, "1785378240": 1785381900, "1785378300": 1785381960, "1785378360": 1785382020, "1785378420": 1785382080, "1785378480": 1785382140, "1785378540": 1785382200, "1785378600": 1785382260, "1785378660": 1785382320, "1785378720": 1785382380, "1785378780": 1785382440, "1785378840": 1785382500, "1785378900": 1785382560, "1785378960": 1785382620, "1785379020": 1785382680, "1785379080": 1785382740, "1785379140": 1785382800, "1785379200": 1785382860, "1785379260": 1785382920, "1785379320": 1785382980, "1785379380": 1785383040, "1785379440": 1785383100, "1785379500": 1785383160, "1785379560": 1785383220, "1785379620": 1785383280, "1785379680": 1785383340, "1785379740": 1785383400, "1785379800": 1785383460, "1785379860": 1785383520, "1785379920": 1785383580, "1785379980": 1785383640, "1785380040": 1785383700, "1785380100": 1785383760, "1785380160": 1785383820, "1785380220": 1785383880, "1785380280": 1785383940, "1785380340": 1785384000, "1785380400": 1785384060, "1785380460": 1785384120, "1785380520": 1785384180, "1785380580": 1785384240, "1785380640": 1785384300, "1785380700": 1785384360, "1785380760": 1785384420, "1785380820": 1785384480, "1785380880": 1785384540, "1785380940": 1785384600, "1785381000": 1785384660, "1785381060": 1785384720, "1785381120": 1785384780, "1785381180": 1785384840, "1785381240": 1785384900, "1785381300": 1785384960, "1785381360": 1785385020, "1785381420": 1785385080, "1785381480": 1785385140, "1785381540": 1785385200, "1785381600": 1785385260, "1785381660": 1785385320, "1785381720": 1785385380, "1785381780": 1785385440, "1785381840": 1785385500, "1785381900": 1785385560, "1785381960": 1785385620, "1785382020": 1785385680, "1785382080": 1785385740, "1785382140": 1785385800, "1785382200": 1785385860, "1785382260": 1785385920, "1785382320": 1785385980, "1785382380": 1785386040, "1785382440": 1785386100, "1785382500": 1785386160, "1785382560": 1785386220, "1785382620": 1785386280, "1785382680": 1785386340, "1785382740": 1785386400, "1785382800": 1785386460, "1785382860": 1785386520, "1785382920": 1785386580, "1785382980": 1785386640, "1785383040": 1785386700, "1785383100": 1785386760, "1785383160": 1785386820, "1785383220": 1785386880, "1785383280": 1785386940, "1785383340": 1785387000, "1785383400": 1785387060, "1785383460": 1785387120, "1785383520": 1785387180, "1785383580": 1785387240, "1785383640": 1785387300, "1785383700": 1785387360, "1785383760": 1785387420, "1785383820": 1785387480, "1785383880": 1785387540, "1785383940": 1785387600, "1785384000": 1785387660, "1785384060": 1785387720, "1785384120": 1785387780, "1785384180": 1785387840, "1785384240": 1785387900, "1785384300": 1785387960, "1785384360": 1785388020, "1785384420": 1785388080, "1785384480": 1785388140, "1785384540": 1785388200, "1785384600": 1785388260, "1785384660": 1785388320, "1785384720": 1785388380, "1785384780": 1785388440, "1785384840": 1785388500, "1785384900": 1785388560, "1785384960": 1785388620, "1785385020": 1785388680, "1785385080": 1785388740, "1785385140": 1785388800, "1785385200": 1785388860, "1785385260": 1785388920, "1785385320": 1785388980, "1785385380": 1785389040, "1785385440": 1785389100, "1785385500": 1785389160, "1785385560": 1785389220, "1785385620": 1785389280, "1785385680": 1785389340, "1785385740": 1785389400, "1785385800": 1785389460, "1785385860": 1785389520, "1785385920": 1785389580, "1785385980": 1785389640, "1785386040": 1785389700, "1785386100": 1785389760, "1785386160": 1785389820, "1785386220": 1785389880, "1785386280": 1785389940, "1785386340": 1785390000, "1785386400": 1785390060, "1785386460": 1785390120, "1785386520": 1785390180, "1785386580": 1785390240, "1785386640": 1785390300, "1785386700": 1785390360, "1785386760": 1785390420, "1785386820": 1785390480, "1785386880": 1785390540, "1785386940": 1785390600, "1785387000": 1785390660, "1785387060": 1785390720, "1785387120": 1785390780, "1785387180": 1785390840, "1785387240": 1785390900, "1785387300": 1785390960, "1785387360": 1785391020, "1785387420": 1785391080, "1785387480": 1785391140, "1785387540": 1785391200, "1785387600": 1785391260, "1785387660": 1785391320, "1785387720": 1785391380, "1785387780": 1785391440, "1785387840": 1785391500, "1785387900": 1785391560, "1785387960": 1785391620, "1785388020": 1785391680, "1785388080": 1785391740, "1785388140": 1785391800, "1785388200": 1785391860, "1785388260": 1785391920, "1785388320": 1785391980, "1785388380": 1785392040, "1785388440": 1785392100, "1785388500": 1785392160, "1785388560": 1785392220, "1785388620": 1785392280, "1785388680": 1785392340, "1785388740": 1785392400, "1785388800": 1785392460, "1785388860": 1785392520, "1785388920": 1785392580, "1785388980": 1785392640, "1785389040": 1785392700, "1785389100": 1785392760, "1785389160": 1785392820, "1785389220": 1785392880, "1785389280": 1785392940, "1785389340": 1785393000, "1785389400": 1785393060, "1785389460": 1785393120, "1785389520": 1785393180, "1785389580": 1785393240, "1785389640": 1785393300, "1785389700": 1785393360, "1785389760": 1785393420, "1785389820": 1785393480, "1785389880": 1785393540, "1785389940": 1785393600, "1785390000": 1785393660, "1785390060": 1785393720, "1785390120": 1785393780, "1785390180": 1785393840, "1785390240": 1785393900, "1785390300": 1785393960, "1785390360": 1785394020, "1785390420": 1785394080, "1785390480": 1785394140, "1785390540": 1785394200, "1785390600": 1785394260, "1785390660": 1785394320, "1785390720": 1785394380, "1785390780": 1785394440, "1785390840": 1785394500, "1785390900": 1785394560, "1785390960": 1785394620, "1785391020": 1785394680, "1785391080": 1785394740, "1785391140": 1785394800, "1785391200": 1785394860, "1785391260": 1785394920, "1785391320": 1785394980, "1785391380": 1785395040, "1785391440": 1785395100, "1785391500": 1785395160, "1785391560": 1785395220, "1785391620": 1785395280, "1785391680": 1785395340, "1785391740": 1785395400, "1785391800": 1785395460, "1785391860": 1785395520, "1785391920": 1785395580, "1785391980": 1785395640, "1785392040": 1785395700, "1785392100": 1785395760, "1785392160": 1785395820, "1785392220": 1785395880, "1785392280": 1785395940, "1785392340": 1785396000, "1785392400": 1785396060, "1785392460": 1785396120, "1785392520": 1785396180, "1785392580": 1785396240, "1785392640": 1785396300, "1785392700": 1785396360, "1785392760": 1785396420, "1785392820": 1785396480, "1785392880": 1785396540, "1785392940": 1785396600, "1785393000": 1785396660, "1785393060": 1785396720, "1785393120": 1785396780, "1785393180": 1785396840, "1785393240": 1785396900, "1785393300": 1785396960, "1785393360": 1785397020, "1785393420": 1785397080, "1785393480": 1785397140, "1785393540": 1785397200, "1785393600": 1785397260, "1785393660": 1785397320, "1785393720": 1785397380, "1785393780": 1785397440, "1785393840": 1785397500, "1785393900": 1785397560, "1785393960": 1785397620, "1785394020": 1785397680, "1785394080": 1785397740, "1785394140": 1785397800, "1785394200": 1785397860, "1785394260": 1785397920, "1785394320": 1785397980, "1785394380": 1785398040, "1785394440": 1785398100, "1785394500": 1785398160, "1785394560": 1785398220, "1785394620": 1785398280, "1785394680": 1785398340, "1785394740": 1785398400, "1785394800": 1785398460, "1785394860": 1785398520, "1785394920": 1785398580, "1785394980": 1785398640, "1785395040": 1785398700, "1785395100": 1785398760, "1785395160": 1785398820, "1785395220": 1785398880, "1785395280": 1785398940, "1785395340": 1785399000, "1785395400": 1785399060, "1785395460": 1785399120, "1785395520": 1785399180, "1785395580": 1785399240, "1785395640": 1785399300, "1785395700": 1785399360, "1785395760": 1785399420, "1785395820": 1785399480, "1785395880": 1785399540, "1785395940": 1785399600, "1785396000": 1785399660, "1785396060": 1785399720, "1785396120": 1785399780, "1785396180": 1785399840, "1785396240": 1785399900, "1785396300": 1785399960, "1785396360": 1785400020, "1785396420": 1785400080, "1785396480": 1785400140, "1785396540": 1785400200, "1785396600": 1785400260, "1785396660": 1785400320, "1785396720": 1785400380, "1785396780": 1785400440, "1785396840": 1785400500, "1785396900": 1785400560, "1785396960": 1785400620, "1785397020": 1785400680, "1785397080": 1785400740, "1785397140": 1785400800, "1785397200": 1785400860, "1785397260": 1785400920, "1785397320": 1785400980, "1785397380": 1785401040, "1785397440": 1785401100, "1785397500": 1785401160, "1785397560": 1785401220, "1785397620": 1785401280, "1785397680": 1785401340, "1785397740": 1785401400, "1785397800": 1785401460, "1785397860": 1785401520, "1785397920": 1785401580, "1785397980": 1785401640, "1785398040": 1785401700, "1785398100": 1785401760, "1785398160": 1785401820, "1785398220": 1785401880, "1785398280": 1785401940, "1785398340": 1785402000, "1785398400": 1785402060, "1785398460": 1785402120, "1785398520": 1785402180, "1785398580": 1785402240, "1785398640": 1785402300, "1785398700": 1785402360, "1785398760": 1785402420, "1785398820": 1785402480, "1785398880": 1785402540, "1785398940": 1785402600, "1785399000": 1785402660, "1785399060": 1785402720, "1785399120": 1785402780, "1785399180": 1785402840, "1785399240": 1785402900, "1785399300": 1785402960, "1785399360": 1785403020, "1785399420": 1785403080, "1785399480": 1785403140, "1785399540": 1785403200, "1785399600": 1785403260, "1785399660": 1785403320, "1785399720": 1785403380, "1785399780": 1785403440, "1785399840": 1785403500, "1785399900": 1785403560, "1785399960": 1785403620, "1785400020": 1785403680, "1785400080": 1785403740, "1785400140": 1785403800, "1785400200": 1785403860, "1785400260": 1785403920, "1785400320": 1785403980, "1785400380": 1785404040, "1785400440": 1785404100, "1785400500": 1785404160, "1785400560": 1785404220, "1785400620": 1785404280, "1785400680": 1785404340, "1785400740": 1785404400, "1785400800": 1785404460, "1785400860": 1785404520, "1785400920": 1785404580, "1785400980": 1785404640, "1785401040": 1785404700, "1785401100": 1785404760, "1785401160": 1785404820, "1785401220": 1785404880, "1785401280": 1785404940, "1785401340": 1785405000, "1785401400": 1785405060, "1785401460": 1785405120, "1785401520": 1785405180, "1785401580": 1785405240, "1785401640": 1785405300, "1785401700": 1785405360, "1785401760": 1785405420, "1785401820": 1785405480, "1785401880": 1785405540, "1785401940": 1785405600, "1785402000": 1785405660, "1785402060": 1785405720, "1785402120": 1785405780, "1785402180": 1785405840, "1785402240": 1785405900, "1785402300": 1785405960, "1785402360": 1785406020, "1785402420": 1785406080, "1785402480": 1785406140, "1785402540": 1785406200, "1785402600": 1785406260, "1785402660": 1785406320, "1785402720": 1785406380, "1785402780": 1785406440, "1785402840": 1785406500, "1785402900": 1785406560, "1785402960": 1785406620, "1785403020": 1785406680, "1785403080": 1785406740, "1785403140": 1785406800, "1785403200": 1785406860, "1785403260": 1785406920, "1785403320": 1785406980, "1785403380": 1785407040, "1785403440": 1785407100, "1785403500": 1785407160, "1785403560": 1785407220, "1785403620": 1785407280, "1785403680": 1785407340, "1785403740": 1785407400, "1785403800": 1785407460, "1785403860": 1785407520, "1785403920": 1785407580, "1785403980": 1785407640, "1785404040": 1785407700, "1785404100": 1785407760, "1785404160": 1785407820, "1785404220": 1785407880, "1785404280": 1785407940, "1785404340": 1785408000, "1785404400": 1785408060, "1785404460": 1785408120, "1785404520": 1785408180, "1785404580": 1785408240, "1785404640": 1785408300, "1785404700": 1785408360, "1785404760": 1785408420, "1785404820": 1785408480, "1785404880": 1785408540, "1785404940": 1785408600, "1785405000": 1785408660, "1785405060": 1785408720, "1785405120": 1785408780, "1785405180": 1785408840, "1785405240": 1785408900, "1785405300": 1785408960, "1785405360": 1785409020, "1785405420": 1785409080, "1785405480": 1785409140, "1785405540": 1785409200, "1785405600": 1785409260, "1785405660": 1785409320, "1785405720": 1785409380, "1785405780": 1785409440, "1785405840": 1785409500, "1785405900": 1785409560, "1785405960": 1785409620, "1785406020": 1785409680, "1785406080": 1785409740, "1785406140": 1785409800, "1785406200": 1785409860, "1785406260": 1785409920, "1785406320": 1785409980, "1785406380": 1785410040, "1785406440": 1785410100, "1785406500": 1785410160, "1785406560": 1785410220, "1785406620": 1785410280, "1785406680": 1785410340, "1785406740": 1785410400, "1785406800": 1785410460, "1785406860": 1785410520, "1785406920": 1785410580, "1785406980": 1785410640, "1785407040": 1785410700, "1785407100": 1785410760, "1785407160": 1785410820, "1785407220": 1785410880, "1785407280": 1785410940, "1785407340": 1785411000, "1785407400": 1785411060, "1785407460": 1785411120, "1785407520": 1785411180, "1785407580": 1785411240, "1785407640": 1785411300, "1785407700": 1785411360, "1785407760": 1785411420, "1785407820": 1785411480, "1785407880": 1785411540, "1785407940": 1785411600, "1785408000": 1785411660, "1785408060": 1785411720, "1785408120": 1785411780, "1785408180": 1785411840, "1785408240": 1785411900, "1785408300": 1785411960, "1785408360": 1785412020, "1785408420": 1785412080, "1785408480": 1785412140, "1785408540": 1785412200, "1785408600": 1785412260, "1785408660": 1785412320, "1785408720": 1785412380, "1785408780": 1785412440, "1785408840": 1785412500, "1785408900": 1785412560, "1785408960": 1785412620, "1785409020": 1785412680, "1785409080": 1785412740, "1785409140": 1785412800, "1785409200": 1785412860, "1785409260": 1785412920, "1785409320": 1785412980, "1785409380": 1785413040, "1785409440": 1785413100, "1785409500": 1785413160, "1785409560": 1785413220, "1785409620": 1785413280, "1785409680": 1785413340, "1785409740": 1785413400, "1785409800": 1785413460, "1785409860": 1785413520, "1785409920": 1785413580, "1785409980": 1785413640, "1785410040": 1785413700, "1785410100": 1785413760, "1785410160": 1785413820, "1785410220": 1785413880, "1785410280": 1785413940, "1785410340": 1785414000, "1785410400": 1785414060, "1785410460": 1785414120, "1785410520": 1785414180, "1785410580": 1785414240, "1785410640": 1785414300, "1785410700": 1785414360, "1785410760": 1785414420, "1785410820": 1785414480, "1785410880": 1785414540, "1785410940": 1785414600, "1785411000": 1785414660, "1785411060": 1785414720, "1785411120": 1785414780, "1785411180": 1785414840, "1785411240": 1785414900, "1785411300": 1785414960, "1785411360": 1785415020, "1785411420": 1785415080, "1785411480": 1785415140, "1785411540": 1785415200, "1785411600": 1785415260, "1785411660": 1785415320, "1785411720": 1785415380, "1785411780": 1785415440, "1785411840": 1785415500, "1785411900": 1785415560, "1785411960": 1785415620, "1785412020": 1785415680, "1785412080": 1785415740, "1785412140": 1785415800, "1785412200": 1785415860, "1785412260": 1785415920, "1785412320": 1785415980, "1785412380": 1785416040, "1785412440": 1785416100, "1785412500": 1785416160, "1785412560": 1785416220, "1785412620": 1785416280, "1785412680": 1785416340, "1785412740": 1785416400, "1785412800": 1785416460, "1785412860": 1785416520, "1785412920": 1785416580, "1785412980": 1785416640, "1785413040": 1785416700, "1785413100": 1785416760, "1785413160": 1785416820, "1785413220": 1785416880, "1785413280": 1785416940, "1785413340": 1785417000, "1785413400": 1785417060, "1785413460": 1785417120, "1785413520": 1785417180, "1785413580": 1785417240, "1785413640": 1785417300, "1785413700": 1785417360, "1785413760": 1785417420, "1785413820": 1785417480, "1785413880": 1785417540, "1785413940": 1785417600, "1785414000": 1785417660, "1785414060": 1785417720, "1785414120": 1785417780, "1785414180": 1785417840, "1785414240": 1785417900, "1785414300": 1785417960, "1785414360": 1785418020, "1785414420": 1785418080, "1785414480": 1785418140, "1785414540": 1785418200, "1785414600": 1785418260, "1785414660": 1785418320, "1785414720": 1785418380, "1785414780": 1785418440, "1785414840": 1785418500, "1785414900": 1785418560, "1785414960": 1785418620, "1785415020": 1785418680, "1785415080": 1785418740, "1785415140": 1785418800, "1785415200": 1785418860, "1785415260": 1785418920, "1785415320": 1785418980, "1785415380": 1785419040, "1785415440": 1785419100, "1785415500": 1785419160, "1785415560": 1785419220, "1785415620": 1785419280, "1785415680": 1785419340, "1785415740": 1785419400, "1785415800": 1785419460, "1785415860": 1785419520, "1785415920": 1785419580, "1785415980": 1785419640, "1785416040": 1785419700, "1785416100": 1785419760, "1785416160": 1785419820, "1785416220": 1785419880, "1785416280": 1785419940, "1785416340": 1785420000, "1785416400": 1785420060, "1785416460": 1785420120, "1785416520": 1785420180, "1785416580": 1785420240, "1785416640": 1785420300, "1785416700": 1785420360, "1785416760": 1785420420, "1785416820": 1785420480, "1785416880": 1785420540, "1785416940": 1785420600, "1785417000": 1785420660, "1785417060": 1785420720, "1785417120": 1785420780, "1785417180": 1785420840, "1785417240": 1785420900, "1785417300": 1785420960, "1785417360": 1785421020, "1785417420": 1785421080, "1785417480": 1785421140, "1785417540": 1785421200, "1785417600": 1785421260, "1785417660": 1785421320, "1785417720": 1785421380, "1785417780": 1785421440, "1785417840": 1785421500, "1785417900": 1785421560, "1785417960": 1785421620, "1785418020": 1785421680, "1785418080": 1785421740, "1785418140": 1785421800, "1785418200": 1785421860, "1785418260": 1785421920, "1785418320": 1785421980, "1785418380": 1785422040, "1785418440": 1785422100, "1785418500": 1785422160, "1785418560": 1785422220, "1785418620": 1785422280, "1785418680": 1785422340, "1785418740": 1785422400, "1785418800": 1785422460, "1785418860": 1785422520, "1785418920": 1785422580, "1785418980": 1785422640, "1785419040": 1785422700, "1785419100": 1785422760, "1785419160": 1785422820, "1785419220": 1785422880, "1785419280": 1785422940, "1785419340": 1785423000, "1785419400": 1785423060, "1785419460": 1785423120, "1785419520": 1785423180, "1785419580": 1785423240, "1785419640": 1785423300, "1785419700": 1785423360, "1785419760": 1785423420, "1785419820": 1785423480, "1785419880": 1785423540, "1785419940": 1785423600, "1785420000": 1785423660, "1785420060": 1785423720, "1785420120": 1785423780, "1785420180": 1785423840, "1785420240": 1785423900, "1785420300": 1785423960, "1785420360": 1785424020, "1785420420": 1785424080, "1785420480": 1785424140, "1785420540": 1785424200, "1785420600": 1785424260, "1785420660": 1785424320, "1785420720": 1785424380, "1785420780": 1785424440, "1785420840": 1785424500, "1785420900": 1785424560, "1785420960": 1785424620, "1785421020": 1785424680, "1785421080": 1785424740, "1785421140": 1785424800, "1785421200": 1785424860, "1785421260": 1785424920, "1785421320": 1785424980, "1785421380": 1785425040, "1785421440": 1785425100, "1785421500": 1785425160, "1785421560": 1785425220, "1785421620": 1785425280, "1785421680": 1785425340, "1785421740": 1785425400, "1785421800": 1785425460, "1785421860": 1785425520, "1785421920": 1785425580, "1785421980": 1785425640, "1785422040": 1785425700, "1785422100": 1785425760, "1785422160": 1785425820, "1785422220": 1785425880, "1785422280": 1785425940, "1785422340": 1785426000, "1785422400": 1785426060, "1785422460": 1785426120, "1785422520": 1785426180, "1785422580": 1785426240, "1785422640": 1785426300, "1785422700": 1785426360, "1785422760": 1785426420, "1785422820": 1785426480, "1785422880": 1785426540, "1785422940": 1785426600, "1785423000": 1785426660, "1785423060": 1785426720, "1785423120": 1785426780, "1785423180": 1785426840, "1785423240": 1785426900, "1785423300": 1785426960, "1785423360": 1785427020, "1785423420": 1785427080, "1785423480": 1785427140, "1785423540": 1785427200, "1785423600": 1785427260, "1785423660": 1785427320, "1785423720": 1785427380, "1785423780": 1785427440, "1785423840": 1785427500, "1785423900": 1785427560, "1785423960": 1785427620, "1785424020": 1785427680, "1785424080": 1785427740, "1785424140": 1785427800, "1785424200": 1785427860, "1785424260": 1785427920, "1785424320": 1785427980, "1785424380": 1785428040, "1785424440": 1785428100, "1785424500": 1785428160, "1785424560": 1785428220, "1785424620": 1785428280, "1785424680": 1785428340, "1785424740": 1785428400, "1785424800": 1785428460, "1785424860": 1785428520, "1785424920": 1785428580, "1785424980": 1785428640, "1785425040": 1785428700, "1785425100": 1785428760, "1785425160": 1785428820, "1785425220": 1785428880, "1785425280": 1785428940, "1785425340": 1785429000, "1785425400": 1785429060, "1785425460": 1785429120, "1785425520": 1785429180, "1785425580": 1785429240, "1785425640": 1785429300, "1785425700": 1785429360, "1785425760": 1785429420, "1785425820": 1785429480, "1785425880": 1785429540, "1785425940": 1785429600, "1785426000": 1785429660, "1785426060": 1785429720, "1785426120": 1785429780, "1785426180": 1785429840, "1785426240": 1785429900, "1785426300": 1785429960, "1785426360": 1785430020, "1785426420": 1785430080, "1785426480": 1785430140, "1785426540": 1785430200, "1785426600": 1785430260, "1785426660": 1785430320, "1785426720": 1785430380, "1785426780": 1785430440, "1785426840": 1785430500, "1785426900": 1785430560, "1785426960": 1785430620, "1785427020": 1785430680, "1785427080": 1785430740, "1785427140": 1785430800, "1785427200": 1785430860, "1785427260": 1785430920, "1785427320": 1785430980, "1785427380": 1785431040, "1785427440": 1785431100, "1785427500": 1785431160, "1785427560": 1785431220, "1785427620": 1785431280, "1785427680": 1785431340, "1785427740": 1785431400, "1785427800": 1785431460, "1785427860": 1785431520, "1785427920": 1785431580, "1785427980": 1785431640, "1785428040": 1785431700, "1785428100": 1785431760, "1785428160": 1785431820, "1785428220": 1785431880, "1785428280": 1785431940, "1785428340": 1785432000, "1785428400": 1785432060, "1785428460": 1785432120, "1785428520": 1785432180, "1785428580": 1785432240, "1785428640": 1785432300, "1785428700": 1785432360, "1785428760": 1785432420, "1785428820": 1785432480, "1785428880": 1785432540, "1785428940": 1785432600, "1785429000": 1785432660, "1785429060": 1785432720, "1785429120": 1785432780, "1785429180": 1785432840, "1785429240": 1785432900, "1785429300": 1785432960, "1785429360": 1785433020, "1785429420": 1785433080, "1785429480": 1785433140, "1785429540": 1785433200, "1785429600": 1785433260, "1785429660": 1785433320, "1785429720": 1785433380, "1785429780": 1785433440, "1785429840": 1785433500, "1785429900": 1785433560, "1785429960": 1785433620, "1785430020": 1785433680, "1785430080": 1785433740, "1785430140": 1785433800, "1785430200": 1785433860, "1785430260": 1785433920, "1785430320": 1785433980, "1785430380": 1785434040, "1785430440": 1785434100, "1785430500": 1785434160, "1785430560": 1785434220, "1785430620": 1785434280, "1785430680": 1785434340, "1785430740": 1785434400, "1785430800": 1785434460, "1785430860": 1785434520, "1785430920": 1785434580, "1785430980": 1785434640, "1785431040": 1785434700, "1785431100": 1785434760, "1785431160": 1785434820, "1785431220": 1785434880, "1785431280": 1785434940, "1785431340": 1785435000, "1785431400": 1785435060, "1785431460": 1785435120, "1785431520": 1785435180, "1785431580": 1785435240, "1785431640": 1785435300, "1785431700": 1785435360, "1785431760": 1785435420, "1785431820": 1785435480, "1785431880": 1785435540, "1785431940": 1785435600, "1785432000": 1785435660, "1785432060": 1785435720, "1785432120": 1785435780, "1785432180": 1785435840, "1785432240": 1785435900, "1785432300": 1785435960, "1785432360": 1785436020, "1785432420": 1785436080, "1785432480": 1785436140, "1785432540": 1785436200, "1785432600": 1785436260, "1785432660": 1785436320, "1785432720": 1785436380, "1785432780": 1785436440, "1785432840": 1785436500, "1785432900": 1785436560, "1785432960": 1785436620, "1785433020": 1785436680, "1785433080": 1785436740, "1785433140": 1785436800, "1785433200": 1785436860, "1785433260": 1785436920, "1785433320": 1785436980, "1785433380": 1785437040, "1785433440": 1785437100, "1785433500": 1785437160, "1785433560": 1785437220, "1785433620": 1785437280, "1785433680": 1785437340, "1785433740": 1785437400, "1785433800": 1785437460, "1785433860": 1785437520, "1785433920": 1785437580, "1785433980": 1785437640, "1785434040": 1785437700, "1785434100": 1785437760, "1785434160": 1785437820, "1785434220": 1785437880, "1785434280": 1785437940, "1785434340": 1785438000, "1785434400": 1785438060, "1785434460": 1785438120, "1785434520": 1785438180, "1785434580": 1785438240, "1785434640": 1785438300, "1785434700": 1785438360, "1785434760": 1785438420, "1785434820": 1785438480, "1785434880": 1785438540, "1785434940": 1785438600, "1785435000": 1785438660, "1785435060": 1785438720, "1785435120": 1785438780, "1785435180": 1785438840, "1785435240": 1785438900, "1785435300": 1785438960, "1785435360": 1785439020, "1785435420": 1785439080, "1785435480": 1785439140, "1785435540": 1785439200, "1785435600": 1785439260, "1785435660": 1785439320, "1785435720": 1785439380, "1785435780": 1785439440, "1785435840": 1785439500, "1785435900": 1785439560, "1785435960": 1785439620, "1785436020": 1785439680, "1785436080": 1785439740, "1785436140": 1785439800, "1785436200": 1785439860, "1785436260": 1785439920, "1785436320": 1785439980, "1785436380": 1785440040, "1785436440": 1785440100, "1785436500": 1785440160, "1785436560": 1785440220, "1785436620": 1785440280, "1785436680": 1785440340, "1785436740": 1785440400, "1785436800": 1785440460, "1785436860": 1785440520, "1785436920": 1785440580, "1785436980": 1785440640, "1785437040": 1785440700, "1785437100": 1785440760, "1785437160": 1785440820, "1785437220": 1785440880, "1785437280": 1785440940, "1785437340": 1785441000, "1785437400": 1785441060, "1785437460": 1785441120, "1785437520": 1785441180, "1785437580": 1785441240, "1785437640": 1785441300, "1785437700": 1785441360, "1785437760": 1785441420, "1785437820": 1785441480, "1785437880": 1785441540, "1785437940": 1785441600, "1785438000": 1785441660, "1785438060": 1785441720, "1785438120": 1785441780, "1785438180": 1785441840, "1785438240": 1785441900, "1785438300": 1785441960, "1785438360": 1785442020, "1785438420": 1785442080, "1785438480": 1785442140, "1785438540": 1785442200, "1785438600": 1785442260, "1785438660": 1785442320, "1785438720": 1785442380, "1785438780": 1785442440, "1785438840": 1785442500, "1785438900": 1785442560, "1785438960": 1785442620, "1785439020": 1785442680, "1785439080": 1785442740, "1785439140": 1785442800, "1785439200": 1785442860, "1785439260": 1785442920, "1785439320": 1785442980, "1785439380": 1785443040, "1785439440": 1785443100, "1785439500": 1785443160, "1785439560": 1785443220, "1785439620": 1785443280, "1785439680": 1785443340, "1785439740": 1785443400, "1785439800": 1785443460, "1785439860": 1785443520, "1785439920": 1785443580, "1785439980": 1785443640, "1785440040": 1785443700, "1785440100": 1785443760, "1785440160": 1785443820, "1785440220": 1785443880, "1785440280": 1785443940, "1785440340": 1785444000, "1785440400": 1785444060, "1785440460": 1785444120, "1785440520": 1785444180, "1785440580": 1785444240, "1785440640": 1785444300, "1785440700": 1785444360, "1785440760": 1785444420, "1785440820": 1785444480, "1785440880": 1785444540, "1785440940": 1785444600, "1785441000": 1785444660, "1785441060": 1785444720, "1785441120": 1785444780, "1785441180": 1785444840, "1785441240": 1785444900, "1785441300": 1785444960, "1785441360": 1785445020, "1785441420": 1785445080, "1785441480": 1785445140, "1785441540": 1785445200, "1785441600": 1785445260, "1785441660": 1785445320, "1785441720": 1785445380, "1785441780": 1785445440, "1785441840": 1785445500, "1785441900": 1785445560, "1785441960": 1785445620, "1785442020": 1785445680, "1785442080": 1785445740, "1785442140": 1785445800, "1785442200": 1785445860, "1785442260": 1785445920, "1785442320": 1785445980, "1785442380": 1785446040, "1785442440": 1785446100, "1785442500": 1785446160, "1785442560": 1785446220, "1785442620": 1785446280, "1785442680": 1785446340, "1785442740": 1785446400, "1785442800": 1785446460, "1785442860": 1785446520, "1785442920": 1785446580, "1785442980": 1785446640, "1785443040": 1785446700, "1785443100": 1785446760, "1785443160": 1785446820, "1785443220": 1785446880, "1785443280": 1785446940, "1785443340": 1785447000, "1785443400": 1785447060, "1785443460": 1785447120, "1785443520": 1785447180, "1785443580": 1785447240, "1785443640": 1785447300, "1785443700": 1785447360, "1785443760": 1785447420, "1785443820": 1785447480, "1785443880": 1785447540, "1785443940": 1785447600, "1785444000": 1785447660, "1785444060": 1785447720, "1785444120": 1785447780, "1785444180": 1785447840, "1785444240": 1785447900, "1785444300": 1785447960, "1785444360": 1785448020, "1785444420": 1785448080, "1785444480": 1785448140, "1785444540": 1785448200, "1785444600": 1785448260, "1785444660": 1785448320, "1785444720": 1785448380, "1785444780": 1785448440, "1785444840": 1785448500, "1785444900": 1785448560, "1785444960": 1785448620, "1785445020": 1785448680, "1785445080": 1785448740, "1785445140": 1785448800, "1785445200": 1785448860, "1785445260": 1785448920, "1785445320": 1785448980, "1785445380": 1785449040, "1785445440": 1785449100, "1785445500": 1785449160, "1785445560": 1785449220, "1785445620": 1785449280, "1785445680": 1785449340, "1785445740": 1785449400, "1785445800": 1785449460, "1785445860": 1785449520, "1785445920": 1785449580, "1785445980": 1785449640, "1785446040": 1785449700, "1785446100": 1785449760, "1785446160": 1785449820, "1785446220": 1785449880, "1785446280": 1785449940, "1785446340": 1785450000, "1785446400": 1785450060, "1785446460": 1785450120, "1785446520": 1785450180, "1785446580": 1785450240, "1785446640": 1785450300, "1785446700": 1785450360, "1785446760": 1785450420, "1785446820": 1785450480, "1785446880": 1785450540, "1785446940": 1785450600, "1785447000": 1785450660, "1785447060": 1785450720, "1785447120": 1785450780, "1785447180": 1785450840, "1785447240": 1785450900, "1785447300": 1785450960, "1785447360": 1785451020, "1785447420": 1785451080, "1785447480": 1785451140, "1785447540": 1785451200, "1785447600": 1785451260, "1785447660": 1785451320, "1785447720": 1785451380, "1785447780": 1785451440, "1785447840": 1785451500, "1785447900": 1785451560, "1785447960": 1785451620, "1785448020": 1785451680, "1785448080": 1785451740, "1785448140": 1785451800, "1785448200": 1785451860, "1785448260": 1785451920, "1785448320": 1785451980, "1785448380": 1785452040, "1785448440": 1785452100, "1785448500": 1785452160, "1785448560": 1785452220, "1785448620": 1785452280, "1785448680": 1785452340, "1785448740": 1785456060, "1785448800": 1785456120, "1785448860": 1785456180, "1785448920": 1785456240, "1785448980": 1785456300, "1785449040": 1785456360, "1785449100": 1785456420, "1785449160": 1785456480, "1785449220": 1785456540, "1785449280": 1785456600, "1785449340": 1785456660, "1785449400": 1785456720, "1785449460": 1785456780, "1785449520": 1785456840, "1785449580": 1785456900, "1785449640": 1785456960, "1785449700": 1785457020, "1785449760": 1785457080, "1785449820": 1785457140, "1785449880": 1785457200, "1785449940": 1785457260, "1785450000": 1785457320, "1785450060": 1785457380, "1785450120": 1785457440, "1785450180": 1785457500, "1785450240": 1785457560, "1785450300": 1785457620, "1785450360": 1785457680, "1785450420": 1785457740, "1785450480": 1785457800, "1785450540": 1785457860, "1785450600": 1785457920, "1785450660": 1785457980, "1785450720": 1785458040, "1785450780": 1785458100, "1785450840": 1785458160, "1785450900": 1785458220, "1785450960": 1785458280, "1785451020": 1785458340, "1785451080": 1785458400, "1785451140": 1785458460, "1785451200": 1785458520, "1785451260": 1785458580, "1785451320": 1785458640, "1785451380": 1785458700, "1785451440": 1785458760, "1785451500": 1785458820, "1785451560": 1785458880, "1785451620": 1785458940, "1785451680": 1785459000, "1785451740": 1785459060, "1785451800": 1785459120, "1785451860": 1785459180, "1785451920": 1785459240, "1785451980": 1785459300, "1785452040": 1785459360, "1785452100": 1785459420, "1785452160": 1785459480, "1785452220": 1785459540, "1785452280": 1785459600, "1785452340": 1785459660, "1785452400": 1785459720, "1785452460": 1785459780, "1785452520": 1785459840, "1785452580": 1785459900, "1785452640": 1785459960, "1785452700": 1785460020, "1785452760": 1785460080, "1785452820": 1785460140, "1785452880": 1785460200, "1785452940": 1785460260, "1785453000": 1785460320, "1785453060": 1785460380, "1785453120": 1785460440, "1785453180": 1785460500, "1785453240": 1785460560, "1785453300": 1785460620, "1785453360": 1785460680, "1785453420": 1785460740, "1785453480": 1785460800, "1785453540": 1785460860, "1785453600": 1785460920, "1785453660": 1785460980, "1785453720": 1785461040, "1785453780": 1785461100, "1785453840": 1785461160, "1785453900": 1785461220, "1785453960": 1785461280, "1785454020": 1785461340, "1785454080": 1785461400, "1785454140": 1785461460, "1785454200": 1785461520, "1785454260": 1785461580, "1785454320": 1785461640, "1785454380": 1785461700, "1785454440": 1785461760, "1785454500": 1785461820, "1785454560": 1785461880, "1785454620": 1785461940, "1785454680": 1785462000, "1785454740": 1785462060, "1785454800": 1785462120, "1785454860": 1785462180, "1785454920": 1785462240, "1785454980": 1785462300, "1785455040": 1785462360, "1785455100": 1785462420, "1785455160": 1785462480, "1785455220": 1785462540, "1785455280": 1785462600, "1785455340": 1785462660, "1785455400": 1785462720, "1785455460": 1785462780, "1785455520": 1785462840, "1785455580": 1785462900, "1785455640": 1785462960, "1785455700": 1785463020, "1785455760": 1785463080, "1785455820": 1785463140, "1785455880": 1785463200, "1785455940": 1785463260, "1785456000": 1785463320, "1785456060": 1785463380, "1785456120": 1785463440, "1785456180": 1785463500, "1785456240": 1785463560, "1785456300": 1785463620, "1785456360": 1785463680, "1785456420": 1785463740, "1785456480": 1785463800, "1785456540": 1785463860, "1785456600": 1785463920, "1785456660": 1785463980, "1785456720": 1785464040, "1785456780": 1785464100, "1785456840": 1785464160, "1785456900": 1785464220, "1785456960": 1785464280, "1785457020": 1785464340, "1785457080": 1785464400, "1785457140": 1785464460, "1785457200": 1785464520, "1785457260": 1785464580, "1785457320": 1785464640, "1785457380": 1785464700, "1785457440": 1785464760, "1785457500": 1785464820, "1785457560": 1785464880, "1785457620": 1785464940, "1785457680": 1785465000, "1785457740": 1785465060, "1785457800": 1785465120, "1785457860": 1785465180, "1785457920": 1785465240, "1785457980": 1785465300, "1785458040": 1785465360, "1785458100": 1785465420, "1785458160": 1785465480, "1785458220": 1785465540, "1785458280": 1785465600, "1785458340": 1785465660, "1785458400": 1785465720, "1785458460": 1785465780, "1785458520": 1785465840, "1785458580": 1785465900, "1785458640": 1785465960, "1785458700": 1785466020, "1785458760": 1785466080, "1785458820": 1785466140, "1785458880": 1785466200, "1785458940": 1785466260, "1785459000": 1785466320, "1785459060": 1785466380, "1785459120": 1785466440, "1785459180": 1785466500, "1785459240": 1785466560, "1785459300": 1785466620, "1785459360": 1785466680, "1785459420": 1785466740, "1785459480": 1785466800, "1785459540": 1785466860, "1785459600": 1785466920, "1785459660": 1785466980, "1785459720": 1785467040, "1785459780": 1785467100, "1785459840": 1785467160, "1785459900": 1785467220, "1785459960": 1785467280, "1785460020": 1785467340, "1785460080": 1785467400, "1785460140": 1785467460, "1785460200": 1785467520, "1785460260": 1785467580, "1785460320": 1785467640, "1785460380": 1785467700, "1785460440": 1785467760, "1785460500": 1785467820, "1785460560": 1785467880, "1785460620": 1785467940, "1785460680": 1785468000, "1785460740": 1785468060, "1785460800": 1785468120, "1785460860": 1785468180, "1785460920": 1785468240, "1785460980": 1785468300, "1785461040": 1785468360, "1785461100": 1785468420, "1785461160": 1785468480, "1785461220": 1785468540, "1785461280": 1785468600, "1785461340": 1785468660, "1785461400": 1785468720, "1785461460": 1785468780, "1785461520": 1785468840, "1785461580": 1785468900, "1785461640": 1785468960, "1785461700": 1785469020, "1785461760": 1785469080, "1785461820": 1785469140, "1785461880": 1785469200, "1785461940": 1785469260, "1785462000": 1785469320, "1785462060": 1785469380, "1785462120": 1785469440, "1785462180": 1785469500, "1785462240": 1785469560, "1785462300": 1785469620, "1785462360": 1785469680, "1785462420": 1785469740, "1785462480": 1785469800, "1785462540": 1785469860, "1785462600": 1785469920, "1785462660": 1785469980, "1785462720": 1785470040, "1785462780": 1785470100, "1785462840": 1785470160, "1785462900": 1785470220, "1785462960": 1785470280, "1785463020": 1785470340, "1785463080": 1785470400, "1785463140": 1785470460, "1785463200": 1785470520, "1785463260": 1785470580, "1785463320": 1785470640, "1785463380": 1785470700, "1785463440": 1785470760, "1785463500": 1785470820, "1785463560": 1785470880, "1785463620": 1785470940, "1785463680": 1785471000, "1785463740": 1785471060, "1785463800": 1785471120, "1785463860": 1785471180, "1785463920": 1785471240, "1785463980": 1785471300, "1785464040": 1785471360, "1785464100": 1785471420, "1785464160": 1785471480, "1785464220": 1785471540, "1785464280": 1785471600, "1785464340": 1785471660, "1785464400": 1785471720, "1785464460": 1785471780, "1785464520": 1785471840, "1785464580": 1785471900, "1785464640": 1785471960, "1785464700": 1785472020, "1785464760": 1785472080, "1785464820": 1785472140, "1785464880": 1785472200, "1785464940": 1785472260, "1785465000": 1785472320, "1785465060": 1785472380, "1785465120": 1785472440, "1785465180": 1785472500, "1785465240": 1785472560, "1785465300": 1785472620, "1785465360": 1785472680, "1785465420": 1785472740, "1785465480": 1785472800, "1785465540": 1785472860, "1785465600": 1785472920, "1785465660": 1785472980, "1785465720": 1785473040, "1785465780": 1785473100, "1785465840": 1785473160, "1785465900": 1785473220, "1785465960": 1785473280, "1785466020": 1785473340, "1785466080": 1785473400, "1785466140": 1785473460, "1785466200": 1785473520, "1785466260": 1785473580, "1785466320": 1785473640, "1785466380": 1785473700, "1785466440": 1785473760, "1785466500": 1785473820, "1785466560": 1785473880, "1785466620": 1785473940, "1785466680": 1785474000, "1785466740": 1785474060, "1785466800": 1785474120, "1785466860": 1785474180, "1785466920": 1785474240, "1785466980": 1785474300, "1785467040": 1785474360, "1785467100": 1785474420, "1785467160": 1785474480, "1785467220": 1785474540, "1785467280": 1785474600, "1785467340": 1785474660, "1785467400": 1785474720, "1785467460": 1785474780, "1785467520": 1785474840, "1785467580": 1785474900, "1785467640": 1785474960, "1785467700": 1785475020, "1785467760": 1785475080, "1785467820": 1785475140, "1785467880": 1785475200, "1785467940": 1785475260, "1785468000": 1785475320, "1785468060": 1785475380, "1785468120": 1785475440, "1785468180": 1785475500, "1785468240": 1785475560, "1785468300": 1785475620, "1785468360": 1785475680, "1785468420": 1785475740, "1785468480": 1785475800, "1785468540": 1785475860, "1785468600": 1785475920, "1785468660": 1785475980, "1785468720": 1785476040, "1785468780": 1785476100, "1785468840": 1785476160, "1785468900": 1785476220, "1785468960": 1785476280, "1785469020": 1785476340, "1785469080": 1785476400, "1785469140": 1785476460, "1785469200": 1785476520, "1785469260": 1785476580, "1785469320": 1785476640, "1785469380": 1785476700, "1785469440": 1785476760, "1785469500": 1785476820, "1785469560": 1785476880, "1785469620": 1785476940, "1785469680": 1785477000, "1785469740": 1785477060, "1785469800": 1785477120, "1785469860": 1785477180, "1785469920": 1785477240, "1785469980": 1785477300, "1785470040": 1785477360, "1785470100": 1785477420, "1785470160": 1785477480, "1785470220": 1785477540, "1785470280": 1785477600, "1785470340": 1785477660, "1785470400": 1785477720, "1785470460": 1785477780, "1785470520": 1785477840, "1785470580": 1785477900, "1785470640": 1785477960, "1785470700": 1785478020, "1785470760": 1785478080, "1785470820": 1785478140, "1785470880": 1785478200, "1785470940": 1785478260, "1785471000": 1785478320, "1785471060": 1785478380, "1785471120": 1785478440, "1785471180": 1785478500, "1785471240": 1785478560, "1785471300": 1785478620, "1785471360": 1785478680, "1785471420": 1785478740, "1785471480": 1785478800, "1785471540": 1785478860, "1785471600": 1785478920, "1785471660": 1785478980, "1785471720": 1785479040, "1785471780": 1785479100, "1785471840": 1785479160, "1785471900": 1785479220, "1785471960": 1785479280, "1785472020": 1785479340, "1785472080": 1785479400, "1785472140": 1785479460, "1785472200": 1785479520, "1785472260": 1785479580, "1785472320": 1785479640, "1785472380": 1785479700, "1785472440": 1785479760, "1785472500": 1785479820, "1785472560": 1785479880, "1785472620": 1785479940, "1785472680": 1785480000, "1785472740": 1785480060, "1785472800": 1785480120, "1785472860": 1785480180, "1785472920": 1785480240, "1785472980": 1785480300, "1785473040": 1785480360, "1785473100": 1785480420, "1785473160": 1785480480, "1785473220": 1785480540, "1785473280": 1785480600, "1785473340": 1785480660, "1785473400": 1785480720, "1785473460": 1785480780, "1785473520": 1785480840, "1785473580": 1785480900, "1785473640": 1785480960, "1785473700": 1785481020, "1785473760": 1785481080, "1785473820": 1785481140, "1785473880": 1785481200, "1785473940": 1785481260, "1785474000": 1785481320, "1785474060": 1785481380, "1785474120": 1785481440, "1785474180": 1785481500, "1785474240": 1785481560, "1785474300": 1785481620, "1785474360": 1785481680, "1785474420": 1785481740, "1785474480": 1785481800, "1785474540": 1785481860, "1785474600": 1785481920, "1785474660": 1785481980, "1785474720": 1785482040, "1785474780": 1785482100, "1785474840": 1785482160, "1785474900": 1785482220, "1785474960": 1785482280, "1785475020": 1785482340, "1785475080": 1785482400, "1785475140": 1785482460, "1785475200": 1785482520, "1785475260": 1785482580, "1785475320": 1785482640, "1785475380": 1785482700, "1785475440": 1785482760, "1785475500": 1785482820, "1785475560": 1785482880, "1785475620": 1785482940, "1785475680": 1785483000, "1785475740": 1785483060, "1785475800": 1785483120, "1785475860": 1785483180, "1785475920": 1785483240, "1785475980": 1785483300, "1785476040": 1785483360, "1785476100": 1785483420, "1785476160": 1785483480, "1785476220": 1785483540, "1785476280": 1785483600, "1785476340": 1785483660, "1785476400": 1785483720, "1785476460": 1785483780, "1785476520": 1785483840, "1785476580": 1785483900, "1785476640": 1785483960, "1785476700": 1785484020, "1785476760": 1785484080, "1785476820": 1785484140, "1785476880": 1785484200, "1785476940": 1785484260, "1785477000": 1785484320, "1785477060": 1785484380, "1785477120": 1785484440, "1785477180": 1785484500, "1785477240": 1785484560, "1785477300": 1785484620, "1785477360": 1785484680, "1785477420": 1785484740, "1785477480": 1785484800, "1785477540": 1785484860, "1785477600": 1785484920, "1785477660": 1785484980, "1785477720": 1785485040, "1785477780": 1785485100, "1785477840": 1785485160, "1785477900": 1785485220, "1785477960": 1785485280, "1785478020": 1785485340, "1785478080": 1785485400, "1785478140": 1785485460, "1785478200": 1785485520, "1785478260": 1785485580, "1785478320": 1785485640, "1785478380": 1785485700, "1785478440": 1785485760, "1785478500": 1785485820, "1785478560": 1785485880, "1785478620": 1785485940, "1785478680": 1785486000, "1785478740": 1785486060, "1785478800": 1785486120, "1785478860": 1785486180, "1785478920": 1785486240, "1785478980": 1785486300, "1785479040": 1785486360, "1785479100": 1785486420, "1785479160": 1785486480, "1785479220": 1785486540, "1785479280": 1785486600, "1785479340": 1785486660, "1785479400": 1785486720, "1785479460": 1785486780, "1785479520": 1785486840, "1785479580": 1785486900, "1785479640": 1785486960, "1785479700": 1785487020, "1785479760": 1785487080, "1785479820": 1785487140, "1785479880": 1785487200, "1785479940": 1785487260, "1785480000": 1785487320, "1785480060": 1785487380, "1785480120": 1785487440, "1785480180": 1785487500, "1785480240": 1785487560, "1785480300": 1785487620, "1785480360": 1785487680, "1785480420": 1785487740, "1785480480": 1785487800, "1785480540": 1785487860, "1785480600": 1785487920, "1785480660": 1785487980, "1785480720": 1785488040, "1785480780": 1785488100, "1785480840": 1785488160, "1785480900": 1785488220, "1785480960": 1785488280, "1785481020": 1785488340, "1785481080": 1785488400, "1785481140": 1785488460, "1785481200": 1785488520, "1785481260": 1785488580, "1785481320": 1785488640, "1785481380": 1785488700, "1785481440": 1785488760, "1785481500": 1785488820, "1785481560": 1785488880, "1785481620": 1785488940, "1785481680": 1785489000, "1785481740": 1785489060, "1785481800": 1785489120, "1785481860": 1785489180, "1785481920": 1785489240, "1785481980": 1785489300, "1785482040": 1785489360, "1785482100": 1785489420, "1785482160": 1785489480, "1785482220": 1785489540, "1785482280": 1785489600, "1785482340": 1785489660, "1785482400": 1785489720, "1785482460": 1785489780, "1785482520": 1785489840, "1785482580": 1785489900, "1785482640": 1785489960, "1785482700": 1785490020, "1785482760": 1785490080, "1785482820": 1785490140, "1785482880": 1785490200, "1785482940": 1785490260, "1785483000": 1785490320, "1785483060": 1785490380, "1785483120": 1785490440, "1785483180": 1785490500, "1785483240": 1785490560, "1785483300": 1785490620, "1785483360": 1785490680, "1785483420": 1785490740, "1785483480": 1785490800, "1785483540": 1785490860, "1785483600": 1785490920, "1785483660": 1785490980, "1785483720": 1785491040, "1785483780": 1785491100, "1785483840": 1785491160, "1785483900": 1785491220, "1785483960": 1785491280, "1785484020": 1785491340, "1785484080": 1785491400, "1785484140": 1785491460, "1785484200": 1785491520, "1785484260": 1785491580, "1785484320": 1785491640, "1785484380": 1785491700, "1785484440": 1785491760, "1785484500": 1785491820, "1785484560": 1785491880, "1785484620": 1785491940, "1785484680": 1785492000, "1785484740": 1785492060, "1785484800": 1785492120, "1785484860": 1785492180, "1785484920": 1785492240, "1785484980": 1785492300, "1785485040": 1785492360, "1785485100": 1785492420, "1785485160": 1785492480, "1785485220": 1785492540, "1785485280": 1785492600, "1785485340": 1785492660, "1785485400": 1785492720, "1785485460": 1785492780, "1785485520": 1785492840, "1785485580": 1785492900, "1785485640": 1785492960, "1785485700": 1785493020, "1785485760": 1785493080, "1785485820": 1785493140, "1785485880": 1785493200, "1785485940": 1785493260, "1785486000": 1785493320, "1785486060": 1785493380, "1785486120": 1785493440, "1785486180": 1785493500, "1785486240": 1785493560, "1785486300": 1785493620, "1785486360": 1785493680, "1785486420": 1785493740, "1785486480": 1785493800, "1785486540": 1785493860, "1785486600": 1785493920, "1785486660": 1785493980, "1785486720": 1785494040, "1785486780": 1785494100, "1785486840": 1785494160, "1785486900": 1785494220, "1785486960": 1785494280, "1785487020": 1785494340, "1785487080": 1785494400, "1785487140": 1785494460, "1785487200": 1785494520, "1785487260": 1785494580, "1785487320": 1785494640, "1785487380": 1785494700, "1785487440": 1785494760, "1785487500": 1785494820, "1785487560": 1785494880, "1785487620": 1785494940, "1785487680": 1785495000, "1785487740": 1785495060, "1785487800": 1785495120, "1785487860": 1785495180, "1785487920": 1785495240, "1785487980": 1785495300, "1785488040": 1785495360, "1785488100": 1785495420, "1785488160": 1785495480, "1785488220": 1785495540, "1785488280": 1785495600, "1785488340": 1785495660, "1785488400": 1785495720, "1785488460": 1785495780, "1785488520": 1785495840, "1785488580": 1785495900, "1785488640": 1785495960, "1785488700": 1785496020, "1785488760": 1785496080, "1785488820": 1785496140, "1785488880": 1785496200, "1785488940": 1785496260, "1785489000": 1785496320, "1785489060": 1785496380, "1785489120": 1785496440, "1785489180": 1785496500, "1785489240": 1785496560, "1785489300": 1785496620, "1785489360": 1785496680, "1785489420": 1785496740, "1785489480": 1785496800, "1785489540": 1785496860, "1785489600": 1785496920, "1785489660": 1785496980, "1785489720": 1785497040, "1785489780": 1785497100, "1785489840": 1785497160, "1785489900": 1785497220, "1785489960": 1785497280, "1785490020": 1785497340, "1785490080": 1785497400, "1785490140": 1785497460, "1785490200": 1785497520}}
+```
+
+--------------------------------------------------
+
+### DATEI: ui/chart_win.ui
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>ChartWindow</class>
+ <widget class="QMainWindow" name="ChartWindow">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>1200</width>
+    <height>750</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>PyTrader - TradingView Native JS Studio</string>
+  </property>
+  <widget class="QWidget" name="centralwidget">
+   <layout class="QVBoxLayout" name="verticalLayout_main">
+    <property name="spacing">
+     <number>5</number>
+    </property>
+    <property name="leftMargin">
+     <number>5</number>
+    </property>
+    <property name="topMargin">
+     <number>5</number>
+    </property>
+    <property name="rightMargin">
+     <number>5</number>
+    </property>
+    <property name="bottomMargin">
+     <number>5</number>
+    </property>
+    <item>
+     <widget class="QWidget" name="toolbar_widget" native="true">
+      <property name="sizePolicy">
+       <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+        <horstretch>0</horstretch>
+        <verstretch>0</verstretch>
+       </sizepolicy>
+      </property>
+      <layout class="QHBoxLayout" name="horizontalLayout_toolbar">
+       <property name="spacing">
+        <number>8</number>
+       </property>
+       <property name="leftMargin">
+        <number>0</number>
+       </property>
+       <property name="topMargin">
+        <number>0</number>
+       </property>
+       <property name="rightMargin">
+        <number>0</number>
+       </property>
+       <property name="bottomMargin">
+        <number>0</number>
+       </property>
+       <item>
+        <layout class="QVBoxLayout" name="verticalLayout_symbol">
+         <property name="spacing">
+          <number>2</number>
+         </property>
+         <item>
+          <widget class="QComboBox" name="combo_symbol">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+           <property name="minimumSize">
+            <size>
+             <width>100</width>
+             <height>28</height>
+            </size>
+           </property>
+           <item>
+            <property name="text">
+             <string>SILVER</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>GOLD</string>
+            </property>
+           </item>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btn_reset_chart">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+           <property name="minimumSize">
+            <size>
+             <width>28</width>
+             <height>28</height>
+            </size>
+           </property>
+           <property name="maximumSize">
+            <size>
+             <width>28</width>
+             <height>28</height>
+            </size>
+           </property>
+           <property name="toolTip">
+            <string>Reset Chart</string>
+           </property>
+           <property name="text">
+            <string>↺</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QVBoxLayout" name="verticalLayout_tf">
+         <property name="spacing">
+          <number>2</number>
+         </property>
+         <item>
+          <widget class="QComboBox" name="combo_tf">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+           <property name="minimumSize">
+            <size>
+             <width>80</width>
+             <height>28</height>
+            </size>
+           </property>
+           <item>
+            <property name="text">
+             <string>M1</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>M2</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>M5</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>M10</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>M15</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>M30</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>H1</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>H4</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>D1</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>W1</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>MN1</string>
+            </property>
+           </item>
+          </widget>
+         </item>
+         <item>
+          <spacer name="verticalSpacer">
+           <property name="orientation">
+            <enum>Qt::Orientation::Vertical</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>20</width>
+             <height>40</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <spacer name="horizontalSpacer">
+         <property name="orientation">
+          <enum>Qt::Orientation::Horizontal</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>40</width>
+           <height>20</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+       <item>
+        <layout class="QVBoxLayout" name="verticalLayout_indicator">
+         <property name="spacing">
+          <number>2</number>
+         </property>
+         <item>
+          <widget class="QPushButton" name="btn_indicator_grid">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+           <property name="minimumSize">
+            <size>
+             <width>28</width>
+             <height>28</height>
+            </size>
+           </property>
+           <property name="maximumSize">
+            <size>
+             <width>28</width>
+             <height>28</height>
+            </size>
+           </property>
+           <property name="toolTip">
+            <string>Grid Liq Lines (Linksklick: An/Aus, Rechtsklick: Einstellungen)</string>
+           </property>
+           <property name="text">
+            <string>#</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btn_signal_select">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+           <property name="minimumSize">
+            <size>
+             <width>28</width>
+             <height>28</height>
+            </size>
+           </property>
+           <property name="maximumSize">
+            <size>
+             <width>28</width>
+             <height>28</height>
+            </size>
+           </property>
+           <property name="toolTip">
+            <string>Signale an/aus (Grid Proximity + EMA)</string>
+           </property>
+           <property name="text">
+            <string>📈</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+      </layout>
+     </widget>
+    </item>
+    <item>
+     <widget class="QWidget" name="web_container" native="true">
+      <property name="sizePolicy">
+       <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+        <horstretch>1</horstretch>
+        <verstretch>1</verstretch>
+       </sizepolicy>
+      </property>
+      <layout class="QVBoxLayout" name="verticalLayout_web">
+       <property name="leftMargin">
+        <number>0</number>
+       </property>
+       <property name="topMargin">
+        <number>0</number>
+       </property>
+       <property name="rightMargin">
+        <number>0</number>
+       </property>
+       <property name="bottomMargin">
+        <number>0</number>
+       </property>
+      </layout>
+     </widget>
+    </item>
+   </layout>
+  </widget>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>
+
+```
+
+--------------------------------------------------
+
+### DATEI: ui/main_win.ui
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>800</width>
+    <height>600</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>MainWindow</string>
+  </property>
+  <widget class="QWidget" name="centralwidget">
+   <widget class="QLineEdit" name="input_field">
+    <property name="geometry">
+     <rect>
+      <x>80</x>
+      <y>10</y>
+      <width>571</width>
+      <height>26</height>
+     </rect>
+    </property>
+   </widget>
+   <widget class="QPushButton" name="btn_send">
+    <property name="geometry">
+     <rect>
+      <x>80</x>
+      <y>40</y>
+      <width>131</width>
+      <height>26</height>
+     </rect>
+    </property>
+    <property name="text">
+     <string>Abfage Gemini</string>
+    </property>
+   </widget>
+   <widget class="QLabel" name="status_label">
+    <property name="geometry">
+     <rect>
+      <x>80</x>
+      <y>80</y>
+      <width>561</width>
+      <height>51</height>
+     </rect>
+    </property>
+    <property name="text">
+     <string>TextLabel</string>
+    </property>
+   </widget>
+   <widget class="QTableWidget" name="table_result">
+    <property name="geometry">
+     <rect>
+      <x>60</x>
+      <y>170</y>
+      <width>681</width>
+      <height>351</height>
+     </rect>
+    </property>
+   </widget>
+   <widget class="QPushButton" name="btn_open_chart">
+    <property name="geometry">
+     <rect>
+      <x>300</x>
+      <y>60</y>
+      <width>81</width>
+      <height>71</height>
+     </rect>
+    </property>
+    <property name="text">
+     <string>Charts</string>
+    </property>
+   </widget>
+   <widget class="QPushButton" name="btn_service">
+    <property name="geometry">
+     <rect>
+      <x>390</x>
+      <y>60</y>
+      <width>81</width>
+      <height>71</height>
+     </rect>
+    </property>
+    <property name="text">
+     <string>Scan</string>
+    </property>
+   </widget>
+      <widget class="QPushButton" name="btn_statistics">
+    <property name="geometry">
+     <rect>
+      <x>480</x>
+      <y>60</y>
+      <width>81</width>
+      <height>71</height>
+     </rect>
+    </property>
+    <property name="text">
+     <string>📊 Statistik</string>
+    </property>
+   </widget>
+   <widget class="QPushButton" name="btn_properties">
+    <property name="geometry">
+     <rect>
+      <x>570</x>
+      <y>60</y>
+      <width>81</width>
+      <height>71</height>
+     </rect>
+    </property>
+    <property name="text">
+     <string>⚙ Optionen</string>
+    </property>
+    <property name="toolTip">
+     <string>Anwendungs-Einstellungen (Candle-Limits, Seitengrößen, etc.)</string>
+    </property>
+   </widget>
+  </widget>
+  <widget class="QMenuBar" name="menubar">
+   <property name="geometry">
+    <rect>
+     <x>0</x>
+     <y>0</y>
+     <width>800</width>
+     <height>33</height>
+    </rect>
+   </property>
+  </widget>
+  <widget class="QStatusBar" name="statusbar"/>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>
+
+```
+
+--------------------------------------------------
+
+### DATEI: ui/service_win.ui
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>ServiceWindow</class>
+ <widget class="QMainWindow" name="ServiceWindow">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>500</width>
+    <height>300</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>PyTrader - Service Kontrolle</string>
+  </property>
+  <widget class="QWidget" name="centralwidget">
+   <layout class="QVBoxLayout" name="verticalLayout">
+    <item>
+     <layout class="QHBoxLayout" name="layout_symbol">
+      <item>
+       <widget class="QLabel" name="label_symbol">
+        <property name="text">
+         <string>Symbol:</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QComboBox" name="combo_symbol">
+        <property name="minimumSize">
+         <size>
+          <width>120</width>
+          <height>0</height>
+         </size>
+        </property>
+        <item>
+         <property name="text">
+          <string>SILVER</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>GOLD</string>
+         </property>
+        </item>
+       </widget>
+      </item>
+      <item>
+       <spacer name="horizontalSpacer">
+        <property name="orientation">
+         <enum>Qt::Orientation::Horizontal</enum>
+        </property>
+        <property name="sizeHint" stdset="0">
+         <size>
+          <width>40</width>
+          <height>20</height>
+         </size>
+        </property>
+       </spacer>
+      </item>
+      <item>
+       <widget class="QCheckBox" name="check_new_scan">
+        <property name="text">
+         <string>New Scan</string>
+        </property>
+        <property name="toolTip">
+         <string>Aktiviert: Löscht bestehende Signale und führt Komplett-Scan durch. Deaktiviert: Nur Delta-Update (fehlende Bars).</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QCheckBox" name="check_grid_scan">
+        <property name="text">
+         <string>Grid Scan</string>
+        </property>
+        <property name="toolTip">
+         <string>Grid Proximity Signal (Composite, Phase 11) statt Standard EMA+ATR.</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </item>
+    <item>
+     <widget class="QPushButton" name="btn_start_scan">
+      <property name="text">
+       <string>Scan starten</string>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <layout class="QHBoxLayout" name="layout_status">
+      <item>
+       <widget class="QLabel" name="label_elapsed">
+        <property name="text">
+         <string>Laufzeit:</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLabel" name="label_elapsed_value">
+        <property name="text">
+         <string>00:00:00</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <spacer name="horizontalSpacer_2">
+        <property name="orientation">
+         <enum>Qt::Orientation::Horizontal</enum>
+        </property>
+        <property name="sizeHint" stdset="0">
+         <size>
+          <width>40</width>
+          <height>20</height>
+         </size>
+        </property>
+       </spacer>
+      </item>
+      <item>
+       <widget class="QLabel" name="label_progress">
+        <property name="text">
+         <string>Fortschritt:</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QProgressBar" name="progress_bar">
+        <property name="value">
+         <number>0</number>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </item>
+    <item>
+     <widget class="QTextEdit" name="text_log">
+      <property name="readOnly">
+       <bool>true</bool>
+      </property>
+      <property name="placeholderText">
+       <string>Scan-Log wird hier angezeigt...</string>
+      </property>
+     </widget>
+    </item>
+   </layout>
+  </widget>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>
+
+```
+
+--------------------------------------------------
+
+### DATEI: ui/statistic_win.ui
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>StatisticsWindow</class>
+ <widget class="QMainWindow" name="StatisticsWindow">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>900</width>
+    <height>600</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>PyTrader - Signal-Statistik</string>
+  </property>
+  <widget class="QWidget" name="centralwidget">
+   <layout class="QVBoxLayout" name="verticalLayout_main">
+    <property name="spacing">
+     <number>8</number>
+    </property>
+    <property name="leftMargin">
+     <number>10</number>
+    </property>
+    <property name="topMargin">
+     <number>10</number>
+    </property>
+    <property name="rightMargin">
+     <number>10</number>
+    </property>
+    <property name="bottomMargin">
+     <number>10</number>
+    </property>
+    <item>
+     <layout class="QHBoxLayout" name="horizontalLayout_filter">
+      <property name="spacing">
+       <number>6</number>
+      </property>
+      <item>
+       <widget class="QLabel" name="label_symbol">
+        <property name="text">
+         <string>Symbol:</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QComboBox" name="combo_symbol_filter">
+        <property name="minimumSize">
+         <size>
+          <width>100</width>
+          <height>0</height>
+         </size>
+        </property>
+        <item>
+         <property name="text">
+          <string>ALLE</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>SILVER</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>GOLD</string>
+         </property>
+        </item>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLabel" name="label_timeframe">
+        <property name="text">
+         <string>Timeframe:</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QComboBox" name="combo_tf_filter">
+        <property name="minimumSize">
+         <size>
+          <width>80</width>
+          <height>0</height>
+         </size>
+        </property>
+        <item>
+         <property name="text">
+          <string>ALLE</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>M1</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>M5</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>M15</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>M30</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>H1</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>H4</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>D1</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>W1</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>MN1</string>
+         </property>
+        </item>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLabel" name="label_signal_set">
+        <property name="text">
+         <string>Signal-Set:</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QComboBox" name="combo_signal_filter">
+        <property name="minimumSize">
+         <size>
+          <width>140</width>
+          <height>0</height>
+         </size>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <spacer name="horizontalSpacer_filter">
+        <property name="orientation">
+         <enum>Qt::Orientation::Horizontal</enum>
+        </property>
+        <property name="sizeHint" stdset="0">
+         <size>
+          <width>40</width>
+          <height>20</height>
+         </size>
+        </property>
+       </spacer>
+      </item>
+      <item>
+       <widget class="QPushButton" name="btn_refresh_stats">
+        <property name="minimumSize">
+         <size>
+          <width>120</width>
+          <height>28</height>
+         </size>
+        </property>
+        <property name="text">
+         <string>⟳ Aktualisieren</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </item>
+    <item>
+     <layout class="QHBoxLayout" name="horizontalLayout_cards">
+      <property name="spacing">
+       <number>10</number>
+      </property>
+      <item>
+       <widget class="QFrame" name="card_total_signals">
+        <property name="styleSheet">
+         <string>QFrame { background-color: #1e222d; border: 1px solid #3d4450; border-radius: 6px; padding: 8px; }</string>
+        </property>
+        <property name="frameShape">
+         <enum>QFrame::Shape::StyledPanel</enum>
+        </property>
+        <layout class="QVBoxLayout" name="verticalLayout_card1">
+         <item>
+          <widget class="QLabel" name="label_total_signals_title">
+           <property name="styleSheet">
+            <string>color: #787b86; font-size: 11px;</string>
+           </property>
+           <property name="text">
+            <string>Signale Gesamt</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="label_total_signals">
+           <property name="styleSheet">
+            <string>color: #d1d4dc; font-size: 24px; font-weight: bold;</string>
+           </property>
+           <property name="text">
+            <string>0</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </widget>
+      </item>
+      <item>
+       <widget class="QFrame" name="card_avg_confidence">
+        <property name="styleSheet">
+         <string>QFrame { background-color: #1e222d; border: 1px solid #3d4450; border-radius: 6px; padding: 8px; }</string>
+        </property>
+        <property name="frameShape">
+         <enum>QFrame::Shape::StyledPanel</enum>
+        </property>
+        <layout class="QVBoxLayout" name="verticalLayout_card2">
+         <item>
+          <widget class="QLabel" name="label_avg_confidence_title">
+           <property name="styleSheet">
+            <string>color: #787b86; font-size: 11px;</string>
+           </property>
+           <property name="text">
+            <string>Ø Confidence</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="label_avg_confidence">
+           <property name="styleSheet">
+            <string>color: #d1d4dc; font-size: 24px; font-weight: bold;</string>
+           </property>
+           <property name="text">
+            <string>0.00</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </widget>
+      </item>
+      <item>
+       <widget class="QFrame" name="card_win_rate">
+        <property name="styleSheet">
+         <string>QFrame { background-color: #1e222d; border: 1px solid #3d4450; border-radius: 6px; padding: 8px; }</string>
+        </property>
+        <property name="frameShape">
+         <enum>QFrame::Shape::StyledPanel</enum>
+        </property>
+        <layout class="QVBoxLayout" name="verticalLayout_card3">
+         <item>
+          <widget class="QLabel" name="label_win_rate_title">
+           <property name="styleSheet">
+            <string>color: #787b86; font-size: 11px;</string>
+           </property>
+           <property name="text">
+            <string>Win-Rate (Forward)</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="label_win_rate">
+           <property name="styleSheet">
+            <string>color: #d1d4dc; font-size: 24px; font-weight: bold;</string>
+           </property>
+           <property name="text">
+            <string>0.0%</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </widget>
+      </item>
+      <item>
+       <widget class="QFrame" name="card_best_tf">
+        <property name="styleSheet">
+         <string>QFrame { background-color: #1e222d; border: 1px solid #3d4450; border-radius: 6px; padding: 8px; }</string>
+        </property>
+        <property name="frameShape">
+         <enum>QFrame::Shape::StyledPanel</enum>
+        </property>
+        <layout class="QVBoxLayout" name="verticalLayout_card4">
+         <item>
+          <widget class="QLabel" name="label_best_tf_title">
+           <property name="styleSheet">
+            <string>color: #787b86; font-size: 11px;</string>
+           </property>
+           <property name="text">
+            <string>Bester TF</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="label_best_tf">
+           <property name="styleSheet">
+            <string>color: #d1d4dc; font-size: 24px; font-weight: bold;</string>
+           </property>
+           <property name="text">
+            <string>-</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </widget>
+      </item>
+     </layout>
+    </item>
+    <item>
+     <widget class="QWidget" name="paging_bar" native="true">
+      <property name="fixedHeight" stdset="0">
+       <number>32</number>
+      </property>
+      <layout class="QHBoxLayout" name="horizontalLayout_paging">
+       <property name="spacing">
+        <number>6</number>
+       </property>
+       <property name="leftMargin">
+        <number>0</number>
+       </property>
+       <property name="topMargin">
+        <number>0</number>
+       </property>
+       <property name="rightMargin">
+        <number>0</number>
+       </property>
+       <property name="bottomMargin">
+        <number>0</number>
+       </property>
+       <item>
+        <widget class="QPushButton" name="btn_prev_page">
+         <property name="styleSheet">
+          <string>QPushButton { background-color: #2b5c8f; color: white; font-weight: bold; border-radius: 3px; } QPushButton:disabled { background-color: #37474f; color: #787b86; }</string>
+         </property>
+         <property name="text">
+          <string>◀ Zurück</string>
+         </property>
+         <property name="fixedSize" stdset="0">
+          <size>
+           <width>90</width>
+           <height>24</height>
+          </size>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="label_page_info">
+         <property name="styleSheet">
+          <string>color: #d1d4dc; font-weight: bold; font-size: 12px;</string>
+         </property>
+         <property name="text">
+          <string>Seite 0 / 0</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="btn_next_page">
+         <property name="styleSheet">
+          <string>QPushButton { background-color: #2b5c8f; color: white; font-weight: bold; border-radius: 3px; } QPushButton:disabled { background-color: #37474f; color: #787b86; }</string>
+         </property>
+         <property name="text">
+          <string>Weiter ▶</string>
+         </property>
+         <property name="fixedSize" stdset="0">
+          <size>
+           <width>90</width>
+           <height>24</height>
+          </size>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="horizontalSpacer_paging_right">
+         <property name="orientation">
+          <enum>Qt::Orientation::Horizontal</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>40</width>
+           <height>20</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+      </layout>
+     </widget>
+    </item>
+    <item>
+     <widget class="QTableWidget" name="table_signals">
+      <property name="styleSheet">
+       <string>QTableWidget { background-color: #131722; color: #d1d4dc; gridline-color: #2B2B43; border: 1px solid #2B2B43; }
+QHeaderView::section { background-color: #1e222d; color: #787b86; border: 1px solid #2B2B43; padding: 4px; font-weight: bold; }
+QTableWidget::item { padding: 4px; }
+QTableWidget::item:selected { background-color: #2b5c8f; }</string>
+      </property>
+      <property name="editTriggers">
+       <set>QAbstractItemView::EditTrigger::NoEditTriggers</set>
+      </property>
+      <property name="selectionBehavior">
+       <enum>QAbstractItemView::SelectionBehavior::SelectRows</enum>
+      </property>
+      <attribute name="horizontalHeaderStretchLastSection">
+       <bool>true</bool>
+      </attribute>
+      <attribute name="verticalHeaderVisible">
+       <bool>true</bool>
+      </attribute>
+      <column>
+       <property name="text">
+        <string>Time</string>
+       </property>
+      </column>
+      <column>
+       <property name="text">
+        <string>Symbol</string>
+       </property>
+      </column>
+      <column>
+       <property name="text">
+        <string>Timeframe</string>
+       </property>
+      </column>
+      <column>
+       <property name="text">
+        <string>Signal-Set</string>
+       </property>
+      </column>
+      <column>
+       <property name="text">
+        <string>Confidence</string>
+       </property>
+      </column>
+      <column>
+       <property name="text">
+        <string>Outcome</string>
+       </property>
+      </column>
+     </widget>
+    </item>
+   </layout>
+  </widget>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>
+
+```
+
+--------------------------------------------------
+
