@@ -85,6 +85,16 @@ class StateManager:
             );
         """)
 
+        # Phase 12 (Hybrid-Schema): Additive Erweiterung der indicator_presets
+        # um die Plugin-Verknuepfung. plugin_id verknuepft ein Preset mit einem
+        # Plugin (z.B. 'grid_liquidity'), version fuehrt die Plugin-Version und
+        # is_active_batch markiert Presets, die von den Batch-Services
+        # (HistoricalScanner/LiveAnalyzer) ueber den PluginExecutor aktiv
+        # verarbeitet werden. Bestehende Presets und Daten bleiben unangetastet.
+        con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS plugin_id VARCHAR;")
+        con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS version VARCHAR DEFAULT '1.0.0';")
+        con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS is_active_batch BOOLEAN DEFAULT FALSE;")
+
         # Explicit Column Check via information_schema
         tables_to_migrate = ["instance_states", "symbol_tf_states"]
         columns_to_check = ["indicators_state", "measurement_state"]
