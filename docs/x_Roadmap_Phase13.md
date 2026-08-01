@@ -195,12 +195,235 @@ Platzsparende UI mit strikter Wert-Validierung und Metadaten-Anzeige.
 * Set-Aktionen im Prop-Fenster: Name vergeben / Speichern / Ausführen (via ServiceSetEvaluator) / Löschen – Löschen zwingend mit QMessageBox-Gegenfrage.
 
 
+4. **Dynamische Fenster- & Box-Größen (VERBINDLICH – KEINE fixen Pixelangaben):**
+   Die Höhe UND die Breite des Prop-Fensters sowie alle Boxen darin sind **vollständig dynamisch** und leiten sich ausschließlich aus ihrem Inhalt ab. Es dürfen **keine fixen Pixelwerte** für Höhe oder Breite von Fenster oder Boxen verwendet werden. Konkret:
+   * **Anzeige & Farben (Indi-Props oben):** Die Höhe dieses Bereichs ist dynamisch und richtet sich nach der Anzahl der vorhandenen Parameter.
+   * **Box „Service-Parameter":** Die Höhe der Box ist dynamisch und richtet sich nach der Anzahl der enthaltenen Parameter (z. B. endet sie exakt unter dem letzten Parameter wie Level 6 – unabhängig davon, wie viele Level existieren).
+   * **Preset-Block (ganz unten):** Der Preset-Block wird dynamisch **direkt unter die höchste Box** (Service-Parameter ODER Experten-Optionen) geplottet – ohne großen Abstand.
+   * **Gesamte Fensterhöhe:** Das Prop-Fenster ist in seiner Höhe vollständig dynamisch und endet **direkt unter dem Preset-Block** (so kompakt wie möglich – kein leerer Platz darunter). Beim Vergrößern des Fensters dürfen die Boxen NICHT mitwachsen; sie bleiben auf Inhalt-Höhe (dynamisch).
+
+---
+
+### 5.2.4 DOKUMENTATION – Delta aller UI-Änderungen (Ist-Zustand, umgesetzt)
+
+> Diese Sektion dokumentiert die tatsächlich umgesetzten UI-Änderungen am
+> `IndicatorSettingsDialog` (`chart/indicator_dialog.py`) als Ergänzung zu den
+> oberen Vorgaben. Sie ist der verbindliche Referenzstand für Punkt 4.
+
+#### a) Vollständig dynamische Größen (Kernumsetzung Punkt 4)
+* **Keine fixen Pixelwerte mehr:** `self.setMinimumWidth(520)` wurde entfernt. In `_restore_geometry()` wird nur noch die **Position** des Dialogs wiederhergestellt – die Größe (bisher `self.resize(max(440, …), max(100, …))`) wird bewusst NICHT mehr restauriert (Größe = Inhalt, siehe `_save_geometry()`).
+* **Haupt-Layout** (`QVBoxLayout` in `init_ui`): `setSpacing(6)`, `setSizeConstraint(QLayout.SetFixedSize)` (Fenster schmiegt sich an Inhalt an, kein leerer Raum unten) und `setAlignment(Qt.AlignTop)` (Boxen bleiben beim manuellen Aufziehen auf Inhalt-Höhe am oberen Rand verankert – 4.6).
+* **Size-Policies (4.2.4):** `QGroupBox` „Service-Parameter" vertikal `Maximum`; `QStackedWidget` vertikal `Maximum`; „Anzeige & Farben", „Service-Set Aktionen" und „Experten-Optionen" horizontal `Expanding` + vertikal `Maximum`.
+* **Neue Klasse `_ServiceStack(QStackedWidget)`:** Der Standard-QStackedWidget liefert als `sizeHint` das Maximum aller Seiten. `_ServiceStack` liefert stattdessen `sizeHint`/`minimumSizeHint` der **aktuell sichtbaren Seite** und ruft `updateGeometry()` bei `setCurrentIndex()` – dadurch endet die Box „Service-Parameter" exakt unter dem letzten Parameter der AKTUELLEN Service-Seite (auch bei nicht angezeigtem Dialog).
+* **Wirklich kollabierbarer Expert-Bereich (4.4):** Neue Methode `_setup_collapsible(group)`: Beim Checkbox-Toggle der `QGroupBox` werden die Kind-Widgets ein-/ausgeblendet und `_reflow()` gerufen; gilt für den Plugin-Expert-Bereich UND die per-Service-Expert-Gruppen im Stack.
+* **Neue Methode `_reflow()`:** Bei nicht angezeigten Dialogen werden Show-Events nicht zugestellt → Haupt-Layout sonst veraltet. `_reflow()` invalidert das Layout explizit und ruft `adjustSize()` (z. B. nach Expert-Toggle, Service-Seitenwechsel, Stack-Neuaufbau).
+
+#### b) Angepasste Layout-Struktur (User-Anpassungen nach Punkt 4)
+Das Plugin-Layout ist auf ein **`QGridLayout` (2 Zeilen × 2 Spalten)** umgestellt
+(`content_grid`, Spacing 6, Spalte 0 stretch=1):
+
+```
+Zeile 0: [ Anzeige & Farben  ] [ Preset                ]
+Zeile 1: [ Service-Parameter ] [ Service-Set Aktionen  ]
+         [                   ] [ Experten-Optionen     ]
+```
+
+* **Rahmen um die Preset-Box:** Neue Methode `_build_preset_group()` – die Preset-Auswahl (ComboBox + „💾 Speichern" + „❌ Löschen") liegt jetzt in einer `QGroupBox("Preset")`. Legacy-Modus (Alt-Indikatoren ohne Plugin): Preset-Box unten (bisherige Position, jetzt im Rahmen). Plugin-Modus: rechts oben.
+* **„Anzeige & Farben" Breite = „Service-Parameter" Breite:** Beide liegen in derselben linken Grid-Spalte → identische Breite (headless gemessen: 360 == 360 px), horizontal `Expanding` beidseitig.
+* **„Service-Set Aktionen" direkt auf Höhe „Service-Parameter" (rechts daneben):** Beide in Grid-Zeile 1, `Qt.AlignTop` → gleiche Y-Position (gemessen: beide y=108).
+* **„Experten-Optionen" direkt unter „Service-Set Aktionen":** In derselben rechten Spalte (`right_bottom`, `AlignTop`), unmittelbar darunter (y = Aktionen-Ende + 6 px Spacing), horizontal `Expanding` → gleiche Breite wie Preset/Aktionen.
+* **Trennlinie (`QFrame.HLine`) nur noch, wenn Indi-Props vorhanden** sind (kein verwaister Strich bei Plugins ohne Sichtbarkeits-/Farb-Props).
+
+#### c) Headless-Verifikation (Grün)
+* `py_compile` auf `chart/indicator_dialog.py` und `test/check_dialog_geometry.py` ✓
+* Code-Inspektion (4.7.2): keine `resize(`, `setFixedSize/Height/Width(`, `setMinimumWidth/Height(` im Dialog ✓
+* `test/check_dialog_geometry.py` (erweitert um Teil 2): Fensterhöhe == `sizeHint` (kein leerer Raum), Expert-Toggle ändert `sizeHint().height()` dynamisch (z. B. 281 → 327 → 281), Service-Parameter-Box == `sizeHint` ✓
+* `test/check_p13_s5.py` sowie alle weiteren Phase-13- und Kompatibilitätstests ✓
+
+# AI-Implementierungsanweisung: Dynamische UI-Layouts für das Prop-Fenster
+
+4.1. Ziel & Prämissen
+Das Eigenschaften-Fenster (z. B. `IndicatorSettingsDialog` / `PropertiesWindow`) muss bezüglich Höhe und Breite **vollständig dynamisch** aufgebaut werden. Jegliche harten Pixelangaben für Fenstergrößen (`resize(x, y)`, `setFixedSize()`, etc.) oder Boxgrößen werden gestrichen. Die GUI schmiegt sich exakt an ihren Inhalt an und vermeidet leeren Raum.
+4.2 Layout-Hierarchie & Stretch-Verhalten festlegen
+Anweisung an die AI
+1. Öffne die Datei `chart/indicator_dialog.py` (bzw. das entsprechende Prop-Fenster-Modul).
+2. Stelle sicher, dass das Central-Widget bzw. das Haupt-Layout ein `QVBoxLayout` nutzt.
+3. Entferne alle Aufrufe wie `self.resize(...)`, `self.setFixedHeight(...)`, `self.setFixedWidth(...)` oder `widget.setMinimumHeight(...)` mit festen Pixelwerten.
+4. Setze die Size-Policy der Container-Widgets/Boxen (`QGroupBox`, `QFrame`) explizit auf `Maximum` oder `Preferred` für die vertikale Richtung:
+```python
+widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+
+```
+5. Setze `layout.setSizeConstraint(QLayout.SetFixedSize)` auf dem Haupt-Layout des Dialogs/Fensters. Dadurch passt sich das Fenster automatisch der minimal benötigten Größe seines Inhalts an und verhindert leeren Raum am unteren Fensterrand.
+
+4.3 Dynamische Sektion "Anzeige & Farben" (Indi-Props oben)
+Anweisung an die AI
+1. Baue die obere Sektion für Indikator-Darstellungsparameter (Farben, Sichtbarkeit) in ein eigenes `QWidget` oder `QGroupBox` ein.
+2. Verwende für die Formularfelder ein `QFormLayout` mit `fieldGrowthPolicy = QFormLayout.AllNonFixedFieldsGrow`.
+3. Füge **keine** vertikalen Spacer (`addSpacer` / `addStretch`) innerhalb dieser oberen Sektion ein. Die Höhe muss sich rein aus der Summe der generierten Formularzeilen ergeben.
+4. Füge unterhalb der Sektion eine visuelle Trennlinie per `QFrame` ein:
+```python
+line = QFrame()
+line.setFrameShape(QFrame.HLine)
+line.setFrameShadow(QFrame.Sunken)
+
+```
+4.4 Dynamische Sektion "Service-Parameter" & "Expert-Options"
+Anweisung an die AI
+1. Erstelle die `QGroupBox` "Service-Parameter".
+2. Die Höhe der Box muss dynamisch mit der Anzahl der sichtbaren Parameter skalieren. Das Unter-Layout (`QFormLayout`) darf keine festen Zeilenhöhen aufweisen.
+3. Die Box endet exakt unter dem letzten Eingabefeld (z. B. `prox_level6`).
+4. Falls der "Expert Mode" (ausklappbarer Bereich / Sub-Widget) aktiviert oder eingeblendet wird:
+* Das Ausklappen/Einblenden ruft automatisch `self.adjustSize()` auf dem Hauptfenster auf, damit sich die Gesamthöhe nahtlos erweitert oder verkleinert.
+* Das `QStackedWidget` für die Services nutzt `QSizePolicy.Preferred` / `QSizePolicy.Maximum`, damit ungenutzter Platz nicht durch leere Ränder auffällt.
+
+4.5 Dynamischer "Preset-Block" (Ganz unten)
+Anweisung an die AI
+1. Plaziere den Preset-Block (Dropdown für Presets, Buttons "Speichern", "Löschen", "Schließen") in einem eigenen `QHBoxLayout` bzw. `QWidget`.
+2. Füge diesen Block im Haupt-`QVBoxLayout` **direkt** unter die Service-Box / den Expert-Bereich ein.
+3. Setze `layout.setSpacing(6)` (oder ähnlich geringen Wert), um den Abstand zwischen der Service-Box und dem Preset-Block minimal zu halten.
+4. Stelle sicher, dass **kein** `addStretch()` vor oder nach dem Preset-Block eingefügt wird, das das Fenster künstlich aufblähen würde.
+
+4.6 Fenster-Resizing & Maximierungs-Schutz
+Anweisung an die AI
+1. Wenn der Anwender das Fenster manuell vergrößert, dürfen die Inhalts-Boxen (`QGroupBox`) vertikal **nicht mitwachsen**.
+2. Erreiche dies, indem am Ende des Haupt-`QVBoxLayout` (unter dem Preset-Block) ein einzelnes `layout.addStretch(1)` platziert wird ODER die `alignTop`-Eigenschaft auf dem Haupt-Layout gesetzt wird:
+```python
+main_layout.setAlignment(Qt.AlignTop)
+
+```
+3. Dadurch bleiben alle Boxen und der Preset-Block auf ihrer inhaltlich berechneten Kompakthöhe am oberen Rand verankert, wenn das Fenster manuell aufgezogen wird.
+
+4.7 Validierung (Headless)
+AI-Prüfauftrag nach der Umsetzung
+1. **Syntax & Import-Check:** Führe `py_compile` auf allen angepassten UI-Dateien aus.
+2. **Code-Inspektion auf Pixel-Hardcoding:**
+* Suche im Code nach `resize(`, `setFixedHeight`, `setFixedWidth`, `setFixedSize` und verifiziere, dass keine festen Pixelwerte für Fenster- oder Box-Dimensionen mehr existieren.
+3. **Headless-Layout-Test (`test/check_dialog_geometry.py`):**
+* Instanziiere den Dialog/das Fenster headless.
+* Blende testweise Zusatzfelder aus/ein und verifiziere via `dialog.sizeHint().height()`, dass sich die empfohlene Gesamthöhe dynamisch mit der Anzahl der Elemente ändert.
 
 ### 5.3 Headless-Validierung
 
 * Erstelle test/check_p13_s5.py: Simuliere die Formulargenerierung anhand eines Schemas und verifiziere, dass expert-Felder im korrekten Unter-Layout landen.
 
+
+### Kapitel 5.4: Anpassungen Speicherverhalten, Presets & Servicefenster-Dynamik
+
 ---
+
+#### 5.4.1 Konzepte & Architektur
+
+##### 5.4.1.1 Breiten- und Höhendynamik im Servicefenster (service_win.py)
+
+Das Servicefenster wird von statischen Einzelsteuerelementen auf ein mehrspaltiges, vollkommen dynamisches Layout umgestellt.
+
+* **Horizontale Spalten-Skalierung (Breite):** Für jedes im Service-Set definierte Element (z. B. grid_1, prox_1) wird eine eigene vertikale Spalte (QGroupBox) nebeneinander im QHBoxLayout angeordnet. Die Fensterbreite passt sich automatisch an die Anzahl der Spalten an (wächst nach rechts).
+* **Vertikale Inhalts-Skalierung (Höhe):** Die Höhe jeder Spalte leitet sich exakt aus der Anzahl ihrer Formularfelder ab. Es gibt keine festen Pixelhöhen.
+* **Experten-Modus:** Parameter mit expert: True (z. B. individueller lookback) werden in eine einklappbare QGroupBox am Fuß der jeweiligen Spalte gelegt. Das Ein-/Ausklappen verändert die Höhe dynamisch per adjustSize().
+* **Dynamische Grenzen:** Es werden keine harten Pixelwerte für min/max-Höhe oder -Breite verwendet. Das Haupt-Layout nutzt setSizeConstraint(QLayout.SetFixedSize) in Kombination mit QSizePolicy.Preferred / QSizePolicy.Maximum.
+
+##### 5.4.1.2 Entkopplung der Indikator-Presets & Speichermechanik
+
+Um Konflikte zwischen der Berechnungslogik (Service-Sets) und der visuellen Darstellung zu vermeiden, werden die Presets strikt entkoppelt:
+
+* **Service-Set (service_sets):** Speichert rein die mathematische Berechnungslogik (Grid-Steps, Proximity-Schwellen, Lookbacks, Zeitfilter).
+* **Indikator-Preset / State (instance_states / symbol_tf_states):** Speichert für den Indikator (z. B. grid_liquidity) nur noch:
+  1. Die Referenz auf das genutzte Service-Set (set_id).
+  2. Reine Darstellungs-Parameter des Charts (Farben, Linienstärken, Sichtbarkeiten).
+
+* **Save/Restore-Verhalten im Chart-Window (chart_win.py):**
+  * **Speichern:** Der IndicatorSettingsDialog übergibt dem Chart-Window ein getrenntes Dictionary aus set_id und display_params.
+  * **Laden/Rendern:** render_indicators liest die set_id, holt die aktuellen Berechnungs-Parameter über das ServiceSetRepository und verknüpft sie mit den Darstellungs-Parametern für den ServiceSetEvaluator.
+  * **Vorteil:** Wird ein Service-Set im Servicefenster angepasst, übernehmen alle offenen Charts mit dieser set_id automatisch die neue Logik, ohne ihre individuellen Farbeinstellungen zu verlieren.
+
+---
+
+#### 5.4.2 Schritt-für-Schritt AI-Anleitung
+
+##### 5.4.2.1 Prämissen & Sicherheitsregeln (Verbindlich)
+
+1. **Inkrementelle Umsetzung:** Die AI arbeitet **exakt einen definierten Schritt** ab, stoppt danach und wartet auf den expliziten Startschuss des Anwenders.
+2. **HARTE VERBOTSREGEL (Alt-Grid):** Die Datei chart/indicators/grid.py darf **unter keinen Umständen editiert, umbenannt oder gelöscht werden**.
+3. **Keine fixen Pixelangaben:** Jegliche Layouts (Höhe und Breite) leiten sich dynamisch aus dem Inhalt ab (setSizeConstraint(QLayout.SetFixedSize) bzw. QSizePolicy.Maximum).
+4. **Validierung:** Alle Prüfungen erfolgen headless (ohne GUI-Start) via py_compile und eigene Test-Skripte.
+
+---
+
+##### 5.4.2.2 Schritt 1: Breiten- & Höhendynamisches Layout im Servicefenster (service_win.py)
+
+###### 5.4.2.2.1 Ziel & Kapselung
+
+Umstellung von service_win.py auf ein mehrspaltiges Layout, das sowohl in der Breite (Anzahl der Services) als auch in der Höhe (Anzahl der Parameter) flexibel skaliert.
+
+###### 5.4.2.2.2 Anweisung an die AI
+
+1. Öffne service_win.py und passe den zentralen Bereich des Fensters an:
+* Ersetze statische Parameter-Felder durch ein QHBoxLayout (service_columns_layout).
+
+2. Implementiere die dynamische Spalten-Generierung (_build_service_columns(set_definition)):
+* Für jede instance_id in execution_order wird eine QGroupBox als vertikale Spalte erzeugt.
+* Innerhalb der Spalte wird ein QFormLayout für die Parameter des jeweiligen Services gerendert (float -> QDoubleSpinBox, int -> QSpinBox, bool -> QCheckBox).
+* Parameter mit expert: True werden in eine einklappbare QGroupBox ("Experten-Optionen") am unteren Ende der Spalte platziert.
+
+3. Dynamische Breiten- & Höhensteuerung:
+* Setze für jede Service-Spalte:
+```python
+column_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+```
+* Das Haupt-Layout des Service-Fensters erhält:
+```python
+main_layout.setSizeConstraint(QLayout.SetFixedSize)
+main_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+```
+* Dadurch wächst das Fenster beim Hinzufügen von Services nach rechts (Breite) und beim Ausklappen von Experten-Optionen nach unten (Höhe) – ohne leeren Raum.
+
+###### 5.4.2.2.3 Headless-Validierung
+
+* Erstelle test/check_p13_service_win_geometry.py.
+* Instanziiere ServiceWindow headless und erstelle/lade nacheinander ein Set mit 1 Service und ein Set mit 3 Services.
+* Prüfe via sizeHint(), dass width mit der Anzahl der Spalten skaliert und height bei Einklappen des Expert-Modus schrumpft.
+
+---
+
+##### 5.4.2.3 Schritt 2: Entkopplung der Indikator-Presets & Speichermechanik (chart_win.py & indicator_dialog.py)
+
+###### 5.4.2.3.1 Ziel & Kapselung
+
+Saubere Trennung von Logik (set_id aus service_sets) und Darstellung (Farben, Sichtbarkeiten) im Indikator-Preset.
+
+###### 5.4.2.3.2 Anweisung an die AI
+
+1. Passe chart/indicator_dialog.py an:
+* Trenne das Rückgabe-Dictionary beim Speichern eines Presets auf:
+```python
+preset_payload = {
+    "set_id": selected_service_set_id,
+    "display_params": {
+        "line_color": "#2196F3",
+        "show_lines": True,
+        "circle_color_std": "#FFEB3B"
+    }
+}
+```
+
+2. Passe chart/chart_win.py an:
+* **Save-State (save_state):** In indicators_state wird für grid_liquidity nur noch die set_id sowie das display_params-Dict abgelegt.
+* **Render-Logik (render_indicators):**
+  1. Liest set_id aus indicators_state.
+  2. Lädt die Logik-Parameter über ServiceSetRepository().get_set(set_id).
+  3. Mergt display_params (Darstellung) und Logik-Parameter zusammen.
+  4. Übergibt das zusammengesetzte Dict an den ServiceSetEvaluator / Indikator-Adapter.
+
+###### 5.4.2.3.3 Headless-Validierung
+
+* Erstelle test/check_p13_preset_decoupling.py.
+* Simuliere den Preset-Speicher- und Ladevorgang in chart_win.py.
+* Verifiziere, dass eine Änderung an der Farbstufe im Indikator-Dialog nicht die service_sets-Tabelle überschreibt, und eine Änderung am Grid-Raster im Servicefenster sofort von allen Charts übernommen wird, die diese set_id nutzen.
+
+
+---
+
 
 ## Schritt 6: Grid Indikator Refactoring (Thread-sicherer Cache)
 

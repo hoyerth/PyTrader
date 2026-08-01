@@ -14,10 +14,18 @@ Phase 13 Schritt 5 (additiv): Plugin-Prop-Fenster mit Expert-Modus & Service-Set
 - Set-Aktionen: Name vergeben / Speichern / Ausführen (ServiceSetEvaluator im
   Hintergrund-Thread) / Löschen (zwingend mit QMessageBox-Gegenfrage).
 - Alt-Indikatoren ohne Plugin (z.B. 'grid') behalten das bisherige Layout.
+
+Phase 13 Schritt 5 Punkt 4 (VERBINDLICH): Vollständig dynamische Fenster- &
+Box-Größen – KEINE fixen Pixelwerte. Höhe/Breite des Fensters und aller Boxen
+ergeben sich ausschließlich aus dem Inhalt: Haupt-Layout mit
+setSizeConstraint(QLayout.SetFixedSize), SizePolicies Maximum/Preferred,
+QStackedWidget-Höhe folgt der AKTUELLEN Service-Seite (_ServiceStack),
+kollabierbarer Expert-Bereich mit adjustSize() (4.2–4.7 Implementierungsanweisung).
+
 """
 
 from typing import Any, Dict, Callable, List, Optional
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QSize
 from PySide6.QtWidgets import (
 	QApplication,
 	QCheckBox,
@@ -26,10 +34,12 @@ from PySide6.QtWidgets import (
 	QDoubleSpinBox,
 	QFormLayout,
 	QFrame,
+	QGridLayout,
 	QGroupBox,
 	QHBoxLayout,
 	QInputDialog,
 	QLabel,
+	QLayout,
 	QLineEdit,
 	QMessageBox,
 	QPushButton,
@@ -92,6 +102,36 @@ class DialogServiceSetRunWorker(QThread):
 			self.run_failed.emit(self.set_definition.get("set_id", ""), str(e))
 
 
+class _ServiceStack(QStackedWidget):
+	"""QStackedWidget mit dynamischer H�he anhand der AKTUELLEN Seite (Punkt 4).
+
+	Der Standard-QStackedWidget liefert als sizeHint das MAXIMUM aller Seiten.
+	Damit bliebe die Box 'Service-Parameter' so hoch wie die h�chste Service-
+	Seite, auch wenn eine k�rzere Seite sichtbar ist (leerer Raum). Diese
+	Variante richtet die H�he exakt nach der aktuell sichtbaren Seite aus -
+	die Box endet immer unter dem letzten Parameter der aktiven Seite.
+	"""
+
+	def sizeHint(self) -> QSize:
+		w = self.currentWidget()
+		if w is not None:
+			return w.sizeHint()
+		return super().sizeHint()
+
+	def minimumSizeHint(self) -> QSize:
+		w = self.currentWidget()
+		if w is not None:
+			return w.minimumSizeHint()
+		return super().minimumSizeHint()
+
+	def setCurrentIndex(self, index: int) -> None:
+		super().setCurrentIndex(index)
+		# Eltern-Layouts informieren, dass sich die Höhe (sizeHint) geändert hat –
+		# auch bei nicht angezeigtem Dialog. Sonst bleibt die Höhe der Box
+		# 'Service-Parameter' auf der höchsten/alten Seite stehen.
+		self.updateGeometry()
+
+
 class IndicatorSettingsDialog(QDialog):
 
 	# Gemeinsamer Geometrie-Key fuer ALLE Indikator-Einstellungsdialoge
@@ -135,10 +175,14 @@ class IndicatorSettingsDialog(QDialog):
 		self.plugin_labels: Dict[str, str] = {}
 
 		self.setWindowTitle(f"Einstellungen - {self.indicator.display_name}")
-		self.setMinimumWidth(520)
 		self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
 
 		self.param_controls: Dict[str, QWidget] = {}
+		# Phase 13 Schritt 5 Punkt 4: Fenster & Boxen sind vollständig dynamisch –
+		# KEINE fixen Pixelwerte für Höhe/Breite. Die Größe ergibt sich allein aus
+		# dem Inhalt (setSizeConstraint(SetFixedSize) am Ende von init_ui).
+		# Während des UI-Aufbaus wird self.adjustSize() übersprungen.
+		self._ui_ready = False
 		self.init_ui()
 
 		# Nicht-modaler Dialog: letzte Position/Groesse wiederherstellen
@@ -287,29 +331,24 @@ class IndicatorSettingsDialog(QDialog):
 			self._init_plugin_ui(main_layout, plugin)
 		else:
 			self._init_legacy_ui(main_layout)
-
-		# Preset-Verwaltungszeile (beide Modi)
-		preset_layout = QHBoxLayout()
-		preset_layout.addWidget(QLabel("Preset:"))
-
-		self.combo_presets = QComboBox()
-		self.refresh_preset_list()
-		self.combo_presets.currentTextChanged.connect(self.on_preset_selected)
-		preset_layout.addWidget(self.combo_presets)
-
-		btn_save_preset = QPushButton("💾 Speichern")
-		btn_save_preset.clicked.connect(self.save_current_preset)
-		preset_layout.addWidget(btn_save_preset)
-
-		btn_delete_preset = QPushButton("❌ Löschen")
-		btn_delete_preset.clicked.connect(self.delete_current_preset)
-		preset_layout.addWidget(btn_delete_preset)
-
-		main_layout.addLayout(preset_layout)
+			# Preset-Verwaltung (Legacy: unten, im eigenen Rahmen)
+			main_layout.addWidget(self._build_preset_group())
 
 		btn_close = QPushButton("Schließen")
 		btn_close.clicked.connect(self.accept)
 		main_layout.addWidget(btn_close)
+
+		# --- Phase 13 Schritt 5 Punkt 4 (VERBINDLICH): Vollständig dynamische
+		# Fenster- & Box-Größen – keine fixen Pixelwerte ---
+		# 4.2.5: Das Fenster schmiegt sich exakt an seinen Inhalt an (kein
+		# leerer Raum unter dem Preset-Block). Beim manuellen Aufziehen bleiben
+		# die Boxen dank AlignTop (4.6) auf ihrer Inhalt-Höhe verankert.
+		main_layout.setSpacing(6)
+		main_layout.setSizeConstraint(QLayout.SetFixedSize)
+		main_layout.setAlignment(Qt.AlignTop)
+
+		self._ui_ready = True
+		self.adjustSize()
 
 	def _init_legacy_ui(self, main_layout: QVBoxLayout) -> None:
 		"""Bisheriges Layout fuer Alt-Indikatoren ohne Plugin-Schema (z.B. 'grid')."""
@@ -370,10 +409,25 @@ class IndicatorSettingsDialog(QDialog):
 		for key, spec in base_schema.items():
 			self.plugin_labels.setdefault(key, spec.get("description") or self._human(key))
 
-		# --- 1) Reine Indi-Props (Sichtbarkeit, Farben) oberhalb der Trennlinie ---
+		# --- 1) Grid: Indi-Props + Service-Parameter links; rechts daneben auf
+		# gleicher Höhe 'Service-Set Aktionen' (darunter 'Experten-Optionen') ---
+		# Zeile 0: 'Anzeige & Farben' (links) + Preset-Rahmen (rechts oben).
+		# Zeile 1: 'Service-Parameter' (links) + 'Service-Set Aktionen' mit der
+		# 'Experten-Optionen'-Box direkt darunter (rechts) – die drei
+		# Service-Boxen gehören thematisch zusammen und stehen daher auf
+		# gleicher Höhe (gleiche Grid-Zeile, AlignTop).
+		content_grid = QGridLayout()
+		content_grid.setSpacing(6)
+		left_col = QVBoxLayout()
+		left_col.setAlignment(Qt.AlignTop)
+
+		# --- 1a) Reine Indi-Props (Sichtbarkeit, Farben) oberhalb der Trennlinie ---
 		indi_keys = [k for k in self.plugin_order if self._is_visual_key(k)]
 		if indi_keys:
 			indi_group = QGroupBox("Anzeige & Farben")
+			# Horizontal Expanding -> füllt die Spaltenbreite (identisch mit der
+			# Breite der Box 'Service-Parameter'); vertikal Maximum (Inhalt-Höhe).
+			indi_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
 			indi_form = QFormLayout(indi_group)
 			for key in indi_keys:
 				spec = self.plugin_schema.get(key, {})
@@ -381,29 +435,22 @@ class IndicatorSettingsDialog(QDialog):
 				ctrl = self.create_schema_control(key, cval, spec)
 				self.param_controls[key] = ctrl
 				indi_form.addRow(self.plugin_labels.get(key, self._human(key)), ctrl)
-			main_layout.addWidget(indi_group)
+			left_col.addWidget(indi_group)
 
-		# --- 2) Trennlinie ---
-		line = QFrame()
-		line.setFrameShape(QFrame.HLine)
-		line.setFrameShadow(QFrame.Sunken)
-		main_layout.addWidget(line)
+			# --- 1b) Trennlinie ---
+			line = QFrame()
+			line.setFrameShape(QFrame.HLine)
+			line.setFrameShadow(QFrame.Sunken)
+			left_col.addWidget(line)
 
-		# --- 3) Hauptzeile: Service-Parameter (links) | Aktionen + Expert (rechts) ---
-		# Rechts neben dem Service-Parameter-Rahmen stehen die Set-Aktionen
-		# (oben) und darunter der Expert-Bereich. Beide Spalten werden oben
-		# ausgerichtet (AlignTop), damit die Service-Parameter-Box direkt unter
-		# der Trennlinie beginnt. KEIN addStretch in der rechten Spalte –
-		# dadurch bleibt die Zeile so kompakt wie die hoechste Box und das
-		# Fenster endet direkt unter dem Preset-Block.
-		main_row = QHBoxLayout()
+		content_grid.addLayout(left_col, 0, 0, Qt.AlignTop)
 
-		# --- 3a) Service-Bereich (Set-Auswahl + QStackedWidget pro Service) ---
+		# --- 1c) Service-Parameter-Box (links, Zeile 1) ---
 		svc_group = QGroupBox("Service-Parameter")
-		# Vertikal NICHT expandieren: Der Rahmen soll dynamisch unter dem
-		# letzten Parameter (z.B. Level 6) enden und beim Vergroessern des
-		# Fensters NICHT mitwachsen (bleibt auf Inhalt-Hoehe).
-		svc_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+		# 4.2.4: Vertikale Size-Policy = Maximum -> Die Box endet dynamisch
+		# unter dem letzten Parameter (z.B. Level 6) und waechst beim
+		# Vergroessern des Fensters NICHT mit (bleibt auf Inhalt-Hoehe).
+		svc_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
 		svc_layout = QVBoxLayout(svc_group)
 
 		set_row = QHBoxLayout()
@@ -420,20 +467,33 @@ class IndicatorSettingsDialog(QDialog):
 		svc_row.addWidget(self.combo_service_sel)
 		svc_layout.addLayout(svc_row)
 
-		self.stack_service_forms = QStackedWidget()
-		# Vertikal NICHT expandieren: Der Rahmen 'Service-Parameter' soll
-		# dynamisch unter dem letzten Parameter (z.B. Level 6) enden und
-		# keinen freien Platz fuellen.
+		self.stack_service_forms = _ServiceStack()
+		# 4.4: Das QStackedWidget nutzt Maximum (vertikal), damit die Box
+		# 'Service-Parameter' exakt unter dem letzten Parameter der AKTUELL
+		# sichtbaren Service-Seite endet (kein leerer Raum durch hoechste Seite).
 		self.stack_service_forms.setSizePolicy(
-			QSizePolicy.Expanding, QSizePolicy.Fixed)
+			QSizePolicy.Expanding, QSizePolicy.Maximum)
 		svc_layout.addWidget(self.stack_service_forms)
 
-		main_row.addWidget(svc_group, 1, Qt.AlignTop)
+		content_grid.addWidget(svc_group, 1, 0, Qt.AlignTop)
 
-		# --- 3b) Rechte Spalte: Set-Aktionen (oben) + Expert-Bereich (darunter) ---
-		right_col = QVBoxLayout()
+		# --- 1d) Rechte Spalte Zeile 0: Preset-Rahmen (rechts oben) ---
+		right_top = QVBoxLayout()
+		right_top.setAlignment(Qt.AlignTop)
+		right_top.addWidget(self._build_preset_group(), 0, Qt.AlignTop)
+		content_grid.addLayout(right_top, 0, 1, Qt.AlignTop)
+
+		# --- 1e) Rechte Spalte Zeile 1: Service-Set Aktionen + Experten-Optionen ---
+		# Direkt auf Höhe der 'Service-Parameter'-Box (gleiche Grid-Zeile 1),
+		# die Expert-Box unmittelbar darunter – thematisch zusammengehörig.
+		right_bottom = QVBoxLayout()
+		right_bottom.setAlignment(Qt.AlignTop)
+
 		# Set-Aktionen: Name / Speichern / Ausführen / Löschen
 		act_group = QGroupBox("Service-Set Aktionen")
+		# Horizontal Expanding -> füllt die rechte Spaltenbreite (wie Preset);
+		# vertikal Maximum -> bleibt auf Inhalt-Höhe (Punkt 4).
+		act_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
 		act_layout = QVBoxLayout(act_group)
 
 		name_row = QHBoxLayout()
@@ -454,12 +514,15 @@ class IndicatorSettingsDialog(QDialog):
 		btn_row.addWidget(self.btn_delete_set)
 		act_layout.addLayout(btn_row)
 
-		right_col.addWidget(act_group, 0, Qt.AlignTop)
+		right_bottom.addWidget(act_group, 0, Qt.AlignTop)
 
 		# Expert-Bereich (ausklappbar) mit Plugin-Metadaten
 		self.group_expert = QGroupBox("Experten-Optionen")
 		self.group_expert.setCheckable(True)
 		self.group_expert.setChecked(False)
+		# Horizontal Expanding -> füllt die rechte Spaltenbreite; vertikal
+		# Maximum -> kollabiert beim Zuklappen auf die Titelzeile (Punkt 4).
+		self.group_expert.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
 		expert_layout = QVBoxLayout(self.group_expert)
 
 		meta = dict(plugin.metadata or {})
@@ -486,18 +549,18 @@ class IndicatorSettingsDialog(QDialog):
 			expert_form.addRow(self.plugin_labels.get(key, self._human(key)), ctrl)
 		expert_layout.addLayout(expert_form)
 
-		right_col.addWidget(self.group_expert, 0, Qt.AlignTop)
-		# KEIN addStretch – die rechte Spalte bleibt auf Inhalt-Hoehe, damit die
-		# Hauptzeile so kompakt ist wie die hoechste Box und das Fenster direkt
-		# unter dem Preset-Block endet.
+		# 4.4: Ausklappbarer Sub-Bereich – beim Abwählen werden die Kinder
+		# ausgeblendet und das Fenster nahtlos auf die neue Höhe verkleinert.
+		self._setup_collapsible(self.group_expert)
 
-		# QBoxLayout.addLayout() kennt keinen Alignments-Parameter (nur stretch).
-		# AlignTop wird stattdessen direkt auf dem Layout gesetzt, damit die
-		# rechte Spalte (Aktionen + Expert) oben beginnt – unabhängig davon,
-		# welche Box höher ist.
-		right_col.setAlignment(Qt.AlignTop)
-		main_row.addLayout(right_col, 0)
-		main_layout.addLayout(main_row)
+		right_bottom.addWidget(self.group_expert, 0, Qt.AlignTop)
+
+		content_grid.addLayout(right_bottom, 1, 1, Qt.AlignTop)
+
+		# Linke Spalte bekommt beim manuellen Aufziehen den zusätzlichen Raum
+		# (beide linken Boxen wachsen horizontal mit, gleiche Breite).
+		content_grid.setColumnStretch(0, 1)
+		main_layout.addLayout(content_grid)
 
 		# Initiale Set-Liste befüllen (list_sets() als Quelle, Roadmap §5.2)
 		self.refresh_service_set_list()
@@ -505,6 +568,34 @@ class IndicatorSettingsDialog(QDialog):
 	# -------------------------------------------------------------------------
 	# Service-Set-UI (Phase 13 Schritt 5)
 	# -------------------------------------------------------------------------
+
+	def _setup_collapsible(self, group: QGroupBox) -> None:
+		"""Macht eine ausklappbare QGroupBox wirklich kollabierbar (Punkt 4).
+
+		Beim Abwählen werden die Kinder ausgeblendet und self.adjustSize()
+		verkleinert das Prop-Fenster nahtlos auf die neue Inhalt-Höhe; beim
+		Aufklappen wird es entsprechend vergrößert (4.4 Implementierungsanweisung).
+		"""
+		def _toggle(checked: bool) -> None:
+			for child in group.findChildren(QWidget):
+				child.setVisible(checked)
+			if self._ui_ready:
+				self._reflow()
+		group.toggled.connect(_toggle)
+		# Initialzustand anwenden (ausgeklappt/versteckt)
+		_toggle(group.isChecked())
+
+	def _reflow(self) -> None:
+		"""Erzwingt die Neuberechnung des Layouts (dynamische Größe, Punkt 4).
+
+		Bei einem nicht angezeigten Dialog werden Show-Events nicht zugestellt,
+		wodurch das Haupt-Layout sonst seinen alten sizeHint behält. Durch
+		explizites invalidate() wird die Gesamthöhe immer frisch berechnet.
+		"""
+		lay = self.layout()
+		if lay is not None:
+			lay.invalidate()
+		self.adjustSize()
 
 	def refresh_service_set_list(self) -> None:
 		"""Befüllt das Set-Dropdown aus ServiceSetRepository.list_sets()."""
@@ -558,6 +649,9 @@ class IndicatorSettingsDialog(QDialog):
 		if not self.stack_service_forms:
 			return
 		self.stack_service_forms.setCurrentIndex(index + 1 if index >= 0 else 0)
+		# 4.4: Fenster/Box auf die neue Service-Seite nachziehen (dynamische Höhe)
+		if self._ui_ready:
+			self._reflow()
 
 	def _rebuild_service_stack(self) -> None:
 		"""Baut das QStackedWidget neu: Seite 0 = aktive Service-Parameter des
@@ -638,11 +732,17 @@ class IndicatorSettingsDialog(QDialog):
 							self._set_param_controls[f"{iid}:{key}"] = ctrl
 							ef.addRow(sp_labels.get(key, self._human(key)), ctrl)
 						vl.addWidget(exp_grp)
+						# 4.4: Auch der Service-Expert-Bereich ist ausklappbar
+						# (Kinder ein-/ausblenden + adjustSize auf dem Dialog).
+						self._setup_collapsible(exp_grp)
 				except Exception:
 					pf.addRow(QLabel(f"Plugin '{pid}' nicht gefunden."))
 				stack.addWidget(page)
 
 		stack.setCurrentIndex(0)
+		# 4.4: Fenster/Box auf die neue Stack-Seite nachziehen (dynamische Höhe)
+		if self._ui_ready:
+			self._reflow()
 
 	# -------------------------------------------------------------------------
 	# Set-Aktionen (Phase 13 Schritt 5)
@@ -794,7 +894,12 @@ class IndicatorSettingsDialog(QDialog):
 	# -------------------------------------------------------------------------
 
 	def _restore_geometry(self) -> None:
-		"""Stellt die letzte Position/Groesse des nicht-modalen Dialogs wieder her."""
+		"""Stellt die letzte POSITION des nicht-modalen Dialogs wieder her.
+
+		Phase 13 Schritt 5 Punkt 4: Die Größe wird NICHT wiederhergestellt –
+		das Prop-Fenster ist vollständig dynamisch (Inhalt bestimmt Höhe/Breite,
+		keine fixen Pixelwerte, kein leerer Raum unter dem Preset-Block).
+		"""
 		try:
 			geom = self.state_manager.get_dialog_geometry(self.DIALOG_GEOMETRY_KEY)
 			if not geom:
@@ -802,8 +907,6 @@ class IndicatorSettingsDialog(QDialog):
 
 			pos_x = geom.get("pos_x")
 			pos_y = geom.get("pos_y")
-			width = geom.get("width")
-			height = geom.get("height")
 
 			# Position validieren (Bildschirm-Bounds; sonst zuruecksetzen)
 			if pos_x is not None and pos_y is not None:
@@ -813,18 +916,15 @@ class IndicatorSettingsDialog(QDialog):
 					pos_x = pos_y = None
 				else:
 					self.move(pos_x, pos_y)
-
-			# Groesse nur uebernehmen, wenn plausibel (min. Breite des Dialogs)
-			if width is not None and height is not None:
-				try:
-					self.resize(max(440, int(width)), max(100, int(height)))
-				except (ValueError, TypeError):
-					pass
 		except Exception as e:
 			print(f"⚠️ [IndicatorDialog] Geometrie-Restore fehlgeschlagen: {e}")
 
 	def _save_geometry(self) -> None:
-		"""Speichert die aktuelle Position/Groesse des Dialogs."""
+		"""Speichert die aktuelle Position/Groesse des Dialogs.
+
+		Punkt 4: Wiederhergestellt wird nur die Position (siehe
+		_restore_geometry) – die Größe ist dynamisch (Inhalt bestimmt Höhe/Breite).
+		"""
 		try:
 			p = self.pos()
 			s = self.size()
@@ -841,6 +941,37 @@ class IndicatorSettingsDialog(QDialog):
 		if self._set_run_worker and self._set_run_worker.isRunning():
 			self._set_run_worker.wait(2000)
 		super().done(r)
+
+	# -------------------------------------------------------------------------
+	# Preset-Verwaltung (Phase 13 Schritt 5 Punkt 4: im eigenen Rahmen)
+	# -------------------------------------------------------------------------
+
+	def _build_preset_group(self) -> QGroupBox:
+		"""Baut die Preset-Verwaltungsbox (Rahmen um die Preset-Auswahl).
+
+		Im Plugin-Modus wird sie direkt rechts oben neben 'Anzeige & Farben'
+		platziert; im Legacy-Modus unten (bisherige Position). Die Box wächst
+		nicht mit dem Fenster mit (Punkt 4: dynamische Größen).
+		"""
+		preset_group = QGroupBox("Preset")
+		preset_layout = QHBoxLayout(preset_group)
+		preset_layout.addWidget(QLabel("Preset:"))
+
+		self.combo_presets = QComboBox()
+		self.refresh_preset_list()
+		self.combo_presets.currentTextChanged.connect(self.on_preset_selected)
+		preset_layout.addWidget(self.combo_presets)
+
+		btn_save_preset = QPushButton("💾 Speichern")
+		btn_save_preset.clicked.connect(self.save_current_preset)
+		preset_layout.addWidget(btn_save_preset)
+
+		btn_delete_preset = QPushButton("❌ Löschen")
+		btn_delete_preset.clicked.connect(self.delete_current_preset)
+		preset_layout.addWidget(btn_delete_preset)
+
+		preset_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+		return preset_group
 
 	def refresh_preset_list(self) -> None:
 		self.combo_presets.blockSignals(True)

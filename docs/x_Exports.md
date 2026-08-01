@@ -52,6 +52,8 @@ PyTrader/
         engine/
             __init__.py
             base_definition.py
+            service_models.py
+            service_set_repository.py
             set_evaluator.py
         features/
             __init__.py
@@ -127,6 +129,10 @@ PyTrader/
         check_measurement.js
         check_mt5_m1_boundary.py
         check_p13_s1.py
+        check_p13_s2.py
+        check_p13_s3.py
+        check_p13_s4.py
+        check_p13_s5.py
         check_phase12_step1_migration.py
         check_plugin_batch_services.py
         check_plugin_executor.py
@@ -1669,34 +1675,101 @@ class PropertiesWindow(PersistentWindow):
 Service-Kontrollfenster für PyTrader.
 Steuert den Historical Scanner (Full-Scan / Delta-Update) über ein separates Fenster.
 Mit automatischem State Persistence via PersistentWindow.
+
+Phase 13 Schritt 4: Zusätzlich Service-Set-Verwaltung (ServiceSetRepository +
+ServiceSetEvaluator): Set-Auswahl (list_sets()), execution_order-Anzeige mit
+Up/Down-Umsortierung, Name (leer → Auto-Name), Speichern/Löschen (mit
+QMessageBox-Rückfrage) und Ausführen (ServiceSetEvaluator im Hintergrund).
 """
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
-from PySide6.QtCore import QFile, QIODevice, QTimer, Slot
+from PySide6.QtCore import QFile, QIODevice, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QLabel, QMainWindow,
-    QProgressBar, QPushButton, QTextEdit, QWidget,
+    QCheckBox, QComboBox, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMessageBox, QProgressBar, QPushButton, QTextEdit, QWidget,
 )
 
 from analytics.background_workers.historical_scanner import HistoricalScanner
+from analytics.engine.service_set_repository import ServiceSetRepository
+from analytics.engine.set_evaluator import ServiceSetEvaluator
 from persistent_win import PersistentWindow, register_persistent_window
 
 BASE_DIR = Path(__file__).resolve().parent
+
+
+class ServiceSetRunWorker(QThread):
+    """Phase 13 Schritt 4: Führt ein Service-Set im Hintergrund aus.
+
+    Lädt OHLCV (Symbol/Timeframe) und ruft ServiceSetEvaluator.execute_set()
+    in einem separaten Thread auf, damit die GUI nicht blockiert.
+    """
+
+    log_message = Signal(str)
+    run_finished = Signal(str, int)  # set_id, Anzahl erfolgreicher Services
+    run_failed = Signal(str, str)    # set_id, Fehlermeldung
+
+    def __init__(self, evaluator: ServiceSetEvaluator, symbol: str, timeframe: str,
+                 set_definition: Dict[str, Any], parent=None):
+        super().__init__(parent)
+        self.evaluator = evaluator
+        self.symbol = symbol
+        self.timeframe = timeframe
+        self.set_definition = set_definition
+
+    def run(self):
+        try:
+            from analytics.features.feature_builder import FeatureBuilder, prepare_plugin_df
+            from analytics.features.plugins.base_plugin import PluginContext
+            from state_manager import StateManager
+
+            settings = StateManager().get_app_settings()
+            fb = FeatureBuilder()
+            df = fb.load_ohlcv(self.symbol, self.timeframe, limit=settings.feature_builder_limit)
+            if df is None or df.empty:
+                self.run_failed.emit(
+                    self.set_definition.get("set_id", ""),
+                    f"Keine OHLCV-Daten fuer {self.symbol} {self.timeframe}.",
+                )
+                return
+
+            df_plugin = prepare_plugin_df(df)
+            context = PluginContext(
+                symbol=self.symbol,
+                timeframe=self.timeframe,
+                mode="batch",
+                timestamp=int(df_plugin["time"].iloc[-1]) if len(df_plugin) else None,
+                settings=settings,
+            )
+            display = self.set_definition.get("display_name") or self.set_definition.get("set_id") or "Unbenannt"
+            self.log_message.emit(f"Ausfuehren: {display} ({self.symbol} {self.timeframe})")
+
+            results = self.evaluator.execute_set(self.set_definition, df_plugin, context=context)
+            for iid in results:
+                self.log_message.emit(f"  {iid}: fertig")
+            self.run_finished.emit(self.set_definition.get("set_id", ""), len(results))
+        except Exception as e:
+            self.run_failed.emit(self.set_definition.get("set_id", ""), str(e))
 
 
 @register_persistent_window(auto_restore=False)
 class ServiceWindow(PersistentWindow):
     INSTANCE_ID = "win_service"
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, service_set_repo: Optional[ServiceSetRepository] = None):
         super().__init__(parent)
         self.scanner: Optional[HistoricalScanner] = None
         self._elapsed_timer = QTimer(self)
         self._elapsed_seconds = 0
         self._elapsed_timer.timeout.connect(self._update_elapsed)
+
+        # Phase 13 Schritt 4: Service-Set-Verwaltung
+        self.set_repo: ServiceSetRepository = service_set_repo or ServiceSetRepository()
+        self.set_evaluator = ServiceSetEvaluator()
+        self._set_run_worker: Optional[ServiceSetRunWorker] = None
+        self._current_set_id: Optional[str] = None
 
         # UI laden
         ui_file = QFile(str(BASE_DIR / "ui" / "service_win.ui"))
@@ -1720,12 +1793,52 @@ class ServiceWindow(PersistentWindow):
         self.progress_bar: QProgressBar = self.ui.findChild(QProgressBar, "progress_bar")
         self.text_log: QTextEdit = self.ui.findChild(QTextEdit, "text_log")
 
+        # Phase 13 Schritt 4: Service-Set-Controls
+        self.combo_set: QComboBox = self.ui.findChild(QComboBox, "combo_set")
+        self.combo_tf_set: QComboBox = self.ui.findChild(QComboBox, "combo_tf_set")
+        self.btn_refresh_sets: QPushButton = self.ui.findChild(QPushButton, "btn_refresh_sets")
+        self.edit_set_name: QLineEdit = self.ui.findChild(QLineEdit, "edit_set_name")
+        self.list_execution_order: QListWidget = self.ui.findChild(QListWidget, "list_execution_order")
+        self.btn_move_up: QPushButton = self.ui.findChild(QPushButton, "btn_move_up")
+        self.btn_move_down: QPushButton = self.ui.findChild(QPushButton, "btn_move_down")
+        self.btn_remove_instance: QPushButton = self.ui.findChild(QPushButton, "btn_remove_instance")
+        self.edit_new_instance: QLineEdit = self.ui.findChild(QLineEdit, "edit_new_instance")
+        self.btn_add_instance: QPushButton = self.ui.findChild(QPushButton, "btn_add_instance")
+        self.btn_save_set: QPushButton = self.ui.findChild(QPushButton, "btn_save_set")
+        self.btn_delete_set: QPushButton = self.ui.findChild(QPushButton, "btn_delete_set")
+        self.btn_execute_set: QPushButton = self.ui.findChild(QPushButton, "btn_execute_set")
+
         if self.btn_start:
             self.btn_start.clicked.connect(self.start_scan)
+
+        # Phase 13 Schritt 4: Service-Set-Signale
+        if self.combo_set:
+            self.combo_set.currentIndexChanged.connect(self._on_set_selected)
+        if self.btn_refresh_sets:
+            self.btn_refresh_sets.clicked.connect(self.refresh_set_list)
+        if self.btn_move_up:
+            self.btn_move_up.clicked.connect(lambda: self.move_order_item(-1))
+        if self.btn_move_down:
+            self.btn_move_down.clicked.connect(lambda: self.move_order_item(1))
+        if self.btn_remove_instance:
+            self.btn_remove_instance.clicked.connect(self.remove_instance)
+        if self.btn_add_instance:
+            self.btn_add_instance.clicked.connect(self.add_instance)
+            if self.edit_new_instance:
+                self.edit_new_instance.returnPressed.connect(self.add_instance)
+        if self.btn_save_set:
+            self.btn_save_set.clicked.connect(self.save_set)
+        if self.btn_delete_set:
+            self.btn_delete_set.clicked.connect(self.delete_set)
+        if self.btn_execute_set:
+            self.btn_execute_set.clicked.connect(self.execute_set)
 
         # Sofort speichern bei Symbol-Änderung
         if self.combo_symbol:
             self.combo_symbol.currentTextChanged.connect(self.save_state)
+
+        # Set-Dropdown initial befüllen (list_sets() als Quelle)
+        self.refresh_set_list()
 
         # State asynchron wiederherstellen (nach show(), damit move/resize vom Window-Manager akzeptiert werden)
         QTimer.singleShot(0, self.restore_state)
@@ -1794,11 +1907,302 @@ class ServiceWindow(PersistentWindow):
         s = self._elapsed_seconds % 60
         self.label_elapsed.setText(f"{h:02d}:{m:02d}:{s:02d}")
 
+    # =========================================================================
+    # Phase 13 Schritt 4: Service-Set-Verwaltung
+    # =========================================================================
+
+    def refresh_set_list(self) -> None:
+        """Befüllt das Set-Dropdown aus ServiceSetRepository.list_sets().
+
+        Quelle für die Set-Auswahl (Roadmap §4.2). Behält die aktuelle
+        Auswahl bei, sofern sie noch existiert; andernfalls wird das erste
+        Set geladen und in den Editor übertragen.
+        """
+        if not self.combo_set:
+            return
+        sets = self.set_repo.list_sets()
+        current = self.combo_set.currentData()
+
+        self.combo_set.blockSignals(True)
+        self.combo_set.clear()
+        for s in sets:
+            label = s.get("display_name") or s.get("set_id") or "Unbenannt"
+            self.combo_set.addItem(label, s.get("set_id"))
+        self.combo_set.blockSignals(False)
+
+        # Aktuelle Auswahl beibehalten, falls noch vorhanden.
+        selected_id: Optional[str] = None
+        if current is not None:
+            idx = self.combo_set.findData(current)
+            if idx >= 0:
+                self.combo_set.setCurrentIndex(idx)
+                selected_id = current
+
+        if selected_id is None and sets:
+            # Achtung: addItem() setzt das erste Item automatisch auf Index 0,
+            # während die Signale blockiert sind -> setCurrentIndex(0) löst KEIN
+            # currentIndexChanged aus. Daher explizit in den Editor laden.
+            self.combo_set.setCurrentIndex(0)
+            selected_id = self.combo_set.itemData(0)
+
+        if selected_id:
+            definition = self.set_repo.get_set(selected_id)
+            if definition:
+                self.load_set_into_editor(definition)
+        else:
+            # Kein Set (mehr) vorhanden -> Editor leeren
+            self._clear_set_editor()
+
+    def _clear_set_editor(self) -> None:
+        """Leert Name-Feld und execution_order-Liste des Set-Editors."""
+        self._current_set_id = None
+        if self.edit_set_name:
+            self.edit_set_name.clear()
+        if self.list_execution_order:
+            self.list_execution_order.clear()
+
+    @Slot(int)
+    def _on_set_selected(self, index: int) -> None:
+        """Lädt das im Dropdown gewählte Set in den Editor."""
+        if index < 0 or not self.combo_set:
+            return
+        set_id = self.combo_set.itemData(index)
+        if not set_id:
+            return
+        definition = self.set_repo.get_set(set_id)
+        if definition:
+            self.load_set_into_editor(definition)
+            self.log(f"Set geladen: {set_id}")
+
+    def load_set_into_editor(self, definition: Dict[str, Any]) -> None:
+        """Überträgt eine ServiceSetDefinition in Name-Feld + execution_order-Liste."""
+        self._current_set_id = definition.get("set_id")
+        if self.edit_set_name:
+            self.edit_set_name.setText(definition.get("display_name") or "")
+        if self.list_execution_order:
+            self.list_execution_order.clear()
+            services = definition.get("services") or {}
+            for iid in (definition.get("execution_order") or []):
+                cfg = services.get(iid, {})
+                plugin_id = cfg.get("plugin_id", "?")
+                item = QListWidgetItem(f"{iid}  [{plugin_id}]")
+                item.setData(Qt.UserRole, iid)
+                item.setData(Qt.UserRole + 1, plugin_id)
+                self.list_execution_order.addItem(item)
+
+    def collect_current_order(self) -> list:
+        """Liefert die instance_ids aus der Liste (aktuelle execution_order)."""
+        if not self.list_execution_order:
+            return []
+        return [
+            self.list_execution_order.item(i).data(Qt.UserRole)
+            for i in range(self.list_execution_order.count())
+        ]
+
+    @Slot()
+    def move_order_item(self, delta: int) -> None:
+        """Verschiebt das markierte Listenelement um delta (-1 = hoch, +1 = runter)."""
+        lw = self.list_execution_order
+        if not lw:
+            return
+        row = lw.currentRow()
+        if row < 0:
+            return
+        new_row = row + delta
+        if new_row < 0 or new_row >= lw.count():
+            return
+        item = lw.takeItem(row)
+        lw.insertItem(new_row, item)
+        lw.setCurrentRow(new_row)
+
+    @Slot()
+    def remove_instance(self) -> None:
+        """Entfernt den markierten Service aus der Ausführungs-Reihenfolge."""
+        lw = self.list_execution_order
+        if not lw or lw.currentRow() < 0:
+            return
+        lw.takeItem(lw.currentRow())
+
+    @Slot()
+    def add_instance(self) -> None:
+        """Fügt eine Service-Instanz 'instance_id [plugin_id]' zur Liste hinzu.
+
+        Plugin muss in der PluginRegistry existieren (Default-Params werden
+        beim Speichern eines neuen Sets verwendet). Duplikate werden abgelehnt.
+        """
+        if not self.edit_new_instance or not self.list_execution_order:
+            return
+        text = self.edit_new_instance.text().strip()
+        if not text:
+            return
+        # Formate: "instance_id [plugin_id]", "instance_id:plugin_id" oder "instance_id"
+        import re
+        m = re.match(r"^([\w\-]+)\s*[\[:]\s*([\w\-]+)\s*\]?$", text)
+        if m:
+            iid, plugin_id = m.group(1), m.group(2)
+        else:
+            iid = text
+            plugin_id = text
+
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            PluginRegistry().get(plugin_id)
+        except KeyError:
+            self.log(f"Plugin '{plugin_id}' nicht gefunden (verfügbar: grid_liquidity).")
+            return
+
+        for i in range(self.list_execution_order.count()):
+            if self.list_execution_order.item(i).data(Qt.UserRole) == iid:
+                self.log(f"instance_id '{iid}' existiert bereits.")
+                return
+
+        item = QListWidgetItem(f"{iid}  [{plugin_id}]")
+        item.setData(Qt.UserRole, iid)
+        item.setData(Qt.UserRole + 1, plugin_id)
+        self.list_execution_order.addItem(item)
+        self.edit_new_instance.clear()
+        self.log(f"Service hinzugefügt: {iid} [{plugin_id}]")
+
+    def collect_set_definition(self) -> Dict[str, Any]:
+        """Baut aus dem Editor eine ServiceSetDefinition.
+
+        Für ein geladenes Set werden die services aus der DB übernommen.
+        Für ein NEUES Set werden die services aus den Listeneinträgen
+        aufgebaut (plugin_id + Default-Params aus der Registry).
+        """
+        order = self.collect_current_order()
+        services: Dict[str, Any] = {}
+        if self._current_set_id:
+            existing = self.set_repo.get_set(self._current_set_id) or {}
+            services = dict(existing.get("services") or {})
+
+        if not services:
+            from analytics.features.feature_builder import PluginRegistry
+            registry = PluginRegistry()
+            if self.list_execution_order:
+                for i in range(self.list_execution_order.count()):
+                    item = self.list_execution_order.item(i)
+                    iid = item.data(Qt.UserRole)
+                    plugin_id = item.data(Qt.UserRole + 1)
+                    if not iid or not plugin_id:
+                        continue
+                    try:
+                        plugin = registry.get(plugin_id)
+                        cfg: Dict[str, Any] = {
+                            "plugin_id": plugin_id,
+                            "lookback": 1000,
+                            "params": dict(plugin.default_params),
+                        }
+                    except KeyError:
+                        cfg = {"plugin_id": plugin_id, "lookback": 1000, "params": {}}
+                    services[iid] = cfg
+
+        return {
+            "set_id": self._current_set_id or "",
+            "display_name": self.edit_set_name.text().strip() if self.edit_set_name else "",
+            "execution_order": order,
+            "services": services,
+        }
+
+    @Slot()
+    def save_set(self) -> None:
+        """Speichert das aktive Set über ServiceSetRepository.save_set().
+
+        Leerer Name → automatischer Name aus den instance_ids (z.B. 'grid_1 + prox_1').
+        """
+        definition = self.collect_set_definition()
+        if not definition.get("execution_order"):
+            self.log("Keine Services in der Ausführungs-Reihenfolge – Speichern abgebrochen.")
+            return
+        if not definition.get("services"):
+            self.log("WARNUNG: Set hat keine services-Konfiguration (nur Reihenfolge wird gespeichert).")
+
+        set_id = self.set_repo.save_set(definition)
+        self._current_set_id = set_id
+        self.log(f"Set gespeichert: {set_id}")
+        self.refresh_set_list()
+        if self.combo_set:
+            idx = self.combo_set.findData(set_id)
+            if idx >= 0:
+                self.combo_set.setCurrentIndex(idx)
+
+    @Slot()
+    def delete_set(self) -> None:
+        """Löscht das gewählte Set – mit zwingender QMessageBox-Rückfrage."""
+        if not self.combo_set:
+            return
+        set_id = self.combo_set.currentData()
+        if not set_id:
+            self.log("Kein Set zum Löschen ausgewählt.")
+            return
+        name = self.combo_set.currentText()
+
+        ret = QMessageBox.warning(
+            self,
+            "Set löschen",
+            f"Service-Set '{name}' wirklich löschen?\n"
+            f"Dies kann nicht rückgängig gemacht werden.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ret != QMessageBox.Yes:
+            self.log("Löschen abgebrochen.")
+            return
+
+        if self.set_repo.delete_set(set_id):
+            self.log(f"Set gelöscht: {set_id}")
+        else:
+            self.log(f"Set '{set_id}' nicht gefunden.")
+
+        self._clear_set_editor()
+        self.refresh_set_list()
+
+    @Slot()
+    def execute_set(self) -> None:
+        """Startet den ServiceSetEvaluator für das aktive Set (Hintergrund-Thread)."""
+        definition = self.collect_set_definition()
+        if not definition.get("execution_order"):
+            self.log("Keine Services in der Ausführungs-Reihenfolge.")
+            return
+        if not definition.get("services"):
+            self.log("Set hat keine services-Konfiguration – Ausführung nicht möglich.")
+            return
+        if self._set_run_worker and self._set_run_worker.isRunning():
+            self.log("Set-Ausführung läuft bereits.")
+            return
+
+        symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
+        timeframe = self.combo_tf_set.currentText() if self.combo_tf_set else "H1"
+
+        if self.btn_execute_set:
+            self.btn_execute_set.setEnabled(False)
+        self._set_run_worker = ServiceSetRunWorker(
+            self.set_evaluator, symbol, timeframe, definition, parent=self,
+        )
+        self._set_run_worker.log_message.connect(self.log)
+        self._set_run_worker.run_finished.connect(self._on_set_run_finished)
+        self._set_run_worker.run_failed.connect(self._on_set_run_failed)
+        self._set_run_worker.start()
+
+    @Slot(str, int)
+    def _on_set_run_finished(self, set_id: str, count: int) -> None:
+        if self.btn_execute_set:
+            self.btn_execute_set.setEnabled(True)
+        self.log(f"Set-Ausführung abgeschlossen: {count} Services.")
+
+    @Slot(str, str)
+    def _on_set_run_failed(self, set_id: str, error: str) -> None:
+        if self.btn_execute_set:
+            self.btn_execute_set.setEnabled(True)
+        self.log(f"FEHLER bei Set-Ausführung: {error}")
+
     def closeEvent(self, event):
         # PersistentWindow.save_state() wird in super().closeEvent gerufen
         if self.scanner and self.scanner.isRunning():
             self.scanner.stop()
             self.scanner.wait(2000)
+        if self._set_run_worker and self._set_run_worker.isRunning():
+            self._set_run_worker.wait(2000)
         self._elapsed_timer.stop()
         super().closeEvent(event)
 
@@ -12092,19 +12496,252 @@ class SignalDefinition(ABC):
 
 --------------------------------------------------
 
+### DATEI: analytics/engine/service_models.py
+```py
+# analytics/engine/service_models.py
+"""
+Phase 13 Schritt 2 – Service-Set-Datenmodell (TypedDicts).
+
+Diese Strukturen sind JSON-konform und werden direkt (als JSON) vom
+ServiceSetRepository in app_data.duckdb persistiert. Bewusst KEINE
+Dataclasses – der ServiceSetEvaluator (Schritt 3) und die UI (Schritte 4/5)
+arbeiten auf denselben Dict-Strukturen wie die JSON-Speicherung.
+
+Multi-Use-Prinzip: Ein Plugin (z.B. grid_lines) kann MEHRFACH in einem Set
+vorkommen. Jede Nutzung erhält eine eindeutige instance_id (z.B. grid_1,
+grid_2). execution_order bestimmt die Ausführungs-Reihenfolge, depends_on
+deklariert explizit, welche instance_ids der Service aus dem shared_state
+liest (Service→Service-Abhängigkeit).
+"""
+
+from typing import Any, Dict, List, Optional, TypedDict
+
+
+class ServiceInstanceConfig(TypedDict, total=False):
+    """Konfiguration einer einzelnen Service-Instanz innerhalb eines Sets.
+
+    Attribute:
+        plugin_id:  Dauerhaft stabile Plugin-ID (z.B. 'grid_lines', 'proximity').
+        lookback:   Scan-Fenster über die Historie (Anzahl Bars, df.tail(lookback)).
+        params:     Plugin-Parameter (werden gegen das parameter_schema validiert).
+        depends_on: Optional. instance_ids, deren shared_state-Einträge dieser
+                    Service liest (muss früher in execution_order stehen).
+    """
+    plugin_id: str
+    lookback: int
+    params: Dict[str, Any]
+    depends_on: Optional[List[str]]
+
+
+class ServiceSetDefinition(TypedDict, total=False):
+    """Vollständige Definition eines Service-Sets (JSON-konform).
+
+    Beispiel (Roadmap Phase 13 §2):
+    {
+      "set_id": "uuid-oder-name",
+      "display_name": "Mein Scalper",
+      "execution_order": ["grid_1", "prox_1", "ema_1"],
+      "services": {
+        "grid_1": {"plugin_id": "grid_lines", "lookback": 1000,
+                   "params": {"step_size": 0.5, "steps_around": 4, "custom_levels": []}},
+        "prox_1": {"plugin_id": "proximity", "lookback": 10000,
+                   "depends_on": ["grid_1"],
+                   "params": {"visit_pct": 0.05, "time_window_mins": 5}}
+      }
+    }
+    """
+    set_id: str                      # Eindeutige ID (uuid oder Name)
+    display_name: str                # Anzeigename (leer → Auto-Name aus instance_ids)
+    execution_order: List[str]       # Ausführungs-Reihenfolge der instance_ids
+    services: Dict[str, ServiceInstanceConfig]  # instance_id → Konfiguration
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/engine/service_set_repository.py
+```py
+# analytics/engine/service_set_repository.py
+"""
+Phase 13 Schritt 2 – ServiceSetRepository.
+
+Kapselt das Laden/Speichern von Service-Sets in einer eigenen Tabelle
+`service_sets` in app_data.duckdb. Der StateManager wird NICHT angefasst –
+das Repository hält seine Persistenz vollständig selbst.
+
+Tabelle service_sets:
+    set_id        VARCHAR PRIMARY KEY
+    display_name  VARCHAR
+    definition    JSON (vollständige ServiceSetDefinition)
+    updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+
+Pflicht-API (Roadmap §Schritt 2.2):
+    save_set()   – speichert/überschreibt ein Set (Upsert); generiert bei
+                   leerem display_name einen Default-Namen aus instance_ids
+                   (z.B. "grid_1 + prox_1"). Liefert die set_id zurück.
+    get_set()    – lädt eine Definition per set_id (oder None).
+    list_sets()  – liefert ALLE gespeicherten Sets (Quelle für die
+                   Set-Dropdowns im Prop-/Service-Fenster).
+    delete_set() – entfernt ein Set sauber (liefert bool).
+"""
+
+import json
+import os
+import uuid
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from db_service import DbPool, _parse_json_field
+
+# Projekt-Root = 3 Ebenen über dieser Datei (engine/ → analytics/ → Projekt-Root)
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+APP_DB_PATH = str(BASE_DIR / "data" / "app_data.duckdb")
+
+
+class ServiceSetRepository:
+    """Persistenz-Layer für Service-Sets (eigene Tabelle in app_data.duckdb)."""
+
+    def __init__(self, db_path: str = APP_DB_PATH) -> None:
+        self.db_path = db_path
+        self._init_db()
+
+    # -------------------------------------------------------------------------
+    # Interna
+    # -------------------------------------------------------------------------
+    def _get_connection(self) -> Any:
+        return DbPool.get(self.db_path)
+
+    def _init_db(self) -> None:
+        """Legt die Tabelle service_sets an (lazy, idempotent)."""
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        con = self._get_connection()
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS service_sets (
+                set_id       VARCHAR PRIMARY KEY,
+                display_name VARCHAR,
+                definition   JSON NOT NULL,
+                updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
+    @staticmethod
+    def _default_display_name(definition: Dict[str, Any]) -> str:
+        """Default-Name aus den instance_ids der execution_order.
+
+        Beispiel: execution_order=["grid_1", "prox_1"] → "grid_1 + prox_1".
+        Nur instance_ids, die auch in services existieren, werden verwendet.
+        """
+        order = definition.get("execution_order") or []
+        services = definition.get("services") or {}
+        names = [iid for iid in order if iid in services]
+        if not names:
+            names = list(services.keys())
+        return " + ".join(names) if names else "Unbenanntes Set"
+
+    # -------------------------------------------------------------------------
+    # Pflicht-API
+    # -------------------------------------------------------------------------
+    def save_set(self, definition: Dict[str, Any]) -> str:
+        """Speichert ein Service-Set (Upsert) und liefert die set_id zurück.
+
+        - set_id leer → wird als uuid4-hex generiert.
+        - display_name leer → Default-Name aus instance_ids (z.B. 'grid_1 + prox_1').
+        - Gleiche set_id überschreibt die bestehende Zeile (kein Duplikat).
+        """
+        set_id = str(definition.get("set_id") or uuid.uuid4().hex)
+        display_name = str(definition.get("display_name") or "").strip()
+        if not display_name:
+            display_name = self._default_display_name(definition)
+
+        payload = {
+            "set_id": set_id,
+            "display_name": display_name,
+            "execution_order": definition.get("execution_order", []),
+            "services": definition.get("services", {}),
+        }
+
+        con = self._get_connection()
+        con.execute("""
+            INSERT INTO service_sets (set_id, display_name, definition, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT (set_id) DO UPDATE SET
+                display_name = EXCLUDED.display_name,
+                definition   = EXCLUDED.definition,
+                updated_at   = EXCLUDED.updated_at
+        """, [set_id, display_name, json.dumps(payload)])
+        return set_id
+
+    def get_set(self, set_id: str) -> Optional[Dict[str, Any]]:
+        """Lädt eine Service-Set-Definition per set_id (oder None)."""
+        con = self._get_connection()
+        res = con.execute(
+            "SELECT set_id, display_name, definition FROM service_sets WHERE set_id = ?",
+            [set_id],
+        ).fetchone()
+        if not res:
+            return None
+        db_set_id, db_display_name, definition_json = res
+        definition = _parse_json_field(definition_json) or {}
+        # DB-Spalten sind die Single Source of Truth für set_id/display_name
+        definition["set_id"] = str(db_set_id)
+        if not definition.get("display_name"):
+            definition["display_name"] = db_display_name or ""
+        return definition
+
+    def list_sets(self) -> List[Dict[str, Any]]:
+        """Liefert ALLE gespeicherten Service-Sets (volle Definitionen).
+
+        Quelle für die Set-Dropdowns im Prop-/Service-Fenster. Deterministisch
+        nach updated_at sortiert (älteste zuerst, analog load_all_instances).
+        """
+        con = self._get_connection()
+        rows = con.execute(
+            "SELECT set_id, display_name, definition FROM service_sets ORDER BY updated_at ASC"
+        ).fetchall()
+        sets: List[Dict[str, Any]] = []
+        for db_set_id, db_display_name, definition_json in rows:
+            definition = _parse_json_field(definition_json) or {}
+            definition["set_id"] = str(db_set_id)
+            if not definition.get("display_name"):
+                definition["display_name"] = db_display_name or ""
+            sets.append(definition)
+        return sets
+
+    def delete_set(self, set_id: str) -> bool:
+        """Entfernt ein Set sauber. Liefert True, wenn eine Zeile existierte."""
+        con = self._get_connection()
+        res = con.execute(
+            "SELECT COUNT(*) FROM service_sets WHERE set_id = ?", [set_id]
+        ).fetchone()
+        exists = bool(res and res[0] and res[0] > 0)
+        if exists:
+            con.execute("DELETE FROM service_sets WHERE set_id = ?", [set_id])
+        return exists
+
+```
+
+--------------------------------------------------
+
 ### DATEI: analytics/engine/set_evaluator.py
 ```py
 # analytics/engine/set_evaluator.py
 """
 Set-Evaluator – Kombiniert mehrere Signale zu einem gewichteten Gesamt-Score.
 Unterstützt gewichtete Summen mit Schwellenwert (Threshold).
+
+Phase 13 Schritt 3: Zusätzlich enthält dieses Modul den NEUEN
+ServiceSetEvaluator (Service-Pipeline). Der bestehende SetEvaluator
+(Signal-Sets) bleibt UNVERÄNDERT und läuft parallel weiter.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import replace
+from typing import Any, Dict, Optional
 import pandas as pd
 import json
 
 from analytics.engine.base_definition import SignalDefinition
+from analytics.features.plugins.base_plugin import PluginContext
+from analytics.features.feature_builder import PluginExecutor
 
 
 class SetEvaluator:
@@ -12207,6 +12844,146 @@ class SetEvaluator:
             config["configuration"] = json.loads(config["configuration"])
 
         return self.evaluate_set(config["configuration"], df_features)
+
+
+# ==============================================================================
+# Phase 13 Schritt 3: ServiceSetEvaluator (Service-Pipeline)
+# ------------------------------------------------------------------------------
+# Führt Service-Sets (ServiceSetDefinition, siehe service_models.py) in
+# execution_order aus. Der bestehende SetEvaluator (oben, Signal-Sets) bleibt
+# UNVERÄNDERT und läuft parallel weiter.
+#
+# Kernregeln (Roadmap Phase 13 §3.2):
+#   - df.tail(lookback) je Service (exakter Zuschnitt).
+#   - shared_state ist mutable, aber strikt per instance_id-Namespace isoliert:
+#     context.shared_state[self.instance_id] ist les-/schreibbar; der Evaluator
+#     legt zusätzlich das Ergebnis unter der instance_id ab, falls der Service
+#     seinen Namespace nicht selbst beschrieben hat.
+#   - Abhängigkeiten (depends_on) werden VOR der Ausführung validiert:
+#     (1) statisch: alle depends_on-IDs müssen früher in execution_order stehen;
+#     (2) runtime:  deren shared_state-Einträge müssen nach deren Ausführung
+#                   vorhanden sein (sonst Fail-Fast).
+#   - Fail-Fast: Bricht ein Service mit Exception ab, wird die Exception als
+#     ServiceSetExecutionError geloggt und die restliche Pipeline übersprungen.
+# ==============================================================================
+
+
+class ServiceSetExecutionError(Exception):
+    """Fail-Fast: Ein Service in der Service-Pipeline ist fehlgeschlagen."""
+
+
+class ServiceSetEvaluator:
+    """Sichere Ausführung einer Service-Pipeline mit Namespace-Isolation."""
+
+    def __init__(self, executor: Optional[PluginExecutor] = None) -> None:
+        self.executor = executor or PluginExecutor()
+
+    # -------------------------------------------------------------------------
+    # Pipeline-Ausführung
+    # -------------------------------------------------------------------------
+    def execute_set(
+        self,
+        set_definition: Dict[str, Any],
+        df: pd.DataFrame,
+        context: Optional[PluginContext] = None,
+    ) -> Dict[str, Any]:
+        """Führt alle Services nacheinander in execution_order aus.
+
+        Args:
+            set_definition: ServiceSetDefinition (set_id/display_name werden
+                hier nicht benötigt – nur execution_order + services).
+            df: OHLCV-DataFrame. Jeder Service bekommt exakt df.tail(lookback).
+            context: Optionaler PluginContext. Wenn None, wird ein frischer
+                Context mit mode='batch' erzeugt.
+
+        Returns:
+            Dict instance_id -> FeatureCalculateResult. Jedes Ergebnis ist
+            zusätzlich unter context.shared_state[instance_id] abgelegt
+            (Namespace-isoliert), sofern der Service seinen Namespace nicht
+            selbst beschrieben hat.
+
+        Raises:
+            ValueError: Ungültige execution_order / Abhängigkeits-Verletzung
+                (statisch ODER runtime: fehlender shared_state-Eintrag).
+            ServiceSetExecutionError: Fail-Fast bei Service-Exception.
+        """
+        if df is None or df.empty:
+            raise ValueError("execute_set: df ist None oder leer")
+
+        execution_order = list(set_definition.get("execution_order") or [])
+        services = dict(set_definition.get("services") or {})
+
+        if not execution_order:
+            raise ValueError("execute_set: execution_order ist leer")
+
+        missing = [iid for iid in execution_order if iid not in services]
+        if missing:
+            raise ValueError(
+                f"execute_set: instance_ids fehlen in 'services': {missing}")
+
+        if context is None:
+            context = PluginContext(mode="batch")
+
+        # --- Statische Abhängigkeits-Validierung VOR der Ausführung ----------
+        position = {iid: idx for idx, iid in enumerate(execution_order)}
+        for iid, cfg in services.items():
+            for dep in (cfg.get("depends_on") or []):
+                if dep not in position:
+                    raise ValueError(
+                        f"execute_set: Service '{iid}' depends_on '{dep}', "
+                        f"das nicht in execution_order existiert")
+                if position[dep] >= position[iid]:
+                    raise ValueError(
+                        f"execute_set: Abhängigkeits-Verletzung – Service "
+                        f"'{iid}' depends_on '{dep}', aber '{dep}' steht nicht "
+                        f"VOR '{iid}' in execution_order (nachgelagerte Referenz)")
+
+        # --- Pipeline-Ausführung (Fail-Fast) ---------------------------------
+        results: Dict[str, Any] = {}
+        for iid in execution_order:
+            cfg = services[iid]
+            plugin_id = cfg["plugin_id"]
+            lookback = int(cfg.get("lookback") or len(df))
+            params = dict(cfg.get("params") or {})
+
+            # Runtime-Check: abhängige shared_state-Einträge müssen nach deren
+            # Ausführung vorhanden sein (sonst Fail-Fast VOR diesem Service).
+            for dep in (cfg.get("depends_on") or []):
+                if dep not in context.shared_state:
+                    raise ValueError(
+                        f"execute_set: Service '{iid}' erwartet "
+                        f"shared_state['{dep}'], aber der Eintrag fehlt "
+                        f"(abhängiger Service lief nicht oder schrieb nichts)")
+
+            # Exakter Zuschnitt auf den Service-lookback
+            service_df = df.tail(lookback)
+
+            # Context je Service: instance_id + depends_on setzen (Namespace).
+            # replace() erzeugt eine flache Kopie – shared_state (dict) bleibt
+            # DASSELBE Objekt, ist also über alle Services hinweg sichtbar.
+            service_ctx = replace(
+                context,
+                instance_id=iid,
+                depends_on=list(cfg.get("depends_on") or []),
+            )
+
+            try:
+                result = self.executor.execute(
+                    plugin_id, service_df, params, context=service_ctx)
+            except Exception as e:
+                raise ServiceSetExecutionError(
+                    f"execute_set: Service '{iid}' (plugin '{plugin_id}') "
+                    f"fehlgeschlagen – Pipeline abgebrochen: {e}") from e
+
+            # Namespace-Isolation: Ergebnis unter der instance_id ablegen.
+            # Hat der Service seinen Namespace bereits selbst beschrieben
+            # (z.B. GridLinesService schreibt Linienliste), wird NICHT
+            # überschrieben – die Linien bleiben für abhängige Services lesbar.
+            if iid not in context.shared_state:
+                context.shared_state[iid] = result
+            results[iid] = result
+
+        return results
 
 ```
 
@@ -13028,7 +13805,7 @@ VERBINDLICHE ENTSCHEIDUNGEN (Roadmap Phase 12):
    Implementierung, Parallelbetrieb). Dieses Plugin ist die Neu-Implementierung.
 """
 
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 import numpy as np
 import pandas as pd
@@ -13092,6 +13869,45 @@ class GridLiquidityFeature(PluginFeature):
             "description": "Erkennt Preisnähe zu Grid-Leveln inkl. Custom Levels & Zeitfenstern",
             "author": "PyTrader AI",
             "tags": ["grid", "liquidity", "proximity"],
+        }
+
+    # Phase 13 Schritt 5: Darstellungs-Reihenfolge & Label-Namen liegen AN DEN
+    # ANFANG der Plugin-Definition (Single Source of Truth fuer das Prop-Fenster,
+    # NICHT mehr im Chart-Adapter). Reihenfolge: Indi-Props (Sichtbarkeit, Farben)
+    # zuerst, darunter die Service-Props, expert-Felder am Ende.
+
+    @property
+    def parameter_order(self) -> List[str]:
+        return [
+            # Reine Indi-Props (oberhalb der Trennlinie)
+            "show_lines", "show_circles",
+            "line_color", "circle_color_std", "circle_color_active",
+            # Service-Props (Berechnung)
+            "grid_step", "proximity_threshold",
+            "use_time_filter", "time_window_mins",
+            # Expert-Felder (Custom Levels, ausklappbar)
+            "prox_level1", "prox_level2", "prox_level3",
+            "prox_level4", "prox_level5", "prox_level6",
+        ]
+
+    @property
+    def param_labels(self) -> Dict[str, str]:
+        return {
+            "grid_step": "Rasterabstand",
+            "proximity_threshold": "Toleranz",
+            "use_time_filter": "Time Filter aktiv",
+            "time_window_mins": "Time Filter Minuten (0/30)",
+            "line_color": "Linien-Farbe",
+            "circle_color_std": "Std-Hit-Farbe (im Fenster)",
+            "circle_color_active": "Aktiv-Hit-Farbe (ausserhalb)",
+            "show_lines": "Linien anzeigen",
+            "show_circles": "Circles anzeigen",
+            "prox_level1": "Level 1",
+            "prox_level2": "Level 2",
+            "prox_level3": "Level 3",
+            "prox_level4": "Level 4",
+            "prox_level5": "Level 5",
+            "prox_level6": "Level 6",
         }
 
     @property
@@ -13283,6 +14099,12 @@ class PluginContext:
     timestamp: Optional[int] = None  # epoch-Sekunden des Live-Ticks / der letzten Bar
     shared_state: Dict[str, Any] = field(default_factory=dict)
     settings: Optional[AppSettings] = None  # Kopie (kein globaler Zugriff)
+    # Phase 13 Schritt 3: Der ServiceSetEvaluator setzt diese Felder je
+    # Service-Aufruf (instance_id = Namespace im shared_state, depends_on =
+    # instance_ids, deren shared_state-Einträge der Service liest). Optional
+    # und abwärtskompatibel – Direkt-Aufrufe (Schritt 1) bleiben unverändert.
+    instance_id: Optional[str] = None
+    depends_on: Optional[List[str]] = None
 
     def __post_init__(self) -> None:
         # Settings werden als Kopie übergeben – mutieren der Ursprungs-Instanz
@@ -13421,6 +14243,39 @@ class PluginFeature(ABC):
         pass
 
     @property
+    def base_parameter_schema(self) -> Dict[str, ParameterSchema]:
+        """Basis-Parameter, die für ALLE Services gelten (Trading & Live).
+
+        Phase 13 Schritt 5: Der lookback ist das Scan-Fenster jeder
+        Service-Instanz (ServiceInstanceConfig.lookback). Er wird im
+        Expert-Bereich des Prop-Fensters angezeigt und ist für jeden Service
+        einzeln einstellbar. Was in den Expert-Bereich kommt, wird ALSO an den
+        Parametern der (Service-)Definition angegeben – hier in der
+        Basisklasse per 'expert': True. Plugins können weitere expert-Parameter
+        in ihrem eigenen parameter_schema markieren.
+        """
+        return {
+            "lookback": {
+                "type": "int",
+                "default": 1000,
+                "min": 100,
+                "max": 100000,
+                "step": 50,
+                "description": "Lookback (Scan-Fenster)",
+                "expert": True,
+            },
+        }
+
+    def full_parameter_schema(self) -> Dict[str, ParameterSchema]:
+        """Vollständiges Schema: Basis-Parameter (z.B. lookback) + plugin-
+        spezifische Parameter (Definition). Basis gewinnt NICHT – die
+        Plugin-Definition überschreibt den Basis-Eintrag, falls sie denselben
+        Key selbst definiert."""
+        merged = dict(self.base_parameter_schema)
+        merged.update(dict(self.parameter_schema or {}))
+        return merged
+
+    @property
     def parameter_order(self) -> List[str]:
         """Darstellungs-Reihenfolge der Props im Prop-Fenster.
 
@@ -13438,18 +14293,18 @@ class PluginFeature(ABC):
         humanisierter Parameter-Key.
         """
         labels: Dict[str, str] = {}
-        for key, spec in self.parameter_schema.items():
+        for key, spec in self.full_parameter_schema().items():
             desc = spec.get("description", "")
             labels[key] = desc if desc else key.replace("_", " ").title()
         return labels
 
     def is_expert_param(self, key: str) -> bool:
         """True, wenn der Parameter mit expert=True markiert ist (Default: False)."""
-        return bool(self.parameter_schema.get(key, {}).get("expert", False))
+        return bool(self.full_parameter_schema().get(key, {}).get("expert", False))
 
     @property
     def default_params(self) -> Dict[str, Any]:
-        return {k: v["default"] for k, v in self.parameter_schema.items() if "default" in v}
+        return {k: v["default"] for k, v in self.full_parameter_schema().items() if "default" in v}
 
     def validate_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Validiert Eingabeparameter gegen das Schema und setzt Defaults ein.
@@ -14801,7 +15656,8 @@ class PyTraderChartWindow(QMainWindow):
             "active": False, "preset": "Default", "params": dict(plugin.default_params)
         })
         dialog = IndicatorSettingsDialog(plugin, st["params"], st["preset"], self.state_manager,
-                                         lambda p, pr: self._on_indicator_params_updated(ind_id, p, pr), self)
+                                         lambda p, pr: self._on_indicator_params_updated(ind_id, p, pr), self,
+                                         symbol=self.current_symbol, timeframe=self.current_tf)
         self._settings_dialog = dialog
         dialog.finished.connect(lambda: self._on_settings_closed(dialog))
         dialog.show()
@@ -15431,10 +16287,32 @@ if __name__ == "__main__":
 ```py
 """
 chart/indicator_dialog.py - Dynamic Universal Settings Dialog with Inline Layout Support & Strict Type Validation
+
+Phase 13 Schritt 5 (additiv): Plugin-Prop-Fenster mit Expert-Modus & Service-Sets.
+- Plugin-basierte Indikatoren (erkennbar an parameter_schema / plugin_id) erhalten
+  ein NEUES Layout: reine Indi-Props (Sichtbarkeit, Farben) oberhalb einer
+  Trennlinie (QFrame.HLine), darunter die Service-Props mit Set-Auswahl
+  (ServiceSetRepository.list_sets()), QStackedWidget (eine Formular-Seite pro
+  Service) und einem ausklappbaren Expert-Bereich (QGroupBox checkable) mit
+  Plugin-Metadaten (description, author, version).
+- min/max/step werden exakt aus dem ParameterSchema auf QDoubleSpinBox/QSpinBox
+  übertragen; Reihenfolge + Labels kommen aus parameter_order/param_labels der
+  Plugin-/Service-Definition (NICHT mehr aus dem Chart-Adapter).
+- Set-Aktionen: Name vergeben / Speichern / Ausführen (ServiceSetEvaluator im
+  Hintergrund-Thread) / Löschen (zwingend mit QMessageBox-Gegenfrage).
+- Alt-Indikatoren ohne Plugin (z.B. 'grid') behalten das bisherige Layout.
+
+Phase 13 Schritt 5 Punkt 4 (VERBINDLICH): Vollständig dynamische Fenster- &
+Box-Größen – KEINE fixen Pixelwerte. Höhe/Breite des Fensters und aller Boxen
+ergeben sich ausschließlich aus dem Inhalt: Haupt-Layout mit
+setSizeConstraint(QLayout.SetFixedSize), SizePolicies Maximum/Preferred,
+QStackedWidget-Höhe folgt der AKTUELLEN Service-Seite (_ServiceStack),
+kollabierbarer Expert-Bereich mit adjustSize() (4.2–4.7 Implementierungsanweisung).
+
 """
 
-from typing import Any, Dict, Callable, List
-from PySide6.QtCore import Qt
+from typing import Any, Dict, Callable, List, Optional
+from PySide6.QtCore import Qt, QThread, Signal, QSize
 from PySide6.QtWidgets import (
 	QApplication,
 	QCheckBox,
@@ -15442,19 +16320,103 @@ from PySide6.QtWidgets import (
 	QDialog,
 	QDoubleSpinBox,
 	QFormLayout,
+	QFrame,
+	QGridLayout,
+	QGroupBox,
 	QHBoxLayout,
 	QInputDialog,
 	QLabel,
+	QLayout,
 	QLineEdit,
 	QMessageBox,
 	QPushButton,
+	QSizePolicy,
 	QSpinBox,
+	QStackedWidget,
 	QWidget,
 	QVBoxLayout,
 )
 
 from chart.indicators.base_indicator import BaseIndicator
 from state_manager import StateManager
+
+
+class DialogServiceSetRunWorker(QThread):
+	"""Phase 13 Schritt 5: Führt ein Service-Set im Hintergrund aus (Prop-Fenster).
+
+	Lädt OHLCV (Symbol/Timeframe) und ruft ServiceSetEvaluator.execute_set()
+	in einem separaten Thread auf, damit der Dialog nicht blockiert.
+	"""
+
+	run_finished = Signal(str, int)  # set_id, Anzahl erfolgreicher Services
+	run_failed = Signal(str, str)    # set_id, Fehlermeldung
+
+	def __init__(self, evaluator, symbol: str, timeframe: str,
+	             set_definition: Dict[str, Any], parent=None) -> None:
+		super().__init__(parent)
+		self.evaluator = evaluator
+		self.symbol = symbol
+		self.timeframe = timeframe
+		self.set_definition = set_definition
+
+	def run(self) -> None:
+		try:
+			from analytics.features.feature_builder import FeatureBuilder, prepare_plugin_df
+			from analytics.features.plugins.base_plugin import PluginContext
+			from state_manager import StateManager
+
+			settings = StateManager().get_app_settings()
+			fb = FeatureBuilder()
+			df = fb.load_ohlcv(self.symbol, self.timeframe, limit=settings.feature_builder_limit)
+			if df is None or df.empty:
+				self.run_failed.emit(
+					self.set_definition.get("set_id", ""),
+					f"Keine OHLCV-Daten fuer {self.symbol} {self.timeframe}.",
+				)
+				return
+
+			df_plugin = prepare_plugin_df(df)
+			context = PluginContext(
+				symbol=self.symbol,
+				timeframe=self.timeframe,
+				mode="batch",
+				timestamp=int(df_plugin["time"].iloc[-1]) if len(df_plugin) else None,
+				settings=settings,
+			)
+			results = self.evaluator.execute_set(self.set_definition, df_plugin, context=context)
+			self.run_finished.emit(self.set_definition.get("set_id", ""), len(results))
+		except Exception as e:
+			self.run_failed.emit(self.set_definition.get("set_id", ""), str(e))
+
+
+class _ServiceStack(QStackedWidget):
+	"""QStackedWidget mit dynamischer H�he anhand der AKTUELLEN Seite (Punkt 4).
+
+	Der Standard-QStackedWidget liefert als sizeHint das MAXIMUM aller Seiten.
+	Damit bliebe die Box 'Service-Parameter' so hoch wie die h�chste Service-
+	Seite, auch wenn eine k�rzere Seite sichtbar ist (leerer Raum). Diese
+	Variante richtet die H�he exakt nach der aktuell sichtbaren Seite aus -
+	die Box endet immer unter dem letzten Parameter der aktiven Seite.
+	"""
+
+	def sizeHint(self) -> QSize:
+		w = self.currentWidget()
+		if w is not None:
+			return w.sizeHint()
+		return super().sizeHint()
+
+	def minimumSizeHint(self) -> QSize:
+		w = self.currentWidget()
+		if w is not None:
+			return w.minimumSizeHint()
+		return super().minimumSizeHint()
+
+	def setCurrentIndex(self, index: int) -> None:
+		super().setCurrentIndex(index)
+		# Eltern-Layouts informieren, dass sich die Höhe (sizeHint) geändert hat –
+		# auch bei nicht angezeigtem Dialog. Sonst bleibt die Höhe der Box
+		# 'Service-Parameter' auf der höchsten/alten Seite stehen.
+		self.updateGeometry()
 
 
 class IndicatorSettingsDialog(QDialog):
@@ -15470,7 +16432,10 @@ class IndicatorSettingsDialog(QDialog):
 		current_preset_name: str,
 		state_manager: StateManager,
 		on_params_changed_callback: Callable[[Dict[str, Any], str], None],
-		parent=None
+		parent=None,
+		symbol: str = "SILVER",
+		timeframe: str = "H1",
+		service_set_repo: Optional[Any] = None,
 	) -> None:
 		super().__init__(parent)
 
@@ -15480,15 +16445,699 @@ class IndicatorSettingsDialog(QDialog):
 		self.state_manager = state_manager
 		self.on_params_changed_callback = on_params_changed_callback
 
+		# Phase 13 Schritt 5: Service-Set-Verwaltung (lazy)
+		self.symbol = symbol
+		self.timeframe = timeframe
+		self._set_repo = service_set_repo
+		self._set_evaluator = None
+		self._set_run_worker: Optional[DialogServiceSetRunWorker] = None
+		self._current_set_id: Optional[str] = None
+		self._current_set_definition: Optional[Dict[str, Any]] = None
+		self._set_param_controls: Dict[str, QWidget] = {}
+
+		# Plugin-Kontext (nur im Plugin-Modus gesetzt)
+		self.plugin = None
+		self.plugin_schema: Dict[str, Any] = {}
+		self.plugin_order: List[str] = []
+		self.plugin_labels: Dict[str, str] = {}
+
 		self.setWindowTitle(f"Einstellungen - {self.indicator.display_name}")
-		self.setMinimumWidth(440)
 		self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
 
 		self.param_controls: Dict[str, QWidget] = {}
+		# Phase 13 Schritt 5 Punkt 4: Fenster & Boxen sind vollständig dynamisch –
+		# KEINE fixen Pixelwerte für Höhe/Breite. Die Größe ergibt sich allein aus
+		# dem Inhalt (setSizeConstraint(SetFixedSize) am Ende von init_ui).
+		# Während des UI-Aufbaus wird self.adjustSize() übersprungen.
+		self._ui_ready = False
 		self.init_ui()
 
 		# Nicht-modaler Dialog: letzte Position/Groesse wiederherstellen
 		self._restore_geometry()
+
+	# -------------------------------------------------------------------------
+	# Phase 13 Schritt 5: Plugin-Erkennung & Schema-Zugriff
+	# -------------------------------------------------------------------------
+
+	def _get_plugin(self) -> Optional[Any]:
+		"""Liefert das PluginFeature-Objekt (Schema/Metadaten) oder None (Legacy).
+
+		Erkennung: (1) der Indikator IST ein PluginFeature (parameter_schema +
+		plugin_id), oder (2) der Indikator hat eine plugin_id/_plugin_id, ueber
+		die das Plugin aus der PluginRegistry geladen wird.
+		"""
+		if hasattr(self.indicator, "parameter_schema") and hasattr(self.indicator, "plugin_id"):
+			return self.indicator
+		pid = getattr(self.indicator, "_plugin_id", None) or getattr(self.indicator, "plugin_id", None)
+		if pid:
+			try:
+				from analytics.features.feature_builder import PluginRegistry
+				return PluginRegistry().get(pid)
+			except Exception:
+				return None
+		return None
+
+	# -------------------------------------------------------------------------
+	# Service-Set-Repository (lazy – echte DB nur bei Nutzung)
+	# -------------------------------------------------------------------------
+
+	@property
+	def set_repo(self) -> Any:
+		if self._set_repo is None:
+			from analytics.engine.service_set_repository import ServiceSetRepository
+			self._set_repo = ServiceSetRepository()
+		return self._set_repo
+
+	@property
+	def set_evaluator(self) -> Any:
+		if self._set_evaluator is None:
+			from analytics.engine.set_evaluator import ServiceSetEvaluator
+			self._set_evaluator = ServiceSetEvaluator()
+		return self._set_evaluator
+
+	# -------------------------------------------------------------------------
+	# Schema-basierte Control-Erzeugung (Phase 13 Schritt 5)
+	# -------------------------------------------------------------------------
+
+	@staticmethod
+	def _decimal_places(value: Any) -> int:
+		"""Nachkommastellen eines float (fuer QDoubleSpinBox.setDecimals)."""
+		if not isinstance(value, float) or value != value:  # NaN-Schutz
+			return 4
+		s = f"{value:.10f}".rstrip("0")
+		if "." in s:
+			return len(s.split(".")[1])
+		return 0
+
+	@staticmethod
+	def _is_visual_key(key: str) -> bool:
+		"""Konvention fuer reine Indi-Props: Sichtbarkeit (show_*) + Farben (color)."""
+		if key.startswith("show_"):
+			return True
+		if "color" in key.lower():
+			return True
+		return False
+
+	@staticmethod
+	def _human(key: str) -> str:
+		return key.replace("_", " ").title()
+
+	def create_schema_control(self, key: str, val: Any, spec: Dict[str, Any]) -> QWidget:
+		"""Erzeugt ein Eingabe-Widget exakt aus dem ParameterSchema.
+
+		min/max/step werden 1:1 auf QDoubleSpinBox/QSpinBox uebertragen.
+		"""
+		p_type = spec.get("type")
+
+		if p_type == "float":
+			spin = QDoubleSpinBox()
+			spin.setRange(float(spec.get("min", -1e9)), float(spec.get("max", 1e9)))
+			step = spec.get("step")
+			decimals = self._decimal_places(step) if step is not None else self._decimal_places(spec.get("default"))
+			spin.setDecimals(min(6, max(0, decimals)))
+			spin.setSingleStep(float(step) if step is not None else 0.01)
+			try:
+				spin.setValue(float(val))
+			except (TypeError, ValueError):
+				spin.setValue(float(spec.get("default", 0.0)))
+			spin.editingFinished.connect(self.on_param_control_changed)
+			return spin
+
+		if p_type == "int":
+			spin = QSpinBox()
+			spin.setRange(int(spec.get("min", -100000)), int(spec.get("max", 100000)))
+			spin.setSingleStep(int(spec.get("step", 1)))
+			try:
+				spin.setValue(int(val))
+			except (TypeError, ValueError):
+				spin.setValue(int(spec.get("default", 0)))
+			spin.editingFinished.connect(self.on_param_control_changed)
+			return spin
+
+		if p_type == "bool":
+			chk = QCheckBox()
+			chk.setChecked(bool(val))
+			chk.toggled.connect(self.on_param_control_changed)
+			return chk
+
+		if p_type == "choice":
+			combo = QComboBox()
+			options = [str(o) for o in (spec.get("options") or [])]
+			combo.addItems(options)
+			combo.setCurrentText(str(val))
+			combo.currentTextChanged.connect(self.on_param_control_changed)
+			return combo
+
+		# color / str / sonstiges
+		txt = QLineEdit()
+		txt.setText(str(val))
+		txt.editingFinished.connect(self.on_param_control_changed)
+		return txt
+
+	def _ctrl_value(self, ctrl: QWidget) -> Any:
+		"""Liest den aktuellen Wert eines Controls typsicher aus."""
+		if isinstance(ctrl, QCheckBox):
+			return ctrl.isChecked()
+		if isinstance(ctrl, QSpinBox):
+			return ctrl.value()
+		if isinstance(ctrl, QDoubleSpinBox):
+			return ctrl.value()
+		if isinstance(ctrl, QComboBox):
+			return ctrl.currentText()
+		return ctrl.text()
+
+	# -------------------------------------------------------------------------
+	# UI-Aufbau
+	# -------------------------------------------------------------------------
+
+	def init_ui(self) -> None:
+		main_layout = QVBoxLayout(self)
+
+		plugin = self._get_plugin()
+		if plugin is not None:
+			self._init_plugin_ui(main_layout, plugin)
+		else:
+			self._init_legacy_ui(main_layout)
+			# Preset-Verwaltung (Legacy: unten, im eigenen Rahmen)
+			main_layout.addWidget(self._build_preset_group())
+
+		btn_close = QPushButton("Schließen")
+		btn_close.clicked.connect(self.accept)
+		main_layout.addWidget(btn_close)
+
+		# --- Phase 13 Schritt 5 Punkt 4 (VERBINDLICH): Vollständig dynamische
+		# Fenster- & Box-Größen – keine fixen Pixelwerte ---
+		# 4.2.5: Das Fenster schmiegt sich exakt an seinen Inhalt an (kein
+		# leerer Raum unter dem Preset-Block). Beim manuellen Aufziehen bleiben
+		# die Boxen dank AlignTop (4.6) auf ihrer Inhalt-Höhe verankert.
+		main_layout.setSpacing(6)
+		main_layout.setSizeConstraint(QLayout.SetFixedSize)
+		main_layout.setAlignment(Qt.AlignTop)
+
+		self._ui_ready = True
+		self.adjustSize()
+
+	def _init_legacy_ui(self, main_layout: QVBoxLayout) -> None:
+		"""Bisheriges Layout fuer Alt-Indikatoren ohne Plugin-Schema (z.B. 'grid')."""
+		form_layout = QFormLayout()
+		layout_schema = self.indicator.param_layout
+
+		if not layout_schema:
+			layout_schema = list(self.params.keys())
+
+		for item in layout_schema:
+			if isinstance(item, str):
+				key = item
+				if key in self.params:
+					label_text = self.indicator.param_labels.get(key, key.replace("_", " ").title())
+					ctrl = self.create_control_widget(key, self.params[key])
+					self.param_controls[key] = ctrl
+					form_layout.addRow(label_text, ctrl)
+
+			elif isinstance(item, tuple) and len(item) == 2:
+				row_label, keys = item
+				row_layout = QHBoxLayout()
+				row_layout.setSpacing(6)
+
+				for i, key in enumerate(keys):
+					if key in self.params:
+						# Sub-Label nur ab 2. Key, da row_label den ersten abdeckt
+						if i > 0:
+							sub_label = self.indicator.param_labels.get(key, "")
+							if sub_label:
+								row_layout.addWidget(QLabel(sub_label))
+						ctrl = self.create_control_widget(key, self.params[key])
+						self.param_controls[key] = ctrl
+						row_layout.addWidget(ctrl)
+
+				form_layout.addRow(row_label, row_layout)
+
+		main_layout.addLayout(form_layout)
+
+	def _init_plugin_ui(self, main_layout: QVBoxLayout, plugin: Any) -> None:
+		"""Phase 13 Schritt 5: Plugin-Prop-Fenster mit Expert-Modus & Service-Sets.
+
+		Was in den Expert-Bereich kommt, wird an den Parametern der
+		Service-Definition angegeben (expert: True im parameter_schema der
+		Definition, die ganz oben in der Datei steht). Der lookback ist ein
+		Basis-Parameter (base_parameter_schema der Basisklasse) und erscheint
+		dadurch automatisch für JEDES Plugin im Expert-Bereich.
+		"""
+		self.plugin = plugin
+		base_schema = dict(getattr(plugin, "base_parameter_schema", None) or {})
+		full_schema = dict(base_schema)
+		full_schema.update(dict(plugin.parameter_schema or {}))
+		self.plugin_schema = full_schema
+		self.plugin_order = list(getattr(plugin, "parameter_order", None) or plugin.parameter_schema.keys())
+		for key in base_schema:
+			if key not in self.plugin_order:
+				self.plugin_order.append(key)
+		self.plugin_labels = dict(getattr(plugin, "param_labels", None) or {})
+		for key, spec in base_schema.items():
+			self.plugin_labels.setdefault(key, spec.get("description") or self._human(key))
+
+		# --- 1) Grid: Indi-Props + Service-Parameter links; rechts daneben auf
+		# gleicher Höhe 'Service-Set Aktionen' (darunter 'Experten-Optionen') ---
+		# Zeile 0: 'Anzeige & Farben' (links) + Preset-Rahmen (rechts oben).
+		# Zeile 1: 'Service-Parameter' (links) + 'Service-Set Aktionen' mit der
+		# 'Experten-Optionen'-Box direkt darunter (rechts) – die drei
+		# Service-Boxen gehören thematisch zusammen und stehen daher auf
+		# gleicher Höhe (gleiche Grid-Zeile, AlignTop).
+		content_grid = QGridLayout()
+		content_grid.setSpacing(6)
+		left_col = QVBoxLayout()
+		left_col.setAlignment(Qt.AlignTop)
+
+		# --- 1a) Reine Indi-Props (Sichtbarkeit, Farben) oberhalb der Trennlinie ---
+		indi_keys = [k for k in self.plugin_order if self._is_visual_key(k)]
+		if indi_keys:
+			indi_group = QGroupBox("Anzeige & Farben")
+			# Horizontal Expanding -> füllt die Spaltenbreite (identisch mit der
+			# Breite der Box 'Service-Parameter'); vertikal Maximum (Inhalt-Höhe).
+			indi_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+			indi_form = QFormLayout(indi_group)
+			for key in indi_keys:
+				spec = self.plugin_schema.get(key, {})
+				cval = self.params.get(key, spec.get("default"))
+				ctrl = self.create_schema_control(key, cval, spec)
+				self.param_controls[key] = ctrl
+				indi_form.addRow(self.plugin_labels.get(key, self._human(key)), ctrl)
+			left_col.addWidget(indi_group)
+
+			# --- 1b) Trennlinie ---
+			line = QFrame()
+			line.setFrameShape(QFrame.HLine)
+			line.setFrameShadow(QFrame.Sunken)
+			left_col.addWidget(line)
+
+		content_grid.addLayout(left_col, 0, 0, Qt.AlignTop)
+
+		# --- 1c) Service-Parameter-Box (links, Zeile 1) ---
+		svc_group = QGroupBox("Service-Parameter")
+		# 4.2.4: Vertikale Size-Policy = Maximum -> Die Box endet dynamisch
+		# unter dem letzten Parameter (z.B. Level 6) und waechst beim
+		# Vergroessern des Fensters NICHT mit (bleibt auf Inhalt-Hoehe).
+		svc_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+		svc_layout = QVBoxLayout(svc_group)
+
+		set_row = QHBoxLayout()
+		set_row.addWidget(QLabel("Service-Set:"))
+		self.combo_service_set = QComboBox()
+		self.combo_service_set.currentIndexChanged.connect(self._on_service_set_changed)
+		set_row.addWidget(self.combo_service_set)
+		svc_layout.addLayout(set_row)
+
+		svc_row = QHBoxLayout()
+		svc_row.addWidget(QLabel("Service:"))
+		self.combo_service_sel = QComboBox()
+		self.combo_service_sel.currentIndexChanged.connect(self._on_service_selected)
+		svc_row.addWidget(self.combo_service_sel)
+		svc_layout.addLayout(svc_row)
+
+		self.stack_service_forms = _ServiceStack()
+		# 4.4: Das QStackedWidget nutzt Maximum (vertikal), damit die Box
+		# 'Service-Parameter' exakt unter dem letzten Parameter der AKTUELL
+		# sichtbaren Service-Seite endet (kein leerer Raum durch hoechste Seite).
+		self.stack_service_forms.setSizePolicy(
+			QSizePolicy.Expanding, QSizePolicy.Maximum)
+		svc_layout.addWidget(self.stack_service_forms)
+
+		content_grid.addWidget(svc_group, 1, 0, Qt.AlignTop)
+
+		# --- 1d) Rechte Spalte Zeile 0: Preset-Rahmen (rechts oben) ---
+		right_top = QVBoxLayout()
+		right_top.setAlignment(Qt.AlignTop)
+		right_top.addWidget(self._build_preset_group(), 0, Qt.AlignTop)
+		content_grid.addLayout(right_top, 0, 1, Qt.AlignTop)
+
+		# --- 1e) Rechte Spalte Zeile 1: Service-Set Aktionen + Experten-Optionen ---
+		# Direkt auf Höhe der 'Service-Parameter'-Box (gleiche Grid-Zeile 1),
+		# die Expert-Box unmittelbar darunter – thematisch zusammengehörig.
+		right_bottom = QVBoxLayout()
+		right_bottom.setAlignment(Qt.AlignTop)
+
+		# Set-Aktionen: Name / Speichern / Ausführen / Löschen
+		act_group = QGroupBox("Service-Set Aktionen")
+		# Horizontal Expanding -> füllt die rechte Spaltenbreite (wie Preset);
+		# vertikal Maximum -> bleibt auf Inhalt-Höhe (Punkt 4).
+		act_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+		act_layout = QVBoxLayout(act_group)
+
+		name_row = QHBoxLayout()
+		name_row.addWidget(QLabel("Name:"))
+		self.edit_set_name = QLineEdit()
+		name_row.addWidget(self.edit_set_name)
+		act_layout.addLayout(name_row)
+
+		btn_row = QHBoxLayout()
+		self.btn_save_set = QPushButton("💾 Set speichern")
+		self.btn_save_set.clicked.connect(self.save_service_set)
+		btn_row.addWidget(self.btn_save_set)
+		self.btn_execute_set = QPushButton("▶ Set ausführen")
+		self.btn_execute_set.clicked.connect(self.execute_service_set)
+		btn_row.addWidget(self.btn_execute_set)
+		self.btn_delete_set = QPushButton("❌ Set löschen")
+		self.btn_delete_set.clicked.connect(self.delete_service_set)
+		btn_row.addWidget(self.btn_delete_set)
+		act_layout.addLayout(btn_row)
+
+		right_bottom.addWidget(act_group, 0, Qt.AlignTop)
+
+		# Expert-Bereich (ausklappbar) mit Plugin-Metadaten
+		self.group_expert = QGroupBox("Experten-Optionen")
+		self.group_expert.setCheckable(True)
+		self.group_expert.setChecked(False)
+		# Horizontal Expanding -> füllt die rechte Spaltenbreite; vertikal
+		# Maximum -> kollabiert beim Zuklappen auf die Titelzeile (Punkt 4).
+		self.group_expert.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+		expert_layout = QVBoxLayout(self.group_expert)
+
+		meta = dict(plugin.metadata or {})
+		meta_text = (
+			f"<b>{meta.get('display_name', plugin.plugin_id)}</b> "
+			f"v{getattr(plugin, 'version', '1.0.0')}<br>"
+			f"{meta.get('description', '')}<br>"
+			f"Autor: {meta.get('author', '')}"
+		)
+		meta_label = QLabel(meta_text)
+		meta_label.setWordWrap(True)
+		expert_layout.addWidget(meta_label)
+
+		expert_form = QFormLayout()
+		expert_keys = [
+			k for k in self.plugin_order
+			if self.plugin_schema.get(k, {}).get("expert")
+		]
+		for key in expert_keys:
+			spec = self.plugin_schema.get(key, {})
+			cval = self.params.get(key, spec.get("default"))
+			ctrl = self.create_schema_control(key, cval, spec)
+			self.param_controls[key] = ctrl
+			expert_form.addRow(self.plugin_labels.get(key, self._human(key)), ctrl)
+		expert_layout.addLayout(expert_form)
+
+		# 4.4: Ausklappbarer Sub-Bereich – beim Abwählen werden die Kinder
+		# ausgeblendet und das Fenster nahtlos auf die neue Höhe verkleinert.
+		self._setup_collapsible(self.group_expert)
+
+		right_bottom.addWidget(self.group_expert, 0, Qt.AlignTop)
+
+		content_grid.addLayout(right_bottom, 1, 1, Qt.AlignTop)
+
+		# Linke Spalte bekommt beim manuellen Aufziehen den zusätzlichen Raum
+		# (beide linken Boxen wachsen horizontal mit, gleiche Breite).
+		content_grid.setColumnStretch(0, 1)
+		main_layout.addLayout(content_grid)
+
+		# Initiale Set-Liste befüllen (list_sets() als Quelle, Roadmap §5.2)
+		self.refresh_service_set_list()
+
+	# -------------------------------------------------------------------------
+	# Service-Set-UI (Phase 13 Schritt 5)
+	# -------------------------------------------------------------------------
+
+	def _setup_collapsible(self, group: QGroupBox) -> None:
+		"""Macht eine ausklappbare QGroupBox wirklich kollabierbar (Punkt 4).
+
+		Beim Abwählen werden die Kinder ausgeblendet und self.adjustSize()
+		verkleinert das Prop-Fenster nahtlos auf die neue Inhalt-Höhe; beim
+		Aufklappen wird es entsprechend vergrößert (4.4 Implementierungsanweisung).
+		"""
+		def _toggle(checked: bool) -> None:
+			for child in group.findChildren(QWidget):
+				child.setVisible(checked)
+			if self._ui_ready:
+				self._reflow()
+		group.toggled.connect(_toggle)
+		# Initialzustand anwenden (ausgeklappt/versteckt)
+		_toggle(group.isChecked())
+
+	def _reflow(self) -> None:
+		"""Erzwingt die Neuberechnung des Layouts (dynamische Größe, Punkt 4).
+
+		Bei einem nicht angezeigten Dialog werden Show-Events nicht zugestellt,
+		wodurch das Haupt-Layout sonst seinen alten sizeHint behält. Durch
+		explizites invalidate() wird die Gesamthöhe immer frisch berechnet.
+		"""
+		lay = self.layout()
+		if lay is not None:
+			lay.invalidate()
+		self.adjustSize()
+
+	def refresh_service_set_list(self) -> None:
+		"""Befüllt das Set-Dropdown aus ServiceSetRepository.list_sets()."""
+		if not self.combo_service_set:
+			return
+		current = self.combo_service_set.currentData()
+
+		self.combo_service_set.blockSignals(True)
+		self.combo_service_set.clear()
+		self.combo_service_set.addItem("- kein Set -", "")
+		for s in self.set_repo.list_sets():
+			label = s.get("display_name") or s.get("set_id") or "Unbenannt"
+			self.combo_service_set.addItem(label, s.get("set_id"))
+		if current:
+			idx = self.combo_service_set.findData(current)
+			if idx >= 0:
+				self.combo_service_set.setCurrentIndex(idx)
+		self.combo_service_set.blockSignals(False)
+		self._on_service_set_changed()
+
+	def _on_service_set_changed(self) -> None:
+		"""Lädt das gewählte Set in den Editor + baut die Service-Seiten neu."""
+		set_id = self.combo_service_set.currentData() if self.combo_service_set else ""
+		self._current_set_id = set_id or None
+		self._current_set_definition = None
+
+		if set_id:
+			definition = self.set_repo.get_set(set_id)
+			if definition:
+				self._current_set_definition = definition
+				if self.edit_set_name:
+					self.edit_set_name.setText(definition.get("display_name") or "")
+		else:
+			if self.edit_set_name:
+				self.edit_set_name.clear()
+
+		if self.combo_service_sel:
+			self.combo_service_sel.blockSignals(True)
+			self.combo_service_sel.clear()
+			if self._current_set_definition:
+				services = self._current_set_definition.get("services") or {}
+				for iid in (self._current_set_definition.get("execution_order") or []):
+					pid = services.get(iid, {}).get("plugin_id", "?")
+					self.combo_service_sel.addItem(f"{iid} [{pid}]", iid)
+			self.combo_service_sel.blockSignals(False)
+
+		self._rebuild_service_stack()
+
+	def _on_service_selected(self, index: int) -> None:
+		"""Wechselt die QStackedWidget-Seite (Seite 0 = aktives Plugin)."""
+		if not self.stack_service_forms:
+			return
+		self.stack_service_forms.setCurrentIndex(index + 1 if index >= 0 else 0)
+		# 4.4: Fenster/Box auf die neue Service-Seite nachziehen (dynamische Höhe)
+		if self._ui_ready:
+			self._reflow()
+
+	def _rebuild_service_stack(self) -> None:
+		"""Baut das QStackedWidget neu: Seite 0 = aktive Service-Parameter des
+		Plugins, weitere Seiten = Services des gewählten Sets."""
+		if not self.stack_service_forms:
+			return
+		stack = self.stack_service_forms
+		while stack.count():
+			w = stack.widget(0)
+			stack.removeWidget(w)
+			w.deleteLater()
+		self._set_param_controls = {}
+
+		# Seite 0: Service-Props des aktiven Plugin-Indikators (self.params)
+		page0 = QWidget()
+		form0 = QFormLayout(page0)
+		for key in self.plugin_order:
+			spec = self.plugin_schema.get(key, {})
+			if self._is_visual_key(key) or spec.get("expert"):
+				continue
+			cval = self.params.get(key, spec.get("default"))
+			ctrl = self.create_schema_control(key, cval, spec)
+			self.param_controls[key] = ctrl
+			form0.addRow(self.plugin_labels.get(key, self._human(key)), ctrl)
+		stack.addWidget(page0)
+
+		# Seiten fuer die Services des gewählten Sets (pro Service eine Seite)
+		definition = self._current_set_definition
+		if definition:
+			services = definition.get("services") or {}
+			for iid in (definition.get("execution_order") or []):
+				cfg = services.get(iid, {})
+				pid = cfg.get("plugin_id", "")
+				page = QWidget()
+				vl = QVBoxLayout(page)
+				pf = QFormLayout()
+				vl.addLayout(pf)
+				try:
+					from analytics.features.feature_builder import PluginRegistry
+					sp = PluginRegistry().get(pid)
+					sp_base = dict(getattr(sp, "base_parameter_schema", None) or {})
+					sp_schema = dict(sp_base)
+					sp_schema.update(dict(sp.parameter_schema or {}))
+					sp_labels = dict(getattr(sp, "param_labels", None) or {})
+					for key, spec in sp_base.items():
+						sp_labels.setdefault(key, spec.get("description") or self._human(key))
+					sp_order = list(getattr(sp, "parameter_order", None) or sp.parameter_schema.keys())
+					for key in sp_base:
+						if key not in sp_order:
+							sp_order.append(key)
+					sp_params = dict(cfg.get("params") or {})
+					# Normale (Nicht-Expert-)Parameter
+					for key in sp_order:
+						spec = sp_schema.get(key, {})
+						if spec.get("expert"):
+							continue
+						cval = sp_params.get(key, spec.get("default"))
+						ctrl = self.create_schema_control(key, cval, spec)
+						self._set_param_controls[f"{iid}:{key}"] = ctrl
+						pf.addRow(sp_labels.get(key, self._human(key)), ctrl)
+					# Expert-Unterbereich je Service (lookback + expert-Parameter)
+					expert_keys = [k for k in sp_order if sp_schema.get(k, {}).get("expert")]
+					if expert_keys:
+						exp_grp = QGroupBox("Experten-Optionen")
+						exp_grp.setCheckable(True)
+						exp_grp.setChecked(False)
+						ef = QFormLayout(exp_grp)
+						for key in expert_keys:
+							spec = sp_schema.get(key, {})
+							if key == "lookback":
+								# lookback ist die Service-Instanz-Einstellung
+								# (ServiceInstanceConfig.lookback), nicht ein
+								# Plugin-param.
+								cval = cfg.get("lookback", spec.get("default"))
+							else:
+								cval = sp_params.get(key, spec.get("default"))
+							ctrl = self.create_schema_control(key, cval, spec)
+							self._set_param_controls[f"{iid}:{key}"] = ctrl
+							ef.addRow(sp_labels.get(key, self._human(key)), ctrl)
+						vl.addWidget(exp_grp)
+						# 4.4: Auch der Service-Expert-Bereich ist ausklappbar
+						# (Kinder ein-/ausblenden + adjustSize auf dem Dialog).
+						self._setup_collapsible(exp_grp)
+				except Exception:
+					pf.addRow(QLabel(f"Plugin '{pid}' nicht gefunden."))
+				stack.addWidget(page)
+
+		stack.setCurrentIndex(0)
+		# 4.4: Fenster/Box auf die neue Stack-Seite nachziehen (dynamische Höhe)
+		if self._ui_ready:
+			self._reflow()
+
+	# -------------------------------------------------------------------------
+	# Set-Aktionen (Phase 13 Schritt 5)
+	# -------------------------------------------------------------------------
+
+	def collect_set_definition(self) -> Dict[str, Any]:
+		"""Baut die ServiceSetDefinition aus Set + Editor zusammen."""
+		if self._current_set_definition:
+			definition = dict(self._current_set_definition)
+			services = dict(definition.get("services") or {})
+		else:
+			definition = {"set_id": "", "display_name": "", "execution_order": [], "services": {}}
+			services = {}
+
+		if self.edit_set_name:
+			definition["display_name"] = self.edit_set_name.text().strip()
+
+		# Kein Set geladen → aktives Plugin als neuer Service (instance_id = plugin_id)
+		if not definition.get("execution_order") and self.plugin is not None:
+			pid = self.plugin.plugin_id
+			params: Dict[str, Any] = {}
+			lookback: int = 1000
+			for key in self.plugin_order:
+				spec = self.plugin_schema.get(key, {})
+				if self._is_visual_key(key) or key == "lookback":
+					continue  # Indi-Props gehören nicht ins Service-Set; lookback ist Instanz-Einstellung
+				if key in self.param_controls:
+					params[key] = self._ctrl_value(self.param_controls[key])
+				else:
+					params[key] = self.params.get(key, spec.get("default"))
+			if "lookback" in self.param_controls:
+				lookback = int(self._ctrl_value(self.param_controls["lookback"]))
+			else:
+				lookback = int(self.params.get("lookback", 1000) or 1000)
+			services[pid] = {"plugin_id": pid, "lookback": lookback, "params": params}
+			definition["execution_order"] = [pid]
+
+		# Service-Params aus den Set-Formular-Seiten übernehmen.
+		# lookback ist die Service-Instanz-Einstellung (ServiceInstanceConfig.
+		# lookback) und wird NICHT in params geschrieben.
+		for fkey, ctrl in self._set_param_controls.items():
+			iid, pkey = fkey.split(":", 1)
+			cfg = services.setdefault(iid, {"plugin_id": self.plugin.plugin_id, "params": {}})
+			if pkey == "lookback":
+				cfg["lookback"] = int(self._ctrl_value(ctrl))
+			else:
+				cfg.setdefault("params", {})[pkey] = self._ctrl_value(ctrl)
+
+		definition["services"] = services
+		return definition
+
+	def save_service_set(self) -> None:
+		"""Speichert das aktive Set über ServiceSetRepository.save_set().
+		Leerer Name → Auto-Name aus instance_ids (z.B. 'grid_1 + prox_1')."""
+		definition = self.collect_set_definition()
+		if not definition.get("execution_order") or not definition.get("services"):
+			QMessageBox.information(self, "Speichern", "Keine Service-Parameter vorhanden.")
+			return
+		set_id = self.set_repo.save_set(definition)
+		self._current_set_id = set_id
+		print(f"💾 [IndicatorDialog] Service-Set gespeichert: {set_id}")
+		self.refresh_service_set_list()
+		idx = self.combo_service_set.findData(set_id)
+		if idx >= 0:
+			self.combo_service_set.setCurrentIndex(idx)
+
+	def delete_service_set(self) -> None:
+		"""Löscht das gewählte Set – zwingend mit QMessageBox-Gegenfrage."""
+		set_id = self.combo_service_set.currentData() if self.combo_service_set else ""
+		if not set_id:
+			return
+		name = self.combo_service_set.currentText()
+		ret = QMessageBox.warning(
+			self, "Set löschen",
+			f"Service-Set '{name}' wirklich löschen?\nDies kann nicht rückgängig gemacht werden.",
+			QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+		)
+		if ret != QMessageBox.Yes:
+			return
+		self.set_repo.delete_set(set_id)
+		self._current_set_id = None
+		self._current_set_definition = None
+		self.refresh_service_set_list()
+
+	def execute_service_set(self) -> None:
+		"""Startet den ServiceSetEvaluator für das aktive Set (Hintergrund-Thread)."""
+		definition = self.collect_set_definition()
+		if not definition.get("execution_order") or not definition.get("services"):
+			return
+		if self._set_run_worker and self._set_run_worker.isRunning():
+			print("⚠️ [IndicatorDialog] Set-Ausführung läuft bereits.")
+			return
+		self._set_run_worker = DialogServiceSetRunWorker(
+			self.set_evaluator, self.symbol, self.timeframe, definition, parent=self,
+		)
+		self._set_run_worker.run_finished.connect(self._on_set_run_finished)
+		self._set_run_worker.run_failed.connect(self._on_set_run_failed)
+		self._set_run_worker.start()
+
+	def _on_set_run_finished(self, set_id: str, count: int) -> None:
+		print(f"✅ [IndicatorDialog] Set-Ausführung abgeschlossen: {count} Services.")
+
+	def _on_set_run_failed(self, set_id: str, error: str) -> None:
+		QMessageBox.warning(self, "Set-Ausführung fehlgeschlagen", str(error))
+
+	# -------------------------------------------------------------------------
+	# Legacy-Helfer (für Alt-Indikatoren)
+	# -------------------------------------------------------------------------
 
 	def create_control_widget(self, key: str, val: Any) -> QWidget:
 		if key in self.indicator.param_options:
@@ -15527,46 +17176,72 @@ class IndicatorSettingsDialog(QDialog):
 			txt.editingFinished.connect(self.on_param_control_changed)
 			return txt
 
-	def init_ui(self) -> None:
-		main_layout = QVBoxLayout(self)
-		form_layout = QFormLayout()
+	# -------------------------------------------------------------------------
+	# Geometrie-Persistenz & Presets (unverändert für beide Modi)
+	# -------------------------------------------------------------------------
 
-		layout_schema = self.indicator.param_layout
+	def _restore_geometry(self) -> None:
+		"""Stellt die letzte POSITION des nicht-modalen Dialogs wieder her.
 
-		if not layout_schema:
-			layout_schema = list(self.params.keys())
+		Phase 13 Schritt 5 Punkt 4: Die Größe wird NICHT wiederhergestellt –
+		das Prop-Fenster ist vollständig dynamisch (Inhalt bestimmt Höhe/Breite,
+		keine fixen Pixelwerte, kein leerer Raum unter dem Preset-Block).
+		"""
+		try:
+			geom = self.state_manager.get_dialog_geometry(self.DIALOG_GEOMETRY_KEY)
+			if not geom:
+				return
 
-		for item in layout_schema:
-			if isinstance(item, str):
-				key = item
-				if key in self.params:
-					label_text = self.indicator.param_labels.get(key, key.replace("_", " ").title())
-					ctrl = self.create_control_widget(key, self.params[key])
-					self.param_controls[key] = ctrl
-					form_layout.addRow(label_text, ctrl)
+			pos_x = geom.get("pos_x")
+			pos_y = geom.get("pos_y")
 
-			elif isinstance(item, tuple) and len(item) == 2:
-				row_label, keys = item
-				row_layout = QHBoxLayout()
-				row_layout.setSpacing(6)
+			# Position validieren (Bildschirm-Bounds; sonst zuruecksetzen)
+			if pos_x is not None and pos_y is not None:
+				screen = QApplication.primaryScreen().availableGeometry()
+				if pos_x < screen.x() - 100 or pos_x > screen.right() or \
+				   pos_y < screen.y() - 100 or pos_y > screen.bottom():
+					pos_x = pos_y = None
+				else:
+					self.move(pos_x, pos_y)
+		except Exception as e:
+			print(f"⚠️ [IndicatorDialog] Geometrie-Restore fehlgeschlagen: {e}")
 
-				for i, key in enumerate(keys):
-					if key in self.params:
-						# Sub-Label nur ab 2. Key, da row_label den ersten abdeckt
-						if i > 0:
-							sub_label = self.indicator.param_labels.get(key, "")
-							if sub_label:
-								row_layout.addWidget(QLabel(sub_label))
-						ctrl = self.create_control_widget(key, self.params[key])
-						self.param_controls[key] = ctrl
-						row_layout.addWidget(ctrl)
+	def _save_geometry(self) -> None:
+		"""Speichert die aktuelle Position/Groesse des Dialogs.
 
-				form_layout.addRow(row_label, row_layout)
+		Punkt 4: Wiederhergestellt wird nur die Position (siehe
+		_restore_geometry) – die Größe ist dynamisch (Inhalt bestimmt Höhe/Breite).
+		"""
+		try:
+			p = self.pos()
+			s = self.size()
+			self.state_manager.save_dialog_geometry(
+				self.DIALOG_GEOMETRY_KEY, p.x(), p.y(), s.width(), s.height()
+			)
+		except Exception as e:
+			print(f"⚠️ [IndicatorDialog] Geometrie-Save fehlgeschlagen: {e}")
 
-		main_layout.addLayout(form_layout)
+	def done(self, r: int) -> None:
+		"""Wird bei jedem Schliessen aufgerufen (accept/reject/Esc/X) ->
+		Geometrie vor dem Schliessen speichern."""
+		self._save_geometry()
+		if self._set_run_worker and self._set_run_worker.isRunning():
+			self._set_run_worker.wait(2000)
+		super().done(r)
 
-		# Preset-Verwaltungszeile
-		preset_layout = QHBoxLayout()
+	# -------------------------------------------------------------------------
+	# Preset-Verwaltung (Phase 13 Schritt 5 Punkt 4: im eigenen Rahmen)
+	# -------------------------------------------------------------------------
+
+	def _build_preset_group(self) -> QGroupBox:
+		"""Baut die Preset-Verwaltungsbox (Rahmen um die Preset-Auswahl).
+
+		Im Plugin-Modus wird sie direkt rechts oben neben 'Anzeige & Farben'
+		platziert; im Legacy-Modus unten (bisherige Position). Die Box wächst
+		nicht mit dem Fenster mit (Punkt 4: dynamische Größen).
+		"""
+		preset_group = QGroupBox("Preset")
+		preset_layout = QHBoxLayout(preset_group)
 		preset_layout.addWidget(QLabel("Preset:"))
 
 		self.combo_presets = QComboBox()
@@ -15582,58 +17257,8 @@ class IndicatorSettingsDialog(QDialog):
 		btn_delete_preset.clicked.connect(self.delete_current_preset)
 		preset_layout.addWidget(btn_delete_preset)
 
-		main_layout.addLayout(preset_layout)
-
-		btn_close = QPushButton("Schließen")
-		btn_close.clicked.connect(self.accept)
-		main_layout.addWidget(btn_close)
-
-	def _restore_geometry(self) -> None:
-		"""Stellt die letzte Position/Groesse des nicht-modalen Dialogs wieder her."""
-		try:
-			geom = self.state_manager.get_dialog_geometry(self.DIALOG_GEOMETRY_KEY)
-			if not geom:
-				return
-
-			pos_x = geom.get("pos_x")
-			pos_y = geom.get("pos_y")
-			width = geom.get("width")
-			height = geom.get("height")
-
-			# Position validieren (Bildschirm-Bounds; sonst zuruecksetzen)
-			if pos_x is not None and pos_y is not None:
-				screen = QApplication.primaryScreen().availableGeometry()
-				if pos_x < screen.x() - 100 or pos_x > screen.right() or \
-				   pos_y < screen.y() - 100 or pos_y > screen.bottom():
-					pos_x = pos_y = None
-				else:
-					self.move(pos_x, pos_y)
-
-			# Groesse nur uebernehmen, wenn plausibel (min. Breite des Dialogs)
-			if width is not None and height is not None:
-				try:
-					self.resize(max(440, int(width)), max(100, int(height)))
-				except (ValueError, TypeError):
-					pass
-		except Exception as e:
-			print(f"⚠️ [IndicatorDialog] Geometrie-Restore fehlgeschlagen: {e}")
-
-	def _save_geometry(self) -> None:
-		"""Speichert die aktuelle Position/Groesse des Dialogs."""
-		try:
-			p = self.pos()
-			s = self.size()
-			self.state_manager.save_dialog_geometry(
-				self.DIALOG_GEOMETRY_KEY, p.x(), p.y(), s.width(), s.height()
-			)
-		except Exception as e:
-			print(f"⚠️ [IndicatorDialog] Geometrie-Save fehlgeschlagen: {e}")
-
-	def done(self, r: int) -> None:
-		"""Wird bei jedem Schliessen aufgerufen (accept/reject/Esc/X) ->
-		Geometrie vor dem Schliessen speichern."""
-		self._save_geometry()
-		super().done(r)
+		preset_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+		return preset_group
 
 	def refresh_preset_list(self) -> None:
 		self.combo_presets.blockSignals(True)
@@ -15777,6 +17402,7 @@ class IndicatorSettingsDialog(QDialog):
 			self.current_preset_name = next_preset
 			self.refresh_preset_list()
 			self.on_preset_selected(next_preset)
+
 ```
 
 --------------------------------------------------
@@ -18126,6 +19752,164 @@ try:
 except OSError:
     pass
 
+# =============================================================================
+# Teil 2 (Roadmap Phase 13 Schritt 5 Punkt 4, §4.7 Punkt 3):
+# Headless-Layout-Test – dynamische Fenster-/Box-Größen des Prop-Fensters.
+# Das Fenster leitet Höhe/Breite vollständig aus seinem Inhalt ab:
+#   - dialog.sizeHint().height() ändert sich dynamisch mit der Anzahl der
+#     sichtbaren Elemente (Expert-Bereich ein/aus).
+#   - Die tatsächliche Fensterhöhe entspricht dem sizeHint (kein leerer Raum
+#     unter dem Preset-Block).
+#   - Keine fixen Pixelwerte für Fenster-/Box-Dimensionen im Code.
+# =============================================================================
+
+def _run_layout_test() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+    from PySide6.QtWidgets import QApplication, QGroupBox, QMessageBox
+    import chart.indicator_dialog as indicator_dialog
+    from analytics.engine.service_set_repository import ServiceSetRepository
+
+    # QMessageBox.warning mocken (kein echter Dialog im headless-Test)
+    QMessageBox.warning = staticmethod(lambda *a, **k: QMessageBox.No)
+
+    class _FakeSignal:
+        def __init__(self):
+            self.slots = []
+
+        def connect(self, slot):
+            self.slots.append(slot)
+
+    class _FakeWorker:
+        run_finished = _FakeSignal()
+        run_failed = _FakeSignal()
+
+        def __init__(self, *a, **k):
+            self.args = a
+
+        def isRunning(self):
+            return False
+
+        def start(self):
+            self.started = True
+
+    indicator_dialog.DialogServiceSetRunWorker = _FakeWorker
+
+    class _SM:
+        def get_dialog_geometry(self, *a, **k):
+            return None
+
+        def save_dialog_geometry(self, *a, **k):
+            pass
+
+        def list_indicator_presets(self, *a, **k):
+            return ["Default"]
+
+        def get_indicator_preset(self, *a, **k):
+            return None
+
+        def save_indicator_preset(self, *a, **k):
+            pass
+
+        def delete_indicator_preset(self, *a, **k):
+            pass
+
+    # Fake-Plugin: WENIG Service-Params, VIEL Expert-Params. Damit ist der
+    # Expert-Bereich (aufgeklappt) die höchste Box und die Fensterhöhe ändert
+    # sich beim Auf-/Zuklappen nachweislich dynamisch (sonst dominiert bei
+    # grid_liquidity die Service-Parameter-Box und maskiert den Effekt).
+    class _FakeIndicator:
+        plugin_id = "geom_fake"
+        indicator_id = "geom_fake"
+        display_name = "Geom Fake"
+        param_options = {}
+        version = "1.0.0"
+        metadata = {"display_name": "Geom Fake", "description": "D", "author": "A"}
+        base_parameter_schema = {
+            "lookback": {"type": "int", "default": 1000, "min": 100, "max": 100000, "step": 50, "expert": True},
+        }
+        parameter_schema = {
+            "show_lines": {"type": "bool", "default": True},
+            "grid_step": {"type": "float", "default": 0.5, "min": 0.01, "max": 100.0, "step": 0.05},
+            "custom_level1": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "expert": True},
+            "custom_level2": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "expert": True},
+            "custom_level3": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "expert": True},
+            "custom_level4": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "expert": True},
+        }
+        parameter_order = [
+            "show_lines", "grid_step", "custom_level1", "custom_level2",
+            "custom_level3", "custom_level4", "lookback",
+        ]
+        param_labels = {}
+
+        @property
+        def default_params(self):
+            return {k: v["default"] for k, v in self.parameter_schema.items()}
+
+        def calculate(self, df, params):
+            return {}
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    tmp_dir = tempfile.mkdtemp(prefix="dlg_geom_")
+    repo = ServiceSetRepository(db_path=os.path.join(tmp_dir, "app.duckdb"))
+
+    ind = _FakeIndicator()
+    win = indicator_dialog.IndicatorSettingsDialog(
+        ind, dict(ind.default_params), "Default", _SM(),
+        lambda p, pr: None, symbol="SILVER", timeframe="H1", service_set_repo=repo,
+    )
+
+    check("Prop-Fenster headless instanziiert (ohne exec_())", win is not None)
+    check("Plugin-Modus aktiv (group_expert vorhanden)",
+          win.plugin is not None and win.group_expert is not None)
+
+    # Box 'Service-Parameter' endet exakt unter dem letzten Parameter
+    # (Höhe == sizeHint, kein leerer Raum innerhalb der Box).
+    svc_group = next((g for g in win.findChildren(QGroupBox)
+                      if g.title() == "Service-Parameter"), None)
+    check("Service-Parameter-Box gefunden", svc_group is not None)
+    if svc_group is not None:
+        check(f"Service-Parameter-Box: Höhe == sizeHint ({svc_group.height()} vs {svc_group.sizeHint().height()})",
+              abs(svc_group.height() - svc_group.sizeHint().height()) <= 2)
+
+    w0 = win.sizeHint().width()
+    h0 = win.sizeHint().height()
+    check(f"sizeHint Breite > 0 ({w0})", w0 > 0)
+    check(f"sizeHint Höhe > 0 ({h0})", h0 > 0)
+    # 4.2.5: Fenster schmiegt sich an seinen Inhalt an -> kein leerer Raum unten
+    check(f"Fensterhöhe == sizeHint (kein leerer Raum) ({win.height()} vs {h0})",
+          abs(win.height() - h0) <= 2)
+
+    # 4.4: Expert-Bereich aufklappen -> sizeHint-Höhe muss wachsen
+    win.group_expert.setChecked(True)
+    h_open = win.sizeHint().height()
+    check(f"Expert aufklappen vergrößert sizeHint-Höhe ({h0} -> {h_open})", h_open > h0)
+
+    # wieder zuklappen -> Höhe schrumpft zurück auf den Ausgangswert
+    win.group_expert.setChecked(False)
+    h_closed = win.sizeHint().height()
+    check(f"Expert zuklappen verkleinert sizeHint-Höhe ({h_open} -> {h_closed})", h_closed < h_open)
+    check(f"Höhe nach Zuklappen nahe Ausgangshöhe (delta={abs(h_closed - h0)})",
+          abs(h_closed - h0) <= 4)
+
+    # 4.7 Punkt 2 (Code-Inspektion): keine fixen Pixelwerte für Fenster/Boxen
+    src = Path(indicator_dialog.__file__).read_text(encoding="utf-8")
+    for token in ("resize(", "setFixedSize(", "setFixedHeight(", "setFixedWidth(",
+                  "setMinimumWidth(", "setMinimumHeight("):
+        check(f"Kein '{token}' im Dialog-Code", token not in src)
+
+    try:
+        os.remove(os.path.join(tmp_dir, "app.duckdb"))
+        os.rmdir(tmp_dir)
+    except Exception:
+        pass
+
+
+_run_layout_test()
+
 print("\nRESULT:", "PASS" if ok else f"FAIL ({failures})")
 raise SystemExit(0 if ok else 1)
 
@@ -20320,6 +22104,1358 @@ if __name__ == "__main__":
 
 --------------------------------------------------
 
+### DATEI: test/check_p13_s2.py
+```py
+# test/check_p13_s2.py
+# Headless-Validierung für Phase 13 Schritt 2 (ServiceSetRepository & Datenmodell).
+#
+# Validiert laut Roadmap §Schritt 2.3:
+#   - Multi-Use-Plugins (gleiches Plugin, unterschiedliche instance_ids)
+#     speichern und erfolgreich zurückladen
+#   - list_sets() liefert alle gespeicherten Sets
+#   - delete_set() entfernt sauber
+#   Zusätzlich:
+#   - Default-Name aus instance_ids, wenn display_name leer ("grid_1 + prox_1")
+#   - Upsert-Semantik (gleiche set_id überschreibt, kein Duplikat)
+#   - Persistenz in eigener Tabelle service_sets in app_data.duckdb
+#   - Keine Kopplung an den StateManager (bleibt unangetastet)
+#
+# WICHTIG: Kein UI-Start (Regel Agents.md §4). Arbeitet auf einer temporären
+# DB – die echte app_data.duckdb wird NICHT verändert.
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import duckdb
+
+from analytics.engine.service_set_repository import ServiceSetRepository
+from analytics.engine.service_models import ServiceInstanceConfig, ServiceSetDefinition
+
+ok = True
+failures = []
+
+
+def check(cond, msg):
+    global ok
+    if cond:
+        print(f"   \u2705 {msg}")
+    else:
+        ok = False
+        failures.append(msg)
+        print(f"   \u274c {msg}")
+
+
+def main() -> int:
+    global ok
+    print("=" * 70)
+    print("Phase 13 Schritt 2 – ServiceSetRepository & Datenmodell (headless)")
+    print("=" * 70)
+
+    tmp_dir = tempfile.mkdtemp(prefix="p13_s2_")
+    tmp_db = os.path.join(tmp_dir, "tmp_app_data.duckdb")
+    repo = ServiceSetRepository(db_path=tmp_db)
+
+    # -------------------------------------------------------------------------
+    # [1] Multi-Use-Set speichern: grid_lines ZWEIMAL (grid_1, grid_2) + proximity
+    # -------------------------------------------------------------------------
+    print("\n[1] Multi-Use-Set speichern (gleiches Plugin, unterschiedliche instance_ids):")
+    definition: ServiceSetDefinition = {
+        "set_id": "scalper_grid",
+        "display_name": "Mein Scalper",
+        "execution_order": ["grid_1", "grid_2", "prox_1"],
+        "services": {
+            "grid_1": ServiceInstanceConfig(
+                plugin_id="grid_lines",
+                lookback=1000,
+                params={"step_size": 0.5, "steps_around": 4, "custom_levels": []},
+            ),
+            "grid_2": ServiceInstanceConfig(
+                plugin_id="grid_lines",
+                lookback=2000,
+                params={"step_size": 1.0, "steps_around": 2, "custom_levels": []},
+            ),
+            "prox_1": ServiceInstanceConfig(
+                plugin_id="proximity",
+                lookback=10000,
+                depends_on=["grid_1"],
+                params={"visit_pct": 0.05, "time_window_mins": 5},
+            ),
+        },
+    }
+    saved_id = repo.save_set(definition)
+    check(saved_id == "scalper_grid", "save_set() liefert set_id zurück")
+
+    # DB-Inspektion: Tabelle service_sets existiert in der (App-)DB
+    con = duckdb.connect(tmp_db)
+    tables = [r[0] for r in con.execute(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"
+    ).fetchall()]
+    con.close()
+    check("service_sets" in tables, "Tabelle 'service_sets' in app_data.duckdb angelegt")
+
+    # -------------------------------------------------------------------------
+    # [2] get_set() lädt das Multi-Use-Set zurück
+    # -------------------------------------------------------------------------
+    print("\n[2] get_set() lädt Multi-Use-Set zurück:")
+    loaded = repo.get_set("scalper_grid")
+    check(loaded is not None, "get_set() findet das Set")
+    check(loaded["set_id"] == "scalper_grid", "set_id korrekt")
+    check(loaded["display_name"] == "Mein Scalper", "display_name korrekt")
+    check(loaded["execution_order"] == ["grid_1", "grid_2", "prox_1"], "execution_order korrekt")
+    check(len(loaded["services"]) == 3, "3 Service-Instanzen geladen")
+    check(loaded["services"]["grid_1"]["plugin_id"] == "grid_lines", "grid_1 plugin_id korrekt")
+    check(loaded["services"]["grid_2"]["plugin_id"] == "grid_lines", "grid_2 plugin_id korrekt (Multi-Use)")
+    check(loaded["services"]["grid_2"]["lookback"] == 2000, "grid_2 lookback=2000 erhalten (Multi-Use)")
+    check(loaded["services"]["grid_1"]["params"]["step_size"] == 0.5, "grid_1 params erhalten")
+    check(loaded["services"]["grid_2"]["params"]["step_size"] == 1.0, "grid_2 params getrennt (kein Merge)")
+    check(loaded["services"]["prox_1"]["depends_on"] == ["grid_1"], "prox_1 depends_on erhalten")
+    check(loaded["services"]["prox_1"]["params"]["visit_pct"] == 0.05, "prox_1 params erhalten")
+
+    # -------------------------------------------------------------------------
+    # [3] Default-Name bei leerem display_name
+    # -------------------------------------------------------------------------
+    print("\n[3] Default-Name aus instance_ids bei leerem display_name:")
+    anon_def: ServiceSetDefinition = {
+        "set_id": "anon_set",
+        "display_name": "",
+        "execution_order": ["grid_1", "prox_1"],
+        "services": {
+            "grid_1": {"plugin_id": "grid_lines", "lookback": 1000, "params": {}},
+            "prox_1": {"plugin_id": "proximity", "lookback": 10000, "params": {}},
+        },
+    }
+    repo.save_set(anon_def)
+    anon = repo.get_set("anon_set")
+    check(anon["display_name"] == "grid_1 + prox_1",
+          f"Default-Name = 'grid_1 + prox_1' (tatsächlich: '{anon['display_name']}')")
+
+    # -------------------------------------------------------------------------
+    # [4] list_sets() liefert alle gespeicherten Sets
+    # -------------------------------------------------------------------------
+    print("\n[4] list_sets() liefert alle Sets:")
+    all_sets = repo.list_sets()
+    ids = {s["set_id"] for s in all_sets}
+    check("scalper_grid" in ids and "anon_set" in ids,
+          f"alle Sets gelistet (gefunden: {sorted(ids)})")
+    check(len(all_sets) == 2, "genau 2 Sets gelistet")
+
+    # -------------------------------------------------------------------------
+    # [5] delete_set() entfernt sauber
+    # -------------------------------------------------------------------------
+    print("\n[5] delete_set() entfernt sauber:")
+    check(repo.delete_set("anon_set") is True, "delete_set() meldet Erfolg (True)")
+    check(repo.get_set("anon_set") is None, "get_set() liefert None nach delete_set()")
+    ids_after = {s["set_id"] for s in repo.list_sets()}
+    check("anon_set" not in ids_after and "scalper_grid" in ids_after,
+          "nur das gelöschte Set fehlt (andere bleiben erhalten)")
+    check(repo.delete_set("gibt_es_nicht") is False, "delete_set() bei unbekannter ID → False")
+
+    # -------------------------------------------------------------------------
+    # [6] Upsert-Semantik (gleiche set_id überschreibt)
+    # -------------------------------------------------------------------------
+    print("\n[6] Upsert-Semantik (gleiche set_id überschreibt, kein Duplikat):")
+    definition["display_name"] = "Mein Scalper V2"
+    repo.save_set(definition)
+    loaded2 = repo.get_set("scalper_grid")
+    check(loaded2["display_name"] == "Mein Scalper V2", "Upsert aktualisiert display_name")
+    check(len(repo.list_sets()) == 1, "keine Duplikat-Zeile bei gleicher set_id")
+
+    # -------------------------------------------------------------------------
+    # [7] StateManager bleibt unangetastet
+    # -------------------------------------------------------------------------
+    print("\n[7] StateManager bleibt unangetastet:")
+    import analytics.engine.service_set_repository as repo_mod
+    src = Path(repo_mod.__file__).read_text(encoding="utf-8")
+    check("state_manager" not in src.lower(),
+          "Repository importiert den StateManager NICHT (keine Kopplung)")
+    # TypedDicts vorhanden
+    check(ServiceSetDefinition is not None and ServiceInstanceConfig is not None,
+          "TypedDicts ServiceSetDefinition / ServiceInstanceConfig importierbar")
+    check(loaded["services"]["grid_2"]["lookback"] == 2000,
+          "Multi-Use-Daten überleben den Persistenz-Zyklus vollständig")
+
+    # Aufräumen
+    try:
+        os.remove(tmp_db)
+        os.rmdir(tmp_dir)
+    except Exception:
+        pass
+
+    print()
+    if ok:
+        print("RESULT: ALLE CHECKS BESTANDEN \u2705")
+        return 0
+    print(f"RESULT: {len(failures)} CHECK(S) FEHLGESCHLAGEN \u274c")
+    for f in failures:
+        print(f"   - {f}")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_p13_s3.py
+```py
+# test/check_p13_s3.py
+# Headless-Validierung für Phase 13 Schritt 3 (ServiceSetEvaluator / Pipeline).
+#
+# Validiert laut Roadmap §Schritt 3.3:
+#   (a) Service 2 greift nur auf den beschnittenen df zu (df.tail(lookback))
+#   (b) shared_state wird per instance_id isoliert (Namespace-Isolation)
+#   (c) Abstürze werden sauber abgefangen (Fail-Fast, Pipeline bricht ab)
+#   (d) depends_on-Verletzung (nachgelagerte Referenz) wirft VOR der Ausführung
+#   Zusätzlich:
+#   - runtime-Check: shared_state-Einträge der depends_on-IDs vorhanden
+#   - Evaluator-Default: legt Ergebnis unter instance_id ab, wenn der Service
+#     seinen Namespace nicht selbst beschrieben hat (Schritt-6-Kompatibilität)
+#   - Context-None → frischer Context wird erzeugt (mode='batch')
+#   - Der bestehende SetEvaluator (Signal-Sets) bleibt unangetastet
+#
+# WICHTIG: Kein UI-Start (Regel Agents.md §4). Reine Engine-Logik headless.
+import sys
+from pathlib import Path
+from typing import Any, Dict, List
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import pandas as pd
+
+from analytics.features.plugins.base_plugin import (
+    FeatureCalculateResult,
+    ParameterSchema,
+    PluginContext,
+    PluginFeature,
+)
+from analytics.features.feature_builder import PluginExecutor
+from analytics.engine.set_evaluator import (
+    ServiceSetEvaluator,
+    ServiceSetExecutionError,
+    SetEvaluator,
+)
+
+ok = True
+failures = []
+
+
+def check(cond, msg):
+    global ok
+    if cond:
+        print(f"   \u2705 {msg}")
+    else:
+        ok = False
+        failures.append(msg)
+        print(f"   \u274c {msg}")
+
+
+# -----------------------------------------------------------------------------
+# Mock-Services (Inline, NICHT in der Registry). Simulieren die Schritt-6-
+# Semantik: GridLinesService schreibt Linien in den eigenen Namespace,
+# ProximityService liest die Linien aus shared_state[depends_on[0]].
+# -----------------------------------------------------------------------------
+class MockGridLines(PluginFeature):
+    calls: List[Dict[str, Any]] = []
+
+    @property
+    def plugin_id(self) -> str:
+        return "grid_lines"
+
+    @property
+    def parameter_schema(self) -> Dict[str, ParameterSchema]:
+        return {"step_size": {"type": "float", "default": 0.5,
+                              "min": 0.01, "max": 100.0, "step": 0.05}}
+
+    def calculate(self, df, params, context=None) -> FeatureCalculateResult:
+        ctx = context
+        MockGridLines.calls.append({
+            "instance_id": ctx.instance_id if ctx else None,
+            "depends_on": list(ctx.depends_on or []) if ctx else [],
+            "rows": len(df),
+            "first_time": int(df["time"].iloc[0]),
+            "last_time": int(df["time"].iloc[-1]),
+        })
+        if ctx is not None and ctx.instance_id:
+            # Schritt-6-Semantik: Service schreibt in seinen EIGENEN Namespace
+            ctx.shared_state[ctx.instance_id] = {
+                "lines": [float(params.get("step_size", 0.5)) * 10.0, 100.0],
+                "rows": len(df),
+            }
+        return {"feature_store_payload": {}, "chart_render_payload": {}}
+
+
+class MockProximity(PluginFeature):
+    calls: List[Dict[str, Any]] = []
+
+    @property
+    def plugin_id(self) -> str:
+        return "proximity"
+
+    @property
+    def parameter_schema(self) -> Dict[str, ParameterSchema]:
+        return {"visit_pct": {"type": "float", "default": 0.05,
+                              "min": 0.001, "max": 10.0, "step": 0.005}}
+
+    def calculate(self, df, params, context=None) -> FeatureCalculateResult:
+        ctx = context
+        dep_id = (ctx.depends_on or [None])[0] if ctx else None
+        lines = []
+        if ctx is not None and dep_id and dep_id in ctx.shared_state:
+            lines = ctx.shared_state[dep_id].get("lines", [])
+        MockProximity.calls.append({
+            "instance_id": ctx.instance_id if ctx else None,
+            "depends_on": list(ctx.depends_on or []) if ctx else [],
+            "rows": len(df),
+            "first_time": int(df["time"].iloc[0]),
+            "last_time": int(df["time"].iloc[-1]),
+            "lines_from_dep": list(lines),
+        })
+        return {"feature_store_payload": {}, "chart_render_payload": {}}
+
+
+class MockNoWrite(PluginFeature):
+    """Schreibt NICHT in shared_state – der Evaluator muss das Ergebnis
+    unter der instance_id ablegen (Default-Verhalten)."""
+    calls: List[Optional[str]] = []
+
+    @property
+    def plugin_id(self) -> str:
+        return "no_write"
+
+    @property
+    def parameter_schema(self) -> Dict[str, ParameterSchema]:
+        return {"x": {"type": "int", "default": 1}}
+
+    def calculate(self, df, params, context=None) -> FeatureCalculateResult:
+        MockNoWrite.calls.append(context.instance_id if context else None)
+        return {"feature_store_payload": {"feature_id": "no_write"},
+                "chart_render_payload": {}}
+
+
+class MockCrash(PluginFeature):
+    @property
+    def plugin_id(self) -> str:
+        return "crasher"
+
+    @property
+    def parameter_schema(self) -> Dict[str, ParameterSchema]:
+        return {"x": {"type": "int", "default": 1}}
+
+    def calculate(self, df, params, context=None) -> FeatureCalculateResult:
+        raise RuntimeError("simulierter Crash")
+
+
+class _MockRegistry:
+    def __init__(self, plugins: Dict[str, PluginFeature]):
+        self._plugins = plugins
+
+    def get(self, plugin_id: str) -> PluginFeature:
+        if plugin_id not in self._plugins:
+            raise KeyError(f"Plugin '{plugin_id}' nicht gefunden.")
+        return self._plugins[plugin_id]
+
+
+def make_executor(plugins: Dict[str, PluginFeature]) -> PluginExecutor:
+    return PluginExecutor(registry=_MockRegistry(plugins))
+
+
+def make_df(rows: int = 100) -> pd.DataFrame:
+    return pd.DataFrame({
+        "time": list(range(rows)),
+        "open": [100.0 + i for i in range(rows)],
+        "high": [101.0 + i for i in range(rows)],
+        "low": [99.0 + i for i in range(rows)],
+        "close": [100.5 + i for i in range(rows)],
+    })
+
+
+def main() -> int:
+    global ok
+    print("=" * 70)
+    print("Phase 13 Schritt 3 – ServiceSetEvaluator (Pipeline, headless)")
+    print("=" * 70)
+
+    grid = MockGridLines()
+    prox = MockProximity()
+    crash = MockCrash()
+    no_write = MockNoWrite()
+    df = make_df(rows=100)
+
+    # -------------------------------------------------------------------------
+    # (a) + (b): lookback-Zuschnitt & Namespace-Isolation
+    # -------------------------------------------------------------------------
+    print("\n[(a)+(b)] lookback-Zuschnitt & Namespace-Isolation:")
+    MockGridLines.calls = []
+    MockProximity.calls = []
+    evaluator = ServiceSetEvaluator(executor=make_executor({
+        "grid_lines": grid, "proximity": prox,
+    }))
+    ctx = PluginContext(symbol="XAUUSD", timeframe="M1", mode="batch", timestamp=99)
+    set_def = {
+        "set_id": "multi_grid",
+        "display_name": "Multi Grid",
+        "execution_order": ["grid_1", "grid_2", "prox_1"],
+        "services": {
+            "grid_1": {"plugin_id": "grid_lines", "lookback": 40,
+                       "params": {"step_size": 0.5}},
+            "grid_2": {"plugin_id": "grid_lines", "lookback": 25,
+                       "params": {"step_size": 1.0}},
+            "prox_1": {"plugin_id": "proximity", "lookback": 60,
+                       "depends_on": ["grid_1"], "params": {"visit_pct": 0.05}},
+        },
+    }
+    results = evaluator.execute_set(set_def, df, context=ctx)
+
+    # (a) lookback-Zuschnitt
+    check(MockGridLines.calls[0]["rows"] == 40,
+          "grid_1 erhielt exakt df.tail(40)")
+    check(MockGridLines.calls[0]["first_time"] == 60 and MockGridLines.calls[0]["last_time"] == 99,
+          "grid_1 tail: erste Zeit = 60, letzte = 99")
+    check(MockGridLines.calls[1]["rows"] == 25,
+          "grid_2 erhielt exakt df.tail(25)")
+    check(MockGridLines.calls[1]["first_time"] == 75 and MockGridLines.calls[1]["last_time"] == 99,
+          "grid_2 tail: erste Zeit = 75, letzte = 99")
+    check(MockProximity.calls[0]["rows"] == 60,
+          "prox_1 erhielt exakt df.tail(60)")
+    check(MockProximity.calls[0]["first_time"] == 40 and MockProximity.calls[0]["last_time"] == 99,
+          "prox_1 tail: erste Zeit = 40, letzte = 99")
+
+    # (b) Namespace-Isolation
+    check("grid_1" in ctx.shared_state,
+          "grid_1 schrieb in shared_state['grid_1']")
+    check("grid_2" in ctx.shared_state,
+          "grid_2 schrieb in shared_state['grid_2']")
+    check(ctx.shared_state["grid_1"]["lines"] == [5.0, 100.0],
+          "grid_1 Linien = step 0.5 (Namespace getrennt)")
+    check(ctx.shared_state["grid_2"]["lines"] == [10.0, 100.0],
+          "grid_2 Linien = step 1.0 (Namespace getrennt, kein Merge)")
+    check(MockProximity.calls[0]["lines_from_dep"] == [5.0, 100.0],
+          "prox_1 las NUR grid_1 (depends_on[0])")
+    check(MockProximity.calls[0]["instance_id"] == "prox_1",
+          "prox_1 hat instance_id='prox_1' im Context")
+    check("lines" in ctx.shared_state["grid_1"] and "feature_store_payload" not in ctx.shared_state["grid_1"],
+          "Evaluator überschreibt service-geschriebenen Namespace NICHT")
+    check(set(results.keys()) == {"grid_1", "grid_2", "prox_1"},
+          "results liefert alle 3 instance_ids")
+
+    # -------------------------------------------------------------------------
+    # Evaluator-Default: Service ohne eigenen Write → Ergebnis abgelegt
+    # -------------------------------------------------------------------------
+    print("\n[Default] Evaluator legt Ergebnis ab, wenn Service nichts schreibt:")
+    MockNoWrite.calls = []
+    ev2 = ServiceSetEvaluator(executor=make_executor({"no_write": no_write}))
+    ctx2 = PluginContext(mode="batch")
+    res2 = ev2.execute_set({
+        "set_id": "s",
+        "execution_order": ["nw_1"],
+        "services": {"nw_1": {"plugin_id": "no_write", "lookback": 50,
+                              "params": {"x": 1}}},
+    }, df, context=ctx2)
+    check(MockNoWrite.calls == ["nw_1"],
+          "Service lief mit instance_id='nw_1'")
+    check("nw_1" in ctx2.shared_state,
+          "Evaluator legte Ergebnis unter shared_state['nw_1'] ab")
+    check(ctx2.shared_state["nw_1"].get("feature_store_payload", {}).get("feature_id") == "no_write",
+          "Ergebnis = FeatureCalculateResult (feature_id='no_write')")
+    check(res2["nw_1"] is ctx2.shared_state["nw_1"],
+          "results['nw_1'] identisch")
+
+    # -------------------------------------------------------------------------
+    # Context=None → frischer Context (mode='batch')
+    # -------------------------------------------------------------------------
+    print("\n[Context] context=None → frischer Context wird erzeugt:")
+    MockGridLines.calls = []
+    ev3 = ServiceSetEvaluator(executor=make_executor({"grid_lines": grid}))
+    res3 = ev3.execute_set({
+        "set_id": "s3",
+        "execution_order": ["g_1"],
+        "services": {"g_1": {"plugin_id": "grid_lines", "lookback": 10,
+                             "params": {"step_size": 0.5}}},
+    }, df)
+    check("g_1" in res3,
+          "ohne Context ausführbar (results vorhanden)")
+    check(MockGridLines.calls[0]["instance_id"] == "g_1",
+          "Service erhielt instance_id='g_1'")
+
+    # -------------------------------------------------------------------------
+    # (c) Fail-Fast: Crash in Service 2 bricht Pipeline ab
+    # -------------------------------------------------------------------------
+    print("\n[(c)] Fail-Fast bei Service-Exception:")
+    MockGridLines.calls = []
+    MockProximity.calls = []
+    ev4 = ServiceSetEvaluator(executor=make_executor({
+        "grid_lines": grid, "crasher": crash, "proximity": prox,
+    }))
+    crashed = False
+    try:
+        ev4.execute_set({
+            "set_id": "crash_set",
+            "execution_order": ["ok_1", "crash_1", "late_1"],
+            "services": {
+                "ok_1": {"plugin_id": "grid_lines", "lookback": 10, "params": {}},
+                "crash_1": {"plugin_id": "crasher", "lookback": 10, "params": {}},
+                "late_1": {"plugin_id": "proximity", "lookback": 10,
+                           "depends_on": ["ok_1"], "params": {}},
+            },
+        }, df, context=PluginContext(mode="batch"))
+    except ServiceSetExecutionError as e:
+        crashed = True
+        check(isinstance(e.__cause__, RuntimeError) and "simulierter Crash" in str(e.__cause__),
+              "Ursache ist RuntimeError ('simulierter Crash')")
+        check("crash_1" in str(e),
+              "Fehlermeldung nennt instance_id 'crash_1'")
+    check(crashed,
+          "ServiceSetExecutionError wurde geworfen (Fail-Fast)")
+    check(len(MockGridLines.calls) == 1,
+          "ok_1 lief (Service 1 ausgeführt)")
+    check(len(MockProximity.calls) == 0,
+          "late_1 lief NICHT (Pipeline abgebrochen)")
+
+    # -------------------------------------------------------------------------
+    # (d) depends_on-Verletzung wirft VOR der Ausführung
+    # -------------------------------------------------------------------------
+    print("\n[(d)] depends_on-Verletzung (nachgelagerte Referenz):")
+    MockGridLines.calls = []
+    ev5 = ServiceSetEvaluator(executor=make_executor({"grid_lines": grid}))
+    violated = False
+    try:
+        ev5.execute_set({
+            "set_id": "viol",
+            "execution_order": ["grid_1", "prox_1", "grid_2"],
+            "services": {
+                "grid_1": {"plugin_id": "grid_lines", "lookback": 10, "params": {}},
+                "prox_1": {"plugin_id": "grid_lines", "lookback": 10,
+                           "depends_on": ["grid_2"], "params": {}},
+                "grid_2": {"plugin_id": "grid_lines", "lookback": 10, "params": {}},
+            },
+        }, df, context=PluginContext(mode="batch"))
+    except ValueError as e:
+        violated = True
+        check("prox_1" in str(e) and "grid_2" in str(e),
+              "Meldung nennt 'prox_1' und 'grid_2'")
+    check(violated,
+          "ValueError wurde geworfen")
+    check(len(MockGridLines.calls) == 0,
+          "KEIN Service lief (Validierung VOR Ausführung)")
+
+    # depends_on auf nicht existierende instance_id
+    violated2 = False
+    try:
+        ev5.execute_set({
+            "set_id": "ghost",
+            "execution_order": ["grid_1"],
+            "services": {
+                "grid_1": {"plugin_id": "grid_lines", "lookback": 10,
+                           "depends_on": ["ghost_1"], "params": {}},
+            },
+        }, df, context=PluginContext(mode="batch"))
+    except ValueError:
+        violated2 = True
+    check(violated2,
+          "depends_on auf unbekannte instance_id wirft ValueError")
+
+    # -------------------------------------------------------------------------
+    # Regression: bestehender SetEvaluator (Signal-Sets) unangetastet
+    # -------------------------------------------------------------------------
+    print("\n[Regression] SetEvaluator (Signal-Sets) unangetastet:")
+    try:
+        from analytics.engine.set_evaluator import SetEvaluator as SE
+        check(SetEvaluator is SE,
+              "SetEvaluator importierbar")
+    except Exception as e:
+        check(False, f"SetEvaluator Import-Fehler: {e}")
+
+    print()
+    if ok:
+        print("RESULT: ALLE CHECKS BESTANDEN \u2705")
+        return 0
+    print(f"RESULT: {len(failures)} CHECK(S) FEHLGESCHLAGEN \u274c")
+    for f in failures:
+        print(f"   - {f}")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_p13_s4.py
+```py
+# test/check_p13_s4.py
+# Headless-Validierung für Phase 13 Schritt 4 (UI-Integration Service-Fenster).
+#
+# Validiert laut Roadmap §Schritt 4.3:
+#   - py_compile auf den UI-Klassen (service_win.py)
+#   - Controller-Methoden OHNE exec_() der GUI aufrufen (Crash-Freiheit)
+# Zusätzlich geprüft:
+#   - Set-Dropdown wird aus ServiceSetRepository.list_sets() befüllt
+#   - Laden eines Sets in Name-Feld + execution_order-Liste
+#   - Up/Down-Umsortierung der execution_order
+#   - add_instance (Parsing "instance_id [plugin_id]") + remove_instance
+#   - save_set (leerer Name -> Auto-Name aus instance_ids)
+#   - delete_set mit zwingender QMessageBox-Rückfrage (Yes/No-Verhalten)
+#   - execute_set startet den ServiceSetRunWorker mit korrekten Argumenten
+#
+# WICHTIG: Keine GUI-Ausführung (exec_()). Offscreen-QApplication + gemockte
+# Dialoge. Arbeitet auf einer temporären DB – echte app_data.duckdb bleibt unberührt.
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import py_compile
+
+from analytics.engine.service_set_repository import ServiceSetRepository
+
+ok = True
+failures = []
+
+
+def check(cond, msg):
+    global ok
+    if cond:
+        print(f"   \u2705 {msg}")
+    else:
+        ok = False
+        failures.append(msg)
+        print(f"   \u274c {msg}")
+
+
+# -----------------------------------------------------------------------------
+# Mocks (kein UI, keine echte DB)
+# -----------------------------------------------------------------------------
+class FakeStateManager:
+    """Ersetzt StateManager in PersistentWindow – keine echte DB-Verbindung."""
+
+    def __init__(self, *a, **k):
+        pass
+
+    def get_window_geometry(self, *a, **k):
+        return None
+
+    def load_all_instances(self, *a, **k):
+        return []
+
+    def save_window_geometry(self, *a, **k):
+        pass
+
+    def save_instance_state(self, *a, **k):
+        pass
+
+    def delete_instance(self, *a, **k):
+        pass
+
+    def get_app_settings(self, *a, **k):
+        return None
+
+
+class _FakeSignal:
+    """Mini-Signal-Ersatz (nur .connect wird vom Controller aufgerufen)."""
+
+    def __init__(self):
+        self.slots = []
+
+    def connect(self, slot):
+        self.slots.append(slot)
+
+
+class _FakeRunWorker:
+    """Ersetzt ServiceSetRunWorker: zeichnet Argumente auf, startet aber NICHTS."""
+
+    log_message = _FakeSignal()
+    run_finished = _FakeSignal()
+    run_failed = _FakeSignal()
+
+    def __init__(self, *a, **k):
+        self.args = a
+        self.kwargs = k
+
+    def isRunning(self):
+        return False
+
+    def start(self):
+        self.started = True
+
+
+def main() -> int:
+    global ok
+    print("=" * 70)
+    print("Phase 13 Schritt 4 – UI-Integration Service-Fenster (headless)")
+    print("=" * 70)
+
+    # [1] py_compile
+    print("\n[1] py_compile auf UI-Klassen:")
+    try:
+        py_compile.compile(
+            str(Path("service_win.py").resolve()), doraise=True
+        )
+        check(True, "service_win.py kompiliert fehlerfrei")
+    except Exception as e:
+        check(False, f"py_compile service_win.py: {e}")
+    ui_file = Path("ui/service_win.ui")
+    check(ui_file.exists(), f"ui/service_win.ui existiert ({ui_file.stat().st_size} Bytes)")
+
+    # [2] Setup: offscreen QApplication + temp Repo + Mocks
+    print("\n[2] Setup (offscreen, temp DB, Mocks):")
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    # QMessageBox.warning wird gemockt (Kein echter Dialog). Verhalten steuerbar.
+    warning_results = {"next": QMessageBox.No}
+
+    def fake_warning(*a, **k):
+        return warning_results["next"]
+
+    QMessageBox.warning = staticmethod(fake_warning)
+
+    # PersistentWindow: StateManager -> Fake (keine echte DB)
+    import persistent_win
+    persistent_win.StateManager = FakeStateManager
+
+    import service_win
+    service_win.ServiceSetRunWorker = _FakeRunWorker  # kein echter Thread
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    check(app is not None, "QApplication (offscreen) erstellt")
+
+    tmp_dir = tempfile.mkdtemp(prefix="p13_s4_")
+    tmp_db = os.path.join(tmp_dir, "tmp_app_data.duckdb")
+    repo = ServiceSetRepository(db_path=tmp_db)
+
+    # Beispiel-Set in die temp DB legen (wie es z.B. Schritt 5 erzeugen würde)
+    repo.save_set({
+        "set_id": "set_a",
+        "display_name": "Mein Scalper",
+        "execution_order": ["grid_1", "prox_1"],
+        "services": {
+            "grid_1": {"plugin_id": "grid_liquidity", "lookback": 1000, "params": {"grid_step": 0.5}},
+            "prox_1": {"plugin_id": "grid_liquidity", "lookback": 10000, "params": {}},
+        },
+    })
+
+    win = service_win.ServiceWindow(service_set_repo=repo)
+    check(win is not None, "ServiceWindow instanziiert (ohne exec_())")
+
+    # [3] Widgets gefunden (UI-Erweiterung korrekt geladen)
+    print("\n[3] Service-Set-Widgets vorhanden:")
+    check(win.combo_set is not None, "combo_set (Set-Dropdown) gefunden")
+    check(win.combo_tf_set is not None, "combo_tf_set gefunden")
+    check(win.edit_set_name is not None, "edit_set_name gefunden")
+    check(win.list_execution_order is not None, "list_execution_order gefunden")
+    check(win.btn_move_up is not None and win.btn_move_down is not None,
+          "btn_move_up / btn_move_down gefunden")
+    check(win.btn_save_set is not None and win.btn_delete_set is not None,
+          "btn_save_set / btn_delete_set gefunden")
+    check(win.btn_execute_set is not None, "btn_execute_set gefunden")
+
+    # [4] list_sets() -> Dropdown
+    print("\n[4] Set-Dropdown aus list_sets():")
+    win.refresh_set_list()
+    check(win.combo_set.count() == 1, f"1 Set im Dropdown (count={win.combo_set.count()})")
+    check(win.combo_set.currentData() == "set_a", "Dropdown zeigt set_a")
+
+    # [5] Laden in Editor
+    print("\n[5] Laden in Editor (Name + execution_order):")
+    check(win.edit_set_name.text() == "Mein Scalper", "Name geladen")
+    check(win.list_execution_order.count() == 2,
+          f"execution_order-Liste: 2 Einträge (count={win.list_execution_order.count()})")
+    order = win.collect_current_order()
+    check(order == ["grid_1", "prox_1"], f"Reihenfolge korrekt: {order}")
+
+    # [6] Up/Down-Umsortierung
+    print("\n[6] Up/Down-Umsortierung:")
+    win.list_execution_order.setCurrentRow(1)  # prox_1 markieren
+    win.move_order_item(-1)
+    check(win.collect_current_order() == ["prox_1", "grid_1"],
+          f"Nach ▲: {win.collect_current_order()}")
+    win.list_execution_order.setCurrentRow(0)
+    win.move_order_item(1)
+    check(win.collect_current_order() == ["grid_1", "prox_1"],
+          f"Nach ▼: {win.collect_current_order()}")
+    # Grenzen: oben kann nicht weiter hoch, unten nicht weiter runter
+    win.list_execution_order.setCurrentRow(0)
+    win.move_order_item(-1)
+    check(win.collect_current_order() == ["grid_1", "prox_1"], "Grenze oben stabil")
+    win.list_execution_order.setCurrentRow(1)
+    win.move_order_item(1)
+    check(win.collect_current_order() == ["grid_1", "prox_1"], "Grenze unten stabil")
+
+    # [7] add_instance / remove_instance
+    print("\n[7] add_instance / remove_instance:")
+    win.edit_new_instance.setText("grid_2 [grid_liquidity]")
+    win.add_instance()
+    check(win.list_execution_order.count() == 3, "grid_2 hinzugefügt (count=3)")
+    win.edit_new_instance.setText("grid_2 [grid_liquidity]")
+    win.add_instance()
+    check(win.list_execution_order.count() == 3, "Duplikat grid_2 abgelehnt")
+    win.edit_new_instance.setText("kaputt [gibt_es_nicht]")
+    win.add_instance()
+    check(win.list_execution_order.count() == 3, "Unbekanntes Plugin abgelehnt")
+    win.list_execution_order.setCurrentRow(2)
+    win.remove_instance()
+    check(win.list_execution_order.count() == 2, "remove_instance entfernt grid_2")
+
+    # [8] save_set (leerer Name -> Auto-Name)
+    print("\n[8] save_set (leerer Name -> Auto-Name):")
+    win.edit_set_name.clear()
+    win._current_set_id = None  # als NEUES Set speichern
+    win.save_set()
+    # Neues Set (grid_1 + prox_1) in der DB prüfen
+    sets = repo.list_sets()
+    saved = next((s for s in sets if s["set_id"] != "set_a"), None)
+    check(saved is not None, "Neues Set gespeichert")
+    check(saved["display_name"] == "grid_1 + prox_1",
+          f"Auto-Name = 'grid_1 + prox_1' (tatsächlich: '{saved['display_name']}')")
+    check(saved["services"]["grid_1"]["plugin_id"] == "grid_liquidity",
+          "services aus Registry-Defaults aufgebaut (plugin_id=grid_liquidity)")
+    check(saved["execution_order"] == ["grid_1", "prox_1"],
+          "execution_order des neuen Sets korrekt")
+
+    # [9] delete_set mit Rückfrage
+    print("\n[9] delete_set (QMessageBox-Rückfrage):")
+    warning_results["next"] = QMessageBox.No
+    win.combo_set.setCurrentIndex(win.combo_set.findData("set_a"))
+    win.delete_set()
+    check(repo.get_set("set_a") is not None, "Bei 'No' wird NICHT gelöscht")
+
+    warning_results["next"] = QMessageBox.Yes
+    win.delete_set()
+    check(repo.get_set("set_a") is None, "Bei 'Yes' wird gelöscht")
+    check(win.combo_set.count() == 1, "Nur das verbleibende Set im Dropdown")
+
+    # [10] execute_set startet Worker mit korrekten Argumenten
+    print("\n[10] execute_set startet ServiceSetRunWorker:")
+    # Das verbleibende (neue) Set laden
+    win.combo_set.setCurrentIndex(win.combo_set.findData(saved["set_id"]))
+    win.execute_set()
+    worker = win._set_run_worker
+    check(worker is not None, "Worker instanziiert")
+    check(getattr(worker, "started", False), "Worker.start() aufgerufen (kein exec_())")
+    check(worker.args[1] == win.combo_symbol.currentText(), "Symbol korrekt übergeben")
+    check(worker.args[2] == "M1", "Timeframe korrekt übergeben (Default M1)")
+    check(worker.args[3]["execution_order"] == ["grid_1", "prox_1"],
+          "definition mit execution_order übergeben")
+
+    # [11] execute_set ohne execution_order -> kein Worker (Guard)
+    print("\n[11] execute_set ohne execution_order -> Guard:")
+    win.list_execution_order.clear()
+    win._current_set_id = None
+    worker_before = win._set_run_worker
+    win.execute_set()
+    check(win._set_run_worker is worker_before,
+          "Kein neuer Worker bei leerer execution_order")
+    check(win.collect_set_definition()["execution_order"] == [],
+          "Leere Liste -> leere execution_order")
+
+    # Aufräumen
+    try:
+        os.remove(tmp_db)
+        os.rmdir(tmp_dir)
+    except Exception:
+        pass
+
+    print()
+    if ok:
+        print("RESULT: ALLE CHECKS BESTANDEN \u2705")
+        return 0
+    print(f"RESULT: {len(failures)} CHECK(S) FEHLGESCHLAGEN \u274c")
+    for f in failures:
+        print(f"   - {f}")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_p13_s5.py
+```py
+# test/check_p13_s5.py
+# Headless-Validierung für Phase 13 Schritt 5 (UI-Integration – Indikator
+# Prop-Fenster & Expert-Modus).
+#
+# Validiert laut Roadmap §5.3:
+#   - Simulierte Formulargenerierung anhand eines Schemas
+#   - expert-Felder landen im korrekten Unter-Layout (ausklappbare QGroupBox)
+# Zusätzlich geprüft:
+#   - min/max/step exakt aus dem ParameterSchema auf QDoubleSpinBox/QSpinBox
+#   - Reihenfolge/Labels aus parameter_order/param_labels der Definition
+#   - Indi-Props (Sichtbarkeit, Farben) oberhalb der Trennlinie (nicht Expert)
+#   - QStackedWidget: Seite 0 = aktive Service-Parameter, weitere = Set-Services
+#   - Set-Dropdown aus ServiceSetRepository.list_sets()
+#   - Plugin-Metadaten (description, author, version) als QLabel im Expert-Bereich
+#   - Set-Aktionen: Speichern / Ausführen / Löschen (mit QMessageBox-Gegenfrage)
+#   - Integration mit echtem Plugin grid_liquidity (prox_level1-6 im
+#     SERVICE-Abschnitt, lookback als Basis-Parameter im Expert-Bereich)
+#   - Abwärtskompatibilität: Alt-Indikator ohne Plugin → Legacy-Layout
+#
+# WICHTIG: Keine GUI-Ausführung (exec_()). Offscreen-QApplication + gemockte
+# Dialoge + gemockter Worker. Arbeitet auf einer temporären DB.
+import os
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any, Dict, List
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import py_compile
+
+from analytics.engine.service_set_repository import ServiceSetRepository
+
+ok = True
+failures = []
+
+
+def check(cond, msg):
+    global ok
+    if cond:
+        print(f"   \u2705 {msg}")
+    else:
+        ok = False
+        failures.append(msg)
+        print(f"   \u274c {msg}")
+
+
+def is_child_of(widget, parent) -> bool:
+    """True, wenn widget (direkt oder indirekt) unter parent im Widget-Baum liegt."""
+    w = widget.parent()
+    while w is not None:
+        if w is parent:
+            return True
+        w = w.parent()
+    return False
+
+
+# -----------------------------------------------------------------------------
+# Mocks & Fakes
+# -----------------------------------------------------------------------------
+class FakeStateManager:
+    """Ersetzt StateManager im Dialog – keine echte DB-Verbindung."""
+
+    def get_dialog_geometry(self, *a, **k):
+        return None
+
+    def save_dialog_geometry(self, *a, **k):
+        pass
+
+    def list_indicator_presets(self, *a, **k):
+        return ["Default"]
+
+    def get_indicator_preset(self, *a, **k):
+        return None
+
+    def save_indicator_preset(self, *a, **k):
+        pass
+
+    def delete_indicator_preset(self, *a, **k):
+        pass
+
+
+class _FakeSignal:
+    def __init__(self):
+        self.slots = []
+
+    def connect(self, slot):
+        self.slots.append(slot)
+
+
+class _FakeWorker:
+    """Ersetzt DialogServiceSetRunWorker: zeichnet Argumente auf, startet NICHTS."""
+
+    run_finished = _FakeSignal()
+    run_failed = _FakeSignal()
+
+    def __init__(self, *a, **k):
+        self.args = a
+        self.kwargs = k
+
+    def isRunning(self):
+        return False
+
+    def start(self):
+        self.started = True
+
+
+class FakePlugin:
+    """Fake-PluginFeature (kein echtes Plugin, nur Schema/Metadaten)."""
+
+    plugin_id = "fake_plugin"
+
+    @property
+    def version(self) -> str:
+        return "2.3.1"
+
+    @property
+    def metadata(self) -> Dict[str, Any]:
+        return {
+            "category": "Test",
+            "display_name": "Fake Plugin",
+            "description": "Test-Beschreibung fuer das Prop-Fenster",
+            "author": "Tester",
+            "tags": ["test"],
+        }
+
+    @property
+    def parameter_schema(self) -> Dict[str, Dict[str, Any]]:
+        return {
+            "show_lines": {"type": "bool", "default": True, "description": "Linien anzeigen"},
+            "line_color": {"type": "color", "default": "#2196F3", "description": "Linien-Farbe"},
+            "grid_step": {"type": "float", "default": 0.50, "min": 0.01, "max": 100.0, "step": 0.05, "description": "Rasterabstand"},
+            "custom_level1": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 1", "expert": True},
+            "lookback": {"type": "int", "default": 1000, "min": 100, "max": 5000, "step": 50, "description": "Lookback", "expert": True},
+        }
+
+    @property
+    def parameter_order(self) -> List[str]:
+        return ["show_lines", "line_color", "grid_step", "custom_level1", "lookback"]
+
+    @property
+    def param_labels(self) -> Dict[str, str]:
+        return {
+            "show_lines": "Linien anzeigen",
+            "line_color": "Linien-Farbe",
+            "grid_step": "Rasterabstand",
+            "custom_level1": "Level 1",
+            "lookback": "Lookback",
+        }
+
+    @property
+    def default_params(self) -> Dict[str, Any]:
+        return {k: v["default"] for k, v in self.parameter_schema.items() if "default" in v}
+
+
+class FakePluginIndicator:
+    """BaseIndicator-Adapter, der das FakePlugin über _plugin_id exponiert."""
+
+    _plugin_id = "fake_plugin"
+    indicator_id = "fake_plugin"
+    display_name = "Fake Plugin"
+    param_options = {}
+
+    @property
+    def default_params(self) -> Dict[str, Any]:
+        return dict(FakePlugin().default_params)
+
+    def calculate(self, df, params):
+        return {"lines": [], "hit_circles": []}
+
+
+class PlainIndicator:
+    """Alt-Indikator OHNE Plugin-Schema (Legacy-Pfad)."""
+
+    indicator_id = "plain"
+    display_name = "Plain"
+    param_options = {}
+    param_layout = [("Basics", ["alpha", "beta"])]
+    param_labels = {"alpha": "Alpha", "beta": "Beta"}
+
+    @property
+    def default_params(self) -> Dict[str, Any]:
+        return {"alpha": 0.5, "beta": 2}
+
+    def calculate(self, df, params):
+        return {}
+
+
+def main() -> int:
+    global ok
+    print("=" * 70)
+    print("Phase 13 Schritt 5 – Indikator Prop-Fenster & Expert-Modus (headless)")
+    print("=" * 70)
+
+    # [1] py_compile
+    print("\n[1] py_compile auf indicator_dialog.py:")
+    try:
+        py_compile.compile(str(Path("chart/indicator_dialog.py").resolve()), doraise=True)
+        check(True, "indicator_dialog.py kompiliert fehlerfrei")
+    except Exception as e:
+        check(False, f"py_compile indicator_dialog.py: {e}")
+
+    # [2] Setup: offscreen QApplication + temp Repo + Mocks
+    print("\n[2] Setup (offscreen, temp DB, Mocks):")
+    from PySide6.QtWidgets import (
+        QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QGroupBox, QLabel,
+        QLineEdit, QMessageBox, QPushButton, QSpinBox,
+    )
+
+    # QMessageBox.warning wird gemockt (Kein echter Dialog). Verhalten steuerbar.
+    warning_results = {"next": QMessageBox.No}
+
+    def fake_warning(*a, **k):
+        return warning_results["next"]
+
+    QMessageBox.warning = staticmethod(fake_warning)
+
+    # Worker mocken (kein echter Thread)
+    import chart.indicator_dialog as indicator_dialog
+    indicator_dialog.DialogServiceSetRunWorker = _FakeWorker
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    check(app is not None, "QApplication (offscreen) erstellt")
+
+    # Fake-Plugin in die PluginRegistry injizieren
+    from analytics.features.feature_builder import PluginRegistry
+    registry = PluginRegistry()
+    registry.plugins[FakePlugin.plugin_id] = FakePlugin()
+
+    tmp_dir = tempfile.mkdtemp(prefix="p13_s5_")
+    tmp_db = os.path.join(tmp_dir, "tmp_app_data.duckdb")
+    repo = ServiceSetRepository(db_path=tmp_db)
+
+    fsm = FakeStateManager()
+    callbacks = []
+
+    def on_change(p, pr):
+        callbacks.append((dict(p), pr))
+
+    # [3] Plugin-Modus: Formulargenerierung aus Fake-Schema
+    print("\n[3] Plugin-Modus (Fake-Schema):")
+    win = indicator_dialog.IndicatorSettingsDialog(
+        FakePluginIndicator(), dict(FakePlugin().default_params), "Default", fsm,
+        on_change, symbol="SILVER", timeframe="H1", service_set_repo=repo,
+    )
+    check(win is not None, "Dialog instanziiert (ohne exec_())")
+    check(win.plugin is not None, "Plugin erkannt (Plugin-Modus aktiv)")
+
+    # Indi-Props (Sichtbarkeit, Farben)
+    check("show_lines" in win.param_controls and isinstance(win.param_controls["show_lines"], QCheckBox),
+          "Indi-Prop show_lines als QCheckBox generiert")
+    check("line_color" in win.param_controls and isinstance(win.param_controls["line_color"], QLineEdit),
+          "Indi-Prop line_color (color) als QLineEdit generiert")
+    check(not is_child_of(win.param_controls["show_lines"], win.group_expert),
+          "show_lines liegt NICHT im Expert-Bereich")
+    check(not is_child_of(win.param_controls["line_color"], win.group_expert),
+          "line_color liegt NICHT im Expert-Bereich")
+
+    # Service-Props (Berechnung) – Seite 0 im QStackedWidget
+    check("grid_step" in win.param_controls, "Service-Prop grid_step generiert")
+    gs = win.param_controls["grid_step"]
+    check(isinstance(gs, QDoubleSpinBox), "grid_step als QDoubleSpinBox generiert")
+    check(gs.minimum() == 0.01, f"grid_step min = 0.01 (tatsächlich {gs.minimum()})")
+    check(gs.maximum() == 100.0, f"grid_step max = 100.0 (tatsächlich {gs.maximum()})")
+    check(gs.singleStep() == 0.05, f"grid_step step = 0.05 (tatsächlich {gs.singleStep()})")
+    check(not is_child_of(gs, win.group_expert), "grid_step liegt NICHT im Expert-Bereich")
+
+    # Expert-Felder im Unter-Layout
+    check(win.group_expert is not None and win.group_expert.isCheckable(),
+          "Expert-Bereich ist ausklappbare QGroupBox (checkable)")
+    check(not win.group_expert.isChecked(), "Expert-Bereich initial zugeklappt")
+    cl1 = win.param_controls.get("custom_level1")
+    check(cl1 is not None and isinstance(cl1, QDoubleSpinBox), "Expert-Feld custom_level1 als QDoubleSpinBox")
+    check(cl1 is not None and is_child_of(cl1, win.group_expert),
+          "custom_level1 liegt im Expert-Bereich (Unter-Layout)")
+    lb = win.param_controls.get("lookback")
+    check(lb is not None and isinstance(lb, QSpinBox), "Expert-Feld lookback als QSpinBox")
+    check(lb is not None and lb.minimum() == 100 and lb.maximum() == 5000 and lb.singleStep() == 50,
+          f"lookback min/max/step = 100/5000/50 (tatsächlich {lb.minimum()}/{lb.maximum()}/{lb.singleStep()})")
+    check(lb is not None and is_child_of(lb, win.group_expert),
+          "lookback liegt im Expert-Bereich (Unter-Layout)")
+
+    # Plugin-Metadaten als QLabel im Expert-Bereich
+    meta_found = any(
+        "Test-Beschreibung" in lbl.text() and "Autor: Tester" in lbl.text() and "v2.3.1" in lbl.text()
+        for lbl in win.group_expert.findChildren(QLabel)
+    )
+    check(meta_found, "Plugin-Metadaten (description, author, version) als QLabel im Expert-Bereich")
+
+    # Set-Widgets vorhanden
+    print("\n[4] Service-Set-Widgets:")
+    check(win.combo_service_set is not None, "combo_service_set (Set-Dropdown) gefunden")
+    check(win.combo_service_sel is not None, "combo_service_sel (Service-Auswahl) gefunden")
+    check(win.stack_service_forms is not None and win.stack_service_forms.count() >= 1,
+          f"QStackedWidget mit mind. 1 Seite (count={win.stack_service_forms.count()})")
+    check(win.edit_set_name is not None, "edit_set_name gefunden")
+    check(win.btn_save_set is not None and win.btn_execute_set is not None and win.btn_delete_set is not None,
+          "Set-Aktionen (Speichern/Ausführen/Löschen) gefunden")
+
+    # [5] Set-Dropdown aus list_sets()
+    print("\n[5] Set-Dropdown aus list_sets():")
+    repo.save_set({
+        "set_id": "set_a",
+        "display_name": "Mein Scalper",
+        "execution_order": ["grid_1", "prox_1"],
+        "services": {
+            "grid_1": {"plugin_id": "grid_liquidity", "lookback": 1000, "params": {"grid_step": 0.5}},
+            "prox_1": {"plugin_id": "grid_liquidity", "lookback": 10000, "params": {}},
+        },
+    })
+    win.refresh_service_set_list()
+    check(win.combo_service_set.count() == 2,
+          f"Dropdown: '- kein Set -' + 1 Set (count={win.combo_service_set.count()})")
+    check(win.combo_service_set.findData("set_a") >= 0, "set_a im Dropdown vorhanden")
+
+    # Set laden → Service-Combo + Stack-Seiten
+    win.combo_service_set.setCurrentIndex(win.combo_service_set.findData("set_a"))
+    check(win._current_set_definition is not None, "Set geladen (_current_set_definition gesetzt)")
+    check(win.edit_set_name.text() == "Mein Scalper", "Set-Name in Editor geladen")
+    check(win.combo_service_sel.count() == 2, f"Service-Auswahl: 2 Services (count={win.combo_service_sel.count()})")
+    check(win.stack_service_forms.count() == 3,
+          f"QStackedWidget: Seite 0 (Plugin) + 2 Service-Seiten (count={win.stack_service_forms.count()})")
+    check(any(k.startswith("grid_1:") for k in win._set_param_controls),
+          "Set-Service grid_1: Parameter-Controls generiert")
+
+    # [6] Set-Aktionen
+    print("\n[6] Set-Aktionen (headless):")
+    # Speichern eines NEUEN Sets aus dem aktiven Plugin (kein Set geladen)
+    win.combo_service_set.setCurrentIndex(0)  # '- kein Set -'
+    win.edit_set_name.clear()
+    win.save_service_set()
+    sets = repo.list_sets()
+    check(len(sets) == 2, f"Neues Set gespeichert (Sets in DB: {len(sets)})")
+    saved = next((s for s in sets if s["set_id"] != "set_a"), None)
+    check(saved is not None and saved["execution_order"] == ["fake_plugin"],
+          "Neues Set: execution_order = ['fake_plugin']")
+    check(saved is not None and "grid_step" in saved["services"]["fake_plugin"]["params"],
+          "Neues Set: Service-Params aus aktiven Controls übernommen")
+    check(saved is not None and saved["services"]["fake_plugin"].get("lookback") == 1000,
+          "Neues Set: lookback als Service-Instanz-Einstellung gespeichert (=1000)")
+    check(saved is not None and "lookback" not in saved["services"]["fake_plugin"].get("params", {}),
+          "Neues Set: lookback NICHT in params (Instanz-Feld)")
+    check(saved is not None and saved["display_name"] == "fake_plugin",
+          f"Auto-Name = 'fake_plugin' (tatsächlich: '{saved['display_name']}')")
+
+    # Löschen mit Rückfrage
+    warning_results["next"] = QMessageBox.No
+    win.combo_service_set.setCurrentIndex(win.combo_service_set.findData("set_a"))
+    win.delete_service_set()
+    check(repo.get_set("set_a") is not None, "Bei 'No' wird NICHT gelöscht")
+    warning_results["next"] = QMessageBox.Yes
+    win.delete_service_set()
+    check(repo.get_set("set_a") is None, "Bei 'Yes' wird gelöscht")
+
+    # Ausführen startet Worker mit korrekten Argumenten
+    win.execute_service_set()
+    worker = win._set_run_worker
+    check(worker is not None, "Worker instanziiert (execute_service_set)")
+    check(getattr(worker, "started", False), "Worker.start() aufgerufen (kein exec_())")
+    check(worker.args[1] == "SILVER" and worker.args[2] == "H1",
+          "Symbol/Timeframe korrekt an den Worker übergeben")
+    check(worker.args[3]["execution_order"] == ["fake_plugin"],
+          "Definition mit execution_order an den Worker übergeben")
+
+    # [7] Integration mit echtem Plugin grid_liquidity
+    print("\n[7] Integration mit echtem Plugin grid_liquidity:")
+    from chart.indicators.grid_liquidity import GridLiquidityIndicator
+    ind = GridLiquidityIndicator()
+    win2 = indicator_dialog.IndicatorSettingsDialog(
+        ind, dict(ind.default_params), "Default", fsm, on_change,
+        symbol="SILVER", timeframe="H1", service_set_repo=repo,
+    )
+    check(win2.plugin is not None and win2.plugin.plugin_id == "grid_liquidity",
+          "Plugin grid_liquidity erkannt")
+    check("show_lines" in win2.param_controls and isinstance(win2.param_controls["show_lines"], QCheckBox),
+          "show_lines als Indi-Prop (QCheckBox)")
+    check("line_color" in win2.param_controls and isinstance(win2.param_controls["line_color"], QLineEdit),
+          "line_color als Indi-Prop (QLineEdit)")
+    gs2 = win2.param_controls.get("grid_step")
+    check(gs2 is not None and isinstance(gs2, QDoubleSpinBox)
+          and gs2.minimum() == 0.01 and gs2.maximum() == 100.0 and gs2.singleStep() == 0.05,
+          "grid_step: min/max/step exakt aus Schema (0.01/100.0/0.05)")
+    check(not is_child_of(win2.param_controls["show_lines"], win2.group_expert),
+          "show_lines NICHT im Expert-Bereich (oberhalb Trennlinie)")
+    check(not is_child_of(gs2, win2.group_expert), "grid_step NICHT im Expert-Bereich")
+    # Die 6 Custom-Level gehören in den SERVICE-Abschnitt (Seite 0 der Stack),
+    # NICHT in den Expert-Bereich (User-Vorgabe).
+    for i in range(1, 7):
+        key = f"prox_level{i}"
+        ctrl = win2.param_controls.get(key)
+        check(ctrl is not None, f"{key} als Service-Prop generiert")
+        check(ctrl is not None and is_child_of(ctrl, win2.stack_service_forms),
+              f"{key} liegt im SERVICE-Abschnitt (Stack-Seite 0)")
+        check(ctrl is not None and not is_child_of(ctrl, win2.group_expert),
+              f"{key} NICHT im Expert-Bereich")
+    # lookback (Basis-Parameter) ist das EINZIGE Feld im Expert-Bereich
+    lb2 = win2.param_controls.get("lookback")
+    check(lb2 is not None and isinstance(lb2, QSpinBox),
+          "lookback (Basis-Parameter) als QSpinBox generiert")
+    check(lb2 is not None and lb2.minimum() == 100 and lb2.maximum() == 100000 and lb2.singleStep() == 50,
+          f"lookback min/max/step = 100/100000/50 (tatsächlich {lb2.minimum()}/{lb2.maximum()}/{lb2.singleStep()})")
+    check(lb2 is not None and is_child_of(lb2, win2.group_expert),
+          "lookback liegt im Expert-Bereich (Unter-Layout)")
+    expert_controls = [k for k, c in win2.param_controls.items() if is_child_of(c, win2.group_expert)]
+    check(expert_controls == ["lookback"],
+          f"NUR lookback im Expert-Bereich (tatsächlich: {expert_controls})")
+    meta2 = any(
+        "Grid Liquidity & Proximity" in lbl.text() and "PyTrader AI" in lbl.text() and "v1.0.0" in lbl.text()
+        for lbl in win2.group_expert.findChildren(QLabel)
+    )
+    check(meta2, "Metadaten grid_liquidity (display_name, author, version) im Expert-Bereich")
+
+    # [8] Abwärtskompatibilität: Alt-Indikator ohne Plugin → Legacy-Layout
+    print("\n[8] Abwärtskompatibilität (Alt-Indikator ohne Plugin):")
+    win3 = indicator_dialog.IndicatorSettingsDialog(
+        PlainIndicator(), dict(PlainIndicator().default_params), "Default", fsm, on_change,
+        service_set_repo=repo,
+    )
+    check(win3.plugin is None, "Kein Plugin erkannt (Legacy-Modus)")
+    check(not hasattr(win3, "combo_service_set") or win3.combo_service_set is None,
+          "Legacy: keine Service-Set-Widgets")
+    check(not hasattr(win3, "group_expert") or win3.group_expert is None,
+          "Legacy: kein Expert-Bereich")
+    check("alpha" in win3.param_controls, "Legacy: Parameter alpha generiert")
+    check("beta" in win3.param_controls, "Legacy: Parameter beta generiert")
+
+    # [9] collect_params_from_ui liefert alle Schema-Keys (Plugin-Modus)
+    print("\n[9] collect_params_from_ui (Plugin-Modus):")
+    collected = win2.collect_params_from_ui()
+    missing = [k for k in win2.plugin_schema if k not in collected]
+    check(not missing, f"Alle Schema-Keys in collect_params_from_ui (fehlend: {missing})")
+    check(collected.get("prox_level1") == 0.0, "Service-Wert prox_level1 in params enthalten")
+
+    # Aufräumen
+    registry.plugins.pop(FakePlugin.plugin_id, None)
+    try:
+        os.remove(tmp_db)
+        os.rmdir(tmp_dir)
+    except Exception:
+        pass
+
+    print()
+    if ok:
+        print("RESULT: ALLE CHECKS BESTANDEN \u2705")
+        return 0
+    print(f"RESULT: {len(failures)} CHECK(S) FEHLGESCHLAGEN \u274c")
+    for f in failures:
+        print(f"   - {f}")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/check_phase12_step1_migration.py
 ```py
 # test/check_phase12_step1_migration.py
@@ -22138,8 +25274,8 @@ print("LOCKTEST FERTIG")
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>500</width>
-    <height>300</height>
+    <width>640</width>
+    <height>580</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -22221,6 +25357,247 @@ print("LOCKTEST FERTIG")
       <property name="text">
        <string>Scan starten</string>
       </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QGroupBox" name="group_service_sets">
+      <property name="title">
+       <string>Service-Sets (Phase 13)</string>
+      </property>
+      <layout class="QVBoxLayout" name="verticalLayout_sets">
+       <item>
+        <layout class="QHBoxLayout" name="layout_set_select">
+         <item>
+          <widget class="QLabel" name="label_set">
+           <property name="text">
+            <string>Set:</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QComboBox" name="combo_set">
+           <property name="toolTip">
+            <string>Gespeicherte Service-Sets (aus ServiceSetRepository.list_sets()).</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btn_refresh_sets">
+           <property name="text">
+            <string>Aktualisieren</string>
+           </property>
+           <property name="toolTip">
+            <string>Set-Liste neu aus der Datenbank laden.</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="layout_set_tf">
+         <item>
+          <widget class="QLabel" name="label_tf_set">
+           <property name="text">
+            <string>Timeframe:</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QComboBox" name="combo_tf_set">
+           <property name="toolTip">
+            <string>Timeframe für die Ausführung des Service-Sets.</string>
+           </property>
+           <item>
+            <property name="text">
+             <string>M1</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>M5</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>M15</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>M30</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>H1</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>H4</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>D1</string>
+            </property>
+           </item>
+          </widget>
+         </item>
+         <item>
+          <spacer name="horizontalSpacer_tf">
+           <property name="orientation">
+            <enum>Qt::Orientation::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="layout_set_name">
+         <item>
+          <widget class="QLabel" name="label_set_name">
+           <property name="text">
+            <string>Name:</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLineEdit" name="edit_set_name">
+           <property name="toolTip">
+            <string>Set-Name. Leer beim Speichern → automatischer Name aus den instance_ids (z.B. "grid_1 + prox_1").</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="layout_set_order">
+         <item>
+          <widget class="QListWidget" name="list_execution_order">
+           <property name="toolTip">
+            <string>Ausführungs-Reihenfolge der Services (instance_id [plugin_id]).</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <layout class="QVBoxLayout" name="layout_order_buttons">
+           <item>
+            <widget class="QPushButton" name="btn_move_up">
+             <property name="text">
+              <string>▲</string>
+             </property>
+             <property name="toolTip">
+              <string>Service in der Reihenfolge nach oben verschieben.</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QPushButton" name="btn_move_down">
+             <property name="text">
+              <string>▼</string>
+             </property>
+             <property name="toolTip">
+              <string>Service in der Reihenfolge nach unten verschieben.</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QPushButton" name="btn_remove_instance">
+             <property name="text">
+              <string>Entfernen</string>
+             </property>
+             <property name="toolTip">
+              <string>Markierten Service aus der Reihenfolge entfernen.</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <spacer name="verticalSpacer_order">
+             <property name="orientation">
+              <enum>Qt::Orientation::Vertical</enum>
+             </property>
+             <property name="sizeHint" stdset="0">
+              <size>
+               <width>20</width>
+               <height>40</height>
+              </size>
+             </property>
+            </spacer>
+           </item>
+          </layout>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="layout_set_add">
+         <item>
+          <widget class="QLineEdit" name="edit_new_instance">
+           <property name="placeholderText">
+            <string>instance_id [plugin_id]  z.B. grid_1 [grid_liquidity]</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btn_add_instance">
+           <property name="text">
+            <string>Hinzufügen</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="layout_set_actions">
+         <item>
+          <widget class="QPushButton" name="btn_save_set">
+           <property name="text">
+            <string>Speichern</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btn_delete_set">
+           <property name="text">
+            <string>Löschen</string>
+           </property>
+           <property name="toolTip">
+            <string>Set löschen (mit Rückfrage). Löschen ist final.</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <spacer name="horizontalSpacer_actions">
+           <property name="orientation">
+            <enum>Qt::Orientation::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btn_execute_set">
+           <property name="text">
+            <string>Ausführen</string>
+           </property>
+           <property name="toolTip">
+            <string>Startet den ServiceSetEvaluator.execute_set für das aktive Set (Services nacheinander in execution_order).</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+      </layout>
      </widget>
     </item>
     <item>
