@@ -388,7 +388,13 @@ class IndicatorSettingsDialog(QDialog):
 		line.setFrameShadow(QFrame.Sunken)
 		main_layout.addWidget(line)
 
-		# --- 3) Service-Bereich (Set-Auswahl + QStackedWidget pro Service) ---
+		# --- 3) Hauptzeile: Service-Parameter (links) | Aktionen + Expert (rechts) ---
+		# Rechts neben dem Service-Parameter-Rahmen stehen die Set-Aktionen
+		# (oben) und darunter der Expert-Bereich. Dadurch wird der Dialog
+		# deutlich flacher und passt auf kleinere Bildschirme.
+		main_row = QHBoxLayout()
+
+		# --- 3a) Service-Bereich (Set-Auswahl + QStackedWidget pro Service) ---
 		svc_group = QGroupBox("Service-Parameter")
 		svc_layout = QVBoxLayout(svc_group)
 
@@ -409,9 +415,36 @@ class IndicatorSettingsDialog(QDialog):
 		self.stack_service_forms = QStackedWidget()
 		svc_layout.addWidget(self.stack_service_forms)
 
-		main_layout.addWidget(svc_group)
+		main_row.addWidget(svc_group, 1)
 
-		# --- 4) Expert-Bereich (ausklappbar) mit Plugin-Metadaten ---
+		# --- 3b) Rechte Spalte: Set-Aktionen (oben) + Expert-Bereich (darunter) ---
+		right_col = QVBoxLayout()
+
+		# Set-Aktionen: Name / Speichern / Ausführen / Löschen
+		act_group = QGroupBox("Service-Set Aktionen")
+		act_layout = QVBoxLayout(act_group)
+
+		name_row = QHBoxLayout()
+		name_row.addWidget(QLabel("Name:"))
+		self.edit_set_name = QLineEdit()
+		name_row.addWidget(self.edit_set_name)
+		act_layout.addLayout(name_row)
+
+		btn_row = QHBoxLayout()
+		self.btn_save_set = QPushButton("💾 Set speichern")
+		self.btn_save_set.clicked.connect(self.save_service_set)
+		btn_row.addWidget(self.btn_save_set)
+		self.btn_execute_set = QPushButton("▶ Set ausführen")
+		self.btn_execute_set.clicked.connect(self.execute_service_set)
+		btn_row.addWidget(self.btn_execute_set)
+		self.btn_delete_set = QPushButton("❌ Set löschen")
+		self.btn_delete_set.clicked.connect(self.delete_service_set)
+		btn_row.addWidget(self.btn_delete_set)
+		act_layout.addLayout(btn_row)
+
+		right_col.addWidget(act_group)
+
+		# Expert-Bereich (ausklappbar) mit Plugin-Metadaten
 		self.group_expert = QGroupBox("Experten-Optionen")
 		self.group_expert.setCheckable(True)
 		self.group_expert.setChecked(False)
@@ -441,31 +474,11 @@ class IndicatorSettingsDialog(QDialog):
 			expert_form.addRow(self.plugin_labels.get(key, self._human(key)), ctrl)
 		expert_layout.addLayout(expert_form)
 
-		main_layout.addWidget(self.group_expert)
+		right_col.addWidget(self.group_expert)
+		right_col.addStretch(1)
 
-		# --- 5) Set-Aktionen: Name / Speichern / Ausführen / Löschen ---
-		act_group = QGroupBox("Service-Set Aktionen")
-		act_layout = QVBoxLayout(act_group)
-
-		name_row = QHBoxLayout()
-		name_row.addWidget(QLabel("Name:"))
-		self.edit_set_name = QLineEdit()
-		name_row.addWidget(self.edit_set_name)
-		act_layout.addLayout(name_row)
-
-		btn_row = QHBoxLayout()
-		self.btn_save_set = QPushButton("💾 Set speichern")
-		self.btn_save_set.clicked.connect(self.save_service_set)
-		btn_row.addWidget(self.btn_save_set)
-		self.btn_execute_set = QPushButton("▶ Set ausführen")
-		self.btn_execute_set.clicked.connect(self.execute_service_set)
-		btn_row.addWidget(self.btn_execute_set)
-		self.btn_delete_set = QPushButton("❌ Set löschen")
-		self.btn_delete_set.clicked.connect(self.delete_service_set)
-		btn_row.addWidget(self.btn_delete_set)
-		act_layout.addLayout(btn_row)
-
-		main_layout.addWidget(act_group)
+		main_row.addLayout(right_col)
+		main_layout.addLayout(main_row)
 
 		# Initiale Set-Liste befüllen (list_sets() als Quelle, Roadmap §5.2)
 		self.refresh_service_set_list()
