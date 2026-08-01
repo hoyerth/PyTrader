@@ -18,7 +18,6 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from PySide6.QtCore import QFile, QIODevice, QObject, QThread, QTimer, QUrl, Signal, Slot, Qt, QEvent
-from PySide6.QtGui import QCursor
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -27,7 +26,6 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QMainWindow,
-    QMenu,
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
@@ -279,6 +277,7 @@ class PyTraderChartWindow(QMainWindow):
         self.tf_combo = self.ui_widget.findChild(QComboBox, "combo_tf")
         self.btn_reset = self.ui_widget.findChild(QPushButton, "btn_reset_chart")
         self.btn_indicator = self.ui_widget.findChild(QPushButton, "btn_indicator_grid")
+        self.btn_indicator_liquidity = self.ui_widget.findChild(QPushButton, "btn_indicator_grid_liquidity")
         self.btn_signal = self.ui_widget.findChild(QPushButton, "btn_signal_select")
         self.chart_container = self.ui_widget.findChild(QWidget, "web_container")
 
@@ -290,11 +289,17 @@ class PyTraderChartWindow(QMainWindow):
             self.tf_combo.currentTextChanged.connect(self.on_tf_changed)
         if self.btn_reset:
             self.btn_reset.clicked.connect(self.fit_chart)
+        # Alt-Grid-Button (btn_indicator_grid) → Indikator 'grid'
         if self.btn_indicator:
             self.btn_indicator.setCheckable(True)
             self.btn_indicator.clicked.connect(self.toggle_grid_lines)
             self.btn_indicator.installEventFilter(self)
-            self.update_indicator_button_style()
+        # Plugin-Grid-Button (btn_indicator_grid_liquidity) → Indikator 'grid_liquidity'
+        if self.btn_indicator_liquidity:
+            self.btn_indicator_liquidity.setCheckable(True)
+            self.btn_indicator_liquidity.clicked.connect(self.toggle_grid_liquidity_lines)
+            self.btn_indicator_liquidity.installEventFilter(self)
+        self.update_indicator_button_style()
 
         if self.btn_signal:
             self.btn_signal.setCheckable(True)
@@ -326,41 +331,53 @@ class PyTraderChartWindow(QMainWindow):
         pass
 
     def eventFilter(self, watched, event):
-        if self.btn_indicator is not None and watched == self.btn_indicator and event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton:
-            # Wenn Dialog offen, schliessen; sonst Auswahl-Menü öffnen
-            if self._settings_dialog is not None and self._settings_dialog.isVisible():
-                self._settings_dialog.close()
-                self._settings_dialog = None
-            else:
-                self._open_indicator_settings_menu()
+        # Rechtsklick auf den Alt-Grid-Button → Einstellungen für 'grid'
+        if (self.btn_indicator is not None and watched == self.btn_indicator
+                and event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton):
+            self._toggle_settings_dialog("grid")
+            return True
+        # Rechtsklick auf den Plugin-Grid-Button → Einstellungen für 'grid_liquidity'
+        if (self.btn_indicator_liquidity is not None and watched == self.btn_indicator_liquidity
+                and event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton):
+            self._toggle_settings_dialog("grid_liquidity")
             return True
         return super().eventFilter(watched, event)
 
-    def _open_indicator_settings_menu(self) -> None:
-        """Rechtsklick auf den Grid-Button: Auswahl zwischen Alt- (grid) und
-        Plugin-Indikator (grid_liquidity) für den generischen Einstellungs-Dialog."""
-        menu = QMenu(self)
-        act_grid = menu.addAction(f"{self.indicators['grid'].display_name} (Alt)")
-        act_liq = menu.addAction(f"{self.indicators['grid_liquidity'].display_name}")
-        chosen = menu.exec(QCursor.pos())
-        if chosen == act_grid:
-            self._open_indicator_settings("grid")
-        elif chosen == act_liq:
-            self._open_indicator_settings("grid_liquidity")
+    def _toggle_settings_dialog(self, ind_id: str) -> None:
+        """Wenn der Einstellungs-Dialog offen ist, schliessen; sonst für den
+        jeweiligen Indikator (alt 'grid' / Plugin 'grid_liquidity') öffnen."""
+        if self._settings_dialog is not None and self._settings_dialog.isVisible():
+            self._settings_dialog.close()
+            self._settings_dialog = None
+        else:
+            self._open_indicator_settings(ind_id)
 
     def _get_indicator_plugin(self, ind_id: str) -> Optional[BaseIndicator]:
         """Gibt die Indikator-Instanz zur ID zurück (oder None)."""
         return self.indicators.get(ind_id)
 
     def update_indicator_button_style(self):
-        if not self.btn_indicator: return
-        is_active = self.indicators_state.get("grid", {}).get("active", False)
+        """Aktualisiert die Färbung beider Indikator-Buttons (Alt 'grid' +
+        Plugin 'grid_liquidity') entsprechend ihres An/Aus-Zustands."""
+        self._apply_indicator_button_style(self.btn_indicator, "grid")
+        self._apply_indicator_button_style(self.btn_indicator_liquidity, "grid_liquidity")
+
+    def _apply_indicator_button_style(self, button: Optional[QPushButton], ind_id: str) -> None:
+        """Setzt die Button-Farbe je nach Aktiv-Zustand des Indikators."""
+        if button is None:
+            return
+        is_active = self.indicators_state.get(ind_id, {}).get("active", False)
         color = "#2e7d32" if is_active else "#37474f"
-        self.btn_indicator.setStyleSheet(
+        button.setStyleSheet(
             f"background-color: {color}; color: white; font-weight: bold; border-radius: 4px; padding: 3px 10px;")
 
     def toggle_grid_lines(self):
+        """Schaltet den ALTEN Grid-Indikator ('grid') an/aus."""
         self._toggle_indicator("grid")
+
+    def toggle_grid_liquidity_lines(self):
+        """Schaltet den NEUEN Plugin-Indikator ('grid_liquidity') an/aus."""
+        self._toggle_indicator("grid_liquidity")
 
     def _toggle_indicator(self, ind_id: str) -> None:
         """Schaltet einen Indikator an/aus."""
