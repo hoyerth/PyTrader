@@ -4,9 +4,8 @@ export_project.py - Exportiert ALLE Projekt-Quellen nach docs/x_Exports.md
 
 - Projekt-Root wird stabil ueber __file__ bestimmt (unabhaengig vom CWD).
 - Ausgabe erfolgt IMMER in den docs-Ordner.
-- Inkludiert alle Quellen: .py, .js, .ui, .sql, .json, .yaml/.yml, .toml, .md
-  sowie den kompletten docs-Ordner.
-- Ausnahme: x_Exports.md selbst wird NICHT inkludiert.
+- Inkludiert alle Quellen: .py, .js, .ui, .sql, .json, .yaml/.yml, .toml, .md.
+- Der komplette docs-Ordner (Konzepte/Roadmaps) wird NICHT exportiert.
 """
 
 import os
@@ -24,9 +23,11 @@ ALLOWED_EXTENSIONS = {
 }
 
 # Ordner, die ignoriert werden sollen (keine Quellen)
+# docs/ wird komplett ausgeschlossen: Konzepte/Roadmaps (x_*.md, Agents.md)
+# gehoeren nicht in den Code-Export. Damit faellt auch x_Exports.md selbst weg.
 IGNORE_DIRS = {
     '.git', '.idea', '__pycache__', 'venv', 'env', 'build', 'dist', '.venv',
-    'node_modules', '.pytest_cache',
+    'node_modules', '.pytest_cache', 'docs',
 }
 
 # Dateien, die ignoriert werden sollen (Ausnahme: x_Exports.md selbst)

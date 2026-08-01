@@ -1,69 +1,93 @@
-
-# Roadmap Phase 12: Dynamische Feature- & Signal-Architektur (Refined)
+# Roadmap Phase 12: Dynamische Feature- & Signal-Architektur (Vollständig synthetisiert)
 
 ## 1. Zielsetzung & Architektur-Konzept
 
-Das Ziel von Phase 12 ist die **vollständige Entkopplung von Berechnungslogik, Parameter-Steuerung, Speicherung und visueller Darstellung**, ohne bestehenden Code zu brechen.
+Das Ziel von Phase 12 ist die vollständige Entkopplung von Berechnungslogik, Parameter-Steuerung, Speicherung und visueller Darstellung bei 100%iger Abwärtskompatibilität zum bestehenden Codebase.
+Core Architecture & Guiding Principles
 
-### Entkopplungs-Prinzip: Feature-Engine vs. Visueller Indikator
-* **Plugin-Engine (`PluginFeature`):** Reine mathematische/logische Berechnung (z. B. Grid-Abstände, Trend-Filter, Machine-Learning-Features). Sie liegt isoliert unter `analytics/features/definitions/` und generiert sowohl den strukturierten Feature-Store-Payload (für DuckDB) als auch den typisierten Visualisierungs-Payload (`ChartRenderPayload`).
-* **Visueller Indikator (`BaseIndicator` / Chart-UI):** Konsumiert den `ChartRenderPayload` des Features, steuert die Interaktion im Chart (Settings-Dialog, Button-Styles) und verwaltet das Rendern über die JS-Bridge (`LightweightCharts v5`).
+    Strikte Zustandslosigkeit (Stateless Plugins): Plugins speichern niemals eigene Zustände oder Parameter. Jede Berechnung ist eine reine Funktion calculate(df, params). Das ermöglicht fehlerfreie Parallelisierung und Thread-Sicherheit.
 
-                 ┌────────────────────────────────────────┐
-                 │   analytics/features/definitions/      │
-                 │ (grid_liquidity.py, ema_diff_v2.py)    │
-                 └───────────────────┬────────────────────┘
-                                     │
-                               PluginLoader
-                        (Auto-Discovery, Thread-Safe)
-                                     │
-            ┌────────────────────────┴────────────────────────┐
-            ▼                                                 ▼
+    Entkopplung Feature-Engine vs. Visueller Indikator:
 
-┌──────────────────────────┐                      ┌──────────────────────────┐
-│       Chart-UI           │                      │      Batch-Service       │
-│ (PyTraderChartWindow)    │                      │   (HistoricalScanner)    │
-├──────────────────────────┤                      ├──────────────────────────┤
-│ - Holt Preset aus DB     │                      │ - Holt Preset aus DB     │
-│ - Tuned Parameter        │                      │ - Führt Massen-Scan aus  │
-│ - Rendert Chart-Payload  │                      │ - Schreibt Feature-Store │
-└────────────┬─────────────┘                      └────────────┬─────────────┘
-│                                                 │
-▼                                                 ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│                       DuckDB (Hybrid-Schema)                               │
-│ - app_data.duckdb  : indicator_presets (Erweitert um version & batch)     │
-│ - analytics.duckdb : feature_store     (Native Spalten + feature_data JSON) │
-│ - analytics.duckdb : signal_results    (Generischer Event-Store)           │
-└────────────────────────────────────────────────────────────────────────────┘
+        Plugin-Engine (PluginFeature): Reine Mathematik/Logik unter analytics/features/definitions/. Generiert strikt getrennt den FeatureStorePayload (für DuckDB) und den ChartRenderPayload (für LightweightCharts v5).
 
+        Visueller Indikator (BaseIndicator / Chart-UI): Konsumiert den ChartRenderPayload und steuert UI-Interaktionen. Der Chart liest niemals direkt aus dem Feature-Store; der Scanner schreibt niemals aus dem Render-Payload.
 
----
+    Additive Rückwärtskompatibilität: Alt-Indikatoren und bestehende BaseFeature-Klassen bleiben unangetastet parallel lauffähig.
 
-## 2. Datenbank-Architektur (Hybrid-Schema & Konsolidierte Presets)
+    Zentrale Ausführungsschicht (PluginExecutor): Scanner, Analyzer und Chart-UI greifen nicht direkt auf Plugins zu, sondern nutzen die PluginExecutor-Schicht für zentrales Logging, Caching, Parametervalidierung und Thread-Safety.
 
-Die Kern-Datenbanken werden über `db_service.py` abwärtskompatibel erweitert.
+                               ┌────────────────────────────────────────┐
+                               │   analytics/features/definitions/      │
+                               │  (grid_liquidity.py, ema_diff_v2.py)   │
+                               └───────────────────┬────────────────────┘
+                                                   │
+                                             PluginLoader
+                                      (Discovery, Validation)
+                                                   │
+                                            PluginRegistry
+                                                   │
+                                            PluginExecutor
+                                  (Execution, Caching, Logging)
+                                                   │
+                  ┌────────────────────────────────┴────────────────────────────────┐
+                  ▼                                                                 ▼
+   ┌──────────────────────────────┐                                ┌──────────────────────────────┐
+   │          Chart-UI            │                                │        Batch-Services        │
+   │    (PyTraderChartWindow)     │                                │ (HistoricalScanner/Analyzer) │
+   ├──────────────────────────────┤                                ├──────────────────────────────┤
+   │ - Liest Schema & Schema-UI   │                                │ - Holt Preset per plugin_id  │
+   │ - Validiert Parameter        │                                │ - Validiert Parameter        │
+   │ - Rendert ChartRenderPayload │                                │ - Schreibt FeatureStorePayload│
+   └──────────────┬───────────────┘                                └──────────────┬───────────────┘
+                  │                                                               │
+                  ▼                                                               ▼
+   ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+   │                                   DuckDB (Hybrid-Schema)                                     │
+   │ - app_data.duckdb  : indicator_presets (mit plugin_id, version, params, is_active_batch)    │
+   │ - analytics.duckdb : feature_store     (Native Spalten + feature_data JSON + feature_id)    │
+   │ - analytics.duckdb : signal_results    (Generischer Event-Store)                             │
+   └──────────────────────────────────────────────────────────────────────────────────────────────┘
 
-```sql
+## 2. Datenbank-Architektur (Hybrid-Schema & Stabile Presets)
+Stabile Schema-Entscheidungen
+
+    Stabile plugin_id: Die plugin_id bleibt dauerhaft konstant (z.B. grid_liquidity). Die Versionierung wird als eigene Spalte version geführt, damit Presets und Datenbank-Referenzen bei Version-Updates nicht abreißen.
+
+    Eindeutige Preset-Zuordnung: indicator_presets wird um plugin_id, version und is_active_batch erweitert.
+
+SQL
+
 -- 1. ANALYTICS.DUCKDB: Hybrid-Feature Store (Additive Erweiterung)
 ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_id VARCHAR;
 ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS plugin_version VARCHAR;
 ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_data JSON;
 
--- 2. APP_DATA.DUCKDB: Erweiterung der bestehenden indicator_presets Tabelle
+-- 2. APP_DATA.DUCKDB: Erweiterung der indicator_presets Tabelle um Plugin-Verknüpfung
+ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS plugin_id VARCHAR;
 ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS version VARCHAR DEFAULT '1.0.0';
 ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS is_active_batch BOOLEAN DEFAULT FALSE;
-```
 
-3. Typisierte Verträge (PluginFeature)
+## 3. Typisierte Verträge & Basisklasse (PluginFeature)
 
-Verortet in analytics/features/plugins/base_plugin.py, um Kollisionen mit der Alt-Klasse BaseFeature zu vermeiden.
+Verortet unter analytics/features/plugins/base_plugin.py.
 Python
 
 from abc import ABC, abstractmethod
-from typing import Dict, Any, List, TypedDict, Literal
+from typing import Dict, Any, List, TypedDict, Literal, Optional
 import pandas as pd
 
+# --- Parametervalidierung & Schema ---
+class ParameterSchema(TypedDict, total=False):
+    type: Literal["float", "int", "bool", "str", "color", "choice"]
+    default: Any
+    min: Optional[float]
+    max: Optional[float]
+    step: Optional[float]
+    options: Optional[List[str]]
+    description: str
+
+# --- Zukunftssicherer ChartRenderPayload ---
 class ChartLine(TypedDict):
     price: float
     color: str
@@ -85,95 +109,163 @@ class ChartMarker(TypedDict):
     text: str
     priority: int
 
+class ChartArea(TypedDict):
+    time_from: int
+    time_to: int
+    price_top: float
+    price_bottom: float
+    color: str
+
+class ChartLabel(TypedDict):
+    time: int
+    price: float
+    text: str
+    color: str
+
 class ChartRenderPayload(TypedDict, total=False):
     lines: List[ChartLine]
-    hit_circles: List[ChartCircle]  # Harmonisiert mit bestehender JS-Bridge!
+    hit_circles: List[ChartCircle]  # JS-Bridge kompatibel
     markers: List[ChartMarker]
+    areas: List[ChartArea]          # Erweiterung für Zonen/Kanäle
+    labels: List[ChartLabel]        # Erweiterung für Text-Labels
+    custom: Dict[str, Any]
+
+# --- Strikter FeatureStorePayload ---
+class FeatureStorePayload(TypedDict, total=False):
+    feature_id: str
+    plugin_version: str
+    records: List[Dict[str, Any]]
+    metadata: Dict[str, Any]
+    statistics: Dict[str, Any]
 
 class FeatureCalculateResult(TypedDict):
-    feature_store_payload: Dict[str, Any]
+    feature_store_payload: FeatureStorePayload
     chart_render_payload: ChartRenderPayload
 
+# --- Plugin-Metadaten & Schnittstelle ---
+class PluginMetadata(TypedDict):
+    category: str
+    display_name: str
+    description: str
+    author: str
+    tags: List[str]
+
 class PluginFeature(ABC):
-    """Neue Plugin-Basisklasse zur sauberen Trennung von der Alt-Klasse BaseFeature."""
+    """Stateless Plugin-Basisklasse mit Schemavalidierung und Metadaten."""
 
     @property
     @abstractmethod
-    def name(self) -> str:
+    def plugin_id(self) -> str:
+        """Dauerhaft stabile ID (z.B. 'grid_liquidity')."""
         pass
-
-    @property
-    def display_name(self) -> str:
-        return self.name.replace("_", " ").title()
 
     @property
     def version(self) -> str:
         return "1.0.0"
 
     @property
-    def plugin_id(self) -> str:
-        return f"{self.name}_v{self.version.replace('.', '_')}"
+    def metadata(self) -> PluginMetadata:
+        return {
+            "category": "General",
+            "display_name": self.plugin_id.replace("_", " ").title(),
+            "description": "",
+            "author": "System",
+            "tags": []
+        }
 
     @property
     def live_op(self) -> bool:
         return True
 
     @property
+    def dependencies(self) -> List[str]:
+        """IDs anderer Plugins, die vorab berechnet werden müssen."""
+        return []
+
+    @property
     @abstractmethod
-    def default_params(self) -> Dict[str, Any]:
+    def parameter_schema(self) -> Dict[str, ParameterSchema]:
+        """Schema zur automatischen Validierung & UI-Generierung."""
         pass
+
+    @property
+    def default_params(self) -> Dict[str, Any]:
+        return {k: v["default"] for k, v in self.parameter_schema.items() if "default" in v}
+
+    def validate_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Validiert Eingabeparameter gegen das Schema und setzt Defaults ein."""
+        validated = {}
+        schema = self.parameter_schema
+        for key, spec in schema.items():
+            val = params.get(key, spec.get("default"))
+            p_type = spec.get("type")
+            if p_type == "float": val = float(val)
+            elif p_type == "int": val = int(val)
+            elif p_type == "bool": val = bool(val)
+            
+            if "min" in spec and val < spec["min"]: val = spec["min"]
+            if "max" in spec and val > spec["max"]: val = spec["max"]
+            validated[key] = val
+        return validated
 
     @abstractmethod
     def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> FeatureCalculateResult:
+        """Stateless Berechnungslogik: Leseinput = df + validated_params."""
         pass
 
-4. Feature-Paritäts-Plugin (grid_liquidity.py)
+## 4. Feature-Paritäts-Plugin (grid_liquidity.py)
 
-Inklusive Custom-Levels, Pierce/Visit-Logik und Zeitfenster-Farben.
+Vollständiges Plugin unter analytics/features/definitions/grid_liquidity.py.
 Python
 
 from typing import Dict, Any
 import pandas as pd
 import numpy as np
-from analytics.features.plugins.base_plugin import PluginFeature, FeatureCalculateResult
+from analytics.features.plugins.base_plugin import PluginFeature, FeatureCalculateResult, ParameterSchema, PluginMetadata
 
 class GridLiquidityFeature(PluginFeature):
 
     @property
-    def name(self) -> str:
+    def plugin_id(self) -> str:
         return "grid_liquidity"
-
-    @property
-    def display_name(self) -> str:
-        return "Grid Liquidity & Proximity"
 
     @property
     def version(self) -> str:
         return "1.0.0"
 
     @property
-    def default_params(self) -> Dict[str, Any]:
+    def metadata(self) -> PluginMetadata:
         return {
-            "grid_step": 0.50,
-            "proximity_threshold": 0.05,
-            "line_color": "#2196F3",
-            "circle_color_std": "#FFEB3B",
-            "circle_color_active": "#E91E63",
-            "show_lines": True,
-            "show_circles": True,
-            "prox_level1": 0.0,
-            "prox_level2": 0.0,
-            "prox_level3": 0.0,
-            "prox_level4": 0.0,
-            "prox_level5": 0.0,
-            "prox_level6": 0.0,
+            "category": "Grid",
+            "display_name": "Grid Liquidity & Proximity",
+            "description": "Erkennt Preisnähe zu Grid-Leveln inkl. Custom Levels & Zeitfenstern",
+            "author": "PyTrader AI",
+            "tags": ["grid", "liquidity", "proximity"]
+        }
+
+    @property
+    def parameter_schema(self) -> Dict[str, ParameterSchema]:
+        return {
+            "grid_step": {"type": "float", "default": 0.50, "min": 0.01, "max": 100.0, "step": 0.05, "description": "Rasterabstand"},
+            "proximity_threshold": {"type": "float", "default": 0.05, "min": 0.001, "max": 10.0, "step": 0.005, "description": "Toleranzschwelle"},
+            "line_color": {"type": "color", "default": "#2196F3", "description": "Farbe Grid-Linien"},
+            "circle_color_std": {"type": "color", "default": "#FFEB3B", "description": "Farbe Standard-Hit"},
+            "circle_color_active": {"type": "color", "default": "#E91E63", "description": "Farbe Hit in Aktivitätsfenster"},
+            "show_lines": {"type": "bool", "default": True, "description": "Grid-Linien anzeigen"},
+            "show_circles": {"type": "bool", "default": True, "description": "Hits anzeigen"},
+            "prox_level1": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 1"},
+            "prox_level2": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 2"},
+            "prox_level3": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 3"},
+            "prox_level4": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 4"},
+            "prox_level5": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 5"},
+            "prox_level6": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 6"},
         }
 
     def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> FeatureCalculateResult:
         if df.empty:
             return {"feature_store_payload": {}, "chart_render_payload": {}}
 
-        p = {**self.default_params, **params}
+        p = self.validate_params(params)
         step = p["grid_step"]
         threshold = p["proximity_threshold"]
 
@@ -184,7 +276,6 @@ class GridLiquidityFeature(PluginFeature):
         end_lvl = np.ceil(max_price / step) * step
         levels = list(np.arange(start_lvl, end_lvl + step, step))
 
-        # Custom Levels einbinden
         custom_lvls = [p[f"prox_level{i}"] for i in range(1, 7) if p[f"prox_level{i}"] > 0]
         all_levels = sorted(list(set(levels + custom_lvls)))
 
@@ -207,7 +298,6 @@ class GridLiquidityFeature(PluginFeature):
             is_hit = dist <= threshold
 
             if is_hit and p["show_circles"]:
-                # Zeitfenster-Farblogik (Beispiel: Asien/London-Aktivität)
                 dt = pd.to_datetime(bar_time, unit='s')
                 is_active_window = 8 <= dt.hour <= 16
                 color = p["circle_color_active"] if is_active_window else p["circle_color_std"]
@@ -227,32 +317,176 @@ class GridLiquidityFeature(PluginFeature):
             })
 
         return {
-            "feature_store_payload": {"records": feature_rows},
+            "feature_store_payload": {
+                "feature_id": self.plugin_id,
+                "plugin_version": self.version,
+                "records": feature_rows,
+                "metadata": {"total_hits": len(hit_circles)}
+            },
             "chart_render_payload": {
                 "lines": lines_payload,
                 "hit_circles": hit_circles
             }
         }
 
-5. Scope & Abgrenzung (Signal-Engine)
+### Entscheidungen (verbindliche Vorgaben für Phase 12)
 
-    Hinweis zur Phasen-Grenzziehung: Phase 12 behandelt exklusiv die Entkopplung und Dynamisierung der Feature-/Indikator-Ebene. Die Signal-Engine (z. B. GridProximitySignal, set_evaluator.py) bleibt in dieser Phase unverändert und greift weiterhin über das Hybrid-Schema auf die benötigten Feature-Werte zu. Die Verallgemeinerung der Signal-Sets ist Gegenstand von Phase 13.
+**1. Native UTC-Zeitfenster (unantastbar):**
+Das native UTC-Zeitfenster (Minute 0/30 ± `time_window_mins`, vektorisiert in `analytics/features/definitions/grid_levels.py` → `in_window_around()` bzw. `chart/indicators/grid.py` → `f_in_window_around()`) ist **grundlegende Logik und wird nie mehr angefasst**. Die im Plugin-Beispiel oben verwendete Farb-/Aktivitätslogik (`8 <= dt.hour <= 16`) ist **ausschließlich ein Platzhalter** und darf das native Zeitfenster **nicht ersetzen**. Andere Zeitkonzepte (Sessions, etc.) werden bei Bedarf in einem **separaten Layer darübergelegt** – nie in die native Logik hinein.
+
+**2. Liq-Raster-Persistenz – Phase 11 wird hiermit abgeschlossen:**
+Phase 11 gilt mit dem aktuellen Stand als beendet. Die persistente Speicherung des **vollständigen Liq-Rasters** (Level-Liste, nicht nur das per-Bar Nearest-Level im `feature_store_payload`) wird **nicht** in Phase 12 vorweggenommen, sondern später **im neuen Plugin-System erweitert** (Service schreibt Raster in die DB → Indikator holt es von dort).
+
+**3. Bestands-Indikator bleibt unangetastet (hardcoded):**
+Der existierende Grid-Indikator (`chart/indicators/grid.py`) wird in Phase 12 **weder verändert noch entfernt** – er bleibt in seiner aktuellen, hartkodierten Form voll funktionsfähig (Referenz-Alt-Implementierung, kann jederzeit parallel betrieben werden). Phase 12 baut daraus einen **NEUEN Grid-Indikator** mit Plugin-Architektur (siehe Schritt 5): Die Service-Logik wandert in das Plugin (`GridLiquidityFeature`), der neue Indikator konsumiert dessen `chart_render_payload`. Beide laufen parallel in der Chart-Registry (Alt: `grid`, Neu: `grid_liquidity`). Der Paritätstest (Schritt 4) dient dem Vergleich, nicht der Migration des Alt-Codes.
+
+**4. Neues Property-Fenster – eigenständige Entwicklung NACH Phase 12:**
+Der NEUE Grid-Indikator erhält ein **vollständig neues Property-Fenster** (kein Wiederverwenden/Anpassen des bestehenden `indicator_dialog.py`). Darin erscheinen zusätzlich zu den Indikator-Parametern **Standard-Felder des genutzten Services** mit zugehörigen **Action-Buttons** (z. B. Service-Scan auslösen, Preset laden/speichern). Dieses Property-Fenster ist eine **komplett neue Entwicklung und startet NACH Phase 12** – in Phase 12 wird der neue Indikator nur mit seinen Basis-Parametern über den bestehenden generischen Dialog (Interim) bedient.
+
+## 5. Ausführungsschicht (PluginLoader, PluginRegistry, PluginExecutor)
+
+Verortet in analytics/features/feature_builder.py.
+Python
+
+import importlib
+import inspect
+import pkgutil
+from pathlib import Path
+from typing import Dict, Type, Optional, Any
+import pandas as pd
+from analytics.features.plugins.base_plugin import PluginFeature, FeatureCalculateResult
+
+class PluginLoader:
+    """Class-Finder scannt Verzeichnisse rein nach Subklassen von PluginFeature (Dateiname-unabhängig)."""
+    
+    def __init__(self, definitions_path: Optional[Path] = None):
+        self.definitions_path = definitions_path or Path(__file__).parent / "definitions"
+
+    def discover_plugins(self) -> Dict[str, PluginFeature]:
+        plugins = {}
+        if not self.definitions_path.exists():
+            return plugins
+
+        for _, module_name, is_pkg in pkgutil.iter_modules([str(self.definitions_path)]):
+            if is_pkg: continue
+            full_module_name = f"analytics.features.definitions.{module_name}"
+            try:
+                module = importlib.import_module(full_module_name)
+                for name, obj in inspect.getmembers(module, inspect.isclass):
+                    if issubclass(obj, PluginFeature) and obj is not PluginFeature:
+                        instance = obj()
+                        plugins[instance.plugin_id] = instance
+            except Exception as e:
+                print(f"⚠️ [PluginLoader] Fehler in Modul {module_name}: {e}")
+        return plugins
+
+class PluginRegistry:
+    """Zentraler Singleton-Katalog für entdeckte Plugins."""
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance.loader = PluginLoader()
+            cls._instance.plugins = cls._instance.loader.discover_plugins()
+        return cls._instance
+
+    def reload(self):
+        """Expliziter Reload nur beim Start oder per Button (thread-sicher)."""
+        self.plugins = self.loader.discover_plugins()
+
+    def get(self, plugin_id: str) -> PluginFeature:
+        if plugin_id not in self.plugins:
+            raise KeyError(f"Plugin '{plugin_id}' nicht gefunden.")
+        return self.plugins[plugin_id]
+
+class PluginExecutor:
+    """Zentrale Schicht für Ausführung, Validierung, Dependency-Ordering & Logging."""
+
+    def __init__(self, registry: Optional[PluginRegistry] = None):
+        self.registry = registry or PluginRegistry()
+
+    def execute(self, plugin_id: str, df: pd.DataFrame, params: Dict[str, Any]) -> FeatureCalculateResult:
+        plugin = self.registry.get(plugin_id)
+        
+        # 1. Dependency Resolution (falls Abhängigkeiten angegeben sind)
+        for dep_id in plugin.dependencies:
+            dep_plugin = self.registry.get(dep_id)
+            dep_plugin.calculate(df, dep_plugin.default_params)
+
+        # 2. Parametervalidierung
+        validated_params = plugin.validate_params(params)
+
+        # 3. Stateless Execution
+        return plugin.calculate(df, validated_params)
+
+## 6. Scope & Abgrenzung (Signal-Engine)
+
+    Grenzziehung: Phase 12 entkoppelt und dynamisiert exklusiv die Feature-/Indikator-Ebene. Die Signal-Engine (GridProximitySignal, set_evaluator.py) bleibt unverändert und greift weiterhin über das Hybrid-Schema auf die benötigten Feature-Werte zu. Die Verallgemeinerung der Signal-Sets folgt in Phase 13.
+
+    **Entscheidung (verbindlich):** Die Signal-Engine ist **nur eine Test-Engine**. Sie wird in einer späteren Phase als **Service in das Plugin-System überführt** und dort durch einen Indikator visualisiert. In Phase 12 bleibt sie unverändert (nur über das Hybrid-Schema angebunden).
+
+## 7. Zusätzliche Architektur-Vorbereitung (additiv)
+
+### 7.1 PluginCapabilities (optionale Erweiterung)
+
+Zur Vorbereitung zukünftiger Plugin-Typen kann die Eigenschaft `live_op` später durch ein allgemeineres Capability-Modell ergänzt werden. Dadurch lässt sich zentral definieren, in welchen Systembereichen ein Plugin verwendet werden darf, ohne Sonderlogik in Chart, Scanner oder Analyzer zu hinterlegen.
+
+**Beispiel:**
+
+```python
+class PluginCapabilities(TypedDict):
+    chart: bool
+    batch: bool
+    live: bool
+    feature_store: bool
+    render: bool
+```
+
+Diese Erweiterung ist **nicht Bestandteil von Phase 12**, wird jedoch für spätere Analyse-, ML- oder Service-Plugins empfohlen.
 
 ---
+
+### 7.2 PluginContext (API-Vorbereitung)
+
+Die aktuelle Schnittstelle `calculate(df, params)` bleibt in Phase 12 unverändert.
+
+Zur langfristigen Erweiterbarkeit kann später ein optionaler `PluginContext` eingeführt werden, der Laufzeitinformationen wie Symbol, Timeframe, Ausführungsmodus oder weitere Services kapselt.
+
+**Beispiel:**
+
+```python
+calculate(context, df, params)
+```
+
+Ein möglicher `PluginContext` enthält beispielsweise:
+
+- symbol
+- timeframe
+- mode (live / historical)
+- timestamp
+
+Diese Vorbereitung verhindert zukünftige API-Brüche, wenn Plugins zusätzliche Kontextinformationen benötigen. **Der PluginContext ist ausdrücklich nicht Bestandteil von Phase 12.**
+
+
+
 
 
 # Phase 12: Step-by-Step AI Implementation Guide
 
-Dieser Leitfaden ist strikt darauf ausgelegt, dass nach jedem Schritt ein voll funktionsfähiger Projektzustand gewährleistet bleibt.
-Schritt 1: Datenbank-Erweiterung (Hybrid-Schema & Presets)
-1.1 Backup-Anforderung
+Dieser Leitfaden sichert nach jedem Schritt einen voll funktionsfähigen Projektzustand.
 
-Erstelle vor Ausführung ein vollständiges Backup des Ordners data/ sowie der Datei db_service.py nach .backup_Phase12_Step1/.
-1.2 Anweisung an die AI
+## Schritt 1: Datenbank-Erweiterung (Hybrid-Schema & Presets)
+
+### 1.1 Backup-Anforderung
+
+Sichere den Ordner data/ sowie db_service.py nach .backup_Phase12_Step1/.
+
+### 1.2 Anweisung an die AI
 
     Öffne db_service.py und passe check_and_init_databases() an.
 
-    Füge folgende DDL-Statements aus:
+    Führe folgende Statements aus:
 
 Python
 
@@ -260,105 +494,122 @@ con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS featur
 con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS plugin_version VARCHAR;")
 con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_data JSON;")
 
+con_app.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS plugin_id VARCHAR;")
 con_app.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS version VARCHAR DEFAULT '1.0.0';")
 con_app.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS is_active_batch BOOLEAN DEFAULT FALSE;")
 
-1.3 Validierung & Test
+### 1.3 Validierung & Test
 
-Starte main.py. Verifiziere in der Konsole, dass die Migration fehlerfrei durchläuft und die alten Daten in ohlcv_bars sowie feature_store erhalten bleiben.
-Schritt 2: Neue Plugin-Basisklasse (PluginFeature)
-2.1 Backup-Anforderung
+Starte main.py. Prüfe die Konsole auf erfolgreiche Migration. Bestehende Daten müssen intakt bleiben.
 
-Erstelle ein Backup des Ordners analytics/features/ nach .backup_Phase12_Step2/. Note: Die bestehende analytics/features/base_feature.py DARF NICHT verändert oder gelöscht werden!
+## Schritt 2: Neue Plugin-Basisklasse (PluginFeature)
 
-2.2 Anweisung an die AI
+### 2.1 Backup-Anforderung
 
-    Erstelle das Unterverzeichnis analytics/features/plugins/ mit einer leeren __init__.py.
+Sichere analytics/features/ nach .backup_Phase12_Step2/. analytics/features/base_feature.py DARF NICHT geändert oder gelöscht werden!
 
-    Erstelle darin die Datei base_plugin.py mit den Klassen PluginFeature, ChartRenderPayload (inkl. hit_circles) und FeatureCalculateResult.
+### 2.2 Anweisung an die AI
 
-2.3 Validierung & Test
+    Erstelle das Ordnerverzeichnis analytics/features/plugins/ mit leerer __init__.py.
 
-Führe python -c "from analytics.features.plugins.base_plugin import PluginFeature" aus. Die Anwendung muss wie gewohnt starten.
-Schritt 3: Thread-Sicherer PluginLoader
+    Erstelle darin base_plugin.py mit PluginFeature, ParameterSchema, PluginMetadata, ChartRenderPayload (inkl. hit_circles, areas, labels) und FeatureStorePayload.
 
-3.1 Backup-Anforderung
+### 2.3 Validierung & Test
+
+Führe python -c "from analytics.features.plugins.base_plugin import PluginFeature" aus.
+
+
+## Schritt 3: Ausführungsschicht (PluginLoader, PluginRegistry, PluginExecutor)
+
+###3.1 Backup-Anforderung
 
 Sichere analytics/features/feature_builder.py nach .backup_Phase12_Step3/.
 
-3.2 Anweisung an die AI
+### 3.2 Anweisung an die AI
 
-    Erstelle das Verzeichnis analytics/features/definitions/ mit einer leeren __init__.py.
+    Erstelle analytics/features/definitions/ mit leerer __init__.py.
 
-    Erstelle in analytics/features/feature_builder.py die Klasse PluginLoader.
+    Implementiere in analytics/features/feature_builder.py die Klassen PluginLoader, PluginRegistry und PluginExecutor.
 
-    Implementiere _discover_plugins(), das alle Module in analytics/features/definitions/ einliest. Entferne automatische importlib.reload()-Aufrufe innerhalb der Getter-Methoden, um Race Conditions zwischen QThreads zu vermeiden.
+    Stelle sicher, dass PluginLoader rein nach Subklassen von PluginFeature scannt (Dateinamen-unabhängig) und keine automatischen Reloads in Threads durchführt.
 
-3.3 Validierung & Test
+### 3.3 Validierung & Test
 
-Erstelle ein Testskript test/check_plugin_loader.py und stelle sicher, dass PluginLoader().list_plugins() ohne Fehler aufgerufen werden kann.
-Schritt 4: Paritäts-Plugin & Regressionstest gegen Altsystem
+Erstelle ein Testskript test/check_plugin_executor.py und verifiziere die Instanziierung von PluginExecutor().
 
-4.1 Backup-Anforderung
 
-Sichere das Verzeichnis analytics/features/definitions/ nach .backup_Phase12_Step4/.
+## Schritt 4: Paritäts-Plugin & Paritäts-Test
 
-4.2 Anweisung an die AI
+### 4.1 Backup-Anforderung
+
+Sichere analytics/features/definitions/ nach .backup_Phase12_Step4/.
+
+###4.2 Anweisung an die AI
 
     Erstelle analytics/features/definitions/grid_liquidity.py mit der Klasse GridLiquidityFeature(PluginFeature).
 
-    Erstelle ein Vergleichs-Testskript test/check_grid_parity.py, das identische OHLCV-Daten durch den alten GridIndicator.calculate() und das neue GridLiquidityFeature.calculate() schickt.
+    Erstelle ein Vergleichs-Testskript test/check_grid_parity.py, das identische OHLCV-Daten durch den alten GridIndicator.calculate() und PluginExecutor().execute("grid_liquidity", df, params) schickt.
 
+### 4.3 Validierung & Test
 
-4.3 Validierung & Test
+Führe python test/check_grid_parity.py aus. **Hinweis:** Linien und Circles sind später **eigenständige Services**, die unabhängig voneinander laufen. Circles hängen logisch an den Ergebnissen des Linien-Services, aber **Anzahl und Positionen von Linien und Circles sind NICHT korreliert** – eine Forderung nach gleicher Anzahl ist gegenstandslos. Der Test validiert daher:
+   - Das Plugin läuft fehlerfrei über `PluginExecutor` (keine Exceptions, korrekte Payload-Struktur).
+   - Linien-Output und Circle-Output werden jeweils für sich konsistent erzeugt (Linien = eigenes Raster-Ergebnis, Circles = eigene Proximity-Auswertung).
+   - Die Circle-Ergebnisse beziehen sich korrekt auf die erzeugten Linien-Levels (logische Kopplung), ohne identische Anzahl zu verlangen.
+---
+## Schritt 5: Anbindung Chart UI, JS-Bridge & Presets
 
-Führe python test/check_grid_parity.py aus. Die Anzahl und Positionen der berechneten Grid-Linien und Circles müssen exakt übereinstimmen.
-Schritt 5: Anbindung Chart UI, JS-Bridge & Presets
+### 5.1 Backup-Anforderung
 
-5.1 Backup-Anforderung
+Sichere chart/indicators/grid.py (nur zur Sicherheit – wird NICHT verändert), chart/chart_win.py, state_manager.py sowie chart/js/03_chart_rendering.js nach .backup_Phase12_Step5/.
 
-Sichere chart/indicators/grid.py, chart/chart_win.py, state_manager.py sowie chart/js/03_chart_rendering.js nach .backup_Phase12_Step5/.
+### 5.2 Anweisung an die AI
 
-5.2 Anweisung an die AI
+    Erweitere state_manager.py um save_indicator_preset mit Unterstützung für plugin_id, version und is_active_batch.
 
-    Erweitere state_manager.py um die abwärtskompatible Handhabung von version und is_active_batch in indicator_presets.
+    **NEUER Indikator (`chart/indicators/grid_liquidity.py`):** Erstelle einen NEUEN Chart-Indikator (indicator_id `grid_liquidity`), der intern das `GridLiquidityFeature` (Plugin) über den `PluginExecutor` nutzt und dessen `chart_render_payload` zurückgibt. Registriere ihn ZUSÄTZLICH zum bestehenden `grid`-Indikator in der Indikator-Registry von `chart/chart_win.py`. Seine Basis-Parameter werden in Phase 12 über den bestehenden generischen `indicator_dialog.py` (Interim) bedient.
 
-    Passe chart/indicators/grid.py so an, dass calculate() intern das GridLiquidityFeature nutzt und dessen chart_render_payload zurückgibt.
+    **Der bestehende `chart/indicators/grid.py` bleibt UNVERÄNDERT** (hardcoded, wie bisher) – er wird weder modifiziert noch entfernt und bleibt als Alt-Implementierung voll funktionsfähig (Parallelbetrieb).
 
-    Überprüfe in chart/js/03_chart_rendering.js und 04_live_updates.js, dass das Feld hit_circles nahtlos von renderGridCircles() verarbeitet wird.
+    **Das vollständig neue Property-Fenster des neuen Indikators (Service-Felder + Action-Buttons) ist NICHT Teil von Phase 12** – es ist eine eigenständige Entwicklung, die NACH Phase 12 startet (siehe Entscheidung 4).
 
-5.3 Validierung & Test
+    Verifiziere in chart/js/03_chart_rendering.js und 04_live_updates.js, dass hit_circles verarbeitet wird.
 
-Starte PyTrader, öffne ein Chart-Fenster, schalte das Grid ein, verändere Parameter im Dialog und speichere ein Preset. Das Chart muss die Linien und Kreise korrekt rendern.
-Schritt 6: Anbindung Batch-Services (Scanner & Analyzer)
+### 5.3 Validierung & Test
 
-6.1 Backup-Anforderung
+Starte PyTrader, öffne ein Chart-Fenster, aktiviere den NEUEN Indikator "Grid Liquidity", verändere seine Basis-Parameter über den generischen Dialog (Interim) und speichere ein Preset. Prüfe die korrekte Visualisierung. Zusätzlich prüfen, dass der bisherige "Grid"-Indikator weiterhin unverändert funktioniert (Parallelbetrieb). Das neue Property-Fenster wird in dieser Phase NICHT gebaut.
+---
+
+## Schritt 6: Anbindung Batch-Services über PluginExecutor
+
+### 6.1 Backup-Anforderung
 
 Sichere analytics/background_workers/historical_scanner.py und live_analyzer.py nach .backup_Phase12_Step6/.
 
-6.2 Anweisung an die AI
+### 6.2 Anweisung an die AI
 
-    Erweitere den HistoricalScanner: Wenn ein Plugin-Scan angefordert wird, liest er das als is_active_batch = True markierte Preset aus indicator_presets.
+    Passe HistoricalScanner so an, dass er statt harter Verzweigungen den PluginExecutor nutzt und die aktiven Presets über plugin_id aus indicator_presets abfragt.
 
-    Er führt plugin.calculate(df, params) aus und speichert feature_store_payload im feature_store in DuckDB ab.
+    Schreibe den feature_store_payload im feature_store ab.
 
-    Der LiveAnalyzer nutzt bei Bar-Closes dieselbe Plugin-Instanz.
+    Binde den LiveAnalyzer an dieselbe PluginExecutor-Instanz an.
 
-6.3 Validierung & Test
+### 6.3 Validierung & Test
 
 Starte im Service-Fenster einen historischen Scan für SILVER H1. Prüfe in der Konsole und via DuckDB-Abfrage, ob Einträge in feature_store geschrieben wurden.
-Schritt 7: Systemweiter Regressionstest
 
-7.1 Backup-Anforderung
+## Schritt 7: Systemweiter Regressionstest
+
+### 7.1 Backup-Anforderung
 
 Sichere das gesamte Projekt nach .backup_Phase12_Final/.
 
-7.2 Anweisung an die AI
+### 7.2 Anweisung an die AI
 
-    Prüfe alle Fenster (Hauptfenster, Chart-Fenster, Service-Fenster, Statistik-Fenster, Optionen) auf korrekte Funktion.
+    Prüfe alle Fenster (Hauptfenster, Chart-Fenster, Service-Fenster, Statistik-Fenster, Optionen) auf fehlerfreie Interaktion.
 
-    Führe alle vorhandenen Test-Skripte im Ordner test/ aus.
+    Führe alle Test-Skripte im Ordner test/ aus.
 
-7.3 Validierung & Test
+### 7.3 Validierung & Test
 
 Vollständiger End-to-End-Test: App-Start → Chart öffnen → Parameter anpassen → Preset speichern → Historical Scan ausführen → Live-Signale empfangen. Alle Funktionen müssen stabil laufen.
