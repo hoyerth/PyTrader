@@ -2,7 +2,7 @@
 
 ## Phase 1: Datenbankschema & Ordnerstruktur
 **Ziel:** Die infrastrukturelle Grundlage schaffen.
-* [ ] Erstellen der neuen Ordnerstruktur (`../analytics`, `../analytics/engine`, `../analytics/features`, `../analytics/signals`, `../analytics/background_workers`).
+* [ ] Erstellen der neuen Ordnerstruktur (`../../analytics`, `../../analytics/engine`, `../../analytics/features`, `../../analytics/signals`, `../../analytics/background_workers`).
 * [ ] Erstellen/Initialisieren der `analytics.duckdb`[cite: 3].
 * [ ] Anlegen der SQL-Tabellen[cite: 3]:
   * `feature_store`[cite: 3]
@@ -89,13 +89,13 @@ Neben klassischen Indikator-Features (EMA, ATR) berechnet der FeatureBuilder nun
 3. **Erste Test-Signale:** Umsetzung von `ema_trend.py` (Trendrichtung/Steigung) und `atr_filter.py` (Volatilität/Abstand) als Referenz-Implementierungen.
 
 ### Aufgaben-Checkliste
-* [ ] **Implementierung der Basisklasse (`../analytics/engine/base_definition.py`):**
+* [ ] **Implementierung der Basisklasse (`../../analytics/engine/base_definition.py`):**
   * Abstrakte Klasse `SignalDefinition` definieren (`signal_id`, `version`, `params`)[cite: 3].
   * Abstrakte Methode `evaluate(df_features)` erzwingen, die eine Pandas Series/DataFrame mit `confidence`-Scores zurückgibt[cite: 3].
 * [ ] **Erstellung der ersten Regel-Signale:**
-  * `../analytics/signals/heuristics/ema_trend.py`: Nimmt `ema_20`, `ema_50` oder `ema_slope` aus dem Feature Store und bewertet die Trendstärke[cite: 3].
-  * `../analytics/signals/heuristics/atr_filter.py`: Evaluierte `atr_norm` zur Bestimmung relevanter Volatilitäts- bzw. Ausbruchszustände[cite: 3].
-* [ ] **Aufbau des Set-Evaluators (`../analytics/engine/set_evaluator.py`):**
+  * `../../analytics/signals/heuristics/ema_trend.py`: Nimmt `ema_20`, `ema_50` oder `ema_slope` aus dem Feature Store und bewertet die Trendstärke[cite: 3].
+  * `../../analytics/signals/heuristics/atr_filter.py`: Evaluierte `atr_norm` zur Bestimmung relevanter Volatilitäts- bzw. Ausbruchszustände[cite: 3].
+* [ ] **Aufbau des Set-Evaluators (`../../analytics/engine/set_evaluator.py`):**
   * Einlesen von JSON-Konfigurationen für `signal_sets`[cite: 3].
   * Berechnung des gewichteten Gesamt-Scores pro Bar:
     $$\text{Score}_{\text{gesamt}} = \sum (\text{confidence}_i \times \text{weight}_i)$$
@@ -129,13 +129,13 @@ Neben klassischen Indikator-Features (EMA, ATR) berechnet der FeatureBuilder nun
 
 ### Aufgaben-Checkliste
 
-* [ ] **Erstellung des Service-Kontrollfensters (`ui/service_window.ui` & `../service_win.py`):**
+* [ ] **Erstellung des Service-Kontrollfensters (`ui/service_window.ui` & `../../service_win.py`):**
   * QComboBox für Symbol (`SILVER`, `GOLD`).
   * QCheckBox ("New Scan").
   * QLabel für die Laufzeitanzeige (*Elapsed Time*) & QProgressBar.
   * Anbindung des "Service"-Buttons im `main_window.ui`.
 
-* [ ] **Implementierung des Background-Scanners (`../analytics/background_workers/historical_scanner.py`):**
+* [ ] **Implementierung des Background-Scanners (`../../analytics/background_workers/historical_scanner.py`):**
   * `QThread`-Worker mit Stoppuhr-Timer[cite: 3].
   * Logik für **Delete & Re-Scan** vs. **Delta-Update** (Zeitstempel-Abgleich zwischen `ohlcv_bars` und `signal_results`).
   * Schleife über alle Timeframes für das ausgewählte Symbol.
@@ -182,7 +182,7 @@ Neben klassischen Indikator-Features (EMA, ATR) berechnet der FeatureBuilder nun
     * Spalten: `Time`, `Symbol`, `Timeframe`, `Signal-Set`, `Confidence`, `Outcome (Win/Loss)`.
   * **Anbindung im Hauptfenster:** Hinzufügen des Buttons "Statistik" in `main_window.ui` und Verknüpfung mit der Instanziierung von `StatisticsWindow`.
 
-* [ ] **Implementierung des Statistik-Repositorys (`../analytics/statistics_repository.py`):**
+* [ ] **Implementierung des Statistik-Repositorys (`../../analytics/statistics_repository.py`):**
   * **Aggregations-Queries:** SQL-Abfragen auf `signal_results` in `analytics.duckdb` für Signalanordnungen, Häufigkeiten und Confidence-Mittelwerte[cite: 3].
   * **Exemplarische Forward-Performance-Engine:**
     * Verknüpfung von `signal_results` (`analytics.duckdb`) mit `ohlcv_bars` (`market_data.duckdb`) über `bar_time`[cite: 3].
@@ -210,9 +210,9 @@ Als Prototyp und Funktionstest dient ein dynamisches, experimentelles **Test-Sig
 ## 2. Architektonische Vorgaben & Festlegungen
 
 ### 2.1. Konsistente Property-Persistierung (`AppSettings` & `StateManager`)
-1. **Kein Regelbruch / Keine Redundanz:** Anstatt ein neues Repository zu erfinden, wird der bestehende `StateManager` (`../state_manager.py`) als zentraler I/O-Verwalter für `app_data.duckdb` genutzt. Er wird um die Methoden `get_app_settings()` und `save_app_settings()` erweitert, die auf die bestehende Tabelle `app_config` zugreifen.
+1. **Kein Regelbruch / Keine Redundanz:** Anstatt ein neues Repository zu erfinden, wird der bestehende `StateManager` (`../../state_manager.py`) als zentraler I/O-Verwalter für `app_data.duckdb` genutzt. Er wird um die Methoden `get_app_settings()` und `save_app_settings()` erweitert, die auf die bestehende Tabelle `app_config` zugreifen.
 2. **Klassenmodell (`AbstractStateModel` & `AppSettings`):**
-   * Erstellung der typsicheren Data-Class `AppSettings` (`../config/app_settings.py`), die von einer abstrakten Basisklasse `AbstractStateModel` erbt (implementiert `to_dict()` und `from_dict()`).
+   * Erstellung der typsicheren Data-Class `AppSettings` (`../../config/app_settings.py`), die von einer abstrakten Basisklasse `AbstractStateModel` erbt (implementiert `to_dict()` und `from_dict()`).
    * Bündelt globale Anwendungs-Defaults (z. B. `lookback_warmup_bars: int = 500`).
 3. **Properties-Button & Nicht-modales Fenster (`PropertiesWindow`):**
    * Im Hauptfenster (`win_main`) wird ein Button "Properties" mit dem Icon `settings` (oder `gear`/`sliders`) integriert.
@@ -236,14 +236,14 @@ Als Prototyp und Funktionstest dient ein dynamisches, experimentelles **Test-Sig
    `model_<algo>_<symbol>_<timeframe>_<created_YYYYMMDD>_<updated_YYYYMMDD>.<ext>`
    * *Beispiel:* `model_lgb_SILVER_M1_20260730_20260730.json`
 2. **Inferenz-Klassen:** 
-   * `LightGBMSignal` und `XGBoostSignal` erben von `SignalDefinition` (`../analytics/signals/machine_learning`).
+   * `LightGBMSignal` und `XGBoostSignal` erben von `SignalDefinition` (`../../analytics/signals/machine_learning`).
    * Die zu ladende Modell-Datei wird dynamisch über den `params`-Block im JSON-Signal-Set definiert.
 3. **Zukunfts-Option (ONNX):** Für die Initialphase werden die nativen Python-APIs (`lightgbm` / `xgboost`) genutzt. Bei sehr großen Datenmengen oder extremen Taktzeiten kann die Inferenzklasse intern transparent auf `onnxruntime` umgestellt werden, ohne den Anwendungscode oder die Signal-Sets anzupassen.
 
 
 ## 3. Test-Signal (Experimental Signal) & Live-Ticker Anbindung
 
-1. **Kein Hardcoding / Kein simples EMA-Cross:** Da einfache EMAs im M1-Chart zu wenige Signale generieren, wird ein experimentelles Test-Signal implementiert (`../analytics/signals/experimental/alternating_arrow_signal.py`).
+1. **Kein Hardcoding / Kein simples EMA-Cross:** Da einfache EMAs im M1-Chart zu wenige Signale generieren, wird ein experimentelles Test-Signal implementiert (`../../analytics/signals/experimental/alternating_arrow_signal.py`).
 2. **Signal-Logik:**
    * Erbt von `SignalDefinition`.
    * Bewertet die geschlossene Kerze im `live_analyzer` und liefert wechselnde Signale (`+1.0` für Buy/Pfeil oben, `-1.0` für Sell/Pfeil unten).
@@ -293,27 +293,27 @@ Die Schließung von Datenlücken in `analytics.duckdb` erfolgt über zwei klar g
    * Sobald ein Chart für ein Symbol:Timeframe-Pärchen geöffnet wird, prüft das System, ob aktive Signal-Sets den Modus `liveOp = True` besitzen.
    * Fehlende Signale seit dem letzten DB-Zeitstempel werden direkt für dieses Pärchen neu berechnet und nachgeführt.
 4. **Manuell (Service-Trigger):**
-   * Über das `ServiceWindow` (`../service_win.py`) und den `HistoricalScanner` können beliebige Datenreihen manuell aktualisiert werden – sowohl für inaktive Charts als auch für Modelle mit `liveOp = False`.
+   * Über das `ServiceWindow` (`../../service_win.py`) und den `HistoricalScanner` können beliebige Datenreihen manuell aktualisiert werden – sowohl für inaktive Charts als auch für Modelle mit `liveOp = False`.
 5. **Optionaler Background-Service (Zukunfts-Option):**
    * Ein vollautomatischer 24/7-Background-Service für geschlossene Charts kann zu einem späteren Zeitpunkt als eigener Worker nachgerüstet werden, nutzt aber dieselbe Schnittstelle wie der manuelle Service-Trigger.
 
 
 ### Aufgaben-Checkliste Phase 3.1
 
-6. **Erweiterung der Signal-Basisklasse (`../analytics/engine/base_definition.py`):**
+6. **Erweiterung der Signal-Basisklasse (`../../analytics/engine/base_definition.py`):**
    * Hinzufügen des Property `live_op: bool` zur Klasse `SignalDefinition`.
-7. **Anpassung der Live-Engine (`../analytics/background_workers/live_analyzer.py`):**
+7. **Anpassung der Live-Engine (`../../analytics/background_workers/live_analyzer.py`):**
    * Filtern der zu evaluierenden Signale vor der Ausführung: Nur Signale mit `live_op == True` werden im Live-Pipeline-Durchlauf verarbeitet.
-8. **Chart-Trigger-Integration (`../chart/chart_win.py`):**
+8. **Chart-Trigger-Integration (`../../chart/chart_win.py`):**
    * Beim Wechsel von Symbol oder Timeframe automatischen Update-Check anstoßen, sofern für das Pärchen `liveOp = True` gesetzt ist.
 
 
 ## 4. Aufgaben-Checkliste für die IDE AI
 
 * [ ] **1. Settings-Klassenstruktur & StateManager-Erweiterung:**
-  * Erstellung von `../config/base_state_model.py` (`AbstractStateModel` ABC).
-  * Erstellung von `../config/app_settings.py` (`AppSettings` Data-Class erbt von `AbstractStateModel`, `lookback_warmup_bars: int = 500`).
-  * Erweiterung von `../state_manager.py` um `get_app_settings()` und `save_app_settings()` (nutzt die bestehende Tabelle `app_config` in `app_data.duckdb`).
+  * Erstellung von `../../config/base_state_model.py` (`AbstractStateModel` ABC).
+  * Erstellung von `../../config/app_settings.py` (`AppSettings` Data-Class erbt von `AbstractStateModel`, `lookback_warmup_bars: int = 500`).
+  * Erweiterung von `../../state_manager.py` um `get_app_settings()` und `save_app_settings()` (nutzt die bestehende Tabelle `app_config` in `app_data.duckdb`).
 
 * [ ] **2. UI & Properties-Steuerung:**
   * Erstellung / Anpassung von `ui/properties_win.ui` und `properties_window.py` (erbt von `PersistentWindow`).
@@ -325,15 +325,15 @@ Die Schließung von Datenlücken in `analytics.duckdb` erfolgt über zwei klar g
   * Liest bei Initialisierung `app_settings.lookback_warmup_bars` in die Instanz-Variable `self.lookback_warmup_bars`.
   * Injiziert `self.lookback_warmup_bars` über den Konstruktor an den `live_analyzer` Worker.
 
-* [ ] **4. Experimental Signal (`../analytics/signals/experimental/alternating_arrow_signal.py`):**
+* [ ] **4. Experimental Signal (`../../analytics/signals/experimental/alternating_arrow_signal.py`):**
   * Erstellung der Klasse `AlternatingArrowSignal` (erbt von `SignalDefinition`).
   * Implementierung der `evaluate()`-Methode mit deterministisch alternierendem Status basierend auf dem `bar_time`-Index oder State.
 
-* [ ] **5. ML Inferenz-Klassen (`../analytics/signals/machine_learning`):**
+* [ ] **5. ML Inferenz-Klassen (`../../analytics/signals/machine_learning`):**
   * Erstellung von `lightgbm_signal.py` und `xgboost_signal.py` (erben von `SignalDefinition`).
   * Dynamisches Laden der Modell-Datei aus `params['model_file']` unter Beachtung der neuen Datums-Nomenklatur.
 
-* [ ] **6. Worker-Thread `live_analyzer.py` (`../analytics/background_workers`):**
+* [ ] **6. Worker-Thread `live_analyzer.py` (`../../analytics/background_workers`):**
   * Empfängt `lookback_warmup_bars` im Konstruktor.
   * Bar-Close Event Handling für `SILVER` `M1`.
   * Feature-Berechnung und sofortiger `INSERT OR REPLACE`-Write in `feature_store` (`analytics.duckdb`).
@@ -367,7 +367,7 @@ Die Schließung von Datenlücken in `analytics.duckdb` erfolgt über zwei klar g
 
 ### Getroffene Architekturentscheidungen
 1. **Visuelle Analyse-Modi (Statistik-Subtabs):**
-   * Einbindung von Subtabs im `StatisticsWindow` (`../ui/statistic_win.ui`) für grafische Auswertungen über Highcharts/Chart.js (via `QWebEngineView`) oder Seaborn/Matplotlib-Rendition.
+   * Einbindung von Subtabs im `StatisticsWindow` (`../../ui/statistic_win.ui`) für grafische Auswertungen über Highcharts/Chart.js (via `QWebEngineView`) oder Seaborn/Matplotlib-Rendition.
 2. **Visualisierungs-Fokus (Pure Signal Stats):**
    * **Handelszeiten-Heatmap:** Signal-Trefferquote & Dichte-Matrix nach Wochentagen (Mo–Fr) $\times$ Tagesstunden (0–23 Uhr).
    * **Parameter-Grid-Surface:** 2D-Heatmap zur Evaluierung von Reihen-Tests / Grid-Search (Sichtbarmachung von Sweet-Spots & Vermeidung von Curve-Fitting).
@@ -375,11 +375,11 @@ Die Schließung von Datenlücken in `analytics.duckdb` erfolgt über zwei klar g
 
 ### Aufgaben-Checkliste
 
-* [ ] **Erweiterung des Statistik-Repositorys (`../analytics/statistics_repository.py`):**
+* [ ] **Erweiterung des Statistik-Repositorys (`../../analytics/statistics_repository.py`):**
   * SQL-Abfrage für Stunden-/Wochentags-Aggregationen (Tageszeit-Heatmap) auf `signal_results` in `analytics.duckdb`.
   * Aggregations-Query für Parameter-Grid-Matrizen aus Reihen-Tests (Grid-Search).
 
-* [ ] **Erweiterung des Statistik-UI (`../ui/statistic_win.ui` & `statistic_window.py`):**
+* [ ] **Erweiterung des Statistik-UI (`../../ui/statistic_win.ui` & `statistic_window.py`):**
   * Integration von Subtabs (z. B. `Tab 1: Tabelle`, `Tab 2: Zeitzonen-Heatmap`, `Tab 3: Grid-Search Surface`).
   * Einbau eines `QWebEngineView`-Widgets zur Darstellung interaktiver HTML/JS-Grafiken (oder Rendering statischer Seaborn-Heatmaps).
 
@@ -400,7 +400,7 @@ Die Schließung von Datenlücken in `analytics.duckdb` erfolgt über zwei klar g
 
 ### Aufgaben-Checkliste
 
-* [ ] **Erweiterung des Historical Scanners (`../analytics/background_workers/historical_scanner.py`):**
+* [ ] **Erweiterung des Historical Scanners (`../../analytics/background_workers/historical_scanner.py`):**
   * Parser für Parameter-Grid-Konfigurationen (Erzeugung der Kombinations-Matrix via `itertools.product`).
   * Iterative Ausführung von `set_evaluator` über die geladenen Features.
   * Speicherung der Testreihen-Ergebnisse mit Zuordnung zur jeweiligen Testlauf-ID (`run_id`).
@@ -425,7 +425,7 @@ Die Schließung von Datenlücken in `analytics.duckdb` erfolgt über zwei klar g
 
 ### Getroffene Architekturentscheidungen
 1. **Hybrid-Ruling-Architektur:**
-   * **Komplexe Bedingungslogik (`../analytics/signals/composite`):** Wenn-Dann-Abfragen, Prozent-Abweichungen, Multi-Bar-Rückblicke und Abhängigkeiten zwischen verschiedenen Indikatoren/Signalen werden sauber in entkoppelten Python-Klassen (erben von `SignalDefinition`) umgesetzt.
+   * **Komplexe Bedingungslogik (`../../analytics/signals/composite`):** Wenn-Dann-Abfragen, Prozent-Abweichungen, Multi-Bar-Rückblicke und Abhängigkeiten zwischen verschiedenen Indikatoren/Signalen werden sauber in entkoppelten Python-Klassen (erben von `SignalDefinition`) umgesetzt.
    * **Dynamische Parameter & Gewichtung (JSON):** Schwellenwerte, Signal-Gewichtungen (`WEIGHTED`), Richtungs-Filter und aktive Handelszeitfenster (`active_time_windows`) werden in JSON-Regelschemata in `analytics.duckdb` (`signal_sets`) gespeichert.
 2. **Kombinations- & Auswertungs-Logik (`SetEvaluator`):**
    * Vektorisierte Auswertung aller im Set definierten Signale.
@@ -438,10 +438,10 @@ Die Schließung von Datenlücken in `analytics.duckdb` erfolgt über zwei klar g
 
 ### Aufgaben-Checkliste
 
-* [ ] **Aufbau der Composite-Signal-Struktur (`../analytics/signals/composite`):**
+* [ ] **Aufbau der Composite-Signal-Struktur (`../../analytics/signals/composite`):**
   * Erstellung komplexer Regel-Klassen (z. B. `trend_pullback_rule.py`), die mehrere Features (z. B. `ema_diff`, `atr_normalized`, `close`) verknüpfen und logische Sequenzen über mehrere Kerzen auswerten.
 
-* [ ] **Erweiterung des Set-Evaluators (`../analytics/engine/set_evaluator.py`):**
+* [ ] **Erweiterung des Set-Evaluators (`../../analytics/engine/set_evaluator.py`):**
   * Einbau der Time-of-Day- und Wochentags-Sperrfilter (`active_time_windows`).
   * Unterstützung komplexer Regelverknüpfungen (z. B. Mindest-Confidence einzelner Teilsignale als Bedingung für das Gesamt-Set).
 

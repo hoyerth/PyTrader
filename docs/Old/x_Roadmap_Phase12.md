@@ -332,13 +332,13 @@ class GridLiquidityFeature(PluginFeature):
 ### Entscheidungen (verbindliche Vorgaben für Phase 12)
 
 **1. Native UTC-Zeitfenster (unantastbar):**
-Das native UTC-Zeitfenster (Minute 0/30 ± `time_window_mins`, vektorisiert in `analytics/features/definitions/grid_levels.py` → `in_window_around()` bzw. `chart/indicators/grid.py` → `f_in_window_around()`) ist **grundlegende Logik und wird nie mehr angefasst**. Die im Plugin-Beispiel oben verwendete Farb-/Aktivitätslogik (`8 <= dt.hour <= 16`) ist **ausschließlich ein Platzhalter** und darf das native Zeitfenster **nicht ersetzen**. Andere Zeitkonzepte (Sessions, etc.) werden bei Bedarf in einem **separaten Layer darübergelegt** – nie in die native Logik hinein.
+Das native UTC-Zeitfenster (Minute 0/30 ± `time_window_mins`, vektorisiert in `../../analytics/features/definitions/grid_levels.py` → `in_window_around()` bzw. `../../chart/indicators/grid.py` → `f_in_window_around()`) ist **grundlegende Logik und wird nie mehr angefasst**. Die im Plugin-Beispiel oben verwendete Farb-/Aktivitätslogik (`8 <= dt.hour <= 16`) ist **ausschließlich ein Platzhalter** und darf das native Zeitfenster **nicht ersetzen**. Andere Zeitkonzepte (Sessions, etc.) werden bei Bedarf in einem **separaten Layer darübergelegt** – nie in die native Logik hinein.
 
 **2. Liq-Raster-Persistenz – Phase 11 wird hiermit abgeschlossen:**
 Phase 11 gilt mit dem aktuellen Stand als beendet. Die persistente Speicherung des **vollständigen Liq-Rasters** (Level-Liste, nicht nur das per-Bar Nearest-Level im `feature_store_payload`) wird **nicht** in Phase 12 vorweggenommen, sondern später **im neuen Plugin-System erweitert** (Service schreibt Raster in die DB → Indikator holt es von dort).
 
 **3. Bestands-Indikator bleibt unangetastet (hardcoded):**
-Der existierende Grid-Indikator (`chart/indicators/grid.py`) wird in Phase 12 **weder verändert noch entfernt** – er bleibt in seiner aktuellen, hartkodierten Form voll funktionsfähig (Referenz-Alt-Implementierung, kann jederzeit parallel betrieben werden). Phase 12 baut daraus einen **NEUEN Grid-Indikator** mit Plugin-Architektur (siehe Schritt 5): Die Service-Logik wandert in das Plugin (`GridLiquidityFeature`), der neue Indikator konsumiert dessen `chart_render_payload`. Beide laufen parallel in der Chart-Registry (Alt: `grid`, Neu: `grid_liquidity`). Der Paritätstest (Schritt 4) dient dem Vergleich, nicht der Migration des Alt-Codes.
+Der existierende Grid-Indikator (`../../chart/indicators/grid.py`) wird in Phase 12 **weder verändert noch entfernt** – er bleibt in seiner aktuellen, hartkodierten Form voll funktionsfähig (Referenz-Alt-Implementierung, kann jederzeit parallel betrieben werden). Phase 12 baut daraus einen **NEUEN Grid-Indikator** mit Plugin-Architektur (siehe Schritt 5): Die Service-Logik wandert in das Plugin (`GridLiquidityFeature`), der neue Indikator konsumiert dessen `chart_render_payload`. Beide laufen parallel in der Chart-Registry (Alt: `grid`, Neu: `grid_liquidity`). Der Paritätstest (Schritt 4) dient dem Vergleich, nicht der Migration des Alt-Codes.
 
 **4. Neues Property-Fenster – eigenständige Entwicklung NACH Phase 12:**
 Der NEUE Grid-Indikator erhält ein **vollständig neues Property-Fenster** (kein Wiederverwenden/Anpassen des bestehenden `indicator_dialog.py`). Darin erscheinen zusätzlich zu den Indikator-Parametern **Standard-Felder des genutzten Services** mit zugehörigen **Action-Buttons** (z. B. Service-Scan auslösen, Preset laden/speichern). Dieses Property-Fenster ist eine **komplett neue Entwicklung und startet NACH Phase 12** – in Phase 12 wird der neue Indikator nur mit seinen Basis-Parametern über den bestehenden generischen Dialog (Interim) bedient.
@@ -481,14 +481,14 @@ Dieser Leitfaden sichert nach jedem Schritt einen voll funktionsfähigen Projekt
 **1. Backups über Git statt Ordner-Kopien:**
 - Code-Backups erfolgen als **Git-Commit/Tag** pro Schritt (`phase12_step1`, `phase12_step2`, …) – sekundenschnell, versioniert, jederzeit zurückrollbar. Die `.backup_*`-Ordner-Kopien entfallen.
 - **Jeder Schritt wird sofort auf GitHub gesichert:** Commit → `git push origin main` → Tag erstellen → `git push origin <tag>` (bzw. `git push origin --tags`). Damit sind Code UND Tags sofort im Remote-Backup (GitHub), nicht nur lokal.
-- **`data/` wird NICHT kopiert** (`market_data.duckdb` ist ~1,2 GB und ändert sich nur durch MT5-Sync). Einzige Ausnahme: **einmaliges Backup von `analytics.duckdb` + `app_data.duckdb`** (zusammen ~23 MB) direkt vor Schritt 1 (DB-Migration), da diese migriert werden.
+- **`../../data` wird NICHT kopiert** (`market_data.duckdb` ist ~1,2 GB und ändert sich nur durch MT5-Sync). Einzige Ausnahme: **einmaliges Backup von `analytics.duckdb` + `app_data.duckdb`** (zusammen ~23 MB) direkt vor Schritt 1 (DB-Migration), da diese migriert werden.
 - Pro Schritt werden nur die **tatsächlich geänderten Dateien** gesichert (siehe Schritt-Backup-Listen).
 
 **2. Testauswahl (nur relevante Tests):**
 - Für Phase 12 werden **nur** folgende Tests ausgeführt:
-  - Regression Grid: `test/check_grid_levels_feature.py`, `test/check_grid_scan_integration.py`
-  - Neu (aus der Roadmap): `test/check_plugin_executor.py`, `test/check_grid_parity.py`
-- Die übrigen `test/`-Skripte sind Einmal-Validierungen vergangener Fixes (Zeitzonen, Chart-JS-Interna) und werden **nicht** automatisch mit ausgeführt.
+  - Regression Grid: `../../test/check_grid_levels_feature.py`, `../../test/check_grid_scan_integration.py`
+  - Neu (aus der Roadmap): `../../test/check_plugin_executor.py`, `../../test/check_grid_parity.py`
+- Die übrigen `../../test`-Skripte sind Einmal-Validierungen vergangener Fixes (Zeitzonen, Chart-JS-Interna) und werden **nicht** automatisch mit ausgeführt.
 - Schritt 7 "alle Test-Skripte ausführen" wird entsprechend auf die obige Auswahl reduziert.
 
 **3. Autonomes Durcharbeiten (keine Bestätigungen):**
@@ -502,8 +502,8 @@ Dieser Leitfaden sichert nach jedem Schritt einen voll funktionsfähigen Projekt
 
 ### 1.1 Backup-Anforderung
 
-- **DB-Backup (einmalig, vor der Migration):** `analytics.duckdb` + `app_data.duckdb` → `.backup_Phase12_Step1/`. (`market_data.duckdb` wird NICHT kopiert.)
-- **Code:** Git-Commit/Tag `phase12_step1` für `db_service.py` + `state_manager.py`.
+- **DB-Backup (einmalig, vor der Migration):** `analytics.duckdb` + `app_data.duckdb` → `../../.backup_Phase12_Step1`. (`market_data.duckdb` wird NICHT kopiert.)
+- **Code:** Git-Commit/Tag `phase12_step1` für `../../db_service.py` + `../../state_manager.py`.
 
 ### 1.2 Anweisung an die AI
 
@@ -524,7 +524,7 @@ con_app.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS is_activ
 ### 1.3 Validierung & Test
 
 **Keine UI-Tests (Regel Agents.md §4).** Validierung headless:
-   - Migration direkt ausführen: `db_service.check_and_init_databases()` in einer Testdatei unter `test/` aufrufen (kein `main.py`-Start).
+   - Migration direkt ausführen: `db_service.check_and_init_databases()` in einer Testdatei unter `../../test` aufrufen (kein `../../main.py`-Start).
    - Danach `DESCRIBE feature_store` / `DESCRIBE indicator_presets` via DuckDB: die neuen Spalten (`feature_id`, `plugin_version`, `feature_data` bzw. `plugin_id`, `version`, `is_active_batch`) sind vorhanden.
    - Datenintegrität: Zeilenzahl und Stichproben in `feature_store`/`signal_results` vor/nach Migration identisch.
 
@@ -532,7 +532,7 @@ con_app.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS is_activ
 
 ### 2.1 Backup-Anforderung
 
-Git-Commit/Tag `phase12_step2` für `analytics/features/`. `analytics/features/base_feature.py` DARF NICHT geändert oder gelöscht werden!
+Git-Commit/Tag `phase12_step2` für `../../analytics/features`. `../../analytics/features/base_feature.py` DARF NICHT geändert oder gelöscht werden!
 
 ### 2.2 Anweisung an die AI
 
@@ -549,7 +549,7 @@ Führe python -c "from analytics.features.plugins.base_plugin import PluginFeatu
 
 ###3.1 Backup-Anforderung
 
-Git-Commit/Tag `phase12_step3` für `analytics/features/feature_builder.py`.
+Git-Commit/Tag `phase12_step3` für `../../analytics/features/feature_builder.py`.
 
 ### 3.2 Anweisung an die AI
 
@@ -568,7 +568,7 @@ Erstelle ein Testskript test/check_plugin_executor.py und verifiziere die Instan
 
 ### 4.1 Backup-Anforderung
 
-Git-Commit/Tag `phase12_step4` für `analytics/features/definitions/`.
+Git-Commit/Tag `phase12_step4` für `../../analytics/features/definitions`.
 
 ###4.2 Anweisung an die AI
 
@@ -587,7 +587,7 @@ Führe python test/check_grid_parity.py aus. **Hinweis:** Linien und Circles sin
 
 ### 5.1 Backup-Anforderung
 
-Git-Commit/Tag `phase12_step5` für `chart/indicators/grid.py` (nur Sicherung – wird NICHT verändert), `chart/chart_win.py`, `state_manager.py` sowie `chart/js/03_chart_rendering.js`.
+Git-Commit/Tag `phase12_step5` für `../../chart/indicators/grid.py` (nur Sicherung – wird NICHT verändert), `../../chart/chart_win.py`, `../../state_manager.py` sowie `../../chart/js/03_chart_rendering.js`.
 
 ### 5.2 Anweisung an die AI
 
@@ -607,15 +607,15 @@ Git-Commit/Tag `phase12_step5` für `chart/indicators/grid.py` (nur Sicherung �
    - Direkter Aufruf des neuen Indikators `GridLiquidityIndicator.calculate(df, params)` auf synthetischen OHLCV-Daten → prüfe korrekte `chart_render_payload`-Struktur (`lines`, `hit_circles`).
    - Registry-Check: `chart_win.py` enthält ZUSÄTZLICH `grid_liquidity` neben `grid` (Parallelbetrieb).
    - `state_manager.save_indicator_preset(...)` mit `plugin_id`/`version`/`is_active_batch` → Roundtrip lesen und validieren.
-   - JS-Bridge: Inspektion in `chart/js/03_chart_rendering.js`/`04_live_updates.js`, dass `hit_circles` von `renderGridCircles()` verarbeitet wird (Code-Inspektion, kein UI-Start).
-   - Der bestehende `chart/indicators/grid.py` bleibt unverändert (Diff-Check via Git). Das neue Property-Fenster wird in dieser Phase NICHT gebaut.
+   - JS-Bridge: Inspektion in `../../chart/js/03_chart_rendering.js`/`04_live_updates.js`, dass `hit_circles` von `renderGridCircles()` verarbeitet wird (Code-Inspektion, kein UI-Start).
+   - Der bestehende `../../chart/indicators/grid.py` bleibt unverändert (Diff-Check via Git). Das neue Property-Fenster wird in dieser Phase NICHT gebaut.
 ---
 
 ## Schritt 6: Anbindung Batch-Services über PluginExecutor
 
 ### 6.1 Backup-Anforderung
 
-Git-Commit/Tag `phase12_step6` für `analytics/background_workers/historical_scanner.py` und `live_analyzer.py`.
+Git-Commit/Tag `phase12_step6` für `../../analytics/background_workers/historical_scanner.py` und `live_analyzer.py`.
 
 ### 6.2 Anweisung an die AI
 
@@ -630,7 +630,7 @@ Git-Commit/Tag `phase12_step6` für `analytics/background_workers/historical_sca
 ### 6.3 Validierung & Test
 
 **Keine UI-Tests (Regel Agents.md §4).** Die Validierung erfolgt headless:
-   - `HistoricalScanner` direkt instanziieren (z. B. `HistoricalScanner("SILVER", grid_scan=True)` bzw. Plugin-Modus) und `run()`/Thread in einer Testdatei unter `test/` ausführen (ohne Service-Fenster).
+   - `HistoricalScanner` direkt instanziieren (z. B. `HistoricalScanner("SILVER", grid_scan=True)` bzw. Plugin-Modus) und `run()`/Thread in einer Testdatei unter `../../test` ausführen (ohne Service-Fenster).
    - Danach DuckDB-Abfrage auf `feature_store`: Einträge mit `feature_id = 'grid_liquidity'` und gefülltem `feature_data` vorhanden.
    - Alt-Modus-Regression: Standard-Scan (`grid_scan=False`) weiterhin lauffähig und schreibt weiterhin `ema_atr_set_v1`-Signale in `signal_results` (Parallelbetrieb intakt).
    - Der `LiveAnalyzer` wird per Code-Inspektion auf dieselbe `PluginExecutor`-Instanz geprüft (kein Live-UI-Test).

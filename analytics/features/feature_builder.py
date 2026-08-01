@@ -22,7 +22,11 @@ from analytics.features.base_feature import BaseFeature
 from analytics.features.definitions.ema_diff import EMADiffFeature
 from analytics.features.definitions.atr_normalized import ATRNormalizedFeature
 from analytics.features.definitions.grid_levels import GridLevelsFeature
-from analytics.features.plugins.base_plugin import PluginFeature, FeatureCalculateResult
+from analytics.features.plugins.base_plugin import (
+    PluginFeature,
+    FeatureCalculateResult,
+    PluginContext,
+)
 from state_manager import StateManager
 from db_service import DbPool
 
@@ -121,19 +125,42 @@ class PluginExecutor:
     def __init__(self, registry: Optional[PluginRegistry] = None):
         self.registry = registry or PluginRegistry()
 
-    def execute(self, plugin_id: str, df: pd.DataFrame, params: Dict[str, any]) -> FeatureCalculateResult:
+    @staticmethod
+    def _call_calculate(
+        plugin: PluginFeature,
+        df: pd.DataFrame,
+        params: Dict[str, Any],
+        context: Optional[PluginContext] = None,
+    ) -> FeatureCalculateResult:
+        """Ruft plugin.calculate() auf – mit Context, falls das Plugin ihn
+        unterstützt. Plugins mit der alten Phase-12-Signatur calculate(df, params)
+        bleiben kompatibel (context ist Optional, Rückwärtskompatibilität)."""
+        sig = inspect.signature(plugin.calculate)
+        if "context" in sig.parameters:
+            return plugin.calculate(df, params, context=context)
+        return plugin.calculate(df, params)
+
+    def execute(
+        self,
+        plugin_id: str,
+        df: pd.DataFrame,
+        params: Dict[str, Any],
+        context: Optional[PluginContext] = None,
+    ) -> FeatureCalculateResult:
         plugin = self.registry.get(plugin_id)
 
-        # 1. Dependency Resolution (falls Abhängigkeiten angegeben sind)
+        # 1. Dependency Resolution (falls Abhängigkeiten angegeben sind) –
+        #    Context wird auch an Abhängigkeiten durchgereicht.
         for dep_id in plugin.dependencies:
             dep_plugin = self.registry.get(dep_id)
-            dep_plugin.calculate(df, dep_plugin.default_params)
+            self._call_calculate(dep_plugin, df, dep_plugin.default_params, context)
 
         # 2. Parametervalidierung
         validated_params = plugin.validate_params(params)
 
-        # 3. Stateless Execution
-        return plugin.calculate(df, validated_params)
+        # 3. Stateless Execution – Context (inkl. shared_state) wird durchgereicht,
+        #    damit Services den shared_state erreichen (Schritt 3 Evaluator).
+        return self._call_calculate(plugin, df, validated_params, context)
 
 
 class FeatureBuilder:

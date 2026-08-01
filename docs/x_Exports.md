@@ -41,6 +41,7 @@ PyTrader/
         chart_basics.py
         chart_win.py
         check_measurement.js
+    .backup_Phase12_Step1/
     analytics/
         __init__.py
         statistics_repository.py
@@ -61,6 +62,10 @@ PyTrader/
                 atr_normalized.py
                 ema_diff.py
                 grid_levels.py
+                grid_liquidity.py
+            plugins/
+                __init__.py
+                base_plugin.py
         signals/
             __init__.py
             composite/
@@ -86,6 +91,7 @@ PyTrader/
             __init__.py
             base_indicator.py
             grid.py
+            grid_liquidity.py
         js/
             01_core.js
             02_time_utils.js
@@ -108,8 +114,11 @@ PyTrader/
         check_chart_data.py
         check_dialog_geometry.py
         check_generation_guard.py
+        check_grid_buttons.py
         check_grid_circles.py
         check_grid_levels_feature.py
+        check_grid_liquidity_indicator.py
+        check_grid_parity.py
         check_grid_scan_integration.py
         check_html_template.py
         check_m1_consistency.py
@@ -117,8 +126,13 @@ PyTrader/
         check_marker_layers.js
         check_measurement.js
         check_mt5_m1_boundary.py
+        check_phase12_step1_migration.py
+        check_plugin_batch_services.py
+        check_plugin_executor.py
+        check_plugin_time_filter.py
         check_race_guard.js
         check_resolve_realtime.js
+        check_statistics_repo.py
         check_time_constants.js
         check_time_utils.js
         simulate_chart_mapping.py
@@ -158,7 +172,7 @@ DB_MARKET_DATA = os.path.join(DATA_DIR, "market_data.duckdb")
 DB_ANALYTICS = os.path.join(DATA_DIR, "analytics.duckdb")
 DB_APP_DATA = os.path.join(DATA_DIR, "app_data.duckdb")
 
-SYMBOLS = ["SILVER", "GOLD"]
+SYMBOLS = ["SILVER", "GOLD", "BTCUSD"]
 
 # TIMEFRAMES als Lazy-Initialisierung (vermeidet MT5-DLL-Load beim Import)
 _TIMEFRAMES_CACHE: Optional[Dict[str, int]] = None
@@ -370,6 +384,15 @@ def check_and_init_databases() -> None:
 			PRIMARY KEY (symbol, timeframe, bar_time)
 		);
 	""")
+
+	# Phase 12 (Hybrid-Schema): Additive Erweiterung des feature_store um die
+	# Plugin-Architektur. feature_id identifiziert das erzeugende Plugin
+	# (z.B. 'grid_liquidity'), plugin_version dessen Version und feature_data
+	# haelt den vollstaendigen FeatureStorePayload (JSON). Bestehende Spalten
+	# und Daten bleiben unangetastet.
+	con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_id VARCHAR;")
+	con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS plugin_version VARCHAR;")
+	con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_data JSON;")
 
 	con_analytics.execute("""
 		CREATE TABLE IF NOT EXISTS signal_definitions (
@@ -1871,6 +1894,16 @@ class StateManager:
             );
         """)
 
+        # Phase 12 (Hybrid-Schema): Additive Erweiterung der indicator_presets
+        # um die Plugin-Verknuepfung. plugin_id verknuepft ein Preset mit einem
+        # Plugin (z.B. 'grid_liquidity'), version fuehrt die Plugin-Version und
+        # is_active_batch markiert Presets, die von den Batch-Services
+        # (HistoricalScanner/LiveAnalyzer) ueber den PluginExecutor aktiv
+        # verarbeitet werden. Bestehende Presets und Daten bleiben unangetastet.
+        con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS plugin_id VARCHAR;")
+        con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS version VARCHAR DEFAULT '1.0.0';")
+        con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS is_active_batch BOOLEAN DEFAULT FALSE;")
+
         # Explicit Column Check via information_schema
         tables_to_migrate = ["instance_states", "symbol_tf_states"]
         columns_to_check = ["indicators_state", "measurement_state"]
@@ -2067,6 +2100,8 @@ class StateManager:
         return records
 
     def get_indicator_preset(self, indicator_id: str, preset_name: str) -> Optional[Dict[str, Any]]:
+        """Liest die Parametervalue eines Indikator-Presets (RÜCKWÄRTSKOMPATIBEL:
+        gibt direkt das params-Dict zurück, wie vom bestehenden indicator_dialog erwartet)."""
         con = self._get_connection()
         res = con.execute(
             "SELECT params FROM indicator_presets WHERE indicator_id = ? AND preset_name = ?",
@@ -2076,14 +2111,51 @@ class StateManager:
             return _parse_json_field(res[0])
         return None
 
-    def save_indicator_preset(self, indicator_id: str, preset_name: str, params: Dict[str, Any]) -> None:
+    def get_indicator_preset_meta(self, indicator_id: str, preset_name: str) -> Optional[Dict[str, Any]]:
+        """Liest ein Indikator-Preset INKL. Plugin-Verknüpfung (Phase 12 Hybrid-Schema).
+        Rückgabe: {"params": ..., "plugin_id": ..., "version": ..., "is_active_batch": ...}."""
+        con = self._get_connection()
+        res = con.execute(
+            "SELECT params, plugin_id, version, is_active_batch FROM indicator_presets WHERE indicator_id = ? AND preset_name = ?",
+            [indicator_id, preset_name]
+        ).fetchone()
+        if res and res[0]:
+            params = _parse_json_field(res[0])
+            data = {"params": params}
+            # Neue Hybrid-Schema-Spalten (können NULL sein bei Alt-Presets)
+            if len(res) > 1 and res[1] is not None:
+                data["plugin_id"] = str(res[1])
+            if len(res) > 2 and res[2] is not None:
+                data["version"] = str(res[2])
+            if len(res) > 3 and res[3] is not None:
+                data["is_active_batch"] = bool(res[3])
+            return data
+        return None
+
+    def save_indicator_preset(
+        self,
+        indicator_id: str,
+        preset_name: str,
+        params: Dict[str, Any],
+        plugin_id: Optional[str] = None,
+        version: Optional[str] = None,
+        is_active_batch: bool = False,
+    ) -> None:
+        """Speichert ein Indikator-Preset. Unterstützt zusätzlich plugin_id,
+        version und is_active_batch (Phase 12 Hybrid-Schema)."""
         con = self._get_connection()
         con.execute("""
-            INSERT INTO indicator_presets (indicator_id, preset_name, params)
-            VALUES (?, ?, ?)
+            INSERT INTO indicator_presets (indicator_id, preset_name, params, plugin_id, version, is_active_batch)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT (indicator_id, preset_name) DO UPDATE SET
-                params = EXCLUDED.params;
-        """, [indicator_id, preset_name, json.dumps(params)])
+                params = EXCLUDED.params,
+                plugin_id = EXCLUDED.plugin_id,
+                version = EXCLUDED.version,
+                is_active_batch = EXCLUDED.is_active_batch;
+        """, [
+            indicator_id, preset_name, json.dumps(params),
+            plugin_id, version, bool(is_active_batch),
+        ])
 
     def delete_indicator_preset(self, indicator_id: str, preset_name: str) -> None:
         con = self._get_connection()
@@ -2101,6 +2173,35 @@ class StateManager:
         presets = [r[0] for r in res]
         if "Default" not in presets:
             presets.insert(0, "Default")
+        return presets
+
+    def list_active_batch_presets(self) -> List[Dict[str, Any]]:
+        """Liefert alle Batch-aktiven Plugin-Presets (Phase 12 Hybrid-Schema).
+
+        Selektiert aus indicator_presets nur Presets mit is_active_batch = TRUE
+        und gesetzter plugin_id. Diese steuern den Plugin-Modus der
+        Batch-Services (HistoricalScanner / LiveAnalyzer) über den
+        PluginExecutor – der Alt-Pfad bleibt davon unberührt.
+
+        Rückgabe: Liste von {"indicator_id", "preset_name", "plugin_id",
+        "version", "params"}.
+        """
+        con = self._get_connection()
+        res = con.execute("""
+            SELECT indicator_id, preset_name, params, plugin_id, version, is_active_batch
+            FROM indicator_presets
+            WHERE is_active_batch = TRUE AND plugin_id IS NOT NULL
+            ORDER BY preset_name ASC
+        """).fetchall()
+        presets: List[Dict[str, Any]] = []
+        for indicator_id, preset_name, params_json, plugin_id, version, is_active in res:
+            presets.append({
+                "indicator_id": indicator_id,
+                "preset_name": preset_name,
+                "plugin_id": plugin_id,
+                "version": version,
+                "params": _parse_json_field(params_json) if params_json else {},
+            })
         return presets
 
     def get_app_settings(self) -> AppSettings:
@@ -10633,7 +10734,7 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-from db_service import db_connect
+from db_service import DbPool
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_ANALYTICS = str(BASE_DIR / "data" / "analytics.duckdb")
@@ -10647,15 +10748,12 @@ class StatisticsRepository:
         """Liefert alle verfuegbaren source_id Werte."""
         if not Path(DB_ANALYTICS).exists():
             return []
-        con = db_connect(DB_ANALYTICS, read_only=True)
-        try:
-            rows = con.execute("""
+        con = DbPool.get(DB_ANALYTICS)
+        rows = con.execute("""
                 SELECT DISTINCT source_id FROM signal_results
                 ORDER BY source_id
             """).fetchall()
-            return [r[0] for r in rows]
-        finally:
-            con.close()
+        return [r[0] for r in rows]
 
     def get_summary(
         self,
@@ -10686,41 +10784,38 @@ class StatisticsRepository:
 
         where_clause = " AND ".join(conditions) if conditions else "1=1"
 
-        con = db_connect(DB_ANALYTICS, read_only=True)
-        try:
-            # Gesamtzahl und avg confidence
-            row = con.execute(f"""
-                SELECT
-                    COUNT(*) AS total,
-                    COALESCE(AVG(sr.confidence), 0.0) AS avg_conf
-                FROM signal_results sr
-                WHERE {where_clause}
-            """, params).fetchone()
-            total = int(row[0]) if row[0] else 0
-            avg_conf = float(row[1]) if row[1] else 0.0
+        con = DbPool.get(DB_ANALYTICS)
+        # Gesamtzahl und avg confidence
+        row = con.execute(f"""
+            SELECT
+                COUNT(*) AS total,
+                COALESCE(AVG(sr.confidence), 0.0) AS avg_conf
+            FROM signal_results sr
+            WHERE {where_clause}
+        """, params).fetchone()
+        total = int(row[0]) if row[0] else 0
+        avg_conf = float(row[1]) if row[1] else 0.0
 
-            # Bester Timeframe (meiste Signale)
-            row_tf = con.execute(f"""
-                SELECT sr.timeframe, COUNT(*) AS cnt
-                FROM signal_results sr
-                WHERE {where_clause}
-                GROUP BY sr.timeframe
-                ORDER BY cnt DESC
-                LIMIT 1
-            """, params).fetchone()
-            best_tf = str(row_tf[0]) if row_tf else "-"
+        # Bester Timeframe (meiste Signale)
+        row_tf = con.execute(f"""
+            SELECT sr.timeframe, COUNT(*) AS cnt
+            FROM signal_results sr
+            WHERE {where_clause}
+            GROUP BY sr.timeframe
+            ORDER BY cnt DESC
+            LIMIT 1
+        """, params).fetchone()
+        best_tf = str(row_tf[0]) if row_tf else "-"
 
-            # Win-Rate via Forward-Performance (naechste 10 Bars)
-            win_rate = self._calc_win_rate(con, where_clause, params)
+        # Win-Rate via Forward-Performance (naechste 10 Bars)
+        win_rate = self._calc_win_rate(con, where_clause, params)
 
-            return {
-                "total_signals": total,
-                "avg_confidence": round(avg_conf, 4),
-                "win_rate": round(win_rate, 1),
-                "best_tf": best_tf,
-            }
-        finally:
-            con.close()
+        return {
+            "total_signals": total,
+            "avg_confidence": round(avg_conf, 4),
+            "win_rate": round(win_rate, 1),
+            "best_tf": best_tf,
+        }
 
     def _calc_win_rate(
         self,
@@ -10782,7 +10877,7 @@ class StatisticsRepository:
 
         where_clause = " AND ".join(conditions) if conditions else "1=1"
 
-        con = db_connect(DB_ANALYTICS, read_only=True)
+        con = DbPool.get(DB_ANALYTICS)
         try:
             rows = con.execute(f"""
                 SELECT
@@ -10799,8 +10894,6 @@ class StatisticsRepository:
         except Exception as e:
             print(f"⚠️ [StatisticsRepository] fetch_signals Fehler: {e}")
             return []
-        finally:
-            con.close()
 
         results = []
         for row in rows:
@@ -10858,7 +10951,7 @@ import time
 from typing import Any, Dict, List, Optional, Set
 from PySide6.QtCore import QThread, Signal
 
-from analytics.features.feature_builder import FeatureBuilder
+from analytics.features.feature_builder import FeatureBuilder, PluginExecutor, prepare_plugin_df
 from analytics.engine.set_evaluator import SetEvaluator
 from analytics.signals.heuristics.ema_trend import EMATrendSignal
 from analytics.signals.heuristics.atr_filter import ATRFilterSignal
@@ -10874,16 +10967,35 @@ class HistoricalScanner(QThread):
     scan_finished = Signal(str, int)          # symbol, total_signals_written
     log_message = Signal(str)                 # log text
 
-    def __init__(self, symbol: str, new_scan: bool = False, grid_scan: bool = False, parent=None):
+    def __init__(
+        self,
+        symbol: str,
+        new_scan: bool = False,
+        grid_scan: bool = False,
+        parent=None,
+        db_path_app: Optional[str] = None,
+        db_path_analytics: Optional[str] = None,
+        db_path_market: Optional[str] = None,
+        timeframes: Optional[List[str]] = None,
+    ):
         super().__init__(parent)
         self.symbol = symbol
         self.new_scan = new_scan
         self.grid_scan = grid_scan
         self._running = True
-        self._state_mgr = StateManager()
+        # Override-Pfade (Test/Isolation) – None = Produktions-DBs
+        self._db_path_app = db_path_app
+        self._db_path_analytics = db_path_analytics
+        self._db_path_market = db_path_market
+        self._timeframes = timeframes
+
+        self._state_mgr = StateManager(db_path=db_path_app) if db_path_app else StateManager()
         self._settings = self._state_mgr.get_app_settings()
 
         self.feature_builder = FeatureBuilder()
+        # Phase 12: PluginExecutor fuer den Plugin-Modus (aktive Batch-Presets).
+        # Der Alt-Pfad (grid_scan / Standard-Scan) bleibt davon unberuehrt.
+        self.plugin_executor = PluginExecutor()
 
         if self.grid_scan:
             # Grid-Proximity Scan (Phase 11): Grid-Levels + ATR als Feature-
@@ -10935,6 +11047,53 @@ class HistoricalScanner(QThread):
     def stop(self):
         self._running = False
 
+    def _get_active_batch_plugins(self) -> List[Dict[str, Any]]:
+        """Liefert die aktiven Batch-Presets (is_active_batch = True) aus den
+        indicator_presets. Steuert den Plugin-Modus (Phase 12)."""
+        try:
+            return self._state_mgr.list_active_batch_presets()
+        except Exception as e:
+            self.log_message.emit(f"Plugin-Presets konnten nicht geladen werden: {e}")
+            return []
+
+    def _run_plugin_batch(
+        self,
+        df_ohlcv,
+        tf: str,
+        active_plugins: List[Dict[str, Any]],
+    ) -> None:
+        """Phase 12 Plugin-Modus: Fuehrt alle aktiven Batch-Presets ueber den
+        PluginExecutor aus und schreibt den feature_store_payload in den
+        feature_store (Hybrid-Spalten feature_id/plugin_version/feature_data).
+        Der Alt-Pfad schreibt weiterhin seine nativen Spalten."""
+        if df_ohlcv is None or df_ohlcv.empty:
+            return
+        # Plugin-Vertrag: DataFrame mit 'time'-Spalte (epoch-Sekunden).
+        # load_ohlcv() liefert 'bar_time' (datetime) -> hier anpassen.
+        df_plugin = prepare_plugin_df(df_ohlcv)
+        for preset in active_plugins:
+            plugin_id = preset.get("plugin_id")
+            if not plugin_id:
+                continue
+            try:
+                result = self.plugin_executor.execute(
+                    plugin_id, df_plugin, preset.get("params", {})
+                )
+            except Exception as e:
+                import traceback
+                self.log_message.emit(f"  {tf}: Plugin {plugin_id} FEHLER: {e}")
+                self.log_message.emit(f"    {traceback.format_exc()}")
+                continue
+            payload = result.get("feature_store_payload", {}) if isinstance(result, dict) else {}
+            if payload:
+                try:
+                    n = self.feature_builder.store_plugin_payload(self.symbol, tf, payload)
+                    self.log_message.emit(
+                        f"  {tf}: Plugin {plugin_id}: {n} Feature-Rows im feature_store"
+                    )
+                except Exception as e:
+                    self.log_message.emit(f"  {tf}: Plugin {plugin_id} Store-Fehler: {e}")
+
     def run(self):
         import duckdb
         import pandas as pd
@@ -10944,15 +11103,18 @@ class HistoricalScanner(QThread):
         from db_service import DbPool
 
         BASE_DIR = Path(__file__).resolve().parent.parent.parent
-        DB_ANALYTICS = str(BASE_DIR / "data" / "analytics.duckdb")
-        DB_MARKET = str(BASE_DIR / "data" / "market_data.duckdb")
+        DB_ANALYTICS = self._db_path_analytics or str(BASE_DIR / "data" / "analytics.duckdb")
+        DB_MARKET = self._db_path_market or str(BASE_DIR / "data" / "market_data.duckdb")
 
         feature_names = self._feature_names
         feature_params = self._feature_params
         source_id = self._source_id
 
+        # Phase 12: aktive Batch-Presets (Plugin-Modus) einmal bestimmen
+        active_plugins = self._get_active_batch_plugins()
+
         total_signals = 0
-        timeframes = list(get_timeframes().keys())
+        timeframes = self._timeframes if self._timeframes is not None else list(get_timeframes().keys())
         num_tfs = len(timeframes)
 
         self.log_message.emit(f"Starte Scan fuer {self.symbol} ueber {num_tfs} Timeframes...")
@@ -10976,6 +11138,13 @@ class HistoricalScanner(QThread):
                 if df_ohlcv.empty:
                     self.log_message.emit(f"  {tf}: Keine OHLCV-Daten, ueberspringe")
                     continue
+
+                # 1b. Plugin-Modus (Phase 12): Aktive Batch-Presets über den
+                # PluginExecutor. Nutzt den vollständigen Lookback (Grid-Levels
+                # brauchen die volle Preisspanne); das Delta-Update (Schritt 2)
+                # betrifft ausschließlich den Alt-Pfad.
+                if active_plugins:
+                    self._run_plugin_batch(df_ohlcv, tf, active_plugins)
 
                 # 2. Delta-Update: Nur neue Bars scannen
                 if not self.new_scan:
@@ -11095,12 +11264,13 @@ import pandas as pd
 from PySide6.QtCore import QThread, Signal
 
 from analytics.engine.set_evaluator import SetEvaluator
-from analytics.features.feature_builder import FeatureBuilder
+from analytics.features.feature_builder import FeatureBuilder, PluginExecutor, prepare_plugin_df
 from analytics.signals.heuristics.ema_trend import EMATrendSignal
 from analytics.signals.heuristics.atr_filter import ATRFilterSignal
 from analytics.signals.experimental.alternating_arrow_signal import AlternatingArrowSignal
 from analytics.signals.composite.grid_proximity_signal import GridProximitySignal
 from db_service import DbPool
+from state_manager import StateManager
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DB_ANALYTICS = str(BASE_DIR / "data" / "analytics.duckdb")
@@ -11137,6 +11307,12 @@ class LiveAnalyzer(QThread):
 
         # Feature Builder
         self.feature_builder = FeatureBuilder()
+
+        # Phase 12: Zentraler PluginExecutor für den Plugin-Modus (aktive
+        # Batch-Presets mit live_op = True). Dieselbe Instanz, die auch der
+        # HistoricalScanner nutzt – der Alt-Pfad bleibt unverändert.
+        self.plugin_executor = PluginExecutor()
+        self._state_mgr = StateManager()
 
         # Verfügbare Signale (kann über set_active_signals() erweitert werden)
         self.signals: Dict[str, Any] = {
@@ -11228,6 +11404,7 @@ class LiveAnalyzer(QThread):
         while self._running:
             try:
                 self._process_new_bars()
+                self._process_plugin_bars()
             except Exception as e:
                 self.log_message.emit(f"❌ LiveAnalyzer Fehler: {e}")
 
@@ -11235,6 +11412,73 @@ class LiveAnalyzer(QThread):
             self.msleep(1000)
 
         self.log_message.emit("LiveAnalyzer gestoppt.")
+
+    def _get_active_live_plugins(self) -> List[Dict[str, Any]]:
+        """Liefert aktive Batch-Presets, deren Plugin live_op = True ist
+        (Phase 12 Plugin-Modus). Bestehende Live-Signale bleiben unverändert."""
+        try:
+            presets = self._state_mgr.list_active_batch_presets()
+        except Exception:
+            return []
+        active: List[Dict[str, Any]] = []
+        for preset in presets:
+            plugin_id = preset.get("plugin_id")
+            if not plugin_id:
+                continue
+            try:
+                plugin = self.plugin_executor.registry.get(plugin_id)
+            except KeyError:
+                continue
+            if getattr(plugin, "live_op", True):
+                active.append(preset)
+        return active
+
+    def _process_plugin_bars(self) -> None:
+        """Phase 12 Plugin-Modus (Live): Fuehrt aktive Batch-Plugins mit
+        live_op = True über dieselbe PluginExecutor-Instanz aus und schreibt
+        den feature_store_payload in den feature_store."""
+        plugins = self._get_active_live_plugins()
+        if not plugins:
+            return
+
+        con = DbPool.get(DB_MARKET)
+        latest_bar_time = con.execute("""
+            SELECT EXTRACT('epoch' FROM MAX("time"))::BIGINT FROM ohlcv_bars
+            WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+              AND "time" IS NOT NULL
+        """, [self.symbol, self.timeframe]).fetchone()[0]
+        if latest_bar_time is None:
+            return
+        latest_bar_time = int(latest_bar_time)
+
+        if self._last_processed_bar_time is not None and latest_bar_time <= self._last_processed_bar_time:
+            return
+
+        df_ohlcv = self.feature_builder.load_ohlcv(
+            self.symbol, self.timeframe, limit=self.lookback_bars
+        )
+        if df_ohlcv.empty:
+            return
+
+        df_plugin = prepare_plugin_df(df_ohlcv)
+        for preset in plugins:
+            plugin_id = preset.get("plugin_id")
+            try:
+                result = self.plugin_executor.execute(plugin_id, df_plugin, preset.get("params", {}))
+            except Exception as e:
+                self.log_message.emit(f"❌ Plugin-Fehler ({plugin_id}): {e}")
+                continue
+            payload = result.get("feature_store_payload", {}) if isinstance(result, dict) else {}
+            if payload:
+                try:
+                    n = self.feature_builder.store_plugin_payload(self.symbol, self.timeframe, payload)
+                    self.log_message.emit(
+                        f"🔌 Plugin {plugin_id}: {n} Feature-Rows im feature_store"
+                    )
+                except Exception as e:
+                    self.log_message.emit(f"❌ Plugin-Store-Fehler ({plugin_id}): {e}")
+
+        self._last_processed_bar_time = latest_bar_time
 
     def _get_live_signal_ids(self) -> List[str]:
         """Ermittelt alle signal_ids aus set_config, deren live_op == True ist."""
@@ -12049,14 +12293,21 @@ Stabiler Basis-Stand + Phase-11-Erweiterung: grid_levels (Y-Achsen-Grid-Levels
 und X-Achsen-Zeitfenster-Flags), gekapselt in analytics/features/definitions/.
 """
 
-from typing import Dict, List, Optional
-import pandas as pd
+from typing import Any, Dict, List, Optional
+import importlib
+import inspect
+import json
+import pkgutil
+from datetime import datetime, timezone
 from pathlib import Path
+
+import pandas as pd
 
 from analytics.features.base_feature import BaseFeature
 from analytics.features.definitions.ema_diff import EMADiffFeature
 from analytics.features.definitions.atr_normalized import ATRNormalizedFeature
 from analytics.features.definitions.grid_levels import GridLevelsFeature
+from analytics.features.plugins.base_plugin import PluginFeature, FeatureCalculateResult
 from state_manager import StateManager
 from db_service import DbPool
 
@@ -12064,6 +12315,110 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = BASE_DIR / "data"
 DB_MARKET = str(DATA_DIR / "market_data.duckdb")
 DB_ANALYTICS = str(DATA_DIR / "analytics.duckdb")
+
+
+def _timestamp_to_epoch(value: Any) -> int:
+    """Konvertiert pandas Timestamp / datetime in epoch-Sekunden (int).
+    Int/Float-Werte (bereits epoch-Sekunden) werden unveraendert uebernommen."""
+    if hasattr(value, "to_pydatetime"):
+        return int(value.to_pydatetime().timestamp())
+    if hasattr(value, "timestamp"):
+        return int(value.timestamp())
+    return int(value)
+
+
+def prepare_plugin_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Bereitet einen OHLCV-DataFrame fuer Plugin-Aufrufe vor.
+    Plugin-Vertrag (base_plugin.py): der Input-DataFrame enthaelt eine
+    'time'-Spalte mit epoch-Sekunden (int). load_ohlcv() liefert stattdessen
+    'bar_time' (datetime) – diese wird hier passend umgewandelt."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if "bar_time" in out.columns and "time" not in out.columns:
+        out["time"] = out["bar_time"].apply(_timestamp_to_epoch)
+    return out
+
+
+def _to_utc_datetime(value: Any):
+    """Konvertiert epoch-Sekunden / pandas Timestamp / datetime in ein
+    timezone-aware datetime (UTC), passend zur TIMESTAMPTZ-Spalte im Store."""
+    if isinstance(value, bool):
+        return datetime.fromtimestamp(int(value), tz=timezone.utc)
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(int(value), tz=timezone.utc)
+    if hasattr(value, "to_pydatetime"):
+        return value.to_pydatetime()
+    return value
+
+
+class PluginLoader:
+    """Class-Finder scannt Verzeichnisse rein nach Subklassen von PluginFeature (Dateiname-unabhängig)."""
+
+    def __init__(self, definitions_path: Optional[Path] = None):
+        self.definitions_path = definitions_path or Path(__file__).parent / "definitions"
+
+    def discover_plugins(self) -> Dict[str, PluginFeature]:
+        plugins = {}
+        if not self.definitions_path.exists():
+            return plugins
+
+        for _, module_name, is_pkg in pkgutil.iter_modules([str(self.definitions_path)]):
+            if is_pkg:
+                continue
+            full_module_name = f"analytics.features.definitions.{module_name}"
+            try:
+                module = importlib.import_module(full_module_name)
+                for name, obj in inspect.getmembers(module, inspect.isclass):
+                    if issubclass(obj, PluginFeature) and obj is not PluginFeature:
+                        instance = obj()
+                        plugins[instance.plugin_id] = instance
+            except Exception as e:
+                print(f"⚠️ [PluginLoader] Fehler in Modul {module_name}: {e}")
+        return plugins
+
+
+class PluginRegistry:
+    """Zentraler Singleton-Katalog für entdeckte Plugins."""
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance.loader = PluginLoader()
+            cls._instance.plugins = cls._instance.loader.discover_plugins()
+        return cls._instance
+
+    def reload(self):
+        """Expliziter Reload nur beim Start oder per Button (thread-sicher)."""
+        self.plugins = self.loader.discover_plugins()
+
+    def get(self, plugin_id: str) -> PluginFeature:
+        if plugin_id not in self.plugins:
+            raise KeyError(f"Plugin '{plugin_id}' nicht gefunden.")
+        return self.plugins[plugin_id]
+
+
+class PluginExecutor:
+    """Zentrale Schicht für Ausführung, Validierung, Dependency-Ordering & Logging."""
+
+    def __init__(self, registry: Optional[PluginRegistry] = None):
+        self.registry = registry or PluginRegistry()
+
+    def execute(self, plugin_id: str, df: pd.DataFrame, params: Dict[str, any]) -> FeatureCalculateResult:
+        plugin = self.registry.get(plugin_id)
+
+        # 1. Dependency Resolution (falls Abhängigkeiten angegeben sind)
+        for dep_id in plugin.dependencies:
+            dep_plugin = self.registry.get(dep_id)
+            dep_plugin.calculate(df, dep_plugin.default_params)
+
+        # 2. Parametervalidierung
+        validated_params = plugin.validate_params(params)
+
+        # 3. Stateless Execution
+        return plugin.calculate(df, validated_params)
 
 
 class FeatureBuilder:
@@ -12218,6 +12573,61 @@ class FeatureBuilder:
             con.unregister("df_temp")
 
             return len(df)
+        finally:
+            if own_connection:
+                con.close()
+
+    def store_plugin_payload(
+        self,
+        symbol: str,
+        timeframe: str,
+        payload: Dict[str, Any],
+        con: Optional = None,
+    ) -> int:
+        """
+        Schreibt den feature_store_payload eines Plugins (Phase 12 Hybrid-Schema)
+        in analytics.duckdb.
+
+        Setzt/aktualisiert NUR die Plugin-Spalten (feature_id, plugin_version,
+        feature_data); native Feature-Spalten bleiben unberuehrt. Dadurch ist
+        der Plugin-Pfad parallel zum Alt-Pfad betreibbar (derselbe (symbol,
+        timeframe, bar_time)-Schluessel kann beide Informationsarten tragen).
+
+        payload: {"feature_id", "plugin_version", "records": [{bar_time, ...}]}
+        """
+        records = payload.get("records") or []
+        if not records:
+            return 0
+
+        feature_id = payload.get("feature_id")
+        plugin_version = payload.get("plugin_version", "1.0.0")
+
+        own_connection = False
+        if con is None:
+            con = DbPool.get(DB_ANALYTICS)
+        else:
+            own_connection = True
+
+        try:
+            rows = []
+            for rec in records:
+                if not isinstance(rec, dict) or "bar_time" not in rec:
+                    continue
+                dt_val = _to_utc_datetime(rec["bar_time"])
+                data = {k: v for k, v in rec.items() if k != "bar_time"}
+                rows.append((symbol, timeframe, dt_val, feature_id, plugin_version, json.dumps(data)))
+            if not rows:
+                return 0
+
+            con.executemany("""
+                INSERT INTO feature_store (symbol, timeframe, bar_time, feature_id, plugin_version, feature_data)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (symbol, timeframe, bar_time) DO UPDATE SET
+                    feature_id = EXCLUDED.feature_id,
+                    plugin_version = EXCLUDED.plugin_version,
+                    feature_data = EXCLUDED.feature_data
+            """, rows)
+            return len(rows)
         finally:
             if own_connection:
                 con.close()
@@ -12565,6 +12975,399 @@ class GridLevelsFeature(BaseFeature):
             t = pd.to_datetime(df["time"], unit="s", utc=True)
             return t.dt.minute.to_numpy(dtype=int)
         return np.zeros(n, dtype=int)
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/features/definitions/grid_liquidity.py
+```py
+# analytics/features/definitions/grid_liquidity.py
+"""
+Plugin: Grid Liquidity & Proximity (Phase 12 Schritt 4).
+
+Paritäts-Plugin zur bestehenden Alt-Implementierung chart/indicators/grid.py.
+
+VERBINDLICHE ENTSCHEIDUNGEN (Roadmap Phase 12):
+1. Die Farb-/Aktivitätslogik unten (`8 <= dt.hour <= 16`) ist ausschließlich
+   ein PLATZHALTER aus der Roadmap. Sie ersetzt NICHT das native UTC-Zeitfenster
+   (Minute 0/30 ± time_window_mins) in analytics/features/definitions/grid_levels.py
+   bzw. chart/indicators/grid.py. Andere Zeitkonzepte werden in einem separaten
+   Layer darübergelegt – nie in die native Logik hinein.
+2. Die persistente Speicherung des vollständigen Liq-Rasters folgt später im
+   Plugin-System (Service schreibt Raster in DB → Indikator holt es).
+3. Der Alt-Indikator chart/indicators/grid.py bleibt UNVERÄNDERT (Referenz-Alt-
+   Implementierung, Parallelbetrieb). Dieses Plugin ist die Neu-Implementierung.
+"""
+
+from typing import Dict, Any
+
+import numpy as np
+import pandas as pd
+
+from analytics.features.plugins.base_plugin import (
+    FeatureCalculateResult,
+    ParameterSchema,
+    PluginFeature,
+    PluginMetadata,
+)
+
+
+def _f_in_window_around(minute_val: int, center: int, span: int) -> bool:
+    """Native UTC-Zeitfenster-Logik (identisch zu f_in_window_around() in
+    chart/indicators/grid.py und in_window_around() in grid_levels.py).
+    True, wenn minute_val im Fenster center +/- span liegt (mit Wrap-Around
+    ueber 0/59). Wird hier im Service dupliziert, damit getimte Treffer als
+    Feature-Store-Daten in Analysen nutzbar sind – die native Logik selbst
+    bleibt unveraendert."""
+    lower = center - span
+    upper = center + span
+    if lower < 0:
+        return minute_val >= (60 + lower) or minute_val <= upper
+    elif upper > 59:
+        return minute_val >= lower or minute_val <= (upper - 60)
+    else:
+        return lower <= minute_val <= upper
+
+
+def _bar_utc_minutes(df: pd.DataFrame) -> np.ndarray:
+    """Liefert die UTC-Minute (0-59) jeder Bar – konsistent zu
+    GridLevelsFeature._bar_utc_minutes(). Unterstuetzt 'bar_time'
+    (datetime/pandas) und 'time' (epoch-Sekunden)."""
+    n = len(df)
+    if "bar_time" in df.columns:
+        t = pd.to_datetime(df["bar_time"])
+        if t.dt.tz is not None:
+            return t.dt.tz_convert("UTC").dt.minute.to_numpy(dtype=int)
+        return t.dt.minute.to_numpy(dtype=int)
+    elif "time" in df.columns:
+        t = pd.to_datetime(df["time"], unit="s", utc=True)
+        return t.dt.minute.to_numpy(dtype=int)
+    return np.zeros(n, dtype=int)
+
+
+class GridLiquidityFeature(PluginFeature):
+
+    @property
+    def plugin_id(self) -> str:
+        return "grid_liquidity"
+
+    @property
+    def version(self) -> str:
+        return "1.0.0"
+
+    @property
+    def metadata(self) -> PluginMetadata:
+        return {
+            "category": "Grid",
+            "display_name": "Grid Liquidity & Proximity",
+            "description": "Erkennt Preisnähe zu Grid-Leveln inkl. Custom Levels & Zeitfenstern",
+            "author": "PyTrader AI",
+            "tags": ["grid", "liquidity", "proximity"],
+        }
+
+    @property
+    def parameter_schema(self) -> Dict[str, ParameterSchema]:
+        return {
+            "grid_step": {"type": "float", "default": 0.50, "min": 0.01, "max": 100.0, "step": 0.05, "description": "Rasterabstand"},
+            "proximity_threshold": {"type": "float", "default": 0.05, "min": 0.001, "max": 10.0, "step": 0.005, "description": "Toleranzschwelle"},
+            "use_time_filter": {"type": "bool", "default": True, "description": "Time Filter aktiv (Zeitfenster um ganze/halbe Stunde)"},
+            "time_window_mins": {"type": "int", "default": 5, "min": 0, "max": 30, "step": 1, "description": "Time Filter Minuten (0 oder 30 um ganze/halbe Stunde)"},
+            "line_color": {"type": "color", "default": "#2196F3", "description": "Farbe Grid-Linien"},
+            "circle_color_std": {"type": "color", "default": "#FFEB3B", "description": "Farbe Standard-Hit (im Zeitfenster)"},
+            "circle_color_active": {"type": "color", "default": "#E91E63", "description": "Farbe Hit in Aktivitätsfenster"},
+            "show_lines": {"type": "bool", "default": True, "description": "Grid-Linien anzeigen"},
+            "show_circles": {"type": "bool", "default": True, "description": "Hits anzeigen"},
+            "prox_level1": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 1"},
+            "prox_level2": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 2"},
+            "prox_level3": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 3"},
+            "prox_level4": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 4"},
+            "prox_level5": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 5"},
+            "prox_level6": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 6"},
+        }
+
+    def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> FeatureCalculateResult:
+        if df.empty:
+            return {"feature_store_payload": {}, "chart_render_payload": {}}
+
+        p = self.validate_params(params)
+        step = p["grid_step"]
+        threshold = p["proximity_threshold"]
+        use_time_filter = bool(p["use_time_filter"])
+        time_window_mins = int(p["time_window_mins"])
+
+        min_price = df["low"].min()
+        max_price = df["high"].max()
+
+        start_lvl = np.floor(min_price / step) * step
+        end_lvl = np.ceil(max_price / step) * step
+        levels = list(np.arange(start_lvl, end_lvl + step, step))
+
+        custom_lvls = [p[f"prox_level{i}"] for i in range(1, 7) if p[f"prox_level{i}"] > 0]
+        all_levels = sorted(list(set(levels + custom_lvls)))
+
+        lines_payload = []
+        if p["show_lines"]:
+            lines_payload = [
+                {"price": float(lvl), "color": p["line_color"], "width": 1, "style": "solid"}
+                for lvl in all_levels
+            ]
+
+        hit_circles = []
+        feature_rows = []
+
+        # Native UTC-Minute jeder Bar (konsistent zu GridLevelsFeature)
+        bar_minutes = _bar_utc_minutes(df)
+        minutes = list(bar_minutes)
+
+        for idx, row in df.iterrows():
+            close_price = row["close"]
+            bar_time = int(row["time"])
+
+            nearest_lvl = round(close_price / step) * step
+            dist = abs(close_price - nearest_lvl)
+            is_hit = dist <= threshold
+
+            # Zeitfenster um ganze Stunde (Minute 0) UND halbe Stunde (Minute 30)
+            # – identische native UTC-Logik wie der Alt-Indikator (grid.py).
+            row_m = minutes[idx]
+            row_in_time = (
+                _f_in_window_around(row_m, 0, time_window_mins)
+                or _f_in_window_around(row_m, 30, time_window_mins)
+            )
+            is_time_window_active = row_in_time if use_time_filter else True
+
+            if is_hit and p["show_circles"]:
+                # Farblogik identisch zum Alt-Indikator:
+                # - Zeitfilter INAKTIV: alle Proximity-Punkte gelb
+                # - Zeitfilter AKTIV: Punkte im Fenster gelb, ausserhalb fuchsia
+                if use_time_filter and not row_in_time:
+                    color = p["circle_color_active"]
+                else:
+                    color = p["circle_color_std"]
+
+                hit_circles.append({
+                    "time": bar_time,
+                    "price": float(nearest_lvl),
+                    "color": color,
+                    "priority": 10,
+                })
+
+            feature_rows.append({
+                "bar_time": bar_time,
+                "nearest_level": float(nearest_lvl),
+                "distance": float(dist),
+                "is_hit": bool(is_hit),
+                # Getimter Treffer für spätere Analysen (Phase 13 Services):
+                # 1 wenn die Bar im Zeitfenster liegt (Minute 0/30 ± mins), sonst 0
+                "is_time_window_active": int(is_time_window_active),
+                "time_window_mins": time_window_mins,
+                "use_time_filter": use_time_filter,
+            })
+
+        return {
+            "feature_store_payload": {
+                "feature_id": self.plugin_id,
+                "plugin_version": self.version,
+                "records": feature_rows,
+                "metadata": {"total_hits": len(hit_circles)},
+            },
+            "chart_render_payload": {
+                "lines": lines_payload,
+                "hit_circles": hit_circles,
+            },
+        }
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/features/plugins/__init__.py
+```py
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/features/plugins/base_plugin.py
+```py
+# analytics/features/plugins/base_plugin.py
+"""
+Basisklasse & typisierte Verträge für das Plugin-System (Phase 12).
+
+Kernprinzip: STRICTE ZUSTANDSLOSIGKEIT. Plugins speichern niemals eigene
+Zustände oder Parameter. Jede Berechnung ist eine reine Funktion
+calculate(df, params). Das ermöglicht fehlerfreie Parallelisierung,
+Thread-Sicherheit und eine klare Trennung zwischen Feature-Engine
+(FeatureStorePayload) und visuellem Indikator (ChartRenderPayload).
+
+Der Chart liest NIE direkt aus dem Feature-Store; der Scanner schreibt
+NIE aus dem Render-Payload.
+"""
+
+from abc import ABC, abstractmethod
+from typing import Dict, Any, List, TypedDict, Literal, Optional
+import pandas as pd
+
+
+# ==============================================================================
+# Parametervalidierung & Schema
+# ==============================================================================
+class ParameterSchema(TypedDict, total=False):
+    type: Literal["float", "int", "bool", "str", "color", "choice"]
+    default: Any
+    min: Optional[float]
+    max: Optional[float]
+    step: Optional[float]
+    options: Optional[List[str]]
+    description: str
+
+
+# ==============================================================================
+# Zukunftssicherer ChartRenderPayload (LightweightCharts v5 / JS-Bridge)
+# ==============================================================================
+class ChartLine(TypedDict):
+    price: float
+    color: str
+    width: int
+    style: Literal["solid", "dashed", "dotted"]
+
+
+class ChartCircle(TypedDict):
+    time: int
+    price: float
+    color: str
+    priority: int
+
+
+class ChartMarker(TypedDict):
+    time: int
+    position: Literal["aboveBar", "belowBar", "inBar"]
+    color: str
+    shape: Literal["circle", "square", "arrowUp", "arrowDown"]
+    size: int
+    text: str
+    priority: int
+
+
+class ChartArea(TypedDict):
+    time_from: int
+    time_to: int
+    price_top: float
+    price_bottom: float
+    color: str
+
+
+class ChartLabel(TypedDict):
+    time: int
+    price: float
+    text: str
+    color: str
+
+
+class ChartRenderPayload(TypedDict, total=False):
+    lines: List[ChartLine]
+    hit_circles: List[ChartCircle]  # JS-Bridge kompatibel
+    markers: List[ChartMarker]
+    areas: List[ChartArea]          # Erweiterung für Zonen/Kanäle
+    labels: List[ChartLabel]        # Erweiterung für Text-Labels
+    custom: Dict[str, Any]
+
+
+# ==============================================================================
+# Strikter FeatureStorePayload (DuckDB)
+# ==============================================================================
+class FeatureStorePayload(TypedDict, total=False):
+    feature_id: str
+    plugin_version: str
+    records: List[Dict[str, Any]]
+    metadata: Dict[str, Any]
+    statistics: Dict[str, Any]
+
+
+class FeatureCalculateResult(TypedDict):
+    feature_store_payload: FeatureStorePayload
+    chart_render_payload: ChartRenderPayload
+
+
+# ==============================================================================
+# Plugin-Metadaten & Schnittstelle
+# ==============================================================================
+class PluginMetadata(TypedDict):
+    category: str
+    display_name: str
+    description: str
+    author: str
+    tags: List[str]
+
+
+class PluginFeature(ABC):
+    """Stateless Plugin-Basisklasse mit Schemavalidierung und Metadaten."""
+
+    @property
+    @abstractmethod
+    def plugin_id(self) -> str:
+        """Dauerhaft stabile ID (z.B. 'grid_liquidity')."""
+        pass
+
+    @property
+    def version(self) -> str:
+        return "1.0.0"
+
+    @property
+    def metadata(self) -> PluginMetadata:
+        return {
+            "category": "General",
+            "display_name": self.plugin_id.replace("_", " ").title(),
+            "description": "",
+            "author": "System",
+            "tags": []
+        }
+
+    @property
+    def live_op(self) -> bool:
+        return True
+
+    @property
+    def dependencies(self) -> List[str]:
+        """IDs anderer Plugins, die vorab berechnet werden müssen."""
+        return []
+
+    @property
+    @abstractmethod
+    def parameter_schema(self) -> Dict[str, ParameterSchema]:
+        """Schema zur automatischen Validierung & UI-Generierung."""
+        pass
+
+    @property
+    def default_params(self) -> Dict[str, Any]:
+        return {k: v["default"] for k, v in self.parameter_schema.items() if "default" in v}
+
+    def validate_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Validiert Eingabeparameter gegen das Schema und setzt Defaults ein."""
+        validated = {}
+        schema = self.parameter_schema
+        for key, spec in schema.items():
+            val = params.get(key, spec.get("default"))
+            p_type = spec.get("type")
+            if p_type == "float":
+                val = float(val)
+            elif p_type == "int":
+                val = int(val)
+            elif p_type == "bool":
+                val = bool(val)
+
+            if "min" in spec and val < spec["min"]:
+                val = spec["min"]
+            if "max" in spec and val > spec["max"]:
+                val = spec["max"]
+            validated[key] = val
+        return validated
+
+    @abstractmethod
+    def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> FeatureCalculateResult:
+        """Stateless Berechnungslogik: Leseinput = df + validated_params."""
+        pass
 
 ```
 
@@ -13502,10 +14305,12 @@ from PySide6.QtWidgets import (
 try:
     from chart.chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, build_html_template
     from chart.indicators.grid import GridIndicator
+    from chart.indicators.grid_liquidity import GridLiquidityIndicator
     from chart.indicator_dialog import IndicatorSettingsDialog
 except ImportError:
     from chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, build_html_template
     from indicators.grid import GridIndicator
+    from indicators.grid_liquidity import GridLiquidityIndicator
     from indicator_dialog import IndicatorSettingsDialog
 
 try:
@@ -13626,8 +14431,11 @@ class PyTraderChartWindow(QMainWindow):
         self.df_data = None
 
         # Generische Indikator-Registry: indicator_id -> BaseIndicator
+        # Alt-Indikator 'grid' (hardcoded, unverändert) + neuer Plugin-Indikator
+        # 'grid_liquidity' (Phase 12) – beide laufen parallel.
         self.indicators: Dict[str, BaseIndicator] = {
             "grid": GridIndicator(),
+            "grid_liquidity": GridLiquidityIndicator(),
         }
         self._settings_dialog: Optional[QDialog] = None
         self._page_loaded: bool = False
@@ -13732,13 +14540,14 @@ class PyTraderChartWindow(QMainWindow):
             self.ui_widget = QWidget(self)
             self.setCentralWidget(self.ui_widget)
 
-        self.setWindowTitle(f"PyTrader Chart - {self.current_symbol} [{self.current_tf}] ({self.instance_id})")
+        self._update_window_title()
         self.resize(1000, 700)
 
         self.symbol_combo = self.ui_widget.findChild(QComboBox, "combo_symbol")
         self.tf_combo = self.ui_widget.findChild(QComboBox, "combo_tf")
         self.btn_reset = self.ui_widget.findChild(QPushButton, "btn_reset_chart")
         self.btn_indicator = self.ui_widget.findChild(QPushButton, "btn_indicator_grid")
+        self.btn_indicator_liquidity = self.ui_widget.findChild(QPushButton, "btn_indicator_grid_liquidity")
         self.btn_signal = self.ui_widget.findChild(QPushButton, "btn_signal_select")
         self.chart_container = self.ui_widget.findChild(QWidget, "web_container")
 
@@ -13750,11 +14559,17 @@ class PyTraderChartWindow(QMainWindow):
             self.tf_combo.currentTextChanged.connect(self.on_tf_changed)
         if self.btn_reset:
             self.btn_reset.clicked.connect(self.fit_chart)
+        # Alt-Grid-Button (btn_indicator_grid) → Indikator 'grid'
         if self.btn_indicator:
             self.btn_indicator.setCheckable(True)
             self.btn_indicator.clicked.connect(self.toggle_grid_lines)
             self.btn_indicator.installEventFilter(self)
-            self.update_indicator_button_style()
+        # Plugin-Grid-Button (btn_indicator_grid_liquidity) → Indikator 'grid_liquidity'
+        if self.btn_indicator_liquidity:
+            self.btn_indicator_liquidity.setCheckable(True)
+            self.btn_indicator_liquidity.clicked.connect(self.toggle_grid_liquidity_lines)
+            self.btn_indicator_liquidity.installEventFilter(self)
+        self.update_indicator_button_style()
 
         if self.btn_signal:
             self.btn_signal.setCheckable(True)
@@ -13786,29 +14601,53 @@ class PyTraderChartWindow(QMainWindow):
         pass
 
     def eventFilter(self, watched, event):
-        if self.btn_indicator is not None and watched == self.btn_indicator and event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton:
-            # Wenn Dialog offen, schliessen; sonst öffnen
-            if self._settings_dialog is not None and self._settings_dialog.isVisible():
-                self._settings_dialog.close()
-                self._settings_dialog = None
-            else:
-                self._open_indicator_settings("grid")
+        # Rechtsklick auf den Alt-Grid-Button → Einstellungen für 'grid'
+        if (self.btn_indicator is not None and watched == self.btn_indicator
+                and event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton):
+            self._toggle_settings_dialog("grid")
+            return True
+        # Rechtsklick auf den Plugin-Grid-Button → Einstellungen für 'grid_liquidity'
+        if (self.btn_indicator_liquidity is not None and watched == self.btn_indicator_liquidity
+                and event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton):
+            self._toggle_settings_dialog("grid_liquidity")
             return True
         return super().eventFilter(watched, event)
+
+    def _toggle_settings_dialog(self, ind_id: str) -> None:
+        """Wenn der Einstellungs-Dialog offen ist, schliessen; sonst für den
+        jeweiligen Indikator (alt 'grid' / Plugin 'grid_liquidity') öffnen."""
+        if self._settings_dialog is not None and self._settings_dialog.isVisible():
+            self._settings_dialog.close()
+            self._settings_dialog = None
+        else:
+            self._open_indicator_settings(ind_id)
 
     def _get_indicator_plugin(self, ind_id: str) -> Optional[BaseIndicator]:
         """Gibt die Indikator-Instanz zur ID zurück (oder None)."""
         return self.indicators.get(ind_id)
 
     def update_indicator_button_style(self):
-        if not self.btn_indicator: return
-        is_active = self.indicators_state.get("grid", {}).get("active", False)
+        """Aktualisiert die Färbung beider Indikator-Buttons (Alt 'grid' +
+        Plugin 'grid_liquidity') entsprechend ihres An/Aus-Zustands."""
+        self._apply_indicator_button_style(self.btn_indicator, "grid")
+        self._apply_indicator_button_style(self.btn_indicator_liquidity, "grid_liquidity")
+
+    def _apply_indicator_button_style(self, button: Optional[QPushButton], ind_id: str) -> None:
+        """Setzt die Button-Farbe je nach Aktiv-Zustand des Indikators."""
+        if button is None:
+            return
+        is_active = self.indicators_state.get(ind_id, {}).get("active", False)
         color = "#2e7d32" if is_active else "#37474f"
-        self.btn_indicator.setStyleSheet(
+        button.setStyleSheet(
             f"background-color: {color}; color: white; font-weight: bold; border-radius: 4px; padding: 3px 10px;")
 
     def toggle_grid_lines(self):
+        """Schaltet den ALTEN Grid-Indikator ('grid') an/aus."""
         self._toggle_indicator("grid")
+
+    def toggle_grid_liquidity_lines(self):
+        """Schaltet den NEUEN Plugin-Indikator ('grid_liquidity') an/aus."""
+        self._toggle_indicator("grid_liquidity")
 
     def _toggle_indicator(self, ind_id: str) -> None:
         """Schaltet einen Indikator an/aus."""
@@ -13898,8 +14737,8 @@ class PyTraderChartWindow(QMainWindow):
                 if hasattr(plugin, "set_context"):
                     plugin.set_context(self.current_symbol, self.current_tf)
                 res = plugin.calculate(self.df_data, st.get("params", {}))
-                # Grid-spezifische Render-Logik (aktuell der einzige Indikator)
-                if ind_id == "grid":
+                # Grid-spezifische Render-Logik (Alt 'grid' + Plugin 'grid_liquidity')
+                if ind_id in ("grid", "grid_liquidity"):
                     lines = res.get("lines", [])
                     circles = res.get("hit_circles", [])
                     # Circle-Zeiten auf kontinuierlich mappen
@@ -14031,7 +14870,7 @@ class PyTraderChartWindow(QMainWindow):
         if self.df_data is not None and not self.df_data.empty:
             for ind_id, plugin in self.indicators.items():
                 st = self.indicators_state.get(ind_id, {})
-                if st.get("active") and ind_id == "grid":
+                if st.get("active") and ind_id in ("grid", "grid_liquidity"):
                     if hasattr(plugin, "set_context"):
                         plugin.set_context(self.current_symbol, self.current_tf)
                     res = plugin.calculate(self.df_data, st.get("params", {}))
@@ -14178,10 +15017,15 @@ class PyTraderChartWindow(QMainWindow):
         except (RuntimeError, AttributeError):
             pass
 
+    def _update_window_title(self) -> None:
+        """Aktualisiert den Fenstertitel mit den aktuellen Symbol/TF-Werten."""
+        self.setWindowTitle(f"PyTrader Chart - {self.current_symbol} [{self.current_tf}] ({self.instance_id})")
+
     def on_symbol_changed(self, s):
         if s and s != self.current_symbol:
             self.save_state()
             self.current_symbol = s
+            self._update_window_title()
             self.df_data = None
             pair_st = self.state_manager.get_symbol_tf_state(self.current_symbol, self.current_tf)
             if pair_st:
@@ -14217,6 +15061,7 @@ class PyTraderChartWindow(QMainWindow):
         if t and t != self.current_tf:
             self.save_state()
             self.current_tf = t
+            self._update_window_title()
             self.df_data = None
             pair_st = self.state_manager.get_symbol_tf_state(self.current_symbol, self.current_tf)
             if pair_st:
@@ -15144,6 +15989,116 @@ class GridIndicator(BaseIndicator):
         except Exception:
             pass
         return None
+```
+
+--------------------------------------------------
+
+### DATEI: chart/indicators/grid_liquidity.py
+```py
+# chart/indicators/grid_liquidity.py
+"""
+NEUER Grid-Indikator mit Plugin-Architektur (Phase 12 Schritt 5).
+
+Konsumiert das GridLiquidityFeature-Plugin über den PluginExecutor und gibt
+dessen chart_render_payload zurück (lines + hit_circles). Die Service-Logik
+liegt im Plugin (analytics/features/definitions/grid_liquidity.py); dieser
+Indikator ist nur der visuelle Adapter (Basis-Parameter über den generischen
+indicator_dialog.py, Interim bis zum neuen Property-Fenster nach Phase 12).
+
+Der bestehende chart/indicators/grid.py bleibt UNVERÄNDERT und läuft als
+Alt-Implementierung parallel (indicator_id 'grid').
+"""
+
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+
+from .base_indicator import BaseIndicator
+from analytics.features.feature_builder import PluginExecutor, PluginRegistry
+
+
+class GridLiquidityIndicator(BaseIndicator):
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._executor: PluginExecutor = PluginExecutor()
+        self._plugin_id: str = "grid_liquidity"
+
+    @property
+    def indicator_id(self) -> str:
+        return "grid_liquidity"
+
+    @property
+    def display_name(self) -> str:
+        return "Grid Liquidity (Plugin)"
+
+    @property
+    def default_params(self) -> Dict[str, Any]:
+        """Standard-Parameter direkt aus dem Plugin-Schema (Single Source of Truth)."""
+        return dict(PluginRegistry().get(self._plugin_id).default_params)
+
+    @property
+    def param_options(self) -> Dict[str, List[Any]]:
+        return {}
+
+    @property
+    def param_labels(self) -> Dict[str, str]:
+        return {
+            "grid_step": "Rasterabstand",
+            "proximity_threshold": "Toleranz",
+            "use_time_filter": "Time Filter aktiv",
+            "time_window_mins": "Time Filter Minuten (0/30)",
+            "line_color": "Linien-Farbe",
+            "circle_color_std": "Std-Hit-Farbe (im Fenster)",
+            "circle_color_active": "Aktiv-Hit-Farbe (ausserhalb)",
+            "show_lines": "Linien anzeigen",
+            "show_circles": "Circles anzeigen",
+            "prox_level1": "Level 1",
+            "prox_level2": "Level 2",
+            "prox_level3": "Level 3",
+            "prox_level4": "Level 4",
+            "prox_level5": "Level 5",
+            "prox_level6": "Level 6",
+        }
+
+    @property
+    def param_layout(self) -> Optional[List[Any]]:
+        return [
+            ("Raster & Toleranz", ["grid_step", "proximity_threshold"]),
+            ("Time Filter", ["use_time_filter", "time_window_mins"]),
+            ("Farben", ["line_color", "circle_color_std", "circle_color_active"]),
+            ("Anzeige", ["show_lines", "show_circles"]),
+            ("Custom Levels 1-3", ["prox_level1", "prox_level2", "prox_level3"]),
+            ("Custom Levels 4-6", ["prox_level4", "prox_level5", "prox_level6"]),
+        ]
+
+    def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Führt das GridLiquidityFeature-Plugin über den PluginExecutor aus und
+        reicht dessen chart_render_payload als Zeichnungsdaten durch."""
+        empty_result: Dict[str, Any] = {
+            "lines": [],
+            "hit_circles": [],
+            "status_info": {"in_time_window": False, "active_hits": []},
+        }
+        if df is None or df.empty:
+            return empty_result
+
+        try:
+            result = self._executor.execute(self._plugin_id, df, params)
+        except Exception as e:
+            print(f"⚠️ [GridLiquidityIndicator] Plugin-Ausführung fehlgeschlagen: {e}")
+            return empty_result
+
+        crp = result.get("chart_render_payload", {}) if isinstance(result, dict) else {}
+
+        lines = crp.get("lines", [])
+        hit_circles = crp.get("hit_circles", [])
+        return {
+            "lines": lines,
+            "hit_circles": hit_circles,
+            "status_info": {"in_time_window": False, "active_hits": []},
+        }
+
 ```
 
 --------------------------------------------------
@@ -17131,6 +18086,181 @@ print('\nRESULT: PASS')
 
 --------------------------------------------------
 
+### DATEI: test/check_grid_buttons.py
+```py
+# test/check_grid_buttons.py
+# Headless-Validierung für die Trennung Alt/Plugin-Indikator-Buttons im Chart
+# (nach Phase 12; Wunsch des Users):
+#
+#   - Zweiter Button 'btn_indicator_grid_liquidity' in chart_win.ui (Layout
+#     verticalLayout_indicator) für den NEUEN Plugin-Indikator.
+#   - Alt-Button 'btn_indicator_grid' steuert 'grid', Plugin-Button steuert
+#     'grid_liquidity' (getrennt).
+#   - Rechtsklick öffnet direkt die Einstellungen NUR des jeweiligen Indikators
+#     (kein Auswahl-Menü mehr).
+#
+# KEINE UI-Tests (Regel Agents.md §4): reine Code-/XML-Inspektion, kein Qt-Start.
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+ok = True
+failures = []
+
+
+def check(cond, msg):
+    global ok
+    if cond:
+        print(f"   ✅ {msg}")
+    else:
+        ok = False
+        failures.append(msg)
+        print(f"   ❌ {msg}")
+
+
+ROOT = Path(__file__).resolve().parent.parent
+ui_path = ROOT / "ui" / "chart_win.ui"
+src_path = ROOT / "chart" / "chart_win.py"
+
+ui_xml = ET.parse(str(ui_path)).getroot()
+src = src_path.read_text(encoding="utf-8", errors="replace")
+
+print("=" * 70)
+print("Trennung Alt/Plugin-Indikator-Buttons im Chart (headless)")
+print("=" * 70)
+
+# --- [1] UI: neuer Plugin-Button vorhanden ---
+print("\n[1] chart_win.ui: neuer Plugin-Button:")
+names = [w.attrib.get("name") for w in ui_xml.iter("widget")]
+check("btn_indicator_grid" in names, "Alt-Button 'btn_indicator_grid' vorhanden")
+check("btn_indicator_grid_liquidity" in names, "Plugin-Button 'btn_indicator_grid_liquidity' vorhanden")
+
+# Layout-Zugehörigkeit prüfen: beide Buttons NEBENEINANDER in Zeile 1
+# (horizontalLayout_row1) – die oberste Toolbar-Zeile.
+row1 = None
+row2 = None
+for layout in ui_xml.iter("layout"):
+    name = layout.attrib.get("name")
+    if name == "horizontalLayout_row1":
+        row1 = layout
+    elif name == "horizontalLayout_row2":
+        row2 = layout
+check(row1 is not None, "Zeile 1 vorhanden (horizontalLayout_row1, oberste Zeile)")
+check(row2 is not None, "Zeile 2 vorhanden (horizontalLayout_row2)")
+row1_ids = [w.attrib.get("name") for w in row1.iter("widget")] if row1 is not None else []
+row2_ids = [w.attrib.get("name") for w in row2.iter("widget")] if row2 is not None else []
+check("btn_indicator_grid" in row1_ids, "Alt-Button '#' in der obersten Zeile (row1)")
+check("btn_indicator_grid_liquidity" in row1_ids, "Plugin-Button '◆' in der obersten Zeile (row1)")
+# Reihenfolge in Zeile 1: Symbol, TF, Spacer, #, ◆, 📈 → die drei Buttons stehen
+# am RECHTEN RAND (hinter dem Spacer), # direkt neben ◆, 📈 direkt danach.
+def _row1_sequence(layout):
+    """Kind-Reihenfolge von row1: Widget-Namen und Spacer-Markierungen.
+    Ein QHBoxLayout enthält <item>-Elemente, die jeweils genau ein Widget
+    oder einen Spacer kapseln."""
+    seq = []
+    for item in layout:
+        if item.tag != "item":
+            continue
+        for child in item:
+            if child.tag == "widget":
+                seq.append(child.attrib.get("name"))
+            elif child.tag == "spacer":
+                seq.append(child.attrib.get("name"))
+    return seq
+
+row1_seq = _row1_sequence(row1) if row1 is not None else []
+check("combo_symbol" in row1_seq and "combo_tf" in row1_seq,
+      "Symbol + TF links in Zeile 1")
+if "horizontalSpacer_row1" in row1_seq:
+    spacer_pos = row1_seq.index("horizontalSpacer_row1")
+    buttons_after = row1_seq[spacer_pos + 1:]
+    check("btn_indicator_grid" in buttons_after, "Alt-Button '#' NACH dem Spacer (am rechten Rand)")
+    check("btn_indicator_grid_liquidity" in buttons_after, "Plugin-Button '◆' NACH dem Spacer (am rechten Rand)")
+    check("btn_signal_select" in buttons_after, "Signal-Button '📈' NACH dem Spacer (am rechten Rand)")
+    check(buttons_after == ["btn_indicator_grid", "btn_indicator_grid_liquidity", "btn_signal_select"],
+          "Rechte Rand-Gruppe exakt: # , ◆ , 📈 (in dieser Reihenfolge)")
+else:
+    check(False, "horizontalSpacer_row1 vor den Buttons vorhanden (rechter Rand)")
+check("btn_reset_chart" in row2_ids, "Reset-Button in Zeile 2")
+check("btn_signal_select" not in row2_ids, "Signal-Button NICHT mehr in Zeile 2 (jetzt in Zeile 1)")
+# Insgesamt nur 2 Control-Zeilen
+total_rows = 0
+for layout in ui_xml.iter("layout"):
+    if layout.attrib.get("name") in ("horizontalLayout_row1", "horizontalLayout_row2"):
+        total_rows += 1
+check(total_rows == 2, f"Insgesamt genau 2 Control-Zeilen ({total_rows})")
+
+# Tooltip des Plugin-Buttons
+btn_liq = None
+for w in ui_xml.iter("widget"):
+    if w.attrib.get("name") == "btn_indicator_grid_liquidity":
+        btn_liq = w
+        break
+tooltip = ""
+if btn_liq is not None:
+    for prop in btn_liq.iter("property"):
+        if prop.attrib.get("name") == "toolTip":
+            st = prop.find("string")
+            if st is not None:
+                tooltip = st.text or ""
+check("Einstellungen" in tooltip and "Rechtsklick" in tooltip,
+      f"Tooltip klar (Plugin, Linksklick An/Aus, Rechtsklick Einstellungen)")
+
+# --- [2] chart_win.py: Plugin-Button eingebunden ---
+print("\n[2] chart_win.py: Plugin-Button verdrahtet:")
+check('findChild(QPushButton, "btn_indicator_grid_liquidity")' in src,
+      "findChild für btn_indicator_grid_liquidity vorhanden")
+check("self.btn_indicator_liquidity = " in src, "self.btn_indicator_liquidity zugewiesen")
+check("self.btn_indicator_liquidity.clicked.connect(self.toggle_grid_liquidity_lines)" in src,
+      "clicked → toggle_grid_liquidity_lines verbunden")
+check("self.btn_indicator_liquidity.installEventFilter(self)" in src,
+      "installEventFilter für Plugin-Button vorhanden")
+
+# --- [3] Getrennte Toggle-Slots ---
+print("\n[3] Getrennte Toggle-Logik:")
+check('def toggle_grid_lines(self):' in src and 'self._toggle_indicator("grid")' in src,
+      "toggle_grid_lines → 'grid' (Alt)")
+check('def toggle_grid_liquidity_lines(self):' in src and 'self._toggle_indicator("grid_liquidity")' in src,
+      "toggle_grid_liquidity_lines → 'grid_liquidity' (Plugin)")
+
+# --- [4] Rechtsklick: direkt je Indikator, kein Menü ---
+print("\n[4] Rechtsklick-Einstellungen (getrennt, ohne Menü):")
+check('self._toggle_settings_dialog("grid")' in src,
+      "Rechtsklick Alt-Button → Einstellungen 'grid'")
+check('self._toggle_settings_dialog("grid_liquidity")' in src,
+      "Rechtsklick Plugin-Button → Einstellungen 'grid_liquidity'")
+check("def _toggle_settings_dialog" in src and 'self._open_indicator_settings(ind_id)' in src,
+      "_toggle_settings_dialog öffnet Settings für den jeweiligen Indikator")
+check("_open_indicator_settings_menu" not in src, "Auswahl-Menü entfernt (_open_indicator_settings_menu)")
+
+# --- [5] Imports sauber (kein QMenu/QCursor mehr) ---
+print("\n[5] Imports:")
+check("from PySide6.QtGui import QCursor" not in src, "QCursor-Import entfernt")
+check("QMenu" not in src, "QMenu-Import entfernt")
+
+# --- [6] Button-Style deckt beide Indikatoren ab ---
+print("\n[6] Button-Style (beide Indikatoren):")
+check('self._apply_indicator_button_style(self.btn_indicator, "grid")' in src,
+      "Style Alt-Button ↔ 'grid'")
+check('self._apply_indicator_button_style(self.btn_indicator_liquidity, "grid_liquidity")' in src,
+      "Style Plugin-Button ↔ 'grid_liquidity'")
+
+print()
+if ok:
+    print("RESULT: ALLE CHECKS BESTANDEN ✅")
+    sys.exit(0)
+else:
+    print(f"RESULT: {len(failures)} CHECK(S) FEHLGESCHLAGEN ❌")
+    for f in failures:
+        print(f"   - {f}")
+    sys.exit(1)
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/check_grid_circles.py
 ```py
 # test/check_grid_circles.py
@@ -17541,6 +18671,387 @@ finally:
 
 print("\nRESULT:", "PASS" if ok else f"FAIL ({failures})")
 raise SystemExit(0 if ok else 1)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_grid_liquidity_indicator.py
+```py
+# test/check_grid_liquidity_indicator.py
+# Headless-Validierung für Phase 12 Schritt 5 (Chart-Anbindung, JS-Bridge & Presets).
+#
+# KEINE UI-Tests (Regel Agents.md §4). Validierung:
+#   1. GridLiquidityIndicator.calculate(df, params) auf synthetischen OHLCV-Daten
+#      liefert korrekte chart_render_payload-Struktur (lines, hit_circles).
+#   2. Registry-Check: chart/chart_win.py enthält ZUSÄTZLICH 'grid_liquidity'
+#      neben 'grid' (Parallelbetrieb) – per Code-Inspektion (kein Qt-Import).
+#   3. state_manager.save_indicator_preset(...) mit plugin_id/version/is_active_batch
+#      → Roundtrip lesen und validieren (temporäre DB, keine Produktions-DB).
+#   4. chart/indicators/grid.py bleibt unverändert (Diff-Check via Git).
+#   5. JS-Bridge-Inspektion: renderGridCircles verarbeitet hit_circles
+#      (chart/js/03_chart_rendering.js + 04_live_updates.js).
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import numpy as np
+import pandas as pd
+
+from chart.indicators.grid_liquidity import GridLiquidityIndicator
+from state_manager import StateManager
+from db_service import DbPool
+
+ok = True
+failures = []
+
+
+def check(cond, msg):
+    global ok
+    if cond:
+        print(f"   ✅ {msg}")
+    else:
+        ok = False
+        failures.append(msg)
+        print(f"   ❌ {msg}")
+
+
+def build_synthetic_df(n=120, seed=7, base_price=100.0, step=0.5, start_ts=1_700_000_000):
+    """Synthetische OHLCV-Daten (M1-Schritte) – wie im Paritätstest."""
+    rng = np.random.default_rng(seed)
+    closes = base_price + np.cumsum(rng.normal(0, 0.3, n))
+    grid_prices = np.round(closes / step) * step
+    mix_mask = rng.random(n) < 0.2
+    closes[mix_mask] = grid_prices[mix_mask]
+    opens = np.concatenate([[base_price], closes[:-1]])
+    highs = np.maximum(opens, closes) + rng.uniform(0, 0.2, n)
+    lows = np.minimum(opens, closes) - rng.uniform(0, 0.2, n)
+    times = [int(start_ts) + i * 60 for i in range(n)]
+    return pd.DataFrame({
+        "time": times, "open": opens, "high": highs, "low": lows, "close": closes,
+    })
+
+
+print("=" * 70)
+print("Phase 12 Schritt 5 – Chart-Anbindung (headless)")
+print("=" * 70)
+
+# --- [1] GridLiquidityIndicator.calculate auf synthetischen Daten ---
+print("\n[1] GridLiquidityIndicator.calculate(df, params):")
+df = build_synthetic_df()
+ind = GridLiquidityIndicator()
+params = dict(ind.default_params)
+params["prox_level1"] = 100.0  # Custom Level
+try:
+    res = ind.calculate(df, params)
+    check(True, "läuft fehlerfrei")
+    check(isinstance(res, dict), "Rückgabe ist dict")
+    check("lines" in res and isinstance(res["lines"], list), f"lines: List (n={len(res['lines'])})")
+    check("hit_circles" in res and isinstance(res["hit_circles"], list), f"hit_circles: List (n={len(res['hit_circles'])})")
+    if res["hit_circles"]:
+        c0 = res["hit_circles"][0]
+        for field in ("time", "price", "color", "priority"):
+            check(field in c0, f"hit_circle-Feld '{field}' vorhanden")
+    # Leeres DataFrame -> leerer Payload
+    empty = ind.calculate(pd.DataFrame(), {})
+    check(empty["lines"] == [] and empty["hit_circles"] == [], "leeres df -> leerer Payload")
+except Exception as e:
+    check(False, f"Indikator Fehler: {e}")
+
+# --- [2] Registry-Check chart_win.py (Code-Inspektion) ---
+print("\n[2] Registry-Check chart_win.py (Parallelbetrieb):")
+chart_win_src = (Path(__file__).parent.parent / "chart" / "chart_win.py").read_text(encoding="utf-8", errors="replace")
+has_grid = '"grid": GridIndicator()' in chart_win_src
+has_liq = '"grid_liquidity": GridLiquidityIndicator()' in chart_win_src
+check(has_grid, "'grid' in Registry")
+check(has_liq, "'grid_liquidity' ZUSÄTZLICH in Registry")
+check(has_grid and has_liq, "beide Indikatoren registriert (Parallelbetrieb)")
+
+# --- [3] Preset-Roundtrip mit plugin_id/version/is_active_batch ---
+print("\n[3] save_indicator_preset mit Plugin-Feldern (temporäre DB):")
+tmp_db = str(Path(__file__).parent / "tmp_phase12_step5.duckdb")
+if os.path.exists(tmp_db):
+    os.remove(tmp_db)
+try:
+    sm = StateManager(db_path=tmp_db)
+    test_params = {"grid_step": 0.25, "proximity_threshold": 0.1, "show_lines": True, "show_circles": False}
+    sm.save_indicator_preset(
+        "grid_liquidity", "BatchScan",
+        test_params,
+        plugin_id="grid_liquidity", version="1.0.0", is_active_batch=True,
+    )
+    meta = sm.get_indicator_preset_meta("grid_liquidity", "BatchScan")
+    check(meta is not None, "Preset wurde gespeichert und gelesen (Roundtrip)")
+    if meta:
+        check(meta.get("plugin_id") == "grid_liquidity", f"plugin_id='{meta.get('plugin_id')}'")
+        check(meta.get("version") == "1.0.0", f"version='{meta.get('version')}'")
+        check(meta.get("is_active_batch") is True, f"is_active_batch={meta.get('is_active_batch')}")
+        lp = meta.get("params", {})
+        check(lp.get("grid_step") == 0.25 and lp.get("show_circles") is False, "params-Roundtrip korrekt")
+    # Rückwärtskompatibilität: get_indicator_preset liefert weiterhin direkt die params
+    # (wie vom bestehenden indicator_dialog erwartet), 3-Argument-Aufruf bleibt möglich
+    sm.save_indicator_preset("grid", "OldPreset", {"prox_stepSize": 1.0})
+    old = sm.get_indicator_preset("grid", "OldPreset")
+    check(old is not None and old.get("prox_stepSize") == 1.0,
+          "3-Argument-Aufruf (Alt-Dialog) weiterhin kompatibel")
+    # cleanup
+    sm = None
+    DbPool.close_all()
+    if os.path.exists(tmp_db):
+        os.remove(tmp_db)
+    check(not os.path.exists(tmp_db), "temporäre DB aufgeräumt")
+except Exception as e:
+    check(False, f"Preset-Roundtrip Fehler: {e}")
+    try:
+        DbPool.close_all()
+        if os.path.exists(tmp_db):
+            os.remove(tmp_db)
+    except Exception:
+        pass
+
+# --- [4] grid.py unverändert (Git-Diff) ---
+print("\n[4] chart/indicators/grid.py unverändert:")
+try:
+    r = subprocess.run(
+        ["git", "diff", "--stat", "chart/indicators/grid.py"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    check(r.stdout.strip() == "", f"kein Diff (Ausgabe leer) – '{r.stdout.strip()}'")
+except Exception as e:
+    check(False, f"Git-Diff-Check Fehler: {e}")
+
+# --- [5] JS-Bridge-Inspektion hit_circles ---
+print("\n[5] JS-Bridge verarbeitet hit_circles:")
+js3 = (Path(__file__).parent.parent / "chart" / "js" / "03_chart_rendering.js").read_text(encoding="utf-8", errors="replace")
+js4 = (Path(__file__).parent.parent / "chart" / "js" / "04_live_updates.js").read_text(encoding="utf-8", errors="replace")
+check("function renderGridCircles" in js3, "03_chart_rendering.js: renderGridCircles() definiert")
+check("c.price" in js3 and "cc.price" in js3, "03_chart_rendering.js: Circles verwenden price/color")
+check("data.gridCircles" in js4 and "renderGridCircles" in js4, "04_live_updates.js: gridCircles via renderGridCircles verarbeitet")
+
+print()
+if ok:
+    print("RESULT: ALLE CHECKS BESTANDEN ✅")
+    sys.exit(0)
+else:
+    print(f"RESULT: {len(failures)} CHECK(S) FEHLGESCHLAGEN ❌")
+    for f in failures:
+        print(f"   - {f}")
+    sys.exit(1)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_grid_parity.py
+```py
+# test/check_grid_parity.py
+# Headless-Validierung für Phase 12 Schritt 4 (Paritäts-Plugin grid_liquidity).
+#
+# Schickt identische OHLCV-Daten durch den Alt-Indikator GridIndicator.calculate()
+# und PluginExecutor().execute("grid_liquidity", df, params).
+#
+# Validiert (Entscheidung 4.3 der Roadmap – Linien/Circles sind eigenständige
+# Services, Anzahl ist NICHT korreliert):
+#   1. Das Plugin läuft fehlerfrei über PluginExecutor (keine Exceptions,
+#      korrekte Payload-Struktur).
+#   2. Linien-Output und Circle-Output werden jeweils für sich konsistent erzeugt
+#      (Linien = eigenes Raster-Ergebnis, Circles = eigene Proximity-Auswertung).
+#   3. Die Circle-Ergebnisse beziehen sich korrekt auf die erzeugten Linien-Levels
+#      (logische Kopplung) – OHNE identische Anzahl zu verlangen.
+#   4. Der Alt-Indikator GridIndicator.calculate() läuft auf denselben Daten
+#      fehlerfrei (Paritäts-Basis, wird NICHT verändert).
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import numpy as np
+import pandas as pd
+
+from chart.indicators.grid import GridIndicator
+from analytics.features.feature_builder import PluginExecutor
+from analytics.features.plugins.base_plugin import PluginFeature
+
+ok = True
+failures = []
+
+
+def check(cond, msg):
+    global ok
+    if cond:
+        print(f"   ✅ {msg}")
+    else:
+        ok = False
+        failures.append(msg)
+        print(f"   ❌ {msg}")
+
+
+def build_synthetic_df(n=120, seed=42, base_price=100.0, step=0.5, start_ts=1_700_000_000):
+    """Synthetische OHLCV-Daten (M1-Schritte) um base_price.
+    ~20% der Closes werden exakt auf ein Grid-Level (Vielfaches von step) gelegt,
+    damit garantiert Proximity-Hits entstehen (Circles nicht leer)."""
+    rng = np.random.default_rng(seed)
+    closes = base_price + np.cumsum(rng.normal(0, 0.3, n))
+    # Einige Bars exakt auf Grid-Level-Raster (step) legen -> garantierte Hits
+    grid_prices = np.round(closes / step) * step
+    mix_mask = rng.random(n) < 0.2
+    closes[mix_mask] = grid_prices[mix_mask]
+
+    opens = np.concatenate([[base_price], closes[:-1]])
+    highs = np.maximum(opens, closes) + rng.uniform(0, 0.2, n)
+    lows = np.minimum(opens, closes) - rng.uniform(0, 0.2, n)
+    times = [int(start_ts) + i * 60 for i in range(n)]
+    return pd.DataFrame({
+        "time": times,
+        "open": opens,
+        "high": highs,
+        "low": lows,
+        "close": closes,
+    })
+
+
+ALT_PARAMS = {
+    "prox_enableMaster": True,
+    "prox_stepSize": 0.5,
+    "prox_stepsAround": 4,
+    "prox_visitPct": 0.05,
+    "prox_useTimeFilter": True,
+    "prox_timeWindowMins": 5,
+    "prox_showLines": True,
+    "prox_showCircles": True,
+    "prox_level1": 100.0,  # Custom Level
+}
+
+PLUGIN_PARAMS = {
+    "grid_step": 0.5,
+    "proximity_threshold": 0.05,
+    "show_lines": True,
+    "show_circles": True,
+    "prox_level1": 100.0,  # Custom Level
+}
+
+print("=" * 70)
+print("Phase 12 Schritt 4 – Paritäts-Plugin grid_liquidity (headless)")
+print("=" * 70)
+
+df = build_synthetic_df()
+print(f"\nSynthetische Daten: {len(df)} Bars, close {df['close'].min():.2f}..{df['close'].max():.2f}")
+
+# --- [1] Alt-Indikator (Paritäts-Basis, unverändert) ---
+print("\n[1] Alt-Indikator GridIndicator.calculate():")
+try:
+    alt = GridIndicator().calculate(df, ALT_PARAMS)
+    alt_lines = alt.get("lines", [])
+    alt_circles = alt.get("hit_circles", [])
+    check(True, "läuft fehlerfrei")
+    check(isinstance(alt_lines, list), f"lines: List (n={len(alt_lines)})")
+    check(isinstance(alt_circles, list), f"hit_circles: List (n={len(alt_circles)})")
+    check(isinstance(alt.get("status_info"), dict), "status_info: Dict")
+except Exception as e:
+    check(False, f"Alt-Indikator Fehler: {e}")
+    alt_lines, alt_circles = [], []
+
+# --- [2] Plugin über PluginExecutor ---
+print("\n[2] PluginExecutor().execute('grid_liquidity', df, params):")
+try:
+    ex = PluginExecutor()
+    result = ex.execute("grid_liquidity", df, PLUGIN_PARAMS)
+    check(True, "läuft fehlerfrei über PluginExecutor")
+    check(isinstance(result, dict), "Rückgabe ist FeatureCalculateResult (dict)")
+
+    fsp = result.get("feature_store_payload", {})
+    crp = result.get("chart_render_payload", {})
+    check(isinstance(crp, dict), "chart_render_payload ist dict")
+    check(isinstance(fsp, dict), "feature_store_payload ist dict")
+
+    plugin_lines = crp.get("lines", [])
+    plugin_circles = crp.get("hit_circles", [])
+    check(isinstance(plugin_lines, list), f"lines: List (n={len(plugin_lines)})")
+    check(isinstance(plugin_circles, list), f"hit_circles: List (n={len(plugin_circles)})")
+except Exception as e:
+    check(False, f"Plugin Fehler: {e}")
+    plugin_lines, plugin_circles, fsp, crp = [], [], {}, {}
+
+# --- [3] Payload-Struktur ---
+print("\n[3] Payload-Struktur:")
+check(fsp.get("feature_id") == "grid_liquidity", f"feature_id='{fsp.get('feature_id')}'")
+check(fsp.get("plugin_version") == "1.0.0", f"plugin_version='{fsp.get('plugin_version')}'")
+records = fsp.get("records", [])
+check(isinstance(records, list) and len(records) == len(df), f"records: {len(records)} (== {len(df)} Bars)")
+if records:
+    r0 = records[0]
+    for field in ("bar_time", "nearest_level", "distance", "is_hit"):
+        check(field in r0, f"record-Feld '{field}' vorhanden")
+    bad_hit = [
+        r for r in records
+        if r["is_hit"] != (r["distance"] <= PLUGIN_PARAMS["proximity_threshold"])
+    ]
+    check(len(bad_hit) == 0, "is_hit konsistent mit distance <= proximity_threshold")
+
+# --- [4] Linien-Output konsistent (eigenes Raster-Ergebnis) ---
+print("\n[4] Linien-Output konsistent:")
+if plugin_lines:
+    prices = [l.get("price") for l in plugin_lines if l.get("price") is not None]
+    check(len(prices) == len(plugin_lines), "alle Linien haben price")
+    low_min = df["low"].min()
+    high_max = df["high"].max()
+    in_range = all(
+        (low_min - PLUGIN_PARAMS["grid_step"] - 1e-6) <= p <= (high_max + PLUGIN_PARAMS["grid_step"] + 1e-6)
+        for p in prices
+    )
+    check(in_range, "Linien-Preise liegen im Bereich [min(low)-step, max(high)+step]")
+    check(len(prices) >= 1, "mindestens eine Linie erzeugt")
+else:
+    check(False, "Plugin erzeugt keine Linien (show_lines=True erwartet)")
+
+# --- [5] Circle-Ergebnisse beziehen sich auf Linien-Levels (logische Kopplung) ---
+print("\n[5] Circle-Ergebnisse ↔ Linien-Levels (logische Kopplung):")
+if plugin_circles:
+    line_prices = sorted(l.get("price") for l in plugin_lines if l.get("price") is not None)
+    tol = PLUGIN_PARAMS["grid_step"] / 2.0 + 1e-3
+    uncoupled = []
+    for c in plugin_circles:
+        cp = c.get("price")
+        if cp is None:
+            uncoupled.append(c)
+            continue
+        if not line_prices:
+            uncoupled.append(c)
+            continue
+        nearest_line = min(abs(cp - lp) for lp in line_prices)
+        if nearest_line > tol:
+            uncoupled.append(c)
+    check(len(uncoupled) == 0,
+          f"alle {len(plugin_circles)} Circles haben ein Linien-Level innerhalb step/2")
+    # Jeder Circle hat die erwartete Struktur (time/price/color/priority)
+    well_formed = all(
+        {"time", "price", "color", "priority"}.issubset(c.keys()) for c in plugin_circles
+    )
+    check(well_formed, "alle Circles haben time/price/color/priority")
+else:
+    check(True, "keine Circles erzeugt – logische Kopplung nicht anwendbar (unwahrscheinlich)")
+
+# --- [6] Plugin-Registry hat das Plugin gefunden ---
+print("\n[6] Registry-Discovery:")
+try:
+    from analytics.features.feature_builder import PluginRegistry
+    plugin = PluginRegistry().get("grid_liquidity")
+    check(isinstance(plugin, PluginFeature), f"Registry.get('grid_liquidity') -> {type(plugin).__name__}")
+except KeyError as e:
+    check(False, f"Plugin nicht in Registry gefunden: {e}")
+
+print()
+if ok:
+    print("RESULT: ALLE CHECKS BESTANDEN ✅")
+    sys.exit(0)
+else:
+    print(f"RESULT: {len(failures)} CHECK(S) FEHLGESCHLAGEN ❌")
+    for f in failures:
+        print(f"   - {f}")
+    sys.exit(1)
 
 ```
 
@@ -18426,6 +19937,745 @@ print("\nFertig.")
 
 --------------------------------------------------
 
+### DATEI: test/check_phase12_step1_migration.py
+```py
+# test/check_phase12_step1_migration.py
+# Headless-Validierung für Phase 12 Schritt 1 (Hybrid-Schema & Presets).
+#
+# Validiert (keine UI-Tests, Regel Agents.md §4):
+#   1. db_service.check_and_init_databases() läuft fehlerfrei (Migration)
+#   2. feature_store enthält danach: feature_id, plugin_version, feature_data
+#   3. StateManager() (app_data) enthält danach in indicator_presets:
+#      plugin_id, version, is_active_batch
+#   4. Datenintegrität: Zeilenzahl in feature_store/signal_results/indicator_presets
+#      vor und nach der Migration identisch (kein Datenverlust)
+#
+# Hinweis: Die Migration ist idempotent (ADD COLUMN IF NOT EXISTS), der Test
+# kann daher beliebig oft wiederholt werden.
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from db_service import check_and_init_databases, DB_ANALYTICS, DB_APP_DATA, DbPool
+from state_manager import StateManager
+
+ok = True
+failures = []
+
+
+def check(cond, msg):
+    global ok
+    if cond:
+        print(f"   ✅ {msg}")
+    else:
+        ok = False
+        failures.append(msg)
+        print(f"   ❌ {msg}")
+
+
+def get_row_counts():
+    """Zeilenzahlen vor der Migration erfassen."""
+    counts = {}
+    c = DbPool.get(DB_ANALYTICS)
+    counts["feature_store"] = c.execute("SELECT COUNT(*) FROM feature_store").fetchone()[0]
+    counts["signal_results"] = c.execute("SELECT COUNT(*) FROM signal_results").fetchone()[0]
+    c = DbPool.get(DB_APP_DATA)
+    counts["indicator_presets"] = c.execute("SELECT COUNT(*) FROM indicator_presets").fetchone()[0]
+    return counts
+
+
+def get_columns(db_path, table_name):
+    """Spaltennamen einer Tabelle als Liste."""
+    c = DbPool.get(db_path)
+    cols = [r[0].lower() for r in c.execute(f"DESCRIBE {table_name}").fetchall()]
+    return cols
+
+
+print("=" * 70)
+print("Phase 12 Schritt 1 – Migration Hybrid-Schema & Presets (headless)")
+print("=" * 70)
+
+# 1) Vorher-Zustand erfassen
+print("\n[1] Vorher-Zeilenzahlen (Baseline):")
+before = get_row_counts()
+print(f"   feature_store={before['feature_store']}  signal_results={before['signal_results']}  indicator_presets={before['indicator_presets']}")
+
+# 2) Migration ausführen (beide DBs)
+print("\n[2] Führe Migration aus ...")
+check_and_init_databases()          # analytics.duckdb: feature_store-Erweiterung
+sm = StateManager()                 # app_data.duckdb:  indicator_presets-Erweiterung
+print("   Migration abgeschlossen.")
+
+# 3) Schema-Prüfung
+print("\n[3] Schema-Prüfung feature_store (analytics):")
+feat_cols = get_columns(DB_ANALYTICS, "feature_store")
+for col in ["feature_id", "plugin_version", "feature_data"]:
+    check(col in feat_cols, f"Spalte '{col}' in feature_store vorhanden")
+
+print("\n[4] Schema-Prüfung indicator_presets (app_data):")
+preset_cols = get_columns(DB_APP_DATA, "indicator_presets")
+for col in ["plugin_id", "version", "is_active_batch"]:
+    check(col in preset_cols, f"Spalte '{col}' in indicator_presets vorhanden")
+
+# 4) Datenintegrität
+print("\n[5] Datenintegrität (Zeilenzahl vor/nach):")
+after = get_row_counts()
+for table in ["feature_store", "signal_results", "indicator_presets"]:
+    check(before[table] == after[table],
+          f"{table}: {before[table]} vor == {after[table]} nach (kein Verlust)")
+
+# 5) Idempotenz: zweite Migration darf keine Fehler werfen
+print("\n[6] Idempotenz (zweite Migration):")
+try:
+    check_and_init_databases()
+    StateManager()
+    check(True, "Zweite Migration fehlerfrei (ADD COLUMN IF NOT EXISTS idempotent)")
+except Exception as e:
+    check(False, f"Zweite Migration fehlgeschlagen: {e}")
+
+print()
+if ok:
+    print("RESULT: ALLE CHECKS BESTANDEN ✅")
+    sys.exit(0)
+else:
+    print(f"RESULT: {len(failures)} CHECK(S) FEHLGESCHLAGEN ❌")
+    for f in failures:
+        print(f"   - {f}")
+    sys.exit(1)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_plugin_batch_services.py
+```py
+# test/check_plugin_batch_services.py
+# Headless-Validierung für Phase 12 Schritt 6 (Anbindung Batch-Services).
+#
+# KEINE UI-Tests (Regel Agents.md §4). Getestet wird mit ISOLIERTEN
+# temporären DuckDB-Dateien (test/tmp_phase12_step6_*.duckdb):
+#   [1] StateManager.list_active_batch_presets() (is_active_batch=True)
+#   [2] HistoricalScanner Plugin-Modus: aktive Batch-Presets laufen über den
+#       PluginExecutor; feature_store_payload wird mit feature_id='grid_liquidity'
+#       und gefülltem feature_data in den feature_store geschrieben.
+#   [3] Alt-Modus-Regression: Standard-Scan (grid_scan=False) läuft weiterhin
+#       und schreibt ema_atr_set_v1-Signale in signal_results (Parallelbetrieb).
+#   [4] Alt-Modus-Regression: Grid-Scan (grid_scan=True) schreibt weiterhin die
+#       nativen Feature-Spalten in den feature_store (feature_id bleibt NULL für
+#       reine Alt-Zeilen; Plugin-Spalten bleiben bei Hybrid-Zeilen erhalten).
+#   [5] LiveAnalyzer per Code-Inspektion: dieselbe PluginExecutor-Instanz,
+#       Plugin-Modus nur für Plugins mit live_op=True.
+#
+# HINWEIS: Historische OHLCV-Daten werden in einer temp market-DB mit
+# synthetischen SILVER-M1-Bars erzeugt (deterministisch, trendig -> garantiert
+# ema_atr_set_v1-Signale im Standard-Scan).
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import duckdb
+import numpy as np
+import pandas as pd
+
+import analytics.features.feature_builder as fb_module
+from db_service import DbPool
+
+ok = True
+failures = []
+
+
+def check(cond, msg):
+    global ok
+    if cond:
+        print(f"   ✅ {msg}")
+    else:
+        ok = False
+        failures.append(msg)
+        print(f"   ❌ {msg}")
+
+
+def build_synth_bars(n=600, base=30.0, seed=7):
+    """Deterministische SILVER-M1-Bars mit starken Trend-Segmenten, damit der
+    Standard-Scan (ema_trend_v1 + atr_filter_v1) garantiert Signale erzeugt."""
+    rng = np.random.default_rng(seed)
+    t = np.arange(n)
+    seg = n // 6
+    deltas = [15.0, -15.0, 15.0, -15.0, 15.0, -15.0]
+    trend = np.zeros(n)
+    for i, d in enumerate(deltas):
+        s = i * seg
+        e = min((i + 1) * seg, n)
+        trend[s:e] = np.linspace(0.0, d, e - s)
+    close = base + trend + rng.normal(0, 0.05, n)
+    open_ = np.concatenate([[base + trend[0]], close[:-1]])
+    high = np.maximum(open_, close) + rng.uniform(0, 0.05, n)
+    low = np.minimum(open_, close) - rng.uniform(0, 0.05, n)
+    return open_, high, low, close
+
+
+def setup_market_db(db_path, n=600):
+    open_, high, low, close = build_synth_bars(n)
+    start = datetime(2026, 7, 1, 0, 0, tzinfo=timezone.utc)
+    times = [start + timedelta(minutes=i) for i in range(n)]
+    con = duckdb.connect(db_path)
+    con.execute("""
+        CREATE TABLE ohlcv_bars (
+            symbol VARCHAR NOT NULL,
+            timeframe VARCHAR NOT NULL,
+            "time" TIMESTAMPTZ NOT NULL,
+            open DOUBLE NOT NULL,
+            high DOUBLE NOT NULL,
+            low DOUBLE NOT NULL,
+            close DOUBLE NOT NULL,
+            tick_volume BIGINT,
+            spread INTEGER,
+            real_volume BIGINT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (symbol, timeframe, "time")
+        )
+    """)
+    rows = [
+        ("SILVER", "M1", t, float(o), float(h), float(l), float(c), 100, 1, 1000)
+        for t, o, h, l, c in zip(times, open_, high, low, close)
+    ]
+    con.executemany("""
+        INSERT INTO ohlcv_bars (symbol, timeframe, "time", open, high, low, close, tick_volume, spread, real_volume)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, rows)
+    con.close()
+
+
+def setup_analytics_db(db_path):
+    con = duckdb.connect(db_path)
+    con.execute("""
+        CREATE TABLE feature_store (
+            symbol VARCHAR NOT NULL,
+            timeframe VARCHAR NOT NULL,
+            bar_time TIMESTAMPTZ NOT NULL,
+            ema_diff DOUBLE,
+            rsi_14 DOUBLE,
+            atr_normalized DOUBLE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            grid_nearest_level DOUBLE,
+            grid_dist_abs DOUBLE,
+            grid_dist_pct DOUBLE,
+            pivot_high DOUBLE,
+            pivot_low DOUBLE,
+            pivot_zone_high DOUBLE,
+            pivot_zone_low DOUBLE,
+            is_time_window_active INTEGER,
+            session_type VARCHAR,
+            session_code INTEGER,
+            is_asia INTEGER,
+            is_london INTEGER,
+            is_ny INTEGER,
+            is_overlap INTEGER,
+            tod_minute INTEGER,
+            day_of_week INTEGER,
+            regime_trend_score DOUBLE,
+            regime_trend_strength DOUBLE,
+            regime_class INTEGER,
+            regime_volatility DOUBLE,
+            feature_id VARCHAR,
+            plugin_version VARCHAR,
+            feature_data JSON,
+            PRIMARY KEY (symbol, timeframe, bar_time)
+        )
+    """)
+    con.execute("""
+        CREATE TABLE signal_results (
+            event_id VARCHAR NOT NULL,
+            symbol VARCHAR NOT NULL,
+            timeframe VARCHAR NOT NULL,
+            bar_time TIMESTAMPTZ NOT NULL,
+            source_id VARCHAR NOT NULL,
+            confidence DOUBLE,
+            context_type VARCHAR NOT NULL,
+            metadata_payload JSON,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (event_id)
+        )
+    """)
+    con.close()
+
+
+print("=" * 70)
+print("Phase 12 Schritt 6 – Batch-Services über PluginExecutor (headless)")
+print("=" * 70)
+
+# ===========================================================================
+# Setup: temporäre DBs
+# ===========================================================================
+print("\n[Setup] Temporäre DBs anlegen:")
+tmp_market = str(Path(__file__).resolve().parent / "tmp_phase12_step6_market.duckdb")
+tmp_analytics = str(Path(__file__).resolve().parent / "tmp_phase12_step6_analytics.duckdb")
+tmp_app = str(Path(__file__).resolve().parent / "tmp_phase12_step6_app.duckdb")
+for p in (tmp_market, tmp_analytics, tmp_app):
+    if os.path.exists(p):
+        os.remove(p)
+
+setup_market_db(tmp_market, n=600)
+setup_analytics_db(tmp_analytics)
+print("   ✅ market/analytics DBs angelegt")
+
+# App-DB über StateManager (legt Tabellen + Migration an)
+from state_manager import StateManager
+from config.app_settings import AppSettings
+
+sm = StateManager(db_path=tmp_app)
+sm.save_app_settings(AppSettings(scanner_candle_limit=700))
+print("   ✅ app-DB angelegt, scanner_candle_limit=700")
+
+# Plugin-Pfad der FeatureBuilder-Module auf temp-DBs umlenken
+fb_module.DB_ANALYTICS = tmp_analytics
+fb_module.DB_MARKET = tmp_market
+
+# ===========================================================================
+# [1] StateManager.list_active_batch_presets
+# ===========================================================================
+print("\n[1] list_active_batch_presets:")
+test_params = {"grid_step": 0.5, "proximity_threshold": 0.05}
+sm.save_indicator_preset(
+    "grid_liquidity", "BatchScan",
+    test_params,
+    plugin_id="grid_liquidity", version="1.0.0", is_active_batch=True,
+)
+active = sm.list_active_batch_presets()
+check(len(active) == 1, f"genau 1 aktives Batch-Preset (gefunden: {len(active)})")
+check(active and active[0]["plugin_id"] == "grid_liquidity", "plugin_id='grid_liquidity'")
+check(active and active[0]["params"].get("grid_step") == 0.5, "params aus Preset übernommen")
+
+# ===========================================================================
+# [2] HistoricalScanner Plugin-Modus
+# ===========================================================================
+print("\n[2] HistoricalScanner Plugin-Modus (grid_liquidity via PluginExecutor):")
+from analytics.background_workers.historical_scanner import HistoricalScanner
+
+scanner_plugin = HistoricalScanner(
+    "SILVER",
+    db_path_app=tmp_app,
+    db_path_analytics=tmp_analytics,
+    db_path_market=tmp_market,
+    timeframes=["M1"],
+)
+scanner_plugin.run()  # synchron (headless)
+
+con = DbPool.get(tmp_analytics)
+plug_rows = con.execute("""
+    SELECT feature_id, plugin_version, feature_data
+    FROM feature_store
+    WHERE feature_id = 'grid_liquidity'
+""").fetchall()
+check(len(plug_rows) > 0, f"feature_store: {len(plug_rows)} Zeilen mit feature_id='grid_liquidity'")
+if plug_rows:
+    fid, pver, fdata = plug_rows[0]
+    check(fid == "grid_liquidity", "feature_id='grid_liquidity'")
+    check(pver == "1.0.0", "plugin_version='1.0.0'")
+    check(fdata is not None, "feature_data gefüllt (JSON)")
+    try:
+        obj = json.loads(fdata)
+        check("is_hit" in obj and "nearest_level" in obj and "distance" in obj,
+              f"feature_data enthält is_hit/nearest_level/distance")
+    except Exception:
+        check(False, "feature_data ist kein valides JSON")
+
+# ===========================================================================
+# [3] Alt-Modus-Regression: Standard-Scan (grid_scan=False)
+# ===========================================================================
+print("\n[3] Alt-Modus-Regression: Standard-Scan (grid_scan=False):")
+# Plugin-Modus deaktivieren (Preset entfernen), damit reiner Alt-Pfad läuft
+sm.delete_indicator_preset("grid_liquidity", "BatchScan")
+check(len(sm.list_active_batch_presets()) == 0, "aktives Batch-Preset entfernt -> reiner Alt-Pfad")
+
+scanner_std = HistoricalScanner(
+    "SILVER",
+    grid_scan=False,
+    db_path_app=tmp_app,
+    db_path_analytics=tmp_analytics,
+    db_path_market=tmp_market,
+    timeframes=["M1"],
+)
+check(scanner_std._source_id == "ema_atr_set_v1", "Standard-Scan: source_id=ema_atr_set_v1")
+scanner_std.run()
+
+con = DbPool.get(tmp_analytics)
+sig_rows = con.execute("""
+    SELECT source_id, COUNT(*) FROM signal_results
+    WHERE source_id = 'ema_atr_set_v1'
+    GROUP BY source_id
+""").fetchall()
+check(len(sig_rows) == 1 and sig_rows[0][1] > 0,
+      f"signal_results: ema_atr_set_v1-Signale vorhanden ({sig_rows[0][1] if sig_rows else 0})")
+
+# ===========================================================================
+# [4] Alt-Modus-Regression: Grid-Scan (grid_scan=True, native Spalten)
+# ===========================================================================
+print("\n[4] Alt-Modus-Regression: Grid-Scan (grid_scan=True, native Spalten):")
+scanner_grid = HistoricalScanner(
+    "SILVER",
+    grid_scan=True,
+    db_path_app=tmp_app,
+    db_path_analytics=tmp_analytics,
+    db_path_market=tmp_market,
+    timeframes=["M1"],
+)
+check(scanner_grid._source_id == "grid_proximity_v1", "Grid-Scan: source_id=grid_proximity_v1")
+scanner_grid.run()
+
+con = DbPool.get(tmp_analytics)
+native_rows = con.execute("""
+    SELECT COUNT(*) FROM feature_store
+    WHERE atr_normalized IS NOT NULL AND grid_nearest_level IS NOT NULL
+      AND is_time_window_active IS NOT NULL
+""").fetchone()[0]
+check(native_rows > 0, f"feature_store: {native_rows} Zeilen mit nativen Grid/ATR-Spalten")
+# Hybrid-Koexistenz: Plugin-Zeilen haben weiterhin feature_id (nicht überschrieben)
+plug_rows2 = con.execute("""
+    SELECT COUNT(*) FROM feature_store WHERE feature_id = 'grid_liquidity'
+""").fetchone()[0]
+check(plug_rows2 > 0, f"Plugin-Spalten bleiben bei Hybrid-Zeilen erhalten ({plug_rows2})")
+
+# ===========================================================================
+# [5] LiveAnalyzer-Code-Inspektion (dieselbe PluginExecutor-Instanz, live_op)
+# ===========================================================================
+print("\n[5] LiveAnalyzer-Code-Inspektion (PluginExecutor, live_op=True):")
+la_src = (Path(__file__).resolve().parent.parent / "analytics" / "background_workers" / "live_analyzer.py").read_text(
+    encoding="utf-8", errors="replace"
+)
+check("self.plugin_executor = PluginExecutor()" in la_src,
+      "live_analyzer.py: PluginExecutor-Instanz vorhanden")
+check("self._process_plugin_bars()" in la_src and "def _process_plugin_bars" in la_src,
+      "live_analyzer.py: Plugin-Modus (_process_plugin_bars) angebunden")
+check('getattr(plugin, "live_op", True)' in la_src,
+      "live_analyzer.py: Plugin-Modus nur für live_op=True")
+
+# ===========================================================================
+# Cleanup
+# ===========================================================================
+print("\n[Cleanup] temporäre DBs aufräumen:")
+sm = None
+DbPool.close_all()
+for p in (tmp_market, tmp_analytics, tmp_app):
+    try:
+        if os.path.exists(p):
+            os.remove(p)
+    except PermissionError:
+        print(f"   (Hinweis: {os.path.basename(p)} konnte nicht gelöscht werden)")
+check(not os.path.exists(tmp_analytics), "temp-DBs entfernt")
+
+print()
+if ok:
+    print("RESULT: ALLE CHECKS BESTANDEN ✅")
+    sys.exit(0)
+else:
+    print(f"RESULT: {len(failures)} CHECK(S) FEHLGESCHLAGEN ❌")
+    for f in failures:
+        print(f"   - {f}")
+    sys.exit(1)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_plugin_executor.py
+```py
+# test/check_plugin_executor.py
+# Headless-Validierung für Phase 12 Schritt 3+ (PluginLoader / PluginRegistry / PluginExecutor).
+#
+# Validiert:
+#   1. PluginExecutor() lässt sich instanziieren
+#   2. PluginRegistry ist ein Singleton und liefert eine PluginRegistry-Instanz
+#   3. PluginLoader scannt definitions/ nach PluginFeature-Subklassen
+#      (seit Schritt 4 ist grid_liquidity registriert)
+#   4. Registry.get() liefert das Plugin / wirft KeyError bei unbekannter plugin_id
+#   5. PluginExecutor.execute() mit unbekannter plugin_id propagiert den KeyError
+#
+# WICHTIG: Kein UI-Start (Regel Agents.md §4). Es werden nur die neuen Klassen
+# der Ausführungsschicht getestet; die Alt-Features (FeatureBuilder) bleiben unberührt.
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from analytics.features.feature_builder import PluginLoader, PluginRegistry, PluginExecutor
+
+ok = True
+failures = []
+
+
+def check(cond, msg):
+    global ok
+    if cond:
+        print(f"   ✅ {msg}")
+    else:
+        ok = False
+        failures.append(msg)
+        print(f"   ❌ {msg}")
+
+
+print("=" * 70)
+print("Phase 12 Schritt 3+ – Ausführungsschicht (headless)")
+print("=" * 70)
+
+# 1) PluginExecutor instanziierbar
+print("\n[1] PluginExecutor instanziieren:")
+try:
+    ex = PluginExecutor()
+    check(isinstance(ex, PluginExecutor), "PluginExecutor() instanziiert")
+except Exception as e:
+    check(False, f"PluginExecutor() Fehler: {e}")
+
+# 2) PluginRegistry als Singleton
+print("\n[2] PluginRegistry Singleton:")
+try:
+    r1 = PluginRegistry()
+    r2 = PluginRegistry()
+    check(r1 is r2, "PluginRegistry() liefert dieselbe Instanz (Singleton)")
+    check(isinstance(r1.loader, PluginLoader), "Registry hat einen PluginLoader")
+except Exception as e:
+    check(False, f"PluginRegistry Fehler: {e}")
+
+# 3) PluginLoader scannt definitions/
+print("\n[3] PluginLoader Discovery:")
+try:
+    loader = PluginLoader()
+    plugins = loader.discover_plugins()
+    check(isinstance(plugins, dict), "discover_plugins() liefert Dict")
+    check("grid_liquidity" in plugins, "Plugin 'grid_liquidity' gefunden (seit Schritt 4)")
+    check(len(plugins) == 1, f"genau 1 Plugin registriert (gefunden: {len(plugins)})")
+    reg_plugins = PluginRegistry().plugins
+    # Vergleiche KEYS (plugin_ids), nicht Instanzen: discover_plugins() erzeugt
+    # bei jedem Aufruf neue Objekte, die per == nicht vergleichbar sind.
+    check(sorted(reg_plugins.keys()) == sorted(plugins.keys()),
+          "Registry-Katalog hat dieselben plugin_ids wie Discovery-Katalog")
+except Exception as e:
+    check(False, f"PluginLoader Fehler: {e}")
+
+# 4) Registry.get() liefert Plugin / wirft KeyError bei unbekannter plugin_id
+print("\n[4] Registry.get() Verhalten:")
+try:
+    plugin = PluginRegistry().get("grid_liquidity")
+    check(plugin is not None, "get('grid_liquidity') liefert Plugin")
+except KeyError:
+    check(False, "get('grid_liquidity') sollte Plugin liefern")
+try:
+    PluginRegistry().get("nicht_existent")
+    check(False, "get('nicht_existent') sollte KeyError werfen")
+except KeyError:
+    check(True, "get() wirft KeyError bei unbekannter plugin_id")
+
+# 5) Executor.execute() mit unbekannter plugin_id propagiert KeyError
+print("\n[5] Executor.execute() Fehlerverhalten:")
+try:
+    import pandas as pd
+    PluginExecutor().execute("nicht_existent", pd.DataFrame(), {})
+    check(False, "execute('nicht_existent') sollte KeyError werfen")
+except KeyError:
+    check(True, "execute() propagiert KeyError bei unbekannter plugin_id")
+
+print()
+if ok:
+    print("RESULT: ALLE CHECKS BESTANDEN ✅")
+    sys.exit(0)
+else:
+    print(f"RESULT: {len(failures)} CHECK(S) FEHLGESCHLAGEN ❌")
+    for f in failures:
+        print(f"   - {f}")
+    sys.exit(1)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_plugin_time_filter.py
+```py
+# test/check_plugin_time_filter.py
+# Headless-Validierung: Time-Filter-Funktionalität im Plugin grid_liquidity
+# (nach Phase 12; Fixing-Wunsch des Users).
+#
+# Das Plugin muss dieselbe native UTC-Zeitfenster-Logik wie der Alt-Indikator
+# (chart/indicators/grid.py) abbilden:
+#   - Parameter 'use_time_filter' (Checkbox) + 'time_window_mins'
+#   - Fenster um ganze Stunde (Minute 0) UND halbe Stunde (Minute 30) ± mins
+#   - Circle-Farbe: im Fenster gelb (#FFEB3B), ausserhalb fuchsia (#E91E63)
+#   - Feature-Store-Records enthalten is_time_window_active (für Analysen)
+#
+# KEINE UI-Tests (Regel Agents.md §4): reine Berechnungs-Validierung.
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import pandas as pd
+
+from analytics.features.feature_builder import PluginExecutor
+from analytics.features.definitions.grid_liquidity import (
+    GridLiquidityFeature,
+    _f_in_window_around,
+)
+
+ok = True
+failures = []
+
+
+def check(cond, msg):
+    global ok
+    if cond:
+        print(f"   ✅ {msg}")
+    else:
+        ok = False
+        failures.append(msg)
+        print(f"   ❌ {msg}")
+
+
+def ts(y, mo, d, h, mi):
+    return datetime(y, mo, d, h, mi, tzinfo=timezone.utc)
+
+
+print("=" * 70)
+print("Time-Filter-Funktionalitaet im Plugin grid_liquidity (headless)")
+print("=" * 70)
+
+# ===========================================================================
+# [1] Parameter-Schema enthält die beiden Time-Filter-Parameter
+# ===========================================================================
+print("\n[1] Parameter-Schema:")
+feat = GridLiquidityFeature()
+schema = feat.parameter_schema
+check("use_time_filter" in schema and schema["use_time_filter"]["type"] == "bool",
+      "Parameter 'use_time_filter' (bool) vorhanden")
+check("time_window_mins" in schema and schema["time_window_mins"]["type"] == "int",
+      "Parameter 'time_window_mins' (int) vorhanden")
+check(schema["use_time_filter"]["default"] is True,
+      "Default use_time_filter = True (wie Alt-Indikator)")
+check(schema["time_window_mins"]["default"] == 5,
+      "Default time_window_mins = 5 (wie Alt-Indikator)")
+
+# ===========================================================================
+# [2] Kernfunktion _f_in_window_around (identische Logik zum Alt)
+# ===========================================================================
+print("\n[2] _f_in_window_around (Wrap-Around, native UTC):")
+# Fenster um Minute 0 mit span=5: 55..59 + 0..5
+check(_f_in_window_around(0, 0, 5), "Minute 0 im Fenster (0±5)")
+check(_f_in_window_around(4, 0, 5), "Minute 4 im Fenster (0±5)")
+check(_f_in_window_around(58, 0, 5), "Minute 58 im Fenster (Wrap 0±5)")
+check(not _f_in_window_around(15, 0, 5), "Minute 15 ausserhalb (0±5)")
+check(_f_in_window_around(30, 30, 5), "Minute 30 im Fenster (30±5)")
+check(_f_in_window_around(34, 30, 5), "Minute 34 im Fenster (30±5)")
+check(not _f_in_window_around(45, 30, 5), "Minute 45 ausserhalb (30±5)")
+
+# ===========================================================================
+# [3] Plugin.calculate: Circle-Farben + Feature-Records mit Zeitfenster
+# ===========================================================================
+print("\n[3] Plugin.calculate (Zeitfenster-Logik):")
+# Testdaten: 4 Bars mit verschiedenen UTC-Minuten, alle auf einem Level
+times = [
+    int(ts(2026, 7, 1, 12, 0).timestamp()),   # Minute 0  -> im Fenster (0±5)
+    int(ts(2026, 7, 1, 12, 3).timestamp()),   # Minute 3  -> im Fenster (0±5)
+    int(ts(2026, 7, 1, 12, 30).timestamp()),  # Minute 30 -> im Fenster (30±5)
+    int(ts(2026, 7, 1, 12, 22).timestamp()),  # Minute 22 -> ausserhalb
+]
+closes = [100.0, 100.0, 100.0, 100.0]
+df = pd.DataFrame({
+    "time": times,
+    "open": closes, "high": [100.05] * 4,
+    "low": [99.95] * 4, "close": closes,
+})
+
+params = {"grid_step": 0.5, "proximity_threshold": 0.05,
+          "use_time_filter": True, "time_window_mins": 5}
+result = PluginExecutor().execute("grid_liquidity", df, params)
+crp = result["chart_render_payload"]
+fsp = result["feature_store_payload"]
+
+# Alle 4 Bars liegen exakt auf Level 100.0 -> alle sind Hits
+circles = crp.get("hit_circles", [])
+check(len(circles) == 4, f"4 Hit-Circles erzeugt (tatsächlich: {len(circles)})")
+if len(circles) == 4:
+    # Minute 0, 3, 30 -> im Fenster -> gelb; Minute 22 -> ausserhalb -> fuchsia
+    check(circles[0]["color"] == "#FFEB3B", "Bar Minute 0: gelb (#FFEB3B, im Fenster)")
+    check(circles[1]["color"] == "#FFEB3B", "Bar Minute 3: gelb (#FFEB3B, im Fenster)")
+    check(circles[2]["color"] == "#FFEB3B", "Bar Minute 30: gelb (#FFEB3B, im Fenster)")
+    check(circles[3]["color"] == "#E91E63", "Bar Minute 22: fuchsia (#E91E63, ausserhalb)")
+
+# Feature-Store-Records enthalten die Zeitfenster-Infos
+recs = fsp.get("records", [])
+check(len(recs) == 4, "4 Feature-Records erzeugt")
+if recs:
+    check("is_time_window_active" in recs[0], "Record enthält is_time_window_active")
+    check(recs[0]["is_time_window_active"] == 1, "Bar Minute 0: is_time_window_active=1")
+    check(recs[2]["is_time_window_active"] == 1, "Bar Minute 30: is_time_window_active=1")
+    check(recs[3]["is_time_window_active"] == 0, "Bar Minute 22: is_time_window_active=0")
+    check(recs[0]["time_window_mins"] == 5, "Record enthält time_window_mins=5")
+    check(recs[0]["use_time_filter"] is True, "Record enthält use_time_filter=True")
+
+# ===========================================================================
+# [4] use_time_filter=False -> alles im Fenster, alle gelb
+# ===========================================================================
+print("\n[4] use_time_filter=False (Zeitfilter deaktiviert):")
+params_off = dict(params)
+params_off["use_time_filter"] = False
+result_off = PluginExecutor().execute("grid_liquidity", df, params_off)
+circles_off = result_off["chart_render_payload"].get("hit_circles", [])
+recs_off = result_off["feature_store_payload"].get("records", [])
+check(len(circles_off) == 4, "4 Hit-Circles (Zeitfilter aus)")
+check(all(c["color"] == "#FFEB3B" for c in circles_off),
+      "ALLE Circles gelb (#FFEB3B) bei deaktiviertem Zeitfilter")
+check(all(r["is_time_window_active"] == 1 for r in recs_off),
+      "is_time_window_active=1 für alle Bars bei deaktiviertem Zeitfilter")
+
+# ===========================================================================
+# [5] Konsistenz mit Alt-Indikator (grid.py) auf denselben Daten
+# ===========================================================================
+print("\n[5] Konsistenz mit Alt-Indikator (grid.py):")
+from chart.indicators.grid import GridIndicator
+
+alt = GridIndicator()
+# Alt-Parameter (Pendant zu den Plugin-Params)
+alt_params = {
+    "prox_enableMaster": True,
+    "prox_level1": 0.0, "prox_level2": 0.0, "prox_level3": 0.0,
+    "prox_level4": 0.0, "prox_level5": 0.0, "prox_level6": 0.0,
+    "prox_visitPct": 0.05,
+    "prox_stepsAround": 4,
+    "prox_stepSize": 0.5,
+    "prox_useTimeFilter": True,
+    "prox_timeWindowMins": 5,
+    # HINWEIS: Im Alt-Indikator hängen die Circles an show_lines
+    # (tracked_levels = sorted_levels if show_lines else []). Daher True,
+    # analog zu den Plugin-Defaults (show_lines/show_circles beide an).
+    "prox_showLines": True,
+    "prox_showCircles": True,
+}
+alt_res = alt.calculate(df, alt_params)
+alt_circles = alt_res.get("hit_circles", [])
+
+# Farbvergleich: Plugin-Farbe == Alt-Farbe pro Circle (nach Zeit sortiert)
+plugin_colors = [c["color"] for c in sorted(circles, key=lambda c: c["time"])]
+alt_colors = [c["color"] for c in sorted(alt_circles, key=lambda c: c["time"])]
+check(plugin_colors == alt_colors,
+      f"Circle-Farben identisch zum Alt-Indikator ({plugin_colors})")
+
+print()
+if ok:
+    print("RESULT: ALLE CHECKS BESTANDEN ✅")
+    sys.exit(0)
+else:
+    print(f"RESULT: {len(failures)} CHECK(S) FEHLGESCHLAGEN ❌")
+    for f in failures:
+        print(f"   - {f}")
+    sys.exit(1)
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/check_race_guard.js
 ```js
 // test/check_race_guard.js
@@ -18571,6 +20821,50 @@ console.log(`  NaN -> ${resolveRealTime(NaN)}`);
 console.log(`  null -> ${resolveRealTime(null)}`);
 
 console.log('\nRESULT:', (ok === 3000 && newReal === 1785456060 && newLabel === 'Fr 31.07.26 00:01' && formatDT(1785452340) === 'Do 30.07.26 22:59' && contOfReal === 1785448740) ? 'PASS' : 'FAIL');
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_statistics_repo.py
+```py
+# test/check_statistics_repo.py
+# Reproduziert den Statistics-Button-Fehler headless im App-Pfad:
+# 1. check_and_init_databases() öffnet RW-Connections via DbPool (wie MainWindow)
+# 2. StatisticsRepository führt danach read_only-Queries aus (wie StatisticWindow)
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from db_service import DbPool, DB_ANALYTICS
+from analytics.statistics_repository import StatisticsRepository
+
+# App-Situation nachahmen: RW-Connection auf analytics.duckdb via DbPool offen
+# (MainWindow hält diese via check_and_init_databases offen).
+DbPool.get(DB_ANALYTICS).execute("SELECT 1")
+
+repo = StatisticsRepository()
+
+print("get_available_sets:", end=" ")
+try:
+    sets = repo.get_available_sets()
+    print(sets)
+except Exception as e:
+    print(f"FEHLER: {type(e).__name__}: {e}")
+
+print("get_summary:", end=" ")
+try:
+    print(repo.get_summary())
+except Exception as e:
+    print(f"FEHLER: {type(e).__name__}: {e}")
+
+print("fetch_signals:", end=" ")
+try:
+    sigs = repo.fetch_signals(limit=5)
+    print(f"{len(sigs)} Signale")
+except Exception as e:
+    print(f"FEHLER: {type(e).__name__}: {e}")
 
 ```
 
@@ -19003,9 +21297,9 @@ print("LOCKTEST FERTIG")
         <verstretch>0</verstretch>
        </sizepolicy>
       </property>
-      <layout class="QHBoxLayout" name="horizontalLayout_toolbar">
+      <layout class="QVBoxLayout" name="verticalLayout_toolbar">
        <property name="spacing">
-        <number>8</number>
+        <number>4</number>
        </property>
        <property name="leftMargin">
         <number>0</number>
@@ -19020,9 +21314,9 @@ print("LOCKTEST FERTIG")
         <number>0</number>
        </property>
        <item>
-        <layout class="QVBoxLayout" name="verticalLayout_symbol">
+        <layout class="QHBoxLayout" name="horizontalLayout_row1">
          <property name="spacing">
-          <number>2</number>
+          <number>8</number>
          </property>
          <item>
           <widget class="QComboBox" name="combo_symbol">
@@ -19048,43 +21342,13 @@ print("LOCKTEST FERTIG")
              <string>GOLD</string>
             </property>
            </item>
+           <item>
+            <property name="text">
+             <string>BTCUSD</string>
+            </property>
+           </item>
           </widget>
          </item>
-         <item>
-          <widget class="QPushButton" name="btn_reset_chart">
-           <property name="sizePolicy">
-            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
-             <horstretch>0</horstretch>
-             <verstretch>0</verstretch>
-            </sizepolicy>
-           </property>
-           <property name="minimumSize">
-            <size>
-             <width>28</width>
-             <height>28</height>
-            </size>
-           </property>
-           <property name="maximumSize">
-            <size>
-             <width>28</width>
-             <height>28</height>
-            </size>
-           </property>
-           <property name="toolTip">
-            <string>Reset Chart</string>
-           </property>
-           <property name="text">
-            <string>↺</string>
-           </property>
-          </widget>
-         </item>
-        </layout>
-       </item>
-       <item>
-        <layout class="QVBoxLayout" name="verticalLayout_tf">
-         <property name="spacing">
-          <number>2</number>
-         </property>
          <item>
           <widget class="QComboBox" name="combo_tf">
            <property name="sizePolicy">
@@ -19157,38 +21421,18 @@ print("LOCKTEST FERTIG")
           </widget>
          </item>
          <item>
-          <spacer name="verticalSpacer">
+          <spacer name="horizontalSpacer_row1">
            <property name="orientation">
-            <enum>Qt::Orientation::Vertical</enum>
+            <enum>Qt::Orientation::Horizontal</enum>
            </property>
            <property name="sizeHint" stdset="0">
             <size>
-             <width>20</width>
-             <height>40</height>
+             <width>40</width>
+             <height>20</height>
             </size>
            </property>
           </spacer>
          </item>
-        </layout>
-       </item>
-       <item>
-        <spacer name="horizontalSpacer">
-         <property name="orientation">
-          <enum>Qt::Orientation::Horizontal</enum>
-         </property>
-         <property name="sizeHint" stdset="0">
-          <size>
-           <width>40</width>
-           <height>20</height>
-          </size>
-         </property>
-        </spacer>
-       </item>
-       <item>
-        <layout class="QVBoxLayout" name="verticalLayout_indicator">
-         <property name="spacing">
-          <number>2</number>
-         </property>
          <item>
           <widget class="QPushButton" name="btn_indicator_grid">
            <property name="sizePolicy">
@@ -19214,6 +21458,34 @@ print("LOCKTEST FERTIG")
            </property>
            <property name="text">
             <string>#</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btn_indicator_grid_liquidity">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+           <property name="minimumSize">
+            <size>
+             <width>28</width>
+             <height>28</height>
+            </size>
+           </property>
+           <property name="maximumSize">
+            <size>
+             <width>28</width>
+             <height>28</height>
+            </size>
+           </property>
+           <property name="toolTip">
+            <string>Grid Liquidity Plugin (Linksklick: An/Aus, Rechtsklick: Einstellungen)</string>
+           </property>
+           <property name="text">
+            <string>◆</string>
            </property>
           </widget>
          </item>
@@ -19244,6 +21516,54 @@ print("LOCKTEST FERTIG")
             <string>📈</string>
            </property>
           </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="horizontalLayout_row2">
+         <property name="spacing">
+          <number>8</number>
+         </property>
+         <item>
+          <widget class="QPushButton" name="btn_reset_chart">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+           <property name="minimumSize">
+            <size>
+             <width>28</width>
+             <height>28</height>
+            </size>
+           </property>
+           <property name="maximumSize">
+            <size>
+             <width>28</width>
+             <height>28</height>
+            </size>
+           </property>
+           <property name="toolTip">
+            <string>Reset Chart</string>
+           </property>
+           <property name="text">
+            <string>↺</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <spacer name="horizontalSpacer_row2">
+           <property name="orientation">
+            <enum>Qt::Orientation::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
          </item>
         </layout>
        </item>
@@ -19471,6 +21791,11 @@ print("LOCKTEST FERTIG")
           <string>GOLD</string>
          </property>
         </item>
+        <item>
+         <property name="text">
+          <string>BTCUSD</string>
+         </property>
+        </item>
        </widget>
       </item>
       <item>
@@ -19648,6 +21973,11 @@ print("LOCKTEST FERTIG")
         <item>
          <property name="text">
           <string>GOLD</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>BTCUSD</string>
          </property>
         </item>
        </widget>
