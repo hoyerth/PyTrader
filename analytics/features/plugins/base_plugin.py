@@ -62,6 +62,12 @@ class PluginContext:
     timestamp: Optional[int] = None  # epoch-Sekunden des Live-Ticks / der letzten Bar
     shared_state: Dict[str, Any] = field(default_factory=dict)
     settings: Optional[AppSettings] = None  # Kopie (kein globaler Zugriff)
+    # Phase 13 Schritt 3: Der ServiceSetEvaluator setzt diese Felder je
+    # Service-Aufruf (instance_id = Namespace im shared_state, depends_on =
+    # instance_ids, deren shared_state-Einträge der Service liest). Optional
+    # und abwärtskompatibel – Direkt-Aufrufe (Schritt 1) bleiben unverändert.
+    instance_id: Optional[str] = None
+    depends_on: Optional[List[str]] = None
 
     def __post_init__(self) -> None:
         # Settings werden als Kopie übergeben – mutieren der Ursprungs-Instanz
