@@ -8,7 +8,7 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-from db_service import db_connect
+from db_service import DbPool
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_ANALYTICS = str(BASE_DIR / "data" / "analytics.duckdb")
@@ -22,15 +22,12 @@ class StatisticsRepository:
         """Liefert alle verfuegbaren source_id Werte."""
         if not Path(DB_ANALYTICS).exists():
             return []
-        con = db_connect(DB_ANALYTICS, read_only=True)
-        try:
-            rows = con.execute("""
+        con = DbPool.get(DB_ANALYTICS)
+        rows = con.execute("""
                 SELECT DISTINCT source_id FROM signal_results
                 ORDER BY source_id
             """).fetchall()
-            return [r[0] for r in rows]
-        finally:
-            con.close()
+        return [r[0] for r in rows]
 
     def get_summary(
         self,
@@ -61,41 +58,38 @@ class StatisticsRepository:
 
         where_clause = " AND ".join(conditions) if conditions else "1=1"
 
-        con = db_connect(DB_ANALYTICS, read_only=True)
-        try:
-            # Gesamtzahl und avg confidence
-            row = con.execute(f"""
-                SELECT
-                    COUNT(*) AS total,
-                    COALESCE(AVG(sr.confidence), 0.0) AS avg_conf
-                FROM signal_results sr
-                WHERE {where_clause}
-            """, params).fetchone()
-            total = int(row[0]) if row[0] else 0
-            avg_conf = float(row[1]) if row[1] else 0.0
+        con = DbPool.get(DB_ANALYTICS)
+        # Gesamtzahl und avg confidence
+        row = con.execute(f"""
+            SELECT
+                COUNT(*) AS total,
+                COALESCE(AVG(sr.confidence), 0.0) AS avg_conf
+            FROM signal_results sr
+            WHERE {where_clause}
+        """, params).fetchone()
+        total = int(row[0]) if row[0] else 0
+        avg_conf = float(row[1]) if row[1] else 0.0
 
-            # Bester Timeframe (meiste Signale)
-            row_tf = con.execute(f"""
-                SELECT sr.timeframe, COUNT(*) AS cnt
-                FROM signal_results sr
-                WHERE {where_clause}
-                GROUP BY sr.timeframe
-                ORDER BY cnt DESC
-                LIMIT 1
-            """, params).fetchone()
-            best_tf = str(row_tf[0]) if row_tf else "-"
+        # Bester Timeframe (meiste Signale)
+        row_tf = con.execute(f"""
+            SELECT sr.timeframe, COUNT(*) AS cnt
+            FROM signal_results sr
+            WHERE {where_clause}
+            GROUP BY sr.timeframe
+            ORDER BY cnt DESC
+            LIMIT 1
+        """, params).fetchone()
+        best_tf = str(row_tf[0]) if row_tf else "-"
 
-            # Win-Rate via Forward-Performance (naechste 10 Bars)
-            win_rate = self._calc_win_rate(con, where_clause, params)
+        # Win-Rate via Forward-Performance (naechste 10 Bars)
+        win_rate = self._calc_win_rate(con, where_clause, params)
 
-            return {
-                "total_signals": total,
-                "avg_confidence": round(avg_conf, 4),
-                "win_rate": round(win_rate, 1),
-                "best_tf": best_tf,
-            }
-        finally:
-            con.close()
+        return {
+            "total_signals": total,
+            "avg_confidence": round(avg_conf, 4),
+            "win_rate": round(win_rate, 1),
+            "best_tf": best_tf,
+        }
 
     def _calc_win_rate(
         self,
@@ -157,7 +151,7 @@ class StatisticsRepository:
 
         where_clause = " AND ".join(conditions) if conditions else "1=1"
 
-        con = db_connect(DB_ANALYTICS, read_only=True)
+        con = DbPool.get(DB_ANALYTICS)
         try:
             rows = con.execute(f"""
                 SELECT
@@ -174,8 +168,6 @@ class StatisticsRepository:
         except Exception as e:
             print(f"⚠️ [StatisticsRepository] fetch_signals Fehler: {e}")
             return []
-        finally:
-            con.close()
 
         results = []
         for row in rows:
