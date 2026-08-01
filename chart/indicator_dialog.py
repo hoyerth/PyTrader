@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 	QLineEdit,
 	QMessageBox,
 	QPushButton,
+	QSizePolicy,
 	QSpinBox,
 	QStackedWidget,
 	QWidget,
@@ -396,6 +397,10 @@ class IndicatorSettingsDialog(QDialog):
 
 		# --- 3a) Service-Bereich (Set-Auswahl + QStackedWidget pro Service) ---
 		svc_group = QGroupBox("Service-Parameter")
+		# Vertikal NICHT expandieren: Der Rahmen soll dynamisch unter dem
+		# letzten Parameter (z.B. Level 6) enden und beim Vergroessern des
+		# Fensters NICHT mitwachsen (bleibt auf Inhalt-Hoehe).
+		svc_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 		svc_layout = QVBoxLayout(svc_group)
 
 		set_row = QHBoxLayout()
@@ -413,6 +418,11 @@ class IndicatorSettingsDialog(QDialog):
 		svc_layout.addLayout(svc_row)
 
 		self.stack_service_forms = QStackedWidget()
+		# Vertikal NICHT expandieren: Der Rahmen 'Service-Parameter' soll
+		# dynamisch unter dem letzten Parameter (z.B. Level 6) enden und
+		# keinen freien Platz fuellen.
+		self.stack_service_forms.setSizePolicy(
+			QSizePolicy.Expanding, QSizePolicy.Fixed)
 		svc_layout.addWidget(self.stack_service_forms)
 
 		main_row.addWidget(svc_group, 1)
