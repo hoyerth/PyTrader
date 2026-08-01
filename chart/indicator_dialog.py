@@ -348,19 +348,36 @@ class IndicatorSettingsDialog(QDialog):
 		main_layout.addLayout(form_layout)
 
 	def _init_plugin_ui(self, main_layout: QVBoxLayout, plugin: Any) -> None:
-		"""Phase 13 Schritt 5: Plugin-Prop-Fenster mit Expert-Modus & Service-Sets."""
+		"""Phase 13 Schritt 5: Plugin-Prop-Fenster mit Expert-Modus & Service-Sets.
+
+		Was in den Expert-Bereich kommt, wird an den Parametern der
+		Service-Definition angegeben (expert: True im parameter_schema der
+		Definition, die ganz oben in der Datei steht). Der lookback ist ein
+		Basis-Parameter (base_parameter_schema der Basisklasse) und erscheint
+		dadurch automatisch für JEDES Plugin im Expert-Bereich.
+		"""
 		self.plugin = plugin
-		self.plugin_schema = dict(plugin.parameter_schema or {})
-		self.plugin_order = list(getattr(plugin, "parameter_order", None) or self.plugin_schema.keys())
+		base_schema = dict(getattr(plugin, "base_parameter_schema", None) or {})
+		full_schema = dict(base_schema)
+		full_schema.update(dict(plugin.parameter_schema or {}))
+		self.plugin_schema = full_schema
+		self.plugin_order = list(getattr(plugin, "parameter_order", None) or plugin.parameter_schema.keys())
+		for key in base_schema:
+			if key not in self.plugin_order:
+				self.plugin_order.append(key)
 		self.plugin_labels = dict(getattr(plugin, "param_labels", None) or {})
+		for key, spec in base_schema.items():
+			self.plugin_labels.setdefault(key, spec.get("description") or self._human(key))
 
 		# --- 1) Reine Indi-Props (Sichtbarkeit, Farben) oberhalb der Trennlinie ---
-		indi_keys = [k for k in self.plugin_order if self._is_visual_key(k) and k in self.params]
+		indi_keys = [k for k in self.plugin_order if self._is_visual_key(k)]
 		if indi_keys:
 			indi_group = QGroupBox("Anzeige & Farben")
 			indi_form = QFormLayout(indi_group)
 			for key in indi_keys:
-				ctrl = self.create_schema_control(key, self.params[key], self.plugin_schema.get(key, {}))
+				spec = self.plugin_schema.get(key, {})
+				cval = self.params.get(key, spec.get("default"))
+				ctrl = self.create_schema_control(key, cval, spec)
 				self.param_controls[key] = ctrl
 				indi_form.addRow(self.plugin_labels.get(key, self._human(key)), ctrl)
 			main_layout.addWidget(indi_group)
@@ -414,10 +431,12 @@ class IndicatorSettingsDialog(QDialog):
 		expert_form = QFormLayout()
 		expert_keys = [
 			k for k in self.plugin_order
-			if self.plugin_schema.get(k, {}).get("expert") and k in self.params
+			if self.plugin_schema.get(k, {}).get("expert")
 		]
 		for key in expert_keys:
-			ctrl = self.create_schema_control(key, self.params[key], self.plugin_schema.get(key, {}))
+			spec = self.plugin_schema.get(key, {})
+			cval = self.params.get(key, spec.get("default"))
+			ctrl = self.create_schema_control(key, cval, spec)
 			self.param_controls[key] = ctrl
 			expert_form.addRow(self.plugin_labels.get(key, self._human(key)), ctrl)
 		expert_layout.addLayout(expert_form)
@@ -527,9 +546,8 @@ class IndicatorSettingsDialog(QDialog):
 			spec = self.plugin_schema.get(key, {})
 			if self._is_visual_key(key) or spec.get("expert"):
 				continue
-			if key not in self.params:
-				continue
-			ctrl = self.create_schema_control(key, self.params[key], spec)
+			cval = self.params.get(key, spec.get("default"))
+			ctrl = self.create_schema_control(key, cval, spec)
 			self.param_controls[key] = ctrl
 			form0.addRow(self.plugin_labels.get(key, self._human(key)), ctrl)
 		stack.addWidget(page0)
@@ -542,14 +560,24 @@ class IndicatorSettingsDialog(QDialog):
 				cfg = services.get(iid, {})
 				pid = cfg.get("plugin_id", "")
 				page = QWidget()
-				pf = QFormLayout(page)
+				vl = QVBoxLayout(page)
+				pf = QFormLayout()
+				vl.addLayout(pf)
 				try:
 					from analytics.features.feature_builder import PluginRegistry
 					sp = PluginRegistry().get(pid)
-					sp_schema = dict(sp.parameter_schema or {})
+					sp_base = dict(getattr(sp, "base_parameter_schema", None) or {})
+					sp_schema = dict(sp_base)
+					sp_schema.update(dict(sp.parameter_schema or {}))
 					sp_labels = dict(getattr(sp, "param_labels", None) or {})
-					sp_order = list(getattr(sp, "parameter_order", None) or sp_schema.keys())
+					for key, spec in sp_base.items():
+						sp_labels.setdefault(key, spec.get("description") or self._human(key))
+					sp_order = list(getattr(sp, "parameter_order", None) or sp.parameter_schema.keys())
+					for key in sp_base:
+						if key not in sp_order:
+							sp_order.append(key)
 					sp_params = dict(cfg.get("params") or {})
+					# Normale (Nicht-Expert-)Parameter
 					for key in sp_order:
 						spec = sp_schema.get(key, {})
 						if spec.get("expert"):
@@ -558,6 +586,26 @@ class IndicatorSettingsDialog(QDialog):
 						ctrl = self.create_schema_control(key, cval, spec)
 						self._set_param_controls[f"{iid}:{key}"] = ctrl
 						pf.addRow(sp_labels.get(key, self._human(key)), ctrl)
+					# Expert-Unterbereich je Service (lookback + expert-Parameter)
+					expert_keys = [k for k in sp_order if sp_schema.get(k, {}).get("expert")]
+					if expert_keys:
+						exp_grp = QGroupBox("Experten-Optionen")
+						exp_grp.setCheckable(True)
+						exp_grp.setChecked(False)
+						ef = QFormLayout(exp_grp)
+						for key in expert_keys:
+							spec = sp_schema.get(key, {})
+							if key == "lookback":
+								# lookback ist die Service-Instanz-Einstellung
+								# (ServiceInstanceConfig.lookback), nicht ein
+								# Plugin-param.
+								cval = cfg.get("lookback", spec.get("default"))
+							else:
+								cval = sp_params.get(key, spec.get("default"))
+							ctrl = self.create_schema_control(key, cval, spec)
+							self._set_param_controls[f"{iid}:{key}"] = ctrl
+							ef.addRow(sp_labels.get(key, self._human(key)), ctrl)
+						vl.addWidget(exp_grp)
 				except Exception:
 					pf.addRow(QLabel(f"Plugin '{pid}' nicht gefunden."))
 				stack.addWidget(page)
@@ -584,22 +632,32 @@ class IndicatorSettingsDialog(QDialog):
 		if not definition.get("execution_order") and self.plugin is not None:
 			pid = self.plugin.plugin_id
 			params: Dict[str, Any] = {}
+			lookback: int = 1000
 			for key in self.plugin_order:
 				spec = self.plugin_schema.get(key, {})
-				if self._is_visual_key(key):
-					continue  # Indi-Props gehören nicht ins Service-Set
+				if self._is_visual_key(key) or key == "lookback":
+					continue  # Indi-Props gehören nicht ins Service-Set; lookback ist Instanz-Einstellung
 				if key in self.param_controls:
 					params[key] = self._ctrl_value(self.param_controls[key])
 				else:
 					params[key] = self.params.get(key, spec.get("default"))
-			services[pid] = {"plugin_id": pid, "lookback": 1000, "params": params}
+			if "lookback" in self.param_controls:
+				lookback = int(self._ctrl_value(self.param_controls["lookback"]))
+			else:
+				lookback = int(self.params.get("lookback", 1000) or 1000)
+			services[pid] = {"plugin_id": pid, "lookback": lookback, "params": params}
 			definition["execution_order"] = [pid]
 
-		# Service-Params aus den Set-Formular-Seiten übernehmen
+		# Service-Params aus den Set-Formular-Seiten übernehmen.
+		# lookback ist die Service-Instanz-Einstellung (ServiceInstanceConfig.
+		# lookback) und wird NICHT in params geschrieben.
 		for fkey, ctrl in self._set_param_controls.items():
 			iid, pkey = fkey.split(":", 1)
 			cfg = services.setdefault(iid, {"plugin_id": self.plugin.plugin_id, "params": {}})
-			cfg.setdefault("params", {})[pkey] = self._ctrl_value(ctrl)
+			if pkey == "lookback":
+				cfg["lookback"] = int(self._ctrl_value(ctrl))
+			else:
+				cfg.setdefault("params", {})[pkey] = self._ctrl_value(ctrl)
 
 		definition["services"] = services
 		return definition

@@ -206,6 +206,39 @@ class PluginFeature(ABC):
         pass
 
     @property
+    def base_parameter_schema(self) -> Dict[str, ParameterSchema]:
+        """Basis-Parameter, die für ALLE Services gelten (Trading & Live).
+
+        Phase 13 Schritt 5: Der lookback ist das Scan-Fenster jeder
+        Service-Instanz (ServiceInstanceConfig.lookback). Er wird im
+        Expert-Bereich des Prop-Fensters angezeigt und ist für jeden Service
+        einzeln einstellbar. Was in den Expert-Bereich kommt, wird ALSO an den
+        Parametern der (Service-)Definition angegeben – hier in der
+        Basisklasse per 'expert': True. Plugins können weitere expert-Parameter
+        in ihrem eigenen parameter_schema markieren.
+        """
+        return {
+            "lookback": {
+                "type": "int",
+                "default": 1000,
+                "min": 100,
+                "max": 100000,
+                "step": 50,
+                "description": "Lookback (Scan-Fenster)",
+                "expert": True,
+            },
+        }
+
+    def full_parameter_schema(self) -> Dict[str, ParameterSchema]:
+        """Vollständiges Schema: Basis-Parameter (z.B. lookback) + plugin-
+        spezifische Parameter (Definition). Basis gewinnt NICHT – die
+        Plugin-Definition überschreibt den Basis-Eintrag, falls sie denselben
+        Key selbst definiert."""
+        merged = dict(self.base_parameter_schema)
+        merged.update(dict(self.parameter_schema or {}))
+        return merged
+
+    @property
     def parameter_order(self) -> List[str]:
         """Darstellungs-Reihenfolge der Props im Prop-Fenster.
 
@@ -223,18 +256,18 @@ class PluginFeature(ABC):
         humanisierter Parameter-Key.
         """
         labels: Dict[str, str] = {}
-        for key, spec in self.parameter_schema.items():
+        for key, spec in self.full_parameter_schema().items():
             desc = spec.get("description", "")
             labels[key] = desc if desc else key.replace("_", " ").title()
         return labels
 
     def is_expert_param(self, key: str) -> bool:
         """True, wenn der Parameter mit expert=True markiert ist (Default: False)."""
-        return bool(self.parameter_schema.get(key, {}).get("expert", False))
+        return bool(self.full_parameter_schema().get(key, {}).get("expert", False))
 
     @property
     def default_params(self) -> Dict[str, Any]:
-        return {k: v["default"] for k, v in self.parameter_schema.items() if "default" in v}
+        return {k: v["default"] for k, v in self.full_parameter_schema().items() if "default" in v}
 
     def validate_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Validiert Eingabeparameter gegen das Schema und setzt Defaults ein.
