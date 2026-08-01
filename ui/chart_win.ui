@@ -83,6 +83,11 @@
              <string>GOLD</string>
             </property>
            </item>
+           <item>
+            <property name="text">
+             <string>BTCUSD</string>
+            </property>
+           </item>
           </widget>
          </item>
          <item>

@@ -265,7 +265,7 @@ class PyTraderChartWindow(QMainWindow):
             self.ui_widget = QWidget(self)
             self.setCentralWidget(self.ui_widget)
 
-        self.setWindowTitle(f"PyTrader Chart - {self.current_symbol} [{self.current_tf}] ({self.instance_id})")
+        self._update_window_title()
         self.resize(1000, 700)
 
         self.symbol_combo = self.ui_widget.findChild(QComboBox, "combo_symbol")
@@ -711,10 +711,15 @@ class PyTraderChartWindow(QMainWindow):
         except (RuntimeError, AttributeError):
             pass
 
+    def _update_window_title(self) -> None:
+        """Aktualisiert den Fenstertitel mit den aktuellen Symbol/TF-Werten."""
+        self.setWindowTitle(f"PyTrader Chart - {self.current_symbol} [{self.current_tf}] ({self.instance_id})")
+
     def on_symbol_changed(self, s):
         if s and s != self.current_symbol:
             self.save_state()
             self.current_symbol = s
+            self._update_window_title()
             self.df_data = None
             pair_st = self.state_manager.get_symbol_tf_state(self.current_symbol, self.current_tf)
             if pair_st:
@@ -750,6 +755,7 @@ class PyTraderChartWindow(QMainWindow):
         if t and t != self.current_tf:
             self.save_state()
             self.current_tf = t
+            self._update_window_title()
             self.df_data = None
             pair_st = self.state_manager.get_symbol_tf_state(self.current_symbol, self.current_tf)
             if pair_st:

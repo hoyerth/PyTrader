@@ -522,7 +522,10 @@ con_app.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS is_activ
 
 ### 1.3 Validierung & Test
 
-Starte main.py. Prüfe die Konsole auf erfolgreiche Migration. Bestehende Daten müssen intakt bleiben.
+**Keine UI-Tests (Regel Agents.md §4).** Validierung headless:
+   - Migration direkt ausführen: `db_service.check_and_init_databases()` in einer Testdatei unter `test/` aufrufen (kein `main.py`-Start).
+   - Danach `DESCRIBE feature_store` / `DESCRIBE indicator_presets` via DuckDB: die neuen Spalten (`feature_id`, `plugin_version`, `feature_data` bzw. `plugin_id`, `version`, `is_active_batch`) sind vorhanden.
+   - Datenintegrität: Zeilenzahl und Stichproben in `feature_store`/`signal_results` vor/nach Migration identisch.
 
 ## Schritt 2: Neue Plugin-Basisklasse (PluginFeature)
 
@@ -599,7 +602,12 @@ Git-Commit/Tag `phase12_step5` für `chart/indicators/grid.py` (nur Sicherung �
 
 ### 5.3 Validierung & Test
 
-Starte PyTrader, öffne ein Chart-Fenster, aktiviere den NEUEN Indikator "Grid Liquidity", verändere seine Basis-Parameter über den generischen Dialog (Interim) und speichere ein Preset. Prüfe die korrekte Visualisierung. Zusätzlich prüfen, dass der bisherige "Grid"-Indikator weiterhin unverändert funktioniert (Parallelbetrieb). Das neue Property-Fenster wird in dieser Phase NICHT gebaut.
+**Keine UI-Tests (Regel Agents.md §4).** Die Validierung erfolgt stattdessen headless:
+   - Direkter Aufruf des neuen Indikators `GridLiquidityIndicator.calculate(df, params)` auf synthetischen OHLCV-Daten → prüfe korrekte `chart_render_payload`-Struktur (`lines`, `hit_circles`).
+   - Registry-Check: `chart_win.py` enthält ZUSÄTZLICH `grid_liquidity` neben `grid` (Parallelbetrieb).
+   - `state_manager.save_indicator_preset(...)` mit `plugin_id`/`version`/`is_active_batch` → Roundtrip lesen und validieren.
+   - JS-Bridge: Inspektion in `chart/js/03_chart_rendering.js`/`04_live_updates.js`, dass `hit_circles` von `renderGridCircles()` verarbeitet wird (Code-Inspektion, kein UI-Start).
+   - Der bestehende `chart/indicators/grid.py` bleibt unverändert (Diff-Check via Git). Das neue Property-Fenster wird in dieser Phase NICHT gebaut.
 ---
 
 ## Schritt 6: Anbindung Batch-Services über PluginExecutor
@@ -610,15 +618,21 @@ Git-Commit/Tag `phase12_step6` für `analytics/background_workers/historical_sca
 
 ### 6.2 Anweisung an die AI
 
-    Passe HistoricalScanner so an, dass er statt harter Verzweigungen den PluginExecutor nutzt und die aktiven Presets über plugin_id aus indicator_presets abfragt.
+    **Parallelbetrieb (verbindlich):** Der bestehende Alt-Pfad (Standard-Scan `ema_atr_set_v1` / `alternating_arrow_v1` über harte Verzweigungen) bleibt UNVERÄNDERT voll funktionsfähig. Der Plugin-Pfad wird NEBEN dem Alt-Pfad ergänzt und ausschließlich über ein `is_active_batch = True` markiertes Preset (per `plugin_id` aus `indicator_presets`) aktiviert.
 
-    Schreibe den feature_store_payload im feature_store ab.
+    Passe HistoricalScanner so an, dass er für den Plugin-Modus (statt harter Verzweigungen) den PluginExecutor nutzt und die aktiven Presets über plugin_id aus indicator_presets abfragt. Der Alt-Scan-Zweig bleibt dabei unberührt.
 
-    Binde den LiveAnalyzer an dieselbe PluginExecutor-Instanz an.
+    Schreibe den feature_store_payload im feature_store ab (nur im Plugin-Modus; der Alt-Modus schreibt weiterhin seine nativen Spalten).
+
+    Binde den LiveAnalyzer an dieselbe PluginExecutor-Instanz an (nur für Plugins mit `live_op = True`; bestehende Live-Signale bleiben unverändert).
 
 ### 6.3 Validierung & Test
 
-Starte im Service-Fenster einen historischen Scan für SILVER H1. Prüfe in der Konsole und via DuckDB-Abfrage, ob Einträge in feature_store geschrieben wurden.
+**Keine UI-Tests (Regel Agents.md §4).** Die Validierung erfolgt headless:
+   - `HistoricalScanner` direkt instanziieren (z. B. `HistoricalScanner("SILVER", grid_scan=True)` bzw. Plugin-Modus) und `run()`/Thread in einer Testdatei unter `test/` ausführen (ohne Service-Fenster).
+   - Danach DuckDB-Abfrage auf `feature_store`: Einträge mit `feature_id = 'grid_liquidity'` und gefülltem `feature_data` vorhanden.
+   - Alt-Modus-Regression: Standard-Scan (`grid_scan=False`) weiterhin lauffähig und schreibt weiterhin `ema_atr_set_v1`-Signale in `signal_results` (Parallelbetrieb intakt).
+   - Der `LiveAnalyzer` wird per Code-Inspektion auf dieselbe `PluginExecutor`-Instanz geprüft (kein Live-UI-Test).
 
 ## Schritt 7: Systemweiter Regressionstest
 
@@ -638,4 +652,8 @@ Git-Commit/Tag `phase12_final` für das gesamte Projekt (Code-Bestand nach Phase
 
 ### 7.3 Validierung & Test
 
-Vollständiger End-to-End-Test: App-Start → Chart öffnen → Parameter anpassen → Preset speichern → Historical Scan ausführen → Live-Signale empfangen. Alle Funktionen müssen stabil laufen.
+**Keine UI-Tests (Regel Agents.md §4).** Abschluss-Validierung headless:
+   - Alle 4 Phase-12-Tests laufen grün (siehe 7.2).
+   - Import-/Syntax-Checks (`py_compile`) für alle geänderten Dateien.
+   - Code-Inspektion der Fenster-Kopplungen (Hauptfenster → Chart/Service/Statistik): keine neuen Abhängigkeiten gebrochen (Alt-Indikator `grid` und neuer `grid_liquidity` beide registriert).
+   - Datenkonsistenz: `feature_store` enthält Plugin-Einträge (`feature_id='grid_liquidity'`), `signal_results` unverändert zusätzlich Alt-Signale.

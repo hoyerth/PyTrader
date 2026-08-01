@@ -20,7 +20,7 @@ DB_MARKET_DATA = os.path.join(DATA_DIR, "market_data.duckdb")
 DB_ANALYTICS = os.path.join(DATA_DIR, "analytics.duckdb")
 DB_APP_DATA = os.path.join(DATA_DIR, "app_data.duckdb")
 
-SYMBOLS = ["SILVER", "GOLD"]
+SYMBOLS = ["SILVER", "GOLD", "BTCUSD"]
 
 # TIMEFRAMES als Lazy-Initialisierung (vermeidet MT5-DLL-Load beim Import)
 _TIMEFRAMES_CACHE: Optional[Dict[str, int]] = None
