@@ -476,11 +476,33 @@ Diese Vorbereitung verhindert zukünftige API-Brüche, wenn Plugins zusätzliche
 
 Dieser Leitfaden sichert nach jedem Schritt einen voll funktionsfähigen Projektzustand.
 
+## Workflow-Vereinbarung (verbindlich, vor Beginn)
+
+**1. Backups über Git statt Ordner-Kopien:**
+- Code-Backups erfolgen als **Git-Commit/Tag** pro Schritt (`phase12_step1`, `phase12_step2`, …) – sekundenschnell, versioniert, jederzeit zurückrollbar. Die `.backup_*`-Ordner-Kopien entfallen.
+- **`data/` wird NICHT kopiert** (`market_data.duckdb` ist ~1,2 GB und ändert sich nur durch MT5-Sync). Einzige Ausnahme: **einmaliges Backup von `analytics.duckdb` + `app_data.duckdb`** (zusammen ~23 MB) direkt vor Schritt 1 (DB-Migration), da diese migriert werden.
+- Pro Schritt werden nur die **tatsächlich geänderten Dateien** gesichert (siehe Schritt-Backup-Listen).
+
+**2. Testauswahl (nur relevante Tests):**
+- Für Phase 12 werden **nur** folgende Tests ausgeführt:
+  - Regression Grid: `test/check_grid_levels_feature.py`, `test/check_grid_scan_integration.py`
+  - Neu (aus der Roadmap): `test/check_plugin_executor.py`, `test/check_grid_parity.py`
+- Die übrigen `test/`-Skripte sind Einmal-Validierungen vergangener Fixes (Zeitzonen, Chart-JS-Interna) und werden **nicht** automatisch mit ausgeführt.
+- Schritt 7 "alle Test-Skripte ausführen" wird entsprechend auf die obige Auswahl reduziert.
+
+**3. Autonomes Durcharbeiten (keine Bestätigungen):**
+- Die AI arbeitet die Schritte **durchgehend und autonom** bis zum nächsten Prompt aus – ohne Rückfragen/Bestätigungen für Standard-Schritte (Code schreiben, Tests ausführen, kleine Korrekturen).
+- **Stopp-Punkte (hier wird trotzdem kurz Rücksprache gehalten):**
+  1. **Echte Architektur-Entscheidungen** (z. B. Schema-Design, plugin_id-Vergabe)
+  2. **Änderungen, die bestehende Logik/Strukturen brechen könnten** (widerspricht Agents.md: "Originalsourcen nicht überschreiben")
+  3. **DB-Migrationen**, die bestehende Daten verändern (Schritt 1) – vorher wird das 23-MB-Backup erstellt
+
 ## Schritt 1: Datenbank-Erweiterung (Hybrid-Schema & Presets)
 
 ### 1.1 Backup-Anforderung
 
-Sichere den Ordner data/ sowie db_service.py nach .backup_Phase12_Step1/.
+- **DB-Backup (einmalig, vor der Migration):** `analytics.duckdb` + `app_data.duckdb` → `.backup_Phase12_Step1/`. (`market_data.duckdb` wird NICHT kopiert.)
+- **Code:** Git-Commit/Tag `phase12_step1` für `db_service.py` + `state_manager.py`.
 
 ### 1.2 Anweisung an die AI
 
@@ -506,7 +528,7 @@ Starte main.py. Prüfe die Konsole auf erfolgreiche Migration. Bestehende Daten 
 
 ### 2.1 Backup-Anforderung
 
-Sichere analytics/features/ nach .backup_Phase12_Step2/. analytics/features/base_feature.py DARF NICHT geändert oder gelöscht werden!
+Git-Commit/Tag `phase12_step2` für `analytics/features/`. `analytics/features/base_feature.py` DARF NICHT geändert oder gelöscht werden!
 
 ### 2.2 Anweisung an die AI
 
@@ -523,7 +545,7 @@ Führe python -c "from analytics.features.plugins.base_plugin import PluginFeatu
 
 ###3.1 Backup-Anforderung
 
-Sichere analytics/features/feature_builder.py nach .backup_Phase12_Step3/.
+Git-Commit/Tag `phase12_step3` für `analytics/features/feature_builder.py`.
 
 ### 3.2 Anweisung an die AI
 
@@ -542,7 +564,7 @@ Erstelle ein Testskript test/check_plugin_executor.py und verifiziere die Instan
 
 ### 4.1 Backup-Anforderung
 
-Sichere analytics/features/definitions/ nach .backup_Phase12_Step4/.
+Git-Commit/Tag `phase12_step4` für `analytics/features/definitions/`.
 
 ###4.2 Anweisung an die AI
 
@@ -561,7 +583,7 @@ Führe python test/check_grid_parity.py aus. **Hinweis:** Linien und Circles sin
 
 ### 5.1 Backup-Anforderung
 
-Sichere chart/indicators/grid.py (nur zur Sicherheit – wird NICHT verändert), chart/chart_win.py, state_manager.py sowie chart/js/03_chart_rendering.js nach .backup_Phase12_Step5/.
+Git-Commit/Tag `phase12_step5` für `chart/indicators/grid.py` (nur Sicherung – wird NICHT verändert), `chart/chart_win.py`, `state_manager.py` sowie `chart/js/03_chart_rendering.js`.
 
 ### 5.2 Anweisung an die AI
 
@@ -584,7 +606,7 @@ Starte PyTrader, öffne ein Chart-Fenster, aktiviere den NEUEN Indikator "Grid L
 
 ### 6.1 Backup-Anforderung
 
-Sichere analytics/background_workers/historical_scanner.py und live_analyzer.py nach .backup_Phase12_Step6/.
+Git-Commit/Tag `phase12_step6` für `analytics/background_workers/historical_scanner.py` und `live_analyzer.py`.
 
 ### 6.2 Anweisung an die AI
 
@@ -602,13 +624,17 @@ Starte im Service-Fenster einen historischen Scan für SILVER H1. Prüfe in der 
 
 ### 7.1 Backup-Anforderung
 
-Sichere das gesamte Projekt nach .backup_Phase12_Final/.
+Git-Commit/Tag `phase12_final` für das gesamte Projekt (Code-Bestand nach Phase 12).
 
 ### 7.2 Anweisung an die AI
 
     Prüfe alle Fenster (Hauptfenster, Chart-Fenster, Service-Fenster, Statistik-Fenster, Optionen) auf fehlerfreie Interaktion.
 
-    Führe alle Test-Skripte im Ordner test/ aus.
+    Führe NUR die Phase-12-relevanten Test-Skripte aus (siehe Workflow-Vereinbarung Punkt 2):
+    - test/check_grid_levels_feature.py
+    - test/check_grid_scan_integration.py
+    - test/check_plugin_executor.py (neu)
+    - test/check_grid_parity.py (neu)
 
 ### 7.3 Validierung & Test
 
