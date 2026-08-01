@@ -366,6 +366,35 @@ class StateManager:
             presets.insert(0, "Default")
         return presets
 
+    def list_active_batch_presets(self) -> List[Dict[str, Any]]:
+        """Liefert alle Batch-aktiven Plugin-Presets (Phase 12 Hybrid-Schema).
+
+        Selektiert aus indicator_presets nur Presets mit is_active_batch = TRUE
+        und gesetzter plugin_id. Diese steuern den Plugin-Modus der
+        Batch-Services (HistoricalScanner / LiveAnalyzer) über den
+        PluginExecutor – der Alt-Pfad bleibt davon unberührt.
+
+        Rückgabe: Liste von {"indicator_id", "preset_name", "plugin_id",
+        "version", "params"}.
+        """
+        con = self._get_connection()
+        res = con.execute("""
+            SELECT indicator_id, preset_name, params, plugin_id, version, is_active_batch
+            FROM indicator_presets
+            WHERE is_active_batch = TRUE AND plugin_id IS NOT NULL
+            ORDER BY preset_name ASC
+        """).fetchall()
+        presets: List[Dict[str, Any]] = []
+        for indicator_id, preset_name, params_json, plugin_id, version, is_active in res:
+            presets.append({
+                "indicator_id": indicator_id,
+                "preset_name": preset_name,
+                "plugin_id": plugin_id,
+                "version": version,
+                "params": _parse_json_field(params_json) if params_json else {},
+            })
+        return presets
+
     def get_app_settings(self) -> AppSettings:
         """L\u00e4dt AppSettings aus der DB oder gibt Defaults zur\u00fcck."""
         con = self._get_connection()

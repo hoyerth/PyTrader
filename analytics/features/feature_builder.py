@@ -8,10 +8,12 @@ Stabiler Basis-Stand + Phase-11-Erweiterung: grid_levels (Y-Achsen-Grid-Levels
 und X-Achsen-Zeitfenster-Flags), gekapselt in analytics/features/definitions/.
 """
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 import importlib
 import inspect
+import json
 import pkgutil
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -28,6 +30,41 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = BASE_DIR / "data"
 DB_MARKET = str(DATA_DIR / "market_data.duckdb")
 DB_ANALYTICS = str(DATA_DIR / "analytics.duckdb")
+
+
+def _timestamp_to_epoch(value: Any) -> int:
+    """Konvertiert pandas Timestamp / datetime in epoch-Sekunden (int).
+    Int/Float-Werte (bereits epoch-Sekunden) werden unveraendert uebernommen."""
+    if hasattr(value, "to_pydatetime"):
+        return int(value.to_pydatetime().timestamp())
+    if hasattr(value, "timestamp"):
+        return int(value.timestamp())
+    return int(value)
+
+
+def prepare_plugin_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Bereitet einen OHLCV-DataFrame fuer Plugin-Aufrufe vor.
+    Plugin-Vertrag (base_plugin.py): der Input-DataFrame enthaelt eine
+    'time'-Spalte mit epoch-Sekunden (int). load_ohlcv() liefert stattdessen
+    'bar_time' (datetime) – diese wird hier passend umgewandelt."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if "bar_time" in out.columns and "time" not in out.columns:
+        out["time"] = out["bar_time"].apply(_timestamp_to_epoch)
+    return out
+
+
+def _to_utc_datetime(value: Any):
+    """Konvertiert epoch-Sekunden / pandas Timestamp / datetime in ein
+    timezone-aware datetime (UTC), passend zur TIMESTAMPTZ-Spalte im Store."""
+    if isinstance(value, bool):
+        return datetime.fromtimestamp(int(value), tz=timezone.utc)
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(int(value), tz=timezone.utc)
+    if hasattr(value, "to_pydatetime"):
+        return value.to_pydatetime()
+    return value
 
 
 class PluginLoader:
@@ -251,6 +288,61 @@ class FeatureBuilder:
             con.unregister("df_temp")
 
             return len(df)
+        finally:
+            if own_connection:
+                con.close()
+
+    def store_plugin_payload(
+        self,
+        symbol: str,
+        timeframe: str,
+        payload: Dict[str, Any],
+        con: Optional = None,
+    ) -> int:
+        """
+        Schreibt den feature_store_payload eines Plugins (Phase 12 Hybrid-Schema)
+        in analytics.duckdb.
+
+        Setzt/aktualisiert NUR die Plugin-Spalten (feature_id, plugin_version,
+        feature_data); native Feature-Spalten bleiben unberuehrt. Dadurch ist
+        der Plugin-Pfad parallel zum Alt-Pfad betreibbar (derselbe (symbol,
+        timeframe, bar_time)-Schluessel kann beide Informationsarten tragen).
+
+        payload: {"feature_id", "plugin_version", "records": [{bar_time, ...}]}
+        """
+        records = payload.get("records") or []
+        if not records:
+            return 0
+
+        feature_id = payload.get("feature_id")
+        plugin_version = payload.get("plugin_version", "1.0.0")
+
+        own_connection = False
+        if con is None:
+            con = DbPool.get(DB_ANALYTICS)
+        else:
+            own_connection = True
+
+        try:
+            rows = []
+            for rec in records:
+                if not isinstance(rec, dict) or "bar_time" not in rec:
+                    continue
+                dt_val = _to_utc_datetime(rec["bar_time"])
+                data = {k: v for k, v in rec.items() if k != "bar_time"}
+                rows.append((symbol, timeframe, dt_val, feature_id, plugin_version, json.dumps(data)))
+            if not rows:
+                return 0
+
+            con.executemany("""
+                INSERT INTO feature_store (symbol, timeframe, bar_time, feature_id, plugin_version, feature_data)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (symbol, timeframe, bar_time) DO UPDATE SET
+                    feature_id = EXCLUDED.feature_id,
+                    plugin_version = EXCLUDED.plugin_version,
+                    feature_data = EXCLUDED.feature_data
+            """, rows)
+            return len(rows)
         finally:
             if own_connection:
                 con.close()

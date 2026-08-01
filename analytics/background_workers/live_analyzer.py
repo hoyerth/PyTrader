@@ -18,12 +18,13 @@ import pandas as pd
 from PySide6.QtCore import QThread, Signal
 
 from analytics.engine.set_evaluator import SetEvaluator
-from analytics.features.feature_builder import FeatureBuilder
+from analytics.features.feature_builder import FeatureBuilder, PluginExecutor, prepare_plugin_df
 from analytics.signals.heuristics.ema_trend import EMATrendSignal
 from analytics.signals.heuristics.atr_filter import ATRFilterSignal
 from analytics.signals.experimental.alternating_arrow_signal import AlternatingArrowSignal
 from analytics.signals.composite.grid_proximity_signal import GridProximitySignal
 from db_service import DbPool
+from state_manager import StateManager
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DB_ANALYTICS = str(BASE_DIR / "data" / "analytics.duckdb")
@@ -60,6 +61,12 @@ class LiveAnalyzer(QThread):
 
         # Feature Builder
         self.feature_builder = FeatureBuilder()
+
+        # Phase 12: Zentraler PluginExecutor für den Plugin-Modus (aktive
+        # Batch-Presets mit live_op = True). Dieselbe Instanz, die auch der
+        # HistoricalScanner nutzt – der Alt-Pfad bleibt unverändert.
+        self.plugin_executor = PluginExecutor()
+        self._state_mgr = StateManager()
 
         # Verfügbare Signale (kann über set_active_signals() erweitert werden)
         self.signals: Dict[str, Any] = {
@@ -151,6 +158,7 @@ class LiveAnalyzer(QThread):
         while self._running:
             try:
                 self._process_new_bars()
+                self._process_plugin_bars()
             except Exception as e:
                 self.log_message.emit(f"❌ LiveAnalyzer Fehler: {e}")
 
@@ -158,6 +166,73 @@ class LiveAnalyzer(QThread):
             self.msleep(1000)
 
         self.log_message.emit("LiveAnalyzer gestoppt.")
+
+    def _get_active_live_plugins(self) -> List[Dict[str, Any]]:
+        """Liefert aktive Batch-Presets, deren Plugin live_op = True ist
+        (Phase 12 Plugin-Modus). Bestehende Live-Signale bleiben unverändert."""
+        try:
+            presets = self._state_mgr.list_active_batch_presets()
+        except Exception:
+            return []
+        active: List[Dict[str, Any]] = []
+        for preset in presets:
+            plugin_id = preset.get("plugin_id")
+            if not plugin_id:
+                continue
+            try:
+                plugin = self.plugin_executor.registry.get(plugin_id)
+            except KeyError:
+                continue
+            if getattr(plugin, "live_op", True):
+                active.append(preset)
+        return active
+
+    def _process_plugin_bars(self) -> None:
+        """Phase 12 Plugin-Modus (Live): Fuehrt aktive Batch-Plugins mit
+        live_op = True über dieselbe PluginExecutor-Instanz aus und schreibt
+        den feature_store_payload in den feature_store."""
+        plugins = self._get_active_live_plugins()
+        if not plugins:
+            return
+
+        con = DbPool.get(DB_MARKET)
+        latest_bar_time = con.execute("""
+            SELECT EXTRACT('epoch' FROM MAX("time"))::BIGINT FROM ohlcv_bars
+            WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+              AND "time" IS NOT NULL
+        """, [self.symbol, self.timeframe]).fetchone()[0]
+        if latest_bar_time is None:
+            return
+        latest_bar_time = int(latest_bar_time)
+
+        if self._last_processed_bar_time is not None and latest_bar_time <= self._last_processed_bar_time:
+            return
+
+        df_ohlcv = self.feature_builder.load_ohlcv(
+            self.symbol, self.timeframe, limit=self.lookback_bars
+        )
+        if df_ohlcv.empty:
+            return
+
+        df_plugin = prepare_plugin_df(df_ohlcv)
+        for preset in plugins:
+            plugin_id = preset.get("plugin_id")
+            try:
+                result = self.plugin_executor.execute(plugin_id, df_plugin, preset.get("params", {}))
+            except Exception as e:
+                self.log_message.emit(f"❌ Plugin-Fehler ({plugin_id}): {e}")
+                continue
+            payload = result.get("feature_store_payload", {}) if isinstance(result, dict) else {}
+            if payload:
+                try:
+                    n = self.feature_builder.store_plugin_payload(self.symbol, self.timeframe, payload)
+                    self.log_message.emit(
+                        f"🔌 Plugin {plugin_id}: {n} Feature-Rows im feature_store"
+                    )
+                except Exception as e:
+                    self.log_message.emit(f"❌ Plugin-Store-Fehler ({plugin_id}): {e}")
+
+        self._last_processed_bar_time = latest_bar_time
 
     def _get_live_signal_ids(self) -> List[str]:
         """Ermittelt alle signal_ids aus set_config, deren live_op == True ist."""
