@@ -1,135 +1,155 @@
-# Phase 12: Dynamische Feature- & Signal-Architektur (AI-Plugin-System)
 
-## 1. Konzept & Zielsetzung
+# Roadmap Phase 12: Dynamische Feature- & Signal-Architektur (Refined)
 
-Um neue Trading-Logiken, Akkumulatoren und Signal-Definitionen extrem flexibel ohne Änderungen am Rumpfcode oder Datenbank-Schema zu integrieren, führen wir eine **Plugin-basierte Architektur** ein. 
+## 1. Zielsetzung & Architektur-Konzept
 
-Sowohl visuelle Chart-Indikatoren als auch abstrakte Batch-Services (Scanner/Analyzer) greifen auf **exakt dieselben externen Definitions-Dateien** im Ordner `../analytics/features/definitions` zurück.
+Das Ziel von Phase 12 ist die **vollständige Entkopplung von Berechnungslogik, Parameter-Steuerung, Speicherung und visueller Darstellung**, ohne bestehenden Code zu brechen.
 
-### Kernprinzipien:
-1. **Single Source of Truth:** Die mathematische/logische Berechnung existiert genau einmal als Python-Datei im Verzeichnis `../analytics/features/definitions`.
-2. **Einfaches Einklinken (Drop-in AI Plugins):** Eine von einer AI generierte Python-Datei muss lediglich in das Definitions-Verzeichnis gelegt werden. Das System erkennt und registriert sie automatisch (Auto-Discovery).
-3. **Schaltzentrale UI & Batch:** 
-   - **Im Chart-Fenster:** Der UI-Indikator lädt das Plugin, rendert Vorschau-Marker/Linien und erlaubt das visuelle Tunen der Parameter.
-   - **Im Batch-Service:** Der Scanner lädt dasselbe Plugin, liest gespeicherte Parameter-Presets aus DuckDB und führt historische Massen-Scans durch.
-4. **Schema-Invariante Datenbank:** Keine DDL-Anpassungen (`ALTER TABLE`) bei neuen Indikatoren. Alle Parameter, Feature-Vektoren und Metadaten werden in generischen `JSON`-Spalten in DuckDB gespeichert.
+### Entkopplungs-Prinzip: Feature-Engine vs. Visueller Indikator
+* **Plugin-Engine (`PluginFeature`):** Reine mathematische/logische Berechnung (z. B. Grid-Abstände, Trend-Filter, Machine-Learning-Features). Sie liegt isoliert unter `analytics/features/definitions/` und generiert sowohl den strukturierten Feature-Store-Payload (für DuckDB) als auch den typisierten Visualisierungs-Payload (`ChartRenderPayload`).
+* **Visueller Indikator (`BaseIndicator` / Chart-UI):** Konsumiert den `ChartRenderPayload` des Features, steuert die Interaktion im Chart (Settings-Dialog, Button-Styles) und verwaltet das Rendern über die JS-Bridge (`LightweightCharts v5`).
+
+                 ┌────────────────────────────────────────┐
+                 │   analytics/features/definitions/      │
+                 │ (grid_liquidity.py, ema_diff_v2.py)    │
+                 └───────────────────┬────────────────────┘
+                                     │
+                               PluginLoader
+                        (Auto-Discovery, Thread-Safe)
+                                     │
+            ┌────────────────────────┴────────────────────────┐
+            ▼                                                 ▼
+
+┌──────────────────────────┐                      ┌──────────────────────────┐
+│       Chart-UI           │                      │      Batch-Service       │
+│ (PyTraderChartWindow)    │                      │   (HistoricalScanner)    │
+├──────────────────────────┤                      ├──────────────────────────┤
+│ - Holt Preset aus DB     │                      │ - Holt Preset aus DB     │
+│ - Tuned Parameter        │                      │ - Führt Massen-Scan aus  │
+│ - Rendert Chart-Payload  │                      │ - Schreibt Feature-Store │
+└────────────┬─────────────┘                      └────────────┬─────────────┘
+│                                                 │
+▼                                                 ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│                       DuckDB (Hybrid-Schema)                               │
+│ - app_data.duckdb  : indicator_presets (Erweitert um version & batch)     │
+│ - analytics.duckdb : feature_store     (Native Spalten + feature_data JSON) │
+│ - analytics.duckdb : signal_results    (Generischer Event-Store)           │
+└────────────────────────────────────────────────────────────────────────────┘
+
 
 ---
 
-## 2. Datenbank-Architektur (Schema-Invariant)
+## 2. Datenbank-Architektur (Hybrid-Schema & Konsolidierte Presets)
 
-Die Datenbanken `analytics.duckdb` und `app_data.duckdb` nutzen hochflexible Strukturen, die beliebige neue Signale und Parameter aufnehmen können.
+Die Kern-Datenbanken werden über `db_service.py` abwärtskompatibel erweitert.
 
 ```sql
--- 1. ANALYTICS.DUCKDB: Generischer Feature Store
-CREATE TABLE IF NOT EXISTS feature_store (
-    symbol          VARCHAR NOT NULL,
-    timeframe       VARCHAR NOT NULL,
-    bar_time        TIMESTAMPTZ NOT NULL,
-    feature_id      VARCHAR NOT NULL,      -- z.B. 'grid_liquidity_v1'
-    feature_data    JSON NOT NULL,          -- Beliebige Payloads: {"liq_lines": [...], "atr": 1.25}
-    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
-);
+-- 1. ANALYTICS.DUCKDB: Hybrid-Feature Store (Additive Erweiterung)
+ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_id VARCHAR;
+ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS plugin_version VARCHAR;
+ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_data JSON;
 
--- 2. ANALYTICS.DUCKDB: Signal-Ergebnisse
-CREATE TABLE IF NOT EXISTS signal_results (
-    event_id        VARCHAR PRIMARY KEY,
-    symbol          VARCHAR NOT NULL,
-    timeframe       VARCHAR NOT NULL,
-    bar_time        TIMESTAMPTZ NOT NULL,
-    source_id       VARCHAR NOT NULL,      -- ID des Signal/Feature Plugins
-    confidence      DOUBLE,
-    context_type    VARCHAR NOT NULL,      -- 'BUY', 'SELL', 'NEUTRAL', 'INFO'
-    metadata_payload JSON,                  -- Zusätzliche Details zur Signal-Auslösung
-    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- 3. APP_DATA.DUCKDB: Parameter-Presets & Service-Konfigurationen
-CREATE TABLE IF NOT EXISTS plugin_presets (
-    plugin_id       VARCHAR NOT NULL,      -- ID des Plugins
-    preset_name     VARCHAR NOT NULL,      -- z.B. 'Default', 'Conservative_Silver'
-    params          JSON NOT NULL,          -- Parameter-Dict als JSON
-    is_active_batch BOOLEAN DEFAULT FALSE, -- Flag ob das Preset im Batch-Service genutzt wird
-    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (plugin_id, preset_name)
-);
-
+-- 2. APP_DATA.DUCKDB: Erweiterung der bestehenden indicator_presets Tabelle
+ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS version VARCHAR DEFAULT '1.0.0';
+ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS is_active_batch BOOLEAN DEFAULT FALSE;
 ```
 
----
+3. Typisierte Verträge (PluginFeature)
 
-## 3. Plugin-Schnittstelle (`BaseFeatureDefinition`)
+Verortet in analytics/features/plugins/base_plugin.py, um Kollisionen mit der Alt-Klasse BaseFeature zu vermeiden.
+Python
 
-Jedes Plugin erbt von `BaseFeatureDefinition` und definiert Eingabeparameter, Berechnungslogik und Visualisierungs-Metadaten.
-
-### `../analytics/features/base_feature.py`
-
-```python
 from abc import ABC, abstractmethod
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, TypedDict, Literal
 import pandas as pd
 
-class BaseFeatureDefinition(ABC):
-    """Basisklasse für alle AI-generierten Feature- & Signal-Plugins."""
+class ChartLine(TypedDict):
+    price: float
+    color: str
+    width: int
+    style: Literal["solid", "dashed", "dotted"]
+
+class ChartCircle(TypedDict):
+    time: int
+    price: float
+    color: str
+    priority: int
+
+class ChartMarker(TypedDict):
+    time: int
+    position: Literal["aboveBar", "belowBar", "inBar"]
+    color: str
+    shape: Literal["circle", "square", "arrowUp", "arrowDown"]
+    size: int
+    text: str
+    priority: int
+
+class ChartRenderPayload(TypedDict, total=False):
+    lines: List[ChartLine]
+    hit_circles: List[ChartCircle]  # Harmonisiert mit bestehender JS-Bridge!
+    markers: List[ChartMarker]
+
+class FeatureCalculateResult(TypedDict):
+    feature_store_payload: Dict[str, Any]
+    chart_render_payload: ChartRenderPayload
+
+class PluginFeature(ABC):
+    """Neue Plugin-Basisklasse zur sauberen Trennung von der Alt-Klasse BaseFeature."""
 
     @property
     @abstractmethod
-    def plugin_id(self) -> str:
-        """Eindeutige ID des Plugins (z. B. 'grid_liquidity_v1')."""
+    def name(self) -> str:
         pass
 
     @property
-    @abstractmethod
     def display_name(self) -> str:
-        """Lesbarer Name für die UI."""
-        pass
+        return self.name.replace("_", " ").title()
+
+    @property
+    def version(self) -> str:
+        return "1.0.0"
+
+    @property
+    def plugin_id(self) -> str:
+        return f"{self.name}_v{self.version.replace('.', '_')}"
+
+    @property
+    def live_op(self) -> bool:
+        return True
 
     @property
     @abstractmethod
     def default_params(self) -> Dict[str, Any]:
-        """Standard-Parameter mit Datentypen und UI-Hinweisen."""
         pass
 
     @abstractmethod
-    def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Hauptberechnungslogik.
-        
-        Args:
-            df: DataFrame mit Spalten ['time', 'open', 'high', 'low', 'close', 'tick_volume']
-            params: Überschriebene Parameter-Werte
-
-        Returns:
-            Dict mit zwei Schlüsseln:
-            - 'feature_store_payload': Daten, die in DuckDB als JSON landen
-            - 'chart_render_payload': Daten für Visualisierung (Lines, Circles, Markers)
-        """
+    def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> FeatureCalculateResult:
         pass
 
-```
+4. Feature-Paritäts-Plugin (grid_liquidity.py)
 
----
+Inklusive Custom-Levels, Pierce/Visit-Logik und Zeitfenster-Farben.
+Python
 
-## 4. Beispiel-Plugin: Liquidity Lines & Proximity
-
-### `analytics/features/definitions/grid_liquidity_v1.py`
-
-```python
-from typing import Dict, Any, List
+from typing import Dict, Any
 import pandas as pd
 import numpy as np
-from analytics.features.base_feature import BaseFeatureDefinition
+from analytics.features.plugins.base_plugin import PluginFeature, FeatureCalculateResult
 
-class GridLiquidityFeature(BaseFeatureDefinition):
+class GridLiquidityFeature(PluginFeature):
 
     @property
-    def plugin_id(self) -> str:
-        return "grid_liquidity_v1"
+    def name(self) -> str:
+        return "grid_liquidity"
 
     @property
     def display_name(self) -> str:
-        return "Grid Liquidity Lines & Proximity"
+        return "Grid Liquidity & Proximity"
+
+    @property
+    def version(self) -> str:
+        return "1.0.0"
 
     @property
     def default_params(self) -> Dict[str, Any]:
@@ -137,32 +157,44 @@ class GridLiquidityFeature(BaseFeatureDefinition):
             "grid_step": 0.50,
             "proximity_threshold": 0.05,
             "line_color": "#2196F3",
-            "circle_color": "#FFEB3B"
+            "circle_color_std": "#FFEB3B",
+            "circle_color_active": "#E91E63",
+            "show_lines": True,
+            "show_circles": True,
+            "prox_level1": 0.0,
+            "prox_level2": 0.0,
+            "prox_level3": 0.0,
+            "prox_level4": 0.0,
+            "prox_level5": 0.0,
+            "prox_level6": 0.0,
         }
 
-    def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
+    def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> FeatureCalculateResult:
         if df.empty:
             return {"feature_store_payload": {}, "chart_render_payload": {}}
 
-        step = params.get("grid_step", 0.50)
-        threshold = params.get("proximity_threshold", 0.05)
-        line_color = params.get("line_color", "#2196F3")
-        circle_color = params.get("circle_color", "#FFEB3B")
+        p = {**self.default_params, **params}
+        step = p["grid_step"]
+        threshold = p["proximity_threshold"]
 
-        # 1. Grid-Linien berechnen
         min_price = df["low"].min()
         max_price = df["high"].max()
-        
-        start_level = np.floor(min_price / step) * step
-        end_level = np.ceil(max_price / step) * step
-        levels = np.arange(start_level, end_level + step, step)
 
-        lines_payload = [
-            {"price": float(lvl), "color": line_color, "width": 1}
-            for lvl in levels
-        ]
+        start_lvl = np.floor(min_price / step) * step
+        end_lvl = np.ceil(max_price / step) * step
+        levels = list(np.arange(start_lvl, end_lvl + step, step))
 
-        # 2. Proximity-Events erkennen (Treffer nahe an Grid-Linien)
+        # Custom Levels einbinden
+        custom_lvls = [p[f"prox_level{i}"] for i in range(1, 7) if p[f"prox_level{i}"] > 0]
+        all_levels = sorted(list(set(levels + custom_lvls)))
+
+        lines_payload = []
+        if p["show_lines"]:
+            lines_payload = [
+                {"price": float(lvl), "color": p["line_color"], "width": 1, "style": "solid"}
+                for lvl in all_levels
+            ]
+
         hit_circles = []
         feature_rows = []
 
@@ -170,16 +202,20 @@ class GridLiquidityFeature(BaseFeatureDefinition):
             close_price = row["close"]
             bar_time = int(row["time"])
 
-            # Nächstgelegenes Level finden
             nearest_lvl = round(close_price / step) * step
             dist = abs(close_price - nearest_lvl)
-
             is_hit = dist <= threshold
-            if is_hit:
+
+            if is_hit and p["show_circles"]:
+                # Zeitfenster-Farblogik (Beispiel: Asien/London-Aktivität)
+                dt = pd.to_datetime(bar_time, unit='s')
+                is_active_window = 8 <= dt.hour <= 16
+                color = p["circle_color_active"] if is_active_window else p["circle_color_std"]
+
                 hit_circles.append({
                     "time": bar_time,
                     "price": float(close_price),
-                    "color": circle_color,
+                    "color": color,
                     "priority": 10
                 })
 
@@ -187,559 +223,142 @@ class GridLiquidityFeature(BaseFeatureDefinition):
                 "bar_time": bar_time,
                 "nearest_level": float(nearest_lvl),
                 "distance": float(dist),
-                "is_proximity_hit": bool(is_hit)
+                "is_hit": bool(is_hit)
             })
 
         return {
-            "feature_store_payload": {
-                "records": feature_rows
-            },
+            "feature_store_payload": {"records": feature_rows},
             "chart_render_payload": {
                 "lines": lines_payload,
                 "hit_circles": hit_circles
             }
         }
 
-```
+5. Scope & Abgrenzung (Signal-Engine)
+
+    Hinweis zur Phasen-Grenzziehung: Phase 12 behandelt exklusiv die Entkopplung und Dynamisierung der Feature-/Indikator-Ebene. Die Signal-Engine (z. B. GridProximitySignal, set_evaluator.py) bleibt in dieser Phase unverändert und greift weiterhin über das Hybrid-Schema auf die benötigten Feature-Werte zu. Die Verallgemeinerung der Signal-Sets ist Gegenstand von Phase 13.
 
 ---
 
-## 5. Auto-Discovery & Registry (`PluginRegistry`)
 
-Damit eingeklinkte Dateien automatisch erkannt werden, scannt die `PluginRegistry` das Verzeichnis `../analytics/features/definitions`.
+# Phase 12: Step-by-Step AI Implementation Guide
 
-### `../analytics/features/feature_builder.py`
+Dieser Leitfaden ist strikt darauf ausgelegt, dass nach jedem Schritt ein voll funktionsfähiger Projektzustand gewährleistet bleibt.
+Schritt 1: Datenbank-Erweiterung (Hybrid-Schema & Presets)
+1.1 Backup-Anforderung
 
-```python
-import importlib
-import inspect
-import pkgutil
-from pathlib import Path
-from typing import Dict, Type
-from analytics.features.base_feature import BaseFeatureDefinition
+Erstelle vor Ausführung ein vollständiges Backup des Ordners data/ sowie der Datei db_service.py nach .backup_Phase12_Step1/.
+1.2 Anweisung an die AI
 
-class PluginRegistry:
-    _instance = None
-    _plugins: Dict[str, Type[BaseFeatureDefinition]] = {}
+    Öffne db_service.py und passe check_and_init_databases() an.
 
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super(PluginRegistry, cls).__new__(cls)
-            cls._instance._discover_plugins()
-        return cls._instance
+    Füge folgende DDL-Statements aus:
 
-    def _discover_plugins(self):
-        definitions_dir = Path(__file__).parent / "definitions"
-        if not definitions_dir.exists():
-            return
+Python
 
-        for _, module_name, is_pkg in pkgutil.iter_modules([str(definitions_dir)]):
-            if is_pkg:
-                continue
-            full_module_name = f"analytics.features.definitions.{module_name}"
-            module = importlib.import_module(full_module_name)
+con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_id VARCHAR;")
+con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS plugin_version VARCHAR;")
+con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_data JSON;")
 
-            for name, obj in inspect.getmembers(module, inspect.isclass):
-                if issubclass(obj, BaseFeatureDefinition) and obj is not BaseFeatureDefinition:
-                    plugin_inst = obj()
-                    self._plugins[plugin_inst.plugin_id] = obj
-                    print(f"🔌 [PluginRegistry] Geladenes Plugin: {plugin_inst.plugin_id} ({plugin_inst.display_name})")
+con_app.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS version VARCHAR DEFAULT '1.0.0';")
+con_app.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS is_active_batch BOOLEAN DEFAULT FALSE;")
 
-    def get_plugin(self, plugin_id: str) -> BaseFeatureDefinition:
-        cls = self._plugins.get(plugin_id)
-        if not cls:
-            raise ValueError(f"Plugin '{plugin_id}' nicht gefunden.")
-        return cls()
+1.3 Validierung & Test
 
-    def list_plugins(self) -> Dict[str, str]:
-        return {pid: cls().display_name for pid, cls in self._plugins.items()}
+Starte main.py. Verifiziere in der Konsole, dass die Migration fehlerfrei durchläuft und die alten Daten in ohlcv_bars sowie feature_store erhalten bleiben.
+Schritt 2: Neue Plugin-Basisklasse (PluginFeature)
+2.1 Backup-Anforderung
 
-```
+Erstelle ein Backup des Ordners analytics/features/ nach .backup_Phase12_Step2/. Note: Die bestehende analytics/features/base_feature.py DARF NICHT verändert oder gelöscht werden!
 
----
+2.2 Anweisung an die AI
 
-## 6. Integration in Chart UI & Service Batch-Prozess
+    Erstelle das Unterverzeichnis analytics/features/plugins/ mit einer leeren __init__.py.
 
-### A) Im Chart-UI Indikator (`PyTraderChartWindow`)
+    Erstelle darin die Datei base_plugin.py mit den Klassen PluginFeature, ChartRenderPayload (inkl. hit_circles) und FeatureCalculateResult.
 
-1. Der Benutzer öffnet die Eigenschaften des Indikators am Chart.
-2. Der Dialog rendert dynamisch alle Eingabefelder basierend auf `plugin.default_params`.
-3. Bei Parameter-Änderung berechnet das Plugin in-memory das `chart_render_payload` und schickt es per JS-Bridge an den Chart (`renderGridLines`, `renderGridCircles`).
-4. Ein Klick auf **"Als Service-Preset speichern"** legt das Parameter-Dict in der Tabelle `plugin_presets` ab.
+2.3 Validierung & Test
 
-### B) Im Batch-Service (`HistoricalScanner`)
+Führe python -c "from analytics.features.plugins.base_plugin import PluginFeature" aus. Die Anwendung muss wie gewohnt starten.
+Schritt 3: Thread-Sicherer PluginLoader
 
-1. Der Scanner liest das aktive Preset aus `plugin_presets` für die gewünschte `plugin_id`.
-2. Er lädt dieselbe Klasse aus der `PluginRegistry`.
-3. Er führt die `calculate()` Methode über die geforderten Symbole/Timeframes aus.
-4. Er schreibt das `feature_store_payload` per `INSERT OR REPLACE` in die Tabelle `feature_store` von `analytics.duckdb`.
+3.1 Backup-Anforderung
 
----
+Sichere analytics/features/feature_builder.py nach .backup_Phase12_Step3/.
 
-## 7. Anweisungen zur Umsetzung (Phase 12 Workflow)
+3.2 Anweisung an die AI
 
-1. **Modul-Struktur anlegen:**
-* Erstelle das Verzeichnis `../analytics/features/definitions`.
-* Erstelle `../analytics/features/base_feature.py` mit der abstrakten Klasse.
-* Erstelle `../analytics/features/feature_builder.py` mit der `PluginRegistry`.
+    Erstelle das Verzeichnis analytics/features/definitions/ mit einer leeren __init__.py.
 
+    Erstelle in analytics/features/feature_builder.py die Klasse PluginLoader.
 
-2. **DuckDB Schemas absichern:**
-* Erweitere `../db_service.py` (`check_and_init_databases()`) um die Tabellen `feature_store`, `signal_results` und `plugin_presets` mit den generischen JSON-Spalten.
+    Implementiere _discover_plugins(), das alle Module in analytics/features/definitions/ einliest. Entferne automatische importlib.reload()-Aufrufe innerhalb der Getter-Methoden, um Race Conditions zwischen QThreads zu vermeiden.
 
+3.3 Validierung & Test
 
-3. **Chart & Service Anbindung:**
-* Adaptiere `GridIndicator` in `../chart/indicators/grid.py`, sodass er die Berechnungslogik aus dem Plugin `grid_liquidity_v1.py` bezieht.
-* Erweitere den `HistoricalScanner` um die Ausführung registrierter Plugins aus der `PluginRegistry`.
+Erstelle ein Testskript test/check_plugin_loader.py und stelle sicher, dass PluginLoader().list_plugins() ohne Fehler aufgerufen werden kann.
+Schritt 4: Paritäts-Plugin & Regressionstest gegen Altsystem
 
+4.1 Backup-Anforderung
 
-4. **Testing:**
-* Füge ein Testskript `test/check_plugin_registry.py` hinzu, das verifiziert, ob neue Dateien im Verzeichnis `../analytics/features/definitions` ohne System-Neustart dynamisch erkannt und ausgeführt werden.
-"""
+Sichere das Verzeichnis analytics/features/definitions/ nach .backup_Phase12_Step4/.
 
+4.2 Anweisung an die AI
 
+    Erstelle analytics/features/definitions/grid_liquidity.py mit der Klasse GridLiquidityFeature(PluginFeature).
 
-doc_path = os.path.join(doc_dir, "Phase12_Feature_Signal_Architecture.md")
-with open(doc_path, "w", encoding="utf-8") as f:
-f.write(md_content)
+    Erstelle ein Vergleichs-Testskript test/check_grid_parity.py, das identische OHLCV-Daten durch den alten GridIndicator.calculate() und das neue GridLiquidityFeature.calculate() schickt.
 
-print(f"File generated successfully: {doc_path}")
 
-```
-
-```text?code_stdout&code_event_index=1
-Traceback (most recent call last):
-  File "<xbox-string>", line 79
-    md_content = """# Phase 12: Dynamische Feature- & Signal-Architektur (AI-Plugin-System)
-
-## 1. Konzept & Zielsetzung
-
-Um neue Trading-Logiken, Akkumulatoren und Signal-Definitionen extrem flexibel ohne Änderungen am Rumpfcode oder Datenbank-Schema zu integrieren, führen wir eine **Plugin-basierte Architektur** ein. 
-
-Sowohl visuelle Chart-Indikatoren als auch abstrakte Batch-Services (Scanner/Analyzer) greifen auf **exakt dieselben externen Definitions-Dateien** im Ordner `analytics/features/definitions/` zurück.
-
-### Kernprinzipien:
-1. **Single Source of Truth:** Die mathematische/logische Berechnung existiert genau einmal als Python-Datei im Verzeichnis `analytics/features/definitions/`.
-2. **Einfaches Einklinken (Drop-in AI Plugins):** Eine von einer AI generierte Python-Datei muss lediglich in das Definitions-Verzeichnis gelegt werden. Das System erkennt und registriert sie automatisch (Auto-Discovery).
-3. **Schaltzentrale UI & Batch:** 
-   - **Im Chart-Fenster:** Der UI-Indikator lädt das Plugin, rendert Vorschau-Marker/Linien und erlaubt das visuelle Tunen der Parameter.
-   - **Im Batch-Service:** Der Scanner lädt dasselbe Plugin, liest gespeicherte Parameter-Presets aus DuckDB und führt historische Massen-Scans durch.
-4. **Schema-Invariante Datenbank:** Keine DDL-Anpassungen (`ALTER TABLE`) bei neuen Indikatoren. Alle Parameter, Feature-Vektoren und Metadaten werden in generischen `JSON`-Spalten in DuckDB gespeichert.
-
----
-
-## 2. Datenbank-Architektur (Schema-Invariant)
-
-Die Datenbanken `analytics.duckdb` und `app_data.duckdb` nutzen hochflexible Strukturen, die beliebige neue Signale und Parameter aufnehmen können.
-
-```sql
--- 1. ANALYTICS.DUCKDB: Generischer Feature Store
-CREATE TABLE IF NOT EXISTS feature_store (
-    symbol          VARCHAR NOT NULL,
-    timeframe       VARCHAR NOT NULL,
-    bar_time        TIMESTAMPTZ NOT NULL,
-    feature_id      VARCHAR NOT NULL,      -- z.B. 'grid_liquidity_v1'
-    feature_data    JSON NOT NULL,          -- Beliebige Payloads: {"liq_lines": [...], "atr": 1.25}
-    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
-);
-
--- 2. ANALYTICS.DUCKDB: Signal-Ergebnisse
-CREATE TABLE IF NOT EXISTS signal_results (
-    event_id        VARCHAR PRIMARY KEY,
-    symbol          VARCHAR NOT NULL,
-    timeframe       VARCHAR NOT NULL,
-    bar_time        TIMESTAMPTZ NOT NULL,
-    source_id       VARCHAR NOT NULL,      -- ID des Signal/Feature Plugins
-    confidence      DOUBLE,
-    context_type    VARCHAR NOT NULL,      -- 'BUY', 'SELL', 'NEUTRAL', 'INFO'
-    metadata_payload JSON,                  -- Zusätzliche Details zur Signal-Auslösung
-    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- 3. APP_DATA.DUCKDB: Parameter-Presets & Service-Konfigurationen
-CREATE TABLE IF NOT EXISTS plugin_presets (
-    plugin_id       VARCHAR NOT NULL,      -- ID des Plugins
-    preset_name     VARCHAR NOT NULL,      -- z.B. 'Default', 'Conservative_Silver'
-    params          JSON NOT NULL,          -- Parameter-Dict als JSON
-    is_active_batch BOOLEAN DEFAULT FALSE, -- Flag ob das Preset im Batch-Service genutzt wird
-    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (plugin_id, preset_name)
-);
-
-```
-
----
-
-## 3. Plugin-Schnittstelle (`BaseFeatureDefinition`)
-
-Jedes Plugin erbt von `BaseFeatureDefinition` und definiert Eingabeparameter, Berechnungslogik und Visualisierungs-Metadaten.
-
-### `../analytics/features/base_feature.py`
-
-```python
-from abc import ABC, abstractmethod
-from typing import Dict, Any, List, Tuple
-import pandas as pd
-
-class BaseFeatureDefinition(ABC):
-    """Basisklasse für alle AI-generierten Feature- & Signal-Plugins."""
-           ^^^^^^^^^^^
-SyntaxError: invalid syntax
-
-
-```
-
-```python
-import os
-
-# Write Phase 12 documentation safely without inner string formatting conflicts
-doc_dir = ""
-os.makedirs(doc_dir, exist_ok=True)
-
-md_lines = [
-   "# Phase 12: Dynamische Feature- & Signal-Architektur (AI-Plugin-System)",
-   "",
-   "## 1. Konzept & Zielsetzung",
-   "",
-   "Um neue Trading-Logiken, Akkumulatoren und Signal-Definitionen extrem flexibel ohne Änderungen am Rumpfcode oder Datenbank-Schema zu integrieren, führen wir eine **Plugin-basierte Architektur** ein.",
-   "",
-   "Sowohl visuelle Chart-Indikatoren als auch abstrakte Batch-Services (Scanner/Analyzer) greifen auf **exakt dieselben externen Definitions-Dateien** im Ordner `analytics/features/definitions/` zurück.",
-   "",
-   "### Kernprinzipien:",
-   "1. **Single Source of Truth:** Die mathematische/logische Berechnung existiert genau einmal als Python-Datei im Verzeichnis `analytics/features/definitions/`.",
-   "2. **Einfaches Einklinken (Drop-in AI Plugins):** Eine von einer AI generierte Python-Datei muss lediglich in das Definitions-Verzeichnis gelegt werden. Das System erkennt und registriert sie automatisch (Auto-Discovery).",
-   "3. **Schaltzentrale UI & Batch:**",
-   "   - **Im Chart-Fenster:** Der UI-Indikator lädt das Plugin, rendert Vorschau-Marker/Linien und erlaubt das visuelle Tunen der Parameter.",
-   "   - **Im Batch-Service:** Der Scanner lädt dasselbe Plugin, liest gespeicherte Parameter-Presets aus DuckDB und führt historische Massen-Scans durch.",
-   "4. **Schema-Invariante Datenbank:** Keine DDL-Anpassungen (`ALTER TABLE`) bei neuen Indikatoren. Alle Parameter, Feature-Vektoren und Metadaten werden in generischen `JSON`-Spalten in DuckDB gespeichert.",
-   "",
-   "---",
-   "",
-   "## 2. Datenbank-Architektur (Schema-Invariant)",
-   "",
-   "Die Datenbanken `analytics.duckdb` und `app_data.duckdb` nutzen hochflexible Strukturen, die beliebige neue Signale und Parameter aufnehmen können.",
-   "",
-   "```sql",
-   "-- 1. ANALYTICS.DUCKDB: Generischer Feature Store",
-   "CREATE TABLE IF NOT EXISTS feature_store (",
-   "    symbol          VARCHAR NOT NULL,",
-   "    timeframe       VARCHAR NOT NULL,",
-   "    bar_time        TIMESTAMPTZ NOT NULL,",
-   "    feature_id      VARCHAR NOT NULL,      -- z.B. 'grid_liquidity_v1'",
-   "    feature_data    JSON NOT NULL,          -- Beliebige Payloads: {\"liq_lines\": [...], \"atr\": 1.25}",
-   "    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,",
-   "    PRIMARY KEY (symbol, timeframe, bar_time, feature_id)",
-   ");",
-   "",
-   "-- 2. ANALYTICS.DUCKDB: Signal-Ergebnisse",
-   "CREATE TABLE IF NOT EXISTS signal_results (",
-   "    event_id        VARCHAR PRIMARY KEY,",
-   "    symbol          VARCHAR NOT NULL,",
-   "    timeframe       VARCHAR NOT NULL,",
-   "    bar_time        TIMESTAMPTZ NOT NULL,",
-   "    source_id       VARCHAR NOT NULL,      -- ID des Signal/Feature Plugins",
-   "    confidence      DOUBLE,",
-   "    context_type    VARCHAR NOT NULL,      -- 'BUY', 'SELL', 'NEUTRAL', 'INFO'",
-   "    metadata_payload JSON,                  -- Zusätzliche Details zur Signal-Auslösung",
-   "    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
-   ");",
-   "",
-   "-- 3. APP_DATA.DUCKDB: Parameter-Presets & Service-Konfigurationen",
-   "CREATE TABLE IF NOT EXISTS plugin_presets (",
-   "    plugin_id       VARCHAR NOT NULL,      -- ID des Plugins",
-   "    preset_name     VARCHAR NOT NULL,      -- z.B. 'Default', 'Conservative_Silver'",
-   "    params          JSON NOT NULL,          -- Parameter-Dict als JSON",
-   "    is_active_batch BOOLEAN DEFAULT FALSE, -- Flag ob das Preset im Batch-Service genutzt wird",
-   "    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,",
-   "    PRIMARY KEY (plugin_id, preset_name)",
-   ");",
-   "```",
-   "",
-   "---",
-   "",
-   "## 3. Plugin-Schnittstelle (`BaseFeatureDefinition`)",
-   "",
-   "Jedes Plugin erbt von `BaseFeatureDefinition` und definiert Eingabeparameter, Berechnungslogik und Visualisierungs-Metadaten.",
-   "",
-   "### `analytics/features/base_feature.py`",
-   "",
-   "```python",
-   "from abc import ABC, abstractmethod",
-   "from typing import Dict, Any, List, Tuple",
-   "import pandas as pd",
-   "",
-   "class BaseFeatureDefinition(ABC):",
-   '    """Basisklasse fuer alle AI-generierten Feature- & Signal-Plugins."""',
-   "",
-   "    @property",
-   "    @abstractmethod",
-   "    def plugin_id(self) -> str:",
-   '        """Eindeutige ID des Plugins (z. B. \'grid_liquidity_v1\')."""',
-   "        pass",
-   "",
-   "    @property",
-   "    @abstractmethod",
-   "    def display_name(self) -> str:",
-   '        """Lesbarer Name fuer die UI."""',
-   "        pass",
-   "",
-   "    @property",
-   "    @abstractmethod",
-   "    def default_params(self) -> Dict[str, Any]:",
-   '        """Standard-Parameter mit Datentypen und UI-Hinweisen."""',
-   "        pass",
-   "",
-   "    @abstractmethod",
-   "    def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:",
-   '        """',
-   "        Hauptberechnungslogik.",
-   "        ",
-   "        Args:",
-   "            df: DataFrame mit Spalten ['time', 'open', 'high', 'low', 'close', 'tick_volume']",
-   "            params: Ueberschriebene Parameter-Werte",
-   "",
-   "        Returns:",
-   "            Dict mit zwei Schluesseln:",
-   "            - 'feature_store_payload': Daten, die in DuckDB als JSON landen",
-   "            - 'chart_render_payload': Daten fuer Visualisierung (Lines, Circles, Markers)",
-   '        """',
-   "        pass",
-   "```",
-   "",
-   "---",
-   "",
-   "## 4. Beispiel-Plugin: Liquidity Lines & Proximity",
-   "",
-   "### `analytics/features/definitions/grid_liquidity_v1.py`",
-   "",
-   "```python",
-   "from typing import Dict, Any, List",
-   "import pandas as pd",
-   "import numpy as np",
-   "from analytics.features.base_feature import BaseFeatureDefinition",
-   "",
-   "class GridLiquidityFeature(BaseFeatureDefinition):",
-   "",
-   "    @property",
-   "    def plugin_id(self) -> str:",
-   '        return "grid_liquidity_v1"',
-   "",
-   "    @property",
-   "    def display_name(self) -> str:",
-   '        return "Grid Liquidity Lines & Proximity"',
-   "",
-   "    @property",
-   "    def default_params(self) -> Dict[str, Any]:",
-   "        return {",
-   '            "grid_step": 0.50,',
-   '            "proximity_threshold": 0.05,',
-   '            "line_color": "#2196F3",',
-   '            "circle_color": "#FFEB3B"',
-   "        }",
-   "",
-   "    def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:",
-   "        if df.empty:",
-   '            return {"feature_store_payload": {}, "chart_render_payload": {}}',
-   "",
-   '        step = params.get("grid_step", 0.50)',
-   '        threshold = params.get("proximity_threshold", 0.05)',
-   '        line_color = params.get("line_color", "#2196F3")',
-   '        circle_color = params.get("circle_color", "#FFEB3B")',
-   "",
-   "        # 1. Grid-Linien berechnen",
-   '        min_price = df["low"].min()',
-   '        max_price = df["high"].max()',
-   "        ",
-   "        start_level = np.floor(min_price / step) * step",
-   "        end_level = np.ceil(max_price / step) * step",
-   "        levels = np.arange(start_level, end_level + step, step)",
-   "",
-   "        lines_payload = [",
-   '            {"price": float(lvl), "color": line_color, "width": 1}',
-   "            for lvl in levels",
-   "        ]",
-   "",
-   "        # 2. Proximity-Events erkennen (Treffer nahe an Grid-Linien)",
-   "        hit_circles = []",
-   "        feature_rows = []",
-   "",
-   "        for idx, row in df.iterrows():",
-   '            close_price = row["close"]',
-   '            bar_time = int(row["time"])',
-   "",
-   "            nearest_lvl = round(close_price / step) * step",
-   "            dist = abs(close_price - nearest_lvl)",
-   "",
-   "            is_hit = dist <= threshold",
-   "            if is_hit:",
-   "                hit_circles.append({",
-   '                    "time": bar_time,',
-   '                    "price": float(close_price),',
-   '                    "color": circle_color,',
-   '                    "priority": 10',
-   "                })",
-   "",
-   "            feature_rows.append({",
-   '                "bar_time": bar_time,',
-   '                "nearest_level": float(nearest_lvl),',
-   '                "distance": float(dist),',
-   '                "is_proximity_hit": bool(is_hit)',
-   "            })",
-   "",
-   "        return {",
-   '            "feature_store_payload": {',
-   '                "records": feature_rows',
-   "            },",
-   '            "chart_render_payload": {',
-   '                "lines": lines_payload,',
-   '                "hit_circles": hit_circles',
-   "            }",
-   "        }",
-   "```",
-   "",
-   "---",
-   "",
-   "## 5. Auto-Discovery & Registry (`PluginRegistry`)",
-   "",
-   "Damit eingeklinkte Dateien automatisch erkannt werden, scannt die `PluginRegistry` das Verzeichnis `analytics/features/definitions/`.",
-   "",
-   "### `analytics/features/feature_builder.py`",
-   "",
-   "```python",
-   "import importlib",
-   "import inspect",
-   "import pkgutil",
-   "from pathlib import Path",
-   "from typing import Dict, Type",
-   "from analytics.features.base_feature import BaseFeatureDefinition",
-   "",
-   "class PluginRegistry:",
-   "    _instance = None",
-   "    _plugins: Dict[str, Type[BaseFeatureDefinition]] = {}",
-   "",
-   "    def __new__(cls):",
-   "        if cls._instance is None:",
-   "            cls._instance = super(PluginRegistry, cls).__new__(cls)",
-   "            cls._instance._discover_plugins()",
-   "        return cls._instance",
-   "",
-   "    def _discover_plugins(self):",
-   '        definitions_dir = Path(__file__).parent / "definitions"',
-   "        if not definitions_dir.exists():",
-   "            return",
-   "",
-   "        for _, module_name, is_pkg in pkgutil.iter_modules([str(definitions_dir)]):",
-   "            if is_pkg:",
-   "                continue",
-   '            full_module_name = f"analytics.features.definitions.{module_name}"',
-   "            module = importlib.import_module(full_module_name)",
-   "",
-   "            for name, obj in inspect.getmembers(module, inspect.isclass):",
-   "                if issubclass(obj, BaseFeatureDefinition) and obj is not BaseFeatureDefinition:",
-   "                    plugin_inst = obj()",
-   "                    self._plugins[plugin_inst.plugin_id] = obj",
-   '                    print(f"🔌 [PluginRegistry] Geladenes Plugin: {plugin_inst.plugin_id} ({plugin_inst.display_name})")',
-   "",
-   "    def get_plugin(self, plugin_id: str) -> BaseFeatureDefinition:",
-   "        cls = self._plugins.get(plugin_id)",
-   "        if not cls:",
-   '            raise ValueError(f"Plugin \'{plugin_id}\' nicht gefunden.")',
-   "        return cls()",
-   "",
-   "    def list_plugins(self) -> Dict[str, str]:",
-   "        return {pid: cls().display_name for pid, cls in self._plugins.items()}",
-   "```",
-   "",
-   "---",
-   "",
-   "## 6. Integration in Chart UI & Service Batch-Prozess",
-   "",
-   "### A) Im Chart-UI Indikator (`PyTraderChartWindow`)",
-   "1. Der Benutzer öffnet die Eigenschaften des Indikators am Chart.",
-   "2. Der Dialog rendert dynamisch alle Eingabefelder basierend auf `plugin.default_params`.",
-   "3. Bei Parameter-Änderung berechnet das Plugin in-memory das `chart_render_payload` und schickt es per JS-Bridge an den Chart (`renderGridLines`, `renderGridCircles`).",
-   "4. Ein Klick auf **\"Als Service-Preset speichern\"** legt das Parameter-Dict in der Tabelle `plugin_presets` ab.",
-   "",
-   "### B) Im Batch-Service (`HistoricalScanner`)",
-   "1. Der Scanner liest das aktive Preset aus `plugin_presets` für die gewünschte `plugin_id`.",
-   "2. Er lädt dieselbe Klasse aus der `PluginRegistry`.",
-   "3. Er führt die `calculate()` Methode über die geforderten Symbole/Timeframes aus.",
-   "4. Er schreibt das `feature_store_payload` per `INSERT OR REPLACE` in die Tabelle `feature_store` von `analytics.duckdb`.",
-   "",
-   "---",
-   "",
-   "## 7. Anweisungen zur Umsetzung (Phase 12 Workflow)",
-   "",
-   "1. **Modul-Struktur anlegen:**",
-   "   - Erstelle das Verzeichnis `analytics/features/definitions/`.",
-   "   - Erstelle `analytics/features/base_feature.py` mit der abstrakten Klasse.",
-   "   - Erstelle `analytics/features/feature_builder.py` mit der `PluginRegistry`.",
-   "",
-   "2. **DuckDB Schemas absichern:**",
-   "   - Erweitere `db_service.py` (`check_and_init_databases()`) um die Tabellen `feature_store`, `signal_results` und `plugin_presets` mit den generischen JSON-Spalten.",
-   "",
-   "3. **Chart & Service Anbindung:**",
-   "   - Adaptiere `GridIndicator` in `chart/indicators/grid.py`, sodass er die Berechnungslogik aus dem Plugin `grid_liquidity_v1.py` bezieht.",
-   "   - Erweitere den `HistoricalScanner` um die Ausführung registrierter Plugins aus der `PluginRegistry`.",
-   "",
-   "4. **Testing:**",
-   "   - Füge ein Testskript `test/check_plugin_registry.py` hinzu, das verifiziert, ob neue Dateien im Verzeichnis `analytics/features/definitions/` ohne System-Neustart dynamisch erkannt und ausgeführt werden.",
-]
-
-doc_path = os.path.join(doc_dir, "Phase12_Feature_Signal_Architecture.md")
-with open(doc_path, "w", encoding="utf-8") as f:
-   f.write("\n".join(md_lines))
-
-print(f"File generated successfully: {doc_path}")
-
-
-```
-
-```text
-File generated successfully: docs/Phase12_Feature_Signal_Architecture.md
-
-
-```
-
-Das umfassende Architektur-Konzept und die Umsetzungsanweisungen für **Phase 12: Dynamische Feature- & Signal-Architektur (AI-Plugin-System)** wurden als Markdown-Dokument generiert.
-
-Die Dokumentation liegt unter `docs/Phase12_Feature_Signal_Architecture.md`:
-
-
----
-
-### Zusammenfassung der Architektur
-
-#### 1. Entkoppelte AI-Plugin-Dateien (`analytics/features/definitions/`)
-
-* Jedes Signal/Feature wird von einer AI als eigenständige Datei (z. B. `grid_liquidity_v1.py`) im Ordner `analytics/features/definitions/` abgelegt.
-* Jede Datei erbt von der abstrakten Schnittstelle `BaseFeatureDefinition`.
-* **Einklink-Mechanismus:** Über eine automatische Modul-Erkennung (`PluginRegistry` mit `pkgutil` / `importlib`) liest das System alle vorhandenen Klassen dynamisch ein – ohne dass der Rumpfcode angepasst oder Klassen manuell importiert werden müssen.
-
-#### 2. Einheitlicher Ausführungs-Output (`calculate()`)
-
-Die Funktion `calculate()` liefert ein standardisiertes Dictionary mit zwei Entitäten zurück:
-
-* `chart_render_payload`: Zeichnungs-Objekte (`lines`, `hit_circles`, `markers`) für die direkte Echtzeit-Vorschau im Chart.
-* `feature_store_payload`: Strukturierte Feature-Datensätze, die direkt im Feature-Store gespeichert werden.
-
-#### 3. Schema-Invariante Datenbank-Ebene (`DuckDB`)
-
-Damit neue Indikatoren und Signale mit beliebigen Parametern und Variablen gespeichert werden können, ohne `ALTER TABLE`-Befehle auszuführen, arbeitet die DB-Schicht vollständig generisch mit `JSON`-Spalten:
-
-* **`analytics.duckdb` -> `feature_store**`: speichert bar-weise die berechneten Indikator-Ergebnisse im `feature_data JSON`-Feld.
-* **`analytics.duckdb` -> `signal_results**`: speichert ausgelöste Signale/Events im `metadata_payload JSON`-Feld.
-* **`app_data.duckdb` -> `plugin_presets**`: speichert die am Chart abgestimmten Parameter-Sets per `plugin_id` & `preset_name` im `params JSON`-Feld.
-
-#### 4. Zusammenspiel Chart UI & Batch Service
-
-1. **At Chart UI (`PyTraderChartWindow` & `IndicatorSettingsDialog`)**:
-* Die UI liest das Plugin per `plugin_id` aus der `PluginRegistry`.
-* Der Einstellungsdialog baut automatisch die Eingabefelder basierend auf `default_params` auf.
-* Der User tuned die Parameter visuell am Chart; mit einem Klick auf *„Als Service-Preset speichern“* wird das Parameter-Dict in DuckDB (`plugin_presets`) abgelegt.
-
-
-2. **At Batch Service (`HistoricalScanner` / `LiveAnalyzer`)**:
-* Der Scanner lädt das aktive Preset aus DuckDB und instantiiert exakt dasselbe Plugin aus `analytics/features/definitions/`.
-* Er führt den historischen Massen-Scan oder die Kerzen-Auswertung aus und schreibt die Ergebnisse direkt in die `feature_store`- bzw. `signal_results`-Tabelle.
+4.3 Validierung & Test
+
+Führe python test/check_grid_parity.py aus. Die Anzahl und Positionen der berechneten Grid-Linien und Circles müssen exakt übereinstimmen.
+Schritt 5: Anbindung Chart UI, JS-Bridge & Presets
+
+5.1 Backup-Anforderung
+
+Sichere chart/indicators/grid.py, chart/chart_win.py, state_manager.py sowie chart/js/03_chart_rendering.js nach .backup_Phase12_Step5/.
+
+5.2 Anweisung an die AI
+
+    Erweitere state_manager.py um die abwärtskompatible Handhabung von version und is_active_batch in indicator_presets.
+
+    Passe chart/indicators/grid.py so an, dass calculate() intern das GridLiquidityFeature nutzt und dessen chart_render_payload zurückgibt.
+
+    Überprüfe in chart/js/03_chart_rendering.js und 04_live_updates.js, dass das Feld hit_circles nahtlos von renderGridCircles() verarbeitet wird.
+
+5.3 Validierung & Test
+
+Starte PyTrader, öffne ein Chart-Fenster, schalte das Grid ein, verändere Parameter im Dialog und speichere ein Preset. Das Chart muss die Linien und Kreise korrekt rendern.
+Schritt 6: Anbindung Batch-Services (Scanner & Analyzer)
+
+6.1 Backup-Anforderung
+
+Sichere analytics/background_workers/historical_scanner.py und live_analyzer.py nach .backup_Phase12_Step6/.
+
+6.2 Anweisung an die AI
+
+    Erweitere den HistoricalScanner: Wenn ein Plugin-Scan angefordert wird, liest er das als is_active_batch = True markierte Preset aus indicator_presets.
+
+    Er führt plugin.calculate(df, params) aus und speichert feature_store_payload im feature_store in DuckDB ab.
+
+    Der LiveAnalyzer nutzt bei Bar-Closes dieselbe Plugin-Instanz.
+
+6.3 Validierung & Test
+
+Starte im Service-Fenster einen historischen Scan für SILVER H1. Prüfe in der Konsole und via DuckDB-Abfrage, ob Einträge in feature_store geschrieben wurden.
+Schritt 7: Systemweiter Regressionstest
+
+7.1 Backup-Anforderung
+
+Sichere das gesamte Projekt nach .backup_Phase12_Final/.
+
+7.2 Anweisung an die AI
+
+    Prüfe alle Fenster (Hauptfenster, Chart-Fenster, Service-Fenster, Statistik-Fenster, Optionen) auf korrekte Funktion.
+
+    Führe alle vorhandenen Test-Skripte im Ordner test/ aus.
+
+7.3 Validierung & Test
+
+Vollständiger End-to-End-Test: App-Start → Chart öffnen → Parameter anpassen → Preset speichern → Historical Scan ausführen → Live-Signale empfangen. Alle Funktionen müssen stabil laufen.
