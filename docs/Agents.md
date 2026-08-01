@@ -8,7 +8,11 @@ Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukture
 - **`docs/x_Exports.md` ist KEIN Bestandteil des offiziellen Quellcodes.** Es ist ein reiner, vom Benutzer erzeugter Export-/Clone der Projektdateien zu Dokumentationszwecken (mehrfach kopierte/veraltete Codeduplikate).
 - **Niemals** `docs/x_Exports.md` als Quelle für Code, Logik oder Dateistruktur verwenden, durchsuchen oder daraus Änderungen ableiten. Es spiegelt NICHT den aktuellen Stand des Quellcodes wider.
 - Verbindlich sind ausschließlich die echten Projektdateien (z. B. `main.py`, `chart/chart_win.py`, `chart/js/*.js`, `chart/chart_basics.py`, `db_service.py`, `state_manager.py`, ...).
-- Korrespondierende Architektur-/Kontext-Dokumente mit `x_`-Präfix (`x_Architektur.md`, `x_Roadmap.md`) sind dagegen normale Kontext-Dokumente und dürfen gelesen werden.
+
+### 0b. WICHTIG: `docs/Old/` NICHT BEACHTEN (Standard)
+- **Alle Dateien im Unterordner `docs/Old/` (`docs/Old/x_Architektur.md`, `docs/Old/x_Roadmap.md`, ...) sind archivierte/abgelegte Alt-Dokumente und werden NICHT beachtet.**
+- **Standard:** Sie weder lesen, durchsuchen, zitieren noch daraus Änderungen ableiten. Sie spiegeln NICHT den aktuellen Stand des Projekts wider.
+- **Ausnahme:** Nur auf temporäre, ausdrückliche Einzelanweisung des Benutzers darf eine bestimmte Datei aus `docs/Old/` ausnahmsweise herangezogen werden.
 
 ---
 
