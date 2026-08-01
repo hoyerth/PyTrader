@@ -291,6 +291,8 @@ class StateManager:
         return records
 
     def get_indicator_preset(self, indicator_id: str, preset_name: str) -> Optional[Dict[str, Any]]:
+        """Liest die Parametervalue eines Indikator-Presets (RÜCKWÄRTSKOMPATIBEL:
+        gibt direkt das params-Dict zurück, wie vom bestehenden indicator_dialog erwartet)."""
         con = self._get_connection()
         res = con.execute(
             "SELECT params FROM indicator_presets WHERE indicator_id = ? AND preset_name = ?",
@@ -300,14 +302,51 @@ class StateManager:
             return _parse_json_field(res[0])
         return None
 
-    def save_indicator_preset(self, indicator_id: str, preset_name: str, params: Dict[str, Any]) -> None:
+    def get_indicator_preset_meta(self, indicator_id: str, preset_name: str) -> Optional[Dict[str, Any]]:
+        """Liest ein Indikator-Preset INKL. Plugin-Verknüpfung (Phase 12 Hybrid-Schema).
+        Rückgabe: {"params": ..., "plugin_id": ..., "version": ..., "is_active_batch": ...}."""
+        con = self._get_connection()
+        res = con.execute(
+            "SELECT params, plugin_id, version, is_active_batch FROM indicator_presets WHERE indicator_id = ? AND preset_name = ?",
+            [indicator_id, preset_name]
+        ).fetchone()
+        if res and res[0]:
+            params = _parse_json_field(res[0])
+            data = {"params": params}
+            # Neue Hybrid-Schema-Spalten (können NULL sein bei Alt-Presets)
+            if len(res) > 1 and res[1] is not None:
+                data["plugin_id"] = str(res[1])
+            if len(res) > 2 and res[2] is not None:
+                data["version"] = str(res[2])
+            if len(res) > 3 and res[3] is not None:
+                data["is_active_batch"] = bool(res[3])
+            return data
+        return None
+
+    def save_indicator_preset(
+        self,
+        indicator_id: str,
+        preset_name: str,
+        params: Dict[str, Any],
+        plugin_id: Optional[str] = None,
+        version: Optional[str] = None,
+        is_active_batch: bool = False,
+    ) -> None:
+        """Speichert ein Indikator-Preset. Unterstützt zusätzlich plugin_id,
+        version und is_active_batch (Phase 12 Hybrid-Schema)."""
         con = self._get_connection()
         con.execute("""
-            INSERT INTO indicator_presets (indicator_id, preset_name, params)
-            VALUES (?, ?, ?)
+            INSERT INTO indicator_presets (indicator_id, preset_name, params, plugin_id, version, is_active_batch)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT (indicator_id, preset_name) DO UPDATE SET
-                params = EXCLUDED.params;
-        """, [indicator_id, preset_name, json.dumps(params)])
+                params = EXCLUDED.params,
+                plugin_id = EXCLUDED.plugin_id,
+                version = EXCLUDED.version,
+                is_active_batch = EXCLUDED.is_active_batch;
+        """, [
+            indicator_id, preset_name, json.dumps(params),
+            plugin_id, version, bool(is_active_batch),
+        ])
 
     def delete_indicator_preset(self, indicator_id: str, preset_name: str) -> None:
         con = self._get_connection()

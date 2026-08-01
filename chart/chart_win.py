@@ -18,6 +18,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from PySide6.QtCore import QFile, QIODevice, QObject, QThread, QTimer, QUrl, Signal, Slot, Qt, QEvent
+from PySide6.QtGui import QCursor
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QMainWindow,
+    QMenu,
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
@@ -35,10 +37,12 @@ from PySide6.QtWidgets import (
 try:
     from chart.chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, build_html_template
     from chart.indicators.grid import GridIndicator
+    from chart.indicators.grid_liquidity import GridLiquidityIndicator
     from chart.indicator_dialog import IndicatorSettingsDialog
 except ImportError:
     from chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, build_html_template
     from indicators.grid import GridIndicator
+    from indicators.grid_liquidity import GridLiquidityIndicator
     from indicator_dialog import IndicatorSettingsDialog
 
 try:
@@ -159,8 +163,11 @@ class PyTraderChartWindow(QMainWindow):
         self.df_data = None
 
         # Generische Indikator-Registry: indicator_id -> BaseIndicator
+        # Alt-Indikator 'grid' (hardcoded, unverändert) + neuer Plugin-Indikator
+        # 'grid_liquidity' (Phase 12) – beide laufen parallel.
         self.indicators: Dict[str, BaseIndicator] = {
             "grid": GridIndicator(),
+            "grid_liquidity": GridLiquidityIndicator(),
         }
         self._settings_dialog: Optional[QDialog] = None
         self._page_loaded: bool = False
@@ -320,14 +327,26 @@ class PyTraderChartWindow(QMainWindow):
 
     def eventFilter(self, watched, event):
         if self.btn_indicator is not None and watched == self.btn_indicator and event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton:
-            # Wenn Dialog offen, schliessen; sonst öffnen
+            # Wenn Dialog offen, schliessen; sonst Auswahl-Menü öffnen
             if self._settings_dialog is not None and self._settings_dialog.isVisible():
                 self._settings_dialog.close()
                 self._settings_dialog = None
             else:
-                self._open_indicator_settings("grid")
+                self._open_indicator_settings_menu()
             return True
         return super().eventFilter(watched, event)
+
+    def _open_indicator_settings_menu(self) -> None:
+        """Rechtsklick auf den Grid-Button: Auswahl zwischen Alt- (grid) und
+        Plugin-Indikator (grid_liquidity) für den generischen Einstellungs-Dialog."""
+        menu = QMenu(self)
+        act_grid = menu.addAction(f"{self.indicators['grid'].display_name} (Alt)")
+        act_liq = menu.addAction(f"{self.indicators['grid_liquidity'].display_name}")
+        chosen = menu.exec(QCursor.pos())
+        if chosen == act_grid:
+            self._open_indicator_settings("grid")
+        elif chosen == act_liq:
+            self._open_indicator_settings("grid_liquidity")
 
     def _get_indicator_plugin(self, ind_id: str) -> Optional[BaseIndicator]:
         """Gibt die Indikator-Instanz zur ID zurück (oder None)."""
@@ -431,8 +450,8 @@ class PyTraderChartWindow(QMainWindow):
                 if hasattr(plugin, "set_context"):
                     plugin.set_context(self.current_symbol, self.current_tf)
                 res = plugin.calculate(self.df_data, st.get("params", {}))
-                # Grid-spezifische Render-Logik (aktuell der einzige Indikator)
-                if ind_id == "grid":
+                # Grid-spezifische Render-Logik (Alt 'grid' + Plugin 'grid_liquidity')
+                if ind_id in ("grid", "grid_liquidity"):
                     lines = res.get("lines", [])
                     circles = res.get("hit_circles", [])
                     # Circle-Zeiten auf kontinuierlich mappen
@@ -564,7 +583,7 @@ class PyTraderChartWindow(QMainWindow):
         if self.df_data is not None and not self.df_data.empty:
             for ind_id, plugin in self.indicators.items():
                 st = self.indicators_state.get(ind_id, {})
-                if st.get("active") and ind_id == "grid":
+                if st.get("active") and ind_id in ("grid", "grid_liquidity"):
                     if hasattr(plugin, "set_context"):
                         plugin.set_context(self.current_symbol, self.current_tf)
                     res = plugin.calculate(self.df_data, st.get("params", {}))

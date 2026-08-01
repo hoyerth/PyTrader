@@ -113,7 +113,7 @@ class GridLiquidityFeature(PluginFeature):
 
                 hit_circles.append({
                     "time": bar_time,
-                    "price": float(close_price),
+                    "price": float(nearest_lvl),
                     "color": color,
                     "priority": 10,
                 })
