@@ -49,9 +49,11 @@ class GridLiquidityIndicator(BaseIndicator):
         return {
             "grid_step": "Rasterabstand",
             "proximity_threshold": "Toleranz",
+            "use_time_filter": "Time Filter aktiv",
+            "time_window_mins": "Time Filter Minuten (0/30)",
             "line_color": "Linien-Farbe",
-            "circle_color_std": "Std-Hit-Farbe",
-            "circle_color_active": "Aktiv-Hit-Farbe",
+            "circle_color_std": "Std-Hit-Farbe (im Fenster)",
+            "circle_color_active": "Aktiv-Hit-Farbe (ausserhalb)",
             "show_lines": "Linien anzeigen",
             "show_circles": "Circles anzeigen",
             "prox_level1": "Level 1",
@@ -66,6 +68,7 @@ class GridLiquidityIndicator(BaseIndicator):
     def param_layout(self) -> Optional[List[Any]]:
         return [
             ("Raster & Toleranz", ["grid_step", "proximity_threshold"]),
+            ("Time Filter", ["use_time_filter", "time_window_mins"]),
             ("Farben", ["line_color", "circle_color_std", "circle_color_active"]),
             ("Anzeige", ["show_lines", "show_circles"]),
             ("Custom Levels 1-3", ["prox_level1", "prox_level2", "prox_level3"]),

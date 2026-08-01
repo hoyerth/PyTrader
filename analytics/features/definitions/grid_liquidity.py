@@ -29,6 +29,39 @@ from analytics.features.plugins.base_plugin import (
 )
 
 
+def _f_in_window_around(minute_val: int, center: int, span: int) -> bool:
+    """Native UTC-Zeitfenster-Logik (identisch zu f_in_window_around() in
+    chart/indicators/grid.py und in_window_around() in grid_levels.py).
+    True, wenn minute_val im Fenster center +/- span liegt (mit Wrap-Around
+    ueber 0/59). Wird hier im Service dupliziert, damit getimte Treffer als
+    Feature-Store-Daten in Analysen nutzbar sind – die native Logik selbst
+    bleibt unveraendert."""
+    lower = center - span
+    upper = center + span
+    if lower < 0:
+        return minute_val >= (60 + lower) or minute_val <= upper
+    elif upper > 59:
+        return minute_val >= lower or minute_val <= (upper - 60)
+    else:
+        return lower <= minute_val <= upper
+
+
+def _bar_utc_minutes(df: pd.DataFrame) -> np.ndarray:
+    """Liefert die UTC-Minute (0-59) jeder Bar – konsistent zu
+    GridLevelsFeature._bar_utc_minutes(). Unterstuetzt 'bar_time'
+    (datetime/pandas) und 'time' (epoch-Sekunden)."""
+    n = len(df)
+    if "bar_time" in df.columns:
+        t = pd.to_datetime(df["bar_time"])
+        if t.dt.tz is not None:
+            return t.dt.tz_convert("UTC").dt.minute.to_numpy(dtype=int)
+        return t.dt.minute.to_numpy(dtype=int)
+    elif "time" in df.columns:
+        t = pd.to_datetime(df["time"], unit="s", utc=True)
+        return t.dt.minute.to_numpy(dtype=int)
+    return np.zeros(n, dtype=int)
+
+
 class GridLiquidityFeature(PluginFeature):
 
     @property
@@ -54,8 +87,10 @@ class GridLiquidityFeature(PluginFeature):
         return {
             "grid_step": {"type": "float", "default": 0.50, "min": 0.01, "max": 100.0, "step": 0.05, "description": "Rasterabstand"},
             "proximity_threshold": {"type": "float", "default": 0.05, "min": 0.001, "max": 10.0, "step": 0.005, "description": "Toleranzschwelle"},
+            "use_time_filter": {"type": "bool", "default": True, "description": "Time Filter aktiv (Zeitfenster um ganze/halbe Stunde)"},
+            "time_window_mins": {"type": "int", "default": 5, "min": 0, "max": 30, "step": 1, "description": "Time Filter Minuten (0 oder 30 um ganze/halbe Stunde)"},
             "line_color": {"type": "color", "default": "#2196F3", "description": "Farbe Grid-Linien"},
-            "circle_color_std": {"type": "color", "default": "#FFEB3B", "description": "Farbe Standard-Hit"},
+            "circle_color_std": {"type": "color", "default": "#FFEB3B", "description": "Farbe Standard-Hit (im Zeitfenster)"},
             "circle_color_active": {"type": "color", "default": "#E91E63", "description": "Farbe Hit in Aktivitätsfenster"},
             "show_lines": {"type": "bool", "default": True, "description": "Grid-Linien anzeigen"},
             "show_circles": {"type": "bool", "default": True, "description": "Hits anzeigen"},
@@ -74,6 +109,8 @@ class GridLiquidityFeature(PluginFeature):
         p = self.validate_params(params)
         step = p["grid_step"]
         threshold = p["proximity_threshold"]
+        use_time_filter = bool(p["use_time_filter"])
+        time_window_mins = int(p["time_window_mins"])
 
         min_price = df["low"].min()
         max_price = df["high"].max()
@@ -95,6 +132,10 @@ class GridLiquidityFeature(PluginFeature):
         hit_circles = []
         feature_rows = []
 
+        # Native UTC-Minute jeder Bar (konsistent zu GridLevelsFeature)
+        bar_minutes = _bar_utc_minutes(df)
+        minutes = list(bar_minutes)
+
         for idx, row in df.iterrows():
             close_price = row["close"]
             bar_time = int(row["time"])
@@ -103,13 +144,23 @@ class GridLiquidityFeature(PluginFeature):
             dist = abs(close_price - nearest_lvl)
             is_hit = dist <= threshold
 
+            # Zeitfenster um ganze Stunde (Minute 0) UND halbe Stunde (Minute 30)
+            # – identische native UTC-Logik wie der Alt-Indikator (grid.py).
+            row_m = minutes[idx]
+            row_in_time = (
+                _f_in_window_around(row_m, 0, time_window_mins)
+                or _f_in_window_around(row_m, 30, time_window_mins)
+            )
+            is_time_window_active = row_in_time if use_time_filter else True
+
             if is_hit and p["show_circles"]:
-                dt = pd.to_datetime(bar_time, unit='s')
-                # ROADMAP-PLATZHALTER: 8-16h ist NUR ein Beispiel für die
-                # Aktiv-Farb-Logik. Das native UTC-Zeitfenster (Minute 0/30 ±
-                # time_window_mins) in grid_levels.py bleibt davon UNBERÜHRT.
-                is_active_window = 8 <= dt.hour <= 16
-                color = p["circle_color_active"] if is_active_window else p["circle_color_std"]
+                # Farblogik identisch zum Alt-Indikator:
+                # - Zeitfilter INAKTIV: alle Proximity-Punkte gelb
+                # - Zeitfilter AKTIV: Punkte im Fenster gelb, ausserhalb fuchsia
+                if use_time_filter and not row_in_time:
+                    color = p["circle_color_active"]
+                else:
+                    color = p["circle_color_std"]
 
                 hit_circles.append({
                     "time": bar_time,
@@ -123,6 +174,11 @@ class GridLiquidityFeature(PluginFeature):
                 "nearest_level": float(nearest_lvl),
                 "distance": float(dist),
                 "is_hit": bool(is_hit),
+                # Getimter Treffer für spätere Analysen (Phase 13 Services):
+                # 1 wenn die Bar im Zeitfenster liegt (Minute 0/30 ± mins), sonst 0
+                "is_time_window_active": int(is_time_window_active),
+                "time_window_mins": time_window_mins,
+                "use_time_filter": use_time_filter,
             })
 
         return {
