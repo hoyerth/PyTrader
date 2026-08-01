@@ -9,13 +9,18 @@ und X-Achsen-Zeitfenster-Flags), gekapselt in analytics/features/definitions/.
 """
 
 from typing import Dict, List, Optional
-import pandas as pd
+import importlib
+import inspect
+import pkgutil
 from pathlib import Path
+
+import pandas as pd
 
 from analytics.features.base_feature import BaseFeature
 from analytics.features.definitions.ema_diff import EMADiffFeature
 from analytics.features.definitions.atr_normalized import ATRNormalizedFeature
 from analytics.features.definitions.grid_levels import GridLevelsFeature
+from analytics.features.plugins.base_plugin import PluginFeature, FeatureCalculateResult
 from state_manager import StateManager
 from db_service import DbPool
 
@@ -23,6 +28,75 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = BASE_DIR / "data"
 DB_MARKET = str(DATA_DIR / "market_data.duckdb")
 DB_ANALYTICS = str(DATA_DIR / "analytics.duckdb")
+
+
+class PluginLoader:
+    """Class-Finder scannt Verzeichnisse rein nach Subklassen von PluginFeature (Dateiname-unabhängig)."""
+
+    def __init__(self, definitions_path: Optional[Path] = None):
+        self.definitions_path = definitions_path or Path(__file__).parent / "definitions"
+
+    def discover_plugins(self) -> Dict[str, PluginFeature]:
+        plugins = {}
+        if not self.definitions_path.exists():
+            return plugins
+
+        for _, module_name, is_pkg in pkgutil.iter_modules([str(self.definitions_path)]):
+            if is_pkg:
+                continue
+            full_module_name = f"analytics.features.definitions.{module_name}"
+            try:
+                module = importlib.import_module(full_module_name)
+                for name, obj in inspect.getmembers(module, inspect.isclass):
+                    if issubclass(obj, PluginFeature) and obj is not PluginFeature:
+                        instance = obj()
+                        plugins[instance.plugin_id] = instance
+            except Exception as e:
+                print(f"⚠️ [PluginLoader] Fehler in Modul {module_name}: {e}")
+        return plugins
+
+
+class PluginRegistry:
+    """Zentraler Singleton-Katalog für entdeckte Plugins."""
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance.loader = PluginLoader()
+            cls._instance.plugins = cls._instance.loader.discover_plugins()
+        return cls._instance
+
+    def reload(self):
+        """Expliziter Reload nur beim Start oder per Button (thread-sicher)."""
+        self.plugins = self.loader.discover_plugins()
+
+    def get(self, plugin_id: str) -> PluginFeature:
+        if plugin_id not in self.plugins:
+            raise KeyError(f"Plugin '{plugin_id}' nicht gefunden.")
+        return self.plugins[plugin_id]
+
+
+class PluginExecutor:
+    """Zentrale Schicht für Ausführung, Validierung, Dependency-Ordering & Logging."""
+
+    def __init__(self, registry: Optional[PluginRegistry] = None):
+        self.registry = registry or PluginRegistry()
+
+    def execute(self, plugin_id: str, df: pd.DataFrame, params: Dict[str, any]) -> FeatureCalculateResult:
+        plugin = self.registry.get(plugin_id)
+
+        # 1. Dependency Resolution (falls Abhängigkeiten angegeben sind)
+        for dep_id in plugin.dependencies:
+            dep_plugin = self.registry.get(dep_id)
+            dep_plugin.calculate(df, dep_plugin.default_params)
+
+        # 2. Parametervalidierung
+        validated_params = plugin.validate_params(params)
+
+        # 3. Stateless Execution
+        return plugin.calculate(df, validated_params)
 
 
 class FeatureBuilder:
