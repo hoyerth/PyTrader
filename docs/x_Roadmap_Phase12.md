@@ -480,6 +480,7 @@ Dieser Leitfaden sichert nach jedem Schritt einen voll funktionsfähigen Projekt
 
 **1. Backups über Git statt Ordner-Kopien:**
 - Code-Backups erfolgen als **Git-Commit/Tag** pro Schritt (`phase12_step1`, `phase12_step2`, …) – sekundenschnell, versioniert, jederzeit zurückrollbar. Die `.backup_*`-Ordner-Kopien entfallen.
+- **Jeder Schritt wird sofort auf GitHub gesichert:** Commit → `git push origin main` → Tag erstellen → `git push origin <tag>` (bzw. `git push origin --tags`). Damit sind Code UND Tags sofort im Remote-Backup (GitHub), nicht nur lokal.
 - **`data/` wird NICHT kopiert** (`market_data.duckdb` ist ~1,2 GB und ändert sich nur durch MT5-Sync). Einzige Ausnahme: **einmaliges Backup von `analytics.duckdb` + `app_data.duckdb`** (zusammen ~23 MB) direkt vor Schritt 1 (DB-Migration), da diese migriert werden.
 - Pro Schritt werden nur die **tatsächlich geänderten Dateien** gesichert (siehe Schritt-Backup-Listen).
 
