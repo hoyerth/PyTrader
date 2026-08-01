@@ -401,7 +401,8 @@ class PyTraderChartWindow(QMainWindow):
             "active": False, "preset": "Default", "params": dict(plugin.default_params)
         })
         dialog = IndicatorSettingsDialog(plugin, st["params"], st["preset"], self.state_manager,
-                                         lambda p, pr: self._on_indicator_params_updated(ind_id, p, pr), self)
+                                         lambda p, pr: self._on_indicator_params_updated(ind_id, p, pr), self,
+                                         symbol=self.current_symbol, timeframe=self.current_tf)
         self._settings_dialog = dialog
         dialog.finished.connect(lambda: self._on_settings_closed(dialog))
         dialog.show()

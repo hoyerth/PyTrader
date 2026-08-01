@@ -16,7 +16,7 @@ VERBINDLICHE ENTSCHEIDUNGEN (Roadmap Phase 12):
    Implementierung, Parallelbetrieb). Dieses Plugin ist die Neu-Implementierung.
 """
 
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 import numpy as np
 import pandas as pd
@@ -82,6 +82,45 @@ class GridLiquidityFeature(PluginFeature):
             "tags": ["grid", "liquidity", "proximity"],
         }
 
+    # Phase 13 Schritt 5: Darstellungs-Reihenfolge & Label-Namen liegen AN DEN
+    # ANFANG der Plugin-Definition (Single Source of Truth fuer das Prop-Fenster,
+    # NICHT mehr im Chart-Adapter). Reihenfolge: Indi-Props (Sichtbarkeit, Farben)
+    # zuerst, darunter die Service-Props, expert-Felder am Ende.
+
+    @property
+    def parameter_order(self) -> List[str]:
+        return [
+            # Reine Indi-Props (oberhalb der Trennlinie)
+            "show_lines", "show_circles",
+            "line_color", "circle_color_std", "circle_color_active",
+            # Service-Props (Berechnung)
+            "grid_step", "proximity_threshold",
+            "use_time_filter", "time_window_mins",
+            # Expert-Felder (Custom Levels, ausklappbar)
+            "prox_level1", "prox_level2", "prox_level3",
+            "prox_level4", "prox_level5", "prox_level6",
+        ]
+
+    @property
+    def param_labels(self) -> Dict[str, str]:
+        return {
+            "grid_step": "Rasterabstand",
+            "proximity_threshold": "Toleranz",
+            "use_time_filter": "Time Filter aktiv",
+            "time_window_mins": "Time Filter Minuten (0/30)",
+            "line_color": "Linien-Farbe",
+            "circle_color_std": "Std-Hit-Farbe (im Fenster)",
+            "circle_color_active": "Aktiv-Hit-Farbe (ausserhalb)",
+            "show_lines": "Linien anzeigen",
+            "show_circles": "Circles anzeigen",
+            "prox_level1": "Level 1",
+            "prox_level2": "Level 2",
+            "prox_level3": "Level 3",
+            "prox_level4": "Level 4",
+            "prox_level5": "Level 5",
+            "prox_level6": "Level 6",
+        }
+
     @property
     def parameter_schema(self) -> Dict[str, ParameterSchema]:
         return {
@@ -94,12 +133,12 @@ class GridLiquidityFeature(PluginFeature):
             "circle_color_active": {"type": "color", "default": "#E91E63", "description": "Farbe Hit in Aktivitätsfenster"},
             "show_lines": {"type": "bool", "default": True, "description": "Grid-Linien anzeigen"},
             "show_circles": {"type": "bool", "default": True, "description": "Hits anzeigen"},
-            "prox_level1": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 1"},
-            "prox_level2": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 2"},
-            "prox_level3": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 3"},
-            "prox_level4": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 4"},
-            "prox_level5": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 5"},
-            "prox_level6": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 6"},
+            "prox_level1": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 1", "expert": True},
+            "prox_level2": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 2", "expert": True},
+            "prox_level3": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 3", "expert": True},
+            "prox_level4": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 4", "expert": True},
+            "prox_level5": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 5", "expert": True},
+            "prox_level6": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 6", "expert": True},
         }
 
     def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> FeatureCalculateResult:
