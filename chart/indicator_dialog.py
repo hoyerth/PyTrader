@@ -391,8 +391,11 @@ class IndicatorSettingsDialog(QDialog):
 
 		# --- 3) Hauptzeile: Service-Parameter (links) | Aktionen + Expert (rechts) ---
 		# Rechts neben dem Service-Parameter-Rahmen stehen die Set-Aktionen
-		# (oben) und darunter der Expert-Bereich. Dadurch wird der Dialog
-		# deutlich flacher und passt auf kleinere Bildschirme.
+		# (oben) und darunter der Expert-Bereich. Beide Spalten werden oben
+		# ausgerichtet (AlignTop), damit die Service-Parameter-Box direkt unter
+		# der Trennlinie beginnt. KEIN addStretch in der rechten Spalte –
+		# dadurch bleibt die Zeile so kompakt wie die hoechste Box und das
+		# Fenster endet direkt unter dem Preset-Block.
 		main_row = QHBoxLayout()
 
 		# --- 3a) Service-Bereich (Set-Auswahl + QStackedWidget pro Service) ---
@@ -425,11 +428,10 @@ class IndicatorSettingsDialog(QDialog):
 			QSizePolicy.Expanding, QSizePolicy.Fixed)
 		svc_layout.addWidget(self.stack_service_forms)
 
-		main_row.addWidget(svc_group, 1)
+		main_row.addWidget(svc_group, 1, Qt.AlignTop)
 
 		# --- 3b) Rechte Spalte: Set-Aktionen (oben) + Expert-Bereich (darunter) ---
 		right_col = QVBoxLayout()
-
 		# Set-Aktionen: Name / Speichern / Ausführen / Löschen
 		act_group = QGroupBox("Service-Set Aktionen")
 		act_layout = QVBoxLayout(act_group)
@@ -452,7 +454,7 @@ class IndicatorSettingsDialog(QDialog):
 		btn_row.addWidget(self.btn_delete_set)
 		act_layout.addLayout(btn_row)
 
-		right_col.addWidget(act_group)
+		right_col.addWidget(act_group, 0, Qt.AlignTop)
 
 		# Expert-Bereich (ausklappbar) mit Plugin-Metadaten
 		self.group_expert = QGroupBox("Experten-Optionen")
@@ -484,10 +486,17 @@ class IndicatorSettingsDialog(QDialog):
 			expert_form.addRow(self.plugin_labels.get(key, self._human(key)), ctrl)
 		expert_layout.addLayout(expert_form)
 
-		right_col.addWidget(self.group_expert)
-		right_col.addStretch(1)
+		right_col.addWidget(self.group_expert, 0, Qt.AlignTop)
+		# KEIN addStretch – die rechte Spalte bleibt auf Inhalt-Hoehe, damit die
+		# Hauptzeile so kompakt ist wie die hoechste Box und das Fenster direkt
+		# unter dem Preset-Block endet.
 
-		main_row.addLayout(right_col)
+		# QBoxLayout.addLayout() kennt keinen Alignments-Parameter (nur stretch).
+		# AlignTop wird stattdessen direkt auf dem Layout gesetzt, damit die
+		# rechte Spalte (Aktionen + Expert) oben beginnt – unabhängig davon,
+		# welche Box höher ist.
+		right_col.setAlignment(Qt.AlignTop)
+		main_row.addLayout(right_col, 0)
 		main_layout.addLayout(main_row)
 
 		# Initiale Set-Liste befüllen (list_sets() als Quelle, Roadmap §5.2)
