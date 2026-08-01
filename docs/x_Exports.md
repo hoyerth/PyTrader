@@ -126,6 +126,7 @@ PyTrader/
         check_marker_layers.js
         check_measurement.js
         check_mt5_m1_boundary.py
+        check_p13_s1.py
         check_phase12_step1_migration.py
         check_plugin_batch_services.py
         check_plugin_executor.py
@@ -12307,7 +12308,11 @@ from analytics.features.base_feature import BaseFeature
 from analytics.features.definitions.ema_diff import EMADiffFeature
 from analytics.features.definitions.atr_normalized import ATRNormalizedFeature
 from analytics.features.definitions.grid_levels import GridLevelsFeature
-from analytics.features.plugins.base_plugin import PluginFeature, FeatureCalculateResult
+from analytics.features.plugins.base_plugin import (
+    PluginFeature,
+    FeatureCalculateResult,
+    PluginContext,
+)
 from state_manager import StateManager
 from db_service import DbPool
 
@@ -12406,19 +12411,42 @@ class PluginExecutor:
     def __init__(self, registry: Optional[PluginRegistry] = None):
         self.registry = registry or PluginRegistry()
 
-    def execute(self, plugin_id: str, df: pd.DataFrame, params: Dict[str, any]) -> FeatureCalculateResult:
+    @staticmethod
+    def _call_calculate(
+        plugin: PluginFeature,
+        df: pd.DataFrame,
+        params: Dict[str, Any],
+        context: Optional[PluginContext] = None,
+    ) -> FeatureCalculateResult:
+        """Ruft plugin.calculate() auf – mit Context, falls das Plugin ihn
+        unterstützt. Plugins mit der alten Phase-12-Signatur calculate(df, params)
+        bleiben kompatibel (context ist Optional, Rückwärtskompatibilität)."""
+        sig = inspect.signature(plugin.calculate)
+        if "context" in sig.parameters:
+            return plugin.calculate(df, params, context=context)
+        return plugin.calculate(df, params)
+
+    def execute(
+        self,
+        plugin_id: str,
+        df: pd.DataFrame,
+        params: Dict[str, Any],
+        context: Optional[PluginContext] = None,
+    ) -> FeatureCalculateResult:
         plugin = self.registry.get(plugin_id)
 
-        # 1. Dependency Resolution (falls Abhängigkeiten angegeben sind)
+        # 1. Dependency Resolution (falls Abhängigkeiten angegeben sind) –
+        #    Context wird auch an Abhängigkeiten durchgereicht.
         for dep_id in plugin.dependencies:
             dep_plugin = self.registry.get(dep_id)
-            dep_plugin.calculate(df, dep_plugin.default_params)
+            self._call_calculate(dep_plugin, df, dep_plugin.default_params, context)
 
         # 2. Parametervalidierung
         validated_params = plugin.validate_params(params)
 
-        # 3. Stateless Execution
-        return plugin.calculate(df, validated_params)
+        # 3. Stateless Execution – Context (inkl. shared_state) wird durchgereicht,
+        #    damit Services den shared_state erreichen (Schritt 3 Evaluator).
+        return self._call_calculate(plugin, df, validated_params, context)
 
 
 class FeatureBuilder:
@@ -13193,21 +13221,27 @@ class GridLiquidityFeature(PluginFeature):
 ```py
 # analytics/features/plugins/base_plugin.py
 """
-Basisklasse & typisierte Verträge für das Plugin-System (Phase 12).
+Basisklasse & typisierte Verträge für das Plugin-System (Phase 12 + 13).
 
 Kernprinzip: STRICTE ZUSTANDSLOSIGKEIT. Plugins speichern niemals eigene
 Zustände oder Parameter. Jede Berechnung ist eine reine Funktion
-calculate(df, params). Das ermöglicht fehlerfreie Parallelisierung,
+calculate(df, params, context). Das ermöglicht fehlerfreie Parallelisierung,
 Thread-Sicherheit und eine klare Trennung zwischen Feature-Engine
 (FeatureStorePayload) und visuellem Indikator (ChartRenderPayload).
 
-Der Chart liest NIE direkt aus dem Feature-Store; der Scanner schreibt
-NIE aus dem Render-Payload.
+Feature-Store-Lese-Regel (präzisiert für Phase 13): Die INDIKATOR-Berechnung
+(GUI) liest NIE direkt aus dem Feature-Store; der Scanner schreibt NIE aus dem
+Render-Payload. Overlay-Konsumenten (SignalOverlay, Statistik) lesen den
+Feature-Store erst in Phase 13 Schritt 7.
 """
 
 from abc import ABC, abstractmethod
+from copy import copy as _shallow_copy
+from dataclasses import dataclass, field
 from typing import Dict, Any, List, TypedDict, Literal, Optional
 import pandas as pd
+
+from config.app_settings import AppSettings
 
 
 # ==============================================================================
@@ -13221,6 +13255,40 @@ class ParameterSchema(TypedDict, total=False):
     step: Optional[float]
     options: Optional[List[str]]
     description: str
+    expert: bool  # True → Prop im ausklappbaren Expert-Bereich (Default: False)
+
+
+# ==============================================================================
+# PluginContext & PluginCapabilities (Phase 13)
+# ==============================================================================
+class PluginCapabilities(TypedDict):
+    """Ersetzt das deprecated live_op (Cleanup in Phase 13 Schritt 7)."""
+    chart: bool          # als Chart-Indikator verfügbar
+    batch: bool          # in der Batch-Pipeline ausführbar
+    live: bool           # unterstützt Live-Ticks
+    feature_store: bool  # schreibt feature_data in feature_store
+    render: bool         # liefert chart_render_payload
+
+
+@dataclass
+class PluginContext:
+    """Immutabler Plugin-Kontext für die Service-/Plugin-Ausführung.
+
+    Grundprinzip: Services greifen NIE direkt auf Datenbanken oder globale
+    Settings zu – alles läuft über diesen Kontext.
+    """
+    symbol: str = ""
+    timeframe: str = ""
+    mode: Literal["chart", "batch", "live"] = "chart"
+    timestamp: Optional[int] = None  # epoch-Sekunden des Live-Ticks / der letzten Bar
+    shared_state: Dict[str, Any] = field(default_factory=dict)
+    settings: Optional[AppSettings] = None  # Kopie (kein globaler Zugriff)
+
+    def __post_init__(self) -> None:
+        # Settings werden als Kopie übergeben – mutieren der Ursprungs-Instanz
+        # darf den Context nicht beeinflussen (kein globaler Zugriff).
+        if self.settings is not None:
+            self.settings = _shallow_copy(self.settings)
 
 
 # ==============================================================================
@@ -13326,7 +13394,20 @@ class PluginFeature(ABC):
 
     @property
     def live_op(self) -> bool:
+        """DEPRECATED: wird durch capabilities['live'] ersetzt
+        (Cleanup in Phase 13 Schritt 7)."""
         return True
+
+    @property
+    def capabilities(self) -> PluginCapabilities:
+        """PluginCapabilities (Phase 13) – ersetzt live_op."""
+        return {
+            "chart": True,
+            "batch": True,
+            "live": self.live_op,
+            "feature_store": True,
+            "render": True,
+        }
 
     @property
     def dependencies(self) -> List[str]:
@@ -13340,33 +13421,82 @@ class PluginFeature(ABC):
         pass
 
     @property
+    def parameter_order(self) -> List[str]:
+        """Darstellungs-Reihenfolge der Props im Prop-Fenster.
+
+        Single Source of Truth: Kann an den ANFANG jeder Plugin-/Service-
+        Definition überschrieben werden. Default = Reihenfolge aus dem Schema.
+        """
+        return list(self.parameter_schema.keys())
+
+    @property
+    def param_labels(self) -> Dict[str, str]:
+        """Label-Namen der Props im Prop-Fenster.
+
+        Single Source of Truth: Kann an den ANFANG jeder Plugin-/Service-
+        Definition überschrieben werden. Default = description bzw.
+        humanisierter Parameter-Key.
+        """
+        labels: Dict[str, str] = {}
+        for key, spec in self.parameter_schema.items():
+            desc = spec.get("description", "")
+            labels[key] = desc if desc else key.replace("_", " ").title()
+        return labels
+
+    def is_expert_param(self, key: str) -> bool:
+        """True, wenn der Parameter mit expert=True markiert ist (Default: False)."""
+        return bool(self.parameter_schema.get(key, {}).get("expert", False))
+
+    @property
     def default_params(self) -> Dict[str, Any]:
         return {k: v["default"] for k, v in self.parameter_schema.items() if "default" in v}
 
     def validate_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Validiert Eingabeparameter gegen das Schema und setzt Defaults ein."""
+        """Validiert Eingabeparameter gegen das Schema und setzt Defaults ein.
+
+        min/max werden hart geclippt; step dient als Widget-Schrittweite im
+        Prop-Fenster (keine Rundung auf step im Validator).
+        """
         validated = {}
         schema = self.parameter_schema
         for key, spec in schema.items():
             val = params.get(key, spec.get("default"))
             p_type = spec.get("type")
-            if p_type == "float":
+
+            if val is None:
+                # Kein Default angegeben → typspezifischen Null-Wert verwenden
+                val = 0.0 if p_type == "float" else 0 if p_type == "int" else False if p_type == "bool" else ""
+            elif p_type == "float":
                 val = float(val)
             elif p_type == "int":
                 val = int(val)
             elif p_type == "bool":
                 val = bool(val)
 
-            if "min" in spec and val < spec["min"]:
-                val = spec["min"]
-            if "max" in spec and val > spec["max"]:
-                val = spec["max"]
+            try:
+                if "min" in spec and val < spec["min"]:
+                    val = spec["min"]
+                if "max" in spec and val > spec["max"]:
+                    val = spec["max"]
+            except TypeError:
+                # Nicht-vergleichbare Werte (z.B. bool/color) unverändert lassen
+                pass
+
             validated[key] = val
         return validated
 
     @abstractmethod
-    def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> FeatureCalculateResult:
-        """Stateless Berechnungslogik: Leseinput = df + validated_params."""
+    def calculate(
+        self,
+        df: pd.DataFrame,
+        params: Dict[str, Any],
+        context: Optional[PluginContext] = None,
+    ) -> FeatureCalculateResult:
+        """Stateless Berechnungslogik: Leseinput = df + validated_params.
+
+        Rückwärtskompatibilität Phase 12: calculate(df, params) ohne context
+        bleibt gültig (context ist Optional).
+        """
         pass
 
 ```
@@ -19932,6 +20062,259 @@ print(f"  Bars mit Wanduhr-Stunde 23: {in_pause} (in letzten {min(3000, len(t))}
 
 mt5.shutdown()
 print("\nFertig.")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_p13_s1.py
+```py
+# test/check_p13_s1.py
+# Headless-Validierung für Phase 13 Schritt 1 (Core-Interfaces).
+#
+# Validiert laut Roadmap §Schritt 1.3:
+#   - calculate mit UND ohne Context (Rückwärtskompatibilität Phase 12)
+#   - (a) PluginCapabilities-Felder vorhanden (chart/batch/live/feature_store/render)
+#   - (b) PluginContext enthält symbol/timeframe/mode/timestamp/settings/shared_state;
+#         settings ist eine KOPIE (kein globaler Zugriff)
+#   - (c) expert im ParameterSchema ist bool
+#   - (d) parameter_order/param_labels vollständig (Default aus Schema bzw. explizit)
+#   Zusätzlich:
+#   - PluginExecutor.execute reicht den Context (inkl. shared_state) durch
+#   - Alt-Plugin grid_liquidity (alte Signatur ohne context) bleibt via Executor kompatibel
+#
+# WICHTIG: Kein UI-Start (Regel Agents.md §4). Nur Core-Interfaces headless.
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import pandas as pd
+
+from config.app_settings import AppSettings
+from analytics.features.plugins.base_plugin import (
+    FeatureCalculateResult,
+    ParameterSchema,
+    PluginCapabilities,
+    PluginContext,
+    PluginFeature,
+)
+from analytics.features.feature_builder import PluginExecutor
+
+ok = True
+failures = []
+
+
+def check(cond, msg):
+    global ok
+    if cond:
+        print(f"   ✅ {msg}")
+    else:
+        ok = False
+        failures.append(msg)
+        print(f"   ❌ {msg}")
+
+
+# -----------------------------------------------------------------------------
+# Test-Plugin mit der NEUEN Signatur (calculate(df, params, context)) und
+# expliziten parameter_order/param_labels/expert/capabilities.
+# -----------------------------------------------------------------------------
+class P13TestPlugin(PluginFeature):
+    """Inline-Test-Plugin – wird NICHT in die Registry geladen."""
+
+    def __init__(self):
+        self.last_context: Optional[PluginContext] = None
+
+    @property
+    def plugin_id(self) -> str:
+        return "p13_test"
+
+    @property
+    def version(self) -> str:
+        return "2.0.0"
+
+    @property
+    def capabilities(self) -> PluginCapabilities:
+        return {
+            "chart": True,
+            "batch": True,
+            "live": False,
+            "feature_store": True,
+            "render": True,
+        }
+
+    @property
+    def parameter_schema(self) -> Dict[str, ParameterSchema]:
+        return {
+            "level": {"type": "float", "default": 1.0, "min": 0.1, "max": 10.0,
+                      "step": 0.1, "description": "Level-Wert", "expert": True},
+            "count": {"type": "int", "default": 3, "min": 1, "max": 20, "step": 1,
+                      "description": "Anzahl"},
+            "show": {"type": "bool", "default": True, "description": "Anzeigen"},
+        }
+
+    @property
+    def parameter_order(self) -> List[str]:
+        return ["show", "count", "level"]
+
+    @property
+    def param_labels(self) -> Dict[str, str]:
+        return {"show": "Anzeigen", "count": "Anzahl Level", "level": "Level-Wert"}
+
+    def calculate(
+        self,
+        df: pd.DataFrame,
+        params: Dict[str, Any],
+        context: Optional[PluginContext] = None,
+    ) -> FeatureCalculateResult:
+        self.last_context = context
+        return {"feature_store_payload": {"feature_id": self.plugin_id,
+                                           "plugin_version": self.version,
+                                           "records": [{"bar_time": 0}]},
+                "chart_render_payload": {}}
+
+
+class _MockRegistry:
+    """Minimal-Registry für den Executor-Durchreichtest (Test-Plugin ist nicht
+    in der Singleton-Registry registriert)."""
+
+    def __init__(self, plugin: PluginFeature):
+        self._p = plugin
+
+    def get(self, plugin_id: str) -> PluginFeature:
+        return self._p
+
+
+def main() -> int:
+    global ok
+    print("=" * 70)
+    print("Phase 13 Schritt 1 – Core-Interfaces (headless)")
+    print("=" * 70)
+
+    plugin = P13TestPlugin()
+
+    # (a) PluginCapabilities – alle 5 Felder vorhanden
+    print("\n[a] PluginCapabilities:")
+    caps = plugin.capabilities
+    req_caps = {"chart", "batch", "live", "feature_store", "render"}
+    check(isinstance(caps, dict), "capabilities ist ein Dict (PluginCapabilities)")
+    check(set(caps.keys()) == req_caps,
+          f"alle 5 Capabilities-Felder vorhanden (gefunden: {sorted(caps.keys())})")
+    check(all(isinstance(v, bool) for v in caps.values()), "alle Capability-Werte sind bool")
+
+    # (b) PluginContext – Felder + settings-Kopie
+    print("\n[b] PluginContext:")
+    settings_orig = AppSettings(statistics_signal_limit=10_000, chart_candle_limit=3000)
+    ctx = PluginContext(
+        symbol="XAUUSD",
+        timeframe="M1",
+        mode="live",
+        timestamp=1_700_000_000,
+        settings=settings_orig,
+    )
+    check(ctx.symbol == "XAUUSD", "Context.symbol vorhanden")
+    check(ctx.timeframe == "M1", "Context.timeframe vorhanden")
+    check(ctx.mode == "live", "Context.mode vorhanden")
+    check(ctx.timestamp == 1_700_000_000, "Context.timestamp (epoch-Sekunden) vorhanden")
+    check(isinstance(ctx.shared_state, dict), "Context.shared_state ist ein Dict")
+    check(ctx.settings is not None and isinstance(ctx.settings, AppSettings),
+          "Context.settings ist AppSettings")
+    # Kopie-Semantik: Mutieren der Ursprungs-Settings darf den Context NICHT ändern
+    settings_orig.statistics_signal_limit = 99
+    check(ctx.settings.statistics_signal_limit == 10_000,
+          "settings ist eine KOPIE (Ursprungs-Mutation wirkt nicht in den Context)")
+    check(ctx.settings is not settings_orig, "settings ist nicht die Ursprungs-Instanz")
+    # shared_state ist mutable und wird pro Namespace beschrieben
+    ctx.shared_state["grid_1"] = {"lines": [1.0, 2.0]}
+    check(ctx.shared_state["grid_1"]["lines"] == [1.0, 2.0],
+          "shared_state ist schreibbar (Namespace-Zugriff)")
+
+    # (c) expert im Schema ist bool
+    print("\n[c] ParameterSchema.expert:")
+    check(isinstance(plugin.parameter_schema["level"].get("expert"), bool),
+          "expert im Schema ist bool (True-Fall)")
+    check(plugin.parameter_schema["count"].get("expert", False) is False,
+          "expert ohne Angabe → Default False")
+    check(plugin.is_expert_param("level") is True, "is_expert_param('level') → True")
+    check(plugin.is_expert_param("count") is False, "is_expert_param('count') → False")
+
+    # (d) parameter_order / param_labels vollständig
+    print("\n[d] parameter_order / param_labels:")
+    schema_keys = set(plugin.parameter_schema.keys())
+    check(list(plugin.parameter_order) == ["show", "count", "level"],
+          "parameter_order explizit definiert (Definitionsdatei)")
+    check(set(plugin.parameter_order) == schema_keys,
+          "parameter_order deckt alle Schema-Keys ab")
+    check(all(k in plugin.param_labels for k in schema_keys),
+          "param_labels enthält alle Schema-Keys")
+    check(isinstance(plugin.param_labels["level"], str) and len(plugin.param_labels["level"]) > 0,
+          "param_labels sind nicht-leere Strings")
+
+    # calculate mit und ohne Context
+    print("\n[e] calculate mit/ohne Context:")
+    df = pd.DataFrame({"time": [1, 2, 3], "open": [10, 11, 12],
+                       "high": [12, 13, 14], "low": [9, 10, 11], "close": [11, 12, 13]})
+    params = {"level": 2.0, "count": 5, "show": True}
+
+    res_no_ctx = plugin.calculate(df, params)
+    check(isinstance(res_no_ctx, dict) and "feature_store_payload" in res_no_ctx,
+          "calculate(df, params) ohne Context funktioniert (Phase-12-Kompatibilität)")
+    check(plugin.last_context is None, "ohne Context ist last_context None")
+
+    res_with_ctx = plugin.calculate(df, params, context=ctx)
+    check(res_with_ctx["feature_store_payload"]["feature_id"] == "p13_test",
+          "calculate(df, params, context) funktioniert")
+    check(plugin.last_context is ctx, "Context wird an calculate durchgereicht")
+
+    # Executor reicht Context durch
+    print("\n[f] PluginExecutor.execute reicht Context durch:")
+    executor = PluginExecutor(registry=_MockRegistry(plugin))
+    res = executor.execute("p13_test", df, params, context=ctx)
+    check(isinstance(res, dict), "execute() liefert FeatureCalculateResult")
+    check(plugin.last_context is ctx, "Executor reicht Context (inkl. shared_state) durch")
+    check(plugin.last_context.shared_state.get("grid_1") is not None,
+          "shared_state ist im durchgereichten Context erreichbar")
+
+    # Abwärtskompatibilität: Alt-Plugin grid_liquidity (alte Signatur ohne context)
+    print("\n[g] Abwärtskompatibilität Alt-Plugin grid_liquidity:")
+    try:
+        ex_real = PluginExecutor()  # Singleton-Registry mit grid_liquidity
+        plugin_id = "grid_liquidity"
+        # Parameter-Schema des Alt-Plugins erwartet grid_step/proximity_threshold
+        alt_res = ex_real.execute(plugin_id, df, {"grid_step": 0.5, "proximity_threshold": 0.05})
+        check("feature_store_payload" in alt_res and "chart_render_payload" in alt_res,
+              "execute() mit Alt-Plugin (ohne context) funktioniert weiterhin")
+    except Exception as e:
+        check(False, f"Alt-Plugin execute() Fehler: {e}")
+
+    # Grid-liquidity liefert parameter_order/param_labels über den Default aus dem Schema
+    try:
+        from analytics.features.feature_builder import PluginRegistry
+        alt_plugin = PluginRegistry().get("grid_liquidity")
+        alt_keys = set(alt_plugin.parameter_schema.keys())
+        check(set(alt_plugin.parameter_order) == alt_keys,
+              "Alt-Plugin: parameter_order-Default vollständig (aus Schema)")
+        check(all(k in alt_plugin.param_labels for k in alt_keys),
+              "Alt-Plugin: param_labels-Default vollständig (aus Schema)")
+    except Exception as e:
+        check(False, f"Alt-Plugin Metadaten-Check Fehler: {e}")
+
+    print()
+    if ok:
+        print("RESULT: ALLE CHECKS BESTANDEN ✅")
+        return 0
+    print(f"RESULT: {len(failures)} CHECK(S) FEHLGESCHLAGEN ❌")
+    for f in failures:
+        print(f"   - {f}")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 
 ```
 
