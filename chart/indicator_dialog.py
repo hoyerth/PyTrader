@@ -50,6 +50,7 @@ from PySide6.QtWidgets import (
 )
 
 from chart.indicators.base_indicator import BaseIndicator
+from chart.widgets.color_button import ColorButton
 from state_manager import StateManager
 from scrollable_content import ContentScrollMixin
 
@@ -301,7 +302,19 @@ class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 			combo.currentTextChanged.connect(self.on_param_control_changed)
 			return combo
 
-		# color / str / sonstiges
+		if p_type == "color":
+			# 5.5 Feintuning (VERBINDLICH): Farbparameter IMMER als kompakter
+			# ColorButton rendern – nie als freies Textfeld (QLineEdit).
+			# allow_alpha aus dem Schema (Default True) schaltet den
+			# Transparenz-Slider im QColorDialog (ShowAlphaChannel) frei.
+			# Der Button liefert '#RRGGBB' (Alpha=255) bzw. 'rgba(r,g,b,a)'
+			# (Teil-Transparenz) – 1:1 kompatibel mit TradingView v5 / CSS.
+			allow_alpha = bool(spec.get("allow_alpha", True))
+			btn = ColorButton(default_color=str(val), enable_alpha=allow_alpha)
+			btn.colorChanged.connect(self.on_param_control_changed)
+			return btn
+
+		# str / sonstiges
 		txt = QLineEdit()
 		txt.setText(str(val))
 		txt.editingFinished.connect(self.on_param_control_changed)
@@ -317,6 +330,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 			return ctrl.value()
 		if isinstance(ctrl, QComboBox):
 			return ctrl.currentText()
+		if isinstance(ctrl, ColorButton):
+			return ctrl.color()
 		return ctrl.text()
 
 	# -------------------------------------------------------------------------
@@ -1091,6 +1106,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 						new_params[key] = default_val
 				else:
 					new_params[key] = raw_val
+			elif isinstance(ctrl, ColorButton):
+				new_params[key] = ctrl.color()
 			elif isinstance(ctrl, QLineEdit):
 				new_params[key] = ctrl.text()
 		return new_params
@@ -1107,6 +1124,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 					ctrl.setValue(val)
 				elif isinstance(ctrl, QComboBox):
 					ctrl.setCurrentText(str(val))
+				elif isinstance(ctrl, ColorButton) and isinstance(val, str):
+					ctrl.setColor(val)
 				elif isinstance(ctrl, QLineEdit) and isinstance(val, str):
 					ctrl.setText(val)
 

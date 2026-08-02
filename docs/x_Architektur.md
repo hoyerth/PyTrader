@@ -60,6 +60,20 @@ Um Rechenlast zu minimieren, werden Rohdaten (OHLCV) vorab transformiert:
 * DuckDB-Connections sind nicht thread-safe. PyTrader verwendet das Thread-Local Singleton `DbPool` (`db_service.py`), bei dem jeder Thread seine eigene Verbindung hält.
 * Dies verhindert File-Locking-Fehler unter Windows und erübrigt globale Threading-Locks auf Datenbankebene.
 
+### 2.5. Verbindliche UI-Regel: Farbwahl ausschließlich über `ColorButton`
+
+Farbwerte im gesamten UI werden **ausschließlich** über das kompakte Custom-Widget `ColorButton` (`chart/widgets/color_button.py`) erfasst – **niemals** über freie Texteingabefelder (`QLineEdit`) oder andere Eingabe-Typen.
+
+* **Geltungsbereich (VERBINDLICH):** Jeder Parameter vom Typ `"color"` im `ParameterSchema` einer Plugin- oder Service-Definition wird **IMMER** als `ColorButton` gerendert – in allen Formular-Generatoren (`indicator_dialog.py`, `service_win.py`) und für alle aktuellen wie zukünftigen Plugin-/Service-Definitionen. Ein Farbparameter ohne `ColorButton` ist ein Fehler.
+* **Alpha-Kanal:** Das optionale Schema-Flag `allow_alpha: bool` (Default `True`) schaltet den Transparenz-Slider im `QColorDialog` frei (`ShowAlphaChannel`).
+* **String-Format (CSS/Chart-kompatibel):**
+  * Alpha = 255 (volle Deckkraft) → Hex-Format `#RRGGBB`.
+  * Alpha < 255 (Teil-Transparenz) → `rgba(r, g, b, a)` (a als Float 0..1).
+  * Beide Formate sind 1:1 kompatibel mit TradingView Lightweight Charts v5 (WebEngine) und HTML/CSS.
+* **Persistenz:** Die von `ColorButton.color()` gelieferten Strings werden unversehrt in Presets, Service-Sets und Chart-State (`display_params`) gespeichert und über den `chart_render_payload` an die Chart-Overlays weitergereicht.
+* **Kompaktes Layout:** `ColorButton` hat eine feste Kompaktgröße (60×24 px) und `QSizePolicy.Fixed` – es blockiert die dynamische Höhen-/Breiten-Berechnung des Prop-Fensters nicht (Roadmap 5.5.2.1 Prämisse 3).
+* **Interaktion:** `colorChanged = Signal(str)` ist mit der Parameter-Aktualisierungs-Logik des Dialogs verknüpft (gleicher Callback wie alle anderen Controls).
+
 ---
 
 ## 3. Ordner- & Modul-Layout
@@ -80,6 +94,7 @@ PyTrader/
 │   ├── js/                         # Lightweight Charts v5 Module (01_core.js - 05_measurement.js)
 │   ├── indicators/                 # Chart-Indikatoren (grid.py, grid_liquidity.py)
 │   ├── overlays/                   # Signal-Marker Overlays
+│   ├── widgets/                    # Wiederverwendbare UI-Widgets (color_button.py)
 │   ├── chart_win.py                # PyTraderChartWindow (WebEngine-Container)
 │   └── indicator_dialog.py         # Generischer Einstellungs-Dialog
 ├── config/                         # App-Einstellungen & State-Modelle
