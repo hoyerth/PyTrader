@@ -1194,15 +1194,40 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		definition["services"] = services
 		return definition
 
-	def create_new_service_set(self) -> None:
-		"""Setzt den Editor zurück, um ein völlig neues Service-Set anzulegen.
+	def _generate_default_service_set_name(self) -> str:
+		"""Generiert einen vorgegebenen Namen aus Indikator-Name und Symbol.
 
-		5.6: Parität zur Preset-Verwaltung – „Neu / Leeren“ leert das
-		Namensfeld und die Set-Auswahl („- kein Set -“), setzt
-		_current_set_id/_current_set_definition auf None und baut den
-		Service-Stack auf den Default-Zustand (Indikator-Services mit
-		Default-Params) zurück. Die Service-Parameter des aktiven Plugins
-		(Live-Overlay) bleiben als Ausgangsbasis für das neue Set erhalten.
+		5.6.5: Vorschlag im Format '<Indikator-Name> - <Symbol>' (z. B.
+		'Grid Liquidity & Proximity - SILVER'). Priorität: Plugin-Metadaten-
+		display_name, dann Indikator-display_name, dann plugin_id, Fallback
+		'Set'; Symbol aus dem Dialog-Kontext, Fallback 'DEFAULT'.
+		"""
+		indicator_name: str = ""
+		meta = getattr(self.plugin, "metadata", None) or {}
+		if isinstance(meta, dict):
+			indicator_name = str(meta.get("display_name") or "").strip()
+		if not indicator_name:
+			dn = getattr(self.indicator, "display_name", None)
+			if dn and str(dn).strip():
+				indicator_name = str(dn).strip()
+		if not indicator_name and self.plugin is not None:
+			indicator_name = str(getattr(self.plugin, "plugin_id", "") or "").strip()
+		if not indicator_name:
+			indicator_name = "Set"
+		symbol = str(getattr(self, "symbol", None) or "DEFAULT").strip() or "DEFAULT"
+		return f"{indicator_name} - {symbol}"
+
+	def create_new_service_set(self) -> None:
+		"""Setzt den Editor zurück, um ein völlig neues Service-Set anzulegen,
+		und belegt das Namensfeld mit einem dynamischen Vorschlag vor.
+
+		5.6 + 5.6.5: Parität zur Preset-Verwaltung – „Neu / Leeren“ leert die
+		Set-Auswahl („- kein Set -“), setzt _current_set_id/_current_set_definition
+		auf None und baut den Service-Stack auf den Default-Zustand (Indikator-
+		Services mit Default-Params) zurück. Das Namensfeld wird danach mit
+		'<Indikator-Name> - <Symbol>' vorbelegt und der Text für die direkte
+		Bearbeitung markiert (selectAll + Fokus). Die Service-Parameter des
+		aktiven Plugins (Live-Overlay) bleiben als Ausgangsbasis erhalten.
 		"""
 		self._current_set_id = None
 		self._current_set_definition = None
@@ -1215,6 +1240,12 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		# _on_service_set_changed leert Namensfeld, baut combo_service_sel +
 		# Service-Stack neu und setzt self.params auf die Indikator-Default-Logik.
 		self._on_service_set_changed()
+		# 5.6.5: Namensfeld mit dynamischem Vorschlag vorbelegen + markieren.
+		default_name = self._generate_default_service_set_name()
+		if self.edit_set_name:
+			self.edit_set_name.setText(default_name)
+			self.edit_set_name.selectAll()
+			self.edit_set_name.setFocus()
 		if self._ui_ready:
 			self._reflow()
 
