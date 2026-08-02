@@ -39,7 +39,6 @@ from PySide6.QtWidgets import (
 	QHBoxLayout,
 	QInputDialog,
 	QLabel,
-	QLayout,
 	QLineEdit,
 	QMessageBox,
 	QPushButton,
@@ -52,6 +51,7 @@ from PySide6.QtWidgets import (
 
 from chart.indicators.base_indicator import BaseIndicator
 from state_manager import StateManager
+from scrollable_content import ContentScrollMixin
 
 
 class DialogServiceSetRunWorker(QThread):
@@ -132,7 +132,7 @@ class _ServiceStack(QStackedWidget):
 		self.updateGeometry()
 
 
-class IndicatorSettingsDialog(QDialog):
+class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 
 	# Gemeinsamer Geometrie-Key fuer ALLE Indikator-Einstellungsdialoge
 	# (gilt damit automatisch fuer alle Indikatoren, aktuelle & zukuenftige).
@@ -324,31 +324,44 @@ class IndicatorSettingsDialog(QDialog):
 	# -------------------------------------------------------------------------
 
 	def init_ui(self) -> None:
-		main_layout = QVBoxLayout(self)
+		# 5.4 User-Anforderung (Scrollbar für das gesamte Fenster,
+		# ContentScrollMixin): Das Fenster ist scrollbar, wenn der Inhalt
+		# höher/breiter als der Bildschirm ist; sonst exakt auf Inhaltgröße.
+		# Alles wird in ein Inhalt-Widget gepackt, das von einer
+		# ContentScrollArea umschlossen wird; die Fenstergröße wird auf den
+		# Bildschirm geklemmt (setMaximumSize). KEIN SetFixedSize auf dem
+		# Inhalt-Layout: QLayout.SetFixedSize würde das Inhalt-Widget auf die
+		# ERSTE Größe fixieren (setFixedSize) und späteres Wachstum (Service-
+		# Seiten, aufgeklappte Experten-Optionen) blockieren; die Klemme würde
+		# zudem das Screen-Cap überschreiben. resize_to_clamped_content() setzt
+		# das Inhalt-Widget in jedem Reflow explizit auf die Layout-Größe.
+		outer = QVBoxLayout(self)
+		outer.setContentsMargins(0, 0, 0, 0)
+
+		self._content_widget = QWidget()
+		content_layout = QVBoxLayout(self._content_widget)
+		content_layout.setSpacing(6)
+		content_layout.setAlignment(Qt.AlignTop)
 
 		plugin = self._get_plugin()
 		if plugin is not None:
-			self._init_plugin_ui(main_layout, plugin)
+			self._init_plugin_ui(content_layout, plugin)
 		else:
-			self._init_legacy_ui(main_layout)
+			self._init_legacy_ui(content_layout)
 			# Preset-Verwaltung (Legacy: unten, im eigenen Rahmen)
-			main_layout.addWidget(self._build_preset_group())
+			content_layout.addWidget(self._build_preset_group())
 
 		btn_close = QPushButton("Schließen")
 		btn_close.clicked.connect(self.accept)
-		main_layout.addWidget(btn_close)
+		content_layout.addWidget(btn_close)
 
-		# --- Phase 13 Schritt 5 Punkt 4 (VERBINDLICH): Vollständig dynamische
-		# Fenster- & Box-Größen – keine fixen Pixelwerte ---
-		# 4.2.5: Das Fenster schmiegt sich exakt an seinen Inhalt an (kein
-		# leerer Raum unter dem Preset-Block). Beim manuellen Aufziehen bleiben
-		# die Boxen dank AlignTop (4.6) auf ihrer Inhalt-Höhe verankert.
-		main_layout.setSpacing(6)
-		main_layout.setSizeConstraint(QLayout.SetFixedSize)
-		main_layout.setAlignment(Qt.AlignTop)
+		# ScrollArea umschließt den Inhalt (natürliche Größe); das Fenster wird
+		# auf den Bildschirm geklemmt (Scrollbars bei Überlänge, sonst exakt
+		# Inhaltgröße – ohne fixe Pixelwerte).
+		self.install_content_scroll(self._content_widget, parent_layout=outer)
 
 		self._ui_ready = True
-		self.adjustSize()
+		self._reflow()
 
 	def _init_legacy_ui(self, main_layout: QVBoxLayout) -> None:
 		"""Bisheriges Layout fuer Alt-Indikatoren ohne Plugin-Schema (z.B. 'grid')."""
@@ -591,11 +604,15 @@ class IndicatorSettingsDialog(QDialog):
 		Bei einem nicht angezeigten Dialog werden Show-Events nicht zugestellt,
 		wodurch das Haupt-Layout sonst seinen alten sizeHint behält. Durch
 		explizites invalidate() wird die Gesamthöhe immer frisch berechnet.
+
+		5.4 User-Anforderung: Die Fenstergröße wird DEFERRED auf
+		min(Inhalt, Bildschirm) gesetzt (ContentScrollMixin._schedule_reflow):
+		Beim Stack-Neuaufbau sind die alten Seiten per deleteLater() noch im
+		Widget-Baum; bis sie zerstört sind, liefern die Layout-Caches einen
+		veralteten sizeHint. _apply_reflow_size zerstört sie erst und misst
+		dann den konsistenten Inhalt.
 		"""
-		lay = self.layout()
-		if lay is not None:
-			lay.invalidate()
-		self.adjustSize()
+		self._schedule_reflow()
 
 	def refresh_service_set_list(self) -> None:
 		"""Befüllt das Set-Dropdown aus ServiceSetRepository.list_sets()."""

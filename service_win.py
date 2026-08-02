@@ -16,14 +16,17 @@ from typing import Any, Dict, Optional
 from PySide6.QtCore import QFile, QIODevice, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMessageBox, QProgressBar, QPushButton, QTextEdit, QWidget,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
+    QProgressBar, QPushButton, QSizePolicy, QSpinBox, QTextEdit, QVBoxLayout,
+    QWidget,
 )
 
 from analytics.background_workers.historical_scanner import HistoricalScanner
 from analytics.engine.service_set_repository import ServiceSetRepository
 from analytics.engine.set_evaluator import ServiceSetEvaluator
 from persistent_win import PersistentWindow, register_persistent_window
+from scrollable_content import ContentScrollMixin
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -83,7 +86,7 @@ class ServiceSetRunWorker(QThread):
 
 
 @register_persistent_window(auto_restore=False)
-class ServiceWindow(PersistentWindow):
+class ServiceWindow(ContentScrollMixin, PersistentWindow):
     INSTANCE_ID = "win_service"
 
     def __init__(self, parent=None, service_set_repo: Optional[ServiceSetRepository] = None):
@@ -98,6 +101,7 @@ class ServiceWindow(PersistentWindow):
         self.set_evaluator = ServiceSetEvaluator()
         self._set_run_worker: Optional[ServiceSetRunWorker] = None
         self._current_set_id: Optional[str] = None
+        self._current_set_definition: Optional[Dict[str, Any]] = None
 
         # UI laden
         ui_file = QFile(str(BASE_DIR / "ui" / "service_win.ui"))
@@ -135,6 +139,58 @@ class ServiceWindow(PersistentWindow):
         self.btn_save_set: QPushButton = self.ui.findChild(QPushButton, "btn_save_set")
         self.btn_delete_set: QPushButton = self.ui.findChild(QPushButton, "btn_delete_set")
         self.btn_execute_set: QPushButton = self.ui.findChild(QPushButton, "btn_execute_set")
+
+        # Phase 13 5.4 Schritt 1: Dynamische Service-Spalten (Breite/Höhe aus
+        # dem Inhalt – KEINE fixen Pixelwerte). Das Inhalt-Layout erhält
+        # SetFixedSize + AlignTop|AlignLeft: Das Fenster wächst mit der Anzahl
+        # der Spalten nach rechts und beim Ausklappen der Experten-Optionen
+        # nach unten – ohne leeren Raum (Roadmap 5.4.2.2 Punkt 3).
+        #
+        # WICHTIG: Der Spalten-Container wird IM CODE erzeugt (nicht per
+        # QUiLoader). Das QWidgetItem QUiLoader-erzeugter Widgets meldet nach
+        # einer späteren Layout-Änderung einen veralteten sizeHint (Qt-Quirk:
+        # 18x18 bzw. alter Gruppenstand), wodurch die Fensterbreite nicht mit
+        # der Spaltenanzahl wachsen würde. Im Code erzeugte Widgets (wie die
+        # Spalten selbst) werden korrekt weitergereicht.
+        self.group_service_sets: Optional[QGroupBox] = self.ui.findChild(QGroupBox, "group_service_sets")
+        self.widget_service_columns = QGroupBox("Service-Parameter")
+        self.widget_service_columns.setObjectName("widget_service_columns")
+        self.service_columns_layout = QHBoxLayout(self.widget_service_columns)
+        self.service_columns_layout.setSpacing(6)
+        # Inhalt-Widget + Layout VOR dem Scroll-Wrapper referenzieren
+        # (install_content_scroll ersetzt das CentralWidget von self.ui).
+        self.content_widget = self.ui.centralWidget()
+        self.central_layout = self.content_widget.layout() if self.content_widget else None
+        if self.central_layout is not None:
+            # 5.4 User-Anpassung: 'Service-Parameter' oben RECHTS direkt neben
+            # dem Rahmen 'Service-Sets' (gleiche Zeile, Service-Sets links).
+            self.top_row = QHBoxLayout()
+            self.top_row.setSpacing(6)
+            idx = self.central_layout.indexOf(self.group_service_sets)
+            if idx < 0:
+                idx = 0
+            self.central_layout.removeWidget(self.group_service_sets)
+            self.top_row.addWidget(self.group_service_sets)
+            self.top_row.addWidget(self.widget_service_columns)
+            self.central_layout.insertLayout(idx, self.top_row)
+        # Scroll-Wrapper: gesamtes Fenster scrollbar, wenn Inhalt > Bildschirm
+        # (ContentScrollMixin). Der Inhalt behält seine natürliche Größe; das
+        # Fenster wird auf den Bildschirm geklemmt (Scrollbars erscheinen erst,
+        # wenn der Inhalt den Viewport übersteigt).
+        self.install_content_scroll(self.content_widget, install_to=self.ui)
+        self.main_layout = self.ui.layout()
+        # KEIN SetFixedSize auf dem QMainWindowLayout: das würde die
+        # Fenstergröße auf den Inhalt fixieren und das Bildschirm-Cap
+        # (setMaximumSize) überschreiben. Auch das INHALT-Layout bekommt KEIN
+        # SetFixedSize: QLayout.SetFixedSize ruft setFixedSize() auf dem
+        # Inhalt-Widget auf und fixiert es auf die ERSTE Layout-Größe – späteres
+        # Wachstum (Service-Spalten, Experten-Optionen) wäre dadurch blockiert.
+        # Stattdessen setzt resize_to_clamped_content() das Inhalt-Widget in
+        # jedem Reflow explizit auf die aktuelle Layout-Größe (ContentScrollMixin).
+        if self.central_layout is not None:
+            self.central_layout.setSpacing(6)
+            self.central_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self._service_param_controls: Dict[Any, QWidget] = {}
 
         if self.btn_start:
             self.btn_start.clicked.connect(self.start_scan)
@@ -284,10 +340,12 @@ class ServiceWindow(PersistentWindow):
     def _clear_set_editor(self) -> None:
         """Leert Name-Feld und execution_order-Liste des Set-Editors."""
         self._current_set_id = None
+        self._current_set_definition = None
         if self.edit_set_name:
             self.edit_set_name.clear()
         if self.list_execution_order:
             self.list_execution_order.clear()
+        self._clear_service_columns()
 
     @Slot(int)
     def _on_set_selected(self, index: int) -> None:
@@ -303,8 +361,13 @@ class ServiceWindow(PersistentWindow):
             self.log(f"Set geladen: {set_id}")
 
     def load_set_into_editor(self, definition: Dict[str, Any]) -> None:
-        """Überträgt eine ServiceSetDefinition in Name-Feld + execution_order-Liste."""
+        """Überträgt eine ServiceSetDefinition in Name-Feld + execution_order-Liste.
+
+        Phase 13 5.4 Schritt 1: Baut zusätzlich die dynamischen Service-Spalten
+        (eine QGroupBox pro Service mit Parameter-Formular) auf.
+        """
         self._current_set_id = definition.get("set_id")
+        self._current_set_definition = definition
         if self.edit_set_name:
             self.edit_set_name.setText(definition.get("display_name") or "")
         if self.list_execution_order:
@@ -317,6 +380,7 @@ class ServiceWindow(PersistentWindow):
                 item.setData(Qt.UserRole, iid)
                 item.setData(Qt.UserRole + 1, plugin_id)
                 self.list_execution_order.addItem(item)
+        self._build_service_columns(definition)
 
     def collect_current_order(self) -> list:
         """Liefert die instance_ids aus der Liste (aktuelle execution_order)."""
@@ -342,6 +406,7 @@ class ServiceWindow(PersistentWindow):
         item = lw.takeItem(row)
         lw.insertItem(new_row, item)
         lw.setCurrentRow(new_row)
+        self._rebuild_columns()
 
     @Slot()
     def remove_instance(self) -> None:
@@ -350,6 +415,7 @@ class ServiceWindow(PersistentWindow):
         if not lw or lw.currentRow() < 0:
             return
         lw.takeItem(lw.currentRow())
+        self._rebuild_columns()
 
     @Slot()
     def add_instance(self) -> None:
@@ -390,13 +456,16 @@ class ServiceWindow(PersistentWindow):
         self.list_execution_order.addItem(item)
         self.edit_new_instance.clear()
         self.log(f"Service hinzugefügt: {iid} [{plugin_id}]")
+        self._rebuild_columns()
 
     def collect_set_definition(self) -> Dict[str, Any]:
         """Baut aus dem Editor eine ServiceSetDefinition.
 
-        Für ein geladenes Set werden die services aus der DB übernommen.
-        Für ein NEUES Set werden die services aus den Listeneinträgen
-        aufgebaut (plugin_id + Default-Params aus der Registry).
+        Für ein geladenes Set werden die services aus der DB übernommen;
+        für neue Instanzen (bzw. neue Sets) werden die services aus den
+        Listeneinträgen aufgebaut (plugin_id + Default-Params aus der
+        Registry). Die Werte der dynamischen Service-Spalten (5.4 Schritt 1)
+        werden anschließend in die services-Konfiguration übernommen.
         """
         order = self.collect_current_order()
         services: Dict[str, Any] = {}
@@ -404,16 +473,18 @@ class ServiceWindow(PersistentWindow):
             existing = self.set_repo.get_set(self._current_set_id) or {}
             services = dict(existing.get("services") or {})
 
-        if not services:
-            from analytics.features.feature_builder import PluginRegistry
-            registry = PluginRegistry()
-            if self.list_execution_order:
-                for i in range(self.list_execution_order.count()):
-                    item = self.list_execution_order.item(i)
-                    iid = item.data(Qt.UserRole)
-                    plugin_id = item.data(Qt.UserRole + 1)
-                    if not iid or not plugin_id:
-                        continue
+        # Jede Instanz in der Reihenfolge braucht eine services-Konfiguration –
+        # neue Instanzen erhalten Default-Params aus der Registry.
+        from analytics.features.feature_builder import PluginRegistry
+        registry = PluginRegistry()
+        if self.list_execution_order:
+            for i in range(self.list_execution_order.count()):
+                item = self.list_execution_order.item(i)
+                iid = item.data(Qt.UserRole)
+                plugin_id = item.data(Qt.UserRole + 1) or iid
+                if not iid:
+                    continue
+                if iid not in services:
                     try:
                         plugin = registry.get(plugin_id)
                         cfg: Dict[str, Any] = {
@@ -425,12 +496,261 @@ class ServiceWindow(PersistentWindow):
                         cfg = {"plugin_id": plugin_id, "lookback": 1000, "params": {}}
                     services[iid] = cfg
 
+        # Werte aus den dynamischen Service-Spalten übernehmen.
+        # lookback ist die Service-Instanz-Einstellung (ServiceInstanceConfig.
+        # lookback) und wird NICHT in params geschrieben.
+        for (iid, key), ctrl in self._service_param_controls.items():
+            cfg = services.setdefault(iid, {"plugin_id": "", "lookback": 1000, "params": {}})
+            if key == "lookback":
+                cfg["lookback"] = int(self._ctrl_value(ctrl))
+            else:
+                cfg.setdefault("params", {})[key] = self._ctrl_value(ctrl)
+
         return {
             "set_id": self._current_set_id or "",
             "display_name": self.edit_set_name.text().strip() if self.edit_set_name else "",
             "execution_order": order,
             "services": services,
         }
+
+    # =========================================================================
+    # Phase 13 5.4 Schritt 1: Breiten- & Höhendynamisches Layout (Service-Spalten)
+    # =========================================================================
+
+    @staticmethod
+    def _is_visual_key(key: str) -> bool:
+        """Konvention für reine Darstellungs-Props: Sichtbarkeit (show_*) + Farben (color).
+
+        Darstellungs-Parameter gehören NICHT ins Service-Set (nur Berechnungs-
+        Logik, Roadmap 5.4.1.2) und werden daher in den Service-Spalten
+        ausgeblendet (konsistent zum Indikator-Dialog).
+        """
+        if key.startswith("show_"):
+            return True
+        if "color" in key.lower():
+            return True
+        return False
+
+    @staticmethod
+    def _human(key: str) -> str:
+        return key.replace("_", " ").title()
+
+    @staticmethod
+    def _decimal_places(value: Any) -> int:
+        """Nachkommastellen eines float (für QDoubleSpinBox.setDecimals)."""
+        if not isinstance(value, float) or value != value:  # NaN-Schutz
+            return 4
+        s = f"{value:.10f}".rstrip("0")
+        if "." in s:
+            return len(s.split(".")[1])
+        return 0
+
+    def _create_param_control(self, key: str, val: Any, spec: Dict[str, Any]) -> QWidget:
+        """Erzeugt ein Eingabe-Widget exakt aus dem ParameterSchema.
+
+        float -> QDoubleSpinBox, int -> QSpinBox, bool -> QCheckBox,
+        choice -> QComboBox, color/str -> QLineEdit. min/max/step werden 1:1
+        übertragen (Roadmap 5.4.2.2).
+        """
+        p_type = spec.get("type")
+        if p_type == "float":
+            spin = QDoubleSpinBox()
+            spin.setRange(float(spec.get("min", -1e9)), float(spec.get("max", 1e9)))
+            step = spec.get("step")
+            decimals = self._decimal_places(step) if step is not None else self._decimal_places(spec.get("default"))
+            spin.setDecimals(min(6, max(0, decimals)))
+            spin.setSingleStep(float(step) if step is not None else 0.01)
+            try:
+                spin.setValue(float(val))
+            except (TypeError, ValueError):
+                spin.setValue(float(spec.get("default", 0.0)))
+            return spin
+        if p_type == "int":
+            spin = QSpinBox()
+            spin.setRange(int(spec.get("min", -100000)), int(spec.get("max", 100000)))
+            spin.setSingleStep(int(spec.get("step", 1)))
+            try:
+                spin.setValue(int(val))
+            except (TypeError, ValueError):
+                spin.setValue(int(spec.get("default", 0)))
+            return spin
+        if p_type == "bool":
+            chk = QCheckBox()
+            chk.setChecked(bool(val))
+            return chk
+        if p_type == "choice":
+            combo = QComboBox()
+            combo.addItems([str(o) for o in (spec.get("options") or [])])
+            combo.setCurrentText(str(val))
+            return combo
+        txt = QLineEdit()
+        txt.setText(str(val))
+        return txt
+
+    @staticmethod
+    def _ctrl_value(ctrl: QWidget) -> Any:
+        """Liest den aktuellen Wert eines Controls typsicher aus."""
+        if isinstance(ctrl, QCheckBox):
+            return ctrl.isChecked()
+        if isinstance(ctrl, QSpinBox):
+            return ctrl.value()
+        if isinstance(ctrl, QDoubleSpinBox):
+            return ctrl.value()
+        if isinstance(ctrl, QComboBox):
+            return ctrl.currentText()
+        return ctrl.text()
+
+    def _setup_collapsible(self, group: QGroupBox) -> None:
+        """Macht eine ausklappbare QGroupBox wirklich kollabierbar.
+
+        Beim Abwählen werden die Kinder ausgeblendet und die Fensterhöhe per
+        _reflow() nahtlos verkleinert (Roadmap 5.4.2.2: Ein-/Ausklappen
+        verändert die Höhe dynamisch). Zusätzlich wird group.updateGeometry()
+        gerufen, damit der gecachte QWidgetItemV2-sizeHint der Box invalidiert
+        wird (Qt 6.11: Layouts refreshen diesen Cache sonst NICHT).
+        """
+        def _toggle(checked: bool) -> None:
+            for child in group.findChildren(QWidget):
+                child.setVisible(checked)
+            group.updateGeometry()  # QWidgetItemV2-Cache invalidieren (s. oben)
+            self._reflow()
+        group.toggled.connect(_toggle)
+        _toggle(group.isChecked())
+
+    def _reflow(self) -> None:
+        """Erzwingt die Neuberechnung der Layouts (dynamische Höhe/Breite).
+
+        Qt 6.11: QWidgetItemV2 cached den sizeHint eines Widgets beim ersten
+        Zugriff und aktualisiert ihn NICHT, wenn der Inhalt später wächst –
+        selbst layout.invalidate() hilft nicht. Daher werden die Caches der
+        betroffenen Widgets explizit per updateGeometry() invalidiert
+        (invalidateSizeCache) und die Layout-Caches geleert.
+
+        WICHTIG: Die Fenstergröße wird DEFERRED (nächste Event-Loop-Runde)
+        angepasst. Beim Set-Wechsel sind die alten Service-Spalten per
+        deleteLater() noch im Widget-Baum; bis sie zerstört sind, melden die
+        Layout-Caches einen veralteten (zu kleinen) sizeHint (z.B. 18x18 für
+        eine volle Spalten-Zeile). Ein synchrones resize würde das Fenster
+        daher fälschlich schrumpfen. _schedule_reflow() zerstört die
+        deleteLater-Widgets und berechnet die Größe erst aus dem konsistenten
+        Zustand (ContentScrollMixin).
+        """
+        self._schedule_reflow()
+
+    def _clear_service_columns(self) -> None:
+        """Entfernt alle Service-Spalten aus dem service_columns_layout."""
+        if self.service_columns_layout is None:
+            return
+        while self.service_columns_layout.count():
+            item = self.service_columns_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._service_param_controls = {}
+
+    def _build_service_columns(self, set_definition: Dict[str, Any]) -> None:
+        """Baut die dynamischen Service-Spalten (Roadmap 5.4.2.2).
+
+        Für jede instance_id in execution_order wird eine QGroupBox-Spalte im
+        service_columns_layout erzeugt. Jede Spalte skaliert in der Höhe exakt
+        mit der Anzahl ihrer Parameter (QSizePolicy.Maximum); die Fensterbreite
+        wächst mit der Anzahl der Spalten nach rechts – ohne leeren Raum und
+        ohne fixe Pixelwerte.
+        """
+        if self.service_columns_layout is None:
+            return
+        self._clear_service_columns()
+        services = set_definition.get("services") or {}
+        for iid in (set_definition.get("execution_order") or []):
+            cfg = services.get(iid) or {}
+            pid = cfg.get("plugin_id") or iid
+            col = self._build_service_column(iid, pid, cfg)
+            self.service_columns_layout.addWidget(col)
+        # Container erneut in die obere Zeile einfügen: Das QWidgetItem
+        # eines Widgets meldet dessen Größe zum Zeitpunkt des Einfügens und
+        # aktualisiert sich bei späterem Inhalts-Wachstum nicht (Qt-Quirk).
+        # Entfernen + erneutes Einfügen erzeugt ein frisches QWidgetItem mit
+        # der aktuellen Größe.
+        if self.top_row is not None and self.widget_service_columns is not None:
+            self.top_row.removeWidget(self.widget_service_columns)
+            self.top_row.addWidget(self.widget_service_columns)
+        self._reflow()
+
+    def _build_service_column(self, iid: str, pid: str, cfg: Dict[str, Any]) -> QGroupBox:
+        """Erzeugt EINE Service-Spalte (QGroupBox) mit Parameter-Formular.
+
+        - Normale Parameter im QFormLayout (float/int/bool nach Schema).
+        - expert: True (inkl. lookback) in einer einklappbaren
+          QGroupBox 'Experten-Optionen' am Spaltenfuß.
+        """
+        col = QGroupBox(f"{iid}  [{pid}]")
+        # 5.4.2.2 Punkt 3: Spalte skaliert in der Höhe exakt mit ihrem Inhalt
+        # (endet unter dem letzten Parameter), wächst beim Vergrößern des
+        # Fensters NICHT mit.
+        col.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        vl = QVBoxLayout(col)
+        vl.setAlignment(Qt.AlignTop)
+
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            plugin = PluginRegistry().get(pid)
+        except KeyError:
+            vl.addWidget(QLabel(f"Plugin '{pid}' nicht gefunden."))
+            return col
+
+        full_schema: Dict[str, Any] = dict(getattr(plugin, "base_parameter_schema", None) or {})
+        full_schema.update(dict(plugin.parameter_schema or {}))
+        order = list(getattr(plugin, "parameter_order", None) or (plugin.parameter_schema or {}).keys())
+        for key in (getattr(plugin, "base_parameter_schema", None) or {}):
+            if key not in order:
+                order.append(key)
+        labels = dict(getattr(plugin, "param_labels", None) or {})
+        for key, spec in (getattr(plugin, "base_parameter_schema", None) or {}).items():
+            labels.setdefault(key, spec.get("description") or self._human(key))
+
+        params = dict(cfg.get("params") or {})
+        lookback = cfg.get("lookback")
+
+        # Normale (Nicht-Expert-, Nicht-Darstellungs-)Parameter
+        form = QFormLayout()
+        for key in order:
+            spec = full_schema.get(key, {})
+            if spec.get("expert") or self._is_visual_key(key):
+                continue
+            cval = params.get(key, spec.get("default"))
+            ctrl = self._create_param_control(key, cval, spec)
+            self._service_param_controls[(iid, key)] = ctrl
+            form.addRow(labels.get(key, self._human(key)), ctrl)
+        vl.addLayout(form)
+
+        # Expert-Parameter (inkl. lookback als Service-Instanz-Einstellung)
+        expert_keys = [k for k in order if full_schema.get(k, {}).get("expert")]
+        if expert_keys:
+            exp_grp = QGroupBox("Experten-Optionen")
+            exp_grp.setCheckable(True)
+            exp_grp.setChecked(False)
+            exp_grp.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+            ef = QFormLayout(exp_grp)
+            for key in expert_keys:
+                spec = full_schema.get(key, {})
+                if key == "lookback":
+                    cval = lookback if lookback is not None else spec.get("default")
+                else:
+                    cval = params.get(key, spec.get("default"))
+                ctrl = self._create_param_control(key, cval, spec)
+                self._service_param_controls[(iid, key)] = ctrl
+                ef.addRow(labels.get(key, self._human(key)), ctrl)
+            vl.addWidget(exp_grp)
+            self._setup_collapsible(exp_grp)
+
+        return col
+
+    def _rebuild_columns(self) -> None:
+        """Baut die Service-Spalten aus dem aktuellen Editor-Zustand neu."""
+        if self.service_columns_layout is None:
+            return
+        definition = self.collect_set_definition()
+        self._build_service_columns(definition)
 
     @Slot()
     def save_set(self) -> None:
