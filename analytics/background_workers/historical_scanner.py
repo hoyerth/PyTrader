@@ -152,9 +152,6 @@ class HistoricalScanner(QThread):
                     self.log_message.emit(f"  {tf}: Plugin {plugin_id} Store-Fehler: {e}")
 
     def run(self):
-        import duckdb
-        import pandas as pd
-        import uuid
         from pathlib import Path
 
         from db_service import DbPool
@@ -204,11 +201,13 @@ class HistoricalScanner(QThread):
                     self._run_plugin_batch(df_ohlcv, tf, active_plugins)
 
                 # 2. Delta-Update: Nur neue Bars scannen
+                # (Phase 13 Schritt 7.B: Anker ist der feature_store statt
+                # signal_results – es finden keine signal_results-Writes mehr statt.)
                 if not self.new_scan:
                     con = DbPool.get(DB_ANALYTICS)
                     last_signal = con.execute("""
-                        SELECT MAX(bar_time) FROM signal_results
-                        WHERE symbol = ? AND timeframe = ? AND source_id = ?
+                        SELECT MAX(bar_time) FROM feature_store
+                        WHERE symbol = ? AND timeframe = ? AND feature_id = ?
                     """, [self.symbol, tf, source_id]).fetchone()[0]
 
                     if last_signal is not None:
@@ -242,46 +241,31 @@ class HistoricalScanner(QThread):
                     self.log_message.emit(f"  {tf}: Keine Signale gefunden")
                     continue
 
-                # 6. In signal_results schreiben
-                con = DbPool.get(DB_ANALYTICS)
-                # Bei Full-Scan: Alte Signale loeschen (nur fuer diese source_id)
-                if self.new_scan:
-                    con.execute("""
-                        DELETE FROM signal_results
-                        WHERE symbol = ? AND timeframe = ? AND source_id = ?
-                    """, [self.symbol, tf, source_id])
-
-                # Neue Signale vorbereiten
-                from datetime import timezone, datetime as _dt
-                rows_to_insert = []
+                # 6. Hits als feature_store-Records schreiben (feature_id =
+                #    source_id). Phase 13 Schritt 7.B: KEINE signal_results
+                #    mehr – die Marker/Statistik lesen feature_data.
+                records: List[Dict[str, Any]] = []
                 for _, row in signals.iterrows():
                     bt = row["bar_time"]
-                    # pandas Timestamp -> timezone-aware datetime UTC
-                    if hasattr(bt, "to_pydatetime"):
-                        bt_dt = bt.to_pydatetime().replace(tzinfo=timezone.utc)
-                    elif isinstance(bt, (int, float)):
-                        bt_dt = _dt.fromtimestamp(int(bt), tz=timezone.utc)
-                    else:
-                        bt_dt = bt
-                    rows_to_insert.append((
-                        str(uuid.uuid4()),
-                        self.symbol,
-                        tf,
-                        bt_dt,
-                        source_id,
-                        float(row["confidence_total"]),
-                        "historical_batch",
-                        '{}',
-                    ))
+                    records.append({
+                        "bar_time": bt,
+                        "is_hit": True,
+                        "confidence_total": float(row["confidence_total"]),
+                        "signal_binary": 1,
+                        "source_id": source_id,
+                    })
 
-                if rows_to_insert:
-                    con.executemany("""
-                        INSERT INTO signal_results (event_id, symbol, timeframe, bar_time, source_id, confidence, context_type, metadata_payload)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """, rows_to_insert)
-
-                self.log_message.emit(f"  {tf}: {len(rows_to_insert)} Signale geschrieben")
-                total_signals += len(rows_to_insert)
+                try:
+                    n = self.feature_builder.store_plugin_payload(
+                        self.symbol, tf,
+                        {"feature_id": source_id, "plugin_version": "1.0.0",
+                         "records": records},
+                    )
+                except Exception as e:
+                    n = 0
+                    self.log_message.emit(f"  {tf}: FEHLER beim feature_store-Write: {e}")
+                self.log_message.emit(f"  {tf}: {n} Hit-Rows in feature_store geschrieben")
+                total_signals += n
 
             except Exception as e:
                 self.log_message.emit(f"  {tf}: FEHLER: {e}")

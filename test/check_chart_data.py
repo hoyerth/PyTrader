@@ -26,17 +26,20 @@ for sym, tf in pairs:
     except Exception as e:
         print(f"{sym:7s} {tf:4s} -> ERROR: {e}")
 
-# Marker-Query (SignalOverlay.fetch_markers)
+# Marker-Query (SignalOverlay.fetch_markers) – Phase 13 7.B: feature_store
+# (feature_data, feature_id), KEIN signal_results-Fallback mehr.
 acon = duckdb.connect(str(ANALYTICS), read_only=True)
-print("\n--- fetch_markers queries ---")
-for sym, tf, sid in [("SILVER", "H1", "grid_proximity_v1"), ("SILVER", "M5", "grid_proximity_v1"),
-                     ("GOLD", "H1", "grid_proximity_v1")]:
+print("\n--- fetch_markers queries (feature_store, feature_id) ---")
+for sym, tf, fid in [("SILVER", "H1", "grid_proximity_v1"), ("SILVER", "M5", "grid_proximity_v1"),
+                     ("GOLD", "H1", "grid_proximity_v1"),
+                     ("SILVER", "H1", "ema_atr_set_v1"), ("SILVER", "H1", "proximity")]:
     try:
         rows = acon.execute("""
-            SELECT EXTRACT(epoch FROM bar_time)::BIGINT AS time_epoch, confidence, metadata_payload
-            FROM (SELECT bar_time, confidence, metadata_payload FROM signal_results
-                  WHERE symbol = ? AND timeframe = ? AND source_id = ?
-                  ORDER BY bar_time DESC LIMIT 500) ORDER BY bar_time ASC""", [sym, tf, sid]).fetchall()
-        print(f"{sym:7s} {tf:4s} {sid:20s} -> {len(rows)} markers")
+            SELECT EXTRACT(epoch FROM bar_time)::BIGINT AS time_epoch, feature_data
+            FROM (SELECT bar_time, feature_data FROM feature_store
+                  WHERE symbol = ? AND timeframe = ? AND feature_id = ?
+                    AND feature_data IS NOT NULL
+                  ORDER BY bar_time DESC LIMIT 500) ORDER BY bar_time ASC""", [sym, tf, fid]).fetchall()
+        print(f"{sym:7s} {tf:4s} {fid:20s} -> {len(rows)} markers")
     except Exception as e:
-        print(f"{sym:7s} {tf:4s} {sid:20s} -> ERROR: {e}")
+        print(f"{sym:7s} {tf:4s} {fid:20s} -> ERROR: {e}")

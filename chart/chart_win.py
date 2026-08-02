@@ -51,7 +51,6 @@ except ImportError:
 from db_service import MarketDataRepository, _parse_json_field, TF_SECONDS_MAP
 
 from chart.overlays.signal_overlay import SignalOverlay
-from analytics.background_workers.live_analyzer import fill_gaps_for_pair
 
 
 def find_null_fields(obj, path=""):
@@ -902,8 +901,8 @@ class PyTraderChartWindow(QMainWindow):
                 self.visible_price_from = self.visible_price_to = None
                 self.measurement_state = None
 
-            # Chart-Trigger: Luecken fuer live_op=True Signale fuellen
-            fill_gaps_for_pair(self.current_symbol, self.current_tf, self.settings.feature_builder_limit)
+            # Phase 13 7.B: Alt-Chart-Trigger (fill_gaps_for_pair) entfernt –
+            # keine signal_results-Writes mehr. Marker lesen feature_store.
             self.refresh_chart_data()
 
     def on_tf_changed(self, t):
@@ -938,8 +937,8 @@ class PyTraderChartWindow(QMainWindow):
                 self.visible_price_from = self.visible_price_to = None
                 self.measurement_state = None
 
-            # Chart-Trigger: Luecken fuer live_op=True Signale fuellen
-            fill_gaps_for_pair(self.current_symbol, self.current_tf, self.settings.feature_builder_limit)
+            # Phase 13 7.B: Alt-Chart-Trigger (fill_gaps_for_pair) entfernt –
+            # keine signal_results-Writes mehr. Marker lesen feature_store.
             self.refresh_chart_data()
 
     def on_signal_button_clicked(self):
@@ -1053,10 +1052,10 @@ class PyTraderChartWindow(QMainWindow):
         markers: List[Dict[str, Any]] = []
 
         # 2) Grid-Proximity (feature_data, feature_id='proximity') + EMA-Signale
-        #    NUR wenn der Signal-Button aktiv ist. Phase 13 Schritt 7: Die
-        #    Grid-Marker kommen aus den Feature-Store-Daten (Proximity-
-        #    Services); die EMA-Signale laufen bis zum Rückbau weiter über
-        #    den signal_results-Fallback (Hybrid-Pfad).
+        #    NUR wenn der Signal-Button aktiv ist. Phase 13 Schritt 7.B:
+        #    BEIDE Marker-Quellen kommen aus dem feature_store (feature_id =
+        #    'proximity' bzw. 'ema_atr_set_v1') - der signal_results-Fallback
+        #    (Hybrid-Pfad) wurde entfernt.
         if self._signals_enabled:
             grid_markers = self._apply_marker_styles(
                 self.signal_overlay.fetch_markers(

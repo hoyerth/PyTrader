@@ -6,6 +6,12 @@ und schreibt Ergebnisse in signal_results (context_type='live_stream').
 
 Architektur (Phase 6 Roadmap):
     Tick -> Bar-Close -> Feature Store -> Signal-Engine -> signal_results -> UI-Overlay
+
+Phase 13 Schritt 7.B (Rückbau Alt-Signal-Mechanik): Der Alt-Pfad in
+signal_results ist DEAKTIVIERT – set_config['signals'] ist leer, daher
+liefern _fill_gaps/_process_new_bars/analyze_single_bar früh zurück und
+es finden KEINE signal_results-Writes mehr statt. Marker/Statistik lesen
+den feature_store; die Tabelle signal_results bleibt nur als Referenz.
 """
 
 import json
@@ -590,165 +596,22 @@ class LiveAnalyzer(QThread):
 # ==============================================================================
 # Standalone-Funktion fuer Chart-Trigger (aufrufbar ohne LiveAnalyzer-Instanz)
 # ==============================================================================
+# Phase 13 Schritt 7.B: Rueckbau der Alt-Signal-Mechanik.
+# Die Funktion ist DEAKTIVIERT - es finden KEINE signal_results-Schreibvorgaenge
+# mehr statt. Der Chart-Trigger (chart_win.py) wurde entfernt; der Stub bleibt
+# nur als API-Hinweis erhalten, falls noch Alt-Code auf sie zeigt.
 def fill_gaps_for_pair(symbol: str, timeframe: str, lookback_bars: int = 500) -> None:
     """
-    Schliesst Datenluecken fuer ein beliebiges Symbol:Timeframe-Paar.
-    Nur Signale mit live_op=True werden verarbeitet.
-    Kann unabhaengig vom LiveAnalyzer-Thread aufgerufen werden (z. B. Chart-Trigger).
+    DEAKTIVIERT (Phase 13 Schritt 7.B): Alt-Signal-Mechanik ist zurueckgebaut.
+
+    Frucher: Schliessen von Datenluecken durch Nachberechnung der
+    Alt-Signal-Sets (ema_atr_set_v1 / alternating_arrow_v1) mit Write in
+    signal_results. Heute: Keine signal_results-Writes mehr - Marker und
+    Statistik lesen ausschliesslich den feature_store (feature_data der
+    Plugins/Proximity-Services). Der Stub gibt nur noch einen Hinweis aus.
     """
-    from analytics.engine.set_evaluator import SetEvaluator
-    from analytics.signals.heuristics.ema_trend import EMATrendSignal
-    from analytics.signals.heuristics.atr_filter import ATRFilterSignal
-    from analytics.signals.experimental.alternating_arrow_signal import AlternatingArrowSignal
-    from analytics.signals.composite.grid_proximity_signal import GridProximitySignal
-
-    signals: Dict[str, Any] = {
-        "alternating_arrow_v1": AlternatingArrowSignal(),
-        "ema_trend_v1": EMATrendSignal(),
-        "atr_filter_v1": ATRFilterSignal(),
-        "grid_proximity_v1": GridProximitySignal(),
-    }
-
-    set_config: Dict[str, Any] = {
-        "signals": [
-            {
-                "id": "alternating_arrow_v1",
-                "weight": 1.0,
-                "params": {"confidence_buy": 1.0, "confidence_sell": 1.0, "skip_first_bars": 1},
-            },
-        ],
-        "threshold": 0.5,
-    }
-
-    # Nur live_op=True Signale im Set behalten
-    filtered_signals = []
-    for cfg in set_config.get("signals", []):
-        sid = cfg["id"]
-        sig = signals.get(sid)
-        if sig is not None and getattr(sig, 'live_op', True):
-            filtered_signals.append(cfg)
-    if not filtered_signals:
-        print("  [Chart-Trigger] Keine live_op=True Signale, uebersprungen.")
-        return
-
-    set_config["signals"] = filtered_signals
-    evaluator = SetEvaluator(signals)
-    builder = FeatureBuilder()
-
-    # Letztes Signal in der DB (EXTRACT(epoch) direkt in SQL)
-    con = DbPool.get(DB_ANALYTICS)
-    last_signal_ts = con.execute("""
-        SELECT EXTRACT('epoch' FROM MAX(bar_time))::BIGINT FROM signal_results
-        WHERE symbol = ? AND timeframe = ?
-    """, [symbol, timeframe]).fetchone()[0]
-
-    if last_signal_ts is None:
-        print(f"  [Chart-Trigger] {symbol}:{timeframe} keine historischen Signale, uebersprungen.")
-        return
-
-    last_signal_ts = int(last_signal_ts)
-
-    # Neueste Bar (EXTRACT(epoch) direkt in SQL)
-    con = DbPool.get(DB_MARKET)
-    latest_bar_ts = con.execute("""
-        SELECT EXTRACT('epoch' FROM MAX("time"))::BIGINT FROM ohlcv_bars
-        WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
-    """, [symbol, timeframe]).fetchone()[0]
-
-    if latest_bar_ts is None:
-        return
-
-    latest_bar_ts = int(latest_bar_ts)
-    if latest_bar_ts <= last_signal_ts:
-        return
-
-    print(f"  [Chart-Trigger] {symbol}:{timeframe} Luecke erkannt, fuelle auf...")
-
-    df_ohlcv = builder.load_ohlcv(symbol, timeframe, limit=lookback_bars)
-    if df_ohlcv.empty:
-        return
-
-    # Dynamisch benötigte Features aus den aktiven Signalen sammeln
-    required = set()
-    for cfg in set_config.get("signals", []):
-        sid = cfg["id"]
-        sig = signals.get(sid)
-        if sig is not None:
-            for feat in sig.required_features:
-                required.add(feat)
-    if not required:
-        required = {"ema_diff", "atr_normalized"}
-
-    # Feature-Parameter optimieren (Basis: ema_diff, atr_normalized)
-    feat_params = {}
-    if "ema_diff" in required:
-        feat_params["ema_diff"] = {"fast_period": 12, "slow_period": 26}
-    if "atr_normalized" in required:
-        feat_params["atr_normalized"] = {"period": 14}
-    # Grid-Spalten werden vom Modul 'grid_levels' erzeugt
-    if any(f in required for f in (
-        "grid_dist_pct", "grid_nearest_level", "grid_dist_abs", "is_time_window_active"
-    )):
-        feat_params["grid_levels"] = {
-            "step_size": 0.5,
-            "steps_around": 4,
-            "custom_levels": [],
-            "time_window_mins": 5,
-            "use_time_filter": True,
-        }
-
-    df_features = builder.calculate_features(
-        df_ohlcv,
-        feature_names=list(required),
-        params=feat_params,
+    print(
+        f"  [Chart-Trigger] fill_gaps_for_pair DEAKTIVIERT (Phase 13 7.B): "
+        f"{symbol}:{timeframe} - keine Alt-Signal-Writes mehr."
     )
 
-    builder.store_features(symbol, timeframe, df_features)
-    result = evaluator.evaluate_set(set_config, df_features)
-    sigs = result[result["signal_binary"] == 1].copy()
-
-    if sigs.empty:
-        print(f"  [Chart-Trigger] {symbol}:{timeframe} keine neuen Signale.")
-        return
-
-    sigs["bar_time_epoch"] = sigs["bar_time"].apply(lambda x: int(x.value // 10**9))
-    sigs = sigs[sigs["bar_time_epoch"] > last_signal_ts]
-
-    if sigs.empty:
-        return
-
-    # Dynamische Source-IDs aus conf_-Spalten ermitteln
-    source_cols = [c for c in sigs.columns if c.startswith("conf_")]
-    if not source_cols:
-        print(f"  [Chart-Trigger] {symbol}:{timeframe} keine conf_-Spalten, uebersprungen.")
-        return
-
-    con = DbPool.get(DB_ANALYTICS)
-    rows = []
-    for _, row in sigs.iterrows():
-        bt = int(row["bar_time_epoch"])
-        dt_val = datetime.fromtimestamp(bt, tz=timezone.utc)
-        for sc in source_cols:
-            source_id = sc.replace("conf_", "")
-            confidence = float(row[sc])
-            rows.append((
-                str(uuid.uuid4()),
-                symbol,
-                timeframe,
-                dt_val,
-                source_id,
-                confidence,
-                "live_stream",
-                json.dumps({"source": "ChartTrigger"}),
-            ))
-            con.execute("""
-                DELETE FROM signal_results
-                WHERE symbol = ? AND timeframe = ? AND bar_time = ? AND source_id = ?
-            """, [symbol, timeframe, dt_val, source_id])
-
-    con.executemany("""
-        INSERT INTO signal_results (event_id, symbol, timeframe, bar_time, source_id, confidence, context_type, metadata_payload)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, rows)
-
-    print(f"  [Chart-Trigger] {symbol}:{timeframe} {len(rows)} Signale nachgetragen.")
