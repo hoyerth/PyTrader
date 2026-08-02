@@ -41,6 +41,13 @@ class ColorButton(QPushButton):
     def __init__(self, default_color: str = "#2196F3", enable_alpha: bool = True,
                  parent=None) -> None:
         super().__init__(parent)
+        # Eindeutiger ObjectName: Das Stylesheet in update_style() wird über
+        # 'QPushButton#ColorButtonSwatch' auf DIESEN Button gescoped. Ohne
+        # Scoping wuerde der breite Selektor 'QPushButton' auf alle
+        # Nachkommen-Buttons abfaerben - insbesondere auf die kleinen Buttons
+        # im QColorDialog (wird mit self als Parent geoeffnet), die dann die
+        # aktuell gewaehlte Farbe statt der Standard-UI-Farbe zeigen.
+        self.setObjectName("ColorButtonSwatch")
         self._enable_alpha: bool = bool(enable_alpha)
         self._color: QColor = QColor()
         self.setColor(default_color)
@@ -96,7 +103,7 @@ class ColorButton(QPushButton):
         else:
             bg = f"rgba({c.red()}, {c.green()}, {c.blue()}, {c.alpha() / 255.0})"
         self.setStyleSheet(
-            "QPushButton { background-color: " + bg +
+            "QPushButton#ColorButtonSwatch { background-color: " + bg +
             "; border: 1px solid #555555; border-radius: 3px; }"
         )
 
