@@ -1022,8 +1022,8 @@ class PyTraderChartWindow(QMainWindow):
                     m["shape"] = "arrowDown"
                     m["color"] = "#ef5350"  # Rot
                 m["priority"] = 5
-            elif source_id == "grid_proximity_v1":
-                # Grid-Proximity: Kreise oberhalb
+            elif source_id in ("proximity", "grid_proximity_v1"):
+                # Grid-Proximity (feature_data) / Legacy: Kreise oberhalb
                 m["position"] = "aboveBar"
                 m["shape"] = "circle"
                 m["color"] = "#7B1FA2"  # Lila
@@ -1052,13 +1052,17 @@ class PyTraderChartWindow(QMainWindow):
         # 1) Testsignal (alternating_arrow_v1) DEAKTIVIERT – keine automatischen Test-Signale
         markers: List[Dict[str, Any]] = []
 
-        # 2) Grid Proximity + EMA-Signale NUR wenn der Signal-Button aktiv ist
+        # 2) Grid-Proximity (feature_data, feature_id='proximity') + EMA-Signale
+        #    NUR wenn der Signal-Button aktiv ist. Phase 13 Schritt 7: Die
+        #    Grid-Marker kommen aus den Feature-Store-Daten (Proximity-
+        #    Services); die EMA-Signale laufen bis zum Rückbau weiter über
+        #    den signal_results-Fallback (Hybrid-Pfad).
         if self._signals_enabled:
             grid_markers = self._apply_marker_styles(
                 self.signal_overlay.fetch_markers(
-                    self.current_symbol, self.current_tf, "grid_proximity_v1"
+                    self.current_symbol, self.current_tf, "proximity"
                 ),
-                "grid_proximity_v1"
+                "proximity"
             )
             markers.extend(grid_markers)
 
