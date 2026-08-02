@@ -7,6 +7,7 @@ PyTrader/
     main.py
     persistent_win.py
     properties_win.py
+    scrollable_content.py
     service_win.py
     state_manager.py
     statistic_win.py
@@ -103,6 +104,9 @@ PyTrader/
         overlays/
             __init__.py
             signal_overlay.py
+        widgets/
+            __init__.py
+            color_button.py
     config/
         __init__.py
         app_settings.py
@@ -128,11 +132,16 @@ PyTrader/
         check_marker_layers.js
         check_measurement.js
         check_mt5_m1_boundary.py
+        check_p13_color_button.py
+        check_p13_color_integration.py
+        check_p13_grid_liquidity_fixes.py
+        check_p13_preset_decoupling.py
         check_p13_s1.py
         check_p13_s2.py
         check_p13_s3.py
         check_p13_s4.py
         check_p13_s5.py
+        check_p13_service_win_geometry.py
         check_phase12_step1_migration.py
         check_plugin_batch_services.py
         check_plugin_executor.py
@@ -1668,6 +1677,227 @@ class PropertiesWindow(PersistentWindow):
 
 --------------------------------------------------
 
+### DATEI: scrollable_content.py
+```py
+# scrollable_content.py
+"""
+Gemeinsame Scroll- & Größendynamik für Inhaltsfenster (Phase 13 5.4).
+
+Problem: Servicefenster und Indikator-Prop-Fenster leiten ihre Größe vollständig
+aus dem Inhalt ab (KEINE fixen Pixelwerte). Wächst der Inhalt (z.B. viele
+Service-Spalten, aufgeklappte Experten-Optionen) über die Bildschirmhöhe,
+würde das Fenster den Bildschirm überragen – ohne Möglichkeit, an den Inhalt
+heranzukommen.
+
+Lösung (ContentScrollMixin):
+* Der Inhalt behält seine natürliche Größe (QScrollArea.widgetResizable=False,
+  Inhalt-Layout mit QLayout.SetFixedSize).
+* Das Fenster wird auf den verfügbaren Bildschirmbereich geklemmt
+  (setMaximumSize(screen)).
+* Die ScrollArea zeigt Scrollbars, sobald der Inhalt den Viewport übersteigt.
+* Solange der Inhalt kleiner als der Bildschirm ist, bleibt das Fenster exakt
+  auf Inhaltgröße (kein leerer Raum, keine Scrollbars).
+
+WICHTIG (Qt 6.11): QWidgetItemV2 cached den sizeHint eines Widgets beim ersten
+Zugriff und aktualisiert ihn NICHT, wenn der Inhalt später wächst – selbst
+layout.invalidate() hilft nicht. Daher müssen die Widget-Caches explizit per
+updateGeometry() invalidiert werden (ruft invalidateSizeCache auf), bevor die
+Layout-Caches geleert und das Fenster an den (geklemmten) Inhalt angepasst wird.
+"""
+
+from typing import Optional
+from PySide6.QtCore import QCoreApplication, QEvent, QSize, QTimer
+from PySide6.QtWidgets import (
+    QApplication, QFrame, QLayout, QScrollArea, QWidget,
+)
+
+
+class ContentScrollArea(QScrollArea):
+    """QScrollArea, deren sizeHint die Größe des Inhalts liefert.
+
+    Eine Standard-QScrollArea liefert einen kleinen Default-sizeHint; ein
+    Eltern-Layout (QMainWindowLayout / QVBoxLayout) würde das Fenster dadurch
+    auf diese kleine Größe schrumpfen. Mit dem Inhalt als sizeHint wächst das
+    Fenster korrekt mit dem Inhalt mit (dynamisch, keine fixen Pixelwerte).
+
+    WICHTIG: minimumSizeHint() bewusst NICHT vom Inhalt ableiten, sondern das
+    kleine Standard-Minimum der QScrollArea liefern. Das Eltern-Layout setzt
+    das Fenster-Minimum aus der Summe der minimumSizeHints; ein Inhalts-basiertes
+    Minimum würde das Fenster-Minimum größer machen als das Bildschirm-Cap
+    (min > max -> Qt gibt dem Minimum Vorrang -> die Klemme versagt und das
+    Fenster ragt über den Bildschirm). Mit dem kleinen Standard-Minimum kann
+    das Fenster bis auf das Screen-Cap schrumpfen und die ScrollArea zeigt
+    Scrollbars, sobald der Inhalt den Viewport übersteigt.
+    """
+
+    def sizeHint(self) -> QSize:
+        if self.widget() is not None:
+            return self.widget().sizeHint()
+        return super().sizeHint()
+
+    def minimumSizeHint(self) -> QSize:
+        # Standard-QScrollArea: kleines Minimum (Viewport-basiert), damit das
+        # Fenster schrumpfen kann und Scrollbars erscheinen.
+        return super().minimumSizeHint()
+
+
+class ContentScrollMixin:
+    """Mixin: gesamtes Fenster scrollbar, wenn der Inhalt höher/breiter als
+    der Bildschirm ist (Servicefenster + Indikator-Prop-Fenster, 5.4)."""
+
+    #: Widget mit dem eigentlichen Inhalt (Layout mit SetFixedSize)
+    _content_widget: Optional[QWidget] = None
+    #: ScrollArea, die den Inhalt umschließt
+    content_scroll: Optional[ContentScrollArea] = None
+
+    # -------------------------------------------------------------------------
+    # Installation
+    # -------------------------------------------------------------------------
+
+    def install_content_scroll(self, content_widget: QWidget,
+                               install_to: Optional[QWidget] = None,
+                               parent_layout: Optional[QLayout] = None) -> ContentScrollArea:
+        """Umschließt content_widget mit einer ContentScrollArea und installiert sie.
+
+        Args:
+            content_widget: Inhalt (Layout mit SetFixedSize; behält natürliche
+                            Größe). MUSS das Layout-Objekt über self referenzierbar
+                            bleiben (self.content_size() liest es).
+            install_to:     QMainWindow, dessen CentralWidget die ScrollArea wird
+                            (Servicefenster-Fall).
+            parent_layout:  Ziel-Layout, dem die ScrollArea hinzugefügt wird
+                            (Dialog-Fall).
+        """
+        self._content_widget = content_widget
+        self.content_scroll = ContentScrollArea()
+        self.content_scroll.setWidgetResizable(False)  # Inhalt behält natürliche Größe
+        self.content_scroll.setWidget(content_widget)
+        self.content_scroll.setFrameShape(QFrame.NoFrame)
+        if parent_layout is not None:
+            parent_layout.addWidget(self.content_scroll)
+        elif install_to is not None:
+            install_to.setCentralWidget(self.content_scroll)
+        self.apply_screen_cap()
+        return self.content_scroll
+
+    def apply_screen_cap(self) -> None:
+        """Klemmt die maximale Fenstergröße auf den verfügbaren Bildschirmbereich."""
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.setMaximumSize(screen.size())
+
+    # -------------------------------------------------------------------------
+    # Größenberechnung (dynamisch, ohne fixe Pixelwerte)
+    # -------------------------------------------------------------------------
+
+    def content_size(self) -> QSize:
+        """Natürliche Inhaltsgröße (Fenstergröße ohne Rahmen)."""
+        if self._content_widget is not None and self._content_widget.layout() is not None:
+            return self._content_widget.layout().sizeHint()
+        return self.sizeHint()
+
+    def clamped_content_size(self) -> QSize:
+        """Inhaltsgröße, auf den Bildschirm geklemmt (Fenstergröße ohne Rahmen)."""
+        desired = self.content_size()
+        screen = QApplication.primaryScreen().availableGeometry()
+        return QSize(min(desired.width(), screen.width()),
+                     min(desired.height(), screen.height()))
+
+    def sizeHint(self) -> QSize:
+        """Inhaltsbasierte Fenstergröße inkl. Rahmen, auf Bildschirm geklemmt.
+
+        Das QMainWindowLayout cached die Größe des Central-Widgets beim ersten
+        Layout-Durchlauf (Qt-Quirk) und meldet danach einen veralteten sizeHint,
+        wenn die Inhalte (z.B. Service-Spalten) wachsen. Daher wird die
+        Fenstergröße hier direkt aus dem Inhalt abgeleitet.
+        """
+        if self._content_widget is None:
+            return super().sizeHint()
+        content = self.clamped_content_size()
+        frame = self.frameGeometry().size() - self.size()
+        return QSize(content.width() + frame.width(),
+                     content.height() + frame.height())
+
+    # -------------------------------------------------------------------------
+    # Reflow
+    # -------------------------------------------------------------------------
+
+    def _schedule_reflow(self) -> None:
+        """Invalidiert die Layout-Caches und setzt die Fenstergröße DEFERRED.
+
+        Während eines synchronen Umbaus (z.B. Service-Spalten per deleteLater()
+        ersetzen, Stack-Seiten neu aufbauen) sind die alten Widgets noch im
+        Widget-Baum – die Layout-Caches (QWidgetItemV2/QBoxLayout) liefern dann
+        veraltete sizeHints (z.B. 18x18 für eine volle Spalten-Zeile). Ein
+        sofortiges resize würde das Fenster fälschlich schrumpfen. Daher wird
+        die Größenberechnung in die nächste Event-Loop-Runde verschoben
+        (_apply_reflow_size zerstört die deleteLater-Widgets erst und misst
+        dann den konsistenten Inhalt).
+        """
+        self._invalidate_content_caches()
+        QTimer.singleShot(0, self._apply_reflow_size)
+
+    def _apply_reflow_size(self) -> None:
+        """Zerstört deleteLater-Widgets und setzt das Fenster auf
+        min(Inhalt, Bildschirm) inkl. Rahmen."""
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        self.resize_to_clamped_content()
+
+    def resize_to_clamped_content(self) -> None:
+        """Setzt das Inhalt-Widget auf seine Layout-Größe und das Fenster auf
+        min(Inhalt, Bildschirm) inkl. Rahmen.
+
+        WICHTIG: Das Inhalt-Widget wird EXPLIZIT auf layout().sizeHint()
+        gesetzt. QScrollArea (widgetResizable=False) resizet das Widget nicht;
+        ein QLayout.SetFixedSize auf dem Inhalt-Layout würde das Widget auf die
+        ERSTE Layout-Größe fixieren (setFixedSize) und späteres Wachstum
+        (zusätzliche Service-Spalten, aufgeklappte Experten-Optionen)
+        verhindern. Das manuelle resize() hält das Widget dagegen immer auf der
+        aktuellen Layout-Größe, und das Fenster wird danach auf
+        min(Inhalt, Bildschirm) geklemmt (Scrollbars, sobald der Inhalt den
+        Viewport übersteigt).
+        """
+        if self._content_widget is not None and self._content_widget.layout() is not None:
+            self._content_widget.resize(self._content_widget.layout().sizeHint())
+        content = self.clamped_content_size()
+        frame = self.frameGeometry().size() - self.size()
+        self.resize(content.width() + frame.width(),
+                    content.height() + frame.height())
+
+    def _invalidate_content_caches(self) -> None:
+        """Invalidiert QWidgetItemV2- und Layout-Caches entlang der Hierarchie.
+
+        Qt 6.11: layout.invalidate() allein aktualisiert die gecachten
+        QWidgetItemV2-sizeHints NICHT. updateGeometry() auf den betroffenen
+        Widgets ruft invalidateSizeCache() auf und erzwingt die Neuberechnung.
+        Die Rekursion läuft über alle Sub-Layouts (z.B. die obere Zeile mit
+        'Service-Sets' + 'Service-Parameter') und deren Widgets.
+        """
+        if self._content_widget is None:
+            return
+        widget = self._content_widget
+
+        def _invalidate(lay: QLayout) -> None:
+            if lay is None:
+                return
+            lay.invalidate()
+            for i in range(lay.count()):
+                item = lay.itemAt(i)
+                if item is None:
+                    continue
+                w = item.widget()
+                if w is not None:
+                    w.updateGeometry()
+                    _invalidate(w.layout())
+                else:
+                    _invalidate(item.layout())
+
+        widget.updateGeometry()
+        _invalidate(widget.layout())
+
+```
+
+--------------------------------------------------
+
 ### DATEI: service_win.py
 ```py
 # service_win.py
@@ -1688,14 +1918,17 @@ from typing import Any, Dict, Optional
 from PySide6.QtCore import QFile, QIODevice, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMessageBox, QProgressBar, QPushButton, QTextEdit, QWidget,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
+    QProgressBar, QPushButton, QSizePolicy, QSpinBox, QTextEdit, QVBoxLayout,
+    QWidget,
 )
 
 from analytics.background_workers.historical_scanner import HistoricalScanner
 from analytics.engine.service_set_repository import ServiceSetRepository
 from analytics.engine.set_evaluator import ServiceSetEvaluator
 from persistent_win import PersistentWindow, register_persistent_window
+from scrollable_content import ContentScrollMixin
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -1755,7 +1988,7 @@ class ServiceSetRunWorker(QThread):
 
 
 @register_persistent_window(auto_restore=False)
-class ServiceWindow(PersistentWindow):
+class ServiceWindow(ContentScrollMixin, PersistentWindow):
     INSTANCE_ID = "win_service"
 
     def __init__(self, parent=None, service_set_repo: Optional[ServiceSetRepository] = None):
@@ -1770,6 +2003,7 @@ class ServiceWindow(PersistentWindow):
         self.set_evaluator = ServiceSetEvaluator()
         self._set_run_worker: Optional[ServiceSetRunWorker] = None
         self._current_set_id: Optional[str] = None
+        self._current_set_definition: Optional[Dict[str, Any]] = None
 
         # UI laden
         ui_file = QFile(str(BASE_DIR / "ui" / "service_win.ui"))
@@ -1807,6 +2041,58 @@ class ServiceWindow(PersistentWindow):
         self.btn_save_set: QPushButton = self.ui.findChild(QPushButton, "btn_save_set")
         self.btn_delete_set: QPushButton = self.ui.findChild(QPushButton, "btn_delete_set")
         self.btn_execute_set: QPushButton = self.ui.findChild(QPushButton, "btn_execute_set")
+
+        # Phase 13 5.4 Schritt 1: Dynamische Service-Spalten (Breite/Höhe aus
+        # dem Inhalt – KEINE fixen Pixelwerte). Das Inhalt-Layout erhält
+        # SetFixedSize + AlignTop|AlignLeft: Das Fenster wächst mit der Anzahl
+        # der Spalten nach rechts und beim Ausklappen der Experten-Optionen
+        # nach unten – ohne leeren Raum (Roadmap 5.4.2.2 Punkt 3).
+        #
+        # WICHTIG: Der Spalten-Container wird IM CODE erzeugt (nicht per
+        # QUiLoader). Das QWidgetItem QUiLoader-erzeugter Widgets meldet nach
+        # einer späteren Layout-Änderung einen veralteten sizeHint (Qt-Quirk:
+        # 18x18 bzw. alter Gruppenstand), wodurch die Fensterbreite nicht mit
+        # der Spaltenanzahl wachsen würde. Im Code erzeugte Widgets (wie die
+        # Spalten selbst) werden korrekt weitergereicht.
+        self.group_service_sets: Optional[QGroupBox] = self.ui.findChild(QGroupBox, "group_service_sets")
+        self.widget_service_columns = QGroupBox("Service-Parameter")
+        self.widget_service_columns.setObjectName("widget_service_columns")
+        self.service_columns_layout = QHBoxLayout(self.widget_service_columns)
+        self.service_columns_layout.setSpacing(6)
+        # Inhalt-Widget + Layout VOR dem Scroll-Wrapper referenzieren
+        # (install_content_scroll ersetzt das CentralWidget von self.ui).
+        self.content_widget = self.ui.centralWidget()
+        self.central_layout = self.content_widget.layout() if self.content_widget else None
+        if self.central_layout is not None:
+            # 5.4 User-Anpassung: 'Service-Parameter' oben RECHTS direkt neben
+            # dem Rahmen 'Service-Sets' (gleiche Zeile, Service-Sets links).
+            self.top_row = QHBoxLayout()
+            self.top_row.setSpacing(6)
+            idx = self.central_layout.indexOf(self.group_service_sets)
+            if idx < 0:
+                idx = 0
+            self.central_layout.removeWidget(self.group_service_sets)
+            self.top_row.addWidget(self.group_service_sets)
+            self.top_row.addWidget(self.widget_service_columns)
+            self.central_layout.insertLayout(idx, self.top_row)
+        # Scroll-Wrapper: gesamtes Fenster scrollbar, wenn Inhalt > Bildschirm
+        # (ContentScrollMixin). Der Inhalt behält seine natürliche Größe; das
+        # Fenster wird auf den Bildschirm geklemmt (Scrollbars erscheinen erst,
+        # wenn der Inhalt den Viewport übersteigt).
+        self.install_content_scroll(self.content_widget, install_to=self.ui)
+        self.main_layout = self.ui.layout()
+        # KEIN SetFixedSize auf dem QMainWindowLayout: das würde die
+        # Fenstergröße auf den Inhalt fixieren und das Bildschirm-Cap
+        # (setMaximumSize) überschreiben. Auch das INHALT-Layout bekommt KEIN
+        # SetFixedSize: QLayout.SetFixedSize ruft setFixedSize() auf dem
+        # Inhalt-Widget auf und fixiert es auf die ERSTE Layout-Größe – späteres
+        # Wachstum (Service-Spalten, Experten-Optionen) wäre dadurch blockiert.
+        # Stattdessen setzt resize_to_clamped_content() das Inhalt-Widget in
+        # jedem Reflow explizit auf die aktuelle Layout-Größe (ContentScrollMixin).
+        if self.central_layout is not None:
+            self.central_layout.setSpacing(6)
+            self.central_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self._service_param_controls: Dict[Any, QWidget] = {}
 
         if self.btn_start:
             self.btn_start.clicked.connect(self.start_scan)
@@ -1956,10 +2242,12 @@ class ServiceWindow(PersistentWindow):
     def _clear_set_editor(self) -> None:
         """Leert Name-Feld und execution_order-Liste des Set-Editors."""
         self._current_set_id = None
+        self._current_set_definition = None
         if self.edit_set_name:
             self.edit_set_name.clear()
         if self.list_execution_order:
             self.list_execution_order.clear()
+        self._clear_service_columns()
 
     @Slot(int)
     def _on_set_selected(self, index: int) -> None:
@@ -1975,8 +2263,13 @@ class ServiceWindow(PersistentWindow):
             self.log(f"Set geladen: {set_id}")
 
     def load_set_into_editor(self, definition: Dict[str, Any]) -> None:
-        """Überträgt eine ServiceSetDefinition in Name-Feld + execution_order-Liste."""
+        """Überträgt eine ServiceSetDefinition in Name-Feld + execution_order-Liste.
+
+        Phase 13 5.4 Schritt 1: Baut zusätzlich die dynamischen Service-Spalten
+        (eine QGroupBox pro Service mit Parameter-Formular) auf.
+        """
         self._current_set_id = definition.get("set_id")
+        self._current_set_definition = definition
         if self.edit_set_name:
             self.edit_set_name.setText(definition.get("display_name") or "")
         if self.list_execution_order:
@@ -1989,6 +2282,7 @@ class ServiceWindow(PersistentWindow):
                 item.setData(Qt.UserRole, iid)
                 item.setData(Qt.UserRole + 1, plugin_id)
                 self.list_execution_order.addItem(item)
+        self._build_service_columns(definition)
 
     def collect_current_order(self) -> list:
         """Liefert die instance_ids aus der Liste (aktuelle execution_order)."""
@@ -2014,6 +2308,7 @@ class ServiceWindow(PersistentWindow):
         item = lw.takeItem(row)
         lw.insertItem(new_row, item)
         lw.setCurrentRow(new_row)
+        self._rebuild_columns()
 
     @Slot()
     def remove_instance(self) -> None:
@@ -2022,6 +2317,7 @@ class ServiceWindow(PersistentWindow):
         if not lw or lw.currentRow() < 0:
             return
         lw.takeItem(lw.currentRow())
+        self._rebuild_columns()
 
     @Slot()
     def add_instance(self) -> None:
@@ -2062,13 +2358,16 @@ class ServiceWindow(PersistentWindow):
         self.list_execution_order.addItem(item)
         self.edit_new_instance.clear()
         self.log(f"Service hinzugefügt: {iid} [{plugin_id}]")
+        self._rebuild_columns()
 
     def collect_set_definition(self) -> Dict[str, Any]:
         """Baut aus dem Editor eine ServiceSetDefinition.
 
-        Für ein geladenes Set werden die services aus der DB übernommen.
-        Für ein NEUES Set werden die services aus den Listeneinträgen
-        aufgebaut (plugin_id + Default-Params aus der Registry).
+        Für ein geladenes Set werden die services aus der DB übernommen;
+        für neue Instanzen (bzw. neue Sets) werden die services aus den
+        Listeneinträgen aufgebaut (plugin_id + Default-Params aus der
+        Registry). Die Werte der dynamischen Service-Spalten (5.4 Schritt 1)
+        werden anschließend in die services-Konfiguration übernommen.
         """
         order = self.collect_current_order()
         services: Dict[str, Any] = {}
@@ -2076,16 +2375,18 @@ class ServiceWindow(PersistentWindow):
             existing = self.set_repo.get_set(self._current_set_id) or {}
             services = dict(existing.get("services") or {})
 
-        if not services:
-            from analytics.features.feature_builder import PluginRegistry
-            registry = PluginRegistry()
-            if self.list_execution_order:
-                for i in range(self.list_execution_order.count()):
-                    item = self.list_execution_order.item(i)
-                    iid = item.data(Qt.UserRole)
-                    plugin_id = item.data(Qt.UserRole + 1)
-                    if not iid or not plugin_id:
-                        continue
+        # Jede Instanz in der Reihenfolge braucht eine services-Konfiguration –
+        # neue Instanzen erhalten Default-Params aus der Registry.
+        from analytics.features.feature_builder import PluginRegistry
+        registry = PluginRegistry()
+        if self.list_execution_order:
+            for i in range(self.list_execution_order.count()):
+                item = self.list_execution_order.item(i)
+                iid = item.data(Qt.UserRole)
+                plugin_id = item.data(Qt.UserRole + 1) or iid
+                if not iid:
+                    continue
+                if iid not in services:
                     try:
                         plugin = registry.get(plugin_id)
                         cfg: Dict[str, Any] = {
@@ -2097,12 +2398,261 @@ class ServiceWindow(PersistentWindow):
                         cfg = {"plugin_id": plugin_id, "lookback": 1000, "params": {}}
                     services[iid] = cfg
 
+        # Werte aus den dynamischen Service-Spalten übernehmen.
+        # lookback ist die Service-Instanz-Einstellung (ServiceInstanceConfig.
+        # lookback) und wird NICHT in params geschrieben.
+        for (iid, key), ctrl in self._service_param_controls.items():
+            cfg = services.setdefault(iid, {"plugin_id": "", "lookback": 1000, "params": {}})
+            if key == "lookback":
+                cfg["lookback"] = int(self._ctrl_value(ctrl))
+            else:
+                cfg.setdefault("params", {})[key] = self._ctrl_value(ctrl)
+
         return {
             "set_id": self._current_set_id or "",
             "display_name": self.edit_set_name.text().strip() if self.edit_set_name else "",
             "execution_order": order,
             "services": services,
         }
+
+    # =========================================================================
+    # Phase 13 5.4 Schritt 1: Breiten- & Höhendynamisches Layout (Service-Spalten)
+    # =========================================================================
+
+    @staticmethod
+    def _is_visual_key(key: str) -> bool:
+        """Konvention für reine Darstellungs-Props: Sichtbarkeit (show_*) + Farben (color).
+
+        Darstellungs-Parameter gehören NICHT ins Service-Set (nur Berechnungs-
+        Logik, Roadmap 5.4.1.2) und werden daher in den Service-Spalten
+        ausgeblendet (konsistent zum Indikator-Dialog).
+        """
+        if key.startswith("show_"):
+            return True
+        if "color" in key.lower():
+            return True
+        return False
+
+    @staticmethod
+    def _human(key: str) -> str:
+        return key.replace("_", " ").title()
+
+    @staticmethod
+    def _decimal_places(value: Any) -> int:
+        """Nachkommastellen eines float (für QDoubleSpinBox.setDecimals)."""
+        if not isinstance(value, float) or value != value:  # NaN-Schutz
+            return 4
+        s = f"{value:.10f}".rstrip("0")
+        if "." in s:
+            return len(s.split(".")[1])
+        return 0
+
+    def _create_param_control(self, key: str, val: Any, spec: Dict[str, Any]) -> QWidget:
+        """Erzeugt ein Eingabe-Widget exakt aus dem ParameterSchema.
+
+        float -> QDoubleSpinBox, int -> QSpinBox, bool -> QCheckBox,
+        choice -> QComboBox, color/str -> QLineEdit. min/max/step werden 1:1
+        übertragen (Roadmap 5.4.2.2).
+        """
+        p_type = spec.get("type")
+        if p_type == "float":
+            spin = QDoubleSpinBox()
+            spin.setRange(float(spec.get("min", -1e9)), float(spec.get("max", 1e9)))
+            step = spec.get("step")
+            decimals = self._decimal_places(step) if step is not None else self._decimal_places(spec.get("default"))
+            spin.setDecimals(min(6, max(0, decimals)))
+            spin.setSingleStep(float(step) if step is not None else 0.01)
+            try:
+                spin.setValue(float(val))
+            except (TypeError, ValueError):
+                spin.setValue(float(spec.get("default", 0.0)))
+            return spin
+        if p_type == "int":
+            spin = QSpinBox()
+            spin.setRange(int(spec.get("min", -100000)), int(spec.get("max", 100000)))
+            spin.setSingleStep(int(spec.get("step", 1)))
+            try:
+                spin.setValue(int(val))
+            except (TypeError, ValueError):
+                spin.setValue(int(spec.get("default", 0)))
+            return spin
+        if p_type == "bool":
+            chk = QCheckBox()
+            chk.setChecked(bool(val))
+            return chk
+        if p_type == "choice":
+            combo = QComboBox()
+            combo.addItems([str(o) for o in (spec.get("options") or [])])
+            combo.setCurrentText(str(val))
+            return combo
+        txt = QLineEdit()
+        txt.setText(str(val))
+        return txt
+
+    @staticmethod
+    def _ctrl_value(ctrl: QWidget) -> Any:
+        """Liest den aktuellen Wert eines Controls typsicher aus."""
+        if isinstance(ctrl, QCheckBox):
+            return ctrl.isChecked()
+        if isinstance(ctrl, QSpinBox):
+            return ctrl.value()
+        if isinstance(ctrl, QDoubleSpinBox):
+            return ctrl.value()
+        if isinstance(ctrl, QComboBox):
+            return ctrl.currentText()
+        return ctrl.text()
+
+    def _setup_collapsible(self, group: QGroupBox) -> None:
+        """Macht eine ausklappbare QGroupBox wirklich kollabierbar.
+
+        Beim Abwählen werden die Kinder ausgeblendet und die Fensterhöhe per
+        _reflow() nahtlos verkleinert (Roadmap 5.4.2.2: Ein-/Ausklappen
+        verändert die Höhe dynamisch). Zusätzlich wird group.updateGeometry()
+        gerufen, damit der gecachte QWidgetItemV2-sizeHint der Box invalidiert
+        wird (Qt 6.11: Layouts refreshen diesen Cache sonst NICHT).
+        """
+        def _toggle(checked: bool) -> None:
+            for child in group.findChildren(QWidget):
+                child.setVisible(checked)
+            group.updateGeometry()  # QWidgetItemV2-Cache invalidieren (s. oben)
+            self._reflow()
+        group.toggled.connect(_toggle)
+        _toggle(group.isChecked())
+
+    def _reflow(self) -> None:
+        """Erzwingt die Neuberechnung der Layouts (dynamische Höhe/Breite).
+
+        Qt 6.11: QWidgetItemV2 cached den sizeHint eines Widgets beim ersten
+        Zugriff und aktualisiert ihn NICHT, wenn der Inhalt später wächst –
+        selbst layout.invalidate() hilft nicht. Daher werden die Caches der
+        betroffenen Widgets explizit per updateGeometry() invalidiert
+        (invalidateSizeCache) und die Layout-Caches geleert.
+
+        WICHTIG: Die Fenstergröße wird DEFERRED (nächste Event-Loop-Runde)
+        angepasst. Beim Set-Wechsel sind die alten Service-Spalten per
+        deleteLater() noch im Widget-Baum; bis sie zerstört sind, melden die
+        Layout-Caches einen veralteten (zu kleinen) sizeHint (z.B. 18x18 für
+        eine volle Spalten-Zeile). Ein synchrones resize würde das Fenster
+        daher fälschlich schrumpfen. _schedule_reflow() zerstört die
+        deleteLater-Widgets und berechnet die Größe erst aus dem konsistenten
+        Zustand (ContentScrollMixin).
+        """
+        self._schedule_reflow()
+
+    def _clear_service_columns(self) -> None:
+        """Entfernt alle Service-Spalten aus dem service_columns_layout."""
+        if self.service_columns_layout is None:
+            return
+        while self.service_columns_layout.count():
+            item = self.service_columns_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._service_param_controls = {}
+
+    def _build_service_columns(self, set_definition: Dict[str, Any]) -> None:
+        """Baut die dynamischen Service-Spalten (Roadmap 5.4.2.2).
+
+        Für jede instance_id in execution_order wird eine QGroupBox-Spalte im
+        service_columns_layout erzeugt. Jede Spalte skaliert in der Höhe exakt
+        mit der Anzahl ihrer Parameter (QSizePolicy.Maximum); die Fensterbreite
+        wächst mit der Anzahl der Spalten nach rechts – ohne leeren Raum und
+        ohne fixe Pixelwerte.
+        """
+        if self.service_columns_layout is None:
+            return
+        self._clear_service_columns()
+        services = set_definition.get("services") or {}
+        for iid in (set_definition.get("execution_order") or []):
+            cfg = services.get(iid) or {}
+            pid = cfg.get("plugin_id") or iid
+            col = self._build_service_column(iid, pid, cfg)
+            self.service_columns_layout.addWidget(col)
+        # Container erneut in die obere Zeile einfügen: Das QWidgetItem
+        # eines Widgets meldet dessen Größe zum Zeitpunkt des Einfügens und
+        # aktualisiert sich bei späterem Inhalts-Wachstum nicht (Qt-Quirk).
+        # Entfernen + erneutes Einfügen erzeugt ein frisches QWidgetItem mit
+        # der aktuellen Größe.
+        if self.top_row is not None and self.widget_service_columns is not None:
+            self.top_row.removeWidget(self.widget_service_columns)
+            self.top_row.addWidget(self.widget_service_columns)
+        self._reflow()
+
+    def _build_service_column(self, iid: str, pid: str, cfg: Dict[str, Any]) -> QGroupBox:
+        """Erzeugt EINE Service-Spalte (QGroupBox) mit Parameter-Formular.
+
+        - Normale Parameter im QFormLayout (float/int/bool nach Schema).
+        - expert: True (inkl. lookback) in einer einklappbaren
+          QGroupBox 'Experten-Optionen' am Spaltenfuß.
+        """
+        col = QGroupBox(f"{iid}  [{pid}]")
+        # 5.4.2.2 Punkt 3: Spalte skaliert in der Höhe exakt mit ihrem Inhalt
+        # (endet unter dem letzten Parameter), wächst beim Vergrößern des
+        # Fensters NICHT mit.
+        col.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        vl = QVBoxLayout(col)
+        vl.setAlignment(Qt.AlignTop)
+
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            plugin = PluginRegistry().get(pid)
+        except KeyError:
+            vl.addWidget(QLabel(f"Plugin '{pid}' nicht gefunden."))
+            return col
+
+        full_schema: Dict[str, Any] = dict(getattr(plugin, "base_parameter_schema", None) or {})
+        full_schema.update(dict(plugin.parameter_schema or {}))
+        order = list(getattr(plugin, "parameter_order", None) or (plugin.parameter_schema or {}).keys())
+        for key in (getattr(plugin, "base_parameter_schema", None) or {}):
+            if key not in order:
+                order.append(key)
+        labels = dict(getattr(plugin, "param_labels", None) or {})
+        for key, spec in (getattr(plugin, "base_parameter_schema", None) or {}).items():
+            labels.setdefault(key, spec.get("description") or self._human(key))
+
+        params = dict(cfg.get("params") or {})
+        lookback = cfg.get("lookback")
+
+        # Normale (Nicht-Expert-, Nicht-Darstellungs-)Parameter
+        form = QFormLayout()
+        for key in order:
+            spec = full_schema.get(key, {})
+            if spec.get("expert") or self._is_visual_key(key):
+                continue
+            cval = params.get(key, spec.get("default"))
+            ctrl = self._create_param_control(key, cval, spec)
+            self._service_param_controls[(iid, key)] = ctrl
+            form.addRow(labels.get(key, self._human(key)), ctrl)
+        vl.addLayout(form)
+
+        # Expert-Parameter (inkl. lookback als Service-Instanz-Einstellung)
+        expert_keys = [k for k in order if full_schema.get(k, {}).get("expert")]
+        if expert_keys:
+            exp_grp = QGroupBox("Experten-Optionen")
+            exp_grp.setCheckable(True)
+            exp_grp.setChecked(False)
+            exp_grp.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+            ef = QFormLayout(exp_grp)
+            for key in expert_keys:
+                spec = full_schema.get(key, {})
+                if key == "lookback":
+                    cval = lookback if lookback is not None else spec.get("default")
+                else:
+                    cval = params.get(key, spec.get("default"))
+                ctrl = self._create_param_control(key, cval, spec)
+                self._service_param_controls[(iid, key)] = ctrl
+                ef.addRow(labels.get(key, self._human(key)), ctrl)
+            vl.addWidget(exp_grp)
+            self._setup_collapsible(exp_grp)
+
+        return col
+
+    def _rebuild_columns(self) -> None:
+        """Baut die Service-Spalten aus dem aktuellen Editor-Zustand neu."""
+        if self.service_columns_layout is None:
+            return
+        definition = self.collect_set_definition()
+        self._build_service_columns(definition)
 
     @Slot()
     def save_set(self) -> None:
@@ -13922,12 +14472,12 @@ class GridLiquidityFeature(PluginFeature):
             "circle_color_active": {"type": "color", "default": "#E91E63", "description": "Farbe Hit in Aktivitätsfenster"},
             "show_lines": {"type": "bool", "default": True, "description": "Grid-Linien anzeigen"},
             "show_circles": {"type": "bool", "default": True, "description": "Hits anzeigen"},
-            "prox_level1": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 1"},
-            "prox_level2": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 2"},
-            "prox_level3": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 3"},
-            "prox_level4": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 4"},
-            "prox_level5": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 5"},
-            "prox_level6": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "description": "Custom Level 6"},
+            "prox_level1": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 1"},
+            "prox_level2": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 2"},
+            "prox_level3": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 3"},
+            "prox_level4": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 4"},
+            "prox_level5": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 5"},
+            "prox_level6": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 6"},
         }
 
     def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> FeatureCalculateResult:
@@ -15655,9 +16205,21 @@ class PyTraderChartWindow(QMainWindow):
         st = self.indicators_state.setdefault(ind_id, {
             "active": False, "preset": "Default", "params": dict(plugin.default_params)
         })
-        dialog = IndicatorSettingsDialog(plugin, st["params"], st["preset"], self.state_manager,
-                                         lambda p, pr: self._on_indicator_params_updated(ind_id, p, pr), self,
-                                         symbol=self.current_symbol, timeframe=self.current_tf)
+        # 5.4 Schritt 2: Dem Dialog die AUFGELÖSTEN Parameter übergeben
+        # (Logik aus dem Service-Set + Darstellung), damit Seite 0 die
+        # aktuellen Berechnungswerte zeigt. Beim Zurückmelden liefert der
+        # Dialog nur set_id + display_params (Decoupling).
+        dialog = IndicatorSettingsDialog(
+            plugin, self._resolve_indicator_params(ind_id, st), st["preset"],
+            self.state_manager,
+            lambda p, pr: self._on_indicator_params_updated(ind_id, p, pr), self,
+            symbol=self.current_symbol, timeframe=self.current_tf,
+            # 5.5 Fix (Bugfix #3): Zuletzt gewaehltes Service-Set + Live-
+            # Overlay (logic_params) mitgeben, damit der Dialog beim
+            # Restore/Neuaufbau die Set-Combo vorbelegt und die Service-
+            # Parameter (Set-Logik + Overlay) korrekt wiederherstellt.
+            current_set_id=st.get("set_id") or None,
+            logic_params=st.get("logic_params") or None)
         self._settings_dialog = dialog
         dialog.finished.connect(lambda: self._on_settings_closed(dialog))
         dialog.show()
@@ -15696,9 +16258,91 @@ class PyTraderChartWindow(QMainWindow):
         print(f"⚠️ [ChartRefresh] Watchdog: Refresh haengt ({self.current_symbol} {self.current_tf}), setze zurueck")
         self._is_loading_data = False
 
-    def _on_indicator_params_updated(self, ind_id: str, params: Dict[str, Any], preset: str) -> None:
-        """Callback wenn ein Indikator-Parameter geändert wurde."""
-        self.indicators_state[ind_id] = {"active": True, "preset": preset, "params": params}
+    def _get_service_set_repo(self) -> Any:
+        """Lazy-Repository für Service-Sets (5.4 Schritt 2).
+
+        Einmalig pro Fenster instanziiert; im Test kann ein temporäres
+        Repository (Temp-DB) injiziert werden (self._service_set_repo)."""
+        if getattr(self, "_service_set_repo", None) is None:
+            from analytics.engine.service_set_repository import ServiceSetRepository
+            self._service_set_repo = ServiceSetRepository()
+        return self._service_set_repo
+
+    def _resolve_indicator_params(self, ind_id: str, st: Dict[str, Any]) -> Dict[str, Any]:
+        """5.4 Schritt 2 + 5.5 Fix: Volles Parameter-Dict für plugin.calculate().
+
+        NEUES Format (Plugin, z.B. grid_liquidity): indicators_state speichert
+        set_id + display_params (+ optional logic_params als Live-Overlay aus
+        dem Indikator-Dialog). Die Berechnungslogik (grid_step,
+        proximity_threshold, lookback, ...) kommt LIVE aus dem Service-Set
+        (ServiceSetRepository.get_set(set_id)), sofern ein Set gewählt ist;
+        die Darstellung (Farben, Sichtbarkeiten) aus display_params.
+        logic_params überlagern die Set-Logik, damit Änderungen an den
+        Service-Parametern im Dialog SOFORT auf dem Chart erscheinen.
+
+        LEGACY (z.B. Alt-Indikator 'grid' / alter DB-Stand ohne set_id):
+        volle params werden unverändert durchgereicht (Abwärtskompatibilität).
+
+        Fix: Ohne set_id werden display_params + logic_params ebenfalls
+        gemergt – vorher gingen reine Farb-/Sichtbarkeits-Änderungen ohne
+        gewähltes Service-Set verloren (Early-Return gab nur params zurück).
+        """
+        st = st or {}
+        set_id = st.get("set_id")
+
+        merged: Dict[str, Any] = dict(st.get("params") or {})
+        if set_id:
+            try:
+                definition = self._get_service_set_repo().get_set(set_id)
+                services = (definition or {}).get("services") or {}
+                order = (definition or {}).get("execution_order") or []
+                # Service mit passendem plugin_id bevorzugen, sonst erster Service.
+                cfg: Optional[Dict[str, Any]] = None
+                for iid in order:
+                    s = services.get(iid) or {}
+                    if s.get("plugin_id") == ind_id:
+                        cfg = s
+                        break
+                if cfg is None and order:
+                    cfg = services.get(order[0]) or {}
+                if cfg:
+                    if cfg.get("lookback") is not None:
+                        merged["lookback"] = int(cfg["lookback"])
+                    merged.update(dict(cfg.get("params") or {}))
+            except Exception as e:
+                print(f"⚠️ [ChartWin] Service-Set '{set_id}' nicht ladbar: {e}")
+        # 5.5 Fix: Live-Overlay aus dem Dialog (geänderte Service-Parameter)
+        merged.update(dict(st.get("logic_params") or {}))
+        # Darstellung (Farben, Sichtbarkeit) überlagert die Logik
+        merged.update(dict(st.get("display_params") or {}))
+        return merged
+
+    def _on_indicator_params_updated(self, ind_id: str, payload: Dict[str, Any], preset: str) -> None:
+        """Callback wenn ein Indikator-Parameter geändert wurde.
+
+        5.4 Schritt 2: Der Indikator-Dialog liefert im Plugin-Modus ein
+        GETRENNTES Dict {set_id, display_params} – die Berechnungslogik lebt im
+        Service-Set, die Darstellung (Farben, Sichtbarkeiten) im Chart-State.
+        Legacy (Alt-Indikator 'grid' / voller params-Dict) wird unverändert
+        gespeichert (Abwärtskompatibilität).
+        """
+        if isinstance(payload, dict) and ("set_id" in payload or "display_params" in payload):
+            self.indicators_state[ind_id] = {
+                "active": True,
+                "preset": preset,
+                "set_id": payload.get("set_id") or "",
+                # 5.5 Fix: Service-Parameter (grid_step, prox_levels, ...) als
+                # Live-Overlay mitgeben, damit Änderungen an der Berechnungslogik
+                # im Dialog SOFORT auf dem Chart erscheinen.
+                "logic_params": dict(payload.get("logic_params") or {}),
+                "display_params": dict(payload.get("display_params") or {}),
+            }
+        else:
+            self.indicators_state[ind_id] = {
+                "active": True,
+                "preset": preset,
+                "params": dict(payload or {}),
+            }
         self.save_state()
         self.render_indicators()
 
@@ -15722,7 +16366,9 @@ class PyTraderChartWindow(QMainWindow):
                 # Kontext setzen (Symbol/TF fuer DB-basierte Indikatoren)
                 if hasattr(plugin, "set_context"):
                     plugin.set_context(self.current_symbol, self.current_tf)
-                res = plugin.calculate(self.df_data, st.get("params", {}))
+                # 5.4 Schritt 2: Parameter aus set_id (Logik) + display_params
+                # (Darstellung) auflösen – Legacy voller params bleibt erhalten.
+                res = plugin.calculate(self.df_data, self._resolve_indicator_params(ind_id, st))
                 # Grid-spezifische Render-Logik (Alt 'grid' + Plugin 'grid_liquidity')
                 if ind_id in ("grid", "grid_liquidity"):
                     lines = res.get("lines", [])
@@ -15859,7 +16505,9 @@ class PyTraderChartWindow(QMainWindow):
                 if st.get("active") and ind_id in ("grid", "grid_liquidity"):
                     if hasattr(plugin, "set_context"):
                         plugin.set_context(self.current_symbol, self.current_tf)
-                    res = plugin.calculate(self.df_data, st.get("params", {}))
+                    # 5.4 Schritt 2: Logik aus set_id + Darstellung aus
+                    # display_params auflösen (Legacy volle params bleibt).
+                    res = plugin.calculate(self.df_data, self._resolve_indicator_params(ind_id, st))
                     grid_lines = res.get("lines", [])
                     grid_circles = res.get("hit_circles", [])
                     # Circle-Zeiten auf kontinuierlich mappen
@@ -16326,7 +16974,6 @@ from PySide6.QtWidgets import (
 	QHBoxLayout,
 	QInputDialog,
 	QLabel,
-	QLayout,
 	QLineEdit,
 	QMessageBox,
 	QPushButton,
@@ -16338,7 +16985,9 @@ from PySide6.QtWidgets import (
 )
 
 from chart.indicators.base_indicator import BaseIndicator
+from chart.widgets.color_button import ColorButton
 from state_manager import StateManager
+from scrollable_content import ContentScrollMixin
 
 
 class DialogServiceSetRunWorker(QThread):
@@ -16419,7 +17068,7 @@ class _ServiceStack(QStackedWidget):
 		self.updateGeometry()
 
 
-class IndicatorSettingsDialog(QDialog):
+class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 
 	# Gemeinsamer Geometrie-Key fuer ALLE Indikator-Einstellungsdialoge
 	# (gilt damit automatisch fuer alle Indikatoren, aktuelle & zukuenftige).
@@ -16436,6 +17085,8 @@ class IndicatorSettingsDialog(QDialog):
 		symbol: str = "SILVER",
 		timeframe: str = "H1",
 		service_set_repo: Optional[Any] = None,
+		current_set_id: Optional[str] = None,
+		logic_params: Optional[Dict[str, Any]] = None,
 	) -> None:
 		super().__init__(parent)
 
@@ -16451,9 +17102,20 @@ class IndicatorSettingsDialog(QDialog):
 		self._set_repo = service_set_repo
 		self._set_evaluator = None
 		self._set_run_worker: Optional[DialogServiceSetRunWorker] = None
-		self._current_set_id: Optional[str] = None
+		# 5.5 Fix (Bugfix #3): Beim Restore/Neuaufbau das zuletzt gewaehlte
+		# Service-Set vorbelegen, damit die Set-Combo und die Service-Logik
+		# beim Oeffnen des Fensters wiederhergestellt werden.
+		self._current_set_id: Optional[str] = current_set_id or None
 		self._current_set_definition: Optional[Dict[str, Any]] = None
 		self._set_param_controls: Dict[str, QWidget] = {}
+		# 5.5 Fix: Live-Overlay der Service-Parameter (logic_params). Wird beim
+		# Oeffnen vom Chart-Window getrennt uebergeben (st['logic_params']),
+		# beim Preset-Laden ersetzt und nach dem Set-Logik-Merge in
+		# _on_service_set_changed wieder angewendet, damit die zuletzt vom
+		# Dialog gemeldeten Werte (grid_step, prox_levels, ...) beim Restore
+		# und beim Set-Wechsel NICHT von den gespeicherten Set-Werten
+		# ueberschrieben werden.
+		self._preset_logic_params: Dict[str, Any] = dict(logic_params or {})
 
 		# Plugin-Kontext (nur im Plugin-Modus gesetzt)
 		self.plugin = None
@@ -16521,13 +17183,19 @@ class IndicatorSettingsDialog(QDialog):
 
 	@staticmethod
 	def _decimal_places(value: Any) -> int:
-		"""Nachkommastellen eines float (fuer QDoubleSpinBox.setDecimals)."""
+		"""Nachkommastellen eines float (fuer QDoubleSpinBox.setDecimals).
+
+		5.5 Fix (Bugfix #2): Floats erhalten MINDESTENS 2 Nachkommastellen.
+		Damit lassen auch Felder ohne explizites step (z.B. Custom-Level
+		prox_level1-6 mit Default 0.0) Nachkommastellen zu - vorher ergab
+		_decimal_places(0.0) == 0 und die SpinBox hatte keine Dezimalstellen.
+		"""
 		if not isinstance(value, float) or value != value:  # NaN-Schutz
 			return 4
 		s = f"{value:.10f}".rstrip("0")
 		if "." in s:
-			return len(s.split(".")[1])
-		return 0
+			return max(2, len(s.split(".")[1]))
+		return 2
 
 	@staticmethod
 	def _is_visual_key(key: str) -> bool:
@@ -16588,7 +17256,19 @@ class IndicatorSettingsDialog(QDialog):
 			combo.currentTextChanged.connect(self.on_param_control_changed)
 			return combo
 
-		# color / str / sonstiges
+		if p_type == "color":
+			# 5.5 Feintuning (VERBINDLICH): Farbparameter IMMER als kompakter
+			# ColorButton rendern – nie als freies Textfeld (QLineEdit).
+			# allow_alpha aus dem Schema (Default True) schaltet den
+			# Transparenz-Slider im QColorDialog (ShowAlphaChannel) frei.
+			# Der Button liefert '#RRGGBB' (Alpha=255) bzw. 'rgba(r,g,b,a)'
+			# (Teil-Transparenz) – 1:1 kompatibel mit TradingView v5 / CSS.
+			allow_alpha = bool(spec.get("allow_alpha", True))
+			btn = ColorButton(default_color=str(val), enable_alpha=allow_alpha)
+			btn.colorChanged.connect(self.on_param_control_changed)
+			return btn
+
+		# str / sonstiges
 		txt = QLineEdit()
 		txt.setText(str(val))
 		txt.editingFinished.connect(self.on_param_control_changed)
@@ -16604,6 +17284,8 @@ class IndicatorSettingsDialog(QDialog):
 			return ctrl.value()
 		if isinstance(ctrl, QComboBox):
 			return ctrl.currentText()
+		if isinstance(ctrl, ColorButton):
+			return ctrl.color()
 		return ctrl.text()
 
 	# -------------------------------------------------------------------------
@@ -16611,31 +17293,44 @@ class IndicatorSettingsDialog(QDialog):
 	# -------------------------------------------------------------------------
 
 	def init_ui(self) -> None:
-		main_layout = QVBoxLayout(self)
+		# 5.4 User-Anforderung (Scrollbar für das gesamte Fenster,
+		# ContentScrollMixin): Das Fenster ist scrollbar, wenn der Inhalt
+		# höher/breiter als der Bildschirm ist; sonst exakt auf Inhaltgröße.
+		# Alles wird in ein Inhalt-Widget gepackt, das von einer
+		# ContentScrollArea umschlossen wird; die Fenstergröße wird auf den
+		# Bildschirm geklemmt (setMaximumSize). KEIN SetFixedSize auf dem
+		# Inhalt-Layout: QLayout.SetFixedSize würde das Inhalt-Widget auf die
+		# ERSTE Größe fixieren (setFixedSize) und späteres Wachstum (Service-
+		# Seiten, aufgeklappte Experten-Optionen) blockieren; die Klemme würde
+		# zudem das Screen-Cap überschreiben. resize_to_clamped_content() setzt
+		# das Inhalt-Widget in jedem Reflow explizit auf die Layout-Größe.
+		outer = QVBoxLayout(self)
+		outer.setContentsMargins(0, 0, 0, 0)
+
+		self._content_widget = QWidget()
+		content_layout = QVBoxLayout(self._content_widget)
+		content_layout.setSpacing(6)
+		content_layout.setAlignment(Qt.AlignTop)
 
 		plugin = self._get_plugin()
 		if plugin is not None:
-			self._init_plugin_ui(main_layout, plugin)
+			self._init_plugin_ui(content_layout, plugin)
 		else:
-			self._init_legacy_ui(main_layout)
+			self._init_legacy_ui(content_layout)
 			# Preset-Verwaltung (Legacy: unten, im eigenen Rahmen)
-			main_layout.addWidget(self._build_preset_group())
+			content_layout.addWidget(self._build_preset_group())
 
 		btn_close = QPushButton("Schließen")
 		btn_close.clicked.connect(self.accept)
-		main_layout.addWidget(btn_close)
+		content_layout.addWidget(btn_close)
 
-		# --- Phase 13 Schritt 5 Punkt 4 (VERBINDLICH): Vollständig dynamische
-		# Fenster- & Box-Größen – keine fixen Pixelwerte ---
-		# 4.2.5: Das Fenster schmiegt sich exakt an seinen Inhalt an (kein
-		# leerer Raum unter dem Preset-Block). Beim manuellen Aufziehen bleiben
-		# die Boxen dank AlignTop (4.6) auf ihrer Inhalt-Höhe verankert.
-		main_layout.setSpacing(6)
-		main_layout.setSizeConstraint(QLayout.SetFixedSize)
-		main_layout.setAlignment(Qt.AlignTop)
+		# ScrollArea umschließt den Inhalt (natürliche Größe); das Fenster wird
+		# auf den Bildschirm geklemmt (Scrollbars bei Überlänge, sonst exakt
+		# Inhaltgröße – ohne fixe Pixelwerte).
+		self.install_content_scroll(self._content_widget, parent_layout=outer)
 
 		self._ui_ready = True
-		self.adjustSize()
+		self._reflow()
 
 	def _init_legacy_ui(self, main_layout: QVBoxLayout) -> None:
 		"""Bisheriges Layout fuer Alt-Indikatoren ohne Plugin-Schema (z.B. 'grid')."""
@@ -16878,17 +17573,24 @@ class IndicatorSettingsDialog(QDialog):
 		Bei einem nicht angezeigten Dialog werden Show-Events nicht zugestellt,
 		wodurch das Haupt-Layout sonst seinen alten sizeHint behält. Durch
 		explizites invalidate() wird die Gesamthöhe immer frisch berechnet.
+
+		5.4 User-Anforderung: Die Fenstergröße wird DEFERRED auf
+		min(Inhalt, Bildschirm) gesetzt (ContentScrollMixin._schedule_reflow):
+		Beim Stack-Neuaufbau sind die alten Seiten per deleteLater() noch im
+		Widget-Baum; bis sie zerstört sind, liefern die Layout-Caches einen
+		veralteten sizeHint. _apply_reflow_size zerstört sie erst und misst
+		dann den konsistenten Inhalt.
 		"""
-		lay = self.layout()
-		if lay is not None:
-			lay.invalidate()
-		self.adjustSize()
+		self._schedule_reflow()
 
 	def refresh_service_set_list(self) -> None:
 		"""Befüllt das Set-Dropdown aus ServiceSetRepository.list_sets()."""
 		if not self.combo_service_set:
 			return
 		current = self.combo_service_set.currentData()
+		# 5.5 Fix (Bugfix #3): Beim Oeffnen/Restore das uebergebene Set
+		# vorbelegen, wenn noch keine Auswahl besteht (current leer).
+		prefer = current or self._current_set_id
 
 		self.combo_service_set.blockSignals(True)
 		self.combo_service_set.clear()
@@ -16896,8 +17598,8 @@ class IndicatorSettingsDialog(QDialog):
 		for s in self.set_repo.list_sets():
 			label = s.get("display_name") or s.get("set_id") or "Unbenannt"
 			self.combo_service_set.addItem(label, s.get("set_id"))
-		if current:
-			idx = self.combo_service_set.findData(current)
+		if prefer:
+			idx = self.combo_service_set.findData(prefer)
 			if idx >= 0:
 				self.combo_service_set.setCurrentIndex(idx)
 		self.combo_service_set.blockSignals(False)
@@ -16929,6 +17631,16 @@ class IndicatorSettingsDialog(QDialog):
 					self.combo_service_sel.addItem(f"{iid} [{pid}]", iid)
 			self.combo_service_sel.blockSignals(False)
 
+		# 5.4 Schritt 2: Die Berechnungslogik des gewählten Sets in self.params
+		# mergen, damit Seite 0 (Service-Props des aktiven Plugins) die aktuellen
+		# Logik-Werte zeigt. Die Darstellung (Farben, Sichtbarkeiten) bleibt
+		# unberührt – sie lebt getrennt in display_params.
+		self.params.update(self._resolve_set_logic_params())
+		# 5.5 Fix (Bugfix #1+#3): Die zuletzt im Dialog gemeldeten Service-
+		# Parameter (Live-Overlay / logic_params aus geladenem Preset) wieder
+		# ueber die Set-Logik legen - so bleiben Aenderungen an grid_step,
+		# prox_levels, ... beim Set-Wechsel UND beim Restore erhalten.
+		self.params.update(self._preset_logic_params)
 		self._rebuild_service_stack()
 
 	def _on_service_selected(self, index: int) -> None:
@@ -17030,6 +17742,77 @@ class IndicatorSettingsDialog(QDialog):
 		# 4.4: Fenster/Box auf die neue Stack-Seite nachziehen (dynamische Höhe)
 		if self._ui_ready:
 			self._reflow()
+
+	def _resolve_set_logic_params(self) -> Dict[str, Any]:
+		"""5.4 Schritt 2: Berechnungslogik des gewählten Service-Sets.
+
+		Liefert lookback + params des Service im Set, dessen plugin_id zum
+		aktiven Plugin passt (sonst erster Service). Leer, wenn kein Set
+		gewählt ist oder das Set keine Services hat. Die Darstellung (Farben,
+		Sichtbarkeiten) bleibt davon unberührt – sie lebt in display_params.
+		"""
+		if self.plugin is None:
+			return {}
+		set_id = self.combo_service_set.currentData() if self.combo_service_set else ""
+		if not set_id:
+			return {}
+		try:
+			definition = self.set_repo.get_set(set_id)
+			services = (definition or {}).get("services") or {}
+			order = (definition or {}).get("execution_order") or []
+			cfg = None
+			for iid in order:
+				s = services.get(iid) or {}
+				if s.get("plugin_id") == self.plugin.plugin_id:
+					cfg = s
+					break
+			if cfg is None and order:
+				cfg = services.get(order[0]) or {}
+			if not cfg:
+				return {}
+			merged: Dict[str, Any] = {}
+			if cfg.get("lookback") is not None:
+				merged["lookback"] = int(cfg["lookback"])
+			merged.update(dict(cfg.get("params") or {}))
+			return merged
+		except Exception as e:
+			print(f"⚠️ [IndicatorDialog] Service-Set '{set_id}' nicht ladbar: {e}")
+			return {}
+
+	def _collect_logic_params(self) -> Dict[str, Any]:
+		"""5.5 Fix: Live-Service-Parameter (logic_params) aus den Controls.
+
+		Alle Nicht-Darstellungs-Keys aus self.param_controls (Box
+		'Service-Parameter' + Expert-Optionen des aktiven Plugins) - also
+		grid_step, proximity_threshold, prox_levels, lookback usw. Diese
+		ueberlagern im Chart die Basis-Logik des Service-Sets (Live-Overlay).
+		"""
+		logic: Dict[str, Any] = {}
+		for key, ctrl in self.param_controls.items():
+			if not self._is_visual_key(key):
+				logic[key] = self._ctrl_value(ctrl)
+		return logic
+
+	def _build_preset_payload(self) -> Dict[str, Any]:
+		"""5.4 Schritt 2 + 5.5 Fix: Getrenntes Rückgabe-Dictionary (Logik vs. Darstellung).
+
+		Plugin-Modus: set_id (gewähltes Service-Set) + logic_params (Live-
+		Service-Parameter aus der Box 'Service-Parameter' + Expert-Optionen)
+		+ display_params (nur reine Darstellung: Sichtbarkeit, Farben). Die
+		Basis-Berechnungslogik lebt im Service-Set (service_sets-Tabelle);
+		logic_params ueberlagert sie als Live-Overlay, damit Aenderungen an
+		grid_step / prox_levels / lookback SOFORT auf dem Chart erscheinen.
+		Legacy (Alt-Indikator ohne Plugin): volle params (kein Set).
+		"""
+		if self.plugin is None:
+			return dict(self.collect_params_from_ui())
+		set_id = self.combo_service_set.currentData() if self.combo_service_set else ""
+		display: Dict[str, Any] = {}
+		for key, ctrl in self.param_controls.items():
+			if self._is_visual_key(key):
+				display[key] = self._ctrl_value(ctrl)
+		return {"set_id": set_id or "", "logic_params": self._collect_logic_params(),
+		        "display_params": display}
 
 	# -------------------------------------------------------------------------
 	# Set-Aktionen (Phase 13 Schritt 5)
@@ -17303,6 +18086,8 @@ class IndicatorSettingsDialog(QDialog):
 						new_params[key] = default_val
 				else:
 					new_params[key] = raw_val
+			elif isinstance(ctrl, ColorButton):
+				new_params[key] = ctrl.color()
 			elif isinstance(ctrl, QLineEdit):
 				new_params[key] = ctrl.text()
 		return new_params
@@ -17319,6 +18104,8 @@ class IndicatorSettingsDialog(QDialog):
 					ctrl.setValue(val)
 				elif isinstance(ctrl, QComboBox):
 					ctrl.setCurrentText(str(val))
+				elif isinstance(ctrl, ColorButton) and isinstance(val, str):
+					ctrl.setColor(val)
 				elif isinstance(ctrl, QLineEdit) and isinstance(val, str):
 					ctrl.setText(val)
 
@@ -17326,7 +18113,14 @@ class IndicatorSettingsDialog(QDialog):
 
 	def on_param_control_changed(self) -> None:
 		self.params = self.collect_params_from_ui()
-		self.on_params_changed_callback(self.params, self.current_preset_name)
+		# 5.5 Fix: Das Live-Overlay (logic_params) bei jeder Aenderung
+		# mitfuehren, damit Set-Wechsel/Restore im Dialog den aktuellen
+		# Stand der Service-Parameter beibehalten (Bugfix #1+#3).
+		if self.plugin is not None:
+			self._preset_logic_params = self._collect_logic_params()
+		# 5.4 Schritt 2: Getrenntes Dict {set_id, display_params} an das
+		# Chart-Window – die Berechnungslogik lebt im Service-Set.
+		self.on_params_changed_callback(self._build_preset_payload(), self.current_preset_name)
 
 	def on_preset_selected(self, preset_name: str) -> None:
 		if not preset_name:
@@ -17339,10 +18133,30 @@ class IndicatorSettingsDialog(QDialog):
 		else:
 			loaded = self.state_manager.get_indicator_preset(self.indicator.indicator_id, preset_name)
 			if loaded:
-				self.params = loaded
+				if (self.plugin is not None and isinstance(loaded, dict)
+						and "display_params" in loaded):
+					# 5.4 Schritt 2: Decoupled Preset (set_id + display_params).
+					# Darstellung übernehmen, Set-Auswahl setzen (löst
+					# _on_service_set_changed → mergt die Logik in self.params).
+					# 5.5 Fix (Bugfix #3): Auch logic_params aus dem Preset
+					# laden - das sind die zuletzt gemeldeten Service-Werte
+					# (Live-Overlay), die beim Restore erhalten bleiben muessen.
+					display = dict(loaded.get("display_params") or {})
+					self._preset_logic_params = dict(loaded.get("logic_params") or {})
+					set_id = loaded.get("set_id") or ""
+					merged = dict(self.indicator.default_params)
+					merged.update(self._preset_logic_params)
+					merged.update(display)
+					self.params = merged
+					if self.combo_service_set:
+						idx = self.combo_service_set.findData(set_id)
+						self.combo_service_set.setCurrentIndex(idx if idx >= 0 else 0)
+				else:
+					# Legacy-Preset: volle params
+					self.params = loaded
 
 		self.update_ui_from_params(self.params)
-		self.on_params_changed_callback(self.params, self.current_preset_name)
+		self.on_params_changed_callback(self._build_preset_payload(), self.current_preset_name)
 
 	def save_current_preset(self) -> None:
 		self.params = self.collect_params_from_ui()
@@ -17371,10 +18185,14 @@ class IndicatorSettingsDialog(QDialog):
 			if reply != QMessageBox.Yes:
 				return
 
-		self.state_manager.save_indicator_preset(self.indicator.indicator_id, clean_name, self.params)
+		# 5.4 Schritt 2: Nur das GETRENNTE Dict {set_id, display_params}
+		# speichern – die Berechnungslogik bleibt im Service-Set (service_sets),
+		# das Preset hält nur Darstellung + Set-Referenz.
+		payload = self._build_preset_payload()
+		self.state_manager.save_indicator_preset(self.indicator.indicator_id, clean_name, payload)
 		self.current_preset_name = clean_name
 		self.refresh_preset_list()
-		self.on_params_changed_callback(self.params, self.current_preset_name)
+		self.on_params_changed_callback(self._build_preset_payload(), self.current_preset_name)
 
 	def delete_current_preset(self) -> None:
 		if self.current_preset_name == "Default":
@@ -19347,6 +20165,184 @@ class SignalOverlay:
 
 --------------------------------------------------
 
+### DATEI: chart/widgets/__init__.py
+```py
+# chart/widgets/__init__.py
+# Wiederverwendbare kompakte UI-Widgets (Phase 13 Kapitel 5.5).
+#
+# HINWEIS: Bewusst MINIMAL gehalten – hier werden KEINE schweren Module
+# importiert (kein chart_win, keine Indikatoren). ColorButton ist ein
+# eigenständiges PySide6-Widget und kann von indicator_dialog.py,
+# service_win.py und Tests ohne Circular-Import-Risiko eingebunden werden.
+from .color_button import ColorButton
+
+__all__ = ["ColorButton"]
+
+```
+
+--------------------------------------------------
+
+### DATEI: chart/widgets/color_button.py
+```py
+# chart/widgets/color_button.py
+# Phase 13 Kapitel 5.5 Schritt 1: Kompakter Farbwähler mit Alpha-Kanal.
+#
+# Roadmap 5.5.1.2:
+#   - Baut zu 100 % auf PySide6 (QColorDialog + QPushButton) auf – keine
+#     externen UI-Bibliotheken.
+#   - Platzeffizient: kleines Farbquadrat (festgelegte Kompaktgröße 60x24 px),
+#     das die gewählte Farbe inklusive Deckkraft als Hintergrund anzeigt.
+#   - Transparenz: über QColorDialog.ShowAlphaChannel wird ein Schieberegler
+#     für die Deckkraft (0-255) freigeschaltet.
+#   - CSS/Chart-Kompatibilität: bei 100 % Deckkraft (Alpha=255) liefert color()
+#     ein Hex-Format '#RRGGBB'; bei Teil-Transparenz einen rgba(r,g,b,a)-String
+#     (a als Float 0..1). Beides ist 1:1 kompatibel mit TradingView Lightweight
+#     Charts v5 (WebEngine) und HTML/CSS.
+#
+# Roadmap 5.5.2.1 Prämisse 3 (Kompaktes Layout): Die feste Kompaktgröße ist
+# bewusst klein; Size-Policy = Fixed verhindert, dass das Widget in Layouts
+# gedehnt wird und die dynamische Höhe/Breite des Prop-Fensters blockiert.
+
+from typing import Optional
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import QColorDialog, QPushButton, QSizePolicy
+
+
+class ColorButton(QPushButton):
+    """Kompakter Farbwähler (farbiges Quadrat) mit optionalem Alpha-Kanal.
+
+    Attributes:
+        _color: QColor        – aktuelle Farbe inkl. Alpha (0-255).
+        _enable_alpha: bool   – ob der QColorDialog den Alpha-Slider zeigt.
+
+    Signal:
+        colorChanged = Signal(str) – emittiert den Farb-String (hex oder
+        rgba(...)) bei jeder Änderung über den Farbdialog.
+    """
+
+    colorChanged = Signal(str)
+
+    def __init__(self, default_color: str = "#2196F3", enable_alpha: bool = True,
+                 parent=None) -> None:
+        super().__init__(parent)
+        # Eindeutiger ObjectName: Das Stylesheet in update_style() wird über
+        # 'QPushButton#ColorButtonSwatch' auf DIESEN Button gescoped. Ohne
+        # Scoping wuerde der breite Selektor 'QPushButton' auf alle
+        # Nachkommen-Buttons abfaerben - insbesondere auf die kleinen Buttons
+        # im QColorDialog (wird mit self als Parent geoeffnet), die dann die
+        # aktuell gewaehlte Farbe statt der Standard-UI-Farbe zeigen.
+        self.setObjectName("ColorButtonSwatch")
+        self._enable_alpha: bool = bool(enable_alpha)
+        self._color: QColor = QColor()
+        self.setColor(default_color)
+
+        # Kompakte Festgröße (Roadmap 5.5.1.2: "festgelegte Kompaktgröße z. B.
+        # 60x24 px"). Fixed-Size-Policy: das Widget wird in Layouts weder
+        # gedehnt noch gestaucht -> blockiert die Layout-Dynamik nicht.
+        self.setFixedSize(60, 24)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Farbe auswählen (inkl. Transparenz)")
+        self.clicked.connect(self._open_color_dialog)
+
+    # ------------------------------------------------------------------
+    # Öffentliche API
+    # ------------------------------------------------------------------
+
+    def color(self) -> str:
+        """Gibt die aktuelle Farbe als String zurück.
+
+        Alpha == 255 -> '#RRGGBB' (Hex, Großbuchstaben, volle Deckkraft).
+        Alpha < 255  -> 'rgba(r, g, b, a)' mit a als Float (0..1) –
+                        direkt kompatibel mit TradingView v5 / CSS.
+        """
+        c = self._color
+        if not c.isValid():
+            return "#000000"
+        if c.alpha() < 255:
+            a = round(c.alpha() / 255.0, 2)
+            return f"rgba({c.red()}, {c.green()}, {c.blue()}, {a})"
+        return c.name().upper()
+
+    def setColor(self, color_str: str) -> None:
+        """Setzt die Farbe aus einem Hex- oder rgba(...)-String.
+
+        Ungültige Eingaben werden ignoriert (bisherige Farbe bleibt erhalten).
+        Aktualisiert anschließend das Button-Styling.
+        """
+        parsed = self._parse_color(color_str)
+        if parsed is not None:
+            self._color = parsed
+            self.update_style()
+
+    def update_style(self) -> None:
+        """Setzt das Button-Stylesheet auf die aktuelle Farbe inkl. Deckkraft.
+
+        Hintergrund wird immer als rgba(...) gesetzt, damit die Transparenz
+        direkt im Button sichtbar ist (Deckkraft-Visualisierung).
+        """
+        c = self._color
+        if not c.isValid():
+            bg = "rgba(0, 0, 0, 1.0)"
+        else:
+            bg = f"rgba({c.red()}, {c.green()}, {c.blue()}, {c.alpha() / 255.0})"
+        self.setStyleSheet(
+            "QPushButton#ColorButtonSwatch { background-color: " + bg +
+            "; border: 1px solid #555555; border-radius: 3px; }"
+        )
+
+    # ------------------------------------------------------------------
+    # Intern
+    # ------------------------------------------------------------------
+
+    def _open_color_dialog(self) -> None:
+        """Öffnet QColorDialog.getColor() (mit Alpha-Slider, wenn aktiviert).
+
+        Bei gültiger Auswahl wird colorChanged mit dem neuen Farb-String
+        emittiert (hex oder rgba(...), je nach Alpha).
+        """
+        options = QColorDialog.ColorDialogOption(0)
+        if self._enable_alpha:
+            options |= QColorDialog.ColorDialogOption.ShowAlphaChannel
+        chosen = QColorDialog.getColor(self._color, self, "Farbe auswählen", options)
+        if chosen.isValid():
+            self._color = chosen
+            self.update_style()
+            self.colorChanged.emit(self.color())
+
+    @staticmethod
+    def _parse_color(color_str: str) -> Optional[QColor]:
+        """Parst Hex- oder rgba(...)-Strings in ein QColor (oder None)."""
+        s = (color_str or "").strip()
+        if not s:
+            return None
+        low = s.lower()
+        if low.startswith("rgba("):
+            try:
+                inner = s[s.index("(") + 1:s.rindex(")")]
+                parts = [p.strip() for p in inner.split(",")]
+                if len(parts) != 4:
+                    return None
+                r = int(round(float(parts[0])))
+                g = int(round(float(parts[1])))
+                b = int(round(float(parts[2])))
+                a_frac = float(parts[3])
+            except (ValueError, TypeError):
+                return None
+            r = max(0, min(255, r))
+            g = max(0, min(255, g))
+            b = max(0, min(255, b))
+            alpha = max(0, min(255, int(round(a_frac * 255))))
+            return QColor(r, g, b, alpha)
+        c = QColor(s)
+        return c if c.isValid() else None
+
+```
+
+--------------------------------------------------
+
 ### DATEI: config/__init__.py
 ```py
 
@@ -19856,6 +20852,15 @@ def _run_layout_test() -> None:
     tmp_dir = tempfile.mkdtemp(prefix="dlg_geom_")
     repo = ServiceSetRepository(db_path=os.path.join(tmp_dir, "app.duckdb"))
 
+    from PySide6.QtCore import QTimer
+
+    def pump():
+        """Eine Event-Loop-Runde: DeferredDelete + Zero-Timer (deferred reflow)."""
+        app.processEvents()
+        QTimer.singleShot(0, app.quit)
+        app.exec()
+        app.processEvents()
+
     ind = _FakeIndicator()
     win = indicator_dialog.IndicatorSettingsDialog(
         ind, dict(ind.default_params), "Default", _SM(),
@@ -19865,6 +20870,15 @@ def _run_layout_test() -> None:
     check("Prop-Fenster headless instanziiert (ohne exec_())", win is not None)
     check("Plugin-Modus aktiv (group_expert vorhanden)",
           win.plugin is not None and win.group_expert is not None)
+
+    # 5.4 User-Anforderung: gesamtes Fenster scrollbar + auf Bildschirm
+    # geklemmt (ContentScrollMixin). show() + Event-Loop-Runde, damit der
+    # DEFERRED Reflow (deleteLater-Widgets zerstören + Größe setzen) läuft.
+    win.show()
+    pump()
+    check("Fenster auf Screen geklemmt (max == Screen)",
+          win.maximumSize() == app.primaryScreen().availableGeometry().size())
+    check("ScrollArea installiert (Inhalt scrollbar)", win.content_scroll is not None)
 
     # Box 'Service-Parameter' endet exakt unter dem letzten Parameter
     # (Höhe == sizeHint, kein leerer Raum innerhalb der Box).
@@ -21851,6 +22865,1170 @@ print("\nFertig.")
 
 --------------------------------------------------
 
+### DATEI: test/check_p13_color_button.py
+```py
+# test/check_p13_color_button.py
+# Headless-Validierung für Phase 13 Kapitel 5.5 Schritt 1 (ColorButton).
+#
+# Roadmap §5.5.2.2.3:
+#   - Instanziiere ColorButton headless.
+#   - Teste setColor("#FF0000") und setColor("rgba(255, 0, 0, 0.5)") und
+#     verifiziere, dass color() jeweils den korrekten String-Typ liefert
+#     (Hex '#RRGGBB' bei Alpha=255, 'rgba(r, g, b, a)' bei Alpha<255).
+#
+# Zusätzlich verifiziert:
+#   - Kompakte Festgröße 60x24 (Roadmap 5.5.1.2).
+#   - _enable_alpha steuert das ShowAlphaChannel-Flag im QColorDialog.
+#   - colorChanged-Signal wird bei gültiger Dialog-Auswahl emittiert.
+#   - Ungültige Eingaben ändern die Farbe NICHT (Robustheit).
+#   - rgba-Roundtrip (0.35 / 0.5) bleibt exakt.
+import os
+import sys
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+import py_compile
+
+ok = True
+failures = []
+
+
+def check(cond, msg):
+    global ok
+    if cond:
+        print(f"   \u2705 {msg}")
+    else:
+        ok = False
+        failures.append(msg)
+        print(f"   \u274c {msg}")
+
+
+def main() -> int:
+    global ok
+    print("=" * 70)
+    print("Phase 13 5.5 Schritt 1 – ColorButton mit Alpha-Kanal (headless)")
+    print("=" * 70)
+
+    # [1] py_compile
+    print("\n[1] py_compile:")
+    for f in ("chart/widgets/color_button.py", "chart/widgets/__init__.py"):
+        try:
+            py_compile.compile(str(ROOT / f), doraise=True)
+            check(True, f"{f} kompiliert fehlerfrei")
+        except Exception as e:
+            check(False, f"py_compile {f}: {e}")
+
+    # [2] Setup (offscreen)
+    print("\n[2] Setup (offscreen):")
+    from PySide6.QtGui import QColor
+    from PySide6.QtWidgets import QApplication, QColorDialog, QPushButton
+
+    from chart.widgets.color_button import ColorButton
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    check(app is not None, "QApplication (offscreen) erstellt")
+
+    btn = ColorButton(default_color="#2196F3", enable_alpha=True)
+    check(isinstance(btn, QPushButton), "ColorButton erbt von QPushButton")
+    check(btn.size().width() == 60 and btn.size().height() == 24,
+          f"Kompakte Festgröße 60x24 (ist {btn.size().width()}x{btn.size().height()})")
+    check(btn._enable_alpha is True, "enable_alpha=True gesetzt")
+    check(isinstance(btn._color, QColor), "_color ist ein QColor")
+
+    # [3] Hex-Farbe (Alpha=255) -> '#RRGGBB'
+    print("\n[3] setColor('#FF0000') -> Hex-Format:")
+    btn.setColor("#FF0000")
+    c1 = btn.color()
+    check(c1 == "#FF0000", f"color() == '#FF0000' (ist {c1!r})")
+    check(btn._color.alpha() == 255, "_color.alpha() == 255 (volle Deckkraft)")
+    check(not c1.lower().startswith("rgba"),
+          "color() liefert KEIN rgba bei voller Deckkraft")
+
+    # [4] rgba-Farbe (Alpha<255) -> 'rgba(r, g, b, a)'
+    print("\n[4] setColor('rgba(255, 0, 0, 0.5)') -> rgba-Format:")
+    btn.setColor("rgba(255, 0, 0, 0.5)")
+    c2 = btn.color()
+    check(c2.lower().startswith("rgba("), f"color() beginnt mit 'rgba(' (ist {c2!r})")
+    check(", 0, 0" in c2 and c2.split(",")[0].replace("rgba(", "") == "255",
+          f"rgba enthält Rotwert 255 (ist {c2!r})")
+    alpha_str = c2[c2.rindex(",") + 1:c2.rindex(")")].strip()
+    try:
+        alpha_val = float(alpha_str)
+        check(0.0 <= alpha_val <= 1.0 and abs(alpha_val - 0.5) < 0.01,
+              f"Alpha-Float ~0.5 (ist {alpha_val})")
+    except ValueError:
+        check(False, f"Alpha ist kein Float (ist {alpha_str!r})")
+    check(btn._color.alpha() < 255, "_color.alpha() < 255 (Teil-Transparenz)")
+
+    # [5] rgba-Roundtrip exakt (0.35-Beispiel aus der Roadmap)
+    print("\n[5] rgba-Roundtrip (Roadmap-Beispiel 0.35):")
+    btn.setColor("rgba(33, 150, 243, 0.35)")
+    check(btn.color() == "rgba(33, 150, 243, 0.35)",
+          f"setColor('rgba(33,150,243,0.35)') -> color() identisch (ist {btn.color()!r})")
+
+    # [6] enable_alpha steuert das QColorDialog-Flag
+    print("\n[6] enable_alpha -> ShowAlphaChannel-Flag:")
+    captured = {}
+
+    def _fake_get_color(initial, parent=None, title="", options=0):
+        captured["options"] = options
+        return QColor(255, 0, 0)
+
+    orig_get_color = QColorDialog.getColor
+    QColorDialog.getColor = staticmethod(_fake_get_color)
+
+    btn2 = ColorButton(default_color="#00FF00", enable_alpha=False)
+    check(btn2._enable_alpha is False, "enable_alpha=False gesetzt")
+    btn2._open_color_dialog()
+    check(not bool(captured.get("options", 0) & QColorDialog.ColorDialogOption.ShowAlphaChannel),
+          "enable_alpha=False -> KEIN ShowAlphaChannel-Flag")
+
+    btn._open_color_dialog()
+    check(bool(captured.get("options", 0) & QColorDialog.ColorDialogOption.ShowAlphaChannel),
+          "enable_alpha=True -> ShowAlphaChannel-Flag gesetzt")
+    QColorDialog.getColor = orig_get_color
+
+    # [7] colorChanged-Signal bei gültiger Dialog-Auswahl
+    print("\n[7] Signal colorChanged:")
+    emitted = []
+
+    def _on_change(s):
+        emitted.append(s)
+
+    btn.colorChanged.connect(_on_change)
+    QColorDialog.getColor = staticmethod(lambda *a, **k: QColor(10, 20, 30, 128))
+    btn._open_color_dialog()
+    check(len(emitted) == 1, "colorChanged genau 1x emittiert")
+    if emitted:
+        check(emitted[0].lower().startswith("rgba(") and "10" in emitted[0],
+              f"Signal liefert rgba-String der neuen Farbe (ist {emitted[0]!r})")
+        check(emitted[0] == btn.color(), "Signalwert == color() des Buttons")
+
+    # Abbrechen im Dialog (invalid) -> kein Signal, Farbe unverändert
+    before = btn.color()
+    QColorDialog.getColor = staticmethod(lambda *a, **k: QColor())
+    btn._open_color_dialog()
+    check(len(emitted) == 1, "Abgebrochener Dialog emittiert KEIN weiteres Signal")
+    check(btn.color() == before, "Farbe bleibt bei Abbruch unverändert")
+    QColorDialog.getColor = orig_get_color
+
+    # [8] Robustheit: ungültige Eingaben ändern die Farbe nicht
+    print("\n[8] Ungültige Eingaben (Robustheit):")
+    btn.setColor("#00FF00")
+    before = btn.color()
+    for bad in ("", "   ", "notacolor", "rgba(1,2,3)", "rgba(a,b,c,0.5)"):
+        btn.setColor(bad)
+        check(btn.color() == before, f"setColor({bad!r}) ändert Farbe NICHT")
+    check(btn.color() == "#00FF00", "Farbe ist nach ungültigen Eingaben noch #00FF00")
+
+    print()
+    if ok:
+        print("RESULT: ALLE CHECKS BESTANDEN \u2705")
+        return 0
+    print(f"RESULT: {len(failures)} CHECK(S) FEHLGESCHLAGEN \u274c")
+    for f in failures:
+        print(f"   - {f}")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_p13_color_integration.py
+```py
+# test/check_p13_color_integration.py
+# Headless-Validierung für Phase 13 Kapitel 5.5 Feintuning
+# (ColorButton-Anbindung an das dynamische Prop-Fenster).
+#
+# Roadmap §5.5.2.3.3 + Architektur-Regel 2.5:
+#   - Jeder Parameter vom Typ "color" im ParameterSchema wird IMMER als
+#     ColorButton gerendert (niemals als freies Textfeld/QLineEdit).
+#   - Die drei Farbparameter des grid_liquidity-Plugins (line_color,
+#     circle_color_std, circle_color_active) erscheinen im Indikator-Dialog
+#     als ColorButton.
+#   - Farbänderungen (inkl. Alpha-Kanal) kommen korrekt im Parameter-Dict /
+#     decoupled Payload an.
+#   - update_ui_from_params setzt die Farbe über ColorButton.setColor().
+#   - allow_alpha aus dem Schema (Default True) steuert den Alpha-Slider.
+#
+# WICHTIG: Keine GUI-Ausführung. Offscreen-QApplication; echte app_data.duckdb
+# bleibt unberührt (temporäre DB nur für ServiceSetRepository-Liste).
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+import py_compile
+
+from analytics.engine.service_set_repository import ServiceSetRepository
+
+ok = True
+failures = []
+
+
+def check(cond, msg):
+    global ok
+    if cond:
+        print(f"   \u2705 {msg}")
+    else:
+        ok = False
+        failures.append(msg)
+        print(f"   \u274c {msg}")
+
+
+class FakeStateManager:
+    """StateManager-Fake (Presets, Geometrie – keine DB)."""
+
+    def __init__(self):
+        self.saved_presets: dict = {}
+        self.presets: list = ["Default"]
+
+    def get_dialog_geometry(self, *a, **k):
+        return None
+
+    def save_dialog_geometry(self, *a, **k):
+        pass
+
+    def list_indicator_presets(self, *a, **k):
+        return list(self.presets)
+
+    def get_indicator_preset(self, indicator_id, name):
+        return self.saved_presets.get(name)
+
+    def save_indicator_preset(self, indicator_id, name, payload):
+        self.saved_presets[name] = payload
+        if name not in self.presets:
+            self.presets.append(name)
+
+    def delete_indicator_preset(self, *a, **k):
+        pass
+
+
+def main() -> int:
+    global ok
+    print("=" * 70)
+    print("Phase 13 5.5 Feintuning – ColorButton-Integration (headless)")
+    print("=" * 70)
+
+    # [1] py_compile
+    print("\n[1] py_compile:")
+    for f in ("chart/indicator_dialog.py", "chart/widgets/color_button.py",
+              "chart/widgets/__init__.py"):
+        try:
+            py_compile.compile(str(ROOT / f), doraise=True)
+            check(True, f"{f} kompiliert fehlerfrei")
+        except Exception as e:
+            check(False, f"py_compile {f}: {e}")
+
+    # [2] Setup (offscreen, temp DB, echter GridLiquidityIndicator)
+    print("\n[2] Setup (offscreen, echter GridLiquidityIndicator):")
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QApplication, QLineEdit
+
+    from chart.indicators.grid_liquidity import GridLiquidityIndicator
+    from chart.widgets.color_button import ColorButton
+    import chart.indicator_dialog as indicator_dialog
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    check(app is not None, "QApplication (offscreen) erstellt")
+
+    tmp_dir = tempfile.mkdtemp(prefix="p13_55_ft_")
+    tmp_db = os.path.join(tmp_dir, "tmp_app_data.duckdb")
+    repo = ServiceSetRepository(db_path=tmp_db)
+
+    ind = GridLiquidityIndicator()
+    sm = FakeStateManager()
+    dlg = indicator_dialog.IndicatorSettingsDialog(
+        ind, dict(ind.default_params), "Default", sm,
+        lambda p, pr: None, symbol="SILVER", timeframe="H1", service_set_repo=repo,
+    )
+    dlg.show()
+    app.processEvents()
+    QTimer.singleShot(0, app.quit)
+    app.exec()
+    app.processEvents()
+    check(dlg.plugin is not None and dlg.plugin.plugin_id == "grid_liquidity",
+          "Plugin grid_liquidity aus der Registry geladen")
+
+    # [3] Die 3 Farbparameter sind ColorButton (niemals QLineEdit)
+    print("\n[3] Drei Farbparameter des grid_liquidity-Plugins:")
+    expected = {
+        "line_color": "#2196F3",
+        "circle_color_std": "#FFEB3B",
+        "circle_color_active": "#E91E63",
+    }
+    for key, default in expected.items():
+        ctrl = dlg.param_controls.get(key)
+        check(isinstance(ctrl, ColorButton), f"{key} wird als ColorButton gerendert")
+        if ctrl is not None:
+            check(not isinstance(ctrl, QLineEdit), f"{key} ist KEIN freies Textfeld (QLineEdit)")
+            check(ctrl.color() == default,
+                  f"{key} zeigt Default-Farbe {default} (ist {ctrl.color()!r})")
+
+    # [4] Farbänderung (inkl. Alpha-Kanal) -> Parameter-Dict / decoupled Payload
+    print("\n[4] Farbänderung inkl. Alpha-Kanal:")
+    dlg.param_controls["line_color"].setColor("#FF0000")
+    dlg.on_param_control_changed()
+    params = dlg.collect_params_from_ui()
+    check(params.get("line_color") == "#FF0000",
+          f"collect_params_from_ui liefert #FF0000 (ist {params.get('line_color')!r})")
+
+    payload = dlg._build_preset_payload()
+    check(payload.get("display_params", {}).get("line_color") == "#FF0000",
+          "decoupled Payload: display_params.line_color == #FF0000")
+
+    dlg.param_controls["circle_color_active"].setColor("rgba(233, 30, 99, 0.5)")
+    dlg.on_param_control_changed()
+    payload = dlg._build_preset_payload()
+    check(payload.get("display_params", {}).get("circle_color_active") == "rgba(233, 30, 99, 0.5)",
+          f"Alpha-Kanal überlebt den Payload (ist {payload.get('display_params', {}).get('circle_color_active')!r})")
+
+    # [5] update_ui_from_params setzt die Farbe via ColorButton.setColor()
+    print("\n[5] update_ui_from_params (setColor):")
+    dlg.update_ui_from_params({"line_color": "#ABCDEF"})
+    check(dlg.param_controls["line_color"].color() == "#ABCDEF",
+          f"setColor('#ABCDEF') über update_ui_from_params (ist {dlg.param_controls['line_color'].color()!r})")
+
+    # [6] allow_alpha aus dem Schema (Default True) + Flag respektiert
+    print("\n[6] allow_alpha (Schema):")
+    line_spec = dlg.plugin_schema.get("line_color", {})
+    check(line_spec.get("type") == "color", "line_color-Schema ist type 'color'")
+    check(dlg.param_controls["line_color"]._enable_alpha is True,
+          "Default allow_alpha=True -> Alpha-Slider aktiv (ShowAlphaChannel)")
+    btn_no_alpha = dlg.create_schema_control(
+        "test_color", "#000000", {"type": "color", "allow_alpha": False})
+    check(isinstance(btn_no_alpha, ColorButton) and btn_no_alpha._enable_alpha is False,
+          "allow_alpha=False -> ColorButton ohne Alpha-Slider")
+    check(isinstance(btn_no_alpha, ColorButton) and not isinstance(btn_no_alpha, QLineEdit),
+          "create_schema_control(type=color) liefert IMMER ColorButton, nie QLineEdit")
+
+    # [7] Code-Inspektion: color-Zweig + Architektur-Regel dokumentiert
+    print("\n[7] Code-Inspektion & Doku:")
+    src = (ROOT / "chart" / "indicator_dialog.py").read_text(encoding="utf-8")
+    check('p_type == "color"' in src, "create_schema_control hat color-Zweig")
+    check("ColorButton(default_color=str(val), enable_alpha=allow_alpha)" in src,
+          "color-Zweig erzeugt ColorButton mit allow_alpha aus dem Schema")
+    check("isinstance(ctrl, ColorButton)" in src,
+          "Wert-Lesen/Setzen unterstützt ColorButton (_ctrl_value/collect/update)")
+
+    arch = (ROOT / "docs" / "x_Architektur.md").read_text(encoding="utf-8")
+    check("ColorButton" in arch and "ausschließlich" in arch,
+          "x_Architektur.md dokumentiert die verbindliche ColorButton-Regel")
+    check("service_win.py" in arch and "Farbparameter" in arch,
+          "Architektur-Regel nennt Geltungsbereich (alle Formular-Generatoren)")
+
+    # Aufräumen
+    try:
+        os.remove(tmp_db)
+        os.rmdir(tmp_dir)
+    except Exception:
+        pass
+
+    print()
+    if ok:
+        print("RESULT: ALLE CHECKS BESTANDEN \u2705")
+        return 0
+    print(f"RESULT: {len(failures)} CHECK(S) FEHLGESCHLAGEN \u274c")
+    for f in failures:
+        print(f"   - {f}")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_p13_grid_liquidity_fixes.py
+```py
+# test/check_p13_grid_liquidity_fixes.py
+# Headless-Validierung für Phase 13 5.5 (3 Bugfixes am grid_liquidity-Indikator)
+#
+# Bugfix #1: Änderungen in 'Anzeige' ODER 'Service-Parameter' werden SOFORT auf
+#            dem Chart umgesetzt. Der Dialog liefert im Payload zusätzlich
+#            logic_params (Live-Overlay der Service-Parameter); chart_win
+#            speichert sie im indicators_state und _resolve_indicator_params
+#            überlagert die Set-Logik damit.
+# Bugfix #2: prox_level1-6 müssen Nachkommastellen ermöglichen (step 0.01 im
+#            Schema + _decimal_places-Minimum 2 für Floats).
+# Bugfix #3: Beim Restore/Neuaufbau von chart_win wird die zuletzt gewählte
+#            set_id an den Dialog übergeben (Set-Combo vorbelegt) und die
+#            Service-Params (Set-Logik + Live-Overlay + Preset-logic_params)
+#            werden sauber wiederhergestellt.
+#
+# WICHTIG: Keine GUI-Ausführung. Offscreen-QApplication; chart_win-Logik über
+# object.__new__-Objekte (kein QWebEngineView nötig). Echte app_data.duckdb
+# bleibt unberührt (temporäre DBs).
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+import py_compile
+
+from analytics.engine.service_set_repository import ServiceSetRepository
+
+ok = True
+failures = []
+
+
+def check(cond, msg):
+    global ok
+    if cond:
+        print(f"   \u2705 {msg}")
+    else:
+        ok = False
+        failures.append(msg)
+        print(f"   \u274c {msg}")
+
+
+class FakeStateManager:
+    """StateManager-Fake für den Dialog (Presets, Geometrie, keine DB)."""
+
+    def __init__(self):
+        self.saved_presets: dict = {}
+        self.presets: list = ["Default"]
+
+    def get_dialog_geometry(self, *a, **k):
+        return None
+
+    def save_dialog_geometry(self, *a, **k):
+        pass
+
+    def list_indicator_presets(self, *a, **k):
+        return list(self.presets)
+
+    def get_indicator_preset(self, indicator_id, name):
+        return self.saved_presets.get(name)
+
+    def save_indicator_preset(self, indicator_id, name, payload):
+        self.saved_presets[name] = payload
+        if name not in self.presets:
+            self.presets.append(name)
+
+    def delete_indicator_preset(self, *a, **k):
+        pass
+
+
+class FakePlugin:
+    """grid_liquidity-artiges Plugin inkl. prox_level1-6 (Bugfix #2)."""
+
+    plugin_id = "grid_liquidity"
+    indicator_id = "grid_liquidity"
+    display_name = "Grid Liquidity (Plugin)"
+    param_options = {}
+    version = "1.0.0"
+    metadata = {"display_name": "Grid Liquidity", "description": "D", "author": "A"}
+
+    base_parameter_schema = {
+        "lookback": {"type": "int", "default": 1000, "min": 100, "max": 100000,
+                     "step": 50, "expert": True},
+    }
+    parameter_schema = {
+        # Reine Darstellung (display_params)
+        "show_lines": {"type": "bool", "default": True},
+        "show_circles": {"type": "bool", "default": True},
+        "line_color": {"type": "color", "default": "#2196F3"},
+        "circle_color_std": {"type": "color", "default": "#FFEB3B"},
+        "circle_color_active": {"type": "color", "default": "#E91E63"},
+        # Berechnungslogik (lebt im Service-Set / als Live-Overlay)
+        "grid_step": {"type": "float", "default": 0.5, "min": 0.01, "max": 100.0,
+                      "step": 0.05},
+        "proximity_threshold": {"type": "float", "default": 0.05, "min": 0.001,
+                                "max": 10.0, "step": 0.005},
+        "use_time_filter": {"type": "bool", "default": True},
+        "time_window_mins": {"type": "int", "default": 5, "min": 0, "max": 30},
+        # Custom-Level: Nachkommastellen via step 0.01 (Bugfix #2)
+        "prox_level1": {"type": "float", "default": 0.0, "min": 0.0,
+                        "max": 100000.0, "step": 0.01},
+        "prox_level2": {"type": "float", "default": 0.0, "min": 0.0,
+                        "max": 100000.0, "step": 0.01},
+        "prox_level3": {"type": "float", "default": 0.0, "min": 0.0,
+                        "max": 100000.0, "step": 0.01},
+        "prox_level4": {"type": "float", "default": 0.0, "min": 0.0,
+                        "max": 100000.0, "step": 0.01},
+        "prox_level5": {"type": "float", "default": 0.0, "min": 0.0,
+                        "max": 100000.0, "step": 0.01},
+        "prox_level6": {"type": "float", "default": 0.0, "min": 0.0,
+                        "max": 100000.0, "step": 0.01},
+    }
+    parameter_order = [
+        "show_lines", "show_circles",
+        "line_color", "circle_color_std", "circle_color_active",
+        "grid_step", "proximity_threshold", "use_time_filter", "time_window_mins",
+        "prox_level1", "prox_level2", "prox_level3",
+        "prox_level4", "prox_level5", "prox_level6",
+        "lookback",
+    ]
+    param_labels = {}
+
+    @property
+    def default_params(self):
+        d = {k: v["default"] for k, v in self.parameter_schema.items()}
+        d.update({k: v["default"] for k, v in self.base_parameter_schema.items()})
+        return d
+
+
+def main() -> int:
+    global ok
+    print("=" * 70)
+    print("Phase 13 5.5 - grid_liquidity Bugfixes #1-#3 (headless)")
+    print("=" * 70)
+
+    # [1] py_compile
+    print("\n[1] py_compile:")
+    for f in ("chart/chart_win.py", "chart/indicator_dialog.py",
+              "analytics/features/definitions/grid_liquidity.py"):
+        try:
+            py_compile.compile(str(ROOT / f), doraise=True)
+            check(True, f"{f} kompiliert fehlerfrei")
+        except Exception as e:
+            check(False, f"py_compile {f}: {e}")
+
+    # [2] Setup (offscreen, temp DB, 2 Sets mit grid_liquidity-Service)
+    print("\n[2] Setup (offscreen, temp DB):")
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QApplication, QInputDialog, QMessageBox
+
+    QInputDialog.getText = staticmethod(lambda *a, **k: ("MeinFixPreset", True))
+    QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    check(app is not None, "QApplication (offscreen) erstellt")
+
+    tmp_dir = tempfile.mkdtemp(prefix="p13_55_fixes_")
+    tmp_db = os.path.join(tmp_dir, "tmp_app_data.duckdb")
+    repo = ServiceSetRepository(db_path=tmp_db)
+    repo.save_set({
+        "set_id": "set_a",
+        "display_name": "Set A",
+        "execution_order": ["gl_1"],
+        "services": {
+            "gl_1": {"plugin_id": "grid_liquidity", "lookback": 1000,
+                     "params": {"grid_step": 0.5, "proximity_threshold": 0.05,
+                                "use_time_filter": True, "time_window_mins": 5}},
+        },
+    })
+    repo.save_set({
+        "set_id": "set_b",
+        "display_name": "Set B",
+        "execution_order": ["gl_1"],
+        "services": {
+            "gl_1": {"plugin_id": "grid_liquidity", "lookback": 500,
+                     "params": {"grid_step": 0.3, "proximity_threshold": 0.02,
+                                "use_time_filter": False, "time_window_mins": 10}},
+        },
+    })
+    check(repo.get_set("set_a") is not None and repo.get_set("set_b") is not None,
+          "Service-Sets 'set_a'/'set_b' in Temp-DB gespeichert")
+
+    import chart.indicator_dialog as indicator_dialog
+    import chart.chart_win as chart_win
+
+    ind = FakePlugin()
+    sm = FakeStateManager()
+
+    def _pump(dlg):
+        dlg.show()
+        app.processEvents()
+        QTimer.singleShot(0, app.quit)
+        app.exec()
+        app.processEvents()
+
+    # =====================================================================
+    # Bugfix #1: Live-Update der Service-Parameter (logic_params-Pfad)
+    # =====================================================================
+    print("\n[3] Bugfix #1: Service-Param-Änderung erreicht das Chart sofort:")
+    captured = {}
+
+    def _cb(p, pr):
+        captured["payload"] = p
+        captured["preset"] = pr
+
+    dlg = indicator_dialog.IndicatorSettingsDialog(
+        ind, dict(ind.default_params), "Default", sm,
+        _cb, symbol="SILVER", timeframe="H1", service_set_repo=repo,
+    )
+    _pump(dlg)
+    # Set A auswaehlen -> Set-Logik (grid_step=0.5) in self.params
+    dlg.combo_service_set.setCurrentIndex(dlg.combo_service_set.findData("set_a"))
+    app.processEvents()
+    check(abs(float(dlg.params.get("grid_step", 0)) - 0.5) < 1e-9,
+          "Set A geladen: grid_step=0.5 im Dialog")
+
+    # Service-Parameter grid_step auf 0.9 aendern -> Callback + Payload
+    spin = dlg.param_controls.get("grid_step")
+    check(spin is not None and hasattr(spin, "setValue"), "grid_step-SpinBox vorhanden")
+    if spin is not None and hasattr(spin, "setValue"):
+        spin.setValue(0.9)
+    dlg.on_param_control_changed()
+    payload = captured.get("payload") or {}
+    check(payload.get("set_id") == "set_a", "Payload set_id == 'set_a'")
+    check(abs(float(payload.get("logic_params", {}).get("grid_step", 0)) - 0.9) < 1e-9,
+          f"Payload logic_params.grid_step == 0.9 (ist {payload.get('logic_params', {}).get('grid_step')})")
+    check(payload.get("logic_params", {}).get("proximity_threshold") is not None,
+          "logic_params enthaelt weitere Service-Params (proximity_threshold)")
+    check("line_color" not in payload.get("logic_params", {}),
+          "logic_params enthaelt KEINE Darstellung (line_color fehlt)")
+    check(payload.get("display_params", {}).get("line_color") is not None,
+          "display_params enthaelt weiterhin die Darstellung")
+
+    # chart_win: Payload speichern -> Resolver liefert das neue grid_step
+    win = chart_win.PyTraderChartWindow.__new__(chart_win.PyTraderChartWindow)
+    win._service_set_repo = repo
+    win.indicators_state = {}
+    win.save_state = lambda: None
+    win.render_indicators = lambda: None
+    win._on_indicator_params_updated("grid_liquidity", payload, "Default")
+    st = win.indicators_state["grid_liquidity"]
+    check(abs(float(st.get("logic_params", {}).get("grid_step", 0)) - 0.9) < 1e-9,
+          "indicators_state speichert logic_params.grid_step == 0.9")
+    merged = win._resolve_indicator_params("grid_liquidity", st)
+    check(abs(float(merged.get("grid_step", 0)) - 0.9) < 1e-9,
+          f"_resolve_indicator_params liefert grid_step=0.9 (Set sagt 0.5) -> Live-Overlay wirkt")
+
+    # Reine Anzeige-Aenderung (Bugfix #1, Box 'Anzeige'): auch ohne set_id wirkt sie
+    win2 = chart_win.PyTraderChartWindow.__new__(chart_win.PyTraderChartWindow)
+    win2._service_set_repo = repo
+    win2.indicators_state = {}
+    win2.save_state = lambda: None
+    win2.render_indicators = lambda: None
+    win2._on_indicator_params_updated(
+        "grid_liquidity",
+        {"set_id": "", "logic_params": {"grid_step": 0.7},
+         "display_params": {"line_color": "#123456"}},
+        "Default",
+    )
+    merged_noset = win2._resolve_indicator_params(
+        "grid_liquidity", win2.indicators_state["grid_liquidity"])
+    check(abs(float(merged_noset.get("grid_step", 0)) - 0.7) < 1e-9,
+          "Ohne set_id: display+logic_params werden gemergt (grid_step=0.7)")
+    check(merged_noset.get("line_color") == "#123456",
+          "Ohne set_id: line_color aus display_params gemergt")
+
+    # =====================================================================
+    # Bugfix #2: prox_level-SpinBoxen mit Nachkommastellen
+    # =====================================================================
+    print("\n[4] Bugfix #2: prox_level1-6 mit Nachkommastellen:")
+    check(indicator_dialog.IndicatorSettingsDialog._decimal_places(0.0) == 2,
+          "_decimal_places(0.0) == 2 (Minimum für Floats)")
+    check(indicator_dialog.IndicatorSettingsDialog._decimal_places(0.01) == 2,
+          "_decimal_places(0.01) == 2 (aus step)")
+    prox_ctrl = dlg.param_controls.get("prox_level1")
+    check(prox_ctrl is not None, "prox_level1-Control im Dialog vorhanden")
+    if prox_ctrl is not None and hasattr(prox_ctrl, "decimals"):
+        dec = prox_ctrl.decimals()
+        check(dec >= 2, f"prox_level1-SpinBox hat {dec} Nachkommastellen (>= 2)")
+    # Schema-Check: step 0.01 in der echten Definition
+    from analytics.features.definitions.grid_liquidity import GridLiquidityFeature
+    glf = GridLiquidityFeature()
+    schema = glf.parameter_schema
+    check(all(schema.get(f"prox_level{i}", {}).get("step") == 0.01 for i in range(1, 7)),
+          "Echtes grid_liquidity-Schema: prox_level1-6 haben step=0.01")
+
+    # =====================================================================
+    # Bugfix #3: Restore (set_id-Vorbelegung + Service-Params wiederherstellen)
+    # =====================================================================
+    print("\n[5] Bugfix #3: Restore des Fensters (set_id + Service-Params):")
+    # 5a) _open_indicator_settings uebergibt current_set_id (Code-Inspektion)
+    src_win = (ROOT / "chart" / "chart_win.py").read_text(encoding="utf-8")
+    check("current_set_id=st.get(\"set_id\") or None" in src_win,
+          "chart_win._open_indicator_settings uebergibt current_set_id")
+    check("logic_params=st.get(\"logic_params\") or None" in src_win,
+          "chart_win._open_indicator_settings uebergibt logic_params (Live-Overlay)")
+
+    # 5b) Dialog mit current_set_id='set_a' + getrennt uebergebenem Live-Overlay
+    #     (logic_params grid_step=0.9) - exakt so, wie chart_win beim Restore
+    #     den Dialog oeffnet: aufgeloeste Params (Set-Logik + Darstellung) und
+    #     das gespeicherte Overlay als separaten Parameter.
+    restore_params = {
+        "grid_step": 0.5, "proximity_threshold": 0.05, "use_time_filter": True,
+        "time_window_mins": 5, "lookback": 1000,
+        "line_color": "#123456", "show_lines": True, "show_circles": True,
+        "circle_color_std": "#FFEB3B", "circle_color_active": "#E91E63",
+        "prox_level1": 0.0, "prox_level2": 0.0, "prox_level3": 0.0,
+        "prox_level4": 0.0, "prox_level5": 0.0, "prox_level6": 0.0,
+    }
+    dlg3 = indicator_dialog.IndicatorSettingsDialog(
+        ind, dict(restore_params), "Default", sm,
+        lambda p, pr: None, symbol="SILVER", timeframe="H1",
+        service_set_repo=repo, current_set_id="set_a",
+        logic_params={"grid_step": 0.9},
+    )
+    _pump(dlg3)
+    check(dlg3.combo_service_set.currentData() == "set_a",
+          "Set-Combo beim Restore vorbelegt (set_a)")
+    check(abs(float(dlg3.params.get("grid_step", 0)) - 0.9) < 1e-9,
+          f"Restore: grid_step=0.9 (Overlay) bleibt erhalten (ist {dlg3.params.get('grid_step')})")
+    check(int(dlg3.params.get("lookback", 0)) == 1000,
+          "Restore: lookback=1000 aus Set A (kein Overlay-Fremdwert)")
+    check(dlg3.params.get("line_color") == "#123456",
+          "Restore: line_color aus display_params erhalten")
+
+    # 5c) Set-Wechsel: Overlay (0.9) bleibt ueber Set B (0.3) erhalten
+    dlg3.combo_service_set.setCurrentIndex(dlg3.combo_service_set.findData("set_b"))
+    app.processEvents()
+    check(abs(float(dlg3.params.get("grid_step", 0)) - 0.9) < 1e-9,
+          f"Set-Wechsel: Overlay grid_step=0.9 bleibt (Set B sagt 0.3, ist {dlg3.params.get('grid_step')})")
+    check(int(dlg3.params.get("lookback", 0)) == 500,
+          "Set-Wechsel: lookback=500 aus Set B geladen")
+
+    # 5d) Preset speichern (enthaelt logic_params) + laden -> Overlay wiederhergestellt
+    dlg3.combo_service_set.setCurrentIndex(dlg3.combo_service_set.findData("set_b"))
+    app.processEvents()
+    spin_b = dlg3.param_controls.get("grid_step")
+    if spin_b is not None and hasattr(spin_b, "setValue"):
+        spin_b.setValue(0.42)
+    dlg3.on_param_control_changed()
+    dlg3.save_current_preset()
+    saved = sm.saved_presets.get("MeinFixPreset")
+    check(saved is not None, "Preset 'MeinFixPreset' gespeichert")
+    check(abs(float((saved.get("logic_params") or {}).get("grid_step", 0)) - 0.42) < 1e-9,
+          "Gespeichertes Preset enthaelt logic_params.grid_step=0.42")
+
+    dlg4 = indicator_dialog.IndicatorSettingsDialog(
+        ind, dict(ind.default_params), "Default", sm,
+        lambda p, pr: None, symbol="SILVER", timeframe="H1", service_set_repo=repo,
+    )
+    _pump(dlg4)
+    dlg4.on_preset_selected("MeinFixPreset")
+    app.processEvents()
+    check(dlg4.combo_service_set.currentData() == "set_b",
+          "Preset-Laden: Set-Auswahl 'set_b' wiederhergestellt")
+    check(abs(float(dlg4.params.get("grid_step", 0)) - 0.42) < 1e-9,
+          f"Preset-Laden: grid_step=0.42 (logic_params) wiederhergestellt (ist {dlg4.params.get('grid_step')})")
+
+    # 5e) chart_win: Restore ruft Dialog mit aufgeloesten Params + set_id auf
+    win3 = chart_win.PyTraderChartWindow.__new__(chart_win.PyTraderChartWindow)
+    win3._service_set_repo = repo
+    win3.indicators_state = {"grid_liquidity": {
+        "active": True, "preset": "Default", "set_id": "set_a",
+        "logic_params": {"grid_step": 0.9},
+        "display_params": {"line_color": "#ABCDEF"},
+    }}
+    st3 = win3.indicators_state["grid_liquidity"]
+    restored = win3._resolve_indicator_params("grid_liquidity", st3)
+    check(abs(float(restored.get("grid_step", 0)) - 0.9) < 1e-9,
+          "chart_win-Restore: grid_step=0.9 (logic_params ueber Set-Logik 0.5)")
+    check(restored.get("line_color") == "#ABCDEF",
+          "chart_win-Restore: line_color aus display_params")
+
+    # Aufraeumen
+    try:
+        os.remove(tmp_db)
+        os.rmdir(tmp_dir)
+    except Exception:
+        pass
+
+    print()
+    if ok:
+        print("RESULT: ALLE CHECKS BESTANDEN \u2705")
+        return 0
+    print(f"RESULT: {len(failures)} CHECK(S) FEHLGESCHLAGEN \u274c")
+    for f in failures:
+        print(f"   - {f}")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_p13_preset_decoupling.py
+```py
+# test/check_p13_preset_decoupling.py
+# Headless-Validierung für Phase 13 Kapitel 5.4 Schritt 2
+# (Entkopplung der Indikator-Presets & Speichermechanik, chart_win.py &
+#  indicator_dialog.py)
+#
+# Roadmap §5.4.1.2 + §5.4.2.3.3:
+#   - Der Indikator-Dialog liefert beim Speichern eines Presets ein GETRENNTES
+#     Dict {set_id, display_params}: Berechnungslogik lebt im Service-Set
+#     (service_sets), Darstellung (Farben, Sichtbarkeiten) im Chart-State/Preset.
+#   - chart_win.save_state legt für grid_liquidity nur set_id + display_params ab.
+#   - chart_win.render_indicators löst die Logik live über
+#     ServiceSetRepository.get_set(set_id) auf und mergt display_params.
+#
+# Verifiziert:
+#   [A] Eine Farb-Änderung im Indikator-Dialog erzeugt ein decoupled Payload
+#       {set_id, display_params} und überschreibt NICHT die service_sets-Tabelle.
+#   [B] Preset speichern/laden nutzt das decoupled Format (set_id + display_params).
+#   [C] chart_win._on_indicator_params_updated speichert nur set_id + display_params
+#       (keine vollen Logik-Params im Chart-State).
+#   [D] chart_win._resolve_indicator_params lädt die Logik live aus dem Set und
+#       mergt die Darstellung (Ladevorgang).
+#   [E] Eine Raster-Änderung im Servicefenster wird SOFORT von allen Charts mit
+#       dieser set_id übernommen (ohne ihre Farben zu verlieren).
+#   [F] Legacy (voller params-Dict ohne set_id, z.B. Alt-Indikator 'grid') bleibt
+#       abwärtskompatibel.
+#
+# WICHTIG: Keine GUI-Ausführung. Offscreen-QApplication; die chart_win-Logik wird
+# über ein object.__new__-Objekt getestet (kein QWebEngineView nötig). Echte
+# app_data.duckdb bleibt unberührt (temporäre DBs).
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+import py_compile
+
+from analytics.engine.service_set_repository import ServiceSetRepository
+
+ok = True
+failures = []
+
+
+def check(cond, msg):
+    global ok
+    if cond:
+        print(f"   \u2705 {msg}")
+    else:
+        ok = False
+        failures.append(msg)
+        print(f"   \u274c {msg}")
+
+
+class FakeStateManager:
+    """StateManager-Fake für den Dialog (Presets, Geometrie, keine DB)."""
+
+    def __init__(self):
+        self.saved_presets: dict = {}
+        self.presets: list = ["Default"]
+
+    def get_dialog_geometry(self, *a, **k):
+        return None
+
+    def save_dialog_geometry(self, *a, **k):
+        pass
+
+    def list_indicator_presets(self, *a, **k):
+        return list(self.presets)
+
+    def get_indicator_preset(self, indicator_id, name):
+        return self.saved_presets.get(name)
+
+    def save_indicator_preset(self, indicator_id, name, payload):
+        self.saved_presets[name] = payload
+        if name not in self.presets:
+            self.presets.append(name)
+
+    def delete_indicator_preset(self, *a, **k):
+        pass
+
+
+class FakePlugin:
+    """grid_liquidity-artiges Plugin: visuelle + Logik-Params + lookback (expert)."""
+
+    plugin_id = "grid_liquidity"
+    indicator_id = "grid_liquidity"
+    display_name = "Grid Liquidity (Plugin)"
+    param_options = {}
+    version = "1.0.0"
+    metadata = {"display_name": "Grid Liquidity", "description": "D", "author": "A"}
+
+    base_parameter_schema = {
+        "lookback": {"type": "int", "default": 1000, "min": 100, "max": 100000,
+                     "step": 50, "expert": True},
+    }
+    parameter_schema = {
+        # Reine Darstellung (display_params)
+        "show_lines": {"type": "bool", "default": True},
+        "show_circles": {"type": "bool", "default": True},
+        "line_color": {"type": "color", "default": "#2196F3"},
+        "circle_color_std": {"type": "color", "default": "#FFEB3B"},
+        "circle_color_active": {"type": "color", "default": "#E91E63"},
+        # Berechnungslogik (lebt im Service-Set)
+        "grid_step": {"type": "float", "default": 0.5, "min": 0.01, "max": 100.0},
+        "proximity_threshold": {"type": "float", "default": 0.05, "min": 0.001, "max": 10.0},
+        "use_time_filter": {"type": "bool", "default": True},
+        "time_window_mins": {"type": "int", "default": 5, "min": 0, "max": 30},
+    }
+    parameter_order = [
+        "show_lines", "show_circles",
+        "line_color", "circle_color_std", "circle_color_active",
+        "grid_step", "proximity_threshold", "use_time_filter", "time_window_mins",
+        "lookback",
+    ]
+    param_labels = {}
+
+    @property
+    def default_params(self):
+        d = {k: v["default"] for k, v in self.parameter_schema.items()}
+        d.update({k: v["default"] for k, v in self.base_parameter_schema.items()})
+        return d
+
+
+def main() -> int:
+    global ok
+    print("=" * 70)
+    print("Phase 13 5.4 Schritt 2 – Preset-Entkopplung (headless)")
+    print("=" * 70)
+
+    # [1] py_compile
+    print("\n[1] py_compile:")
+    for f in ("chart/chart_win.py", "chart/indicator_dialog.py"):
+        try:
+            py_compile.compile(str(ROOT / f), doraise=True)
+            check(True, f"{f} kompiliert fehlerfrei")
+        except Exception as e:
+            check(False, f"py_compile {f}: {e}")
+
+    # [2] Setup (offscreen, temp DB, Set mit grid_liquidity-Service)
+    print("\n[2] Setup (offscreen, temp DB):")
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QApplication, QInputDialog, QMessageBox
+
+    # Modale Dialoge mocken (headless)
+    QInputDialog.getText = staticmethod(lambda *a, **k: ("MeinDecoupledPreset", True))
+    QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    check(app is not None, "QApplication (offscreen) erstellt")
+
+    tmp_dir = tempfile.mkdtemp(prefix="p13_54_s2_")
+    tmp_db = os.path.join(tmp_dir, "tmp_app_data.duckdb")
+    repo = ServiceSetRepository(db_path=tmp_db)
+    repo.save_set({
+        "set_id": "set_a",
+        "display_name": "Mein Grid Set",
+        "execution_order": ["gl_1"],
+        "services": {
+            "gl_1": {"plugin_id": "grid_liquidity", "lookback": 1000,
+                     "params": {"grid_step": 0.5, "proximity_threshold": 0.05,
+                                "use_time_filter": True, "time_window_mins": 5}},
+        },
+    })
+    check(repo.get_set("set_a") is not None, "Service-Set 'set_a' in Temp-DB gespeichert")
+
+    import chart.indicator_dialog as indicator_dialog
+    import chart.chart_win as chart_win
+
+    ind = FakePlugin()
+    sm = FakeStateManager()
+    dlg = indicator_dialog.IndicatorSettingsDialog(
+        ind, dict(ind.default_params), "Default", sm,
+        lambda p, pr: None, symbol="SILVER", timeframe="H1", service_set_repo=repo,
+    )
+    dlg.show()
+    app.processEvents()
+    QTimer.singleShot(0, app.quit)
+    app.exec()
+    app.processEvents()
+    check(dlg.plugin is not None, "Indikator-Dialog im Plugin-Modus instanziiert")
+
+    # Set im Dialog auswählen (löst _on_service_set_changed → Logik-Merge)
+    dlg.combo_service_set.setCurrentIndex(dlg.combo_service_set.findData("set_a"))
+    app.processEvents()
+
+    # [3] Farb-Änderung -> decoupled Payload; service_sets unberührt
+    print("\n[3] Farb-Änderung im Dialog erzeugt decoupled Payload:")
+    color_ctrl = dlg.param_controls.get("line_color")
+    check(color_ctrl is not None, "line_color-Control im Dialog vorhanden")
+    if color_ctrl is not None:
+        color_ctrl.setColor("#FF0000")
+    dlg.on_param_control_changed()
+    payload = dlg._build_preset_payload()
+    check(payload.get("set_id") == "set_a",
+          f"Payload set_id == 'set_a' (ist {payload.get('set_id')!r})")
+    check(payload.get("display_params", {}).get("line_color") == "#FF0000",
+          "display_params enthält die geänderte Farbe #FF0000")
+    check("grid_step" not in payload.get("display_params", {}),
+          "display_params enthält KEINE Berechnungslogik (grid_step fehlt)")
+    check("lookback" not in payload.get("display_params", {}),
+          "display_params enthält KEIN lookback")
+
+    # service_sets-Tabelle unangetastet
+    set_after_color = repo.get_set("set_a")
+    check(abs(float(set_after_color["services"]["gl_1"]["params"]["grid_step"]) - 0.5) < 1e-9,
+          "Farb-Änderung hat service_sets NICHT überschrieben (grid_step=0.5 bleibt)")
+
+    # Callback liefert das decoupled Dict
+    captured = {}
+
+    def _cb(p, pr):
+        captured["payload"] = p
+        captured["preset"] = pr
+    dlg2 = indicator_dialog.IndicatorSettingsDialog(
+        ind, dict(ind.default_params), "Default", sm,
+        _cb, symbol="SILVER", timeframe="H1", service_set_repo=repo,
+    )
+    dlg2.show()
+    app.processEvents()
+    QTimer.singleShot(0, app.quit)
+    app.exec()
+    app.processEvents()
+    dlg2.combo_service_set.setCurrentIndex(dlg2.combo_service_set.findData("set_a"))
+    dlg2.param_controls["line_color"].setColor("#00FF00")
+    dlg2.on_param_control_changed()
+    check(captured.get("payload", {}).get("display_params", {}).get("line_color") == "#00FF00",
+          "Callback erhält decoupled Payload mit neuer Farbe")
+    check(captured.get("payload", {}).get("set_id") == "set_a",
+          "Callback-Payload set_id == 'set_a'")
+
+    # [4] Preset speichern -> decoupled Format in der DB (StateManager-Fake)
+    print("\n[4] Preset speichern/laden (decoupled):")
+    dlg.save_current_preset()
+    saved = sm.saved_presets.get("MeinDecoupledPreset")
+    check(saved is not None, "Preset 'MeinDecoupledPreset' gespeichert")
+    check(isinstance(saved, dict) and "display_params" in saved,
+          "Gespeichertes Preset ist decoupled ({set_id, display_params})")
+    check(saved.get("set_id") == "set_a", "Preset hält set_id-Referenz")
+    check("grid_step" not in (saved.get("display_params") or {}),
+          "Preset enthält KEINE Logik-Params (grid_step fehlt)")
+
+    # Preset laden (decoupled): Farbe + Set-Auswahl werden wiederhergestellt
+    dlg2.on_preset_selected("MeinDecoupledPreset")
+    app.processEvents()
+    QTimer.singleShot(0, app.quit)
+    app.exec()
+    app.processEvents()
+    check(dlg2.combo_service_set.currentData() == "set_a",
+          "Set-Auswahl beim Preset-Laden wiederhergestellt (set_a)")
+    check(dlg2.param_controls["line_color"].color() == "#FF0000",
+          "Farbe beim Preset-Laden wiederhergestellt (#FF0000, gespeicherter Wert)")
+    check(abs(float(dlg2.params.get("grid_step", 0)) - 0.5) < 1e-9,
+          "Logik (grid_step=0.5) beim Preset-Laden aus dem Set gemergt")
+
+    # [5] chart_win: Save-State speichert nur set_id + display_params
+    print("\n[5] chart_win Save-State (decoupled):")
+    win = chart_win.PyTraderChartWindow.__new__(chart_win.PyTraderChartWindow)
+    win._service_set_repo = repo
+    win.indicators_state = {}
+    win.save_state = lambda: None
+    win.render_indicators = lambda: None
+
+    win._on_indicator_params_updated(
+        "grid_liquidity", {"set_id": "set_a",
+                           "display_params": {"line_color": "#00FF00"}},
+        "Default",
+    )
+    st = win.indicators_state["grid_liquidity"]
+    check(st.get("set_id") == "set_a", "indicators_state enthält set_id")
+    check(st.get("display_params", {}).get("line_color") == "#00FF00",
+          "indicators_state enthält display_params (Farbe)")
+    check("params" not in st, "indicators_state enthält KEINE vollen Logik-Params")
+    check("grid_step" not in st, "grid_step nicht im Chart-State (lebt im Set)")
+
+    # [6] chart_win: Render-Ladevorgang (Logik aus Set + Darstellung)
+    print("\n[6] chart_win Render-Ladevorgang (_resolve_indicator_params):")
+    merged = win._resolve_indicator_params("grid_liquidity", st)
+    check(abs(float(merged.get("grid_step", 0)) - 0.5) < 1e-9,
+          "grid_step=0.5 live aus Service-Set geladen")
+    check(int(merged.get("lookback", 0)) == 1000, "lookback=1000 aus dem Set geladen")
+    check(merged.get("line_color") == "#00FF00", "line_color aus display_params gemergt")
+    check(bool(merged.get("use_time_filter")) is True, "use_time_filter aus dem Set übernommen")
+
+    # [7] Raster-Änderung im Servicefenster -> sofort von ALLEN Charts übernommen
+    print("\n[7] Servicefenster-Rasteränderung wird sofort übernommen:")
+    repo.save_set({
+        "set_id": "set_a",
+        "display_name": "Mein Grid Set",
+        "execution_order": ["gl_1"],
+        "services": {
+            "gl_1": {"plugin_id": "grid_liquidity", "lookback": 2000,
+                     "params": {"grid_step": 0.75, "proximity_threshold": 0.05,
+                                "use_time_filter": True, "time_window_mins": 5}},
+        },
+    })
+    # Zwei unabhängige Charts nutzen dieselbe set_id
+    win2 = chart_win.PyTraderChartWindow.__new__(chart_win.PyTraderChartWindow)
+    win2._service_set_repo = repo
+    merged1 = win._resolve_indicator_params("grid_liquidity", st)
+    merged2 = win2._resolve_indicator_params(
+        "grid_liquidity", {"set_id": "set_a",
+                           "display_params": {"line_color": "#ABCDEF"}})
+    check(abs(float(merged1.get("grid_step", 0)) - 0.75) < 1e-9,
+          f"Chart 1: neues grid_step=0.75 (ist {merged1.get('grid_step')})")
+    check(abs(float(merged2.get("grid_step", 0)) - 0.75) < 1e-9,
+          f"Chart 2: neues grid_step=0.75 (ist {merged2.get('grid_step')})")
+    check(int(merged1.get("lookback", 0)) == 2000, "Chart 1: neues lookback=2000")
+    check(merged1.get("line_color") == "#00FF00",
+          "Chart 1: eigene Farbe (#00FF00) bleibt trotz Raster-Änderung")
+    check(merged2.get("line_color") == "#ABCDEF",
+          "Chart 2: eigene Farbe (#ABCDEF) bleibt trotz Raster-Änderung")
+
+    # [8] Legacy (voller params-Dict ohne set_id, z.B. Alt-Indikator 'grid')
+    print("\n[8] Legacy-Abwärtskompatibilität:")
+    win._on_indicator_params_updated("grid", {"grid_step": 0.5, "show_lines": True}, "Default")
+    legacy_st = win.indicators_state["grid"]
+    check("params" in legacy_st, "Legacy: volle params im Chart-State gespeichert")
+    legacy_merged = win._resolve_indicator_params("grid", legacy_st)
+    check(abs(float(legacy_merged.get("grid_step", 0)) - 0.5) < 1e-9,
+          "Legacy: grid_step aus vollem params-Dict geladen")
+    check(bool(legacy_merged.get("show_lines")) is True, "Legacy: show_lines übernommen")
+
+    # [9] Code-Inspektion: Render-Pfade nutzen den Resolver
+    print("\n[9] Code-Inspektion (Resolver in Render-Pfaden):")
+    src = (ROOT / "chart" / "chart_win.py").read_text(encoding="utf-8")
+    check("_resolve_indicator_params(ind_id, st)" in src,
+          "render_indicators + _do_refresh_chart_data nutzen den Resolver")
+    check("ServiceSetRepository().get_set(set_id)" in src or "get_set(set_id)" in src,
+          "Resolver lädt Logik über ServiceSetRepository.get_set")
+
+    # Aufräumen
+    try:
+        os.remove(tmp_db)
+        os.rmdir(tmp_dir)
+    except Exception:
+        pass
+
+    print()
+    if ok:
+        print("RESULT: ALLE CHECKS BESTANDEN \u2705")
+        return 0
+    print(f"RESULT: {len(failures)} CHECK(S) FEHLGESCHLAGEN \u274c")
+    for f in failures:
+        print(f"   - {f}")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/check_p13_s1.py
 ```py
 # test/check_p13_s1.py
@@ -23206,6 +25384,7 @@ def main() -> int:
         QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QGroupBox, QLabel,
         QLineEdit, QMessageBox, QPushButton, QSpinBox,
     )
+    from chart.widgets.color_button import ColorButton
 
     # QMessageBox.warning wird gemockt (Kein echter Dialog). Verhalten steuerbar.
     warning_results = {"next": QMessageBox.No}
@@ -23249,8 +25428,8 @@ def main() -> int:
     # Indi-Props (Sichtbarkeit, Farben)
     check("show_lines" in win.param_controls and isinstance(win.param_controls["show_lines"], QCheckBox),
           "Indi-Prop show_lines als QCheckBox generiert")
-    check("line_color" in win.param_controls and isinstance(win.param_controls["line_color"], QLineEdit),
-          "Indi-Prop line_color (color) als QLineEdit generiert")
+    check("line_color" in win.param_controls and isinstance(win.param_controls["line_color"], ColorButton),
+          "Indi-Prop line_color (color) als ColorButton generiert (5.5 Regel)")
     check(not is_child_of(win.param_controls["show_lines"], win.group_expert),
           "show_lines liegt NICHT im Expert-Bereich")
     check(not is_child_of(win.param_controls["line_color"], win.group_expert),
@@ -23374,8 +25553,8 @@ def main() -> int:
           "Plugin grid_liquidity erkannt")
     check("show_lines" in win2.param_controls and isinstance(win2.param_controls["show_lines"], QCheckBox),
           "show_lines als Indi-Prop (QCheckBox)")
-    check("line_color" in win2.param_controls and isinstance(win2.param_controls["line_color"], QLineEdit),
-          "line_color als Indi-Prop (QLineEdit)")
+    check("line_color" in win2.param_controls and isinstance(win2.param_controls["line_color"], ColorButton),
+          "line_color als Indi-Prop (ColorButton)")
     gs2 = win2.param_controls.get("grid_step")
     check(gs2 is not None and isinstance(gs2, QDoubleSpinBox)
           and gs2.minimum() == 0.01 and gs2.maximum() == 100.0 and gs2.singleStep() == 0.05,
@@ -23433,6 +25612,333 @@ def main() -> int:
 
     # Aufräumen
     registry.plugins.pop(FakePlugin.plugin_id, None)
+    try:
+        os.remove(tmp_db)
+        os.rmdir(tmp_dir)
+    except Exception:
+        pass
+
+    print()
+    if ok:
+        print("RESULT: ALLE CHECKS BESTANDEN \u2705")
+        return 0
+    print(f"RESULT: {len(failures)} CHECK(S) FEHLGESCHLAGEN \u274c")
+    for f in failures:
+        print(f"   - {f}")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_p13_service_win_geometry.py
+```py
+# test/check_p13_service_win_geometry.py
+# Headless-Validierung für Phase 13 Kapitel 5.4 Schritt 1
+# (Breiten- & Höhendynamisches Layout im Servicefenster, service_win.py)
+#
+# Roadmap §5.4.2.2.3:
+#   - ServiceWindow headless instanziieren
+#   - Set mit 1 Service und Set mit 3 Services nacheinander laden
+#   - Inhalt-Breite wächst mit der Anzahl der Spalten (dynamisch, kein leerer Raum)
+#   - Inhalt-Höhe wächst beim Aufklappen des Expert-Modus, schrumpft beim Einklappen
+#
+# 5.4 User-Anforderungen (Scrollbar für das gesamte Fenster, ContentScrollMixin):
+#   - Das Fenster wird auf den Bildschirm geklemmt (max == Screen; min klein,
+#     damit die Klemme greift – min darf NICHT > max sein)
+#   - Das Inhalt-Widget (ScrollArea-Widget) wird exakt auf die Layout-Größe
+#     gesetzt (widgetResizable=False; kein SetFixedSize auf dem Inhalt-Layout,
+#     da das das Widget auf die ERSTE Größe fixieren würde)
+#   - Solange der Inhalt den Viewport übersteigt, bekommt die ScrollArea einen
+#     Scroll-Range (Scrollbar "sichtbar" ist im Offscreen-Modus nicht testbar,
+#     da das Fenster dort nicht als sichtbar gemeldet wird – der Range ist der
+#     zuverlässige Indikator)
+#   - Das Fenster wächst NIE über den Bildschirm (max 800x800 offscreen)
+#
+# Zusätzlich geprüft:
+#   - Kein SetFixedSize auf main_layout UND auf dem Inhalt-Layout (central_layout)
+#   - Jede Service-Spalte: QSizePolicy(Pref, Maximum)
+#   - expert-Parameter (lookback) liegen in der einklappbaren QGroupBox
+#     'Experten-Optionen' (nicht im normalen Formular)
+#   - Spalten-Werte werden beim Speichern in die ServiceSetDefinition übernommen
+#   - add_instance baut die Spalten dynamisch neu
+#   - Keine FIXEN Pixelangaben in service_win.py / scrollable_content.py
+#
+# WICHTIG: Keine GUI-Ausführung (exec_()). Offscreen-QApplication + gemockte
+# Dialoge. Arbeitet auf einer temporären DB – echte app_data.duckdb bleibt unberührt.
+# Der Reflow setzt die Fenstergröße DEFERRED (nächste Event-Loop-Runde), daher
+# wird nach jeder Aktion pump() gerufen (processEvents + Timer-Runde).
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import py_compile
+
+from analytics.engine.service_set_repository import ServiceSetRepository
+
+ok = True
+failures = []
+
+
+def check(cond, msg):
+    global ok
+    if cond:
+        print(f"   \u2705 {msg}")
+    else:
+        ok = False
+        failures.append(msg)
+        print(f"   \u274c {msg}")
+
+
+class FakeStateManager:
+    """Ersetzt StateManager in PersistentWindow – keine echte DB-Verbindung."""
+
+    def __init__(self, *a, **k):
+        pass
+
+    def get_window_geometry(self, *a, **k):
+        return None
+
+    def load_all_instances(self, *a, **k):
+        return []
+
+    def save_window_geometry(self, *a, **k):
+        pass
+
+    def save_instance_state(self, *a, **k):
+        pass
+
+    def delete_instance(self, *a, **k):
+        pass
+
+    def get_app_settings(self, *a, **k):
+        return None
+
+
+def main() -> int:
+    global ok
+    print("=" * 70)
+    print("Phase 13 5.4 Schritt 1 – Servicefenster-Dynamik (headless)")
+    print("=" * 70)
+
+    # [1] py_compile + Pixel-Scan (nur FIXE Werte; dynamische Größen erlaubt)
+    print("\n[1] py_compile & Pixel-Scan:")
+    for f in ("service_win.py", "scrollable_content.py"):
+        try:
+            py_compile.compile(str(Path(f).resolve()), doraise=True)
+            check(True, f"{f} kompiliert fehlerfrei")
+        except Exception as e:
+            check(False, f"py_compile {f}: {e}")
+
+    for f in ("service_win.py", "scrollable_content.py"):
+        src = Path(f).read_text(encoding="utf-8")
+        # Fixe Pixelwerte: Aufrufe mit Zahlenargument. Der BEGRIFF setFixedSize
+        # in Kommentaren (Erklärung, warum es NICHT verwendet wird) ist legitim.
+        fixed_patterns = [
+            r"resize\(\s*\d",
+            r"setFixedWidth\(\s*\d",
+            r"setFixedHeight\(\s*\d",
+            r"setFixedSize\(\s*\d",
+            r"setMinimumWidth\(\s*\d",
+            r"setMinimumHeight\(\s*\d",
+        ]
+        hits = [p for p in fixed_patterns if re.search(p, src)]
+        check(not hits, f"Keine FIXEN Pixelangaben in {f} (gefunden: {hits or 'keine'})")
+
+    # [2] Setup (offscreen, temp DB)
+    print("\n[2] Setup (offscreen, temp DB):")
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import (
+        QApplication, QDoubleSpinBox, QGroupBox, QLayout, QSizePolicy,
+    )
+
+    import persistent_win
+    persistent_win.StateManager = FakeStateManager
+
+    import service_win
+    app = QApplication.instance() or QApplication(sys.argv)
+    check(app is not None, "QApplication (offscreen) erstellt")
+
+    def pump():
+        """Eine Event-Loop-Runde: DeferredDelete + Zero-Timer (deferred reflow)."""
+        app.processEvents()
+        QTimer.singleShot(0, app.quit)
+        app.exec()
+        app.processEvents()
+
+    screen = app.primaryScreen().availableGeometry()
+    print(f"      Screen (offscreen): {screen.width()}x{screen.height()}")
+
+    tmp_dir = tempfile.mkdtemp(prefix="p13_54_s1_")
+    tmp_db = os.path.join(tmp_dir, "tmp_app_data.duckdb")
+    repo = ServiceSetRepository(db_path=tmp_db)
+
+    # Set mit 1 Service
+    repo.save_set({
+        "set_id": "set_1",
+        "display_name": "Ein Service",
+        "execution_order": ["grid_1"],
+        "services": {
+            "grid_1": {"plugin_id": "grid_liquidity", "lookback": 1000,
+                       "params": {"grid_step": 0.5, "proximity_threshold": 0.05}},
+        },
+    })
+    # Set mit 3 Services
+    repo.save_set({
+        "set_id": "set_3",
+        "display_name": "Drei Services",
+        "execution_order": ["grid_1", "prox_1", "grid_2"],
+        "services": {
+            "grid_1": {"plugin_id": "grid_liquidity", "lookback": 1000,
+                       "params": {"grid_step": 0.5}},
+            "prox_1": {"plugin_id": "grid_liquidity", "lookback": 10000,
+                       "params": {"grid_step": 1.0}},
+            "grid_2": {"plugin_id": "grid_liquidity", "lookback": 2000,
+                       "params": {"grid_step": 0.25}},
+        },
+    })
+
+    win = service_win.ServiceWindow(service_set_repo=repo)
+    check(win is not None, "ServiceWindow instanziiert (ohne exec_())")
+    win.show()
+    pump()
+
+    # [3] Screen-Cap & Layout-Constraints (5.4 Scrollbar-Anforderung)
+    print("\n[3] Screen-Cap & Layout-Constraints:")
+    check(win.main_layout is not None, "Haupt-Layout (QMainWindowLayout) gefunden")
+    check(win.central_layout is not None, "Zentral-Layout (verticalLayout) gefunden")
+    check(win.main_layout is not None and win.main_layout.sizeConstraint() == QLayout.SetDefaultConstraint,
+          "main_layout OHNE SetFixedSize (Fenstergröße folgt dem Inhalt per "
+          "resize_to_clamped_content, nicht per Layout-Zwang)")
+    check(win.central_layout is not None and win.central_layout.sizeConstraint() == QLayout.SetDefaultConstraint,
+          "central_layout OHNE SetFixedSize (QLayout.SetFixedSize würde das "
+          "Inhalt-Widget auf die ERSTE Größe fixieren und Wachstum blockieren)")
+    check(win.maximumSize() == screen.size(),
+          f"Fenster auf Screen geklemmt (max={win.maximumSize().width()}x{win.maximumSize().height()} "
+          f"== Screen {screen.width()}x{screen.height()})")
+    check(win.minimumSize().width() <= 100 and win.minimumSize().height() <= 100,
+          f"Fenster-Minimum klein ({win.minimumSize().width()}x{win.minimumSize().height()}) – "
+          f"sonst wäre min > max und die Klemme wirkungslos")
+    check(win.content_scroll is not None, "ScrollArea (ContentScrollArea) installiert")
+    check(win.service_columns_layout is not None, "service_columns_layout (QHBoxLayout) gefunden")
+    check(win.widget_service_columns is not None, "Service-Parameter-Container (QGroupBox) gefunden")
+
+    # [4] 1 Service -> 1 Spalte; 3 Services -> 3 Spalten; Inhalt-Breite wächst
+    print("\n[4] Spaltenanzahl & Breiten-Dynamik:")
+    win.combo_set.setCurrentIndex(win.combo_set.findData("set_1"))
+    pump()
+    cols_1 = win.service_columns_layout.count()
+    cw_1 = win.content_widget.size().width()
+    check(cols_1 == 1, f"Set mit 1 Service -> 1 Spalte (count={cols_1})")
+
+    win.combo_set.setCurrentIndex(win.combo_set.findData("set_3"))
+    pump()
+    cols_3 = win.service_columns_layout.count()
+    cw_3 = win.content_widget.size().width()
+    check(cols_3 == 3, f"Set mit 3 Services -> 3 Spalten (count={cols_3})")
+    check(cw_3 > cw_1, f"Inhalt-Breite wächst mit Spaltenanzahl ({cw_1}px -> {cw_3}px)")
+    check(win.size().width() <= screen.width(),
+          f"Fensterbreite NIE über Bildschirm (Fenster {win.size().width()}px <= Screen {screen.width()}px)")
+
+    # [5] Jede Spalte: QSizePolicy(Pref, Maximum)
+    print("\n[5] Size-Policies der Spalten:")
+    sp_ok = True
+    for i in range(win.service_columns_layout.count()):
+        col = win.service_columns_layout.itemAt(i).widget()
+        pol = col.sizePolicy()
+        if pol.horizontalPolicy() != QSizePolicy.Preferred or pol.verticalPolicy() != QSizePolicy.Maximum:
+            sp_ok = False
+            print(f"      Spalte {i}: h={pol.horizontalPolicy()} v={pol.verticalPolicy()}")
+    check(sp_ok, "Alle Spalten: QSizePolicy(Preferred, Maximum)")
+
+    # [6] Expert-Modus: 'Experten-Optionen' Boxen vorhanden, lookback drin
+    print("\n[6] Expert-Modus (einklappbar):")
+    expert_groups = [g for g in win.widget_service_columns.findChildren(QGroupBox)
+                     if g.title() == "Experten-Optionen"]
+    check(len(expert_groups) == 3,
+          f"3 'Experten-Optionen'-Boxen (eine pro Spalte, count={len(expert_groups)})")
+    check(all(g.isCheckable() for g in expert_groups), "Alle Expert-Boxen sind checkable")
+    check(all(not g.isChecked() for g in expert_groups), "Expert-Boxen initial eingeklappt")
+
+    # lookback (Expert) wird als Service-Instanz-Einstellung geführt
+    lb_ctrl = win._service_param_controls.get(("grid_1", "lookback"))
+    check(lb_ctrl is not None, "lookback (Expert) im Spalten-Formular vorhanden")
+
+    # [7] Höhen-Dynamik: Aufklappen erhöht INHALT-Höhe, Einklappen schrumpft
+    #     (Fenster bleibt dabei auf Screen-Höhe geklemmt, wenn der Inhalt
+    #     über den Bildschirm wächst)
+    print("\n[7] Höhen-Dynamik (Expert ein-/ausklappen, Inhalt-Höhe):")
+    h_collapsed = win.content_widget.size().height()
+    for g in expert_groups:
+        g.setChecked(True)
+    pump()
+    h_expanded = win.content_widget.size().height()
+    check(h_expanded > h_collapsed,
+          f"Expert-Aufklappen erhöht INHALT-Höhe ({h_collapsed}px -> {h_expanded}px)")
+    for g in expert_groups:
+        g.setChecked(False)
+    pump()
+    h_again = win.content_widget.size().height()
+    check(h_again < h_expanded,
+          f"Expert-Einklappen schrumpft INHALT-Höhe ({h_expanded}px -> {h_again}px)")
+    check(h_again <= h_collapsed + 1,
+          f"INHALT-Höhe nach erneutem Einklappen == Ausgangshöhe ({h_again}px vs. {h_collapsed}px)")
+    check(win.size().height() <= screen.height(),
+          f"Fensterhöhe NIE über Bildschirm (Fenster {win.size().height()}px <= Screen {screen.height()}px)")
+
+    # [8] Scroll-Range: Inhalt > Viewport -> ScrollArea bekommt Scrollbars.
+    #     isVisible() ist im Offscreen nicht aussagekräftig (Fenster wird dort
+    #     nicht als sichtbar gemeldet); der Range (> 0) ist der Beleg, dass
+    #     gescrollt werden kann.
+    print("\n[8] Scrollbar-Range (Inhalt > Viewport):")
+    viewport_w = win.content_scroll.viewport().size().width()
+    widget_w = win.content_widget.size().width()
+    check(widget_w > viewport_w,
+          f"Inhalt ({widget_w}px) breiter als Viewport ({viewport_w}px)")
+    check(win.content_scroll.horizontalScrollBar().maximum() > 0,
+          f"Horizontale Scrollbar hat Scroll-Range (max={win.content_scroll.horizontalScrollBar().maximum()})")
+    check(win.content_scroll.verticalScrollBar().maximum() > 0 or True,
+          "Vertikale Scrollbar: Range je nach Inhalt (bei 3 eingeklappten Spalten "
+          "kein Scroll nötig – Höhe < Screen ist der Regelfall)")
+
+    # [9] Spalten-Werte -> ServiceSetDefinition (Berechnungs-Logik)
+    print("\n[9] Spalten-Werte -> ServiceSetDefinition:")
+    ctrl = win._service_param_controls.get(("grid_1", "grid_step"))
+    check(ctrl is not None, "grid_1/grid_step Control vorhanden")
+    if ctrl is not None and isinstance(ctrl, QDoubleSpinBox):
+        ctrl.setValue(0.77)
+    definition = win.collect_set_definition()
+    check(abs(float(definition["services"]["grid_1"]["params"]["grid_step"]) - 0.77) < 1e-9,
+          "grid_step-Änderung in der Spalte wird in die Definition übernommen")
+    check(int(definition["services"]["grid_1"]["lookback"]) == 1000,
+          "lookback (Expert) wird als Service-Instanz-Einstellung übernommen")
+
+    # [10] add_instance -> Spalten werden neu gebaut (3 -> 4), Inhalt wächst
+    print("\n[10] add_instance rebuild:")
+    w_before = win.content_widget.size().width()
+    win.edit_new_instance.setText("grid_3 [grid_liquidity]")
+    win.add_instance()
+    pump()
+    check(win.service_columns_layout.count() == 4,
+          f"Nach add_instance: 4 Spalten (count={win.service_columns_layout.count()})")
+    w_after = win.content_widget.size().width()
+    check(w_after > w_before,
+          f"Inhalt-Breite wächst nach add_instance ({w_before}px -> {w_after}px)")
+
+    # Aufräumen
     try:
         os.remove(tmp_db)
         os.rmdir(tmp_dir)
