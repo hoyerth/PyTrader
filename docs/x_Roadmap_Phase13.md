@@ -666,6 +666,91 @@ Stellen).
 3. **Tabelle `signal_results`** wird NICHT gelöscht (Daten bleiben als Referenz erhalten).
 4. **Nach dem Rückbau:** Die Hybrid-Fallbacks in `signal_overlay.py` (Legacy-Pfad `_fetch_markers_from_signal_results`) werden entfernt; EMA-Marker laufen dann ebenfalls über den feature_store-Pfad (Feature mit `feature_id='ema_atr_set_v1'`).
 
+### 7.B UMGSETZT (abgeschlossen, Commit-Tag: phase13_step19)
+
+**Startschuss:** User-Auftrag „backup und umsetzung 7.B" → Backup-Commits
+(`b01a72e` Backup, Tag `phase13_step18`, inkl. `.backup_7B_step18/` mit
+historical_scanner.py, live_analyzer.py, chart_win.py, signal_overlay.py)
++ Umsetzungs-Commit `aa83429` (Tag `phase13_step19`), gepusht.
+
+**Umgesetzte Änderungen (alle 4 Punkte des Plans):**
+
+1. **Schreiber deaktiviert/entfernt:**
+   * `analytics/background_workers/historical_scanner.py`: Delta-Update-Anker
+     nutzt `feature_store` (feature_id) statt `signal_results`; Schritt 6
+     schreibt Hits als `feature_data` (`is_hit`, `confidence_total`,
+     `signal_binary`, `source_id`) per `store_plugin_payload` mit
+     `feature_id=source_id` in den feature_store – KEINE signal_results-Writes
+     mehr. Unbenutzte Imports (`uuid`, `duckdb`, `pandas`) entfernt.
+   * `analytics/background_workers/live_analyzer.py`: `fill_gaps_for_pair`
+     (Chart-Trigger) ist ein deaktivierter API-Stub (nur print-Hinweis, keine
+     signal_results-Writes). Die übrigen Alt-Schreiber
+     (`_fill_gaps`/`_process_new_bars`/`analyze_single_bar`) bleiben über die
+     leere `set_config["signals"]` abgeschaltet (frühe Returns) – kein Umbau
+     nötig. Modul-Docstring dokumentiert den 7.B-Zustand.
+   * `chart/chart_win.py`: Import + beide `fill_gaps_for_pair`-Aufrufe
+     (on_symbol_changed / on_tf_changed) entfernt; Marker-Kommentar
+     aktualisiert (beide Quellen aus feature_store).
+2. **`analytics/engine/set_evaluator.py` (SetEvaluator)** bleibt unverändert –
+   der neue ServiceSetEvaluator (Schritt 3) läuft parallel weiter. ✓
+3. **Tabelle `signal_results`** wurde NICHT gelöscht (Daten bleiben als
+   Referenz erhalten); es finden keine neuen Schreibvorgänge mehr statt. ✓
+4. **Hybrid-Fallbacks entfernt:** `signal_overlay.py` hat keinen
+   `_fetch_markers_from_signal_results`-Pfad mehr – `fetch_markers` liest
+   ausschließlich den feature_store. `_fetch_markers_from_feature_data`
+   unterstützt jetzt ZWEI Record-Typen:
+   * Proximity-Records (`levels_hit`/`in_time_window`): Text = Anzahl Levels,
+     Farbe grün (im Zeitfenster) / fuchsia.
+   * EMA/ATR-Records (z. B. `feature_id='ema_atr_set_v1'`, KEIN levels_hit):
+     confidence-basierte Farbe (#26a69a/#FFEB3B/#ef5350), Text = Confidence-%.
+
+**Angepasste Tests (headless, alle grün):**
+* `test/check_p13_s7.py`: [3] get_available_sets enthält proximity +
+  ema_atr_set_v1; [5] EMA-Marker aus feature_data (circle, Text '90%', grün);
+  [5b] Legacy-Source-ID ohne feature_store-Daten → `[]` (kein Fallback mehr).
+* `test/check_plugin_batch_services.py`: [3] Standard-Scan prüft
+  feature_store (`feature_id='ema_atr_set_v1'`-Hit-Rows) UND signal_results
+  enthält 0 neue Zeilen (7.B-Rückbau).
+* `test/check_chart_data.py`: Marker-Query auf feature_store/feature_id
+  umgestellt (kein signal_results mehr).
+
+**Verbleibende signal_results-Referenzen (bewusst, dokumentiert):**
+* `analytics/statistics_repository.py` Docstring (Z.8) – nur Text, kein Code.
+* `chart/chart_win.py` + `signal_overlay.py` Kommentare – nur Text.
+* `analytics/background_workers/live_analyzer.py`:
+  `_batch_write_signals`/`_write_signal_result` (Z. 387-398 / 507-518) bleiben
+  als toter, via leere set_config unerreichbarer Alt-Pfad erhalten (Referenz).
+
+### 7.C Systemweiter Regressionstest (abgeschlossen, Commit-Tag: phase13_step20)
+
+Nach dem 7.B-Rückbau (§7.2 Punkte 4+5) – alle Tests in einer Session, headless:
+
+**Phase-13-Tests (alle grün):**
+* check_p13_s1, s2, s3 („Fail-Fast" enthält „FAIL" – kein echter Fehlschlag),
+  s4, s5, s56, s6, s7, color_button, color_integration, grid_liquidity_fixes,
+  preset_decoupling, proximity_cleanup, service_win_geometry, ui_plugins,
+  plugin_batch_services – jeweils „ALLE CHECKS BESTANDEN".
+* check_statistics_repo (Diagnose-Skript ohne RESULT-Zeile): keine FEHLER-
+  Ausgabe → RW-Connection via DbPool + read_only-Queries funktionieren.
+
+**Phase-12-Kompatibilitätstests (alle grün):**
+* grid_parity, plugin_executor, plugin_time_filter, grid_scan_integration,
+  grid_liquidity_indicator, grid_levels_feature, m1_consistency,
+  m1_midnight, mt5_m1_boundary, broker_tz, app_state, generation_guard,
+  chart_data, grid_buttons, grid_circles, html_template.
+* **check_phase12_step1_migration:** Diesmal AUSFÜHRBAR (App nicht aktiv, DB
+  frei) und GRÜN: Idempotenz (ADD COLUMN IF NOT EXISTS), Datenintegrität
+  (feature_store 16182, signal_results 37340, indicator_presets 6 – kein
+  Verlust). Damit ist die frühere Einzige-Ausnahme-Notiz in 7.A hinfällig.
+
+**Harte Regel verifiziert:** `chart/indicators/grid.py`, `chart/indicators/
+grid_liquidity.py` und `analytics/features/definitions/grid_liquidity.py`
+sind im Git-Tree UNMODIFIED (Git-Diff leer). Die Referenzdatei
+`analytics/features/definitions/grid.py` existiert nicht im Baum
+(tatsächliche Referenz = grid_liquidity.py, siehe Architektur-Sektion).
+
+
+
 
 
 
