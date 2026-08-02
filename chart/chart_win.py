@@ -408,7 +408,13 @@ class PyTraderChartWindow(QMainWindow):
             plugin, self._resolve_indicator_params(ind_id, st), st["preset"],
             self.state_manager,
             lambda p, pr: self._on_indicator_params_updated(ind_id, p, pr), self,
-            symbol=self.current_symbol, timeframe=self.current_tf)
+            symbol=self.current_symbol, timeframe=self.current_tf,
+            # 5.5 Fix (Bugfix #3): Zuletzt gewaehltes Service-Set + Live-
+            # Overlay (logic_params) mitgeben, damit der Dialog beim
+            # Restore/Neuaufbau die Set-Combo vorbelegt und die Service-
+            # Parameter (Set-Logik + Overlay) korrekt wiederherstellt.
+            current_set_id=st.get("set_id") or None,
+            logic_params=st.get("logic_params") or None)
         self._settings_dialog = dialog
         dialog.finished.connect(lambda: self._on_settings_closed(dialog))
         dialog.show()
@@ -458,44 +464,50 @@ class PyTraderChartWindow(QMainWindow):
         return self._service_set_repo
 
     def _resolve_indicator_params(self, ind_id: str, st: Dict[str, Any]) -> Dict[str, Any]:
-        """5.4 Schritt 2: Volles Parameter-Dict für plugin.calculate().
+        """5.4 Schritt 2 + 5.5 Fix: Volles Parameter-Dict für plugin.calculate().
 
         NEUES Format (Plugin, z.B. grid_liquidity): indicators_state speichert
-        nur noch set_id + display_params. Die Berechnungslogik (grid_step,
+        set_id + display_params (+ optional logic_params als Live-Overlay aus
+        dem Indikator-Dialog). Die Berechnungslogik (grid_step,
         proximity_threshold, lookback, ...) kommt LIVE aus dem Service-Set
-        (ServiceSetRepository.get_set(set_id)); die Darstellung (Farben,
-        Sichtbarkeiten) aus display_params. Wird ein Set im Servicefenster
-        angepasst, übernehmen ALLE Charts mit dieser set_id die neue Logik,
-        ohne ihre individuellen Farbeinstellungen zu verlieren.
+        (ServiceSetRepository.get_set(set_id)), sofern ein Set gewählt ist;
+        die Darstellung (Farben, Sichtbarkeiten) aus display_params.
+        logic_params überlagern die Set-Logik, damit Änderungen an den
+        Service-Parametern im Dialog SOFORT auf dem Chart erscheinen.
 
         LEGACY (z.B. Alt-Indikator 'grid' / alter DB-Stand ohne set_id):
         volle params werden unverändert durchgereicht (Abwärtskompatibilität).
+
+        Fix: Ohne set_id werden display_params + logic_params ebenfalls
+        gemergt – vorher gingen reine Farb-/Sichtbarkeits-Änderungen ohne
+        gewähltes Service-Set verloren (Early-Return gab nur params zurück).
         """
         st = st or {}
         set_id = st.get("set_id")
-        if not set_id:
-            return dict(st.get("params") or {})
 
-        merged: Dict[str, Any] = {}
-        try:
-            definition = self._get_service_set_repo().get_set(set_id)
-            services = (definition or {}).get("services") or {}
-            order = (definition or {}).get("execution_order") or []
-            # Service mit passendem plugin_id bevorzugen, sonst erster Service.
-            cfg: Optional[Dict[str, Any]] = None
-            for iid in order:
-                s = services.get(iid) or {}
-                if s.get("plugin_id") == ind_id:
-                    cfg = s
-                    break
-            if cfg is None and order:
-                cfg = services.get(order[0]) or {}
-            if cfg:
-                if cfg.get("lookback") is not None:
-                    merged["lookback"] = int(cfg["lookback"])
-                merged.update(dict(cfg.get("params") or {}))
-        except Exception as e:
-            print(f"⚠️ [ChartWin] Service-Set '{set_id}' nicht ladbar: {e}")
+        merged: Dict[str, Any] = dict(st.get("params") or {})
+        if set_id:
+            try:
+                definition = self._get_service_set_repo().get_set(set_id)
+                services = (definition or {}).get("services") or {}
+                order = (definition or {}).get("execution_order") or []
+                # Service mit passendem plugin_id bevorzugen, sonst erster Service.
+                cfg: Optional[Dict[str, Any]] = None
+                for iid in order:
+                    s = services.get(iid) or {}
+                    if s.get("plugin_id") == ind_id:
+                        cfg = s
+                        break
+                if cfg is None and order:
+                    cfg = services.get(order[0]) or {}
+                if cfg:
+                    if cfg.get("lookback") is not None:
+                        merged["lookback"] = int(cfg["lookback"])
+                    merged.update(dict(cfg.get("params") or {}))
+            except Exception as e:
+                print(f"⚠️ [ChartWin] Service-Set '{set_id}' nicht ladbar: {e}")
+        # 5.5 Fix: Live-Overlay aus dem Dialog (geänderte Service-Parameter)
+        merged.update(dict(st.get("logic_params") or {}))
         # Darstellung (Farben, Sichtbarkeit) überlagert die Logik
         merged.update(dict(st.get("display_params") or {}))
         return merged
@@ -514,6 +526,10 @@ class PyTraderChartWindow(QMainWindow):
                 "active": True,
                 "preset": preset,
                 "set_id": payload.get("set_id") or "",
+                # 5.5 Fix: Service-Parameter (grid_step, prox_levels, ...) als
+                # Live-Overlay mitgeben, damit Änderungen an der Berechnungslogik
+                # im Dialog SOFORT auf dem Chart erscheinen.
+                "logic_params": dict(payload.get("logic_params") or {}),
                 "display_params": dict(payload.get("display_params") or {}),
             }
         else:

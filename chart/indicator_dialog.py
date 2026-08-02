@@ -150,6 +150,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 		symbol: str = "SILVER",
 		timeframe: str = "H1",
 		service_set_repo: Optional[Any] = None,
+		current_set_id: Optional[str] = None,
+		logic_params: Optional[Dict[str, Any]] = None,
 	) -> None:
 		super().__init__(parent)
 
@@ -165,9 +167,20 @@ class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 		self._set_repo = service_set_repo
 		self._set_evaluator = None
 		self._set_run_worker: Optional[DialogServiceSetRunWorker] = None
-		self._current_set_id: Optional[str] = None
+		# 5.5 Fix (Bugfix #3): Beim Restore/Neuaufbau das zuletzt gewaehlte
+		# Service-Set vorbelegen, damit die Set-Combo und die Service-Logik
+		# beim Oeffnen des Fensters wiederhergestellt werden.
+		self._current_set_id: Optional[str] = current_set_id or None
 		self._current_set_definition: Optional[Dict[str, Any]] = None
 		self._set_param_controls: Dict[str, QWidget] = {}
+		# 5.5 Fix: Live-Overlay der Service-Parameter (logic_params). Wird beim
+		# Oeffnen vom Chart-Window getrennt uebergeben (st['logic_params']),
+		# beim Preset-Laden ersetzt und nach dem Set-Logik-Merge in
+		# _on_service_set_changed wieder angewendet, damit die zuletzt vom
+		# Dialog gemeldeten Werte (grid_step, prox_levels, ...) beim Restore
+		# und beim Set-Wechsel NICHT von den gespeicherten Set-Werten
+		# ueberschrieben werden.
+		self._preset_logic_params: Dict[str, Any] = dict(logic_params or {})
 
 		# Plugin-Kontext (nur im Plugin-Modus gesetzt)
 		self.plugin = None
@@ -235,13 +248,19 @@ class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 
 	@staticmethod
 	def _decimal_places(value: Any) -> int:
-		"""Nachkommastellen eines float (fuer QDoubleSpinBox.setDecimals)."""
+		"""Nachkommastellen eines float (fuer QDoubleSpinBox.setDecimals).
+
+		5.5 Fix (Bugfix #2): Floats erhalten MINDESTENS 2 Nachkommastellen.
+		Damit lassen auch Felder ohne explizites step (z.B. Custom-Level
+		prox_level1-6 mit Default 0.0) Nachkommastellen zu - vorher ergab
+		_decimal_places(0.0) == 0 und die SpinBox hatte keine Dezimalstellen.
+		"""
 		if not isinstance(value, float) or value != value:  # NaN-Schutz
 			return 4
 		s = f"{value:.10f}".rstrip("0")
 		if "." in s:
-			return len(s.split(".")[1])
-		return 0
+			return max(2, len(s.split(".")[1]))
+		return 2
 
 	@staticmethod
 	def _is_visual_key(key: str) -> bool:
@@ -634,6 +653,9 @@ class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 		if not self.combo_service_set:
 			return
 		current = self.combo_service_set.currentData()
+		# 5.5 Fix (Bugfix #3): Beim Oeffnen/Restore das uebergebene Set
+		# vorbelegen, wenn noch keine Auswahl besteht (current leer).
+		prefer = current or self._current_set_id
 
 		self.combo_service_set.blockSignals(True)
 		self.combo_service_set.clear()
@@ -641,8 +663,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 		for s in self.set_repo.list_sets():
 			label = s.get("display_name") or s.get("set_id") or "Unbenannt"
 			self.combo_service_set.addItem(label, s.get("set_id"))
-		if current:
-			idx = self.combo_service_set.findData(current)
+		if prefer:
+			idx = self.combo_service_set.findData(prefer)
 			if idx >= 0:
 				self.combo_service_set.setCurrentIndex(idx)
 		self.combo_service_set.blockSignals(False)
@@ -679,6 +701,11 @@ class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 		# Logik-Werte zeigt. Die Darstellung (Farben, Sichtbarkeiten) bleibt
 		# unberührt – sie lebt getrennt in display_params.
 		self.params.update(self._resolve_set_logic_params())
+		# 5.5 Fix (Bugfix #1+#3): Die zuletzt im Dialog gemeldeten Service-
+		# Parameter (Live-Overlay / logic_params aus geladenem Preset) wieder
+		# ueber die Set-Logik legen - so bleiben Aenderungen an grid_step,
+		# prox_levels, ... beim Set-Wechsel UND beim Restore erhalten.
+		self.params.update(self._preset_logic_params)
 		self._rebuild_service_stack()
 
 	def _on_service_selected(self, index: int) -> None:
@@ -817,12 +844,29 @@ class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 			print(f"⚠️ [IndicatorDialog] Service-Set '{set_id}' nicht ladbar: {e}")
 			return {}
 
-	def _build_preset_payload(self) -> Dict[str, Any]:
-		"""5.4 Schritt 2: Getrenntes Rückgabe-Dictionary (Logik vs. Darstellung).
+	def _collect_logic_params(self) -> Dict[str, Any]:
+		"""5.5 Fix: Live-Service-Parameter (logic_params) aus den Controls.
 
-		Plugin-Modus: set_id (gewähltes Service-Set) + display_params (nur
-		reine Darstellung: Sichtbarkeit, Farben). Die Berechnungslogik lebt im
-		Service-Set (service_sets-Tabelle), NICHT im Chart-State/Preset.
+		Alle Nicht-Darstellungs-Keys aus self.param_controls (Box
+		'Service-Parameter' + Expert-Optionen des aktiven Plugins) - also
+		grid_step, proximity_threshold, prox_levels, lookback usw. Diese
+		ueberlagern im Chart die Basis-Logik des Service-Sets (Live-Overlay).
+		"""
+		logic: Dict[str, Any] = {}
+		for key, ctrl in self.param_controls.items():
+			if not self._is_visual_key(key):
+				logic[key] = self._ctrl_value(ctrl)
+		return logic
+
+	def _build_preset_payload(self) -> Dict[str, Any]:
+		"""5.4 Schritt 2 + 5.5 Fix: Getrenntes Rückgabe-Dictionary (Logik vs. Darstellung).
+
+		Plugin-Modus: set_id (gewähltes Service-Set) + logic_params (Live-
+		Service-Parameter aus der Box 'Service-Parameter' + Expert-Optionen)
+		+ display_params (nur reine Darstellung: Sichtbarkeit, Farben). Die
+		Basis-Berechnungslogik lebt im Service-Set (service_sets-Tabelle);
+		logic_params ueberlagert sie als Live-Overlay, damit Aenderungen an
+		grid_step / prox_levels / lookback SOFORT auf dem Chart erscheinen.
 		Legacy (Alt-Indikator ohne Plugin): volle params (kein Set).
 		"""
 		if self.plugin is None:
@@ -832,7 +876,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 		for key, ctrl in self.param_controls.items():
 			if self._is_visual_key(key):
 				display[key] = self._ctrl_value(ctrl)
-		return {"set_id": set_id or "", "display_params": display}
+		return {"set_id": set_id or "", "logic_params": self._collect_logic_params(),
+		        "display_params": display}
 
 	# -------------------------------------------------------------------------
 	# Set-Aktionen (Phase 13 Schritt 5)
@@ -1133,6 +1178,11 @@ class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 
 	def on_param_control_changed(self) -> None:
 		self.params = self.collect_params_from_ui()
+		# 5.5 Fix: Das Live-Overlay (logic_params) bei jeder Aenderung
+		# mitfuehren, damit Set-Wechsel/Restore im Dialog den aktuellen
+		# Stand der Service-Parameter beibehalten (Bugfix #1+#3).
+		if self.plugin is not None:
+			self._preset_logic_params = self._collect_logic_params()
 		# 5.4 Schritt 2: Getrenntes Dict {set_id, display_params} an das
 		# Chart-Window – die Berechnungslogik lebt im Service-Set.
 		self.on_params_changed_callback(self._build_preset_payload(), self.current_preset_name)
@@ -1153,9 +1203,14 @@ class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 					# 5.4 Schritt 2: Decoupled Preset (set_id + display_params).
 					# Darstellung übernehmen, Set-Auswahl setzen (löst
 					# _on_service_set_changed → mergt die Logik in self.params).
+					# 5.5 Fix (Bugfix #3): Auch logic_params aus dem Preset
+					# laden - das sind die zuletzt gemeldeten Service-Werte
+					# (Live-Overlay), die beim Restore erhalten bleiben muessen.
 					display = dict(loaded.get("display_params") or {})
+					self._preset_logic_params = dict(loaded.get("logic_params") or {})
 					set_id = loaded.get("set_id") or ""
 					merged = dict(self.indicator.default_params)
+					merged.update(self._preset_logic_params)
 					merged.update(display)
 					self.params = merged
 					if self.combo_service_set:
