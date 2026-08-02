@@ -659,6 +659,11 @@ class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 					self.combo_service_sel.addItem(f"{iid} [{pid}]", iid)
 			self.combo_service_sel.blockSignals(False)
 
+		# 5.4 Schritt 2: Die Berechnungslogik des gewählten Sets in self.params
+		# mergen, damit Seite 0 (Service-Props des aktiven Plugins) die aktuellen
+		# Logik-Werte zeigt. Die Darstellung (Farben, Sichtbarkeiten) bleibt
+		# unberührt – sie lebt getrennt in display_params.
+		self.params.update(self._resolve_set_logic_params())
 		self._rebuild_service_stack()
 
 	def _on_service_selected(self, index: int) -> None:
@@ -760,6 +765,59 @@ class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 		# 4.4: Fenster/Box auf die neue Stack-Seite nachziehen (dynamische Höhe)
 		if self._ui_ready:
 			self._reflow()
+
+	def _resolve_set_logic_params(self) -> Dict[str, Any]:
+		"""5.4 Schritt 2: Berechnungslogik des gewählten Service-Sets.
+
+		Liefert lookback + params des Service im Set, dessen plugin_id zum
+		aktiven Plugin passt (sonst erster Service). Leer, wenn kein Set
+		gewählt ist oder das Set keine Services hat. Die Darstellung (Farben,
+		Sichtbarkeiten) bleibt davon unberührt – sie lebt in display_params.
+		"""
+		if self.plugin is None:
+			return {}
+		set_id = self.combo_service_set.currentData() if self.combo_service_set else ""
+		if not set_id:
+			return {}
+		try:
+			definition = self.set_repo.get_set(set_id)
+			services = (definition or {}).get("services") or {}
+			order = (definition or {}).get("execution_order") or []
+			cfg = None
+			for iid in order:
+				s = services.get(iid) or {}
+				if s.get("plugin_id") == self.plugin.plugin_id:
+					cfg = s
+					break
+			if cfg is None and order:
+				cfg = services.get(order[0]) or {}
+			if not cfg:
+				return {}
+			merged: Dict[str, Any] = {}
+			if cfg.get("lookback") is not None:
+				merged["lookback"] = int(cfg["lookback"])
+			merged.update(dict(cfg.get("params") or {}))
+			return merged
+		except Exception as e:
+			print(f"⚠️ [IndicatorDialog] Service-Set '{set_id}' nicht ladbar: {e}")
+			return {}
+
+	def _build_preset_payload(self) -> Dict[str, Any]:
+		"""5.4 Schritt 2: Getrenntes Rückgabe-Dictionary (Logik vs. Darstellung).
+
+		Plugin-Modus: set_id (gewähltes Service-Set) + display_params (nur
+		reine Darstellung: Sichtbarkeit, Farben). Die Berechnungslogik lebt im
+		Service-Set (service_sets-Tabelle), NICHT im Chart-State/Preset.
+		Legacy (Alt-Indikator ohne Plugin): volle params (kein Set).
+		"""
+		if self.plugin is None:
+			return dict(self.collect_params_from_ui())
+		set_id = self.combo_service_set.currentData() if self.combo_service_set else ""
+		display: Dict[str, Any] = {}
+		for key, ctrl in self.param_controls.items():
+			if self._is_visual_key(key):
+				display[key] = self._ctrl_value(ctrl)
+		return {"set_id": set_id or "", "display_params": display}
 
 	# -------------------------------------------------------------------------
 	# Set-Aktionen (Phase 13 Schritt 5)
@@ -1056,7 +1114,9 @@ class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 
 	def on_param_control_changed(self) -> None:
 		self.params = self.collect_params_from_ui()
-		self.on_params_changed_callback(self.params, self.current_preset_name)
+		# 5.4 Schritt 2: Getrenntes Dict {set_id, display_params} an das
+		# Chart-Window – die Berechnungslogik lebt im Service-Set.
+		self.on_params_changed_callback(self._build_preset_payload(), self.current_preset_name)
 
 	def on_preset_selected(self, preset_name: str) -> None:
 		if not preset_name:
@@ -1069,10 +1129,25 @@ class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 		else:
 			loaded = self.state_manager.get_indicator_preset(self.indicator.indicator_id, preset_name)
 			if loaded:
-				self.params = loaded
+				if (self.plugin is not None and isinstance(loaded, dict)
+						and "display_params" in loaded):
+					# 5.4 Schritt 2: Decoupled Preset (set_id + display_params).
+					# Darstellung übernehmen, Set-Auswahl setzen (löst
+					# _on_service_set_changed → mergt die Logik in self.params).
+					display = dict(loaded.get("display_params") or {})
+					set_id = loaded.get("set_id") or ""
+					merged = dict(self.indicator.default_params)
+					merged.update(display)
+					self.params = merged
+					if self.combo_service_set:
+						idx = self.combo_service_set.findData(set_id)
+						self.combo_service_set.setCurrentIndex(idx if idx >= 0 else 0)
+				else:
+					# Legacy-Preset: volle params
+					self.params = loaded
 
 		self.update_ui_from_params(self.params)
-		self.on_params_changed_callback(self.params, self.current_preset_name)
+		self.on_params_changed_callback(self._build_preset_payload(), self.current_preset_name)
 
 	def save_current_preset(self) -> None:
 		self.params = self.collect_params_from_ui()
@@ -1101,10 +1176,14 @@ class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 			if reply != QMessageBox.Yes:
 				return
 
-		self.state_manager.save_indicator_preset(self.indicator.indicator_id, clean_name, self.params)
+		# 5.4 Schritt 2: Nur das GETRENNTE Dict {set_id, display_params}
+		# speichern – die Berechnungslogik bleibt im Service-Set (service_sets),
+		# das Preset hält nur Darstellung + Set-Referenz.
+		payload = self._build_preset_payload()
+		self.state_manager.save_indicator_preset(self.indicator.indicator_id, clean_name, payload)
 		self.current_preset_name = clean_name
 		self.refresh_preset_list()
-		self.on_params_changed_callback(self.params, self.current_preset_name)
+		self.on_params_changed_callback(self._build_preset_payload(), self.current_preset_name)
 
 	def delete_current_preset(self) -> None:
 		if self.current_preset_name == "Default":

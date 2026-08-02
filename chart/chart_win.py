@@ -400,9 +400,15 @@ class PyTraderChartWindow(QMainWindow):
         st = self.indicators_state.setdefault(ind_id, {
             "active": False, "preset": "Default", "params": dict(plugin.default_params)
         })
-        dialog = IndicatorSettingsDialog(plugin, st["params"], st["preset"], self.state_manager,
-                                         lambda p, pr: self._on_indicator_params_updated(ind_id, p, pr), self,
-                                         symbol=self.current_symbol, timeframe=self.current_tf)
+        # 5.4 Schritt 2: Dem Dialog die AUFGELÖSTEN Parameter übergeben
+        # (Logik aus dem Service-Set + Darstellung), damit Seite 0 die
+        # aktuellen Berechnungswerte zeigt. Beim Zurückmelden liefert der
+        # Dialog nur set_id + display_params (Decoupling).
+        dialog = IndicatorSettingsDialog(
+            plugin, self._resolve_indicator_params(ind_id, st), st["preset"],
+            self.state_manager,
+            lambda p, pr: self._on_indicator_params_updated(ind_id, p, pr), self,
+            symbol=self.current_symbol, timeframe=self.current_tf)
         self._settings_dialog = dialog
         dialog.finished.connect(lambda: self._on_settings_closed(dialog))
         dialog.show()
@@ -441,9 +447,81 @@ class PyTraderChartWindow(QMainWindow):
         print(f"⚠️ [ChartRefresh] Watchdog: Refresh haengt ({self.current_symbol} {self.current_tf}), setze zurueck")
         self._is_loading_data = False
 
-    def _on_indicator_params_updated(self, ind_id: str, params: Dict[str, Any], preset: str) -> None:
-        """Callback wenn ein Indikator-Parameter geändert wurde."""
-        self.indicators_state[ind_id] = {"active": True, "preset": preset, "params": params}
+    def _get_service_set_repo(self) -> Any:
+        """Lazy-Repository für Service-Sets (5.4 Schritt 2).
+
+        Einmalig pro Fenster instanziiert; im Test kann ein temporäres
+        Repository (Temp-DB) injiziert werden (self._service_set_repo)."""
+        if getattr(self, "_service_set_repo", None) is None:
+            from analytics.engine.service_set_repository import ServiceSetRepository
+            self._service_set_repo = ServiceSetRepository()
+        return self._service_set_repo
+
+    def _resolve_indicator_params(self, ind_id: str, st: Dict[str, Any]) -> Dict[str, Any]:
+        """5.4 Schritt 2: Volles Parameter-Dict für plugin.calculate().
+
+        NEUES Format (Plugin, z.B. grid_liquidity): indicators_state speichert
+        nur noch set_id + display_params. Die Berechnungslogik (grid_step,
+        proximity_threshold, lookback, ...) kommt LIVE aus dem Service-Set
+        (ServiceSetRepository.get_set(set_id)); die Darstellung (Farben,
+        Sichtbarkeiten) aus display_params. Wird ein Set im Servicefenster
+        angepasst, übernehmen ALLE Charts mit dieser set_id die neue Logik,
+        ohne ihre individuellen Farbeinstellungen zu verlieren.
+
+        LEGACY (z.B. Alt-Indikator 'grid' / alter DB-Stand ohne set_id):
+        volle params werden unverändert durchgereicht (Abwärtskompatibilität).
+        """
+        st = st or {}
+        set_id = st.get("set_id")
+        if not set_id:
+            return dict(st.get("params") or {})
+
+        merged: Dict[str, Any] = {}
+        try:
+            definition = self._get_service_set_repo().get_set(set_id)
+            services = (definition or {}).get("services") or {}
+            order = (definition or {}).get("execution_order") or []
+            # Service mit passendem plugin_id bevorzugen, sonst erster Service.
+            cfg: Optional[Dict[str, Any]] = None
+            for iid in order:
+                s = services.get(iid) or {}
+                if s.get("plugin_id") == ind_id:
+                    cfg = s
+                    break
+            if cfg is None and order:
+                cfg = services.get(order[0]) or {}
+            if cfg:
+                if cfg.get("lookback") is not None:
+                    merged["lookback"] = int(cfg["lookback"])
+                merged.update(dict(cfg.get("params") or {}))
+        except Exception as e:
+            print(f"⚠️ [ChartWin] Service-Set '{set_id}' nicht ladbar: {e}")
+        # Darstellung (Farben, Sichtbarkeit) überlagert die Logik
+        merged.update(dict(st.get("display_params") or {}))
+        return merged
+
+    def _on_indicator_params_updated(self, ind_id: str, payload: Dict[str, Any], preset: str) -> None:
+        """Callback wenn ein Indikator-Parameter geändert wurde.
+
+        5.4 Schritt 2: Der Indikator-Dialog liefert im Plugin-Modus ein
+        GETRENNTES Dict {set_id, display_params} – die Berechnungslogik lebt im
+        Service-Set, die Darstellung (Farben, Sichtbarkeiten) im Chart-State.
+        Legacy (Alt-Indikator 'grid' / voller params-Dict) wird unverändert
+        gespeichert (Abwärtskompatibilität).
+        """
+        if isinstance(payload, dict) and ("set_id" in payload or "display_params" in payload):
+            self.indicators_state[ind_id] = {
+                "active": True,
+                "preset": preset,
+                "set_id": payload.get("set_id") or "",
+                "display_params": dict(payload.get("display_params") or {}),
+            }
+        else:
+            self.indicators_state[ind_id] = {
+                "active": True,
+                "preset": preset,
+                "params": dict(payload or {}),
+            }
         self.save_state()
         self.render_indicators()
 
@@ -467,7 +545,9 @@ class PyTraderChartWindow(QMainWindow):
                 # Kontext setzen (Symbol/TF fuer DB-basierte Indikatoren)
                 if hasattr(plugin, "set_context"):
                     plugin.set_context(self.current_symbol, self.current_tf)
-                res = plugin.calculate(self.df_data, st.get("params", {}))
+                # 5.4 Schritt 2: Parameter aus set_id (Logik) + display_params
+                # (Darstellung) auflösen – Legacy voller params bleibt erhalten.
+                res = plugin.calculate(self.df_data, self._resolve_indicator_params(ind_id, st))
                 # Grid-spezifische Render-Logik (Alt 'grid' + Plugin 'grid_liquidity')
                 if ind_id in ("grid", "grid_liquidity"):
                     lines = res.get("lines", [])
@@ -604,7 +684,9 @@ class PyTraderChartWindow(QMainWindow):
                 if st.get("active") and ind_id in ("grid", "grid_liquidity"):
                     if hasattr(plugin, "set_context"):
                         plugin.set_context(self.current_symbol, self.current_tf)
-                    res = plugin.calculate(self.df_data, st.get("params", {}))
+                    # 5.4 Schritt 2: Logik aus set_id + Darstellung aus
+                    # display_params auflösen (Legacy volle params bleibt).
+                    res = plugin.calculate(self.df_data, self._resolve_indicator_params(ind_id, st))
                     grid_lines = res.get("lines", [])
                     grid_circles = res.get("hit_circles", [])
                     # Circle-Zeiten auf kontinuierlich mappen
