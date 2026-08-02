@@ -1,32 +1,81 @@
 # chart/indicators/grid_liquidity.py
 """
-NEUER Grid-Indikator mit Plugin-Architektur (Phase 12 Schritt 5).
+NEUER Grid-Indikator mit Service-Pipeline (Phase 13 Schritt 6).
 
-Konsumiert das GridLiquidityFeature-Plugin über den PluginExecutor und gibt
-dessen chart_render_payload zurück (lines + hit_circles). Die Service-Logik
-liegt im Plugin (analytics/features/definitions/grid_liquidity.py); dieser
-Indikator ist nur der visuelle Adapter (Basis-Parameter über den generischen
-indicator_dialog.py, Interim bis zum neuen Property-Fenster nach Phase 12).
+Der Indikator ist jetzt der VISUELLE ADAPTER über die neuen Services
+grid_lines + proximity (analytics/features/definitions/):
 
-Der bestehende chart/indicators/grid.py bleibt UNVERÄNDERT und läuft als
-Alt-Implementierung parallel (indicator_id 'grid').
+  * Historical-Run: Er instanziiert intern eine ServiceSetDefinition
+    (grid_1 → grid_lines, prox_1 → proximity, Reihenfolge + depends_on) und
+    führt sie über den ServiceSetEvaluator aus. Die Linien (Parität zu
+    chart/indicators/grid.py) werden THREAD-SICHER in self._cached_grid_lines
+    zwischengespeichert (atomare Zuweisung unter Lock).
+  * Live-Ticks (update_live_candle): Die Pipeline wird NICHT aufgerufen. Es
+    wird ausschließlich die mathematische Differenz zwischen dem Live-Tick und
+    den gecachten Linien berechnet (prozentuale visit%-Semantik), um
+    Live-Punkte zu setzen. Ein neuer Close (gerundete Time nicht in
+    self._known_times) stößt NUR einen debounced Refresh an – nicht jeder Tick.
+
+Das UI-Schema bleibt über das Alt-Plugin 'grid_liquidity' (PluginRegistry)
+bezogen (grid_step/proximity_threshold/prox_level1-6/Farben) – es ist die
+Single Source of Truth für das Prop-Fenster. Der Alt-Bestand
+(analytics/features/definitions/grid_liquidity.py und chart/indicators/grid.py)
+bleibt UNVERÄNDERT als Referenz-Parallelbetrieb erhalten.
 """
 
-from typing import Any, Dict, List, Optional
+import threading
+from datetime import datetime, timezone as dt_timezone
+from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
 
+from db_service import TF_SECONDS_MAP
 from .base_indicator import BaseIndicator
 from analytics.features.feature_builder import PluginExecutor, PluginRegistry
+from analytics.features.plugins.base_plugin import PluginContext
+from analytics.engine.set_evaluator import ServiceSetEvaluator
+
+
+def _as_bool(value: Any, default: bool = True) -> bool:
+    if isinstance(value, str):
+        return value.lower() in ("true", "1", "yes")
+    if value is None:
+        return default
+    return bool(value)
+
+
+def _f_in_window_around(minute_val: int, center: int, span: int) -> bool:
+    """Native UTC-Zeitfenster-Logik (identisch zu grid.py / proximity_service)."""
+    lower = center - span
+    upper = center + span
+    if lower < 0:
+        return minute_val >= (60 + lower) or minute_val <= upper
+    elif upper > 59:
+        return minute_val >= lower or minute_val <= (upper - 60)
+    else:
+        return lower <= minute_val <= upper
 
 
 class GridLiquidityIndicator(BaseIndicator):
 
     def __init__(self) -> None:
         super().__init__()
+        self._symbol: Optional[str] = None
+        self._timeframe: Optional[str] = None
+        self._settings: Any = None
         self._executor: PluginExecutor = PluginExecutor()
+        self._evaluator: ServiceSetEvaluator = ServiceSetEvaluator(self._executor)
         self._plugin_id: str = "grid_liquidity"
 
+        # --- Thread-sicherer Cache (Phase 13 Schritt 6) ----------------------
+        self._cache_lock = threading.Lock()
+        self._cached_grid_lines: List[Dict[str, Any]] = []
+        self._live_points: List[Dict[str, Any]] = []
+        self._known_times: set = set()
+        self._last_params: Dict[str, Any] = {}
+        self._on_new_candle: Optional[Callable[[], None]] = None
+
+    # ------------------------------------------------------------------ Basis
     @property
     def indicator_id(self) -> str:
         return "grid_liquidity"
@@ -75,9 +124,134 @@ class GridLiquidityIndicator(BaseIndicator):
             ("Custom Levels 4-6", ["prox_level4", "prox_level5", "prox_level6"]),
         ]
 
+    # ------------------------------------------------------------ Kontext-API
+    def set_context(self, symbol: str, timeframe: str) -> None:
+        self._symbol = symbol
+        self._timeframe = timeframe
+
+    def set_settings(self, settings: Any) -> None:
+        """Injiziert AppSettings (Kopie) – sonst lazy aus dem StateManager."""
+        self._settings = settings
+
+    def set_new_candle_callback(self, callback: Optional[Callable[[], None]]) -> None:
+        """Debounced Refresh-Callback (chart_win.refresh_chart_data). Wird bei
+        einem neuen Close genau EINMAL aufgerufen (Cache-Neuaufbau)."""
+        self._on_new_candle = callback
+
+    # ------------------------------------------------------------- Cache-API
+    def _set_cached_lines(self, lines: List[Dict[str, Any]]) -> None:
+        """Thread-sichere atomare Zuweisung: ersetzt die Liste als GANZES
+        (neue Liste, niemals in-place-Mutation) unter Lock."""
+        with self._cache_lock:
+            self._cached_grid_lines = list(lines)
+
+    def _get_cached_lines(self) -> List[Dict[str, Any]]:
+        """Liefert eine flache Kopie der gecachten Linien (Lock-geschützt)."""
+        with self._cache_lock:
+            return list(self._cached_grid_lines)
+
+    # -------------------------------------------------------------- Berechnung
+    def _get_app_settings(self) -> Any:
+        if self._settings is not None:
+            return self._settings
+        try:
+            from state_manager import StateManager
+            return StateManager().get_app_settings()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_custom_levels(params: Dict[str, Any]) -> List[float]:
+        """prox_level1..6 (nur > 0) ODER custom_levels (Liste/String)."""
+        levels: List[float] = []
+        for i in range(1, 7):
+            v = params.get(f"prox_level{i}")
+            if v is None:
+                continue
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if fv > 0.0:
+                levels.append(round(fv, 6))
+        if levels:
+            return levels
+        raw = params.get("custom_levels")
+        if isinstance(raw, (list, tuple)):
+            return [round(float(x), 6) for x in raw if float(x) > 0.0]
+        if isinstance(raw, str) and raw.strip():
+            parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
+            return [round(float(x), 6) for x in parts if float(x) > 0.0]
+        return []
+
+    def _build_set_definition(self, params: Dict[str, Any], df: pd.DataFrame) -> Dict[str, Any]:
+        """Interne ServiceSetDefinition für den Historical-Run (Schritt 6):
+        grid_1 → grid_lines, prox_1 → proximity (depends_on grid_1)."""
+        lookback = int(params.get("lookback") or len(df))
+        if lookback < 1:
+            lookback = 1
+        step_size = float(params.get("step_size", params.get("grid_step", 0.5)))
+        steps_around = int(params.get("steps_around", 4))
+        visit_pct = float(params.get("visit_pct", params.get("proximity_threshold", 0.05)))
+        time_window_mins = int(params.get("time_window_mins", 5))
+        use_time_filter = _as_bool(params.get("use_time_filter"), True)
+        show_lines = _as_bool(params.get("show_lines"), True)
+        show_circles = _as_bool(params.get("show_circles"), True)
+        line_color = str(params.get("line_color") or "").strip()
+        circle_std = str(params.get("circle_color_std") or "#FFEB3B")
+        circle_active = str(params.get("circle_color_active") or "#E91E63")
+        custom_levels = self._extract_custom_levels(params)
+
+        return {
+            "set_id": "grid_liquidity_internal",
+            "display_name": "Grid Liquidity (intern)",
+            "execution_order": ["grid_1", "prox_1"],
+            "services": {
+                "grid_1": {
+                    "plugin_id": "grid_lines",
+                    "lookback": lookback,
+                    "params": {
+                        "step_size": step_size,
+                        "steps_around": steps_around,
+                        "custom_levels": custom_levels,
+                        "show_lines": show_lines,
+                        "line_color": line_color,
+                    },
+                },
+                "prox_1": {
+                    "plugin_id": "proximity",
+                    "lookback": lookback,
+                    "depends_on": ["grid_1"],
+                    "params": {
+                        "visit_pct": visit_pct,
+                        "time_window_mins": time_window_mins,
+                        "use_time_filter": use_time_filter,
+                        "show_lines": show_lines,
+                        "show_circles": show_circles,
+                        "circle_color_std": circle_std,
+                        "circle_color_active": circle_active,
+                    },
+                },
+            },
+        }
+
+    def _compute_known_times(self, df: pd.DataFrame) -> set:
+        """Rundet alle Bar-Zeiten auf den Timeframe (gerundete Time) – dieselbe
+        Erkennung wie chart_win (rounded_t nicht in _time_real_to_cont)."""
+        t_sec = TF_SECONDS_MAP.get(str(self._timeframe or "").upper(), 60)
+        out: set = set()
+        for t in df["time"]:
+            try:
+                ti = int(t)
+            except (TypeError, ValueError):
+                continue
+            out.add(ti - (ti % t_sec))
+        return out
+
     def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Führt das GridLiquidityFeature-Plugin über den PluginExecutor aus und
-        reicht dessen chart_render_payload als Zeichnungsdaten durch."""
+        """Führt die Service-Pipeline (grid_lines + proximity) für den
+        Historical-Run aus, cached die Linien thread-sicher und liefert den
+        Render-Payload (Parität zu grid.py)."""
         empty_result: Dict[str, Any] = {
             "lines": [],
             "hit_circles": [],
@@ -87,17 +261,118 @@ class GridLiquidityIndicator(BaseIndicator):
             return empty_result
 
         try:
-            result = self._executor.execute(self._plugin_id, df, params)
+            p = dict(params or {})
+            self._last_params = dict(p)
+
+            context = PluginContext(
+                symbol=self._symbol or "",
+                timeframe=self._timeframe or "",
+                mode="chart",
+                settings=self._get_app_settings(),
+            )
+            definition = self._build_set_definition(p, df)
+            results = self._evaluator.execute_set(definition, df, context)
+
+            # Linien kommen aus dem Namespace grid_1 (GridLinesService schreibt
+            # die Linienliste dorthin) – atomare, thread-sichere Zuweisung.
+            grid_lines = context.shared_state.get("grid_1") or []
+            lines = list(grid_lines) if isinstance(grid_lines, list) else []
+
+            prox_result = results.get("prox_1") or {}
+            prox_crp = prox_result.get("chart_render_payload") or {}
+            # Display-Layer: priority=10 (JS-Bridge-Erwartung, wie Alt-Plugin).
+            # Die Services selbst bleiben Paritäts-pur (kein priority – exakt
+            # wie grid.py); die Anreicherung passiert erst hier im Adapter.
+            circles = [dict(c, priority=10) for c in (prox_crp.get("hit_circles") or [])]
+            status = dict(prox_crp.get("status_info") or empty_result["status_info"])
+
+            self._set_cached_lines(lines)
+            self._known_times = self._compute_known_times(df)
+            self._live_points = []
+
+            return {
+                "lines": lines,
+                "hit_circles": circles,
+                "status_info": status,
+            }
         except Exception as e:
-            print(f"⚠️ [GridLiquidityIndicator] Plugin-Ausführung fehlgeschlagen: {e}")
+            print(f"⚠️ [GridLiquidityIndicator] Service-Pipeline fehlgeschlagen: {e}")
             return empty_result
 
-        crp = result.get("chart_render_payload", {}) if isinstance(result, dict) else {}
+    def update_live_candle(self, candle: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Live-Tick-Verarbeitung OHNE Pipeline (Phase 13 Schritt 6):
+        berechnet ausschließlich die mathematische Differenz zwischen dem
+        Live-Tick und self._cached_grid_lines (prozentuale visit%-Semantik),
+        um Live-Punkte zu setzen. Ein neuer Close wird über self._known_times
+        erkannt und löst genau EINEN debounced Refresh aus (Cache-Neuaufbau),
+        nicht bei jedem Tick.
 
-        lines = crp.get("lines", [])
-        hit_circles = crp.get("hit_circles", [])
-        return {
-            "lines": lines,
-            "hit_circles": hit_circles,
-            "status_info": {"in_time_window": False, "active_hits": []},
-        }
+        Args:
+            candle: Live-Candle/Quote mit 'time' (epoch-Sekunden, auf den
+                    Timeframe gerundet) und 'close' (bzw. 'price').
+
+        Returns:
+            Liste der Live-Punkte [{time, price, color}, ...] – zusätzlich in
+            self._live_points (atomare Zuweisung).
+        """
+        if not candle:
+            return []
+        cached_lines = self._get_cached_lines()
+        if not cached_lines:
+            return []
+
+        try:
+            ts = int(candle.get("time", 0))
+            if ts <= 0:
+                return []
+        except (TypeError, ValueError):
+            return []
+
+        t_sec = TF_SECONDS_MAP.get(str(self._timeframe or "").upper(), 60)
+        rounded = ts - (ts % t_sec)
+
+        # Neue Candle → NUR ein debounced Cache-Neuaufbau (nicht jeder Tick).
+        if rounded not in self._known_times:
+            self._known_times.add(rounded)
+            if self._on_new_candle is not None:
+                try:
+                    self._on_new_candle()
+                except Exception as e:
+                    print(f"⚠️ [GridLiquidityIndicator] Cache-Neuaufbau fehlgeschlagen: {e}")
+
+        try:
+            price = float(candle.get("close", candle.get("price", 0.0)))
+        except (TypeError, ValueError):
+            return []
+
+        p = self._last_params or {}
+        visit_pct = float(p.get("visit_pct", p.get("proximity_threshold", 0.05)))
+        use_time_filter = _as_bool(p.get("use_time_filter"), True)
+        time_window_mins = int(p.get("time_window_mins", 5))
+        circle_std = str(p.get("circle_color_std") or "#FFEB3B")
+        circle_active = str(p.get("circle_color_active") or "#E91E63")
+
+        row_m = datetime.fromtimestamp(rounded, tz=dt_timezone.utc).minute
+        row_in_time = (
+            _f_in_window_around(row_m, 0, time_window_mins)
+            or _f_in_window_around(row_m, 30, time_window_mins)
+        )
+        color = circle_active if (use_time_filter and not row_in_time) else circle_std
+
+        points: List[Dict[str, Any]] = []
+        for line in cached_lines:
+            lvl = line.get("price")
+            if lvl is None:
+                continue
+            try:
+                lvl = float(lvl)
+            except (TypeError, ValueError):
+                continue
+            visit_min = lvl * (1.0 - visit_pct / 100.0)
+            visit_max = lvl * (1.0 + visit_pct / 100.0)
+            if visit_min <= price <= visit_max:
+                points.append({"time": rounded, "price": lvl, "color": color,
+                               "priority": 10})
+
+        self._live_points = list(points)  # atomare Zuweisung
+        return points

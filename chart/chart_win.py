@@ -167,6 +167,11 @@ class PyTraderChartWindow(QMainWindow):
             "grid": GridIndicator(),
             "grid_liquidity": GridLiquidityIndicator(),
         }
+        # Phase 13 Schritt 6: Neuer Close im grid_liquidity-Indikator → NUR ein
+        # debounced Refresh (Cache-Neuaufbau), nicht bei jedem Tick.
+        liq_ind = self.indicators.get("grid_liquidity")
+        if liq_ind is not None and hasattr(liq_ind, "set_new_candle_callback"):
+            liq_ind.set_new_candle_callback(self.refresh_chart_data)
         self._settings_dialog: Optional[QDialog] = None
         self._page_loaded: bool = False
 
@@ -836,8 +841,23 @@ class PyTraderChartWindow(QMainWindow):
             c_copy["time"] = last_cont + t_sec
             self._time_cont_to_real[c_copy["time"]] = rounded_t
             self._time_real_to_cont[rounded_t] = c_copy["time"]
+            # Phase 13 Schritt 6: Neue Candle → NUR ein debounced Refresh, der
+            # den Linien-Cache des grid_liquidity-Indikators einmal neu aufbaut
+            # (nicht bei jedem Tick).
+            self.refresh_chart_data()
         else:
             c_copy["time"] = rounded_t
+
+        # Phase 13 Schritt 6: Live-Ticks an den grid_liquidity-Indikator
+        # delegieren – er berechnet die mathematische Differenz Live-Tick vs.
+        # gecachte Liq-Lines (KEINE Pipeline pro Tick) und setzt Live-Punkte.
+        liq_ind = self.indicators.get("grid_liquidity")
+        if (liq_ind is not None and hasattr(liq_ind, "update_live_candle")
+                and self.indicators_state.get("grid_liquidity", {}).get("active")):
+            try:
+                liq_ind.update_live_candle(dict(c_copy, time=rounded_t))
+            except Exception as e:
+                print(f"⚠️ [GridLiquidity] Live-Update fehlgeschlagen: {e}")
 
         try:
             self.web_view.page().runJavaScript(f"if(window.updateLiveCandle) updateLiveCandle('{json.dumps(c_copy, allow_nan=False)}');")
