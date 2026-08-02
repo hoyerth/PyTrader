@@ -13,11 +13,13 @@ und wendet die PROZENTUALE visit%-Semantik von grid.py an:
 
 – NICHT die absolute threshold-Distanz des Alt-Plugins grid_liquidity.
 
-Das native UTC-Zeitfenster (Minute 0/30 ± time_window_mins) bestimmt wie in
-grid.py nur die Farbe der Kreise:
-  - Zeitfilter INAKTIV  → alle Treffer circle_color_std (gelb #FFEB3B)
-  - Zeitfilter AKTIV    → im Fenster circle_color_std, ausserhalb
-                          circle_color_active (fuchsia #E91E63)
+Das native UTC-Zeitfenster (Minute 0/30 ± time_window_mins) wird pro Hit als
+`in_window`-Flag in den hit_circles gemeldet. Die FARBE der Kreise (gelb im
+Fenster / fuchsia außerhalb) und die Sichtbarkeit (show_lines / show_circles)
+sind KEINE Service-Parameter – sie werden vom INDIKATOR gesteuert
+(chart/indicators/grid_liquidity.py), der die Circle-Farben auf Basis seines
+eigenen Schemas (circle_color_std / circle_color_active) und des
+`in_window`-Flags setzt.
 
 lookback (Scan-Fenster von rechts nach links) = min(statistics_signal_limit,
 len(df)) aus context.settings. Der Service schreibt die Hit-Records nach
@@ -38,10 +40,6 @@ from analytics.features.plugins.base_plugin import (
     PluginContext,
     PluginFeature,
 )
-
-# Paritäts-Defaults (identisch zu grid.py)
-YELLOW = "#FFEB3B"
-FUCHSIA = "#E91E63"
 
 
 def f_in_window_around(minute_val: int, center: int, span: int) -> bool:
@@ -113,25 +111,24 @@ class ProximityService(PluginFeature):
         }
 
     # --- Single Source of Truth fürs Prop-Fenster (Phase 13 Schritt 5) -------
+    # Hinweis (Schritt 6-Korrektur 3): Die visuellen Parameter (show_circles,
+    # circle_color_std, circle_color_active, show_lines) sind KEINE
+    # Service-Parameter – sie gehören zum Indikator-Schema und werden dort
+    # gesteuert (chart/indicators/grid_liquidity.py). Der Service meldet nur
+    # das in_window-Flag; der Indikator färbt die Kreise.
     @property
     def parameter_order(self) -> List[str]:
         return [
-            "show_circles", "circle_color_std", "circle_color_active",
             "visit_pct",
             "use_time_filter", "time_window_mins",
-            "show_lines",
         ]
 
     @property
     def param_labels(self) -> Dict[str, str]:
         return {
-            "show_circles": "Hits anzeigen",
-            "circle_color_std": "Std-Hit-Farbe (im Fenster)",
-            "circle_color_active": "Aktiv-Hit-Farbe (ausserhalb)",
             "visit_pct": "Besuchs-Toleranz (%)",
             "use_time_filter": "Time Filter aktiv",
             "time_window_mins": "Time Filter Minuten (0/30)",
-            "show_lines": "Level-Tracking (Linien-Sichtbarkeit)",
         }
 
     @property
@@ -139,28 +136,15 @@ class ProximityService(PluginFeature):
         return {
             "visit_pct": {
                 "type": "float", "default": 0.05, "min": 0.0, "max": 100.0,
-                "step": 0.005, "description": "Prozentuale Toleranz um jede Linie (prox_visitPct ↔ visit_pct)",
+                "step": 0.005, "description": "Prozentuale Toleranz um jede Linie (Parität zu grid.py visit_pct)",
             },
             "time_window_mins": {
                 "type": "int", "default": 5, "min": 0, "max": 30,
-                "step": 1, "description": "Time Filter Minuten um 0/30 (prox_timeWindowMins ↔ time_window_mins)",
+                "step": 1, "description": "Time Filter Minuten um 0/30 UTC",
             },
             "use_time_filter": {
                 "type": "bool", "default": True,
-                "description": "Time Filter aktiv – außerhalb gelb/fuchsia (prox_useTimeFilter ↔ use_time_filter)",
-            },
-            "show_lines": {
-                "type": "bool", "default": True,
-                "description": "Level-Tracking aktiv (grid.py: tracked_levels = levels if show_lines else [])",
-            },
-            "show_circles": {
-                "type": "bool", "default": True, "description": "Hits anzeigen",
-            },
-            "circle_color_std": {
-                "type": "color", "default": YELLOW, "description": "Farbe Hit im Zeitfenster",
-            },
-            "circle_color_active": {
-                "type": "color", "default": FUCHSIA, "description": "Farbe Hit außerhalb des Fensters",
+                "description": "Time Filter aktiv – steuert das in_window-Flag der Hits",
             },
         }
 
@@ -203,10 +187,6 @@ class ProximityService(PluginFeature):
         visit_pct = float(p["visit_pct"])
         time_window_mins = int(p["time_window_mins"])
         use_time_filter = bool(p["use_time_filter"])
-        show_lines = bool(p["show_lines"])
-        show_circles = bool(p["show_circles"])
-        circle_std = str(p.get("circle_color_std") or YELLOW)
-        circle_active = str(p.get("circle_color_active") or FUCHSIA)
 
         # --- Scan-Fenster von rechts nach links: min(statistics_signal_limit, len(df))
         limit = len(df)
@@ -219,7 +199,10 @@ class ProximityService(PluginFeature):
                 pass
         scan_df = df.tail(limit)
 
-        tracked_levels = [float(l["price"]) for l in lines_payload] if show_lines else []
+        # tracked_levels: IMMER aus der Linienliste – Sichtbarkeit (show_lines)
+        # steuert der GridLinesService (liefert bei show_lines=false gar keine
+        # Linien) bzw. der Indikator. show_lines ist KEIN Service-Parameter.
+        tracked_levels = [float(l["price"]) for l in lines_payload]
 
         # --- Proximity & Hit-Logik (exakte Parität zu grid.py) ---------------
         hit_circles: List[Dict[str, Any]] = []
@@ -239,10 +222,6 @@ class ProximityService(PluginFeature):
                 f_in_window_around(row_m, 0, time_window_mins)
                 or f_in_window_around(row_m, 30, time_window_mins)
             )
-            if use_time_filter and not row_in_time:
-                circle_color = circle_active
-            else:
-                circle_color = circle_std
 
             levels_hit: List[float] = []
             for lvl in tracked_levels:
@@ -256,12 +235,15 @@ class ProximityService(PluginFeature):
 
                 if near:
                     levels_hit.append(lvl)
-                    if show_circles:
-                        hit_circles.append({
-                            "time": time_val,
-                            "price": lvl,
-                            "color": circle_color,
-                        })
+                    # hit_circles ohne Farbe – der INDIKATOR färbt auf Basis
+                    # seines eigenen Schemas (circle_color_std / _active) und
+                    # des in_window-Flags. in_window=True wenn die Bar im
+                    # UTC-Zeitfenster (0/30 ± time_window_mins) liegt.
+                    hit_circles.append({
+                        "time": time_val,
+                        "price": lvl,
+                        "in_window": bool(row_in_time),
+                    })
                     if last_idx is not None and idx == last_idx:
                         active_hits.append(f_strip_trailing_zeros(lvl))
 

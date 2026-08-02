@@ -203,10 +203,7 @@ class GridLiquidityIndicator(BaseIndicator):
         time_window_mins = int(params.get("time_window_mins", 5))
         use_time_filter = _as_bool(params.get("use_time_filter"), True)
         show_lines = _as_bool(params.get("show_lines"), True)
-        show_circles = _as_bool(params.get("show_circles"), True)
         line_color = str(params.get("line_color") or "").strip()
-        circle_std = str(params.get("circle_color_std") or "#FFEB3B")
-        circle_active = str(params.get("circle_color_active") or "#E91E63")
         custom_levels = self._extract_custom_levels(params)
 
         return {
@@ -233,10 +230,6 @@ class GridLiquidityIndicator(BaseIndicator):
                         "visit_pct": visit_pct,
                         "time_window_mins": time_window_mins,
                         "use_time_filter": use_time_filter,
-                        "show_lines": show_lines,
-                        "show_circles": show_circles,
-                        "circle_color_std": circle_std,
-                        "circle_color_active": circle_active,
                     },
                 },
             },
@@ -290,7 +283,30 @@ class GridLiquidityIndicator(BaseIndicator):
             # Display-Layer: priority=10 (JS-Bridge-Erwartung, wie Alt-Plugin).
             # Die Services selbst bleiben Paritäts-pur (kein priority – exakt
             # wie grid.py); die Anreicherung passiert erst hier im Adapter.
-            circles = [dict(c, priority=10) for c in (prox_crp.get("hit_circles") or [])]
+            # Der Proximity-Service meldet pro Hit nur das in_window-Flag; die
+            # Farbe setzt der INDIKATOR aus seinem eigenen Schema:
+            #   use_time_filter und ausserhalb des Fensters → circle_color_active
+            #   sonst                            → circle_color_std
+            # show_circles=false (Indikator-Parameter) → keine Circles.
+            circles_raw = prox_crp.get("hit_circles") or []
+            if _as_bool(p.get("show_circles"), True):
+                circle_std = str(p.get("circle_color_std") or "#FFEB3B")
+                circle_active = str(p.get("circle_color_active") or "#E91E63")
+                use_time_filter = _as_bool(p.get("use_time_filter"), True)
+                circles = [
+                    dict(
+                        c,
+                        color=(
+                            circle_active
+                            if (use_time_filter and not bool(c.get("in_window", True)))
+                            else circle_std
+                        ),
+                        priority=10,
+                    )
+                    for c in circles_raw
+                ]
+            else:
+                circles = []
             status = dict(prox_crp.get("status_info") or empty_result["status_info"])
 
             self._set_cached_lines(lines)
