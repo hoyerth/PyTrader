@@ -715,6 +715,9 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		act_layout.addLayout(name_row)
 
 		btn_row = QHBoxLayout()
+		self.btn_new_service_set = QPushButton("✨ Neu")
+		self.btn_new_service_set.clicked.connect(self.create_new_service_set)
+		btn_row.addWidget(self.btn_new_service_set)
 		self.btn_save_set = QPushButton("💾 Set speichern")
 		self.btn_save_set.clicked.connect(self.save_service_set)
 		btn_row.addWidget(self.btn_save_set)
@@ -1190,6 +1193,30 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 
 		definition["services"] = services
 		return definition
+
+	def create_new_service_set(self) -> None:
+		"""Setzt den Editor zurück, um ein völlig neues Service-Set anzulegen.
+
+		5.6: Parität zur Preset-Verwaltung – „Neu / Leeren“ leert das
+		Namensfeld und die Set-Auswahl („- kein Set -“), setzt
+		_current_set_id/_current_set_definition auf None und baut den
+		Service-Stack auf den Default-Zustand (Indikator-Services mit
+		Default-Params) zurück. Die Service-Parameter des aktiven Plugins
+		(Live-Overlay) bleiben als Ausgangsbasis für das neue Set erhalten.
+		"""
+		self._current_set_id = None
+		self._current_set_definition = None
+		if self.edit_set_name:
+			self.edit_set_name.clear()
+		if self.combo_service_set:
+			self.combo_service_set.blockSignals(True)
+			self.combo_service_set.setCurrentIndex(0)  # "- kein Set -"
+			self.combo_service_set.blockSignals(False)
+		# _on_service_set_changed leert Namensfeld, baut combo_service_sel +
+		# Service-Stack neu und setzt self.params auf die Indikator-Default-Logik.
+		self._on_service_set_changed()
+		if self._ui_ready:
+			self._reflow()
 
 	def save_service_set(self) -> None:
 		"""Speichert das aktive Set – analog zur Preset-Verwaltung (generisch).
