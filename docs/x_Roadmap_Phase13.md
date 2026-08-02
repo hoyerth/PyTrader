@@ -424,6 +424,92 @@ preset_payload = {
 
 ---
 
+# Kapitel 5.5: Farbauswahl & Transparenz-Unterstützung (ColorButton mit Alpha-Kanal)
+
+## 5.5.1 Konzept & Architektur
+
+### 5.5.1.1 Problemstellung & Anforderungen
+
+Bisher wurden Farbwerte teilweise als Hex-Strings manuell eingegeben oder über simple Standard-Inputs abgefragt. Für moderne Chart-Overlay-Grafiken (z. B. Farbzonen, schattierte Level, semi-transparente Marker/Circles) ist eine **stufenlose Transparenz-Steuerung (Alpha-Kanal)** essenziell.
+Zudem darf ein Farbwähler das dynamische Layout des Prop-Fensters nicht durch ein riesiges Farbrad aufblähen, sondern muss sich kompakt in das `QFormLayout` einfügen.
+
+### 5.5.1.2 Die Lösung: Kompaktes Custom-Widget (`ColorButton`)
+
+* **Bordmittel-Nutzung:** Baut zu 100 % auf PySide6 / PyQt (`QColorDialog` und `QPushButton`) auf – keine externen UI-Bibliotheken erforderlich.
+* **Platzeffizient:** Der `ColorButton` ist ein kleines Farbquadrat (festgelegte Kompaktgröße z. B. 60×24 px), das die aktuell gewählte Farbe inklusive Deckkraft als Hintergrund anzeigt.
+* **Transparenz (Alpha-Kanal):** Über die Option `QColorDialog.ShowAlphaChannel` wird im Dialog ein zusätzlicher Schieberegler für Transparenz (0–255 bzw. 0.0–1.0) freigeschaltet.
+* **CSS / Chart-Kompatibilität:**
+* Bei **100 % Deckkraft** (Alpha = 255) liefert der Button ein Standard-Hex-Format (`#RRGGBB`).
+* Bei **Teil-Transparenz** (Alpha < 255) liefert der Button automatisch einen `rgba(r, g, b, alpha)`-String. Dieser ist direkt 1:1 kompatibel mit TradingView Lightweight Charts v5 (WebEngine) und HTML/CSS.
+
+
+* **Schema-Integration:** Das `ParameterSchema` eines Plugins unterstützt beim Typ `"color"` das optionale Flag `allow_alpha: bool` (Default: `True`).
+
+---
+
+## 5.5.2 Schritt-für-Schritt AI-Anleitung
+
+### 5.5.2.1 Prämissen & Sicherheitsregeln (Verbindlich)
+
+1. **Inkrementelle Umsetzung:** Die AI arbeitet **exakt einen definierten Schritt** ab, stoppt danach und wartet auf den expliziten Startschuss des Anwenders.
+2. **HARTE VERBOTSREGEL (Alt-Grid):** Die Datei `chart/indicators/grid.py` darf **unter keinen Umständen editiert, umbenannt oder gelöscht werden**.
+3. **Kompaktes Layout:** Der `ColorButton` darf die vertikale oder horizontale Dynamik des Prop-Fensters nicht blockieren (`setSizePolicy` des Buttons beachten).
+4. **Validierung:** Alle Prüfungen erfolgen headless (ohne GUI-Start) via `py_compile` und eigene Test-Skripte.
+
+---
+
+### 5.5.2.2 Schritt 1: Erstellung der `ColorButton`-Klasse
+
+#### 5.5.2.2.1 Ziel & Kapselung
+
+Erstellung einer wiederverwendbaren UI-Komponente `ColorButton` unter `chart/widgets/color_button.py` (oder direkt in `chart/indicator_dialog.py`).
+
+#### 5.5.2.2.2 Anweisung an die AI
+
+1. Erstelle die Klasse `ColorButton(QPushButton)`:
+* **Attributes:** `_color: QColor`, `_enable_alpha: bool`.
+* **Signal:** `colorChanged = Signal(str)` (emittiert den Farb-String bei jeder Änderung).
+
+
+2. Implementiere die Methoden:
+* `color() -> str`: Gibt bei `alpha < 255` einen `rgba(r, g, b, a)`-String (z. B. `rgba(33, 150, 243, 0.35)`) zurück, sonst `#RRGGBB`.
+* `setColor(color_str: str)`: Setzt die Farbe aus Hex oder `rgba(...)`-String und aktualisiert das Styling.
+* `update_style()`: Setzt das Button-Stylesheet dynamisch auf `background-color: rgba(...)`, um die gewählte Farbe und Deckkraft direkt im Button zu visualisieren.
+* `_open_color_dialog()`: Öffnet `QColorDialog.getColor()`. Setzt bei `_enable_alpha=True` das Flag `QColorDialog.ShowAlphaChannel`. Bei gültiger Auswahl wird `colorChanged` emittiert.
+
+
+
+#### 5.5.2.2.3 Headless-Validierung
+
+* Erstelle `test/check_p13_color_button.py`.
+* Instanziiere `ColorButton` headless. Teste `setColor("#FF0000")` und `setColor("rgba(255, 0, 0, 0.5)")` und verifiziere, dass `color()` jeweils den korrekten String-Typ liefert.
+
+---
+
+### 5.5.2.3 Schritt 2: Anbindung an das dynamische Prop-Fenster (`indicator_dialog.py` & `service_win.py`)
+
+#### 5.5.2.3.1 Ziel & Kapselung
+
+Erweiterung der automatischen Formular-Generierung, sodass Parameter vom Typ `"color"` automatisch als `ColorButton` gerendert werden.
+
+#### 5.5.2.3.2 Anweisung an die AI
+
+1. Passe die Formular-Generierungs-Logik in `IndicatorSettingsDialog` (und ggf. `ServiceWindow`) an:
+* Wenn `spec.get("type") == "color"`:
+* Lese `allow_alpha = spec.get("allow_alpha", True)` aus dem `ParameterSchema`.
+* Erzeuge ein `widget = ColorButton(default_color=val, enable_alpha=allow_alpha)`.
+* Verknüpfe `widget.colorChanged` mit der Parameter-Aktualisierungs-Logik des Dialogs.
+* Füge das Widget in das `QFormLayout` der jeweiligen Sektion ein.
+
+2. Stelle sicher, dass die übergebenen `rgba(...)`-Farben beim Speichern von Presets oder Service-Sets unversehrt als String in der Datenbank landen und vom `ServiceSetEvaluator` / Indikator an den `chart_render_payload` weitergereicht werden.
+
+#### 5.5.2.3.3 Headless-Validierung
+
+* Erstelle `test/check_p13_color_integration.py`.
+* Generiere ein Test-Formular aus einem `ParameterSchema` mit `type: "color"`.
+* Verifiziere, dass der Formular-Generator den `ColorButton` erzeugt und Farbänderungen inklusive Alpha-Kanal korrekt im Parameter-Dictionary ankommen.
+
+---
 
 ## Schritt 6: Grid Indikator Refactoring (Thread-sicherer Cache)
 
