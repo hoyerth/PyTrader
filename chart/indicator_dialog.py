@@ -1197,25 +1197,28 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 	def _generate_default_service_set_name(self) -> str:
 		"""Generiert einen vorgegebenen Namen aus Indikator-Name und Symbol.
 
-		5.6.5: Vorschlag im Format '<Indikator-Name> - <Symbol>' (z. B.
-		'Grid Liquidity & Proximity - SILVER'). Priorität: Plugin-Metadaten-
-		display_name, dann Indikator-display_name, dann plugin_id, Fallback
-		'Set'; Symbol aus dem Dialog-Kontext, Fallback 'DEFAULT'.
+		Bugfix: Vorschlag im Format '<Indikator-Name>-<Symbol>-', getrennt
+		durch Bindestriche OHNE Leerzeichen (z. B. 'Grid Liquidity-BTCUSD-').
+		Als Vorgabe wird NUR der Indikator-Name genommen (display_name, ohne
+		'(Plugin)'-Suffix) – NICHT die Service-Namen (plugin.metadata
+		enthaelt z. B. 'Grid Liquidity & Proximity' und faellt als Quelle
+		weg). Fallback auf plugin_id bzw. 'Set'; Symbol aus dem Dialog-
+		Kontext, Fallback 'DEFAULT'.
 		"""
 		indicator_name: str = ""
-		meta = getattr(self.plugin, "metadata", None) or {}
-		if isinstance(meta, dict):
-			indicator_name = str(meta.get("display_name") or "").strip()
-		if not indicator_name:
-			dn = getattr(self.indicator, "display_name", None)
-			if dn and str(dn).strip():
-				indicator_name = str(dn).strip()
+		dn = getattr(self.indicator, "display_name", None)
+		if dn and str(dn).strip():
+			indicator_name = str(dn).strip()
+		# Nachgestelltes '(Plugin)'-Suffix entfernen (reiner Indikator-Name).
+		if indicator_name.endswith(")"):
+			import re
+			indicator_name = re.sub(r"\s*\([^)]*\)\s*$", "", indicator_name).strip()
 		if not indicator_name and self.plugin is not None:
 			indicator_name = str(getattr(self.plugin, "plugin_id", "") or "").strip()
 		if not indicator_name:
 			indicator_name = "Set"
 		symbol = str(getattr(self, "symbol", None) or "DEFAULT").strip() or "DEFAULT"
-		return f"{indicator_name} - {symbol}"
+		return f"{indicator_name}-{symbol}-"
 
 	def create_new_service_set(self) -> None:
 		"""Setzt den Editor zurück, um ein völlig neues Service-Set anzulegen,
