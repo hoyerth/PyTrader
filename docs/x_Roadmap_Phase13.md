@@ -6,7 +6,7 @@ Um die Komplexität beherrschbar zu halten und die Stabilität zu garantieren, w
 
 | Feature / Anforderung | Status Phase 13 | Ausgelagert in Phase 14 |
 | --- | --- | --- |
-| **Plugin Discovery** | Hardcoded/Manuelle Registrierung im Code. | Dynamischer Folder-Scan / Reflection. |
+- Services und sets bekommen noch ein Beschreibungsfeld, die die Bedingungen des Services beschreiben -> als Tooltip oder als Button, der den Text aufpoppt| **Plugin Discovery** | Hardcoded/Manuelle Registrierung im Code. | Dynamischer Folder-Scan / Reflection. |
 | **Fehlerbehandlung** | Fail-Fast: Stürzt ein Service ab, stoppt die Pipeline, Fehler wird geloggt. | Skip-Logic, Fallback-Caches, Auto-Recovery. |
 | **Versionierung & Migration** | Keine Auto-Migration. Inkompatible Parameter fallen auf Defaults zurück. | Intelligente Migration alter Service-Sets. |
 | **Undo / Papierkorb** | Löschen ist final (mit QMessageBox Bestätigung). | Papierkorb, Versionierung von Sets. |
@@ -563,3 +563,362 @@ Umfang erweitert: Es werden ALLE signal_results-Konsumenten umgestellt (SignalOv
 4. Führe alle Phase-13-Tests sowie die Kompatibilitätstests von Phase 12 aus.
 
 5. Prüfe explizit, ob chart/indicators/grid.py im Git-Tree als "unmodified" markiert ist.
+
+
+## Schritt 6b: Service-Set Speichern/Löschen analog Preset (generische NamedItemActions-Mechanik)
+
+### 6b.1 Ziel & Kapselung
+
+Die Neu-/Speichern-/Löschen-Logik der Service-Sets – im Indikator-Prop-Fenster
+(`IndicatorSettingsDialog`) und im Service-Fenster (`ServiceWindow`) – funktioniert
+**identisch zur bewährten Preset-Verwaltung** und ist **generisch in einer Basis-
+Klasse** implementiert (keine Duplizierung der Dialog-/Rückfrage-Logik an mehreren
+Stellen).
+
+### 6b.2 Architektur (Adapter-Design)
+
+* **`chart/widgets/named_item_actions.py`** (neu):
+  * `NamedItemAdapter` – Basisklasse/Protokoll mit den `_item_*`-Methoden
+    (`_item_scope_label`, `_item_current_name`, `_item_current_id`, `_item_auto_name`,
+    `_item_list_names`, `_item_exists`, `_item_save_as`, `_item_delete_current`,
+    `_item_select`, `_item_reserved_name`).
+  * `NamedItemActionsMixin` – liefert die **Preset-Mechanik zentral**:
+    `save_named_item(adapter, dialog_title, prompt)` und `delete_named_item(adapter)`.
+  * **Warum Adapter statt Callbacks auf der Dialog-Klasse:** Ein Dialog kann MEHRERE
+    benannte Sammlungen verwalten (Presets + Service-Sets). Lägen die `_item_*`-
+    Methoden direkt auf der Dialog-Klasse, würden sich zwei Callback-Sätze mit
+    denselben Methodennamen gegenseitig überschreiben (Bughistorie!). Daher liegt
+    pro Sammlung EIN Adapter, der beim Aufruf übergeben wird.
+
+* **`chart/indicator_dialog.py`**:
+  * `_PresetItemAdapter` (Referenz-Mechanik: `'Default'`-Schutz, `_item_select(None)`
+    lädt nach dem Löschen das nächstverfügbare Preset via `on_preset_selected`).
+  * `_ServiceSetItemAdapter` (Auto-Name aus instance_ids via
+    `ServiceSetRepository._default_display_name`; Überschreiben übernimmt die set_id
+    des gleichnamigen anderen Sets).
+  * Der Dialog instanziiert `self._preset_adapter` / `self._set_adapter`; die
+    Methoden `save_current_preset`/`delete_current_preset` und
+    `save_service_set`/`delete_service_set` wrappen das Mixin mit dem jeweiligen
+    Adapter.
+
+* **`service_win.py`**:
+  * `_ServiceSetItemAdapter` (gleiche Mechanik; `_item_save_as` prüft die
+    execution_order, `_item_delete_current` loggt Erfolg/Fehlschlag).
+  * `ServiceWindow` erbt `NamedItemActionsMixin`; `save_set()`/`delete_set()` wrappen
+    das Mixin mit `self._set_adapter`.
+
+### 6b.3 Verhalten (identisch zur Preset-Mechanik)
+
+* **Speichern:** Namensdialog (`QInputDialog.getText`, vorbelegt mit aktuellem Namen)
+  → leerer Name → Auto-Name aus instance_ids (z. B. `grid_1 + prox_1`) → Schutz des
+  reservierten Namens (`'Default'` nur Presets) → Name bereits vergeben →
+  Überschreiben-Rückfrage (`QMessageBox.question`, Default = Nein) → speichern →
+  Auswahl auf das gespeicherte Element setzen.
+* **Löschen:** Schutz des reservierten Namens → Rückfrage (`QMessageBox.question`,
+  Default = Nein) → löschen → nächstverfügbares Element laden/auswählen.
+
+### 6b.4 Headless-Validierung (Grün)
+
+* `test/check_p13_s4.py` + `test/check_p13_s5.py`: `QInputDialog.getText`- und
+  `QMessageBox.question`-Mocks ergänzt (leere Eingabe → Auto-Name; Yes/No-Verhalten
+  der Lösch-Rückfrage).
+* Alle Phase-13-Tests (s1–s6, preset_decoupling, grid_liquidity_fixes,
+  service_win_geometry, dialog_geometry, color_button, color_integration, parity,
+  plugin_executor) sowie die Phase-12-Kompatibilitätstests laufen grün.
+* `chart/indicators/grid.py` unverändert (Git-Diff leer).
+
+
+## Schritt 7: Ist-Zustand (umgesetzt) – Cleanup & Systemweiter Regressionstest
+
+### 7.A Umgesetzte Änderungen (Commit-Tag: phase13_step11)
+
+**1. `chart/overlays/signal_overlay.py` (komplett überarbeitet):**
+* `get_available_sets()` liest künftig `SELECT DISTINCT feature_id FROM feature_store WHERE feature_id IS NOT NULL AND feature_data IS NOT NULL` – Basis sind die feature_data-Einträge der Proximity-Services (`feature_id='proximity'`), NICHT mehr `SELECT DISTINCT source_id FROM signal_results`.
+* `fetch_markers()` arbeitet im **HYBRID-Modus** (entschiedene Design-Frage: nur Grid-Marker umstellen, EMA-Marker bleiben vorerst auf signal_results):
+  1. Zuerst wird die feature_id im feature_store geprüft (z. B. `'proximity'` für Grid-Marker). Existiert sie, kommen die Marker aus `_fetch_markers_from_feature_data` (nur Bars mit `is_hit=true`, Farbe `#26a69a` im Zeitfenster / `#E91E63` außerhalb, shape=circle, text = Anzahl `levels_hit`).
+  2. Fallback: Legacy-Sets (z. B. `ema_atr_set_v1`) laufen weiter über `_fetch_markers_from_signal_results` (signal_results) – bis zum geplanten Rückbau.
+* JSON-Parsing-Fix: DuckDB liefert die JSON-Spalte `feature_data` als String → `json.loads` wenn `str`.
+
+**2. `analytics/statistics_repository.py` (komplett überarbeitet):**
+* Alle 3 Methoden (`get_available_sets`, `get_summary`, `fetch_signals`) lesen aus `feature_data` (`feature_id='proximity'`) statt aus `signal_results`. `statistic_win.py` bleibt API-stabil – nur die Datenquelle ändert sich, nicht das Fenster.
+* Neue Semantik auf Basis der Hit-Records: `total_signals` = Hit-Bars, `avg_confidence` = Hit-Fraktion (0..1), `win_rate` = % Hits im Zeitfenster, `best_tf` = Timeframe mit den meisten Hits; `fetch_signals`: `confidence` = `levels × 0.25` (max 1.0), `outcome` = Win (im Zeitfenster) / Neutral.
+* Nutzt DuckDB-JSON-Pfade (`feature_data['is_hit']`, `json_array_length(...)`).
+
+**3. `chart/chart_win.py` (2 Stellen):**
+* `_get_signal_markers_for_update`: `fetch_markers`-Aufruf `"grid_proximity_v1"` → `"proximity"`.
+* `_apply_marker_styles`: zusätzlich `source_id in ("proximity", "grid_proximity_v1")`.
+
+**4. Tests (headless, alle grün):**
+* NEU `test/check_p13_s7.py` (19 Checks): Temp-analytics.duckdb via DB_ANALYTICS-Monkeypatch; testet get_available_sets, Marker-Farben/-Zeiten, Legacy-Fallback, get_summary, fetch_signals, chart_win-Code-Inspektion, grid.py-Diff leer.
+* Alle Phase-13-Tests (s1–s7, preset_decoupling, grid_liquidity_fixes, service_win_geometry, color_button, color_integration, plugin_batch_services, statistics_repo) grün.
+* Alle Phase-12-Kompatibilitätstests grün (grid_parity, plugin_executor, plugin_time_filter, grid_scan_integration, grid_liquidity_indicator, grid_levels_feature, m1_consistency, m1_midnight, mt5_m1_boundary, broker_tz, app_state, generation_guard, chart_data, grid_buttons, grid_circles, html_template).
+* Einzige Ausnahme: `test/check_phase12_step1_migration.py` ist während der laufenden App nicht ausführbar (market_data.duckdb von App-Prozess gesperrt) – muss nach Beendigung der App nachgeholt werden.
+* `chart/indicators/grid.py` unverändert (Git-Diff leer).
+
+### 7.B Rückbau-Plan Alt-Signal-Mechanik (§7.2.3 – NUR nach manuellem User-Test, gesonderter Startschuss)
+
+**Zielzustand:** `signal_overlay.py` und `statistics_repository.py` lesen KEINE signal_results mehr; in die Tabelle `signal_results` finden keine neuen Schreibvorgänge mehr statt (Tabelle bleibt als Referenz erhalten).
+
+1. **Schreiber deaktivieren/entfernen:**
+   * `analytics/background_workers/historical_scanner.py` – schreibt signal_results in den Zeilen 210/250/279.
+   * `analytics/background_workers/live_analyzer.py` – `set_config["signals"]` ist bereits leer, aber evaluator/set_active_signals werden weiterhin instanziiert; `fill_gaps_for_pair` wird aus `chart_win.py:54/787/823` aufgerufen und schreibt weiterhin signal_results.
+2. **`analytics/engine/set_evaluator.py` (SetEvaluator)** bleibt bis zum Rückbau unverändert – der neue ServiceSetEvaluator (Schritt 3) läuft parallel weiter.
+3. **Tabelle `signal_results`** wird NICHT gelöscht (Daten bleiben als Referenz erhalten).
+4. **Nach dem Rückbau:** Die Hybrid-Fallbacks in `signal_overlay.py` (Legacy-Pfad `_fetch_markers_from_signal_results`) werden entfernt; EMA-Marker laufen dann ebenfalls über den feature_store-Pfad (Feature mit `feature_id='ema_atr_set_v1'`).
+
+
+
+
+# 5.6 Vereinheitlichung der Service-Set-Bedienung im Indikator-Einstellungsfenster
+
+## 5.6.1 Ausgangslage & Problemstellung
+
+Im Indikator-Einstellungsdialog (`IndicatorSettingsDialog` in `chart/indicator_dialog.py`) funktioniert das Speichern, Überschreiben und Verwalten von **Anzeige-Presets** (`preset_combo`) hervorragend über die generische Mixin-Klasse `NamedItemActionsMixin`. 
+
+Bei den **Service-Sets** (Verwaltung der Hintergrund-Services wie Liquidez, Proximity etc.) im selben Prop-Fenster existiert jedoch ein Problem: Es können derzeit keine neuen Service-Sets angelegt werden, sondern nur bestehende Sets gelöscht oder umbenannt werden. Die Bedienung der Service-Sets unterscheidet sich somit im GUI-Workflow und der Benutzerführung von der hervorragend funktionierenden Preset-Verwaltung der Anzeige-Parameter.
+
+**Ziel:** Die Bedienung der Service-Sets im Indikator-Einstellungsfenster soll **exakt genauso gestaltet** werden wie die Handhabung der Anzeige-Parameter-Presets.
+
+---
+
+## 5.6.2 Ziel-Bedienkonzept
+
+Die Bedienung der Service-Sets übernimmt 1:1 die Logik und Mechanik der Anzeige-Presets:
+
+1. **Button „Neu / Leeren“ (`btn_new_service_set` / „Neu“)**:
+   - Setzt den Service-Set-Editor in den Zustand für ein neues Set zurück.
+   - Leert die Eingabefelder für Name (`edit_service_set_name`) und die zugewiesenen Service-Instanzen.
+   - Schaltet den internen Zustand (`_current_service_set_id`) auf `None`.
+   - Baut die Parameter-Spalten für Services auf den Initial-/Default-Zustand zurück.
+
+2. **Button „💾 Speichern“ (`btn_save_service_set` via `NamedItemActionsMixin.save_named_item`)**:
+   - Öffnet den standardisierten Namenseingabe-Dialog (vorbelegt mit dem aktuellen Namen oder Auto-Name).
+   - **Auto-Naming:** Bleibt das Namensfeld leer, wird automatisch ein aussagekräftiger Name aus den enthaltenen Service-Instanzen erzeugt (z. B. `grid_1 + prox_1`).
+   - **Duplikats-Prüfung & Überschreiben:** Existiert bereits ein Service-Set unter diesem Namen (und unterscheidet sich die ID), wird per `QMessageBox.question` gefragt, ob das bestehende Set überschrieben werden soll.
+   - Nach dem Speichern wird die Dropdown-Liste (`combo_service_set`) aktualisiert und das neu erzeugte Set selektiert.
+
+3. **Button „🗑️ Löschen“ (`btn_delete_service_set` via `NamedItemActionsMixin.delete_named_item`)**:
+   - Blendet eine Bestätigungsabfrage (`QMessageBox.question`) ein.
+   - Bei Bestätigung wird das Service-Set über das `ServiceSetRepository` gelöscht, das Dropdown aktualisiert und das nächstverfügbare Set ausgewählt.
+
+4. **Kopplung an Parameter- & Reihenfolge-Aktionen**:
+   - Änderungen an den Parametern oder der Reihenfolge der Service-Instanzen triggern automatisch das Rebuild/Update des Service-Set-Zustands im Dialog.
+
+---
+
+## 5.6.3 Anweisungen für die IDE-AI
+
+Zur Umsetzung im Code sind folgende Anpassungen in `chart/indicator_dialog.py` (sowie ggf. zugehörigen UI-Dateien/Widgets) durchzuführen:
+
+### Schritt 1: UI-Buttons für Service-Sets bereitstellen und verbinden
+
+Stellen Sie sicher, dass im Indikator-Einstellungsdialog neben der Preset-Leiste auch für die Service-Set-Leiste folgende Buttons vorhanden und verbunden sind:
+- `btn_new_service_set` („Neu“): Löst `self.create_new_service_set()` aus.
+- `btn_save_service_set` („💾 Speichern“): Löst `self.save_service_set()` aus.
+- `btn_delete_service_set` („🗑️ Löschen“): Löst `self.delete_service_set()` aus.
+
+### Schritt 2: Implementierung des `_ServiceSetItemAdapter` in `chart/indicator_dialog.py`
+
+Stellen Sie sicher, dass der Adapter alle Methoden des `NamedItemAdapter` korrekt auf das Indikator-Prop-Fenster auflöst:
+
+```python
+class _ServiceSetItemAdapter(NamedItemAdapter):
+    def __init__(self, dlg: "IndicatorSettingsDialog") -> None:
+        self.dlg = dlg
+
+    def _item_scope_label(self) -> str:
+        return "Service-Set"
+
+    def _item_current_name(self) -> str:
+        if hasattr(self.dlg, "edit_service_set_name") and self.dlg.edit_service_set_name:
+            return self.dlg.edit_service_set_name.text().strip()
+        return ""
+
+    def _item_current_id(self) -> Optional[str]:
+        if getattr(self.dlg, "_current_service_set_id", None):
+            return self.dlg._current_service_set_id
+        if hasattr(self.dlg, "combo_service_set") and self.dlg.combo_service_set:
+            return self.dlg.combo_service_set.currentData()
+        return None
+
+    def _item_auto_name(self) -> str:
+        try:
+            definition = self.dlg.collect_service_set_definition()
+            definition["display_name"] = ""
+            return ServiceSetRepository._default_display_name(definition)
+        except Exception as e:
+            print(f"Auto-Name Fehler bei Service-Set: {e}")
+            return "Neues Service-Set"
+
+    def _item_list_names(self) -> List[str]:
+        return [s.get("display_name") or "" for s in self.dlg.service_set_repo.list_sets()]
+
+    def _item_exists(self, name: str) -> bool:
+        current_id = self._item_current_id()
+        return any(
+            (s.get("display_name") or "") == name and s.get("set_id") != current_id
+            for s in self.dlg.service_set_repo.list_sets()
+        )
+
+    def _item_save_as(self, name: str) -> Optional[str]:
+        definition = self.dlg.collect_service_set_definition()
+        if not definition.get("execution_order"):
+            print("Keine Services ausgewählt – Speichern abgebrochen.")
+            return None
+        definition["display_name"] = name
+        set_id = self.dlg.service_set_repo.save_set(definition)
+        self.dlg._current_service_set_id = set_id
+        return set_id
+
+    def _item_delete_current(self) -> bool:
+        set_id = self._item_current_id()
+        if not set_id:
+            return False
+        return self.dlg.service_set_repo.delete_set(set_id)
+
+    def _item_select(self, set_id: Optional[str] = None) -> None:
+        self.dlg._current_service_set_id = set_id
+        self.dlg.refresh_service_set_list()
+        if set_id and hasattr(self.dlg, "combo_service_set") and self.dlg.combo_service_set:
+            idx = self.dlg.combo_service_set.findData(set_id)
+            if idx >= 0:
+                self.dlg.combo_service_set.setCurrentIndex(idx)
+
+    def _item_reserved_name(self) -> Optional[str]:
+        return None
+
+```
+
+### Schritt 3: Methoden zur Service-Set-Steuerung in `IndicatorSettingsDialog` ergänzen
+
+1. **Zurücksetzen für ein neues Service-Set:**
+```python
+@Slot()
+def create_new_service_set(self) -> None:
+    """Setzt den Editor zurück, um ein völlig neues Service-Set anzulegen."""
+    self._current_service_set_id = None
+    if hasattr(self, "edit_service_set_name") and self.edit_service_set_name:
+        self.edit_service_set_name.clear()
+    if hasattr(self, "list_service_execution_order") and self.list_service_execution_order:
+        self.list_service_execution_order.clear()
+    if hasattr(self, "combo_service_set") and self.combo_service_set:
+        self.combo_service_set.blockSignals(True)
+        self.combo_service_set.setCurrentIndex(-1)
+        self.combo_service_set.blockSignals(False)
+    self._clear_service_param_columns()
+
+```
+
+
+2. **Speichern und Löschen über das `NamedItemActionsMixin` ausführen:**
+```python
+@Slot()
+def save_service_set(self) -> None:
+    """Speichert das aktuelle Service-Set analog zur Anzeige-Preset-Logik."""
+    self.save_named_item(
+        self._service_set_adapter,
+        dialog_title="Service-Set speichern",
+        prompt="Name für das Service-Set:",
+    )
+
+@Slot()
+def delete_service_set(self) -> None:
+    """Löscht das gewählte Service-Set nach Sicherheitsabfrage."""
+    self.delete_named_item(self._service_set_adapter)
+
+```
+
+
+3. **Verbindungen im `__init__` herstellen:**
+* Instanziieren Sie den Adapter: `self._service_set_adapter = _ServiceSetItemAdapter(self)`
+* Verbinden Sie `btn_new_service_set.clicked` mit `self.create_new_service_set`
+* Verbinden Sie `btn_save_service_set.clicked` mit `self.save_service_set`
+* Verbinden Sie `btn_delete_service_set.clicked` mit `self.delete_service_set`
+
+
+
+---
+
+## 5.6.4 Testkriterien & Verifikation
+
+* **Neues Service-Set anlegen:** Klick auf „Neu“ leert alle Service-Set-Felder. Nach Konfiguration der Services öffnet ein Klick auf „Speichern“ den Dialog zur Namenseingabe, legt das neue Set an und selektiert es im Dropdown.
+* **Service-Set überschreiben:** Wird ein Name gewählt, der bereits existiert, erscheint die Sicherheitsabfrage bezüglich des Überschreibens.
+* **Service-Set löschen:** Ein Klick auf „Löschen“ entfernt nach Bestätigung das gewählte Service-Set sauber aus der Datenbank.
+* **Parität mit Anzeige-Presets:** Die Handhabung von Service-Sets im Indikator-Prop-Fenster verhält sich nun exakt so wie die Handhabung der Anzeige-Presets.
+
+
+## 5.6.5 Erweiterung: Dynamische Namens-Vorbelegung beim Erstellen neuer Service-Sets
+
+### Ausgangslage & Ziel
+Wird beim Anlegen eines neuen Service-Sets der Button **„Neu / Leeren“** gedrückt, soll das Namensfeld (`edit_service_set_name`) nicht komplett leer bleiben. Stattdessen wird ein sinnvoller Standardname automatisch generiert und im Textfeld vorbelegt.
+
+Der generierte Vorschlag setzt sich aus folgenden Kontext-Informationen zusammen:
+- **Indikator-Name** (z. B. `Grid Liquidity` oder `Grid`)
+- **Symbol** (z. B. `SILVER`, `GOLD`)
+
+**Verhalten für den Anwender:**  
+Der vorgeschlagene Name steht im Textfeld zur Verfügung und kann vom Benutzer vor dem Speichern beliebig angepasst, ergänzt oder vollständig überschrieben werden.
+
+---
+
+### Anweisungen für die IDE-AI
+
+Die Methode `create_new_service_set()` in `chart/indicator_dialog.py` ist so anzupassen, dass der Name dynamisch zusammengestellt und im Eingabefeld eingetragen wird.
+
+#### 1. Implementierung der Hilfsmethode zur Namensgenerierung
+
+Fügen Sie eine Hilfsmethode `_generate_default_service_set_name()` zur Klasse `IndicatorSettingsDialog` hinzu:
+
+```python
+def _generate_default_service_set_name(self) -> str:
+    """Generiert einen vorgegebenen Namen aus Indikator-Name und Symbol."""
+    # Indikator-Bezeichnung ermitteln (Fallback auf Plugin-ID oder 'Set')
+    indicator_name = getattr(self.plugin, "name", None) or getattr(self.plugin, "plugin_id", "Set")
+    
+    # Aktuelles Symbol aus dem Kontext oder Dialog ermitteln
+    symbol = getattr(self, "symbol", None) or "DEFAULT"
+    
+    # Zusammenbau des Namens, z.B. "Grid Liquidity - SILVER"
+    return f"{indicator_name} - {symbol}"
+
+```
+
+#### 2. Anpassung von `create_new_service_set()`
+
+Passen Sie die Zurücksetzen-Methode so an, dass das Namensfeld mit dem generierten Vorschlag belegt und der Text für die direkte Bearbeitung markiert wird:
+
+```python
+@Slot()
+def create_new_service_set(self) -> None:
+    """Setzt den Editor zurück, um ein völlig neues Service-Set anzulegen,
+    und belegt einen Standardnamen vor."""
+    self._current_service_set_id = None
+    
+    # Dynamischen Vorschlag generieren
+    default_name = self._generate_default_service_set_name()
+    
+    if hasattr(self, "edit_service_set_name") and self.edit_service_set_name:
+        self.edit_service_set_name.setText(default_name)
+        # Markiert den Text direkt, damit der User sofort tippen oder überschreiben kann
+        self.edit_service_set_name.selectAll()
+        self.edit_service_set_name.setFocus()
+
+    if hasattr(self, "list_service_execution_order") and self.list_service_execution_order:
+        self.list_service_execution_order.clear()
+
+    if hasattr(self, "combo_service_set") and self.combo_service_set:
+        self.combo_service_set.blockSignals(True)
+        self.combo_service_set.setCurrentIndex(-1)
+        self.combo_service_set.blockSignals(False)
+
+    self._clear_service_param_controls()
+
+```
+
+---
+
+### Testkriterien & Verifikation
+
+* **Button „Neu“ drücken:** Das Namensfeld `edit_service_set_name` wird automatisch mit dem Format `<Indikator-Name> - <Symbol>` (z. B. `Grid Liquidity - SILVER`) befüllt.
+* **Fokus & Selektion:** Der vorgebelegte Text ist blau markiert und hat den Fokus. Tippt der Anwender sofort los, wird der Vorschlag überschrieben. Alternativ kann der Name per Pfeiltaste ergänzt werden.
+* **Speichern:** Beim Klick auf „Speichern“ wird der vorbelegte (oder vom Anwender modifizierte) Name als Vorbelegung in den Speichern-Dialog übernommen.
