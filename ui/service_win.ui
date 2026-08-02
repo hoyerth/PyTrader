@@ -272,7 +272,7 @@
          <item>
           <widget class="QLineEdit" name="edit_new_instance">
            <property name="placeholderText">
-            <string>instance_id [plugin_id]  z.B. grid_1 [grid_liquidity]</string>
+            <string>instance_id [plugin_id]  z.B. grid_1 [grid_lines] oder prox_1 [proximity]</string>
            </property>
           </widget>
          </item>

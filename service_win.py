@@ -32,6 +32,20 @@ from chart.widgets.named_item_actions import NamedItemAdapter, NamedItemActionsM
 BASE_DIR = Path(__file__).resolve().parent
 
 
+def _available_plugin_ids() -> str:
+    """Alle registrierten Plugin-IDs (sortiert, kommasepariert).
+
+    Phase 13 Schritt 6-Korrektur: Die Verfügbarkeit wird dynamisch aus der
+    PluginRegistry abgeleitet (grid_lines, proximity, grid_liquidity, ...),
+    NICHT hartkodiert auf 'grid_liquidity'.
+    """
+    try:
+        from analytics.features.feature_builder import PluginRegistry
+        return ", ".join(sorted(PluginRegistry().plugins.keys()))
+    except Exception:
+        return "?"
+
+
 class ServiceSetRunWorker(QThread):
     """Phase 13 Schritt 4: Führt ein Service-Set im Hintergrund aus.
 
@@ -315,6 +329,15 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         # Set-Dropdown initial befüllen (list_sets() als Quelle)
         self.refresh_set_list()
 
+        # Phase 13 Schritt 6-Korrektur: Verfügbare Services sichtbar machen –
+        # der Platzhalter im Eingabefeld zeigt jetzt grid_lines + proximity
+        # (die neuen Services aus Schritt 6) statt nur grid_liquidity.
+        if self.edit_new_instance:
+            self.edit_new_instance.setPlaceholderText(
+                "instance_id [plugin_id]  z.B. grid_1 [grid_lines] oder prox_1 [proximity]"
+            )
+        self.log(f"Verfügbare Plugins: {_available_plugin_ids()}")
+
         # State asynchron wiederherstellen (nach show(), damit move/resize vom Window-Manager akzeptiert werden)
         QTimer.singleShot(0, self.restore_state)
 
@@ -533,7 +556,8 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             from analytics.features.feature_builder import PluginRegistry
             PluginRegistry().get(plugin_id)
         except KeyError:
-            self.log(f"Plugin '{plugin_id}' nicht gefunden (verfügbar: grid_liquidity).")
+            self.log(f"Plugin '{plugin_id}' nicht gefunden. "
+                     f"Verfügbare Plugins: {_available_plugin_ids()}")
             return
 
         for i in range(self.list_execution_order.count()):
