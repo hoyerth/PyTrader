@@ -270,6 +270,13 @@
        <item>
         <layout class="QHBoxLayout" name="layout_set_add">
          <item>
+          <widget class="QComboBox" name="combo_plugin_select">
+           <property name="toolTip">
+            <string>Verfügbare Services (aus der PluginRegistry). Auswahl füllt das Instanz-Feld vor.</string>
+           </property>
+          </widget>
+         </item>
+         <item>
           <widget class="QLineEdit" name="edit_new_instance">
            <property name="placeholderText">
             <string>instance_id [plugin_id]  z.B. grid_1 [grid_lines] oder prox_1 [proximity]</string>

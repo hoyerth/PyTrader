@@ -90,6 +90,13 @@ class GridLiquidityIndicator(BaseIndicator):
         return dict(PluginRegistry().get(self._plugin_id).default_params)
 
     @property
+    def service_plugin_ids(self) -> List[str]:
+        """Die Service-Plugin-IDs, die dieser Indikator intern ausführt (Schritt 6):
+        grid_lines + proximity. grid_liquidity ist nur Schema-Quelle (Altbestand)
+        und KEIN Service dieses Indikators."""
+        return ["grid_lines", "proximity"]
+
+    @property
     def param_options(self) -> Dict[str, List[Any]]:
         return {}
 

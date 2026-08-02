@@ -241,6 +241,8 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         self.btn_remove_instance: QPushButton = self.ui.findChild(QPushButton, "btn_remove_instance")
         self.edit_new_instance: QLineEdit = self.ui.findChild(QLineEdit, "edit_new_instance")
         self.btn_add_instance: QPushButton = self.ui.findChild(QPushButton, "btn_add_instance")
+        # Phase 13 Schritt 6-Korrektur: Dropdown mit ALLEN verfügbaren Services
+        self.combo_plugin_select: Optional[QComboBox] = self.ui.findChild(QComboBox, "combo_plugin_select")
         self.btn_save_set: QPushButton = self.ui.findChild(QPushButton, "btn_save_set")
         self.btn_delete_set: QPushButton = self.ui.findChild(QPushButton, "btn_delete_set")
         self.btn_execute_set: QPushButton = self.ui.findChild(QPushButton, "btn_execute_set")
@@ -336,6 +338,13 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             self.edit_new_instance.setPlaceholderText(
                 "instance_id [plugin_id]  z.B. grid_1 [grid_lines] oder prox_1 [proximity]"
             )
+        # Dropdown listet ALLE registrierten Services (grid_lines, grid_liquidity,
+        # proximity). Auswahl füllt das Instanz-Feld vor ("plugin_id [plugin_id]").
+        if self.combo_plugin_select:
+            from analytics.features.feature_builder import PluginRegistry
+            for pid in sorted(PluginRegistry().plugins.keys()):
+                self.combo_plugin_select.addItem(pid, pid)
+            self.combo_plugin_select.currentTextChanged.connect(self._on_plugin_select_changed)
         self.log(f"Verfügbare Plugins: {_available_plugin_ids()}")
 
         # State asynchron wiederherstellen (nach show(), damit move/resize vom Window-Manager akzeptiert werden)
@@ -532,6 +541,15 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         self._rebuild_columns()
 
     @Slot()
+    def _on_plugin_select_changed(self, plugin_id: str) -> None:
+        """Füllt das Instanz-Feld mit 'plugin_id [plugin_id]' vor, wenn der
+        User einen Service aus dem verfügbaren-Dropdown wählt (Schritt 6-
+        Korrektur: alle Services sichtbar + auswählbar)."""
+        if not plugin_id or not self.edit_new_instance:
+            return
+        self.edit_new_instance.setText(f"{plugin_id} [{plugin_id}]")
+
+    @Slot()
     def add_instance(self) -> None:
         """Fügt eine Service-Instanz 'instance_id [plugin_id]' zur Liste hinzu.
 
@@ -541,6 +559,11 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         if not self.edit_new_instance or not self.list_execution_order:
             return
         text = self.edit_new_instance.text().strip()
+        # Fallback: leeres Feld + Service im verfügbaren-Dropdown gewählt
+        if not text and self.combo_plugin_select:
+            plugin_id = self.combo_plugin_select.currentText()
+            if plugin_id:
+                text = f"{plugin_id} [{plugin_id}]"
         if not text:
             return
         # Formate: "instance_id [plugin_id]", "instance_id:plugin_id" oder "instance_id"

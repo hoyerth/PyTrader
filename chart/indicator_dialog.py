@@ -813,6 +813,71 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		"""
 		self._schedule_reflow()
 
+	# -------------------------------------------------------------------------
+	# Indikator-Services (Phase 13 Schritt 6-Korrektur): die Services, die der
+	# aktive Plugin-Indikator intern ausführt (z.B. grid_lines + proximity beim
+	# Grid-Liquidity-Indikator). grid_liquidity (Altbestand) ist nur Schema-
+	# Quelle und KEIN Service des Indikators.
+	# -------------------------------------------------------------------------
+
+	def _indicator_service_ids(self) -> List[str]:
+		"""Service-Plugin-IDs, die der aktive Indikator intern ausführt.
+
+		Leer, wenn der Indikator keine deklariert → Fallback auf die Services
+		des gewählten Sets (Alt-Verhalten).
+		"""
+		if self.indicator is None:
+			return []
+		ids = getattr(self.indicator, "service_plugin_ids", None)
+		if isinstance(ids, (list, tuple)):
+			return [str(x) for x in ids]
+		return []
+
+	def _service_items(self) -> List[Dict[str, Any]]:
+		"""Anzuzeigende Services im Prop-Fenster: [{instance_id, plugin_id}].
+
+		Bevorzugt die vom Indikator deklarierten Service-IDs (z.B. grid_lines +
+		proximity). Existiert ein Service mit dieser plugin_id im gewählten Set,
+		wird dessen instance_id (z.B. grid_1) übernommen; sonst plugin_id.
+		Ohne Indikator-Deklaration: die Services des gewählten Sets.
+		"""
+		svc_ids = self._indicator_service_ids()
+		definition = self._current_set_definition
+		services = ((definition or {}).get("services") or {}) if definition else {}
+		if not svc_ids:
+			return [
+				{"instance_id": iid,
+				 "plugin_id": (services.get(iid) or {}).get("plugin_id") or "?"}
+				for iid in ((definition or {}).get("execution_order") or [])
+			]
+		items = []
+		for pid in svc_ids:
+			iid = next(
+				(i for i in ((definition or {}).get("execution_order") or [])
+				 if (services.get(i) or {}).get("plugin_id") == pid),
+				None,
+			)
+			items.append({"instance_id": iid or pid, "plugin_id": pid})
+		return items
+
+	def _service_cfg(self, plugin_id: str) -> Dict[str, Any]:
+		"""Konfiguration eines Service (lookback+params): aus dem gewählten Set,
+		falls ein Service mit plugin_id existiert, sonst Defaults aus der
+		Registry."""
+		definition = self._current_set_definition
+		services = ((definition or {}).get("services") or {}) if definition else {}
+		for i in ((definition or {}).get("execution_order") or []):
+			cfg = services.get(i) or {}
+			if cfg.get("plugin_id") == plugin_id:
+				return dict(cfg)
+		try:
+			from analytics.features.feature_builder import PluginRegistry
+			sp = PluginRegistry().get(plugin_id)
+			return {"plugin_id": plugin_id, "lookback": 1000,
+			        "params": dict(getattr(sp, "default_params", None) or {})}
+		except Exception:
+			return {"plugin_id": plugin_id, "lookback": 1000, "params": {}}
+
 	def refresh_service_set_list(self) -> None:
 		"""Befüllt das Set-Dropdown aus ServiceSetRepository.list_sets()."""
 		if not self.combo_service_set:
@@ -854,11 +919,10 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		if self.combo_service_sel:
 			self.combo_service_sel.blockSignals(True)
 			self.combo_service_sel.clear()
-			if self._current_set_definition:
-				services = self._current_set_definition.get("services") or {}
-				for iid in (self._current_set_definition.get("execution_order") or []):
-					pid = services.get(iid, {}).get("plugin_id", "?")
-					self.combo_service_sel.addItem(f"{iid} [{pid}]", iid)
+			for item in self._service_items():
+				self.combo_service_sel.addItem(
+					f"{item['instance_id']} [{item['plugin_id']}]",
+					item['instance_id'])
 			self.combo_service_sel.blockSignals(False)
 
 		# 5.4 Schritt 2: Die Berechnungslogik des gewählten Sets in self.params
@@ -907,66 +971,65 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			form0.addRow(self.plugin_labels.get(key, self._human(key)), ctrl)
 		stack.addWidget(page0)
 
-		# Seiten fuer die Services des gewählten Sets (pro Service eine Seite)
-		definition = self._current_set_definition
-		if definition:
-			services = definition.get("services") or {}
-			for iid in (definition.get("execution_order") or []):
-				cfg = services.get(iid, {})
-				pid = cfg.get("plugin_id", "")
-				page = QWidget()
-				vl = QVBoxLayout(page)
-				pf = QFormLayout()
-				vl.addLayout(pf)
-				try:
-					from analytics.features.feature_builder import PluginRegistry
-					sp = PluginRegistry().get(pid)
-					sp_base = dict(getattr(sp, "base_parameter_schema", None) or {})
-					sp_schema = dict(sp_base)
-					sp_schema.update(dict(sp.parameter_schema or {}))
-					sp_labels = dict(getattr(sp, "param_labels", None) or {})
-					for key, spec in sp_base.items():
-						sp_labels.setdefault(key, spec.get("description") or self._human(key))
-					sp_order = list(getattr(sp, "parameter_order", None) or sp.parameter_schema.keys())
-					for key in sp_base:
-						if key not in sp_order:
-							sp_order.append(key)
-					sp_params = dict(cfg.get("params") or {})
-					# Normale (Nicht-Expert-)Parameter
-					for key in sp_order:
+		# Seiten fuer die anzuzeigenden Services (Indikator-Services, sonst
+		# Services des gewählten Sets) – pro Service eine Seite
+		for item in self._service_items():
+			iid = item["instance_id"]
+			pid = item["plugin_id"]
+			cfg = self._service_cfg(pid)
+			page = QWidget()
+			vl = QVBoxLayout(page)
+			pf = QFormLayout()
+			vl.addLayout(pf)
+			try:
+				from analytics.features.feature_builder import PluginRegistry
+				sp = PluginRegistry().get(pid)
+				sp_base = dict(getattr(sp, "base_parameter_schema", None) or {})
+				sp_schema = dict(sp_base)
+				sp_schema.update(dict(sp.parameter_schema or {}))
+				sp_labels = dict(getattr(sp, "param_labels", None) or {})
+				for key, spec in sp_base.items():
+					sp_labels.setdefault(key, spec.get("description") or self._human(key))
+				sp_order = list(getattr(sp, "parameter_order", None) or sp.parameter_schema.keys())
+				for key in sp_base:
+					if key not in sp_order:
+						sp_order.append(key)
+				sp_params = dict(cfg.get("params") or {})
+				# Normale (Nicht-Expert-)Parameter
+				for key in sp_order:
+					spec = sp_schema.get(key, {})
+					if spec.get("expert"):
+						continue
+					cval = sp_params.get(key, spec.get("default"))
+					ctrl = self.create_schema_control(key, cval, spec)
+					self._set_param_controls[f"{iid}:{key}"] = ctrl
+					pf.addRow(sp_labels.get(key, self._human(key)), ctrl)
+				# Expert-Unterbereich je Service (lookback + expert-Parameter)
+				expert_keys = [k for k in sp_order if sp_schema.get(k, {}).get("expert")]
+				if expert_keys:
+					exp_grp = QGroupBox("Experten-Optionen")
+					exp_grp.setCheckable(True)
+					exp_grp.setChecked(False)
+					ef = QFormLayout(exp_grp)
+					for key in expert_keys:
 						spec = sp_schema.get(key, {})
-						if spec.get("expert"):
-							continue
-						cval = sp_params.get(key, spec.get("default"))
+						if key == "lookback":
+							# lookback ist die Service-Instanz-Einstellung
+							# (ServiceInstanceConfig.lookback), nicht ein
+							# Plugin-param.
+							cval = cfg.get("lookback", spec.get("default"))
+						else:
+							cval = sp_params.get(key, spec.get("default"))
 						ctrl = self.create_schema_control(key, cval, spec)
 						self._set_param_controls[f"{iid}:{key}"] = ctrl
-						pf.addRow(sp_labels.get(key, self._human(key)), ctrl)
-					# Expert-Unterbereich je Service (lookback + expert-Parameter)
-					expert_keys = [k for k in sp_order if sp_schema.get(k, {}).get("expert")]
-					if expert_keys:
-						exp_grp = QGroupBox("Experten-Optionen")
-						exp_grp.setCheckable(True)
-						exp_grp.setChecked(False)
-						ef = QFormLayout(exp_grp)
-						for key in expert_keys:
-							spec = sp_schema.get(key, {})
-							if key == "lookback":
-								# lookback ist die Service-Instanz-Einstellung
-								# (ServiceInstanceConfig.lookback), nicht ein
-								# Plugin-param.
-								cval = cfg.get("lookback", spec.get("default"))
-							else:
-								cval = sp_params.get(key, spec.get("default"))
-							ctrl = self.create_schema_control(key, cval, spec)
-							self._set_param_controls[f"{iid}:{key}"] = ctrl
-							ef.addRow(sp_labels.get(key, self._human(key)), ctrl)
-						vl.addWidget(exp_grp)
-						# 4.4: Auch der Service-Expert-Bereich ist ausklappbar
-						# (Kinder ein-/ausblenden + adjustSize auf dem Dialog).
-						self._setup_collapsible(exp_grp)
-				except Exception:
-					pf.addRow(QLabel(f"Plugin '{pid}' nicht gefunden."))
-				stack.addWidget(page)
+						ef.addRow(sp_labels.get(key, self._human(key)), ctrl)
+					vl.addWidget(exp_grp)
+					# 4.4: Auch der Service-Expert-Bereich ist ausklappbar
+					# (Kinder ein-/ausblenden + adjustSize auf dem Dialog).
+					self._setup_collapsible(exp_grp)
+			except Exception:
+				pf.addRow(QLabel(f"Plugin '{pid}' nicht gefunden."))
+			stack.addWidget(page)
 
 		stack.setCurrentIndex(0)
 		# 4.4: Fenster/Box auf die neue Stack-Seite nachziehen (dynamische Höhe)
@@ -990,20 +1053,28 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			definition = self.set_repo.get_set(set_id)
 			services = (definition or {}).get("services") or {}
 			order = (definition or {}).get("execution_order") or []
-			cfg = None
+			# Alle Services des Sets mergen, die zum Indikator gehören (das
+			# aktive Plugin selbst ODER deklarierte Indikator-Services wie
+			# grid_lines + proximity). Fremde Services werden nicht eingemischt.
+			svc_ids = self._indicator_service_ids()
+			merged: Dict[str, Any] = {}
+			merged_lookback: Optional[int] = None
 			for iid in order:
 				s = services.get(iid) or {}
-				if s.get("plugin_id") == self.plugin.plugin_id:
-					cfg = s
-					break
-			if cfg is None and order:
-				cfg = services.get(order[0]) or {}
-			if not cfg:
-				return {}
-			merged: Dict[str, Any] = {}
-			if cfg.get("lookback") is not None:
-				merged["lookback"] = int(cfg["lookback"])
-			merged.update(dict(cfg.get("params") or {}))
+				sid = s.get("plugin_id")
+				if not (sid == self.plugin.plugin_id or sid in svc_ids):
+					continue
+				if s.get("lookback") is not None:
+					merged_lookback = int(s["lookback"])
+				merged.update(dict(s.get("params") or {}))
+			if not merged and order:
+				# Fallback (Alt): erster Service des Sets
+				s = services.get(order[0]) or {}
+				if s.get("lookback") is not None:
+					merged_lookback = int(s["lookback"])
+				merged.update(dict(s.get("params") or {}))
+			if merged_lookback is not None:
+				merged["lookback"] = merged_lookback
 			return merged
 		except Exception as e:
 			print(f"⚠️ [IndicatorDialog] Service-Set '{set_id}' nicht ladbar: {e}")
@@ -1060,32 +1131,58 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		if self.edit_set_name:
 			definition["display_name"] = self.edit_set_name.text().strip()
 
-		# Kein Set geladen → aktives Plugin als neuer Service (instance_id = plugin_id)
+		# Kein Set geladen → die Indikator-Services (z.B. grid_lines + proximity)
+		# als neue Services, sonst das aktive Plugin (instance_id = plugin_id).
 		if not definition.get("execution_order") and self.plugin is not None:
-			pid = self.plugin.plugin_id
-			params: Dict[str, Any] = {}
-			lookback: int = 1000
-			for key in self.plugin_order:
-				spec = self.plugin_schema.get(key, {})
-				if self._is_visual_key(key) or key == "lookback":
-					continue  # Indi-Props gehören nicht ins Service-Set; lookback ist Instanz-Einstellung
-				if key in self.param_controls:
-					params[key] = self._ctrl_value(self.param_controls[key])
-				else:
-					params[key] = self.params.get(key, spec.get("default"))
-			if "lookback" in self.param_controls:
-				lookback = int(self._ctrl_value(self.param_controls["lookback"]))
+			svc_ids = self._indicator_service_ids()
+			if svc_ids:
+				for sid in svc_ids:
+					try:
+						from analytics.features.feature_builder import PluginRegistry
+						base = dict(getattr(PluginRegistry().get(sid), "default_params", None) or {})
+					except Exception:
+						base = {}
+					params = dict(base)
+					lookback = int(params.pop("lookback", 1000) or 1000) if "lookback" in params else 1000
+					for fkey, ctrl in self._set_param_controls.items():
+						iid, key = fkey.split(":", 1)
+						if iid != sid:
+							continue
+						if key == "lookback":
+							lookback = int(self._ctrl_value(ctrl))
+						else:
+							params[key] = self._ctrl_value(ctrl)
+					services[sid] = {"plugin_id": sid, "lookback": lookback, "params": params}
+				definition["execution_order"] = list(svc_ids)
 			else:
-				lookback = int(self.params.get("lookback", 1000) or 1000)
-			services[pid] = {"plugin_id": pid, "lookback": lookback, "params": params}
-			definition["execution_order"] = [pid]
+				pid = self.plugin.plugin_id
+				params: Dict[str, Any] = {}
+				lookback: int = 1000
+				for key in self.plugin_order:
+					spec = self.plugin_schema.get(key, {})
+					if self._is_visual_key(key) or key == "lookback":
+						continue  # Indi-Props gehören nicht ins Service-Set; lookback ist Instanz-Einstellung
+					if key in self.param_controls:
+						params[key] = self._ctrl_value(self.param_controls[key])
+					else:
+						params[key] = self.params.get(key, spec.get("default"))
+				if "lookback" in self.param_controls:
+					lookback = int(self._ctrl_value(self.param_controls["lookback"]))
+				else:
+					lookback = int(self.params.get("lookback", 1000) or 1000)
+				services[pid] = {"plugin_id": pid, "lookback": lookback, "params": params}
+				definition["execution_order"] = [pid]
 
 		# Service-Params aus den Set-Formular-Seiten übernehmen.
 		# lookback ist die Service-Instanz-Einstellung (ServiceInstanceConfig.
 		# lookback) und wird NICHT in params geschrieben.
 		for fkey, ctrl in self._set_param_controls.items():
 			iid, pkey = fkey.split(":", 1)
-			cfg = services.setdefault(iid, {"plugin_id": self.plugin.plugin_id, "params": {}})
+			existing_cfg = services.get(iid) or {}
+			pid = (existing_cfg.get("plugin_id")
+			       or (iid if iid in self._indicator_service_ids()
+			           else (self.plugin.plugin_id if self.plugin else iid)))
+			cfg = services.setdefault(iid, {"plugin_id": pid, "params": {}})
 			if pkey == "lookback":
 				cfg["lookback"] = int(self._ctrl_value(ctrl))
 			else:
