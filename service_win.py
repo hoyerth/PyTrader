@@ -17,7 +17,7 @@ from PySide6.QtCore import QFile, QIODevice, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QProgressBar, QPushButton, QSizePolicy, QSpinBox, QTextEdit, QVBoxLayout,
     QWidget,
 )
@@ -27,6 +27,7 @@ from analytics.engine.service_set_repository import ServiceSetRepository
 from analytics.engine.set_evaluator import ServiceSetEvaluator
 from persistent_win import PersistentWindow, register_persistent_window
 from scrollable_content import ContentScrollMixin
+from chart.widgets.named_item_actions import NamedItemAdapter, NamedItemActionsMixin
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -85,8 +86,93 @@ class ServiceSetRunWorker(QThread):
             self.run_failed.emit(self.set_definition.get("set_id", ""), str(e))
 
 
+class _ServiceSetItemAdapter(NamedItemAdapter):
+    """Adapter für die SERVICE-SET-Sammlung im Service-Fenster.
+
+    Phase 13 Schritt 8: Die Service-Set-Verwaltung (Speichern/Löschen) nutzt
+    exakt dieselbe generische Preset-Mechanik wie das Indikator-Prop-Fenster
+    (NamedItemActionsMixin). Die _item_*-Protokoll-Methoden liegen in diesem
+    Adapter und greifen auf das ServiceWindow (self.dlg) zu.
+    """
+
+    def __init__(self, dlg: "ServiceWindow") -> None:
+        self.dlg = dlg
+
+    def _item_scope_label(self) -> str:
+        return "Service-Set"
+
+    def _item_current_name(self) -> str:
+        return self.dlg.edit_set_name.text().strip() if self.dlg.edit_set_name else ""
+
+    def _item_current_id(self) -> Optional[str]:
+        if self.dlg._current_set_id:
+            return self.dlg._current_set_id
+        if self.dlg.combo_set:
+            return self.dlg.combo_set.currentData()
+        return None
+
+    def _item_auto_name(self) -> str:
+        """Auto-Name aus den instance_ids (Roadmap: leerer Name → Auto-Name)."""
+        try:
+            definition = self.dlg.collect_set_definition()
+            definition["display_name"] = ""
+            return ServiceSetRepository._default_display_name(definition)
+        except Exception as e:
+            print(f"⚠️ [ServiceWindow] Auto-Name fehlgeschlagen: {e}")
+            return ""
+
+    def _item_list_names(self) -> List[str]:
+        return [s.get("display_name") or "" for s in self.dlg.set_repo.list_sets()]
+
+    def _item_exists(self, name: str) -> bool:
+        """True, wenn ein ANDERES Set bereits diesen Namen trägt."""
+        current = self._item_current_id()
+        return any(
+            (s.get("display_name") or "") == name and s.get("set_id") != current
+            for s in self.dlg.set_repo.list_sets()
+        )
+
+    def _item_save_as(self, name: str) -> Optional[str]:
+        """Speichert das Set unter 'name'; liefert die set_id zurück."""
+        definition = self.dlg.collect_set_definition()
+        if not definition.get("execution_order"):
+            self.dlg.log("Keine Services in der Ausführungs-Reihenfolge – "
+                         "Speichern abgebrochen.")
+            return None
+        if not definition.get("services"):
+            self.dlg.log("WARNUNG: Set hat keine services-Konfiguration "
+                         "(nur Reihenfolge wird gespeichert).")
+        definition["display_name"] = name
+        set_id = self.dlg.set_repo.save_set(definition)
+        self.dlg.log(f"Set gespeichert: {set_id}")
+        return set_id
+
+    def _item_delete_current(self) -> bool:
+        set_id = self._item_current_id()
+        if not set_id:
+            self.dlg.log("Kein Set zum Löschen ausgewählt.")
+            return False
+        if self.dlg.set_repo.delete_set(set_id):
+            self.dlg.log(f"Set gelöscht: {set_id}")
+            return True
+        self.dlg.log(f"Set '{set_id}' nicht gefunden.")
+        return False
+
+    def _item_select(self, set_id: Optional[str] = None) -> None:
+        """Setzt die Set-Auswahl nach Speichern (set_id) bzw. Löschen (None)."""
+        self.dlg._current_set_id = None  # Neuauswahl erzwingen (sonst bleibt Alt-Selektion)
+        self.dlg.refresh_set_list()
+        if set_id and self.dlg.combo_set:
+            idx = self.dlg.combo_set.findData(set_id)
+            if idx >= 0:
+                self.dlg.combo_set.setCurrentIndex(idx)
+
+    def _item_reserved_name(self) -> Optional[str]:
+        return None  # Service-Sets haben kein geschütztes 'Default'-Set
+
+
 @register_persistent_window(auto_restore=False)
-class ServiceWindow(ContentScrollMixin, PersistentWindow):
+class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow):
     INSTANCE_ID = "win_service"
 
     def __init__(self, parent=None, service_set_repo: Optional[ServiceSetRepository] = None):
@@ -102,6 +188,11 @@ class ServiceWindow(ContentScrollMixin, PersistentWindow):
         self._set_run_worker: Optional[ServiceSetRunWorker] = None
         self._current_set_id: Optional[str] = None
         self._current_set_definition: Optional[Dict[str, Any]] = None
+
+        # Phase 13 Schritt 8: Service-Set-Adapler für die generische
+        # Neu-/Speichern-/Löschen-Mechanik (NamedItemActionsMixin) – exakt
+        # analog zur Preset-Verwaltung im Indikator-Prop-Fenster.
+        self._set_adapter = _ServiceSetItemAdapter(self)
 
         # UI laden
         ui_file = QFile(str(BASE_DIR / "ui" / "service_win.ui"))
@@ -754,56 +845,28 @@ class ServiceWindow(ContentScrollMixin, PersistentWindow):
 
     @Slot()
     def save_set(self) -> None:
-        """Speichert das aktive Set über ServiceSetRepository.save_set().
+        """Speichert das aktive Set – analog zur Preset-Verwaltung (generisch).
 
-        Leerer Name → automatischer Name aus den instance_ids (z.B. 'grid_1 + prox_1').
+        Namensdialog (vorbelegt), leerer Name → Auto-Name aus den instance_ids
+        (z.B. 'grid_1 + prox_1'), Überschreiben-Rückfrage bei doppeltem Namen.
+        Implementierung: NamedItemActionsMixin.save_named_item() mit dem
+        Service-Set-Adapter (_ServiceSetItemAdapter).
         """
-        definition = self.collect_set_definition()
-        if not definition.get("execution_order"):
-            self.log("Keine Services in der Ausführungs-Reihenfolge – Speichern abgebrochen.")
-            return
-        if not definition.get("services"):
-            self.log("WARNUNG: Set hat keine services-Konfiguration (nur Reihenfolge wird gespeichert).")
-
-        set_id = self.set_repo.save_set(definition)
-        self._current_set_id = set_id
-        self.log(f"Set gespeichert: {set_id}")
-        self.refresh_set_list()
-        if self.combo_set:
-            idx = self.combo_set.findData(set_id)
-            if idx >= 0:
-                self.combo_set.setCurrentIndex(idx)
+        self.save_named_item(
+            self._set_adapter,
+            dialog_title="Service-Set speichern",
+            prompt="Name für das Service-Set:",
+        )
 
     @Slot()
     def delete_set(self) -> None:
-        """Löscht das gewählte Set – mit zwingender QMessageBox-Rückfrage."""
-        if not self.combo_set:
-            return
-        set_id = self.combo_set.currentData()
-        if not set_id:
-            self.log("Kein Set zum Löschen ausgewählt.")
-            return
-        name = self.combo_set.currentText()
+        """Löscht das gewählte Set – analog zur Preset-Verwaltung (generisch).
 
-        ret = QMessageBox.warning(
-            self,
-            "Set löschen",
-            f"Service-Set '{name}' wirklich löschen?\n"
-            f"Dies kann nicht rückgängig gemacht werden.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if ret != QMessageBox.Yes:
-            self.log("Löschen abgebrochen.")
-            return
-
-        if self.set_repo.delete_set(set_id):
-            self.log(f"Set gelöscht: {set_id}")
-        else:
-            self.log(f"Set '{set_id}' nicht gefunden.")
-
-        self._clear_set_editor()
-        self.refresh_set_list()
+        Rückfrage (QMessageBox.question), danach wird das nächstverfügbare Set
+        ausgewählt. Implementierung: NamedItemActionsMixin.delete_named_item()
+        mit dem Service-Set-Adapter.
+        """
+        self.delete_named_item(self._set_adapter)
 
     @Slot()
     def execute_set(self) -> None:

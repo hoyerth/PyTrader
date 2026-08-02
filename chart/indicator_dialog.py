@@ -51,6 +51,7 @@ from PySide6.QtWidgets import (
 
 from chart.indicators.base_indicator import BaseIndicator
 from chart.widgets.color_button import ColorButton
+from chart.widgets.named_item_actions import NamedItemAdapter, NamedItemActionsMixin
 from state_manager import StateManager
 from scrollable_content import ContentScrollMixin
 
@@ -133,7 +134,164 @@ class _ServiceStack(QStackedWidget):
 		self.updateGeometry()
 
 
-class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
+class _PresetItemAdapter(NamedItemAdapter):
+	"""Adapter für die PRESET-Sammlung (Referenz-Mechanik) im Prop-Fenster.
+
+	Phase 13 Schritt 8: Die _item_*-Protokoll-Methoden liegen NICHT auf der
+	Dialog-Klasse (zwei Callback-Sätze – Presets + Service-Sets – würden sich
+	dort sonst gegenseitig überschreiben), sondern in je einem Adapter. Dieser
+	Adapter kapselt die Preset-Verwaltung des Indikator-Prop-Fensters.
+	"""
+
+	def __init__(self, dlg: "IndicatorSettingsDialog") -> None:
+		self.dlg = dlg
+
+	def _item_scope_label(self) -> str:
+		return "Preset"
+
+	def _item_current_name(self) -> str:
+		return self.dlg.current_preset_name
+
+	def _item_current_id(self) -> Optional[str]:
+		return None  # Presets werden über ihren Namen identifiziert
+
+	def _item_auto_name(self) -> str:
+		return ""  # Presets: leerer Name → Abbruch mit Hinweis
+
+	def _item_list_names(self) -> List[str]:
+		return self.dlg.state_manager.list_indicator_presets(
+			self.dlg.indicator.indicator_id)
+
+	def _item_exists(self, name: str) -> bool:
+		return name in self._item_list_names()
+
+	def _item_save_as(self, name: str) -> str:
+		"""Speichert das Preset unter 'name' (getrenntes Dict {set_id, display_params})."""
+		payload = self.dlg._build_preset_payload()
+		self.dlg.state_manager.save_indicator_preset(
+			self.dlg.indicator.indicator_id, name, payload)
+		return name
+
+	def _item_delete_current(self) -> bool:
+		try:
+			self.dlg.state_manager.delete_indicator_preset(
+				self.dlg.indicator.indicator_id, self.dlg.current_preset_name)
+			return True
+		except Exception as e:
+			print(f"⚠️ [IndicatorDialog] Preset löschen fehlgeschlagen: {e}")
+			return False
+
+	def _item_select(self, name_or_id: Optional[str] = None) -> None:
+		"""Setzt die Preset-Auswahl nach Speichern (name) bzw. Löschen (None).
+
+		Nach dem Löschen wird das nächstverfügbare Preset GELADEN (on_preset_
+		selected), damit die UI-Parameter auf den nächsten Stand wechseln –
+		identisches Verhalten zur bisherigen delete_current_preset()-Logik.
+		"""
+		if name_or_id is not None:
+			self.dlg.current_preset_name = name_or_id
+			self.dlg.refresh_preset_list()
+			self.dlg.on_params_changed_callback(
+				self.dlg._build_preset_payload(), self.dlg.current_preset_name)
+			return
+		remaining = [p for p in self._item_list_names()
+		             if p != self._item_reserved_name()]
+		nxt = remaining[0] if remaining else (self._item_reserved_name() or "")
+		self.dlg.current_preset_name = nxt
+		self.dlg.refresh_preset_list()
+		self.dlg.on_preset_selected(nxt)
+
+	def _item_reserved_name(self) -> Optional[str]:
+		return "Default"
+
+
+class _ServiceSetItemAdapter(NamedItemAdapter):
+	"""Adapter für die SERVICE-SET-Sammlung im Indikator-Prop-Fenster.
+
+	Phase 13 Schritt 8: identische Mechanik wie die Preset-Verwaltung, aber
+	auf Service-Sets gemünzt (ServiceSetRepository statt StateManager). Die
+	_item_*-Methoden greifen auf den Dialog (self.dlg) zu.
+	"""
+
+	def __init__(self, dlg: "IndicatorSettingsDialog") -> None:
+		self.dlg = dlg
+
+	def _item_scope_label(self) -> str:
+		return "Service-Set"
+
+	def _item_current_name(self) -> str:
+		return self.dlg.edit_set_name.text().strip() if self.dlg.edit_set_name else ""
+
+	def _item_current_id(self) -> Optional[str]:
+		return self.dlg._current_set_id
+
+	def _item_auto_name(self) -> str:
+		"""Auto-Name aus den instance_ids (Roadmap: leerer Name → Auto-Name)."""
+		try:
+			from analytics.engine.service_set_repository import ServiceSetRepository
+			definition = self.dlg.collect_set_definition()
+			definition["display_name"] = ""
+			return ServiceSetRepository._default_display_name(definition)
+		except Exception as e:
+			print(f"⚠️ [IndicatorDialog] Auto-Name fehlgeschlagen: {e}")
+			return ""
+
+	def _item_list_names(self) -> List[str]:
+		return [s.get("display_name") or "" for s in self.dlg.set_repo.list_sets()]
+
+	def _item_exists(self, name: str) -> bool:
+		"""True, wenn ein ANDERES Set bereits diesen Namen trägt."""
+		current = self._item_current_id()
+		return any(
+			(s.get("display_name") or "") == name and s.get("set_id") != current
+			for s in self.dlg.set_repo.list_sets()
+		)
+
+	def _item_save_as(self, name: str) -> Optional[str]:
+		"""Speichert das Set unter 'name'; liefert die set_id zurück.
+
+		Analog Preset: Existiert bereits ein ANDERES Set mit diesem Namen und
+		hat der Nutzer das Überschreiben bestätigt, wird DESSEN set_id
+		übernommen (Name identifiziert das Set, kein Duplikat).
+		"""
+		definition = self.dlg.collect_set_definition()
+		if not definition.get("execution_order") or not definition.get("services"):
+			QMessageBox.information(self.dlg, "Speichern",
+			                        "Keine Service-Parameter vorhanden.")
+			return None
+		definition["display_name"] = name
+		existing = next(
+			(s for s in self.dlg.set_repo.list_sets()
+			 if (s.get("display_name") or "") == name
+			 and s.get("set_id") != self._item_current_id()),
+			None,
+		)
+		if existing:
+			definition["set_id"] = existing["set_id"]
+		set_id = self.dlg.set_repo.save_set(definition)
+		print(f"💾 [IndicatorDialog] Service-Set gespeichert: {set_id}")
+		return set_id
+
+	def _item_delete_current(self) -> bool:
+		set_id = self._item_current_id()
+		if not set_id:
+			return False
+		return self.dlg.set_repo.delete_set(set_id)
+
+	def _item_select(self, set_id: Optional[str] = None) -> None:
+		"""Setzt die Set-Auswahl nach Speichern (set_id) bzw. Löschen (None)."""
+		self.dlg._current_set_id = None  # Neuauswahl erzwingen (sonst bleibt Alt-Selektion)
+		self.dlg.refresh_service_set_list()
+		if set_id:
+			idx = self.dlg.combo_service_set.findData(set_id)
+			if idx >= 0:
+				self.dlg.combo_service_set.setCurrentIndex(idx)
+
+	def _item_reserved_name(self) -> Optional[str]:
+		return None  # Service-Sets haben kein geschütztes 'Default'-Set
+
+
+class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog):
 
 	# Gemeinsamer Geometrie-Key fuer ALLE Indikator-Einstellungsdialoge
 	# (gilt damit automatisch fuer alle Indikatoren, aktuelle & zukuenftige).
@@ -181,6 +339,13 @@ class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 		# und beim Set-Wechsel NICHT von den gespeicherten Set-Werten
 		# ueberschrieben werden.
 		self._preset_logic_params: Dict[str, Any] = dict(logic_params or {})
+
+		# Phase 13 Schritt 8: EIN NamedItemAdapter pro Sammlung (Presets +
+		# Service-Sets). Die _item_*-Protokoll-Methoden liegen NICHT auf der
+		# Dialog-Klasse, sondern in den Adaptern – zwei Callback-Sätze auf
+		# derselben Klasse würden sich sonst gegenseitig überschreiben.
+		self._preset_adapter = _PresetItemAdapter(self)
+		self._set_adapter = _ServiceSetItemAdapter(self)
 
 		# Plugin-Kontext (nur im Plugin-Modus gesetzt)
 		self.plugin = None
@@ -930,37 +1095,27 @@ class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 		return definition
 
 	def save_service_set(self) -> None:
-		"""Speichert das aktive Set über ServiceSetRepository.save_set().
-		Leerer Name → Auto-Name aus instance_ids (z.B. 'grid_1 + prox_1')."""
-		definition = self.collect_set_definition()
-		if not definition.get("execution_order") or not definition.get("services"):
-			QMessageBox.information(self, "Speichern", "Keine Service-Parameter vorhanden.")
-			return
-		set_id = self.set_repo.save_set(definition)
-		self._current_set_id = set_id
-		print(f"💾 [IndicatorDialog] Service-Set gespeichert: {set_id}")
-		self.refresh_service_set_list()
-		idx = self.combo_service_set.findData(set_id)
-		if idx >= 0:
-			self.combo_service_set.setCurrentIndex(idx)
+		"""Speichert das aktive Set – analog zur Preset-Verwaltung (generisch).
+
+		Namensdialog (vorbelegt), leerer Name → Auto-Name aus instance_ids
+		(z.B. 'grid_1 + prox_1'), Überschreiben-Rückfrage bei doppeltem Namen.
+		Implementierung: NamedItemActionsMixin.save_named_item() mit dem
+		Service-Set-Adapter (_ServiceSetItemAdapter).
+		"""
+		self.save_named_item(
+			self._set_adapter,
+			dialog_title="Service-Set speichern",
+			prompt="Name für das Service-Set:",
+		)
 
 	def delete_service_set(self) -> None:
-		"""Löscht das gewählte Set – zwingend mit QMessageBox-Gegenfrage."""
-		set_id = self.combo_service_set.currentData() if self.combo_service_set else ""
-		if not set_id:
-			return
-		name = self.combo_service_set.currentText()
-		ret = QMessageBox.warning(
-			self, "Set löschen",
-			f"Service-Set '{name}' wirklich löschen?\nDies kann nicht rückgängig gemacht werden.",
-			QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-		)
-		if ret != QMessageBox.Yes:
-			return
-		self.set_repo.delete_set(set_id)
-		self._current_set_id = None
-		self._current_set_definition = None
-		self.refresh_service_set_list()
+		"""Löscht das gewählte Set – analog zur Preset-Verwaltung (generisch).
+
+		Rückfrage (QMessageBox.question), danach wird das nächstverfügbare Set
+		ausgewählt. Implementierung: NamedItemActionsMixin.delete_named_item()
+		mit dem Service-Set-Adapter.
+		"""
+		self.delete_named_item(self._set_adapter)
 
 	def execute_service_set(self) -> None:
 		"""Startet den ServiceSetEvaluator für das aktive Set (Hintergrund-Thread)."""
@@ -1224,64 +1379,24 @@ class IndicatorSettingsDialog(ContentScrollMixin, QDialog):
 		self.on_params_changed_callback(self._build_preset_payload(), self.current_preset_name)
 
 	def save_current_preset(self) -> None:
+		"""Speichert das aktive Preset (generische Preset-Mechanik).
+
+		Implementierung: NamedItemActionsMixin.save_named_item() mit dem
+		Preset-Adapter (_PresetItemAdapter) – Namensdialog, 'Default'-Schutz,
+		Überschreiben-Rückfrage bei doppeltem Namen.
+		"""
 		self.params = self.collect_params_from_ui()
-
-		name, ok = QInputDialog.getText(
-			self, "Preset speichern",
-			"Name für das Parameter-Set:",
-			text=self.current_preset_name if self.current_preset_name != "Default" else ""
+		self.save_named_item(
+			self._preset_adapter,
+			dialog_title="Preset speichern",
+			prompt="Name für das Parameter-Set:",
 		)
-		if not ok or not name.strip():
-			return
-
-		clean_name = name.strip()
-		if clean_name.lower() == "default":
-			QMessageBox.warning(self, "Fehler", "Das 'Default'-Preset kann nicht überschrieben werden.")
-			return
-
-		# Prüfen ob bereits ein Preset mit diesem Namen existiert
-		existing_presets = self.state_manager.list_indicator_presets(self.indicator.indicator_id)
-		if clean_name in existing_presets:
-			reply = QMessageBox.question(
-				self, "Überschreiben bestätigen",
-				f"Das Preset '{clean_name}' existiert bereits.\nMöchtest du es überschreiben?",
-				QMessageBox.Yes | QMessageBox.No
-			)
-			if reply != QMessageBox.Yes:
-				return
-
-		# 5.4 Schritt 2: Nur das GETRENNTE Dict {set_id, display_params}
-		# speichern – die Berechnungslogik bleibt im Service-Set (service_sets),
-		# das Preset hält nur Darstellung + Set-Referenz.
-		payload = self._build_preset_payload()
-		self.state_manager.save_indicator_preset(self.indicator.indicator_id, clean_name, payload)
-		self.current_preset_name = clean_name
-		self.refresh_preset_list()
-		self.on_params_changed_callback(self._build_preset_payload(), self.current_preset_name)
 
 	def delete_current_preset(self) -> None:
-		if self.current_preset_name == "Default":
-			QMessageBox.warning(self, "Fehler", "Das 'Default'-Preset kann nicht gelöscht werden.")
-			return
+		"""Löscht das aktive Preset (generische Preset-Mechanik).
 
-		reply = QMessageBox.question(
-			self, "Löschen bestätigen",
-			f"Möchtest du das Preset '{self.current_preset_name}' wirklich löschen?",
-			QMessageBox.Yes | QMessageBox.No
-		)
-
-		if reply == QMessageBox.Yes:
-			self.state_manager.delete_indicator_preset(self.indicator.indicator_id, self.current_preset_name)
-
-			# Nächstes verfügbares Preset auswählen, sonst Default
-			remaining = self.state_manager.list_indicator_presets(self.indicator.indicator_id)
-			remaining = [p for p in remaining if p != "Default"]
-
-			if remaining:
-				next_preset = remaining[0]
-			else:
-				next_preset = "Default"
-
-			self.current_preset_name = next_preset
-			self.refresh_preset_list()
-			self.on_preset_selected(next_preset)
+		Implementierung: NamedItemActionsMixin.delete_named_item() mit dem
+		Preset-Adapter – 'Default'-Schutz, Rückfrage, danach nächstverfügbares
+		Preset laden.
+		"""
+		self.delete_named_item(self._preset_adapter)
