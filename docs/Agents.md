@@ -85,3 +85,12 @@ Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukture
 
 **Testdateien in `test/` (regelkonform, keine UI):**
 `test.py`, `check_chart_data.py`, `test_db_lock.py`, `check_time_utils.js`, `check_html_template.py`, `check_m1_consistency.py` (Pausen-Erkennung Wanduhr 23:00–23:59), `simulate_chart_mapping.py`, `check_m1_midnight.py`, `check_mt5_m1_boundary.py`, `check_broker_tz.py` (MT5 = Wanduhr-encoded), `check_app_state.py`, `build_cont_map.py` (erzeugt `tmp_cont_map.json`), `check_resolve_realtime.js`.
+
+---
+
+### 6. INKREMENTELLES ARBEITEN & STOPP-PUNKTE (HARTE REGEL)
+
+1. **Niemals die Fortsetzung in eine interaktive Frage/Abfrage setzen:** Die AI darf die Aufforderung zum nächsten Schritt **NIEMALS** in eine User-Interaktion (z. B. `AskQuestion`/Options-Dialog) verpacken. Es besteht die Gefahr, dass der Anwender versehentlich auf „Continue"/Enter/Tab drückt und damit eine Ausführung auslöst, die er nicht angeordnet hat.
+2. **Status nur als einfacher Prompt ausgeben:** Nach Abschluss eines Schrittes gibt die AI ausschließlich den **Status** (was umgesetzt, validiert und committet wurde) als einfachen Text-Prompt aus.
+3. **Warten auf expliziten Startschuss:** Die AI wartet danach, bis der Anwender **ausdrücklich** die Ausführung des nächsten Schrittes anweist (z. B. „continue" / „setze Schritt X um" / konkrete Anweisung). Ohne diesen expliziten Startschuss wird **kein** weiterer Schritt begonnen.
+4. **Keine unbeabsichtigten Folgeaktionen:** Kein automatisches Anstoßen von Folge-Steps, kein vorauseilendes Commit des nächsten Schrittes und keine Vorschlags-Buttons/Abfragen für den nächsten Schritt – nur der reine Statusbericht.
