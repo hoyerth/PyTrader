@@ -11,15 +11,15 @@ QMessageBox-Rückfrage) und Ausführen (ServiceSetEvaluator im Hintergrund).
 """
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QFile, QIODevice, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QProgressBar, QPushButton, QSizePolicy, QSpinBox, QTextEdit, QVBoxLayout,
-    QWidget,
+    QMessageBox, QProgressBar, QPushButton, QSizePolicy, QSpinBox, QTextEdit,
+    QVBoxLayout, QWidget,
 )
 
 from analytics.background_workers.historical_scanner import HistoricalScanner
@@ -45,6 +45,24 @@ def _available_plugin_ids() -> str:
         return ", ".join(sorted(PluginRegistry().plugins.keys()))
     except Exception:
         return "?"
+
+
+def _sets_using_plugin(plugin_id: str, sets: List[Dict[str, Any]]) -> List[str]:
+    """P14-04-E: Namen aller Service-Sets, die einen Service mit dieser
+    plugin_id enthalten.
+
+    Basis der Service-Sperre: Einzel-Services, die in einem gespeicherten
+    Service-Set vorkommen, dürfen im Service-Fenster nicht entfernt werden
+    (Indikator-Basisservices wie grid_lines/proximity bleiben funktionsfähig).
+    Beim Löschversuch wird der Name des verwendeten Sets angezeigt.
+    """
+    names: List[str] = []
+    for s in sets or []:
+        services = s.get("services") or {}
+        if any((cfg or {}).get("plugin_id") == plugin_id
+               for cfg in services.values()):
+            names.append(str(s.get("display_name") or s.get("set_id") or "?"))
+    return names
 
 
 class ServiceSetRunWorker(QThread):
@@ -540,10 +558,11 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             for iid in (definition.get("execution_order") or []):
                 cfg = services.get(iid, {})
                 plugin_id = cfg.get("plugin_id", "?")
-                item = QListWidgetItem(f"{iid}  [{plugin_id}]")
+                prefix, lock_tip = self._service_lock(plugin_id)
+                item = QListWidgetItem(f"{prefix}{iid}  [{plugin_id}]")
                 item.setData(Qt.UserRole, iid)
                 item.setData(Qt.UserRole + 1, plugin_id)
-                item.setToolTip(self._build_tooltip(iid, cfg))
+                item.setToolTip(self._build_tooltip(iid, cfg) + lock_tip)
                 self.list_execution_order.addItem(item)
         self._build_service_columns(definition)
 
@@ -575,9 +594,26 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
 
     @Slot()
     def remove_instance(self) -> None:
-        """Entfernt den markierten Service aus der Ausführungs-Reihenfolge."""
+        """Entfernt den markierten Service aus der Ausführungs-Reihenfolge.
+
+        P14-04-E (Service-Sperre): Einzel-Services, die in einem gespeicherten
+        Service-Set vorkommen, dürfen NICHT entfernt werden – sonst würde das
+        Set invalide und der Indikator verlöre seine Basisservices. Beim
+        Löschversuch erscheint ein Hinweis mit dem Namen des verwendeten Sets.
+        """
         lw = self.list_execution_order
         if not lw or lw.currentRow() < 0:
+            return
+        item = lw.item(lw.currentRow())
+        plugin_id = str(item.data(Qt.UserRole + 1) or item.data(Qt.UserRole) or "")
+        names = _sets_using_plugin(plugin_id, self.set_repo.list_sets())
+        if names:
+            QMessageBox.warning(
+                self, "Service gesperrt",
+                f"Der Service '{plugin_id}' kann nicht entfernt werden.\n"
+                f"Er wird vom Service-Set '{names[0]}' verwendet.\n"
+                f"Solange er in einem Set vorkommt, bleibt er für den "
+                f"Indikator gesperrt (P14-04).")
             return
         lw.takeItem(lw.currentRow())
         self._rebuild_columns()
@@ -630,10 +666,11 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
                 self.log(f"instance_id '{iid}' existiert bereits.")
                 return
 
-        item = QListWidgetItem(f"{iid}  [{plugin_id}]")
+        prefix, lock_tip = self._service_lock(plugin_id)
+        item = QListWidgetItem(f"{prefix}{iid}  [{plugin_id}]")
         item.setData(Qt.UserRole, iid)
         item.setData(Qt.UserRole + 1, plugin_id)
-        item.setToolTip(self._build_tooltip(iid, {"plugin_id": plugin_id}))
+        item.setToolTip(self._build_tooltip(iid, {"plugin_id": plugin_id}) + lock_tip)
         self.list_execution_order.addItem(item)
         self.edit_new_instance.clear()
         self.log(f"Service hinzugefügt: {iid} [{plugin_id}]")
@@ -732,6 +769,21 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             lines.append(f"<i>{desc}</i>")
         return "<br>".join(lines)
 
+    def _service_lock(self, plugin_id: str) -> tuple:
+        """P14-04-E: (🔒-Präfix, Tooltip-Nachtrag) für die sichtbare Sperr-
+        Kennzeichnung im Service-Fenster.
+
+        Ein Service ist gesperrt, wenn er in einem gespeicherten Service-Set
+        vorkommt (Indikator-Basisservice). Liefert ("", "") wenn der Service
+        frei ist; andernfalls ein 🔒-Präfix für Listeneintrag/Spaltentitel und
+        einen HTML-Tooltip-Nachtrag mit dem Namen des verwendeten Sets.
+        """
+        names = _sets_using_plugin(str(plugin_id), self.set_repo.list_sets())
+        if not names:
+            return "", ""
+        return "🔒 ", (f"<br><b>Gesperrt (P14-04)</b>: wird vom Service-Set "
+                       f"'{names[0]}' verwendet – Entfernen nicht möglich")
+
     def _update_service_tooltip(self, iid: str) -> None:
         """Aktualisiert den Tooltip des Listen-Items live beim Tippen."""
         if not self.list_execution_order:
@@ -743,7 +795,10 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
                 desc_ctrl = self._service_desc_controls.get(iid)
                 if desc_ctrl is not None:
                     cfg["description"] = desc_ctrl.text().strip()
-                item.setToolTip(self._build_tooltip(iid, cfg))
+                # P14-04-E: Sperr-Nachtrag (🔒) beibehalten – der Live-Tooltip
+                # darf die Sperr-Kennzeichnung nicht überschreiben.
+                _prefix, lock_tip = self._service_lock(str(cfg.get("plugin_id") or ""))
+                item.setToolTip(self._build_tooltip(iid, cfg) + lock_tip)
                 break
 
     def _on_order_item_clicked(self, item: QListWidgetItem) -> None:
@@ -975,8 +1030,12 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         - Normale Parameter im QFormLayout (float/int/bool nach Schema).
         - expert: True (inkl. lookback) in einer einklappbaren
           QGroupBox 'Experten-Optionen' am Spaltenfuß.
+
+        P14-04-E: Spaltentitel trägt die 🔒-Kennzeichnung, wenn der Service in
+        einem gespeicherten Service-Set vorkommt (Sperre sichtbar).
         """
-        col = QGroupBox(f"{iid}  [{pid}]")
+        prefix, _ = self._service_lock(pid)
+        col = QGroupBox(f"{prefix}{iid}  [{pid}]")
         # 5.4.2.2 Punkt 3: Spalte skaliert in der Höhe exakt mit ihrem Inhalt
         # (endet unter dem letzten Parameter), wächst beim Vergrößern des
         # Fensters NICHT mit.
@@ -1090,7 +1149,17 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         Rückfrage (QMessageBox.question), danach wird das nächstverfügbare Set
         ausgewählt. Implementierung: NamedItemActionsMixin.delete_named_item()
         mit dem Service-Set-Adapter.
+
+        P14-04-E (Set-Sperre): Es muss immer mindestens ein gültiges Service-
+        Set erhalten bleiben, damit der Indikator funktionsfähig bleibt. Das
+        Löschen des letzten verbliebenen Sets ist gesperrt.
         """
+        if len(self.set_repo.list_sets()) <= 1:
+            QMessageBox.warning(
+                self, "Löschen gesperrt",
+                "Es muss immer mindestens ein gültiges Service-Set erhalten "
+                "bleiben, damit der Indikator funktionsfähig bleibt (P14-04).")
+            return
         self.delete_named_item(self._set_adapter)
 
     # =========================================================================

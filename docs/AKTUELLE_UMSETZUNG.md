@@ -111,7 +111,7 @@ Sicherstellung der dauerhaften Lauffähigkeit alter Service-Sets bei Weiterentwi
 ### AI-Auftrag: Implementierung P14-04 (Schema-Migration, Semantic Versioning & Rollback)
 
 #### 2. Allgemeine Grundsätze & Workflow-Vereinbarungen (Agents.md / Architektur.md)
-
+beachte
 1. **HARTE VERBOTSREGEL (Alt-Grid & Bestands-Pfade):**
 Die Alt-Dateien `chart/indicators/grid.py`, `chart/indicators/grid_liquidity.py` sowie bestehende Kernmodule dürfen unter keinen Umständen beschädigt oder in ihrer Funktionsweise für bestehende Aufrufe verändert werden. Neue Logiken werden additiv integriert.
 
@@ -176,6 +176,89 @@ a) Version wurde bei Major/Minor-Änderung auf die aktuelle `plugin.version` ang
 b) Bei einer bloßen Patch-Änderung (`1.0.0` -> `1.0.1`) erfolgte keine unnötige Migration.
 c) Fehlende Parameter wurden ergänzt, veraltete Keys entfernt.
 d) Bei Auslösen eines Fehlers griff das Rollback sauber.
+
+
+
+---
+
+### Kapitel 4.4-E [P14-04]: Ergänzung – Service-Set-Schutz im Service-Fenster (Set- & Service-Sperre)
+
+Konzeptionelle Erklärung & Schritt-Anleitung auf Basis der User-Anweisung „Punkt 3":
+Solange ein Indikator installiert ist, dürfen seine Basis-Services im `service_win`
+nicht gelöscht werden. Es muss eine sichtbare Kennzeichnung und eine aktive Sperre
+geben. Rein additiv; die bestehende Set-Verwaltung (P14-04 / P14-01) bleibt
+unangetastet.
+
+#### A. Konzept & Regeln
+
+1. **Regel 1 – Mindestens ein valides Set bleibt erhalten:**
+   Service-Sets dürfen gelöscht werden, aber es muss **immer mindestens ein
+   gültiges Service-Set** im Repository verbleiben, damit der Indikator
+   funktionsfähig bleibt. Das Löschen des **letzten** verbliebenen Sets ist
+   gesperrt (`delete_set()`-Guard: `len(list_sets()) <= 1` → Warn-Meldung).
+
+2. **Regel 2 – Service-Sperre für Einzel-Services:**
+   Einzel-Services dürfen **nicht** aus der Ausführungs-Reihenfolge entfernt
+   werden, solange sie in einem **gespeicherten Service-Set** vorkommen
+   (Indikator-Basis-Services wie `grid_lines`/`proximity` bleiben dadurch
+   dauerhaft funktionsfähig). Beim Löschversuch erscheint ein Hinweis mit dem
+   **Namen des verwendeten Sets** (`remove_instance()`-Guard).
+
+3. **Regel 3 – Sichtbare Kennzeichnung:**
+   Services, die in einem gespeicherten Set vorkommen, werden im Service-Fenster
+   mit 🔒 markiert:
+   * Listeneintrag (`🔒 grid_1  [grid_lines]`)
+   * Service-Spalten-Titel (`QGroupBox`)
+   * Tooltip: „Gesperrt (P14-04): wird vom Service-Set '<Name>' verwendet"
+   Der Live-Tooltip (`_update_service_tooltip`) erhält den Sperr-Nachtrag,
+   damit die Kennzeichnung beim Bearbeiten der Instanz-Beschreibung nicht
+   überschrieben wird.
+
+Datenquelle der Sperre ist rein datengetrieben (`_sets_using_plugin()` über
+`ServiceSetRepository.list_sets()`), **kein** neues Indikator-Sonderwissen im
+Service-Fenster nötig – die Basisdienste werden über ihre bloße Existenz in
+einem Set geschützt.
+
+#### B. Schritt-für-Schritt AI-Anleitung
+
+##### Schritt 1: `service_win.py` – Sperren & Kennzeichnung (additiv)
+
+1. **Import:** `QMessageBox` in den `PySide6.QtWidgets`-Import aufnehmen;
+   `List` im `typing`-Import ergänzen.
+
+2. **Modul-Helper `_sets_using_plugin(plugin_id, sets) -> List[str]`:**
+   Liefert die Namen aller Sets, die einen Service mit dieser `plugin_id`
+   enthalten (Match über `services[].plugin_id`; Anzeige `display_name`,
+   Fallback `set_id`). Basis für Sperre + Hinweis (Regel 2).
+
+3. **`ServiceWindow._service_lock(plugin_id) -> (prefix, tooltip_suffix)`:**
+   Liefert `("🔒 ", "<br><b>Gesperrt (P14-04)</b>: wird vom Service-Set
+   '<Name>' verwendet …")` wenn der Service in einem gespeicherten Set
+   vorkommt, sonst `("", "")`.
+
+4. **`remove_instance()` (Regel 2):** Vor dem Entfernen `_sets_using_plugin()`
+   prüfen. Nicht leer → `QMessageBox.warning` mit Set-Namen und Abbruch.
+
+5. **`delete_set()` (Regel 1):** Vor `delete_named_item()` prüfen:
+   `len(self.set_repo.list_sets()) <= 1` → `QMessageBox.warning` (Sperre des
+   letzten Sets) und Abbruch.
+
+6. **Kennzeichnung (Regel 3):** In `load_set_into_editor()` und `add_instance()`
+   die Listeneinträge mit `_service_lock()`-Präfix + Tooltip-Nachtrag erzeugen;
+   in `_build_service_column()` den Spaltentitel mit Präfix versehen;
+   in `_update_service_tooltip()` den Sperr-Nachtrag beibehalten.
+
+##### Schritt 2: Headless Validierung
+
+1. Erstelle und führe aus: `test/check_p14_s4_services_locked.py`:
+* Repo mit 3 Sets (2 mit `grid_lines`/`proximity`, 1 mit `ema_atr_set_v1`).
+* Verifiziere (Regel 2): `_sets_using_plugin("grid_lines", …)` nennt beide
+  Grid-Sets; `proximity`/`ema` je ihr Set; freie Services liefern `[]`.
+* Verifiziere (Regel 1): Bei 3 Sets ist Löschen erlaubt; nach Löschen auf
+  genau 1 verbleibendes Set greift der Guard (`len <= 1` → gesperrt).
+* Verifiziere (Regel 3): `_service_lock` (unbound via Dummy-Objekt) liefert
+  🔒-Präfix + Set-Namen-Tooltip für `grid_lines`, `("", "")` für freie
+  Services.
 
 
 
