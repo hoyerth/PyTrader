@@ -45,3 +45,16 @@ Die folgenden Themen sind für den schnellen operative Einsatz der App nicht zwi
 
 
 2. **Event Typen:** `ServiceSetExecutedEvent`, `PluginReloadedEvent`, `LiveSignalDetectedEvent`.
+
+
+Others Topics 
+
+- optional 24/7 background service for closed charts (same interface as manual trigger) — would keep statistics data fresh without user action.
+- ONNX as future option: native lightgbm/xgboost Python APIs for the initial phase; the inference classes may later transparently switch to `onnxruntime` (no app/signal-set changes needed).
+- working out existing structure:
+  `analytics/signals/machine_learning/` contains two fully implemented inference signals (both inherit SignalDefinition from analytics/engine/base_definition.py):
+
+  | Object | signal_id | Model loading | Params |
+  |---|---|---|---|
+  | LightGBMSignal (lightgbm_signal.py) | lightgbm_v1 | lgb.Booster(model_file=...) (.txt) | model_file, feature_columns, threshold (0.5) |
+  | XGBoostSignal (xgboost_signal.py) | xgboost_v1 | xgb.XGBClassifier().load_model() (.json) | same schema |
