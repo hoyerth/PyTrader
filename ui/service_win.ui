@@ -321,6 +321,16 @@
            </property>
           </widget>
          </item>
+         <item>
+          <widget class="QPushButton" name="btn_reload_plugins">
+           <property name="text">
+            <string>Plugins neu laden</string>
+           </property>
+           <property name="toolTip">
+            <string>P14-02: Lädt Custom-Plugins aus data/custom_plugins/ neu (Hot-Reload). Laufende Berechnungen laufen auf ihren bisherigen Objekten weiter; neue Instanziierungen nutzen die neuen Klassen.</string>
+           </property>
+          </widget>
+         </item>
         </layout>
        </item>
        <item>

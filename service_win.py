@@ -245,6 +245,8 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         self.btn_remove_instance: QPushButton = self.ui.findChild(QPushButton, "btn_remove_instance")
         self.edit_new_instance: QLineEdit = self.ui.findChild(QLineEdit, "edit_new_instance")
         self.btn_add_instance: QPushButton = self.ui.findChild(QPushButton, "btn_add_instance")
+        # Phase 14 P14-02: Hot-Reload-Button für Custom-Plugins
+        self.btn_reload_plugins: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_reload_plugins")
         # Phase 13 Schritt 6-Korrektur: Dropdown mit ALLEN verfügbaren Services
         self.combo_plugin_select: Optional[QComboBox] = self.ui.findChild(QComboBox, "combo_plugin_select")
         self.btn_save_set: QPushButton = self.ui.findChild(QPushButton, "btn_save_set")
@@ -358,6 +360,9 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             for pid in sorted(PluginRegistry().plugins.keys()):
                 self.combo_plugin_select.addItem(pid, pid)
             self.combo_plugin_select.currentTextChanged.connect(self._on_plugin_select_changed)
+        # Phase 14 P14-02: Hot-Reload der Custom-Plugins (data/custom_plugins/)
+        if self.btn_reload_plugins:
+            self.btn_reload_plugins.clicked.connect(self.reload_plugins)
         self.log(f"Verfügbare Plugins: {_available_plugin_ids()}")
 
         # State asynchron wiederherstellen (nach show(), damit move/resize vom Window-Manager akzeptiert werden)
@@ -1034,6 +1039,38 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         mit dem Service-Set-Adapter.
         """
         self.delete_named_item(self._set_adapter)
+
+    # =========================================================================
+    # Phase 14 P14-02: Hot-Reload der Plugins (Dynamic Discovery)
+    # =========================================================================
+
+    @Slot()
+    def reload_plugins(self) -> None:
+        """Lädt Custom-Plugins aus data/custom_plugins/ neu (Hot-Reload).
+
+        P14-02: Ruft PluginRegistry().reload() auf (unter RLock) und
+        aktualisiert das verfügbare-Services-Dropdown. Bereits laufende
+        Service-Ausführungen laufen auf ihren bisherigen Objektinstanzen
+        weiter; neue Instanziierungen nutzen die neuen Klassen.
+        """
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            registry = PluginRegistry()
+            registry.reload()
+            self.log("Plugins neu geladen.")
+        except Exception as e:
+            self.log(f"FEHLER beim Plugin-Reload: {e}")
+        # Dropdown aktualisieren (neue Custom-Plugins sichtbar machen)
+        if self.combo_plugin_select:
+            current = self.combo_plugin_select.currentText()
+            self.combo_plugin_select.blockSignals(True)
+            self.combo_plugin_select.clear()
+            for pid in sorted(PluginRegistry().plugins.keys()):
+                self.combo_plugin_select.addItem(pid, pid)
+            idx = self.combo_plugin_select.findText(current)
+            self.combo_plugin_select.setCurrentIndex(idx if idx >= 0 else 0)
+            self.combo_plugin_select.blockSignals(False)
+        self.log(f"Verfügbare Plugins: {_available_plugin_ids()}")
 
     @Slot()
     def execute_set(self) -> None:

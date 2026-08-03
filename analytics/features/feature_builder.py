@@ -13,6 +13,8 @@ import importlib
 import inspect
 import json
 import pkgutil
+import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -72,51 +74,136 @@ def _to_utc_datetime(value: Any):
 
 
 class PluginLoader:
-    """Class-Finder scannt Verzeichnisse rein nach Subklassen von PluginFeature (Dateiname-unabhängig)."""
+    """Class-Finder scannt Verzeichnisse rein nach Subklassen von PluginFeature (Dateiname-unabhängig).
 
-    def __init__(self, definitions_path: Optional[Path] = None):
+    P14-02 (additiv): Automatische, rekursive Discovery über
+    pkgutil.walk_packages() + importlib.import_module() für
+    analytics/features/definitions/ (Core) und data/custom_plugins/ (Custom).
+    - data/custom_plugins/ wird automatisch angelegt (os.makedirs).
+    - Eindeutigkeit der plugin_id strikt case-insensitiv (plugin_id.lower()).
+    - Core Protection Rule: Custom-Plugins mit bereits belegter ID werden
+      verworfen (WARN-Log).
+    - Abstrakte Klassen werden ignoriert; Import-/Instanzierungsfehler einzelner
+      Module werden isoliert abgefangen (kein App-Absturz).
+    """
+
+    def __init__(self, definitions_path: Optional[Path] = None,
+                 custom_plugins_path: Optional[Path] = None):
         self.definitions_path = definitions_path or Path(__file__).parent / "definitions"
+        self.custom_plugins_path = custom_plugins_path or DATA_DIR / "custom_plugins"
+        # P14-02: Namen der zuletzt erfolgreich geladenen Custom-Plugin-Module
+        # (fuer gezieltes importlib.reload in PluginRegistry.reload()).
+        self.loaded_custom_modules: List[str] = []
 
-    def discover_plugins(self) -> Dict[str, PluginFeature]:
-        plugins = {}
-        if not self.definitions_path.exists():
-            return plugins
+    def _ensure_custom_dir(self) -> None:
+        """Legt data/custom_plugins/ an, falls es noch nicht existiert (P14-02)."""
+        try:
+            self.custom_plugins_path.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"WARN [PluginLoader] Ordner {self.custom_plugins_path} nicht erstellbar: {e}")
 
-        for _, module_name, is_pkg in pkgutil.iter_modules([str(self.definitions_path)]):
-            if is_pkg:
-                continue
-            full_module_name = f"analytics.features.definitions.{module_name}"
+    def _scan_dir(self, plugins: Dict[str, PluginFeature], path: Path,
+                  package_prefix: str, is_custom: bool) -> None:
+        """Scannt ein Verzeichnis rekursiv nach PluginFeature-Subklassen (P14-02).
+
+        is_custom=True: Module werden in loaded_custom_modules registriert und
+        eine bereits belegte plugin_id (Core Protection Rule) fuehrt zum
+        Ueberspringen mit WARN-Log.
+        """
+        if not path.exists():
+            return
+        for mod_info in pkgutil.walk_packages([str(path)]):
+            module_name = mod_info.name
+            full_module_name = f"{package_prefix}.{module_name}"
             try:
                 module = importlib.import_module(full_module_name)
-                for name, obj in inspect.getmembers(module, inspect.isclass):
-                    if issubclass(obj, PluginFeature) and obj is not PluginFeature:
-                        instance = obj()
-                        plugins[instance.plugin_id] = instance
             except Exception as e:
-                print(f"⚠️ [PluginLoader] Fehler in Modul {module_name}: {e}")
+                print(f"WARN [PluginLoader] Modul {full_module_name} nicht ladbar: {e}")
+                continue
+            if is_custom and full_module_name not in self.loaded_custom_modules:
+                self.loaded_custom_modules.append(full_module_name)
+            for _name, obj in inspect.getmembers(module, inspect.isclass):
+                if inspect.isabstract(obj):
+                    continue  # abstrakte Basisklassen ignorieren
+                if issubclass(obj, PluginFeature) and obj is not PluginFeature:
+                    try:
+                        instance = obj()
+                    except Exception as e:
+                        print(f"WARN [PluginLoader] Instanzierung {_name} ({full_module_name}) fehlgeschlagen: {e}")
+                        continue
+                    pid = str(instance.plugin_id)
+                    pid_key = pid.lower()
+                    if is_custom and pid_key in plugins:
+                        print(f"WARN: Custom plugin skipped: plugin_id '{pid}' already registered")
+                        continue
+                    plugins[pid_key] = instance
+
+    def discover_plugins(self) -> Dict[str, PluginFeature]:
+        """Entdeckt Core-Plugins (zuerst) und Custom-Plugins (danach), case-insensitiv.
+
+        P14-02: data/custom_plugins/ wird automatisch angelegt; fuer den Import
+        der Custom-Module ('custom_plugins.<mod>') wird data/ in sys.path
+        aufgenommen, falls noetig (namespace package).
+        """
+        plugins: Dict[str, PluginFeature] = {}
+        self.loaded_custom_modules = []
+        self._ensure_custom_dir()
+        # Core zuerst (analytics/features/definitions/)
+        self._scan_dir(plugins, self.definitions_path,
+                       "analytics.features.definitions", is_custom=False)
+        # Custom danach (data/custom_plugins/) - data/ in sys.path sicherstellen
+        try:
+            data_dir = str(DATA_DIR)
+            if data_dir not in sys.path:
+                sys.path.insert(0, data_dir)
+        except Exception:
+            pass
+        self._scan_dir(plugins, self.custom_plugins_path, "custom_plugins", is_custom=True)
         return plugins
 
 
 class PluginRegistry:
-    """Zentraler Singleton-Katalog für entdeckte Plugins."""
+    """Zentraler Singleton-Katalog für entdeckte Plugins (P14-02: thread-sicher)."""
 
     _instance = None
 
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
+            # P14-02: Reentrant Lock fuer Schreib-/Lesezugriffe (Thread-Safety)
+            cls._instance._lock = threading.RLock()
             cls._instance.loader = PluginLoader()
             cls._instance.plugins = cls._instance.loader.discover_plugins()
         return cls._instance
 
     def reload(self):
-        """Expliziter Reload nur beim Start oder per Button (thread-sicher)."""
-        self.plugins = self.loader.discover_plugins()
+        """Expliziter Reload nur beim Start oder per Button (thread-sicher).
+
+        P14-02: Unter dem RLock werden zuerst die geladenen Custom-Plugin-Module
+        gezielt neu importiert (importlib.reload), danach die Registry ueber
+        discover_plugins() neu aufgebaut. Bereits laufende Service-Instanzen
+        behalten ihre bisherigen Objekt-Referenzen (Hot-Reload-Semantik); neue
+        Instanziierungen nutzen die neuen Klassen.
+        """
+        with self._lock:
+            # 1. Custom-Module gezielt neu laden (Datei geloescht/fehlerhaft ->
+            #    Modul aus sys.modules entfernen)
+            for mod_name in list(self.loader.loaded_custom_modules):
+                try:
+                    if mod_name in sys.modules:
+                        importlib.reload(sys.modules[mod_name])
+                except Exception as e:
+                    sys.modules.pop(mod_name, None)
+                    print(f"WARN [PluginRegistry] Custom-Modul {mod_name} nicht reloadbar: {e}")
+            # 2. Registry neu aufbauen
+            self.plugins = self.loader.discover_plugins()
 
     def get(self, plugin_id: str) -> PluginFeature:
-        if plugin_id not in self.plugins:
+        """Case-insensitiver Zugriff (P14-02): plugin_id.lower()."""
+        key = plugin_id.lower()
+        if key not in self.plugins:
             raise KeyError(f"Plugin '{plugin_id}' nicht gefunden.")
-        return self.plugins[plugin_id]
+        return self.plugins[key]
 
 
 class PluginExecutor:
