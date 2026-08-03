@@ -459,6 +459,49 @@ def _parse_json_field(val: Any) -> Any:
 
 
 # ==============================================================================
+# HELPER: Symbol-Preision (fixer Wert je Symbol, identisch zur Preisskala)
+# ==============================================================================
+def get_symbol_precision(symbol: str, timeframe: str,
+                         db_path: str = DB_MARKET_DATA) -> int:
+    """Liefert die Preisskala-Praezision (Nachkommastellen) eines Symbols.
+
+    Identische Query wie MarketDataRepository.fetch_historical_candles()
+    (die Preisskala im Chart nutzt exakt diesen Wert) – jedoch OHNE die
+    Candles zu laden. Wird fuer die Custom-Level-Eingabefelder (prox_level1..6)
+    verwendet, damit die Eingabe dieselbe Dezimalanzahl wie die Preisskala hat.
+
+    Fallback: 2 bei fehlender DB / leerer Tabelle / Fehler.
+    """
+    default = 2
+    if not os.path.exists(db_path):
+        return default
+    try:
+        con = DbPool.get(db_path)
+        p_row = con.execute("""
+            SELECT COALESCE(MAX(
+                CASE
+                    WHEN POSITION('.' IN CAST(ROUND(close, 5) AS VARCHAR)) > 0
+                    THEN LENGTH(RTRIM(CAST(ROUND(close, 5) AS VARCHAR), '0'))
+                         - POSITION('.' IN CAST(ROUND(close, 5) AS VARCHAR))
+                    ELSE 0
+                END
+            ), 2) AS precision
+            FROM (
+                SELECT close
+                FROM ohlcv_bars
+                WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+                  AND close IS NOT NULL
+                LIMIT 1000
+            );
+        """, [symbol, timeframe]).fetchone()
+        if p_row and p_row[0] is not None:
+            return int(p_row[0])
+    except Exception:
+        pass
+    return default
+
+
+# ==============================================================================
 # 5) REPOSITORY MIT ROBUSTER STATISTISCHER PRECISION-ERMITTLUNG
 # ==============================================================================
 class MarketDataRepository:

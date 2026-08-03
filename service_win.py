@@ -203,6 +203,9 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         self._set_run_worker: Optional[ServiceSetRunWorker] = None
         self._current_set_id: Optional[str] = None
         self._current_set_definition: Optional[Dict[str, Any]] = None
+        # USER-REQ (P14-03): Preisskala-Praezision je Symbol fuer die 6
+        # Custom-Level-Eingabefelder (prox_level1..6). Lazy + gecacht.
+        self._symbol_precision: Optional[int] = None
 
         # Phase 13 Schritt 8: Service-Set-Adapler für die generische
         # Neu-/Speichern-/Löschen-Mechanik (NamedItemActionsMixin) – exakt
@@ -342,6 +345,9 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         # Sofort speichern bei Symbol-Änderung
         if self.combo_symbol:
             self.combo_symbol.currentTextChanged.connect(self.save_state)
+            # USER-REQ: Preisskala-Praezision ist je Symbol fix – beim
+            # Symbol-Wechsel Cache invalidieren + Spalten neu bauen.
+            self.combo_symbol.currentTextChanged.connect(self._on_symbol_changed)
 
         # Set-Dropdown initial befüllen (list_sets() als Quelle)
         self.refresh_set_list()
@@ -381,6 +387,17 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             idx = self.combo_symbol.findText(symbol)
             if idx >= 0:
                 self.combo_symbol.setCurrentIndex(idx)
+
+    def _on_symbol_changed(self, symbol: str) -> None:
+        """USER-REQ: Preisskala-Praezision ist je Symbol fix. Beim Symbol-
+        Wechsel wird der Precision-Cache invalidiert und – falls ein Set
+        aktiv ist – die Service-Spalten neu aufgebaut, damit die 6
+        Custom-Level-Felder (prox_level1..6) die neue Preisskala-Praezision
+        des Symbols anzeigen."""
+        self._symbol_precision = None
+        if (self.combo_set is not None and self.combo_set.currentIndex() >= 0
+                and self.service_columns_layout is not None):
+            self._rebuild_columns()
 
     # --- Scanner ---
 
@@ -784,6 +801,23 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             return len(s.split(".")[1])
         return 0
 
+    def _get_symbol_precision(self) -> int:
+        """USER-REQ: Preisskala-Praezision (fix je Symbol) fuer die 6
+        Custom-Level-Eingabefelder. Lazy ermittelt (db_service.get_symbol_
+        precision) und fuer die Fenster-Instanz gecacht – kein DB-Zugriff
+        bei jedem Spalten-Neuaufbau."""
+        if self._symbol_precision is None:
+            try:
+                from db_service import get_symbol_precision
+                symbol = (self.combo_symbol.currentText()
+                          if self.combo_symbol else "SILVER")
+                timeframe = (self.combo_tf_set.currentText()
+                             if self.combo_tf_set else "H1")
+                self._symbol_precision = get_symbol_precision(symbol, timeframe)
+            except Exception:
+                self._symbol_precision = 2
+        return self._symbol_precision
+
     def _create_param_control(self, key: str, val: Any, spec: Dict[str, Any]) -> QWidget:
         """Erzeugt ein Eingabe-Widget exakt aus dem ParameterSchema.
 
@@ -797,6 +831,11 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             spin.setRange(float(spec.get("min", -1e9)), float(spec.get("max", 1e9)))
             step = spec.get("step")
             decimals = self._decimal_places(step) if step is not None else self._decimal_places(spec.get("default"))
+            # USER-REQ: Custom-Levels (prox_level1..6) nutzen die Preisskala-
+            # Praezision (fix je Symbol). MUSS vor setValue geschehen, sonst
+            # rundet QDoubleSpinBox den Wert auf die Schema-Default-Digits.
+            if key.startswith("prox_level"):
+                decimals = self._get_symbol_precision()
             spin.setDecimals(min(6, max(0, decimals)))
             spin.setSingleStep(float(step) if step is not None else 0.01)
             try:

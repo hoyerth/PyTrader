@@ -323,6 +323,9 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		# Phase 13 Schritt 5: Service-Set-Verwaltung (lazy)
 		self.symbol = symbol
 		self.timeframe = timeframe
+		# USER-REQ (P14-03): Preisskala-Praezision je Symbol fuer die 6
+		# Custom-Level-Eingabefelder (prox_level1..6). Lazy + gecacht.
+		self._symbol_precision: Optional[int] = None
 		self._set_repo = service_set_repo
 		self._set_evaluator = None
 		self._set_run_worker: Optional[DialogServiceSetRunWorker] = None
@@ -430,6 +433,20 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			return max(2, len(s.split(".")[1]))
 		return 2
 
+	def _get_symbol_precision(self) -> int:
+		"""USER-REQ: Preisskala-Praezision (fix je Symbol) fuer die 6
+		Custom-Level-Eingabefelder. Lazy ermittelt (db_service.get_symbol_
+		precision) und fuer die Dialog-Instanz gecacht – kein DB-Zugriff bei
+		jedem Control-Neuaufbau."""
+		if self._symbol_precision is None:
+			try:
+				from db_service import get_symbol_precision
+				self._symbol_precision = get_symbol_precision(
+					self.symbol, self.timeframe)
+			except Exception:
+				self._symbol_precision = 2
+		return self._symbol_precision
+
 	@staticmethod
 	def _is_visual_key(key: str) -> bool:
 		"""Konvention fuer reine Indi-Props: Sichtbarkeit (show_*) + Farben (color)."""
@@ -455,6 +472,11 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			spin.setRange(float(spec.get("min", -1e9)), float(spec.get("max", 1e9)))
 			step = spec.get("step")
 			decimals = self._decimal_places(step) if step is not None else self._decimal_places(spec.get("default"))
+			# USER-REQ: Custom-Levels (prox_level1..6) nutzen die Preisskala-
+			# Praezision (fix je Symbol). MUSS vor setValue geschehen, sonst
+			# rundet QDoubleSpinBox den Wert auf die Schema-Default-Digits.
+			if key.startswith("prox_level"):
+				decimals = self._get_symbol_precision()
 			spin.setDecimals(min(6, max(0, decimals)))
 			spin.setSingleStep(float(step) if step is not None else 0.01)
 			try:
