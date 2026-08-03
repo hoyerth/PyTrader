@@ -207,7 +207,7 @@ Platzsparende UI mit strikter Wert-Validierung und Metadaten-Anzeige.
 ### 5.2.4 DOKUMENTATION – Delta aller UI-Änderungen (Ist-Zustand, umgesetzt)
 
 > Diese Sektion dokumentiert die tatsächlich umgesetzten UI-Änderungen am
-> `IndicatorSettingsDialog` (`chart/indicator_dialog.py`) als Ergänzung zu den
+> `IndicatorSettingsDialog` (`../../chart/indicator_dialog.py`) als Ergänzung zu den
 > oberen Vorgaben. Sie ist der verbindliche Referenzstand für Punkt 4.
 
 #### a) Vollständig dynamische Größen (Kernumsetzung Punkt 4)
@@ -235,10 +235,10 @@ Zeile 1: [ Service-Parameter ] [ Service-Set Aktionen  ]
 * **Trennlinie (`QFrame.HLine`) nur noch, wenn Indi-Props vorhanden** sind (kein verwaister Strich bei Plugins ohne Sichtbarkeits-/Farb-Props).
 
 #### c) Headless-Verifikation (Grün)
-* `py_compile` auf `chart/indicator_dialog.py` und `test/check_dialog_geometry.py` ✓
+* `py_compile` auf `../../chart/indicator_dialog.py` und `../../test/check_dialog_geometry.py` ✓
 * Code-Inspektion (4.7.2): keine `resize(`, `setFixedSize/Height/Width(`, `setMinimumWidth/Height(` im Dialog ✓
-* `test/check_dialog_geometry.py` (erweitert um Teil 2): Fensterhöhe == `sizeHint` (kein leerer Raum), Expert-Toggle ändert `sizeHint().height()` dynamisch (z. B. 281 → 327 → 281), Service-Parameter-Box == `sizeHint` ✓
-* `test/check_p13_s5.py` sowie alle weiteren Phase-13- und Kompatibilitätstests ✓
+* `../../test/check_dialog_geometry.py` (erweitert um Teil 2): Fensterhöhe == `sizeHint` (kein leerer Raum), Expert-Toggle ändert `sizeHint().height()` dynamisch (z. B. 281 → 327 → 281), Service-Parameter-Box == `sizeHint` ✓
+* `../../test/check_p13_s5.py` sowie alle weiteren Phase-13- und Kompatibilitätstests ✓
 
 # AI-Implementierungsanweisung: Dynamische UI-Layouts für das Prop-Fenster
 
@@ -246,7 +246,7 @@ Zeile 1: [ Service-Parameter ] [ Service-Set Aktionen  ]
 Das Eigenschaften-Fenster (z. B. `IndicatorSettingsDialog` / `PropertiesWindow`) muss bezüglich Höhe und Breite **vollständig dynamisch** aufgebaut werden. Jegliche harten Pixelangaben für Fenstergrößen (`resize(x, y)`, `setFixedSize()`, etc.) oder Boxgrößen werden gestrichen. Die GUI schmiegt sich exakt an ihren Inhalt an und vermeidet leeren Raum.
 4.2 Layout-Hierarchie & Stretch-Verhalten festlegen
 Anweisung an die AI
-1. Öffne die Datei `chart/indicator_dialog.py` (bzw. das entsprechende Prop-Fenster-Modul).
+1. Öffne die Datei `../../chart/indicator_dialog.py` (bzw. das entsprechende Prop-Fenster-Modul).
 2. Stelle sicher, dass das Central-Widget bzw. das Haupt-Layout ein `QVBoxLayout` nutzt.
 3. Entferne alle Aufrufe wie `self.resize(...)`, `self.setFixedHeight(...)`, `self.setFixedWidth(...)` oder `widget.setMinimumHeight(...)` mit festen Pixelwerten.
 4. Setze die Size-Policy der Container-Widgets/Boxen (`QGroupBox`, `QFrame`) explizit auf `Maximum` oder `Preferred` für die vertikale Richtung:
@@ -299,7 +299,7 @@ AI-Prüfauftrag nach der Umsetzung
 1. **Syntax & Import-Check:** Führe `py_compile` auf allen angepassten UI-Dateien aus.
 2. **Code-Inspektion auf Pixel-Hardcoding:**
 * Suche im Code nach `resize(`, `setFixedHeight`, `setFixedWidth`, `setFixedSize` und verifiziere, dass keine festen Pixelwerte für Fenster- oder Box-Dimensionen mehr existieren.
-3. **Headless-Layout-Test (`test/check_dialog_geometry.py`):**
+3. **Headless-Layout-Test (`../../test/check_dialog_geometry.py`):**
 * Instanziiere den Dialog/das Fenster headless.
 * Blende testweise Zusatzfelder aus/ein und verifiziere via `dialog.sizeHint().height()`, dass sich die empfohlene Gesamthöhe dynamisch mit der Anzahl der Elemente ändert.
 
@@ -452,7 +452,7 @@ Zudem darf ein Farbwähler das dynamische Layout des Prop-Fensters nicht durch e
 ### 5.5.2.1 Prämissen & Sicherheitsregeln (Verbindlich)
 
 1. **Inkrementelle Umsetzung:** Die AI arbeitet **exakt einen definierten Schritt** ab, stoppt danach und wartet auf den expliziten Startschuss des Anwenders.
-2. **HARTE VERBOTSREGEL (Alt-Grid):** Die Datei `chart/indicators/grid.py` darf **unter keinen Umständen editiert, umbenannt oder gelöscht werden**.
+2. **HARTE VERBOTSREGEL (Alt-Grid):** Die Datei `../../chart/indicators/grid.py` darf **unter keinen Umständen editiert, umbenannt oder gelöscht werden**.
 3. **Kompaktes Layout:** Der `ColorButton` darf die vertikale oder horizontale Dynamik des Prop-Fensters nicht blockieren (`setSizePolicy` des Buttons beachten).
 4. **Validierung:** Alle Prüfungen erfolgen headless (ohne GUI-Start) via `py_compile` und eigene Test-Skripte.
 
@@ -462,7 +462,7 @@ Zudem darf ein Farbwähler das dynamische Layout des Prop-Fensters nicht durch e
 
 #### 5.5.2.2.1 Ziel & Kapselung
 
-Erstellung einer wiederverwendbaren UI-Komponente `ColorButton` unter `chart/widgets/color_button.py` (oder direkt in `chart/indicator_dialog.py`).
+Erstellung einer wiederverwendbaren UI-Komponente `ColorButton` unter `../../chart/widgets/color_button.py` (oder direkt in `../../chart/indicator_dialog.py`).
 
 #### 5.5.2.2.2 Anweisung an die AI
 
@@ -481,12 +481,12 @@ Erstellung einer wiederverwendbaren UI-Komponente `ColorButton` unter `chart/wid
 
 #### 5.5.2.2.3 Headless-Validierung
 
-* Erstelle `test/check_p13_color_button.py`.
+* Erstelle `../../test/check_p13_color_button.py`.
 * Instanziiere `ColorButton` headless. Teste `setColor("#FF0000")` und `setColor("rgba(255, 0, 0, 0.5)")` und verifiziere, dass `color()` jeweils den korrekten String-Typ liefert.
 
 ---
 
-### 5.5.2.3 Schritt 2: Anbindung an das dynamische Prop-Fenster (`indicator_dialog.py` & `service_win.py`)
+### 5.5.2.3 Schritt 2: Anbindung an das dynamische Prop-Fenster (`indicator_dialog.py` & `../../service_win.py`)
 
 #### 5.5.2.3.1 Ziel & Kapselung
 
@@ -505,7 +505,7 @@ Erweiterung der automatischen Formular-Generierung, sodass Parameter vom Typ `"c
 
 #### 5.5.2.3.3 Headless-Validierung
 
-* Erstelle `test/check_p13_color_integration.py`.
+* Erstelle `../../test/check_p13_color_integration.py`.
 * Generiere ein Test-Formular aus einem `ParameterSchema` mit `type: "color"`.
 * Verifiziere, dass der Formular-Generator den `ColorButton` erzeugt und Farbänderungen inklusive Alpha-Kanal korrekt im Parameter-Dictionary ankommen.
 
@@ -577,7 +577,7 @@ Stellen).
 
 ### 6b.2 Architektur (Adapter-Design)
 
-* **`chart/widgets/named_item_actions.py`** (neu):
+* **`../../chart/widgets/named_item_actions.py`** (neu):
   * `NamedItemAdapter` – Basisklasse/Protokoll mit den `_item_*`-Methoden
     (`_item_scope_label`, `_item_current_name`, `_item_current_id`, `_item_auto_name`,
     `_item_list_names`, `_item_exists`, `_item_save_as`, `_item_delete_current`,
@@ -590,7 +590,7 @@ Stellen).
     denselben Methodennamen gegenseitig überschreiben (Bughistorie!). Daher liegt
     pro Sammlung EIN Adapter, der beim Aufruf übergeben wird.
 
-* **`chart/indicator_dialog.py`**:
+* **`../../chart/indicator_dialog.py`**:
   * `_PresetItemAdapter` (Referenz-Mechanik: `'Default'`-Schutz, `_item_select(None)`
     lädt nach dem Löschen das nächstverfügbare Preset via `on_preset_selected`).
   * `_ServiceSetItemAdapter` (Auto-Name aus instance_ids via
@@ -601,7 +601,7 @@ Stellen).
     `save_service_set`/`delete_service_set` wrappen das Mixin mit dem jeweiligen
     Adapter.
 
-* **`service_win.py`**:
+* **`../../service_win.py`**:
   * `_ServiceSetItemAdapter` (gleiche Mechanik; `_item_save_as` prüft die
     execution_order, `_item_delete_current` loggt Erfolg/Fehlschlag).
   * `ServiceWindow` erbt `NamedItemActionsMixin`; `save_set()`/`delete_set()` wrappen
@@ -619,79 +619,79 @@ Stellen).
 
 ### 6b.4 Headless-Validierung (Grün)
 
-* `test/check_p13_s4.py` + `test/check_p13_s5.py`: `QInputDialog.getText`- und
+* `../../test/check_p13_s4.py` + `../../test/check_p13_s5.py`: `QInputDialog.getText`- und
   `QMessageBox.question`-Mocks ergänzt (leere Eingabe → Auto-Name; Yes/No-Verhalten
   der Lösch-Rückfrage).
 * Alle Phase-13-Tests (s1–s6, preset_decoupling, grid_liquidity_fixes,
   service_win_geometry, dialog_geometry, color_button, color_integration, parity,
   plugin_executor) sowie die Phase-12-Kompatibilitätstests laufen grün.
-* `chart/indicators/grid.py` unverändert (Git-Diff leer).
+* `../../chart/indicators/grid.py` unverändert (Git-Diff leer).
 
 
 ## Schritt 7: Ist-Zustand (umgesetzt) – Cleanup & Systemweiter Regressionstest
 
 ### 7.A Umgesetzte Änderungen (Commit-Tag: phase13_step11)
 
-**1. `chart/overlays/signal_overlay.py` (komplett überarbeitet):**
+**1. `../../chart/overlays/signal_overlay.py` (komplett überarbeitet):**
 * `get_available_sets()` liest künftig `SELECT DISTINCT feature_id FROM feature_store WHERE feature_id IS NOT NULL AND feature_data IS NOT NULL` – Basis sind die feature_data-Einträge der Proximity-Services (`feature_id='proximity'`), NICHT mehr `SELECT DISTINCT source_id FROM signal_results`.
 * `fetch_markers()` arbeitet im **HYBRID-Modus** (entschiedene Design-Frage: nur Grid-Marker umstellen, EMA-Marker bleiben vorerst auf signal_results):
   1. Zuerst wird die feature_id im feature_store geprüft (z. B. `'proximity'` für Grid-Marker). Existiert sie, kommen die Marker aus `_fetch_markers_from_feature_data` (nur Bars mit `is_hit=true`, Farbe `#26a69a` im Zeitfenster / `#E91E63` außerhalb, shape=circle, text = Anzahl `levels_hit`).
   2. Fallback: Legacy-Sets (z. B. `ema_atr_set_v1`) laufen weiter über `_fetch_markers_from_signal_results` (signal_results) – bis zum geplanten Rückbau.
 * JSON-Parsing-Fix: DuckDB liefert die JSON-Spalte `feature_data` als String → `json.loads` wenn `str`.
 
-**2. `analytics/statistics_repository.py` (komplett überarbeitet):**
-* Alle 3 Methoden (`get_available_sets`, `get_summary`, `fetch_signals`) lesen aus `feature_data` (`feature_id='proximity'`) statt aus `signal_results`. `statistic_win.py` bleibt API-stabil – nur die Datenquelle ändert sich, nicht das Fenster.
+**2. `../../analytics/statistics_repository.py` (komplett überarbeitet):**
+* Alle 3 Methoden (`get_available_sets`, `get_summary`, `fetch_signals`) lesen aus `feature_data` (`feature_id='proximity'`) statt aus `signal_results`. `../../statistic_win.py` bleibt API-stabil – nur die Datenquelle ändert sich, nicht das Fenster.
 * Neue Semantik auf Basis der Hit-Records: `total_signals` = Hit-Bars, `avg_confidence` = Hit-Fraktion (0..1), `win_rate` = % Hits im Zeitfenster, `best_tf` = Timeframe mit den meisten Hits; `fetch_signals`: `confidence` = `levels × 0.25` (max 1.0), `outcome` = Win (im Zeitfenster) / Neutral.
 * Nutzt DuckDB-JSON-Pfade (`feature_data['is_hit']`, `json_array_length(...)`).
 
-**3. `chart/chart_win.py` (2 Stellen):**
+**3. `../../chart/chart_win.py` (2 Stellen):**
 * `_get_signal_markers_for_update`: `fetch_markers`-Aufruf `"grid_proximity_v1"` → `"proximity"`.
 * `_apply_marker_styles`: zusätzlich `source_id in ("proximity", "grid_proximity_v1")`.
 
 **4. Tests (headless, alle grün):**
-* NEU `test/check_p13_s7.py` (19 Checks): Temp-analytics.duckdb via DB_ANALYTICS-Monkeypatch; testet get_available_sets, Marker-Farben/-Zeiten, Legacy-Fallback, get_summary, fetch_signals, chart_win-Code-Inspektion, grid.py-Diff leer.
+* NEU `../../test/check_p13_s7.py` (19 Checks): Temp-analytics.duckdb via DB_ANALYTICS-Monkeypatch; testet get_available_sets, Marker-Farben/-Zeiten, Legacy-Fallback, get_summary, fetch_signals, chart_win-Code-Inspektion, grid.py-Diff leer.
 * Alle Phase-13-Tests (s1–s7, preset_decoupling, grid_liquidity_fixes, service_win_geometry, color_button, color_integration, plugin_batch_services, statistics_repo) grün.
 * Alle Phase-12-Kompatibilitätstests grün (grid_parity, plugin_executor, plugin_time_filter, grid_scan_integration, grid_liquidity_indicator, grid_levels_feature, m1_consistency, m1_midnight, mt5_m1_boundary, broker_tz, app_state, generation_guard, chart_data, grid_buttons, grid_circles, html_template).
-* Einzige Ausnahme: `test/check_phase12_step1_migration.py` ist während der laufenden App nicht ausführbar (market_data.duckdb von App-Prozess gesperrt) – muss nach Beendigung der App nachgeholt werden.
-* `chart/indicators/grid.py` unverändert (Git-Diff leer).
+* Einzige Ausnahme: `../../test/check_phase12_step1_migration.py` ist während der laufenden App nicht ausführbar (market_data.duckdb von App-Prozess gesperrt) – muss nach Beendigung der App nachgeholt werden.
+* `../../chart/indicators/grid.py` unverändert (Git-Diff leer).
 
 ### 7.B Rückbau-Plan Alt-Signal-Mechanik (§7.2.3 – NUR nach manuellem User-Test, gesonderter Startschuss)
 
 **Zielzustand:** `signal_overlay.py` und `statistics_repository.py` lesen KEINE signal_results mehr; in die Tabelle `signal_results` finden keine neuen Schreibvorgänge mehr statt (Tabelle bleibt als Referenz erhalten).
 
 1. **Schreiber deaktivieren/entfernen:**
-   * `analytics/background_workers/historical_scanner.py` – schreibt signal_results in den Zeilen 210/250/279.
-   * `analytics/background_workers/live_analyzer.py` – `set_config["signals"]` ist bereits leer, aber evaluator/set_active_signals werden weiterhin instanziiert; `fill_gaps_for_pair` wird aus `chart_win.py:54/787/823` aufgerufen und schreibt weiterhin signal_results.
-2. **`analytics/engine/set_evaluator.py` (SetEvaluator)** bleibt bis zum Rückbau unverändert – der neue ServiceSetEvaluator (Schritt 3) läuft parallel weiter.
+   * `../../analytics/background_workers/historical_scanner.py` – schreibt signal_results in den Zeilen 210/250/279.
+   * `../../analytics/background_workers/live_analyzer.py` – `set_config["signals"]` ist bereits leer, aber evaluator/set_active_signals werden weiterhin instanziiert; `fill_gaps_for_pair` wird aus `chart_win.py:54/787/823` aufgerufen und schreibt weiterhin signal_results.
+2. **`../../analytics/engine/set_evaluator.py` (SetEvaluator)** bleibt bis zum Rückbau unverändert – der neue ServiceSetEvaluator (Schritt 3) läuft parallel weiter.
 3. **Tabelle `signal_results`** wird NICHT gelöscht (Daten bleiben als Referenz erhalten).
 4. **Nach dem Rückbau:** Die Hybrid-Fallbacks in `signal_overlay.py` (Legacy-Pfad `_fetch_markers_from_signal_results`) werden entfernt; EMA-Marker laufen dann ebenfalls über den feature_store-Pfad (Feature mit `feature_id='ema_atr_set_v1'`).
 
 ### 7.B UMGSETZT (abgeschlossen, Commit-Tag: phase13_step19)
 
 **Startschuss:** User-Auftrag „backup und umsetzung 7.B" → Backup-Commits
-(`b01a72e` Backup, Tag `phase13_step18`, inkl. `.backup_7B_step18/` mit
+(`b01a72e` Backup, Tag `phase13_step18`, inkl. `../../.backup_7B_step18` mit
 historical_scanner.py, live_analyzer.py, chart_win.py, signal_overlay.py)
 + Umsetzungs-Commit `aa83429` (Tag `phase13_step19`), gepusht.
 
 **Umgesetzte Änderungen (alle 4 Punkte des Plans):**
 
 1. **Schreiber deaktiviert/entfernt:**
-   * `analytics/background_workers/historical_scanner.py`: Delta-Update-Anker
+   * `../../analytics/background_workers/historical_scanner.py`: Delta-Update-Anker
      nutzt `feature_store` (feature_id) statt `signal_results`; Schritt 6
      schreibt Hits als `feature_data` (`is_hit`, `confidence_total`,
      `signal_binary`, `source_id`) per `store_plugin_payload` mit
      `feature_id=source_id` in den feature_store – KEINE signal_results-Writes
      mehr. Unbenutzte Imports (`uuid`, `duckdb`, `pandas`) entfernt.
-   * `analytics/background_workers/live_analyzer.py`: `fill_gaps_for_pair`
+   * `../../analytics/background_workers/live_analyzer.py`: `fill_gaps_for_pair`
      (Chart-Trigger) ist ein deaktivierter API-Stub (nur print-Hinweis, keine
      signal_results-Writes). Die übrigen Alt-Schreiber
      (`_fill_gaps`/`_process_new_bars`/`analyze_single_bar`) bleiben über die
      leere `set_config["signals"]` abgeschaltet (frühe Returns) – kein Umbau
      nötig. Modul-Docstring dokumentiert den 7.B-Zustand.
-   * `chart/chart_win.py`: Import + beide `fill_gaps_for_pair`-Aufrufe
+   * `../../chart/chart_win.py`: Import + beide `fill_gaps_for_pair`-Aufrufe
      (on_symbol_changed / on_tf_changed) entfernt; Marker-Kommentar
      aktualisiert (beide Quellen aus feature_store).
-2. **`analytics/engine/set_evaluator.py` (SetEvaluator)** bleibt unverändert –
+2. **`../../analytics/engine/set_evaluator.py` (SetEvaluator)** bleibt unverändert –
    der neue ServiceSetEvaluator (Schritt 3) läuft parallel weiter. ✓
 3. **Tabelle `signal_results`** wurde NICHT gelöscht (Daten bleiben als
    Referenz erhalten); es finden keine neuen Schreibvorgänge mehr statt. ✓
@@ -705,19 +705,19 @@ historical_scanner.py, live_analyzer.py, chart_win.py, signal_overlay.py)
      confidence-basierte Farbe (#26a69a/#FFEB3B/#ef5350), Text = Confidence-%.
 
 **Angepasste Tests (headless, alle grün):**
-* `test/check_p13_s7.py`: [3] get_available_sets enthält proximity +
+* `../../test/check_p13_s7.py`: [3] get_available_sets enthält proximity +
   ema_atr_set_v1; [5] EMA-Marker aus feature_data (circle, Text '90%', grün);
   [5b] Legacy-Source-ID ohne feature_store-Daten → `[]` (kein Fallback mehr).
-* `test/check_plugin_batch_services.py`: [3] Standard-Scan prüft
+* `../../test/check_plugin_batch_services.py`: [3] Standard-Scan prüft
   feature_store (`feature_id='ema_atr_set_v1'`-Hit-Rows) UND signal_results
   enthält 0 neue Zeilen (7.B-Rückbau).
-* `test/check_chart_data.py`: Marker-Query auf feature_store/feature_id
+* `../../test/check_chart_data.py`: Marker-Query auf feature_store/feature_id
   umgestellt (kein signal_results mehr).
 
 **Verbleibende signal_results-Referenzen (bewusst, dokumentiert):**
-* `analytics/statistics_repository.py` Docstring (Z.8) – nur Text, kein Code.
-* `chart/chart_win.py` + `signal_overlay.py` Kommentare – nur Text.
-* `analytics/background_workers/live_analyzer.py`:
+* `../../analytics/statistics_repository.py` Docstring (Z.8) – nur Text, kein Code.
+* `../../chart/chart_win.py` + `signal_overlay.py` Kommentare – nur Text.
+* `../../analytics/background_workers/live_analyzer.py`:
   `_batch_write_signals`/`_write_signal_result` (Z. 387-398 / 507-518) bleiben
   als toter, via leere set_config unerreichbarer Alt-Pfad erhalten (Referenz).
 
@@ -743,8 +743,8 @@ Nach dem 7.B-Rückbau (§7.2 Punkte 4+5) – alle Tests in einer Session, headle
   (feature_store 16182, signal_results 37340, indicator_presets 6 – kein
   Verlust). Damit ist die frühere Einzige-Ausnahme-Notiz in 7.A hinfällig.
 
-**Harte Regel verifiziert:** `chart/indicators/grid.py`, `chart/indicators/
-grid_liquidity.py` und `analytics/features/definitions/grid_liquidity.py`
+**Harte Regel verifiziert:** `../../chart/indicators/grid.py`, `chart/indicators/
+grid_liquidity.py` und `../../analytics/features/definitions/grid_liquidity.py`
 sind im Git-Tree UNMODIFIED (Git-Diff leer). Die Referenzdatei
 `analytics/features/definitions/grid.py` existiert nicht im Baum
 (tatsächliche Referenz = grid_liquidity.py, siehe Architektur-Sektion).
@@ -758,7 +758,7 @@ sind im Git-Tree UNMODIFIED (Git-Diff leer). Die Referenzdatei
 
 ## 5.6.1 Ausgangslage & Problemstellung
 
-Im Indikator-Einstellungsdialog (`IndicatorSettingsDialog` in `chart/indicator_dialog.py`) funktioniert das Speichern, Überschreiben und Verwalten von **Anzeige-Presets** (`preset_combo`) hervorragend über die generische Mixin-Klasse `NamedItemActionsMixin`. 
+Im Indikator-Einstellungsdialog (`IndicatorSettingsDialog` in `../../chart/indicator_dialog.py`) funktioniert das Speichern, Überschreiben und Verwalten von **Anzeige-Presets** (`preset_combo`) hervorragend über die generische Mixin-Klasse `NamedItemActionsMixin`. 
 
 Bei den **Service-Sets** (Verwaltung der Hintergrund-Services wie Liquidez, Proximity etc.) im selben Prop-Fenster existiert jedoch ein Problem: Es können derzeit keine neuen Service-Sets angelegt werden, sondern nur bestehende Sets gelöscht oder umbenannt werden. Die Bedienung der Service-Sets unterscheidet sich somit im GUI-Workflow und der Benutzerführung von der hervorragend funktionierenden Preset-Verwaltung der Anzeige-Parameter.
 
@@ -793,7 +793,7 @@ Die Bedienung der Service-Sets übernimmt 1:1 die Logik und Mechanik der Anzeige
 
 ## 5.6.3 Anweisungen für die IDE-AI
 
-Zur Umsetzung im Code sind folgende Anpassungen in `chart/indicator_dialog.py` (sowie ggf. zugehörigen UI-Dateien/Widgets) durchzuführen:
+Zur Umsetzung im Code sind folgende Anpassungen in `../../chart/indicator_dialog.py` (sowie ggf. zugehörigen UI-Dateien/Widgets) durchzuführen:
 
 ### Schritt 1: UI-Buttons für Service-Sets bereitstellen und verbinden
 
@@ -802,7 +802,7 @@ Stellen Sie sicher, dass im Indikator-Einstellungsdialog neben der Preset-Leiste
 - `btn_save_service_set` („💾 Speichern“): Löst `self.save_service_set()` aus.
 - `btn_delete_service_set` („🗑️ Löschen“): Löst `self.delete_service_set()` aus.
 
-### Schritt 2: Implementierung des `_ServiceSetItemAdapter` in `chart/indicator_dialog.py`
+### Schritt 2: Implementierung des `_ServiceSetItemAdapter` in `../../chart/indicator_dialog.py`
 
 Stellen Sie sicher, dass der Adapter alle Methoden des `NamedItemAdapter` korrekt auf das Indikator-Prop-Fenster auflöst:
 
@@ -948,7 +948,7 @@ Der vorgeschlagene Name steht im Textfeld zur Verfügung und kann vom Benutzer v
 
 ### Anweisungen für die IDE-AI
 
-Die Methode `create_new_service_set()` in `chart/indicator_dialog.py` ist so anzupassen, dass der Name dynamisch zusammengestellt und im Eingabefeld eingetragen wird.
+Die Methode `create_new_service_set()` in `../../chart/indicator_dialog.py` ist so anzupassen, dass der Name dynamisch zusammengestellt und im Eingabefeld eingetragen wird.
 
 #### 1. Implementierung der Hilfsmethode zur Namensgenerierung
 

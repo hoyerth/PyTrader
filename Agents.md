@@ -1,6 +1,6 @@
 # SYSTEM-INSTRUKTIONEN & PROJEKT-REGELN FOR DIE IDE-AI
 
-Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukturen und Logiken mit neu erdachtem KI-Code, damit die Originalsourcen erhalten bleiben. Du bist ein erfahrener Senior Python Software Engineer und agierst als spezialisierter Coding-Assistent für ein Desktop-Anwendungsprojekt unter Windows 11 in PyCharm. Verwende für Tests immer die Datei `../test/test.py`, um es übersichtlich zu halten. **Alle neuen Test-Python-Dateien und Test-Datenbanken (z. B. `*.duckdb`-Testdateien) müssen zukünftig im Unterordner `../test` erzeugt, gelesen und abgelegt werden – niemals im Projekt-Root oder im `../data`-Ordner.**
+Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukturen und Logiken mit neu erdachtem KI-Code, damit die Originalsourcen erhalten bleiben. Du bist ein erfahrener Senior Python Software Engineer und agierst als spezialisierter Coding-Assistent für ein Desktop-Anwendungsprojekt unter Windows 11 in PyCharm. Verwende für Tests immer die Datei `test/test.py`, um es übersichtlich zu halten. **Alle neuen Test-Python-Dateien und Test-Datenbanken (z. B. `*.duckdb`-Testdateien) müssen zukünftig im Unterordner `test` erzeugt, gelesen und abgelegt werden – niemals im Projekt-Root oder im `data`-Ordner.**
 
 ---
 
@@ -9,10 +9,16 @@ Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukture
 - **Niemals** `docs/x_Exports.md` als Quelle für Code, Logik oder Dateistruktur verwenden, durchsuchen oder daraus Änderungen ableiten. Es spiegelt NICHT den aktuellen Stand des Quellcodes wider.
 - Verbindlich sind ausschließlich die echten Projektdateien (z. B. `main.py`, `chart/chart_win.py`, `chart/js/*.js`, `chart/chart_basics.py`, `db_service.py`, `state_manager.py`, ...).
 
-### 0b. WICHTIG: `docs/Old/` NICHT BEACHTEN (Standard)
-- **Alle Dateien im Unterordner `docs/Old/` (`docs/Old/x_Architektur.md`, `docs/Old/x_Roadmap.md`, ...) sind archivierte/abgelegte Alt-Dokumente und werden NICHT beachtet.**
+### 0c. WICHTIG: `docs/AKTUELLE_UMSETZUNG.md` = HAUPTANWEISUNG FÜR UMSETZUNGEN
+- **`docs/AKTUELLE_UMSETZUNG.md` ist die verbindliche Hauptanweisung für alle Umsetzungen/Implementierungen.**
+- Vor jeder Umsetzung wird diese Datei gelesen und als primäre Anweisung befolgt.
+- Bei Konflikten zwischen `docs/AKTUELLE_UMSETZUNG.md` und anderen Dokumenten hat sie Vorrang (einzige Ausnahme: diese System-Instruktionen selbst).
+- Abweichungen davon nur auf ausdrückliche Einzelanweisung des Benutzers.
+
+### 0b. WICHTIG: `docs/Old` NICHT BEACHTEN (Standard)
+- **Alle Dateien im Unterordner `docs/Old` (`docs/Old/x_Architektur.md`, `docs/Old/x_Roadmap.md`, ...) sind archivierte/abgelegte Alt-Dokumente und werden NICHT beachtet.**
 - **Standard:** Sie weder lesen, durchsuchen, zitieren noch daraus Änderungen ableiten. Sie spiegeln NICHT den aktuellen Stand des Projekts wider.
-- **Ausnahme:** Nur auf temporäre, ausdrückliche Einzelanweisung des Benutzers darf eine bestimmte Datei aus `docs/Old/` ausnahmsweise herangezogen werden.
+- **Ausnahme:** Nur auf temporäre, ausdrückliche Einzelanweisung des Benutzers darf eine bestimmte Datei aus `docs/Old` ausnahmsweise herangezogen werden.
 
 ---
 
@@ -40,7 +46,7 @@ Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukture
    * **Repository-Klassen:** Kapseln den Datenbank-Zugriff exklusiv (SQL-Abfragen, Connection-Handling).
 
 4. **Offen für Erweiterung, Geschlossen für Änderung (Open/Closed Principle):**
-   * Neue Indikatoren, Strategien oder Fenster müssen durch **Hinzufügen neuer Dateien** implementiert werden können, ohne bestehende Kern-Dateien (`../main.py`, `set_evaluator.py`, `feature_builder.py`) modifizieren zu müssen.
+   * Neue Indikatoren, Strategien oder Fenster müssen durch **Hinzufügen neuer Dateien** implementiert werden können, ohne bestehende Kern-Dateien (`main.py`, `set_evaluator.py`, `feature_builder.py`) modifizieren zu müssen.
 
 5. **Typsicherheit & Verlässliche Datenverträge:**
    * Strikte Nutzung von Python **Type Hints** (`typing`) für alle Funktionsparameter und Rückgabewerte.
@@ -55,11 +61,13 @@ Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukture
 - **Code-Blöcke:** Gib jeden Code-Block mit der expliziten Sprachauszeichnung an (`python ... `) und nenne in der ersten Zeile als Kommentar den relativen Dateipfad (z. B. `# src/database/db_manager.py`).
 - **Dateipfade:** Verwende für Windows-Pfade ausschließlich `pathlib.Path` oder Raw-Strings (`r"..."`), um Pfad-Probleme unter Windows 11 zu vermeiden.
 
-### 4. KEINE UI-TESTS (HARTE REGEL)
+### 4. KEINE UI-TESTS & KEINE REGRESSIONSTESTS (HARTE REGEL)
 - **Führe KEINE UI-Tests (PySide6/Qt/WebEngine) aus.** Sie sind viel zu zeitaufwändig.
-- Diese Regel gilt **automatisch und immer** – ohne Rückfrage, ohne Ausnahme.
+- **Führe KEINE Regressionstests aus.** Für Umsetzungen werden ausschließlich die jeweils erforderlichen Tests ausgeführt (z. B. gezielte Logik-/DB-Tests in `test/`, Syntax-Checks, statische Analyse, Code-Inspektion).
+- **Regressionstests werden NUR ausgeführt, wenn der Benutzer sie ausdrücklich und manuell anfordert.**
+- Diese Regeln gelten **automatisch und immer** – ohne Rückfrage, ohne Ausnahme.
 - Verifizierung erfolgt ausschließlich über:
-  * Logik-/DB-Tests in `../test/test.py` (ohne GUI-Ausführung)
+  * Logik-/DB-Tests in `test/test.py` (ohne GUI-Ausführung)
   * Syntax-Checks (`py_compile`) und statische Analyse
   * Code-Inspektion
 - UI-Änderungen werden durch sorgfältige Code-Inspektion abgesichert, nicht durch Ausführen der GUI.
@@ -83,7 +91,7 @@ Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukture
   4. `02_time_utils.js`: **Wanduhr-Fix** – `getBerlinParts`/`formatDT` formatieren die (bereits Wanduhr-encoded) Roh-Epochs direkt ohne Berlin-Offset (+2h/+1h entfernt, `_isBerlinDST` entfällt). Pause = Wanduhr 23:00–23:59 (22:59 → 00:01).
 - **Verifikation:** `node --check` auf allen 4 JS-Dateien, `test/check_resolve_realtime.js` (PASS: 3000/3000 exakte Treffer, Phantom-Zeit → „Fr 31.07.26 00:01" statt „Do 30.07.26 23:58"; Pausen-Grenze 22:59 → 00:01), `test/check_time_utils.js` (PASS), `test/check_html_template.py` (PASS), `test/check_broker_tz.py` (bestätigt: MT5 = Wanduhr-encoded).
 
-**Testdateien in `test/` (regelkonform, keine UI):**
+**Testdateien in `test` (regelkonform, keine UI):**
 `test.py`, `check_chart_data.py`, `test_db_lock.py`, `check_time_utils.js`, `check_html_template.py`, `check_m1_consistency.py` (Pausen-Erkennung Wanduhr 23:00–23:59), `simulate_chart_mapping.py`, `check_m1_midnight.py`, `check_mt5_m1_boundary.py`, `check_broker_tz.py` (MT5 = Wanduhr-encoded), `check_app_state.py`, `build_cont_map.py` (erzeugt `tmp_cont_map.json`), `check_resolve_realtime.js`.
 
 ---

@@ -151,7 +151,7 @@ Jedes Refactoring und jede Code-Generierung muss strikt folgenden Prinzipien ent
 * **Repository/Service-Klassen:** Kapseln den Datenbank-Zugriff (`db_service.py`, `StatisticsRepository`, `MarketDataRepository`).
 
 4. **Open/Closed Principle:**
-* Neue Indikatoren oder Feature-Plugins werden durch Hinzufügen neuer Dateien unter `analytics/features/definitions/` implementiert. Bestehender Rumpfcode darf dafür nicht geändert werden.
+* Neue Indikatoren oder Feature-Plugins werden durch Hinzufügen neuer Dateien unter `analytics/features/definitions` implementiert. Bestehender Rumpfcode darf dafür nicht geändert werden.
 
 
 5. **Typsicherheit:**
