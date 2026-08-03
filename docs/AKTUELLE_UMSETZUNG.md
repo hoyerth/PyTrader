@@ -195,3 +195,52 @@ Vor der Veröffentlichung einer neuen Version MÜSSEN folgende Checks durchgefü
     3. Rollback-Plan: Bei einem kritischen Fehler NACH dem Deployment:
         Führe git reset --hard phase14_step5 (oder den letzten stabilen Tag) aus.
         Achtung: Da die Datenbank-Schemata (app_data.duckdb, analytics.duckdb) additiv sind (ADD COLUMN IF NOT EXISTS), ist ein Rollback des Codes ohne Datenbank-Rollback unproblematisch. Neue Spalten werden von älterem Code einfach ignoriert.
+
+---
+
+## 8. Abschluss-Validierung Phase 14 – Umsetzungs-Doku & Testergebnisse (Stand 03.08.2026)
+
+Dokumentation der letzten Änderungen (Commit `5212b3a`, Backup `3dea585`, Tag `phase14_step6`) auf Basis der Kapitel 5–7 dieser Datei.
+
+### 8.1 Umgesetzte Änderungen
+
+1. **Kap 5 – Set-Level-Metadaten (`analytics/engine/service_set_repository.py`):**
+   `save_set()` stempelt automatisch (additiv, idempotent, Bestand wird beim nächsten Speichern nachgezogen):
+   * `schema_version` → `"1.0"` (Default)
+   * `version` → Aufrufer-Version gewinnt; sonst **Patch-Bump** (`major.minor.patch`) bei jedem Überschreiben, `"1.0.0"` bei Neuanlage (neuer Helper `_semver_bump_patch()`)
+   * `created_at` → ISO-8601 UTC bei Neuanlage; bleibt bei Überschreiben stabil
+   * `ServiceSetDefinition` (TypedDict in `service_models.py`) um die drei Felder erweitert
+
+2. **Kap 6 – Universal-Regressionstest `test/check_phase14_regression.py`:**
+   Headless (KEINE UI, KEIN `exec_()`), ASCII-Ausgabe (cp1252-sicher), Test-DB in `test/phase14_regression_test.duckdb` (kein Zugriff auf Produktions-DBs). 41 Checks über alle P14-Kernmodule (P14-01 bis P14-05).
+
+3. **Kap 7.2 – Performance-Benchmarks `test/check_performance_p14.py`:**
+   Headless Messungen mit großzügigen Dev-Schwellen:
+   * Plugin-Discovery-Speed – `PluginRegistry().reload()` (< 2,0 s)
+   * Service-Evaluation-Speed – `ServiceSetEvaluator.execute_set()` auf 1000 synthetischen Bars mit grid_lines + proximity (< 2,0 s)
+   * Feature-Store-Read-Speed – DuckDB-SELECT auf 1000 Zeilen der feature_store-Test-Tabelle (< 0,2 s)
+
+4. **Kap 7.3 – `--check-plugins` (Core Protection Rule):**
+   * `PluginLoader.find_custom_conflicts()` in `feature_builder.py` (additiv) – scannt Core- und Custom-Plugins und liefert alle Custom-IDs, die Core-IDs überschreiben
+   * `main.py --check-plugins` – headless, ohne GUI; Exit-Code 0 = OK, 1 = Konflikt
+
+5. **Doku-Abgleich dieser Datei:** Kapitel 4-Index (Kapitel 4.1–4.5 archiviert in `docs/Old/x_Roadmap_Phase14.md`), Kapitel 5-Umsetzungsstatus, Kapitel 6/7.2/7.3 auf den Ist-Zustand aktualisiert.
+
+### 8.2 Testergebnisse (alle bestanden)
+
+| Test | Ergebnis | Anmerkung |
+| :--- | :--- | :--- |
+| `test/check_phase14_regression.py` | **OK (41 Checks)** | P14-01..P14-05 funktional inkl. Set-Metadaten & Snapshot-Historie |
+| `test/check_performance_p14.py` | **OK (5 Checks)** | Discovery 0,8 ms / Evaluation 20,9 ms / Store-Read 98,6 ms |
+| `test/check_p14_s5_trash.py` | **OK (32 Checks)** | Papierkorb & Snapshot-Historie (Regression) |
+| `test/check_p14_s4_migration.py` | **OK (alle)** | Schema-Migration & Rollback (Regression) |
+| `test/check_p14_s4_services_locked.py` | **OK (16 Checks)** | Service-Set-Schutz (Regression) |
+| `python main.py --check-plugins` | **OK (Exit 0)** | Core Protection Rule aktiv, keine Konflikte |
+| `py_compile` (6 Dateien) | **OK** | service_set_repository, service_models, feature_builder, main, beide neuen Tests |
+
+### 8.3 Git-Stand
+
+* Backup vor Umsetzung: `3dea585` (`backup: pre P14 Abschluss-Validierung`), Tag `phase14_step6`
+* Umsetzung: `5212b3a` (`feat(P14-Abschluss): Kap 5-7 AKTUELLE_UMSETZUNG umgesetzt (Set-Metadaten, Regressionstest, Benchmarks, --check-plugins)`)
+* Neue Testdateien per `git add -f` getrackt (test/ ist gitignored)
+
