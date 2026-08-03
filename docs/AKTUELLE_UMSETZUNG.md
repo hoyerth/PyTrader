@@ -173,3 +173,409 @@ c) Service, der 3x nacheinander abstürzt (Prüfe RAM-Quarantäne und State-Fall
 d) Verifikation, dass `GridLiquidityIndicator` Daten korrekt aus `feature_store.feature_data` liest.
 * Verifiziere, dass das Gesamtsystem stabil bleibt und unabhängige Services weiterlaufen.
 
+---
+
+### Kapitel 4.3-E [P14-03]: Ergänzung – Konzeptionelle Erklärung & Schritt-Anleitung (Live-Engine-Resilienz & Flackerfreies Overlay-Rendering)
+
+Konzeptionelle Erklärung & Schritt-Anleitung für Roadmap P14-03 (Ergänzungsanweisung auf
+Basis der Live-Tests & Code-Inspektion der Kette main.py → chart_win.py → grid_liquidity
+→ JS). Rein additiv; Alt-Grid (`grid.py`, `grid_liquidity.py`) und die B-Anleitung
+(Schritte 0-4) bleiben unangetastet.
+
+#### A. Konzeptionelle Erklärung & Flacker-Analyse
+
+##### Das Flacker- & Unterbrechungsproblem
+
+Bisher führte das Eintreffen einer offenen Live-Kerze in `chart_win.py` dazu, dass der
+Timestamp der offenen Kerze nicht in den historischen Maps (`_time_real_to_cont`) gefunden
+wurde. Dies löste einen Re-Build des gesamten Charts (`refresh_chart_data()`) aus. Da die
+offene Kerze noch nicht in DuckDB persistiert war (Persistierung erst bei Bar-Close durch
+`LiveTickWorker._persist_bar`), warfen der Re-Build und JS (`applyFullChartUpdate` →
+`chart.remove()` + Neuaufbau NUR aus DB-Kerzen) die Live-Kerze sofort wieder aus dem Chart.
+Jeder 500-ms-Tick (Polling-Intervall `LiveTickWorker`) erzeugte so ein Wechselspiel aus
+Anhängen (`elif self._time_cont_to_real` in `update_live_candle`) und Löschen
+(`applyFullChartUpdate`) der Kerze → sichtbares Flackern zwischen zwei Zuständen, das erst
+endet, wenn die Kerze geschlossen/gesynct ist (dann ist ihr Timestamp beim nächsten Refresh
+in den Maps enthalten).
+
+Zusätzlich war die Kette zur Übertragung von Indikator-Ergebnissen (Grid-Circles /
+Proximity-Marker) an drei Stellen unterbrochen:
+1. Der Resilienz-Seam `_process_plugin_bars_resilient()` im LiveAnalyzer war **nicht
+   verdrahtet** (nur Definition + Docstring, kein Aufruf in `run()`).
+2. Der Alt-Pfad `_process_plugin_bars()` übergab **keinen `PluginContext`** →
+   `GridLinesService` schrieb kein Raster in `shared_state`, `ProximityService` fand keine
+   Linien (`return empty`) → keine Hit-Records im `feature_store` für Live-Bars.
+3. JS `updateLiveCandle()` verwarf die Live-Rückgabe (nur `candleSeries.update(c)`);
+   `renderGridCircles()` wurde ausschließlich aus `applyFullChartUpdate` gerufen.
+
+##### Die Architektur-Lösung
+
+1. **Incremental Time Map Expansion:** Neue Live-Bar-Timestamps erweitern die bestehenden
+   Maps (`_time_real_to_cont` / `_time_cont_to_real`) dynamisch In-Memory. Ein Aufruf von
+   `refresh_chart_data()` entfällt beim Live-Tick vollständig.
+2. **Resilient Bar-Close Pipeline:** Der `LiveAnalyzer` nutzt exklusiv
+   `_process_plugin_bars_resilient()` unter Übergabe eines vollständigen `PluginContext`
+   (inkl. `shared_state` = `self._live_shared_state`).
+3. **Generisches Live-Overlay Rendering:** Der Live-Tick transportiert gerenderte
+   Live-Overlays (Circles/Marker) im Payload. JS verarbeitet diese in `updateLiveCandle()`
+   ohne kompletten Chart-Rebuild.
+4. **Pflicht-Re-Injektion der offenen Live-Kerze:** Der (einmalige) New-Candle-Refresh
+   baut die Time-Maps in `_do_refresh_chart_data` neu auf. Die offene Live-Kerze wird
+   NACH dem Rebuild zwingend in die Maps (`_time_real_to_cont`/`_time_cont_to_real`),
+   in `continuous_candles` (mit letzter Live-OHLC) und in die `_known_times` des
+   Indikators re-injiziert – sonst feuert der New-Candle-Callback bei jedem Tick erneut
+   und die Flacker-Schleife bleibt bestehen (siehe Prüfprotokoll P5).
+
+#### B. Generische Entkopplungs-Regel
+
+1. **Kein Chart-Rebuild bei Live-Ticks:** Ein Live-Tick darf **niemals**
+   `refresh_chart_data()` aufrufen! (Der einzige Refresh pro neuer Kerze erfolgt über den
+   New-Candle-Callback `set_new_candle_callback(self.refresh_chart_data)` des
+   `GridLiquidityIndicator` – genau einmal pro neuer Kerze, debounced 400 ms. Siehe
+   Prüfprotokoll P5.)
+2. **In-Memory Map-Append:** Wenn ein neuer Bar-Timestamp im Live-Betrieb auftaucht, wird
+   er In-Memory an `_time_real_to_cont` angehängt, **ohne** die Maps zu löschen (`clear()`).
+3. **Pflicht-Re-Injektion (Flacker-Fix):** Die offene Live-Kerze (noch nicht in DuckDB)
+   wird bei jedem Chart-Refresh zwingend in die Time-Maps, in `continuous_candles` und in
+   die `_known_times` des Indikators re-injiziert. Erst dann ist der (einmalige)
+   New-Candle-Refresh nicht mehr die Ursache einer Flacker-Schleife (siehe Prüfprotokoll P5).
+4. **Generische JS-Push-Schnittstelle (Open/Closed):** `JS updateLiveCandle(payload)`
+   verarbeitet `c.overlays` dynamisch (Schema: `{kind, layer, time, price, color,
+   priority}`). Ein generischer Dispatcher (`applyLiveOverlays`) rendert vorhandene
+   Plugin-Layer punktuell – OHNE kompletten Chart-Rebuild und OHNE die historischen
+   Overlays zu verwerfen. Spätere Indikator-Plugins docken über neue `kind`/`layer`-Werte
+   an, ohne `updateLiveCandle` zu ändern.
+5. **Generischer Overlay-Hook (`BaseIndicator.get_live_overlays()`):** Jedes Indikator-
+   Plugin liefert seine Live-Overlays über einen gemeinsamen Hook (Default `[]`). Die
+   Engine (`chart_win`) sammelt die Overlays ALLER aktiven Indikatoren generisch ein –
+   kein `hasattr(plugin, "_live_points")`-Sonderfall pro Plugin.
+
+#### C. Schritt-für-Schritt Anleitung zur Behebung (P14-03 Refactoring)
+
+##### Schritt 1: Flackern stoppen & Time-Maps dynamisch erweitern (`chart/chart_win.py`)
+
+In `PyTraderChartWindow.update_live_candle()` den Aufruf von `self.refresh_chart_data()`
+im `elif self._time_cont_to_real:`-Zweig entfernen. Stattdessen den neuen Timestamp
+kontinuierlich an die bestehenden Maps anhängen.
+
+##### Schritt 2: Resilienz-Seam verdrahten (`analytics/background_workers/live_analyzer.py`)
+
+In `LiveAnalyzer.run()` den Aufruf `self._process_plugin_bars()` durch
+`self._process_plugin_bars_resilient()` ersetzen. Sicherstellen, dass ein gültiger
+`PluginContext` (der bereits vorhandene `self._live_context` mit
+`shared_state=self._live_shared_state`) durchgereicht wird.
+
+##### Schritt 3: Generisches Live-Overlay-Rendering (`chart/chart_win.py`, `chart/indicators/base_indicator.py` & `chart/js/04_live_updates.js`)
+
+1. `BaseIndicator` erhält den generischen Hook `get_live_overlays(candle) -> List[Dict]`
+   (Default `[]`). `GridLiquidityIndicator` überschreibt ihn und liefert seine
+   Live-Punkte als Circle-Overlays (`kind='circle', layer=indicator_id`).
+2. In `update_live_candle()` sammelt `chart_win` die Overlays ALLER aktiven Indikatoren
+   generisch ein und bettet sie als `c.overlays` in das JSON-Payload ein (Zeiten
+   real→kontinuierlich gemappt).
+3. In `chart/js/04_live_updates.js` `updateLiveCandle(json)` erweitern: generischer
+   Dispatcher `applyLiveOverlays(overlays)` rendert `kind='circle'`-Einträge als Merged-
+   Render mit dem historischen Circle-Cache (siehe D.3).
+
+##### Schritt 4: Chart-Lesepfad auf Feature-Store umstellen (`chart/indicators/grid_liquidity.py`)
+
+`GridLiquidityIndicator.calculate()` so anpassen, dass die Hit-Circles primär aus dem
+Feature-Store gelesen werden (DuckDB `feature_store.feature_data`, feature_id='proximity',
+inkl. `schema_version`); die Heavy-Berechnung über die Service-Pipeline bleibt als
+Fallback. Der Leser `read_proximity_from_feature_store()` wird um den Parameter
+`feature_id: str = "proximity"` generalisiert, damit spätere Plugins dieselbe
+Lesearchitektur nutzen können (siehe D.4).
+
+#### D. AI-Arbeitsauftrag: Behebung der Live-Circle & Flacker-Befunde (P14-03 Ergänzung)
+
+##### Context & Zielsetzung
+
+Behebung der 5 Befunde bezüglich des Flackerns der Live-Kerze, der fehlenden
+Circle-Anzeige auf der offenen Kerze sowie der unterbrochenen Service-Pipeline im
+Live-Pfad.
+
+---
+
+##### Code-Anpassungen
+
+##### 1. `chart/chart_win.py` – Live-Tick ohne Rebuild, Pflicht-Re-Injektion & generische Overlays:
+
+a) In `__init__` den Live-Kerzen-State ergänzen:
+
+```python
+# P14-03-E: Live-Kerzen-State für die Pflicht-Re-Injektion (Flacker-Fix).
+self._live_bar_time: Optional[int] = None   # reale, gerundete Bar-Zeit der offenen Kerze
+self._live_candle_cont: Optional[Dict[str, Any]] = None  # letzter Live-Candle (kont. Zeit + OHLC)
+```
+
+b) In `update_live_candle()` den `elif self._time_cont_to_real:`-Zweig ersetzen –
+   Refresh ENTFERNEN, Maps erweitern, Live-State merken:
+
+```python
+# BEFORE:
+#     self.refresh_chart_data()  # <-- KERNPROBLEM (Flacker-Loop, Loeschen!)
+
+# AFTER:
+last_cont = max(self._time_cont_to_real.keys())
+c_copy["time"] = last_cont + t_sec
+self._time_cont_to_real[c_copy["time"]] = rounded_t
+self._time_real_to_cont[rounded_t] = c_copy["time"]
+# P14-03-E: Live-Kerzen-State für die Pflicht-Re-Injektion merken.
+self._live_bar_time = rounded_t
+self._live_candle_cont = dict(c_copy)
+# KEIN refresh_chart_data() Aufruf bei Live-Ticks!
+```
+
+c) Generisches Overlay-Einsammeln über den `get_live_overlays()`-Hook (Open/Closed):
+   Die bisherige `liq_ind.update_live_candle(...)`-Sonderbehandlung entfällt; die Engine
+   iteriert über ALLE aktiven Indikatoren:
+
+```python
+# P14-03-E: Overlays ALLER aktiven Indikatoren generisch einsammeln.
+overlays: List[Dict[str, Any]] = []
+for ind_id, plugin in self.indicators.items():
+    st = self.indicators_state.get(ind_id, {})
+    if not st.get("active"):
+        continue
+    getter = getattr(plugin, "get_live_overlays", None)
+    if not callable(getter):
+        continue
+    try:
+        ov = getter(dict(c_copy, time=rounded_t)) or []
+    except Exception:
+        continue
+    for item in ov:
+        item = dict(item)
+        t = item.get("time")
+        if t is not None:
+            try:
+                item["time"] = self._time_real_to_cont.get(int(t), int(t))
+            except (TypeError, ValueError):
+                pass
+        overlays.append(item)
+c_copy["overlays"] = overlays
+```
+
+d) In `_do_refresh_chart_data()` NACH dem Map-Aufbau (nach dem `for i, c in
+   enumerate(clean_candles):`-Block, vor dem Erstellen von `update_package`) – die
+   PFLICHT-Re-Injektion der offenen Live-Kerze:
+
+```python
+# P14-03-E (PFLICHT, Pruefprotokoll P5): Offene Live-Kerze nach dem Map-Rebuild
+# re-injizieren – sonst feuert der New-Candle-Callback bei jedem Tick erneut
+# und die Flacker-Schleife bleibt bestehen.
+if (self._live_bar_time is not None
+        and self._live_bar_time not in self._time_real_to_cont):
+    last_cont = max(self._time_cont_to_real.keys())
+    cont = last_cont + t_sec
+    self._time_cont_to_real[cont] = self._live_bar_time
+    self._time_real_to_cont[self._live_bar_time] = cont
+    if self._live_candle_cont is not None:
+        lc = dict(self._live_candle_cont)
+        lc["time"] = cont
+        continuous_candles.append(lc)
+    # Auch dem Indikator die Live-Bar merken (verhindert erneuten Callback).
+    liq_ind = self.indicators.get("grid_liquidity")
+    if liq_ind is not None and hasattr(liq_ind, "remember_live_time"):
+        liq_ind.remember_live_time(self._live_bar_time)
+```
+
+##### 2. `analytics/background_workers/live_analyzer.py` – `run(self)`:
+
+Ersetze die Ausführung des Alt-Pfads durch den Resilienz-Seam:
+
+```python
+# BEFORE:
+#     self._process_plugin_bars()
+
+# AFTER:
+self._process_plugin_bars_resilient()
+```
+
+Der `PluginContext` existiert bereits als `self._live_context` (Mode `'live'`,
+`shared_state=self._live_shared_state`) und wird im Seam pro Service per
+`dataclasses.replace()` instanziiert (`instance_id=plugin_id`, bei
+`plugin_id == "proximity"` zusätzlich `depends_on=["grid_lines"]`). KEIN neues Attribut
+`self.shared_state` anlegen – es existiert nicht (siehe Prüfprotokoll P3). Ein expliziter
+Neuaufbau ist nur nötig, falls der Context-Buffer zurückgesetzt wurde:
+
+```python
+if self._live_context is None:
+    self._live_shared_state = {}
+    self._live_context = PluginContext(
+        symbol=self.symbol,
+        timeframe=self.timeframe,
+        mode="live",
+        shared_state=self._live_shared_state,
+    )
+```
+
+##### 3. `chart/js/04_live_updates.js` – generischer Overlay-Dispatcher:
+
+`updateLiveCandle(json)` verarbeitet `c.overlays` generisch über `applyLiveOverlays()`.
+Da `renderGridCircles()` intern `clearGridCircles()` aufruft, werden die Live-Circles mit
+dem historischen Circle-Cache `_gridCirclesCache` gemerged (siehe Prüfprotokoll P1):
+
+```javascript
+function updateLiveCandle(json) {
+    if (!candleSeries || isUpdatingChart) return;
+    try {
+        var c = JSON.parse(json);
+        if (!c || typeof c.time !== 'number' || isNaN(c.time)) return;
+        if (c.symbol !== undefined && c.symbol !== null && c.symbol !== currentSymbol) return;
+        if (c.timeframe !== undefined && c.timeframe !== null && c.timeframe !== currentTimeframe) return;
+        if (c.open === null || c.high === null || c.low === null || c.close === null) return;
+
+        // Live-Candle in Serie aktualisieren
+        candleSeries.update(c);
+        lastClosePrice = c.close;
+        updateCountdownDisplay();
+
+        // GENERISCHES LIVE-OVERLAY RENDERING (Open/Closed-Dispatcher)
+        if (c.overlays && Array.isArray(c.overlays) && c.overlays.length > 0) {
+            applyLiveOverlays(c.overlays);
+        }
+    } catch(e) {
+        console.error('[updateLiveCandle] Error:', e);
+    }
+}
+
+// Generischer Overlay-Dispatcher (P14-03-E): Spätere Plugins docken über neue
+// kind/layer-Werte an, ohne updateLiveCandle zu ändern.
+function applyLiveOverlays(overlays) {
+    if (typeof renderGridCircles !== 'function') return;
+    var circles = [];
+    for (var i = 0; i < overlays.length; i++) {
+        var o = overlays[i];
+        if (o && o.kind === 'circle' && typeof o.time === 'number' &&
+            typeof o.price === 'number' && !isNaN(o.time) && !isNaN(o.price)) {
+            circles.push(o);
+        }
+    }
+    if (circles.length === 0) return;
+    // Merged-Render: nur die Live-Zeit ersetzen, historische Circles behalten.
+    var liveTime = circles[0].time;
+    _gridCirclesCache = _gridCirclesCache.filter(function(x) { return x.time !== liveTime; });
+    for (var j = 0; j < circles.length; j++) { _gridCirclesCache.push(circles[j]); }
+    renderGridCircles(_gridCirclesCache);
+}
+```
+
+`_gridCirclesCache` wird in `applyFullChartUpdate()` beim Setzen von `data.gridCircles`
+befüllt: `_gridCirclesCache = (data.gridCircles || []).slice();` (neben
+`rawCandleData = validCandles;`).
+
+##### 4. `chart/indicators/grid_liquidity.py` – Feature-Store primär + generische Hooks:
+
+a) `read_proximity_from_feature_store()` um den Parameter `feature_id` generalisieren
+   (Standard `'proximity'` – spätere Plugins lesen über denselben Lesepfad):
+
+```python
+def read_proximity_from_feature_store(
+    self,
+    symbol: str,
+    timeframe: str,
+    limit: Optional[int] = None,
+    db_path: Optional[str] = None,
+    feature_id: str = "proximity",
+) -> List[Dict[str, Any]]:
+    # ... SQL: WHERE symbol=? AND timeframe=? AND feature_id=? ...
+```
+
+b) Feature-Store-Lesepfad PRIMÄR in den bestehenden `calculate()`-Body integrieren
+   (rein additiv; `super().calculate()` existiert NICHT – `BaseIndicator.calculate` ist
+   `@abstractmethod`, siehe Prüfprotokoll P4). Nur bei leerem Feature-Store auf die
+   Pipeline-Hit-Circles zurückfallen:
+
+```python
+# Im try-Body von calculate(), NACH dem Auslesen von grid_lines:
+prox_result = results.get("prox_1") or {}
+prox_crp = prox_result.get("chart_render_payload") or {}
+
+# P14-03-E (Schritt 4): PRIMÄR gecachte Proximity-Hits aus dem feature_store lesen.
+cached_circles = self.read_proximity_from_feature_store(
+    self._symbol or "", self._timeframe or ""
+)
+if cached_circles:
+    circles = cached_circles
+else:
+    circles_raw = prox_crp.get("hit_circles") or []
+    # ... bestehende Farb-/priority-Anreicherung unverändert weiterführen ...
+```
+
+c) Generische Live-Overlay-Hooks (Open/Closed) ergänzen:
+
+```python
+# chart/indicators/base_indicator.py – generischer Hook (Basis-Default []):
+def get_live_overlays(self, candle: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """P14-03-E: Liefert die Live-Overlays des Plugins als Liste von Overlay-Items
+    {kind, layer, time, price, color, priority, ...}. Basis-Default: [].
+    Plugin-Klassen überschreiben diesen Hook (Open/Closed)."""
+    return []
+
+# chart/indicators/grid_liquidity.py – Überschreibung (Circle-Overlays):
+def get_live_overlays(self, candle: Dict[str, Any]) -> List[Dict[str, Any]]:
+    pts = self.update_live_candle(candle)
+    return [dict(p, kind="circle", layer=self.indicator_id) for p in pts]
+
+# chart/indicators/grid_liquidity.py – Live-Bar merken (Pflicht-Re-Injektion):
+def remember_live_time(self, ts: int) -> None:
+    """P14-03-E: Merkt eine offene Live-Bar-Zeit im _known_times-Set, damit der
+    New-Candle-Callback über den Refresh hinweg NICHT erneut feuert (Flacker-Fix)."""
+    try:
+        self._known_times.add(int(ts))
+    except (TypeError, ValueError):
+        pass
+```
+
+#### E. Headless Validierung (Ergänzung)
+
+Erstelle und führe aus: `test/check_p14_live_fixes.py` (headless, kein `exec_()`):
+
+1. Simuliere das Senden von 10 Live-Ticks im Abstand von 500 ms (Mock `update_live_candle`).
+2. Verifiziere, dass `refresh_chart_data()` 0-mal aufgerufen wurde.
+3. Verifiziere, dass `_time_real_to_cont` kontinuierlich gewachsen ist (kein `clear()`).
+4. Verifiziere, dass `_process_plugin_bars_resilient()` aufgerufen wurde und den
+   `feature_store` beschreibt (feature_id='proximity'-Zeile vorhanden).
+5. Verifiziere, dass `update_live_candle()` des Indikators Live-Punkte liefert und diese
+   als `live_circles` im Payload ankommen.
+
+#### F. Prüfprotokoll (Korrekturen am Rohentwurf)
+
+Die Anweisungen wurden gegen den Quellcode geprüft; Abweichungen sind korrigiert
+eingearbeitet:
+
+- **P1 (JS-Render):** `renderGridCircles(live_circles)` allein löscht die historischen
+  Circles (`clearGridCircles()` intern). Korrektur: Merged-Render über `_gridCirclesCache`
+  (siehe D.3).
+- **P2 (Indikator-Rückgabe):** `GridLiquidityIndicator.update_live_candle()` liefert eine
+  LISTE `[{time, price, color, priority}]`, kein Dict mit `hit_circles`.
+  `get_live_overlays()` verpackt diese Liste in generische Overlay-Items
+  (`kind='circle'`); `chart_win` greift NICHT mehr direkt auf `_live_points` zu
+  (siehe D.4c).
+- **P3 (LiveAnalyzer-Context):** `self.shared_state` existiert nicht – korrekt ist
+  `self._live_shared_state` bzw. der bereits vorhandene `self._live_context` (siehe D.2).
+- **P4 (calculate-Super):** `super().calculate(df, params)` existiert nicht
+  (`BaseIndicator.calculate` ist `@abstractmethod`); `self._last_lines` existiert nicht.
+  Korrektur: Feature-Store-Read additiv in den bestehenden `calculate()`-Body (siehe D.4).
+- **P5 (New-Candle-Refresh bleibt + RE-INJEKTION IST PFLICHT):** Der
+  `GridLiquidityIndicator` ruft über `set_new_candle_callback(self.refresh_chart_data)`
+  genau EINEN debounced Refresh pro neuer Kerze auf (Grid-Cache-Neuaufbau) – dieser ist
+  NICHT zu entfernen. Entfernt wird nur der Refresh bei JEDEM Tick in
+  `chart_win.update_live_candle()`. DA der Refresh die Maps in `_do_refresh_chart_data`
+  komplett neu baut (Z. 678-679) und `applyFullChartUpdate` den Chart nur aus DB-Kerzen
+  neu aufbaut, MUSS die offene Live-Kerze (noch nicht in DuckDB) beim Refresh zwingend
+  re-injiziert werden: (1) in `_time_real_to_cont`/`_time_cont_to_real`, (2) in
+  `continuous_candles` (mit letzter Live-OHLC aus `_live_candle_cont`), (3) in die
+  `_known_times` des Indikators via `remember_live_time()`. Erst dann feuert der
+  New-Candle-Callback pro neuer Kerze GENAU 1× und die Flacker-Schleife endet.
+  Siehe D.1d.
+- **P6 (Generisches Overlay-Schema):** Statt `live_circles` (circle-spezifisch) transportiert
+  der Live-Tick `c.overlays` mit `{kind, layer, time, price, color, priority}`. Der JS-
+  Dispatcher `applyLiveOverlays()` routet je `kind`; der Python-Hook
+  `BaseIndicator.get_live_overlays()` (Default `[]`) ist die offene Erweiterungsstelle für
+  spätere Indikator-Plugins (Open/Closed). Siehe D.1c/D.3/D.4c.
+- **P7 (Overlay-Zeit-Mapping):** Live-Overlays tragen die reale, gerundete Bar-Zeit des
+  Indikators; `chart_win` mappt sie beim Einsammeln über `_time_real_to_cont` auf die
+  kontinuierliche Chart-Zeit, bevor sie als `c.overlays` an JS gehen (siehe D.1c).
+

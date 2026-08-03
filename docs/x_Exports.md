@@ -140,7 +140,10 @@ PyTrader/
         base_state_model.py
     data/
         analytics.duckdb.tmp/
+        custom_plugins/
     test/
+        _check_doc2_tmp.py
+        _check_doc_tmp.py
         build_cont_map.py
         check_app_state.py
         check_broker_tz.py
@@ -174,8 +177,11 @@ PyTrader/
         check_p13_s7.py
         check_p13_service_win_geometry.py
         check_p13_ui_plugins.py
+        check_p14_precision_levels.py
         check_p14_prop_ui.py
         check_p14_s1_description.py
+        check_p14_s2_discovery.py
+        check_p14_s3_resilience.py
         check_p14_service_params.py
         check_phase12_step1_migration.py
         check_plugin_batch_services.py
@@ -933,6 +939,49 @@ def _parse_json_field(val: Any) -> Any:
     if isinstance(val, str):
         return json.loads(val) if val else None
     return val
+
+
+# ==============================================================================
+# HELPER: Symbol-Preision (fixer Wert je Symbol, identisch zur Preisskala)
+# ==============================================================================
+def get_symbol_precision(symbol: str, timeframe: str,
+                         db_path: str = DB_MARKET_DATA) -> int:
+    """Liefert die Preisskala-Praezision (Nachkommastellen) eines Symbols.
+
+    Identische Query wie MarketDataRepository.fetch_historical_candles()
+    (die Preisskala im Chart nutzt exakt diesen Wert) – jedoch OHNE die
+    Candles zu laden. Wird fuer die Custom-Level-Eingabefelder (prox_level1..6)
+    verwendet, damit die Eingabe dieselbe Dezimalanzahl wie die Preisskala hat.
+
+    Fallback: 2 bei fehlender DB / leerer Tabelle / Fehler.
+    """
+    default = 2
+    if not os.path.exists(db_path):
+        return default
+    try:
+        con = DbPool.get(db_path)
+        p_row = con.execute("""
+            SELECT COALESCE(MAX(
+                CASE
+                    WHEN POSITION('.' IN CAST(ROUND(close, 5) AS VARCHAR)) > 0
+                    THEN LENGTH(RTRIM(CAST(ROUND(close, 5) AS VARCHAR), '0'))
+                         - POSITION('.' IN CAST(ROUND(close, 5) AS VARCHAR))
+                    ELSE 0
+                END
+            ), 2) AS precision
+            FROM (
+                SELECT close
+                FROM ohlcv_bars
+                WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+                  AND close IS NOT NULL
+                LIMIT 1000
+            );
+        """, [symbol, timeframe]).fetchone()
+        if p_row and p_row[0] is not None:
+            return int(p_row[0])
+    except Exception:
+        pass
+    return default
 
 
 # ==============================================================================
@@ -2414,6 +2463,9 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         self._set_run_worker: Optional[ServiceSetRunWorker] = None
         self._current_set_id: Optional[str] = None
         self._current_set_definition: Optional[Dict[str, Any]] = None
+        # USER-REQ (P14-03): Preisskala-Praezision je Symbol fuer die 6
+        # Custom-Level-Eingabefelder (prox_level1..6). Lazy + gecacht.
+        self._symbol_precision: Optional[int] = None
 
         # Phase 13 Schritt 8: Service-Set-Adapler für die generische
         # Neu-/Speichern-/Löschen-Mechanik (NamedItemActionsMixin) – exakt
@@ -2456,6 +2508,8 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         self.btn_remove_instance: QPushButton = self.ui.findChild(QPushButton, "btn_remove_instance")
         self.edit_new_instance: QLineEdit = self.ui.findChild(QLineEdit, "edit_new_instance")
         self.btn_add_instance: QPushButton = self.ui.findChild(QPushButton, "btn_add_instance")
+        # Phase 14 P14-02: Hot-Reload-Button für Custom-Plugins
+        self.btn_reload_plugins: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_reload_plugins")
         # Phase 13 Schritt 6-Korrektur: Dropdown mit ALLEN verfügbaren Services
         self.combo_plugin_select: Optional[QComboBox] = self.ui.findChild(QComboBox, "combo_plugin_select")
         self.btn_save_set: QPushButton = self.ui.findChild(QPushButton, "btn_save_set")
@@ -2551,6 +2605,9 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         # Sofort speichern bei Symbol-Änderung
         if self.combo_symbol:
             self.combo_symbol.currentTextChanged.connect(self.save_state)
+            # USER-REQ: Preisskala-Praezision ist je Symbol fix – beim
+            # Symbol-Wechsel Cache invalidieren + Spalten neu bauen.
+            self.combo_symbol.currentTextChanged.connect(self._on_symbol_changed)
 
         # Set-Dropdown initial befüllen (list_sets() als Quelle)
         self.refresh_set_list()
@@ -2569,6 +2626,9 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             for pid in sorted(PluginRegistry().plugins.keys()):
                 self.combo_plugin_select.addItem(pid, pid)
             self.combo_plugin_select.currentTextChanged.connect(self._on_plugin_select_changed)
+        # Phase 14 P14-02: Hot-Reload der Custom-Plugins (data/custom_plugins/)
+        if self.btn_reload_plugins:
+            self.btn_reload_plugins.clicked.connect(self.reload_plugins)
         self.log(f"Verfügbare Plugins: {_available_plugin_ids()}")
 
         # State asynchron wiederherstellen (nach show(), damit move/resize vom Window-Manager akzeptiert werden)
@@ -2587,6 +2647,17 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             idx = self.combo_symbol.findText(symbol)
             if idx >= 0:
                 self.combo_symbol.setCurrentIndex(idx)
+
+    def _on_symbol_changed(self, symbol: str) -> None:
+        """USER-REQ: Preisskala-Praezision ist je Symbol fix. Beim Symbol-
+        Wechsel wird der Precision-Cache invalidiert und – falls ein Set
+        aktiv ist – die Service-Spalten neu aufgebaut, damit die 6
+        Custom-Level-Felder (prox_level1..6) die neue Preisskala-Praezision
+        des Symbols anzeigen."""
+        self._symbol_precision = None
+        if (self.combo_set is not None and self.combo_set.currentIndex() >= 0
+                and self.service_columns_layout is not None):
+            self._rebuild_columns()
 
     # --- Scanner ---
 
@@ -2990,6 +3061,23 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             return len(s.split(".")[1])
         return 0
 
+    def _get_symbol_precision(self) -> int:
+        """USER-REQ: Preisskala-Praezision (fix je Symbol) fuer die 6
+        Custom-Level-Eingabefelder. Lazy ermittelt (db_service.get_symbol_
+        precision) und fuer die Fenster-Instanz gecacht – kein DB-Zugriff
+        bei jedem Spalten-Neuaufbau."""
+        if self._symbol_precision is None:
+            try:
+                from db_service import get_symbol_precision
+                symbol = (self.combo_symbol.currentText()
+                          if self.combo_symbol else "SILVER")
+                timeframe = (self.combo_tf_set.currentText()
+                             if self.combo_tf_set else "H1")
+                self._symbol_precision = get_symbol_precision(symbol, timeframe)
+            except Exception:
+                self._symbol_precision = 2
+        return self._symbol_precision
+
     def _create_param_control(self, key: str, val: Any, spec: Dict[str, Any]) -> QWidget:
         """Erzeugt ein Eingabe-Widget exakt aus dem ParameterSchema.
 
@@ -3003,6 +3091,11 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             spin.setRange(float(spec.get("min", -1e9)), float(spec.get("max", 1e9)))
             step = spec.get("step")
             decimals = self._decimal_places(step) if step is not None else self._decimal_places(spec.get("default"))
+            # USER-REQ: Custom-Levels (prox_level1..6) nutzen die Preisskala-
+            # Praezision (fix je Symbol). MUSS vor setValue geschehen, sonst
+            # rundet QDoubleSpinBox den Wert auf die Schema-Default-Digits.
+            if key.startswith("prox_level"):
+                decimals = self._get_symbol_precision()
             spin.setDecimals(min(6, max(0, decimals)))
             spin.setSingleStep(float(step) if step is not None else 0.01)
             try:
@@ -3245,6 +3338,38 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         mit dem Service-Set-Adapter.
         """
         self.delete_named_item(self._set_adapter)
+
+    # =========================================================================
+    # Phase 14 P14-02: Hot-Reload der Plugins (Dynamic Discovery)
+    # =========================================================================
+
+    @Slot()
+    def reload_plugins(self) -> None:
+        """Lädt Custom-Plugins aus data/custom_plugins/ neu (Hot-Reload).
+
+        P14-02: Ruft PluginRegistry().reload() auf (unter RLock) und
+        aktualisiert das verfügbare-Services-Dropdown. Bereits laufende
+        Service-Ausführungen laufen auf ihren bisherigen Objektinstanzen
+        weiter; neue Instanziierungen nutzen die neuen Klassen.
+        """
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            registry = PluginRegistry()
+            registry.reload()
+            self.log("Plugins neu geladen.")
+        except Exception as e:
+            self.log(f"FEHLER beim Plugin-Reload: {e}")
+        # Dropdown aktualisieren (neue Custom-Plugins sichtbar machen)
+        if self.combo_plugin_select:
+            current = self.combo_plugin_select.currentText()
+            self.combo_plugin_select.blockSignals(True)
+            self.combo_plugin_select.clear()
+            for pid in sorted(PluginRegistry().plugins.keys()):
+                self.combo_plugin_select.addItem(pid, pid)
+            idx = self.combo_plugin_select.findText(current)
+            self.combo_plugin_select.setCurrentIndex(idx if idx >= 0 else 0)
+            self.combo_plugin_select.blockSignals(False)
+        self.log(f"Verfügbare Plugins: {_available_plugin_ids()}")
 
     @Slot()
     def execute_set(self) -> None:
@@ -20419,6 +20544,7 @@ den feature_store; die Tabelle signal_results bleibt nur als Referenz.
 
 import json
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -20427,7 +20553,13 @@ import pandas as pd
 from PySide6.QtCore import QThread, Signal
 
 from analytics.engine.set_evaluator import SetEvaluator
-from analytics.features.feature_builder import FeatureBuilder, PluginExecutor, prepare_plugin_df
+from analytics.features.feature_builder import (
+    FeatureBuilder,
+    PluginExecutor,
+    PluginExecutionError,
+    prepare_plugin_df,
+)
+from analytics.features.plugins.base_plugin import PluginContext
 from analytics.signals.heuristics.ema_trend import EMATrendSignal
 from analytics.signals.heuristics.atr_filter import ATRFilterSignal
 from analytics.signals.experimental.alternating_arrow_signal import AlternatingArrowSignal
@@ -20476,6 +20608,18 @@ class LiveAnalyzer(QThread):
         # HistoricalScanner nutzt – der Alt-Pfad bleibt unverändert.
         self.plugin_executor = PluginExecutor()
         self._state_mgr = StateManager()
+
+        # P14-03 (Live-Entkopplung A.1.2): Persistenter EvaluationContext-
+        # Buffer über alle Polls hinweg. Der LiveAnalyzer evaluiert geschlossene
+        # Kerzen mit stark verkürztem Lookback (1-2 Bars) GEGEN dieses im RAM
+        # gepufferte Raster – kein voller Pipeline-Neuaufbau pro Poll.
+        self._live_shared_state: Dict[str, Any] = {}
+        self._live_context = PluginContext(
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            mode="live",
+            shared_state=self._live_shared_state,
+        )
 
         # Verfügbare Signale (kann über set_active_signals() erweitert werden)
         self.signals: Dict[str, Any] = {
@@ -20599,7 +20743,13 @@ class LiveAnalyzer(QThread):
     def _process_plugin_bars(self) -> None:
         """Phase 12 Plugin-Modus (Live): Fuehrt aktive Batch-Plugins mit
         live_op = True über dieselbe PluginExecutor-Instanz aus und schreibt
-        den feature_store_payload in den feature_store."""
+        den feature_store_payload in den feature_store.
+
+        P14-03 (Schritt 3.1, additiv): Fuer laufende Bar-Close-Evaluierungen
+        existiert der Seam _process_plugin_bars_resilient() – er nutzt einen
+        stark verkuerzten Lookback (limit=2: 1 unvollstaendige + 1 frisch
+        geschlossene Kerze) gegen das gepufferte EvaluationContext.shared_state
+        -Raster. Dieser Alt-Pfad bleibt unveraendert."""
         plugins = self._get_active_live_plugins()
         if not plugins:
             return
@@ -20640,6 +20790,87 @@ class LiveAnalyzer(QThread):
                     )
                 except Exception as e:
                     self.log_message.emit(f"❌ Plugin-Store-Fehler ({plugin_id}): {e}")
+
+        self._last_processed_bar_time = latest_bar_time
+
+    def _process_plugin_bars_resilient(self) -> None:
+        """P14-03 (Live-Entkopplung A.1.2): Bar-Close-Evaluierung im
+        Hintergrund mit STARK VERKÜRZTEM Lookback (1-2 Bars) gegen das im
+        EvaluationContext.shared_state gepufferte Raster.
+
+        Additiver Seam zum bestehenden Phase-12-Pfad (run() ruft weiterhin
+        _process_plugin_bars auf): Der persistente self._live_context
+        (shared_state = self._live_shared_state) puffert das Grid-Raster über
+        alle Polls hinweg; bei Bar-Close werden nur die letzten 1-2 Bars neu
+        bewertet. Schlägt ein Service fehl, wird der Fehler strukturiert
+        (PluginExecutionErrorInfo) geloggt und der alte shared_state-Eintrag
+        (State-Fallback) bleibt für abhängige Auswertungen erhalten – KEINE
+        DB-Abfragen im Live-Tick, nur bei Bar-Close.
+        """
+        plugins = self._get_active_live_plugins()
+        if not plugins:
+            return
+
+        con = DbPool.get(DB_MARKET)
+        latest_bar_time = con.execute("""
+            SELECT EXTRACT('epoch' FROM MAX("time"))::BIGINT FROM ohlcv_bars
+            WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+              AND "time" IS NOT NULL
+        """, [self.symbol, self.timeframe]).fetchone()[0]
+        if latest_bar_time is None:
+            return
+        latest_bar_time = int(latest_bar_time)
+
+        if self._last_processed_bar_time is not None and latest_bar_time <= self._last_processed_bar_time:
+            return
+
+        df_ohlcv = self.feature_builder.load_ohlcv(
+            self.symbol, self.timeframe, limit=self.lookback_bars
+        )
+        if df_ohlcv.empty:
+            return
+
+        df_plugin = prepare_plugin_df(df_ohlcv)
+        # P14-03: stark verkürzter Lookback (1-2 Bars) gegen das gepufferte
+        # Raster – minimiert Rechnerlast und DB-I/O.
+        df_short = df_plugin.tail(2)
+
+        for preset in plugins:
+            plugin_id = preset.get("plugin_id")
+            # instance_id = plugin_id → GridLinesService schreibt sein Raster
+            # in den persistenten shared_state (Namespace-isoliert).
+            svc_ctx = replace(self._live_context, instance_id=plugin_id)
+            if plugin_id == "proximity":
+                # Proximity liest das Grid-Raster aus shared_state[depends_on[0]].
+                svc_ctx = replace(svc_ctx, depends_on=["grid_lines"])
+            try:
+                result = self.plugin_executor.execute(
+                    plugin_id, df_short, preset.get("params", {}), context=svc_ctx
+                )
+            except PluginExecutionError as e:
+                info = e.info
+                self.log_message.emit(
+                    f"WARN [LiveAnalyzer] LiveService '{plugin_id}' fehlgeschlagen "
+                    f"({info.stage}: {info.exception_type}: "
+                    f"{info.exception_message}) – State-Fallback aktiv"
+                )
+                continue
+            except Exception as e:
+                self.log_message.emit(
+                    f"WARN [LiveAnalyzer] LiveService '{plugin_id}' fehlgeschlagen: {e}"
+                )
+                continue
+            payload = result.get("feature_store_payload", {}) if isinstance(result, dict) else {}
+            if payload:
+                try:
+                    n = self.feature_builder.store_plugin_payload(
+                        self.symbol, self.timeframe, payload
+                    )
+                    self.log_message.emit(
+                        f"Plugin {plugin_id}: {n} Feature-Rows im feature_store"
+                    )
+                except Exception as e:
+                    self.log_message.emit(f"Plugin-Store-Fehler ({plugin_id}): {e}")
 
         self._last_processed_bar_time = latest_bar_time
 
@@ -21569,13 +21800,20 @@ ServiceSetEvaluator (Service-Pipeline). Der bestehende SetEvaluator
 """
 
 from dataclasses import replace
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
+import threading
+import time
+import traceback
 import pandas as pd
 import json
 
 from analytics.engine.base_definition import SignalDefinition
-from analytics.features.plugins.base_plugin import PluginContext
-from analytics.features.feature_builder import PluginExecutor
+from analytics.features.plugins.base_plugin import PluginContext, ServiceErrorLog
+from analytics.features.feature_builder import (
+    PluginExecutor,
+    PluginExecutionError,
+    PluginExecutionErrorInfo,
+)
 
 
 class SetEvaluator:
@@ -21707,13 +21945,74 @@ class ServiceSetExecutionError(Exception):
 
 
 class ServiceSetEvaluator:
-    """Sichere Ausführung einer Service-Pipeline mit Namespace-Isolation."""
+    """Sichere Ausführung einer Service-Pipeline mit Namespace-Isolation.
+
+    P14-03 (Resiliente Evaluator-Schleife): execute_set_resilient() ersetzt
+    das Fail-Fast-Prinzip durch Skip-Logic, Dependency-Skip, State-Fallback
+    und eine RAM-Quarantäne (3 aufeinanderfolgende Fehler → für die Session
+    gesperrt; Zähler-Ready nach 300 s ohne Fehler, Quarantäne bleibt bis
+    reset()). Die bestehende execute_set()-Methode bleibt unverändert
+    (Fail-Fast) und läuft für Bestands-Aufrufer parallel weiter.
+    """
 
     def __init__(self, executor: Optional[PluginExecutor] = None) -> None:
         self.executor = executor or PluginExecutor()
+        # P14-03: Session-Zustand (nur RAM, wird NICHT in DuckDB persistiert)
+        self._failure_counters: Dict[str, int] = {}
+        self._quarantined: Set[str] = set()
+        self._last_failure_time: Dict[str, float] = {}
+        self._recovery_seconds: float = 300.0
+        self._execution_lock = threading.RLock()
+        # Diagnose-Status der letzten resilienten Ausführung (instance_id ->
+        # skip_reason bzw. strukturiertes Fehlerobjekt).
+        self.last_skipped: Dict[str, str] = {}
+        self.last_errors: Dict[str, PluginExecutionErrorInfo] = {}
 
     # -------------------------------------------------------------------------
-    # Pipeline-Ausführung
+    # Session-Quarantäne & Auto-Recovery (P14-03, Invariante 4 + 11)
+    # -------------------------------------------------------------------------
+    def reset(self) -> None:
+        """Vollständiger Neustart der Pipeline (Invariante 11): Quarantäne,
+        Fehlerzähler und Diagnose-Status werden geleert (Session-Scope)."""
+        with self._execution_lock:
+            self._failure_counters.clear()
+            self._quarantined.clear()
+            self._last_failure_time.clear()
+            self.last_skipped.clear()
+            self.last_errors.clear()
+
+    def _is_quarantined(self, instance_id: str) -> bool:
+        """True, wenn die Instanz für die Session quarantänisiert ist.
+
+        Auto-Recovery (Invariante 11): Der Fehlerzähler wird nach
+        _recovery_seconds (300 s) ohne weiteren Fehler automatisch
+        zurückgesetzt – die einmalige Quarantäne selbst bleibt bis reset()
+        bestehen."""
+        last = self._last_failure_time.get(instance_id)
+        if last is not None and time.time() - last >= self._recovery_seconds:
+            self._failure_counters.pop(instance_id, None)
+            self._last_failure_time.pop(instance_id, None)
+        return instance_id in self._quarantined
+
+    def _record_failure(self, instance_id: str) -> bool:
+        """Zählt einen Fehler; bei 3 aufeinanderfolgenden Fehlern wird die
+        Instanz quarantänisiert. Gibt True zurück, wenn Quarantäne ausgelöst."""
+        now = time.time()
+        self._last_failure_time[instance_id] = now
+        self._failure_counters[instance_id] = self._failure_counters.get(instance_id, 0) + 1
+        if self._failure_counters[instance_id] >= 3:
+            self._quarantined.add(instance_id)
+            return True
+        return False
+
+    def _reset_failure(self, instance_id: str) -> None:
+        """Erfolgreiche Ausführung → Fehlerzähler zurücksetzen (nur
+        aufeinanderfolgende Fehler zählen)."""
+        self._failure_counters.pop(instance_id, None)
+        self._last_failure_time.pop(instance_id, None)
+
+    # -------------------------------------------------------------------------
+    # Pipeline-Ausführung (bestehender Fail-Fast-Pfad – unverändert)
     # -------------------------------------------------------------------------
     def execute_set(
         self,
@@ -21819,6 +22118,173 @@ class ServiceSetEvaluator:
 
         return results
 
+    # -------------------------------------------------------------------------
+    # P14-03: Resiliente Pipeline-Ausführung (Skip-Logic / Dependency-Skip /
+    # State-Fallback / Session-Quarantäne)
+    # -------------------------------------------------------------------------
+    def execute_set_resilient(
+        self,
+        set_definition: Dict[str, Any],
+        df: pd.DataFrame,
+        context: Optional[PluginContext] = None,
+    ) -> Dict[str, Any]:
+        """Führt die Service-Pipeline elastisch aus (P14-03) – Ablösung des
+        strikten Fail-Fast-Prinzips (A.3/A.4 des Kapitels):
+
+        * Skip-Logic: Schlägt ein unkritischer Service fehl, wird er geloggt
+          (strukturiertes Fehlerobjekt unter self.last_errors) und mit
+          skip_reason in self.last_skipped markiert. Unabhängige Services
+          laufen weiter.
+        * Dependency-Skip: Services, die per depends_on von der fehlerhaften
+          instance_id abhängen, werden mit skip_reason="dependency_failed"
+          übersprungen.
+        * State-Fallback: Der shared_state-Eintrag der VORHERIGEN Kerze einer
+          fehlgeschlagenen Instanz bleibt unangetastet erhalten – der Aufrufer
+          kann exklusiv darüber auf den letzten guten Zustand zugreifen
+          (EvaluationContext.shared_state.get(instance_id)).
+        * RAM-Quarantäne: 3 aufeinanderfolgende Fehler einer Instanz →
+          quarantäne (nur RAM, keine DB-Persistenz); Zähler-Ready nach 300 s
+          ohne Fehler (Invariante 11), Quarantäne bleibt bis reset().
+
+        Der Rückgabewert enthält ausschließlich erfolgreiche Ausführungen
+        (Dict instance_id -> FeatureCalculateResult) – identische Struktur wie
+        execute_set(). Diagnose über self.last_skipped / self.last_errors.
+
+        Raises:
+            ValueError: Ungültige execution_order / statische
+                Abhängigkeits-Verletzung (wie execute_set).
+        """
+        if df is None or df.empty:
+            raise ValueError("execute_set_resilient: df ist None oder leer")
+
+        execution_order = list(set_definition.get("execution_order") or [])
+        services = dict(set_definition.get("services") or {})
+
+        if not execution_order:
+            raise ValueError("execute_set_resilient: execution_order ist leer")
+
+        missing = [iid for iid in execution_order if iid not in services]
+        if missing:
+            raise ValueError(
+                f"execute_set_resilient: instance_ids fehlen in 'services': {missing}")
+
+        if context is None:
+            context = PluginContext(mode="batch")
+
+        # --- Statische Abhängigkeits-Validierung VOR der Ausführung ----------
+        position = {iid: idx for idx, iid in enumerate(execution_order)}
+        for iid, cfg in services.items():
+            for dep in (cfg.get("depends_on") or []):
+                if dep not in position:
+                    raise ValueError(
+                        f"execute_set_resilient: Service '{iid}' depends_on "
+                        f"'{dep}', das nicht in execution_order existiert")
+                if position[dep] >= position[iid]:
+                    raise ValueError(
+                        f"execute_set_resilient: Abhängigkeits-Verletzung – "
+                        f"Service '{iid}' depends_on '{dep}', aber '{dep}' "
+                        f"steht nicht VOR '{iid}' in execution_order")
+
+        # --- Resiliente Pipeline-Ausführung (Skip-Logic) ---------------------
+        results: Dict[str, Any] = {}
+        with self._execution_lock:
+            self.last_skipped.clear()
+            self.last_errors.clear()
+            for iid in execution_order:
+                # Quarantäne-Skip (Session-Scope, RAM only)
+                if self._is_quarantined(iid):
+                    self.last_skipped[iid] = "quarantined"
+                    print(f"WARN [ServiceSetEvaluator] Service '{iid}' "
+                          f"uebersprungen (quarantined)")
+                    continue
+
+                cfg = services[iid]
+                plugin_id = cfg["plugin_id"]
+                lookback = int(cfg.get("lookback") or len(df))
+                params = dict(cfg.get("params") or {})
+
+                # Dependency-Skip: abhängige Instanz fehlgeschlagen oder
+                # quarantänisiert → kontrolliert überspringen.
+                dep_failed = False
+                for dep in (cfg.get("depends_on") or []):
+                    if dep in self.last_skipped or dep in self._quarantined:
+                        self.last_skipped[iid] = "dependency_failed"
+                        print(f"WARN [ServiceSetEvaluator] Service '{iid}' "
+                              f"uebersprungen (dependency_failed: '{dep}')")
+                        dep_failed = True
+                        break
+                if dep_failed:
+                    continue
+
+                # Exakter Zuschnitt auf den Service-lookback
+                service_df = df.tail(lookback)
+
+                # Context je Service: instance_id + depends_on setzen (Namespace).
+                service_ctx = replace(
+                    context,
+                    instance_id=iid,
+                    depends_on=list(cfg.get("depends_on") or []),
+                )
+
+                try:
+                    result = self.executor.execute(
+                        plugin_id, service_df, params, context=service_ctx)
+                except PluginExecutionError as e:
+                    self.last_errors[iid] = e.info
+                    quarantined_now = self._record_failure(iid)
+                    self.last_skipped[iid] = "quarantined" if quarantined_now else "error"
+                    # P14-03 (Schritt 2.2): Logging über das strukturierte
+                    # ServiceErrorLog-TypedDict (maschinelle Auswertung).
+                    log: ServiceErrorLog = e.info.to_service_error_log()
+                    print(
+                        f"WARN [ServiceSetEvaluator] Service '{iid}' "
+                        f"(plugin '{log['plugin_id']}') fehlgeschlagen: "
+                        f"{log['exception']} "
+                        f"(Fehler #{self._failure_counters.get(iid, 0)})"
+                    )
+                    if quarantined_now:
+                        print(f"WARN [ServiceSetEvaluator] Service '{iid}' fuer "
+                              f"die Session quarantaenisiert (RAM only)")
+                    # State-Fallback: alter shared_state-Eintrag (vorherige
+                    # Kerze) bleibt unangetastet erhalten.
+                    continue
+                except Exception as e:
+                    # Sicherheitsnetz: PluginExecutor kapselt eigentlich alle
+                    # Fehler – hier trotzdem defensiv absichern.
+                    info = PluginExecutionErrorInfo(
+                        timestamp=time.time(),
+                        plugin_id=plugin_id,
+                        instance_id=iid,
+                        symbol=str(getattr(context, "symbol", "") or ""),
+                        timeframe=str(getattr(context, "timeframe", "") or ""),
+                        bar_time=getattr(context, "timestamp", None),
+                        stage="execute_set_resilient",
+                        exception_type=type(e).__name__,
+                        exception_message=str(e),
+                        traceback=traceback.format_exc(),
+                    )
+                    self.last_errors[iid] = info
+                    quarantined_now = self._record_failure(iid)
+                    self.last_skipped[iid] = "quarantined" if quarantined_now else "error"
+                    log2: ServiceErrorLog = info.to_service_error_log()
+                    print(f"WARN [ServiceSetEvaluator] Service '{iid}' "
+                          f"(plugin '{log2['plugin_id']}') fehlgeschlagen: "
+                          f"{log2['exception']}")
+                    continue
+
+                # Erfolg → Fehlerzähler zurücksetzen, Diagnose-Status bereinigen.
+                self._reset_failure(iid)
+                self.last_skipped.pop(iid, None)
+                self.last_errors.pop(iid, None)
+
+                # Namespace-Isolation (wie execute_set): Ergebnis ablegen, falls
+                # der Service seinen Namespace nicht selbst beschrieben hat.
+                if iid not in context.shared_state:
+                    context.shared_state[iid] = result
+                results[iid] = result
+
+        return results
+
 ```
 
 --------------------------------------------------
@@ -21905,11 +22371,16 @@ Stabiler Basis-Stand + Phase-11-Erweiterung: grid_levels (Y-Achsen-Grid-Levels
 und X-Achsen-Zeitfenster-Flags), gekapselt in analytics/features/definitions/.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import importlib
 import inspect
 import json
 import pkgutil
+import sys
+import threading
+import time
+import traceback
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21923,6 +22394,7 @@ from analytics.features.plugins.base_plugin import (
     PluginFeature,
     FeatureCalculateResult,
     PluginContext,
+    ServiceErrorLog,
 )
 from state_manager import StateManager
 from db_service import DbPool
@@ -21968,56 +22440,226 @@ def _to_utc_datetime(value: Any):
     return value
 
 
+# ==============================================================================
+# P14-03: Strukturierte Fehlerobjekte & In-Memory-Cache-Invalidierung
+# ------------------------------------------------------------------------------
+# Architektur-Invariante 8: Logging verwendet strukturierte Fehlerobjekte
+# (timestamp, plugin, instance, symbol, timeframe, bar, exception, traceback).
+# Architektur-Invariante 13: store_plugin_payload() invalidiert den
+# In-Memory-Cache für (symbol, timeframe).
+# ==============================================================================
+@dataclass
+class PluginExecutionErrorInfo:
+    """Strukturiertes Fehlerobjekt eines fehlgeschlagenen Plugin-Aufrufs.
+
+    Wird von PluginExecutor bei jeder Exception der Ausführungskette erzeugt
+    (stage: resolve / dependency / validate_params / calculate) und als
+    .info am PluginExecutionError mitgereicht. Der ServiceSetEvaluator nutzt
+    es für Skip-Logic, State-Fallback und Session-Quarantäne.
+    """
+    timestamp: float
+    plugin_id: str
+    instance_id: Optional[str]
+    symbol: str
+    timeframe: str
+    bar_time: Optional[int]
+    stage: str
+    exception_type: str
+    exception_message: str
+    traceback: str
+
+    def to_service_error_log(self) -> ServiceErrorLog:
+        """P14-03 (Schritt 2.2): Liefert das strukturierte Fehlerobjekt als
+        ServiceErrorLog-TypedDict (Pflichtfelder laut Anleitung) für die
+        maschinelle Auswertung des Loggings in PluginExecutor /
+        ServiceSetEvaluator."""
+        return ServiceErrorLog(
+            timestamp=self.timestamp,
+            plugin_id=self.plugin_id,
+            instance_id=self.instance_id,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            bar_time=self.bar_time,
+            exception=f"{self.exception_type}: {self.exception_message}",
+            traceback=self.traceback,
+        )
+
+
+class PluginExecutionError(Exception):
+    """Getypter Ausführungsfehler mit strukturiertem Fehlerobjekt (.info)."""
+
+    def __init__(self, info: PluginExecutionErrorInfo):
+        self.info = info
+        super().__init__(info.exception_message)
+
+
+_feature_cache_lock = threading.Lock()
+_feature_cache_invalidated: Dict[Tuple[str, str], float] = {}
+
+
+def invalidate_feature_cache(symbol: str, timeframe: str) -> None:
+    """P14-03 (Invariante 13): Meldet die Invalidation des In-Memory-Caches
+    für (symbol, timeframe). Wird bei jedem store_plugin_payload() aufgerufen,
+    damit veraltete Zustände (z. B. in EvaluationContext.shared_state) nicht
+    über einen Refresh hinweg weiterleben."""
+    with _feature_cache_lock:
+        _feature_cache_invalidated[
+            (str(symbol).lower(), str(timeframe).lower())
+        ] = time.time()
+
+
+def feature_cache_last_invalidated(symbol: str, timeframe: str) -> Optional[float]:
+    """Letzter Invalidation-Zeitpunkt für (symbol, timeframe) oder None."""
+    with _feature_cache_lock:
+        return _feature_cache_invalidated.get(
+            (str(symbol).lower(), str(timeframe).lower())
+        )
+
+
 class PluginLoader:
-    """Class-Finder scannt Verzeichnisse rein nach Subklassen von PluginFeature (Dateiname-unabhängig)."""
+    """Class-Finder scannt Verzeichnisse rein nach Subklassen von PluginFeature (Dateiname-unabhängig).
 
-    def __init__(self, definitions_path: Optional[Path] = None):
+    P14-02 (additiv): Automatische, rekursive Discovery über
+    pkgutil.walk_packages() + importlib.import_module() für
+    analytics/features/definitions/ (Core) und data/custom_plugins/ (Custom).
+    - data/custom_plugins/ wird automatisch angelegt (os.makedirs).
+    - Eindeutigkeit der plugin_id strikt case-insensitiv (plugin_id.lower()).
+    - Core Protection Rule: Custom-Plugins mit bereits belegter ID werden
+      verworfen (WARN-Log).
+    - Abstrakte Klassen werden ignoriert; Import-/Instanzierungsfehler einzelner
+      Module werden isoliert abgefangen (kein App-Absturz).
+    """
+
+    def __init__(self, definitions_path: Optional[Path] = None,
+                 custom_plugins_path: Optional[Path] = None):
         self.definitions_path = definitions_path or Path(__file__).parent / "definitions"
+        self.custom_plugins_path = custom_plugins_path or DATA_DIR / "custom_plugins"
+        # P14-02: Namen der zuletzt erfolgreich geladenen Custom-Plugin-Module
+        # (fuer gezieltes importlib.reload in PluginRegistry.reload()).
+        self.loaded_custom_modules: List[str] = []
 
-    def discover_plugins(self) -> Dict[str, PluginFeature]:
-        plugins = {}
-        if not self.definitions_path.exists():
-            return plugins
+    def _ensure_custom_dir(self) -> None:
+        """Legt data/custom_plugins/ an, falls es noch nicht existiert (P14-02)."""
+        try:
+            self.custom_plugins_path.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"WARN [PluginLoader] Ordner {self.custom_plugins_path} nicht erstellbar: {e}")
 
-        for _, module_name, is_pkg in pkgutil.iter_modules([str(self.definitions_path)]):
-            if is_pkg:
-                continue
-            full_module_name = f"analytics.features.definitions.{module_name}"
+    def _scan_dir(self, plugins: Dict[str, PluginFeature], path: Path,
+                  package_prefix: str, is_custom: bool) -> None:
+        """Scannt ein Verzeichnis rekursiv nach PluginFeature-Subklassen (P14-02).
+
+        is_custom=True: Module werden in loaded_custom_modules registriert und
+        eine bereits belegte plugin_id (Core Protection Rule) fuehrt zum
+        Ueberspringen mit WARN-Log.
+        """
+        if not path.exists():
+            return
+        for mod_info in pkgutil.walk_packages([str(path)]):
+            module_name = mod_info.name
+            full_module_name = f"{package_prefix}.{module_name}"
             try:
                 module = importlib.import_module(full_module_name)
-                for name, obj in inspect.getmembers(module, inspect.isclass):
-                    if issubclass(obj, PluginFeature) and obj is not PluginFeature:
-                        instance = obj()
-                        plugins[instance.plugin_id] = instance
             except Exception as e:
-                print(f"⚠️ [PluginLoader] Fehler in Modul {module_name}: {e}")
+                print(f"WARN [PluginLoader] Modul {full_module_name} nicht ladbar: {e}")
+                continue
+            if is_custom and full_module_name not in self.loaded_custom_modules:
+                self.loaded_custom_modules.append(full_module_name)
+            for _name, obj in inspect.getmembers(module, inspect.isclass):
+                if inspect.isabstract(obj):
+                    continue  # abstrakte Basisklassen ignorieren
+                if issubclass(obj, PluginFeature) and obj is not PluginFeature:
+                    try:
+                        instance = obj()
+                    except Exception as e:
+                        print(f"WARN [PluginLoader] Instanzierung {_name} ({full_module_name}) fehlgeschlagen: {e}")
+                        continue
+                    pid = str(instance.plugin_id)
+                    pid_key = pid.lower()
+                    if is_custom and pid_key in plugins:
+                        print(f"WARN: Custom plugin skipped: plugin_id '{pid}' already registered")
+                        continue
+                    plugins[pid_key] = instance
+
+    def discover_plugins(self) -> Dict[str, PluginFeature]:
+        """Entdeckt Core-Plugins (zuerst) und Custom-Plugins (danach), case-insensitiv.
+
+        P14-02: data/custom_plugins/ wird automatisch angelegt; fuer den Import
+        der Custom-Module ('custom_plugins.<mod>') wird data/ in sys.path
+        aufgenommen, falls noetig (namespace package).
+        """
+        plugins: Dict[str, PluginFeature] = {}
+        self.loaded_custom_modules = []
+        self._ensure_custom_dir()
+        # Core zuerst (analytics/features/definitions/)
+        self._scan_dir(plugins, self.definitions_path,
+                       "analytics.features.definitions", is_custom=False)
+        # Custom danach (data/custom_plugins/) - data/ in sys.path sicherstellen
+        try:
+            data_dir = str(DATA_DIR)
+            if data_dir not in sys.path:
+                sys.path.insert(0, data_dir)
+        except Exception:
+            pass
+        self._scan_dir(plugins, self.custom_plugins_path, "custom_plugins", is_custom=True)
         return plugins
 
 
 class PluginRegistry:
-    """Zentraler Singleton-Katalog für entdeckte Plugins."""
+    """Zentraler Singleton-Katalog für entdeckte Plugins (P14-02: thread-sicher)."""
 
     _instance = None
 
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
+            # P14-02: Reentrant Lock fuer Schreib-/Lesezugriffe (Thread-Safety)
+            cls._instance._lock = threading.RLock()
             cls._instance.loader = PluginLoader()
             cls._instance.plugins = cls._instance.loader.discover_plugins()
         return cls._instance
 
     def reload(self):
-        """Expliziter Reload nur beim Start oder per Button (thread-sicher)."""
-        self.plugins = self.loader.discover_plugins()
+        """Expliziter Reload nur beim Start oder per Button (thread-sicher).
+
+        P14-02: Unter dem RLock werden zuerst die geladenen Custom-Plugin-Module
+        gezielt neu importiert (importlib.reload), danach die Registry ueber
+        discover_plugins() neu aufgebaut. Bereits laufende Service-Instanzen
+        behalten ihre bisherigen Objekt-Referenzen (Hot-Reload-Semantik); neue
+        Instanziierungen nutzen die neuen Klassen.
+        """
+        with self._lock:
+            # 1. Custom-Module gezielt neu laden (Datei geloescht/fehlerhaft ->
+            #    Modul aus sys.modules entfernen)
+            for mod_name in list(self.loader.loaded_custom_modules):
+                try:
+                    if mod_name in sys.modules:
+                        importlib.reload(sys.modules[mod_name])
+                except Exception as e:
+                    sys.modules.pop(mod_name, None)
+                    print(f"WARN [PluginRegistry] Custom-Modul {mod_name} nicht reloadbar: {e}")
+            # 2. Registry neu aufbauen
+            self.plugins = self.loader.discover_plugins()
 
     def get(self, plugin_id: str) -> PluginFeature:
-        if plugin_id not in self.plugins:
+        """Case-insensitiver Zugriff (P14-02): plugin_id.lower()."""
+        key = plugin_id.lower()
+        if key not in self.plugins:
             raise KeyError(f"Plugin '{plugin_id}' nicht gefunden.")
-        return self.plugins[plugin_id]
+        return self.plugins[key]
 
 
 class PluginExecutor:
-    """Zentrale Schicht für Ausführung, Validierung, Dependency-Ordering & Logging."""
+    """Zentrale Schicht für Ausführung, Validierung, Dependency-Ordering & Logging.
+
+    P14-03 (Ganzheitliche Fehlerkapselung): Sämtliche Exceptions der
+    Ausführungskette eines Plugins – Plugin-Auflösung (resolve), interne
+    Dependency-Aufrufe (dependency), validate_params() und calculate() –
+    werden isoliert abgefangen, in ein strukturiertes Fehlerobjekt
+    (PluginExecutionErrorInfo, Invariante 8) umgewandelt, geloggt und als
+    PluginExecutionError weitergereicht. Der ServiceSetEvaluator entscheidet
+    darüber mit Skip-Logic / Dependency-Skip / Quarantäne.
+    """
 
     def __init__(self, registry: Optional[PluginRegistry] = None):
         self.registry = registry or PluginRegistry()
@@ -22037,6 +22679,40 @@ class PluginExecutor:
             return plugin.calculate(df, params, context=context)
         return plugin.calculate(df, params)
 
+    @staticmethod
+    def _build_error(
+        plugin_id: str,
+        context: Optional[PluginContext],
+        exc: Exception,
+        stage: str,
+    ) -> "PluginExecutionError":
+        """Baut aus einer Exception das strukturierte Fehlerobjekt (P14-03)."""
+        symbol = getattr(context, "symbol", "") or ""
+        timeframe = getattr(context, "timeframe", "") or ""
+        instance_id = getattr(context, "instance_id", None)
+        bar_time = getattr(context, "timestamp", None)
+        info = PluginExecutionErrorInfo(
+            timestamp=time.time(),
+            plugin_id=plugin_id,
+            instance_id=instance_id,
+            symbol=str(symbol),
+            timeframe=str(timeframe),
+            bar_time=bar_time,
+            stage=stage,
+            exception_type=type(exc).__name__,
+            exception_message=str(exc),
+            traceback=traceback.format_exc(),
+        )
+        # P14-03 (Schritt 2.2): Logging über das strukturierte
+        # ServiceErrorLog-TypedDict (maschinelle Auswertung).
+        log: ServiceErrorLog = info.to_service_error_log()
+        print(
+            f"WARN [PluginExecutor] {stage} fehlgeschlagen: plugin='{log['plugin_id']}' "
+            f"instance='{log['instance_id']}' {log['symbol']}/{log['timeframe']} – "
+            f"{log['exception']}"
+        )
+        return PluginExecutionError(info)
+
     def execute(
         self,
         plugin_id: str,
@@ -22044,20 +22720,36 @@ class PluginExecutor:
         params: Dict[str, Any],
         context: Optional[PluginContext] = None,
     ) -> FeatureCalculateResult:
-        plugin = self.registry.get(plugin_id)
+        # 0. Plugin-Auflösung (Registry) – Fehler werden strukturiert gekapselt.
+        try:
+            plugin = self.registry.get(plugin_id)
+        except Exception as e:
+            raise self._build_error(plugin_id, context, e, "resolve") from e
 
         # 1. Dependency Resolution (falls Abhängigkeiten angegeben sind) –
-        #    Context wird auch an Abhängigkeiten durchgereicht.
+        #    Context wird auch an Abhängigkeiten durchgereicht. Fehler in
+        #    Dependency-Aufrufen werden unter der Dependency-plugin_id gekapselt.
         for dep_id in plugin.dependencies:
-            dep_plugin = self.registry.get(dep_id)
-            self._call_calculate(dep_plugin, df, dep_plugin.default_params, context)
+            try:
+                dep_plugin = self.registry.get(dep_id)
+                self._call_calculate(dep_plugin, df, dep_plugin.default_params, context)
+            except PluginExecutionError:
+                raise
+            except Exception as e:
+                raise self._build_error(dep_id, context, e, "dependency") from e
 
         # 2. Parametervalidierung
-        validated_params = plugin.validate_params(params)
+        try:
+            validated_params = plugin.validate_params(params)
+        except Exception as e:
+            raise self._build_error(plugin_id, context, e, "validate_params") from e
 
         # 3. Stateless Execution – Context (inkl. shared_state) wird durchgereicht,
         #    damit Services den shared_state erreichen (Schritt 3 Evaluator).
-        return self._call_calculate(plugin, df, validated_params, context)
+        try:
+            return self._call_calculate(plugin, df, validated_params, context)
+        except Exception as e:
+            raise self._build_error(plugin_id, context, e, "calculate") from e
 
 
 class FeatureBuilder:
@@ -22266,6 +22958,9 @@ class FeatureBuilder:
                     plugin_version = EXCLUDED.plugin_version,
                     feature_data = EXCLUDED.feature_data
             """, rows)
+            # P14-03 (Invariante 13): In-Memory-Cache für (symbol, timeframe)
+            # explizit invalidieren (veraltete shared_state-Zustände vermeiden).
+            invalidate_feature_cache(symbol, timeframe)
             return len(rows)
         finally:
             if own_connection:
@@ -23468,6 +24163,10 @@ class ProximityService(PluginFeature):
                     "depends_on": dep_id,
                     "scan_limit": limit,
                     "visit_pct": visit_pct,
+                    # P14-03 (Invariante 5): explizite schema_version in jedem
+                    # Feature-Payload – der Indikator-Lesepfad (feature_data)
+                    # prüft sie beim Chart-Re-Render.
+                    "schema_version": "1.0.0",
                 },
             },
             "chart_render_payload": {
@@ -23653,6 +24352,28 @@ class PluginMetadata(TypedDict):
     description_long: str
     condition_rules: List[str]
     api_version: str
+
+
+# ==============================================================================
+# P14-03 (Schritt 2.2): Strukturiertes Fehlerobjekt (maschinelle Auswertung)
+# ==============================================================================
+class ServiceErrorLog(TypedDict):
+    """Strukturiertes Fehlerobjekt für das Logging in PluginExecutor und
+    ServiceSetEvaluator (Pflichtfelder laut P14-03 Anleitung).
+
+    Wird ausschließlich für die maschinelle Auswertung von Service-Fehlern
+    verwendet (timestamp, plugin_id, instance_id, symbol, timeframe, bar_time,
+    exception, traceback). PluginExecutionErrorInfo (feature_builder.py) liefert
+    über to_service_error_log() ein exakt dieses TypedDict erfüllendes Dict.
+    """
+    timestamp: float
+    plugin_id: str
+    instance_id: Optional[str]
+    symbol: str
+    timeframe: str
+    bar_time: Optional[int]
+    exception: str
+    traceback: str
 
 
 class PluginFeature(ABC):
@@ -26199,6 +26920,9 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		# Phase 13 Schritt 5: Service-Set-Verwaltung (lazy)
 		self.symbol = symbol
 		self.timeframe = timeframe
+		# USER-REQ (P14-03): Preisskala-Praezision je Symbol fuer die 6
+		# Custom-Level-Eingabefelder (prox_level1..6). Lazy + gecacht.
+		self._symbol_precision: Optional[int] = None
 		self._set_repo = service_set_repo
 		self._set_evaluator = None
 		self._set_run_worker: Optional[DialogServiceSetRunWorker] = None
@@ -26306,6 +27030,20 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			return max(2, len(s.split(".")[1]))
 		return 2
 
+	def _get_symbol_precision(self) -> int:
+		"""USER-REQ: Preisskala-Praezision (fix je Symbol) fuer die 6
+		Custom-Level-Eingabefelder. Lazy ermittelt (db_service.get_symbol_
+		precision) und fuer die Dialog-Instanz gecacht – kein DB-Zugriff bei
+		jedem Control-Neuaufbau."""
+		if self._symbol_precision is None:
+			try:
+				from db_service import get_symbol_precision
+				self._symbol_precision = get_symbol_precision(
+					self.symbol, self.timeframe)
+			except Exception:
+				self._symbol_precision = 2
+		return self._symbol_precision
+
 	@staticmethod
 	def _is_visual_key(key: str) -> bool:
 		"""Konvention fuer reine Indi-Props: Sichtbarkeit (show_*) + Farben (color)."""
@@ -26331,6 +27069,11 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			spin.setRange(float(spec.get("min", -1e9)), float(spec.get("max", 1e9)))
 			step = spec.get("step")
 			decimals = self._decimal_places(step) if step is not None else self._decimal_places(spec.get("default"))
+			# USER-REQ: Custom-Levels (prox_level1..6) nutzen die Preisskala-
+			# Praezision (fix je Symbol). MUSS vor setValue geschehen, sonst
+			# rundet QDoubleSpinBox den Wert auf die Schema-Default-Digits.
+			if key.startswith("prox_level"):
+				decimals = self._get_symbol_precision()
 			spin.setDecimals(min(6, max(0, decimals)))
 			spin.setSingleStep(float(step) if step is not None else 0.01)
 			try:
@@ -27972,6 +28715,7 @@ bleibt UNVERÄNDERT als Referenz-Parallelbetrieb erhalten.
 
 import threading
 from datetime import datetime, timezone as dt_timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
@@ -28103,6 +28847,91 @@ class GridLiquidityIndicator(BaseIndicator):
         """Liefert eine flache Kopie der gecachten Linien (Lock-geschützt)."""
         with self._cache_lock:
             return list(self._cached_grid_lines)
+
+    # ------------------------------------------------- P14-03: Lesepfad (additiv)
+    def read_proximity_from_feature_store(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: Optional[int] = None,
+        db_path: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """P14-03 (Live-Entkopplung A.1.3 / Schritt 3.2): PRIMÄRER
+        DB-Lesepfad des Indikators – liest fertige Proximity-Hits aus dem
+        feature_store (JSON-Feld feature_data, feature_id='proximity', inkl.
+        schema_version) beim Chart-Re-Render/Refresh OHNE synchrone
+        Service-Pipeline (Invariante 10: definierter Fallback).
+
+        Der Indikator führt hier KEINE Berechnungen aus; er liest ausschließlich
+        vorberechnete Daten aus DuckDB. Die Heavy-Berechnung über die
+        FeatureBuilder-Service-Pipeline (calculate) ist nur der Fallback,
+        wenn der feature_store leer ist. Liefert die Hit-Kreise des Proximity-
+        Service ({time, price, in_window}) oder [] bei fehlenden Daten/Fehlern –
+        der Aufrufer entscheidet, ob er auf die Pipeline (calculate) zurückfällt.
+
+        Args:
+            symbol: Symbol-Name
+            timeframe: Timeframe
+            limit: Maximale Anzahl Bars (Default 1000)
+            db_path: Optionaler DB-Pfad (für Tests) – Default analytics.duckdb
+        """
+        if not symbol or not timeframe:
+            return []
+        if db_path is None:
+            db_path = str(Path(__file__).resolve().parent.parent.parent
+                          / "data" / "analytics.duckdb")
+        if limit is None:
+            limit = 1000
+        try:
+            from db_service import DbPool
+            con = DbPool.get(db_path)
+            rows = con.execute("""
+                SELECT EXTRACT('epoch' FROM bar_time)::BIGINT AS time_epoch,
+                       feature_data
+                FROM (
+                    SELECT bar_time, feature_data
+                    FROM feature_store
+                    WHERE symbol = ? AND timeframe = ? AND feature_id = 'proximity'
+                      AND feature_data IS NOT NULL
+                    ORDER BY bar_time DESC
+                    LIMIT ?
+                )
+                ORDER BY bar_time ASC
+            """, [symbol, timeframe, limit]).fetchall()
+        except Exception as e:
+            print(f"WARN [GridLiquidityIndicator] feature_store-Lesepfad "
+                  f"fehlgeschlagen: {e}")
+            return []
+
+        circles: List[Dict[str, Any]] = []
+        for row in rows:
+            time_sec = row[0]
+            if time_sec is None or time_sec <= 0:
+                continue
+            data = row[1] or {}
+            if isinstance(data, str):
+                try:
+                    import json as _json
+                    data = _json.loads(data) or {}
+                except (ValueError, TypeError):
+                    data = {}
+            if not data.get("is_hit"):
+                continue
+            # feature_data enthält levels_hit (Preise der getroffenen Levels)
+            # – je Level ein Hit-Kreis (Farbe setzt der Aufrufer über das
+            # in_window-Flag, wie bei der Live-Pipeline).
+            in_window = bool(data.get("in_time_window"))
+            for lvl in (data.get("levels_hit") or []):
+                try:
+                    circles.append({
+                        "time": time_sec,
+                        "price": float(lvl),
+                        "in_window": in_window,
+                        "priority": 10,
+                    })
+                except (TypeError, ValueError):
+                    continue
+        return circles
 
     # -------------------------------------------------------------- Berechnung
     def _get_app_settings(self) -> Any:
@@ -30371,6 +31200,85 @@ class AbstractStateModel(ABC):
     def from_dict(cls, data: Dict[str, Any]) -> "AbstractStateModel":
         """Deserialisiert ein Dict zurück in eine Modell-Instanz."""
         pass
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_check_doc2_tmp.py
+```py
+# test/_check_doc2_tmp.py (temporärer Konsistenz-Check)
+import re
+
+s = open(r'docs/AKTUELLE_UMSETZUNG.md', encoding='utf-8').read()
+lines = s.splitlines()
+errs = []
+
+probes = [
+    ('get_live_overlays', 'Overlay-Hook'),
+    ('applyLiveOverlays', 'JS-Dispatcher'),
+    ('c.overlays', 'Payload overlays'),
+    ('_live_bar_time', 'Live-Bar-State'),
+    ('_live_candle_cont', 'Live-Candle-State'),
+    ('remember_live_time', 'remember_live_time'),
+    ('RE-INJEKTION IST PFLICHT', 'P5 PFLICHT'),
+    ('P6 (Generisches Overlay-Schema)', 'P6'),
+    ('P7 (Overlay-Zeit-Mapping)', 'P7'),
+    ('feature_id: str = "proximity"', 'generischer Feature-Read'),
+]
+for probe, desc in probes:
+    if probe not in s:
+        errs.append('fehlt: ' + desc)
+
+# Veraltete Referenzen (sollten weg sein)
+for old, desc in [
+    ('c.live_circles', 'altes live_circles-Payload'),
+    ('hasattr(liq_ind, "_live_points")', 'alter _live_points-Zugriff in chart_win'),
+]:
+    if old in s:
+        errs.append('NOCH VORHANDEN: ' + desc)
+
+fences = len(re.findall('```.*$', s, re.M))
+print('Code-Fences:', fences, '(gerade:', fences % 2 == 0, ')')
+print('ERRORS:', errs if errs else 'keine')
+print('LINES:', len(lines))
+for i, ln in enumerate(lines, 1):
+    if ln.startswith('### Kapitel 4.3-E'):
+        print('Kapitel 4.3-E Zeile', i)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_check_doc_tmp.py
+```py
+import re
+s = open(r'docs/AKTUELLE_UMSETZUNG.md', encoding='utf-8').read()
+lines = s.splitlines()
+errs = []
+probes = [
+    ('### Kapitel 4.3-E [P14-03]', 'Kapitel 4.3-E'),
+    ('#### A. Konzeptionelle Erklärung & Flacker-Analyse', 'Sektion A'),
+    ('#### B. Generische Entkopplungs-Regel', 'Sektion B'),
+    ('#### C. Schritt-für-Schritt Anleitung zur Behebung', 'Sektion C'),
+    ('#### D. AI-Arbeitsauftrag', 'Sektion D'),
+    ('#### E. Headless Validierung (Ergänzung)', 'Sektion E'),
+    ('#### F. Prüfprotokoll', 'Sektion F'),
+    ('_process_plugin_bars_resilient()', 'Seam'),
+    ('_gridCirclesCache', 'JS-Cache'),
+    ('read_proximity_from_feature_store(', 'Lesepfad'),
+    ('live_circles', 'Payload'),
+]
+for probe, desc in probes:
+    if probe not in s:
+        errs.append('fehlt: ' + desc)
+fences = len(re.findall(chr(96)*3 + r'.*$', s, re.M))
+print('Code-Fences (Zeilen mit Fence-Start):', fences)
+print('ERRORS:', errs if errs else 'keine')
+print('LINES:', len(lines))
+for i, ln in enumerate(lines, 1):
+    if ln.startswith('### Kapitel 4.3-E'):
+        print('Kapitel 4.3-E beginnt Zeile', i)
 
 ```
 
@@ -37591,6 +38499,242 @@ if __name__ == "__main__":
 
 --------------------------------------------------
 
+### DATEI: test/check_p14_precision_levels.py
+```py
+# test/check_p14_precision_levels.py
+"""
+USER-REQ (P14-03): Die 6 Custom-Level-Eingabefelder (prox_level1..6) muessen
+dieselbe Anzahl Nachkommastellen nutzen wie die Preisskala (Precision je
+Symbol). Es existiert ein fixer Wert je Symbol – ermittelt ueber die
+identische Query wie die Preisskala (db_service.get_symbol_precision).
+
+Headless, kein exec_():
+1. get_symbol_precision: Test-Market-DB mit 3-Nachkommastellen-closes -> 3;
+   fehlende DB -> 2 (Fallback).
+2. IndicatorSettingsDialog: prox_level1..6-Spinboxen haben decimals() ==
+   Precision (3); andere Felder (step_size) bleiben unveraendert.
+3. ServiceWindow: prox_level-Spinboxen haben decimals() == Precision (3).
+"""
+import os
+import sys
+import duckdb
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+if os.name != "nt":
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+MARKET_DB = os.path.join(TEST_DIR, "p14_precision_market.duckdb")
+SETS_DB = os.path.join(TEST_DIR, "p14_precision_sets.duckdb")
+STATE_DB = os.path.join(TEST_DIR, "p14_precision_state.duckdb")
+for db in (MARKET_DB, SETS_DB, STATE_DB):
+    if os.path.exists(db):
+        os.remove(db)
+
+failures = []
+
+
+def check(name, ok, extra=""):
+    print(f"[{'PASS' if ok else 'FAIL'}] {name} {extra}")
+    if not ok:
+        failures.append(name)
+
+
+# ==============================================================================
+# [1] get_symbol_precision (fixer Wert je Symbol)
+# ==============================================================================
+print("\n=== [1] db_service.get_symbol_precision ===")
+# Test-Market-DB mit closes auf 3 Nachkommastellen
+con = duckdb.connect(MARKET_DB)
+con.execute("""
+    CREATE TABLE ohlcv_bars (
+        symbol VARCHAR NOT NULL,
+        timeframe VARCHAR NOT NULL,
+        time TIMESTAMPTZ NOT NULL,
+        open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
+        PRIMARY KEY (symbol, timeframe, time)
+    )
+""")
+con.execute("""
+    INSERT INTO ohlcv_bars VALUES
+        ('SILVER', 'H1', TIMESTAMPTZ 'epoch' + 1000 * INTERVAL 1 SECOND,
+         1.200, 1.300, 1.100, 1.234),
+        ('SILVER', 'H1', TIMESTAMPTZ 'epoch' + 2000 * INTERVAL 1 SECOND,
+         1.300, 1.400, 1.200, 5.678),
+        ('GOLD',   'H1', TIMESTAMPTZ 'epoch' + 1000 * INTERVAL 1 SECOND,
+         100.00, 101.00, 99.00, 100.25)
+""")
+con.close()
+
+from db_service import get_symbol_precision  # noqa: E402
+
+p_silver = get_symbol_precision("SILVER", "H1", db_path=MARKET_DB)
+p_gold = get_symbol_precision("GOLD", "H1", db_path=MARKET_DB)
+p_missing = get_symbol_precision("SILVER", "H1",
+                                 db_path=os.path.join(TEST_DIR, "gibt_es_nicht.duckdb"))
+check("[1a] SILVER -> 3 Nachkommastellen", p_silver == 3, f"(={p_silver})")
+check("[1b] GOLD -> 2 Nachkommastellen", p_gold == 2, f"(={p_gold})")
+check("[1c] fehlende DB -> Fallback 2", p_missing == 2, f"(={p_missing})")
+
+# Ab hier fuer die UI-Tests die Precision symbolabhaengig fixieren
+# (SILVER -> 3, GOLD -> 2) – unabhaengig von der echten market_data.duckdb.
+# Die UIs holen die Funktion lazy aus db_service.
+import db_service  # noqa: E402
+
+
+def _fake_precision(symbol, timeframe, db_path=None):
+    return 3 if str(symbol).upper() == "SILVER" else 2
+
+
+db_service.get_symbol_precision = _fake_precision
+
+# ==============================================================================
+# [2] IndicatorSettingsDialog
+# ==============================================================================
+print("\n=== [2] IndicatorSettingsDialog: prox_level-Spinboxen ===")
+from PySide6.QtWidgets import QApplication, QDoubleSpinBox  # noqa: E402
+
+from analytics.engine.service_set_repository import ServiceSetRepository  # noqa: E402
+from chart.indicator_dialog import IndicatorSettingsDialog  # noqa: E402
+from chart.indicators.grid_liquidity import GridLiquidityIndicator  # noqa: E402
+from state_manager import StateManager  # noqa: E402
+
+app = QApplication.instance() or QApplication([])
+
+repo = ServiceSetRepository(db_path=SETS_DB)
+repo.save_set({
+    "set_id": "test-set",
+    "display_name": "Test-Set",
+    "execution_order": ["grid_1", "prox_1"],
+    "services": {
+        "grid_1": {
+            "plugin_id": "grid_lines", "lookback": 500,
+            "params": {"step_size": 1.5, "steps_around": 4,
+                       "prox_level1": 100.123, "prox_level2": 101.456,
+                       "prox_level3": 0.0, "prox_level4": 0.0,
+                       "prox_level5": 0.0, "prox_level6": 0.0},
+        },
+        "prox_1": {
+            "plugin_id": "proximity", "lookback": 500, "depends_on": ["grid_1"],
+            "params": {"visit_pct": 0.05, "use_time_filter": True,
+                       "time_window_mins": 5},
+        },
+    },
+})
+
+indicator = GridLiquidityIndicator()
+state_mgr = StateManager(db_path=STATE_DB)
+dlg = IndicatorSettingsDialog(
+    indicator=indicator,
+    current_params=dict(indicator.default_params),
+    current_preset_name="Default",
+    state_manager=state_mgr,
+    on_params_changed_callback=lambda payload, name: None,
+    symbol="SILVER", timeframe="H1",
+    service_set_repo=repo, current_set_id="test-set",
+)
+
+lvl1 = dlg._set_param_controls.get("grid_1:prox_level1")
+lvl6 = dlg._set_param_controls.get("grid_1:prox_level6")
+step = dlg._set_param_controls.get("grid_1:step_size")
+check("[2a] prox_level1 Spinbox", isinstance(lvl1, QDoubleSpinBox))
+check("[2b] prox_level1 decimals == 3",
+      isinstance(lvl1, QDoubleSpinBox) and lvl1.decimals() == 3,
+      f"(={lvl1.decimals() if lvl1 else None})")
+check("[2c] prox_level6 decimals == 3",
+      isinstance(lvl6, QDoubleSpinBox) and lvl6.decimals() == 3,
+      f"(={lvl6.decimals() if lvl6 else None})")
+check("[2d] Wert bleibt exakt erhalten",
+      isinstance(lvl1, QDoubleSpinBox) and abs(lvl1.value() - 100.123) < 1e-9,
+      f"(={lvl1.value() if lvl1 else None})")
+check("[2e] step_size NICHT auf Preisskala-Precision gesetzt",
+      isinstance(step, QDoubleSpinBox) and step.decimals() != 3,
+      f"(={step.decimals() if step else None})")
+
+# ==============================================================================
+# [3] ServiceWindow
+# ==============================================================================
+print("\n=== [3] ServiceWindow: prox_level-Spinboxen ===")
+
+
+class FakeStateManager:
+    """Ersetzt StateManager in PersistentWindow – keine echte DB-Verbindung."""
+
+    def __init__(self, *a, **k):
+        pass
+
+    def get_window_geometry(self, *a, **k):
+        return None
+
+    def load_all_instances(self, *a, **k):
+        return []
+
+    def save_window_geometry(self, *a, **k):
+        pass
+
+    def save_instance_state(self, *a, **k):
+        pass
+
+    def delete_instance(self, *a, **k):
+        pass
+
+    def get_app_settings(self, *a, **k):
+        return None
+
+
+import persistent_win  # noqa: E402
+persistent_win.StateManager = FakeStateManager
+
+import service_win  # noqa: E402
+
+win = service_win.ServiceWindow(service_set_repo=repo)
+
+def pump():
+    app.processEvents()
+
+win.combo_set.setCurrentIndex(win.combo_set.findData("test-set"))
+pump()
+
+sp = win._service_param_controls.get(("grid_1", "prox_level1"))
+sp6 = win._service_param_controls.get(("grid_1", "prox_level6"))
+sstep = win._service_param_controls.get(("grid_1", "step_size"))
+check("[3a] prox_level1 Spinbox", isinstance(sp, QDoubleSpinBox))
+check("[3b] prox_level1 decimals == 3",
+      isinstance(sp, QDoubleSpinBox) and sp.decimals() == 3,
+      f"(={sp.decimals() if sp else None})")
+check("[3c] prox_level6 decimals == 3",
+      isinstance(sp6, QDoubleSpinBox) and sp6.decimals() == 3,
+      f"(={sp6.decimals() if sp6 else None})")
+check("[3d] Wert bleibt exakt erhalten",
+      isinstance(sp, QDoubleSpinBox) and abs(sp.value() - 100.123) < 1e-9,
+      f"(={sp.value() if sp else None})")
+check("[3e] step_size NICHT auf Preisskala-Precision gesetzt",
+      isinstance(sstep, QDoubleSpinBox) and sstep.decimals() != 3,
+      f"(={sstep.decimals() if sstep else None})")
+
+# --- [3f] Symbol-Wechsel aktualisiert die Preisskala-Praezision ---------------
+if win.combo_symbol.findText("GOLD") >= 0:
+    win.combo_symbol.setCurrentText("GOLD")
+    pump()
+    sp_gold = win._service_param_controls.get(("grid_1", "prox_level1"))
+    check("[3f] Symbol-Wechsel -> decimals == 2 (GOLD)",
+          isinstance(sp_gold, QDoubleSpinBox) and sp_gold.decimals() == 2,
+          f"(={sp_gold.decimals() if sp_gold else None})")
+else:
+    check("[3f] Symbol-Wechsel", False, "(GOLD nicht im Combo)")
+
+print("-" * 60)
+if failures:
+    print("BEFUND: " + "; ".join(failures))
+    sys.exit(1)
+print("BEFUND: Custom-Level-Felder nutzen die Preisskala-Praezision "
+      "(fix je Symbol) – Dialog & ServiceWindow OK.")
+sys.exit(0)
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/check_p14_prop_ui.py
 ```py
 # test/check_p14_prop_ui.py
@@ -37901,6 +39045,674 @@ if FAILURES:
     sys.exit(1)
 print("ALLE PRÜFUNGEN BESTANDEN (OK)")
 sys.exit(0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_p14_s2_discovery.py
+```py
+# test/check_p14_s2_discovery.py
+"""
+Phase 14 P14-02 – Verifikation: Dynamische Plugin-Discovery & Hot-Reload.
+
+Der PluginLoader scannt data/custom_plugins/ (wird automatisch angelegt) nach
+PluginFeature-Subklassen; der PluginRegistry-Singleton bietet reload() mit
+gezieltem importlib.reload der Custom-Module (thread-sicher via RLock).
+
+Pruefung (headless, kein exec_()):
+1. Temp-Mock data/custom_plugins/tmp_dummy_plugin.py (plugin_id="tmp_dummy")
+   -> nach registry.reload() in registry.plugins enthalten.
+2. Kollision data/custom_plugins/tmp_collision.py (plugin_id="GRID_LINES",
+   absichtlich Grossschreibung) -> Core grid_lines wird NICHT ueberschrieben
+   (Core Protection Rule, case-insensitive).
+3. Case-insensitiver Zugriff registry.get('TMP_DUMMY') / get('GRID_LINES').
+4. Temp-Dateien loeschen -> reload() -> sauberer Rueckbau (tmp_dummy weg,
+   loaded_custom_modules leer, grid_lines unveraendert).
+5. Thread-Smoke: parallele get()-Aufrufe aus mehreren Threads ohne Fehler.
+
+Hinweis: Die Temp-Plugin-Dateien muessen in data/custom_plugins/ liegen, weil
+discover_plugins() sie als 'custom_plugins.<mod>' importiert (data/ in
+sys.path). Sie werden in finally garantiert wieder geloescht; zurueck bleibt
+nur der leere (automatisch angelegte) Ordner.
+"""
+import os
+import sys
+import threading
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+
+BASE_DIR = r"F:\Python\PyTrader"
+CUSTOM_DIR = os.path.join(BASE_DIR, "data", "custom_plugins")
+DUMMY_FILE = os.path.join(CUSTOM_DIR, "tmp_dummy_plugin.py")
+COLLISION_FILE = os.path.join(CUSTOM_DIR, "tmp_collision.py")
+
+DUMMY_SRC = '''# tmp_dummy_plugin.py (temporaeres Test-Plugin, wird nach dem Test geloescht)
+from typing import Any, Dict, Optional
+import pandas as pd
+from analytics.features.plugins.base_plugin import PluginFeature
+
+
+class TmpDummyPlugin(PluginFeature):
+    @property
+    def plugin_id(self) -> str:
+        return "tmp_dummy"
+
+    @property
+    def parameter_schema(self) -> Dict[str, Any]:
+        return {}
+
+    def calculate(self, df, params, context=None):
+        return {
+            "feature_store_payload": {"feature_id": "tmp_dummy", "records": []},
+            "chart_render_payload": {"lines": []},
+        }
+'''
+
+COLLISION_SRC = '''# tmp_collision.py (temporaeres Test-Plugin, wird nach dem Test geloescht)
+from typing import Any, Dict, Optional
+from analytics.features.plugins.base_plugin import PluginFeature
+
+
+class TmpCollisionPlugin(PluginFeature):
+    @property
+    def plugin_id(self) -> str:
+        return "GRID_LINES"
+
+    @property
+    def parameter_schema(self) -> Dict[str, Any]:
+        return {}
+
+    def calculate(self, df, params, context=None):
+        return {
+            "feature_store_payload": {"feature_id": "GRID_LINES", "records": []},
+            "chart_render_payload": {"lines": []},
+        }
+'''
+
+failures = []
+
+
+def write_file(path, content):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def remove_files():
+    for p in (DUMMY_FILE, COLLISION_FILE):
+        if os.path.exists(p):
+            os.remove(p)
+
+
+def main():
+    from analytics.features.feature_builder import PluginRegistry
+
+    os.makedirs(CUSTOM_DIR, exist_ok=True)
+    remove_files()  # Reste frueherer Laeufe entfernen
+
+    registry = PluginRegistry()
+
+    # --- Basis: Core-Plugins vorhanden -------------------------------------
+    core_ids = {"grid_lines", "grid_liquidity", "proximity"}
+    core_ok = core_ids.issubset(set(registry.plugins.keys()))
+    print(f"Core-Plugins vorhanden: {sorted(core_ids & set(registry.plugins.keys()))} -> {core_ok}")
+    if not core_ok:
+        failures.append(f"Core-Plugins fehlen: {core_ids - set(registry.plugins.keys())}")
+
+    try:
+        # --- 1+2: Temp-Plugins schreiben & reload ---------------------------
+        write_file(DUMMY_FILE, DUMMY_SRC)
+        write_file(COLLISION_FILE, COLLISION_SRC)
+
+        registry.reload()
+
+        dummy_found = "tmp_dummy" in registry.plugins
+        print(f"tmp_dummy nach reload() entdeckt: {dummy_found}")
+        if not dummy_found:
+            failures.append("tmp_dummy wurde nicht entdeckt")
+
+        gl = registry.plugins.get("grid_lines")
+        gl_ok = gl is not None and type(gl).__name__ == "GridLinesService" \
+                and gl.plugin_id == "grid_lines"
+        collision_registered = "tmp_collision" in registry.plugins
+        print(f"grid_lines unveraendert (Core Protection): {gl_ok} "
+              f"(Kollision registriert: {collision_registered})")
+        if not gl_ok:
+            failures.append("Core grid_lines wurde durch Kollision ueberschrieben")
+        if collision_registered:
+            failures.append("Kollisions-Plugin tmp_collision wurde trotzdem registriert")
+
+        # --- 3: Case-insensitiver Zugriff -----------------------------------
+        try:
+            dummy_via_get = registry.get("TMP_DUMMY")
+            ci_dummy = dummy_via_get.plugin_id == "tmp_dummy"
+        except KeyError:
+            ci_dummy = False
+        print(f"get('TMP_DUMMY') case-insensitiv: {ci_dummy}")
+        if not ci_dummy:
+            failures.append("get() nicht case-insensitiv (TMP_DUMMY)")
+
+        try:
+            core_via_get = registry.get("GRID_LINES")
+            ci_core = core_via_get.plugin_id == "grid_lines"
+        except KeyError:
+            ci_core = False
+        print(f"get('GRID_LINES') liefert Core (nicht Kollision): {ci_core}")
+        if not ci_core:
+            failures.append("get('GRID_LINES') liefert nicht das Core-Plugin")
+
+        # --- 5: Thread-Smoke (parallele get()-Aufrufe) ----------------------
+        thread_errors = []
+        def reader():
+            try:
+                for _ in range(50):
+                    registry.get("grid_lines")
+                    registry.get("proximity")
+            except Exception as e:  # noqa: BLE001
+                thread_errors.append(repr(e))
+        threads = [threading.Thread(target=reader) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        lock_ok = hasattr(registry, "_lock")
+        print(f"RLock vorhanden: {lock_ok}, parallele get() Fehler: {len(thread_errors)}")
+        if not lock_ok:
+            failures.append("Registry besitzt kein _lock (Thread-Safety)")
+        if thread_errors:
+            failures.append(f"Thread-Smoke Fehler: {thread_errors}")
+    finally:
+        # --- 4: Aufraeumen & Rueckbau-Verifikation --------------------------
+        remove_files()
+
+    registry.reload()
+    dummy_cleaned = "tmp_dummy" not in registry.plugins
+    mods_cleaned = registry.loader.loaded_custom_modules == []
+    gl_after = registry.plugins.get("grid_lines") is not None \
+        and registry.plugins["grid_lines"].plugin_id == "grid_lines"
+    print(f"tmp_dummy nach Cleanup weg: {dummy_cleaned}")
+    print(f"loaded_custom_modules leer: {mods_cleaned}")
+    print(f"grid_lines weiterhin verfuegbar: {gl_after}")
+    if not dummy_cleaned:
+        failures.append("tmp_dummy nach Cleanup noch in Registry")
+    if not mods_cleaned:
+        failures.append("loaded_custom_modules nicht geleert")
+    if not gl_after:
+        failures.append("grid_lines nach Cleanup nicht mehr verfuegbar")
+
+    leftovers = [os.path.basename(p) for p in (DUMMY_FILE, COLLISION_FILE)
+                 if os.path.exists(p)]
+    print(f"Temp-Dateien zurueckgelassen: {leftovers or 'keine'}")
+    if leftovers:
+        failures.append(f"Temp-Dateien nicht geloescht: {leftovers}")
+
+    print("-" * 60)
+    if failures:
+        print("BEFUND: " + "; ".join(failures))
+        sys.exit(1)
+    print("BEFUND: Discovery, Hot-Reload (Kollision abgewehrt), case-insensitiver "
+          "Zugriff, Cleanup & Thread-Smoke OK.")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_p14_s3_resilience.py
+```py
+# test/check_p14_s3_resilience.py
+"""
+Phase 14 P14-03 – Verifikation: Erweiterte Pipeline-Fehlerbehandlung,
+Auto-Recovery & Live-Feature-Store-Entkopplung.
+
+Konzept (docs/AKTUELLE_UMSETZUNG.md, Kapitel 4.3 A.1-A.4) – rein additiv:
+A.2 Ganzheitliche Fehlerkapselung im PluginExecutor (strukturiertes
+    Fehlerobjekt PluginExecutionErrorInfo: timestamp, plugin, instance,
+    symbol, timeframe, bar, stage, exception, traceback).
+A.3 Resiliente Evaluator-Schleife (execute_set_resilient): Skip-Logic,
+    Dependency-Skip (skip_reason="dependency_failed").
+A.4 State-Fallback (alter shared_state-Eintrag bleibt erhalten) &
+    RAM-Quarantäne (3 aufeinanderfolgende Fehler, nur RAM, kein DB-Persist;
+    Zähler-Recovery nach 300 s, Quarantäne bleibt bis reset()).
+Invariante 5: schema_version im Proximity-Feature-Payload.
+Invariante 13: store_plugin_payload() invalidiert den In-Memory-Cache.
+A.1.3: Indikator-Lesepfad read_proximity_from_feature_store (feature_data,
+    inkl. schema_version, definierter Fallback []).
+A.1.2: LiveAnalyzer persistenter EvaluationContext-Buffer + verkürzter
+    Lookback-Pfad (Attribut-Level, kein DB-Run).
+
+Pruefung (headless, kein exec_()):
+1. Executor: stage 'resolve' (unbekannte plugin_id) / 'calculate' /
+   'validate_params' / 'dependency' – jeweils PluginExecutionError mit
+   strukturiertem Info-Objekt.
+2. Resilient: Set mit grid_1(ok) + prox_1(ok, depends_on grid_1) +
+   bad_1(boom) -> bad_1 in last_skipped ('error'), unabhängige laufen weiter.
+3. Dependency-Skip: grid_1 boom + prox_1 depends_on grid_1 -> 'dependency_failed'.
+4. Quarantäne: bad_1 schlägt 3x fehl -> 4. Aufruf 'quarantined'.
+5. Recovery-Timer: Zähler nach 300 s zurückgesetzt (Quarantäne bleibt).
+6. reset(): räumt Quarantäne/Zähler/Diagnose ab.
+7. State-Fallback: alter shared_state-Eintrag nach Fehler unangetastet.
+8. Cache-Invalidierung: store_plugin_payload -> feature_cache_last_invalidated.
+9. schema_version im proximity feature_store_payload-metadata.
+10. Indikator-Lesepfad: feature_store-Zeile -> read_proximity_from_feature_store
+    liefert Hit-Kreise; keine Daten -> [] (definierter Fallback).
+11. LiveAnalyzer: persistenter _live_context/_live_shared_state vorhanden.
+"""
+import os
+import sys
+import time
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+ANALYTICS_DB = os.path.join(TEST_DIR, "p14_s3_analytics.duckdb")
+
+failures = []
+
+
+def check(name, ok, extra=""):
+    print(f"[{'PASS' if ok else 'FAIL'}] {name} {extra}")
+    if not ok:
+        failures.append(name)
+
+
+# ==============================================================================
+# Failing-Plugin-Mocks (direkt in die Registry injiziert – kein Datei-I/O)
+# ==============================================================================
+def make_boom_plugin():
+    """PluginFeature, dessen calculate() immer eine RuntimeError wirft."""
+    from analytics.features.plugins.base_plugin import PluginFeature
+
+    class BoomPlugin(PluginFeature):
+        @property
+        def plugin_id(self):
+            return "boom"
+
+        @property
+        def parameter_schema(self):
+            return {}
+
+        def calculate(self, df, params, context=None):
+            raise RuntimeError("kaputt-in-calculate")
+
+    return BoomPlugin()
+
+
+def make_bad_validate_plugin():
+    """PluginFeature, dessen validate_params() eine ValueError wirft."""
+    from analytics.features.plugins.base_plugin import PluginFeature
+
+    class BadValidatePlugin(PluginFeature):
+        @property
+        def plugin_id(self):
+            return "bad_validate"
+
+        @property
+        def parameter_schema(self):
+            return {}
+
+        def validate_params(self, params):
+            raise ValueError("kaputt-in-validate")
+
+        def calculate(self, df, params, context=None):
+            return {"feature_store_payload": {}, "chart_render_payload": {}}
+
+    return BadValidatePlugin()
+
+
+def make_dep_plugin():
+    """PluginFeature mit plugin-level dependency auf 'boom'."""
+    from analytics.features.plugins.base_plugin import PluginFeature
+
+    class DepPlugin(PluginFeature):
+        @property
+        def plugin_id(self):
+            return "dep_user"
+
+        @property
+        def dependencies(self):
+            return ["boom"]
+
+        @property
+        def parameter_schema(self):
+            return {}
+
+        def calculate(self, df, params, context=None):
+            return {"feature_store_payload": {}, "chart_render_payload": {}}
+
+    return DepPlugin()
+
+
+def main():
+    import pandas as pd
+    from analytics.features.feature_builder import (
+        PluginExecutor,
+        PluginRegistry,
+        PluginExecutionError,
+        FeatureBuilder,
+        invalidate_feature_cache,
+        feature_cache_last_invalidated,
+    )
+    from analytics.engine.set_evaluator import ServiceSetEvaluator
+    from analytics.features.plugins.base_plugin import PluginContext
+
+    df = pd.DataFrame({
+        "time": [1000, 1060, 1120],
+        "open": [100.0, 100.5, 101.0],
+        "high": [101.0, 101.5, 102.0],
+        "low": [99.0, 99.5, 100.0],
+        "close": [100.2, 100.8, 101.3],
+    })
+
+    registry = PluginRegistry()
+    # Test-Plugins injizieren (werden am Ende entfernt)
+    registry.plugins["boom"] = make_boom_plugin()
+    registry.plugins["bad_validate"] = make_bad_validate_plugin()
+    registry.plugins["dep_user"] = make_dep_plugin()
+
+    try:
+        # ---------------------------------------------------------------- 1.
+        print("\n=== 1. Executor-Fehlerkapselung (stages) ===")
+        ex = PluginExecutor(registry)
+
+        # resolve
+        try:
+            ex.execute("gibt_es_nicht", df, {})
+            check("resolve: keine Exception", False)
+        except PluginExecutionError as e:
+            check("resolve: stage", e.info.stage == "resolve",
+                  f"({e.info.stage})")
+            check("resolve: plugin_id", e.info.plugin_id == "gibt_es_nicht")
+            check("resolve: strukturiert", bool(e.info.traceback)
+                  and e.info.exception_type == "KeyError")
+
+        # calculate
+        ctx = PluginContext(symbol="SILVER", timeframe="H1",
+                            instance_id="i1", timestamp=12345)
+        try:
+            ex.execute("boom", df, {}, context=ctx)
+            check("calculate: keine Exception", False)
+        except PluginExecutionError as e:
+            check("calculate: stage", e.info.stage == "calculate",
+                  f"({e.info.stage})")
+            check("calculate: exception_type",
+                  e.info.exception_type == "RuntimeError")
+            check("calculate: Kontext propagiert",
+                  e.info.symbol == "SILVER" and e.info.timeframe == "H1"
+                  and e.info.instance_id == "i1" and e.info.bar_time == 12345,
+                  f"({e.info.symbol}/{e.info.timeframe}/i={e.info.instance_id}/"
+                  f"t={e.info.bar_time})")
+            # P14-03 Schritt 2.2: to_service_error_log() liefert das
+            # ServiceErrorLog-TypedDict (alle 8 Pflichtfelder).
+            slog = e.info.to_service_error_log()
+            from analytics.features.plugins.base_plugin import ServiceErrorLog
+            required = {"timestamp", "plugin_id", "instance_id", "symbol",
+                        "timeframe", "bar_time", "exception", "traceback"}
+            check("1x: to_service_error_log() -> alle 8 Felder",
+                  set(slog.keys()) == required, f"(keys={set(slog.keys())})")
+            check("1y: to_service_error_log() Werte korrekt",
+                  slog["plugin_id"] == "boom" and slog["symbol"] == "SILVER"
+                  and slog["timeframe"] == "H1" and slog["bar_time"] == 12345
+                  and slog["exception"].startswith("RuntimeError")
+                  and bool(slog["traceback"]),
+                  f"(plugin={slog['plugin_id']}, exc={slog['exception']})")
+
+        # validate_params
+        try:
+            ex.execute("bad_validate", df, {}, context=ctx)
+            check("validate_params: keine Exception", False)
+        except PluginExecutionError as e:
+            check("validate_params: stage",
+                  e.info.stage == "validate_params", f"({e.info.stage})")
+            check("validate_params: exception_type",
+                  e.info.exception_type == "ValueError")
+
+        # dependency (plugin-level)
+        try:
+            ex.execute("dep_user", df, {}, context=ctx)
+            check("dependency: keine Exception", False)
+        except PluginExecutionError as e:
+            check("dependency: stage", e.info.stage == "dependency",
+                  f"({e.info.stage})")
+            check("dependency: plugin_id der Dep",
+                  e.info.plugin_id == "boom", f"({e.info.plugin_id})")
+
+        # ---------------------------------------------------------------- 2.
+        print("\n=== 2. Resilient: Skip-Logic (unabhängige laufen weiter) ===")
+        ev = ServiceSetEvaluator(ex)
+        definition = {
+            "execution_order": ["grid_1", "prox_1", "bad_1"],
+            "services": {
+                "grid_1": {"plugin_id": "grid_lines", "lookback": 3,
+                           "params": {"step_size": 1.0, "steps_around": 1}},
+                "prox_1": {"plugin_id": "proximity", "lookback": 3,
+                           "depends_on": ["grid_1"],
+                           "params": {"visit_pct": 0.5,
+                                      "use_time_filter": False}},
+                "bad_1": {"plugin_id": "boom", "lookback": 3},
+            },
+        }
+        rctx = PluginContext(symbol="SILVER", timeframe="H1", mode="batch")
+        res = ev.execute_set_resilient(definition, df, context=rctx)
+        check("2a: grid_1 erfolgreich", "grid_1" in res)
+        check("2b: prox_1 erfolgreich", "prox_1" in res)
+        check("2c: bad_1 fehlt im Ergebnis", "bad_1" not in res)
+        check("2d: bad_1 skip_reason 'error'",
+              ev.last_skipped.get("bad_1") == "error",
+              f"(={ev.last_skipped.get('bad_1')})")
+        check("2e: last_errors strukturiert",
+              "bad_1" in ev.last_errors
+              and ev.last_errors["bad_1"].exception_type == "RuntimeError")
+
+        # ---------------------------------------------------------------- 3.
+        print("\n=== 3. Dependency-Skip ===")
+        def3 = {
+            "execution_order": ["grid_1", "prox_1"],
+            "services": {
+                "grid_1": {"plugin_id": "boom", "lookback": 3},
+                "prox_1": {"plugin_id": "proximity", "lookback": 3,
+                           "depends_on": ["grid_1"],
+                           "params": {"visit_pct": 0.5,
+                                      "use_time_filter": False}},
+            },
+        }
+        rctx3 = PluginContext(symbol="SILVER", timeframe="H1", mode="batch")
+        res3 = ev.execute_set_resilient(def3, df, context=rctx3)
+        check("3a: grid_1 fehlgeschlagen",
+              ev.last_skipped.get("grid_1") == "error")
+        check("3b: prox_1 dependency_failed",
+              ev.last_skipped.get("prox_1") == "dependency_failed",
+              f"(={ev.last_skipped.get('prox_1')})")
+        check("3c: prox_1 nicht ausgeführt", "prox_1" not in res3)
+
+        # ---------------------------------------------------------------- 4.
+        print("\n=== 4. RAM-Quarantäne (3 aufeinanderfolgende Fehler) ===")
+        ev4 = ServiceSetEvaluator(ex)
+        def4 = {
+            "execution_order": ["bad_1"],
+            "services": {"bad_1": {"plugin_id": "boom", "lookback": 3}},
+        }
+        for i in range(3):
+            rc = PluginContext(mode="batch")
+            ev4.execute_set_resilient(def4, df, context=rc)
+        check("4a: Zähler = 3", ev4._failure_counters.get("bad_1") == 3,
+              f"(={ev4._failure_counters.get('bad_1')})")
+        check("4b: quarantined gesetzt", "bad_1" in ev4._quarantined)
+        rc4 = PluginContext(mode="batch")
+        ev4.execute_set_resilient(def4, df, context=rc4)
+        check("4c: 4. Aufruf -> 'quarantined'",
+              ev4.last_skipped.get("bad_1") == "quarantined",
+              f"(={ev4.last_skipped.get('bad_1')})")
+
+        # ---------------------------------------------------------------- 5.
+        print("\n=== 5. Auto-Recovery (Zähler nach 300 s) ===")
+        ev4._last_failure_time["bad_1"] = time.time() - 400.0
+        ev4._is_quarantined("bad_1")
+        check("5a: Zähler zurückgesetzt",
+              "bad_1" not in ev4._failure_counters)
+        check("5b: Quarantäne bleibt (Session)",
+              "bad_1" in ev4._quarantined)
+
+        # ---------------------------------------------------------------- 6.
+        print("\n=== 6. reset() ===")
+        ev4.reset()
+        check("6a: Quarantäne geleert", not ev4._quarantined)
+        check("6b: Zähler geleert", not ev4._failure_counters)
+        check("6c: Diagnose geleert", not ev4.last_skipped
+              and not ev4.last_errors)
+
+        # ---------------------------------------------------------------- 7.
+        print("\n=== 7. State-Fallback (alter shared_state bleibt) ===")
+        ev7 = ServiceSetEvaluator(ex)
+        def7_ok = {
+            "execution_order": ["grid_1"],
+            "services": {"grid_1": {"plugin_id": "grid_lines", "lookback": 3,
+                                    "params": {"step_size": 1.0,
+                                               "steps_around": 1}}},
+        }
+        rc7 = PluginContext(symbol="SILVER", timeframe="H1", mode="batch")
+        ev7.execute_set_resilient(def7_ok, df, context=rc7)
+        old_lines = rc7.shared_state.get("grid_1")
+        check("7a: grid_1 Raster im shared_state", isinstance(old_lines, list)
+              and len(old_lines) > 0)
+        def7_bad = {
+            "execution_order": ["grid_1"],
+            "services": {"grid_1": {"plugin_id": "boom", "lookback": 3}},
+        }
+        ev7.execute_set_resilient(def7_bad, df, context=rc7)
+        check("7b: Fehler markiert", ev7.last_skipped.get("grid_1") == "error")
+        check("7c: alter shared_state-Eintrag erhalten (Fallback)",
+              rc7.shared_state.get("grid_1") == old_lines)
+
+        # ---------------------------------------------------------------- 8.
+        print("\n=== 8. Cache-Invalidierung (Invariante 13) ===")
+        import duckdb
+        if os.path.exists(ANALYTICS_DB):
+            os.remove(ANALYTICS_DB)
+        fb = FeatureBuilder()
+        # Rohe Connection: store_plugin_payload(con=...) schliesst die
+        # uebergebene Connection selbst (own_connection=True, Bestands-Logik)
+        # – daher hier KEINE DbPool-Connection verwenden.
+        con = duckdb.connect(ANALYTICS_DB)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS feature_store (
+                symbol VARCHAR NOT NULL,
+                timeframe VARCHAR NOT NULL,
+                bar_time TIMESTAMPTZ NOT NULL,
+                feature_id VARCHAR,
+                plugin_version VARCHAR,
+                feature_data JSON,
+                PRIMARY KEY (symbol, timeframe, bar_time)
+            )
+        """)
+        invalidate_feature_cache("SILVER", "H1")
+        before = feature_cache_last_invalidated("silver", "h1")
+        time.sleep(0.01)
+        n = fb.store_plugin_payload(
+            "SILVER", "H1",
+            {"feature_id": "proximity", "plugin_version": "1.0.0",
+             "records": [{"bar_time": 1000, "is_hit": False,
+                          "levels_hit": []}]},
+            con=con,
+        )
+        after = feature_cache_last_invalidated("SILVER", "H1")
+        check("8a: store_plugin_payload schreibt", n == 1)
+        check("8b: Invalidation nach store", after is not None
+              and before is not None and after > before,
+              f"(before={before}, after={after})")
+        # con wurde von store_plugin_payload geschlossen – fuer Schritt 10
+        # eine neue rohe Connection oeffnen.
+        con = duckdb.connect(ANALYTICS_DB)
+
+        # ---------------------------------------------------------------- 9.
+        print("\n=== 9. schema_version im Proximity-Payload ===")
+        from analytics.features.definitions.proximity_service import ProximityService
+        from analytics.features.definitions.grid_lines_service import GridLinesService
+        svc = GridLinesService()
+        df_pp = df.copy()
+        pctx = PluginContext(symbol="SILVER", timeframe="H1", mode="batch",
+                             instance_id="grid_1")
+        pctx.shared_state["grid_1"] = [{"price": 100.0}, {"price": 101.0}]
+        pres = svc.calculate(df_pp, {"step_size": 1.0, "steps_around": 1},
+                             context=pctx)
+        grid_lines = pctx.shared_state.get("grid_1")
+        check("9a: grid_lines Raster geschrieben", isinstance(grid_lines, list)
+              and len(grid_lines) >= 2)
+        prox = ProximityService()
+        prctx = PluginContext(symbol="SILVER", timeframe="H1", mode="batch",
+                              instance_id="prox_1", depends_on=["grid_1"])
+        prctx.shared_state["grid_1"] = grid_lines
+        pp = prox.calculate(df_pp, {"visit_pct": 0.5, "use_time_filter": False},
+                            context=prctx)
+        meta = pp["feature_store_payload"].get("metadata") or {}
+        check("9b: schema_version in metadata",
+              meta.get("schema_version") == "1.0.0",
+              f"(={meta.get('schema_version')})")
+        check("9c: feature_id/plugin_version",
+              pp["feature_store_payload"].get("feature_id") == "proximity")
+
+        # ---------------------------------------------------------------- 10.
+        print("\n=== 10. Indikator-Lesepfad (feature_store, definierter Fallback) ===")
+        from chart.indicators.grid_liquidity import GridLiquidityIndicator
+        ind = GridLiquidityIndicator()
+        # Fallback ohne Daten
+        empty = ind.read_proximity_from_feature_store(
+            "SILVER", "H1", db_path=ANALYTICS_DB)
+        check("10a: Fallback [] ohne feature_data", empty == [])
+        # Hit-Zeile einfügen (anderer bar_time als Schritt 8 – PK-Konflikt vermeiden)
+        con.execute("""
+            INSERT INTO feature_store
+                (symbol, timeframe, bar_time, feature_id, plugin_version, feature_data)
+            VALUES (?, ?, TIMESTAMPTZ 'epoch' + (? * INTERVAL 1 SECOND),
+                    'proximity', '1.0.0', ?)
+        """, ["SILVER", "H1", 2000,
+              '{"is_hit": true, "levels_hit": [100.0, 101.5], '
+              '"in_time_window": true, "schema_version": "1.0.0"}'])
+        circles = ind.read_proximity_from_feature_store(
+            "SILVER", "H1", db_path=ANALYTICS_DB)
+        check("10b: Hit-Kreise gelesen", len(circles) == 2,
+              f"(len={len(circles)})")
+        check("10c: price aus levels_hit",
+              all(c["price"] in (100.0, 101.5) for c in circles))
+        check("10d: in_window propagiert",
+              all(c["in_window"] is True for c in circles))
+
+        # ---------------------------------------------------------------- 11.
+        print("\n=== 11. LiveAnalyzer persistenter Context (A.1.2) ===")
+        from analytics.background_workers.live_analyzer import LiveAnalyzer
+        la = LiveAnalyzer(symbol="SILVER", timeframe="M1")
+        check("11a: _live_context vorhanden",
+              la._live_context.mode == "live"
+              and la._live_context.symbol == "SILVER")
+        check("11b: shared_state persistiert (identisches Objekt)",
+              la._live_context.shared_state is la._live_shared_state)
+        # Buffer schreiben -> bleibt im Context erhalten
+        la._live_shared_state["grid_lines"] = [{"price": 100.0}]
+        check("11c: Buffer über Context erreichbar",
+              la._live_context.shared_state.get("grid_lines") == [{"price": 100.0}])
+
+    finally:
+        # Test-Plugins aus der Singleton-Registry entfernen
+        for pid in ("boom", "bad_validate", "dep_user"):
+            registry.plugins.pop(pid, None)
+
+    print("-" * 60)
+    if failures:
+        print("BEFUND: " + "; ".join(failures))
+        sys.exit(1)
+    print("BEFUND: Fehlerkapselung (4 stages), Skip-Logic, Dependency-Skip, "
+          "RAM-Quarantäne, Auto-Recovery, reset(), State-Fallback, "
+          "Cache-Invalidierung, schema_version, Indikator-Lesepfad & "
+          "LiveAnalyzer-Context OK.")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
 
 ```
 
@@ -40291,6 +42103,16 @@ print("LOCKTEST FERTIG")
           <widget class="QPushButton" name="btn_add_instance">
            <property name="text">
             <string>Hinzufügen</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btn_reload_plugins">
+           <property name="text">
+            <string>Plugins neu laden</string>
+           </property>
+           <property name="toolTip">
+            <string>P14-02: Lädt Custom-Plugins aus data/custom_plugins/ neu (Hot-Reload). Laufende Berechnungen laufen auf ihren bisherigen Objekten weiter; neue Instanziierungen nutzen die neuen Klassen.</string>
            </property>
           </widget>
          </item>
