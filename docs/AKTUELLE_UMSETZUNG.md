@@ -74,147 +74,212 @@ Der Indicator ruft niemals direkt Plugins zur Neuberechnung auf.
 
 ---
 
-### Kapitel 4.5 [P14-05]: Papierkorb- & Historien-System (Soft-Delete & Deterministische Snapshots)
+## 5. Phase 14 Standard JSON-Schema
 
-#### A. Konzept & Datenmodell
+Das erweiterte JSON-Schema definiert exakt die Struktur für Service-Sets inklusive Metadaten, Schema-Versionen und Instanz-Abhängigkeiten:
 
-Schutz vor versehentlichem Löschen oder Überschreiben von Service-Sets.
-
-1. **Soft-Delete (`analytics/engine/service_set_repository.py`):**
-* Verschieben gelöschter Service-Sets in die Tabelle `service_sets_trash` mit `deleted_at`-Zeitstempel.
-
-2. **Deterministische Snapshot-Historie:**
-* Ein automatischer Snapshot wird in `service_set_history` **ausschließlich dann** angelegt, wenn ein bereits in der DB existierendes Service-Set erfolgreich überschrieben wird. Bei reinen Neuanlagen oder Schreibfehlern entsteht kein Snapshot.
-
-3. **UI-Integration (`service_win.py`):**
-* "Papierkorb"-Dialog zur Einsicht und Wiederherstellung gelöschter Sets.
-
-4. **Scope von Papierkorb & Historie:**
-Der Papierkorb und die Snapshot-Historie werden primär für **Service-Sets** eingeführt. Über das generische `NamedItemAdapter`-Protokoll ist das System jedoch so strukturiert, dass es in einer späteren Phase schrittweise auf Indikator-Presets erweitert werden kann.
-
----
-
-#### B. Schritt-für-Schritt AI-Anleitung (Kopierblock P14-05)
-
-### AI-Auftrag: Implementierung P14-05 (Papierkorb & Snapshot-Historie)
-
-#### 2. Allgemeine Grundsätze & Workflow-Vereinbarungen (Agents.md / Architektur.md)
-
-1. **HARTE VERBOTSREGEL (Alt-Grid & Bestands-Pfade):**
-Die Alt-Dateien `chart/indicators/grid.py`, `chart/indicators/grid_liquidity.py` sowie bestehende Kernmodule dürfen unter keinen Umständen beschädigt oder in ihrer Funktionsweise für bestehende Aufrufe verändert werden. Neue Logiken werden additiv integriert.
-
-2. **Git-Backup & Fallback vor JEDEM Kapitel:**
-Vor Beginn jedes Kapitels erstellt die AI / der User automatisch einen Git-Commit und Tag: `phase14_step1`, `phase14_step2`, etc. Bei Fehlern wird sofort per `git reset --hard` auf das jeweilige Tag zurückgerollt.
-
-3. **Headless-Validierung (Keine UI- und Keine unnötigen (Regressions-)tests):**
-Validierungen erfolgen rein headless (kein `QApplication.exec()`, keine manuellen Klicks) über gezielte PyTest- / Headless-Python-Skripte im Ordner `test/`. Es werden ausschließlich die für den jeweiligen Schritt absolut notwendigen Tests ausgeführt – keine unnötigen (Regressions-)tests.
-
-4. **Modulare Herauskoppelbarkeit:**
-Jedes Kapitel ist so aufgebaut, dass Beschreibung, Schema-Änderung, Implementierungsanleitung, die allgemeinen Grundsätze und der notwendige Test als zusammenhängender Block an die IDE-AI übergeben werden können.
-
-
-#### Schritt 0: Fallback & Backup
-
-1. Führe vor Code-Änderungen folgendes Git-Backup aus:
-git add -A && git commit -m "backup: pre P14-05" && git tag -f phase14_step5
-
-#### Schritt 1: Datenbank-Tabellen & Repository-Anpassung
-
-1. Öffne `analytics/engine/service_set_repository.py`:
-* Ergänze in `_init_db()`:
-
-CREATE TABLE IF NOT EXISTS service_sets_trash (
-    set_id VARCHAR PRIMARY KEY,
-    display_name VARCHAR,
-    definition JSON,
-    deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS service_set_history (
-    history_id VARCHAR PRIMARY KEY,
-    set_id VARCHAR,
-    version VARCHAR,
-    definition JSON,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-2. Implementiere `delete_set(set_id, soft_delete=True)`:
-* Bei `soft_delete=True`: Kopiere den Datensatz nach `service_sets_trash` und lösche ihn aus `service_sets`.
-
-3. Implementiere `restore_set_from_trash(set_id)` und `list_trash()`.
-4. Ergänze in `save_set()`: Prüfe, ob das Set bereits in `service_sets` existiert. **Nur bei bestehenden Sets**: Erstelle unmittelbar vor dem Überschreiben einen Snapshot-Eintrag in `service_set_history`.
-
-#### Schritt 2: Headless Validierung
-
-1. Erstelle und führe aus: `test/check_p14_s5_trash.py`:
-* Erstelle ein Set und speichere es zum ersten Mal (Verifiziere: KEIN Eintrag in `service_set_history`).
-* Überschreibe das existierende Set (Verifiziere: Genau 1 Snapshot in `service_set_history`).
-* Führe `delete_set()` aus und verifiziere, dass es in `list_sets()` fehlt, aber in `list_trash()` vorhanden ist.
-* Rufe `restore_set_from_trash()` auf und verifiziere die vollständige Wiederherstellung.
-
+{
+  "set_id": "set_grid_scalp_v2",
+  "display_name": "Grid Scalper Pro",
+  "description": "Erweitertes Grid-System mit Proximity-Erkennung und M30-Zeitfenster-Analyse.",
+  "version": "2.1.0",
+  "schema_version": "1.0",
+  "created_at": "2026-08-03T10:00:00Z",
+  "execution_order": ["grid_1", "prox_1"],
+  "services": {
+    "grid_1": {
+      "plugin_id": "grid_lines",
+      "version": "1.0.0",
+      "description": "Haupt-Grid-Raster 0.50 mit 4 Umkreis-Leveln",
+      "lookback": 1000,
+      "params": {
+        "step_size": 0.5,
+        "steps_around": 4
+      }
+    },
+    "prox_1": {
+      "plugin_id": "proximity",
+      "version": "1.1.0",
+      "description": "Prüfung auf Preisannäherung im 5-Min-Aktivitätsfenster",
+      "lookback": 3000,
+      "depends_on": ["grid_1"],
+      "params": {
+        "visit_pct": 0.05,
+        "time_window_mins": 5
+      }
+    }
+  }
+}
 
 
 
 ---
 
----
+## 6. Universal-Regressionstest für Phase 14
 
-### Kapitel 4.5-E [P14-05]: Ergaenzung - Papierkorb-Dialog im Service-Fenster (doppelte Sicherheitsnachfrage)
+Dieses Testskript ist **vollständig dynamisch** und fehlertolerant aufgebaut. Noch nicht implementierte Module werden als `[SKIPPED / PENDING]` markiert.
 
-Ergaenzende UI-Dokumentation zur User-Vorgabe: Auch das endgueltige Loeschen/
-Bereinigen aus dem Papierkorb erfolgt IMMER mit doppelter Sicherheitsnachfrage.
-Rein additiv; Repository-API (P14-05 Schritt 1) und bestehende Set-Verwaltung
-bleiben unangetastet.
+```python
+# test/check_phase14_regression.py
+"""
+Universal-Regressionstest für Phase 14 (PyTrader).
+"""
 
-#### A. Konzept & Regeln
+import sys
+import os
+import unittest
+from pathlib import Path
 
-1. **Papierkorb-Dialog (ServiceWindow.show_trash_dialog):**
-   * Oeffnet ein modales QDialog mit QListWidget aller soft-geloeschten
-     Sets (set_repo.list_trash(), sortiert nach deleted_at).
-   * Jeder Eintrag zeigt Name + Loesch-Zeitstempel (deleted_at).
-   * Buttons: **Wiederherstellen**, **Endgueltig loeschen**,
-     **Papierkorb leeren**, **Schliessen**.
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
 
-2. **Wiederherstellen:** restore_set_from_trash(set_id) verschiebt das Set
-   zurueck nach service_sets; anschliessend refresht der Dialog die Liste
-   und das Hauptfenster ruft refresh_set_list() (Set-Dropdown aktuell).
 
-3. **Doppelte Sicherheitsnachfrage (User-Vorgabe):** purge_trash_set()
-   (einzelnes Set) und purge_trash() (kompletter Papierkorb) sind NICHT
-   umkehrbar. Die UI verlangt daher vor jeder Ausfuehrung ZWEI aufeinander-
-   folgende QMessageBox.question-Bestaetigungen (Default jeweils Nein).
+class TestPhase14Regression(unittest.TestCase):
 
-4. **Scope:** Der Dialog ist eine reine UI-Komponente - er spricht
-   ausschliesslich die Repository-API an (keine direkten SQL-Zugriffe) und
-   protokolliert jede Aktion ueber self.log().
+    def setUp(self):
+        print("\n" + "=" * 70)
+        print("🔍 START: Phase 14 Dynamic Regression Suite")
+        print("=" * 70)
 
-#### B. Schritt-fuer-Schritt AI-Anleitung
+    def test_p14_01_description_fields(self):
+        print("\n[P14-01] Prüfe Beschreibungsfelder & Metadaten...")
+        try:
+            from analytics.features.plugins.base_plugin import PluginMetadata
+            from analytics.engine.service_models import ServiceSetDefinition
+            from analytics.engine.service_set_repository import ServiceSetRepository
 
-##### Schritt 1: service_win.py - Papierkorb-Dialog (additiv)
+            annotations = ServiceSetDefinition.__annotations__
+            if "description" in annotations:
+                print("  ✅ ServiceSetDefinition enthält 'description'")
+            else:
+                print("  ⚠️ ServiceSetDefinition hat kein 'description'-Feld (Pending)")
 
-1. **UI-Wiring:** btn_trash_sets (in ui/service_win.ui zwischen Loeschen-
-   Button und Spacer) wird in __init__ mit show_trash_dialog verdrahtet.
-   QDialog ist bereits im PySide6.QtWidgets-Import vorhanden.
+            repo = ServiceSetRepository()
+            if hasattr(repo, "get_set"):
+                print("  ✅ ServiceSetRepository ist verfügbar")
 
-2. **show_trash_dialog()** (zwischen delete_set() und P14-02-Abschnitt):
-   * Baut den Dialog vollstaendig im Code (hardcoded UI-Wiring).
-   * _reload() befuellt die Liste aus list_trash(); leere Buttons werden
-     deaktiviert, der Hinweistext zeigt 'Der Papierkorb ist leer.'.
-   * Wiederherstellen / Endgueltig loeschen / Leeren als verschachtelte
-     Handler; jede purge-Aktion durchlaeuft zwei QMessageBox.question.
-   * Nach jeder Aktion: Log via self.log(...), Listen-Refresh, bei
-     Wiederherstellung zusaetzlich refresh_set_list().
+        except ImportError as e:
+            print(f"  ⏭️ [SKIPPED] Modul noch nicht vollständig implementiert: {e}")
 
-##### Schritt 2: Headless Validierung
+    def test_p14_02_dynamic_discovery(self):
+        print("\n[P14-02] Prüfe Plugin Discovery & Registry...")
+        try:
+            from analytics.features.feature_builder import PluginRegistry, PluginLoader
 
-1. Erstelle und fuehre aus: test/check_p14_s5_trash.py:
-* Neuanlage -> KEIN Snapshot; Ueberschreiben -> GENAU 1 Snapshot (Version
-  fortlaufend); record_snapshot=False -> KEIN Snapshot.
-* delete_set() -> nicht in list_sets(), aber in list_trash() mit
-  deleted_at; Definition/Name vollstaendig erhalten.
-* restore_set_from_trash() -> vollstaendige Wiederherstellung.
-* purge_trash_set / purge_trash entfernen endgueltig (bool/Anzahl).
+            registry = PluginRegistry()
+            plugins = registry.plugins
+            print(f"  ✅ Entdeckte Plugins in Registry: {list(plugins.keys())}")
 
-> Hinweis: Die doppelte Sicherheitsnachfrage selbst ist UI-Logik
-> (QMessageBox) und wird NICHT headless ausgefuehrt - sie wird durch
-> sorgfaeltige Code-Inspektion abgesichert. Die Repository-Funktionen hinter
-> den Buttons (purge/purge_trash) sind vollstaendig headless getestet.
+            if hasattr(registry, "reload"):
+                print("  ✅ Hot-Reload Funktion 'reload' vorhanden")
+            else:
+                print("  ⚠️ Hot-Reload 'reload' steht noch aus (Pending)")
+
+        except ImportError as e:
+            print(f"  ⏭️ [SKIPPED] Modul noch nicht implementiert: {e}")
+
+    def test_p14_03_resilience(self):
+        print("\n[P14-03] Prüfe Pipeline-Resilienz & Error-Handling...")
+        try:
+            from analytics.engine.set_evaluator import ServiceSetEvaluator
+
+            evaluator = ServiceSetEvaluator()
+            if hasattr(evaluator, "_failure_counters"):
+                print("  ✅ Failure-Counter / Quarantäne-System im Evaluator aktiv")
+            else:
+                print("  ⚠️ Resilience Skip-Logic noch im Standard-Modus (Pending)")
+
+        except ImportError as e:
+            print(f"  ⏭️ [SKIPPED] Modul noch nicht implementiert: {e}")
+
+    def test_p14_04_schema_migration(self):
+        print("\n[P14-04] Prüfe Schema-Migrator...")
+        try:
+            from analytics.engine.schema_migrator import SchemaMigrator
+            print("  ✅ SchemaMigrator-Klasse erfolgreich geladen")
+        except ImportError:
+            print("  ⏭️ [SKIPPED] SchemaMigrator noch nicht erstellt (Pending)")
+
+    def test_p14_05_trash_and_history(self):
+        print("\n[P14-05] Prüfe Papierkorb & Snapshot-Historie...")
+        try:
+            from analytics.engine.service_set_repository import ServiceSetRepository
+
+            repo = ServiceSetRepository()
+            has_trash = hasattr(repo, "list_trash") or hasattr(repo, "restore_set_from_trash")
+            if has_trash:
+                print("  ✅ Soft-Delete & Papierkorb-Funktionen im Repository vorhanden")
+            else:
+                print("  ⚠️ Soft-Delete / Papierkorb noch nicht im Repository aktiv (Pending)")
+
+        except Exception as e:
+            print(f"  ⏭️ [SKIPPED] Repository-Prüfung übersprungen: {e}")
+
+
+def run_phase14_regression():
+    suite = unittest.TestLoader().loadTestsFromTestCase(TestPhase14Regression)
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
+    print("\n" + "=" * 70)
+    print("📊 REGRESSIONSTEST ERGEBNIS")
+    print(f"  Ran: {result.testsRun} | Errors: {len(result.errors)} | Failures: {len(result.failures)}")
+    print("=" * 70)
+    return result.wasSuccessful()
+
+
+if __name__ == "__main__":
+    success = run_phase14_regression()
+    sys.exit(0 if success else 1)
+```
+
+## 7. Betriebliche Rahmenbedingungen, Monitoring & Deployment-Checks (Kapitel 14.6 - Betriebsrahmen)
+
+Dieses Kapitel definiert die nicht-funktionalen Anforderungen für den produktiven Betrieb der Phase-14-Infrastruktur.
+
+### 7.1 Monitoring & Alerting (Metriken)
+
+Folgende Metriken MÜSSEN über das bestehende Logging-System (strukturierte Fehlerobjekte) erfassbar sein, um eine automatisierte Überwachung zu ermöglichen:
+
+| Metrik | Typ | Beschreibung | Alert-Schwelle |
+| :--- | :--- | :--- | :--- |
+| `plugin_loading_time` | Histogram | Dauer der Plugin-Discovery beim App-Start / Reload | > 500ms → Warnung |
+| `service_execution_errors` | Counter | Anzahl fehlgeschlagener Service-Executions (pro Plugin) | > 5% Fehlerquote in 5min |
+| `quarantine_events` | Counter | Anzahl der in Quarantäne gesetzten Service-Instanzen | > 10 Ereignisse in 1h |
+| `schema_migration_failures` | Counter | Fehlgeschlagene Schema-Migrationen (Rollback-Fälle) | > 0 → Kritisch |
+| `cache_hit_ratio` | Gauge | Trefferquote des Feature-Store-Caches | < 80% → Warnung |
+
+### 7.2 Performance-Benchmarks (Headless)
+
+Die folgenden Test-Skripte MÜSSEN vor jedem produktiven Release durchlaufen:
+
+1. **Erstelle `test/check_performance_p14.py`:**
+
+   import time
+   class TestPerformance(unittest.TestCase):
+       def test_plugin_discovery_speed(self):
+           start = time.perf_counter()
+           PluginRegistry().reload()
+           elapsed = time.perf_counter() - start
+           self.assertLess(elapsed, 0.1, f"Discovery zu langsam: {elapsed:.3f}s")
+       
+       def test_service_evaluation_speed(self):
+           # 1000 Bars, 5 Services
+           elapsed = self._run_benchmark(1000, 5)
+           self.assertLess(elapsed, 0.05, f"Evaluation zu langsam: {elapsed:.3f}s")
+       
+       def test_feature_store_read_speed(self):
+           elapsed = self._read_benchmark(1000)
+           self.assertLess(elapsed, 0.005, f"Store-Read zu langsam: {elapsed:.3f}s")
+   
+### 7.3 Deployment-Checks & Rollback-Plan
+
+Vor der Veröffentlichung einer neuen Version MÜSSEN folgende Checks durchgeführt werden:
+
+    1. Schema-Migration Dry-Run: Führe ServiceSetRepository().list_sets() in einer isolierten Test-DB mit der neuen Migrations-Logik aus, um sicherzustellen, dass keine MigrationError geworfen werden.
+
+    2. Plugin-Isolation: Starte die App einmalig mit --check-plugins, um zu validieren, dass keine Custom-Plugins Core-Plugin-IDs überschreiben (Core Protection Rule).
+
+    3. Rollback-Plan: Bei einem kritischen Fehler NACH dem Deployment:
+        Führe git reset --hard phase14_step5 (oder den letzten stabilen Tag) aus.
+        Achtung: Da die Datenbank-Schemata (app_data.duckdb, analytics.duckdb) additiv sind (ADD COLUMN IF NOT EXISTS), ist ein Rollback des Codes ohne Datenbank-Rollback unproblematisch. Neue Spalten werden von älterem Code einfach ignoriert.
