@@ -586,6 +586,31 @@ class PyTraderChartWindow(QMainWindow):
             except (RuntimeError, AttributeError):
                 pass
 
+        # P14-03-E (Flacker-Fix): calculate() resettet die _known_times der
+        # Indikatoren – die offene Live-Bar generisch wieder einfügen, damit
+        # der New-Candle-Callback nicht erneut feuert (Flacker-Zyklus).
+        self._reinject_live_bar_to_indicators()
+
+    def _reinject_live_bar_to_indicators(self) -> None:
+        """P14-03-E (Flacker-Fix): Fügt die offene Live-Bar-Zeit generisch in
+        die _known_times ALLER Indikatoren mit remember_live_time()-Hook wieder
+        ein. Wird NACH JEDEM calculate()-Aufruf ausgeführt – calculate() setzt
+        die _known_times aus den DB-Bars zurück (die offene Live-Bar ist noch
+        nicht in DuckDB) und ohne diese Re-Injektion feuert der New-Candle-
+        Callback des Indikators bei jedem Live-Tick erneut (500ms-Flacker-
+        Zyklus Live-Plot <-> Chart-Rebuild). Generisch über den Base-Hook
+        (Open/Closed), kein Plugin-Sonderfall."""
+        if self._live_bar_time is None:
+            return
+        for plugin in self.indicators.values():
+            rt = getattr(plugin, "remember_live_time", None)
+            if not callable(rt):
+                continue
+            try:
+                rt(self._live_bar_time)
+            except Exception:
+                continue
+
     def _serialize_and_render_grid(self, lines: list, circles: list) -> None:
         """Serialisiert Grid-Daten im Hintergrund-Thread und rendert sie.
         Alter Thread wird vor Neustart sauber beendet.
@@ -695,6 +720,10 @@ class PyTraderChartWindow(QMainWindow):
             # P14-03-E (PFLICHT, Pruefprotokoll P5): Offene Live-Kerze nach dem
             # Map-Rebuild re-injizieren – sonst feuert der New-Candle-Callback
             # bei jedem Tick erneut und die Flacker-Schleife bleibt bestehen.
+            # (remember_live_time-Re-Injektion erfolgt GENERISCH NACH dem
+            # calculate()-Loop weiter unten – calculate setzt die _known_times
+            # der Indikatoren aus den DB-Bars zurück und wuerde eine Re-Injektion
+            # VOR dem Loop wieder zunichte machen.)
             if (self._live_bar_time is not None
                     and self._live_bar_time not in self._time_real_to_cont):
                 last_cont = max(self._time_cont_to_real.keys())
@@ -705,10 +734,6 @@ class PyTraderChartWindow(QMainWindow):
                     lc = dict(self._live_candle_cont)
                     lc["time"] = cont
                     continuous_candles.append(lc)
-                # Auch dem Indikator die Live-Bar merken (verhindert erneuten Callback).
-                liq_ind = self.indicators.get("grid_liquidity")
-                if liq_ind is not None and hasattr(liq_ind, "remember_live_time"):
-                    liq_ind.remember_live_time(self._live_bar_time)
 
             import pandas as pd
             self.df_data = pd.DataFrame(clean_candles)
@@ -736,6 +761,16 @@ class PyTraderChartWindow(QMainWindow):
                             gc_t = gc.get("time")
                             if gc_t is not None and int(gc_t) in self._time_real_to_cont:
                                 gc["time"] = self._time_real_to_cont[int(gc_t)]
+
+        # P14-03-E (Flacker-Fix, generisch): plugin.calculate() setzt die
+        # _known_times der Indikatoren auf die DB-Bars zurück – die offene
+        # Live-Bar (noch nicht in DuckDB) geht dabei verloren. Würde sie nicht
+        # DANACH wieder eingefügt, feuert der New-Candle-Callback bei jedem
+        # Live-Tick (500ms) erneut und der Chart flackert im Wechsel
+        # Live-Plot <-> Chart-Rebuild (alte/leere Kerze). Re-Injektion über
+        # ALLE Indikatoren mit remember_live_time()-Hook (Open/Closed, kein
+        # Plugin-Sonderfall).
+        self._reinject_live_bar_to_indicators()
 
         update_package = {
             "symbol": self.current_symbol,
@@ -868,6 +903,14 @@ class PyTraderChartWindow(QMainWindow):
             self._live_candle_cont = dict(c_copy)
         else:
             c_copy["time"] = rounded_t
+
+        # P14-03-E (Flacker-Fix): Live-Kerzen-State bei JEDEM Tick der offenen
+        # Bar aktualisieren (nicht nur beim ersten Tick). Die Pflicht-Re-Injektion
+        # im Rebuild nutzt sonst den OHLC-Stand des ERSTEN Ticks – der Rebuild
+        # zeichnete kurzzeitig eine veraltete/leere Erst-Tick-Kerze ("dünne
+        # Linie") statt der aktuellen offenen Kerze.
+        if self._live_bar_time is not None and rounded_t == self._live_bar_time:
+            self._live_candle_cont = dict(c_copy)
 
         # P14-03-E (D.1c): Overlays ALLER aktiven Indikatoren generisch über den
         # get_live_overlays()-Hook einsammeln (Open/Closed – kein Sonderfall pro Plugin).

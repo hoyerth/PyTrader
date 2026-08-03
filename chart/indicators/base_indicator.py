@@ -57,3 +57,13 @@ class BaseIndicator(ABC):
 		(chart_win) die Overlays ALLER aktiven Indikatoren generisch einsammelt –
 		kein Indikator-spezifischer Sonderfall pro Plugin."""
 		return []
+
+	def remember_live_time(self, ts: int) -> None:
+		"""P14-03-E (Flacker-Fix): Merkt eine offene Live-Bar-Zeit (gerundete
+		Epoch), damit der New-Candle-Erkennung des Plugins nach einem
+		calculate()-Rebuild die Live-Bar nicht als "neue Kerze" erscheint und der
+		debounced Refresh nicht erneut feuert. Basis-Default: no-op.
+		Plugin-Klassen mit New-Candle-Callback überschreiben diesen Hook
+		(Open/Closed), damit die Engine (chart_win) die Re-Injektion generisch
+		über ALLE Indikatoren ausführen kann – kein Indikator-Sonderfall."""
+		pass

@@ -358,12 +358,15 @@ c_copy["overlays"] = overlays
 
 d) In `_do_refresh_chart_data()` NACH dem Map-Aufbau (nach dem `for i, c in
    enumerate(clean_candles):`-Block, vor dem Erstellen von `update_package`) – die
-   PFLICHT-Re-Injektion der offenen Live-Kerze:
+   PFLICHT-Re-Injektion der offenen Live-Kerze (Map + Candle):
 
 ```python
 # P14-03-E (PFLICHT, Pruefprotokoll P5): Offene Live-Kerze nach dem Map-Rebuild
 # re-injizieren – sonst feuert der New-Candle-Callback bei jedem Tick erneut
 # und die Flacker-Schleife bleibt bestehen.
+# (Die remember_live_time-Re-Injektion erfolgt GENERISCH NACH dem calculate()-
+# Loop weiter unten – calculate setzt die _known_times der Indikatoren aus den
+# DB-Bars zurueck und wuerde eine Re-Injektion VOR dem Loop wieder zunichte machen.)
 if (self._live_bar_time is not None
         and self._live_bar_time not in self._time_real_to_cont):
     last_cont = max(self._time_cont_to_real.keys())
@@ -374,10 +377,6 @@ if (self._live_bar_time is not None
         lc = dict(self._live_candle_cont)
         lc["time"] = cont
         continuous_candles.append(lc)
-    # Auch dem Indikator die Live-Bar merken (verhindert erneuten Callback).
-    liq_ind = self.indicators.get("grid_liquidity")
-    if liq_ind is not None and hasattr(liq_ind, "remember_live_time"):
-        liq_ind.remember_live_time(self._live_bar_time)
 ```
 
 ##### 2. `analytics/background_workers/live_analyzer.py` – `run(self)`:
@@ -618,4 +617,37 @@ eingearbeitet:
   Live-Updates, nur verschwundene Level entfernt, leere Liste räumt auf, Change-Detection,
   Bar-Wechsel-Cache), Regression `check_p14_live_fixes.py` (14/14), `check_grid_parity.py`,
   `check_p14_precision_levels.py`, `check_time_utils.js`, `check_resolve_realtime.js`.
+- **P9 (Flacker-Fix – New-Candle-Callback-Zyklus nach neuer Kerze):** User-Befund nach P8:
+  direkt nach dem Erzeugen einer neuen Kerze flackert der Chart periodisch (~500ms) –
+  die neue Kerze wird aufgebaut, aber abwechselnd wird die ALTE Kerze ohne Neuplot
+  (meist als dünne Linie) gezeigt; das Flackern verschwindet erst nach einem
+  Service-Update. ROOT CAUSE (2 Stellen in `chart_win.py`):
+  1. **Reihenfolge-Fehler:** `_do_refresh_chart_data` rief `liq_ind.remember_live_time()`
+     VOR dem `calculate()`-Loop auf. `calculate()` setzt `self._known_times` aus den
+     DB-Bars zurück (`grid_liquidity.py: self._known_times = self._compute_known_times(df)`)
+     – die offene Live-Bar (noch NICHT in DuckDB) ging dabei verloren. Damit feuert der
+     New-Candle-Callback bei JEDEM Live-Tick (LiveTickWorker, main.py: 500ms) erneut →
+     debounce (400ms) → Chart-Rebuild → Flackern im Wechsel Live-Plot (neue Kerze) <-> Rebuild
+     (alte/leere Kerze). Erst wenn die Live-Bar durch einen Service-Update in der DB steht,
+     enthält `_known_times` sie → Callback stoppt → "Flackern verschwindet nach Service-Update".
+  2. **Hardcoding:** Die Re-Injektion war auf `self.indicators.get("grid_liquidity")`
+     hardcoded (Verstoß gegen die Generik-Regel).
+  3. **Veraltete Live-Kerze:** `_live_candle_cont` wurde nur beim ERSTEN Tick einer neuen
+     Bar gesetzt – der Rebuild reinjizierte die Kerze mit veraltetem OHLC-Stand (dünne Linie).
+  FIX (generisch):
+  1. `base_indicator.py`: `remember_live_time(ts)` als generischer Base-Hook (no-op Default),
+     analog zu `get_live_overlays` (Open/Closed).
+  2. `chart_win.py`: neue Methode `_reinject_live_bar_to_indicators()` – führt die
+     Live-Bar-Zeit generisch über ALLE Indikatoren mit `remember_live_time()`-Hook wieder ein
+     (kein Plugin-Sonderfall). Aufgerufen NACH JEDEM `calculate()`-Loop
+     (`_do_refresh_chart_data` UND `render_indicators`).
+  3. `chart_win.py update_live_candle`: `_live_candle_cont` wird bei JEDEM Tick der offenen
+     Bar aktualisiert (aktueller OHLC-Stand für die Re-Injektion).
+  Verifikation: `py_compile` auf den 3 Python-Dateien, headless
+  `test/check_p14_flacker_zyklus.py` (4 Checks: Base-Hook, Callback-1x-Logik +
+  calculate-Resetszenario + remember_live_time bricht Zyklus, Generik über alle Indikatoren,
+  statische Regression Reihenfolge/Hardcoding/`_live_candle_cont`), Regression
+  `check_p14_live_fixes.py` (14/14), `check_p14_grid_incremental.js` (14/14),
+  `check_grid_parity.py`, `check_p14_precision_levels.py`, `check_time_utils.js`,
+  `check_resolve_realtime.js`.
 
