@@ -693,6 +693,20 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             cfg = services.setdefault(iid, {"plugin_id": "", "lookback": 1000, "params": {}})
             cfg["description"] = ctrl.text().strip()
 
+        # Phase 14 P14-04: Semantische Versionierung – bei JEDER instance_id
+        # wird die aktuelle plugin.version aus der PluginRegistry eingestempelt
+        # (ServiceInstanceConfig.version). So trägt jede gespeicherte Instanz
+        # die Version des erzeugenden Plugins für den späteren Schema-Migrator.
+        # Kann ein Plugin nicht aufgelöst werden (z. B. deinstalliert), bleibt
+        # ein vorhandenes version-Feld bzw. dessen Fehlen unverändert erhalten.
+        for iid, cfg in services.items():
+            pid = cfg.get("plugin_id") or iid
+            try:
+                plugin = registry.get(pid)
+                cfg["version"] = getattr(plugin, "version", "0.0.0") or "0.0.0"
+            except KeyError:
+                pass
+
         return {
             "set_id": self._current_set_id or "",
             "display_name": self.edit_set_name.text().strip() if self.edit_set_name else "",
