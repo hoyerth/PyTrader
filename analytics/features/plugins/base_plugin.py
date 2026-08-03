@@ -152,6 +152,12 @@ class PluginMetadata(TypedDict):
     description: str
     author: str
     tags: List[str]
+    # Phase 14 P14-01: Erweiterte Beschreibungsfelder (Markdown-Hilfe,
+    # strukturierte Regeln und explizite API-Version). Defaults in
+    # PluginFeature.metadata: description_long="", condition_rules=[], api_version="1".
+    description_long: str
+    condition_rules: List[str]
+    api_version: str
 
 
 class PluginFeature(ABC):
@@ -174,7 +180,11 @@ class PluginFeature(ABC):
             "display_name": self.plugin_id.replace("_", " ").title(),
             "description": "",
             "author": "System",
-            "tags": []
+            "tags": [],
+            # Phase 14 P14-01: Defaults für die erweiterten Beschreibungsfelder
+            "description_long": "",
+            "condition_rules": [],
+            "api_version": "1",
         }
 
     @property

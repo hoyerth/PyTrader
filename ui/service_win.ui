@@ -210,6 +210,27 @@
         </layout>
        </item>
        <item>
+        <layout class="QHBoxLayout" name="layout_set_description">
+         <item>
+          <widget class="QLabel" name="label_set_description">
+           <property name="text">
+            <string>Beschreibung:</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLineEdit" name="edit_set_description">
+           <property name="placeholderText">
+            <string>Ausführliche Set-/Strategie-Beschreibung (optional)</string>
+           </property>
+           <property name="toolTip">
+            <string>Individuelle Anmerkung für dieses Service-Set (Phase 14 P14-01).</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
         <layout class="QHBoxLayout" name="layout_set_order">
          <item>
           <widget class="QListWidget" name="list_execution_order">
@@ -247,6 +268,16 @@
              </property>
              <property name="toolTip">
               <string>Markierten Service aus der Reihenfolge entfernen.</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QPushButton" name="btn_info_service">
+             <property name="text">
+              <string>ℹ Info</string>
+             </property>
+             <property name="toolTip">
+              <string>Zeigt die vollständigen Beschreibungsfelder der markierten Service-Instanz (Phase 14 P14-01).</string>
              </property>
             </widget>
            </item>

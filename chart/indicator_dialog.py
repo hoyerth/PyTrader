@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
 from chart.indicators.base_indicator import BaseIndicator
 from chart.widgets.color_button import ColorButton
 from chart.widgets.named_item_actions import NamedItemAdapter, NamedItemActionsMixin
+from analytics.engine.description_dialog import ServiceDescriptionDialog
 from state_manager import StateManager
 from scrollable_content import ContentScrollMixin
 
@@ -677,6 +678,13 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		self.combo_service_sel = QComboBox()
 		self.combo_service_sel.currentIndexChanged.connect(self._on_service_selected)
 		svc_row.addWidget(self.combo_service_sel)
+		# Phase 14 P14-01: Info-Button für die markierte Service-Instanz
+		self.btn_info_service = QPushButton("ℹ")
+		self.btn_info_service.setToolTip(
+			"Vollständige Beschreibungsfelder der markierten Service-Instanz "
+			"(Phase 14 P14-01).")
+		self.btn_info_service.clicked.connect(self._show_service_info)
+		svc_row.addWidget(self.btn_info_service)
 		svc_layout.addLayout(svc_row)
 
 		self.stack_service_forms = _ServiceStack()
@@ -713,6 +721,17 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		self.edit_set_name = QLineEdit()
 		name_row.addWidget(self.edit_set_name)
 		act_layout.addLayout(name_row)
+
+		# Phase 14 P14-01: Set-Beschreibung unter dem Set-Namen
+		desc_row = QHBoxLayout()
+		desc_row.addWidget(QLabel("Beschreibung:"))
+		self.edit_set_description = QLineEdit()
+		self.edit_set_description.setPlaceholderText(
+			"Ausführliche Set-/Strategie-Beschreibung (optional)")
+		self.edit_set_description.setToolTip(
+			"Individuelle Anmerkung für dieses Service-Set (Phase 14 P14-01).")
+		desc_row.addWidget(self.edit_set_description)
+		act_layout.addLayout(desc_row)
 
 		btn_row = QHBoxLayout()
 		self.btn_new_service_set = QPushButton("✨ Neu")
@@ -915,9 +934,13 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 				self._current_set_definition = definition
 				if self.edit_set_name:
 					self.edit_set_name.setText(definition.get("display_name") or "")
+				if self.edit_set_description:
+					self.edit_set_description.setText(definition.get("description") or "")
 		else:
 			if self.edit_set_name:
 				self.edit_set_name.clear()
+			if self.edit_set_description:
+				self.edit_set_description.clear()
 
 		if self.combo_service_sel:
 			self.combo_service_sel.blockSignals(True)
@@ -948,6 +971,50 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		# 4.4: Fenster/Box auf die neue Service-Seite nachziehen (dynamische Höhe)
 		if self._ui_ready:
 			self._reflow()
+
+	# -------------------------------------------------------------------------
+	# Phase 14 P14-01: Tooltips & Info-Dialog für Service-Instanzen
+	# -------------------------------------------------------------------------
+
+	def _build_tooltip(self, instance_id: str, config: Dict[str, Any]) -> str:
+		"""Baut einen Rich-Text-Tooltip (HTML) für eine Service-Instanz.
+
+		Angezeigt werden instance_id, Plugin-ID und – falls vorhanden – die
+		individuelle Instanz-Beschreibung (ServiceInstanceConfig.description).
+		"""
+		lines = [f"<b>{instance_id}</b>", f"Plugin: {config.get('plugin_id', '?')}"]
+		desc = config.get("description")
+		if desc:
+			lines.append(f"<i>{desc}</i>")
+		return "<br>".join(lines)
+
+	def _show_service_info(self) -> None:
+		"""Öffnet den ServiceDescriptionDialog für die markierte Service-Instanz.
+
+		Die Selektion kommt aus combo_service_sel (instance_id als UserData);
+		Plugin-Objekt und Instanz-Config werden aus der Registry bzw. dem
+		gewählten Set aufgelöst.
+		"""
+		if not self.combo_service_sel or self.plugin is None:
+			return
+		iid = self.combo_service_sel.currentData()
+		if not iid:
+			return
+		cfg: Dict[str, Any] = {}
+		if self._current_set_definition:
+			cfg = dict((self._current_set_definition.get("services") or {}).get(iid, {}))
+		pid = cfg.get("plugin_id") or iid
+		plugin = None
+		try:
+			from analytics.features.feature_builder import PluginRegistry
+			plugin = PluginRegistry().get(pid)
+		except KeyError:
+			QMessageBox.warning(self, "Plugin nicht gefunden",
+			                    f"Plugin '{pid}' ist nicht registriert.")
+			return
+		dlg = ServiceDescriptionDialog.from_plugin(
+			plugin, instance_id=str(iid), config=cfg, parent=self)
+		dlg.exec()
 
 	def _rebuild_service_stack(self) -> None:
 		"""Baut das QStackedWidget neu: Seite 0 = aktive Service-Parameter des
@@ -1133,6 +1200,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 
 		if self.edit_set_name:
 			definition["display_name"] = self.edit_set_name.text().strip()
+		if self.edit_set_description:
+			definition["description"] = self.edit_set_description.text().strip()
 
 		# Kein Set geladen → die Indikator-Services (z.B. grid_lines + proximity)
 		# als neue Services, sonst das aktive Plugin (instance_id = plugin_id).
@@ -1236,6 +1305,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		self._current_set_definition = None
 		if self.edit_set_name:
 			self.edit_set_name.clear()
+		if self.edit_set_description:
+			self.edit_set_description.clear()
 		if self.combo_service_set:
 			self.combo_service_set.blockSignals(True)
 			self.combo_service_set.setCurrentIndex(0)  # "- kein Set -"

@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from analytics.background_workers.historical_scanner import HistoricalScanner
+from analytics.engine.description_dialog import ServiceDescriptionDialog
 from analytics.engine.service_set_repository import ServiceSetRepository
 from analytics.engine.set_evaluator import ServiceSetEvaluator
 from persistent_win import PersistentWindow, register_persistent_window
@@ -235,6 +236,9 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         self.combo_tf_set: QComboBox = self.ui.findChild(QComboBox, "combo_tf_set")
         self.btn_refresh_sets: QPushButton = self.ui.findChild(QPushButton, "btn_refresh_sets")
         self.edit_set_name: QLineEdit = self.ui.findChild(QLineEdit, "edit_set_name")
+        # Phase 14 P14-01: Set-Beschreibung + Info-Button (ServiceDescriptionDialog)
+        self.edit_set_description: Optional[QLineEdit] = self.ui.findChild(QLineEdit, "edit_set_description")
+        self.btn_info_service: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_info_service")
         self.list_execution_order: QListWidget = self.ui.findChild(QListWidget, "list_execution_order")
         self.btn_move_up: QPushButton = self.ui.findChild(QPushButton, "btn_move_up")
         self.btn_move_down: QPushButton = self.ui.findChild(QPushButton, "btn_move_down")
@@ -313,6 +317,13 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             self.btn_move_down.clicked.connect(lambda: self.move_order_item(1))
         if self.btn_remove_instance:
             self.btn_remove_instance.clicked.connect(self.remove_instance)
+        # Phase 14 P14-01: Info-Button + itemClicked-Selektion der Instanzliste
+        self._current_list_iid: Optional[str] = None
+        if self.list_execution_order:
+            self.list_execution_order.itemClicked.connect(self._on_order_item_clicked)
+            self.list_execution_order.itemSelectionChanged.connect(self._sync_list_selection)
+        if self.btn_info_service:
+            self.btn_info_service.clicked.connect(self._show_service_info)
         if self.btn_add_instance:
             self.btn_add_instance.clicked.connect(self.add_instance)
             if self.edit_new_instance:
@@ -461,11 +472,14 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             self._clear_set_editor()
 
     def _clear_set_editor(self) -> None:
-        """Leert Name-Feld und execution_order-Liste des Set-Editors."""
+        """Leert Name-Feld, Beschreibung und execution_order-Liste des Set-Editors."""
         self._current_set_id = None
         self._current_set_definition = None
+        self._current_list_iid = None
         if self.edit_set_name:
             self.edit_set_name.clear()
+        if self.edit_set_description:
+            self.edit_set_description.clear()
         if self.list_execution_order:
             self.list_execution_order.clear()
         self._clear_service_columns()
@@ -491,8 +505,11 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         """
         self._current_set_id = definition.get("set_id")
         self._current_set_definition = definition
+        self._current_list_iid = None
         if self.edit_set_name:
             self.edit_set_name.setText(definition.get("display_name") or "")
+        if self.edit_set_description:
+            self.edit_set_description.setText(definition.get("description") or "")
         if self.list_execution_order:
             self.list_execution_order.clear()
             services = definition.get("services") or {}
@@ -502,6 +519,7 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
                 item = QListWidgetItem(f"{iid}  [{plugin_id}]")
                 item.setData(Qt.UserRole, iid)
                 item.setData(Qt.UserRole + 1, plugin_id)
+                item.setToolTip(self._build_tooltip(iid, cfg))
                 self.list_execution_order.addItem(item)
         self._build_service_columns(definition)
 
@@ -591,6 +609,7 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         item = QListWidgetItem(f"{iid}  [{plugin_id}]")
         item.setData(Qt.UserRole, iid)
         item.setData(Qt.UserRole + 1, plugin_id)
+        item.setToolTip(self._build_tooltip(iid, {"plugin_id": plugin_id}))
         self.list_execution_order.addItem(item)
         self.edit_new_instance.clear()
         self.log(f"Service hinzugefügt: {iid} [{plugin_id}]")
@@ -647,9 +666,60 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         return {
             "set_id": self._current_set_id or "",
             "display_name": self.edit_set_name.text().strip() if self.edit_set_name else "",
+            # Phase 14 P14-01: Set-Beschreibung wird mitgespeichert
+            "description": self.edit_set_description.text().strip() if self.edit_set_description else "",
             "execution_order": order,
             "services": services,
         }
+
+    # =========================================================================
+    # Phase 14 P14-01: Tooltips & Info-Dialog für Service-Instanzen
+    # =========================================================================
+
+    def _build_tooltip(self, instance_id: str, config: Dict[str, Any]) -> str:
+        """Baut einen Rich-Text-Tooltip (HTML) für eine Service-Instanz.
+
+        Angezeigt werden instance_id, Plugin-ID und – falls vorhanden – die
+        individuelle Instanz-Beschreibung (ServiceInstanceConfig.description).
+        """
+        lines = [f"<b>{instance_id}</b>", f"Plugin: {config.get('plugin_id', '?')}"]
+        desc = config.get("description")
+        if desc:
+            lines.append(f"<i>{desc}</i>")
+        return "<br>".join(lines)
+
+    def _on_order_item_clicked(self, item: QListWidgetItem) -> None:
+        """Merkt sich die aktuell markierte instance_id (itemClicked)."""
+        if item is not None:
+            self._current_list_iid = item.data(Qt.UserRole)
+
+    def _sync_list_selection(self) -> None:
+        """Synchronisiert _current_list_iid mit der aktuellen Selektion."""
+        if self.list_execution_order is not None:
+            row = self.list_execution_order.currentRow()
+            if row >= 0:
+                self._current_list_iid = self.list_execution_order.item(row).data(Qt.UserRole)
+
+    @Slot()
+    def _show_service_info(self) -> None:
+        """Öffnet den ServiceDescriptionDialog für die markierte Instanz."""
+        iid = self._current_list_iid
+        if not iid or self.list_execution_order is None:
+            self.log("Keine Service-Instanz markiert.")
+            return
+        cfg: Dict[str, Any] = {}
+        plugin = None
+        if self._current_set_definition:
+            cfg = dict((self._current_set_definition.get("services") or {}).get(iid, {}))
+        plugin_id = cfg.get("plugin_id") or iid
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            plugin = PluginRegistry().get(plugin_id)
+        except KeyError:
+            self.log(f"Plugin '{plugin_id}' nicht gefunden.")
+            return
+        dlg = ServiceDescriptionDialog.from_plugin(plugin, instance_id=iid, config=cfg, parent=self)
+        dlg.exec()
 
     # =========================================================================
     # Phase 13 5.4 Schritt 1: Breiten- & Höhendynamisches Layout (Service-Spalten)

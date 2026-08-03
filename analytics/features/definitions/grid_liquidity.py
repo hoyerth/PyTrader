@@ -80,6 +80,15 @@ class GridLiquidityFeature(PluginFeature):
             "description": "Erkennt Preisnähe zu Grid-Leveln inkl. Custom Levels & Zeitfenstern",
             "author": "PyTrader AI",
             "tags": ["grid", "liquidity", "proximity"],
+            # Phase 14 P14-01: Erweiterte Beschreibungsfelder
+            "description_long": "Berechnet prozentuale Treffer von Preispunkten auf "
+                                "Grid-Leveln (Standardraster + Custom Levels) inkl. "
+                                "Zeitfenster-Filter um ganze/halbe Stunde.",
+            "condition_rules": [
+                "Besuch eines Grid-Levels (Toleranz proximity_threshold)",
+                "Zeitfenster-Filter (use_time_filter / time_window_mins)",
+            ],
+            "api_version": "1",
         }
 
     # Phase 13 Schritt 5: Darstellungs-Reihenfolge & Label-Namen liegen AN DEN

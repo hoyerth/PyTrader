@@ -26,11 +26,17 @@ class ServiceInstanceConfig(TypedDict, total=False):
         params:     Plugin-Parameter (werden gegen das parameter_schema validiert).
         depends_on: Optional. instance_ids, deren shared_state-Einträge dieser
                     Service liest (muss früher in execution_order stehen).
+        description: Optional (Phase 14 P14-01). Individuelle Anmerkung für
+                    diese Instanz (wird im Tooltip/Info-Dialog angezeigt).
+        version:    Optional (Phase 14 P14-01). Plugin-Version dieser Instanz,
+                    Default "1.0.0" (Semantic Versioning major.minor.patch).
     """
     plugin_id: str
     lookback: int
     params: Dict[str, Any]
     depends_on: Optional[List[str]]
+    description: Optional[str]
+    version: Optional[str]
 
 
 class ServiceSetDefinition(TypedDict, total=False):
@@ -52,5 +58,6 @@ class ServiceSetDefinition(TypedDict, total=False):
     """
     set_id: str                      # Eindeutige ID (uuid oder Name)
     display_name: str                # Anzeigename (leer → Auto-Name aus instance_ids)
+    description: Optional[str]       # Phase 14 P14-01: Ausführliche Set-/Strategie-Beschreibung
     execution_order: List[str]       # Ausführungs-Reihenfolge der instance_ids
     services: Dict[str, ServiceInstanceConfig]  # instance_id → Konfiguration

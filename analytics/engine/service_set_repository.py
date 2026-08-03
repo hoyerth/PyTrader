@@ -57,9 +57,12 @@ class ServiceSetRepository:
                 set_id       VARCHAR PRIMARY KEY,
                 display_name VARCHAR,
                 definition   JSON NOT NULL,
+                description  VARCHAR,
                 updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        # Phase 14 P14-01: Additive Spalte für bestehende Datenbanken (idempotent)
+        con.execute("ALTER TABLE service_sets ADD COLUMN IF NOT EXISTS description VARCHAR;")
 
     @staticmethod
     def _default_display_name(definition: Dict[str, Any]) -> str:
@@ -89,40 +92,49 @@ class ServiceSetRepository:
         display_name = str(definition.get("display_name") or "").strip()
         if not display_name:
             display_name = self._default_display_name(definition)
+        # Phase 14 P14-01: description optional – wird in der eigenen Spalte
+        # UND im JSON-Payload persistiert (Definition bleibt vollständig).
+        description = definition.get("description")
+        description = str(description).strip() if description is not None else None
 
         payload = {
             "set_id": set_id,
             "display_name": display_name,
+            "description": description,
             "execution_order": definition.get("execution_order", []),
             "services": definition.get("services", {}),
         }
 
         con = self._get_connection()
         con.execute("""
-            INSERT INTO service_sets (set_id, display_name, definition, updated_at)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO service_sets (set_id, display_name, definition, description, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT (set_id) DO UPDATE SET
                 display_name = EXCLUDED.display_name,
                 definition   = EXCLUDED.definition,
+                description  = EXCLUDED.description,
                 updated_at   = EXCLUDED.updated_at
-        """, [set_id, display_name, json.dumps(payload)])
+        """, [set_id, display_name, json.dumps(payload), description])
         return set_id
 
     def get_set(self, set_id: str) -> Optional[Dict[str, Any]]:
         """Lädt eine Service-Set-Definition per set_id (oder None)."""
         con = self._get_connection()
         res = con.execute(
-            "SELECT set_id, display_name, definition FROM service_sets WHERE set_id = ?",
+            "SELECT set_id, display_name, definition, description FROM service_sets WHERE set_id = ?",
             [set_id],
         ).fetchone()
         if not res:
             return None
-        db_set_id, db_display_name, definition_json = res
+        db_set_id, db_display_name, definition_json, db_description = res
         definition = _parse_json_field(definition_json) or {}
         # DB-Spalten sind die Single Source of Truth für set_id/display_name
         definition["set_id"] = str(db_set_id)
         if not definition.get("display_name"):
             definition["display_name"] = db_display_name or ""
+        # Phase 14 P14-01: description aus der DB-Spalte nachziehen
+        if not definition.get("description") and db_description:
+            definition["description"] = db_description
         return definition
 
     def list_sets(self) -> List[Dict[str, Any]]:
@@ -133,14 +145,17 @@ class ServiceSetRepository:
         """
         con = self._get_connection()
         rows = con.execute(
-            "SELECT set_id, display_name, definition FROM service_sets ORDER BY updated_at ASC"
+            "SELECT set_id, display_name, definition, description FROM service_sets ORDER BY updated_at ASC"
         ).fetchall()
         sets: List[Dict[str, Any]] = []
-        for db_set_id, db_display_name, definition_json in rows:
+        for db_set_id, db_display_name, definition_json, db_description in rows:
             definition = _parse_json_field(definition_json) or {}
             definition["set_id"] = str(db_set_id)
             if not definition.get("display_name"):
                 definition["display_name"] = db_display_name or ""
+            # Phase 14 P14-01: description aus der DB-Spalte nachziehen
+            if not definition.get("description") and db_description:
+                definition["description"] = db_description
             sets.append(definition)
         return sets
 

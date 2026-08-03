@@ -98,6 +98,17 @@ class ProximityService(PluginFeature):
             "description": "Prozentuale visit%-Treffer auf den Grid-Linien (Parität zu grid.py) inkl. Feature-Store-Records",
             "author": "PyTrader AI",
             "tags": ["grid", "proximity", "liquidity", "feature-store"],
+            # Phase 14 P14-01: Erweiterte Beschreibungsfelder
+            "description_long": "Liest die Linienliste aus shared_state[depends_on] "
+                                "und wendet die prozentuale visit%-Semantik von "
+                                "grid.py an (visit_min/max je Linie). Schreibt "
+                                "Hit-Records in den Feature-Store.",
+            "condition_rules": [
+                "Treffer: visit_min <= high/low <= visit_max ODER Piercing (low <= lvl <= high)",
+                "in_window-Flag: Minute 0/30 ± time_window_mins (UTC)",
+                "Scan-Fenster: min(statistics_signal_limit, len(df)) von rechts",
+            ],
+            "api_version": "1",
         }
 
     @property

@@ -105,6 +105,17 @@ class GridLinesService(PluginFeature):
             "description": "Baut das Grid-Raster in Parität zu grid.py (Center ± steps_around × step_size + Custom-Levels)",
             "author": "PyTrader AI",
             "tags": ["grid", "lines", "raster"],
+            # Phase 14 P14-01: Erweiterte Beschreibungsfelder
+            "description_long": "Baut das Level-Raster exakt wie chart/indicators/"
+                                "grid.py (Zentrierung auf dem letzten Close) und "
+                                "schreibt die Linienliste in den shared_state "
+                                "für nachgelagerte Services (depends_on).",
+            "condition_rules": [
+                "Zentrierung: runden(close / step_size) × step_size",
+                "Levels: center + i × step_size für i in [-steps_around, steps_around]",
+                "Custom-Levels nur > 0",
+            ],
+            "api_version": "1",
         }
 
     @property
