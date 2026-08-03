@@ -912,7 +912,7 @@ Sicherstellung der dauerhaften Lauffähigkeit alter Service-Sets bei Weiterentwi
 ### AI-Auftrag: Implementierung P14-04 (Schema-Migration, Semantic Versioning & Rollback)
 
 #### 2. Allgemeine Grundsätze & Workflow-Vereinbarungen (Agents.md / Architektur.md)
-
+beachte
 1. **HARTE VERBOTSREGEL (Alt-Grid & Bestands-Pfade):**
 Die Alt-Dateien `chart/indicators/grid.py`, `chart/indicators/grid_liquidity.py` sowie bestehende Kernmodule dürfen unter keinen Umständen beschädigt oder in ihrer Funktionsweise für bestehende Aufrufe verändert werden. Neue Logiken werden additiv integriert.
 
@@ -982,6 +982,88 @@ d) Bei Auslösen eines Fehlers griff das Rollback sauber.
 
 ---
 
+### Kapitel 4.4-E [P14-04]: Ergänzung – Service-Set-Schutz im Service-Fenster (Set- & Service-Sperre)
+
+Konzeptionelle Erklärung & Schritt-Anleitung auf Basis der User-Anweisung „Punkt 3":
+Solange ein Indikator installiert ist, dürfen seine Basis-Services im `service_win`
+nicht gelöscht werden. Es muss eine sichtbare Kennzeichnung und eine aktive Sperre
+geben. Rein additiv; die bestehende Set-Verwaltung (P14-04 / P14-01) bleibt
+unangetastet.
+
+#### A. Konzept & Regeln
+
+1. **Regel 1 – Mindestens ein valides Set bleibt erhalten:**
+   Service-Sets dürfen gelöscht werden, aber es muss **immer mindestens ein
+   gültiges Service-Set** im Repository verbleiben, damit der Indikator
+   funktionsfähig bleibt. Das Löschen des **letzten** verbliebenen Sets ist
+   gesperrt (`delete_set()`-Guard: `len(list_sets()) <= 1` → Warn-Meldung).
+
+2. **Regel 2 – Service-Sperre für Einzel-Services:**
+   Einzel-Services dürfen **nicht** aus der Ausführungs-Reihenfolge entfernt
+   werden, solange sie in einem **gespeicherten Service-Set** vorkommen
+   (Indikator-Basis-Services wie `grid_lines`/`proximity` bleiben dadurch
+   dauerhaft funktionsfähig). Beim Löschversuch erscheint ein Hinweis mit dem
+   **Namen des verwendeten Sets** (`remove_instance()`-Guard).
+
+3. **Regel 3 – Sichtbare Kennzeichnung:**
+   Services, die in einem gespeicherten Set vorkommen, werden im Service-Fenster
+   mit 🔒 markiert:
+   * Listeneintrag (`🔒 grid_1  [grid_lines]`)
+   * Service-Spalten-Titel (`QGroupBox`)
+   * Tooltip: „Gesperrt (P14-04): wird vom Service-Set '<Name>' verwendet"
+   Der Live-Tooltip (`_update_service_tooltip`) erhält den Sperr-Nachtrag,
+   damit die Kennzeichnung beim Bearbeiten der Instanz-Beschreibung nicht
+   überschrieben wird.
+
+Datenquelle der Sperre ist rein datengetrieben (`_sets_using_plugin()` über
+`ServiceSetRepository.list_sets()`), **kein** neues Indikator-Sonderwissen im
+Service-Fenster nötig – die Basisdienste werden über ihre bloße Existenz in
+einem Set geschützt.
+
+#### B. Schritt-für-Schritt AI-Anleitung
+
+##### Schritt 1: `service_win.py` – Sperren & Kennzeichnung (additiv)
+
+1. **Import:** `QMessageBox` in den `PySide6.QtWidgets`-Import aufnehmen;
+   `List` im `typing`-Import ergänzen.
+
+2. **Modul-Helper `_sets_using_plugin(plugin_id, sets) -> List[str]`:**
+   Liefert die Namen aller Sets, die einen Service mit dieser `plugin_id`
+   enthalten (Match über `services[].plugin_id`; Anzeige `display_name`,
+   Fallback `set_id`). Basis für Sperre + Hinweis (Regel 2).
+
+3. **`ServiceWindow._service_lock(plugin_id) -> (prefix, tooltip_suffix)`:**
+   Liefert `("🔒 ", "<br><b>Gesperrt (P14-04)</b>: wird vom Service-Set
+   '<Name>' verwendet …")` wenn der Service in einem gespeicherten Set
+   vorkommt, sonst `("", "")`.
+
+4. **`remove_instance()` (Regel 2):** Vor dem Entfernen `_sets_using_plugin()`
+   prüfen. Nicht leer → `QMessageBox.warning` mit Set-Namen und Abbruch.
+
+5. **`delete_set()` (Regel 1):** Vor `delete_named_item()` prüfen:
+   `len(self.set_repo.list_sets()) <= 1` → `QMessageBox.warning` (Sperre des
+   letzten Sets) und Abbruch.
+
+6. **Kennzeichnung (Regel 3):** In `load_set_into_editor()` und `add_instance()`
+   die Listeneinträge mit `_service_lock()`-Präfix + Tooltip-Nachtrag erzeugen;
+   in `_build_service_column()` den Spaltentitel mit Präfix versehen;
+   in `_update_service_tooltip()` den Sperr-Nachtrag beibehalten.
+
+##### Schritt 2: Headless Validierung
+
+1. Erstelle und führe aus: `test/check_p14_s4_services_locked.py`:
+* Repo mit 3 Sets (2 mit `grid_lines`/`proximity`, 1 mit `ema_atr_set_v1`).
+* Verifiziere (Regel 2): `_sets_using_plugin("grid_lines", …)` nennt beide
+  Grid-Sets; `proximity`/`ema` je ihr Set; freie Services liefern `[]`.
+* Verifiziere (Regel 1): Bei 3 Sets ist Löschen erlaubt; nach Löschen auf
+  genau 1 verbleibendes Set greift der Guard (`len <= 1` → gesperrt).
+* Verifiziere (Regel 3): `_service_lock` (unbound via Dummy-Objekt) liefert
+  🔒-Präfix + Set-Namen-Tooltip für `grid_lines`, `("", "")` für freie
+  Services.
+
+
+---
+
 ### Kapitel 4.5 [P14-05]: Papierkorb- & Historien-System (Soft-Delete & Deterministische Snapshots)
 
 #### A. Konzept & Datenmodell
@@ -989,25 +1071,16 @@ d) Bei Auslösen eines Fehlers griff das Rollback sauber.
 Schutz vor versehentlichem Löschen oder Überschreiben von Service-Sets.
 
 1. **Soft-Delete (`analytics/engine/service_set_repository.py`):**
-
 * Verschieben gelöschter Service-Sets in die Tabelle `service_sets_trash` mit `deleted_at`-Zeitstempel.
 
-
-
 2. **Deterministische Snapshot-Historie:**
-
 * Ein automatischer Snapshot wird in `service_set_history` **ausschließlich dann** angelegt, wenn ein bereits in der DB existierendes Service-Set erfolgreich überschrieben wird. Bei reinen Neuanlagen oder Schreibfehlern entsteht kein Snapshot.
 
 3. **UI-Integration (`service_win.py`):**
-
 * "Papierkorb"-Dialog zur Einsicht und Wiederherstellung gelöschter Sets.
-
-
 
 4. **Scope von Papierkorb & Historie:**
 Der Papierkorb und die Snapshot-Historie werden primär für **Service-Sets** eingeführt. Über das generische `NamedItemAdapter`-Protokoll ist das System jedoch so strukturiert, dass es in einer späteren Phase schrittweise auf Indikator-Presets erweitert werden kann.
-
-
 
 ---
 
@@ -1020,18 +1093,14 @@ Der Papierkorb und die Snapshot-Historie werden primär für **Service-Sets** ei
 1. **HARTE VERBOTSREGEL (Alt-Grid & Bestands-Pfade):**
 Die Alt-Dateien `chart/indicators/grid.py`, `chart/indicators/grid_liquidity.py` sowie bestehende Kernmodule dürfen unter keinen Umständen beschädigt oder in ihrer Funktionsweise für bestehende Aufrufe verändert werden. Neue Logiken werden additiv integriert.
 
-
 2. **Git-Backup & Fallback vor JEDEM Kapitel:**
 Vor Beginn jedes Kapitels erstellt die AI / der User automatisch einen Git-Commit und Tag: `phase14_step1`, `phase14_step2`, etc. Bei Fehlern wird sofort per `git reset --hard` auf das jeweilige Tag zurückgerollt.
-
 
 3. **Headless-Validierung (Keine UI- und Keine unnötigen (Regressions-)tests):**
 Validierungen erfolgen rein headless (kein `QApplication.exec()`, keine manuellen Klicks) über gezielte PyTest- / Headless-Python-Skripte im Ordner `test/`. Es werden ausschließlich die für den jeweiligen Schritt absolut notwendigen Tests ausgeführt – keine unnötigen (Regressions-)tests.
 
-
 4. **Modulare Herauskoppelbarkeit:**
 Jedes Kapitel ist so aufgebaut, dass Beschreibung, Schema-Änderung, Implementierungsanleitung, die allgemeinen Grundsätze und der notwendige Test als zusammenhängender Block an die IDE-AI übergeben werden können.
-
 
 
 #### Schritt 0: Fallback & Backup
@@ -1043,7 +1112,7 @@ git add -A && git commit -m "backup: pre P14-05" && git tag -f phase14_step5
 
 1. Öffne `analytics/engine/service_set_repository.py`:
 * Ergänze in `_init_db()`:
-```sql
+
 CREATE TABLE IF NOT EXISTS service_sets_trash (
     set_id VARCHAR PRIMARY KEY,
     display_name VARCHAR,
@@ -1058,14 +1127,8 @@ CREATE TABLE IF NOT EXISTS service_set_history (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-```
-
-
-
-
 2. Implementiere `delete_set(set_id, soft_delete=True)`:
 * Bei `soft_delete=True`: Kopiere den Datensatz nach `service_sets_trash` und lösche ihn aus `service_sets`.
-
 
 3. Implementiere `restore_set_from_trash(set_id)` und `list_trash()`.
 4. Ergänze in `save_set()`: Prüfe, ob das Set bereits in `service_sets` existiert. **Nur bei bestehenden Sets**: Erstelle unmittelbar vor dem Überschreiben einen Snapshot-Eintrag in `service_set_history`.
@@ -1078,15 +1141,12 @@ CREATE TABLE IF NOT EXISTS service_set_history (
 * Führe `delete_set()` aus und verifiziere, dass es in `list_sets()` fehlt, aber in `list_trash()` vorhanden ist.
 * Rufe `restore_set_from_trash()` auf und verifiziere die vollständige Wiederherstellung.
 
-
-
 ---
 
 ## 5. Phase 14 Standard JSON-Schema
 
 Das erweiterte JSON-Schema definiert exakt die Struktur für Service-Sets inklusive Metadaten, Schema-Versionen und Instanz-Abhängigkeiten:
 
-```json
 {
   "set_id": "set_grid_scalp_v2",
   "display_name": "Grid Scalper Pro",
@@ -1120,7 +1180,7 @@ Das erweiterte JSON-Schema definiert exakt die Struktur für Service-Sets inklus
   }
 }
 
-```
+
 
 ---
 
