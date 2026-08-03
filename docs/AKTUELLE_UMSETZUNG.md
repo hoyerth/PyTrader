@@ -168,3 +168,38 @@ con.execute("ALTER TABLE service_sets ADD COLUMN IF NOT EXISTS description VARCH
 * Erstelle ein Test-Set mit `description`, speichere es im `ServiceSetRepository` und lade es zurück.
 * Instanziiere den `ServiceDescriptionDialog` headless ohne `exec_()` und verifiziere die saubere Datenbefüllung.
 
+---
+
+### C. Nachtrag: Additive Anpassungen nach Umsetzung (Ist-Zustand, Commits `6878a23` – `4fccb09`)
+
+Kapitel 4.1 [P14-01] ist **vollständig umgesetzt**. Zusätzlich zur ursprünglichen Anleitung wurden folgende additive Anpassungen vorgenommen (dokumentierter Ist-Zustand):
+
+#### C.1 Bearbeitbare Instanz-Beschreibungen (Commit `6878a23`)
+- `service_win.py` + `chart/indicator_dialog.py`: `Beschreibung:`-`QLineEdit` oben in jeder Service-Spalte/-Seite (`_service_desc_controls` / `_set_desc_controls`).
+- Live-Tooltip-Update beim Tippen (`_update_service_tooltip`).
+- Übernahme in `collect_set_definition()` als `ServiceInstanceConfig.description` (gehört NICHT in `params`).
+- Info-Dialoge (`ServiceDescriptionDialog`) zeigen den Live-Wert.
+
+#### C.2 Service-Parameter nur als Modell-Params (Commit `07930f2`)
+- Das Prop-Fenster zeigt je Service NUR die im Service-Modell gespeicherten Parameter (Parität zum `service_win`).
+- Die frühere „Plugin-Live-Seite" (Seite 0 mit `self.params`) entfällt – sie zeigte Werte, die nicht im Modell stehen.
+- `_service_items()`: Fallback auf das aktive Plugin als Service, wenn weder Set-Services noch deklarierte Services existieren.
+- `_on_service_selected()`: `setCurrentIndex(max(0, index))` (keine separate Plugin-Seite mehr).
+- Rein visuelle Keys (`show_*`/`color`) werden ausgeblendet.
+
+#### C.3 USER-REQ: 6 Custom-Levels als Einzelparameter (Commit `52d384b`)
+- `grid_lines_service.py`: `parameter_order`/`param_labels`/`parameter_schema` um `prox_level1..6` („Level 1"–„Level 6") erweitert.
+- `custom_levels` bleibt im Schema (interne Pipeline/Alt-Sets), ist aber NICHT mehr in der Editor-Reihenfolge (kein Komma-Textfeld).
+- `calculate()` liest via `custom_levels_from_params()`: bevorzugt `prox_level1..6`, sonst `custom_levels` (beide Speicherformen rendern auf dem Chart).
+- `map_custom_levels_to_prox_levels()`: Vorbefüllung der 6 Level-Felder aus `custom_levels`-Aggregat bei Alt-Sets (`indicator_dialog` + `service_win`).
+
+#### C.4 USER-REQ: Prop-Fenster kompakte Buttons + Auto-Set-Ausführung (Commit `4fccb09`)
+- „Set ausführen"-Button (`btn_execute_set`): nur noch Icon `▶` (28×28), Tooltip „Set ausführen".
+- Auto-Set-Ausführung: Bei Verlassen des Eingabefeldes (`editingFinished`) bzw. sofortiger Änderung (CheckBox/Combo) wird das Set automatisch ausgeführt (`_connect_service_param_commit` → `_on_service_param_commit` → `execute_service_set`).
+- `_collect_logic_params()` meldet zusätzlich die Service-Seiten-Werte (`step_size`, `prox_level1..6`, `visit_pct`, …) als Live-Overlay an den Chart.
+- Service-Beschreibungs-Button (`btn_info_service`): nur noch Icon `i` (28×28), Tooltip „Beschreibung des Services".
+
+#### C.5 Verifikation (headless, `test/`)
+- `test/check_p14_s1_description.py` (27/27 PASS), `test/check_p14_service_params.py`, `test/check_p14_prop_ui.py`, `test/check_p13_s6.py`, `test/check_grid_parity.py`.
+- Hinweis: `test/check_p13_s5.py` ist seit C.2 veraltet (testet das alte Layout mit `grid_step` in `param_controls`).
+
