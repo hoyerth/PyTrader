@@ -57,7 +57,7 @@ Der Indicator ruft niemals direkt Plugins zur Neuberechnung auf.
 * Logging verwendet strukturierte Fehlerobjekte (inkl. `timestamp`, `plugin`, `instance`, `symbol`, `timeframe`, `bar`, `exception`, `traceback`).
 * Schlägt eine Schema-Migration fehl (`SchemaMigrator` Exception), wird die Transaktion abgebrochen, das alte Set im Speicher belassen und ein Rollback durchgeführt.
 
-9. **Snapshot-Historie:** Ein historischer Snapshot in `service_set_history` wird ausschließlich beim erfolgreichen Überschreiben eines bereits existierenden Sets erzeugt.
+  9. **Snapshot-Historie:** Ein historischer Snapshot in `service_set_history` wird ausschließlich beim erfolgreichen Überschreiben eines bereits existierenden Sets erzeugt.
 10. **Chart-Entkopplung:** Der Chart führt niemals Berechnungen aus, sondern liest ausschließlich vorberechnete Daten aus DuckDB (mit definiertem Fallback).
 11. **Quarantäne-Recovery (Lebensdauer):** Der `_failure_counters`-Zähler jeder Service-Instanz wird nach 300 Sekunden (5 Minuten) ohne weiteren Fehler automatisch zurückgesetzt (`_recovery_timer`). Eine einmalige Quarantäne (`quarantined = True`) bleibt für die laufende Session bestehen, bis der Evaluator einen vollständigen Neustart der Pipeline durchläuft (`reset()`).
 
@@ -71,93 +71,6 @@ Der Indicator ruft niemals direkt Plugins zur Neuberechnung auf.
 ---
 
 ## 4. Spezifikation & Schritt-für-Schritt-Anleitungen der Kernmodule (Phase 14)
-
----
-
-### Kapitel 4.2 [P14-02]: Dynamische Plugin Discovery, Hot-Reload & Thread-Safety
-
-#### A. Konzept & Datenmodell
-
-Ersetzung manueller Modul-Importe durch ein automatisches Reflection-System für Core- und Custom-Plugins unter Wahrung harter Konfliktregeln und Thread-Sicherheit.
-
-1. **Folder Scanner & Auto-Directory (`analytics/features/feature_builder.py`):**
-* `PluginLoader.discover_plugins()` stellt sicher, dass der Ordner `data/custom_plugins/` existiert (`os.makedirs(..., exist_ok=True)`).
-* Automatisches, rekursives Durchsuchen von `analytics/features/definitions/` (Core) und `data/custom_plugins/` (User/Custom) mittels `pkgutil.walk_packages()` und `importlib.import_module()`.
-
-2. **Konfliktregel, Case-Insensitivität & Core-Schutz:**
-* Core-Plugins aus `analytics/features/definitions/` werden **zuerst** geladen.
-* Die Eindeutigkeit der `plugin_id` wird strikt case-insensitiv (`plugin_id.lower()`) geprüft.
-* Versucht ein Custom-Plugin aus `data/custom_plugins/` eine bereits registrierte `plugin_id` zu belegen, wird das Custom-Plugin verworfen und ein Warn-Log geschrieben (**Core Protection Rule**).
-* Abstrakte Klassen (`inspect.isabstract`) werden ignoriert.
-
-3. **Singleton & Process-Ownership:**
-* `PluginRegistry` ist als Thread-sicheres Singleton pro Prozess ausgeführt.
-
-4. **Hot-Reload & Thread Safety (`PluginRegistry.reload()`):**
-* Schreib- und Lesezugriffe auf `PluginRegistry` werden durch einen `threading.RLock()` geschützt.
-* `PluginRegistry.reload()` führt vor dem Discovery-Scan ein gezieltes `importlib.reload()` auf den geladenen Custom-Plugin-Modulen aus.
-* Laufende Berechnungen nutzen weiterhin die bisher instanziierten Objekte. Neue Instanziiertungen greifen auf die aktualisierten Klassen zu.
-
----
-
-#### B. Schritt-für-Schritt AI-Anleitung (Kopierblock P14-02)
-
-### AI-Auftrag: Implementierung P14-02 (Dynamische Plugin Discovery, Hot-Reload & Thread-Safety)
-
-#### 2. Allgemeine Grundsätze & Workflow-Vereinbarungen (Agents.md / Architektur.md)
-
-1. **HARTE VERBOTSREGEL (Alt-Grid & Bestands-Pfade):**
-Die Alt-Dateien `chart/indicators/grid.py`, `chart/indicators/grid_liquidity.py` sowie bestehende Kernmodule dürfen unter keinen Umständen beschädigt oder in ihrer Funktionsweise für bestehende Aufrufe verändert werden. Neue Logiken werden additiv integriert.
-
-2. **Git-Backup & Fallback vor JEDEM Kapitel:**
-Vor Beginn jedes Kapitels erstellt die AI / der User automatisch einen Git-Commit und Tag: `phase14_step1`, `phase14_step2`, etc. Bei Fehlern wird sofort per `git reset --hard` auf das jeweilige Tag zurückgerollt.
-
-3. **Headless-Validierung (Keine UI- und Keine unnötigen (Regressions-)tests):**
-Validierungen erfolgen rein headless (kein `QApplication.exec()`, keine manuellen Klicks) über gezielte PyTest- / Headless-Python-Skripte im Ordner `test/`. Es werden ausschließlich die für den jeweiligen Schritt absolut notwendigen Tests ausgeführt – keine unnötigen (Regressions-)tests.
-
-4. **Modulare Herauskoppelbarkeit:**
-Jedes Kapitel ist so aufgebaut, dass Beschreibung, Schema-Änderung, Implementierungsanleitung, die allgemeinen Grundsätze und der notwendige Test als zusammenhängender Block an die IDE-AI übergeben werden können.
-
-
-#### Schritt 0: Fallback & Backup
-
-1. Führe vor Code-Änderungen folgendes Git-Backup aus:
-git add -A && git commit -m "backup: pre P14-02" && git tag -f phase14_step2
-
-#### Schritt 1: Dynamic Loader & Reflection mit Thread-Lock & Case-Insensitivität (Vollständig)
-
-1. Öffne `analytics/features/feature_builder.py`:
-   * Stelle sicher, dass `PluginRegistry` als Singleton mit einheitlicher Prozess-Instanz und internem `threading.RLock()` aufgebaut ist.
-   * Erweitere `PluginLoader.discover_plugins()`:
-     * Erstelle den Zielordner `data/custom_plugins/` automatisch per `os.makedirs(..., exist_ok=True)`.
-     * Scanne zuerst `analytics/features/definitions/` (Core) via `pkgutil.walk_packages()` und `importlib.import_module()`.
-     * Scanne danach `data/custom_plugins/` (Custom).
-     * **Case-Insensitive Eindeutigkeit & Core-Schutz:** Normalisiere Schlüssel via `plugin_id.lower()`. Wenn eine entdeckte ID bereits in `registry.plugins` existiert, überspringe das Plugin und logge `WARN: Custom plugin skipped: plugin_id '{plugin_id}' already registered`.
-     * Ignoriere abstrakte Klassen (`inspect.isabstract()`).
-     * Fange Import-Fehler einzelner fehlerhafter Plugin-Dateien isoliert ab (strukturierte Warnung im Log, kein App-Absturz).
-
-2. **Lifecycle-Erweiterung (Neu):** Füge in `PluginRegistry` eine interne Liste `_loaded_custom_modules` hinzu. Bei `reload()`:
-   * Iteriere NUR über `_loaded_custom_modules` und führe `importlib.reload(sys.modules[mod_name])` aus.
-   * Aktualisiere die Registry über `self.discover_plugins()` und überschreibe `self.plugins`.
-
-#### Schritt 2: Hot-Reload Refactoring
-
-1. Öffne `analytics/features/feature_builder.py` (`PluginRegistry`):
-* Refactore die Methode `reload(self)` unter Reentrant Lock (`with self._lock:`):
-* Iteriere über alle geladenen Custom-Plugin-Module und führe `importlib.reload(sys.modules[mod_name])` aus.
-* Aktualisiere die Registry über `self.discover_plugins()`.
-
-2. Öffne `service_win.py`:
-* Verbinde den "Plugins neu laden"-Button mit `PluginRegistry().reload()`.
-
-#### Schritt 3: Headless Validierung
-
-1. Erstelle und führe aus: `test/check_p14_s2_discovery.py`:
-* Erzeuge temporär eine Mock-Plugin-Datei `data/custom_plugins/tmp_dummy_plugin.py` mit `plugin_id = "tmp_dummy"`.
-* Rufe `PluginRegistry().reload()` auf und verifiziere, dass `"tmp_dummy"` in `PluginRegistry().plugins` enthalten ist.
-* Erzeuge eine kollidierende Datei `data/custom_plugins/tmp_collision.py` mit `plugin_id = "GRID_LINES"` (Core-ID Fallback-Case).
-* Rufe `PluginRegistry().reload()` auf und verifiziere, dass das Core-Plugin `"grid_lines"` nicht überschrieben wurde.
-* Lösche die temporären Test-Dateien, rufe erneut `reload()` auf und verifiziere die saubere Bereinigung.
 
 ---
 
@@ -183,4 +96,80 @@ Ablösung des strikten Fail-Fast-Prinzips durch ein elastisches, fehlerfreies Pi
 4. **State-Fallback & Session-Quarantäne:**
 * **State-Fallback:** Tritt beim Bar-Close-Intervall oder Chart-Refresh ein Fehler auf, greift der Evaluator exklusiv auf `EvaluationContext.shared_state.get(instance_id)` der vorherigen Kerze zurück.
 * **RAM-Quarantäne-System:** Fällt eine Service-Instanz in 3 aufeinanderfolgenden Ausführungen aus, wird sie im RAM für die laufende Session quarantänisiert (`quarantined = True`) und dauerhaft übersprungen. Quarantäne-Zustände werden **nicht** in DuckDB persistiert.
+
+
+---
+
+#### B. Schritt-für-Schritt AI-Anleitung (Kopierblock P14-03)
+
+### AI-Auftrag: Implementierung P14-03 (Pipeline-Fehlerbehandlung, Feature-Store-Lesepfad & Live-Resilience)
+
+#### 2. Allgemeine Grundsätze & Workflow-Vereinbarungen (Agents.md / Architektur.md)
+
+1. **HARTE VERBOTSREGEL (Alt-Grid & Bestands-Pfade):**
+Die Alt-Dateien `chart/indicators/grid.py`, `chart/indicators/grid_liquidity.py` sowie bestehende Kernmodule dürfen unter keinen Umständen beschädigt oder in ihrer Funktionsweise für bestehende Aufrufe verändert werden. Neue Logiken werden additiv integriert.
+
+2. **Git-Backup & Fallback vor JEDEM Kapitel:**
+Vor Beginn jedes Kapitels erstellt die AI / der User automatisch einen Git-Commit und Tag: `phase14_step1`, `phase14_step2`, etc. Bei Fehlern wird sofort per `git reset --hard` auf das jeweilige Tag zurückgerollt.
+
+3. **Headless-Validierung (Keine UI- und Keine unnötigen (Regressions-)tests):**
+Validierungen erfolgen rein headless (kein `QApplication.exec()`, keine manuellen Klicks) über gezielte PyTest- / Headless-Python-Skripte im Ordner `test/`. Es werden ausschließlich die für den jeweiligen Schritt absolut notwendigen Tests ausgeführt – keine unnötigen (Regressions-)tests.
+
+4. **Modulare Herauskoppelbarkeit:**
+Jedes Kapitel ist so aufgebaut, dass Beschreibung, Schema-Änderung, Implementierungsanleitung, die allgemeinen Grundsätze und der notwendige Test als zusammenhängender Block an die IDE-AI übergeben werden können.
+
+
+
+#### Schritt 0: Fallback & Backup
+
+1. Führe vor Code-Änderungen folgendes Git-Backup aus:
+git add -A && git commit -m "backup: pre P14-03" && git tag -f phase14_step3
+
+#### Schritt 1: Absicherung im PluginExecutor & Evaluator
+
+1. Öffne `analytics/features/feature_builder.py` (`PluginExecutor`):
+* Umschließe in `execute()` die gesamte Kette mit `try...except Exception as e`.
+* Prüfe `depends_on`-Abhängigkeiten strikt gegen vorhandene `instance_id`-Keys.
+* Erzeuge bei Fehlern ein strukturiertes Fehlerobjekt (mit `timestamp`, `plugin`, `instance_id`, `symbol`, `timeframe`, `bar`, `exception`, `traceback`) im Log und liefere ein Error-Result-Dict `{"success": False, "error": str(e), "instance_id": instance_id}` zurück.
+
+2. Öffne `analytics/engine/set_evaluator.py` (`ServiceSetEvaluator`):
+* Ergänze Konfigurations-Flag `allow_skip_errors: bool = True` in `execute_set()`.
+* Bei Fehler einer `instance_id`:
+* Markiere davon per `depends_on` abhängige Instanzen als übersprungen (`skip_reason="dependency_failed"`).
+* Führe unabhängige Services regulär fort.
+
+#### Schritt 2: State-Fallback, Session-Quarantäne & Recovery (Erweitert)
+
+1. Erweitere `ServiceSetEvaluator`:
+   * Führe ein internes RAM-Dict `_failure_counters: Dict[str, int]` und `_last_failure_time: Dict[str, float]` für Service-Instanzen.
+   * Bei Fehler:
+     * Greife im Bar-Close-Betrieb exklusiv auf `context.shared_state.get(instance_id)` zurück.
+     * Inkrementiere `_failure_counters[instance_id] += 1` und setze `_last_failure_time[instance_id] = time.time()`.
+     * **Recovery-Logik:** Prüfe vor jedem Inkrement, ob `time.time() - _last_failure_time.get(iid, 0) > 300`. Falls ja, setze den Counter zurück (Self-Healing nach 5 Minuten).
+   * Bei 3 aufeinanderfolgenden Fehlern (innerhalb von 5 Minuten): Setze `quarantined = True` im RAM für die laufende Session und überspringe die Instanz mit Log-Warnung. (Nicht DB-persistieren).
+
+2. **Strukturierte Fehlerobjekte (P14-03.1):**
+   * Definiere in `base_plugin.py` ein `TypedDict` (`ServiceErrorLog`) mit den Pflichtfeldern: `timestamp`, `plugin_id`, `instance_id`, `symbol`, `timeframe`, `bar_time`, `exception`, `traceback`.
+   * Nutze dieses Dict ausschließlich für das Logging in `PluginExecutor` und `ServiceSetEvaluator`, um maschinelle Auswertung zu ermöglichen.
+
+
+#### Schritt 3: Verkürzter Live-Lookback & Indikator-Feature-Store-Lesepfad
+
+1. Öffne `analytics/background_workers/live_analyzer.py`:
+* Optimiere `_process_plugin_bars()`: Setze den `lookback_bars`-Parameter bei laufenden Bar-Close-Evaluierungen gezielt auf `limit = 2` (1 unvollständige, 1 frisch geschlossene Kerze) gegen das gepufferte `shared_state`-Raster.
+
+2. Öffne `chart/indicators/grid_liquidity.py` (`GridLiquidityIndicator`):
+* Ergänze in `calculate()` einen primären DB-Lesepfad: Lade gepufferte Daten aus `feature_store.feature_data` (DuckDB), sofern aktuelle Daten und passendes `schema_version` vorhanden sind.
+* Nutze Heavy-Berechnung über `FeatureBuilder` nur als Fallback, wenn `feature_store` leer ist.
+* Architektur-Constraint wahren: Stelle sicher, dass `update_live_candle()` weiterhin KEINE Pipeline ausführt, sondern performant auf gecachte Daten zugreift.
+
+#### Schritt 4: Headless Validierung
+
+1. Erstelle und führe aus: `test/check_p14_s3_resilience.py`:
+* Erzeuge einen Test mit:
+a) Service mit defekter Parameter-Validierung.
+b) Service mit fehlerhafter `depends_on` Reference (`instance_id`).
+c) Service, der 3x nacheinander abstürzt (Prüfe RAM-Quarantäne und State-Fallback).
+d) Verifikation, dass `GridLiquidityIndicator` Daten korrekt aus `feature_store.feature_data` liest.
+* Verifiziere, dass das Gesamtsystem stabil bleibt und unabhängige Services weiterlaufen.
 

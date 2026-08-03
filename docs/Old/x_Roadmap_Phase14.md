@@ -330,14 +330,11 @@ Ablösung des strikten Fail-Fast-Prinzips durch ein elastisches, fehlerfreies Pi
 1. **HARTE VERBOTSREGEL (Alt-Grid & Bestands-Pfade):**
 Die Alt-Dateien `chart/indicators/grid.py`, `chart/indicators/grid_liquidity.py` sowie bestehende Kernmodule dürfen unter keinen Umständen beschädigt oder in ihrer Funktionsweise für bestehende Aufrufe verändert werden. Neue Logiken werden additiv integriert.
 
-
 2. **Git-Backup & Fallback vor JEDEM Kapitel:**
 Vor Beginn jedes Kapitels erstellt die AI / der User automatisch einen Git-Commit und Tag: `phase14_step1`, `phase14_step2`, etc. Bei Fehlern wird sofort per `git reset --hard` auf das jeweilige Tag zurückgerollt.
 
-
 3. **Headless-Validierung (Keine UI- und Keine unnötigen (Regressions-)tests):**
 Validierungen erfolgen rein headless (kein `QApplication.exec()`, keine manuellen Klicks) über gezielte PyTest- / Headless-Python-Skripte im Ordner `test/`. Es werden ausschließlich die für den jeweiligen Schritt absolut notwendigen Tests ausgeführt – keine unnötigen (Regressions-)tests.
-
 
 4. **Modulare Herauskoppelbarkeit:**
 Jedes Kapitel ist so aufgebaut, dass Beschreibung, Schema-Änderung, Implementierungsanleitung, die allgemeinen Grundsätze und der notwendige Test als zusammenhängender Block an die IDE-AI übergeben werden können.
@@ -356,16 +353,11 @@ git add -A && git commit -m "backup: pre P14-03" && git tag -f phase14_step3
 * Prüfe `depends_on`-Abhängigkeiten strikt gegen vorhandene `instance_id`-Keys.
 * Erzeuge bei Fehlern ein strukturiertes Fehlerobjekt (mit `timestamp`, `plugin`, `instance_id`, `symbol`, `timeframe`, `bar`, `exception`, `traceback`) im Log und liefere ein Error-Result-Dict `{"success": False, "error": str(e), "instance_id": instance_id}` zurück.
 
-
 2. Öffne `analytics/engine/set_evaluator.py` (`ServiceSetEvaluator`):
 * Ergänze Konfigurations-Flag `allow_skip_errors: bool = True` in `execute_set()`.
 * Bei Fehler einer `instance_id`:
 * Markiere davon per `depends_on` abhängige Instanzen als übersprungen (`skip_reason="dependency_failed"`).
 * Führe unabhängige Services regulär fort.
-
-
-
-
 
 #### Schritt 2: State-Fallback, Session-Quarantäne & Recovery (Erweitert)
 
@@ -386,7 +378,6 @@ git add -A && git commit -m "backup: pre P14-03" && git tag -f phase14_step3
 
 1. Öffne `analytics/background_workers/live_analyzer.py`:
 * Optimiere `_process_plugin_bars()`: Setze den `lookback_bars`-Parameter bei laufenden Bar-Close-Evaluierungen gezielt auf `limit = 2` (1 unvollständige, 1 frisch geschlossene Kerze) gegen das gepufferte `shared_state`-Raster.
-
 
 2. Öffne `chart/indicators/grid_liquidity.py` (`GridLiquidityIndicator`):
 * Ergänze in `calculate()` einen primären DB-Lesepfad: Lade gepufferte Daten aus `feature_store.feature_data` (DuckDB), sofern aktuelle Daten und passendes `schema_version` vorhanden sind.
