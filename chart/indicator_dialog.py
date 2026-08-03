@@ -332,6 +332,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		self._current_set_id: Optional[str] = current_set_id or None
 		self._current_set_definition: Optional[Dict[str, Any]] = None
 		self._set_param_controls: Dict[str, QWidget] = {}
+		# Phase 14 P14-01: Beschreibungs-Eingabefelder der Service-Instanzen
+		self._set_desc_controls: Dict[str, QWidget] = {}
 		# 5.5 Fix: Live-Overlay der Service-Parameter (logic_params). Wird beim
 		# Oeffnen vom Chart-Window getrennt uebergeben (st['logic_params']),
 		# beim Preset-Laden ersetzt und nach dem Set-Logik-Merge in
@@ -1003,6 +1005,10 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		cfg: Dict[str, Any] = {}
 		if self._current_set_definition:
 			cfg = dict((self._current_set_definition.get("services") or {}).get(iid, {}))
+		# Live-Beschreibung aus dem Eingabefeld übernehmen (falls vorhanden)
+		desc_ctrl = self._set_desc_controls.get(str(iid))
+		if desc_ctrl is not None:
+			cfg["description"] = desc_ctrl.text().strip()
 		pid = cfg.get("plugin_id") or iid
 		plugin = None
 		try:
@@ -1027,6 +1033,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			stack.removeWidget(w)
 			w.deleteLater()
 		self._set_param_controls = {}
+		self._set_desc_controls = {}
 
 		# Seite 0: Service-Props des aktiven Plugin-Indikators (self.params)
 		page0 = QWidget()
@@ -1049,6 +1056,17 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			cfg = self._service_cfg(pid)
 			page = QWidget()
 			vl = QVBoxLayout(page)
+			# Phase 14 P14-01: Individuelle Instanz-Beschreibung (bearbeitbar) –
+			# wird in ServiceInstanceConfig.description gespeichert und im
+			# Info-Dialog (ServiceDescriptionDialog) angezeigt.
+			desc_row = QHBoxLayout()
+			desc_row.addWidget(QLabel("Beschreibung:"))
+			desc_edit = QLineEdit()
+			desc_edit.setPlaceholderText("Individuelle Anmerkung für diese Instanz (optional)")
+			desc_edit.setText(str(cfg.get("description") or ""))
+			self._set_desc_controls[iid] = desc_edit
+			desc_row.addWidget(desc_edit)
+			vl.addLayout(desc_row)
 			pf = QFormLayout()
 			vl.addLayout(pf)
 			try:
@@ -1259,6 +1277,16 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 				cfg["lookback"] = int(self._ctrl_value(ctrl))
 			else:
 				cfg.setdefault("params", {})[pkey] = self._ctrl_value(ctrl)
+
+		# Phase 14 P14-01: Instanz-Beschreibung aus den Service-Seiten
+		# übernehmen (ServiceInstanceConfig.description – gehört NICHT in params).
+		for iid, ctrl in self._set_desc_controls.items():
+			existing_cfg = services.get(iid) or {}
+			pid = (existing_cfg.get("plugin_id")
+			       or (iid if iid in self._indicator_service_ids()
+			           else (self.plugin.plugin_id if self.plugin else iid)))
+			cfg = services.setdefault(iid, {"plugin_id": pid, "params": {}})
+			cfg["description"] = ctrl.text().strip()
 
 		definition["services"] = services
 		return definition

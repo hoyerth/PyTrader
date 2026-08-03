@@ -302,6 +302,8 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             self.central_layout.setSpacing(6)
             self.central_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self._service_param_controls: Dict[Any, QWidget] = {}
+        # Phase 14 P14-01: Beschreibungs-Eingabefelder der Service-Instanzen
+        self._service_desc_controls: Dict[str, QWidget] = {}
 
         if self.btn_start:
             self.btn_start.clicked.connect(self.start_scan)
@@ -663,6 +665,12 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             else:
                 cfg.setdefault("params", {})[key] = self._ctrl_value(ctrl)
 
+        # Phase 14 P14-01: Instanz-Beschreibung aus den Spalten übernehmen
+        # (ServiceInstanceConfig.description – gehört NICHT in params).
+        for iid, ctrl in self._service_desc_controls.items():
+            cfg = services.setdefault(iid, {"plugin_id": "", "lookback": 1000, "params": {}})
+            cfg["description"] = ctrl.text().strip()
+
         return {
             "set_id": self._current_set_id or "",
             "display_name": self.edit_set_name.text().strip() if self.edit_set_name else "",
@@ -688,6 +696,20 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             lines.append(f"<i>{desc}</i>")
         return "<br>".join(lines)
 
+    def _update_service_tooltip(self, iid: str) -> None:
+        """Aktualisiert den Tooltip des Listen-Items live beim Tippen."""
+        if not self.list_execution_order:
+            return
+        for i in range(self.list_execution_order.count()):
+            item = self.list_execution_order.item(i)
+            if item.data(Qt.UserRole) == iid:
+                cfg: Dict[str, Any] = {"plugin_id": item.data(Qt.UserRole + 1) or iid}
+                desc_ctrl = self._service_desc_controls.get(iid)
+                if desc_ctrl is not None:
+                    cfg["description"] = desc_ctrl.text().strip()
+                item.setToolTip(self._build_tooltip(iid, cfg))
+                break
+
     def _on_order_item_clicked(self, item: QListWidgetItem) -> None:
         """Merkt sich die aktuell markierte instance_id (itemClicked)."""
         if item is not None:
@@ -711,6 +733,10 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         plugin = None
         if self._current_set_definition:
             cfg = dict((self._current_set_definition.get("services") or {}).get(iid, {}))
+        # Live-Beschreibung aus dem Eingabefeld übernehmen (falls vorhanden)
+        desc_ctrl = self._service_desc_controls.get(iid)
+        if desc_ctrl is not None:
+            cfg["description"] = desc_ctrl.text().strip()
         plugin_id = cfg.get("plugin_id") or iid
         try:
             from analytics.features.feature_builder import PluginRegistry
@@ -855,6 +881,7 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             if w is not None:
                 w.deleteLater()
         self._service_param_controls = {}
+        self._service_desc_controls = {}
 
     def _build_service_columns(self, set_definition: Dict[str, Any]) -> None:
         """Baut die dynamischen Service-Spalten (Roadmap 5.4.2.2).
@@ -918,6 +945,20 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
 
         params = dict(cfg.get("params") or {})
         lookback = cfg.get("lookback")
+
+        # Phase 14 P14-01: Individuelle Instanz-Beschreibung (bearbeitbar) –
+        # wird in ServiceInstanceConfig.description gespeichert und in
+        # Tooltip + Info-Dialog angezeigt.
+        desc_row = QHBoxLayout()
+        desc_label = QLabel("Beschreibung:")
+        desc_edit = QLineEdit()
+        desc_edit.setPlaceholderText("Individuelle Anmerkung für diese Instanz (optional)")
+        desc_edit.setText(str(cfg.get("description") or ""))
+        self._service_desc_controls[iid] = desc_edit
+        desc_edit.textChanged.connect(lambda _t, iid=iid: self._update_service_tooltip(iid))
+        desc_row.addWidget(desc_label)
+        desc_row.addWidget(desc_edit)
+        vl.addLayout(desc_row)
 
         # Normale (Nicht-Expert-, Nicht-Darstellungs-)Parameter
         form = QFormLayout()
