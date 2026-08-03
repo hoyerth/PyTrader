@@ -9,13 +9,20 @@ ServiceSetEvaluator (Service-Pipeline). Der bestehende SetEvaluator
 """
 
 from dataclasses import replace
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
+import threading
+import time
+import traceback
 import pandas as pd
 import json
 
 from analytics.engine.base_definition import SignalDefinition
 from analytics.features.plugins.base_plugin import PluginContext
-from analytics.features.feature_builder import PluginExecutor
+from analytics.features.feature_builder import (
+    PluginExecutor,
+    PluginExecutionError,
+    PluginExecutionErrorInfo,
+)
 
 
 class SetEvaluator:
@@ -147,13 +154,74 @@ class ServiceSetExecutionError(Exception):
 
 
 class ServiceSetEvaluator:
-    """Sichere Ausführung einer Service-Pipeline mit Namespace-Isolation."""
+    """Sichere Ausführung einer Service-Pipeline mit Namespace-Isolation.
+
+    P14-03 (Resiliente Evaluator-Schleife): execute_set_resilient() ersetzt
+    das Fail-Fast-Prinzip durch Skip-Logic, Dependency-Skip, State-Fallback
+    und eine RAM-Quarantäne (3 aufeinanderfolgende Fehler → für die Session
+    gesperrt; Zähler-Ready nach 300 s ohne Fehler, Quarantäne bleibt bis
+    reset()). Die bestehende execute_set()-Methode bleibt unverändert
+    (Fail-Fast) und läuft für Bestands-Aufrufer parallel weiter.
+    """
 
     def __init__(self, executor: Optional[PluginExecutor] = None) -> None:
         self.executor = executor or PluginExecutor()
+        # P14-03: Session-Zustand (nur RAM, wird NICHT in DuckDB persistiert)
+        self._failure_counters: Dict[str, int] = {}
+        self._quarantined: Set[str] = set()
+        self._last_failure_ts: Dict[str, float] = {}
+        self._recovery_seconds: float = 300.0
+        self._execution_lock = threading.RLock()
+        # Diagnose-Status der letzten resilienten Ausführung (instance_id ->
+        # skip_reason bzw. strukturiertes Fehlerobjekt).
+        self.last_skipped: Dict[str, str] = {}
+        self.last_errors: Dict[str, PluginExecutionErrorInfo] = {}
 
     # -------------------------------------------------------------------------
-    # Pipeline-Ausführung
+    # Session-Quarantäne & Auto-Recovery (P14-03, Invariante 4 + 11)
+    # -------------------------------------------------------------------------
+    def reset(self) -> None:
+        """Vollständiger Neustart der Pipeline (Invariante 11): Quarantäne,
+        Fehlerzähler und Diagnose-Status werden geleert (Session-Scope)."""
+        with self._execution_lock:
+            self._failure_counters.clear()
+            self._quarantined.clear()
+            self._last_failure_ts.clear()
+            self.last_skipped.clear()
+            self.last_errors.clear()
+
+    def _is_quarantined(self, instance_id: str) -> bool:
+        """True, wenn die Instanz für die Session quarantänisiert ist.
+
+        Auto-Recovery (Invariante 11): Der Fehlerzähler wird nach
+        _recovery_seconds (300 s) ohne weiteren Fehler automatisch
+        zurückgesetzt – die einmalige Quarantäne selbst bleibt bis reset()
+        bestehen."""
+        last = self._last_failure_ts.get(instance_id)
+        if last is not None and time.time() - last >= self._recovery_seconds:
+            self._failure_counters.pop(instance_id, None)
+            self._last_failure_ts.pop(instance_id, None)
+        return instance_id in self._quarantined
+
+    def _record_failure(self, instance_id: str) -> bool:
+        """Zählt einen Fehler; bei 3 aufeinanderfolgenden Fehlern wird die
+        Instanz quarantänisiert. Gibt True zurück, wenn Quarantäne ausgelöst."""
+        now = time.time()
+        self._last_failure_ts[instance_id] = now
+        self._failure_counters[instance_id] = self._failure_counters.get(instance_id, 0) + 1
+        if self._failure_counters[instance_id] >= 3:
+            self._quarantined.add(instance_id)
+            return True
+        return False
+
+    def _reset_failure(self, instance_id: str) -> None:
+        """Erfolgreiche Ausführung → Fehlerzähler zurücksetzen (nur
+        aufeinanderfolgende Fehler zählen)."""
+        self._failure_counters.pop(instance_id, None)
+        self._last_failure_ts.pop(instance_id, None)
+
+    # -------------------------------------------------------------------------
+    # Pipeline-Ausführung (bestehender Fail-Fast-Pfad – unverändert)
     # -------------------------------------------------------------------------
     def execute_set(
         self,
@@ -256,5 +324,167 @@ class ServiceSetEvaluator:
             if iid not in context.shared_state:
                 context.shared_state[iid] = result
             results[iid] = result
+
+        return results
+
+    # -------------------------------------------------------------------------
+    # P14-03: Resiliente Pipeline-Ausführung (Skip-Logic / Dependency-Skip /
+    # State-Fallback / Session-Quarantäne)
+    # -------------------------------------------------------------------------
+    def execute_set_resilient(
+        self,
+        set_definition: Dict[str, Any],
+        df: pd.DataFrame,
+        context: Optional[PluginContext] = None,
+    ) -> Dict[str, Any]:
+        """Führt die Service-Pipeline elastisch aus (P14-03) – Ablösung des
+        strikten Fail-Fast-Prinzips (A.3/A.4 des Kapitels):
+
+        * Skip-Logic: Schlägt ein unkritischer Service fehl, wird er geloggt
+          (strukturiertes Fehlerobjekt unter self.last_errors) und mit
+          skip_reason in self.last_skipped markiert. Unabhängige Services
+          laufen weiter.
+        * Dependency-Skip: Services, die per depends_on von der fehlerhaften
+          instance_id abhängen, werden mit skip_reason="dependency_failed"
+          übersprungen.
+        * State-Fallback: Der shared_state-Eintrag der VORHERIGEN Kerze einer
+          fehlgeschlagenen Instanz bleibt unangetastet erhalten – der Aufrufer
+          kann exklusiv darüber auf den letzten guten Zustand zugreifen
+          (EvaluationContext.shared_state.get(instance_id)).
+        * RAM-Quarantäne: 3 aufeinanderfolgende Fehler einer Instanz →
+          quarantäne (nur RAM, keine DB-Persistenz); Zähler-Ready nach 300 s
+          ohne Fehler (Invariante 11), Quarantäne bleibt bis reset().
+
+        Der Rückgabewert enthält ausschließlich erfolgreiche Ausführungen
+        (Dict instance_id -> FeatureCalculateResult) – identische Struktur wie
+        execute_set(). Diagnose über self.last_skipped / self.last_errors.
+
+        Raises:
+            ValueError: Ungültige execution_order / statische
+                Abhängigkeits-Verletzung (wie execute_set).
+        """
+        if df is None or df.empty:
+            raise ValueError("execute_set_resilient: df ist None oder leer")
+
+        execution_order = list(set_definition.get("execution_order") or [])
+        services = dict(set_definition.get("services") or {})
+
+        if not execution_order:
+            raise ValueError("execute_set_resilient: execution_order ist leer")
+
+        missing = [iid for iid in execution_order if iid not in services]
+        if missing:
+            raise ValueError(
+                f"execute_set_resilient: instance_ids fehlen in 'services': {missing}")
+
+        if context is None:
+            context = PluginContext(mode="batch")
+
+        # --- Statische Abhängigkeits-Validierung VOR der Ausführung ----------
+        position = {iid: idx for idx, iid in enumerate(execution_order)}
+        for iid, cfg in services.items():
+            for dep in (cfg.get("depends_on") or []):
+                if dep not in position:
+                    raise ValueError(
+                        f"execute_set_resilient: Service '{iid}' depends_on "
+                        f"'{dep}', das nicht in execution_order existiert")
+                if position[dep] >= position[iid]:
+                    raise ValueError(
+                        f"execute_set_resilient: Abhängigkeits-Verletzung – "
+                        f"Service '{iid}' depends_on '{dep}', aber '{dep}' "
+                        f"steht nicht VOR '{iid}' in execution_order")
+
+        # --- Resiliente Pipeline-Ausführung (Skip-Logic) ---------------------
+        results: Dict[str, Any] = {}
+        with self._execution_lock:
+            self.last_skipped.clear()
+            self.last_errors.clear()
+            for iid in execution_order:
+                # Quarantäne-Skip (Session-Scope, RAM only)
+                if self._is_quarantined(iid):
+                    self.last_skipped[iid] = "quarantined"
+                    print(f"WARN [ServiceSetEvaluator] Service '{iid}' "
+                          f"uebersprungen (quarantined)")
+                    continue
+
+                cfg = services[iid]
+                plugin_id = cfg["plugin_id"]
+                lookback = int(cfg.get("lookback") or len(df))
+                params = dict(cfg.get("params") or {})
+
+                # Dependency-Skip: abhängige Instanz fehlgeschlagen oder
+                # quarantänisiert → kontrolliert überspringen.
+                dep_failed = False
+                for dep in (cfg.get("depends_on") or []):
+                    if dep in self.last_skipped or dep in self._quarantined:
+                        self.last_skipped[iid] = "dependency_failed"
+                        print(f"WARN [ServiceSetEvaluator] Service '{iid}' "
+                              f"uebersprungen (dependency_failed: '{dep}')")
+                        dep_failed = True
+                        break
+                if dep_failed:
+                    continue
+
+                # Exakter Zuschnitt auf den Service-lookback
+                service_df = df.tail(lookback)
+
+                # Context je Service: instance_id + depends_on setzen (Namespace).
+                service_ctx = replace(
+                    context,
+                    instance_id=iid,
+                    depends_on=list(cfg.get("depends_on") or []),
+                )
+
+                try:
+                    result = self.executor.execute(
+                        plugin_id, service_df, params, context=service_ctx)
+                except PluginExecutionError as e:
+                    self.last_errors[iid] = e.info
+                    quarantined_now = self._record_failure(iid)
+                    self.last_skipped[iid] = "quarantined" if quarantined_now else "error"
+                    print(
+                        f"WARN [ServiceSetEvaluator] Service '{iid}' "
+                        f"(plugin '{plugin_id}') fehlgeschlagen: "
+                        f"{e.info.exception_type}: {e.info.exception_message} "
+                        f"(Fehler #{self._failure_counters.get(iid, 0)})"
+                    )
+                    if quarantined_now:
+                        print(f"WARN [ServiceSetEvaluator] Service '{iid}' fuer "
+                              f"die Session quarantaenisiert (RAM only)")
+                    # State-Fallback: alter shared_state-Eintrag (vorherige
+                    # Kerze) bleibt unangetastet erhalten.
+                    continue
+                except Exception as e:
+                    # Sicherheitsnetz: PluginExecutor kapselt eigentlich alle
+                    # Fehler – hier trotzdem defensiv absichern.
+                    info = PluginExecutionErrorInfo(
+                        timestamp=time.time(),
+                        plugin_id=plugin_id,
+                        instance_id=iid,
+                        symbol=str(getattr(context, "symbol", "") or ""),
+                        timeframe=str(getattr(context, "timeframe", "") or ""),
+                        bar_time=getattr(context, "timestamp", None),
+                        stage="execute_set_resilient",
+                        exception_type=type(e).__name__,
+                        exception_message=str(e),
+                        traceback=traceback.format_exc(),
+                    )
+                    self.last_errors[iid] = info
+                    quarantined_now = self._record_failure(iid)
+                    self.last_skipped[iid] = "quarantined" if quarantined_now else "error"
+                    print(f"WARN [ServiceSetEvaluator] Service '{iid}' "
+                          f"(plugin '{plugin_id}') fehlgeschlagen: {e}")
+                    continue
+
+                # Erfolg → Fehlerzähler zurücksetzen, Diagnose-Status bereinigen.
+                self._reset_failure(iid)
+                self.last_skipped.pop(iid, None)
+                self.last_errors.pop(iid, None)
+
+                # Namespace-Isolation (wie execute_set): Ergebnis ablegen, falls
+                # der Service seinen Namespace nicht selbst beschrieben hat.
+                if iid not in context.shared_state:
+                    context.shared_state[iid] = result
+                results[iid] = result
 
         return results

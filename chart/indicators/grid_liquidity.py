@@ -25,6 +25,7 @@ bleibt UNVERÄNDERT als Referenz-Parallelbetrieb erhalten.
 
 import threading
 from datetime import datetime, timezone as dt_timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
@@ -156,6 +157,88 @@ class GridLiquidityIndicator(BaseIndicator):
         """Liefert eine flache Kopie der gecachten Linien (Lock-geschützt)."""
         with self._cache_lock:
             return list(self._cached_grid_lines)
+
+    # ------------------------------------------------- P14-03: Lesepfad (additiv)
+    def read_proximity_from_feature_store(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: Optional[int] = None,
+        db_path: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """P14-03 (Live-Entkopplung A.1.3): Liest fertige Proximity-Hits aus
+        dem feature_store (JSON-Feld feature_data, feature_id='proximity',
+        inkl. schema_version) – der GUI-Lesepfad beim Chart-Re-Render/Refresh
+        OHNE synchrone Service-Pipeline (Invariante 10: definierter Fallback).
+
+        Der Indikator führt hier KEINE Berechnungen aus; er liest ausschließlich
+        vorberechnete Daten aus DuckDB. Liefert die Hit-Kreise des Proximity-
+        Service ({time, price, in_window}) oder [] bei fehlenden Daten/Fehlern –
+        der Aufrufer entscheidet, ob er auf die Pipeline (calculate) zurückfällt.
+
+        Args:
+            symbol: Symbol-Name
+            timeframe: Timeframe
+            limit: Maximale Anzahl Bars (Default 1000)
+            db_path: Optionaler DB-Pfad (für Tests) – Default analytics.duckdb
+        """
+        if not symbol or not timeframe:
+            return []
+        if db_path is None:
+            db_path = str(Path(__file__).resolve().parent.parent.parent
+                          / "data" / "analytics.duckdb")
+        if limit is None:
+            limit = 1000
+        try:
+            from db_service import DbPool
+            con = DbPool.get(db_path)
+            rows = con.execute("""
+                SELECT EXTRACT('epoch' FROM bar_time)::BIGINT AS time_epoch,
+                       feature_data
+                FROM (
+                    SELECT bar_time, feature_data
+                    FROM feature_store
+                    WHERE symbol = ? AND timeframe = ? AND feature_id = 'proximity'
+                      AND feature_data IS NOT NULL
+                    ORDER BY bar_time DESC
+                    LIMIT ?
+                )
+                ORDER BY bar_time ASC
+            """, [symbol, timeframe, limit]).fetchall()
+        except Exception as e:
+            print(f"WARN [GridLiquidityIndicator] feature_store-Lesepfad "
+                  f"fehlgeschlagen: {e}")
+            return []
+
+        circles: List[Dict[str, Any]] = []
+        for row in rows:
+            time_sec = row[0]
+            if time_sec is None or time_sec <= 0:
+                continue
+            data = row[1] or {}
+            if isinstance(data, str):
+                try:
+                    import json as _json
+                    data = _json.loads(data) or {}
+                except (ValueError, TypeError):
+                    data = {}
+            if not data.get("is_hit"):
+                continue
+            # feature_data enthält levels_hit (Preise der getroffenen Levels)
+            # – je Level ein Hit-Kreis (Farbe setzt der Aufrufer über das
+            # in_window-Flag, wie bei der Live-Pipeline).
+            in_window = bool(data.get("in_time_window"))
+            for lvl in (data.get("levels_hit") or []):
+                try:
+                    circles.append({
+                        "time": time_sec,
+                        "price": float(lvl),
+                        "in_window": in_window,
+                        "priority": 10,
+                    })
+                except (TypeError, ValueError):
+                    continue
+        return circles
 
     # -------------------------------------------------------------- Berechnung
     def _get_app_settings(self) -> Any:

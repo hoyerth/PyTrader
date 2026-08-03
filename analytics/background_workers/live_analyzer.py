@@ -16,6 +16,7 @@ den feature_store; die Tabelle signal_results bleibt nur als Referenz.
 
 import json
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -24,7 +25,13 @@ import pandas as pd
 from PySide6.QtCore import QThread, Signal
 
 from analytics.engine.set_evaluator import SetEvaluator
-from analytics.features.feature_builder import FeatureBuilder, PluginExecutor, prepare_plugin_df
+from analytics.features.feature_builder import (
+    FeatureBuilder,
+    PluginExecutor,
+    PluginExecutionError,
+    prepare_plugin_df,
+)
+from analytics.features.plugins.base_plugin import PluginContext
 from analytics.signals.heuristics.ema_trend import EMATrendSignal
 from analytics.signals.heuristics.atr_filter import ATRFilterSignal
 from analytics.signals.experimental.alternating_arrow_signal import AlternatingArrowSignal
@@ -73,6 +80,18 @@ class LiveAnalyzer(QThread):
         # HistoricalScanner nutzt – der Alt-Pfad bleibt unverändert.
         self.plugin_executor = PluginExecutor()
         self._state_mgr = StateManager()
+
+        # P14-03 (Live-Entkopplung A.1.2): Persistenter EvaluationContext-
+        # Buffer über alle Polls hinweg. Der LiveAnalyzer evaluiert geschlossene
+        # Kerzen mit stark verkürztem Lookback (1-2 Bars) GEGEN dieses im RAM
+        # gepufferte Raster – kein voller Pipeline-Neuaufbau pro Poll.
+        self._live_shared_state: Dict[str, Any] = {}
+        self._live_context = PluginContext(
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            mode="live",
+            shared_state=self._live_shared_state,
+        )
 
         # Verfügbare Signale (kann über set_active_signals() erweitert werden)
         self.signals: Dict[str, Any] = {
@@ -237,6 +256,87 @@ class LiveAnalyzer(QThread):
                     )
                 except Exception as e:
                     self.log_message.emit(f"❌ Plugin-Store-Fehler ({plugin_id}): {e}")
+
+        self._last_processed_bar_time = latest_bar_time
+
+    def _process_plugin_bars_resilient(self) -> None:
+        """P14-03 (Live-Entkopplung A.1.2): Bar-Close-Evaluierung im
+        Hintergrund mit STARK VERKÜRZTEM Lookback (1-2 Bars) gegen das im
+        EvaluationContext.shared_state gepufferte Raster.
+
+        Additiver Seam zum bestehenden Phase-12-Pfad (run() ruft weiterhin
+        _process_plugin_bars auf): Der persistente self._live_context
+        (shared_state = self._live_shared_state) puffert das Grid-Raster über
+        alle Polls hinweg; bei Bar-Close werden nur die letzten 1-2 Bars neu
+        bewertet. Schlägt ein Service fehl, wird der Fehler strukturiert
+        (PluginExecutionErrorInfo) geloggt und der alte shared_state-Eintrag
+        (State-Fallback) bleibt für abhängige Auswertungen erhalten – KEINE
+        DB-Abfragen im Live-Tick, nur bei Bar-Close.
+        """
+        plugins = self._get_active_live_plugins()
+        if not plugins:
+            return
+
+        con = DbPool.get(DB_MARKET)
+        latest_bar_time = con.execute("""
+            SELECT EXTRACT('epoch' FROM MAX("time"))::BIGINT FROM ohlcv_bars
+            WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+              AND "time" IS NOT NULL
+        """, [self.symbol, self.timeframe]).fetchone()[0]
+        if latest_bar_time is None:
+            return
+        latest_bar_time = int(latest_bar_time)
+
+        if self._last_processed_bar_time is not None and latest_bar_time <= self._last_processed_bar_time:
+            return
+
+        df_ohlcv = self.feature_builder.load_ohlcv(
+            self.symbol, self.timeframe, limit=self.lookback_bars
+        )
+        if df_ohlcv.empty:
+            return
+
+        df_plugin = prepare_plugin_df(df_ohlcv)
+        # P14-03: stark verkürzter Lookback (1-2 Bars) gegen das gepufferte
+        # Raster – minimiert Rechnerlast und DB-I/O.
+        df_short = df_plugin.tail(2)
+
+        for preset in plugins:
+            plugin_id = preset.get("plugin_id")
+            # instance_id = plugin_id → GridLinesService schreibt sein Raster
+            # in den persistenten shared_state (Namespace-isoliert).
+            svc_ctx = replace(self._live_context, instance_id=plugin_id)
+            if plugin_id == "proximity":
+                # Proximity liest das Grid-Raster aus shared_state[depends_on[0]].
+                svc_ctx = replace(svc_ctx, depends_on=["grid_lines"])
+            try:
+                result = self.plugin_executor.execute(
+                    plugin_id, df_short, preset.get("params", {}), context=svc_ctx
+                )
+            except PluginExecutionError as e:
+                info = e.info
+                self.log_message.emit(
+                    f"WARN [LiveAnalyzer] LiveService '{plugin_id}' fehlgeschlagen "
+                    f"({info.stage}: {info.exception_type}: "
+                    f"{info.exception_message}) – State-Fallback aktiv"
+                )
+                continue
+            except Exception as e:
+                self.log_message.emit(
+                    f"WARN [LiveAnalyzer] LiveService '{plugin_id}' fehlgeschlagen: {e}"
+                )
+                continue
+            payload = result.get("feature_store_payload", {}) if isinstance(result, dict) else {}
+            if payload:
+                try:
+                    n = self.feature_builder.store_plugin_payload(
+                        self.symbol, self.timeframe, payload
+                    )
+                    self.log_message.emit(
+                        f"Plugin {plugin_id}: {n} Feature-Rows im feature_store"
+                    )
+                except Exception as e:
+                    self.log_message.emit(f"Plugin-Store-Fehler ({plugin_id}): {e}")
 
         self._last_processed_bar_time = latest_bar_time
 

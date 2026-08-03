@@ -289,6 +289,10 @@ class ProximityService(PluginFeature):
                     "depends_on": dep_id,
                     "scan_limit": limit,
                     "visit_pct": visit_pct,
+                    # P14-03 (Invariante 5): explizite schema_version in jedem
+                    # Feature-Payload – der Indikator-Lesepfad (feature_data)
+                    # prüft sie beim Chart-Re-Render.
+                    "schema_version": "1.0.0",
                 },
             },
             "chart_render_payload": {

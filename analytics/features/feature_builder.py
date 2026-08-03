@@ -8,13 +8,16 @@ Stabiler Basis-Stand + Phase-11-Erweiterung: grid_levels (Y-Achsen-Grid-Levels
 und X-Achsen-Zeitfenster-Flags), gekapselt in analytics/features/definitions/.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import importlib
 import inspect
 import json
 import pkgutil
 import sys
 import threading
+import time
+import traceback
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -71,6 +74,66 @@ def _to_utc_datetime(value: Any):
     if hasattr(value, "to_pydatetime"):
         return value.to_pydatetime()
     return value
+
+
+# ==============================================================================
+# P14-03: Strukturierte Fehlerobjekte & In-Memory-Cache-Invalidierung
+# ------------------------------------------------------------------------------
+# Architektur-Invariante 8: Logging verwendet strukturierte Fehlerobjekte
+# (timestamp, plugin, instance, symbol, timeframe, bar, exception, traceback).
+# Architektur-Invariante 13: store_plugin_payload() invalidiert den
+# In-Memory-Cache für (symbol, timeframe).
+# ==============================================================================
+@dataclass
+class PluginExecutionErrorInfo:
+    """Strukturiertes Fehlerobjekt eines fehlgeschlagenen Plugin-Aufrufs.
+
+    Wird von PluginExecutor bei jeder Exception der Ausführungskette erzeugt
+    (stage: resolve / dependency / validate_params / calculate) und als
+    .info am PluginExecutionError mitgereicht. Der ServiceSetEvaluator nutzt
+    es für Skip-Logic, State-Fallback und Session-Quarantäne.
+    """
+    timestamp: float
+    plugin_id: str
+    instance_id: Optional[str]
+    symbol: str
+    timeframe: str
+    bar_time: Optional[int]
+    stage: str
+    exception_type: str
+    exception_message: str
+    traceback: str
+
+
+class PluginExecutionError(Exception):
+    """Getypter Ausführungsfehler mit strukturiertem Fehlerobjekt (.info)."""
+
+    def __init__(self, info: PluginExecutionErrorInfo):
+        self.info = info
+        super().__init__(info.exception_message)
+
+
+_feature_cache_lock = threading.Lock()
+_feature_cache_invalidated: Dict[Tuple[str, str], float] = {}
+
+
+def invalidate_feature_cache(symbol: str, timeframe: str) -> None:
+    """P14-03 (Invariante 13): Meldet die Invalidation des In-Memory-Caches
+    für (symbol, timeframe). Wird bei jedem store_plugin_payload() aufgerufen,
+    damit veraltete Zustände (z. B. in EvaluationContext.shared_state) nicht
+    über einen Refresh hinweg weiterleben."""
+    with _feature_cache_lock:
+        _feature_cache_invalidated[
+            (str(symbol).lower(), str(timeframe).lower())
+        ] = time.time()
+
+
+def feature_cache_last_invalidated(symbol: str, timeframe: str) -> Optional[float]:
+    """Letzter Invalidation-Zeitpunkt für (symbol, timeframe) oder None."""
+    with _feature_cache_lock:
+        return _feature_cache_invalidated.get(
+            (str(symbol).lower(), str(timeframe).lower())
+        )
 
 
 class PluginLoader:
@@ -207,7 +270,16 @@ class PluginRegistry:
 
 
 class PluginExecutor:
-    """Zentrale Schicht für Ausführung, Validierung, Dependency-Ordering & Logging."""
+    """Zentrale Schicht für Ausführung, Validierung, Dependency-Ordering & Logging.
+
+    P14-03 (Ganzheitliche Fehlerkapselung): Sämtliche Exceptions der
+    Ausführungskette eines Plugins – Plugin-Auflösung (resolve), interne
+    Dependency-Aufrufe (dependency), validate_params() und calculate() –
+    werden isoliert abgefangen, in ein strukturiertes Fehlerobjekt
+    (PluginExecutionErrorInfo, Invariante 8) umgewandelt, geloggt und als
+    PluginExecutionError weitergereicht. Der ServiceSetEvaluator entscheidet
+    darüber mit Skip-Logic / Dependency-Skip / Quarantäne.
+    """
 
     def __init__(self, registry: Optional[PluginRegistry] = None):
         self.registry = registry or PluginRegistry()
@@ -227,6 +299,37 @@ class PluginExecutor:
             return plugin.calculate(df, params, context=context)
         return plugin.calculate(df, params)
 
+    @staticmethod
+    def _build_error(
+        plugin_id: str,
+        context: Optional[PluginContext],
+        exc: Exception,
+        stage: str,
+    ) -> "PluginExecutionError":
+        """Baut aus einer Exception das strukturierte Fehlerobjekt (P14-03)."""
+        symbol = getattr(context, "symbol", "") or ""
+        timeframe = getattr(context, "timeframe", "") or ""
+        instance_id = getattr(context, "instance_id", None)
+        bar_time = getattr(context, "timestamp", None)
+        info = PluginExecutionErrorInfo(
+            timestamp=time.time(),
+            plugin_id=plugin_id,
+            instance_id=instance_id,
+            symbol=str(symbol),
+            timeframe=str(timeframe),
+            bar_time=bar_time,
+            stage=stage,
+            exception_type=type(exc).__name__,
+            exception_message=str(exc),
+            traceback=traceback.format_exc(),
+        )
+        print(
+            f"WARN [PluginExecutor] {stage} fehlgeschlagen: plugin='{plugin_id}' "
+            f"instance='{instance_id}' {symbol}/{timeframe} – "
+            f"{info.exception_type}: {info.exception_message}"
+        )
+        return PluginExecutionError(info)
+
     def execute(
         self,
         plugin_id: str,
@@ -234,20 +337,36 @@ class PluginExecutor:
         params: Dict[str, Any],
         context: Optional[PluginContext] = None,
     ) -> FeatureCalculateResult:
-        plugin = self.registry.get(plugin_id)
+        # 0. Plugin-Auflösung (Registry) – Fehler werden strukturiert gekapselt.
+        try:
+            plugin = self.registry.get(plugin_id)
+        except Exception as e:
+            raise self._build_error(plugin_id, context, e, "resolve") from e
 
         # 1. Dependency Resolution (falls Abhängigkeiten angegeben sind) –
-        #    Context wird auch an Abhängigkeiten durchgereicht.
+        #    Context wird auch an Abhängigkeiten durchgereicht. Fehler in
+        #    Dependency-Aufrufen werden unter der Dependency-plugin_id gekapselt.
         for dep_id in plugin.dependencies:
-            dep_plugin = self.registry.get(dep_id)
-            self._call_calculate(dep_plugin, df, dep_plugin.default_params, context)
+            try:
+                dep_plugin = self.registry.get(dep_id)
+                self._call_calculate(dep_plugin, df, dep_plugin.default_params, context)
+            except PluginExecutionError:
+                raise
+            except Exception as e:
+                raise self._build_error(dep_id, context, e, "dependency") from e
 
         # 2. Parametervalidierung
-        validated_params = plugin.validate_params(params)
+        try:
+            validated_params = plugin.validate_params(params)
+        except Exception as e:
+            raise self._build_error(plugin_id, context, e, "validate_params") from e
 
         # 3. Stateless Execution – Context (inkl. shared_state) wird durchgereicht,
         #    damit Services den shared_state erreichen (Schritt 3 Evaluator).
-        return self._call_calculate(plugin, df, validated_params, context)
+        try:
+            return self._call_calculate(plugin, df, validated_params, context)
+        except Exception as e:
+            raise self._build_error(plugin_id, context, e, "calculate") from e
 
 
 class FeatureBuilder:
@@ -456,6 +575,9 @@ class FeatureBuilder:
                     plugin_version = EXCLUDED.plugin_version,
                     feature_data = EXCLUDED.feature_data
             """, rows)
+            # P14-03 (Invariante 13): In-Memory-Cache für (symbol, timeframe)
+            # explizit invalidieren (veraltete shared_state-Zustände vermeiden).
+            invalidate_feature_cache(symbol, timeframe)
             return len(rows)
         finally:
             if own_connection:
