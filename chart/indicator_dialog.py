@@ -680,11 +680,10 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		self.combo_service_sel = QComboBox()
 		self.combo_service_sel.currentIndexChanged.connect(self._on_service_selected)
 		svc_row.addWidget(self.combo_service_sel)
-		# Phase 14 P14-01: Info-Button für die markierte Service-Instanz
+		# USER-REQ: Info-Button kompakt (nur Icon 'i'), Tooltip kurz.
 		self.btn_info_service = QPushButton("ℹ")
-		self.btn_info_service.setToolTip(
-			"Vollständige Beschreibungsfelder der markierten Service-Instanz "
-			"(Phase 14 P14-01).")
+		self.btn_info_service.setToolTip("Beschreibung des Services")
+		self.btn_info_service.setFixedSize(28, 28)
 		self.btn_info_service.clicked.connect(self._show_service_info)
 		svc_row.addWidget(self.btn_info_service)
 		svc_layout.addLayout(svc_row)
@@ -742,7 +741,10 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		self.btn_save_set = QPushButton("💾 Set speichern")
 		self.btn_save_set.clicked.connect(self.save_service_set)
 		btn_row.addWidget(self.btn_save_set)
-		self.btn_execute_set = QPushButton("▶ Set ausführen")
+		# USER-REQ: Set-ausführen-Button kompakt (nur Icon ▶, Tooltip statt Text)
+		self.btn_execute_set = QPushButton("▶")
+		self.btn_execute_set.setToolTip("Set ausführen")
+		self.btn_execute_set.setFixedSize(28, 28)
 		self.btn_execute_set.clicked.connect(self.execute_service_set)
 		btn_row.addWidget(self.btn_execute_set)
 		self.btn_delete_set = QPushButton("❌ Set löschen")
@@ -1108,6 +1110,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 							pass
 					ctrl = self.create_schema_control(key, cval, spec)
 					self._set_param_controls[f"{iid}:{key}"] = ctrl
+					# USER-REQ: Set bei Aenderung automatisch ausfuehren
+					self._connect_service_param_commit(ctrl)
 					pf.addRow(sp_labels.get(key, self._human(key)), ctrl)
 				# Expert-Unterbereich je Service (lookback + expert-Parameter)
 				expert_keys = [k for k in sp_order if sp_schema.get(k, {}).get("expert")]
@@ -1127,6 +1131,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 							cval = sp_params.get(key, spec.get("default"))
 						ctrl = self.create_schema_control(key, cval, spec)
 						self._set_param_controls[f"{iid}:{key}"] = ctrl
+						# USER-REQ: Set bei Aenderung automatisch ausfuehren
+						self._connect_service_param_commit(ctrl)
 						ef.addRow(sp_labels.get(key, self._human(key)), ctrl)
 					vl.addWidget(exp_grp)
 					# 4.4: Auch der Service-Expert-Bereich ist ausklappbar
@@ -1199,11 +1205,20 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		'Service-Parameter' + Expert-Optionen des aktiven Plugins) - also
 		grid_step, proximity_threshold, prox_levels, lookback usw. Diese
 		ueberlagern im Chart die Basis-Logik des Service-Sets (Live-Overlay).
+		USER-REQ: Zusaetzlich werden die aktuellen Werte der Service-Seiten
+		(_set_param_controls) als Live-Overlay gemeldet, damit Aenderungen an
+		Service-Parametern SOFORT im Chart sichtbar werden (on_param_control_
+		changed feuert bei editingFinished ueber create_schema_control).
 		"""
 		logic: Dict[str, Any] = {}
 		for key, ctrl in self.param_controls.items():
 			if not self._is_visual_key(key):
 				logic[key] = self._ctrl_value(ctrl)
+		for fkey, ctrl in self._set_param_controls.items():
+			iid, key = fkey.split(":", 1)
+			if self._is_visual_key(key) or key == "lookback":
+				continue  # Darstellung + Instanz-Setting (lookback) nicht in die Logik
+			logic[key] = self._ctrl_value(ctrl)
 		return logic
 
 	def _build_preset_payload(self) -> Dict[str, Any]:
@@ -1396,6 +1411,31 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		mit dem Service-Set-Adapter.
 		"""
 		self.delete_named_item(self._set_adapter)
+
+	# -------------------------------------------------------------------------
+	# USER-REQ: Automatische Set-Ausfuehrung bei Service-Parameter-Aenderung
+	# -------------------------------------------------------------------------
+
+	def _connect_service_param_commit(self, ctrl: QWidget) -> None:
+		"""Verbindet ein Service-Parameter-Control mit der Auto-Ausfuehrung.
+
+		USER-REQ: Bei Verlassen des Eingabefeldes (editingFinished bei
+		SpinBox/LineEdit) bzw. sofortiger Aenderung (Checkbox/Combo) wird das
+		Set automatisch ausgefuehrt, damit die Aenderung sofort im Chart
+		sichtbar wird. on_param_control_changed (in create_schema_control
+		verbunden) meldet die Werte bereits als Live-Overlay an den Chart;
+		diese Methode ergaenzt nur den Auto-Run.
+		"""
+		if isinstance(ctrl, (QSpinBox, QDoubleSpinBox, QLineEdit)):
+			ctrl.editingFinished.connect(self._on_service_param_commit)
+		elif isinstance(ctrl, QCheckBox):
+			ctrl.toggled.connect(self._on_service_param_commit)
+		elif isinstance(ctrl, QComboBox):
+			ctrl.currentTextChanged.connect(self._on_service_param_commit)
+
+	def _on_service_param_commit(self, *args: Any) -> None:
+		"""Fuehrt das Set nach einer Service-Parameter-Aenderung aus."""
+		self.execute_service_set()
 
 	def execute_service_set(self) -> None:
 		"""Startet den ServiceSetEvaluator für das aktive Set (Hintergrund-Thread)."""
