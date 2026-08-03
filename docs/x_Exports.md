@@ -3,6 +3,8 @@
 ## 1. ORDNERSTRUKTUR
 ```
 PyTrader/
+    Agents.md
+    Architektur.md
     db_service.py
     main.py
     persistent_win.py
@@ -74,6 +76,7 @@ PyTrader/
         engine/
             __init__.py
             base_definition.py
+            description_dialog.py
             service_models.py
             service_set_repository.py
             set_evaluator.py
@@ -171,6 +174,9 @@ PyTrader/
         check_p13_s7.py
         check_p13_service_win_geometry.py
         check_p13_ui_plugins.py
+        check_p14_prop_ui.py
+        check_p14_s1_description.py
+        check_p14_service_params.py
         check_phase12_step1_migration.py
         check_plugin_batch_services.py
         check_plugin_executor.py
@@ -192,6 +198,280 @@ PyTrader/
 ```
 
 ## 2. QUELLCODE
+
+### DATEI: Agents.md
+```md
+# SYSTEM-INSTRUKTIONEN & PROJEKT-REGELN FOR DIE IDE-AI
+
+Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukturen und Logiken mit neu erdachtem KI-Code, damit die Originalsourcen erhalten bleiben. Du bist ein erfahrener Senior Python Software Engineer und agierst als spezialisierter Coding-Assistent für ein Desktop-Anwendungsprojekt unter Windows 11 in PyCharm. Verwende für Tests immer die Datei `test/test.py`, um es übersichtlich zu halten. **Alle neuen Test-Python-Dateien und Test-Datenbanken (z. B. `*.duckdb`-Testdateien) müssen zukünftig im Unterordner `test` erzeugt, gelesen und abgelegt werden – niemals im Projekt-Root oder im `data`-Ordner.**
+
+---
+
+### 0. WICHTIG: `docs/x_Exports.md` BITTE NICHT BEACHTEN
+- **`docs/x_Exports.md` ist KEIN Bestandteil des offiziellen Quellcodes.** Es ist ein reiner, vom Benutzer erzeugter Export-/Clone der Projektdateien zu Dokumentationszwecken (mehrfach kopierte/veraltete Codeduplikate).
+- **Niemals** `docs/x_Exports.md` als Quelle für Code, Logik oder Dateistruktur verwenden, durchsuchen oder daraus Änderungen ableiten. Es spiegelt NICHT den aktuellen Stand des Quellcodes wider.
+- Verbindlich sind ausschließlich die echten Projektdateien (z. B. `main.py`, `chart/chart_win.py`, `chart/js/*.js`, `chart/chart_basics.py`, `db_service.py`, `state_manager.py`, ...).
+
+### 0c. WICHTIG: `docs/AKTUELLE_UMSETZUNG.md` = HAUPTANWEISUNG FÜR UMSETZUNGEN
+- **`docs/AKTUELLE_UMSETZUNG.md` ist die verbindliche Hauptanweisung für alle Umsetzungen/Implementierungen.**
+- Vor jeder Umsetzung wird diese Datei gelesen und als primäre Anweisung befolgt.
+- Bei Konflikten zwischen `docs/AKTUELLE_UMSETZUNG.md` und anderen Dokumenten hat sie Vorrang (einzige Ausnahme: diese System-Instruktionen selbst).
+- Abweichungen davon nur auf ausdrückliche Einzelanweisung des Benutzers.
+
+### 0b. WICHTIG: `docs/Old` NICHT BEACHTEN (Standard)
+- **Alle Dateien im Unterordner `docs/Old` (`docs/Old/x_Architektur.md`, `docs/Old/x_Roadmap.md`, ...) sind archivierte/abgelegte Alt-Dokumente und werden NICHT beachtet.**
+- **Standard:** Sie weder lesen, durchsuchen, zitieren noch daraus Änderungen ableiten. Sie spiegeln NICHT den aktuellen Stand des Projekts wider.
+- **Ausnahme:** Nur auf temporäre, ausdrückliche Einzelanweisung des Benutzers darf eine bestimmte Datei aus `docs/Old` ausnahmsweise herangezogen werden.
+
+---
+
+### 1. ROLLE & ARCHITEKTUR-FOKUS
+- Dein Hauptfokus liegt auf sauberer, modularer Python-Entwicklung (Typische Stacks: PySide6/Qt, DuckDB, AsyncIO/APIs, Clean Code Architecture).
+- Halte Code strukturiert, performant und wartbar. Vermeide monolithische Skripte; nutze eine klare Trennung von Logik, Daten und Benutzeroberfläche (z. B. MVC / MVVM).
+
+---
+
+### 2. GOLDENE REGELN DER OBJEKTORIENTIERUNG (OOP) & SYSTEM-ENTKOPPLUNG
+
+1. **Abstraktion durch Abstrakte Basisklassen (ABC & Polymorphie):**
+   * Keine isolierten Funktionen oder ad-hoc Klassen für Business-Logik.
+   * Jede Kern-Komponente (z. B. Signale, Features, Fenster, Indikatoren) **muss** von ihrer jeweiligen abstrakten Basisklasse erben (`SignalDefinition`, `BaseFeature`, `PersistentWindow`, `BaseIndicator`).
+   * Die aufrufende Engine interagiert **ausschließlich** mit dem abstrakten Interface, niemals mit konkreten Implementierungen.
+
+2. **Vollständige Entkopplung & Inversion of Control (IoC):**
+   * **Keine Zirkulären Abhängigkeiten:** Sub-Module (z. B. Worker oder Dialoge) dürfen niemals Kenntnis von konkreten Orchestratoren (wie `MainWindow`) haben.
+   * **Kommunikation über Signals/Slots & Repositories:** UI-Komponenten und Datenverarbeiter kommunizieren strikt asynchron über PyQt-Signals oder Read-Only-Datenbankabfragen.
+   * **Verboten:** Hardcoded Klassennamen-Checks (z. B. `if name == "win_statistics"`) in zentralen Repositories. Fenstertypen müssen sich generisch/dynamisch über Dekoratoren oder Registrys registrieren.
+
+3. **Single Responsibility Principle (SRP - Eine Aufgabe pro Klasse):**
+   * **UI-Klassen (`PySide6`):** Verantwortlich *nur* für Event-Handling und Rendering. Keine Berechnungen, Indikator-Logik oder direkte DB-Verbindungsaufbauten.
+   * **Worker/Engine-Klassen:** Verantwortlich *nur* für Datenverarbeitung und mathematische Evaluierung. Absolut kein UI-Import oder GUI-Code.
+   * **Repository-Klassen:** Kapseln den Datenbank-Zugriff exklusiv (SQL-Abfragen, Connection-Handling).
+
+4. **Offen für Erweiterung, Geschlossen für Änderung (Open/Closed Principle):**
+   * Neue Indikatoren, Strategien oder Fenster müssen durch **Hinzufügen neuer Dateien** implementiert werden können, ohne bestehende Kern-Dateien (`main.py`, `set_evaluator.py`, `feature_builder.py`) modifizieren zu müssen.
+
+5. **Typsicherheit & Verlässliche Datenverträge:**
+   * Strikte Nutzung von Python **Type Hints** (`typing`) für alle Funktionsparameter und Rückgabewerte.
+   * Keine impliziten Dictionaries als Datenverträge zwischen Modulen; Datenströme nutzen definierte Dataframes, Primitive oder Typ-Aliase.
+
+---
+
+### 3. CODE- & ANTWORT-FORMATIERUNG
+- **Prägnanz & Effizienz:** Verzicht auf lange theoretische Vorgeplänkel oder Höflichkeitsfloskeln. Biete direkt die funktionierende Lösung.
+- **Vollständigkeit bei neuen Dateien:** Wenn eine neue Datei oder Klasse erstellt wird, liefere den vollständigen, ausführbaren Code.
+- **Gezielte Refactorings:** Bei Änderungen an bestehendem Code zeige exakt die geänderten Abschnitte oder Methoden mit klaren Hinweisen, wo sie einzufügen sind, statt hunderte Zeilen unveränderten Code zu wiederholen.
+- **Code-Blöcke:** Gib jeden Code-Block mit der expliziten Sprachauszeichnung an (`python ... `) und nenne in der ersten Zeile als Kommentar den relativen Dateipfad (z. B. `# src/database/db_manager.py`).
+- **Dateipfade:** Verwende für Windows-Pfade ausschließlich `pathlib.Path` oder Raw-Strings (`r"..."`), um Pfad-Probleme unter Windows 11 zu vermeiden.
+
+### 4. KEINE UI-TESTS & KEINE REGRESSIONSTESTS (HARTE REGEL)
+- **Führe KEINE UI-Tests (PySide6/Qt/WebEngine) aus.** Sie sind viel zu zeitaufwändig.
+- **Führe KEINE Regressionstests aus.** Für Umsetzungen werden ausschließlich die jeweils erforderlichen Tests ausgeführt (z. B. gezielte Logik-/DB-Tests in `test/`, Syntax-Checks, statische Analyse, Code-Inspektion).
+- **Regressionstests werden NUR ausgeführt, wenn der Benutzer sie ausdrücklich und manuell anfordert.**
+- Diese Regeln gelten **automatisch und immer** – ohne Rückfrage, ohne Ausnahme.
+- Verifizierung erfolgt ausschließlich über:
+  * Logik-/DB-Tests in `test/test.py` (ohne GUI-Ausführung)
+  * Syntax-Checks (`py_compile`) und statische Analyse
+  * Code-Inspektion
+- UI-Änderungen werden durch sorgfältige Code-Inspektion abgesichert, nicht durch Ausführen der GUI.
+
+---
+
+### 5. PROJEKT-KONTEXT & ERKENNTNISSE (Stand 31.07.2026)
+
+**SILVER M1 – Datenbasis & Zeitachse:**
+- Die M1-Daten in `data/market_data.duckdb` sind konsistent mit der MT5-Ground-Truth: **keine leeren Candles, keine Lückenfüller, keine Duplikate, keine ungültigen Candles.**
+- **Zeitkonvention (Wanduhr):** MT5 liefert Zeiten als **Berlin-Wanduhr-encoded Epochs** (empirisch: bei echter UTC 10:00 ist `tick.time` bereits die Zahl „12:00", diff ≈ +7200 s). `sync_market_data()` schreibt sie via `pd.to_datetime(..., unit="s", utc=True)` **1:1** in die DB; `EXTRACT(EPOCH)` und `fetch_historical_candles()` geben genau diese Wanduhr-Epochs an den Chart. ⇒ **Der Chart muss die Epochs DIREKT als Wanduhr formatieren – KEIN Berlin-Offset (+2h/+1h) in `getBerlinParts`, sonst sind alle Labels 2h zu spät.** Das ist automatisch DST-robust (Sommer CEST-encoded / Winter CET-encoded, jeweils direkt korrekt).
+- **Handelspause:** SILVER (XAG) handelt 24/5. Die einzige tägliche Pause ist **Wanduhr 23:00–23:59** (Pause = 3720 s: letzte Bar 22:59 → erste 00:01). Zusätzlich Wochenend-Lücke (Fr 23:00 → So/Mo 00:00 Wanduhr).
+- **Kontext-Regel:** „Keine leeren Candles/Lückenfüller in M1 – Zeitachse muss lückenlos sein außer Handelspause."
+
+**Chart-Leerstelle „30.7.26 23:58" an der Tagesgrenze – GEFIXT (31.07.2026):**
+- **Ursache:** `updateDaySeparators` (chart/js/03_chart_rendering.js) zeichnete Tageslinien mit **gebrochenen Zeiten** (`currTime - 0.5` / `currTime + 0.5`). LWC v5 fügt diese als **Phantom-Index-Slots** in die Timescale ein → sichtbare Leerstelle zwischen zwei Candles. Der Label-Fallback `_continuousTimeMap[ts] || ts` formatierte die Fake-Zeit → „Do 30.07.26 23:58" (Beweis: `test/check_resolve_realtime.js`).
+- **Fix (4 Änderungen):**
+  1. `03_chart_rendering.js`: Separator nutzt jetzt **echte Candle-Zeiten** `prevTime`/`currTime` (statt `±0.5`) → keine Phantom-Slots.
+  2. `01_core.js`: Neue Funktion **`resolveRealTime(ts)`** (Binary-Search auf sortierten `_continuousKeys`) → liefert bei unbekannten Werten den **nächstgelegenen realen Zeitpunkt**, nie die Fake-Zeit.
+  3. `04_live_updates.js`: `tickMarkFormatter`/`timeFormatter` und `updateDaySeparators`-Tag-Berechnung nutzen `resolveRealTime()`; `_continuousKeys` wird bei jedem `applyFullChartUpdate` neu aufgebaut.
+  4. `02_time_utils.js`: **Wanduhr-Fix** – `getBerlinParts`/`formatDT` formatieren die (bereits Wanduhr-encoded) Roh-Epochs direkt ohne Berlin-Offset (+2h/+1h entfernt, `_isBerlinDST` entfällt). Pause = Wanduhr 23:00–23:59 (22:59 → 00:01).
+- **Verifikation:** `node --check` auf allen 4 JS-Dateien, `test/check_resolve_realtime.js` (PASS: 3000/3000 exakte Treffer, Phantom-Zeit → „Fr 31.07.26 00:01" statt „Do 30.07.26 23:58"; Pausen-Grenze 22:59 → 00:01), `test/check_time_utils.js` (PASS), `test/check_html_template.py` (PASS), `test/check_broker_tz.py` (bestätigt: MT5 = Wanduhr-encoded).
+
+**Testdateien in `test` (regelkonform, keine UI):**
+`test.py`, `check_chart_data.py`, `test_db_lock.py`, `check_time_utils.js`, `check_html_template.py`, `check_m1_consistency.py` (Pausen-Erkennung Wanduhr 23:00–23:59), `simulate_chart_mapping.py`, `check_m1_midnight.py`, `check_mt5_m1_boundary.py`, `check_broker_tz.py` (MT5 = Wanduhr-encoded), `check_app_state.py`, `build_cont_map.py` (erzeugt `tmp_cont_map.json`), `check_resolve_realtime.js`.
+
+---
+
+### 6. INKREMENTELLES ARBEITEN & STOPP-PUNKTE (HARTE REGEL)
+
+1. **Niemals die Fortsetzung in eine interaktive Frage/Abfrage setzen:** Die AI darf die Aufforderung zum nächsten Schritt **NIEMALS** in eine User-Interaktion (z. B. `AskQuestion`/Options-Dialog) verpacken. Es besteht die Gefahr, dass der Anwender versehentlich auf „Continue"/Enter/Tab drückt und damit eine Ausführung auslöst, die er nicht angeordnet hat.
+2. **Status nur als einfacher Prompt ausgeben:** Nach Abschluss eines Schrittes gibt die AI ausschließlich den **Status** (was umgesetzt, validiert und committet wurde) als einfachen Text-Prompt aus.
+3. **Warten auf expliziten Startschuss:** Die AI wartet danach, bis der Anwender **ausdrücklich** die Ausführung des nächsten Schrittes anweist (z. B. „continue" / „setze Schritt X um" / konkrete Anweisung). Ohne diesen expliziten Startschuss wird **kein** weiterer Schritt begonnen.
+4. **Keine unbeabsichtigten Folgeaktionen:** Kein automatisches Anstoßen von Folge-Steps, kein vorauseilendes Commit des nächsten Schrittes und keine Vorschlags-Buttons/Abfragen für den nächsten Schritt – nur der reine Statusbericht.
+```
+
+--------------------------------------------------
+
+### DATEI: Architektur.md
+```md
+# Architektur-Dokumentation: PyTrader System-Architektur
+
+## 1. Executive Summary
+
+Dieses Dokument beschreibt die verbindlichen Architektur-Richtlinien für das PyTrader-System. Das Kernziel ist die Bereitstellung einer hochperformanten, vollständig entkoppelten Desktop-Architektur (Python / PySide6 / DuckDB). Sie ermöglicht historische Massen-Scans, Echtzeit-Marktüberwachung (Live-Analyzer) und visuelle Chart-Analysen ohne redundante Code-Basis, Thread-Sperren oder UI-Blockaden.
+
+Der Lösungsansatz basiert auf der **vollständigen Entkopplung von Berechnungs-Engines, Benutzeroberfläche und Speicher-Services** über DuckDB als zentrale, thread-sichere Kommunikationsschicht.
+
+---
+
+## 2. Architektonische Grundfesten
+
+### 2.1. Entkopplung von Berechnung und UI (Datenbank als Brücke)
+
+Die Benutzeroberfläche (Chart-Windows, Statistik-Fenster, Service-Fenster) darf unter keinen Umständen blockiert werden.
+
+* **Backend (Background Worker Threads):** Hintergrund-Prozesse (`HistoricalScanner`, `LiveAnalyzer`) berechnen Daten und schreiben Ergebnisse asynchron in DuckDB.
+
+* **Frontend (PySide6 / Lightweight Charts v5):** Chart-Overlays und Statistik-Widgets greifen *lesend* auf DuckDB zu oder empfangen typisierte Payloads (`ChartRenderPayload`) über die Ausführungsschicht, ohne Berechnungen auf dem GUI-Thread auszuführen.
+
+
+
+```
+ ┌─────────────────────────┐          ┌──────────────────────────┐
+ │  PyTrader Chart-UI      │          │ Background Worker        │
+ │  (PyTraderChartWindow)  │          │ (Scanner / LiveAnalyzer) │
+ └────────────┬────────────┘          └────────────┬─────────────┘
+              │                                    │
+              │ read-only / Payloads               │ write (Bulk / Upsert)
+              ▼                                    ▼
+ ┌───────────────────────────────────────────────────────────────┐
+ │                     DuckDB Data Layer                         │
+ │ - market_data.duckdb : ohlcv_bars                             │
+ │ - analytics.duckdb   : feature_store, signal_results          │
+ │ - app_data.duckdb    : indicator_presets, window_instances    │
+ └───────────────────────────────────────────────────────────────┘
+
+```
+
+### 2.2. Plugin-Architektur (`PluginFeature` & `PluginExecutor`)
+
+Berechnungs-Engines sind strikt zustandslos (*stateless*).
+
+* **Zustandslosigkeit:** Jede Berechnung ist eine reine Funktion `calculate(df, params)`.
+* **Einheitliches Interface:** Neue Features und Indikator-Engines erben von `PluginFeature` unter `analytics/features/plugins/base_plugin.py`.
+* **Zentrale Ausführungsschicht (`PluginExecutor`):** Der Zugriff durch Scanner, LiveAnalyzer oder Chart-UI erfolgt ausschließlich über `PluginExecutor`, der Parametervalidierung (`ParameterSchema`), Dependency-Ordering und Logging übernimmt.
+
+
+### 2.3. Hybrid Feature Store
+
+Um Rechenlast zu minimieren, werden Rohdaten (OHLCV) vorab transformiert:
+
+* **Native High-Speed Spalten:** Häufig abgefragte Werte (`ema_diff`, `rsi_14`, `atr_normalized`) liegen als native Tabellenspalten für maximale Query-Performance vor.
+* **Generisches JSON-Payload:** Beliebige dynamische Zusatzdaten neuer Plugins werden im Feld `feature_data JSON` abgelegt, verknüpft mit der stabilen `feature_id`.
+
+
+
+### 2.4. Thread-Sicherer Database Connection Pool (`DbPool`)
+
+* DuckDB-Connections sind nicht thread-safe. PyTrader verwendet das Thread-Local Singleton `DbPool` (`db_service.py`), bei dem jeder Thread seine eigene Verbindung hält.
+* Dies verhindert File-Locking-Fehler unter Windows und erübrigt globale Threading-Locks auf Datenbankebene.
+
+### 2.5. Verbindliche UI-Regel: Farbwahl ausschließlich über `ColorButton`
+
+Farbwerte im gesamten UI werden **ausschließlich** über das kompakte Custom-Widget `ColorButton` (`chart/widgets/color_button.py`) erfasst – **niemals** über freie Texteingabefelder (`QLineEdit`) oder andere Eingabe-Typen.
+
+* **Geltungsbereich (VERBINDLICH):** Jeder Parameter vom Typ `"color"` im `ParameterSchema` einer Plugin- oder Service-Definition wird **IMMER** als `ColorButton` gerendert – in allen Formular-Generatoren (`indicator_dialog.py`, `service_win.py`) und für alle aktuellen wie zukünftigen Plugin-/Service-Definitionen. Ein Farbparameter ohne `ColorButton` ist ein Fehler.
+* **Alpha-Kanal:** Das optionale Schema-Flag `allow_alpha: bool` (Default `True`) schaltet den Transparenz-Slider im `QColorDialog` frei (`ShowAlphaChannel`).
+* **String-Format (CSS/Chart-kompatibel):**
+  * Alpha = 255 (volle Deckkraft) → Hex-Format `#RRGGBB`.
+  * Alpha < 255 (Teil-Transparenz) → `rgba(r, g, b, a)` (a als Float 0..1).
+  * Beide Formate sind 1:1 kompatibel mit TradingView Lightweight Charts v5 (WebEngine) und HTML/CSS.
+* **Persistenz:** Die von `ColorButton.color()` gelieferten Strings werden unversehrt in Presets, Service-Sets und Chart-State (`display_params`) gespeichert und über den `chart_render_payload` an die Chart-Overlays weitergereicht.
+* **Kompaktes Layout:** `ColorButton` hat eine feste Kompaktgröße (60×24 px) und `QSizePolicy.Fixed` – es blockiert die dynamische Höhen-/Breiten-Berechnung des Prop-Fensters nicht (Roadmap 5.5.2.1 Prämisse 3).
+* **Interaktion:** `colorChanged = Signal(str)` ist mit der Parameter-Aktualisierungs-Logik des Dialogs verknüpft (gleicher Callback wie alle anderen Controls).
+
+---
+
+## 3. Ordner- & Modul-Layout
+
+Das Projekt folgt einer klaren Domain-Struktur:
+
+```text
+PyTrader/
+├── analytics/                      # Analyse- & Berechnungsdomäne
+│   ├── background_workers/         # QThread Hintergrund-Prozesse (Scanner, LiveAnalyzer)
+│   ├── engine/                     # Signal-Evaluierung & Set-Logik (set_evaluator.py)
+│   ├── features/                   # Feature-Generierung & Plugin-System
+│   │   ├── feature_builder.py      # PluginLoader, PluginRegistry, PluginExecutor
+│   │   ├── definitions/            # Konkrete Plugins (grid_liquidity.py, ema_diff.py)
+│   │   └── plugins/                # Plugin-Schnittstellen (base_plugin.py)
+│   └── signals/                    # Signal-Algorithmen (heuristics, ML)
+├── chart/                          # Visualisierungsdomäne
+│   ├── js/                         # Lightweight Charts v5 Module (01_core.js - 05_measurement.js)
+│   ├── indicators/                 # Chart-Indikatoren (grid.py, grid_liquidity.py)
+│   ├── overlays/                   # Signal-Marker Overlays
+│   ├── widgets/                    # Wiederverwendbare UI-Widgets (color_button.py)
+│   ├── chart_win.py                # PyTraderChartWindow (WebEngine-Container)
+│   └── indicator_dialog.py         # Generischer Einstellungs-Dialog
+├── config/                         # App-Einstellungen & State-Modelle
+├── data/                           # DuckDB Datenbanken (*.duckdb)
+├── db_service.py                   # MT5-Sync, DB-Pool & Schema-Migrationen
+├── main.py                         # Haupt-Orchestrator (MainWindow)
+├── persistent_win.py               # Basisklasse für Fenster-Persistence & Registry
+└── state_manager.py                # UI-Status, Fenstergeometrien & Presets
+
+```
+
+---
+
+## 4. Kern-Workflows
+
+### 4.1. Historischer Scan (Batch)
+
+1. User startet den Scan im Service-Fenster (`service_win.py`).
+2. `HistoricalScanner` (QThread) lädt OHLCV-Daten aus `market_data.duckdb`.
+3. Aktive Presets werden anhand von `plugin_id` aus `indicator_presets` gelesen.
+4. Der `PluginExecutor` führt `plugin.calculate(df, params)` aus.
+5. `FeatureStorePayload` wird via Bulk-Insert/Upsert in den `feature_store` geschrieben.
+6. `SignalEngine` evaluiert Signale und schreibt Ergebnisse in `signal_results`.
+
+
+### 4.2. Echtzeit-Analyse (Live-Stream)
+
+1. `LiveTickWorker` empfängt MT5-Ticks, erkennt Bar-Closes und persistiert geschlossene Kerzen.
+2. `LiveAnalyzer` evaluiert für die neue Kerze das Plugin via `PluginExecutor`.
+3. Erzeugte Signale werden in `signal_results` gespeichert und per Qt-Signal (`on_live_signal`) an offene `PyTraderChartWindow`-Instanzen emittiert.
+4. Das Chart-Fenster aktualisiert ausschließlich das Marker-Overlay via JS-Bridge, ohne den Chart neu aufzubauen.
+
+---
+
+## 5. Goldene Regeln der Objektorientierung & Entkopplung (OOP Principles)
+
+Jedes Refactoring und jede Code-Generierung muss strikt folgenden Prinzipien entsprechen:
+
+1. **Abstraktion durch Basisklassen:**
+* Jede Kern-Komponente erbt zwingend von ihrer abstrakten Klasse (`PluginFeature`, `PersistentWindow`, `BaseIndicator`).
+* Aufrufende Schichten interagieren ausschließlich mit dem Interface, nicht mit konkreten Implementierungen.
+
+2. **Entkopplung & Inversion of Control (IoC):**
+* Keine zirkulären Abhängigkeiten: Sub-Module und Background-Worker dürfen niemals Kenntnis von konkreten UI-Orchestratoren (`MainWindow`) haben.
+* Sub-Fenster erben von `PersistentWindow` und registrieren sich über den Dekoratormechanismus (`@register_persistent_window`).
+* Kommunikation erfolgt asynchron über Qt-Signals/Slots oder Read-Only DB-Abfragen.
+
+3. **Single Responsibility Principle (SRP):**
+* **UI-Klassen (`PySide6`):** Nur Event-Handling, Rendering und State-Persistenz. Keine mathematischen Berechnungen.
+* **Worker/Engine-Klassen:** Nur Datenverarbeitung und Logik. Kein GUI-Code oder PySide-UI-Import.
+* **Repository/Service-Klassen:** Kapseln den Datenbank-Zugriff (`db_service.py`, `StatisticsRepository`, `MarketDataRepository`).
+
+4. **Open/Closed Principle:**
+* Neue Indikatoren oder Feature-Plugins werden durch Hinzufügen neuer Dateien unter `analytics/features/definitions` implementiert. Bestehender Rumpfcode darf dafür nicht geändert werden.
+
+5. **Typsicherheit:**
+* Strikte Nutzung von Python Type Hints (`typing`, `TypedDict`).
+* Der Datenaustausch zwischen Plugins und UI/Services folgt typisierten Verträgen (`ChartRenderPayload`, `FeatureStorePayload`).
+
+6. **Knappe In-Code-Dokumentation bei Anforderungsänderungen:**
+* Bei allen neuen oder angepassten Logiken (insbesondere manuellen User-Vorgaben) muss direkt in den geänderten Sourcedateien an der betroffenen Stelle ein knapper Inline-Kommentar (1–2 Zeilen, z. B. `# USER-REQ: [Kurzbeschreibung der Anforderung]`) gesetzt werden, der den Grund der Code-Anpassung nachvollziehbar dokumentiert.
+```
+
+--------------------------------------------------
 
 ### DATEI: db_service.py
 ```py
@@ -1954,6 +2234,7 @@ from PySide6.QtWidgets import (
 )
 
 from analytics.background_workers.historical_scanner import HistoricalScanner
+from analytics.engine.description_dialog import ServiceDescriptionDialog
 from analytics.engine.service_set_repository import ServiceSetRepository
 from analytics.engine.set_evaluator import ServiceSetEvaluator
 from persistent_win import PersistentWindow, register_persistent_window
@@ -2166,6 +2447,9 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         self.combo_tf_set: QComboBox = self.ui.findChild(QComboBox, "combo_tf_set")
         self.btn_refresh_sets: QPushButton = self.ui.findChild(QPushButton, "btn_refresh_sets")
         self.edit_set_name: QLineEdit = self.ui.findChild(QLineEdit, "edit_set_name")
+        # Phase 14 P14-01: Set-Beschreibung + Info-Button (ServiceDescriptionDialog)
+        self.edit_set_description: Optional[QLineEdit] = self.ui.findChild(QLineEdit, "edit_set_description")
+        self.btn_info_service: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_info_service")
         self.list_execution_order: QListWidget = self.ui.findChild(QListWidget, "list_execution_order")
         self.btn_move_up: QPushButton = self.ui.findChild(QPushButton, "btn_move_up")
         self.btn_move_down: QPushButton = self.ui.findChild(QPushButton, "btn_move_down")
@@ -2229,6 +2513,8 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             self.central_layout.setSpacing(6)
             self.central_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self._service_param_controls: Dict[Any, QWidget] = {}
+        # Phase 14 P14-01: Beschreibungs-Eingabefelder der Service-Instanzen
+        self._service_desc_controls: Dict[str, QWidget] = {}
 
         if self.btn_start:
             self.btn_start.clicked.connect(self.start_scan)
@@ -2244,6 +2530,13 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             self.btn_move_down.clicked.connect(lambda: self.move_order_item(1))
         if self.btn_remove_instance:
             self.btn_remove_instance.clicked.connect(self.remove_instance)
+        # Phase 14 P14-01: Info-Button + itemClicked-Selektion der Instanzliste
+        self._current_list_iid: Optional[str] = None
+        if self.list_execution_order:
+            self.list_execution_order.itemClicked.connect(self._on_order_item_clicked)
+            self.list_execution_order.itemSelectionChanged.connect(self._sync_list_selection)
+        if self.btn_info_service:
+            self.btn_info_service.clicked.connect(self._show_service_info)
         if self.btn_add_instance:
             self.btn_add_instance.clicked.connect(self.add_instance)
             if self.edit_new_instance:
@@ -2392,11 +2685,14 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             self._clear_set_editor()
 
     def _clear_set_editor(self) -> None:
-        """Leert Name-Feld und execution_order-Liste des Set-Editors."""
+        """Leert Name-Feld, Beschreibung und execution_order-Liste des Set-Editors."""
         self._current_set_id = None
         self._current_set_definition = None
+        self._current_list_iid = None
         if self.edit_set_name:
             self.edit_set_name.clear()
+        if self.edit_set_description:
+            self.edit_set_description.clear()
         if self.list_execution_order:
             self.list_execution_order.clear()
         self._clear_service_columns()
@@ -2422,8 +2718,11 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         """
         self._current_set_id = definition.get("set_id")
         self._current_set_definition = definition
+        self._current_list_iid = None
         if self.edit_set_name:
             self.edit_set_name.setText(definition.get("display_name") or "")
+        if self.edit_set_description:
+            self.edit_set_description.setText(definition.get("description") or "")
         if self.list_execution_order:
             self.list_execution_order.clear()
             services = definition.get("services") or {}
@@ -2433,6 +2732,7 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
                 item = QListWidgetItem(f"{iid}  [{plugin_id}]")
                 item.setData(Qt.UserRole, iid)
                 item.setData(Qt.UserRole + 1, plugin_id)
+                item.setToolTip(self._build_tooltip(iid, cfg))
                 self.list_execution_order.addItem(item)
         self._build_service_columns(definition)
 
@@ -2522,6 +2822,7 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         item = QListWidgetItem(f"{iid}  [{plugin_id}]")
         item.setData(Qt.UserRole, iid)
         item.setData(Qt.UserRole + 1, plugin_id)
+        item.setToolTip(self._build_tooltip(iid, {"plugin_id": plugin_id}))
         self.list_execution_order.addItem(item)
         self.edit_new_instance.clear()
         self.log(f"Service hinzugefügt: {iid} [{plugin_id}]")
@@ -2575,12 +2876,87 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             else:
                 cfg.setdefault("params", {})[key] = self._ctrl_value(ctrl)
 
+        # Phase 14 P14-01: Instanz-Beschreibung aus den Spalten übernehmen
+        # (ServiceInstanceConfig.description – gehört NICHT in params).
+        for iid, ctrl in self._service_desc_controls.items():
+            cfg = services.setdefault(iid, {"plugin_id": "", "lookback": 1000, "params": {}})
+            cfg["description"] = ctrl.text().strip()
+
         return {
             "set_id": self._current_set_id or "",
             "display_name": self.edit_set_name.text().strip() if self.edit_set_name else "",
+            # Phase 14 P14-01: Set-Beschreibung wird mitgespeichert
+            "description": self.edit_set_description.text().strip() if self.edit_set_description else "",
             "execution_order": order,
             "services": services,
         }
+
+    # =========================================================================
+    # Phase 14 P14-01: Tooltips & Info-Dialog für Service-Instanzen
+    # =========================================================================
+
+    def _build_tooltip(self, instance_id: str, config: Dict[str, Any]) -> str:
+        """Baut einen Rich-Text-Tooltip (HTML) für eine Service-Instanz.
+
+        Angezeigt werden instance_id, Plugin-ID und – falls vorhanden – die
+        individuelle Instanz-Beschreibung (ServiceInstanceConfig.description).
+        """
+        lines = [f"<b>{instance_id}</b>", f"Plugin: {config.get('plugin_id', '?')}"]
+        desc = config.get("description")
+        if desc:
+            lines.append(f"<i>{desc}</i>")
+        return "<br>".join(lines)
+
+    def _update_service_tooltip(self, iid: str) -> None:
+        """Aktualisiert den Tooltip des Listen-Items live beim Tippen."""
+        if not self.list_execution_order:
+            return
+        for i in range(self.list_execution_order.count()):
+            item = self.list_execution_order.item(i)
+            if item.data(Qt.UserRole) == iid:
+                cfg: Dict[str, Any] = {"plugin_id": item.data(Qt.UserRole + 1) or iid}
+                desc_ctrl = self._service_desc_controls.get(iid)
+                if desc_ctrl is not None:
+                    cfg["description"] = desc_ctrl.text().strip()
+                item.setToolTip(self._build_tooltip(iid, cfg))
+                break
+
+    def _on_order_item_clicked(self, item: QListWidgetItem) -> None:
+        """Merkt sich die aktuell markierte instance_id (itemClicked)."""
+        if item is not None:
+            self._current_list_iid = item.data(Qt.UserRole)
+
+    def _sync_list_selection(self) -> None:
+        """Synchronisiert _current_list_iid mit der aktuellen Selektion."""
+        if self.list_execution_order is not None:
+            row = self.list_execution_order.currentRow()
+            if row >= 0:
+                self._current_list_iid = self.list_execution_order.item(row).data(Qt.UserRole)
+
+    @Slot()
+    def _show_service_info(self) -> None:
+        """Öffnet den ServiceDescriptionDialog für die markierte Instanz."""
+        iid = self._current_list_iid
+        if not iid or self.list_execution_order is None:
+            self.log("Keine Service-Instanz markiert.")
+            return
+        cfg: Dict[str, Any] = {}
+        plugin = None
+        if self._current_set_definition:
+            cfg = dict((self._current_set_definition.get("services") or {}).get(iid, {}))
+        # Live-Beschreibung aus dem Eingabefeld übernehmen (falls vorhanden)
+        desc_ctrl = self._service_desc_controls.get(iid)
+        if desc_ctrl is not None:
+            cfg["description"] = desc_ctrl.text().strip()
+        plugin_id = cfg.get("plugin_id") or iid
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            plugin = PluginRegistry().get(plugin_id)
+        except KeyError:
+            self.log(f"Plugin '{plugin_id}' nicht gefunden.")
+            return
+        dlg = ServiceDescriptionDialog.from_plugin(plugin, instance_id=iid, config=cfg, parent=self)
+        dlg.exec()
 
     # =========================================================================
     # Phase 13 5.4 Schritt 1: Breiten- & Höhendynamisches Layout (Service-Spalten)
@@ -2716,6 +3092,7 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             if w is not None:
                 w.deleteLater()
         self._service_param_controls = {}
+        self._service_desc_controls = {}
 
     def _build_service_columns(self, set_definition: Dict[str, Any]) -> None:
         """Baut die dynamischen Service-Spalten (Roadmap 5.4.2.2).
@@ -2780,6 +3157,20 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         params = dict(cfg.get("params") or {})
         lookback = cfg.get("lookback")
 
+        # Phase 14 P14-01: Individuelle Instanz-Beschreibung (bearbeitbar) –
+        # wird in ServiceInstanceConfig.description gespeichert und in
+        # Tooltip + Info-Dialog angezeigt.
+        desc_row = QHBoxLayout()
+        desc_label = QLabel("Beschreibung:")
+        desc_edit = QLineEdit()
+        desc_edit.setPlaceholderText("Individuelle Anmerkung für diese Instanz (optional)")
+        desc_edit.setText(str(cfg.get("description") or ""))
+        self._service_desc_controls[iid] = desc_edit
+        desc_edit.textChanged.connect(lambda _t, iid=iid: self._update_service_tooltip(iid))
+        desc_row.addWidget(desc_label)
+        desc_row.addWidget(desc_edit)
+        vl.addLayout(desc_row)
+
         # Normale (Nicht-Expert-, Nicht-Darstellungs-)Parameter
         form = QFormLayout()
         for key in order:
@@ -2787,6 +3178,15 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             if spec.get("expert") or self._is_visual_key(key):
                 continue
             cval = params.get(key, spec.get("default"))
+            # USER-REQ: P14-01 Nachtrag - Alt-Sets speichern die 6 Custom-Levels
+            # als Aggregat custom_levels (Liste/String) statt als Einzelparameter
+            # prox_level1..6 - leere Level-Felder werden daraus vorbefüllt.
+            if key.startswith("prox_level") and not cval:
+                try:
+                    from analytics.features.definitions.grid_lines_service import map_custom_levels_to_prox_levels
+                    cval = map_custom_levels_to_prox_levels(params).get(key, cval)
+                except Exception:
+                    pass
             ctrl = self._create_param_control(key, cval, spec)
             self._service_param_controls[(iid, key)] = ctrl
             form.addRow(labels.get(key, self._human(key)), ctrl)
@@ -20711,6 +21111,203 @@ class SignalDefinition(ABC):
 
 --------------------------------------------------
 
+### DATEI: analytics/engine/description_dialog.py
+```py
+# analytics/engine/description_dialog.py
+"""
+Phase 14 P14-01 – ServiceDescriptionDialog.
+
+Zeigt die vollständigen Beschreibungsfelder einer Service-Instanz / eines
+Plugins / eines Service-Sets an: Plugin-Name, Version, API-Version, Autor,
+Kurz-Beschreibung, description_long (Markdown-Hilfe) und condition_rules
+(strukturierte Regeln) in einem sauberen Read-Only QTextBrowser.
+
+Design-Regeln:
+- Headless-fähig instanziierbar: Der Konstruktor startet KEINEN Event-Loop
+  (kein exec_()); er baut nur das Widget auf. Der Aufrufer entscheidet, ob
+  und wann der Dialog modal angezeigt wird.
+- Rein additiv: Der Dialog importiert keine konkreten Orchestratoren und
+  greift ausschließlich auf übergebene Daten (Plugin-Objekt / dict) zu
+  (Entkopplung, keine zirkulären Abhängigkeiten).
+"""
+
+from typing import Any, Dict, List, Optional
+
+from PySide6.QtWidgets import (
+    QDialog,
+    QHBoxLayout,
+    QPushButton,
+    QTextBrowser,
+    QVBoxLayout,
+)
+
+
+class ServiceDescriptionDialog(QDialog):
+    """Zeigt Plugin-/Service-/Set-Informationen im Read-Only-Modus an.
+
+    Kann wahlweise direkt mit expliziten Feldern ODER komfortabel über die
+    Klassenmethode ``from_plugin()`` aus einem PluginFeature + Instanz-Config
+    befüllt werden (headless instanziierbar, kein exec_() im Konstruktor).
+    """
+
+    def __init__(
+        self,
+        parent=None,
+        *,
+        instance_id: Optional[str] = None,
+        display_name: str = "",
+        plugin_id: str = "",
+        version: str = "1.0.0",
+        api_version: str = "1",
+        author: str = "",
+        description: str = "",
+        description_long: str = "",
+        condition_rules: Optional[List[str]] = None,
+        instance_description: str = "",
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Service-Informationen")
+        self.setMinimumWidth(480)
+
+        layout = QVBoxLayout(self)
+
+        browser = QTextBrowser()
+        browser.setReadOnly(True)
+        browser.setOpenExternalLinks(True)
+        browser.setHtml(self._render_html(
+            instance_id=instance_id,
+            display_name=display_name,
+            plugin_id=plugin_id,
+            version=version,
+            api_version=api_version,
+            author=author,
+            description=description,
+            description_long=description_long,
+            condition_rules=condition_rules,
+            instance_description=instance_description,
+        ))
+        layout.addWidget(browser)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        close_btn = QPushButton("Schließen")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+    # -------------------------------------------------------------------------
+    # Fabrik-Methode: bequeme Befüllung aus PluginFeature + Instanz-Config
+    # -------------------------------------------------------------------------
+    @classmethod
+    def from_plugin(
+        cls,
+        plugin: Any,
+        instance_id: str = "",
+        config: Optional[Dict[str, Any]] = None,
+        parent=None,
+    ) -> "ServiceDescriptionDialog":
+        """Baut den Dialog aus einem PluginFeature und einer optionalen
+        ServiceInstanceConfig (description der Instanz)."""
+        meta = dict(getattr(plugin, "metadata", None) or {})
+        cfg = dict(config or {})
+        return cls(
+            parent=parent,
+            instance_id=instance_id or "",
+            display_name=str(meta.get("display_name", "") or ""),
+            plugin_id=str(getattr(plugin, "plugin_id", "") or ""),
+            version=str(getattr(plugin, "version", "1.0.0") or "1.0.0"),
+            api_version=str(meta.get("api_version", "1") or "1"),
+            author=str(meta.get("author", "") or ""),
+            description=str(meta.get("description", "") or ""),
+            description_long=str(meta.get("description_long", "") or ""),
+            condition_rules=list(meta.get("condition_rules") or []),
+            instance_description=str(cfg.get("description", "") or ""),
+        )
+
+    # -------------------------------------------------------------------------
+    # Interna
+    # -------------------------------------------------------------------------
+    @staticmethod
+    def _html_escape(value: str) -> str:
+        """Minimaler HTML-Escape für Anzeige-Strings (kein externer Import)."""
+        return (
+            str(value)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
+    def _render_html(
+        self,
+        *,
+        instance_id: Optional[str],
+        display_name: str,
+        plugin_id: str,
+        version: str,
+        api_version: str,
+        author: str,
+        description: str,
+        description_long: str,
+        condition_rules: Optional[List[str]],
+        instance_description: str,
+    ) -> str:
+        """Erzeugt das Read-Only-HTML des Dialogs (sauber strukturiert)."""
+        e = self._html_escape
+        parts: List[str] = []
+
+        # Kopf: Instanz (falls vorhanden) + Plugin-Name + Version
+        head = ""
+        if instance_id:
+            head += f"<b>Instanz:</b> {e(instance_id)}<br>"
+        if display_name:
+            head += f"<b>{e(display_name)}</b>"
+        if plugin_id:
+            head += f" <i>({e(plugin_id)})</i>"
+        if version:
+            head += f" &mdash; v{e(version)}"
+        if head.strip():
+            parts.append(f"<h3>{head}</h3>")
+
+        # Meta-Zeile: API-Version + Autor
+        meta_bits = []
+        if api_version:
+            meta_bits.append(f"API-Version: {e(api_version)}")
+        if author:
+            meta_bits.append(f"Autor: {e(author)}")
+        if meta_bits:
+            parts.append(f"<p style='color:#666;'>{' | '.join(meta_bits)}</p>")
+
+        # Instanz-Beschreibung (ServiceInstanceConfig.description)
+        if instance_description:
+            parts.append(f"<p><b>Instanz-Anmerkung:</b><br>{e(instance_description)}</p>")
+
+        # Kurz-Beschreibung
+        if description:
+            parts.append(f"<p><b>Beschreibung:</b><br>{e(description)}</p>")
+
+        # Lange Beschreibung (Markdown-Hilfe)
+        if description_long:
+            parts.append(f"<p><b>Details:</b><br>{e(description_long)}</p>")
+
+        # Strukturierte Regeln
+        rules = [r for r in (condition_rules or []) if str(r).strip()]
+        if rules:
+            items = "".join(f"<li>{e(r)}</li>" for r in rules)
+            parts.append(f"<p><b>Regeln:</b></p><ul>{items}</ul>")
+
+        if not parts:
+            parts.append("<p>Keine Beschreibungsfelder hinterlegt.</p>")
+
+        return (
+            "<html><body style='font-family:Segoe UI, sans-serif; font-size:12px;'>"
+            + "".join(parts)
+            + "</body></html>"
+        )
+
+```
+
+--------------------------------------------------
+
 ### DATEI: analytics/engine/service_models.py
 ```py
 # analytics/engine/service_models.py
@@ -20741,11 +21338,17 @@ class ServiceInstanceConfig(TypedDict, total=False):
         params:     Plugin-Parameter (werden gegen das parameter_schema validiert).
         depends_on: Optional. instance_ids, deren shared_state-Einträge dieser
                     Service liest (muss früher in execution_order stehen).
+        description: Optional (Phase 14 P14-01). Individuelle Anmerkung für
+                    diese Instanz (wird im Tooltip/Info-Dialog angezeigt).
+        version:    Optional (Phase 14 P14-01). Plugin-Version dieser Instanz,
+                    Default "1.0.0" (Semantic Versioning major.minor.patch).
     """
     plugin_id: str
     lookback: int
     params: Dict[str, Any]
     depends_on: Optional[List[str]]
+    description: Optional[str]
+    version: Optional[str]
 
 
 class ServiceSetDefinition(TypedDict, total=False):
@@ -20767,6 +21370,7 @@ class ServiceSetDefinition(TypedDict, total=False):
     """
     set_id: str                      # Eindeutige ID (uuid oder Name)
     display_name: str                # Anzeigename (leer → Auto-Name aus instance_ids)
+    description: Optional[str]       # Phase 14 P14-01: Ausführliche Set-/Strategie-Beschreibung
     execution_order: List[str]       # Ausführungs-Reihenfolge der instance_ids
     services: Dict[str, ServiceInstanceConfig]  # instance_id → Konfiguration
 
@@ -20835,9 +21439,12 @@ class ServiceSetRepository:
                 set_id       VARCHAR PRIMARY KEY,
                 display_name VARCHAR,
                 definition   JSON NOT NULL,
+                description  VARCHAR,
                 updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        # Phase 14 P14-01: Additive Spalte für bestehende Datenbanken (idempotent)
+        con.execute("ALTER TABLE service_sets ADD COLUMN IF NOT EXISTS description VARCHAR;")
 
     @staticmethod
     def _default_display_name(definition: Dict[str, Any]) -> str:
@@ -20867,40 +21474,49 @@ class ServiceSetRepository:
         display_name = str(definition.get("display_name") or "").strip()
         if not display_name:
             display_name = self._default_display_name(definition)
+        # Phase 14 P14-01: description optional – wird in der eigenen Spalte
+        # UND im JSON-Payload persistiert (Definition bleibt vollständig).
+        description = definition.get("description")
+        description = str(description).strip() if description is not None else None
 
         payload = {
             "set_id": set_id,
             "display_name": display_name,
+            "description": description,
             "execution_order": definition.get("execution_order", []),
             "services": definition.get("services", {}),
         }
 
         con = self._get_connection()
         con.execute("""
-            INSERT INTO service_sets (set_id, display_name, definition, updated_at)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO service_sets (set_id, display_name, definition, description, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT (set_id) DO UPDATE SET
                 display_name = EXCLUDED.display_name,
                 definition   = EXCLUDED.definition,
+                description  = EXCLUDED.description,
                 updated_at   = EXCLUDED.updated_at
-        """, [set_id, display_name, json.dumps(payload)])
+        """, [set_id, display_name, json.dumps(payload), description])
         return set_id
 
     def get_set(self, set_id: str) -> Optional[Dict[str, Any]]:
         """Lädt eine Service-Set-Definition per set_id (oder None)."""
         con = self._get_connection()
         res = con.execute(
-            "SELECT set_id, display_name, definition FROM service_sets WHERE set_id = ?",
+            "SELECT set_id, display_name, definition, description FROM service_sets WHERE set_id = ?",
             [set_id],
         ).fetchone()
         if not res:
             return None
-        db_set_id, db_display_name, definition_json = res
+        db_set_id, db_display_name, definition_json, db_description = res
         definition = _parse_json_field(definition_json) or {}
         # DB-Spalten sind die Single Source of Truth für set_id/display_name
         definition["set_id"] = str(db_set_id)
         if not definition.get("display_name"):
             definition["display_name"] = db_display_name or ""
+        # Phase 14 P14-01: description aus der DB-Spalte nachziehen
+        if not definition.get("description") and db_description:
+            definition["description"] = db_description
         return definition
 
     def list_sets(self) -> List[Dict[str, Any]]:
@@ -20911,14 +21527,17 @@ class ServiceSetRepository:
         """
         con = self._get_connection()
         rows = con.execute(
-            "SELECT set_id, display_name, definition FROM service_sets ORDER BY updated_at ASC"
+            "SELECT set_id, display_name, definition, description FROM service_sets ORDER BY updated_at ASC"
         ).fetchall()
         sets: List[Dict[str, Any]] = []
-        for db_set_id, db_display_name, definition_json in rows:
+        for db_set_id, db_display_name, definition_json, db_description in rows:
             definition = _parse_json_field(definition_json) or {}
             definition["set_id"] = str(db_set_id)
             if not definition.get("display_name"):
                 definition["display_name"] = db_display_name or ""
+            # Phase 14 P14-01: description aus der DB-Spalte nachziehen
+            if not definition.get("description") and db_description:
+                definition["description"] = db_description
             sets.append(definition)
         return sets
 
@@ -22091,6 +22710,54 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _extract_prox_levels(params: Dict[str, Any]) -> List[float]:
+    """Custom-Levels aus den EINZELPARAMETERN prox_level1..6 (nur > 0).
+
+    Parität zu grid_liquidity._extract_custom_levels(): Einzelwerte werden
+    bevorzugt, wenn mindestens einer > 0 ist.
+    """
+    levels: List[float] = []
+    for i in range(1, 7):
+        v = params.get(f"prox_level{i}")
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if fv > 0.0:
+            levels.append(round(fv, 6))
+    return levels
+
+
+def custom_levels_from_params(params: Dict[str, Any]) -> List[float]:
+    """Custom-Levels aus params: bevorzugt prox_level1..6 (Einzelparameter,
+    Alt-/Neu-Speicherung im Service-Modell), sonst custom_levels (Liste/String).
+
+    USER-REQ: P14-01 Nachtrag - Sets koennen die 6 Level EINZELN
+    (prox_level1..6) ODER als Aggregat (custom_levels) gespeichert haben -
+    beide Formen werden gelesen.
+    """
+    levels = _extract_prox_levels(params)
+    if levels:
+        return levels
+    return _parse_custom_levels(params.get("custom_levels"))
+
+
+def map_custom_levels_to_prox_levels(params: Dict[str, Any]) -> Dict[str, float]:
+    """Mappt gespeicherte custom_levels (Liste/String) auf prox_level1..6.
+
+    USER-REQ: P14-01 Nachtrag - damit Alt-Sets mit Aggregat-Speicherung im
+    Editor (6 Level-Felder) ihre Werte weiterhin anzeigen. Nur Werte > 0
+    werden gemappt; max. 6 Level.
+    """
+    out: Dict[str, float] = {}
+    for i, v in enumerate(_parse_custom_levels(params.get("custom_levels"))[:6], start=1):
+        if v > 0.0:
+            out[f"prox_level{i}"] = float(v)
+    return out
+
+
 class GridLinesService(PluginFeature):
 
     @property
@@ -22109,6 +22776,17 @@ class GridLinesService(PluginFeature):
             "description": "Baut das Grid-Raster in Parität zu grid.py (Center ± steps_around × step_size + Custom-Levels)",
             "author": "PyTrader AI",
             "tags": ["grid", "lines", "raster"],
+            # Phase 14 P14-01: Erweiterte Beschreibungsfelder
+            "description_long": "Baut das Level-Raster exakt wie chart/indicators/"
+                                "grid.py (Zentrierung auf dem letzten Close) und "
+                                "schreibt die Linienliste in den shared_state "
+                                "für nachgelagerte Services (depends_on).",
+            "condition_rules": [
+                "Zentrierung: runden(close / step_size) × step_size",
+                "Levels: center + i × step_size für i in [-steps_around, steps_around]",
+                "Custom-Levels nur > 0",
+            ],
+            "api_version": "1",
         }
 
     @property
@@ -22124,9 +22802,16 @@ class GridLinesService(PluginFeature):
     # --- Single Source of Truth fürs Prop-Fenster (Phase 13 Schritt 5) -------
     @property
     def parameter_order(self) -> List[str]:
+        # USER-REQ: P14-01 Nachtrag - die 6 Custom-Levels werden im Editor als
+        # EINZELPARAMETER prox_level1..6 (Level 1..6, wie grid_liquidity)
+        # gerendert. custom_levels bleibt im parameter_schema (interne Pipeline
+        # & Aggregat-Speicherung), ist aber NICHT in der Darstellungs-Reihenfolge
+        # -> wird im Editor nicht als Komma-Feld gerendert.
         return [
             "show_lines", "line_color",
-            "step_size", "steps_around", "custom_levels",
+            "step_size", "steps_around",
+            "prox_level1", "prox_level2", "prox_level3",
+            "prox_level4", "prox_level5", "prox_level6",
         ]
 
     @property
@@ -22136,7 +22821,12 @@ class GridLinesService(PluginFeature):
             "line_color": "Linien-Farbe",
             "step_size": "Rasterabstand",
             "steps_around": "Level-Anzahl (je Seite)",
-            "custom_levels": "Custom-Levels (kommagetrennt)",
+            "prox_level1": "Level 1",
+            "prox_level2": "Level 2",
+            "prox_level3": "Level 3",
+            "prox_level4": "Level 4",
+            "prox_level5": "Level 5",
+            "prox_level6": "Level 6",
         }
 
     @property
@@ -22150,12 +22840,22 @@ class GridLinesService(PluginFeature):
                 "type": "int", "default": 4, "min": 0, "max": 100,
                 "step": 1, "description": "Level ober-/unterhalb des Zentrums (prox_stepsAround ↔ steps_around)",
             },
-            # Listeneingabe wird bewusst als 'str' deklariert, damit der
-            # Schema-Validator sie unverändert durchreicht (Liste ODER String).
+            # USER-REQ: P14-01 Nachtrag - die 6 Custom-Levels werden im Editor
+            # als EINZELPARAMETER prox_level1..6 gerendert (Level 1..6). Das
+            # Aggregat custom_levels bleibt im Schema erhalten - die interne
+            # Pipeline (GridLiquidityIndicator._build_set_definition) und
+            # Alt-Sets speichern die Level als Liste/String. calculate() liest
+            # beide Formen (custom_levels_from_params).
             "custom_levels": {
                 "type": "str", "default": "",
                 "description": "Custom-Levels, nur > 0 (prox_level1..6 ↔ custom_levels)",
             },
+            "prox_level1": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 1"},
+            "prox_level2": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 2"},
+            "prox_level3": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 3"},
+            "prox_level4": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 4"},
+            "prox_level5": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 5"},
+            "prox_level6": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 6"},
             "show_lines": {
                 "type": "bool", "default": True, "description": "Grid-Linien anzeigen",
             },
@@ -22182,7 +22882,7 @@ class GridLinesService(PluginFeature):
         show_lines = bool(p["show_lines"])
         line_color = str(p.get("line_color") or "").strip()
 
-        custom_levels = _parse_custom_levels(p.get("custom_levels"))
+        custom_levels = custom_levels_from_params(p)
         sorted_levels = build_grid_levels(
             last_close=float(df.iloc[-1]["close"]),
             step_size=step_size,
@@ -22309,6 +23009,15 @@ class GridLiquidityFeature(PluginFeature):
             "description": "Erkennt Preisnähe zu Grid-Leveln inkl. Custom Levels & Zeitfenstern",
             "author": "PyTrader AI",
             "tags": ["grid", "liquidity", "proximity"],
+            # Phase 14 P14-01: Erweiterte Beschreibungsfelder
+            "description_long": "Berechnet prozentuale Treffer von Preispunkten auf "
+                                "Grid-Leveln (Standardraster + Custom Levels) inkl. "
+                                "Zeitfenster-Filter um ganze/halbe Stunde.",
+            "condition_rules": [
+                "Besuch eines Grid-Levels (Toleranz proximity_threshold)",
+                "Zeitfenster-Filter (use_time_filter / time_window_mins)",
+            ],
+            "api_version": "1",
         }
 
     # Phase 13 Schritt 5: Darstellungs-Reihenfolge & Label-Namen liegen AN DEN
@@ -22568,6 +23277,17 @@ class ProximityService(PluginFeature):
             "description": "Prozentuale visit%-Treffer auf den Grid-Linien (Parität zu grid.py) inkl. Feature-Store-Records",
             "author": "PyTrader AI",
             "tags": ["grid", "proximity", "liquidity", "feature-store"],
+            # Phase 14 P14-01: Erweiterte Beschreibungsfelder
+            "description_long": "Liest die Linienliste aus shared_state[depends_on] "
+                                "und wendet die prozentuale visit%-Semantik von "
+                                "grid.py an (visit_min/max je Linie). Schreibt "
+                                "Hit-Records in den Feature-Store.",
+            "condition_rules": [
+                "Treffer: visit_min <= high/low <= visit_max ODER Piercing (low <= lvl <= high)",
+                "in_window-Flag: Minute 0/30 ± time_window_mins (UTC)",
+                "Scan-Fenster: min(statistics_signal_limit, len(df)) von rechts",
+            ],
+            "api_version": "1",
         }
 
     @property
@@ -22927,6 +23647,12 @@ class PluginMetadata(TypedDict):
     description: str
     author: str
     tags: List[str]
+    # Phase 14 P14-01: Erweiterte Beschreibungsfelder (Markdown-Hilfe,
+    # strukturierte Regeln und explizite API-Version). Defaults in
+    # PluginFeature.metadata: description_long="", condition_rules=[], api_version="1".
+    description_long: str
+    condition_rules: List[str]
+    api_version: str
 
 
 class PluginFeature(ABC):
@@ -22949,7 +23675,11 @@ class PluginFeature(ABC):
             "display_name": self.plugin_id.replace("_", " ").title(),
             "description": "",
             "author": "System",
-            "tags": []
+            "tags": [],
+            # Phase 14 P14-01: Defaults für die erweiterten Beschreibungsfelder
+            "description_long": "",
+            "condition_rules": [],
+            "api_version": "1",
         }
 
     @property
@@ -25198,6 +25928,7 @@ from PySide6.QtWidgets import (
 from chart.indicators.base_indicator import BaseIndicator
 from chart.widgets.color_button import ColorButton
 from chart.widgets.named_item_actions import NamedItemAdapter, NamedItemActionsMixin
+from analytics.engine.description_dialog import ServiceDescriptionDialog
 from state_manager import StateManager
 from scrollable_content import ContentScrollMixin
 
@@ -25477,6 +26208,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		self._current_set_id: Optional[str] = current_set_id or None
 		self._current_set_definition: Optional[Dict[str, Any]] = None
 		self._set_param_controls: Dict[str, QWidget] = {}
+		# Phase 14 P14-01: Beschreibungs-Eingabefelder der Service-Instanzen
+		self._set_desc_controls: Dict[str, QWidget] = {}
 		# 5.5 Fix: Live-Overlay der Service-Parameter (logic_params). Wird beim
 		# Oeffnen vom Chart-Window getrennt uebergeben (st['logic_params']),
 		# beim Preset-Laden ersetzt und nach dem Set-Logik-Merge in
@@ -25823,6 +26556,12 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		self.combo_service_sel = QComboBox()
 		self.combo_service_sel.currentIndexChanged.connect(self._on_service_selected)
 		svc_row.addWidget(self.combo_service_sel)
+		# USER-REQ: Info-Button kompakt (nur Icon 'i'), Tooltip kurz.
+		self.btn_info_service = QPushButton("ℹ")
+		self.btn_info_service.setToolTip("Beschreibung des Services")
+		self.btn_info_service.setFixedSize(28, 28)
+		self.btn_info_service.clicked.connect(self._show_service_info)
+		svc_row.addWidget(self.btn_info_service)
 		svc_layout.addLayout(svc_row)
 
 		self.stack_service_forms = _ServiceStack()
@@ -25860,6 +26599,17 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		name_row.addWidget(self.edit_set_name)
 		act_layout.addLayout(name_row)
 
+		# Phase 14 P14-01: Set-Beschreibung unter dem Set-Namen
+		desc_row = QHBoxLayout()
+		desc_row.addWidget(QLabel("Beschreibung:"))
+		self.edit_set_description = QLineEdit()
+		self.edit_set_description.setPlaceholderText(
+			"Ausführliche Set-/Strategie-Beschreibung (optional)")
+		self.edit_set_description.setToolTip(
+			"Individuelle Anmerkung für dieses Service-Set (Phase 14 P14-01).")
+		desc_row.addWidget(self.edit_set_description)
+		act_layout.addLayout(desc_row)
+
 		btn_row = QHBoxLayout()
 		self.btn_new_service_set = QPushButton("✨ Neu")
 		self.btn_new_service_set.clicked.connect(self.create_new_service_set)
@@ -25867,7 +26617,10 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		self.btn_save_set = QPushButton("💾 Set speichern")
 		self.btn_save_set.clicked.connect(self.save_service_set)
 		btn_row.addWidget(self.btn_save_set)
-		self.btn_execute_set = QPushButton("▶ Set ausführen")
+		# USER-REQ: Set-ausführen-Button kompakt (nur Icon ▶, Tooltip statt Text)
+		self.btn_execute_set = QPushButton("▶")
+		self.btn_execute_set.setToolTip("Set ausführen")
+		self.btn_execute_set.setFixedSize(28, 28)
 		self.btn_execute_set.clicked.connect(self.execute_service_set)
 		btn_row.addWidget(self.btn_execute_set)
 		self.btn_delete_set = QPushButton("❌ Set löschen")
@@ -25989,24 +26742,31 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		proximity). Existiert ein Service mit dieser plugin_id im gewählten Set,
 		wird dessen instance_id (z.B. grid_1) übernommen; sonst plugin_id.
 		Ohne Indikator-Deklaration: die Services des gewählten Sets.
+		Phase 14 P14-01: Fallback auf das aktive Plugin als Service, wenn weder
+		Set-Services noch deklarierte Services existieren (konsistent zur
+		Service-Erzeugung in collect_set_definition).
 		"""
 		svc_ids = self._indicator_service_ids()
 		definition = self._current_set_definition
 		services = ((definition or {}).get("services") or {}) if definition else {}
 		if not svc_ids:
-			return [
+			items = [
 				{"instance_id": iid,
 				 "plugin_id": (services.get(iid) or {}).get("plugin_id") or "?"}
 				for iid in ((definition or {}).get("execution_order") or [])
 			]
-		items = []
-		for pid in svc_ids:
-			iid = next(
-				(i for i in ((definition or {}).get("execution_order") or [])
-				 if (services.get(i) or {}).get("plugin_id") == pid),
-				None,
-			)
-			items.append({"instance_id": iid or pid, "plugin_id": pid})
+		else:
+			items = []
+			for pid in svc_ids:
+				iid = next(
+					(i for i in ((definition or {}).get("execution_order") or [])
+					 if (services.get(i) or {}).get("plugin_id") == pid),
+					None,
+				)
+				items.append({"instance_id": iid or pid, "plugin_id": pid})
+		if not items and self.plugin is not None:
+			items = [{"instance_id": self.plugin.plugin_id,
+			          "plugin_id": self.plugin.plugin_id}]
 		return items
 
 	def _service_cfg(self, plugin_id: str) -> Dict[str, Any]:
@@ -26061,9 +26821,13 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 				self._current_set_definition = definition
 				if self.edit_set_name:
 					self.edit_set_name.setText(definition.get("display_name") or "")
+				if self.edit_set_description:
+					self.edit_set_description.setText(definition.get("description") or "")
 		else:
 			if self.edit_set_name:
 				self.edit_set_name.clear()
+			if self.edit_set_description:
+				self.edit_set_description.clear()
 
 		if self.combo_service_sel:
 			self.combo_service_sel.blockSignals(True)
@@ -26087,17 +26851,76 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		self._rebuild_service_stack()
 
 	def _on_service_selected(self, index: int) -> None:
-		"""Wechselt die QStackedWidget-Seite (Seite 0 = aktives Plugin)."""
+		"""Wechselt die QStackedWidget-Seite (Seite i = Service i).
+
+		Phase 14 P14-01: Es gibt keine separate Plugin-Live-Seite mehr –
+		Seite 0 ist der erste Service (Parität zum service_win).
+		"""
 		if not self.stack_service_forms:
 			return
-		self.stack_service_forms.setCurrentIndex(index + 1 if index >= 0 else 0)
+		self.stack_service_forms.setCurrentIndex(max(0, index))
 		# 4.4: Fenster/Box auf die neue Service-Seite nachziehen (dynamische Höhe)
 		if self._ui_ready:
 			self._reflow()
 
+	# -------------------------------------------------------------------------
+	# Phase 14 P14-01: Tooltips & Info-Dialog für Service-Instanzen
+	# -------------------------------------------------------------------------
+
+	def _build_tooltip(self, instance_id: str, config: Dict[str, Any]) -> str:
+		"""Baut einen Rich-Text-Tooltip (HTML) für eine Service-Instanz.
+
+		Angezeigt werden instance_id, Plugin-ID und – falls vorhanden – die
+		individuelle Instanz-Beschreibung (ServiceInstanceConfig.description).
+		"""
+		lines = [f"<b>{instance_id}</b>", f"Plugin: {config.get('plugin_id', '?')}"]
+		desc = config.get("description")
+		if desc:
+			lines.append(f"<i>{desc}</i>")
+		return "<br>".join(lines)
+
+	def _show_service_info(self) -> None:
+		"""Öffnet den ServiceDescriptionDialog für die markierte Service-Instanz.
+
+		Die Selektion kommt aus combo_service_sel (instance_id als UserData);
+		Plugin-Objekt und Instanz-Config werden aus der Registry bzw. dem
+		gewählten Set aufgelöst.
+		"""
+		if not self.combo_service_sel or self.plugin is None:
+			return
+		iid = self.combo_service_sel.currentData()
+		if not iid:
+			return
+		cfg: Dict[str, Any] = {}
+		if self._current_set_definition:
+			cfg = dict((self._current_set_definition.get("services") or {}).get(iid, {}))
+		# Live-Beschreibung aus dem Eingabefeld übernehmen (falls vorhanden)
+		desc_ctrl = self._set_desc_controls.get(str(iid))
+		if desc_ctrl is not None:
+			cfg["description"] = desc_ctrl.text().strip()
+		pid = cfg.get("plugin_id") or iid
+		plugin = None
+		try:
+			from analytics.features.feature_builder import PluginRegistry
+			plugin = PluginRegistry().get(pid)
+		except KeyError:
+			QMessageBox.warning(self, "Plugin nicht gefunden",
+			                    f"Plugin '{pid}' ist nicht registriert.")
+			return
+		dlg = ServiceDescriptionDialog.from_plugin(
+			plugin, instance_id=str(iid), config=cfg, parent=self)
+		dlg.exec()
+
 	def _rebuild_service_stack(self) -> None:
-		"""Baut das QStackedWidget neu: Seite 0 = aktive Service-Parameter des
-		Plugins, weitere Seiten = Services des gewählten Sets."""
+		"""Baut das QStackedWidget neu: EINE Seite pro Service aus dem
+		Service-Modell – Parität zu den Service-Spalten im service_win.
+
+		Phase 14 P14-01: Es werden NUR die im Service-Modell gespeicherten
+		Parameter des jeweiligen Service angezeigt (cfg['params'] + lookback +
+		description). Die frühere 'Seite 0' mit den Plugin-Live-Parametern aus
+		self.params entfällt – sie zeigte Werte, die NICHT im Modell stehen.
+		Rein visuelle Keys (show_*/color) werden ausgeblendet (wie service_win).
+		"""
 		if not self.stack_service_forms:
 			return
 		stack = self.stack_service_forms
@@ -26106,19 +26929,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			stack.removeWidget(w)
 			w.deleteLater()
 		self._set_param_controls = {}
-
-		# Seite 0: Service-Props des aktiven Plugin-Indikators (self.params)
-		page0 = QWidget()
-		form0 = QFormLayout(page0)
-		for key in self.plugin_order:
-			spec = self.plugin_schema.get(key, {})
-			if self._is_visual_key(key) or spec.get("expert"):
-				continue
-			cval = self.params.get(key, spec.get("default"))
-			ctrl = self.create_schema_control(key, cval, spec)
-			self.param_controls[key] = ctrl
-			form0.addRow(self.plugin_labels.get(key, self._human(key)), ctrl)
-		stack.addWidget(page0)
+		self._set_desc_controls = {}
 
 		# Seiten fuer die anzuzeigenden Services (Indikator-Services, sonst
 		# Services des gewählten Sets) – pro Service eine Seite
@@ -26128,6 +26939,17 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			cfg = self._service_cfg(pid)
 			page = QWidget()
 			vl = QVBoxLayout(page)
+			# Phase 14 P14-01: Individuelle Instanz-Beschreibung (bearbeitbar) –
+			# wird in ServiceInstanceConfig.description gespeichert und im
+			# Info-Dialog (ServiceDescriptionDialog) angezeigt.
+			desc_row = QHBoxLayout()
+			desc_row.addWidget(QLabel("Beschreibung:"))
+			desc_edit = QLineEdit()
+			desc_edit.setPlaceholderText("Individuelle Anmerkung für diese Instanz (optional)")
+			desc_edit.setText(str(cfg.get("description") or ""))
+			self._set_desc_controls[iid] = desc_edit
+			desc_row.addWidget(desc_edit)
+			vl.addLayout(desc_row)
 			pf = QFormLayout()
 			vl.addLayout(pf)
 			try:
@@ -26144,14 +26966,28 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 					if key not in sp_order:
 						sp_order.append(key)
 				sp_params = dict(cfg.get("params") or {})
-				# Normale (Nicht-Expert-)Parameter
+				# Normale (Nicht-Expert-, Nicht-Darstellungs-)Parameter –
+				# NUR die im Service-Modell gespeicherten (wie service_win).
 				for key in sp_order:
 					spec = sp_schema.get(key, {})
-					if spec.get("expert"):
+					if spec.get("expert") or self._is_visual_key(key):
 						continue
 					cval = sp_params.get(key, spec.get("default"))
+					# USER-REQ: P14-01 Nachtrag - Alt-Sets speichern die 6
+					# Custom-Levels als Aggregat custom_levels (Liste/String)
+					# statt als Einzelparameter prox_level1..6. Damit die 6
+					# Level-Felder diese Werte trotzdem anzeigen, werden leere
+					# Felder aus dem Aggregat vorbefüllt.
+					if key.startswith("prox_level") and not cval:
+						try:
+							from analytics.features.definitions.grid_lines_service import map_custom_levels_to_prox_levels
+							cval = map_custom_levels_to_prox_levels(sp_params).get(key, cval)
+						except Exception:
+							pass
 					ctrl = self.create_schema_control(key, cval, spec)
 					self._set_param_controls[f"{iid}:{key}"] = ctrl
+					# USER-REQ: Set bei Aenderung automatisch ausfuehren
+					self._connect_service_param_commit(ctrl)
 					pf.addRow(sp_labels.get(key, self._human(key)), ctrl)
 				# Expert-Unterbereich je Service (lookback + expert-Parameter)
 				expert_keys = [k for k in sp_order if sp_schema.get(k, {}).get("expert")]
@@ -26171,6 +27007,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 							cval = sp_params.get(key, spec.get("default"))
 						ctrl = self.create_schema_control(key, cval, spec)
 						self._set_param_controls[f"{iid}:{key}"] = ctrl
+						# USER-REQ: Set bei Aenderung automatisch ausfuehren
+						self._connect_service_param_commit(ctrl)
 						ef.addRow(sp_labels.get(key, self._human(key)), ctrl)
 					vl.addWidget(exp_grp)
 					# 4.4: Auch der Service-Expert-Bereich ist ausklappbar
@@ -26180,7 +27018,14 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 				pf.addRow(QLabel(f"Plugin '{pid}' nicht gefunden."))
 			stack.addWidget(page)
 
-		stack.setCurrentIndex(0)
+		# Phase 14 P14-01: Stack-Seite mit der Combo-Auswahl synchronisieren
+		# (Seite 0 = erster Service; keine separate Plugin-Seite mehr).
+		if self.combo_service_sel is not None:
+			combo_idx = self.combo_service_sel.currentIndex()
+		else:
+			combo_idx = 0
+		if stack.count():
+			stack.setCurrentIndex(max(0, min(combo_idx, stack.count() - 1)))
 		# 4.4: Fenster/Box auf die neue Stack-Seite nachziehen (dynamische Höhe)
 		if self._ui_ready:
 			self._reflow()
@@ -26236,11 +27081,20 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		'Service-Parameter' + Expert-Optionen des aktiven Plugins) - also
 		grid_step, proximity_threshold, prox_levels, lookback usw. Diese
 		ueberlagern im Chart die Basis-Logik des Service-Sets (Live-Overlay).
+		USER-REQ: Zusaetzlich werden die aktuellen Werte der Service-Seiten
+		(_set_param_controls) als Live-Overlay gemeldet, damit Aenderungen an
+		Service-Parametern SOFORT im Chart sichtbar werden (on_param_control_
+		changed feuert bei editingFinished ueber create_schema_control).
 		"""
 		logic: Dict[str, Any] = {}
 		for key, ctrl in self.param_controls.items():
 			if not self._is_visual_key(key):
 				logic[key] = self._ctrl_value(ctrl)
+		for fkey, ctrl in self._set_param_controls.items():
+			iid, key = fkey.split(":", 1)
+			if self._is_visual_key(key) or key == "lookback":
+				continue  # Darstellung + Instanz-Setting (lookback) nicht in die Logik
+			logic[key] = self._ctrl_value(ctrl)
 		return logic
 
 	def _build_preset_payload(self) -> Dict[str, Any]:
@@ -26279,6 +27133,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 
 		if self.edit_set_name:
 			definition["display_name"] = self.edit_set_name.text().strip()
+		if self.edit_set_description:
+			definition["description"] = self.edit_set_description.text().strip()
 
 		# Kein Set geladen → die Indikator-Services (z.B. grid_lines + proximity)
 		# als neue Services, sonst das aktive Plugin (instance_id = plugin_id).
@@ -26307,18 +27163,17 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 				pid = self.plugin.plugin_id
 				params: Dict[str, Any] = {}
 				lookback: int = 1000
-				for key in self.plugin_order:
-					spec = self.plugin_schema.get(key, {})
-					if self._is_visual_key(key) or key == "lookback":
-						continue  # Indi-Props gehören nicht ins Service-Set; lookback ist Instanz-Einstellung
-					if key in self.param_controls:
-						params[key] = self._ctrl_value(self.param_controls[key])
+				# Phase 14 P14-01: Der Plugin-als-Service-Editor liegt jetzt in
+				# den Service-Seiten (_set_param_controls), nicht mehr auf einer
+				# separaten Plugin-Live-Seite (param_controls / self.params).
+				for fkey, ctrl in self._set_param_controls.items():
+					c_iid, key = fkey.split(":", 1)
+					if c_iid != pid:
+						continue
+					if key == "lookback":
+						lookback = int(self._ctrl_value(ctrl))
 					else:
-						params[key] = self.params.get(key, spec.get("default"))
-				if "lookback" in self.param_controls:
-					lookback = int(self._ctrl_value(self.param_controls["lookback"]))
-				else:
-					lookback = int(self.params.get("lookback", 1000) or 1000)
+						params[key] = self._ctrl_value(ctrl)
 				services[pid] = {"plugin_id": pid, "lookback": lookback, "params": params}
 				definition["execution_order"] = [pid]
 
@@ -26336,6 +27191,16 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 				cfg["lookback"] = int(self._ctrl_value(ctrl))
 			else:
 				cfg.setdefault("params", {})[pkey] = self._ctrl_value(ctrl)
+
+		# Phase 14 P14-01: Instanz-Beschreibung aus den Service-Seiten
+		# übernehmen (ServiceInstanceConfig.description – gehört NICHT in params).
+		for iid, ctrl in self._set_desc_controls.items():
+			existing_cfg = services.get(iid) or {}
+			pid = (existing_cfg.get("plugin_id")
+			       or (iid if iid in self._indicator_service_ids()
+			           else (self.plugin.plugin_id if self.plugin else iid)))
+			cfg = services.setdefault(iid, {"plugin_id": pid, "params": {}})
+			cfg["description"] = ctrl.text().strip()
 
 		definition["services"] = services
 		return definition
@@ -26382,6 +27247,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		self._current_set_definition = None
 		if self.edit_set_name:
 			self.edit_set_name.clear()
+		if self.edit_set_description:
+			self.edit_set_description.clear()
 		if self.combo_service_set:
 			self.combo_service_set.blockSignals(True)
 			self.combo_service_set.setCurrentIndex(0)  # "- kein Set -"
@@ -26420,6 +27287,31 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		mit dem Service-Set-Adapter.
 		"""
 		self.delete_named_item(self._set_adapter)
+
+	# -------------------------------------------------------------------------
+	# USER-REQ: Automatische Set-Ausfuehrung bei Service-Parameter-Aenderung
+	# -------------------------------------------------------------------------
+
+	def _connect_service_param_commit(self, ctrl: QWidget) -> None:
+		"""Verbindet ein Service-Parameter-Control mit der Auto-Ausfuehrung.
+
+		USER-REQ: Bei Verlassen des Eingabefeldes (editingFinished bei
+		SpinBox/LineEdit) bzw. sofortiger Aenderung (Checkbox/Combo) wird das
+		Set automatisch ausgefuehrt, damit die Aenderung sofort im Chart
+		sichtbar wird. on_param_control_changed (in create_schema_control
+		verbunden) meldet die Werte bereits als Live-Overlay an den Chart;
+		diese Methode ergaenzt nur den Auto-Run.
+		"""
+		if isinstance(ctrl, (QSpinBox, QDoubleSpinBox, QLineEdit)):
+			ctrl.editingFinished.connect(self._on_service_param_commit)
+		elif isinstance(ctrl, QCheckBox):
+			ctrl.toggled.connect(self._on_service_param_commit)
+		elif isinstance(ctrl, QComboBox):
+			ctrl.currentTextChanged.connect(self._on_service_param_commit)
+
+	def _on_service_param_commit(self, *args: Any) -> None:
+		"""Fuehrt das Set nach einer Service-Parameter-Aenderung aus."""
+		self.execute_service_set()
 
 	def execute_service_set(self) -> None:
 		"""Startet den ServiceSetEvaluator für das aktive Set (Hintergrund-Thread)."""
@@ -36699,6 +37591,563 @@ if __name__ == "__main__":
 
 --------------------------------------------------
 
+### DATEI: test/check_p14_prop_ui.py
+```py
+# test/check_p14_prop_ui.py
+"""
+USER-REQ (Plugin-Prop-Fenster) Verifikation:
+1) 'Set ausfuehren'-Button kompakt (nur Icon ▶, Tooltip 'Set ausführen', 28x28)
+2) Service-Parameter-Aenderung -> bei Verlassen des Eingabefeldes wird das Set
+   automatisch ausgefuehrt (execute_service_set), Aenderung als Live-Overlay
+   (logic_params enthaelt Service-Seiten-Werte)
+3) Service-Beschreibungs-Button kompakt (nur Icon 'i'), Tooltip
+   'Beschreibung des Services'
+Headless, kein exec_().
+"""
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+if os.name != "nt":
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+SETS_DB = os.path.join(TEST_DIR, "p14_propui_sets.duckdb")
+STATE_DB = os.path.join(TEST_DIR, "p14_propui_state.duckdb")
+for db in (SETS_DB, STATE_DB):
+    if os.path.exists(db):
+        os.remove(db)
+
+from PySide6.QtWidgets import QApplication, QDoubleSpinBox  # noqa: E402
+
+from analytics.engine.service_set_repository import ServiceSetRepository  # noqa: E402
+from chart.indicator_dialog import IndicatorSettingsDialog  # noqa: E402
+from chart.indicators.grid_liquidity import GridLiquidityIndicator  # noqa: E402
+from state_manager import StateManager  # noqa: E402
+
+app = QApplication.instance() or QApplication([])
+
+repo = ServiceSetRepository(db_path=SETS_DB)
+repo.save_set({
+    "set_id": "test-set",
+    "display_name": "Test-Set",
+    "execution_order": ["grid_1", "prox_1"],
+    "services": {
+        "grid_1": {
+            "plugin_id": "grid_lines", "lookback": 500,
+            "params": {"step_size": 0.5, "steps_around": 4,
+                       "prox_level1": 100.0, "prox_level2": 0.0,
+                       "prox_level3": 0.0, "prox_level4": 0.0,
+                       "prox_level5": 0.0, "prox_level6": 0.0},
+        },
+        "prox_1": {
+            "plugin_id": "proximity", "lookback": 500, "depends_on": ["grid_1"],
+            "params": {"visit_pct": 0.05, "use_time_filter": True,
+                       "time_window_mins": 5},
+        },
+    },
+})
+
+indicator = GridLiquidityIndicator()
+state_mgr = StateManager(db_path=STATE_DB)
+dlg = IndicatorSettingsDialog(
+    indicator=indicator,
+    current_params=dict(indicator.default_params),
+    current_preset_name="Default",
+    state_manager=state_mgr,
+    on_params_changed_callback=lambda payload, name: None,
+    symbol="SILVER", timeframe="H1",
+    service_set_repo=repo, current_set_id="test-set",
+)
+
+failures = []
+
+# --- [1] Set-ausfuehren-Button kompakt --------------------------------------
+btn = dlg.btn_execute_set
+txt = btn.text().strip()
+print(f"[1] btn_execute_set text={txt.encode('unicode_escape')!r} tooltip={btn.toolTip()!r} min/max={btn.minimumWidth()}x{btn.minimumHeight()} / {btn.maximumWidth()}x{btn.maximumHeight()}")
+if txt not in ("\u25b6",):
+    failures.append(f"btn_execute_set zeigt Text statt nur Icon: {txt!r}")
+if btn.toolTip() != "Set ausführen":
+    failures.append(f"btn_execute_set Tooltip falsch: {btn.toolTip()!r}")
+if not (btn.minimumWidth() == btn.maximumWidth() == 28 and btn.minimumHeight() == btn.maximumHeight() == 28):
+    failures.append(f"btn_execute_set nicht kompakt fixiert: min={btn.minimumWidth()}x{btn.minimumHeight()} max={btn.maximumWidth()}x{btn.maximumHeight()}")
+
+# --- [3] Service-Beschreibungs-Button kompakt --------------------------------
+bi = dlg.btn_info_service
+print(f"[3] btn_info_service text={bi.text().strip().encode('unicode_escape')!r} tooltip={bi.toolTip()!r} min/max={bi.minimumWidth()}x{bi.minimumHeight()} / {bi.maximumWidth()}x{bi.maximumHeight()}")
+if bi.toolTip() != "Beschreibung des Services":
+    failures.append(f"btn_info_service Tooltip falsch: {bi.toolTip()!r}")
+if not (bi.minimumWidth() == bi.maximumWidth() == 28 and bi.minimumHeight() == bi.maximumHeight() == 28):
+    failures.append(f"btn_info_service nicht kompakt fixiert: min={bi.minimumWidth()}x{bi.minimumHeight()} max={bi.maximumWidth()}x{bi.maximumHeight()}")
+
+# --- [2a] Live-Overlay enthaelt Service-Seiten-Werte -------------------------
+logic = dlg._collect_logic_params()
+print(f"[2a] logic_params={ {k: v for k, v in sorted(logic.items())} }")
+if logic.get("step_size") != 0.5:
+    failures.append(f"logic_params enthaelt step_size nicht korrekt: {logic.get('step_size')!r}")
+if logic.get("prox_level1") != 100.0:
+    failures.append(f"logic_params enthaelt prox_level1 nicht korrekt: {logic.get('prox_level1')!r}")
+# Service-Seiten-lookback (iid:lookback) wird NICHT als eigener Key in
+# logic_params aufgeloest (nur der Alt-lookback aus param_controls bleibt).
+svc_lookback_keys = [k for k in dlg._set_param_controls if k.endswith(":lookback")]
+print(f"[2a] service-lookback-Felder im Stack: {len(svc_lookback_keys)} "
+      f"(werden in logic_params uebersprungen)")
+
+# --- [2b] Auto-Ausfuehrung bei editingFinished -------------------------------
+exec_calls = {"n": 0}
+
+
+def _spy_exec():
+    # Nur zaehlen - kein echter Worker-Thread im Headless-Test.
+    exec_calls["n"] += 1
+
+
+dlg.execute_service_set = _spy_exec
+step_ctrl = dlg._set_param_controls.get("grid_1:step_size")
+if not isinstance(step_ctrl, QDoubleSpinBox):
+    failures.append("grid_1:step_size Control fehlt oder falscher Typ")
+else:
+    step_ctrl.setValue(2.5)
+    step_ctrl.editingFinished.emit()
+    print(f"[2b] Auto-Ausfuehrung nach editingFinished: {exec_calls['n']}x (erwartet >= 1)")
+    if exec_calls["n"] < 1:
+        failures.append("editingFinished hat execute_service_set nicht ausgeloest")
+
+print("-" * 60)
+if failures:
+    print("BEFUND: " + "; ".join(failures))
+    sys.exit(1)
+print("BEFUND: Prop-Fenster-UI (kompakte Buttons + Auto-Set-Ausfuehrung + Live-Overlay) OK.")
+sys.exit(0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_p14_s1_description.py
+```py
+# test/check_p14_s1_description.py
+"""
+Phase 14 P14-01 – Headless Validierung (KEINE UI, KEIN exec_()).
+
+Prüft:
+1. ServiceSetRepository: description-Round-Trip (save_set → get_set/list_sets),
+   inkl. Überschreiben (Upsert) und Instanz-Feldern (description/version).
+2. PluginMetadata: neue Felder (description_long, condition_rules, api_version)
+   mit Defaults ("" / [] / "1") in der Basisklasse.
+3. ServiceDescriptionDialog: headless instanziierbar (kein exec_()) und
+   Datenbefüllung (Plugin-Name, Version, API-Version, Autor, Kurz-Beschreibung,
+   description_long, condition_rules, Instanz-Anmerkung) im QTextBrowser.
+
+Test-DB liegt im Unterordner test/ (Regel: keine Test-DBs im Projekt-Root/data).
+"""
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+# Offscreen nur auf Linux/CI; auf Windows nutzt Qt das native Platform-Plugin
+# (der Test zeigt nie ein Fenster / ruft nie exec_() auf).
+if os.name != "nt":
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+TEST_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "p14_s1_test.duckdb")
+if os.path.exists(TEST_DB):
+    os.remove(TEST_DB)
+
+from PySide6.QtWidgets import QApplication, QTextBrowser  # noqa: E402
+
+from analytics.engine.description_dialog import ServiceDescriptionDialog  # noqa: E402
+from analytics.engine.service_set_repository import ServiceSetRepository  # noqa: E402
+from analytics.features.definitions.grid_liquidity import GridLiquidityFeature  # noqa: E402
+from analytics.features.plugins.base_plugin import PluginFeature  # noqa: E402
+
+app = QApplication.instance() or QApplication([])
+
+FAILURES: list = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    status = "PASS" if cond else "FAIL"
+    print(f"[{status}] {name}" + (f" – {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(name)
+
+
+# ---------------------------------------------------------------------------
+# 1) PluginMetadata-Defaults (Basisklasse + Overrides)
+# ---------------------------------------------------------------------------
+class _FakePlugin(PluginFeature):
+    @property
+    def plugin_id(self) -> str:
+        return "fake_plugin"
+
+    @property
+    def parameter_schema(self):
+        return {}
+
+    def calculate(self, df, params, context=None):
+        return {"feature_store_payload": {}, "chart_render_payload": {}}
+
+
+meta = dict(_FakePlugin().metadata)
+check("Basis-Metadata: description_long Default ''", meta.get("description_long") == "")
+check("Basis-Metadata: condition_rules Default []", meta.get("condition_rules") == [])
+check("Basis-Metadata: api_version Default '1'", meta.get("api_version") == "1")
+
+gl_meta = dict(GridLiquidityFeature().metadata)
+check("grid_liquidity: description_long gesetzt", bool(gl_meta.get("description_long")))
+check("grid_liquidity: condition_rules nicht leer", bool(gl_meta.get("condition_rules")))
+check("grid_liquidity: api_version gesetzt", gl_meta.get("api_version") == "1")
+
+# ---------------------------------------------------------------------------
+# 2) ServiceSetRepository – description Round-Trip
+# ---------------------------------------------------------------------------
+repo = ServiceSetRepository(db_path=TEST_DB)
+
+definition = {
+    "set_id": "test-set-1",
+    "display_name": "Mein Test-Set",
+    "description": "Ausführliche Strategie-Beschreibung für den Round-Trip",
+    "execution_order": ["grid_1", "prox_1"],
+    "services": {
+        "grid_1": {
+            "plugin_id": "grid_lines", "lookback": 1000,
+            "params": {"step_size": 0.5},
+            "description": "Meine Grid-Instanz",
+            "version": "1.0.0",
+        },
+        "prox_1": {
+            "plugin_id": "proximity", "lookback": 1000,
+            "params": {},
+            "description": "Meine Proximity-Instanz",
+        },
+    },
+}
+
+saved_id = repo.save_set(definition)
+check("save_set liefert set_id", saved_id == "test-set-1")
+
+loaded = repo.get_set("test-set-1")
+check("get_set: description Round-Trip",
+      loaded is not None and loaded.get("description") == definition["description"])
+check("get_set: Instanz-description erhalten",
+      loaded is not None and loaded["services"]["grid_1"].get("description") == "Meine Grid-Instanz")
+check("get_set: Instanz-version erhalten",
+      loaded is not None and loaded["services"]["grid_1"].get("version") == "1.0.0")
+
+listed = repo.list_sets()
+check("list_sets: enthält description",
+      any(s.get("set_id") == "test-set-1" and s.get("description") == definition["description"] for s in listed))
+
+# Upsert: gleiche set_id überschreibt inkl. neuer description
+definition["description"] = "Aktualisierte Beschreibung"
+repo.save_set(definition)
+loaded2 = repo.get_set("test-set-1")
+check("Upsert: description überschrieben",
+      loaded2 is not None and loaded2.get("description") == "Aktualisierte Beschreibung")
+sets_after = repo.list_sets()
+check("Upsert: kein Duplikat", sum(1 for s in sets_after if s.get("set_id") == "test-set-1") == 1)
+
+# Set ohne description → None / leer (kein Crash, abwärtskompatibel)
+repo.save_set({"set_id": "test-set-2", "display_name": "Ohne Beschreibung",
+               "execution_order": [], "services": {}})
+loaded3 = repo.get_set("test-set-2")
+check("Set ohne description: kein Crash", loaded3 is not None and "set_id" in loaded3)
+
+# ---------------------------------------------------------------------------
+# 3) ServiceDescriptionDialog – headless Instanziierung & Datenbefüllung
+# ---------------------------------------------------------------------------
+dlg = ServiceDescriptionDialog.from_plugin(
+    GridLiquidityFeature(),
+    instance_id="grid_liq_1",
+    config={"description": "Instanz-Anmerkung für den Test"},
+)
+browser = dlg.findChild(QTextBrowser)
+check("Dialog: QTextBrowser vorhanden", browser is not None)
+if browser is not None:
+    text = browser.toPlainText()
+    check("Dialog: Instanz-ID sichtbar", "grid_liq_1" in text)
+    check("Dialog: Plugin-Name sichtbar", "Grid Liquidity & Proximity" in text)
+    check("Dialog: Version sichtbar", "1.0.0" in text)
+    check("Dialog: API-Version sichtbar", "1" in text)
+    check("Dialog: Autor sichtbar", "PyTrader AI" in text)
+    check("Dialog: description_long sichtbar", "Grid-Leveln" in text)
+    check("Dialog: condition_rules sichtbar", "Zeitfenster-Filter" in text)
+    check("Dialog: Instanz-Anmerkung sichtbar", "Instanz-Anmerkung für den Test" in text)
+
+# Minimal-Dialog (Standard-Defaults): headless instanziierbar, zeigt Defaults
+dlg_empty = ServiceDescriptionDialog()
+check("Dialog leer: headless instanziierbar", dlg_empty is not None)
+empty_browser = dlg_empty.findChild(QTextBrowser)
+if empty_browser is not None:
+    check("Dialog leer: Version-Default sichtbar", "1.0.0" in empty_browser.toPlainText())
+    check("Dialog leer: API-Version-Default sichtbar", "API-Version: 1" in empty_browser.toPlainText())
+
+# Dialog mit explizit leeren Feldern → Platzhalter-Text
+dlg_blank = ServiceDescriptionDialog(
+    display_name="", plugin_id="", version="", api_version="",
+    author="", description="", description_long="", condition_rules=[],
+)
+blank_browser = dlg_blank.findChild(QTextBrowser)
+if blank_browser is not None:
+    check("Dialog blank: Platzhalter sichtbar",
+          "Keine Beschreibungsfelder" in blank_browser.toPlainText())
+
+# ---------------------------------------------------------------------------
+print("-" * 60)
+if FAILURES:
+    print(f"FEHLER: {len(FAILURES)} Prüfung(en) fehlgeschlagen: {FAILURES}")
+    sys.exit(1)
+print("ALLE PRÜFUNGEN BESTANDEN (OK)")
+sys.exit(0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_p14_service_params.py
+```py
+# test/check_p14_service_params.py
+"""
+Phase 14 P14-01 – Verifikation: Zeigt der Rahmen 'Service-Parameter' im
+Indikator-Prop-Fenster NUR die im Service-Modell gespeicherten Parameter
+(je nach ausgewähltem Service) – wie im service_win?
+
+P14-01 Nachtrag (User-Vorgabe): Die 6 Custom-Levels des grid_lines-Service
+werden als EINZELPARAMETER prox_level1..6 (Level 1..6) angezeigt – wie vor
+P14-01 auf der Service-Seite. Alt-Sets, die die Level als Aggregat
+custom_levels (Liste/String) speichern, werden auf die 6 Felder vorbefüllt
+(map_custom_levels_to_prox_levels). Das Aggregat-Feld custom_levels wird
+NICHT mehr als Komma-Textfeld gerendert.
+
+Prüfung (headless, kein exec_()):
+1. Test-Set mit grid_1 [grid_lines] + prox_1 [proximity] (mit Modell-Params)
+   in einer Test-DB anlegen.
+2. IndicatorSettingsDialog instanziieren (GridLiquidityIndicator).
+3. Stack-Seiten des Rahmens 'Service-Parameter' inspizieren:
+   - Zeigt Seite 0 (grid_lines) NUR Modell-Params: step_size, steps_around,
+     prox_level1..6, lookback (KEIN custom_levels-Kommafeld)?
+   - prox_1: visit_pct, use_time_filter, time_window_mins, lookback?
+4. Vorbefüllung: Set mit custom_levels '100.0, 101.5' -> Level 1/2 gefüllt.
+5. Service-Konsum: grid_lines_service.calculate() rendert Custom-Levels aus
+   prox_level1..6 UND aus custom_levels (beide Speicherformen).
+"""
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+if os.name != "nt":
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+SETS_DB = os.path.join(TEST_DIR, "p14_svc_params_sets.duckdb")
+STATE_DB = os.path.join(TEST_DIR, "p14_svc_params_state.duckdb")
+for db in (SETS_DB, STATE_DB):
+    if os.path.exists(db):
+        os.remove(db)
+
+import pandas as pd  # noqa: E402
+from PySide6.QtWidgets import QApplication, QDoubleSpinBox  # noqa: E402
+
+from analytics.engine.service_set_repository import ServiceSetRepository  # noqa: E402
+from analytics.features.definitions.grid_lines_service import (  # noqa: E402
+    GridLinesService,
+    custom_levels_from_params,
+)
+from chart.indicator_dialog import IndicatorSettingsDialog  # noqa: E402
+from chart.indicators.grid_liquidity import GridLiquidityIndicator  # noqa: E402
+from state_manager import StateManager  # noqa: E402
+
+app = QApplication.instance() or QApplication([])
+
+# --- Test-Set A: grid_lines mit prox_level1..6 als EINZELPARAMS -------------
+repo = ServiceSetRepository(db_path=SETS_DB)
+repo.save_set({
+    "set_id": "test-set",
+    "display_name": "Test-Set",
+    "description": "Set-Beschreibung",
+    "execution_order": ["grid_1", "prox_1"],
+    "services": {
+        "grid_1": {
+            "plugin_id": "grid_lines", "lookback": 500,
+            "params": {
+                "step_size": 1.5, "steps_around": 6,
+                "prox_level1": 100.0, "prox_level2": 101.5,
+                "prox_level3": 0.0, "prox_level4": 0.0,
+                "prox_level5": 0.0, "prox_level6": 0.0,
+            },
+            "description": "Grid-Instanz",
+        },
+        "prox_1": {
+            "plugin_id": "proximity", "lookback": 500,
+            "depends_on": ["grid_1"],
+            "params": {"visit_pct": 0.1, "use_time_filter": True,
+                       "time_window_mins": 5},
+        },
+    },
+})
+# --- Test-Set B: grid_lines mit custom_levels-Aggregat (Alt-Speicherung) ----
+repo.save_set({
+    "set_id": "test-set-aggr",
+    "display_name": "Test-Set Aggregat",
+    "execution_order": ["grid_1", "prox_1"],
+    "services": {
+        "grid_1": {
+            "plugin_id": "grid_lines", "lookback": 500,
+            "params": {"step_size": 1.0, "steps_around": 2,
+                       "custom_levels": "100.0, 101.5"},
+        },
+        "prox_1": {
+            "plugin_id": "proximity", "lookback": 500, "depends_on": ["grid_1"],
+            "params": {"visit_pct": 0.05, "use_time_filter": True,
+                       "time_window_mins": 5},
+        },
+    },
+})
+
+indicator = GridLiquidityIndicator()
+state_mgr = StateManager(db_path=STATE_DB)
+dlg = IndicatorSettingsDialog(
+    indicator=indicator,
+    current_params=dict(indicator.default_params),
+    current_preset_name="Default",
+    state_manager=state_mgr,
+    on_params_changed_callback=lambda payload, name: None,
+    symbol="SILVER",
+    timeframe="H1",
+    service_set_repo=repo,
+    current_set_id="test-set",
+)
+
+print("=== combo_service_sel ===")
+for i in range(dlg.combo_service_sel.count()):
+    print(f"  [{i}] {dlg.combo_service_sel.itemText(i)} (data={dlg.combo_service_sel.itemData(i)})")
+
+stack = dlg.stack_service_forms
+print(f"=== Stack: {stack.count()} Seiten, aktuell: {stack.currentIndex()} ===")
+
+# --- Bewertung --------------------------------------------------------------
+# Kontrolle über die Control-Keys: was steckt im Rahmen 'Service-Parameter'
+# wirklich als editierbarer Parameter?
+set_ctrl_keys = sorted(dlg._set_param_controls.keys())
+param_ctrl_keys = sorted(dlg.param_controls.keys())
+
+# Echte Plugin-Only-Keys des grid_liquidity-Altplugins (NICHT im Service-Modell
+# von grid_lines/proximity): grid_step + proximity_threshold. prox_level1..6
+# sind jetzt legitime Modell-Params des grid_lines-Service.
+plugin_only = {"grid_step", "proximity_threshold"}
+visual_keys = {"show_lines", "line_color"}
+
+# Erwartete Modell-Params je Instanz (Berechnungs-/Instanz-Felder)
+expected = {
+    "grid_1": {"step_size", "steps_around", "lookback",
+               "prox_level1", "prox_level2", "prox_level3",
+               "prox_level4", "prox_level5", "prox_level6"},
+    "prox_1": {"visit_pct", "use_time_filter", "time_window_mins", "lookback"},
+}
+actual: dict = {}
+for key in set_ctrl_keys:
+    iid, pkey = key.split(":", 1)
+    actual.setdefault(iid, set()).add(pkey)
+
+plugin_params_visible = any(
+    k in param_ctrl_keys for k in plugin_only
+) or any(
+    k in set_ctrl_keys for k in plugin_only
+)
+visual_visible = any(k in set_ctrl_keys for k in visual_keys)
+custom_levels_field_visible = any(k.endswith(":custom_levels") for k in set_ctrl_keys)
+extra_page = stack.count() != 2  # keine separate Plugin-Seite mehr
+model_ok = actual == expected
+
+print("-" * 60)
+print(f"Stack-Seiten: {stack.count()} (erwartet 2: grid_1 + prox_1)")
+print(f"Editierbare Keys im Rahmen (_set_param_controls): {set_ctrl_keys}")
+print(f"Plugin-Only-Keys (grid_step/proximity_threshold) sichtbar: {plugin_params_visible}")
+print(f"Visuelle Keys sichtbar: {visual_visible}")
+print(f"custom_levels-Kommafeld sichtbar: {custom_levels_field_visible}")
+print(f"Modell-Params je Instanz exakt: {model_ok} (ist={actual}, erwartet={expected})")
+
+failures = []
+if plugin_params_visible:
+    failures.append("Plugin-Only-Keys (grid_step/proximity_threshold) sichtbar")
+if visual_visible:
+    failures.append("Visuelle Keys sichtbar")
+if custom_levels_field_visible:
+    failures.append("custom_levels-Kommafeld sichtbar (soll durch 6 Level-Felder ersetzt sein)")
+if extra_page:
+    failures.append("Separate Plugin-Seite vorhanden (stack.count() != 2)")
+if not model_ok:
+    failures.append(f"Modell-Params weichen ab (ist={actual}, erwartet={expected})")
+
+# --- Vorbefüllung aus custom_levels-Aggregat (Set B) ------------------------
+print("\n=== Vorbefuellung aus custom_levels-Aggregat (test-set-aggr) ===")
+dlg2 = IndicatorSettingsDialog(
+    indicator=indicator,
+    current_params=dict(indicator.default_params),
+    current_preset_name="Default",
+    state_manager=state_mgr,
+    on_params_changed_callback=lambda payload, name: None,
+    symbol="SILVER", timeframe="H1",
+    service_set_repo=repo, current_set_id="test-set-aggr",
+)
+lvl1 = dlg2._set_param_controls.get("grid_1:prox_level1")
+lvl2 = dlg2._set_param_controls.get("grid_1:prox_level2")
+lvl1_ok = isinstance(lvl1, QDoubleSpinBox) and abs(lvl1.value() - 100.0) < 1e-6
+lvl2_ok = isinstance(lvl2, QDoubleSpinBox) and abs(lvl2.value() - 101.5) < 1e-6
+print(f"prox_level1 = {lvl1.value() if lvl1 else None} (erwartet 100.0): {lvl1_ok}")
+print(f"prox_level2 = {lvl2.value() if lvl2 else None} (erwartet 101.5): {lvl2_ok}")
+if not lvl1_ok:
+    failures.append("Vorbefuellung prox_level1 aus custom_levels fehlgeschlagen")
+if not lvl2_ok:
+    failures.append("Vorbefuellung prox_level2 aus custom_levels fehlgeschlagen")
+
+# --- Service-Konsum: beide Speicherformen rendern Custom-Levels -------------
+print("\n=== Service-Konsum (grid_lines_service.calculate) ===")
+svc = GridLinesService()
+df = pd.DataFrame({
+    "time": [1000, 1060], "open": [100.0, 100.5], "high": [101.0, 101.5],
+    "low": [99.0, 99.5], "close": [100.2, 100.8],
+})
+res_prox = svc.calculate(df, {"step_size": 0.5, "steps_around": 2,
+                              "prox_level1": 100.0, "prox_level2": 101.5})
+prices_prox = {round(float(l["price"]), 6) for l in res_prox["chart_render_payload"]["lines"]}
+consume_prox_ok = any(abs(p - 100.0) < 1e-6 for p in prices_prox) and \
+                  any(abs(p - 101.5) < 1e-6 for p in prices_prox)
+print(f"prox_level1..2 in Lines: {consume_prox_ok} ({len(prices_prox)} Linien)")
+if not consume_prox_ok:
+    failures.append("grid_lines_service rendert prox_level1..6 nicht")
+
+res_aggr = svc.calculate(df, {"step_size": 0.5, "steps_around": 2,
+                              "custom_levels": "100.0, 101.5"})
+prices_aggr = {round(float(l["price"]), 6) for l in res_aggr["chart_render_payload"]["lines"]}
+consume_aggr_ok = any(abs(p - 100.0) < 1e-6 for p in prices_aggr) and \
+                  any(abs(p - 101.5) < 1e-6 for p in prices_aggr)
+print(f"custom_levels in Lines: {consume_aggr_ok} ({len(prices_aggr)} Linien)")
+if not consume_aggr_ok:
+    failures.append("grid_lines_service rendert custom_levels nicht")
+
+# Helper custom_levels_from_params: Einzel > Aggregat
+helper_ok = custom_levels_from_params(
+    {"prox_level1": 100.0, "custom_levels": "200.0"}) == [100.0]
+print(f"custom_levels_from_params bevorzugt Einzelparams: {helper_ok}")
+if not helper_ok:
+    failures.append("custom_levels_from_params bevorzugt prox_level1..6 nicht")
+
+print("-" * 60)
+if failures:
+    print("BEFUND: " + "; ".join(failures))
+    sys.exit(1)
+print("BEFUND: Rahmen zeigt NUR Modell-Params je Service - 6 Level-Felder "
+      "(prox_level1..6) statt custom_levels-Kommafeld; Vorbefuellung & "
+      "Service-Konsum beider Speicherformen OK.")
+sys.exit(0)
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/check_phase12_step1_migration.py
 ```py
 # test/check_phase12_step1_migration.py
@@ -38734,6 +40183,27 @@ print("LOCKTEST FERTIG")
         </layout>
        </item>
        <item>
+        <layout class="QHBoxLayout" name="layout_set_description">
+         <item>
+          <widget class="QLabel" name="label_set_description">
+           <property name="text">
+            <string>Beschreibung:</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLineEdit" name="edit_set_description">
+           <property name="placeholderText">
+            <string>Ausführliche Set-/Strategie-Beschreibung (optional)</string>
+           </property>
+           <property name="toolTip">
+            <string>Individuelle Anmerkung für dieses Service-Set (Phase 14 P14-01).</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
         <layout class="QHBoxLayout" name="layout_set_order">
          <item>
           <widget class="QListWidget" name="list_execution_order">
@@ -38771,6 +40241,16 @@ print("LOCKTEST FERTIG")
              </property>
              <property name="toolTip">
               <string>Markierten Service aus der Reihenfolge entfernen.</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QPushButton" name="btn_info_service">
+             <property name="text">
+              <string>ℹ Info</string>
+             </property>
+             <property name="toolTip">
+              <string>Zeigt die vollständigen Beschreibungsfelder der markierten Service-Instanz (Phase 14 P14-01).</string>
              </property>
             </widget>
            </item>

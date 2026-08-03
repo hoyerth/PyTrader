@@ -168,6 +168,42 @@ con.execute("ALTER TABLE service_sets ADD COLUMN IF NOT EXISTS description VARCH
 * Erstelle ein Test-Set mit `description`, speichere es im `ServiceSetRepository` und lade es zurück.
 * Instanziiere den `ServiceDescriptionDialog` headless ohne `exec_()` und verifiziere die saubere Datenbefüllung.
 
+---
+
+### C. Nachtrag: Additive Anpassungen nach Umsetzung (Ist-Zustand, Commits `6878a23` – `4fccb09`)
+
+Kapitel 4.1 [P14-01] ist **vollständig umgesetzt**. Zusätzlich zur ursprünglichen Anleitung wurden folgende additive Anpassungen vorgenommen (dokumentierter Ist-Zustand):
+
+#### C.1 Bearbeitbare Instanz-Beschreibungen (Commit `6878a23`)
+- `service_win.py` + `chart/indicator_dialog.py`: `Beschreibung:`-`QLineEdit` oben in jeder Service-Spalte/-Seite (`_service_desc_controls` / `_set_desc_controls`).
+- Live-Tooltip-Update beim Tippen (`_update_service_tooltip`).
+- Übernahme in `collect_set_definition()` als `ServiceInstanceConfig.description` (gehört NICHT in `params`).
+- Info-Dialoge (`ServiceDescriptionDialog`) zeigen den Live-Wert.
+
+#### C.2 Service-Parameter nur als Modell-Params (Commit `07930f2`)
+- Das Prop-Fenster zeigt je Service NUR die im Service-Modell gespeicherten Parameter (Parität zum `service_win`).
+- Die frühere „Plugin-Live-Seite" (Seite 0 mit `self.params`) entfällt – sie zeigte Werte, die nicht im Modell stehen.
+- `_service_items()`: Fallback auf das aktive Plugin als Service, wenn weder Set-Services noch deklarierte Services existieren.
+- `_on_service_selected()`: `setCurrentIndex(max(0, index))` (keine separate Plugin-Seite mehr).
+- Rein visuelle Keys (`show_*`/`color`) werden ausgeblendet.
+
+#### C.3 USER-REQ: 6 Custom-Levels als Einzelparameter (Commit `52d384b`)
+- `grid_lines_service.py`: `parameter_order`/`param_labels`/`parameter_schema` um `prox_level1..6` („Level 1"–„Level 6") erweitert.
+- `custom_levels` bleibt im Schema (interne Pipeline/Alt-Sets), ist aber NICHT mehr in der Editor-Reihenfolge (kein Komma-Textfeld).
+- `calculate()` liest via `custom_levels_from_params()`: bevorzugt `prox_level1..6`, sonst `custom_levels` (beide Speicherformen rendern auf dem Chart).
+- `map_custom_levels_to_prox_levels()`: Vorbefüllung der 6 Level-Felder aus `custom_levels`-Aggregat bei Alt-Sets (`indicator_dialog` + `service_win`).
+
+#### C.4 USER-REQ: Prop-Fenster kompakte Buttons + Auto-Set-Ausführung (Commit `4fccb09`)
+- „Set ausführen"-Button (`btn_execute_set`): nur noch Icon `▶` (28×28), Tooltip „Set ausführen".
+- Auto-Set-Ausführung: Bei Verlassen des Eingabefeldes (`editingFinished`) bzw. sofortiger Änderung (CheckBox/Combo) wird das Set automatisch ausgeführt (`_connect_service_param_commit` → `_on_service_param_commit` → `execute_service_set`).
+- `_collect_logic_params()` meldet zusätzlich die Service-Seiten-Werte (`step_size`, `prox_level1..6`, `visit_pct`, …) als Live-Overlay an den Chart.
+- Service-Beschreibungs-Button (`btn_info_service`): nur noch Icon `i` (28×28), Tooltip „Beschreibung des Services".
+
+#### C.5 Verifikation (headless, `test/`)
+- `test/check_p14_s1_description.py` (27/27 PASS), `test/check_p14_service_params.py`, `test/check_p14_prop_ui.py`, `test/check_p13_s6.py`, `test/check_grid_parity.py`.
+- Hinweis: `test/check_p13_s5.py` ist seit C.2 veraltet (testet das alte Layout mit `grid_step` in `param_controls`).
+
+
 
 
 ---
@@ -182,28 +218,19 @@ Ersetzung manueller Modul-Importe durch ein automatisches Reflection-System für
 * `PluginLoader.discover_plugins()` stellt sicher, dass der Ordner `data/custom_plugins/` existiert (`os.makedirs(..., exist_ok=True)`).
 * Automatisches, rekursives Durchsuchen von `analytics/features/definitions/` (Core) und `data/custom_plugins/` (User/Custom) mittels `pkgutil.walk_packages()` und `importlib.import_module()`.
 
-
 2. **Konfliktregel, Case-Insensitivität & Core-Schutz:**
 * Core-Plugins aus `analytics/features/definitions/` werden **zuerst** geladen.
 * Die Eindeutigkeit der `plugin_id` wird strikt case-insensitiv (`plugin_id.lower()`) geprüft.
 * Versucht ein Custom-Plugin aus `data/custom_plugins/` eine bereits registrierte `plugin_id` zu belegen, wird das Custom-Plugin verworfen und ein Warn-Log geschrieben (**Core Protection Rule**).
-
-
 * Abstrakte Klassen (`inspect.isabstract`) werden ignoriert.
-
-
-
 
 3. **Singleton & Process-Ownership:**
 * `PluginRegistry` ist als Thread-sicheres Singleton pro Prozess ausgeführt.
-
 
 4. **Hot-Reload & Thread Safety (`PluginRegistry.reload()`):**
 * Schreib- und Lesezugriffe auf `PluginRegistry` werden durch einen `threading.RLock()` geschützt.
 * `PluginRegistry.reload()` führt vor dem Discovery-Scan ein gezieltes `importlib.reload()` auf den geladenen Custom-Plugin-Modulen aus.
 * Laufende Berechnungen nutzen weiterhin die bisher instanziierten Objekte. Neue Instanziiertungen greifen auf die aktualisierten Klassen zu.
-
-
 
 ---
 
@@ -216,25 +243,20 @@ Ersetzung manueller Modul-Importe durch ein automatisches Reflection-System für
 1. **HARTE VERBOTSREGEL (Alt-Grid & Bestands-Pfade):**
 Die Alt-Dateien `chart/indicators/grid.py`, `chart/indicators/grid_liquidity.py` sowie bestehende Kernmodule dürfen unter keinen Umständen beschädigt oder in ihrer Funktionsweise für bestehende Aufrufe verändert werden. Neue Logiken werden additiv integriert.
 
-
 2. **Git-Backup & Fallback vor JEDEM Kapitel:**
 Vor Beginn jedes Kapitels erstellt die AI / der User automatisch einen Git-Commit und Tag: `phase14_step1`, `phase14_step2`, etc. Bei Fehlern wird sofort per `git reset --hard` auf das jeweilige Tag zurückgerollt.
-
 
 3. **Headless-Validierung (Keine UI- und Keine unnötigen (Regressions-)tests):**
 Validierungen erfolgen rein headless (kein `QApplication.exec()`, keine manuellen Klicks) über gezielte PyTest- / Headless-Python-Skripte im Ordner `test/`. Es werden ausschließlich die für den jeweiligen Schritt absolut notwendigen Tests ausgeführt – keine unnötigen (Regressions-)tests.
 
-
 4. **Modulare Herauskoppelbarkeit:**
 Jedes Kapitel ist so aufgebaut, dass Beschreibung, Schema-Änderung, Implementierungsanleitung, die allgemeinen Grundsätze und der notwendige Test als zusammenhängender Block an die IDE-AI übergeben werden können.
-
 
 
 #### Schritt 0: Fallback & Backup
 
 1. Führe vor Code-Änderungen folgendes Git-Backup aus:
 git add -A && git commit -m "backup: pre P14-02" && git tag -f phase14_step2
-
 
 #### Schritt 1: Dynamic Loader & Reflection mit Thread-Lock & Case-Insensitivität (Vollständig)
 
@@ -252,7 +274,6 @@ git add -A && git commit -m "backup: pre P14-02" && git tag -f phase14_step2
    * Iteriere NUR über `_loaded_custom_modules` und führe `importlib.reload(sys.modules[mod_name])` aus.
    * Aktualisiere die Registry über `self.discover_plugins()` und überschreibe `self.plugins`.
 
-
 #### Schritt 2: Hot-Reload Refactoring
 
 1. Öffne `analytics/features/feature_builder.py` (`PluginRegistry`):
@@ -262,8 +283,6 @@ git add -A && git commit -m "backup: pre P14-02" && git tag -f phase14_step2
 
 2. Öffne `service_win.py`:
 * Verbinde den "Plugins neu laden"-Button mit `PluginRegistry().reload()`.
-
-
 
 #### Schritt 3: Headless Validierung
 
@@ -286,7 +305,6 @@ Ablösung des strikten Fail-Fast-Prinzips durch ein elastisches, fehlerfreies Pi
 * **Live-Ticks in der GUI (`update_live_candle`):** Führen **keine** Service-Pipeline und keine DB-Abfragen aus. Der Indikator berechnet für den allerletzten Tick lediglich die mathematische Differenz zu den bereits im Arbeitsspeicher gecachten Grid-Linien.
 * **Bar-Close Polling (`LiveAnalyzer`):** Der `LiveAnalyzer` evaluiert geschlossene Kerzen im Hintergrund. Er nutzt hierfür einen **stark verkürzten Lookback (1 bis 2 Bars)** gegen das im `EvaluationContext.shared_state` gepufferte Raster, um Rechnerlast und DB-I/O minimal zu halten.
 * **Indikator-Lesepfad (`feature_store`):** Beim Chart-Re-Render / Refresh liest der `GridLiquidityIndicator` fertige Daten primär aus dem JSON-Feld `feature_data` (inkl. `schema_version`) der Tabelle `feature_store` in DuckDB aus, anstatt die Pipeline synchron auf der GUI neu zu berechnen.
-
 
 2. **Ganzheitliche Fehlerkapselung (`PluginExecutor`):**
 * Sämtliche Exceptions in der Ausführungskette eines Plugins – inklusive `validate_params()`, interner Dependency-Aufrufe (`depends_on` auf `instance_id`) und `calculate()` – werden innerhalb von `PluginExecutor.execute()` isoliert abgefangen.
