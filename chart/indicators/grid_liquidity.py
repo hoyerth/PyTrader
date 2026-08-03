@@ -165,12 +165,17 @@ class GridLiquidityIndicator(BaseIndicator):
         timeframe: str,
         limit: Optional[int] = None,
         db_path: Optional[str] = None,
+        feature_id: str = "proximity",
     ) -> List[Dict[str, Any]]:
         """P14-03 (Live-Entkopplung A.1.3 / Schritt 3.2): PRIMÄRER
         DB-Lesepfad des Indikators – liest fertige Proximity-Hits aus dem
         feature_store (JSON-Feld feature_data, feature_id='proximity', inkl.
         schema_version) beim Chart-Re-Render/Refresh OHNE synchrone
         Service-Pipeline (Invariante 10: definierter Fallback).
+
+        P14-03-E (Schritt 4, generisch): `feature_id` ist parametrisiert
+        (Standard 'proximity'), damit spätere Indikator-Plugins denselben
+        Lesepfad über die eigene feature_id nutzen können (Open/Closed).
 
         Der Indikator führt hier KEINE Berechnungen aus; er liest ausschließlich
         vorberechnete Daten aus DuckDB. Die Heavy-Berechnung über die
@@ -184,6 +189,7 @@ class GridLiquidityIndicator(BaseIndicator):
             timeframe: Timeframe
             limit: Maximale Anzahl Bars (Default 1000)
             db_path: Optionaler DB-Pfad (für Tests) – Default analytics.duckdb
+            feature_id: Feature-ID im feature_store (Default 'proximity')
         """
         if not symbol or not timeframe:
             return []
@@ -201,13 +207,13 @@ class GridLiquidityIndicator(BaseIndicator):
                 FROM (
                     SELECT bar_time, feature_data
                     FROM feature_store
-                    WHERE symbol = ? AND timeframe = ? AND feature_id = 'proximity'
+                    WHERE symbol = ? AND timeframe = ? AND feature_id = ?
                       AND feature_data IS NOT NULL
                     ORDER BY bar_time DESC
                     LIMIT ?
                 )
                 ORDER BY bar_time ASC
-            """, [symbol, timeframe, limit]).fetchall()
+            """, [symbol, timeframe, feature_id, limit]).fetchall()
         except Exception as e:
             print(f"WARN [GridLiquidityIndicator] feature_store-Lesepfad "
                   f"fehlgeschlagen: {e}")
@@ -366,33 +372,43 @@ class GridLiquidityIndicator(BaseIndicator):
 
             prox_result = results.get("prox_1") or {}
             prox_crp = prox_result.get("chart_render_payload") or {}
-            # Display-Layer: priority=10 (JS-Bridge-Erwartung, wie Alt-Plugin).
-            # Die Services selbst bleiben Paritäts-pur (kein priority – exakt
-            # wie grid.py); die Anreicherung passiert erst hier im Adapter.
-            # Der Proximity-Service meldet pro Hit nur das in_window-Flag; die
-            # Farbe setzt der INDIKATOR aus seinem eigenen Schema:
-            #   use_time_filter und ausserhalb des Fensters → circle_color_active
-            #   sonst                            → circle_color_std
-            # show_circles=false (Indikator-Parameter) → keine Circles.
-            circles_raw = prox_crp.get("hit_circles") or []
-            if _as_bool(p.get("show_circles"), True):
-                circle_std = str(p.get("circle_color_std") or "#FFEB3B")
-                circle_active = str(p.get("circle_color_active") or "#E91E63")
-                use_time_filter = _as_bool(p.get("use_time_filter"), True)
-                circles = [
-                    dict(
-                        c,
-                        color=(
-                            circle_active
-                            if (use_time_filter and not bool(c.get("in_window", True)))
-                            else circle_std
-                        ),
-                        priority=10,
-                    )
-                    for c in circles_raw
-                ]
+
+            # P14-03-E (Schritt 4, generisch): PRIMÄR gecachte Proximity-Hits
+            # aus dem feature_store lesen (inkl. schema_version). Heavy-
+            # Berechnung nur als Fallback, wenn der Feature-Store leer ist.
+            cached_circles = self.read_proximity_from_feature_store(
+                self._symbol or "", self._timeframe or ""
+            )
+            if cached_circles:
+                circles = cached_circles
             else:
-                circles = []
+                # Display-Layer: priority=10 (JS-Bridge-Erwartung, wie Alt-Plugin).
+                # Die Services selbst bleiben Paritäts-pur (kein priority – exakt
+                # wie grid.py); die Anreicherung passiert erst hier im Adapter.
+                # Der Proximity-Service meldet pro Hit nur das in_window-Flag; die
+                # Farbe setzt der INDIKATOR aus seinem eigenen Schema:
+                #   use_time_filter und ausserhalb des Fensters → circle_color_active
+                #   sonst                            → circle_color_std
+                # show_circles=false (Indikator-Parameter) → keine Circles.
+                circles_raw = prox_crp.get("hit_circles") or []
+                if _as_bool(p.get("show_circles"), True):
+                    circle_std = str(p.get("circle_color_std") or "#FFEB3B")
+                    circle_active = str(p.get("circle_color_active") or "#E91E63")
+                    use_time_filter = _as_bool(p.get("use_time_filter"), True)
+                    circles = [
+                        dict(
+                            c,
+                            color=(
+                                circle_active
+                                if (use_time_filter and not bool(c.get("in_window", True)))
+                                else circle_std
+                            ),
+                            priority=10,
+                        )
+                        for c in circles_raw
+                    ]
+                else:
+                    circles = []
             status = dict(prox_crp.get("status_info") or empty_result["status_info"])
 
             self._set_cached_lines(lines)
@@ -485,3 +501,20 @@ class GridLiquidityIndicator(BaseIndicator):
 
         self._live_points = list(points)  # atomare Zuweisung
         return points
+
+    # -------------------------------------------------- P14-03-E: Live-Overlays
+    def get_live_overlays(self, candle: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """P14-03-E (Open/Closed-Hook): Liefert die Live-Overlays des Plugins als
+        generische Overlay-Items {kind='circle', layer=indicator_id, time, price,
+        color, priority}. Basis ist update_live_candle() (mathematische Differenz
+        Live-Tick vs. gecachte Liq-Lines) – keine Pipeline pro Tick."""
+        pts = self.update_live_candle(candle)
+        return [dict(p, kind="circle", layer=self.indicator_id) for p in pts]
+
+    def remember_live_time(self, ts: int) -> None:
+        """P14-03-E: Merkt eine offene Live-Bar-Zeit im _known_times-Set, damit der
+        New-Candle-Callback über den Refresh hinweg NICHT erneut feuert (Flacker-Fix)."""
+        try:
+            self._known_times.add(int(ts))
+        except (TypeError, ValueError):
+            pass

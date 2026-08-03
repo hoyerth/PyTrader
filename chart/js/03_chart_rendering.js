@@ -38,13 +38,22 @@ function clearGridCircles() {
     }
     _circleSeries = [];
     _circleMarkerPlugins = [];
+    _circleLevelSeries = {};
 }
 
+// P14-03-E (Flacker-Fix): renderGridCircles() ist jetzt INKREMENTELL. Bestehende
+// Level-Serien werden per setData/setMarkers in-place aktualisiert; nur ver-
+// schwundene Level werden entfernt, nur neue erzeugt. Kein removeSeries/addSeries
+// für unveränderte Level => kein Full-Layer-Rebuild pro Live-Tick (bisher rief
+// jede applyLiveOverlays renderGridCircles -> clearGridCircles auf, das ALLE
+// Circle-Serien wegwarf und neu aufbaute = Flackern bei erfüllter Proximity).
 function renderGridCircles(circles) {
     if (!chart || !circles) return;
     var data = (typeof circles === 'string') ? JSON.parse(circles) : circles;
-    clearGridCircles();
-    if (!data || data.length === 0) return;
+    if (!data || data.length === 0) {
+        clearGridCircles();
+        return;
+    }
 
     // Nach Level-Preis gruppieren: LWC-Serien brauchen eindeutige Zeiten,
     // daher je Level eine Serie (im selben Level gibt es max. 1 Treffer/Bar).
@@ -58,25 +67,28 @@ function renderGridCircles(circles) {
         byLevel[key].push(c);
     }
 
+    // 1) Level entfernen, die im neuen Satz nicht mehr existieren – OHNE den
+    //    Rest anzutasten.
+    for (var oldKey in _circleLevelSeries) {
+        if (!byLevel[oldKey]) {
+            var gone = _circleLevelSeries[oldKey];
+            try { if (gone.series) chart.removeSeries(gone.series); } catch(e) {}
+            var gidx = _circleSeries.indexOf(gone.series);
+            if (gidx >= 0) _circleSeries.splice(gidx, 1);
+            if (gone.plugin) {
+                var pidx = _circleMarkerPlugins.indexOf(gone.plugin);
+                if (pidx >= 0) _circleMarkerPlugins.splice(pidx, 1);
+            }
+            delete _circleLevelSeries[oldKey];
+        }
+    }
+
+    // 2) Upsert pro Level: existierende Serie in-place aktualisieren.
     var keys = Object.keys(byLevel);
     for (var j = 0; j < keys.length; j++) {
         var levelCircles = byLevel[keys[j]];
         // LWC v5: Markers und Serie brauchen NACH ZEIT SORTIERTE Daten.
         levelCircles.sort(function(a, b) { return a.time - b.time; });
-
-        var series = null;
-        try {
-            series = chart.addSeries(LightweightCharts.LineSeries, {
-                lineVisible: false,
-                pointMarkersVisible: false,
-                lastValueVisible: false,
-                priceLineVisible: false,
-                crosshairMarkerVisible: false,
-                color: 'rgba(0,0,0,0)',
-                priceScaleId: 'right',
-                autoscaleInfoProvider: function() { return null; }
-            });
-        } catch(e) { continue; }
 
         var sd = [];
         var markers = [];
@@ -94,15 +106,45 @@ function renderGridCircles(circles) {
                 priority: 10
             });
         }
-        try { series.setData(sd); } catch(e) { continue; }
 
-        try {
-            var plugin = LightweightCharts.createSeriesMarkers(series, []);
-            plugin.setMarkers(markers);
-        } catch(e) { continue; }
+        var key = keys[j];
+        var existing = _circleLevelSeries[key];
+        if (existing) {
+            // Inkrementell: Serie/Plugin existiert bereits -> nur Daten ersetzen
+            // (kein removeSeries/addSeries -> kein Flackern).
+            try { existing.series.setData(sd); } catch(e) { continue; }
+            if (existing.plugin) {
+                try { existing.plugin.setMarkers(markers); } catch(e) { continue; }
+            }
+        } else {
+            var series = null;
+            try {
+                series = chart.addSeries(LightweightCharts.LineSeries, {
+                    lineVisible: false,
+                    pointMarkersVisible: false,
+                    lastValueVisible: false,
+                    priceLineVisible: false,
+                    crosshairMarkerVisible: false,
+                    color: 'rgba(0,0,0,0)',
+                    priceScaleId: 'right',
+                    autoscaleInfoProvider: function() { return null; }
+                });
+            } catch(e) { continue; }
 
-        _circleSeries.push(series);
-        _circleMarkerPlugins.push(plugin);
+            var plugin = null;
+            try {
+                plugin = LightweightCharts.createSeriesMarkers(series, []);
+            } catch(e) { plugin = null; }
+
+            _circleLevelSeries[key] = { series: series, plugin: plugin };
+            _circleSeries.push(series);
+            if (plugin) _circleMarkerPlugins.push(plugin);
+
+            try { series.setData(sd); } catch(e) { continue; }
+            if (plugin) {
+                try { plugin.setMarkers(markers); } catch(e) {}
+            }
+        }
     }
 }
 

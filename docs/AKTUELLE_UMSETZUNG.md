@@ -413,8 +413,12 @@ if self._live_context is None:
 ##### 3. `chart/js/04_live_updates.js` – generischer Overlay-Dispatcher:
 
 `updateLiveCandle(json)` verarbeitet `c.overlays` generisch über `applyLiveOverlays()`.
-Da `renderGridCircles()` intern `clearGridCircles()` aufruft, werden die Live-Circles mit
-dem historischen Circle-Cache `_gridCirclesCache` gemerged (siehe Prüfprotokoll P1):
+Der Merged-Render fasst Live-Circles mit dem historischen Circle-Cache
+`_gridCirclesCache` zusammen und übergibt ihn an das INKREMENTELLE
+`renderGridCircles()` (siehe Prüfprotokoll P1/P8). Zusätzlich greift eine
+**Change-Detection**: Unveränderte Live-Circle-Sets zwischen Ticks lösen KEINEN
+Re-Render aus, und beim Wechsel auf eine neue Live-Bar werden die Kreise der
+VORHERIGEN Live-Zeit aus dem Cache entfernt (`_lastLiveOverlayTime`):
 
 ```javascript
 function updateLiveCandle(json) {
@@ -453,8 +457,21 @@ function applyLiveOverlays(overlays) {
         }
     }
     if (circles.length === 0) return;
+
+    // FLACKER-FIX (P8): Change-Detection – identische Live-Circle-Sets zwischen
+    // Ticks (gleiche Level-Hits, gleiche Farben) lösen KEINEN Re-Render aus.
+    var nowJson = JSON.stringify(circles);
+    if (nowJson === _lastLiveCirclesJson) return;
+    _lastLiveCirclesJson = nowJson;
+
     // Merged-Render: nur die Live-Zeit ersetzen, historische Circles behalten.
     var liveTime = circles[0].time;
+    // FLACKER-FIX (P8): Bei neuer Live-Bar zusätzlich die Kreise der VORHERIGEN
+    // Live-Zeit entfernen (sonst hängen veraltete Live-Kreise der Vor-Bar).
+    if (_lastLiveOverlayTime !== null && _lastLiveOverlayTime !== liveTime) {
+        _gridCirclesCache = _gridCirclesCache.filter(function(x) { return x.time !== _lastLiveOverlayTime; });
+    }
+    _lastLiveOverlayTime = liveTime;
     _gridCirclesCache = _gridCirclesCache.filter(function(x) { return x.time !== liveTime; });
     for (var j = 0; j < circles.length; j++) { _gridCirclesCache.push(circles[j]); }
     renderGridCircles(_gridCirclesCache);
@@ -578,4 +595,27 @@ eingearbeitet:
 - **P7 (Overlay-Zeit-Mapping):** Live-Overlays tragen die reale, gerundete Bar-Zeit des
   Indikators; `chart_win` mappt sie beim Einsammeln über `_time_real_to_cont` auf die
   kontinuierliche Chart-Zeit, bevor sie als `c.overlays` an JS gehen (siehe D.1c).
+- **P8 (Flacker-Fix – inkrementelles Circle-Rendering & Change-Detection):** User-Befund
+  nach D.1–D.4: Circles werden live korrekt gesetzt und das generelle Flackern ist weg,
+  ABER sobald die Proximity-Bedingung erfüllt ist, flackert es erneut bei jedem Tick.
+  Ursache: `renderGridCircles()` rief intern `clearGridCircles()` auf, das ALLE
+  Circle-Serien via `removeSeries()` entfernte und neu aufbaute – bei jedem Live-Tick
+  mit erfüllter Bedingung ein Full-Layer-Rebuild (destruktiv, kein Einzelfall).
+  Fix (rein JS, additiv):
+  1. `03_chart_rendering.js`: `renderGridCircles()` ist jetzt INKREMENTELL – neue
+     Registry `_circleLevelSeries` (01_core.js) je Level-Preis; bestehende Level werden
+     per `series.setData()`/`plugin.setMarkers()` in-place aktualisiert, nur verschwundene
+     Level entfernt, nur neue erzeugt. `clearGridCircles()` leert zusätzlich die Registry.
+     Alle Call-Sites (`applyFullChartUpdate` Schritt 6, `applyLiveOverlays`) bleiben
+     unverändert.
+  2. `04_live_updates.js`: `applyLiveOverlays()` – Change-Detection über
+     `_lastLiveCirclesJson` (JSON-Vergleich): identische Circle-Sets zwischen Ticks
+     lösen KEINEN Re-Render aus. `_lastLiveOverlayTime` entfernt beim Live-Bar-Wechsel
+     auch die Kreise der VORHERIGEN Live-Zeit aus dem Cache. Beide werden in
+     `applyFullChartUpdate` zurückgesetzt (`'[]'` bzw. `null`).
+  Verifikation: `node --check` auf allen 3 JS-Dateien, headless
+  `test/check_p14_grid_incremental.js` (14 Checks: Serien-Identität bei identischen/
+  Live-Updates, nur verschwundene Level entfernt, leere Liste räumt auf, Change-Detection,
+  Bar-Wechsel-Cache), Regression `check_p14_live_fixes.py` (14/14), `check_grid_parity.py`,
+  `check_p14_precision_levels.py`, `check_time_utils.js`, `check_resolve_realtime.js`.
 

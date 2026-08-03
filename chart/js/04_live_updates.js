@@ -106,7 +106,49 @@ function updateLiveCandle(json) {
         candleSeries.update(c);
         lastClosePrice = c.close;
         updateCountdownDisplay();
+
+        // P14-03-E (D.3): GENERISCHES LIVE-OVERLAY RENDERING – Dispatcher routet
+        // je kind (Open/Closed), ohne kompletten Chart-Rebuild und ohne die
+        // historischen Overlays zu verwerfen.
+        if (c.overlays && Array.isArray(c.overlays) && c.overlays.length > 0) {
+            applyLiveOverlays(c.overlays);
+        }
     } catch(e) {}
+}
+
+// P14-03-E: Generischer Overlay-Dispatcher. Spätere Indikator-Plugins docken
+// über neue kind/layer-Werte an, ohne updateLiveCandle zu ändern.
+function applyLiveOverlays(overlays) {
+    if (typeof renderGridCircles !== 'function') return;
+    var circles = [];
+    for (var i = 0; i < overlays.length; i++) {
+        var o = overlays[i];
+        if (o && o.kind === 'circle' && typeof o.time === 'number' &&
+            typeof o.price === 'number' && !isNaN(o.time) && !isNaN(o.price)) {
+            circles.push(o);
+        }
+    }
+    if (circles.length === 0) return;
+
+    // P14-03-E (Flacker-Fix): Change-Detection – wenn sich der Live-Circle-Satz
+    // gegenüber dem letzten Tick NICHT geändert hat (gleiche Level-Hits, gleiche
+    // Farben), wird kein Re-Render ausgelöst. Identische Sichtbarkeit, aber kein
+    // Canvas-Rebuild -> behebt das Tick-Flackern bei erfüllter Proximity.
+    var nowJson = JSON.stringify(circles);
+    if (nowJson === _lastLiveCirclesJson) return;
+    _lastLiveCirclesJson = nowJson;
+
+    // Merged-Render: nur die Live-Zeit ersetzen, historische Circles behalten.
+    var liveTime = circles[0].time;
+    // P14-03-E: Bei neuer Live-Bar zusätzlich die Kreise der VORHERIGEN Live-Zeit
+    // entfernen (sonst bleiben veraltete Live-Kreise der Vor-Bar im Cache hängen).
+    if (_lastLiveOverlayTime !== null && _lastLiveOverlayTime !== liveTime) {
+        _gridCirclesCache = _gridCirclesCache.filter(function(x) { return x.time !== _lastLiveOverlayTime; });
+    }
+    _lastLiveOverlayTime = liveTime;
+    _gridCirclesCache = _gridCirclesCache.filter(function(x) { return x.time !== liveTime; });
+    for (var j = 0; j < circles.length; j++) { _gridCirclesCache.push(circles[j]); }
+    renderGridCircles(_gridCirclesCache);
 }
 
 function fitChartContent() { if(chart) chart.timeScale().fitContent(); }
@@ -222,6 +264,7 @@ function applyFullChartUpdate(data) {
         gridPriceLines = [];
         _circleSeries = [];
         _circleMarkerPlugins = [];
+        _circleLevelSeries = {};
         seriesMarkersPlugin = null;
         try { DaySeparator.clear(); } catch(e) {}
 
@@ -306,6 +349,12 @@ function applyFullChartUpdate(data) {
         }
         rawCandleData = validCandles;
         lastClosePrice = validCandles[validCandles.length - 1].close;
+        // P14-03-E: Circle-Cache für Merged-Render aus dem Refresh-Payload.
+        _gridCirclesCache = (data.gridCircles || []).slice();
+        // P14-03-E (Flacker-Fix): Live-Circle-Change-Detection nach Full-Update
+        // zurücksetzen – der erste Tick nach dem Refresh rendert wieder.
+        _lastLiveCirclesJson = '[]';
+        _lastLiveOverlayTime = null;
 
         // Schritt 4: TimeScale Subscription
         try {

@@ -193,6 +193,9 @@ class PyTraderChartWindow(QMainWindow):
         # Mapping: kontinuierliche Zeit -> originale epoch (für JS tickMarkFormatter)
         self._time_cont_to_real: Dict[int, int] = {}
         self._time_real_to_cont: Dict[int, int] = {}
+        # P14-03-E: Live-Kerzen-State für die Pflicht-Re-Injektion (Flacker-Fix).
+        self._live_bar_time: Optional[int] = None   # reale, gerundete Bar-Zeit der offenen Kerze
+        self._live_candle_cont: Optional[Dict[str, Any]] = None  # letzter Live-Candle (kont. Zeit + OHLC)
         # Generations-Guard: monoton steigende Update-IDs für Chart- und Grid-Refresh.
         # Veraltete Serializer-Ergebnisse (langsamer Thread aus einem frueheren
         # Symbol/TF-Stand) werden in _apply_chart_update/_apply_grid_render verworfen.
@@ -689,6 +692,24 @@ class PyTraderChartWindow(QMainWindow):
                     dc["time"] = cont_time
                     continuous_candles.append(dc)
 
+            # P14-03-E (PFLICHT, Pruefprotokoll P5): Offene Live-Kerze nach dem
+            # Map-Rebuild re-injizieren – sonst feuert der New-Candle-Callback
+            # bei jedem Tick erneut und die Flacker-Schleife bleibt bestehen.
+            if (self._live_bar_time is not None
+                    and self._live_bar_time not in self._time_real_to_cont):
+                last_cont = max(self._time_cont_to_real.keys())
+                cont = last_cont + t_sec
+                self._time_cont_to_real[cont] = self._live_bar_time
+                self._time_real_to_cont[self._live_bar_time] = cont
+                if self._live_candle_cont is not None:
+                    lc = dict(self._live_candle_cont)
+                    lc["time"] = cont
+                    continuous_candles.append(lc)
+                # Auch dem Indikator die Live-Bar merken (verhindert erneuten Callback).
+                liq_ind = self.indicators.get("grid_liquidity")
+                if liq_ind is not None and hasattr(liq_ind, "remember_live_time"):
+                    liq_ind.remember_live_time(self._live_bar_time)
+
             import pandas as pd
             self.df_data = pd.DataFrame(clean_candles)
         else:
@@ -835,28 +856,43 @@ class PyTraderChartWindow(QMainWindow):
         if rounded_t in self._time_real_to_cont:
             c_copy["time"] = self._time_real_to_cont[rounded_t]
         elif self._time_cont_to_real:
-            # Neue Candle: an letzte kont. Zeit anhängen
+            # Neue Candle: an letzte kont. Zeit anhängen – OHNE refresh_chart_data()
+            # (P14-03-E: Kein Chart-Rebuild bei Live-Ticks! Der einmalige Refresh
+            # pro neuer Kerze erfolgt über den New-Candle-Callback des Indikators.)
             last_cont = max(self._time_cont_to_real.keys())
             c_copy["time"] = last_cont + t_sec
             self._time_cont_to_real[c_copy["time"]] = rounded_t
             self._time_real_to_cont[rounded_t] = c_copy["time"]
-            # Phase 13 Schritt 6: Neue Candle → NUR ein debounced Refresh, der
-            # den Linien-Cache des grid_liquidity-Indikators einmal neu aufbaut
-            # (nicht bei jedem Tick).
-            self.refresh_chart_data()
+            # P14-03-E: Live-Kerzen-State für die Pflicht-Re-Injektion merken.
+            self._live_bar_time = rounded_t
+            self._live_candle_cont = dict(c_copy)
         else:
             c_copy["time"] = rounded_t
 
-        # Phase 13 Schritt 6: Live-Ticks an den grid_liquidity-Indikator
-        # delegieren – er berechnet die mathematische Differenz Live-Tick vs.
-        # gecachte Liq-Lines (KEINE Pipeline pro Tick) und setzt Live-Punkte.
-        liq_ind = self.indicators.get("grid_liquidity")
-        if (liq_ind is not None and hasattr(liq_ind, "update_live_candle")
-                and self.indicators_state.get("grid_liquidity", {}).get("active")):
+        # P14-03-E (D.1c): Overlays ALLER aktiven Indikatoren generisch über den
+        # get_live_overlays()-Hook einsammeln (Open/Closed – kein Sonderfall pro Plugin).
+        overlays: List[Dict[str, Any]] = []
+        for ind_id, plugin in self.indicators.items():
+            st = self.indicators_state.get(ind_id, {})
+            if not st.get("active"):
+                continue
+            getter = getattr(plugin, "get_live_overlays", None)
+            if not callable(getter):
+                continue
             try:
-                liq_ind.update_live_candle(dict(c_copy, time=rounded_t))
-            except Exception as e:
-                print(f"⚠️ [GridLiquidity] Live-Update fehlgeschlagen: {e}")
+                ov = getter(dict(c_copy, time=rounded_t)) or []
+            except Exception:
+                continue
+            for item in ov:
+                item = dict(item)
+                t = item.get("time")
+                if t is not None:
+                    try:
+                        item["time"] = self._time_real_to_cont.get(int(t), int(t))
+                    except (TypeError, ValueError):
+                        pass
+                overlays.append(item)
+        c_copy["overlays"] = overlays
 
         try:
             self.web_view.page().runJavaScript(f"if(window.updateLiveCandle) updateLiveCandle('{json.dumps(c_copy, allow_nan=False)}');")

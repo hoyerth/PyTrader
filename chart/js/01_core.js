@@ -15,6 +15,25 @@ let gridPriceLines = [], dayLinesSeries = [];
 // exakt auf dem Level) + SeriesMarkers-Plugin -> Circles liegen auf den
 // Liq-Lines statt auf der Bar (native Engine-Positionierung, kein CSS-Overlay).
 let _circleSeries = [], _circleMarkerPlugins = [];
+// P14-03-E: Circle-Cache für Merged-Render (historische + Live-Circles).
+// Wird in applyFullChartUpdate() aus data.gridCircles befüllt; applyLiveOverlays()
+// ersetzt nur die Live-Zeit-Einträge und rendert den Cache neu.
+let _gridCirclesCache = [];
+// P14-03-E (Flacker-Fix): Level-Registry für INKREMENTELLES Circle-Rendering.
+// renderGridCircles() aktualisiert nur veränderte Level per setData/setMarkers,
+// statt alle Serien via removeSeries/addSeries zu entfernen und neu aufzubauen –
+// dieser Full-Layer-Rebuild pro Live-Tick (sobald die Proximity-Bedingung erfüllt
+// war) verursachte das Live-Flackern. Schluessel = String(c.price).
+let _circleLevelSeries = {};
+// P14-03-E (Flacker-Fix): Change-Detection für Live-Circles. Identische Circle-
+// Sets zwischen Ticks (gleiche Level-Hits, gleiche Farbe) lösen KEINEN Re-Render
+// aus – sonst re-rendert jeder Tick mit erfüllter Bedingung den ganzen Layer.
+let _lastLiveCirclesJson = '[]';
+// P14-03-E (Flacker-Fix): Live-Zeit der letzten Live-Overlay-Anwendung. Beim
+// Wechsel auf eine neue Live-Bar werden auch die Kreise der VORHERIGEN Live-Zeit
+// aus dem Cache entfernt (sonst bleiben veraltete Live-Kreise der Vor-Bar bis zum
+// Refresh sichtbar). Wird in applyFullChartUpdate auf null zurückgesetzt.
+let _lastLiveOverlayTime = null;
 let currentPriceLine = null, resizeTimeout = null;
 let currentPrecision = 2;
 let pendingRange = null;

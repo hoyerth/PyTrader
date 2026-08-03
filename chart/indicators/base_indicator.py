@@ -49,3 +49,11 @@ class BaseIndicator(ABC):
 	def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
 		"""Führt die mathematische Berechnung auf dem DataFrame aus und liefert Zeichnungsdaten zurück."""
 		pass
+
+	def get_live_overlays(self, candle: Dict[str, Any]) -> List[Dict[str, Any]]:
+		"""P14-03-E: Liefert die Live-Overlays des Plugins als Liste von Overlay-Items
+		{kind, layer, time, price, color, priority, ...}. Basis-Default: [].
+		Plugin-Klassen überschreiben diesen Hook (Open/Closed), damit die Engine
+		(chart_win) die Overlays ALLER aktiven Indikatoren generisch einsammelt –
+		kein Indikator-spezifischer Sonderfall pro Plugin."""
+		return []

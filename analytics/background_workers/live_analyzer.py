@@ -183,7 +183,10 @@ class LiveAnalyzer(QThread):
         while self._running:
             try:
                 self._process_new_bars()
-                self._process_plugin_bars()
+                # P14-03-E (Schritt 2): Resilienz-Seam statt Alt-Pfad – nutzt den
+                # stark verkürzten Lookback (limit=2) gegen das gepufferte
+                # EvaluationContext.shared_state-Raster (keine volle Pipeline).
+                self._process_plugin_bars_resilient()
             except Exception as e:
                 self.log_message.emit(f"❌ LiveAnalyzer Fehler: {e}")
 
