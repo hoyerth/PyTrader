@@ -160,6 +160,28 @@ class PluginMetadata(TypedDict):
     api_version: str
 
 
+# ==============================================================================
+# P14-03 (Schritt 2.2): Strukturiertes Fehlerobjekt (maschinelle Auswertung)
+# ==============================================================================
+class ServiceErrorLog(TypedDict):
+    """Strukturiertes Fehlerobjekt für das Logging in PluginExecutor und
+    ServiceSetEvaluator (Pflichtfelder laut P14-03 Anleitung).
+
+    Wird ausschließlich für die maschinelle Auswertung von Service-Fehlern
+    verwendet (timestamp, plugin_id, instance_id, symbol, timeframe, bar_time,
+    exception, traceback). PluginExecutionErrorInfo (feature_builder.py) liefert
+    über to_service_error_log() ein exakt dieses TypedDict erfüllendes Dict.
+    """
+    timestamp: float
+    plugin_id: str
+    instance_id: Optional[str]
+    symbol: str
+    timeframe: str
+    bar_time: Optional[int]
+    exception: str
+    traceback: str
+
+
 class PluginFeature(ABC):
     """Stateless Plugin-Basisklasse mit Schemavalidierung und Metadaten."""
 

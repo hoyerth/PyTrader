@@ -17,7 +17,7 @@ import pandas as pd
 import json
 
 from analytics.engine.base_definition import SignalDefinition
-from analytics.features.plugins.base_plugin import PluginContext
+from analytics.features.plugins.base_plugin import PluginContext, ServiceErrorLog
 from analytics.features.feature_builder import (
     PluginExecutor,
     PluginExecutionError,
@@ -169,7 +169,7 @@ class ServiceSetEvaluator:
         # P14-03: Session-Zustand (nur RAM, wird NICHT in DuckDB persistiert)
         self._failure_counters: Dict[str, int] = {}
         self._quarantined: Set[str] = set()
-        self._last_failure_ts: Dict[str, float] = {}
+        self._last_failure_time: Dict[str, float] = {}
         self._recovery_seconds: float = 300.0
         self._execution_lock = threading.RLock()
         # Diagnose-Status der letzten resilienten Ausführung (instance_id ->
@@ -186,7 +186,7 @@ class ServiceSetEvaluator:
         with self._execution_lock:
             self._failure_counters.clear()
             self._quarantined.clear()
-            self._last_failure_ts.clear()
+            self._last_failure_time.clear()
             self.last_skipped.clear()
             self.last_errors.clear()
 
@@ -197,17 +197,17 @@ class ServiceSetEvaluator:
         _recovery_seconds (300 s) ohne weiteren Fehler automatisch
         zurückgesetzt – die einmalige Quarantäne selbst bleibt bis reset()
         bestehen."""
-        last = self._last_failure_ts.get(instance_id)
+        last = self._last_failure_time.get(instance_id)
         if last is not None and time.time() - last >= self._recovery_seconds:
             self._failure_counters.pop(instance_id, None)
-            self._last_failure_ts.pop(instance_id, None)
+            self._last_failure_time.pop(instance_id, None)
         return instance_id in self._quarantined
 
     def _record_failure(self, instance_id: str) -> bool:
         """Zählt einen Fehler; bei 3 aufeinanderfolgenden Fehlern wird die
         Instanz quarantänisiert. Gibt True zurück, wenn Quarantäne ausgelöst."""
         now = time.time()
-        self._last_failure_ts[instance_id] = now
+        self._last_failure_time[instance_id] = now
         self._failure_counters[instance_id] = self._failure_counters.get(instance_id, 0) + 1
         if self._failure_counters[instance_id] >= 3:
             self._quarantined.add(instance_id)
@@ -218,7 +218,7 @@ class ServiceSetEvaluator:
         """Erfolgreiche Ausführung → Fehlerzähler zurücksetzen (nur
         aufeinanderfolgende Fehler zählen)."""
         self._failure_counters.pop(instance_id, None)
-        self._last_failure_ts.pop(instance_id, None)
+        self._last_failure_time.pop(instance_id, None)
 
     # -------------------------------------------------------------------------
     # Pipeline-Ausführung (bestehender Fail-Fast-Pfad – unverändert)
@@ -442,10 +442,13 @@ class ServiceSetEvaluator:
                     self.last_errors[iid] = e.info
                     quarantined_now = self._record_failure(iid)
                     self.last_skipped[iid] = "quarantined" if quarantined_now else "error"
+                    # P14-03 (Schritt 2.2): Logging über das strukturierte
+                    # ServiceErrorLog-TypedDict (maschinelle Auswertung).
+                    log: ServiceErrorLog = e.info.to_service_error_log()
                     print(
                         f"WARN [ServiceSetEvaluator] Service '{iid}' "
-                        f"(plugin '{plugin_id}') fehlgeschlagen: "
-                        f"{e.info.exception_type}: {e.info.exception_message} "
+                        f"(plugin '{log['plugin_id']}') fehlgeschlagen: "
+                        f"{log['exception']} "
                         f"(Fehler #{self._failure_counters.get(iid, 0)})"
                     )
                     if quarantined_now:
@@ -472,8 +475,10 @@ class ServiceSetEvaluator:
                     self.last_errors[iid] = info
                     quarantined_now = self._record_failure(iid)
                     self.last_skipped[iid] = "quarantined" if quarantined_now else "error"
+                    log2: ServiceErrorLog = info.to_service_error_log()
                     print(f"WARN [ServiceSetEvaluator] Service '{iid}' "
-                          f"(plugin '{plugin_id}') fehlgeschlagen: {e}")
+                          f"(plugin '{log2['plugin_id']}') fehlgeschlagen: "
+                          f"{log2['exception']}")
                     continue
 
                 # Erfolg → Fehlerzähler zurücksetzen, Diagnose-Status bereinigen.

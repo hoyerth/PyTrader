@@ -31,6 +31,7 @@ from analytics.features.plugins.base_plugin import (
     PluginFeature,
     FeatureCalculateResult,
     PluginContext,
+    ServiceErrorLog,
 )
 from state_manager import StateManager
 from db_service import DbPool
@@ -103,6 +104,22 @@ class PluginExecutionErrorInfo:
     exception_type: str
     exception_message: str
     traceback: str
+
+    def to_service_error_log(self) -> ServiceErrorLog:
+        """P14-03 (Schritt 2.2): Liefert das strukturierte Fehlerobjekt als
+        ServiceErrorLog-TypedDict (Pflichtfelder laut Anleitung) für die
+        maschinelle Auswertung des Loggings in PluginExecutor /
+        ServiceSetEvaluator."""
+        return ServiceErrorLog(
+            timestamp=self.timestamp,
+            plugin_id=self.plugin_id,
+            instance_id=self.instance_id,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            bar_time=self.bar_time,
+            exception=f"{self.exception_type}: {self.exception_message}",
+            traceback=self.traceback,
+        )
 
 
 class PluginExecutionError(Exception):
@@ -323,10 +340,13 @@ class PluginExecutor:
             exception_message=str(exc),
             traceback=traceback.format_exc(),
         )
+        # P14-03 (Schritt 2.2): Logging über das strukturierte
+        # ServiceErrorLog-TypedDict (maschinelle Auswertung).
+        log: ServiceErrorLog = info.to_service_error_log()
         print(
-            f"WARN [PluginExecutor] {stage} fehlgeschlagen: plugin='{plugin_id}' "
-            f"instance='{instance_id}' {symbol}/{timeframe} – "
-            f"{info.exception_type}: {info.exception_message}"
+            f"WARN [PluginExecutor] {stage} fehlgeschlagen: plugin='{log['plugin_id']}' "
+            f"instance='{log['instance_id']}' {log['symbol']}/{log['timeframe']} – "
+            f"{log['exception']}"
         )
         return PluginExecutionError(info)
 

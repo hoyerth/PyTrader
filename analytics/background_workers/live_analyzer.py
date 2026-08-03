@@ -215,7 +215,13 @@ class LiveAnalyzer(QThread):
     def _process_plugin_bars(self) -> None:
         """Phase 12 Plugin-Modus (Live): Fuehrt aktive Batch-Plugins mit
         live_op = True über dieselbe PluginExecutor-Instanz aus und schreibt
-        den feature_store_payload in den feature_store."""
+        den feature_store_payload in den feature_store.
+
+        P14-03 (Schritt 3.1, additiv): Fuer laufende Bar-Close-Evaluierungen
+        existiert der Seam _process_plugin_bars_resilient() – er nutzt einen
+        stark verkuerzten Lookback (limit=2: 1 unvollstaendige + 1 frisch
+        geschlossene Kerze) gegen das gepufferte EvaluationContext.shared_state
+        -Raster. Dieser Alt-Pfad bleibt unveraendert."""
         plugins = self._get_active_live_plugins()
         if not plugins:
             return

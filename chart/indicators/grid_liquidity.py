@@ -166,13 +166,16 @@ class GridLiquidityIndicator(BaseIndicator):
         limit: Optional[int] = None,
         db_path: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """P14-03 (Live-Entkopplung A.1.3): Liest fertige Proximity-Hits aus
-        dem feature_store (JSON-Feld feature_data, feature_id='proximity',
-        inkl. schema_version) – der GUI-Lesepfad beim Chart-Re-Render/Refresh
-        OHNE synchrone Service-Pipeline (Invariante 10: definierter Fallback).
+        """P14-03 (Live-Entkopplung A.1.3 / Schritt 3.2): PRIMÄRER
+        DB-Lesepfad des Indikators – liest fertige Proximity-Hits aus dem
+        feature_store (JSON-Feld feature_data, feature_id='proximity', inkl.
+        schema_version) beim Chart-Re-Render/Refresh OHNE synchrone
+        Service-Pipeline (Invariante 10: definierter Fallback).
 
         Der Indikator führt hier KEINE Berechnungen aus; er liest ausschließlich
-        vorberechnete Daten aus DuckDB. Liefert die Hit-Kreise des Proximity-
+        vorberechnete Daten aus DuckDB. Die Heavy-Berechnung über die
+        FeatureBuilder-Service-Pipeline (calculate) ist nur der Fallback,
+        wenn der feature_store leer ist. Liefert die Hit-Kreise des Proximity-
         Service ({time, price, in_window}) oder [] bei fehlenden Daten/Fehlern –
         der Aufrufer entscheidet, ob er auf die Pipeline (calculate) zurückfällt.
 
