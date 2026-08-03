@@ -87,6 +87,54 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _extract_prox_levels(params: Dict[str, Any]) -> List[float]:
+    """Custom-Levels aus den EINZELPARAMETERN prox_level1..6 (nur > 0).
+
+    Parität zu grid_liquidity._extract_custom_levels(): Einzelwerte werden
+    bevorzugt, wenn mindestens einer > 0 ist.
+    """
+    levels: List[float] = []
+    for i in range(1, 7):
+        v = params.get(f"prox_level{i}")
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if fv > 0.0:
+            levels.append(round(fv, 6))
+    return levels
+
+
+def custom_levels_from_params(params: Dict[str, Any]) -> List[float]:
+    """Custom-Levels aus params: bevorzugt prox_level1..6 (Einzelparameter,
+    Alt-/Neu-Speicherung im Service-Modell), sonst custom_levels (Liste/String).
+
+    USER-REQ: P14-01 Nachtrag - Sets koennen die 6 Level EINZELN
+    (prox_level1..6) ODER als Aggregat (custom_levels) gespeichert haben -
+    beide Formen werden gelesen.
+    """
+    levels = _extract_prox_levels(params)
+    if levels:
+        return levels
+    return _parse_custom_levels(params.get("custom_levels"))
+
+
+def map_custom_levels_to_prox_levels(params: Dict[str, Any]) -> Dict[str, float]:
+    """Mappt gespeicherte custom_levels (Liste/String) auf prox_level1..6.
+
+    USER-REQ: P14-01 Nachtrag - damit Alt-Sets mit Aggregat-Speicherung im
+    Editor (6 Level-Felder) ihre Werte weiterhin anzeigen. Nur Werte > 0
+    werden gemappt; max. 6 Level.
+    """
+    out: Dict[str, float] = {}
+    for i, v in enumerate(_parse_custom_levels(params.get("custom_levels"))[:6], start=1):
+        if v > 0.0:
+            out[f"prox_level{i}"] = float(v)
+    return out
+
+
 class GridLinesService(PluginFeature):
 
     @property
@@ -131,9 +179,16 @@ class GridLinesService(PluginFeature):
     # --- Single Source of Truth fürs Prop-Fenster (Phase 13 Schritt 5) -------
     @property
     def parameter_order(self) -> List[str]:
+        # USER-REQ: P14-01 Nachtrag - die 6 Custom-Levels werden im Editor als
+        # EINZELPARAMETER prox_level1..6 (Level 1..6, wie grid_liquidity)
+        # gerendert. custom_levels bleibt im parameter_schema (interne Pipeline
+        # & Aggregat-Speicherung), ist aber NICHT in der Darstellungs-Reihenfolge
+        # -> wird im Editor nicht als Komma-Feld gerendert.
         return [
             "show_lines", "line_color",
-            "step_size", "steps_around", "custom_levels",
+            "step_size", "steps_around",
+            "prox_level1", "prox_level2", "prox_level3",
+            "prox_level4", "prox_level5", "prox_level6",
         ]
 
     @property
@@ -143,7 +198,12 @@ class GridLinesService(PluginFeature):
             "line_color": "Linien-Farbe",
             "step_size": "Rasterabstand",
             "steps_around": "Level-Anzahl (je Seite)",
-            "custom_levels": "Custom-Levels (kommagetrennt)",
+            "prox_level1": "Level 1",
+            "prox_level2": "Level 2",
+            "prox_level3": "Level 3",
+            "prox_level4": "Level 4",
+            "prox_level5": "Level 5",
+            "prox_level6": "Level 6",
         }
 
     @property
@@ -157,12 +217,22 @@ class GridLinesService(PluginFeature):
                 "type": "int", "default": 4, "min": 0, "max": 100,
                 "step": 1, "description": "Level ober-/unterhalb des Zentrums (prox_stepsAround ↔ steps_around)",
             },
-            # Listeneingabe wird bewusst als 'str' deklariert, damit der
-            # Schema-Validator sie unverändert durchreicht (Liste ODER String).
+            # USER-REQ: P14-01 Nachtrag - die 6 Custom-Levels werden im Editor
+            # als EINZELPARAMETER prox_level1..6 gerendert (Level 1..6). Das
+            # Aggregat custom_levels bleibt im Schema erhalten - die interne
+            # Pipeline (GridLiquidityIndicator._build_set_definition) und
+            # Alt-Sets speichern die Level als Liste/String. calculate() liest
+            # beide Formen (custom_levels_from_params).
             "custom_levels": {
                 "type": "str", "default": "",
                 "description": "Custom-Levels, nur > 0 (prox_level1..6 ↔ custom_levels)",
             },
+            "prox_level1": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 1"},
+            "prox_level2": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 2"},
+            "prox_level3": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 3"},
+            "prox_level4": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 4"},
+            "prox_level5": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 5"},
+            "prox_level6": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 6"},
             "show_lines": {
                 "type": "bool", "default": True, "description": "Grid-Linien anzeigen",
             },
@@ -189,7 +259,7 @@ class GridLinesService(PluginFeature):
         show_lines = bool(p["show_lines"])
         line_color = str(p.get("line_color") or "").strip()
 
-        custom_levels = _parse_custom_levels(p.get("custom_levels"))
+        custom_levels = custom_levels_from_params(p)
         sorted_levels = build_grid_levels(
             last_close=float(df.iloc[-1]["close"]),
             step_size=step_size,

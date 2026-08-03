@@ -1095,6 +1095,17 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 					if spec.get("expert") or self._is_visual_key(key):
 						continue
 					cval = sp_params.get(key, spec.get("default"))
+					# USER-REQ: P14-01 Nachtrag - Alt-Sets speichern die 6
+					# Custom-Levels als Aggregat custom_levels (Liste/String)
+					# statt als Einzelparameter prox_level1..6. Damit die 6
+					# Level-Felder diese Werte trotzdem anzeigen, werden leere
+					# Felder aus dem Aggregat vorbefüllt.
+					if key.startswith("prox_level") and not cval:
+						try:
+							from analytics.features.definitions.grid_lines_service import map_custom_levels_to_prox_levels
+							cval = map_custom_levels_to_prox_levels(sp_params).get(key, cval)
+						except Exception:
+							pass
 					ctrl = self.create_schema_control(key, cval, spec)
 					self._set_param_controls[f"{iid}:{key}"] = ctrl
 					pf.addRow(sp_labels.get(key, self._human(key)), ctrl)

@@ -967,6 +967,15 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             if spec.get("expert") or self._is_visual_key(key):
                 continue
             cval = params.get(key, spec.get("default"))
+            # USER-REQ: P14-01 Nachtrag - Alt-Sets speichern die 6 Custom-Levels
+            # als Aggregat custom_levels (Liste/String) statt als Einzelparameter
+            # prox_level1..6 - leere Level-Felder werden daraus vorbefüllt.
+            if key.startswith("prox_level") and not cval:
+                try:
+                    from analytics.features.definitions.grid_lines_service import map_custom_levels_to_prox_levels
+                    cval = map_custom_levels_to_prox_levels(params).get(key, cval)
+                except Exception:
+                    pass
             ctrl = self._create_param_control(key, cval, spec)
             self._service_param_controls[(iid, key)] = ctrl
             form.addRow(labels.get(key, self._human(key)), ctrl)
