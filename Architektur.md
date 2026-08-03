@@ -142,9 +142,6 @@ Jedes Refactoring und jede Code-Generierung muss strikt folgenden Prinzipien ent
 * Sub-Fenster erben von `PersistentWindow` und registrieren sich über den Dekoratormechanismus (`@register_persistent_window`).
 * Kommunikation erfolgt asynchron über Qt-Signals/Slots oder Read-Only DB-Abfragen.
 
-
-
-
 3. **Single Responsibility Principle (SRP):**
 * **UI-Klassen (`PySide6`):** Nur Event-Handling, Rendering und State-Persistenz. Keine mathematischen Berechnungen.
 * **Worker/Engine-Klassen:** Nur Datenverarbeitung und Logik. Kein GUI-Code oder PySide-UI-Import.
@@ -153,8 +150,9 @@ Jedes Refactoring und jede Code-Generierung muss strikt folgenden Prinzipien ent
 4. **Open/Closed Principle:**
 * Neue Indikatoren oder Feature-Plugins werden durch Hinzufügen neuer Dateien unter `analytics/features/definitions` implementiert. Bestehender Rumpfcode darf dafür nicht geändert werden.
 
-
 5. **Typsicherheit:**
 * Strikte Nutzung von Python Type Hints (`typing`, `TypedDict`).
 * Der Datenaustausch zwischen Plugins und UI/Services folgt typisierten Verträgen (`ChartRenderPayload`, `FeatureStorePayload`).
-* 
+
+6. **Knappe In-Code-Dokumentation bei Anforderungsänderungen:**
+* Bei allen neuen oder angepassten Logiken (insbesondere manuellen User-Vorgaben) muss direkt in den geänderten Sourcedateien an der betroffenen Stelle ein knapper Inline-Kommentar (1–2 Zeilen, z. B. `# USER-REQ: [Kurzbeschreibung der Anforderung]`) gesetzt werden, der den Grund der Code-Anpassung nachvollziehbar dokumentiert.
