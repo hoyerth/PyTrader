@@ -65,6 +65,26 @@ class ServiceSetRepository:
         """)
         # Phase 14 P14-01: Additive Spalte für bestehende Datenbanken (idempotent)
         con.execute("ALTER TABLE service_sets ADD COLUMN IF NOT EXISTS description VARCHAR;")
+        # Phase 14 P14-05: Papierkorb- & Historien-Tabellen (Soft-Delete &
+        # Deterministische Snapshots). Idempotent – bestehende DBs werden
+        # additiv erweitert (Invariante 9: Snapshot nur bei Überschreiben).
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS service_sets_trash (
+                set_id       VARCHAR PRIMARY KEY,
+                display_name VARCHAR,
+                definition   JSON,
+                deleted_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS service_set_history (
+                history_id VARCHAR PRIMARY KEY,
+                set_id     VARCHAR,
+                version    VARCHAR,
+                definition JSON,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
         # Phase 14 P14-04 (Bestands-Migration): Nach dem ALTER TABLE laufende
         # Sets bereinigen (fehlende description-Felder mit "" auffüllen).
         self._migrate_existing_sets()
@@ -97,7 +117,11 @@ class ServiceSetRepository:
                 continue
             definition["description"] = ""
             try:
-                self.save_set(definition)
+                # P14-05: record_snapshot=False – die Bestands-Migration ist ein
+                # interner Verwaltungsschreibvorgang (nur description ergänzen)
+                # und darf KEINE Snapshot-Historie erzeugen (Invariante 9:
+                # Snapshot nur bei Nutzer-Überschreiben).
+                self.save_set(definition, record_snapshot=False)
                 print(f"  . Bestandsset '{set_id}': description aufgefuellt (P14-04)")
             except Exception as e:
                 print(f"WARN [ServiceSetRepository] Bestands-Migration Set "
@@ -120,12 +144,25 @@ class ServiceSetRepository:
     # -------------------------------------------------------------------------
     # Pflicht-API
     # -------------------------------------------------------------------------
-    def save_set(self, definition: Dict[str, Any]) -> str:
+    def save_set(self, definition: Dict[str, Any], record_snapshot: bool = True) -> str:
         """Speichert ein Service-Set (Upsert) und liefert die set_id zurück.
 
         - set_id leer → wird als uuid4-hex generiert.
         - display_name leer → Default-Name aus instance_ids (z.B. 'grid_1 + prox_1').
         - Gleiche set_id überschreibt die bestehende Zeile (kein Duplikat).
+
+        Phase 14 P14-05 (Deterministische Snapshot-Historie): Existiert das Set
+        bereits in service_sets (Überschreiben), wird UNMITTELBAR VOR dem
+        Überschreiben der bisherige Stand als Snapshot in service_set_history
+        gesichert (version = fortlaufender Zähler je set_id). Bei reinen
+        Neuanlagen oder Schreibfehlern entsteht KEIN Snapshot (Invariante 9).
+
+        Args:
+            definition: ServiceSetDefinition.
+            record_snapshot: False unterdrückt die Snapshot-Erzeugung für
+                interne Verwaltungsschreibvorgänge (z. B. die P14-04
+                Bestands-Migration, die Bestands-Sets nur um description
+                ergänzt und dafür keinen Historie-Eintrag erzeugen darf).
         """
         set_id = str(definition.get("set_id") or uuid.uuid4().hex)
         display_name = str(definition.get("display_name") or "").strip()
@@ -145,6 +182,26 @@ class ServiceSetRepository:
         }
 
         con = self._get_connection()
+
+        # P14-05: Snapshot-Historie – NUR bei erfolgreichem Überschreiben eines
+        # BEREITS EXISTIERENDEN Sets (vor dem Upsert).
+        if record_snapshot:
+            row = con.execute(
+                "SELECT definition FROM service_sets WHERE set_id = ?", [set_id]
+            ).fetchone()
+            if row:
+                old_definition = _parse_json_field(row[0]) or {}
+                history_count = con.execute(
+                    "SELECT COUNT(*) FROM service_set_history WHERE set_id = ?",
+                    [set_id],
+                ).fetchone()
+                count = int(history_count[0]) if history_count and history_count[0] else 0
+                con.execute("""
+                    INSERT INTO service_set_history (history_id, set_id, version, definition, created_at)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, [uuid.uuid4().hex, set_id, str(count + 1),
+                      json.dumps(old_definition)])
+
         con.execute("""
             INSERT INTO service_sets (set_id, display_name, definition, description, updated_at)
             VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
@@ -248,13 +305,118 @@ class ServiceSetRepository:
             sets.append(definition)
         return sets
 
-    def delete_set(self, set_id: str) -> bool:
-        """Entfernt ein Set sauber. Liefert True, wenn eine Zeile existierte."""
+    def delete_set(self, set_id: str, soft_delete: bool = True) -> bool:
+        """Entfernt ein Set. Liefert True, wenn eine Zeile existierte.
+
+        Phase 14 P14-05 (Soft-Delete): Bei soft_delete=True wird das Set in
+        die Papierkorb-Tabelle `service_sets_trash` verschoben (mit
+        deleted_at-Zeitstempel) statt hart gelöscht. Die Wiederherstellung
+        erfolgt über restore_set_from_trash(). Bei soft_delete=False wird das
+        Set ENDGÜLTIG entfernt (z. B. für die Papierkorb-Bereinigung).
+        """
         con = self._get_connection()
         res = con.execute(
-            "SELECT COUNT(*) FROM service_sets WHERE set_id = ?", [set_id]
+            "SELECT set_id, display_name, definition FROM service_sets WHERE set_id = ?",
+            [set_id],
+        ).fetchone()
+        if not res:
+            return False
+        db_set_id, db_display_name, definition_json = res
+        if soft_delete:
+            # Kopie nach service_sets_trash (Upsert – erneutes Löschen eines
+            # bereits im Papierkorb liegenden Sets aktualisiert den Zeitstempel).
+            con.execute("""
+                INSERT INTO service_sets_trash (set_id, display_name, definition, deleted_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT (set_id) DO UPDATE SET
+                    display_name = EXCLUDED.display_name,
+                    definition   = EXCLUDED.definition,
+                    deleted_at   = EXCLUDED.deleted_at
+            """, [db_set_id, db_display_name or "", definition_json])
+        con.execute("DELETE FROM service_sets WHERE set_id = ?", [set_id])
+        return True
+
+    def list_trash(self) -> List[Dict[str, Any]]:
+        """Liefert ALLE im Papierkorb befindlichen Service-Sets.
+
+        Analog list_sets() – deterministisch nach deleted_at sortiert
+        (älteste zuerst). Enthält zusätzlich das Feld 'deleted_at' und ist
+        die Quelle für den Papierkorb-Dialog im Service-Fenster.
+        """
+        con = self._get_connection()
+        rows = con.execute(
+            "SELECT set_id, display_name, definition, deleted_at "
+            "FROM service_sets_trash ORDER BY deleted_at ASC"
+        ).fetchall()
+        items: List[Dict[str, Any]] = []
+        for db_set_id, db_display_name, definition_json, db_deleted_at in rows:
+            definition = _parse_json_field(definition_json) or {}
+            definition["set_id"] = str(db_set_id)
+            if not definition.get("display_name"):
+                definition["display_name"] = db_display_name or ""
+            definition["deleted_at"] = db_deleted_at
+            items.append(definition)
+        return items
+
+    def restore_set_from_trash(self, set_id: str) -> bool:
+        """Stellt ein Set aus dem Papierkorb wieder her (Trash → service_sets).
+
+        Liefert True, wenn ein Trash-Eintrag existierte und wiederhergestellt
+        wurde. Existiert die set_id in service_sets bereits (z. B. weil sie
+        zwischenzeitlich neu angelegt wurde), wird sie überschrieben.
+        """
+        con = self._get_connection()
+        res = con.execute(
+            "SELECT set_id, display_name, definition FROM service_sets_trash WHERE set_id = ?",
+            [set_id],
+        ).fetchone()
+        if not res:
+            return False
+        db_set_id, db_display_name, definition_json = res
+        definition = _parse_json_field(definition_json) or {}
+        definition["set_id"] = str(db_set_id)
+        if not definition.get("display_name"):
+            definition["display_name"] = db_display_name or ""
+        description = definition.get("description")
+        description = str(description).strip() if description is not None else None
+        # Wiederherstellen (Upsert auf service_sets)
+        con.execute("""
+            INSERT INTO service_sets (set_id, display_name, definition, description, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT (set_id) DO UPDATE SET
+                display_name = EXCLUDED.display_name,
+                definition   = EXCLUDED.definition,
+                description  = EXCLUDED.description,
+                updated_at   = EXCLUDED.updated_at
+        """, [db_set_id, definition.get("display_name") or "", json.dumps(definition), description])
+        con.execute("DELETE FROM service_sets_trash WHERE set_id = ?", [set_id])
+        return True
+
+    def purge_trash_set(self, set_id: str) -> bool:
+        """Entfernt ein Set ENDGÜLTIG aus dem Papierkorb (hartes Löschen).
+
+        Liefert True, wenn ein Trash-Eintrag existierte und entfernt wurde.
+        Dieser Vorgang ist nicht umkehrbar – die UI verlangt daher eine
+        doppelte Sicherheitsabfrage.
+        """
+        con = self._get_connection()
+        res = con.execute(
+            "SELECT COUNT(*) FROM service_sets_trash WHERE set_id = ?", [set_id]
         ).fetchone()
         exists = bool(res and res[0] and res[0] > 0)
         if exists:
-            con.execute("DELETE FROM service_sets WHERE set_id = ?", [set_id])
+            con.execute("DELETE FROM service_sets_trash WHERE set_id = ?", [set_id])
         return exists
+
+    def purge_trash(self) -> int:
+        """Leert den Papierkorb vollständig (Endgültige Bereinigung der DB).
+
+        Liefert die Anzahl endgültig entfernter Sets. Nicht umkehrbar – die
+        UI verlangt daher eine doppelte Sicherheitsabfrage.
+        """
+        con = self._get_connection()
+        res = con.execute("SELECT COUNT(*) FROM service_sets_trash").fetchone()
+        count = int(res[0]) if res and res[0] else 0
+        if count:
+            con.execute("DELETE FROM service_sets_trash")
+        return count

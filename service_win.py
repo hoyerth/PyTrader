@@ -16,8 +16,8 @@ from typing import Any, Dict, List, Optional
 from PySide6.QtCore import QFile, QIODevice, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFormLayout, QGroupBox,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMessageBox, QProgressBar, QPushButton, QSizePolicy, QSpinBox, QTextEdit,
     QVBoxLayout, QWidget,
 )
@@ -186,7 +186,9 @@ class _ServiceSetItemAdapter(NamedItemAdapter):
             self.dlg.log("Kein Set zum Löschen ausgewählt.")
             return False
         if self.dlg.set_repo.delete_set(set_id):
-            self.dlg.log(f"Set gelöscht: {set_id}")
+            # P14-05: Soft-Delete – das Set liegt im Papierkorb und kann über
+            # den Papierkorb-Dialog wiederhergestellt werden.
+            self.dlg.log(f"Set in den Papierkorb verschoben (P14-05): {set_id}")
             return True
         self.dlg.log(f"Set '{set_id}' nicht gefunden.")
         return False
@@ -272,6 +274,8 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         self.combo_plugin_select: Optional[QComboBox] = self.ui.findChild(QComboBox, "combo_plugin_select")
         self.btn_save_set: QPushButton = self.ui.findChild(QPushButton, "btn_save_set")
         self.btn_delete_set: QPushButton = self.ui.findChild(QPushButton, "btn_delete_set")
+        # Phase 14 P14-05: Papierkorb-Button (Soft-Delete/Wiederherstellung)
+        self.btn_trash_sets: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_trash_sets")
         self.btn_execute_set: QPushButton = self.ui.findChild(QPushButton, "btn_execute_set")
 
         # Phase 13 5.4 Schritt 1: Dynamische Service-Spalten (Breite/Höhe aus
@@ -357,6 +361,9 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             self.btn_save_set.clicked.connect(self.save_set)
         if self.btn_delete_set:
             self.btn_delete_set.clicked.connect(self.delete_set)
+        # Phase 14 P14-05: Papierkorb-Dialog (Soft-Delete)
+        if self.btn_trash_sets:
+            self.btn_trash_sets.clicked.connect(self.show_trash_dialog)
         if self.btn_execute_set:
             self.btn_execute_set.clicked.connect(self.execute_set)
 
@@ -1161,6 +1168,152 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
                 "bleiben, damit der Indikator funktionsfähig bleibt (P14-04).")
             return
         self.delete_named_item(self._set_adapter)
+
+    # =========================================================================
+    # Phase 14 P14-05: Papierkorb (Soft-Delete / Wiederherstellung)
+    # =========================================================================
+
+    @Slot()
+    def show_trash_dialog(self) -> None:
+        """Öffnet den Papierkorb-Dialog für Service-Sets (P14-05).
+
+        Zeigt alle soft-gelöschten Sets (list_trash()) mit Name und
+        Lösch-Zeitstempel. Aktionen:
+          - Wiederherstellen  : restore_set_from_trash() verschiebt das Set
+                                zurück nach service_sets (das Set-Dropdown des
+                                Hauptfensters wird anschließend refresht).
+          - Endgültig löschen : purge_trash_set() mit doppelter Sicherheits-
+                                abfrage (Vorgang ist nicht umkehrbar).
+          - Papierkorb leeren : purge_trash() mit doppelter Sicherheits-
+                                abfrage (Vorgang ist nicht umkehrbar).
+
+        Der Dialog ist eine reine UI-Komponente: Er spricht ausschließlich
+        die Repository-API an (keine direkten SQL-Zugriffe) und protokolliert
+        jede Aktion über self.log(). Das endgültige Löschen/Bereinigen erfolgt
+        IMMER mit doppelter Sicherheitsnachfrage (User-Vorgabe P14-05).
+        """
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Papierkorb - Service-Sets")
+        dialog.setMinimumSize(440, 340)
+
+        layout = QVBoxLayout(dialog)
+        hint = QLabel(
+            "Soft-geloeschte Service-Sets (P14-05). Wiederherstellen verschiebt "
+            "das Set zurueck in die aktive Liste; endgueltiges Loeschen ist "
+            "nicht umkehrbar."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        trash_list = QListWidget()
+        layout.addWidget(trash_list, 1)
+
+        btn_row = QHBoxLayout()
+        btn_restore = QPushButton("Wiederherstellen")
+        btn_purge_one = QPushButton("Endgueltig loeschen")
+        btn_purge_all = QPushButton("Papierkorb leeren")
+        btn_close = QPushButton("Schliessen")
+        for b in (btn_restore, btn_purge_one, btn_purge_all, btn_close):
+            btn_row.addWidget(b)
+        layout.addLayout(btn_row)
+
+        def _reload() -> None:
+            trash_list.clear()
+            trash_items = self.set_repo.list_trash()
+            for item in trash_items:
+                name = item.get("display_name") or item.get("set_id") or "Unbenannt"
+                deleted_at = str(item.get("deleted_at") or "")
+                li = QListWidgetItem(f"{name}   (geloescht: {deleted_at})")
+                li.setData(Qt.UserRole, item.get("set_id"))
+                trash_list.addItem(li)
+            has_items = trash_list.count() > 0
+            btn_restore.setEnabled(has_items)
+            btn_purge_one.setEnabled(has_items)
+            btn_purge_all.setEnabled(has_items)
+            hint.setText(
+                "Der Papierkorb ist leer."
+                if not has_items
+                else "Soft-geloeschte Service-Sets (P14-05). Wiederherstellen "
+                     "verschiebt das Set zurueck in die aktive Liste; "
+                     "endgueltiges Loeschen ist nicht umkehrbar."
+            )
+
+        def _selected_id() -> Optional[str]:
+            item = trash_list.currentItem()
+            return item.data(Qt.UserRole) if item else None
+
+        def _restore() -> None:
+            set_id = _selected_id()
+            if not set_id:
+                return
+            if self.set_repo.restore_set_from_trash(set_id):
+                self.log(f"Set wiederhergestellt (P14-05): {set_id}")
+                _reload()
+                self.refresh_set_list()
+            else:
+                self.log(f"Set '{set_id}' nicht im Papierkorb gefunden.")
+
+        def _purge_selected() -> None:
+            set_id = _selected_id()
+            if not set_id:
+                return
+            # Doppelte Sicherheitsnachfrage - endgueltiges Loeschen ist nicht
+            # umkehrbar (User-Vorgabe P14-05).
+            first = QMessageBox.question(
+                dialog, "Endgueltig loeschen?",
+                "Das Set wird ENDGUELTIG geloescht und kann nicht "
+                "wiederhergestellt werden. Fortfahren?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if first != QMessageBox.Yes:
+                return
+            second = QMessageBox.question(
+                dialog, "Wirklich endgueltig loeschen?",
+                "Dieser Vorgang ist NICHT umkehrbar. Das Set wird unwiderruflich "
+                "aus dem Papierkorb entfernt. Fortfahren?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if second != QMessageBox.Yes:
+                return
+            if self.set_repo.purge_trash_set(set_id):
+                self.log(f"Set endgueltig geloescht (P14-05): {set_id}")
+                _reload()
+            else:
+                self.log(f"Set '{set_id}' nicht im Papierkorb gefunden.")
+
+        def _purge_all() -> None:
+            if trash_list.count() == 0:
+                return
+            # Doppelte Sicherheitsnachfrage - endgueltiges Loeschen ist nicht
+            # umkehrbar (User-Vorgabe P14-05).
+            first = QMessageBox.question(
+                dialog, "Papierkorb leeren?",
+                f"Alle {trash_list.count()} Sets im Papierkorb werden "
+                "ENDGUELTIG geloescht und koennen nicht wiederhergestellt "
+                "werden. Fortfahren?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if first != QMessageBox.Yes:
+                return
+            second = QMessageBox.question(
+                dialog, "Wirklich Papierkorb leeren?",
+                "Dieser Vorgang ist NICHT umkehrbar. Alle Sets werden "
+                "unwiderruflich entfernt. Fortfahren?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if second != QMessageBox.Yes:
+                return
+            count = self.set_repo.purge_trash()
+            self.log(f"Papierkorb geleert (P14-05): {count} Set(s) endgueltig entfernt.")
+            _reload()
+
+        btn_restore.clicked.connect(_restore)
+        btn_purge_one.clicked.connect(_purge_selected)
+        btn_purge_all.clicked.connect(_purge_all)
+        btn_close.clicked.connect(dialog.accept)
+
+        _reload()
+        dialog.exec()
 
     # =========================================================================
     # Phase 14 P14-02: Hot-Reload der Plugins (Dynamic Discovery)

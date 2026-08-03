@@ -153,3 +153,68 @@ CREATE TABLE IF NOT EXISTS service_set_history (
 
 
 
+
+---
+
+---
+
+### Kapitel 4.5-E [P14-05]: Ergaenzung - Papierkorb-Dialog im Service-Fenster (doppelte Sicherheitsnachfrage)
+
+Ergaenzende UI-Dokumentation zur User-Vorgabe: Auch das endgueltige Loeschen/
+Bereinigen aus dem Papierkorb erfolgt IMMER mit doppelter Sicherheitsnachfrage.
+Rein additiv; Repository-API (P14-05 Schritt 1) und bestehende Set-Verwaltung
+bleiben unangetastet.
+
+#### A. Konzept & Regeln
+
+1. **Papierkorb-Dialog (ServiceWindow.show_trash_dialog):**
+   * Oeffnet ein modales QDialog mit QListWidget aller soft-geloeschten
+     Sets (set_repo.list_trash(), sortiert nach deleted_at).
+   * Jeder Eintrag zeigt Name + Loesch-Zeitstempel (deleted_at).
+   * Buttons: **Wiederherstellen**, **Endgueltig loeschen**,
+     **Papierkorb leeren**, **Schliessen**.
+
+2. **Wiederherstellen:** restore_set_from_trash(set_id) verschiebt das Set
+   zurueck nach service_sets; anschliessend refresht der Dialog die Liste
+   und das Hauptfenster ruft refresh_set_list() (Set-Dropdown aktuell).
+
+3. **Doppelte Sicherheitsnachfrage (User-Vorgabe):** purge_trash_set()
+   (einzelnes Set) und purge_trash() (kompletter Papierkorb) sind NICHT
+   umkehrbar. Die UI verlangt daher vor jeder Ausfuehrung ZWEI aufeinander-
+   folgende QMessageBox.question-Bestaetigungen (Default jeweils Nein).
+
+4. **Scope:** Der Dialog ist eine reine UI-Komponente - er spricht
+   ausschliesslich die Repository-API an (keine direkten SQL-Zugriffe) und
+   protokolliert jede Aktion ueber self.log().
+
+#### B. Schritt-fuer-Schritt AI-Anleitung
+
+##### Schritt 1: service_win.py - Papierkorb-Dialog (additiv)
+
+1. **UI-Wiring:** btn_trash_sets (in ui/service_win.ui zwischen Loeschen-
+   Button und Spacer) wird in __init__ mit show_trash_dialog verdrahtet.
+   QDialog ist bereits im PySide6.QtWidgets-Import vorhanden.
+
+2. **show_trash_dialog()** (zwischen delete_set() und P14-02-Abschnitt):
+   * Baut den Dialog vollstaendig im Code (hardcoded UI-Wiring).
+   * _reload() befuellt die Liste aus list_trash(); leere Buttons werden
+     deaktiviert, der Hinweistext zeigt 'Der Papierkorb ist leer.'.
+   * Wiederherstellen / Endgueltig loeschen / Leeren als verschachtelte
+     Handler; jede purge-Aktion durchlaeuft zwei QMessageBox.question.
+   * Nach jeder Aktion: Log via self.log(...), Listen-Refresh, bei
+     Wiederherstellung zusaetzlich refresh_set_list().
+
+##### Schritt 2: Headless Validierung
+
+1. Erstelle und fuehre aus: test/check_p14_s5_trash.py:
+* Neuanlage -> KEIN Snapshot; Ueberschreiben -> GENAU 1 Snapshot (Version
+  fortlaufend); record_snapshot=False -> KEIN Snapshot.
+* delete_set() -> nicht in list_sets(), aber in list_trash() mit
+  deleted_at; Definition/Name vollstaendig erhalten.
+* restore_set_from_trash() -> vollstaendige Wiederherstellung.
+* purge_trash_set / purge_trash entfernen endgueltig (bool/Anzahl).
+
+> Hinweis: Die doppelte Sicherheitsnachfrage selbst ist UI-Logik
+> (QMessageBox) und wird NICHT headless ausgefuehrt - sie wird durch
+> sorgfaeltige Code-Inspektion abgesichert. Die Repository-Funktionen hinter
+> den Buttons (purge/purge_trash) sind vollstaendig headless getestet.
