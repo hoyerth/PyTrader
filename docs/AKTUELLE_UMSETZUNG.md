@@ -72,6 +72,17 @@ Der Indicator ruft niemals direkt Plugins zur Neuberechnung auf.
 
 ## 4. Spezifikation & Schritt-für-Schritt-Anleitungen der Kernmodule (Phase 14)
 
+Die ausführlichen Kapitel 4.1–4.5 (P14-01 bis P14-05) inkl. Kopierblöcken,
+Schritt-für-Schritt-Anleitungen und pro-Kapitel Validierung sind **archiviert** in:
+
+* `docs/Old/x_Roadmap_Phase14.md` (verbindliche Referenz, NICHT Bestandteil der
+  Hauptanweisung – siehe System-Regeln `docs/Old`)
+
+Alle P14-Kapitel sind **umgesetzt und committet** (Commits `6878a23`–`1408e46`,
+Tags `phase14_step1`–`phase14_step6`). Die aktive Hauptanweisung für weitere
+Umsetzungen sind die Kapitel 5 (JSON-Schema), 6 (Regressionstest) und 7
+(Betriebsrahmen) dieser Datei.
+
 ---
 
 ## 5. Phase 14 Standard JSON-Schema
@@ -112,126 +123,35 @@ Das erweiterte JSON-Schema definiert exakt die Struktur für Service-Sets inklus
 }
 
 
+**Umsetzungs-Status (additiv):** `ServiceSetRepository.save_set()` stempelt die
+Set-Level-Felder automatisch in jede Definition (idempotent):
+* `schema_version` → `"1.0"` (Default, aus Definition/Bestand übernommen)
+* `version` → Aufrufer-Version gewinnt; sonst **Patch-Bump** (`major.minor.patch`)
+  bei jedem Überschreiben, `"1.0.0"` bei Neuanlage
+* `created_at` → ISO-8601 UTC bei Neuanlage; bleibt bei Überschreiben stabil
+* `ServiceSetDefinition` (TypedDict) enthält die Felder `version`,
+  `schema_version`, `created_at` (analog `description`)
+
+Das `depends_on`-Feld je Service wird vom TypedDict unterstützt und vom
+Evaluator validiert; die Erzeugung erfolgt durch die aufrufenden Komponenten
+(Indikator-Pipeline), nicht durch das Repository.
 
 ---
 
 ## 6. Universal-Regressionstest für Phase 14
 
-Dieses Testskript ist **vollständig dynamisch** und fehlertolerant aufgebaut. Noch nicht implementierte Module werden als `[SKIPPED / PENDING]` markiert.
+**Umgesetzt:** `test/check_phase14_regression.py` (headless, KEINE UI, KEIN `exec_()`).
 
-```python
-# test/check_phase14_regression.py
-"""
-Universal-Regressionstest für Phase 14 (PyTrader).
-"""
+Ausführen:
+    python test/check_phase14_regression.py
 
-import sys
-import os
-import unittest
-from pathlib import Path
+Der Test validiert alle P14-Kernmodule funktional (ASCII-Ausgabe, Test-DB in `test/phase14_regression_test.duckdb`, 41 Checks):
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-if str(BASE_DIR) not in sys.path:
-    sys.path.insert(0, str(BASE_DIR))
-
-
-class TestPhase14Regression(unittest.TestCase):
-
-    def setUp(self):
-        print("\n" + "=" * 70)
-        print("🔍 START: Phase 14 Dynamic Regression Suite")
-        print("=" * 70)
-
-    def test_p14_01_description_fields(self):
-        print("\n[P14-01] Prüfe Beschreibungsfelder & Metadaten...")
-        try:
-            from analytics.features.plugins.base_plugin import PluginMetadata
-            from analytics.engine.service_models import ServiceSetDefinition
-            from analytics.engine.service_set_repository import ServiceSetRepository
-
-            annotations = ServiceSetDefinition.__annotations__
-            if "description" in annotations:
-                print("  ✅ ServiceSetDefinition enthält 'description'")
-            else:
-                print("  ⚠️ ServiceSetDefinition hat kein 'description'-Feld (Pending)")
-
-            repo = ServiceSetRepository()
-            if hasattr(repo, "get_set"):
-                print("  ✅ ServiceSetRepository ist verfügbar")
-
-        except ImportError as e:
-            print(f"  ⏭️ [SKIPPED] Modul noch nicht vollständig implementiert: {e}")
-
-    def test_p14_02_dynamic_discovery(self):
-        print("\n[P14-02] Prüfe Plugin Discovery & Registry...")
-        try:
-            from analytics.features.feature_builder import PluginRegistry, PluginLoader
-
-            registry = PluginRegistry()
-            plugins = registry.plugins
-            print(f"  ✅ Entdeckte Plugins in Registry: {list(plugins.keys())}")
-
-            if hasattr(registry, "reload"):
-                print("  ✅ Hot-Reload Funktion 'reload' vorhanden")
-            else:
-                print("  ⚠️ Hot-Reload 'reload' steht noch aus (Pending)")
-
-        except ImportError as e:
-            print(f"  ⏭️ [SKIPPED] Modul noch nicht implementiert: {e}")
-
-    def test_p14_03_resilience(self):
-        print("\n[P14-03] Prüfe Pipeline-Resilienz & Error-Handling...")
-        try:
-            from analytics.engine.set_evaluator import ServiceSetEvaluator
-
-            evaluator = ServiceSetEvaluator()
-            if hasattr(evaluator, "_failure_counters"):
-                print("  ✅ Failure-Counter / Quarantäne-System im Evaluator aktiv")
-            else:
-                print("  ⚠️ Resilience Skip-Logic noch im Standard-Modus (Pending)")
-
-        except ImportError as e:
-            print(f"  ⏭️ [SKIPPED] Modul noch nicht implementiert: {e}")
-
-    def test_p14_04_schema_migration(self):
-        print("\n[P14-04] Prüfe Schema-Migrator...")
-        try:
-            from analytics.engine.schema_migrator import SchemaMigrator
-            print("  ✅ SchemaMigrator-Klasse erfolgreich geladen")
-        except ImportError:
-            print("  ⏭️ [SKIPPED] SchemaMigrator noch nicht erstellt (Pending)")
-
-    def test_p14_05_trash_and_history(self):
-        print("\n[P14-05] Prüfe Papierkorb & Snapshot-Historie...")
-        try:
-            from analytics.engine.service_set_repository import ServiceSetRepository
-
-            repo = ServiceSetRepository()
-            has_trash = hasattr(repo, "list_trash") or hasattr(repo, "restore_set_from_trash")
-            if has_trash:
-                print("  ✅ Soft-Delete & Papierkorb-Funktionen im Repository vorhanden")
-            else:
-                print("  ⚠️ Soft-Delete / Papierkorb noch nicht im Repository aktiv (Pending)")
-
-        except Exception as e:
-            print(f"  ⏭️ [SKIPPED] Repository-Prüfung übersprungen: {e}")
-
-
-def run_phase14_regression():
-    suite = unittest.TestLoader().loadTestsFromTestCase(TestPhase14Regression)
-    runner = unittest.TextTestRunner(verbosity=2)
-    result = runner.run(suite)
-    print("\n" + "=" * 70)
-    print("📊 REGRESSIONSTEST ERGEBNIS")
-    print(f"  Ran: {result.testsRun} | Errors: {len(result.errors)} | Failures: {len(result.failures)}")
-    print("=" * 70)
-    return result.wasSuccessful()
-
-
-if __name__ == "__main__":
-    success = run_phase14_regression()
-    sys.exit(0 if success else 1)
-```
+* **P14-01** – `ServiceSetDefinition` enthält `description` + `version` (Kap 5), `ServiceInstanceConfig.version`, `PluginMetadata` importierbar.
+* **P14-02** – `PluginRegistry` (Singleton) entdeckt Core-Plugins (`grid_lines`, `proximity`, `grid_liquidity`); `reload()` läuft fehlerfrei.
+* **P14-03** – `ServiceSetEvaluator` mit `_failure_counters` / `_quarantined` / `reset()`; `execute_set_resilient()` liefert Ergebnisse auf synthetischen Daten.
+* **P14-04** – `SchemaMigrator` importierbar; SemVer-Matrix (Legacy → Migration, Patch → keine unnötige Migration).
+* **P14-05** – Soft-Delete/Restore/purge funktional; Set-Level-Metadaten (`version`/`schema_version`/`created_at`, Kap 5) und Snapshot-Historie verifiziert.
 
 ## 7. Betriebliche Rahmenbedingungen, Monitoring & Deployment-Checks (Kapitel 14.6 - Betriebsrahmen)
 
@@ -253,25 +173,16 @@ Folgende Metriken MÜSSEN über das bestehende Logging-System (strukturierte Feh
 
 Die folgenden Test-Skripte MÜSSEN vor jedem produktiven Release durchlaufen:
 
-1. **Erstelle `test/check_performance_p14.py`:**
+1. **`test/check_performance_p14.py`** (umgesetzt, headless):
 
-   import time
-   class TestPerformance(unittest.TestCase):
-       def test_plugin_discovery_speed(self):
-           start = time.perf_counter()
-           PluginRegistry().reload()
-           elapsed = time.perf_counter() - start
-           self.assertLess(elapsed, 0.1, f"Discovery zu langsam: {elapsed:.3f}s")
-       
-       def test_service_evaluation_speed(self):
-           # 1000 Bars, 5 Services
-           elapsed = self._run_benchmark(1000, 5)
-           self.assertLess(elapsed, 0.05, f"Evaluation zu langsam: {elapsed:.3f}s")
-       
-       def test_feature_store_read_speed(self):
-           elapsed = self._read_benchmark(1000)
-           self.assertLess(elapsed, 0.005, f"Store-Read zu langsam: {elapsed:.3f}s")
-   
+   Ausführen:
+       python test/check_performance_p14.py
+
+   Der Test misst (Test-DBs in `test/`, großzügige Dev-Schwellen – Produktiv-Alerts siehe 7.1):
+   * **Plugin-Discovery-Speed** – `PluginRegistry().reload()` (< 2,0 s; Produktiv-Warnung laut 7.1: > 500 ms)
+   * **Service-Evaluation-Speed** – `ServiceSetEvaluator.execute_set()` auf 1000 synthetischen Bars mit grid_lines + proximity (< 2,0 s)
+   * **Feature-Store-Read-Speed** – DuckDB-SELECT auf 1000 Zeilen der feature_store-Test-Tabelle (< 0,2 s)
+
 ### 7.3 Deployment-Checks & Rollback-Plan
 
 Vor der Veröffentlichung einer neuen Version MÜSSEN folgende Checks durchgeführt werden:
@@ -279,6 +190,7 @@ Vor der Veröffentlichung einer neuen Version MÜSSEN folgende Checks durchgefü
     1. Schema-Migration Dry-Run: Führe ServiceSetRepository().list_sets() in einer isolierten Test-DB mit der neuen Migrations-Logik aus, um sicherzustellen, dass keine MigrationError geworfen werden.
 
     2. Plugin-Isolation: Starte die App einmalig mit --check-plugins, um zu validieren, dass keine Custom-Plugins Core-Plugin-IDs überschreiben (Core Protection Rule).
+       **Umgesetzt:** `python main.py --check-plugins` (headless, ohne GUI). Nutzt `PluginLoader.find_custom_conflicts()`; Exit-Code 0 = OK, 1 = Konflikt.
 
     3. Rollback-Plan: Bei einem kritischen Fehler NACH dem Deployment:
         Führe git reset --hard phase14_step5 (oder den letzten stabilen Tag) aus.

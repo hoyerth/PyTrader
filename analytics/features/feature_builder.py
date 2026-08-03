@@ -241,6 +241,59 @@ class PluginLoader:
         self._scan_dir(plugins, self.custom_plugins_path, "custom_plugins", is_custom=True)
         return plugins
 
+    def find_custom_conflicts(self) -> List[Dict[str, str]]:
+        """Kapitel 7.3 AKTUELLE_UMSETZUNG (Core Protection Rule, --check-plugins).
+
+        Scannt die Core-Definitions und anschliessend die Custom-Plugins –
+        exakt wie discover_plugins() – und liefert alle Custom-Plugin-IDs, die
+        mit einer bereits registrierten Core-Plugin-ID kollidieren. Die
+        eigentliche Registry verwirft solche Custom-Plugins bereits beim Laden
+        (WARN-Log); dieser Check macht die Kollisionen fuer den Deployment-
+        Check (`python main.py --check-plugins`) sichtbar und pruefbar.
+
+        Returns:
+            Liste von Dicts {"plugin_id", "custom_module"} – leer, wenn die
+            Core Protection Rule vollstaendig greift.
+        """
+        conflicts: List[Dict[str, str]] = []
+        core: Dict[str, PluginFeature] = {}
+        self._scan_dir(core, self.definitions_path,
+                       "analytics.features.definitions", is_custom=False)
+        if not self.custom_plugins_path.exists():
+            return conflicts
+        # data/ in sys.path sicherstellen (namespace package custom_plugins)
+        try:
+            data_dir = str(DATA_DIR)
+            if data_dir not in sys.path:
+                sys.path.insert(0, data_dir)
+        except Exception:
+            pass
+        for mod_info in pkgutil.walk_packages([str(self.custom_plugins_path)]):
+            full_module_name = f"custom_plugins.{mod_info.name}"
+            try:
+                module = importlib.import_module(full_module_name)
+            except Exception as e:
+                print(f"WARN [PluginLoader] Modul {full_module_name} nicht "
+                      f"ladbar: {e}")
+                continue
+            for _name, obj in inspect.getmembers(module, inspect.isclass):
+                if inspect.isabstract(obj):
+                    continue
+                if issubclass(obj, PluginFeature) and obj is not PluginFeature:
+                    try:
+                        instance = obj()
+                    except Exception as e:
+                        print(f"WARN [PluginLoader] Instanzierung {_name} "
+                              f"({full_module_name}) fehlgeschlagen: {e}")
+                        continue
+                    pid = str(instance.plugin_id)
+                    if pid.lower() in core:
+                        conflicts.append({
+                            "plugin_id": pid,
+                            "custom_module": full_module_name,
+                        })
+        return conflicts
+
 
 class PluginRegistry:
     """Zentraler Singleton-Katalog für entdeckte Plugins (P14-02: thread-sicher)."""

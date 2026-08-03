@@ -604,6 +604,32 @@ class MainWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    # Kapitel 7.3 AKTUELLE_UMSETZUNG: Deployment-Check "python main.py
+    # --check-plugins" – headless Validierung der Core Protection Rule
+    # (kein Custom-Plugin ueberschreibt eine Core-Plugin-ID). Endet mit
+    # exit 0 (OK) bzw. exit 1 (Konflikt) OHNE GUI-Start. Additiv: der
+    # normale App-Start bleibt unveraendert.
+    if "--check-plugins" in sys.argv:
+        from analytics.features.feature_builder import PluginRegistry, PluginLoader
+        registry = PluginRegistry()
+        print(f"[check-plugins] Core-Plugins: {sorted(registry.plugins.keys())}")
+        try:
+            conflicts = PluginLoader().find_custom_conflicts()
+        except Exception as e:
+            print(f"[check-plugins] FEHLER bei der Konflikt-Pruefung: {e}")
+            sys.exit(1)
+        if conflicts:
+            print(f"[check-plugins] KONFLIKT: {len(conflicts)} Custom-Plugin(s) "
+                  f"ueberschreiben Core-IDs:")
+            for c in conflicts:
+                print(f"  - '{c['plugin_id']}' aus {c['custom_module']}")
+            print("[check-plugins] Core Protection Rule verletzt – bereinige "
+                  "die Custom-Plugins.")
+            sys.exit(1)
+        print("[check-plugins] OK: keine Custom-Plugins ueberschreiben "
+              "Core-IDs (Core Protection Rule aktiv).")
+        sys.exit(0)
+
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()

@@ -26,6 +26,7 @@ import copy
 import json
 import os
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -141,6 +142,24 @@ class ServiceSetRepository:
             names = list(services.keys())
         return " + ".join(names) if names else "Unbenanntes Set"
 
+    @staticmethod
+    def _semver_bump_patch(version: str) -> str:
+        """Erhoeht die Patch-Stufe einer Semantic-Version (1.2.3 -> 1.2.4).
+
+        Dient dem Set-Level `version`-Feld (Kap 5 AKTUELLE_UMSETZUNG): Bei jedem
+        Ueberschreiben eines Sets wird die Patch-Stufe automatisch angehoben,
+        sofern der Aufrufer keine explizite Version mitgibt. Ungueltige/leere
+        Versionen werden als "0.0.1" behandelt (defensiv).
+        """
+        parts = str(version or "0.0.0").split(".")
+        try:
+            major = int(parts[0])
+            minor = int(parts[1]) if len(parts) > 1 else 0
+            patch = int(parts[2]) if len(parts) > 2 else 0
+        except (ValueError, IndexError):
+            return "0.0.1"
+        return f"{major}.{minor}.{patch + 1}"
+
     # -------------------------------------------------------------------------
     # Pflicht-API
     # -------------------------------------------------------------------------
@@ -156,6 +175,17 @@ class ServiceSetRepository:
         Überschreiben der bisherige Stand als Snapshot in service_set_history
         gesichert (version = fortlaufender Zähler je set_id). Bei reinen
         Neuanlagen oder Schreibfehlern entsteht KEIN Snapshot (Invariante 9).
+
+        Kap 5 AKTUELLE_UMSETZUNG (Set-Level Metadaten, additiv): Jede Definition
+        erhält automatisch die Felder
+          - version         Set-Level Semantic Version (major.minor.patch).
+                            Aufrufer-Version gewinnt; sonst Patch-Bump beim
+                            Überschreiben, "1.0.0" bei Neuanlage.
+          - schema_version  Format-Version der Definition ("1.0", Default).
+          - created_at      Erstellungs-Zeitstempel (ISO-8601 UTC); wird bei
+                            Überschreiben aus dem Bestand übernommen.
+        Bestehende Sets werden beim nächsten Speichern automatisch auf diese
+        Felder nachgezogen (idempotent, kein Datenverlust).
 
         Args:
             definition: ServiceSetDefinition.
@@ -173,24 +203,47 @@ class ServiceSetRepository:
         description = definition.get("description")
         description = str(description).strip() if description is not None else None
 
+        con = self._get_connection()
+
+        # Kap 5 AKTUELLE_UMSETZUNG: Set-Level Metadaten (version/schema_version/
+        # created_at). Bestand lesen, damit created_at bei Überschreiben erhalten
+        # bleibt und die Snapshot-Historie denselben Lesezugriff nutzen kann.
+        existing_row = con.execute(
+            "SELECT definition FROM service_sets WHERE set_id = ?", [set_id]
+        ).fetchone()
+        existing_def = _parse_json_field(existing_row[0]) if existing_row else {}
+
+        if definition.get("version"):
+            version = str(definition["version"])
+        elif existing_def.get("version"):
+            version = self._semver_bump_patch(str(existing_def["version"]))
+        else:
+            version = "1.0.0"
+        schema_version = str(
+            definition.get("schema_version")
+            or existing_def.get("schema_version")
+            or "1.0"
+        )
+        created_at = definition.get("created_at") or existing_def.get("created_at")
+        if not created_at:
+            created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
         payload = {
             "set_id": set_id,
             "display_name": display_name,
             "description": description,
+            "version": version,
+            "schema_version": schema_version,
+            "created_at": created_at,
             "execution_order": definition.get("execution_order", []),
             "services": definition.get("services", {}),
         }
 
-        con = self._get_connection()
-
         # P14-05: Snapshot-Historie – NUR bei erfolgreichem Überschreiben eines
         # BEREITS EXISTIERENDEN Sets (vor dem Upsert).
         if record_snapshot:
-            row = con.execute(
-                "SELECT definition FROM service_sets WHERE set_id = ?", [set_id]
-            ).fetchone()
-            if row:
-                old_definition = _parse_json_field(row[0]) or {}
+            if existing_row:
+                old_definition = existing_def or {}
                 history_count = con.execute(
                     "SELECT COUNT(*) FROM service_set_history WHERE set_id = ?",
                     [set_id],
