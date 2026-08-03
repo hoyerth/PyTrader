@@ -864,24 +864,31 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		proximity). Existiert ein Service mit dieser plugin_id im gewählten Set,
 		wird dessen instance_id (z.B. grid_1) übernommen; sonst plugin_id.
 		Ohne Indikator-Deklaration: die Services des gewählten Sets.
+		Phase 14 P14-01: Fallback auf das aktive Plugin als Service, wenn weder
+		Set-Services noch deklarierte Services existieren (konsistent zur
+		Service-Erzeugung in collect_set_definition).
 		"""
 		svc_ids = self._indicator_service_ids()
 		definition = self._current_set_definition
 		services = ((definition or {}).get("services") or {}) if definition else {}
 		if not svc_ids:
-			return [
+			items = [
 				{"instance_id": iid,
 				 "plugin_id": (services.get(iid) or {}).get("plugin_id") or "?"}
 				for iid in ((definition or {}).get("execution_order") or [])
 			]
-		items = []
-		for pid in svc_ids:
-			iid = next(
-				(i for i in ((definition or {}).get("execution_order") or [])
-				 if (services.get(i) or {}).get("plugin_id") == pid),
-				None,
-			)
-			items.append({"instance_id": iid or pid, "plugin_id": pid})
+		else:
+			items = []
+			for pid in svc_ids:
+				iid = next(
+					(i for i in ((definition or {}).get("execution_order") or [])
+					 if (services.get(i) or {}).get("plugin_id") == pid),
+					None,
+				)
+				items.append({"instance_id": iid or pid, "plugin_id": pid})
+		if not items and self.plugin is not None:
+			items = [{"instance_id": self.plugin.plugin_id,
+			          "plugin_id": self.plugin.plugin_id}]
 		return items
 
 	def _service_cfg(self, plugin_id: str) -> Dict[str, Any]:
@@ -966,10 +973,14 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		self._rebuild_service_stack()
 
 	def _on_service_selected(self, index: int) -> None:
-		"""Wechselt die QStackedWidget-Seite (Seite 0 = aktives Plugin)."""
+		"""Wechselt die QStackedWidget-Seite (Seite i = Service i).
+
+		Phase 14 P14-01: Es gibt keine separate Plugin-Live-Seite mehr –
+		Seite 0 ist der erste Service (Parität zum service_win).
+		"""
 		if not self.stack_service_forms:
 			return
-		self.stack_service_forms.setCurrentIndex(index + 1 if index >= 0 else 0)
+		self.stack_service_forms.setCurrentIndex(max(0, index))
 		# 4.4: Fenster/Box auf die neue Service-Seite nachziehen (dynamische Höhe)
 		if self._ui_ready:
 			self._reflow()
@@ -1023,8 +1034,15 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		dlg.exec()
 
 	def _rebuild_service_stack(self) -> None:
-		"""Baut das QStackedWidget neu: Seite 0 = aktive Service-Parameter des
-		Plugins, weitere Seiten = Services des gewählten Sets."""
+		"""Baut das QStackedWidget neu: EINE Seite pro Service aus dem
+		Service-Modell – Parität zu den Service-Spalten im service_win.
+
+		Phase 14 P14-01: Es werden NUR die im Service-Modell gespeicherten
+		Parameter des jeweiligen Service angezeigt (cfg['params'] + lookback +
+		description). Die frühere 'Seite 0' mit den Plugin-Live-Parametern aus
+		self.params entfällt – sie zeigte Werte, die NICHT im Modell stehen.
+		Rein visuelle Keys (show_*/color) werden ausgeblendet (wie service_win).
+		"""
 		if not self.stack_service_forms:
 			return
 		stack = self.stack_service_forms
@@ -1034,19 +1052,6 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			w.deleteLater()
 		self._set_param_controls = {}
 		self._set_desc_controls = {}
-
-		# Seite 0: Service-Props des aktiven Plugin-Indikators (self.params)
-		page0 = QWidget()
-		form0 = QFormLayout(page0)
-		for key in self.plugin_order:
-			spec = self.plugin_schema.get(key, {})
-			if self._is_visual_key(key) or spec.get("expert"):
-				continue
-			cval = self.params.get(key, spec.get("default"))
-			ctrl = self.create_schema_control(key, cval, spec)
-			self.param_controls[key] = ctrl
-			form0.addRow(self.plugin_labels.get(key, self._human(key)), ctrl)
-		stack.addWidget(page0)
 
 		# Seiten fuer die anzuzeigenden Services (Indikator-Services, sonst
 		# Services des gewählten Sets) – pro Service eine Seite
@@ -1083,10 +1088,11 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 					if key not in sp_order:
 						sp_order.append(key)
 				sp_params = dict(cfg.get("params") or {})
-				# Normale (Nicht-Expert-)Parameter
+				# Normale (Nicht-Expert-, Nicht-Darstellungs-)Parameter –
+				# NUR die im Service-Modell gespeicherten (wie service_win).
 				for key in sp_order:
 					spec = sp_schema.get(key, {})
-					if spec.get("expert"):
+					if spec.get("expert") or self._is_visual_key(key):
 						continue
 					cval = sp_params.get(key, spec.get("default"))
 					ctrl = self.create_schema_control(key, cval, spec)
@@ -1119,7 +1125,14 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 				pf.addRow(QLabel(f"Plugin '{pid}' nicht gefunden."))
 			stack.addWidget(page)
 
-		stack.setCurrentIndex(0)
+		# Phase 14 P14-01: Stack-Seite mit der Combo-Auswahl synchronisieren
+		# (Seite 0 = erster Service; keine separate Plugin-Seite mehr).
+		if self.combo_service_sel is not None:
+			combo_idx = self.combo_service_sel.currentIndex()
+		else:
+			combo_idx = 0
+		if stack.count():
+			stack.setCurrentIndex(max(0, min(combo_idx, stack.count() - 1)))
 		# 4.4: Fenster/Box auf die neue Stack-Seite nachziehen (dynamische Höhe)
 		if self._ui_ready:
 			self._reflow()
@@ -1248,18 +1261,17 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 				pid = self.plugin.plugin_id
 				params: Dict[str, Any] = {}
 				lookback: int = 1000
-				for key in self.plugin_order:
-					spec = self.plugin_schema.get(key, {})
-					if self._is_visual_key(key) or key == "lookback":
-						continue  # Indi-Props gehören nicht ins Service-Set; lookback ist Instanz-Einstellung
-					if key in self.param_controls:
-						params[key] = self._ctrl_value(self.param_controls[key])
+				# Phase 14 P14-01: Der Plugin-als-Service-Editor liegt jetzt in
+				# den Service-Seiten (_set_param_controls), nicht mehr auf einer
+				# separaten Plugin-Live-Seite (param_controls / self.params).
+				for fkey, ctrl in self._set_param_controls.items():
+					c_iid, key = fkey.split(":", 1)
+					if c_iid != pid:
+						continue
+					if key == "lookback":
+						lookback = int(self._ctrl_value(ctrl))
 					else:
-						params[key] = self.params.get(key, spec.get("default"))
-				if "lookback" in self.param_controls:
-					lookback = int(self._ctrl_value(self.param_controls["lookback"]))
-				else:
-					lookback = int(self.params.get("lookback", 1000) or 1000)
+						params[key] = self._ctrl_value(ctrl)
 				services[pid] = {"plugin_id": pid, "lookback": lookback, "params": params}
 				definition["execution_order"] = [pid]
 
