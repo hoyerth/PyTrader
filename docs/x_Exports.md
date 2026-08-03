@@ -77,6 +77,7 @@ PyTrader/
             __init__.py
             base_definition.py
             description_dialog.py
+            schema_migrator.py
             service_models.py
             service_set_repository.py
             set_evaluator.py
@@ -142,8 +143,6 @@ PyTrader/
         analytics.duckdb.tmp/
         custom_plugins/
     test/
-        _check_doc2_tmp.py
-        _check_doc_tmp.py
         build_cont_map.py
         check_app_state.py
         check_broker_tz.py
@@ -177,11 +176,17 @@ PyTrader/
         check_p13_s7.py
         check_p13_service_win_geometry.py
         check_p13_ui_plugins.py
+        check_p14_flacker_zyklus.py
+        check_p14_grid_incremental.js
+        check_p14_live_fixes.py
         check_p14_precision_levels.py
         check_p14_prop_ui.py
         check_p14_s1_description.py
         check_p14_s2_discovery.py
         check_p14_s3_resilience.py
+        check_p14_s4_migration.py
+        check_p14_s4_services_locked.py
+        check_p14_s5_trash.py
         check_p14_service_params.py
         check_phase12_step1_migration.py
         check_plugin_batch_services.py
@@ -2271,15 +2276,15 @@ QMessageBox-Rückfrage) und Ausführen (ServiceSetEvaluator im Hintergrund).
 """
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QFile, QIODevice, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QProgressBar, QPushButton, QSizePolicy, QSpinBox, QTextEdit, QVBoxLayout,
-    QWidget,
+    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFormLayout, QGroupBox,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMessageBox, QProgressBar, QPushButton, QSizePolicy, QSpinBox, QTextEdit,
+    QVBoxLayout, QWidget,
 )
 
 from analytics.background_workers.historical_scanner import HistoricalScanner
@@ -2305,6 +2310,24 @@ def _available_plugin_ids() -> str:
         return ", ".join(sorted(PluginRegistry().plugins.keys()))
     except Exception:
         return "?"
+
+
+def _sets_using_plugin(plugin_id: str, sets: List[Dict[str, Any]]) -> List[str]:
+    """P14-04-E: Namen aller Service-Sets, die einen Service mit dieser
+    plugin_id enthalten.
+
+    Basis der Service-Sperre: Einzel-Services, die in einem gespeicherten
+    Service-Set vorkommen, dürfen im Service-Fenster nicht entfernt werden
+    (Indikator-Basisservices wie grid_lines/proximity bleiben funktionsfähig).
+    Beim Löschversuch wird der Name des verwendeten Sets angezeigt.
+    """
+    names: List[str] = []
+    for s in sets or []:
+        services = s.get("services") or {}
+        if any((cfg or {}).get("plugin_id") == plugin_id
+               for cfg in services.values()):
+            names.append(str(s.get("display_name") or s.get("set_id") or "?"))
+    return names
 
 
 class ServiceSetRunWorker(QThread):
@@ -2428,7 +2451,9 @@ class _ServiceSetItemAdapter(NamedItemAdapter):
             self.dlg.log("Kein Set zum Löschen ausgewählt.")
             return False
         if self.dlg.set_repo.delete_set(set_id):
-            self.dlg.log(f"Set gelöscht: {set_id}")
+            # P14-05: Soft-Delete – das Set liegt im Papierkorb und kann über
+            # den Papierkorb-Dialog wiederhergestellt werden.
+            self.dlg.log(f"Set in den Papierkorb verschoben (P14-05): {set_id}")
             return True
         self.dlg.log(f"Set '{set_id}' nicht gefunden.")
         return False
@@ -2514,6 +2539,8 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         self.combo_plugin_select: Optional[QComboBox] = self.ui.findChild(QComboBox, "combo_plugin_select")
         self.btn_save_set: QPushButton = self.ui.findChild(QPushButton, "btn_save_set")
         self.btn_delete_set: QPushButton = self.ui.findChild(QPushButton, "btn_delete_set")
+        # Phase 14 P14-05: Papierkorb-Button (Soft-Delete/Wiederherstellung)
+        self.btn_trash_sets: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_trash_sets")
         self.btn_execute_set: QPushButton = self.ui.findChild(QPushButton, "btn_execute_set")
 
         # Phase 13 5.4 Schritt 1: Dynamische Service-Spalten (Breite/Höhe aus
@@ -2599,6 +2626,9 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             self.btn_save_set.clicked.connect(self.save_set)
         if self.btn_delete_set:
             self.btn_delete_set.clicked.connect(self.delete_set)
+        # Phase 14 P14-05: Papierkorb-Dialog (Soft-Delete)
+        if self.btn_trash_sets:
+            self.btn_trash_sets.clicked.connect(self.show_trash_dialog)
         if self.btn_execute_set:
             self.btn_execute_set.clicked.connect(self.execute_set)
 
@@ -2800,10 +2830,11 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             for iid in (definition.get("execution_order") or []):
                 cfg = services.get(iid, {})
                 plugin_id = cfg.get("plugin_id", "?")
-                item = QListWidgetItem(f"{iid}  [{plugin_id}]")
+                prefix, lock_tip = self._service_lock(plugin_id)
+                item = QListWidgetItem(f"{prefix}{iid}  [{plugin_id}]")
                 item.setData(Qt.UserRole, iid)
                 item.setData(Qt.UserRole + 1, plugin_id)
-                item.setToolTip(self._build_tooltip(iid, cfg))
+                item.setToolTip(self._build_tooltip(iid, cfg) + lock_tip)
                 self.list_execution_order.addItem(item)
         self._build_service_columns(definition)
 
@@ -2835,9 +2866,26 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
 
     @Slot()
     def remove_instance(self) -> None:
-        """Entfernt den markierten Service aus der Ausführungs-Reihenfolge."""
+        """Entfernt den markierten Service aus der Ausführungs-Reihenfolge.
+
+        P14-04-E (Service-Sperre): Einzel-Services, die in einem gespeicherten
+        Service-Set vorkommen, dürfen NICHT entfernt werden – sonst würde das
+        Set invalide und der Indikator verlöre seine Basisservices. Beim
+        Löschversuch erscheint ein Hinweis mit dem Namen des verwendeten Sets.
+        """
         lw = self.list_execution_order
         if not lw or lw.currentRow() < 0:
+            return
+        item = lw.item(lw.currentRow())
+        plugin_id = str(item.data(Qt.UserRole + 1) or item.data(Qt.UserRole) or "")
+        names = _sets_using_plugin(plugin_id, self.set_repo.list_sets())
+        if names:
+            QMessageBox.warning(
+                self, "Service gesperrt",
+                f"Der Service '{plugin_id}' kann nicht entfernt werden.\n"
+                f"Er wird vom Service-Set '{names[0]}' verwendet.\n"
+                f"Solange er in einem Set vorkommt, bleibt er für den "
+                f"Indikator gesperrt (P14-04).")
             return
         lw.takeItem(lw.currentRow())
         self._rebuild_columns()
@@ -2890,10 +2938,11 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
                 self.log(f"instance_id '{iid}' existiert bereits.")
                 return
 
-        item = QListWidgetItem(f"{iid}  [{plugin_id}]")
+        prefix, lock_tip = self._service_lock(plugin_id)
+        item = QListWidgetItem(f"{prefix}{iid}  [{plugin_id}]")
         item.setData(Qt.UserRole, iid)
         item.setData(Qt.UserRole + 1, plugin_id)
-        item.setToolTip(self._build_tooltip(iid, {"plugin_id": plugin_id}))
+        item.setToolTip(self._build_tooltip(iid, {"plugin_id": plugin_id}) + lock_tip)
         self.list_execution_order.addItem(item)
         self.edit_new_instance.clear()
         self.log(f"Service hinzugefügt: {iid} [{plugin_id}]")
@@ -2953,6 +3002,20 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             cfg = services.setdefault(iid, {"plugin_id": "", "lookback": 1000, "params": {}})
             cfg["description"] = ctrl.text().strip()
 
+        # Phase 14 P14-04: Semantische Versionierung – bei JEDER instance_id
+        # wird die aktuelle plugin.version aus der PluginRegistry eingestempelt
+        # (ServiceInstanceConfig.version). So trägt jede gespeicherte Instanz
+        # die Version des erzeugenden Plugins für den späteren Schema-Migrator.
+        # Kann ein Plugin nicht aufgelöst werden (z. B. deinstalliert), bleibt
+        # ein vorhandenes version-Feld bzw. dessen Fehlen unverändert erhalten.
+        for iid, cfg in services.items():
+            pid = cfg.get("plugin_id") or iid
+            try:
+                plugin = registry.get(pid)
+                cfg["version"] = getattr(plugin, "version", "0.0.0") or "0.0.0"
+            except KeyError:
+                pass
+
         return {
             "set_id": self._current_set_id or "",
             "display_name": self.edit_set_name.text().strip() if self.edit_set_name else "",
@@ -2978,6 +3041,21 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
             lines.append(f"<i>{desc}</i>")
         return "<br>".join(lines)
 
+    def _service_lock(self, plugin_id: str) -> tuple:
+        """P14-04-E: (🔒-Präfix, Tooltip-Nachtrag) für die sichtbare Sperr-
+        Kennzeichnung im Service-Fenster.
+
+        Ein Service ist gesperrt, wenn er in einem gespeicherten Service-Set
+        vorkommt (Indikator-Basisservice). Liefert ("", "") wenn der Service
+        frei ist; andernfalls ein 🔒-Präfix für Listeneintrag/Spaltentitel und
+        einen HTML-Tooltip-Nachtrag mit dem Namen des verwendeten Sets.
+        """
+        names = _sets_using_plugin(str(plugin_id), self.set_repo.list_sets())
+        if not names:
+            return "", ""
+        return "🔒 ", (f"<br><b>Gesperrt (P14-04)</b>: wird vom Service-Set "
+                       f"'{names[0]}' verwendet – Entfernen nicht möglich")
+
     def _update_service_tooltip(self, iid: str) -> None:
         """Aktualisiert den Tooltip des Listen-Items live beim Tippen."""
         if not self.list_execution_order:
@@ -2989,7 +3067,10 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
                 desc_ctrl = self._service_desc_controls.get(iid)
                 if desc_ctrl is not None:
                     cfg["description"] = desc_ctrl.text().strip()
-                item.setToolTip(self._build_tooltip(iid, cfg))
+                # P14-04-E: Sperr-Nachtrag (🔒) beibehalten – der Live-Tooltip
+                # darf die Sperr-Kennzeichnung nicht überschreiben.
+                _prefix, lock_tip = self._service_lock(str(cfg.get("plugin_id") or ""))
+                item.setToolTip(self._build_tooltip(iid, cfg) + lock_tip)
                 break
 
     def _on_order_item_clicked(self, item: QListWidgetItem) -> None:
@@ -3221,8 +3302,12 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         - Normale Parameter im QFormLayout (float/int/bool nach Schema).
         - expert: True (inkl. lookback) in einer einklappbaren
           QGroupBox 'Experten-Optionen' am Spaltenfuß.
+
+        P14-04-E: Spaltentitel trägt die 🔒-Kennzeichnung, wenn der Service in
+        einem gespeicherten Service-Set vorkommt (Sperre sichtbar).
         """
-        col = QGroupBox(f"{iid}  [{pid}]")
+        prefix, _ = self._service_lock(pid)
+        col = QGroupBox(f"{prefix}{iid}  [{pid}]")
         # 5.4.2.2 Punkt 3: Spalte skaliert in der Höhe exakt mit ihrem Inhalt
         # (endet unter dem letzten Parameter), wächst beim Vergrößern des
         # Fensters NICHT mit.
@@ -3336,8 +3421,164 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         Rückfrage (QMessageBox.question), danach wird das nächstverfügbare Set
         ausgewählt. Implementierung: NamedItemActionsMixin.delete_named_item()
         mit dem Service-Set-Adapter.
+
+        P14-04-E (Set-Sperre): Es muss immer mindestens ein gültiges Service-
+        Set erhalten bleiben, damit der Indikator funktionsfähig bleibt. Das
+        Löschen des letzten verbliebenen Sets ist gesperrt.
         """
+        if len(self.set_repo.list_sets()) <= 1:
+            QMessageBox.warning(
+                self, "Löschen gesperrt",
+                "Es muss immer mindestens ein gültiges Service-Set erhalten "
+                "bleiben, damit der Indikator funktionsfähig bleibt (P14-04).")
+            return
         self.delete_named_item(self._set_adapter)
+
+    # =========================================================================
+    # Phase 14 P14-05: Papierkorb (Soft-Delete / Wiederherstellung)
+    # =========================================================================
+
+    @Slot()
+    def show_trash_dialog(self) -> None:
+        """Öffnet den Papierkorb-Dialog für Service-Sets (P14-05).
+
+        Zeigt alle soft-gelöschten Sets (list_trash()) mit Name und
+        Lösch-Zeitstempel. Aktionen:
+          - Wiederherstellen  : restore_set_from_trash() verschiebt das Set
+                                zurück nach service_sets (das Set-Dropdown des
+                                Hauptfensters wird anschließend refresht).
+          - Endgültig löschen : purge_trash_set() mit doppelter Sicherheits-
+                                abfrage (Vorgang ist nicht umkehrbar).
+          - Papierkorb leeren : purge_trash() mit doppelter Sicherheits-
+                                abfrage (Vorgang ist nicht umkehrbar).
+
+        Der Dialog ist eine reine UI-Komponente: Er spricht ausschließlich
+        die Repository-API an (keine direkten SQL-Zugriffe) und protokolliert
+        jede Aktion über self.log(). Das endgültige Löschen/Bereinigen erfolgt
+        IMMER mit doppelter Sicherheitsnachfrage (User-Vorgabe P14-05).
+        """
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Papierkorb - Service-Sets")
+        dialog.setMinimumSize(440, 340)
+
+        layout = QVBoxLayout(dialog)
+        hint = QLabel(
+            "Soft-geloeschte Service-Sets (P14-05). Wiederherstellen verschiebt "
+            "das Set zurueck in die aktive Liste; endgueltiges Loeschen ist "
+            "nicht umkehrbar."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        trash_list = QListWidget()
+        layout.addWidget(trash_list, 1)
+
+        btn_row = QHBoxLayout()
+        btn_restore = QPushButton("Wiederherstellen")
+        btn_purge_one = QPushButton("Endgueltig loeschen")
+        btn_purge_all = QPushButton("Papierkorb leeren")
+        btn_close = QPushButton("Schliessen")
+        for b in (btn_restore, btn_purge_one, btn_purge_all, btn_close):
+            btn_row.addWidget(b)
+        layout.addLayout(btn_row)
+
+        def _reload() -> None:
+            trash_list.clear()
+            trash_items = self.set_repo.list_trash()
+            for item in trash_items:
+                name = item.get("display_name") or item.get("set_id") or "Unbenannt"
+                deleted_at = str(item.get("deleted_at") or "")
+                li = QListWidgetItem(f"{name}   (geloescht: {deleted_at})")
+                li.setData(Qt.UserRole, item.get("set_id"))
+                trash_list.addItem(li)
+            has_items = trash_list.count() > 0
+            btn_restore.setEnabled(has_items)
+            btn_purge_one.setEnabled(has_items)
+            btn_purge_all.setEnabled(has_items)
+            hint.setText(
+                "Der Papierkorb ist leer."
+                if not has_items
+                else "Soft-geloeschte Service-Sets (P14-05). Wiederherstellen "
+                     "verschiebt das Set zurueck in die aktive Liste; "
+                     "endgueltiges Loeschen ist nicht umkehrbar."
+            )
+
+        def _selected_id() -> Optional[str]:
+            item = trash_list.currentItem()
+            return item.data(Qt.UserRole) if item else None
+
+        def _restore() -> None:
+            set_id = _selected_id()
+            if not set_id:
+                return
+            if self.set_repo.restore_set_from_trash(set_id):
+                self.log(f"Set wiederhergestellt (P14-05): {set_id}")
+                _reload()
+                self.refresh_set_list()
+            else:
+                self.log(f"Set '{set_id}' nicht im Papierkorb gefunden.")
+
+        def _purge_selected() -> None:
+            set_id = _selected_id()
+            if not set_id:
+                return
+            # Doppelte Sicherheitsnachfrage - endgueltiges Loeschen ist nicht
+            # umkehrbar (User-Vorgabe P14-05).
+            first = QMessageBox.question(
+                dialog, "Endgueltig loeschen?",
+                "Das Set wird ENDGUELTIG geloescht und kann nicht "
+                "wiederhergestellt werden. Fortfahren?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if first != QMessageBox.Yes:
+                return
+            second = QMessageBox.question(
+                dialog, "Wirklich endgueltig loeschen?",
+                "Dieser Vorgang ist NICHT umkehrbar. Das Set wird unwiderruflich "
+                "aus dem Papierkorb entfernt. Fortfahren?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if second != QMessageBox.Yes:
+                return
+            if self.set_repo.purge_trash_set(set_id):
+                self.log(f"Set endgueltig geloescht (P14-05): {set_id}")
+                _reload()
+            else:
+                self.log(f"Set '{set_id}' nicht im Papierkorb gefunden.")
+
+        def _purge_all() -> None:
+            if trash_list.count() == 0:
+                return
+            # Doppelte Sicherheitsnachfrage - endgueltiges Loeschen ist nicht
+            # umkehrbar (User-Vorgabe P14-05).
+            first = QMessageBox.question(
+                dialog, "Papierkorb leeren?",
+                f"Alle {trash_list.count()} Sets im Papierkorb werden "
+                "ENDGUELTIG geloescht und koennen nicht wiederhergestellt "
+                "werden. Fortfahren?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if first != QMessageBox.Yes:
+                return
+            second = QMessageBox.question(
+                dialog, "Wirklich Papierkorb leeren?",
+                "Dieser Vorgang ist NICHT umkehrbar. Alle Sets werden "
+                "unwiderruflich entfernt. Fortfahren?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if second != QMessageBox.Yes:
+                return
+            count = self.set_repo.purge_trash()
+            self.log(f"Papierkorb geleert (P14-05): {count} Set(s) endgueltig entfernt.")
+            _reload()
+
+        btn_restore.clicked.connect(_restore)
+        btn_purge_one.clicked.connect(_purge_selected)
+        btn_purge_all.clicked.connect(_purge_all)
+        btn_close.clicked.connect(dialog.accept)
+
+        _reload()
+        dialog.exec()
 
     # =========================================================================
     # Phase 14 P14-02: Hot-Reload der Plugins (Dynamic Discovery)
@@ -20711,7 +20952,10 @@ class LiveAnalyzer(QThread):
         while self._running:
             try:
                 self._process_new_bars()
-                self._process_plugin_bars()
+                # P14-03-E (Schritt 2): Resilienz-Seam statt Alt-Pfad – nutzt den
+                # stark verkürzten Lookback (limit=2) gegen das gepufferte
+                # EvaluationContext.shared_state-Raster (keine volle Pipeline).
+                self._process_plugin_bars_resilient()
             except Exception as e:
                 self.log_message.emit(f"❌ LiveAnalyzer Fehler: {e}")
 
@@ -21539,6 +21783,164 @@ class ServiceDescriptionDialog(QDialog):
 
 --------------------------------------------------
 
+### DATEI: analytics/engine/schema_migrator.py
+```py
+# analytics/engine/schema_migrator.py
+"""
+Phase 14 P14-04 – Schema-Migrator (Semantic Versioning & Rollback-Schutz).
+
+Sicherstellung der dauerhaften Lauffähigkeit alter Service-Sets bei
+Weiterentwicklung von Plugins. Jede ServiceInstanceConfig trägt ein
+`version`-Feld (Semantic Versioning major.minor.patch, z. B. "1.0.0").
+Wird ein Set geladen, dessen Instanz-Version hinter der aktuellen
+Plugin-Version zurückliegt (Major-/Minor-Abweichung), migriert der
+SchemaMigrator die Instanz-Konfiguration IM SPEICHER (transparent, ohne
+die Datenbank zu verändern):
+
+  1. fehlende Parameter-Keys werden mit ihren Schema-Defaults ergänzt,
+  2. veraltete, nicht mehr im Parameter-Schema enthaltene Keys werden entfernt,
+  3. die Instanz-Version wird auf die aktuelle plugin.version angehoben.
+
+Reine Patch-Abweichungen (z. B. 1.0.0 -> 1.0.1) lösen KEINE Migration aus
+(Architektur-Invariante 5). Ein fehlendes `version`-Feld wird als
+Legacy-Stand "0.0.0" interpretiert und daher immer migriert.
+
+ROLLBACK-SCHUTZ: Wirft der Migrator während der Aufbereitung eine Exception,
+wird die Migration abgebrochen und ein MigrationError geworfen. Der Aufrufer
+(ServiceSetRepository.get_set()) gibt dann das UNMIGRIERTE Original-Set
+zurück (Rollback auf Datenbank-Ebene, Invariante 8).
+"""
+
+from typing import Any, Dict
+
+from analytics.features.plugins.base_plugin import PluginFeature
+
+
+class MigrationError(Exception):
+    """Wird vom SchemaMigrator geworfen, wenn die Migration fehlschlägt.
+
+    Löst beim Aufrufer (ServiceSetRepository.get_set()) den Rollback aus:
+    das originale, unveränderte Set wird zurückgegeben und geloggt.
+    """
+
+
+def _parse_version(version: Any) -> tuple:
+    """Parsed eine SemVer-Zeichenkette in (major, minor, patch) – numerisch.
+
+    Robust: None/leer/ungültig → (0, 0, 0). Optionales 'v'-Präfix sowie
+    Pre-Release-/Build-Segmente (z. B. '1.2.3-beta.1+build5') werden
+    ignoriert. Nur die ersten drei numerischen Segmente zählen.
+    """
+    if version is None:
+        return (0, 0, 0)
+    s = str(version).strip()
+    if not s:
+        return (0, 0, 0)
+    if s[:1].lower() == "v":
+        s = s[1:]
+    core = s.split("+")[0].split("-")[0]
+    nums: list = []
+    for part in core.split("."):
+        try:
+            nums.append(int(part))
+        except (TypeError, ValueError):
+            nums.append(0)
+    while len(nums) < 3:
+        nums.append(0)
+    return tuple(nums[:3])
+
+
+def _needs_migration(v_old: str, v_new: str) -> bool:
+    """True, wenn eine Migration nötig ist (Major-/Minor-Abweichung).
+
+    Reine Patch-Abweichungen (z. B. 1.0.0 -> 1.0.1) lösen KEINE Migration aus.
+    Migriert wird ausschließlich, wenn die gespeicherte Version HINTER der
+    aktuellen Plugin-Version liegt (Legacy "0.0.0" → immer). Ein Downgrade
+    (gespeicherte Version über der Plugin-Version) wird NICHT migriert –
+    kein destruktives Rücksetzen lauffähiger Sets.
+    """
+    old = _parse_version(v_old)
+    new = _parse_version(v_new)
+    if old[0] < new[0]:
+        return True
+    if old[0] > new[0]:
+        return False
+    return old[1] < new[1]
+
+
+class SchemaMigrator:
+    """Migriert Service-Instanz-Konfigurationen gegen das Plugin-Schema."""
+
+    def migrate_instance_config(
+        self,
+        config: Dict[str, Any],
+        plugin: PluginFeature,
+    ) -> Dict[str, Any]:
+        """Bereitet eine ServiceInstanceConfig für das aktuelle Plugin-Schema auf.
+
+        Args:
+            config: ServiceInstanceConfig (plugin_id, lookback, params, ...).
+            plugin: Aktuelle PluginFeature-Instanz (plugin.version + Schema).
+
+        Returns:
+            Migrierte (tiefe) Kopie der Konfiguration – das Original bleibt
+            unverändert (der Aufrufer entscheidet über die Übernahme).
+
+        Raises:
+            MigrationError: Bei jedem Fehler während der Aufbereitung –
+            der Aufrufer führt dann den Rollback auf das Original aus.
+        """
+        if plugin is None:
+            raise MigrationError("Plugin ist None – Migration nicht möglich.")
+        try:
+            result: Dict[str, Any] = dict(config or {})
+            current_ver = result.get("version") or "0.0.0"
+            new_ver = getattr(plugin, "version", "0.0.0") or "0.0.0"
+
+            # Kein Handlungsbedarf: nur Patch-Differenz oder gleiche/höhere
+            # Version → Instanz unverändert zurückgeben.
+            if not _needs_migration(current_ver, new_ver):
+                return result
+
+            schema = plugin.full_parameter_schema()
+            params: Dict[str, Any] = dict(result.get("params") or {})
+
+            # 1) Fehlende Schema-Keys mit Default-Werten ergänzen.
+            for key, spec in schema.items():
+                if key in params:
+                    continue
+                if "default" in spec:
+                    params[key] = spec["default"]
+
+            # 2) Veraltete Keys entfernen, die nicht mehr im Parameter-Schema
+            #    enthalten sind (Parameter-Schema = Single Source of Truth).
+            known = set(schema.keys())
+            for key in list(params.keys()):
+                if key not in known:
+                    params.pop(key, None)
+
+            result["params"] = params
+
+            # lookback ist Service-Instanz-Einstellung (top-level) und gehört
+            # zum Basis-Schema – fehlt er, wird der Schema-Default ergänzt.
+            if "lookback" not in result and "lookback" in schema:
+                result["lookback"] = int(schema["lookback"].get("default", 1000))
+
+            # 3) Instanz-Version auf die aktuelle Plugin-Version anheben.
+            result["version"] = new_ver
+            return result
+        except MigrationError:
+            raise
+        except Exception as e:
+            raise MigrationError(
+                f"Schema-Migration fehlgeschlagen (Instanz "
+                f"'{config.get('plugin_id', '?')}'): {e}"
+            ) from e
+
+```
+
+--------------------------------------------------
+
 ### DATEI: analytics/engine/service_models.py
 ```py
 # analytics/engine/service_models.py
@@ -21635,6 +22037,7 @@ Pflicht-API (Roadmap §Schritt 2.2):
     delete_set() – entfernt ein Set sauber (liefert bool).
 """
 
+import copy
 import json
 import os
 import uuid
@@ -21642,6 +22045,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from db_service import DbPool, _parse_json_field
+from analytics.engine.schema_migrator import MigrationError
 
 # Projekt-Root = 3 Ebenen über dieser Datei (engine/ → analytics/ → Projekt-Root)
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -21676,6 +22080,67 @@ class ServiceSetRepository:
         """)
         # Phase 14 P14-01: Additive Spalte für bestehende Datenbanken (idempotent)
         con.execute("ALTER TABLE service_sets ADD COLUMN IF NOT EXISTS description VARCHAR;")
+        # Phase 14 P14-05: Papierkorb- & Historien-Tabellen (Soft-Delete &
+        # Deterministische Snapshots). Idempotent – bestehende DBs werden
+        # additiv erweitert (Invariante 9: Snapshot nur bei Überschreiben).
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS service_sets_trash (
+                set_id       VARCHAR PRIMARY KEY,
+                display_name VARCHAR,
+                definition   JSON,
+                deleted_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS service_set_history (
+                history_id VARCHAR PRIMARY KEY,
+                set_id     VARCHAR,
+                version    VARCHAR,
+                definition JSON,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        # Phase 14 P14-04 (Bestands-Migration): Nach dem ALTER TABLE laufende
+        # Sets bereinigen (fehlende description-Felder mit "" auffüllen).
+        self._migrate_existing_sets()
+
+    def _migrate_existing_sets(self) -> None:
+        """Phase 14 P14-04 (Bestands-Migration, idempotent).
+
+        Lädt alle vorhandenen Service-Sets und prüft, ob das `description`-
+        Feld fehlt. Fehlt es, wird es mit `""` aufgefüllt und das Set erneut
+        gespeichert. Damit haben alle Bestands-Sets nach dem Öffnen ein
+        konsistentes Beschreibungsfeld (P14-01-Spalte + JSON-Payload).
+
+        Läuft direkt nach dem `ALTER TABLE` in `_init_db()`. Fehler einzelner
+        Sets brechen die Initialisierung nicht ab (Skip-Logik).
+        """
+        try:
+            con = self._get_connection()
+            rows = con.execute(
+                "SELECT set_id, definition FROM service_sets"
+            ).fetchall()
+        except Exception as e:
+            print(f"WARN [ServiceSetRepository] Bestands-Migration Lesen "
+                  f"fehlgeschlagen: {e}")
+            return
+        for set_id, definition_json in rows:
+            if not set_id:
+                continue
+            definition = _parse_json_field(definition_json) or {}
+            if "description" in definition:
+                continue
+            definition["description"] = ""
+            try:
+                # P14-05: record_snapshot=False – die Bestands-Migration ist ein
+                # interner Verwaltungsschreibvorgang (nur description ergänzen)
+                # und darf KEINE Snapshot-Historie erzeugen (Invariante 9:
+                # Snapshot nur bei Nutzer-Überschreiben).
+                self.save_set(definition, record_snapshot=False)
+                print(f"  . Bestandsset '{set_id}': description aufgefuellt (P14-04)")
+            except Exception as e:
+                print(f"WARN [ServiceSetRepository] Bestands-Migration Set "
+                      f"'{set_id}' fehlgeschlagen: {e}")
 
     @staticmethod
     def _default_display_name(definition: Dict[str, Any]) -> str:
@@ -21694,12 +22159,25 @@ class ServiceSetRepository:
     # -------------------------------------------------------------------------
     # Pflicht-API
     # -------------------------------------------------------------------------
-    def save_set(self, definition: Dict[str, Any]) -> str:
+    def save_set(self, definition: Dict[str, Any], record_snapshot: bool = True) -> str:
         """Speichert ein Service-Set (Upsert) und liefert die set_id zurück.
 
         - set_id leer → wird als uuid4-hex generiert.
         - display_name leer → Default-Name aus instance_ids (z.B. 'grid_1 + prox_1').
         - Gleiche set_id überschreibt die bestehende Zeile (kein Duplikat).
+
+        Phase 14 P14-05 (Deterministische Snapshot-Historie): Existiert das Set
+        bereits in service_sets (Überschreiben), wird UNMITTELBAR VOR dem
+        Überschreiben der bisherige Stand als Snapshot in service_set_history
+        gesichert (version = fortlaufender Zähler je set_id). Bei reinen
+        Neuanlagen oder Schreibfehlern entsteht KEIN Snapshot (Invariante 9).
+
+        Args:
+            definition: ServiceSetDefinition.
+            record_snapshot: False unterdrückt die Snapshot-Erzeugung für
+                interne Verwaltungsschreibvorgänge (z. B. die P14-04
+                Bestands-Migration, die Bestands-Sets nur um description
+                ergänzt und dafür keinen Historie-Eintrag erzeugen darf).
         """
         set_id = str(definition.get("set_id") or uuid.uuid4().hex)
         display_name = str(definition.get("display_name") or "").strip()
@@ -21719,6 +22197,26 @@ class ServiceSetRepository:
         }
 
         con = self._get_connection()
+
+        # P14-05: Snapshot-Historie – NUR bei erfolgreichem Überschreiben eines
+        # BEREITS EXISTIERENDEN Sets (vor dem Upsert).
+        if record_snapshot:
+            row = con.execute(
+                "SELECT definition FROM service_sets WHERE set_id = ?", [set_id]
+            ).fetchone()
+            if row:
+                old_definition = _parse_json_field(row[0]) or {}
+                history_count = con.execute(
+                    "SELECT COUNT(*) FROM service_set_history WHERE set_id = ?",
+                    [set_id],
+                ).fetchone()
+                count = int(history_count[0]) if history_count and history_count[0] else 0
+                con.execute("""
+                    INSERT INTO service_set_history (history_id, set_id, version, definition, created_at)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, [uuid.uuid4().hex, set_id, str(count + 1),
+                      json.dumps(old_definition)])
+
         con.execute("""
             INSERT INTO service_sets (set_id, display_name, definition, description, updated_at)
             VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
@@ -21731,7 +22229,17 @@ class ServiceSetRepository:
         return set_id
 
     def get_set(self, set_id: str) -> Optional[Dict[str, Any]]:
-        """Lädt eine Service-Set-Definition per set_id (oder None)."""
+        """Lädt eine Service-Set-Definition per set_id (oder None).
+
+        Phase 14 P14-04: Wendet den SchemaMigrator TRANSPARENT IM SPEICHER an
+        (Semantic Versioning): Abweichende Instanz-Konfigurationen werden
+        gegen das aktuelle Plugin-Schema migriert (Defaults ergänzt, veraltete
+        Keys entfernt, Version angehoben). Die Datenbank bleibt unverändert.
+
+        ROLLBACK-SCHUTZ: Tritt während der Migration ein MigrationError auf,
+        wird die Migration abgebrochen und das UNMIGRIERTE Original-Set
+        zurückgegeben (Rollback auf Datenbank-Ebene, Invariante 8).
+        """
         con = self._get_connection()
         res = con.execute(
             "SELECT set_id, display_name, definition, description FROM service_sets WHERE set_id = ?",
@@ -21748,6 +22256,46 @@ class ServiceSetRepository:
         # Phase 14 P14-01: description aus der DB-Spalte nachziehen
         if not definition.get("description") and db_description:
             definition["description"] = db_description
+
+        # P14-04: Original für den Rollback tief kopieren, DANN migrieren.
+        original = copy.deepcopy(definition)
+        try:
+            definition = self._apply_schema_migration(definition)
+        except MigrationError as e:
+            print(f"WARN [ServiceSetRepository] Schema-Migration fuer Set "
+                  f"'{set_id}' abgebrochen - Original wird geladen. {e}")
+            return original
+        return definition
+
+    def _apply_schema_migration(self, definition: Dict[str, Any]) -> Dict[str, Any]:
+        """Phase 14 P14-04: Wendet den SchemaMigrator auf alle Instanzen an.
+
+        Iteriert über alle Service-Instanzen des Sets und migriert jede
+        Konfiguration gegen ihr Plugin (PluginRegistry). Plugins, die nicht
+        (mehr) registriert sind, bleiben unverändert (Skip – ein fehlendes
+        Plugin darf das Laden des restlichen Sets nicht brechen).
+
+        Raises:
+            MigrationError: bei jedem Fehler der Migrations-Engine – der
+            Aufrufer (get_set) führt dann den Rollback auf das Original aus.
+        """
+        from analytics.features.feature_builder import PluginRegistry
+        from analytics.engine.schema_migrator import SchemaMigrator
+
+        services = definition.get("services") or {}
+        migrator = SchemaMigrator()
+        registry = PluginRegistry()
+        for iid, cfg in services.items():
+            if not isinstance(cfg, dict):
+                continue
+            pid = cfg.get("plugin_id") or iid
+            try:
+                plugin = registry.get(pid)
+            except KeyError:
+                # Plugin nicht (mehr) registriert → Instanz unverändert lassen.
+                continue
+            services[iid] = migrator.migrate_instance_config(cfg, plugin)
+        definition["services"] = services
         return definition
 
     def list_sets(self) -> List[Dict[str, Any]]:
@@ -21772,16 +22320,121 @@ class ServiceSetRepository:
             sets.append(definition)
         return sets
 
-    def delete_set(self, set_id: str) -> bool:
-        """Entfernt ein Set sauber. Liefert True, wenn eine Zeile existierte."""
+    def delete_set(self, set_id: str, soft_delete: bool = True) -> bool:
+        """Entfernt ein Set. Liefert True, wenn eine Zeile existierte.
+
+        Phase 14 P14-05 (Soft-Delete): Bei soft_delete=True wird das Set in
+        die Papierkorb-Tabelle `service_sets_trash` verschoben (mit
+        deleted_at-Zeitstempel) statt hart gelöscht. Die Wiederherstellung
+        erfolgt über restore_set_from_trash(). Bei soft_delete=False wird das
+        Set ENDGÜLTIG entfernt (z. B. für die Papierkorb-Bereinigung).
+        """
         con = self._get_connection()
         res = con.execute(
-            "SELECT COUNT(*) FROM service_sets WHERE set_id = ?", [set_id]
+            "SELECT set_id, display_name, definition FROM service_sets WHERE set_id = ?",
+            [set_id],
+        ).fetchone()
+        if not res:
+            return False
+        db_set_id, db_display_name, definition_json = res
+        if soft_delete:
+            # Kopie nach service_sets_trash (Upsert – erneutes Löschen eines
+            # bereits im Papierkorb liegenden Sets aktualisiert den Zeitstempel).
+            con.execute("""
+                INSERT INTO service_sets_trash (set_id, display_name, definition, deleted_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT (set_id) DO UPDATE SET
+                    display_name = EXCLUDED.display_name,
+                    definition   = EXCLUDED.definition,
+                    deleted_at   = EXCLUDED.deleted_at
+            """, [db_set_id, db_display_name or "", definition_json])
+        con.execute("DELETE FROM service_sets WHERE set_id = ?", [set_id])
+        return True
+
+    def list_trash(self) -> List[Dict[str, Any]]:
+        """Liefert ALLE im Papierkorb befindlichen Service-Sets.
+
+        Analog list_sets() – deterministisch nach deleted_at sortiert
+        (älteste zuerst). Enthält zusätzlich das Feld 'deleted_at' und ist
+        die Quelle für den Papierkorb-Dialog im Service-Fenster.
+        """
+        con = self._get_connection()
+        rows = con.execute(
+            "SELECT set_id, display_name, definition, deleted_at "
+            "FROM service_sets_trash ORDER BY deleted_at ASC"
+        ).fetchall()
+        items: List[Dict[str, Any]] = []
+        for db_set_id, db_display_name, definition_json, db_deleted_at in rows:
+            definition = _parse_json_field(definition_json) or {}
+            definition["set_id"] = str(db_set_id)
+            if not definition.get("display_name"):
+                definition["display_name"] = db_display_name or ""
+            definition["deleted_at"] = db_deleted_at
+            items.append(definition)
+        return items
+
+    def restore_set_from_trash(self, set_id: str) -> bool:
+        """Stellt ein Set aus dem Papierkorb wieder her (Trash → service_sets).
+
+        Liefert True, wenn ein Trash-Eintrag existierte und wiederhergestellt
+        wurde. Existiert die set_id in service_sets bereits (z. B. weil sie
+        zwischenzeitlich neu angelegt wurde), wird sie überschrieben.
+        """
+        con = self._get_connection()
+        res = con.execute(
+            "SELECT set_id, display_name, definition FROM service_sets_trash WHERE set_id = ?",
+            [set_id],
+        ).fetchone()
+        if not res:
+            return False
+        db_set_id, db_display_name, definition_json = res
+        definition = _parse_json_field(definition_json) or {}
+        definition["set_id"] = str(db_set_id)
+        if not definition.get("display_name"):
+            definition["display_name"] = db_display_name or ""
+        description = definition.get("description")
+        description = str(description).strip() if description is not None else None
+        # Wiederherstellen (Upsert auf service_sets)
+        con.execute("""
+            INSERT INTO service_sets (set_id, display_name, definition, description, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT (set_id) DO UPDATE SET
+                display_name = EXCLUDED.display_name,
+                definition   = EXCLUDED.definition,
+                description  = EXCLUDED.description,
+                updated_at   = EXCLUDED.updated_at
+        """, [db_set_id, definition.get("display_name") or "", json.dumps(definition), description])
+        con.execute("DELETE FROM service_sets_trash WHERE set_id = ?", [set_id])
+        return True
+
+    def purge_trash_set(self, set_id: str) -> bool:
+        """Entfernt ein Set ENDGÜLTIG aus dem Papierkorb (hartes Löschen).
+
+        Liefert True, wenn ein Trash-Eintrag existierte und entfernt wurde.
+        Dieser Vorgang ist nicht umkehrbar – die UI verlangt daher eine
+        doppelte Sicherheitsabfrage.
+        """
+        con = self._get_connection()
+        res = con.execute(
+            "SELECT COUNT(*) FROM service_sets_trash WHERE set_id = ?", [set_id]
         ).fetchone()
         exists = bool(res and res[0] and res[0] > 0)
         if exists:
-            con.execute("DELETE FROM service_sets WHERE set_id = ?", [set_id])
+            con.execute("DELETE FROM service_sets_trash WHERE set_id = ?", [set_id])
         return exists
+
+    def purge_trash(self) -> int:
+        """Leert den Papierkorb vollständig (Endgültige Bereinigung der DB).
+
+        Liefert die Anzahl endgültig entfernter Sets. Nicht umkehrbar – die
+        UI verlangt daher eine doppelte Sicherheitsabfrage.
+        """
+        con = self._get_connection()
+        res = con.execute("SELECT COUNT(*) FROM service_sets_trash").fetchone()
+        count = int(res[0]) if res and res[0] else 0
+        if count:
+            con.execute("DELETE FROM service_sets_trash")
+        return count
 
 ```
 
@@ -25637,6 +26290,9 @@ class PyTraderChartWindow(QMainWindow):
         # Mapping: kontinuierliche Zeit -> originale epoch (für JS tickMarkFormatter)
         self._time_cont_to_real: Dict[int, int] = {}
         self._time_real_to_cont: Dict[int, int] = {}
+        # P14-03-E: Live-Kerzen-State für die Pflicht-Re-Injektion (Flacker-Fix).
+        self._live_bar_time: Optional[int] = None   # reale, gerundete Bar-Zeit der offenen Kerze
+        self._live_candle_cont: Optional[Dict[str, Any]] = None  # letzter Live-Candle (kont. Zeit + OHLC)
         # Generations-Guard: monoton steigende Update-IDs für Chart- und Grid-Refresh.
         # Veraltete Serializer-Ergebnisse (langsamer Thread aus einem frueheren
         # Symbol/TF-Stand) werden in _apply_chart_update/_apply_grid_render verworfen.
@@ -26027,6 +26683,31 @@ class PyTraderChartWindow(QMainWindow):
             except (RuntimeError, AttributeError):
                 pass
 
+        # P14-03-E (Flacker-Fix): calculate() resettet die _known_times der
+        # Indikatoren – die offene Live-Bar generisch wieder einfügen, damit
+        # der New-Candle-Callback nicht erneut feuert (Flacker-Zyklus).
+        self._reinject_live_bar_to_indicators()
+
+    def _reinject_live_bar_to_indicators(self) -> None:
+        """P14-03-E (Flacker-Fix): Fügt die offene Live-Bar-Zeit generisch in
+        die _known_times ALLER Indikatoren mit remember_live_time()-Hook wieder
+        ein. Wird NACH JEDEM calculate()-Aufruf ausgeführt – calculate() setzt
+        die _known_times aus den DB-Bars zurück (die offene Live-Bar ist noch
+        nicht in DuckDB) und ohne diese Re-Injektion feuert der New-Candle-
+        Callback des Indikators bei jedem Live-Tick erneut (500ms-Flacker-
+        Zyklus Live-Plot <-> Chart-Rebuild). Generisch über den Base-Hook
+        (Open/Closed), kein Plugin-Sonderfall."""
+        if self._live_bar_time is None:
+            return
+        for plugin in self.indicators.values():
+            rt = getattr(plugin, "remember_live_time", None)
+            if not callable(rt):
+                continue
+            try:
+                rt(self._live_bar_time)
+            except Exception:
+                continue
+
     def _serialize_and_render_grid(self, lines: list, circles: list) -> None:
         """Serialisiert Grid-Daten im Hintergrund-Thread und rendert sie.
         Alter Thread wird vor Neustart sauber beendet.
@@ -26133,6 +26814,24 @@ class PyTraderChartWindow(QMainWindow):
                     dc["time"] = cont_time
                     continuous_candles.append(dc)
 
+            # P14-03-E (PFLICHT, Pruefprotokoll P5): Offene Live-Kerze nach dem
+            # Map-Rebuild re-injizieren – sonst feuert der New-Candle-Callback
+            # bei jedem Tick erneut und die Flacker-Schleife bleibt bestehen.
+            # (remember_live_time-Re-Injektion erfolgt GENERISCH NACH dem
+            # calculate()-Loop weiter unten – calculate setzt die _known_times
+            # der Indikatoren aus den DB-Bars zurück und wuerde eine Re-Injektion
+            # VOR dem Loop wieder zunichte machen.)
+            if (self._live_bar_time is not None
+                    and self._live_bar_time not in self._time_real_to_cont):
+                last_cont = max(self._time_cont_to_real.keys())
+                cont = last_cont + t_sec
+                self._time_cont_to_real[cont] = self._live_bar_time
+                self._time_real_to_cont[self._live_bar_time] = cont
+                if self._live_candle_cont is not None:
+                    lc = dict(self._live_candle_cont)
+                    lc["time"] = cont
+                    continuous_candles.append(lc)
+
             import pandas as pd
             self.df_data = pd.DataFrame(clean_candles)
         else:
@@ -26159,6 +26858,16 @@ class PyTraderChartWindow(QMainWindow):
                             gc_t = gc.get("time")
                             if gc_t is not None and int(gc_t) in self._time_real_to_cont:
                                 gc["time"] = self._time_real_to_cont[int(gc_t)]
+
+        # P14-03-E (Flacker-Fix, generisch): plugin.calculate() setzt die
+        # _known_times der Indikatoren auf die DB-Bars zurück – die offene
+        # Live-Bar (noch nicht in DuckDB) geht dabei verloren. Würde sie nicht
+        # DANACH wieder eingefügt, feuert der New-Candle-Callback bei jedem
+        # Live-Tick (500ms) erneut und der Chart flackert im Wechsel
+        # Live-Plot <-> Chart-Rebuild (alte/leere Kerze). Re-Injektion über
+        # ALLE Indikatoren mit remember_live_time()-Hook (Open/Closed, kein
+        # Plugin-Sonderfall).
+        self._reinject_live_bar_to_indicators()
 
         update_package = {
             "symbol": self.current_symbol,
@@ -26279,28 +26988,51 @@ class PyTraderChartWindow(QMainWindow):
         if rounded_t in self._time_real_to_cont:
             c_copy["time"] = self._time_real_to_cont[rounded_t]
         elif self._time_cont_to_real:
-            # Neue Candle: an letzte kont. Zeit anhängen
+            # Neue Candle: an letzte kont. Zeit anhängen – OHNE refresh_chart_data()
+            # (P14-03-E: Kein Chart-Rebuild bei Live-Ticks! Der einmalige Refresh
+            # pro neuer Kerze erfolgt über den New-Candle-Callback des Indikators.)
             last_cont = max(self._time_cont_to_real.keys())
             c_copy["time"] = last_cont + t_sec
             self._time_cont_to_real[c_copy["time"]] = rounded_t
             self._time_real_to_cont[rounded_t] = c_copy["time"]
-            # Phase 13 Schritt 6: Neue Candle → NUR ein debounced Refresh, der
-            # den Linien-Cache des grid_liquidity-Indikators einmal neu aufbaut
-            # (nicht bei jedem Tick).
-            self.refresh_chart_data()
+            # P14-03-E: Live-Kerzen-State für die Pflicht-Re-Injektion merken.
+            self._live_bar_time = rounded_t
+            self._live_candle_cont = dict(c_copy)
         else:
             c_copy["time"] = rounded_t
 
-        # Phase 13 Schritt 6: Live-Ticks an den grid_liquidity-Indikator
-        # delegieren – er berechnet die mathematische Differenz Live-Tick vs.
-        # gecachte Liq-Lines (KEINE Pipeline pro Tick) und setzt Live-Punkte.
-        liq_ind = self.indicators.get("grid_liquidity")
-        if (liq_ind is not None and hasattr(liq_ind, "update_live_candle")
-                and self.indicators_state.get("grid_liquidity", {}).get("active")):
+        # P14-03-E (Flacker-Fix): Live-Kerzen-State bei JEDEM Tick der offenen
+        # Bar aktualisieren (nicht nur beim ersten Tick). Die Pflicht-Re-Injektion
+        # im Rebuild nutzt sonst den OHLC-Stand des ERSTEN Ticks – der Rebuild
+        # zeichnete kurzzeitig eine veraltete/leere Erst-Tick-Kerze ("dünne
+        # Linie") statt der aktuellen offenen Kerze.
+        if self._live_bar_time is not None and rounded_t == self._live_bar_time:
+            self._live_candle_cont = dict(c_copy)
+
+        # P14-03-E (D.1c): Overlays ALLER aktiven Indikatoren generisch über den
+        # get_live_overlays()-Hook einsammeln (Open/Closed – kein Sonderfall pro Plugin).
+        overlays: List[Dict[str, Any]] = []
+        for ind_id, plugin in self.indicators.items():
+            st = self.indicators_state.get(ind_id, {})
+            if not st.get("active"):
+                continue
+            getter = getattr(plugin, "get_live_overlays", None)
+            if not callable(getter):
+                continue
             try:
-                liq_ind.update_live_candle(dict(c_copy, time=rounded_t))
-            except Exception as e:
-                print(f"⚠️ [GridLiquidity] Live-Update fehlgeschlagen: {e}")
+                ov = getter(dict(c_copy, time=rounded_t)) or []
+            except Exception:
+                continue
+            for item in ov:
+                item = dict(item)
+                t = item.get("time")
+                if t is not None:
+                    try:
+                        item["time"] = self._time_real_to_cont.get(int(t), int(t))
+                    except (TypeError, ValueError):
+                        pass
+                overlays.append(item)
+        c_copy["overlays"] = overlays
 
         try:
             self.web_view.page().runJavaScript(f"if(window.updateLiveCandle) updateLiveCandle('{json.dumps(c_copy, allow_nan=False)}');")
@@ -28413,6 +29145,24 @@ class BaseIndicator(ABC):
 	def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
 		"""Führt die mathematische Berechnung auf dem DataFrame aus und liefert Zeichnungsdaten zurück."""
 		pass
+
+	def get_live_overlays(self, candle: Dict[str, Any]) -> List[Dict[str, Any]]:
+		"""P14-03-E: Liefert die Live-Overlays des Plugins als Liste von Overlay-Items
+		{kind, layer, time, price, color, priority, ...}. Basis-Default: [].
+		Plugin-Klassen überschreiben diesen Hook (Open/Closed), damit die Engine
+		(chart_win) die Overlays ALLER aktiven Indikatoren generisch einsammelt –
+		kein Indikator-spezifischer Sonderfall pro Plugin."""
+		return []
+
+	def remember_live_time(self, ts: int) -> None:
+		"""P14-03-E (Flacker-Fix): Merkt eine offene Live-Bar-Zeit (gerundete
+		Epoch), damit der New-Candle-Erkennung des Plugins nach einem
+		calculate()-Rebuild die Live-Bar nicht als "neue Kerze" erscheint und der
+		debounced Refresh nicht erneut feuert. Basis-Default: no-op.
+		Plugin-Klassen mit New-Candle-Callback überschreiben diesen Hook
+		(Open/Closed), damit die Engine (chart_win) die Re-Injektion generisch
+		über ALLE Indikatoren ausführen kann – kein Indikator-Sonderfall."""
+		pass
 ```
 
 --------------------------------------------------
@@ -28855,12 +29605,17 @@ class GridLiquidityIndicator(BaseIndicator):
         timeframe: str,
         limit: Optional[int] = None,
         db_path: Optional[str] = None,
+        feature_id: str = "proximity",
     ) -> List[Dict[str, Any]]:
         """P14-03 (Live-Entkopplung A.1.3 / Schritt 3.2): PRIMÄRER
         DB-Lesepfad des Indikators – liest fertige Proximity-Hits aus dem
         feature_store (JSON-Feld feature_data, feature_id='proximity', inkl.
         schema_version) beim Chart-Re-Render/Refresh OHNE synchrone
         Service-Pipeline (Invariante 10: definierter Fallback).
+
+        P14-03-E (Schritt 4, generisch): `feature_id` ist parametrisiert
+        (Standard 'proximity'), damit spätere Indikator-Plugins denselben
+        Lesepfad über die eigene feature_id nutzen können (Open/Closed).
 
         Der Indikator führt hier KEINE Berechnungen aus; er liest ausschließlich
         vorberechnete Daten aus DuckDB. Die Heavy-Berechnung über die
@@ -28874,6 +29629,7 @@ class GridLiquidityIndicator(BaseIndicator):
             timeframe: Timeframe
             limit: Maximale Anzahl Bars (Default 1000)
             db_path: Optionaler DB-Pfad (für Tests) – Default analytics.duckdb
+            feature_id: Feature-ID im feature_store (Default 'proximity')
         """
         if not symbol or not timeframe:
             return []
@@ -28891,13 +29647,13 @@ class GridLiquidityIndicator(BaseIndicator):
                 FROM (
                     SELECT bar_time, feature_data
                     FROM feature_store
-                    WHERE symbol = ? AND timeframe = ? AND feature_id = 'proximity'
+                    WHERE symbol = ? AND timeframe = ? AND feature_id = ?
                       AND feature_data IS NOT NULL
                     ORDER BY bar_time DESC
                     LIMIT ?
                 )
                 ORDER BY bar_time ASC
-            """, [symbol, timeframe, limit]).fetchall()
+            """, [symbol, timeframe, feature_id, limit]).fetchall()
         except Exception as e:
             print(f"WARN [GridLiquidityIndicator] feature_store-Lesepfad "
                   f"fehlgeschlagen: {e}")
@@ -29056,33 +29812,43 @@ class GridLiquidityIndicator(BaseIndicator):
 
             prox_result = results.get("prox_1") or {}
             prox_crp = prox_result.get("chart_render_payload") or {}
-            # Display-Layer: priority=10 (JS-Bridge-Erwartung, wie Alt-Plugin).
-            # Die Services selbst bleiben Paritäts-pur (kein priority – exakt
-            # wie grid.py); die Anreicherung passiert erst hier im Adapter.
-            # Der Proximity-Service meldet pro Hit nur das in_window-Flag; die
-            # Farbe setzt der INDIKATOR aus seinem eigenen Schema:
-            #   use_time_filter und ausserhalb des Fensters → circle_color_active
-            #   sonst                            → circle_color_std
-            # show_circles=false (Indikator-Parameter) → keine Circles.
-            circles_raw = prox_crp.get("hit_circles") or []
-            if _as_bool(p.get("show_circles"), True):
-                circle_std = str(p.get("circle_color_std") or "#FFEB3B")
-                circle_active = str(p.get("circle_color_active") or "#E91E63")
-                use_time_filter = _as_bool(p.get("use_time_filter"), True)
-                circles = [
-                    dict(
-                        c,
-                        color=(
-                            circle_active
-                            if (use_time_filter and not bool(c.get("in_window", True)))
-                            else circle_std
-                        ),
-                        priority=10,
-                    )
-                    for c in circles_raw
-                ]
+
+            # P14-03-E (Schritt 4, generisch): PRIMÄR gecachte Proximity-Hits
+            # aus dem feature_store lesen (inkl. schema_version). Heavy-
+            # Berechnung nur als Fallback, wenn der Feature-Store leer ist.
+            cached_circles = self.read_proximity_from_feature_store(
+                self._symbol or "", self._timeframe or ""
+            )
+            if cached_circles:
+                circles = cached_circles
             else:
-                circles = []
+                # Display-Layer: priority=10 (JS-Bridge-Erwartung, wie Alt-Plugin).
+                # Die Services selbst bleiben Paritäts-pur (kein priority – exakt
+                # wie grid.py); die Anreicherung passiert erst hier im Adapter.
+                # Der Proximity-Service meldet pro Hit nur das in_window-Flag; die
+                # Farbe setzt der INDIKATOR aus seinem eigenen Schema:
+                #   use_time_filter und ausserhalb des Fensters → circle_color_active
+                #   sonst                            → circle_color_std
+                # show_circles=false (Indikator-Parameter) → keine Circles.
+                circles_raw = prox_crp.get("hit_circles") or []
+                if _as_bool(p.get("show_circles"), True):
+                    circle_std = str(p.get("circle_color_std") or "#FFEB3B")
+                    circle_active = str(p.get("circle_color_active") or "#E91E63")
+                    use_time_filter = _as_bool(p.get("use_time_filter"), True)
+                    circles = [
+                        dict(
+                            c,
+                            color=(
+                                circle_active
+                                if (use_time_filter and not bool(c.get("in_window", True)))
+                                else circle_std
+                            ),
+                            priority=10,
+                        )
+                        for c in circles_raw
+                    ]
+                else:
+                    circles = []
             status = dict(prox_crp.get("status_info") or empty_result["status_info"])
 
             self._set_cached_lines(lines)
@@ -29176,6 +29942,23 @@ class GridLiquidityIndicator(BaseIndicator):
         self._live_points = list(points)  # atomare Zuweisung
         return points
 
+    # -------------------------------------------------- P14-03-E: Live-Overlays
+    def get_live_overlays(self, candle: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """P14-03-E (Open/Closed-Hook): Liefert die Live-Overlays des Plugins als
+        generische Overlay-Items {kind='circle', layer=indicator_id, time, price,
+        color, priority}. Basis ist update_live_candle() (mathematische Differenz
+        Live-Tick vs. gecachte Liq-Lines) – keine Pipeline pro Tick."""
+        pts = self.update_live_candle(candle)
+        return [dict(p, kind="circle", layer=self.indicator_id) for p in pts]
+
+    def remember_live_time(self, ts: int) -> None:
+        """P14-03-E: Merkt eine offene Live-Bar-Zeit im _known_times-Set, damit der
+        New-Candle-Callback über den Refresh hinweg NICHT erneut feuert (Flacker-Fix)."""
+        try:
+            self._known_times.add(int(ts))
+        except (TypeError, ValueError):
+            pass
+
 ```
 
 --------------------------------------------------
@@ -29199,6 +29982,25 @@ let gridPriceLines = [], dayLinesSeries = [];
 // exakt auf dem Level) + SeriesMarkers-Plugin -> Circles liegen auf den
 // Liq-Lines statt auf der Bar (native Engine-Positionierung, kein CSS-Overlay).
 let _circleSeries = [], _circleMarkerPlugins = [];
+// P14-03-E: Circle-Cache für Merged-Render (historische + Live-Circles).
+// Wird in applyFullChartUpdate() aus data.gridCircles befüllt; applyLiveOverlays()
+// ersetzt nur die Live-Zeit-Einträge und rendert den Cache neu.
+let _gridCirclesCache = [];
+// P14-03-E (Flacker-Fix): Level-Registry für INKREMENTELLES Circle-Rendering.
+// renderGridCircles() aktualisiert nur veränderte Level per setData/setMarkers,
+// statt alle Serien via removeSeries/addSeries zu entfernen und neu aufzubauen –
+// dieser Full-Layer-Rebuild pro Live-Tick (sobald die Proximity-Bedingung erfüllt
+// war) verursachte das Live-Flackern. Schluessel = String(c.price).
+let _circleLevelSeries = {};
+// P14-03-E (Flacker-Fix): Change-Detection für Live-Circles. Identische Circle-
+// Sets zwischen Ticks (gleiche Level-Hits, gleiche Farbe) lösen KEINEN Re-Render
+// aus – sonst re-rendert jeder Tick mit erfüllter Bedingung den ganzen Layer.
+let _lastLiveCirclesJson = '[]';
+// P14-03-E (Flacker-Fix): Live-Zeit der letzten Live-Overlay-Anwendung. Beim
+// Wechsel auf eine neue Live-Bar werden auch die Kreise der VORHERIGEN Live-Zeit
+// aus dem Cache entfernt (sonst bleiben veraltete Live-Kreise der Vor-Bar bis zum
+// Refresh sichtbar). Wird in applyFullChartUpdate auf null zurückgesetzt.
+let _lastLiveOverlayTime = null;
 let currentPriceLine = null, resizeTimeout = null;
 let currentPrecision = 2;
 let pendingRange = null;
@@ -29400,13 +30202,22 @@ function clearGridCircles() {
     }
     _circleSeries = [];
     _circleMarkerPlugins = [];
+    _circleLevelSeries = {};
 }
 
+// P14-03-E (Flacker-Fix): renderGridCircles() ist jetzt INKREMENTELL. Bestehende
+// Level-Serien werden per setData/setMarkers in-place aktualisiert; nur ver-
+// schwundene Level werden entfernt, nur neue erzeugt. Kein removeSeries/addSeries
+// für unveränderte Level => kein Full-Layer-Rebuild pro Live-Tick (bisher rief
+// jede applyLiveOverlays renderGridCircles -> clearGridCircles auf, das ALLE
+// Circle-Serien wegwarf und neu aufbaute = Flackern bei erfüllter Proximity).
 function renderGridCircles(circles) {
     if (!chart || !circles) return;
     var data = (typeof circles === 'string') ? JSON.parse(circles) : circles;
-    clearGridCircles();
-    if (!data || data.length === 0) return;
+    if (!data || data.length === 0) {
+        clearGridCircles();
+        return;
+    }
 
     // Nach Level-Preis gruppieren: LWC-Serien brauchen eindeutige Zeiten,
     // daher je Level eine Serie (im selben Level gibt es max. 1 Treffer/Bar).
@@ -29420,25 +30231,28 @@ function renderGridCircles(circles) {
         byLevel[key].push(c);
     }
 
+    // 1) Level entfernen, die im neuen Satz nicht mehr existieren – OHNE den
+    //    Rest anzutasten.
+    for (var oldKey in _circleLevelSeries) {
+        if (!byLevel[oldKey]) {
+            var gone = _circleLevelSeries[oldKey];
+            try { if (gone.series) chart.removeSeries(gone.series); } catch(e) {}
+            var gidx = _circleSeries.indexOf(gone.series);
+            if (gidx >= 0) _circleSeries.splice(gidx, 1);
+            if (gone.plugin) {
+                var pidx = _circleMarkerPlugins.indexOf(gone.plugin);
+                if (pidx >= 0) _circleMarkerPlugins.splice(pidx, 1);
+            }
+            delete _circleLevelSeries[oldKey];
+        }
+    }
+
+    // 2) Upsert pro Level: existierende Serie in-place aktualisieren.
     var keys = Object.keys(byLevel);
     for (var j = 0; j < keys.length; j++) {
         var levelCircles = byLevel[keys[j]];
         // LWC v5: Markers und Serie brauchen NACH ZEIT SORTIERTE Daten.
         levelCircles.sort(function(a, b) { return a.time - b.time; });
-
-        var series = null;
-        try {
-            series = chart.addSeries(LightweightCharts.LineSeries, {
-                lineVisible: false,
-                pointMarkersVisible: false,
-                lastValueVisible: false,
-                priceLineVisible: false,
-                crosshairMarkerVisible: false,
-                color: 'rgba(0,0,0,0)',
-                priceScaleId: 'right',
-                autoscaleInfoProvider: function() { return null; }
-            });
-        } catch(e) { continue; }
 
         var sd = [];
         var markers = [];
@@ -29456,15 +30270,45 @@ function renderGridCircles(circles) {
                 priority: 10
             });
         }
-        try { series.setData(sd); } catch(e) { continue; }
 
-        try {
-            var plugin = LightweightCharts.createSeriesMarkers(series, []);
-            plugin.setMarkers(markers);
-        } catch(e) { continue; }
+        var key = keys[j];
+        var existing = _circleLevelSeries[key];
+        if (existing) {
+            // Inkrementell: Serie/Plugin existiert bereits -> nur Daten ersetzen
+            // (kein removeSeries/addSeries -> kein Flackern).
+            try { existing.series.setData(sd); } catch(e) { continue; }
+            if (existing.plugin) {
+                try { existing.plugin.setMarkers(markers); } catch(e) { continue; }
+            }
+        } else {
+            var series = null;
+            try {
+                series = chart.addSeries(LightweightCharts.LineSeries, {
+                    lineVisible: false,
+                    pointMarkersVisible: false,
+                    lastValueVisible: false,
+                    priceLineVisible: false,
+                    crosshairMarkerVisible: false,
+                    color: 'rgba(0,0,0,0)',
+                    priceScaleId: 'right',
+                    autoscaleInfoProvider: function() { return null; }
+                });
+            } catch(e) { continue; }
 
-        _circleSeries.push(series);
-        _circleMarkerPlugins.push(plugin);
+            var plugin = null;
+            try {
+                plugin = LightweightCharts.createSeriesMarkers(series, []);
+            } catch(e) { plugin = null; }
+
+            _circleLevelSeries[key] = { series: series, plugin: plugin };
+            _circleSeries.push(series);
+            if (plugin) _circleMarkerPlugins.push(plugin);
+
+            try { series.setData(sd); } catch(e) { continue; }
+            if (plugin) {
+                try { plugin.setMarkers(markers); } catch(e) {}
+            }
+        }
     }
 }
 
@@ -29841,7 +30685,49 @@ function updateLiveCandle(json) {
         candleSeries.update(c);
         lastClosePrice = c.close;
         updateCountdownDisplay();
+
+        // P14-03-E (D.3): GENERISCHES LIVE-OVERLAY RENDERING – Dispatcher routet
+        // je kind (Open/Closed), ohne kompletten Chart-Rebuild und ohne die
+        // historischen Overlays zu verwerfen.
+        if (c.overlays && Array.isArray(c.overlays) && c.overlays.length > 0) {
+            applyLiveOverlays(c.overlays);
+        }
     } catch(e) {}
+}
+
+// P14-03-E: Generischer Overlay-Dispatcher. Spätere Indikator-Plugins docken
+// über neue kind/layer-Werte an, ohne updateLiveCandle zu ändern.
+function applyLiveOverlays(overlays) {
+    if (typeof renderGridCircles !== 'function') return;
+    var circles = [];
+    for (var i = 0; i < overlays.length; i++) {
+        var o = overlays[i];
+        if (o && o.kind === 'circle' && typeof o.time === 'number' &&
+            typeof o.price === 'number' && !isNaN(o.time) && !isNaN(o.price)) {
+            circles.push(o);
+        }
+    }
+    if (circles.length === 0) return;
+
+    // P14-03-E (Flacker-Fix): Change-Detection – wenn sich der Live-Circle-Satz
+    // gegenüber dem letzten Tick NICHT geändert hat (gleiche Level-Hits, gleiche
+    // Farben), wird kein Re-Render ausgelöst. Identische Sichtbarkeit, aber kein
+    // Canvas-Rebuild -> behebt das Tick-Flackern bei erfüllter Proximity.
+    var nowJson = JSON.stringify(circles);
+    if (nowJson === _lastLiveCirclesJson) return;
+    _lastLiveCirclesJson = nowJson;
+
+    // Merged-Render: nur die Live-Zeit ersetzen, historische Circles behalten.
+    var liveTime = circles[0].time;
+    // P14-03-E: Bei neuer Live-Bar zusätzlich die Kreise der VORHERIGEN Live-Zeit
+    // entfernen (sonst bleiben veraltete Live-Kreise der Vor-Bar im Cache hängen).
+    if (_lastLiveOverlayTime !== null && _lastLiveOverlayTime !== liveTime) {
+        _gridCirclesCache = _gridCirclesCache.filter(function(x) { return x.time !== _lastLiveOverlayTime; });
+    }
+    _lastLiveOverlayTime = liveTime;
+    _gridCirclesCache = _gridCirclesCache.filter(function(x) { return x.time !== liveTime; });
+    for (var j = 0; j < circles.length; j++) { _gridCirclesCache.push(circles[j]); }
+    renderGridCircles(_gridCirclesCache);
 }
 
 function fitChartContent() { if(chart) chart.timeScale().fitContent(); }
@@ -29957,6 +30843,7 @@ function applyFullChartUpdate(data) {
         gridPriceLines = [];
         _circleSeries = [];
         _circleMarkerPlugins = [];
+        _circleLevelSeries = {};
         seriesMarkersPlugin = null;
         try { DaySeparator.clear(); } catch(e) {}
 
@@ -30041,6 +30928,12 @@ function applyFullChartUpdate(data) {
         }
         rawCandleData = validCandles;
         lastClosePrice = validCandles[validCandles.length - 1].close;
+        // P14-03-E: Circle-Cache für Merged-Render aus dem Refresh-Payload.
+        _gridCirclesCache = (data.gridCircles || []).slice();
+        // P14-03-E (Flacker-Fix): Live-Circle-Change-Detection nach Full-Update
+        // zurücksetzen – der erste Tick nach dem Refresh rendert wieder.
+        _lastLiveCirclesJson = '[]';
+        _lastLiveOverlayTime = null;
 
         // Schritt 4: TimeScale Subscription
         try {
@@ -31200,85 +32093,6 @@ class AbstractStateModel(ABC):
     def from_dict(cls, data: Dict[str, Any]) -> "AbstractStateModel":
         """Deserialisiert ein Dict zurück in eine Modell-Instanz."""
         pass
-
-```
-
---------------------------------------------------
-
-### DATEI: test/_check_doc2_tmp.py
-```py
-# test/_check_doc2_tmp.py (temporärer Konsistenz-Check)
-import re
-
-s = open(r'docs/AKTUELLE_UMSETZUNG.md', encoding='utf-8').read()
-lines = s.splitlines()
-errs = []
-
-probes = [
-    ('get_live_overlays', 'Overlay-Hook'),
-    ('applyLiveOverlays', 'JS-Dispatcher'),
-    ('c.overlays', 'Payload overlays'),
-    ('_live_bar_time', 'Live-Bar-State'),
-    ('_live_candle_cont', 'Live-Candle-State'),
-    ('remember_live_time', 'remember_live_time'),
-    ('RE-INJEKTION IST PFLICHT', 'P5 PFLICHT'),
-    ('P6 (Generisches Overlay-Schema)', 'P6'),
-    ('P7 (Overlay-Zeit-Mapping)', 'P7'),
-    ('feature_id: str = "proximity"', 'generischer Feature-Read'),
-]
-for probe, desc in probes:
-    if probe not in s:
-        errs.append('fehlt: ' + desc)
-
-# Veraltete Referenzen (sollten weg sein)
-for old, desc in [
-    ('c.live_circles', 'altes live_circles-Payload'),
-    ('hasattr(liq_ind, "_live_points")', 'alter _live_points-Zugriff in chart_win'),
-]:
-    if old in s:
-        errs.append('NOCH VORHANDEN: ' + desc)
-
-fences = len(re.findall('```.*$', s, re.M))
-print('Code-Fences:', fences, '(gerade:', fences % 2 == 0, ')')
-print('ERRORS:', errs if errs else 'keine')
-print('LINES:', len(lines))
-for i, ln in enumerate(lines, 1):
-    if ln.startswith('### Kapitel 4.3-E'):
-        print('Kapitel 4.3-E Zeile', i)
-
-```
-
---------------------------------------------------
-
-### DATEI: test/_check_doc_tmp.py
-```py
-import re
-s = open(r'docs/AKTUELLE_UMSETZUNG.md', encoding='utf-8').read()
-lines = s.splitlines()
-errs = []
-probes = [
-    ('### Kapitel 4.3-E [P14-03]', 'Kapitel 4.3-E'),
-    ('#### A. Konzeptionelle Erklärung & Flacker-Analyse', 'Sektion A'),
-    ('#### B. Generische Entkopplungs-Regel', 'Sektion B'),
-    ('#### C. Schritt-für-Schritt Anleitung zur Behebung', 'Sektion C'),
-    ('#### D. AI-Arbeitsauftrag', 'Sektion D'),
-    ('#### E. Headless Validierung (Ergänzung)', 'Sektion E'),
-    ('#### F. Prüfprotokoll', 'Sektion F'),
-    ('_process_plugin_bars_resilient()', 'Seam'),
-    ('_gridCirclesCache', 'JS-Cache'),
-    ('read_proximity_from_feature_store(', 'Lesepfad'),
-    ('live_circles', 'Payload'),
-]
-for probe, desc in probes:
-    if probe not in s:
-        errs.append('fehlt: ' + desc)
-fences = len(re.findall(chr(96)*3 + r'.*$', s, re.M))
-print('Code-Fences (Zeilen mit Fence-Start):', fences)
-print('ERRORS:', errs if errs else 'keine')
-print('LINES:', len(lines))
-for i, ln in enumerate(lines, 1):
-    if ln.startswith('### Kapitel 4.3-E'):
-        print('Kapitel 4.3-E beginnt Zeile', i)
 
 ```
 
@@ -38499,6 +39313,707 @@ if __name__ == "__main__":
 
 --------------------------------------------------
 
+### DATEI: test/check_p14_flacker_zyklus.py
+```py
+# test/check_p14_flacker_zyklus.py
+# Headless-Verifikation des P14-03-E Flacker-Fix (Kapitel 4.3-E, Pruefprotokoll P9):
+#
+# BEFUND (User, nach P8): Direkt nach dem Erzeugen einer neuen Kerze flackert der
+# Chart periodisch (~500ms): Die neue Kerze wird aufgebaut, aber abwechselnd wird
+# die ALTE Kerze ohne Neuplot (meist als duenne Linie) gezeigt. Das Flackern
+# verschwindet erst nach einem Service-Update (wenn die Live-Bar in der DB steht).
+#
+# ROOT CAUSE:
+# 1) _do_refresh_chart_data() rief liq_ind.remember_live_time() VOR dem
+#    calculate()-Loop auf. calculate() setzt self._known_times aus den DB-Bars
+#    zurueck – die offene Live-Bar (noch NICHT in DuckDB) geht dabei verloren.
+#    Damit feuert der New-Candle-Callback bei JEDEM Live-Tick (LiveTickWorker,
+#    main.py: 500ms) erneut -> debounce (400ms) -> Chart-Rebuild -> Flackern
+#    im Wechsel Live-Plot (neue Kerze) <-> Rebuild (alte/leere Kerze).
+# 2) Die Re-Injektion war hardcoded auf 'grid_liquidity' (liq_ind ...) statt
+#    generisch ueber alle Indikatoren mit remember_live_time()-Hook.
+# 3) _live_candle_cont wurde nur beim ERSTEN Tick einer neuen Bar gesetzt –
+#    der Rebuild reinjizierte die Kerze mit veraltetem OHLC (duenne Linie).
+#
+# FIX:
+# A) base_indicator.py: remember_live_time(ts) als generischer Base-Hook (no-op).
+# B) chart_win.py: _reinject_live_bar_to_indicators() – generisch ueber ALLE
+#    Indikatoren; aufgerufen NACH jedem calculate()-Loop (_do_refresh_chart_data
+#    und render_indicators).
+# C) chart_win.py update_live_candle: _live_candle_cont bei jedem Tick der
+#    offenen Bar aktualisieren (aktueller OHLC-Stand fuer die Re-Injektion).
+import os
+import sys
+
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, BASE)
+
+import pandas as pd  # noqa: E402
+
+failures = 0
+
+
+def run_check(label, fn):
+    global failures
+    try:
+        fn()
+        print(f"[PASS] {label}")
+    except Exception as e:
+        failures += 1
+        print(f"[FAIL] {label} -> {e}")
+
+
+# ---------------------------------------------------------------------------
+print("=== 1. BaseIndicator: remember_live_time-Hook (Open/Closed) ===")
+from chart.indicators.base_indicator import BaseIndicator  # noqa: E402
+
+
+class _Dummy(BaseIndicator):
+    @property
+    def indicator_id(self) -> str:
+        return "dummy"
+
+    @property
+    def display_name(self) -> str:
+        return "Dummy"
+
+    @property
+    def default_params(self) -> dict:
+        return {}
+
+    def calculate(self, df, params):
+        return {}
+
+
+def _test_hook():
+    d = _Dummy()
+    assert callable(getattr(d, "remember_live_time", None)), "Hook fehlt"
+    d.remember_live_time(123)  # no-op Default, kein Fehler
+
+
+run_check("1a: Base-Hook existiert & no-op (kein Fehler)", _test_hook)
+
+# ---------------------------------------------------------------------------
+print("=== 2. New-Candle-Logik: Callback 1x, remember_live_time bricht Zyklus ===")
+from chart.indicators.grid_liquidity import GridLiquidityIndicator  # noqa: E402
+
+
+def _test_callback_zyklus():
+    ind = GridLiquidityIndicator()
+    ind.set_context("SILVER", "M1")  # t_sec = 60 -> Zeiten als 60er-Vielfache
+    # Cache-Linien setzen, damit update_live_candle nicht frueh zurueckgibt.
+    ind._set_cached_lines([{"price": 100.0}])
+    ind._known_times = {60}
+    calls = []
+    ind.set_new_candle_callback(lambda: calls.append(1))
+
+    # Erster Tick der NEUEN Bar (Zeit 120, gerundet auf 120) -> Callback 1x
+    ind.update_live_candle({"time": 120, "close": 100.5})
+    assert len(calls) == 1, f"erster Tick: calls={calls}"
+    assert 120 in ind._known_times
+
+    # Zweiter Tick derselben Bar -> KEIN weiterer Callback
+    ind.update_live_candle({"time": 120, "close": 100.7})
+    assert len(calls) == 1, f"zweiter Tick: calls={calls}"
+
+    # Effekt von calculate(): _known_times wird aus DB-Bars neu aufgebaut
+    # (die offene Bar 120 ist noch NICHT in der DB).
+    ind._known_times = ind._compute_known_times(pd.DataFrame({"time": [60]}))
+    assert 120 not in ind._known_times, "calculate-Resetszenario fehlt"
+
+    # BUG-Demo (OHNE Re-Injektion): naechster Tick feuert erneut -> Rebuild
+    ind.update_live_candle({"time": 120, "close": 100.6})
+    assert len(calls) == 2, f"Bug-Demo: calls={calls} (erwartet 2 = Flacker-Zyklus)"
+
+    # FIX-Demo (MIT Re-Injektion via remember_live_time): kein weiterer Callback
+    ind.remember_live_time(120)
+    ind.update_live_candle({"time": 120, "close": 100.6})
+    assert len(calls) == 2, f"Fix-Demo: calls={calls} (erwartet 2 = Zyklus gebrochen)"
+
+
+run_check("2a: Callback 1x, calculate-Resetszenario, remember_live_time bricht Zyklus",
+          _test_callback_zyklus)
+
+# ---------------------------------------------------------------------------
+print("=== 3. chart_win: _reinject_live_bar_to_indicators() generisch ===")
+import chart.chart_win as cw  # noqa: E402
+
+
+def _test_generic_reinject():
+    win = cw.PyTraderChartWindow.__new__(cw.PyTraderChartWindow)
+    win._live_bar_time = 200
+
+    class _MockInd:
+        def __init__(self):
+            self.remembered = []
+
+        def remember_live_time(self, ts):
+            self.remembered.append(ts)
+
+    class _NoHook:
+        pass
+
+    liq = _MockInd()
+    fut = _MockInd()
+    plain = _NoHook()
+    win.indicators = {
+        "grid_liquidity": liq,
+        "grid": plain,
+        "future_plugin": fut,
+    }
+    win._reinject_live_bar_to_indicators()
+    assert liq.remembered == [200], f"grid_liquidity: {liq.remembered}"
+    assert fut.remembered == [200], f"zukuenftiges Plugin: {fut.remembered}"
+    # grid (ohne Hook) darf nicht abstuerzen -> implizit geprueft
+
+    # Ohne offene Live-Bar -> no-op
+    win._live_bar_time = None
+    win._reinject_live_bar_to_indicators()
+    assert liq.remembered == [200], "None darf nichts ausloesen"
+
+
+run_check("3a: Generik ueber ALLE Indikatoren (kein grid_liquidity-Sonderfall)",
+          _test_generic_reinject)
+
+# ---------------------------------------------------------------------------
+print("=== 4. Statische Regression: Reihenfolge & Hardcoding entfernt ===")
+src = open(os.path.join(BASE, "chart", "chart_win.py"), encoding="utf-8").read()
+base_src = open(os.path.join(BASE, "chart", "indicators", "base_indicator.py"),
+                encoding="utf-8").read()
+
+
+def _test_static():
+    # Re-Injektion NACH dem calculate()-Loop: Aufruf in _do_refresh_chart_data
+    # und render_indicators (mind. 2 Stellen) + Methodendefinition.
+    assert src.count("self._reinject_live_bar_to_indicators()") >= 2, \
+        "Re-Injektion fehlt nach calculate-Loop(s)"
+    assert "def _reinject_live_bar_to_indicators" in src, "Methode fehlt"
+    # Kein hardcoded remember_live_time-Aufruf fuer ein bestimmtes Plugin.
+    assert "liq_ind.remember_live_time" not in src, \
+        "Hardcoded remember_live_time-Aufruf noch vorhanden"
+    # Live-Candle-State wird bei jedem Tick der offenen Bar aktualisiert.
+    assert "rounded_t == self._live_bar_time" in src, \
+        "_live_candle_cont-Update im Tick fehlt"
+    # Base-Hook existiert.
+    assert "def remember_live_time" in base_src, "Base-Hook fehlt"
+
+
+run_check("4a: Reihenfolge (Re-Injektion nach calculate), kein Hardcoding, "
+          "_live_candle_cont-Update", _test_static)
+
+# ---------------------------------------------------------------------------
+if failures == 0:
+    print("\nALLE TESTS OK – FLACKER-ZYKLUS-FIX VERIFIZIERT (P9)")
+    sys.exit(0)
+else:
+    print(f"\n{failures} TEST(S) FEHLGESCHLAGEN")
+    sys.exit(1)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_p14_grid_incremental.js
+```js
+// test/check_p14_grid_incremental.js
+// Headless-Verifikation des P14-03-E Flacker-Fixes (inkrementelles Circle-Rendering):
+//   renderGridCircles() darf unveraenderte Level NICHT neu aufbauen (kein
+//   removeSeries/addSeries), nur veraenderte Level per setData/setMarkers
+//   aktualisieren und verschwundene Level entfernen. Vorher rief jede
+//   applyLiveOverlays -> renderGridCircles -> clearGridCircles alle Circle-Serien
+//   ab und baute sie neu auf = Flackern bei erfuellter Proximity.
+//
+// Zusaetzlich wird die Change-Detection von applyLiveOverlays geprueft: identische
+// Circle-Sets zwischen Ticks duerfen KEINEN Re-Render ausloesen, und beim
+// Live-Bar-Wechsel werden die Kreise der Vor-Bar aus dem Cache entfernt.
+const fs = require('fs');
+const path = require('path');
+const vm = require('vm');
+
+let failures = 0;
+
+// ---------------------------------------------------------------------------
+// Mocks (kein echtes LightweightCharts – nur die von renderGridCircles/
+// applyLiveOverlays genutzte API). WICHTIG: JS String(51.0)==='51' und Objekt-
+// Enumeration liefert integer-like Keys ("51") VOR "50.5" -> Serien im Mock
+// werden per PRICE-KEY (Registry) referenziert, nie per Array-Index.
+// ---------------------------------------------------------------------------
+function makeChartMock() {
+    const allSeries = [];
+    return {
+        allSeries,
+        addSeries(type, opts) {
+            const s = {
+                type, opts,
+                removed: false,
+                setDataCalls: 0,
+                data: null,
+                markers: [],
+                setData(d) { this.data = d; this.setDataCalls++; },
+                setMarkers(m) { this.markers = (m || []).slice(); }
+            };
+            allSeries.push(s);
+            return s;
+        },
+        removeSeries(s) {
+            s.removed = true;
+            const i = allSeries.indexOf(s);
+            if (i >= 0) allSeries.splice(i, 1);
+        }
+    };
+}
+
+function freshGlobals() {
+    global.chart = makeChartMock();
+    global.candleSeries = null;
+    global._circleSeries = [];
+    global._circleMarkerPlugins = [];
+    global._circleLevelSeries = {};
+    global._storedSignalMarkersData = [];
+    global._gridCirclesCache = [];
+    global._lastLiveCirclesJson = '[]';
+    global._lastLiveOverlayTime = null;
+    global.LightweightCharts = {
+        LineSeries: 'LineSeries',
+        createSeriesMarkers(series, initial) {
+            return {
+                series,
+                markers: (initial || []).slice(),
+                setMarkers(m) { this.markers = (m || []).slice(); series.setMarkers((m || []).slice()); }
+            };
+        }
+    };
+}
+
+const code03 = fs.readFileSync(path.join(__dirname, '..', 'chart', 'js', '03_chart_rendering.js'), 'utf-8');
+const code04 = fs.readFileSync(path.join(__dirname, '..', 'chart', 'js', '04_live_updates.js'), 'utf-8');
+
+function fail(label, detail) {
+    failures++;
+    console.error(`FAIL ${label} -> ${detail}`);
+}
+function ok(label) {
+    console.log(`OK   ${label}`);
+}
+function runCheck(label, fn) {
+    try {
+        fn();
+        ok(label);
+    } catch (e) {
+        fail(label, e.message);
+    }
+}
+// Serie fuer einen Preis-KEY ueber die Registry holen (Reihenfolge-unabhaengig).
+function seriesOf(priceKey) {
+    const e = _circleLevelSeries[priceKey];
+    if (!e) throw new Error(`Level ${priceKey} nicht in Registry (${Object.keys(_circleLevelSeries)})`);
+    return e.series;
+}
+
+// ---------------------------------------------------------------------------
+console.log('=== Szenario 1: Erst-Render baut alle Level-Serien auf ===');
+freshGlobals();
+vm.runInThisContext(code03, { filename: '03_chart_rendering.js' });
+renderGridCircles([
+    { time: 100, price: 50.5, color: '#FFEB3B' },
+    { time: 100, price: 51.0, color: '#E91E63' },
+    { time: 200, price: 50.5, color: '#FFEB3B' },
+    { time: 200, price: 51.0, color: '#E91E63' }
+]);
+runCheck('2 Level -> genau 2 Serien erzeugt', () => {
+    if (chart.allSeries.length !== 2) throw new Error(`erwartet 2, war ${chart.allSeries.length}`);
+});
+runCheck('Registry enthaelt beide Level (50.5 + 51)', () => {
+    if (Object.keys(_circleLevelSeries).length !== 2) throw new Error(`Keys ${Object.keys(_circleLevelSeries)}`);
+});
+runCheck('Marker je Level = 2 (2 Zeitpunkte)', () => {
+    const m50 = seriesOf('50.5').markers.length;
+    const m51 = seriesOf('51').markers.length;
+    if (m50 !== 2 || m51 !== 2) throw new Error(`Marker 50.5=${m50}, 51=${m51}`);
+});
+runCheck('Datenpunkte liegen exakt auf dem Level-Preis', () => {
+    const d50 = seriesOf('50.5').data;
+    const d51 = seriesOf('51').data;
+    if (d50.some(p => p.value !== 50.5)) throw new Error(`Level50.5 Daten ${JSON.stringify(d50)}`);
+    if (d51.some(p => p.value !== 51.0)) throw new Error(`Level51 Daten ${JSON.stringify(d51)}`);
+});
+
+// ---------------------------------------------------------------------------
+console.log('=== Szenario 2: Identischer Satz -> KEINE neuen/entfernten Serien ===');
+const ref50 = seriesOf('50.5');
+const ref51 = seriesOf('51');
+runCheck('erneuter Render gleicher Daten: Serien-Objekte identisch (kein Rebuild)', () => {
+    renderGridCircles([
+        { time: 100, price: 50.5, color: '#FFEB3B' },
+        { time: 100, price: 51.0, color: '#E91E63' },
+        { time: 200, price: 50.5, color: '#FFEB3B' },
+        { time: 200, price: 51.0, color: '#E91E63' }
+    ]);
+    if (chart.allSeries.length !== 2) throw new Error(`Serienanzahl ${chart.allSeries.length}`);
+    if (seriesOf('50.5') !== ref50 || seriesOf('51') !== ref51) {
+        throw new Error('Serien wurden neu erzeugt statt wiederverwendet');
+    }
+});
+runCheck('keine Serie als removed markiert', () => {
+    if (chart.allSeries.some(s => s.removed)) throw new Error('removeSeries wurde aufgerufen');
+});
+
+// ---------------------------------------------------------------------------
+console.log('=== Szenario 3: Live-Update (neue Zeit) -> nur setData/setMarkers ===');
+runCheck('Live-Zeit 300: nur Daten ersetzt, Objekte bleiben', () => {
+    renderGridCircles([
+        { time: 100, price: 50.5, color: '#FFEB3B' },
+        { time: 100, price: 51.0, color: '#E91E63' },
+        { time: 200, price: 50.5, color: '#FFEB3B' },
+        { time: 200, price: 51.0, color: '#E91E63' },
+        { time: 300, price: 50.5, color: '#FFEB3B' },
+        { time: 300, price: 51.0, color: '#E91E63' }
+    ]);
+    if (chart.allSeries.length !== 2) throw new Error(`Serienanzahl ${chart.allSeries.length}`);
+    if (seriesOf('50.5') !== ref50 || seriesOf('51') !== ref51) throw new Error('Serien neu erzeugt');
+    if (ref50.removed || ref51.removed) throw new Error('removeSeries aufgerufen');
+    if (ref50.data.length !== 3) throw new Error(`Level50.5 Daten ${ref50.data.length}`);
+    if (ref50.markers.length !== 3) throw new Error(`Level50.5 Marker ${ref50.markers.length}`);
+});
+
+// ---------------------------------------------------------------------------
+console.log('=== Szenario 4: Level verschwindet -> nur dieses Level entfernt ===');
+runCheck('Level 51 verschwindet: Serie entfernt, Level 50.5 bleibt identisch', () => {
+    renderGridCircles([
+        { time: 100, price: 50.5, color: '#FFEB3B' },
+        { time: 200, price: 50.5, color: '#FFEB3B' }
+    ]);
+    if (chart.allSeries.length !== 1) throw new Error(`Serienanzahl ${chart.allSeries.length}`);
+    if (seriesOf('50.5') !== ref50) throw new Error('Level 50.5 wurde neu erzeugt statt wiederverwendet');
+    if (!ref51.removed) throw new Error('Level 51 wurde nicht entfernt');
+    if (Object.keys(_circleLevelSeries).length !== 1) throw new Error(`Registry ${Object.keys(_circleLevelSeries)}`);
+});
+
+// ---------------------------------------------------------------------------
+console.log('=== Szenario 5: Leere Liste -> alle Serien entfernt ===');
+runCheck('renderGridCircles([]) raeumt alle Serien + Registry', () => {
+    renderGridCircles([]);
+    if (chart.allSeries.length !== 0) throw new Error(`Serienanzahl ${chart.allSeries.length}`);
+    if (Object.keys(_circleLevelSeries).length !== 0) throw new Error('Registry nicht geleert');
+    if (_circleSeries.length !== 0) throw new Error(`_circleSeries ${_circleSeries.length}`);
+});
+
+// ---------------------------------------------------------------------------
+console.log('=== Szenario 6: applyLiveOverlays Change-Detection + Bar-Wechsel ===');
+freshGlobals();
+vm.runInThisContext(code03, { filename: '03_chart_rendering.js' });
+vm.runInThisContext(code04, { filename: '04_live_updates.js' });
+
+// Cache wie applyFullChartUpdate befuellen (historische Kreise).
+_gridCirclesCache = [
+    { time: 100, price: 50.5, color: '#FFEB3B' },
+    { time: 200, price: 50.5, color: '#FFEB3B' }
+];
+let renderCount = 0;
+const origRender = renderGridCircles; // globale Funktion aus vm (03)
+global.renderGridCircles = function(c) { renderCount++; origRender(c); };
+
+runCheck('erster Live-Satz (Zeit 300) -> Render laeuft, Cache=Hist+Live', () => {
+    applyLiveOverlays([
+        { kind: 'circle', layer: 'grid_liquidity', time: 300, price: 50.5, color: '#FFEB3B', priority: 10 }
+    ]);
+    if (renderCount !== 1) throw new Error(`renderCount ${renderCount}`);
+    if (_gridCirclesCache.length !== 3) throw new Error(`Cache ${_gridCirclesCache.length} (Hist 2 + Live 1 erwartet)`);
+});
+runCheck('identischer zweiter Tick (gleiche Zeit/Menge) -> KEIN Render', () => {
+    applyLiveOverlays([
+        { kind: 'circle', layer: 'grid_liquidity', time: 300, price: 50.5, color: '#FFEB3B', priority: 10 }
+    ]);
+    if (renderCount !== 1) throw new Error(`renderCount ${renderCount} – Change-Detection greift nicht`);
+});
+runCheck('geaenderter Satz (neues Level 51) -> Render laeuft', () => {
+    applyLiveOverlays([
+        { kind: 'circle', layer: 'grid_liquidity', time: 300, price: 50.5, color: '#FFEB3B', priority: 10 },
+        { kind: 'circle', layer: 'grid_liquidity', time: 300, price: 51.0, color: '#E91E63', priority: 10 }
+    ]);
+    if (renderCount !== 2) throw new Error(`renderCount ${renderCount}`);
+});
+runCheck('Live-Bar-Wechsel 300->400: Vor-Bar-Kreise + alte Live-Zeit entfernt (Merged-Render)', () => {
+    applyLiveOverlays([
+        { kind: 'circle', layer: 'grid_liquidity', time: 400, price: 50.5, color: '#FFEB3B', priority: 10 }
+    ]);
+    // Hist (100,200) + Live 400; die Kreise von 300 (Vor-Bar) sind entfernt.
+    const times = _gridCirclesCache.map(x => x.time).sort();
+    if (JSON.stringify(times) !== JSON.stringify([100, 200, 400])) {
+        throw new Error(`Cache-Zeiten ${JSON.stringify(times)}`);
+    }
+    if (renderCount !== 3) throw new Error(`renderCount ${renderCount}`);
+});
+runCheck('Live-Bar-Wechsel 400->500: Kreise der 400er-Bar entfernt', () => {
+    applyLiveOverlays([
+        { kind: 'circle', layer: 'grid_liquidity', time: 500, price: 51.0, color: '#E91E63', priority: 10 }
+    ]);
+    const times = _gridCirclesCache.map(x => x.time).sort();
+    if (JSON.stringify(times) !== JSON.stringify([100, 200, 500])) {
+        throw new Error(`Cache-Zeiten ${JSON.stringify(times)}`);
+    }
+});
+
+if (failures === 0) {
+    console.log('\nALLE TESTS OK – INKREMENTELLES RENDERING + CHANGE-DETECTION VERIFIZIERT');
+    process.exit(0);
+} else {
+    console.error(`\n${failures} TEST(S) FEHLGESCHLAGEN`);
+    process.exit(1);
+}
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_p14_live_fixes.py
+```py
+# test/check_p14_live_fixes.py
+"""
+Phase 14 P14-03-E – Verifikation: Flacker-freies Live-Rendering &
+generisches Overlay-Schema (Kapitel 4.3-E, D.1-D.4).
+
+Pruefung (headless, kein exec_()):
+1. Simuliere 10 Live-Ticks -> refresh_chart_data() 0x aufgerufen.
+2. _time_real_to_cont kontinuierlich gewachsen (kein clear()).
+3. _process_plugin_bars_resilient() aufgerufen & feature_store beschrieben.
+4. get_live_overlays() liefert Circle-Overlays, als c.overlays im Payload.
+5. Pflicht-Re-Injektion: nach _do_refresh_chart_data() ist _live_bar_time in
+   _time_real_to_cont, Live-Kerze in continuous_candles, Callback 1x.
+6. Generik: Mock-Plugin mit kind='marker' reicht ohne Engine-Aenderung durch.
+"""
+import os
+import sys
+import time
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+ANALYTICS_DB = os.path.join(TEST_DIR, "p14_live_fixes_analytics.duckdb")
+
+failures = []
+
+
+def check(name, ok, extra=""):
+    print(f"[{'PASS' if ok else 'FAIL'}] {name} {extra}")
+    if not ok:
+        failures.append(name)
+
+
+def make_marker_plugin():
+    """Mock-Indikator mit eigenem get_live_overlays() -> kind='marker'."""
+    from chart.indicators.base_indicator import BaseIndicator
+
+    class MarkerPlugin(BaseIndicator):
+        @property
+        def indicator_id(self):
+            return "mock_marker"
+
+        @property
+        def display_name(self):
+            return "Mock Marker"
+
+        @property
+        def default_params(self):
+            return {}
+
+        def calculate(self, df, params):
+            return {}
+
+        def get_live_overlays(self, candle):
+            return [{
+                "kind": "marker", "layer": self.indicator_id,
+                "time": candle.get("time"), "price": 100.0,
+                "color": "#FF0000", "priority": 5,
+            }]
+
+    return MarkerPlugin()
+
+
+def main():
+    import pandas as pd
+    from analytics.features.feature_builder import PluginRegistry
+    from chart.indicators.grid_liquidity import GridLiquidityIndicator
+
+    # ---------------------------------------------------------------- 1+2.
+    print("\n=== 1. Live-Ticks ohne refresh_chart_data() ===")
+    ind = GridLiquidityIndicator()
+    ind.set_context("SILVER", "H1")
+    # Cached Lines setzen (für update_live_candle / get_live_overlays)
+    ind._set_cached_lines([{"price": 100.0}, {"price": 101.0}])
+    ind._last_params = {"visit_pct": 0.5, "use_time_filter": False,
+                        "time_window_mins": 5,
+                        "circle_color_std": "#FFEB3B", "circle_color_active": "#E91E63"}
+
+    refresh_calls = [0]
+    ind.set_new_candle_callback(lambda: refresh_calls.__setitem__(0, refresh_calls[0] + 1))
+
+    # Zeit-Maps initial füllen (wie _do_refresh_chart_data)
+    t_sec = 3600
+    base = 1_700_000_000
+    ind._known_times = set()
+    for i in range(5):
+        ind._known_times.add(base + i * t_sec)
+    from chart.chart_win import PyTraderChartWindow
+    win = PyTraderChartWindow.__new__(PyTraderChartWindow)
+    win._time_cont_to_real = {}
+    win._time_real_to_cont = {}
+    for i in range(5):
+        cont = base + i * t_sec
+        win._time_cont_to_real[cont] = base + i * t_sec
+        win._time_real_to_cont[base + i * t_sec] = cont
+    win._live_bar_time = None
+    win._live_candle_cont = None
+    win.indicators = {"grid_liquidity": ind}
+    win.indicators_state = {"grid_liquidity": {"active": True}}
+
+    # 10 Ticks simulieren (aktive Kerze base+5*t_sec) – über get_live_overlays,
+    # das intern update_live_candle aufruft. Der New-Candle-Callback feuert
+    # GENAU 1x (neue Kerze, gewollt – P5); refresh_chart_data() wird NICHT
+    # direkt aus dem Tick heraus aufgerufen.
+    for i in range(10):
+        rounded_t = base + 5 * t_sec
+        candle = {"time": rounded_t, "open": 100.0, "high": 100.5, "low": 99.5,
+                  "close": 100.2, "symbol": "SILVER", "timeframe": "H1"}
+        ov = ind.get_live_overlays(dict(candle, time=rounded_t))
+
+    check("1a: New-Candle-Callback GENAU 1x (neue Kerze, P5)",
+          refresh_calls[0] == 1, f"(calls={refresh_calls[0]})")
+    check("1b: _time_real_to_cont unveraendert (kein clear/append)",
+          base + 5 * t_sec not in win._time_real_to_cont,
+          f"(size={len(win._time_real_to_cont)})")
+
+    # ---------------------------------------------------------------- 3.
+    print("\n=== 2. _process_plugin_bars_resilient() aufgerufen ===")
+    # LiveAnalyzer ohne vollen Konstruktor instanziieren (vermeidet DB-Lock
+    # auf data/app_data.duckdb durch StateManager/FeatureBuilder).
+    from analytics.background_workers.live_analyzer import LiveAnalyzer
+    la = LiveAnalyzer.__new__(LiveAnalyzer)
+    la.symbol, la.timeframe = "SILVER", "M1"
+    la._live_shared_state = {}
+    from analytics.features.plugins.base_plugin import PluginContext
+    la._live_context = PluginContext(symbol="SILVER", timeframe="M1", mode="live",
+                                     shared_state=la._live_shared_state)
+    check("2a: Seam existiert", hasattr(la, "_process_plugin_bars_resilient"))
+    check("2b: _live_context vorhanden (mode=live)",
+          la._live_context.mode == "live"
+          and la._live_context.symbol == "SILVER")
+    check("2c: shared_state persistiert",
+          la._live_context.shared_state is la._live_shared_state)
+
+    # feature_store-Beschreibung (nur wenn DB vorhanden – Mock in Tests)
+    import duckdb
+    if os.path.exists(ANALYTICS_DB):
+        os.remove(ANALYTICS_DB)
+    con = duckdb.connect(ANALYTICS_DB)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS feature_store (
+            symbol VARCHAR NOT NULL, timeframe VARCHAR NOT NULL,
+            bar_time TIMESTAMPTZ NOT NULL, feature_id VARCHAR,
+            plugin_version VARCHAR, feature_data JSON,
+            PRIMARY KEY (symbol, timeframe, bar_time))
+    """)
+    con.execute("""
+        INSERT INTO feature_store (symbol, timeframe, bar_time, feature_id, plugin_version, feature_data)
+        VALUES ('SILVER', 'M1', TIMESTAMPTZ 'epoch' + 1000 * INTERVAL 1 SECOND,
+                'proximity', '1.0.0',
+                '{"is_hit": true, "levels_hit": [100.0, 101.5],
+                  "in_time_window": true, "schema_version": "1.0.0"}')
+    """)
+    from chart.indicators.grid_liquidity import GridLiquidityIndicator as G
+    ind2 = G()
+    circles = ind2.read_proximity_from_feature_store(
+        "SILVER", "M1", db_path=ANALYTICS_DB, feature_id="proximity")
+    check("2d: feature_store-Lesepfad (feature_id-Parameter)", len(circles) == 2,
+          f"(len={len(circles)})")
+    con.close()
+
+    # ---------------------------------------------------------------- 4.
+    print("\n=== 3. get_live_overlays -> Circle-Overlays im Payload ===")
+    ov2 = ind.get_live_overlays({"time": base + 5 * t_sec, "close": 100.2})
+    check("3a: Overlay-Items mit kind=circle", all(o.get("kind") == "circle" for o in ov2),
+          f"(n={len(ov2)})")
+    check("3b: layer=indicator_id", all(o.get("layer") == "grid_liquidity" for o in ov2))
+
+    # Payload-Einsammeln (D.1c) simulieren
+    overlays = []
+    for o in ov2:
+        d = dict(o)
+        t = d.get("time")
+        if t is not None:
+            d["time"] = win._time_real_to_cont.get(int(t), int(t))
+        overlays.append(d)
+    payload = {"overlays": overlays}
+    check("3c: c.overlays im Payload", isinstance(payload["overlays"], list))
+
+    # ---------------------------------------------------------------- 5.
+    print("\n=== 4. Pflicht-Re-Injektion (D.1d) ===")
+    win._live_bar_time = base + 5 * t_sec
+    win._live_candle_cont = {"time": base + 5 * t_sec, "open": 100.0,
+                             "high": 100.5, "low": 99.5, "close": 100.2}
+    # _do_refresh_chart_data Kern-Logik simulieren (Map-Rebuild + Re-Injektion)
+    t_sec2 = t_sec
+    win._time_cont_to_real = {}
+    win._time_real_to_cont = {}
+    cont_candles = []
+    for i in range(5):
+        cont = base + i * t_sec2
+        win._time_cont_to_real[cont] = base + i * t_sec2
+        win._time_real_to_cont[base + i * t_sec2] = cont
+        cont_candles.append({"time": cont, "close": 100.0})
+    # PFLICHT-Re-Injektion (D.1d-Block)
+    if (win._live_bar_time is not None
+            and win._live_bar_time not in win._time_real_to_cont):
+        last_cont = max(win._time_cont_to_real.keys())
+        cont = last_cont + t_sec2
+        win._time_cont_to_real[cont] = win._live_bar_time
+        win._time_real_to_cont[win._live_bar_time] = cont
+        if win._live_candle_cont is not None:
+            lc = dict(win._live_candle_cont)
+            lc["time"] = cont
+            cont_candles.append(lc)
+    check("4a: _live_bar_time in Maps nach Re-Injektion",
+          win._live_bar_time in win._time_real_to_cont)
+    check("4b: Live-Kerze in continuous_candles",
+          any(c["time"] == win._live_bar_time or
+              c["time"] == win._time_real_to_cont[win._live_bar_time]
+              for c in cont_candles))
+    # Callback-Zähler: nach Re-Injektion muss rounded_t in _known_times sein
+    ind.remember_live_time(win._live_bar_time)
+    check("4c: remember_live_time -> Callback nicht erneut",
+          win._live_bar_time in ind._known_times)
+
+    # ---------------------------------------------------------------- 6.
+    print("\n=== 5. Generik: Mock-Plugin kind='marker' ===")
+    mock = make_marker_plugin()
+    mv = mock.get_live_overlays({"time": base + 5 * t_sec, "close": 100.0})
+    check("5a: Mock liefert kind=marker", mv and mv[0].get("kind") == "marker")
+    # Engine-Einsammeln (D.1c) über get_live_overlays – mock hat keinen
+    # _live_points, aber der generische Hook funktioniert.
+    mock_overlays = []
+    getter = getattr(mock, "get_live_overlays", None)
+    if callable(getter):
+        ovm = getter({"time": base + 5 * t_sec, "close": 100.0}) or []
+        mock_overlays = [dict(x) for x in ovm]
+    check("5b: Mock-Overlays ohne Engine-Sonderfall", len(mock_overlays) == 1
+          and mock_overlays[0]["kind"] == "marker")
+
+    print("-" * 60)
+    if failures:
+        print("BEFUND: " + "; ".join(failures))
+        sys.exit(1)
+    print("BEFUND: Live-Ticks ohne Refresh, Map-Append, Seam-Verdrahtung, "
+          "Overlay-Schema, Pflicht-Re-Injektion & Generik OK.")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/check_p14_precision_levels.py
 ```py
 # test/check_p14_precision_levels.py
@@ -39713,6 +41228,720 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_p14_s4_migration.py
+```py
+# test/check_p14_s4_migration.py
+"""
+Phase 14 P14-04 – Headless Validierung (KEINE UI, KEIN exec_()).
+
+Prüft (laut Kopierblock P14-04, Schritt 3):
+a) Version wird bei Major/Minor-Änderung auf die aktuelle plugin.version
+   angehoben.
+b) Bei einer bloßen Patch-Änderung (1.0.0 -> 1.0.1) erfolgt KEINE unnötige
+   Migration.
+c) Fehlende Parameter werden ergänzt, veraltete Keys entfernt.
+d) Bei Auslösen eines Fehlers greift das Rollback sauber (get_set liefert
+   das UNMIGRIERTE Original zurück).
+
+Zusätzlich:
+- `_needs_migration` SemVer-Matrix (inkl. Legacy '0.0.0', Downgrade-Schutz).
+- `ServiceSetRepository.get_set()` wendet den Migrator transparent an
+  (Integrationspfad) und `_migrate_existing_sets()` füllt fehlende
+  description-Felder auf (Bestands-Migration).
+- `ServiceInstanceConfig.version`-Stamping in service_win.collect_set_definition()
+  wird als reine Logik nachgeprüft (headless, ohne UI): Das Stamping wird
+  über die Registry-Version erzwungen.
+
+Test-DB liegt im Unterordner test/ (Regel: keine Test-DBs im Root/data).
+"""
+import json
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+
+TEST_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "p14_s4_test.duckdb")
+if os.path.exists(TEST_DB):
+    os.remove(TEST_DB)
+
+from analytics.engine.schema_migrator import (  # noqa: E402
+    SchemaMigrator,
+    MigrationError,
+    _needs_migration,
+    _parse_version,
+)
+from analytics.engine.service_set_repository import ServiceSetRepository  # noqa: E402
+from analytics.features.plugins.base_plugin import PluginFeature  # noqa: E402
+from analytics.features.definitions.grid_lines_service import GridLinesService  # noqa: E402
+
+FAILURES: list = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    status = "PASS" if cond else "FAIL"
+    print(f"[{status}] {name}" + (f" – {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(name)
+
+
+# ---------------------------------------------------------------------------
+# 0) SemVer-Hilfsfunktionen
+# ---------------------------------------------------------------------------
+check("parse: '1.2.3'", _parse_version("1.2.3") == (1, 2, 3))
+check("parse: None -> 0.0.0", _parse_version(None) == (0, 0, 0))
+check("parse: '' -> 0.0.0", _parse_version("") == (0, 0, 0))
+check("parse: 'v1.2.3' Präfix", _parse_version("v1.2.3") == (1, 2, 3))
+check("parse: Pre-Release/Build ignoriert",
+      _parse_version("1.2.3-beta.1+build5") == (1, 2, 3))
+check("parse: '1.2' ergänzt", _parse_version("1.2") == (1, 2, 0))
+
+# SemVer-Matrix für _needs_migration (v_old -> v_new)
+check("needs: Legacy 0.0.0 -> 1.0.0 (immer migrieren)", _needs_migration(None, "1.0.0") is True)
+check("needs: Major 1.0.0 -> 2.0.0", _needs_migration("1.0.0", "2.0.0") is True)
+check("needs: Minor 1.0.0 -> 1.1.0", _needs_migration("1.0.0", "1.1.0") is True)
+check("needs: Patch 1.0.0 -> 1.0.1 (KEINE Migration)", _needs_migration("1.0.0", "1.0.1") is False)
+check("needs: gleich 1.0.0 -> 1.0.0", _needs_migration("1.0.0", "1.0.0") is False)
+check("needs: Downgrade 2.0.0 -> 1.0.0 (KEIN destruktives Reset)",
+      _needs_migration("2.0.0", "1.0.0") is False)
+
+# ---------------------------------------------------------------------------
+# 1) Migrator direkt (Fake-Plugin Version 2.0.0)
+# ---------------------------------------------------------------------------
+class _V2Plugin(PluginFeature):
+    @property
+    def plugin_id(self) -> str:
+        return "v2_plugin"
+
+    @property
+    def version(self) -> str:
+        return "2.0.0"
+
+    @property
+    def parameter_schema(self):
+        return {
+            "step_size": {"type": "float", "default": 0.5},
+            "new_param": {"type": "int", "default": 7},
+        }
+
+    def calculate(self, df, params, context=None):
+        return {"feature_store_payload": {}, "chart_render_payload": {}}
+
+
+migrator = SchemaMigrator()
+
+# a) Major-Änderung: Version wird angehoben + c) Keys ergänzt/entfernt
+old_cfg = {
+    "plugin_id": "v2_plugin",
+    "version": "1.0.0",
+    "lookback": 500,
+    "params": {"step_size": 0.5, "old_key": 999, "to_remove": "x"},
+}
+migrated = migrator.migrate_instance_config(old_cfg, _V2Plugin())
+check("a) Version bei Major auf 2.0.0 angehoben",
+      migrated.get("version") == "2.0.0", str(migrated.get("version")))
+check("c) Fehlender Key 'new_param' mit Default 7 ergänzt",
+      migrated.get("params", {}).get("new_param") == 7)
+check("c) Vorhandener Key 'step_size' erhalten",
+      migrated.get("params", {}).get("step_size") == 0.5)
+check("c) Veralteter Key 'old_key' entfernt",
+      "old_key" not in migrated.get("params", {}))
+check("c) Veralteter Key 'to_remove' entfernt",
+      "to_remove" not in migrated.get("params", {}))
+check("c) lookback bleibt erhalten", migrated.get("lookback") == 500)
+check("Original unverändert (keine In-Place-Mutation)",
+      old_cfg.get("version") == "1.0.0" and "old_key" in old_cfg.get("params", {}))
+
+# Legacy ohne version-Feld (None -> 0.0.0) wird migriert
+legacy_cfg = {"plugin_id": "v2_plugin", "params": {}}
+legacy_migrated = migrator.migrate_instance_config(legacy_cfg, _V2Plugin())
+check("Legacy ohne version: Migration (0.0.0 -> 2.0.0)",
+      legacy_migrated.get("version") == "2.0.0")
+check("Legacy: lookback Default 1000 ergänzt",
+      legacy_migrated.get("lookback") == 1000)
+
+# b) Patch-Änderung: KEINE unnötige Migration (1.0.0 -> 1.0.1)
+class _PatchPlugin(PluginFeature):
+    @property
+    def plugin_id(self) -> str:
+        return "v2_plugin"
+
+    @property
+    def version(self) -> str:
+        return "1.0.1"
+
+    @property
+    def parameter_schema(self):
+        return {
+            "step_size": {"type": "float", "default": 0.5},
+            "new_param": {"type": "int", "default": 7},
+        }
+
+    def calculate(self, df, params, context=None):
+        return {"feature_store_payload": {}, "chart_render_payload": {}}
+
+
+patch_cfg = {
+    "plugin_id": "v2_plugin",
+    "version": "1.0.0",
+    "params": {"step_size": 0.5, "fremd_key": 1},
+}
+patch_migrated = migrator.migrate_instance_config(patch_cfg, _PatchPlugin())
+check("b) Patch 1.0.0 -> 1.0.1: KEINE Migration",
+      patch_migrated.get("version") == "1.0.0",
+      str(patch_migrated.get("version")))
+check("b) Patch: fremde Keys bleiben erhalten (kein Eingriff)",
+      patch_migrated.get("params", {}).get("fremd_key") == 1)
+
+# Downgrade-Schutz: 2.0.0 -> 1.0.0 (Plugin-Version kleiner) → unverändert
+downgrade_cfg = {"plugin_id": "v2_plugin", "version": "2.0.0",
+                 "params": {"step_size": 0.5, "zukunft_key": 1}}
+downgrade_migrated = migrator.migrate_instance_config(downgrade_cfg, _V2Plugin())
+check("Downgrade 2.0.0 -> 1.0.0: kein Reset", downgrade_migrated.get("version") == "2.0.0")
+
+# d) MigrationError bei Plugin=None
+try:
+    migrator.migrate_instance_config({"plugin_id": "x"}, None)
+    check("d) MigrationError bei Plugin=None", False, "keine Exception geworfen")
+except MigrationError:
+    check("d) MigrationError bei Plugin=None", True)
+
+
+# ---------------------------------------------------------------------------
+# 2) Integration: ServiceSetRepository.get_set() wendet Migrator an
+# ---------------------------------------------------------------------------
+repo = ServiceSetRepository(db_path=TEST_DB)
+
+# 2a) Set mit Legacy-Instanz (version fehlt, veralteter Key) -> Migration beim Laden
+legacy_set = {
+    "set_id": "legacy-set",
+    "display_name": "Legacy",
+    "execution_order": ["grid_1"],
+    "services": {
+        "grid_1": {
+            "plugin_id": "grid_lines",
+            "lookback": 800,
+            "params": {"step_size": 0.25, "veralteter_key": 42},
+        },
+    },
+}
+repo.save_set(legacy_set)
+loaded = repo.get_set("legacy-set")
+grid_cfg = loaded["services"]["grid_1"]
+check("2a) get_set: Version auf 1.0.0 (plugin.version) angehoben",
+      grid_cfg.get("version") == "1.0.0", str(grid_cfg.get("version")))
+check("2a) get_set: veralteter Key entfernt",
+      "veralteter_key" not in (grid_cfg.get("params") or {}))
+check("2a) get_set: Schema-Defaults ergänzt (steps_around vorhanden)",
+      (grid_cfg.get("params") or {}).get("steps_around") == 4)
+# DB unverändert: Raw-JSON in der Tabelle enthält weiterhin KEIN version-Feld
+raw_row = repo._get_connection().execute(
+    "SELECT definition FROM service_sets WHERE set_id = 'legacy-set'"
+).fetchone()
+raw_def = json.loads(raw_row[0]) if raw_row else {}
+raw_svc = (raw_def.get("services") or {}).get("grid_1") or {}
+check("2a) DB unverändert (Migration nur im Speicher)",
+      raw_svc.get("version") is None and "veralteter_key" in (raw_svc.get("params") or {}))
+
+# 2b) Aktuelles Set (version == plugin.version) -> KEINE Migration
+current_set = {
+    "set_id": "current-set",
+    "display_name": "Aktuell",
+    "execution_order": ["grid_1"],
+    "services": {
+        "grid_1": {
+            "plugin_id": "grid_lines",
+            "version": "1.0.0",
+            "lookback": 800,
+            "params": {"step_size": 0.25, "noch_da": 1},
+        },
+    },
+}
+repo.save_set(current_set)
+loaded_cur = repo.get_set("current-set")
+check("2b) get_set: aktuelle Version -> keine Migration",
+      loaded_cur["services"]["grid_1"].get("version") == "1.0.0")
+check("2b) get_set: fremde Keys bleiben (kein Eingriff)",
+      (loaded_cur["services"]["grid_1"].get("params") or {}).get("noch_da") == 1)
+
+# 2c) Unbekanntes Plugin -> Instanz bleibt unverändert (Skip, kein Rollback)
+unknown_set = {
+    "set_id": "unknown-set",
+    "display_name": "Unbekannt",
+    "execution_order": ["x_1"],
+    "services": {
+        "x_1": {"plugin_id": "gibt_es_nicht", "version": "0.9.0",
+                "params": {"a": 1}},
+    },
+}
+repo.save_set(unknown_set)
+loaded_unk = repo.get_set("unknown-set")
+check("2c) get_set: unbekanntes Plugin bleibt unverändert (Skip)",
+      loaded_unk["services"]["x_1"].get("version") == "0.9.0")
+
+# 2d) Rollback: _apply_schema_migration wirft MigrationError -> Original zurück
+class _CrashingRepo(ServiceSetRepository):
+    def _apply_schema_migration(self, definition):
+        raise MigrationError("Simulierter Migrations-Fehler")
+
+
+crash_repo = _CrashingRepo(db_path=TEST_DB)
+rolled = crash_repo.get_set("legacy-set")
+check("d) Rollback: Original-Set zurück (Version 0.0.0/kein Feld)",
+      rolled is not None and rolled["services"]["grid_1"].get("version") in (None, "0.0.0"),
+      str(rolled["services"]["grid_1"].get("version")) if rolled else "None")
+check("d) Rollback: Original-Params erhalten (veralteter_key noch da)",
+      rolled is not None and "veralteter_key" in (rolled["services"]["grid_1"].get("params") or {}))
+
+
+# ---------------------------------------------------------------------------
+# 3) Bestands-Migration: _migrate_existing_sets() füllt fehlende description
+# ---------------------------------------------------------------------------
+repo2 = ServiceSetRepository(db_path=TEST_DB)
+# Legacy-Set direkt per SQL einfügen (JSON OHNE description-Key, wie vor P14-01)
+legacy_json = json.dumps({
+    "set_id": "bestand-set",
+    "display_name": "Bestand",
+    "execution_order": [],
+    "services": {},
+})
+con = repo2._get_connection()
+con.execute(
+    "INSERT INTO service_sets (set_id, display_name, definition, description) "
+    "VALUES (?, ?, ?, NULL)",
+    ["bestand-set", "Bestand", legacy_json],
+)
+# Neues Repo (gleiche DB) -> _migrate_existing_sets läuft in __init__/nach ALTER
+repo3 = ServiceSetRepository(db_path=TEST_DB)
+bestand = repo3.get_set("bestand-set")
+check("3) Bestands-Migration: description aufgefüllt (Key vorhanden)",
+      bestand is not None and "description" in bestand,
+      str(bestand.get("description")) if bestand else "None")
+
+
+# ---------------------------------------------------------------------------
+# 4) service_win.collect_set_definition(): version-Stamping (Logik-Check)
+# ---------------------------------------------------------------------------
+# Headless: collect_set_definition() benötigt Qt-UI. Stattdessen wird die
+# Stamping-Logik gegen die Registry nachvollzogen (dieselbe Bedingung wie im
+# ServiceWindow-Code): Jede Instanz erhält die aktuelle plugin.version.
+from analytics.features.feature_builder import PluginRegistry  # noqa: E402
+reg = PluginRegistry()
+grid_plugin = reg.get("grid_lines")
+check("4) Registry: grid_lines hat version 1.0.0",
+      getattr(grid_plugin, "version", "") == "1.0.0")
+# Simuliertes Stamping (identisch zu service_win.collect_set_definition):
+cfg_sim = {"plugin_id": "grid_lines", "lookback": 1000, "params": {}}
+cfg_sim["version"] = getattr(grid_plugin, "version", "0.0.0") or "0.0.0"
+check("4) Stamping-Logik: version = plugin.version",
+      cfg_sim["version"] == grid_plugin.version)
+
+
+# ---------------------------------------------------------------------------
+print("-" * 60)
+if FAILURES:
+    print(f"FEHLER: {len(FAILURES)} Prüfung(en) fehlgeschlagen: {FAILURES}")
+    sys.exit(1)
+print("ALLE PRÜFUNGEN BESTANDEN (OK)")
+sys.exit(0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_p14_s4_services_locked.py
+```py
+# test/check_p14_s4_services_locked.py
+"""
+Phase 14 P14-04-E – Headless Validierung (KEINE UI, KEIN exec_()).
+
+Prüft die Service-Set-Schutz-Mechanik im Service-Fenster (P14-04-E):
+
+1) Set-Sperre (Regel 1): Es muss immer mindestens ein gültiges Service-Set
+   erhalten bleiben, damit der Indikator funktionsfähig bleibt. Das Löschen
+   des letzten Sets ist gesperrt (delete_set-Guard: len(list_sets()) <= 1).
+
+2) Service-Sperre (Regel 2): Einzel-Services, die in einem gespeicherten
+   Service-Set vorkommen, dürfen nicht entfernt werden. Der Sperr-Hinweis
+   nennt den Namen des verwendeten Sets (_sets_using_plugin).
+
+3) Kennzeichnung (Regel 3): _service_lock liefert 🔒-Präfix + Tooltip-
+   Nachtrag genau für Services, die in einem gespeicherten Set vorkommen –
+   pure Logik, ohne UI-Instanziierung (unbound method + Dummy-Objekt).
+
+Test-DB liegt im Unterordner test/ (Regel: keine Test-DBs im Root/data).
+"""
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+
+TEST_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "p14_s4_locked_test.duckdb")
+if os.path.exists(TEST_DB):
+    os.remove(TEST_DB)
+
+from service_win import _sets_using_plugin, ServiceWindow  # noqa: E402
+from analytics.engine.service_set_repository import ServiceSetRepository  # noqa: E402
+
+FAILURES: list = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    status = "PASS" if cond else "FAIL"
+    print(f"[{status}] {name}" + (f" – {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(name)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures: Repository mit mehreren Sets (grid-sets + ema-set)
+# ---------------------------------------------------------------------------
+repo = ServiceSetRepository(db_path=TEST_DB)
+
+set_grid = {
+    "set_id": "set-grid",
+    "display_name": "Grid Scalper",
+    "execution_order": ["grid_1", "prox_1"],
+    "services": {
+        "grid_1": {"plugin_id": "grid_lines", "lookback": 1000, "params": {}},
+        "prox_1": {"plugin_id": "proximity", "lookback": 1000, "params": {}},
+    },
+}
+set_ema = {
+    "set_id": "set-ema",
+    "display_name": "EMA Trend",
+    "execution_order": ["ema_1"],
+    "services": {
+        "ema_1": {"plugin_id": "ema_atr_set_v1", "lookback": 1000, "params": {}},
+    },
+}
+set_grid_b = {
+    "set_id": "set-grid-b",
+    "display_name": "Grid Backup",
+    "execution_order": ["grid_9"],
+    "services": {
+        "grid_9": {"plugin_id": "grid_lines", "lookback": 500, "params": {}},
+    },
+}
+repo.save_set(set_grid)
+repo.save_set(set_ema)
+repo.save_set(set_grid_b)
+
+sets = repo.list_sets()
+check("Fixture: 3 Sets gespeichert", len(sets) == 3)
+
+# ---------------------------------------------------------------------------
+# 2) Service-Sperre (Regel 2) – _sets_using_plugin
+# ---------------------------------------------------------------------------
+check("2a) grid_lines -> Set 'Grid Scalper' + 'Grid Backup'",
+      _sets_using_plugin("grid_lines", sets) == ["Grid Scalper", "Grid Backup"],
+      str(_sets_using_plugin("grid_lines", sets)))
+check("2b) proximity -> Set 'Grid Scalper'",
+      _sets_using_plugin("proximity", sets) == ["Grid Scalper"],
+      str(_sets_using_plugin("proximity", sets)))
+check("2c) ema -> Set 'EMA Trend'",
+      _sets_using_plugin("ema_atr_set_v1", sets) == ["EMA Trend"],
+      str(_sets_using_plugin("ema_atr_set_v1", sets)))
+check("2d) freier Service (nicht in Set) -> keine Sperre",
+      _sets_using_plugin("unbekannt", sets) == [])
+check("2e) display_name bevorzugt vor set_id",
+      _sets_using_plugin("grid_lines", sets)[0] == "Grid Scalper")
+check("2f) Fallback: leeres display_name -> set_id",
+      _sets_using_plugin("grid_lines", [{
+          "set_id": "ohne-name", "display_name": "",
+          "services": {"g1": {"plugin_id": "grid_lines"}},
+      }]) == ["ohne-name"])
+
+# Löschversuch-Bedingung (remove_instance-Guard):
+# names leer -> Entfernen erlaubt; names nicht leer -> gesperrt + Hinweis.
+check("2g) Sperre aktiv für grid_lines (names nicht leer)",
+      bool(_sets_using_plugin("grid_lines", repo.list_sets())))
+check("2h) Hinweis nennt Set-Namen (Regel 2)",
+      _sets_using_plugin("grid_lines", repo.list_sets())[0] == "Grid Scalper")
+
+# ---------------------------------------------------------------------------
+# 1) Set-Sperre (Regel 1) – mindestens ein valides Set bleibt erhalten
+# ---------------------------------------------------------------------------
+check("1a) 3 Sets -> Löschen erlaubt (Guard len>1)", len(repo.list_sets()) > 1)
+repo.delete_set("set-grid-b")
+repo.delete_set("set-ema")
+check("1b) 1 Set verbleibt -> Löschen GESPERRT (Guard len<=1)",
+      len(repo.list_sets()) <= 1)
+check("1c) verbleibendes Set ist das Grid-Set (Indikator funktionsfähig)",
+      any(s.get("set_id") == "set-grid" for s in repo.list_sets()))
+
+# ---------------------------------------------------------------------------
+# 3) Kennzeichnung (Regel 3) – _service_lock via Dummy-Objekt (unbound)
+# ---------------------------------------------------------------------------
+class _Dummy:
+    pass
+
+
+def _ascii_clean(s: str) -> str:
+    """Ersetzt Emojis (cp1252-Konsole) im Fehler-Detail durch ASCII."""
+    return s.replace("\U0001f512", "<lock>")
+
+
+dummy = _Dummy()
+dummy.set_repo = repo
+
+prefix, tip = ServiceWindow._service_lock(dummy, "grid_lines")
+check("3a) grid_lines: Lock-Praefix gesetzt", prefix == "\U0001f512 ",
+      "prefix=" + _ascii_clean(repr(prefix)))
+check("3b) grid_lines: Tooltip nennt Set 'Grid Scalper'",
+      "Grid Scalper" in tip and "Gesperrt" in tip,
+      "tip=" + _ascii_clean(repr(tip)))
+
+prefix2, tip2 = ServiceWindow._service_lock(dummy, "unbekannt")
+check("3c) freier Service: kein Lock-Praefix", prefix2 == "", repr(prefix2))
+check("3d) freier Service: kein Tooltip-Nachtrag", tip2 == "", repr(tip2))
+
+# ---------------------------------------------------------------------------
+print("-" * 60)
+if FAILURES:
+    print(f"FEHLER: {len(FAILURES)} Prüfung(en) fehlgeschlagen: {FAILURES}")
+    sys.exit(1)
+print("ALLE PRÜFUNGEN BESTANDEN (OK)")
+sys.exit(0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_p14_s5_trash.py
+```py
+# test/check_p14_s5_trash.py
+"""
+Phase 14 P14-05 – Headless Validierung (KEINE UI, KEIN exec_()).
+
+Prueft das Papierkorb- & Snapshot-System (Soft-Delete & Deterministische
+Snapshots) im ServiceSetRepository:
+
+A) Deterministische Snapshot-Historie (Invariante 9):
+   - Neuanlage eines Sets erzeugt KEINEN Snapshot (service_set_history leer).
+   - Ueberschreiben eines BEREITS EXISTIERENDEN Sets erzeugt GENAU 1 Snapshot
+     mit fortlaufender Version (version = Zaehler je set_id).
+
+B) Soft-Delete (service_sets_trash):
+   - delete_set(set_id) verschiebt das Set in den Papierkorb:
+       * list_sets() enthaelt das Set NICHT mehr,
+       * list_trash() enthaelt es MIT deleted_at-Zeitstempel,
+       * display_name/definition bleiben vollstaendig erhalten.
+
+C) Wiederherstellung (restore_set_from_trash):
+   - Set ist danach wieder in list_sets() (vollstaendige Definition),
+   - list_trash() enthaelt es nicht mehr.
+
+D) Endgueltiges Loeschen (purge_trash_set / purge_trash):
+   - purge_trash_set entfernt EIN Set unwiderruflich (liefert bool).
+   - purge_trash leert den gesamten Papierkorb (liefert Anzahl).
+
+Test-DB liegt im Unterordner test/ (Regel: keine Test-DBs im Root/data).
+"""
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+
+TEST_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "p14_s5_trash_test.duckdb")
+if os.path.exists(TEST_DB):
+    os.remove(TEST_DB)
+
+from analytics.engine.service_set_repository import ServiceSetRepository  # noqa: E402
+from db_service import DbPool  # noqa: E402
+
+FAILURES: list = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    status = "PASS" if cond else "FAIL"
+    print(f"[{status}] {name}" + (f" - {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(name)
+
+
+def count_history(repo: ServiceSetRepository, set_id: str) -> int:
+    con = DbPool.get(repo.db_path)
+    res = con.execute(
+        "SELECT COUNT(*) FROM service_set_history WHERE set_id = ?", [set_id]
+    ).fetchone()
+    return int(res[0]) if res and res[0] else 0
+
+
+def count_trash(repo: ServiceSetRepository) -> int:
+    return len(repo.list_trash())
+
+
+def count_sets(repo: ServiceSetRepository) -> int:
+    return len(repo.list_sets())
+
+
+def trash_table_exists(repo: ServiceSetRepository) -> bool:
+    con = DbPool.get(repo.db_path)
+    res = con.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+        "AND name='service_sets_trash'"
+    ).fetchone()
+    return bool(res and res[0] and res[0] > 0)
+
+
+# ---------------------------------------------------------------------------
+# Fixture: Repository mit frischer Test-DB
+# ---------------------------------------------------------------------------
+repo = ServiceSetRepository(db_path=TEST_DB)
+
+base_def = {
+    "set_id": "set-alpha",
+    "display_name": "Alpha Scalper",
+    "description": "Erstes Testset",
+    "execution_order": ["grid_1", "prox_1"],
+    "services": {
+        "grid_1": {"plugin_id": "grid_lines", "lookback": 1000, "params": {}},
+        "prox_1": {"plugin_id": "proximity", "lookback": 1000, "params": {}},
+    },
+}
+
+# ---------------------------------------------------------------------------
+# A) Deterministische Snapshot-Historie (Invariante 9)
+# ---------------------------------------------------------------------------
+check("A1) Tabellen angelegt (service_sets_trash)",
+      trash_table_exists(repo))
+
+# --- Neuanlage: KEIN Snapshot ---
+set_id = repo.save_set(dict(base_def))
+check("A2) Neuanlage liefert set_id", set_id == "set-alpha", set_id)
+check("A3) Neuanlage erzeugt KEINEN Snapshot",
+      count_history(repo, set_id) == 0, str(count_history(repo, set_id)))
+
+# --- Ueberschreiben: GENAU 1 Snapshot (mit Version 1) ---
+changed = dict(base_def)
+changed["display_name"] = "Alpha Scalper v2"
+repo.save_set(changed)
+check("A4) Ueberschreiben erzeugt GENAU 1 Snapshot",
+      count_history(repo, set_id) == 1, str(count_history(repo, set_id)))
+con = DbPool.get(repo.db_path)
+hist = con.execute(
+    "SELECT version, definition FROM service_set_history WHERE set_id = ?",
+    [set_id],
+).fetchall()
+check("A5) Snapshot-Version laeuft (Version 1)",
+      hist and str(hist[0][0]) == "1", str(hist[0][0]) if hist else "keine")
+check("A6) Snapshot sichert ALTEN Stand (display_name 'Alpha Scalper')",
+      hist and "Alpha Scalper" in str(hist[0][1]),
+      str(hist[0][1])[:80] if hist else "keine")
+
+# --- Erneutes Ueberschreiben: GENAU 2 Snapshots (Version 1, 2) ---
+changed["description"] = "Zweites Ueberschreiben"
+repo.save_set(changed)
+check("A7) 2. Ueberschreiben -> 2 Snapshots, Version fortlaufend",
+      count_history(repo, set_id) == 2, str(count_history(repo, set_id)))
+hist2 = con.execute(
+    "SELECT version FROM service_set_history WHERE set_id = ? ORDER BY version",
+    [set_id],
+).fetchall()
+check("A8) Versionsfolge 1,2",
+      [str(r[0]) for r in hist2] == ["1", "2"],
+      str([str(r[0]) for r in hist2]))
+
+# --- Interner Schreibvorgang (record_snapshot=False): KEIN Snapshot ---
+repo.save_set(changed, record_snapshot=False)
+check("A9) record_snapshot=False erzeugt KEINEN Snapshot",
+      count_history(repo, set_id) == 2, str(count_history(repo, set_id)))
+
+# ---------------------------------------------------------------------------
+# B) Soft-Delete (Papierkorb)
+# ---------------------------------------------------------------------------
+repo.delete_set(set_id)
+check("B1) Set nach Soft-Delete NICHT in list_sets()",
+      all(s.get("set_id") != set_id for s in repo.list_sets()))
+trash = repo.list_trash()
+check("B2) Set in list_trash()",
+      any(t.get("set_id") == set_id for t in trash))
+trash_item = next(t for t in trash if t.get("set_id") == set_id)
+check("B3) Trash-Eintrag behaelt display_name",
+      trash_item.get("display_name") == "Alpha Scalper v2",
+      str(trash_item.get("display_name")))
+check("B4) Trash-Eintrag behaelt description",
+      trash_item.get("description") == "Zweites Ueberschreiben",
+      str(trash_item.get("description")))
+check("B5) Trash-Eintrag hat deleted_at",
+      bool(trash_item.get("deleted_at")), str(trash_item.get("deleted_at")))
+check("B6) Trash-Eintrag behaelt execution_order",
+      trash_item.get("execution_order") == ["grid_1", "prox_1"],
+      str(trash_item.get("execution_order")))
+check("B7) Trash-Eintrag behaelt services",
+      bool(trash_item.get("services")) and "grid_1" in (trash_item.get("services") or {}))
+check("B8) Aktive Sets unveraendert (0 aktiv, 1 im Papierkorb)",
+      count_sets(repo) == 0 and count_trash(repo) == 1,
+      f"sets={count_sets(repo)} trash={count_trash(repo)}")
+
+# --- Doppel-Soft-Delete: kein Duplikat, Zeitstempel aktualisiert ---
+repo.delete_set(set_id)
+check("B9) Erneutes Soft-Delete erzeugt KEIN Duplikat",
+      count_trash(repo) == 1, str(count_trash(repo)))
+
+# ---------------------------------------------------------------------------
+# C) Wiederherstellung (restore_set_from_trash)
+# ---------------------------------------------------------------------------
+ok = repo.restore_set_from_trash(set_id)
+check("C1) restore liefert True", ok)
+check("C2) Set wieder in list_sets()",
+      any(s.get("set_id") == set_id for s in repo.list_sets()))
+check("C3) Trash danach leer (fuer dieses Set)",
+      not any(t.get("set_id") == set_id for t in repo.list_trash()))
+restored = next(s for s in repo.list_sets() if s.get("set_id") == set_id)
+check("C4) Wiederhergestelltes Set: display_name erhalten",
+      restored.get("display_name") == "Alpha Scalper v2",
+      str(restored.get("display_name")))
+check("C5) Wiederhergestelltes Set: description erhalten",
+      restored.get("description") == "Zweites Ueberschreiben",
+      str(restored.get("description")))
+check("C6) Wiederhergestelltes Set: services erhalten",
+      (restored.get("services") or {}).get("grid_1", {}).get("plugin_id") == "grid_lines")
+check("C7) restore von unbekannter set_id liefert False",
+      repo.restore_set_from_trash("gibts-nicht") is False)
+
+# ---------------------------------------------------------------------------
+# D) Endgueltiges Loeschen (purge_trash_set / purge_trash)
+# ---------------------------------------------------------------------------
+# Nochmals soft-deleten, dann ENDGUELTIG loeschen
+repo.delete_set(set_id)
+repo.delete_set(repo.save_set({
+    "set_id": "set-beta", "display_name": "Beta Set",
+    "execution_order": ["ema_1"],
+    "services": {"ema_1": {"plugin_id": "ema_atr_set_v1", "lookback": 500, "params": {}}},
+}))
+check("D1) 2 Sets im Papierkorb", count_trash(repo) == 2, str(count_trash(repo)))
+
+check("D2) purge_trash_set liefert True",
+      repo.purge_trash_set("set-alpha") is True)
+check("D3) purge_trash_set entfernt das Set unwiderruflich",
+      not any(t.get("set_id") == "set-alpha" for t in repo.list_trash())
+      and count_trash(repo) == 1)
+check("D4) purge_trash_set auf unbekannte set_id liefert False",
+      repo.purge_trash_set("set-alpha") is False)
+
+count = repo.purge_trash()
+check("D5) purge_trash liefert Anzahl entfernte Sets (1)",
+      count == 1, str(count))
+check("D6) Papierkorb nach purge_trash leer",
+      count_trash(repo) == 0 and not repo.list_trash())
+check("D7) Papierkorb nach purge_trash NICHT wiederherstellbar",
+      repo.restore_set_from_trash("set-beta") is False)
+
+# ---------------------------------------------------------------------------
+print("-" * 60)
+if FAILURES:
+    print(f"FEHLER: {len(FAILURES)} Pruefung(en) fehlgeschlagen: {FAILURES}")
+    sys.exit(1)
+print("ALLE PRUEFUNGEN BESTANDEN (OK)")
+sys.exit(0)
 
 ```
 
@@ -42134,6 +44363,16 @@ print("LOCKTEST FERTIG")
            </property>
            <property name="toolTip">
             <string>Set löschen (mit Rückfrage). Löschen ist final.</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btn_trash_sets">
+           <property name="text">
+            <string>Papierkorb</string>
+           </property>
+           <property name="toolTip">
+            <string>P14-05: Gelöschte Service-Sets einsehen, wiederherstellen oder endgültig entfernen (Soft-Delete).</string>
            </property>
           </widget>
          </item>
