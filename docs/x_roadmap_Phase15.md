@@ -231,7 +231,31 @@ der Entfernung des Alt-Grid-Indikators + abgeleitete Kapitel-Arbeiten (15.1–15
   * `check_p13_ui_plugins.py` [4]+[11]: Instanz-Platzhalter-Auswahl (P14-01,
     mehrere placeholderText) + Stack-Count 2 statt 3 (P14-01: keine
     Plugin-Live-Seite 0).
-- [ ] **U15-D2** Bedien-Feinschliff: offen für User-Vorgaben (Sammelliste während 15.1).
+- [x] **U15-D2** Bedien-Feinschliff: offen für User-Vorgaben (Sammelliste während 15.1).
+  **Umgesetzt (04.08.2026, User-Vorgabe „Alle Punkte nacheinander"):**
+  * **(1) Doppeltes Ausführen eines Sets verhindern (Button-Lock):** Der Guard
+    (`_set_run_worker.isRunning()` → „Set-Ausführung läuft bereits.") bestand
+    bereits; zusätzlich zeigt `btn_execute_set` jetzt während der Laufzeit
+    „Läuft..." (deaktiviert) und nach `run_finished`/`run_failed` wieder
+    „Ausführen" (aktiviert).
+  * **(2) Set-Dropdown lädt nach Löschen/Umbenennen automatisch das nächste
+    gültige Set:** war bereits über die generische Mechanik implementiert
+    (`delete_named_item` → `_item_select(None)` → `refresh_set_list()` lädt das
+    erste verbleibende Set; nach Umbenennen wird das gespeicherte Set
+    selektiert) – per Headless-Test verifiziert, keine Code-Änderung nötig.
+  * **(3) Log-Bereich:** `log()` scrollt jetzt automatisch ans Log-Ende
+    (`verticalScrollBar().setValue(maximum())`); Kontext-Rechtsklick
+    (CustomContextMenu) mit „Kopieren" (nur bei Textauswahl) und
+    „Log leeren" (`_on_log_context_menu`).
+  * **(4) Bestätigungsdialog vor Voll-Scan:** Bei `new_scan=True`
+    (FULL SCAN = bestehende Signale werden gelöscht, unwiderruflich) fragt
+    `start_scan` per `QMessageBox.question` nach (Default: No). Delta-Scan
+    (`new_scan=False`) startet ohne Rückfrage.
+  **Validierung:** py_compile OK; alle 5 betroffenen Headless-Checks BESTANDEN
+  (`check_p13_s4.py`, `check_p13_ui_plugins.py`, `check_p14_s4_services_locked.py`,
+  `check_p14_precision_levels.py`, `check_p13_service_win_geometry.py`) plus
+  gezielte U15-D2-Headless-Verifikation (Button-Lock, Set-Nachladen, Auto-Scroll,
+  Scan-Bestätigung: 14/14 PASS).
 
 ---
 

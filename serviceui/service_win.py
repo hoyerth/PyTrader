@@ -28,8 +28,8 @@ from PySide6.QtCore import QFile, QIODevice, QTimer, Qt, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMessageBox, QProgressBar, QPushButton,
-    QTextEdit, QWidget,
+    QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar,
+    QPushButton, QTextEdit, QWidget,
 )
 
 from analytics.background_workers.historical_scanner import HistoricalScanner
@@ -212,6 +212,12 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         if self.btn_execute_set:
             self.btn_execute_set.clicked.connect(self.execute_set)
 
+        # U15-D2 (Bedien-Feinschliff): Log-Kontextmenü (Kopieren / Log leeren)
+        # + Auto-Scroll ans Ende in log() – siehe _on_log_context_menu().
+        if self.text_log:
+            self.text_log.setContextMenuPolicy(Qt.CustomContextMenu)
+            self.text_log.customContextMenuRequested.connect(self._on_log_context_menu)
+
         # Sofort speichern bei Symbol-Änderung
         if self.combo_symbol:
             self.combo_symbol.currentTextChanged.connect(self.save_state)
@@ -281,6 +287,22 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         new_scan = self.check_new_scan.isChecked() if self.check_new_scan else False
         grid_scan = self.check_grid_scan.isChecked() if self.check_grid_scan else False
 
+        # U15-D2 (Bedien-Feinschliff): Bestätigungsdialog vor FULL SCAN.
+        # new_scan=True löscht bestehende Signale und berechnet neu
+        # (HistoricalScanner: "Modus: FULL SCAN ... werden geloescht") –
+        # dieser Overwrite ist unwiderruflich, daher Rückfrage.
+        if new_scan:
+            reply = QMessageBox.question(
+                self, "Voll-Scan bestätigen",
+                f"Voll-Scan für {symbol}?\n\n"
+                "Bestehende Signale werden GELÖSCHT und neu berechnet "
+                "(unwiderruflich). Fortfahren?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                self.log("Voll-Scan abgebrochen.")
+                return
+
         mode = "GRID PROXIMITY" if grid_scan else "EMA+ATR STANDARD"
         self.log(f"Starte {mode}-Scan: {symbol}, New Scan = {new_scan}")
         self.btn_start.setEnabled(False)
@@ -311,6 +333,30 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
     def log(self, message: str):
         if self.text_log:
             self.text_log.append(message)
+            # U15-D2 (Bedien-Feinschliff): Auto-Scroll ans Log-Ende, damit
+            # bei langen Scans immer die neueste Meldung sichtbar ist.
+            bar = self.text_log.verticalScrollBar()
+            if bar is not None:
+                bar.setValue(bar.maximum())
+
+    def _on_log_context_menu(self, pos) -> None:
+        """U15-D2 (Bedien-Feinschliff): Kontext-Rechtsklick im Log-Bereich.
+
+        Aktionen: 'Kopieren' (nur bei vorhandener Textauswahl) und
+        'Log leeren'. Reine QTextEdit-Operationen (copy/clear), keine
+        Logik-Duplikate.
+        """
+        if not self.text_log:
+            return
+        menu = QMenu(self)
+        copy_action = menu.addAction("Kopieren")
+        copy_action.setEnabled(bool(self.text_log.textCursor().hasSelection()))
+        clear_action = menu.addAction("Log leeren")
+        chosen = menu.exec(self.text_log.mapToGlobal(pos))
+        if chosen == copy_action:
+            self.text_log.copy()
+        elif chosen == clear_action:
+            self.text_log.clear()
 
     def _update_elapsed(self):
         self._elapsed_seconds += 1
@@ -783,7 +829,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         timeframe = self.combo_tf_set.currentText() if self.combo_tf_set else "H1"
 
         if self.btn_execute_set:
+            # U15-D2 (Bedien-Feinschliff): sichtbarer Button-Lock – der
+            # Button wird deaktiviert und zeigt 'Läuft...', solange der
+            # Worker aktiv ist (verhindert doppeltes Ausführen).
             self.btn_execute_set.setEnabled(False)
+            self.btn_execute_set.setText("Läuft...")
         self._set_run_worker = ServiceSetRunWorker(
             self.set_evaluator, symbol, timeframe, definition, parent=self,
         )
@@ -796,12 +846,14 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
     def _on_set_run_finished(self, set_id: str, count: int) -> None:
         if self.btn_execute_set:
             self.btn_execute_set.setEnabled(True)
+            self.btn_execute_set.setText("Ausführen")
         self.log(f"Set-Ausführung abgeschlossen: {count} Services.")
 
     @Slot(str, str)
     def _on_set_run_failed(self, set_id: str, error: str) -> None:
         if self.btn_execute_set:
             self.btn_execute_set.setEnabled(True)
+            self.btn_execute_set.setText("Ausführen")
         self.log(f"FEHLER bei Set-Ausführung: {error}")
 
     def closeEvent(self, event):

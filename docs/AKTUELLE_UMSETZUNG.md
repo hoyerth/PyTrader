@@ -87,13 +87,15 @@ etablierten Plugin-/Service-Architektur (Phasen 12–14):
   / future.
 - [x] **U15-D1** `service_win.py` modularisiert in den **neuen Unterordner
   `serviceui/`** (inkl. `service_win.py` selbst) – Details siehe §5.
+- [x] **U15-D2** Bedien-Feinschliff umgesetzt (Details Roadmap §4 D):
+  Button-Lock bei Set-Ausführung, Set-Nachladen nach Löschen (verifiziert),
+  Log-Auto-Scroll + Kontextmenü (Kopieren/Leeren), Voll-Scan-Bestätigung.
 
 ### 3.2 Noch offen (Reihenfolge)
 
-1. **U15-D2** Bedien-Feinschliff: offen für User-Vorgaben (Sammelliste während
-   15.1).
-2. Headless-Validierung (py_compile + gezielte Tests) + Commit(s) mit Tags
-   `phase15_stepN`.
+1. Headless-Validierung (py_compile + gezielte Tests) + Commit(s) mit Tags
+   `phase15_stepN` – der aktuelle Stand ist validiert und wird als
+   `phase15_step3` committet.
 
 ### 3.3 Legacy-Tabellen (U15-C3 – Entscheidung)
 
