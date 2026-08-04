@@ -13,13 +13,20 @@ from PySide6.QtCore import QFile, QIODevice, QTimer, Slot
 from PySide6.QtGui import QColor
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QHeaderView, QLabel, QMainWindow,
+    QApplication, QComboBox, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
     QPushButton, QTableWidget, QTableWidgetItem, QWidget,
 )
 
 from analytics.statistics_repository import StatisticsRepository
 from persistent_win import PersistentWindow, register_persistent_window
 from state_manager import StateManager
+
+# Phase 15 15.01-Nachtrag 4: Favoriten-Symbol-Verwaltung im Statistik-Fenster
+# (★-Button oeffnet das SymbolsWindow; Symbol-Filter-Dropdown zeigt
+# 'ALLE' + Favoriten, EventBus-Kopplung analog Chart-/ServiceWindow).
+from config.event_bus import event_bus
+from symbol_repository import SymbolRepository, get_symbol_repository
+from serviceui.symbols_win import SymbolsWindow
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -83,6 +90,28 @@ class StatisticWindow(PersistentWindow):
         if self.table:
             self.table.itemDoubleClicked.connect(self.on_item_double_clicked)
 
+        # Phase 15 15.01-Nachtrag 4 (User-Notiz 04.08.2026): Favoriten-Symbol-
+        # Verwaltung im Statistik-Fenster – ★-Button rechts neben der Symbol-
+        # Filter-ComboBox oeffnet das nicht-modale SymbolsWindow (analog
+        # Chart-/ServiceWindow). Das Symbol-Filter-Dropdown zeigt 'ALLE' +
+        # Favoriten (Fallback auf Default-Symbole); die aktuelle Auswahl bleibt
+        # erhalten, damit der Filter nicht ungewollt umspringt. EventBus-
+        # Kopplung: Favoriten-Aenderungen -> Dropdown neu befuellen.
+        self._symbol_repo: SymbolRepository = get_symbol_repository()
+        self.btn_symbol_fav: QPushButton = QPushButton("★", self.ui)
+        self.btn_symbol_fav.setObjectName("btn_symbol_fav")
+        self.btn_symbol_fav.setToolTip(
+            "Favoriten verwalten – oeffnet das Symbol-Fenster. "
+            "Das Symbol-Filter-Dropdown zeigt 'ALLE' + Favoriten.")
+        self.btn_symbol_fav.setFixedSize(28, 28)
+        layout_filter = self.ui.findChild(QHBoxLayout, "horizontalLayout_filter")
+        if layout_filter is not None and self.combo_symbol is not None:
+            idx = layout_filter.indexOf(self.combo_symbol)
+            layout_filter.insertWidget(idx + 1, self.btn_symbol_fav)
+        self.btn_symbol_fav.clicked.connect(self.open_symbols_window)
+        event_bus.favorites_changed.connect(self._refresh_symbol_combo)
+        self._refresh_symbol_combo()
+
         # State asynchron wiederherstellen (nach show(), damit move/resize vom Window-Manager akzeptiert werden)
         QTimer.singleShot(0, self.restore_state)
 
@@ -126,6 +155,51 @@ class StatisticWindow(PersistentWindow):
             self.combo_symbol.blockSignals(False)
         if self.combo_tf:
             self.combo_tf.blockSignals(False)
+
+    # --- Phase 15 15.01-Nachtrag 4: Symbol- & Favoriten-Verwaltung ---
+
+    @Slot()
+    def open_symbols_window(self) -> None:
+        """Oeffnet das nicht-modale SymbolsWindow (Singleton-Verhalten).
+
+        Analog zu chart_win/service_win: Existiert bereits eine sichtbare
+        Instanz, wird sie in den Vordergrund geholt statt neu geoeffnet
+        (PersistentWindow.get_existing_instance()).
+        """
+        existing = SymbolsWindow.get_existing_instance()
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
+        win = SymbolsWindow(self)  # parent=self nur fuer state_manager-Zugriff
+        win.show()
+
+    def _refresh_symbol_combo(self) -> None:
+        """Befuellt die Symbol-Filter-ComboBox: 'ALLE' + Favoriten.
+
+        Wird beim Start und bei jedem `EventBus.favorites_changed`-Event
+        aufgerufen (Verbindung im __init__). Fallback auf die Standard-
+        Defaults (SILVER/GOLD/BTCUSD), falls keine Favoriten gesetzt sind.
+        Die aktuelle Auswahl bleibt erhalten (auch wenn sie kein Favorit
+        mehr ist), damit der Filter nicht ungewollt umspringt. Signale sind
+        waehrend des Umbaus blockiert (kein Refresh-Explosion).
+        """
+        if not self.combo_symbol:
+            return
+        favorites = self._symbol_repo.get_favorite_symbols()
+        if not favorites:
+            favorites = list(SymbolRepository.DEFAULT_SYMBOLS)
+        current = self.combo_symbol.currentText()
+        self.combo_symbol.blockSignals(True)
+        self.combo_symbol.clear()
+        self.combo_symbol.addItem("ALLE")
+        for sym in favorites:
+            self.combo_symbol.addItem(sym)
+        if current and current != "ALLE" and current not in favorites:
+            self.combo_symbol.addItem(current)
+        idx = self.combo_symbol.findText(current)
+        self.combo_symbol.setCurrentIndex(idx if idx >= 0 else 0)
+        self.combo_symbol.blockSignals(False)
 
     # --- Paging ---
 

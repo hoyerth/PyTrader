@@ -171,7 +171,20 @@ Zusätzlich: `py_compile` auf allen neuen/geänderten Dateien (Exit 0) und Impor
 
 **Validierung:** `py_compile` auf allen geänderten Dateien (Exit 0), `test/check_p15_s1_symbols.py` weiterhin **30/30 PASS** (Repository-API unverändert – der Test prüft Logik/DB, nicht das Fenster), Import-Smoke-Test (`main`, `symbols_win`, `grid_liquidity` importierbar). Keine UI-/Regressionstests (Regel 4).
 
-### 3.9 Offene Punkte / nächste Schritte
+### 3.9 Nachtrag 4 – ★-Favoriten-Button & Favoriten-Dropdown im Statistik-Fenster (User-Notiz 04.08.2026)
+
+**Problem (handschriftliche User-Notiz in der Roadmap):** „auch hier in der Kopzeile die Symbolauswahl mit Favoriten-Button einbauen" – nach Chart-Fenster (3.7) und Service-Fenster (3.4) fehlte der ★-Favoriten-Button im `StatisticWindow` (`statistic_win.py`, `win_statistics`).
+
+**Lösung (additiv, `statistic_win.py`):**
+* **`btn_symbol_fav` (`★`)** wird programmatisch in `horizontalLayout_filter` (Kopfzeile) direkt rechts neben `combo_symbol_filter` eingefügt (keine `.ui`-Änderung; 28×28 px, gleiche Optik wie Chart/Service).
+* Klick öffnet das nicht-modale `SymbolsWindow` (Singleton via `get_existing_instance()`, identisch zu Chart/Service).
+* **Favoriten-Dropdown:** `_refresh_symbol_combo()` befüllt `combo_symbol` mit **`ALLE` + Favoriten** (`get_favorite_symbols()`, Fallback auf `DEFAULT_SYMBOLS`). `ALLE` bleibt erster Eintrag (Standard-/Default-Filter der Statistik, `get_summary("ALLE")`). Die **aktuelle Auswahl bleibt in der Liste** (auch wenn sie kein Favorit mehr ist), damit der Filter nicht ungewollt umspringt. Signale sind beim Umbau blockiert (kein Refresh-Explosion durch `_on_filter_changed`).
+* **EventBus-Kopplung:** `event_bus.favorites_changed` → `_refresh_symbol_combo()` (beim Start + bei jeder Favoriten-Änderung).
+* **Keine zirkulären Importe:** `statistic_win` importiert `config.event_bus`, `symbol_repository`, `serviceui.symbols_win` – keines davon importiert `statistic_win`.
+
+**Validierung:** `py_compile` (Exit 0) + Import-Smoke-Test (`statistic_win`, `main` importierbar). Keine UI-/Regressionstests (Regel 4).
+
+### 3.10 Offene Punkte / nächste Schritte
 
 * **15.02:** Service-UI-Refactoring & Master-Tree (nächste Phase).
 * **15.03:** `AnalyticsWindow` – dort wird die Favoriten-Dropdown-Kopplung (Punkt 3.4) und der `EventBus`-Empfang ergänzt.
