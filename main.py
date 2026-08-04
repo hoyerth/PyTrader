@@ -41,7 +41,7 @@ from db_service import get_timeframes, TF_SECONDS_MAP, MT5_LOCK, DbPool
 import db_service
 from symbol_repository import get_symbol_repository
 from serviceui.service_win import ServiceWindow
-from statistic_win import StatisticWindow
+from analytics.ui.analytics_win import AnalyticsWindow
 from properties_win import PropertiesWindow
 from config.app_settings import AppSettings
 from analytics.background_workers.live_analyzer import LiveAnalyzer
@@ -226,7 +226,7 @@ class MainWindow(QMainWindow):
 
         self.btn_statistics: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_statistics")
         if self.btn_statistics:
-            self.btn_statistics.clicked.connect(self.open_statistic_window)
+            self.btn_statistics.clicked.connect(self.open_analytics_window)
 
         self.btn_properties: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_properties")
         if self.btn_properties:
@@ -433,14 +433,16 @@ class MainWindow(QMainWindow):
         self.persistent_sub_windows.append(win)
         win.show()
 
-    def open_statistic_window(self) -> None:
+    def open_analytics_window(self) -> None:
+        # Phase 15 15.03: Statistik-Fenster durch AnalyticsWindow ersetzt
+        # (win_statistics-Persistenz wird per E-2 nach win_analytics migriert).
         # Singleton: Bestehendes Fenster in den Vordergrund holen
-        existing = StatisticWindow.get_existing_instance()
+        existing = AnalyticsWindow.get_existing_instance()
         if existing is not None:
             existing.raise_()
             existing.activateWindow()
             return
-        win = StatisticWindow(self)  # parent=self nur für state_manager-Zugriff
+        win = AnalyticsWindow(self)  # parent=self nur für state_manager-Zugriff
         self.persistent_sub_windows.append(win)
         win.show()
 
@@ -588,7 +590,7 @@ class MainWindow(QMainWindow):
         )
 
         # Alle offenen PersistentWindow-Instanzen speichern und schliessen
-        # (ServiceWindow, StatisticWindow, etc. - haben keinen Qt-Parent mehr,
+        # (ServiceWindow, AnalyticsWindow, etc. - haben keinen Qt-Parent mehr,
         #  daher muessen sie explizit geschlossen werden)
         from persistent_win import _open_windows as pw_open_windows
         for sub_win in list(pw_open_windows):

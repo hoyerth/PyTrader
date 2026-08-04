@@ -383,6 +383,94 @@ class FeatureStoreReader:
             "total_rows": total,
         }
 
+    # ------------------------------------------------------------------
+    # Lesen: Jump-to-Chart-Helfer (15.03 Schritt 5, open_chart_at_bar)
+    # ------------------------------------------------------------------
+    def fetch_latest_bar_time(
+        self,
+        symbol: str,
+        timeframe: str,
+        feature_id: Optional[str] = None,
+    ) -> Optional[int]:
+        """Neuester Wanduhr-Epoch (int) der Feature-Rows (oder None).
+
+        Wird fuer 'Jump-to-Chart' (Variante 2) aus Scatter/Heatmap genutzt:
+        Ein Klick auf einen Punkt/eine Zelle oeffnet das Chart-Fenster an der
+        zugehoerigen Bar-Position. Wanduhr-Garantie: EXTRACT('epoch') liefert
+        exakt die gespeicherte Wanduhr-Epoch (Invariante 7).
+        """
+        if not symbol or not timeframe:
+            return None
+        conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
+        params: List[Any] = [symbol, timeframe]
+        if feature_id:
+            conditions.append("feature_id = ?")
+            params.append(feature_id)
+        con = self._get_connection()
+        try:
+            row = con.execute(f"""
+                SELECT EXTRACT('epoch' FROM MAX(bar_time))::BIGINT
+                FROM feature_store
+                WHERE {' AND '.join(conditions)}
+            """, params).fetchone()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_latest_bar_time "
+                  f"fehlgeschlagen: {e}")
+            return None
+        if row and row[0] is not None:
+            return int(row[0])
+        return None
+
+    def fetch_recent_bar_time_for_cell(
+        self,
+        symbol: str,
+        timeframe: str,
+        dow: int,
+        hour: int,
+        feature_id: Optional[str] = None,
+    ) -> Optional[int]:
+        """Neuester Wanduhr-Epoch einer (dow, hour)-Heatmap-Zelle (oder None).
+
+        Jump-to-Chart aus der Heatmap: Ein Doppelklick auf eine Zelle
+        (Wochentag x Tagesstunde) oeffnet das Chart an der neuesten
+        Feature-Bar dieser Zelle. DOW/HOUR werden mit
+        `bar_time AT TIME ZONE 'UTC'` extrahiert (Wanduhr-Garantie,
+        Invariante 7 – identisch zu fetch_heatmap).
+        """
+        if not symbol or not timeframe:
+            return None
+        try:
+            dow = int(dow)
+            hour = int(hour)
+        except (TypeError, ValueError):
+            return None
+        if not (0 <= dow < DAYS_PER_WEEK and 0 <= hour < HOURS_PER_DAY):
+            return None
+        conditions = [
+            "LOWER(symbol) = LOWER(?)",
+            "LOWER(timeframe) = LOWER(?)",
+            "EXTRACT(DOW FROM bar_time AT TIME ZONE 'UTC')::INTEGER = ?",
+            "EXTRACT(HOUR FROM bar_time AT TIME ZONE 'UTC')::INTEGER = ?",
+        ]
+        params: List[Any] = [symbol, timeframe, dow, hour]
+        if feature_id:
+            conditions.append("feature_id = ?")
+            params.append(feature_id)
+        con = self._get_connection()
+        try:
+            row = con.execute(f"""
+                SELECT EXTRACT('epoch' FROM MAX(bar_time))::BIGINT
+                FROM feature_store
+                WHERE {' AND '.join(conditions)}
+            """, params).fetchone()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_recent_bar_time_for_cell "
+                  f"fehlgeschlagen: {e}")
+            return None
+        if row and row[0] is not None:
+            return int(row[0])
+        return None
+
     def exists(self) -> bool:
         """True, wenn die analytics.duckdb-Datei existiert."""
         return os.path.exists(self.db_path)

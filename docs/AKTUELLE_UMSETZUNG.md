@@ -178,3 +178,38 @@ Zusätzlich: `py_compile` auf Reader, Repository und Test (Exit 0). Keine UI-/Re
 | D ViewModel asynchron | D1–D7 | Debounce+Worker-Thread → data_ready aller 5 Kinds, Heatmap-Daten, `busy_changed` True/False, keine query_failed |
 
 Zusätzlich: `py_compile` auf Worker, ViewModel und Test (Exit 0); bestehende Tests `check_p15_s3_profiles.py` (30/30) und `check_p15_s3_reader_repo.py` (39/39) weiterhin PASS (reine Additions, keine Bestandsdatei veraendert). Keine UI-/Regressionstests (Regel 4).
+
+### 3.5 Schritt 5 – UI-Pages, `analytics_win.py` & `main.py`-Ersatz
+
+**`analytics/ui/` (NEU, Ordner):**
+* `common.py` – gemeinsame UI-Helfer: `format_wanduhr_time(epoch)` (**Wanduhr-Formatierung Invariante 7:** `fromtimestamp(epoch, tz=utc)` ohne Berlin-Offset, DST-robust) und `make_overlay_stack()` („No Data"-Overlay via `QStackedLayout`, Index 0 = Inhalt / 1 = Overlay).
+* `table_page.py` – `TablePage`: Feature-Store-Tabelle (Zeit-Wanduhr, Symbol, TF, Feature, Version, ema_diff/rsi_14/atr_normalized), Doppelklick → **Jump-to-Chart** (Variante 2, `open_chart_at_bar`).
+* `heatmap_page.py` – `HeatmapPage`: pyqtgraph `ImageItem` (24×7, X: Wochentage, Y: Tagesstunden Berlin Wanduhr) + `ColorBarItem` (viridis), Metrik-Dropdown (count/native Spalten); **Doppelklick auf eine Zelle** → neuester Bar der (dow, hour)-Zelle (Aufloesung über den ViewModel).
+* `scatter_page.py` – `ScatterPage`: pyqtgraph `ScatterPlotItem` (X/Y-Dropdowns aus `native_columns`); **Klick auf einen Punkt** → neuester Bar des Symbol/TF.
+* `distribution_page.py` – `DistributionPage`: pyqtgraph `BarGraphItem`-Histogramm, Spalten-Dropdown + **bins-Slider (2–100, Debounce über den ViewModel-QTimer 250 ms)**.
+* `equity_page.py` – `EquityPage`: Platzhalter mit dauerhaftem „No Data"-Overlay („Equity-Analyse: noch keine Daten vorhanden (geplant für eine spätere Phase)"); Plot-Bereich reserviert, keine Datenabfrage (noch kein query_kind).
+
+**`analytics/ui/analytics_win.py` (NEU):** `AnalyticsWindow` – `PersistentWindow`, `INSTANCE_ID = "win_analytics"`, **1280 × 800**, nicht-modal, `@register_persistent_window()` (Auto-Restore beim App-Start).
+* **Top-Bar CRUD (Option B – Explicit Save):** Profil-Combo („– kein Profil –" bei leer), Name-/Beschreibungs-Edit, Buttons `Neu` (QInputDialog), `💾 Save` (update name/desc + `save_profile`), `Löschen` (QMessageBox-Rückfrage); **Dirty-Flag `*`** im Fenstertitel + Status-Label; indeterminierter **Progress-Busy-Bar** (`busy_changed`).
+* **Filter-Zeile:** Symbol-Combo (Favoriten + ★-SymbolsWindow, `EventBus.favorites_changed`), Timeframe-Combo (M1…D1), Feature-Combo („Alle" + `feature_ids` aus `QUERY_FEATURES`), **Limit-SpinBox (1…`MAX_LOOKBACK_LIMIT`)**.
+* **Sidebar-Navigation:** `QListWidget` (Tabelle/Heatmap/Scatter/Verteilung/Equity) + `QStackedWidget`; Seitenwechsel ruft `request_data()` der aktiven Page.
+* **MVVM-Wiring:** `AnalyticsViewModel` (parent=self), `data_ready` → Pages + Feature-Combo, `query_failed` → Log, Jump-to-Chart-Handler/Resolver an die Pages.
+* **E-2-Migration:** `migrate_statistics_persistence(state_manager)` kopiert **Fenstergeometrie + Instanz-Zustand** von `win_statistics` nach `win_analytics` (nur wenn `win_analytics` noch leer; Alt-Einträge werden entfernt; idempotent). Hinweis: Die Kapselung in `window_state_repository.py` folgt in 15.04 (E-2); bis dahin nutzt die Migration das StateManager-Interface.
+* `closeEvent()` ruft `vm.shutdown()` (Debounce + Worker stoppen).
+
+**`main.py` (Anpassung):** `from statistic_win import StatisticWindow` → `from analytics.ui.analytics_win import AnalyticsWindow`; `open_statistic_window()` → `open_analytics_window()` (Singleton, `AnalyticsWindow.get_existing_instance()`); `btn_statistics`-Button öffnet nun das AnalyticsWindow. `restore_all_windows()` stellt `win_analytics` über die Klassen-Registry wieder her (Alt `win_statistics` wird nicht mehr registriert und per E-2 bereinigt). `statistic_win.py` bleibt als ungenutzte Legacy-Datei liegen (E-1).
+
+### 3.6 Schritt 6 – Headless-Gesamttest
+
+**`test/check_p15_s3_analytics.py` (NEU):** Gesamt-Validierung der Analytics-Engine (KEINE UI, KEIN `QApplication.exec()`; nur `QCoreApplication` + `processEvents()`). Test-DBs in `test/` (`p15_s3_analytics_test.duckdb`, `p15_s3_analytics_app.duckdb`, `p15_s3_migration_test.duckdb`).
+
+**Ergebnis: 40/40 Checks PASS** (Exit 0):
+
+| Bereich | Checks | Inhalt |
+| --- | --- | --- |
+| A Profiles-CRUD | A1–A10 | create/get/get_by_name/list/update/delete, schema_version-Pflichtfeld + Alt-Row-Default, genau EIN aktives Profil |
+| B SQL-Aggregationen | B1–B14 | fetch_rows, Heatmap 24×7 (Wanduhr-Tagesgrenze), Scatter, Verteilung; **NEU:** `get_latest_bar_time`, `get_recent_bar_time_for_cell` (Tagesgrenze Fr 23:00, ungültige Zelle → None, feature_id-Filter) |
+| C ViewModel | C1–C7 | create→aktiv, Dirty→Save→Dirty False, Payload mit schema_version, Jump-to-Chart-Resolution (latest/cell) |
+| D E-2-Migration | D1–D9 | Geometrie + Instanz-Zustand kopiert, win_statistics entfernt, **Idempotenz** (2. Aufruf → False), kein Overwrite bestehender win_analytics-Geometrie |
+
+Zusätzlich: `py_compile` auf allen neuen UI-Dateien, `analytics_win.py`, `main.py` und dem Test (Exit 0); `import main` erfolgreich (Import-Kette `analytics.ui.analytics_win` inkl. pyqtgraph-Import ohne QApplication); bestehende Tests `check_p15_s3_profiles.py` (30/30), `check_p15_s3_reader_repo.py` (39/39) und `check_p15_s3_worker_vm.py` (49/49) weiterhin PASS (additive Reader-/Repo-/VM-Methoden). **Gesamt 158 gezielte Checks PASS.** Keine UI-/Regressionstests (Regel 4) – UI-Änderungen durch Code-Inspektion + py_compile abgesichert.

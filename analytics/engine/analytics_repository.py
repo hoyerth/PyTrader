@@ -194,6 +194,42 @@ class AnalyticsRepository:
         }
 
     # ------------------------------------------------------------------
+    # Jump-to-Chart (15.03 Schritt 5, Variante 2: open_chart_at_bar)
+    # ------------------------------------------------------------------
+    def get_latest_bar_time(
+        self,
+        symbol: str,
+        timeframe: str,
+        feature_id: Optional[str] = None,
+    ) -> Optional[int]:
+        """Neuester Wanduhr-Epoch (int) der Feature-Rows (oder None).
+
+        Fuer 'Jump-to-Chart' aus Scatter (ein Klick auf einen Punkt oeffnet
+        das Chart an der neuesten Feature-Bar des Symbol/Timeframe).
+        """
+        return self.reader.fetch_latest_bar_time(
+            symbol, timeframe, feature_id=feature_id
+        )
+
+    def get_recent_bar_time_for_cell(
+        self,
+        symbol: str,
+        timeframe: str,
+        dow: int,
+        hour: int,
+        feature_id: Optional[str] = None,
+    ) -> Optional[int]:
+        """Neuester Wanduhr-Epoch einer (dow, hour)-Heatmap-Zelle (oder None).
+
+        Fuer 'Jump-to-Chart' aus der Heatmap: Doppelklick auf eine Zelle
+        (Wochentag x Tagesstunde) oeffnet das Chart an der neuesten
+        Feature-Bar dieser Zelle (Wanduhr-Garantie, Invariante 7).
+        """
+        return self.reader.fetch_recent_bar_time_for_cell(
+            symbol, timeframe, dow, hour, feature_id=feature_id
+        )
+
+    # ------------------------------------------------------------------
     # Metadaten
     # ------------------------------------------------------------------
     def get_available_features(

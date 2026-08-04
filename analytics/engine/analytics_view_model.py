@@ -400,6 +400,35 @@ class AnalyticsViewModel(QObject):
         event_bus.profile_changed.emit(name or "")
 
     # ------------------------------------------------------------------
+    # Jump-to-Chart-Resolution (15.03 Schritt 5, Variante 2)
+    # ------------------------------------------------------------------
+    def resolve_latest_bar_time(
+        self, symbol: str, timeframe: str
+    ) -> Optional[int]:
+        """Neuester Wanduhr-Epoch fuer 'Jump-to-Chart' (oder None).
+
+        Schnelle Punktabfrage (PK-Index) fuer Klick-auf-Punkt aus dem
+        Scatter – delegiert lesend an das AnalyticsRepository (kein SQL
+        im ViewModel).
+        """
+        return self._repo.get_latest_bar_time(
+            symbol, timeframe, feature_id=self._params.get("feature_id")
+        )
+
+    def resolve_recent_bar_time_for_cell(
+        self, symbol: str, timeframe: str, dow: int, hour: int
+    ) -> Optional[int]:
+        """Neuester Wanduhr-Epoch einer (dow, hour)-Zelle (oder None).
+
+        Jump-to-Chart aus der Heatmap (Doppelklick auf eine Zelle) –
+        delegiert lesend an das AnalyticsRepository.
+        """
+        return self._repo.get_recent_bar_time_for_cell(
+            symbol, timeframe, dow, hour,
+            feature_id=self._params.get("feature_id"),
+        )
+
+    # ------------------------------------------------------------------
     # Clamping (Typ- & Werte-Sicherheit)
     # ------------------------------------------------------------------
     @staticmethod
