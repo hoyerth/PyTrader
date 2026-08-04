@@ -250,6 +250,25 @@ def check_and_init_databases() -> None:
 			updated_at TIMESTAMP DEFAULT current_timestamp
 		);
 	""")
+
+	# Phase 15 (15.01): Symbol- & Favoriten-Verwaltung. broker_symbols haelt
+	# die Broker-Symbole (aus mt5.symbols_get()) inkl. Favoriten-Flag und
+	# dient als Fallback, wenn MT5 nicht verfuegbar ist. Standard-Defaults
+	# (SILVER, GOLD, BTCUSD) werden als Favoriten vorbelegt, damit die
+	# Favoriten-Dropdowns (ServiceWindow/AnalyticsWindow) nie leer starten.
+	con_app.execute("""
+		CREATE TABLE IF NOT EXISTS broker_symbols (
+			symbol      VARCHAR PRIMARY KEY,
+			path        VARCHAR,
+			is_favorite BOOLEAN DEFAULT FALSE,
+			updated_at  TIMESTAMP DEFAULT current_timestamp
+		);
+	""")
+	con_app.execute("""
+		INSERT INTO broker_symbols (symbol, path, is_favorite)
+		VALUES ('SILVER', '', TRUE), ('GOLD', '', TRUE), ('BTCUSD', '', TRUE)
+		ON CONFLICT (symbol) DO NOTHING;
+	""")
 	print(f"   ✅ Ordner '{DATA_DIR}/' und alle 3 DBs sind einsatzbereit.")
 
 

@@ -47,6 +47,11 @@ from serviceui.set_item_adapter import ServiceSetItemAdapter, _ServiceSetItemAda
 from serviceui.param_columns import ServiceParamColumnsMixin
 from serviceui.trash_dialog import ServiceSetTrashDialog
 
+# Phase 15 15.01: Symbol- & Favoriten-Verwaltung (SymbolsWindow + EventBus)
+from serviceui.symbols_win import SymbolsWindow
+from symbol_repository import SymbolRepository, get_symbol_repository
+from config.event_bus import event_bus
+
 # Projekt-Root (eine Ebene über serviceui/) – für die UI-Datei unter ui/.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -224,6 +229,28 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             # Symbol-Wechsel Cache invalidieren + Spalten neu bauen.
             self.combo_symbol.currentTextChanged.connect(self._on_symbol_changed)
 
+        # Phase 15 15.01: Favoriten-Symbol-Verwaltung.
+        # ★-Button rechts neben der Symbol-ComboBox oeffnet das nicht-modale
+        # SymbolsWindow (Favoriten verwalten). Das Symbol-Dropdown zeigt nur
+        # Favoriten (is_favorite == True) und wird ueber den EventBus bei
+        # jeder Favoriten-Aenderung neu befuellt (Entkopplung, kein direktes
+        # Fenster-Wissen).
+        self._symbol_repo: SymbolRepository = get_symbol_repository()
+        self.btn_symbol_fav: QPushButton = QPushButton("★", self.ui)
+        self.btn_symbol_fav.setObjectName("btn_symbol_fav")
+        self.btn_symbol_fav.setToolTip(
+            "Favoriten verwalten – oeffnet das Symbol-Fenster. "
+            "Das Symbol-Dropdown zeigt nur Favoriten.")
+        self.btn_symbol_fav.setFixedWidth(32)
+        layout_symbol = self.ui.findChild(QHBoxLayout, "layout_symbol")
+        if layout_symbol is not None and self.combo_symbol is not None:
+            idx = layout_symbol.indexOf(self.combo_symbol)
+            layout_symbol.insertWidget(idx + 1, self.btn_symbol_fav)
+        self.btn_symbol_fav.clicked.connect(self.open_symbols_window)
+        # EventBus: Favoriten-Aenderungen -> ComboBox neu befuellen
+        event_bus.favorites_changed.connect(self._refresh_symbol_combo)
+        self._refresh_symbol_combo()
+
         # Set-Dropdown initial befüllen (list_sets() als Quelle)
         self.refresh_set_list()
 
@@ -273,6 +300,48 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         if (self.combo_set is not None and self.combo_set.currentIndex() >= 0
                 and self.service_columns_layout is not None):
             self._rebuild_columns()
+
+    # --- Phase 15 15.01: Symbol- & Favoriten-Verwaltung ---
+
+    @Slot()
+    def open_symbols_window(self) -> None:
+        """Oeffnet das nicht-modale SymbolsWindow (Singleton-Verhalten).
+
+        Analog zu open_service_window in main.py: Existiert bereits eine
+        sichtbare Instanz, wird sie in den Vordergrund geholt statt neu
+        geoeffnet (PersistentWindow.get_existing_instance()).
+        """
+        existing = SymbolsWindow.get_existing_instance()
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
+        win = SymbolsWindow(self)  # parent=self nur fuer state_manager-Zugriff
+        win.show()
+
+    def _refresh_symbol_combo(self) -> None:
+        """Befuellt die Symbol-ComboBox aus den Favoriten (is_favorite == True).
+
+        Wird beim Start und bei jedem `EventBus.favorites_changed`-Event
+        aufgerufen (Verbindung im __init__). Fallback auf die Standard-
+        Defaults (SILVER/GOLD/BTCUSD), falls keine Favoriten gesetzt sind –
+        damit der Scanner nie ohne Symbol-Auswahl steht. Die aktuelle
+        Auswahl bleibt erhalten, sofern sie noch Favorit ist.
+        """
+        if not self.combo_symbol:
+            return
+        favorites = self._symbol_repo.get_favorite_symbols()
+        if not favorites:
+            favorites = list(SymbolRepository.DEFAULT_SYMBOLS)
+        current = self.combo_symbol.currentText()
+        self.combo_symbol.blockSignals(True)
+        self.combo_symbol.clear()
+        for sym in favorites:
+            self.combo_symbol.addItem(sym)
+        idx = self.combo_symbol.findText(current)
+        if idx >= 0:
+            self.combo_symbol.setCurrentIndex(idx)
+        self.combo_symbol.blockSignals(False)
 
     # --- Scanner ---
 
