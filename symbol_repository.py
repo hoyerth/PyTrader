@@ -16,6 +16,9 @@ Verhalten:
   MT5-Import), schreibt sie per Upsert in die DB und gibt die DB-Liste
   zurueck. Bei MT5-Ausfall (initialize()==False / Exception) automatischer
   Fallback auf die DB-Tabelle – die App bleibt voll funktionsfaehig.
+  Seit 15.01-Nachtrag 3 (04.08.2026) wird der Fetch NUR noch EINMALIG beim
+  App-Start (main.py) aufgerufen – die UI-Fenster (SymbolsWindow) lesen
+  ausschliesslich die gespeicherte Liste ueber `get_symbols()`.
 - `toggle_favorite()`    : kippt das Favoriten-Flag eines Symbols.
 """
 
@@ -205,11 +208,13 @@ class SymbolRepository:
     def sync_from_broker_with_status(self) -> Tuple[List[Dict[str, Any]], str, Optional[str]]:
         """Wie sync_from_broker(), liefert zusaetzlich Status & Fehlermeldung.
 
-        Erweiterung fuer die UI (SymbolsWindow): Die Liste aller verfuegbaren
-        Symbole wird bei jedem Oeffnen live von MT5 geladen; schlaegt der
-        MT5-Zugriff fehl, wird der Grund als Fehlermeldung geliefert, damit
-        die UI eine Log-Meldung ausgeben kann, statt still auf den DB-Stand
-        zurueckzufallen (User-Anweisung 15.01-Nachtrag).
+        Erweiterung fuer den App-Start-Sync (main.py, 15.01-Nachtrag 3): Die
+        Liste aller verfuegbaren Symbole wird EINMALIG beim App-Start live von
+        MT5 geladen; schlaegt der MT5-Zugriff fehl, wird der Grund als
+        Fehlermeldung geliefert, damit der Aufrufer eine Log-Meldung ausgeben
+        kann, statt still auf den DB-Stand zurueckzufallen. Die UI-Fenster
+        (SymbolsWindow) rufen diese Methode seit Nachtrag 3 NICHT mehr auf –
+        sie lesen ausschliesslich die gespeicherte Liste (get_symbols()).
 
         Returns:
             (symbols, status, error)

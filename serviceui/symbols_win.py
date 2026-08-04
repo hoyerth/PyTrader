@@ -23,7 +23,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QTableWidget,
     QTableWidgetItem,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -83,40 +82,21 @@ class SymbolsWindow(PersistentWindow):
         self.table.cellClicked.connect(self._on_cell_clicked)
         layout.addWidget(self.table)
 
-        # Status-/Fehler-Log (z. B. MT5 nicht verfuegbar -> Fallback-Meldung,
-        # User-Anweisung 15.01-Nachtrag: Fehlermeldung sichtbar im Log).
-        self.log_text = QTextEdit(self)
-        self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(72)
-        self.log_text.setPlaceholderText("Status-Log (MT5-Sync)...")
-        layout.addWidget(self.log_text)
-
-    def _log(self, message: str) -> None:
-        """Haengt eine Status-/Fehlermeldung ans Status-Log (unten)."""
-        if hasattr(self, "log_text") and self.log_text is not None:
-            self.log_text.append(message)
-
     # ------------------------------------------------------------------
     # Daten-Befuellung
     # ------------------------------------------------------------------
     def _load_symbols(self) -> None:
-        """Befuellt die Tabelle – versucht zunaechst den Live-Broker-Fetch (MT5).
+        """Befuellt die Tabelle aus der gespeicherten Liste (`get_symbols()`).
 
-        Ruft `sync_from_broker_with_status()` auf: Die Liste aller verfuegbaren
-        Symbole wird bei jedem Oeffnen live von MT5 geladen und per Upsert
-        persistiert. Bei MT5-Ausfall automatischer Fallback auf die DB-Tabelle
-        (Roadmap 15.01); der Grund wird im Status-Log ausgegeben (User-
-        Anweisung: Fehlermeldung im Log statt stillem Fallback).
+        User-Anweisung 04.08.2026 (15.01-Nachtrag 3): Der MT5-Live-Fetch wurde
+        aus diesem Fenster entfernt – alle Broker-Symbole werden NUR noch
+        EINMALIG beim App-Start (main.py) von MT5 geladen und persistiert.
+        Dieses Fenster liest ausschliesslich den gespeicherten DB-Stand
+        (kein MT5-Zugriff beim Oeffnen -> keine Verzoegerungen).
         """
         self._rows: dict = {}  # symbol -> Zeilen-Index
         self.table.setRowCount(0)
-        symbols, status, error = self.repo.sync_from_broker_with_status()
-        if status == "live":
-            self._log(f"[OK] {len(symbols)} Symbole live von MT5 geladen.")
-        else:
-            self._log(f"[WARNUNG] MT5 nicht verfügbar – zeige DB-Stand "
-                      f"({len(symbols)} Symbole). {error or 'Unbekannter Fehler'}")
-        for entry in symbols:
+        for entry in self.repo.get_symbols():
             self._append_symbol_row(entry["symbol"], entry["is_favorite"])
 
     def _append_symbol_row(self, symbol: str, is_favorite: bool) -> None:

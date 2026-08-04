@@ -155,7 +155,23 @@ Zusätzlich: `py_compile` auf allen neuen/geänderten Dateien (Exit 0) und Impor
 * Offscreen-Smoke-Test (Window-Instanziierung, kein `exec()`): ★-Button vorhanden und rechts neben `combo_symbol` im `horizontalLayout_row1`; Combo zeigt Favoriten zuerst; aktuelles Symbol bleibt nach EventBus-Refresh erhalten; nicht-Favorit-Symbol bleibt in der Liste; `SymbolsWindow` wird geöffnet.
 * `test/check_p15_s1_symbols.py` weiterhin 30/30 PASS (unverändert).
 
-### 3.8 Offene Punkte / nächste Schritte
+### 3.8 Nachtrag 3 – MT5-Symbol-Fetch nur beim App-Start + Pipeline-Fallback entfernt (User-Anweisung 04.08.2026)
+
+**Zwei User-Anweisungen (04.08.2026):**
+
+**(a) „laden aller Symbole nur bei app start, es gibt sonst verzögerungen"** – der MT5-Live-Fetch wurde aus dem `SymbolsWindow` entfernt:
+* **`serviceui/symbols_win.py`:** `_load_symbols()` liest jetzt **ausschließlich die gespeicherte Liste** (`SymbolRepository.get_symbols()`, DB). Der bisherige Aufruf von `sync_from_broker_with_status()` (Live-Fetch bei jedem Öffnen, 15.01-Nachtrag) ist entfernt. Das Status-Log (`log_text`/`_log`) – das nur für die MT5-Sync-Meldungen existierte – wurde mit entfernt (leeres Log hätte keine Funktion mehr). Kein MT5-Zugriff beim Öffnen → keine Verzögerungen.
+* **`main.py`:** Der MT5-Symbol-Fetch wird jetzt **einmalig beim App-Start** ausgeführt (direkt nach `check_mt5_connection()`, MT5 ist dort bereits initialisiert → schnell): `get_symbol_repository().sync_from_broker_with_status()` mit Konsolen-Log `[Symbol-Sync]` (live/fallback + Fehlermeldung).
+* **`symbol_repository.py`:** Docstrings aktualisiert (`sync_from_broker_with_status()` ist jetzt der App-Start-Sync, nicht mehr das Fenster-Öffnen). Die Methode selbst bleibt unverändert.
+
+**(b) „Fallback ausbauen, es gibt dafür keinen grund mehr"** – der Pipeline-Fallback im `GridLiquidityIndicator` wurde entfernt:
+* **`chart/indicators/grid_liquidity.py` (`calculate()`):** Der `else`-Zweig (Definierter Fallback U15-A2: Circles aus der synchron ausgeführten Service-Pipeline bei leerem `feature_store` inkl. Warnung `⚠️ ... Pipeline-Fallback`) ist **entfernt**. Die Circles kommen jetzt **ausschließlich** aus `read_proximity_from_feature_store()` (Farb-Semantik additiv aus dem Indikator-Schema bleibt). **Bei leerem Store → `circles = []`** (kein Rendern, kein Warn-Print).
+* **Linien-Pipeline bleibt erhalten:** Die Grid-LINIEN (Live-Tick-Cache) kommen weiterhin immer aus der Pipeline (`GridLinesService`) – sie sind kein DB-Output und waren nie Teil des entfernten Fallbacks. `status_info` kommt weiterhin aus dem Proximity-`chart_render_payload` der (für die Linien ohnehin laufenden) Pipeline.
+* Docstrings (`calculate()`, `read_proximity_from_feature_store`) auf den neuen Zustand (U15-A3) aktualisiert.
+
+**Validierung:** `py_compile` auf allen geänderten Dateien (Exit 0), `test/check_p15_s1_symbols.py` weiterhin **30/30 PASS** (Repository-API unverändert – der Test prüft Logik/DB, nicht das Fenster), Import-Smoke-Test (`main`, `symbols_win`, `grid_liquidity` importierbar). Keine UI-/Regressionstests (Regel 4).
+
+### 3.9 Offene Punkte / nächste Schritte
 
 * **15.02:** Service-UI-Refactoring & Master-Tree (nächste Phase).
 * **15.03:** `AnalyticsWindow` – dort wird die Favoriten-Dropdown-Kopplung (Punkt 3.4) und der `EventBus`-Empfang ergänzt.

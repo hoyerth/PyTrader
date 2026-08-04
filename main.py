@@ -39,6 +39,7 @@ from state_manager import StateManager
 from persistent_win import PersistentWindow
 from db_service import get_timeframes, TF_SECONDS_MAP, MT5_LOCK, DbPool
 import db_service
+from symbol_repository import get_symbol_repository
 from serviceui.service_win import ServiceWindow
 from statistic_win import StatisticWindow
 from properties_win import PropertiesWindow
@@ -236,6 +237,25 @@ class MainWindow(QMainWindow):
         db_service.check_and_init_databases()
 
         db_service.check_mt5_connection()
+
+        # Phase 15 15.01-Nachtrag 3 (User-Anweisung 04.08.2026): Alle Broker-
+        # Symbole werden NUR beim App-Start EINMALIG live von MT5 geladen und
+        # per Upsert in broker_symbols persistiert. Das SymbolsWindow liest
+        # danach ausschliesslich diese gespeicherte Liste (get_symbols()) –
+        # kein MT5-Fetch beim Oeffnen des Fensters (keine Verzoegerungen).
+        # MT5 ist hier bereits initialisiert (check_mt5_connection), daher ist
+        # der Fetch einmalig und schnell.
+        try:
+            _symbols, _status, _error = get_symbol_repository().sync_from_broker_with_status()
+            if _status == "live":
+                print(f"✅ [Symbol-Sync] {len(_symbols)} Symbole beim App-Start "
+                      f"von MT5 geladen.")
+            else:
+                print(f"⚠️ [Symbol-Sync] MT5-Fetch beim App-Start fehlgeschlagen "
+                      f"– nutze DB-Stand ({len(_symbols)} Symbole). "
+                      f"{_error or 'Unbekannter Fehler'}")
+        except Exception as exc:
+            print(f"⚠️ [Symbol-Sync] Fehler beim App-Start-Sync: {exc}")
 
         self.db: duckdb.DuckDBPyConnection = DbPool.get(
             str(BASE_DIR / "data" / "app_data.duckdb")
