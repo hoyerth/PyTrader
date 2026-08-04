@@ -6,7 +6,7 @@ Ziel von **Phase 15** ist die Weiterentwicklung der Service-UI (`service_win.py`
 
 * **15.01 Symbol-Auswahl & Favoriten:** Broker-Fetch via MT5, Persistierung in `app_data.duckdb`, Favoriten-Dropdowns & nicht-modales `SymbolsWindow`.
 * **15.02 Service-UI Refactoring & Master-Tree:** Modularisierung der gewachsenen `service_win.py` in Orchestrator + Sub-Widgets (`MasterTree`, `ParameterPanel`, `Toolbar`), Einführung von `ServiceTreeModel`, 2-Spalten-TreeWidget mit Indikator-Live-Status (`📌` / `🟢`) & Buttons für Struktur-Aktionen.
-* **15.03 Analytics Engine & UI:** Ersetzung von `statistic_win.py` durch `AnalyticsWindow` (`analytics/ui/analytics_win.py`), Entkopplung via MVVM (`AnalyticsViewModel`, `AnalyticsRepository`, `FeatureStoreReader`), `pyqtgraph`-Visualisierungen (Tabelle, Heatmap, Scatter, Verteilung), Profil-CRUD mit Explicit Save (`*`) & `schema_version` im Profil-JSON, Entkopplung über einen zentralen `EventBus`.
+* **15.03 Analytics Engine & UI:** Ersetzung von `../../statistic_win.py` durch `AnalyticsWindow` (`analytics/ui/analytics_win.py`), Entkopplung via MVVM (`AnalyticsViewModel`, `AnalyticsRepository`, `FeatureStoreReader`), `pyqtgraph`-Visualisierungen (Tabelle, Heatmap, Scatter, Verteilung), Profil-CRUD mit Explicit Save (`*`) & `schema_version` im Profil-JSON, Entkopplung über einen zentralen `EventBus`.
 
 ---
 
@@ -16,19 +16,19 @@ Ziel von **Phase 15** ist die Weiterentwicklung der Service-UI (`service_win.py`
 3. **Headless-Validierung (Keine UI-Tests):** Validierungen erfolgen rein headless (kein `QApplication.exec()`) über gezielte PyTest-/Python-Skripte in `test`.
 4. **Strikte Trennung & MVVM (Kein SQL in UI):** UI-Klassen enthalten **keine SQL-Queries**. Datenfluss: `DuckDB` $\rightarrow$ `FeatureStoreReader` / `Repositories` $\rightarrow$ `Worker/ViewModel` $\rightarrow$ `UI-Pages`.
 5. **Zentraler `EventBus`:** Fenster kommunizieren schwellenfrei über Events (`favorites_changed`, `profile_changed`, `service_set_changed`), um zirkuläre Abhängigkeiten zu vermeiden.
-6. **Thread-Safety & DbPool:** DB-Zugriff erfolgt lock-frei über den Thread-local `DbPool` (`db_service.py`).
+6. **Thread-Safety & DbPool:** DB-Zugriff erfolgt lock-frei über den Thread-local `DbPool` (`../../db_service.py`).
 7. **Wanduhr-Garantie:** Achsen und Zeitfilter formatieren streng die Berliner Wanduhrzeit aus MT5-Epochs ohne doppelte UTC-Offsets.
 
 ### Entscheidungs-Protokoll Phase 15 (Beschluss 04.08.2026)
 
 | # | Thema | Entscheidung |
 | --- | --- | --- |
-| E-1 | Legacy-Alias `analytics/statistics_repository.py` | Bleibt bis auf Weiteres unverändert bestehen; kompletter Ersatz erst in einer späteren Phase |
+| E-1 | Legacy-Alias `../../analytics/statistics_repository.py` | Bleibt bis auf Weiteres unverändert bestehen; kompletter Ersatz erst in einer späteren Phase |
 | E-2 | Persistenz `win_statistics` | Fenstergeometrie & Instanz-Zustände werden beim Ersetzen nach `win_analytics` migriert |
 | E-3 | `schema_version` Pflichtfeld | Pflichtfeld im `FeatureStorePayload`; alte `feature_store`-Rows erhalten beim Lesen den Default `"1.0"` |
-| E-4 | Schutzregel Grid-Liquidity | Schutz für `chart/indicators/grid_liquidity.py` aufgehoben; Anpassungen erlaubt, wenn der Fallback-Abbau sie erfordert |
+| E-4 | Schutzregel Grid-Liquidity | Schutz für `../../chart/indicators/grid_liquidity.py` aufgehoben; Anpassungen erlaubt, wenn der Fallback-Abbau sie erfordert |
 | E-5 | Zeilenzahl `service_win.py` | Doku-Korrektur: 864 Zeilen (statt 1.400) |
-| E-6 | Pfad-Konvention | Dateien werden einheitlich vom Projekt-Root referenziert (ohne `../`) |
+| E-6 | Pfad-Konvention | Dateien werden einheitlich vom Projekt-Root referenziert (ohne `../..`) |
 
 ---
 
@@ -37,19 +37,18 @@ Ziel von **Phase 15** ist die Weiterentwicklung der Service-UI (`service_win.py`
 ## 1. SPEZIFIKATION (15.01)
 
 * **Broker-Fetch & Persistenz:** Liest Symbole live via `mt5.symbols_get()` und speichert sie per Upsert in `app_data.duckdb` (Tabelle `broker_symbols` mit Spalten `symbol`, `path`, `is_favorite`, `updated_at`). Bei MT5-Ausfall erfolgt ein automatischer Fallback auf die DB-Tabelle.
-* **Symbol-Repository (`symbol_repository.py`):** Kapselt den Lese-/Schreibzugriff für Symbole und Favoriten entkoppelt aus `state_manager.py`.
+* **Symbol-Repository (`symbol_repository.py`):** Kapselt den Lese-/Schreibzugriff für Symbole und Favoriten entkoppelt aus `../../state_manager.py`.
 * **Favoriten-Dropdowns:** Dropdowns in `ServiceWindow` und `AnalyticsWindow` zeigen nur `is_favorite == True` Symbole an.
 * **Auswahlfenster `SymbolsWindow` (`serviceui/symbols_win.py`):** Erbt von `PersistentWindow` (`win_symbols`), nicht-modal.
 * *Search-LineEdit:* Live-Filter mit `scrollToItem` zum ersten Treffer.
 * *2-Spalten-Table:* Spalte 0: Symbol, Spalte 1: `★` (Favoriten-Toggle per Klick).
 * *EventBus:* Emittiert bei Änderung `EventBus.favorites_changed`.
 
-
 ## 2. SCHRITT-FÜR-SCHRITT ANLEITUNG (15.01)
 
 1. **Backup:** Git Commit `phase15_s1_backup`.
-2. **Repository & DB (`db_service.py` & `symbol_repository.py`):**
-* Tabelle `broker_symbols` in `db_service.py` anlegen (Standard-Defaults: SILVER, GOLD, BTCUSD).
+2. **Repository & DB (`../../db_service.py` & `symbol_repository.py`):**
+* Tabelle `broker_symbols` in `../../db_service.py` anlegen (Standard-Defaults: SILVER, GOLD, BTCUSD).
 * `symbol_repository.py` erstellen: Implementierung von `get_symbols()`, `get_favorite_symbols()`, `toggle_favorite()`.
 
 3. **UI `SymbolsWindow` (`serviceui/symbols_win.py`):**
@@ -59,7 +58,6 @@ Ziel von **Phase 15** ist die Weiterentwicklung der Service-UI (`service_win.py`
 4. **Integration in UI-Dropdowns:**
 * Button `btn_symbol_fav` (`★`) neben Symbol-ComboBox in `ServiceWindow` und `AnalyticsWindow` einbauen.
 * `EventBus.favorites_changed` an Neu-Befüllung der ComboBoxen koppeln.
-
 
 5. **Headless-Test (`test/check_p15_s1_symbols.py`):** Validierung von DB-Persistenz, Fallback & Favoriten-Toggle ohne GUI.
 
@@ -84,7 +82,6 @@ Ziel von **Phase 15** ist die Weiterentwicklung der Service-UI (`service_win.py`
 * Buttons `[▲]` / `[▼]` ändern `execution_order`.
 * Button `[🗑️]` führt P14-04 Sperr-Prüfung durch.
 
-
 ## 2. SCHRITT-FÜR-SCHRITT ANLEITUNG (15.02)
 
 1. **Backup:** Git Commit `phase15_s2_backup`.
@@ -108,9 +105,9 @@ Ziel von **Phase 15** ist die Weiterentwicklung der Service-UI (`service_win.py`
 
 ## 1. SPEZIFIKATION (15.03)
 
-* **Ersetzung `statistic_win.py`:** Vollständiger Austausch durch `AnalyticsWindow` (`analytics/ui/analytics_win.py`).
+* **Ersetzung `../../statistic_win.py`:** Vollständiger Austausch durch `AnalyticsWindow` (`analytics/ui/analytics_win.py`).
 * **Persistenz-Migration (E-2):** Beim Ersetzen werden Fenstergeometrie & Instanz-Zustände von `win_statistics` nach `win_analytics` migriert (über `window_state_repository.py`, siehe 15.04).
-* **Legacy-Alias (E-1):** Das bestehende `analytics/statistics_repository.py` (aktuell von `statistic_win.py` genutzt) bleibt vorerst unverändert bestehen; ein kompletter Ersatz durch `FeatureStoreReader`/`AnalyticsRepository` ist erst in einer späteren Phase vorgesehen.
+* **Legacy-Alias (E-1):** Das bestehende `../../analytics/statistics_repository.py` (aktuell von `../../statistic_win.py` genutzt) bleibt vorerst unverändert bestehen; ein kompletter Ersatz durch `FeatureStoreReader`/`AnalyticsRepository` ist erst in einer späteren Phase vorgesehen.
 * **Ablage & Modularisierung der UI (`analytics/ui/`):**
 * `analytics_win.py`: Hauptfenster (`PersistentWindow`, `win_analytics`, `1280 x 800`, nicht-modal).
 * Sub-Pages: `table_page.py`, `heatmap_page.py`, `scatter_page.py`, `distribution_page.py`, `equity_page.py`.
@@ -127,60 +124,29 @@ Ziel von **Phase 15** ist die Weiterentwicklung der Service-UI (`service_win.py`
 * Max-Lookback-Cap (max. 50.000 Kerzen) & Async-Worker mit Progress-Spinner / "No Data"-Overlay.
 * **Jump-to-Chart (Variante 2):** Jeder Klick auf Signale in Tabelle, Heatmap oder Scatter ruft `open_chart_at_bar(symbol, tf, bar_time)` auf und bringt das Chart-Fenster in den Vordergrund.
 
-
 ## 2. SCHRITT-FÜR-SCHRITT ANLEITUNG (15.03)
 
 1. **Backup:** Git Commit `phase15_s3_backup`.
-
-
 2. **Profile-Repository & Schema (`analytics_profile_repository.py`):**
 * Anlegen der Tabelle `analytics_profiles` in `app_data.duckdb` mit `schema_version` im JSON.
-
-
 * Implementieren der CRUD-Operationen.
-
-
-
 
 3. **Reader & Analytics-Repository:**
 * `analytics/engine/feature_store_reader.py`: Reines Auslesen des `feature_store`.
-
-
 * `analytics/engine/analytics_repository.py`: Methoden für Heatmap-, Scatter- und Verteilungs-Matrizen.
-
-
-
 
 4. **ViewModel & Worker:**
 * `analytics/engine/analytics_worker.py`: Async Worker für DuckDB-Queries.
-
-
 * `analytics/engine/analytics_view_model.py`: Verwaltung des aktiven Profils, Dirty-States (`*`) & Debouncing.
-
-
-
 
 5. **UI-Pages & `analytics_win.py`:**
 * Erstellung der Einzelseiten in `analytics/ui/` (`table_page.py`, `heatmap_page.py`, `scatter_page.py`, `distribution_page.py`, `equity_page.py`).
-
-
 * `analytics_win.py` als `PersistentWindow` mit Top-Bar CRUD & Sidebar-Navigation aufbauen.
-
-
 * Klick-Events in Plots/Tabellen an `open_chart_at_bar()` koppeln.
-
-
-* Alt-Fenster `statistic_win.py` in `main.py` durch `AnalyticsWindow` ersetzen.
-
-
+* Alt-Fenster `../../statistic_win.py` in `../../main.py` durch `AnalyticsWindow` ersetzen.
 * Bestehende `win_statistics`-Persistenz migrieren (E-2): Fenstergeometrie & Instanz-Zustände nach `win_analytics` übernehmen (via `window_state_repository.py`).
 
-
-
-
 6. **Headless-Test (`test/check_p15_s3_analytics.py`):** Validierung von Profiles-CRUD, SQL-Aggregationen, Reader & ViewModel ohne GUI.
-
-
 
 ---
 
@@ -189,28 +155,13 @@ Ziel von **Phase 15** ist die Weiterentwicklung der Service-UI (`service_win.py`
 ## 1. SPEZIFIKATION (15.04)
 
 * **`event_bus.py`:** Erstellen eines zentralen Signal-Hubs als Singleton im Core-Paket.
-
-
-* **Repositories Spaltung (`state_manager.py` Cleanup):**
+* **Repositories Spaltung (`../../state_manager.py` Cleanup):**
 * `analytics_profile_repository.py`: Profil-Persistenz.
-
-
 * `symbol_repository.py`: Symbole & Favoriten.
-
-
 * `window_state_repository.py`: Fenstergeometrien & Instanz-Zustände.
-
-
-
-
 * **Legacy-Abbau & Schema-Invarianten:**
 * `schema_version` als Pflichtfeld im `FeatureStorePayload`-TypedDict.
-
-
 * Entfernen verbliebener Pipeline-Fallbacks in `grid_liquidity.calculate()` zugunsten des reinen `feature_store`-Lesepfads.
-
-
-
 
 
 ## 2. SCHRITT-FÜR-SCHRITT ANLEITUNG (15.04)
@@ -218,34 +169,17 @@ Ziel von **Phase 15** ist die Weiterentwicklung der Service-UI (`service_win.py`
 1. **Backup:** Git Commit `phase15_s4_backup`.
 2. **`EventBus` bereitstellen (`config/event_bus.py`):**
 * Signale definieren: `favorites_changed`, `profile_changed`, `service_set_changed`.
-
-
 * Fenster-Verdrahtungen sukzessive auf den `EventBus` umstellen.
 
-
-
-
 3. **Repositories auskoppeln:**
-* `window_state_repository.py` aus `state_manager.py` herauslösen.
-
-
-* `state_manager.py` als dünne Fassade für Abwärtskompatibilität beibehalten.
-
-
-
+* `window_state_repository.py` aus `../../state_manager.py` herauslösen.
+* `../../state_manager.py` als dünne Fassade für Abwärtskompatibilität beibehalten.
 
 4. **Schema & Fallback Cleanup:**
 * Strikten `schema_version`-Stempel erzwingen (E-3: Pflichtfeld; Alt-Rows ohne Stempel erhalten beim Lesen Default `"1.0"`).
-
-
 * Fallback-Code in `grid_liquidity.py` bereinigen (E-4: Schutzregel aufgehoben, Anpassungen erlaubt wenn erforderlich).
 
-
-
-
 5. **Headless-Test (`test/check_p15_s4_infra.py`):** Verifizierung von EventBus, Repositories und Schema-Stempeln ohne GUI.
-
-
 
 ---
 
@@ -268,7 +202,7 @@ Ziel von **Phase 15** ist die Weiterentwicklung der Service-UI (`service_win.py`
 | `serviceui/symbols_win.py` | **NEU** | Nicht-modales `SymbolsWindow` mit Suche & Favoriten-Toggle
 
  |
-| `serviceui/service_win.py` | **Refactoring** | Schlanker Orchestrator mit `QSplitter` (1280x800)
+| `../../serviceui/service_win.py` | **Refactoring** | Schlanker Orchestrator mit `QSplitter` (1280x800)
 
  |
 | `serviceui/master_tree.py` | **NEU** | 2-Spalten `QTreeWidget` mit Indikator-Live-Status (`📌` / `🟢`)
@@ -312,11 +246,11 @@ Ziel von **Phase 15** ist die Weiterentwicklung der Service-UI (`service_win.py`
 | `analytics/ui/equity_page.py` | **NEU** | Vorbereiteter Container für spätere Performance-Kurven
 
  |
-| `main.py` | **Anpassung** | Ersetzung von `StatisticWindow` durch `AnalyticsWindow`<br> |
-| `statistic_win.py` | **Entfernt** | Altes Statistik-Fenster wird vollständig durch `AnalyticsWindow` ersetzt
+| `../../main.py` | **Anpassung** | Ersetzung von `StatisticWindow` durch `AnalyticsWindow`<br> |
+| `../../statistic_win.py` | **Entfernt** | Altes Statistik-Fenster wird vollständig durch `AnalyticsWindow` ersetzt
 
  |
-| `analytics/statistics_repository.py` | **bleibt (Legacy-Alias)** | Bleibt bis auf Weiteres unverändert (E-1); Ersatz durch `FeatureStoreReader`/`AnalyticsRepository` erst in späterer Phase
+| `../../analytics/statistics_repository.py` | **bleibt (Legacy-Alias)** | Bleibt bis auf Weiteres unverändert (E-1); Ersatz durch `FeatureStoreReader`/`AnalyticsRepository` erst in späterer Phase
 
  |
 | `test/check_p15_s1_symbols.py` | **NEU** | Headless-Test für Symbol-Fetch, DB-Persistenz & Favoriten
@@ -342,4 +276,4 @@ Folgende Themen sind bewusst **nicht Bestandteil von Phase 15** und werden gesam
 2. **Multi-Symbol und Multi-Timeframe:** Gezielter Vergleich mehrerer Symbole/Timeframes nebeneinander in einer Matrix oder Kurve.
 3. **Massentests & Parameter-Optimierung:** Automatische Parameter-Sweeps über verschiedene Zeiträume, Service-Parameter und ML-Variablen.
 4. **Aktive ML-Inferenz:** In Phase 15 wird ML noch nicht aktiv eingebunden; die bestehenden Profil-Strukturen (`"ml_models"` im JSON-Payload) bleiben rein vorbereitend vorhanden.
-5. **Legacy-Ersatz `analytics/statistics_repository.py`:** Der Legacy-Alias (E-1) wird in einer späteren Phase vollständig durch `FeatureStoreReader`/`AnalyticsRepository` ersetzt.
+5. **Legacy-Ersatz `../../analytics/statistics_repository.py`:** Der Legacy-Alias (E-1) wird in einer späteren Phase vollständig durch `FeatureStoreReader`/`AnalyticsRepository` ersetzt.
