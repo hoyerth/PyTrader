@@ -117,3 +117,33 @@ DuckDB-Hinweis: Die `JSON`-Spalte wird beim Lesen mit `_parse_json_field` (str�
 | D Schema-Konvention | D1–D4 | `schema_version`-Pflichtfeld (Default 1), explizite Version gewinnt, Alt-Row-Default |
 
 Zusätzlich: `py_compile` auf `analytics_profile_repository.py`, `db_service.py` und dem Test (Exit 0); bestehender Test `test/check_p15_s1_symbols.py` weiterhin **30/30 PASS** (db_service-Änderung additiv). Keine UI-/Regressionstests (Regel 4).
+
+### 3.3 Schritt 3 – FeatureStoreReader & AnalyticsRepository
+
+**`analytics/engine/feature_store_reader.py` (NEU):** `FeatureStoreReader` – reiner Lese-Zugriff auf den `feature_store` (Invariante 4 / MVVM: DuckDB → Reader → Repository → ViewModel → UI). Keine Berechnungen, kein Schreiben:
+* `fetch_rows(symbol, timeframe, feature_id?, limit?)` – Zeilen als Dicts (time als **Wanduhr-Epoch** int, native Spalten, `feature_data` geparst).
+* `fetch_columns(symbol, timeframe, columns, feature_id?, limit?)` – nur native Spalten (non-null) für Scatter/Histogramm.
+* `fetch_heatmap(symbol, timeframe, metric?, feature_id?)` – 2D-Matrix (rows=Stunde 0–23, cols=DOW 0=So..6=Sa); `metric`: `"count"` (0 für leere Zellen) oder native Spalte (`AVG`, nan für leere Zellen); unerlaubte Metrik → `ValueError`.
+* `get_available_features(symbol, timeframe)` – verfügbare Plugin-IDs, native Spalten, Zeilenzahl.
+* **E-3:** Alt-Rows ohne `schema_version` in `feature_data` erhalten beim Lesen den Default `"1.0"` (DB bleibt unverändert).
+* **Wanduhr-Garantie (Invariante 7):** Für die Heatmap wird `EXTRACT(DOW/HOUR FROM bar_time AT TIME ZONE 'UTC')` verwendet. **Umsetzungs-Erkenntnis:** DuckDB rechnet `EXTRACT(HOUR FROM TIMESTAMPTZ)` ohne Forcierung in die **System-Lokalzeit** um (Berlin +2h/+1h, DST-bruchig; an Tagesgrenzen verschiebt sich sogar der Wochentag). Da die gespeicherten Werte Berlin-Wanduhr-encoded sind (die UTC-Darstellung IST die Wanduhr-Zeit), liefert die UTC-Forcierung exakt die Wanduhr-Stunde/-Tag.
+
+**`analytics/engine/analytics_repository.py` (NEU):** `AnalyticsRepository` – High-Level-Datenmethoden (delegiert lesend an den Reader):
+* `get_table(symbol, timeframe, feature_id?, limit?)` → `{"rows", "total"}`.
+* `get_heatmap(symbol, timeframe, metric?, feature_id?)` → 2D-Matrix (X: Wochentage, Y: Tagesstunden Berlin Wanduhr) + Labels.
+* `get_scatter(symbol, timeframe, x_column?, y_column?)` → `{"points": [{x, y}], ...}` (nur finite Werte; unerlaubte Spalten → `ValueError`).
+* `get_distribution(symbol, timeframe, column?, bins?)` → Histogramm `{"bins", "counts", ...}` via `numpy.histogram` (NaN/Inf gefiltert).
+* `get_available_features()`, `available_heatmap_metrics()`, `native_columns`.
+* E-1: Das Alt-Repository `analytics/statistics_repository.py` bleibt unverändert bestehen (Legacy-StatisticWindow).
+
+**Headless-Test (`test/check_p15_s3_reader_repo.py`, NEU):** Test-DB in `test/p15_s3_reader_test.duckdb` (Regel: keine Test-DBs im Root/`data`), Wanduhr-encoded Testdaten (inkl. Tagesgrenze Fr 23:00).
+
+**Ergebnis: 39/39 Checks PASS** (Exit 0):
+
+| Bereich | Checks | Inhalt |
+| --- | --- | --- |
+| A fetch_rows | A1–A11 | Zeilen/epoch/schema_version-Default (E-3)/feature_id-Filter/limit/leere Filter |
+| B fetch_heatmap | B1–B14 | 24×7-Matrix, count/avg an korrekter Zelle, leere Zellen, **Tagesgrenze Wanduhr** (Fr 23:00 → HOUR=23, DOW=5; ohne UTC-Forcierung wäre Sa 01:00), feature_id-Filter, ValueError |
+| C AnalyticsRepository | C1–C9 | get_table/get_scatter/get_distribution, ValueError bei unerlaubten Spalten, Metadaten |
+
+Zusätzlich: `py_compile` auf Reader, Repository und Test (Exit 0). Keine UI-/Regressionstests (Regel 4).

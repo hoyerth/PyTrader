@@ -1,0 +1,388 @@
+# analytics/engine/feature_store_reader.py
+"""
+feature_store_reader.py - FeatureStoreReader (Phase 15.03).
+
+Reiner Lese-Zugriff auf die `feature_store`-Tabelle in `analytics.duckdb`
+(Invariante 4 / MVVM: DuckDB -> FeatureStoreReader -> AnalyticsRepository
+-> ViewModel -> UI). Der Reader fuehrt KEINE Berechnungen aus und schreibt
+NIE in die DB – er kapselt ausschliesslich lesende DuckDB-Abfragen.
+
+Datenmodell feature_store (Hybrid-Schema, Phasen 12+):
+    symbol, timeframe, bar_time TIMESTAMPTZ, ema_diff, rsi_14,
+    atr_normalized, created_at, feature_id, plugin_version,
+    feature_data JSON (FeatureStorePayload des Plugins)
+
+Wanduhr-Garantie (Invariante 7, 15.03-Spez: Heatmap X/Y):
+    Die gespeicherten bar_time-Werte sind Berlin-Wanduhr-encoded (MT5
+    liefert Wanduhr-Epochs, die 1:1 als UTC-Darstellung in die DB
+    geschrieben werden; EXTRACT('epoch' FROM bar_time) liefert exakt diese
+    Wanduhr-Epochs). Fuer Wochentag/Stunde (Heatmap) wird DAHER die
+    UTC-Forcierung `bar_time AT TIME ZONE 'UTC'` verwendet – OHNE sie
+    rechnet DuckDB in die System-Lokalzeit um (Berlin +2h/+1h) und die
+    Heatmap waere um den Offset verschoben (DST-bruchig, Invariante 7).
+
+E-3 (schema_version-Pflichtfeld): Alte feature_store-Rows ohne
+`schema_version` in feature_data erhalten beim Lesen den Default `"1.0"` –
+die DB-Zeile bleibt unveraendert (Lesen ist rein).
+"""
+
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+
+from db_service import DbPool, _parse_json_field
+
+# Projekt-Root = 2 Ebenen ueber dieser Datei (engine/ -> analytics/ -> Root)
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+DB_ANALYTICS = str(BASE_DIR / "data" / "analytics.duckdb")
+
+# E-3: schema_version-Default fuer Alt-Rows ohne Pflichtfeld (analog
+# GridLiquidityIndicator-Lesepfad: Default "1.0").
+SCHEMA_VERSION_DEFAULT = "1.0"
+
+# Native Feature-Spalten der feature_store-Tabelle (fuer Heatmap-Metriken,
+# Scatter-/Verteilungs-Achsen). Keine JSON-Feld-Pfade – nur echte Spalten.
+NATIVE_COLUMNS = ("ema_diff", "rsi_14", "atr_normalized")
+
+# Heatmap-Achsen (15.03-Spezifikation): X = Wochentage, Y = Tagesstunden
+# Berlin Wanduhr. Matrix: rows = Stunde (0-23), cols = DOW (0=Sonntag..6).
+DOW_LABELS = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"]
+HOURS_PER_DAY = 24
+DAYS_PER_WEEK = 7
+
+
+class FeatureStoreReader:
+    """Kapselt rein lesend DuckDB-Abfragen auf den feature_store."""
+
+    def __init__(self, db_path: str = DB_ANALYTICS) -> None:
+        self.db_path = db_path
+
+    # ------------------------------------------------------------------
+    # Interna
+    # ------------------------------------------------------------------
+    def _get_connection(self):
+        return DbPool.get(self.db_path)
+
+    @staticmethod
+    def _normalize_feature_data(raw: Any) -> Dict[str, Any]:
+        """Parst feature_data (str->dict) und stellt schema_version sicher.
+
+        E-3: Fehlt das Pflichtfeld `schema_version` (Alt-Rows), wird es beim
+        Lesen additiv mit dem Default `"1.0"` ergaenzt – die DB-Zeile bleibt
+        unveraendert (rein lesender Reader).
+        """
+        data = _parse_json_field(raw) or {}
+        data = dict(data)
+        data.setdefault("schema_version", SCHEMA_VERSION_DEFAULT)
+        return data
+
+    @staticmethod
+    def _epoch_of(bar_time: Any) -> int:
+        """Wandelt bar_time (datetime/epoch) in die Wanduhr-Epoch (int) um.
+
+        Verwendet .timestamp() auf der UTC-Darstellung – das liefert exakt
+        die gespeicherte Wanduhr-encoded Epoch (konsistent zum Chart und zu
+        statistics_repository.fetch_signals).
+        """
+        if hasattr(bar_time, "timestamp"):
+            return int(bar_time.timestamp())
+        return int(bar_time)
+
+    # ------------------------------------------------------------------
+    # Lesen: Roh-Zeilen
+    # ------------------------------------------------------------------
+    def fetch_rows(
+        self,
+        symbol: str,
+        timeframe: str,
+        feature_id: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Liefert Feature-Store-Zeilen als Dicts (zeilen-aufwaerts sortiert).
+
+        Jede Zeile enthaelt:
+            time          – Wanduhr-Epoch (int, bar_time)
+            symbol/timeframe – Filterwerte
+            feature_id    – Plugin-ID (oder None)
+            plugin_version– Plugin-Version (oder None)
+            ema_diff/rsi_14/atr_normalized – native Spalten (oder None)
+            feature_data  – geparstes JSON inkl. schema_version-Default (E-3)
+
+        Args:
+            symbol: Symbol-Name (case-insensitive)
+            timeframe: Timeframe (case-insensitive)
+            feature_id: Optionaler Filter auf die Plugin-ID
+            limit: Maximale Anzahl Zeilen (Default 1000)
+        """
+        if not symbol or not timeframe:
+            return []
+        if limit is None:
+            limit = 1000
+        conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
+        params: List[Any] = [symbol, timeframe]
+        if feature_id:
+            conditions.append("feature_id = ?")
+            params.append(feature_id)
+
+        con = self._get_connection()
+        try:
+            rows = con.execute(f"""
+                SELECT
+                    bar_time,
+                    symbol,
+                    timeframe,
+                    feature_id,
+                    plugin_version,
+                    ema_diff,
+                    rsi_14,
+                    atr_normalized,
+                    feature_data
+                FROM feature_store
+                WHERE {' AND '.join(conditions)}
+                ORDER BY bar_time ASC
+                LIMIT ?
+            """, params + [limit]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_rows fehlgeschlagen: {e}")
+            return []
+
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            out.append({
+                "time": self._epoch_of(r[0]),
+                "symbol": str(r[1]),
+                "timeframe": str(r[2]),
+                "feature_id": str(r[3]) if r[3] is not None else None,
+                "plugin_version": str(r[4]) if r[4] is not None else None,
+                "ema_diff": self._float_or_none(r[5]),
+                "rsi_14": self._float_or_none(r[6]),
+                "atr_normalized": self._float_or_none(r[7]),
+                "feature_data": self._normalize_feature_data(r[8]),
+            })
+        return out
+
+    @staticmethod
+    def _float_or_none(value: Any) -> Optional[float]:
+        """Konvertiert einen DB-Wert in float (None/ungueltig -> None)."""
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    # ------------------------------------------------------------------
+    # Lesen: Gezielte Spalten (Scatter / Verteilung)
+    # ------------------------------------------------------------------
+    def fetch_columns(
+        self,
+        symbol: str,
+        timeframe: str,
+        columns: List[str],
+        feature_id: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, float]]:
+        """Liefert nur die angeforderten nativen Spalten (non-null).
+
+        Args:
+            symbol/timeframe: Filter (case-insensitive)
+            columns: Nur native Spalten (ema_diff, rsi_14, atr_normalized)
+            feature_id: Optionaler Plugin-Filter
+            limit: Maximale Zeilen (Default 1000)
+
+        Returns:
+            Liste von Dicts {spaltenname: float, ...} – Zeilen mit NULL in
+            einer angeforderten Spalte werden ausgelassen (Scatter/Histogramm).
+        """
+        if not symbol or not timeframe or not columns:
+            return []
+        valid = [c for c in columns if c in NATIVE_COLUMNS]
+        if not valid:
+            return []
+        if limit is None:
+            limit = 1000
+        col_sql = ", ".join(f'"{c}"' for c in valid)
+        conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
+        params: List[Any] = [symbol, timeframe]
+        if feature_id:
+            conditions.append("feature_id = ?")
+            params.append(feature_id)
+
+        con = self._get_connection()
+        try:
+            rows = con.execute(f"""
+                SELECT {col_sql}
+                FROM feature_store
+                WHERE {' AND '.join(conditions)}
+                  AND {" AND ".join(f'"{c}" IS NOT NULL' for c in valid)}
+                ORDER BY bar_time ASC
+                LIMIT ?
+            """, params + [limit]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_columns fehlgeschlagen: {e}")
+            return []
+
+        out: List[Dict[str, float]] = []
+        for r in rows:
+            item: Dict[str, float] = {}
+            ok = True
+            for i, c in enumerate(valid):
+                fv = self._float_or_none(r[i])
+                if fv is None:
+                    ok = False
+                    break
+                item[c] = fv
+            if ok:
+                out.append(item)
+        return out
+
+    # ------------------------------------------------------------------
+    # Lesen: Heatmap (2D-Matrix X=Wochentag, Y=Stunde, Berlin Wanduhr)
+    # ------------------------------------------------------------------
+    def fetch_heatmap(
+        self,
+        symbol: str,
+        timeframe: str,
+        metric: str = "count",
+        feature_id: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Aggregiert eine 2D-Matrix (X: Wochentage, Y: Tagesstunden).
+
+        Wanduhr-Garantie (Invariante 7): DOW/HOUR werden mit
+        `bar_time AT TIME ZONE 'UTC'` extrahiert – die gespeicherten Werte
+        sind Wanduhr-encoded, die UTC-Darstellung ist die Wanduhr-Zeit.
+        Ohne die Forcierung rechnet DuckDB in die System-Lokalzeit (Berlin
+        +2h/+1h) um und die Heatmap waere DST-bruchig verschoben.
+
+        Args:
+            symbol/timeframe: Filter (case-insensitive)
+            metric: "count" (Anzahl Zeilen je Zelle) ODER eine native Spalte
+                (ema_diff, rsi_14, atr_normalized) -> AVG je Zelle.
+            feature_id: Optionaler Plugin-Filter
+            limit: Optionaler Deckel (nur fuer konsistente Semantik; die
+                Aggregation erfolgt in SQL ueber den Filter).
+
+        Returns:
+            {
+              "matrix":   7x24 Liste (rows=Stunde 0-23, cols=DOW 0=So..6=Sa),
+                          count -> 0 fuer leere Zellen,
+                          avg   -> nan fuer leere Zellen (numpy),
+              "x_labels": DOW_LABELS (Wochentage, Spalten),
+              "y_labels": ["00:00", ..., "23:00"] (Stunden, Zeilen),
+              "metric":   metric,
+              "symbol":   symbol, "timeframe": timeframe,
+            }
+
+        Raises:
+            ValueError: bei unbekannter Metrik (nur count / native Spalten).
+        """
+        if not symbol or not timeframe:
+            return self._empty_heatmap(symbol, timeframe, metric)
+        metric_key = str(metric).lower()
+        if metric_key == "count":
+            agg_sql = "COUNT(*) AS val"
+        elif metric_key in NATIVE_COLUMNS:
+            agg_sql = f'AVG("{metric_key}") AS val'
+        else:
+            raise ValueError(
+                f"[FeatureStoreReader] Unbekannte Heatmap-Metrik '{metric}' – "
+                f"erlaubt: 'count' oder eine native Spalte {NATIVE_COLUMNS}."
+            )
+
+        conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
+        params: List[Any] = [symbol, timeframe]
+        if feature_id:
+            conditions.append("feature_id = ?")
+            params.append(feature_id)
+
+        con = self._get_connection()
+        try:
+            rows = con.execute(f"""
+                SELECT
+                    EXTRACT(DOW FROM bar_time AT TIME ZONE 'UTC')::INTEGER AS dow,
+                    EXTRACT(HOUR FROM bar_time AT TIME ZONE 'UTC')::INTEGER AS hour,
+                    {agg_sql}
+                FROM feature_store
+                WHERE {' AND '.join(conditions)}
+                GROUP BY 1, 2
+                ORDER BY 1, 2
+            """, params).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_heatmap fehlgeschlagen: {e}")
+            return self._empty_heatmap(symbol, timeframe, metric)
+
+        # Matrix: rows=Stunde (0-23), cols=DOW (0-6). count -> 0, avg -> nan.
+        fill = 0.0 if metric_key == "count" else float("nan")
+        matrix = np.full((HOURS_PER_DAY, DAYS_PER_WEEK), fill, dtype=float)
+        for r in rows:
+            dow = int(r[0])
+            hour = int(r[1])
+            val = r[2]
+            if 0 <= dow < DAYS_PER_WEEK and 0 <= hour < HOURS_PER_DAY and val is not None:
+                matrix[hour][dow] = float(val)
+
+        return {
+            "matrix": matrix.tolist(),
+            "x_labels": list(DOW_LABELS),
+            "y_labels": [f"{h:02d}:00" for h in range(HOURS_PER_DAY)],
+            "metric": metric,
+            "symbol": symbol,
+            "timeframe": timeframe,
+        }
+
+    def _empty_heatmap(
+        self, symbol: str, timeframe: str, metric: str
+    ) -> Dict[str, Any]:
+        """Leere Heatmap (keine Daten / Fehler / fehlende Filter)."""
+        fill = 0.0 if str(metric).lower() == "count" else float("nan")
+        return {
+            "matrix": np.full(
+                (HOURS_PER_DAY, DAYS_PER_WEEK), fill, dtype=float
+            ).tolist(),
+            "x_labels": list(DOW_LABELS),
+            "y_labels": [f"{h:02d}:00" for h in range(HOURS_PER_DAY)],
+            "metric": metric,
+            "symbol": symbol,
+            "timeframe": timeframe,
+        }
+
+    # ------------------------------------------------------------------
+    # Lesen: Metadaten
+    # ------------------------------------------------------------------
+    def get_available_features(
+        self, symbol: str, timeframe: str
+    ) -> Dict[str, Any]:
+        """Liefert verfuegbare Plugin-IDs, native Spalten und Zeilenzahl.
+
+        Returns:
+            {"feature_ids": [...], "columns": [...], "total_rows": int}
+        """
+        con = self._get_connection()
+        try:
+            ids = [r[0] for r in con.execute("""
+                SELECT DISTINCT feature_id FROM feature_store
+                WHERE feature_id IS NOT NULL AND feature_id != ''
+                ORDER BY feature_id
+            """).fetchall()]
+            total = con.execute("""
+                SELECT COUNT(*) FROM feature_store
+                WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+            """, [symbol, timeframe]).fetchone()
+            total = int(total[0]) if total and total[0] is not None else 0
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] get_available_features "
+                  f"fehlgeschlagen: {e}")
+            return {"feature_ids": [], "columns": list(NATIVE_COLUMNS),
+                    "total_rows": 0}
+        return {
+            "feature_ids": [str(i) for i in ids],
+            "columns": list(NATIVE_COLUMNS),
+            "total_rows": total,
+        }
+
+    def exists(self) -> bool:
+        """True, wenn die analytics.duckdb-Datei existiert."""
+        return os.path.exists(self.db_path)
