@@ -147,3 +147,34 @@ Zusätzlich: `py_compile` auf `analytics_profile_repository.py`, `db_service.py`
 | C AnalyticsRepository | C1–C9 | get_table/get_scatter/get_distribution, ValueError bei unerlaubten Spalten, Metadaten |
 
 Zusätzlich: `py_compile` auf Reader, Repository und Test (Exit 0). Keine UI-/Regressionstests (Regel 4).
+
+### 3.4 Schritt 4 – Analytics-ViewModel & Async-Worker
+
+**`analytics/engine/analytics_worker.py` (NEU):** `AnalyticsAsyncWorker` (QThread, EINWEG-Worker – eine Abfrage pro Instanz) fuer asynchrone DuckDB-Queries (15.03-Spez: „Async-Worker mit Progress-Spinner / No Data-Overlay"). Analogie: `ServiceSetRunWorker`/`LiveAnalyzer`.
+* `QUERY_TABLE/QUERY_HEATMAP/QUERY_SCATTER/QUERY_DISTRIBUTION/QUERY_FEATURES` – query_kind-Konstanten (Single Source of Truth fuer Worker & ViewModel).
+* Dispatch auf `AnalyticsRepository`-Methoden (lesend, kein SQL im Worker; Invariante 4).
+* Thread-Safety: Der Worker-Thread erhaelt ueber den Thread-local `DbPool` automatisch seine eigene DB-Connection (Invariante 6), blockiert nie den Hauptthread.
+* **Max-Lookback-Cap (15.03-Spez):** `MAX_LOOKBACK_LIMIT = 50_000` + `cap_lookback_limit()` deckeln alle limit-Parameter hart (None bleibt None/Repo-Default, Werte < 1 → 1).
+* Signale `finished_ok(str, dict)` / `failed(str, str)` (vom Worker-Thread; Qt Queued Connection zum ViewModel). `cancel()` unterdrueckt Ergebnis-Signale.
+
+**`analytics/engine/analytics_view_model.py` (NEU):** `AnalyticsViewModel` (QObject) – MVVM-Vermittler zwischen Repository, Async-Worker und UI-Pages (kein SQL, kein UI; nur Qt-Core).
+* **Datenfluss:** UI ruft `request_*()`/`set_*()` auf → ViewModel puffert Parameter → **Debounce-QTimer (250 ms, 15.03-Spez 200–300 ms)** → `AnalyticsAsyncWorker` → `data_ready(query_kind, data)`. Parameternaenderungen feuern die betroffenen Abfragen automatisch nach (symbol/timeframe/feature_id → alle; heatmap_metric → Heatmap; scatter_x/y → Scatter; column/bins → Verteilung; limit → Tabelle/Scatter/Verteilung).
+* **Progress-Spinner:** `busy_changed(bool)` True beim Worker-Start, False wenn die Warteschlange leer ist; mehrere gepufferte Kinds werden sequenziell abgearbeitet (`_pending_kinds`-Queue).
+* **Profil-Verwaltung (Option B – Explicit Save):** `create_profile` (sofort aktiv, genau EIN aktives), `save_profile` (persistiert aktuelle Parameter in den Payload inkl. `schema_version`), `update_profile` (Name/Beschreibung additiv), `delete_profile`, `set_active_profile`/`load_profiles`; **Dirty-Flag** `dirty_changed(bool)` nur bei vorhandenem aktivem Profil (Slider-/Parametertrends → `*` im Titel/Combo; Save setzt zurueck).
+* **EventBus (Invariante 5):** Profilwechsel (create/save/activate/update) emittiert `event_bus.profile_changed(name)`.
+* **Clamping:** `set_bins` (≥ 2), `set_limit` (1…`MAX_LOOKBACK_LIMIT`); `_apply_profile` uebernimmt Profil-Parameter typ-sicher und loest `refresh_all()` aus.
+* Properties fuer UI-Dropdowns: `heatmap_metrics`, `native_columns`, `max_lookback_limit`, `params`, `active_profile`, `profiles`, `is_dirty`.
+* `shutdown()` stoppt Debounce + laufenden Worker (Fenster schliessen).
+
+**Headless-Test (`test/check_p15_s3_worker_vm.py`, NEU):** Test-DBs in `test/` (`p15_s3_worker_analytics.duckdb`, `p15_s3_worker_app.duckdb`); asynchroner Datenfluss nur mit `QCoreApplication` + `processEvents()` (KEIN GUI, kein `exec()`).
+
+**Ergebnis: 49/49 Checks PASS** (Exit 0):
+
+| Bereich | Checks | Inhalt |
+| --- | --- | --- |
+| A Worker-Dispatch & Cap | A1–A9 | Dispatch aller 5 Kinds (RecordingRepo-Stub), **limit-Cap 100.000→50.000**, None/negativ, `cap_lookback_limit`, unbekannter Kind → failed |
+| B Worker + echtes Repo | B1–B5 | get_table/heatmap/scatter/distribution/features via `run()` mit Test-DB |
+| C ViewModel Profil & Dirty | C1–C23 | create→aktiv + EventBus, Payload mit `schema_version`, Duplikat→ValueError, Dirty→Save→Dirty False, set_active/delete, limit-Cap, Properties |
+| D ViewModel asynchron | D1–D7 | Debounce+Worker-Thread → data_ready aller 5 Kinds, Heatmap-Daten, `busy_changed` True/False, keine query_failed |
+
+Zusätzlich: `py_compile` auf Worker, ViewModel und Test (Exit 0); bestehende Tests `check_p15_s3_profiles.py` (30/30) und `check_p15_s3_reader_repo.py` (39/39) weiterhin PASS (reine Additions, keine Bestandsdatei veraendert). Keine UI-/Regressionstests (Regel 4).
