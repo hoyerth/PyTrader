@@ -10,7 +10,6 @@ PyTrader/
     persistent_win.py
     properties_win.py
     scrollable_content.py
-    service_win.py
     state_manager.py
     statistic_win.py
     .backup_7B_step18/
@@ -92,6 +91,7 @@ PyTrader/
                 grid_levels.py
                 grid_lines_service.py
                 grid_liquidity.py
+                grid_math.py
                 proximity_service.py
             plugins/
                 __init__.py
@@ -120,7 +120,6 @@ PyTrader/
         indicators/
             __init__.py
             base_indicator.py
-            grid.py
             grid_liquidity.py
         js/
             01_core.js
@@ -142,6 +141,14 @@ PyTrader/
     data/
         analytics.duckdb.tmp/
         custom_plugins/
+    serviceui/
+        __init__.py
+        param_columns.py
+        service_set_utils.py
+        service_win.py
+        set_item_adapter.py
+        set_run_worker.py
+        trash_dialog.py
     test/
         build_cont_map.py
         check_app_state.py
@@ -199,8 +206,8 @@ PyTrader/
         check_statistics_repo.py
         check_time_constants.js
         check_time_utils.js
+        grid_ref.py
         simulate_chart_mapping.py
-        test.py
         test_db_lock.py
         tmp_cont_map.json
     ui/
@@ -326,6 +333,11 @@ Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukture
 ```md
 # Architektur-Dokumentation: PyTrader System-Architektur
 
+> **Single Point of Truth:** Dieses Dokument ist die verbindliche Architektur-Datei.
+> Archiv-/Alt-Fassungen (`docs/Old/`) werden nicht mehr gepflegt. Detaillierte
+> Modul- und Tabellen-Beschreibungen liegen direkt im Code (Modul-Docstrings,
+> `db_service.py` als Schema-Source-of-Truth).
+
 ## 1. Executive Summary
 
 Dieses Dokument beschreibt die verbindlichen Architektur-Richtlinien für das PyTrader-System. Das Kernziel ist die Bereitstellung einer hochperformanten, vollständig entkoppelten Desktop-Architektur (Python / PySide6 / DuckDB). Sie ermöglicht historische Massen-Scans, Echtzeit-Marktüberwachung (Live-Analyzer) und visuelle Chart-Analysen ohne redundante Code-Basis, Thread-Sperren oder UI-Blockaden.
@@ -357,8 +369,10 @@ Die Benutzeroberfläche (Chart-Windows, Statistik-Fenster, Service-Fenster) darf
  ┌───────────────────────────────────────────────────────────────┐
  │                     DuckDB Data Layer                         │
  │ - market_data.duckdb : ohlcv_bars                             │
- │ - analytics.duckdb   : feature_store, signal_results          │
- │ - app_data.duckdb    : indicator_presets, window_instances    │
+ │ - analytics.duckdb   : feature_store (Hybrid),                │
+ │                       signal_results (Legacy)                 │
+ │ - app_data.duckdb    : indicator_presets, service_sets,       │
+ │                       window_instances                        │
  └───────────────────────────────────────────────────────────────┘
 
 ```
@@ -367,67 +381,52 @@ Die Benutzeroberfläche (Chart-Windows, Statistik-Fenster, Service-Fenster) darf
 
 Berechnungs-Engines sind strikt zustandslos (*stateless*).
 
-* **Zustandslosigkeit:** Jede Berechnung ist eine reine Funktion `calculate(df, params)`.
+* **Zustandslosigkeit:** Jede Berechnung ist eine reine Funktion `calculate(df, params, context)`.
 * **Einheitliches Interface:** Neue Features und Indikator-Engines erben von `PluginFeature` unter `analytics/features/plugins/base_plugin.py`.
 * **Zentrale Ausführungsschicht (`PluginExecutor`):** Der Zugriff durch Scanner, LiveAnalyzer oder Chart-UI erfolgt ausschließlich über `PluginExecutor`, der Parametervalidierung (`ParameterSchema`), Dependency-Ordering und Logging übernimmt.
-
+* **Service-Pipeline (`ServiceSetEvaluator`):** Führt Service-Sets (`ServiceSetDefinition`) in `execution_order` aus; Abhängigkeiten laufen über `depends_on`/`instance_id` und `PluginContext.shared_state` (Namespace-isoliert).
 
 ### 2.3. Hybrid Feature Store
 
 Um Rechenlast zu minimieren, werden Rohdaten (OHLCV) vorab transformiert:
 
-* **Native High-Speed Spalten:** Häufig abgefragte Werte (`ema_diff`, `rsi_14`, `atr_normalized`) liegen als native Tabellenspalten für maximale Query-Performance vor.
-* **Generisches JSON-Payload:** Beliebige dynamische Zusatzdaten neuer Plugins werden im Feld `feature_data JSON` abgelegt, verknüpft mit der stabilen `feature_id`.
-
-
+* **Native High-Speed Spalten:** Häufig abgefragte Werte (`ema_diff`, `atr_normalized`, `grid_nearest_level`) liegen als native Tabellenspalten für maximale Query-Performance vor.
+* **Generisches JSON-Payload:** Beliebige dynamische Zusatzdaten neuer Plugins werden im Feld `feature_data JSON` abgelegt, verknüpft mit der stabilen `feature_id` und `plugin_version`.
 
 ### 2.4. Thread-Sicherer Database Connection Pool (`DbPool`)
 
 * DuckDB-Connections sind nicht thread-safe. PyTrader verwendet das Thread-Local Singleton `DbPool` (`db_service.py`), bei dem jeder Thread seine eigene Verbindung hält.
 * Dies verhindert File-Locking-Fehler unter Windows und erübrigt globale Threading-Locks auf Datenbankebene.
 
-### 2.5. Verbindliche UI-Regel: Farbwahl ausschließlich über `ColorButton`
-
-Farbwerte im gesamten UI werden **ausschließlich** über das kompakte Custom-Widget `ColorButton` (`chart/widgets/color_button.py`) erfasst – **niemals** über freie Texteingabefelder (`QLineEdit`) oder andere Eingabe-Typen.
-
-* **Geltungsbereich (VERBINDLICH):** Jeder Parameter vom Typ `"color"` im `ParameterSchema` einer Plugin- oder Service-Definition wird **IMMER** als `ColorButton` gerendert – in allen Formular-Generatoren (`indicator_dialog.py`, `service_win.py`) und für alle aktuellen wie zukünftigen Plugin-/Service-Definitionen. Ein Farbparameter ohne `ColorButton` ist ein Fehler.
-* **Alpha-Kanal:** Das optionale Schema-Flag `allow_alpha: bool` (Default `True`) schaltet den Transparenz-Slider im `QColorDialog` frei (`ShowAlphaChannel`).
-* **String-Format (CSS/Chart-kompatibel):**
-  * Alpha = 255 (volle Deckkraft) → Hex-Format `#RRGGBB`.
-  * Alpha < 255 (Teil-Transparenz) → `rgba(r, g, b, a)` (a als Float 0..1).
-  * Beide Formate sind 1:1 kompatibel mit TradingView Lightweight Charts v5 (WebEngine) und HTML/CSS.
-* **Persistenz:** Die von `ColorButton.color()` gelieferten Strings werden unversehrt in Presets, Service-Sets und Chart-State (`display_params`) gespeichert und über den `chart_render_payload` an die Chart-Overlays weitergereicht.
-* **Kompaktes Layout:** `ColorButton` hat eine feste Kompaktgröße (60×24 px) und `QSizePolicy.Fixed` – es blockiert die dynamische Höhen-/Breiten-Berechnung des Prop-Fensters nicht (Roadmap 5.5.2.1 Prämisse 3).
-* **Interaktion:** `colorChanged = Signal(str)` ist mit der Parameter-Aktualisierungs-Logik des Dialogs verknüpft (gleicher Callback wie alle anderen Controls).
-
 ---
 
 ## 3. Ordner- & Modul-Layout
 
-Das Projekt folgt einer klaren Domain-Struktur:
+Domain-Struktur (Ebene 1). Detaillierte Modulübersichten liegen direkt im Code (Modul-Docstrings):
 
 ```text
 PyTrader/
-├── analytics/                      # Analyse- & Berechnungsdomäne
-│   ├── background_workers/         # QThread Hintergrund-Prozesse (Scanner, LiveAnalyzer)
-│   ├── engine/                     # Signal-Evaluierung & Set-Logik (set_evaluator.py)
-│   ├── features/                   # Feature-Generierung & Plugin-System
-│   │   ├── feature_builder.py      # PluginLoader, PluginRegistry, PluginExecutor
-│   │   ├── definitions/            # Konkrete Plugins (grid_liquidity.py, ema_diff.py)
-│   │   └── plugins/                # Plugin-Schnittstellen (base_plugin.py)
-│   └── signals/                    # Signal-Algorithmen (heuristics, ML)
-├── chart/                          # Visualisierungsdomäne
-│   ├── js/                         # Lightweight Charts v5 Module (01_core.js - 05_measurement.js)
-│   ├── indicators/                 # Chart-Indikatoren (grid.py, grid_liquidity.py)
-│   ├── overlays/                   # Signal-Marker Overlays
-│   ├── widgets/                    # Wiederverwendbare UI-Widgets (color_button.py)
-│   ├── chart_win.py                # PyTraderChartWindow (WebEngine-Container)
-│   └── indicator_dialog.py         # Generischer Einstellungs-Dialog
+├── analytics/                      # Berechnungsdomäne
+│   ├── background_workers/         # QThread-Hintergrundprozesse (historical_scanner, live_analyzer)
+│   ├── engine/                     # Evaluierung & Service-Set-Logik (set_evaluator, service_models,
+│   │                               #  service_set_repository, schema_migrator, base_definition)
+│   ├── features/                   # Feature-Generierung & Plugin-System (feature_builder, definitions/, plugins/)
+│   ├── signals/                    # Signal-Algorithmen (Alt-Pfad, deaktiviert)
+│   └── statistics_repository.py    # SQL-Aggregationen auf feature_data (Statistik)
+├── chart/                          # Visualisierungsdomäne (js/, indicators/, overlays/, widgets/,
+│   │                               #  chart_win.py, indicator_dialog.py)
 ├── config/                         # App-Einstellungen & State-Modelle
-├── data/                           # DuckDB Datenbanken (*.duckdb)
-├── db_service.py                   # MT5-Sync, DB-Pool & Schema-Migrationen
+├── ui/                             # Qt-Designer-Dateien (*.ui)
+├── data/                           # DuckDB-Datenbanken (*.duckdb) + custom_plugins/
+├── db_service.py                   # MT5-Sync, DbPool & Schema-Migrationen
 ├── main.py                         # Haupt-Orchestrator (MainWindow)
-├── persistent_win.py               # Basisklasse für Fenster-Persistence & Registry
+├── persistent_win.py               # Fenster-Persistence & Registry
+├── serviceui/                       # Service-UI-Paket (Phase 15): service_win.py,
+│   │                               #  set_run_worker.py, set_item_adapter.py,
+│   │                               #  param_columns.py, trash_dialog.py, service_set_utils.py
+├── statistic_win.py                # Statistik-Fenster
+├── properties_win.py               # Properties-Fenster
+├── scrollable_content.py           # Scrollbare Content-Mixin
 └── state_manager.py                # UI-Status, Fenstergeometrien & Presets
 
 ```
@@ -438,20 +437,15 @@ PyTrader/
 
 ### 4.1. Historischer Scan (Batch)
 
-1. User startet den Scan im Service-Fenster (`service_win.py`).
-2. `HistoricalScanner` (QThread) lädt OHLCV-Daten aus `market_data.duckdb`.
-3. Aktive Presets werden anhand von `plugin_id` aus `indicator_presets` gelesen.
-4. Der `PluginExecutor` führt `plugin.calculate(df, params)` aus.
-5. `FeatureStorePayload` wird via Bulk-Insert/Upsert in den `feature_store` geschrieben.
-6. `SignalEngine` evaluiert Signale und schreibt Ergebnisse in `signal_results`.
-
+1. `HistoricalScanner` (QThread) lädt OHLCV aus `market_data.duckdb` und führt aktive Batch-Presets/Service-Sets über den `PluginExecutor` aus.
+2. `FeatureStorePayload` wird per Bulk-Upsert in den `feature_store` geschrieben (`feature_id`, `plugin_version`, `feature_data`).
+3. Chart-Marker und Statistik lesen ausschließlich aus dem `feature_store` – **keine `signal_results`-Writes** (seit Phase 13 Schritt 7.B; die Tabelle bleibt als Legacy erhalten).
 
 ### 4.2. Echtzeit-Analyse (Live-Stream)
 
-1. `LiveTickWorker` empfängt MT5-Ticks, erkennt Bar-Closes und persistiert geschlossene Kerzen.
-2. `LiveAnalyzer` evaluiert für die neue Kerze das Plugin via `PluginExecutor`.
-3. Erzeugte Signale werden in `signal_results` gespeichert und per Qt-Signal (`on_live_signal`) an offene `PyTraderChartWindow`-Instanzen emittiert.
-4. Das Chart-Fenster aktualisiert ausschließlich das Marker-Overlay via JS-Bridge, ohne den Chart neu aufzubauen.
+1. `LiveTickWorker` erkennt Bar-Closes; `LiveAnalyzer` bewertet die neue Kerze über den resilienten Pfad (`execute_set_resilient`, Skip-Logic, RAM-Quarantäne) gegen das im `PluginContext.shared_state` gepufferte Raster.
+2. Ergebnisse werden in den `feature_store` geschrieben; der Chart liest sie über den feature_id-Lesepfad (New-Candle-Callback, debounced).
+3. Das Chart-Fenster aktualisiert ausschließlich Overlays/Marker via JS-Bridge, ohne den Chart neu aufzubauen.
 
 ---
 
@@ -474,14 +468,15 @@ Jedes Refactoring und jede Code-Generierung muss strikt folgenden Prinzipien ent
 * **Repository/Service-Klassen:** Kapseln den Datenbank-Zugriff (`db_service.py`, `StatisticsRepository`, `MarketDataRepository`).
 
 4. **Open/Closed Principle:**
-* Neue Indikatoren oder Feature-Plugins werden durch Hinzufügen neuer Dateien unter `analytics/features/definitions` implementiert. Bestehender Rumpfcode darf dafür nicht geändert werden.
+* Neue Indikatoren oder Feature-Plugins werden durch Hinzufügen neuer Dateien unter `analytics/features/definitions` implementiert. Bestehender Rumpfcode darf dafür nicht geändert werden; Erweiterungen erfolgen strikt additiv (Wrapper/Schnittstellen).
 
 5. **Typsicherheit:**
 * Strikte Nutzung von Python Type Hints (`typing`, `TypedDict`).
-* Der Datenaustausch zwischen Plugins und UI/Services folgt typisierten Verträgen (`ChartRenderPayload`, `FeatureStorePayload`).
+* Der Datenaustausch zwischen Plugins und UI/Services folgt typisierten Verträgen (`ChartRenderPayload`, `FeatureStorePayload`, `ServiceSetDefinition`).
 
 6. **Knappe In-Code-Dokumentation bei Anforderungsänderungen:**
 * Bei allen neuen oder angepassten Logiken (insbesondere manuellen User-Vorgaben) muss direkt in den geänderten Sourcedateien an der betroffenen Stelle ein knapper Inline-Kommentar (1–2 Zeilen, z. B. `# USER-REQ: [Kurzbeschreibung der Anforderung]`) gesetzt werden, der den Grund der Code-Anpassung nachvollziehbar dokumentiert.
+
 ```
 
 --------------------------------------------------
@@ -1124,7 +1119,7 @@ from state_manager import StateManager
 from persistent_win import PersistentWindow
 from db_service import get_timeframes, TF_SECONDS_MAP, MT5_LOCK, DbPool
 import db_service
-from service_win import ServiceWindow
+from serviceui.service_win import ServiceWindow
 from statistic_win import StatisticWindow
 from properties_win import PropertiesWindow
 from config.app_settings import AppSettings
@@ -2289,1410 +2284,6 @@ class ContentScrollMixin:
 
 --------------------------------------------------
 
-### DATEI: service_win.py
-```py
-# service_win.py
-"""
-Service-Kontrollfenster für PyTrader.
-Steuert den Historical Scanner (Full-Scan / Delta-Update) über ein separates Fenster.
-Mit automatischem State Persistence via PersistentWindow.
-
-Phase 13 Schritt 4: Zusätzlich Service-Set-Verwaltung (ServiceSetRepository +
-ServiceSetEvaluator): Set-Auswahl (list_sets()), execution_order-Anzeige mit
-Up/Down-Umsortierung, Name (leer → Auto-Name), Speichern/Löschen (mit
-QMessageBox-Rückfrage) und Ausführen (ServiceSetEvaluator im Hintergrund).
-"""
-
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-
-from PySide6.QtCore import QFile, QIODevice, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtUiTools import QUiLoader
-from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFormLayout, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMessageBox, QProgressBar, QPushButton, QSizePolicy, QSpinBox, QTextEdit,
-    QVBoxLayout, QWidget,
-)
-
-from analytics.background_workers.historical_scanner import HistoricalScanner
-from analytics.engine.description_dialog import ServiceDescriptionDialog
-from analytics.engine.service_set_repository import ServiceSetRepository
-from analytics.engine.set_evaluator import ServiceSetEvaluator
-from persistent_win import PersistentWindow, register_persistent_window
-from scrollable_content import ContentScrollMixin
-from chart.widgets.named_item_actions import NamedItemAdapter, NamedItemActionsMixin
-
-BASE_DIR = Path(__file__).resolve().parent
-
-
-def _available_plugin_ids() -> str:
-    """Alle registrierten Plugin-IDs (sortiert, kommasepariert).
-
-    Phase 13 Schritt 6-Korrektur: Die Verfügbarkeit wird dynamisch aus der
-    PluginRegistry abgeleitet (grid_lines, proximity, grid_liquidity, ...),
-    NICHT hartkodiert auf 'grid_liquidity'.
-    """
-    try:
-        from analytics.features.feature_builder import PluginRegistry
-        return ", ".join(sorted(PluginRegistry().plugins.keys()))
-    except Exception:
-        return "?"
-
-
-def _sets_using_plugin(plugin_id: str, sets: List[Dict[str, Any]]) -> List[str]:
-    """P14-04-E: Namen aller Service-Sets, die einen Service mit dieser
-    plugin_id enthalten.
-
-    Basis der Service-Sperre: Einzel-Services, die in einem gespeicherten
-    Service-Set vorkommen, dürfen im Service-Fenster nicht entfernt werden
-    (Indikator-Basisservices wie grid_lines/proximity bleiben funktionsfähig).
-    Beim Löschversuch wird der Name des verwendeten Sets angezeigt.
-    """
-    names: List[str] = []
-    for s in sets or []:
-        services = s.get("services") or {}
-        if any((cfg or {}).get("plugin_id") == plugin_id
-               for cfg in services.values()):
-            names.append(str(s.get("display_name") or s.get("set_id") or "?"))
-    return names
-
-
-class ServiceSetRunWorker(QThread):
-    """Phase 13 Schritt 4: Führt ein Service-Set im Hintergrund aus.
-
-    Lädt OHLCV (Symbol/Timeframe) und ruft ServiceSetEvaluator.execute_set()
-    in einem separaten Thread auf, damit die GUI nicht blockiert.
-    """
-
-    log_message = Signal(str)
-    run_finished = Signal(str, int)  # set_id, Anzahl erfolgreicher Services
-    run_failed = Signal(str, str)    # set_id, Fehlermeldung
-
-    def __init__(self, evaluator: ServiceSetEvaluator, symbol: str, timeframe: str,
-                 set_definition: Dict[str, Any], parent=None):
-        super().__init__(parent)
-        self.evaluator = evaluator
-        self.symbol = symbol
-        self.timeframe = timeframe
-        self.set_definition = set_definition
-
-    def run(self):
-        try:
-            from analytics.features.feature_builder import FeatureBuilder, prepare_plugin_df
-            from analytics.features.plugins.base_plugin import PluginContext
-            from state_manager import StateManager
-
-            settings = StateManager().get_app_settings()
-            fb = FeatureBuilder()
-            df = fb.load_ohlcv(self.symbol, self.timeframe, limit=settings.feature_builder_limit)
-            if df is None or df.empty:
-                self.run_failed.emit(
-                    self.set_definition.get("set_id", ""),
-                    f"Keine OHLCV-Daten fuer {self.symbol} {self.timeframe}.",
-                )
-                return
-
-            df_plugin = prepare_plugin_df(df)
-            context = PluginContext(
-                symbol=self.symbol,
-                timeframe=self.timeframe,
-                mode="batch",
-                timestamp=int(df_plugin["time"].iloc[-1]) if len(df_plugin) else None,
-                settings=settings,
-            )
-            display = self.set_definition.get("display_name") or self.set_definition.get("set_id") or "Unbenannt"
-            self.log_message.emit(f"Ausfuehren: {display} ({self.symbol} {self.timeframe})")
-
-            results = self.evaluator.execute_set(self.set_definition, df_plugin, context=context)
-            for iid in results:
-                self.log_message.emit(f"  {iid}: fertig")
-            self.run_finished.emit(self.set_definition.get("set_id", ""), len(results))
-        except Exception as e:
-            self.run_failed.emit(self.set_definition.get("set_id", ""), str(e))
-
-
-class _ServiceSetItemAdapter(NamedItemAdapter):
-    """Adapter für die SERVICE-SET-Sammlung im Service-Fenster.
-
-    Phase 13 Schritt 8: Die Service-Set-Verwaltung (Speichern/Löschen) nutzt
-    exakt dieselbe generische Preset-Mechanik wie das Indikator-Prop-Fenster
-    (NamedItemActionsMixin). Die _item_*-Protokoll-Methoden liegen in diesem
-    Adapter und greifen auf das ServiceWindow (self.dlg) zu.
-    """
-
-    def __init__(self, dlg: "ServiceWindow") -> None:
-        self.dlg = dlg
-
-    def _item_scope_label(self) -> str:
-        return "Service-Set"
-
-    def _item_current_name(self) -> str:
-        return self.dlg.edit_set_name.text().strip() if self.dlg.edit_set_name else ""
-
-    def _item_current_id(self) -> Optional[str]:
-        if self.dlg._current_set_id:
-            return self.dlg._current_set_id
-        if self.dlg.combo_set:
-            return self.dlg.combo_set.currentData()
-        return None
-
-    def _item_auto_name(self) -> str:
-        """Auto-Name aus den instance_ids (Roadmap: leerer Name → Auto-Name)."""
-        try:
-            definition = self.dlg.collect_set_definition()
-            definition["display_name"] = ""
-            return ServiceSetRepository._default_display_name(definition)
-        except Exception as e:
-            print(f"⚠️ [ServiceWindow] Auto-Name fehlgeschlagen: {e}")
-            return ""
-
-    def _item_list_names(self) -> List[str]:
-        return [s.get("display_name") or "" for s in self.dlg.set_repo.list_sets()]
-
-    def _item_exists(self, name: str) -> bool:
-        """True, wenn ein ANDERES Set bereits diesen Namen trägt."""
-        current = self._item_current_id()
-        return any(
-            (s.get("display_name") or "") == name and s.get("set_id") != current
-            for s in self.dlg.set_repo.list_sets()
-        )
-
-    def _item_save_as(self, name: str) -> Optional[str]:
-        """Speichert das Set unter 'name'; liefert die set_id zurück."""
-        definition = self.dlg.collect_set_definition()
-        if not definition.get("execution_order"):
-            self.dlg.log("Keine Services in der Ausführungs-Reihenfolge – "
-                         "Speichern abgebrochen.")
-            return None
-        if not definition.get("services"):
-            self.dlg.log("WARNUNG: Set hat keine services-Konfiguration "
-                         "(nur Reihenfolge wird gespeichert).")
-        definition["display_name"] = name
-        set_id = self.dlg.set_repo.save_set(definition)
-        self.dlg.log(f"Set gespeichert: {set_id}")
-        return set_id
-
-    def _item_delete_current(self) -> bool:
-        set_id = self._item_current_id()
-        if not set_id:
-            self.dlg.log("Kein Set zum Löschen ausgewählt.")
-            return False
-        if self.dlg.set_repo.delete_set(set_id):
-            # P14-05: Soft-Delete – das Set liegt im Papierkorb und kann über
-            # den Papierkorb-Dialog wiederhergestellt werden.
-            self.dlg.log(f"Set in den Papierkorb verschoben (P14-05): {set_id}")
-            return True
-        self.dlg.log(f"Set '{set_id}' nicht gefunden.")
-        return False
-
-    def _item_select(self, set_id: Optional[str] = None) -> None:
-        """Setzt die Set-Auswahl nach Speichern (set_id) bzw. Löschen (None)."""
-        self.dlg._current_set_id = None  # Neuauswahl erzwingen (sonst bleibt Alt-Selektion)
-        self.dlg.refresh_set_list()
-        if set_id and self.dlg.combo_set:
-            idx = self.dlg.combo_set.findData(set_id)
-            if idx >= 0:
-                self.dlg.combo_set.setCurrentIndex(idx)
-
-    def _item_reserved_name(self) -> Optional[str]:
-        return None  # Service-Sets haben kein geschütztes 'Default'-Set
-
-
-@register_persistent_window(auto_restore=False)
-class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow):
-    INSTANCE_ID = "win_service"
-
-    def __init__(self, parent=None, service_set_repo: Optional[ServiceSetRepository] = None):
-        super().__init__(parent)
-        self.scanner: Optional[HistoricalScanner] = None
-        self._elapsed_timer = QTimer(self)
-        self._elapsed_seconds = 0
-        self._elapsed_timer.timeout.connect(self._update_elapsed)
-
-        # Phase 13 Schritt 4: Service-Set-Verwaltung
-        self.set_repo: ServiceSetRepository = service_set_repo or ServiceSetRepository()
-        self.set_evaluator = ServiceSetEvaluator()
-        self._set_run_worker: Optional[ServiceSetRunWorker] = None
-        self._current_set_id: Optional[str] = None
-        self._current_set_definition: Optional[Dict[str, Any]] = None
-        # USER-REQ (P14-03): Preisskala-Praezision je Symbol fuer die 6
-        # Custom-Level-Eingabefelder (prox_level1..6). Lazy + gecacht.
-        self._symbol_precision: Optional[int] = None
-
-        # Phase 13 Schritt 8: Service-Set-Adapler für die generische
-        # Neu-/Speichern-/Löschen-Mechanik (NamedItemActionsMixin) – exakt
-        # analog zur Preset-Verwaltung im Indikator-Prop-Fenster.
-        self._set_adapter = _ServiceSetItemAdapter(self)
-
-        # UI laden
-        ui_file = QFile(str(BASE_DIR / "ui" / "service_win.ui"))
-        if ui_file.open(QIODevice.ReadOnly):
-            loader = QUiLoader()
-            self.ui = loader.load(ui_file)
-            ui_file.close()
-            self.setCentralWidget(self.ui)
-        else:
-            self.ui = QWidget(self)
-            self.setCentralWidget(self.ui)
-
-        self.setWindowTitle("PyTrader - Service Kontrolle")
-
-        # Controls
-        self.combo_symbol: QComboBox = self.ui.findChild(QComboBox, "combo_symbol")
-        self.check_new_scan: QCheckBox = self.ui.findChild(QCheckBox, "check_new_scan")
-        self.check_grid_scan: QCheckBox = self.ui.findChild(QCheckBox, "check_grid_scan")
-        self.btn_start: QPushButton = self.ui.findChild(QPushButton, "btn_start_scan")
-        self.label_elapsed: QLabel = self.ui.findChild(QLabel, "label_elapsed_value")
-        self.progress_bar: QProgressBar = self.ui.findChild(QProgressBar, "progress_bar")
-        self.text_log: QTextEdit = self.ui.findChild(QTextEdit, "text_log")
-
-        # Phase 13 Schritt 4: Service-Set-Controls
-        self.combo_set: QComboBox = self.ui.findChild(QComboBox, "combo_set")
-        self.combo_tf_set: QComboBox = self.ui.findChild(QComboBox, "combo_tf_set")
-        self.btn_refresh_sets: QPushButton = self.ui.findChild(QPushButton, "btn_refresh_sets")
-        self.edit_set_name: QLineEdit = self.ui.findChild(QLineEdit, "edit_set_name")
-        # Phase 14 P14-01: Set-Beschreibung + Info-Button (ServiceDescriptionDialog)
-        self.edit_set_description: Optional[QLineEdit] = self.ui.findChild(QLineEdit, "edit_set_description")
-        self.btn_info_service: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_info_service")
-        self.list_execution_order: QListWidget = self.ui.findChild(QListWidget, "list_execution_order")
-        self.btn_move_up: QPushButton = self.ui.findChild(QPushButton, "btn_move_up")
-        self.btn_move_down: QPushButton = self.ui.findChild(QPushButton, "btn_move_down")
-        self.btn_remove_instance: QPushButton = self.ui.findChild(QPushButton, "btn_remove_instance")
-        self.edit_new_instance: QLineEdit = self.ui.findChild(QLineEdit, "edit_new_instance")
-        self.btn_add_instance: QPushButton = self.ui.findChild(QPushButton, "btn_add_instance")
-        # Phase 14 P14-02: Hot-Reload-Button für Custom-Plugins
-        self.btn_reload_plugins: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_reload_plugins")
-        # Phase 13 Schritt 6-Korrektur: Dropdown mit ALLEN verfügbaren Services
-        self.combo_plugin_select: Optional[QComboBox] = self.ui.findChild(QComboBox, "combo_plugin_select")
-        self.btn_save_set: QPushButton = self.ui.findChild(QPushButton, "btn_save_set")
-        self.btn_delete_set: QPushButton = self.ui.findChild(QPushButton, "btn_delete_set")
-        # Phase 14 P14-05: Papierkorb-Button (Soft-Delete/Wiederherstellung)
-        self.btn_trash_sets: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_trash_sets")
-        self.btn_execute_set: QPushButton = self.ui.findChild(QPushButton, "btn_execute_set")
-
-        # Phase 13 5.4 Schritt 1: Dynamische Service-Spalten (Breite/Höhe aus
-        # dem Inhalt – KEINE fixen Pixelwerte). Das Inhalt-Layout erhält
-        # SetFixedSize + AlignTop|AlignLeft: Das Fenster wächst mit der Anzahl
-        # der Spalten nach rechts und beim Ausklappen der Experten-Optionen
-        # nach unten – ohne leeren Raum (Roadmap 5.4.2.2 Punkt 3).
-        #
-        # WICHTIG: Der Spalten-Container wird IM CODE erzeugt (nicht per
-        # QUiLoader). Das QWidgetItem QUiLoader-erzeugter Widgets meldet nach
-        # einer späteren Layout-Änderung einen veralteten sizeHint (Qt-Quirk:
-        # 18x18 bzw. alter Gruppenstand), wodurch die Fensterbreite nicht mit
-        # der Spaltenanzahl wachsen würde. Im Code erzeugte Widgets (wie die
-        # Spalten selbst) werden korrekt weitergereicht.
-        self.group_service_sets: Optional[QGroupBox] = self.ui.findChild(QGroupBox, "group_service_sets")
-        self.widget_service_columns = QGroupBox("Service-Parameter")
-        self.widget_service_columns.setObjectName("widget_service_columns")
-        self.service_columns_layout = QHBoxLayout(self.widget_service_columns)
-        self.service_columns_layout.setSpacing(6)
-        # Inhalt-Widget + Layout VOR dem Scroll-Wrapper referenzieren
-        # (install_content_scroll ersetzt das CentralWidget von self.ui).
-        self.content_widget = self.ui.centralWidget()
-        self.central_layout = self.content_widget.layout() if self.content_widget else None
-        if self.central_layout is not None:
-            # 5.4 User-Anpassung: 'Service-Parameter' oben RECHTS direkt neben
-            # dem Rahmen 'Service-Sets' (gleiche Zeile, Service-Sets links).
-            self.top_row = QHBoxLayout()
-            self.top_row.setSpacing(6)
-            idx = self.central_layout.indexOf(self.group_service_sets)
-            if idx < 0:
-                idx = 0
-            self.central_layout.removeWidget(self.group_service_sets)
-            self.top_row.addWidget(self.group_service_sets)
-            self.top_row.addWidget(self.widget_service_columns)
-            self.central_layout.insertLayout(idx, self.top_row)
-        # Scroll-Wrapper: gesamtes Fenster scrollbar, wenn Inhalt > Bildschirm
-        # (ContentScrollMixin). Der Inhalt behält seine natürliche Größe; das
-        # Fenster wird auf den Bildschirm geklemmt (Scrollbars erscheinen erst,
-        # wenn der Inhalt den Viewport übersteigt).
-        self.install_content_scroll(self.content_widget, install_to=self.ui)
-        self.main_layout = self.ui.layout()
-        # KEIN SetFixedSize auf dem QMainWindowLayout: das würde die
-        # Fenstergröße auf den Inhalt fixieren und das Bildschirm-Cap
-        # (setMaximumSize) überschreiben. Auch das INHALT-Layout bekommt KEIN
-        # SetFixedSize: QLayout.SetFixedSize ruft setFixedSize() auf dem
-        # Inhalt-Widget auf und fixiert es auf die ERSTE Layout-Größe – späteres
-        # Wachstum (Service-Spalten, Experten-Optionen) wäre dadurch blockiert.
-        # Stattdessen setzt resize_to_clamped_content() das Inhalt-Widget in
-        # jedem Reflow explizit auf die aktuelle Layout-Größe (ContentScrollMixin).
-        if self.central_layout is not None:
-            self.central_layout.setSpacing(6)
-            self.central_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self._service_param_controls: Dict[Any, QWidget] = {}
-        # Phase 14 P14-01: Beschreibungs-Eingabefelder der Service-Instanzen
-        self._service_desc_controls: Dict[str, QWidget] = {}
-
-        if self.btn_start:
-            self.btn_start.clicked.connect(self.start_scan)
-
-        # Phase 13 Schritt 4: Service-Set-Signale
-        if self.combo_set:
-            self.combo_set.currentIndexChanged.connect(self._on_set_selected)
-        if self.btn_refresh_sets:
-            self.btn_refresh_sets.clicked.connect(self.refresh_set_list)
-        if self.btn_move_up:
-            self.btn_move_up.clicked.connect(lambda: self.move_order_item(-1))
-        if self.btn_move_down:
-            self.btn_move_down.clicked.connect(lambda: self.move_order_item(1))
-        if self.btn_remove_instance:
-            self.btn_remove_instance.clicked.connect(self.remove_instance)
-        # Phase 14 P14-01: Info-Button + itemClicked-Selektion der Instanzliste
-        self._current_list_iid: Optional[str] = None
-        if self.list_execution_order:
-            self.list_execution_order.itemClicked.connect(self._on_order_item_clicked)
-            self.list_execution_order.itemSelectionChanged.connect(self._sync_list_selection)
-        if self.btn_info_service:
-            self.btn_info_service.clicked.connect(self._show_service_info)
-        if self.btn_add_instance:
-            self.btn_add_instance.clicked.connect(self.add_instance)
-            if self.edit_new_instance:
-                self.edit_new_instance.returnPressed.connect(self.add_instance)
-        if self.btn_save_set:
-            self.btn_save_set.clicked.connect(self.save_set)
-        if self.btn_delete_set:
-            self.btn_delete_set.clicked.connect(self.delete_set)
-        # Phase 14 P14-05: Papierkorb-Dialog (Soft-Delete)
-        if self.btn_trash_sets:
-            self.btn_trash_sets.clicked.connect(self.show_trash_dialog)
-        if self.btn_execute_set:
-            self.btn_execute_set.clicked.connect(self.execute_set)
-
-        # Sofort speichern bei Symbol-Änderung
-        if self.combo_symbol:
-            self.combo_symbol.currentTextChanged.connect(self.save_state)
-            # USER-REQ: Preisskala-Praezision ist je Symbol fix – beim
-            # Symbol-Wechsel Cache invalidieren + Spalten neu bauen.
-            self.combo_symbol.currentTextChanged.connect(self._on_symbol_changed)
-
-        # Set-Dropdown initial befüllen (list_sets() als Quelle)
-        self.refresh_set_list()
-
-        # Phase 13 Schritt 6-Korrektur: Verfügbare Services sichtbar machen –
-        # der Platzhalter im Eingabefeld zeigt jetzt grid_lines + proximity
-        # (die neuen Services aus Schritt 6) statt nur grid_liquidity.
-        if self.edit_new_instance:
-            self.edit_new_instance.setPlaceholderText(
-                "instance_id [plugin_id]  z.B. grid_1 [grid_lines] oder prox_1 [proximity]"
-            )
-        # Dropdown listet ALLE registrierten Services (grid_lines, grid_liquidity,
-        # proximity). Auswahl füllt das Instanz-Feld vor ("plugin_id [plugin_id]").
-        if self.combo_plugin_select:
-            from analytics.features.feature_builder import PluginRegistry
-            for pid in sorted(PluginRegistry().plugins.keys()):
-                self.combo_plugin_select.addItem(pid, pid)
-            self.combo_plugin_select.currentTextChanged.connect(self._on_plugin_select_changed)
-        # Phase 14 P14-02: Hot-Reload der Custom-Plugins (data/custom_plugins/)
-        if self.btn_reload_plugins:
-            self.btn_reload_plugins.clicked.connect(self.reload_plugins)
-        self.log(f"Verfügbare Plugins: {_available_plugin_ids()}")
-
-        # State asynchron wiederherstellen (nach show(), damit move/resize vom Window-Manager akzeptiert werden)
-        QTimer.singleShot(0, self.restore_state)
-
-    # --- PersistentWindow-Interface ---
-
-    def get_persistent_symbol(self) -> str:
-        return self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
-
-    def get_persistent_timeframe(self) -> str:
-        return "H1"
-
-    def _apply_persistent_filters(self, symbol: str, timeframe: str) -> None:
-        if self.combo_symbol:
-            idx = self.combo_symbol.findText(symbol)
-            if idx >= 0:
-                self.combo_symbol.setCurrentIndex(idx)
-
-    def _on_symbol_changed(self, symbol: str) -> None:
-        """USER-REQ: Preisskala-Praezision ist je Symbol fix. Beim Symbol-
-        Wechsel wird der Precision-Cache invalidiert und – falls ein Set
-        aktiv ist – die Service-Spalten neu aufgebaut, damit die 6
-        Custom-Level-Felder (prox_level1..6) die neue Preisskala-Praezision
-        des Symbols anzeigen."""
-        self._symbol_precision = None
-        if (self.combo_set is not None and self.combo_set.currentIndex() >= 0
-                and self.service_columns_layout is not None):
-            self._rebuild_columns()
-
-    # --- Scanner ---
-
-    @Slot()
-    def start_scan(self):
-        if self.scanner and self.scanner.isRunning():
-            self.log("Scan laeuft bereits.")
-            return
-
-        symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
-        new_scan = self.check_new_scan.isChecked() if self.check_new_scan else False
-        grid_scan = self.check_grid_scan.isChecked() if self.check_grid_scan else False
-
-        mode = "GRID PROXIMITY" if grid_scan else "EMA+ATR STANDARD"
-        self.log(f"Starte {mode}-Scan: {symbol}, New Scan = {new_scan}")
-        self.btn_start.setEnabled(False)
-        self._elapsed_seconds = 0
-        self.label_elapsed.setText("00:00:00")
-        self.progress_bar.setValue(0)
-        self._elapsed_timer.start(1000)
-
-        self.scanner = HistoricalScanner(symbol, new_scan, grid_scan)
-        self.scanner.progress_updated.connect(self.on_progress)
-        self.scanner.scan_finished.connect(self.on_finished)
-        self.scanner.log_message.connect(self.log)
-        self.scanner.start()
-
-    @Slot(str, int, int)
-    def on_progress(self, message: str, current: int, total: int):
-        self.progress_bar.setMaximum(total)
-        self.progress_bar.setValue(current)
-        self.log(message)
-
-    @Slot(str, int)
-    def on_finished(self, symbol: str, count: int):
-        self._elapsed_timer.stop()
-        self.btn_start.setEnabled(True)
-        self.log(f"Scan für {symbol} beendet: {count} Signale geschrieben.")
-
-    @Slot(str)
-    def log(self, message: str):
-        if self.text_log:
-            self.text_log.append(message)
-
-    def _update_elapsed(self):
-        self._elapsed_seconds += 1
-        h = self._elapsed_seconds // 3600
-        m = (self._elapsed_seconds % 3600) // 60
-        s = self._elapsed_seconds % 60
-        self.label_elapsed.setText(f"{h:02d}:{m:02d}:{s:02d}")
-
-    # =========================================================================
-    # Phase 13 Schritt 4: Service-Set-Verwaltung
-    # =========================================================================
-
-    def refresh_set_list(self) -> None:
-        """Befüllt das Set-Dropdown aus ServiceSetRepository.list_sets().
-
-        Quelle für die Set-Auswahl (Roadmap §4.2). Behält die aktuelle
-        Auswahl bei, sofern sie noch existiert; andernfalls wird das erste
-        Set geladen und in den Editor übertragen.
-        """
-        if not self.combo_set:
-            return
-        sets = self.set_repo.list_sets()
-        current = self.combo_set.currentData()
-
-        self.combo_set.blockSignals(True)
-        self.combo_set.clear()
-        for s in sets:
-            label = s.get("display_name") or s.get("set_id") or "Unbenannt"
-            self.combo_set.addItem(label, s.get("set_id"))
-        self.combo_set.blockSignals(False)
-
-        # Aktuelle Auswahl beibehalten, falls noch vorhanden.
-        selected_id: Optional[str] = None
-        if current is not None:
-            idx = self.combo_set.findData(current)
-            if idx >= 0:
-                self.combo_set.setCurrentIndex(idx)
-                selected_id = current
-
-        if selected_id is None and sets:
-            # Achtung: addItem() setzt das erste Item automatisch auf Index 0,
-            # während die Signale blockiert sind -> setCurrentIndex(0) löst KEIN
-            # currentIndexChanged aus. Daher explizit in den Editor laden.
-            self.combo_set.setCurrentIndex(0)
-            selected_id = self.combo_set.itemData(0)
-
-        if selected_id:
-            definition = self.set_repo.get_set(selected_id)
-            if definition:
-                self.load_set_into_editor(definition)
-        else:
-            # Kein Set (mehr) vorhanden -> Editor leeren
-            self._clear_set_editor()
-
-    def _clear_set_editor(self) -> None:
-        """Leert Name-Feld, Beschreibung und execution_order-Liste des Set-Editors."""
-        self._current_set_id = None
-        self._current_set_definition = None
-        self._current_list_iid = None
-        if self.edit_set_name:
-            self.edit_set_name.clear()
-        if self.edit_set_description:
-            self.edit_set_description.clear()
-        if self.list_execution_order:
-            self.list_execution_order.clear()
-        self._clear_service_columns()
-
-    @Slot(int)
-    def _on_set_selected(self, index: int) -> None:
-        """Lädt das im Dropdown gewählte Set in den Editor."""
-        if index < 0 or not self.combo_set:
-            return
-        set_id = self.combo_set.itemData(index)
-        if not set_id:
-            return
-        definition = self.set_repo.get_set(set_id)
-        if definition:
-            self.load_set_into_editor(definition)
-            self.log(f"Set geladen: {set_id}")
-
-    def load_set_into_editor(self, definition: Dict[str, Any]) -> None:
-        """Überträgt eine ServiceSetDefinition in Name-Feld + execution_order-Liste.
-
-        Phase 13 5.4 Schritt 1: Baut zusätzlich die dynamischen Service-Spalten
-        (eine QGroupBox pro Service mit Parameter-Formular) auf.
-        """
-        self._current_set_id = definition.get("set_id")
-        self._current_set_definition = definition
-        self._current_list_iid = None
-        if self.edit_set_name:
-            self.edit_set_name.setText(definition.get("display_name") or "")
-        if self.edit_set_description:
-            self.edit_set_description.setText(definition.get("description") or "")
-        if self.list_execution_order:
-            self.list_execution_order.clear()
-            services = definition.get("services") or {}
-            for iid in (definition.get("execution_order") or []):
-                cfg = services.get(iid, {})
-                plugin_id = cfg.get("plugin_id", "?")
-                prefix, lock_tip = self._service_lock(plugin_id)
-                item = QListWidgetItem(f"{prefix}{iid}  [{plugin_id}]")
-                item.setData(Qt.UserRole, iid)
-                item.setData(Qt.UserRole + 1, plugin_id)
-                item.setToolTip(self._build_tooltip(iid, cfg) + lock_tip)
-                self.list_execution_order.addItem(item)
-        self._build_service_columns(definition)
-
-    def collect_current_order(self) -> list:
-        """Liefert die instance_ids aus der Liste (aktuelle execution_order)."""
-        if not self.list_execution_order:
-            return []
-        return [
-            self.list_execution_order.item(i).data(Qt.UserRole)
-            for i in range(self.list_execution_order.count())
-        ]
-
-    @Slot()
-    def move_order_item(self, delta: int) -> None:
-        """Verschiebt das markierte Listenelement um delta (-1 = hoch, +1 = runter)."""
-        lw = self.list_execution_order
-        if not lw:
-            return
-        row = lw.currentRow()
-        if row < 0:
-            return
-        new_row = row + delta
-        if new_row < 0 or new_row >= lw.count():
-            return
-        item = lw.takeItem(row)
-        lw.insertItem(new_row, item)
-        lw.setCurrentRow(new_row)
-        self._rebuild_columns()
-
-    @Slot()
-    def remove_instance(self) -> None:
-        """Entfernt den markierten Service aus der Ausführungs-Reihenfolge.
-
-        P14-04-E (Service-Sperre): Einzel-Services, die in einem gespeicherten
-        Service-Set vorkommen, dürfen NICHT entfernt werden – sonst würde das
-        Set invalide und der Indikator verlöre seine Basisservices. Beim
-        Löschversuch erscheint ein Hinweis mit dem Namen des verwendeten Sets.
-        """
-        lw = self.list_execution_order
-        if not lw or lw.currentRow() < 0:
-            return
-        item = lw.item(lw.currentRow())
-        plugin_id = str(item.data(Qt.UserRole + 1) or item.data(Qt.UserRole) or "")
-        names = _sets_using_plugin(plugin_id, self.set_repo.list_sets())
-        if names:
-            QMessageBox.warning(
-                self, "Service gesperrt",
-                f"Der Service '{plugin_id}' kann nicht entfernt werden.\n"
-                f"Er wird vom Service-Set '{names[0]}' verwendet.\n"
-                f"Solange er in einem Set vorkommt, bleibt er für den "
-                f"Indikator gesperrt (P14-04).")
-            return
-        lw.takeItem(lw.currentRow())
-        self._rebuild_columns()
-
-    @Slot()
-    def _on_plugin_select_changed(self, plugin_id: str) -> None:
-        """Füllt das Instanz-Feld mit 'plugin_id [plugin_id]' vor, wenn der
-        User einen Service aus dem verfügbaren-Dropdown wählt (Schritt 6-
-        Korrektur: alle Services sichtbar + auswählbar)."""
-        if not plugin_id or not self.edit_new_instance:
-            return
-        self.edit_new_instance.setText(f"{plugin_id} [{plugin_id}]")
-
-    @Slot()
-    def add_instance(self) -> None:
-        """Fügt eine Service-Instanz 'instance_id [plugin_id]' zur Liste hinzu.
-
-        Plugin muss in der PluginRegistry existieren (Default-Params werden
-        beim Speichern eines neuen Sets verwendet). Duplikate werden abgelehnt.
-        """
-        if not self.edit_new_instance or not self.list_execution_order:
-            return
-        text = self.edit_new_instance.text().strip()
-        # Fallback: leeres Feld + Service im verfügbaren-Dropdown gewählt
-        if not text and self.combo_plugin_select:
-            plugin_id = self.combo_plugin_select.currentText()
-            if plugin_id:
-                text = f"{plugin_id} [{plugin_id}]"
-        if not text:
-            return
-        # Formate: "instance_id [plugin_id]", "instance_id:plugin_id" oder "instance_id"
-        import re
-        m = re.match(r"^([\w\-]+)\s*[\[:]\s*([\w\-]+)\s*\]?$", text)
-        if m:
-            iid, plugin_id = m.group(1), m.group(2)
-        else:
-            iid = text
-            plugin_id = text
-
-        try:
-            from analytics.features.feature_builder import PluginRegistry
-            PluginRegistry().get(plugin_id)
-        except KeyError:
-            self.log(f"Plugin '{plugin_id}' nicht gefunden. "
-                     f"Verfügbare Plugins: {_available_plugin_ids()}")
-            return
-
-        for i in range(self.list_execution_order.count()):
-            if self.list_execution_order.item(i).data(Qt.UserRole) == iid:
-                self.log(f"instance_id '{iid}' existiert bereits.")
-                return
-
-        prefix, lock_tip = self._service_lock(plugin_id)
-        item = QListWidgetItem(f"{prefix}{iid}  [{plugin_id}]")
-        item.setData(Qt.UserRole, iid)
-        item.setData(Qt.UserRole + 1, plugin_id)
-        item.setToolTip(self._build_tooltip(iid, {"plugin_id": plugin_id}) + lock_tip)
-        self.list_execution_order.addItem(item)
-        self.edit_new_instance.clear()
-        self.log(f"Service hinzugefügt: {iid} [{plugin_id}]")
-        self._rebuild_columns()
-
-    def collect_set_definition(self) -> Dict[str, Any]:
-        """Baut aus dem Editor eine ServiceSetDefinition.
-
-        Für ein geladenes Set werden die services aus der DB übernommen;
-        für neue Instanzen (bzw. neue Sets) werden die services aus den
-        Listeneinträgen aufgebaut (plugin_id + Default-Params aus der
-        Registry). Die Werte der dynamischen Service-Spalten (5.4 Schritt 1)
-        werden anschließend in die services-Konfiguration übernommen.
-        """
-        order = self.collect_current_order()
-        services: Dict[str, Any] = {}
-        if self._current_set_id:
-            existing = self.set_repo.get_set(self._current_set_id) or {}
-            services = dict(existing.get("services") or {})
-
-        # Jede Instanz in der Reihenfolge braucht eine services-Konfiguration –
-        # neue Instanzen erhalten Default-Params aus der Registry.
-        from analytics.features.feature_builder import PluginRegistry
-        registry = PluginRegistry()
-        if self.list_execution_order:
-            for i in range(self.list_execution_order.count()):
-                item = self.list_execution_order.item(i)
-                iid = item.data(Qt.UserRole)
-                plugin_id = item.data(Qt.UserRole + 1) or iid
-                if not iid:
-                    continue
-                if iid not in services:
-                    try:
-                        plugin = registry.get(plugin_id)
-                        cfg: Dict[str, Any] = {
-                            "plugin_id": plugin_id,
-                            "lookback": 1000,
-                            "params": dict(plugin.default_params),
-                        }
-                    except KeyError:
-                        cfg = {"plugin_id": plugin_id, "lookback": 1000, "params": {}}
-                    services[iid] = cfg
-
-        # Werte aus den dynamischen Service-Spalten übernehmen.
-        # lookback ist die Service-Instanz-Einstellung (ServiceInstanceConfig.
-        # lookback) und wird NICHT in params geschrieben.
-        for (iid, key), ctrl in self._service_param_controls.items():
-            cfg = services.setdefault(iid, {"plugin_id": "", "lookback": 1000, "params": {}})
-            if key == "lookback":
-                cfg["lookback"] = int(self._ctrl_value(ctrl))
-            else:
-                cfg.setdefault("params", {})[key] = self._ctrl_value(ctrl)
-
-        # Phase 14 P14-01: Instanz-Beschreibung aus den Spalten übernehmen
-        # (ServiceInstanceConfig.description – gehört NICHT in params).
-        for iid, ctrl in self._service_desc_controls.items():
-            cfg = services.setdefault(iid, {"plugin_id": "", "lookback": 1000, "params": {}})
-            cfg["description"] = ctrl.text().strip()
-
-        # Phase 14 P14-04: Semantische Versionierung – bei JEDER instance_id
-        # wird die aktuelle plugin.version aus der PluginRegistry eingestempelt
-        # (ServiceInstanceConfig.version). So trägt jede gespeicherte Instanz
-        # die Version des erzeugenden Plugins für den späteren Schema-Migrator.
-        # Kann ein Plugin nicht aufgelöst werden (z. B. deinstalliert), bleibt
-        # ein vorhandenes version-Feld bzw. dessen Fehlen unverändert erhalten.
-        for iid, cfg in services.items():
-            pid = cfg.get("plugin_id") or iid
-            try:
-                plugin = registry.get(pid)
-                cfg["version"] = getattr(plugin, "version", "0.0.0") or "0.0.0"
-            except KeyError:
-                pass
-
-        return {
-            "set_id": self._current_set_id or "",
-            "display_name": self.edit_set_name.text().strip() if self.edit_set_name else "",
-            # Phase 14 P14-01: Set-Beschreibung wird mitgespeichert
-            "description": self.edit_set_description.text().strip() if self.edit_set_description else "",
-            "execution_order": order,
-            "services": services,
-        }
-
-    # =========================================================================
-    # Phase 14 P14-01: Tooltips & Info-Dialog für Service-Instanzen
-    # =========================================================================
-
-    def _build_tooltip(self, instance_id: str, config: Dict[str, Any]) -> str:
-        """Baut einen Rich-Text-Tooltip (HTML) für eine Service-Instanz.
-
-        Angezeigt werden instance_id, Plugin-ID und – falls vorhanden – die
-        individuelle Instanz-Beschreibung (ServiceInstanceConfig.description).
-        """
-        lines = [f"<b>{instance_id}</b>", f"Plugin: {config.get('plugin_id', '?')}"]
-        desc = config.get("description")
-        if desc:
-            lines.append(f"<i>{desc}</i>")
-        return "<br>".join(lines)
-
-    def _service_lock(self, plugin_id: str) -> tuple:
-        """P14-04-E: (🔒-Präfix, Tooltip-Nachtrag) für die sichtbare Sperr-
-        Kennzeichnung im Service-Fenster.
-
-        Ein Service ist gesperrt, wenn er in einem gespeicherten Service-Set
-        vorkommt (Indikator-Basisservice). Liefert ("", "") wenn der Service
-        frei ist; andernfalls ein 🔒-Präfix für Listeneintrag/Spaltentitel und
-        einen HTML-Tooltip-Nachtrag mit dem Namen des verwendeten Sets.
-        """
-        names = _sets_using_plugin(str(plugin_id), self.set_repo.list_sets())
-        if not names:
-            return "", ""
-        return "🔒 ", (f"<br><b>Gesperrt (P14-04)</b>: wird vom Service-Set "
-                       f"'{names[0]}' verwendet – Entfernen nicht möglich")
-
-    def _update_service_tooltip(self, iid: str) -> None:
-        """Aktualisiert den Tooltip des Listen-Items live beim Tippen."""
-        if not self.list_execution_order:
-            return
-        for i in range(self.list_execution_order.count()):
-            item = self.list_execution_order.item(i)
-            if item.data(Qt.UserRole) == iid:
-                cfg: Dict[str, Any] = {"plugin_id": item.data(Qt.UserRole + 1) or iid}
-                desc_ctrl = self._service_desc_controls.get(iid)
-                if desc_ctrl is not None:
-                    cfg["description"] = desc_ctrl.text().strip()
-                # P14-04-E: Sperr-Nachtrag (🔒) beibehalten – der Live-Tooltip
-                # darf die Sperr-Kennzeichnung nicht überschreiben.
-                _prefix, lock_tip = self._service_lock(str(cfg.get("plugin_id") or ""))
-                item.setToolTip(self._build_tooltip(iid, cfg) + lock_tip)
-                break
-
-    def _on_order_item_clicked(self, item: QListWidgetItem) -> None:
-        """Merkt sich die aktuell markierte instance_id (itemClicked)."""
-        if item is not None:
-            self._current_list_iid = item.data(Qt.UserRole)
-
-    def _sync_list_selection(self) -> None:
-        """Synchronisiert _current_list_iid mit der aktuellen Selektion."""
-        if self.list_execution_order is not None:
-            row = self.list_execution_order.currentRow()
-            if row >= 0:
-                self._current_list_iid = self.list_execution_order.item(row).data(Qt.UserRole)
-
-    @Slot()
-    def _show_service_info(self) -> None:
-        """Öffnet den ServiceDescriptionDialog für die markierte Instanz."""
-        iid = self._current_list_iid
-        if not iid or self.list_execution_order is None:
-            self.log("Keine Service-Instanz markiert.")
-            return
-        cfg: Dict[str, Any] = {}
-        plugin = None
-        if self._current_set_definition:
-            cfg = dict((self._current_set_definition.get("services") or {}).get(iid, {}))
-        # Live-Beschreibung aus dem Eingabefeld übernehmen (falls vorhanden)
-        desc_ctrl = self._service_desc_controls.get(iid)
-        if desc_ctrl is not None:
-            cfg["description"] = desc_ctrl.text().strip()
-        plugin_id = cfg.get("plugin_id") or iid
-        try:
-            from analytics.features.feature_builder import PluginRegistry
-            plugin = PluginRegistry().get(plugin_id)
-        except KeyError:
-            self.log(f"Plugin '{plugin_id}' nicht gefunden.")
-            return
-        dlg = ServiceDescriptionDialog.from_plugin(plugin, instance_id=iid, config=cfg, parent=self)
-        dlg.exec()
-
-    # =========================================================================
-    # Phase 13 5.4 Schritt 1: Breiten- & Höhendynamisches Layout (Service-Spalten)
-    # =========================================================================
-
-    @staticmethod
-    def _is_visual_key(key: str) -> bool:
-        """Konvention für reine Darstellungs-Props: Sichtbarkeit (show_*) + Farben (color).
-
-        Darstellungs-Parameter gehören NICHT ins Service-Set (nur Berechnungs-
-        Logik, Roadmap 5.4.1.2) und werden daher in den Service-Spalten
-        ausgeblendet (konsistent zum Indikator-Dialog).
-        """
-        if key.startswith("show_"):
-            return True
-        if "color" in key.lower():
-            return True
-        return False
-
-    @staticmethod
-    def _human(key: str) -> str:
-        return key.replace("_", " ").title()
-
-    @staticmethod
-    def _decimal_places(value: Any) -> int:
-        """Nachkommastellen eines float (für QDoubleSpinBox.setDecimals)."""
-        if not isinstance(value, float) or value != value:  # NaN-Schutz
-            return 4
-        s = f"{value:.10f}".rstrip("0")
-        if "." in s:
-            return len(s.split(".")[1])
-        return 0
-
-    def _get_symbol_precision(self) -> int:
-        """USER-REQ: Preisskala-Praezision (fix je Symbol) fuer die 6
-        Custom-Level-Eingabefelder. Lazy ermittelt (db_service.get_symbol_
-        precision) und fuer die Fenster-Instanz gecacht – kein DB-Zugriff
-        bei jedem Spalten-Neuaufbau."""
-        if self._symbol_precision is None:
-            try:
-                from db_service import get_symbol_precision
-                symbol = (self.combo_symbol.currentText()
-                          if self.combo_symbol else "SILVER")
-                timeframe = (self.combo_tf_set.currentText()
-                             if self.combo_tf_set else "H1")
-                self._symbol_precision = get_symbol_precision(symbol, timeframe)
-            except Exception:
-                self._symbol_precision = 2
-        return self._symbol_precision
-
-    def _create_param_control(self, key: str, val: Any, spec: Dict[str, Any]) -> QWidget:
-        """Erzeugt ein Eingabe-Widget exakt aus dem ParameterSchema.
-
-        float -> QDoubleSpinBox, int -> QSpinBox, bool -> QCheckBox,
-        choice -> QComboBox, color/str -> QLineEdit. min/max/step werden 1:1
-        übertragen (Roadmap 5.4.2.2).
-        """
-        p_type = spec.get("type")
-        if p_type == "float":
-            spin = QDoubleSpinBox()
-            spin.setRange(float(spec.get("min", -1e9)), float(spec.get("max", 1e9)))
-            step = spec.get("step")
-            decimals = self._decimal_places(step) if step is not None else self._decimal_places(spec.get("default"))
-            # USER-REQ: Custom-Levels (prox_level1..6) nutzen die Preisskala-
-            # Praezision (fix je Symbol). MUSS vor setValue geschehen, sonst
-            # rundet QDoubleSpinBox den Wert auf die Schema-Default-Digits.
-            if key.startswith("prox_level"):
-                decimals = self._get_symbol_precision()
-            spin.setDecimals(min(6, max(0, decimals)))
-            spin.setSingleStep(float(step) if step is not None else 0.01)
-            try:
-                spin.setValue(float(val))
-            except (TypeError, ValueError):
-                spin.setValue(float(spec.get("default", 0.0)))
-            return spin
-        if p_type == "int":
-            spin = QSpinBox()
-            spin.setRange(int(spec.get("min", -100000)), int(spec.get("max", 100000)))
-            spin.setSingleStep(int(spec.get("step", 1)))
-            try:
-                spin.setValue(int(val))
-            except (TypeError, ValueError):
-                spin.setValue(int(spec.get("default", 0)))
-            return spin
-        if p_type == "bool":
-            chk = QCheckBox()
-            chk.setChecked(bool(val))
-            return chk
-        if p_type == "choice":
-            combo = QComboBox()
-            combo.addItems([str(o) for o in (spec.get("options") or [])])
-            combo.setCurrentText(str(val))
-            return combo
-        txt = QLineEdit()
-        txt.setText(str(val))
-        return txt
-
-    @staticmethod
-    def _ctrl_value(ctrl: QWidget) -> Any:
-        """Liest den aktuellen Wert eines Controls typsicher aus."""
-        if isinstance(ctrl, QCheckBox):
-            return ctrl.isChecked()
-        if isinstance(ctrl, QSpinBox):
-            return ctrl.value()
-        if isinstance(ctrl, QDoubleSpinBox):
-            return ctrl.value()
-        if isinstance(ctrl, QComboBox):
-            return ctrl.currentText()
-        return ctrl.text()
-
-    def _setup_collapsible(self, group: QGroupBox) -> None:
-        """Macht eine ausklappbare QGroupBox wirklich kollabierbar.
-
-        Beim Abwählen werden die Kinder ausgeblendet und die Fensterhöhe per
-        _reflow() nahtlos verkleinert (Roadmap 5.4.2.2: Ein-/Ausklappen
-        verändert die Höhe dynamisch). Zusätzlich wird group.updateGeometry()
-        gerufen, damit der gecachte QWidgetItemV2-sizeHint der Box invalidiert
-        wird (Qt 6.11: Layouts refreshen diesen Cache sonst NICHT).
-        """
-        def _toggle(checked: bool) -> None:
-            for child in group.findChildren(QWidget):
-                child.setVisible(checked)
-            group.updateGeometry()  # QWidgetItemV2-Cache invalidieren (s. oben)
-            self._reflow()
-        group.toggled.connect(_toggle)
-        _toggle(group.isChecked())
-
-    def _reflow(self) -> None:
-        """Erzwingt die Neuberechnung der Layouts (dynamische Höhe/Breite).
-
-        Qt 6.11: QWidgetItemV2 cached den sizeHint eines Widgets beim ersten
-        Zugriff und aktualisiert ihn NICHT, wenn der Inhalt später wächst –
-        selbst layout.invalidate() hilft nicht. Daher werden die Caches der
-        betroffenen Widgets explizit per updateGeometry() invalidiert
-        (invalidateSizeCache) und die Layout-Caches geleert.
-
-        WICHTIG: Die Fenstergröße wird DEFERRED (nächste Event-Loop-Runde)
-        angepasst. Beim Set-Wechsel sind die alten Service-Spalten per
-        deleteLater() noch im Widget-Baum; bis sie zerstört sind, melden die
-        Layout-Caches einen veralteten (zu kleinen) sizeHint (z.B. 18x18 für
-        eine volle Spalten-Zeile). Ein synchrones resize würde das Fenster
-        daher fälschlich schrumpfen. _schedule_reflow() zerstört die
-        deleteLater-Widgets und berechnet die Größe erst aus dem konsistenten
-        Zustand (ContentScrollMixin).
-        """
-        self._schedule_reflow()
-
-    def _clear_service_columns(self) -> None:
-        """Entfernt alle Service-Spalten aus dem service_columns_layout."""
-        if self.service_columns_layout is None:
-            return
-        while self.service_columns_layout.count():
-            item = self.service_columns_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-        self._service_param_controls = {}
-        self._service_desc_controls = {}
-
-    def _build_service_columns(self, set_definition: Dict[str, Any]) -> None:
-        """Baut die dynamischen Service-Spalten (Roadmap 5.4.2.2).
-
-        Für jede instance_id in execution_order wird eine QGroupBox-Spalte im
-        service_columns_layout erzeugt. Jede Spalte skaliert in der Höhe exakt
-        mit der Anzahl ihrer Parameter (QSizePolicy.Maximum); die Fensterbreite
-        wächst mit der Anzahl der Spalten nach rechts – ohne leeren Raum und
-        ohne fixe Pixelwerte.
-        """
-        if self.service_columns_layout is None:
-            return
-        self._clear_service_columns()
-        services = set_definition.get("services") or {}
-        for iid in (set_definition.get("execution_order") or []):
-            cfg = services.get(iid) or {}
-            pid = cfg.get("plugin_id") or iid
-            col = self._build_service_column(iid, pid, cfg)
-            self.service_columns_layout.addWidget(col)
-        # Container erneut in die obere Zeile einfügen: Das QWidgetItem
-        # eines Widgets meldet dessen Größe zum Zeitpunkt des Einfügens und
-        # aktualisiert sich bei späterem Inhalts-Wachstum nicht (Qt-Quirk).
-        # Entfernen + erneutes Einfügen erzeugt ein frisches QWidgetItem mit
-        # der aktuellen Größe.
-        if self.top_row is not None and self.widget_service_columns is not None:
-            self.top_row.removeWidget(self.widget_service_columns)
-            self.top_row.addWidget(self.widget_service_columns)
-        self._reflow()
-
-    def _build_service_column(self, iid: str, pid: str, cfg: Dict[str, Any]) -> QGroupBox:
-        """Erzeugt EINE Service-Spalte (QGroupBox) mit Parameter-Formular.
-
-        - Normale Parameter im QFormLayout (float/int/bool nach Schema).
-        - expert: True (inkl. lookback) in einer einklappbaren
-          QGroupBox 'Experten-Optionen' am Spaltenfuß.
-
-        P14-04-E: Spaltentitel trägt die 🔒-Kennzeichnung, wenn der Service in
-        einem gespeicherten Service-Set vorkommt (Sperre sichtbar).
-        """
-        prefix, _ = self._service_lock(pid)
-        col = QGroupBox(f"{prefix}{iid}  [{pid}]")
-        # 5.4.2.2 Punkt 3: Spalte skaliert in der Höhe exakt mit ihrem Inhalt
-        # (endet unter dem letzten Parameter), wächst beim Vergrößern des
-        # Fensters NICHT mit.
-        col.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-        vl = QVBoxLayout(col)
-        vl.setAlignment(Qt.AlignTop)
-
-        try:
-            from analytics.features.feature_builder import PluginRegistry
-            plugin = PluginRegistry().get(pid)
-        except KeyError:
-            vl.addWidget(QLabel(f"Plugin '{pid}' nicht gefunden."))
-            return col
-
-        full_schema: Dict[str, Any] = dict(getattr(plugin, "base_parameter_schema", None) or {})
-        full_schema.update(dict(plugin.parameter_schema or {}))
-        order = list(getattr(plugin, "parameter_order", None) or (plugin.parameter_schema or {}).keys())
-        for key in (getattr(plugin, "base_parameter_schema", None) or {}):
-            if key not in order:
-                order.append(key)
-        labels = dict(getattr(plugin, "param_labels", None) or {})
-        for key, spec in (getattr(plugin, "base_parameter_schema", None) or {}).items():
-            labels.setdefault(key, spec.get("description") or self._human(key))
-
-        params = dict(cfg.get("params") or {})
-        lookback = cfg.get("lookback")
-
-        # Phase 14 P14-01: Individuelle Instanz-Beschreibung (bearbeitbar) –
-        # wird in ServiceInstanceConfig.description gespeichert und in
-        # Tooltip + Info-Dialog angezeigt.
-        desc_row = QHBoxLayout()
-        desc_label = QLabel("Beschreibung:")
-        desc_edit = QLineEdit()
-        desc_edit.setPlaceholderText("Individuelle Anmerkung für diese Instanz (optional)")
-        desc_edit.setText(str(cfg.get("description") or ""))
-        self._service_desc_controls[iid] = desc_edit
-        desc_edit.textChanged.connect(lambda _t, iid=iid: self._update_service_tooltip(iid))
-        desc_row.addWidget(desc_label)
-        desc_row.addWidget(desc_edit)
-        vl.addLayout(desc_row)
-
-        # Normale (Nicht-Expert-, Nicht-Darstellungs-)Parameter
-        form = QFormLayout()
-        for key in order:
-            spec = full_schema.get(key, {})
-            if spec.get("expert") or self._is_visual_key(key):
-                continue
-            cval = params.get(key, spec.get("default"))
-            # USER-REQ: P14-01 Nachtrag - Alt-Sets speichern die 6 Custom-Levels
-            # als Aggregat custom_levels (Liste/String) statt als Einzelparameter
-            # prox_level1..6 - leere Level-Felder werden daraus vorbefüllt.
-            if key.startswith("prox_level") and not cval:
-                try:
-                    from analytics.features.definitions.grid_lines_service import map_custom_levels_to_prox_levels
-                    cval = map_custom_levels_to_prox_levels(params).get(key, cval)
-                except Exception:
-                    pass
-            ctrl = self._create_param_control(key, cval, spec)
-            self._service_param_controls[(iid, key)] = ctrl
-            form.addRow(labels.get(key, self._human(key)), ctrl)
-        vl.addLayout(form)
-
-        # Expert-Parameter (inkl. lookback als Service-Instanz-Einstellung)
-        expert_keys = [k for k in order if full_schema.get(k, {}).get("expert")]
-        if expert_keys:
-            exp_grp = QGroupBox("Experten-Optionen")
-            exp_grp.setCheckable(True)
-            exp_grp.setChecked(False)
-            exp_grp.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-            ef = QFormLayout(exp_grp)
-            for key in expert_keys:
-                spec = full_schema.get(key, {})
-                if key == "lookback":
-                    cval = lookback if lookback is not None else spec.get("default")
-                else:
-                    cval = params.get(key, spec.get("default"))
-                ctrl = self._create_param_control(key, cval, spec)
-                self._service_param_controls[(iid, key)] = ctrl
-                ef.addRow(labels.get(key, self._human(key)), ctrl)
-            vl.addWidget(exp_grp)
-            self._setup_collapsible(exp_grp)
-
-        return col
-
-    def _rebuild_columns(self) -> None:
-        """Baut die Service-Spalten aus dem aktuellen Editor-Zustand neu."""
-        if self.service_columns_layout is None:
-            return
-        definition = self.collect_set_definition()
-        self._build_service_columns(definition)
-
-    @Slot()
-    def save_set(self) -> None:
-        """Speichert das aktive Set – analog zur Preset-Verwaltung (generisch).
-
-        Namensdialog (vorbelegt), leerer Name → Auto-Name aus den instance_ids
-        (z.B. 'grid_1 + prox_1'), Überschreiben-Rückfrage bei doppeltem Namen.
-        Implementierung: NamedItemActionsMixin.save_named_item() mit dem
-        Service-Set-Adapter (_ServiceSetItemAdapter).
-        """
-        self.save_named_item(
-            self._set_adapter,
-            dialog_title="Service-Set speichern",
-            prompt="Name für das Service-Set:",
-        )
-
-    @Slot()
-    def delete_set(self) -> None:
-        """Löscht das gewählte Set – analog zur Preset-Verwaltung (generisch).
-
-        Rückfrage (QMessageBox.question), danach wird das nächstverfügbare Set
-        ausgewählt. Implementierung: NamedItemActionsMixin.delete_named_item()
-        mit dem Service-Set-Adapter.
-
-        P14-04-E (Set-Sperre): Es muss immer mindestens ein gültiges Service-
-        Set erhalten bleiben, damit der Indikator funktionsfähig bleibt. Das
-        Löschen des letzten verbliebenen Sets ist gesperrt.
-        """
-        if len(self.set_repo.list_sets()) <= 1:
-            QMessageBox.warning(
-                self, "Löschen gesperrt",
-                "Es muss immer mindestens ein gültiges Service-Set erhalten "
-                "bleiben, damit der Indikator funktionsfähig bleibt (P14-04).")
-            return
-        self.delete_named_item(self._set_adapter)
-
-    # =========================================================================
-    # Phase 14 P14-05: Papierkorb (Soft-Delete / Wiederherstellung)
-    # =========================================================================
-
-    @Slot()
-    def show_trash_dialog(self) -> None:
-        """Öffnet den Papierkorb-Dialog für Service-Sets (P14-05).
-
-        Zeigt alle soft-gelöschten Sets (list_trash()) mit Name und
-        Lösch-Zeitstempel. Aktionen:
-          - Wiederherstellen  : restore_set_from_trash() verschiebt das Set
-                                zurück nach service_sets (das Set-Dropdown des
-                                Hauptfensters wird anschließend refresht).
-          - Endgültig löschen : purge_trash_set() mit doppelter Sicherheits-
-                                abfrage (Vorgang ist nicht umkehrbar).
-          - Papierkorb leeren : purge_trash() mit doppelter Sicherheits-
-                                abfrage (Vorgang ist nicht umkehrbar).
-
-        Der Dialog ist eine reine UI-Komponente: Er spricht ausschließlich
-        die Repository-API an (keine direkten SQL-Zugriffe) und protokolliert
-        jede Aktion über self.log(). Das endgültige Löschen/Bereinigen erfolgt
-        IMMER mit doppelter Sicherheitsnachfrage (User-Vorgabe P14-05).
-        """
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Papierkorb - Service-Sets")
-        dialog.setMinimumSize(440, 340)
-
-        layout = QVBoxLayout(dialog)
-        hint = QLabel(
-            "Soft-geloeschte Service-Sets (P14-05). Wiederherstellen verschiebt "
-            "das Set zurueck in die aktive Liste; endgueltiges Loeschen ist "
-            "nicht umkehrbar."
-        )
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-
-        trash_list = QListWidget()
-        layout.addWidget(trash_list, 1)
-
-        btn_row = QHBoxLayout()
-        btn_restore = QPushButton("Wiederherstellen")
-        btn_purge_one = QPushButton("Endgueltig loeschen")
-        btn_purge_all = QPushButton("Papierkorb leeren")
-        btn_close = QPushButton("Schliessen")
-        for b in (btn_restore, btn_purge_one, btn_purge_all, btn_close):
-            btn_row.addWidget(b)
-        layout.addLayout(btn_row)
-
-        def _reload() -> None:
-            trash_list.clear()
-            trash_items = self.set_repo.list_trash()
-            for item in trash_items:
-                name = item.get("display_name") or item.get("set_id") or "Unbenannt"
-                deleted_at = str(item.get("deleted_at") or "")
-                li = QListWidgetItem(f"{name}   (geloescht: {deleted_at})")
-                li.setData(Qt.UserRole, item.get("set_id"))
-                trash_list.addItem(li)
-            has_items = trash_list.count() > 0
-            btn_restore.setEnabled(has_items)
-            btn_purge_one.setEnabled(has_items)
-            btn_purge_all.setEnabled(has_items)
-            hint.setText(
-                "Der Papierkorb ist leer."
-                if not has_items
-                else "Soft-geloeschte Service-Sets (P14-05). Wiederherstellen "
-                     "verschiebt das Set zurueck in die aktive Liste; "
-                     "endgueltiges Loeschen ist nicht umkehrbar."
-            )
-
-        def _selected_id() -> Optional[str]:
-            item = trash_list.currentItem()
-            return item.data(Qt.UserRole) if item else None
-
-        def _restore() -> None:
-            set_id = _selected_id()
-            if not set_id:
-                return
-            if self.set_repo.restore_set_from_trash(set_id):
-                self.log(f"Set wiederhergestellt (P14-05): {set_id}")
-                _reload()
-                self.refresh_set_list()
-            else:
-                self.log(f"Set '{set_id}' nicht im Papierkorb gefunden.")
-
-        def _purge_selected() -> None:
-            set_id = _selected_id()
-            if not set_id:
-                return
-            # Doppelte Sicherheitsnachfrage - endgueltiges Loeschen ist nicht
-            # umkehrbar (User-Vorgabe P14-05).
-            first = QMessageBox.question(
-                dialog, "Endgueltig loeschen?",
-                "Das Set wird ENDGUELTIG geloescht und kann nicht "
-                "wiederhergestellt werden. Fortfahren?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            )
-            if first != QMessageBox.Yes:
-                return
-            second = QMessageBox.question(
-                dialog, "Wirklich endgueltig loeschen?",
-                "Dieser Vorgang ist NICHT umkehrbar. Das Set wird unwiderruflich "
-                "aus dem Papierkorb entfernt. Fortfahren?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            )
-            if second != QMessageBox.Yes:
-                return
-            if self.set_repo.purge_trash_set(set_id):
-                self.log(f"Set endgueltig geloescht (P14-05): {set_id}")
-                _reload()
-            else:
-                self.log(f"Set '{set_id}' nicht im Papierkorb gefunden.")
-
-        def _purge_all() -> None:
-            if trash_list.count() == 0:
-                return
-            # Doppelte Sicherheitsnachfrage - endgueltiges Loeschen ist nicht
-            # umkehrbar (User-Vorgabe P14-05).
-            first = QMessageBox.question(
-                dialog, "Papierkorb leeren?",
-                f"Alle {trash_list.count()} Sets im Papierkorb werden "
-                "ENDGUELTIG geloescht und koennen nicht wiederhergestellt "
-                "werden. Fortfahren?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            )
-            if first != QMessageBox.Yes:
-                return
-            second = QMessageBox.question(
-                dialog, "Wirklich Papierkorb leeren?",
-                "Dieser Vorgang ist NICHT umkehrbar. Alle Sets werden "
-                "unwiderruflich entfernt. Fortfahren?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            )
-            if second != QMessageBox.Yes:
-                return
-            count = self.set_repo.purge_trash()
-            self.log(f"Papierkorb geleert (P14-05): {count} Set(s) endgueltig entfernt.")
-            _reload()
-
-        btn_restore.clicked.connect(_restore)
-        btn_purge_one.clicked.connect(_purge_selected)
-        btn_purge_all.clicked.connect(_purge_all)
-        btn_close.clicked.connect(dialog.accept)
-
-        _reload()
-        dialog.exec()
-
-    # =========================================================================
-    # Phase 14 P14-02: Hot-Reload der Plugins (Dynamic Discovery)
-    # =========================================================================
-
-    @Slot()
-    def reload_plugins(self) -> None:
-        """Lädt Custom-Plugins aus data/custom_plugins/ neu (Hot-Reload).
-
-        P14-02: Ruft PluginRegistry().reload() auf (unter RLock) und
-        aktualisiert das verfügbare-Services-Dropdown. Bereits laufende
-        Service-Ausführungen laufen auf ihren bisherigen Objektinstanzen
-        weiter; neue Instanziierungen nutzen die neuen Klassen.
-        """
-        try:
-            from analytics.features.feature_builder import PluginRegistry
-            registry = PluginRegistry()
-            registry.reload()
-            self.log("Plugins neu geladen.")
-        except Exception as e:
-            self.log(f"FEHLER beim Plugin-Reload: {e}")
-        # Dropdown aktualisieren (neue Custom-Plugins sichtbar machen)
-        if self.combo_plugin_select:
-            current = self.combo_plugin_select.currentText()
-            self.combo_plugin_select.blockSignals(True)
-            self.combo_plugin_select.clear()
-            for pid in sorted(PluginRegistry().plugins.keys()):
-                self.combo_plugin_select.addItem(pid, pid)
-            idx = self.combo_plugin_select.findText(current)
-            self.combo_plugin_select.setCurrentIndex(idx if idx >= 0 else 0)
-            self.combo_plugin_select.blockSignals(False)
-        self.log(f"Verfügbare Plugins: {_available_plugin_ids()}")
-
-    @Slot()
-    def execute_set(self) -> None:
-        """Startet den ServiceSetEvaluator für das aktive Set (Hintergrund-Thread)."""
-        definition = self.collect_set_definition()
-        if not definition.get("execution_order"):
-            self.log("Keine Services in der Ausführungs-Reihenfolge.")
-            return
-        if not definition.get("services"):
-            self.log("Set hat keine services-Konfiguration – Ausführung nicht möglich.")
-            return
-        if self._set_run_worker and self._set_run_worker.isRunning():
-            self.log("Set-Ausführung läuft bereits.")
-            return
-
-        symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
-        timeframe = self.combo_tf_set.currentText() if self.combo_tf_set else "H1"
-
-        if self.btn_execute_set:
-            self.btn_execute_set.setEnabled(False)
-        self._set_run_worker = ServiceSetRunWorker(
-            self.set_evaluator, symbol, timeframe, definition, parent=self,
-        )
-        self._set_run_worker.log_message.connect(self.log)
-        self._set_run_worker.run_finished.connect(self._on_set_run_finished)
-        self._set_run_worker.run_failed.connect(self._on_set_run_failed)
-        self._set_run_worker.start()
-
-    @Slot(str, int)
-    def _on_set_run_finished(self, set_id: str, count: int) -> None:
-        if self.btn_execute_set:
-            self.btn_execute_set.setEnabled(True)
-        self.log(f"Set-Ausführung abgeschlossen: {count} Services.")
-
-    @Slot(str, str)
-    def _on_set_run_failed(self, set_id: str, error: str) -> None:
-        if self.btn_execute_set:
-            self.btn_execute_set.setEnabled(True)
-        self.log(f"FEHLER bei Set-Ausführung: {error}")
-
-    def closeEvent(self, event):
-        # PersistentWindow.save_state() wird in super().closeEvent gerufen
-        if self.scanner and self.scanner.isRunning():
-            self.scanner.stop()
-            self.scanner.wait(2000)
-        if self._set_run_worker and self._set_run_worker.isRunning():
-            self._set_run_worker.wait(2000)
-        self._elapsed_timer.stop()
-        super().closeEvent(event)
-
-```
-
---------------------------------------------------
-
 ### DATEI: state_manager.py
 ```py
 # state_manager.py
@@ -3791,6 +2382,14 @@ class StateManager:
         con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS plugin_id VARCHAR;")
         con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS version VARCHAR DEFAULT '1.0.0';")
         con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS is_active_batch BOOLEAN DEFAULT FALSE;")
+
+        # Phase 15 (U15-B4): Alt-Indikator 'grid' (chart/indicators/grid.py)
+        # wurde am 04.08.2026 entfernt. Persistierte Presets mit
+        # indicator_id='grid' werden idempotent bereinigt (einmalig pro
+        # App-Start, additiv – bestehende 'grid_liquidity'-Presets bleiben
+        # unangetastet). Der Legacy-Pfad in _resolve_indicator_params()
+        # bleibt fuer Abwaertskompatibilitaet bestehen.
+        con.execute("DELETE FROM indicator_presets WHERE indicator_id = 'grid'")
 
         # Explicit Column Check via information_schema
         tables_to_migrate = ["instance_states", "symbol_tf_states"]
@@ -20512,6 +19111,15 @@ class StatisticsRepository:
 """
 Historical Scanner – QThread-Worker für Batch-Scans über historische Daten.
 Unterstützt Full-Scan (Delete + Re-Scan) und Delta-Update (fehlende Bars).
+
+Phase 15 U15-C2 (Alt-Pfad-Rückbau, additiv): ZIELZUSTAND des
+HistoricalScanner ist der PLUGIN-BATCH (`_run_plugin_batch` über den
+PluginExecutor, aktive Batch-Presets aus `indicator_presets`). Der Alt-Scan
+(grid_scan / Standard-Scan über SetEvaluator) bleibt parallel betreibbar,
+schreibt aber wie der Plugin-Batch AUSSCHLIESSLICH in den feature_store
+(Phase 13 Schritt 7.B) – es finden KEINE signal_results-Writes mehr statt.
+`signal_results` bleibt bis zur finalen Entscheidung (U15-C3) unverändert
+als Referenz erhalten.
 """
 
 import time
@@ -20670,6 +19278,11 @@ class HistoricalScanner(QThread):
         DB_ANALYTICS = self._db_path_analytics or str(BASE_DIR / "data" / "analytics.duckdb")
         DB_MARKET = self._db_path_market or str(BASE_DIR / "data" / "market_data.duckdb")
 
+        # U15-C2 (Zielzustand): Der Plugin-Batch (PluginExecutor) ist der
+        # primäre Schreibpfad in den feature_store. Der Alt-Scan (SetEvaluator)
+        # bleibt kompatibel – ebenfalls feature_store-only (keine
+        # signal_results-Writes, Phase 13 Schritt 7.B).
+
         feature_names = self._feature_names
         feature_params = self._feature_params
         source_id = self._source_id
@@ -20809,6 +19422,15 @@ signal_results ist DEAKTIVIERT – set_config['signals'] ist leer, daher
 liefern _fill_gaps/_process_new_bars/analyze_single_bar früh zurück und
 es finden KEINE signal_results-Writes mehr statt. Marker/Statistik lesen
 den feature_store; die Tabelle signal_results bleibt nur als Referenz.
+
+Phase 15 U15-C1 (Alt-Pfad-Rückbau, additiv): ZIELZUSTAND des LiveAnalyzer
+ist der resiliente Pfad `_process_plugin_bars_resilient()` (P14-03-E):
+Bar-Close-Evaluierung mit stark verkürztem Lookback (1-2 Bars) gegen das im
+`PluginContext.shared_state` gepufferte Raster – keine volle Pipeline und
+KEINE DB-Abfragen im Live-Tick. Die Alt-Signal-Pfade (`_fill_gaps`,
+`_process_new_bars`, `analyze_single_bar`, `set_config['signals']=[]`)
+sind LEGACY: Sie laufen weiterhin ohne Seiteneffekte (Early-Return), werden
+aber nicht mehr gepflegt und schreiben bewusst NICHT in signal_results.
 """
 
 import json
@@ -20968,6 +19590,12 @@ class LiveAnalyzer(QThread):
         Hauptschleife: Wartet auf Bar-Close-Events (Polling).
         Fuehrt vor dem Live-Betrieb einen einmaligen Auto-Fill durch,
         um Luecken seit dem letzten Signal in der DB zu schliessen.
+
+        U15-C1 (Zielzustand): Die eigentliche Live-Auswertung läuft über den
+        resilienten Pfad `_process_plugin_bars_resilient()` (Plugin-Modus,
+        gepuffertes shared_state-Raster). `_process_new_bars()` (Alt-Signal-
+        Pfad) wird weiterhin aufgerufen, ist aber mit leerer signal-Liste
+        wirkungslos (Early-Return, keine signal_results-Writes).
         """
         self.log_message.emit(
             f"LiveAnalyzer gestartet: {self.symbol} {self.timeframe}, "
@@ -23907,8 +22535,10 @@ class EMADiffFeature(BaseFeature):
 Feature: Grid-Levels (Y-Achse) + Zeitfenster-Flags (X-Achse) – Phase 11
 
 Berechnet vektorisiert fuer jede Bar die Liq-Line / Grid-Level Logik des
-GridIndicator (chart/indicators/grid.py) und stellt sie als Feature-Spalten
-fuer den feature_store bereit:
+Grid-Systems (Paritaetsfunktionen in `grid_math.py`, Phase 15 U15-B3 –
+eingefrorene Referenz-Kopien des am 04.08.2026 entfernten Alt-Indikators
+chart/indicators/grid.py) und stellt sie als Feature-Spalten fuer den
+feature_store bereit:
 
     grid_nearest_level      naechstes Grid-Level zum close (Preis)
     grid_dist_abs           absoluter Preisabstand |close - nearest_level|
@@ -23918,10 +22548,11 @@ fuer den feature_store bereit:
 
 Das Modul ist bewusst gekapselt und unabhaengig vom Chart-Indikator. Es bildet
 nur die Berechnungslogik ab (kein Rendering, kein DB-Zugriff). Die Konsistenz
-mit dem Indikator wird durch dieselben Kernfunktionen sichergestellt:
+wird durch dieselben Kernfunktionen sichergestellt (vektorisierte Varianten
+der Skalar-Funktionen in `grid_math.py`):
 
-    build_grid_levels()  <->  GridIndicator Berechnung (center +- i*step + custom)
-    in_window_around()   <->  f_in_window_around() aus chart/indicators/grid.py
+    build_grid_levels()  <->  grid_math.build_grid_levels() (center +- i*step + custom)
+    in_window_around()   <->  grid_math.f_in_window_around() (Minute 0/30 +- span)
 
 Parameter (params-Dict):
     step_size          float, Schrittweite des Grids (Default 0.5, prox_stepSize)
@@ -23958,7 +22589,7 @@ def build_grid_levels(
     """
     Erzeugt die sortierte Grid-Level-Liste (absteigend) fuer ein Zentrum.
 
-    Identische Logik wie die Level-Zusammenstellung im GridIndicator:
+    Identische Logik wie grid_math.build_grid_levels() (Referenz-Snapshot):
       center = round(price / step) * step
       levels = center + i*step  fuer i in [-steps_around, steps_around]
       + zusaetzliche custom_levels (nur > 0)
@@ -23984,7 +22615,7 @@ def in_window_around(
     span: int,
 ) -> np.ndarray:
     """
-    Vektorisierte Version von f_in_window_around() des GridIndicator:
+    Vektorisierte Version von grid_math.f_in_window_around():
     Liefert True fuer Minuten, die im Fenster center +/- span liegen
     (mit Wrap-Around ueber 0/59).
     """
@@ -24022,7 +22653,7 @@ class GridLevelsFeature(BaseFeature):
         if n == 0:
             return pd.DataFrame({c: [] for c in GRID_COLUMNS})
 
-        # --- Parameter (Defaults konsistent zum GridIndicator) ---
+        # --- Parameter (Defaults konsistent zu grid_math.py) ---
         step_size = float(params.get("step_size", 0.5))
         steps_around = int(params.get("steps_around", 4))
         time_window_mins = int(params.get("time_window_mins", 5))
@@ -24087,7 +22718,7 @@ class GridLevelsFeature(BaseFeature):
         Unterstuetzt:
           - 'bar_time' als tz-aware pandas datetime (feature_builder load_ohlcv)
           - 'bar_time' als naive datetime/str (wird als UTC interpretiert)
-          - 'time' als Unix-Epoch-Integer (GridIndicator-Stil)
+          - 'time' als Unix-Epoch-Integer (grid_math.py-Stil)
         """
         n = len(df)
         if "bar_time" in df.columns:
@@ -24110,16 +22741,18 @@ class GridLevelsFeature(BaseFeature):
 """
 Service: GridLines (Phase 13 Schritt 6)
 
-Paritäts-Service zur Alt-Implementierung chart/indicators/grid.py – baut das
-Level-Raster EXAKT wie grid.py (Zentrierung auf dem letzten Close):
+Paritäts-Service zur Alt-Implementierung (ehemals chart/indicators/grid.py,
+am 04.08.2026 entfernt) – baut das Level-Raster EXAKT wie der Alt-Indikator.
+Die Paritätsfunktionen liegen in `grid_math.py` (Phase 15 U15-B3, eingefrorene
+Referenz-Kopien):
 
     center = f_round_to_custom_step(last_close, step_size)
     levels = {round(center + i * step_size, 6) | i in [-steps_around, steps_around]}
              + Custom-Levels (prox_level1..6, nur > 0)
 
 Der Service liefert den chart_render_payload (lines) in identischer Struktur
-wie grid.py (is_custom-Färbung, width 1/3, style Solid) und schreibt die
-Linienliste zusätzlich nach context.shared_state[self.instance_id] – der
+wie der Alt-Indikator (is_custom-Färbung, width 1/3, style Solid) und schreibt
+die Linienliste zusätzlich nach context.shared_state[self.instance_id] – der
 nachgelagerte ProximityService liest sie von dort (depends_on).
 
 KEINE eigenen Zeitkonzepte: Das native UTC-Zeitfenster (Minute 0/30 ±
@@ -24133,6 +22766,10 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from analytics.features.definitions.grid_math import (
+    build_grid_levels,
+    f_round_to_custom_step,
+)
 from analytics.features.plugins.base_plugin import (
     FeatureCalculateResult,
     ParameterSchema,
@@ -24140,40 +22777,6 @@ from analytics.features.plugins.base_plugin import (
     PluginContext,
     PluginFeature,
 )
-
-
-def f_round_to_custom_step(price: float, step: float) -> float:
-    """Identisch zu chart/indicators/grid.py – Rundung auf das nächste
-    Vielfache von step (Paritäts-Anforderung)."""
-    if step <= 0:
-        return price
-    inv_step = 1.0 / step
-    return round(price * inv_step) / inv_step
-
-
-def build_grid_levels(
-    last_close: float,
-    step_size: float,
-    steps_around: int,
-    custom_levels: Optional[List[float]] = None,
-) -> List[float]:
-    """Sortierte Level-Liste (absteigend) – exakte Parität zu grid.py.
-
-    grid.py:
-      center_price = f_round_to_custom_step(last_close, step_size)
-      grid_levels  = {round(center_price + i*step_size, 6)
-                      | i in range(-steps_around, steps_around+1)}
-      + {round(c_lvl, 6) | c_lvl in custom_levels, c_lvl > 0.0}
-    """
-    center_price = f_round_to_custom_step(last_close, step_size)
-    grid_levels: set = set()
-    for i in range(-steps_around, steps_around + 1):
-        grid_levels.add(round(center_price + (i * step_size), 6))
-    for c_lvl in (custom_levels or []):
-        v = float(c_lvl)
-        if v > 0.0:
-            grid_levels.add(round(v, 6))
-    return sorted(list(grid_levels), reverse=True)
 
 
 def _parse_custom_levels(raw: Any) -> List[float]:
@@ -24258,12 +22861,12 @@ class GridLinesService(PluginFeature):
         return {
             "category": "Grid",
             "display_name": "Grid Lines",
-            "description": "Baut das Grid-Raster in Parität zu grid.py (Center ± steps_around × step_size + Custom-Levels)",
+            "description": "Baut das Grid-Raster in Parität zum Alt-Grid (Center ± steps_around × step_size + Custom-Levels)",
             "author": "PyTrader AI",
             "tags": ["grid", "lines", "raster"],
             # Phase 14 P14-01: Erweiterte Beschreibungsfelder
-            "description_long": "Baut das Level-Raster exakt wie chart/indicators/"
-                                "grid.py (Zentrierung auf dem letzten Close) und "
+            "description_long": "Baut das Level-Raster exakt wie der Alt-Grid-Indikator "
+                                "(Paritätsfunktionen in grid_math.py) und "
                                 "schreibt die Linienliste in den shared_state "
                                 "für nachgelagerte Services (depends_on).",
             "condition_rules": [
@@ -24346,7 +22949,7 @@ class GridLinesService(PluginFeature):
             },
             "line_color": {
                 "type": "color", "default": "",
-                "description": "Linien-Farbe (leer = Paritäts-Styling aus grid.py)",
+                "description": "Linien-Farbe (leer = Paritäts-Styling aus grid_math.py)",
             },
         }
 
@@ -24356,8 +22959,8 @@ class GridLinesService(PluginFeature):
         params: Dict[str, Any],
         context: Optional[PluginContext] = None,
     ) -> FeatureCalculateResult:
-        """Baut das Raster in Parität zu grid.py und schreibt die Linienliste
-        nach context.shared_state[self.instance_id] (Namespace-isoliert)."""
+        """Baut das Raster in Parität zum Alt-Grid (grid_math.py) und schreibt
+        die Linienliste nach context.shared_state[self.instance_id] (Namespace-isoliert)."""
         if df is None or df.empty:
             return {"feature_store_payload": {}, "chart_render_payload": {"lines": [], "hit_circles": []}}
 
@@ -24648,13 +23251,108 @@ class GridLiquidityFeature(PluginFeature):
                 "feature_id": self.plugin_id,
                 "plugin_version": self.version,
                 "records": feature_rows,
-                "metadata": {"total_hits": len(hit_circles)},
+                "metadata": {
+                    "total_hits": len(hit_circles),
+                    # Phase 15 (U15-A1, Invariante 5): explizite schema_version
+                    # in jedem Feature-Payload (Pflichtfeld für feature_store=True).
+                    "schema_version": "1.0.0",
+                },
             },
             "chart_render_payload": {
                 "lines": lines_payload,
                 "hit_circles": hit_circles,
             },
         }
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/features/definitions/grid_math.py
+```py
+# analytics/features/definitions/grid_math.py
+"""
+Phase 15 (U15-B3): Eigenständige Paritäts-Mathematik für Grid-Services.
+
+Die Funktionen sind die eingefrorenen Referenz-Kopien der ehemaligen
+Alt-Implementierung `chart/indicators/grid.py` (am 04.08.2026 entfernt).
+Sie dienen als SINGLE SOURCE OF TRUTH für die Grid-Parität:
+
+* `f_round_to_custom_step` – Rundung auf das nächste Vielfache von step.
+* `build_grid_levels`      – Level-Array (Center ± steps_around × step + Custom).
+* `f_in_window_around`     – natives UTC-Zeitfenster (Minute 0/30 ± span, Wrap-Around).
+* `f_strip_trailing_zeros` – '%.6f' ohne nachgestellte Nullen (Level-Strings).
+
+Die Services (grid_lines_service.py, proximity_service.py) importieren diese
+Funktionen und garantieren damit identisches Verhalten zum historischen
+Alt-Indikator, ohne auf das gelöschte Modul zu verweisen.
+
+HINWEIS: Die geschützten Alt-Dateien (chart/indicators/grid_liquidity.py,
+analytics/features/definitions/grid_liquidity.py) behalten ihre privaten
+Kopien (`_f_in_window_around`) unverändert – sie werden nicht umgestellt.
+"""
+
+from typing import List, Optional
+
+
+def f_round_to_custom_step(price: float, step: float) -> float:
+    """Rundet price auf das nächste Vielfache von step.
+
+    Exakte Parität zur ehemaligen chart/indicators/grid.py.
+    """
+    if step <= 0:
+        return price
+    inv_step = 1.0 / step
+    return round(price * inv_step) / inv_step
+
+
+def build_grid_levels(
+    last_close: float,
+    step_size: float,
+    steps_around: int,
+    custom_levels: Optional[List[float]] = None,
+) -> List[float]:
+    """Sortierte Level-Liste (absteigend) – exakte Parität zum Alt-Grid.
+
+    grid.py (historisch):
+      center_price = f_round_to_custom_step(last_close, step_size)
+      grid_levels  = {round(center_price + i*step_size, 6)
+                      | i in range(-steps_around, steps_around+1)}
+      + {round(c_lvl, 6) | c_lvl in custom_levels, c_lvl > 0.0}
+    """
+    center_price = f_round_to_custom_step(last_close, step_size)
+    grid_levels: set = set()
+    for i in range(-steps_around, steps_around + 1):
+        grid_levels.add(round(center_price + (i * step_size), 6))
+    for c_lvl in (custom_levels or []):
+        v = float(c_lvl)
+        if v > 0.0:
+            grid_levels.add(round(v, 6))
+    return sorted(list(grid_levels), reverse=True)
+
+
+def f_in_window_around(minute_val: int, center: int, span: int) -> bool:
+    """Native UTC-Zeitfenster-Logik – exakte Parität zum Alt-Grid.
+
+    True, wenn minute_val im Fenster center ± span liegt (mit Wrap-Around
+    über 0/59). Zentren: 0 (ganze Stunde) und 30 (halbe Stunde).
+    """
+    lower = center - span
+    upper = center + span
+    if lower < 0:
+        return minute_val >= (60 + lower) or minute_val <= upper
+    elif upper > 59:
+        return minute_val >= lower or minute_val <= (upper - 60)
+    else:
+        return lower <= minute_val <= upper
+
+
+def f_strip_trailing_zeros(val: float) -> str:
+    """'%.6f' ohne nachgestellte Nullen – exakte Parität zum Alt-Grid."""
+    s = f"{val:.6f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
 
 ```
 
@@ -24667,7 +23365,8 @@ class GridLiquidityFeature(PluginFeature):
 Service: Proximity (Phase 13 Schritt 6)
 
 Liest die Linienliste aus context.shared_state[depends_on[0]] (z. B. grid_1)
-und wendet die PROZENTUALE visit%-Semantik von grid.py an:
+und wendet die PROZENTUALE visit%-Semantik des Alt-Grid-Indikators an
+(Paritätsfunktionen in `grid_math.py`, Phase 15 U15-B3):
 
     visit_min = lvl * (1.0 - visit_pct / 100.0)
     visit_max = lvl * (1.0 + visit_pct / 100.0)
@@ -24697,6 +23396,10 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from analytics.features.definitions.grid_math import (
+    f_in_window_around,
+    f_strip_trailing_zeros,
+)
 from analytics.features.plugins.base_plugin import (
     FeatureCalculateResult,
     ParameterSchema,
@@ -24704,26 +23407,6 @@ from analytics.features.plugins.base_plugin import (
     PluginContext,
     PluginFeature,
 )
-
-
-def f_in_window_around(minute_val: int, center: int, span: int) -> bool:
-    """Native UTC-Zeitfenster-Logik – identisch zu grid.py."""
-    lower = center - span
-    upper = center + span
-    if lower < 0:
-        return minute_val >= (60 + lower) or minute_val <= upper
-    elif upper > 59:
-        return minute_val >= lower or minute_val <= (upper - 60)
-    else:
-        return lower <= minute_val <= upper
-
-
-def f_strip_trailing_zeros(val: float) -> str:
-    """Identisch zu grid.py – '%.6f' ohne nachgestellte Nullen."""
-    s = f"{val:.6f}"
-    if "." in s:
-        s = s.rstrip("0").rstrip(".")
-    return s
 
 
 def _bar_utc_minutes(df: pd.DataFrame) -> List[int]:
@@ -24759,13 +23442,14 @@ class ProximityService(PluginFeature):
         return {
             "category": "Grid",
             "display_name": "Proximity",
-            "description": "Prozentuale visit%-Treffer auf den Grid-Linien (Parität zu grid.py) inkl. Feature-Store-Records",
+            "description": "Prozentuale visit%-Treffer auf den Grid-Linien (Parität zu grid_math.py) inkl. Feature-Store-Records",
             "author": "PyTrader AI",
             "tags": ["grid", "proximity", "liquidity", "feature-store"],
             # Phase 14 P14-01: Erweiterte Beschreibungsfelder
             "description_long": "Liest die Linienliste aus shared_state[depends_on] "
-                                "und wendet die prozentuale visit%-Semantik von "
-                                "grid.py an (visit_min/max je Linie). Schreibt "
+                                "und wendet die prozentuale visit%-Semantik der "
+                                "Paritätsfunktionen (grid_math.py) an "
+                                "(visit_min/max je Linie). Schreibt "
                                 "Hit-Records in den Feature-Store.",
             "condition_rules": [
                 "Treffer: visit_min <= high/low <= visit_max ODER Piercing (low <= lvl <= high)",
@@ -24811,7 +23495,7 @@ class ProximityService(PluginFeature):
         return {
             "visit_pct": {
                 "type": "float", "default": 0.05, "min": 0.0, "max": 100.0,
-                "step": 0.005, "description": "Prozentuale Toleranz um jede Linie (Parität zu grid.py visit_pct)",
+                "step": 0.005, "description": "Prozentuale Toleranz um jede Linie (Parität zu grid_math.py visit_pct)",
             },
             "time_window_mins": {
                 "type": "int", "default": 5, "min": 0, "max": 30,
@@ -24829,9 +23513,9 @@ class ProximityService(PluginFeature):
         params: Dict[str, Any],
         context: Optional[PluginContext] = None,
     ) -> FeatureCalculateResult:
-        """Wendet die prozentuale visit%-Semantik von grid.py auf die Linien aus
-        context.shared_state[depends_on[0]] an und schreibt Hit-Records nach
-        feature_data (feature_store=True)."""
+        """Wendet die prozentuale visit%-Semantik der Paritätsfunktionen
+        (grid_math.py) auf die Linien aus context.shared_state[depends_on[0]]
+        an und schreibt Hit-Records nach feature_data (feature_store=True)."""
         empty: FeatureCalculateResult = {
             "feature_store_payload": {},
             "chart_render_payload": {"lines": [], "hit_circles": []},
@@ -24879,7 +23563,7 @@ class ProximityService(PluginFeature):
         # Linien) bzw. der Indikator. show_lines ist KEIN Service-Parameter.
         tracked_levels = [float(l["price"]) for l in lines_payload]
 
-        # --- Proximity & Hit-Logik (exakte Parität zu grid.py) ---------------
+        # --- Proximity & Hit-Logik (exakte Parität zu grid_math.py) ----------
         hit_circles: List[Dict[str, Any]] = []
         active_hits: List[str] = []
         feature_rows: List[Dict[str, Any]] = []
@@ -24932,7 +23616,7 @@ class ProximityService(PluginFeature):
                 "visit_pct": visit_pct,
             })
 
-        # --- Status-Info (letzte Bar des Scan-Fensters, Parität zu grid.py) --
+        # --- Status-Info (letzte Bar des Scan-Fensters, Parität zu grid_math.py)
         if len(scan_df):
             last_ts = int(scan_df.iloc[-1]["time"])
             last_m = datetime.fromtimestamp(last_ts, tz=dt_timezone.utc).minute
@@ -25115,10 +23799,18 @@ class ChartRenderPayload(TypedDict, total=False):
 # Strikter FeatureStorePayload (DuckDB)
 # ==============================================================================
 class FeatureStorePayload(TypedDict, total=False):
+    """Feature-Store-Payload eines Plugins.
+
+    Phase 15 (U15-A1, Invariante 5): `schema_version` ist für ALLE Plugins mit
+    capabilities['feature_store']=True ein PFLICHTFELD (Semantic Versioning,
+    major.minor.patch) und wird im `metadata`-Objekt gestempelt. Der
+    GUI-Lesepfad (Indikator) prüft sie beim Chart-Re-Render.
+    """
     feature_id: str
     plugin_version: str
     records: List[Dict[str, Any]]
     metadata: Dict[str, Any]
+    schema_version: str
     statistics: Dict[str, Any]
 
 
@@ -26268,12 +24960,10 @@ from PySide6.QtWidgets import (
 
 try:
     from chart.chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, build_html_template
-    from chart.indicators.grid import GridIndicator
     from chart.indicators.grid_liquidity import GridLiquidityIndicator
     from chart.indicator_dialog import IndicatorSettingsDialog
 except ImportError:
     from chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, build_html_template
-    from indicators.grid import GridIndicator
     from indicators.grid_liquidity import GridLiquidityIndicator
     from indicator_dialog import IndicatorSettingsDialog
 
@@ -26393,11 +25083,10 @@ class PyTraderChartWindow(QMainWindow):
         self._is_loading_data = False
         self.df_data = None
 
-        # Generische Indikator-Registry: indicator_id -> BaseIndicator
-        # Alt-Indikator 'grid' (hardcoded, unverändert) + neuer Plugin-Indikator
-        # 'grid_liquidity' (Phase 12) – beide laufen parallel.
+        # Generische Indikator-Registry: indicator_id -> BaseIndicator.
+        # Phase 15: Alt-Indikator 'grid' (chart/indicators/grid.py) entfernt;
+        # verbleibender Plugin-Indikator 'grid_liquidity' (Phase 12).
         self.indicators: Dict[str, BaseIndicator] = {
-            "grid": GridIndicator(),
             "grid_liquidity": GridLiquidityIndicator(),
         }
         # Phase 13 Schritt 6: Neuer Close im grid_liquidity-Indikator → NUR ein
@@ -26484,6 +25173,12 @@ class PyTraderChartWindow(QMainWindow):
         if not isinstance(self.indicators_state, dict):
             self.indicators_state = {}
 
+        # Phase 15 (U15-B4): Alt-Indikator 'grid' entfernt – persistierte
+        # indicators_state['grid']-Einträge werden ignoriert/bereinigt (keine
+        # Registry-Instanz mehr; der Legacy-Pfad in _resolve_indicator_params()
+        # bleibt für Abwärtskompatibilität bestehen, erhält aber kein Set).
+        self.indicators_state.pop("grid", None)
+
         # Standard-Indikator-Setups ergänzen falls unvollständig
         for ind_id, ind_plugin in self.indicators.items():
             if ind_id not in self.indicators_state:
@@ -26517,7 +25212,6 @@ class PyTraderChartWindow(QMainWindow):
         self.symbol_combo = self.ui_widget.findChild(QComboBox, "combo_symbol")
         self.tf_combo = self.ui_widget.findChild(QComboBox, "combo_tf")
         self.btn_reset = self.ui_widget.findChild(QPushButton, "btn_reset_chart")
-        self.btn_indicator = self.ui_widget.findChild(QPushButton, "btn_indicator_grid")
         self.btn_indicator_liquidity = self.ui_widget.findChild(QPushButton, "btn_indicator_grid_liquidity")
         self.btn_signal = self.ui_widget.findChild(QPushButton, "btn_signal_select")
         self.chart_container = self.ui_widget.findChild(QWidget, "web_container")
@@ -26530,11 +25224,6 @@ class PyTraderChartWindow(QMainWindow):
             self.tf_combo.currentTextChanged.connect(self.on_tf_changed)
         if self.btn_reset:
             self.btn_reset.clicked.connect(self.fit_chart)
-        # Alt-Grid-Button (btn_indicator_grid) → Indikator 'grid'
-        if self.btn_indicator:
-            self.btn_indicator.setCheckable(True)
-            self.btn_indicator.clicked.connect(self.toggle_grid_lines)
-            self.btn_indicator.installEventFilter(self)
         # Plugin-Grid-Button (btn_indicator_grid_liquidity) → Indikator 'grid_liquidity'
         if self.btn_indicator_liquidity:
             self.btn_indicator_liquidity.setCheckable(True)
@@ -26572,11 +25261,6 @@ class PyTraderChartWindow(QMainWindow):
         pass
 
     def eventFilter(self, watched, event):
-        # Rechtsklick auf den Alt-Grid-Button → Einstellungen für 'grid'
-        if (self.btn_indicator is not None and watched == self.btn_indicator
-                and event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton):
-            self._toggle_settings_dialog("grid")
-            return True
         # Rechtsklick auf den Plugin-Grid-Button → Einstellungen für 'grid_liquidity'
         if (self.btn_indicator_liquidity is not None and watched == self.btn_indicator_liquidity
                 and event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton):
@@ -26586,7 +25270,7 @@ class PyTraderChartWindow(QMainWindow):
 
     def _toggle_settings_dialog(self, ind_id: str) -> None:
         """Wenn der Einstellungs-Dialog offen ist, schliessen; sonst für den
-        jeweiligen Indikator (alt 'grid' / Plugin 'grid_liquidity') öffnen."""
+        jeweiligen Indikator ('grid_liquidity') öffnen."""
         if self._settings_dialog is not None and self._settings_dialog.isVisible():
             self._settings_dialog.close()
             self._settings_dialog = None
@@ -26598,9 +25282,8 @@ class PyTraderChartWindow(QMainWindow):
         return self.indicators.get(ind_id)
 
     def update_indicator_button_style(self):
-        """Aktualisiert die Färbung beider Indikator-Buttons (Alt 'grid' +
-        Plugin 'grid_liquidity') entsprechend ihres An/Aus-Zustands."""
-        self._apply_indicator_button_style(self.btn_indicator, "grid")
+        """Aktualisiert die Färbung des Plugin-Indikator-Buttons
+        ('grid_liquidity') entsprechend seines An/Aus-Zustands."""
         self._apply_indicator_button_style(self.btn_indicator_liquidity, "grid_liquidity")
 
     def _apply_indicator_button_style(self, button: Optional[QPushButton], ind_id: str) -> None:
@@ -26611,10 +25294,6 @@ class PyTraderChartWindow(QMainWindow):
         color = "#2e7d32" if is_active else "#37474f"
         button.setStyleSheet(
             f"background-color: {color}; color: white; font-weight: bold; border-radius: 4px; padding: 3px 10px;")
-
-    def toggle_grid_lines(self):
-        """Schaltet den ALTEN Grid-Indikator ('grid') an/aus."""
-        self._toggle_indicator("grid")
 
     def toggle_grid_liquidity_lines(self):
         """Schaltet den NEUEN Plugin-Indikator ('grid_liquidity') an/aus."""
@@ -26716,7 +25395,7 @@ class PyTraderChartWindow(QMainWindow):
         logic_params überlagern die Set-Logik, damit Änderungen an den
         Service-Parametern im Dialog SOFORT auf dem Chart erscheinen.
 
-        LEGACY (z.B. Alt-Indikator 'grid' / alter DB-Stand ohne set_id):
+        LEGACY (alter DB-Stand ohne set_id):
         volle params werden unverändert durchgereicht (Abwärtskompatibilität).
 
         Fix: Ohne set_id werden display_params + logic_params ebenfalls
@@ -26759,8 +25438,8 @@ class PyTraderChartWindow(QMainWindow):
         5.4 Schritt 2: Der Indikator-Dialog liefert im Plugin-Modus ein
         GETRENNTES Dict {set_id, display_params} – die Berechnungslogik lebt im
         Service-Set, die Darstellung (Farben, Sichtbarkeiten) im Chart-State.
-        Legacy (Alt-Indikator 'grid' / voller params-Dict) wird unverändert
-        gespeichert (Abwärtskompatibilität).
+        Legacy (voller params-Dict ohne set_id) wird unverändert gespeichert
+        (Abwärtskompatibilität).
         """
         if isinstance(payload, dict) and ("set_id" in payload or "display_params" in payload):
             self.indicators_state[ind_id] = {
@@ -26805,8 +25484,8 @@ class PyTraderChartWindow(QMainWindow):
                 # 5.4 Schritt 2: Parameter aus set_id (Logik) + display_params
                 # (Darstellung) auflösen – Legacy voller params bleibt erhalten.
                 res = plugin.calculate(self.df_data, self._resolve_indicator_params(ind_id, st))
-                # Grid-spezifische Render-Logik (Alt 'grid' + Plugin 'grid_liquidity')
-                if ind_id in ("grid", "grid_liquidity"):
+                # Grid-spezifische Render-Logik (Plugin 'grid_liquidity')
+                if ind_id == "grid_liquidity":
                     lines = res.get("lines", [])
                     circles = res.get("hit_circles", [])
                     # Circle-Zeiten auf kontinuierlich mappen
@@ -26981,7 +25660,7 @@ class PyTraderChartWindow(QMainWindow):
         if self.df_data is not None and not self.df_data.empty:
             for ind_id, plugin in self.indicators.items():
                 st = self.indicators_state.get(ind_id, {})
-                if st.get("active") and ind_id in ("grid", "grid_liquidity"):
+                if st.get("active") and ind_id == "grid_liquidity":
                     if hasattr(plugin, "set_context"):
                         plugin.set_context(self.current_symbol, self.current_tf)
                     # 5.4 Schritt 2: Logik aus set_id + Darstellung aus
@@ -27202,6 +25881,10 @@ class PyTraderChartWindow(QMainWindow):
                     loaded_ind = _parse_json_field(ind_st) or {}
                     # Merge statt ersetzen, damit Grid-Fallback erhalten bleibt
                     self.indicators_state.update(loaded_ind)
+                    # Phase 15 (U15-B4): Alt-'grid'-Einträge beim Symbol/TF-
+                    # Wechsel ebenfalls ignorieren/bereinigen (keine Registry-
+                    # Instanz mehr, erhält kein Set).
+                    self.indicators_state.pop("grid", None)
                     # Fehlende Default-Parameter nachtragen
                     for ind_id, ind_plugin in self.indicators.items():
                         if ind_id in self.indicators_state:
@@ -27238,6 +25921,10 @@ class PyTraderChartWindow(QMainWindow):
                     loaded_ind = _parse_json_field(ind_st) or {}
                     # Merge statt ersetzen, damit Grid-Fallback erhalten bleibt
                     self.indicators_state.update(loaded_ind)
+                    # Phase 15 (U15-B4): Alt-'grid'-Einträge beim Symbol/TF-
+                    # Wechsel ebenfalls ignorieren/bereinigen (keine Registry-
+                    # Instanz mehr, erhält kein Set).
+                    self.indicators_state.pop("grid", None)
                     # Fehlende Default-Parameter nachtragen
                     for ind_id, ind_plugin in self.indicators.items():
                         if ind_id in self.indicators_state:
@@ -29218,13 +27905,10 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 # ==============================================================================
 # chart/indicators/__init__.py
 # ==============================================================================
-
-try:
-	from .grid import GridIndicator
-except (ImportError, ValueError):
-	from grid import GridIndicator
-
-__all__ = ["GridIndicator"]
+# Phase 15: Alt-Indikator 'grid' (grid.py) entfernt. Verbleibende Indikatoren
+# werden direkt über ihre Module importiert (z. B. chart_win.py importiert
+# chart.indicators.grid_liquidity.GridLiquidityIndicator).
+# Keine Exporte im Paket-__init__ – keine harten Imports erforderlich.
 ```
 
 --------------------------------------------------
@@ -29300,275 +27984,6 @@ class BaseIndicator(ABC):
 		(Open/Closed), damit die Engine (chart_win) die Re-Injektion generisch
 		über ALLE Indikatoren ausführen kann – kein Indikator-Sonderfall."""
 		pass
-```
-
---------------------------------------------------
-
-### DATEI: chart/indicators/grid.py
-```py
-# chart/indicators/grid.py
-"""
-Grid & Proximity Indicator Plugin
-Restaurierter, stabiler Stand ohne Zeitzonen-Offsets (basierend auf Agents2.md)
-"""
-
-import math
-from datetime import datetime, timezone as dt_timezone
-from typing import Any, Dict, List, Optional
-import numpy as np
-import pandas as pd
-from pathlib import Path
-
-from .base_indicator import BaseIndicator
-from db_service import DbPool
-
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
-DB_ANALYTICS = str(BASE_DIR / "data" / "analytics.duckdb")
-
-
-def f_round_to_custom_step(price: float, step: float) -> float:
-    if step <= 0:
-        return price
-    inv_step = 1.0 / step
-    return round(price * inv_step) / inv_step
-
-
-def f_strip_trailing_zeros(val: float) -> str:
-    s = f"{val:.6f}"
-    if "." in s:
-        s = s.rstrip("0").rstrip(".")
-    return s
-
-
-def f_in_window_around(minute_val: int, center: int, span: int) -> bool:
-    lower = center - span
-    upper = center + span
-    if lower < 0:
-        return minute_val >= (60 + lower) or minute_val <= upper
-    elif upper > 59:
-        return minute_val >= lower or minute_val <= (upper - 60)
-    else:
-        return lower <= minute_val <= upper
-
-
-class GridIndicator(BaseIndicator):
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._symbol: Optional[str] = None
-        self._timeframe: Optional[str] = None
-
-    def set_context(self, symbol: str, timeframe: str) -> None:
-        self._symbol = symbol
-        self._timeframe = timeframe
-
-    @property
-    def indicator_id(self) -> str:
-        return "grid"
-
-    @property
-    def display_name(self) -> str:
-        return "Grid & Proximity Liq Lines"
-
-    @property
-    def default_params(self) -> Dict[str, Any]:
-        return {
-            "prox_enableMaster": True,
-            "prox_level1": 0.0,
-            "prox_level2": 0.0,
-            "prox_level3": 0.0,
-            "prox_level4": 0.0,
-            "prox_level5": 0.0,
-            "prox_level6": 0.0,
-            "prox_visitPct": 0.05,
-            "prox_stepsAround": 4,
-            "prox_stepSize": 0.5,
-            "prox_useTimeFilter": True,
-            "prox_timeWindowMins": 5,
-            "prox_showLines": True,
-            "prox_showCircles": True,
-        }
-
-    @property
-    def param_options(self) -> Dict[str, List[Any]]:
-        return {}
-
-    @property
-    def param_layout(self) -> Optional[List[Any]]:
-        return [
-            "prox_enableMaster",
-            ("Zusatz-Levels 1 - 3", ["prox_level1", "prox_level2", "prox_level3"]),
-            ("Zusatz-Levels 4 - 6", ["prox_level4", "prox_level5", "prox_level6"]),
-            "prox_visitPct",
-            ("Grid (Steps / Size $)", ["prox_stepsAround", "prox_stepSize"]),
-            ("Time Filter (Aktiv / Mins)", ["prox_useTimeFilter", "prox_timeWindowMins"]),
-            "prox_showLines",
-            "prox_showCircles",
-        ]
-
-    def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
-        if df.empty or not params.get("prox_enableMaster", True):
-            return {
-                "lines": [],
-                "hit_circles": [],
-                "status_info": {"in_time_window": False, "active_hits": []},
-            }
-
-        step_size = float(params.get("prox_stepSize", 0.5))
-        steps_around = int(params.get("prox_stepsAround", 4))
-        visit_pct = float(params.get("prox_visitPct", 0.05))
-
-        use_time_filter_raw = params.get("prox_useTimeFilter", True)
-        if isinstance(use_time_filter_raw, str):
-            use_time_filter = use_time_filter_raw.lower() in ("true", "1", "yes")
-        else:
-            use_time_filter = bool(use_time_filter_raw)
-
-        time_window_mins = int(params.get("prox_timeWindowMins", 5))
-
-        show_lines_raw = params.get("prox_showLines", True)
-        show_lines = show_lines_raw.lower() in ("true", "1", "yes") if isinstance(show_lines_raw, str) else bool(
-            show_lines_raw)
-
-        show_circles_raw = params.get("prox_showCircles", True)
-        show_circles = show_circles_raw.lower() in ("true", "1", "yes") if isinstance(show_circles_raw, str) else bool(
-            show_circles_raw)
-
-        custom_levels = [
-            float(params.get("prox_level1", 0.0)),
-            float(params.get("prox_level2", 0.0)),
-            float(params.get("prox_level3", 0.0)),
-            float(params.get("prox_level4", 0.0)),
-            float(params.get("prox_level5", 0.0)),
-            float(params.get("prox_level6", 0.0)),
-        ]
-        valid_custom_levels = [lvl for lvl in custom_levels if lvl > 0.0]
-
-        last_row = df.iloc[-1]
-        last_close = float(last_row["close"])
-
-        # 1. GRID LEVEL ARRAY ZUSAMMENSTELLEN
-        center_price = f_round_to_custom_step(last_close, step_size)
-        grid_levels = set()
-
-        for i in range(-steps_around, steps_around + 1):
-            grid_levels.add(round(center_price + (i * step_size), 6))
-
-        for c_lvl in valid_custom_levels:
-            grid_levels.add(round(c_lvl, 6))
-
-        sorted_levels = sorted(list(grid_levels), reverse=True)
-
-        # 2. ZEITFENSTER-FILTER (REINES NATIVE UTC DER KERZENZEIT)
-        if "time" in df.columns:
-            last_ts = int(last_row["time"])
-            m = datetime.fromtimestamp(last_ts, tz=dt_timezone.utc).minute
-        else:
-            m = datetime.now(dt_timezone.utc).minute
-
-        full_win = f_in_window_around(m, 0, time_window_mins)
-        half_win = f_in_window_around(m, 30, time_window_mins)
-        in_time_window_raw = full_win or half_win
-        in_time_window = in_time_window_raw if use_time_filter else True
-
-        # 3. PROXIMITY & HIT LOGIK ÜBER HISTORIE
-        hit_circles = []
-        active_hits = []
-
-        tracked_levels = sorted_levels if show_lines else []
-
-        for idx, row in df.iterrows():
-            time_val = int(row["time"])
-            c_high = float(row["high"])
-            c_low = float(row["low"])
-
-            # Native UTC-Minute ohne künstlichen Offset
-            row_m = datetime.fromtimestamp(time_val, tz=dt_timezone.utc).minute
-            row_in_time = (
-                f_in_window_around(row_m, 0, time_window_mins) or f_in_window_around(row_m, 30, time_window_mins)
-            )
-
-            # Farblogik:
-            # - Zeitfilter INAKTIV (Checkbox aus): ALLE Proximity-Punkte im
-            #   Bereich einer Liq-Line werden gelb (#FFEB3B) geplottet.
-            # - Zeitfilter AKTIV (Checkbox an): Punkte im Zeitfenster werden
-            #   gelb (#FFEB3B), Punkte ausserhalb des Fensters fuchsia (#E91E63).
-            if use_time_filter and not row_in_time:
-                circle_color = "#E91E63"  # ausserhalb des Fensters -> fuchsia
-            else:
-                circle_color = "#FFEB3B"  # gelb (alle / im Fenster)
-
-            for lvl in tracked_levels:
-                visit_min = lvl * (1.0 - visit_pct / 100.0)
-                visit_max = lvl * (1.0 + visit_pct / 100.0)
-
-                touch_high = visit_min <= c_high <= visit_max
-                touch_low = visit_min <= c_low <= visit_max
-                pierce = c_low <= lvl and c_high >= lvl
-
-                near = touch_high or touch_low or pierce
-
-                if near:
-                    if show_circles:
-                        hit_circles.append({
-                            "time": time_val,
-                            "price": lvl,
-                            "color": circle_color,
-                        })
-                    if idx == df.index[-1]:
-                        active_hits.append(f_strip_trailing_zeros(lvl))
-
-        # 4. LINES PAYLOAD
-        lines_payload = []
-        if show_lines:
-            for lvl in sorted_levels:
-                is_custom = any(abs(lvl - c_lvl) < 0.0001 for c_lvl in valid_custom_levels)
-
-                lines_payload.append({
-                    "price": lvl,
-                    "color": "rgba(33, 150, 243, 0.9)" if is_custom else "rgba(33, 150, 243, 0.5)",
-                    "width": 1 if is_custom else 3,
-                    "style": "Solid",
-                    "is_custom": is_custom,
-                })
-
-        return {
-            "lines": lines_payload,
-            "hit_circles": hit_circles,
-            "status_info": {
-                "in_time_window": in_time_window,
-                "active_hits": active_hits,
-            },
-        }
-
-    @staticmethod
-    def _get_custom_levels(params: Dict[str, Any]) -> List[float]:
-        levels = []
-        for i in range(1, 7):
-            try:
-                v = float(params.get(f"custom_level_{i}", 0.0))
-                if v > 0:
-                    levels.append(round(v, 6))
-            except (ValueError, TypeError):
-                pass
-        return levels
-
-    def _get_level_at_time(self, con, ts: int) -> Optional[float]:
-        try:
-            dt = datetime.fromtimestamp(ts, tz=dt_timezone.utc)
-            row = con.execute("""
-                SELECT grid_nearest_level
-                FROM feature_store
-                WHERE symbol = ? AND timeframe = ? AND bar_time = ?
-                  AND grid_nearest_level IS NOT NULL AND grid_nearest_level > 0
-            """, [self._symbol, self._timeframe, dt]).fetchone()
-            if row and row[0] is not None:
-                v = float(row[0])
-                if not math.isnan(v) and v > 0:
-                    return v
-        except Exception:
-            pass
-        return None
 ```
 
 --------------------------------------------------
@@ -29761,6 +28176,10 @@ class GridLiquidityIndicator(BaseIndicator):
         Service ({time, price, in_window}) oder [] bei fehlenden Daten/Fehlern –
         der Aufrufer entscheidet, ob er auf die Pipeline (calculate) zurückfällt.
 
+        U15-A2 (Farb-Semantik): Die gelieferten Kreise enthalten KEINE Farbe –
+        der Aufrufer (calculate) wendet die circle_color_std/_active-Färbung
+        additiv aus dem Indikator-Schema an (in_window + use_time_filter).
+
         Args:
             symbol: Symbol-Name
             timeframe: Timeframe
@@ -29920,7 +28339,22 @@ class GridLiquidityIndicator(BaseIndicator):
     def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
         """Führt die Service-Pipeline (grid_lines + proximity) für den
         Historical-Run aus, cached die Linien thread-sicher und liefert den
-        Render-Payload (Parität zu grid.py)."""
+        Render-Payload (Parität zu grid.py).
+
+        Invariante 10 (Chart-Entkopplung, Phase 15 U15-A2) – Lese-Kette:
+          1. PRIMÄR: Proximity-Hit-Circles werden aus dem feature_store
+             gelesen (read_proximity_from_feature_store) – der Chart führt
+             KEINE Proximity-Berechnung aus, er liest vorberechnete Daten
+             aus DuckDB.
+          2. DEFINIERTER FALLBACK: Ist der feature_store leer (noch kein
+             Batch-Lauf geschrieben), wird die Service-Pipeline
+             (grid_lines + proximity) synchron ausgeführt – Linien/Circles
+             werden daraus gerendert UND die Circles zusätzlich als
+             berechnete Referenz verwendet. Zielzustand 15.2: Fallback
+             entfällt, sobald der Store verlässlich befüllt ist.
+          Die Grid-LINIEN (Live-Tick-Cache) kommen unabhängig davon immer
+          aus der Pipeline (GridLinesService) – sie sind kein DB-Output.
+        """
         empty_result: Dict[str, Any] = {
             "lines": [],
             "hit_circles": [],
@@ -29957,8 +28391,33 @@ class GridLiquidityIndicator(BaseIndicator):
                 self._symbol or "", self._timeframe or ""
             )
             if cached_circles:
-                circles = cached_circles
+                # U15-A2 (Farb-Konsistenz): Die Feature-Store-Kreise kommen aus
+                # dem DB-Lesepfad OHNE Farbe (nur time/price/in_window). Damit
+                # der Primärpfad identisch zum Pipeline-Fallback färbt, wird
+                # die Farbe hier additiv aus dem Indikator-Schema angewendet:
+                #   in_window + use_time_filter → circle_color_std, sonst _active.
+                circle_std = str(p.get("circle_color_std") or "#FFEB3B")
+                circle_active = str(p.get("circle_color_active") or "#E91E63")
+                use_time_filter = _as_bool(p.get("use_time_filter"), True)
+                circles = [
+                    dict(
+                        c,
+                        color=(
+                            circle_active
+                            if (use_time_filter and not bool(c.get("in_window", True)))
+                            else circle_std
+                        ),
+                    )
+                    for c in cached_circles
+                ]
             else:
+                # DEFINIERTER FALLBACK (U15-A2): feature_store enthält keine
+                # Proximity-Hits für dieses (symbol, timeframe) – die
+                # Service-Pipeline liefert die Circles als berechnete
+                # Referenz (Invariante 10, Zielzustand: Fallback entfällt).
+                print(f"⚠️ [GridLiquidityIndicator] feature_store leer für "
+                      f"{self._symbol}/{self._timeframe} – Pipeline-Fallback "
+                      f"(U15-A2, definierter Fallback).")
                 # Display-Layer: priority=10 (JS-Bridge-Erwartung, wie Alt-Plugin).
                 # Die Services selbst bleiben Paritäts-pur (kein priority – exakt
                 # wie grid.py); die Anreicherung passiert erst hier im Adapter.
@@ -31766,7 +30225,7 @@ class SignalOverlay:
 # HINWEIS: Bewusst MINIMAL gehalten – hier werden KEINE schweren Module
 # importiert (kein chart_win, keine Indikatoren). ColorButton ist ein
 # eigenständiges PySide6-Widget und kann von indicator_dialog.py,
-# service_win.py und Tests ohne Circular-Import-Risiko eingebunden werden.
+# serviceui/service_win.py und Tests ohne Circular-Import-Risiko eingebunden werden.
 # NamedItemActionsMixin ist ein reines Qt-Mixin (nur QInputDialog/QMessageBox)
 # und ebenfalls import-schwerelos.
 from .color_button import ColorButton
@@ -32235,8 +30694,1678 @@ class AbstractStateModel(ABC):
 
 --------------------------------------------------
 
+### DATEI: serviceui/__init__.py
+```py
+# serviceui/__init__.py
+"""
+Service-UI-Paket (Phase 15, Kapitel 15.1 – U15-D1).
+
+Modularisierte Service-UI: Die gewachsene service_win.py wurde in den
+Unterordner serviceui/ verschoben und in SRP-Module zerlegt:
+
+  * service_set_utils.py   – _available_plugin_ids, _sets_using_plugin
+  * set_run_worker.py      – ServiceSetRunWorker (QThread)
+  * set_item_adapter.py    – ServiceSetItemAdapter (NamedItemAdapter)
+  * param_columns.py       – ServiceParamColumnsMixin (Parameter-Column-Builder)
+  * trash_dialog.py        – ServiceSetTrashDialog (Papierkorb-Dialog)
+  * service_win.py         – ServiceWindow (Hauptfenster, re-exportiert API)
+
+Verhalten unverändert gegenüber der alten service_win.py.
+"""
+
+from serviceui.service_win import (
+    ServiceWindow,
+    ServiceSetRunWorker,
+    ServiceSetItemAdapter,
+    _ServiceSetItemAdapter,
+    _available_plugin_ids,
+    _sets_using_plugin,
+    BASE_DIR,
+)
+
+__all__ = [
+    "ServiceWindow",
+    "ServiceSetRunWorker",
+    "ServiceSetItemAdapter",
+    "_ServiceSetItemAdapter",
+    "_available_plugin_ids",
+    "_sets_using_plugin",
+    "BASE_DIR",
+]
+
+```
+
+--------------------------------------------------
+
+### DATEI: serviceui/param_columns.py
+```py
+# serviceui/param_columns.py
+"""
+Service-UI: Parameter-Column-Builder (dynamische Service-Spalten).
+
+Phase 15, Kapitel 15.1 (U15-D1): Aus service_win.py ausgelagert –
+Verhalten unverändert. Als Mixin, damit die Host-Klasse (ServiceWindow)
+weiterhin direkt `self._build_service_columns(...)` etc. aufrufen kann.
+
+Die Methoden greifen auf Host-Attribute zurück, die zur Laufzeit vorhanden
+sind: service_columns_layout, _service_param_controls, _service_desc_controls,
+top_row, widget_service_columns, combo_symbol, combo_tf_set, _symbol_precision,
+list_execution_order, collect_set_definition(), _schedule_reflow (ContentScrollMixin),
+_service_lock/_build_tooltip (ServiceWindow).
+"""
+
+from typing import Any, Dict
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
+    QLabel, QLineEdit, QSizePolicy, QSpinBox, QVBoxLayout, QWidget,
+)
+
+
+class ServiceParamColumnsMixin:
+    """Baut die dynamischen Service-Spalten (Roadmap 5.4.2.2).
+
+    Für jede instance_id in execution_order wird eine QGroupBox-Spalte im
+    service_columns_layout erzeugt. Jede Spalte skaliert in der Höhe exakt
+    mit der Anzahl ihrer Parameter (QSizePolicy.Maximum); die Fensterbreite
+    wächst mit der Anzahl der Spalten nach rechts – ohne leeren Raum und
+    ohne fixe Pixelwerte.
+    """
+
+    @staticmethod
+    def _is_visual_key(key: str) -> bool:
+        """Konvention für reine Darstellungs-Props: Sichtbarkeit (show_*) + Farben (color).
+
+        Darstellungs-Parameter gehören NICHT ins Service-Set (nur Berechnungs-
+        Logik, Roadmap 5.4.1.2) und werden daher in den Service-Spalten
+        ausgeblendet (konsistent zum Indikator-Dialog).
+        """
+        if key.startswith("show_"):
+            return True
+        if "color" in key.lower():
+            return True
+        return False
+
+    @staticmethod
+    def _human(key: str) -> str:
+        return key.replace("_", " ").title()
+
+    @staticmethod
+    def _decimal_places(value: Any) -> int:
+        """Nachkommastellen eines float (für QDoubleSpinBox.setDecimals)."""
+        if not isinstance(value, float) or value != value:  # NaN-Schutz
+            return 4
+        s = f"{value:.10f}".rstrip("0")
+        if "." in s:
+            return len(s.split(".")[1])
+        return 0
+
+    def _get_symbol_precision(self) -> int:
+        """USER-REQ: Preisskala-Praezision (fix je Symbol) fuer die 6
+        Custom-Level-Eingabefelder. Lazy ermittelt (db_service.get_symbol_
+        precision) und fuer die Fenster-Instanz gecacht – kein DB-Zugriff
+        bei jedem Spalten-Neuaufbau."""
+        if self._symbol_precision is None:
+            try:
+                from db_service import get_symbol_precision
+                symbol = (self.combo_symbol.currentText()
+                          if self.combo_symbol else "SILVER")
+                timeframe = (self.combo_tf_set.currentText()
+                             if self.combo_tf_set else "H1")
+                self._symbol_precision = get_symbol_precision(symbol, timeframe)
+            except Exception:
+                self._symbol_precision = 2
+        return self._symbol_precision
+
+    def _create_param_control(self, key: str, val: Any, spec: Dict[str, Any]) -> QWidget:
+        """Erzeugt ein Eingabe-Widget exakt aus dem ParameterSchema.
+
+        float -> QDoubleSpinBox, int -> QSpinBox, bool -> QCheckBox,
+        choice -> QComboBox, color/str -> QLineEdit. min/max/step werden 1:1
+        übertragen (Roadmap 5.4.2.2).
+        """
+        p_type = spec.get("type")
+        if p_type == "float":
+            spin = QDoubleSpinBox()
+            spin.setRange(float(spec.get("min", -1e9)), float(spec.get("max", 1e9)))
+            step = spec.get("step")
+            decimals = self._decimal_places(step) if step is not None else self._decimal_places(spec.get("default"))
+            # USER-REQ: Custom-Levels (prox_level1..6) nutzen die Preisskala-
+            # Praezision (fix je Symbol). MUSS vor setValue geschehen, sonst
+            # rundet QDoubleSpinBox den Wert auf die Schema-Default-Digits.
+            if key.startswith("prox_level"):
+                decimals = self._get_symbol_precision()
+            spin.setDecimals(min(6, max(0, decimals)))
+            spin.setSingleStep(float(step) if step is not None else 0.01)
+            try:
+                spin.setValue(float(val))
+            except (TypeError, ValueError):
+                spin.setValue(float(spec.get("default", 0.0)))
+            return spin
+        if p_type == "int":
+            spin = QSpinBox()
+            spin.setRange(int(spec.get("min", -100000)), int(spec.get("max", 100000)))
+            spin.setSingleStep(int(spec.get("step", 1)))
+            try:
+                spin.setValue(int(val))
+            except (TypeError, ValueError):
+                spin.setValue(int(spec.get("default", 0)))
+            return spin
+        if p_type == "bool":
+            chk = QCheckBox()
+            chk.setChecked(bool(val))
+            return chk
+        if p_type == "choice":
+            combo = QComboBox()
+            combo.addItems([str(o) for o in (spec.get("options") or [])])
+            combo.setCurrentText(str(val))
+            return combo
+        txt = QLineEdit()
+        txt.setText(str(val))
+        return txt
+
+    @staticmethod
+    def _ctrl_value(ctrl: QWidget) -> Any:
+        """Liest den aktuellen Wert eines Controls typsicher aus."""
+        if isinstance(ctrl, QCheckBox):
+            return ctrl.isChecked()
+        if isinstance(ctrl, QSpinBox):
+            return ctrl.value()
+        if isinstance(ctrl, QDoubleSpinBox):
+            return ctrl.value()
+        if isinstance(ctrl, QComboBox):
+            return ctrl.currentText()
+        return ctrl.text()
+
+    def _setup_collapsible(self, group: QGroupBox) -> None:
+        """Macht eine ausklappbare QGroupBox wirklich kollabierbar.
+
+        Beim Abwählen werden die Kinder ausgeblendet und die Fensterhöhe per
+        _reflow() nahtlos verkleinert (Roadmap 5.4.2.2: Ein-/Ausklappen
+        verändert die Höhe dynamisch). Zusätzlich wird group.updateGeometry()
+        gerufen, damit der gecachte QWidgetItemV2-sizeHint der Box invalidiert
+        wird (Qt 6.11: Layouts refreshen diesen Cache sonst NICHT).
+        """
+        def _toggle(checked: bool) -> None:
+            for child in group.findChildren(QWidget):
+                child.setVisible(checked)
+            group.updateGeometry()  # QWidgetItemV2-Cache invalidieren (s. oben)
+            self._reflow()
+        group.toggled.connect(_toggle)
+        _toggle(group.isChecked())
+
+    def _reflow(self) -> None:
+        """Erzwingt die Neuberechnung der Layouts (dynamische Höhe/Breite).
+
+        Qt 6.11: QWidgetItemV2 cached den sizeHint eines Widgets beim ersten
+        Zugriff und aktualisiert ihn NICHT, wenn der Inhalt später wächst –
+        selbst layout.invalidate() hilft nicht. Daher werden die Caches der
+        betroffenen Widgets explizit per updateGeometry() invalidiert
+        (invalidateSizeCache) und die Layout-Caches geleert.
+
+        WICHTIG: Die Fenstergröße wird DEFERRED (nächste Event-Loop-Runde)
+        angepasst. Beim Set-Wechsel sind die alten Service-Spalten per
+        deleteLater() noch im Widget-Baum; bis sie zerstört sind, melden die
+        Layout-Caches einen veralteten (zu kleinen) sizeHint (z.B. 18x18 für
+        eine volle Spalten-Zeile). Ein synchrones resize würde das Fenster
+        daher fälschlich schrumpfen. _schedule_reflow() zerstört die
+        deleteLater-Widgets und berechnet die Größe erst aus dem konsistenten
+        Zustand (ContentScrollMixin).
+        """
+        self._schedule_reflow()
+
+    def _clear_service_columns(self) -> None:
+        """Entfernt alle Service-Spalten aus dem service_columns_layout."""
+        if self.service_columns_layout is None:
+            return
+        while self.service_columns_layout.count():
+            item = self.service_columns_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._service_param_controls = {}
+        self._service_desc_controls = {}
+
+    def _build_service_columns(self, set_definition: Dict[str, Any]) -> None:
+        """Baut die dynamischen Service-Spalten (Roadmap 5.4.2.2).
+
+        Für jede instance_id in execution_order wird eine QGroupBox-Spalte im
+        service_columns_layout erzeugt. Jede Spalte skaliert in der Höhe exakt
+        mit der Anzahl ihrer Parameter (QSizePolicy.Maximum); die Fensterbreite
+        wächst mit der Anzahl der Spalten nach rechts – ohne leeren Raum und
+        ohne fixe Pixelwerte.
+        """
+        if self.service_columns_layout is None:
+            return
+        self._clear_service_columns()
+        services = set_definition.get("services") or {}
+        for iid in (set_definition.get("execution_order") or []):
+            cfg = services.get(iid) or {}
+            pid = cfg.get("plugin_id") or iid
+            col = self._build_service_column(iid, pid, cfg)
+            self.service_columns_layout.addWidget(col)
+        # Container erneut in die obere Zeile einfügen: Das QWidgetItem
+        # eines Widgets meldet dessen Größe zum Zeitpunkt des Einfügens und
+        # aktualisiert sich bei späterem Inhalts-Wachstum nicht (Qt-Quirk).
+        # Entfernen + erneutes Einfügen erzeugt ein frisches QWidgetItem mit
+        # der aktuellen Größe.
+        if self.top_row is not None and self.widget_service_columns is not None:
+            self.top_row.removeWidget(self.widget_service_columns)
+            self.top_row.addWidget(self.widget_service_columns)
+        self._reflow()
+
+    def _build_service_column(self, iid: str, pid: str, cfg: Dict[str, Any]) -> QGroupBox:
+        """Erzeugt EINE Service-Spalte (QGroupBox) mit Parameter-Formular.
+
+        - Normale Parameter im QFormLayout (float/int/bool nach Schema).
+        - expert: True (inkl. lookback) in einer einklappbaren
+          QGroupBox 'Experten-Optionen' am Spaltenfuß.
+
+        P14-04-E: Spaltentitel trägt die 🔒-Kennzeichnung, wenn der Service in
+        einem gespeicherten Service-Set vorkommt (Sperre sichtbar).
+        """
+        prefix, _ = self._service_lock(pid)
+        col = QGroupBox(f"{prefix}{iid}  [{pid}]")
+        # 5.4.2.2 Punkt 3: Spalte skaliert in der Höhe exakt mit ihrem Inhalt
+        # (endet unter dem letzten Parameter), wächst beim Vergrößern des
+        # Fensters NICHT mit.
+        col.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        vl = QVBoxLayout(col)
+        vl.setAlignment(Qt.AlignTop)
+
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            plugin = PluginRegistry().get(pid)
+        except KeyError:
+            vl.addWidget(QLabel(f"Plugin '{pid}' nicht gefunden."))
+            return col
+
+        full_schema: Dict[str, Any] = dict(getattr(plugin, "base_parameter_schema", None) or {})
+        full_schema.update(dict(plugin.parameter_schema or {}))
+        order = list(getattr(plugin, "parameter_order", None) or (plugin.parameter_schema or {}).keys())
+        for key in (getattr(plugin, "base_parameter_schema", None) or {}):
+            if key not in order:
+                order.append(key)
+        labels = dict(getattr(plugin, "param_labels", None) or {})
+        for key, spec in (getattr(plugin, "base_parameter_schema", None) or {}).items():
+            labels.setdefault(key, spec.get("description") or self._human(key))
+
+        params = dict(cfg.get("params") or {})
+        lookback = cfg.get("lookback")
+
+        # Phase 14 P14-01: Individuelle Instanz-Beschreibung (bearbeitbar) –
+        # wird in ServiceInstanceConfig.description gespeichert und in
+        # Tooltip + Info-Dialog angezeigt.
+        desc_row = QHBoxLayout()
+        desc_label = QLabel("Beschreibung:")
+        desc_edit = QLineEdit()
+        desc_edit.setPlaceholderText("Individuelle Anmerkung für diese Instanz (optional)")
+        desc_edit.setText(str(cfg.get("description") or ""))
+        self._service_desc_controls[iid] = desc_edit
+        desc_edit.textChanged.connect(lambda _t, iid=iid: self._update_service_tooltip(iid))
+        desc_row.addWidget(desc_label)
+        desc_row.addWidget(desc_edit)
+        vl.addLayout(desc_row)
+
+        # Normale (Nicht-Expert-, Nicht-Darstellungs-)Parameter
+        form = QFormLayout()
+        for key in order:
+            spec = full_schema.get(key, {})
+            if spec.get("expert") or self._is_visual_key(key):
+                continue
+            cval = params.get(key, spec.get("default"))
+            # USER-REQ: P14-01 Nachtrag - Alt-Sets speichern die 6 Custom-Levels
+            # als Aggregat custom_levels (Liste/String) statt als Einzelparameter
+            # prox_level1..6 - leere Level-Felder werden daraus vorbefüllt.
+            if key.startswith("prox_level") and not cval:
+                try:
+                    from analytics.features.definitions.grid_lines_service import map_custom_levels_to_prox_levels
+                    cval = map_custom_levels_to_prox_levels(params).get(key, cval)
+                except Exception:
+                    pass
+            ctrl = self._create_param_control(key, cval, spec)
+            self._service_param_controls[(iid, key)] = ctrl
+            form.addRow(labels.get(key, self._human(key)), ctrl)
+        vl.addLayout(form)
+
+        # Expert-Parameter (inkl. lookback als Service-Instanz-Einstellung)
+        expert_keys = [k for k in order if full_schema.get(k, {}).get("expert")]
+        if expert_keys:
+            exp_grp = QGroupBox("Experten-Optionen")
+            exp_grp.setCheckable(True)
+            exp_grp.setChecked(False)
+            exp_grp.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+            ef = QFormLayout(exp_grp)
+            for key in expert_keys:
+                spec = full_schema.get(key, {})
+                if key == "lookback":
+                    cval = lookback if lookback is not None else spec.get("default")
+                else:
+                    cval = params.get(key, spec.get("default"))
+                ctrl = self._create_param_control(key, cval, spec)
+                self._service_param_controls[(iid, key)] = ctrl
+                ef.addRow(labels.get(key, self._human(key)), ctrl)
+            vl.addWidget(exp_grp)
+            self._setup_collapsible(exp_grp)
+
+        return col
+
+    def _rebuild_columns(self) -> None:
+        """Baut die Service-Spalten aus dem aktuellen Editor-Zustand neu."""
+        if self.service_columns_layout is None:
+            return
+        definition = self.collect_set_definition()
+        self._build_service_columns(definition)
+
+    def _update_service_tooltip(self, iid: str) -> None:
+        """Aktualisiert den Tooltip des Listen-Items live beim Tippen."""
+        if not self.list_execution_order:
+            return
+        for i in range(self.list_execution_order.count()):
+            item = self.list_execution_order.item(i)
+            if item.data(Qt.UserRole) == iid:
+                cfg: Dict[str, Any] = {"plugin_id": item.data(Qt.UserRole + 1) or iid}
+                desc_ctrl = self._service_desc_controls.get(iid)
+                if desc_ctrl is not None:
+                    cfg["description"] = desc_ctrl.text().strip()
+                # P14-04-E: Sperr-Nachtrag (🔒) beibehalten – der Live-Tooltip
+                # darf die Sperr-Kennzeichnung nicht überschreiben.
+                _prefix, lock_tip = self._service_lock(str(cfg.get("plugin_id") or ""))
+                item.setToolTip(self._build_tooltip(iid, cfg) + lock_tip)
+                break
+
+```
+
+--------------------------------------------------
+
+### DATEI: serviceui/service_set_utils.py
+```py
+# serviceui/service_set_utils.py
+"""
+Service-UI: Wiederverwendbare Helfer für das Service-Fenster.
+
+Phase 15, Kapitel 15.1 (U15-D1): Aus service_win.py ausgelagert –
+Verhalten unverändert.
+"""
+
+from typing import Any, Dict, List
+
+
+def _available_plugin_ids() -> str:
+    """Alle registrierten Plugin-IDs (sortiert, kommasepariert).
+
+    Phase 13 Schritt 6-Korrektur: Die Verfügbarkeit wird dynamisch aus der
+    PluginRegistry abgeleitet (grid_lines, proximity, grid_liquidity, ...),
+    NICHT hartkodiert auf 'grid_liquidity'.
+    """
+    try:
+        from analytics.features.feature_builder import PluginRegistry
+        return ", ".join(sorted(PluginRegistry().plugins.keys()))
+    except Exception:
+        return "?"
+
+
+def _sets_using_plugin(plugin_id: str, sets: List[Dict[str, Any]]) -> List[str]:
+    """P14-04-E: Namen aller Service-Sets, die einen Service mit dieser
+    plugin_id enthalten.
+
+    Basis der Service-Sperre: Einzel-Services, die in einem gespeicherten
+    Service-Set vorkommen, dürfen im Service-Fenster nicht entfernt werden
+    (Indikator-Basisservices wie grid_lines/proximity bleiben funktionsfähig).
+    Beim Löschversuch wird der Name des verwendeten Sets angezeigt.
+    """
+    names: List[str] = []
+    for s in sets or []:
+        services = s.get("services") or {}
+        if any((cfg or {}).get("plugin_id") == plugin_id
+               for cfg in services.values()):
+            names.append(str(s.get("display_name") or s.get("set_id") or "?"))
+    return names
+
+```
+
+--------------------------------------------------
+
+### DATEI: serviceui/service_win.py
+```py
+# serviceui/service_win.py
+"""
+Service-Kontrollfenster für PyTrader.
+Steuert den Historical Scanner (Full-Scan / Delta-Update) über ein separates Fenster.
+Mit automatischem State Persistence via PersistentWindow.
+
+Phase 13 Schritt 4: Zusätzlich Service-Set-Verwaltung (ServiceSetRepository +
+ServiceSetEvaluator): Set-Auswahl (list_sets()), execution_order-Anzeige mit
+Up/Down-Umsortierung, Name (leer → Auto-Name), Speichern/Löschen (mit
+QMessageBox-Rückfrage) und Ausführen (ServiceSetEvaluator im Hintergrund).
+
+Phase 15 Kapitel 15.1 (U15-D1): Modularisierung – die gewachsene Datei wurde
+in den Unterordner serviceui/ verschoben und in Module zerlegt (Verhalten
+unverändert):
+  * service_set_utils.py   – _available_plugin_ids, _sets_using_plugin
+  * set_run_worker.py      – ServiceSetRunWorker (QThread)
+  * set_item_adapter.py    – ServiceSetItemAdapter (NamedItemAdapter)
+  * param_columns.py       – ServiceParamColumnsMixin (Parameter-Column-Builder)
+  * trash_dialog.py        – ServiceSetTrashDialog (Papierkorb-Dialog)
+Diese Datei re-exportiert die öffentliche API, damit bestehende Aufrufe
+(main.py, Tests) weiter funktionieren.
+"""
+
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from PySide6.QtCore import QFile, QIODevice, QTimer, Qt, Slot
+from PySide6.QtUiTools import QUiLoader
+from PySide6.QtWidgets import (
+    QCheckBox, QComboBox, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar,
+    QPushButton, QTextEdit, QWidget,
+)
+
+from analytics.background_workers.historical_scanner import HistoricalScanner
+from analytics.engine.description_dialog import ServiceDescriptionDialog
+from analytics.engine.service_set_repository import ServiceSetRepository
+from analytics.engine.set_evaluator import ServiceSetEvaluator
+from persistent_win import PersistentWindow, register_persistent_window
+from scrollable_content import ContentScrollMixin
+from chart.widgets.named_item_actions import NamedItemActionsMixin
+
+# Phase 15 U15-D1: Submodule der Service-UI
+from serviceui.service_set_utils import _available_plugin_ids, _sets_using_plugin
+from serviceui.set_run_worker import ServiceSetRunWorker
+from serviceui.set_item_adapter import ServiceSetItemAdapter, _ServiceSetItemAdapter
+from serviceui.param_columns import ServiceParamColumnsMixin
+from serviceui.trash_dialog import ServiceSetTrashDialog
+
+# Projekt-Root (eine Ebene über serviceui/) – für die UI-Datei unter ui/.
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+@register_persistent_window(auto_restore=False)
+class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActionsMixin, PersistentWindow):
+    INSTANCE_ID = "win_service"
+
+    def __init__(self, parent=None, service_set_repo: Optional[ServiceSetRepository] = None):
+        super().__init__(parent)
+        self.scanner: Optional[HistoricalScanner] = None
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_seconds = 0
+        self._elapsed_timer.timeout.connect(self._update_elapsed)
+
+        # Phase 13 Schritt 4: Service-Set-Verwaltung
+        self.set_repo: ServiceSetRepository = service_set_repo or ServiceSetRepository()
+        self.set_evaluator = ServiceSetEvaluator()
+        self._set_run_worker: Optional[ServiceSetRunWorker] = None
+        self._current_set_id: Optional[str] = None
+        self._current_set_definition: Optional[Dict[str, Any]] = None
+        # USER-REQ (P14-03): Preisskala-Praezision je Symbol fuer die 6
+        # Custom-Level-Eingabefelder (prox_level1..6). Lazy + gecacht.
+        self._symbol_precision: Optional[int] = None
+
+        # Phase 13 Schritt 8: Service-Set-Adapler für die generische
+        # Neu-/Speichern-/Löschen-Mechanik (NamedItemActionsMixin) – exakt
+        # analog zur Preset-Verwaltung im Indikator-Prop-Fenster.
+        self._set_adapter = _ServiceSetItemAdapter(self)
+
+        # UI laden
+        ui_file = QFile(str(BASE_DIR / "ui" / "service_win.ui"))
+        if ui_file.open(QIODevice.ReadOnly):
+            loader = QUiLoader()
+            self.ui = loader.load(ui_file)
+            ui_file.close()
+            self.setCentralWidget(self.ui)
+        else:
+            self.ui = QWidget(self)
+            self.setCentralWidget(self.ui)
+
+        self.setWindowTitle("PyTrader - Service Kontrolle")
+
+        # Controls
+        self.combo_symbol: QComboBox = self.ui.findChild(QComboBox, "combo_symbol")
+        self.check_new_scan: QCheckBox = self.ui.findChild(QCheckBox, "check_new_scan")
+        self.check_grid_scan: QCheckBox = self.ui.findChild(QCheckBox, "check_grid_scan")
+        self.btn_start: QPushButton = self.ui.findChild(QPushButton, "btn_start_scan")
+        self.label_elapsed: QLabel = self.ui.findChild(QLabel, "label_elapsed_value")
+        self.progress_bar: QProgressBar = self.ui.findChild(QProgressBar, "progress_bar")
+        self.text_log: QTextEdit = self.ui.findChild(QTextEdit, "text_log")
+
+        # Phase 13 Schritt 4: Service-Set-Controls
+        self.combo_set: QComboBox = self.ui.findChild(QComboBox, "combo_set")
+        self.combo_tf_set: QComboBox = self.ui.findChild(QComboBox, "combo_tf_set")
+        self.btn_refresh_sets: QPushButton = self.ui.findChild(QPushButton, "btn_refresh_sets")
+        self.edit_set_name: QLineEdit = self.ui.findChild(QLineEdit, "edit_set_name")
+        # Phase 14 P14-01: Set-Beschreibung + Info-Button (ServiceDescriptionDialog)
+        self.edit_set_description: Optional[QLineEdit] = self.ui.findChild(QLineEdit, "edit_set_description")
+        self.btn_info_service: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_info_service")
+        self.list_execution_order: QListWidget = self.ui.findChild(QListWidget, "list_execution_order")
+        self.btn_move_up: QPushButton = self.ui.findChild(QPushButton, "btn_move_up")
+        self.btn_move_down: QPushButton = self.ui.findChild(QPushButton, "btn_move_down")
+        self.btn_remove_instance: QPushButton = self.ui.findChild(QPushButton, "btn_remove_instance")
+        self.edit_new_instance: QLineEdit = self.ui.findChild(QLineEdit, "edit_new_instance")
+        self.btn_add_instance: QPushButton = self.ui.findChild(QPushButton, "btn_add_instance")
+        # Phase 14 P14-02: Hot-Reload-Button für Custom-Plugins
+        self.btn_reload_plugins: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_reload_plugins")
+        # Phase 13 Schritt 6-Korrektur: Dropdown mit ALLEN verfügbaren Services
+        self.combo_plugin_select: Optional[QComboBox] = self.ui.findChild(QComboBox, "combo_plugin_select")
+        self.btn_save_set: QPushButton = self.ui.findChild(QPushButton, "btn_save_set")
+        self.btn_delete_set: QPushButton = self.ui.findChild(QPushButton, "btn_delete_set")
+        # Phase 14 P14-05: Papierkorb-Button (Soft-Delete/Wiederherstellung)
+        self.btn_trash_sets: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_trash_sets")
+        self.btn_execute_set: QPushButton = self.ui.findChild(QPushButton, "btn_execute_set")
+
+        # Phase 13 5.4 Schritt 1: Dynamische Service-Spalten (Breite/Höhe aus
+        # dem Inhalt – KEINE fixen Pixelwerte). Das Inhalt-Layout erhält
+        # SetFixedSize + AlignTop|AlignLeft: Das Fenster wächst mit der Anzahl
+        # der Spalten nach rechts und beim Ausklappen der Experten-Optionen
+        # nach unten – ohne leeren Raum (Roadmap 5.4.2.2 Punkt 3).
+        #
+        # WICHTIG: Der Spalten-Container wird IM CODE erzeugt (nicht per
+        # QUiLoader). Das QWidgetItem QUiLoader-erzeugter Widgets meldet nach
+        # einer späteren Layout-Änderung einen veralteten sizeHint (Qt-Quirk:
+        # 18x18 bzw. alter Gruppenstand), wodurch die Fensterbreite nicht mit
+        # der Spaltenanzahl wachsen würde. Im Code erzeugte Widgets (wie die
+        # Spalten selbst) werden korrekt weitergereicht.
+        self.group_service_sets: Optional[QGroupBox] = self.ui.findChild(QGroupBox, "group_service_sets")
+        self.widget_service_columns = QGroupBox("Service-Parameter")
+        self.widget_service_columns.setObjectName("widget_service_columns")
+        self.service_columns_layout = QHBoxLayout(self.widget_service_columns)
+        self.service_columns_layout.setSpacing(6)
+        # Inhalt-Widget + Layout VOR dem Scroll-Wrapper referenzieren
+        # (install_content_scroll ersetzt das CentralWidget von self.ui).
+        self.content_widget = self.ui.centralWidget()
+        self.central_layout = self.content_widget.layout() if self.content_widget else None
+        if self.central_layout is not None:
+            # 5.4 User-Anpassung: 'Service-Parameter' oben RECHTS direkt neben
+            # dem Rahmen 'Service-Sets' (gleiche Zeile, Service-Sets links).
+            self.top_row = QHBoxLayout()
+            self.top_row.setSpacing(6)
+            idx = self.central_layout.indexOf(self.group_service_sets)
+            if idx < 0:
+                idx = 0
+            self.central_layout.removeWidget(self.group_service_sets)
+            self.top_row.addWidget(self.group_service_sets)
+            self.top_row.addWidget(self.widget_service_columns)
+            self.central_layout.insertLayout(idx, self.top_row)
+        # Scroll-Wrapper: gesamtes Fenster scrollbar, wenn Inhalt > Bildschirm
+        # (ContentScrollMixin). Der Inhalt behält seine natürliche Größe; das
+        # Fenster wird auf den Bildschirm geklemmt (Scrollbars erscheinen erst,
+        # wenn der Inhalt den Viewport übersteigt).
+        self.install_content_scroll(self.content_widget, install_to=self.ui)
+        self.main_layout = self.ui.layout()
+        # KEIN SetFixedSize auf dem QMainWindowLayout: das würde die
+        # Fenstergröße auf den Inhalt fixieren und das Bildschirm-Cap
+        # (setMaximumSize) überschreiben. Auch das INHALT-Layout bekommt KEIN
+        # SetFixedSize: QLayout.SetFixedSize ruft setFixedSize() auf dem
+        # Inhalt-Widget auf und fixiert es auf die ERSTE Layout-Größe – späteres
+        # Wachstum (Service-Spalten, Experten-Optionen) wäre dadurch blockiert.
+        # Stattdessen setzt resize_to_clamped_content() das Inhalt-Widget in
+        # jedem Reflow explizit auf die aktuelle Layout-Größe (ContentScrollMixin).
+        if self.central_layout is not None:
+            self.central_layout.setSpacing(6)
+            self.central_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self._service_param_controls: Dict[Any, QWidget] = {}
+        # Phase 14 P14-01: Beschreibungs-Eingabefelder der Service-Instanzen
+        self._service_desc_controls: Dict[str, QWidget] = {}
+
+        if self.btn_start:
+            self.btn_start.clicked.connect(self.start_scan)
+
+        # Phase 13 Schritt 4: Service-Set-Signale
+        if self.combo_set:
+            self.combo_set.currentIndexChanged.connect(self._on_set_selected)
+        if self.btn_refresh_sets:
+            self.btn_refresh_sets.clicked.connect(self.refresh_set_list)
+        if self.btn_move_up:
+            self.btn_move_up.clicked.connect(lambda: self.move_order_item(-1))
+        if self.btn_move_down:
+            self.btn_move_down.clicked.connect(lambda: self.move_order_item(1))
+        if self.btn_remove_instance:
+            self.btn_remove_instance.clicked.connect(self.remove_instance)
+        # Phase 14 P14-01: Info-Button + itemClicked-Selektion der Instanzliste
+        self._current_list_iid: Optional[str] = None
+        if self.list_execution_order:
+            self.list_execution_order.itemClicked.connect(self._on_order_item_clicked)
+            self.list_execution_order.itemSelectionChanged.connect(self._sync_list_selection)
+        if self.btn_info_service:
+            self.btn_info_service.clicked.connect(self._show_service_info)
+        if self.btn_add_instance:
+            self.btn_add_instance.clicked.connect(self.add_instance)
+            if self.edit_new_instance:
+                self.edit_new_instance.returnPressed.connect(self.add_instance)
+        if self.btn_save_set:
+            self.btn_save_set.clicked.connect(self.save_set)
+        if self.btn_delete_set:
+            self.btn_delete_set.clicked.connect(self.delete_set)
+        # Phase 14 P14-05: Papierkorb-Dialog (Soft-Delete)
+        if self.btn_trash_sets:
+            self.btn_trash_sets.clicked.connect(self.show_trash_dialog)
+        if self.btn_execute_set:
+            self.btn_execute_set.clicked.connect(self.execute_set)
+
+        # U15-D2 (Bedien-Feinschliff): Log-Kontextmenü (Kopieren / Log leeren)
+        # + Auto-Scroll ans Ende in log() – siehe _on_log_context_menu().
+        if self.text_log:
+            self.text_log.setContextMenuPolicy(Qt.CustomContextMenu)
+            self.text_log.customContextMenuRequested.connect(self._on_log_context_menu)
+
+        # Sofort speichern bei Symbol-Änderung
+        if self.combo_symbol:
+            self.combo_symbol.currentTextChanged.connect(self.save_state)
+            # USER-REQ: Preisskala-Praezision ist je Symbol fix – beim
+            # Symbol-Wechsel Cache invalidieren + Spalten neu bauen.
+            self.combo_symbol.currentTextChanged.connect(self._on_symbol_changed)
+
+        # Set-Dropdown initial befüllen (list_sets() als Quelle)
+        self.refresh_set_list()
+
+        # Phase 13 Schritt 6-Korrektur: Verfügbare Services sichtbar machen –
+        # der Platzhalter im Eingabefeld zeigt jetzt grid_lines + proximity
+        # (die neuen Services aus Schritt 6) statt nur grid_liquidity.
+        if self.edit_new_instance:
+            self.edit_new_instance.setPlaceholderText(
+                "instance_id [plugin_id]  z.B. grid_1 [grid_lines] oder prox_1 [proximity]"
+            )
+        # Dropdown listet ALLE registrierten Services (grid_lines, grid_liquidity,
+        # proximity). Auswahl füllt das Instanz-Feld vor ("plugin_id [plugin_id]").
+        if self.combo_plugin_select:
+            from analytics.features.feature_builder import PluginRegistry
+            for pid in sorted(PluginRegistry().plugins.keys()):
+                self.combo_plugin_select.addItem(pid, pid)
+            self.combo_plugin_select.currentTextChanged.connect(self._on_plugin_select_changed)
+        # Phase 14 P14-02: Hot-Reload der Custom-Plugins (data/custom_plugins/)
+        if self.btn_reload_plugins:
+            self.btn_reload_plugins.clicked.connect(self.reload_plugins)
+        self.log(f"Verfügbare Plugins: {_available_plugin_ids()}")
+
+        # State asynchron wiederherstellen (nach show(), damit move/resize vom Window-Manager akzeptiert werden)
+        QTimer.singleShot(0, self.restore_state)
+
+    # --- PersistentWindow-Interface ---
+
+    def get_persistent_symbol(self) -> str:
+        return self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
+
+    def get_persistent_timeframe(self) -> str:
+        return "H1"
+
+    def _apply_persistent_filters(self, symbol: str, timeframe: str) -> None:
+        if self.combo_symbol:
+            idx = self.combo_symbol.findText(symbol)
+            if idx >= 0:
+                self.combo_symbol.setCurrentIndex(idx)
+
+    def _on_symbol_changed(self, symbol: str) -> None:
+        """USER-REQ: Preisskala-Praezision ist je Symbol fix. Beim Symbol-
+        Wechsel wird der Precision-Cache invalidiert und – falls ein Set
+        aktiv ist – die Service-Spalten neu aufgebaut, damit die 6
+        Custom-Level-Felder (prox_level1..6) die neue Preisskala-Praezision
+        des Symbols anzeigen."""
+        self._symbol_precision = None
+        if (self.combo_set is not None and self.combo_set.currentIndex() >= 0
+                and self.service_columns_layout is not None):
+            self._rebuild_columns()
+
+    # --- Scanner ---
+
+    @Slot()
+    def start_scan(self):
+        if self.scanner and self.scanner.isRunning():
+            self.log("Scan laeuft bereits.")
+            return
+
+        symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
+        new_scan = self.check_new_scan.isChecked() if self.check_new_scan else False
+        grid_scan = self.check_grid_scan.isChecked() if self.check_grid_scan else False
+
+        # U15-D2 (Bedien-Feinschliff): Bestätigungsdialog vor FULL SCAN.
+        # new_scan=True löscht bestehende Signale und berechnet neu
+        # (HistoricalScanner: "Modus: FULL SCAN ... werden geloescht") –
+        # dieser Overwrite ist unwiderruflich, daher Rückfrage.
+        if new_scan:
+            reply = QMessageBox.question(
+                self, "Voll-Scan bestätigen",
+                f"Voll-Scan für {symbol}?\n\n"
+                "Bestehende Signale werden GELÖSCHT und neu berechnet "
+                "(unwiderruflich). Fortfahren?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                self.log("Voll-Scan abgebrochen.")
+                return
+
+        mode = "GRID PROXIMITY" if grid_scan else "EMA+ATR STANDARD"
+        self.log(f"Starte {mode}-Scan: {symbol}, New Scan = {new_scan}")
+        self.btn_start.setEnabled(False)
+        self._elapsed_seconds = 0
+        self.label_elapsed.setText("00:00:00")
+        self.progress_bar.setValue(0)
+        self._elapsed_timer.start(1000)
+
+        self.scanner = HistoricalScanner(symbol, new_scan, grid_scan)
+        self.scanner.progress_updated.connect(self.on_progress)
+        self.scanner.scan_finished.connect(self.on_finished)
+        self.scanner.log_message.connect(self.log)
+        self.scanner.start()
+
+    @Slot(str, int, int)
+    def on_progress(self, message: str, current: int, total: int):
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(current)
+        self.log(message)
+
+    @Slot(str, int)
+    def on_finished(self, symbol: str, count: int):
+        self._elapsed_timer.stop()
+        self.btn_start.setEnabled(True)
+        self.log(f"Scan für {symbol} beendet: {count} Signale geschrieben.")
+
+    @Slot(str)
+    def log(self, message: str):
+        if self.text_log:
+            self.text_log.append(message)
+            # U15-D2 (Bedien-Feinschliff): Auto-Scroll ans Log-Ende, damit
+            # bei langen Scans immer die neueste Meldung sichtbar ist.
+            bar = self.text_log.verticalScrollBar()
+            if bar is not None:
+                bar.setValue(bar.maximum())
+
+    def _on_log_context_menu(self, pos) -> None:
+        """U15-D2 (Bedien-Feinschliff): Kontext-Rechtsklick im Log-Bereich.
+
+        Aktionen: 'Kopieren' (nur bei vorhandener Textauswahl) und
+        'Log leeren'. Reine QTextEdit-Operationen (copy/clear), keine
+        Logik-Duplikate.
+        """
+        if not self.text_log:
+            return
+        menu = QMenu(self)
+        copy_action = menu.addAction("Kopieren")
+        copy_action.setEnabled(bool(self.text_log.textCursor().hasSelection()))
+        clear_action = menu.addAction("Log leeren")
+        chosen = menu.exec(self.text_log.mapToGlobal(pos))
+        if chosen == copy_action:
+            self.text_log.copy()
+        elif chosen == clear_action:
+            self.text_log.clear()
+
+    def _update_elapsed(self):
+        self._elapsed_seconds += 1
+        h = self._elapsed_seconds // 3600
+        m = (self._elapsed_seconds % 3600) // 60
+        s = self._elapsed_seconds % 60
+        self.label_elapsed.setText(f"{h:02d}:{m:02d}:{s:02d}")
+
+    # =========================================================================
+    # Phase 13 Schritt 4: Service-Set-Verwaltung
+    # =========================================================================
+
+    def refresh_set_list(self) -> None:
+        """Befüllt das Set-Dropdown aus ServiceSetRepository.list_sets().
+
+        Quelle für die Set-Auswahl (Roadmap §4.2). Behält die aktuelle
+        Auswahl bei, sofern sie noch existiert; andernfalls wird das erste
+        Set geladen und in den Editor übertragen.
+        """
+        if not self.combo_set:
+            return
+        sets = self.set_repo.list_sets()
+        current = self.combo_set.currentData()
+
+        self.combo_set.blockSignals(True)
+        self.combo_set.clear()
+        for s in sets:
+            label = s.get("display_name") or s.get("set_id") or "Unbenannt"
+            self.combo_set.addItem(label, s.get("set_id"))
+        self.combo_set.blockSignals(False)
+
+        # Aktuelle Auswahl beibehalten, falls noch vorhanden.
+        selected_id: Optional[str] = None
+        if current is not None:
+            idx = self.combo_set.findData(current)
+            if idx >= 0:
+                self.combo_set.setCurrentIndex(idx)
+                selected_id = current
+
+        if selected_id is None and sets:
+            # Achtung: addItem() setzt das erste Item automatisch auf Index 0,
+            # während die Signale blockiert sind -> setCurrentIndex(0) löst KEIN
+            # currentIndexChanged aus. Daher explizit in den Editor laden.
+            self.combo_set.setCurrentIndex(0)
+            selected_id = self.combo_set.itemData(0)
+
+        if selected_id:
+            definition = self.set_repo.get_set(selected_id)
+            if definition:
+                self.load_set_into_editor(definition)
+        else:
+            # Kein Set (mehr) vorhanden -> Editor leeren
+            self._clear_set_editor()
+
+    def _clear_set_editor(self) -> None:
+        """Leert Name-Feld, Beschreibung und execution_order-Liste des Set-Editors."""
+        self._current_set_id = None
+        self._current_set_definition = None
+        self._current_list_iid = None
+        if self.edit_set_name:
+            self.edit_set_name.clear()
+        if self.edit_set_description:
+            self.edit_set_description.clear()
+        if self.list_execution_order:
+            self.list_execution_order.clear()
+        self._clear_service_columns()
+
+    @Slot(int)
+    def _on_set_selected(self, index: int) -> None:
+        """Lädt das im Dropdown gewählte Set in den Editor."""
+        if index < 0 or not self.combo_set:
+            return
+        set_id = self.combo_set.itemData(index)
+        if not set_id:
+            return
+        definition = self.set_repo.get_set(set_id)
+        if definition:
+            self.load_set_into_editor(definition)
+            self.log(f"Set geladen: {set_id}")
+
+    def load_set_into_editor(self, definition: Dict[str, Any]) -> None:
+        """Überträgt eine ServiceSetDefinition in Name-Feld + execution_order-Liste.
+
+        Phase 13 5.4 Schritt 1: Baut zusätzlich die dynamischen Service-Spalten
+        (eine QGroupBox pro Service mit Parameter-Formular) auf.
+        """
+        self._current_set_id = definition.get("set_id")
+        self._current_set_definition = definition
+        self._current_list_iid = None
+        if self.edit_set_name:
+            self.edit_set_name.setText(definition.get("display_name") or "")
+        if self.edit_set_description:
+            self.edit_set_description.setText(definition.get("description") or "")
+        if self.list_execution_order:
+            self.list_execution_order.clear()
+            services = definition.get("services") or {}
+            for iid in (definition.get("execution_order") or []):
+                cfg = services.get(iid, {})
+                plugin_id = cfg.get("plugin_id", "?")
+                prefix, lock_tip = self._service_lock(plugin_id)
+                item = QListWidgetItem(f"{prefix}{iid}  [{plugin_id}]")
+                item.setData(Qt.UserRole, iid)
+                item.setData(Qt.UserRole + 1, plugin_id)
+                item.setToolTip(self._build_tooltip(iid, cfg) + lock_tip)
+                self.list_execution_order.addItem(item)
+        self._build_service_columns(definition)
+
+    def collect_current_order(self) -> list:
+        """Liefert die instance_ids aus der Liste (aktuelle execution_order)."""
+        if not self.list_execution_order:
+            return []
+        return [
+            self.list_execution_order.item(i).data(Qt.UserRole)
+            for i in range(self.list_execution_order.count())
+        ]
+
+    @Slot()
+    def move_order_item(self, delta: int) -> None:
+        """Verschiebt das markierte Listenelement um delta (-1 = hoch, +1 = runter)."""
+        lw = self.list_execution_order
+        if not lw:
+            return
+        row = lw.currentRow()
+        if row < 0:
+            return
+        new_row = row + delta
+        if new_row < 0 or new_row >= lw.count():
+            return
+        item = lw.takeItem(row)
+        lw.insertItem(new_row, item)
+        lw.setCurrentRow(new_row)
+        self._rebuild_columns()
+
+    @Slot()
+    def remove_instance(self) -> None:
+        """Entfernt den markierten Service aus der Ausführungs-Reihenfolge.
+
+        P14-04-E (Service-Sperre): Einzel-Services, die in einem gespeicherten
+        Service-Set vorkommen, dürfen NICHT entfernt werden – sonst würde das
+        Set invalide und der Indikator verlöre seine Basisservices. Beim
+        Löschversuch erscheint ein Hinweis mit dem Namen des verwendeten Sets.
+        """
+        lw = self.list_execution_order
+        if not lw or lw.currentRow() < 0:
+            return
+        item = lw.item(lw.currentRow())
+        plugin_id = str(item.data(Qt.UserRole + 1) or item.data(Qt.UserRole) or "")
+        names = _sets_using_plugin(plugin_id, self.set_repo.list_sets())
+        if names:
+            QMessageBox.warning(
+                self, "Service gesperrt",
+                f"Der Service '{plugin_id}' kann nicht entfernt werden.\n"
+                f"Er wird vom Service-Set '{names[0]}' verwendet.\n"
+                f"Solange er in einem Set vorkommt, bleibt er für den "
+                f"Indikator gesperrt (P14-04).")
+            return
+        lw.takeItem(lw.currentRow())
+        self._rebuild_columns()
+
+    @Slot()
+    def _on_plugin_select_changed(self, plugin_id: str) -> None:
+        """Füllt das Instanz-Feld mit 'plugin_id [plugin_id]' vor, wenn der
+        User einen Service aus dem verfügbaren-Dropdown wählt (Schritt 6-
+        Korrektur: alle Services sichtbar + auswählbar)."""
+        if not plugin_id or not self.edit_new_instance:
+            return
+        self.edit_new_instance.setText(f"{plugin_id} [{plugin_id}]")
+
+    @Slot()
+    def add_instance(self) -> None:
+        """Fügt eine Service-Instanz 'instance_id [plugin_id]' zur Liste hinzu.
+
+        Plugin muss in der PluginRegistry existieren (Default-Params werden
+        beim Speichern eines neuen Sets verwendet). Duplikate werden abgelehnt.
+        """
+        if not self.edit_new_instance or not self.list_execution_order:
+            return
+        text = self.edit_new_instance.text().strip()
+        # Fallback: leeres Feld + Service im verfügbaren-Dropdown gewählt
+        if not text and self.combo_plugin_select:
+            plugin_id = self.combo_plugin_select.currentText()
+            if plugin_id:
+                text = f"{plugin_id} [{plugin_id}]"
+        if not text:
+            return
+        # Formate: "instance_id [plugin_id]", "instance_id:plugin_id" oder "instance_id"
+        import re
+        m = re.match(r"^([\w\-]+)\s*[\[:]\s*([\w\-]+)\s*\]?$", text)
+        if m:
+            iid, plugin_id = m.group(1), m.group(2)
+        else:
+            iid = text
+            plugin_id = text
+
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            PluginRegistry().get(plugin_id)
+        except KeyError:
+            self.log(f"Plugin '{plugin_id}' nicht gefunden. "
+                     f"Verfügbare Plugins: {_available_plugin_ids()}")
+            return
+
+        for i in range(self.list_execution_order.count()):
+            if self.list_execution_order.item(i).data(Qt.UserRole) == iid:
+                self.log(f"instance_id '{iid}' existiert bereits.")
+                return
+
+        prefix, lock_tip = self._service_lock(plugin_id)
+        item = QListWidgetItem(f"{prefix}{iid}  [{plugin_id}]")
+        item.setData(Qt.UserRole, iid)
+        item.setData(Qt.UserRole + 1, plugin_id)
+        item.setToolTip(self._build_tooltip(iid, {"plugin_id": plugin_id}) + lock_tip)
+        self.list_execution_order.addItem(item)
+        self.edit_new_instance.clear()
+        self.log(f"Service hinzugefügt: {iid} [{plugin_id}]")
+        self._rebuild_columns()
+
+    def collect_set_definition(self) -> Dict[str, Any]:
+        """Baut aus dem Editor eine ServiceSetDefinition.
+
+        Für ein geladenes Set werden die services aus der DB übernommen;
+        für neue Instanzen (bzw. neue Sets) werden die services aus den
+        Listeneinträgen aufgebaut (plugin_id + Default-Params aus der
+        Registry). Die Werte der dynamischen Service-Spalten (5.4 Schritt 1)
+        werden anschließend in die services-Konfiguration übernommen.
+        """
+        order = self.collect_current_order()
+        services: Dict[str, Any] = {}
+        if self._current_set_id:
+            existing = self.set_repo.get_set(self._current_set_id) or {}
+            services = dict(existing.get("services") or {})
+
+        # Jede Instanz in der Reihenfolge braucht eine services-Konfiguration –
+        # neue Instanzen erhalten Default-Params aus der Registry.
+        from analytics.features.feature_builder import PluginRegistry
+        registry = PluginRegistry()
+        if self.list_execution_order:
+            for i in range(self.list_execution_order.count()):
+                item = self.list_execution_order.item(i)
+                iid = item.data(Qt.UserRole)
+                plugin_id = item.data(Qt.UserRole + 1) or iid
+                if not iid:
+                    continue
+                if iid not in services:
+                    try:
+                        plugin = registry.get(plugin_id)
+                        cfg: Dict[str, Any] = {
+                            "plugin_id": plugin_id,
+                            "lookback": 1000,
+                            "params": dict(plugin.default_params),
+                        }
+                    except KeyError:
+                        cfg = {"plugin_id": plugin_id, "lookback": 1000, "params": {}}
+                    services[iid] = cfg
+
+        # Werte aus den dynamischen Service-Spalten übernehmen.
+        # lookback ist die Service-Instanz-Einstellung (ServiceInstanceConfig.
+        # lookback) und wird NICHT in params geschrieben.
+        for (iid, key), ctrl in self._service_param_controls.items():
+            cfg = services.setdefault(iid, {"plugin_id": "", "lookback": 1000, "params": {}})
+            if key == "lookback":
+                cfg["lookback"] = int(self._ctrl_value(ctrl))
+            else:
+                cfg.setdefault("params", {})[key] = self._ctrl_value(ctrl)
+
+        # Phase 14 P14-01: Instanz-Beschreibung aus den Spalten übernehmen
+        # (ServiceInstanceConfig.description – gehört NICHT in params).
+        for iid, ctrl in self._service_desc_controls.items():
+            cfg = services.setdefault(iid, {"plugin_id": "", "lookback": 1000, "params": {}})
+            cfg["description"] = ctrl.text().strip()
+
+        # Phase 14 P14-04: Semantische Versionierung – bei JEDER instance_id
+        # wird die aktuelle plugin.version aus der PluginRegistry eingestempelt
+        # (ServiceInstanceConfig.version). So trägt jede gespeicherte Instanz
+        # die Version des erzeugenden Plugins für den späteren Schema-Migrator.
+        # Kann ein Plugin nicht aufgelöst werden (z. B. deinstalliert), bleibt
+        # ein vorhandenes version-Feld bzw. dessen Fehlen unverändert erhalten.
+        for iid, cfg in services.items():
+            pid = cfg.get("plugin_id") or iid
+            try:
+                plugin = registry.get(pid)
+                cfg["version"] = getattr(plugin, "version", "0.0.0") or "0.0.0"
+            except KeyError:
+                pass
+
+        return {
+            "set_id": self._current_set_id or "",
+            "display_name": self.edit_set_name.text().strip() if self.edit_set_name else "",
+            # Phase 14 P14-01: Set-Beschreibung wird mitgespeichert
+            "description": self.edit_set_description.text().strip() if self.edit_set_description else "",
+            "execution_order": order,
+            "services": services,
+        }
+
+    # =========================================================================
+    # Phase 14 P14-01: Tooltips & Info-Dialog für Service-Instanzen
+    # =========================================================================
+
+    def _build_tooltip(self, instance_id: str, config: Dict[str, Any]) -> str:
+        """Baut einen Rich-Text-Tooltip (HTML) für eine Service-Instanz.
+
+        Angezeigt werden instance_id, Plugin-ID und – falls vorhanden – die
+        individuelle Instanz-Beschreibung (ServiceInstanceConfig.description).
+        """
+        lines = [f"<b>{instance_id}</b>", f"Plugin: {config.get('plugin_id', '?')}"]
+        desc = config.get("description")
+        if desc:
+            lines.append(f"<i>{desc}</i>")
+        return "<br>".join(lines)
+
+    def _service_lock(self, plugin_id: str) -> tuple:
+        """P14-04-E: (🔒-Präfix, Tooltip-Nachtrag) für die sichtbare Sperr-
+        Kennzeichnung im Service-Fenster.
+
+        Ein Service ist gesperrt, wenn er in einem gespeicherten Service-Set
+        vorkommt (Indikator-Basisservice). Liefert ("", "") wenn der Service
+        frei ist; andernfalls ein 🔒-Präfix für Listeneintrag/Spaltentitel und
+        einen HTML-Tooltip-Nachtrag mit dem Namen des verwendeten Sets.
+        """
+        names = _sets_using_plugin(str(plugin_id), self.set_repo.list_sets())
+        if not names:
+            return "", ""
+        return "🔒 ", (f"<br><b>Gesperrt (P14-04)</b>: wird vom Service-Set "
+                       f"'{names[0]}' verwendet – Entfernen nicht möglich")
+
+    def _on_order_item_clicked(self, item: QListWidgetItem) -> None:
+        """Merkt sich die aktuell markierte instance_id (itemClicked)."""
+        if item is not None:
+            self._current_list_iid = item.data(Qt.UserRole)
+
+    def _sync_list_selection(self) -> None:
+        """Synchronisiert _current_list_iid mit der aktuellen Selektion."""
+        if self.list_execution_order is not None:
+            row = self.list_execution_order.currentRow()
+            if row >= 0:
+                self._current_list_iid = self.list_execution_order.item(row).data(Qt.UserRole)
+
+    @Slot()
+    def _show_service_info(self) -> None:
+        """Öffnet den ServiceDescriptionDialog für die markierte Instanz.
+
+        Phase 15 U15-D1: Der Info-/Beschreibungs-Dialog selbst ist bereits
+        extern ausgelagert (analytics/engine/description_dialog.py,
+        ServiceDescriptionDialog); diese Slot-Methode öffnet ihn nur noch.
+        """
+        iid = self._current_list_iid
+        if not iid or self.list_execution_order is None:
+            self.log("Keine Service-Instanz markiert.")
+            return
+        cfg: Dict[str, Any] = {}
+        plugin = None
+        if self._current_set_definition:
+            cfg = dict((self._current_set_definition.get("services") or {}).get(iid, {}))
+        # Live-Beschreibung aus dem Eingabefeld übernehmen (falls vorhanden)
+        desc_ctrl = self._service_desc_controls.get(iid)
+        if desc_ctrl is not None:
+            cfg["description"] = desc_ctrl.text().strip()
+        plugin_id = cfg.get("plugin_id") or iid
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            plugin = PluginRegistry().get(plugin_id)
+        except KeyError:
+            self.log(f"Plugin '{plugin_id}' nicht gefunden.")
+            return
+        dlg = ServiceDescriptionDialog.from_plugin(plugin, instance_id=iid, config=cfg, parent=self)
+        dlg.exec()
+
+    @Slot()
+    def save_set(self) -> None:
+        """Speichert das aktive Set – analog zur Preset-Verwaltung (generisch).
+
+        Namensdialog (vorbelegt), leerer Name → Auto-Name aus den instance_ids
+        (z.B. 'grid_1 + prox_1'), Überschreiben-Rückfrage bei doppeltem Namen.
+        Implementierung: NamedItemActionsMixin.save_named_item() mit dem
+        Service-Set-Adapter (ServiceSetItemAdapter).
+        """
+        self.save_named_item(
+            self._set_adapter,
+            dialog_title="Service-Set speichern",
+            prompt="Name für das Service-Set:",
+        )
+
+    @Slot()
+    def delete_set(self) -> None:
+        """Löscht das gewählte Set – analog zur Preset-Verwaltung (generisch).
+
+        Rückfrage (QMessageBox.question), danach wird das nächstverfügbare Set
+        ausgewählt. Implementierung: NamedItemActionsMixin.delete_named_item()
+        mit dem Service-Set-Adapter.
+
+        P14-04-E (Set-Sperre): Es muss immer mindestens ein gültiges Service-
+        Set erhalten bleiben, damit der Indikator funktionsfähig bleibt. Das
+        Löschen des letzten verbliebenen Sets ist gesperrt.
+        """
+        if len(self.set_repo.list_sets()) <= 1:
+            QMessageBox.warning(
+                self, "Löschen gesperrt",
+                "Es muss immer mindestens ein gültiges Service-Set erhalten "
+                "bleiben, damit der Indikator funktionsfähig bleibt (P14-04).")
+            return
+        self.delete_named_item(self._set_adapter)
+
+    # =========================================================================
+    # Phase 14 P14-05: Papierkorb (Soft-Delete / Wiederherstellung)
+    # =========================================================================
+
+    @Slot()
+    def show_trash_dialog(self) -> None:
+        """Öffnet den Papierkorb-Dialog für Service-Sets (P14-05).
+
+        Phase 15 U15-D1: Der Dialog ist in serviceui/trash_dialog.py als
+        eigenständige Widget-Klasse (ServiceSetTrashDialog) ausgelagert –
+        Verhalten unverändert (inkl. doppelter Sicherheitsnachfrage).
+        """
+        dialog = ServiceSetTrashDialog(
+            repo=self.set_repo,
+            log_fn=self.log,
+            refresh_fn=self.refresh_set_list,
+            parent=self,
+        )
+        dialog.exec()
+
+    # =========================================================================
+    # Phase 14 P14-02: Hot-Reload der Plugins (Dynamic Discovery)
+    # =========================================================================
+
+    @Slot()
+    def reload_plugins(self) -> None:
+        """Lädt Custom-Plugins aus data/custom_plugins/ neu (Hot-Reload).
+
+        P14-02: Ruft PluginRegistry().reload() auf (unter RLock) und
+        aktualisiert das verfügbare-Services-Dropdown. Bereits laufende
+        Service-Ausführungen laufen auf ihren bisherigen Objektinstanzen
+        weiter; neue Instanziierungen nutzen die neuen Klassen.
+        """
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            registry = PluginRegistry()
+            registry.reload()
+            self.log("Plugins neu geladen.")
+        except Exception as e:
+            self.log(f"FEHLER beim Plugin-Reload: {e}")
+        # Dropdown aktualisieren (neue Custom-Plugins sichtbar machen)
+        if self.combo_plugin_select:
+            current = self.combo_plugin_select.currentText()
+            self.combo_plugin_select.blockSignals(True)
+            self.combo_plugin_select.clear()
+            for pid in sorted(PluginRegistry().plugins.keys()):
+                self.combo_plugin_select.addItem(pid, pid)
+            idx = self.combo_plugin_select.findText(current)
+            self.combo_plugin_select.setCurrentIndex(idx if idx >= 0 else 0)
+            self.combo_plugin_select.blockSignals(False)
+        self.log(f"Verfügbare Plugins: {_available_plugin_ids()}")
+
+    @Slot()
+    def execute_set(self) -> None:
+        """Startet den ServiceSetEvaluator für das aktive Set (Hintergrund-Thread)."""
+        definition = self.collect_set_definition()
+        if not definition.get("execution_order"):
+            self.log("Keine Services in der Ausführungs-Reihenfolge.")
+            return
+        if not definition.get("services"):
+            self.log("Set hat keine services-Konfiguration – Ausführung nicht möglich.")
+            return
+        if self._set_run_worker and self._set_run_worker.isRunning():
+            self.log("Set-Ausführung läuft bereits.")
+            return
+
+        symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
+        timeframe = self.combo_tf_set.currentText() if self.combo_tf_set else "H1"
+
+        if self.btn_execute_set:
+            # U15-D2 (Bedien-Feinschliff): sichtbarer Button-Lock – der
+            # Button wird deaktiviert und zeigt 'Läuft...', solange der
+            # Worker aktiv ist (verhindert doppeltes Ausführen).
+            self.btn_execute_set.setEnabled(False)
+            self.btn_execute_set.setText("Läuft...")
+        self._set_run_worker = ServiceSetRunWorker(
+            self.set_evaluator, symbol, timeframe, definition, parent=self,
+        )
+        self._set_run_worker.log_message.connect(self.log)
+        self._set_run_worker.run_finished.connect(self._on_set_run_finished)
+        self._set_run_worker.run_failed.connect(self._on_set_run_failed)
+        self._set_run_worker.start()
+
+    @Slot(str, int)
+    def _on_set_run_finished(self, set_id: str, count: int) -> None:
+        if self.btn_execute_set:
+            self.btn_execute_set.setEnabled(True)
+            self.btn_execute_set.setText("Ausführen")
+        self.log(f"Set-Ausführung abgeschlossen: {count} Services.")
+
+    @Slot(str, str)
+    def _on_set_run_failed(self, set_id: str, error: str) -> None:
+        if self.btn_execute_set:
+            self.btn_execute_set.setEnabled(True)
+            self.btn_execute_set.setText("Ausführen")
+        self.log(f"FEHLER bei Set-Ausführung: {error}")
+
+    def closeEvent(self, event):
+        # PersistentWindow.save_state() wird in super().closeEvent gerufen
+        if self.scanner and self.scanner.isRunning():
+            self.scanner.stop()
+            self.scanner.wait(2000)
+        if self._set_run_worker and self._set_run_worker.isRunning():
+            self._set_run_worker.wait(2000)
+        self._elapsed_timer.stop()
+        super().closeEvent(event)
+
+```
+
+--------------------------------------------------
+
+### DATEI: serviceui/set_item_adapter.py
+```py
+# serviceui/set_item_adapter.py
+"""
+Service-UI: Adapter für die generische Service-Set-Verwaltung.
+
+Phase 15, Kapitel 15.1 (U15-D1): Aus service_win.py ausgelagert –
+Verhalten unverändert. Die _item_*-Protokoll-Methoden greifen auf das
+ServiceWindow (self.dlg) zu (NamedItemActionsMixin-Mechanik, exakt analog
+zur Preset-Verwaltung im Indikator-Prop-Fenster).
+"""
+
+from typing import Any, Dict, List, Optional
+
+from chart.widgets.named_item_actions import NamedItemAdapter
+from analytics.engine.service_set_repository import ServiceSetRepository
+
+
+class _ServiceSetItemAdapter(NamedItemAdapter):
+    """Adapter für die SERVICE-SET-Sammlung im Service-Fenster.
+
+    Phase 13 Schritt 8: Die Service-Set-Verwaltung (Speichern/Löschen) nutzt
+    exakt dieselbe generische Preset-Mechanik wie das Indikator-Prop-Fenster
+    (NamedItemActionsMixin). Die _item_*-Protokoll-Methoden liegen in diesem
+    Adapter und greifen auf das ServiceWindow (self.dlg) zu.
+    """
+
+    def __init__(self, dlg: "ServiceWindow") -> None:
+        self.dlg = dlg
+
+    def _item_scope_label(self) -> str:
+        return "Service-Set"
+
+    def _item_current_name(self) -> str:
+        return self.dlg.edit_set_name.text().strip() if self.dlg.edit_set_name else ""
+
+    def _item_current_id(self) -> Optional[str]:
+        if self.dlg._current_set_id:
+            return self.dlg._current_set_id
+        if self.dlg.combo_set:
+            return self.dlg.combo_set.currentData()
+        return None
+
+    def _item_auto_name(self) -> str:
+        """Auto-Name aus den instance_ids (Roadmap: leerer Name → Auto-Name)."""
+        try:
+            definition = self.dlg.collect_set_definition()
+            definition["display_name"] = ""
+            return ServiceSetRepository._default_display_name(definition)
+        except Exception as e:
+            print(f"⚠️ [ServiceWindow] Auto-Name fehlgeschlagen: {e}")
+            return ""
+
+    def _item_list_names(self) -> List[str]:
+        return [s.get("display_name") or "" for s in self.dlg.set_repo.list_sets()]
+
+    def _item_exists(self, name: str) -> bool:
+        """True, wenn ein ANDERES Set bereits diesen Namen trägt."""
+        current = self._item_current_id()
+        return any(
+            (s.get("display_name") or "") == name and s.get("set_id") != current
+            for s in self.dlg.set_repo.list_sets()
+        )
+
+    def _item_save_as(self, name: str) -> Optional[str]:
+        """Speichert das Set unter 'name'; liefert die set_id zurück."""
+        definition = self.dlg.collect_set_definition()
+        if not definition.get("execution_order"):
+            self.dlg.log("Keine Services in der Ausführungs-Reihenfolge – "
+                         "Speichern abgebrochen.")
+            return None
+        if not definition.get("services"):
+            self.dlg.log("WARNUNG: Set hat keine services-Konfiguration "
+                         "(nur Reihenfolge wird gespeichert).")
+        definition["display_name"] = name
+        set_id = self.dlg.set_repo.save_set(definition)
+        self.dlg.log(f"Set gespeichert: {set_id}")
+        return set_id
+
+    def _item_delete_current(self) -> bool:
+        set_id = self._item_current_id()
+        if not set_id:
+            self.dlg.log("Kein Set zum Löschen ausgewählt.")
+            return False
+        if self.dlg.set_repo.delete_set(set_id):
+            # P14-05: Soft-Delete – das Set liegt im Papierkorb und kann über
+            # den Papierkorb-Dialog wiederhergestellt werden.
+            self.dlg.log(f"Set in den Papierkorb verschoben (P14-05): {set_id}")
+            return True
+        self.dlg.log(f"Set '{set_id}' nicht gefunden.")
+        return False
+
+    def _item_select(self, set_id: Optional[str] = None) -> None:
+        """Setzt die Set-Auswahl nach Speichern (set_id) bzw. Löschen (None)."""
+        self.dlg._current_set_id = None  # Neuauswahl erzwingen (sonst bleibt Alt-Selektion)
+        self.dlg.refresh_set_list()
+        if set_id and self.dlg.combo_set:
+            idx = self.dlg.combo_set.findData(set_id)
+            if idx >= 0:
+                self.dlg.combo_set.setCurrentIndex(idx)
+
+    def _item_reserved_name(self) -> Optional[str]:
+        return None  # Service-Sets haben kein geschütztes 'Default'-Set
+
+
+# Öffentlicher Alias (Phase 15 U15-D1): der Adapter ist Teil des Set-Editors
+# und wird von außen nicht als "privat" importiert.
+ServiceSetItemAdapter = _ServiceSetItemAdapter
+
+```
+
+--------------------------------------------------
+
+### DATEI: serviceui/set_run_worker.py
+```py
+# serviceui/set_run_worker.py
+"""
+Service-UI: Hintergrund-Worker für die Set-Ausführung.
+
+Phase 15, Kapitel 15.1 (U15-D1): Aus service_win.py ausgelagert –
+Verhalten unverändert.
+"""
+
+from typing import Any, Dict
+
+from PySide6.QtCore import QThread, Signal
+
+from analytics.engine.set_evaluator import ServiceSetEvaluator
+
+
+class ServiceSetRunWorker(QThread):
+    """Phase 13 Schritt 4: Führt ein Service-Set im Hintergrund aus.
+
+    Lädt OHLCV (Symbol/Timeframe) und ruft ServiceSetEvaluator.execute_set()
+    in einem separaten Thread auf, damit die GUI nicht blockiert.
+    """
+
+    log_message = Signal(str)
+    run_finished = Signal(str, int)  # set_id, Anzahl erfolgreicher Services
+    run_failed = Signal(str, str)    # set_id, Fehlermeldung
+
+    def __init__(self, evaluator: ServiceSetEvaluator, symbol: str, timeframe: str,
+                 set_definition: Dict[str, Any], parent=None):
+        super().__init__(parent)
+        self.evaluator = evaluator
+        self.symbol = symbol
+        self.timeframe = timeframe
+        self.set_definition = set_definition
+
+    def run(self):
+        try:
+            from analytics.features.feature_builder import FeatureBuilder, prepare_plugin_df
+            from analytics.features.plugins.base_plugin import PluginContext
+            from state_manager import StateManager
+
+            settings = StateManager().get_app_settings()
+            fb = FeatureBuilder()
+            df = fb.load_ohlcv(self.symbol, self.timeframe, limit=settings.feature_builder_limit)
+            if df is None or df.empty:
+                self.run_failed.emit(
+                    self.set_definition.get("set_id", ""),
+                    f"Keine OHLCV-Daten fuer {self.symbol} {self.timeframe}.",
+                )
+                return
+
+            df_plugin = prepare_plugin_df(df)
+            context = PluginContext(
+                symbol=self.symbol,
+                timeframe=self.timeframe,
+                mode="batch",
+                timestamp=int(df_plugin["time"].iloc[-1]) if len(df_plugin) else None,
+                settings=settings,
+            )
+            display = self.set_definition.get("display_name") or self.set_definition.get("set_id") or "Unbenannt"
+            self.log_message.emit(f"Ausfuehren: {display} ({self.symbol} {self.timeframe})")
+
+            results = self.evaluator.execute_set(self.set_definition, df_plugin, context=context)
+            for iid in results:
+                self.log_message.emit(f"  {iid}: fertig")
+            self.run_finished.emit(self.set_definition.get("set_id", ""), len(results))
+        except Exception as e:
+            self.run_failed.emit(self.set_definition.get("set_id", ""), str(e))
+
+```
+
+--------------------------------------------------
+
+### DATEI: serviceui/trash_dialog.py
+```py
+# serviceui/trash_dialog.py
+"""
+Service-UI: Papierkorb-Dialog für Service-Sets (Soft-Delete).
+
+Phase 15, Kapitel 15.1 (U15-D1): Aus service_win.py ausgelagert –
+Verhalten unverändert (inkl. doppelter Sicherheitsnachfrage, P14-05).
+
+Der Dialog ist eine reine UI-Komponente: Er spricht ausschließlich die
+Repository-API an (keine direkten SQL-Zugriffe) und protokolliert jede
+Aktion über eine Log-Callback. Das endgültige Löschen/Bereinigen erfolgt
+IMMER mit doppelter Sicherheitsnachfrage (User-Vorgabe P14-05).
+"""
+
+from typing import Callable, Optional
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
+    QMessageBox, QPushButton, QVBoxLayout,
+)
+
+from analytics.engine.service_set_repository import ServiceSetRepository
+
+
+class ServiceSetTrashDialog(QDialog):
+    """Phase 14 P14-05: Papierkorb-Dialog für Service-Sets (Soft-Delete).
+
+    Zeigt alle soft-gelöschten Sets (list_trash()) mit Name und
+    Lösch-Zeitstempel. Aktionen:
+      - Wiederherstellen  : restore_set_from_trash() verschiebt das Set
+                            zurück nach service_sets (das Set-Dropdown des
+                            Hauptfensters wird anschließend refresht).
+      - Endgültig löschen : purge_trash_set() mit doppelter Sicherheits-
+                            abfrage (Vorgang ist nicht umkehrbar).
+      - Papierkorb leeren : purge_trash() mit doppelter Sicherheits-
+                            abfrage (Vorgang ist nicht umkehrbar).
+    """
+
+    def __init__(
+        self,
+        repo: ServiceSetRepository,
+        log_fn: Callable[[str], None],
+        refresh_fn: Callable[[], None],
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._repo = repo
+        self._log = log_fn
+        self._refresh = refresh_fn
+
+        self.setWindowTitle("Papierkorb - Service-Sets")
+        self.setMinimumSize(440, 340)
+
+        layout = QVBoxLayout(self)
+        self.hint = QLabel()
+        self.hint.setWordWrap(True)
+        layout.addWidget(self.hint)
+
+        self.trash_list = QListWidget()
+        layout.addWidget(self.trash_list, 1)
+
+        btn_row = QHBoxLayout()
+        self.btn_restore = QPushButton("Wiederherstellen")
+        self.btn_purge_one = QPushButton("Endgueltig loeschen")
+        self.btn_purge_all = QPushButton("Papierkorb leeren")
+        btn_close = QPushButton("Schliessen")
+        for b in (self.btn_restore, self.btn_purge_one, self.btn_purge_all, btn_close):
+            btn_row.addWidget(b)
+        layout.addLayout(btn_row)
+
+        self.btn_restore.clicked.connect(self._restore)
+        self.btn_purge_one.clicked.connect(self._purge_selected)
+        self.btn_purge_all.clicked.connect(self._purge_all)
+        btn_close.clicked.connect(self.accept)
+
+        self._reload()
+
+    # --- intern ---
+
+    def _reload(self) -> None:
+        self.trash_list.clear()
+        trash_items = self._repo.list_trash()
+        for item in trash_items:
+            name = item.get("display_name") or item.get("set_id") or "Unbenannt"
+            deleted_at = str(item.get("deleted_at") or "")
+            li = QListWidgetItem(f"{name}   (geloescht: {deleted_at})")
+            li.setData(Qt.UserRole, item.get("set_id"))
+            self.trash_list.addItem(li)
+        has_items = self.trash_list.count() > 0
+        self.btn_restore.setEnabled(has_items)
+        self.btn_purge_one.setEnabled(has_items)
+        self.btn_purge_all.setEnabled(has_items)
+        self.hint.setText(
+            "Der Papierkorb ist leer."
+            if not has_items
+            else "Soft-geloeschte Service-Sets (P14-05). Wiederherstellen "
+                 "verschiebt das Set zurueck in die aktive Liste; "
+                 "endgueltiges Loeschen ist nicht umkehrbar."
+        )
+
+    def _selected_id(self) -> Optional[str]:
+        item = self.trash_list.currentItem()
+        return item.data(Qt.UserRole) if item else None
+
+    def _restore(self) -> None:
+        set_id = self._selected_id()
+        if not set_id:
+            return
+        if self._repo.restore_set_from_trash(set_id):
+            self._log(f"Set wiederhergestellt (P14-05): {set_id}")
+            self._reload()
+            self._refresh()
+        else:
+            self._log(f"Set '{set_id}' nicht im Papierkorb gefunden.")
+
+    def _purge_selected(self) -> None:
+        set_id = self._selected_id()
+        if not set_id:
+            return
+        # Doppelte Sicherheitsnachfrage - endgueltiges Loeschen ist nicht
+        # umkehrbar (User-Vorgabe P14-05).
+        first = QMessageBox.question(
+            self, "Endgueltig loeschen?",
+            "Das Set wird ENDGUELTIG geloescht und kann nicht "
+            "wiederhergestellt werden. Fortfahren?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if first != QMessageBox.Yes:
+            return
+        second = QMessageBox.question(
+            self, "Wirklich endgueltig loeschen?",
+            "Dieser Vorgang ist NICHT umkehrbar. Das Set wird unwiderruflich "
+            "aus dem Papierkorb entfernt. Fortfahren?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if second != QMessageBox.Yes:
+            return
+        if self._repo.purge_trash_set(set_id):
+            self._log(f"Set endgueltig geloescht (P14-05): {set_id}")
+            self._reload()
+        else:
+            self._log(f"Set '{set_id}' nicht im Papierkorb gefunden.")
+
+    def _purge_all(self) -> None:
+        if self.trash_list.count() == 0:
+            return
+        # Doppelte Sicherheitsnachfrage - endgueltiges Loeschen ist nicht
+        # umkehrbar (User-Vorgabe P14-05).
+        first = QMessageBox.question(
+            self, "Papierkorb leeren?",
+            f"Alle {self.trash_list.count()} Sets im Papierkorb werden "
+            "ENDGUELTIG geloescht und koennen nicht wiederhergestellt "
+            "werden. Fortfahren?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if first != QMessageBox.Yes:
+            return
+        second = QMessageBox.question(
+            self, "Wirklich Papierkorb leeren?",
+            "Dieser Vorgang ist NICHT umkehrbar. Alle Sets werden "
+            "unwiderruflich entfernt. Fortfahren?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if second != QMessageBox.Yes:
+            return
+        count = self._repo.purge_trash()
+        self._log(f"Papierkorb geleert (P14-05): {count} Set(s) endgueltig entfernt.")
+        self._reload()
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/build_cont_map.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/build_cont_map.py
 """Baut die kontinuierliche cont->real Map fuer die letzten 3000 SILVER M1 Bars
 (exakt wie chart_win._do_refresh_chart_data) und schreibt sie als JSON,
@@ -32286,6 +32415,7 @@ for probe in [base_time, base_time + 2307 * 60, base_time + 2308 * 60]:
 
 ### DATEI: test/check_app_state.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_app_state.py
 """Liest den gespeicherten App-State (visible ranges, Instanzen) fuer die Diagnose
 der Chart-Leerstelle. KEIN UI-Test."""
@@ -32340,6 +32470,7 @@ con.close()
 
 ### DATEI: test/check_broker_tz.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_broker_tz.py
 """Klaert die Zeitzonen-Frage empirisch:
 1) MT5-Tick-Zeit vs. Systemzeit -> Offset des Broker-Timestamps
@@ -32425,6 +32556,7 @@ print("  - getBerlinParts/formatDT muessen DIREKT formatieren (KEIN +2h-Offset).
 
 ### DATEI: test/check_chart_data.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_chart_data.py
 """Kurzer Check: Verifiziert die DB-Queries, die das Chart-Fenster nutzt, fuer alle Symbol/TF-Kombos."""
 import duckdb
@@ -32477,6 +32609,7 @@ for sym, tf, fid in [("SILVER", "H1", "grid_proximity_v1"), ("SILVER", "M5", "gr
 
 ### DATEI: test/check_dialog_geometry.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_dialog_geometry.py
 # Nicht-UI-Test: StateManager speichert/liest Dialog-Geometrie in global_settings
 # (wird vom IndicatorSettingsDialog fuer alle Indikatoren verwendet).
@@ -32731,6 +32864,7 @@ raise SystemExit(0 if ok else 1)
 
 ### DATEI: test/check_generation_guard.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_generation_guard.py
 # Verifiziert die Generations-Guard-Logik aus chart_win.py (_apply_chart_update /
 # _apply_grid_render): Veraltete Serializer-Ergebnisse werden verworfen,
@@ -32814,15 +32948,18 @@ print('\nRESULT: PASS')
 
 ### DATEI: test/check_grid_buttons.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_grid_buttons.py
-# Headless-Validierung für die Trennung Alt/Plugin-Indikator-Buttons im Chart
-# (nach Phase 12; Wunsch des Users):
+# Headless-Validierung für die Indikator-Buttons im Chart (Phase 15 U15-B2).
 #
-#   - Zweiter Button 'btn_indicator_grid_liquidity' in chart_win.ui (Layout
-#     verticalLayout_indicator) für den NEUEN Plugin-Indikator.
-#   - Alt-Button 'btn_indicator_grid' steuert 'grid', Plugin-Button steuert
-#     'grid_liquidity' (getrennt).
-#   - Rechtsklick öffnet direkt die Einstellungen NUR des jeweiligen Indikators
+# Der Alt-Indikator 'grid' (chart/indicators/grid.py) wurde am 04.08.2026
+# entfernt. Im Chart gibt es NUR NOCH den Plugin-Indikator 'grid_liquidity':
+#
+#   - EIN Button 'btn_indicator_grid_liquidity' in chart_win.ui (Layout
+#     horizontalLayout_row1) für den Plugin-Indikator.
+#   - KEIN Alt-Button 'btn_indicator_grid' mehr (kein 'grid'-Eintrag in der
+#     Indikator-Registry von chart_win.py).
+#   - Rechtsklick öffnet direkt die Einstellungen für 'grid_liquidity'
 #     (kein Auswahl-Menü mehr).
 #
 # KEINE UI-Tests (Regel Agents.md §4): reine Code-/XML-Inspektion, kein Qt-Start.
@@ -32831,6 +32968,9 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 ok = True
 failures = []
@@ -32854,17 +32994,17 @@ ui_xml = ET.parse(str(ui_path)).getroot()
 src = src_path.read_text(encoding="utf-8", errors="replace")
 
 print("=" * 70)
-print("Trennung Alt/Plugin-Indikator-Buttons im Chart (headless)")
+print("Plugin-Indikator-Button im Chart (headless, U15-B2)")
 print("=" * 70)
 
-# --- [1] UI: neuer Plugin-Button vorhanden ---
-print("\n[1] chart_win.ui: neuer Plugin-Button:")
+# --- [1] UI: Alt-Button ENTFERNT, Plugin-Button vorhanden ---
+print("\n[1] chart_win.ui: Alt-Button entfernt, Plugin-Button vorhanden:")
 names = [w.attrib.get("name") for w in ui_xml.iter("widget")]
-check("btn_indicator_grid" in names, "Alt-Button 'btn_indicator_grid' vorhanden")
+check("btn_indicator_grid" not in names, "Alt-Button 'btn_indicator_grid' ENTFERNT (U15-B2)")
 check("btn_indicator_grid_liquidity" in names, "Plugin-Button 'btn_indicator_grid_liquidity' vorhanden")
 
-# Layout-Zugehörigkeit prüfen: beide Buttons NEBENEINANDER in Zeile 1
-# (horizontalLayout_row1) – die oberste Toolbar-Zeile.
+# Layout-Zugehörigkeit prüfen: Plugin-Button in Zeile 1 (oberste Toolbar-Zeile),
+# Alt-Button ist dort NICHT (mehr) vorhanden.
 row1 = None
 row2 = None
 for layout in ui_xml.iter("layout"):
@@ -32877,10 +33017,10 @@ check(row1 is not None, "Zeile 1 vorhanden (horizontalLayout_row1, oberste Zeile
 check(row2 is not None, "Zeile 2 vorhanden (horizontalLayout_row2)")
 row1_ids = [w.attrib.get("name") for w in row1.iter("widget")] if row1 is not None else []
 row2_ids = [w.attrib.get("name") for w in row2.iter("widget")] if row2 is not None else []
-check("btn_indicator_grid" in row1_ids, "Alt-Button '#' in der obersten Zeile (row1)")
+check("btn_indicator_grid" not in row1_ids, "Alt-Button '#' NICHT mehr in Zeile 1")
 check("btn_indicator_grid_liquidity" in row1_ids, "Plugin-Button '◆' in der obersten Zeile (row1)")
-# Reihenfolge in Zeile 1: Symbol, TF, Spacer, #, ◆, 📈 → die drei Buttons stehen
-# am RECHTEN RAND (hinter dem Spacer), # direkt neben ◆, 📈 direkt danach.
+# Reihenfolge in Zeile 1: Symbol, TF, Spacer, ◆, 📈 → die beiden Buttons stehen
+# am RECHTEN RAND (hinter dem Spacer), ◆ direkt neben 📈.
 def _row1_sequence(layout):
     """Kind-Reihenfolge von row1: Widget-Namen und Spacer-Markierungen.
     Ein QHBoxLayout enthält <item>-Elemente, die jeweils genau ein Widget
@@ -32902,11 +33042,11 @@ check("combo_symbol" in row1_seq and "combo_tf" in row1_seq,
 if "horizontalSpacer_row1" in row1_seq:
     spacer_pos = row1_seq.index("horizontalSpacer_row1")
     buttons_after = row1_seq[spacer_pos + 1:]
-    check("btn_indicator_grid" in buttons_after, "Alt-Button '#' NACH dem Spacer (am rechten Rand)")
+    check("btn_indicator_grid" not in buttons_after, "Alt-Button '#' NICHT nach dem Spacer")
     check("btn_indicator_grid_liquidity" in buttons_after, "Plugin-Button '◆' NACH dem Spacer (am rechten Rand)")
     check("btn_signal_select" in buttons_after, "Signal-Button '📈' NACH dem Spacer (am rechten Rand)")
-    check(buttons_after == ["btn_indicator_grid", "btn_indicator_grid_liquidity", "btn_signal_select"],
-          "Rechte Rand-Gruppe exakt: # , ◆ , 📈 (in dieser Reihenfolge)")
+    check(buttons_after == ["btn_indicator_grid_liquidity", "btn_signal_select"],
+          "Rechte Rand-Gruppe exakt: ◆ , 📈 (in dieser Reihenfolge)")
 else:
     check(False, "horizontalSpacer_row1 vor den Buttons vorhanden (rechter Rand)")
 check("btn_reset_chart" in row2_ids, "Reset-Button in Zeile 2")
@@ -32944,19 +33084,19 @@ check("self.btn_indicator_liquidity.clicked.connect(self.toggle_grid_liquidity_l
 check("self.btn_indicator_liquidity.installEventFilter(self)" in src,
       "installEventFilter für Plugin-Button vorhanden")
 
-# --- [3] Getrennte Toggle-Slots ---
-print("\n[3] Getrennte Toggle-Logik:")
-check('def toggle_grid_lines(self):' in src and 'self._toggle_indicator("grid")' in src,
-      "toggle_grid_lines → 'grid' (Alt)")
-check('def toggle_grid_liquidity_lines(self):' in src and 'self._toggle_indicator("grid_liquidity")' in src,
+# --- [3] Toggle-Logik: NUR grid_liquidity (kein Alt-'grid') ---
+print("\n[3] Toggle-Logik (nur Plugin):")
+check("def toggle_grid_liquidity_lines" in src and 'self._toggle_indicator("grid_liquidity")' in src,
       "toggle_grid_liquidity_lines → 'grid_liquidity' (Plugin)")
+check("def toggle_grid_lines" not in src, "toggle_grid_lines (Alt) ENTFERNT")
+check('self._toggle_indicator("grid")' not in src, "Alt-Toggle auf 'grid' ENTFERNT")
 
-# --- [4] Rechtsklick: direkt je Indikator, kein Menü ---
-print("\n[4] Rechtsklick-Einstellungen (getrennt, ohne Menü):")
-check('self._toggle_settings_dialog("grid")' in src,
-      "Rechtsklick Alt-Button → Einstellungen 'grid'")
+# --- [4] Rechtsklick: direkt für grid_liquidity, kein Menü ---
+print("\n[4] Rechtsklick-Einstellungen (grid_liquidity, ohne Menü):")
 check('self._toggle_settings_dialog("grid_liquidity")' in src,
       "Rechtsklick Plugin-Button → Einstellungen 'grid_liquidity'")
+check('self._toggle_settings_dialog("grid")' not in src,
+      "Rechtsklick für 'grid' (Alt) ENTFERNT")
 check("def _toggle_settings_dialog" in src and 'self._open_indicator_settings(ind_id)' in src,
       "_toggle_settings_dialog öffnet Settings für den jeweiligen Indikator")
 check("_open_indicator_settings_menu" not in src, "Auswahl-Menü entfernt (_open_indicator_settings_menu)")
@@ -32966,12 +33106,11 @@ print("\n[5] Imports:")
 check("from PySide6.QtGui import QCursor" not in src, "QCursor-Import entfernt")
 check("QMenu" not in src, "QMenu-Import entfernt")
 
-# --- [6] Button-Style deckt beide Indikatoren ab ---
-print("\n[6] Button-Style (beide Indikatoren):")
-check('self._apply_indicator_button_style(self.btn_indicator, "grid")' in src,
-      "Style Alt-Button ↔ 'grid'")
+# --- [6] Button-Style deckt den Plugin-Indikator ab ---
+print("\n[6] Button-Style (Plugin-Indikator):")
 check('self._apply_indicator_button_style(self.btn_indicator_liquidity, "grid_liquidity")' in src,
       "Style Plugin-Button ↔ 'grid_liquidity'")
+check('"grid"' not in src.replace('"grid_liquidity"', ''), "kein Alt-'grid'-Eintrag im Style/Registry")
 
 print()
 if ok:
@@ -32989,11 +33128,19 @@ else:
 
 ### DATEI: test/check_grid_circles.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_grid_circles.py
-# Regression-Test für GridIndicator hit_circles:
+# Regression-Test für die Grid-Circle-Logik (Phase 15 U15-B1):
+# Der Alt-Indikator chart/indicators/grid.py wurde am 04.08.2026 entfernt.
+# Die Circle-Logik lebt jetzt in den Services grid_lines + proximity
+# (analytics/features/definitions/, Paritätsfunktionen in grid_math.py) und
+# der Indikator-Adapter (chart/indicators/grid_liquidity.py) färbt die Kreise
+# aus seinem Schema (circle_color_std/_active) + in_window-Flag.
+#
+# Geprüft wird:
 # 1) Jeder Circle-Preis ist exakt ein Liq-Line-Level (Grid-Level) -> Kreise
 #    sitzen auf den Linien.
-# 2) Checkbox-Zeitfilter (prox_useTimeFilter):
+# 2) Checkbox-Zeitfilter (use_time_filter):
 #    - INAKTIV (aus): ALLE Proximity-Punkte im Bereich einer Liq-Line werden
 #      gelb (#FFEB3B) geplottet (kein fuchsia).
 #    - AKTIV (an): Punkte im Zeitfenster werden gelb (#FFEB3B), Punkte
@@ -33006,7 +33153,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pandas as pd
 
-from chart.indicators.grid import GridIndicator
+from analytics.engine.set_evaluator import ServiceSetEvaluator
+from analytics.features.definitions.grid_math import f_in_window_around
+from analytics.features.plugins.base_plugin import PluginContext
+from config.app_settings import AppSettings
 
 YELLOW = "#FFEB3B"
 FUCHSIA = "#E91E63"
@@ -33023,12 +33173,53 @@ def epoch(y, mo, d, h, mi):
     return int(datetime(y, mo, d, h, mi, tzinfo=dt_timezone.utc).timestamp())
 
 
-ind = GridIndicator()
-params = dict(ind.default_params)
-params["prox_stepsAround"] = 1      # Levels 29.5 / 30.0 / 30.5
-params["prox_stepSize"] = 0.5
-params["prox_visitPct"] = 0.05
-params["prox_timeWindowMins"] = 5
+def run_pipeline(df, step, steps_around, visit_pct, use_time_filter, time_window_mins):
+    """Führt die Services grid_lines + proximity über den ServiceSetEvaluator aus
+    (deterministisch, headless – ohne Feature-Store) und liefert
+    (lines, circles). Circles tragen das in_window-Flag (keine Farbe – die
+    färbt der Indikator-Adapter)."""
+    ctx = PluginContext(symbol="SILVER", timeframe="M1", mode="chart",
+                        settings=AppSettings())
+    definition = {
+        "set_id": "circles_internal",
+        "display_name": "Circles",
+        "execution_order": ["grid_1", "prox_1"],
+        "services": {
+            "grid_1": {
+                "plugin_id": "grid_lines",
+                "lookback": len(df),
+                "params": {"step_size": step, "steps_around": steps_around,
+                           "custom_levels": [], "show_lines": True},
+            },
+            "prox_1": {
+                "plugin_id": "proximity",
+                "lookback": len(df),
+                "depends_on": ["grid_1"],
+                "params": {"visit_pct": visit_pct,
+                           "time_window_mins": time_window_mins,
+                           "use_time_filter": use_time_filter,
+                           "show_lines": True, "show_circles": True},
+            },
+        },
+    }
+    results = ServiceSetEvaluator().execute_set(definition, df, ctx)
+    lines = ctx.shared_state.get("grid_1") or []
+    circles = (results.get("prox_1") or {}).get(
+        "chart_render_payload", {}).get("hit_circles", [])
+    return lines, circles
+
+
+def adapter_color(c, use_time_filter, std=YELLOW, active=FUCHSIA):
+    """Adapter-Farblogik (chart/indicators/grid_liquidity.py, U15-A2):
+    use_time_filter AKTIV + ausserhalb des Fensters → active (fuchsia),
+    sonst → std (gelb)."""
+    return active if (use_time_filter and not bool(c.get("in_window", True))) else std
+
+
+step = 0.5
+steps_around = 1      # Levels 29.5 / 30.0 / 30.5
+visit_pct = 0.05
+time_window_mins = 5
 
 # Candles: Minute 0 (im Fenster), Minute 15 (ausserhalb), Minute 30 (im Fenster)
 t0 = epoch(2026, 1, 5, 0, 0)   # 00:00 -> Minute 0
@@ -33039,7 +33230,7 @@ highs = [30.01, 30.01, 30.01]  # alle touch Level 30.0
 lows = [29.99, 29.99, 29.99]
 
 df = make_df(times, highs, lows)
-lines = ind.calculate(df, params).get("lines", [])
+lines, _ = run_pipeline(df, step, steps_around, visit_pct, True, time_window_mins)
 line_prices = {l["price"] for l in lines}
 
 ok = True
@@ -33059,32 +33250,35 @@ def check(label, cond):
 # ---------------------------------------------------------------------------
 # Szenario A: Zeitfilter AUS -> ALLE Kreise gelb (kein fuchsia)
 # ---------------------------------------------------------------------------
-p_off = dict(params)
-p_off["prox_useTimeFilter"] = False
-res_off = ind.calculate(df, p_off)
-circles_off = res_off.get("hit_circles", [])
+lines_off, circles_off = run_pipeline(df, step, steps_around, visit_pct, False, time_window_mins)
+circles_off_colored = [dict(c, color=adapter_color(c, False)) for c in circles_off]
 print("\n[AUS] circles:", circles_off)
 
 check("AUS: 3 Kreise (alle Bars)", len(circles_off) == 3)
-check("AUS: KEIN fuchsia-Kreis", not any(c["color"] == FUCHSIA for c in circles_off))
-check("AUS: alle Kreise gelb", all(c["color"] == YELLOW for c in circles_off))
-check("AUS: Bar Minute 0 vorhanden (gelb)", any(c["time"] == t0 and c["color"] == YELLOW for c in circles_off))
-check("AUS: Bar Minute 15 vorhanden (gelb)", any(c["time"] == t1 and c["color"] == YELLOW for c in circles_off))
-check("AUS: Bar Minute 30 vorhanden (gelb)", any(c["time"] == t2 and c["color"] == YELLOW for c in circles_off))
+check("AUS: KEIN fuchsia-Kreis", not any(c["color"] == FUCHSIA for c in circles_off_colored))
+check("AUS: alle Kreise gelb", all(c["color"] == YELLOW for c in circles_off_colored))
+check("AUS: Bar Minute 0 vorhanden (gelb)", any(c["time"] == t0 and c["color"] == YELLOW for c in circles_off_colored))
+check("AUS: Bar Minute 15 vorhanden (gelb)", any(c["time"] == t1 and c["color"] == YELLOW for c in circles_off_colored))
+check("AUS: Bar Minute 30 vorhanden (gelb)", any(c["time"] == t2 and c["color"] == YELLOW for c in circles_off_colored))
 
 # ---------------------------------------------------------------------------
 # Szenario B: Zeitfilter AN -> im Fenster gelb, ausserhalb fuchsia
 # ---------------------------------------------------------------------------
-p_on = dict(params)
-p_on["prox_useTimeFilter"] = True
-res_on = ind.calculate(df, p_on)
-circles_on = res_on.get("hit_circles", [])
+lines_on, circles_on = run_pipeline(df, step, steps_around, visit_pct, True, time_window_mins)
+circles_on_colored = [dict(c, color=adapter_color(c, True)) for c in circles_on]
 print("\n[AN] circles:", circles_on)
 
 check("AN: 3 Kreise (alle Bars)", len(circles_on) == 3)
-check("AN: Bar Minute 0 -> gelb", any(c["time"] == t0 and c["color"] == YELLOW for c in circles_on))
-check("AN: Bar Minute 30 -> gelb", any(c["time"] == t2 and c["color"] == YELLOW for c in circles_on))
-check("AN: Bar Minute 15 bleibt fuchsia", any(c["time"] == t1 and c["color"] == FUCHSIA for c in circles_on))
+check("AN: Bar Minute 0 -> gelb", any(c["time"] == t0 and c["color"] == YELLOW for c in circles_on_colored))
+check("AN: Bar Minute 30 -> gelb", any(c["time"] == t2 and c["color"] == YELLOW for c in circles_on_colored))
+check("AN: Bar Minute 15 bleibt fuchsia", any(c["time"] == t1 and c["color"] == FUCHSIA for c in circles_on_colored))
+# Das in_window-Flag selbst ist rein zeitbasiert (unabhängig von use_time_filter)
+check("AN: in_window-Flag Minute 0 == True",
+      any(c["time"] == t0 and c.get("in_window") is True for c in circles_on))
+check("AN: in_window-Flag Minute 15 == False",
+      any(c["time"] == t1 and c.get("in_window") is False for c in circles_on))
+check("AN: in_window-Flag Minute 30 == True",
+      any(c["time"] == t2 and c.get("in_window") is True for c in circles_on))
 
 # ---------------------------------------------------------------------------
 # Szenario C: Alle Circle-Preise sind exakte Line-Level
@@ -33094,7 +33288,17 @@ all_circles = circles_off + circles_on
 for c in all_circles:
     check(f"Level: circle price {c['price']} ist Line-Level", c["price"] in line_prices)
     check(f"Level: circle price ist number ({c['price']})", isinstance(c["price"], (int, float)))
-    check(f"Level: circle hat time+color", "time" in c and "color" in c)
+    check(f"Level: circle hat time+in_window", "time" in c and "in_window" in c)
+
+# ---------------------------------------------------------------------------
+# Szenario D: grid_math.f_in_window_around-Referenz (eingefrorene Parität)
+# ---------------------------------------------------------------------------
+print("\n[Referenz] f_in_window_around (grid_math.py):")
+check("Minute 0 in Fenster (center 0, span 5)", f_in_window_around(0, 0, time_window_mins))
+check("Minute 15 NICHT in Fenster", not f_in_window_around(15, 0, time_window_mins))
+check("Minute 30 in Fenster (center 30, span 5)", f_in_window_around(30, 30, time_window_mins))
+check("Wrap-Around: Minute 58 in Fenster (center 0, span 5)",
+      f_in_window_around(58, 0, time_window_mins))
 
 print("\nRESULT:", "PASS" if ok else f"FAIL ({failures})")
 raise SystemExit(0 if ok else 1)
@@ -33105,6 +33309,7 @@ raise SystemExit(0 if ok else 1)
 
 ### DATEI: test/check_grid_levels_feature.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_grid_levels_feature.py
 # Test für das gekapselte Phase-11-Feature GridLevelsFeature
 # (analytics/features/definitions/grid_levels.py).
@@ -33404,25 +33609,30 @@ raise SystemExit(0 if ok else 1)
 
 ### DATEI: test/check_grid_liquidity_indicator.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_grid_liquidity_indicator.py
-# Headless-Validierung für Phase 12 Schritt 5 (Chart-Anbindung, JS-Bridge & Presets).
+# Headless-Validierung für Phase 12 Schritt 5 / Phase 15 U15-B2
+# (Chart-Anbindung, JS-Bridge & Presets).
 #
 # KEINE UI-Tests (Regel Agents.md §4). Validierung:
 #   1. GridLiquidityIndicator.calculate(df, params) auf synthetischen OHLCV-Daten
 #      liefert korrekte chart_render_payload-Struktur (lines, hit_circles).
-#   2. Registry-Check: chart/chart_win.py enthält ZUSÄTZLICH 'grid_liquidity'
-#      neben 'grid' (Parallelbetrieb) – per Code-Inspektion (kein Qt-Import).
+#   2. Registry-Check: chart/chart_win.py enthält NUR 'grid_liquidity'
+#      (Alt-'grid' wurde am 04.08.2026 entfernt, U15-B2) – per Code-Inspektion
+#      (kein Qt-Import).
 #   3. state_manager.save_indicator_preset(...) mit plugin_id/version/is_active_batch
 #      → Roundtrip lesen und validieren (temporäre DB, keine Produktions-DB).
-#   4. chart/indicators/grid.py bleibt unverändert (Diff-Check via Git).
+#   4. chart/indicators/grid.py ist entfernt (04.08.2026) – Pfad existiert nicht.
 #   5. JS-Bridge-Inspektion: renderGridCircles verarbeitet hit_circles
 #      (chart/js/03_chart_rendering.js + 04_live_updates.js).
 import os
-import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import numpy as np
 import pandas as pd
@@ -33462,7 +33672,7 @@ def build_synthetic_df(n=120, seed=7, base_price=100.0, step=0.5, start_ts=1_700
 
 
 print("=" * 70)
-print("Phase 12 Schritt 5 – Chart-Anbindung (headless)")
+print("Phase 12/15 – Chart-Anbindung (headless, U15-B2)")
 print("=" * 70)
 
 # --- [1] GridLiquidityIndicator.calculate auf synthetischen Daten ---
@@ -33488,13 +33698,13 @@ except Exception as e:
     check(False, f"Indikator Fehler: {e}")
 
 # --- [2] Registry-Check chart_win.py (Code-Inspektion) ---
-print("\n[2] Registry-Check chart_win.py (Parallelbetrieb):")
+print("\n[2] Registry-Check chart_win.py (nur grid_liquidity, U15-B2):")
 chart_win_src = (Path(__file__).parent.parent / "chart" / "chart_win.py").read_text(encoding="utf-8", errors="replace")
-has_grid = '"grid": GridIndicator()' in chart_win_src
 has_liq = '"grid_liquidity": GridLiquidityIndicator()' in chart_win_src
-check(has_grid, "'grid' in Registry")
-check(has_liq, "'grid_liquidity' ZUSÄTZLICH in Registry")
-check(has_grid and has_liq, "beide Indikatoren registriert (Parallelbetrieb)")
+has_grid = '"grid": GridIndicator()' in chart_win_src
+check(has_liq, "'grid_liquidity' in Registry (Plugin)")
+check(not has_grid, "Alt-'grid' NICHT mehr in Registry (U15-B2)")
+check(not has_grid and has_liq, "Registry enthält NUR den Plugin-Indikator")
 
 # --- [3] Preset-Roundtrip mit plugin_id/version/is_active_batch ---
 print("\n[3] save_indicator_preset mit Plugin-Feldern (temporäre DB):")
@@ -33538,16 +33748,11 @@ except Exception as e:
     except Exception:
         pass
 
-# --- [4] grid.py unverändert (Git-Diff) ---
-print("\n[4] chart/indicators/grid.py unverändert:")
-try:
-    r = subprocess.run(
-        ["git", "diff", "--stat", "chart/indicators/grid.py"],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-    )
-    check(r.stdout.strip() == "", f"kein Diff (Ausgabe leer) – '{r.stdout.strip()}'")
-except Exception as e:
-    check(False, f"Git-Diff-Check Fehler: {e}")
+# --- [4] grid.py entfernt (U15-B2) ---
+print("\n[4] chart/indicators/grid.py entfernt:")
+grid_py = Path(__file__).resolve().parent.parent / "chart" / "indicators" / "grid.py"
+check(not grid_py.exists(),
+      f"grid.py existiert NICHT mehr (Entfernung 04.08.2026, Pfad: {grid_py})")
 
 # --- [5] JS-Bridge-Inspektion hit_circles ---
 print("\n[5] JS-Bridge verarbeitet hit_circles:")
@@ -33573,11 +33778,19 @@ else:
 
 ### DATEI: test/check_grid_parity.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_grid_parity.py
-# Headless-Validierung für Phase 12 Schritt 4 (Paritäts-Plugin grid_liquidity).
+# Headless-Validierung für Phase 12 Schritt 4 / Phase 13 Schritt 6
+# (Paritäts-Plugin grid_liquidity, Phase 15 U15-B1).
 #
-# Schickt identische OHLCV-Daten durch den Alt-Indikator GridIndicator.calculate()
-# und PluginExecutor().execute("grid_liquidity", df, params).
+# Der Alt-Indikator chart/indicators/grid.py wurde am 04.08.2026 entfernt.
+# Die eingefrorene Referenz-Mathematik liegt in
+# analytics/features/definitions/grid_math.py (Phase 15 U15-B3, Single Source
+# of Truth). Dieser Test baut die Alt-Referenz AUSSCHLIESSLICH aus den
+# grid_math.py-Funktionen (f_round_to_custom_step, build_grid_levels,
+# f_in_window_around, f_strip_trailing_zeros) und vergleicht die Services
+# grid_lines + proximity dagegen – identisches Verhalten zum historischen
+# Alt-Indikator, ohne auf das gelöschte Modul zu verweisen.
 #
 # Validiert (Entscheidung 4.3 der Roadmap – Linien/Circles sind eigenständige
 # Services, Anzahl ist NICHT korreliert):
@@ -33587,8 +33800,8 @@ else:
 #      (Linien = eigenes Raster-Ergebnis, Circles = eigene Proximity-Auswertung).
 #   3. Die Circle-Ergebnisse beziehen sich korrekt auf die erzeugten Linien-Levels
 #      (logische Kopplung) – OHNE identische Anzahl zu verlangen.
-#   4. Der Alt-Indikator GridIndicator.calculate() läuft auf denselben Daten
-#      fehlerfrei (Paritäts-Basis, wird NICHT verändert).
+#   4. Die grid_math.py-Referenz läuft auf denselben Daten fehlerfrei
+#      (Paritäts-Basis, wird NICHT verändert).
 import sys
 from pathlib import Path
 
@@ -33600,7 +33813,9 @@ if hasattr(sys.stdout, "reconfigure"):
 import numpy as np
 import pandas as pd
 
-from chart.indicators.grid import GridIndicator
+# U15-B3: eingefrorene Referenz-Mathematik (ehemals chart/indicators/grid.py)
+# und gemeinsame Alt-Referenz (test/grid_ref.py, U15-B1).
+from grid_ref import run_alt_reference
 from analytics.features.feature_builder import PluginExecutor
 from analytics.features.plugins.base_plugin import PluginFeature, PluginContext
 from analytics.engine.set_evaluator import ServiceSetEvaluator
@@ -33644,6 +33859,10 @@ def build_synthetic_df(n=120, seed=42, base_price=100.0, step=0.5, start_ts=1_70
     })
 
 
+# ALT-Referenz (eingefroren) liegt in test/grid_ref.py (U15-B1): exakte
+# Replikation des historischen grid.py-calculate()-Verhaltens, gebaut NUR
+# aus grid_math.py-Funktionen.
+
 ALT_PARAMS = {
     "prox_enableMaster": True,
     "prox_stepSize": 0.5,
@@ -33665,16 +33884,16 @@ PLUGIN_PARAMS = {
 }
 
 print("=" * 70)
-print("Phase 12 Schritt 4 – Paritäts-Plugin grid_liquidity (headless)")
+print("Phase 12/13/15 – Paritäts-Plugin grid_liquidity (headless, U15-B1)")
 print("=" * 70)
 
 df = build_synthetic_df()
 print(f"\nSynthetische Daten: {len(df)} Bars, close {df['close'].min():.2f}..{df['close'].max():.2f}")
 
-# --- [1] Alt-Indikator (Paritäts-Basis, unverändert) ---
-print("\n[1] Alt-Indikator GridIndicator.calculate():")
+# --- [1] Alt-Referenz (grid_math.py, Paritäts-Basis, unverändert) ---
+print("\n[1] Alt-Referenz run_alt_reference() (grid_math.py):")
 try:
-    alt = GridIndicator().calculate(df, ALT_PARAMS)
+    alt = run_alt_reference(df, ALT_PARAMS)
     alt_lines = alt.get("lines", [])
     alt_circles = alt.get("hit_circles", [])
     check(True, "läuft fehlerfrei")
@@ -33682,7 +33901,7 @@ try:
     check(isinstance(alt_circles, list), f"hit_circles: List (n={len(alt_circles)})")
     check(isinstance(alt.get("status_info"), dict), "status_info: Dict")
 except Exception as e:
-    check(False, f"Alt-Indikator Fehler: {e}")
+    check(False, f"Alt-Referenz Fehler: {e}")
     alt_lines, alt_circles = [], []
 
 # --- [2] Plugin über PluginExecutor ---
@@ -33775,8 +33994,8 @@ except KeyError as e:
     check(False, f"Plugin nicht in Registry gefunden: {e}")
 
 # =============================================================================
-# [7] PFICHT-PARITY-TEST (Phase 13 Schritt 6) – neue Services grid_lines +
-#     proximity vs. Alt-Indikator grid.py auf DENSELBEN Daten.
+# [7] PFICHT-PARITY-TEST (Phase 13 Schritt 6, Phase 15 U15-B1) – neue Services
+#     grid_lines + proximity vs. grid_math.py-Referenz auf DENSELBEN Daten.
 #
 # Roadmap: "Auf denselben Daten liefern die neuen Services (grid_lines +
 # proximity) IDENTISCHE Linien/Circles wie grid.py." Parameter-Äquivalenz:
@@ -33788,14 +34007,14 @@ except KeyError as e:
 #     use_time_filter ↔ prox_useTimeFilter
 # =============================================================================
 print("\n" + "=" * 70)
-print("[7] PFICHT-PARITY-TEST: grid_lines + proximity vs. grid.py")
+print("[7] PFICHT-PARITY-TEST: grid_lines + proximity vs. grid_math.py-Referenz")
 print("=" * 70)
 
 
 def run_services_parity(df, alt_params, grid_svc_params, prox_svc_params):
-    """Läuft grid.py + die neue Service-Pipeline auf denselben Daten und
-    liefert (alt_lines, alt_circles, new_lines, new_circles)."""
-    alt = GridIndicator().calculate(df, alt_params)
+    """Läuft die grid_math.py-Referenz + die neue Service-Pipeline auf denselben
+    Daten und liefert (alt_lines, alt_circles, new_lines, new_circles)."""
+    alt = run_alt_reference(df, alt_params)
     ctx = PluginContext(symbol="SILVER", timeframe="M1", mode="chart",
                         settings=AppSettings())
     definition = {
@@ -33930,6 +34149,8 @@ try:
             check(field in r0, f"record-Feld '{field}' vorhanden")
     check(fsp.get("metadata", {}).get("total_hits") == len(fs_circles),
           "metadata.total_hits == Circle-Anzahl")
+    check(fsp.get("metadata", {}).get("schema_version") == "1.0.0",
+          "metadata.schema_version == '1.0.0' (Invariante 5, U15-A1)")
 except Exception as e:
     check(False, f"Feature-Store-Payload Fehler: {e}")
 
@@ -33949,6 +34170,7 @@ else:
 
 ### DATEI: test/check_grid_scan_integration.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_grid_scan_integration.py
 # Integrationstest Phase 11 (Rest): Service-Scan-Pfad fuer grid_proximity_v1.
 #
@@ -34186,6 +34408,7 @@ raise SystemExit(0 if ok else 1)
 
 ### DATEI: test/check_html_template.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_html_template.py
 """Verifiziert, dass das gebaute Chart-HTML-Template die JS-Fixes enthaelt."""
 import sys
@@ -34222,6 +34445,7 @@ sys.exit(0 if all_ok else 1)
 
 ### DATEI: test/check_m1_consistency.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_m1_consistency.py
 """Prueft die SILVER M1-Daten auf Konsistenz: Luecken, Handelspause,
 Tagesgrenzen, ungueltige Candles. Kein UI-Test - nur DB-Logik.
@@ -34366,6 +34590,7 @@ con.close()
 
 ### DATEI: test/check_m1_midnight.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_m1_midnight.py
 """Prueft direkt, welche SILVER M1-Bars in der DB um Mitternacht 30.07->31.07 liegen.
 Die DB-Roh-Epochs (EXTRACT) sind Berlin-Wanduhr-encoded - datetime.fromtimestamp(e, tz=utc)
@@ -34414,6 +34639,7 @@ con.close()
 
 ### DATEI: test/check_marker_layers.js
 ```js
+﻿// BEREIT FÜR PHASE 15
 // test/check_marker_layers.js
 // Regressionstest: Signal-Marker und Grid-Circles sind getrennte Layer.
 // - Signal-Marker gehen in das SeriesMarkers-Plugin der candleSeries.
@@ -34595,6 +34821,7 @@ process.exit(failures === 0 ? 0 : 1);
 
 ### DATEI: test/check_measurement.js
 ```js
+﻿// BEREIT FÜR PHASE 15
 // test/check_measurement.js
 // Regressionstest für die rekonstruierte Messfunktion (05_measurement.js):
 // Strg+LMB Box -> Messwerte -> pyBridge-Sync -> Restore.
@@ -34715,6 +34942,7 @@ process.exit(failures === 0 ? 0 : 1);
 
 ### DATEI: test/check_mt5_m1_boundary.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_mt5_m1_boundary.py
 """Holt SILVER M1-Daten direkt von MT5 (Ground Truth) und analysiert die
 Tagesgrenzen der letzten Tage.
@@ -34829,6 +35057,7 @@ print("\nFertig.")
 
 ### DATEI: test/check_p13_color_button.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p13_color_button.py
 # Headless-Validierung für Phase 13 Kapitel 5.5 Schritt 1 (ColorButton).
 #
@@ -35009,6 +35238,7 @@ if __name__ == "__main__":
 
 ### DATEI: test/check_p13_color_integration.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p13_color_integration.py
 # Headless-Validierung für Phase 13 Kapitel 5.5 Feintuning
 # (ColorButton-Anbindung an das dynamische Prop-Fenster).
@@ -35224,6 +35454,7 @@ if __name__ == "__main__":
 
 ### DATEI: test/check_p13_grid_liquidity_fixes.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p13_grid_liquidity_fixes.py
 # Headless-Validierung für Phase 13 5.5 (3 Bugfixes am grid_liquidity-Indikator)
 #
@@ -35630,6 +35861,7 @@ if __name__ == "__main__":
 
 ### DATEI: test/check_p13_preset_decoupling.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p13_preset_decoupling.py
 # Headless-Validierung für Phase 13 Kapitel 5.4 Schritt 2
 # (Entkopplung der Indikator-Presets & Speichermechanik, chart_win.py &
@@ -35993,6 +36225,7 @@ if __name__ == "__main__":
 
 ### DATEI: test/check_p13_proximity_cleanup.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p13_proximity_cleanup.py
 # Headless-Validierung: Phase 13 Schritt 6-Korrektur 3 – Proximity-Service
 # bereinigt.
@@ -36311,6 +36544,7 @@ if __name__ == "__main__":
 
 ### DATEI: test/check_p13_s1.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p13_s1.py
 # Headless-Validierung für Phase 13 Schritt 1 (Core-Interfaces).
 #
@@ -36564,6 +36798,7 @@ if __name__ == "__main__":
 
 ### DATEI: test/check_p13_s2.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p13_s2.py
 # Headless-Validierung für Phase 13 Schritt 2 (ServiceSetRepository & Datenmodell).
 #
@@ -36764,6 +36999,7 @@ if __name__ == "__main__":
 
 ### DATEI: test/check_p13_s3.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p13_s3.py
 # Headless-Validierung für Phase 13 Schritt 3 (ServiceSetEvaluator / Pipeline).
 #
@@ -37153,6 +37389,7 @@ if __name__ == "__main__":
 
 ### DATEI: test/check_p13_s4.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p13_s4.py
 # Headless-Validierung für Phase 13 Schritt 4 (UI-Integration Service-Fenster).
 #
@@ -37266,11 +37503,11 @@ def main() -> int:
     print("\n[1] py_compile auf UI-Klassen:")
     try:
         py_compile.compile(
-            str(Path("service_win.py").resolve()), doraise=True
+            str(Path("serviceui/service_win.py").resolve()), doraise=True
         )
-        check(True, "service_win.py kompiliert fehlerfrei")
+        check(True, "serviceui/service_win.py kompiliert fehlerfrei")
     except Exception as e:
-        check(False, f"py_compile service_win.py: {e}")
+        check(False, f"py_compile serviceui/service_win.py: {e}")
     ui_file = Path("ui/service_win.ui")
     check(ui_file.exists(), f"ui/service_win.ui existiert ({ui_file.stat().st_size} Bytes)")
 
@@ -37288,12 +37525,15 @@ def main() -> int:
         return question_results["next"]
 
     QMessageBox.question = staticmethod(fake_question)
+    # P14-04-E: QMessageBox.warning (Service-Sperre) headless mocken, damit
+    # ein gesperrtes Entfernen nicht modal blockiert.
+    QMessageBox.warning = staticmethod(lambda *a, **k: QMessageBox.Ok)
 
     # PersistentWindow: StateManager -> Fake (keine echte DB)
     import persistent_win
     persistent_win.StateManager = FakeStateManager
 
-    import service_win
+    from serviceui import service_win
     service_win.ServiceSetRunWorker = _FakeRunWorker  # kein echter Thread
 
     app = QApplication.instance() or QApplication(sys.argv)
@@ -37363,10 +37603,12 @@ def main() -> int:
 
     # [7] add_instance / remove_instance
     print("\n[7] add_instance / remove_instance:")
-    win.edit_new_instance.setText("grid_2 [grid_liquidity]")
+    # grid_2 mit grid_lines (FREIER Service – grid_liquidity ist durch das
+    # gespeicherte set_a gesperrt, P14-04-E) -> Entfernen ist erlaubt.
+    win.edit_new_instance.setText("grid_2 [grid_lines]")
     win.add_instance()
     check(win.list_execution_order.count() == 3, "grid_2 hinzugefügt (count=3)")
-    win.edit_new_instance.setText("grid_2 [grid_liquidity]")
+    win.edit_new_instance.setText("grid_2 [grid_lines]")
     win.add_instance()
     check(win.list_execution_order.count() == 3, "Duplikat grid_2 abgelehnt")
     win.edit_new_instance.setText("kaputt [gibt_es_nicht]")
@@ -37375,6 +37617,16 @@ def main() -> int:
     win.list_execution_order.setCurrentRow(2)
     win.remove_instance()
     check(win.list_execution_order.count() == 2, "remove_instance entfernt grid_2")
+    # Gesperrter Service (grid_liquidity, in set_a verwendet): Entfernen wird
+    # blockiert (QMessageBox.warning headless gemockt, count bleibt 3).
+    win.edit_new_instance.setText("grid_3 [grid_liquidity]")
+    win.add_instance()
+    check(win.list_execution_order.count() == 3, "grid_3 hinzugefügt (count=3)")
+    win.list_execution_order.setCurrentRow(2)
+    win.remove_instance()
+    check(win.list_execution_order.count() == 3,
+          "Gesperrter Service (grid_liquidity) wird NICHT entfernt (P14-04-E)")
+    win.list_execution_order.takeItem(2)  # grid_3 manuell entfernen
 
     # [8] save_set (leerer Name -> Auto-Name)
     print("\n[8] save_set (leerer Name -> Auto-Name):")
@@ -37454,6 +37706,7 @@ if __name__ == "__main__":
 
 ### DATEI: test/check_p13_s5.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p13_s5.py
 # Headless-Validierung für Phase 13 Schritt 5 (UI-Integration – Indikator
 # Prop-Fenster & Expert-Modus).
@@ -37924,6 +38177,7 @@ if __name__ == "__main__":
 
 ### DATEI: test/check_p13_s56.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p13_s56.py
 # Headless-Validierung: Kapitel 5.6 – Vereinheitlichung der Service-Set-
 # Bedienung im Indikator-Einstellungsfenster (IndicatorSettingsDialog).
@@ -38257,6 +38511,7 @@ if __name__ == "__main__":
 
 ### DATEI: test/check_p13_s6.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p13_s6.py
 # Headless-Validierung für Phase 13 Schritt 6 (Grid Indikator Refactoring –
 # Thread-sicherer Cache).
@@ -38277,13 +38532,15 @@ if __name__ == "__main__":
 #       debounced Refresh (New-Candle-Callback) – nicht pro Tick.
 #   [6] Thread-Sicherheit: atomare Zuweisung (neue Liste unter Lock, Getter
 #       liefert Kopie; Setzen ersetzt das Objekt, keine In-place-Mutation).
-#   [7] grid.py bleibt unverändert (Git-Diff).
+#   [7] chart/indicators/grid.py ist entfernt (04.08.2026) – Parität über die
+#       eingefrorene Referenz in grid_math.py / test/grid_ref.py (U15-B1/B3).
 import os
 import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # test/grid_ref.py
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -38293,9 +38550,9 @@ import pandas as pd
 import py_compile
 
 from chart.indicators.grid_liquidity import GridLiquidityIndicator
-from chart.indicators.grid import GridIndicator
 from analytics.features.feature_builder import PluginRegistry
 from config.app_settings import AppSettings
+from grid_ref import build_synthetic_df, run_alt_reference
 
 ok = True
 failures = []
@@ -38309,22 +38566,6 @@ def check(cond, msg):
         ok = False
         failures.append(msg)
         print(f"   ❌ {msg}")
-
-
-def build_synthetic_df(n=120, seed=42, base_price=100.0, step=0.5, start_ts=1_700_000_000):
-    """Synthetische OHLCV-Daten (M1-Schritte) – wie im Paritätstest."""
-    rng = np.random.default_rng(seed)
-    closes = base_price + np.cumsum(rng.normal(0, 0.3, n))
-    grid_prices = np.round(closes / step) * step
-    mix_mask = rng.random(n) < 0.2
-    closes[mix_mask] = grid_prices[mix_mask]
-    opens = np.concatenate([[base_price], closes[:-1]])
-    highs = np.maximum(opens, closes) + rng.uniform(0, 0.2, n)
-    lows = np.minimum(opens, closes) - rng.uniform(0, 0.2, n)
-    times = [int(start_ts) + i * 60 for i in range(n)]
-    return pd.DataFrame({
-        "time": times, "open": opens, "high": highs, "low": lows, "close": closes,
-    })
 
 
 def main() -> int:
@@ -38391,14 +38632,15 @@ def main() -> int:
     check(len(ind._known_times) == len(df), f"_known_times enthält alle {len(df)} Bar-Zeiten")
     check(pipeline_calls["n"] == 1, "Historical-Run: GENAU 1 Pipeline-Execution (Spy)")
 
-    # Parität auf Indikator-Ebene (gleiche Linien wie grid.py, Default-Farben):
-    alt = GridIndicator().calculate(df, {
+    # Parität auf Indikator-Ebene (gleiche Linien wie die grid_math.py-Referenz,
+    # Default-Farben) – U15-B1: ehemals grid.py, jetzt test/grid_ref.py:
+    alt = run_alt_reference(df, {
         "prox_enableMaster": True, "prox_stepSize": 0.5, "prox_stepsAround": 4,
         "prox_visitPct": 0.05, "prox_useTimeFilter": True, "prox_timeWindowMins": 5,
         "prox_showLines": True, "prox_showCircles": True, "prox_level1": 100.0,
     })
     check([l["price"] for l in res["lines"]] == [l["price"] for l in alt["lines"]],
-          "Linien-Preise identisch zu grid.py (Center-Raster-Parität)")
+          "Linien-Preise identisch zur grid_math.py-Referenz (Center-Raster-Parität)")
 
     # ------------------------------------------------------------------ [4]
     print("\n[4] 100 Live-Ticks auf derselben Candle (KEINE Pipeline):")
@@ -38468,15 +38710,10 @@ def main() -> int:
     ind._set_cached_lines(old_cache)
 
     # ------------------------------------------------------------------ [7]
-    print("\n[7] chart/indicators/grid.py unverändert:")
-    try:
-        r = subprocess.run(
-            ["git", "diff", "--stat", "chart/indicators/grid.py"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-        )
-        check(r.stdout.strip() == "", f"kein Diff (Ausgabe leer) – '{r.stdout.strip()}'")
-    except Exception as e:
-        check(False, f"Git-Diff-Check Fehler: {e}")
+    print("\n[7] chart/indicators/grid.py entfernt (U15-B1):")
+    grid_py = Path(__file__).resolve().parent.parent / "chart" / "indicators" / "grid.py"
+    check(not grid_py.exists(),
+          f"grid.py existiert NICHT mehr (Entfernung 04.08.2026, Pfad: {grid_py})")
 
     print()
     if ok:
@@ -38497,6 +38734,7 @@ if __name__ == "__main__":
 
 ### DATEI: test/check_p13_s7.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p13_s7.py
 # Headless-Validierung für Phase 13 Schritt 7 (Cleanup: SignalOverlay +
 # StatisticsRepository lesen aus feature_data statt signal_results).
@@ -38796,6 +39034,7 @@ if __name__ == "__main__":
 
 ### DATEI: test/check_p13_service_win_geometry.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p13_service_win_geometry.py
 # Headless-Validierung für Phase 13 Kapitel 5.4 Schritt 1
 # (Breiten- & Höhendynamisches Layout im Servicefenster, service_win.py)
@@ -38895,14 +39134,14 @@ def main() -> int:
 
     # [1] py_compile + Pixel-Scan (nur FIXE Werte; dynamische Größen erlaubt)
     print("\n[1] py_compile & Pixel-Scan:")
-    for f in ("service_win.py", "scrollable_content.py"):
+    for f in ("serviceui/service_win.py", "scrollable_content.py"):
         try:
             py_compile.compile(str(Path(f).resolve()), doraise=True)
             check(True, f"{f} kompiliert fehlerfrei")
         except Exception as e:
             check(False, f"py_compile {f}: {e}")
 
-    for f in ("service_win.py", "scrollable_content.py"):
+    for f in ("serviceui/service_win.py", "scrollable_content.py"):
         src = Path(f).read_text(encoding="utf-8")
         # Fixe Pixelwerte: Aufrufe mit Zahlenargument. Der BEGRIFF setFixedSize
         # in Kommentaren (Erklärung, warum es NICHT verwendet wird) ist legitim.
@@ -38927,7 +39166,7 @@ def main() -> int:
     import persistent_win
     persistent_win.StateManager = FakeStateManager
 
-    import service_win
+    from serviceui import service_win
     app = QApplication.instance() or QApplication(sys.argv)
     check(app is not None, "QApplication (offscreen) erstellt")
 
@@ -39123,6 +39362,7 @@ if __name__ == "__main__":
 
 ### DATEI: test/check_p13_ui_plugins.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p13_ui_plugins.py
 # Fokussierte Validierung: Phase 13 Schritt 6-Korrektur – die neuen Services
 # (grid_lines + proximity) sind in der Service-Fenster-UI sichtbar/verfügbar
@@ -39225,7 +39465,7 @@ def main() -> int:
 
     # [1] py_compile
     print("\n[1] py_compile:")
-    for f in ("service_win.py",):
+    for f in ("serviceui/service_win.py",):
         try:
             py_compile.compile(str(Path(f).resolve()), doraise=True)
             check(True, f"{f} kompiliert fehlerfrei")
@@ -39241,24 +39481,28 @@ def main() -> int:
     check("proximity" in pids, f"proximity registriert ({pids})")
     check("grid_liquidity" in pids, f"grid_liquidity registriert ({pids})")
 
-    import service_win
+    from serviceui import service_win
     avail = service_win._available_plugin_ids()
     check("grid_lines" in avail and "proximity" in avail and "grid_liquidity" in avail,
           f"_available_plugin_ids() listet alle: {avail!r}")
 
     # [3] Kein hartkodierter 'verfügbar: grid_liquidity'-Hinweis mehr
     print("\n[3] Kein hartkodierter Hinweis in service_win.py:")
-    src = Path("service_win.py").read_text(encoding="utf-8")
+    src = Path("serviceui/service_win.py").read_text(encoding="utf-8")
     check("verfügbar: grid_liquidity" not in src,
           "Fehlermeldung NICHT mehr auf 'grid_liquidity' hartkodiert")
 
     # [4] UI-Platzhalter zeigt die neuen Services
     print("\n[4] Platzhalter in ui/service_win.ui:")
     ui_src = Path("ui/service_win.ui").read_text(encoding="utf-8")
-    ph = re.search(r'name="placeholderText"\s*>\s*<string>([^<]+)</string>', ui_src)
-    check(ph is not None, "Platzhaltertext vorhanden")
+    # P14-01: Die UI hat MEHRERE placeholderText-Elemente (Set-Beschreibung,
+    # Instanz-Feld, Scan-Log). Gesucht wird der INSTANZ-Platzhalter
+    # ("instance_id [plugin_id] ... grid_1 [grid_lines] ... prox_1 [proximity]").
+    ph_texts = re.findall(r'name="placeholderText"\s*>\s*<string>([^<]+)</string>', ui_src)
+    ph = next((t for t in ph_texts if "grid_1 [grid_lines]" in t), None)
+    check(ph is not None, "Instanz-Platzhalter vorhanden (grid_1 [grid_lines]...)")
     if ph:
-        text = ph.group(1)
+        text = ph
         check("grid_1 [grid_lines]" in text and "prox_1 [proximity]" in text,
               f"Platzhalter zeigt grid_lines + proximity: {text!r}")
         check("grid_1 [grid_liquidity]" not in text,
@@ -39400,9 +39644,12 @@ def main() -> int:
     check(not any("grid_liquidity" in t for t in sel_items),
           f"grid_liquidity (Altbestand) erscheint NICHT als Service ({sel_items})")
 
-    # Service-Seiten + Controls für beide Indikator-Services
-    check(dlg.stack_service_forms.count() == 3,
-          f"Stack: Seite 0 (Plugin) + 2 Service-Seiten (count={dlg.stack_service_forms.count()})")
+    # Service-Seiten + Controls für beide Indikator-Services.
+    # P14-01: Die frühere 'Seite 0' (Plugin-Live-Parameter) entfällt –
+    # der Stack enthält nur noch EINE Seite pro Service (count=2).
+    check(dlg.stack_service_forms.count() == 2,
+          f"Stack: 2 Service-Seiten (P14-01, keine Plugin-Live-Seite 0; "
+          f"count={dlg.stack_service_forms.count()})")
     check("grid_lines:step_size" in dlg._set_param_controls,
           "grid_lines:step_size-Control auf der grid_lines-Seite vorhanden")
     check("proximity:visit_pct" in dlg._set_param_controls,
@@ -39452,6 +39699,7 @@ if __name__ == "__main__":
 
 ### DATEI: test/check_p14_flacker_zyklus.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p14_flacker_zyklus.py
 # Headless-Verifikation des P14-03-E Flacker-Fix (Kapitel 4.3-E, Pruefprotokoll P9):
 #
@@ -39652,6 +39900,7 @@ else:
 
 ### DATEI: test/check_p14_grid_incremental.js
 ```js
+﻿// BEREIT FÜR PHASE 15
 // test/check_p14_grid_incremental.js
 // Headless-Verifikation des P14-03-E Flacker-Fixes (inkrementelles Circle-Rendering):
 //   renderGridCircles() darf unveraenderte Level NICHT neu aufbauen (kein
@@ -39905,6 +40154,7 @@ if (failures === 0) {
 
 ### DATEI: test/check_p14_live_fixes.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p14_live_fixes.py
 """
 Phase 14 P14-03-E – Verifikation: Flacker-freies Live-Rendering &
@@ -40153,6 +40403,7 @@ if __name__ == "__main__":
 
 ### DATEI: test/check_p14_precision_levels.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p14_precision_levels.py
 """
 USER-REQ (P14-03): Die 6 Custom-Level-Eingabefelder (prox_level1..6) muessen
@@ -40337,7 +40588,7 @@ class FakeStateManager:
 import persistent_win  # noqa: E402
 persistent_win.StateManager = FakeStateManager
 
-import service_win  # noqa: E402
+from serviceui import service_win  # noqa: E402
 
 win = service_win.ServiceWindow(service_set_repo=repo)
 
@@ -40389,6 +40640,7 @@ sys.exit(0)
 
 ### DATEI: test/check_p14_prop_ui.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p14_prop_ui.py
 """
 USER-REQ (Plugin-Prop-Fenster) Verifikation:
@@ -40523,6 +40775,7 @@ sys.exit(0)
 
 ### DATEI: test/check_p14_s1_description.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p14_s1_description.py
 """
 Phase 14 P14-01 – Headless Validierung (KEINE UI, KEIN exec_()).
@@ -40704,6 +40957,7 @@ sys.exit(0)
 
 ### DATEI: test/check_p14_s2_discovery.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p14_s2_discovery.py
 """
 Phase 14 P14-02 – Verifikation: Dynamische Plugin-Discovery & Hot-Reload.
@@ -40916,6 +41170,7 @@ if __name__ == "__main__":
 
 ### DATEI: test/check_p14_s3_resilience.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p14_s3_resilience.py
 """
 Phase 14 P14-03 – Verifikation: Erweiterte Pipeline-Fehlerbehandlung,
@@ -41372,6 +41627,7 @@ if __name__ == "__main__":
 
 ### DATEI: test/check_p14_s4_migration.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p14_s4_migration.py
 """
 Phase 14 P14-04 – Headless Validierung (KEINE UI, KEIN exec_()).
@@ -41692,6 +41948,7 @@ sys.exit(0)
 
 ### DATEI: test/check_p14_s4_services_locked.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p14_s4_services_locked.py
 """
 Phase 14 P14-04-E – Headless Validierung (KEINE UI, KEIN exec_()).
@@ -41722,7 +41979,7 @@ TEST_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 if os.path.exists(TEST_DB):
     os.remove(TEST_DB)
 
-from service_win import _sets_using_plugin, ServiceWindow  # noqa: E402
+from serviceui.service_win import _sets_using_plugin, ServiceWindow  # noqa: E402
 from analytics.engine.service_set_repository import ServiceSetRepository  # noqa: E402
 
 FAILURES: list = []
@@ -41852,6 +42109,7 @@ sys.exit(0)
 
 ### DATEI: test/check_p14_s5_trash.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p14_s5_trash.py
 """
 Phase 14 P14-05 – Headless Validierung (KEINE UI, KEIN exec_()).
@@ -42086,6 +42344,7 @@ sys.exit(0)
 
 ### DATEI: test/check_p14_service_params.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_p14_service_params.py
 """
 Phase 14 P14-01 – Verifikation: Zeigt der Rahmen 'Service-Parameter' im
@@ -42328,6 +42587,7 @@ sys.exit(0)
 
 ### DATEI: test/check_performance_p14.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_performance_p14.py
 """
 Phase 14 – Performance-Benchmarks (Kapitel 7.2 AKTUELLE_UMSETZUNG).
@@ -42486,6 +42746,7 @@ sys.exit(0)
 
 ### DATEI: test/check_phase12_step1_migration.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_phase12_step1_migration.py
 # Headless-Validierung für Phase 12 Schritt 1 (Hybrid-Schema & Presets).
 #
@@ -42597,6 +42858,7 @@ else:
 
 ### DATEI: test/check_phase14_regression.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_phase14_regression.py
 """
 Phase 14 – Universal-Regressionstest (Kapitel 6 AKTUELLE_UMSETZUNG).
@@ -42844,6 +43106,7 @@ sys.exit(0)
 
 ### DATEI: test/check_plugin_batch_services.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_plugin_batch_services.py
 # Headless-Validierung für Phase 12 Schritt 6 (Anbindung Batch-Services).
 #
@@ -43188,6 +43451,7 @@ else:
 
 ### DATEI: test/check_plugin_executor.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_plugin_executor.py
 # Headless-Validierung für Phase 12 Schritt 3+ (PluginLoader / PluginRegistry / PluginExecutor).
 #
@@ -43301,6 +43565,7 @@ else:
 
 ### DATEI: test/check_plugin_time_filter.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_plugin_time_filter.py
 # Headless-Validierung: Time-Filter-Funktionalität im Plugin grid_liquidity
 # (nach Phase 12; Fixing-Wunsch des Users).
@@ -43318,8 +43583,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # test/grid_ref.py
 
 import pandas as pd
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from analytics.features.feature_builder import PluginExecutor
 from analytics.features.definitions.grid_liquidity import (
@@ -43438,13 +43707,12 @@ check(all(r["is_time_window_active"] == 1 for r in recs_off),
       "is_time_window_active=1 für alle Bars bei deaktiviertem Zeitfilter")
 
 # ===========================================================================
-# [5] Konsistenz mit Alt-Indikator (grid.py) auf denselben Daten
+# [5] Konsistenz mit der grid_math.py-Referenz (U15-B1) auf denselben Daten
+#     (ehemals Alt-Indikator grid.py – am 04.08.2026 entfernt)
 # ===========================================================================
-print("\n[5] Konsistenz mit Alt-Indikator (grid.py):")
-from chart.indicators.grid import GridIndicator
+print("\n[5] Konsistenz mit der grid_math.py-Referenz (test/grid_ref.py):")
+from grid_ref import run_alt_reference
 
-alt = GridIndicator()
-# Alt-Parameter (Pendant zu den Plugin-Params)
 alt_params = {
     "prox_enableMaster": True,
     "prox_level1": 0.0, "prox_level2": 0.0, "prox_level3": 0.0,
@@ -43460,14 +43728,14 @@ alt_params = {
     "prox_showLines": True,
     "prox_showCircles": True,
 }
-alt_res = alt.calculate(df, alt_params)
+alt_res = run_alt_reference(df, alt_params)
 alt_circles = alt_res.get("hit_circles", [])
 
-# Farbvergleich: Plugin-Farbe == Alt-Farbe pro Circle (nach Zeit sortiert)
+# Farbvergleich: Plugin-Farbe == Referenz-Farbe pro Circle (nach Zeit sortiert)
 plugin_colors = [c["color"] for c in sorted(circles, key=lambda c: c["time"])]
 alt_colors = [c["color"] for c in sorted(alt_circles, key=lambda c: c["time"])]
 check(plugin_colors == alt_colors,
-      f"Circle-Farben identisch zum Alt-Indikator ({plugin_colors})")
+      f"Circle-Farben identisch zur grid_math.py-Referenz ({plugin_colors})")
 
 print()
 if ok:
@@ -43485,6 +43753,7 @@ else:
 
 ### DATEI: test/check_race_guard.js
 ```js
+﻿// BEREIT FÜR PHASE 15
 // test/check_race_guard.js
 // Verifiziert die Race-Guard-Kernlogik aus 01_core.js / 04_live_updates.js:
 // 1) applyFullChartUpdate: veraltete Payloads werden verworfen (stale updateId)
@@ -43547,6 +43816,7 @@ console.log('\nRESULT:', (guardOk && tickOk) ? 'PASS' : 'FAIL');
 
 ### DATEI: test/check_resolve_realtime.js
 ```js
+﻿// BEREIT FÜR PHASE 15
 // test/check_resolve_realtime.js
 // Beweist den Fix fuer die "Leerstelle 30.7.26 23:58" (Wanduhr-Zeitachse):
 // 1) Laedt die echte cont->real Map (test/tmp_cont_map.json)
@@ -43635,6 +43905,7 @@ console.log('\nRESULT:', (ok === 3000 && newReal === 1785456060 && newLabel === 
 
 ### DATEI: test/check_statistics_repo.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/check_statistics_repo.py
 # Reproduziert den Statistics-Button-Fehler headless im App-Pfad:
 # 1. check_and_init_databases() öffnet RW-Connections via DbPool (wie MainWindow)
@@ -43679,6 +43950,7 @@ except Exception as e:
 
 ### DATEI: test/check_time_constants.js
 ```js
+﻿// BEREIT FÜR PHASE 15
 // test/check_time_constants.js
 // Verifiziert Punkt B4: die zentralen Zeit-Konstanten aus 02_time_utils.js.
 // Zusaetzlich (Punkt C/D): die Tageswechsel-Erkennung wird NICHT mehr dupliziert,
@@ -43768,6 +44040,7 @@ eval(utils + '\n' + rendering + '\n' + testBody);
 
 ### DATEI: test/check_time_utils.js
 ```js
+﻿// BEREIT FÜR PHASE 15
 // test/check_time_utils.js
 // Verifiziert: keine Endlosschleife bei ungueltigen Eingaben in getBerlinParts/formatDT
 // (Root Cause: timeFormatter erhielt UTCTimestamp-Zahl, Code griff auf t.time zu -> undefined
@@ -43837,8 +44110,188 @@ if (failures === 0) {
 
 --------------------------------------------------
 
+### DATEI: test/grid_ref.py
+```py
+﻿# BEREIT FÜR PHASE 15
+# test/grid_ref.py
+# Gemeinsame Alt-Referenz für Grid-Paritäts-Tests (Phase 15 U15-B1/B3).
+#
+# Der Alt-Indikator chart/indicators/grid.py wurde am 04.08.2026 entfernt.
+# Die eingefrorene Referenz-Mathematik liegt in
+# analytics/features/definitions/grid_math.py (Single Source of Truth).
+# Dieses Modul baut die ALT-REFERENZ (exaktes historisches grid.py-Verhalten)
+# ausschließlich aus den grid_math.py-Funktionen – verwendbar von allen
+# Grid-Tests ohne Import des gelöschten Moduls.
+import numpy as np
+import pandas as pd
+
+from analytics.features.definitions.grid_math import (
+    build_grid_levels,
+    f_in_window_around,
+    f_strip_trailing_zeros,
+)
+
+
+def build_synthetic_df(n=120, seed=42, base_price=100.0, step=0.5, start_ts=1_700_000_000):
+    """Synthetische OHLCV-Daten (M1-Schritte) um base_price.
+    ~20% der Closes werden exakt auf ein Grid-Level (Vielfaches von step) gelegt,
+    damit garantiert Proximity-Hits entstehen (Circles nicht leer)."""
+    rng = np.random.default_rng(seed)
+    closes = base_price + np.cumsum(rng.normal(0, 0.3, n))
+    # Einige Bars exakt auf Grid-Level-Raster (step) legen -> garantierte Hits
+    grid_prices = np.round(closes / step) * step
+    mix_mask = rng.random(n) < 0.2
+    closes[mix_mask] = grid_prices[mix_mask]
+
+    opens = np.concatenate([[base_price], closes[:-1]])
+    highs = np.maximum(opens, closes) + rng.uniform(0, 0.2, n)
+    lows = np.minimum(opens, closes) - rng.uniform(0, 0.2, n)
+    times = [int(start_ts) + i * 60 for i in range(n)]
+    return pd.DataFrame({
+        "time": times,
+        "open": opens,
+        "high": highs,
+        "low": lows,
+        "close": closes,
+    })
+
+
+def run_alt_reference(df, params):
+    """Alt-Referenz (grid_math.py, ehemals chart/indicators/grid.py).
+
+    Liefert {lines, hit_circles, status_info} exakt in der historischen
+    Struktur – ohne das gelöschte grid.py-Modul zu importieren.
+    """
+    if df.empty or not params.get("prox_enableMaster", True):
+        return {
+            "lines": [],
+            "hit_circles": [],
+            "status_info": {"in_time_window": False, "active_hits": []},
+        }
+
+    step_size = float(params.get("prox_stepSize", 0.5))
+    steps_around = int(params.get("prox_stepsAround", 4))
+    visit_pct = float(params.get("prox_visitPct", 0.05))
+
+    use_time_filter_raw = params.get("prox_useTimeFilter", True)
+    if isinstance(use_time_filter_raw, str):
+        use_time_filter = use_time_filter_raw.lower() in ("true", "1", "yes")
+    else:
+        use_time_filter = bool(use_time_filter_raw)
+
+    time_window_mins = int(params.get("prox_timeWindowMins", 5))
+
+    show_lines_raw = params.get("prox_showLines", True)
+    show_lines = show_lines_raw.lower() in ("true", "1", "yes") if isinstance(show_lines_raw, str) else bool(
+        show_lines_raw)
+
+    show_circles_raw = params.get("prox_showCircles", True)
+    show_circles = show_circles_raw.lower() in ("true", "1", "yes") if isinstance(show_circles_raw, str) else bool(
+        show_circles_raw)
+
+    custom_levels = [
+        float(params.get("prox_level1", 0.0)),
+        float(params.get("prox_level2", 0.0)),
+        float(params.get("prox_level3", 0.0)),
+        float(params.get("prox_level4", 0.0)),
+        float(params.get("prox_level5", 0.0)),
+        float(params.get("prox_level6", 0.0)),
+    ]
+    valid_custom_levels = [lvl for lvl in custom_levels if lvl > 0.0]
+
+    last_row = df.iloc[-1]
+    last_close = float(last_row["close"])
+
+    # 1. GRID LEVEL ARRAY (grid_math.build_grid_levels = identische Logik)
+    sorted_levels = build_grid_levels(
+        last_close, step_size, steps_around, valid_custom_levels
+    )
+
+    # 2. ZEITFENSTER-FILTER (native UTC der Kerzenzeit)
+    if "time" in df.columns:
+        last_ts = int(last_row["time"])
+        m = pd.Timestamp(last_ts, unit="s", tz="UTC").minute
+    else:
+        m = 0
+
+    full_win = f_in_window_around(m, 0, time_window_mins)
+    half_win = f_in_window_around(m, 30, time_window_mins)
+    in_time_window_raw = full_win or half_win
+    in_time_window = in_time_window_raw if use_time_filter else True
+
+    # 3. PROXIMITY & HIT LOGIK ÜBER HISTORIE
+    hit_circles = []
+    active_hits = []
+
+    tracked_levels = sorted_levels if show_lines else []
+
+    for idx, row in df.iterrows():
+        time_val = int(row["time"])
+        c_high = float(row["high"])
+        c_low = float(row["low"])
+
+        row_m = pd.Timestamp(time_val, unit="s", tz="UTC").minute
+        row_in_time = (
+            f_in_window_around(row_m, 0, time_window_mins)
+            or f_in_window_around(row_m, 30, time_window_mins)
+        )
+
+        # Farblogik: Zeitfilter INAKTIV → gelb; AKTIV: im Fenster gelb,
+        # ausserhalb fuchsia.
+        if use_time_filter and not row_in_time:
+            circle_color = "#E91E63"  # ausserhalb des Fensters -> fuchsia
+        else:
+            circle_color = "#FFEB3B"  # gelb (alle / im Fenster)
+
+        for lvl in tracked_levels:
+            visit_min = lvl * (1.0 - visit_pct / 100.0)
+            visit_max = lvl * (1.0 + visit_pct / 100.0)
+
+            touch_high = visit_min <= c_high <= visit_max
+            touch_low = visit_min <= c_low <= visit_max
+            pierce = c_low <= lvl and c_high >= lvl
+
+            near = touch_high or touch_low or pierce
+
+            if near:
+                if show_circles:
+                    hit_circles.append({
+                        "time": time_val,
+                        "price": lvl,
+                        "color": circle_color,
+                    })
+                if idx == df.index[-1]:
+                    active_hits.append(f_strip_trailing_zeros(lvl))
+
+    # 4. LINES PAYLOAD
+    lines_payload = []
+    if show_lines:
+        for lvl in sorted_levels:
+            is_custom = any(abs(lvl - c_lvl) < 0.0001 for c_lvl in valid_custom_levels)
+            lines_payload.append({
+                "price": lvl,
+                "color": "rgba(33, 150, 243, 0.9)" if is_custom else "rgba(33, 150, 243, 0.5)",
+                "width": 1 if is_custom else 3,
+                "style": "Solid",
+                "is_custom": is_custom,
+            })
+
+    return {
+        "lines": lines_payload,
+        "hit_circles": hit_circles,
+        "status_info": {
+            "in_time_window": in_time_window,
+            "active_hits": active_hits,
+        },
+    }
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/simulate_chart_mapping.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/simulate_chart_mapping.py
 """Simuliert exakt den Chart-Mapping-Pfad aus chart_win._do_refresh_chart_data:
 1) laedt die letzten 3000 SILVER M1-Candles aus der DB
@@ -43954,38 +44407,9 @@ print(f"  Ticks ohne Mapping: {missing}")
 
 --------------------------------------------------
 
-### DATEI: test/test.py
-```py
-import duckdb
-
-con = duckdb.connect(r'F:/Python/PyTrader/trading_data.duckdb')
-tables = con.execute("SHOW TABLES").fetchall()
-print("Tables:", tables)
-
-# Try listing schemas
-schemas = con.execute("SELECT * FROM information_schema.schemata").fetchall()
-print("Schemata:", schemas)
-
-# Try a direct query on sih1_candles
-try:
-    r = con.execute("SELECT count(*) FROM sih1_candles").fetchall()
-    print("sih1_candles count:", r)
-except Exception as e:
-    print("sih1_candles error:", e)
-
-# Try to find ANY table with candle in name
-try:
-    r = con.execute("SELECT table_name, table_type FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'pg_catalog')").fetchall()
-    print("User tables:", r)
-except Exception as e:
-    print("User tables error:", e)
-
-```
-
---------------------------------------------------
-
 ### DATEI: test/test_db_lock.py
 ```py
+﻿# BEREIT FÜR PHASE 15
 # test/test_db_lock.py
 """Test: Kann ein paralleler Schreiber (INSERT-Loop) neue Lese-Verbindungen blockieren?
 Simuliert DataSyncWorker (schreibt) vs. MarketDataRepository (liest via db_connect)."""
@@ -44239,34 +44663,6 @@ print("LOCKTEST FERTIG")
             </size>
            </property>
           </spacer>
-         </item>
-         <item>
-          <widget class="QPushButton" name="btn_indicator_grid">
-           <property name="sizePolicy">
-            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
-             <horstretch>0</horstretch>
-             <verstretch>0</verstretch>
-            </sizepolicy>
-           </property>
-           <property name="minimumSize">
-            <size>
-             <width>28</width>
-             <height>28</height>
-            </size>
-           </property>
-           <property name="maximumSize">
-            <size>
-             <width>28</width>
-             <height>28</height>
-            </size>
-           </property>
-           <property name="toolTip">
-            <string>Grid Liq Lines (Linksklick: An/Aus, Rechtsklick: Einstellungen)</string>
-           </property>
-           <property name="text">
-            <string>#</string>
-           </property>
-          </widget>
          </item>
          <item>
           <widget class="QPushButton" name="btn_indicator_grid_liquidity">

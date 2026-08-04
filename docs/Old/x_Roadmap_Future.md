@@ -61,9 +61,5 @@ Others Topics -
 
 - überwachung von live charts nach meinen anweisungen mit diversen Alarmen und ggf. autom. Traden
 
-- code signale entfernen, wenn wir sie nicht zur Darstellung von Services gebrauchen können
 
-- testordner aufräumen bzw aktualisieren
-
-- welche paritätsregeln gibt es noch und wo?  können die jetzt weg?
 - 
