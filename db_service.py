@@ -269,6 +269,24 @@ def check_and_init_databases() -> None:
 		VALUES ('SILVER', '', TRUE), ('GOLD', '', TRUE), ('BTCUSD', '', TRUE)
 		ON CONFLICT (symbol) DO NOTHING;
 	""")
+
+	# Phase 15 (15.03): Analytics-Profile. analytics_profiles haelt benannte
+	# Parametrisierungen der Analytics-UI (Option B – Explicit Save: Slider-/
+	# Parametertrends setzen Dirty-Flag, Speichern erst auf [Save]). Das
+	# Profil-Payload-JSON (Spalte payload) enthaelt als Pflichtfeld
+	# `schema_version` (15.03-Spezifikation: 1). Additiv/idempotent –
+	# bestehende Profile bleiben unangetastet.
+	con_app.execute("""
+		CREATE TABLE IF NOT EXISTS analytics_profiles (
+			profile_id  VARCHAR PRIMARY KEY,
+			name        VARCHAR NOT NULL,
+			description VARCHAR,
+			payload     JSON,
+			is_active   BOOLEAN DEFAULT FALSE,
+			created_at  TIMESTAMP DEFAULT current_timestamp,
+			updated_at  TIMESTAMP DEFAULT current_timestamp
+		);
+	""")
 	print(f"   ✅ Ordner '{DATA_DIR}/' und alle 3 DBs sind einsatzbereit.")
 
 
