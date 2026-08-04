@@ -24,6 +24,15 @@ from typing import Any, Dict, Optional
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QHeaderView, QTreeWidget, QTreeWidgetItem
 
+# P15-Bugfix: shiboken6.isValid() schuetzt vor dem Zugriff auf bereits
+# C++-seitig zerstoerte Items (QTreeWidget.clear() nach data_changed bei
+# wildem Klicken) – verhindert Access Violation (0xC0000005).
+try:
+    from shiboken6 import isValid
+except ImportError:  # pragma: no cover
+    def isValid(obj) -> bool:  # type: ignore
+        return obj is not None
+
 # UserRole-Kennungen fuer die Knotentypen (Deterministische Auswertung)
 ROLE_NODE_TYPE = Qt.UserRole
 ROLE_SET_ID = Qt.UserRole + 1
@@ -65,7 +74,7 @@ class MasterTree(QTreeWidget):
 
     def _populate(self) -> None:
         """Baut den Baum aus model.build_tree() neu auf (deterministisch)."""
-        current = self.current_selection()
+        current = self._safe_current_selection()
         self.blockSignals(True)
         self.clear()
         try:
@@ -84,7 +93,28 @@ class MasterTree(QTreeWidget):
             print(f"WARN [MasterTree] Baum-Aufbau fehlgeschlagen: {e}")
         self.blockSignals(False)
         # Aktuelle Auswahl nach Refresh wiederherstellen (falls noch vorhanden)
-        self._restore_selection(current)
+        try:
+            self._restore_selection(current)
+        except Exception as e:
+            print(f"WARN [MasterTree] Auswahl-Restore fehlgeschlagen: {e}")
+
+    def _safe_current_selection(self) -> Dict[str, str]:
+        """Liess die aktuelle Auswahl defensiv (isValid-Guard gegen zerstoerte
+        Items, z.B. nach einem zwischenzeitlichen clear())."""
+        try:
+            item = self.currentItem()
+            if item is None or not isValid(item):
+                return {"set_id": "", "service_id": ""}
+            node_type = item.data(0, ROLE_NODE_TYPE)
+            set_id = str(item.data(0, ROLE_SET_ID) or "")
+            if node_type == TYPE_SERVICE:
+                return {"set_id": set_id,
+                        "service_id": str(item.data(0, ROLE_INSTANCE_ID) or "")}
+            if node_type == TYPE_SET:
+                return {"set_id": set_id, "service_id": ""}
+            return {"set_id": "", "service_id": ""}
+        except (RuntimeError, AttributeError):
+            return {"set_id": "", "service_id": ""}
 
     def _build_child_item(self, group: str,
                           child: Dict[str, Any]) -> Optional[QTreeWidgetItem]:
@@ -129,18 +159,26 @@ class MasterTree(QTreeWidget):
     # -------------------------------------------------------------------------
 
     def current_selection(self) -> Dict[str, str]:
-        """Liefert die aktuelle Auswahl als {"set_id": ..., "service_id": ...}."""
-        item = self.currentItem()
-        if item is None:
+        """Liefert die aktuelle Auswahl als {"set_id": ..., "service_id": ...}.
+
+        P15-Bugfix: isValid-Guard – bei wildem Klicken kann currentItem() auf
+        ein durch clear() zerstoertes C++-Item zeigen; der Zugriff auf
+        .data() wuerde sonst einen Access Violation (0xC0000005) ausloesen.
+        """
+        try:
+            item = self.currentItem()
+            if item is None or not isValid(item):
+                return {"set_id": "", "service_id": ""}
+            node_type = item.data(0, ROLE_NODE_TYPE)
+            set_id = str(item.data(0, ROLE_SET_ID) or "")
+            if node_type == TYPE_SERVICE:
+                return {"set_id": set_id,
+                        "service_id": str(item.data(0, ROLE_INSTANCE_ID) or "")}
+            if node_type == TYPE_SET:
+                return {"set_id": set_id, "service_id": ""}
             return {"set_id": "", "service_id": ""}
-        node_type = item.data(0, ROLE_NODE_TYPE)
-        set_id = str(item.data(0, ROLE_SET_ID) or "")
-        if node_type == TYPE_SERVICE:
-            return {"set_id": set_id,
-                    "service_id": str(item.data(0, ROLE_INSTANCE_ID) or "")}
-        if node_type == TYPE_SET:
-            return {"set_id": set_id, "service_id": ""}
-        return {"set_id": "", "service_id": ""}
+        except (RuntimeError, AttributeError):
+            return {"set_id": "", "service_id": ""}
 
     def current_set_id(self) -> str:
         return self.current_selection().get("set_id", "")
@@ -150,40 +188,66 @@ class MasterTree(QTreeWidget):
 
     def _emit_selection(self) -> None:
         sel = self.current_selection()
-        self.selection_changed.emit(sel["set_id"], sel["service_id"])
+        try:
+            self.selection_changed.emit(sel["set_id"], sel["service_id"])
+        except (RuntimeError, AttributeError):
+            pass
 
     def _restore_selection(self, previous: Dict[str, str]) -> None:
-        """Stellt die Auswahl nach einem Refresh wieder her (sofern vorhanden)."""
+        """Stellt die Auswahl nach einem Refresh wieder her (sofern vorhanden).
+
+        P15-Bugfix: setCurrentItem unter blockSignals (kein Signal-Sturm /
+        keine Rekursion in _on_master_selection) + isValid-Guards gegen
+        zerstoerte Items (Access-Violation-Schutz).
+        """
         if not previous or not previous.get("set_id"):
             return
         target_id = previous.get("service_id") or previous.get("set_id")
-        for item in TreeItemIterator(self):
-            svc_id = item.data(0, ROLE_INSTANCE_ID)
-            set_id = item.data(0, ROLE_SET_ID)
-            node_type = item.data(0, ROLE_NODE_TYPE)
-            if (node_type == TYPE_SERVICE and svc_id == target_id
-                    and set_id == previous.get("set_id")):
-                self.setCurrentItem(item)
-                return
-            if (node_type == TYPE_SET and set_id == target_id
-                    and not previous.get("service_id")):
-                self.setCurrentItem(item)
-                return
+        try:
+            self.blockSignals(True)
+            for item in TreeItemIterator(self):
+                if item is None or not isValid(item):
+                    continue
+                svc_id = item.data(0, ROLE_INSTANCE_ID)
+                set_id = item.data(0, ROLE_SET_ID)
+                node_type = item.data(0, ROLE_NODE_TYPE)
+                if (node_type == TYPE_SERVICE and svc_id == target_id
+                        and set_id == previous.get("set_id")):
+                    self.setCurrentItem(item)
+                    break
+                if (node_type == TYPE_SET and set_id == target_id
+                        and not previous.get("service_id")):
+                    self.setCurrentItem(item)
+                    break
+        finally:
+            self.blockSignals(False)
 
 
 class TreeItemIterator:
-    """Leichter Iterator ueber alle QTreeWidgetItems (rekursiv, depth-first)."""
+    """Leichter Iterator ueber alle QTreeWidgetItems (rekursiv, depth-first).
+
+    P15-Bugfix: isValid-Guard im __next__ – Items koennen zwischen Sammlung
+    und Iteration C++-seitig zerstoert werden (clear() bei data_changed).
+    """
 
     def __init__(self, tree: QTreeWidget) -> None:
         self._items: list = []
-        for i in range(tree.topLevelItemCount()):
-            self._collect(tree.topLevelItem(i))
+        try:
+            for i in range(tree.topLevelItemCount()):
+                self._collect(tree.topLevelItem(i))
+        except (RuntimeError, AttributeError):
+            self._items = []
         self._index = 0
 
-    def _collect(self, item: QTreeWidgetItem) -> None:
+    def _collect(self, item: Optional[QTreeWidgetItem]) -> None:
+        if item is None or not isValid(item):
+            return
         self._items.append(item)
-        for i in range(item.childCount()):
-            self._collect(item.child(i))
+        try:
+            for i in range(item.childCount()):
+                self._collect(item.child(i))
+        except (RuntimeError, AttributeError):
+            pass
 
     def __iter__(self):
         self._index = 0
@@ -194,4 +258,6 @@ class TreeItemIterator:
             raise StopIteration
         item = self._items[self._index]
         self._index += 1
+        if item is None or not isValid(item):
+            return None
         return item

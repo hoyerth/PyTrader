@@ -32,6 +32,15 @@ from PySide6.QtWidgets import (
     QPushButton, QSpinBox, QSplitter, QTextEdit, QVBoxLayout, QWidget,
 )
 
+# P15-Bugfix: shiboken6.isValid() schuetzt vor dem Zugriff auf bereits
+# C++-seitig zerstoerte Qt-Objekte (Access Violation 0xC0000005 bei wildem
+# Klicken, wenn z.B. Controls per deleteLater entfernt werden).
+try:
+    from shiboken6 import isValid as _qt_valid
+except ImportError:  # pragma: no cover
+    def _qt_valid(obj) -> bool:  # type: ignore
+        return obj is not None
+
 from analytics.background_workers.historical_scanner import HistoricalScanner
 from analytics.engine.description_dialog import ServiceDescriptionDialog
 from analytics.engine.service_set_repository import ServiceSetRepository
@@ -386,37 +395,63 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
     @Slot(str, str)
     def _on_master_selection(self, set_id: str, service_id: str) -> None:
         """Synchronisiert Editor (Set-Combo/Liste) und ParameterPanel mit der
-        MasterTree-Auswahl."""
-        if set_id and self.combo_set is not None:
-            idx = self.combo_set.findData(set_id)
-            if idx >= 0 and self.combo_set.currentData() != set_id:
-                self.combo_set.setCurrentIndex(idx)
+        MasterTree-Auswahl.
+
+        P15-Bugfix: isValid-Guards – bei wildem Klicken koennen combo_set /
+        list_execution_order waehrend des Handlers neu aufgebaut werden
+        (setCurrentIndex -> _on_set_selected -> load_set_into_editor); der
+        Zugriff auf geloeschte Items wuerde sonst crashen (0xC0000005).
+        """
+        try:
+            if set_id and self.combo_set is not None and _qt_valid(self.combo_set):
+                idx = self.combo_set.findData(set_id)
+                if idx >= 0 and self.combo_set.currentData() != set_id:
+                    self.combo_set.setCurrentIndex(idx)
+        except (RuntimeError, AttributeError):
+            pass
         if service_id and self.list_execution_order is not None:
-            for i in range(self.list_execution_order.count()):
-                item = self.list_execution_order.item(i)
-                if item.data(Qt.UserRole) == service_id:
-                    self.list_execution_order.setCurrentRow(i)
-                    self._current_list_iid = service_id
-                    break
+            try:
+                if not _qt_valid(self.list_execution_order):
+                    return
+                for i in range(self.list_execution_order.count()):
+                    item = self.list_execution_order.item(i)
+                    if item is None or not _qt_valid(item):
+                        continue
+                    if item.data(Qt.UserRole) == service_id:
+                        self.list_execution_order.setCurrentRow(i)
+                        self._current_list_iid = service_id
+                        break
+            except (RuntimeError, AttributeError):
+                pass
         self._sync_param_panel()
 
     def _sync_param_panel(self) -> None:
         """Laedt die Parameter der markierten Service-Instanz ins ParameterPanel."""
         if getattr(self, "param_panel", None) is None:
             return
-        iid = self._current_list_iid
-        if not iid or not self._current_set_definition:
-            self.param_panel.clear()
-            return
-        cfg = dict((self._current_set_definition.get("services") or {}).get(iid, {}))
-        pid = str(cfg.get("plugin_id") or iid)
-        self.param_panel.set_symbol_precision(self._get_symbol_precision())
-        self.param_panel.set_service(iid, pid, cfg)
+        try:
+            if not _qt_valid(self.param_panel):
+                return
+            iid = self._current_list_iid
+            if not iid or not self._current_set_definition:
+                self.param_panel.clear()
+                return
+            cfg = dict((self._current_set_definition.get("services") or {}).get(iid, {}))
+            pid = str(cfg.get("plugin_id") or iid)
+            self.param_panel.set_symbol_precision(self._get_symbol_precision())
+            self.param_panel.set_service(iid, pid, cfg)
+        except (RuntimeError, AttributeError):
+            pass
 
     @Slot(str, dict)
     def _on_param_panel_changed(self, instance_id: str, params: dict) -> None:
         """Uebernimmt ParameterPanel-Aenderungen in die Set-Definition und die
-        Editor-Spalten (Live-Edit, damit collect_set_definition() sie findet)."""
+        Editor-Spalten (Live-Edit, damit collect_set_definition() sie findet).
+
+        P15-Bugfix: isValid-Guard auf ctrl – bei wildem Klicken koennen
+        Editor-Spalten-Controls zwischenzeitlich per deleteLater entfernt
+        worden sein (0xC0000005-Schutz).
+        """
         if not instance_id:
             return
         # 1) In die Set-Definition schreiben
@@ -434,22 +469,29 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             })
         # 2) Editor-Spalten synchron halten (falls Controls existieren)
         for (iid, key), ctrl in self._service_param_controls.items():
-            if iid == instance_id and key in params:
+            if iid == instance_id and key in params and _qt_valid(ctrl):
                 self._set_ctrl_value(ctrl, params[key])
 
     @staticmethod
     def _set_ctrl_value(ctrl: QWidget, value: Any) -> None:
-        """Setzt den Wert eines Parameter-Controls typsicher."""
-        if isinstance(ctrl, QCheckBox):
-            ctrl.setChecked(bool(value))
-        elif isinstance(ctrl, QSpinBox):
-            ctrl.setValue(int(value))
-        elif isinstance(ctrl, QDoubleSpinBox):
-            ctrl.setValue(float(value))
-        elif isinstance(ctrl, QComboBox):
-            ctrl.setCurrentText(str(value))
-        else:
-            ctrl.setText(str(value))
+        """Setzt den Wert eines Parameter-Controls typsicher.
+
+        P15-Bugfix: try/except – Control kann zwischen Iteration und Zugriff
+        per deleteLater zerstoert worden sein (Access-Violation-Schutz).
+        """
+        try:
+            if isinstance(ctrl, QCheckBox):
+                ctrl.setChecked(bool(value))
+            elif isinstance(ctrl, QSpinBox):
+                ctrl.setValue(int(value))
+            elif isinstance(ctrl, QDoubleSpinBox):
+                ctrl.setValue(float(value))
+            elif isinstance(ctrl, QComboBox):
+                ctrl.setCurrentText(str(value))
+            else:
+                ctrl.setText(str(value))
+        except (RuntimeError, AttributeError):
+            pass
 
     # --- Phase 15 15.01: Symbol- & Favoriten-Verwaltung ---
 

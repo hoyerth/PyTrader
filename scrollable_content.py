@@ -157,9 +157,17 @@ class ContentScrollMixin:
 
     def _apply_reflow_size(self) -> None:
         """Zerstört deleteLater-Widgets und setzt das Fenster auf
-        min(Inhalt, Bildschirm) inkl. Rahmen."""
-        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-        self.resize_to_clamped_content()
+        min(Inhalt, Bildschirm) inkl. Rahmen.
+
+        P15-Bugfix: try/except – der deferred QTimer kann feuern, nachdem das
+        Fenster bereits geschlossen/zerstoert wurde (wildes Klicken + schnelles
+        Schliessen); ein Zugriff wuerde sonst crashen (0xC0000005).
+        """
+        try:
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+            self.resize_to_clamped_content()
+        except (RuntimeError, AttributeError):
+            pass
 
     def resize_to_clamped_content(self) -> None:
         """Setzt das Inhalt-Widget auf seine Layout-Größe und das Fenster auf
@@ -171,16 +179,27 @@ class ContentScrollMixin:
         ERSTE Layout-Größe fixieren (setFixedSize) und späteres Wachstum
         (zusätzliche Service-Spalten, aufgeklappte Experten-Optionen)
         verhindern. Das manuelle resize() hält das Widget dagegen immer auf der
-        aktuellen Layout-Größe, und das Fenster wird danach auf
-        min(Inhalt, Bildschirm) geklemmt (Scrollbars, sobald der Inhalt den
-        Viewport übersteigt).
+        aktuellen Layout-Größe.
+
+        BUGFIX (Persistenz): Das FENSTER wird dabei NIE unter die aktuelle
+        (User-/wiederhergestellte) Größe geschrumpft, sondern nur vergrößert,
+        wenn der Inhalt mehr Platz braucht – maximal bis zum Bildschirm. Vorher
+        überschrieb der Reflow nach restore_state() die persistierte Geometrie
+        (Fenster schrumpfte auf Inhaltgröße), wodurch save_state() die falsche
+        Größe speicherte und die letzte Fensterposition/-größe verloren ging.
         """
         if self._content_widget is not None and self._content_widget.layout() is not None:
             self._content_widget.resize(self._content_widget.layout().sizeHint())
         content = self.clamped_content_size()
         frame = self.frameGeometry().size() - self.size()
-        self.resize(content.width() + frame.width(),
-                    content.height() + frame.height())
+        desired = QSize(content.width() + frame.width(),
+                        content.height() + frame.height())
+        screen = QApplication.primaryScreen().availableGeometry()
+        # Nur wachsen, nie schrumpfen (unter aktuelle Größe) + Screen-Klemme.
+        current = self.size()
+        new_w = min(max(desired.width(), current.width()), screen.width())
+        new_h = min(max(desired.height(), current.height()), screen.height())
+        self.resize(new_w, new_h)
 
     def _invalidate_content_caches(self) -> None:
         """Invalidiert QWidgetItemV2- und Layout-Caches entlang der Hierarchie.

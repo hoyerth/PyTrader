@@ -147,18 +147,45 @@ class ParameterPanel(ContentScrollMixin, ServiceParamColumnsMixin, QWidget):
         self._reflow()
 
     def clear(self) -> None:
-        """Leert das Formular (naechster set_service() baut es neu auf)."""
+        """Leert das Formular (naechster set_service() baut es neu auf).
+
+        P15-Bugfix: Die Controls der Form-Zeilen werden EXPLIZIT entfernt
+        (setParent(None) + deleteLater) statt nur die Layout-Zeilen zu loesen –
+        sonst stapeln sich die unsichtbaren C++-Widgets als Kinder des
+        form_group und koennen bei schnellen Klicks Signale auf geloeschte
+        Zustände feuern (Memory-Leak + Access-Violation-Kandidat).
+        """
         self._instance_id = None
         self._plugin = None
         self._controls = {}
-        # Formularzeilen entfernen (FormLayout leeren)
-        while self.form_layout.rowCount():
-            self.form_layout.removeRow(0)
+        # Widgets der Form-Zeilen entfernen (FormLayout leeren)
+        try:
+            while self.form_layout.rowCount():
+                item = self.form_layout.takeRow(0)
+                # PySide6: TakeRowResult liefert labelItem/fieldItem als
+                # Attribute (QWidgetItem), NICHT als Methoden.
+                field = item.fieldItem
+                if field is not None:
+                    w = field.widget()
+                    if w is not None:
+                        w.setParent(None)
+                        w.deleteLater()
+                label_item = item.labelItem
+                if label_item is not None:
+                    w = label_item.widget()
+                    if w is not None:
+                        w.setParent(None)
+                        w.deleteLater()
+        except (RuntimeError, AttributeError):
+            pass
         # Experten-Gruppe (falls vorhanden) entfernen
-        for child in list(self._content.findChildren(QGroupBox)):
-            if child is not self.form_group:
-                child.setParent(None)
-                child.deleteLater()
+        try:
+            for child in list(self._content.findChildren(QGroupBox)):
+                if child is not self.form_group:
+                    child.setParent(None)
+                    child.deleteLater()
+        except (RuntimeError, AttributeError):
+            pass
         self._reflow()
 
     # -------------------------------------------------------------------------
@@ -188,10 +215,18 @@ class ParameterPanel(ContentScrollMixin, ServiceParamColumnsMixin, QWidget):
         signal.connect(lambda _v, k=key: self._emit_params_changed(k))
 
     def _emit_params_changed(self, _key: str) -> None:
-        if self._instance_id is not None:
-            self.params_changed.emit(self._instance_id, self.collect_params())
+        """P15-Bugfix: try/except – das Panel kann zwischen Signal und Aufruf
+        zerstoert/gecleart worden sein (Access-Violation-Schutz)."""
+        try:
+            if self._instance_id is not None:
+                self.params_changed.emit(self._instance_id, self.collect_params())
+        except (RuntimeError, AttributeError):
+            pass
 
     def _reflow(self) -> None:
         """Passt die Groesse an den Inhalt an (deferred, ContentScrollMixin)."""
-        if hasattr(self, "_schedule_reflow"):
-            self._schedule_reflow()
+        try:
+            if hasattr(self, "_schedule_reflow"):
+                self._schedule_reflow()
+        except (RuntimeError, AttributeError):
+            pass
