@@ -2,6 +2,15 @@
 """
 Historical Scanner – QThread-Worker für Batch-Scans über historische Daten.
 Unterstützt Full-Scan (Delete + Re-Scan) und Delta-Update (fehlende Bars).
+
+Phase 15 U15-C2 (Alt-Pfad-Rückbau, additiv): ZIELZUSTAND des
+HistoricalScanner ist der PLUGIN-BATCH (`_run_plugin_batch` über den
+PluginExecutor, aktive Batch-Presets aus `indicator_presets`). Der Alt-Scan
+(grid_scan / Standard-Scan über SetEvaluator) bleibt parallel betreibbar,
+schreibt aber wie der Plugin-Batch AUSSCHLIESSLICH in den feature_store
+(Phase 13 Schritt 7.B) – es finden KEINE signal_results-Writes mehr statt.
+`signal_results` bleibt bis zur finalen Entscheidung (U15-C3) unverändert
+als Referenz erhalten.
 """
 
 import time
@@ -159,6 +168,11 @@ class HistoricalScanner(QThread):
         BASE_DIR = Path(__file__).resolve().parent.parent.parent
         DB_ANALYTICS = self._db_path_analytics or str(BASE_DIR / "data" / "analytics.duckdb")
         DB_MARKET = self._db_path_market or str(BASE_DIR / "data" / "market_data.duckdb")
+
+        # U15-C2 (Zielzustand): Der Plugin-Batch (PluginExecutor) ist der
+        # primäre Schreibpfad in den feature_store. Der Alt-Scan (SetEvaluator)
+        # bleibt kompatibel – ebenfalls feature_store-only (keine
+        # signal_results-Writes, Phase 13 Schritt 7.B).
 
         feature_names = self._feature_names
         feature_params = self._feature_params

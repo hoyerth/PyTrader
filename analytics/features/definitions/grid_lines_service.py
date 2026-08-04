@@ -2,16 +2,18 @@
 """
 Service: GridLines (Phase 13 Schritt 6)
 
-Paritäts-Service zur Alt-Implementierung chart/indicators/grid.py – baut das
-Level-Raster EXAKT wie grid.py (Zentrierung auf dem letzten Close):
+Paritäts-Service zur Alt-Implementierung (ehemals chart/indicators/grid.py,
+am 04.08.2026 entfernt) – baut das Level-Raster EXAKT wie der Alt-Indikator.
+Die Paritätsfunktionen liegen in `grid_math.py` (Phase 15 U15-B3, eingefrorene
+Referenz-Kopien):
 
     center = f_round_to_custom_step(last_close, step_size)
     levels = {round(center + i * step_size, 6) | i in [-steps_around, steps_around]}
              + Custom-Levels (prox_level1..6, nur > 0)
 
 Der Service liefert den chart_render_payload (lines) in identischer Struktur
-wie grid.py (is_custom-Färbung, width 1/3, style Solid) und schreibt die
-Linienliste zusätzlich nach context.shared_state[self.instance_id] – der
+wie der Alt-Indikator (is_custom-Färbung, width 1/3, style Solid) und schreibt
+die Linienliste zusätzlich nach context.shared_state[self.instance_id] – der
 nachgelagerte ProximityService liest sie von dort (depends_on).
 
 KEINE eigenen Zeitkonzepte: Das native UTC-Zeitfenster (Minute 0/30 ±
@@ -25,6 +27,10 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from analytics.features.definitions.grid_math import (
+    build_grid_levels,
+    f_round_to_custom_step,
+)
 from analytics.features.plugins.base_plugin import (
     FeatureCalculateResult,
     ParameterSchema,
@@ -32,40 +38,6 @@ from analytics.features.plugins.base_plugin import (
     PluginContext,
     PluginFeature,
 )
-
-
-def f_round_to_custom_step(price: float, step: float) -> float:
-    """Identisch zu chart/indicators/grid.py – Rundung auf das nächste
-    Vielfache von step (Paritäts-Anforderung)."""
-    if step <= 0:
-        return price
-    inv_step = 1.0 / step
-    return round(price * inv_step) / inv_step
-
-
-def build_grid_levels(
-    last_close: float,
-    step_size: float,
-    steps_around: int,
-    custom_levels: Optional[List[float]] = None,
-) -> List[float]:
-    """Sortierte Level-Liste (absteigend) – exakte Parität zu grid.py.
-
-    grid.py:
-      center_price = f_round_to_custom_step(last_close, step_size)
-      grid_levels  = {round(center_price + i*step_size, 6)
-                      | i in range(-steps_around, steps_around+1)}
-      + {round(c_lvl, 6) | c_lvl in custom_levels, c_lvl > 0.0}
-    """
-    center_price = f_round_to_custom_step(last_close, step_size)
-    grid_levels: set = set()
-    for i in range(-steps_around, steps_around + 1):
-        grid_levels.add(round(center_price + (i * step_size), 6))
-    for c_lvl in (custom_levels or []):
-        v = float(c_lvl)
-        if v > 0.0:
-            grid_levels.add(round(v, 6))
-    return sorted(list(grid_levels), reverse=True)
 
 
 def _parse_custom_levels(raw: Any) -> List[float]:
@@ -150,12 +122,12 @@ class GridLinesService(PluginFeature):
         return {
             "category": "Grid",
             "display_name": "Grid Lines",
-            "description": "Baut das Grid-Raster in Parität zu grid.py (Center ± steps_around × step_size + Custom-Levels)",
+            "description": "Baut das Grid-Raster in Parität zum Alt-Grid (Center ± steps_around × step_size + Custom-Levels)",
             "author": "PyTrader AI",
             "tags": ["grid", "lines", "raster"],
             # Phase 14 P14-01: Erweiterte Beschreibungsfelder
-            "description_long": "Baut das Level-Raster exakt wie chart/indicators/"
-                                "grid.py (Zentrierung auf dem letzten Close) und "
+            "description_long": "Baut das Level-Raster exakt wie der Alt-Grid-Indikator "
+                                "(Paritätsfunktionen in grid_math.py) und "
                                 "schreibt die Linienliste in den shared_state "
                                 "für nachgelagerte Services (depends_on).",
             "condition_rules": [
@@ -238,7 +210,7 @@ class GridLinesService(PluginFeature):
             },
             "line_color": {
                 "type": "color", "default": "",
-                "description": "Linien-Farbe (leer = Paritäts-Styling aus grid.py)",
+                "description": "Linien-Farbe (leer = Paritäts-Styling aus grid_math.py)",
             },
         }
 
@@ -248,8 +220,8 @@ class GridLinesService(PluginFeature):
         params: Dict[str, Any],
         context: Optional[PluginContext] = None,
     ) -> FeatureCalculateResult:
-        """Baut das Raster in Parität zu grid.py und schreibt die Linienliste
-        nach context.shared_state[self.instance_id] (Namespace-isoliert)."""
+        """Baut das Raster in Parität zum Alt-Grid (grid_math.py) und schreibt
+        die Linienliste nach context.shared_state[self.instance_id] (Namespace-isoliert)."""
         if df is None or df.empty:
             return {"feature_store_payload": {}, "chart_render_payload": {"lines": [], "hit_circles": []}}
 

@@ -234,7 +234,12 @@ class GridLiquidityFeature(PluginFeature):
                 "feature_id": self.plugin_id,
                 "plugin_version": self.version,
                 "records": feature_rows,
-                "metadata": {"total_hits": len(hit_circles)},
+                "metadata": {
+                    "total_hits": len(hit_circles),
+                    # Phase 15 (U15-A1, Invariante 5): explizite schema_version
+                    # in jedem Feature-Payload (Pflichtfeld für feature_store=True).
+                    "schema_version": "1.0.0",
+                },
             },
             "chart_render_payload": {
                 "lines": lines_payload,

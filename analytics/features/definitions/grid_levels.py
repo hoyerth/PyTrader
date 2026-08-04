@@ -3,8 +3,10 @@
 Feature: Grid-Levels (Y-Achse) + Zeitfenster-Flags (X-Achse) – Phase 11
 
 Berechnet vektorisiert fuer jede Bar die Liq-Line / Grid-Level Logik des
-GridIndicator (chart/indicators/grid.py) und stellt sie als Feature-Spalten
-fuer den feature_store bereit:
+Grid-Systems (Paritaetsfunktionen in `grid_math.py`, Phase 15 U15-B3 –
+eingefrorene Referenz-Kopien des am 04.08.2026 entfernten Alt-Indikators
+chart/indicators/grid.py) und stellt sie als Feature-Spalten fuer den
+feature_store bereit:
 
     grid_nearest_level      naechstes Grid-Level zum close (Preis)
     grid_dist_abs           absoluter Preisabstand |close - nearest_level|
@@ -14,10 +16,11 @@ fuer den feature_store bereit:
 
 Das Modul ist bewusst gekapselt und unabhaengig vom Chart-Indikator. Es bildet
 nur die Berechnungslogik ab (kein Rendering, kein DB-Zugriff). Die Konsistenz
-mit dem Indikator wird durch dieselben Kernfunktionen sichergestellt:
+wird durch dieselben Kernfunktionen sichergestellt (vektorisierte Varianten
+der Skalar-Funktionen in `grid_math.py`):
 
-    build_grid_levels()  <->  GridIndicator Berechnung (center +- i*step + custom)
-    in_window_around()   <->  f_in_window_around() aus chart/indicators/grid.py
+    build_grid_levels()  <->  grid_math.build_grid_levels() (center +- i*step + custom)
+    in_window_around()   <->  grid_math.f_in_window_around() (Minute 0/30 +- span)
 
 Parameter (params-Dict):
     step_size          float, Schrittweite des Grids (Default 0.5, prox_stepSize)
@@ -54,7 +57,7 @@ def build_grid_levels(
     """
     Erzeugt die sortierte Grid-Level-Liste (absteigend) fuer ein Zentrum.
 
-    Identische Logik wie die Level-Zusammenstellung im GridIndicator:
+    Identische Logik wie grid_math.build_grid_levels() (Referenz-Snapshot):
       center = round(price / step) * step
       levels = center + i*step  fuer i in [-steps_around, steps_around]
       + zusaetzliche custom_levels (nur > 0)
@@ -80,7 +83,7 @@ def in_window_around(
     span: int,
 ) -> np.ndarray:
     """
-    Vektorisierte Version von f_in_window_around() des GridIndicator:
+    Vektorisierte Version von grid_math.f_in_window_around():
     Liefert True fuer Minuten, die im Fenster center +/- span liegen
     (mit Wrap-Around ueber 0/59).
     """
@@ -118,7 +121,7 @@ class GridLevelsFeature(BaseFeature):
         if n == 0:
             return pd.DataFrame({c: [] for c in GRID_COLUMNS})
 
-        # --- Parameter (Defaults konsistent zum GridIndicator) ---
+        # --- Parameter (Defaults konsistent zu grid_math.py) ---
         step_size = float(params.get("step_size", 0.5))
         steps_around = int(params.get("steps_around", 4))
         time_window_mins = int(params.get("time_window_mins", 5))
@@ -183,7 +186,7 @@ class GridLevelsFeature(BaseFeature):
         Unterstuetzt:
           - 'bar_time' als tz-aware pandas datetime (feature_builder load_ohlcv)
           - 'bar_time' als naive datetime/str (wird als UTC interpretiert)
-          - 'time' als Unix-Epoch-Integer (GridIndicator-Stil)
+          - 'time' als Unix-Epoch-Integer (grid_math.py-Stil)
         """
         n = len(df)
         if "bar_time" in df.columns:

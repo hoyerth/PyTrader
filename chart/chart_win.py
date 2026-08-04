@@ -247,6 +247,12 @@ class PyTraderChartWindow(QMainWindow):
         if not isinstance(self.indicators_state, dict):
             self.indicators_state = {}
 
+        # Phase 15 (U15-B4): Alt-Indikator 'grid' entfernt – persistierte
+        # indicators_state['grid']-Einträge werden ignoriert/bereinigt (keine
+        # Registry-Instanz mehr; der Legacy-Pfad in _resolve_indicator_params()
+        # bleibt für Abwärtskompatibilität bestehen, erhält aber kein Set).
+        self.indicators_state.pop("grid", None)
+
         # Standard-Indikator-Setups ergänzen falls unvollständig
         for ind_id, ind_plugin in self.indicators.items():
             if ind_id not in self.indicators_state:
@@ -949,6 +955,10 @@ class PyTraderChartWindow(QMainWindow):
                     loaded_ind = _parse_json_field(ind_st) or {}
                     # Merge statt ersetzen, damit Grid-Fallback erhalten bleibt
                     self.indicators_state.update(loaded_ind)
+                    # Phase 15 (U15-B4): Alt-'grid'-Einträge beim Symbol/TF-
+                    # Wechsel ebenfalls ignorieren/bereinigen (keine Registry-
+                    # Instanz mehr, erhält kein Set).
+                    self.indicators_state.pop("grid", None)
                     # Fehlende Default-Parameter nachtragen
                     for ind_id, ind_plugin in self.indicators.items():
                         if ind_id in self.indicators_state:
@@ -985,6 +995,10 @@ class PyTraderChartWindow(QMainWindow):
                     loaded_ind = _parse_json_field(ind_st) or {}
                     # Merge statt ersetzen, damit Grid-Fallback erhalten bleibt
                     self.indicators_state.update(loaded_ind)
+                    # Phase 15 (U15-B4): Alt-'grid'-Einträge beim Symbol/TF-
+                    # Wechsel ebenfalls ignorieren/bereinigen (keine Registry-
+                    # Instanz mehr, erhält kein Set).
+                    self.indicators_state.pop("grid", None)
                     # Fehlende Default-Parameter nachtragen
                     for ind_id, ind_plugin in self.indicators.items():
                         if ind_id in self.indicators_state:

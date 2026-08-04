@@ -95,6 +95,14 @@ class StateManager:
         con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS version VARCHAR DEFAULT '1.0.0';")
         con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS is_active_batch BOOLEAN DEFAULT FALSE;")
 
+        # Phase 15 (U15-B4): Alt-Indikator 'grid' (chart/indicators/grid.py)
+        # wurde am 04.08.2026 entfernt. Persistierte Presets mit
+        # indicator_id='grid' werden idempotent bereinigt (einmalig pro
+        # App-Start, additiv – bestehende 'grid_liquidity'-Presets bleiben
+        # unangetastet). Der Legacy-Pfad in _resolve_indicator_params()
+        # bleibt fuer Abwaertskompatibilitaet bestehen.
+        con.execute("DELETE FROM indicator_presets WHERE indicator_id = 'grid'")
+
         # Explicit Column Check via information_schema
         tables_to_migrate = ["instance_states", "symbol_tf_states"]
         columns_to_check = ["indicators_state", "measurement_state"]

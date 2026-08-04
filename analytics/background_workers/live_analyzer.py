@@ -12,6 +12,15 @@ signal_results ist DEAKTIVIERT – set_config['signals'] ist leer, daher
 liefern _fill_gaps/_process_new_bars/analyze_single_bar früh zurück und
 es finden KEINE signal_results-Writes mehr statt. Marker/Statistik lesen
 den feature_store; die Tabelle signal_results bleibt nur als Referenz.
+
+Phase 15 U15-C1 (Alt-Pfad-Rückbau, additiv): ZIELZUSTAND des LiveAnalyzer
+ist der resiliente Pfad `_process_plugin_bars_resilient()` (P14-03-E):
+Bar-Close-Evaluierung mit stark verkürztem Lookback (1-2 Bars) gegen das im
+`PluginContext.shared_state` gepufferte Raster – keine volle Pipeline und
+KEINE DB-Abfragen im Live-Tick. Die Alt-Signal-Pfade (`_fill_gaps`,
+`_process_new_bars`, `analyze_single_bar`, `set_config['signals']=[]`)
+sind LEGACY: Sie laufen weiterhin ohne Seiteneffekte (Early-Return), werden
+aber nicht mehr gepflegt und schreiben bewusst NICHT in signal_results.
 """
 
 import json
@@ -171,6 +180,12 @@ class LiveAnalyzer(QThread):
         Hauptschleife: Wartet auf Bar-Close-Events (Polling).
         Fuehrt vor dem Live-Betrieb einen einmaligen Auto-Fill durch,
         um Luecken seit dem letzten Signal in der DB zu schliessen.
+
+        U15-C1 (Zielzustand): Die eigentliche Live-Auswertung läuft über den
+        resilienten Pfad `_process_plugin_bars_resilient()` (Plugin-Modus,
+        gepuffertes shared_state-Raster). `_process_new_bars()` (Alt-Signal-
+        Pfad) wird weiterhin aufgerufen, ist aber mit leerer signal-Liste
+        wirkungslos (Early-Return, keine signal_results-Writes).
         """
         self.log_message.emit(
             f"LiveAnalyzer gestartet: {self.symbol} {self.timeframe}, "

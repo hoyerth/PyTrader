@@ -131,10 +131,18 @@ class ChartRenderPayload(TypedDict, total=False):
 # Strikter FeatureStorePayload (DuckDB)
 # ==============================================================================
 class FeatureStorePayload(TypedDict, total=False):
+    """Feature-Store-Payload eines Plugins.
+
+    Phase 15 (U15-A1, Invariante 5): `schema_version` ist für ALLE Plugins mit
+    capabilities['feature_store']=True ein PFLICHTFELD (Semantic Versioning,
+    major.minor.patch) und wird im `metadata`-Objekt gestempelt. Der
+    GUI-Lesepfad (Indikator) prüft sie beim Chart-Re-Render.
+    """
     feature_id: str
     plugin_version: str
     records: List[Dict[str, Any]]
     metadata: Dict[str, Any]
+    schema_version: str
     statistics: Dict[str, Any]
 
 

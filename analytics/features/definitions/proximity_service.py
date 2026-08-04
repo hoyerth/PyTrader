@@ -3,7 +3,8 @@
 Service: Proximity (Phase 13 Schritt 6)
 
 Liest die Linienliste aus context.shared_state[depends_on[0]] (z. B. grid_1)
-und wendet die PROZENTUALE visit%-Semantik von grid.py an:
+und wendet die PROZENTUALE visit%-Semantik des Alt-Grid-Indikators an
+(Paritätsfunktionen in `grid_math.py`, Phase 15 U15-B3):
 
     visit_min = lvl * (1.0 - visit_pct / 100.0)
     visit_max = lvl * (1.0 + visit_pct / 100.0)
@@ -33,6 +34,10 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from analytics.features.definitions.grid_math import (
+    f_in_window_around,
+    f_strip_trailing_zeros,
+)
 from analytics.features.plugins.base_plugin import (
     FeatureCalculateResult,
     ParameterSchema,
@@ -40,26 +45,6 @@ from analytics.features.plugins.base_plugin import (
     PluginContext,
     PluginFeature,
 )
-
-
-def f_in_window_around(minute_val: int, center: int, span: int) -> bool:
-    """Native UTC-Zeitfenster-Logik – identisch zu grid.py."""
-    lower = center - span
-    upper = center + span
-    if lower < 0:
-        return minute_val >= (60 + lower) or minute_val <= upper
-    elif upper > 59:
-        return minute_val >= lower or minute_val <= (upper - 60)
-    else:
-        return lower <= minute_val <= upper
-
-
-def f_strip_trailing_zeros(val: float) -> str:
-    """Identisch zu grid.py – '%.6f' ohne nachgestellte Nullen."""
-    s = f"{val:.6f}"
-    if "." in s:
-        s = s.rstrip("0").rstrip(".")
-    return s
 
 
 def _bar_utc_minutes(df: pd.DataFrame) -> List[int]:
@@ -95,13 +80,14 @@ class ProximityService(PluginFeature):
         return {
             "category": "Grid",
             "display_name": "Proximity",
-            "description": "Prozentuale visit%-Treffer auf den Grid-Linien (Parität zu grid.py) inkl. Feature-Store-Records",
+            "description": "Prozentuale visit%-Treffer auf den Grid-Linien (Parität zu grid_math.py) inkl. Feature-Store-Records",
             "author": "PyTrader AI",
             "tags": ["grid", "proximity", "liquidity", "feature-store"],
             # Phase 14 P14-01: Erweiterte Beschreibungsfelder
             "description_long": "Liest die Linienliste aus shared_state[depends_on] "
-                                "und wendet die prozentuale visit%-Semantik von "
-                                "grid.py an (visit_min/max je Linie). Schreibt "
+                                "und wendet die prozentuale visit%-Semantik der "
+                                "Paritätsfunktionen (grid_math.py) an "
+                                "(visit_min/max je Linie). Schreibt "
                                 "Hit-Records in den Feature-Store.",
             "condition_rules": [
                 "Treffer: visit_min <= high/low <= visit_max ODER Piercing (low <= lvl <= high)",
@@ -147,7 +133,7 @@ class ProximityService(PluginFeature):
         return {
             "visit_pct": {
                 "type": "float", "default": 0.05, "min": 0.0, "max": 100.0,
-                "step": 0.005, "description": "Prozentuale Toleranz um jede Linie (Parität zu grid.py visit_pct)",
+                "step": 0.005, "description": "Prozentuale Toleranz um jede Linie (Parität zu grid_math.py visit_pct)",
             },
             "time_window_mins": {
                 "type": "int", "default": 5, "min": 0, "max": 30,
@@ -165,9 +151,9 @@ class ProximityService(PluginFeature):
         params: Dict[str, Any],
         context: Optional[PluginContext] = None,
     ) -> FeatureCalculateResult:
-        """Wendet die prozentuale visit%-Semantik von grid.py auf die Linien aus
-        context.shared_state[depends_on[0]] an und schreibt Hit-Records nach
-        feature_data (feature_store=True)."""
+        """Wendet die prozentuale visit%-Semantik der Paritätsfunktionen
+        (grid_math.py) auf die Linien aus context.shared_state[depends_on[0]]
+        an und schreibt Hit-Records nach feature_data (feature_store=True)."""
         empty: FeatureCalculateResult = {
             "feature_store_payload": {},
             "chart_render_payload": {"lines": [], "hit_circles": []},
@@ -215,7 +201,7 @@ class ProximityService(PluginFeature):
         # Linien) bzw. der Indikator. show_lines ist KEIN Service-Parameter.
         tracked_levels = [float(l["price"]) for l in lines_payload]
 
-        # --- Proximity & Hit-Logik (exakte Parität zu grid.py) ---------------
+        # --- Proximity & Hit-Logik (exakte Parität zu grid_math.py) ----------
         hit_circles: List[Dict[str, Any]] = []
         active_hits: List[str] = []
         feature_rows: List[Dict[str, Any]] = []
@@ -268,7 +254,7 @@ class ProximityService(PluginFeature):
                 "visit_pct": visit_pct,
             })
 
-        # --- Status-Info (letzte Bar des Scan-Fensters, Parität zu grid.py) --
+        # --- Status-Info (letzte Bar des Scan-Fensters, Parität zu grid_math.py)
         if len(scan_df):
             last_ts = int(scan_df.iloc[-1]["time"])
             last_m = datetime.fromtimestamp(last_ts, tz=dt_timezone.utc).minute

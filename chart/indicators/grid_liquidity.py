@@ -184,6 +184,10 @@ class GridLiquidityIndicator(BaseIndicator):
         Service ({time, price, in_window}) oder [] bei fehlenden Daten/Fehlern –
         der Aufrufer entscheidet, ob er auf die Pipeline (calculate) zurückfällt.
 
+        U15-A2 (Farb-Semantik): Die gelieferten Kreise enthalten KEINE Farbe –
+        der Aufrufer (calculate) wendet die circle_color_std/_active-Färbung
+        additiv aus dem Indikator-Schema an (in_window + use_time_filter).
+
         Args:
             symbol: Symbol-Name
             timeframe: Timeframe
@@ -343,7 +347,22 @@ class GridLiquidityIndicator(BaseIndicator):
     def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
         """Führt die Service-Pipeline (grid_lines + proximity) für den
         Historical-Run aus, cached die Linien thread-sicher und liefert den
-        Render-Payload (Parität zu grid.py)."""
+        Render-Payload (Parität zu grid.py).
+
+        Invariante 10 (Chart-Entkopplung, Phase 15 U15-A2) – Lese-Kette:
+          1. PRIMÄR: Proximity-Hit-Circles werden aus dem feature_store
+             gelesen (read_proximity_from_feature_store) – der Chart führt
+             KEINE Proximity-Berechnung aus, er liest vorberechnete Daten
+             aus DuckDB.
+          2. DEFINIERTER FALLBACK: Ist der feature_store leer (noch kein
+             Batch-Lauf geschrieben), wird die Service-Pipeline
+             (grid_lines + proximity) synchron ausgeführt – Linien/Circles
+             werden daraus gerendert UND die Circles zusätzlich als
+             berechnete Referenz verwendet. Zielzustand 15.2: Fallback
+             entfällt, sobald der Store verlässlich befüllt ist.
+          Die Grid-LINIEN (Live-Tick-Cache) kommen unabhängig davon immer
+          aus der Pipeline (GridLinesService) – sie sind kein DB-Output.
+        """
         empty_result: Dict[str, Any] = {
             "lines": [],
             "hit_circles": [],
@@ -380,8 +399,33 @@ class GridLiquidityIndicator(BaseIndicator):
                 self._symbol or "", self._timeframe or ""
             )
             if cached_circles:
-                circles = cached_circles
+                # U15-A2 (Farb-Konsistenz): Die Feature-Store-Kreise kommen aus
+                # dem DB-Lesepfad OHNE Farbe (nur time/price/in_window). Damit
+                # der Primärpfad identisch zum Pipeline-Fallback färbt, wird
+                # die Farbe hier additiv aus dem Indikator-Schema angewendet:
+                #   in_window + use_time_filter → circle_color_std, sonst _active.
+                circle_std = str(p.get("circle_color_std") or "#FFEB3B")
+                circle_active = str(p.get("circle_color_active") or "#E91E63")
+                use_time_filter = _as_bool(p.get("use_time_filter"), True)
+                circles = [
+                    dict(
+                        c,
+                        color=(
+                            circle_active
+                            if (use_time_filter and not bool(c.get("in_window", True)))
+                            else circle_std
+                        ),
+                    )
+                    for c in cached_circles
+                ]
             else:
+                # DEFINIERTER FALLBACK (U15-A2): feature_store enthält keine
+                # Proximity-Hits für dieses (symbol, timeframe) – die
+                # Service-Pipeline liefert die Circles als berechnete
+                # Referenz (Invariante 10, Zielzustand: Fallback entfällt).
+                print(f"⚠️ [GridLiquidityIndicator] feature_store leer für "
+                      f"{self._symbol}/{self._timeframe} – Pipeline-Fallback "
+                      f"(U15-A2, definierter Fallback).")
                 # Display-Layer: priority=10 (JS-Bridge-Erwartung, wie Alt-Plugin).
                 # Die Services selbst bleiben Paritäts-pur (kein priority – exakt
                 # wie grid.py); die Anreicherung passiert erst hier im Adapter.
