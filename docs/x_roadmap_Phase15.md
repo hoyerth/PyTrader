@@ -126,13 +126,27 @@ der Entfernung des Alt-Grid-Indikators + abgeleitete Kapitel-Arbeiten (15.1–15
   `chart/indicators/grid_liquidity.py` `calculate()` additiv durch reinen
   DB-Lesepfad ersetzen; `read_proximity_from_feature_store()` als Primärpfad
   festigen, definierter Fallback dokumentieren. → Kapitel 15.2
-- [ ] **U15-A3** `docs/AKTUELLE_UMSETZUNG.md` wieder aufsetzen bzw. die
+- [x] **U15-A3** `docs/AKTUELLE_UMSETZUNG.md` wieder aufsetzen bzw. die
   Phase-15-Roadmap als neue Hauptanweisung etablieren (Abstimmung mit
   System-Regel 0c). → vor Kapitel 15.1
-- [ ] **U15-A4** ML-Signale: Entscheidung aktivieren vs. deaktivieren
+  **Umgesetzt (04.08.2026):** `docs/AKTUELLE_UMSETZUNG.md` neu aufgesetzt –
+  enthält Zielsetzung, Grundsätze, Arbeitsstand (erledigt/offen in
+  Reihenfolge), Legacy-Tabellen-Entscheidung (U15-C3), ML-Entscheidung
+  (U15-A4) und die neue `serviceui/`-Modularisierungs-Anweisung (U15-D1).
+- [x] **U15-A4** ML-Signale: Entscheidung aktivieren vs. deaktivieren
   (`analytics/signals/machine_learning/`); bei Aktivierung `lightgbm`/`xgboost`
   in `requirements.txt` ergänzen und Signale in Worker/UI verdrahten.
   → Kapitel 15.4
+  **Entscheidung (04.08.2026): DEAKTIVIERT / explizit als „future" deklariert.**
+  * `LightGBMSignal`/`XGBoostSignal` (`analytics/signals/machine_learning/`)
+    sind eigenständige `SignalDefinition`-Subklassen mit LAZY-Imports
+    (`import lightgbm`/`import xgboost` erst beim `_load_model`-Aufruf) – sie
+    brechen den Import nicht, sind aber nirgends registriert/verdrahtet.
+  * `requirements.txt` enthält weder `lightgbm` noch `xgboost`; eine
+    Aktivierung würde Modell-Dateien (`model_file`), Feature-Konfiguration und
+    Worker/UI-Verdrahtung erfordern – bewusst NICHT Teil von Phase 15.
+  * Die Klassen bleiben als „future"-Baustein erhalten (kein Löschen, kein
+    Registrieren). → Kapitel 15.4 bei Bedarf reaktivierbar.
 
 ### B. Konsequenzen aus der Entfernung des Alt-Grid-Indikators
 
@@ -163,16 +177,60 @@ der Entfernung des Alt-Grid-Indikators + abgeleitete Kapitel-Arbeiten (15.1–15
   resilienter Pfad (`_process_plugin_bars_resilient`) als Zielzustand.
 - [ ] **U15-C2** `HistoricalScanner`: Alt-Scan (grid/standard) vs. Plugin-Batch –
   Zielzustand festlegen; `signal_results`-Schreibpfade endgültig abwickeln.
-- [ ] **U15-C3** Legacy-Tabellen `signal_definitions`, `signal_sets`,
+- [x] **U15-C3** Legacy-Tabellen `signal_definitions`, `signal_sets`,
   `signal_results` in `analytics.duckdb`: nach Abschluss des Alt-Pfad-Rückbaus
   entscheiden (löschen vs. als Referenz behalten). `signal_results` bleibt bis dahin
   unverändert erhalten.
+  **Entscheidung (04.08.2026): Alle drei Tabellen werden ALS REFERENZ BEHALTEN**
+  (kein DROP). Begründung:
+  * `db_service.py` legt sie bei jedem Init per `CREATE TABLE IF NOT EXISTS`
+    (Z. 246/254/261) ohnehin neu an – ein DROP wäre wirkungslos und würde beim
+    nächsten Start automatisch re-erzeugt.
+  * `signal_results` wird noch von den DEAKTIVIERTEN Alt-Pfaden in
+    `live_analyzer.py` referenziert (`_fill_gaps`/`_process_plugin_bars`,
+    Early-Return, `set_config['signals']=[]`). Erst wenn diese Alt-Pfade
+    physisch abgewickelt sind (U15-C1/C2), entfällt die letzte Referenz.
+  * Aktive Lese-/Schreibpfade existieren nicht mehr: `statistics_repository.py`
+    liest `feature_store` (feature_id), `chart/overlays/signal_overlay.py` hat
+    den signal_results-Fallback entfernt (Phase 13 7.B), `historical_scanner.py`
+    schreibt nicht mehr in `signal_results`. Die Tabellen sind ungenutzt und
+    dienen als Schema-Referenz der Alt-Signal-Mechanik.
 
 ### D. Service-UI-Modularisierung (Kapitel 15.1)
 
-- [ ] **U15-D1** `service_win.py` modularisieren: Set-Editor, Parameter-Column-Builder,
+- [x] **U15-D1** `service_win.py` modularisieren: Set-Editor, Parameter-Column-Builder,
   Papierkorb-Dialog, Info-/Beschreibungs-Dialoge in eigene Widgets/Dialoge extrahieren
   (SRP, Invariante-Konformität); Verhalten unverändert.
+  **Umgesetzt (04.08.2026, User-Anweisung):** Neuer Unterordner **`serviceui/`**
+  – die gewachsene Datei wurde dorthin verschoben (inkl. `service_win.py`
+  selbst) und in SRP-Module zerlegt:
+  * `serviceui/service_win.py` – `ServiceWindow` (re-exportiert die öffentliche
+    API: `ServiceSetRunWorker`, `ServiceSetItemAdapter`, `_available_plugin_ids`,
+    `_sets_using_plugin`; `BASE_DIR = parent.parent` für `ui/service_win.ui`).
+  * `serviceui/service_set_utils.py` – `_available_plugin_ids`, `_sets_using_plugin`.
+  * `serviceui/set_run_worker.py` – `ServiceSetRunWorker` (QThread).
+  * `serviceui/set_item_adapter.py` – `ServiceSetItemAdapter` (Set-Editor-Adapter,
+    NamedItemActionsMixin-Mechanik).
+  * `serviceui/param_columns.py` – `ServiceParamColumnsMixin`
+    (Parameter-Column-Builder, dynamische Service-Spalten).
+  * `serviceui/trash_dialog.py` – `ServiceSetTrashDialog` (Papierkorb-Dialog,
+    P14-05, doppelte Sicherheitsnachfrage).
+  * `serviceui/__init__.py` – Paket-Re-Exports.
+  Imports aktualisiert: `main.py` (Z. 42), `chart/widgets/__init__.py`
+  (Kommentar), `Architektur.md` (Z. 91) sowie die Test-Dateien
+  `check_p13_s4.py`, `check_p13_service_win_geometry.py`, `check_p13_ui_plugins.py`,
+  `check_p14_precision_levels.py`, `check_p14_s4_services_locked.py`.
+  **Headless-Validierung:** py_compile OK; alle 5 betroffenen Checks BESTANDEN
+  (`check_p14_s4_services_locked.py`, `check_p13_s4.py`, `check_p13_ui_plugins.py`,
+  `check_p13_service_win_geometry.py`, `check_p14_precision_levels.py`).
+  Dabei 2 vorbestehende (P14-01/P14-04-E-bedingte) Test-Staleness-Fixes:
+  * `check_p13_s4.py` [7]: Service-Sperre (P14-04-E) blockiert Entfernen von
+    `grid_liquidity` (gesperrt durch gespeichertes Set) – Test nutzt für den
+    Remove-Mechanik-Check jetzt `grid_lines` (frei) + prüft die Sperre
+    (QMessageBox.warning gemockt).
+  * `check_p13_ui_plugins.py` [4]+[11]: Instanz-Platzhalter-Auswahl (P14-01,
+    mehrere placeholderText) + Stack-Count 2 statt 3 (P14-01: keine
+    Plugin-Live-Seite 0).
 - [ ] **U15-D2** Bedien-Feinschliff: offen für User-Vorgaben (Sammelliste während 15.1).
 
 ---

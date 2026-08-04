@@ -1,4 +1,4 @@
-# service_win.py
+# serviceui/service_win.py
 """
 Service-Kontrollfenster für PyTrader.
 Steuert den Historical Scanner (Full-Scan / Delta-Update) über ein separates Fenster.
@@ -8,18 +8,28 @@ Phase 13 Schritt 4: Zusätzlich Service-Set-Verwaltung (ServiceSetRepository +
 ServiceSetEvaluator): Set-Auswahl (list_sets()), execution_order-Anzeige mit
 Up/Down-Umsortierung, Name (leer → Auto-Name), Speichern/Löschen (mit
 QMessageBox-Rückfrage) und Ausführen (ServiceSetEvaluator im Hintergrund).
+
+Phase 15 Kapitel 15.1 (U15-D1): Modularisierung – die gewachsene Datei wurde
+in den Unterordner serviceui/ verschoben und in Module zerlegt (Verhalten
+unverändert):
+  * service_set_utils.py   – _available_plugin_ids, _sets_using_plugin
+  * set_run_worker.py      – ServiceSetRunWorker (QThread)
+  * set_item_adapter.py    – ServiceSetItemAdapter (NamedItemAdapter)
+  * param_columns.py       – ServiceParamColumnsMixin (Parameter-Column-Builder)
+  * trash_dialog.py        – ServiceSetTrashDialog (Papierkorb-Dialog)
+Diese Datei re-exportiert die öffentliche API, damit bestehende Aufrufe
+(main.py, Tests) weiter funktionieren.
 """
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-from PySide6.QtCore import QFile, QIODevice, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QFile, QIODevice, QTimer, Qt, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFormLayout, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMessageBox, QProgressBar, QPushButton, QSizePolicy, QSpinBox, QTextEdit,
-    QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMessageBox, QProgressBar, QPushButton,
+    QTextEdit, QWidget,
 )
 
 from analytics.background_workers.historical_scanner import HistoricalScanner
@@ -28,186 +38,21 @@ from analytics.engine.service_set_repository import ServiceSetRepository
 from analytics.engine.set_evaluator import ServiceSetEvaluator
 from persistent_win import PersistentWindow, register_persistent_window
 from scrollable_content import ContentScrollMixin
-from chart.widgets.named_item_actions import NamedItemAdapter, NamedItemActionsMixin
+from chart.widgets.named_item_actions import NamedItemActionsMixin
 
-BASE_DIR = Path(__file__).resolve().parent
+# Phase 15 U15-D1: Submodule der Service-UI
+from serviceui.service_set_utils import _available_plugin_ids, _sets_using_plugin
+from serviceui.set_run_worker import ServiceSetRunWorker
+from serviceui.set_item_adapter import ServiceSetItemAdapter, _ServiceSetItemAdapter
+from serviceui.param_columns import ServiceParamColumnsMixin
+from serviceui.trash_dialog import ServiceSetTrashDialog
 
-
-def _available_plugin_ids() -> str:
-    """Alle registrierten Plugin-IDs (sortiert, kommasepariert).
-
-    Phase 13 Schritt 6-Korrektur: Die Verfügbarkeit wird dynamisch aus der
-    PluginRegistry abgeleitet (grid_lines, proximity, grid_liquidity, ...),
-    NICHT hartkodiert auf 'grid_liquidity'.
-    """
-    try:
-        from analytics.features.feature_builder import PluginRegistry
-        return ", ".join(sorted(PluginRegistry().plugins.keys()))
-    except Exception:
-        return "?"
-
-
-def _sets_using_plugin(plugin_id: str, sets: List[Dict[str, Any]]) -> List[str]:
-    """P14-04-E: Namen aller Service-Sets, die einen Service mit dieser
-    plugin_id enthalten.
-
-    Basis der Service-Sperre: Einzel-Services, die in einem gespeicherten
-    Service-Set vorkommen, dürfen im Service-Fenster nicht entfernt werden
-    (Indikator-Basisservices wie grid_lines/proximity bleiben funktionsfähig).
-    Beim Löschversuch wird der Name des verwendeten Sets angezeigt.
-    """
-    names: List[str] = []
-    for s in sets or []:
-        services = s.get("services") or {}
-        if any((cfg or {}).get("plugin_id") == plugin_id
-               for cfg in services.values()):
-            names.append(str(s.get("display_name") or s.get("set_id") or "?"))
-    return names
-
-
-class ServiceSetRunWorker(QThread):
-    """Phase 13 Schritt 4: Führt ein Service-Set im Hintergrund aus.
-
-    Lädt OHLCV (Symbol/Timeframe) und ruft ServiceSetEvaluator.execute_set()
-    in einem separaten Thread auf, damit die GUI nicht blockiert.
-    """
-
-    log_message = Signal(str)
-    run_finished = Signal(str, int)  # set_id, Anzahl erfolgreicher Services
-    run_failed = Signal(str, str)    # set_id, Fehlermeldung
-
-    def __init__(self, evaluator: ServiceSetEvaluator, symbol: str, timeframe: str,
-                 set_definition: Dict[str, Any], parent=None):
-        super().__init__(parent)
-        self.evaluator = evaluator
-        self.symbol = symbol
-        self.timeframe = timeframe
-        self.set_definition = set_definition
-
-    def run(self):
-        try:
-            from analytics.features.feature_builder import FeatureBuilder, prepare_plugin_df
-            from analytics.features.plugins.base_plugin import PluginContext
-            from state_manager import StateManager
-
-            settings = StateManager().get_app_settings()
-            fb = FeatureBuilder()
-            df = fb.load_ohlcv(self.symbol, self.timeframe, limit=settings.feature_builder_limit)
-            if df is None or df.empty:
-                self.run_failed.emit(
-                    self.set_definition.get("set_id", ""),
-                    f"Keine OHLCV-Daten fuer {self.symbol} {self.timeframe}.",
-                )
-                return
-
-            df_plugin = prepare_plugin_df(df)
-            context = PluginContext(
-                symbol=self.symbol,
-                timeframe=self.timeframe,
-                mode="batch",
-                timestamp=int(df_plugin["time"].iloc[-1]) if len(df_plugin) else None,
-                settings=settings,
-            )
-            display = self.set_definition.get("display_name") or self.set_definition.get("set_id") or "Unbenannt"
-            self.log_message.emit(f"Ausfuehren: {display} ({self.symbol} {self.timeframe})")
-
-            results = self.evaluator.execute_set(self.set_definition, df_plugin, context=context)
-            for iid in results:
-                self.log_message.emit(f"  {iid}: fertig")
-            self.run_finished.emit(self.set_definition.get("set_id", ""), len(results))
-        except Exception as e:
-            self.run_failed.emit(self.set_definition.get("set_id", ""), str(e))
-
-
-class _ServiceSetItemAdapter(NamedItemAdapter):
-    """Adapter für die SERVICE-SET-Sammlung im Service-Fenster.
-
-    Phase 13 Schritt 8: Die Service-Set-Verwaltung (Speichern/Löschen) nutzt
-    exakt dieselbe generische Preset-Mechanik wie das Indikator-Prop-Fenster
-    (NamedItemActionsMixin). Die _item_*-Protokoll-Methoden liegen in diesem
-    Adapter und greifen auf das ServiceWindow (self.dlg) zu.
-    """
-
-    def __init__(self, dlg: "ServiceWindow") -> None:
-        self.dlg = dlg
-
-    def _item_scope_label(self) -> str:
-        return "Service-Set"
-
-    def _item_current_name(self) -> str:
-        return self.dlg.edit_set_name.text().strip() if self.dlg.edit_set_name else ""
-
-    def _item_current_id(self) -> Optional[str]:
-        if self.dlg._current_set_id:
-            return self.dlg._current_set_id
-        if self.dlg.combo_set:
-            return self.dlg.combo_set.currentData()
-        return None
-
-    def _item_auto_name(self) -> str:
-        """Auto-Name aus den instance_ids (Roadmap: leerer Name → Auto-Name)."""
-        try:
-            definition = self.dlg.collect_set_definition()
-            definition["display_name"] = ""
-            return ServiceSetRepository._default_display_name(definition)
-        except Exception as e:
-            print(f"⚠️ [ServiceWindow] Auto-Name fehlgeschlagen: {e}")
-            return ""
-
-    def _item_list_names(self) -> List[str]:
-        return [s.get("display_name") or "" for s in self.dlg.set_repo.list_sets()]
-
-    def _item_exists(self, name: str) -> bool:
-        """True, wenn ein ANDERES Set bereits diesen Namen trägt."""
-        current = self._item_current_id()
-        return any(
-            (s.get("display_name") or "") == name and s.get("set_id") != current
-            for s in self.dlg.set_repo.list_sets()
-        )
-
-    def _item_save_as(self, name: str) -> Optional[str]:
-        """Speichert das Set unter 'name'; liefert die set_id zurück."""
-        definition = self.dlg.collect_set_definition()
-        if not definition.get("execution_order"):
-            self.dlg.log("Keine Services in der Ausführungs-Reihenfolge – "
-                         "Speichern abgebrochen.")
-            return None
-        if not definition.get("services"):
-            self.dlg.log("WARNUNG: Set hat keine services-Konfiguration "
-                         "(nur Reihenfolge wird gespeichert).")
-        definition["display_name"] = name
-        set_id = self.dlg.set_repo.save_set(definition)
-        self.dlg.log(f"Set gespeichert: {set_id}")
-        return set_id
-
-    def _item_delete_current(self) -> bool:
-        set_id = self._item_current_id()
-        if not set_id:
-            self.dlg.log("Kein Set zum Löschen ausgewählt.")
-            return False
-        if self.dlg.set_repo.delete_set(set_id):
-            # P14-05: Soft-Delete – das Set liegt im Papierkorb und kann über
-            # den Papierkorb-Dialog wiederhergestellt werden.
-            self.dlg.log(f"Set in den Papierkorb verschoben (P14-05): {set_id}")
-            return True
-        self.dlg.log(f"Set '{set_id}' nicht gefunden.")
-        return False
-
-    def _item_select(self, set_id: Optional[str] = None) -> None:
-        """Setzt die Set-Auswahl nach Speichern (set_id) bzw. Löschen (None)."""
-        self.dlg._current_set_id = None  # Neuauswahl erzwingen (sonst bleibt Alt-Selektion)
-        self.dlg.refresh_set_list()
-        if set_id and self.dlg.combo_set:
-            idx = self.dlg.combo_set.findData(set_id)
-            if idx >= 0:
-                self.dlg.combo_set.setCurrentIndex(idx)
-
-    def _item_reserved_name(self) -> Optional[str]:
-        return None  # Service-Sets haben kein geschütztes 'Default'-Set
+# Projekt-Root (eine Ebene über serviceui/) – für die UI-Datei unter ui/.
+BASE_DIR = Path(__file__).resolve().parent.parent
 
 
 @register_persistent_window(auto_restore=False)
-class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow):
+class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActionsMixin, PersistentWindow):
     INSTANCE_ID = "win_service"
 
     def __init__(self, parent=None, service_set_repo: Optional[ServiceSetRepository] = None):
@@ -791,23 +636,6 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         return "🔒 ", (f"<br><b>Gesperrt (P14-04)</b>: wird vom Service-Set "
                        f"'{names[0]}' verwendet – Entfernen nicht möglich")
 
-    def _update_service_tooltip(self, iid: str) -> None:
-        """Aktualisiert den Tooltip des Listen-Items live beim Tippen."""
-        if not self.list_execution_order:
-            return
-        for i in range(self.list_execution_order.count()):
-            item = self.list_execution_order.item(i)
-            if item.data(Qt.UserRole) == iid:
-                cfg: Dict[str, Any] = {"plugin_id": item.data(Qt.UserRole + 1) or iid}
-                desc_ctrl = self._service_desc_controls.get(iid)
-                if desc_ctrl is not None:
-                    cfg["description"] = desc_ctrl.text().strip()
-                # P14-04-E: Sperr-Nachtrag (🔒) beibehalten – der Live-Tooltip
-                # darf die Sperr-Kennzeichnung nicht überschreiben.
-                _prefix, lock_tip = self._service_lock(str(cfg.get("plugin_id") or ""))
-                item.setToolTip(self._build_tooltip(iid, cfg) + lock_tip)
-                break
-
     def _on_order_item_clicked(self, item: QListWidgetItem) -> None:
         """Merkt sich die aktuell markierte instance_id (itemClicked)."""
         if item is not None:
@@ -822,7 +650,12 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
 
     @Slot()
     def _show_service_info(self) -> None:
-        """Öffnet den ServiceDescriptionDialog für die markierte Instanz."""
+        """Öffnet den ServiceDescriptionDialog für die markierte Instanz.
+
+        Phase 15 U15-D1: Der Info-/Beschreibungs-Dialog selbst ist bereits
+        extern ausgelagert (analytics/engine/description_dialog.py,
+        ServiceDescriptionDialog); diese Slot-Methode öffnet ihn nur noch.
+        """
         iid = self._current_list_iid
         if not iid or self.list_execution_order is None:
             self.log("Keine Service-Instanz markiert.")
@@ -845,295 +678,6 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         dlg = ServiceDescriptionDialog.from_plugin(plugin, instance_id=iid, config=cfg, parent=self)
         dlg.exec()
 
-    # =========================================================================
-    # Phase 13 5.4 Schritt 1: Breiten- & Höhendynamisches Layout (Service-Spalten)
-    # =========================================================================
-
-    @staticmethod
-    def _is_visual_key(key: str) -> bool:
-        """Konvention für reine Darstellungs-Props: Sichtbarkeit (show_*) + Farben (color).
-
-        Darstellungs-Parameter gehören NICHT ins Service-Set (nur Berechnungs-
-        Logik, Roadmap 5.4.1.2) und werden daher in den Service-Spalten
-        ausgeblendet (konsistent zum Indikator-Dialog).
-        """
-        if key.startswith("show_"):
-            return True
-        if "color" in key.lower():
-            return True
-        return False
-
-    @staticmethod
-    def _human(key: str) -> str:
-        return key.replace("_", " ").title()
-
-    @staticmethod
-    def _decimal_places(value: Any) -> int:
-        """Nachkommastellen eines float (für QDoubleSpinBox.setDecimals)."""
-        if not isinstance(value, float) or value != value:  # NaN-Schutz
-            return 4
-        s = f"{value:.10f}".rstrip("0")
-        if "." in s:
-            return len(s.split(".")[1])
-        return 0
-
-    def _get_symbol_precision(self) -> int:
-        """USER-REQ: Preisskala-Praezision (fix je Symbol) fuer die 6
-        Custom-Level-Eingabefelder. Lazy ermittelt (db_service.get_symbol_
-        precision) und fuer die Fenster-Instanz gecacht – kein DB-Zugriff
-        bei jedem Spalten-Neuaufbau."""
-        if self._symbol_precision is None:
-            try:
-                from db_service import get_symbol_precision
-                symbol = (self.combo_symbol.currentText()
-                          if self.combo_symbol else "SILVER")
-                timeframe = (self.combo_tf_set.currentText()
-                             if self.combo_tf_set else "H1")
-                self._symbol_precision = get_symbol_precision(symbol, timeframe)
-            except Exception:
-                self._symbol_precision = 2
-        return self._symbol_precision
-
-    def _create_param_control(self, key: str, val: Any, spec: Dict[str, Any]) -> QWidget:
-        """Erzeugt ein Eingabe-Widget exakt aus dem ParameterSchema.
-
-        float -> QDoubleSpinBox, int -> QSpinBox, bool -> QCheckBox,
-        choice -> QComboBox, color/str -> QLineEdit. min/max/step werden 1:1
-        übertragen (Roadmap 5.4.2.2).
-        """
-        p_type = spec.get("type")
-        if p_type == "float":
-            spin = QDoubleSpinBox()
-            spin.setRange(float(spec.get("min", -1e9)), float(spec.get("max", 1e9)))
-            step = spec.get("step")
-            decimals = self._decimal_places(step) if step is not None else self._decimal_places(spec.get("default"))
-            # USER-REQ: Custom-Levels (prox_level1..6) nutzen die Preisskala-
-            # Praezision (fix je Symbol). MUSS vor setValue geschehen, sonst
-            # rundet QDoubleSpinBox den Wert auf die Schema-Default-Digits.
-            if key.startswith("prox_level"):
-                decimals = self._get_symbol_precision()
-            spin.setDecimals(min(6, max(0, decimals)))
-            spin.setSingleStep(float(step) if step is not None else 0.01)
-            try:
-                spin.setValue(float(val))
-            except (TypeError, ValueError):
-                spin.setValue(float(spec.get("default", 0.0)))
-            return spin
-        if p_type == "int":
-            spin = QSpinBox()
-            spin.setRange(int(spec.get("min", -100000)), int(spec.get("max", 100000)))
-            spin.setSingleStep(int(spec.get("step", 1)))
-            try:
-                spin.setValue(int(val))
-            except (TypeError, ValueError):
-                spin.setValue(int(spec.get("default", 0)))
-            return spin
-        if p_type == "bool":
-            chk = QCheckBox()
-            chk.setChecked(bool(val))
-            return chk
-        if p_type == "choice":
-            combo = QComboBox()
-            combo.addItems([str(o) for o in (spec.get("options") or [])])
-            combo.setCurrentText(str(val))
-            return combo
-        txt = QLineEdit()
-        txt.setText(str(val))
-        return txt
-
-    @staticmethod
-    def _ctrl_value(ctrl: QWidget) -> Any:
-        """Liest den aktuellen Wert eines Controls typsicher aus."""
-        if isinstance(ctrl, QCheckBox):
-            return ctrl.isChecked()
-        if isinstance(ctrl, QSpinBox):
-            return ctrl.value()
-        if isinstance(ctrl, QDoubleSpinBox):
-            return ctrl.value()
-        if isinstance(ctrl, QComboBox):
-            return ctrl.currentText()
-        return ctrl.text()
-
-    def _setup_collapsible(self, group: QGroupBox) -> None:
-        """Macht eine ausklappbare QGroupBox wirklich kollabierbar.
-
-        Beim Abwählen werden die Kinder ausgeblendet und die Fensterhöhe per
-        _reflow() nahtlos verkleinert (Roadmap 5.4.2.2: Ein-/Ausklappen
-        verändert die Höhe dynamisch). Zusätzlich wird group.updateGeometry()
-        gerufen, damit der gecachte QWidgetItemV2-sizeHint der Box invalidiert
-        wird (Qt 6.11: Layouts refreshen diesen Cache sonst NICHT).
-        """
-        def _toggle(checked: bool) -> None:
-            for child in group.findChildren(QWidget):
-                child.setVisible(checked)
-            group.updateGeometry()  # QWidgetItemV2-Cache invalidieren (s. oben)
-            self._reflow()
-        group.toggled.connect(_toggle)
-        _toggle(group.isChecked())
-
-    def _reflow(self) -> None:
-        """Erzwingt die Neuberechnung der Layouts (dynamische Höhe/Breite).
-
-        Qt 6.11: QWidgetItemV2 cached den sizeHint eines Widgets beim ersten
-        Zugriff und aktualisiert ihn NICHT, wenn der Inhalt später wächst –
-        selbst layout.invalidate() hilft nicht. Daher werden die Caches der
-        betroffenen Widgets explizit per updateGeometry() invalidiert
-        (invalidateSizeCache) und die Layout-Caches geleert.
-
-        WICHTIG: Die Fenstergröße wird DEFERRED (nächste Event-Loop-Runde)
-        angepasst. Beim Set-Wechsel sind die alten Service-Spalten per
-        deleteLater() noch im Widget-Baum; bis sie zerstört sind, melden die
-        Layout-Caches einen veralteten (zu kleinen) sizeHint (z.B. 18x18 für
-        eine volle Spalten-Zeile). Ein synchrones resize würde das Fenster
-        daher fälschlich schrumpfen. _schedule_reflow() zerstört die
-        deleteLater-Widgets und berechnet die Größe erst aus dem konsistenten
-        Zustand (ContentScrollMixin).
-        """
-        self._schedule_reflow()
-
-    def _clear_service_columns(self) -> None:
-        """Entfernt alle Service-Spalten aus dem service_columns_layout."""
-        if self.service_columns_layout is None:
-            return
-        while self.service_columns_layout.count():
-            item = self.service_columns_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-        self._service_param_controls = {}
-        self._service_desc_controls = {}
-
-    def _build_service_columns(self, set_definition: Dict[str, Any]) -> None:
-        """Baut die dynamischen Service-Spalten (Roadmap 5.4.2.2).
-
-        Für jede instance_id in execution_order wird eine QGroupBox-Spalte im
-        service_columns_layout erzeugt. Jede Spalte skaliert in der Höhe exakt
-        mit der Anzahl ihrer Parameter (QSizePolicy.Maximum); die Fensterbreite
-        wächst mit der Anzahl der Spalten nach rechts – ohne leeren Raum und
-        ohne fixe Pixelwerte.
-        """
-        if self.service_columns_layout is None:
-            return
-        self._clear_service_columns()
-        services = set_definition.get("services") or {}
-        for iid in (set_definition.get("execution_order") or []):
-            cfg = services.get(iid) or {}
-            pid = cfg.get("plugin_id") or iid
-            col = self._build_service_column(iid, pid, cfg)
-            self.service_columns_layout.addWidget(col)
-        # Container erneut in die obere Zeile einfügen: Das QWidgetItem
-        # eines Widgets meldet dessen Größe zum Zeitpunkt des Einfügens und
-        # aktualisiert sich bei späterem Inhalts-Wachstum nicht (Qt-Quirk).
-        # Entfernen + erneutes Einfügen erzeugt ein frisches QWidgetItem mit
-        # der aktuellen Größe.
-        if self.top_row is not None and self.widget_service_columns is not None:
-            self.top_row.removeWidget(self.widget_service_columns)
-            self.top_row.addWidget(self.widget_service_columns)
-        self._reflow()
-
-    def _build_service_column(self, iid: str, pid: str, cfg: Dict[str, Any]) -> QGroupBox:
-        """Erzeugt EINE Service-Spalte (QGroupBox) mit Parameter-Formular.
-
-        - Normale Parameter im QFormLayout (float/int/bool nach Schema).
-        - expert: True (inkl. lookback) in einer einklappbaren
-          QGroupBox 'Experten-Optionen' am Spaltenfuß.
-
-        P14-04-E: Spaltentitel trägt die 🔒-Kennzeichnung, wenn der Service in
-        einem gespeicherten Service-Set vorkommt (Sperre sichtbar).
-        """
-        prefix, _ = self._service_lock(pid)
-        col = QGroupBox(f"{prefix}{iid}  [{pid}]")
-        # 5.4.2.2 Punkt 3: Spalte skaliert in der Höhe exakt mit ihrem Inhalt
-        # (endet unter dem letzten Parameter), wächst beim Vergrößern des
-        # Fensters NICHT mit.
-        col.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-        vl = QVBoxLayout(col)
-        vl.setAlignment(Qt.AlignTop)
-
-        try:
-            from analytics.features.feature_builder import PluginRegistry
-            plugin = PluginRegistry().get(pid)
-        except KeyError:
-            vl.addWidget(QLabel(f"Plugin '{pid}' nicht gefunden."))
-            return col
-
-        full_schema: Dict[str, Any] = dict(getattr(plugin, "base_parameter_schema", None) or {})
-        full_schema.update(dict(plugin.parameter_schema or {}))
-        order = list(getattr(plugin, "parameter_order", None) or (plugin.parameter_schema or {}).keys())
-        for key in (getattr(plugin, "base_parameter_schema", None) or {}):
-            if key not in order:
-                order.append(key)
-        labels = dict(getattr(plugin, "param_labels", None) or {})
-        for key, spec in (getattr(plugin, "base_parameter_schema", None) or {}).items():
-            labels.setdefault(key, spec.get("description") or self._human(key))
-
-        params = dict(cfg.get("params") or {})
-        lookback = cfg.get("lookback")
-
-        # Phase 14 P14-01: Individuelle Instanz-Beschreibung (bearbeitbar) –
-        # wird in ServiceInstanceConfig.description gespeichert und in
-        # Tooltip + Info-Dialog angezeigt.
-        desc_row = QHBoxLayout()
-        desc_label = QLabel("Beschreibung:")
-        desc_edit = QLineEdit()
-        desc_edit.setPlaceholderText("Individuelle Anmerkung für diese Instanz (optional)")
-        desc_edit.setText(str(cfg.get("description") or ""))
-        self._service_desc_controls[iid] = desc_edit
-        desc_edit.textChanged.connect(lambda _t, iid=iid: self._update_service_tooltip(iid))
-        desc_row.addWidget(desc_label)
-        desc_row.addWidget(desc_edit)
-        vl.addLayout(desc_row)
-
-        # Normale (Nicht-Expert-, Nicht-Darstellungs-)Parameter
-        form = QFormLayout()
-        for key in order:
-            spec = full_schema.get(key, {})
-            if spec.get("expert") or self._is_visual_key(key):
-                continue
-            cval = params.get(key, spec.get("default"))
-            # USER-REQ: P14-01 Nachtrag - Alt-Sets speichern die 6 Custom-Levels
-            # als Aggregat custom_levels (Liste/String) statt als Einzelparameter
-            # prox_level1..6 - leere Level-Felder werden daraus vorbefüllt.
-            if key.startswith("prox_level") and not cval:
-                try:
-                    from analytics.features.definitions.grid_lines_service import map_custom_levels_to_prox_levels
-                    cval = map_custom_levels_to_prox_levels(params).get(key, cval)
-                except Exception:
-                    pass
-            ctrl = self._create_param_control(key, cval, spec)
-            self._service_param_controls[(iid, key)] = ctrl
-            form.addRow(labels.get(key, self._human(key)), ctrl)
-        vl.addLayout(form)
-
-        # Expert-Parameter (inkl. lookback als Service-Instanz-Einstellung)
-        expert_keys = [k for k in order if full_schema.get(k, {}).get("expert")]
-        if expert_keys:
-            exp_grp = QGroupBox("Experten-Optionen")
-            exp_grp.setCheckable(True)
-            exp_grp.setChecked(False)
-            exp_grp.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-            ef = QFormLayout(exp_grp)
-            for key in expert_keys:
-                spec = full_schema.get(key, {})
-                if key == "lookback":
-                    cval = lookback if lookback is not None else spec.get("default")
-                else:
-                    cval = params.get(key, spec.get("default"))
-                ctrl = self._create_param_control(key, cval, spec)
-                self._service_param_controls[(iid, key)] = ctrl
-                ef.addRow(labels.get(key, self._human(key)), ctrl)
-            vl.addWidget(exp_grp)
-            self._setup_collapsible(exp_grp)
-
-        return col
-
-    def _rebuild_columns(self) -> None:
-        """Baut die Service-Spalten aus dem aktuellen Editor-Zustand neu."""
-        if self.service_columns_layout is None:
-            return
-        definition = self.collect_set_definition()
-        self._build_service_columns(definition)
-
     @Slot()
     def save_set(self) -> None:
         """Speichert das aktive Set – analog zur Preset-Verwaltung (generisch).
@@ -1141,7 +685,7 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
         Namensdialog (vorbelegt), leerer Name → Auto-Name aus den instance_ids
         (z.B. 'grid_1 + prox_1'), Überschreiben-Rückfrage bei doppeltem Namen.
         Implementierung: NamedItemActionsMixin.save_named_item() mit dem
-        Service-Set-Adapter (_ServiceSetItemAdapter).
+        Service-Set-Adapter (ServiceSetItemAdapter).
         """
         self.save_named_item(
             self._set_adapter,
@@ -1177,142 +721,16 @@ class ServiceWindow(ContentScrollMixin, NamedItemActionsMixin, PersistentWindow)
     def show_trash_dialog(self) -> None:
         """Öffnet den Papierkorb-Dialog für Service-Sets (P14-05).
 
-        Zeigt alle soft-gelöschten Sets (list_trash()) mit Name und
-        Lösch-Zeitstempel. Aktionen:
-          - Wiederherstellen  : restore_set_from_trash() verschiebt das Set
-                                zurück nach service_sets (das Set-Dropdown des
-                                Hauptfensters wird anschließend refresht).
-          - Endgültig löschen : purge_trash_set() mit doppelter Sicherheits-
-                                abfrage (Vorgang ist nicht umkehrbar).
-          - Papierkorb leeren : purge_trash() mit doppelter Sicherheits-
-                                abfrage (Vorgang ist nicht umkehrbar).
-
-        Der Dialog ist eine reine UI-Komponente: Er spricht ausschließlich
-        die Repository-API an (keine direkten SQL-Zugriffe) und protokolliert
-        jede Aktion über self.log(). Das endgültige Löschen/Bereinigen erfolgt
-        IMMER mit doppelter Sicherheitsnachfrage (User-Vorgabe P14-05).
+        Phase 15 U15-D1: Der Dialog ist in serviceui/trash_dialog.py als
+        eigenständige Widget-Klasse (ServiceSetTrashDialog) ausgelagert –
+        Verhalten unverändert (inkl. doppelter Sicherheitsnachfrage).
         """
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Papierkorb - Service-Sets")
-        dialog.setMinimumSize(440, 340)
-
-        layout = QVBoxLayout(dialog)
-        hint = QLabel(
-            "Soft-geloeschte Service-Sets (P14-05). Wiederherstellen verschiebt "
-            "das Set zurueck in die aktive Liste; endgueltiges Loeschen ist "
-            "nicht umkehrbar."
+        dialog = ServiceSetTrashDialog(
+            repo=self.set_repo,
+            log_fn=self.log,
+            refresh_fn=self.refresh_set_list,
+            parent=self,
         )
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-
-        trash_list = QListWidget()
-        layout.addWidget(trash_list, 1)
-
-        btn_row = QHBoxLayout()
-        btn_restore = QPushButton("Wiederherstellen")
-        btn_purge_one = QPushButton("Endgueltig loeschen")
-        btn_purge_all = QPushButton("Papierkorb leeren")
-        btn_close = QPushButton("Schliessen")
-        for b in (btn_restore, btn_purge_one, btn_purge_all, btn_close):
-            btn_row.addWidget(b)
-        layout.addLayout(btn_row)
-
-        def _reload() -> None:
-            trash_list.clear()
-            trash_items = self.set_repo.list_trash()
-            for item in trash_items:
-                name = item.get("display_name") or item.get("set_id") or "Unbenannt"
-                deleted_at = str(item.get("deleted_at") or "")
-                li = QListWidgetItem(f"{name}   (geloescht: {deleted_at})")
-                li.setData(Qt.UserRole, item.get("set_id"))
-                trash_list.addItem(li)
-            has_items = trash_list.count() > 0
-            btn_restore.setEnabled(has_items)
-            btn_purge_one.setEnabled(has_items)
-            btn_purge_all.setEnabled(has_items)
-            hint.setText(
-                "Der Papierkorb ist leer."
-                if not has_items
-                else "Soft-geloeschte Service-Sets (P14-05). Wiederherstellen "
-                     "verschiebt das Set zurueck in die aktive Liste; "
-                     "endgueltiges Loeschen ist nicht umkehrbar."
-            )
-
-        def _selected_id() -> Optional[str]:
-            item = trash_list.currentItem()
-            return item.data(Qt.UserRole) if item else None
-
-        def _restore() -> None:
-            set_id = _selected_id()
-            if not set_id:
-                return
-            if self.set_repo.restore_set_from_trash(set_id):
-                self.log(f"Set wiederhergestellt (P14-05): {set_id}")
-                _reload()
-                self.refresh_set_list()
-            else:
-                self.log(f"Set '{set_id}' nicht im Papierkorb gefunden.")
-
-        def _purge_selected() -> None:
-            set_id = _selected_id()
-            if not set_id:
-                return
-            # Doppelte Sicherheitsnachfrage - endgueltiges Loeschen ist nicht
-            # umkehrbar (User-Vorgabe P14-05).
-            first = QMessageBox.question(
-                dialog, "Endgueltig loeschen?",
-                "Das Set wird ENDGUELTIG geloescht und kann nicht "
-                "wiederhergestellt werden. Fortfahren?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            )
-            if first != QMessageBox.Yes:
-                return
-            second = QMessageBox.question(
-                dialog, "Wirklich endgueltig loeschen?",
-                "Dieser Vorgang ist NICHT umkehrbar. Das Set wird unwiderruflich "
-                "aus dem Papierkorb entfernt. Fortfahren?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            )
-            if second != QMessageBox.Yes:
-                return
-            if self.set_repo.purge_trash_set(set_id):
-                self.log(f"Set endgueltig geloescht (P14-05): {set_id}")
-                _reload()
-            else:
-                self.log(f"Set '{set_id}' nicht im Papierkorb gefunden.")
-
-        def _purge_all() -> None:
-            if trash_list.count() == 0:
-                return
-            # Doppelte Sicherheitsnachfrage - endgueltiges Loeschen ist nicht
-            # umkehrbar (User-Vorgabe P14-05).
-            first = QMessageBox.question(
-                dialog, "Papierkorb leeren?",
-                f"Alle {trash_list.count()} Sets im Papierkorb werden "
-                "ENDGUELTIG geloescht und koennen nicht wiederhergestellt "
-                "werden. Fortfahren?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            )
-            if first != QMessageBox.Yes:
-                return
-            second = QMessageBox.question(
-                dialog, "Wirklich Papierkorb leeren?",
-                "Dieser Vorgang ist NICHT umkehrbar. Alle Sets werden "
-                "unwiderruflich entfernt. Fortfahren?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            )
-            if second != QMessageBox.Yes:
-                return
-            count = self.set_repo.purge_trash()
-            self.log(f"Papierkorb geleert (P14-05): {count} Set(s) endgueltig entfernt.")
-            _reload()
-
-        btn_restore.clicked.connect(_restore)
-        btn_purge_one.clicked.connect(_purge_selected)
-        btn_purge_all.clicked.connect(_purge_all)
-        btn_close.clicked.connect(dialog.accept)
-
-        _reload()
         dialog.exec()
 
     # =========================================================================

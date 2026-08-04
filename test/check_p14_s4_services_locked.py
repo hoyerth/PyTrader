@@ -28,7 +28,7 @@ TEST_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 if os.path.exists(TEST_DB):
     os.remove(TEST_DB)
 
-from service_win import _sets_using_plugin, ServiceWindow  # noqa: E402
+from serviceui.service_win import _sets_using_plugin, ServiceWindow  # noqa: E402
 from analytics.engine.service_set_repository import ServiceSetRepository  # noqa: E402
 
 FAILURES: list = []

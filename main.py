@@ -39,7 +39,7 @@ from state_manager import StateManager
 from persistent_win import PersistentWindow
 from db_service import get_timeframes, TF_SECONDS_MAP, MT5_LOCK, DbPool
 import db_service
-from service_win import ServiceWindow
+from serviceui.service_win import ServiceWindow
 from statistic_win import StatisticWindow
 from properties_win import PropertiesWindow
 from config.app_settings import AppSettings

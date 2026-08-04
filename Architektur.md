@@ -88,7 +88,9 @@ PyTrader/
 ├── db_service.py                   # MT5-Sync, DbPool & Schema-Migrationen
 ├── main.py                         # Haupt-Orchestrator (MainWindow)
 ├── persistent_win.py               # Fenster-Persistence & Registry
-├── service_win.py                  # Service-Fenster (Set-Editor, Papierkorb, Sperren)
+├── serviceui/                       # Service-UI-Paket (Phase 15): service_win.py,
+│   │                               #  set_run_worker.py, set_item_adapter.py,
+│   │                               #  param_columns.py, trash_dialog.py, service_set_utils.py
 ├── statistic_win.py                # Statistik-Fenster
 ├── properties_win.py               # Properties-Fenster
 ├── scrollable_content.py           # Scrollbare Content-Mixin
