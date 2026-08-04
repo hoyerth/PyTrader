@@ -140,23 +140,6 @@
        </widget>
       </item>
       <item>
-       <widget class="QLabel" name="label_signal_set">
-        <property name="text">
-         <string>Signal-Set:</string>
-        </property>
-       </widget>
-      </item>
-      <item>
-       <widget class="QComboBox" name="combo_signal_filter">
-        <property name="minimumSize">
-         <size>
-          <width>140</width>
-          <height>0</height>
-         </size>
-        </property>
-       </widget>
-      </item>
-      <item>
        <spacer name="horizontalSpacer_filter">
         <property name="orientation">
          <enum>Qt::Orientation::Horizontal</enum>

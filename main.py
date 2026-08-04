@@ -257,13 +257,12 @@ class MainWindow(QMainWindow):
         self.tick_worker.ticks_ready.connect(self.on_ticks_ready)
         self.tick_worker.start()
 
-        # LiveAnalyzer für SILVER M1 (Bar-Close-Analyse)
+        # LiveAnalyzer für SILVER M1 (Plugin-Bar-Close-Evaluierung)
         self.live_analyzer: LiveAnalyzer = LiveAnalyzer(
             symbol="SILVER",
             timeframe="M1",
             lookback_bars=self.settings.feature_builder_limit,
         )
-        self.live_analyzer.new_live_signal.connect(self.on_live_signal)
         self.live_analyzer.log_message.connect(self._on_live_analyzer_log)
         self.live_analyzer.start()
 
@@ -542,20 +541,6 @@ class MainWindow(QMainWindow):
     # ==============================================================================
     # LiveAnalyzer Integration
     # ==============================================================================
-
-    @Slot(str, str, int, float, str)
-    def on_live_signal(self, symbol: str, timeframe: str, bar_time: int, confidence: float, source_id: str) -> None:
-        """Wird vom LiveAnalyzer emittiert, wenn ein neues Live-Signal erkannt wurde.
-        Aktualisiert das Chart-Overlay für das betroffene Symbol/TF."""
-        print(f"🔔 Live-Signal empfangen: {symbol} {timeframe} @ {bar_time} (conf={confidence:.2f})")
-
-        # Direkt an die Chart-Fenster weiterleiten (on_live_signal_received)
-        for win in list(self.chart_windows):
-            try:
-                if win.isVisible():
-                    win.on_live_signal_received(symbol, timeframe, bar_time, confidence, source_id)
-            except (RuntimeError, AttributeError):
-                pass
 
     @Slot(str)
     def _on_live_analyzer_log(self, message: str) -> None:

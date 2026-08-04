@@ -55,7 +55,6 @@ class StatisticWindow(PersistentWindow):
         # Controls
         self.combo_symbol: QComboBox = self.ui.findChild(QComboBox, "combo_symbol_filter")
         self.combo_tf: QComboBox = self.ui.findChild(QComboBox, "combo_tf_filter")
-        self.combo_signal: QComboBox = self.ui.findChild(QComboBox, "combo_signal_filter")
         self.btn_refresh: QPushButton = self.ui.findChild(QPushButton, "btn_refresh_stats")
 
         self.label_total: QLabel = self.ui.findChild(QLabel, "label_total_signals")
@@ -70,16 +69,11 @@ class StatisticWindow(PersistentWindow):
         self.btn_next: QPushButton = self.ui.findChild(QPushButton, "btn_next_page")
         self.label_page: QLabel = self.ui.findChild(QLabel, "label_page_info")
 
-        # Signal-Sets laden
-        self._load_signal_sets()
-
         # Events (nach restore_state, damit die gesetzten Filter keine refresh-Explosion auslösen)
         if self.combo_symbol:
             self.combo_symbol.currentTextChanged.connect(self._on_filter_changed)
         if self.combo_tf:
             self.combo_tf.currentTextChanged.connect(self._on_filter_changed)
-        if self.combo_signal:
-            self.combo_signal.currentTextChanged.connect(self.refresh)
         if self.btn_refresh:
             self.btn_refresh.clicked.connect(self.refresh)
         if self.btn_prev:
@@ -164,26 +158,13 @@ class StatisticWindow(PersistentWindow):
 
     # --- Daten laden ---
 
-    def _load_signal_sets(self):
-        if not self.combo_signal:
-            return
-        self.combo_signal.blockSignals(True)
-        self.combo_signal.clear()
-        self.combo_signal.addItem("ALLE")
-        for s in self.repo.get_available_sets():
-            self.combo_signal.addItem(s)
-        self.combo_signal.blockSignals(False)
-
     @Slot()
     def refresh(self):
         symbol = self.combo_symbol.currentText() if self.combo_symbol else "ALLE"
         tf = self.combo_tf.currentText() if self.combo_tf else "ALLE"
-        source = self.combo_signal.currentText() if self.combo_signal else None
-        if source == "ALLE":
-            source = None
 
         # Summary
-        summary = self.repo.get_summary(symbol, tf, source)
+        summary = self.repo.get_summary(symbol, tf)
         if self.label_total:
             self.label_total.setText(str(summary["total_signals"]))
         if self.label_avg_conf:
@@ -194,7 +175,7 @@ class StatisticWindow(PersistentWindow):
             self.label_best_tf.setText(summary["best_tf"])
 
         # Signale mit Paging
-        self._all_signals = self.repo.fetch_signals(symbol, tf, source, limit=self.settings.statistics_signal_limit)
+        self._all_signals = self.repo.fetch_signals(symbol, tf, limit=self.settings.statistics_signal_limit)
         self._total_pages = max(1, (len(self._all_signals) + self.settings.statistics_page_size - 1) // self.settings.statistics_page_size)
         self._current_page = 0
         self._render_current_page()

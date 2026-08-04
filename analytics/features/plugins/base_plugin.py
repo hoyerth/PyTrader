@@ -10,8 +10,8 @@ Thread-Sicherheit und eine klare Trennung zwischen Feature-Engine
 
 Feature-Store-Lese-Regel (präzisiert für Phase 13): Die INDIKATOR-Berechnung
 (GUI) liest NIE direkt aus dem Feature-Store; der Scanner schreibt NIE aus dem
-Render-Payload. Overlay-Konsumenten (SignalOverlay, Statistik) lesen den
-Feature-Store erst in Phase 13 Schritt 7.
+Render-Payload. Overlay-Konsumenten (Statistik) lesen den Feature-Store erst
+in Phase 13 Schritt 7.
 """
 
 from abc import ABC, abstractmethod

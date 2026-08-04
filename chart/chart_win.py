@@ -48,8 +48,6 @@ except ImportError:
 
 from db_service import MarketDataRepository, _parse_json_field, TF_SECONDS_MAP
 
-from chart.overlays.signal_overlay import SignalOverlay
-
 
 def find_null_fields(obj, path=""):
     """Sucht rekursiv nach None/null in Dictionaries und Listen."""
@@ -171,9 +169,6 @@ class PyTraderChartWindow(QMainWindow):
         self._settings_dialog: Optional[QDialog] = None
         self._page_loaded: bool = False
 
-        self.signal_overlay = SignalOverlay()
-        # Signal-Marker standardmaessig AUS, toggle via Button (📈)
-        self._signals_enabled: bool = False
         self._grid_serializer: Optional[GridDataSerializer] = None
         self._chart_serializer: Optional[ChartDataSerializer] = None
         # Debounce-Timer für Chart-Refresh (verhindert Race-Conditions bei schnellen Wechseln)
@@ -287,7 +282,6 @@ class PyTraderChartWindow(QMainWindow):
         self.tf_combo = self.ui_widget.findChild(QComboBox, "combo_tf")
         self.btn_reset = self.ui_widget.findChild(QPushButton, "btn_reset_chart")
         self.btn_indicator_liquidity = self.ui_widget.findChild(QPushButton, "btn_indicator_grid_liquidity")
-        self.btn_signal = self.ui_widget.findChild(QPushButton, "btn_signal_select")
         self.chart_container = self.ui_widget.findChild(QWidget, "web_container")
 
         if self.symbol_combo:
@@ -304,10 +298,6 @@ class PyTraderChartWindow(QMainWindow):
             self.btn_indicator_liquidity.clicked.connect(self.toggle_grid_liquidity_lines)
             self.btn_indicator_liquidity.installEventFilter(self)
         self.update_indicator_button_style()
-
-        if self.btn_signal:
-            self.btn_signal.setCheckable(True)
-            self.btn_signal.clicked.connect(self.on_signal_button_clicked)
 
         self.web_view = QWebEngineView()
         self.web_view.setPage(WebEngineConsolePage(self.web_view))
@@ -329,10 +319,6 @@ class PyTraderChartWindow(QMainWindow):
         self.web_view.page().setWebChannel(self.channel)
         self.web_view.setHtml(build_html_template(), QUrl("https://localhost"))
         self.web_view.loadFinished.connect(self._on_page_loaded)
-
-    def _auto_init_signal_set(self) -> None:
-        """Nicht mehr verwendet - Testsignal ist deaktiviert."""
-        pass
 
     def eventFilter(self, watched, event):
         # Rechtsklick auf den Plugin-Grid-Button → Einstellungen für 'grid_liquidity'
@@ -622,10 +608,7 @@ class PyTraderChartWindow(QMainWindow):
 
     def _apply_grid_render(self, lines_json: str, circles_json: str, grid_gen: int) -> None:
         """Übergibt serialisierte Grid-Daten an JS (wird im GUI-Thread aufgerufen).
-        Verwirft veraltete Ergebnisse, falls inzwischen ein neuerer Render lief.
-        Nach dem Grid-Render werden die Signal-Marker IMMER neu gesetzt –
-        so können aktive Signale (EMA, Grid-Proximity) durch den Grid-Render
-        nie verdrängt werden (Marker-Cache-Robustheit)."""
+        Verwirft veraltete Ergebnisse, falls inzwischen ein neuerer Render lief."""
         if grid_gen < self._grid_generation:
             print(f"⚠️ [GridRender] Veraltetes Ergebnis verworfen (gen={grid_gen} < {self._grid_generation})")
             return
@@ -638,13 +621,6 @@ class PyTraderChartWindow(QMainWindow):
             if circles_json:
                 self.web_view.page().runJavaScript(
                     f"if(window.renderGridCircles) renderGridCircles('{circles_json}');")
-            # Signale nach dem Grid-Render wiederherstellen (falls aktiv).
-            # Guard in _update_signal_markers_only verhindert Arbeit während
-            # eines laufenden Chart-Refreshes.
-            try:
-                self._update_signal_markers_only()
-            except Exception as e:
-                print(f"⚠️ [GridRender] Signal-Marker-Update fehlgeschlagen: {e}")
         except (RuntimeError, AttributeError):
             pass
 
@@ -766,7 +742,6 @@ class PyTraderChartWindow(QMainWindow):
             "precision": precision,
             "gridLines": grid_lines,
             "gridCircles": grid_circles,
-            "signalMarkers": self._get_signal_markers_for_update(),
             "measurementState": self.measurement_state,
             "timeMap": self._time_cont_to_real,
             # TF_SECONDS_MAP: Python ist die Single Source of Truth. JS nutzt
@@ -971,8 +946,8 @@ class PyTraderChartWindow(QMainWindow):
                 self.visible_price_from = self.visible_price_to = None
                 self.measurement_state = None
 
-            # Phase 13 7.B: Alt-Chart-Trigger (fill_gaps_for_pair) entfernt –
-            # keine signal_results-Writes mehr. Marker lesen feature_store.
+            # Phase 15: Alt-Signal-Trigger (fill_gaps_for_pair) entfernt –
+            # keine signal_results-Writes mehr, keine Signal-Marker.
             self.refresh_chart_data()
 
     def on_tf_changed(self, t):
@@ -1011,162 +986,9 @@ class PyTraderChartWindow(QMainWindow):
                 self.visible_price_from = self.visible_price_to = None
                 self.measurement_state = None
 
-            # Phase 13 7.B: Alt-Chart-Trigger (fill_gaps_for_pair) entfernt –
-            # keine signal_results-Writes mehr. Marker lesen feature_store.
+            # Phase 15: Alt-Signal-Trigger (fill_gaps_for_pair) entfernt –
+            # keine signal_results-Writes mehr, keine Signal-Marker.
             self.refresh_chart_data()
-
-    def on_signal_button_clicked(self):
-        """Schaltet ALLE Signal-Marker an/aus (Grid Proximity + EMA-Signale).
-        Testsignale (alternating_arrow_v1) bleiben deaktiviert.
-        Aktualisiert NUR die Signal-Marker, ohne Chart-Neubau."""
-        if not self.btn_signal:
-            return
-
-        self._signals_enabled = self.btn_signal.isChecked()
-        status = "AN" if self._signals_enabled else "AUS"
-        print(f"🔔 Signale: {status}")
-        self._update_signal_markers_only()
-
-    def _update_signal_markers_only(self) -> None:
-        """Aktualisiert NUR die Signal-Marker im Chart, OHNE kompletten Chart-Neubau.
-
-        HINWEIS: Bewusst KEIN _is_loading_data-Guard mehr. Der Grid-Render
-        (_apply_grid_render) ruft diese Funktion direkt nach dem Grid-Render
-        auf – waehrend eines laufenden Chart-Refreshes wuerde der Guard das
-        Signal-Update blockieren und die EMA-Marker waeren weg (Bug).
-        Die JS-seitige Marker-Kombination (Caches + _applyAllMarkers) ist
-        race-sicher, weil alle JS-Aufrufe sequenziell im Page-Thread laufen.
-        """
-        if not self._page_loaded or self.df_data is None or self.df_data.empty:
-            return
-
-        markers = self._get_signal_markers_for_update()
-        markers_json = json.dumps(markers, allow_nan=False)
-
-        # ======================================================================
-        # DEBUG-CHECK für Marker-Updates
-        # ======================================================================
-        try:
-            null_paths = find_null_fields(markers)
-            if null_paths:
-                print(f"🚨 [NULL MARKER in {self.current_symbol} {self.current_tf}] Gefundene null-Pfade:")
-                for p in null_paths[:10]:
-                    print(f"   -> markers{p}")
-        except Exception:
-            pass
-        # ======================================================================
-
-        try:
-            self.web_view.page().runJavaScript(
-                f"if(window.renderSignalMarkers) renderSignalMarkers({markers_json});"
-            )
-        except (RuntimeError, AttributeError) as e:
-            print(f"⚠️ [SignalMarker] JS-Fehler: {e}")
-
-    # ==============================================================================
-    # Live-Signal Integration (wird von MainWindow.on_live_signal gerufen)
-    # ==============================================================================
-
-    def on_live_signal_received(self, symbol: str, timeframe: str, bar_time: int, confidence: float, source_id: str) -> None:
-        """Wird vom MainWindow bei neuem Live-Signal gerufen.
-        Aktualisiert NUR die Marker, kein Chart-Neubau.
-        Blockiert waerend _is_loading_data (verhindert JS-Race-Condition)."""
-        if symbol != self.current_symbol or timeframe != self.current_tf:
-            return
-        if self._is_loading_data or not self._page_loaded:
-            return
-        self._update_signal_markers_only()
-
-    @staticmethod
-    def _apply_marker_styles(markers: List[Dict[str, Any]], source_id: str) -> List[Dict[str, Any]]:
-        """Wendet visuelle Stile auf Marker basierend auf source_id an.
-        Ermoeglicht Unterscheidung verschiedener Signal-Typen im Chart.
-        priority (int): Stapel-Reihenfolge bei gleicher Kerze in JS
-        (niedriger = näher an der Kerze, höher = weiter oben)."""
-        for m in markers:
-            if source_id == "alternating_arrow_v1":
-                # Alternierende Pfeile: Buy=arrowUp (oben), Sell=arrowDown (unten)
-                if m["time"] % 2 == 0:
-                    m["position"] = "belowBar"
-                    m["shape"] = "arrowUp"
-                    m["color"] = "#26a69a"  # Gruen
-                else:
-                    m["position"] = "aboveBar"
-                    m["shape"] = "arrowDown"
-                    m["color"] = "#ef5350"  # Rot
-                m["priority"] = 5
-            elif source_id in ("proximity", "grid_proximity_v1"):
-                # Grid-Proximity (feature_data) / Legacy: Kreise oberhalb
-                m["position"] = "aboveBar"
-                m["shape"] = "circle"
-                m["color"] = "#7B1FA2"  # Lila
-                m["priority"] = 10
-            elif source_id == "ema_atr_set_v1":
-                # EMA/ATR: Quadrate oberhalb
-                m["position"] = "aboveBar"
-                m["shape"] = "square"
-                m["color"] = "#FF9800"  # Orange
-                m["priority"] = 4
-            # Fuer neue Signalquellen hier einen eigenen Zweig ergaenzen.
-            # Ohne priority-Zweig gilt der JS-Default (0 = nahe an der Kerze).
-        return markers
-
-    def _get_signal_markers_for_update(self) -> List[Dict[str, Any]]:
-        """Sammelt alle Signal-Marker fuer den Chart-Update-Payload.
-        - Testsignal (alternating_arrow_v1): DEAKTIVIERT
-        - Grid Proximity (grid_proximity_v1): nur wenn Signal-Button aktiv
-        - EMA-Signale (ema_atr_set_v1): nur wenn Signal-Button aktiv
-        Marker-Zeiten werden auf Candle-Grenzen gerundet (exakter Match mit candleSeries in LWC v5)."""
-        if self.df_data is None or self.df_data.empty:
-            return []
-
-        t_sec = TF_SECONDS_MAP.get(str(self.current_tf).upper(), 60)
-
-        # 1) Testsignal (alternating_arrow_v1) DEAKTIVIERT – keine automatischen Test-Signale
-        markers: List[Dict[str, Any]] = []
-
-        # 2) Grid-Proximity (feature_data, feature_id='proximity') + EMA-Signale
-        #    NUR wenn der Signal-Button aktiv ist. Phase 13 Schritt 7.B:
-        #    BEIDE Marker-Quellen kommen aus dem feature_store (feature_id =
-        #    'proximity' bzw. 'ema_atr_set_v1') - der signal_results-Fallback
-        #    (Hybrid-Pfad) wurde entfernt.
-        if self._signals_enabled:
-            grid_markers = self._apply_marker_styles(
-                self.signal_overlay.fetch_markers(
-                    self.current_symbol, self.current_tf, "proximity"
-                ),
-                "proximity"
-            )
-            markers.extend(grid_markers)
-
-            ema_markers = self._apply_marker_styles(
-                self.signal_overlay.fetch_markers(
-                    self.current_symbol, self.current_tf, "ema_atr_set_v1"
-                ),
-                "ema_atr_set_v1"
-            )
-            markers.extend(ema_markers)
-
-        # Marker-Zeiten auf Candle-Grenzen runden + auf kontinuierliche Zeit mappen
-        if markers:
-            clean_markers = []
-            for m in markers:
-                mt = m.get("time")
-                if mt is None:
-                    continue
-                # Auf Candle-Timeframe-Grenze runden (z.B. H1: 3600er-Schritte)
-                rounded = int(mt) - (int(mt) % t_sec)
-                # Nur behalten + auf kontinuierliche Zeit mappen
-                if rounded in self._time_real_to_cont:
-                    m["time"] = self._time_real_to_cont[rounded]
-                    clean_markers.append(m)
-            markers = clean_markers
-            if markers:
-                print(f"   → Marker: {len(markers)} (kont. zeit, z.B. {markers[0]['time']})")
-            else:
-                print(f"   → KEINE Marker nach Filter! real_times samples={list(self._time_real_to_cont.keys())[:3]}")
-
-        return markers
 
     def fit_chart(self):
         try:

@@ -93,7 +93,6 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # Controls
         self.combo_symbol: QComboBox = self.ui.findChild(QComboBox, "combo_symbol")
         self.check_new_scan: QCheckBox = self.ui.findChild(QCheckBox, "check_new_scan")
-        self.check_grid_scan: QCheckBox = self.ui.findChild(QCheckBox, "check_grid_scan")
         self.btn_start: QPushButton = self.ui.findChild(QPushButton, "btn_start_scan")
         self.label_elapsed: QLabel = self.ui.findChild(QLabel, "label_elapsed_value")
         self.progress_bar: QProgressBar = self.ui.findChild(QProgressBar, "progress_bar")
@@ -285,33 +284,31 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
 
         symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
         new_scan = self.check_new_scan.isChecked() if self.check_new_scan else False
-        grid_scan = self.check_grid_scan.isChecked() if self.check_grid_scan else False
 
         # U15-D2 (Bedien-Feinschliff): Bestätigungsdialog vor FULL SCAN.
-        # new_scan=True löscht bestehende Signale und berechnet neu
-        # (HistoricalScanner: "Modus: FULL SCAN ... werden geloescht") –
+        # new_scan=True löscht bestehende Feature-Rows und berechnet neu
+        # (HistoricalScanner: "Modus: FULL SCAN ...") –
         # dieser Overwrite ist unwiderruflich, daher Rückfrage.
         if new_scan:
             reply = QMessageBox.question(
                 self, "Voll-Scan bestätigen",
                 f"Voll-Scan für {symbol}?\n\n"
-                "Bestehende Signale werden GELÖSCHT und neu berechnet "
-                "(unwiderruflich). Fortfahren?",
+                "Bestehende Feature-Rows werden überschrieben und neu "
+                "berechnet (unwiderruflich). Fortfahren?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
             if reply != QMessageBox.Yes:
                 self.log("Voll-Scan abgebrochen.")
                 return
 
-        mode = "GRID PROXIMITY" if grid_scan else "EMA+ATR STANDARD"
-        self.log(f"Starte {mode}-Scan: {symbol}, New Scan = {new_scan}")
+        self.log(f"Starte Plugin-Batch: {symbol}, New Scan = {new_scan}")
         self.btn_start.setEnabled(False)
         self._elapsed_seconds = 0
         self.label_elapsed.setText("00:00:00")
         self.progress_bar.setValue(0)
         self._elapsed_timer.start(1000)
 
-        self.scanner = HistoricalScanner(symbol, new_scan, grid_scan)
+        self.scanner = HistoricalScanner(symbol, new_scan)
         self.scanner.progress_updated.connect(self.on_progress)
         self.scanner.scan_finished.connect(self.on_finished)
         self.scanner.log_message.connect(self.log)
@@ -327,7 +324,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
     def on_finished(self, symbol: str, count: int):
         self._elapsed_timer.stop()
         self.btn_start.setEnabled(True)
-        self.log(f"Scan für {symbol} beendet: {count} Signale geschrieben.")
+        self.log(f"Scan für {symbol} beendet: {count} Feature-Rows geschrieben.")
 
     @Slot(str)
     def log(self, message: str):

@@ -3,10 +3,9 @@
 Statistics Repository – SQL-Aggregations-Queries auf feature_data
 (Proximity-Services, feature_id='proximity') + Forward-Performance.
 
-Phase 13 Schritt 7: Die Statistik liest die Treffer-Records künftig aus
-dem feature_store (feature_data der Proximity-Services) statt aus
-signal_results. statistic_win.py bleibt API-stabil – es ändert sich nur
-die Datenquelle, nicht das Fenster.
+Die Statistik liest die Treffer-Records aus dem feature_store
+(feature_data der Proximity-Services); signal_results-Tabellen existieren
+seit Phase 15 nicht mehr.
 
 Da die feature_store-Tabelle KEINE set_id-Spalte hat, ist das 'Set' im
 neuen Datenmodell die feature_id (Plugin-Identität, z. B. 'proximity').

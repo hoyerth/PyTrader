@@ -219,7 +219,7 @@ def check_and_init_databases() -> None:
 		);
 	""")
 
-	# Phase 1: Analytics-Tabellen für Signal-Engine
+	# Analytics-Tabelle für Feature-/Plugin-Daten
 	con_analytics.execute("""
 		CREATE TABLE IF NOT EXISTS feature_store (
 			symbol      VARCHAR NOT NULL,
@@ -241,35 +241,6 @@ def check_and_init_databases() -> None:
 	con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_id VARCHAR;")
 	con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS plugin_version VARCHAR;")
 	con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_data JSON;")
-
-	con_analytics.execute("""
-		CREATE TABLE IF NOT EXISTS signal_definitions (
-			signal_id   VARCHAR PRIMARY KEY,
-			category    VARCHAR NOT NULL,
-			version     VARCHAR,
-			params      JSON
-		);
-	""")
-	con_analytics.execute("""
-		CREATE TABLE IF NOT EXISTS signal_sets (
-			set_id          VARCHAR PRIMARY KEY,
-			configuration   JSON NOT NULL,
-			logic           VARCHAR NOT NULL
-		);
-	""")
-	con_analytics.execute("""
-		CREATE TABLE IF NOT EXISTS signal_results (
-			event_id        VARCHAR PRIMARY KEY,
-			symbol          VARCHAR NOT NULL,
-			timeframe       VARCHAR NOT NULL,
-			bar_time        TIMESTAMPTZ NOT NULL,
-			source_id       VARCHAR NOT NULL,
-			confidence      DOUBLE,
-			context_type    VARCHAR NOT NULL,
-			metadata_payload JSON,
-			created_at      TIMESTAMP DEFAULT current_timestamp
-		);
-	""")
 
 	con_app = DbPool.get(DB_APP_DATA)
 	con_app.execute("""

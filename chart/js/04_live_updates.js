@@ -241,7 +241,6 @@ function applyFullChartUpdate(data) {
         // Alte Resourcen entfernen
         try { clearGridCircles(); } catch(e) {}
         try { clearGridLines(); } catch(e) {}
-        try { clearSignalMarkers(); } catch(e) {}
         if (currentPriceLine) {
             try { if (candleSeries) candleSeries.removePriceLine(currentPriceLine); } catch(e) {}
             currentPriceLine = null;
@@ -265,7 +264,6 @@ function applyFullChartUpdate(data) {
         _circleSeries = [];
         _circleMarkerPlugins = [];
         _circleLevelSeries = {};
-        seriesMarkersPlugin = null;
         try { DaySeparator.clear(); } catch(e) {}
 
         var container = document.getElementById('chart-container');
@@ -396,16 +394,7 @@ function applyFullChartUpdate(data) {
             console.warn('[applyFullChartUpdate] Schritt 6 (gridCircles) fehlgeschlagen:', e.message || e);
         }
 
-        // Schritt 7: Signal-Marker (eigenes Marker-Layer auf candleSeries;
-        // Proximity-Circles liegen separat auf ihren Level-Serien).
-        try {
-            _storedSignalMarkersData = data.signalMarkers || [];
-            _applyAllMarkers();
-        } catch(e) {
-            console.warn('[applyFullChartUpdate] Schritt 7 (signalMarkers) fehlgeschlagen:', e.message || e);
-        }
-
-        // Schritt 8: Range
+        // Schritt 7: Range
         try {
             if (data.rangeFrom !== undefined && data.rangeTo !== undefined &&
                 data.rangeFrom !== null && data.rangeTo !== null &&
@@ -416,15 +405,15 @@ function applyFullChartUpdate(data) {
                 if (chart) chart.timeScale().fitContent();
             }
         } catch(e) {
-            console.warn('[applyFullChartUpdate] Schritt 8 (applyRange) fehlgeschlagen:', e.message || e);
+            console.warn('[applyFullChartUpdate] Schritt 7 (applyRange) fehlgeschlagen:', e.message || e);
         }
 
-        // Schritt 9: Day Separators (gekapseltes Modul, CSS-Overlay)
+        // Schritt 8: Day Separators (gekapseltes Modul, CSS-Overlay)
         try { DaySeparator.render(rawCandleData); } catch(e) {
-            console.warn('[applyFullChartUpdate] Schritt 9 (daySeparators) fehlgeschlagen:', e.message || e);
+            console.warn('[applyFullChartUpdate] Schritt 8 (daySeparators) fehlgeschlagen:', e.message || e);
         }
 
-        // Schritt 10: Measurement-State wiederherstellen (Messbox nach Refresh
+        // Schritt 9: Measurement-State wiederherstellen (Messbox nach Refresh
         // bzw. Fenster-Neustart). Ohne State im Payload wird die Box geleert.
         try {
             if (window.Measurement) {
@@ -435,7 +424,7 @@ function applyFullChartUpdate(data) {
                 }
             }
         } catch(e) {
-            console.warn('[applyFullChartUpdate] Schritt 10 (measurement) fehlgeschlagen:', e.message || e);
+            console.warn('[applyFullChartUpdate] Schritt 9 (measurement) fehlgeschlagen:', e.message || e);
         }
 
         // Fertig – isUpdatingChart freigeben + initialen sync

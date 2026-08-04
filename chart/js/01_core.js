@@ -41,8 +41,6 @@ let _updateId = 0;
 let _lastAppliedUpdateId = 0; // höchste akzeptierte updateId (Race-Guard)
 let _continuousTimeMap = {};  // { cont_time: real_epoch } für tickMarkFormatter
 let _continuousKeys = [];     // sortierte cont-Schlüssel für resolveRealTime()
-// LWC v5: setMarkers() auf der Serie existiert nicht mehr – SeriesMarkers-Plugin verwenden
-let seriesMarkersPlugin = null;
 
 let isWindowActive = true;
 let lastRenderedPrice = null;

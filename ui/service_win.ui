@@ -68,17 +68,7 @@
          <string>New Scan</string>
         </property>
         <property name="toolTip">
-         <string>Aktiviert: Löscht bestehende Signale und führt Komplett-Scan durch. Deaktiviert: Nur Delta-Update (fehlende Bars).</string>
-        </property>
-       </widget>
-      </item>
-      <item>
-       <widget class="QCheckBox" name="check_grid_scan">
-        <property name="text">
-         <string>Grid Scan</string>
-        </property>
-        <property name="toolTip">
-         <string>Grid Proximity Signal (Composite, Phase 11) statt Standard EMA+ATR.</string>
+         <string>Aktiviert: Löscht bestehende Feature-Rows und führt Komplett-Scan durch. Deaktiviert: Nur Delta-Update (fehlende Bars).</string>
         </property>
        </widget>
       </item>

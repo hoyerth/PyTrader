@@ -27,13 +27,13 @@ for sym, tf in pairs:
     except Exception as e:
         print(f"{sym:7s} {tf:4s} -> ERROR: {e}")
 
-# Marker-Query (SignalOverlay.fetch_markers) – Phase 13 7.B: feature_store
-# (feature_data, feature_id), KEIN signal_results-Fallback mehr.
+# Marker-Query (feature_store, feature_id) – Phase 15: Alt-Signale
+# (grid_proximity_v1, ema_atr_set_v1) entfernt. Aktiv sind nur noch die
+# Plugin-IDs 'proximity' und 'grid_liquidity'.
 acon = duckdb.connect(str(ANALYTICS), read_only=True)
-print("\n--- fetch_markers queries (feature_store, feature_id) ---")
-for sym, tf, fid in [("SILVER", "H1", "grid_proximity_v1"), ("SILVER", "M5", "grid_proximity_v1"),
-                     ("GOLD", "H1", "grid_proximity_v1"),
-                     ("SILVER", "H1", "ema_atr_set_v1"), ("SILVER", "H1", "proximity")]:
+print("\n--- feature_store queries (feature_id, Plugin-Daten) ---")
+for sym, tf, fid in [("SILVER", "H1", "proximity"), ("SILVER", "M5", "proximity"),
+                     ("GOLD", "H1", "proximity"), ("SILVER", "H1", "grid_liquidity")]:
     try:
         rows = acon.execute("""
             SELECT EXTRACT(epoch FROM bar_time)::BIGINT AS time_epoch, feature_data
