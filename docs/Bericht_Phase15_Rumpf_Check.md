@@ -1,4 +1,4 @@
-# Bericht: Prüfung des Phase-15-Rumpfs (`docs/x_roadmap_Phase15.md`)
+# Bericht: Prüfung des Phase-15-Rumpfs (`Old/x_Roadmap_Phase15.md`)
 
 Stand: 04.08.2026 · Basis: Git HEAD `fc27094` (P14 abgeschlossen, Phase 15 noch nicht begonnen)
 
@@ -24,7 +24,7 @@ Geprüfte Module u. a.: `analytics/features/feature_builder.py`, `analytics/feat
 
 - **Phase 15 ist ein unvollständiger Rumpf:** Kap. 1 enthält den Platzhalter `<auformulieren>`
   (Zielsetzung fehlt), Kap. 2 + 3 sind formuliert, konkrete Kapitel/Module (15.x) existieren noch nicht.
-- **Git-Status:** `docs/x_roadmap_Phase15.md` ist im Zustand „AM" (neu gestaged + modifiziert).
+- **Git-Status:** `Old/x_Roadmap_Phase15.md` ist im Zustand „AM" (neu gestaged + modifiziert).
 - **Wichtig:** `docs/AKTUELLE_UMSETZUNG.md` (laut System-Regeln die verbindliche Hauptanweisung)
   ist seit Commit `fc27094` („x", 03.08.2026) **leer (0 Bytes)** – die Hauptanweisung fehlt derzeit.
 - P14 ist vollständig umgesetzt (P14-01 … P14-05, Abschluss-Doku in `f2fb88f`/`5212b3a`).

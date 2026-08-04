@@ -3,7 +3,7 @@
 ## 1. Übersicht & Zielsetzung
 
 Ziel von **Phase 15** ist die Weiterentwicklung der **Service-UI** (`service_win.py`)
-und des **gesamten Analytics-Moduls** (`analytics/`) auf Basis der etablierten
+und des **gesamten Analytics-Moduls** (`../../analytics`) auf Basis der etablierten
 Plugin-/Service-Architektur (Phasen 12–14). Abgeleitete Modul-Struktur:
 
 * **15.1 Service-UI:** Modularisierung der gewachsenen `service_win.py` (≈ 1.400
@@ -24,14 +24,14 @@ Jedes Modul enthält direkt im Anschluss die vollständige, isolierte **Schritt-
 
 1. **HARTE VERBOTSREGEL (Bestands-Pfade):**
    Geschützte Dateien (niemals beschädigen, bestehende Aufrufe unverändert lassen):
-   * `../chart/indicators/grid_liquidity.py` – Plugin-Indikator (Service-Pipeline-Adapter, Cache, feature_store-Lesepfad).
+   * `../../chart/indicators/grid_liquidity.py` – Plugin-Indikator (Service-Pipeline-Adapter, Cache, feature_store-Lesepfad).
    Neue Logiken werden **additiv** integriert (Wrapper/Schnittstellen).
 
 2. **Git-Backup & Fallback vor JEDEM Kapitel:**
 Vor Beginn jedes Kapitels erstellt die AI / der User automatisch einen Git-Commit und Tag: `phase15_step1`, `phase15_step2`, etc. Bei Fehlern wird sofort per `git reset --hard` auf das jeweilige Tag zurückgerollt.
 
 3. **Headless-Validierung (Keine UI- und Keine unnötigen (Regressions-)tests):**
-Validierungen erfolgen rein headless (kein `QApplication.exec()`, keine manuellen Klicks) über gezielte PyTest- / Headless-Python-Skripte im Ordner `../test`. Es werden ausschließlich die für den jeweiligen Schritt absolut notwendigen Tests ausgeführt – keine unnötigen (Regressions-)tests.
+Validierungen erfolgen rein headless (kein `QApplication.exec()`, keine manuellen Klicks) über gezielte PyTest- / Headless-Python-Skripte im Ordner `../../test`. Es werden ausschließlich die für den jeweiligen Schritt absolut notwendigen Tests ausgeführt – keine unnötigen (Regressions-)tests.
 
 4. **Modulare Herauskoppelbarkeit:**
 Jedes Kapitel ist so aufgebaut, dass Beschreibung, Schema-Änderung, Implementierungsanleitung, die allgemeinen Grundsätze und der notwendige Test als zusammenhängender Block an die IDE-AI übergeben werden können.
@@ -54,7 +54,7 @@ Vor jeglicher Code-Implementierung gelten folgende unumstößliche System-Regeln
 Der Indicator ruft niemals direkt Plugins zur Neuberechnung auf.
 **Präzisierung (Empfehlung 1):** Die Konzeptklasse heißt `PluginContext` (Begriff
 „EvaluationContext" ist vereinheitlicht; die reale Klasse liegt in
-`analytics/features/plugins/base_plugin.py`). Abbauziel 15.2: Der noch vorhandene
+`../../analytics/features/plugins/base_plugin.py`). Abbauziel 15.2: Der noch vorhandene
 Pipeline-Fallback in `grid_liquidity.calculate()` wird additiv durch einen reinen
 DB-Lesepfad ersetzt.
 3. **ID-Semantik:**
@@ -75,7 +75,7 @@ DB-Lesepfad ersetzt.
 (Session-State, Quarantäne) und `FeatureStore` (Cache-Invalidierung) erfolgt über
 `RLock` (Thread-Safety).
 **Präzisierung (Empfehlung 3):** DB-Zugriff erfolgt bewusst **lock-frei** über
-Thread-local `DbPool` (`db_service.py`, eine Connection pro Thread & DB) – globale
+Thread-local `DbPool` (`../../db_service.py`, eine Connection pro Thread & DB) – globale
 Threading-Locks auf Datenbankebene sind kontraproduktiv und werden nicht verwendet.
 8. **Logging & Migration Rollback:**
 * Logging verwendet strukturierte Fehlerobjekte (inkl. `timestamp`, `plugin`, `instance`, `symbol`, `timeframe`, `bar`, `exception`, `traceback`).
@@ -90,7 +90,7 @@ Der noch vorhandene Service-Pipeline-Fallback in `calculate()` ist **Abbauziel 1
 (U15-A2).
 11. **Quarantäne-Recovery (Lebensdauer):** Der `_failure_counters`-Zähler jeder Service-Instanz wird nach 300 Sekunden (5 Minuten) ohne weiteren Fehler automatisch zurückgesetzt (`_recovery_timer`). Eine einmalige Quarantäne (`quarantined = True`) bleibt für die laufende Session bestehen, bis der Evaluator einen vollständigen Neustart der Pipeline durchläuft (`reset()`).
 12. **Hot-Reload Lifecycle:** `PluginRegistry.reload()` führt folgende atomare Schritte unter dem `RLock()` aus:
-    a) Erfassen der aktuell geladenen Custom-Modul-Namen (`../data/custom_plugins`).
+    a) Erfassen der aktuell geladenen Custom-Modul-Namen (`../../data/custom_plugins`).
     b) Gezieltes `importlib.reload(sys.modules[mod_name])` NUR für diese Module.
     c) Erneute Ausführung von `discover_plugins()` mit anschließendem Überschreiben des internen `plugins`-Dictionaries.
     d) WICHTIG: Bereits laufende Service-Instanzen (`LiveAnalyzer`, historische Berechnungen) behalten ihre alte Objekt-Referenz; neue Service-Instanzen nutzen die neuen Klassen.
@@ -106,12 +106,12 @@ Der noch vorhandene Service-Pipeline-Fallback in `calculate()` ist **Abbauziel 1
 ### 1.1 Zielsetzung & Anwendungsbereich
 Die Anforderung definiert eine zentral wiederverwendbare Symbol-Verwaltung mit Favoriten-Unterstützung für PyTrader.
 * **Kernaufgabe:** Dynamische Ermittlung aller Broker-Symbole über MetaTrader5 (MT5), Persistierung in `app_data.duckdb` (als Cache/Offline-Fallback), Verwaltung einer Favoriten-Liste und Bereitstellung einer generischen UI-Komponente für alle Fenster (`ServiceWindow`, `StatisticWindow`/Analytics etc.).
-* **Entkopplungs-Garantie:** Gemäß den Architektur-Regeln (OOP, IoC) wird die Symbol-Logik in Repositories/Helfer gekapselt (`db_service.py` / `state_manager.py`). Es entstehen keine zirkulären Abhängigkeiten.
+* **Entkopplungs-Garantie:** Gemäß den Architektur-Regeln (OOP, IoC) wird die Symbol-Logik in Repositories/Helfer gekapselt (`../../db_service.py` / `../../state_manager.py`). Es entstehen keine zirkulären Abhängigkeiten.
 
 ### 1.2 Detaillierte Bausteine & Spezifikation
 1. **Broker-Fetch & Persistenz (`get_symbols`):**
    * Liest alle verfügbaren Symbole live via `MetaTrader5.symbols_get()` aus.
-   * Speichert/aktualisiert die vollständige Liste sowie den Favoriten-Status (`is_favorite` boolean) in der DuckDB `data/app_data.duckdb` (neue Tabelle `broker_symbols`).
+   * Speichert/aktualisiert die vollständige Liste sowie den Favoriten-Status (`is_favorite` boolean) in der DuckDB `../../data/app_data.duckdb` (neue Tabelle `broker_symbols`).
    * Falls MT5 offline ist oder fehlschlägt: Ausgabe einer Log-Warnung und automatisches Ausweichen auf den zuletzt persistierten Datenstand in `app_data.duckdb`.
 2. **Favoriten-Dropdown in den Hauptfenstern (`service_win`, `statistic_win` etc.):**
    * Zeigt in den UI-ComboBoxen ausschließlich Symbole an, deren Favoriten-Status `is_favorite == True` ist.
@@ -134,7 +134,7 @@ Die Anforderung definiert eine zentral wiederverwendbare Symbol-Verwaltung mit F
 ## 2. VORBEREITUNG, BACKUP & TESTING-STRATEGIE (OHNE UI)
 
 ### 2.1 Sicherheits-Backup (Vorab-Schritt)
-Vor Code-Änderungen wird ein lokaler Git-Commit erzeugt und der `test/`-Ordner gesichert.
+Vor Code-Änderungen wird ein lokaler Git-Commit erzeugt und der `../../test`-Ordner gesichert.
 ```bash
 git add -A
 git commit -m "backup: vor Umsetzung Phase 15.01 Symbol-Auswahl und Favoriten"
@@ -165,9 +165,9 @@ Die Verifizierung erfolgt ausschließlich über:
 
 ## 3. SCHRITT-FÜR-SCHRITT UMSETZUNGSANLEITUNG
 
-### Schritt 1: Datenbank-Schema in `db_service.py` & `state_manager.py` erweitern
+### Schritt 1: Datenbank-Schema in `../../db_service.py` & `../../state_manager.py` erweitern
 
-1. In `db_service.py` (`check_and_init_databases`) die Tabelle `broker_symbols` in `app_data.duckdb` anlegen:
+1. In `../../db_service.py` (`check_and_init_databases`) die Tabelle `broker_symbols` in `app_data.duckdb` anlegen:
 ```sql
 CREATE TABLE IF NOT EXISTS broker_symbols (
     symbol VARCHAR PRIMARY KEY,
@@ -181,14 +181,14 @@ CREATE TABLE IF NOT EXISTS broker_symbols (
 
 2. Standard-Favoriten (`SILVER`, `GOLD`, `BTCUSD`) bei leerer Tabelle initial per Upsert einfügen (`is_favorite = TRUE`).
 
-### Schritt 2: Kerndaten-Logik in `db_service.py` implementieren
+### Schritt 2: Kerndaten-Logik in `../../db_service.py` implementieren
 
 1. Funktion `get_broker_symbols(force_fetch: bool = False) -> List[Dict[str, Any]]` erstellen:
 * **Primary:** Versucht MT5-Verbindung via `check_mt5_connection()` und `mt5.symbols_get()`. Speichert gefundene Symbole per `INSERT OR REPLACE` in `broker_symbols` (Favoriten-Status `is_favorite` bestehender Symbole bleibt erhalten).
 * **Fallback:** Bei MT5-Fehler/Offline Log-Ausgabe (`⚠️ MT5 nicht erreichbar – nutze lokale Symbol-Datenbank`) und Auslesen aller Symbole aus `app_data.duckdb`.
 
 
-2. Hilfsfunktionen zur Favoriten-Verwaltung in `state_manager.py` / `db_service.py`:
+2. Hilfsfunktionen zur Favoriten-Verwaltung in `../../state_manager.py` / `../../db_service.py`:
 * `get_favorite_symbols() -> List[str]`: Liefert nur Symbole mit `is_favorite == TRUE`.
 * `toggle_symbol_favorite(symbol: str, is_fav: bool) -> None`: Aktualisiert den Status in `app_data.duckdb`.
 
@@ -212,13 +212,13 @@ CREATE TABLE IF NOT EXISTS broker_symbols (
 
 
 
-### Schritt 4: Integration in `ServiceWindow` (`serviceui/service_win.py`)
+### Schritt 4: Integration in `ServiceWindow` (`../../serviceui/service_win.py`)
 
 1. In der UI/Layout-Erstellung neben `combo_symbol` einen kleinen Button `btn_symbol_fav` mit Beschriftung `★` einbauen.
 2. Klick auf `btn_symbol_fav` öffnet `SymbolsWindow` als nicht-modale Singleton-Instanz (`SymbolsWindow.get_existing_instance()`).
 3. Koppelung von `symbols_win.favorites_changed` an die Aktualisierung von `combo_symbol` (lädt `get_favorite_symbols()` neu und behält aktuelle Auswahl bei).
 
-### Schritt 5: Integration in `StatisticWindow` (`statistic_win.py`) / Analytics
+### Schritt 5: Integration in `StatisticWindow` (`../../statistic_win.py`) / Analytics
 
 1. Gleichen Favoriten-Button (`★`) neben dem Symbol-Filter-Combo platzieren.
 2. Signal-Koppelung analog zu Schritt 4 zur dynamischen Aktualisierung der Favoriten-Auswahl.
@@ -229,7 +229,7 @@ CREATE TABLE IF NOT EXISTS broker_symbols (
 * Prüft DB-Table-Creation, Symbol-Fetch, Favoriten-Toggle und Fallback-Handling ohne MT5.
 
 
-2. Syntax-Check auf allen geänderten/neuen Modulen (`main.py`, `db_service.py`, `state_manager.py`, `serviceui/symbols_win.py`, `serviceui/service_win.py`, `statistic_win.py`).
+2. Syntax-Check auf allen geänderten/neuen Modulen (`../../main.py`, `../../db_service.py`, `../../state_manager.py`, `serviceui/symbols_win.py`, `../../serviceui/service_win.py`, `../../statistic_win.py`).
 
 ---
 
@@ -237,11 +237,11 @@ CREATE TABLE IF NOT EXISTS broker_symbols (
 
 | Datei | Status | Beschreibung |
 | --- | --- | --- |
-| `db_service.py` | **Anpassung** | Tabelle `broker_symbols` initialisieren, `get_broker_symbols()` mit MT5/DB-Fallback & `toggle_symbol_favorite()` |
-| `state_manager.py` | **Anpassung** | Helper-Methoden `get_favorite_symbols()` & `set_symbol_favorite()` ergänzen |
+| `../../db_service.py` | **Anpassung** | Tabelle `broker_symbols` initialisieren, `get_broker_symbols()` mit MT5/DB-Fallback & `toggle_symbol_favorite()` |
+| `../../state_manager.py` | **Anpassung** | Helper-Methoden `get_favorite_symbols()` & `set_symbol_favorite()` ergänzen |
 | `serviceui/symbols_win.py` | **NEU** | Nicht-modales `SymbolsWindow` (PersistentWindow) mit Suchfeld, 2-Spalten-Tabelle & Favoriten-Toggle |
-| `serviceui/service_win.py` | **Anpassung** | Favoriten-Button (`★`) einbauen, DropDown auf Favoriten umstellen, Sync-Signal verbinden |
-| `statistic_win.py` | **Anpassung** | Favoriten-Button (`★`) einbauen, DropDown auf Favoriten umstellen, Sync-Signal verbinden |
+| `../../serviceui/service_win.py` | **Anpassung** | Favoriten-Button (`★`) einbauen, DropDown auf Favoriten umstellen, Sync-Signal verbinden |
+| `../../statistic_win.py` | **Anpassung** | Favoriten-Button (`★`) einbauen, DropDown auf Favoriten umstellen, Sync-Signal verbinden |
 | `test/check_p15_s1_symbols.py` | **NEU** | Headless-Test für Symbol-Fetch, DB-Persistenz und Favoriten-Logik (ohne UI) |
 
 ---
@@ -332,7 +332,7 @@ Die Verifizierung erfolgt ausschließlich über:
 
 ## 3. SCHRITT-FÜR-SCHRITT UMSETZUNGSANLEITUNG
 
-### Schritt 1: Layout-Erweiterung & Vergrößerung in `serviceui/service_win.py`
+### Schritt 1: Layout-Erweiterung & Vergrößerung in `../../serviceui/service_win.py`
 
 1. Fenstergröße auf **1280 x 800 Pixel** anpassen.
 2. Umbau des Hauptfensters mit `QSplitter` (horizontal):
@@ -396,8 +396,8 @@ Aufbau des TreeWidgets mit folgenden Hauptknoten:
 
 | Datei | Status | Beschreibung |
 | --- | --- | --- |
-| `serviceui/service_win.py` | **Anpassung** | Umbau auf Splitter (1280x800), Master-Tree (`QTreeWidget`) mit Drag & Drop, Standalone-Services & kompakter Indikator-Statusanzeige |
-| `analytics/engine/service_set_repository.py` | **Anpassung** | Helper zum schnellen Hinzufügen/Einfügen von Einzel-Services in bestehende Sets |
+| `../../serviceui/service_win.py` | **Anpassung** | Umbau auf Splitter (1280x800), Master-Tree (`QTreeWidget`) mit Drag & Drop, Standalone-Services & kompakter Indikator-Statusanzeige |
+| `../../analytics/engine/service_set_repository.py` | **Anpassung** | Helper zum schnellen Hinzufügen/Einfügen von Einzel-Services in bestehende Sets |
 | `test/check_p15_s2_service_tree.py` | **NEU** | Headless-Test für Tree-Datenstrukturen, Indikator-Live-Status & Set-Updates (ohne UI) |
 
 ---
@@ -412,7 +412,7 @@ Das Konzept für **Phase 15.02** ist vollständig ausgearbeitet. Ich warte nun a
 ## 1. SPEZIFIKATION & ARCHITEKTUR (15.03)
 
 ### 1.1 Zielsetzung & Modul-Ablage
-Das alte `StatisticWindow` (`statistic_win.py`) wird vollständig durch das neue, modulare `AnalyticsWindow` ersetzt[cite: 1, 2].
+Das alte `StatisticWindow` (`../../statistic_win.py`) wird vollständig durch das neue, modulare `AnalyticsWindow` ersetzt[cite: 1, 2].
 * **Speicherort:** `analytics/ui/analytics_win.py`
 * **Fenster-Typ:** Nicht-modales `PersistentWindow` (INSTANCE_ID = `"win_analytics"`, Min-Größe `1280 x 800` Pixel)[cite: 1, 2].
 * **Architektur:** Master-Stacked Layout (`QSplitter` + `QStackedWidget` für Lazy Loading) mit strikter Trennung von UI-Rendering (`pyqtgraph` / `QTableWidget`) und Hintergrund-Berechnung (`DuckDB` + `PySide6 Async Worker`).
@@ -422,7 +422,7 @@ Das alte `StatisticWindow` (`statistic_win.py`) wird vollständig durch das neue
 #### 1. Header: Globale Aktionsleiste (Top-Bar)
 `[ Profile: ▾ Profile_Name ]` `[➕ New]` `[💾 Save]` `[📋 Clone]` `[🗑️ Delete]` `|` `Symbol: [ SILVER ▾ ] [★]` `TF: [ M1 ▾ ]` `[ Refresh 🔄 ]`
 * **Profil-Management (CRUD):**
-  * `analytics_profiles`-Tabelle in `data/app_data.duckdb` speichert Konfigurationen als JSON (`profile_id`, `name`, `symbols`, `timeframes`, `service_sets`, `time_filters`, `ml_models`, `is_active`).
+  * `analytics_profiles`-Tabelle in `../../data/app_data.duckdb` speichert Konfigurationen als JSON (`profile_id`, `name`, `symbols`, `timeframes`, `service_sets`, `time_filters`, `ml_models`, `is_active`).
   * **Explicit Save (Option B):** Nach Parameter- / Slider-Änderungen wird der Profilname mit einem Dirty-State Marker versehen (`*` im Titel / Profile-Combo). Änderungen werden erst beim Klick auf `[💾 Save]` in DuckDB geschrieben.
 * **Symbol & Timeframe:** Nutzt die in 15.01 erstellten Favoriten-Logiken[cite: 1, 2, 3].
 
@@ -477,7 +477,7 @@ Die Verifizierung erfolgt ausschließlich über:
 
 ### Schritt 1: DB-Schema & Repository erweitern
 
-1. In `state_manager.py` / `db_service.py` die Tabelle `analytics_profiles` anlegen:
+1. In `../../state_manager.py` / `../../db_service.py` die Tabelle `analytics_profiles` anlegen:
 
 CREATE TABLE IF NOT EXISTS analytics_profiles (
     profile_id VARCHAR PRIMARY KEY,
@@ -489,7 +489,7 @@ CREATE TABLE IF NOT EXISTS analytics_profiles (
 );
 
 
-2. Repository-Helper zur Verwaltung von Analytics-Profilen (`get_profile`, `save_profile`, `delete_profile`, `list_profiles`) in `state_manager.py` implementieren.
+2. Repository-Helper zur Verwaltung von Analytics-Profilen (`get_profile`, `save_profile`, `delete_profile`, `list_profiles`) in `../../state_manager.py` implementieren.
 
 
 ### Schritt 2: Analytics Data Worker (`analytics/engine/analytics_worker.py`) erstellen
@@ -516,8 +516,8 @@ CREATE TABLE IF NOT EXISTS analytics_profiles (
 3. **Jump-to-Chart Anbindung:**
 * Klick-Events auf Tabellenzeilen, Heatmap-Zellen oder Scatter-Punkte erfassen und `open_chart_at_bar(symbol, tf, bar_time)` des Main-Windows auslösen.
 
-4. **Ersetzung in `main.py`:**
-* Import von `StatisticWindow` in `main.py` entfernen und durch `AnalyticsWindow` aus `analytics/ui/analytics_win.py` ersetzen.
+4. **Ersetzung in `../../main.py`:**
+* Import von `StatisticWindow` in `../../main.py` entfernen und durch `AnalyticsWindow` aus `analytics/ui/analytics_win.py` ersetzen.
 
 
 
@@ -538,11 +538,11 @@ CREATE TABLE IF NOT EXISTS analytics_profiles (
 
  |
 | `analytics/engine/analytics_worker.py` | **NEU** | Asynchroner QThread-Worker für DuckDB-SQL-Aggregationen auf `feature_store`<br> |
-| `state_manager.py` | **Anpassung** | Tabelle & Helper `analytics_profiles` ergänzen
+| `../../state_manager.py` | **Anpassung** | Tabelle & Helper `analytics_profiles` ergänzen
 
  |
-| `main.py` | **Anpassung** | Ersetzung von `StatisticWindow` durch `AnalyticsWindow`<br> |
-| `statistic_win.py` | **Entfernt/Deprecated** | Altes Statistik-Fenster wird durch `AnalyticsWindow` ersetzt
+| `../../main.py` | **Anpassung** | Ersetzung von `StatisticWindow` durch `AnalyticsWindow`<br> |
+| `../../statistic_win.py` | **Entfernt/Deprecated** | Altes Statistik-Fenster wird durch `AnalyticsWindow` ersetzt
 
  |
 | `test/check_p15_s3_analytics.py` | **NEU** | Headless-Test für Analytics-Profile, SQL-Queries & Performance (ohne UI)

@@ -6,21 +6,10 @@ Die folgenden Themen sind für den schnellen operative Einsatz der App nicht zwi
 
 ---
 
-### Modul Z-01 (ehemals 3.6): Visueller Node-Editor für Service-Pipelines
-
-#### A. Zielsetzung & Abgrenzung
-
-* Grafische Aufbereitung von Service-Abhängigkeiten als Knoten-Netzwerk (Node Graph) mittels `QGraphicsScene` / `QGraphicsItem`.
-
-
-* **Grund für Verschiebung:** Die listenbasierte Verwaltung in `service_win.py` deckt alle Anforderungen ab. Ein Node-Editor bietet rein visuellen Zusatzkomfort, verändert jedoch nicht das zugrundeliegende Ausführungs-JSON.
-
-
 
 #### B. Technisches Konzept
 
 1. **Visual Graph:** `ServiceNodeItem` mit Ports für `depends_on`-Verbindungen.
-
 
 2. **Bidirektionale Synchronisation:** Das visuelle Netzwerk dient lediglich als alternative Ansicht auf dasselbe `ServiceSetDefinition`-JSON.
 

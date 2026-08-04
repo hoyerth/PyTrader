@@ -74,7 +74,6 @@ PyTrader/
             live_analyzer.py
         engine/
             __init__.py
-            base_definition.py
             description_dialog.py
             schema_migrator.py
             service_models.py
@@ -96,22 +95,6 @@ PyTrader/
             plugins/
                 __init__.py
                 base_plugin.py
-        signals/
-            __init__.py
-            composite/
-                __init__.py
-                grid_proximity_signal.py
-            experimental/
-                __init__.py
-                alternating_arrow_signal.py
-            heuristics/
-                __init__.py
-                atr_filter.py
-                ema_trend.py
-            machine_learning/
-                __init__.py
-                lightgbm_signal.py
-                xgboost_signal.py
     chart/
         __init__.py
         chart_basics.py
@@ -129,7 +112,6 @@ PyTrader/
             05_measurement.js
         overlays/
             __init__.py
-            signal_overlay.py
         widgets/
             __init__.py
             color_button.py
@@ -704,7 +686,7 @@ def check_and_init_databases() -> None:
 		);
 	""")
 
-	# Phase 1: Analytics-Tabellen für Signal-Engine
+	# Analytics-Tabelle für Feature-/Plugin-Daten
 	con_analytics.execute("""
 		CREATE TABLE IF NOT EXISTS feature_store (
 			symbol      VARCHAR NOT NULL,
@@ -726,35 +708,6 @@ def check_and_init_databases() -> None:
 	con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_id VARCHAR;")
 	con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS plugin_version VARCHAR;")
 	con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_data JSON;")
-
-	con_analytics.execute("""
-		CREATE TABLE IF NOT EXISTS signal_definitions (
-			signal_id   VARCHAR PRIMARY KEY,
-			category    VARCHAR NOT NULL,
-			version     VARCHAR,
-			params      JSON
-		);
-	""")
-	con_analytics.execute("""
-		CREATE TABLE IF NOT EXISTS signal_sets (
-			set_id          VARCHAR PRIMARY KEY,
-			configuration   JSON NOT NULL,
-			logic           VARCHAR NOT NULL
-		);
-	""")
-	con_analytics.execute("""
-		CREATE TABLE IF NOT EXISTS signal_results (
-			event_id        VARCHAR PRIMARY KEY,
-			symbol          VARCHAR NOT NULL,
-			timeframe       VARCHAR NOT NULL,
-			bar_time        TIMESTAMPTZ NOT NULL,
-			source_id       VARCHAR NOT NULL,
-			confidence      DOUBLE,
-			context_type    VARCHAR NOT NULL,
-			metadata_payload JSON,
-			created_at      TIMESTAMP DEFAULT current_timestamp
-		);
-	""")
 
 	con_app = DbPool.get(DB_APP_DATA)
 	con_app.execute("""
@@ -1337,13 +1290,12 @@ class MainWindow(QMainWindow):
         self.tick_worker.ticks_ready.connect(self.on_ticks_ready)
         self.tick_worker.start()
 
-        # LiveAnalyzer für SILVER M1 (Bar-Close-Analyse)
+        # LiveAnalyzer für SILVER M1 (Plugin-Bar-Close-Evaluierung)
         self.live_analyzer: LiveAnalyzer = LiveAnalyzer(
             symbol="SILVER",
             timeframe="M1",
             lookback_bars=self.settings.feature_builder_limit,
         )
-        self.live_analyzer.new_live_signal.connect(self.on_live_signal)
         self.live_analyzer.log_message.connect(self._on_live_analyzer_log)
         self.live_analyzer.start()
 
@@ -1622,20 +1574,6 @@ class MainWindow(QMainWindow):
     # ==============================================================================
     # LiveAnalyzer Integration
     # ==============================================================================
-
-    @Slot(str, str, int, float, str)
-    def on_live_signal(self, symbol: str, timeframe: str, bar_time: int, confidence: float, source_id: str) -> None:
-        """Wird vom LiveAnalyzer emittiert, wenn ein neues Live-Signal erkannt wurde.
-        Aktualisiert das Chart-Overlay für das betroffene Symbol/TF."""
-        print(f"🔔 Live-Signal empfangen: {symbol} {timeframe} @ {bar_time} (conf={confidence:.2f})")
-
-        # Direkt an die Chart-Fenster weiterleiten (on_live_signal_received)
-        for win in list(self.chart_windows):
-            try:
-                if win.isVisible():
-                    win.on_live_signal_received(symbol, timeframe, bar_time, confidence, source_id)
-            except (RuntimeError, AttributeError):
-                pass
 
     @Slot(str)
     def _on_live_analyzer_log(self, message: str) -> None:
@@ -2803,7 +2741,6 @@ class StatisticWindow(PersistentWindow):
         # Controls
         self.combo_symbol: QComboBox = self.ui.findChild(QComboBox, "combo_symbol_filter")
         self.combo_tf: QComboBox = self.ui.findChild(QComboBox, "combo_tf_filter")
-        self.combo_signal: QComboBox = self.ui.findChild(QComboBox, "combo_signal_filter")
         self.btn_refresh: QPushButton = self.ui.findChild(QPushButton, "btn_refresh_stats")
 
         self.label_total: QLabel = self.ui.findChild(QLabel, "label_total_signals")
@@ -2818,16 +2755,11 @@ class StatisticWindow(PersistentWindow):
         self.btn_next: QPushButton = self.ui.findChild(QPushButton, "btn_next_page")
         self.label_page: QLabel = self.ui.findChild(QLabel, "label_page_info")
 
-        # Signal-Sets laden
-        self._load_signal_sets()
-
         # Events (nach restore_state, damit die gesetzten Filter keine refresh-Explosion auslösen)
         if self.combo_symbol:
             self.combo_symbol.currentTextChanged.connect(self._on_filter_changed)
         if self.combo_tf:
             self.combo_tf.currentTextChanged.connect(self._on_filter_changed)
-        if self.combo_signal:
-            self.combo_signal.currentTextChanged.connect(self.refresh)
         if self.btn_refresh:
             self.btn_refresh.clicked.connect(self.refresh)
         if self.btn_prev:
@@ -2912,26 +2844,13 @@ class StatisticWindow(PersistentWindow):
 
     # --- Daten laden ---
 
-    def _load_signal_sets(self):
-        if not self.combo_signal:
-            return
-        self.combo_signal.blockSignals(True)
-        self.combo_signal.clear()
-        self.combo_signal.addItem("ALLE")
-        for s in self.repo.get_available_sets():
-            self.combo_signal.addItem(s)
-        self.combo_signal.blockSignals(False)
-
     @Slot()
     def refresh(self):
         symbol = self.combo_symbol.currentText() if self.combo_symbol else "ALLE"
         tf = self.combo_tf.currentText() if self.combo_tf else "ALLE"
-        source = self.combo_signal.currentText() if self.combo_signal else None
-        if source == "ALLE":
-            source = None
 
         # Summary
-        summary = self.repo.get_summary(symbol, tf, source)
+        summary = self.repo.get_summary(symbol, tf)
         if self.label_total:
             self.label_total.setText(str(summary["total_signals"]))
         if self.label_avg_conf:
@@ -2942,7 +2861,7 @@ class StatisticWindow(PersistentWindow):
             self.label_best_tf.setText(summary["best_tf"])
 
         # Signale mit Paging
-        self._all_signals = self.repo.fetch_signals(symbol, tf, source, limit=self.settings.statistics_signal_limit)
+        self._all_signals = self.repo.fetch_signals(symbol, tf, limit=self.settings.statistics_signal_limit)
         self._total_pages = max(1, (len(self._all_signals) + self.settings.statistics_page_size - 1) // self.settings.statistics_page_size)
         self._current_page = 0
         self._render_current_page()
@@ -18873,10 +18792,9 @@ class StatisticsRepository:
 Statistics Repository – SQL-Aggregations-Queries auf feature_data
 (Proximity-Services, feature_id='proximity') + Forward-Performance.
 
-Phase 13 Schritt 7: Die Statistik liest die Treffer-Records künftig aus
-dem feature_store (feature_data der Proximity-Services) statt aus
-signal_results. statistic_win.py bleibt API-stabil – es ändert sich nur
-die Datenquelle, nicht das Fenster.
+Die Statistik liest die Treffer-Records aus dem feature_store
+(feature_data der Proximity-Services); signal_results-Tabellen existieren
+seit Phase 15 nicht mehr.
 
 Da die feature_store-Tabelle KEINE set_id-Spalte hat, ist das 'Set' im
 neuen Datenmodell die feature_id (Plugin-Identität, z. B. 'proximity').
@@ -19110,43 +19028,35 @@ class StatisticsRepository:
 # analytics/background_workers/historical_scanner.py
 """
 Historical Scanner – QThread-Worker für Batch-Scans über historische Daten.
-Unterstützt Full-Scan (Delete + Re-Scan) und Delta-Update (fehlende Bars).
 
-Phase 15 U15-C2 (Alt-Pfad-Rückbau, additiv): ZIELZUSTAND des
-HistoricalScanner ist der PLUGIN-BATCH (`_run_plugin_batch` über den
-PluginExecutor, aktive Batch-Presets aus `indicator_presets`). Der Alt-Scan
-(grid_scan / Standard-Scan über SetEvaluator) bleibt parallel betreibbar,
-schreibt aber wie der Plugin-Batch AUSSCHLIESSLICH in den feature_store
-(Phase 13 Schritt 7.B) – es finden KEINE signal_results-Writes mehr statt.
-`signal_results` bleibt bis zur finalen Entscheidung (U15-C3) unverändert
-als Referenz erhalten.
+Phase 15 (Alt-Signal-Rückbau): Der Alt-Scan (grid_scan / Standard-Scan über
+SetEvaluator mit ema_atr_set_v1 / grid_proximity_v1) wurde komplett entfernt –
+es gibt keine Signal-Engine und keine signal_results-Writes mehr. Der Scanner
+führt ausschließlich den PLUGIN-BATCH aus: aktive Batch-Presets aus
+`indicator_presets` werden über den PluginExecutor ausgeführt und schreiben
+ihre Ergebnisse in den feature_store (feature_data, feature_id = Plugin).
 """
 
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 from PySide6.QtCore import QThread, Signal
 
 from analytics.features.feature_builder import FeatureBuilder, PluginExecutor, prepare_plugin_df
-from analytics.engine.set_evaluator import SetEvaluator
-from analytics.signals.heuristics.ema_trend import EMATrendSignal
-from analytics.signals.heuristics.atr_filter import ATRFilterSignal
-from analytics.signals.composite.grid_proximity_signal import GridProximitySignal
 from db_service import get_timeframes
 from state_manager import StateManager
 
 
 class HistoricalScanner(QThread):
-    """Scannt historische Daten für ein Symbol über alle Timeframes."""
+    """Scannt historische Daten für ein Symbol über alle Timeframes (Plugin-Batch)."""
 
     progress_updated = Signal(str, int, int)  # message, current, total
-    scan_finished = Signal(str, int)          # symbol, total_signals_written
+    scan_finished = Signal(str, int)          # symbol, total_feature_rows
     log_message = Signal(str)                 # log text
 
     def __init__(
         self,
         symbol: str,
         new_scan: bool = False,
-        grid_scan: bool = False,
         parent=None,
         db_path_app: Optional[str] = None,
         db_path_analytics: Optional[str] = None,
@@ -19156,7 +19066,6 @@ class HistoricalScanner(QThread):
         super().__init__(parent)
         self.symbol = symbol
         self.new_scan = new_scan
-        self.grid_scan = grid_scan
         self._running = True
         # Override-Pfade (Test/Isolation) – None = Produktions-DBs
         self._db_path_app = db_path_app
@@ -19168,63 +19077,15 @@ class HistoricalScanner(QThread):
         self._settings = self._state_mgr.get_app_settings()
 
         self.feature_builder = FeatureBuilder()
-        # Phase 12: PluginExecutor fuer den Plugin-Modus (aktive Batch-Presets).
-        # Der Alt-Pfad (grid_scan / Standard-Scan) bleibt davon unberuehrt.
+        # PluginExecutor fuer den Plugin-Batch (aktive Batch-Presets).
         self.plugin_executor = PluginExecutor()
-
-        if self.grid_scan:
-            # Grid-Proximity Scan (Phase 11): Grid-Levels + ATR als Feature-
-            # Basis fuer grid_proximity_v1. Die Grid-Spalten werden zusaetzlich
-            # in den feature_store geschrieben (siehe run()).
-            self._feature_names: List[str] = ["atr_normalized", "grid_levels"]
-            self._feature_params: Dict[str, Dict[str, Any]] = {
-                "atr_normalized": {"period": 14},
-                "grid_levels": {
-                    "step_size": 0.5,
-                    "steps_around": 4,
-                    "custom_levels": [],
-                    "time_window_mins": 5,
-                    "use_time_filter": True,
-                },
-            }
-            self._source_id = "grid_proximity_v1"
-            self.signals = {
-                "grid_proximity_v1": GridProximitySignal(),
-            }
-            self.evaluator = SetEvaluator(self.signals)
-            self.set_config = {
-                "signals": [
-                    {"id": "grid_proximity_v1", "weight": 1.0, "params": {}},
-                ],
-                "threshold": 0.5,
-            }
-        else:
-            # Standard-Scan (EMA + ATR)
-            self._feature_names = ["ema_diff", "atr_normalized"]
-            self._feature_params = {
-                "ema_diff": {"fast_period": 12, "slow_period": 26},
-                "atr_normalized": {"period": 14},
-            }
-            self._source_id = "ema_atr_set_v1"
-            self.signals = {
-                "ema_trend_v1": EMATrendSignal(),
-                "atr_filter_v1": ATRFilterSignal(),
-            }
-            self.evaluator = SetEvaluator(self.signals)
-            self.set_config = {
-                "signals": [
-                    {"id": "ema_trend_v1", "weight": 0.7, "params": {"threshold_pct": 0.3, "max_confidence": 1.0, "direction": "both"}},
-                    {"id": "atr_filter_v1", "weight": 0.3, "params": {"threshold_pct": 0.8, "max_confidence": 1.0, "mode": "high_volatility"}},
-                ],
-                "threshold": 0.5,
-            }
 
     def stop(self):
         self._running = False
 
     def _get_active_batch_plugins(self) -> List[Dict[str, Any]]:
         """Liefert die aktiven Batch-Presets (is_active_batch = True) aus den
-        indicator_presets. Steuert den Plugin-Modus (Phase 12)."""
+        indicator_presets. Steuert den Plugin-Batch."""
         try:
             return self._state_mgr.list_active_batch_presets()
         except Exception as e:
@@ -19236,16 +19097,20 @@ class HistoricalScanner(QThread):
         df_ohlcv,
         tf: str,
         active_plugins: List[Dict[str, Any]],
-    ) -> None:
-        """Phase 12 Plugin-Modus: Fuehrt alle aktiven Batch-Presets ueber den
-        PluginExecutor aus und schreibt den feature_store_payload in den
-        feature_store (Hybrid-Spalten feature_id/plugin_version/feature_data).
-        Der Alt-Pfad schreibt weiterhin seine nativen Spalten."""
+    ) -> int:
+        """Fuehrt alle aktiven Batch-Presets ueber den PluginExecutor aus und
+        schreibt den feature_store_payload in den feature_store (Hybrid-Spalten
+        feature_id/plugin_version/feature_data).
+
+        Returns:
+            Anzahl der geschriebenen Feature-Rows (summiert ueber alle Plugins).
+        """
         if df_ohlcv is None or df_ohlcv.empty:
-            return
+            return 0
         # Plugin-Vertrag: DataFrame mit 'time'-Spalte (epoch-Sekunden).
         # load_ohlcv() liefert 'bar_time' (datetime) -> hier anpassen.
         df_plugin = prepare_plugin_df(df_ohlcv)
+        total_rows = 0
         for preset in active_plugins:
             plugin_id = preset.get("plugin_id")
             if not plugin_id:
@@ -19263,42 +19128,36 @@ class HistoricalScanner(QThread):
             if payload:
                 try:
                     n = self.feature_builder.store_plugin_payload(self.symbol, tf, payload)
+                    total_rows += n
                     self.log_message.emit(
                         f"  {tf}: Plugin {plugin_id}: {n} Feature-Rows im feature_store"
                     )
                 except Exception as e:
                     self.log_message.emit(f"  {tf}: Plugin {plugin_id} Store-Fehler: {e}")
+        return total_rows
 
     def run(self):
-        from pathlib import Path
-
-        from db_service import DbPool
-
-        BASE_DIR = Path(__file__).resolve().parent.parent.parent
-        DB_ANALYTICS = self._db_path_analytics or str(BASE_DIR / "data" / "analytics.duckdb")
-        DB_MARKET = self._db_path_market or str(BASE_DIR / "data" / "market_data.duckdb")
-
-        # U15-C2 (Zielzustand): Der Plugin-Batch (PluginExecutor) ist der
-        # primäre Schreibpfad in den feature_store. Der Alt-Scan (SetEvaluator)
-        # bleibt kompatibel – ebenfalls feature_store-only (keine
-        # signal_results-Writes, Phase 13 Schritt 7.B).
-
-        feature_names = self._feature_names
-        feature_params = self._feature_params
-        source_id = self._source_id
-
-        # Phase 12: aktive Batch-Presets (Plugin-Modus) einmal bestimmen
+        # Phase 12: aktive Batch-Presets (Plugin-Batch) einmal bestimmen
         active_plugins = self._get_active_batch_plugins()
 
-        total_signals = 0
+        total_rows = 0
         timeframes = self._timeframes if self._timeframes is not None else list(get_timeframes().keys())
         num_tfs = len(timeframes)
 
-        self.log_message.emit(f"Starte Scan fuer {self.symbol} ueber {num_tfs} Timeframes...")
+        self.log_message.emit(f"Starte Plugin-Batch fuer {self.symbol} ueber {num_tfs} Timeframes...")
+        if not active_plugins:
+            self.log_message.emit(
+                "Keine aktiven Batch-Presets (is_active_batch) gefunden – "
+                "nichts zu tun. Aktiviere zuerst einen Batch-Service in den "
+                "Indikator-Einstellungen."
+            )
+            self.progress_updated.emit("Fertig", num_tfs, num_tfs)
+            self.scan_finished.emit(self.symbol, 0)
+            return
         if self.new_scan:
-            self.log_message.emit("Modus: FULL SCAN (bestehende Signale werden geloescht)")
+            self.log_message.emit("Modus: FULL SCAN (kompletter Neuaufbau der Feature-Rows)")
         else:
-            self.log_message.emit("Modus: DELTA UPDATE (nur fehlende Bars)")
+            self.log_message.emit("Modus: DELTA UPDATE (Upsert, fehlende Bars werden ergaenzt)")
 
         start_time = time.time()
 
@@ -19310,85 +19169,12 @@ class HistoricalScanner(QThread):
             self.progress_updated.emit(f"Verarbeite {tf}...", idx, num_tfs)
 
             try:
-                # 1. OHLCV laden
                 df_ohlcv = self.feature_builder.load_ohlcv(self.symbol, tf, limit=self._settings.scanner_candle_limit)
                 if df_ohlcv.empty:
                     self.log_message.emit(f"  {tf}: Keine OHLCV-Daten, ueberspringe")
                     continue
 
-                # 1b. Plugin-Modus (Phase 12): Aktive Batch-Presets über den
-                # PluginExecutor. Nutzt den vollständigen Lookback (Grid-Levels
-                # brauchen die volle Preisspanne); das Delta-Update (Schritt 2)
-                # betrifft ausschließlich den Alt-Pfad.
-                if active_plugins:
-                    self._run_plugin_batch(df_ohlcv, tf, active_plugins)
-
-                # 2. Delta-Update: Nur neue Bars scannen
-                # (Phase 13 Schritt 7.B: Anker ist der feature_store statt
-                # signal_results – es finden keine signal_results-Writes mehr statt.)
-                if not self.new_scan:
-                    con = DbPool.get(DB_ANALYTICS)
-                    last_signal = con.execute("""
-                        SELECT MAX(bar_time) FROM feature_store
-                        WHERE symbol = ? AND timeframe = ? AND feature_id = ?
-                    """, [self.symbol, tf, source_id]).fetchone()[0]
-
-                    if last_signal is not None:
-                        df_ohlcv = df_ohlcv[df_ohlcv["bar_time"] > last_signal]
-                        if df_ohlcv.empty:
-                            self.log_message.emit(f"  {tf}: Keine neuen Bars seit letztem Scan")
-                            continue
-                        self.log_message.emit(f"  {tf}: {len(df_ohlcv)} neue Bars seit {last_signal}")
-
-                # 3. Features berechnen
-                df_features = self.feature_builder.calculate_features(
-                    df_ohlcv,
-                    feature_names=feature_names,
-                    params=feature_params,
-                )
-
-                # 3b. Features in den feature_store schreiben (Grid-Scan:
-                # Grid-Levels & Zeitfenster-Flags fuer Signal & Chart-Overlay)
-                if self.grid_scan:
-                    try:
-                        self.feature_builder.store_features(self.symbol, tf, df_features)
-                    except Exception as e:
-                        self.log_message.emit(f"  {tf}: FEHLER beim Feature-Store: {e}")
-
-                # 4. Signal-Set auswerten
-                result = self.evaluator.evaluate_set(self.set_config, df_features)
-
-                # 5. Nur Bars mit binaerem Signal uebernehmen
-                signals = result[result["signal_binary"] == 1]
-                if signals.empty:
-                    self.log_message.emit(f"  {tf}: Keine Signale gefunden")
-                    continue
-
-                # 6. Hits als feature_store-Records schreiben (feature_id =
-                #    source_id). Phase 13 Schritt 7.B: KEINE signal_results
-                #    mehr – die Marker/Statistik lesen feature_data.
-                records: List[Dict[str, Any]] = []
-                for _, row in signals.iterrows():
-                    bt = row["bar_time"]
-                    records.append({
-                        "bar_time": bt,
-                        "is_hit": True,
-                        "confidence_total": float(row["confidence_total"]),
-                        "signal_binary": 1,
-                        "source_id": source_id,
-                    })
-
-                try:
-                    n = self.feature_builder.store_plugin_payload(
-                        self.symbol, tf,
-                        {"feature_id": source_id, "plugin_version": "1.0.0",
-                         "records": records},
-                    )
-                except Exception as e:
-                    n = 0
-                    self.log_message.emit(f"  {tf}: FEHLER beim feature_store-Write: {e}")
-                self.log_message.emit(f"  {tf}: {n} Hit-Rows in feature_store geschrieben")
-                total_signals += n
+                total_rows += self._run_plugin_batch(df_ohlcv, tf, active_plugins)
 
             except Exception as e:
                 self.log_message.emit(f"  {tf}: FEHLER: {e}")
@@ -19398,9 +19184,9 @@ class HistoricalScanner(QThread):
         elapsed = time.time() - start_time
         elapsed_str = f"{int(elapsed // 3600):02d}:{int((elapsed % 3600) // 60):02d}:{int(elapsed % 60):02d}"
         self.log_message.emit(f"Scan abgeschlossen in {elapsed_str}")
-        self.log_message.emit(f"Gesamt: {total_signals} Signale geschrieben")
+        self.log_message.emit(f"Gesamt: {total_rows} Feature-Rows geschrieben")
         self.progress_updated.emit("Fertig", num_tfs, num_tfs)
-        self.scan_finished.emit(self.symbol, total_signals)
+        self.scan_finished.emit(self.symbol, total_rows)
 
 ```
 
@@ -19411,39 +19197,27 @@ class HistoricalScanner(QThread):
 # analytics/background_workers/live_analyzer.py
 """
 Live Analyzer – QThread-Worker für die Live-Analyse bei Bar-Close.
-Empfängt neue Ticks/Bar-Events, berechnet Features, evaluiert Signal-Sets
-und schreibt Ergebnisse in signal_results (context_type='live_stream').
 
-Architektur (Phase 6 Roadmap):
-    Tick -> Bar-Close -> Feature Store -> Signal-Engine -> signal_results -> UI-Overlay
+Phase 15 (Alt-Signal-Rückbau): Die Alt-Signal-Mechanik (ema_atr_set_v1 /
+alternating_arrow_v1 / grid_proximity_v1) wurde komplett entfernt – es gibt
+keine Signal-Engine, keine signal_results-Writes und keine new_live_signal-
+Emission mehr. Der LiveAnalyzer evaluiert ausschließlich die aktiven
+Batch-Plugins (live_op=True) über den PluginExecutor:
 
-Phase 13 Schritt 7.B (Rückbau Alt-Signal-Mechanik): Der Alt-Pfad in
-signal_results ist DEAKTIVIERT – set_config['signals'] ist leer, daher
-liefern _fill_gaps/_process_new_bars/analyze_single_bar früh zurück und
-es finden KEINE signal_results-Writes mehr statt. Marker/Statistik lesen
-den feature_store; die Tabelle signal_results bleibt nur als Referenz.
+    Tick -> Bar-Close -> PluginExecutor -> feature_store (feature_data)
 
-Phase 15 U15-C1 (Alt-Pfad-Rückbau, additiv): ZIELZUSTAND des LiveAnalyzer
-ist der resiliente Pfad `_process_plugin_bars_resilient()` (P14-03-E):
-Bar-Close-Evaluierung mit stark verkürztem Lookback (1-2 Bars) gegen das im
+Der resiliente Pfad `_process_plugin_bars_resilient()` (P14-03-E) ist der
+primäre Bar-Close-Pfad: stark verkürzter Lookback (1-2 Bars) gegen das im
 `PluginContext.shared_state` gepufferte Raster – keine volle Pipeline und
-KEINE DB-Abfragen im Live-Tick. Die Alt-Signal-Pfade (`_fill_gaps`,
-`_process_new_bars`, `analyze_single_bar`, `set_config['signals']=[]`)
-sind LEGACY: Sie laufen weiterhin ohne Seiteneffekte (Early-Return), werden
-aber nicht mehr gepflegt und schreiben bewusst NICHT in signal_results.
+KEINE DB-Abfragen im Live-Tick.
 """
 
-import json
-import uuid
 from dataclasses import replace
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
-import pandas as pd
 from PySide6.QtCore import QThread, Signal
 
-from analytics.engine.set_evaluator import SetEvaluator
 from analytics.features.feature_builder import (
     FeatureBuilder,
     PluginExecutor,
@@ -19451,10 +19225,6 @@ from analytics.features.feature_builder import (
     prepare_plugin_df,
 )
 from analytics.features.plugins.base_plugin import PluginContext
-from analytics.signals.heuristics.ema_trend import EMATrendSignal
-from analytics.signals.heuristics.atr_filter import ATRFilterSignal
-from analytics.signals.experimental.alternating_arrow_signal import AlternatingArrowSignal
-from analytics.signals.composite.grid_proximity_signal import GridProximitySignal
 from db_service import DbPool
 from state_manager import StateManager
 
@@ -19465,16 +19235,10 @@ DB_MARKET = str(BASE_DIR / "data" / "market_data.duckdb")
 
 class LiveAnalyzer(QThread):
     """
-    Analysiert eine geschlossene Live-Kerze (Bar-Close Event):
-    1. Features berechnen und in feature_store schreiben
-    2. Signal-Set evaluieren
-    3. Ergebnisse in signal_results schreiben (context_type='live_stream')
-    4. Signal ans UI emittieren
+    Analysiert eine geschlossene Live-Kerze (Bar-Close Event) über die
+    aktiven Batch-Plugins (live_op=True) und schreibt die Ergebnisse in den
+    feature_store (feature_data).
     """
-
-    # Emittiert, wenn ein neues Live-Signal erkannt wurde
-    new_live_signal = Signal(str, str, int, float, str)
-    # (symbol, timeframe, bar_time, confidence, source_id)
 
     log_message = Signal(str)
 
@@ -19494,9 +19258,9 @@ class LiveAnalyzer(QThread):
         # Feature Builder
         self.feature_builder = FeatureBuilder()
 
-        # Phase 12: Zentraler PluginExecutor für den Plugin-Modus (aktive
-        # Batch-Presets mit live_op = True). Dieselbe Instanz, die auch der
-        # HistoricalScanner nutzt – der Alt-Pfad bleibt unverändert.
+        # Zentraler PluginExecutor für den Plugin-Modus (aktive Batch-Presets
+        # mit live_op = True). Dieselbe Instanz, die auch der HistoricalScanner
+        # nutzt.
         self.plugin_executor = PluginExecutor()
         self._state_mgr = StateManager()
 
@@ -19512,105 +19276,26 @@ class LiveAnalyzer(QThread):
             shared_state=self._live_shared_state,
         )
 
-        # Verfügbare Signale (kann über set_active_signals() erweitert werden)
-        self.signals: Dict[str, Any] = {
-            "alternating_arrow_v1": AlternatingArrowSignal(),
-            "ema_trend_v1": EMATrendSignal(),
-            "atr_filter_v1": ATRFilterSignal(),
-            "grid_proximity_v1": GridProximitySignal(),
-        }
-        self.evaluator = SetEvaluator(self.signals)
-
-        # Aktive Set-Konfiguration (Testsignale DEAKTIVIERT – Signal-Liste leer).
-        # TODO: Automatische Testsignale (alternating_arrow_v1) spaeter hier reaktivieren.
-        self.set_config: Dict[str, Any] = {
-            "signals": [],
-            "threshold": 0.5,
-        }
-
         # Letzte verarbeitete Bar-Time (für Duplikatserkennung)
         self._last_processed_bar_time: Optional[int] = None
 
     def stop(self) -> None:
         self._running = False
 
-    def set_active_signals(self, signals: Dict[str, Any]) -> None:
-        """Ersetzt die Signal-Registry (z. B. um ML-Modelle zu ergänzen)."""
-        self.signals = signals
-        self.evaluator = SetEvaluator(self.signals)
-
-    def set_set_config(self, config: Dict[str, Any]) -> None:
-        """Setzt die aktive Set-Konfiguration."""
-        self.set_config = config
-
-    def get_required_features(self) -> List[str]:
-        """
-        Sammelt alle required_features aus den im aktiven set_config
-        verwendeten Signalen.
-        """
-        required = set()
-        for cfg in self.set_config.get("signals", []):
-            sid = cfg["id"]
-            sig = self.signals.get(sid)
-            if sig is not None:
-                for feat in sig.required_features:
-                    required.add(feat)
-        # Fallback: immer ema_diff + atr_normalized fuer Basis-Funktion
-        if not required:
-            required = {"ema_diff", "atr_normalized"}
-        return list(required)
-
-    def _get_feature_params(self) -> Dict[str, Dict[str, Any]]:
-        """
-        Gibt optimierte Parameter fuer den FeatureBuilder zurueck,
-        basierend auf den benoetigten Features (Basis: ema_diff, atr_normalized).
-        """
-        feats = self.get_required_features()
-        params = {}
-        if "ema_diff" in feats:
-            params["ema_diff"] = {"fast_period": 12, "slow_period": 26}
-        if "atr_normalized" in feats:
-            params["atr_normalized"] = {"period": 14}
-        # Grid-Spalten (grid_dist_pct / grid_nearest_level / grid_dist_abs /
-        # is_time_window_active) werden vom Modul 'grid_levels' erzeugt.
-        if any(f in feats for f in (
-            "grid_dist_pct", "grid_nearest_level", "grid_dist_abs", "is_time_window_active"
-        )):
-            params["grid_levels"] = {
-                "step_size": 0.5,
-                "steps_around": 4,
-                "custom_levels": [],
-                "time_window_mins": 5,
-                "use_time_filter": True,
-            }
-        return params
-
     def run(self) -> None:
         """
-        Hauptschleife: Wartet auf Bar-Close-Events (Polling).
-        Fuehrt vor dem Live-Betrieb einen einmaligen Auto-Fill durch,
-        um Luecken seit dem letzten Signal in der DB zu schliessen.
-
-        U15-C1 (Zielzustand): Die eigentliche Live-Auswertung läuft über den
-        resilienten Pfad `_process_plugin_bars_resilient()` (Plugin-Modus,
-        gepuffertes shared_state-Raster). `_process_new_bars()` (Alt-Signal-
-        Pfad) wird weiterhin aufgerufen, ist aber mit leerer signal-Liste
-        wirkungslos (Early-Return, keine signal_results-Writes).
+        Hauptschleife: Wartet auf Bar-Close-Events (Polling) und evaluiert
+        die aktiven Batch-Plugins über den resilienten Pfad
+        `_process_plugin_bars_resilient()` (Plugin-Modus, gepuffertes
+        shared_state-Raster).
         """
         self.log_message.emit(
             f"LiveAnalyzer gestartet: {self.symbol} {self.timeframe}, "
             f"lookback={self.lookback_bars}"
         )
 
-        # Auto-Fill: Luecken schliessen bevor Live-Betrieb startet
-        self._fill_gaps()
-
         while self._running:
             try:
-                self._process_new_bars()
-                # P14-03-E (Schritt 2): Resilienz-Seam statt Alt-Pfad – nutzt den
-                # stark verkürzten Lookback (limit=2) gegen das gepufferte
-                # EvaluationContext.shared_state-Raster (keine volle Pipeline).
                 self._process_plugin_bars_resilient()
             except Exception as e:
                 self.log_message.emit(f"❌ LiveAnalyzer Fehler: {e}")
@@ -19622,7 +19307,7 @@ class LiveAnalyzer(QThread):
 
     def _get_active_live_plugins(self) -> List[Dict[str, Any]]:
         """Liefert aktive Batch-Presets, deren Plugin live_op = True ist
-        (Phase 12 Plugin-Modus). Bestehende Live-Signale bleiben unverändert."""
+        (Phase 12 Plugin-Modus)."""
         try:
             presets = self._state_mgr.list_active_batch_presets()
         except Exception:
@@ -19774,469 +19459,12 @@ class LiveAnalyzer(QThread):
 
         self._last_processed_bar_time = latest_bar_time
 
-    def _get_live_signal_ids(self) -> List[str]:
-        """Ermittelt alle signal_ids aus set_config, deren live_op == True ist."""
-        live_ids = []
-        for cfg in self.set_config.get("signals", []):
-            sid = cfg["id"]
-            sig = self.signals.get(sid)
-            if sig is not None and getattr(sig, 'live_op', True):
-                live_ids.append(sid)
-        return live_ids
-
-    def _fill_gaps(self) -> None:
-        """
-        Schliesst Luecken zwischen dem letzten Signal in signal_results
-        und der aktuellsten Bar in market_data.duckdb.
-        Verarbeitet NUR Signale mit live_op == True.
-        """
-        live_ids = self._get_live_signal_ids()
-        if not live_ids:
-            self.log_message.emit("  -> Keine live_op=True Signale, Auto-Fill uebersprungen.")
-            return
-
-        # Letztes Signal in der DB fuer dieses Symbol/TF ermitteln
-        # EXTRACT(epoch) direkt in SQL fuer TIMESTAMPTZ-Korrektheit
-        con = DbPool.get(DB_ANALYTICS)
-        last_signal_ts = con.execute("""
-            SELECT EXTRACT('epoch' FROM MAX(bar_time))::BIGINT FROM signal_results
-            WHERE symbol = ? AND timeframe = ?
-        """, [self.symbol, self.timeframe]).fetchone()[0]
-
-        if last_signal_ts is None:
-            self.log_message.emit("  -> Keine historischen Signale vorhanden, Auto-Fill uebersprungen.")
-            return
-
-        last_signal_ts = int(last_signal_ts)
-
-        # Neueste Bar in market_data ermitteln
-        con = DbPool.get(DB_MARKET)
-        latest_bar_ts = con.execute("""
-            SELECT EXTRACT('epoch' FROM MAX("time"))::BIGINT FROM ohlcv_bars
-            WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
-        """, [self.symbol, self.timeframe]).fetchone()[0]
-
-        if latest_bar_ts is None:
-            return
-
-        latest_bar_ts = int(latest_bar_ts)
-
-        # Pruefen ob Luecke existiert
-        if latest_bar_ts <= last_signal_ts:
-            self.log_message.emit("  -> Keine Luecken, Auto-Fill uebersprungen.")
-            self._last_processed_bar_time = latest_bar_ts
-            return
-
-        self.log_message.emit(
-            f"  -> Luecke erkannt! Letztes Signal: {last_signal_ts}, "
-            f"aktuellste Bar: {latest_bar_ts}, fuelle auf..."
-        )
-
-        # OHLCV ab letztem Signal laden
-        con = DbPool.get(DB_MARKET)
-        df_missing = con.execute("""
-            SELECT "time" AS bar_time, open, high, low, close
-            FROM ohlcv_bars
-            WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
-              AND "time" > ? AND "time" <= ?
-              AND "time" IS NOT NULL
-              AND open IS NOT NULL AND high IS NOT NULL
-              AND low IS NOT NULL AND close IS NOT NULL
-            ORDER BY "time" ASC
-        """, [self.symbol, self.timeframe,
-              datetime.fromtimestamp(last_signal_ts, tz=timezone.utc),
-              datetime.fromtimestamp(latest_bar_ts, tz=timezone.utc)]).df()
-
-        if df_missing.empty:
-            self.log_message.emit("  -> Keine neuen Bars gefunden.")
-            self._last_processed_bar_time = latest_bar_ts
-            return
-
-        self.log_message.emit(f"  -> {len(df_missing)} neue Bars, berechne Signale...")
-
-        # Features fuer das gesamte Lookback berechnen
-        df_ohlcv = self.feature_builder.load_ohlcv(
-            self.symbol, self.timeframe, limit=self.lookback_bars
-        )
-        if df_ohlcv.empty:
-            return
-
-        df_features = self.feature_builder.calculate_features(
-            df_ohlcv,
-            feature_names=self.get_required_features(),
-            params=self._get_feature_params(),
-        )
-
-        # Features persistieren
-        self.feature_builder.store_features(self.symbol, self.timeframe, df_features)
-
-        # Signal-Set evaluieren
-        result = self.evaluator.evaluate_set(self.set_config, df_features)
-
-        # Nur die fehlenden Bars rausfiltern und Bulk-Insert
-        sigs = result[result["signal_binary"] == 1].copy()
-        if sigs.empty:
-            self.log_message.emit("  -> Keine Signale in den neuen Bars.")
-            self._last_processed_bar_time = latest_bar_ts
-            return
-
-        # Sicherstellen bar_time als int (value // 10**9 = epoch seconds, timezone-sicher)
-        sigs["bar_time_epoch"] = sigs["bar_time"].apply(lambda x: int(x.value // 10**9))
-
-        # Nur Bars nach dem letzten Signal nehmen
-        sigs = sigs[sigs["bar_time_epoch"] > last_signal_ts]
-
-        if sigs.empty:
-            self.log_message.emit("  -> Keine neuen Signale in den gefuellten Bars.")
-            self._last_processed_bar_time = latest_bar_ts
-            return
-
-        self._batch_write_signals(sigs)
-        self._last_processed_bar_time = latest_bar_ts
-        self.log_message.emit(f"  -> Auto-Fill abgeschlossen: {len(sigs)} Signale geschrieben.")
-
-    def _batch_write_signals(self, sigs_df: pd.DataFrame) -> None:
-        """Bulk-Insert fuer mehrere Signale mit DELETE-vor-INSERT pro Bar.
-        Schreibt Signale basierend auf den Quell-Source-IDs im Ergebnis-DataFrame."""
-        con = DbPool.get(DB_ANALYTICS)
-        # Bestimme source_id(s) aus den Ergebnis-Spalten (conf_*)
-        source_cols = [c for c in sigs_df.columns if c.startswith("conf_")]
-        if not source_cols:
-            self.log_message.emit("  [WARN] Keine conf_*-Spalten im Ergebnis.")
-            return
-
-        rows = []
-        for _, row in sigs_df.iterrows():
-            bt = row["bar_time_epoch"]
-            dt_val = datetime.fromtimestamp(int(bt), tz=timezone.utc)
-            for sc in source_cols:
-                source_id = sc.replace("conf_", "")
-                confidence = float(row[sc])
-                rows.append((
-                    str(uuid.uuid4()),
-                    self.symbol,
-                    self.timeframe,
-                    dt_val,
-                    source_id,
-                    confidence,
-                    "live_stream",
-                    json.dumps({"source": "LiveAnalyzerFill", "lookback": self.lookback_bars}),
-                ))
-                # Einzel-DELETE pro Bar
-                con.execute("""
-                    DELETE FROM signal_results
-                    WHERE symbol = ? AND timeframe = ? AND bar_time = ? AND source_id = ?
-                """, [self.symbol, self.timeframe, dt_val, source_id])
-
-        con.executemany("""
-            INSERT INTO signal_results (event_id, symbol, timeframe, bar_time, source_id, confidence, context_type, metadata_payload)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, rows)
-
-    def _process_new_bars(self) -> None:
-        """Lädt ALLE neuen Kerzen seit _last_processed_bar_time aus market_data.duckdb
-        und analysiert sie. EXTRACT(epoch) in SQL für TIMESTAMPTZ-Korrektheit."""
-        # Keine aktiven Signale in der Set-Konfiguration → keine Live-Analyse (Testsignale deaktiviert)
-        if not self.set_config.get("signals"):
-            return
-
-        # Neueste Zeit als Referenz holen
-        con = DbPool.get(DB_MARKET)
-        latest_bar_time = con.execute("""
-            SELECT EXTRACT('epoch' FROM MAX("time"))::BIGINT FROM ohlcv_bars
-            WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
-              AND "time" IS NOT NULL
-        """, [self.symbol, self.timeframe]).fetchone()[0]
-
-        if latest_bar_time is None:
-            return
-
-        latest_bar_time = int(latest_bar_time)
-
-        # Keine neuen Bars
-        if self._last_processed_bar_time is not None and latest_bar_time <= self._last_processed_bar_time:
-            return
-
-        # Alle neuen Bars seit last_processed_bar_time laden
-        if self._last_processed_bar_time is not None:
-            con = DbPool.get(DB_MARKET)
-            rows = con.execute("""
-                SELECT EXTRACT('epoch' FROM "time")::BIGINT AS time_epoch,
-                       open, high, low, close
-                FROM ohlcv_bars
-                WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
-                  AND "time" > ?::TIMESTAMPTZ AND "time" <= ?::TIMESTAMPTZ
-                  AND "time" IS NOT NULL
-                  AND open IS NOT NULL AND high IS NOT NULL
-                  AND low IS NOT NULL AND close IS NOT NULL
-                ORDER BY "time" ASC
-            """, [self.symbol, self.timeframe,
-                  datetime.fromtimestamp(self._last_processed_bar_time, tz=timezone.utc),
-                  datetime.fromtimestamp(latest_bar_time, tz=timezone.utc)]).fetchall()
-        else:
-            # Erstmaliger Start: nur neueste Bar nehmen
-            con = DbPool.get(DB_MARKET)
-            rows = con.execute("""
-                SELECT EXTRACT('epoch' FROM "time")::BIGINT AS time_epoch,
-                       open, high, low, close
-                FROM ohlcv_bars
-                WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
-                  AND "time" IS NOT NULL
-                  AND open IS NOT NULL AND high IS NOT NULL
-                  AND low IS NOT NULL AND close IS NOT NULL
-                ORDER BY "time" DESC
-                LIMIT 1
-            """, [self.symbol, self.timeframe]).fetchall()
-
-        if not rows:
-            self._last_processed_bar_time = latest_bar_time
-            return
-
-        # Lookback-Daten für Feature-Berechnung laden (nur einmal!)
-        df_ohlcv = self.feature_builder.load_ohlcv(
-            self.symbol, self.timeframe, limit=self.lookback_bars
-        )
-        if df_ohlcv.empty:
-            return
-
-        df_features = self.feature_builder.calculate_features(
-            df_ohlcv,
-            feature_names=self.get_required_features(),
-            params=self._get_feature_params(),
-        )
-
-        self.feature_builder.store_features(self.symbol, self.timeframe, df_features)
-        result = self.evaluator.evaluate_set(self.set_config, df_features)
-
-        # Nur die letzten N Bars (neue) auswerten
-        result_new = result.iloc[-len(rows):].copy()
-
-        # Quell-Source-IDs aus den conf_-Spalten ermitteln
-        source_cols = [c for c in result_new.columns if c.startswith("conf_")]
-        if not source_cols:
-            source_cols = ["confidence_total"]
-
-        for _, row in result_new.iterrows():
-            bar_time = int(row["bar_time"].value // 10**9)
-            confidence = float(row["confidence_total"])
-            signal_binary = int(row["signal_binary"])
-
-            if signal_binary == 1:
-                # Erste Quell-Source-ID für UI-Event nehmen
-                src = source_cols[0]
-                source_id = src.replace("conf_", "") if src.startswith("conf_") else "grid_proximity_v1"
-                self._write_signal_result(bar_time, confidence, source_id)
-                self.new_live_signal.emit(
-                    self.symbol, self.timeframe, bar_time, confidence, source_id
-                )
-                self.log_message.emit(
-                    f"🔔 Live-Signal: {self.symbol} {self.timeframe} @ {bar_time} "
-                    f"(confidence={confidence:.2f})"
-                )
-
-        self._last_processed_bar_time = latest_bar_time
-
-    def _write_signal_result(self, bar_time: int, confidence: float, source_id: str = "grid_proximity_v1") -> None:
-        """Schreibt ein Live-Signal in signal_results.
-        Loescht vorher ein evtl. vorhandenes Signal fuer denselben (symbol, timeframe, bar_time, source_id),
-        damit es exakt 1 Signal pro Kerze gibt."""
-        con = DbPool.get(DB_ANALYTICS)
-        dt_val = datetime.fromtimestamp(bar_time, tz=timezone.utc)
-        # Vorhandenes Signal entfernen
-        con.execute("""
-            DELETE FROM signal_results
-            WHERE symbol = ? AND timeframe = ? AND bar_time = ? AND source_id = ?
-        """, [self.symbol, self.timeframe, dt_val, source_id])
-        # Neues Signal einfuegen
-        con.execute("""
-            INSERT INTO signal_results (event_id, symbol, timeframe, bar_time, source_id, confidence, context_type, metadata_payload)
-            VALUES (?, ?, ?, ?, ?, ?, 'live_stream', ?)
-        """, [
-            str(uuid.uuid4()),
-            self.symbol,
-            self.timeframe,
-            dt_val,
-            source_id,
-            confidence,
-            json.dumps({"source": "LiveAnalyzer", "lookback": self.lookback_bars}),
-        ])
-
-    def analyze_single_bar(
-        self,
-        symbol: str,
-        timeframe: str,
-        bar_time: int,
-        open_price: float,
-        high: float,
-        low: float,
-        close: float,
-    ) -> Optional[float]:
-        """
-        Analysiert eine einzelne Kerze (für externen Tick-Aggregator).
-        
-        Args:
-            symbol: Symbol-Name
-            timeframe: Timeframe
-            bar_time: Unix-Timestamp der Kerze
-            open_price, high, low, close: OHLC-Werte
-        
-        Returns:
-            Confidence-Score oder None wenn kein Signal
-        """
-        # Keine aktiven Signale → keine Analyse (Testsignale deaktiviert)
-        if not self.set_config.get("signals"):
-            return None
-
-        # Duplikatserkennung
-        if self._last_processed_bar_time is not None and bar_time <= self._last_processed_bar_time:
-            return None
-
-        self._last_processed_bar_time = bar_time
-
-        # Lookback-Daten laden
-        df_ohlcv = self.feature_builder.load_ohlcv(symbol, timeframe, limit=self.lookback_bars)
-        if df_ohlcv.empty:
-            return None
-
-        # Features berechnen (dynamisch aus set_config)
-        df_features = self.feature_builder.calculate_features(
-            df_ohlcv,
-            feature_names=self.get_required_features(),
-            params=self._get_feature_params(),
-        )
-
-        # Features persistieren
-        self.feature_builder.store_features(symbol, timeframe, df_features)
-
-        # Signal evaluieren
-        result = self.evaluator.evaluate_set(self.set_config, df_features)
-        last_row = result.iloc[-1]
-        confidence = float(last_row["confidence_total"])
-        signal_binary = int(last_row["signal_binary"])
-
-        # Quell-Source-ID aus conf_-Spalten ermitteln
-        source_cols = [c for c in result.columns if c.startswith("conf_")]
-        src = source_cols[0] if source_cols else "confidence_total"
-        source_id = src.replace("conf_", "") if src.startswith("conf_") else "grid_proximity_v1"
-
-        if signal_binary == 1:
-            self._write_signal_result(bar_time, confidence, source_id)
-            self.new_live_signal.emit(symbol, timeframe, bar_time, confidence, source_id)
-            return confidence
-
-        return None
-
-
-# ==============================================================================
-# Standalone-Funktion fuer Chart-Trigger (aufrufbar ohne LiveAnalyzer-Instanz)
-# ==============================================================================
-# Phase 13 Schritt 7.B: Rueckbau der Alt-Signal-Mechanik.
-# Die Funktion ist DEAKTIVIERT - es finden KEINE signal_results-Schreibvorgaenge
-# mehr statt. Der Chart-Trigger (chart_win.py) wurde entfernt; der Stub bleibt
-# nur als API-Hinweis erhalten, falls noch Alt-Code auf sie zeigt.
-def fill_gaps_for_pair(symbol: str, timeframe: str, lookback_bars: int = 500) -> None:
-    """
-    DEAKTIVIERT (Phase 13 Schritt 7.B): Alt-Signal-Mechanik ist zurueckgebaut.
-
-    Frucher: Schliessen von Datenluecken durch Nachberechnung der
-    Alt-Signal-Sets (ema_atr_set_v1 / alternating_arrow_v1) mit Write in
-    signal_results. Heute: Keine signal_results-Writes mehr - Marker und
-    Statistik lesen ausschliesslich den feature_store (feature_data der
-    Plugins/Proximity-Services). Der Stub gibt nur noch einen Hinweis aus.
-    """
-    print(
-        f"  [Chart-Trigger] fill_gaps_for_pair DEAKTIVIERT (Phase 13 7.B): "
-        f"{symbol}:{timeframe} - keine Alt-Signal-Writes mehr."
-    )
-
-
 ```
 
 --------------------------------------------------
 
 ### DATEI: analytics/engine/__init__.py
 ```py
-
-```
-
---------------------------------------------------
-
-### DATEI: analytics/engine/base_definition.py
-```py
-# analytics/engine/base_definition.py
-"""
-Abstrakte Basisklasse für alle Signal-Definitionen.
-Jedes Signal (Regel, Pattern, ML) erbt von SignalDefinition und
-implementiert evaluate(), das einen Confidence-Score [0.0, 1.0] pro Bar liefert.
-"""
-
-from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
-import pandas as pd
-
-
-class SignalDefinition(ABC):
-    """Abstrakte Basisklasse für Signal-Definitionen."""
-
-    @property
-    @abstractmethod
-    def signal_id(self) -> str:
-        """Eindeutige ID (z. B. 'ema_trend_v1')."""
-        pass
-
-    @property
-    @abstractmethod
-    def display_name(self) -> str:
-        """Anzeigename für UI/Logs."""
-        pass
-
-    @property
-    @abstractmethod
-    def version(self) -> str:
-        """Versionsstring (z. B. '1.0.0')."""
-        pass
-
-    @property
-    @abstractmethod
-    def default_params(self) -> Dict[str, Any]:
-        """Standard-Parameter für dieses Signal."""
-        pass
-
-    @property
-    def param_descriptions(self) -> Dict[str, str]:
-        """Optionale Beschreibungen der Parameter."""
-        return {}
-
-    @property
-    def live_op(self) -> bool:
-        """
-        Live-Betriebsmodus.
-        True (Default) → Dynamisch: wird bei Chart-Aufruf aktualisiert, Live-Tracking.
-        False → Statisch: dient als unveränderliche Benchmark-Historie für Statistiken.
-        """
-        return True
-
-    @property
-    def required_features(self) -> List[str]:
-        """
-        Liste der Feature-Namen, die für evaluate() benötigt werden.
-        Wird vom FeatureBuilder verwendet, um fehlende Features zu erkennen.
-        """
-        return []
-
-    @abstractmethod
-    def evaluate(self, df_features: pd.DataFrame, params: Optional[Dict[str, Any]] = None) -> pd.Series:
-        """
-        Berechnet den Confidence-Score [0.0, 1.0] für jede Bar.
-
-        Args:
-            df_features: DataFrame mit Feature-Spalten (bar_time + feature-Spalten).
-            params: Überschreibt default_params für diesen Aufruf.
-
-        Returns:
-            pd.Series mit Confidence-Werten [0.0, 1.0], gleicher Index wie df_features.
-        """
-        pass
 
 ```
 
@@ -21156,12 +20384,12 @@ class ServiceSetRepository:
 ```py
 # analytics/engine/set_evaluator.py
 """
-Set-Evaluator – Kombiniert mehrere Signale zu einem gewichteten Gesamt-Score.
-Unterstützt gewichtete Summen mit Schwellenwert (Threshold).
+ServiceSetEvaluator – Führt Service-Sets (ServiceSetDefinition, siehe
+service_models.py) in execution_order über den PluginExecutor aus.
 
-Phase 13 Schritt 3: Zusätzlich enthält dieses Modul den NEUEN
-ServiceSetEvaluator (Service-Pipeline). Der bestehende SetEvaluator
-(Signal-Sets) bleibt UNVERÄNDERT und läuft parallel weiter.
+Phase 15 (Alt-Signal-Rückbau): Der Signal-basierte SetEvaluator (ema_trend_v1 /
+atr_filter_v1 / grid_proximity_v1 / alternating_arrow_v1) wurde komplett
+entfernt – es gibt keine Signal-Engine mehr.
 """
 
 from dataclasses import replace
@@ -21170,9 +20398,7 @@ import threading
 import time
 import traceback
 import pandas as pd
-import json
 
-from analytics.engine.base_definition import SignalDefinition
 from analytics.features.plugins.base_plugin import PluginContext, ServiceErrorLog
 from analytics.features.feature_builder import (
     PluginExecutor,
@@ -21181,114 +20407,11 @@ from analytics.features.feature_builder import (
 )
 
 
-class SetEvaluator:
-    """
-    Wertet Signal-Sets aus: Kombiniert Einzelsignale mit Gewichtung
-    zu einem Gesamt-Confidence-Score pro Bar.
-    """
-
-    def __init__(self, signals: Dict[str, SignalDefinition]) -> None:
-        """
-        Args:
-            signals: Dict aller verfügbarer Signale {signal_id: SignalDefinition}
-        """
-        self.signals = signals
-
-    def evaluate_set(
-        self,
-        set_config: Dict[str, Any],
-        df_features: pd.DataFrame,
-    ) -> pd.DataFrame:
-        """
-        Wertet ein komplettes Signal-Set aus.
-
-        Args:
-            set_config: JSON-konforme Konfiguration {
-                "signals": [{"id": "ema_trend_v1", "weight": 0.6, "params": {...}}, ...],
-                "threshold": 0.5
-            }
-            df_features: DataFrame mit Feature-Spalten
-
-        Returns:
-            DataFrame mit Spalten: bar_time, confidence_total, sowie Einzel-Confidences
-        """
-        signal_configs = set_config.get("signals", [])
-        threshold = float(set_config.get("threshold", 0.5))
-
-        if not signal_configs:
-            raise ValueError("Set-Konfiguration enthält keine Signale")
-
-        result = df_features[["bar_time"]].copy()
-        total_weight = 0.0
-        weighted_sum = pd.Series(0.0, index=df_features.index)
-
-        for cfg in signal_configs:
-            signal_id = cfg["id"]
-            weight = float(cfg.get("weight", 1.0))
-            params = cfg.get("params", {})
-
-            if signal_id not in self.signals:
-                print(f"⚠️ [SetEvaluator] Unbekanntes Signal: {signal_id}")
-                continue
-
-            signal = self.signals[signal_id]
-
-            # Prüfen ob benötigte Features vorhanden sind
-            missing = [f for f in signal.required_features if f not in df_features.columns]
-            if missing:
-                print(f"⚠️ [SetEvaluator] Fehlende Features für {signal_id}: {missing}")
-                continue
-
-            confidence = signal.evaluate(df_features, params)
-            result[f"conf_{signal_id}"] = confidence.values
-
-            weighted_sum += confidence * weight
-            total_weight += weight
-
-        # Gewichteter Gesamt-Score
-        if total_weight > 0:
-            result["confidence_total"] = (weighted_sum / total_weight).values
-        else:
-            result["confidence_total"] = 0.0
-
-        # Binäres Signal (Threshold-Überschreitung)
-        result["signal_binary"] = (result["confidence_total"] >= threshold).astype(int)
-
-        return result
-
-    def evaluate_set_from_db(
-        self,
-        set_id: str,
-        set_configs: Dict[str, Dict[str, Any]],
-        df_features: pd.DataFrame,
-    ) -> pd.DataFrame:
-        """
-        Lädt eine Set-Konfiguration anhand der set_id und wertet sie aus.
-
-        Args:
-            set_id: ID des Signal-Sets
-            set_configs: Dict aller verfügbarer Set-Konfigurationen
-            df_features: DataFrame mit Feature-Spalten
-
-        Returns:
-            DataFrame mit Ergebnissen
-        """
-        if set_id not in set_configs:
-            raise ValueError(f"Set-ID '{set_id}' nicht gefunden")
-
-        config = set_configs[set_id]
-        if isinstance(config.get("configuration"), str):
-            config["configuration"] = json.loads(config["configuration"])
-
-        return self.evaluate_set(config["configuration"], df_features)
-
-
 # ==============================================================================
-# Phase 13 Schritt 3: ServiceSetEvaluator (Service-Pipeline)
+# ServiceSetEvaluator (Service-Pipeline)
 # ------------------------------------------------------------------------------
 # Führt Service-Sets (ServiceSetDefinition, siehe service_models.py) in
-# execution_order aus. Der bestehende SetEvaluator (oben, Signal-Sets) bleibt
-# UNVERÄNDERT und läuft parallel weiter.
+# execution_order aus.
 #
 # Kernregeln (Roadmap Phase 13 §3.2):
 #   - df.tail(lookback) je Service (exakter Zuschnitt).
@@ -23678,8 +22801,8 @@ Thread-Sicherheit und eine klare Trennung zwischen Feature-Engine
 
 Feature-Store-Lese-Regel (präzisiert für Phase 13): Die INDIKATOR-Berechnung
 (GUI) liest NIE direkt aus dem Feature-Store; der Scanner schreibt NIE aus dem
-Render-Payload. Overlay-Konsumenten (SignalOverlay, Statistik) lesen den
-Feature-Store erst in Phase 13 Schritt 7.
+Render-Payload. Overlay-Konsumenten (Statistik) lesen den Feature-Store erst
+in Phase 13 Schritt 7.
 """
 
 from abc import ABC, abstractmethod
@@ -24029,785 +23152,6 @@ class PluginFeature(ABC):
 
 --------------------------------------------------
 
-### DATEI: analytics/signals/__init__.py
-```py
-# analytics/signals/__init__.py
-from analytics.signals.heuristics.ema_trend import EMATrendSignal
-from analytics.signals.heuristics.atr_filter import ATRFilterSignal
-from analytics.signals.experimental.alternating_arrow_signal import AlternatingArrowSignal
-from analytics.signals.composite.grid_proximity_signal import GridProximitySignal
-
-__all__ = [
-    "EMATrendSignal",
-    "ATRFilterSignal",
-    "AlternatingArrowSignal",
-    "GridProximitySignal",
-]
-
-```
-
---------------------------------------------------
-
-### DATEI: analytics/signals/composite/__init__.py
-```py
-# analytics/signals/composite/__init__.py
-from analytics.signals.composite.grid_proximity_signal import GridProximitySignal
-
-__all__ = ["GridProximitySignal"]
-
-```
-
---------------------------------------------------
-
-### DATEI: analytics/signals/composite/grid_proximity_signal.py
-```py
-# analytics/signals/composite/grid_proximity_signal.py
-"""
-Composite Signal: Grid Proximity Signal (Phase 11)
-Verknuepft multidimensionale Features aus dem feature_store:
-  - Y-Achse: grid_dist_pct (Preisabstand zum naechsten Grid-Level)
-  - X-Achse: is_time_window_active (Zeitfenster-Filter)
-  - Volatilitaet: atr_normalized / regime_volatility (Markt-Regime)
-
-Signal-Logik:
-  Buy  (confidence > 0.5): Preis nahe Grid-Level + aktives Zeitfenster + niedrige Vola
-  Sell (confidence < -0.5): Preis fern von Grid-Level + aktives Zeitfenster + hohe Vola
-  Neutral (confidence = 0.0): Zeitfenster geschlossen oder keine klare Signallage
-"""
-
-from typing import Any, Dict, List, Optional
-import pandas as pd
-import numpy as np
-from analytics.engine.base_definition import SignalDefinition
-
-
-class GridProximitySignal(SignalDefinition):
-    """
-    Composite Signal: Grid-Proximity mit multidimensionaler Verknuepfung.
-    Nutzt feature_store-Spalten: grid_dist_pct, is_time_window_active,
-    atr_normalized, regime_volatility.
-    """
-
-    @property
-    def signal_id(self) -> str:
-        return "grid_proximity_v1"
-
-    @property
-    def display_name(self) -> str:
-        return "Grid Proximity (Composite)"
-
-    @property
-    def version(self) -> str:
-        return "1.0.0"
-
-    @property
-    def default_params(self) -> Dict[str, Any]:
-        return {
-            "proximity_threshold_pct": 0.1,       # max. Abstand in % zum Level fuer "nahe"
-            "confidence_high": 0.8,                 # Confidence bei starkem Signal
-            "confidence_low": 0.3,                  # Confidence bei schwachem Signal
-            "vola_regime_threshold": 1.2,           # regime_volatility >= x = "hohe Vola"
-            "atr_filter_enabled": True,             # ATR-Filter aktivieren
-            "atr_percentile": 0.7,                  # ATR-Perzentil-Schwelle (0-1)
-            "time_window_must": True,               # Nur Signale in aktiven Zeitfenstern
-            "min_bars_since_pivot": 3,              # Mindestbars seit letztem Pivot-Hit
-            "use_regime_filter": True,              # Regime-Filter aktivieren
-        }
-
-    @property
-    def param_descriptions(self) -> Dict[str, str]:
-        return {
-            "proximity_threshold_pct": "Max. Abstand in % vom naechsten Grid-Level",
-            "confidence_high": "Confidence bei starkem Signal (Level-Touch im Fenster)",
-            "confidence_low": "Confidence bei schwachem Signal (Level-nahe, normale Vola)",
-            "vola_regime_threshold": "Schwelle fuer 'hohe Volatilitaet' (regime_volatility)",
-            "atr_filter_enabled": "ATR-Filter fuer Ausbruchsbestaetigung aktiv",
-            "atr_percentile": "ATR-Perzentil-Schwelle (0-1)",
-            "time_window_must": "Nur Signale in aktiven Zeitfenstern (is_time_window_active=1)",
-            "min_bars_since_pivot": "Mindestbars seit letztem Pivot-Hit",
-            "use_regime_filter": "Regime-Filter (Trend/Volatility) aktivieren",
-        }
-
-    @property
-    def live_op(self) -> bool:
-        return True  # Dynamisch: wird bei Chart-Aufruf aktualisiert
-
-    @property
-    def required_features(self) -> List[str]:
-        # Nur Pflicht-Spalten. regime_volatility / regime_trend_score sind
-        # optional: evaluate() behandelt fehlende Regime-Spalten bereits mit
-        # Defaults (1.0 / 0.0), daher muessen sie nicht als Pflicht gelten.
-        return [
-            "grid_dist_pct",
-            "grid_nearest_level",
-            "is_time_window_active",
-            "atr_normalized",
-        ]
-
-    def evaluate(
-        self,
-        df_features: pd.DataFrame,
-        params: Optional[Dict[str, Any]] = None,
-    ) -> pd.Series:
-        """
-        Berechnet Confidence-Score [0.0, 1.0] basierend auf Grid-Proximity.
-
-        Args:
-            df_features: DataFrame mit Feature-Spalten aus feature_store.
-                         Benoetigt: grid_dist_pct, is_time_window_active,
-                         atr_normalized, regime_volatility, regime_trend_score
-            params: Ueberschreibt default_params
-
-        Returns:
-            pd.Series mit Confidence-Werten [0.0, 1.0]
-        """
-        p = {**self.default_params, **(params or {})}
-        prox_threshold = float(p["proximity_threshold_pct"])
-        conf_high = float(p["confidence_high"])
-        conf_low = float(p["confidence_low"])
-        vola_thresh = float(p["vola_regime_threshold"])
-        atr_enabled = bool(p["atr_filter_enabled"])
-        atr_pctile = float(p["atr_percentile"])
-        time_must = bool(p["time_window_must"])
-        min_bars = int(p["min_bars_since_pivot"])
-        use_regime = bool(p["use_regime_filter"])
-
-        n = len(df_features)
-        confidence = np.zeros(n, dtype=float)
-
-        if n < 2:
-            return pd.Series(confidence, index=df_features.index)
-
-        # --- Feature-Spalten extrahieren (mit Fallback auf NaN) ---
-        dist_pct = df_features.get("grid_dist_pct", pd.Series(np.nan, index=df_features.index)).values.astype(float)
-        nearest_level = df_features.get("grid_nearest_level", pd.Series(np.nan, index=df_features.index)).values.astype(float)
-        time_active = df_features.get("is_time_window_active", pd.Series(1, index=df_features.index)).values.astype(int)
-        atr_norm = df_features.get("atr_normalized", pd.Series(np.nan, index=df_features.index)).values.astype(float)
-        regime_vol = df_features.get("regime_volatility", pd.Series(1.0, index=df_features.index)).values.astype(float)
-        regime_score = df_features.get("regime_trend_score", pd.Series(0.0, index=df_features.index)).values.astype(float)
-
-        # close fuer Level-Berechnung (Fallback wenn keine grid_dist_pct)
-        close = df_features.get("close", pd.Series(np.nan, index=df_features.index)).values.astype(float)
-
-        # --- Hilfsvektoren ---
-        # Ist das Zeitfenster aktiv?
-        window_ok = time_active == 1 if time_must else np.ones(n, dtype=bool)
-
-        # Ist der Preis nahe einem Grid-Level?
-        # dist_pct < threshold bedeutet "nahe dran"
-        # NaN-Werte als "nicht nahe" behandeln
-        is_near = np.where(np.isfinite(dist_pct), dist_pct < prox_threshold, False)
-
-        # Ist der Preis genau AUF einem Level? (dist_pct extrem klein)
-        is_on_level = np.where(np.isfinite(dist_pct), dist_pct < prox_threshold * 0.1, False)
-
-        # Volatilitaets-Regime
-        low_vola = np.where(np.isfinite(regime_vol), regime_vol < vola_thresh, True)
-        high_vola = np.where(np.isfinite(regime_vol), regime_vol >= vola_thresh, False)
-
-        # ATR-Perzentil (dynamische Schwelle)
-        if atr_enabled:
-            atr_valid = atr_norm[np.isfinite(atr_norm)]
-            if len(atr_valid) > 10:
-                atr_threshold = np.percentile(atr_valid, atr_pctile * 100)
-                atr_high = atr_norm >= atr_threshold
-                atr_low = atr_norm < atr_threshold
-            else:
-                atr_high = np.zeros(n, dtype=bool)
-                atr_low = np.ones(n, dtype=bool)
-        else:
-            atr_high = np.ones(n, dtype=bool)
-            atr_low = np.ones(n, dtype=bool)
-
-        # --- Signallogik vektorisiert ---
-        for i in range(n):
-            if not window_ok[i]:
-                # Zeitfenster geschlossen -> neutral
-                confidence[i] = 0.0
-                continue
-
-            if np.isnan(dist_pct[i]) or np.isnan(nearest_level[i]):
-                # Keine Grid-Daten verfuegbar -> neutral
-                confidence[i] = 0.0
-                continue
-
-            # === Starkes Signal: Level-Touch (direkt auf Level) ===
-            if is_on_level[i]:
-                if use_regime and regime_score[i] > 0.3:
-                    # Level-Touch im Aufwaertstrend -> Bestaetigung
-                    confidence[i] = conf_high * 1.0
-                elif use_regime and regime_score[i] < -0.3:
-                    # Level-Touch im Abwaertstrend -> Abschwaechung
-                    confidence[i] = conf_high * 0.7
-                else:
-                    # Neutraler Trend -> mittel
-                    confidence[i] = conf_high * 0.85
-
-                # Vola-Boost: Level-Touch mit hoher Vola = staerkeres Signal
-                if high_vola[i] and atr_high[i]:
-                    confidence[i] = min(1.0, confidence[i] * 1.2)
-
-            # === Mittleres Signal: Preis nahe Level ===
-            elif is_near[i]:
-                base = conf_low
-                # Vola-Boost: Bei niedriger Vola ist Level-Naehe relevanter
-                if low_vola[i]:
-                    base *= 1.3
-                # Trend-Boost: In Trendrichtung
-                if use_regime and regime_score[i] > 0.3:
-                    base *= 1.2
-                confidence[i] = min(conf_high, base)
-
-            # === Schwaches Signal: Weit weg vom Level ===
-            else:
-                # Nur wenn Regime stark genug fuer "Ablehnung"
-                if use_regime and abs(regime_score[i]) > 0.6:
-                    confidence[i] = 0.1  # Sehr niedrig, aber nicht 0
-                else:
-                    confidence[i] = 0.0
-
-        # --- Glatttung: min_bars_since_pivot ---
-        # Nach einem starken Signal (confidence > 0.5) keine neuen Signale
-        # fuer min_bars Bars
-        if min_bars > 0:
-            for i in range(1, n):
-                lookback_start = max(0, i - min_bars)
-                lookback = confidence[lookback_start:i]
-                if np.any(lookback > 0.5):
-                    # Nur ueberschreiben wenn aktuelles Signal schwaecher
-                    if confidence[i] > 0.0 and confidence[i] < 0.5:
-                        confidence[i] = 0.0
-
-        return pd.Series(confidence, index=df_features.index)
-
-```
-
---------------------------------------------------
-
-### DATEI: analytics/signals/experimental/__init__.py
-```py
-
-```
-
---------------------------------------------------
-
-### DATEI: analytics/signals/experimental/alternating_arrow_signal.py
-```py
-# analytics/signals/experimental/alternating_arrow_signal.py
-"""
-Experimental Signal: Alternating Arrow Signal
-Erzeugt deterministisch alternierende Buy/Sell-Signale basierend auf dem
-bar_time-Index. Dient als Test-Signal für die Live-Pipeline (Tick -> Bar-Close
--> Feature Store -> Signal-Engine -> Persistence -> UI-Overlay).
-
-Signal-Logik:
-- Gerader bar_time-Index (bar_time % 2 == 0) -> Buy (confidence=1.0)
-- Ungerader bar_time-Index (bar_time % 2 == 1) -> Sell (confidence=1.0)
-- Erste Bar immer neutral (confidence=0.0)
-"""
-
-from typing import Any, Dict, Optional
-import pandas as pd
-import numpy as np
-from analytics.engine.base_definition import SignalDefinition
-
-
-class AlternatingArrowSignal(SignalDefinition):
-    """Erzeugt alternierende Buy/Sell-Pfeile für Testzwecke."""
-
-    @property
-    def signal_id(self) -> str:
-        return "alternating_arrow_v1"
-
-    @property
-    def display_name(self) -> str:
-        return "Alternating Arrow (Test)"
-
-    @property
-    def version(self) -> str:
-        return "1.0.0"
-
-    @property
-    def default_params(self) -> Dict[str, Any]:
-        return {
-            "confidence_buy": 1.0,
-            "confidence_sell": 1.0,
-            "skip_first_bars": 1,
-        }
-
-    @property
-    def param_descriptions(self) -> Dict[str, str]:
-        return {
-            "confidence_buy": "Confidence-Wert für Buy-Signale",
-            "confidence_sell": "Confidence-Wert für Sell-Signale",
-            "skip_first_bars": "Anzahl der ersten Bars ohne Signal",
-        }
-
-    @property
-    def required_features(self) -> list:
-        return []
-
-    @property
-    def live_op(self) -> bool:
-        """Testsignal ist deaktiviert (keine automatischen Test-Signale in der Live-Pipeline)."""
-        return False
-
-    def evaluate(self, df_features: pd.DataFrame, params: Optional[Dict[str, Any]] = None) -> pd.Series:
-        p = {**self.default_params, **(params or {})}
-        conf_buy = float(p["confidence_buy"])
-        conf_sell = float(p["confidence_sell"])
-        skip = int(p["skip_first_bars"])
-
-        n = len(df_features)
-        confidence = np.zeros(n, dtype=float)
-
-        if n <= skip:
-            return pd.Series(confidence, index=df_features.index)
-
-        # Alternierend: gerader Index = Buy, ungerader Index = Sell
-        for i in range(skip, n):
-            bar_time = df_features.iloc[i].get("bar_time", i)
-            # Nutze bar_time als Seed für deterministische Alternierung
-            if isinstance(bar_time, (int, float)):
-                idx_val = int(bar_time)
-            else:
-                idx_val = i
-
-            if idx_val % 2 == 0:
-                confidence[i] = conf_buy
-            else:
-                confidence[i] = conf_sell
-
-        return pd.Series(confidence, index=df_features.index)
-
-```
-
---------------------------------------------------
-
-### DATEI: analytics/signals/heuristics/__init__.py
-```py
-
-```
-
---------------------------------------------------
-
-### DATEI: analytics/signals/heuristics/atr_filter.py
-```py
-# analytics/signals/heuristics/atr_filter.py
-"""
-Signal: ATR-Filter
-Bewertet die Volatilitätssituation anhand des normalisierten ATR.
-- Hoher ATR (> Schwellwert) → hoher Confidence (Ausbruch/Volatilität)
-- Niedriger ATR → niedriger Confidence (Seitwärts/Konsolidierung)
-"""
-
-from typing import Any, Dict, Optional
-import pandas as pd
-import numpy as np
-from analytics.engine.base_definition import SignalDefinition
-
-
-class ATRFilterSignal(SignalDefinition):
-    @property
-    def signal_id(self) -> str:
-        return "atr_filter_v1"
-
-    @property
-    def display_name(self) -> str:
-        return "ATR Volatility Filter"
-
-    @property
-    def version(self) -> str:
-        return "1.0.0"
-
-    @property
-    def default_params(self) -> Dict[str, Any]:
-        return {
-            "threshold_pct": 0.8,       # ATR-Schwellwert in Prozent
-            "max_confidence": 1.0,       # Maximaler Confidence
-            "mode": "high_volatility",   # 'high_volatility' oder 'low_volatility'
-        }
-
-    @property
-    def param_descriptions(self) -> Dict[str, str]:
-        return {
-            "threshold_pct": "ATR-Schwellwert: ATR > threshold ergibt Confidence > 0",
-            "max_confidence": "Maximaler Confidence-Wert",
-            "mode": "Modus: 'high_volatility' oder 'low_volatility'",
-        }
-
-    @property
-    def required_features(self) -> list:
-        return ["atr_normalized"]
-
-    @property
-    def live_op(self) -> bool:
-        return False
-
-    def evaluate(self, df_features: pd.DataFrame, params: Optional[Dict[str, Any]] = None) -> pd.Series:
-        p = {**self.default_params, **(params or {})}
-        threshold = float(p["threshold_pct"])
-        max_conf = float(p["max_confidence"])
-        mode = str(p["mode"])
-
-        if "atr_normalized" not in df_features.columns:
-            raise ValueError("ATR-Filter Signal benötigt 'atr_normalized' im Feature-Store")
-
-        atr = df_features["atr_normalized"].values
-
-        if mode == "high_volatility":
-            # Hoher ATR → hoher Confidence
-            confidence = np.clip((atr - threshold) / (3 * threshold - threshold), 0.0, 1.0)
-        else:
-            # Niedriger ATR → hoher Confidence
-            confidence = np.clip((threshold - atr) / (threshold - 0.1), 0.0, 1.0)
-
-        confidence = confidence * max_conf
-        return pd.Series(confidence, index=df_features.index)
-
-```
-
---------------------------------------------------
-
-### DATEI: analytics/signals/heuristics/ema_trend.py
-```py
-# analytics/signals/heuristics/ema_trend.py
-"""
-Signal: EMA-Trend
-Bewertet die Trendstärke anhand der EMA-Differenz (ema_diff).
-- Stark positiv (> Schwellwert) → hoher Confidence für Aufwärtstrend
-- Stark negativ (< -Schwellwert) → hoher Confidence für Abwärtstrend
-- Nah an 0 → niedriger Confidence (kein klarer Trend)
-"""
-
-from typing import Any, Dict, Optional
-import pandas as pd
-import numpy as np
-from analytics.engine.base_definition import SignalDefinition
-
-
-class EMATrendSignal(SignalDefinition):
-    @property
-    def signal_id(self) -> str:
-        return "ema_trend_v1"
-
-    @property
-    def display_name(self) -> str:
-        return "EMA Trend Signal"
-
-    @property
-    def version(self) -> str:
-        return "1.0.0"
-
-    @property
-    def default_params(self) -> Dict[str, Any]:
-        return {
-            "threshold_pct": 0.3,       # Schwellwert in Prozent (absolut)
-            "max_confidence": 1.0,       # Maximaler Confidence bei starkem Trend
-            "direction": "both",         # 'long', 'short', 'both'
-        }
-
-    @property
-    def param_descriptions(self) -> Dict[str, str]:
-        return {
-            "threshold_pct": "Schwellwert: |ema_diff| > threshold ergibt Confidence > 0",
-            "max_confidence": "Maximaler Confidence-Wert bei sehr starkem Trend",
-            "direction": "Richtung: 'long', 'short' oder 'both'",
-        }
-
-    @property
-    def required_features(self) -> list:
-        return ["ema_diff"]
-
-    @property
-    def live_op(self) -> bool:
-        return False
-
-    def evaluate(self, df_features: pd.DataFrame, params: Optional[Dict[str, Any]] = None) -> pd.Series:
-        p = {**self.default_params, **(params or {})}
-        threshold = float(p["threshold_pct"])
-        max_conf = float(p["max_confidence"])
-        direction = str(p["direction"])
-
-        if "ema_diff" not in df_features.columns:
-            raise ValueError("EMA-Trend Signal benötigt 'ema_diff' im Feature-Store")
-
-        ema = df_features["ema_diff"].values
-        abs_ema = np.abs(ema)
-
-        # Confidence linear von 0 bei threshold bis max_conf bei 3*threshold
-        confidence = np.clip((abs_ema - threshold) / (3 * threshold - threshold), 0.0, 1.0)
-        confidence = confidence * max_conf
-
-        # Richtungsfilter
-        if direction == "long":
-            confidence[ema < 0] = 0.0
-        elif direction == "short":
-            confidence[ema > 0] = 0.0
-
-        return pd.Series(confidence, index=df_features.index)
-
-```
-
---------------------------------------------------
-
-### DATEI: analytics/signals/machine_learning/__init__.py
-```py
-
-```
-
---------------------------------------------------
-
-### DATEI: analytics/signals/machine_learning/lightgbm_signal.py
-```py
-# analytics/signals/machine_learning/lightgbm_signal.py
-"""
-ML-Signal: LightGBM Inferenz
-Lädt ein trainiertes LightGBM-Modell dynamisch über params['model_file']
-und führt Inferenz auf dem Feature-Store aus.
-
-Modell-Namenskonvention:
-    model_lgb_<symbol>_<timeframe>_<created_YYYYMMDD>_<updated_YYYYMMDD>.txt
-
-Abhängigkeit: lightgbm (pip install lightgbm)
-"""
-
-from typing import Any, Dict, Optional
-import pandas as pd
-import numpy as np
-from pathlib import Path
-
-from analytics.engine.base_definition import SignalDefinition
-
-
-class LightGBMSignal(SignalDefinition):
-    """LightGBM-Modell-Inferenz als Signal."""
-
-    @property
-    def signal_id(self) -> str:
-        return "lightgbm_v1"
-
-    @property
-    def display_name(self) -> str:
-        return "LightGBM ML Signal"
-
-    @property
-    def version(self) -> str:
-        return "1.0.0"
-
-    @property
-    def default_params(self) -> Dict[str, Any]:
-        return {
-            "model_file": "",           # Relativer Pfad zur .txt-Datei
-            "feature_columns": [],       # Liste der Feature-Spaltennamen
-            "threshold": 0.5,           # Schwellwert für binäre Klassifikation
-        }
-
-    @property
-    def param_descriptions(self) -> Dict[str, str]:
-        return {
-            "model_file": "Pfad zur LightGBM-Modelldatei (.txt)",
-            "feature_columns": "Liste der Feature-Spalten für die Inferenz",
-            "threshold": "Schwellwert für die binäre Klassifikation",
-        }
-
-    @property
-    def required_features(self) -> list:
-        return self._params.get("feature_columns", []) if hasattr(self, '_params') else []
-
-    def __init__(self):
-        super().__init__()
-        self._model = None
-        self._params = {}
-
-    def _load_model(self, model_path: str) -> None:
-        """Lädt das LightGBM-Modell (Booster) aus einer Datei."""
-        path = Path(model_path)
-        if not path.exists():
-            raise FileNotFoundError(f"LightGBM-Modell nicht gefunden: {model_path}")
-
-        try:
-            import lightgbm as lgb
-            self._model = lgb.Booster(model_file=str(path))
-            print(f"✅ LightGBM-Modell geladen: {path.name}")
-        except ImportError:
-            raise ImportError(
-                "LightGBM ist nicht installiert. "
-                "Installiere es mit: pip install lightgbm"
-            )
-
-    def evaluate(self, df_features: pd.DataFrame, params: Optional[Dict[str, Any]] = None) -> pd.Series:
-        p = {**self.default_params, **(params or {})}
-        self._params = p
-        model_file = str(p.get("model_file", ""))
-        feature_cols = list(p.get("feature_columns", []))
-        threshold = float(p.get("threshold", 0.5))
-
-        if not model_file:
-            raise ValueError("LightGBMSignal: 'model_file' ist nicht gesetzt")
-
-        if not feature_cols:
-            raise ValueError("LightGBMSignal: 'feature_columns' ist leer")
-
-        # Prüfen ob alle benötigten Features vorhanden sind
-        missing = [f for f in feature_cols if f not in df_features.columns]
-        if missing:
-            raise ValueError(f"LightGBMSignal: Fehlende Features: {missing}")
-
-        # Modell laden (cached)
-        if self._model is None:
-            self._load_model(model_file)
-
-        # Feature-Matrix erstellen
-        X = df_features[feature_cols].values
-
-        # Inferenz
-        try:
-            y_pred = self._model.predict(X)
-        except Exception as e:
-            raise RuntimeError(f"LightGBM-Inferenz fehlgeschlagen: {e}")
-
-        # Confidence = predicted probability (für binäre Klassifikation)
-        if y_pred.ndim > 1 and y_pred.shape[1] > 1:
-            # Multi-Class: nimm Wahrscheinlichkeit der positiven Klasse
-            confidence = y_pred[:, 1]
-        else:
-            confidence = y_pred.flatten()
-
-        # Clipping auf [0, 1]
-        confidence = np.clip(confidence, 0.0, 1.0)
-
-        return pd.Series(confidence, index=df_features.index)
-
-```
-
---------------------------------------------------
-
-### DATEI: analytics/signals/machine_learning/xgboost_signal.py
-```py
-# analytics/signals/machine_learning/xgboost_signal.py
-"""
-ML-Signal: XGBoost Inferenz
-Lädt ein trainiertes XGBoost-Modell dynamisch über params['model_file']
-und führt Inferenz auf dem Feature-Store aus.
-
-Modell-Namenskonvention:
-    model_xgb_<symbol>_<timeframe>_<created_YYYYMMDD>_<updated_YYYYMMDD>.json
-
-Abhängigkeit: xgboost (pip install xgboost)
-"""
-
-from typing import Any, Dict, Optional
-import pandas as pd
-import numpy as np
-from pathlib import Path
-
-from analytics.engine.base_definition import SignalDefinition
-
-
-class XGBoostSignal(SignalDefinition):
-    """XGBoost-Modell-Inferenz als Signal."""
-
-    @property
-    def signal_id(self) -> str:
-        return "xgboost_v1"
-
-    @property
-    def display_name(self) -> str:
-        return "XGBoost ML Signal"
-
-    @property
-    def version(self) -> str:
-        return "1.0.0"
-
-    @property
-    def default_params(self) -> Dict[str, Any]:
-        return {
-            "model_file": "",           # Relativer Pfad zur .json-Datei
-            "feature_columns": [],       # Liste der Feature-Spaltennamen
-            "threshold": 0.5,           # Schwellwert für binäre Klassifikation
-        }
-
-    @property
-    def param_descriptions(self) -> Dict[str, str]:
-        return {
-            "model_file": "Pfad zur XGBoost-Modelldatei (.json)",
-            "feature_columns": "Liste der Feature-Spalten für die Inferenz",
-            "threshold": "Schwellwert für die binäre Klassifikation",
-        }
-
-    @property
-    def required_features(self) -> list:
-        return self._params.get("feature_columns", []) if hasattr(self, '_params') else []
-
-    def __init__(self):
-        super().__init__()
-        self._model = None
-        self._params = {}
-
-    def _load_model(self, model_path: str) -> None:
-        """Lädt das XGBoost-Modell aus einer JSON-Datei."""
-        path = Path(model_path)
-        if not path.exists():
-            raise FileNotFoundError(f"XGBoost-Modell nicht gefunden: {model_path}")
-
-        try:
-            import xgboost as xgb
-            self._model = xgb.XGBClassifier()
-            self._model.load_model(str(path))
-            print(f"✅ XGBoost-Modell geladen: {path.name}")
-        except ImportError:
-            raise ImportError(
-                "XGBoost ist nicht installiert. "
-                "Installiere es mit: pip install xgboost"
-            )
-
-    def evaluate(self, df_features: pd.DataFrame, params: Optional[Dict[str, Any]] = None) -> pd.Series:
-        p = {**self.default_params, **(params or {})}
-        self._params = p
-        model_file = str(p.get("model_file", ""))
-        feature_cols = list(p.get("feature_columns", []))
-        threshold = float(p.get("threshold", 0.5))
-
-        if not model_file:
-            raise ValueError("XGBoostSignal: 'model_file' ist nicht gesetzt")
-
-        if not feature_cols:
-            raise ValueError("XGBoostSignal: 'feature_columns' ist leer")
-
-        # Prüfen ob alle benötigten Features vorhanden sind
-        missing = [f for f in feature_cols if f not in df_features.columns]
-        if missing:
-            raise ValueError(f"XGBoostSignal: Fehlende Features: {missing}")
-
-        # Modell laden (cached)
-        if self._model is None:
-            self._load_model(model_file)
-
-        # Feature-Matrix erstellen
-        X = df_features[feature_cols].values
-
-        # Inferenz
-        try:
-            y_pred = self._model.predict_proba(X)
-        except Exception as e:
-            raise RuntimeError(f"XGBoost-Inferenz fehlgeschlagen: {e}")
-
-        # Confidence = predicted probability der positiven Klasse
-        if y_pred.ndim > 1 and y_pred.shape[1] > 1:
-            confidence = y_pred[:, 1]
-        else:
-            confidence = y_pred.flatten()
-
-        # Clipping auf [0, 1]
-        confidence = np.clip(confidence, 0.0, 1.0)
-
-        return pd.Series(confidence, index=df_features.index)
-
-```
-
---------------------------------------------------
-
 ### DATEI: chart/__init__.py
 ```py
 # chart/__init__.py
@@ -24974,8 +23318,6 @@ except ImportError:
 
 from db_service import MarketDataRepository, _parse_json_field, TF_SECONDS_MAP
 
-from chart.overlays.signal_overlay import SignalOverlay
-
 
 def find_null_fields(obj, path=""):
     """Sucht rekursiv nach None/null in Dictionaries und Listen."""
@@ -25097,9 +23439,6 @@ class PyTraderChartWindow(QMainWindow):
         self._settings_dialog: Optional[QDialog] = None
         self._page_loaded: bool = False
 
-        self.signal_overlay = SignalOverlay()
-        # Signal-Marker standardmaessig AUS, toggle via Button (📈)
-        self._signals_enabled: bool = False
         self._grid_serializer: Optional[GridDataSerializer] = None
         self._chart_serializer: Optional[ChartDataSerializer] = None
         # Debounce-Timer für Chart-Refresh (verhindert Race-Conditions bei schnellen Wechseln)
@@ -25213,7 +23552,6 @@ class PyTraderChartWindow(QMainWindow):
         self.tf_combo = self.ui_widget.findChild(QComboBox, "combo_tf")
         self.btn_reset = self.ui_widget.findChild(QPushButton, "btn_reset_chart")
         self.btn_indicator_liquidity = self.ui_widget.findChild(QPushButton, "btn_indicator_grid_liquidity")
-        self.btn_signal = self.ui_widget.findChild(QPushButton, "btn_signal_select")
         self.chart_container = self.ui_widget.findChild(QWidget, "web_container")
 
         if self.symbol_combo:
@@ -25230,10 +23568,6 @@ class PyTraderChartWindow(QMainWindow):
             self.btn_indicator_liquidity.clicked.connect(self.toggle_grid_liquidity_lines)
             self.btn_indicator_liquidity.installEventFilter(self)
         self.update_indicator_button_style()
-
-        if self.btn_signal:
-            self.btn_signal.setCheckable(True)
-            self.btn_signal.clicked.connect(self.on_signal_button_clicked)
 
         self.web_view = QWebEngineView()
         self.web_view.setPage(WebEngineConsolePage(self.web_view))
@@ -25255,10 +23589,6 @@ class PyTraderChartWindow(QMainWindow):
         self.web_view.page().setWebChannel(self.channel)
         self.web_view.setHtml(build_html_template(), QUrl("https://localhost"))
         self.web_view.loadFinished.connect(self._on_page_loaded)
-
-    def _auto_init_signal_set(self) -> None:
-        """Nicht mehr verwendet - Testsignal ist deaktiviert."""
-        pass
 
     def eventFilter(self, watched, event):
         # Rechtsklick auf den Plugin-Grid-Button → Einstellungen für 'grid_liquidity'
@@ -25548,10 +23878,7 @@ class PyTraderChartWindow(QMainWindow):
 
     def _apply_grid_render(self, lines_json: str, circles_json: str, grid_gen: int) -> None:
         """Übergibt serialisierte Grid-Daten an JS (wird im GUI-Thread aufgerufen).
-        Verwirft veraltete Ergebnisse, falls inzwischen ein neuerer Render lief.
-        Nach dem Grid-Render werden die Signal-Marker IMMER neu gesetzt –
-        so können aktive Signale (EMA, Grid-Proximity) durch den Grid-Render
-        nie verdrängt werden (Marker-Cache-Robustheit)."""
+        Verwirft veraltete Ergebnisse, falls inzwischen ein neuerer Render lief."""
         if grid_gen < self._grid_generation:
             print(f"⚠️ [GridRender] Veraltetes Ergebnis verworfen (gen={grid_gen} < {self._grid_generation})")
             return
@@ -25564,13 +23891,6 @@ class PyTraderChartWindow(QMainWindow):
             if circles_json:
                 self.web_view.page().runJavaScript(
                     f"if(window.renderGridCircles) renderGridCircles('{circles_json}');")
-            # Signale nach dem Grid-Render wiederherstellen (falls aktiv).
-            # Guard in _update_signal_markers_only verhindert Arbeit während
-            # eines laufenden Chart-Refreshes.
-            try:
-                self._update_signal_markers_only()
-            except Exception as e:
-                print(f"⚠️ [GridRender] Signal-Marker-Update fehlgeschlagen: {e}")
         except (RuntimeError, AttributeError):
             pass
 
@@ -25692,7 +24012,6 @@ class PyTraderChartWindow(QMainWindow):
             "precision": precision,
             "gridLines": grid_lines,
             "gridCircles": grid_circles,
-            "signalMarkers": self._get_signal_markers_for_update(),
             "measurementState": self.measurement_state,
             "timeMap": self._time_cont_to_real,
             # TF_SECONDS_MAP: Python ist die Single Source of Truth. JS nutzt
@@ -25897,8 +24216,8 @@ class PyTraderChartWindow(QMainWindow):
                 self.visible_price_from = self.visible_price_to = None
                 self.measurement_state = None
 
-            # Phase 13 7.B: Alt-Chart-Trigger (fill_gaps_for_pair) entfernt –
-            # keine signal_results-Writes mehr. Marker lesen feature_store.
+            # Phase 15: Alt-Signal-Trigger (fill_gaps_for_pair) entfernt –
+            # keine signal_results-Writes mehr, keine Signal-Marker.
             self.refresh_chart_data()
 
     def on_tf_changed(self, t):
@@ -25937,162 +24256,9 @@ class PyTraderChartWindow(QMainWindow):
                 self.visible_price_from = self.visible_price_to = None
                 self.measurement_state = None
 
-            # Phase 13 7.B: Alt-Chart-Trigger (fill_gaps_for_pair) entfernt –
-            # keine signal_results-Writes mehr. Marker lesen feature_store.
+            # Phase 15: Alt-Signal-Trigger (fill_gaps_for_pair) entfernt –
+            # keine signal_results-Writes mehr, keine Signal-Marker.
             self.refresh_chart_data()
-
-    def on_signal_button_clicked(self):
-        """Schaltet ALLE Signal-Marker an/aus (Grid Proximity + EMA-Signale).
-        Testsignale (alternating_arrow_v1) bleiben deaktiviert.
-        Aktualisiert NUR die Signal-Marker, ohne Chart-Neubau."""
-        if not self.btn_signal:
-            return
-
-        self._signals_enabled = self.btn_signal.isChecked()
-        status = "AN" if self._signals_enabled else "AUS"
-        print(f"🔔 Signale: {status}")
-        self._update_signal_markers_only()
-
-    def _update_signal_markers_only(self) -> None:
-        """Aktualisiert NUR die Signal-Marker im Chart, OHNE kompletten Chart-Neubau.
-
-        HINWEIS: Bewusst KEIN _is_loading_data-Guard mehr. Der Grid-Render
-        (_apply_grid_render) ruft diese Funktion direkt nach dem Grid-Render
-        auf – waehrend eines laufenden Chart-Refreshes wuerde der Guard das
-        Signal-Update blockieren und die EMA-Marker waeren weg (Bug).
-        Die JS-seitige Marker-Kombination (Caches + _applyAllMarkers) ist
-        race-sicher, weil alle JS-Aufrufe sequenziell im Page-Thread laufen.
-        """
-        if not self._page_loaded or self.df_data is None or self.df_data.empty:
-            return
-
-        markers = self._get_signal_markers_for_update()
-        markers_json = json.dumps(markers, allow_nan=False)
-
-        # ======================================================================
-        # DEBUG-CHECK für Marker-Updates
-        # ======================================================================
-        try:
-            null_paths = find_null_fields(markers)
-            if null_paths:
-                print(f"🚨 [NULL MARKER in {self.current_symbol} {self.current_tf}] Gefundene null-Pfade:")
-                for p in null_paths[:10]:
-                    print(f"   -> markers{p}")
-        except Exception:
-            pass
-        # ======================================================================
-
-        try:
-            self.web_view.page().runJavaScript(
-                f"if(window.renderSignalMarkers) renderSignalMarkers({markers_json});"
-            )
-        except (RuntimeError, AttributeError) as e:
-            print(f"⚠️ [SignalMarker] JS-Fehler: {e}")
-
-    # ==============================================================================
-    # Live-Signal Integration (wird von MainWindow.on_live_signal gerufen)
-    # ==============================================================================
-
-    def on_live_signal_received(self, symbol: str, timeframe: str, bar_time: int, confidence: float, source_id: str) -> None:
-        """Wird vom MainWindow bei neuem Live-Signal gerufen.
-        Aktualisiert NUR die Marker, kein Chart-Neubau.
-        Blockiert waerend _is_loading_data (verhindert JS-Race-Condition)."""
-        if symbol != self.current_symbol or timeframe != self.current_tf:
-            return
-        if self._is_loading_data or not self._page_loaded:
-            return
-        self._update_signal_markers_only()
-
-    @staticmethod
-    def _apply_marker_styles(markers: List[Dict[str, Any]], source_id: str) -> List[Dict[str, Any]]:
-        """Wendet visuelle Stile auf Marker basierend auf source_id an.
-        Ermoeglicht Unterscheidung verschiedener Signal-Typen im Chart.
-        priority (int): Stapel-Reihenfolge bei gleicher Kerze in JS
-        (niedriger = näher an der Kerze, höher = weiter oben)."""
-        for m in markers:
-            if source_id == "alternating_arrow_v1":
-                # Alternierende Pfeile: Buy=arrowUp (oben), Sell=arrowDown (unten)
-                if m["time"] % 2 == 0:
-                    m["position"] = "belowBar"
-                    m["shape"] = "arrowUp"
-                    m["color"] = "#26a69a"  # Gruen
-                else:
-                    m["position"] = "aboveBar"
-                    m["shape"] = "arrowDown"
-                    m["color"] = "#ef5350"  # Rot
-                m["priority"] = 5
-            elif source_id in ("proximity", "grid_proximity_v1"):
-                # Grid-Proximity (feature_data) / Legacy: Kreise oberhalb
-                m["position"] = "aboveBar"
-                m["shape"] = "circle"
-                m["color"] = "#7B1FA2"  # Lila
-                m["priority"] = 10
-            elif source_id == "ema_atr_set_v1":
-                # EMA/ATR: Quadrate oberhalb
-                m["position"] = "aboveBar"
-                m["shape"] = "square"
-                m["color"] = "#FF9800"  # Orange
-                m["priority"] = 4
-            # Fuer neue Signalquellen hier einen eigenen Zweig ergaenzen.
-            # Ohne priority-Zweig gilt der JS-Default (0 = nahe an der Kerze).
-        return markers
-
-    def _get_signal_markers_for_update(self) -> List[Dict[str, Any]]:
-        """Sammelt alle Signal-Marker fuer den Chart-Update-Payload.
-        - Testsignal (alternating_arrow_v1): DEAKTIVIERT
-        - Grid Proximity (grid_proximity_v1): nur wenn Signal-Button aktiv
-        - EMA-Signale (ema_atr_set_v1): nur wenn Signal-Button aktiv
-        Marker-Zeiten werden auf Candle-Grenzen gerundet (exakter Match mit candleSeries in LWC v5)."""
-        if self.df_data is None or self.df_data.empty:
-            return []
-
-        t_sec = TF_SECONDS_MAP.get(str(self.current_tf).upper(), 60)
-
-        # 1) Testsignal (alternating_arrow_v1) DEAKTIVIERT – keine automatischen Test-Signale
-        markers: List[Dict[str, Any]] = []
-
-        # 2) Grid-Proximity (feature_data, feature_id='proximity') + EMA-Signale
-        #    NUR wenn der Signal-Button aktiv ist. Phase 13 Schritt 7.B:
-        #    BEIDE Marker-Quellen kommen aus dem feature_store (feature_id =
-        #    'proximity' bzw. 'ema_atr_set_v1') - der signal_results-Fallback
-        #    (Hybrid-Pfad) wurde entfernt.
-        if self._signals_enabled:
-            grid_markers = self._apply_marker_styles(
-                self.signal_overlay.fetch_markers(
-                    self.current_symbol, self.current_tf, "proximity"
-                ),
-                "proximity"
-            )
-            markers.extend(grid_markers)
-
-            ema_markers = self._apply_marker_styles(
-                self.signal_overlay.fetch_markers(
-                    self.current_symbol, self.current_tf, "ema_atr_set_v1"
-                ),
-                "ema_atr_set_v1"
-            )
-            markers.extend(ema_markers)
-
-        # Marker-Zeiten auf Candle-Grenzen runden + auf kontinuierliche Zeit mappen
-        if markers:
-            clean_markers = []
-            for m in markers:
-                mt = m.get("time")
-                if mt is None:
-                    continue
-                # Auf Candle-Timeframe-Grenze runden (z.B. H1: 3600er-Schritte)
-                rounded = int(mt) - (int(mt) % t_sec)
-                # Nur behalten + auf kontinuierliche Zeit mappen
-                if rounded in self._time_real_to_cont:
-                    m["time"] = self._time_real_to_cont[rounded]
-                    clean_markers.append(m)
-            markers = clean_markers
-            if markers:
-                print(f"   → Marker: {len(markers)} (kont. zeit, z.B. {markers[0]['time']})")
-            else:
-                print(f"   → KEINE Marker nach Filter! real_times samples={list(self._time_real_to_cont.keys())[:3]}")
-
-        return markers
 
     def fit_chart(self):
         try:
@@ -28604,8 +26770,6 @@ let _updateId = 0;
 let _lastAppliedUpdateId = 0; // höchste akzeptierte updateId (Race-Guard)
 let _continuousTimeMap = {};  // { cont_time: real_epoch } für tickMarkFormatter
 let _continuousKeys = [];     // sortierte cont-Schlüssel für resolveRealTime()
-// LWC v5: setMarkers() auf der Serie existiert nicht mehr – SeriesMarkers-Plugin verwenden
-let seriesMarkersPlugin = null;
 
 let isWindowActive = true;
 let lastRenderedPrice = null;
@@ -28784,14 +26948,13 @@ function renderGridLines(lines) {
     });
 }
 
-// NOTE: _storedSignalMarkersData (Signal-Layer) und die Proximity-Circles sind
-// getrennte Layer. Die Circles werden auf der ZUGEHOERIGEN LIQ-LINE geplottet:
+// NOTE: Die Proximity-Circles werden auf der ZUGEHOERIGEN LIQ-LINE geplottet:
 // Je Level-Preis wird eine UNSICHTBARE LineSeries erzeugt (lineVisible:false,
 // autoscaleInfoProvider:null, rechte Preisskala), deren Datenpunkte exakt auf
 // dem Level-Preis liegen. Die Circle-Marker (Standard-Marker der Engine, shape
 // 'circle') haengen an dieser Serie -> die Engine positioniert sie direkt auf
 // der Liq-Line. Das folgt Zoom/Scroll/Resize nativ (kein CSS-Overlay, kein
-// Redraw-Bug) und verdraengt die Signal-Marker nie.
+// Redraw-Bug).
 function clearGridCircles() {
     for (var i = 0; i < _circleSeries.length; i++) {
         try { chart.removeSeries(_circleSeries[i]); } catch(e) {}
@@ -28927,87 +27090,6 @@ function applyRange(rangeFrom, rangeTo, priceFrom, priceTo) {
     if (priceFrom !== undefined && priceTo !== undefined && priceFrom !== priceTo) {
         try { priceScale.setVisibleRange({ from: Number(priceFrom), to: Number(priceTo) }); } catch(e) {}
     }
-}
-
-// Signal-Marker: eigenes Marker-Layer auf candleSeries. Die Proximity-Circles
-// liegen separat (unsichtbare LineSeries je Level auf der Liq-Line) und werden
-// NICHT mit den Signal-Markern gemischt.
-var _storedSignalMarkersData = [];
-
-function clearSignalMarkers() {
-    // Nur das Signal-Layer leeren – Circles bleiben aus dem Cache erhalten.
-    // (Im Chart-Refresh wird das Plugin anschliessend ohnehin neu aufgebaut.)
-    _storedSignalMarkersData = [];
-    _applyAllMarkers();
-}
-
-function renderSignalMarkers(markers) {
-    var data = (typeof markers === 'string') ? JSON.parse(markers) : markers;
-    // Cache IMMER aktualisieren (auch bei leerer Liste) – verhindert, dass
-    // ein veralteter Cache nach dem Ausschalten der Signale wieder auftaucht.
-    _storedSignalMarkersData = data || [];
-    _applyAllMarkers();
-}
-
-function _applyAllMarkers() {
-    if (!candleSeries) return;
-    try {
-        var allMarkers = [];
-
-        // 1. Signal-Marker (aus dem Signal-Cache)
-        if (_storedSignalMarkersData && _storedSignalMarkersData.length > 0) {
-            for (var i = 0; i < _storedSignalMarkersData.length; i++) {
-                var m = _storedSignalMarkersData[i];
-                allMarkers.push({
-                    time: m.time,
-                    position: m.position || 'aboveBar',
-                    color: m.color || '#26a69a',
-                    shape: m.shape || 'arrowDown',
-                    size: (m.size !== undefined) ? m.size : 1,
-                    text: m.text || '',
-                    // priority steuert die Stapel-Reihenfolge bei gleicher Kerze
-                    // (niedriger = näher an der Kerze, höher = weiter oben).
-                    // Wird von der LWC-Engine ignoriert (explizite Feldliste) –
-                    // dient NUR unserer Sortierung.
-                    priority: (m.priority !== undefined && m.priority !== null) ? m.priority : 0
-                });
-            }
-        }
-
-        // 2. Proximity-Circles werden NICHT hier gerendert – sie liegen als
-        // unsichtbare LineSeries je Level-Preis direkt auf den Liq-Lines
-        // (siehe renderGridCircles) und sind eigenstaendige Engine-Serien.
-
-        // LWC v5: candleSeries.setMarkers() wurde entfernt → SeriesMarkers-Plugin nutzen.
-        // Das Plugin wird pro Chart-Instanz einmalig erzeugt (Reset in applyFullChartUpdate).
-        // WICHTIG (v5.2.0-Engine): setMarkers() erwartet ein NACH ZEIT SORTIERTES Array:
-        //  - Die interne Suche nach dem sichtbaren Bereich ist eine Binärsuche (unsortiert = falsche Grenzen).
-        //  - Mehrere Marker DERSELBEN Kerze werden nur vertikal gestapelt, wenn sie im Array
-        //    BENACHBART sind (Stack-Offset resettet bei jedem Zeitsprung). Unsortiert überdecken
-        //    sich Marker derselben Kerze exakt.
-        // Sortierung (stabil seit ES2019):
-        //   1. Kriterium: Zeit (Pflicht für die Engine).
-        //   2. Kriterium: priority (Stapel-Reihenfolge bei gleicher Kerze).
-        //      Niedrige priority = näher an der Kerze, hohe = weiter oben.
-        //      Gleiche priority => Einfüge-Reihenfolge bleibt erhalten.
-        allMarkers.sort(function(a, b) {
-            if (a.time !== b.time) return a.time - b.time;
-            var pa = (typeof a.priority === 'number') ? a.priority : 0;
-            var pb = (typeof b.priority === 'number') ? b.priority : 0;
-            return pa - pb;
-        });
-
-        if (!seriesMarkersPlugin) {
-            seriesMarkersPlugin = LightweightCharts.createSeriesMarkers(candleSeries, []);
-        }
-        seriesMarkersPlugin.setMarkers(allMarkers);
-    } catch(e) {
-        console.error('[setMarkers] Error:', e.message || e);
-    }
-}
-
-function reapplySignalMarkers() {
-    _applyAllMarkers();
 }
 
 // =============================================================================
@@ -29416,7 +27498,6 @@ function applyFullChartUpdate(data) {
         // Alte Resourcen entfernen
         try { clearGridCircles(); } catch(e) {}
         try { clearGridLines(); } catch(e) {}
-        try { clearSignalMarkers(); } catch(e) {}
         if (currentPriceLine) {
             try { if (candleSeries) candleSeries.removePriceLine(currentPriceLine); } catch(e) {}
             currentPriceLine = null;
@@ -29440,7 +27521,6 @@ function applyFullChartUpdate(data) {
         _circleSeries = [];
         _circleMarkerPlugins = [];
         _circleLevelSeries = {};
-        seriesMarkersPlugin = null;
         try { DaySeparator.clear(); } catch(e) {}
 
         var container = document.getElementById('chart-container');
@@ -29571,16 +27651,7 @@ function applyFullChartUpdate(data) {
             console.warn('[applyFullChartUpdate] Schritt 6 (gridCircles) fehlgeschlagen:', e.message || e);
         }
 
-        // Schritt 7: Signal-Marker (eigenes Marker-Layer auf candleSeries;
-        // Proximity-Circles liegen separat auf ihren Level-Serien).
-        try {
-            _storedSignalMarkersData = data.signalMarkers || [];
-            _applyAllMarkers();
-        } catch(e) {
-            console.warn('[applyFullChartUpdate] Schritt 7 (signalMarkers) fehlgeschlagen:', e.message || e);
-        }
-
-        // Schritt 8: Range
+        // Schritt 7: Range
         try {
             if (data.rangeFrom !== undefined && data.rangeTo !== undefined &&
                 data.rangeFrom !== null && data.rangeTo !== null &&
@@ -29591,15 +27662,15 @@ function applyFullChartUpdate(data) {
                 if (chart) chart.timeScale().fitContent();
             }
         } catch(e) {
-            console.warn('[applyFullChartUpdate] Schritt 8 (applyRange) fehlgeschlagen:', e.message || e);
+            console.warn('[applyFullChartUpdate] Schritt 7 (applyRange) fehlgeschlagen:', e.message || e);
         }
 
-        // Schritt 9: Day Separators (gekapseltes Modul, CSS-Overlay)
+        // Schritt 8: Day Separators (gekapseltes Modul, CSS-Overlay)
         try { DaySeparator.render(rawCandleData); } catch(e) {
-            console.warn('[applyFullChartUpdate] Schritt 9 (daySeparators) fehlgeschlagen:', e.message || e);
+            console.warn('[applyFullChartUpdate] Schritt 8 (daySeparators) fehlgeschlagen:', e.message || e);
         }
 
-        // Schritt 10: Measurement-State wiederherstellen (Messbox nach Refresh
+        // Schritt 9: Measurement-State wiederherstellen (Messbox nach Refresh
         // bzw. Fenster-Neustart). Ohne State im Payload wird die Box geleert.
         try {
             if (window.Measurement) {
@@ -29610,7 +27681,7 @@ function applyFullChartUpdate(data) {
                 }
             }
         } catch(e) {
-            console.warn('[applyFullChartUpdate] Schritt 10 (measurement) fehlgeschlagen:', e.message || e);
+            console.warn('[applyFullChartUpdate] Schritt 9 (measurement) fehlgeschlagen:', e.message || e);
         }
 
         // Fertig – isUpdatingChart freigeben + initialen sync
@@ -30026,192 +28097,6 @@ var Measurement = (function() {
 
 ### DATEI: chart/overlays/__init__.py
 ```py
-
-```
-
---------------------------------------------------
-
-### DATEI: chart/overlays/signal_overlay.py
-```py
-# chart/overlays/signal_overlay.py
-"""
-Signal-Overlay – Liest Marker-Daten aus analytics.duckdb und bereitet sie
-als Lightweight Charts Marker-Daten für das Chart-Fenster auf.
-
-Phase 13 Schritt 7: Die Marker kommen aus den Feature-Store-Daten
-(feature_store.feature_data, feature_id = Plugin-Identität).
-Phase 13 Schritt 7.B: Rückbau der Alt-Signal-Mechanik abgeschlossen –
-der Legacy-Fallback auf signal_results wurde ENTFERNT; es gibt nur noch
-den feature_store-Pfad.
-"""
-
-from typing import Any, Dict, List, Optional
-import duckdb
-from pathlib import Path
-
-from db_service import DbPool
-from state_manager import StateManager
-
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
-DB_ANALYTICS = str(BASE_DIR / "data" / "analytics.duckdb")
-
-
-class SignalOverlay:
-    """
-    Liest Marker aus feature_data (feature_id = Plugin-Identität) für die
-    Darstellung im Chart. Kein signal_results-Fallback mehr (Phase 13 7.B).
-    """
-
-    def __init__(self):
-        self._current_set_id: Optional[str] = None
-        self._state_mgr = StateManager()
-        self._settings = self._state_mgr.get_app_settings()
-
-    @property
-    def current_set_id(self) -> Optional[str]:
-        return self._current_set_id
-
-    def get_available_sets(self) -> List[str]:
-        """Liefert alle verfügbaren Sets aus den Feature-Store-Daten.
-
-        Phase 13 Schritt 7: Quelle sind die feature_data-Einträge
-        (feature_id IS NOT NULL + feature_data gefüllt) – NICHT mehr
-        `SELECT DISTINCT source_id FROM signal_results`.
-        Das 'Set' = feature_id (die feature_store-Tabelle hat keine set_id).
-        """
-        if not Path(DB_ANALYTICS).exists():
-            return []
-        con = DbPool.get(DB_ANALYTICS)
-        rows = con.execute("""
-            SELECT DISTINCT feature_id
-            FROM feature_store
-            WHERE feature_id IS NOT NULL AND feature_data IS NOT NULL
-            ORDER BY feature_id
-        """).fetchall()
-        return [r[0] for r in rows]
-
-    def set_active_set(self, set_id: str):
-        self._current_set_id = set_id
-
-    def fetch_markers(
-        self,
-        symbol: str,
-        timeframe: str,
-        set_id: Optional[str] = None,
-        limit: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Holt Marker aus den Feature-Store-Daten (feature_id).
-
-        Phase 13 Schritt 7.B: Nur noch feature_store – der Legacy-Fallback
-        auf signal_results wurde entfernt. set_id = feature_id.
-
-        Args:
-            symbol: Symbol-Name
-            timeframe: Timeframe
-            set_id: feature_id (optional, sonst current_set_id)
-            limit: Maximale Anzahl Marker
-
-        Returns:
-            Liste von Marker-Dicts für Lightweight Charts:
-            [{time, position, color, shape, size, text}, ...]
-        """
-        if set_id is None:
-            set_id = self._current_set_id
-        if set_id is None:
-            return []
-
-        if limit is None:
-            limit = self._settings.signal_marker_limit
-
-        if not Path(DB_ANALYTICS).exists():
-            return []
-
-        con = DbPool.get(DB_ANALYTICS)
-        return self._fetch_markers_from_feature_data(
-            con, symbol, timeframe, set_id, limit)
-
-    def _fetch_markers_from_feature_data(
-        self,
-        con: duckdb.DuckDBPyConnection,
-        symbol: str,
-        timeframe: str,
-        feature_id: str,
-        limit: int,
-    ) -> List[Dict[str, Any]]:
-        """Baut Marker aus feature_data (is_hit=true).
-
-        WICHTIG: Subquery mit DESC + äußeres ASC für Lightweight Charts;
-        EXTRACT(epoch) direkt in SQL, damit DuckDB TIMESTAMPTZ korrekt
-        verarbeitet.
-
-        Zwei Record-Typen (Phase 13 7.B, nach Rückbau der Alt-Mechanik):
-          - Proximity-Records (feature_id='proximity' bzw. grid-Proximity):
-            besitzen levels_hit + in_time_window → Text = Anzahl getroffener
-            Levels, Farbe grün (im nativen UTC-Zeitfenster) / fuchsia.
-          - EMA/ATR-Records (z. B. feature_id='ema_atr_set_v1'): besitzen
-            KEIN levels_hit/in_time_window → confidence-basierte Farbe und
-            Text = Confidence-Prozent.
-        """
-        rows = con.execute("""
-            SELECT EXTRACT('epoch' FROM bar_time)::BIGINT AS time_epoch,
-                   feature_data
-            FROM (
-                SELECT bar_time, feature_data
-                FROM feature_store
-                WHERE symbol = ? AND timeframe = ? AND feature_id = ?
-                  AND feature_data IS NOT NULL
-                ORDER BY bar_time DESC
-                LIMIT ?
-            )
-            ORDER BY bar_time ASC
-        """, [symbol, timeframe, feature_id, limit]).fetchall()
-
-        markers = []
-        for row in rows:
-            time_sec = row[0]
-            if time_sec is None or time_sec <= 0:
-                continue
-
-            data = row[1] or {}
-            # DuckDB liefert JSON-Spalten als String – ggf. parsen.
-            if isinstance(data, str):
-                try:
-                    import json
-                    data = json.loads(data) or {}
-                except (ValueError, TypeError):
-                    data = {}
-            if not data.get("is_hit"):
-                continue
-
-            levels = data.get("levels_hit")
-            in_window = bool(data.get("in_time_window"))
-            confidence = float(data.get("confidence_total") or 0.0)
-
-            if levels is not None:
-                # Proximity-Record: Anzahl getroffener Levels + Zeitfenster
-                text = str(len(levels))
-                color = "#26a69a" if in_window else "#E91E63"  # grün / fuchsia
-            else:
-                # EMA/ATR-Record (Phase 13 7.B): Confidence-basierte Farbe
-                if confidence >= 0.8:
-                    color = "#26a69a"   # Grün (stark)
-                elif confidence >= 0.5:
-                    color = "#FFEB3B"   # Gelb (mittel)
-                else:
-                    color = "#ef5350"   # Rot (schwach)
-                text = f"{confidence:.0%}"
-
-            markers.append({
-                "time": time_sec,
-                "position": "aboveBar",
-                "color": color,
-                "shape": "circle",
-                "size": 1,
-                "text": text,
-            })
-
-        return markers
 
 ```
 
@@ -31224,7 +29109,6 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # Controls
         self.combo_symbol: QComboBox = self.ui.findChild(QComboBox, "combo_symbol")
         self.check_new_scan: QCheckBox = self.ui.findChild(QCheckBox, "check_new_scan")
-        self.check_grid_scan: QCheckBox = self.ui.findChild(QCheckBox, "check_grid_scan")
         self.btn_start: QPushButton = self.ui.findChild(QPushButton, "btn_start_scan")
         self.label_elapsed: QLabel = self.ui.findChild(QLabel, "label_elapsed_value")
         self.progress_bar: QProgressBar = self.ui.findChild(QProgressBar, "progress_bar")
@@ -31416,33 +29300,31 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
 
         symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
         new_scan = self.check_new_scan.isChecked() if self.check_new_scan else False
-        grid_scan = self.check_grid_scan.isChecked() if self.check_grid_scan else False
 
         # U15-D2 (Bedien-Feinschliff): Bestätigungsdialog vor FULL SCAN.
-        # new_scan=True löscht bestehende Signale und berechnet neu
-        # (HistoricalScanner: "Modus: FULL SCAN ... werden geloescht") –
+        # new_scan=True löscht bestehende Feature-Rows und berechnet neu
+        # (HistoricalScanner: "Modus: FULL SCAN ...") –
         # dieser Overwrite ist unwiderruflich, daher Rückfrage.
         if new_scan:
             reply = QMessageBox.question(
                 self, "Voll-Scan bestätigen",
                 f"Voll-Scan für {symbol}?\n\n"
-                "Bestehende Signale werden GELÖSCHT und neu berechnet "
-                "(unwiderruflich). Fortfahren?",
+                "Bestehende Feature-Rows werden überschrieben und neu "
+                "berechnet (unwiderruflich). Fortfahren?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
             if reply != QMessageBox.Yes:
                 self.log("Voll-Scan abgebrochen.")
                 return
 
-        mode = "GRID PROXIMITY" if grid_scan else "EMA+ATR STANDARD"
-        self.log(f"Starte {mode}-Scan: {symbol}, New Scan = {new_scan}")
+        self.log(f"Starte Plugin-Batch: {symbol}, New Scan = {new_scan}")
         self.btn_start.setEnabled(False)
         self._elapsed_seconds = 0
         self.label_elapsed.setText("00:00:00")
         self.progress_bar.setValue(0)
         self._elapsed_timer.start(1000)
 
-        self.scanner = HistoricalScanner(symbol, new_scan, grid_scan)
+        self.scanner = HistoricalScanner(symbol, new_scan)
         self.scanner.progress_updated.connect(self.on_progress)
         self.scanner.scan_finished.connect(self.on_finished)
         self.scanner.log_message.connect(self.log)
@@ -31458,7 +29340,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
     def on_finished(self, symbol: str, count: int):
         self._elapsed_timer.stop()
         self.btn_start.setEnabled(True)
-        self.log(f"Scan für {symbol} beendet: {count} Signale geschrieben.")
+        self.log(f"Scan für {symbol} beendet: {count} Feature-Rows geschrieben.")
 
     @Slot(str)
     def log(self, message: str):
@@ -32585,13 +30467,13 @@ for sym, tf in pairs:
     except Exception as e:
         print(f"{sym:7s} {tf:4s} -> ERROR: {e}")
 
-# Marker-Query (SignalOverlay.fetch_markers) – Phase 13 7.B: feature_store
-# (feature_data, feature_id), KEIN signal_results-Fallback mehr.
+# Marker-Query (feature_store, feature_id) – Phase 15: Alt-Signale
+# (grid_proximity_v1, ema_atr_set_v1) entfernt. Aktiv sind nur noch die
+# Plugin-IDs 'proximity' und 'grid_liquidity'.
 acon = duckdb.connect(str(ANALYTICS), read_only=True)
-print("\n--- fetch_markers queries (feature_store, feature_id) ---")
-for sym, tf, fid in [("SILVER", "H1", "grid_proximity_v1"), ("SILVER", "M5", "grid_proximity_v1"),
-                     ("GOLD", "H1", "grid_proximity_v1"),
-                     ("SILVER", "H1", "ema_atr_set_v1"), ("SILVER", "H1", "proximity")]:
+print("\n--- feature_store queries (feature_id, Plugin-Daten) ---")
+for sym, tf, fid in [("SILVER", "H1", "proximity"), ("SILVER", "M5", "proximity"),
+                     ("GOLD", "H1", "proximity"), ("SILVER", "H1", "grid_liquidity")]:
     try:
         rows = acon.execute("""
             SELECT EXTRACT(epoch FROM bar_time)::BIGINT AS time_epoch, feature_data
@@ -32962,6 +30844,9 @@ print('\nRESULT: PASS')
 #   - Rechtsklick öffnet direkt die Einstellungen für 'grid_liquidity'
 #     (kein Auswahl-Menü mehr).
 #
+# Phase 15 (Signal-Rückbau): Der Signal-Button 'btn_signal_select' wurde
+# ebenfalls entfernt – rechts neben dem Plugin-Button steht nichts mehr.
+#
 # KEINE UI-Tests (Regel Agents.md §4): reine Code-/XML-Inspektion, kein Qt-Start.
 import sys
 import xml.etree.ElementTree as ET
@@ -33019,8 +30904,8 @@ row1_ids = [w.attrib.get("name") for w in row1.iter("widget")] if row1 is not No
 row2_ids = [w.attrib.get("name") for w in row2.iter("widget")] if row2 is not None else []
 check("btn_indicator_grid" not in row1_ids, "Alt-Button '#' NICHT mehr in Zeile 1")
 check("btn_indicator_grid_liquidity" in row1_ids, "Plugin-Button '◆' in der obersten Zeile (row1)")
-# Reihenfolge in Zeile 1: Symbol, TF, Spacer, ◆, 📈 → die beiden Buttons stehen
-# am RECHTEN RAND (hinter dem Spacer), ◆ direkt neben 📈.
+# Reihenfolge in Zeile 1: Symbol, TF, Spacer, ◆ → der Plugin-Button steht am
+# RECHTEN RAND (hinter dem Spacer), der Signal-Button '📈' wurde entfernt.
 def _row1_sequence(layout):
     """Kind-Reihenfolge von row1: Widget-Namen und Spacer-Markierungen.
     Ein QHBoxLayout enthält <item>-Elemente, die jeweils genau ein Widget
@@ -33044,13 +30929,13 @@ if "horizontalSpacer_row1" in row1_seq:
     buttons_after = row1_seq[spacer_pos + 1:]
     check("btn_indicator_grid" not in buttons_after, "Alt-Button '#' NICHT nach dem Spacer")
     check("btn_indicator_grid_liquidity" in buttons_after, "Plugin-Button '◆' NACH dem Spacer (am rechten Rand)")
-    check("btn_signal_select" in buttons_after, "Signal-Button '📈' NACH dem Spacer (am rechten Rand)")
-    check(buttons_after == ["btn_indicator_grid_liquidity", "btn_signal_select"],
-          "Rechte Rand-Gruppe exakt: ◆ , 📈 (in dieser Reihenfolge)")
+    check("btn_signal_select" not in buttons_after, "Signal-Button '📈' ENTFERNT (Phase 15 Signal-Rückbau)")
+    check(buttons_after == ["btn_indicator_grid_liquidity"],
+          "Rechte Rand-Gruppe exakt: nur ◆ (kein 📈 mehr)")
 else:
     check(False, "horizontalSpacer_row1 vor den Buttons vorhanden (rechter Rand)")
 check("btn_reset_chart" in row2_ids, "Reset-Button in Zeile 2")
-check("btn_signal_select" not in row2_ids, "Signal-Button NICHT mehr in Zeile 2 (jetzt in Zeile 1)")
+check("btn_signal_select" not in row2_ids, "Signal-Button NICHT in Zeile 2 (entfernt)")
 # Insgesamt nur 2 Control-Zeilen
 total_rows = 0
 for layout in ui_xml.iter("layout"):
@@ -33110,7 +30995,11 @@ check("QMenu" not in src, "QMenu-Import entfernt")
 print("\n[6] Button-Style (Plugin-Indikator):")
 check('self._apply_indicator_button_style(self.btn_indicator_liquidity, "grid_liquidity")' in src,
       "Style Plugin-Button ↔ 'grid_liquidity'")
-check('"grid"' not in src.replace('"grid_liquidity"', ''), "kein Alt-'grid'-Eintrag im Style/Registry")
+# Kein Alt-'grid' mehr in Registry/Style: Erlaubt sind nur die dokumentierten
+# Legacy-State-Cleanups (indicators_state.pop('grid', None) für persistierte
+# Alt-Einträge aus der DB).
+_grid_cleaned = src.replace('"grid_liquidity"', '').replace('self.indicators_state.pop("grid", None)', '')
+check('"grid"' not in _grid_cleaned, "kein Alt-'grid'-Eintrag im Style/Registry")
 
 print()
 if ok:
@@ -34172,24 +32061,25 @@ else:
 ```py
 ﻿# BEREIT FÜR PHASE 15
 # test/check_grid_scan_integration.py
-# Integrationstest Phase 11 (Rest): Service-Scan-Pfad fuer grid_proximity_v1.
+# Integrationstest (Phase 11 Rest + Phase 15 Plugin-Pfad): Feature-Pipeline
+# und Plugin-Batch des HistoricalScanner.
 #
-# Validiert den kompletten entkoppelten Datenfluss, wie ihn der
-# HistoricalScanner (grid_scan=True) und der LiveAnalyzer nutzen:
+# Phase 15 (Alt-Signal-Rückbau): Der Alt-Service-Scan (grid_scan=True über
+# SetEvaluator mit grid_proximity_v1) wurde komplett entfernt. Stattdessen
+# validiert der Test den modernen Plugin-Pfad:
 #
 #   OHLCV -> calculate_features(atr_normalized + grid_levels)
 #         -> store_features  (feature_store)
-#         -> SetEvaluator.evaluate_set(grid_proximity_v1)
-#         -> signal_binary / confidence
+#         -> PluginExecutor.execute('grid_liquidity')
+#         -> feature_store_payload (feature_id='grid_liquidity')
 #
 # Zusaetzlich:
 #   - Spaltenname -> Feature-Modul Aufloesung im FeatureBuilder
-#     (grid_dist_pct etc. => grid_levels), wie vom LiveAnalyzer benoetigt
-#   - HistoricalScanner-Konfiguration (grid_scan=True vs. Standard-Scan)
-#   - GridProximitySignal.required_features enthaelt nur verfuegbare Spalten
-#     (kein SetEvaluator-Skip wegen fehlender Regime-Features)
+#     (grid_dist_pct etc. => grid_levels)
+#   - HistoricalScanner: Plugin-Batch-Interface (KEIN grid_scan-Param mehr)
 #
-# HINWEIS: Der Indikator (chart/indicators/grid.py) wird nicht veraendert.
+# HINWEIS: Der Indikator (chart/indicators/grid_liquidity.py) wird nicht
+# veraendert.
 import os
 import sys
 from datetime import datetime, timezone as dt_timezone
@@ -34200,9 +32090,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import duckdb
 import pandas as pd
 
-from analytics.engine.set_evaluator import SetEvaluator
-from analytics.features.feature_builder import FeatureBuilder
-from analytics.signals.composite.grid_proximity_signal import GridProximitySignal
+from analytics.features.feature_builder import FeatureBuilder, PluginExecutor, prepare_plugin_df
 
 ok = True
 failures = []
@@ -34317,6 +32205,9 @@ try:
             grid_dist_abs       DOUBLE,
             grid_dist_pct       DOUBLE,
             is_time_window_active INTEGER,
+            feature_id VARCHAR,
+            plugin_version VARCHAR,
+            feature_data JSON,
             PRIMARY KEY (symbol, timeframe, bar_time)
         )
     """)
@@ -34335,6 +32226,30 @@ try:
     check("Store: nearest_level Bar 3 = 30.5", approx(rows[3][0], 30.5))
     check("Store: dist_abs Bar 2 = 0.02", approx(rows[2][1], 0.02))
     check("Store: is_time_window_active Bar 1 = 0", int(rows[1][3]) == 0)
+
+    # =========================================================================
+    # 4) Plugin-Pfad: grid_liquidity via PluginExecutor (feature_store_payload)
+    # =========================================================================
+    print("\n=== 4) Plugin-Pfad (grid_liquidity via PluginExecutor) ===")
+    executor = PluginExecutor()
+    df_plugin = prepare_plugin_df(df)
+    result = executor.execute("grid_liquidity", df_plugin, {})
+    payload = result.get("feature_store_payload", {})
+    check("feature_store_payload vorhanden", isinstance(payload, dict) and payload)
+    check("feature_id='grid_liquidity'", payload.get("feature_id") == "grid_liquidity")
+    records = payload.get("records") or []
+    check("5 Feature-Records (alle Bars)", len(records) == 5)
+    hits = [r for r in records if r.get("is_hit")]
+    # Bars 0/1/2/4: dist <= 0.05 zu Level 30.0; Bar 3 (30.30, Level 30.5): dist 0.20
+    check("4 Hits (Bars 0/1/2/4)", len(hits) == 4)
+    if hits:
+        hit_times = sorted(int(r["bar_time"]) for r in hits)
+        exp_hit_times = sorted(int(t.timestamp()) for t in [times[0], times[1], times[2], times[4]])
+        check("Hit-Zeiten = Bars 0/1/2/4", hit_times == exp_hit_times)
+    # Zeitfenster-Flag konsistent zur nativen Logik
+    for i, rec in enumerate(records):
+        check(f"Record Bar {i}: is_time_window_active={rec.get('is_time_window_active')}",
+              int(rec.get("is_time_window_active")) == exp_flags[i])
 finally:
     if os.path.exists(tmp_db):
         try:
@@ -34343,61 +32258,18 @@ finally:
             print("  (Hinweis: tmp-DB konnte nicht geloescht werden)")
 
 # ===========================================================================
-# 4) Signal-Evaluierung (grid_proximity_v1 via SetEvaluator)
+# 5) HistoricalScanner: Plugin-Batch-Interface (KEIN grid_scan mehr)
 # ===========================================================================
-print("\n=== 4) Signal-Evaluierung ===")
-signal = GridProximitySignal()
-check("required_features ohne Regime-Pflicht", signal.required_features == [
-    "grid_dist_pct", "grid_nearest_level", "is_time_window_active", "atr_normalized",
-])
-
-set_config = {
-    "signals": [
-        {"id": "grid_proximity_v1", "weight": 1.0, "params": {"confidence_low": 0.5}},
-    ],
-    "threshold": 0.5,
-}
-evaluator = SetEvaluator({"grid_proximity_v1": signal})
-result = evaluator.evaluate_set(set_config, df_feat)
-
-check("SetEvaluator: conf_grid_proximity_v1 vorhanden", "conf_grid_proximity_v1" in result.columns)
-check("SetEvaluator: confidence_total vorhanden", "confidence_total" in result.columns)
-
-# Erwartete Binärsignale:
-#   Bar 0: auf Level 30.0 + Fenster -> stark (0.68) -> 1
-#   Bar 1: auf Level 30.0, aber Fenster zu -> 0.0 -> 0
-#   Bar 2: nahe Level (0.067%) + Fenster -> 0.65 -> 1
-#   Bar 3: fern (0.66%) -> 0.0 -> 0
-#   Bar 4: nahe Level (0.033%) + Fenster -> 0.65 -> 1
-exp_binary = [1, 0, 1, 0, 1]
-binaries = result["signal_binary"].tolist()
-check("Binärsignale exakt", binaries == exp_binary)
-check("Bar 0: confidence > 0.5", float(result["confidence_total"].iloc[0]) > 0.5)
-check("Bar 1: confidence == 0.0 (Fenster zu)", float(result["confidence_total"].iloc[1]) == 0.0)
-check("Bar 3: confidence == 0.0 (fern)", float(result["confidence_total"].iloc[3]) == 0.0)
-
-# ===========================================================================
-# 5) HistoricalScanner-Konfiguration (grid_scan vs. Standard)
-# ===========================================================================
-print("\n=== 5) HistoricalScanner-Konfiguration ===")
+print("\n=== 5) HistoricalScanner (Plugin-Batch-Interface) ===")
 from analytics.background_workers.historical_scanner import HistoricalScanner
 
-scan_grid = HistoricalScanner("SILVER", grid_scan=True)
-scan_std = HistoricalScanner("SILVER", grid_scan=False)
-
-check("Scanner grid_scan: grid_levels im Feature-Set", "grid_levels" in scan_grid._feature_names)
-check("Scanner grid_scan: atr_normalized im Feature-Set", "atr_normalized" in scan_grid._feature_names)
-check("Scanner grid_scan: source_id=grid_proximity_v1", scan_grid._source_id == "grid_proximity_v1")
-check("Scanner grid_scan: grid_params vorhanden", "grid_levels" in scan_grid._feature_params)
-check(
-    "Scanner grid_scan: Defaults konsistent (step=0.5, steps=4, window=5)",
-    scan_grid._feature_params["grid_levels"]["step_size"] == 0.5
-    and scan_grid._feature_params["grid_levels"]["steps_around"] == 4
-    and scan_grid._feature_params["grid_levels"]["time_window_mins"] == 5
+hs_src = (Path(__file__).resolve().parent.parent / "analytics" / "background_workers" / "historical_scanner.py").read_text(
+    encoding="utf-8", errors="replace"
 )
-check("Scanner standard: grid_levels NICHT im Feature-Set", "grid_levels" not in scan_std._feature_names)
-check("Scanner standard: source_id=ema_atr_set_v1", scan_std._source_id == "ema_atr_set_v1")
-check("Scanner standard: ema_diff im Feature-Set", "ema_diff" in scan_std._feature_names)
+check("Konstruktor: grid_scan-Param ENTFERNT", "grid_scan" not in hs_src.replace("(grid_scan", "("))
+check("_run_plugin_batch vorhanden", "def _run_plugin_batch" in hs_src)
+check("_get_active_batch_plugins vorhanden", "def _get_active_batch_plugins" in hs_src)
+check("PluginExecutor-Instanz", "self.plugin_executor = PluginExecutor()" in hs_src)
 
 print("\nRESULT:", "PASS" if ok else f"FAIL ({failures})")
 raise SystemExit(0 if ok else 1)
@@ -34639,17 +32511,17 @@ con.close()
 
 ### DATEI: test/check_marker_layers.js
 ```js
-﻿// BEREIT FÜR PHASE 15
+// BEREIT FÜR PHASE 15
 // test/check_marker_layers.js
-// Regressionstest: Signal-Marker und Grid-Circles sind getrennte Layer.
-// - Signal-Marker gehen in das SeriesMarkers-Plugin der candleSeries.
+// Regressionstest: Grid-Circles auf unsichtbaren Level-Linien (getrennte Layer).
 // - Proximity-Circles werden auf der ZUGEHOERIGEN LIQ-LINE geplottet:
 //   Je Level-Preis wird eine UNSICHTBARE LineSeries erzeugt, deren Datenpunkt
 //   exakt auf dem Level-Preis liegt; die Circle-Marker (shape 'circle',
 //   position 'inBar') haengen an dieser Serie -> die Engine positioniert sie
 //   direkt auf der Liq-Line (native, folgt Zoom/Scroll, kein Redraw-Bug).
-// Ein Grid-Render darf die EMA-Signale nie verdrängen (Bug: "EMA-Signale
-// verschwinden bei Grid an").
+// - Phase 15 (Signal-Rückbau): Signal-Marker-Funktionen (renderSignalMarkers,
+//   clearSignalMarkers, reapplySignalMarkers, seriesMarkersPlugin) sind
+//   ENTFERNT – nur noch Grid-Lines/Circles + DaySeparator existieren.
 //
 // Laedt die ECHTE 03_chart_rendering.js mit Mock-Objekten (kein DOM/Chart).
 const fs = require('fs');
@@ -34658,15 +32530,12 @@ const path = require('path');
 const rendering = fs.readFileSync(path.join(__dirname, '..', 'chart', 'js', '03_chart_rendering.js'), 'utf8');
 
 // --- Mock-Umgebung ---
-let pluginMarkers = [];        // Marker auf der candleSeries (NUR Signale)
 let circleSeriesList = [];     // unsichtbare Level-Serien der Circles
 let removedSeries = [];
 
 global._circleSeries = [];     // in 01_core.js deklariert (nicht in 03 geladen)
 global._circleMarkerPlugins = [];
-global.seriesMarkersPlugin = {
-    setMarkers: (markers) => { pluginMarkers = markers || []; },
-};
+global._circleLevelSeries = {};
 global.chart = {
     addSeries: (type, options) => {
         const s = {
@@ -34686,9 +32555,11 @@ global.chart = {
     },
 };
 global.candleSeries = { removePriceLine: () => {}, createPriceLine: () => ({}) };
+global.gridPriceLines = [];
 global.LightweightCharts = {
     LineSeries: 'LineSeries',
     CandlestickSeries: 'CandlestickSeries',
+    LineStyle: { Solid: 0 },
     createSeriesMarkers: (series, initial) => ({
         setMarkers: (m) => { series.markers = m || []; },
     }),
@@ -34703,8 +32574,6 @@ global.WEEKEND_GAP_SECONDS = 43200;
 global.MIN_SEPARATOR_SPACING_SECONDS = 21600;
 global.currentTfInSeconds = 3600;
 
-// candleSeries-Setup fuer _applyAllMarkers (echte Funktion in 03 benutzt
-// LightweightCharts.createSeriesMarkers(candleSeries, []))
 eval(rendering);
 
 let failures = 0;
@@ -34715,12 +32584,6 @@ function check(label, cond, extra) {
         failures++;
         console.error('FAIL ' + label);
     }
-}
-function signalShapes() {
-    return pluginMarkers.map(m => m.time + ':' + m.shape);
-}
-function hasSignal(shape) {
-    return pluginMarkers.some(m => m.shape === shape);
 }
 // Alle Circle-Marker ueber alle Level-Serien
 function allCircleMarkers() {
@@ -34737,13 +32600,18 @@ function levelSeriesCount() {
     return circleSeriesList.length;
 }
 
-console.log('=== Marker-Layer: Signale (candleSeries) + Circles (Level-Serien) getrennt ===');
+console.log('=== Marker-Layer: Grid-Circles (unsichtbare Level-Serien) ===');
 
-// --- Szenario 1: Signal an, Grid an -> EMA auf candleSeries, Circles auf Level-Serien ---
-renderSignalMarkers([{ time: 1001, shape: 'square', position: 'aboveBar', color: '#FF9800' }, { time: 1002, shape: 'square' }]);
+// --- Phase 15: Signal-Marker-Funktionen ENTFERNT ---
+console.log('\n=== Phase 15: Signal-Marker-Funktionen entfernt ===');
+check('renderSignalMarkers NICHT definiert', typeof renderSignalMarkers === 'undefined');
+check('clearSignalMarkers NICHT definiert', typeof clearSignalMarkers === 'undefined');
+check('reapplySignalMarkers NICHT definiert', typeof reapplySignalMarkers === 'undefined');
+check('seriesMarkersPlugin NICHT referenziert', !rendering.includes('seriesMarkersPlugin'));
+
+// --- Szenario 1: Grid an -> Circles auf Level-Serien ---
+console.log('\n=== Grid-Circles auf unsichtbaren Level-Serien ===');
 renderGridCircles([{ time: 1003, price: 30.5 }, { time: 1004, price: 31.0 }]);
-check('Signal an + Grid an -> Signale sichtbar', hasSignal('square'), JSON.stringify(signalShapes()));
-check('Circles NICHT im Signal-Marker-Plugin', !hasSignal('circle'), JSON.stringify(signalShapes()));
 check('Circles -> 2 Level-Serien', levelSeriesCount() === 2, 'serien=' + levelSeriesCount());
 // Serie fuer Level 30.5 hat Datenpunkt exakt auf dem Level -> Circle auf der Liq-Line
 const s30 = circleSeriesList.find(s => (s.data[0] || {}).value === 30.5);
@@ -34753,39 +32621,30 @@ check('Level 30.5: LineSeries unsichtbar (lineVisible:false)', s30 && s30.option
 check('Level 30.5: priceScaleId=right', s30 && s30.options.priceScaleId === 'right', '');
 check('Level 30.5: autoscaleInfoProvider -> null', s30 && typeof s30.options.autoscaleInfoProvider === 'function' && s30.options.autoscaleInfoProvider() === null, '');
 
-// --- Szenario 2: Grid render_indicators (clearGridCircles + renderGridCircles) ---
+// --- Szenario 2: clearGridCircles entfernt Level-Serien ---
 clearGridCircles();
 check('clearGridCircles -> Level-Serien entfernt', levelSeriesCount() === 0, 'serien=' + levelSeriesCount());
-check('clearGridCircles -> Signale bleiben', hasSignal('square'), JSON.stringify(signalShapes()));
 renderGridCircles([{ time: 1005, price: 30.0 }]);
 check('renderGridCircles -> neue Level-Serie', levelSeriesCount() === 1, 'serien=' + levelSeriesCount());
 check('renderGridCircles -> Circle aktualisiert', hasCircleTime(1005), JSON.stringify(allCircleMarkers().map(m => m.time)));
 
-// --- Szenario 3: Signal AUS (renderSignalMarkers([])) + Grid an -> NUR Circles ---
-renderSignalMarkers([]);
-check('Signal AUS -> keine Signale', !hasSignal('square'), JSON.stringify(signalShapes()));
-check('Signal AUS -> Circles da', hasCircleTime(1005), JSON.stringify(allCircleMarkers().map(m => m.time)));
+// --- Szenario 3: leerer Satz -> alle Circles weg ---
+renderGridCircles([]);
+check('renderGridCircles([]) -> keine Level-Serien', levelSeriesCount() === 0, 'serien=' + levelSeriesCount());
 
-// --- Szenario 4: Grid AUS (clearGridCircles) bei aktiven Signalen -> EMA bleibt ---
-renderSignalMarkers([{ time: 1007, shape: 'square' }]);
+// --- Szenario 4: Grid AUS (clearGridCircles) ---
 renderGridCircles([{ time: 1008, price: 30.0 }]);
 clearGridCircles();
-check('Grid AUS -> EMA bleibt', hasSignal('square'), JSON.stringify(signalShapes()));
 check('Grid AUS -> Circles weg', levelSeriesCount() === 0, 'serien=' + levelSeriesCount());
 
-// --- Szenario 5: clearSignalMarkers leert Signale, Circles bleiben ---
-renderSignalMarkers([{ time: 1009, shape: 'square' }]);
-renderGridCircles([{ time: 1010, price: 30.0 }]);
-clearSignalMarkers();
-check('clearSignalMarkers -> Signale weg', !hasSignal('square'), JSON.stringify(signalShapes()));
-check('clearSignalMarkers -> Circles bleiben', hasCircleTime(1010), JSON.stringify(allCircleMarkers().map(m => m.time)));
-
-// --- Szenario 6: reapplySignalMarkers kombiniert aus Caches ---
-renderSignalMarkers([{ time: 1011, shape: 'square' }]);
-renderGridCircles([{ time: 1012, price: 30.0 }]);
-clearSignalMarkers();
-renderSignalMarkers([{ time: 1011, shape: 'square' }]);
-check('reapplySignalMarkers -> Signale + Circles', hasSignal('square') && hasCircleTime(1012), JSON.stringify(signalShapes()) + ' / ' + JSON.stringify(allCircleMarkers().map(m => m.time)));
+// --- Szenario 5: P14-03-E Inkrementell (kein Rebuild bei unveraendertem Level) ---
+renderGridCircles([{ time: 2001, price: 30.0 }]);
+const firstSeries = circleSeriesList[0];
+renderGridCircles([{ time: 2001, price: 30.0 }, { time: 2002, price: 31.0 }]);
+check('Inkrementell: bestehendes Level bleibt (gleiche Serie)', circleSeriesList[0] === firstSeries, '');
+check('Inkrementell: neues Level hinzugefuegt', levelSeriesCount() === 2, 'serien=' + levelSeriesCount());
+renderGridCircles([{ time: 2001, price: 30.0 }]);
+check('Inkrementell: verschwundenes Level entfernt', levelSeriesCount() === 1, 'serien=' + levelSeriesCount());
 
 console.log('\n=== Sortierung (gleiches Level, mehrere Circles) ===');
 // LWC v5: Serie & Markers brauchen NACH ZEIT SORTIERTE Daten.
@@ -34799,18 +32658,11 @@ check('1 Level-Serie fuer gleichen Preis', levelSeriesCount() === 1, 'serien=' +
 check('Daten nach Zeit sortiert', JSON.stringify(sLevel.data.map(d => d.time)) === JSON.stringify([2001, 2002, 2003]), JSON.stringify(sLevel.data.map(d => d.time)));
 check('Markers nach Zeit sortiert', JSON.stringify(sLevel.markers.map(m => m.time)) === JSON.stringify([2001, 2002, 2003]), JSON.stringify(sLevel.markers.map(m => m.time)));
 
-console.log('\n=== Sortierung (Signal-Marker auf candleSeries) ===');
-renderSignalMarkers([
-    { time: 3002, shape: 'square' },
-    { time: 3001, shape: 'square' },
-]);
-function isSorted(arr) {
-    for (let i = 1; i < arr.length; i++) {
-        if (arr[i].time < arr[i - 1].time) return false;
-    }
-    return true;
-}
-check('Signal-Array nach Zeit sortiert', isSorted(pluginMarkers), JSON.stringify(signalShapes()));
+console.log('\n=== Grid-Lines (PriceLines auf candleSeries) ===');
+renderGridLines([{ price: 30.0, color: '#2196F3', width: 1 }, { price: 30.5, color: '#2196F3', width: 1 }]);
+check('renderGridLines -> 2 PriceLines', gridPriceLines.length === 2, 'lines=' + gridPriceLines.length);
+clearGridLines();
+check('clearGridLines -> PriceLines entfernt', gridPriceLines.length === 0, 'lines=' + gridPriceLines.length);
 
 console.log('\nRESULT: ' + (failures === 0 ? 'PASS' : 'FAIL (' + failures + ')'));
 process.exit(failures === 0 ? 0 : 1);
@@ -37013,7 +34865,7 @@ if __name__ == "__main__":
 #   - Evaluator-Default: legt Ergebnis unter instance_id ab, wenn der Service
 #     seinen Namespace nicht selbst beschrieben hat (Schritt-6-Kompatibilität)
 #   - Context-None → frischer Context wird erzeugt (mode='batch')
-#   - Der bestehende SetEvaluator (Signal-Sets) bleibt unangetastet
+#   - Phase 15: Der Alt-SetEvaluator (Signal-Sets) ist ENTFERNT
 #
 # WICHTIG: Kein UI-Start (Regel Agents.md §4). Reine Engine-Logik headless.
 import sys
@@ -37037,7 +34889,6 @@ from analytics.features.feature_builder import PluginExecutor
 from analytics.engine.set_evaluator import (
     ServiceSetEvaluator,
     ServiceSetExecutionError,
-    SetEvaluator,
 )
 
 ok = True
@@ -37305,8 +35156,17 @@ def main() -> int:
         }, df, context=PluginContext(mode="batch"))
     except ServiceSetExecutionError as e:
         crashed = True
-        check(isinstance(e.__cause__, RuntimeError) and "simulierter Crash" in str(e.__cause__),
-              "Ursache ist RuntimeError ('simulierter Crash')")
+        # PluginExecutor kapselt RuntimeError -> PluginExecutionError;
+        # ServiceSetEvaluator kapselt erneut -> __cause__-Kette durchlaufen.
+        cause_chain = []
+        cur = e
+        while cur is not None:
+            cause_chain.append(type(cur).__name__)
+            cur = cur.__cause__
+        has_runtime = any(t == "RuntimeError" for t in cause_chain)
+        has_message = "simulierter Crash" in (str(e) + str(e.__cause__))
+        check(has_runtime and has_message,
+              f"Ursache ist RuntimeError ('simulierter Crash') – Kette: {cause_chain}")
         check("crash_1" in str(e),
               "Fehlermeldung nennt instance_id 'crash_1'")
     check(crashed,
@@ -37360,15 +35220,18 @@ def main() -> int:
           "depends_on auf unbekannte instance_id wirft ValueError")
 
     # -------------------------------------------------------------------------
-    # Regression: bestehender SetEvaluator (Signal-Sets) unangetastet
+    # Phase 15: Alt-Signal-Engine (SetEvaluator) vollständig entfernt
     # -------------------------------------------------------------------------
-    print("\n[Regression] SetEvaluator (Signal-Sets) unangetastet:")
-    try:
-        from analytics.engine.set_evaluator import SetEvaluator as SE
-        check(SetEvaluator is SE,
-              "SetEvaluator importierbar")
-    except Exception as e:
-        check(False, f"SetEvaluator Import-Fehler: {e}")
+    print("\n[Phase 15] Alt-Signal-Engine entfernt:")
+    se_src = (Path(__file__).resolve().parent.parent / "analytics" / "engine" / "set_evaluator.py").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    check("class SetEvaluator" not in se_src,
+          "SetEvaluator-Klasse aus set_evaluator.py ENTFERNT")
+    check("SignalDefinition" not in se_src,
+          "SignalDefinition-Import ENTFERNT")
+    check("class ServiceSetEvaluator" in se_src,
+          "ServiceSetEvaluator bleibt erhalten (Plugin-Set-Architektur)")
 
     print()
     if ok:
@@ -38736,31 +36599,23 @@ if __name__ == "__main__":
 ```py
 ﻿# BEREIT FÜR PHASE 15
 # test/check_p13_s7.py
-# Headless-Validierung für Phase 13 Schritt 7 (Cleanup: SignalOverlay +
-# StatisticsRepository lesen aus feature_data statt signal_results).
+# Headless-Validierung für Phase 13 Schritt 7 (Cleanup: StatisticsRepository
+# liest aus feature_data statt signal_results) + Phase 15 Signal-Rückbau.
 #
-# Roadmap §7.2.1 + §7.2.2 + §7.B (Rückbau):
-#   - SignalOverlay.get_available_sets() basiert auf den feature_data-
-#     Einträgen der Proximity-Services (feature_id='proximity'), NICHT mehr
-#     auf SELECT DISTINCT source_id FROM signal_results.
-#   - fetch_markers() lädt Marker ausschließlich aus feature_data
-#     (is_hit=true; Proximity: Farbe nach in_time_window; EMA/ATR-Records:
-#     confidence-basierte Farbe). Phase 13 7.B: KEIN signal_results-Fallback
-#     mehr – eine Legacy-Source-ID ohne feature_store-Daten liefert [].
-#   - StatisticsRepository liest aus feature_data (feature_id='proximity'):
-#     get_available_sets / get_summary / fetch_signals.
+# Roadmap §7.2.1 + §7.2.2 + §7.B (Rückbau) + Phase 15 (Signal-Entfernung):
+#   - StatisticsRepository liest aus feature_data (feature_id): get_available_sets /
+#     get_summary / fetch_signals. signal_results-Tabellen existieren NICHT mehr.
+#   - SignalOverlay / Signal-Marker / signal_results wurden ENTFERNT.
 #
-# WICHTIG: Keine GUI-Ausführung. Offscreen-QApplication; beide Repositories
-# werden per DB_ANALYTICS-Monkeypatch auf eine TEMP-analytics.duckdb gelenkt –
-# echte app_data/analytics-DBs bleiben unberührt.
+# WICHTIG: Keine GUI-Ausführung. Offscreen-QApplication; das Repository wird
+# per DB_ANALYTICS-Monkeypatch auf eine TEMP-analytics.duckdb gelenkt – echte
+# app_data/analytics-DBs bleiben unberührt.
 import json
 import os
-import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -38786,15 +36641,8 @@ def check(cond, msg):
         print(f"   \u274c {msg}")
 
 
-class FakeStateManager:
-    """StateManager-Ersatz für SignalOverlay (nur get_app_settings nötig)."""
-
-    def get_app_settings(self):
-        return SimpleNamespace(signal_marker_limit=1000)
-
-
 def create_temp_analytics_db(tmp_db: str) -> None:
-    """Legt feature_store + signal_results mit Testdaten in der Temp-DB an."""
+    """Legt feature_store (OHNE signal-Tabellen) mit Testdaten in der Temp-DB an."""
     import duckdb
 
     con = duckdb.connect(tmp_db)
@@ -38806,18 +36654,6 @@ def create_temp_analytics_db(tmp_db: str) -> None:
             feature_id     VARCHAR,
             plugin_version VARCHAR,
             feature_data   JSON
-        )
-    """)
-    con.execute("""
-        CREATE TABLE signal_results (
-            event_id         VARCHAR NOT NULL,
-            symbol           VARCHAR NOT NULL,
-            timeframe        VARCHAR NOT NULL,
-            bar_time         TIMESTAMPTZ NOT NULL,
-            source_id        VARCHAR NOT NULL,
-            confidence       DOUBLE,
-            context_type     VARCHAR NOT NULL,
-            metadata_payload VARCHAR
         )
     """)
 
@@ -38841,32 +36677,6 @@ def create_temp_analytics_db(tmp_db: str) -> None:
             ["SILVER", "H1", datetime.fromtimestamp(ts, tz=timezone.utc),
              "proximity", "1.0.0", json.dumps(data)],
         )
-
-    # Legacy-Signal in signal_results (NUR Referenzdaten – der 7.B-Fallback
-    # ist ENTFERNT: eine Source-ID ohne feature_store-Daten liefert []).
-    con.executemany(
-        "INSERT INTO signal_results (event_id, symbol, timeframe, bar_time, source_id, confidence, context_type, metadata_payload) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        [("e_legacy", "SILVER", "H1", datetime.fromtimestamp(base, tz=timezone.utc),
-          "ema_atr_set_v1", 0.9, "historical_batch", "{}"),
-         ("e_legacy2", "SILVER", "H1", datetime.fromtimestamp(base + 120, tz=timezone.utc),
-          "alternating_arrow_v1", 0.7, "historical_batch", "{}")],
-    )
-
-    # EMA/ATR-feature_data (Phase 13 7.B): feature_id='ema_atr_set_v1',
-    # KEIN levels_hit/in_time_window → confidence-basierte Marker.
-    ema = {
-        "is_hit": True,
-        "confidence_total": 0.9,
-        "signal_binary": 1,
-        "source_id": "ema_atr_set_v1",
-    }
-    con.execute(
-        "INSERT INTO feature_store (symbol, timeframe, bar_time, feature_id, plugin_version, feature_data) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        ["SILVER", "H1", datetime.fromtimestamp(base, tz=timezone.utc),
-         "ema_atr_set_v1", "1.0.0", json.dumps(ema)],
-    )
     con.close()
 
 
@@ -38878,9 +36688,11 @@ def main() -> int:
 
     # [1] py_compile
     print("\n[1] py_compile:")
-    for f in ("chart/overlays/signal_overlay.py",
-              "analytics/statistics_repository.py",
-              "chart/chart_win.py"):
+    for f in ("analytics/statistics_repository.py",
+              "analytics/background_workers/historical_scanner.py",
+              "analytics/background_workers/live_analyzer.py",
+              "statistic_win.py",
+              "db_service.py"):
         try:
             py_compile.compile(str(ROOT / f), doraise=True)
             check(True, f"{f} kompiliert fehlerfrei")
@@ -38893,11 +36705,7 @@ def main() -> int:
     tmp_db = os.path.join(tmp_dir, "analytics.duckdb")
     create_temp_analytics_db(tmp_db)
 
-    import chart.overlays.signal_overlay as signal_overlay
     import analytics.statistics_repository as statistics_repository
-
-    signal_overlay.DB_ANALYTICS = tmp_db
-    signal_overlay.StateManager = FakeStateManager
     statistics_repository.DB_ANALYTICS = tmp_db
 
     from PySide6.QtWidgets import QApplication
@@ -38905,63 +36713,18 @@ def main() -> int:
     check(app is not None, "QApplication (offscreen) erstellt")
     check(Path(tmp_db).exists(), "Temp-analytics.duckdb angelegt")
 
-    overlay = signal_overlay.SignalOverlay()
     repo = statistics_repository.StatisticsRepository()
 
-    # [3] get_available_sets → feature_data (feature_id), NICHT signal_results
+    # [3] get_available_sets → feature_data (feature_id), KEINE signal_results
     print("\n[3] get_available_sets (feature_data-basiert):")
-    ov_sets = overlay.get_available_sets()
-    check("proximity" in ov_sets and "ema_atr_set_v1" in ov_sets,
-          f"SignalOverlay.get_available_sets() enthält proximity + ema_atr_set_v1 (ist {ov_sets})")
     st_sets = repo.get_available_sets()
-    check("proximity" in st_sets and "ema_atr_set_v1" in st_sets,
-          f"StatisticsRepository.get_available_sets() enthält proximity + ema_atr_set_v1 (ist {st_sets})")
+    check("proximity" in st_sets,
+          f"StatisticsRepository.get_available_sets() enthält proximity (ist {st_sets})")
+    check("grid_proximity_v1" not in st_sets and "ema_atr_set_v1" not in st_sets,
+          f"Keine Alt-Source-IDs mehr (ist {st_sets})")
 
-    # [4] fetch_markers → feature_data (Proximity-Hits, is_hit=true)
-    print("\n[4] fetch_markers aus feature_data ('proximity'):")
-    markers = overlay.fetch_markers("SILVER", "H1", "proximity")
-    check(isinstance(markers, list) and len(markers) == 3,
-          f"3 Proximity-Marker aus feature_data (Bars 0/2/4) – ist {len(markers)}")
-    if markers:
-        m0 = markers[0]
-        check(m0.get("shape") == "circle" and m0.get("position") == "aboveBar",
-              "Proximity-Marker: circle/aboveBar")
-        check(m0.get("text") == "2",
-              f"Marker-Text = Anzahl getroffener Levels ('2' – ist {m0.get('text')!r})")
-        # Bar 0: i%3==0 → in_time_window=true → grün
-        check(m0.get("color") == "#26a69a",
-              "Bar 0 (im Zeitfenster): Marker grün (#26a69a)")
-        # Bar 2: i%3=2 → in_time_window=false → fuchsia
-        check(markers[1].get("color") == "#E91E63",
-              "Bar 2 (außerhalb Zeitfenster): Marker fuchsia (#E91E63)")
-        times = sorted(m["time"] for m in markers)
-        check(times == [base_ts for base_ts in
-                        (1_700_000_000, 1_700_000_120, 1_700_000_240)],
-              f"Marker-Zeiten = Hit-Bars 0/2/4 (ist {times})")
-
-    # [5] Phase 13 7.B: EMA/ATR-Marker aus feature_data (feature_id)
-    print("\n[5] EMA/ATR-Marker aus feature_data ('ema_atr_set_v1'):")
-    ema_m = overlay.fetch_markers("SILVER", "H1", "ema_atr_set_v1")
-    check(len(ema_m) == 1,
-          f"1 EMA-Marker aus feature_data (ist {len(ema_m)})")
-    if ema_m:
-        check(ema_m[0].get("shape") == "circle" and ema_m[0].get("position") == "aboveBar",
-              "EMA-Marker: circle/aboveBar")
-        check(ema_m[0].get("text") == "90%",
-              f"EMA-Marker-Text = Confidence-Prozent '90%' (ist {ema_m[0].get('text')!r})")
-        # confidence_total=0.9 >= 0.8 → grün
-        check(ema_m[0].get("color") == "#26a69a",
-              "EMA-Marker (Confidence 90%): grün (#26a69a)")
-
-    # [5b] KEIN signal_results-Fallback mehr (Phase 13 7.B): Legacy-Source-ID
-    # ohne feature_store-Daten liefert [].
-    print("[5b] Kein signal_results-Fallback (7.B):")
-    no_fallback = overlay.fetch_markers("SILVER", "H1", "alternating_arrow_v1")
-    check(no_fallback == [],
-          f"Legacy-Source-ID ohne feature_store-Daten -> [] (ist {len(no_fallback)} Marker)")
-
-    # [6] StatisticsRepository.get_summary → feature_data
-    print("\n[6] StatisticsRepository.get_summary (feature_data):")
+    # [4] StatisticsRepository.get_summary → feature_data
+    print("\n[4] StatisticsRepository.get_summary (feature_data):")
     summary = repo.get_summary(symbol="SILVER", timeframe="H1", source_id="proximity")
     check(summary["total_signals"] == 3,
           f"total_signals == 3 Hit-Bars (ist {summary['total_signals']})")
@@ -38973,8 +36736,8 @@ def main() -> int:
     check(summary["best_tf"] == "H1",
           f"best_tf == 'H1' (ist {summary['best_tf']!r})")
 
-    # [7] StatisticsRepository.fetch_signals → feature_data
-    print("\n[7] StatisticsRepository.fetch_signals (feature_data):")
+    # [5] StatisticsRepository.fetch_signals → feature_data
+    print("\n[5] StatisticsRepository.fetch_signals (feature_data):")
     sigs = repo.fetch_signals(symbol="SILVER", timeframe="H1",
                               source_id="proximity", limit=10)
     check(len(sigs) == 3, f"3 Hit-Signale geladen (ist {len(sigs)})")
@@ -38987,26 +36750,36 @@ def main() -> int:
             check(s["outcome"] in ("Win", "Neutral"),
                   f"outcome Win/Neutral (ist {s['outcome']!r})")
 
-    # [8] chart_win: Marker-Quelle 'proximity' (Code-Inspektion)
-    print("\n[8] chart_win Marker-Quelle (Code-Inspektion):")
-    src = (ROOT / "chart" / "chart_win.py").read_text(encoding="utf-8")
-    check('self.signal_overlay.fetch_markers(\n                    self.current_symbol, self.current_tf, "proximity"\n                )' in src
-          or '"proximity"' in src,
-          "chart_win ruft fetch_markers mit 'proximity' (feature_data)")
-    check('"proximity", "grid_proximity_v1"' in src,
-          "_apply_marker_styles hat 'proximity'-Zweig")
+    # [6] Signal-Rückbau: SignalOverlay/signal_results nicht mehr vorhanden
+    print("\n[6] Signal-Rückbau (SignalOverlay / signal_results entfernt):")
+    check(not (ROOT / "chart" / "overlays" / "signal_overlay.py").exists(),
+          "chart/overlays/signal_overlay.py ENTFERNT")
+    check(not (ROOT / "analytics" / "signals").exists(),
+          "analytics/signals/ ENTFERNT")
 
-    # [9] grid.py unverändert (harte Regel)
-    print("\n[9] chart/indicators/grid.py unverändert:")
-    try:
-        r = subprocess.run(
-            ["git", "diff", "--stat", "chart/indicators/grid.py"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-        )
-        check(r.stdout.strip() == "",
-              f"kein Diff (Ausgabe leer) – '{r.stdout.strip()}'")
-    except Exception as e:
-        check(False, f"Git-Diff-Check Fehler: {e}")
+    src = (ROOT / "chart" / "chart_win.py").read_text(encoding="utf-8")
+    check("signal_overlay" not in src and "SignalOverlay" not in src,
+          "chart_win.py: keine SignalOverlay-Referenz mehr")
+    check("btn_signal_select" not in src and "signalMarkers" not in src,
+          "chart_win.py: kein Signal-Button/Marker-Code mehr")
+    check("_update_signal_markers_only" not in src,
+          "chart_win.py: _update_signal_markers_only ENTFERNT")
+
+    src_stat = (ROOT / "statistic_win.py").read_text(encoding="utf-8")
+    check("combo_signal_filter" not in src_stat and "combo_signal" not in src_stat,
+          "statistic_win.py: keine Signal-Auswahl (combo_signal_filter) mehr")
+    check("_load_signal_sets" not in src_stat,
+          "statistic_win.py: _load_signal_sets ENTFERNT")
+
+    src_db = (ROOT / "db_service.py").read_text(encoding="utf-8")
+    check("signal_results" not in src_db and "signal_sets" not in src_db
+          and "signal_definitions" not in src_db,
+          "db_service.py: keine signal-Tabellen-Anlage mehr")
+
+    # [7] grid_liquidity unverändert (harte Regel)
+    print("\n[7] chart/indicators/grid_liquidity.py unverändert:")
+    check("grid_proximity_v1" not in (ROOT / "chart" / "indicators" / "grid_liquidity.py").read_text(encoding="utf-8", errors="replace"),
+          "grid_liquidity.py: keine grid_proximity_v1-Referenz")
 
     # Aufräumen
     try:
@@ -42755,8 +40528,9 @@ sys.exit(0)
 #   2. feature_store enthält danach: feature_id, plugin_version, feature_data
 #   3. StateManager() (app_data) enthält danach in indicator_presets:
 #      plugin_id, version, is_active_batch
-#   4. Datenintegrität: Zeilenzahl in feature_store/signal_results/indicator_presets
+#   4. Datenintegrität: Zeilenzahl in feature_store/indicator_presets
 #      vor und nach der Migration identisch (kein Datenverlust)
+#      (Phase 15: signal_results-Tabellen existieren nicht mehr)
 #
 # Hinweis: Die Migration ist idempotent (ADD COLUMN IF NOT EXISTS), der Test
 # kann daher beliebig oft wiederholt werden.
@@ -42764,6 +40538,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from db_service import check_and_init_databases, DB_ANALYTICS, DB_APP_DATA, DbPool
 from state_manager import StateManager
@@ -42787,7 +40564,6 @@ def get_row_counts():
     counts = {}
     c = DbPool.get(DB_ANALYTICS)
     counts["feature_store"] = c.execute("SELECT COUNT(*) FROM feature_store").fetchone()[0]
-    counts["signal_results"] = c.execute("SELECT COUNT(*) FROM signal_results").fetchone()[0]
     c = DbPool.get(DB_APP_DATA)
     counts["indicator_presets"] = c.execute("SELECT COUNT(*) FROM indicator_presets").fetchone()[0]
     return counts
@@ -42807,7 +40583,7 @@ print("=" * 70)
 # 1) Vorher-Zustand erfassen
 print("\n[1] Vorher-Zeilenzahlen (Baseline):")
 before = get_row_counts()
-print(f"   feature_store={before['feature_store']}  signal_results={before['signal_results']}  indicator_presets={before['indicator_presets']}")
+print(f"   feature_store={before['feature_store']}  indicator_presets={before['indicator_presets']}")
 
 # 2) Migration ausführen (beide DBs)
 print("\n[2] Führe Migration aus ...")
@@ -42829,7 +40605,7 @@ for col in ["plugin_id", "version", "is_active_batch"]:
 # 4) Datenintegrität
 print("\n[5] Datenintegrität (Zeilenzahl vor/nach):")
 after = get_row_counts()
-for table in ["feature_store", "signal_results", "indicator_presets"]:
+for table in ["feature_store", "indicator_presets"]:
     check(before[table] == after[table],
           f"{table}: {before[table]} vor == {after[table]} nach (kein Verlust)")
 
@@ -43108,26 +40884,22 @@ sys.exit(0)
 ```py
 ﻿# BEREIT FÜR PHASE 15
 # test/check_plugin_batch_services.py
-# Headless-Validierung für Phase 12 Schritt 6 (Anbindung Batch-Services).
+# Headless-Validierung für Phase 12 Schritt 6 (Anbindung Batch-Services) –
+# aktualisiert für Phase 15 (Alt-Signal-Rückbau).
 #
 # KEINE UI-Tests (Regel Agents.md §4). Getestet wird mit ISOLIERTEN
 # temporären DuckDB-Dateien (test/tmp_phase12_step6_*.duckdb):
 #   [1] StateManager.list_active_batch_presets() (is_active_batch=True)
-#   [2] HistoricalScanner Plugin-Modus: aktive Batch-Presets laufen über den
+#   [2] HistoricalScanner Plugin-Batch: aktive Batch-Presets laufen über den
 #       PluginExecutor; feature_store_payload wird mit feature_id='grid_liquidity'
 #       und gefülltem feature_data in den feature_store geschrieben.
-#   [3] Alt-Modus-Regression: Standard-Scan (grid_scan=False) läuft weiterhin
-#       und schreibt ema_atr_set_v1-Hits als feature_data in den feature_store
-#       (Phase 13 7.B: KEINE signal_results-Writes mehr).
-#   [4] Alt-Modus-Regression: Grid-Scan (grid_scan=True) schreibt weiterhin die
-#       nativen Feature-Spalten in den feature_store (feature_id bleibt NULL für
-#       reine Alt-Zeilen; Plugin-Spalten bleiben bei Hybrid-Zeilen erhalten).
-#   [5] LiveAnalyzer per Code-Inspektion: dieselbe PluginExecutor-Instanz,
-#       Plugin-Modus nur für Plugins mit live_op=True.
+#   [3] Leerer Plugin-Batch: OHNE aktive Presets schreibt der Scanner nichts
+#       (keine Alt-Scans ema_atr_set_v1 / grid_proximity_v1 mehr).
+#   [4] LiveAnalyzer per Code-Inspektion: nur Plugin-Modus, KEINE Alt-Signal-
+#       Mechanik (new_live_signal / signal_results / grid_scan) mehr.
 #
 # HINWEIS: Historische OHLCV-Daten werden in einer temp market-DB mit
-# synthetischen SILVER-M1-Bars erzeugt (deterministisch, trendig -> garantiert
-# ema_atr_set_v1-Signale im Standard-Scan).
+# synthetischen SILVER-M1-Bars erzeugt (deterministisch, trendig).
 import json
 import os
 import sys
@@ -43138,10 +40910,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import duckdb
 import numpy as np
-import pandas as pd
 
 import analytics.features.feature_builder as fb_module
 from db_service import DbPool
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 ok = True
 failures = []
@@ -43158,8 +40932,7 @@ def check(cond, msg):
 
 
 def build_synth_bars(n=600, base=30.0, seed=7):
-    """Deterministische SILVER-M1-Bars mit starken Trend-Segmenten, damit der
-    Standard-Scan (ema_trend_v1 + atr_filter_v1) garantiert Signale erzeugt."""
+    """Deterministische SILVER-M1-Bars mit starken Trend-Segmenten."""
     rng = np.random.default_rng(seed)
     t = np.arange(n)
     seg = n // 6
@@ -43245,20 +41018,6 @@ def setup_analytics_db(db_path):
             PRIMARY KEY (symbol, timeframe, bar_time)
         )
     """)
-    con.execute("""
-        CREATE TABLE signal_results (
-            event_id VARCHAR NOT NULL,
-            symbol VARCHAR NOT NULL,
-            timeframe VARCHAR NOT NULL,
-            bar_time TIMESTAMPTZ NOT NULL,
-            source_id VARCHAR NOT NULL,
-            confidence DOUBLE,
-            context_type VARCHAR NOT NULL,
-            metadata_payload JSON,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (event_id)
-        )
-    """)
     con.close()
 
 
@@ -43309,9 +41068,9 @@ check(active and active[0]["plugin_id"] == "grid_liquidity", "plugin_id='grid_li
 check(active and active[0]["params"].get("grid_step") == 0.5, "params aus Preset übernommen")
 
 # ===========================================================================
-# [2] HistoricalScanner Plugin-Modus
+# [2] HistoricalScanner Plugin-Batch
 # ===========================================================================
-print("\n[2] HistoricalScanner Plugin-Modus (grid_liquidity via PluginExecutor):")
+print("\n[2] HistoricalScanner Plugin-Batch (grid_liquidity via PluginExecutor):")
 from analytics.background_workers.historical_scanner import HistoricalScanner
 
 scanner_plugin = HistoricalScanner(
@@ -43343,83 +41102,62 @@ if plug_rows:
         check(False, "feature_data ist kein valides JSON")
 
 # ===========================================================================
-# [3] Alt-Modus-Regression: Standard-Scan (grid_scan=False)
+# [3] Leerer Plugin-Batch: keine Alt-Scans mehr
 # ===========================================================================
-print("\n[3] Alt-Modus-Regression: Standard-Scan (grid_scan=False):")
-# Plugin-Modus deaktivieren (Preset entfernen), damit reiner Alt-Pfad läuft
+print("\n[3] Leerer Plugin-Batch (keine Alt-Scans mehr):")
 sm.delete_indicator_preset("grid_liquidity", "BatchScan")
-check(len(sm.list_active_batch_presets()) == 0, "aktives Batch-Preset entfernt -> reiner Alt-Pfad")
+check(len(sm.list_active_batch_presets()) == 0, "aktives Batch-Preset entfernt")
 
-scanner_std = HistoricalScanner(
+scan_finished_rows = []
+scanner_empty = HistoricalScanner(
     "SILVER",
-    grid_scan=False,
     db_path_app=tmp_app,
     db_path_analytics=tmp_analytics,
     db_path_market=tmp_market,
     timeframes=["M1"],
 )
-check(scanner_std._source_id == "ema_atr_set_v1", "Standard-Scan: source_id=ema_atr_set_v1")
-scanner_std.run()
+scanner_empty.scan_finished.connect(lambda sym, total: scan_finished_rows.append(total))
+scanner_empty.run()
 
-# Phase 13 7.B: Hits landen als feature_data im feature_store
-# (feature_id='ema_atr_set_v1'), NICHT mehr in signal_results.
-con = DbPool.get(tmp_analytics)
-sig_rows = con.execute("""
-    SELECT feature_id, COUNT(*) FROM feature_store
-    WHERE feature_id = 'ema_atr_set_v1'
-    GROUP BY feature_id
+check(len(scan_finished_rows) == 1 and scan_finished_rows[0] == 0,
+      f"scan_finished mit 0 Feature-Rows (ist {scan_finished_rows})")
+alt_ids = con.execute("""
+    SELECT DISTINCT feature_id FROM feature_store
+    WHERE feature_id IN ('ema_atr_set_v1', 'grid_proximity_v1', 'alternating_arrow_v1')
 """).fetchall()
-check(len(sig_rows) == 1 and sig_rows[0][1] > 0,
-      f"feature_store: ema_atr_set_v1-Hit-Rows vorhanden ({sig_rows[0][1] if sig_rows else 0})")
-
-# Sicherstellen: signal_results erhält KEINE neuen Writes mehr (7.B)
-legacy_sig_rows = con.execute("""
-    SELECT COUNT(*) FROM signal_results WHERE source_id = 'ema_atr_set_v1'
+check(len(alt_ids) == 0,
+      f"KEINE Alt-Signal-feature_ids geschrieben (ema_atr_set_v1/grid_proximity_v1/alternating_arrow_v1) – ist {alt_ids}")
+no_signal_tables = con.execute("""
+    SELECT COUNT(*) FROM information_schema.tables
+    WHERE table_name IN ('signal_results', 'signal_definitions', 'signal_sets')
 """).fetchone()[0]
-check(legacy_sig_rows == 0,
-      f"signal_results: 0 neue ema_atr_set_v1-Zeilen (7.B-Rückbau) – ist {legacy_sig_rows}")
+check(no_signal_tables == 0, "keine signal-Tabellen in der analytics-DB angelegt")
 
 # ===========================================================================
-# [4] Alt-Modus-Regression: Grid-Scan (grid_scan=True, native Spalten)
+# [4] LiveAnalyzer-Code-Inspektion (PluginExecutor, keine Alt-Signal-Mechanik)
 # ===========================================================================
-print("\n[4] Alt-Modus-Regression: Grid-Scan (grid_scan=True, native Spalten):")
-scanner_grid = HistoricalScanner(
-    "SILVER",
-    grid_scan=True,
-    db_path_app=tmp_app,
-    db_path_analytics=tmp_analytics,
-    db_path_market=tmp_market,
-    timeframes=["M1"],
-)
-check(scanner_grid._source_id == "grid_proximity_v1", "Grid-Scan: source_id=grid_proximity_v1")
-scanner_grid.run()
-
-con = DbPool.get(tmp_analytics)
-native_rows = con.execute("""
-    SELECT COUNT(*) FROM feature_store
-    WHERE atr_normalized IS NOT NULL AND grid_nearest_level IS NOT NULL
-      AND is_time_window_active IS NOT NULL
-""").fetchone()[0]
-check(native_rows > 0, f"feature_store: {native_rows} Zeilen mit nativen Grid/ATR-Spalten")
-# Hybrid-Koexistenz: Plugin-Zeilen haben weiterhin feature_id (nicht überschrieben)
-plug_rows2 = con.execute("""
-    SELECT COUNT(*) FROM feature_store WHERE feature_id = 'grid_liquidity'
-""").fetchone()[0]
-check(plug_rows2 > 0, f"Plugin-Spalten bleiben bei Hybrid-Zeilen erhalten ({plug_rows2})")
-
-# ===========================================================================
-# [5] LiveAnalyzer-Code-Inspektion (dieselbe PluginExecutor-Instanz, live_op)
-# ===========================================================================
-print("\n[5] LiveAnalyzer-Code-Inspektion (PluginExecutor, live_op=True):")
+print("\n[4] LiveAnalyzer-Code-Inspektion (PluginExecutor, keine Alt-Signale):")
 la_src = (Path(__file__).resolve().parent.parent / "analytics" / "background_workers" / "live_analyzer.py").read_text(
     encoding="utf-8", errors="replace"
 )
 check("self.plugin_executor = PluginExecutor()" in la_src,
       "live_analyzer.py: PluginExecutor-Instanz vorhanden")
-check("self._process_plugin_bars()" in la_src and "def _process_plugin_bars" in la_src,
-      "live_analyzer.py: Plugin-Modus (_process_plugin_bars) angebunden")
-check('getattr(plugin, "live_op", True)' in la_src,
-      "live_analyzer.py: Plugin-Modus nur für live_op=True")
+check("def _process_plugin_bars_resilient" in la_src,
+      "live_analyzer.py: resiliente Bar-Close-Evaluierung vorhanden")
+# Code-präzise: Nur echte Code-Konstrukte zählen, Doku-Kommentare über den
+# Rückbau (modul-docstring) sind erlaubt.
+check("new_live_signal = Signal" not in la_src,
+      "live_analyzer.py: KEIN new_live_signal-Signal-Definition mehr")
+check("def set_config" not in la_src and "INSERT INTO signal_results" not in la_src,
+      "live_analyzer.py: KEINE signal_results/set_config-Alt-Mechanik mehr")
+
+hs_src = (Path(__file__).resolve().parent.parent / "analytics" / "background_workers" / "historical_scanner.py").read_text(
+    encoding="utf-8", errors="replace"
+)
+check("grid_scan" not in hs_src.replace("(grid_scan", "(") and "SetEvaluator(" not in hs_src,
+      "historical_scanner.py: KEIN grid_scan/SetEvaluator-Alt-Pfad mehr")
+check("def _run_plugin_batch" in hs_src,
+      "historical_scanner.py: _run_plugin_batch vorhanden")
 
 # ===========================================================================
 # Cleanup
@@ -44692,34 +42430,6 @@ print("LOCKTEST FERTIG")
            </property>
           </widget>
          </item>
-         <item>
-          <widget class="QPushButton" name="btn_signal_select">
-           <property name="sizePolicy">
-            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
-             <horstretch>0</horstretch>
-             <verstretch>0</verstretch>
-            </sizepolicy>
-           </property>
-           <property name="minimumSize">
-            <size>
-             <width>28</width>
-             <height>28</height>
-            </size>
-           </property>
-           <property name="maximumSize">
-            <size>
-             <width>28</width>
-             <height>28</height>
-            </size>
-           </property>
-           <property name="toolTip">
-            <string>Signale an/aus (Grid Proximity + EMA)</string>
-           </property>
-           <property name="text">
-            <string>📈</string>
-           </property>
-          </widget>
-         </item>
         </layout>
        </item>
        <item>
@@ -45020,17 +42730,7 @@ print("LOCKTEST FERTIG")
          <string>New Scan</string>
         </property>
         <property name="toolTip">
-         <string>Aktiviert: Löscht bestehende Signale und führt Komplett-Scan durch. Deaktiviert: Nur Delta-Update (fehlende Bars).</string>
-        </property>
-       </widget>
-      </item>
-      <item>
-       <widget class="QCheckBox" name="check_grid_scan">
-        <property name="text">
-         <string>Grid Scan</string>
-        </property>
-        <property name="toolTip">
-         <string>Grid Proximity Signal (Composite, Phase 11) statt Standard EMA+ATR.</string>
+         <string>Aktiviert: Löscht bestehende Feature-Rows und führt Komplett-Scan durch. Deaktiviert: Nur Delta-Update (fehlende Bars).</string>
         </property>
        </widget>
       </item>
@@ -45549,23 +43249,6 @@ print("LOCKTEST FERTIG")
           <string>MN1</string>
          </property>
         </item>
-       </widget>
-      </item>
-      <item>
-       <widget class="QLabel" name="label_signal_set">
-        <property name="text">
-         <string>Signal-Set:</string>
-        </property>
-       </widget>
-      </item>
-      <item>
-       <widget class="QComboBox" name="combo_signal_filter">
-        <property name="minimumSize">
-         <size>
-          <width>140</width>
-          <height>0</height>
-         </size>
-        </property>
        </widget>
       </item>
       <item>
