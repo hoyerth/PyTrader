@@ -131,3 +131,24 @@ Die vom Anwender neu aufgesetzte `docs/AKTUELLE_UMSETZUNG.md` (15.02-Spezifikati
 **Ergebnis: 31/31 Checks PASS** (Exit 0). Zusätzlich verifiziert:
 * `check_p13_service_win_geometry.py`: ServiceWindow konstruiert mit neuem QSplitter-Aufbau; alle 5.4-Dynamik-Checks (Spalten, Expert-Aufklappen, Scroll-Range, add_instance) bestehen. **Einzige verbleibende Meldung:** vorbestehend aus 15.01 (`setFixedWidth(32)` des ★-Favoriten-Buttons), nicht durch 15.02 verursacht.
 * `python -m py_compile` auf allen neuen/geänderten Dateien (Exit 0).
+
+### 3.7 Schritt 7 – Bugfixing: Access-Violation-Schutz & Geometrie-Persistenz (Commit `7ac0581`)
+
+**Fehler 0 – App-Crash bei wildem Klicken auf Services (Exit-Code `0xC0000005`, Access Violation):**
+Ursache: `data_changed`/`setCurrentItem`-Klick löst `_populate()` → `clear()` aus; `currentItem()` zeigte auf ein bereits C++-seitig zerstörtes `QTreeWidgetItem` → `.data()`-Zugriff crasht hart. Zusätzlich: `clear()` im `ParameterPanel` stieß beim `TypeError` (`'QWidgetItem' object is not callable`) auf ein Absturz-Kandidat-Problem.
+
+Fixes (4 Dateien):
+* **`scrollable_content.py`:** `resize_to_clamped_content()` – **Persistenz-Fix**, Fenster wird nie unter die aktuelle (User-/wiederhergestellte) Größe geschrumpft, nur vergrößert (bis Bildschirm). `_apply_reflow_size()` – try/except gegen Feuern nach Fenster-Schließen.
+* **`serviceui/master_tree.py`:** `shiboken6.isValid()`-Guards (Fallback-Def) in `_safe_current_selection()`/`current_selection()`/`_emit_selection()`/`_restore_selection()` (setCurrentItem unter `blockSignals` + try/finally) und im `TreeItemIterator` (Init/`_collect`/`__next__`).
+* **`serviceui/parameter_panel.py`:** `clear()` entfernt Form-Zeilen-Widgets jetzt explizit (`takeRow` → `fieldItem`/`labelItem` als **Attribute** der `TakeRowResult` – nicht Methoden –, `setParent(None)` + `deleteLater()`), Experten-Gruppe inklusive. `_emit_params_changed()`/`_reflow()` mit try/except.
+* **`serviceui/service_win.py`:** `_qt_valid`-Import; isValid-Guards in `_on_master_selection()`, `_sync_param_panel()`, `_on_param_panel_changed()`; try/except in `_set_ctrl_value()`.
+
+**Fehler 1 – Letzte Fensterposition/-größe wurde nicht persistiert:**
+Ursache: `resize_to_clamped_content()` (ContentScrollMixin) schrumpfte nach `restore_state()` das Fenster wieder auf Inhalt/Screen-Größe → `save_state()` speicherte falsche Geometrie. Fix: Nur-wachsen-Logik (siehe oben).
+
+**Validierung (`test/test.py`, offscreen, Test-DBs in `test/`):**
+* Teil 1 Persistenz (P1–P5): Position wiederhergestellt (150,120), Höhe nicht unter 400 geschrumpft, User-Höhe 450 bleibt erhalten, `save_state()` speichert User-Position/-Höhe → **alle PASS**.
+* Teil 2 Klick-Sturm (K1/K2): 40 schnelle Service-Klicks (`setCurrentItem` + `_on_master_selection`) ohne Absturz, Fenster bleibt lebendig → **alle PASS**.
+* `python -m py_compile` auf allen geänderten Dateien (Exit 0).
+
+**Hinweis Test-Artefakt:** Der frühere K2-Fail lag nicht an der App, sondern am `pump()`-Helper: `QApplication.quit()` setzt den Quit-Flag und versteckt auf der offscreen-Plattform alle Top-Level-Fenster (`isVisible() → False`). Fix im Test: `QEventLoop`-Muster statt `QApplication.quit()`.
