@@ -73,6 +73,31 @@ Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukture
   * Code-Inspektion
 - UI-Änderungen werden durch sorgfältige Code-Inspektion abgesichert, nicht durch Ausführen der GUI.
 
+### 4.5. BUGFIXING- & SPEED-MODUS (MAXIMALE EFFIZIENZ)
+- **Aktivierung:** Erfolgt explizit durch die Anweisung *"Bugfixing-Modus"* oder die Übergabe einer konkreten Fehlermeldung/Tracebacks.
+- **Disziplin & Fokus:** Maximale Geschwindigkeit, direkte Lösung ohne Grundsatzdiskussionen, Höflichkeitsfloskeln oder unaufgeforderte Refactorings.
+
+#### A. Harte Test- & Ausführungsregeln
+- **Keine UI- / GUI-Tests:** Unter keinen Umständen PySide6/Qt-Anwendungen starten oder UI-Skripte ausführen.
+- **Keine Regressionstests:** Keine unbeteiligten Test-Suites oder kompletten Test-Pipelines laufen lassen.
+- **Minimaler Backend-Check (1-Sekunden-Verifikation):**
+  1. Statischer Syntax-Check via `python -m py_compile <geänderte_datei>.py`.
+  2. Isolierter Backend-/DB-Logic-Test ausschließlich in `test/test.py` (falls zwingend nötig).
+- **Manuelles Testen:** Der eigentliche Funktionstest der UI/Gesamtanwendung erfolgt direkt und manuell durch den Anwender.
+
+#### B. Code-Ausgabe & Gezieltes Prompting (Diff-Only)
+- **Patch-/Snippet-Format:** Es werden NIEMALS komplette 400-Zeilen-Dateien neu generiert, wenn sich nur wenige Zeilen ändern.
+- **Präzise Verortung:** Ausgegeben werden nur die geänderten Methoden oder Blöcke mit relativer Pfadangabe als Kommentar in Zeile 1 und klaren Einfüge-Hinweisen (z. B. Zeilennummer oder bestehende Anker-Funktion).
+
+#### C. Doku erst nach Freigabe
+- **Keine Vorab-Dokumentation:** Während der Fehlersuche und Fix-Erstellung werden keine Dokumente (`docs/...`), Readmes oder Changelogs angepasst.
+- **Protokollierung:** Doku-Einträge in `docs/AKTUELLE_UMSETZUNG.md` erfolgen erst, nachdem der Anwender den Fix explizit als funktionierend bestätigt hat.
+
+#### D. Integrierte Zyklus-Booster (Prozess-Beschleuniger)
+1. **Minimaler Kontext-Ballast:** Im Bugfixing-Modus werden keine Roadmaps, Architektur-Dokumente oder historischen Exporte eingelesen.
+2. **Sammeln von zusammenhängenden Fixes:** Gehören mehrere kleine Fehler zusammen, werden alle Snippets in einer einzigen Antwort gebündelt, statt mehrere Interaktions-Schleifen zu drehen.
+3. **Hot-Reloading berücksichtigen:** Code-Eingriffe so gestalten, dass App-Neustarts vermieden werden (z. B. durch Ausnutzung von `PluginRegistry.reload()` oder dynamischen Re-Imports).
+4. **Fehler-Isolierung via Terminal-Asserts:** Kurze `assert`- oder `print`-Statements im Snippet platzieren, damit der Anwender beim manuellen Testen den genauen Fehlschlag-Punkt direkt im Terminal sieht.
 ---
 
 ### 5. PROJEKT-KONTEXT & ERKENNTNISSE (Stand 31.07.2026)
