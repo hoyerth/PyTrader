@@ -22,10 +22,12 @@ D) Broker-Upsert:
    - upsert_from_broker() fuegt neue Symbole hinzu (path/updated_at).
    - Bestehende Favoriten-Flags bleiben beim Upsert unangetastet.
 
-E) MT5-Fallback (sync_from_broker):
+E) MT5-Fallback (sync_from_broker / sync_from_broker_with_status):
    - MT5 nicht verfuegbar (initialize()==False) -> Fallback auf DB-Tabelle.
    - MT5 verfuegbar (symbols_get()) -> Upsert + Rueckgabe der DB-Liste.
    - MT5 wirft Exception -> Fallback auf DB-Tabelle.
+   - sync_from_broker_with_status() liefert Status "live"/"fallback" und eine
+     Fehlermeldung (User-Anweisung: Fehlermeldung im Log statt stillem Fallback).
 
 F) EventBus:
    - favorites_changed wird nach Toggle emittiert (Verbindung wird aufgerufen).
@@ -176,6 +178,13 @@ try:
           repo.count() == before and isinstance(result, list)
           and len(result) == before, f"count={repo.count()}")
 
+    # E1b) sync_from_broker_with_status: Status 'fallback' + Fehlermeldung
+    symbols, status, error = repo.sync_from_broker_with_status()
+    check("E1b) Status 'fallback' + Fehlermeldung bei MT5 offline",
+          status == "fallback" and bool(error)
+          and "initialize" in error.lower(),
+          f"status={status} error={error}")
+
     # E2) MT5 online -> Upsert + Rueckgabe der DB-Liste
     sys.modules["MetaTrader5"] = _FakeMT5_Online()
     result = repo.sync_from_broker()
@@ -190,12 +199,32 @@ try:
           repo.get_symbol("AUDUSD")["is_favorite"] is False
           and repo.get_symbol("SILVER")["is_favorite"] is True)
 
+    # E3c) sync_from_broker_with_status: Status 'live' ohne Fehlermeldung
+    symbols, status, error = repo.sync_from_broker_with_status()
+    check("E3c) Status 'live' ohne Fehlermeldung bei MT5 online",
+          status == "live" and error is None
+          and len(symbols) == repo.count(),
+          f"status={status} error={error}")
+
     # E4) MT5 wirft Exception -> Fallback auf DB
     sys.modules["MetaTrader5"] = _FakeMT5_Error()
     before = repo.count()
     result = repo.sync_from_broker()
     check("E4) MT5-Exception -> Fallback auf DB-Tabelle",
           repo.count() == before and len(result) == before, f"count={repo.count()}")
+
+    # E4b) sync_from_broker_with_status: Status 'fallback' + Meldung bei Exception
+    symbols, status, error = repo.sync_from_broker_with_status()
+    check("E4b) Status 'fallback' + Fehlermeldung bei MT5-Exception",
+          status == "fallback" and bool(error), f"status={status} error={error}")
+
+    # E5) MT5-Import schlaegt fehl (sys.modules=None) -> Fallback + Meldung
+    sys.modules["MetaTrader5"] = None
+    symbols, status, error = repo.sync_from_broker_with_status()
+    check("E5) MT5-Import-Fehler -> Fallback + Meldung",
+          status == "fallback" and bool(error)
+          and len(symbols) == repo.count(),
+          f"status={status} error={error}")
 finally:
     if _original_mt5 is None:
         sys.modules.pop("MetaTrader5", None)

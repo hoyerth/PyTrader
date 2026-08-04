@@ -195,27 +195,55 @@ class SymbolRepository:
         - Bei Erfolg: Upsert aller Symbole in die DB, Rückgabe der DB-Liste.
         - Bei MT5-Ausfall (initialize()==False, Exception): Fallback auf die
           DB-Tabelle – die App bleibt voll funktionsfaehig (Roadmap 15.01).
+
+        Detaillierter Status (live/fallback + Fehlermeldung) ist ueber
+        `sync_from_broker_with_status()` verfuegbar.
+        """
+        symbols, _status, _error = self.sync_from_broker_with_status()
+        return symbols
+
+    def sync_from_broker_with_status(self) -> Tuple[List[Dict[str, Any]], str, Optional[str]]:
+        """Wie sync_from_broker(), liefert zusaetzlich Status & Fehlermeldung.
+
+        Erweiterung fuer die UI (SymbolsWindow): Die Liste aller verfuegbaren
+        Symbole wird bei jedem Oeffnen live von MT5 geladen; schlaegt der
+        MT5-Zugriff fehl, wird der Grund als Fehlermeldung geliefert, damit
+        die UI eine Log-Meldung ausgeben kann, statt still auf den DB-Stand
+        zurueckzufallen (User-Anweisung 15.01-Nachtrag).
+
+        Returns:
+            (symbols, status, error)
+            - symbols: immer die DB-Symbol-Liste (Fallback inklusive).
+            - status:  "live" bei erfolgreichem MT5-Fetch,
+                       "fallback" bei MT5-Ausfall (DB-Stand).
+            - error:   Fehlertext (oder None bei Erfolg).
         """
         try:
             import MetaTrader5 as _mt5
+        except Exception as exc:
+            return self.get_symbols(), "fallback", f"MetaTrader5-Import fehlgeschlagen: {exc}"
 
-            try:
-                initialized = bool(_mt5.initialize())
-            except Exception:
-                initialized = False
-            if not initialized:
-                return self.get_symbols()
+        try:
+            initialized = bool(_mt5.initialize())
+        except Exception as exc:
+            return self.get_symbols(), "fallback", f"mt5.initialize() Fehler: {exc}"
+        if not initialized:
+            return self.get_symbols(), "fallback", "MT5-Terminal nicht verfügbar (initialize() == False)"
 
+        try:
             symbols = _mt5.symbols_get()
-            if not symbols:
-                return self.get_symbols()
+        except Exception as exc:
+            return self.get_symbols(), "fallback", f"mt5.symbols_get() Fehler: {exc}"
+        if not symbols:
+            return self.get_symbols(), "fallback", "MT5 liefert keine Symbole (symbols_get() leer)"
 
+        try:
             pairs = [(s.name, getattr(s, "path", "")) for s in symbols]
             self.upsert_from_broker(pairs)
-            return self.get_symbols()
-        except Exception:
-            # MT5 nicht verfuegbar (DLL-Load-Fehler, Terminal zu, ...)
-            return self.get_symbols()
+        except Exception as exc:
+            return self.get_symbols(), "fallback", f"Upsert in broker_symbols fehlgeschlagen: {exc}"
+
+        return self.get_symbols(), "live", None
 
 
 # Bequeme Default-Instanz (kapselt app_data.duckdb) – fuer UI-Fenster.

@@ -111,7 +111,7 @@ Nicht-modales `SymbolsWindow` (`PersistentWindow`, `INSTANCE_ID = "win_symbols"`
 
 Test-DB in `test/p15_s1_symbols_test.duckdb` (Regel: keine Test-DBs im Root/`data`), kein `QApplication.exec()`.
 
-**Ergebnis: 26/26 Checks PASS** (Exit 0):
+**Ergebnis: 30/30 Checks PASS** (Exit 0):
 
 | Bereich | Checks | Inhalt |
 | --- | --- | --- |
@@ -119,12 +119,27 @@ Test-DB in `test/p15_s1_symbols_test.duckdb` (Regel: keine Test-DBs im Root/`dat
 | B Lese-API | B1–B3 | `get_symbols`/`get_favorite_symbols`/`get_symbol` (case-insensitive) |
 | C Favoriten-Toggle | C1–C5 | Toggle liefert neuen Zustand; unbekanntes Symbol wird Favorit |
 | D Broker-Upsert | D1–D5 | Neue Symbole + path, Favoriten-Flags unangetastet, keine Duplikate |
-| E MT5-Fallback | E1–E4 | offline → DB-Fallback; online → Upsert; Exception → DB-Fallback |
+| E MT5-Fallback & Status | E1–E5 | offline/Exception/Import-Fehler → DB-Fallback + Fehlermeldung; online → Upsert + Status `"live"` |
 | F EventBus | F1–F3 | `favorites_changed`, `profile_changed(payload)`, `service_set_changed` |
 
 Zusätzlich: `py_compile` auf allen neuen/geänderten Dateien (Exit 0) und Import-Smoke-Test (event_bus, symbol_repository, symbols_win, service_win) erfolgreich.
 
-### 3.6 Offene Punkte / nächste Schritte
+### 3.7 Nachtrag – MT5-Sync beim Öffnen + Log-Meldung (User-Anweisung 04.08.2026)
+
+**Problem:** Beim Öffnen des SymbolsWindow wurde die Symbol-Liste nur aus der DB gelesen (`get_symbols()`); ein Live-Fetch von MT5 fand nie statt. Zusätzlich schluckte `sync_from_broker()` MT5-Fehler still (stiller DB-Fallback ohne Meldung).
+
+**Lösung (additiv):**
+* **`symbol_repository.py`:** Neue Methode **`sync_from_broker_with_status()`** liefert `(symbols, status, error)`:
+  * `status = "live"` bei erfolgreichem MT5-Fetch, `"fallback"` bei MT5-Ausfall.
+  * `error` = konkrete Fehlermeldung (MT5-Import fehlgeschlagen / `initialize()==False` / `symbols_get()`-Fehler oder leer / Upsert-Fehler) bzw. `None` bei Erfolg.
+  * `sync_from_broker()` bleibt als dünner Wrapper erhalten (Rückgabe unverändert – keine API-Brechung).
+* **`serviceui/symbols_win.py`:** `_load_symbols()` ruft jetzt `sync_from_broker_with_status()` auf → **Live-Fetch bei jedem Öffnen**. Neues **Status-Log** (`QTextEdit`, unten im Fenster):
+  * `[OK] N Symbole live von MT5 geladen.` bei Erfolg,
+  * `[WARNUNG] MT5 nicht verfügbar – zeige DB-Stand (N Symbole). <Fehlermeldung>` bei MT5-Ausfall (automatischer DB-Fallback wie spezifiziert – aber sichtbar).
+* **Test:** `test/check_p15_s1_symbols.py` um E1b (offline → fallback + Meldung), E3c (online → live + None), E4b (Exception → fallback + Meldung) und E5 (Import-Fehler → fallback + Meldung) erweitert (26 → **30 Checks**).
+* **Offscreen-Smoke-Test** (Window-Instanziierung, kein `exec()`): SymbolsWindow baut mit Log-Bereich, lädt **632 Symbole live von MT5** und der Favoriten-Toggle emittiert `favorites_changed` – bestätigt den Live-Pfad in der realen Umgebung.
+
+### 3.7 Offene Punkte / nächste Schritte
 
 * **15.02:** Service-UI-Refactoring & Master-Tree (nächste Phase).
 * **15.03:** `AnalyticsWindow` – dort wird die Favoriten-Dropdown-Kopplung (Punkt 3.4) und der `EventBus`-Empfang ergänzt.
