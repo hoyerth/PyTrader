@@ -1,125 +1,135 @@
-# Architektur-Dokumentation: Einheitliche Signal- und ML-Engine für PyTrader
+# Architektur-Dokumentation: Einheitliche Berechnungs- und Service-Engine für PyTrader
+
+> Hinweis: Diese Datei liegt unter `docs/Old` und ist ein archiviertes Konzept-Dokument.
+> Verbindliche, aktuell gepflegte Architektur: `Architektur.md` (Projekt-Root) sowie
+> `Agents.md`. Dieser Stand wurde am 04.08.2026 gegen den Ist-Code (Phase 14,
+> Commit `fc27094`) abgeglichen und faktisch korrigiert.
 
 ## 1. Executive Summary
 
-Dieses Dokument beschreibt die Architektur-Richtlinien für die Erweiterung des PyTrader-Systems um Mustererkennung und Machine-Learning-gestützte Signalanalyse. Das Kernziel ist die Schaffung einer hochperformanten, entkoppelten Desktop-Architektur (Python/PySide6), die historische Analysen, Live-Marktüberwachung und Statistik-Auswertungen ohne redundante Code-Basis ermöglicht.
+Dieses Dokument beschreibt die Architektur-Richtlinien für das PyTrader-System. Das Kernziel ist die Schaffung einer hochperformanten, entkoppelten Desktop-Architektur (Python/PySide6), die historische Analysen, Live-Marktüberwachung und Statistik-Auswertungen ohne redundante Code-Basis ermöglicht.
 
-Der Lösungsansatz basiert auf einer **einheitlichen Signal-Engine** mit einem vorgeschalteten **Feature Store** und einer strikten **Trennung von Berechnung und Visualisierung** über DuckDB als Kommunikationsschicht.
+Der Lösungsansatz basiert auf einer **einheitlichen Berechnungs-Engine** (Plugin-/Service-Pipeline) mit einem vorgeschalteten **Hybrid-Feature-Store** und einer strikten **Trennung von Berechnung und Visualisierung** über DuckDB als Kommunikationsschicht.
+
+> Stand-Korrektur (04.08.2026): Die frühere „einheitliche Signal-Engine" (`SignalDefinition`
+> / Signal-Sets) ist seit Phase 13 Schritt 7.B **deaktiviert** (keine `signal_results`-Writes
+> mehr). Marktentscheidend ist heute die Plugin-/Service-Architektur (`PluginFeature`,
+> `PluginExecutor`, `ServiceSetEvaluator`) mit dem `feature_store` als Lesequelle für
+> Chart-Marker und Statistik.
 
 ---
 
 ## 2. Architektonische Grundprinzipien
 
 ### 2.1. Entkopplung von Berechnung und UI (Datenbank als Brücke)
-Die UI (Chart-Ansicht, Statistik-Fenster) darf unter keinen Umständen blockiert werden. Daher berechnen Indikatoren im Chart keine eigenen Signale.
-*   **Backend (Worker-Prozesse):** Analysieren historische Daten oder Live-Ticks und schreiben alle gefundenen Ereignisse (Patterns, Trends, ML-Signale) kontinuierlich in eine Analytics-Datenbank.
-*   **Frontend (PySide6 / Lightweight Charts):** Die Chart-Overlays und Statistik-Widgets greifen ausschließlich *lesend (read-only)* auf diese Datenbank zu und visualisieren fertige Ergebnisse.
+Die UI (Chart-Ansicht, Statistik-Fenster, Service-Fenster) darf unter keinen Umständen blockiert werden. Der Chart führt keine Berechnungen aus, sondern liest ausschließlich vorberechnete Daten aus DuckDB (mit definiertem Fallback).
+*   **Backend (Worker-Prozesse):** Analysieren historische Daten oder Live-Ticks und schreiben alle gefundenen Ereignisse kontinuierlich in den `feature_store` (`analytics.duckdb`).
+*   **Frontend (PySide6 / Lightweight Charts v5):** Die Chart-Overlays und Statistik-Widgets greifen ausschließlich *lesend (read-only)* auf diese Datenbank zu und visualisieren fertige Ergebnisse (`ChartRenderPayload`).
 
-### 2.2. Einheitliche Signal-Engine (`SignalDefinition`)
-Es gibt keine architektonische Trennung zwischen "klassischen Indikator-Regeln", "Chart-Mustern" oder "Machine Learning".
-*   Alle Analyse-Methoden implementieren dieselbe abstrakte Basisklasse (`SignalDefinition`).
-*   Für das System macht es keinen Unterschied, ob ein Signal durch einen gleitenden Durchschnitt (Heuristik) oder durch ein Gradient-Boosting-Modell (ML) generiert wird.
-*   Signale können beliebig in **Signal-Sets** gebündelt und gewichtet werden.
+### 2.2. Einheitliche Berechnungs-Engine (Plugin-Architektur)
+Die zentrale Schnittstelle aller Berechnungen ist das **stateless Plugin** (`PluginFeature`, `analytics/features/plugins/base_plugin.py`):
+*   Jede Berechnung ist eine reine Funktion `calculate(df, params, context)`.
+*   Der **`PluginExecutor`** übernimmt Plugin-Auflösung (Registry), Parametervalidierung (`ParameterSchema`), Dependency-Ordering und strukturiertes Fehler-Logging.
+*   Der **`ServiceSetEvaluator`** führt Service-Sets (`ServiceSetDefinition`) in `execution_order` aus; Abhängigkeiten laufen über `depends_on`/`instance_id` und `PluginContext.shared_state` (Namespace-isoliert).
+*   Die frühere Trennung nach Signal-Typen (klassische Regeln / Muster / ML) entfällt im aktiven Pfad; `SignalDefinition`-Sets sind deaktiviert (Phase 13 7.B).
 
-### 2.3. Der Feature Store als Fundament
-Um die Rechenlast im Desktop-Betrieb zu minimieren und das ML-Training zu optimieren, werden Rohdaten (OHLCV) vorab in strukturierte Features transformiert.
-*   Die Feature-Extraktion (z. B. Momentum, Volatilität, Swing-Strukturen, gleitende Durchschnitte) erfolgt nur *einmal*.
-*   Diese berechneten Merkmale werden dauerhaft im *Feature Store* gespeichert.
-*   Sowohl deterministische Regeln als auch ML-Modelle greifen zur Evaluation ausschließlich auf den Feature Store zu, nicht auf rohe Kerzendaten.
+### 2.3. Der Hybrid Feature Store als Fundament
+Um die Rechenlast im Desktop-Betrieb zu minimieren, werden Rohdaten (OHLCV) vorab in strukturierte Features transformiert:
+*   **Native High-Speed-Spalten:** Häufig abgefragte Werte (`ema_diff`, `atr_normalized`, `grid_nearest_level`) liegen als native Tabellenspalten für maximale Query-Performance vor.
+*   **Generisches JSON-Payload:** Beliebige dynamische Zusatzdaten neuer Plugins werden im Feld `feature_data JSON` abgelegt, verknüpft mit stabiler `feature_id` und `plugin_version` (Hybrid-Schema, Phase 12).
+*   Die Feature-Extraktion erfolgt nur *einmal*; diese berechneten Merkmale werden dauerhaft gespeichert.
+*   Sowohl deterministische Regeln als auch (zukünftige) ML-Modelle greifen ausschließlich auf den Feature-Store zu, nicht auf rohe Kerzendaten.
 
 ### 2.4. Lokale Execution First
-In der Initialphase werden alle Berechnungen lokal innerhalb der nativen Python-Desktop-Umgebung ausgeführt. Komplexe ML-Modelle werden über performante lokale Runtimes eingebunden. Ein ausgelagerter Microservice (z.B. FastAPI/Docker) wird nur bei zukünftigen Skalierungsanforderungen (z.B. massive GPU-Nutzung) in Betracht gezogen.
+In der Initialphase werden alle Berechnungen lokal innerhalb der nativen Python-Desktop-Umgebung ausgeführt. Komplexe ML-Modelle werden über performante lokale Runtimes eingebunden. Ein ausgelagerter Microservice (z. B. FastAPI/Docker) wird nur bei zukünftigen Skalierungsanforderungen in Betracht gezogen.
 
 ---
 
 ## 3. Datenbank-Architektur (DuckDB)
 
-Die bestehende `market_data.duckdb` (für OHLCV-Rohdaten) wird um eine spezifische `analytics.duckdb` erweitert.
+Die bestehende `market_data.duckdb` (OHLCV-Rohdaten) wird um `analytics.duckdb` (Features/Signale) und `app_data.duckdb` (UI-Status, Presets, Service-Sets) ergänzt.
 
-### Tabellen-Struktur (analytics.duckdb)
+### Tabellen-Struktur (analytics.duckdb) – konzeptionell
 
-**1. `feature_store`** (Persistente Speicherung der vorberechneten Merkmale)
-*   `symbol` (VARCHAR)
-*   `timeframe` (VARCHAR)
-*   `bar_time` (TIMESTAMPTZ)
-*   `ema_diff` (DOUBLE), `rsi_14` (DOUBLE), `atr_normalized` (DOUBLE) ... (weitere Features)
+**1. `feature_store`** (Persistente Speicherung der vorberechneten Merkmale – **zentrale Lesequelle für Chart & Statistik**)
+*   `symbol` (VARCHAR), `timeframe` (VARCHAR), `bar_time` (TIMESTAMPTZ) – Primärschlüssel
+*   Native Feature-Spalten (z. B. `ema_diff`, `atr_normalized`, `grid_nearest_level`)
+*   Hybrid-Schema (Phase 12): `feature_id` (VARCHAR), `plugin_version` (VARCHAR), `feature_data` (JSON)
+*   **Schema-Detail (verbindlich):** `db_service.py` `check_and_init_databases()` – Single Source of Truth
 
-**2. `signal_definitions`** (Metadaten zu allen verfügbaren Algorithmen)
-*   `signal_id` (VARCHAR) - Primärschlüssel (z.B. 'trend_ema_cross_v1')
-*   `category` (VARCHAR) - 'rule', 'pattern', 'ml'
-*   `version` (VARCHAR)
-*   `params` (JSON) - Standard-Parameter
+**2. `signal_definitions`** (Legacy-Tabelle, Phase 1)
+*   Metadaten zu Signal-Algorithmen. Wird seit Phase 13 7.B **nicht mehr aktiv gelesen**; Signale sind in den Workern als Hardcoded-Dicts definiert.
 
-**3. `signal_sets`** (Dynamische JSON-Konfiguration kombinierter Signale)
-*   `set_id` (VARCHAR) - Primärschlüssel
-*   `configuration` (JSON) - Enthält die IDs und Gewichtungen der Signale
-*   `logic` (VARCHAR) - 'AND', 'OR', 'WEIGHTED'
+**3. `signal_sets`** (Legacy-Tabelle, Phase 1)
+*   JSON-Konfiguration kombinierter Signale. Wird nicht mehr aktiv gelesen. Die aktiven Service-Sets liegen in `app_data.duckdb` → Tabelle `service_sets` (Phase 13, `ServiceSetRepository`).
 
-**4. `signal_results`** (Zentrale Tabelle für alle erkannten Events – Historie & Live)
-*   `event_id` (VARCHAR) - Primärschlüssel
-*   `symbol` (VARCHAR)
-*   `timeframe` (VARCHAR)
-*   `bar_time` (TIMESTAMPTZ)
-*   `source_id` (VARCHAR) - Verweis auf `signal_id` oder `set_id`
-*   `confidence` (DOUBLE) - Wahrscheinlichkeit / Stärke des Signals
-*   `context_type` (VARCHAR) - 'historical_batch' oder 'live_stream'
-*   `metadata_payload` (JSON) - Zusätzliche Kontextdaten
+**4. `signal_results`** (Legacy-Tabelle, Phase 1 – Writes deaktiviert)
+*   War die zentrale Tabelle für erkannte Events (hist. & live). Seit Phase 13 7.B werden **keine `signal_results`-Writes** mehr erzeugt; Marker und Statistik lesen den `feature_store` (`feature_data` der Plugins/Services, z. B. `feature_id='proximity'`). Die Tabelle bleibt als Referenz erhalten.
 
 ---
 
 ## 4. Software-Struktur & Ordner-Layout
 
-Das Projekt (PyTrader) sollte in eine klare Domain-Struktur unterteilt werden:
+Das Projekt (PyTrader) folgt einer klaren Domain-Struktur. Verbindlich und aktuell gepflegt ist das Layout in `Architektur.md` (Root, §3); nachfolgend der konzeptionelle Überblick:
 
-```text
+```
 PyTrader/
-├── analytics/
-│   ├── engine/                     # Kernlogik der Analyse
-│   │   ├── signal_runtime.py       # Orchestrierung (Tick/Bar -> Features -> Signals -> DB)
-│   │   ├── set_evaluator.py        # Kombinationslogik für Signal-Sets
-│   │   └── base_definition.py      # Abstrakte Klasse SignalDefinition
-│   ├── features/                   # Logik zur Generierung des Feature Stores
-│   │   ├── feature_builder.py
-│   │   └── definitions/            # (z.B. volatility.py, momentum.py, structure.py)
-│   ├── signals/                    # Die konkreten Algorithmen (Implementierungen)
-│   │   ├── heuristics/             # (z.B. ema_crossover.py)
-│   │   ├── patterns/               # (z.B. pullback.py)
-│   │   └── machine_learning/       # (Inferenz, z.B. xgboost_model.py)
-│   └── background_workers/         # QThread Prozesse
-│       ├── historical_scanner.py   # Batch-Verarbeitung über Historie
-│       └── live_analyzer.py        # Polling/Event-Listener für neue Bars
-├── ui/                             # PySide6 Frontend
-│   ├── chart/                      
-│   │   └── overlays/               # Indikatoren, die aus `signal_results` lesen
-│   └── statistics/                 # Fenster für DuckDB SQL-Aggregationsabfragen
-└── data/                           # Lokale DuckDB Dateien
+├── analytics/                     # Analyse- & Berechnungsdomäne
+│   ├── engine/                    # set_evaluator.py (SetEvaluator + ServiceSetEvaluator),
+│   │                              # service_models.py, service_set_repository.py,
+│   │                              # schema_migrator.py, base_definition.py
+│   ├── features/                  # Feature-Generierung & Plugin-System
+│   │   ├── feature_builder.py     # PluginLoader, PluginRegistry, PluginExecutor, FeatureBuilder
+│   │   ├── definitions/           # Konkrete Plugins (grid_lines, proximity, grid_liquidity, ema_diff, atr_normalized, grid_levels)
+│   │   └── plugins/               # Plugin-Schnittstellen (base_plugin.py)
+│   ├── signals/                   # Signal-Algorithmen (Alt-Pfad, deaktiviert): heuristics/,
+│   │                              # composite/, experimental/, machine_learning/ (Inferenz)
+│   ├── statistics_repository.py   # SQL-Aggregationen auf feature_data (Statistik-Fenster)
+│   └── background_workers/        # QThread-Prozesse: historical_scanner.py, live_analyzer.py
+├── chart/                         # Visualisierungsdomäne
+│   ├── js/                        # Lightweight Charts v5 Module (01_core.js – 05_measurement.js)
+│   ├── indicators/                # Chart-Indikatoren (grid_liquidity.py; Alt-Indikator grid.py entfernt)
+│   ├── overlays/                  # Signal-Marker Overlay (signal_overlay.py)
+│   ├── widgets/                   # Wiederverwendbare UI-Widgets (color_button.py)
+│   ├── chart_win.py               # PyTraderChartWindow (WebEngine-Container)
+│   └── indicator_dialog.py        # Generischer Einstellungs-Dialog
+├── config/                        # App-Einstellungen & State-Modelle (app_settings.py)
+├── ui/                            # Qt-Designer-Dateien (*.ui: chart_win, main_win, service_win, statistic_win)
+├── data/                          # Lokale DuckDB-Dateien (market_data, analytics, app_data, custom_plugins)
+├── db_service.py                  # MT5-Sync, DbPool (Thread-local) & Schema-Migrationen
+├── main.py                        # Haupt-Orchestrator (MainWindow)
+├── persistent_win.py              # Basisklasse für Fenster-Persistence & Registry
+├── service_win.py                 # Service-Fenster (Set-Editor, Papierkorb, Sperren)
+├── statistic_win.py               # Statistik-Fenster
+└── state_manager.py               # UI-Status, Fenstergeometrien & Presets
+```
 
 ## 5. Kernprozesse
 
 ### 5.1. Historischer Backtest & Scanner
-1. Ein User triggert einen Scan für ein bestimmtes Signal-Set.
-2. Der `historical_scanner` Worker lädt OHLCV-Daten.
-3. Die `feature_builder` Logik berechnet fehlende Features und speichert sie im `feature_store`.
-4. Die `signal_runtime` evaluiert alle Signale des Sets anhand der Features.
-5. Ergebnisse werden via *Bulk-Insert* als 'historical_batch' in `signal_results` geschrieben.
+1. Ein User triggert einen Scan (Service-Fenster).
+2. Der `historical_scanner`-Worker lädt OHLCV-Daten aus `market_data.duckdb`.
+3. Der `PluginExecutor` führt aktive Batch-Presets / Service-Sets aus.
+4. Ergebnisse werden als FeatureStorePayload (Bulk-Upsert) in den `feature_store` geschrieben (inkl. `feature_id`, `plugin_version`, `feature_data`).
+5. Statistik und Chart-Marker lesen diese Daten aus dem `feature_store` (keine `signal_results`-Writes).
 
 ### 5.2. Live-Erkennung
 1. Neue Ticks aggregieren zu einer abgeschlossenen Kerze (Bar-Close).
-2. Der `live_analyzer` Worker extrahiert nur für diese *neue* Kerze die Features.
-3. Die Features werden an die aktive `signal_runtime` übergeben.
-4. Identifizierte Signale werden in `signal_results` als 'live_stream' geschrieben.
-5. Über einen PyQt-Signal-Slot-Mechanismus wird das Chart-Fenster benachrichtigt, die neuen Overlays aus der Datenbank zu laden.
+2. Der `live_analyzer`-Worker bewertet die neue Kerze über den resilienten Pfad (`execute_set_resilient`, Skip-Logic, RAM-Quarantäne) gegen ein im `PluginContext.shared_state` gepuffertes Raster.
+3. Ergebnisse werden in den `feature_store` geschrieben; der Chart liest sie per Re-Render/Refresh (feature_id-Lesepfad).
+4. Die UI wird bei neuen Bar-Closes über den New-Candle-Callback (debounced Refresh) benachrichtigt.
 
 ---
 
 ## 6. Richtlinien für die KI-gestützte Weiterentwicklung
 
-Wenn Sie diese Dokumentation nutzen, um mit verschiedenen KIs Teilkomponenten auszuarbeiten, beachten Sie folgende Anweisungen für den Prompt-Kontext:
+Wenn Sie diese Dokumentation nutzen, um mit verschiedenen KIs Teilkomponenten auszuarbeiten, beachten Sie folgende Anweisungen für den Prompt-Kontext (verbindliche Details: `Architektur.md` §5, `Agents.md`, System-Instruktionen):
 
-*   **Keine Logik-Vermischung:** Weisen Sie die KI an, Logik für UI-Aktualisierungen strikt von der Signal-Evaluation zu trennen.
-*   **Fokus auf DuckDB:** Fordern Sie effiziente vektorisierte Pandas/Numpy-Operationen, die gut mit DuckDB harmonieren.
-*   **Abstrakte Vererbung:** Bestehen Sie darauf, dass neue Signale zwingend von der `SignalDefinition` Basisklasse erben müssen.
-*   **Desktop-Kompatibilität:** Schließen Sie Lösungen aus, die komplexe verteilte Systeme (Kafka, Redis, Kubernetes) fordern, solange es sich um eine Desktop-Anwendung (Windows 11) handelt.
+*   **Keine Logik-Vermischung:** UI-Aktualisierungen strikt von der Berechnungs-Logik trennen.
+*   **Fokus auf DuckDB:** Effiziente vektorisierte Pandas/Numpy-Operationen, die gut mit DuckDB harmonieren.
+*   **Abstrakte Vererbung:** Neue Komponenten erben zwingend von ihrer Basisklasse (`PluginFeature`, `PersistentWindow`, `BaseIndicator`).
+*   **Additive Erweiterung (Open/Closed):** Neue Plugins/Services/Fenster durch neue Dateien; Bestandsmodule nicht brechen.
+*   **Desktop-Kompatibilität:** Keine komplexen verteilten Systeme (Kafka, Redis, Kubernetes) – Desktop-Anwendung (Windows 11).
 
 ## 7. Goldene Regeln der Objektorientierung & System-Entkopplung (OOP Principles)
 
@@ -127,22 +137,22 @@ Jede Code-Generierung und Refactoring-Aufgabe durch KI-Assistenten muss strikt d
 
 1. **Abstraktion durch Abstrakte Basisklassen (ABC & Polymorphie):**
    * Keine isolierten Funktionen oder ad-hoc Klassen für Business-Logik.
-   * Jede Kern-Komponente (z. B. Signale, Features, Fenster, Indikatoren) **muss** von ihrer jeweiligen abstrakten Basisklasse erben (`SignalDefinition`, `BaseFeature`, `PersistentWindow`, `BaseIndicator`).
-   * Die aufrufende Engine interagiert **ausschließlich** mit dem abstrakten Interface, niemals mit konkreten Implementierungen[cite: 3].
+   * Jede Kern-Komponente (z. B. Plugins, Features, Fenster, Indikatoren) **muss** von ihrer jeweiligen abstrakten Basisklasse erben (`PluginFeature`, `BaseFeature`, `PersistentWindow`, `BaseIndicator`).
+   * Die aufrufende Engine interagiert **ausschließlich** mit dem abstrakten Interface, niemals mit konkreten Implementierungen.
 
 2. **Vollständige Entkopplung & Inversion of Control (IoC):**
-   * **Keine Zirkulären Abhängigkeiten:** Sub-Module (z. B. Worker oder Dialoge) dürfen niemal Kenntnis von konkreten Orchestratoren (wie `MainWindow`) haben.
-   * **Kommunikation über Signals/Sockets & Repositories:** UI-Komponenten und Datenverarbeiter kommunizieren strikt asynchron über PyQt-Signals oder Read-Only-Datenbankabfragen[cite: 3].
-   * Verboten: Hardcoded Klassennamen-Checks (z. B. `if name == "win_statistics"`) in zentralen Repositories. Fenstertypen müssen sich generisch/dynamisch über Dekoratoren oder Registrys registrieren.
+   * **Keine zirkulären Abhängigkeiten:** Sub-Module (z. B. Worker oder Dialoge) dürfen niemals Kenntnis von konkreten Orchestratoren (wie `MainWindow`) haben.
+   * **Kommunikation über Signals/Slots & Repositories:** UI-Komponenten und Datenverarbeiter kommunizieren strikt asynchron über PyQt-Signals oder Read-Only-Datenbankabfragen.
+   * **Verboten:** Hardcoded Klassennamen-Checks in zentralen Repositories. Fenstertypen registrieren sich generisch/dynamisch über Dekoratoren/Registrys (`@register_persistent_window`).
 
 3. **Single Responsibility Principle (SRP - Eine Aufgabe pro Klasse):**
-   * **UI-Klassen (`PySide6`):** Verantwortlich *nur* für Event-Handling und Rendering[cite: 3]. Keine Berechnungen, Indikator-Logik oder direkte DB-Verbindungsaufbauten.
-   * **Worker/Engine-Klassen:** Verantwortlich *nur* für Datenverarbeitung und mathematische Evaluierung[cite: 3]. Absolut kein UI-Import oder GUI-Code.
-   * **Repository-Klassen:** Kapseln den Datenbank-Zugriff exklusiv (SQL-Abfragen, Connection-Handling)[cite: 3].
+   * **UI-Klassen (`PySide6`):** Verantwortlich *nur* für Event-Handling, Rendering und State-Persistenz. Keine Berechnungen, Indikator-Logik oder direkte DB-Verbindungsaufbauten.
+   * **Worker/Engine-Klassen:** Verantwortlich *nur* für Datenverarbeitung und mathematische Evaluierung. Absolut kein UI-Import oder GUI-Code.
+   * **Repository-Klassen:** Kapseln den Datenbank-Zugriff exklusiv (SQL-Abfragen, Connection-Handling).
 
 4. **Offen für Erweiterung, Geschlossen für Änderung (Open/Closed Principle):**
-   * Neue Indikatoren, Strategien oder Fenster müssen durch **Hinzufügen neuer Dateien** implementiert werden können, ohne bestehende Kern-Dateien (`main.py`, `set_evaluator.py`, `feature_builder.py`) modifizieren zu müssen[cite: 3].
+   * Neue Indikatoren, Strategien, Plugins oder Fenster müssen durch **Hinzufügen neuer Dateien** implementiert werden können, ohne bestehende Kern-Dateien brechen zu müssen. Erweiterungen bestehender Module erfolgen strikt additiv (Wrapper/Schnittstellen).
 
 5. **Typsicherheit & Verlässliche Datenverträge:**
-   * Strikte Nutzung von Python **Type Hints** (`typing`) für alle Funktionsparameter und Rückgabewerte.
-   * Keine impliziten Dictionaries als Datenverträge zwischen Modulen; Datenströme nutzen definierte Dataframes, Primitive oder Typ-Aliase[cite: 3].
+   * Strikte Nutzung von Python **Type Hints** (`typing`, `TypedDict`) für alle Funktionsparameter und Rückgabewerte.
+   * Keine impliziten Dictionaries als Datenverträge zwischen Modulen; Datenströme nutzen definierte TypedDict-Verträge (`ChartRenderPayload`, `FeatureStorePayload`, `ServiceSetDefinition`), Dataframes, Primitive oder Typ-Aliase.

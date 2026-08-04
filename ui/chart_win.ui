@@ -175,34 +175,6 @@
           </spacer>
          </item>
          <item>
-          <widget class="QPushButton" name="btn_indicator_grid">
-           <property name="sizePolicy">
-            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
-             <horstretch>0</horstretch>
-             <verstretch>0</verstretch>
-            </sizepolicy>
-           </property>
-           <property name="minimumSize">
-            <size>
-             <width>28</width>
-             <height>28</height>
-            </size>
-           </property>
-           <property name="maximumSize">
-            <size>
-             <width>28</width>
-             <height>28</height>
-            </size>
-           </property>
-           <property name="toolTip">
-            <string>Grid Liq Lines (Linksklick: An/Aus, Rechtsklick: Einstellungen)</string>
-           </property>
-           <property name="text">
-            <string>#</string>
-           </property>
-          </widget>
-         </item>
-         <item>
           <widget class="QPushButton" name="btn_indicator_grid_liquidity">
            <property name="sizePolicy">
             <sizepolicy hsizetype="Fixed" vsizetype="Fixed">

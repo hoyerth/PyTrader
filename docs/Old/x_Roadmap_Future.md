@@ -47,7 +47,7 @@ Die folgenden Themen sind für den schnellen operative Einsatz der App nicht zwi
 2. **Event Typen:** `ServiceSetExecutedEvent`, `PluginReloadedEvent`, `LiveSignalDetectedEvent`.
 
 
-Others Topics 
+Others Topics -
 
 - optional 24/7 background service for closed charts (same interface as manual trigger) — would keep statistics data fresh without user action.
 - ONNX as future option: native lightgbm/xgboost Python APIs for the initial phase; the inference classes may later transparently switch to `onnxruntime` (no app/signal-set changes needed).
@@ -58,3 +58,13 @@ Others Topics
   |---|---|---|---|
   | LightGBMSignal (lightgbm_signal.py) | lightgbm_v1 | lgb.Booster(model_file=...) (.txt) | model_file, feature_columns, threshold (0.5) |
   | XGBoostSignal (xgboost_signal.py) | xgboost_v1 | xgb.XGBClassifier().load_model() (.json) | same schema |
+
+- überwachung von live charts nach meinen anweisungen mit diversen Alarmen und ggf. autom. Traden
+
+- code signale entfernen, wenn wir sie nicht zur Darstellung von Services gebrauchen können
+
+- Feature-Store-vs.-Cache-Kette (`Plugin → shared_state → feature_store → Indicator`) | ⚠️ **Teil-Delta** | Kette existiert grundsätzlich. Aber: (a) Konzeptname **„EvaluationContext" existiert nicht als Klasse** – nur Kommentare in `live_analyzer.py`, `set_evaluator.py`, `feature_builder.py` erwähnen ihn; die reale Klasse heißt `PluginContext`. (b) Der Indikator **ruft sehr wohl Plugins direkt auf** (Fallback, s. Invariante 10). |
+- Versionierung & Schema (SemVer; `api_version`; `schema_version` in Payloads) | ⚠️ **teilweise** | `api_version` ✅ (`PluginMetadata`, Default „1"). SemVer + `SchemaMigrator` ✅ (`schema_migrator.py`, Patch löst keine Migration aus). **Lücke:** `schema_version` wird nur vom `ProximityService` in `metadata` geschrieben; das `FeatureStorePayload`-TypedDict (`base_plugin.py`) hat **kein** `schema_version`-Feld; das Alt-Plugin `grid_liquidity` (`definitions/grid_liquidity.py`) schreibt nur `plugin_version`. |
+- Thread Safety über explizite Thread-Locks | ⚠️ **Formulierung** | Registry/Evaluator haben RLocks ✅. **Aber:** Der DB-Zugriff ist bewusst **lock-frei** über Thread-local `DbPool` (Thread-local Singleton, `db_service.py` Z. 85–115: „Threading-Locks sind hier kontraproduktiv"). Die Invarianten-Formulierung „explizite Thread-Locks" entspricht nicht dem Ist-Design. |
+
+- Chart-Entkopplung (Chart rechnet nie, liest nur vorberechnete Daten) | ⚠️ **teilweise** | Primärpfad ✅: `grid_liquidity.read_proximity_from_feature_store()` liest `feature_store`. **Aber:** `grid_liquidity.calculate()` führt weiterhin die komplette Service-Pipeline im Chart aus (`ServiceSetEvaluator.execute_set`, Fallback bei leerem Store). „Der Indicator ruft niemals direkt Plugins zur Neuberechnung auf" ist damit **nicht vollständig** erreicht. |

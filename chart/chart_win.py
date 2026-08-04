@@ -34,12 +34,10 @@ from PySide6.QtWidgets import (
 
 try:
     from chart.chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, build_html_template
-    from chart.indicators.grid import GridIndicator
     from chart.indicators.grid_liquidity import GridLiquidityIndicator
     from chart.indicator_dialog import IndicatorSettingsDialog
 except ImportError:
     from chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, build_html_template
-    from indicators.grid import GridIndicator
     from indicators.grid_liquidity import GridLiquidityIndicator
     from indicator_dialog import IndicatorSettingsDialog
 
@@ -159,11 +157,10 @@ class PyTraderChartWindow(QMainWindow):
         self._is_loading_data = False
         self.df_data = None
 
-        # Generische Indikator-Registry: indicator_id -> BaseIndicator
-        # Alt-Indikator 'grid' (hardcoded, unverändert) + neuer Plugin-Indikator
-        # 'grid_liquidity' (Phase 12) – beide laufen parallel.
+        # Generische Indikator-Registry: indicator_id -> BaseIndicator.
+        # Phase 15: Alt-Indikator 'grid' (chart/indicators/grid.py) entfernt;
+        # verbleibender Plugin-Indikator 'grid_liquidity' (Phase 12).
         self.indicators: Dict[str, BaseIndicator] = {
-            "grid": GridIndicator(),
             "grid_liquidity": GridLiquidityIndicator(),
         }
         # Phase 13 Schritt 6: Neuer Close im grid_liquidity-Indikator → NUR ein
@@ -283,7 +280,6 @@ class PyTraderChartWindow(QMainWindow):
         self.symbol_combo = self.ui_widget.findChild(QComboBox, "combo_symbol")
         self.tf_combo = self.ui_widget.findChild(QComboBox, "combo_tf")
         self.btn_reset = self.ui_widget.findChild(QPushButton, "btn_reset_chart")
-        self.btn_indicator = self.ui_widget.findChild(QPushButton, "btn_indicator_grid")
         self.btn_indicator_liquidity = self.ui_widget.findChild(QPushButton, "btn_indicator_grid_liquidity")
         self.btn_signal = self.ui_widget.findChild(QPushButton, "btn_signal_select")
         self.chart_container = self.ui_widget.findChild(QWidget, "web_container")
@@ -296,11 +292,6 @@ class PyTraderChartWindow(QMainWindow):
             self.tf_combo.currentTextChanged.connect(self.on_tf_changed)
         if self.btn_reset:
             self.btn_reset.clicked.connect(self.fit_chart)
-        # Alt-Grid-Button (btn_indicator_grid) → Indikator 'grid'
-        if self.btn_indicator:
-            self.btn_indicator.setCheckable(True)
-            self.btn_indicator.clicked.connect(self.toggle_grid_lines)
-            self.btn_indicator.installEventFilter(self)
         # Plugin-Grid-Button (btn_indicator_grid_liquidity) → Indikator 'grid_liquidity'
         if self.btn_indicator_liquidity:
             self.btn_indicator_liquidity.setCheckable(True)
@@ -338,11 +329,6 @@ class PyTraderChartWindow(QMainWindow):
         pass
 
     def eventFilter(self, watched, event):
-        # Rechtsklick auf den Alt-Grid-Button → Einstellungen für 'grid'
-        if (self.btn_indicator is not None and watched == self.btn_indicator
-                and event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton):
-            self._toggle_settings_dialog("grid")
-            return True
         # Rechtsklick auf den Plugin-Grid-Button → Einstellungen für 'grid_liquidity'
         if (self.btn_indicator_liquidity is not None and watched == self.btn_indicator_liquidity
                 and event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton):
@@ -352,7 +338,7 @@ class PyTraderChartWindow(QMainWindow):
 
     def _toggle_settings_dialog(self, ind_id: str) -> None:
         """Wenn der Einstellungs-Dialog offen ist, schliessen; sonst für den
-        jeweiligen Indikator (alt 'grid' / Plugin 'grid_liquidity') öffnen."""
+        jeweiligen Indikator ('grid_liquidity') öffnen."""
         if self._settings_dialog is not None and self._settings_dialog.isVisible():
             self._settings_dialog.close()
             self._settings_dialog = None
@@ -364,9 +350,8 @@ class PyTraderChartWindow(QMainWindow):
         return self.indicators.get(ind_id)
 
     def update_indicator_button_style(self):
-        """Aktualisiert die Färbung beider Indikator-Buttons (Alt 'grid' +
-        Plugin 'grid_liquidity') entsprechend ihres An/Aus-Zustands."""
-        self._apply_indicator_button_style(self.btn_indicator, "grid")
+        """Aktualisiert die Färbung des Plugin-Indikator-Buttons
+        ('grid_liquidity') entsprechend seines An/Aus-Zustands."""
         self._apply_indicator_button_style(self.btn_indicator_liquidity, "grid_liquidity")
 
     def _apply_indicator_button_style(self, button: Optional[QPushButton], ind_id: str) -> None:
@@ -377,10 +362,6 @@ class PyTraderChartWindow(QMainWindow):
         color = "#2e7d32" if is_active else "#37474f"
         button.setStyleSheet(
             f"background-color: {color}; color: white; font-weight: bold; border-radius: 4px; padding: 3px 10px;")
-
-    def toggle_grid_lines(self):
-        """Schaltet den ALTEN Grid-Indikator ('grid') an/aus."""
-        self._toggle_indicator("grid")
 
     def toggle_grid_liquidity_lines(self):
         """Schaltet den NEUEN Plugin-Indikator ('grid_liquidity') an/aus."""
@@ -482,7 +463,7 @@ class PyTraderChartWindow(QMainWindow):
         logic_params überlagern die Set-Logik, damit Änderungen an den
         Service-Parametern im Dialog SOFORT auf dem Chart erscheinen.
 
-        LEGACY (z.B. Alt-Indikator 'grid' / alter DB-Stand ohne set_id):
+        LEGACY (alter DB-Stand ohne set_id):
         volle params werden unverändert durchgereicht (Abwärtskompatibilität).
 
         Fix: Ohne set_id werden display_params + logic_params ebenfalls
@@ -525,8 +506,8 @@ class PyTraderChartWindow(QMainWindow):
         5.4 Schritt 2: Der Indikator-Dialog liefert im Plugin-Modus ein
         GETRENNTES Dict {set_id, display_params} – die Berechnungslogik lebt im
         Service-Set, die Darstellung (Farben, Sichtbarkeiten) im Chart-State.
-        Legacy (Alt-Indikator 'grid' / voller params-Dict) wird unverändert
-        gespeichert (Abwärtskompatibilität).
+        Legacy (voller params-Dict ohne set_id) wird unverändert gespeichert
+        (Abwärtskompatibilität).
         """
         if isinstance(payload, dict) and ("set_id" in payload or "display_params" in payload):
             self.indicators_state[ind_id] = {
@@ -571,8 +552,8 @@ class PyTraderChartWindow(QMainWindow):
                 # 5.4 Schritt 2: Parameter aus set_id (Logik) + display_params
                 # (Darstellung) auflösen – Legacy voller params bleibt erhalten.
                 res = plugin.calculate(self.df_data, self._resolve_indicator_params(ind_id, st))
-                # Grid-spezifische Render-Logik (Alt 'grid' + Plugin 'grid_liquidity')
-                if ind_id in ("grid", "grid_liquidity"):
+                # Grid-spezifische Render-Logik (Plugin 'grid_liquidity')
+                if ind_id == "grid_liquidity":
                     lines = res.get("lines", [])
                     circles = res.get("hit_circles", [])
                     # Circle-Zeiten auf kontinuierlich mappen
@@ -747,7 +728,7 @@ class PyTraderChartWindow(QMainWindow):
         if self.df_data is not None and not self.df_data.empty:
             for ind_id, plugin in self.indicators.items():
                 st = self.indicators_state.get(ind_id, {})
-                if st.get("active") and ind_id in ("grid", "grid_liquidity"):
+                if st.get("active") and ind_id == "grid_liquidity":
                     if hasattr(plugin, "set_context"):
                         plugin.set_context(self.current_symbol, self.current_tf)
                     # 5.4 Schritt 2: Logik aus set_id + Darstellung aus
