@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from analytics.engine.service_set_repository import ServiceSetRepository
+from config.event_bus import event_bus
 
 
 class ServiceSetTrashDialog(QDialog):
@@ -110,6 +111,9 @@ class ServiceSetTrashDialog(QDialog):
             self._log(f"Set wiederhergestellt (P14-05): {set_id}")
             self._reload()
             self._refresh()
+            # Phase 15.02: Struktur-Aenderung -> EventBus (Live-Sync aller
+            # ServiceSelectorModel-Instanzen, Invariante 5).
+            event_bus.service_set_changed.emit()
         else:
             self._log(f"Set '{set_id}' nicht im Papierkorb gefunden.")
 

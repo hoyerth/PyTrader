@@ -27,9 +27,9 @@ from typing import Any, Dict, Optional
 from PySide6.QtCore import QFile, QIODevice, QTimer, Qt, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar,
-    QPushButton, QTextEdit, QWidget,
+    QCheckBox, QComboBox, QDoubleSpinBox, QGroupBox, QHBoxLayout, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar,
+    QPushButton, QSpinBox, QSplitter, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from analytics.background_workers.historical_scanner import HistoricalScanner
@@ -51,6 +51,11 @@ from serviceui.trash_dialog import ServiceSetTrashDialog
 from serviceui.symbols_win import SymbolsWindow
 from symbol_repository import SymbolRepository, get_symbol_repository
 from config.event_bus import event_bus
+
+# Phase 15 15.02: Service-UI Refactoring – MasterTree & generischer
+# ServiceSelector (ServiceSelectorWidget im Modus FULL_EDIT) + ParameterPanel.
+from serviceui.service_selector_widget import ServiceSelectorWidget
+from serviceui.parameter_panel import ParameterPanel
 
 # Projekt-Root (eine Ebene über serviceui/) – für die UI-Datei unter ui/.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -149,17 +154,49 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self.content_widget = self.ui.centralWidget()
         self.central_layout = self.content_widget.layout() if self.content_widget else None
         if self.central_layout is not None:
-            # 5.4 User-Anpassung: 'Service-Parameter' oben RECHTS direkt neben
-            # dem Rahmen 'Service-Sets' (gleiche Zeile, Service-Sets links).
+            # Phase 15 15.02 (Orchestrator): QSplitter-Zusammensetzung.
+            #  * Links:  bestehender Set-Editor + dynamische Service-Spalten.
+            #  * Rechts: MasterTree (2-Spalten-Hierarchie, Live-Status-Badges,
+            #            ServiceSelectorWidget im Modus FULL_EDIT) + ParameterPanel.
             self.top_row = QHBoxLayout()
             self.top_row.setSpacing(6)
             idx = self.central_layout.indexOf(self.group_service_sets)
             if idx < 0:
                 idx = 0
             self.central_layout.removeWidget(self.group_service_sets)
-            self.top_row.addWidget(self.group_service_sets)
-            self.top_row.addWidget(self.widget_service_columns)
+
+            self._editor_panel = QWidget()
+            editor_layout = QVBoxLayout(self._editor_panel)
+            editor_layout.setContentsMargins(0, 0, 0, 0)
+            editor_layout.setSpacing(6)
+            editor_layout.addWidget(self.group_service_sets)
+            editor_layout.addWidget(self.widget_service_columns)
+
+            self.right_panel = QWidget()
+            right_layout = QVBoxLayout(self.right_panel)
+            right_layout.setContentsMargins(0, 0, 0, 0)
+            right_layout.setSpacing(6)
+            # MasterTree + Aktions-Toolbar (Modus B / FULL_EDIT)
+            self.service_selector = ServiceSelectorWidget(
+                mode=ServiceSelectorWidget.MODE_FULL_EDIT, parent=self)
+            # Parameter-Formular fuer die markierte Service-Instanz
+            self.param_panel = ParameterPanel(parent=self)
+            right_layout.addWidget(self.service_selector, 2)
+            right_layout.addWidget(self.param_panel, 1)
+
+            self.main_splitter = QSplitter(Qt.Horizontal)
+            self.main_splitter.addWidget(self._editor_panel)
+            self.main_splitter.addWidget(self.right_panel)
+            self.main_splitter.setStretchFactor(0, 3)
+            self.main_splitter.setStretchFactor(1, 2)
+
+            self.top_row.addWidget(self.main_splitter)
             self.central_layout.insertLayout(idx, self.top_row)
+        # Fenstergroesse (15.02): 1280 x 800 als Default – Single Source of
+        # Truth ist die ui/service_win.ui-Geometrie (der QUiLoader wendet sie
+        # beim Laden an). KEIN resize()-Aufruf im Code: der 5.4-Content-Reflow
+        # (resize_to_clamped_content) darf die Groesse weiterhin inhalt- und
+        # bildschirmbasiert anpassen (keine fixen Pixel im Quellcode).
         # Scroll-Wrapper: gesamtes Fenster scrollbar, wenn Inhalt > Bildschirm
         # (ContentScrollMixin). Der Inhalt behält seine natürliche Größe; das
         # Fenster wird auf den Bildschirm geklemmt (Scrollbars erscheinen erst,
@@ -271,6 +308,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # Phase 14 P14-02: Hot-Reload der Custom-Plugins (data/custom_plugins/)
         if self.btn_reload_plugins:
             self.btn_reload_plugins.clicked.connect(self.reload_plugins)
+
+        # Phase 15 15.02: MasterTree/ServiceSelector (FULL_EDIT) verdrahten –
+        # Toolbar-Aktionen auf die bestehenden Set-Methoden + EventBus-Sync.
+        self._wire_selector_toolbar()
+
         self.log(f"Verfügbare Plugins: {_available_plugin_ids()}")
 
         # State asynchron wiederherstellen (nach show(), damit move/resize vom Window-Manager akzeptiert werden)
@@ -300,6 +342,114 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         if (self.combo_set is not None and self.combo_set.currentIndex() >= 0
                 and self.service_columns_layout is not None):
             self._rebuild_columns()
+        # ParameterPanel-Praezision (prox_level1..6) je Symbol synchronisieren
+        if getattr(self, "param_panel", None) is not None:
+            self.param_panel.set_symbol_precision(self._get_symbol_precision())
+
+    # --- Phase 15 15.02: MasterTree / ServiceSelector (FULL_EDIT) ---
+
+    def _wire_selector_toolbar(self) -> None:
+        """Verdrahtet die ServiceSelectorWidget-Toolbar (Modus FULL_EDIT)
+        mit den bestehenden Set-Methoden (add/move/remove/reload)."""
+        selector = getattr(self, "service_selector", None)
+        if selector is None or selector.toolbar is None:
+            return
+        toolbar = selector.toolbar
+        toolbar.request_add_popup = self._show_toolbar_add_popup
+        toolbar.add_service_requested.connect(self._toolbar_add_service)
+        toolbar.move_up_requested.connect(lambda: self.move_order_item(-1))
+        toolbar.move_down_requested.connect(lambda: self.move_order_item(1))
+        toolbar.remove_requested.connect(self.remove_instance)
+        toolbar.reload_plugins_requested.connect(self.reload_plugins)
+        # MasterTree-Auswahl -> Editor + ParameterPanel synchronisieren
+        if selector.master_tree is not None:
+            selector.master_tree.selection_changed.connect(self._on_master_selection)
+        # ParameterPanel-Aenderungen -> Set-Definition + Spalten (Live-Edit)
+        self.param_panel.params_changed.connect(self._on_param_panel_changed)
+
+    def _show_toolbar_add_popup(self) -> None:
+        """Zeigt das [➕ Service]-Popup mit allen verfuegbaren Plugins."""
+        selector = getattr(self, "service_selector", None)
+        if selector is not None and selector.toolbar is not None:
+            selector.toolbar.show_add_menu(selector.get_plugin_ids())
+
+    @Slot(str)
+    def _toolbar_add_service(self, plugin_id: str) -> None:
+        """Uebernimmt die Popup-Auswahl ins Instanz-Feld und fuegt den
+        Service zum aktiven Set hinzu (add_instance)."""
+        if not plugin_id:
+            return
+        if self.edit_new_instance:
+            self.edit_new_instance.setText(f"{plugin_id} [{plugin_id}]")
+        self.add_instance()
+
+    @Slot(str, str)
+    def _on_master_selection(self, set_id: str, service_id: str) -> None:
+        """Synchronisiert Editor (Set-Combo/Liste) und ParameterPanel mit der
+        MasterTree-Auswahl."""
+        if set_id and self.combo_set is not None:
+            idx = self.combo_set.findData(set_id)
+            if idx >= 0 and self.combo_set.currentData() != set_id:
+                self.combo_set.setCurrentIndex(idx)
+        if service_id and self.list_execution_order is not None:
+            for i in range(self.list_execution_order.count()):
+                item = self.list_execution_order.item(i)
+                if item.data(Qt.UserRole) == service_id:
+                    self.list_execution_order.setCurrentRow(i)
+                    self._current_list_iid = service_id
+                    break
+        self._sync_param_panel()
+
+    def _sync_param_panel(self) -> None:
+        """Laedt die Parameter der markierten Service-Instanz ins ParameterPanel."""
+        if getattr(self, "param_panel", None) is None:
+            return
+        iid = self._current_list_iid
+        if not iid or not self._current_set_definition:
+            self.param_panel.clear()
+            return
+        cfg = dict((self._current_set_definition.get("services") or {}).get(iid, {}))
+        pid = str(cfg.get("plugin_id") or iid)
+        self.param_panel.set_symbol_precision(self._get_symbol_precision())
+        self.param_panel.set_service(iid, pid, cfg)
+
+    @Slot(str, dict)
+    def _on_param_panel_changed(self, instance_id: str, params: dict) -> None:
+        """Uebernimmt ParameterPanel-Aenderungen in die Set-Definition und die
+        Editor-Spalten (Live-Edit, damit collect_set_definition() sie findet)."""
+        if not instance_id:
+            return
+        # 1) In die Set-Definition schreiben
+        if self._current_set_definition:
+            services = self._current_set_definition.setdefault("services", {})
+            cfg = services.setdefault(
+                instance_id, {"plugin_id": "", "lookback": 1000, "params": {}})
+            if "lookback" in params:
+                try:
+                    cfg["lookback"] = int(params["lookback"])
+                except (TypeError, ValueError):
+                    pass
+            cfg.setdefault("params", {}).update({
+                k: v for k, v in params.items() if k != "lookback"
+            })
+        # 2) Editor-Spalten synchron halten (falls Controls existieren)
+        for (iid, key), ctrl in self._service_param_controls.items():
+            if iid == instance_id and key in params:
+                self._set_ctrl_value(ctrl, params[key])
+
+    @staticmethod
+    def _set_ctrl_value(ctrl: QWidget, value: Any) -> None:
+        """Setzt den Wert eines Parameter-Controls typsicher."""
+        if isinstance(ctrl, QCheckBox):
+            ctrl.setChecked(bool(value))
+        elif isinstance(ctrl, QSpinBox):
+            ctrl.setValue(int(value))
+        elif isinstance(ctrl, QDoubleSpinBox):
+            ctrl.setValue(float(value))
+        elif isinstance(ctrl, QComboBox):
+            ctrl.setCurrentText(str(value))
+        else:
+            ctrl.setText(str(value))
 
     # --- Phase 15 15.01: Symbol- & Favoriten-Verwaltung ---
 
@@ -489,6 +639,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         if self.list_execution_order:
             self.list_execution_order.clear()
         self._clear_service_columns()
+        # Phase 15.02: ParameterPanel leeren (kein Set mehr aktiv)
+        self._sync_param_panel()
 
     @Slot(int)
     def _on_set_selected(self, index: int) -> None:
@@ -529,6 +681,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                 item.setToolTip(self._build_tooltip(iid, cfg) + lock_tip)
                 self.list_execution_order.addItem(item)
         self._build_service_columns(definition)
+        # Phase 15.02: ParameterPanel an das geladene Set angleichen
+        self._sync_param_panel()
 
     def collect_current_order(self) -> list:
         """Liefert die instance_ids aus der Liste (aktuelle execution_order)."""
@@ -555,6 +709,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         lw.insertItem(new_row, item)
         lw.setCurrentRow(new_row)
         self._rebuild_columns()
+        # Phase 15.02: Struktur-Aenderung -> EventBus (Live-Sync des MasterTree)
+        event_bus.service_set_changed.emit()
 
     @Slot()
     def remove_instance(self) -> None:
@@ -581,6 +737,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             return
         lw.takeItem(lw.currentRow())
         self._rebuild_columns()
+        # Phase 15.02: Struktur-Aenderung -> EventBus (Live-Sync des MasterTree)
+        event_bus.service_set_changed.emit()
 
     @Slot()
     def _on_plugin_select_changed(self, plugin_id: str) -> None:
@@ -639,6 +797,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self.edit_new_instance.clear()
         self.log(f"Service hinzugefügt: {iid} [{plugin_id}]")
         self._rebuild_columns()
+        # Phase 15.02: Struktur-Aenderung -> EventBus (Live-Sync des MasterTree)
+        event_bus.service_set_changed.emit()
 
     def collect_set_definition(self) -> Dict[str, Any]:
         """Baut aus dem Editor eine ServiceSetDefinition.
@@ -759,6 +919,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             row = self.list_execution_order.currentRow()
             if row >= 0:
                 self._current_list_iid = self.list_execution_order.item(row).data(Qt.UserRole)
+        # Phase 15.02: ParameterPanel an die markierte Instanz angleichen
+        self._sync_param_panel()
 
     @Slot()
     def _show_service_info(self) -> None:

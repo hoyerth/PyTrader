@@ -80,3 +80,54 @@ Ziel von **Phase 15** ist die Weiterentwicklung der Service-UI (`service_win.py`
 6. **Headless-Test (`test/check_p15_s2_service_tree.py`):**
 * Prüft `ServiceSelectorModel` im Modus `SELECT_ONLY` und `FULL_EDIT` ohne GUI.
 * Prüft Indikator-Status-Badges, Set-Updates, Umsortieren & EventBus-Reaktivität.
+
+---
+
+## 3. Implementierungs-Log
+
+### 3.1 Schritt 1 – Backup (Commit `0aaba70`, Tag `phase15_s2_backup`)
+
+Die vom Anwender neu aufgesetzte `docs/AKTUELLE_UMSETZUNG.md` (15.02-Spezifikation, alte 15.03-Inhalte nach `docs/Old/x_Roadmap_Phase15.md` archiviert) wurde als Arbeitsstand gesichert. Tag `phase15_s2_backup` gesetzt.
+
+### 3.2 Schritt 2 – ServiceSelectorModel & ServiceSelectorWidget
+
+**`analytics/engine/service_selector_model.py` (NEU):** Zentrales, lesendes Datenmodell (`ServiceSelectorModel`, QObject mit `data_changed`-Signal):
+* Quellen: `ServiceSetRepository.list_sets()`, `PluginRegistry`, `StateManager.load_all_instances()` (Live-Status „aktiv im Chart" via `indicators_state[*]['active']`).
+* `build_tree()` liefert die deterministische 3-Gruppen-Hierarchie (📁 Service-Sets / ⚡ Standalone Services / 📦 Alle verfügbaren Plugins) inkl. Status-Badges.
+* `badge_for(plugin_id)`: `📌 Indikator: <Name>` (capabilities.chart) + `🟢 Aktiv in Chart` / `⚪ Inaktiv in Chart`.
+* Hört auf `EventBus.service_set_changed` → `refresh()` (Live-Sync in allen Fenstern, Invariante 5).
+* Reines Lesemodell – kein SQL, kein Schreiben (Invariante 4).
+
+**`serviceui/service_selector_widget.py` (NEU):** `ServiceSelectorWidget` mit Modus-Umschaltung:
+* Modus A (`SELECT_ONLY`): kompakte Set-/Service-Combos, emittiert `selection_changed(set_id, service_id)`.
+* Modus B (`FULL_EDIT`): MasterTree + ServiceToolbar (2-Spalten-Hierarchie + Aktions-Buttons).
+
+### 3.3 Schritt 3 – Sub-Widgets
+
+* **`serviceui/master_tree.py` (NEU):** `MasterTree` – 2-Spalten-`QTreeWidget` (Spalte 0: Hierarchie, Spalte 1: Status-Badges), befüllt aus dem Modell, `selection_changed(set_id, service_id)`, `current_selection()`/`current_set_id()`/`current_service_id()`, Auswahl-Restore nach Refresh.
+* **`serviceui/toolbar.py` (NEU):** `ServiceToolbar` – `[➕ Service]` (Popup-Plugin-Auswahl → `add_service_requested(plugin_id)`), `[▲]/[▼]`, `[🗑️ Entfernen]`, `[🔄 Plugins]`. Reine Signal-Emitter (SRP, kein SQL).
+* **`serviceui/status_panel.py` (NEU):** `StatusPanel` – Laufzeit/Fortschritt/Log (Auto-Scroll), reines Anzeige-Widget.
+* **`serviceui/parameter_panel.py` (NEU):** `ParameterPanel` – scrollbares Parameter-Formular (`ContentScrollMixin` + Wiederverwendung der Control-Builder aus `ServiceParamColumnsMixin`), `set_service(instance_id, plugin_id, config)`, `params_changed(instance_id, params)`.
+
+### 3.4 Schritt 4 – `service_win.py` Refactoring (Orchestrator)
+
+* **`serviceui/service_win.py` (Anpassung):** Fensteraufbau um einen `QSplitter` (horizontal) erweitert: links bestehender Set-Editor + dynamische Service-Spalten, rechts `ServiceSelectorWidget` (Modus `FULL_EDIT`) + `ParameterPanel`. Bestehende Scanner-/Set-/Evaluator-Logik bleibt unverändert (Verbotsregel).
+* **Fenstergröße 1280 x 800:** Single Source of Truth ist die `ui/service_win.ui`-Geometrie (vom QUiLoader angewendet) – kein fixer `resize()`-Aufruf im Code, damit der 5.4-Content-Reflow (`resize_to_clamped_content`) die Größe weiterhin inhalt-/bildschirmbasiert anpassen kann.
+* **`serviceui/__init__.py`:** Export der neuen Sub-Widgets (`MasterTree`, `ServiceToolbar`, `StatusPanel`, `ParameterPanel`, `ServiceSelectorWidget`).
+
+### 3.5 Schritt 5 – Action-Handler & EventBus-Sync
+
+* Toolbar-Aktionen auf die bestehenden Set-Methoden gekoppelt: `[➕]` → Popup → `add_instance()`, `[▲]/[▼]` → `move_order_item(±1)`, `[🗑️]` → `remove_instance()` (P14-04-Sperrprüfung), `[🔄]` → `reload_plugins()`.
+* MasterTree-Auswahl synchronisiert Set-Combo, Instanz-Liste und `ParameterPanel` (bidirektional, Live-Edit fließt in `collect_set_definition()`).
+* **EventBus-Sync:** `service_set_changed` wird bei jeder Struktur-/Parameter-Änderung emittiert:
+  * `set_item_adapter.py`: nach `_item_save_as()` (speichern) und `_item_delete_current()` (löschen).
+  * `trash_dialog.py`: nach `restore_set_from_trash()` (wiederherstellen).
+  * `service_win.py`: nach `add_instance()`, `move_order_item()`, `remove_instance()`.
+
+### 3.6 Schritt 6 – Headless-Test
+
+**`test/check_p15_s2_service_tree.py` (NEU, Test-DB in `test/`):** Prüft ServiceSelectorModel (Grunddaten, Hierarchie, Standalone-Abgrenzung, Live-Status „Aktiv im Chart" via StateManager, EventBus-Reaktivität), ServiceSelectorWidget Modus `SELECT_ONLY` (Combos + `selection_changed`) und Modus `FULL_EDIT` (MasterTree-Gruppen, Badge-Spalte, `current_selection()`) sowie Set-Updates/Umsortieren.
+
+**Ergebnis: 31/31 Checks PASS** (Exit 0). Zusätzlich verifiziert:
+* `check_p13_service_win_geometry.py`: ServiceWindow konstruiert mit neuem QSplitter-Aufbau; alle 5.4-Dynamik-Checks (Spalten, Expert-Aufklappen, Scroll-Range, add_instance) bestehen. **Einzige verbleibende Meldung:** vorbestehend aus 15.01 (`setFixedWidth(32)` des ★-Favoriten-Buttons), nicht durch 15.02 verursacht.
+* `python -m py_compile` auf allen neuen/geänderten Dateien (Exit 0).

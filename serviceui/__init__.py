@@ -1,6 +1,6 @@
 # serviceui/__init__.py
 """
-Service-UI-Paket (Phase 15, Kapitel 15.1 – U15-D1).
+Service-UI-Paket (Phase 15, Kapitel 15.1 – U15-D1 + 15.02).
 
 Modularisierte Service-UI: Die gewachsene service_win.py wurde in den
 Unterordner serviceui/ verschoben und in SRP-Module zerlegt:
@@ -12,7 +12,13 @@ Unterordner serviceui/ verschoben und in SRP-Module zerlegt:
   * trash_dialog.py        – ServiceSetTrashDialog (Papierkorb-Dialog)
   * service_win.py         – ServiceWindow (Hauptfenster, re-exportiert API)
 
-Verhalten unverändert gegenüber der alten service_win.py.
+Phase 15.02 (Master-Tree & generischer ServiceSelector):
+  * master_tree.py             – 2-Spalten MasterTree (Hierarchie + Badges)
+  * toolbar.py                 – ServiceToolbar (Aktions-Buttons)
+  * status_panel.py            – StatusPanel (Laufzeit/Fortschritt/Log)
+  * parameter_panel.py         – ParameterPanel (Parameter-Formular)
+  * service_selector_widget.py – ServiceSelectorWidget (SELECT_ONLY/FULL_EDIT)
+  * analytics/engine/service_selector_model.py – lesendes Datenmodell
 """
 
 from serviceui.service_win import (
@@ -25,6 +31,13 @@ from serviceui.service_win import (
     BASE_DIR,
 )
 
+# Phase 15.02: Wiederverwendbare Sub-Widgets
+from serviceui.master_tree import MasterTree
+from serviceui.toolbar import ServiceToolbar
+from serviceui.status_panel import StatusPanel
+from serviceui.parameter_panel import ParameterPanel
+from serviceui.service_selector_widget import ServiceSelectorWidget
+
 __all__ = [
     "ServiceWindow",
     "ServiceSetRunWorker",
@@ -33,4 +46,10 @@ __all__ = [
     "_available_plugin_ids",
     "_sets_using_plugin",
     "BASE_DIR",
+    # Phase 15.02
+    "MasterTree",
+    "ServiceToolbar",
+    "StatusPanel",
+    "ParameterPanel",
+    "ServiceSelectorWidget",
 ]

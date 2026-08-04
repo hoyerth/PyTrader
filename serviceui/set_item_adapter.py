@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 
 from chart.widgets.named_item_actions import NamedItemAdapter
 from analytics.engine.service_set_repository import ServiceSetRepository
+from config.event_bus import event_bus
 
 
 class _ServiceSetItemAdapter(NamedItemAdapter):
@@ -73,6 +74,10 @@ class _ServiceSetItemAdapter(NamedItemAdapter):
         definition["display_name"] = name
         set_id = self.dlg.set_repo.save_set(definition)
         self.dlg.log(f"Set gespeichert: {set_id}")
+        # Phase 15.02: Struktur-Aenderung -> EventBus, damit alle lauschenden
+        # ServiceSelectorModel-Instanzen (MasterTree, Analytics, ...) live
+        # aktualisieren (Invariante 5: schwellenfreie Entkopplung).
+        event_bus.service_set_changed.emit()
         return set_id
 
     def _item_delete_current(self) -> bool:
@@ -84,6 +89,9 @@ class _ServiceSetItemAdapter(NamedItemAdapter):
             # P14-05: Soft-Delete – das Set liegt im Papierkorb und kann über
             # den Papierkorb-Dialog wiederhergestellt werden.
             self.dlg.log(f"Set in den Papierkorb verschoben (P14-05): {set_id}")
+            # Phase 15.02: Struktur-Aenderung -> EventBus (Live-Sync aller
+            # ServiceSelectorModel-Instanzen, Invariante 5).
+            event_bus.service_set_changed.emit()
             return True
         self.dlg.log(f"Set '{set_id}' nicht gefunden.")
         return False
