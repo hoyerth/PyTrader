@@ -11,7 +11,7 @@ Headless Validierung (KEINE UI, KEIN exec_()) ueber alle P14-Kernmodule:
            - ServiceSetRepository verfuegbar (save/get/list)
   [P14-02] Dynamic Discovery & Hot-Reload:
            - PluginRegistry (Singleton) + PluginLoader vorhanden
-           - Core-Plugins (grid_lines, proximity, grid_liquidity) entdeckt
+           - Core-Plugins (grid_lines, proximity) entdeckt
            - reload() existiert und laeuft fehlerfrei (Hot-Reload)
   [P14-03] Pipeline-Resilienz:
            - ServiceSetEvaluator mit _failure_counters / _quarantined / reset()
@@ -82,12 +82,14 @@ try:
     )
     registry = PluginRegistry()
     plugins = registry.plugins
-    check("P14-02a) PluginRegistry enthaelt Plugins", len(plugins) >= 3,
+    # Bugfix 04.08.2026: Alt-Plugin 'grid_liquidity' entfernt -> die beiden
+    # Core-Grid-Plugins grid_lines + proximity sind der finale Bestand.
+    check("P14-02a) PluginRegistry enthaelt Core-Plugins", len(plugins) >= 2,
           str(len(plugins)))
     check("P14-02b) Core-Plugin 'grid_lines' entdeckt", "grid_lines" in plugins)
     check("P14-02c) Core-Plugin 'proximity' entdeckt", "proximity" in plugins)
-    check("P14-02d) Core-Plugin 'grid_liquidity' entdeckt",
-          "grid_liquidity" in plugins)
+    check("P14-02d) Alt-Plugin 'grid_liquidity' NICHT mehr registriert",
+          "grid_liquidity" not in plugins)
     check("P14-02e) PluginLoader verfuegbar", hasattr(registry, "loader"))
     check("P14-02f) reload() existiert", hasattr(registry, "reload"))
     try:

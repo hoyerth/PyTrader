@@ -16,11 +16,14 @@ grid_lines + proximity (analytics/features/definitions/):
     Live-Punkte zu setzen. Ein neuer Close (gerundete Time nicht in
     self._known_times) stößt NUR einen debounced Refresh an – nicht jeder Tick.
 
-Das UI-Schema bleibt über das Alt-Plugin 'grid_liquidity' (PluginRegistry)
-bezogen (grid_step/proximity_threshold/prox_level1-6/Farben) – es ist die
-Single Source of Truth für das Prop-Fenster. Der Alt-Bestand
-(analytics/features/definitions/grid_liquidity.py und chart/indicators/grid.py)
-bleibt UNVERÄNDERT als Referenz-Parallelbetrieb erhalten.
+SELF-CONTAINED (Bugfix 04.08.2026): Das UI-Schema (grid_step /
+proximity_threshold / prox_level1-6 / Farben) ist direkt in diesem Modul
+hinterlegt (_GRID_LIQUIDITY_SCHEMA) – der Indikator ist dadurch die eigene
+Single Source of Truth für das Prop-Fenster (parameter_schema/plugin_id) und
+hängt NICHT mehr am entfernten Alt-Plugin 'grid_liquidity'
+(analytics/features/definitions/grid_liquidity.py, archiviert). Die Services
+grid_lines + proximity (grid_lines_service.py / proximity_service.py) bleiben
+die einzigen Service-Plugins dieses Indikators.
 """
 
 import threading
@@ -32,7 +35,7 @@ import pandas as pd
 
 from db_service import TF_SECONDS_MAP
 from .base_indicator import BaseIndicator
-from analytics.features.feature_builder import PluginExecutor, PluginRegistry
+from analytics.features.feature_builder import PluginExecutor
 from analytics.features.plugins.base_plugin import PluginContext
 from analytics.engine.set_evaluator import ServiceSetEvaluator
 
@@ -55,6 +58,46 @@ def _f_in_window_around(minute_val: int, center: int, span: int) -> bool:
         return minute_val >= lower or minute_val <= (upper - 60)
     else:
         return lower <= minute_val <= upper
+
+
+# ---------------------------------------------------------------------------
+# Self-contained UI-Schema (Bugfix 04.08.2026): Single Source of Truth fürs
+# Prop-Fenster. Die Werte entsprechen exakt dem archivierten Alt-Plugin
+# 'grid_liquidity' (analytics/features/definitions/grid_liquidity.py) –
+# Reihenfolge: Indi-Props (Sichtbarkeit, Farben) zuerst, darunter die
+# Service-Props, expert-Felder am Ende. Der Indikator liefert damit
+# parameter_schema/parameter_order direkt (plugin_id='grid_liquidity') und
+# benötigt KEINEN PluginRegistry-Zugriff mehr.
+# ---------------------------------------------------------------------------
+_GRID_LIQUIDITY_SCHEMA: Dict[str, Dict[str, Any]] = {
+    "grid_step": {"type": "float", "default": 0.50, "min": 0.01, "max": 100.0, "step": 0.05, "description": "Rasterabstand"},
+    "proximity_threshold": {"type": "float", "default": 0.05, "min": 0.001, "max": 10.0, "step": 0.005, "description": "Toleranzschwelle"},
+    "use_time_filter": {"type": "bool", "default": True, "description": "Time Filter aktiv (Zeitfenster um ganze/halbe Stunde)"},
+    "time_window_mins": {"type": "int", "default": 5, "min": 0, "max": 30, "step": 1, "description": "Time Filter Minuten (0 oder 30 um ganze/halbe Stunde)"},
+    "line_color": {"type": "color", "default": "#2196F3", "description": "Farbe Grid-Linien"},
+    "circle_color_std": {"type": "color", "default": "#FFEB3B", "description": "Farbe Standard-Hit (im Zeitfenster)"},
+    "circle_color_active": {"type": "color", "default": "#E91E63", "description": "Farbe Hit in Aktivitätsfenster"},
+    "show_lines": {"type": "bool", "default": True, "description": "Grid-Linien anzeigen"},
+    "show_circles": {"type": "bool", "default": True, "description": "Hits anzeigen"},
+    "prox_level1": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 1"},
+    "prox_level2": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 2"},
+    "prox_level3": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 3"},
+    "prox_level4": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 4"},
+    "prox_level5": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 5"},
+    "prox_level6": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 6"},
+}
+
+_GRID_LIQUIDITY_ORDER: List[str] = [
+    # Reine Indi-Props (oberhalb der Trennlinie)
+    "show_lines", "show_circles",
+    "line_color", "circle_color_std", "circle_color_active",
+    # Service-Props (Berechnung)
+    "grid_step", "proximity_threshold",
+    "use_time_filter", "time_window_mins",
+    # Expert-Felder (Custom Levels, ausklappbar)
+    "prox_level1", "prox_level2", "prox_level3",
+    "prox_level4", "prox_level5", "prox_level6",
+]
 
 
 class GridLiquidityIndicator(BaseIndicator):
@@ -85,16 +128,60 @@ class GridLiquidityIndicator(BaseIndicator):
     def display_name(self) -> str:
         return "Grid Liquidity (Plugin)"
 
+    # --- Self-contained Plugin-Schnittstelle (Bugfix 04.08.2026) -------------
+    # Der Indikator ist jetzt die eigene Single Source of Truth fürs Prop-
+    # Fenster (parameter_schema/parameter_order/plugin_id). Damit erkennt
+    # IndicatorDialog._get_plugin() den Indikator direkt als "Plugin" (Branch
+    # 1) und baut die schema-basierte UI OHNE PluginRegistry-Zugriff auf –
+    # das Alt-Plugin 'grid_liquidity' ist entfernt.
+    @property
+    def plugin_id(self) -> str:
+        return "grid_liquidity"
+
+    @property
+    def parameter_schema(self) -> Dict[str, Dict[str, Any]]:
+        """UI-Schema (Indi-Props + Service-Props + Custom-Levels), exakt wie
+        im archivierten Alt-Plugin 'grid_liquidity'."""
+        return {k: dict(v) for k, v in _GRID_LIQUIDITY_SCHEMA.items()}
+
+    @property
+    def parameter_order(self) -> List[str]:
+        """Darstellungs-Reihenfolge der Props im Prop-Fenster."""
+        return list(_GRID_LIQUIDITY_ORDER)
+
+    @property
+    def base_parameter_schema(self) -> Dict[str, Dict[str, Any]]:
+        """Basis-Parameter (lookback) – identisch zur Plugin-Basisklasse,
+        damit der Expert-Bereich des Prop-Fensters den lookback zeigt."""
+        return {
+            "lookback": {
+                "type": "int", "default": 1000, "min": 100, "max": 100000,
+                "step": 50, "description": "Lookback (Scan-Fenster)",
+                "expert": True,
+            },
+        }
+
+    def full_parameter_schema(self) -> Dict[str, Dict[str, Any]]:
+        """Vollständiges Schema: Basis-Parameter (lookback) + Indikator-Schema."""
+        merged = dict(self.base_parameter_schema)
+        merged.update(dict(self.parameter_schema or {}))
+        return merged
+
     @property
     def default_params(self) -> Dict[str, Any]:
-        """Standard-Parameter direkt aus dem Plugin-Schema (Single Source of Truth)."""
-        return dict(PluginRegistry().get(self._plugin_id).default_params)
+        """Standard-Parameter aus dem self-contained Schema (inkl. lookback) –
+        KEIN PluginRegistry-Zugriff mehr (Bugfix 04.08.2026)."""
+        return {
+            k: v["default"]
+            for k, v in self.full_parameter_schema().items()
+            if "default" in v
+        }
 
     @property
     def service_plugin_ids(self) -> List[str]:
         """Die Service-Plugin-IDs, die dieser Indikator intern ausführt (Schritt 6):
-        grid_lines + proximity. grid_liquidity ist nur Schema-Quelle (Altbestand)
-        und KEIN Service dieses Indikators."""
+        grid_lines + proximity. Der Alt-Service 'grid_liquidity' existiert nicht
+        mehr (Bugfix 04.08.2026) – KEIN Service dieses Indikators."""
         return ["grid_lines", "proximity"]
 
     @property
@@ -104,6 +191,7 @@ class GridLiquidityIndicator(BaseIndicator):
     @property
     def param_labels(self) -> Dict[str, str]:
         return {
+            "lookback": "Lookback (Scan-Fenster)",
             "grid_step": "Rasterabstand",
             "proximity_threshold": "Toleranz",
             "use_time_filter": "Time Filter aktiv",

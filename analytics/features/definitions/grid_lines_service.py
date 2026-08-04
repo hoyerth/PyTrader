@@ -122,6 +122,9 @@ class GridLinesService(PluginFeature):
         return {
             "category": "Grid",
             "display_name": "Grid Lines",
+            # Bugfix (04.08.2026): Zugehoeriger Indikator-Name fuer die Status-
+            # Badges im MasterTree (der Service laeuft IN GridLiquidityIndicator).
+            "indicator_name": "GridLiquidityIndicator",
             "description": "Baut das Grid-Raster in Parität zum Alt-Grid (Center ± steps_around × step_size + Custom-Levels)",
             "author": "PyTrader AI",
             "tags": ["grid", "lines", "raster"],

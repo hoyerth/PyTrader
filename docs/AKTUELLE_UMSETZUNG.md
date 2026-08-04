@@ -185,3 +185,31 @@ Ergebnis-Semantik (identisch zu `chart_win`):
 * `python -m py_compile` auf allen geänderten Dateien (Exit 0).
 
 **Hinweis Test-Isolation:** Der Test patcht die `__init__`-Methoden von `ServiceSetRepository`/`StateManager` direkt (Modul-Patches würden durch In-Funktion-Imports überschrieben) und leitet `get_symbol_repository()` auf eine Temp-DB um – so läuft er unabhängig von der geöffneten App (die echten `data/*.duckdb`-Dateien sind durch deren Prozess gesperrt).
+
+### 3.9 Schritt 9 – MasterTree-Layout-Bugfixes (5 Punkte) & Alt-Plugin `grid_liquidity` entfernt (04.08.2026)
+
+**A) MasterTree – 5 Layout-/Bedien-Bugfixes (`serviceui/master_tree.py`):**
+1. **Ebene 0 startet ganz links an der Linie der umschließenden Box:** `rootIsDecorated=False` + KEINE Icons/Spacer auf Top-Level-Knoten; die Einrückung der Untereinträge kommt ausschließlich aus `setIndentation(LEVEL_INDENT)` (20 px je Ebene). Vorher schob ein Spacer-Icon alle Zeilen nach rechts.
+2. **Eingeklappt → `> ` vor dem Namen** (Knoten mit Kindern, noch nicht aufgeklappt).
+3. **Ausgeklappt → `⌄ ` vor dem Namen** (Knoten mit Kindern, aufgeklappt). Das Symbol folgt dem IST-Zustand via `itemExpanded`/`itemCollapsed` → `_refresh_expand_label` (unter `blockSignals` explizit für Top-Level nach `_populate()`). `drawBranches` bleibt als bewusst leerer Override (keine nativen Branch-Dreiecke).
+4. **Einfacher Mausklick togglet auf/zu:** `mousePressEvent` klappt bei Klick auf die GESAMTE Zeile eines Knotens mit Kindern um (zusätzlich Selektion bei selektierbaren Knoten); `setExpandsOnDoubleClick(False)` – Doppelklick togglet nicht mehr.
+5. **Info-Symbol in der Status-Spalte ist ASCII `'i'`:** `BADGE_TRUNCATE_ICON = "i"` statt Unicode `🛈` (U+1F6C8) – das Emoji rendert in den Qt-Fonts unter Windows nicht zuverlässig (tofu-Box). Lange Badges (> `MAX_BADGE_CELL_CHARS` = 24) werden auf `'i'` gekürzt; der Indikator-Name steht im Tooltip der Spalte 1.
+
+**B) Badge-Konvention auf echten Indikator-Namen umgestellt (`indicator_name`):**
+* `analytics/engine/service_selector_model.py`: `badge_for()` liefert `📌 im <Indikator> | 🟢 aktiv in <Indikator>` bzw. `⚪ inaktiv in <Indikator>`; `get_indicator_display_name()` bevorzugt `metadata['indicator_name']` (z. B. `GridLiquidityIndicator`), Fallback `display_name`/`plugin_id`.
+* `analytics/features/definitions/grid_lines_service.py` & `proximity_service.py`: Metadaten-Feld `indicator_name: "GridLiquidityIndicator"` ergänzt.
+* `serviceui/master_tree.py` `_apply_badge()`: Tooltip der Status-Spalte unterscheidet `aktiv <Indikator>` (aktuell im Chart aktiv) vs. `im <Indikator>` (nur Abhängigkeit).
+
+**C) Alt-Plugin `analytics/features/definitions/grid_liquidity.py` entfernt (archiviert):**
+* `chart/indicators/grid_liquidity.py` ist jetzt vollständig self-contained: `_GRID_LIQUIDITY_SCHEMA`/`_GRID_LIQUIDITY_ORDER`, Properties `plugin_id`/`parameter_schema`/`parameter_order`/`base_parameter_schema`/`full_parameter_schema()`, statisches `default_params` – kein `PluginRegistry`-Import mehr.
+* `indicator_dialog._get_plugin()` nutzt für `grid_liquidity` Branch 1 (Indikator ist das Plugin) – alle `self.plugin.*`-Zugriffe bleiben kompatibel.
+* Produktions-Aufrufer sind robust gegen fehlende Plugins (KeyError-Handling): `service_set_repository`, `live_analyzer`, `service_win`, `parameter_panel`, `param_columns`, `indicator_dialog`.
+* **Migration angewendet** (`python test/migrate_grid_liquidity.py --apply`): keine Alt-Referenzen in `service_sets`/`service_sets_trash`/`service_set_history`/`indicator_presets`/`feature_store`.
+* **Archivierung:** `analytics/features/definitions/grid_liquidity.py` → `.backup_grid_liquidity/analytics/features/definitions/grid_liquidity.py` (aus dem Discovery-Pfad entfernt; Original bleibt erhalten). Ordner `.backup_*/` ist jetzt in `.gitignore`.
+* `PluginRegistry` findet final nur noch `grid_lines` + `proximity`; `get('grid_liquidity')` wirft `KeyError` (erwartet). `test/check_phase14_regression.py` P14-02a-Schwelle `>= 3` → `>= 2`.
+
+**Validierung (alle headless, grün):**
+* `test/check_p15_s2_service_tree.py`: F5 → `'i'`-Badge, F5c/F5d → `⌄` (expandiert) / `>` (zugeklappt), F5e Blatt ohne Symbol, F5f–F5j Layout, G1/G2 – **alle PASS**.
+* `test/test.py`: T9a (zustandsabhängiger Marker), T9b/T10 (Einfach-Klick-Toggle), T11 (kein Icon), T4/T5 (`'i'`-Badge) – **alle PASS**.
+* `test/check_phase14_regression.py` (P14-02d: `grid_liquidity` NICHT mehr registriert), `test/check_plugin_batch_services.py`, `test/check_plugin_executor.py`, `test/check_p14_s2_discovery.py`, `test/check_grid_parity.py`, `test/check_p13_s1.py` – **alle PASS**.
+* `python -m py_compile` auf allen geänderten Dateien (Exit 0); Import-Smoke-Test der Produktionsmodule (Chart, Service-UI, Dialoge, Repository) erfolgreich.

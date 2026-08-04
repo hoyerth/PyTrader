@@ -4,6 +4,7 @@
 ```
 PyTrader/
     Agents.md
+    analytics_profile_repository.py
     Architektur.md
     db_service.py
     main.py
@@ -12,6 +13,7 @@ PyTrader/
     scrollable_content.py
     state_manager.py
     statistic_win.py
+    symbol_repository.py
     .backup_7B_step18/
         chart_win.py
         historical_scanner.py
@@ -74,9 +76,14 @@ PyTrader/
             live_analyzer.py
         engine/
             __init__.py
+            analytics_repository.py
+            analytics_view_model.py
+            analytics_worker.py
             description_dialog.py
+            feature_store_reader.py
             schema_migrator.py
             service_models.py
+            service_selector_model.py
             service_set_repository.py
             set_evaluator.py
         features/
@@ -95,6 +102,15 @@ PyTrader/
             plugins/
                 __init__.py
                 base_plugin.py
+        ui/
+            __init__.py
+            analytics_win.py
+            common.py
+            distribution_page.py
+            equity_page.py
+            heatmap_page.py
+            scatter_page.py
+            table_page.py
     chart/
         __init__.py
         chart_basics.py
@@ -120,23 +136,38 @@ PyTrader/
         __init__.py
         app_settings.py
         base_state_model.py
+        event_bus.py
     data/
         analytics.duckdb.tmp/
         custom_plugins/
     serviceui/
         __init__.py
+        master_tree.py
         param_columns.py
+        parameter_panel.py
+        service_selector_widget.py
         service_set_utils.py
         service_win.py
         set_item_adapter.py
         set_run_worker.py
+        status_panel.py
+        symbols_win.py
+        toolbar.py
         trash_dialog.py
     test/
         build_cont_map.py
+        check_analytics_leak.py
+        check_analytics_queries.py
+        check_analytics_race.py
+        check_analytics_table_render.py
+        check_analytics_tf_spam.py
+        check_analytics_vm_flow.py
         check_app_state.py
         check_broker_tz.py
         check_chart_data.py
         check_dialog_geometry.py
+        check_duckdb_write_contention.py
+        check_fixes_1503.py
         check_generation_guard.py
         check_grid_buttons.py
         check_grid_circles.py
@@ -177,6 +208,12 @@ PyTrader/
         check_p14_s4_services_locked.py
         check_p14_s5_trash.py
         check_p14_service_params.py
+        check_p15_s1_symbols.py
+        check_p15_s2_service_tree.py
+        check_p15_s3_analytics.py
+        check_p15_s3_profiles.py
+        check_p15_s3_reader_repo.py
+        check_p15_s3_worker_vm.py
         check_performance_p14.py
         check_phase12_step1_migration.py
         check_phase14_regression.py
@@ -186,10 +223,18 @@ PyTrader/
         check_race_guard.js
         check_resolve_realtime.js
         check_statistics_repo.py
+        check_table_render_fix.py
+        check_tf_change_all11.py
+        check_tf_change_hang.py
+        check_tf_change_hang2.py
+        check_tf_change_hang3.py
+        check_tf_change_hang4.py
+        check_tf_gray.py
         check_time_constants.js
         check_time_utils.js
         grid_ref.py
         simulate_chart_mapping.py
+        test.py
         test_db_lock.py
         tmp_cont_map.json
     ui/
@@ -219,6 +264,7 @@ Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukture
 - Vor jeder Umsetzung wird diese Datei gelesen und als primäre Anweisung befolgt.
 - Bei Konflikten zwischen `docs/AKTUELLE_UMSETZUNG.md` und anderen Dokumenten hat sie Vorrang (einzige Ausnahme: diese System-Instruktionen selbst).
 - Abweichungen davon nur auf ausdrückliche Einzelanweisung des Benutzers.
+- Anpassungen, ob aus dieser Datei oder manuell eingegeben, werden hier in weiteren Kapiteln nach gegebener Taxonomie als Implementierungs-Log im Format MD dokumentiert
 
 ### 0b. WICHTIG: `docs/Old` NICHT BEACHTEN (Standard)
 - **Alle Dateien im Unterordner `docs/Old` (`docs/Old/x_Architektur.md`, `docs/Old/x_Roadmap.md`, ...) sind archivierte/abgelegte Alt-Dokumente und werden NICHT beachtet.**
@@ -277,6 +323,31 @@ Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukture
   * Code-Inspektion
 - UI-Änderungen werden durch sorgfältige Code-Inspektion abgesichert, nicht durch Ausführen der GUI.
 
+### 4.5. BUGFIXING- & SPEED-MODUS (MAXIMALE EFFIZIENZ)
+- **Aktivierung:** Erfolgt explizit durch die Anweisung *"Bugfixing-Modus"* oder die Übergabe einer konkreten Fehlermeldung/Tracebacks.
+- **Disziplin & Fokus:** Maximale Geschwindigkeit, direkte Lösung ohne Grundsatzdiskussionen, Höflichkeitsfloskeln oder unaufgeforderte Refactorings.
+
+#### A. Harte Test- & Ausführungsregeln
+- **Keine UI- / GUI-Tests:** Unter keinen Umständen PySide6/Qt-Anwendungen starten oder UI-Skripte ausführen.
+- **Keine Regressionstests:** Keine unbeteiligten Test-Suites oder kompletten Test-Pipelines laufen lassen.
+- **Minimaler Backend-Check (1-Sekunden-Verifikation):**
+  1. Statischer Syntax-Check via `python -m py_compile <geänderte_datei>.py`.
+  2. Isolierter Backend-/DB-Logic-Test ausschließlich in `test/test.py` (falls zwingend nötig).
+- **Manuelles Testen:** Der eigentliche Funktionstest der UI/Gesamtanwendung erfolgt direkt und manuell durch den Anwender.
+
+#### B. Code-Ausgabe & Gezieltes Prompting (Diff-Only)
+- **Patch-/Snippet-Format:** Es werden NIEMALS komplette 400-Zeilen-Dateien neu generiert, wenn sich nur wenige Zeilen ändern.
+- **Präzise Verortung:** Ausgegeben werden nur die geänderten Methoden oder Blöcke mit relativer Pfadangabe als Kommentar in Zeile 1 und klaren Einfüge-Hinweisen (z. B. Zeilennummer oder bestehende Anker-Funktion).
+
+#### C. Doku erst nach Freigabe
+- **Keine Vorab-Dokumentation:** Während der Fehlersuche und Fix-Erstellung werden keine Dokumente (`docs/...`), Readmes oder Changelogs angepasst.
+- **Protokollierung:** Doku-Einträge in `docs/AKTUELLE_UMSETZUNG.md` erfolgen erst, nachdem der Anwender den Fix explizit als funktionierend bestätigt hat.
+
+#### D. Integrierte Zyklus-Booster (Prozess-Beschleuniger)
+1. **Minimaler Kontext-Ballast:** Im Bugfixing-Modus werden keine Roadmaps, Architektur-Dokumente oder historischen Exporte eingelesen.
+2. **Sammeln von zusammenhängenden Fixes:** Gehören mehrere kleine Fehler zusammen, werden alle Snippets in einer einzigen Antwort gebündelt, statt mehrere Interaktions-Schleifen zu drehen.
+3. **Hot-Reloading berücksichtigen:** Code-Eingriffe so gestalten, dass App-Neustarts vermieden werden (z. B. durch Ausnutzung von `PluginRegistry.reload()` oder dynamischen Re-Imports).
+4. **Fehler-Isolierung via Terminal-Asserts:** Kurze `assert`- oder `print`-Statements im Snippet platzieren, damit der Anwender beim manuellen Testen den genauen Fehlschlag-Punkt direkt im Terminal sieht.
 ---
 
 ### 5. PROJEKT-KONTEXT & ERKENNTNISSE (Stand 31.07.2026)
@@ -307,6 +378,335 @@ Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukture
 2. **Status nur als einfacher Prompt ausgeben:** Nach Abschluss eines Schrittes gibt die AI ausschließlich den **Status** (was umgesetzt, validiert und committet wurde) als einfachen Text-Prompt aus.
 3. **Warten auf expliziten Startschuss:** Die AI wartet danach, bis der Anwender **ausdrücklich** die Ausführung des nächsten Schrittes anweist (z. B. „continue" / „setze Schritt X um" / konkrete Anweisung). Ohne diesen expliziten Startschuss wird **kein** weiterer Schritt begonnen.
 4. **Keine unbeabsichtigten Folgeaktionen:** Kein automatisches Anstoßen von Folge-Steps, kein vorauseilendes Commit des nächsten Schrittes und keine Vorschlags-Buttons/Abfragen für den nächsten Schritt – nur der reine Statusbericht.
+```
+
+--------------------------------------------------
+
+### DATEI: analytics_profile_repository.py
+```py
+# analytics_profile_repository.py
+"""
+analytics_profile_repository.py - Analytics-Profile-Repository (Phase 15.03).
+
+Kapselt den Lese-/Schreibzugriff auf die `analytics_profiles`-Tabelle in
+`app_data.duckdb` – die Persistenz-Schicht fuer die Analytics-UI
+(AnalyticsWindow, 15.03). Ein Profil haelt eine benannte Parametrisierung
+der Analytics-Ansichten (Option B – Explicit Save: Slider-/Parametertrends
+setzen ein Dirty-Flag `*`; gespeichert wird erst auf `[💾 Save]`).
+
+Datenfluss (Invariante 4, Kein SQL in UI):
+    DuckDB (analytics_profiles) <-- AnalyticsProfileRepository <-- ViewModel/UI
+
+Schema (analytics_profiles):
+    profile_id  VARCHAR PRIMARY KEY   – uuid4-hex (generiert)
+    name        VARCHAR NOT NULL      – eindeutiger Profil-Name (case-insensitiv)
+    description VARCHAR               – optionale Beschreibung
+    payload     JSON                  – Profil-Payload INKL. Pflichtfeld
+                                        `schema_version` (15.03-Spez: 1)
+    is_active   BOOLEAN DEFAULT FALSE – genau EIN aktives Profil
+    created_at  TIMESTAMP DEFAULT current_timestamp
+    updated_at  TIMESTAMP DEFAULT current_timestamp
+
+Verhalten:
+- `create_profile()`   : legt ein neues Profil an; ergaenzt den Payload
+  additiv um `schema_version` (Pflichtfeld, 15.03-Spezifikation).
+- `get_profile()`      : liest ein Profil per profile_id (oder None).
+- `get_profile_by_name()`: liest per Name (case-insensitive).
+- `list_profiles()`    : alle Profile (deterministisch nach Name sortiert).
+- `update_profile()`   : aktualisiert name/description/payload (Payload
+  behaelt sein schema_version-Pflichtfeld).
+- `delete_profile()`   : entfernt ein Profil (liefert bool).
+- `set_active()`       : setzt genau EIN aktives Profil (andere auf False).
+- `get_active_profile()`: liefert das aktive Profil (oder None).
+- `count()`            : Anzahl der Profile.
+"""
+
+import json
+import os
+import uuid
+from typing import Any, Dict, List, Optional
+
+from db_service import DB_APP_DATA, DbPool, _parse_json_field
+
+# Pflichtfeld im Profil-Payload (15.03-Spezifikation: `schema_version: 1`).
+SCHEMA_VERSION_DEFAULT: int = 1
+
+
+class AnalyticsProfileRepository:
+    """Persistenz-Layer fuer Analytics-Profile (app_data.duckdb)."""
+
+    def __init__(self, db_path: str = DB_APP_DATA) -> None:
+        self.db_path = db_path
+        self._ensure_table()
+
+    # ------------------------------------------------------------------
+    # Interna
+    # ------------------------------------------------------------------
+    def _get_connection(self):
+        return DbPool.get(self.db_path)
+
+    def _ensure_table(self) -> None:
+        """Legt die Tabelle (falls noetig) an – additiv/idempotent.
+
+        Bestehende Profile und Flags werden nicht angetastet (Verbotsregel:
+        Bestandsdaten nicht beschädigen). Dieselbe Tabelle wird auch in
+        db_service.check_and_init_databases() angelegt (App-Start); das
+        CREATE TABLE IF NOT EXISTS hier macht das Repository unabhaengig.
+        """
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        con = self._get_connection()
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS analytics_profiles (
+                profile_id  VARCHAR PRIMARY KEY,
+                name        VARCHAR NOT NULL,
+                description VARCHAR,
+                payload     JSON,
+                is_active   BOOLEAN DEFAULT FALSE,
+                created_at  TIMESTAMP DEFAULT current_timestamp,
+                updated_at  TIMESTAMP DEFAULT current_timestamp
+            );
+        """)
+
+    @staticmethod
+    def _ensure_schema_version(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Stellt das Pflichtfeld `schema_version` im Profil-Payload sicher.
+
+        Wird beim Erzeugen/Aktualisieren additiv gesetzt (15.03-Spez: 1).
+        Ein vom Aufrufer bereits mitgegebenes schema_version gewinnt
+        (Aufwaertskompatibilitaet).
+        """
+        payload = dict(payload or {})
+        payload.setdefault("schema_version", SCHEMA_VERSION_DEFAULT)
+        return payload
+
+    @staticmethod
+    def _row_to_profile(row) -> Dict[str, Any]:
+        """Wandelt eine DB-Zeile in ein Profil-Dict (JSON geparst).
+
+        Fehlt im Payload das Pflichtfeld `schema_version` (z. B. Alt-Rows
+        aus einer frueheren Schema-Version), wird es beim Lesen mit dem
+        Default ergaenzt (analog E-3: Default fuer Alt-Rows) – der Payload
+        selbst bleibt unveraendert.
+        """
+        profile_id, name, description, payload_json, is_active, created_at, updated_at = row
+        payload = _parse_json_field(payload_json) or {}
+        payload = dict(payload)
+        payload.setdefault("schema_version", SCHEMA_VERSION_DEFAULT)
+        return {
+            "profile_id": str(profile_id),
+            "name": str(name),
+            "description": str(description) if description is not None else "",
+            "payload": payload,
+            "is_active": bool(is_active),
+            "created_at": created_at,
+            "updated_at": updated_at,
+        }
+
+    # ------------------------------------------------------------------
+    # CRUD
+    # ------------------------------------------------------------------
+    def create_profile(
+        self,
+        name: str,
+        payload: Optional[Dict[str, Any]] = None,
+        description: str = "",
+    ) -> str:
+        """Legt ein neues Profil an und liefert dessen profile_id.
+
+        Args:
+            name: Eindeutiger Profil-Name (case-insensitiv; ein bestehendes
+                Profil mit demselben Namen wird NICHT ueberschrieben –
+                Aufrufer prueft mit get_profile_by_name()).
+            payload: Profil-Payload (Slider-/Parametertrends der Analytics-
+                UI). Wird additiv um `schema_version` ergaenzt (Pflichtfeld).
+            description: Optionale Beschreibung.
+
+        Returns:
+            Die neue profile_id (uuid4-hex).
+        """
+        profile_id = uuid.uuid4().hex
+        safe_payload = self._ensure_schema_version(payload)
+        con = self._get_connection()
+        con.execute("""
+            INSERT INTO analytics_profiles
+                (profile_id, name, description, payload, is_active)
+            VALUES (?, ?, ?, ?, FALSE)
+        """, [
+            profile_id,
+            str(name).strip(),
+            str(description or "").strip(),
+            json.dumps(safe_payload),
+        ])
+        return profile_id
+
+    def get_profile(self, profile_id: str) -> Optional[Dict[str, Any]]:
+        """Liefert ein Profil per profile_id (oder None)."""
+        if not profile_id:
+            return None
+        con = self._get_connection()
+        row = con.execute("""
+            SELECT profile_id, name, description, payload, is_active,
+                   created_at, updated_at
+            FROM analytics_profiles
+            WHERE profile_id = ?
+        """, [profile_id]).fetchone()
+        if row is None:
+            return None
+        return self._row_to_profile(row)
+
+    def get_profile_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+        """Liefert ein Profil per Name (case-insensitive) oder None."""
+        if not name:
+            return None
+        con = self._get_connection()
+        row = con.execute("""
+            SELECT profile_id, name, description, payload, is_active,
+                   created_at, updated_at
+            FROM analytics_profiles
+            WHERE LOWER(name) = LOWER(?)
+            ORDER BY created_at ASC
+            LIMIT 1
+        """, [name]).fetchone()
+        if row is None:
+            return None
+        return self._row_to_profile(row)
+
+    def list_profiles(self) -> List[Dict[str, Any]]:
+        """Liefert ALLE Profile (deterministisch nach Name sortiert)."""
+        con = self._get_connection()
+        rows = con.execute("""
+            SELECT profile_id, name, description, payload, is_active,
+                   created_at, updated_at
+            FROM analytics_profiles
+            ORDER BY name ASC
+        """).fetchall()
+        return [self._row_to_profile(r) for r in rows]
+
+    def update_profile(
+        self,
+        profile_id: str,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Aktualisiert name/description/payload eines Profils.
+
+        Nur uebergebene Felder werden geaendert (additiv). Wird ein Payload
+        uebergeben, behaelt er sein `schema_version`-Pflichtfeld (additiv,
+        falls der Aufrufer es nicht mitgibt).
+
+        Returns:
+            True, wenn ein Profil existierte und aktualisiert wurde.
+        """
+        if not profile_id:
+            return False
+        con = self._get_connection()
+        existing = self.get_profile(profile_id)
+        if existing is None:
+            return False
+
+        new_name = str(name).strip() if name is not None else existing["name"]
+        new_desc = (
+            str(description or "").strip()
+            if description is not None
+            else existing["description"]
+        )
+        if payload is not None:
+            new_payload = self._ensure_schema_version(payload)
+            new_payload_json = json.dumps(new_payload)
+        else:
+            new_payload_json = json.dumps(existing["payload"])
+
+        con.execute("""
+            UPDATE analytics_profiles
+            SET name = ?, description = ?, payload = ?,
+                updated_at = current_timestamp
+            WHERE profile_id = ?
+        """, [new_name, new_desc, new_payload_json, profile_id])
+        return True
+
+    def delete_profile(self, profile_id: str) -> bool:
+        """Entfernt ein Profil (hartes Loeschen).
+
+        Returns:
+            True, wenn eine Zeile existierte und entfernt wurde.
+        """
+        if not profile_id:
+            return False
+        con = self._get_connection()
+        res = con.execute(
+            "SELECT COUNT(*) FROM analytics_profiles WHERE profile_id = ?",
+            [profile_id],
+        ).fetchone()
+        exists = bool(res and res[0] and res[0] > 0)
+        if exists:
+            con.execute("DELETE FROM analytics_profiles WHERE profile_id = ?",
+                        [profile_id])
+        return exists
+
+    # ------------------------------------------------------------------
+    # Aktives Profil (Explicit Save – genau EIN aktives Profil)
+    # ------------------------------------------------------------------
+    def set_active(self, profile_id: str) -> bool:
+        """Setzt genau EIN aktives Profil (alle anderen auf False).
+
+        Returns:
+            True, wenn das Profil existiert und aktiviert wurde.
+        """
+        if not profile_id:
+            return False
+        con = self._get_connection()
+        res = con.execute(
+            "SELECT COUNT(*) FROM analytics_profiles WHERE profile_id = ?",
+            [profile_id],
+        ).fetchone()
+        exists = bool(res and res[0] and res[0] > 0)
+        if not exists:
+            return False
+        con.execute("UPDATE analytics_profiles SET is_active = FALSE")
+        con.execute("""
+            UPDATE analytics_profiles
+            SET is_active = TRUE, updated_at = current_timestamp
+            WHERE profile_id = ?
+        """, [profile_id])
+        return True
+
+    def get_active_profile(self) -> Optional[Dict[str, Any]]:
+        """Liefert das aktive Profil (oder None, wenn keines aktiv ist)."""
+        con = self._get_connection()
+        row = con.execute("""
+            SELECT profile_id, name, description, payload, is_active,
+                   created_at, updated_at
+            FROM analytics_profiles
+            WHERE is_active = TRUE
+            ORDER BY updated_at DESC
+            LIMIT 1
+        """).fetchone()
+        if row is None:
+            return None
+        return self._row_to_profile(row)
+
+    # ------------------------------------------------------------------
+    # Zaehler
+    # ------------------------------------------------------------------
+    def count(self) -> int:
+        """Anzahl der gespeicherten Profile."""
+        con = self._get_connection()
+        res = con.execute("SELECT COUNT(*) FROM analytics_profiles").fetchone()
+        return int(res[0]) if res and res[0] is not None else 0
+
+
+# Bequeme Default-Instanz (kapselt app_data.duckdb) – fuer ViewModel/UI.
+_profile_repo_default: Optional[AnalyticsProfileRepository] = None
+
+
+def get_analytics_profile_repository() -> AnalyticsProfileRepository:
+    """Liefert die app-weite Standard-Instanz (lazy, app_data.duckdb)."""
+    global _profile_repo_default
+    if _profile_repo_default is None:
+        _profile_repo_default = AnalyticsProfileRepository()
+    return _profile_repo_default
+
 ```
 
 --------------------------------------------------
@@ -600,13 +1000,23 @@ class DbPool:
 
     @staticmethod
     def close_all() -> None:
-        """Schliesst ALLE Connections des aktuellen Threads."""
+        """Schliesst ALLE Connections des aktuellen Threads.
+
+        Dekrementiert dabei den globalen Referenzzaehler, damit der
+        atexit-Bookkeeping-Dict (Fix 15.03, Worker-Connection-Leak) nicht
+        unbegrenzt waechst. Wird u. a. von AnalyticsAsyncWorker nach jeder
+        Abfrage aufgerufen (Worker-Thread gibt seine Connection frei; ein
+        neuer Worker-Thread erhaelt automatisch eine frische Connection).
+        """
         if hasattr(DbPool._local, 'conns'):
             for abs_path in list(DbPool._local.conns.keys()):
                 try:
                     DbPool._local.conns[abs_path].close()
                 except Exception:
                     pass
+                with _db_pool_lock:
+                    _db_pool_global[abs_path] = max(
+                        0, _db_pool_global.get(abs_path, 0) - 1)
             DbPool._local.conns = {}
 
 
@@ -715,6 +1125,43 @@ def check_and_init_databases() -> None:
 			key VARCHAR PRIMARY KEY,
 			value VARCHAR,
 			updated_at TIMESTAMP DEFAULT current_timestamp
+		);
+	""")
+
+	# Phase 15 (15.01): Symbol- & Favoriten-Verwaltung. broker_symbols haelt
+	# die Broker-Symbole (aus mt5.symbols_get()) inkl. Favoriten-Flag und
+	# dient als Fallback, wenn MT5 nicht verfuegbar ist. Standard-Defaults
+	# (SILVER, GOLD, BTCUSD) werden als Favoriten vorbelegt, damit die
+	# Favoriten-Dropdowns (ServiceWindow/AnalyticsWindow) nie leer starten.
+	con_app.execute("""
+		CREATE TABLE IF NOT EXISTS broker_symbols (
+			symbol      VARCHAR PRIMARY KEY,
+			path        VARCHAR,
+			is_favorite BOOLEAN DEFAULT FALSE,
+			updated_at  TIMESTAMP DEFAULT current_timestamp
+		);
+	""")
+	con_app.execute("""
+		INSERT INTO broker_symbols (symbol, path, is_favorite)
+		VALUES ('SILVER', '', TRUE), ('GOLD', '', TRUE), ('BTCUSD', '', TRUE)
+		ON CONFLICT (symbol) DO NOTHING;
+	""")
+
+	# Phase 15 (15.03): Analytics-Profile. analytics_profiles haelt benannte
+	# Parametrisierungen der Analytics-UI (Option B – Explicit Save: Slider-/
+	# Parametertrends setzen Dirty-Flag, Speichern erst auf [Save]). Das
+	# Profil-Payload-JSON (Spalte payload) enthaelt als Pflichtfeld
+	# `schema_version` (15.03-Spezifikation: 1). Additiv/idempotent –
+	# bestehende Profile bleiben unangetastet.
+	con_app.execute("""
+		CREATE TABLE IF NOT EXISTS analytics_profiles (
+			profile_id  VARCHAR PRIMARY KEY,
+			name        VARCHAR NOT NULL,
+			description VARCHAR,
+			payload     JSON,
+			is_active   BOOLEAN DEFAULT FALSE,
+			created_at  TIMESTAMP DEFAULT current_timestamp,
+			updated_at  TIMESTAMP DEFAULT current_timestamp
 		);
 	""")
 	print(f"   ✅ Ordner '{DATA_DIR}/' und alle 3 DBs sind einsatzbereit.")
@@ -1072,8 +1519,9 @@ from state_manager import StateManager
 from persistent_win import PersistentWindow
 from db_service import get_timeframes, TF_SECONDS_MAP, MT5_LOCK, DbPool
 import db_service
+from symbol_repository import get_symbol_repository
 from serviceui.service_win import ServiceWindow
-from statistic_win import StatisticWindow
+from analytics.ui.analytics_win import AnalyticsWindow
 from properties_win import PropertiesWindow
 from config.app_settings import AppSettings
 from analytics.background_workers.live_analyzer import LiveAnalyzer
@@ -1258,7 +1706,7 @@ class MainWindow(QMainWindow):
 
         self.btn_statistics: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_statistics")
         if self.btn_statistics:
-            self.btn_statistics.clicked.connect(self.open_statistic_window)
+            self.btn_statistics.clicked.connect(self.open_analytics_window)
 
         self.btn_properties: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_properties")
         if self.btn_properties:
@@ -1269,6 +1717,25 @@ class MainWindow(QMainWindow):
         db_service.check_and_init_databases()
 
         db_service.check_mt5_connection()
+
+        # Phase 15 15.01-Nachtrag 3 (User-Anweisung 04.08.2026): Alle Broker-
+        # Symbole werden NUR beim App-Start EINMALIG live von MT5 geladen und
+        # per Upsert in broker_symbols persistiert. Das SymbolsWindow liest
+        # danach ausschliesslich diese gespeicherte Liste (get_symbols()) –
+        # kein MT5-Fetch beim Oeffnen des Fensters (keine Verzoegerungen).
+        # MT5 ist hier bereits initialisiert (check_mt5_connection), daher ist
+        # der Fetch einmalig und schnell.
+        try:
+            _symbols, _status, _error = get_symbol_repository().sync_from_broker_with_status()
+            if _status == "live":
+                print(f"✅ [Symbol-Sync] {len(_symbols)} Symbole beim App-Start "
+                      f"von MT5 geladen.")
+            else:
+                print(f"⚠️ [Symbol-Sync] MT5-Fetch beim App-Start fehlgeschlagen "
+                      f"– nutze DB-Stand ({len(_symbols)} Symbole). "
+                      f"{_error or 'Unbekannter Fehler'}")
+        except Exception as exc:
+            print(f"⚠️ [Symbol-Sync] Fehler beim App-Start-Sync: {exc}")
 
         self.db: duckdb.DuckDBPyConnection = DbPool.get(
             str(BASE_DIR / "data" / "app_data.duckdb")
@@ -1446,14 +1913,16 @@ class MainWindow(QMainWindow):
         self.persistent_sub_windows.append(win)
         win.show()
 
-    def open_statistic_window(self) -> None:
+    def open_analytics_window(self) -> None:
+        # Phase 15 15.03: Statistik-Fenster durch AnalyticsWindow ersetzt
+        # (win_statistics-Persistenz wird per E-2 nach win_analytics migriert).
         # Singleton: Bestehendes Fenster in den Vordergrund holen
-        existing = StatisticWindow.get_existing_instance()
+        existing = AnalyticsWindow.get_existing_instance()
         if existing is not None:
             existing.raise_()
             existing.activateWindow()
             return
-        win = StatisticWindow(self)  # parent=self nur für state_manager-Zugriff
+        win = AnalyticsWindow(self)  # parent=self nur für state_manager-Zugriff
         self.persistent_sub_windows.append(win)
         win.show()
 
@@ -1601,7 +2070,7 @@ class MainWindow(QMainWindow):
         )
 
         # Alle offenen PersistentWindow-Instanzen speichern und schliessen
-        # (ServiceWindow, StatisticWindow, etc. - haben keinen Qt-Parent mehr,
+        # (ServiceWindow, AnalyticsWindow, etc. - haben keinen Qt-Parent mehr,
         #  daher muessen sie explizit geschlossen werden)
         from persistent_win import _open_windows as pw_open_windows
         for sub_win in list(pw_open_windows):
@@ -1716,6 +2185,11 @@ class PersistentWindow(QMainWindow):
 
     INSTANCE_ID: ClassVar[str] = ""
     _auto_restore: ClassVar[bool] = True
+    # True: Fenster bleibt nach manuellem Schliessen in der Fenster-Historie
+    # (window_instances + instance_states bleiben erhalten – Symbol/Timeframe
+    # werden fuer das naechste Oeffnen gemerkt). False (Default): Eintrag wird
+    # beim manuellen Schliessen entfernt (Standard-Verhalten).
+    _keep_history_on_close: ClassVar[bool] = False
 
     def __init__(self, parent=None, state_manager: Optional[StateManager] = None):
         # WICHTIG: KEIN Parent übergeben! Ein Fenster mit Parent (z.B. MainWindow)
@@ -1858,13 +2332,17 @@ class PersistentWindow(QMainWindow):
         
         Nur beim App-Beenden (_is_quitting) bleibt der Eintrag erhalten,
         damit das Fenster beim naechsten Start wiederhergestellt wird.
+        Fenster mit `_keep_history_on_close = True` (z. B. AnalyticsWindow)
+        bleiben auch nach manuellem Schliessen in der Historie, damit ihr
+        Symbol/Timeframe-Zustand fuer das naechste Oeffnen gemerkt bleibt.
         """
         self.save_state()
 
         # DB-Eintrag nur loeschen, wenn die App NICHT insgesamt beendet wird
+        # UND das Fenster nicht dauerhaft in der Historie bleiben soll.
         app = QApplication.instance()
         is_quitting = getattr(app, '_is_quitting', False) if app else False
-        if not is_quitting:
+        if not is_quitting and not self._keep_history_on_close:
             inst_id = self.get_instance_id()
             if inst_id:
                 try:
@@ -2162,9 +2640,17 @@ class ContentScrollMixin:
 
     def _apply_reflow_size(self) -> None:
         """Zerstört deleteLater-Widgets und setzt das Fenster auf
-        min(Inhalt, Bildschirm) inkl. Rahmen."""
-        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-        self.resize_to_clamped_content()
+        min(Inhalt, Bildschirm) inkl. Rahmen.
+
+        P15-Bugfix: try/except – der deferred QTimer kann feuern, nachdem das
+        Fenster bereits geschlossen/zerstoert wurde (wildes Klicken + schnelles
+        Schliessen); ein Zugriff wuerde sonst crashen (0xC0000005).
+        """
+        try:
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+            self.resize_to_clamped_content()
+        except (RuntimeError, AttributeError):
+            pass
 
     def resize_to_clamped_content(self) -> None:
         """Setzt das Inhalt-Widget auf seine Layout-Größe und das Fenster auf
@@ -2176,16 +2662,27 @@ class ContentScrollMixin:
         ERSTE Layout-Größe fixieren (setFixedSize) und späteres Wachstum
         (zusätzliche Service-Spalten, aufgeklappte Experten-Optionen)
         verhindern. Das manuelle resize() hält das Widget dagegen immer auf der
-        aktuellen Layout-Größe, und das Fenster wird danach auf
-        min(Inhalt, Bildschirm) geklemmt (Scrollbars, sobald der Inhalt den
-        Viewport übersteigt).
+        aktuellen Layout-Größe.
+
+        BUGFIX (Persistenz): Das FENSTER wird dabei NIE unter die aktuelle
+        (User-/wiederhergestellte) Größe geschrumpft, sondern nur vergrößert,
+        wenn der Inhalt mehr Platz braucht – maximal bis zum Bildschirm. Vorher
+        überschrieb der Reflow nach restore_state() die persistierte Geometrie
+        (Fenster schrumpfte auf Inhaltgröße), wodurch save_state() die falsche
+        Größe speicherte und die letzte Fensterposition/-größe verloren ging.
         """
         if self._content_widget is not None and self._content_widget.layout() is not None:
             self._content_widget.resize(self._content_widget.layout().sizeHint())
         content = self.clamped_content_size()
         frame = self.frameGeometry().size() - self.size()
-        self.resize(content.width() + frame.width(),
-                    content.height() + frame.height())
+        desired = QSize(content.width() + frame.width(),
+                        content.height() + frame.height())
+        screen = QApplication.primaryScreen().availableGeometry()
+        # Nur wachsen, nie schrumpfen (unter aktuelle Größe) + Screen-Klemme.
+        current = self.size()
+        new_w = min(max(desired.width(), current.width()), screen.width())
+        new_h = min(max(desired.height(), current.height()), screen.height())
+        self.resize(new_w, new_h)
 
     def _invalidate_content_caches(self) -> None:
         """Invalidiert QWidgetItemV2- und Layout-Caches entlang der Hierarchie.
@@ -2699,13 +3196,20 @@ from PySide6.QtCore import QFile, QIODevice, QTimer, Slot
 from PySide6.QtGui import QColor
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QHeaderView, QLabel, QMainWindow,
+    QApplication, QComboBox, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
     QPushButton, QTableWidget, QTableWidgetItem, QWidget,
 )
 
 from analytics.statistics_repository import StatisticsRepository
 from persistent_win import PersistentWindow, register_persistent_window
 from state_manager import StateManager
+
+# Phase 15 15.01-Nachtrag 4: Favoriten-Symbol-Verwaltung im Statistik-Fenster
+# (★-Button oeffnet das SymbolsWindow; Symbol-Filter-Dropdown zeigt
+# 'ALLE' + Favoriten, EventBus-Kopplung analog Chart-/ServiceWindow).
+from config.event_bus import event_bus
+from symbol_repository import SymbolRepository, get_symbol_repository
+from serviceui.symbols_win import SymbolsWindow
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -2769,6 +3273,28 @@ class StatisticWindow(PersistentWindow):
         if self.table:
             self.table.itemDoubleClicked.connect(self.on_item_double_clicked)
 
+        # Phase 15 15.01-Nachtrag 4 (User-Notiz 04.08.2026): Favoriten-Symbol-
+        # Verwaltung im Statistik-Fenster – ★-Button rechts neben der Symbol-
+        # Filter-ComboBox oeffnet das nicht-modale SymbolsWindow (analog
+        # Chart-/ServiceWindow). Das Symbol-Filter-Dropdown zeigt 'ALLE' +
+        # Favoriten (Fallback auf Default-Symbole); die aktuelle Auswahl bleibt
+        # erhalten, damit der Filter nicht ungewollt umspringt. EventBus-
+        # Kopplung: Favoriten-Aenderungen -> Dropdown neu befuellen.
+        self._symbol_repo: SymbolRepository = get_symbol_repository()
+        self.btn_symbol_fav: QPushButton = QPushButton("★", self.ui)
+        self.btn_symbol_fav.setObjectName("btn_symbol_fav")
+        self.btn_symbol_fav.setToolTip(
+            "Favoriten verwalten – oeffnet das Symbol-Fenster. "
+            "Das Symbol-Filter-Dropdown zeigt 'ALLE' + Favoriten.")
+        self.btn_symbol_fav.setFixedSize(28, 28)
+        layout_filter = self.ui.findChild(QHBoxLayout, "horizontalLayout_filter")
+        if layout_filter is not None and self.combo_symbol is not None:
+            idx = layout_filter.indexOf(self.combo_symbol)
+            layout_filter.insertWidget(idx + 1, self.btn_symbol_fav)
+        self.btn_symbol_fav.clicked.connect(self.open_symbols_window)
+        event_bus.favorites_changed.connect(self._refresh_symbol_combo)
+        self._refresh_symbol_combo()
+
         # State asynchron wiederherstellen (nach show(), damit move/resize vom Window-Manager akzeptiert werden)
         QTimer.singleShot(0, self.restore_state)
 
@@ -2812,6 +3338,51 @@ class StatisticWindow(PersistentWindow):
             self.combo_symbol.blockSignals(False)
         if self.combo_tf:
             self.combo_tf.blockSignals(False)
+
+    # --- Phase 15 15.01-Nachtrag 4: Symbol- & Favoriten-Verwaltung ---
+
+    @Slot()
+    def open_symbols_window(self) -> None:
+        """Oeffnet das nicht-modale SymbolsWindow (Singleton-Verhalten).
+
+        Analog zu chart_win/service_win: Existiert bereits eine sichtbare
+        Instanz, wird sie in den Vordergrund geholt statt neu geoeffnet
+        (PersistentWindow.get_existing_instance()).
+        """
+        existing = SymbolsWindow.get_existing_instance()
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
+        win = SymbolsWindow(self)  # parent=self nur fuer state_manager-Zugriff
+        win.show()
+
+    def _refresh_symbol_combo(self) -> None:
+        """Befuellt die Symbol-Filter-ComboBox: 'ALLE' + Favoriten.
+
+        Wird beim Start und bei jedem `EventBus.favorites_changed`-Event
+        aufgerufen (Verbindung im __init__). Fallback auf die Standard-
+        Defaults (SILVER/GOLD/BTCUSD), falls keine Favoriten gesetzt sind.
+        Die aktuelle Auswahl bleibt erhalten (auch wenn sie kein Favorit
+        mehr ist), damit der Filter nicht ungewollt umspringt. Signale sind
+        waehrend des Umbaus blockiert (kein Refresh-Explosion).
+        """
+        if not self.combo_symbol:
+            return
+        favorites = self._symbol_repo.get_favorite_symbols()
+        if not favorites:
+            favorites = list(SymbolRepository.DEFAULT_SYMBOLS)
+        current = self.combo_symbol.currentText()
+        self.combo_symbol.blockSignals(True)
+        self.combo_symbol.clear()
+        self.combo_symbol.addItem("ALLE")
+        for sym in favorites:
+            self.combo_symbol.addItem(sym)
+        if current and current != "ALLE" and current not in favorites:
+            self.combo_symbol.addItem(current)
+        idx = self.combo_symbol.findText(current)
+        self.combo_symbol.setCurrentIndex(idx if idx >= 0 else 0)
+        self.combo_symbol.blockSignals(False)
 
     # --- Paging ---
 
@@ -2946,6 +3517,276 @@ class StatisticWindow(PersistentWindow):
             if widget.metaObject().className() == "MainWindow":
                 return widget
         return None
+
+```
+
+--------------------------------------------------
+
+### DATEI: symbol_repository.py
+```py
+# symbol_repository.py
+"""
+symbol_repository.py - Symbol- & Favoriten-Repository (Phase 15.01).
+
+Kapselt den Lese-/Schreibzugriff auf die `broker_symbols`-Tabelle in
+`app_data.duckdb` – entkoppelt aus `state_manager.py` (SRP: Repository-
+Schicht). Die UI (SymbolsWindow, ServiceWindow/AnalyticsWindow-Dropdowns)
+greift ausschliesslich ueber dieses Repository auf Symbole zu.
+
+Datenfluss (Invariante 4, Kein SQL in UI):
+    DuckDB (broker_symbols) <-- SymbolRepository <-- UI-Fenster
+
+Verhalten:
+- `ensure_defaults()`    : legt SILVER/GOLD/BTCUSD als Favoriten an (idempotent).
+- `sync_from_broker()`   : liest Symbole live via mt5.symbols_get() (lazy
+  MT5-Import), schreibt sie per Upsert in die DB und gibt die DB-Liste
+  zurueck. Bei MT5-Ausfall (initialize()==False / Exception) automatischer
+  Fallback auf die DB-Tabelle – die App bleibt voll funktionsfaehig.
+  Seit 15.01-Nachtrag 3 (04.08.2026) wird der Fetch NUR noch EINMALIG beim
+  App-Start (main.py) aufgerufen – die UI-Fenster (SymbolsWindow) lesen
+  ausschliesslich die gespeicherte Liste ueber `get_symbols()`.
+- `toggle_favorite()`    : kippt das Favoriten-Flag eines Symbols.
+"""
+
+import os
+from typing import Any, Dict, List, Optional, Tuple
+
+from db_service import DB_APP_DATA, DbPool
+
+# Komfort-Konstante fuer UI-Fallback (Dropdown nie leer), identisch zu den
+# Defaults in db_service.check_and_init_databases().
+DEFAULT_SYMBOLS: Tuple[str, ...] = ("SILVER", "GOLD", "BTCUSD")
+
+
+class SymbolRepository:
+    """Kapselt den Zugriff auf die broker_symbols-Tabelle (app_data.duckdb)."""
+
+    def __init__(self, db_path: str = DB_APP_DATA) -> None:
+        self.db_path = db_path
+        self._ensure_table()
+
+    # ------------------------------------------------------------------
+    # Interne Helfer
+    # ------------------------------------------------------------------
+    def _get_connection(self):
+        return DbPool.get(self.db_path)
+
+    def _ensure_table(self) -> None:
+        """Legt die Tabelle (falls noetig) an und stellt die Defaults sicher.
+
+        Additiv/idempotent: bestehende Zeilen und Favoriten-Flags werden
+        nicht angetastet (Verbotsregel: Bestandsdaten nicht beschädigen).
+        """
+        con = self._get_connection()
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS broker_symbols (
+                symbol      VARCHAR PRIMARY KEY,
+                path        VARCHAR,
+                is_favorite BOOLEAN DEFAULT FALSE,
+                updated_at  TIMESTAMP DEFAULT current_timestamp
+            );
+        """)
+        self.ensure_defaults()
+
+    def ensure_defaults(self) -> None:
+        """Legt SILVER/GOLD/BTCUSD als Favoriten an (falls noch nicht vorhanden)."""
+        con = self._get_connection()
+        con.execute("""
+            INSERT INTO broker_symbols (symbol, path, is_favorite)
+            VALUES ('SILVER', '', TRUE), ('GOLD', '', TRUE), ('BTCUSD', '', TRUE)
+            ON CONFLICT (symbol) DO NOTHING;
+        """)
+
+    # ------------------------------------------------------------------
+    # Lese-API
+    # ------------------------------------------------------------------
+    def get_symbols(self) -> List[Dict[str, Any]]:
+        """Liefert alle Broker-Symbole (aufsteigend nach Name).
+
+        Rückgabe: [{"symbol", "path", "is_favorite", "updated_at"}, ...]
+        """
+        con = self._get_connection()
+        rows = con.execute("""
+            SELECT symbol, path, is_favorite, updated_at
+            FROM broker_symbols
+            ORDER BY symbol ASC
+        """).fetchall()
+        return [
+            {
+                "symbol": str(r[0]),
+                "path": str(r[1]) if r[1] is not None else "",
+                "is_favorite": bool(r[2]),
+                "updated_at": r[3],
+            }
+            for r in rows
+        ]
+
+    def get_favorite_symbols(self) -> List[str]:
+        """Liefert nur die Favoriten-Symbole (is_favorite == TRUE), sortiert."""
+        con = self._get_connection()
+        rows = con.execute("""
+            SELECT symbol FROM broker_symbols
+            WHERE is_favorite = TRUE
+            ORDER BY symbol ASC
+        """).fetchall()
+        return [str(r[0]) for r in rows]
+
+    def get_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Liefert ein einzelnes Symbol (oder None)."""
+        con = self._get_connection()
+        row = con.execute("""
+            SELECT symbol, path, is_favorite, updated_at
+            FROM broker_symbols
+            WHERE LOWER(symbol) = LOWER(?)
+        """, [symbol]).fetchone()
+        if row is None:
+            return None
+        return {
+            "symbol": str(row[0]),
+            "path": str(row[1]) if row[1] is not None else "",
+            "is_favorite": bool(row[2]),
+            "updated_at": row[3],
+        }
+
+    def count(self) -> int:
+        """Anzahl der gespeicherten Symbole."""
+        con = self._get_connection()
+        res = con.execute("SELECT COUNT(*) FROM broker_symbols").fetchone()
+        return int(res[0]) if res and res[0] is not None else 0
+
+    # ------------------------------------------------------------------
+    # Schreib-API
+    # ------------------------------------------------------------------
+    def toggle_favorite(self, symbol: str) -> bool:
+        """Kippt das Favoriten-Flag eines Symbols.
+
+        Args:
+            symbol: Symbol-Name (case-insensitive).
+
+        Returns:
+            Der NEUE Favoriten-Zustand (True = jetzt Favorit).
+            Ist das Symbol unbekannt, wird es mit is_favorite=TRUE angelegt.
+        """
+        con = self._get_connection()
+        current = self.get_symbol(symbol)
+        if current is None:
+            con.execute("""
+                INSERT INTO broker_symbols (symbol, path, is_favorite)
+                VALUES (?, '', TRUE)
+                ON CONFLICT (symbol) DO NOTHING;
+            """, [symbol])
+            return True
+        new_state = not current["is_favorite"]
+        con.execute("""
+            UPDATE broker_symbols
+            SET is_favorite = ?, updated_at = current_timestamp
+            WHERE LOWER(symbol) = LOWER(?)
+        """, [new_state, symbol])
+        return new_state
+
+    def upsert_from_broker(self, broker_symbols: List[Tuple[str, str]]) -> int:
+        """Schreibt Broker-Symbole per Upsert in die DB.
+
+        Bestehende Zeilen werden aktualisiert (path/updated_at), Favoriten-
+        Flags bleiben dabei unangetastet (additiv, keine Datenverluste).
+
+        Args:
+            broker_symbols: Liste von (symbol, path)-Paaren aus MT5.
+
+        Returns:
+            Anzahl der verarbeiteten Symbole.
+        """
+        if not broker_symbols:
+            return 0
+        con = self._get_connection()
+        seen: Dict[str, str] = {}
+        for symbol, path in broker_symbols:
+            sym = str(symbol).strip()
+            if not sym:
+                continue
+            # Letzter Eintrag pro Symbol gewinnt (MT5 kann Duplikate liefern)
+            seen[sym] = str(path or "")
+        for sym, path in seen.items():
+            con.execute("""
+                INSERT INTO broker_symbols (symbol, path, is_favorite)
+                VALUES (?, ?, FALSE)
+                ON CONFLICT (symbol) DO UPDATE SET
+                    path = EXCLUDED.path,
+                    updated_at = DEFAULT;
+            """, [sym, path])
+        return len(seen)
+
+    def sync_from_broker(self) -> List[Dict[str, Any]]:
+        """Synchronisiert Symbole live aus MT5 (mit automatischem DB-Fallback).
+
+        - Versucht mt5.symbols_get() (lazy import; schaltet MT5 NICHT ein,
+          wenn das Terminal geschlossen ist).
+        - Bei Erfolg: Upsert aller Symbole in die DB, Rückgabe der DB-Liste.
+        - Bei MT5-Ausfall (initialize()==False, Exception): Fallback auf die
+          DB-Tabelle – die App bleibt voll funktionsfaehig (Roadmap 15.01).
+
+        Detaillierter Status (live/fallback + Fehlermeldung) ist ueber
+        `sync_from_broker_with_status()` verfuegbar.
+        """
+        symbols, _status, _error = self.sync_from_broker_with_status()
+        return symbols
+
+    def sync_from_broker_with_status(self) -> Tuple[List[Dict[str, Any]], str, Optional[str]]:
+        """Wie sync_from_broker(), liefert zusaetzlich Status & Fehlermeldung.
+
+        Erweiterung fuer den App-Start-Sync (main.py, 15.01-Nachtrag 3): Die
+        Liste aller verfuegbaren Symbole wird EINMALIG beim App-Start live von
+        MT5 geladen; schlaegt der MT5-Zugriff fehl, wird der Grund als
+        Fehlermeldung geliefert, damit der Aufrufer eine Log-Meldung ausgeben
+        kann, statt still auf den DB-Stand zurueckzufallen. Die UI-Fenster
+        (SymbolsWindow) rufen diese Methode seit Nachtrag 3 NICHT mehr auf –
+        sie lesen ausschliesslich die gespeicherte Liste (get_symbols()).
+
+        Returns:
+            (symbols, status, error)
+            - symbols: immer die DB-Symbol-Liste (Fallback inklusive).
+            - status:  "live" bei erfolgreichem MT5-Fetch,
+                       "fallback" bei MT5-Ausfall (DB-Stand).
+            - error:   Fehlertext (oder None bei Erfolg).
+        """
+        try:
+            import MetaTrader5 as _mt5
+        except Exception as exc:
+            return self.get_symbols(), "fallback", f"MetaTrader5-Import fehlgeschlagen: {exc}"
+
+        try:
+            initialized = bool(_mt5.initialize())
+        except Exception as exc:
+            return self.get_symbols(), "fallback", f"mt5.initialize() Fehler: {exc}"
+        if not initialized:
+            return self.get_symbols(), "fallback", "MT5-Terminal nicht verfügbar (initialize() == False)"
+
+        try:
+            symbols = _mt5.symbols_get()
+        except Exception as exc:
+            return self.get_symbols(), "fallback", f"mt5.symbols_get() Fehler: {exc}"
+        if not symbols:
+            return self.get_symbols(), "fallback", "MT5 liefert keine Symbole (symbols_get() leer)"
+
+        try:
+            pairs = [(s.name, getattr(s, "path", "")) for s in symbols]
+            self.upsert_from_broker(pairs)
+        except Exception as exc:
+            return self.get_symbols(), "fallback", f"Upsert in broker_symbols fehlgeschlagen: {exc}"
+
+        return self.get_symbols(), "live", None
+
+
+# Bequeme Default-Instanz (kapselt app_data.duckdb) – fuer UI-Fenster.
+_symbol_repo_default: Optional[SymbolRepository] = None
+
+
+def get_symbol_repository() -> SymbolRepository:
+    """Liefert die app-weite Standard-Instanz (lazy, gebunden an app_data.duckdb)."""
+    global _symbol_repo_default
+    if _symbol_repo_default is None:
+        _symbol_repo_default = SymbolRepository()
+    return _symbol_repo_default
 
 ```
 
@@ -19470,6 +20311,985 @@ class LiveAnalyzer(QThread):
 
 --------------------------------------------------
 
+### DATEI: analytics/engine/analytics_repository.py
+```py
+# analytics/engine/analytics_repository.py
+"""
+analytics_repository.py - AnalyticsRepository (Phase 15.03).
+
+High-Level-Datenmethoden fuer die Analytics-UI (AnalyticsWindow).
+Delegiert lesend an den `FeatureStoreReader` (reiner Lese-Pfad auf den
+feature_store, Invariante 4 / MVVM) und bereitet die Rohdaten in die von
+den UI-Pages benoetigten Strukturen auf:
+
+    get_table()         – rohe Feature-Zeilen fuer die Tabellen-Seite
+    get_heatmap()       – 2D-Matrix (X: Wochentage, Y: Tagesstunden
+                          Berlin Wanduhr, Invariante 7)
+    get_scatter()       – X/Y-Paare zweier nativer Spalten
+    get_distribution()  – Histogramm (bins/counts) einer nativen Spalte
+
+Das Repository ist rein lesend (kein SQL in UI, keine Schreiboperationen) –
+die Profil-Persistenz (Option B / Explicit Save) liegt separat im
+`AnalyticsProfileRepository` (Schritt 2).
+
+E-1: Das Alt-Repository `analytics/statistics_repository.py` bleibt bis auf
+Weiteres unveraendert bestehen (genutzt vom Legacy-StatisticWindow); dieses
+Repository ist der Ersatz fuer die neue Analytics-UI (15.03).
+"""
+
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+
+from analytics.engine.feature_store_reader import (
+    FeatureStoreReader,
+    NATIVE_COLUMNS,
+    DOW_LABELS,
+    HOURS_PER_DAY,
+    DAYS_PER_WEEK,
+)
+
+# Vertraglich unterstuetzte Metriken fuer die Heatmap (count + native Spalten).
+HEATMAP_METRICS = ("count",) + NATIVE_COLUMNS
+
+
+class AnalyticsRepository:
+    """High-Level-Datenzugriff fuer die Analytics-UI (lesend)."""
+
+    def __init__(self, reader: Optional[FeatureStoreReader] = None) -> None:
+        self.reader = reader or FeatureStoreReader()
+
+    # ------------------------------------------------------------------
+    # Tabelle
+    # ------------------------------------------------------------------
+    def get_table(
+        self,
+        symbol: str,
+        timeframe: str,
+        feature_id: Optional[str] = None,
+        limit: Optional[int] = 1000,
+    ) -> Dict[str, Any]:
+        """Rohe Feature-Zeilen fuer die Tabellen-Seite.
+
+        Returns:
+            {"rows": [FeatureStoreReader-Zeilen...], "total": n}
+        """
+        rows = self.reader.fetch_rows(symbol, timeframe, feature_id=feature_id,
+                                      limit=limit)
+        return {"rows": rows, "total": len(rows)}
+
+    # ------------------------------------------------------------------
+    # Heatmap (X: Wochentage, Y: Tagesstunden Berlin Wanduhr)
+    # ------------------------------------------------------------------
+    def get_heatmap(
+        self,
+        symbol: str,
+        timeframe: str,
+        metric: str = "count",
+        feature_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """2D-Matrix (Wochentag x Tagesstunde) fuer die Heatmap-Seite.
+
+        Wanduhr-Garantie (Invariante 7): Die Extraktion von Wochentag/Stunde
+        erfolgt im Reader mit `bar_time AT TIME ZONE 'UTC'` (die gespeicherten
+        Werte sind Berlin-Wanduhr-encoded – die UTC-Darstellung IST die
+        Wanduhr-Zeit, kein Offset).
+
+        Returns:
+            {
+              "matrix":   7x24 (rows=Stunde 0-23, cols=DOW 0=So..6=Sa),
+              "x_labels": Wochentage, "y_labels": Stunden,
+              "metric", "symbol", "timeframe",
+            }
+        """
+        return self.reader.fetch_heatmap(
+            symbol, timeframe, metric=metric, feature_id=feature_id
+        )
+
+    # ------------------------------------------------------------------
+    # Scatter
+    # ------------------------------------------------------------------
+    def get_scatter(
+        self,
+        symbol: str,
+        timeframe: str,
+        x_column: str = "ema_diff",
+        y_column: str = "rsi_14",
+        feature_id: Optional[str] = None,
+        limit: Optional[int] = 1000,
+    ) -> Dict[str, Any]:
+        """X/Y-Paare zweier nativer Spalten fuer die Scatter-Seite.
+
+        Zeilen mit NULL in einer der beiden Spalten werden ausgelassen.
+        Unbekannte Spalten werden durch die Reader-Validierung abgefangen
+        (nur native Spalten erlaubt).
+
+        Returns:
+            {"points": [{"x": float, "y": float}, ...],
+             "x_label": x_column, "y_label": y_column,
+             "symbol", "timeframe", "total": n}
+        """
+        if x_column not in NATIVE_COLUMNS or y_column not in NATIVE_COLUMNS:
+            raise ValueError(
+                f"[AnalyticsRepository] Unbekannte Scatter-Spalten "
+                f"x='{x_column}', y='{y_column}' – erlaubt: {NATIVE_COLUMNS}."
+            )
+        rows = self.reader.fetch_columns(
+            symbol, timeframe, [x_column, y_column],
+            feature_id=feature_id, limit=limit,
+        )
+        points: List[Dict[str, float]] = []
+        for r in rows:
+            xv = r.get(x_column)
+            yv = r.get(y_column)
+            if xv is None or yv is None:
+                continue
+            if not (np.isfinite(xv) and np.isfinite(yv)):
+                continue
+            points.append({"x": xv, "y": yv})
+        return {
+            "points": points,
+            "x_label": x_column,
+            "y_label": y_column,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "total": len(points),
+        }
+
+    # ------------------------------------------------------------------
+    # Verteilung
+    # ------------------------------------------------------------------
+    def get_distribution(
+        self,
+        symbol: str,
+        timeframe: str,
+        column: str = "atr_normalized",
+        bins: int = 20,
+        feature_id: Optional[str] = None,
+        limit: Optional[int] = 1000,
+    ) -> Dict[str, Any]:
+        """Histogramm einer nativen Spalte fuer die Verteilungs-Seite.
+
+        Berechnet bin-Edges + counts mit numpy.histogram (NaN-/Inf-Werte
+        werden ausgelassen). Unbekannte Spalten werden abgefangen.
+
+        Returns:
+            {"bins": [edges...], "counts": [n...], "column": column,
+             "symbol", "timeframe", "total": n}
+        """
+        if column not in NATIVE_COLUMNS:
+            raise ValueError(
+                f"[AnalyticsRepository] Unbekannte Verteilungs-Spalte "
+                f"'{column}' – erlaubt: {NATIVE_COLUMNS}."
+            )
+        try:
+            n_bins = max(2, int(bins))
+        except (TypeError, ValueError):
+            n_bins = 20
+
+        rows = self.reader.fetch_columns(
+            symbol, timeframe, [column], feature_id=feature_id, limit=limit,
+        )
+        values = [r[column] for r in rows if r.get(column) is not None]
+        values = [v for v in values if np.isfinite(v)]
+        if not values:
+            return {
+                "bins": [], "counts": [], "column": column,
+                "symbol": symbol, "timeframe": timeframe, "total": 0,
+            }
+
+        counts, bin_edges = np.histogram(values, bins=n_bins)
+        return {
+            "bins": [float(e) for e in bin_edges],
+            "counts": [int(c) for c in counts],
+            "column": column,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "total": len(values),
+        }
+
+    # ------------------------------------------------------------------
+    # Jump-to-Chart (15.03 Schritt 5, Variante 2: open_chart_at_bar)
+    # ------------------------------------------------------------------
+    def get_latest_bar_time(
+        self,
+        symbol: str,
+        timeframe: str,
+        feature_id: Optional[str] = None,
+    ) -> Optional[int]:
+        """Neuester Wanduhr-Epoch (int) der Feature-Rows (oder None).
+
+        Fuer 'Jump-to-Chart' aus Scatter (ein Klick auf einen Punkt oeffnet
+        das Chart an der neuesten Feature-Bar des Symbol/Timeframe).
+        """
+        return self.reader.fetch_latest_bar_time(
+            symbol, timeframe, feature_id=feature_id
+        )
+
+    def get_recent_bar_time_for_cell(
+        self,
+        symbol: str,
+        timeframe: str,
+        dow: int,
+        hour: int,
+        feature_id: Optional[str] = None,
+    ) -> Optional[int]:
+        """Neuester Wanduhr-Epoch einer (dow, hour)-Heatmap-Zelle (oder None).
+
+        Fuer 'Jump-to-Chart' aus der Heatmap: Doppelklick auf eine Zelle
+        (Wochentag x Tagesstunde) oeffnet das Chart an der neuesten
+        Feature-Bar dieser Zelle (Wanduhr-Garantie, Invariante 7).
+        """
+        return self.reader.fetch_recent_bar_time_for_cell(
+            symbol, timeframe, dow, hour, feature_id=feature_id
+        )
+
+    # ------------------------------------------------------------------
+    # Metadaten
+    # ------------------------------------------------------------------
+    def available_timeframes(self, symbol: str) -> List[str]:
+        """Timeframes mit Feature-Store-Daten fuer ein Symbol (TF-Ausgrauung)."""
+        return self.reader.get_available_timeframes(symbol)
+
+    def get_available_features(
+        self, symbol: str, timeframe: str
+    ) -> Dict[str, Any]:
+        """Verfuegbare Plugin-IDs, native Spalten und Zeilenzahl."""
+        return self.reader.get_available_features(symbol, timeframe)
+
+    def available_heatmap_metrics(self) -> List[str]:
+        """Vertraglich unterstuetzte Heatmap-Metriken (fuer UI-Dropdowns)."""
+        return list(HEATMAP_METRICS)
+
+    @property
+    def native_columns(self) -> List[str]:
+        """Native Feature-Spalten (fuer Scatter-/Verteilungs-Dropdowns)."""
+        return list(NATIVE_COLUMNS)
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/engine/analytics_view_model.py
+```py
+# analytics/engine/analytics_view_model.py
+"""
+analytics_view_model.py - AnalyticsViewModel (Phase 15.03 Schritt 4).
+
+Vermittelt zwischen `AnalyticsRepository` (+ `FeatureStoreReader`), dem
+asynchronen `AnalyticsAsyncWorker` und den UI-Pages (analytics/ui/*,
+Invariante 4 / MVVM). KEIN SQL, KEIN UI-Code – nur Qt-Core (QObject/QTimer)
+und Repositories. Datenfluss:
+
+    UI-Page -> set_*()/request_*() -> ViewModel (Debounce-QTimer 250 ms)
+    -> AnalyticsAsyncWorker (QThread) -> data_ready(query_kind, data)
+
+Aufgaben (15.03-Spezifikation):
+1. Datenfluss: UI-Pages fordern Daten ueber `request_*()` an; der ViewModel
+   puffert die aktuellen Parameter, debounced (QTimer, 200-300 ms) und
+   startet bei Bedarf einen Async-Worker. Parameternaenderungen (Slider
+   usw.) feuern die betroffenen Abfragen automatisch nach.
+2. Profil-Verwaltung (Option B – Explicit Save): Aktives Profil via
+   `AnalyticsProfileRepository`; Parametertrends setzen das Dirty-Flag
+   (`*` im Titel/Combo); gespeichert wird erst auf `save_profile()`.
+3. Max-Lookback-Cap: `MAX_LOOKBACK_LIMIT = 50_000` (hart, 15.03-Spez).
+4. EventBus: Profilwechsel wird auf `event_bus.profile_changed(str)`
+   emittiert (Invariante 5 / zentraler EventBus, Payload = Profil-Name).
+"""
+
+from typing import Any, Dict, Iterable, List, Optional
+
+from PySide6.QtCore import QObject, QTimer, Signal
+
+from analytics.engine.analytics_repository import AnalyticsRepository
+from analytics.engine.analytics_worker import (
+    QUERY_TABLE,
+    QUERY_HEATMAP,
+    QUERY_SCATTER,
+    QUERY_DISTRIBUTION,
+    QUERY_FEATURES,
+    MAX_LOOKBACK_LIMIT,
+    AnalyticsAsyncWorker,
+)
+from analytics_profile_repository import (
+    AnalyticsProfileRepository,
+    get_analytics_profile_repository,
+    SCHEMA_VERSION_DEFAULT,
+)
+from config.event_bus import event_bus
+
+# QTimer-Debounce (15.03-Spezifikation: 200-300 ms) gegen SQL-Feuer.
+DEBOUNCE_MS = 250
+
+# Default-Parameter (Anfangs-Parametrisierung der Analytics-Ansichten).
+DEFAULT_BINS = 20
+DEFAULT_LIMIT = 5000
+
+
+class AnalyticsViewModel(QObject):
+    """MVVM-ViewModel der Analytics-Engine (kein SQL, kein UI)."""
+
+    # Datenfluss-Signale (query_kind -> Ergebnis/Fehler)
+    data_ready = Signal(str, dict)
+    query_failed = Signal(str, str)
+    busy_changed = Signal(bool)  # Progress-Spinner an/aus
+
+    # Profil-Signale (Option B – Explicit Save)
+    active_profile_changed = Signal(object)  # Profil-Dict oder None
+    dirty_changed = Signal(bool)             # '*' im Titel/Combo
+    profile_saved = Signal(str)              # profile_id
+    profile_deleted = Signal(str)            # profile_id
+    profiles_available = Signal(list)        # Liste der Profile
+
+    def __init__(
+        self,
+        analytics_repo: Optional[AnalyticsRepository] = None,
+        profile_repo: Optional[AnalyticsProfileRepository] = None,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._repo = analytics_repo or AnalyticsRepository()
+        self._profile_repo = profile_repo or get_analytics_profile_repository()
+
+        # Aktuelle Ansichtsparameter (werden im Profil-Payload persistiert).
+        self._params: Dict[str, Any] = {
+            "symbol": "",
+            "timeframe": "M1",
+            "feature_id": None,
+            "heatmap_metric": "count",
+            "scatter_x": "ema_diff",
+            "scatter_y": "rsi_14",
+            "distribution_column": "atr_normalized",
+            "bins": DEFAULT_BINS,
+            "limit": DEFAULT_LIMIT,
+        }
+        self._pending_kinds: List[str] = []
+        self._worker: Optional[AnalyticsAsyncWorker] = None
+        self._dirty = False
+        self._active_profile: Optional[Dict[str, Any]] = None
+        self._profiles: List[Dict[str, Any]] = []
+
+        # Debounce-QTimer (200-300 ms, 15.03-Spezifikation)
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(DEBOUNCE_MS)
+        self._debounce.timeout.connect(self._start_next_query)
+
+    # ------------------------------------------------------------------
+    # Lebenszyklus
+    # ------------------------------------------------------------------
+    def shutdown(self) -> None:
+        """Stoppt Debounce + laufenden Worker und wartet dessen Ende ab.
+
+        Fix 15.03 (Haenger bei TF-Wechsel): Der Worker wird gecancelt (Flag)
+        und mit wait() abgewartet (Queries sind schnell, < 1 s). Ohne wait()
+        wuerde der noch laufende QThread beim Zerstoeren des Fensters/
+        ViewModel abgebrochen ('QThread: Destroyed while thread is still
+        running') – die App haengt. self._worker wird vorher auf None gesetzt,
+        damit verspaetete Signale des alten Workers vom Guard in
+        _on_finished/_on_failed verworfen werden.
+        """
+        self._debounce.stop()
+        self._pending_kinds.clear()
+        worker = self._worker
+        self._worker = None
+        if worker is not None:
+            worker.cancel()
+            if worker.isRunning():
+                worker.wait(5000)
+
+    # ------------------------------------------------------------------
+    # Datenfluss: UI-Pages fordern Abfragen an (MVVM)
+    # ------------------------------------------------------------------
+    def request_table(self) -> None:
+        self._refresh((QUERY_TABLE,))
+
+    def request_heatmap(self) -> None:
+        self._refresh((QUERY_HEATMAP,))
+
+    def request_scatter(self) -> None:
+        self._refresh((QUERY_SCATTER,))
+
+    def request_distribution(self) -> None:
+        self._refresh((QUERY_DISTRIBUTION,))
+
+    def request_features(self) -> None:
+        self._refresh((QUERY_FEATURES,))
+
+    def refresh_all(self) -> None:
+        """Stoesst alle Abfragen neu an (Seiten-/Profilwechsel)."""
+        self._refresh((QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
+                       QUERY_DISTRIBUTION, QUERY_FEATURES))
+
+    # ------------------------------------------------------------------
+    # Parameter setzen (UI-Pages) – markieren Dirty + feuern betroffen ab
+    # ------------------------------------------------------------------
+    def set_symbol(self, symbol: str) -> None:
+        self._set_param("symbol", str(symbol or ""),
+                        (QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
+                         QUERY_DISTRIBUTION, QUERY_FEATURES))
+
+    def set_timeframe(self, timeframe: str) -> None:
+        self._set_param("timeframe", str(timeframe or "M1"),
+                        (QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
+                         QUERY_DISTRIBUTION, QUERY_FEATURES))
+
+    def set_feature_id(self, feature_id: Optional[str]) -> None:
+        self._set_param("feature_id", feature_id or None,
+                        (QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
+                         QUERY_DISTRIBUTION))
+
+    def set_heatmap_metric(self, metric: str) -> None:
+        self._set_param("heatmap_metric", str(metric or "count"),
+                        (QUERY_HEATMAP,))
+
+    def set_scatter_columns(self, x_column: str, y_column: str) -> None:
+        self._set_param("scatter_x", str(x_column or "ema_diff"),
+                        (QUERY_SCATTER,))
+        self._set_param("scatter_y", str(y_column or "rsi_14"),
+                        (QUERY_SCATTER,))
+
+    def set_distribution_column(self, column: str) -> None:
+        self._set_param("distribution_column",
+                        str(column or "atr_normalized"),
+                        (QUERY_DISTRIBUTION,))
+
+    def set_bins(self, bins: int) -> None:
+        new_bins = self._clamp_bins(bins)
+        if new_bins != self._params["bins"]:
+            self._params["bins"] = new_bins
+            self._mark_dirty()
+            self._refresh((QUERY_DISTRIBUTION,))
+
+    def set_limit(self, limit: int) -> None:
+        new_limit = self._clamp_limit(limit)
+        if new_limit != self._params["limit"]:
+            self._params["limit"] = new_limit
+            self._mark_dirty()
+            self._refresh((QUERY_TABLE, QUERY_SCATTER, QUERY_DISTRIBUTION))
+
+    def _set_param(self, key: str, value: Any, kinds: Iterable[str]) -> None:
+        if self._params.get(key) == value:
+            return
+        self._params[key] = value
+        self._mark_dirty()
+        self._refresh(kinds)
+
+    # ------------------------------------------------------------------
+    # Interna: Debounce + Worker-Verwaltung
+    # ------------------------------------------------------------------
+    def _refresh(self, kinds: Iterable[str]) -> None:
+        for kind in kinds:
+            if kind not in self._pending_kinds:
+                self._pending_kinds.append(kind)
+        self._debounce.start()
+
+    def _start_next_query(self) -> None:
+        """Startet die naechste gepufferte Abfrage (Debounce-Timeout)."""
+        if self._worker is not None and self._worker.isRunning():
+            return  # laufender Worker uebernimmt; Puffer bleibt gefuellt
+        while self._pending_kinds:
+            kind = self._pending_kinds.pop(0)
+            params = self._current_params(kind)
+            if params is None:
+                continue  # kein Symbol/Timeframe -> Abfrage ueberspringen
+            self._launch(kind, params)
+            return
+        self.busy_changed.emit(False)
+
+    def _launch(self, kind: str, params: Dict[str, Any]) -> None:
+        worker = AnalyticsAsyncWorker(self._repo, kind, params, parent=self)
+        self._worker = worker
+        worker.finished_ok.connect(self._on_finished)
+        worker.failed.connect(self._on_failed)
+        worker.finished.connect(worker.deleteLater)
+        self.busy_changed.emit(True)
+        worker.start()
+
+    def _on_finished(self, worker, kind: str, result: Dict[str, Any]) -> None:
+        """Verarbeitet das Ergebnis eines Workers – NUR des aktuellen.
+
+        Fix 15.03 (Haenger bei TF-Wechsel): Race-Condition, bei der ein
+        veralteter Worker (Thread bereits beendet, finished_ok noch nicht
+        zugestellt, waehrend der Debounce bereits einen neuen Worker startet)
+        den self._worker-Verweis ueberschrieb und mehrere Worker parallel
+        liefen. Der Guard `self._worker is worker` verwirft verspaetete
+        Ergebnisse veralteter Worker; nur der zuletzt gestartete Worker darf
+        weiterverarbeiten.
+        """
+        if self._worker is not worker:
+            return
+        self._worker = None
+        self.data_ready.emit(kind, result)
+        self._start_next_query()
+
+    def _on_failed(self, worker, kind: str, error: str) -> None:
+        """Verarbeitet einen Worker-Fehler – NUR des aktuellen (Race-Guard).
+
+        Siehe _on_finished: Verspaetete Fehler veralteter Worker werden
+        verworfen, damit der laufende/naechste Worker nicht gestoert wird.
+        """
+        if self._worker is not worker:
+            return
+        self._worker = None
+        self.query_failed.emit(kind, error)
+        self._start_next_query()
+
+    def _current_params(self, kind: str) -> Optional[Dict[str, Any]]:
+        """Baut die Abfrageparameter fuer einen query_kind (oder None)."""
+        p = self._params
+        if not p.get("symbol") or not p.get("timeframe"):
+            return None
+        base: Dict[str, Any] = {
+            "symbol": p["symbol"],
+            "timeframe": p["timeframe"],
+            "feature_id": p["feature_id"],
+        }
+        if kind == QUERY_TABLE:
+            base["limit"] = p["limit"]
+        elif kind == QUERY_HEATMAP:
+            base["metric"] = p["heatmap_metric"]
+        elif kind == QUERY_SCATTER:
+            base["x_column"] = p["scatter_x"]
+            base["y_column"] = p["scatter_y"]
+            base["limit"] = p["limit"]
+        elif kind == QUERY_DISTRIBUTION:
+            base["column"] = p["distribution_column"]
+            base["bins"] = p["bins"]
+            base["limit"] = p["limit"]
+        return base
+
+    # ------------------------------------------------------------------
+    # Dirty-Flag (Option B – Explicit Save)
+    # ------------------------------------------------------------------
+    def _mark_dirty(self) -> None:
+        """Nur bei vorhandenem aktivem Profil (sonst nichts zu speichern)."""
+        if not self._dirty and self._active_profile is not None:
+            self._dirty = True
+            self.dirty_changed.emit(True)
+
+    # ------------------------------------------------------------------
+    # Profil-Verwaltung (CRUD + aktives Profil)
+    # ------------------------------------------------------------------
+    def load_profiles(self) -> None:
+        """Laedt die Profil-Liste und wendet das aktive Profil an."""
+        self._profiles = self._profile_repo.list_profiles()
+        self.profiles_available.emit([dict(p) for p in self._profiles])
+        active = self._profile_repo.get_active_profile()
+        if active is not None:
+            self._apply_profile(active, mark_dirty=False)
+        elif self._active_profile is not None:
+            self._active_profile = None
+            self._dirty = False
+            self.dirty_changed.emit(False)
+            self.active_profile_changed.emit(None)
+
+    def create_profile(
+        self, name: str, description: str = ""
+    ) -> Optional[str]:
+        """Legt ein neues Profil mit den aktuellen Parametern an.
+
+        Das neue Profil wird sofort aktiv (genau EIN aktives Profil).
+        Raises ValueError bei doppeltem Namen.
+        """
+        name = (name or "").strip()
+        if not name:
+            return None
+        if self._profile_repo.get_profile_by_name(name) is not None:
+            raise ValueError(f"Profil '{name}' existiert bereits.")
+        profile_id = self._profile_repo.create_profile(
+            name, self._current_payload(), description
+        )
+        self._profile_repo.set_active(profile_id)
+        self._profiles = self._profile_repo.list_profiles()
+        self.profiles_available.emit([dict(p) for p in self._profiles])
+        self._active_profile = self._profile_repo.get_profile(profile_id)
+        self._dirty = False
+        self.dirty_changed.emit(False)
+        self.active_profile_changed.emit(dict(self._active_profile))
+        self._emit_profile_changed(self._active_profile["name"])
+        return profile_id
+
+    def save_profile(self) -> bool:
+        """Persistiert die aktuellen Parameter im aktiven Profil (Save).
+
+        Returns:
+            True, wenn ein aktives Profil existierte und gespeichert wurde.
+        """
+        if self._active_profile is None:
+            return False
+        profile_id = self._active_profile["profile_id"]
+        ok = self._profile_repo.update_profile(
+            profile_id, payload=self._current_payload()
+        )
+        if ok:
+            self._active_profile = self._profile_repo.get_profile(profile_id)
+            self._dirty = False
+            self.dirty_changed.emit(False)
+            self.profile_saved.emit(profile_id)
+            self._emit_profile_changed(self._active_profile["name"])
+        return ok
+
+    def update_profile(
+        self,
+        profile_id: str,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> bool:
+        """Aktualisiert Name/Beschreibung eines Profils (additiv)."""
+        ok = self._profile_repo.update_profile(
+            profile_id, name=name, description=description
+        )
+        if ok:
+            self._profiles = self._profile_repo.list_profiles()
+            self.profiles_available.emit([dict(p) for p in self._profiles])
+            if (self._active_profile is not None
+                    and self._active_profile["profile_id"] == profile_id):
+                self._active_profile = self._profile_repo.get_profile(profile_id)
+                self.active_profile_changed.emit(dict(self._active_profile))
+                self._emit_profile_changed(self._active_profile["name"])
+        return ok
+
+    def delete_profile(self, profile_id: str) -> bool:
+        """Loescht ein Profil (hart). Aktives Profil wird zurueckgesetzt."""
+        ok = self._profile_repo.delete_profile(profile_id)
+        if not ok:
+            return False
+        was_active = (self._active_profile is not None
+                      and self._active_profile["profile_id"] == profile_id)
+        if was_active:
+            self._active_profile = None
+            self._dirty = False
+            self.dirty_changed.emit(False)
+            self.active_profile_changed.emit(None)
+        self._profiles = self._profile_repo.list_profiles()
+        self.profiles_available.emit([dict(p) for p in self._profiles])
+        self.profile_deleted.emit(profile_id)
+        return True
+
+    def set_active_profile(self, profile_id: str) -> bool:
+        """Setzt ein Profil als aktiv und wendet dessen Parameter an."""
+        profile = self._profile_repo.get_profile(profile_id)
+        if profile is None:
+            return False
+        self._profile_repo.set_active(profile_id)
+        self._apply_profile(profile, mark_dirty=False)
+        self.active_profile_changed.emit(dict(profile))
+        self._emit_profile_changed(profile["name"])
+        return True
+
+    def _apply_profile(
+        self, profile: Dict[str, Any], mark_dirty: bool = True
+    ) -> None:
+        """Uebernimmt die Profil-Parameter in die Ansicht (Explicit Save)."""
+        self._active_profile = dict(profile)
+        payload = profile.get("payload") or {}
+        for key in list(self._params.keys()):
+            if key in payload and payload[key] is not None:
+                self._params[key] = payload[key]
+        self._params["bins"] = self._clamp_bins(self._params.get("bins"))
+        self._params["limit"] = self._clamp_limit(self._params.get("limit"))
+        if not mark_dirty:
+            self._dirty = False
+            self.dirty_changed.emit(False)
+        self.refresh_all()
+
+    def _current_payload(self) -> Dict[str, Any]:
+        """Profil-Payload aus den aktuellen Ansichtsparametern."""
+        payload = dict(self._params)
+        payload["schema_version"] = SCHEMA_VERSION_DEFAULT
+        return payload
+
+    @staticmethod
+    def _emit_profile_changed(name: str) -> None:
+        """Emittiert profile_changed auf dem zentralen EventBus."""
+        event_bus.profile_changed.emit(name or "")
+
+    # ------------------------------------------------------------------
+    # Jump-to-Chart-Resolution (15.03 Schritt 5, Variante 2)
+    # ------------------------------------------------------------------
+    def resolve_latest_bar_time(
+        self, symbol: str, timeframe: str
+    ) -> Optional[int]:
+        """Neuester Wanduhr-Epoch fuer 'Jump-to-Chart' (oder None).
+
+        Schnelle Punktabfrage (PK-Index) fuer Klick-auf-Punkt aus dem
+        Scatter – delegiert lesend an das AnalyticsRepository (kein SQL
+        im ViewModel).
+        """
+        return self._repo.get_latest_bar_time(
+            symbol, timeframe, feature_id=self._params.get("feature_id")
+        )
+
+    def resolve_recent_bar_time_for_cell(
+        self, symbol: str, timeframe: str, dow: int, hour: int
+    ) -> Optional[int]:
+        """Neuester Wanduhr-Epoch einer (dow, hour)-Zelle (oder None).
+
+        Jump-to-Chart aus der Heatmap (Doppelklick auf eine Zelle) –
+        delegiert lesend an das AnalyticsRepository.
+        """
+        return self._repo.get_recent_bar_time_for_cell(
+            symbol, timeframe, dow, hour,
+            feature_id=self._params.get("feature_id"),
+        )
+
+    # ------------------------------------------------------------------
+    # Clamping (Typ- & Werte-Sicherheit)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _clamp_bins(value: Any) -> int:
+        try:
+            return max(2, int(value))
+        except (TypeError, ValueError):
+            return DEFAULT_BINS
+
+    @staticmethod
+    def _clamp_limit(value: Any) -> int:
+        if value is None:
+            return DEFAULT_LIMIT
+        try:
+            return max(1, min(int(value), MAX_LOOKBACK_LIMIT))
+        except (TypeError, ValueError):
+            return DEFAULT_LIMIT
+
+    # ------------------------------------------------------------------
+    # Lesende Zugriffe fuer UI-Pages
+    # ------------------------------------------------------------------
+    @property
+    def params(self) -> Dict[str, Any]:
+        """Kopie der aktuellen Ansichtsparameter (fuer UI-Kontrolle)."""
+        return dict(self._params)
+
+    @property
+    def active_profile(self) -> Optional[Dict[str, Any]]:
+        """Kopie des aktiven Profils (oder None)."""
+        return dict(self._active_profile) if self._active_profile else None
+
+    @property
+    def profiles(self) -> List[Dict[str, Any]]:
+        """Kopie der Profil-Liste (deterministisch nach Name sortiert)."""
+        return [dict(p) for p in self._profiles]
+
+    @property
+    def is_dirty(self) -> bool:
+        """True, wenn ungespeicherte Parametertrends vorliegen ('*')."""
+        return self._dirty
+
+    @property
+    def heatmap_metrics(self) -> List[str]:
+        """Verfuegbare Heatmap-Metriken (fuer UI-Dropdown)."""
+        return self._repo.available_heatmap_metrics()
+
+    @property
+    def native_columns(self) -> List[str]:
+        """Native Feature-Spalten (fuer Scatter-/Verteilungs-Dropdown)."""
+        return self._repo.native_columns
+
+    @property
+    def max_lookback_limit(self) -> int:
+        """Max-Lookback-Cap (UI-Slider-Maximum)."""
+        return MAX_LOOKBACK_LIMIT
+
+    def available_timeframes(self, symbol: str) -> List[str]:
+        """Timeframes mit Feature-Store-Daten fuer ein Symbol (TF-Ausgrauung).
+
+        Delegiert lesend an das AnalyticsRepository (kein SQL im ViewModel).
+        Bei Fehlern wird eine leere Liste geliefert; die UI kann dann alle
+        Timeframes aktiv lassen (Fallback).
+        """
+        try:
+            return self._repo.available_timeframes(str(symbol or ""))
+        except Exception:
+            return []
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/engine/analytics_worker.py
+```py
+# analytics/engine/analytics_worker.py
+"""
+analytics_worker.py - AnalyticsAsyncWorker (Phase 15.03 Schritt 4).
+
+Asynchroner DuckDB-Query-Worker (QThread) fuer die Analytics-UI.
+
+Entkopplung (Invariante 4 / MVVM):
+    DuckDB -> FeatureStoreReader/AnalyticsRepository -> AnalyticsAsyncWorker
+    -> AnalyticsViewModel -> UI-Pages
+
+Der Worker fuehrt EINE einzelne Datenabfrage (Tabelle, Heatmap, Scatter,
+Verteilung, Metadaten) in einem separaten QThread aus, damit die GUI nicht
+blockiert (Analogie: ServiceSetRunWorker / LiveAnalyzer). Die DB-Zugriffe
+laufen ueber `AnalyticsRepository`/`FeatureStoreReader` – beide nutzen den
+Thread-local `DbPool` (eine Connection pro Thread & DB-Datei,
+Thread-Safety-Invariante 6); der Worker-Thread erhaelt dadurch automatisch
+seine eigene Connection und blockiert nie den App-Hauptthread.
+
+Max-Lookback-Cap (15.03-Spezifikation): `MAX_LOOKBACK_LIMIT = 50_000`
+deckelt alle limit-Parameter hart nach oben – gegen SQL-Feuer / UI-Freeze.
+
+Signale (werden vom Worker-Thread emittiert; Qt stellt die Queued
+Connection zum ViewModel im Hauptthread her):
+    finished_ok = Signal(object, str, dict)   – worker, query_kind, Ergebnis
+    failed      = Signal(object, str, str)    – worker, query_kind, Fehlermeldung
+
+Die Worker-Referenz im Signal ist Teil des Race-Fix (15.03): Das ViewModel
+kann damit verspaetete Ergebnisse veralteter Worker verwerfen (Guard
+`self._worker is worker`).
+
+Der Worker ist EINWEG (eine Abfrage pro Instanz). Das ViewModel erzeugt pro
+Abfrage eine neue Instanz; die Qt-Elternschaft (parent) haelt die Instanz
+am Leben und `worker.finished.connect(worker.deleteLater)` raeumt auf.
+
+Abfrage-Typen (query_kind, Single Source of Truth fuer Worker & ViewModel):
+    QUERY_TABLE        – rohe Feature-Zeilen (Tabellen-Seite)
+    QUERY_HEATMAP      – 2D-Matrix Wochentag x Tagesstunde (Berlin Wanduhr)
+    QUERY_SCATTER      – X/Y-Paare zweier nativer Spalten
+    QUERY_DISTRIBUTION – Histogramm (bins/counts)
+    QUERY_FEATURES     – Metadaten (Plugin-IDs, Spalten, Zeilenzahl)
+"""
+
+from typing import Any, Dict, Optional
+
+from PySide6.QtCore import QThread, Signal
+
+# Abfrage-Typen (query_kind).
+QUERY_TABLE = "table"
+QUERY_HEATMAP = "heatmap"
+QUERY_SCATTER = "scatter"
+QUERY_DISTRIBUTION = "distribution"
+QUERY_FEATURES = "features"
+
+# Max-Lookback-Cap (15.03-Spezifikation): Keine Abfrage darf mehr als
+# 50.000 Zeilen anfordern.
+MAX_LOOKBACK_LIMIT = 50_000
+
+
+def cap_lookback_limit(value: Optional[int]) -> Optional[int]:
+    """Deckelt einen limit-Wert hart auf MAX_LOOKBACK_LIMIT.
+
+    None (Repo-Default) bleibt None; ungueltige Werte -> None.
+    """
+    if value is None:
+        return None
+    try:
+        return max(1, min(int(value), MAX_LOOKBACK_LIMIT))
+    except (TypeError, ValueError):
+        return None
+
+
+class AnalyticsAsyncWorker(QThread):
+    """Fuehrt eine einzelne Analytics-Datenabfrage im Hintergrund aus.
+
+    EINWEG-Worker: Eine Abfrage pro Instanz. Das ViewModel erzeugt bei
+    Bedarf neue Instanzen und verbindet finished_ok/failed.
+    """
+
+    finished_ok = Signal(object, str, dict)  # worker, query_kind, Ergebnis-Dict
+    failed = Signal(object, str, str)        # worker, query_kind, Fehlermeldung
+
+    def __init__(
+        self,
+        repository: Any,
+        query_kind: str,
+        params: Optional[Dict[str, Any]] = None,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._repository = repository
+        self._query_kind = query_kind
+        self._params = dict(params or {})
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """Bricht die Abfrage ab (Ergebnis-Signale werden unterdrueckt)."""
+        self._cancelled = True
+
+    def run(self) -> None:  # noqa: D102
+        if self._cancelled:
+            return
+        try:
+            result = self._execute()
+        except Exception as e:
+            if not self._cancelled:
+                self.failed.emit(self, self._query_kind, str(e))
+            return
+        finally:
+            # Connection-Leak vermeiden (Fix 15.03): Die im Worker-Thread
+            # ueber DbPool geoeffnete DuckDB-Connection wird am Ende
+            # freigegeben – sonst bleibt pro Abfrage ein offenes Datei-Handle
+            # zurueck und die App haengt nach vielen Abfragen (TF-Wechsel).
+            self._release_thread_connections()
+        if not self._cancelled:
+            self.finished_ok.emit(self, self._query_kind, result)
+
+    def _release_thread_connections(self) -> None:
+        """Gibt die DuckDB-Connections des Worker-Threads frei (Leak-Fix).
+
+        DbPool.close_all() schliesst die Thread-lokalen Connections des
+        aktuellen Threads (und dekrementiert den globalen Referenzzaehler).
+        Jeder neue Worker-Thread erhaelt beim naechsten Zugriff automatisch
+        eine frische Connection.
+        """
+        try:
+            from db_service import DbPool
+            DbPool.close_all()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Dispatch auf die Repository-Methoden (lesend, kein SQL hier)
+    # ------------------------------------------------------------------
+    def _execute(self) -> Dict[str, Any]:
+        repo = self._repository
+        p = self._params
+        symbol = str(p.get("symbol", "") or "")
+        timeframe = str(p.get("timeframe", "") or "")
+        feature_id = p.get("feature_id")
+
+        if self._query_kind == QUERY_TABLE:
+            return repo.get_table(
+                symbol, timeframe,
+                feature_id=feature_id,
+                limit=cap_lookback_limit(p.get("limit")),
+            )
+        if self._query_kind == QUERY_HEATMAP:
+            return repo.get_heatmap(
+                symbol, timeframe,
+                metric=str(p.get("metric", "count") or "count"),
+                feature_id=feature_id,
+            )
+        if self._query_kind == QUERY_SCATTER:
+            return repo.get_scatter(
+                symbol, timeframe,
+                x_column=str(p.get("x_column", "ema_diff") or "ema_diff"),
+                y_column=str(p.get("y_column", "rsi_14") or "rsi_14"),
+                feature_id=feature_id,
+                limit=cap_lookback_limit(p.get("limit")),
+            )
+        if self._query_kind == QUERY_DISTRIBUTION:
+            return repo.get_distribution(
+                symbol, timeframe,
+                column=str(p.get("column", "atr_normalized") or "atr_normalized"),
+                bins=p.get("bins", 20),
+                feature_id=feature_id,
+                limit=cap_lookback_limit(p.get("limit")),
+            )
+        if self._query_kind == QUERY_FEATURES:
+            return repo.get_available_features(symbol, timeframe)
+
+        raise ValueError(
+            f"[AnalyticsAsyncWorker] Unbekannte Abfrage '{self._query_kind}' – "
+            f"erlaubt: {QUERY_TABLE}, {QUERY_HEATMAP}, {QUERY_SCATTER}, "
+            f"{QUERY_DISTRIBUTION}, {QUERY_FEATURES}."
+        )
+
+```
+
+--------------------------------------------------
+
 ### DATEI: analytics/engine/description_dialog.py
 ```py
 # analytics/engine/description_dialog.py
@@ -19662,6 +21482,514 @@ class ServiceDescriptionDialog(QDialog):
             + "".join(parts)
             + "</body></html>"
         )
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/engine/feature_store_reader.py
+```py
+# analytics/engine/feature_store_reader.py
+"""
+feature_store_reader.py - FeatureStoreReader (Phase 15.03).
+
+Reiner Lese-Zugriff auf die `feature_store`-Tabelle in `analytics.duckdb`
+(Invariante 4 / MVVM: DuckDB -> FeatureStoreReader -> AnalyticsRepository
+-> ViewModel -> UI). Der Reader fuehrt KEINE Berechnungen aus und schreibt
+NIE in die DB – er kapselt ausschliesslich lesende DuckDB-Abfragen.
+
+Datenmodell feature_store (Hybrid-Schema, Phasen 12+):
+    symbol, timeframe, bar_time TIMESTAMPTZ, ema_diff, rsi_14,
+    atr_normalized, created_at, feature_id, plugin_version,
+    feature_data JSON (FeatureStorePayload des Plugins)
+
+Wanduhr-Garantie (Invariante 7, 15.03-Spez: Heatmap X/Y):
+    Die gespeicherten bar_time-Werte sind Berlin-Wanduhr-encoded (MT5
+    liefert Wanduhr-Epochs, die 1:1 als UTC-Darstellung in die DB
+    geschrieben werden; EXTRACT('epoch' FROM bar_time) liefert exakt diese
+    Wanduhr-Epochs). Fuer Wochentag/Stunde (Heatmap) wird DAHER die
+    UTC-Forcierung `bar_time AT TIME ZONE 'UTC'` verwendet – OHNE sie
+    rechnet DuckDB in die System-Lokalzeit um (Berlin +2h/+1h) und die
+    Heatmap waere um den Offset verschoben (DST-bruchig, Invariante 7).
+
+E-3 (schema_version-Pflichtfeld): Alte feature_store-Rows ohne
+`schema_version` in feature_data erhalten beim Lesen den Default `"1.0"` –
+die DB-Zeile bleibt unveraendert (Lesen ist rein).
+"""
+
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+
+from db_service import DbPool, _parse_json_field
+
+# Projekt-Root = 2 Ebenen ueber dieser Datei (engine/ -> analytics/ -> Root)
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+DB_ANALYTICS = str(BASE_DIR / "data" / "analytics.duckdb")
+
+# E-3: schema_version-Default fuer Alt-Rows ohne Pflichtfeld (analog
+# GridLiquidityIndicator-Lesepfad: Default "1.0").
+SCHEMA_VERSION_DEFAULT = "1.0"
+
+# Native Feature-Spalten der feature_store-Tabelle (fuer Heatmap-Metriken,
+# Scatter-/Verteilungs-Achsen). Keine JSON-Feld-Pfade – nur echte Spalten.
+NATIVE_COLUMNS = ("ema_diff", "rsi_14", "atr_normalized")
+
+# Heatmap-Achsen (15.03-Spezifikation): X = Wochentage, Y = Tagesstunden
+# Berlin Wanduhr. Matrix: rows = Stunde (0-23), cols = DOW (0=Sonntag..6).
+DOW_LABELS = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"]
+HOURS_PER_DAY = 24
+DAYS_PER_WEEK = 7
+
+
+class FeatureStoreReader:
+    """Kapselt rein lesend DuckDB-Abfragen auf den feature_store."""
+
+    def __init__(self, db_path: str = DB_ANALYTICS) -> None:
+        self.db_path = db_path
+
+    # ------------------------------------------------------------------
+    # Interna
+    # ------------------------------------------------------------------
+    def _get_connection(self):
+        return DbPool.get(self.db_path)
+
+    @staticmethod
+    def _normalize_feature_data(raw: Any) -> Dict[str, Any]:
+        """Parst feature_data (str->dict) und stellt schema_version sicher.
+
+        E-3: Fehlt das Pflichtfeld `schema_version` (Alt-Rows), wird es beim
+        Lesen additiv mit dem Default `"1.0"` ergaenzt – die DB-Zeile bleibt
+        unveraendert (rein lesender Reader).
+        """
+        data = _parse_json_field(raw) or {}
+        data = dict(data)
+        data.setdefault("schema_version", SCHEMA_VERSION_DEFAULT)
+        return data
+
+    @staticmethod
+    def _epoch_of(bar_time: Any) -> int:
+        """Wandelt bar_time (datetime/epoch) in die Wanduhr-Epoch (int) um.
+
+        Verwendet .timestamp() auf der UTC-Darstellung – das liefert exakt
+        die gespeicherte Wanduhr-encoded Epoch (konsistent zum Chart und zu
+        statistics_repository.fetch_signals).
+        """
+        if hasattr(bar_time, "timestamp"):
+            return int(bar_time.timestamp())
+        return int(bar_time)
+
+    # ------------------------------------------------------------------
+    # Lesen: Roh-Zeilen
+    # ------------------------------------------------------------------
+    def fetch_rows(
+        self,
+        symbol: str,
+        timeframe: str,
+        feature_id: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Liefert Feature-Store-Zeilen als Dicts (zeilen-aufwaerts sortiert).
+
+        Jede Zeile enthaelt:
+            time          – Wanduhr-Epoch (int, bar_time)
+            symbol/timeframe – Filterwerte
+            feature_id    – Plugin-ID (oder None)
+            plugin_version– Plugin-Version (oder None)
+            ema_diff/rsi_14/atr_normalized – native Spalten (oder None)
+            feature_data  – geparstes JSON inkl. schema_version-Default (E-3)
+
+        Args:
+            symbol: Symbol-Name (case-insensitive)
+            timeframe: Timeframe (case-insensitive)
+            feature_id: Optionaler Filter auf die Plugin-ID
+            limit: Maximale Anzahl Zeilen (Default 1000)
+        """
+        if not symbol or not timeframe:
+            return []
+        if limit is None:
+            limit = 1000
+        conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
+        params: List[Any] = [symbol, timeframe]
+        if feature_id:
+            conditions.append("feature_id = ?")
+            params.append(feature_id)
+
+        con = self._get_connection()
+        try:
+            rows = con.execute(f"""
+                SELECT
+                    bar_time,
+                    symbol,
+                    timeframe,
+                    feature_id,
+                    plugin_version,
+                    ema_diff,
+                    rsi_14,
+                    atr_normalized,
+                    feature_data
+                FROM feature_store
+                WHERE {' AND '.join(conditions)}
+                ORDER BY bar_time ASC
+                LIMIT ?
+            """, params + [limit]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_rows fehlgeschlagen: {e}")
+            return []
+
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            out.append({
+                "time": self._epoch_of(r[0]),
+                "symbol": str(r[1]),
+                "timeframe": str(r[2]),
+                "feature_id": str(r[3]) if r[3] is not None else None,
+                "plugin_version": str(r[4]) if r[4] is not None else None,
+                "ema_diff": self._float_or_none(r[5]),
+                "rsi_14": self._float_or_none(r[6]),
+                "atr_normalized": self._float_or_none(r[7]),
+                "feature_data": self._normalize_feature_data(r[8]),
+            })
+        return out
+
+    @staticmethod
+    def _float_or_none(value: Any) -> Optional[float]:
+        """Konvertiert einen DB-Wert in float (None/ungueltig -> None)."""
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    # ------------------------------------------------------------------
+    # Lesen: Gezielte Spalten (Scatter / Verteilung)
+    # ------------------------------------------------------------------
+    def fetch_columns(
+        self,
+        symbol: str,
+        timeframe: str,
+        columns: List[str],
+        feature_id: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, float]]:
+        """Liefert nur die angeforderten nativen Spalten (non-null).
+
+        Args:
+            symbol/timeframe: Filter (case-insensitive)
+            columns: Nur native Spalten (ema_diff, rsi_14, atr_normalized)
+            feature_id: Optionaler Plugin-Filter
+            limit: Maximale Zeilen (Default 1000)
+
+        Returns:
+            Liste von Dicts {spaltenname: float, ...} – Zeilen mit NULL in
+            einer angeforderten Spalte werden ausgelassen (Scatter/Histogramm).
+        """
+        if not symbol or not timeframe or not columns:
+            return []
+        valid = [c for c in columns if c in NATIVE_COLUMNS]
+        if not valid:
+            return []
+        if limit is None:
+            limit = 1000
+        col_sql = ", ".join(f'"{c}"' for c in valid)
+        conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
+        params: List[Any] = [symbol, timeframe]
+        if feature_id:
+            conditions.append("feature_id = ?")
+            params.append(feature_id)
+
+        con = self._get_connection()
+        try:
+            rows = con.execute(f"""
+                SELECT {col_sql}
+                FROM feature_store
+                WHERE {' AND '.join(conditions)}
+                  AND {" AND ".join(f'"{c}" IS NOT NULL' for c in valid)}
+                ORDER BY bar_time ASC
+                LIMIT ?
+            """, params + [limit]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_columns fehlgeschlagen: {e}")
+            return []
+
+        out: List[Dict[str, float]] = []
+        for r in rows:
+            item: Dict[str, float] = {}
+            ok = True
+            for i, c in enumerate(valid):
+                fv = self._float_or_none(r[i])
+                if fv is None:
+                    ok = False
+                    break
+                item[c] = fv
+            if ok:
+                out.append(item)
+        return out
+
+    # ------------------------------------------------------------------
+    # Lesen: Heatmap (2D-Matrix X=Wochentag, Y=Stunde, Berlin Wanduhr)
+    # ------------------------------------------------------------------
+    def fetch_heatmap(
+        self,
+        symbol: str,
+        timeframe: str,
+        metric: str = "count",
+        feature_id: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Aggregiert eine 2D-Matrix (X: Wochentage, Y: Tagesstunden).
+
+        Wanduhr-Garantie (Invariante 7): DOW/HOUR werden mit
+        `bar_time AT TIME ZONE 'UTC'` extrahiert – die gespeicherten Werte
+        sind Wanduhr-encoded, die UTC-Darstellung ist die Wanduhr-Zeit.
+        Ohne die Forcierung rechnet DuckDB in die System-Lokalzeit (Berlin
+        +2h/+1h) um und die Heatmap waere DST-bruchig verschoben.
+
+        Args:
+            symbol/timeframe: Filter (case-insensitive)
+            metric: "count" (Anzahl Zeilen je Zelle) ODER eine native Spalte
+                (ema_diff, rsi_14, atr_normalized) -> AVG je Zelle.
+            feature_id: Optionaler Plugin-Filter
+            limit: Optionaler Deckel (nur fuer konsistente Semantik; die
+                Aggregation erfolgt in SQL ueber den Filter).
+
+        Returns:
+            {
+              "matrix":   7x24 Liste (rows=Stunde 0-23, cols=DOW 0=So..6=Sa),
+                          count -> 0 fuer leere Zellen,
+                          avg   -> nan fuer leere Zellen (numpy),
+              "x_labels": DOW_LABELS (Wochentage, Spalten),
+              "y_labels": ["00:00", ..., "23:00"] (Stunden, Zeilen),
+              "metric":   metric,
+              "symbol":   symbol, "timeframe": timeframe,
+            }
+
+        Raises:
+            ValueError: bei unbekannter Metrik (nur count / native Spalten).
+        """
+        if not symbol or not timeframe:
+            return self._empty_heatmap(symbol, timeframe, metric)
+        metric_key = str(metric).lower()
+        if metric_key == "count":
+            agg_sql = "COUNT(*) AS val"
+        elif metric_key in NATIVE_COLUMNS:
+            agg_sql = f'AVG("{metric_key}") AS val'
+        else:
+            raise ValueError(
+                f"[FeatureStoreReader] Unbekannte Heatmap-Metrik '{metric}' – "
+                f"erlaubt: 'count' oder eine native Spalte {NATIVE_COLUMNS}."
+            )
+
+        conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
+        params: List[Any] = [symbol, timeframe]
+        if feature_id:
+            conditions.append("feature_id = ?")
+            params.append(feature_id)
+
+        con = self._get_connection()
+        try:
+            rows = con.execute(f"""
+                SELECT
+                    EXTRACT(DOW FROM bar_time AT TIME ZONE 'UTC')::INTEGER AS dow,
+                    EXTRACT(HOUR FROM bar_time AT TIME ZONE 'UTC')::INTEGER AS hour,
+                    {agg_sql}
+                FROM feature_store
+                WHERE {' AND '.join(conditions)}
+                GROUP BY 1, 2
+                ORDER BY 1, 2
+            """, params).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_heatmap fehlgeschlagen: {e}")
+            return self._empty_heatmap(symbol, timeframe, metric)
+
+        # Matrix: rows=Stunde (0-23), cols=DOW (0-6). count -> 0, avg -> nan.
+        fill = 0.0 if metric_key == "count" else float("nan")
+        matrix = np.full((HOURS_PER_DAY, DAYS_PER_WEEK), fill, dtype=float)
+        for r in rows:
+            dow = int(r[0])
+            hour = int(r[1])
+            val = r[2]
+            if 0 <= dow < DAYS_PER_WEEK and 0 <= hour < HOURS_PER_DAY and val is not None:
+                matrix[hour][dow] = float(val)
+
+        return {
+            "matrix": matrix.tolist(),
+            "x_labels": list(DOW_LABELS),
+            "y_labels": [f"{h:02d}:00" for h in range(HOURS_PER_DAY)],
+            "metric": metric,
+            "symbol": symbol,
+            "timeframe": timeframe,
+        }
+
+    def _empty_heatmap(
+        self, symbol: str, timeframe: str, metric: str
+    ) -> Dict[str, Any]:
+        """Leere Heatmap (keine Daten / Fehler / fehlende Filter)."""
+        fill = 0.0 if str(metric).lower() == "count" else float("nan")
+        return {
+            "matrix": np.full(
+                (HOURS_PER_DAY, DAYS_PER_WEEK), fill, dtype=float
+            ).tolist(),
+            "x_labels": list(DOW_LABELS),
+            "y_labels": [f"{h:02d}:00" for h in range(HOURS_PER_DAY)],
+            "metric": metric,
+            "symbol": symbol,
+            "timeframe": timeframe,
+        }
+
+    # ------------------------------------------------------------------
+    # Lesen: Metadaten
+    # ------------------------------------------------------------------
+    def get_available_timeframes(self, symbol: str) -> List[str]:
+        """Liefert die Timeframes mit Feature-Store-Daten fuer ein Symbol.
+
+        Dient der TF-Combo-Ausgrauung (15.03-Fix): Timeframes ohne Daten im
+        feature_store werden in der UI ausgegraut und sind nicht auswaehlbar.
+
+        Returns:
+            Liste der Timeframe-Strings (z. B. ["M1", "H1", ...]) – leer,
+            wenn das Symbol keine Feature-Daten hat.
+        """
+        if not symbol:
+            return []
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT DISTINCT timeframe FROM feature_store
+                WHERE LOWER(symbol) = LOWER(?)
+                ORDER BY timeframe
+            """, [symbol]).fetchall()
+            return [str(r[0]) for r in rows if r[0] is not None]
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] get_available_timeframes "
+                  f"fehlgeschlagen: {e}")
+            return []
+
+    def get_available_features(
+        self, symbol: str, timeframe: str
+    ) -> Dict[str, Any]:
+        """Liefert verfuegbare Plugin-IDs, native Spalten und Zeilenzahl.
+
+        Returns:
+            {"feature_ids": [...], "columns": [...], "total_rows": int}
+        """
+        con = self._get_connection()
+        try:
+            ids = [r[0] for r in con.execute("""
+                SELECT DISTINCT feature_id FROM feature_store
+                WHERE feature_id IS NOT NULL AND feature_id != ''
+                ORDER BY feature_id
+            """).fetchall()]
+            total = con.execute("""
+                SELECT COUNT(*) FROM feature_store
+                WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+            """, [symbol, timeframe]).fetchone()
+            total = int(total[0]) if total and total[0] is not None else 0
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] get_available_features "
+                  f"fehlgeschlagen: {e}")
+            return {"feature_ids": [], "columns": list(NATIVE_COLUMNS),
+                    "total_rows": 0}
+        return {
+            "feature_ids": [str(i) for i in ids],
+            "columns": list(NATIVE_COLUMNS),
+            "total_rows": total,
+        }
+
+    # ------------------------------------------------------------------
+    # Lesen: Jump-to-Chart-Helfer (15.03 Schritt 5, open_chart_at_bar)
+    # ------------------------------------------------------------------
+    def fetch_latest_bar_time(
+        self,
+        symbol: str,
+        timeframe: str,
+        feature_id: Optional[str] = None,
+    ) -> Optional[int]:
+        """Neuester Wanduhr-Epoch (int) der Feature-Rows (oder None).
+
+        Wird fuer 'Jump-to-Chart' (Variante 2) aus Scatter/Heatmap genutzt:
+        Ein Klick auf einen Punkt/eine Zelle oeffnet das Chart-Fenster an der
+        zugehoerigen Bar-Position. Wanduhr-Garantie: EXTRACT('epoch') liefert
+        exakt die gespeicherte Wanduhr-Epoch (Invariante 7).
+        """
+        if not symbol or not timeframe:
+            return None
+        conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
+        params: List[Any] = [symbol, timeframe]
+        if feature_id:
+            conditions.append("feature_id = ?")
+            params.append(feature_id)
+        con = self._get_connection()
+        try:
+            row = con.execute(f"""
+                SELECT EXTRACT('epoch' FROM MAX(bar_time))::BIGINT
+                FROM feature_store
+                WHERE {' AND '.join(conditions)}
+            """, params).fetchone()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_latest_bar_time "
+                  f"fehlgeschlagen: {e}")
+            return None
+        if row and row[0] is not None:
+            return int(row[0])
+        return None
+
+    def fetch_recent_bar_time_for_cell(
+        self,
+        symbol: str,
+        timeframe: str,
+        dow: int,
+        hour: int,
+        feature_id: Optional[str] = None,
+    ) -> Optional[int]:
+        """Neuester Wanduhr-Epoch einer (dow, hour)-Heatmap-Zelle (oder None).
+
+        Jump-to-Chart aus der Heatmap: Ein Doppelklick auf eine Zelle
+        (Wochentag x Tagesstunde) oeffnet das Chart an der neuesten
+        Feature-Bar dieser Zelle. DOW/HOUR werden mit
+        `bar_time AT TIME ZONE 'UTC'` extrahiert (Wanduhr-Garantie,
+        Invariante 7 – identisch zu fetch_heatmap).
+        """
+        if not symbol or not timeframe:
+            return None
+        try:
+            dow = int(dow)
+            hour = int(hour)
+        except (TypeError, ValueError):
+            return None
+        if not (0 <= dow < DAYS_PER_WEEK and 0 <= hour < HOURS_PER_DAY):
+            return None
+        conditions = [
+            "LOWER(symbol) = LOWER(?)",
+            "LOWER(timeframe) = LOWER(?)",
+            "EXTRACT(DOW FROM bar_time AT TIME ZONE 'UTC')::INTEGER = ?",
+            "EXTRACT(HOUR FROM bar_time AT TIME ZONE 'UTC')::INTEGER = ?",
+        ]
+        params: List[Any] = [symbol, timeframe, dow, hour]
+        if feature_id:
+            conditions.append("feature_id = ?")
+            params.append(feature_id)
+        con = self._get_connection()
+        try:
+            row = con.execute(f"""
+                SELECT EXTRACT('epoch' FROM MAX(bar_time))::BIGINT
+                FROM feature_store
+                WHERE {' AND '.join(conditions)}
+            """, params).fetchone()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_recent_bar_time_for_cell "
+                  f"fehlgeschlagen: {e}")
+            return None
+        if row and row[0] is not None:
+            return int(row[0])
+        return None
+
+    def exists(self) -> bool:
+        """True, wenn die analytics.duckdb-Datei existiert."""
+        return os.path.exists(self.db_path)
 
 ```
 
@@ -19893,6 +22221,283 @@ class ServiceSetDefinition(TypedDict, total=False):
     created_at: Optional[str]        # Kap 5: Erstellungs-Zeitstempel (ISO-8601 UTC)
     execution_order: List[str]       # Ausführungs-Reihenfolge der instance_ids
     services: Dict[str, ServiceInstanceConfig]  # instance_id → Konfiguration
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/engine/service_selector_model.py
+```py
+# analytics/engine/service_selector_model.py
+"""
+Phase 15 15.02 – ServiceSelectorModel (zentrales, lesendes Datenmodell).
+
+Bereitet die Service-/Set-Hierarchie fuer das 2-Spalten-MasterTree und die
+generische Service-Auswahl (ServiceSelectorWidget) auf. Quellen:
+
+  * `ServiceSetRepository.list_sets()`       – gespeicherte Service-Sets
+  * `PluginRegistry`                          – alle verfuegbaren Plugins
+  * `StateManager.load_all_instances()`       – Live-Status "aktiv im Chart"
+    (indicators_state[*]['active'] == True)
+
+Der Model hoert auf `EventBus.service_set_changed` und aktualisiert sich
+automatisch in allen Fenstern (Invariante 5: schwellenfreie Entkopplung).
+
+Reines Lesemodell – es schreibt NIE in die DB. UI-Klassen zeigen ausschliesslich
+diese aufbereiteten Daten an (Invariante 4: kein SQL in UI).
+
+Verwendete Badge-Konvention (Spalte 1 des MasterTree):
+  * `📌 Indikator: <Name>`   – Plugin mit capabilities['chart'] == True
+  * `🟢 Aktiv in Chart`      – Indikator ist in mind. einem Chart-Fenster aktiv
+  * `⚪ Inaktiv in Chart`    – Indikator ist nirgends aktiv / kein Chart-Pflicht
+"""
+
+from typing import Any, Dict, List, Optional, Set
+
+from PySide6.QtCore import QObject, Signal
+
+from config.event_bus import event_bus
+
+
+class ServiceSelectorModel(QObject):
+    """Zentrales, lesendes Datenmodell der Service-Hierarchie (Phase 15.02).
+
+    Signals:
+        data_changed: wird nach jedem Refresh emittiert (Set-/Status-Aenderung
+                      oder Plugin-Reload) – Widgets abonnieren es und bauen
+                      ihren Baum/die Combos neu auf.
+    """
+
+    data_changed = Signal()
+
+    #: Gruppen-Kennungen der Hierarchie (build_tree)
+    GROUP_SETS = "sets"
+    GROUP_STANDALONE = "standalone"
+    GROUP_PLUGINS = "plugins"
+
+    def __init__(self, set_repo=None, state_manager=None, registry=None,
+                 parent: Optional[QObject] = None) -> None:
+        """Erstellt das Modell.
+
+        Args:
+            set_repo:      ServiceSetRepository (Default: echte Instanz).
+            state_manager: StateManager (Default: echte Instanz) – Quelle fuer
+                           den Live-Status "aktiv im Chart".
+            registry:      PluginRegistry (Default: echte Instanz) – Quelle der
+                           verfuegbaren Plugins.
+            parent:        Qt-Parent (optional).
+        """
+        super().__init__(parent)
+        from analytics.engine.service_set_repository import ServiceSetRepository
+        from analytics.features.feature_builder import PluginRegistry
+        from state_manager import StateManager
+
+        self.set_repo = set_repo or ServiceSetRepository()
+        self.state_manager = state_manager or StateManager()
+        self.registry = registry or PluginRegistry()
+
+        self._sets: List[Dict[str, Any]] = []
+        self._active_indicator_ids: Set[str] = set()
+
+        # Initialbefuellung + Live-Sync (schwellenfrei via EventBus)
+        self.refresh()
+        event_bus.service_set_changed.connect(self.refresh)
+
+    # -------------------------------------------------------------------------
+    # Refresh & Status-Ermittlung
+    # -------------------------------------------------------------------------
+
+    def refresh(self) -> None:
+        """Laedt Sets, Plugins und den Live-Status neu und informiert alle
+        lauschenden Widgets (data_changed)."""
+        try:
+            self._sets = self.set_repo.list_sets()
+        except Exception as e:
+            print(f"WARN [ServiceSelectorModel] list_sets() fehlgeschlagen: {e}")
+            self._sets = []
+        self._active_indicator_ids = self._collect_active_indicator_ids()
+        self.data_changed.emit()
+
+    def _collect_active_indicator_ids(self) -> Set[str]:
+        """Sammelt alle indicator_ids/plugin_ids, die in offenen Chart-
+        Fenstern aktiv sind (indicators_state[..]['active'] == True).
+
+        Quelle: StateManager.load_all_instances() – pro Fenster-Instanz wird
+        das indicators_state-JSON ausgewertet. Defensiv gegen fehlende/leere
+        Eintraege und JSON-Strings (DuckDB liefert die JSON-Spalte teils als
+        String).
+        """
+        active: Set[str] = set()
+        try:
+            for inst in self.state_manager.load_all_instances() or []:
+                ind_state = self._as_dict(inst.get("indicators_state"))
+                if not ind_state:
+                    continue
+                for ind_id, st in ind_state.items():
+                    if isinstance(st, dict) and st.get("active"):
+                        active.add(str(ind_id))
+        except Exception as e:
+            print(f"WARN [ServiceSelectorModel] Aktiv-Status nicht lesbar: {e}")
+        return active
+
+    @staticmethod
+    def _as_dict(value: Any) -> Dict[str, Any]:
+        """Wandelt einen Wert defensiv in ein Dict um (JSON-String oder dict)."""
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                from db_service import _parse_json_field
+                parsed = _parse_json_field(value)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    # -------------------------------------------------------------------------
+    # Lese-API (fuer Widgets & Tests)
+    # -------------------------------------------------------------------------
+
+    def get_sets(self) -> List[Dict[str, Any]]:
+        """Alle gespeicherten Service-Sets (volle Definitionen)."""
+        return list(self._sets)
+
+    def get_plugins(self) -> Dict[str, Any]:
+        """Alle registrierten Plugins (plugin_id.lower() -> PluginFeature)."""
+        return dict(getattr(self.registry, "plugins", {}) or {})
+
+    def get_plugin(self, plugin_id: str) -> Optional[Any]:
+        """Plugin aus der Registry (case-insensitiv) oder None."""
+        try:
+            return self.registry.get(plugin_id)
+        except (KeyError, AttributeError):
+            return None
+
+    def is_chart_indicator(self, plugin_id: str) -> bool:
+        """True, wenn das Plugin als Chart-Indikator verfuegbar ist
+        (capabilities['chart'] == True)."""
+        plugin = self.get_plugin(plugin_id)
+        if plugin is None:
+            return False
+        try:
+            return bool((plugin.capabilities or {}).get("chart", False))
+        except Exception:
+            return False
+
+    def get_indicator_display_name(self, plugin_id: str) -> str:
+        """Anzeige-Name fuer das 📌-Badge (metadata['display_name'])."""
+        plugin = self.get_plugin(plugin_id)
+        if plugin is None:
+            return plugin_id
+        try:
+            return str((plugin.metadata or {}).get("display_name") or plugin_id)
+        except Exception:
+            return plugin_id
+
+    def is_active_in_chart(self, plugin_id: str) -> bool:
+        """True, wenn das Plugin in mind. einem Chart-Fenster aktiv ist."""
+        key = str(plugin_id).lower()
+        return any(pid.lower() == key for pid in self._active_indicator_ids)
+
+    def badge_for(self, plugin_id: str) -> str:
+        """Kompaktes Status-Badge (Spalte 1 des MasterTree).
+
+        Beispiele:
+            "📌 Indikator: Grid Liquidity | 🟢 Aktiv in Chart"
+            "📌 Indikator: Grid Liquidity | ⚪ Inaktiv in Chart"
+            "⚪ Inaktiv in Chart"            (kein Chart-Indikator, nicht aktiv)
+            "🟢 Aktiv in Chart"              (kein Chart-Indikator, aber aktiv)
+        """
+        parts: List[str] = []
+        if self.is_chart_indicator(plugin_id):
+            parts.append(f"📌 Indikator: {self.get_indicator_display_name(plugin_id)}")
+        parts.append("🟢 Aktiv in Chart" if self.is_active_in_chart(plugin_id)
+                     else "⚪ Inaktiv in Chart")
+        return " | ".join(parts)
+
+    def get_standalone_plugin_ids(self) -> List[str]:
+        """Plugin-IDs, die in KEINEM gespeicherten Service-Set vorkommen
+        (⚡ Standalone Services – frei verfuegbare Plugins)."""
+        used: Set[str] = set()
+        for s in self._sets:
+            services = s.get("services") or {}
+            for cfg in services.values():
+                if isinstance(cfg, dict) and cfg.get("plugin_id"):
+                    used.add(str(cfg["plugin_id"]).lower())
+        return sorted(
+            pid for pid in self.get_plugins().keys()
+            if pid.lower() not in used
+        )
+
+    def build_tree(self) -> List[Dict[str, Any]]:
+        """Baut die vollstaendige Hierarchie fuer das 2-Spalten-MasterTree.
+
+        Rueckgabe (pro Gruppe ein Dict):
+            [{"group": "sets", "label": "📁 Service-Sets", "children": [
+                 {"set_id": ..., "display_name": ..., "definition": {...},
+                  "services": [{"instance_id": ..., "plugin_id": ...,
+                                "badge": ...}, ...]}, ...]},
+             {"group": "standalone", "label": "⚡ Standalone Services",
+              "children": [{"plugin_id": ..., "badge": ...}, ...]},
+             {"group": "plugins", "label": "📦 Alle verfügbaren Plugins",
+              "children": [{"plugin_id": ..., "badge": ...}, ...]}]
+
+        Deterministisch sortiert (Sets nach display_name, Plugins alphabetisch).
+        """
+        sets = sorted(self._sets,
+                      key=lambda s: str(s.get("display_name") or s.get("set_id") or "").lower())
+        set_nodes: List[Dict[str, Any]] = []
+        for s in sets:
+            services = s.get("services") or {}
+            order = s.get("execution_order") or []
+            service_nodes: List[Dict[str, Any]] = []
+            for iid in order:
+                cfg = services.get(iid) or {}
+                pid = str(cfg.get("plugin_id") or iid)
+                service_nodes.append({
+                    "instance_id": iid,
+                    "plugin_id": pid,
+                    "badge": self.badge_for(pid),
+                })
+            set_nodes.append({
+                "set_id": s.get("set_id"),
+                "display_name": s.get("display_name") or s.get("set_id") or "Unbenannt",
+                "definition": s,
+                "services": service_nodes,
+            })
+
+        standalone_nodes = [
+            {"plugin_id": pid, "badge": self.badge_for(pid)}
+            for pid in self.get_standalone_plugin_ids()
+        ]
+
+        plugin_nodes = [
+            {"plugin_id": pid, "badge": self.badge_for(pid)}
+            for pid in sorted(self.get_plugins().keys())
+        ]
+
+        return [
+            {"group": self.GROUP_SETS, "label": "📁 Service-Sets",
+             "children": set_nodes},
+            {"group": self.GROUP_STANDALONE, "label": "⚡ Standalone Services",
+             "children": standalone_nodes},
+            {"group": self.GROUP_PLUGINS, "label": "📦 Alle verfügbaren Plugins",
+             "children": plugin_nodes},
+        ]
+
+    def find_set(self, set_id: str) -> Optional[Dict[str, Any]]:
+        """Liefert die Set-Definition zur set_id (oder None)."""
+        for s in self._sets:
+            if s.get("set_id") == set_id:
+                return s
+        return None
+
+    def find_service(self, set_id: str, instance_id: str) -> Optional[Dict[str, Any]]:
+        """Liefert die Service-Konfiguration (instance_id) eines Sets (oder None)."""
+        s = self.find_set(set_id)
+        if not s:
+            return None
+        return (s.get("services") or {}).get(instance_id)
 
 ```
 
@@ -23152,6 +25757,1361 @@ class PluginFeature(ABC):
 
 --------------------------------------------------
 
+### DATEI: analytics/ui/__init__.py
+```py
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/ui/analytics_win.py
+```py
+# analytics/ui/analytics_win.py
+"""
+analytics_win.py - AnalyticsWindow (Phase 15.03).
+
+Hauptfenster der Analytics-Engine: `PersistentWindow` mit INSTANCE_ID
+"win_analytics", 1280 x 800, nicht-modal. Ersetzt das Legacy-
+Statistik-Fenster (`statistic_win.py`; E-1: das Alt-Repository
+`analytics/statistics_repository.py` bleibt bestehen).
+
+MVVM-Orchestrator (Invariante 4, kein SQL in der UI):
+    UI (Top-Bar CRUD, Sidebar, Pages) <-> AnalyticsViewModel <-> Worker
+    <-> AnalyticsRepository/FeatureStoreReader <-> DuckDB
+
+Aufgaben (15.03-Spezifikation):
+- Top-Bar: Profil-CRUD (Option B – Explicit Save, Dirty-Flag '*').
+- Sidebar-Navigation: Tabelle, Heatmap, Scatter, Verteilung, Equity.
+- Jump-to-Chart (Variante 2): open_chart_at_bar(symbol, tf, bar_time)
+  und Chart-Fenster in den Vordergrund holen.
+- E-2: Migration der win_statistics-Persistenz nach win_analytics
+  (Fenstergeometrie & Instanz-Zustand).
+- EventBus (Invariante 5): Profilwechsel + Favoriten-Aenderungen.
+"""
+
+from typing import Any, Dict, List, Optional
+
+from PySide6.QtCore import QTimer, Slot
+from PySide6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSpinBox,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+from analytics.engine.analytics_view_model import AnalyticsViewModel
+from analytics.engine.analytics_worker import QUERY_FEATURES
+from analytics.ui.table_page import TablePage
+from analytics.ui.heatmap_page import HeatmapPage
+from analytics.ui.scatter_page import ScatterPage
+from analytics.ui.distribution_page import DistributionPage
+from analytics.ui.equity_page import EquityPage
+from persistent_win import PersistentWindow, register_persistent_window
+from state_manager import StateManager
+from symbol_repository import SymbolRepository, get_symbol_repository
+from config.event_bus import event_bus
+from serviceui.symbols_win import SymbolsWindow
+
+# Im AnalyticsWindow angebotene Timeframes (Feature-Store-Auswahl).
+# 15.03-Fix: ALLE MT5-Timeframes werden angeboten (der Feature-Store haelt
+# z. B. fuer SILVER Daten in M1, M2, M5, M10, M15, M30, H1, H4, D1, W1, MN1).
+# Timeframes ohne Feature-Store-Daten werden in der Combo ausgegraut
+# (_refresh_timeframe_combo) und sind nicht auswaehlbar.
+TIMEFRAMES = ["M1", "M2", "M5", "M10", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"]
+
+# Fenstertitel (Option B: '*' = ungespeicherte Parametertrends).
+WINDOW_TITLE_BASE = "PyTrader - Analytics"
+
+
+def migrate_statistics_persistence(
+    state_manager: Optional[StateManager] = None,
+) -> bool:
+    """E-2: Migriert Fenstergeometrie & Instanz-Zustand von win_statistics.
+
+    Wird beim Oeffnen des AnalyticsWindow EINMALIG ausgefuehrt (idempotent):
+    - Geometrie (window_instances) wird nach win_analytics kopiert (nur wenn
+      dort noch kein Eintrag existiert).
+    - Instanz-Zustand (instance_states: symbol/timeframe) wird kopiert.
+    - Die Alt-Eintraege win_statistics werden entfernt (statistic_win ist
+      durch AnalyticsWindow ersetzt).
+
+    Hinweis (15.03): Die Fensterzustands-Persistenz wird laut Entscheidung
+    E-2 in 15.04 in `window_state_repository.py` gekapselt; bis dahin nutzt
+    die Migration direkt das StateManager-Persistence-Interface.
+
+    Returns:
+        True, wenn Daten von win_statistics uebernommen wurden.
+    """
+    sm = state_manager or StateManager()
+    geom = sm.get_window_geometry("win_statistics")
+    if geom is None:
+        return False
+    migrated = False
+
+    # 1. Geometrie kopieren (nur wenn win_analytics noch keinen Eintrag hat)
+    if sm.get_window_geometry("win_analytics") is None:
+        sm.save_window_geometry(
+            "win_analytics",
+            geom.get("pos_x"),
+            geom.get("pos_y"),
+            geom.get("width"),
+            geom.get("height"),
+            bool(geom.get("is_maximized")),
+        )
+        migrated = True
+
+    # 2. Instanz-Zustand kopieren (symbol/timeframe)
+    all_inst = sm.load_all_instances()
+    stats_inst = next(
+        (i for i in all_inst if i.get("instance_id") == "win_statistics"), None
+    )
+    if stats_inst and stats_inst.get("symbol"):
+        ana_inst = next(
+            (i for i in all_inst if i.get("instance_id") == "win_analytics"),
+            None,
+        )
+        if not (ana_inst and ana_inst.get("symbol")):
+            sm.save_instance_state(
+                "win_analytics",
+                stats_inst["symbol"],
+                stats_inst.get("timeframe") or "H1",
+            )
+            migrated = True
+
+    # 3. Alt-Eintraege entfernen (statistic_win ist ersetzt)
+    try:
+        sm.delete_instance("win_statistics")
+    except Exception:
+        pass
+    return migrated
+
+
+@register_persistent_window()
+class AnalyticsWindow(PersistentWindow):
+    """Analytics-Hauptfenster (win_analytics, 1280 x 800, nicht-modal)."""
+
+    INSTANCE_ID = "win_analytics"
+    # Bugfix 04.08.2026 (Fenster-Historie): auto_restore=True – das Fenster
+    # wird beim App-Start wiederhergestellt, wenn es beim Beenden der App
+    # OFFEN war. _keep_history_on_close bleibt Default (False): ein MANUELL
+    # geschlossenes Fenster wird aus der aktiven History entfernt
+    # (delete_instance) und poppt beim naechsten Start NICHT wieder auf
+    # (Semantik identisch zu chart_win).
+
+    def __init__(
+        self,
+        parent=None,
+        view_model: Optional[AnalyticsViewModel] = None,
+        analytics_repo: Any = None,
+        profile_repo: Any = None,
+    ) -> None:
+        super().__init__(parent)
+        self._vm = view_model or AnalyticsViewModel(
+            analytics_repo=analytics_repo,
+            profile_repo=profile_repo,
+            parent=self,
+        )
+        self._symbol_repo: SymbolRepository = get_symbol_repository()
+        self._profile_combo_syncing: bool = False
+
+        self.setWindowTitle(WINDOW_TITLE_BASE)
+        self.resize(1280, 800)
+
+        # E-2: win_statistics-Persistenz migrieren – VOR restore_state(),
+        # damit die wiederhergestellte Geometrie die migrierten Werte nutzt.
+        try:
+            migrate_statistics_persistence(self.state_manager)
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] E-2-Migration fehlgeschlagen: {e}")
+
+        self._build_ui()
+        self._wire_view_model()
+        self._wire_controls()
+
+        # State asynchron wiederherstellen (nach show(), damit move/resize
+        # vom Window-Manager akzeptiert werden – Muster StatisticWindow).
+        QTimer.singleShot(0, self.restore_state)
+        # Initiale Daten + Profile laden.
+        QTimer.singleShot(100, self._initial_load)
+
+    # ------------------------------------------------------------------
+    # UI-Aufbau
+    # ------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        central = QWidget(self)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+
+        # --- Top-Bar: Profil-CRUD (Option B – Explicit Save) ---
+        top = QHBoxLayout()
+        self.combo_profile = QComboBox()
+        self.combo_profile.setMinimumWidth(160)
+        self.edit_profile_name = QLineEdit()
+        self.edit_profile_name.setPlaceholderText("Profil-Name")
+        self.edit_profile_name.setMaximumWidth(180)
+        self.edit_profile_desc = QLineEdit()
+        self.edit_profile_desc.setPlaceholderText("Beschreibung (optional)")
+        self.edit_profile_desc.setMaximumWidth(200)
+        self.btn_profile_new = QPushButton("Neu")
+        self.btn_profile_save = QPushButton("💾 Save")
+        self.btn_profile_delete = QPushButton("Löschen")
+        self.label_dirty = QLabel("")
+        self.label_dirty.setStyleSheet("color: #e65100; font-weight: bold;")
+        self.progress_busy = QProgressBar()
+        self.progress_busy.setRange(0, 0)  # indeterminierter Spinner
+        self.progress_busy.setFixedWidth(120)
+        self.progress_busy.setVisible(False)
+
+        top.addWidget(QLabel("Profil:"))
+        top.addWidget(self.combo_profile)
+        top.addWidget(self.edit_profile_name)
+        top.addWidget(self.edit_profile_desc)
+        top.addWidget(self.btn_profile_new)
+        top.addWidget(self.btn_profile_save)
+        top.addWidget(self.btn_profile_delete)
+        top.addWidget(self.label_dirty)
+        top.addStretch(1)
+        top.addWidget(self.progress_busy)
+        root.addLayout(top)
+
+        # --- Filter-Zeile: Symbol / TF / Feature / Limit ---
+        filt = QHBoxLayout()
+        self.combo_symbol = QComboBox()
+        self.btn_symbol_fav = QPushButton("★")
+        self.btn_symbol_fav.setFixedWidth(32)
+        self.btn_symbol_fav.setToolTip(
+            "Favoriten verwalten – öffnet das Symbol-Fenster.")
+        self.combo_tf = QComboBox()
+        for tf in TIMEFRAMES:
+            self.combo_tf.addItem(tf, tf)
+        self.combo_feature = QComboBox()
+        self.combo_feature.addItem("Alle", None)
+        self.spin_limit = QSpinBox()
+        self.spin_limit.setRange(1, self._vm.max_lookback_limit)
+        self.spin_limit.setValue(int(self._vm.params.get("limit") or 5000))
+        self.spin_limit.setSuffix(" Bars")
+
+        filt.addWidget(QLabel("Symbol:"))
+        filt.addWidget(self.combo_symbol)
+        filt.addWidget(self.btn_symbol_fav)
+        filt.addWidget(QLabel("Timeframe:"))
+        filt.addWidget(self.combo_tf)
+        filt.addWidget(QLabel("Feature:"))
+        filt.addWidget(self.combo_feature)
+        filt.addWidget(QLabel("Limit:"))
+        filt.addWidget(self.spin_limit)
+        filt.addStretch(1)
+        root.addLayout(filt)
+
+        # --- Body: Sidebar + Seiten (QStackedWidget) ---
+        body = QHBoxLayout()
+        self.sidebar = QListWidget()
+        self.sidebar.setFixedWidth(150)
+        self.pages_stack = QStackedWidget()
+        self.table_page = TablePage()
+        self.heatmap_page = HeatmapPage()
+        self.scatter_page = ScatterPage()
+        self.distribution_page = DistributionPage()
+        self.equity_page = EquityPage()
+        for page in (self.table_page, self.heatmap_page, self.scatter_page,
+                     self.distribution_page, self.equity_page):
+            self.pages_stack.addWidget(page)
+        for label in ("Tabelle", "Heatmap", "Scatter", "Verteilung", "Equity"):
+            self.sidebar.addItem(QListWidgetItem(label))
+        self.sidebar.setCurrentRow(0)
+
+        body.addWidget(self.sidebar)
+        body.addWidget(self.pages_stack, 1)
+        root.addLayout(body, 1)
+
+        self.setCentralWidget(central)
+
+    # ------------------------------------------------------------------
+    # MVVM + Steuerung verdrahten
+    # ------------------------------------------------------------------
+    def _wire_view_model(self) -> None:
+        vm = self._vm
+        for page in (self.table_page, self.heatmap_page, self.scatter_page,
+                     self.distribution_page, self.equity_page):
+            page.attach_view_model(vm)
+        vm.profiles_available.connect(self._on_profiles_available)
+        vm.active_profile_changed.connect(self._on_active_profile_changed)
+        vm.dirty_changed.connect(self._on_dirty_changed)
+        vm.busy_changed.connect(self._on_busy_changed)
+        vm.data_ready.connect(self._on_vm_data_ready)
+        vm.query_failed.connect(self._on_query_failed)
+
+        # Jump-to-Chart (Variante 2): open_chart_at_bar + Aufloesung
+        self.table_page.set_navigation_handler(self._open_chart_at_bar)
+        self.heatmap_page.set_navigation_handler(self._open_chart_at_bar)
+        self.heatmap_page.set_cell_resolver(
+            self._vm.resolve_recent_bar_time_for_cell)
+        self.scatter_page.set_navigation_handler(self._open_chart_at_bar)
+        self.scatter_page.set_bar_resolver(self._vm.resolve_latest_bar_time)
+
+    def _wire_controls(self) -> None:
+        self.combo_symbol.currentTextChanged.connect(self._vm.set_symbol)
+        # TF-Ausgrauung (15.03-Fix): Bei Symbolwechsel die verfuegbaren
+        # Timeframes aus dem Feature-Store ermitteln und TFs ohne Daten
+        # ausgrauen (nicht auswaehlbar).
+        self.combo_symbol.currentTextChanged.connect(self._refresh_timeframe_combo)
+        self.combo_tf.currentTextChanged.connect(self._vm.set_timeframe)
+        self.combo_feature.currentIndexChanged.connect(self._on_feature_changed)
+        self.spin_limit.valueChanged.connect(self._vm.set_limit)
+        self.btn_symbol_fav.clicked.connect(self.open_symbols_window)
+        self.btn_profile_new.clicked.connect(self._on_profile_new)
+        self.btn_profile_save.clicked.connect(self._on_profile_save)
+        self.btn_profile_delete.clicked.connect(self._on_profile_delete)
+        self.combo_profile.currentIndexChanged.connect(self._on_profile_selected)
+        self.sidebar.currentRowChanged.connect(self._on_page_changed)
+        event_bus.favorites_changed.connect(self._refresh_symbol_combo)
+        self._refresh_symbol_combo()
+        self._refresh_timeframe_combo()
+
+    def _refresh_timeframe_combo(self, symbol: Optional[str] = None) -> None:
+        """Graut Timeframes ohne Feature-Store-Daten aus (nicht auswaehlbar).
+
+        Fix 15.03 (TF-Verfuegbarkeit): TFs mit Daten bleiben aktiv; TFs ohne
+        Daten werden per QComboBox-Model disabled (Qt stellt sie grau dar und
+        verhindert die Auswahl). Die aktuelle Auswahl wird nur beibehalten,
+        wenn ihr TF Daten hat; sonst faellt sie auf den ersten verfuegbaren TF
+        zurueck. Schlaegt die Abfrage fehl, bleiben alle TFs aktiv (Fallback).
+        """
+        if not hasattr(self, "combo_tf") or not hasattr(self, "combo_symbol"):
+            return
+        symbol = (symbol or self.combo_symbol.currentText()).strip()
+        available: Optional[set] = None  # None = Abfrage fehlgeschlagen
+        if symbol:
+            try:
+                tfs = self._vm.available_timeframes(symbol)
+                available = {str(t) for t in tfs}
+            except Exception:
+                available = None
+        self.combo_tf.blockSignals(True)
+        first_enabled = -1
+        for i in range(self.combo_tf.count()):
+            tf = self.combo_tf.itemText(i)
+            enabled = (available is None) or (tf in available)
+            self.combo_tf.model().item(i).setEnabled(enabled)
+            if enabled and first_enabled < 0:
+                first_enabled = i
+        current = self.combo_tf.currentText()
+        cur_idx = self.combo_tf.findText(current)
+        if cur_idx >= 0 and self.combo_tf.model().item(cur_idx).isEnabled():
+            pass  # aktuelle Auswahl hat Daten -> behalten
+        elif first_enabled >= 0:
+            self.combo_tf.setCurrentIndex(first_enabled)
+        self.combo_tf.blockSignals(False)
+
+    # ------------------------------------------------------------------
+    # PersistentWindow-Interface
+    # ------------------------------------------------------------------
+    def get_persistent_symbol(self) -> str:
+        return (self.combo_symbol.currentText()
+                if hasattr(self, "combo_symbol") else "SILVER")
+
+    def get_persistent_timeframe(self) -> str:
+        return (self.combo_tf.currentText()
+                if hasattr(self, "combo_tf") else "M1")
+
+    def _apply_persistent_filters(self, symbol: str, timeframe: str) -> None:
+        """Wird von PersistentWindow.restore_state() gerufen."""
+        if symbol and hasattr(self, "combo_symbol"):
+            idx = self.combo_symbol.findText(symbol)
+            if idx < 0:
+                # Nicht-Favorit aus der Historie: in die Combo aufnehmen,
+                # damit der gespeicherte Filter wiederhergestellt wird
+                # (Fix 15.03 – zuletzt gewaehltes Symbol bleibt gemerkt).
+                self.combo_symbol.blockSignals(True)
+                self.combo_symbol.addItem(symbol, symbol)
+                idx = self.combo_symbol.count() - 1
+                self.combo_symbol.blockSignals(False)
+            self.combo_symbol.setCurrentIndex(idx)
+        if timeframe and hasattr(self, "combo_tf"):
+            idx = self.combo_tf.findText(timeframe)
+            if idx >= 0:
+                self.combo_tf.setCurrentIndex(idx)
+        # VM-Parameter idempotent uebernehmen (setCurrentIndex hat die
+        # Signale bereits gefeuert; der ViewModel dedupliziert gleiche Werte).
+        self._vm.set_symbol(self.get_persistent_symbol())
+        self._vm.set_timeframe(self.get_persistent_timeframe())
+        # TF-Ausgrauung nach Restore: Fall der aktuelle TF keine Daten hat,
+        # faellt die Auswahl auf den ersten verfuegbaren TF zurueck.
+        self._refresh_timeframe_combo(symbol)
+
+    # ------------------------------------------------------------------
+    # Symbol- & Favoriten-Verwaltung (15.01-Muster)
+    # ------------------------------------------------------------------
+    @Slot()
+    def open_symbols_window(self) -> None:
+        """Oeffnet das nicht-modale SymbolsWindow (Singleton-Verhalten)."""
+        existing = SymbolsWindow.get_existing_instance()
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
+        win = SymbolsWindow(self)  # parent=self nur fuer state_manager-Zugriff
+        win.show()
+
+    def _refresh_symbol_combo(self) -> None:
+        """Befuellt die Symbol-ComboBox aus den Favoriten (Fallback Defaults).
+
+        Die aktuell gewaehlte Auswahl bleibt erhalten – auch wenn sie kein
+        Favorit (mehr) ist (analog StatisticWindow) – damit der Filter nicht
+        ungewollt umspringt und ein aus der Historie restauriertes Symbol
+        sichtbar bleibt (Fix 15.03).
+        """
+        if not hasattr(self, "combo_symbol"):
+            return
+        favorites = self._symbol_repo.get_favorite_symbols()
+        if not favorites:
+            favorites = list(SymbolRepository.DEFAULT_SYMBOLS)
+        current = self.combo_symbol.currentText()
+        self.combo_symbol.blockSignals(True)
+        self.combo_symbol.clear()
+        for sym in favorites:
+            self.combo_symbol.addItem(sym, sym)
+        if current and current not in favorites:
+            self.combo_symbol.addItem(current, current)
+        idx = self.combo_symbol.findText(current)
+        self.combo_symbol.setCurrentIndex(idx if idx >= 0 else 0)
+        self.combo_symbol.blockSignals(False)
+
+    # ------------------------------------------------------------------
+    # Datenfluss (MVVM): Feature-Dropdown, Seiten, Status
+    # ------------------------------------------------------------------
+    def _on_page_changed(self, row: int) -> None:
+        if 0 <= row < self.pages_stack.count():
+            page = self.pages_stack.widget(row)
+            if hasattr(page, "request_data"):
+                page.request_data()
+
+    def _populate_feature_combo(self, feature_ids: List[str]) -> None:
+        current = self.combo_feature.currentData()
+        self.combo_feature.blockSignals(True)
+        self.combo_feature.clear()
+        self.combo_feature.addItem("Alle", None)
+        for fid in feature_ids:
+            self.combo_feature.addItem(fid, fid)
+        idx = self.combo_feature.findData(current)
+        self.combo_feature.setCurrentIndex(idx if idx >= 0 else 0)
+        self.combo_feature.blockSignals(False)
+
+    @Slot(int)
+    def _on_feature_changed(self, _index: int) -> None:
+        self._vm.set_feature_id(self.combo_feature.currentData())
+
+    @Slot(str, dict)
+    def _on_vm_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
+        if kind == QUERY_FEATURES:
+            self._populate_feature_combo(data.get("feature_ids") or [])
+
+    @Slot(str, str)
+    def _on_query_failed(self, kind: str, error: str) -> None:
+        print(f"WARN [AnalyticsWindow] Abfrage '{kind}' fehlgeschlagen: {error}")
+
+    @Slot(bool)
+    def _on_busy_changed(self, busy: bool) -> None:
+        self.progress_busy.setVisible(busy)
+
+    # ------------------------------------------------------------------
+    # Profil-CRUD (Option B – Explicit Save)
+    # ------------------------------------------------------------------
+    @Slot(list)
+    def _on_profiles_available(self, profiles: List[Dict[str, Any]]) -> None:
+        active_pid = next(
+            (p.get("profile_id") for p in profiles if p.get("is_active")),
+            None,
+        )
+        self._profile_combo_syncing = True
+        self.combo_profile.blockSignals(True)
+        self.combo_profile.clear()
+        if not profiles:
+            self.combo_profile.addItem("– kein Profil –", None)
+        for p in profiles:
+            self.combo_profile.addItem(
+                p.get("name") or "?", p.get("profile_id"))
+        target = active_pid or (self._vm.active_profile or {}).get("profile_id")
+        idx = self.combo_profile.findData(target)
+        self.combo_profile.setCurrentIndex(idx if idx >= 0 else 0)
+        self.combo_profile.blockSignals(False)
+        self._profile_combo_syncing = False
+
+    @Slot(int)
+    def _on_profile_selected(self, _index: int) -> None:
+        if self._profile_combo_syncing:
+            return
+        profile_id = self.combo_profile.currentData()
+        if profile_id:
+            self._vm.set_active_profile(profile_id)
+
+    @Slot(object)
+    def _on_active_profile_changed(
+        self, profile: Optional[Dict[str, Any]]
+    ) -> None:
+        if profile is None:
+            self.edit_profile_name.clear()
+            self.edit_profile_desc.clear()
+            return
+        self.edit_profile_name.setText(profile.get("name") or "")
+        self.edit_profile_desc.setText(profile.get("description") or "")
+        pid = profile.get("profile_id")
+        idx = self.combo_profile.findData(pid)
+        if idx >= 0 and self.combo_profile.currentIndex() != idx:
+            self.combo_profile.blockSignals(True)
+            self.combo_profile.setCurrentIndex(idx)
+            self.combo_profile.blockSignals(False)
+
+    @Slot(bool)
+    def _on_dirty_changed(self, dirty: bool) -> None:
+        self.label_dirty.setText(
+            "● ungespeicherte Änderungen" if dirty else "")
+        self.setWindowTitle(
+            WINDOW_TITLE_BASE + (" *" if dirty else ""))
+
+    @Slot()
+    def _on_profile_new(self) -> None:
+        name, ok = QInputDialog.getText(self, "Neues Profil", "Profil-Name:")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        desc, ok2 = QInputDialog.getText(
+            self, "Neues Profil", "Beschreibung (optional):")
+        if not ok2:
+            desc = ""
+        try:
+            self._vm.create_profile(name, desc or "")
+        except ValueError as e:
+            QMessageBox.warning(self, "Profil anlegen", str(e))
+
+    @Slot()
+    def _on_profile_save(self) -> None:
+        """Explicit Save: Name/Beschreibung + aktuelle Parameter persistieren."""
+        if self._vm.active_profile is None:
+            return
+        pid = self._vm.active_profile["profile_id"]
+        self._vm.update_profile(
+            pid,
+            name=self.edit_profile_name.text(),
+            description=self.edit_profile_desc.text(),
+        )
+        self._vm.save_profile()
+
+    @Slot()
+    def _on_profile_delete(self) -> None:
+        if self._vm.active_profile is None:
+            return
+        name = self._vm.active_profile.get("name") or "?"
+        reply = QMessageBox.question(
+            self, "Profil löschen",
+            f"Profil '{name}' wirklich löschen?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self._vm.delete_profile(self._vm.active_profile["profile_id"])
+
+    # ------------------------------------------------------------------
+    # Jump-to-Chart (Variante 2): open_chart_at_bar
+    # ------------------------------------------------------------------
+    def _open_chart_at_bar(
+        self, symbol: str, timeframe: str, bar_time: int
+    ) -> None:
+        """Oeffnet/fokussiert ein Chart-Fenster an der Bar-Position."""
+        main_window = self._find_main_window()
+        if main_window is not None and hasattr(main_window, "open_chart_at_bar"):
+            main_window.open_chart_at_bar(symbol, timeframe, bar_time)
+        elif main_window is not None and hasattr(main_window, "open_chart_window"):
+            main_window.open_chart_window()
+
+    def _find_main_window(self):
+        app = QApplication.instance()
+        if not app:
+            return None
+        for widget in app.topLevelWidgets():
+            if widget.metaObject().className() == "MainWindow":
+                return widget
+        return None
+
+    # ------------------------------------------------------------------
+    # Initiale Ladung + Lebenszyklus
+    # ------------------------------------------------------------------
+    def _initial_load(self) -> None:
+        # VM mit dem aktuellen Combo-Zustand starten (Fix 15.03, idempotent):
+        # restore_state (t=0) bzw. _apply_profile koennen bereits Werte gesetzt
+        # haben; ohne Historie/Profil sorgt das hier dafuer, dass die Ansicht
+        # sofort Daten fuer das sichtbare Symbol/Timeframe laedt.
+        self._vm.set_symbol(self.combo_symbol.currentText())
+        self._vm.set_timeframe(self.combo_tf.currentText())
+        self._vm.load_profiles()
+        self._on_page_changed(self.sidebar.currentRow())
+        self._vm.request_features()
+
+    def closeEvent(self, event) -> None:
+        """Stoppt Debounce + laufenden Worker (PersistentWindow speichert).
+
+        Der Fenster-Historie-Eintrag bleibt dank _keep_history_on_close
+        erhalten, damit Symbol/Timeframe beim naechsten Oeffnen
+        wiederhergestellt werden (Fix 15.03).
+        """
+        try:
+            self._vm.shutdown()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/ui/common.py
+```py
+# analytics/ui/common.py
+"""
+Gemeinsame UI-Helfer der Analytics-Pages (analytics/ui/*, Phase 15.03).
+
+- format_wanduhr_time(): Wanduhr-Formatierung (Invariante 7, KEIN Offset)
+- make_overlay_stack(): 'Keine Daten'-Overlay (QStackedLayout) fuer die
+  Seiten mit Progress-Spinner-/No-Data-Semantik (15.03-Spezifikation).
+"""
+
+from datetime import datetime, timezone
+from typing import Any
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QLabel, QStackedLayout, QWidget
+
+# Ausgabeformat der Wanduhr-Zeit (z. B. '03.08.2026 12:00').
+WANDUHR_FORMAT = "%d.%m.%Y %H:%M"
+
+
+def format_wanduhr_time(epoch: Any) -> str:
+    """Formatiert eine Wanduhr-encoded Epoch DIREKT als Berliner Wanduhrzeit.
+
+    Invariante 7: Die gespeicherten Epochs sind Wanduhr-encoded (MT5 liefert
+    Berlin-Wanduhr-Epochs; die UTC-Darstellung IST die Wanduhr-Zeit). Daher
+    formatiert `fromtimestamp(epoch, tz=utc)` OHNE weiteren Berlin-Offset
+    korrekt und ist automatisch DST-robust (CEST/CET sind bereits in den
+    Roh-Epochs enthalten). Ein zusaetzlicher +2h/+1h-Offset waere falsch.
+    """
+    try:
+        dt = datetime.fromtimestamp(int(epoch), tz=timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+    return dt.strftime(WANDUHR_FORMAT)
+
+
+def make_overlay_stack(
+    content: QWidget, message: str = "Keine Daten vorhanden."
+) -> QStackedLayout:
+    """Stapelt einen zentrierten 'Keine Daten'-Hinweis ueber den Inhalt.
+
+    Index 0 = Inhalt, Index 1 = Overlay. Die Seiten schalten per
+    `stack.setCurrentIndex(0 | 1)` um (No-Data-Overlay, 15.03-Spez).
+    """
+    stack = QStackedLayout()
+    overlay = QLabel(message)
+    overlay.setAlignment(Qt.AlignCenter)
+    overlay.setStyleSheet("color: #808080; font-size: 14px;")
+    stack.addWidget(content)
+    stack.addWidget(overlay)
+    stack.setCurrentWidget(content)
+    return stack
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/ui/distribution_page.py
+```py
+# analytics/ui/distribution_page.py
+"""
+distribution_page.py - Verteilungs-Seite der Analytics-UI (Phase 15.03).
+
+Zeigt das Histogramm einer nativen Feature-Spalte (ema_diff, rsi_14,
+atr_normalized) als pyqtgraph-BarGraphItem. Spalte und Bin-Anzahl sind
+ueber die Steuerleiste einstellbar; die Bin-Aenderung laeuft ueber den
+ViewModel-Debounce (200-300 ms, 15.03-Spezifikation).
+
+MVVM (Invariante 4): Reine UI – Daten kommen ueber
+`data_ready(QUERY_DISTRIBUTION, data)` vom ViewModel (Async-Worker); es
+gibt KEIN SQL in dieser Klasse.
+"""
+
+from typing import Any, Dict
+
+import pyqtgraph as pg
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QSlider,
+    QVBoxLayout,
+    QWidget,
+)
+
+from analytics.engine.analytics_worker import QUERY_DISTRIBUTION
+from analytics.ui.common import make_overlay_stack
+
+_BINS_MIN = 2
+_BINS_MAX = 100
+
+
+class DistributionPage(QWidget):
+    """Histogramm einer nativen Spalte (bins-Slider + Spalten-Dropdown)."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._view_model = None
+
+        self._combo_column = QComboBox()
+        self._slider_bins = QSlider(Qt.Horizontal)
+        self._slider_bins.setRange(_BINS_MIN, _BINS_MAX)
+        self._label_bins = QLabel("20")
+
+        self._plot = pg.PlotWidget()
+        self._plot.setBackground("w")
+        self._plot.setLabel("left", "Anzahl")
+        self._bar = pg.BarGraphItem(
+            x=[], height=[], width=0.8, brush=pg.mkBrush(41, 98, 255)
+        )
+        self._plot.addItem(self._bar)
+
+        content = QWidget(self)
+        lay = QVBoxLayout(content)
+        ctrl = QHBoxLayout()
+        ctrl.addWidget(QLabel("Spalte:"))
+        ctrl.addWidget(self._combo_column)
+        ctrl.addWidget(QLabel("Bins:"))
+        ctrl.addWidget(self._slider_bins)
+        ctrl.addWidget(self._label_bins)
+        ctrl.addStretch(1)
+        lay.addLayout(ctrl)
+        lay.addWidget(self._plot)
+        self._stack = make_overlay_stack(content)
+        self.setLayout(self._stack)
+
+        self._combo_column.currentTextChanged.connect(self._on_column_changed)
+        self._slider_bins.valueChanged.connect(self._on_bins_changed)
+
+    # ------------------------------------------------------------------
+    # MVVM-Anbindung (vom AnalyticsWindow gesetzt)
+    # ------------------------------------------------------------------
+    def attach_view_model(self, view_model: Any) -> None:
+        self._view_model = view_model
+        params = view_model.params
+        self._combo_column.blockSignals(True)
+        for col in view_model.native_columns:
+            self._combo_column.addItem(col, col)
+        idx = self._combo_column.findData(params.get("distribution_column"))
+        self._combo_column.setCurrentIndex(idx if idx >= 0 else 0)
+        self._combo_column.blockSignals(False)
+        self._slider_bins.blockSignals(True)
+        self._slider_bins.setValue(int(params.get("bins") or 20))
+        self._slider_bins.blockSignals(False)
+        self._label_bins.setText(str(self._slider_bins.value()))
+        view_model.data_ready.connect(self.on_data_ready)
+
+    def request_data(self) -> None:
+        if self._view_model is not None:
+            self._view_model.request_distribution()
+
+    # ------------------------------------------------------------------
+    # Datenfluss (UI rendert, KEIN SQL)
+    # ------------------------------------------------------------------
+    def on_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
+        if kind != QUERY_DISTRIBUTION:
+            return
+        bins = data.get("bins") or []
+        counts = data.get("counts") or []
+        if not bins or not counts:
+            self._bar.setOpts(x=[], height=[], width=0.8)
+            self._stack.setCurrentIndex(1)
+            return
+        widths = [bins[i + 1] - bins[i] for i in range(len(counts))]
+        centers = [(bins[i] + bins[i + 1]) / 2.0 for i in range(len(counts))]
+        self._bar.setOpts(
+            x=centers,
+            height=[float(c) for c in counts],
+            width=0.9 * min(widths) if widths else 0.8,
+        )
+        self._plot.setLabel(
+            "bottom", str(data.get("column") or "")
+        )
+        self._plot.autoRange()
+        self._stack.setCurrentIndex(0)
+
+    # ------------------------------------------------------------------
+    # Steuerung (Spalte/Bins -> ViewModel -> Debounce -> Worker)
+    # ------------------------------------------------------------------
+    def _on_column_changed(self, column: str) -> None:
+        if self._view_model is not None and column:
+            self._view_model.set_distribution_column(column)
+
+    def _on_bins_changed(self, value: int) -> None:
+        if self._view_model is not None:
+            self._label_bins.setText(str(value))
+            self._view_model.set_bins(value)
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/ui/equity_page.py
+```py
+# analytics/ui/equity_page.py
+"""
+equity_page.py - Equity-Seite der Analytics-UI (Phase 15.03).
+
+Platzhalter-Seite fuer die Equity-Analyse: Es existiert noch KEINE
+Equity-Datenquelle in PyTrader (geplant fuer eine spaetere Phase). Die
+Seite reserviert den pyqtgraph-Plotbereich und zeigt dauerhaft das
+'No Data'-Overlay (15.03-Spezifikation: 'No Data'-Overlay).
+
+MVVM (Invariante 4): Reine UI, keine Datenabfrage (noch kein
+query_kind). Sobald eine Equity-Datenquelle existiert, wird diese Seite
+additiv an einen neuen QUERY_*-Kanal des ViewModels angebunden.
+"""
+
+from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
+
+import pyqtgraph as pg
+
+from analytics.ui.common import make_overlay_stack
+
+_NO_DATA_MESSAGE = (
+    "Equity-Analyse: noch keine Daten vorhanden "
+    "(geplant fuer eine spaetere Phase)."
+)
+
+
+class EquityPage(QWidget):
+    """Equity-Verlauf (Platzhalter mit dauerhaftem 'No Data'-Overlay)."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._view_model = None
+
+        self._plot = pg.PlotWidget()
+        self._plot.setBackground("w")
+        self._plot.setLabel("bottom", "Zeit (Berlin Wanduhr)")
+        self._plot.setLabel("left", "Equity")
+
+        content = QWidget(self)
+        lay = QVBoxLayout(content)
+        lay.addWidget(QLabel("Equity-Verlauf"))
+        lay.addWidget(self._plot)
+        self._stack = make_overlay_stack(content, message=_NO_DATA_MESSAGE)
+        self.setLayout(self._stack)
+        # Dauerhaftes No-Data-Overlay (noch keine Equity-Datenquelle).
+        self._stack.setCurrentIndex(1)
+
+    def attach_view_model(self, view_model: Any) -> None:
+        """Vorgesehen fuer die spaetere Equity-Anbindung (additiv)."""
+        self._view_model = view_model
+
+    def request_data(self) -> None:
+        """No-op: noch keine Equity-Datenabfrage vorhanden."""
+        return
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/ui/heatmap_page.py
+```py
+# analytics/ui/heatmap_page.py
+"""
+heatmap_page.py - Heatmap-Seite der Analytics-UI (Phase 15.03).
+
+Zeigt die 2D-Matrix (X: Wochentage, Y: Tagesstunden Berlin Wanduhr,
+Invariante 7) als pyqtgraph-ImageItem mit Farbskala. Ein Doppelklick auf
+eine Zelle oeffnet das Chart an der neuesten Feature-Bar dieser Zelle
+(Jump-to-Chart Variante 2, Aufloesung ueber den ViewModel).
+
+MVVM (Invariante 4): Reine UI – Daten kommen ueber
+`data_ready(QUERY_HEATMAP, data)` vom ViewModel (Async-Worker); es gibt
+KEIN SQL in dieser Klasse.
+"""
+
+from typing import Any, Callable, Dict, Optional
+
+import numpy as np
+import pyqtgraph as pg
+from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+
+from analytics.engine.analytics_worker import QUERY_HEATMAP
+from analytics.engine.feature_store_reader import (
+    DOW_LABELS,
+    DAYS_PER_WEEK,
+    HOURS_PER_DAY,
+)
+from analytics.ui.common import make_overlay_stack
+
+# Farbverlauf (pyqtgraph-intern, 'viridis').
+_HEATMAP_COLORMAP = "viridis"
+
+
+class HeatmapPage(QWidget):
+    """Heatmap Wochentag x Stunde (Berlin Wanduhr) mit Jump-to-Chart."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._view_model = None
+        self._navigation_handler: Optional[Callable[[str, str, int], None]] = None
+        self._cell_resolver: Optional[Callable[[str, str, int, int], Optional[int]]] = None
+        self._current_symbol = ""
+        self._current_timeframe = "M1"
+
+        # Metrik-Dropdown (count | native Spalten)
+        self._combo_metric = QComboBox()
+        self._label_info = QLabel("")
+
+        # pyqtgraph-Plot + ImageItem + Farbskala
+        self._plot = pg.PlotWidget()
+        self._plot.setBackground("w")
+        self._plot.setLabel("bottom", "Wochentag")
+        self._plot.setLabel("left", "Stunde (Berlin Wanduhr)")
+        self._image = pg.ImageItem()
+        self._plot.addItem(self._image)
+        self._colormap = pg.colormap.get(_HEATMAP_COLORMAP)
+        self._image.setColorMap(self._colormap)
+        self._colorbar = pg.ColorBarItem(colorMap=self._colormap, values=(0.0, 1.0))
+        self._colorbar.setImageItem(self._image)
+        # Achsen-Ticks: X = Wochentage, Y = Stunden (Wanduhr)
+        self._plot.getAxis("bottom").setTicks(
+            [[(i, DOW_LABELS[i]) for i in range(DAYS_PER_WEEK)]]
+        )
+        self._plot.getAxis("left").setTicks(
+            [[(h, f"{h:02d}") for h in range(0, HOURS_PER_DAY, 3)]]
+        )
+
+        content = QWidget(self)
+        lay = QVBoxLayout(content)
+        ctrl = QHBoxLayout()
+        ctrl.addWidget(QLabel("Metrik:"))
+        ctrl.addWidget(self._combo_metric)
+        ctrl.addWidget(self._label_info)
+        ctrl.addStretch(1)
+        lay.addLayout(ctrl)
+        lay.addWidget(self._plot)
+        self._stack = make_overlay_stack(content)
+        self.setLayout(self._stack)
+
+        self._combo_metric.currentTextChanged.connect(self._on_metric_changed)
+        self._plot.scene().sigMouseClicked.connect(self._on_plot_clicked)
+
+    # ------------------------------------------------------------------
+    # MVVM-Anbindung (vom AnalyticsWindow gesetzt)
+    # ------------------------------------------------------------------
+    def attach_view_model(self, view_model: Any) -> None:
+        self._view_model = view_model
+        # Metrik-Dropdown befuellen (count + native Spalten)
+        self._combo_metric.blockSignals(True)
+        for metric in view_model.heatmap_metrics:
+            self._combo_metric.addItem(metric, metric)
+        idx = self._combo_metric.findData(view_model.params.get("heatmap_metric"))
+        self._combo_metric.setCurrentIndex(idx if idx >= 0 else 0)
+        self._combo_metric.blockSignals(False)
+        view_model.data_ready.connect(self.on_data_ready)
+
+    def set_navigation_handler(self, fn: Callable[[str, str, int], None]) -> None:
+        self._navigation_handler = fn
+
+    def set_cell_resolver(
+        self, fn: Callable[[str, str, int, int], Optional[int]]
+    ) -> None:
+        """Setzt die Zell-Aufloesung (dow, hour -> neuester bar_time)."""
+        self._cell_resolver = fn
+
+    def request_data(self) -> None:
+        if self._view_model is not None:
+            self._view_model.request_heatmap()
+
+    # ------------------------------------------------------------------
+    # Datenfluss (UI rendert, KEIN SQL)
+    # ------------------------------------------------------------------
+    def on_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
+        if kind != QUERY_HEATMAP:
+            return
+        self._current_symbol = str(data.get("symbol") or "")
+        self._current_timeframe = str(data.get("timeframe") or "M1")
+        matrix = np.asarray(data.get("matrix"), dtype=float)
+        if matrix.size == 0:
+            self._stack.setCurrentIndex(1)
+            return
+        self._render(matrix)
+        self._stack.setCurrentIndex(0)
+
+    def _render(self, matrix: np.ndarray) -> None:
+        """Zeichnet die 24x7-Matrix (rows=Stunde, cols=DOW)."""
+        finite = matrix[np.isfinite(matrix)]
+        if finite.size:
+            vmin = float(finite.min())
+            vmax = float(finite.max())
+            if vmin == vmax:
+                vmax = vmin + 1.0
+        else:
+            vmin, vmax = 0.0, 1.0
+        self._image.setImage(matrix, levels=(vmin, vmax))
+        self._colorbar.setLevels((vmin, vmax))
+        self._plot.setXRange(-0.5, DAYS_PER_WEEK - 0.5, padding=0)
+        self._plot.setYRange(-0.5, HOURS_PER_DAY - 0.5, padding=0)
+
+    # ------------------------------------------------------------------
+    # Jump-to-Chart (Variante 2): Doppelklick auf eine Zelle
+    # ------------------------------------------------------------------
+    def _on_plot_clicked(self, event) -> None:
+        if not event.double() or self._cell_resolver is None \
+                or self._navigation_handler is None:
+            return
+        vb = self._plot.plotItem.vb
+        pos = vb.mapSceneToView(event.scenePos())
+        dow = int(round(pos.x()))
+        hour = int(round(pos.y()))
+        if not (0 <= dow < DAYS_PER_WEEK and 0 <= hour < HOURS_PER_DAY):
+            return
+        bar_time = self._cell_resolver(
+            self._current_symbol, self._current_timeframe, dow, hour
+        )
+        if bar_time is not None:
+            self._navigation_handler(
+                self._current_symbol, self._current_timeframe, int(bar_time)
+            )
+
+    # ------------------------------------------------------------------
+    # Steuerung (Metrik -> ViewModel -> Debounce -> Worker)
+    # ------------------------------------------------------------------
+    def _on_metric_changed(self, metric: str) -> None:
+        if self._view_model is not None and metric:
+            self._view_model.set_heatmap_metric(metric)
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/ui/scatter_page.py
+```py
+# analytics/ui/scatter_page.py
+"""
+scatter_page.py - Scatter-Seite der Analytics-UI (Phase 15.03).
+
+Zeigt X/Y-Paare zweier nativer Feature-Spalten (ema_diff, rsi_14,
+atr_normalized) als pyqtgraph-ScatterPlot. Ein Klick auf einen Punkt
+oeffnet das Chart-Fenster an der neuesten Feature-Bar des Symbol/Timeframe
+(Jump-to-Chart Variante 2, Aufloesung ueber den ViewModel).
+
+MVVM (Invariante 4): Reine UI – Daten kommen ueber
+`data_ready(QUERY_SCATTER, data)` vom ViewModel (Async-Worker); es gibt
+KEIN SQL in dieser Klasse.
+"""
+
+from typing import Any, Callable, Dict, Optional
+
+import pyqtgraph as pg
+from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+
+from analytics.engine.analytics_worker import QUERY_SCATTER
+from analytics.ui.common import make_overlay_stack
+
+
+class ScatterPage(QWidget):
+    """Scatterplot zweier nativer Spalten mit Jump-to-Chart."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._view_model = None
+        self._navigation_handler: Optional[Callable[[str, str, int], None]] = None
+        self._bar_resolver: Optional[Callable[[str, str], Optional[int]]] = None
+        self._current_symbol = ""
+        self._current_timeframe = "M1"
+
+        self._combo_x = QComboBox()
+        self._combo_y = QComboBox()
+
+        self._plot = pg.PlotWidget()
+        self._plot.setBackground("w")
+        self._scatter = pg.ScatterPlotItem(
+            size=6, pen=None, brush=pg.mkBrush(41, 98, 255, 180)
+        )
+        self._plot.addItem(self._scatter)
+
+        content = QWidget(self)
+        lay = QVBoxLayout(content)
+        ctrl = QHBoxLayout()
+        ctrl.addWidget(QLabel("X:"))
+        ctrl.addWidget(self._combo_x)
+        ctrl.addWidget(QLabel("Y:"))
+        ctrl.addWidget(self._combo_y)
+        ctrl.addStretch(1)
+        lay.addLayout(ctrl)
+        lay.addWidget(self._plot)
+        self._stack = make_overlay_stack(content)
+        self.setLayout(self._stack)
+
+        self._combo_x.currentTextChanged.connect(self._on_columns_changed)
+        self._combo_y.currentTextChanged.connect(self._on_columns_changed)
+        self._scatter.sigClicked.connect(self._on_point_clicked)
+
+    # ------------------------------------------------------------------
+    # MVVM-Anbindung (vom AnalyticsWindow gesetzt)
+    # ------------------------------------------------------------------
+    def attach_view_model(self, view_model: Any) -> None:
+        self._view_model = view_model
+        columns = view_model.native_columns
+        params = view_model.params
+        self._combo_x.blockSignals(True)
+        self._combo_y.blockSignals(True)
+        for col in columns:
+            self._combo_x.addItem(col, col)
+            self._combo_y.addItem(col, col)
+        idx_x = self._combo_x.findData(params.get("scatter_x"))
+        idx_y = self._combo_y.findData(params.get("scatter_y"))
+        self._combo_x.setCurrentIndex(idx_x if idx_x >= 0 else 0)
+        self._combo_y.setCurrentIndex(idx_y if idx_y >= 0 else 0)
+        self._combo_x.blockSignals(False)
+        self._combo_y.blockSignals(False)
+        view_model.data_ready.connect(self.on_data_ready)
+
+    def set_navigation_handler(self, fn: Callable[[str, str, int], None]) -> None:
+        self._navigation_handler = fn
+
+    def set_bar_resolver(self, fn: Callable[[str, str], Optional[int]]) -> None:
+        """Setzt die Bar-Aufloesung (symbol, tf -> neuester bar_time)."""
+        self._bar_resolver = fn
+
+    def request_data(self) -> None:
+        if self._view_model is not None:
+            self._view_model.request_scatter()
+
+    # ------------------------------------------------------------------
+    # Datenfluss (UI rendert, KEIN SQL)
+    # ------------------------------------------------------------------
+    def on_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
+        if kind != QUERY_SCATTER:
+            return
+        self._current_symbol = str(data.get("symbol") or "")
+        self._current_timeframe = str(data.get("timeframe") or "M1")
+        points = data.get("points") or []
+        xs = [p["x"] for p in points]
+        ys = [p["y"] for p in points]
+        self._scatter.setData(x=xs, y=ys)
+        if xs:
+            self._plot.setLabel("bottom", str(data.get("x_label") or ""))
+            self._plot.setLabel("left", str(data.get("y_label") or ""))
+            self._plot.autoRange()
+            self._stack.setCurrentIndex(0)
+        else:
+            self._stack.setCurrentIndex(1)
+
+    # ------------------------------------------------------------------
+    # Jump-to-Chart (Variante 2): Klick auf einen Punkt
+    # ------------------------------------------------------------------
+    def _on_point_clicked(self, scatter_item, points, event) -> None:
+        if not points or self._bar_resolver is None \
+                or self._navigation_handler is None:
+            return
+        bar_time = self._bar_resolver(
+            self._current_symbol, self._current_timeframe
+        )
+        if bar_time is not None:
+            self._navigation_handler(
+                self._current_symbol, self._current_timeframe, int(bar_time)
+            )
+
+    # ------------------------------------------------------------------
+    # Steuerung (Spalten -> ViewModel -> Debounce -> Worker)
+    # ------------------------------------------------------------------
+    def _on_columns_changed(self, _text: str) -> None:
+        if self._view_model is None:
+            return
+        x_col = self._combo_x.currentData()
+        y_col = self._combo_y.currentData()
+        if x_col and y_col:
+            self._view_model.set_scatter_columns(x_col, y_col)
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/ui/table_page.py
+```py
+# analytics/ui/table_page.py
+"""
+table_page.py - Tabellen-Seite der Analytics-UI (Phase 15.03).
+
+Zeigt die rohen Feature-Store-Zeilen (Tabelle) und koppelt einen
+Doppelklick an 'Jump-to-Chart' (Variante 2): open_chart_at_bar(symbol, tf,
+bar_time) wird aufgerufen und das Chart-Fenster in den Vordergrund geholt.
+
+MVVM (Invariante 4): Die Page ist reine UI – Rendering + Event-Handling.
+Die Daten kommen ueber `data_ready(QUERY_TABLE, data)` vom ViewModel
+(Async-Worker); es gibt KEIN SQL in dieser Klasse.
+"""
+
+from typing import Any, Callable, Dict, List, Optional
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QHeaderView,
+    QLabel,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from analytics.engine.analytics_worker import QUERY_TABLE
+from analytics.ui.common import format_wanduhr_time, make_overlay_stack
+
+# Datenvertrag der Tabellen-Spalten (feature_store-Zeilen).
+_TABLE_COLUMNS = [
+    ("Zeit (Wanduhr)", 150),
+    ("Symbol", 90),
+    ("TF", 60),
+    ("Feature", 110),
+    ("Version", 80),
+    ("ema_diff", 90),
+    ("rsi_14", 80),
+    ("atr_normalized", 100),
+]
+
+
+class TablePage(QWidget):
+    """Feature-Store-Tabelle mit Jump-to-Chart (Doppelklick)."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._view_model = None
+        self._navigation_handler: Optional[Callable[[str, str, int], None]] = None
+
+        self._header = QLabel("Feature-Store-Tabelle")
+        self._table = QTableWidget(0, len(_TABLE_COLUMNS))
+        self._table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._table.setSelectionMode(QTableWidget.SingleSelection)
+        self._table.setAlternatingRowColors(True)
+        self._table.setHorizontalHeaderLabels([c[0] for c in _TABLE_COLUMNS])
+        header = self._table.horizontalHeader()
+        # Fix 15.03 (TF-Wechsel-Haenger): KEIN ResizeToContents! Der Modus
+        # berechnet bei JEDEM setItem die optimale Breite ueber ALLE Zeilen
+        # (O(n^2)) – bei 5000 Zeilen blockiert das den Main-Thread minuten-
+        # lang. Stattdessen FIXE Spaltenbreiten aus _TABLE_COLUMNS
+        # (deterministisch schnell, unabhaengig von der Zeilenanzahl).
+        header.setStretchLastSection(False)
+        for i, (_, width) in enumerate(_TABLE_COLUMNS):
+            header.setSectionResizeMode(i, QHeaderView.Fixed)
+            self._table.setColumnWidth(i, width)
+
+        content = QWidget(self)
+        lay = QVBoxLayout(content)
+        lay.addWidget(self._header)
+        lay.addWidget(self._table)
+        self._stack = make_overlay_stack(content)
+        self.setLayout(self._stack)
+
+        self._table.itemDoubleClicked.connect(self._on_double_clicked)
+
+    # ------------------------------------------------------------------
+    # MVVM-Anbindung (vom AnalyticsWindow gesetzt)
+    # ------------------------------------------------------------------
+    def attach_view_model(self, view_model: Any) -> None:
+        """Verbindet die Page mit dem AnalyticsViewModel (data_ready)."""
+        self._view_model = view_model
+        view_model.data_ready.connect(self.on_data_ready)
+
+    def set_navigation_handler(
+        self, fn: Callable[[str, str, int], None]
+    ) -> None:
+        """Setzt den Jump-to-Chart-Handler (open_chart_at_bar)."""
+        self._navigation_handler = fn
+
+    def request_data(self) -> None:
+        """Fordert die Tabellen-Daten ueber das ViewModel an."""
+        if self._view_model is not None:
+            self._view_model.request_table()
+
+    # ------------------------------------------------------------------
+    # Datenfluss (UI rendert, KEIN SQL)
+    # ------------------------------------------------------------------
+    def on_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
+        if kind != QUERY_TABLE:
+            return
+        if not self.isVisible():
+            # Fix 15.03 (TF-Wechsel-Haenger): Die Tabelle wird NUR gerendert,
+            # wenn sie die aktive/ sichtbare Seite ist. data_ready feuert bei
+            # jedem TF-Wechsel fuer ALLE Seiten; ein versteckter 5000-Zeilen-
+            # Render (ResizeToContents + Sortierung) wuerde den Main-Thread
+            # blockieren. Beim Aktivieren der Seite fordert _on_page_changed
+            # die Daten erneut an (request_data -> frischer Query).
+            return
+        rows = data.get("rows") or []
+        self._populate(rows)
+        self._stack.setCurrentIndex(0 if rows else 1)
+
+    def _populate(self, rows: List[Dict[str, Any]]) -> None:
+        self._table.setUpdatesEnabled(False)
+        self._table.setSortingEnabled(False)
+        self._table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            # Zeit: Wanduhr-Formatierung (Invariante 7) + Roh-Epoch im
+            # UserRole fuer Jump-to-Chart.
+            epoch = row.get("time")
+            time_item = QTableWidgetItem(format_wanduhr_time(epoch))
+            if epoch is not None:
+                time_item.setData(Qt.UserRole, int(epoch))
+            self._table.setItem(r, 0, time_item)
+            self._table.setItem(r, 1, QTableWidgetItem(str(row.get("symbol") or "")))
+            self._table.setItem(r, 2, QTableWidgetItem(str(row.get("timeframe") or "")))
+            self._table.setItem(r, 3, QTableWidgetItem(str(row.get("feature_id") or "-")))
+            self._table.setItem(r, 4, QTableWidgetItem(str(row.get("plugin_version") or "-")))
+            for ci, key in enumerate(("ema_diff", "rsi_14", "atr_normalized"),
+                                     start=5):
+                v = row.get(key)
+                if isinstance(v, (int, float)):
+                    self._table.setItem(r, ci, QTableWidgetItem(f"{v:.4f}"))
+                else:
+                    self._table.setItem(r, ci, QTableWidgetItem("-"))
+        self._table.setSortingEnabled(True)
+        self._table.setUpdatesEnabled(True)
+
+    # ------------------------------------------------------------------
+    # Jump-to-Chart (Variante 2)
+    # ------------------------------------------------------------------
+    def _on_double_clicked(self, item: QTableWidgetItem) -> None:
+        row = item.row()
+        if row < 0 or self._navigation_handler is None:
+            return
+        symbol = self._table.item(row, 1)
+        tf = self._table.item(row, 2)
+        time_item = self._table.item(row, 0)
+        if not symbol or not tf or not time_item:
+            return
+        bar_time = time_item.data(Qt.UserRole)
+        if bar_time is None:
+            return
+        try:
+            bar_time = int(bar_time)
+        except (TypeError, ValueError):
+            return
+        self._navigation_handler(symbol.text(), tf.text(), bar_time)
+
+```
+
+--------------------------------------------------
+
 ### DATEI: chart/__init__.py
 ```py
 # chart/__init__.py
@@ -23295,6 +27255,7 @@ from PySide6.QtWebEngineCore import QWebEnginePage
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QHBoxLayout,
     QMainWindow,
     QPushButton,
     QSizePolicy,
@@ -23317,6 +27278,12 @@ except ImportError:
     from state_manager import StateManager
 
 from db_service import MarketDataRepository, _parse_json_field, TF_SECONDS_MAP
+
+# Phase 15 15.01: Symbol- & Favoriten-Verwaltung im Chart-Fenster
+# (★-Button oeffnet das SymbolsWindow; Favoriten-Dropdown via EventBus).
+from config.event_bus import event_bus
+from symbol_repository import SymbolRepository, get_symbol_repository
+from serviceui.symbols_win import SymbolsWindow
 
 
 def find_null_fields(obj, path=""):
@@ -23557,6 +27524,27 @@ class PyTraderChartWindow(QMainWindow):
         if self.symbol_combo:
             self.symbol_combo.setCurrentText(str(self.current_symbol) if self.current_symbol is not None else "SILVER")
             self.symbol_combo.currentTextChanged.connect(self.on_symbol_changed)
+        # Phase 15 15.01: Favoriten-Symbol-Verwaltung im Chart-Fenster.
+        # ★-Button rechts neben der Symbol-ComboBox oeffnet das nicht-modale
+        # SymbolsWindow (Favoriten verwalten). Das Symbol-Dropdown wird bei
+        # Favoriten-Aenderungen ueber den EventBus neu befuellt (Favoriten
+        # zuerst); das aktuell angezeigte Symbol bleibt immer auswaehlbar,
+        # damit der Chart beim Favoriten-Wechsel nicht ungewollt umspringt.
+        self._symbol_repo: SymbolRepository = get_symbol_repository()
+        self.btn_symbol_fav: QPushButton = QPushButton("★", self.ui_widget)
+        self.btn_symbol_fav.setObjectName("btn_symbol_fav")
+        self.btn_symbol_fav.setToolTip(
+            "Favoriten verwalten – oeffnet das Symbol-Fenster. "
+            "Das Symbol-Dropdown zeigt Favoriten zuerst.")
+        self.btn_symbol_fav.setFixedSize(28, 28)
+        row1_layout = self.ui_widget.findChild(QHBoxLayout, "horizontalLayout_row1")
+        if row1_layout is not None and self.symbol_combo is not None:
+            idx = row1_layout.indexOf(self.symbol_combo)
+            row1_layout.insertWidget(idx + 1, self.btn_symbol_fav)
+        self.btn_symbol_fav.clicked.connect(self.open_symbols_window)
+        # EventBus: Favoriten-Aenderungen -> ComboBox neu befuellen
+        event_bus.favorites_changed.connect(self._refresh_symbol_combo)
+        self._refresh_symbol_combo()
         if self.tf_combo:
             self.tf_combo.setCurrentText(str(self.current_tf) if self.current_tf is not None else "H1")
             self.tf_combo.currentTextChanged.connect(self.on_tf_changed)
@@ -24179,6 +28167,49 @@ class PyTraderChartWindow(QMainWindow):
     def _update_window_title(self) -> None:
         """Aktualisiert den Fenstertitel mit den aktuellen Symbol/TF-Werten."""
         self.setWindowTitle(f"PyTrader Chart - {self.current_symbol} [{self.current_tf}] ({self.instance_id})")
+
+    # --- Phase 15 15.01: Symbol- & Favoriten-Verwaltung ---
+
+    @Slot()
+    def open_symbols_window(self) -> None:
+        """Oeffnet das nicht-modale SymbolsWindow (Singleton-Verhalten).
+
+        Analog zu open_service_window in main.py: Existiert bereits eine
+        sichtbare Instanz, wird sie in den Vordergrund geholt statt neu
+        geoeffnet (PersistentWindow.get_existing_instance()).
+        """
+        existing = SymbolsWindow.get_existing_instance()
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
+        win = SymbolsWindow(self)  # parent=self nur fuer state_manager-Zugriff
+        win.show()
+
+    def _refresh_symbol_combo(self) -> None:
+        """Befuellt die Symbol-ComboBox aus den Favoriten (Favoriten zuerst).
+
+        Wird beim Start und bei jedem `EventBus.favorites_changed`-Event
+        aufgerufen (Verbindung im __init__). Das aktuell angezeigte Symbol
+        bleibt immer in der Liste (auch wenn es kein Favorit mehr ist), damit
+        der Chart beim Favoriten-Wechsel nicht ungewollt auf ein anderes
+        Symbol springt. Signale sind waehrend des Umbaus blockiert.
+        """
+        if not self.symbol_combo:
+            return
+        favorites = self._symbol_repo.get_favorite_symbols()
+        if not favorites:
+            favorites = list(SymbolRepository.DEFAULT_SYMBOLS)
+        current = self.symbol_combo.currentText() or self.current_symbol
+        self.symbol_combo.blockSignals(True)
+        self.symbol_combo.clear()
+        for sym in favorites:
+            self.symbol_combo.addItem(sym)
+        if current and current not in favorites:
+            self.symbol_combo.addItem(current)
+        idx = self.symbol_combo.findText(current)
+        self.symbol_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.symbol_combo.blockSignals(False)
 
     def on_symbol_changed(self, s):
         if s and s != self.current_symbol:
@@ -26329,18 +30360,17 @@ class GridLiquidityIndicator(BaseIndicator):
         DB-Lesepfad des Indikators – liest fertige Proximity-Hits aus dem
         feature_store (JSON-Feld feature_data, feature_id='proximity', inkl.
         schema_version) beim Chart-Re-Render/Refresh OHNE synchrone
-        Service-Pipeline (Invariante 10: definierter Fallback).
+        Service-Pipeline (Invariante 10).
 
         P14-03-E (Schritt 4, generisch): `feature_id` ist parametrisiert
         (Standard 'proximity'), damit spätere Indikator-Plugins denselben
         Lesepfad über die eigene feature_id nutzen können (Open/Closed).
 
         Der Indikator führt hier KEINE Berechnungen aus; er liest ausschließlich
-        vorberechnete Daten aus DuckDB. Die Heavy-Berechnung über die
-        FeatureBuilder-Service-Pipeline (calculate) ist nur der Fallback,
-        wenn der feature_store leer ist. Liefert die Hit-Kreise des Proximity-
+        vorberechnete Daten aus DuckDB. Liefert die Hit-Kreise des Proximity-
         Service ({time, price, in_window}) oder [] bei fehlenden Daten/Fehlern –
-        der Aufrufer entscheidet, ob er auf die Pipeline (calculate) zurückfällt.
+        leere Ergebnisse sind der definierte Zustand (U15-A3: der frühere
+        Pipeline-Fallback in calculate() wurde entfernt).
 
         U15-A2 (Farb-Semantik): Die gelieferten Kreise enthalten KEINE Farbe –
         der Aufrufer (calculate) wendet die circle_color_std/_active-Färbung
@@ -26507,17 +30537,13 @@ class GridLiquidityIndicator(BaseIndicator):
         Historical-Run aus, cached die Linien thread-sicher und liefert den
         Render-Payload (Parität zu grid.py).
 
-        Invariante 10 (Chart-Entkopplung, Phase 15 U15-A2) – Lese-Kette:
-          1. PRIMÄR: Proximity-Hit-Circles werden aus dem feature_store
+        Invariante 10 (Chart-Entkopplung, Phase 15 U15-A2/A3) – Lese-Kette:
+          1. Proximity-Hit-Circles werden AUSSCHLIESSLICH aus dem feature_store
              gelesen (read_proximity_from_feature_store) – der Chart führt
              KEINE Proximity-Berechnung aus, er liest vorberechnete Daten
-             aus DuckDB.
-          2. DEFINIERTER FALLBACK: Ist der feature_store leer (noch kein
-             Batch-Lauf geschrieben), wird die Service-Pipeline
-             (grid_lines + proximity) synchron ausgeführt – Linien/Circles
-             werden daraus gerendert UND die Circles zusätzlich als
-             berechnete Referenz verwendet. Zielzustand 15.2: Fallback
-             entfällt, sobald der Store verlässlich befüllt ist.
+             aus DuckDB. Ist der Store leer (noch kein Batch-Lauf
+             geschrieben), werden keine Circles gerendert (U15-A3: der
+             frühere Pipeline-Fallback wurde entfernt).
           Die Grid-LINIEN (Live-Tick-Cache) kommen unabhängig davon immer
           aus der Pipeline (GridLinesService) – sie sind kein DB-Output.
         """
@@ -26550,65 +30576,41 @@ class GridLiquidityIndicator(BaseIndicator):
             prox_result = results.get("prox_1") or {}
             prox_crp = prox_result.get("chart_render_payload") or {}
 
-            # P14-03-E (Schritt 4, generisch): PRIMÄR gecachte Proximity-Hits
-            # aus dem feature_store lesen (inkl. schema_version). Heavy-
-            # Berechnung nur als Fallback, wenn der Feature-Store leer ist.
+            # U15-A2 (Farb-Semantik) mit Bugfix 04.08.2026 (Circles wieder
+            # sichtbar): PRIMÄR werden die Proximity-Hits aus dem feature_store
+            # gelesen (read_proximity_from_feature_store – U15-A3-Lesepfad).
+            # Ist der Store leer (noch kein Batch-Lauf mit aktivem
+            # proximity-Preset geschrieben), greift der DEFINIERTE FALLBACK
+            # auf die pipeline-berechneten Circles des Proximity-Service
+            # (prox_crp.hit_circles) – der Chart führt die Pipeline intern
+            # ohnehin aus und verwirft die Treffer sonst ungenutzt. Beide
+            # Pfade liefern time/price/in_window ohne Farbe; die Farbe wird
+            # additiv aus dem Indikator-Schema angewendet:
+            #   in_window + use_time_filter → circle_color_std, sonst _active.
+            # show_circles=false (Indikator-Parameter) → keine Circles.
             cached_circles = self.read_proximity_from_feature_store(
                 self._symbol or "", self._timeframe or ""
             )
+            circle_std = str(p.get("circle_color_std") or "#FFEB3B")
+            circle_active = str(p.get("circle_color_active") or "#E91E63")
+            use_time_filter = _as_bool(p.get("use_time_filter"), True)
+
+            def _colorize(c: Dict[str, Any]) -> Dict[str, Any]:
+                return dict(
+                    c,
+                    color=(
+                        circle_active
+                        if (use_time_filter and not bool(c.get("in_window", True)))
+                        else circle_std
+                    ),
+                )
+
             if cached_circles:
-                # U15-A2 (Farb-Konsistenz): Die Feature-Store-Kreise kommen aus
-                # dem DB-Lesepfad OHNE Farbe (nur time/price/in_window). Damit
-                # der Primärpfad identisch zum Pipeline-Fallback färbt, wird
-                # die Farbe hier additiv aus dem Indikator-Schema angewendet:
-                #   in_window + use_time_filter → circle_color_std, sonst _active.
-                circle_std = str(p.get("circle_color_std") or "#FFEB3B")
-                circle_active = str(p.get("circle_color_active") or "#E91E63")
-                use_time_filter = _as_bool(p.get("use_time_filter"), True)
-                circles = [
-                    dict(
-                        c,
-                        color=(
-                            circle_active
-                            if (use_time_filter and not bool(c.get("in_window", True)))
-                            else circle_std
-                        ),
-                    )
-                    for c in cached_circles
-                ]
+                circles = [_colorize(c) for c in cached_circles]
             else:
-                # DEFINIERTER FALLBACK (U15-A2): feature_store enthält keine
-                # Proximity-Hits für dieses (symbol, timeframe) – die
-                # Service-Pipeline liefert die Circles als berechnete
-                # Referenz (Invariante 10, Zielzustand: Fallback entfällt).
-                print(f"⚠️ [GridLiquidityIndicator] feature_store leer für "
-                      f"{self._symbol}/{self._timeframe} – Pipeline-Fallback "
-                      f"(U15-A2, definierter Fallback).")
-                # Display-Layer: priority=10 (JS-Bridge-Erwartung, wie Alt-Plugin).
-                # Die Services selbst bleiben Paritäts-pur (kein priority – exakt
-                # wie grid.py); die Anreicherung passiert erst hier im Adapter.
-                # Der Proximity-Service meldet pro Hit nur das in_window-Flag; die
-                # Farbe setzt der INDIKATOR aus seinem eigenen Schema:
-                #   use_time_filter und ausserhalb des Fensters → circle_color_active
-                #   sonst                            → circle_color_std
-                # show_circles=false (Indikator-Parameter) → keine Circles.
                 circles_raw = prox_crp.get("hit_circles") or []
                 if _as_bool(p.get("show_circles"), True):
-                    circle_std = str(p.get("circle_color_std") or "#FFEB3B")
-                    circle_active = str(p.get("circle_color_active") or "#E91E63")
-                    use_time_filter = _as_bool(p.get("use_time_filter"), True)
-                    circles = [
-                        dict(
-                            c,
-                            color=(
-                                circle_active
-                                if (use_time_filter and not bool(c.get("in_window", True)))
-                                else circle_std
-                            ),
-                            priority=10,
-                        )
-                        for c in circles_raw
-                    ]
+                    circles = [_colorize(c) for c in circles_raw]
                 else:
                     circles = []
             status = dict(prox_crp.get("status_info") or empty_result["status_info"])
@@ -28579,11 +32581,74 @@ class AbstractStateModel(ABC):
 
 --------------------------------------------------
 
+### DATEI: config/event_bus.py
+```py
+# config/event_bus.py
+"""
+config/event_bus.py - Zentraler Signal-Hub (EventBus-Singleton) fuer die
+schwellenfreie Entkopplung der Fenster (Phase 15, Invariante 5).
+
+Fenster kommunizieren NIE direkt miteinander (keine zirkulaeren
+Abhaengigkeiten, kein Hardcoding von Fensterklassen). Stattdessen emittieren
+sie Events auf dem zentralen EventBus und andere Fenster/Module abonnieren
+diese Signale.
+
+Phase 15.01: `favorites_changed` wird vom SymbolsWindow nach jedem
+Favoriten-Toggle emittiert; ServiceWindow (und spaeter AnalyticsWindow)
+befuellen daraufhin ihre Symbol-Dropdowns neu.
+
+Verwendungsbeispiel:
+    from config.event_bus import event_bus
+    event_bus.favorites_changed.connect(self._refresh_symbol_combo)
+    event_bus.favorites_changed.emit()
+"""
+
+from typing import ClassVar, Optional
+
+from PySide6.QtCore import QObject, Signal
+
+
+class EventBus(QObject):
+    """Zentraler Signal-Hub (Singleton) fuer fensteruebergreifende Events.
+
+    Signaldefinitionen (minimal gehalten, Phase-15-Entscheidungs-Protokoll):
+    - favorites_changed : Favoriten-Liste wurde geaendert (SymbolsWindow).
+    - profile_changed   : Analytics-Profil wurde geaendert (15.03, Payload =
+                          Profil-Name/-ID).
+    - service_set_changed: Service-Set wurde gespeichert/geloescht (15.02).
+    """
+
+    favorites_changed = Signal()
+    profile_changed = Signal(str)
+    service_set_changed = Signal()
+
+    _instance: ClassVar[Optional["EventBus"]] = None
+
+    def __init__(self) -> None:
+        # QObject ohne Parent: Der Singleton lebt app-weit und wird nie
+        # geloescht (gehoert keiner Fenster-Hierarchie an).
+        super().__init__(None)
+
+    @classmethod
+    def instance(cls) -> "EventBus":
+        """Liefert die app-weite Singleton-Instanz (lazy)."""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+
+# Bequeme Modul-Level-Instanz: `from config.event_bus import event_bus`
+event_bus = EventBus.instance()
+
+```
+
+--------------------------------------------------
+
 ### DATEI: serviceui/__init__.py
 ```py
 # serviceui/__init__.py
 """
-Service-UI-Paket (Phase 15, Kapitel 15.1 – U15-D1).
+Service-UI-Paket (Phase 15, Kapitel 15.1 – U15-D1 + 15.02).
 
 Modularisierte Service-UI: Die gewachsene service_win.py wurde in den
 Unterordner serviceui/ verschoben und in SRP-Module zerlegt:
@@ -28595,7 +32660,13 @@ Unterordner serviceui/ verschoben und in SRP-Module zerlegt:
   * trash_dialog.py        – ServiceSetTrashDialog (Papierkorb-Dialog)
   * service_win.py         – ServiceWindow (Hauptfenster, re-exportiert API)
 
-Verhalten unverändert gegenüber der alten service_win.py.
+Phase 15.02 (Master-Tree & generischer ServiceSelector):
+  * master_tree.py             – 2-Spalten MasterTree (Hierarchie + Badges)
+  * toolbar.py                 – ServiceToolbar (Aktions-Buttons)
+  * status_panel.py            – StatusPanel (Laufzeit/Fortschritt/Log)
+  * parameter_panel.py         – ParameterPanel (Parameter-Formular)
+  * service_selector_widget.py – ServiceSelectorWidget (SELECT_ONLY/FULL_EDIT)
+  * analytics/engine/service_selector_model.py – lesendes Datenmodell
 """
 
 from serviceui.service_win import (
@@ -28608,6 +32679,13 @@ from serviceui.service_win import (
     BASE_DIR,
 )
 
+# Phase 15.02: Wiederverwendbare Sub-Widgets
+from serviceui.master_tree import MasterTree
+from serviceui.toolbar import ServiceToolbar
+from serviceui.status_panel import StatusPanel
+from serviceui.parameter_panel import ParameterPanel
+from serviceui.service_selector_widget import ServiceSelectorWidget
+
 __all__ = [
     "ServiceWindow",
     "ServiceSetRunWorker",
@@ -28616,7 +32694,313 @@ __all__ = [
     "_available_plugin_ids",
     "_sets_using_plugin",
     "BASE_DIR",
+    # Phase 15.02
+    "MasterTree",
+    "ServiceToolbar",
+    "StatusPanel",
+    "ParameterPanel",
+    "ServiceSelectorWidget",
 ]
+
+```
+
+--------------------------------------------------
+
+### DATEI: serviceui/master_tree.py
+```py
+# serviceui/master_tree.py
+"""
+Service-UI: 2-Spalten-MasterTree (Phase 15 15.02).
+
+Hierarchische Darstellung der Service-Landschaft:
+
+  * Spalte 0: Knoten – 📁 Service-Sets (mit ihren Service-Instanzen),
+              ⚡ Standalone Services, 📦 Alle verfuegbaren Plugins.
+  * Spalte 1: Kompakte Status-Badges (`📌 Indikator: <Name> |
+              🟢 Aktiv in Chart` / `⚪ Inaktiv in Chart`).
+
+Der Baum wird ausschliesslich aus dem `ServiceSelectorModel` befuellt
+(lesendes Datenmodell, Invariante 4: kein SQL in UI) und aktualisiert sich
+automatisch ueber `data_changed`/EventBus. Der `ServiceSelectorWidget` nutzt
+den MasterTree im Modus `FULL_EDIT` (MasterTree + ServiceToolbar).
+
+Signale:
+  * selection_changed(set_id, service_id) – bei jeder Baum-Selektion
+    (set_id/service_id koennen leer sein, wenn nichts Konkretes gewaehlt ist).
+"""
+
+from typing import Any, Dict, Optional
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import QHeaderView, QTreeWidget, QTreeWidgetItem
+
+# P15-Bugfix: shiboken6.isValid() schuetzt vor dem Zugriff auf bereits
+# C++-seitig zerstoerte Items (QTreeWidget.clear() nach data_changed bei
+# wildem Klicken) – verhindert Access Violation (0xC0000005).
+try:
+    from shiboken6 import isValid
+except ImportError:  # pragma: no cover
+    def isValid(obj) -> bool:  # type: ignore
+        return obj is not None
+
+# UserRole-Kennungen fuer die Knotentypen (Deterministische Auswertung)
+ROLE_NODE_TYPE = Qt.UserRole
+ROLE_SET_ID = Qt.UserRole + 1
+ROLE_INSTANCE_ID = Qt.UserRole + 2
+ROLE_PLUGIN_ID = Qt.UserRole + 3
+
+#: Knotentypen
+TYPE_GROUP = "group"
+TYPE_SET = "set"
+TYPE_SERVICE = "service"
+TYPE_PLUGIN = "plugin"
+
+# Bugfix 2.1 (04.08.2026): Lange Relationstexte in der Badge-Spalte (z. B.
+# "📌 Indikator: Grid Liquidity | 🟢 Aktiv in Chart") werden auf ein '!'-Icon
+# gekuerzt – der volle Text steht im Tooltip der Spalte 1 (keine extrem breiten
+# Spalten im MasterTree).
+MAX_BADGE_CELL_CHARS = 24
+BADGE_TRUNCATE_ICON = "!"
+
+
+class MasterTree(QTreeWidget):
+    """2-Spalten-TreeWidget fuer die hierarchische Service-Darstellung."""
+
+    selection_changed = Signal(str, str)  # set_id, service_id
+
+    def __init__(self, model, parent=None) -> None:
+        super().__init__(parent)
+        self.model = model
+        self.setColumnCount(2)
+        self.setHeaderLabels(["Services", "Status"])
+        header = self.header()
+        if header is not None:
+            header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        # Breite genug fuer die Badges vorbelegen
+        self.setColumnWidth(1, 260)
+        self.setRootIsDecorated(True)
+
+        self._populate()
+        self.itemSelectionChanged.connect(self._emit_selection)
+        self.model.data_changed.connect(self._populate)
+
+    # -------------------------------------------------------------------------
+    # Befuellung aus dem Modell
+    # -------------------------------------------------------------------------
+
+    def _populate(self) -> None:
+        """Baut den Baum aus model.build_tree() neu auf (deterministisch)."""
+        current = self._safe_current_selection()
+        self.blockSignals(True)
+        self.clear()
+        try:
+            for group in self.model.build_tree():
+                group_item = QTreeWidgetItem([str(group.get("label", ""))])
+                group_item.setData(0, ROLE_NODE_TYPE, TYPE_GROUP)
+                group_item.setData(0, ROLE_SET_ID, group.get("group", ""))
+                group_item.setFlags(group_item.flags() & ~Qt.ItemIsSelectable)
+                for child in group.get("children", []):
+                    item = self._build_child_item(group.get("group"), child)
+                    if item is not None:
+                        group_item.addChild(item)
+                self.addTopLevelItem(group_item)
+                group_item.setExpanded(True)
+        except Exception as e:
+            print(f"WARN [MasterTree] Baum-Aufbau fehlgeschlagen: {e}")
+        self.blockSignals(False)
+        # Aktuelle Auswahl nach Refresh wiederherstellen (falls noch vorhanden)
+        try:
+            self._restore_selection(current)
+        except Exception as e:
+            print(f"WARN [MasterTree] Auswahl-Restore fehlgeschlagen: {e}")
+
+    def _safe_current_selection(self) -> Dict[str, str]:
+        """Liess die aktuelle Auswahl defensiv (isValid-Guard gegen zerstoerte
+        Items, z.B. nach einem zwischenzeitlichen clear())."""
+        try:
+            item = self.currentItem()
+            if item is None or not isValid(item):
+                return {"set_id": "", "service_id": ""}
+            node_type = item.data(0, ROLE_NODE_TYPE)
+            set_id = str(item.data(0, ROLE_SET_ID) or "")
+            if node_type == TYPE_SERVICE:
+                return {"set_id": set_id,
+                        "service_id": str(item.data(0, ROLE_INSTANCE_ID) or "")}
+            if node_type == TYPE_SET:
+                return {"set_id": set_id, "service_id": ""}
+            return {"set_id": "", "service_id": ""}
+        except (RuntimeError, AttributeError):
+            return {"set_id": "", "service_id": ""}
+
+    def _build_child_item(self, group: str,
+                          child: Dict[str, Any]) -> Optional[QTreeWidgetItem]:
+        """Erzeugt das Kind-Item fuer einen Knoten der Gruppe `group`."""
+        if group == self.model.GROUP_SETS:
+            return self._build_set_item(child)
+        if group == self.model.GROUP_STANDALONE:
+            return self._build_plugin_item(child, group)
+        if group == self.model.GROUP_PLUGINS:
+            return self._build_plugin_item(child, group)
+        return None
+
+    def _build_set_item(self, child: Dict[str, Any]) -> QTreeWidgetItem:
+        set_item = QTreeWidgetItem([str(child.get("display_name") or "Unbenannt"), ""])
+        set_item.setData(0, ROLE_NODE_TYPE, TYPE_SET)
+        set_item.setData(0, ROLE_SET_ID, child.get("set_id") or "")
+        set_item.setToolTip(0, f"Service-Set: {child.get('set_id') or '?'}")
+        for svc in child.get("services", []):
+            # Bugfix 2.0: KEINE fuehrenden Leerzeichen – QTreeWidget indentiert
+            # Kinder nativ, die zusaetzlichen 2 Spaces raubten nur Platz.
+            badge = str(svc.get("badge") or "")
+            svc_item = QTreeWidgetItem([
+                f"{svc.get('instance_id')}  [{svc.get('plugin_id')}]",
+                self._badge_cell_text(badge),
+            ])
+            svc_item.setData(0, ROLE_NODE_TYPE, TYPE_SERVICE)
+            svc_item.setData(0, ROLE_SET_ID, child.get("set_id") or "")
+            svc_item.setData(0, ROLE_INSTANCE_ID, svc.get("instance_id") or "")
+            svc_item.setData(0, ROLE_PLUGIN_ID, svc.get("plugin_id") or "")
+            if badge:
+                # Bugfix 2.1: voller Relationstext im Tooltip der Badge-Spalte
+                svc_item.setToolTip(1, badge)
+            set_item.addChild(svc_item)
+        return set_item
+
+    def _build_plugin_item(self, child: Dict[str, Any],
+                           group: str) -> QTreeWidgetItem:
+        pid = child.get("plugin_id") or ""
+        # Bugfix 2.0: keine fuehrenden Leerzeichen (native Tree-Indentation)
+        badge = str(child.get("badge") or "")
+        plugin_item = QTreeWidgetItem([pid, self._badge_cell_text(badge)])
+        plugin_item.setData(0, ROLE_NODE_TYPE, TYPE_PLUGIN)
+        plugin_item.setData(0, ROLE_SET_ID, group)
+        plugin_item.setData(0, ROLE_PLUGIN_ID, pid)
+        if badge:
+            # Bugfix 2.1: voller Relationstext im Tooltip der Badge-Spalte
+            plugin_item.setToolTip(1, badge)
+        return plugin_item
+
+    @staticmethod
+    def _badge_cell_text(badge: str) -> str:
+        """Kurzform fuer die Badge-Spalte (Relationen zu Indikatoren).
+
+        Texte laenger als MAX_BADGE_CELL_CHARS werden auf das '!'-Icon
+        gekuerzt (der volle Text steht im Tooltip der Spalte 1) – verhindert
+        extrem breite Spalten bei langen Indikator-Relationen (Bugfix 2.1).
+        """
+        badge = str(badge or "")
+        if len(badge) > MAX_BADGE_CELL_CHARS:
+            return BADGE_TRUNCATE_ICON
+        return badge
+
+    # -------------------------------------------------------------------------
+    # Selektion / Auswertung
+    # -------------------------------------------------------------------------
+
+    def current_selection(self) -> Dict[str, str]:
+        """Liefert die aktuelle Auswahl als {"set_id": ..., "service_id": ...}.
+
+        P15-Bugfix: isValid-Guard – bei wildem Klicken kann currentItem() auf
+        ein durch clear() zerstoertes C++-Item zeigen; der Zugriff auf
+        .data() wuerde sonst einen Access Violation (0xC0000005) ausloesen.
+        """
+        try:
+            item = self.currentItem()
+            if item is None or not isValid(item):
+                return {"set_id": "", "service_id": ""}
+            node_type = item.data(0, ROLE_NODE_TYPE)
+            set_id = str(item.data(0, ROLE_SET_ID) or "")
+            if node_type == TYPE_SERVICE:
+                return {"set_id": set_id,
+                        "service_id": str(item.data(0, ROLE_INSTANCE_ID) or "")}
+            if node_type == TYPE_SET:
+                return {"set_id": set_id, "service_id": ""}
+            return {"set_id": "", "service_id": ""}
+        except (RuntimeError, AttributeError):
+            return {"set_id": "", "service_id": ""}
+
+    def current_set_id(self) -> str:
+        return self.current_selection().get("set_id", "")
+
+    def current_service_id(self) -> str:
+        return self.current_selection().get("service_id", "")
+
+    def _emit_selection(self) -> None:
+        sel = self.current_selection()
+        try:
+            self.selection_changed.emit(sel["set_id"], sel["service_id"])
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _restore_selection(self, previous: Dict[str, str]) -> None:
+        """Stellt die Auswahl nach einem Refresh wieder her (sofern vorhanden).
+
+        P15-Bugfix: setCurrentItem unter blockSignals (kein Signal-Sturm /
+        keine Rekursion in _on_master_selection) + isValid-Guards gegen
+        zerstoerte Items (Access-Violation-Schutz).
+        """
+        if not previous or not previous.get("set_id"):
+            return
+        target_id = previous.get("service_id") or previous.get("set_id")
+        try:
+            self.blockSignals(True)
+            for item in TreeItemIterator(self):
+                if item is None or not isValid(item):
+                    continue
+                svc_id = item.data(0, ROLE_INSTANCE_ID)
+                set_id = item.data(0, ROLE_SET_ID)
+                node_type = item.data(0, ROLE_NODE_TYPE)
+                if (node_type == TYPE_SERVICE and svc_id == target_id
+                        and set_id == previous.get("set_id")):
+                    self.setCurrentItem(item)
+                    break
+                if (node_type == TYPE_SET and set_id == target_id
+                        and not previous.get("service_id")):
+                    self.setCurrentItem(item)
+                    break
+        finally:
+            self.blockSignals(False)
+
+
+class TreeItemIterator:
+    """Leichter Iterator ueber alle QTreeWidgetItems (rekursiv, depth-first).
+
+    P15-Bugfix: isValid-Guard im __next__ – Items koennen zwischen Sammlung
+    und Iteration C++-seitig zerstoert werden (clear() bei data_changed).
+    """
+
+    def __init__(self, tree: QTreeWidget) -> None:
+        self._items: list = []
+        try:
+            for i in range(tree.topLevelItemCount()):
+                self._collect(tree.topLevelItem(i))
+        except (RuntimeError, AttributeError):
+            self._items = []
+        self._index = 0
+
+    def _collect(self, item: Optional[QTreeWidgetItem]) -> None:
+        if item is None or not isValid(item):
+            return
+        self._items.append(item)
+        try:
+            for i in range(item.childCount()):
+                self._collect(item.child(i))
+        except (RuntimeError, AttributeError):
+            pass
+
+    def __iter__(self):
+        self._index = 0
+        return self
+
+    def __next__(self) -> Optional[QTreeWidgetItem]:
+        if self._index >= len(self._items):
+            raise StopIteration
+        item = self._items[self._index]
+        self._index += 1
+        if item is None or not isValid(item):
+            return None
+        return item
 
 ```
 
@@ -28964,6 +33348,441 @@ class ServiceParamColumnsMixin:
 
 --------------------------------------------------
 
+### DATEI: serviceui/parameter_panel.py
+```py
+# serviceui/parameter_panel.py
+"""
+Service-UI: Parameter-Formular (Phase 15 15.02).
+
+Zeigt die Parameter der aktuell markierten Service-Instanz (lookback +
+Plugin-Schema) in einem scrollbaren Formular an (ContentScrollMixin).
+
+Entkoppelt: Das Panel kennt weder Repository noch Datenbank – es bekommt
+instance_id, plugin_id und die Konfiguration ueber `set_service()` und
+meldet Aenderungen ueber `params_changed(instance_id, params)` zurueck
+(Invariante 4: kein SQL in UI; SRP).
+
+Wiederverwendung der Control-Builder aus `ServiceParamColumnsMixin`
+(identisches Widget-Verhalten wie die Service-Spalten im Alt-Fenster).
+"""
+
+from typing import Any, Dict, Optional
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QFormLayout, QGroupBox, QLabel, QVBoxLayout, QWidget,
+)
+
+from scrollable_content import ContentScrollMixin
+from serviceui.param_columns import ServiceParamColumnsMixin
+
+
+class ParameterPanel(ContentScrollMixin, ServiceParamColumnsMixin, QWidget):
+    """Scrollbares Parameter-Formular fuer eine Service-Instanz."""
+
+    params_changed = Signal(str, dict)  # instance_id, params (partial)
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+
+        self._instance_id: Optional[str] = None
+        self._plugin = None
+        self._controls: Dict[Any, QWidget] = {}
+        # Preisskala-Praezision (fix je Symbol) fuer prox_level1..6
+        self._symbol_precision: Optional[int] = None
+
+        self._content = QWidget(self)
+        self._content_layout = QVBoxLayout(self._content)
+        self._content_layout.setContentsMargins(4, 4, 4, 4)
+        self._content_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+
+        self.title_label = QLabel("Kein Service ausgewählt")
+        self.title_label.setStyleSheet("font-weight: bold;")
+        self._content_layout.addWidget(self.title_label)
+
+        self.form_group = QGroupBox("Parameter")
+        self.form_layout = QFormLayout(self.form_group)
+        self.form_layout.setAlignment(Qt.AlignTop)
+        self._content_layout.addWidget(self.form_group)
+
+        # In den Scroll-Wrapper (behaelt natuerliche Groesse, Scrollbars bei Bedarf)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.install_content_scroll(self._content, parent_layout=outer)
+
+    # -------------------------------------------------------------------------
+    # Preisskala-Praezision (ueberschreibt ServiceParamColumnsMixin)
+    # -------------------------------------------------------------------------
+
+    def set_symbol_precision(self, precision: int) -> None:
+        """Setzt die Preisskala-Praezision des aktiven Symbols (fuer prox_levels)."""
+        self._symbol_precision = max(0, int(precision))
+
+    def _get_symbol_precision(self) -> int:
+        return self._symbol_precision if self._symbol_precision is not None else 2
+
+    # -------------------------------------------------------------------------
+    # Befuellung
+    # -------------------------------------------------------------------------
+
+    def set_service(self, instance_id: str, plugin_id: str,
+                    config: Optional[Dict[str, Any]]) -> None:
+        """Laedt die Parameter einer Service-Instanz ins Formular.
+
+        Args:
+            instance_id: instance_id der markierten Instanz ("" -> leeren).
+            plugin_id:   Plugin-ID (aus dem Modell/Set).
+            config:      Service-Konfiguration {"lookback": int,
+                         "params": {...}} oder None (Defaults aus dem Plugin).
+        """
+        self.clear()
+        if not instance_id or not plugin_id:
+            self.title_label.setText("Kein Service ausgewählt")
+            return
+
+        from analytics.features.feature_builder import PluginRegistry
+        try:
+            plugin = PluginRegistry().get(plugin_id)
+        except KeyError:
+            self.title_label.setText(f"Plugin '{plugin_id}' nicht gefunden")
+            return
+
+        self._instance_id = instance_id
+        self._plugin = plugin
+        self.title_label.setText(f"{instance_id}  [{plugin_id}]")
+
+        config = config or {}
+        params = dict(config.get("params") or {})
+        lookback = config.get("lookback")
+
+        full_schema: Dict[str, Any] = dict(getattr(plugin, "base_parameter_schema", None) or {})
+        full_schema.update(dict(plugin.parameter_schema or {}))
+        order = list(getattr(plugin, "parameter_order", None) or (plugin.parameter_schema or {}).keys())
+        for key in (getattr(plugin, "base_parameter_schema", None) or {}):
+            if key not in order:
+                order.append(key)
+        labels = dict(getattr(plugin, "param_labels", None) or {})
+        for key, spec in (getattr(plugin, "base_parameter_schema", None) or {}).items():
+            labels.setdefault(key, spec.get("description") or self._human(key))
+
+        normal_keys = [k for k in order if not full_schema.get(k, {}).get("expert")
+                       and not self._is_visual_key(k)]
+        expert_keys = [k for k in order if full_schema.get(k, {}).get("expert")]
+
+        for key in normal_keys:
+            spec = full_schema.get(key, {})
+            cval = params.get(key, spec.get("default"))
+            ctrl = self._create_param_control(key, cval, spec)
+            self._controls[key] = ctrl
+            self._connect_changed(key, ctrl)
+            self.form_layout.addRow(labels.get(key, self._human(key)), ctrl)
+
+        if expert_keys:
+            exp_grp = QGroupBox("Experten-Optionen")
+            exp_grp.setCheckable(True)
+            exp_grp.setChecked(False)
+            exp_grp.setStyleSheet("")
+            ef = QFormLayout(exp_grp)
+            for key in expert_keys:
+                spec = full_schema.get(key, {})
+                if key == "lookback":
+                    cval = lookback if lookback is not None else spec.get("default")
+                else:
+                    cval = params.get(key, spec.get("default"))
+                ctrl = self._create_param_control(key, cval, spec)
+                self._controls[key] = ctrl
+                self._connect_changed(key, ctrl)
+                ef.addRow(labels.get(key, self._human(key)), ctrl)
+            self._content_layout.addWidget(exp_grp)
+            self._setup_collapsible(exp_grp)
+
+        self._reflow()
+
+    def clear(self) -> None:
+        """Leert das Formular (naechster set_service() baut es neu auf).
+
+        P15-Bugfix: Die Controls der Form-Zeilen werden EXPLIZIT entfernt
+        (setParent(None) + deleteLater) statt nur die Layout-Zeilen zu loesen –
+        sonst stapeln sich die unsichtbaren C++-Widgets als Kinder des
+        form_group und koennen bei schnellen Klicks Signale auf geloeschte
+        Zustände feuern (Memory-Leak + Access-Violation-Kandidat).
+        """
+        self._instance_id = None
+        self._plugin = None
+        self._controls = {}
+        # Widgets der Form-Zeilen entfernen (FormLayout leeren)
+        try:
+            while self.form_layout.rowCount():
+                item = self.form_layout.takeRow(0)
+                # PySide6: TakeRowResult liefert labelItem/fieldItem als
+                # Attribute (QWidgetItem), NICHT als Methoden.
+                field = item.fieldItem
+                if field is not None:
+                    w = field.widget()
+                    if w is not None:
+                        w.setParent(None)
+                        w.deleteLater()
+                label_item = item.labelItem
+                if label_item is not None:
+                    w = label_item.widget()
+                    if w is not None:
+                        w.setParent(None)
+                        w.deleteLater()
+        except (RuntimeError, AttributeError):
+            pass
+        # Experten-Gruppe (falls vorhanden) entfernen
+        try:
+            for child in list(self._content.findChildren(QGroupBox)):
+                if child is not self.form_group:
+                    child.setParent(None)
+                    child.deleteLater()
+        except (RuntimeError, AttributeError):
+            pass
+        self._reflow()
+
+    # -------------------------------------------------------------------------
+    # Auslesen & Aenderungs-Signal
+    # -------------------------------------------------------------------------
+
+    def current_instance_id(self) -> Optional[str]:
+        return self._instance_id
+
+    def collect_params(self) -> Dict[str, Any]:
+        """Liefert die aktuellen Parameterwerte des Formulars."""
+        return {key: self._ctrl_value(ctrl) for key, ctrl in self._controls.items()}
+
+    def _connect_changed(self, key: str, ctrl: QWidget) -> None:
+        """Verdrahtet das Aenderungs-Signal des Controls auf params_changed."""
+        if isinstance(ctrl, (QGroupBox,)):
+            return
+        signal = getattr(ctrl, "valueChanged", None)
+        if signal is None:
+            signal = getattr(ctrl, "textChanged", None)
+        if signal is None:
+            signal = getattr(ctrl, "toggled", None)
+        if signal is None:
+            signal = getattr(ctrl, "currentTextChanged", None)
+        if signal is None:
+            return
+        signal.connect(lambda _v, k=key: self._emit_params_changed(k))
+
+    def _emit_params_changed(self, _key: str) -> None:
+        """P15-Bugfix: try/except – das Panel kann zwischen Signal und Aufruf
+        zerstoert/gecleart worden sein (Access-Violation-Schutz)."""
+        try:
+            if self._instance_id is not None:
+                self.params_changed.emit(self._instance_id, self.collect_params())
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _reflow(self) -> None:
+        """Passt die Groesse an den Inhalt an (deferred, ContentScrollMixin)."""
+        try:
+            if hasattr(self, "_schedule_reflow"):
+                self._schedule_reflow()
+        except (RuntimeError, AttributeError):
+            pass
+
+```
+
+--------------------------------------------------
+
+### DATEI: serviceui/service_selector_widget.py
+```py
+# serviceui/service_selector_widget.py
+"""
+Service-UI: Generisches Service-Auswahl-Widget (Phase 15 15.02).
+
+Konfigurierbares PySide6-Widget mit zwei Betriebsmodi:
+
+  * Modus A (SELECT_ONLY): Kompakte Dropdown-Auswahl (Set-Combo + Service-
+    Combo) fuer die schwellenfreie Wiederverwendung in Analytics (15.03),
+    Backtester oder Charts. Emittiert `selection_changed(set_id, service_id)`.
+  * Modus B (FULL_EDIT):  Vollstaendiges Master-Tree-Widget mit Aktions-
+    Toolbar fuer service_win.py (Erstellen, Umsortieren, Loeschen).
+
+Beide Modi werden ausschliesslich aus dem `ServiceSelectorModel` befuellt
+(lesendes Datenmodell, EventBus-Live-Sync, Invariante 4/5).
+"""
+
+from typing import List, Optional
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QComboBox, QHBoxLayout, QLabel, QVBoxLayout, QWidget,
+)
+
+from analytics.engine.service_selector_model import ServiceSelectorModel
+from serviceui.master_tree import MasterTree
+from serviceui.toolbar import ServiceToolbar
+
+
+class ServiceSelectorWidget(QWidget):
+    """Wiederverwendbares Auswahl-Widget fuer Service-Sets & Services."""
+
+    #: Betriebsmodi
+    MODE_SELECT_ONLY = "SELECT_ONLY"
+    MODE_FULL_EDIT = "FULL_EDIT"
+
+    #: Emittiert (set_id, service_id) – service_id leer, wenn nur ein Set
+    #: gewaehlt wurde (bzw. in SELECT_ONLY ohne aktives Set).
+    selection_changed = Signal(str, str)
+
+    def __init__(self, mode: str = MODE_SELECT_ONLY, model: Optional[ServiceSelectorModel] = None,
+                 parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.model = model or ServiceSelectorModel()
+
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+
+        # Modus-Bausteine (werden je nach Modus erzeugt/eingefuegt)
+        self._compact_row: Optional[QWidget] = None
+        self.master_tree: Optional[MasterTree] = None
+        self.toolbar: Optional[ServiceToolbar] = None
+
+        self.model.data_changed.connect(self._on_model_changed)
+        self.set_mode(mode)
+
+    # -------------------------------------------------------------------------
+    # Modus-Umschaltung
+    # -------------------------------------------------------------------------
+
+    def set_mode(self, mode: str) -> None:
+        """Baut das Widget fuer den gewuenschten Betriebsmodus auf.
+
+        Args:
+            mode: MODE_SELECT_ONLY (Dropdown) oder MODE_FULL_EDIT (Tree+Toolbar).
+        """
+        mode = mode or self.MODE_SELECT_ONLY
+        # Alte Bausteine entfernen
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        self._compact_row = None
+        self.master_tree = None
+        self.toolbar = None
+
+        if mode == self.MODE_FULL_EDIT:
+            self._build_full_edit()
+        else:
+            self._build_select_only()
+
+    def _build_select_only(self) -> None:
+        """Modus A: kompakte Set-/Service-Combos."""
+        self._compact_row = QWidget(self)
+        row = QHBoxLayout(self._compact_row)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        row.addWidget(QLabel("Set:"))
+        self.combo_set = QComboBox()
+        self.combo_set.setMinimumWidth(140)
+        row.addWidget(self.combo_set, 1)
+        row.addWidget(QLabel("Service:"))
+        self.combo_service = QComboBox()
+        self.combo_service.setMinimumWidth(140)
+        row.addWidget(self.combo_service, 1)
+
+        self.combo_set.currentIndexChanged.connect(self._on_set_combo_changed)
+        self.combo_service.currentIndexChanged.connect(self._emit_combo_selection)
+        self._layout.addWidget(self._compact_row)
+        self._repopulate_select_only()
+
+    def _build_full_edit(self) -> None:
+        """Modus B: MasterTree (2 Spalten) + ServiceToolbar."""
+        self.master_tree = MasterTree(self.model, parent=self)
+        self.toolbar = ServiceToolbar(parent=self)
+        self._layout.addWidget(self.toolbar)
+        self._layout.addWidget(self.master_tree, 1)
+
+        self.master_tree.selection_changed.connect(self.selection_changed)
+
+    # -------------------------------------------------------------------------
+    # Modell-Sync
+    # -------------------------------------------------------------------------
+
+    def _on_model_changed(self) -> None:
+        """Modell-Aenderung (EventBus): SELECT_ONLY-Combos neu befuellen;
+        im FULL_EDIT aktualisiert der MasterTree sich selbst."""
+        if self._compact_row is not None:
+            self._repopulate_select_only()
+
+    def _repopulate_select_only(self) -> None:
+        """Befuellt Set- und Service-Combo aus dem Modell (deterministisch)."""
+        current_set = self.combo_set.currentData() if hasattr(self, "combo_set") else None
+        sets = self.model.get_sets()
+
+        self.combo_set.blockSignals(True)
+        self.combo_set.clear()
+        self.combo_set.addItem("(kein Set)", None)
+        for s in sets:
+            self.combo_set.addItem(
+                str(s.get("display_name") or s.get("set_id") or "Unbenannt"),
+                s.get("set_id"))
+        if current_set is not None:
+            idx = self.combo_set.findData(current_set)
+            if idx >= 0:
+                self.combo_set.setCurrentIndex(idx)
+        self.combo_set.blockSignals(False)
+
+        self._fill_service_combo(self.combo_set.currentData())
+
+    def _fill_service_combo(self, set_id: Optional[str]) -> None:
+        """Befuellt die Service-Combo mit den Services des gewaehlten Sets."""
+        self.combo_service.blockSignals(True)
+        self.combo_service.clear()
+        self.combo_service.addItem("(Service wählen)", None)
+        if set_id:
+            s = self.model.find_set(set_id)
+            services = (s or {}).get("services") or {}
+            for iid in (s or {}).get("execution_order") or []:
+                cfg = services.get(iid) or {}
+                pid = cfg.get("plugin_id") or iid
+                self.combo_service.addItem(f"{iid} [{pid}]", iid)
+        self.combo_service.blockSignals(False)
+
+    def _on_set_combo_changed(self, _index: int) -> None:
+        self._fill_service_combo(self.combo_set.currentData())
+        self._emit_combo_selection()
+
+    def _emit_combo_selection(self) -> None:
+        set_id = self.combo_set.currentData() or ""
+        service_id = self.combo_service.currentData() or ""
+        self.selection_changed.emit(set_id, service_id)
+
+    # -------------------------------------------------------------------------
+    # Oeffentliche Auswahl-API
+    # -------------------------------------------------------------------------
+
+    def current_set_id(self) -> str:
+        if self._compact_row is not None:
+            return self.combo_set.currentData() or ""
+        if self.master_tree is not None:
+            return self.master_tree.current_set_id()
+        return ""
+
+    def current_service_id(self) -> str:
+        if self._compact_row is not None:
+            return self.combo_service.currentData() or ""
+        if self.master_tree is not None:
+            return self.master_tree.current_service_id()
+        return ""
+
+    def get_plugin_ids(self) -> List[str]:
+        """Alle verfuegbaren Plugin-IDs (sortiert) – fuer das [➕]-Popup."""
+        return sorted(self.model.get_plugins().keys())
+
+    def refresh(self) -> None:
+        """Erzwingt einen Modell-Refresh (z.B. nach manuellen DB-Aenderungen)."""
+        self.model.refresh()
+
+```
+
+--------------------------------------------------
+
 ### DATEI: serviceui/service_set_utils.py
 ```py
 # serviceui/service_set_utils.py
@@ -29043,10 +33862,19 @@ from typing import Any, Dict, Optional
 from PySide6.QtCore import QFile, QIODevice, QTimer, Qt, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar,
-    QPushButton, QTextEdit, QWidget,
+    QCheckBox, QComboBox, QDoubleSpinBox, QGroupBox, QHBoxLayout, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar,
+    QPushButton, QSpinBox, QSplitter, QTextEdit, QVBoxLayout, QWidget,
 )
+
+# P15-Bugfix: shiboken6.isValid() schuetzt vor dem Zugriff auf bereits
+# C++-seitig zerstoerte Qt-Objekte (Access Violation 0xC0000005 bei wildem
+# Klicken, wenn z.B. Controls per deleteLater entfernt werden).
+try:
+    from shiboken6 import isValid as _qt_valid
+except ImportError:  # pragma: no cover
+    def _qt_valid(obj) -> bool:  # type: ignore
+        return obj is not None
 
 from analytics.background_workers.historical_scanner import HistoricalScanner
 from analytics.engine.description_dialog import ServiceDescriptionDialog
@@ -29063,13 +33891,29 @@ from serviceui.set_item_adapter import ServiceSetItemAdapter, _ServiceSetItemAda
 from serviceui.param_columns import ServiceParamColumnsMixin
 from serviceui.trash_dialog import ServiceSetTrashDialog
 
+# Phase 15 15.01: Symbol- & Favoriten-Verwaltung (SymbolsWindow + EventBus)
+from serviceui.symbols_win import SymbolsWindow
+from symbol_repository import SymbolRepository, get_symbol_repository
+from config.event_bus import event_bus
+
+# Phase 15 15.02: Service-UI Refactoring – MasterTree & generischer
+# ServiceSelector (ServiceSelectorWidget im Modus FULL_EDIT) + ParameterPanel.
+from serviceui.service_selector_widget import ServiceSelectorWidget
+from serviceui.parameter_panel import ParameterPanel
+
 # Projekt-Root (eine Ebene über serviceui/) – für die UI-Datei unter ui/.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
-@register_persistent_window(auto_restore=False)
+@register_persistent_window()
 class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActionsMixin, PersistentWindow):
     INSTANCE_ID = "win_service"
+    # Bugfix 04.08.2026 (Fenster-Historie): auto_restore=True – wie chart_win
+    # wird das ServiceWindow beim App-Start wiederhergestellt, wenn es beim
+    # Beenden der App OFFEN war (Geometrie/Position werden dann restauriert).
+    # _keep_history_on_close bleibt Default (False): ein MANUELL geschlossenes
+    # Fenster wird aus der aktiven History entfernt (delete_instance) und
+    # poppt beim naechsten Start NICHT wieder auf.
 
     def __init__(self, parent=None, service_set_repo: Optional[ServiceSetRepository] = None):
         super().__init__(parent)
@@ -29160,17 +34004,49 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self.content_widget = self.ui.centralWidget()
         self.central_layout = self.content_widget.layout() if self.content_widget else None
         if self.central_layout is not None:
-            # 5.4 User-Anpassung: 'Service-Parameter' oben RECHTS direkt neben
-            # dem Rahmen 'Service-Sets' (gleiche Zeile, Service-Sets links).
+            # Phase 15 15.02 (Orchestrator): QSplitter-Zusammensetzung.
+            #  * Links:  bestehender Set-Editor + dynamische Service-Spalten.
+            #  * Rechts: MasterTree (2-Spalten-Hierarchie, Live-Status-Badges,
+            #            ServiceSelectorWidget im Modus FULL_EDIT) + ParameterPanel.
             self.top_row = QHBoxLayout()
             self.top_row.setSpacing(6)
             idx = self.central_layout.indexOf(self.group_service_sets)
             if idx < 0:
                 idx = 0
             self.central_layout.removeWidget(self.group_service_sets)
-            self.top_row.addWidget(self.group_service_sets)
-            self.top_row.addWidget(self.widget_service_columns)
+
+            self._editor_panel = QWidget()
+            editor_layout = QVBoxLayout(self._editor_panel)
+            editor_layout.setContentsMargins(0, 0, 0, 0)
+            editor_layout.setSpacing(6)
+            editor_layout.addWidget(self.group_service_sets)
+            editor_layout.addWidget(self.widget_service_columns)
+
+            self.right_panel = QWidget()
+            right_layout = QVBoxLayout(self.right_panel)
+            right_layout.setContentsMargins(0, 0, 0, 0)
+            right_layout.setSpacing(6)
+            # MasterTree + Aktions-Toolbar (Modus B / FULL_EDIT)
+            self.service_selector = ServiceSelectorWidget(
+                mode=ServiceSelectorWidget.MODE_FULL_EDIT, parent=self)
+            # Parameter-Formular fuer die markierte Service-Instanz
+            self.param_panel = ParameterPanel(parent=self)
+            right_layout.addWidget(self.service_selector, 2)
+            right_layout.addWidget(self.param_panel, 1)
+
+            self.main_splitter = QSplitter(Qt.Horizontal)
+            self.main_splitter.addWidget(self._editor_panel)
+            self.main_splitter.addWidget(self.right_panel)
+            self.main_splitter.setStretchFactor(0, 3)
+            self.main_splitter.setStretchFactor(1, 2)
+
+            self.top_row.addWidget(self.main_splitter)
             self.central_layout.insertLayout(idx, self.top_row)
+        # Fenstergroesse (15.02): 1280 x 800 als Default – Single Source of
+        # Truth ist die ui/service_win.ui-Geometrie (der QUiLoader wendet sie
+        # beim Laden an). KEIN resize()-Aufruf im Code: der 5.4-Content-Reflow
+        # (resize_to_clamped_content) darf die Groesse weiterhin inhalt- und
+        # bildschirmbasiert anpassen (keine fixen Pixel im Quellcode).
         # Scroll-Wrapper: gesamtes Fenster scrollbar, wenn Inhalt > Bildschirm
         # (ContentScrollMixin). Der Inhalt behält seine natürliche Größe; das
         # Fenster wird auf den Bildschirm geklemmt (Scrollbars erscheinen erst,
@@ -29240,6 +34116,28 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             # Symbol-Wechsel Cache invalidieren + Spalten neu bauen.
             self.combo_symbol.currentTextChanged.connect(self._on_symbol_changed)
 
+        # Phase 15 15.01: Favoriten-Symbol-Verwaltung.
+        # ★-Button rechts neben der Symbol-ComboBox oeffnet das nicht-modale
+        # SymbolsWindow (Favoriten verwalten). Das Symbol-Dropdown zeigt nur
+        # Favoriten (is_favorite == True) und wird ueber den EventBus bei
+        # jeder Favoriten-Aenderung neu befuellt (Entkopplung, kein direktes
+        # Fenster-Wissen).
+        self._symbol_repo: SymbolRepository = get_symbol_repository()
+        self.btn_symbol_fav: QPushButton = QPushButton("★", self.ui)
+        self.btn_symbol_fav.setObjectName("btn_symbol_fav")
+        self.btn_symbol_fav.setToolTip(
+            "Favoriten verwalten – oeffnet das Symbol-Fenster. "
+            "Das Symbol-Dropdown zeigt nur Favoriten.")
+        self.btn_symbol_fav.setFixedWidth(32)
+        layout_symbol = self.ui.findChild(QHBoxLayout, "layout_symbol")
+        if layout_symbol is not None and self.combo_symbol is not None:
+            idx = layout_symbol.indexOf(self.combo_symbol)
+            layout_symbol.insertWidget(idx + 1, self.btn_symbol_fav)
+        self.btn_symbol_fav.clicked.connect(self.open_symbols_window)
+        # EventBus: Favoriten-Aenderungen -> ComboBox neu befuellen
+        event_bus.favorites_changed.connect(self._refresh_symbol_combo)
+        self._refresh_symbol_combo()
+
         # Set-Dropdown initial befüllen (list_sets() als Quelle)
         self.refresh_set_list()
 
@@ -29260,6 +34158,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # Phase 14 P14-02: Hot-Reload der Custom-Plugins (data/custom_plugins/)
         if self.btn_reload_plugins:
             self.btn_reload_plugins.clicked.connect(self.reload_plugins)
+
+        # Phase 15 15.02: MasterTree/ServiceSelector (FULL_EDIT) verdrahten –
+        # Toolbar-Aktionen auf die bestehenden Set-Methoden + EventBus-Sync.
+        self._wire_selector_toolbar()
+
         self.log(f"Verfügbare Plugins: {_available_plugin_ids()}")
 
         # State asynchron wiederherstellen (nach show(), damit move/resize vom Window-Manager akzeptiert werden)
@@ -29289,6 +34192,189 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         if (self.combo_set is not None and self.combo_set.currentIndex() >= 0
                 and self.service_columns_layout is not None):
             self._rebuild_columns()
+        # ParameterPanel-Praezision (prox_level1..6) je Symbol synchronisieren
+        if getattr(self, "param_panel", None) is not None:
+            self.param_panel.set_symbol_precision(self._get_symbol_precision())
+
+    # --- Phase 15 15.02: MasterTree / ServiceSelector (FULL_EDIT) ---
+
+    def _wire_selector_toolbar(self) -> None:
+        """Verdrahtet die ServiceSelectorWidget-Toolbar (Modus FULL_EDIT)
+        mit den bestehenden Set-Methoden (add/move/remove/reload)."""
+        selector = getattr(self, "service_selector", None)
+        if selector is None or selector.toolbar is None:
+            return
+        toolbar = selector.toolbar
+        toolbar.request_add_popup = self._show_toolbar_add_popup
+        toolbar.add_service_requested.connect(self._toolbar_add_service)
+        toolbar.move_up_requested.connect(lambda: self.move_order_item(-1))
+        toolbar.move_down_requested.connect(lambda: self.move_order_item(1))
+        toolbar.remove_requested.connect(self.remove_instance)
+        toolbar.reload_plugins_requested.connect(self.reload_plugins)
+        # MasterTree-Auswahl -> Editor + ParameterPanel synchronisieren
+        if selector.master_tree is not None:
+            selector.master_tree.selection_changed.connect(self._on_master_selection)
+        # ParameterPanel-Aenderungen -> Set-Definition + Spalten (Live-Edit)
+        self.param_panel.params_changed.connect(self._on_param_panel_changed)
+
+    def _show_toolbar_add_popup(self) -> None:
+        """Zeigt das [➕ Service]-Popup mit allen verfuegbaren Plugins."""
+        selector = getattr(self, "service_selector", None)
+        if selector is not None and selector.toolbar is not None:
+            selector.toolbar.show_add_menu(selector.get_plugin_ids())
+
+    @Slot(str)
+    def _toolbar_add_service(self, plugin_id: str) -> None:
+        """Uebernimmt die Popup-Auswahl ins Instanz-Feld und fuegt den
+        Service zum aktiven Set hinzu (add_instance)."""
+        if not plugin_id:
+            return
+        if self.edit_new_instance:
+            self.edit_new_instance.setText(f"{plugin_id} [{plugin_id}]")
+        self.add_instance()
+
+    @Slot(str, str)
+    def _on_master_selection(self, set_id: str, service_id: str) -> None:
+        """Synchronisiert Editor (Set-Combo/Liste) und ParameterPanel mit der
+        MasterTree-Auswahl.
+
+        P15-Bugfix: isValid-Guards – bei wildem Klicken koennen combo_set /
+        list_execution_order waehrend des Handlers neu aufgebaut werden
+        (setCurrentIndex -> _on_set_selected -> load_set_into_editor); der
+        Zugriff auf geloeschte Items wuerde sonst crashen (0xC0000005).
+        """
+        try:
+            if set_id and self.combo_set is not None and _qt_valid(self.combo_set):
+                idx = self.combo_set.findData(set_id)
+                if idx >= 0 and self.combo_set.currentData() != set_id:
+                    self.combo_set.setCurrentIndex(idx)
+        except (RuntimeError, AttributeError):
+            pass
+        if service_id and self.list_execution_order is not None:
+            try:
+                if not _qt_valid(self.list_execution_order):
+                    return
+                for i in range(self.list_execution_order.count()):
+                    item = self.list_execution_order.item(i)
+                    if item is None or not _qt_valid(item):
+                        continue
+                    if item.data(Qt.UserRole) == service_id:
+                        self.list_execution_order.setCurrentRow(i)
+                        self._current_list_iid = service_id
+                        break
+            except (RuntimeError, AttributeError):
+                pass
+        self._sync_param_panel()
+
+    def _sync_param_panel(self) -> None:
+        """Laedt die Parameter der markierten Service-Instanz ins ParameterPanel."""
+        if getattr(self, "param_panel", None) is None:
+            return
+        try:
+            if not _qt_valid(self.param_panel):
+                return
+            iid = self._current_list_iid
+            if not iid or not self._current_set_definition:
+                self.param_panel.clear()
+                return
+            cfg = dict((self._current_set_definition.get("services") or {}).get(iid, {}))
+            pid = str(cfg.get("plugin_id") or iid)
+            self.param_panel.set_symbol_precision(self._get_symbol_precision())
+            self.param_panel.set_service(iid, pid, cfg)
+        except (RuntimeError, AttributeError):
+            pass
+
+    @Slot(str, dict)
+    def _on_param_panel_changed(self, instance_id: str, params: dict) -> None:
+        """Uebernimmt ParameterPanel-Aenderungen in die Set-Definition und die
+        Editor-Spalten (Live-Edit, damit collect_set_definition() sie findet).
+
+        P15-Bugfix: isValid-Guard auf ctrl – bei wildem Klicken koennen
+        Editor-Spalten-Controls zwischenzeitlich per deleteLater entfernt
+        worden sein (0xC0000005-Schutz).
+        """
+        if not instance_id:
+            return
+        # 1) In die Set-Definition schreiben
+        if self._current_set_definition:
+            services = self._current_set_definition.setdefault("services", {})
+            cfg = services.setdefault(
+                instance_id, {"plugin_id": "", "lookback": 1000, "params": {}})
+            if "lookback" in params:
+                try:
+                    cfg["lookback"] = int(params["lookback"])
+                except (TypeError, ValueError):
+                    pass
+            cfg.setdefault("params", {}).update({
+                k: v for k, v in params.items() if k != "lookback"
+            })
+        # 2) Editor-Spalten synchron halten (falls Controls existieren)
+        for (iid, key), ctrl in self._service_param_controls.items():
+            if iid == instance_id and key in params and _qt_valid(ctrl):
+                self._set_ctrl_value(ctrl, params[key])
+
+    @staticmethod
+    def _set_ctrl_value(ctrl: QWidget, value: Any) -> None:
+        """Setzt den Wert eines Parameter-Controls typsicher.
+
+        P15-Bugfix: try/except – Control kann zwischen Iteration und Zugriff
+        per deleteLater zerstoert worden sein (Access-Violation-Schutz).
+        """
+        try:
+            if isinstance(ctrl, QCheckBox):
+                ctrl.setChecked(bool(value))
+            elif isinstance(ctrl, QSpinBox):
+                ctrl.setValue(int(value))
+            elif isinstance(ctrl, QDoubleSpinBox):
+                ctrl.setValue(float(value))
+            elif isinstance(ctrl, QComboBox):
+                ctrl.setCurrentText(str(value))
+            else:
+                ctrl.setText(str(value))
+        except (RuntimeError, AttributeError):
+            pass
+
+    # --- Phase 15 15.01: Symbol- & Favoriten-Verwaltung ---
+
+    @Slot()
+    def open_symbols_window(self) -> None:
+        """Oeffnet das nicht-modale SymbolsWindow (Singleton-Verhalten).
+
+        Analog zu open_service_window in main.py: Existiert bereits eine
+        sichtbare Instanz, wird sie in den Vordergrund geholt statt neu
+        geoeffnet (PersistentWindow.get_existing_instance()).
+        """
+        existing = SymbolsWindow.get_existing_instance()
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
+        win = SymbolsWindow(self)  # parent=self nur fuer state_manager-Zugriff
+        win.show()
+
+    def _refresh_symbol_combo(self) -> None:
+        """Befuellt die Symbol-ComboBox aus den Favoriten (is_favorite == True).
+
+        Wird beim Start und bei jedem `EventBus.favorites_changed`-Event
+        aufgerufen (Verbindung im __init__). Fallback auf die Standard-
+        Defaults (SILVER/GOLD/BTCUSD), falls keine Favoriten gesetzt sind –
+        damit der Scanner nie ohne Symbol-Auswahl steht. Die aktuelle
+        Auswahl bleibt erhalten, sofern sie noch Favorit ist.
+        """
+        if not self.combo_symbol:
+            return
+        favorites = self._symbol_repo.get_favorite_symbols()
+        if not favorites:
+            favorites = list(SymbolRepository.DEFAULT_SYMBOLS)
+        current = self.combo_symbol.currentText()
+        self.combo_symbol.blockSignals(True)
+        self.combo_symbol.clear()
+        for sym in favorites:
+            self.combo_symbol.addItem(sym)
+        idx = self.combo_symbol.findText(current)
+        if idx >= 0:
+            self.combo_symbol.setCurrentIndex(idx)
+        self.combo_symbol.blockSignals(False)
 
     # --- Scanner ---
 
@@ -29436,6 +34522,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         if self.list_execution_order:
             self.list_execution_order.clear()
         self._clear_service_columns()
+        # Phase 15.02: ParameterPanel leeren (kein Set mehr aktiv)
+        self._sync_param_panel()
 
     @Slot(int)
     def _on_set_selected(self, index: int) -> None:
@@ -29476,6 +34564,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                 item.setToolTip(self._build_tooltip(iid, cfg) + lock_tip)
                 self.list_execution_order.addItem(item)
         self._build_service_columns(definition)
+        # Phase 15.02: ParameterPanel an das geladene Set angleichen
+        self._sync_param_panel()
 
     def collect_current_order(self) -> list:
         """Liefert die instance_ids aus der Liste (aktuelle execution_order)."""
@@ -29502,6 +34592,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         lw.insertItem(new_row, item)
         lw.setCurrentRow(new_row)
         self._rebuild_columns()
+        # Phase 15.02: Struktur-Aenderung -> EventBus (Live-Sync des MasterTree)
+        event_bus.service_set_changed.emit()
 
     @Slot()
     def remove_instance(self) -> None:
@@ -29528,6 +34620,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             return
         lw.takeItem(lw.currentRow())
         self._rebuild_columns()
+        # Phase 15.02: Struktur-Aenderung -> EventBus (Live-Sync des MasterTree)
+        event_bus.service_set_changed.emit()
 
     @Slot()
     def _on_plugin_select_changed(self, plugin_id: str) -> None:
@@ -29586,6 +34680,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self.edit_new_instance.clear()
         self.log(f"Service hinzugefügt: {iid} [{plugin_id}]")
         self._rebuild_columns()
+        # Phase 15.02: Struktur-Aenderung -> EventBus (Live-Sync des MasterTree)
+        event_bus.service_set_changed.emit()
 
     def collect_set_definition(self) -> Dict[str, Any]:
         """Baut aus dem Editor eine ServiceSetDefinition.
@@ -29706,6 +34802,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             row = self.list_execution_order.currentRow()
             if row >= 0:
                 self._current_list_iid = self.list_execution_order.item(row).data(Qt.UserRole)
+        # Phase 15.02: ParameterPanel an die markierte Instanz angleichen
+        self._sync_param_panel()
 
     @Slot()
     def _show_service_info(self) -> None:
@@ -29899,6 +34997,7 @@ from typing import Any, Dict, List, Optional
 
 from chart.widgets.named_item_actions import NamedItemAdapter
 from analytics.engine.service_set_repository import ServiceSetRepository
+from config.event_bus import event_bus
 
 
 class _ServiceSetItemAdapter(NamedItemAdapter):
@@ -29960,6 +35059,10 @@ class _ServiceSetItemAdapter(NamedItemAdapter):
         definition["display_name"] = name
         set_id = self.dlg.set_repo.save_set(definition)
         self.dlg.log(f"Set gespeichert: {set_id}")
+        # Phase 15.02: Struktur-Aenderung -> EventBus, damit alle lauschenden
+        # ServiceSelectorModel-Instanzen (MasterTree, Analytics, ...) live
+        # aktualisieren (Invariante 5: schwellenfreie Entkopplung).
+        event_bus.service_set_changed.emit()
         return set_id
 
     def _item_delete_current(self) -> bool:
@@ -29971,6 +35074,9 @@ class _ServiceSetItemAdapter(NamedItemAdapter):
             # P14-05: Soft-Delete – das Set liegt im Papierkorb und kann über
             # den Papierkorb-Dialog wiederhergestellt werden.
             self.dlg.log(f"Set in den Papierkorb verschoben (P14-05): {set_id}")
+            # Phase 15.02: Struktur-Aenderung -> EventBus (Live-Sync aller
+            # ServiceSelectorModel-Instanzen, Invariante 5).
+            event_bus.service_set_changed.emit()
             return True
         self.dlg.log(f"Set '{set_id}' nicht gefunden.")
         return False
@@ -30070,6 +35176,387 @@ class ServiceSetRunWorker(QThread):
 
 --------------------------------------------------
 
+### DATEI: serviceui/status_panel.py
+```py
+# serviceui/status_panel.py
+"""
+Service-UI: Status- & Log-Panel (Phase 15 15.02).
+
+Entkoppelte Anzeige fuer Laufzeit, Fortschritt und das Scan-/Set-Log.
+Reines Anzeige-Widget ohne Geschaeftslogik (SRP): Der Orchestrator
+(service_win.py) versorgt es ueber Methoden mit Werten.
+
+Enthaelt:
+  * Statuszeile (Laufzeit / Fortschritt)
+  * Log-View (QTextEdit, readonly) mit Auto-Scroll ans Ende
+"""
+
+from typing import Optional
+
+from PySide6.QtCore import Qt, Slot
+from PySide6.QtWidgets import (
+    QHBoxLayout, QLabel, QProgressBar, QTextEdit, QVBoxLayout, QWidget,
+)
+
+
+class StatusPanel(QWidget):
+    """Status- & Log-Anzeige des Service-Fensters."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+
+        self.label_elapsed = QLabel("Laufzeit:")
+        self.label_elapsed_value = QLabel("00:00:00")
+        self.label_progress = QLabel("Fortschritt:")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        self.text_log = QTextEdit()
+        self.text_log.setReadOnly(True)
+        self.text_log.setPlaceholderText("Scan-/Set-Log wird hier angezeigt...")
+
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.label_elapsed)
+        status_row.addWidget(self.label_elapsed_value)
+        status_row.addStretch(1)
+        status_row.addWidget(self.label_progress)
+        status_row.addWidget(self.progress_bar, 1)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        lay.addLayout(status_row)
+        lay.addWidget(self.text_log, 1)
+
+    # -------------------------------------------------------------------------
+    # Laufzeit
+    # -------------------------------------------------------------------------
+
+    @Slot(int)
+    def set_elapsed_seconds(self, seconds: int) -> None:
+        """Setzt die Laufzeit-Anzeige (h:mm:ss)."""
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        s = seconds % 60
+        self.label_elapsed_value.setText(f"{h:02d}:{m:02d}:{s:02d}")
+
+    def reset_elapsed(self) -> None:
+        self.set_elapsed_seconds(0)
+
+    # -------------------------------------------------------------------------
+    # Fortschritt
+    # -------------------------------------------------------------------------
+
+    @Slot(int)
+    def set_progress(self, current: int, total: int) -> None:
+        """Setzt die Fortschritts-Anzeige."""
+        self.progress_bar.setMaximum(max(total, 1))
+        self.progress_bar.setValue(current)
+
+    @Slot(int)
+    def set_progress_value(self, value: int) -> None:
+        self.progress_bar.setValue(value)
+
+    # -------------------------------------------------------------------------
+    # Log
+    # -------------------------------------------------------------------------
+
+    @Slot(str)
+    def log(self, message: str) -> None:
+        """Haengt eine Meldung ans Log an und scrollt ans Ende."""
+        self.text_log.append(message)
+        bar = self.text_log.verticalScrollBar()
+        if bar is not None:
+            bar.setValue(bar.maximum())
+
+    def clear_log(self) -> None:
+        self.text_log.clear()
+
+```
+
+--------------------------------------------------
+
+### DATEI: serviceui/symbols_win.py
+```py
+# serviceui/symbols_win.py
+"""
+serviceui/symbols_win.py - Nicht-modales SymbolsWindow (Phase 15.01).
+
+Ermoeglicht die zentrale Symbol- & Favoriten-Verwaltung:
+- 2-Spalten-Tabelle (Spalte 0: Symbol, Spalte 1: ★ Favoriten-Toggle per Klick).
+- Live-Suche mit `scrollToItem` zum ersten Treffer.
+- ESC schliesst das Fenster.
+- Jeder Favoriten-Toggle persistiert ueber `SymbolRepository` und emittiert
+  `EventBus.favorites_changed` – ServiceWindow (und spaeter AnalyticsWindow)
+  befuellen daraufhin ihre Symbol-Dropdowns neu (Entkopplung via EventBus).
+
+Architektur (SRP): Das Fenster ist NUR Event-Handling & Rendering. SQL-Zugriff
+erfolgt exklusiv ueber `SymbolRepository` (kein SQL in UI, Invariante 4).
+"""
+
+from typing import Optional
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QHeaderView,
+    QLineEdit,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from config.event_bus import event_bus
+from persistent_win import PersistentWindow, register_persistent_window
+from symbol_repository import SymbolRepository, get_symbol_repository
+
+# Sichtbare Darstellung: ausgefuellter Stern = Favorit, leerer Stern = nicht.
+STAR_FAVORITE = "★"
+STAR_NORMAL = "☆"
+
+
+@register_persistent_window(auto_restore=False)
+class SymbolsWindow(PersistentWindow):
+    """Nicht-modales Fenster zur Symbol- & Favoriten-Verwaltung."""
+
+    INSTANCE_ID = "win_symbols"
+
+    def __init__(self, parent=None, repo: Optional[SymbolRepository] = None) -> None:
+        super().__init__(parent)
+        self.repo: SymbolRepository = repo or get_symbol_repository()
+        self._build_ui()
+        self._load_symbols()
+
+    # ------------------------------------------------------------------
+    # UI-Aufbau (reines Rendering, kein SQL)
+    # ------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        self.setWindowTitle("PyTrader - Symbole & Favoriten")
+        self.resize(420, 560)
+
+        central = QWidget(self)
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+
+        self.search_edit = QLineEdit(self)
+        self.search_edit.setPlaceholderText("Symbol suchen...")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(self._apply_filter)
+        layout.addWidget(self.search_edit)
+
+        self.table = QTableWidget(0, 2, self)
+        self.table.setHorizontalHeaderLabels(["Symbol", "★"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setAlternatingRowColors(True)
+        header = self.table.horizontalHeader()
+        if header is not None:
+            header.setSectionResizeMode(0, QHeaderView.Stretch)
+            header.setSectionResizeMode(1, QHeaderView.Fixed)
+            self.table.setColumnWidth(1, 48)
+        # Spalte 1 zentriert darstellen (★ / ☆)
+        self.table.setColumnWidth(1, 48)
+        self.table.cellClicked.connect(self._on_cell_clicked)
+        layout.addWidget(self.table)
+
+    # ------------------------------------------------------------------
+    # Daten-Befuellung
+    # ------------------------------------------------------------------
+    def _load_symbols(self) -> None:
+        """Befuellt die Tabelle aus der gespeicherten Liste (`get_symbols()`).
+
+        User-Anweisung 04.08.2026 (15.01-Nachtrag 3): Der MT5-Live-Fetch wurde
+        aus diesem Fenster entfernt – alle Broker-Symbole werden NUR noch
+        EINMALIG beim App-Start (main.py) von MT5 geladen und persistiert.
+        Dieses Fenster liest ausschliesslich den gespeicherten DB-Stand
+        (kein MT5-Zugriff beim Oeffnen -> keine Verzoegerungen).
+        """
+        self._rows: dict = {}  # symbol -> Zeilen-Index
+        self.table.setRowCount(0)
+        for entry in self.repo.get_symbols():
+            self._append_symbol_row(entry["symbol"], entry["is_favorite"])
+
+    def _append_symbol_row(self, symbol: str, is_favorite: bool) -> None:
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        sym_item = QTableWidgetItem(symbol)
+        sym_item.setData(Qt.UserRole, symbol)
+        self.table.setItem(row, 0, sym_item)
+        star_item = QTableWidgetItem(STAR_FAVORITE if is_favorite else STAR_NORMAL)
+        star_item.setTextAlignment(Qt.AlignCenter)
+        star_item.setData(Qt.UserRole, symbol)
+        self.table.setItem(row, 1, star_item)
+        self._rows[symbol] = row
+
+    # ------------------------------------------------------------------
+    # Interaktion
+    # ------------------------------------------------------------------
+    def _on_cell_clicked(self, row: int, column: int) -> None:
+        """Klick in Spalte 1 togglet den Favoriten und emittiert das Event."""
+        if column != 1:
+            return
+        item = self.table.item(row, 0)
+        if item is None:
+            return
+        symbol = str(item.data(Qt.UserRole) or item.text())
+        new_state = self.repo.toggle_favorite(symbol)
+        star_item = self.table.item(row, 1)
+        if star_item is not None:
+            star_item.setText(STAR_FAVORITE if new_state else STAR_NORMAL)
+        event_bus.favorites_changed.emit()
+
+    def _apply_filter(self, text: str) -> None:
+        """Live-Filter: blendet nicht passende Zeilen aus und scrollt zum
+        ersten Treffer (scrollToItem, Spalte 0)."""
+        query = text.strip().lower()
+        first_visible_row = -1
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            symbol = item.text().lower() if item is not None else ""
+            match = (query in symbol) if query else True
+            self.table.setRowHidden(row, not match)
+            if match and first_visible_row < 0:
+                first_visible_row = row
+        if first_visible_row >= 0:
+            item = self.table.item(first_visible_row, 0)
+            if item is not None:
+                self.table.scrollToItem(item, QAbstractItemView.PositionAtTop)
+
+    def keyPressEvent(self, event) -> None:
+        """ESC schliesst das Fenster (Standard-PersistentWindow-Verhalten)."""
+        if event.key() == Qt.Key_Escape:
+            self.close()
+            return
+        super().keyPressEvent(event)
+
+```
+
+--------------------------------------------------
+
+### DATEI: serviceui/toolbar.py
+```py
+# serviceui/toolbar.py
+"""
+Service-UI: Aktions-Toolbar (Phase 15 15.02).
+
+Entkoppelte Button-Leiste fuer Struktur-Aktionen des Service-Fensters
+(Modus B / FULL_EDIT des ServiceSelectorWidget):
+
+  * [➕ Service]   – oeffnet ein Popup-Menue mit allen verfuegbaren Plugins
+                     (Auswahl emittiert `add_service_requested(plugin_id)`).
+  * [▲] / [▼]      – Aenderung der execution_order im aktiven Set.
+  * [🗑️ Entfernen] – Entfernen des markierten Services (P14-04-Sperrpruefung
+                     fuehrt der Orchestrator durch).
+  * [🔄 Plugins]   – Hot-Reload der Custom-Plugins (P14-02).
+
+Die Toolbar emittiert NUR Signale – sie kennt weder das Repository noch die
+Datenbank (Invariante 4: kein SQL in UI; SRP: eine Aufgabe pro Klasse).
+"""
+
+from typing import List, Optional
+
+from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtWidgets import (
+    QHBoxLayout, QMenu, QPushButton, QWidget,
+)
+
+
+class ServiceToolbar(QWidget):
+    """Aktions-Buttons der Service-Verwaltung (schwellenfrei entkoppelt)."""
+
+    #: Emittiert mit der plugin_id, wenn im [➕ Service]-Popup ein Plugin gewaehlt wird
+    add_service_requested = Signal(str)
+    #: Ausfuehrungs-Reihenfolge: um -1 (hoch) bzw. +1 (runter) verschieben
+    move_up_requested = Signal()
+    move_down_requested = Signal()
+    #: Markierten Service entfernen (Orchestrator fuehrt P14-04-Sperrpruefung aus)
+    remove_requested = Signal()
+    #: Plugins neu laden (P14-02 Hot-Reload)
+    reload_plugins_requested = Signal()
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._menu: Optional[QMenu] = None
+
+        self.btn_add = QPushButton("➕ Service")
+        self.btn_add.setToolTip(
+            "Service zum aktiven Set hinzufuegen – waehlt das Plugin aus einem Popup.")
+        self.btn_move_up = QPushButton("▲")
+        self.btn_move_up.setToolTip("Service in der Reihenfolge nach oben verschieben.")
+        self.btn_move_down = QPushButton("▼")
+        self.btn_move_down.setToolTip("Service in der Reihenfolge nach unten verschieben.")
+        self.btn_remove = QPushButton("🗑️ Entfernen")
+        self.btn_remove.setToolTip(
+            "Markierten Service aus dem Set entfernen (P14-04-Sperrpruefung).")
+        self.btn_reload = QPushButton("🔄 Plugins")
+        self.btn_reload.setToolTip(
+            "P14-02: Custom-Plugins aus data/custom_plugins/ neu laden (Hot-Reload).")
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        lay.addWidget(self.btn_add)
+        lay.addWidget(self.btn_move_up)
+        lay.addWidget(self.btn_move_down)
+        lay.addWidget(self.btn_remove)
+        lay.addStretch(1)
+        lay.addWidget(self.btn_reload)
+
+        self.btn_add.clicked.connect(self._on_add_clicked)
+        self.btn_move_up.clicked.connect(self.move_up_requested)
+        self.btn_move_down.clicked.connect(self.move_down_requested)
+        self.btn_remove.clicked.connect(self.remove_requested)
+        self.btn_reload.clicked.connect(self.reload_plugins_requested)
+
+    # -------------------------------------------------------------------------
+    # Popup-Auswahl der Plugins ([➕ Service])
+    # -------------------------------------------------------------------------
+
+    def show_add_menu(self, plugin_ids: List[str],
+                      anchor: Optional[QWidget] = None) -> None:
+        """Zeigt das Popup-Menue mit den verfuegbaren Plugins.
+
+        Args:
+            plugin_ids: sortierte Liste der Plugin-IDs (aus dem Modell).
+            anchor:     Widget, an dem das Menue ausgerichtet wird (Default:
+                        der [➕ Service]-Button).
+        """
+        self._menu = QMenu(self)
+        if not plugin_ids:
+            self._menu.addAction("(keine Plugins verfuegbar)").setEnabled(False)
+        else:
+            for pid in plugin_ids:
+                action = self._menu.addAction(pid)
+                action.setData(pid)
+        target = anchor or self.btn_add
+        chosen = self._menu.exec(
+            target.mapToGlobal(QPoint(0, target.height())))
+        if chosen is not None and chosen.data():
+            self.add_service_requested.emit(str(chosen.data()))
+
+    def _on_add_clicked(self) -> None:
+        """[➕ Service] geklickt – das Popup wird vom Orchestrator befuellt
+        (er kennt das Modell/die Registry). Ohne Plugin-Liste passiert nichts."""
+        if hasattr(self, "request_add_popup") and callable(self.request_add_popup):
+            self.request_add_popup()
+
+    # -------------------------------------------------------------------------
+    # Aktions-Zustaende (Orchestrator steuert die Aktivierung)
+    # -------------------------------------------------------------------------
+
+    def set_actions_enabled(self, enabled: bool) -> None:
+        """Aktiviert/deaktiviert Struktur-Buttons (z.B. bei laufender Set-
+        Ausfuehrung oder leerem Set)."""
+        for btn in (self.btn_add, self.btn_move_up, self.btn_move_down,
+                    self.btn_remove):
+            btn.setEnabled(enabled)
+
+```
+
+--------------------------------------------------
+
 ### DATEI: serviceui/trash_dialog.py
 ```py
 # serviceui/trash_dialog.py
@@ -30094,6 +35581,7 @@ from PySide6.QtWidgets import (
 )
 
 from analytics.engine.service_set_repository import ServiceSetRepository
+from config.event_bus import event_bus
 
 
 class ServiceSetTrashDialog(QDialog):
@@ -30184,6 +35672,9 @@ class ServiceSetTrashDialog(QDialog):
             self._log(f"Set wiederhergestellt (P14-05): {set_id}")
             self._reload()
             self._refresh()
+            # Phase 15.02: Struktur-Aenderung -> EventBus (Live-Sync aller
+            # ServiceSelectorModel-Instanzen, Invariante 5).
+            event_bus.service_set_changed.emit()
         else:
             self._log(f"Set '{set_id}' nicht im Papierkorb gefunden.")
 
@@ -30290,6 +35781,502 @@ print(f"Map geschrieben: {len(cont_to_real)} Eintraege, base={base_time}")
 for probe in [base_time, base_time + 2307 * 60, base_time + 2308 * 60]:
     b = datetime.fromtimestamp(int(cont_to_real[str(probe)]), tz=timezone.utc)
     print(f"  cont={probe} -> real={cont_to_real[str(probe)]} (Wanduhr {b.strftime('%d.%m %H:%M')})")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_analytics_leak.py
+```py
+# test/check_analytics_leak.py
+"""Analyse (NUR Lesen, kein Fix): Misst, ob die DuckDB-Connection-Leaks
+der Analytics-Worker (eine Connection pro Worker-Thread, nie geschlossen)
+zu Verlangsamung fuehren – Kandidat fuer 'App haengt nach TF-Wechseln'.
+
+Simuliert 30 'TF-Wechsel' (je 5 Worker) = 150 Worker-Queries.
+Hermetisch: testet gegen die Test-Kopie test/analytics_test.duckdb
+(keine Sperre durch eine laufende PyTrader-Instanz).
+"""
+import os
+import sys
+import threading
+import time
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+
+from PySide6.QtCore import QCoreApplication  # noqa: E402
+
+_app = QCoreApplication.instance() or QCoreApplication(sys.argv)
+
+from analytics.engine.analytics_repository import AnalyticsRepository  # noqa: E402
+from analytics.engine.analytics_worker import (  # noqa: E402
+    AnalyticsAsyncWorker, QUERY_HEATMAP,
+)
+from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
+import db_service as db_service  # noqa: E402
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+TEST_ANALYTICS = os.path.join(TEST_DIR, "analytics_test.duckdb")
+
+repo = AnalyticsRepository(
+    reader=FeatureStoreReader(db_path=TEST_ANALYTICS))
+times = []
+for i in range(30):
+    w = AnalyticsAsyncWorker(repo, QUERY_HEATMAP,
+                             {"symbol": "SILVER", "timeframe": "M1",
+                              "feature_id": None, "metric": "count"})
+    t0 = time.time()
+    w.start()
+    while w.isRunning():
+        _app.processEvents()
+        time.sleep(0.001)
+    w.wait(5000)
+    times.append(time.time() - t0)
+    if (i + 1) % 5 == 0:
+        n_conn = db_service._db_pool_global.get(TEST_ANALYTICS, 0)
+        print(f"  nach {i + 1:3d} Workern: letzte Query {times[-1] * 1000:.1f}ms "
+              f"| Connection-Refcount analytics_test.duckdb: {n_conn}")
+
+print("\nMin/Med/Max Query-Zeit: {:.1f}/{:.1f}/{:.1f} ms".format(
+    min(times) * 1000, sorted(times)[len(times) // 2] * 1000, max(times) * 1000))
+print("FERTIG")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_analytics_queries.py
+```py
+# test/check_analytics_queries.py
+"""Analyse (NUR Lesen, kein Fix): Prueft die SQL-Queries der Analytics-
+Engine (Phase 15.03) direkt gegen die Test-Kopie test/analytics_test.duckdb
+(hermetisch, keine Sperre durch eine laufende PyTrader-Instanz).
+"""
+import os
+import duckdb
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+DB = os.path.join(TEST_DIR, "analytics_test.duckdb")
+con = duckdb.connect(DB, read_only=True)
+
+print("=== TEST 1: fetch_rows (table) ===")
+try:
+    rows = con.execute("""
+        SELECT bar_time, symbol, timeframe, feature_id, plugin_version,
+               ema_diff, rsi_14, atr_normalized, feature_data
+        FROM feature_store
+        WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+        ORDER BY bar_time ASC
+        LIMIT ?
+    """, ['SILVER', 'H1', 1000]).fetchall()
+    print("OK, rows:", len(rows))
+except Exception as e:
+    print("ERROR:", repr(e))
+
+print()
+print("=== TEST 2: fetch_heatmap (AT TIME ZONE) ===")
+try:
+    rows = con.execute("""
+        SELECT
+            EXTRACT(DOW FROM bar_time AT TIME ZONE 'UTC')::INTEGER AS dow,
+            EXTRACT(HOUR FROM bar_time AT TIME ZONE 'UTC')::INTEGER AS hour,
+            COUNT(*) AS val
+        FROM feature_store
+        WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+        GROUP BY 1, 2
+        ORDER BY 1, 2
+    """, ['SILVER', 'H1']).fetchall()
+    print("OK, rows:", len(rows), "first:", rows[:3])
+except Exception as e:
+    print("ERROR:", repr(e))
+
+print()
+print("=== TEST 3: fetch_columns (scatter/distribution) ===")
+try:
+    rows = con.execute("""
+        SELECT "ema_diff", "rsi_14", "atr_normalized"
+        FROM feature_store
+        WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+          AND "ema_diff" IS NOT NULL AND "rsi_14" IS NOT NULL AND "atr_normalized" IS NOT NULL
+        ORDER BY bar_time ASC
+        LIMIT ?
+    """, ['SILVER', 'H1', 1000]).fetchall()
+    print("OK, rows:", len(rows), "first:", rows[:2])
+except Exception as e:
+    print("ERROR:", repr(e))
+
+print()
+print("=== TEST 4: get_available_features ===")
+try:
+    ids = con.execute("""
+        SELECT DISTINCT feature_id FROM feature_store
+        WHERE feature_id IS NOT NULL AND feature_id != ''
+        ORDER BY feature_id
+    """).fetchall()
+    total = con.execute("""
+        SELECT COUNT(*) FROM feature_store
+        WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+    """, ['SILVER', 'H1']).fetchone()
+    print("OK, ids:", ids, "total:", total)
+except Exception as e:
+    print("ERROR:", repr(e))
+
+print()
+print("=== TEST 5: native column NULL-Rate je TF (warum scatter leer?) ===")
+for tf in ("M1", "H1", "D1"):
+    try:
+        r = con.execute("""
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN ema_diff IS NOT NULL THEN 1 ELSE 0 END) AS n_ema,
+                SUM(CASE WHEN rsi_14 IS NOT NULL THEN 1 ELSE 0 END) AS n_rsi,
+                SUM(CASE WHEN atr_normalized IS NOT NULL THEN 1 ELSE 0 END) AS n_atr
+            FROM feature_store
+            WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+        """, ['SILVER', tf]).fetchone()
+        print(f"  {tf}: total={r[0]} ema_diff={r[1]} rsi_14={r[2]} atr_normalized={r[3]}")
+    except Exception as e:
+        print(f"  {tf}: ERROR {e!r}")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_analytics_race.py
+```py
+# test/check_analytics_race.py
+"""Analyse (NUR Lesen, kein Fix): Untersucht die Worker-Race-Condition im
+AnalyticsViewModel (_on_finished clobbert self._worker) und die DuckDB-
+Verbindungs-Anzahl nach vielen Abfragen (TF-Wechsel-Simulation).
+
+Messung: Wie viele AnalyticsAsyncWorker werden bei einem einzigen
+refresh_all() erzeugt? (Erwartung: 5; bei Race: mehr)
+"""
+import sys
+import time
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+
+from PySide6.QtCore import QCoreApplication  # noqa: E402
+
+_app = QCoreApplication.instance() or QCoreApplication(sys.argv)
+
+from analytics.engine.analytics_view_model import (  # noqa: E402
+    AnalyticsViewModel,
+)
+
+launches = []
+
+
+def _patched_launch(self, kind, params):
+    launches.append((kind, time.time()))
+    # Original-Logik nachbauen (ohne den echten Worker-Code zu duplizieren:
+    # wir rufen die Original-Methode auf)
+    AnalyticsViewModel._launch_orig(self, kind, params)
+
+
+AnalyticsViewModel._launch_orig = AnalyticsViewModel._launch
+AnalyticsViewModel._launch = _patched_launch
+
+vm = AnalyticsViewModel()
+vm.set_symbol("SILVER")
+vm.set_timeframe("M1")
+vm.refresh_all()
+vm._debounce.start()
+
+start = time.time()
+while time.time() - start < 30:
+    _app.processEvents()
+    time.sleep(0.002)
+    if not vm._pending_kinds and vm._worker is None and len(launches) >= 5:
+        # kurz nach Abschluss noch Events verarbeiten
+        if time.time() - start > 2:
+            break
+
+print("Worker-Launches bei einem refresh_all():", len(launches))
+for k, t in launches:
+    print(f"  {k:<13} bei t={t - launches[0][1]:.3f}s")
+
+vm.shutdown()
+print("\nFERTIG")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_analytics_table_render.py
+```py
+# test/check_analytics_table_render.py
+"""Analyse (NUR Lesen, kein Fix): Misst die Hauptthread-Kosten der
+Tabellen-Renderung (QTableWidget + Sortierung), die bei jedem TF-Wechsel
+auf der TablePage laeuft. Hermetisch gegen die Test-Kopie
+test/analytics_test.duckdb (keine Sperre durch laufende Instanz).
+"""
+import os
+import sys
+import time
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+_app = QApplication.instance() or QApplication(sys.argv)
+
+from analytics.engine.analytics_repository import AnalyticsRepository  # noqa: E402
+from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
+from analytics.ui.table_page import TablePage  # noqa: E402
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+TEST_ANALYTICS = os.path.join(TEST_DIR, "analytics_test.duckdb")
+repo = AnalyticsRepository(reader=FeatureStoreReader(db_path=TEST_ANALYTICS))
+page = TablePage()
+
+print("--- Render-Zeit TablePage (5000 Zeilen) ---")
+for tf in ("M1", "H1", "D1"):
+    data = repo.get_table("SILVER", tf, limit=5000)
+    t0 = time.time()
+    page.on_data_ready("table", data)
+    t_render = time.time() - t0
+    print(f"{tf}: rows={data['total']} render={t_render:.3f}s")
+
+print("\n--- Render-Zeit Heatmap/Scatter/Distribution Pages ---")
+from analytics.ui.heatmap_page import HeatmapPage
+from analytics.ui.scatter_page import ScatterPage
+from analytics.ui.distribution_page import DistributionPage
+
+hm = HeatmapPage()
+data = repo.get_heatmap("SILVER", "M1", metric="count")
+t0 = time.time()
+hm.on_data_ready("heatmap", data)
+print(f"heatmap render: {time.time() - t0:.3f}s  matrix_zeilen={len(data['matrix'])}")
+
+sc = ScatterPage()
+data = repo.get_scatter("SILVER", "M1", x_column="ema_diff", y_column="atr_normalized", limit=5000)
+t0 = time.time()
+sc.on_data_ready("scatter", data)
+print(f"scatter render: {time.time() - t0:.3f}s  punkte={data['total']}")
+
+di = DistributionPage()
+data = repo.get_distribution("SILVER", "M1", column="atr_normalized", bins=20, limit=5000)
+t0 = time.time()
+di.on_data_ready("distribution", data)
+print(f"distribution render: {time.time() - t0:.3f}s  counts={len(data['counts'])}")
+
+print("\nANALYSE FERTIG")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_analytics_tf_spam.py
+```py
+# test/check_analytics_tf_spam.py
+"""Analyse (NUR Lesen, kein Fix): Simuliert rasche TF-Wechsel (User klickt
+M5->M15->M30->H1...) und beobachtet, ob Worker-/Verbindungszahl explodiert
+oder der Datenfluss stockt (Haenger-Kandidat).
+Hermetisch: FeatureStoreReader zeigt auf die Test-Kopie
+test/analytics_test.duckdb (keine Sperre durch laufende Instanz).
+"""
+import os
+import sys
+import time
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+
+from PySide6.QtCore import QCoreApplication  # noqa: E402
+
+_app = QCoreApplication.instance() or QCoreApplication(sys.argv)
+
+from analytics.engine.analytics_view_model import (  # noqa: E402
+    AnalyticsViewModel,
+)
+from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
+from analytics_profile_repository import AnalyticsProfileRepository  # noqa: E402
+from db_service import DbPool  # noqa: E402
+import db_service as db_service  # noqa: E402
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_ANA = os.path.join(TEST_DIR, "analytics_test.duckdb")
+TEST_APP = os.path.join(TEST_DIR, "tf_spam_app.duckdb")
+
+# FeatureStoreReader hermetisch auf die Test-Kopie lenken.
+_real_fsr_init = FeatureStoreReader.__init__
+def _patched_fsr_init(self, db_path=DB_ANA):
+    _real_fsr_init(self, db_path)
+FeatureStoreReader.__init__ = _patched_fsr_init
+
+# AnalyticsProfileRepository auf eine Test-DB lenken (die echte
+# app_data.duckdb kann von einer laufenden PyTrader-Instanz gesperrt sein).
+if os.path.exists(TEST_APP):
+    os.remove(TEST_APP)
+_real_apr_init = AnalyticsProfileRepository.__init__
+def _patched_apr_init(self, db_path=TEST_APP):
+    _real_apr_init(self, db_path)
+AnalyticsProfileRepository.__init__ = _patched_apr_init
+
+launches = []
+
+
+def _patched_launch(self, kind, params):
+    launches.append((kind, time.time()))
+    AnalyticsViewModel._launch_orig(self, kind, params)
+
+
+AnalyticsViewModel._launch_orig = AnalyticsViewModel._launch
+AnalyticsViewModel._launch = _patched_launch
+
+vm = AnalyticsViewModel()
+vm.set_symbol("SILVER")
+
+# Verbindungszaehler vorher
+before = db_service._db_pool_global.get(DB_ANA, 0)
+
+tfs = ["M1", "M5", "M15", "M30", "H1"]
+t0 = time.time()
+for i in range(6):
+    vm.set_timeframe(tfs[i % len(tfs)])
+    vm._debounce.start()
+    # dem Debounce Zeit geben, dann kurz Events pumpen
+    for _ in range(50):
+        _app.processEvents()
+        time.sleep(0.002)
+    time.sleep(0.05)
+
+# Nachlauf: Events pumpen, bis alles fertig ist
+start = time.time()
+while time.time() - start < 30:
+    _app.processEvents()
+    time.sleep(0.002)
+    if not vm._pending_kinds and vm._worker is None:
+        # stabil? kurz pruefen
+        idle_t0 = time.time()
+        for _ in range(20):
+            _app.processEvents()
+            time.sleep(0.002)
+        if not vm._pending_kinds and vm._worker is None:
+            break
+
+after = db_service._db_pool_global.get(DB_ANA, 0)
+print("Gesamtzeit:", f"{time.time() - t0:.2f}s")
+print("Worker-Launches gesamt:", len(launches))
+kinds_seen = {}
+for k, t in launches:
+    kinds_seen[k] = kinds_seen.get(k, 0) + 1
+print("Launches je Kind:", kinds_seen)
+print("DuckDB-Connections analytics_test.duckdb vorher/nachher:", before, "->", after)
+print("Offene Connection-Handles (Thread-local main):",
+      len(getattr(DbPool._local, 'conns', {})))
+
+vm.shutdown()
+print("FERTIG")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_analytics_vm_flow.py
+```py
+# test/check_analytics_vm_flow.py
+"""Analyse (NUR Lesen, kein Fix): Simuliert den AnalyticsViewModel-Datenfluss
+headless (QCoreApplication) gegen die Test-Kopie test/analytics_test.duckdb
+(hermetisch, keine Sperre durch eine laufende PyTrader-Instanz).
+"""
+import os
+import sys
+import time
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+
+from PySide6.QtCore import QCoreApplication  # noqa: E402
+
+_app = QCoreApplication.instance() or QCoreApplication(sys.argv)
+
+from analytics.engine.analytics_view_model import (  # noqa: E402
+    AnalyticsViewModel,
+    QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER, QUERY_DISTRIBUTION, QUERY_FEATURES,
+)
+from analytics.engine.analytics_repository import AnalyticsRepository  # noqa: E402
+from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
+from analytics_profile_repository import AnalyticsProfileRepository  # noqa: E402
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+TEST_ANALYTICS = os.path.join(TEST_DIR, "analytics_test.duckdb")
+TEST_APP = os.path.join(TEST_DIR, "vm_flow_app.duckdb")
+
+# FeatureStoreReader hermetisch auf die Test-Kopie lenken.
+_real_fsr_init = FeatureStoreReader.__init__
+def _patched_fsr_init(self, db_path=TEST_ANALYTICS):
+    _real_fsr_init(self, db_path)
+FeatureStoreReader.__init__ = _patched_fsr_init
+
+# AnalyticsProfileRepository auf eine Test-DB lenken (die echte
+# app_data.duckdb kann von einer laufenden PyTrader-Instanz gesperrt sein).
+if os.path.exists(TEST_APP):
+    os.remove(TEST_APP)
+_real_apr_init = AnalyticsProfileRepository.__init__
+def _patched_apr_init(self, db_path=TEST_APP):
+    _real_apr_init(self, db_path)
+AnalyticsProfileRepository.__init__ = _patched_apr_init
+
+print("--- A) VM-Params beim Start (kein Eintrag, kein Profil) ---")
+vm = AnalyticsViewModel()
+print("A1) symbol:", repr(vm.params.get("symbol")), "| timeframe:", repr(vm.params.get("timeframe")))
+print("A2) _current_params(TABLE) mit leerem Symbol:", vm._current_params(QUERY_TABLE))
+vm.set_symbol("SILVER")
+vm.set_timeframe("M1")
+
+print("\n--- B) Sequentieller Durchlauf aller 5 Abfragen (SILVER/M1) ---")
+results = {}
+vm.data_ready.connect(lambda kind, data: results.update({kind: True}))
+vm.refresh_all()
+vm._debounce.start()
+
+start = time.time()
+while time.time() - start < 60:
+    _app.processEvents()
+    time.sleep(0.005)
+    if not vm._pending_kinds and vm._worker is None and results:
+        # warten, bis busy false kam und nichts mehr pending ist
+        if len(results) >= 5:
+            break
+    if vm._worker is not None:
+        pass
+
+print("B) Ergebnisse nach {:.2f}s: {}".format(time.time() - start, sorted(results.keys())))
+
+print("\n--- C) Was liefert die Scatter-Abfrage mit Default-Spalten? ---")
+from analytics.engine.analytics_repository import AnalyticsRepository
+repo = AnalyticsRepository()
+sc = repo.get_scatter("SILVER", "M1", x_column="ema_diff", y_column="rsi_14")
+print("C1) scatter ema_diff/rsi_14 total:", sc["total"])
+sc2 = repo.get_scatter("SILVER", "M1", x_column="ema_diff", y_column="atr_normalized")
+print("C2) scatter ema_diff/atr_normalized total:", sc2["total"])
+
+print("\n--- D) Zeitmessung der Einzelabfragen (Worker direkt) ---")
+from analytics.engine.analytics_worker import AnalyticsAsyncWorker
+
+def run_query(kind, params):
+    w = AnalyticsAsyncWorker(repo, kind, params)
+    w.start()
+    t0 = time.time()
+    while w.isRunning():
+        _app.processEvents()
+        time.sleep(0.005)
+    w.wait(5000)
+    return time.time() - t0
+
+for kind, params in [
+    (QUERY_TABLE, {"symbol": "SILVER", "timeframe": "M1", "feature_id": None, "limit": 5000}),
+    (QUERY_HEATMAP, {"symbol": "SILVER", "timeframe": "M1", "feature_id": None, "metric": "count"}),
+    (QUERY_SCATTER, {"symbol": "SILVER", "timeframe": "M1", "feature_id": None, "x_column": "ema_diff", "y_column": "atr_normalized", "limit": 5000}),
+    (QUERY_DISTRIBUTION, {"symbol": "SILVER", "timeframe": "M1", "feature_id": None, "column": "atr_normalized", "bins": 20, "limit": 5000}),
+    (QUERY_FEATURES, {"symbol": "SILVER", "timeframe": "M1", "feature_id": None}),
+]:
+    t = run_query(kind, params)
+    print(f"D) {kind:<13}: {t:.3f}s")
+
+vm.shutdown()
+print("\nANALYSE FERTIG")
 
 ```
 
@@ -30739,6 +36726,345 @@ _run_layout_test()
 
 print("\nRESULT:", "PASS" if ok else f"FAIL ({failures})")
 raise SystemExit(0 if ok else 1)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_duckdb_write_contention.py
+```py
+# test/check_duckdb_write_contention.py
+"""Analyse (15.03): Blockiert das Oeffnen/Schliessen von DuckDB-Connections
+(Worker-Churn nach Leak-Fix) waehrend ein anderer Thread dieselbe DB schreibt
+(LiveAnalyzer-Szenario)?
+
+Simuliert: Writer-Thread schreibt kontinuierlich in analytics-Test-DB,
+waehrend der Main-Thread Lesequeries mit je frischer Connection ausfuehrt.
+"""
+import os
+import sys
+import threading
+import time
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+
+from db_service import DbPool  # noqa: E402
+import duckdb  # noqa: E402
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+TEST_DB = os.path.join(TEST_DIR, "contention.duckdb")
+if os.path.exists(TEST_DB):
+    os.remove(TEST_DB)
+
+# Test-DB anlegen
+con = DbPool.get(TEST_DB)
+con.execute("""
+    CREATE TABLE IF NOT EXISTS t (
+        id INTEGER, ts TIMESTAMPTZ, v DOUBLE, PRIMARY KEY (id, ts)
+    );
+""")
+con.execute("INSERT INTO t VALUES (1, now(), 1.0), (2, now(), 2.0), (3, now(), 3.0)")
+DbPool.close_all()
+
+STOP = threading.Event()
+WRITE_EVERY = 0.002  # 2ms -> sehr agressives Schreiben
+
+def writer():
+    local = DbPool.get(TEST_DB)
+    i = 0
+    while not STOP.is_set():
+        try:
+            local.execute("""
+                INSERT OR REPLACE INTO t VALUES (?, now(), ?)
+            """, [i % 3, float(i)])
+            i += 1
+        except Exception as e:
+            print(f"  WRITER ERROR: {e!r}")
+            break
+        time.sleep(WRITE_EVERY)
+    DbPool.close_all()
+
+wt = threading.Thread(target=writer, daemon=True)
+wt.start()
+time.sleep(0.2)  # Writer warmlaufen lassen
+
+print("Reader mit je frischer Connection (Worker-Churn-Simulation):")
+times = []
+for i in range(50):
+    t0 = time.time()
+    try:
+        con = DbPool.get(TEST_DB)  # neue/frische Connection je Zyklus
+        con.execute("SELECT COUNT(*), MAX(v) FROM t").fetchone()
+        DbPool.close_all()          # Worker-Leak-Fix-Verhalten
+        dt = time.time() - t0
+    except Exception as e:
+        dt = time.time() - t0
+        print(f"  READ {i}: ERROR {e!r} nach {dt*1000:.0f}ms")
+    times.append(time.time() - t0)
+    if (i + 1) % 10 == 0:
+        print(f"  nach {i+1:2d} Zyklen: letzter {times[-1]*1000:.1f}ms")
+
+print(f"\nMin/Med/Max: {min(times)*1000:.1f}/{sorted(times)[len(times)//2]*1000:.1f}"
+      f"/{max(times)*1000:.1f} ms")
+slow = [t for t in times if t > 0.5]
+print(f"Zyklen > 500ms: {len(slow)}")
+
+STOP.set()
+wt.join(timeout=5)
+try:
+    os.remove(TEST_DB)
+except OSError:
+    pass
+print("FERTIG")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_fixes_1503.py
+```py
+# test/check_fixes_1503.py
+"""
+Verifikation der 15.03-Fixes (NUR Logik/DB, KEINE GUI-Ausfuehrung):
+
+Fix 1+2 (Fenster-Historie / Symbol merken):
+  A) PersistentWindow.closeEvent: Eintrag bleibt bei _keep_history_on_close=True
+     erhalten; wird bei False (Default) geloescht (bisheriges Verhalten).
+  B) save_state/restore_state: Symbol/TF werden ueber die Basisklasse
+     wiederhergestellt (auch Nicht-Favorit-Symbol).
+  C) AnalyticsWindow registriert _keep_history_on_close=True.
+
+Fix 4 (Haenger bei TF-Wechsel):
+  D) AnalyticsAsyncWorker gibt seine DuckDB-Connection nach der Abfrage frei
+     (kein Connection-Leak mehr: _db_pool_global-Refcount bleibt stabil).
+  E) AnalyticsViewModel._on_finished/_on_failed: verspaetete Ergebnisse
+     veralteter Worker werden verworfen (Race-Guard).
+  F) shutdown() cancel+wait: laufender Worker wird sauber beendet.
+"""
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+_app = QApplication.instance() or QApplication(sys.argv)
+
+from persistent_win import PersistentWindow  # noqa: E402
+from state_manager import StateManager  # noqa: E402
+from analytics.ui.analytics_win import AnalyticsWindow  # noqa: E402
+from analytics.engine.analytics_worker import (  # noqa: E402
+    AnalyticsAsyncWorker, QUERY_HEATMAP,
+)
+from analytics.engine.analytics_repository import (  # noqa: E402
+    AnalyticsRepository,
+)
+from analytics.engine.analytics_view_model import (  # noqa: E402
+    AnalyticsViewModel,
+)
+from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
+from analytics_profile_repository import (  # noqa: E402
+    AnalyticsProfileRepository,
+)
+import db_service as db_service  # noqa: E402
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+TEST_DB = os.path.join(TEST_DIR, "fixes_1503_state.duckdb")
+TEST_DB_APP = os.path.join(TEST_DIR, "fixes_1503_app.duckdb")
+TEST_ANALYTICS = os.path.join(TEST_DIR, "analytics_test.duckdb")
+for _db in (TEST_DB, TEST_DB_APP):
+    if os.path.exists(_db):
+        os.remove(_db)
+
+# FeatureStoreReader hermetisch auf die Test-Kopie lenken (die echte
+# analytics.duckdb kann von einem laufenden PyTrader-Prozess gesperrt sein).
+_real_fsr_init = FeatureStoreReader.__init__
+def _patched_fsr_init(self, db_path=TEST_ANALYTICS):
+    _real_fsr_init(self, db_path)
+FeatureStoreReader.__init__ = _patched_fsr_init
+
+# AnalyticsProfileRepository auf Test-DB umbiegen (die echte app_data.duckdb
+# kann von einem laufenden PyTrader-Prozess gesperrt sein – dann wuerde der
+# AnalyticsViewModel bereits beim Konstruieren scheitern).
+_real_apr_init = AnalyticsProfileRepository.__init__
+def _patched_apr_init(self, db_path=TEST_DB_APP):
+    _real_apr_init(self, db_path)
+AnalyticsProfileRepository.__init__ = _patched_apr_init
+
+FAILURES: list = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    status = "PASS" if cond else "FAIL"
+    print(f"[{status}] {name}" + (f" - {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(name)
+
+
+# ---------------------------------------------------------------------------
+# A+B) Fenster-Historie: closeEvent behaelt Eintrag bei _keep_history_on_close
+# ---------------------------------------------------------------------------
+class KeepHistoryWin(PersistentWindow):
+    INSTANCE_ID = "win_keep"
+    _keep_history_on_close = True
+
+    def __init__(self, state_manager):
+        super().__init__(state_manager=state_manager)
+        self._symbol = "SILVER"
+        self._tf = "M1"
+
+    def get_persistent_symbol(self) -> str:
+        return self._symbol
+
+    def get_persistent_timeframe(self) -> str:
+        return self._tf
+
+    def _apply_persistent_filters(self, symbol: str, timeframe: str) -> None:
+        self._symbol = symbol
+        self._tf = timeframe
+
+
+class DropHistoryWin(PersistentWindow):
+    INSTANCE_ID = "win_drop"  # Default: _keep_history_on_close = False
+
+    def __init__(self, state_manager):
+        super().__init__(state_manager=state_manager)
+        self._symbol = "GOLD"
+        self._tf = "H1"
+
+    def get_persistent_symbol(self) -> str:
+        return self._symbol
+
+    def get_persistent_timeframe(self) -> str:
+        return self._tf
+
+    def _apply_persistent_filters(self, symbol: str, timeframe: str) -> None:
+        self._symbol = symbol
+        self._tf = timeframe
+
+
+sm = StateManager(db_path=TEST_DB)
+
+win_keep = KeepHistoryWin(sm)
+win_keep.save_state()
+check("A1) win_keep nach save_state in Historie",
+      sm.get_window_geometry("win_keep") is not None
+      and any(i["instance_id"] == "win_keep" for i in sm.load_all_instances()))
+
+win_keep.close()  # manuelles Schliessen (App laeuft weiter)
+check("A2) closeEvent: Eintrag BLEIBT bei _keep_history_on_close",
+      sm.get_window_geometry("win_keep") is not None
+      and any(i["instance_id"] == "win_keep"
+              and i["symbol"] == "SILVER" and i["timeframe"] == "M1"
+              for i in sm.load_all_instances()),
+      str([i for i in sm.load_all_instances()]))
+
+# Wiederherstellung ueber die Basisklasse (Simulation: Fenster neu oeffnen)
+win_keep2 = KeepHistoryWin(sm)
+win_keep2._apply_persistent_filters("SILVER", "M1")
+check("B1) restore liefert gespeichertes Symbol/TF (auch manuell gesetzt)",
+      win_keep2._symbol == "SILVER" and win_keep2._tf == "M1")
+
+# Nicht-Favorit-Symbol aus der Historie: _apply_persistent_filters ergaenzt
+# die Combo (in AnalyticsWindow) – hier: Kernlogik, Symbol wird uebernommen.
+win_keep2._apply_persistent_filters("XAUUSD", "H4")
+check("B2) Nicht-Favorit-Symbol wird uebernommen",
+      win_keep2._symbol == "XAUUSD" and win_keep2._tf == "H4")
+
+# Gegenprobe: Default-Verhalten (ohne _keep_history_on_close) loescht Eintrag
+win_drop = DropHistoryWin(sm)
+win_drop.save_state()
+check("A3) win_drop nach save_state in Historie",
+      sm.get_window_geometry("win_drop") is not None)
+win_drop.close()
+check("A4) closeEvent: Eintrag GELOESCHT bei Default (unveraendertes Verhalten)",
+      sm.get_window_geometry("win_drop") is None)
+
+# C) AnalyticsWindow-Konfiguration
+check("C1) AnalyticsWindow._keep_history_on_close == True",
+      AnalyticsWindow._keep_history_on_close is True)
+check("C2) AnalyticsWindow registriert (win_analytics)",
+      AnalyticsWindow.INSTANCE_ID == "win_analytics")
+
+# ---------------------------------------------------------------------------
+# D) Connection-Leak: Worker gibt seine DuckDB-Connection frei
+# ---------------------------------------------------------------------------
+repo = AnalyticsRepository()
+before = db_service._db_pool_global.get(TEST_ANALYTICS, 0)
+for i in range(30):
+    w = AnalyticsAsyncWorker(repo, QUERY_HEATMAP,
+                             {"symbol": "SILVER", "timeframe": "M1",
+                              "feature_id": None, "metric": "count"})
+    w.start()
+    w.wait(10000)
+after = db_service._db_pool_global.get(TEST_ANALYTICS, 0)
+check("D1) Connection-Refcount nach 30 Workern stabil ({} -> {})".format(
+      before, after), after <= before + 1,
+      f"before={before} after={after}")
+
+# Der Hauptthread haelt legitimerweise andere Connections (z. B. die
+# StateManager-Test-DB). Die Analytics-Test-DB darf im Hauptthread NICHT
+# offen sein – die Worker-Threads haben ihre Connections freigegeben.
+main_conns = getattr(db_service.DbPool._local, 'conns', {})
+ana_open_main = [k for k in main_conns
+                 if os.path.abspath(k) == os.path.abspath(TEST_ANALYTICS)]
+check("D2) analytics_test.duckdb im Hauptthread geschlossen (Worker-Leak-Fix)",
+      not ana_open_main, str(ana_open_main))
+
+# ---------------------------------------------------------------------------
+# E) Race-Guard: verspaetete Ergebnisse veralteter Worker werden verworfen
+# ---------------------------------------------------------------------------
+vm = AnalyticsViewModel(analytics_repo=repo)
+got: list = []
+vm.data_ready.connect(lambda k, d: got.append(k))
+
+vm._worker = "CURRENT"  # Dummy-Referenz des aktuellen Workers
+vm._on_finished("OLD", QUERY_HEATMAP, {"matrix": []})
+check("E1) verspaeteter Worker (OLD) wird verworfen",
+      got == [] and vm._worker == "CURRENT", str(got))
+
+vm._on_finished("CURRENT", QUERY_HEATMAP, {"matrix": []})
+check("E2) aktueller Worker (CURRENT) wird verarbeitet",
+      got == [QUERY_HEATMAP] and vm._worker is None, str(got))
+
+vm._worker = "CURRENT2"
+vm._on_failed("OLD", "heatmap", "alt")
+check("E3) verspaeteter Fehler (OLD) wird verworfen",
+      vm._worker == "CURRENT2")
+vm._on_failed("CURRENT2", "heatmap", "echt")
+check("E4) aktueller Fehler (CURRENT2) wird verarbeitet",
+      vm._worker is None)
+
+# ---------------------------------------------------------------------------
+# F) shutdown(): cancel + wait – Worker wird sauber beendet
+# ---------------------------------------------------------------------------
+vm2 = AnalyticsViewModel(analytics_repo=repo)
+vm2.set_symbol("SILVER")
+vm2.set_timeframe("M1")
+vm2.refresh_all()
+vm2._debounce.start()
+vm2.shutdown()
+check("F1) shutdown: kein Worker mehr aktiv", vm2._worker is None)
+check("F2) shutdown: keine pending Kinds mehr", vm2._pending_kinds == [])
+vm2.shutdown()  # idempotent
+
+# ---------------------------------------------------------------------------
+# Aufraeumen
+# ---------------------------------------------------------------------------
+for _db in (TEST_DB, TEST_DB_APP):
+    try:
+        os.remove(_db)
+    except OSError:
+        pass
+
+print("-" * 60)
+if FAILURES:
+    print(f"FEHLER: {len(FAILURES)} Pruefung(en) fehlgeschlagen: {FAILURES}")
+    sys.exit(1)
+print("ALLE PRUEFUNGEN BESTANDEN (OK)")
+sys.exit(0)
 
 ```
 
@@ -40358,6 +46684,1838 @@ sys.exit(0)
 
 --------------------------------------------------
 
+### DATEI: test/check_p15_s1_symbols.py
+```py
+# test/check_p15_s1_symbols.py
+"""
+Phase 15 15.01 – Headless Validierung (KEINE UI, KEIN QApplication.exec()).
+
+Prueft das Symbol- & Favoriten-System rein auf Logik-/DB-Ebene:
+
+A) DB-Persistenz & Defaults:
+   - broker_symbols-Tabelle wird angelegt (idempotent).
+   - Standard-Defaults SILVER/GOLD/BTCUSD sind als Favoriten vorhanden.
+   - ensure_defaults() ist idempotent (Favoriten-Flags bleiben erhalten).
+
+B) Lese-API:
+   - get_symbols() liefert alle Symbole inkl. path/is_favorite.
+   - get_favorite_symbols() liefert nur Favoriten (sortiert).
+   - get_symbol() liefert ein einzelnes Symbol (case-insensitive).
+
+C) Favoriten-Toggle:
+   - toggle_favorite() kippt den Zustand und liefert den NEUEN Zustand.
+   - Unbekanntes Symbol wird beim Toggle als Favorit angelegt.
+
+D) Broker-Upsert:
+   - upsert_from_broker() fuegt neue Symbole hinzu (path/updated_at).
+   - Bestehende Favoriten-Flags bleiben beim Upsert unangetastet.
+
+E) MT5-Fallback (sync_from_broker / sync_from_broker_with_status):
+   - MT5 nicht verfuegbar (initialize()==False) -> Fallback auf DB-Tabelle.
+   - MT5 verfuegbar (symbols_get()) -> Upsert + Rueckgabe der DB-Liste.
+   - MT5 wirft Exception -> Fallback auf DB-Tabelle.
+   - sync_from_broker_with_status() liefert Status "live"/"fallback" und eine
+     Fehlermeldung (User-Anweisung: Fehlermeldung im Log statt stillem Fallback).
+
+F) EventBus:
+   - favorites_changed wird nach Toggle emittiert (Verbindung wird aufgerufen).
+   - profile_changed/service_set_changed existieren (Signal-API).
+
+Test-DB liegt im Unterordner test/ (Regel: keine Test-DBs im Root/data).
+"""
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+TEST_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "p15_s1_symbols_test.duckdb")
+if os.path.exists(TEST_DB):
+    os.remove(TEST_DB)
+
+from symbol_repository import SymbolRepository, DEFAULT_SYMBOLS  # noqa: E402
+from db_service import DbPool  # noqa: E402
+
+FAILURES: list = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    status = "PASS" if cond else "FAIL"
+    print(f"[{status}] {name}" + (f" - {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(name)
+
+
+repo = SymbolRepository(db_path=TEST_DB)
+
+# ---------------------------------------------------------------------------
+# A) DB-Persistenz & Defaults
+# ---------------------------------------------------------------------------
+con = DbPool.get(TEST_DB)
+tables = [r[0] for r in con.execute(
+    "SELECT table_name FROM information_schema.tables "
+    "WHERE table_name = 'broker_symbols'").fetchall()]
+check("A1) broker_symbols-Tabelle angelegt", "broker_symbols" in tables)
+
+defaults = [s.get("symbol") for s in repo.get_symbols()]
+check("A2) Defaults vorhanden (SILVER/GOLD/BTCUSD)",
+      defaults == ["BTCUSD", "GOLD", "SILVER"], str(defaults))
+
+favs = repo.get_favorite_symbols()
+check("A3) Defaults sind Favoriten",
+      set(favs) == {"SILVER", "GOLD", "BTCUSD"}, str(favs))
+
+# Idempotenz: ensure_defaults() darf bestehende Favoriten-Flags nicht aendern
+repo.toggle_favorite("GOLD")          # GOLD jetzt KEIN Favorit mehr
+repo.ensure_defaults()                # darf GOLD nicht zuruecksetzen
+check("A4) ensure_defaults() idempotent (GOLD bleibt Nicht-Favorit)",
+      "GOLD" not in repo.get_favorite_symbols(),
+      str(repo.get_favorite_symbols()))
+repo.toggle_favorite("GOLD")          # zuruecksetzen fuer spaetere Checks
+
+# ---------------------------------------------------------------------------
+# B) Lese-API
+# ---------------------------------------------------------------------------
+syms = repo.get_symbols()
+check("B1) get_symbols() liefert Dicts mit symbol/path/is_favorite",
+      all(k in syms[0] for k in ("symbol", "path", "is_favorite", "updated_at")),
+      str(syms[0].keys()))
+
+g = repo.get_symbol("silver")         # case-insensitive
+check("B2) get_symbol() case-insensitive",
+      g is not None and g["symbol"] == "SILVER")
+
+check("B3) get_symbol() unbekannt -> None",
+      repo.get_symbol("UNBEKANNT") is None)
+
+# ---------------------------------------------------------------------------
+# C) Favoriten-Toggle
+# ---------------------------------------------------------------------------
+new_state = repo.toggle_favorite("SILVER")
+check("C1) toggle liefert NEUEN Zustand (SILVER -> False)", new_state is False)
+check("C2) SILVER aus Favoriten entfernt",
+      "SILVER" not in repo.get_favorite_symbols())
+
+new_state = repo.toggle_favorite("SILVER")
+check("C3) erneuter Toggle (SILVER -> True)", new_state is True)
+check("C4) SILVER wieder Favorit", "SILVER" in repo.get_favorite_symbols())
+
+repo.toggle_favorite("EURUSD")        # unbekannt -> wird als Favorit angelegt
+check("C5) unbekanntes Symbol wird als Favorit angelegt",
+      repo.get_symbol("EURUSD") is not None
+      and repo.get_symbol("EURUSD")["is_favorite"] is True)
+
+# ---------------------------------------------------------------------------
+# D) Broker-Upsert
+# ---------------------------------------------------------------------------
+n = repo.upsert_from_broker([("GBPUSD", "Forex\\GBPUSD"),
+                             ("EURUSD", "Forex\\EURUSD"),
+                             ("XAUUSD", "Metals\\XAUUSD")])
+check("D1) upsert_from_broker verarbeitet 3 Symbole", n == 3, str(n))
+check("D2) GBPUSD/XAUUSD angelegt",
+      repo.get_symbol("GBPUSD") is not None and repo.get_symbol("XAUUSD") is not None)
+check("D3) path gespeichert (EURUSD -> Forex\\EURUSD)",
+      repo.get_symbol("EURUSD")["path"] == "Forex\\EURUSD")
+check("D4) Favoriten-Flag beim Upsert unangetastet (EURUSD bleibt Favorit)",
+      repo.get_symbol("EURUSD")["is_favorite"] is True)
+check("D5) Duplikate: gleicher Symbol-Name nur 1 Zeile",
+      sum(1 for s in repo.get_symbols() if s["symbol"] == "EURUSD") == 1)
+
+# ---------------------------------------------------------------------------
+# E) MT5-Fallback (sync_from_broker)
+# ---------------------------------------------------------------------------
+_original_mt5 = sys.modules.get("MetaTrader5")
+
+
+class _FakeSymbol:
+    def __init__(self, name: str, path: str):
+        self.name = name
+        self.path = path
+
+
+class _FakeMT5_Offline:
+    def initialize(self):
+        return False
+
+    def symbols_get(self):
+        raise AssertionError("symbols_get() darf bei initialize()==False nicht gerufen werden")
+
+
+class _FakeMT5_Online:
+    def initialize(self):
+        return True
+
+    def symbols_get(self):
+        return [_FakeSymbol("AUDUSD", "Forex\\AUDUSD"),
+                _FakeSymbol("NZDUSD", "Forex\\NZDUSD")]
+
+
+class _FakeMT5_Error:
+    def initialize(self):
+        raise RuntimeError("MT5-DLL nicht ladbar")
+
+
+try:
+    # E1) MT5 offline -> Fallback auf DB (unveraendert)
+    sys.modules["MetaTrader5"] = _FakeMT5_Offline()
+    before = repo.count()
+    result = repo.sync_from_broker()
+    check("E1) MT5 offline -> Fallback auf DB-Tabelle",
+          repo.count() == before and isinstance(result, list)
+          and len(result) == before, f"count={repo.count()}")
+
+    # E1b) sync_from_broker_with_status: Status 'fallback' + Fehlermeldung
+    symbols, status, error = repo.sync_from_broker_with_status()
+    check("E1b) Status 'fallback' + Fehlermeldung bei MT5 offline",
+          status == "fallback" and bool(error)
+          and "initialize" in error.lower(),
+          f"status={status} error={error}")
+
+    # E2) MT5 online -> Upsert + Rueckgabe der DB-Liste
+    sys.modules["MetaTrader5"] = _FakeMT5_Online()
+    result = repo.sync_from_broker()
+    check("E2) MT5 online -> AUDUSD/NZDUSD uebernommen",
+          repo.get_symbol("AUDUSD") is not None
+          and repo.get_symbol("NZDUSD") is not None)
+    check("E3) Rueckgabe ist die DB-Liste (alle Symbole)",
+          isinstance(result, list) and repo.count() == len(result))
+
+    # E3b) Upsert setzt neue Symbole NICHT automatisch auf Favorit
+    check("E3b) neue MT5-Symbole sind keine Favoriten (außer Defaults)",
+          repo.get_symbol("AUDUSD")["is_favorite"] is False
+          and repo.get_symbol("SILVER")["is_favorite"] is True)
+
+    # E3c) sync_from_broker_with_status: Status 'live' ohne Fehlermeldung
+    symbols, status, error = repo.sync_from_broker_with_status()
+    check("E3c) Status 'live' ohne Fehlermeldung bei MT5 online",
+          status == "live" and error is None
+          and len(symbols) == repo.count(),
+          f"status={status} error={error}")
+
+    # E4) MT5 wirft Exception -> Fallback auf DB
+    sys.modules["MetaTrader5"] = _FakeMT5_Error()
+    before = repo.count()
+    result = repo.sync_from_broker()
+    check("E4) MT5-Exception -> Fallback auf DB-Tabelle",
+          repo.count() == before and len(result) == before, f"count={repo.count()}")
+
+    # E4b) sync_from_broker_with_status: Status 'fallback' + Meldung bei Exception
+    symbols, status, error = repo.sync_from_broker_with_status()
+    check("E4b) Status 'fallback' + Fehlermeldung bei MT5-Exception",
+          status == "fallback" and bool(error), f"status={status} error={error}")
+
+    # E5) MT5-Import schlaegt fehl (sys.modules=None) -> Fallback + Meldung
+    sys.modules["MetaTrader5"] = None
+    symbols, status, error = repo.sync_from_broker_with_status()
+    check("E5) MT5-Import-Fehler -> Fallback + Meldung",
+          status == "fallback" and bool(error)
+          and len(symbols) == repo.count(),
+          f"status={status} error={error}")
+finally:
+    if _original_mt5 is None:
+        sys.modules.pop("MetaTrader5", None)
+    else:
+        sys.modules["MetaTrader5"] = _original_mt5
+
+# ---------------------------------------------------------------------------
+# F) EventBus
+# ---------------------------------------------------------------------------
+from config.event_bus import event_bus  # noqa: E402
+
+calls = []
+event_bus.favorites_changed.connect(lambda: calls.append("favorites"))
+event_bus.favorites_changed.emit()
+check("F1) favorites_changed wird emittiert", calls == ["favorites"], str(calls))
+
+profile_calls = []
+event_bus.profile_changed.connect(profile_calls.append)
+event_bus.profile_changed.emit("profil_alpha")
+check("F2) profile_changed mit Payload", profile_calls == ["profil_alpha"], str(profile_calls))
+
+set_calls = []
+event_bus.service_set_changed.connect(lambda: set_calls.append(1))
+event_bus.service_set_changed.emit()
+check("F3) service_set_changed wird emittiert", set_calls == [1], str(set_calls))
+
+# ---------------------------------------------------------------------------
+# Aufraeumen
+# ---------------------------------------------------------------------------
+try:
+    os.remove(TEST_DB)
+except OSError:
+    pass
+
+print("-" * 60)
+if FAILURES:
+    print(f"FEHLER: {len(FAILURES)} Pruefung(en) fehlgeschlagen: {FAILURES}")
+    sys.exit(1)
+print("ALLE PRUEFUNGEN BESTANDEN (OK)")
+sys.exit(0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_p15_s2_service_tree.py
+```py
+# test/check_p15_s2_service_tree.py
+"""
+Phase 15 15.02 – Headless Validierung (KEINE UI, KEIN QApplication.exec()).
+
+Prueft den generischen ServiceSelector (ServiceSelectorModel +
+ServiceSelectorWidget + MasterTree) rein auf Logik-/Widget-Ebene:
+
+A) ServiceSelectorModel – Grunddaten:
+   - get_sets() leer bei frischer DB.
+   - get_plugins() liefert die PluginRegistry (grid_liquidity, ...).
+   - is_chart_indicator()/get_indicator_display_name().
+   - Badges: '📌 Indikator: <Name> | ⚪ Inaktiv in Chart' fuer Chart-Indikatoren.
+
+B) ServiceSelectorModel – Set-Aufbau & Hierarchie:
+   - Nach save_set() liefert build_tree() die Gruppen
+     📁 Service-Sets / ⚡ Standalone Services / 📦 Alle verfuegbaren Plugins.
+   - Set-Knoten enthalten ihre Service-Instanzen (instance_id, plugin_id, badge).
+   - Standalone enthaelt NICHT die im Set verwendeten Plugins.
+
+C) ServiceSelectorModel – Live-Status "Aktiv im Chart" (StateManager):
+   - indicators_state['grid_liquidity'].active=True -> is_active_in_chart True.
+   - Badge wechselt auf '🟢 Aktiv in Chart'.
+
+D) EventBus-Reaktivitaet:
+   - service_set_changed.emit() -> data_changed feuert + Modell refresht.
+
+E) ServiceSelectorWidget (Modus SELECT_ONLY):
+   - Set-/Service-Combos werden aus dem Modell befuellt.
+   - selection_changed(set_id, service_id) wird bei Auswahl emittiert.
+
+F) ServiceSelectorWidget (Modus FULL_EDIT / MasterTree):
+   - master_tree + toolbar vorhanden; 3 Top-Level-Gruppen (📁/⚡/📦).
+   - Service-Knoten tragen das Status-Badge in Spalte 1.
+   - current_selection()/current_set_id() liefern die markierte Auswahl.
+
+G) Set-Updates & Umsortieren:
+   - execution_order-Aenderung erscheint nach refresh() in der Hierarchie.
+
+Test-DB liegt im Unterordner test/ (Regel: keine Test-DBs im Root/data).
+"""
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+TEST_DB = os.path.join(TEST_DIR, "p15_s2_service_tree_test.duckdb")
+if os.path.exists(TEST_DB):
+    os.remove(TEST_DB)
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+_app = QApplication.instance() or QApplication(sys.argv)
+
+from analytics.engine.service_set_repository import ServiceSetRepository  # noqa: E402
+from state_manager import StateManager  # noqa: E402
+from analytics.features.feature_builder import PluginRegistry  # noqa: E402
+from analytics.engine.service_selector_model import ServiceSelectorModel  # noqa: E402
+from serviceui.service_selector_widget import ServiceSelectorWidget  # noqa: E402
+from config.event_bus import event_bus  # noqa: E402
+
+FAILURES: list = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    status = "PASS" if cond else "FAIL"
+    print(f"[{status}] {name}" + (f" - {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(name)
+
+
+# ---------------------------------------------------------------------------
+# Test-Infrastruktur (frische Test-DB, injizierte Repos)
+# ---------------------------------------------------------------------------
+set_repo = ServiceSetRepository(db_path=TEST_DB)
+state_mgr = StateManager(db_path=TEST_DB)
+registry = PluginRegistry()
+
+model = ServiceSelectorModel(set_repo=set_repo, state_manager=state_mgr,
+                             registry=registry)
+
+plugins = model.get_plugins()
+print(f"   Plugins: {sorted(plugins.keys())}")
+
+# ---------------------------------------------------------------------------
+# A) Grunddaten
+# ---------------------------------------------------------------------------
+check("A1) get_sets() leer bei frischer DB", model.get_sets() == [])
+check("A2) get_plugins() liefert PluginRegistry",
+      isinstance(plugins, dict) and len(plugins) > 0)
+check("A3) grid_liquidity ist Chart-Indikator",
+      model.is_chart_indicator("grid_liquidity"))
+check("A4) get_indicator_display_name liefert lesbaren Namen",
+      bool(model.get_indicator_display_name("grid_liquidity")))
+
+badge_inactive = model.badge_for("grid_liquidity")
+check("A5) Badge inaktiv enthaelt Indikator + ⚪",
+      badge_inactive.startswith("📌 Indikator:")
+      and "⚪ Inaktiv in Chart" in badge_inactive, badge_inactive)
+check("A6) is_active_in_chart False ohne Chart-State",
+      model.is_active_in_chart("grid_liquidity") is False)
+
+# ---------------------------------------------------------------------------
+# B) Set-Aufbau & Hierarchie
+# ---------------------------------------------------------------------------
+set_id = set_repo.save_set({
+    "display_name": "Grid-Basis",
+    "execution_order": ["grid_1", "prox_1"],
+    "services": {
+        "grid_1": {"plugin_id": "grid_liquidity", "lookback": 1000,
+                   "params": {"grid_step": 0.5}},
+        "prox_1": {"plugin_id": "proximity", "lookback": 500,
+                   "params": {"prox_level1": 1.0}},
+    },
+})
+model.refresh()
+
+check("B1) Set nach save_set() im Modell", len(model.get_sets()) == 1)
+
+tree = model.build_tree()
+group_labels = [g["label"] for g in tree]
+check("B2) 3 Gruppen (📁/⚡/📦)",
+      any("📁" in l for l in group_labels)
+      and any("⚡" in l for l in group_labels)
+      and any("📦" in l for l in group_labels), str(group_labels))
+
+set_nodes = tree[0]["children"]
+check("B3) Set-Knoten vorhanden", len(set_nodes) == 1)
+svcs = set_nodes[0]["services"]
+svc_ids = [s["instance_id"] for s in svcs]
+check("B4) Set enthaelt beide Services",
+      svc_ids == ["grid_1", "prox_1"], str(svc_ids))
+check("B5) Service-Badge gesetzt",
+      all(s["badge"] for s in svcs), str([s["badge"] for s in svcs]))
+
+standalone_ids = [s["plugin_id"] for s in tree[1]["children"]]
+check("B6) verwendete Plugins NICHT in Standalone",
+      "grid_liquidity" not in standalone_ids
+      and "proximity" not in standalone_ids, str(standalone_ids))
+
+plugin_ids = [p["plugin_id"] for p in tree[2]["children"]]
+check("B7) Alle Plugins in 📦-Gruppe",
+      "grid_liquidity" in plugin_ids and "proximity" in plugin_ids,
+      str(plugin_ids))
+
+# ---------------------------------------------------------------------------
+# C) Live-Status "Aktiv im Chart" (StateManager)
+# ---------------------------------------------------------------------------
+state_mgr.save_window_geometry("win_1", 0, 0, 800, 600, False)
+state_mgr.save_instance_state(
+    "win_1", "SILVER", "H1",
+    indicators_state={"grid_liquidity": {"active": True}},
+)
+model.refresh()
+
+check("C1) grid_liquidity ist aktiv im Chart",
+      model.is_active_in_chart("grid_liquidity"))
+badge_active = model.badge_for("grid_liquidity")
+check("C2) Badge aktiv enthaelt 🟢",
+      "🟢 Aktiv in Chart" in badge_active, badge_active)
+check("C3) proximity bleibt inaktiv",
+      not model.is_active_in_chart("proximity"))
+
+# ---------------------------------------------------------------------------
+# D) EventBus-Reaktivitaet
+# ---------------------------------------------------------------------------
+data_calls = []
+model.data_changed.connect(lambda: data_calls.append(1))
+event_bus.service_set_changed.emit()
+check("D1) data_changed feuert bei service_set_changed",
+      len(data_calls) >= 1, str(data_calls))
+check("D2) Modell nach EventBus-Refresh aktuell",
+      len(model.get_sets()) == 1 and model.is_active_in_chart("grid_liquidity"))
+
+# ---------------------------------------------------------------------------
+# E) ServiceSelectorWidget – Modus SELECT_ONLY
+# ---------------------------------------------------------------------------
+sel = ServiceSelectorWidget(mode=ServiceSelectorWidget.MODE_SELECT_ONLY,
+                            model=model)
+emitted = []
+sel.selection_changed.connect(lambda sid, svc: emitted.append((sid, svc)))
+
+check("E1) Set-Combo befuellt", sel.combo_set.count() == 2, str(sel.combo_set.count()))
+idx = sel.combo_set.findData(set_id)
+check("E2) Set auswaehlbar", idx >= 0)
+if idx >= 0:
+    sel.combo_set.setCurrentIndex(idx)
+check("E3) Service-Combo befuellt", sel.combo_service.count() == 3,
+      str(sel.combo_service.count()))  # Platzhalter + grid_1 + prox_1
+if sel.combo_service.count() > 1:
+    sel.combo_service.setCurrentIndex(1)
+check("E4) selection_changed emittiert (set_id, service_id)",
+      emitted and emitted[-1][0] == set_id and emitted[-1][1] == "grid_1",
+      str(emitted))
+check("E5) current_set_id/current_service_id",
+      sel.current_set_id() == set_id and sel.current_service_id() == "grid_1",
+      f"{sel.current_set_id()}/{sel.current_service_id()}")
+
+# ---------------------------------------------------------------------------
+# F) ServiceSelectorWidget – Modus FULL_EDIT (MasterTree)
+# ---------------------------------------------------------------------------
+full = ServiceSelectorWidget(mode=ServiceSelectorWidget.MODE_FULL_EDIT,
+                             model=model)
+check("F1) MasterTree vorhanden", full.master_tree is not None)
+check("F2) Toolbar vorhanden", full.toolbar is not None)
+mt = full.master_tree
+check("F3) 3 Top-Level-Gruppen", mt.topLevelItemCount() == 3,
+      str(mt.topLevelItemCount()))
+
+set_group = mt.topLevelItem(0)
+check("F4) Set-Gruppe hat Set-Knoten mit Services",
+      set_group.childCount() == 1 and set_group.child(0).childCount() == 2,
+      f"sets={set_group.childCount()} svcs={set_group.child(0).childCount()}")
+
+# Service-Knoten: Badge in Spalte 1 (📌/🟢)
+svc_item = set_group.child(0).child(0)
+badge_text = svc_item.text(1)
+check("F5) Service-Badge in Spalte 1",
+      "📌" in badge_text and ("🟢" in badge_text or "⚪" in badge_text),
+      badge_text)
+
+# Selektion: Set-Knoten markieren
+mt.setCurrentItem(set_group.child(0))
+check("F6) current_set_id aus MasterTree", mt.current_set_id() == set_id,
+      str(mt.current_set_id()))
+mt.setCurrentItem(svc_item)
+sel2 = mt.current_selection()
+check("F7) current_selection() liefert Set+Service",
+      sel2["set_id"] == set_id and sel2["service_id"] == "grid_1",
+      str(sel2))
+
+# ---------------------------------------------------------------------------
+# G) Set-Updates & Umsortieren
+# ---------------------------------------------------------------------------
+set_repo.save_set({
+    "set_id": set_id,
+    "display_name": "Grid-Basis",
+    "execution_order": ["prox_1", "grid_1"],  # Umsortieren
+    "services": {
+        "grid_1": {"plugin_id": "grid_liquidity", "lookback": 1000,
+                   "params": {}},
+        "prox_1": {"plugin_id": "proximity", "lookback": 500,
+                   "params": {}},
+    },
+})
+model.refresh()
+set_nodes = model.build_tree()[0]["children"]
+check("G1) Umsortieren sichtbar (prox_1 zuerst)",
+      [s["instance_id"] for s in set_nodes[0]["services"]] == ["prox_1", "grid_1"],
+      str([s["instance_id"] for s in set_nodes[0]["services"]]))
+
+event_bus.service_set_changed.emit()
+check("G2) Modell reagiert auf EventBus (Set-Update)",
+      [s["instance_id"] for s in model.build_tree()[0]["children"][0]["services"]]
+      == ["prox_1", "grid_1"])
+
+# ---------------------------------------------------------------------------
+# Aufraeumen
+# ---------------------------------------------------------------------------
+try:
+    os.remove(TEST_DB)
+except OSError:
+    pass
+
+print("-" * 60)
+if FAILURES:
+    print(f"FEHLER: {len(FAILURES)} Pruefung(en) fehlgeschlagen: {FAILURES}")
+    sys.exit(1)
+print("ALLE PRUEFUNGEN BESTANDEN (OK)")
+sys.exit(0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_p15_s3_analytics.py
+```py
+# test/check_p15_s3_analytics.py
+"""
+Phase 15 15.03 Schritt 6 – Headless Gesamt-Validierung (KEINE UI, KEIN
+QApplication.exec()). Test-DBs in test/ (Regel: keine Test-DBs im Root/data).
+
+A) Analytics-Profile-CRUD + schema_version-Pflichtfeld (app_data)
+B) SQL-Aggregationen: fetch_rows/heatmap/scatter/distribution + NEUE
+   Jump-to-Chart-Methoden get_latest_bar_time / get_recent_bar_time_for_cell
+   (Wanduhr-Garantie, Invariante 7)
+C) AnalyticsViewModel: Profil-Verwaltung (Dirty/Save) + Jump-to-Chart-
+   Resolution mit echtem AnalyticsRepository
+D) E-2-Migration: win_statistics -> win_analytics (StateManager, app_data)
+"""
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+
+from PySide6.QtCore import QCoreApplication  # noqa: E402
+
+_app = QCoreApplication.instance() or QCoreApplication(sys.argv)
+
+from db_service import DbPool  # noqa: E402
+from state_manager import StateManager  # noqa: E402
+from analytics.engine.feature_store_reader import (  # noqa: E402
+    FeatureStoreReader,
+    SCHEMA_VERSION_DEFAULT,
+    HOURS_PER_DAY,
+    DAYS_PER_WEEK,
+)
+from analytics.engine.analytics_repository import (  # noqa: E402
+    AnalyticsRepository,
+)
+from analytics.engine.analytics_view_model import (  # noqa: E402
+    AnalyticsViewModel,
+)
+from analytics_profile_repository import (  # noqa: E402
+    AnalyticsProfileRepository,
+    SCHEMA_VERSION_DEFAULT as PROFILE_SCHEMA_VERSION,
+)
+from analytics.ui.analytics_win import (  # noqa: E402
+    migrate_statistics_persistence,
+)
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+TEST_DB_ANALYTICS = os.path.join(TEST_DIR, "p15_s3_analytics_test.duckdb")
+TEST_DB_APP = os.path.join(TEST_DIR, "p15_s3_analytics_app.duckdb")
+TEST_DB_MIGRATION = os.path.join(TEST_DIR, "p15_s3_migration_test.duckdb")
+for _db in (TEST_DB_ANALYTICS, TEST_DB_APP, TEST_DB_MIGRATION):
+    if os.path.exists(_db):
+        os.remove(_db)
+
+FAILURES: list = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    status = "PASS" if cond else "FAIL"
+    print(f"[{status}] {name}" + (f" - {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(name)
+
+
+def _utc(y, mo, d, h, mi=0):
+    return datetime(y, mo, d, h, mi, tzinfo=timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Test-DB analytics: feature_store mit Wanduhr-encoded Testdaten
+# ---------------------------------------------------------------------------
+con_ana = DbPool.get(TEST_DB_ANALYTICS)
+con_ana.execute("""
+    CREATE TABLE IF NOT EXISTS feature_store (
+        symbol      VARCHAR NOT NULL,
+        timeframe   VARCHAR NOT NULL,
+        bar_time    TIMESTAMPTZ NOT NULL,
+        ema_diff    DOUBLE,
+        rsi_14      DOUBLE,
+        atr_normalized DOUBLE,
+        created_at  TIMESTAMP DEFAULT current_timestamp,
+        feature_id  VARCHAR,
+        plugin_version VARCHAR,
+        feature_data JSON,
+        PRIMARY KEY (symbol, timeframe, bar_time)
+    );
+""")
+rows_to_insert = [
+    # (bar_time, feature_id, version, ema, rsi, atr, feature_data)
+    (_utc(2026, 8, 3, 12), "proximity", "1.0.0", 0.10, 55.0, 0.02,
+     {"schema_version": "1.0", "is_hit": True}),
+    (_utc(2026, 8, 3, 13), "proximity", "1.0.0", 0.12, 57.0, 0.03,
+     {"schema_version": "1.0", "is_hit": False}),
+    (_utc(2026, 8, 3, 14), "proximity", "1.0.0", 0.11, 56.0, 0.025,
+     {"is_hit": True}),  # Alt-Row OHNE schema_version (E-3)
+    (_utc(2026, 8, 5, 8), "grid_lines", "0.9.0", -0.05, 42.0, 0.015,
+     {"schema_version": "1.0"}),
+    (_utc(2026, 8, 7, 23), "proximity", "1.0.0", 0.08, 60.0, 0.04,
+     {"schema_version": "1.0", "is_hit": True}),
+]
+for (bt, fid, ver, ema, rsi, atr, fdata) in rows_to_insert:
+    con_ana.execute("""
+        INSERT INTO feature_store
+            (symbol, timeframe, bar_time, feature_id, plugin_version,
+             ema_diff, rsi_14, atr_normalized, feature_data)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ["SILVER", "M1", bt, fid, ver, ema, rsi, atr, json.dumps(fdata)])
+
+reader = FeatureStoreReader(db_path=TEST_DB_ANALYTICS)
+repo = AnalyticsRepository(reader=reader)
+
+EPOCH_MO_12 = int(_utc(2026, 8, 3, 12).timestamp())
+EPOCH_FR_23 = int(_utc(2026, 8, 7, 23).timestamp())
+
+# ---------------------------------------------------------------------------
+# A) Analytics-Profile-CRUD + schema_version
+# ---------------------------------------------------------------------------
+prepo = AnalyticsProfileRepository(db_path=TEST_DB_APP)
+check("A1) anfangs 0 Profile", prepo.count() == 0)
+
+pid = prepo.create_profile(
+    name="Standard", payload={"view": "heatmap", "lookback": 5000},
+    description="Default",
+)
+p = prepo.get_profile(pid)
+check("A2) create + get", p is not None and p["name"] == "Standard")
+check("A3) schema_version-Pflichtfeld (Default 1)",
+      p["payload"].get("schema_version") == PROFILE_SCHEMA_VERSION)
+check("A4) get_profile_by_name case-insensitive",
+      prepo.get_profile_by_name("standard")["profile_id"] == pid)
+
+pid2 = prepo.create_profile(name="Alpha", payload={"view": "scatter"})
+names = [x["name"] for x in prepo.list_profiles()]
+check("A5) list_profiles sortiert", names == sorted(names), str(names))
+
+check("A6) update additiv",
+      prepo.update_profile(pid, payload={"view": "table"}) is True
+      and prepo.get_profile(pid)["payload"]["view"] == "table"
+      and prepo.get_profile(pid)["description"] == "Default")
+check("A7) update ergaenzt schema_version additiv",
+      prepo.get_profile(pid)["payload"].get("schema_version") == PROFILE_SCHEMA_VERSION)
+
+check("A8) genau EIN aktives Profil",
+      prepo.set_active(pid) is True and prepo.set_active(pid2) is True
+      and prepo.get_active_profile()["profile_id"] == pid2
+      and prepo.get_profile(pid)["is_active"] is False)
+
+# Alt-Row ohne schema_version -> Default beim Lesen
+con_app = DbPool.get(TEST_DB_APP)
+con_app.execute("""
+    UPDATE analytics_profiles SET payload = CAST(? AS JSON) WHERE profile_id = ?
+""", [json.dumps({"view": "alt"}), pid])
+check("A9) Alt-Row erhaelt schema_version-Default beim Lesen",
+      prepo.get_profile(pid)["payload"].get("schema_version") == PROFILE_SCHEMA_VERSION)
+
+check("A10) delete + count",
+      prepo.delete_profile(pid2) is True and prepo.delete_profile(pid) is True
+      and prepo.count() == 0)
+
+# ---------------------------------------------------------------------------
+# B) SQL-Aggregationen + NEUE Jump-to-Chart-Methoden
+# ---------------------------------------------------------------------------
+rows = reader.fetch_rows("SILVER", "M1")
+check("B1) fetch_rows 5 Zeilen", len(rows) == 5)
+check("B2) Alt-Row schema_version-Default beim Lesen",
+      rows[2]["feature_data"].get("schema_version") == SCHEMA_VERSION_DEFAULT)
+
+hm = repo.get_heatmap("SILVER", "M1", metric="count")
+check("B3) Heatmap 24x7", len(hm["matrix"]) == HOURS_PER_DAY)
+check("B4) Heatmap Mo 12:00 count == 1", hm["matrix"][12][1] == 1.0)
+check("B5) Tagesgrenze Wanduhr Fr 23:00 -> [23][5]",
+      hm["matrix"][23][5] == 1.0 and hm["matrix"][1][6] == 0.0)
+
+sc = repo.get_scatter("SILVER", "M1", x_column="ema_diff", y_column="rsi_14")
+check("B6) Scatter 5 Punkte", sc["total"] == 5 and len(sc["points"]) == 5)
+
+di = repo.get_distribution("SILVER", "M1", column="atr_normalized", bins=4)
+check("B7) Verteilung bins/counts",
+      len(di["bins"]) == 5 and sum(di["counts"]) == 5)
+
+# NEU (Schritt 5): Jump-to-Chart-Aufloesung
+check("B8) get_latest_bar_time = Fr 23:00 (max)",
+      repo.get_latest_bar_time("SILVER", "M1") == EPOCH_FR_23,
+      str(repo.get_latest_bar_time("SILVER", "M1")))
+check("B9) get_latest_bar_time leer -> None",
+      repo.get_latest_bar_time("", "M1") is None)
+check("B10) get_recent_bar_time_for_cell (Mo 12:00)",
+      repo.get_recent_bar_time_for_cell("SILVER", "M1", 1, 12) == EPOCH_MO_12,
+      str(repo.get_recent_bar_time_for_cell("SILVER", "M1", 1, 12)))
+check("B11) get_recent_bar_time_for_cell (Fr 23:00, Tagesgrenze)",
+      repo.get_recent_bar_time_for_cell("SILVER", "M1", 5, 23) == EPOCH_FR_23)
+check("B12) get_recent_bar_time_for_cell ohne Daten -> None",
+      repo.get_recent_bar_time_for_cell("SILVER", "M1", 0, 5) is None)
+check("B13) get_recent_bar_time_for_cell ungueltige Zelle -> None",
+      repo.get_recent_bar_time_for_cell("SILVER", "M1", 9, 5) is None
+      and repo.get_recent_bar_time_for_cell("SILVER", "M1", 1, 30) is None)
+check("B14) get_recent_bar_time_for_cell feature_id-Filter",
+      repo.get_recent_bar_time_for_cell("SILVER", "M1", 5, 23,
+                                        feature_id="grid_lines") is None
+      and repo.get_recent_bar_time_for_cell("SILVER", "M1", 5, 23,
+                                            feature_id="proximity") == EPOCH_FR_23)
+
+# ---------------------------------------------------------------------------
+# C) AnalyticsViewModel: Profil + Dirty/Save + Jump-to-Chart-Resolution
+# ---------------------------------------------------------------------------
+vm = AnalyticsViewModel(analytics_repo=repo, profile_repo=prepo)
+vm.set_symbol("SILVER")
+vm.set_timeframe("M1")
+
+pid_vm = vm.create_profile("VM-Profil")
+check("C1) create_profile -> aktiv", vm.active_profile is not None
+      and vm.active_profile["name"] == "VM-Profil")
+check("C2) anfangs nicht dirty", vm.is_dirty is False)
+
+vm.set_heatmap_metric("ema_diff")
+check("C3) Parametertrend -> dirty", vm.is_dirty is True)
+check("C4) save -> dirty False + Payload persistiert",
+      vm.save_profile() is True and vm.is_dirty is False
+      and prepo.get_profile(pid_vm)["payload"]["heatmap_metric"] == "ema_diff"
+      and prepo.get_profile(pid_vm)["payload"]["schema_version"] == PROFILE_SCHEMA_VERSION)
+
+check("C5) resolve_latest_bar_time via ViewModel",
+      vm.resolve_latest_bar_time("SILVER", "M1") == EPOCH_FR_23)
+check("C6) resolve_recent_bar_time_for_cell via ViewModel",
+      vm.resolve_recent_bar_time_for_cell("SILVER", "M1", 1, 12) == EPOCH_MO_12)
+check("C7) resolve ohne Daten -> None",
+      vm.resolve_latest_bar_time("SILVER", "H4") is None)
+
+vm.shutdown()
+
+# ---------------------------------------------------------------------------
+# D) E-2-Migration: win_statistics -> win_analytics (StateManager)
+# ---------------------------------------------------------------------------
+sm = StateManager(db_path=TEST_DB_MIGRATION)
+sm.save_window_geometry("win_statistics", 120, 80, 900, 620, False)
+sm.save_instance_state("win_statistics", "SILVER", "H1")
+
+check("D1) win_statistics vor Migration vorhanden",
+      sm.get_window_geometry("win_statistics") is not None)
+check("D2) win_analytics vor Migration leer",
+      sm.get_window_geometry("win_analytics") is None)
+
+migrated = migrate_statistics_persistence(sm)
+check("D3) Migration liefert True", migrated is True)
+check("D4) Geometrie nach win_analytics kopiert",
+      sm.get_window_geometry("win_analytics") is not None
+      and sm.get_window_geometry("win_analytics")["width"] == 900
+      and sm.get_window_geometry("win_analytics")["pos_x"] == 120)
+insts = {i["instance_id"]: i for i in sm.load_all_instances()}
+check("D5) Instanz-Zustand nach win_analytics kopiert",
+      insts.get("win_analytics", {}).get("symbol") == "SILVER"
+      and insts["win_analytics"]["timeframe"] == "H1")
+check("D6) win_statistics entfernt",
+      "win_statistics" not in insts
+      and sm.get_window_geometry("win_statistics") is None)
+
+check("D7) Idempotenz: zweiter Aufruf -> False",
+      migrate_statistics_persistence(sm) is False)
+
+# D8) Bestehende win_analytics-Geometrie wird NICHT ueberschrieben
+sm2 = StateManager(db_path=TEST_DB_MIGRATION)
+sm2.save_window_geometry("win_analytics", 10, 10, 1280, 800, True)
+sm2.save_window_geometry("win_statistics", 1, 1, 100, 100, False)
+migrated2 = migrate_statistics_persistence(sm2)
+geom_ana = sm2.get_window_geometry("win_analytics")
+check("D8) bestehende win_analytics-Geometrie bleibt (kein Overwrite)",
+      migrated2 is False and geom_ana is not None
+      and geom_ana["width"] == 1280 and geom_ana["pos_x"] == 10)
+check("D9) win_statistics trotzdem entfernt",
+      sm2.get_window_geometry("win_statistics") is None)
+
+# ---------------------------------------------------------------------------
+# Aufraeumen
+# ---------------------------------------------------------------------------
+for _db in (TEST_DB_ANALYTICS, TEST_DB_APP, TEST_DB_MIGRATION):
+    try:
+        os.remove(_db)
+    except OSError:
+        pass
+
+print("-" * 60)
+if FAILURES:
+    print(f"FEHLER: {len(FAILURES)} Pruefung(en) fehlgeschlagen: {FAILURES}")
+    sys.exit(1)
+print("ALLE PRUEFUNGEN BESTANDEN (OK)")
+sys.exit(0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_p15_s3_profiles.py
+```py
+# test/check_p15_s3_profiles.py
+"""
+Phase 15 15.03 Schritt 2 – Headless Validierung (KEINE UI, KEIN QApplication).
+
+Prueft das Analytics-Profile-Repository (analytics_profile_repository.py)
+rein auf Logik-/DB-Ebene:
+
+A) DB-Schema:
+   - analytics_profiles-Tabelle wird angelegt (idempotent).
+   - Pflichtfeld schema_version im Payload (Default 1).
+
+B) CRUD:
+   - create_profile() legt an, liefert profile_id (uuid4-hex).
+   - get_profile() / get_profile_by_name() (case-insensitive).
+   - list_profiles() sortiert nach Name.
+   - update_profile() (name/description/payload) – nur uebergebene Felder.
+   - delete_profile() liefert bool und entfernt.
+   - count().
+
+C) Aktives Profil (Explicit Save):
+   - set_active() setzt genau EIN aktives Profil (andere auf False).
+   - get_active_profile() liefert das aktive.
+
+D) Schema-Konvention:
+   - schema_version wird beim create/update additiv ergaenzt (Default 1).
+   - Alt-Rows OHNE schema_version erhalten beim Lesen den Default.
+
+Test-DB liegt im Unterordner test/ (Regel: keine Test-DBs im Root/data).
+"""
+import json
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+
+TEST_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "p15_s3_profiles_test.duckdb")
+if os.path.exists(TEST_DB):
+    os.remove(TEST_DB)
+
+from analytics_profile_repository import (  # noqa: E402
+    AnalyticsProfileRepository,
+    SCHEMA_VERSION_DEFAULT,
+)
+from db_service import DbPool  # noqa: E402
+
+FAILURES: list = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    status = "PASS" if cond else "FAIL"
+    print(f"[{status}] {name}" + (f" - {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(name)
+
+
+repo = AnalyticsProfileRepository(db_path=TEST_DB)
+
+# ---------------------------------------------------------------------------
+# A) DB-Schema
+# ---------------------------------------------------------------------------
+con = DbPool.get(TEST_DB)
+tables = [r[0] for r in con.execute(
+    "SELECT table_name FROM information_schema.tables "
+    "WHERE table_name = 'analytics_profiles'").fetchall()]
+check("A1) analytics_profiles-Tabelle angelegt", "analytics_profiles" in tables)
+
+# Idempotenz: zweite Instanz darf nichts zerstoeren
+repo2 = AnalyticsProfileRepository(db_path=TEST_DB)
+check("A2) _ensure_table() idempotent", repo2.count() == repo.count() == 0)
+
+# ---------------------------------------------------------------------------
+# B) CRUD
+# ---------------------------------------------------------------------------
+pid = repo.create_profile(
+    name="Standard",
+    payload={"lookback": 5000, "view": "heatmap"},
+    description="Default-Profil",
+)
+check("B1) create_profile liefert profile_id",
+      isinstance(pid, str) and len(pid) > 0, str(pid))
+check("B2) count() == 1", repo.count() == 1, str(repo.count()))
+
+p = repo.get_profile(pid)
+check("B3) get_profile liefert Profil",
+      p is not None and p["name"] == "Standard"
+      and p["description"] == "Default-Profil")
+
+p_by_name = repo.get_profile_by_name("standard")  # case-insensitive
+check("B4) get_profile_by_name case-insensitive",
+      p_by_name is not None and p_by_name["profile_id"] == pid)
+
+check("B5) get_profile unbekannt -> None", repo.get_profile("gibtsnicht") is None)
+check("B6) get_profile_by_name unbekannt -> None",
+      repo.get_profile_by_name("NIX") is None)
+
+# Payload wird korrekt persistiert
+p_payload = repo.get_profile(pid)["payload"]
+check("B7) Payload persistiert (lookback/view)",
+      p_payload.get("lookback") == 5000 and p_payload.get("view") == "heatmap")
+
+# Zweites Profil -> list_profiles sortiert nach Name
+pid2 = repo.create_profile(name="Alpha", payload={"view": "scatter"})
+profiles = repo.list_profiles()
+names = [x["name"] for x in profiles]
+check("B8) list_profiles sortiert nach Name",
+      names == sorted(names) and len(profiles) == 2, str(names))
+
+# update_profile: nur name
+check("B9) update name", repo.update_profile(pid, name="Standard 2") is True)
+check("B10) name aktualisiert",
+      repo.get_profile(pid)["name"] == "Standard 2")
+
+# update_profile: nur payload (description bleibt)
+repo.update_profile(pid, payload={"view": "distribution"})
+p_upd = repo.get_profile(pid)
+check("B11) payload aktualisiert",
+      p_upd["payload"].get("view") == "distribution")
+check("B12) description blieb erhalten (additiv)",
+      p_upd["description"] == "Default-Profil")
+
+# update_profile unbekannt -> False
+check("B13) update unbekannt -> False",
+      repo.update_profile("gibtsnicht", name="x") is False)
+
+# delete_profile
+check("B14) delete liefert True", repo.delete_profile(pid2) is True)
+check("B15) delete unbekannt -> False", repo.delete_profile(pid2) is False)
+check("B16) count() == 1 nach delete", repo.count() == 1, str(repo.count()))
+
+# ---------------------------------------------------------------------------
+# C) Aktives Profil (Explicit Save)
+# ---------------------------------------------------------------------------
+pid3 = repo.create_profile(name="Aktiv-Profil", payload={"view": "equity"})
+check("C1) anfangs kein aktives Profil", repo.get_active_profile() is None)
+
+check("C2) set_active liefert True", repo.set_active(pid3) is True)
+check("C3) set_active unbekannt -> False", repo.set_active("gibtsnicht") is False)
+
+active = repo.get_active_profile()
+check("C4) get_active_profile liefert das aktive",
+      active is not None and active["profile_id"] == pid3
+      and active["is_active"] is True)
+
+# set_active auf anderes Profil -> genau EIN aktives
+repo.set_active(pid)
+active2 = repo.get_active_profile()
+check("C5) genau EIN aktives Profil",
+      active2 is not None and active2["profile_id"] == pid)
+other = repo.get_profile(pid3)
+check("C6) vorheriges Profil ist nicht mehr aktiv",
+      other is not None and other["is_active"] is False)
+
+# ---------------------------------------------------------------------------
+# D) Schema-Konvention (schema_version Pflichtfeld)
+# ---------------------------------------------------------------------------
+p_new = repo.get_profile(pid)
+check("D1) create ergaenzt schema_version",
+      p_new["payload"].get("schema_version") == SCHEMA_VERSION_DEFAULT,
+      str(p_new["payload"].get("schema_version")))
+
+# Explizit uebergebene schema_version gewinnt
+pid4 = repo.create_profile(
+    name="Neu-Version",
+    payload={"schema_version": 2, "view": "table"},
+)
+check("D2) explizite schema_version gewinnt",
+      repo.get_profile(pid4)["payload"]["schema_version"] == 2)
+
+# update ergaenzt schema_version additiv
+repo.update_profile(pid, payload={"view": "heatmap"})
+check("D3) update ergaenzt schema_version additiv",
+      repo.get_profile(pid)["payload"]["schema_version"] == SCHEMA_VERSION_DEFAULT)
+
+# Alt-Row OHNE schema_version -> Lesen ergaenzt Default
+con.execute("""
+    UPDATE analytics_profiles
+    SET payload = CAST(? AS JSON)
+    WHERE profile_id = ?
+""", [json.dumps({"view": "alt"}), pid4])
+alt = repo.get_profile(pid4)
+check("D4) Alt-Row ohne schema_version erhaelt Default beim Lesen",
+      alt is not None and alt["payload"].get("schema_version") == SCHEMA_VERSION_DEFAULT,
+      str(alt["payload"].get("schema_version")) if alt else "None")
+
+# ---------------------------------------------------------------------------
+# Aufraeumen
+# ---------------------------------------------------------------------------
+try:
+    os.remove(TEST_DB)
+except OSError:
+    pass
+
+print("-" * 60)
+if FAILURES:
+    print(f"FEHLER: {len(FAILURES)} Pruefung(en) fehlgeschlagen: {FAILURES}")
+    sys.exit(1)
+print("ALLE PRUEFUNGEN BESTANDEN (OK)")
+sys.exit(0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_p15_s3_reader_repo.py
+```py
+# test/check_p15_s3_reader_repo.py
+"""
+Phase 15 15.03 Schritt 3 – Headless Validierung (KEINE UI, KEIN QApplication).
+
+Prueft FeatureStoreReader (analytics/engine/feature_store_reader.py) und
+AnalyticsRepository (analytics/engine/analytics_repository.py) auf
+Logik-/DB-Ebene mit einer Test-DB in test/ (Regel: keine Test-DBs im
+Root/data).
+
+Testdaten (Berlin-Wanduhr-encoded, Invariante 7 – die UTC-Darstellung der
+gespeicherten TIMESTAMPTZ IST die Wanduhr-Zeit, kein Offset):
+  - Mo 03.08.2026 12:00  (DOW=1, HOUR=12)  ema_diff=0.10 rsi=55.0 atr=0.02
+  - Mo 03.08.2026 13:00  (DOW=1, HOUR=13)  ema_diff=0.12 rsi=57.0 atr=0.03
+  - Mo 03.08.2026 14:00  (DOW=1, HOUR=14)  OHNE schema_version (Alt-Row)
+  - Mi 05.08.2026 08:00  (DOW=3, HOUR=8)   ema_diff=-0.05 rsi=42.0 atr=0.015
+                                            feature_id='grid_lines'
+  - Fr 07.08.2026 23:00  (DOW=5, HOUR=23)  ema_diff=0.08 rsi=60.0 atr=0.04
+                                            (Tagesgrenze: ohne UTC-Forcierung
+                                             waere HOUR=1 Sa / DOW=6)
+
+A) FeatureStoreReader.fetch_rows:
+   - Zeilenanzahl, Wanduhr-Epoch, feature_data-Parsing
+   - E-3: Alt-Row ohne schema_version erhaelt Default "1.0" beim Lesen
+   - feature_id-Filter, limit
+
+B) FeatureStoreReader.fetch_heatmap:
+   - Matrix 24x7, count/avg an korrekter Zelle
+   - leere Zellen (count=0, avg=nan)
+   - Tagesgrenze Wanduhr (23:00 Fr -> HOUR=23, DOW=5)  [Invariante 7]
+   - ungueltige Metrik -> ValueError
+
+C) AnalyticsRepository:
+   - get_table, get_scatter, get_distribution
+   - ungueltige Spalten -> ValueError
+   - get_available_features
+"""
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+
+TEST_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "p15_s3_reader_test.duckdb")
+if os.path.exists(TEST_DB):
+    os.remove(TEST_DB)
+
+from db_service import DbPool  # noqa: E402
+from analytics.engine.feature_store_reader import (  # noqa: E402
+    FeatureStoreReader,
+    SCHEMA_VERSION_DEFAULT,
+    DOW_LABELS,
+    HOURS_PER_DAY,
+    DAYS_PER_WEEK,
+)
+from analytics.engine.analytics_repository import (  # noqa: E402
+    AnalyticsRepository,
+)
+
+FAILURES: list = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    status = "PASS" if cond else "FAIL"
+    print(f"[{status}] {name}" + (f" - {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(name)
+
+
+# ---------------------------------------------------------------------------
+# Test-DB + feature_store-Tabelle + Testdaten anlegen
+# ---------------------------------------------------------------------------
+con = DbPool.get(TEST_DB)
+con.execute("""
+    CREATE TABLE IF NOT EXISTS feature_store (
+        symbol      VARCHAR NOT NULL,
+        timeframe   VARCHAR NOT NULL,
+        bar_time    TIMESTAMPTZ NOT NULL,
+        ema_diff    DOUBLE,
+        rsi_14      DOUBLE,
+        atr_normalized DOUBLE,
+        created_at  TIMESTAMP DEFAULT current_timestamp,
+        feature_id  VARCHAR,
+        plugin_version VARCHAR,
+        feature_data JSON,
+        PRIMARY KEY (symbol, timeframe, bar_time)
+    );
+""")
+
+
+def _utc(y, mo, d, h, mi=0):
+    return datetime(y, mo, d, h, mi, tzinfo=timezone.utc)
+
+
+rows_to_insert = [
+    # (bar_time, feature_id, version, ema, rsi, atr, feature_data)
+    (_utc(2026, 8, 3, 12), "proximity", "1.0.0", 0.10, 55.0, 0.02,
+     {"schema_version": "1.0", "is_hit": True, "in_time_window": True}),
+    (_utc(2026, 8, 3, 13), "proximity", "1.0.0", 0.12, 57.0, 0.03,
+     {"schema_version": "1.0", "is_hit": False, "in_time_window": False}),
+    (_utc(2026, 8, 3, 14), "proximity", "1.0.0", 0.11, 56.0, 0.025,
+     {"is_hit": True, "in_time_window": False}),  # Alt-Row OHNE schema_version
+    (_utc(2026, 8, 5, 8), "grid_lines", "0.9.0", -0.05, 42.0, 0.015,
+     {"schema_version": "1.0"}),
+    (_utc(2026, 8, 7, 23), "proximity", "1.0.0", 0.08, 60.0, 0.04,
+     {"schema_version": "1.0", "is_hit": True, "in_time_window": False}),
+]
+for (bt, fid, ver, ema, rsi, atr, fdata) in rows_to_insert:
+    con.execute("""
+        INSERT INTO feature_store
+            (symbol, timeframe, bar_time, feature_id, plugin_version,
+             ema_diff, rsi_14, atr_normalized, feature_data)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ["SILVER", "M1", bt, fid, ver, ema, rsi, atr, json.dumps(fdata)])
+
+reader = FeatureStoreReader(db_path=TEST_DB)
+repo = AnalyticsRepository(reader=reader)
+
+# ---------------------------------------------------------------------------
+# A) FeatureStoreReader.fetch_rows
+# ---------------------------------------------------------------------------
+rows = reader.fetch_rows("SILVER", "M1")
+check("A1) fetch_rows liefert 5 Zeilen", len(rows) == 5, str(len(rows)))
+check("A2) time = Wanduhr-Epoch (int)",
+      all(isinstance(r["time"], int) and r["time"] > 0 for r in rows))
+check("A3) symbol/timeframe gesetzt",
+      all(r["symbol"] == "SILVER" and r["timeframe"] == "M1" for r in rows))
+
+# Erste Zeile: Montag 12:00 -> Epoch
+exp_epoch = int(_utc(2026, 8, 3, 12).timestamp())
+check("A4) Zeitstempel korrekt (Wanduhr-Epoch)",
+      rows[0]["time"] == exp_epoch, f"{rows[0]['time']} != {exp_epoch}")
+
+# feature_data geparst + schema_version
+fd0 = rows[0]["feature_data"]
+check("A5) feature_data geparst (dict)",
+      isinstance(fd0, dict) and fd0.get("is_hit") is True)
+check("A6) schema_version-Pflichtfeld vorhanden",
+      fd0.get("schema_version") == SCHEMA_VERSION_DEFAULT)
+
+# Alt-Row ohne schema_version -> Default beim Lesen (E-3)
+fd_alt = rows[2]["feature_data"]
+check("A7) Alt-Row erhaelt schema_version-Default beim Lesen",
+      isinstance(fd_alt, dict)
+      and fd_alt.get("schema_version") == SCHEMA_VERSION_DEFAULT
+      and "is_hit" in fd_alt)
+
+# feature_id-Filter
+rows_prox = reader.fetch_rows("SILVER", "M1", feature_id="proximity")
+check("A8) feature_id-Filter (proximity -> 4)",
+      len(rows_prox) == 4, str(len(rows_prox)))
+rows_gl = reader.fetch_rows("SILVER", "M1", feature_id="grid_lines")
+check("A9) feature_id-Filter (grid_lines -> 1)",
+      len(rows_gl) == 1, str(len(rows_gl)))
+
+# limit
+rows_lim = reader.fetch_rows("SILVER", "M1", limit=3)
+check("A10) limit=3", len(rows_lim) == 3, str(len(rows_lim)))
+
+# leerer Filter -> []
+check("A11) leere Filter -> []", reader.fetch_rows("", "M1") == [])
+
+# ---------------------------------------------------------------------------
+# B) FeatureStoreReader.fetch_heatmap
+# ---------------------------------------------------------------------------
+hm = reader.fetch_heatmap("SILVER", "M1", metric="count")
+mat = hm["matrix"]
+check("B1) Matrix 24x7",
+      len(mat) == HOURS_PER_DAY and all(len(r) == DAYS_PER_WEEK for r in mat))
+check("B2) x_labels/y_labels korrekt",
+      hm["x_labels"] == list(DOW_LABELS)
+      and hm["y_labels"][0] == "00:00" and hm["y_labels"][23] == "23:00")
+
+# count an Mo 12:00 -> Zelle [12][1] == 1 (DOW: 0=So, 1=Mo)
+check("B3) count Mo 12:00 == 1", mat[12][1] == 1.0,
+      f"mat[12][1]={mat[12][1]}")
+# count an Mo 13:00 -> [13][1] == 1, Mo 14:00 -> [14][1] == 1
+check("B4) count Mo 13:00 == 1", mat[13][1] == 1.0)
+check("B5) count Mo 14:00 == 1 (Alt-Row zaehlt mit)", mat[14][1] == 1.0)
+
+# Tagesgrenze: Fr 23:00 -> HOUR=23, DOW=5 (Wanduhr! Ohne UTC-Forcierung
+# waere HOUR=1, DOW=6 – Berlin +2h -> Sa 01:00)
+check("B6) Tagesgrenze Wanduhr: Fr 23:00 -> [23][5] == 1",
+      mat[23][5] == 1.0, f"mat[23][5]={mat[23][5]} mat[1][6]={mat[1][6]}")
+check("B7) keine falsche Zelle Sa 01:00 (ohne UTC waere hier)",
+      mat[1][6] == 0.0)
+
+# leere Zelle count == 0
+check("B8) leere Zelle count == 0", mat[0][0] == 0.0)
+
+# avg-Metrik
+hm_avg = reader.fetch_heatmap("SILVER", "M1", metric="ema_diff")
+check("B9) avg ema_diff Mo 12:00 == 0.10",
+      abs(hm_avg["matrix"][12][1] - 0.10) < 1e-9,
+      str(hm_avg["matrix"][12][1]))
+import math
+check("B10) leere Zelle avg == nan",
+      math.isnan(hm_avg["matrix"][0][0]))
+
+# feature_id-Filter in Heatmap
+hm_prox = reader.fetch_heatmap("SILVER", "M1", metric="count",
+                               feature_id="proximity")
+check("B11) Heatmap feature_id-Filter (proximity: Mi 08:00 == 0)",
+      hm_prox["matrix"][8][3] == 0.0, str(hm_prox["matrix"][8][3]))
+hm_gl = reader.fetch_heatmap("SILVER", "M1", metric="count",
+                             feature_id="grid_lines")
+check("B12) Heatmap feature_id-Filter (grid_lines: Mi 08:00 == 1)",
+      hm_gl["matrix"][8][3] == 1.0, str(hm_gl["matrix"][8][3]))
+
+# ungueltige Metrik -> ValueError
+try:
+    reader.fetch_heatmap("SILVER", "M1", metric="bogus")
+    check("B13) ungueltige Metrik -> ValueError", False, "kein Fehler")
+except ValueError:
+    check("B13) ungueltige Metrik -> ValueError", True)
+
+# leerer Filter -> leere Matrix (kein Absturz)
+hm_empty = reader.fetch_heatmap("", "M1", metric="count")
+check("B14) leerer Filter -> leere Matrix",
+      len(hm_empty["matrix"]) == HOURS_PER_DAY)
+
+# ---------------------------------------------------------------------------
+# C) AnalyticsRepository
+# ---------------------------------------------------------------------------
+tab = repo.get_table("SILVER", "M1")
+check("C1) get_table rows+total",
+      tab["total"] == 5 and len(tab["rows"]) == 5, str(tab["total"]))
+
+scatter = repo.get_scatter("SILVER", "M1", x_column="ema_diff", y_column="rsi_14")
+check("C2) get_scatter liefert 5 Punkte (alle non-null)",
+      scatter["total"] == 5 and len(scatter["points"]) == 5,
+      f"total={scatter['total']}")
+check("C3) get_scatter x/y-Keys",
+      all(set(p.keys()) == {"x", "y"} for p in scatter["points"]))
+
+dist = repo.get_distribution("SILVER", "M1", column="atr_normalized", bins=4)
+check("C4) get_distribution bins+counts",
+      len(dist["bins"]) == 5 and len(dist["counts"]) == 4
+      and dist["total"] == 5, f"bins={len(dist['bins'])} counts={len(dist['counts'])}")
+check("C5) get_distribution counts summieren auf total",
+      sum(dist["counts"]) == 5, str(sum(dist["counts"])))
+
+# leere Verteilung (Spalte ohne Daten -> keine Zeilen mit atr)
+dist_empty = repo.get_distribution("SILVER", "H4", column="atr_normalized")
+check("C6) get_distribution ohne Daten -> leer",
+      dist_empty["bins"] == [] and dist_empty["counts"] == [])
+
+# ungueltige Spalten -> ValueError
+scatter_bad = [
+    ("C7a) ungueltige x-Spalte -> ValueError",
+     lambda: repo.get_scatter("SILVER", "M1", x_column="nix", y_column="rsi_14")),
+    ("C7b) ungueltige y-Spalte -> ValueError",
+     lambda: repo.get_scatter("SILVER", "M1", x_column="ema_diff", y_column="nix")),
+    ("C7c) ungueltige Verteilungs-Spalte -> ValueError",
+     lambda: repo.get_distribution("SILVER", "M1", column="nix")),
+]
+for name, fn in scatter_bad:
+    try:
+        fn()
+        check(name, False, "kein Fehler")
+    except ValueError:
+        check(name, True)
+
+meta = repo.get_available_features("SILVER", "M1")
+check("C8) get_available_features",
+      meta["feature_ids"] == ["grid_lines", "proximity"]
+      and meta["total_rows"] == 5
+      and set(meta["columns"]) == {"ema_diff", "rsi_14", "atr_normalized"},
+      str(meta))
+
+check("C9) available_heatmap_metrics",
+      repo.available_heatmap_metrics() == ["count", "ema_diff", "rsi_14",
+                                           "atr_normalized"])
+
+# ---------------------------------------------------------------------------
+# Aufraeumen
+# ---------------------------------------------------------------------------
+try:
+    os.remove(TEST_DB)
+except OSError:
+    pass
+
+print("-" * 60)
+if FAILURES:
+    print(f"FEHLER: {len(FAILURES)} Pruefung(en) fehlgeschlagen: {FAILURES}")
+    sys.exit(1)
+print("ALLE PRUEFUNGEN BESTANDEN (OK)")
+sys.exit(0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_p15_s3_worker_vm.py
+```py
+# test/check_p15_s3_worker_vm.py
+"""
+Phase 15 15.03 Schritt 4 – Headless Validierung (KEINE UI, KEIN QApplication.exec()).
+
+Prueft den AnalyticsAsyncWorker (analytics/engine/analytics_worker.py) und
+das AnalyticsViewModel (analytics/engine/analytics_view_model.py) auf
+Logik-/DB-Ebene mit Test-DBs in test/ (Regel: keine Test-DBs im Root/data).
+Es wird NUR QCoreApplication (QtCore, ohne GUI) + processEvents() genutzt.
+
+A) Worker-Dispatch & Max-Lookback-Cap (synchron, RecordingRepo-Stub):
+   - table/heatmap/scatter/distribution/features werden korrekt dispatched
+   - limit wird hart auf MAX_LOOKBACK_LIMIT (50.000) gedeckelt
+   - unbekannter query_kind -> failed-Signal
+
+B) Worker mit echtem AnalyticsRepository + Test-DB (synchron, run() direkt):
+   - get_table/get_heatmap/get_scatter/get_distribution/get_available_features
+
+C) AnalyticsViewModel – Profil & Dirty (ohne Event-Loop):
+   - create -> aktives Profil + EventBus profile_changed
+   - Parametertrend -> dirty True; save -> dirty False + Payload persistiert
+   - set_active/delete; set_limit-Cap; Duplikat-Name -> ValueError
+
+D) AnalyticsViewModel – asynchroner Datenfluss (QCoreApplication +
+   processEvents, Worker-Thread + Debounce-QTimer):
+   - set_symbol/set_timeframe + Debounce -> data_ready fuer alle Kinds
+   - busy_changed True->False (Progress-Spinner)
+"""
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+
+from PySide6.QtCore import QCoreApplication  # noqa: E402
+
+_app = QCoreApplication.instance() or QCoreApplication(sys.argv)
+
+from db_service import DbPool  # noqa: E402
+from analytics.engine.feature_store_reader import (  # noqa: E402
+    FeatureStoreReader,
+    HOURS_PER_DAY,
+    DAYS_PER_WEEK,
+)
+from analytics.engine.analytics_repository import (  # noqa: E402
+    AnalyticsRepository,
+)
+from analytics.engine.analytics_worker import (  # noqa: E402
+    AnalyticsAsyncWorker,
+    QUERY_TABLE,
+    QUERY_HEATMAP,
+    QUERY_SCATTER,
+    QUERY_DISTRIBUTION,
+    QUERY_FEATURES,
+    MAX_LOOKBACK_LIMIT,
+    cap_lookback_limit,
+)
+from analytics.engine.analytics_view_model import (  # noqa: E402
+    AnalyticsViewModel,
+    DEFAULT_BINS,
+    DEFAULT_LIMIT,
+)
+from analytics_profile_repository import (  # noqa: E402
+    AnalyticsProfileRepository,
+    SCHEMA_VERSION_DEFAULT,
+)
+from config.event_bus import event_bus  # noqa: E402
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+TEST_DB_ANALYTICS = os.path.join(TEST_DIR, "p15_s3_worker_analytics.duckdb")
+TEST_DB_APP = os.path.join(TEST_DIR, "p15_s3_worker_app.duckdb")
+for _db in (TEST_DB_ANALYTICS, TEST_DB_APP):
+    if os.path.exists(_db):
+        os.remove(_db)
+
+FAILURES: list = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    status = "PASS" if cond else "FAIL"
+    print(f"[{status}] {name}" + (f" - {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(name)
+
+
+def run_until(condition, timeout_s: float = 6.0) -> bool:
+    """Verarbeitet Qt-Events (QCoreApplication.processEvents) bis Bedingung."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        QCoreApplication.processEvents()
+        if condition():
+            return True
+        time.sleep(0.01)
+    QCoreApplication.processEvents()
+    return condition()
+
+
+# ---------------------------------------------------------------------------
+# Test-DB: feature_store (analytics) mit Wanduhr-encoded Testdaten
+# ---------------------------------------------------------------------------
+con_ana = DbPool.get(TEST_DB_ANALYTICS)
+con_ana.execute("""
+    CREATE TABLE IF NOT EXISTS feature_store (
+        symbol      VARCHAR NOT NULL,
+        timeframe   VARCHAR NOT NULL,
+        bar_time    TIMESTAMPTZ NOT NULL,
+        ema_diff    DOUBLE,
+        rsi_14      DOUBLE,
+        atr_normalized DOUBLE,
+        created_at  TIMESTAMP DEFAULT current_timestamp,
+        feature_id  VARCHAR,
+        plugin_version VARCHAR,
+        feature_data JSON,
+        PRIMARY KEY (symbol, timeframe, bar_time)
+    );
+""")
+
+
+def _utc(y, mo, d, h, mi=0):
+    return datetime(y, mo, d, h, mi, tzinfo=timezone.utc)
+
+
+rows_to_insert = [
+    (_utc(2026, 8, 3, 12), "proximity", "1.0.0", 0.10, 55.0, 0.02,
+     {"schema_version": "1.0", "is_hit": True}),
+    (_utc(2026, 8, 3, 13), "proximity", "1.0.0", 0.12, 57.0, 0.03,
+     {"schema_version": "1.0", "is_hit": False}),
+    (_utc(2026, 8, 3, 14), "proximity", "1.0.0", 0.11, 56.0, 0.025,
+     {"is_hit": True}),  # Alt-Row OHNE schema_version (E-3)
+    (_utc(2026, 8, 5, 8), "grid_lines", "0.9.0", -0.05, 42.0, 0.015,
+     {"schema_version": "1.0"}),
+    (_utc(2026, 8, 7, 23), "proximity", "1.0.0", 0.08, 60.0, 0.04,
+     {"schema_version": "1.0", "is_hit": True}),
+]
+for (bt, fid, ver, ema, rsi, atr, fdata) in rows_to_insert:
+    con_ana.execute("""
+        INSERT INTO feature_store
+            (symbol, timeframe, bar_time, feature_id, plugin_version,
+             ema_diff, rsi_14, atr_normalized, feature_data)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, ["SILVER", "M1", bt, fid, ver, ema, rsi, atr, json.dumps(fdata)])
+
+reader = FeatureStoreReader(db_path=TEST_DB_ANALYTICS)
+repo = AnalyticsRepository(reader=reader)
+
+
+# ---------------------------------------------------------------------------
+# A) Worker-Dispatch & Max-Lookback-Cap (synchron, Stub)
+# ---------------------------------------------------------------------------
+class RecordingRepo:
+    """Stub-Repository: zeichnet die erhaltenen Argumente auf."""
+
+    def __init__(self):
+        self.calls: list = []
+
+    def get_table(self, symbol, timeframe, feature_id=None, limit=None):
+        self.calls.append(("table", symbol, timeframe, feature_id, limit))
+        return {"rows": [], "total": 0}
+
+    def get_heatmap(self, symbol, timeframe, metric="count", feature_id=None):
+        self.calls.append(("heatmap", symbol, timeframe, metric, feature_id))
+        return {"matrix": [], "x_labels": [], "y_labels": []}
+
+    def get_scatter(self, symbol, timeframe, x_column="ema_diff", y_column="rsi_14",
+                    feature_id=None, limit=None):
+        self.calls.append(("scatter", symbol, timeframe, x_column, y_column,
+                           feature_id, limit))
+        return {"points": [], "x_label": x_column, "y_label": y_column, "total": 0}
+
+    def get_distribution(self, symbol, timeframe, column="atr_normalized",
+                         bins=20, feature_id=None, limit=None):
+        self.calls.append(("dist", symbol, timeframe, column, bins, feature_id,
+                           limit))
+        return {"bins": [], "counts": [], "column": column, "total": 0}
+
+    def get_available_features(self, symbol, timeframe):
+        self.calls.append(("features", symbol, timeframe))
+        return {"feature_ids": [], "columns": [], "total_rows": 0}
+
+
+def run_worker_sync(stub, kind, params):
+    captured = {}
+    w = AnalyticsAsyncWorker(stub, kind, params)
+    w.finished_ok.connect(lambda _w, k, d: captured.__setitem__(k, d))
+    w.failed.connect(lambda _w, k, e: captured.__setitem__(k, e))
+    w.run()
+    return captured
+
+
+# A1) Cap: limit=100000 -> 50000
+stub = RecordingRepo()
+res = run_worker_sync(stub, QUERY_TABLE, {"symbol": "S", "timeframe": "M1",
+                                          "limit": 100_000})
+check("A1) table dispatch + limit-Cap (100000 -> 50000)",
+      stub.calls and stub.calls[0][0] == "table"
+      and stub.calls[0][4] == MAX_LOOKBACK_LIMIT
+      and res.get(QUERY_TABLE) == {"rows": [], "total": 0},
+      str(stub.calls))
+
+# A2) limit=None bleibt None (Repo-Default)
+stub = RecordingRepo()
+run_worker_sync(stub, QUERY_TABLE, {"symbol": "S", "timeframe": "M1",
+                                    "limit": None})
+check("A2) limit=None bleibt None (kein Cap-Eingriff)",
+      stub.calls and stub.calls[0][4] is None, str(stub.calls))
+
+# A3) limit negativ -> 1
+stub = RecordingRepo()
+run_worker_sync(stub, QUERY_TABLE, {"symbol": "S", "timeframe": "M1",
+                                    "limit": -7})
+check("A3) limit<1 -> 1 (Untergrenze)",
+      stub.calls and stub.calls[0][4] == 1, str(stub.calls))
+
+# A4) cap_lookback_limit als Funktion
+check("A4) cap_lookback_limit direkt",
+      cap_lookback_limit(10 ** 9) == MAX_LOOKBACK_LIMIT
+      and cap_lookback_limit("x") is None
+      and cap_lookback_limit(None) is None)
+
+# A5) Heatmap-Dispatch (metric + feature_id)
+stub = RecordingRepo()
+run_worker_sync(stub, QUERY_HEATMAP,
+                {"symbol": "S", "timeframe": "M1", "metric": "rsi_14",
+                 "feature_id": "prox"})
+check("A5) heatmap dispatch (metric/feature_id)",
+      stub.calls and stub.calls[0][0] == "heatmap"
+      and stub.calls[0][3] == "rsi_14" and stub.calls[0][4] == "prox",
+      str(stub.calls))
+
+# A6) Scatter-Dispatch (Spalten + limit)
+stub = RecordingRepo()
+run_worker_sync(stub, QUERY_SCATTER,
+                {"symbol": "S", "timeframe": "M1", "x_column": "ema_diff",
+                 "y_column": "atr_normalized", "limit": 5000})
+check("A6) scatter dispatch",
+      stub.calls and stub.calls[0][0] == "scatter"
+      and stub.calls[0][3] == "ema_diff" and stub.calls[0][4] == "atr_normalized"
+      and stub.calls[0][6] == 5000, str(stub.calls))
+
+# A7) Distribution-Dispatch (column/bins)
+stub = RecordingRepo()
+run_worker_sync(stub, QUERY_DISTRIBUTION,
+                {"symbol": "S", "timeframe": "M1", "column": "rsi_14",
+                 "bins": 8, "limit": 1000})
+check("A7) distribution dispatch",
+      stub.calls and stub.calls[0][0] == "dist"
+      and stub.calls[0][3] == "rsi_14" and stub.calls[0][4] == 8
+      and stub.calls[0][6] == 1000, str(stub.calls))
+
+# A8) Features-Dispatch
+stub = RecordingRepo()
+run_worker_sync(stub, QUERY_FEATURES, {"symbol": "S", "timeframe": "M1"})
+check("A8) features dispatch",
+      stub.calls and stub.calls[0][0] == "features"
+      and stub.calls[0][1] == "S" and stub.calls[0][2] == "M1", str(stub.calls))
+
+# A9) unbekannter query_kind -> failed-Signal
+stub = RecordingRepo()
+captured = {}
+w = AnalyticsAsyncWorker(stub, "bogus", {"symbol": "S", "timeframe": "M1"})
+w.finished_ok.connect(lambda _w, k, d: captured.__setitem__(k, d))
+w.failed.connect(lambda _w, k, e: captured.__setitem__(k, e))
+w.run()
+check("A9) unbekannter query_kind -> failed",
+      "bogus" in captured and "Unbekannte" in str(captured["bogus"]),
+      str(captured))
+
+# ---------------------------------------------------------------------------
+# B) Worker mit echtem AnalyticsRepository + Test-DB (synchron)
+# ---------------------------------------------------------------------------
+cap = {}
+w = AnalyticsAsyncWorker(repo, QUERY_TABLE,
+                         {"symbol": "SILVER", "timeframe": "M1", "limit": 5000})
+w.finished_ok.connect(lambda _w, k, d: cap.__setitem__(k, d))
+w.failed.connect(lambda _w, k, e: cap.__setitem__(k, e))
+w.run()
+tab = cap.get(QUERY_TABLE)
+check("B1) get_table via Worker (total=5, rows=5)",
+      tab is not None and tab["total"] == 5 and len(tab["rows"]) == 5,
+      str(tab))
+
+cap2 = {}
+w = AnalyticsAsyncWorker(repo, QUERY_HEATMAP,
+                         {"symbol": "SILVER", "timeframe": "M1",
+                          "metric": "count"})
+w.finished_ok.connect(lambda _w, k, d: cap2.__setitem__(k, d))
+w.failed.connect(lambda _w, k, e: cap2.__setitem__(k, e))
+w.run()
+hm = cap2.get(QUERY_HEATMAP)
+check("B2) get_heatmap via Worker (24x7, Mo 12:00 == 1)",
+      hm is not None and len(hm["matrix"]) == HOURS_PER_DAY
+      and hm["matrix"][12][1] == 1.0, str(hm)[:120])
+
+cap3 = {}
+w = AnalyticsAsyncWorker(repo, QUERY_SCATTER,
+                         {"symbol": "SILVER", "timeframe": "M1",
+                          "x_column": "ema_diff", "y_column": "rsi_14"})
+w.finished_ok.connect(lambda _w, k, d: cap3.__setitem__(k, d))
+w.failed.connect(lambda _w, k, e: cap3.__setitem__(k, e))
+w.run()
+sc = cap3.get(QUERY_SCATTER)
+check("B3) get_scatter via Worker (5 Punkte)",
+      sc is not None and sc["total"] == 5 and len(sc["points"]) == 5, str(sc))
+
+cap4 = {}
+w = AnalyticsAsyncWorker(repo, QUERY_DISTRIBUTION,
+                         {"symbol": "SILVER", "timeframe": "M1",
+                          "column": "atr_normalized", "bins": 4})
+w.finished_ok.connect(lambda _w, k, d: cap4.__setitem__(k, d))
+w.failed.connect(lambda _w, k, e: cap4.__setitem__(k, e))
+w.run()
+di = cap4.get(QUERY_DISTRIBUTION)
+check("B4) get_distribution via Worker (bins=4)",
+      di is not None and len(di["bins"]) == 5 and di["total"] == 5, str(di))
+
+cap5 = {}
+w = AnalyticsAsyncWorker(repo, QUERY_FEATURES,
+                         {"symbol": "SILVER", "timeframe": "M1"})
+w.finished_ok.connect(lambda _w, k, d: cap5.__setitem__(k, d))
+w.failed.connect(lambda _w, k, e: cap5.__setitem__(k, e))
+w.run()
+fe = cap5.get(QUERY_FEATURES)
+check("B5) get_available_features via Worker",
+      fe is not None and fe["feature_ids"] == ["grid_lines", "proximity"]
+      and fe["total_rows"] == 5, str(fe))
+
+# ---------------------------------------------------------------------------
+# C) AnalyticsViewModel – Profil & Dirty (ohne Event-Loop)
+# ---------------------------------------------------------------------------
+prepo = AnalyticsProfileRepository(db_path=TEST_DB_APP)
+vm = AnalyticsViewModel(analytics_repo=repo, profile_repo=prepo)
+
+events: list = []
+bus_events: list = []
+vm.profiles_available.connect(lambda lst: events.append(("list", len(lst))))
+vm.active_profile_changed.connect(
+    lambda p: events.append(("active", p["name"] if p else None)))
+vm.dirty_changed.connect(lambda d: events.append(("dirty", d)))
+vm.profile_saved.connect(lambda pid: events.append(("saved", pid)))
+vm.profile_deleted.connect(lambda pid: events.append(("deleted", pid)))
+event_bus.profile_changed.connect(lambda name: bus_events.append(name))
+
+check("C1) anfangs kein aktives Profil", vm.active_profile is None
+      and vm.is_dirty is False)
+
+pid = vm.create_profile("Standard", description="Default")
+check("C2) create_profile -> aktiv + events",
+      pid is not None and vm.active_profile is not None
+      and vm.active_profile["name"] == "Standard"
+      and vm.is_dirty is False)
+check("C3) EventBus profile_changed bei create",
+      bus_events and bus_events[-1] == "Standard", str(bus_events))
+p = prepo.get_profile(pid)
+check("C4) Payload enthaelt schema_version",
+      p is not None and p["payload"].get("schema_version") == SCHEMA_VERSION_DEFAULT)
+
+# Duplikat-Name -> ValueError
+try:
+    vm.create_profile("Standard")
+    check("C5) Duplikat-Name -> ValueError", False, "kein Fehler")
+except ValueError:
+    check("C5) Duplikat-Name -> ValueError", True)
+
+# Parametertrend -> dirty True
+vm.set_symbol("SILVER")
+vm.set_timeframe("M1")
+vm.set_heatmap_metric("ema_diff")
+check("C6) Parametertrends setzen dirty",
+      vm.is_dirty is True and vm.params["symbol"] == "SILVER"
+      and vm.params["heatmap_metric"] == "ema_diff")
+
+# Save -> dirty False + Payload persistiert
+check("C7) save_profile liefert True", vm.save_profile() is True)
+check("C8) nach Save dirty False", vm.is_dirty is False)
+p = prepo.get_profile(pid)
+check("C9) Payload nach Save persistiert (symbol/metric)",
+      p is not None and p["payload"].get("symbol") == "SILVER"
+      and p["payload"].get("heatmap_metric") == "ema_diff"
+      and p["payload"].get("schema_version") == SCHEMA_VERSION_DEFAULT,
+      str(p["payload"]) if p else "None")
+
+# Zweites Profil + set_active
+pid2 = vm.create_profile("Zweites")
+check("C10) Zweites Profil aktiv", vm.active_profile["profile_id"] == pid2)
+check("C11) set_active liefert True", vm.set_active_profile(pid) is True)
+check("C12) aktives Profil im Repo umgeschaltet",
+      prepo.get_active_profile()["profile_id"] == pid
+      and prepo.get_profile(pid2)["is_active"] is False)
+check("C13) set_active unbekannt -> False", vm.set_active_profile("gibtsnicht") is False)
+
+# limit-Cap im ViewModel
+vm.set_limit(100_000)
+check("C14) set_limit-Cap (100000 -> 50000)",
+      vm.params["limit"] == MAX_LOOKBACK_LIMIT and vm.is_dirty is True)
+vm.set_limit(-3)
+check("C15) set_limit-Untergrenze (-> 1)", vm.params["limit"] == 1)
+
+# Delete
+check("C16) delete unbekannt -> False", vm.delete_profile("gibtsnicht") is False)
+check("C17) delete Profil", vm.delete_profile(pid2) is True)
+check("C18) delete aktives Profil",
+      vm.delete_profile(pid) is True and vm.active_profile is None
+      and vm.is_dirty is False)
+check("C19) kein Profil mehr aktiv", prepo.get_active_profile() is None)
+
+# save ohne aktives Profil -> False
+vm2 = AnalyticsViewModel(analytics_repo=repo, profile_repo=prepo)
+check("C20) save ohne aktives Profil -> False", vm2.save_profile() is False)
+
+# Datenfluss-Properties
+check("C21) heatmap_metrics/native_columns via ViewModel",
+      vm2.heatmap_metrics == ["count", "ema_diff", "rsi_14", "atr_normalized"]
+      and set(vm2.native_columns) == {"ema_diff", "rsi_14", "atr_normalized"})
+check("C22) max_lookback_limit Property",
+      vm2.max_lookback_limit == MAX_LOOKBACK_LIMIT)
+check("C23) Default-Parameter", vm2.params["bins"] == DEFAULT_BINS
+      and vm2.params["limit"] == DEFAULT_LIMIT)
+
+vm.shutdown()
+vm2.shutdown()
+
+# ---------------------------------------------------------------------------
+# D) AnalyticsViewModel – asynchroner Datenfluss (Event-Loop + Worker-Thread)
+# ---------------------------------------------------------------------------
+received: dict = {}
+busy: list = []
+vm3 = AnalyticsViewModel(analytics_repo=repo, profile_repo=prepo)
+vm3.data_ready.connect(lambda k, d: received.__setitem__(k, d))
+vm3.busy_changed.connect(busy.append)
+vm3.query_failed.connect(
+    lambda k, e: received.__setitem__(("failed", k), e))
+
+vm3.set_symbol("SILVER")
+vm3.set_timeframe("M1")
+
+check("D1) data_ready fuer table nach Debounce+Worker",
+      run_until(lambda: QUERY_TABLE in received))
+check("D2) table-Daten korrekt (total=5)",
+      received.get(QUERY_TABLE, {}).get("total") == 5,
+      str(received.get(QUERY_TABLE)))
+
+check("D3) alle 5 Kinds nach Debounce+Worker",
+      run_until(lambda: all(k in received for k in (
+          QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
+          QUERY_DISTRIBUTION, QUERY_FEATURES))))
+check("D4) heatmap-Daten (Mo 12:00 == 1)",
+      received[QUERY_HEATMAP]["matrix"][12][1] == 1.0)
+check("D5) features-Daten",
+      received[QUERY_FEATURES]["feature_ids"] == ["grid_lines", "proximity"])
+check("D6) busy_changed True und False (Progress-Spinner)",
+      busy.count(True) >= 1 and busy.count(False) >= 1, str(busy))
+check("D7) keine query_failed", not any(k == ("failed", QUERY_TABLE)
+                                        for k in received))
+
+vm3.shutdown()
+# Laufende Worker ausraeumen
+for _ in range(5):
+    QCoreApplication.processEvents()
+    time.sleep(0.01)
+
+# ---------------------------------------------------------------------------
+# Aufraeumen
+# ---------------------------------------------------------------------------
+for _db in (TEST_DB_ANALYTICS, TEST_DB_APP):
+    try:
+        os.remove(_db)
+    except OSError:
+        pass
+
+print("-" * 60)
+if FAILURES:
+    print(f"FEHLER: {len(FAILURES)} Pruefung(en) fehlgeschlagen: {FAILURES}")
+    sys.exit(1)
+print("ALLE PRUEFUNGEN BESTANDEN (OK)")
+sys.exit(0)
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/check_performance_p14.py
 ```py
 ﻿# BEREIT FÜR PHASE 15
@@ -41686,6 +49844,702 @@ except Exception as e:
 
 --------------------------------------------------
 
+### DATEI: test/check_table_render_fix.py
+```py
+# test/check_table_render_fix.py
+"""Misst den TablePage-Render (sichtbare Seite, 5000 Zeilen).
+
+Vor dem Fix (QHeaderView.ResizeToContents) blockierte _populate den
+Main-Thread minutenlang (O(n^2)-Breitenberechnung bei jedem setItem).
+Nach dem Fix (Fixe Spaltenbreiten) muss der Render unter 2s liegen.
+"""
+import os
+import sys
+import time
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+_app = QApplication.instance() or QApplication(sys.argv)
+
+from analytics.ui.table_page import TablePage  # noqa: E402
+
+page = TablePage()
+page.show()
+_app.processEvents()
+
+rows = []
+for i in range(5000):
+    rows.append({
+        "time": 1785000000 + i * 60,
+        "symbol": "SILVER",
+        "timeframe": "M2",
+        "feature_id": None,
+        "plugin_version": "1.0",
+        "ema_diff": 0.1234 + i * 1e-6,
+        "rsi_14": None,
+        "atr_normalized": 0.05 + i * 1e-7,
+    })
+
+t0 = time.time()
+page.on_data_ready("table", {"rows": rows, "total": len(rows)})
+dt = time.time() - t0
+print(f"Render sichtbare Tabelle 5000 Zeilen: {dt:.2f}s")
+assert dt < 2.0, f"Render zu langsam: {dt:.2f}s"
+assert page._table.rowCount() == 5000
+
+# Versteckte Seite: gar kein Render (Guard)
+page.hide()
+t0 = time.time()
+page.on_data_ready("table", {"rows": rows, "total": len(rows)})
+dt2 = time.time() - t0
+print(f"Render versteckte Tabelle: {dt2:.4f}s (kein Work erwartet)")
+assert dt2 < 0.1, f"Versteckter Render zu langsam: {dt2:.2f}s"
+
+print("OK - TablePage-Render-Fix verifiziert")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_tf_change_all11.py
+```py
+# test/check_tf_change_all11.py
+"""Verifikation 15.03 Issue 3: TF-Wechsel ueber ALLE 11 TFs (SILVER) mit
+dem echten Fenster (Test-DBs) – kein Haenger, alle TFs selektierbar.
+
+Hermetisch: FeatureStoreReader nutzt die Test-Kopie `analytics_test.duckdb`
+(regelkonform in test/), NICHT die echte data/analytics.duckdb – so ist der
+Test unabhaengig von einer evtl. laufenden PyTrader-Instanz (Datei-Sperre).
+"""
+import os
+import sys
+import time
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+_app = QApplication.instance() or QApplication(sys.argv)
+
+from state_manager import StateManager as SM
+from symbol_repository import SymbolRepository as SR
+from analytics_profile_repository import AnalyticsProfileRepository as APR
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+TEST_APP = os.path.join(TEST_DIR, "all11_app.duckdb")
+TEST_SYM = os.path.join(TEST_DIR, "all11_sym.duckdb")
+TEST_ANALYTICS = os.path.join(TEST_DIR, "analytics_test.duckdb")
+for p in (TEST_APP, TEST_SYM):
+    if os.path.exists(p):
+        os.remove(p)
+
+_real_sm_init = SM.__init__
+def _p1(self, db_path=TEST_APP): _real_sm_init(self, db_path)
+SM.__init__ = _p1
+
+_real_sr_init = SR.__init__
+def _p2(self, db_path=TEST_SYM): _real_sr_init(self, db_path)
+SR.__init__ = _p2
+
+_real_apr_init = APR.__init__
+def _p3(self, db_path=TEST_APP): _real_apr_init(self, db_path)
+APR.__init__ = _p3
+
+# FeatureStoreReader auf die Test-Kopie lenken (hermetisch, keine Sperre).
+from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
+_real_fsr_init = FeatureStoreReader.__init__
+def _p4(self, db_path=TEST_ANALYTICS): _real_fsr_init(self, db_path)
+FeatureStoreReader.__init__ = _p4
+
+import analytics.ui.analytics_win as aw
+aw.get_symbol_repository = lambda: SR(db_path=TEST_SYM)
+
+from analytics.engine.analytics_worker import (  # noqa: E402
+    QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
+    QUERY_DISTRIBUTION, QUERY_FEATURES,
+)
+
+ALL_KINDS = (QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
+             QUERY_DISTRIBUTION, QUERY_FEATURES)
+
+FAILURES: list = []
+
+def check(name, cond, detail=""):
+    print(f"[{'PASS' if cond else 'FAIL'}] {name}" + (f" - {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(name)
+
+win = aw.AnalyticsWindow()
+win.show()
+
+done_kinds = set()
+failed_kinds = set()
+win._vm.data_ready.connect(lambda k, d: done_kinds.add(k))
+# query_failed zaehlt ebenfalls als Abschluss (kein Endlos-Warten).
+win._vm.query_failed.connect(
+    lambda k, e: (failed_kinds.add(k), print(f"  [WARN] query {k} fehlgeschlagen: {e}")))
+
+def _all_done():
+    return all((k in done_kinds or k in failed_kinds) for k in ALL_KINDS)
+
+def pump_until(desc, timeout_s=10):
+    t0 = time.time()
+    deadline = t0 + timeout_s
+    while time.time() < deadline:
+        _app.processEvents()
+        time.sleep(0.003)
+        if _all_done() and win._vm._worker is None and not win._vm._pending_kinds:
+            return time.time() - t0
+    print(f"[HANG?] {desc}: TIMEOUT busy={win._vm._worker is not None} "
+          f"pending={win._vm._pending_kinds} done={sorted(done_kinds)} "
+          f"failed={sorted(failed_kinds)}")
+    return None
+
+# SILVER auswaehlen (hat Daten in allen 11 TFs)
+idx = win.combo_symbol.findText("SILVER")
+win.combo_symbol.setCurrentIndex(idx)
+_app.processEvents()
+done_kinds.clear()
+failed_kinds.clear()
+dt_init = pump_until("INIT SILVER", 15)
+if dt_init is None:
+    check("A0) INIT SILVER ohne Haenger", False)
+
+# Schleife ueber ALLE 11 TFs: Jeder TF-Wechsel muss zum VORHERIGEN TF
+# erfolgen (Signalfeuerung); zum Abschluss wird der Kreis geschlossen.
+order = ["M1", "M2", "M5", "M10", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"]
+all_ok = True
+for i, tf in enumerate(order):
+    prev_tf = order[i - 1]
+    tidx = win.combo_tf.findText(tf)
+    if tidx < 0:
+        print(f"[FAIL] TF {tf} fehlt in Combo")
+        all_ok = False
+        continue
+    if not win.combo_tf.model().item(tidx).isEnabled():
+        print(f"[FAIL] TF {tf} ist ausgegraut (sollte Daten haben)")
+        all_ok = False
+        continue
+    # Wechsel vom vorherigen TF (Kreis): immer ein ECHTER Wechsel.
+    prev_idx = win.combo_tf.findText(prev_tf)
+    win.combo_tf.setCurrentIndex(prev_idx)
+    _app.processEvents()
+    done_kinds.clear()
+    failed_kinds.clear()
+    win.combo_tf.setCurrentIndex(tidx)
+    dt = pump_until(f"TF={tf} (von {prev_tf})", 10)
+    if dt is None:
+        all_ok = False
+    else:
+        print(f"[OK] TF={tf:<4} (von {prev_tf}): {dt:.2f}s")
+
+check("A) alle 11 TFs fuer SILVER auswaehlbar + kein Haenger", all_ok)
+check("B) kein Worker offen am Ende", win._vm._worker is None)
+
+win.close()
+print("-" * 60)
+if FAILURES:
+    print(f"FEHLER: {FAILURES}")
+    sys.exit(1)
+print("ALLE PRUEFUNGEN BESTANDEN (OK)")
+sys.exit(0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_tf_change_hang.py
+```py
+# test/check_tf_change_hang.py
+"""Analyse (15.03): Reproduziert den TF-Wechsel-Haenger mit dem echten
+AnalyticsWindow (offscreen QApplication, echte DBs).
+
+Beobachtet:
+  - wie lange ein einzelner TF-Wechsel dauert (bis alle data_ready)
+  - ob ein Worker stecken bleibt (busy=True ohne Abschluss)
+  - ob die Event-Loop haengt (timeout-Pruefung)
+"""
+import os
+import sys
+import time
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+_app = QApplication.instance() or QApplication(sys.argv)
+
+from analytics.ui.analytics_win import AnalyticsWindow  # noqa: E402
+from analytics.engine.analytics_worker import (  # noqa: E402
+    QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
+    QUERY_DISTRIBUTION, QUERY_FEATURES,
+)
+
+ALL_KINDS = (QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
+             QUERY_DISTRIBUTION, QUERY_FEATURES)
+
+win = AnalyticsWindow()
+win.show()
+
+# Erstmal warten bis initial geladen
+t0 = time.time()
+done_kinds = set()
+win._vm.data_ready.connect(lambda k, d: done_kinds.add(k))
+deadline = time.time() + 15
+while time.time() < deadline:
+    _app.processEvents()
+    time.sleep(0.005)
+    if all(k in done_kinds for k in ALL_KINDS):
+        break
+print(f"[INIT] initiale 5 Kinds nach {time.time() - t0:.2f}s: "
+      f"{sorted(done_kinds)}")
+
+# Jetzt 10 schnelle TF-Wechsel
+tfs = ["M1", "M2", "M5", "M10", "M15", "M30", "H1", "H4", "D1", "W1"]
+for i, tf in enumerate(tfs):
+    t_start = time.time()
+    win.combo_tf.setCurrentText(tf)
+    # Event-Loop bis der Worker-Zyklus fertig ist (max 8s)
+    done_kinds.clear()
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        _app.processEvents()
+        time.sleep(0.005)
+        if all(k in done_kinds for k in ALL_KINDS) \
+                and win._vm._worker is None \
+                and not win._vm._pending_kinds:
+            break
+    elapsed = time.time() - t_start
+    if elapsed >= 8:
+        print(f"[HANG?] TF={tf}: TIMEOUT nach 8s! busy="
+              f"{win._vm._worker is not None} pending={win._vm._pending_kinds} "
+              f"done={sorted(done_kinds)}")
+    else:
+        print(f"[OK] TF={tf:<4}: {elapsed:.2f}s done={sorted(done_kinds)}")
+    _app.processEvents()
+
+win.close()
+print("FERTIG")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_tf_change_hang2.py
+```py
+# test/check_tf_change_hang2.py
+"""Analyse (15.03): Reproduziert den TF-Wechsel-Haenger.
+
+- Verwendet nur TFs, die in der Combo sind (setCurrentIndex)
+- Watchdog-Thread mit faulthandler.dump_traceback(), wenn >3s kein Fortschritt
+"""
+import faulthandler
+import os
+import sys
+import threading
+import time
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+faulthandler.enable()
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+_app = QApplication.instance() or QApplication(sys.argv)
+
+from analytics.ui.analytics_win import AnalyticsWindow  # noqa: E402
+from analytics.engine.analytics_worker import (  # noqa: E402
+    QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
+    QUERY_DISTRIBUTION, QUERY_FEATURES,
+)
+
+ALL_KINDS = (QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
+             QUERY_DISTRIBUTION, QUERY_FEATURES)
+
+win = AnalyticsWindow()
+win.show()
+
+done_kinds = set()
+win._vm.data_ready.connect(lambda k, d: done_kinds.add(k))
+
+watchdog_stop = False
+
+
+def watchdog():
+    last = time.time()
+    while not watchdog_stop:
+        time.sleep(0.5)
+        if time.time() - last > 3:
+            print("\n=== WATCHDOG: KEIN FORTSCHRITT SEIT 3s, STACKS: ===")
+            faulthandler.dump_traceback()
+            last = time.time()
+
+
+wt = threading.Thread(target=watchdog, daemon=True)
+wt.start()
+
+
+def pump_until(desc, timeout_s=10):
+    t0 = time.time()
+    deadline = t0 + timeout_s
+    while time.time() < deadline:
+        _app.processEvents()
+        time.sleep(0.005)
+        if all(k in done_kinds for k in ALL_KINDS) \
+                and win._vm._worker is None \
+                and not win._vm._pending_kinds:
+            print(f"[OK] {desc}: {time.time() - t0:.2f}s done={sorted(done_kinds)}")
+            return True
+    print(f"[HANG?] {desc}: TIMEOUT nach {timeout_s}s busy="
+          f"{win._vm._worker is not None} pending={win._vm._pending_kinds} "
+          f"done={sorted(done_kinds)}")
+    return False
+
+
+# Init abwarten
+done_kinds.clear()
+pump_until("INIT", 15)
+
+# TF-Wechsel mit validen TFs
+for tf in ["M5", "H1", "M15", "M30", "D1"]:
+    idx = win.combo_tf.findText(tf)
+    if idx < 0:
+        print(f"[SKIP] {tf} nicht in Combo")
+        continue
+    done_kinds.clear()
+    win.combo_tf.setCurrentIndex(idx)
+    pump_until(f"TF={tf}", 10)
+
+watchdog_stop = True
+win.close()
+print("FERTIG")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_tf_change_hang3.py
+```py
+# test/check_tf_change_hang3.py
+"""Hypothesen-Test: Haengt der TF-Wechsel am synchronen save_state()
+(_on_filter_changed_save -> app_data.duckdb)? Patch auf no-op und messen.
+"""
+import os
+import sys
+import time
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+_app = QApplication.instance() or QApplication(sys.argv)
+
+import analytics.ui.analytics_win as aw
+from analytics.engine.analytics_worker import (  # noqa: E402
+    QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
+    QUERY_DISTRIBUTION, QUERY_FEATURES,
+)
+
+# HYPOTHESE: _on_filter_changed_save ist der Haenger -> no-op patchen
+aw.AnalyticsWindow._on_filter_changed_save = lambda self: None
+
+ALL_KINDS = (QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
+             QUERY_DISTRIBUTION, QUERY_FEATURES)
+
+win = aw.AnalyticsWindow()
+win.show()
+
+done_kinds = set()
+win._vm.data_ready.connect(lambda k, d: done_kinds.add(k))
+
+def pump_until(desc, timeout_s=10):
+    t0 = time.time()
+    deadline = t0 + timeout_s
+    while time.time() < deadline:
+        _app.processEvents()
+        time.sleep(0.005)
+        if all(k in done_kinds for k in ALL_KINDS) \
+                and win._vm._worker is None \
+                and not win._vm._pending_kinds:
+            print(f"[OK] {desc}: {time.time() - t0:.2f}s")
+            return True
+    print(f"[HANG?] {desc}: TIMEOUT busy={win._vm._worker is not None} "
+          f"pending={win._vm._pending_kinds} done={sorted(done_kinds)}")
+    return False
+
+done_kinds.clear()
+pump_until("INIT", 15)
+
+for tf in ["M5", "H1", "M15", "M30", "D1"]:
+    idx = win.combo_tf.findText(tf)
+    if idx < 0:
+        print(f"[SKIP] {tf}")
+        continue
+    done_kinds.clear()
+    win.combo_tf.setCurrentIndex(idx)
+    pump_until(f"TF={tf}", 10)
+
+win.close()
+print("FERTIG")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_tf_change_hang4.py
+```py
+# test/check_tf_change_hang4.py
+"""Analyse (15.03): TF-Wechsel mit ISOLIERTEN Test-DBs (app_data + symbols),
+damit die echte, von PID 8228 gesperrte app_data.duckdb nicht stoert.
+
+Vergleich:
+  A) MIT synchronem save_state (_on_filter_changed_save) -> Haenger?
+  B) OHNE save_state (gepatched) -> laeuft?
+"""
+import os
+import sys
+import time
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+_app = QApplication.instance() or QApplication(sys.argv)
+
+from state_manager import StateManager as SM
+from symbol_repository import SymbolRepository as SR
+from analytics_profile_repository import AnalyticsProfileRepository as APR
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+TEST_APP = os.path.join(TEST_DIR, "tf_hang_app.duckdb")
+TEST_SYM = os.path.join(TEST_DIR, "tf_hang_sym.duckdb")
+for p in (TEST_APP, TEST_SYM):
+    if os.path.exists(p):
+        os.remove(p)
+
+# StateManager + SymbolRepository + AnalyticsProfileRepository auf Test-DBs
+# umbiegen (Default-Parameter sind beim Klassenimport gebunden -> __init__ patchen).
+_real_sm_init = SM.__init__
+def _patched_sm_init(self, db_path=TEST_APP):
+    _real_sm_init(self, db_path)
+SM.__init__ = _patched_sm_init
+
+_real_sr_init = SR.__init__
+def _patched_sr_init(self, db_path=TEST_SYM):
+    _real_sr_init(self, db_path)
+SR.__init__ = _patched_sr_init
+
+_real_apr_init = APR.__init__
+def _patched_apr_init(self, db_path=TEST_APP):
+    _real_apr_init(self, db_path)
+APR.__init__ = _patched_apr_init
+
+import analytics.ui.analytics_win as aw
+import persistent_win as pw
+# persistent_win.StateManager ist dieselbe Klasse; get_symbol_repository
+# muss auf die Test-DB zeigen.
+aw.get_symbol_repository = lambda: SR(db_path=TEST_SYM)
+
+from analytics.engine.analytics_worker import (  # noqa: E402
+    QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
+    QUERY_DISTRIBUTION, QUERY_FEATURES,
+)
+
+ALL_KINDS = (QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
+             QUERY_DISTRIBUTION, QUERY_FEATURES)
+
+MODE = sys.argv[1] if len(sys.argv) > 1 else "with_save"
+if MODE == "no_save":
+    aw.AnalyticsWindow._on_filter_changed_save = lambda self: None
+    print("=== MODUS: OHNE save_state (gepatched) ===")
+else:
+    print("=== MODUS: MIT synchronem save_state ===")
+
+win = aw.AnalyticsWindow()
+win.show()
+
+done_kinds = set()
+win._vm.data_ready.connect(lambda k, d: done_kinds.add(k))
+
+def pump_until(desc, timeout_s=10):
+    t0 = time.time()
+    deadline = t0 + timeout_s
+    while time.time() < deadline:
+        _app.processEvents()
+        time.sleep(0.005)
+        if all(k in done_kinds for k in ALL_KINDS) \
+                and win._vm._worker is None \
+                and not win._vm._pending_kinds:
+            print(f"[OK] {desc}: {time.time() - t0:.2f}s")
+            return True
+    print(f"[HANG?] {desc}: TIMEOUT busy={win._vm._worker is not None} "
+          f"pending={win._vm._pending_kinds} done={sorted(done_kinds)}")
+    return False
+
+done_kinds.clear()
+pump_until("INIT", 15)
+
+for tf in ["M5", "H1", "M15", "M30", "D1"]:
+    idx = win.combo_tf.findText(tf)
+    if idx < 0:
+        print(f"[SKIP] {tf}")
+        continue
+    done_kinds.clear()
+    t0 = time.time()
+    win.combo_tf.setCurrentIndex(idx)
+    pump_until(f"TF={tf}", 10)
+
+win.close()
+print("FERTIG")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_tf_gray.py
+```py
+# test/check_tf_gray.py
+"""Verifikation 15.03-Fixes Issue 1+2:
+- Alle MT5-Timeframes werden in der Combo angeboten (inkl. M2, M10, W1, MN1)
+- TFs ohne Feature-Store-Daten werden ausgegraut und sind nicht auswaehlbar
+"""
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+_app = QApplication.instance() or QApplication(sys.argv)
+
+from state_manager import StateManager as SM
+from symbol_repository import SymbolRepository as SR
+from analytics_profile_repository import AnalyticsProfileRepository as APR
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+TEST_APP = os.path.join(TEST_DIR, "tf_gray_app.duckdb")
+TEST_SYM = os.path.join(TEST_DIR, "tf_gray_sym.duckdb")
+TEST_ANALYTICS = os.path.join(TEST_DIR, "analytics_test.duckdb")
+for p in (TEST_APP, TEST_SYM):
+    if os.path.exists(p):
+        os.remove(p)
+
+_real_sm_init = SM.__init__
+def _patched_sm_init(self, db_path=TEST_APP):
+    _real_sm_init(self, db_path)
+SM.__init__ = _patched_sm_init
+
+_real_sr_init = SR.__init__
+def _patched_sr_init(self, db_path=TEST_SYM):
+    _real_sr_init(self, db_path)
+SR.__init__ = _patched_sr_init
+
+_real_apr_init = APR.__init__
+def _patched_apr_init(self, db_path=TEST_APP):
+    _real_apr_init(self, db_path)
+APR.__init__ = _patched_apr_init
+
+# FeatureStoreReader hermetisch auf die Test-Kopie lenken (keine Sperre
+# durch eine laufende PyTrader-Instanz auf data/analytics.duckdb).
+from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
+_real_fsr_init = FeatureStoreReader.__init__
+def _patched_fsr_init(self, db_path=TEST_ANALYTICS):
+    _real_fsr_init(self, db_path)
+FeatureStoreReader.__init__ = _patched_fsr_init
+
+import analytics.ui.analytics_win as aw
+aw.get_symbol_repository = lambda: SR(db_path=TEST_SYM)
+
+from analytics.ui.analytics_win import TIMEFRAMES  # noqa: E402
+
+FAILURES: list = []
+
+def check(name, cond, detail=""):
+    print(f"[{'PASS' if cond else 'FAIL'}] {name}" + (f" - {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(name)
+
+# --- Issue 1: alle TFs in der Combo ---
+EXPECTED = ["M1", "M2", "M5", "M10", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"]
+check("I1) TIMEFRAMES enthaelt M2", "M2" in TIMEFRAMES, str(TIMEFRAMES))
+check("I1b) TIMEFRAMES enthaelt alle 11", sorted(TIMEFRAMES) == sorted(EXPECTED),
+      str(TIMEFRAMES))
+
+win = aw.AnalyticsWindow()
+win.show()
+_app.processEvents()
+
+check("I2) Combo hat 11 Eintraege", win.combo_tf.count() == 11,
+      f"count={win.combo_tf.count()}")
+combo_tfs = [win.combo_tf.itemText(i) for i in range(win.combo_tf.count())]
+check("I2b) Combo enthaelt M2/M10/W1/MN1",
+      "M2" in combo_tfs and "M10" in combo_tfs and "W1" in combo_tfs
+      and "MN1" in combo_tfs, str(combo_tfs))
+
+# --- Issue 2: SILVER hat Daten in allen 11 TFs -> alle aktiv ---
+win._refresh_timeframe_combo("SILVER")
+enabled_silver = [win.combo_tf.itemText(i)
+                  for i in range(win.combo_tf.count())
+                  if win.combo_tf.model().item(i).isEnabled()]
+check("I3) SILVER: alle 11 TFs aktiv", sorted(enabled_silver) == sorted(EXPECTED),
+      str(enabled_silver))
+
+# BTCUSD hat KEINE Feature-Daten -> alle TFs ausgegraut
+win._refresh_timeframe_combo("BTCUSD")
+enabled_btc = [win.combo_tf.itemText(i)
+               for i in range(win.combo_tf.count())
+               if win.combo_tf.model().item(i).isEnabled()]
+check("I4) BTCUSD: keine TFs aktiv (alle grau)", enabled_btc == [],
+      str(enabled_btc))
+
+# Auswahl kann nicht auf deaktivierten TF gesetzt werden: current index
+# muss auf einem aktivierten TF liegen.
+win._refresh_timeframe_combo("SILVER")
+win.combo_tf.setCurrentIndex(0)  # M1
+check("I5) SILVER: aktuelle Auswahl (M1) ist aktiv",
+      win.combo_tf.model().item(win.combo_tf.currentIndex()).isEnabled())
+
+# Symbolwechsel ueber die Combo (Signal-Pfad): BTCUSD -> SILVER
+idx = win.combo_symbol.findText("SILVER")
+check("I6a) SILVER in Combo vorhanden", idx >= 0, str(idx))
+win.combo_symbol.setCurrentIndex(idx)
+_app.processEvents()
+enabled_after_silver = [win.combo_tf.itemText(i)
+                        for i in range(win.combo_tf.count())
+                        if win.combo_tf.model().item(i).isEnabled()]
+check("I6) Wechsel auf SILVER aktiviert TFs (Signal-Pfad)",
+      sorted(enabled_after_silver) == sorted(EXPECTED),
+      str(enabled_after_silver))
+
+# Wechsel zurueck auf BTCUSD -> alle grau
+idx = win.combo_symbol.findText("BTCUSD")
+win.combo_symbol.setCurrentIndex(idx)
+_app.processEvents()
+enabled_back = [win.combo_tf.itemText(i)
+                for i in range(win.combo_tf.count())
+                if win.combo_tf.model().item(i).isEnabled()]
+check("I7) Wechsel auf BTCUSD graut TFs aus (Signal-Pfad)",
+      enabled_back == [], str(enabled_back))
+
+win.close()
+print("-" * 60)
+if FAILURES:
+    print(f"FEHLER: {len(FAILURES)}: {FAILURES}")
+    sys.exit(1)
+print("ALLE PRUEFUNGEN BESTANDEN (OK)")
+sys.exit(0)
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/check_time_constants.js
 ```js
 ﻿// BEREIT FÜR PHASE 15
@@ -42140,6 +50994,320 @@ for tick in range(cont_candles[0] - cont_candles[0] % 3600, cont_candles[-1], 36
         missing += 1
         print(f"  Tick {tick} -> [FALLBACK fake] {tick}  => label {datetime.fromtimestamp(tick, tz=timezone.utc)}")
 print(f"  Ticks ohne Mapping: {missing}")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/test.py
+```py
+# test/test.py
+"""
+Bugfixing-Modus: Isolierter Backend-Check fuer
+  1) Persistenz der Fenstergeometrie (restore -> Reflow ueberschreibt)
+  2) MasterTree-Klick-Sturm (Access-Violation-Kandidat)
+  3) Fenster-Historie: ServiceWindow/AnalyticsWindow wie chart_win –
+     manuell geschlossene Fenster werden aus der aktiven History entfernt
+     (kein Auto-Restore beim Neustart); offene Fenster beim App-Ende
+     werden mit Geometrie wiederhergestellt.
+  4) Chart-Circles: GridLiquidityIndicator liefert hit_circles wieder
+     (Pipeline-Fallback, wenn der feature_store leer ist).
+
+KEINE GUI-Ausfuehrung (kein exec_ im Produktivpfad).
+"""
+import os
+import sys
+import tempfile
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtCore import QEventLoop, QTimer  # noqa: E402
+
+_app = QApplication.instance() or QApplication(sys.argv)
+
+from state_manager import StateManager  # noqa: E402
+from analytics.engine.service_set_repository import ServiceSetRepository  # noqa: E402
+from serviceui.service_win import ServiceWindow  # noqa: E402
+from persistent_win import PersistentWindow, register_persistent_window  # noqa: E402
+
+FAILURES = []
+
+
+def check(name, cond, detail=""):
+    s = "PASS" if cond else "FAIL"
+    print(f"[{s}] {name}" + (f" - {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(name)
+
+
+def pump():
+    _app.processEvents()
+    # WICHTIG: QEventLoop statt QApplication.quit() – quit() setzt intern
+    # den Quit-Flag und versteckt auf dem offscreen-Platform-Fenster alle
+    # Top-Level-Widgets (isVisible() -> False). Das QEventLoop-Muster lässt
+    # die Fenster sichtbar und verhält sich wie die echte GUI.
+    loop = QEventLoop()
+    QTimer.singleShot(0, loop.quit)
+    loop.exec()
+    _app.processEvents()
+
+
+tmp = tempfile.mkdtemp(prefix="bf_")
+db_app = os.path.join(tmp, "app_data.duckdb")
+db_set = os.path.join(tmp, "sets.duckdb")
+
+sm = StateManager(db_path=db_app)
+repo = ServiceSetRepository(db_path=db_set)
+
+# --- Isolation gegen die laufende App ---------------------------------------
+# Die echten DBs (data/app_data.duckdb usw.) sind durch die offene
+# PyTrader-Instanz gesperrt (DuckDB: Single-Writer). Daher werden ALLE
+# Repository-/StateManager-Zugriffe der Fenster auf die Test-DBs umgeleitet.
+# WICHTIG: Die __init__-Methoden werden direkt gepatcht (nicht Modul-Attribute),
+# weil z. B. ServiceSelectorModel.__init__ die Klassen per In-Funktion-Import
+# neu bindet und Modul-Patches sonst ueberschrieben wuerden.
+import symbol_repository as _symrepo  # noqa: E402
+_symrepo.get_symbol_repository = lambda: _symrepo.SymbolRepository(db_path=db_app)
+import serviceui.service_win as _sw  # noqa: E402
+_sw.get_symbol_repository = _symrepo.get_symbol_repository
+
+import analytics.engine.service_set_repository as _ssr_mod  # noqa: E402
+_orig_ssr_init = _ssr_mod.ServiceSetRepository.__init__
+def _patched_ssr_init(self, db_path=None, *a, **kw):
+    _orig_ssr_init(self, db_path or db_set, *a, **kw)
+_ssr_mod.ServiceSetRepository.__init__ = _patched_ssr_init
+
+import state_manager as _sm_mod  # noqa: E402
+_orig_sm_init = _sm_mod.StateManager.__init__
+def _patched_sm_init(self, db_path=None, *a, **kw):
+    _orig_sm_init(self, db_path or db_app, *a, **kw)
+_sm_mod.StateManager.__init__ = _patched_sm_init
+
+repo.save_set({
+    "set_id": "set_1",
+    "display_name": "Drei Services",
+    "execution_order": ["grid_1", "prox_1", "grid_2"],
+    "services": {
+        "grid_1": {"plugin_id": "grid_liquidity", "lookback": 1000, "params": {"grid_step": 0.5}},
+        "prox_1": {"plugin_id": "proximity", "lookback": 500, "params": {"prox_level1": 1.0}},
+        "grid_2": {"plugin_id": "grid_liquidity", "lookback": 2000, "params": {"grid_step": 0.25}},
+    },
+})
+
+# ---------------------------------------------------------------------------
+# Teil 1: Persistenz – gespeicherte Geometrie wird wiederhergestellt und
+#         nicht durch deferred Reflows ueberschrieben.
+# ---------------------------------------------------------------------------
+print("\n=== Teil 1: Persistenz ===")
+sm.save_window_geometry("win_service", 150, 120, 640, 400, False)
+sm.save_instance_state("win_service", "SILVER", "H1")
+
+
+class _Parent:
+    state_manager = sm
+
+
+w = ServiceWindow(parent=_Parent(), service_set_repo=repo)
+# ServiceSelector nutzt das GLEICHE Test-Repo (sonst echte app_data.duckdb)
+w.service_selector.model.set_repo = repo
+w.service_selector.model.refresh()
+w.show()
+pump()
+pump()
+screen = _app.primaryScreen().availableGeometry()
+print(f"   Screen offscreen: {screen.width()}x{screen.height()}")
+pos = w.pos()
+size = w.size()
+print(f"   nach Restore+Reflow: pos=({pos.x()},{pos.y()}) size={size.width()}x{size.height()}")
+check("P1) Position wiederhergestellt (150,120)", pos.x() == 150 and pos.y() == 120,
+      f"({pos.x()},{pos.y()})")
+check("P2) Hoehe nicht unter gespeicherte 400 geschrumpft", size.height() >= 400,
+      f"{size.height()}")
+
+# User zieht das Fenster auf (800, 450) und klappt Expert-Optionen ein
+# (Inhalt schrumpft) -> Reflow darf die User-Hoehe NICHT ueberschreiben.
+w.resize(w.width(), 450)
+from PySide6.QtWidgets import QGroupBox  # noqa: E402
+for g in w.widget_service_columns.findChildren(QGroupBox):
+    if g.title() == "Experten-Optionen":
+        g.setChecked(False)  # einklappen -> Inhalt schrumpft
+pump()
+pump()
+print(f"   nach User-Resize 450 + Einklappen: size={w.width()}x{w.height()}")
+check("P3) User-Hoehe 450 bleibt erhalten (kein Schrumpfen auf Inhalt)",
+      w.height() == 450, f"{w.height()}")
+
+w.move(200, 180)
+w.save_state()
+geom = sm.get_window_geometry("win_service")
+print(f"   nach save_state: {geom}")
+check("P4) save_state speichert User-Position (200,180)",
+      geom and geom["pos_x"] == 200 and geom["pos_y"] == 180, str(geom))
+check("P5) save_state speichert User-Hoehe 450",
+      geom and geom["height"] == 450, str(geom))
+
+# ---------------------------------------------------------------------------
+# Teil 2: Klick-Sturm auf Services (MasterTree -> _on_master_selection ->
+#         load_set_into_editor -> _clear_service_columns -> deleteLater).
+# ---------------------------------------------------------------------------
+print("\n=== Teil 2: Klick-Sturm ===")
+mt = w.service_selector.master_tree
+set_group = mt.topLevelItem(0)
+svc_count = set_group.child(0).childCount() if set_group and set_group.childCount() else 0
+print(f"   Set-Knoten: {svc_count} Services")
+crash = None
+for i in range(40):
+    try:
+        svc = set_group.child(0).child(i % max(svc_count, 1))
+        mt.setCurrentItem(svc)
+        pump()
+        if hasattr(w, "_on_master_selection"):
+            sel = mt.current_selection()
+            w._on_master_selection(sel["set_id"], sel["service_id"])
+            pump()
+    except Exception as e:  # noqa: BLE001
+        crash = f"{type(e).__name__}: {e}"
+        break
+check("K1) 40 schnelle Service-Klicks ohne Absturz", crash is None, crash)
+check("K2) Fenster noch lebendig", w.isVisible(), "")
+
+# ---------------------------------------------------------------------------
+# Teil 3: Fenster-Historie – manuell geschlossene Fenster werden aus der
+#         aktiven History entfernt (kein Auto-Restore beim Neustart).
+#         Semantik identisch zu chart_win: Nur Fenster, die beim App-Ende
+#         OFFEN waren, werden mit Geometrie wiederhergestellt.
+# ---------------------------------------------------------------------------
+print("\n=== Teil 3: Fenster-Historie ===")
+check("H1) auto_restore aktiv (Registry)",
+      PersistentWindow.get_registered_class("win_service") is ServiceWindow,
+      str(PersistentWindow.get_registered_class("win_service")))
+check("H2) should_auto_restore('win_service') == True (offen beim App-Ende)",
+      PersistentWindow.should_auto_restore("win_service"))
+check("H3) _keep_history_on_close == False (manuelles Schliessen entfernt Eintrag)",
+      getattr(ServiceWindow, "_keep_history_on_close", False) is False)
+
+# Geometrie liegt in der DB (P4/P5). Fenster MANUELL schliessen (nicht
+# App-Ende) -> Eintrag wird geloescht (kein Auto-Restore beim Neustart).
+w.close()
+pump()
+geom_after_close = sm.get_window_geometry("win_service")
+check("H4) Geometrie-Eintrag nach close() entfernt (kein Auto-Restore)",
+      geom_after_close is None, str(geom_after_close))
+inst_after_close = [i for i in sm.load_all_instances() if i.get("instance_id") == "win_service"]
+check("H5) Instanz-Eintrag nach close() entfernt (kein Auto-Restore)",
+      len(inst_after_close) == 0, str(inst_after_close))
+
+# "App-Ende mit OFFENEM Fenster"-Pfad: save_state ohne close() -> Eintrag
+# bleibt -> Neustart-Simulation stellt Position/Groesse wieder her
+# (identisch zum restore_all_windows-Ablauf fuer offene Fenster).
+sm.save_window_geometry("win_service", 333, 222, 900, 600, False)
+sm.save_instance_state("win_service", "SILVER", "H1")
+w2 = ServiceWindow(parent=_Parent(), service_set_repo=repo)
+w2.service_selector.model.set_repo = repo
+w2.service_selector.model.refresh()
+w2.show()
+pump()
+pump()
+pos2 = w2.pos()
+size2 = w2.size()
+print(f"   nach Restore: pos=({pos2.x()},{pos2.y()}) size={size2.width()}x{size2.height()}")
+check("H6) Position nach Neustart-Simulation (333,222)",
+      pos2.x() == 333 and pos2.y() == 222, f"({pos2.x()},{pos2.y()})")
+check("H7) Groesse nach Neustart-Simulation (>=600 hoch)",
+      size2.height() >= 600, f"{size2.height()}")
+w2.close()
+pump()
+
+# AnalyticsWindow: gleiche Semantik (manuelles Schliessen entfernt History).
+from analytics.ui.analytics_win import AnalyticsWindow  # noqa: E402
+check("H8) AnalyticsWindow aus History entfernt (keep_history=False)",
+      getattr(AnalyticsWindow, "_keep_history_on_close", False) is False)
+check("H9) AnalyticsWindow auto_restore aktiv (offen beim App-Ende)",
+      PersistentWindow.should_auto_restore("win_analytics"))
+
+try:
+    os.remove(db_app)
+    os.remove(db_set)
+    os.rmdir(tmp)
+except OSError:
+    pass
+
+# ---------------------------------------------------------------------------
+# Teil 4: Chart-Circles – GridLiquidityIndicator liefert hit_circles wieder
+#         (Pipeline-Fallback, wenn der feature_store leer ist).
+# ---------------------------------------------------------------------------
+print("\n=== Teil 4: Chart-Circles (Pipeline-Fallback) ===")
+import pandas as pd  # noqa: E402
+from chart.indicators.grid_liquidity import GridLiquidityIndicator  # noqa: E402
+
+# Synthetischer OHLCV-DataFrame (H1), Preis stabil um 30.0 -> Grid-Level 30
+# wird bei jedem Bar (high/low in der 5%-visit-Bandbreite) getroffen.
+_n = 200
+_base = 1600000000
+df_synth = pd.DataFrame({
+    "time": [_base + i * 3600 for i in range(_n)],
+    "open": [30.0] * _n,
+    "high": [30.1] * _n,
+    "low": [29.9] * _n,
+    "close": [30.0] * _n,
+})
+
+# 1) Feature-Store-Lesepfad liefert fuer das Test-Symbol garantiert [] (leer).
+#    Eigene leere Temp-DB (analytics) – unabhaengig vom Zustand von tmp.
+ind = GridLiquidityIndicator()
+ind.set_context("TEST_SYM_NO_FEATURES", "H1")
+tmp4 = tempfile.mkdtemp(prefix="bf4_")
+empty_db = os.path.join(tmp4, "analytics.duckdb")
+import duckdb  # noqa: E402
+_con4 = duckdb.connect(empty_db)
+_con4.execute("CREATE TABLE IF NOT EXISTS feature_store (symbol VARCHAR, timeframe VARCHAR, bar_time TIMESTAMPTZ, feature_id VARCHAR, feature_data JSON)")
+_con4.close()
+store_empty = ind.read_proximity_from_feature_store(
+    "TEST_SYM_NO_FEATURES", "H1", limit=1000, db_path=empty_db)
+check("C1) Feature-Store leer (kein DB-Feeding noetig)",
+      len(store_empty) == 0, f"{len(store_empty)} Eintraege")
+
+# 2) calculate() mit leerem Store -> Pipeline-Fallback liefert hit_circles.
+params = {
+    "grid_step": 1.0,
+    "steps_around": 4,
+    "proximity_threshold": 5.0,   # visit_pct 5%
+    "use_time_filter": True,
+    "time_window_mins": 5,
+    "show_lines": True,
+    "show_circles": True,
+    "circle_color_std": "#FFEB3B",
+    "circle_color_active": "#E91E63",
+    "lookback": 200,
+}
+res = ind.calculate(df_synth, params)
+circles = res.get("hit_circles") or []
+print(f"   hit_circles aus calculate(): {len(circles)}")
+check("C2) hit_circles wieder gefuellt (Fallback aktiv)", len(circles) > 0,
+      f"{len(circles)}")
+check("C3) Circles tragen Farbe (Indikator-Schema)",
+      all(c.get("color") in ("#FFEB3B", "#E91E63") for c in circles),
+      str([c.get("color") for c in circles[:3]]))
+check("C4) Circles tragen time + price",
+      all(isinstance(c.get("time"), int) and isinstance(c.get("price"), float)
+          for c in circles),
+      str(circles[0] if circles else None))
+
+# 3) show_circles=False -> keine Circles (Anzeige-Parameter wird respektiert)
+params_off = dict(params, show_circles=False)
+res_off = ind.calculate(df_synth, params_off)
+circles_off = res_off.get("hit_circles") or []
+check("C5) show_circles=False -> keine Circles", len(circles_off) == 0,
+      f"{len(circles_off)}")
+
+print("-" * 60)
+if FAILURES:
+    print(f"FEHLER: {len(FAILURES)}: {FAILURES}")
+    sys.exit(1)
+print("ALLE PRUEFUNGEN BESTANDEN (OK)")
+sys.exit(0)
 
 ```
 
@@ -42668,8 +51836,8 @@ print("LOCKTEST FERTIG")
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>640</width>
-    <height>580</height>
+    <width>1280</width>
+    <height>800</height>
    </rect>
   </property>
   <property name="windowTitle">

@@ -80,6 +80,9 @@ class ProximityService(PluginFeature):
         return {
             "category": "Grid",
             "display_name": "Proximity",
+            # Bugfix (04.08.2026): Zugehoeriger Indikator-Name fuer die Status-
+            # Badges im MasterTree (der Service laeuft IN GridLiquidityIndicator).
+            "indicator_name": "GridLiquidityIndicator",
             "description": "Prozentuale visit%-Treffer auf den Grid-Linien (Parität zu grid_math.py) inkl. Feature-Store-Records",
             "author": "PyTrader AI",
             "tags": ["grid", "proximity", "liquidity", "feature-store"],

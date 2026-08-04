@@ -17,9 +17,11 @@ Reines Lesemodell – es schreibt NIE in die DB. UI-Klassen zeigen ausschliessli
 diese aufbereiteten Daten an (Invariante 4: kein SQL in UI).
 
 Verwendete Badge-Konvention (Spalte 1 des MasterTree):
-  * `📌 Indikator: <Name>`   – Plugin mit capabilities['chart'] == True
-  * `🟢 Aktiv in Chart`      – Indikator ist in mind. einem Chart-Fenster aktiv
-  * `⚪ Inaktiv in Chart`    – Indikator ist nirgends aktiv / kein Chart-Pflicht
+  * `📌 im <Indikator>`     – Plugin mit capabilities['chart'] == True
+                             (bezieht sich auf den echten Indikator-Namen,
+                             z.B. 'GridLiquidityIndicator' – KEIN Service-Name)
+  * `🟢 aktiv in <Indikator>` – Indikator ist in mind. einem Chart-Fenster aktiv
+  * `⚪ inaktiv in <Indikator>` – Indikator ist nirgends aktiv / kein Chart-Pflicht
 """
 
 from typing import Any, Dict, List, Optional, Set
@@ -155,12 +157,19 @@ class ServiceSelectorModel(QObject):
             return False
 
     def get_indicator_display_name(self, plugin_id: str) -> str:
-        """Anzeige-Name fuer das 📌-Badge (metadata['display_name'])."""
+        """Anzeige-Name des Indikators zu einer Plugin-ID.
+
+        Bevorzugt metadata['indicator_name'] (echter Indikatorname, z.B.
+        'GridLiquidityIndicator'); Fallback metadata['display_name']
+        (Service-Name) bzw. plugin_id.
+        """
         plugin = self.get_plugin(plugin_id)
         if plugin is None:
             return plugin_id
         try:
-            return str((plugin.metadata or {}).get("display_name") or plugin_id)
+            meta = plugin.metadata or {}
+            return str(meta.get("indicator_name")
+                       or meta.get("display_name") or plugin_id)
         except Exception:
             return plugin_id
 
@@ -172,17 +181,21 @@ class ServiceSelectorModel(QObject):
     def badge_for(self, plugin_id: str) -> str:
         """Kompaktes Status-Badge (Spalte 1 des MasterTree).
 
-        Beispiele:
-            "📌 Indikator: Grid Liquidity | 🟢 Aktiv in Chart"
-            "📌 Indikator: Grid Liquidity | ⚪ Inaktiv in Chart"
-            "⚪ Inaktiv in Chart"            (kein Chart-Indikator, nicht aktiv)
-            "🟢 Aktiv in Chart"              (kein Chart-Indikator, aber aktiv)
+        Die Badges referenzieren den INDIKATOR-Namen (metadata['indicator_name'],
+        z.B. 'GridLiquidityIndicator') – Service-Namen erscheinen hier bewusst
+        NICHT:
+
+            "📌 im GridLiquidityIndicator | 🟢 aktiv in GridLiquidityIndicator"
+            "📌 im GridLiquidityIndicator | ⚪ inaktiv in GridLiquidityIndicator"
+            "⚪ inaktiv in GridLiquidityIndicator"   (kein Chart-Indikator)
+            "🟢 aktiv in GridLiquidityIndicator"     (kein Chart-Indikator, aktiv)
         """
         parts: List[str] = []
+        name = self.get_indicator_display_name(plugin_id)
         if self.is_chart_indicator(plugin_id):
-            parts.append(f"📌 Indikator: {self.get_indicator_display_name(plugin_id)}")
-        parts.append("🟢 Aktiv in Chart" if self.is_active_in_chart(plugin_id)
-                     else "⚪ Inaktiv in Chart")
+            parts.append(f"📌 im {name}")
+        parts.append(f"🟢 aktiv in {name}" if self.is_active_in_chart(plugin_id)
+                     else f"⚪ inaktiv in {name}")
         return " | ".join(parts)
 
     def get_standalone_plugin_ids(self) -> List[str]:

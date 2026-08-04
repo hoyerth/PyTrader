@@ -226,3 +226,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Legacy-Backups (archivierte Alt-Stände, Originale bleiben in Git-Historie)
+.backup_*/
