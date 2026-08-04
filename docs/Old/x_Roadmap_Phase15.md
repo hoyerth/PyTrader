@@ -61,44 +61,6 @@ Ziel von **Phase 15** ist die Weiterentwicklung der Service-UI (`service_win.py`
 
 5. **Headless-Test (`test/check_p15_s1_symbols.py`):** Validierung von DB-Persistenz, Fallback & Favoriten-Toggle ohne GUI.
 
----
-
-# 15.02 Service-UI Refactoring & Master-Tree
-
-## 1. SPEZIFIKATION (15.02)
-
-* **Modularisierung (`service_win.py` als Orchestrator):** Zerlegung von `service_win.py` (864 Zeilen, E-5) in dedizierte Sub-Komponenten:
-* `serviceui/master_tree.py`: 2-Spalten `QTreeWidget`.
-* `serviceui/parameter_panel.py`: Parameter-Formular mit `ContentScrollMixin`.
-* `serviceui/toolbar.py`: Aktions-Buttons (`[➕ Service]`, `[▲]`, `[▼]`, `[🗑️ Entfernen]`).
-* `serviceui/status_panel.py`: Status- und Log-Anzeigen.
-* **Tree-Architektur (`ServiceTreeModel`):** Entkoppeltes Datenmodell zwischen `ServiceSetRepository` und `MasterTree`.
-
-* **2-Spalten-MasterTree Visualisierung:**
-* *Spalte 0:* Hierarchische Knoten (📁 Service-Sets, ⚡ Standalone Services, 📦 Alle verfügbaren Plugins).
-* *Spalte 1:* Kompakte Status-Badges (`📌 Indikator: <Name> | 🟢 Aktiv in Chart` oder `⚪ Inaktiv in Chart`).
-* **Deterministische Bedienung ("Tree + Buttons"):**
-* Klick auf `[➕ Service hinzufügen]` $\rightarrow$ Popup-Auswahl $\rightarrow$ Hinzufügen ins aktive Set via `ServiceSetRepository.save_set()`.
-* Buttons `[▲]` / `[▼]` ändern `execution_order`.
-* Button `[🗑️]` führt P14-04 Sperr-Prüfung durch.
-
-## 2. SCHRITT-FÜR-SCHRITT ANLEITUNG (15.02)
-
-1. **Backup:** Git Commit `phase15_s2_backup`.
-2. **TreeModel & Sub-Widgets erstellen:**
-* `serviceui/service_tree_model.py`: Aufbereitung der Hierarchie & Live-Status-Badging.
-* `serviceui/master_tree.py`, `parameter_panel.py`, `toolbar.py`, `status_panel.py` erstellen.
-
-3. **`service_win.py` Refactoring:**
-* Fenstergröße auf `1280 x 800` anpassen.
-* Umbau auf `QSplitter` mit Zusammensetzung der Sub-Widgets als schlanker Orchestrator.
-
-4. **Action-Handler & Repository-Sync:**
-* Buttons in `toolbar.py` koppeln mit `ServiceSetRepository` und `ServiceTreeModel`.
-* Bei Set-Änderung `EventBus.service_set_changed` emittieren.
-
-5. **Headless-Test (`test/check_p15_s2_service_tree.py`):** Testen von Tree-Model, Status-Badges & Set-Updates ohne GUI.
-
 **Ergebnis: 30/30 Checks PASS** (Exit 0):
 
 | Bereich | Checks | Inhalt |
@@ -177,6 +139,57 @@ Zusätzlich: `py_compile` auf allen neuen/geänderten Dateien (Exit 0) und Impor
 * **15.02:** Service-UI-Refactoring & Master-Tree (nächste Phase).
 * **15.03:** `AnalyticsWindow` – dort wird die Favoriten-Dropdown-Kopplung (Punkt 3.4) und der `EventBus`-Empfang ergänzt.
 * Der ★-Button in `AnalyticsWindow` folgt ebenfalls in 15.03 (Fenster existiert noch nicht).
+* 
+---
+
+# 15.02 Service-UI Refactoring, Master-Tree & Generischer ServiceSelector
+
+## 1. SPEZIFIKATION (15.02)
+
+* **Modularisierung (`service_win.py` als Orchestrator):** Zerlegung der gewachsenen `service_win.py` (864 Zeilen, E-5) in entkoppelte, wiederverwendbare Sub-Komponenten:
+* `serviceui/master_tree.py`: 2-Spalten `QTreeWidget` für die hierarchische Darstellung.
+* `serviceui/parameter_panel.py`: Parameter-Formular mit `ContentScrollMixin`.
+* `serviceui/toolbar.py`: Aktions-Buttons (`[➕ Service]`, `[▲]`, `[▼]`, `[🗑️ Entfernen]`).
+* `serviceui/status_panel.py`: Status- und Log-Anzeigen.
+* `serviceui/service_selector_widget.py`: Generisches Auswahl-Widget (wiederverwendbar).
+* **Generische Service- & Set-Auswahl (`ServiceSelectorModel` & `ServiceSelectorWidget`):**
+* **`ServiceSelectorModel` (`analytics/engine/service_selector_model.py`):** Zentrales, lesendes Datenmodell. Lädt Sets und Services aus `ServiceSetRepository` und `PluginRegistry`. Hört auf `EventBus.service_set_changed` für automatische Live-Aktualisierung in allen Fenstern.
+* **`ServiceSelectorWidget` (`serviceui/service_selector_widget.py`):** Konfigurierbares PySide6-Widget mit zwei Betriebsmodi:
+* **Modus A (`SELECT_ONLY`):** Kompaktes Popover/Dropdown-Auswahl-Widget für schwellenfreie Wiederverwendung in Analytics (15.03), Backtester oder Charts. Emittiert `selection_changed(set_id, service_id)`.
+* **Modus B (`FULL_EDIT`):** Vollständiges Master-Tree-Widget mit Aktions-Toolbar für `service_win.py` (Erstellen, Umsortieren, Löschen).
+* **2-Spalten-MasterTree Visualisierung (Modus B):**
+* *Spalte 0:* Hierarchische Knoten (📁 Service-Sets, ⚡ Standalone Services, 📦 Alle verfügbaren Plugins).
+* *Spalte 1:* Kompakte Status-Badges (`📌 Indikator: <Name> | 🟢 Aktiv in Chart` oder `⚪ Inaktiv in Chart`).
+* **Deterministische Bedienung ("Tree + Buttons"):**
+* Klick auf `[➕ Service hinzufügen]` $\rightarrow$ Popup-Auswahl des Plugins $\rightarrow$ Hinzufügen ins aktive Set via `ServiceSetRepository.save_set()`.
+* Buttons `[▲]` / `[▼]` ändern die `execution_order` im Set.
+* Button `[🗑️]` führt P14-04 Sperr-Prüfung durch (Warnung bei aktiven Indikatoren).
+
+---
+
+## 2. SCHRITT-FÜR-SCHRITT ANLEITUNG (15.02)
+
+1. **Backup:** Git Commit `phase15_s2_backup`.
+
+2. **Generisches Datenmodell & Selector-Widget erstellen:**
+* `analytics/engine/service_selector_model.py`: Aufbereitung der Hierarchie & Live-Status-Badging aus `ServiceSetRepository` und `StateManager`.
+* `serviceui/service_selector_widget.py`: Erstellung des wiederverwendbaren Widgets mit Modus-Umschaltung (`SELECT_ONLY` vs. `FULL_EDIT`).
+
+3. **Sub-Widgets für `service_win.py` erstellen:**
+* `serviceui/master_tree.py` (nutzt `ServiceSelectorWidget` im Modus `FULL_EDIT`).
+* `serviceui/parameter_panel.py`, `serviceui/toolbar.py`, `serviceui/status_panel.py` erstellen.
+
+4. **`service_win.py` Refactoring:**
+* Fenstergröße auf `1280 x 800` anpassen.
+* Umbau auf `QSplitter` mit Zusammensetzung der Sub-Widgets als schlanker Orchestrator.
+
+5. **Action-Handler & EventBus-Sync:**
+* Aktions-Buttons in `toolbar.py` mit `ServiceSetRepository` koppeln.
+* Bei jeder Struktur- oder Parameter-Änderung `EventBus.service_set_changed` emittieren, um alle lauschenden `ServiceSelectorModel`-Instanzen projektweit automatisch zu aktualisieren.
+
+6. **Headless-Test (`test/check_p15_s2_service_tree.py`):**
+* Prüft `ServiceSelectorModel` im Modus `SELECT_ONLY` und `FULL_EDIT` ohne GUI.
+* Prüft Indikator-Status-Badges, Set-Updates, Umsortieren & EventBus-Reaktivität.
 
 ---
 
@@ -227,6 +240,45 @@ Zusätzlich: `py_compile` auf allen neuen/geänderten Dateien (Exit 0) und Impor
 
 6. **Headless-Test (`test/check_p15_s3_analytics.py`):** Validierung von Profiles-CRUD, SQL-Aggregationen, Reader & ViewModel ohne GUI.
 
+# 15.03-E Ergänzungskapitel: Generische Service-/Set-Auswahl (SELECT_ONLY) in Analytics
+
+## 1. SPEZIFIKATION (15.03-E)
+
+* **Integration `ServiceSelectorWidget` (Modus `SELECT_ONLY`):**
+* Einbindung des in 15.02 erstellten `ServiceSelectorWidget` im lesenden Modus (`SELECT_ONLY`) direkt in die Top-Bar von `AnalyticsWindow` (`analytics/ui/analytics_win.py`).
+
+* Bietet ein kompaktes Dropdown/Popover zur Selektion des aktiven **Service-Sets** oder **Einzel-Services**.
+
+* *Top-Bar Layout:* `[ Profile: ▾ Profile_Name ]` `|` `[ Set/Service: ▾ Scalper_Grid_v1 ]` `|` `Symbol: [ SILVER ▾ ] [★]` `TF: [ M1 ▾ ]` `[ Refresh 🔄 ]`.
+
+* **Datenfluss & SQL-Filterung:**
+* Das Signal `selection_changed(set_id, service_id)` des Widgets wird an das `AnalyticsViewModel` gekoppelt.
+
+* `FeatureStoreReader` und `AnalyticsRepository` nutzen die ausgewählte `set_id` / `service_id` als obligatorischen Filter in den SQL-Queries (`WHERE set_id = ?` bzw. `WHERE service_id = ?`) für alle Unterseiten (`table_page`, `heatmap_page`, `scatter_page`, `distribution_page`).
+
+* **EventBus-Reaktivität:**
+* Das im `ServiceSelectorWidget` hinterlegte `ServiceSelectorModel` reagiert automatisch auf `EventBus.service_set_changed`.
+* Wird im `ServiceWindow` ein Set erstellt, geändert oder gelöscht, aktualisiert sich das Auswahl-Dropdown im Analytics-Fenster ohne Neustart im laufenden Betrieb.
+
+---
+
+## 2. SCHRITT-FÜR-SCHRITT ANLEITUNG (15.03-E)
+
+1. **Top-Bar Erweiterung in `analytics/ui/analytics_win.py`:**
+* Instanziierung von `ServiceSelectorWidget(mode=SelectorMode.SELECT_ONLY)`.
+* Plazierung in der oberen `QHBoxLayout`-Aktionsleiste zwischen Profil-Aktionen und Symbol-Auswahl.
+
+2. **Kopplung an `AnalyticsViewModel` & `FeatureStoreReader`:**
+* Verbinden des Signals `selection_changed` mit `AnalyticsViewModel.set_active_service_filter(set_id, service_id)`.
+* Anpassung der Abfragemethoden in `analytics/engine/feature_store_reader.py` (`get_heatmap_data`, `get_scatter_data`, `get_distribution_data`, `get_table_data`), sodass der `set_id`/`service_id`-Filter an die DuckDB-SQL-Queries übergeben wird.
+
+3. **Profil-Synchronisation:**
+* Beim Laden oder Speichern eines Analytics-Profils via `analytics_profile_repository.py` wird das aktuell gewählte Set (`"service_sets": [...]`) automatisch im `ServiceSelectorWidget` selektiert bzw. ausgelesen.
+
+4. **Headless-Test Erweiterung (`test/check_p15_s3_analytics.py`):**
+* Verifizierung, dass `FeatureStoreReader` bei Angabe einer `set_id` ausschließlich korrespondierende Eintragsdaten aus `feature_store` zurückliefert.
+* Verifizierung der Signalverarbeitung von `selection_changed` im `AnalyticsViewModel` ohne GUI-Ausführung.
+* 
 ---
 
 # 15.04 Infrastructure & EventBus
@@ -350,6 +402,8 @@ Zusätzlich: `py_compile` auf allen neuen/geänderten Dateien (Exit 0) und Impor
 ## 4. NACHGELAGERTE ARBEITEN (ERST SPÄTER IMPLEMENTIERT)
 
 Folgende Themen sind bewusst **nicht Bestandteil von Phase 15** und werden gesammelt in späteren Phasen umgesetzt:
+
+- default symbols entfernen - Vorgabe Favoriten sind SILVER, GOLD
 
 1. **Exporte:** Export von gefilterten Daten und Matrizen als CSV, Excel oder PNG/SVG-Grafik.
 2. **Multi-Symbol und Multi-Timeframe:** Gezielter Vergleich mehrerer Symbole/Timeframes nebeneinander in einer Matrix oder Kurve.

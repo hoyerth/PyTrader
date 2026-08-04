@@ -14,6 +14,7 @@ Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukture
 - Vor jeder Umsetzung wird diese Datei gelesen und als primäre Anweisung befolgt.
 - Bei Konflikten zwischen `docs/AKTUELLE_UMSETZUNG.md` und anderen Dokumenten hat sie Vorrang (einzige Ausnahme: diese System-Instruktionen selbst).
 - Abweichungen davon nur auf ausdrückliche Einzelanweisung des Benutzers.
+- Anpassungen, ob aus dieser Datei oder manuell eingegeben, werden hier in weiteren Kapiteln nach gegebener Taxonomie als Implementierungs-Log im Format MD dokumentiert
 
 ### 0b. WICHTIG: `docs/Old` NICHT BEACHTEN (Standard)
 - **Alle Dateien im Unterordner `docs/Old` (`docs/Old/x_Architektur.md`, `docs/Old/x_Roadmap.md`, ...) sind archivierte/abgelegte Alt-Dokumente und werden NICHT beachtet.**
