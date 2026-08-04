@@ -6,6 +6,9 @@ Hierarchische Darstellung der Service-Landschaft:
 
   * Spalte 0: Knoten – 📁 Service-Sets (mit ihren Service-Instanzen),
               ⚡ Standalone Services, 📦 Alle verfuegbaren Plugins.
+              Alle Zeilen sind buendig (keine Hierarchie-Einrueckung,
+              Bugfix 3.1); Knoten mit Kindern tragen links ein Aufklapp-
+              Dreieck (selbst gezeichnet, per Klick toggelbar).
   * Spalte 1: Schmale Status-Spalte rechts – kompakte Badges
               (`📌 Indikator: <Name> | 🟢 Aktiv in Chart` /
               `⚪ Inaktiv in Chart`); sehr lange Badges werden auf ein
@@ -25,7 +28,10 @@ Signale:
 from typing import Any, Dict, Optional
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QHeaderView, QStyle, QTreeWidget, QTreeWidgetItem
+from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtWidgets import (
+    QHeaderView, QStyle, QStyleOptionViewItem, QTreeWidget, QTreeWidgetItem,
+)
 
 # P15-Bugfix: shiboken6.isValid() schuetzt vor dem Zugriff auf bereits
 # C++-seitig zerstoerte Items (QTreeWidget.clear() nach data_changed bei
@@ -60,6 +66,14 @@ BADGE_TRUNCATE_ICON = "!"
 # das '!'-Icon, nicht fuer lange Relationstexte.
 BADGE_COLUMN_WIDTH = 36
 
+# Bugfix 3.1 (04.08.2026): Bündige Zeilen + Aufklapp-Dreiecke.
+# Die native Qt-Indentation (20px/Ebene) entfaellt (setIndentation(0)),
+# damit alle Zeilen buendig sind. Die Aufklapp-Dreiecke werden deshalb
+# selbst gezeichnet (drawBranches) – in einer festen Zone am linken Rand,
+# deren Breite ein transparentes Spacer-Icon auf allen Zeilen reserviert
+# (keine Text-Ueberlappung mit dem Dreieck).
+BRANCH_ZONE_WIDTH = 16
+
 
 class MasterTree(QTreeWidget):
     """2-Spalten-TreeWidget fuer die hierarchische Service-Darstellung."""
@@ -73,20 +87,26 @@ class MasterTree(QTreeWidget):
         self.setHeaderLabels(["Services", ""])
         header = self.header()
         if header is not None:
-            # Bugfix 3.0: Spalte 0 (Services) fuellt die Breite, Spalte 1
-            # (Status) ist eine schmale Festbreiten-Spalte ganz rechts.
-            # WICHTIG: setStretchLastSection(False) – QTreeView setzt den
-            # Default auf True, wodurch die letzte Spalte trotz Fixed-Mode
-            # auf die volle Restbreite gedehnt wuerde.
+            # Spalte 0 (Services): ResizeToContents (bewaehrter Modus, kein
+            # Stretch-Layout-Risiko). Spalte 1 (Status): schmale Fixed-Spalte
+            # ganz rechts (Bugfix 3.0). WICHTIG: setStretchLastSection(False)
+            # – QTreeView setzt den Default auf True, wodurch die letzte
+            # Spalte trotz Fixed-Mode auf die Restbreite gedehnt wuerde.
             header.setStretchLastSection(False)
-            header.setSectionResizeMode(0, QHeaderView.Stretch)
+            header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
             header.setSectionResizeMode(1, QHeaderView.Fixed)
             header.resizeSection(1, BADGE_COLUMN_WIDTH)
-        # Bugfix 3.0: Native Qt-Indentation (20px/Ebene) entfaellt – alle
-        # Zeilen sind buendig. setRootIsDecorated bleibt aktiv, damit die
-        # Aufklapp-Dreiecke der Gruppen/Set-Knoten erhalten bleiben.
+        # Bugfix 3.1: Native Qt-Indentation (20px/Ebene) entfaellt – alle
+        # Zeilen buendig. Die Aufklapp-Dreiecke zeichnet drawBranches()
+        # selbst (setRootIsDecorated bleibt aus Kompatibilitaet aktiv).
         self.setIndentation(0)
         self.setRootIsDecorated(True)
+        # Transparentes Spacer-Icon: reserviert links die BRANCH_ZONE_WIDTH
+        # fuer das Aufklapp-Dreieck, damit der Text jeder Zeile buendig
+        # NACH der Dreieck-Zone beginnt (keine Ueberlappung).
+        _spacer = QPixmap(BRANCH_ZONE_WIDTH, BRANCH_ZONE_WIDTH)
+        _spacer.fill(Qt.transparent)
+        self._branch_spacer_icon = QIcon(_spacer)
         # Farbiges '!'-Icon (Spalte 1) fuer gekuerzte Badges (Bugfix 2.1)
         self._warn_icon = self.style().standardIcon(
             QStyle.StandardPixmap.SP_MessageBoxWarning)
@@ -109,6 +129,7 @@ class MasterTree(QTreeWidget):
                 group_item = QTreeWidgetItem([str(group.get("label", ""))])
                 group_item.setData(0, ROLE_NODE_TYPE, TYPE_GROUP)
                 group_item.setData(0, ROLE_SET_ID, group.get("group", ""))
+                group_item.setIcon(0, self._branch_spacer_icon)
                 group_item.setFlags(group_item.flags() & ~Qt.ItemIsSelectable)
                 for child in group.get("children", []):
                     item = self._build_child_item(group.get("group"), child)
@@ -158,6 +179,7 @@ class MasterTree(QTreeWidget):
         set_item = QTreeWidgetItem([str(child.get("display_name") or "Unbenannt"), ""])
         set_item.setData(0, ROLE_NODE_TYPE, TYPE_SET)
         set_item.setData(0, ROLE_SET_ID, child.get("set_id") or "")
+        set_item.setIcon(0, self._branch_spacer_icon)
         set_item.setToolTip(0, f"Service-Set: {child.get('set_id') or '?'}")
         for svc in child.get("services", []):
             # Bugfix 2.0: KEINE fuehrenden Leerzeichen – die bündige Zeile
@@ -188,14 +210,16 @@ class MasterTree(QTreeWidget):
 
     def _apply_badge(self, item: QTreeWidgetItem, plugin_id: str,
                      badge: str) -> None:
-        """Setzt die Spalte-1-Darstellung eines Service-/Plugin-Items.
+        """Setzt die Darstellung eines Service-/Plugin-Items (Spalte 0/1).
 
-        * Kuerzer als MAX_BADGE_CELL_CHARS: Text = kompaktes Badge.
-        * Laenger (Bugfix 2.1): farbiges '!'-Icon statt des Textes –
-          verhindert extrem breite Spalten bei langen Indikator-Relationen.
+        * Spacer-Icon in Spalte 0 (Bugfix 3.1): reserviert die Dreieck-Zone,
+          damit alle Zeilen buendig nach der Zone beginnen.
+        * Spalte 1: kompaktes Badge; laenger als MAX_BADGE_CELL_CHARS wird es
+          auf ein farbiges '!'-Icon gekuerzt (Bugfix 2.1).
         * Tooltip der Spalte 1 (Bugfix 3.0): Name des Indikators
           (metadata['display_name']) statt der Badge-Zeile.
         """
+        item.setIcon(0, self._branch_spacer_icon)
         badge = str(badge or "")
         if len(badge) > MAX_BADGE_CELL_CHARS:
             if not self._warn_icon.isNull():
@@ -208,6 +232,67 @@ class MasterTree(QTreeWidget):
             1,
             f"Indikator: {self.model.get_indicator_display_name(plugin_id)}",
         )
+
+    # -------------------------------------------------------------------------
+    # Bugfix 3.1: Aufklapp-Dreiecke bei buendigen Zeilen
+    # -------------------------------------------------------------------------
+
+    def drawBranches(self, painter, rect, index) -> None:
+        """Zeichnet die Aufklapp-Dreiecke am linken Rand (Bugfix 3.1).
+
+        Da setIndentation(0) die native Qt-Branch-Zeichnung (indentation
+        pro Ebene) entfaellt, werden die Dreiecke fuer alle Knoten mit
+        Kindern hier selbst gezeichnet – im Stil des aktiven Qt-Styles,
+        in der BRANCH_ZONE_WIDTH-breiten Zone am linken Rand (die alle
+        Zeilen durch ihr Spacer-Icon freihalten). Der uebergebene `rect`
+        begrenzt den sichtbaren Ausschnitt; unsichtbare (collapsed) Zeilen
+        liefern eine leere visualItemRect und werden uebersprungen.
+        """
+        try:
+            if rect is None or rect.isEmpty():
+                return
+            opt = QStyleOptionViewItem()
+            opt.initFrom(self)
+            opt.state |= QStyle.State_Item
+            top, bottom = rect.top(), rect.bottom()
+            for item in TreeItemIterator(self):
+                if item is None or not isValid(item) or item.childCount() <= 0:
+                    continue
+                r = self.visualItemRect(item)
+                if r.isEmpty() or r.bottom() < top or r.top() > bottom:
+                    continue
+                bo = QStyleOptionViewItem(opt)
+                bo.rect = r
+                bo.rect.setRight(r.left() + BRANCH_ZONE_WIDTH - 1)
+                state = QStyle.State_Children
+                if item.isExpanded():
+                    state |= QStyle.State_Open
+                bo.state = state
+                self.style().drawPrimitive(
+                    QStyle.PE_IndicatorBranch, bo, painter, self)
+        except (RuntimeError, AttributeError):
+            pass
+
+    def mousePressEvent(self, event) -> None:
+        """Bugfix 3.1: Klick in die Dreieck-Zone togglet auf/zu.
+
+        Die native Branch-Klickzone existiert bei setIndentation(0) nicht;
+        der Klick in die BRANCH_ZONE_WIDTH-breite Zone am linken Rand einer
+        Zeile mit Kindern wird hier selbst ausgewertet.
+        """
+        try:
+            pos = (event.position().toPoint() if hasattr(event, "position")
+                   else event.pos())
+            item = self.itemAt(pos)
+            if item is not None and isValid(item) and item.childCount() > 0:
+                r = self.visualItemRect(item)
+                if r.left() <= pos.x() < r.left() + BRANCH_ZONE_WIDTH:
+                    item.setExpanded(not item.isExpanded())
+                    event.accept()
+                    return
+        except (RuntimeError, AttributeError):
+            pass
+        super().mousePressEvent(event)
 
     # -------------------------------------------------------------------------
     # Selektion / Auswertung
