@@ -70,9 +70,15 @@ from serviceui.parameter_panel import ParameterPanel
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
-@register_persistent_window(auto_restore=False)
+@register_persistent_window()
 class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActionsMixin, PersistentWindow):
     INSTANCE_ID = "win_service"
+    # Bugfix 04.08.2026 (Fenster-Historie): auto_restore=True – wie chart_win
+    # wird das ServiceWindow beim App-Start wiederhergestellt, wenn es beim
+    # Beenden der App OFFEN war (Geometrie/Position werden dann restauriert).
+    # _keep_history_on_close bleibt Default (False): ein MANUELL geschlossenes
+    # Fenster wird aus der aktiven History entfernt (delete_instance) und
+    # poppt beim naechsten Start NICHT wieder auf.
 
     def __init__(self, parent=None, service_set_repo: Optional[ServiceSetRepository] = None):
         super().__init__(parent)

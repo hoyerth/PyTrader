@@ -387,24 +387,27 @@ class GridLiquidityIndicator(BaseIndicator):
             prox_result = results.get("prox_1") or {}
             prox_crp = prox_result.get("chart_render_payload") or {}
 
-            # U15-A2 (Farb-Semantik) / U15-A3 (kein Fallback): Die Circles
-            # kommen AUSSCHLIESSLICH aus dem feature_store-Lesepfad
-            # (read_proximity_from_feature_store). Der frühere Pipeline-
-            # Fallback (berechnete Circles aus dem Proximity-Service) wurde
-            # entfernt (User-Anweisung: "Fallback ausbauen, es gibt dafür
-            # keinen Grund mehr"). Ist der Store leer, werden keine Circles
-            # gerendert (circles = []). Der DB-Lesepfad liefert KEINE Farbe
-            # (nur time/price/in_window) – die Farbe wird hier additiv aus
-            # dem Indikator-Schema angewendet:
+            # U15-A2 (Farb-Semantik) mit Bugfix 04.08.2026 (Circles wieder
+            # sichtbar): PRIMÄR werden die Proximity-Hits aus dem feature_store
+            # gelesen (read_proximity_from_feature_store – U15-A3-Lesepfad).
+            # Ist der Store leer (noch kein Batch-Lauf mit aktivem
+            # proximity-Preset geschrieben), greift der DEFINIERTE FALLBACK
+            # auf die pipeline-berechneten Circles des Proximity-Service
+            # (prox_crp.hit_circles) – der Chart führt die Pipeline intern
+            # ohnehin aus und verwirft die Treffer sonst ungenutzt. Beide
+            # Pfade liefern time/price/in_window ohne Farbe; die Farbe wird
+            # additiv aus dem Indikator-Schema angewendet:
             #   in_window + use_time_filter → circle_color_std, sonst _active.
+            # show_circles=false (Indikator-Parameter) → keine Circles.
             cached_circles = self.read_proximity_from_feature_store(
                 self._symbol or "", self._timeframe or ""
             )
             circle_std = str(p.get("circle_color_std") or "#FFEB3B")
             circle_active = str(p.get("circle_color_active") or "#E91E63")
             use_time_filter = _as_bool(p.get("use_time_filter"), True)
-            circles = [
-                dict(
+
+            def _colorize(c: Dict[str, Any]) -> Dict[str, Any]:
+                return dict(
                     c,
                     color=(
                         circle_active
@@ -412,8 +415,15 @@ class GridLiquidityIndicator(BaseIndicator):
                         else circle_std
                     ),
                 )
-                for c in cached_circles
-            ]
+
+            if cached_circles:
+                circles = [_colorize(c) for c in cached_circles]
+            else:
+                circles_raw = prox_crp.get("hit_circles") or []
+                if _as_bool(p.get("show_circles"), True):
+                    circles = [_colorize(c) for c in circles_raw]
+                else:
+                    circles = []
             status = dict(prox_crp.get("status_info") or empty_result["status_info"])
 
             self._set_cached_lines(lines)

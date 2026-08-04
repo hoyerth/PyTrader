@@ -152,3 +152,36 @@ Ursache: `resize_to_clamped_content()` (ContentScrollMixin) schrumpfte nach `res
 * `python -m py_compile` auf allen geänderten Dateien (Exit 0).
 
 **Hinweis Test-Artefakt:** Der frühere K2-Fail lag nicht an der App, sondern am `pump()`-Helper: `QApplication.quit()` setzt den Quit-Flag und versteckt auf der offscreen-Plattform alle Top-Level-Fenster (`isVisible() → False`). Fix im Test: `QEventLoop`-Muster statt `QApplication.quit()`.
+
+### 3.8 Schritt 8 – Bugfixing: Fenster-Historie (Service/Analytics) & Chart-Circles
+
+**Fehler A – ServiceWindow wurde nicht aus der Fenster-Historie wiederhergestellt & letzte Position nicht gespeichert:**
+Ursache: `serviceui/service_win.py` war mit `@register_persistent_window(auto_restore=False)` registriert → `restore_all_windows()` (main.py) übersprang es beim App-Start. Zusätzlich war `_keep_history_on_close` nicht gesetzt (Default `False`) → `PersistentWindow.closeEvent()` rief nach `save_state()` sofort `delete_instance()` → die Geometrie wurde gespeichert und wieder gelöscht („letzte Position wird nicht saved/restored").
+
+Fix (Runde 2): `@register_persistent_window()` (auto_restore=True) – das Fenster wird beim App-Start wiederhergestellt, wenn es beim Beenden offen war.
+
+**Fehler B – Im Chart werden keine Proximity-Circles mehr angezeigt:**
+Ursache: Seit U15-A3 (Commit `2e3d8d4`, „Pipeline-Fallback entfernt") kamen die Circles ausschließlich aus dem feature_store (`feature_id='proximity'`). Der Store ist aber leer, solange keine aktiven Batch-Presets (`is_active_batch=True`) existieren → LiveAnalyzer/HistoricalScanner schreiben keine Proximity-Payloads → `read_proximity_from_feature_store()` liefert `[]` → keine Circles. Der Chart berechnete die Circles in seiner internen Service-Pipeline zwar, verwarf sie aber ungenutzt.
+
+Fix (Runde 2) in `chart/indicators/grid_liquidity.py` (`calculate()`): PRIMÄR feature_store lesen (U15-A3-Lesepfad bleibt); ist der Store leer, greift der definierte Fallback auf die pipeline-berechneten `hit_circles` des Proximity-Service (`prox_crp.hit_circles`, Parität zu U15-A2). Beide Pfade nutzen dieselbe `_colorize()`-Farb-Logik (in_window + use_time_filter → `circle_color_std`, sonst `circle_color_active`); `show_circles=False` wird in beiden Pfaden respektiert.
+
+**Fehler C – Analytics- & ServiceWindow poppten trotz manuellem Schliessen beim Neustart wieder auf:**
+Ursache: Durch den Runde-2-Fix (und den vorbestehenden 15.03-Fix bei AnalyticsWindow) war `_keep_history_on_close = True` gesetzt → manuell geschlossene Fenster blieben in `window_instances`/`instance_states` → `restore_all_windows()` stellte sie wieder her.
+
+Fix (Runde 3) – **History-Semantik wie `chart_win`**:
+* `serviceui/service_win.py`: `_keep_history_on_close = True` entfernt (Default `False`); `@register_persistent_window()` (auto_restore=True) bleibt.
+* `analytics/ui/analytics_win.py`: `_keep_history_on_close = True` entfernt (Default `False`); `@register_persistent_window()` (auto_restore=True) bleibt.
+
+Ergebnis-Semantik (identisch zu `chart_win`):
+| Szenario | Ergebnis |
+| --- | --- |
+| Fenster offen, App beendet | `save_state()` im App-CloseEvent → Eintrag bleibt → **Restore beim Start** (Position/Größe) |
+| Fenster manuell geschlossen, dann App beendet | `closeEvent` → `delete_instance()` → **kein Auto-Restore beim Start** |
+
+**Validierung (`test/test.py`, offscreen, vollständig auf Temp-DBs isoliert – läuft auch bei offener App, DuckDB-Single-Writer):**
+* Teil 1 Persistenz (P1–P5), Teil 2 Klick-Sturm (K1/K2) → alle PASS (Regressions-Schutz aus Schritt 7).
+* Teil 3 Fenster-Historie (H1–H9): auto_restore aktiv; `_keep_history_on_close` ist False; nach `close()` sind Geometrie- UND Instanz-Eintrag entfernt (kein Auto-Restore); Neustart-Simulation für offene Fenster stellt (333,222)/600 wieder her; AnalyticsWindow identisch.
+* Teil 4 Chart-Circles (C1–C5): feature_store leer → Pipeline-Fallback liefert 600 `hit_circles` mit Farbe + time/price; `show_circles=False` → keine Circles.
+* `python -m py_compile` auf allen geänderten Dateien (Exit 0).
+
+**Hinweis Test-Isolation:** Der Test patcht die `__init__`-Methoden von `ServiceSetRepository`/`StateManager` direkt (Modul-Patches würden durch In-Funktion-Imports überschrieben) und leitet `get_symbol_repository()` auf eine Temp-DB um – so läuft er unabhängig von der geöffneten App (die echten `data/*.duckdb`-Dateien sind durch deren Prozess gesperrt).

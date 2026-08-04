@@ -134,11 +134,12 @@ class AnalyticsWindow(PersistentWindow):
     """Analytics-Hauptfenster (win_analytics, 1280 x 800, nicht-modal)."""
 
     INSTANCE_ID = "win_analytics"
-    # Fenster-Historie (Fix 15.03): Der Eintrag bleibt nach manuellem
-    # Schliessen erhalten (PersistentWindow._keep_history_on_close), damit
-    # das zuletzt gewaehlte Symbol/Timeframe beim naechsten Oeffnen
-    # wiederhergestellt wird (speichern/restore ueber die Basisklasse).
-    _keep_history_on_close = True
+    # Bugfix 04.08.2026 (Fenster-Historie): auto_restore=True – das Fenster
+    # wird beim App-Start wiederhergestellt, wenn es beim Beenden der App
+    # OFFEN war. _keep_history_on_close bleibt Default (False): ein MANUELL
+    # geschlossenes Fenster wird aus der aktiven History entfernt
+    # (delete_instance) und poppt beim naechsten Start NICHT wieder auf
+    # (Semantik identisch zu chart_win).
 
     def __init__(
         self,
