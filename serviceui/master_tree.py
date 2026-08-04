@@ -45,6 +45,13 @@ TYPE_SET = "set"
 TYPE_SERVICE = "service"
 TYPE_PLUGIN = "plugin"
 
+# Bugfix 2.1 (04.08.2026): Lange Relationstexte in der Badge-Spalte (z. B.
+# "📌 Indikator: Grid Liquidity | 🟢 Aktiv in Chart") werden auf ein '!'-Icon
+# gekuerzt – der volle Text steht im Tooltip der Spalte 1 (keine extrem breiten
+# Spalten im MasterTree).
+MAX_BADGE_CELL_CHARS = 24
+BADGE_TRUNCATE_ICON = "!"
+
 
 class MasterTree(QTreeWidget):
     """2-Spalten-TreeWidget fuer die hierarchische Service-Darstellung."""
@@ -60,8 +67,9 @@ class MasterTree(QTreeWidget):
         if header is not None:
             header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
             header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        # Breite genug fuer die Badges vorbelegen
-        self.setColumnWidth(1, 260)
+        # Breite fuer die Badge-Spalte vorbelegen (ResizeToContents passt sie
+        # an den Inhalt an; nach Bugfix 2.1 sind lange Badges nur noch '!')
+        self.setColumnWidth(1, 80)
         self.setRootIsDecorated(True)
 
         self._populate()
@@ -133,26 +141,49 @@ class MasterTree(QTreeWidget):
         set_item.setData(0, ROLE_SET_ID, child.get("set_id") or "")
         set_item.setToolTip(0, f"Service-Set: {child.get('set_id') or '?'}")
         for svc in child.get("services", []):
+            # Bugfix 2.0: KEINE fuehrenden Leerzeichen – QTreeWidget indentiert
+            # Kinder nativ, die zusaetzlichen 2 Spaces raubten nur Platz.
+            badge = str(svc.get("badge") or "")
             svc_item = QTreeWidgetItem([
-                f"  {svc.get('instance_id')}  [{svc.get('plugin_id')}]",
-                str(svc.get("badge") or ""),
+                f"{svc.get('instance_id')}  [{svc.get('plugin_id')}]",
+                self._badge_cell_text(badge),
             ])
             svc_item.setData(0, ROLE_NODE_TYPE, TYPE_SERVICE)
             svc_item.setData(0, ROLE_SET_ID, child.get("set_id") or "")
             svc_item.setData(0, ROLE_INSTANCE_ID, svc.get("instance_id") or "")
             svc_item.setData(0, ROLE_PLUGIN_ID, svc.get("plugin_id") or "")
+            if badge:
+                # Bugfix 2.1: voller Relationstext im Tooltip der Badge-Spalte
+                svc_item.setToolTip(1, badge)
             set_item.addChild(svc_item)
         return set_item
 
     def _build_plugin_item(self, child: Dict[str, Any],
                            group: str) -> QTreeWidgetItem:
         pid = child.get("plugin_id") or ""
-        label = f"  {pid}"
-        plugin_item = QTreeWidgetItem([label, str(child.get("badge") or "")])
+        # Bugfix 2.0: keine fuehrenden Leerzeichen (native Tree-Indentation)
+        badge = str(child.get("badge") or "")
+        plugin_item = QTreeWidgetItem([pid, self._badge_cell_text(badge)])
         plugin_item.setData(0, ROLE_NODE_TYPE, TYPE_PLUGIN)
         plugin_item.setData(0, ROLE_SET_ID, group)
         plugin_item.setData(0, ROLE_PLUGIN_ID, pid)
+        if badge:
+            # Bugfix 2.1: voller Relationstext im Tooltip der Badge-Spalte
+            plugin_item.setToolTip(1, badge)
         return plugin_item
+
+    @staticmethod
+    def _badge_cell_text(badge: str) -> str:
+        """Kurzform fuer die Badge-Spalte (Relationen zu Indikatoren).
+
+        Texte laenger als MAX_BADGE_CELL_CHARS werden auf das '!'-Icon
+        gekuerzt (der volle Text steht im Tooltip der Spalte 1) – verhindert
+        extrem breite Spalten bei langen Indikator-Relationen (Bugfix 2.1).
+        """
+        badge = str(badge or "")
+        if len(badge) > MAX_BADGE_CELL_CHARS:
+            return BADGE_TRUNCATE_ICON
+        return badge
 
     # -------------------------------------------------------------------------
     # Selektion / Auswertung
