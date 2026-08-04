@@ -25,6 +25,7 @@ from PySide6.QtWebEngineCore import QWebEnginePage
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QHBoxLayout,
     QMainWindow,
     QPushButton,
     QSizePolicy,
@@ -47,6 +48,12 @@ except ImportError:
     from state_manager import StateManager
 
 from db_service import MarketDataRepository, _parse_json_field, TF_SECONDS_MAP
+
+# Phase 15 15.01: Symbol- & Favoriten-Verwaltung im Chart-Fenster
+# (★-Button oeffnet das SymbolsWindow; Favoriten-Dropdown via EventBus).
+from config.event_bus import event_bus
+from symbol_repository import SymbolRepository, get_symbol_repository
+from serviceui.symbols_win import SymbolsWindow
 
 
 def find_null_fields(obj, path=""):
@@ -287,6 +294,27 @@ class PyTraderChartWindow(QMainWindow):
         if self.symbol_combo:
             self.symbol_combo.setCurrentText(str(self.current_symbol) if self.current_symbol is not None else "SILVER")
             self.symbol_combo.currentTextChanged.connect(self.on_symbol_changed)
+        # Phase 15 15.01: Favoriten-Symbol-Verwaltung im Chart-Fenster.
+        # ★-Button rechts neben der Symbol-ComboBox oeffnet das nicht-modale
+        # SymbolsWindow (Favoriten verwalten). Das Symbol-Dropdown wird bei
+        # Favoriten-Aenderungen ueber den EventBus neu befuellt (Favoriten
+        # zuerst); das aktuell angezeigte Symbol bleibt immer auswaehlbar,
+        # damit der Chart beim Favoriten-Wechsel nicht ungewollt umspringt.
+        self._symbol_repo: SymbolRepository = get_symbol_repository()
+        self.btn_symbol_fav: QPushButton = QPushButton("★", self.ui_widget)
+        self.btn_symbol_fav.setObjectName("btn_symbol_fav")
+        self.btn_symbol_fav.setToolTip(
+            "Favoriten verwalten – oeffnet das Symbol-Fenster. "
+            "Das Symbol-Dropdown zeigt Favoriten zuerst.")
+        self.btn_symbol_fav.setFixedSize(28, 28)
+        row1_layout = self.ui_widget.findChild(QHBoxLayout, "horizontalLayout_row1")
+        if row1_layout is not None and self.symbol_combo is not None:
+            idx = row1_layout.indexOf(self.symbol_combo)
+            row1_layout.insertWidget(idx + 1, self.btn_symbol_fav)
+        self.btn_symbol_fav.clicked.connect(self.open_symbols_window)
+        # EventBus: Favoriten-Aenderungen -> ComboBox neu befuellen
+        event_bus.favorites_changed.connect(self._refresh_symbol_combo)
+        self._refresh_symbol_combo()
         if self.tf_combo:
             self.tf_combo.setCurrentText(str(self.current_tf) if self.current_tf is not None else "H1")
             self.tf_combo.currentTextChanged.connect(self.on_tf_changed)
@@ -909,6 +937,49 @@ class PyTraderChartWindow(QMainWindow):
     def _update_window_title(self) -> None:
         """Aktualisiert den Fenstertitel mit den aktuellen Symbol/TF-Werten."""
         self.setWindowTitle(f"PyTrader Chart - {self.current_symbol} [{self.current_tf}] ({self.instance_id})")
+
+    # --- Phase 15 15.01: Symbol- & Favoriten-Verwaltung ---
+
+    @Slot()
+    def open_symbols_window(self) -> None:
+        """Oeffnet das nicht-modale SymbolsWindow (Singleton-Verhalten).
+
+        Analog zu open_service_window in main.py: Existiert bereits eine
+        sichtbare Instanz, wird sie in den Vordergrund geholt statt neu
+        geoeffnet (PersistentWindow.get_existing_instance()).
+        """
+        existing = SymbolsWindow.get_existing_instance()
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
+        win = SymbolsWindow(self)  # parent=self nur fuer state_manager-Zugriff
+        win.show()
+
+    def _refresh_symbol_combo(self) -> None:
+        """Befuellt die Symbol-ComboBox aus den Favoriten (Favoriten zuerst).
+
+        Wird beim Start und bei jedem `EventBus.favorites_changed`-Event
+        aufgerufen (Verbindung im __init__). Das aktuell angezeigte Symbol
+        bleibt immer in der Liste (auch wenn es kein Favorit mehr ist), damit
+        der Chart beim Favoriten-Wechsel nicht ungewollt auf ein anderes
+        Symbol springt. Signale sind waehrend des Umbaus blockiert.
+        """
+        if not self.symbol_combo:
+            return
+        favorites = self._symbol_repo.get_favorite_symbols()
+        if not favorites:
+            favorites = list(SymbolRepository.DEFAULT_SYMBOLS)
+        current = self.symbol_combo.currentText() or self.current_symbol
+        self.symbol_combo.blockSignals(True)
+        self.symbol_combo.clear()
+        for sym in favorites:
+            self.symbol_combo.addItem(sym)
+        if current and current not in favorites:
+            self.symbol_combo.addItem(current)
+        idx = self.symbol_combo.findText(current)
+        self.symbol_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.symbol_combo.blockSignals(False)
 
     def on_symbol_changed(self, s):
         if s and s != self.current_symbol:
