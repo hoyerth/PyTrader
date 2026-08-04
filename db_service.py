@@ -133,13 +133,23 @@ class DbPool:
 
     @staticmethod
     def close_all() -> None:
-        """Schliesst ALLE Connections des aktuellen Threads."""
+        """Schliesst ALLE Connections des aktuellen Threads.
+
+        Dekrementiert dabei den globalen Referenzzaehler, damit der
+        atexit-Bookkeeping-Dict (Fix 15.03, Worker-Connection-Leak) nicht
+        unbegrenzt waechst. Wird u. a. von AnalyticsAsyncWorker nach jeder
+        Abfrage aufgerufen (Worker-Thread gibt seine Connection frei; ein
+        neuer Worker-Thread erhaelt automatisch eine frische Connection).
+        """
         if hasattr(DbPool._local, 'conns'):
             for abs_path in list(DbPool._local.conns.keys()):
                 try:
                     DbPool._local.conns[abs_path].close()
                 except Exception:
                     pass
+                with _db_pool_lock:
+                    _db_pool_global[abs_path] = max(
+                        0, _db_pool_global.get(abs_path, 0) - 1)
             DbPool._local.conns = {}
 
 

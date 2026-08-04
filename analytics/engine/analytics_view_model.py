@@ -105,11 +105,24 @@ class AnalyticsViewModel(QObject):
     # Lebenszyklus
     # ------------------------------------------------------------------
     def shutdown(self) -> None:
-        """Stoppt Debounce + laufenden Worker (Fenster schliessen)."""
+        """Stoppt Debounce + laufenden Worker und wartet dessen Ende ab.
+
+        Fix 15.03 (Haenger bei TF-Wechsel): Der Worker wird gecancelt (Flag)
+        und mit wait() abgewartet (Queries sind schnell, < 1 s). Ohne wait()
+        wuerde der noch laufende QThread beim Zerstoeren des Fensters/
+        ViewModel abgebrochen ('QThread: Destroyed while thread is still
+        running') – die App haengt. self._worker wird vorher auf None gesetzt,
+        damit verspaetete Signale des alten Workers vom Guard in
+        _on_finished/_on_failed verworfen werden.
+        """
         self._debounce.stop()
         self._pending_kinds.clear()
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.cancel()
+        worker = self._worker
+        self._worker = None
+        if worker is not None:
+            worker.cancel()
+            if worker.isRunning():
+                worker.wait(5000)
 
     # ------------------------------------------------------------------
     # Datenfluss: UI-Pages fordern Abfragen an (MVVM)
@@ -219,12 +232,31 @@ class AnalyticsViewModel(QObject):
         self.busy_changed.emit(True)
         worker.start()
 
-    def _on_finished(self, kind: str, result: Dict[str, Any]) -> None:
+    def _on_finished(self, worker, kind: str, result: Dict[str, Any]) -> None:
+        """Verarbeitet das Ergebnis eines Workers – NUR des aktuellen.
+
+        Fix 15.03 (Haenger bei TF-Wechsel): Race-Condition, bei der ein
+        veralteter Worker (Thread bereits beendet, finished_ok noch nicht
+        zugestellt, waehrend der Debounce bereits einen neuen Worker startet)
+        den self._worker-Verweis ueberschrieb und mehrere Worker parallel
+        liefen. Der Guard `self._worker is worker` verwirft verspaetete
+        Ergebnisse veralteter Worker; nur der zuletzt gestartete Worker darf
+        weiterverarbeiten.
+        """
+        if self._worker is not worker:
+            return
         self._worker = None
         self.data_ready.emit(kind, result)
         self._start_next_query()
 
-    def _on_failed(self, kind: str, error: str) -> None:
+    def _on_failed(self, worker, kind: str, error: str) -> None:
+        """Verarbeitet einen Worker-Fehler – NUR des aktuellen (Race-Guard).
+
+        Siehe _on_finished: Verspaetete Fehler veralteter Worker werden
+        verworfen, damit der laufende/naechste Worker nicht gestoert wird.
+        """
+        if self._worker is not worker:
+            return
         self._worker = None
         self.query_failed.emit(kind, error)
         self._start_next_query()
@@ -484,3 +516,15 @@ class AnalyticsViewModel(QObject):
     def max_lookback_limit(self) -> int:
         """Max-Lookback-Cap (UI-Slider-Maximum)."""
         return MAX_LOOKBACK_LIMIT
+
+    def available_timeframes(self, symbol: str) -> List[str]:
+        """Timeframes mit Feature-Store-Daten fuer ein Symbol (TF-Ausgrauung).
+
+        Delegiert lesend an das AnalyticsRepository (kein SQL im ViewModel).
+        Bei Fehlern wird eine leere Liste geliefert; die UI kann dann alle
+        Timeframes aktiv lassen (Fallback).
+        """
+        try:
+            return self._repo.available_timeframes(str(symbol or ""))
+        except Exception:
+            return []

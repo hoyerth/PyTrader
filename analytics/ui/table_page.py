@@ -55,8 +55,15 @@ class TablePage(QWidget):
         self._table.setAlternatingRowColors(True)
         self._table.setHorizontalHeaderLabels([c[0] for c in _TABLE_COLUMNS])
         header = self._table.horizontalHeader()
+        # Fix 15.03 (TF-Wechsel-Haenger): KEIN ResizeToContents! Der Modus
+        # berechnet bei JEDEM setItem die optimale Breite ueber ALLE Zeilen
+        # (O(n^2)) – bei 5000 Zeilen blockiert das den Main-Thread minuten-
+        # lang. Stattdessen FIXE Spaltenbreiten aus _TABLE_COLUMNS
+        # (deterministisch schnell, unabhaengig von der Zeilenanzahl).
+        header.setStretchLastSection(False)
         for i, (_, width) in enumerate(_TABLE_COLUMNS):
-            header.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+            header.setSectionResizeMode(i, QHeaderView.Fixed)
+            self._table.setColumnWidth(i, width)
 
         content = QWidget(self)
         lay = QVBoxLayout(content)
@@ -91,6 +98,14 @@ class TablePage(QWidget):
     # ------------------------------------------------------------------
     def on_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
         if kind != QUERY_TABLE:
+            return
+        if not self.isVisible():
+            # Fix 15.03 (TF-Wechsel-Haenger): Die Tabelle wird NUR gerendert,
+            # wenn sie die aktive/ sichtbare Seite ist. data_ready feuert bei
+            # jedem TF-Wechsel fuer ALLE Seiten; ein versteckter 5000-Zeilen-
+            # Render (ResizeToContents + Sortierung) wuerde den Main-Thread
+            # blockieren. Beim Aktivieren der Seite fordert _on_page_changed
+            # die Daten erneut an (request_data -> frischer Query).
             return
         rows = data.get("rows") or []
         self._populate(rows)

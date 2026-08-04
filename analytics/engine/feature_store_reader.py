@@ -352,6 +352,31 @@ class FeatureStoreReader:
     # ------------------------------------------------------------------
     # Lesen: Metadaten
     # ------------------------------------------------------------------
+    def get_available_timeframes(self, symbol: str) -> List[str]:
+        """Liefert die Timeframes mit Feature-Store-Daten fuer ein Symbol.
+
+        Dient der TF-Combo-Ausgrauung (15.03-Fix): Timeframes ohne Daten im
+        feature_store werden in der UI ausgegraut und sind nicht auswaehlbar.
+
+        Returns:
+            Liste der Timeframe-Strings (z. B. ["M1", "H1", ...]) – leer,
+            wenn das Symbol keine Feature-Daten hat.
+        """
+        if not symbol:
+            return []
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT DISTINCT timeframe FROM feature_store
+                WHERE LOWER(symbol) = LOWER(?)
+                ORDER BY timeframe
+            """, [symbol]).fetchall()
+            return [str(r[0]) for r in rows if r[0] is not None]
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] get_available_timeframes "
+                  f"fehlgeschlagen: {e}")
+            return []
+
     def get_available_features(
         self, symbol: str, timeframe: str
     ) -> Dict[str, Any]:

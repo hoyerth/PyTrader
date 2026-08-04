@@ -232,6 +232,10 @@ class AnalyticsRepository:
     # ------------------------------------------------------------------
     # Metadaten
     # ------------------------------------------------------------------
+    def available_timeframes(self, symbol: str) -> List[str]:
+        """Timeframes mit Feature-Store-Daten fuer ein Symbol (TF-Ausgrauung)."""
+        return self.reader.get_available_timeframes(symbol)
+
     def get_available_features(
         self, symbol: str, timeframe: str
     ) -> Dict[str, Any]:

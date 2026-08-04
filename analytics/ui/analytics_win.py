@@ -56,7 +56,11 @@ from config.event_bus import event_bus
 from serviceui.symbols_win import SymbolsWindow
 
 # Im AnalyticsWindow angebotene Timeframes (Feature-Store-Auswahl).
-TIMEFRAMES = ["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
+# 15.03-Fix: ALLE MT5-Timeframes werden angeboten (der Feature-Store haelt
+# z. B. fuer SILVER Daten in M1, M2, M5, M10, M15, M30, H1, H4, D1, W1, MN1).
+# Timeframes ohne Feature-Store-Daten werden in der Combo ausgegraut
+# (_refresh_timeframe_combo) und sind nicht auswaehlbar.
+TIMEFRAMES = ["M1", "M2", "M5", "M10", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"]
 
 # Fenstertitel (Option B: '*' = ungespeicherte Parametertrends).
 WINDOW_TITLE_BASE = "PyTrader - Analytics"
@@ -130,6 +134,11 @@ class AnalyticsWindow(PersistentWindow):
     """Analytics-Hauptfenster (win_analytics, 1280 x 800, nicht-modal)."""
 
     INSTANCE_ID = "win_analytics"
+    # Fenster-Historie (Fix 15.03): Der Eintrag bleibt nach manuellem
+    # Schliessen erhalten (PersistentWindow._keep_history_on_close), damit
+    # das zuletzt gewaehlte Symbol/Timeframe beim naechsten Oeffnen
+    # wiederhergestellt wird (speichern/restore ueber die Basisklasse).
+    _keep_history_on_close = True
 
     def __init__(
         self,
@@ -285,6 +294,10 @@ class AnalyticsWindow(PersistentWindow):
 
     def _wire_controls(self) -> None:
         self.combo_symbol.currentTextChanged.connect(self._vm.set_symbol)
+        # TF-Ausgrauung (15.03-Fix): Bei Symbolwechsel die verfuegbaren
+        # Timeframes aus dem Feature-Store ermitteln und TFs ohne Daten
+        # ausgrauen (nicht auswaehlbar).
+        self.combo_symbol.currentTextChanged.connect(self._refresh_timeframe_combo)
         self.combo_tf.currentTextChanged.connect(self._vm.set_timeframe)
         self.combo_feature.currentIndexChanged.connect(self._on_feature_changed)
         self.spin_limit.valueChanged.connect(self._vm.set_limit)
@@ -296,6 +309,42 @@ class AnalyticsWindow(PersistentWindow):
         self.sidebar.currentRowChanged.connect(self._on_page_changed)
         event_bus.favorites_changed.connect(self._refresh_symbol_combo)
         self._refresh_symbol_combo()
+        self._refresh_timeframe_combo()
+
+    def _refresh_timeframe_combo(self, symbol: Optional[str] = None) -> None:
+        """Graut Timeframes ohne Feature-Store-Daten aus (nicht auswaehlbar).
+
+        Fix 15.03 (TF-Verfuegbarkeit): TFs mit Daten bleiben aktiv; TFs ohne
+        Daten werden per QComboBox-Model disabled (Qt stellt sie grau dar und
+        verhindert die Auswahl). Die aktuelle Auswahl wird nur beibehalten,
+        wenn ihr TF Daten hat; sonst faellt sie auf den ersten verfuegbaren TF
+        zurueck. Schlaegt die Abfrage fehl, bleiben alle TFs aktiv (Fallback).
+        """
+        if not hasattr(self, "combo_tf") or not hasattr(self, "combo_symbol"):
+            return
+        symbol = (symbol or self.combo_symbol.currentText()).strip()
+        available: Optional[set] = None  # None = Abfrage fehlgeschlagen
+        if symbol:
+            try:
+                tfs = self._vm.available_timeframes(symbol)
+                available = {str(t) for t in tfs}
+            except Exception:
+                available = None
+        self.combo_tf.blockSignals(True)
+        first_enabled = -1
+        for i in range(self.combo_tf.count()):
+            tf = self.combo_tf.itemText(i)
+            enabled = (available is None) or (tf in available)
+            self.combo_tf.model().item(i).setEnabled(enabled)
+            if enabled and first_enabled < 0:
+                first_enabled = i
+        current = self.combo_tf.currentText()
+        cur_idx = self.combo_tf.findText(current)
+        if cur_idx >= 0 and self.combo_tf.model().item(cur_idx).isEnabled():
+            pass  # aktuelle Auswahl hat Daten -> behalten
+        elif first_enabled >= 0:
+            self.combo_tf.setCurrentIndex(first_enabled)
+        self.combo_tf.blockSignals(False)
 
     # ------------------------------------------------------------------
     # PersistentWindow-Interface
@@ -312,8 +361,15 @@ class AnalyticsWindow(PersistentWindow):
         """Wird von PersistentWindow.restore_state() gerufen."""
         if symbol and hasattr(self, "combo_symbol"):
             idx = self.combo_symbol.findText(symbol)
-            if idx >= 0:
-                self.combo_symbol.setCurrentIndex(idx)
+            if idx < 0:
+                # Nicht-Favorit aus der Historie: in die Combo aufnehmen,
+                # damit der gespeicherte Filter wiederhergestellt wird
+                # (Fix 15.03 – zuletzt gewaehltes Symbol bleibt gemerkt).
+                self.combo_symbol.blockSignals(True)
+                self.combo_symbol.addItem(symbol, symbol)
+                idx = self.combo_symbol.count() - 1
+                self.combo_symbol.blockSignals(False)
+            self.combo_symbol.setCurrentIndex(idx)
         if timeframe and hasattr(self, "combo_tf"):
             idx = self.combo_tf.findText(timeframe)
             if idx >= 0:
@@ -322,6 +378,9 @@ class AnalyticsWindow(PersistentWindow):
         # Signale bereits gefeuert; der ViewModel dedupliziert gleiche Werte).
         self._vm.set_symbol(self.get_persistent_symbol())
         self._vm.set_timeframe(self.get_persistent_timeframe())
+        # TF-Ausgrauung nach Restore: Fall der aktuelle TF keine Daten hat,
+        # faellt die Auswahl auf den ersten verfuegbaren TF zurueck.
+        self._refresh_timeframe_combo(symbol)
 
     # ------------------------------------------------------------------
     # Symbol- & Favoriten-Verwaltung (15.01-Muster)
@@ -338,7 +397,13 @@ class AnalyticsWindow(PersistentWindow):
         win.show()
 
     def _refresh_symbol_combo(self) -> None:
-        """Befuellt die Symbol-ComboBox aus den Favoriten (Fallback Defaults)."""
+        """Befuellt die Symbol-ComboBox aus den Favoriten (Fallback Defaults).
+
+        Die aktuell gewaehlte Auswahl bleibt erhalten – auch wenn sie kein
+        Favorit (mehr) ist (analog StatisticWindow) – damit der Filter nicht
+        ungewollt umspringt und ein aus der Historie restauriertes Symbol
+        sichtbar bleibt (Fix 15.03).
+        """
         if not hasattr(self, "combo_symbol"):
             return
         favorites = self._symbol_repo.get_favorite_symbols()
@@ -349,6 +414,8 @@ class AnalyticsWindow(PersistentWindow):
         self.combo_symbol.clear()
         for sym in favorites:
             self.combo_symbol.addItem(sym, sym)
+        if current and current not in favorites:
+            self.combo_symbol.addItem(current, current)
         idx = self.combo_symbol.findText(current)
         self.combo_symbol.setCurrentIndex(idx if idx >= 0 else 0)
         self.combo_symbol.blockSignals(False)
@@ -512,12 +579,23 @@ class AnalyticsWindow(PersistentWindow):
     # Initiale Ladung + Lebenszyklus
     # ------------------------------------------------------------------
     def _initial_load(self) -> None:
+        # VM mit dem aktuellen Combo-Zustand starten (Fix 15.03, idempotent):
+        # restore_state (t=0) bzw. _apply_profile koennen bereits Werte gesetzt
+        # haben; ohne Historie/Profil sorgt das hier dafuer, dass die Ansicht
+        # sofort Daten fuer das sichtbare Symbol/Timeframe laedt.
+        self._vm.set_symbol(self.combo_symbol.currentText())
+        self._vm.set_timeframe(self.combo_tf.currentText())
         self._vm.load_profiles()
         self._on_page_changed(self.sidebar.currentRow())
         self._vm.request_features()
 
     def closeEvent(self, event) -> None:
-        """Stoppt Debounce + laufenden Worker (PersistentWindow speichert)."""
+        """Stoppt Debounce + laufenden Worker (PersistentWindow speichert).
+
+        Der Fenster-Historie-Eintrag bleibt dank _keep_history_on_close
+        erhalten, damit Symbol/Timeframe beim naechsten Oeffnen
+        wiederhergestellt werden (Fix 15.03).
+        """
         try:
             self._vm.shutdown()
         except Exception:

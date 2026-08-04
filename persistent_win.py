@@ -56,6 +56,11 @@ class PersistentWindow(QMainWindow):
 
     INSTANCE_ID: ClassVar[str] = ""
     _auto_restore: ClassVar[bool] = True
+    # True: Fenster bleibt nach manuellem Schliessen in der Fenster-Historie
+    # (window_instances + instance_states bleiben erhalten – Symbol/Timeframe
+    # werden fuer das naechste Oeffnen gemerkt). False (Default): Eintrag wird
+    # beim manuellen Schliessen entfernt (Standard-Verhalten).
+    _keep_history_on_close: ClassVar[bool] = False
 
     def __init__(self, parent=None, state_manager: Optional[StateManager] = None):
         # WICHTIG: KEIN Parent übergeben! Ein Fenster mit Parent (z.B. MainWindow)
@@ -198,13 +203,17 @@ class PersistentWindow(QMainWindow):
         
         Nur beim App-Beenden (_is_quitting) bleibt der Eintrag erhalten,
         damit das Fenster beim naechsten Start wiederhergestellt wird.
+        Fenster mit `_keep_history_on_close = True` (z. B. AnalyticsWindow)
+        bleiben auch nach manuellem Schliessen in der Historie, damit ihr
+        Symbol/Timeframe-Zustand fuer das naechste Oeffnen gemerkt bleibt.
         """
         self.save_state()
 
         # DB-Eintrag nur loeschen, wenn die App NICHT insgesamt beendet wird
+        # UND das Fenster nicht dauerhaft in der Historie bleiben soll.
         app = QApplication.instance()
         is_quitting = getattr(app, '_is_quitting', False) if app else False
-        if not is_quitting:
+        if not is_quitting and not self._keep_history_on_close:
             inst_id = self.get_instance_id()
             if inst_id:
                 try:

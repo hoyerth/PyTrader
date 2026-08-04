@@ -182,8 +182,8 @@ class RecordingRepo:
 def run_worker_sync(stub, kind, params):
     captured = {}
     w = AnalyticsAsyncWorker(stub, kind, params)
-    w.finished_ok.connect(lambda k, d: captured.__setitem__(k, d))
-    w.failed.connect(lambda k, e: captured.__setitem__(k, e))
+    w.finished_ok.connect(lambda _w, k, d: captured.__setitem__(k, d))
+    w.failed.connect(lambda _w, k, e: captured.__setitem__(k, e))
     w.run()
     return captured
 
@@ -259,8 +259,8 @@ check("A8) features dispatch",
 stub = RecordingRepo()
 captured = {}
 w = AnalyticsAsyncWorker(stub, "bogus", {"symbol": "S", "timeframe": "M1"})
-w.finished_ok.connect(lambda k, d: captured.__setitem__(k, d))
-w.failed.connect(lambda k, e: captured.__setitem__(k, e))
+w.finished_ok.connect(lambda _w, k, d: captured.__setitem__(k, d))
+w.failed.connect(lambda _w, k, e: captured.__setitem__(k, e))
 w.run()
 check("A9) unbekannter query_kind -> failed",
       "bogus" in captured and "Unbekannte" in str(captured["bogus"]),
@@ -272,8 +272,8 @@ check("A9) unbekannter query_kind -> failed",
 cap = {}
 w = AnalyticsAsyncWorker(repo, QUERY_TABLE,
                          {"symbol": "SILVER", "timeframe": "M1", "limit": 5000})
-w.finished_ok.connect(lambda k, d: cap.__setitem__(k, d))
-w.failed.connect(lambda k, e: cap.__setitem__(k, e))
+w.finished_ok.connect(lambda _w, k, d: cap.__setitem__(k, d))
+w.failed.connect(lambda _w, k, e: cap.__setitem__(k, e))
 w.run()
 tab = cap.get(QUERY_TABLE)
 check("B1) get_table via Worker (total=5, rows=5)",
@@ -284,8 +284,8 @@ cap2 = {}
 w = AnalyticsAsyncWorker(repo, QUERY_HEATMAP,
                          {"symbol": "SILVER", "timeframe": "M1",
                           "metric": "count"})
-w.finished_ok.connect(lambda k, d: cap2.__setitem__(k, d))
-w.failed.connect(lambda k, e: cap2.__setitem__(k, e))
+w.finished_ok.connect(lambda _w, k, d: cap2.__setitem__(k, d))
+w.failed.connect(lambda _w, k, e: cap2.__setitem__(k, e))
 w.run()
 hm = cap2.get(QUERY_HEATMAP)
 check("B2) get_heatmap via Worker (24x7, Mo 12:00 == 1)",
@@ -296,8 +296,8 @@ cap3 = {}
 w = AnalyticsAsyncWorker(repo, QUERY_SCATTER,
                          {"symbol": "SILVER", "timeframe": "M1",
                           "x_column": "ema_diff", "y_column": "rsi_14"})
-w.finished_ok.connect(lambda k, d: cap3.__setitem__(k, d))
-w.failed.connect(lambda k, e: cap3.__setitem__(k, e))
+w.finished_ok.connect(lambda _w, k, d: cap3.__setitem__(k, d))
+w.failed.connect(lambda _w, k, e: cap3.__setitem__(k, e))
 w.run()
 sc = cap3.get(QUERY_SCATTER)
 check("B3) get_scatter via Worker (5 Punkte)",
@@ -307,8 +307,8 @@ cap4 = {}
 w = AnalyticsAsyncWorker(repo, QUERY_DISTRIBUTION,
                          {"symbol": "SILVER", "timeframe": "M1",
                           "column": "atr_normalized", "bins": 4})
-w.finished_ok.connect(lambda k, d: cap4.__setitem__(k, d))
-w.failed.connect(lambda k, e: cap4.__setitem__(k, e))
+w.finished_ok.connect(lambda _w, k, d: cap4.__setitem__(k, d))
+w.failed.connect(lambda _w, k, e: cap4.__setitem__(k, e))
 w.run()
 di = cap4.get(QUERY_DISTRIBUTION)
 check("B4) get_distribution via Worker (bins=4)",
@@ -317,8 +317,8 @@ check("B4) get_distribution via Worker (bins=4)",
 cap5 = {}
 w = AnalyticsAsyncWorker(repo, QUERY_FEATURES,
                          {"symbol": "SILVER", "timeframe": "M1"})
-w.finished_ok.connect(lambda k, d: cap5.__setitem__(k, d))
-w.failed.connect(lambda k, e: cap5.__setitem__(k, e))
+w.finished_ok.connect(lambda _w, k, d: cap5.__setitem__(k, d))
+w.failed.connect(lambda _w, k, e: cap5.__setitem__(k, e))
 w.run()
 fe = cap5.get(QUERY_FEATURES)
 check("B5) get_available_features via Worker",

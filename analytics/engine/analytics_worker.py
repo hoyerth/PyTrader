@@ -21,8 +21,12 @@ deckelt alle limit-Parameter hart nach oben – gegen SQL-Feuer / UI-Freeze.
 
 Signale (werden vom Worker-Thread emittiert; Qt stellt die Queued
 Connection zum ViewModel im Hauptthread her):
-    finished_ok = Signal(str, dict)   – query_kind, Ergebnis-Dict
-    failed      = Signal(str, str)    – query_kind, Fehlermeldung
+    finished_ok = Signal(object, str, dict)   – worker, query_kind, Ergebnis
+    failed      = Signal(object, str, str)    – worker, query_kind, Fehlermeldung
+
+Die Worker-Referenz im Signal ist Teil des Race-Fix (15.03): Das ViewModel
+kann damit verspaetete Ergebnisse veralteter Worker verwerfen (Guard
+`self._worker is worker`).
 
 Der Worker ist EINWEG (eine Abfrage pro Instanz). Das ViewModel erzeugt pro
 Abfrage eine neue Instanz; die Qt-Elternschaft (parent) haelt die Instanz
@@ -72,8 +76,8 @@ class AnalyticsAsyncWorker(QThread):
     Bedarf neue Instanzen und verbindet finished_ok/failed.
     """
 
-    finished_ok = Signal(str, dict)  # query_kind, Ergebnis-Dict
-    failed = Signal(str, str)        # query_kind, Fehlermeldung
+    finished_ok = Signal(object, str, dict)  # worker, query_kind, Ergebnis-Dict
+    failed = Signal(object, str, str)        # worker, query_kind, Fehlermeldung
 
     def __init__(
         self,
@@ -99,10 +103,30 @@ class AnalyticsAsyncWorker(QThread):
             result = self._execute()
         except Exception as e:
             if not self._cancelled:
-                self.failed.emit(self._query_kind, str(e))
+                self.failed.emit(self, self._query_kind, str(e))
             return
+        finally:
+            # Connection-Leak vermeiden (Fix 15.03): Die im Worker-Thread
+            # ueber DbPool geoeffnete DuckDB-Connection wird am Ende
+            # freigegeben – sonst bleibt pro Abfrage ein offenes Datei-Handle
+            # zurueck und die App haengt nach vielen Abfragen (TF-Wechsel).
+            self._release_thread_connections()
         if not self._cancelled:
-            self.finished_ok.emit(self._query_kind, result)
+            self.finished_ok.emit(self, self._query_kind, result)
+
+    def _release_thread_connections(self) -> None:
+        """Gibt die DuckDB-Connections des Worker-Threads frei (Leak-Fix).
+
+        DbPool.close_all() schliesst die Thread-lokalen Connections des
+        aktuellen Threads (und dekrementiert den globalen Referenzzaehler).
+        Jeder neue Worker-Thread erhaelt beim naechsten Zugriff automatisch
+        eine frische Connection.
+        """
+        try:
+            from db_service import DbPool
+            DbPool.close_all()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Dispatch auf die Repository-Methoden (lesend, kein SQL hier)
