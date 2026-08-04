@@ -1465,7 +1465,7 @@ Dokumentation der letzten Änderungen (Commit `5212b3a`, Backup `3dea585`, Tag `
 > **Status (04.08.2026):** Dieses Dokument ist die **verbindliche Hauptanweisung**
 > (System-Regel 0c) für alle aktuellen Umsetzungen. Die ausführliche
 > Kapitel-Struktur, die Architektur-Invarianten und die vollständige
-> Umsetzungsliste stehen in **`x_Roadmap_Phase15.md`** – dieses Dokument
+> Umsetzungsliste stehen in **`../x_Roadmap_Phase15.md`** – dieses Dokument
 > ist die Kurzfassung mit dem **aktuellen Arbeitsstand** und der
 > **Reihenfolge** der nächsten Schritte. Bei Konflikten hat dieses Dokument
 > Vorrang (einzige Ausnahme: die System-Instruktionen selbst).
@@ -1578,7 +1578,7 @@ werden **als Referenz behalten** (kein DROP):
 
 ## 4. U15-A4 – ML-Signale (Entscheidung)
 
-**Status:** Entscheidung dokumentiert in `x_Roadmap_Phase15.md` §4 A
+**Status:** Entscheidung dokumentiert in `../x_Roadmap_Phase15.md` §4 A
 (siehe dort). `analytics/signals/machine_learning/` bleibt **deaktiviert**
 (future), solange `lightgbm`/`xgboost` nicht in `requirements.txt` stehen.
 

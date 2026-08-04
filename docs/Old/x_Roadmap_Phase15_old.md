@@ -257,45 +257,74 @@ Hier ist das aktualisierte und erweiterte Konzept für **Phase 15.02 (Anpassunge
 
 ---
 
-# Phase 15.02 – Master-Detail ServiceUI mit Drag & Drop und Indikator-Status
+# Phase 15.02 – Master-Detail ServiceUI (TreeWidget, Buttons & Indikator-Status)
 
 ---
 
-## 1. Detaillierte Spezifikationen der Erweiterungen
+## 1. SPEZIFIKATION & ARCHITEKTUR (15.02)
 
-### A) Drag & Drop für Service-Set-Erstellung (zu Punkt 3)
+### 1.1 Zielsetzung & Layout
+Die Benutzeroberfläche des `ServiceWindow` (`../../serviceui/service_win.py`) wird von der bisherigen reinen Spalten-Ansicht auf ein hochflexibles, stabiles **Master-Detail-Layout (TreeWidget + Buttons + Parameter-Panel)** umgestellt.
+* **Fenstergröße:** Das `ServiceWindow` wird für maximale Übersichtlichkeit deutlich vergrößert (Standardgröße: **1280 x 800 Pixel**).
+* **Haupt-Layout:** Horizontaler `QSplitter` zur stufenlosen Aufteilung zwischen Master-Tree (links) und Detail-Panel (rechts).
 
-* **Funktionsweise:** Aus der Gruppe **"📦 Alle verfügbaren Plugins / Services"** kann ein Einzel-Service/Plugin per **Drag & Drop** in ein bestehendes **Service-Set** (oder einen Bereich "Neues Service-Set erstellen") gezogen werden.
-* **Wirkung:**
-1. Der Service wird mit seinen Standard-Parametern am Zielort eingefügt.
-2. Die `execution_order` des Sets wird automatisch aktualisiert.
-3. Die Änderung wird direkt in `ServiceSetRepository` / `app_data.duckdb` gespeichert und das Parameter-Formular rechts aktualisiert.
+---
+
+### 1.2 Detaillierte Bausteine
+
+#### A) Linkes Panel: Zweispaltiges Master-TreeWidget (`QTreeWidget`)
+Strukturierung aller Services und Sets in einer zweispaltigen Hierarchie (Spalte 0: *Struktur/Name*, Spalte 1: *Status & Verknüpfungen*):
+
+```text
+Spalte 0 (Struktur / Name)              │ Spalte 1 (Indikator- & Live-Status)
+────────────────────────────────────────┼────────────────────────────────────────
+▼ 📁 Service-Sets                       │
+  ▼ 🟦 Mein Scalper                     │ 📌 Indikator: grid_liquidity | 🟢 Aktiv in Chart
+      📌 grid_1 [grid_lines]            │ 🔗 depends_on: -
+      📌 prox_1 [proximity_service]     │ 🔗 depends_on: grid_1
+▼ ⚡ Standalone Executable Services     │
+    adhoc_scanner                       │ Standalone Executable
+▼ 📦 Alle verfügbaren Plugins (Repo)    │
+    grid_lines                          │ Core Plugin
+    proximity_service                   │ Custom Plugin
+
+```
+
+#### B) Kompakte Indikator-Anzeige & Live-Status (Spalte 1 / Badge)
+
+Jedes Service-Set erhält in Spalte 1 eine **kompakte, zweistufige Indikator-Statusanzeige**:
+
+1. **Zuordnung (`Gehört zu Indikator`):** `📌 Indikator: <Name>` (ausgelesen aus `indicator_presets` / `ServiceSetDefinition`), zeigt die mathematische Zuordnung.
+
+2. **Aktiv-Status (`Ist gerade aktiv`):** `🟢 Aktiv in Chart` oder `⚪ Inaktiv in Chart` (ausgelesen aus den `instance_states` / `symbol_tf_states` der offenen/persistierten Chart-Fenster).
+
+* *Render-Beispiel:* `📌 Indikator: grid_liquidity | 🟢 Aktiv in Chart`
+
+
+#### C) Deterministische Bedienung ("Tree + Buttons" statt Drag & Drop)
+
+Selektive, hochgradig fehlerfreie Steuerung über kontext-sensitive Aktions-Buttons unter/neben dem Tree:
+
+* **`[➕ Service hinzufügen]` Button:**
+* *Workflow 1 (Set markiert):* Klick öffnet ein kleines Popup/ComboBox mit allen verfügbaren Plugins aus der `PluginRegistry`. Auswahl fügt das Plugin mit Default-Parametern direkt in das selektierte Set ein.
+
+* *Workflow 2 (Plugin unter "Alle verfügbaren Plugins" markiert):* Klick auf `[➕ Zu Set hinzufügen]` öffnet ein Kontext-Menü mit allen bestehenden Sets zur Ziel-Auswahl.
+* **`[▲]` / `[▼]` Buttons:** Verschiebt den gewählten Service innerhalb der `execution_order` des Sets nach oben/unten.
+* **`[🗑️ Service entfernen]` Button:** Entfernt den Service aus dem Set (inkl. der **P14-04 Service-Sperre**: Warnung, falls das Set von einem aktiven Indikator genutzt wird).
 
 
 
-### B) Standalone-Services unterstützen (zu Punkt 4)
+#### D) Standalone Executable Services
 
-* **Funktionsweise:** Ein Einzel-Service muss nicht zwingend in einem Set verpackt sein.
-* Standalone-Services erhalten einen eigenen Bereich **"⚡ Standalone Executable Services"**.
-* Diese können direkt im `ServiceWindow` konfiguriert und einzeln als ad-hoc Task oder Hintergrund-Job ausgeführt werden.
-
-### C) Kompakte Indikator-Anzeige & Live-Status (zu Punkt 2 Erweiterung)
-
-Jedes Service-Set bzw. jeder Service im Master-Tree erhält eine **kompakte, zweistufige Indikator-Statusanzeige** in der Spalte *Info / Status*:
-
-1. **Zuordnung (`Gehört zu Indikator`):**
-* Symbol/Badge: `📌 [Indikator: <Name>]` (Zeigt, dass das Set die mathematische Basis für diesen Indikator bildet).
-
-
-2. **Aktiv-Status (`Ist gerade aktiv in Indikator`):**
-* Symbol/Badge: `🟢 [Aktiv: <Name>]` (wenn der Indikator im aktuellen Chart-Fenster aktiv geschaltet ist).
-* Symbol/Badge: `⚪ [Inaktiv: <Name>]` (wenn der Indikator im Chart existiert, aber derzeit ausgeschaltet ist).
+* Ein separater Bereich **"⚡ Standalone Executable Services"** erlaubt die Konfiguration und Ausführung von Einzel-Services ohne zwingende Set-Hülle.
 
 
 
-**Kompakte Darstellung im Tree-Row-Label:**
+#### E) Rechstes Panel: Detail- & Parameter-Formular
 
-> `📈 grid_liquidity` $\rightarrow$ `📌 Indikator: grid_liquidity | 🟢 Aktiv in Chart`
+* Zeigt beim Anklicken eines Knoten im Tree das zugehörige Formular / die Parameter-Spalten für das gewählte Set, den gewählten Einzel-Service oder das Standalone-Plugin.
+* Nutzt weiterhin das `ContentScrollMixin` für dynamisches Scrollen und Bildschirm-Capping.
+
 
 ---
 
@@ -305,11 +334,10 @@ Jedes Service-Set bzw. jeder Service im Master-Tree erhält eine **kompakte, zwe
 
 Vor Beginn der Arbeiten wird ein lokales Backup via Git erstellt:
 
-```bash
 git add -A
-git commit -m "backup: vor Umsetzung Phase 15.02 (Master-Tree mit DragNDrop & Live-Status)"
+git commit -m "backup: vor Umsetzung Phase 15.02 (Master-Tree mit Buttons & Live-Status)"
 
-```
+
 
 ### 2.2 Testing-Strategie (Strikte Einhaltung der "Keine UI-Tests"-Regel)
 
@@ -317,16 +345,18 @@ Gemäß den System-Instruktionen werden **keine PySide6-GUI-Tests** ausgeführt.
 Die Verifizierung erfolgt ausschließlich über:
 
 1. **Headless DB- & Logik-Tests (`test/check_p15_s2_service_tree.py`):**
-* Testet die Zuordnung von Services zu Sets via Backend-Logik (Drag-and-Drop-Entsprechung im Model).
-* Testet das Erkennen von Standalone-Services.
-* Testet das Auslesen des Live-Indikator-Status (`is_active`) aus den `instance_states` / `symbol_tf_states` der Chart-Fenster.
+* Testet das Mappen der Baum-Hierarchie (Service-Sets, Standalone-Services, `depends_on`).
+* Testet das Hinzufügen, Umsortieren und Entfernen von Services via Backend-Methoden (`ServiceSetRepository.save_set()`).
+* Testet das Auslesen des Live-Indikator-Status (`is_active`) aus den Persistenzdaten.
 
 
 2. **Statische Analyse & Syntax-Checks:**
-* `python -m py_compile` über alle geänderten/neuen Dateien.
+* `python -m py_compile` über alle geänderten/neuen Module.
 
 
-3. **Code-Inspektion.**
+
+
+3. **Sorgfältige Code-Inspektion.**
 
 ---
 
@@ -334,61 +364,46 @@ Die Verifizierung erfolgt ausschließlich über:
 
 ### Schritt 1: Layout-Erweiterung & Vergrößerung in `../../serviceui/service_win.py`
 
-1. Fenstergröße auf **1280 x 800 Pixel** anpassen.
-2. Umbau des Hauptfensters mit `QSplitter` (horizontal):
-* **Links:** Custom `QTreeWidget` mit aktivierter Drag & Drop Unterstützung (`setDragEnabled(True)`, `setAcceptDrops(True)`, `setDropIndicatorShown(True)`).
-* **Rechts:** Inhaltsbereich (`ContentScrollMixin`) für Parameter-Spalten und Detail-Formulare.
+1. Fenstergröße in `ServiceWindow.__init__()` auf **1280 x 800 Pixel** anpassen.
+2. Hauptlayout auf einen horizontalen `QSplitter` umstellen:
+* **Linkes Panel:** 2-Spalten `QTreeWidget` (`Tree + Buttons` Aktionsleiste).
+
+
+* **Rechtes Panel:** Parameter-Inhaltsbereich mit `ContentScrollMixin`.
 
 
 
 ### Schritt 2: Aufbau der Baum-Hierarchie (`_populate_master_tree`)
 
-Aufbau des TreeWidgets mit folgenden Hauptknoten:
-
-1. **📁 Service-Sets:**
-* Alle Sets aus `ServiceSetRepository`.
-* **Kompaktes Indikator-Badge in Spalte 2:**
-* Liest aus `StateManager`, ob eine `set_id` einem Indikator zugeordnet ist.
-* Liest aus `instance_states`, ob der Indikator im Chart aktuell den Schalter `active == True` hat.
-* Render-Beispiel: `📌 grid_liquidity | 🟢 Aktiv` oder `📌 grid_liquidity | ⚪ Inaktiv`.
+1. **Service-Sets befüllen:**
+* Lade alle Sets aus `ServiceSetRepository`.
+* Prüfe im `StateManager` / `indicator_presets` und `instance_states`, ob das Set einem Indikator zugeordnet und im Chart aktiv ist.
+* Setze Spalte 1 Badge: z. B. `📌 Indikator: grid_liquidity | 🟢 Aktiv in Chart`.
+* Füge Unterknoten für enthaltene Services gemäß `execution_order` an.
 
 
-* **Unterknoten:** Services im Set mit Abhängigkeits-Pfeilen (`🔗 depends_on: <id>`).
+2. **Standalone Services befüllen:** Bereich für ungebundene Executable-Services anlegen.
+3. **Plugin-Repository befüllen:** Alle Plugins aus `PluginRegistry` auflisten.
 
 
-2. **⚡ Standalone Services:**
-* Ausführbare Einzel-Services ohne Set-Verpackung.
+### Schritt 3: Button-Steuerung & Repository-Integration
+
+1. Connecte Button `[➕ Service hinzufügen]` mit Slot `_on_add_service_clicked()`:
+* Zeigt Dropdown-Auswahl der Plugins $\rightarrow$ Erzeugt `ServiceConfiguration` $\rightarrow$ Ruft `ServiceSetRepository.save_set()` auf.
+
+2. Connecte Buttons `[▲]` / `[▼]` mit Slot `_on_move_service_clicked()`:
+* Passt `execution_order` im Set an und speichert.
+
+3. Connecte Button `[🗑️ Service entfernen]` mit Slot `_on_remove_service_clicked()`:
+* Führt P14-04 Sperr-Prüfung durch und entfernt den Service.
 
 
-3. **📦 Alle verfügbaren Plugins (Repository):**
-* Vollständige Liste aller in PyTrader registrierten Plugins aus `PluginRegistry`.
-* Dienen als Quelle für Drag & Drop Aktionen.
+### Schritt 4: Headless-Verifikation
+
+1. Erstellung und Ausführung von `test/check_p15_s2_service_tree.py`.
+2. Syntax-Check aller betroffenen Module (`python -m py_compile serviceui/service_win.py`).
 
 
-
-### Schritt 3: Drag & Drop Logik implementieren
-
-1. Überschreiben von `dropEvent` und `dragMoveEvent` im TreeWidget:
-* **Drop-Quelle:** Muss ein Item aus "📦 Alle verfügbaren Plugins" sein.
-* **Drop-Ziel:** Muss ein Service-Set-Knoten sein.
-
-
-2. Beim Drop:
-* Extrahieren der `plugin_id`.
-* Erzeugen einer neuen `ServiceConfiguration` im Ziel-Set.
-* Speichern des aktualisierten Service-Sets via `ServiceSetRepository.save_set()`.
-* Aktualisieren der Tree-Darstellung und Selektion des neu hinzugefügten Services im rechten Parameter-Panel.
-
-
-
-### Schritt 4: Headless Verifikation
-
-1. Erstellung und Ausführung von `test/check_p15_s2_service_tree.py`:
-* Überprüft die programmatische Set-Erweiterung (Drag&Drop-Äquivalent im Backend).
-* Überprüft die korrekte Ermittlung des Aktiv-Status von Indikatoren aus den Persistenzdaten.
-
-
-2. Syntax-Check aller geänderten Dateien (`python -m py_compile serviceui/service_win.py`).
 
 ---
 
@@ -396,15 +411,22 @@ Aufbau des TreeWidgets mit folgenden Hauptknoten:
 
 | Datei | Status | Beschreibung |
 | --- | --- | --- |
-| `../../serviceui/service_win.py` | **Anpassung** | Umbau auf Splitter (1280x800), Master-Tree (`QTreeWidget`) mit Drag & Drop, Standalone-Services & kompakter Indikator-Statusanzeige |
-| `../../analytics/engine/service_set_repository.py` | **Anpassung** | Helper zum schnellen Hinzufügen/Einfügen von Einzel-Services in bestehende Sets |
-| `test/check_p15_s2_service_tree.py` | **NEU** | Headless-Test für Tree-Datenstrukturen, Indikator-Live-Status & Set-Updates (ohne UI) |
+| `../../serviceui/service_win.py` | **Anpassung** | Umbau auf Splitter (1280x800), 2-Spalten Master-Tree (`QTreeWidget`) mit Buttons, Standalone-Services & Indikator-Live-Status
+
+ |
+| `../../analytics/engine/service_set_repository.py` | **Anpassung** | Helper zum schnellen Hinzufügen, Umsortieren und Entfernen von Einzel-Services in bestehenden Sets
+
+ |
+| `test/check_p15_s2_service_tree.py` | **NEU** | Headless-Test für Tree-Datenstrukturen, Indikator-Live-Status & Set-Updates (ohne UI)
+
+ |
 
 ---
 
 ## 5. STATUS
 
-Das Konzept für **Phase 15.02** ist vollständig ausgearbeitet. Ich warte nun auf deinen expliziten Startschuss zur schrittweisen Umsetzung.
+Das Kapitel **15.02** ist damit vollständig überarbeitet, hochgradig stabil konzipiert und einsatzbereit. Ich stehe bereit und warte auf Deinen expliziten Startschuss zur schrittweisen Ausführung!
+
 
 
 # Phase 15.03 – Analytics-Engine & UI
@@ -474,6 +496,10 @@ Die Verifizierung erfolgt ausschließlich über:
 ---
 
 ## 3. SCHRITT-FÜR-SCHRITT UMSETZUNGSANLEITUNG
+
+### Beachten
+- Typ-Sicherheit bei analytics_profiles JSON: Beim Laden des Profil-JSONs sollte state_manager.py ein pydantic- oder dataclass-basiertes Schema (AnalyticsProfileModel) nutzen, um fehlerhafte oder veraltete JSON-Formate abzufangen.
+- pyqtgraph-Aufräumarbeiten beim Tab-Wechsel: Wenn das QStackedWidget im AnalyticsWindow zwischen Plots umschaltet, sollten alte Plot-Items explizit geleert (plot_widget.clear()) und GPU-Ressourcen vor dem Neuzeichnen zurückgegeben werden, um Memory-Leaks im Hintergrund zu vermeiden.
 
 ### Schritt 1: DB-Schema & Repository erweitern
 
