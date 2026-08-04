@@ -1,3 +1,4 @@
+﻿# BEREIT FÜR PHASE 15
 # test/test_db_lock.py
 """Test: Kann ein paralleler Schreiber (INSERT-Loop) neue Lese-Verbindungen blockieren?
 Simuliert DataSyncWorker (schreibt) vs. MarketDataRepository (liest via db_connect)."""

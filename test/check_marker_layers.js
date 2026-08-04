@@ -1,3 +1,4 @@
+﻿// BEREIT FÜR PHASE 15
 // test/check_marker_layers.js
 // Regressionstest: Signal-Marker und Grid-Circles sind getrennte Layer.
 // - Signal-Marker gehen in das SeriesMarkers-Plugin der candleSeries.

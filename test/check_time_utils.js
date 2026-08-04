@@ -1,3 +1,4 @@
+﻿// BEREIT FÜR PHASE 15
 // test/check_time_utils.js
 // Verifiziert: keine Endlosschleife bei ungueltigen Eingaben in getBerlinParts/formatDT
 // (Root Cause: timeFormatter erhielt UTCTimestamp-Zahl, Code griff auf t.time zu -> undefined

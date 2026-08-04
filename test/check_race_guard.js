@@ -1,3 +1,4 @@
+﻿// BEREIT FÜR PHASE 15
 // test/check_race_guard.js
 // Verifiziert die Race-Guard-Kernlogik aus 01_core.js / 04_live_updates.js:
 // 1) applyFullChartUpdate: veraltete Payloads werden verworfen (stale updateId)

@@ -1,3 +1,4 @@
+﻿# BEREIT FÜR PHASE 15
 # test/check_p14_s5_trash.py
 """
 Phase 14 P14-05 – Headless Validierung (KEINE UI, KEIN exec_()).

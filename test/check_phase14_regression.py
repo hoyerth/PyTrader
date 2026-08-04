@@ -1,3 +1,4 @@
+﻿# BEREIT FÜR PHASE 15
 # test/check_phase14_regression.py
 """
 Phase 14 – Universal-Regressionstest (Kapitel 6 AKTUELLE_UMSETZUNG).

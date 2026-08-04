@@ -1,3 +1,4 @@
+﻿# BEREIT FÜR PHASE 15
 # test/check_broker_tz.py
 """Klaert die Zeitzonen-Frage empirisch:
 1) MT5-Tick-Zeit vs. Systemzeit -> Offset des Broker-Timestamps

@@ -1,3 +1,4 @@
+﻿# BEREIT FÜR PHASE 15
 # test/check_app_state.py
 """Liest den gespeicherten App-State (visible ranges, Instanzen) fuer die Diagnose
 der Chart-Leerstelle. KEIN UI-Test."""

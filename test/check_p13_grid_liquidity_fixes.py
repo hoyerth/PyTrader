@@ -1,3 +1,4 @@
+﻿# BEREIT FÜR PHASE 15
 # test/check_p13_grid_liquidity_fixes.py
 # Headless-Validierung für Phase 13 5.5 (3 Bugfixes am grid_liquidity-Indikator)
 #

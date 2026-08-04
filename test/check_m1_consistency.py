@@ -1,3 +1,4 @@
+﻿# BEREIT FÜR PHASE 15
 # test/check_m1_consistency.py
 """Prueft die SILVER M1-Daten auf Konsistenz: Luecken, Handelspause,
 Tagesgrenzen, ungueltige Candles. Kein UI-Test - nur DB-Logik.

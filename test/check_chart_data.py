@@ -1,3 +1,4 @@
+﻿# BEREIT FÜR PHASE 15
 # test/check_chart_data.py
 """Kurzer Check: Verifiziert die DB-Queries, die das Chart-Fenster nutzt, fuer alle Symbol/TF-Kombos."""
 import duckdb

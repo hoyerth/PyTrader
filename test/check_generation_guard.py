@@ -1,3 +1,4 @@
+﻿# BEREIT FÜR PHASE 15
 # test/check_generation_guard.py
 # Verifiziert die Generations-Guard-Logik aus chart_win.py (_apply_chart_update /
 # _apply_grid_render): Veraltete Serializer-Ergebnisse werden verworfen,

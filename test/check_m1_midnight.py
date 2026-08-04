@@ -1,3 +1,4 @@
+﻿# BEREIT FÜR PHASE 15
 # test/check_m1_midnight.py
 """Prueft direkt, welche SILVER M1-Bars in der DB um Mitternacht 30.07->31.07 liegen.
 Die DB-Roh-Epochs (EXTRACT) sind Berlin-Wanduhr-encoded - datetime.fromtimestamp(e, tz=utc)

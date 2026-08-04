@@ -1,3 +1,4 @@
+﻿# BEREIT FÜR PHASE 15
 # test/check_performance_p14.py
 """
 Phase 14 – Performance-Benchmarks (Kapitel 7.2 AKTUELLE_UMSETZUNG).

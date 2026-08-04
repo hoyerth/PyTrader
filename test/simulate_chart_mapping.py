@@ -1,3 +1,4 @@
+﻿# BEREIT FÜR PHASE 15
 # test/simulate_chart_mapping.py
 """Simuliert exakt den Chart-Mapping-Pfad aus chart_win._do_refresh_chart_data:
 1) laedt die letzten 3000 SILVER M1-Candles aus der DB

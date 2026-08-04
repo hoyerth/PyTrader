@@ -1,3 +1,4 @@
+﻿# BEREIT FÜR PHASE 15
 # test/check_mt5_m1_boundary.py
 """Holt SILVER M1-Daten direkt von MT5 (Ground Truth) und analysiert die
 Tagesgrenzen der letzten Tage.

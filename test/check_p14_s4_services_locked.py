@@ -1,3 +1,4 @@
+﻿# BEREIT FÜR PHASE 15
 # test/check_p14_s4_services_locked.py
 """
 Phase 14 P14-04-E – Headless Validierung (KEINE UI, KEIN exec_()).

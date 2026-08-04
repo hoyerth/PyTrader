@@ -1,3 +1,4 @@
+﻿# BEREIT FÜR PHASE 15
 # test/check_html_template.py
 """Verifiziert, dass das gebaute Chart-HTML-Template die JS-Fixes enthaelt."""
 import sys

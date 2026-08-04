@@ -1,3 +1,4 @@
+﻿// BEREIT FÜR PHASE 15
 // test/check_measurement.js
 // Regressionstest für die rekonstruierte Messfunktion (05_measurement.js):
 // Strg+LMB Box -> Messwerte -> pyBridge-Sync -> Restore.

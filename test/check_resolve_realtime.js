@@ -1,3 +1,4 @@
+﻿// BEREIT FÜR PHASE 15
 // test/check_resolve_realtime.js
 // Beweist den Fix fuer die "Leerstelle 30.7.26 23:58" (Wanduhr-Zeitachse):
 // 1) Laedt die echte cont->real Map (test/tmp_cont_map.json)

@@ -1,3 +1,4 @@
+﻿// BEREIT FÜR PHASE 15
 // test/check_time_constants.js
 // Verifiziert Punkt B4: die zentralen Zeit-Konstanten aus 02_time_utils.js.
 // Zusaetzlich (Punkt C/D): die Tageswechsel-Erkennung wird NICHT mehr dupliziert,

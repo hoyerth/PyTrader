@@ -1,3 +1,4 @@
+﻿# BEREIT FÜR PHASE 15
 # test/build_cont_map.py
 """Baut die kontinuierliche cont->real Map fuer die letzten 3000 SILVER M1 Bars
 (exakt wie chart_win._do_refresh_chart_data) und schreibt sie als JSON,
