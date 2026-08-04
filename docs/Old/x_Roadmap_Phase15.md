@@ -99,6 +99,85 @@ Ziel von **Phase 15** ist die Weiterentwicklung der Service-UI (`service_win.py`
 
 5. **Headless-Test (`test/check_p15_s2_service_tree.py`):** Testen von Tree-Model, Status-Badges & Set-Updates ohne GUI.
 
+**Ergebnis: 30/30 Checks PASS** (Exit 0):
+
+| Bereich | Checks | Inhalt |
+| --- | --- | --- |
+| A DB-Persistenz & Defaults | A1–A4 | Tabelle angelegt, SILVER/GOLD/BTCUSD als Favoriten, `ensure_defaults()` idempotent |
+| B Lese-API | B1–B3 | `get_symbols`/`get_favorite_symbols`/`get_symbol` (case-insensitive) |
+| C Favoriten-Toggle | C1–C5 | Toggle liefert neuen Zustand; unbekanntes Symbol wird Favorit |
+| D Broker-Upsert | D1–D5 | Neue Symbole + path, Favoriten-Flags unangetastet, keine Duplikate |
+| E MT5-Fallback & Status | E1–E5 | offline/Exception/Import-Fehler → DB-Fallback + Fehlermeldung; online → Upsert + Status `"live"` |
+| F EventBus | F1–F3 | `favorites_changed`, `profile_changed(payload)`, `service_set_changed` |
+
+Zusätzlich: `py_compile` auf allen neuen/geänderten Dateien (Exit 0) und Import-Smoke-Test (event_bus, symbol_repository, symbols_win, service_win) erfolgreich.
+
+### 3.6 Nachtrag – MT5-Sync beim Öffnen + Log-Meldung (User-Anweisung 04.08.2026)
+
+**Problem:** Beim Öffnen des SymbolsWindow wurde die Symbol-Liste nur aus der DB gelesen (`get_symbols()`); ein Live-Fetch von MT5 fand nie statt. Zusätzlich schluckte `sync_from_broker()` MT5-Fehler still (stiller DB-Fallback ohne Meldung).
+
+**Lösung (additiv):**
+* **`symbol_repository.py`:** Neue Methode **`sync_from_broker_with_status()`** liefert `(symbols, status, error)`:
+  * `status = "live"` bei erfolgreichem MT5-Fetch, `"fallback"` bei MT5-Ausfall.
+  * `error` = konkrete Fehlermeldung (MT5-Import fehlgeschlagen / `initialize()==False` / `symbols_get()`-Fehler oder leer / Upsert-Fehler) bzw. `None` bei Erfolg.
+  * `sync_from_broker()` bleibt als dünner Wrapper erhalten (Rückgabe unverändert – keine API-Brechung).
+* **`serviceui/symbols_win.py`:** `_load_symbols()` ruft jetzt `sync_from_broker_with_status()` auf → **Live-Fetch bei jedem Öffnen**. Neues **Status-Log** (`QTextEdit`, unten im Fenster):
+  * `[OK] N Symbole live von MT5 geladen.` bei Erfolg,
+  * `[WARNUNG] MT5 nicht verfügbar – zeige DB-Stand (N Symbole). <Fehlermeldung>` bei MT5-Ausfall (automatischer DB-Fallback wie spezifiziert – aber sichtbar).
+* **Test:** `test/check_p15_s1_symbols.py` um E1b (offline → fallback + Meldung), E3c (online → live + None), E4b (Exception → fallback + Meldung) und E5 (Import-Fehler → fallback + Meldung) erweitert (26 → **30 Checks**).
+* **Offscreen-Smoke-Test** (Window-Instanziierung, kein `exec()`): SymbolsWindow baut mit Log-Bereich, lädt **632 Symbole live von MT5** und der Favoriten-Toggle emittiert `favorites_changed` – bestätigt den Live-Pfad in der realen Umgebung.
+
+### 3.7 Nachtrag 2 – Favoriten-Button & Favoriten-Dropdown im Chart-Fenster (User-Anweisung 04.08.2026)
+
+**Problem:** Der ★-Favoriten-Button fehlte im `PyTraderChartWindow` (nur ServiceWindow hatte ihn).
+
+**Lösung (additiv, `chart/chart_win.py`):**
+* **`btn_symbol_fav` (`★`)** wird programmatisch in `horizontalLayout_row1` direkt rechts neben `combo_symbol` eingefügt (keine `.ui`-Änderung; 28×28 px, gleiche Optik wie die anderen Toolbar-Buttons).
+* Klick öffnet das nicht-modale `SymbolsWindow` (Singleton via `get_existing_instance()`, identisch zu ServiceWindow).
+* **Favoriten-Dropdown:** `_refresh_symbol_combo()` befüllt `combo_symbol` mit `get_favorite_symbols()` (Fallback auf `DEFAULT_SYMBOLS`). Das **aktuell angezeigte Symbol bleibt immer in der Liste** (auch wenn es kein Favorit mehr ist), damit der Chart beim Favoriten-Wechsel nicht ungewollt auf ein anderes Symbol springt. Signale sind beim Umbau blockiert (kein ungewollter Chart-Refresh).
+* **EventBus-Kopplung:** `event_bus.favorites_changed` → `_refresh_symbol_combo()` (beim Start + bei jeder Favoriten-Änderung).
+* **Keine zirkulären Importe:** `chart_win` importiert `config.event_bus`, `symbol_repository`, `serviceui.symbols_win` – keines davon importiert `chart_win`.
+
+**Validierung:**
+* `py_compile` (Exit 0) + Import-Smoke-Test (`chart_win` + `main` importierbar).
+* Offscreen-Smoke-Test (Window-Instanziierung, kein `exec()`): ★-Button vorhanden und rechts neben `combo_symbol` im `horizontalLayout_row1`; Combo zeigt Favoriten zuerst; aktuelles Symbol bleibt nach EventBus-Refresh erhalten; nicht-Favorit-Symbol bleibt in der Liste; `SymbolsWindow` wird geöffnet.
+* `test/check_p15_s1_symbols.py` weiterhin 30/30 PASS (unverändert).
+
+### 3.8 Nachtrag 3 – MT5-Symbol-Fetch nur beim App-Start + Pipeline-Fallback entfernt (User-Anweisung 04.08.2026)
+
+**Zwei User-Anweisungen (04.08.2026):**
+
+**(a) „laden aller Symbole nur bei app start, es gibt sonst verzögerungen"** – der MT5-Live-Fetch wurde aus dem `SymbolsWindow` entfernt:
+* **`serviceui/symbols_win.py`:** `_load_symbols()` liest jetzt **ausschließlich die gespeicherte Liste** (`SymbolRepository.get_symbols()`, DB). Der bisherige Aufruf von `sync_from_broker_with_status()` (Live-Fetch bei jedem Öffnen, 15.01-Nachtrag) ist entfernt. Das Status-Log (`log_text`/`_log`) – das nur für die MT5-Sync-Meldungen existierte – wurde mit entfernt (leeres Log hätte keine Funktion mehr). Kein MT5-Zugriff beim Öffnen → keine Verzögerungen.
+* **`main.py`:** Der MT5-Symbol-Fetch wird jetzt **einmalig beim App-Start** ausgeführt (direkt nach `check_mt5_connection()`, MT5 ist dort bereits initialisiert → schnell): `get_symbol_repository().sync_from_broker_with_status()` mit Konsolen-Log `[Symbol-Sync]` (live/fallback + Fehlermeldung).
+* **`symbol_repository.py`:** Docstrings aktualisiert (`sync_from_broker_with_status()` ist jetzt der App-Start-Sync, nicht mehr das Fenster-Öffnen). Die Methode selbst bleibt unverändert.
+
+**(b) „Fallback ausbauen, es gibt dafür keinen grund mehr"** – der Pipeline-Fallback im `GridLiquidityIndicator` wurde entfernt:
+* **`chart/indicators/grid_liquidity.py` (`calculate()`):** Der `else`-Zweig (Definierter Fallback U15-A2: Circles aus der synchron ausgeführten Service-Pipeline bei leerem `feature_store` inkl. Warnung `⚠️ ... Pipeline-Fallback`) ist **entfernt**. Die Circles kommen jetzt **ausschließlich** aus `read_proximity_from_feature_store()` (Farb-Semantik additiv aus dem Indikator-Schema bleibt). **Bei leerem Store → `circles = []`** (kein Rendern, kein Warn-Print).
+* **Linien-Pipeline bleibt erhalten:** Die Grid-LINIEN (Live-Tick-Cache) kommen weiterhin immer aus der Pipeline (`GridLinesService`) – sie sind kein DB-Output und waren nie Teil des entfernten Fallbacks. `status_info` kommt weiterhin aus dem Proximity-`chart_render_payload` der (für die Linien ohnehin laufenden) Pipeline.
+* Docstrings (`calculate()`, `read_proximity_from_feature_store`) auf den neuen Zustand (U15-A3) aktualisiert.
+
+**Validierung:** `py_compile` auf allen geänderten Dateien (Exit 0), `test/check_p15_s1_symbols.py` weiterhin **30/30 PASS** (Repository-API unverändert – der Test prüft Logik/DB, nicht das Fenster), Import-Smoke-Test (`main`, `symbols_win`, `grid_liquidity` importierbar). Keine UI-/Regressionstests (Regel 4).
+
+### 3.9 Nachtrag 4 – ★-Favoriten-Button & Favoriten-Dropdown im Statistik-Fenster (User-Notiz 04.08.2026)
+
+**Problem (handschriftliche User-Notiz in der Roadmap):** „auch hier in der Kopzeile die Symbolauswahl mit Favoriten-Button einbauen" – nach Chart-Fenster (3.7) und Service-Fenster (3.4) fehlte der ★-Favoriten-Button im `StatisticWindow` (`statistic_win.py`, `win_statistics`).
+
+**Lösung (additiv, `statistic_win.py`):**
+* **`btn_symbol_fav` (`★`)** wird programmatisch in `horizontalLayout_filter` (Kopfzeile) direkt rechts neben `combo_symbol_filter` eingefügt (keine `.ui`-Änderung; 28×28 px, gleiche Optik wie Chart/Service).
+* Klick öffnet das nicht-modale `SymbolsWindow` (Singleton via `get_existing_instance()`, identisch zu Chart/Service).
+* **Favoriten-Dropdown:** `_refresh_symbol_combo()` befüllt `combo_symbol` mit **`ALLE` + Favoriten** (`get_favorite_symbols()`, Fallback auf `DEFAULT_SYMBOLS`). `ALLE` bleibt erster Eintrag (Standard-/Default-Filter der Statistik, `get_summary("ALLE")`). Die **aktuelle Auswahl bleibt in der Liste** (auch wenn sie kein Favorit mehr ist), damit der Filter nicht ungewollt umspringt. Signale sind beim Umbau blockiert (kein Refresh-Explosion durch `_on_filter_changed`).
+* **EventBus-Kopplung:** `event_bus.favorites_changed` → `_refresh_symbol_combo()` (beim Start + bei jeder Favoriten-Änderung).
+* **Keine zirkulären Importe:** `statistic_win` importiert `config.event_bus`, `symbol_repository`, `serviceui.symbols_win` – keines davon importiert `statistic_win`.
+
+**Validierung:** `py_compile` (Exit 0) + Import-Smoke-Test (`statistic_win`, `main` importierbar). Keine UI-/Regressionstests (Regel 4).
+
+### 3.10 Offene Punkte / nächste Schritte
+
+* **15.02:** Service-UI-Refactoring & Master-Tree (nächste Phase).
+* **15.03:** `AnalyticsWindow` – dort wird die Favoriten-Dropdown-Kopplung (Punkt 3.4) und der `EventBus`-Empfang ergänzt.
+* Der ★-Button in `AnalyticsWindow` folgt ebenfalls in 15.03 (Fenster existiert noch nicht).
+
 ---
 
 # 15.03 Analytics Engine & UI
