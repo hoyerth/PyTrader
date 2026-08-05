@@ -138,6 +138,62 @@ class ServiceParamColumnsMixin:
             return ctrl.currentText()
         return ctrl.text()
 
+    # ------------------------------------------------------------------
+    # Phase 15 (Dirty-State): Aenderungs-Tracking der Parameter-Controls
+    # ------------------------------------------------------------------
+    def _connect_param_change(self, ctrl: QWidget, iid: str, key: str) -> None:
+        """Verbindet das Aenderungs-Signal eines Parameter-Controls mit dem
+        Dirty-State-Tracking (valueChanged/textChanged/toggled).
+
+        Jede Aenderung aktualisiert die ServiceSetDefinition im RAM
+        (_current_set_definition) und markiert die instance_id im MasterTree
+        als ungespeichert ('*' am Service-Knoten).
+        """
+        if isinstance(ctrl, QCheckBox):
+            ctrl.toggled.connect(
+                lambda _v, i=iid, k=key: self._on_param_changed(i, k))
+        elif isinstance(ctrl, (QSpinBox, QDoubleSpinBox)):
+            ctrl.valueChanged.connect(
+                lambda _v, i=iid, k=key: self._on_param_changed(i, k))
+        elif isinstance(ctrl, QComboBox):
+            ctrl.currentTextChanged.connect(
+                lambda _v, i=iid, k=key: self._on_param_changed(i, k))
+        else:  # QLineEdit (color/str)
+            ctrl.textChanged.connect(
+                lambda _t, i=iid, k=key: self._on_param_changed(i, k))
+
+    def _on_param_changed(self, iid: str, key: str) -> None:
+        """Aktualisiert die RAM-ServiceSetDefinition und markiert die
+        Instanz als dirty ('*' im MasterTree)."""
+        ctrl = self._service_param_controls.get((iid, key))
+        if ctrl is None:
+            return
+        value = self._ctrl_value(ctrl)
+        # RAM-Definition der geladenen ServiceSetDefinition aktualisieren
+        # (lookback ist eine Instanz-Einstellung, alle anderen gehoeren in
+        # params; Phase 15 Dirty-State).
+        definition = getattr(self, "_current_set_definition", None)
+        if definition is not None:
+            cfg = (definition.get("services") or {}).get(iid)
+            if isinstance(cfg, dict):
+                if key == "lookback":
+                    cfg["lookback"] = value
+                else:
+                    cfg.setdefault("params", {})[key] = value
+        self._mark_service_dirty(iid)
+
+    def _mark_service_dirty(self, iid: str) -> None:
+        """Versieht den Service-Knoten im MasterTree mit einem '*' (und
+        merkt den Dirty-Zustand fuer Baum-Neuaufbauten)."""
+        selector = getattr(self, "service_selector", None)
+        tree = getattr(selector, "master_tree", None)
+        if tree is None or not iid:
+            return
+        try:
+            tree.set_instance_dirty(iid, True)
+        except (RuntimeError, AttributeError):
+            pass
+
     def _setup_collapsible(self, group: QGroupBox) -> None:
         """Macht eine ausklappbare QGroupBox wirklich kollabierbar.
 
@@ -205,14 +261,33 @@ class ServiceParamColumnsMixin:
             pid = cfg.get("plugin_id") or iid
             col = self._build_service_column(iid, pid, cfg)
             self.service_columns_layout.addWidget(col)
-        # Container erneut in die obere Zeile einfügen: Das QWidgetItem
-        # eines Widgets meldet dessen Größe zum Zeitpunkt des Einfügens und
-        # aktualisiert sich bei späterem Inhalts-Wachstum nicht (Qt-Quirk).
-        # Entfernen + erneutes Einfügen erzeugt ein frisches QWidgetItem mit
-        # der aktuellen Größe.
-        if self.top_row is not None and self.widget_service_columns is not None:
-            self.top_row.removeWidget(self.widget_service_columns)
-            self.top_row.addWidget(self.widget_service_columns)
+        # BUGFIX 05.08.2026 (Dirty-State-Aktionsleiste): Die Parameter-Box
+        # (widget_service_columns) liegt seit dem 15.02-Splitter-Refactoring
+        # im _editor_panel (unter group_service_sets, über der Aktionsleiste).
+        # Der frühere Reinsert in die top_row (Alt-Layout, die Box lag direkt
+        # in der oberen Zeile) hat die Box bei JEDEM Spaltenaufbau AUS dem
+        # Editor-Panel in die top_row NEBEN den Splitter verschoben – die
+        # Speichern-Buttons lagen dadurch NICHT unter der Parameter-Box.
+        # Der Reinsert läuft daher jetzt in das Editor-Panel (frisches
+        # QWidgetItem gegen den Qt 6.11 QWidgetItemV2-Cache, vgl. _reflow()).
+        panel = getattr(self, "_editor_panel", None)
+        panel_layout = panel.layout() if panel is not None else None
+        if panel_layout is not None and self.widget_service_columns is not None:
+            # Falls die Box durch frühere Builds in der top_row gelandet ist,
+            # dort zuerst entfernen (defensiv, idempotent).
+            if self.top_row is not None and \
+                    self.top_row.indexOf(self.widget_service_columns) >= 0:
+                self.top_row.removeWidget(self.widget_service_columns)
+            panel_layout.removeWidget(self.widget_service_columns)
+            insert_idx = panel_layout.count()
+            action_row = getattr(self, "_param_action_row", None)
+            for i in range(panel_layout.count()):
+                item = panel_layout.itemAt(i)
+                if item is not None and action_row is not None and \
+                        item.layout() is action_row:
+                    insert_idx = i
+                    break
+            panel_layout.insertWidget(insert_idx, self.widget_service_columns)
         self._reflow()
 
     def _build_service_column(self, iid: str, pid: str, cfg: Dict[str, Any]) -> QGroupBox:
@@ -268,6 +343,9 @@ class ServiceParamColumnsMixin:
         desc_edit.setText(str(cfg.get("description") or ""))
         self._service_desc_controls[iid] = desc_edit
         desc_edit.textChanged.connect(lambda _t, iid=iid: self._update_service_tooltip(iid))
+        # Phase 15 (Dirty-State): auch die Instanz-Beschreibung ist Teil des
+        # Sets und wird erst beim Set-Speichern persistiert -> dirty markieren.
+        desc_edit.textChanged.connect(lambda _t, iid=iid: self._mark_service_dirty(iid))
         desc_row.addWidget(desc_label)
         desc_row.addWidget(desc_edit)
         desc_edit_btn = QPushButton("✏️")
@@ -299,6 +377,8 @@ class ServiceParamColumnsMixin:
                     pass
             ctrl = self._create_param_control(key, cval, spec)
             self._service_param_controls[(iid, key)] = ctrl
+            # Phase 15 (Dirty-State): Aenderungen markieren die Instanz.
+            self._connect_param_change(ctrl, iid, key)
             form.addRow(labels.get(key, self._human(key)), ctrl)
         vl.addLayout(form)
 
@@ -318,6 +398,8 @@ class ServiceParamColumnsMixin:
                     cval = params.get(key, spec.get("default"))
                 ctrl = self._create_param_control(key, cval, spec)
                 self._service_param_controls[(iid, key)] = ctrl
+                # Phase 15 (Dirty-State): Aenderungen markieren die Instanz.
+                self._connect_param_change(ctrl, iid, key)
                 ef.addRow(labels.get(key, self._human(key)), ctrl)
             vl.addWidget(exp_grp)
             self._setup_collapsible(exp_grp)

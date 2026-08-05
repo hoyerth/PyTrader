@@ -572,3 +572,37 @@ ew_set_dialog.py, param_columns.py, 	rash_dialog.py (Exit 0).
 * Isolierte Logik-Checks in `test/` (temporaere Skripte, danach geloescht): `_format_deleted_at` (datetime/ISO/None/Rohwert -> `Sa. 04.07.26 14:34`, `Mo. 06.07.26 14:34`, leerer String, Rohwert), `_deleted_at_sort_key` (absteigend: neueste zuerst, None/unparsebar = aelteste, stabile Reihenfolge) - **ALLE PASS**.
 * Keine UI-Tests (Regel). Keine externen Referenzen auf das alte `trash_list`-Attribut (findstr-Check).
 * `docs/x_Exports.md` wurde vom Anwender selbst export-aktualisiert und bleibt wie immer unangetastet (nicht Bestandteil dieses Commits).
+
+### 3.24 Schritt 24 - ParameterPanel Dirty-State ('*') + Speichern & Direct-Run Integration (05.08.2026)
+
+**Umsetzung (Phase 15 Dirty-State):** Parameter-Aenderungen in den dynamischen Service-Spalten markieren die Service-Instanz im MasterTree als ungespeichert ('*' am Knoten, Format `Service_Name* (DD.MM.JJ)`) und aktivieren eine Aktionsleiste unter der Parameter-Box mit `[💾 Speichern]` und `[▶️ Speichern & Ausführen]`.
+
+**A) `serviceui/param_columns.py` (Dirty-Tracking):**
+* `_connect_param_change(ctrl, iid, key)`: verbindet das Aenderungs-Signal jedes Parameter-Controls (QCheckBox -> `toggled`, QSpinBox/QDoubleSpinBox -> `valueChanged`, QComboBox -> `currentTextChanged`, QLineEdit -> `textChanged`) mit `_on_param_changed`.
+* `_on_param_changed(iid, key)`: aktualisiert die RAM-`_current_set_definition` (lookback -> Instanz-Ebene, alle anderen -> `params`) und ruft `_mark_service_dirty(iid)`.
+* `_mark_service_dirty(iid)`: delegiert an `service_selector.master_tree.set_instance_dirty(iid, True)`.
+* Auch die Instanz-Beschreibung (desc_edit) markiert dirty (`textChanged`).
+
+**B) `serviceui/master_tree.py` (Dirty-Marker):**
+* `_dirty_instance_ids` (RAM-Set) + `set_instance_dirty()` / `clear_dirty_markers()` / `_apply_dirty_label()` (Format `Service_Name* (DD.MM.JJ)`, Ausfuehrungsdatum bleibt erhalten).
+* Re-Apply nach `_populate()` (Baum-Neuaufbau via `data_changed` verliert die Sternchen nicht).
+
+**C) `serviceui/service_win.py` (Aktionsleiste & Handler):**
+* `_param_action_row` (QHBoxLayout) mit `btn_save_params` + `btn_save_run_params` am Ende des `editor_layout` (unter `widget_service_columns`).
+* `_save_params_from_panel()`: `collect_set_definition()` -> `set_repo.save_set()` -> `_clear_dirty_markers()` -> EventBus `service_set_changed` (ohne Neuberechnung).
+* `_save_and_run_from_panel()`: speichert zusaetzlich und stoesst nach Bestaetigungsabfrage (Symbol/Timeframe aus der Filterleiste, inkl. Sentinel 'ALLE Timeframes') den gezielten `ServiceRunWorker` an (`_start_run_worker`, kein Massen-Scan).
+* `_clear_dirty_markers()` zentral; wird auch nach Instanz-/Set-Beschreibungs-Speicherung und beim Set-Wechsel (`_clear_set_editor`/`load_set_into_editor`) aufgerufen.
+
+**Bugfix-Runde (Anwender-Feedback, 3 Punkte):** (1) keine sichtbare Markierung, (2) Buttons unsichtbar, (3) Buttons muessen direkt unter der Parameter-Box liegen.
+
+**Root-Cause (Kern-Bug):** In `_build_service_columns()` (`param_columns.py`) war ein Reinsert-Ueberbleibsel aus dem Alt-Layout (vor dem 15.02-Splitter-Refactoring, Commit `afe4483`) aktiv: `top_row.removeWidget(widget_service_columns) + top_row.addWidget(...)`. Das verschob die Parameter-Box bei JEDEM Spaltenaufbau AUS dem Editor-Panel in die `top_row` NEBEN den Splitter - die Speichern-Buttons lagen dadurch isoliert am Panel-Ende (NICHT unter der Parameter-Box).
+
+**Fix:** Der Reinsert laeuft jetzt in das `_editor_panel` (frisches QWidgetItem gegen den Qt-6.11-QWidgetItemV2-Cache, gleicher Mechanismus wie zuvor) - die Box wird unmittelbar vor der `_param_action_row` eingefuegt (defensiv: erst aus der `top_row` entfernen, falls sie durch fruehere Builds dort gelandet ist). Der Dirty-Flow selbst war korrekt (RAM-Update + Tree-Label), nur die sichtbare Zuordnung stimmte nicht.
+
+**Validierung (headless, gruen):**
+* `python -m py_compile` auf `serviceui/param_columns.py`, `serviceui/master_tree.py`, `serviceui/service_win.py` (Exit 0).
+* Echte `ServiceWindow`-Instanz (offscreen, Test-DB in `test/`): Parameter-Box jetzt im Editor-Panel `(0, 403)` ueber den Buttons (vorher `(989, 63)` = top_row neben dem Splitter); `btn_save_params.isVisible() == True`; Button direkt unter der Param-Box (`True`); End-to-End Dirty-Flow (echte QDoubleSpinBox-Aenderung -> RAM `params['visit_pct']: 1.05` + Tree-Label `prox_1*`) PASS.
+* MasterTree-Dirty-Marker-Isolationscheck: `prox_1 (05.08.26)` -> dirty -> `prox_1* (05.08.26)` -> nach `_populate()` erhalten -> nach Clean -> `prox_1 (05.08.26)` - ALLE PASS.
+* Temporaere Testdateien (`tmp_check_*.py`, `tmp_app_data.duckdb`) danach geloescht (Regel: Tests nur in `test/`).
+* Keine UI-Tests (Regel). Manuelle UI-Verifikation durch den Anwender.
+* `docs/x_Exports.md` bleibt unangetastet (Nutzer-Export, nicht Bestandteil dieses Commits).

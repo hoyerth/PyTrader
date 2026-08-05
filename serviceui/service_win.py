@@ -210,6 +210,25 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             editor_layout.setSpacing(6)
             editor_layout.addWidget(self.group_service_sets)
             editor_layout.addWidget(self.widget_service_columns)
+            # Phase 15 (Dirty-State): Aktions-Leiste am unteren Ende der
+            # Parameter-Spalten – [💾 Speichern] persistiert die Parameter-
+            # Aenderungen ohne Neuberechnung; [▶️ Speichern & Ausführen]
+            # speichert und stoesst sofort den Service-Run an (ServiceRun-
+            # Worker, kein Schwerlast-Scan).
+            self._param_action_row = QHBoxLayout()
+            self._param_action_row.setSpacing(6)
+            self.btn_save_params = QPushButton("💾 Speichern")
+            self.btn_save_run_params = QPushButton("▶️ Speichern & Ausführen")
+            self.btn_save_params.setToolTip(
+                "Speichert die aktuellen Parameter-Aenderungen im Set "
+                "(app_data.duckdb) und entfernt das '*' im Baum.")
+            self.btn_save_run_params.setToolTip(
+                "Speichert die Aenderungen UND stoesst sofort die "
+                "Neuberechnung an (Bestätigungsabfrage mit Symbol/Timeframe).")
+            self._param_action_row.addWidget(self.btn_save_params)
+            self._param_action_row.addWidget(self.btn_save_run_params)
+            self._param_action_row.addStretch(1)
+            editor_layout.addLayout(self._param_action_row)
 
             self.right_panel = QWidget()
             right_layout = QVBoxLayout(self.right_panel)
@@ -288,6 +307,13 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.btn_trash_sets.clicked.connect(self.show_trash_dialog)
         if self.btn_execute_set:
             self.btn_execute_set.clicked.connect(self.execute_set)
+        # Phase 15 (Dirty-State): Parameter-Panel-Aktionsleiste (Speichern /
+        # Speichern & Ausführen) – siehe _save_params_from_panel /
+        # _save_and_run_from_panel.
+        if self.btn_save_params:
+            self.btn_save_params.clicked.connect(self._save_params_from_panel)
+        if self.btn_save_run_params:
+            self.btn_save_run_params.clicked.connect(self._save_and_run_from_panel)
 
         # U15-D2 (Bedien-Feinschliff): Log-Kontextmenü (Kopieren / Log leeren)
         # + Auto-Scroll ans Ende in log() – siehe _on_log_context_menu().
@@ -688,6 +714,86 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # Phase 16: 45s-Hintergrund-Sync auch bei Fehler freigeben.
         self._end_sync_guard()
         self.log(f"FEHLER bei Ausführung ({scope_id}): {error}")
+
+    # -------------------------------------------------------------------------
+    # Phase 15 (Dirty-State): Parameter-Panel-Aktionsleiste
+    # -------------------------------------------------------------------------
+
+    @Slot()
+    def _save_params_from_panel(self) -> None:
+        """'[💾 Speichern]' – persistiert die aktuellen Parameter-Aenderungen
+        des aktiven Sets (ServiceSetRepository.save_set, ohne Neuberechnung),
+        entfernt den '*' -Dirty-Marker im Baum und emittiert den EventBus
+        (Live-Sync aller ServiceSelectorModel-Instanzen).
+        """
+        if not self._current_set_id:
+            self.log("Kein Set geladen – Speichern nicht möglich.")
+            return
+        definition = self.collect_set_definition()
+        try:
+            self.set_repo.save_set(definition)
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern der Parameter: {e}")
+            return
+        self._clear_dirty_markers()
+        event_bus.service_set_changed.emit()
+        self.log(f"Parameter gespeichert (P15): {self._current_set_id}")
+
+    @Slot()
+    def _save_and_run_from_panel(self) -> None:
+        """'[▶️ Speichern & Ausführen]' – speichert die Aenderungen und
+        stoesst nach Bestaetigungsabfrage (Symbol/Timeframe) sofort die
+        Neuberechnung an.
+
+        Die Neuberechnung laeuft ueber den gezielten ServiceRunWorker
+        (FeatureStore-Persistenz + EventBus-Sync): Dadurch wird der
+        '*' -Marker entfernt und nach Abschluss das Ausfuehrungsdatum
+        '(DD.MM.JJ)' im MasterTree live aktualisiert.
+        """
+        if not self._current_set_id:
+            self.log("Kein Set geladen – Speichern & Ausführen nicht möglich.")
+            return
+        definition = self.collect_set_definition()
+        if not definition.get("execution_order"):
+            self.log("Keine Services in der Ausführungs-Reihenfolge – "
+                     "Speichern & Ausführen abgebrochen.")
+            return
+        try:
+            self.set_repo.save_set(definition)
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern der Parameter: {e}")
+            return
+        self._clear_dirty_markers()
+        event_bus.service_set_changed.emit()
+        symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
+        # U15-E: Timeframe-Control der Filterleiste (combo_tf) – kann auch
+        # 'ALLE Timeframes' sein (Multi-TF-Ausfuehrung im Worker).
+        timeframe = self.combo_tf.currentText() if self.combo_tf else "H1"
+        set_name = str(definition.get("display_name") or self._current_set_id)
+        count = len(definition.get("execution_order") or [])
+        reply = QMessageBox.question(
+            self, "Speichern & Ausführen",
+            f"Set '{set_name}' wurde gespeichert.\n\n"
+            f"Jetzt ausführen?\n"
+            f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+            f"Alle Services ({count}) werden neu berechnet und die "
+            f"Feature-Store-Payloads in analytics.duckdb geschrieben.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            self.log("Ausführung abgebrochen (Parameter gespeichert).")
+            return
+        self._start_run_worker(self._current_set_id, definition, instance_id=None)
+
+    def _clear_dirty_markers(self) -> None:
+        """Entfernt alle '*' -Dirty-Marker im MasterTree (nach Speichern)."""
+        selector = getattr(self, "service_selector", None)
+        tree = getattr(selector, "master_tree", None)
+        if tree is None:
+            return
+        try:
+            tree.clear_dirty_markers()
+        except (RuntimeError, AttributeError):
+            pass
 
     def _persist_current_set(self, action: str) -> None:
         """Persistiert das aktuell geladene Service-Set zurueck in die DB.
@@ -1240,6 +1346,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.edit_set_description.clear()
         if self.list_execution_order:
             self.list_execution_order.clear()
+        # Phase 15 (Dirty-State): Marker des vorherigen Sets entfernen.
+        self._clear_dirty_markers()
         self._clear_service_columns()
 
     @Slot(int)
@@ -1261,6 +1369,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         Phase 13 5.4 Schritt 1: Baut zusätzlich die dynamischen Service-Spalten
         (eine QGroupBox pro Service mit Parameter-Formular) auf.
         """
+        # Phase 15 (Dirty-State): Marker des vorherigen Sets entfernen –
+        # ein frisch geladenes Set ist per Definition unverändert (kein '*').
+        self._clear_dirty_markers()
         self._current_set_id = definition.get("set_id")
         self._current_set_definition = definition
         self._current_list_iid = None
@@ -1656,6 +1767,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         except Exception as e:
             self.log(f"FEHLER beim Speichern der Instanz-Beschreibung: {e}")
             return
+        # Phase 15 (Dirty-State): explizites Set-Speichern -> '*' entfernen.
+        self._clear_dirty_markers()
         self.log(f"Instanz-Beschreibung '{instance_id}' gespeichert.")
 
     def _save_set_description(self, set_id: str, new_desc: str) -> None:
@@ -1686,6 +1799,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         except Exception as e:
             self.log(f"FEHLER beim Speichern der Set-Beschreibung: {e}")
             return
+        # Phase 15 (Dirty-State): explizites Set-Speichern -> '*' entfernen.
+        self._clear_dirty_markers()
         self.log(f"Set-Beschreibung '{set_id}' gespeichert.")
 
     @Slot(str, str, str)

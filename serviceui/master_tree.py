@@ -224,6 +224,12 @@ class MasterTree(QTreeWidget):
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
 
+        # Phase 15 (Dirty-State): instance_ids mit ungespeicherten Parameter-
+        # Aenderungen. Die Sternchen-Markierung ('*' am Service-Knoten) wird
+        # bei jedem Baum-Neuaufbau aus diesem Set re-appliziert (set_instance_
+        # dirty / clear_dirty_markers halten es aktuell).
+        self._dirty_instance_ids: set = set()
+
         self._populate()
         self.itemSelectionChanged.connect(self._emit_selection)
         self.model.data_changed.connect(self._populate)
@@ -275,6 +281,11 @@ class MasterTree(QTreeWidget):
         # Baum-Aufbau anhaengen – setItemWidget() verlangt, dass das Item
         # bereits Teil des TreeWidgets ist (sonst kein sichtbarer Button).
         self._attach_item_buttons()
+        # Phase 15 (Dirty-State): Sternchen-Markierungen ungespeicherter
+        # Parameter-Aenderungen nach einem Neuaufbau wieder anwenden
+        # (data_changed -> _populate wuerde sie sonst verlieren).
+        for iid in list(getattr(self, "_dirty_instance_ids", set())):
+            self._apply_dirty_label(iid, True)
 
     def _safe_current_selection(self) -> Dict[str, str]:
         """Liess die aktuelle Auswahl defensiv (isValid-Guard gegen zerstoerte
@@ -448,6 +459,57 @@ class MasterTree(QTreeWidget):
                     lambda _=False, s=set_id, svc=service_id, pid=plugin_id:
                     self.info_requested.emit(s, svc, pid))
                 self.setItemWidget(item, 1, btn)
+        except (RuntimeError, AttributeError):
+            pass
+
+    # -------------------------------------------------------------------------
+    # Phase 15 (Dirty-State): '*' am Service-Knoten bei ungespeicherten
+    # Parameter-Aenderungen (Format 'Service_Name* (DD.MM.JJ)')
+    # -------------------------------------------------------------------------
+
+    def set_instance_dirty(self, instance_id: str, dirty: bool) -> None:
+        """Markiert eine Service-Instanz als ungespeichert ('*' am Knoten).
+
+        Der Dirty-Zustand wird im RAM gehalten (self._dirty_instance_ids) und
+        bei jedem Baum-Neuaufbau (_populate) re-appliziert. Nach erfolgreichem
+        Speichern ruft der Orchestrator clear_dirty_markers() auf.
+        """
+        if not instance_id:
+            return
+        if dirty:
+            self._dirty_instance_ids.add(instance_id)
+        else:
+            self._dirty_instance_ids.discard(instance_id)
+        self._apply_dirty_label(instance_id, dirty)
+
+    def clear_dirty_markers(self) -> None:
+        """Entfernt ALLE Sternchen-Markierungen (nach Speichern).
+
+        Das Set wird geleert und die Knoten-Labels zurueckgesetzt; der
+        naechste Baum-Neuaufbau erzeugt damit saubere Labels.
+        """
+        for iid in list(self._dirty_instance_ids):
+            self._apply_dirty_label(iid, False)
+        self._dirty_instance_ids.clear()
+
+    def _apply_dirty_label(self, instance_id: str, dirty: bool) -> None:
+        """Setzt/entfernt das '*' im Label des Service-Knotens mit
+        instance_id. Das Ausfuehrungsdatum '(DD.MM.JJ)' bleibt erhalten."""
+        try:
+            for item in TreeItemIterator(self):
+                if item is None or not isValid(item):
+                    continue
+                if item.data(0, ROLE_NODE_TYPE) != TYPE_SERVICE:
+                    continue
+                if str(item.data(0, ROLE_INSTANCE_ID) or "") != instance_id:
+                    continue
+                text = item.text(0) or ""
+                name, sep, rest = text.partition(" (")
+                if not sep:
+                    continue
+                name = name.rstrip("*")
+                item.setText(0, f"{name}{'*' if dirty else ''} ({rest}")
+                break
         except (RuntimeError, AttributeError):
             pass
 
