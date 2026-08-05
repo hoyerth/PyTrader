@@ -1697,13 +1697,15 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                             editierbar, header_line = 'aktiv/im <Indikator>').
           * Set-Zeile:      ServiceDescriptionEditDialog (Set-Beschreibung
                             editierbar, header_line aus _info_set_tooltip).
-          * Plugin-Zeile:   Read-Only ServiceDescriptionDialog (Plugin-Info,
-                            ohne Instanz) – Phase 16: 'ohne Instanz ausgenommen'
-                            von der Editierbarkeit.
+          * Plugin-Zeile:   ServiceDescriptionEditDialog (Plugin-Info, ohne
+                            Instanz) – Bugfix 05.08.2026: derselbe Editor wie
+                            bei den Einzel-Services der Sets (vorbefuellt mit
+                            der Plugin-Beschreibung; kein Persistenz-Ziel).
 
-        Phase 16 (05.08.2026): Im Service Window werden keine Plugin-
-        Beschreibungen verarbeitet – editierbar sind ausschliesslich die
-        Instanz- und die Set-Beschreibung.
+        Bugfix 05.08.2026: Auch Plugin-/Standalone-Zeilen oeffnen den
+        Beschreibungs-Editor (konsistent zu den Einzel-Services). Eine
+        persistierbare Beschreibung existiert nur fuer Instanzen (in Sets)
+        und fuer die Sets selbst.
         """
         model = getattr(self.service_selector, "model", None)
         if model is None:
@@ -1727,15 +1729,25 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                 dlg.exec()
                 return
             # 2) Plugin-Zeile (nur plugin_id; set_id = Gruppenkennung) –
-            #    Read-Only-Info (Phase 16: ohne Instanz von Editierung
-            #    ausgenommen; Plugin-Metadaten werden NICHT bearbeitet).
+            #    EDITIERBAR wie die Einzel-Services der Sets (Bugfix
+            #    05.08.2026): derselbe ServiceDescriptionEditDialog. Ein
+            #    Plugin ohne Instanz/Set hat keine persistierbare Instanz-
+            #    Beschreibung – der Editor wird mit der Plugin-Metadaten-
+            #    Beschreibung vorbefuellt (kein save_requested: Speichern/
+            #    Abbrechen schliessen den Dialog, es gibt kein Ziel).
             if plugin_id and not service_id:
                 plugin = self._resolve_info_plugin(plugin_id)
                 if plugin is None:
                     return
-                dlg = ServiceDescriptionDialog.from_plugin(
-                    plugin, instance_id="", config=None, parent=self,
-                    header_line=self._info_header_tooltip(plugin_id))
+                meta = dict(getattr(plugin, "metadata", None) or {})
+                dlg = ServiceDescriptionEditDialog(
+                    parent=self,
+                    instance_id="",
+                    plugin_id=plugin_id,
+                    header_line=self._info_header_tooltip(plugin_id),
+                    description=str(meta.get("description") or ""),
+                    title="Service-Beschreibung bearbeiten",
+                )
                 dlg.exec()
                 return
             # 3) Set-Zeile (nur set_id) – editierbar (Set-Beschreibung)
