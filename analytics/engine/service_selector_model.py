@@ -31,6 +31,54 @@ from PySide6.QtCore import QObject, Signal
 from config.event_bus import event_bus
 
 
+def list_indicators() -> List[Dict[str, Any]]:
+    """Alle verfuegbaren Indikatoren (deterministisch).
+
+    Liefert pro Indikator: {"indicator_id", "display_name",
+    "service_plugin_ids"} – Grundlage der Indikator-Auswahl beim Anlegen
+    neuer Service-Sets (Bugfix 05.08.2026). Aktuell existiert genau ein
+    Plugin-Indikator (GridLiquidityIndicator); weitere Indikatoren werden
+    hier Open/Closed ergaenzt (Registry-Prinzip).
+    """
+    result: List[Dict[str, Any]] = []
+    try:
+        from chart.indicators.grid_liquidity import GridLiquidityIndicator
+        ind = GridLiquidityIndicator()
+        svc_ids = list(getattr(ind, "service_plugin_ids", []) or [])
+        # Konsistenter Anzeigename: bevorzugt metadata['indicator_name'] des
+        # ersten Indikator-Services (identisch zur Tree-Badge-Logik in
+        # get_indicator_display_name); Fallback ind.display_name/indicator_id.
+        display = str(getattr(ind, "display_name", "")
+                      or getattr(ind, "indicator_id", ""))
+        try:
+            if svc_ids:
+                from analytics.features.feature_builder import PluginRegistry
+                meta = getattr(PluginRegistry().get(svc_ids[0]),
+                               "metadata", {}) or {}
+                if meta.get("indicator_name"):
+                    display = str(meta["indicator_name"])
+        except Exception:
+            pass
+        result.append({
+            "indicator_id": str(getattr(ind, "indicator_id", "")),
+            "display_name": display,
+            "service_plugin_ids": svc_ids,
+        })
+    except Exception:
+        pass
+    return result
+
+
+def indicator_display_name(indicator_id: str) -> str:
+    """Anzeigename eines Indikators (id -> Name); ohne Treffer die id."""
+    if not indicator_id:
+        return ""
+    for info in list_indicators():
+        if info["indicator_id"] == indicator_id:
+            return info["display_name"] or indicator_id
+    return indicator_id
+
+
 class ServiceSelectorModel(QObject):
     """Zentrales, lesendes Datenmodell der Service-Hierarchie (Phase 15.02).
 
@@ -225,11 +273,20 @@ class ServiceSelectorModel(QObject):
         return False
 
     def get_set_indicator_names(self, definition: Dict[str, Any]) -> List[str]:
-        """Distinkte Indikator-Namen aller Services eines Service-Sets
-        (in execution_order-Reihenfolge, nur Services mit Indikator-
-        Zugehoerigkeit). Leer, wenn das Set keinem Indikator gehoert.
+        """Distinkte Indikator-Namen eines Service-Sets.
+
+        Bugfix 05.08.2026: Ein explizit zugewiesenes Feld `indicator_id` in
+        der Set-Definition (Anlage-Dialog) wird zuerst ausgewertet; zusaetz-
+        lich liefern Services mit Indikator-Zugehoerigkeit (in execution_
+        order-Reihenfolge) weitere Indikatoren. Leer, wenn das Set keinem
+        Indikator gehoert.
         """
         names: List[str] = []
+        explicit = str(definition.get("indicator_id") or "")
+        if explicit:
+            nm = indicator_display_name(explicit)
+            if nm and nm not in names:
+                names.append(nm)
         services = definition.get("services") or {}
         order = definition.get("execution_order") or list(services.keys())
         for iid in order:

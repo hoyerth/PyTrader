@@ -303,3 +303,30 @@ Fix: Neue `_apply_set_badge()` – Set-Knoten mit Indikator-Zugehörigkeit zeige
 * `python -m py_compile` auf `serviceui/toolbar.py`, `serviceui/master_tree.py`, `serviceui/service_win.py` (Exit 0).
 * Import-Smoke: `MasterTree`/`ServiceToolbar`/`ServiceWindow` mit allen neuen Signalen & Methoden vorhanden; `btn_reload`/`reload_plugins_requested`/`set_actions_enabled` vollständig entfernt (keine Rest-Referenzen im Produktionscode; `reload_plugins_requested` nur noch als Doku-Kommentar).
 * Projektweite Suche: keine Test-Abhängigkeiten auf das entfernte Toolbar-API.
+### 3.14 Schritt 14 - Bugfix Runde 3: Rechtsklick-Toggle, Papierkorb-Kontextmenue & ParameterPanel entfernt (05.08.2026)
+
+**Anforderung (4 Punkte, vom Anwender entschieden):**
+
+**A) Rechtsklick expandiert/kollabiert Knoten (serviceui/master_tree.py):**
+* _show_context_menu() togglet vor dem Menueaufbau bei Knoten mit Kindern (childCount() > 0) item.setExpanded(not item.isExpanded()) - Konsistenz mit dem Linksklick (Schritt 9, Punkt 4), damit das Kontextmenue immer auf dem sichtbaren Knoten steht (isValid-Guard bleibt).
+
+**B) Loeschen in den Papierkorb (bereits vorhanden, keine Aenderung):**
+* delete_set() → ServiceSetRepository.delete_set(soft_delete=True) verschiebt das Set nach service_sets_trash; ServiceSetTrashDialog (tn_trash_sets) bietet Wiederherstellen + endgueltiges Loeschen (P14-05).
+
+**C) Kontextmenue \'Papierkorb loeschen...\' mit doppelter Sicherheitsabfrage (2 Dateien):**
+* serviceui/master_tree.py: Neues Signal purge_trash_requested = Signal(); Menueeintrag \'Papierkorb loeschen...\' bei Set- UND Service-Knoten (alle Lambdas mit _=False, Shiboken-bool-Schutz).
+* serviceui/service_win.py: Neuer Slot _on_purge_trash() - leere-Pruefung ueber set_repo.list_trash(), dann DOPPELTE QMessageBox.question-Abfrage (P14-05, Vorgang nicht umkehrbar), set_repo.purge_trash() + event_bus.service_set_changed.emit(); verdrahtet via 	ree.purge_trash_requested.connect(self._on_purge_trash) in _wire_selector_toolbar().
+
+**D) ParameterPanel komplett entfernt (Code + Relationen, 3 Aenderungen):**
+* serviceui/service_win.py (Patch via 	est/_apply_fix_round3_sw.py): ParameterPanel-Import, param_panel-Erzeugung/Layout (right_layout), _on_symbol_changed-Block, params_changed-Verdrahtung, _sync_param_panel()-Aufrufe in _on_master_selection/_clear_set_editor/load_set_into_editor/_sync_list_selection sowie die Methoden _sync_param_panel/_on_param_panel_changed/_set_ctrl_value KOMPLETT entfernt. Wichtig: Das End-Slice der Methoden-Entfernung zeigt auf die U15-D2-Sektion (Toolbar-Zustand & Kontextmenue-Handler) - die Handler _on_remove_service & Co. liegen NACH diesem Marker und bleiben erhalten (erster Versuch mit der 15.01-Sektion als End-Slice entfernte faelschlich _on_remove_service). Zusaetzlich 2 veraltete Kommentar-/Docstring-Erwaehungen bereinigt.
+* serviceui/__init__.py: ParameterPanel-Import, __all__-Export und Dokuzeile entfernt (
+ew_set_dialog.py in der Doku ergaenzt).
+* serviceui/parameter_panel.py → .backup_parameter_panel/serviceui/parameter_panel.py archiviert (Konvention wie .backup_grid_liquidity, aus dem Discovery-Pfad entfernt; Original bleibt erhalten).
+* **Keine DB-Tabelle:** ParameterPanel ist reine UI - nichts in DuckDB zu loeschen.
+
+**Validierung (headless, gruen):**
+* python -m py_compile auf service_win.py, master_tree.py, __init__.py, service_selector_widget.py, 
+ew_set_dialog.py, param_columns.py, 	rash_dialog.py (Exit 0).
+* Import-Smoke: serviceui, service_win, master_tree (Signal purge_trash_requested vorhanden), selector/widget/dialog/toolbar/status - OK; ParameterPanel nicht mehr in __all__.
+* Projektweite Rest-Referenz-Suche (ParameterPanel|param_panel|_sync_param_panel|_on_param_panel_changed|_set_ctrl_value im Produktionscode): **0 Treffer**.
+* Verifikation _on_purge_trash: set_repo.list_trash()/purge_trash() und event_bus vorhanden; Kontextmenue-Toggle (count 2), Papierkorb-Eintraege (count 2, Set- + Service-Knoten) bestaetigt.

@@ -27,10 +27,10 @@ from typing import Any, Dict, Optional
 from PySide6.QtCore import QFile, QIODevice, QTimer, Qt, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QGroupBox, QHBoxLayout, QInputDialog,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox,
-    QProgressBar, QPushButton, QSpinBox, QSplitter, QTextEdit, QVBoxLayout,
-    QWidget,
+    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QGroupBox, QHBoxLayout,
+    QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
+    QMessageBox, QProgressBar, QPushButton, QSpinBox, QSplitter, QTextEdit,
+    QVBoxLayout, QWidget,
 )
 
 # P15-Bugfix: shiboken6.isValid() schuetzt vor dem Zugriff auf bereits
@@ -56,6 +56,7 @@ from serviceui.set_run_worker import ServiceSetRunWorker
 from serviceui.set_item_adapter import ServiceSetItemAdapter, _ServiceSetItemAdapter
 from serviceui.param_columns import ServiceParamColumnsMixin
 from serviceui.trash_dialog import ServiceSetTrashDialog
+from serviceui.new_set_dialog import NewServiceSetDialog
 
 # Phase 15 15.01: Symbol- & Favoriten-Verwaltung (SymbolsWindow + EventBus)
 from serviceui.symbols_win import SymbolsWindow
@@ -63,9 +64,8 @@ from symbol_repository import SymbolRepository, get_symbol_repository
 from config.event_bus import event_bus
 
 # Phase 15 15.02: Service-UI Refactoring – MasterTree & generischer
-# ServiceSelector (ServiceSelectorWidget im Modus FULL_EDIT) + ParameterPanel.
+# ServiceSelector (ServiceSelectorWidget im Modus FULL_EDIT).
 from serviceui.service_selector_widget import ServiceSelectorWidget
-from serviceui.parameter_panel import ParameterPanel
 
 # Projekt-Root (eine Ebene über serviceui/) – für die UI-Datei unter ui/.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -173,7 +173,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             # Phase 15 15.02 (Orchestrator): QSplitter-Zusammensetzung.
             #  * Links:  bestehender Set-Editor + dynamische Service-Spalten.
             #  * Rechts: MasterTree (2-Spalten-Hierarchie, Live-Status-Badges,
-            #            ServiceSelectorWidget im Modus FULL_EDIT) + ParameterPanel.
+            #            ServiceSelectorWidget im Modus FULL_EDIT).
             self.top_row = QHBoxLayout()
             self.top_row.setSpacing(6)
             idx = self.central_layout.indexOf(self.group_service_sets)
@@ -195,10 +195,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             # MasterTree + Aktions-Toolbar (Modus B / FULL_EDIT)
             self.service_selector = ServiceSelectorWidget(
                 mode=ServiceSelectorWidget.MODE_FULL_EDIT, parent=self)
-            # Parameter-Formular fuer die markierte Service-Instanz
-            self.param_panel = ParameterPanel(parent=self)
-            right_layout.addWidget(self.service_selector, 2)
-            right_layout.addWidget(self.param_panel, 1)
+            right_layout.addWidget(self.service_selector, 1)
 
             self.main_splitter = QSplitter(Qt.Horizontal)
             self.main_splitter.addWidget(self._editor_panel)
@@ -358,9 +355,6 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         if (self.combo_set is not None and self.combo_set.currentIndex() >= 0
                 and self.service_columns_layout is not None):
             self._rebuild_columns()
-        # ParameterPanel-Praezision (prox_level1..6) je Symbol synchronisieren
-        if getattr(self, "param_panel", None) is not None:
-            self.param_panel.set_symbol_precision(self._get_symbol_precision())
 
     # --- Phase 15 15.02: MasterTree / ServiceSelector (FULL_EDIT) ---
 
@@ -398,10 +392,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             tree.delete_set_requested.connect(self._on_delete_set)
             tree.move_service_requested.connect(self._on_move_service)
             tree.remove_service_requested.connect(self._on_remove_service)
+            tree.purge_trash_requested.connect(self._on_purge_trash)
             # Gruppen-Klick -> Toolbar-State ([➕ Set] bei der 📁-Gruppe)
             tree.group_activated.connect(self._on_group_activated)
-        # ParameterPanel-Aenderungen -> Set-Definition + Spalten (Live-Edit)
-        self.param_panel.params_changed.connect(self._on_param_panel_changed)
 
     def _show_toolbar_add_popup(self) -> None:
         """Zeigt das [➕ Service]-Popup mit allen verfuegbaren Plugins."""
@@ -421,7 +414,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
 
     @Slot(str, str)
     def _on_master_selection(self, set_id: str, service_id: str) -> None:
-        """Synchronisiert Editor (Set-Combo/Liste) und ParameterPanel mit der
+        """Synchronisiert Editor (Set-Combo/Liste) mit der
         MasterTree-Auswahl.
 
         P15-Bugfix: isValid-Guards – bei wildem Klicken koennen combo_set /
@@ -450,78 +443,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                         break
             except (RuntimeError, AttributeError):
                 pass
-        self._sync_param_panel()
         # Bugfix 05.08.2026: bifunktionalen Toolbar-Zustand nach der
         # MasterTree-Auswahl aktualisieren (set/service/none + Order).
         self._update_toolbar_actions(set_id, service_id)
-
-    def _sync_param_panel(self) -> None:
-        """Laedt die Parameter der markierten Service-Instanz ins ParameterPanel."""
-        if getattr(self, "param_panel", None) is None:
-            return
-        try:
-            if not _qt_valid(self.param_panel):
-                return
-            iid = self._current_list_iid
-            if not iid or not self._current_set_definition:
-                self.param_panel.clear()
-                return
-            cfg = dict((self._current_set_definition.get("services") or {}).get(iid, {}))
-            pid = str(cfg.get("plugin_id") or iid)
-            self.param_panel.set_symbol_precision(self._get_symbol_precision())
-            self.param_panel.set_service(iid, pid, cfg)
-        except (RuntimeError, AttributeError):
-            pass
-
-    @Slot(str, dict)
-    def _on_param_panel_changed(self, instance_id: str, params: dict) -> None:
-        """Uebernimmt ParameterPanel-Aenderungen in die Set-Definition und die
-        Editor-Spalten (Live-Edit, damit collect_set_definition() sie findet).
-
-        P15-Bugfix: isValid-Guard auf ctrl – bei wildem Klicken koennen
-        Editor-Spalten-Controls zwischenzeitlich per deleteLater entfernt
-        worden sein (0xC0000005-Schutz).
-        """
-        if not instance_id:
-            return
-        # 1) In die Set-Definition schreiben
-        if self._current_set_definition:
-            services = self._current_set_definition.setdefault("services", {})
-            cfg = services.setdefault(
-                instance_id, {"plugin_id": "", "lookback": 1000, "params": {}})
-            if "lookback" in params:
-                try:
-                    cfg["lookback"] = int(params["lookback"])
-                except (TypeError, ValueError):
-                    pass
-            cfg.setdefault("params", {}).update({
-                k: v for k, v in params.items() if k != "lookback"
-            })
-        # 2) Editor-Spalten synchron halten (falls Controls existieren)
-        for (iid, key), ctrl in self._service_param_controls.items():
-            if iid == instance_id and key in params and _qt_valid(ctrl):
-                self._set_ctrl_value(ctrl, params[key])
-
-    @staticmethod
-    def _set_ctrl_value(ctrl: QWidget, value: Any) -> None:
-        """Setzt den Wert eines Parameter-Controls typsicher.
-
-        P15-Bugfix: try/except – Control kann zwischen Iteration und Zugriff
-        per deleteLater zerstoert worden sein (Access-Violation-Schutz).
-        """
-        try:
-            if isinstance(ctrl, QCheckBox):
-                ctrl.setChecked(bool(value))
-            elif isinstance(ctrl, QSpinBox):
-                ctrl.setValue(int(value))
-            elif isinstance(ctrl, QDoubleSpinBox):
-                ctrl.setValue(float(value))
-            elif isinstance(ctrl, QComboBox):
-                ctrl.setCurrentText(str(value))
-            else:
-                ctrl.setText(str(value))
-        except (RuntimeError, AttributeError):
-            pass
 
     # -------------------------------------------------------------------------
     # Bugfix 05.08.2026: Toolbar-Zustand & Kontextmenue-Handler (U15-D2)
@@ -607,24 +531,175 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         elif set_id:
             self._on_delete_set(set_id)
 
-    @Slot()
-    def _on_add_set(self) -> None:
-        """Erzeugt ein NEUES LEERES Service-Set ([➕ Set] / Kontextmenue
-        'Neues Set anlegen').
+    def _persist_current_set(self, action: str) -> None:
+        """Persistiert das aktuell geladene Service-Set zurueck in die DB.
 
-        Bewusst DIREKT ueber set_repo.save_set(): der NamedItemAdapter
-        (_item_save_as) verweigert leere execution_order, daher ist der
-        Umweg ueber save_named_item() fuer leere Sets nicht moeglich. Der
-        Name bleibt leer -> das Repository erzeugt den Default-Namen
-        ('Unbenanntes Set'); Umbenennen ueber das Kontextmenue.
+        Bugfix 05.08.2026: Struktur-Aenderungen (add/move/remove) werden
+        SOFORT gespeichert (P14-05: Snapshot beim Ueberschreiben) und der
+        EventBus emittiert `service_set_changed` – alle ServiceSelectorModel-
+        Instanzen (MasterTree, Analytics, ...) aktualisieren live. Verwaiste
+        services-Konfigurationen (nicht mehr in execution_order) werden dabei
+        bereinigt. Nur Sets MIT set_id werden persistiert (ein neues, noch
+        ungespeichertes Set lebt bis zum expliziten 'Speichern' im Editor).
         """
-        definition = {
+        if not self._current_set_id:
+            return
+        try:
+            definition = self.collect_set_definition()
+            order = definition.get("execution_order") or []
+            services = definition.get("services") or {}
+            definition["services"] = {
+                iid: cfg for iid, cfg in services.items() if iid in order
+            }
+            self.set_repo.save_set(definition)
+            event_bus.service_set_changed.emit()
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern des Sets ({action}): {e}")
+
+    def _plugin_belongs_to_indicator(self, plugin_id: str) -> bool:
+        """True, wenn der Service einem Indikator zugeordnet ist
+        (metadata['indicator_id']/['indicator_name']).
+
+        Bugfix 05.08.2026: Grundlage der entschaerften P14-04-Sperre –
+        nur Indikator-Services sind ueber die 'letztes Vorkommen'-Regel
+        geschuetzt, freie Services sind immer loeschbar.
+        """
+        try:
+            model = getattr(getattr(self, "service_selector", None),
+                            "model", None)
+            if model is not None:
+                return bool(model.belongs_to_indicator(plugin_id))
+        except (RuntimeError, AttributeError):
+            pass
+        return False
+
+    def _remaining_sets_with_plugin(self, plugin_id: str,
+                                    exclude_set_id: Optional[str]) -> list:
+        """GESPEICHERTE Sets (ohne exclude_set_id), die einen Service mit
+        plugin_id enthalten – Basis der P14-04-Sperre (Bugfix 05.08.2026:
+        Entfernen/Loeschen erlaubt, solange ein gueltiges Set fuer den
+        Indikator erhalten bleibt)."""
+        return [
+            s for s in self.set_repo.list_sets()
+            if s.get("set_id") != exclude_set_id
+            and any((cfg or {}).get("plugin_id") == plugin_id
+                    for cfg in (s.get("services") or {}).values())
+        ]
+
+    def _select_set_in_tree(self, set_id: str) -> None:
+        """Selektiert ein Set im MasterTree (Bugfix 05.08.2026).
+
+        Loest ueber selection_changed -> _on_master_selection auch den
+        Editor-Sync und den bifunktionalen Toolbar-Zustand ([➕ Service])
+        aus – direkt nach dem Anlegen eines neuen Sets.
+        """
+        selector = getattr(self, "service_selector", None)
+        tree = getattr(selector, "master_tree", None)
+        if tree is None or not set_id:
+            return
+        try:
+            from serviceui.master_tree import (
+                ROLE_NODE_TYPE, ROLE_SET_ID, TYPE_SET, TreeItemIterator)
+            for item in TreeItemIterator(tree):
+                if item is None:
+                    continue
+                if (item.data(0, ROLE_NODE_TYPE) == TYPE_SET and
+                        str(item.data(0, ROLE_SET_ID) or "") == set_id):
+                    tree.setCurrentItem(item)
+                    return
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _build_new_set_definition(self, name: str,
+                                  indicator_id: str) -> Dict[str, Any]:
+        """Baut die Definition fuer ein neues Service-Set.
+
+        Bugfix 05.08.2026: Bei Indikator-Auswahl wird die `indicator_id`
+        explizit gespeichert und die Basis-Services des Indikators
+        (service_plugin_ids, z.B. grid_lines + proximity) werden mit
+        Registry-Defaults automatisch angelegt (instance_id = plugin_id) –
+        einfache Bedienung und das Set ist sofort gueltig fuer den Indikator.
+        """
+        definition: Dict[str, Any] = {
             "set_id": "",
-            "display_name": "",
+            "display_name": name,
             "description": "",
             "execution_order": [],
             "services": {},
         }
+        if not indicator_id:
+            return definition
+        definition["indicator_id"] = indicator_id
+        try:
+            from analytics.engine.service_selector_model import list_indicators
+            info = next(
+                (i for i in list_indicators()
+                 if str(i.get("indicator_id") or "") == indicator_id),
+                None,
+            )
+        except Exception:
+            info = None
+        if info is None:
+            return definition
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            registry = PluginRegistry()
+        except Exception:
+            registry = None
+        for pid in (info.get("service_plugin_ids") or []):
+            pid = str(pid)
+            if not pid or pid in definition["services"]:
+                continue
+            params: Dict[str, Any] = {}
+            if registry is not None:
+                try:
+                    params = dict(getattr(
+                        registry.get(pid), "default_params", {}) or {})
+                except (KeyError, AttributeError):
+                    params = {}
+            lookback: int = 1000
+            if "lookback" in params:
+                try:
+                    lookback = int(params.pop("lookback") or 1000)
+                except (TypeError, ValueError):
+                    lookback = 1000
+            definition["services"][pid] = {
+                "plugin_id": pid,
+                "lookback": lookback,
+                "params": params,
+            }
+            definition["execution_order"].append(pid)
+        return definition
+
+    @Slot()
+    def _on_add_set(self) -> None:
+        """Erzeugt ein NEUES Service-Set ([➕ Set] / Kontextmenue
+        'Neues Set anlegen').
+
+        Bugfix 05.08.2026 (einfache Bedienung): Dialog mit Namens- und
+        Indikator-Auswahl (NewServiceSetDialog). Der Name ist Pflicht; wird
+        ein Indikator gewaehlt, wird er explizit zugewiesen (indicator_id)
+        und die Basis-Services automatisch angelegt (_build_new_set_definition).
+        Das neue Set wird direkt im MasterTree selektiert, damit die Toolbar
+        in den [➕ Service]-Modus wechselt.
+        """
+        try:
+            from analytics.engine.service_selector_model import list_indicators
+            indicators = list_indicators()
+        except Exception:
+            indicators = []
+        dlg = NewServiceSetDialog(indicators, parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        name = dlg.result_name()
+        ind_id = dlg.result_indicator_id()
+        if any((s.get("display_name") or "") == name
+               for s in self.set_repo.list_sets()):
+            QMessageBox.warning(
+                self, "Name vergeben",
+                f"Ein Service-Set heißt bereits '{name}'.")
+            return
+        definition = self._build_new_set_definition(name, ind_id)
         try:
             set_id = self.set_repo.save_set(definition)
         except Exception as e:
@@ -633,13 +708,16 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         if not set_id:
             self.log("Set-Anlage fehlgeschlagen.")
             return
-        self.log(f"Neues leeres Service-Set angelegt: {set_id}")
+        self.log(f"Neues Service-Set angelegt: {set_id}"
+                 + (f" (Indikator: {ind_id})" if ind_id else ""))
         event_bus.service_set_changed.emit()
         self.refresh_set_list()
         if self.combo_set is not None:
             idx = self.combo_set.findData(set_id)
             if idx >= 0:
                 self.combo_set.setCurrentIndex(idx)
+        # Neues Set im MasterTree selektieren -> Toolbar [➕ Service]-Modus
+        self._select_set_in_tree(set_id)
 
     @Slot(str)
     def _on_rename_set(self, set_id: str) -> None:
@@ -697,16 +775,31 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
 
     @Slot(str)
     def _on_add_set_service(self, set_id: str) -> None:
-        """'Service hinzufuegen' (Kontextmenue): Set in den Editor laden und
-        das [➕ Service]-Plugin-Popup oeffnen (Reuse: _show_toolbar_add_popup
-        + _toolbar_add_service + add_instance)."""
+        """'Service hinzufuegen' (Kontextmenue): EIGENE Auswahlbox.
+
+        Bugfix 05.08.2026: Eine eigene QInputDialog-Auswahlbox statt der
+        Toolbar-Auswahl (show_add_menu) – die Toolbar-Auswahl wird bald
+        entfernt. Nach der Auswahl wird der Service ueber den bestehenden
+        Pfad (edit_new_instance + add_instance) ins Set uebernommen und
+        sofort persistiert.
+        """
         if not set_id:
             return
         if self.combo_set is not None:
             idx = self.combo_set.findData(set_id)
             if idx >= 0:
                 self.combo_set.setCurrentIndex(idx)
-        self._show_toolbar_add_popup()
+        selector = getattr(self, "service_selector", None)
+        ids = sorted(selector.get_plugin_ids()) if selector is not None else []
+        if not ids:
+            self.log("Keine Services verfuegbar.")
+            return
+        pid, ok = QInputDialog.getItem(
+            self, "Service hinzufügen",
+            "Service wählen:", ids, 0, False)
+        if not ok or not pid:
+            return
+        self._toolbar_add_service(str(pid))
 
     @Slot(str)
     def _on_delete_set(self, set_id: str) -> None:
@@ -763,6 +856,42 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             return
         self._select_service_in_editor(set_id, service_id)
         self.remove_instance()
+
+    @Slot()
+    def _on_purge_trash(self) -> None:
+        """Leert den Papierkorb ENDGUELTIG (Kontextmenue 'Papierkorb löschen').
+
+        Bugfix 05.08.2026: Doppelte Sicherheitsabfrage (P14-05) – der Vorgang
+        ist nicht umkehrbar. Einzelne Sets koennen weiterhin ueber den
+        Papierkorb-Dialog (btn_trash_sets) wiederhergestellt werden.
+        """
+        trash = self.set_repo.list_trash()
+        if not trash:
+            QMessageBox.information(
+                self, "Papierkorb",
+                "Der Papierkorb ist leer – es gibt nichts zu löschen.")
+            return
+        count = len(trash)
+        reply = QMessageBox.question(
+            self, "Papierkorb löschen",
+            f"{count} Set(s) liegen im Papierkorb.\n"
+            f"Wirklich ENDGÜLTIG löschen?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        reply2 = QMessageBox.question(
+            self, "Wirklich?",
+            "Diese Aktion kann nicht rückgängig gemacht werden.\nFortfahren?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply2 != QMessageBox.Yes:
+            return
+        try:
+            n = self.set_repo.purge_trash()
+        except Exception as e:
+            self.log(f"FEHLER beim Leeren des Papierkorbs: {e}")
+            return
+        self.log(f"Papierkorb geleert: {n} Set(s) endgültig entfernt (P14-05).")
+        event_bus.service_set_changed.emit()
 
     # --- Phase 15 15.01: Symbol- & Favoriten-Verwaltung ---
 
@@ -952,8 +1081,6 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         if self.list_execution_order:
             self.list_execution_order.clear()
         self._clear_service_columns()
-        # Phase 15.02: ParameterPanel leeren (kein Set mehr aktiv)
-        self._sync_param_panel()
 
     @Slot(int)
     def _on_set_selected(self, index: int) -> None:
@@ -994,8 +1121,6 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                 item.setToolTip(self._build_tooltip(iid, cfg) + lock_tip)
                 self.list_execution_order.addItem(item)
         self._build_service_columns(definition)
-        # Phase 15.02: ParameterPanel an das geladene Set angleichen
-        self._sync_param_panel()
 
     def collect_current_order(self) -> list:
         """Liefert die instance_ids aus der Liste (aktuelle execution_order)."""
@@ -1022,8 +1147,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         lw.insertItem(new_row, item)
         lw.setCurrentRow(new_row)
         self._rebuild_columns()
-        # Phase 15.02: Struktur-Aenderung -> EventBus (Live-Sync des MasterTree)
-        event_bus.service_set_changed.emit()
+        # Bugfix 05.08.2026: Reihenfolge SOFORT persistieren (P14-05-Snapshot)
+        # + EventBus-Live-Sync (MasterTree/Set-Anzeige zeigen die neue Order).
+        self._persist_current_set("Reihenfolge geaendert")
 
     @Slot()
     def remove_instance(self) -> None:
@@ -1039,19 +1165,42 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             return
         item = lw.item(lw.currentRow())
         plugin_id = str(item.data(Qt.UserRole + 1) or item.data(Qt.UserRole) or "")
-        names = _sets_using_plugin(plugin_id, self.set_repo.list_sets())
-        if names:
-            QMessageBox.warning(
-                self, "Service gesperrt",
-                f"Der Service '{plugin_id}' kann nicht entfernt werden.\n"
-                f"Er wird vom Service-Set '{names[0]}' verwendet.\n"
-                f"Solange er in einem Set vorkommt, bleibt er für den "
-                f"Indikator gesperrt (P14-04).")
+        # P14-04-E (Bugfix 05.08.2026): Nur der LETZTE Vorkommen eines
+        # Indikator-Services ueber ALLE gespeicherten Sets ist gesperrt –
+        # solange ein anderes gültiges Set den Service enthaelt, darf er
+        # entfernt werden.
+        if self._plugin_belongs_to_indicator(plugin_id):
+            others = self._remaining_sets_with_plugin(
+                plugin_id, exclude_set_id=self._current_set_id)
+            if not others:
+                QMessageBox.warning(
+                    self, "Service gesperrt",
+                    f"Der Service '{plugin_id}' ist der letzte in einem "
+                    f"gespeicherten Service-Set.\n"
+                    f"Für den Indikator muss mindestens ein gültiges Set "
+                    f"mit diesem Service erhalten bleiben (P14-04).")
+                return
+        # Bugfix 05.08.2026: Doppelte Sicherheitsabfrage (P14-05) – der
+        # bisherige Set-Stand wird als Snapshot in service_set_history
+        # gesichert, bevor der Service entfernt wird.
+        iid = str(item.data(Qt.UserRole) or "")
+        reply = QMessageBox.question(
+            self, "Service entfernen",
+            f"Service '{iid} [{plugin_id}]' aus dem Set entfernen?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        reply2 = QMessageBox.question(
+            self, "Wirklich?",
+            "Der bisherige Set-Stand wird als Snapshot gesichert "
+            "(service_set_history). Fortfahren?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply2 != QMessageBox.Yes:
             return
         lw.takeItem(lw.currentRow())
         self._rebuild_columns()
-        # Phase 15.02: Struktur-Aenderung -> EventBus (Live-Sync des MasterTree)
-        event_bus.service_set_changed.emit()
+        # Bugfix 05.08.2026: Entfernen SOFORT persistieren + EventBus-Sync.
+        self._persist_current_set("Service entfernt")
 
     @Slot()
     def _on_plugin_select_changed(self, plugin_id: str) -> None:
@@ -1110,8 +1259,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self.edit_new_instance.clear()
         self.log(f"Service hinzugefügt: {iid} [{plugin_id}]")
         self._rebuild_columns()
-        # Phase 15.02: Struktur-Aenderung -> EventBus (Live-Sync des MasterTree)
-        event_bus.service_set_changed.emit()
+        # Bugfix 05.08.2026: Hinzufuegen SOFORT persistieren (nur bei
+        # geladenem Set) + EventBus-Live-Sync (Tree zeigt den neuen Service).
+        self._persist_current_set("Service hinzugefuegt")
 
     def collect_set_definition(self) -> Dict[str, Any]:
         """Baut aus dem Editor eine ServiceSetDefinition.
@@ -1186,6 +1336,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             "display_name": self.edit_set_name.text().strip() if self.edit_set_name else "",
             # Phase 14 P14-01: Set-Beschreibung wird mitgespeichert
             "description": self.edit_set_description.text().strip() if self.edit_set_description else "",
+            # Bugfix 05.08.2026: explizite Indikator-Zuordnung erhalten
+            "indicator_id": (self._current_set_definition or {}).get("indicator_id"),
             "execution_order": order,
             "services": services,
         }
@@ -1232,8 +1384,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             row = self.list_execution_order.currentRow()
             if row >= 0:
                 self._current_list_iid = self.list_execution_order.item(row).data(Qt.UserRole)
-        # Phase 15.02: ParameterPanel an die markierte Instanz angleichen
-        self._sync_param_panel()
+
 
     @Slot()
     def _show_service_info(self) -> None:
@@ -1383,11 +1534,48 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         Set erhalten bleiben, damit der Indikator funktionsfähig bleibt. Das
         Löschen des letzten verbliebenen Sets ist gesperrt.
         """
-        if len(self.set_repo.list_sets()) <= 1:
-            QMessageBox.warning(
-                self, "Löschen gesperrt",
-                "Es muss immer mindestens ein gültiges Service-Set erhalten "
-                "bleiben, damit der Indikator funktionsfähig bleibt (P14-04).")
+        # P14-04-E (Bugfix 05.08.2026): Ein Set darf gelöscht werden,
+        # solange für jeden Indikator-Service des Sets in einem ANDEREN
+        # gespeicherten Set noch ein Vorkommen existiert (gültiges Set für
+        # den Indikator bleibt erhalten). Enthält das Set den LETZTEN
+        # Vorkommen eines Indikator-Services, ist das Löschen gesperrt.
+        current_id = self._set_adapter._item_current_id()
+        current = next(
+            (s for s in self.set_repo.list_sets()
+             if s.get("set_id") == current_id),
+            None,
+        )
+        if current:
+            services = current.get("services") or {}
+            for cfg in services.values():
+                if not isinstance(cfg, dict):
+                    continue
+                pid = str(cfg.get("plugin_id") or "")
+                if not pid or not self._plugin_belongs_to_indicator(pid):
+                    continue
+                others = self._remaining_sets_with_plugin(
+                    pid, exclude_set_id=current_id)
+                if not others:
+                    QMessageBox.warning(
+                        self, "Löschen gesperrt",
+                        f"Dieses Service-Set enthält den letzten "
+                        f"gespeicherten Service '{pid}' für den Indikator.\n"
+                        f"Es muss mindestens ein gültiges Set mit diesem "
+                        f"Service erhalten bleiben (P14-04).")
+                    return
+        # Bugfix 05.08.2026: Erste Bestaetigung – das Set wird in den
+        # Papierkorb (service_sets_trash) verschoben (zweite Abfrage folgt
+        # in delete_named_item; Wiederherstellung ueber den Papierkorb-
+        # Dialog).
+        name = self._set_adapter._item_current_name()
+        if not name:
+            return
+        reply = QMessageBox.question(
+            self, "Set in den Papierkorb verschieben",
+            f"Set '{name}' wirklich in den Papierkorb verschieben?\n"
+            f"(Wiederherstellung über den Papierkorb-Dialog möglich.)",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
             return
         self.delete_named_item(self._set_adapter)
 

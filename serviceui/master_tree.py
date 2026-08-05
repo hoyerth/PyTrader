@@ -158,6 +158,9 @@ class MasterTree(QTreeWidget):
     delete_set_requested = Signal(str)          # set_id
     move_service_requested = Signal(str, str, int)  # set_id, service_id, delta
     remove_service_requested = Signal(str, str)     # set_id, service_id
+    # Bugfix 05.08.2026: Kontextmenue 'Papierkorb löschen' – endgueltig
+    # leeren (Orchestrator fuehrt die doppelte Sicherheitsabfrage aus).
+    purge_trash_requested = Signal()
     # Bugfix 05.08.2026: Klick auf einen (nicht selektierbaren) Gruppen-Knoten
     # (group id: 'sets' / 'standalone' / 'plugins') – fuer den Toolbar-State.
     group_activated = Signal(str)
@@ -452,6 +455,14 @@ class MasterTree(QTreeWidget):
             item = self.itemAt(pos)
             if item is None or not isValid(item):
                 return
+            # Bugfix 05.08.2026: Rechtsklick togglet aufklappbare Knoten
+            # (Konsistenz mit Linksklick), damit das Kontextmenue immer auf
+            # dem sichtbaren Knoten steht.
+            try:
+                if item.childCount() > 0:
+                    item.setExpanded(not item.isExpanded())
+            except (RuntimeError, AttributeError):
+                pass
             node_type = item.data(0, ROLE_NODE_TYPE)
             menu = QMenu(self)
             if node_type == TYPE_GROUP:
@@ -459,7 +470,7 @@ class MasterTree(QTreeWidget):
                 if group == self.model.GROUP_SETS:
                     act = menu.addAction("Neues Set anlegen")
                     act.triggered.connect(
-                        lambda: self.create_set_requested.emit())
+                        lambda _=False: self.create_set_requested.emit())
                 else:
                     self._add_outside_set_actions(menu, item)
                 menu.exec(self.viewport().mapToGlobal(pos))
@@ -468,14 +479,21 @@ class MasterTree(QTreeWidget):
                 set_id = str(item.data(0, ROLE_SET_ID) or "")
                 act_rename = menu.addAction("Set umbenennen")
                 act_rename.triggered.connect(
-                    lambda s=set_id: self.rename_set_requested.emit(s))
+                    lambda _=False, s=set_id:
+                    self.rename_set_requested.emit(s))
                 act_add = menu.addAction("Service hinzufügen")
                 act_add.triggered.connect(
-                    lambda s=set_id: self.add_set_service_requested.emit(s))
+                    lambda _=False, s=set_id:
+                    self.add_set_service_requested.emit(s))
                 menu.addSeparator()
                 act_del = menu.addAction("Set löschen")
                 act_del.triggered.connect(
-                    lambda s=set_id: self.delete_set_requested.emit(s))
+                    lambda _=False, s=set_id:
+                    self.delete_set_requested.emit(s))
+                menu.addSeparator()
+                act_purge = menu.addAction("Papierkorb löschen…")
+                act_purge.triggered.connect(
+                    lambda _=False: self.purge_trash_requested.emit())
                 menu.exec(self.viewport().mapToGlobal(pos))
                 return
             if node_type == TYPE_SERVICE:
@@ -484,21 +502,25 @@ class MasterTree(QTreeWidget):
                 plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
                 act_up = menu.addAction("Order ▲")
                 act_up.triggered.connect(
-                    lambda s=set_id, i=service_id:
+                    lambda _=False, s=set_id, i=service_id:
                     self.move_service_requested.emit(s, i, -1))
                 act_down = menu.addAction("Order ▼")
                 act_down.triggered.connect(
-                    lambda s=set_id, i=service_id:
+                    lambda _=False, s=set_id, i=service_id:
                     self.move_service_requested.emit(s, i, 1))
                 menu.addSeparator()
                 act_rem = menu.addAction("Service entfernen")
                 act_rem.triggered.connect(
-                    lambda s=set_id, i=service_id:
+                    lambda _=False, s=set_id, i=service_id:
                     self.remove_service_requested.emit(s, i))
                 act_info = menu.addAction("Service-Info anzeigen")
                 act_info.triggered.connect(
-                    lambda s=set_id, i=service_id, p=plugin_id:
+                    lambda _=False, s=set_id, i=service_id, p=plugin_id:
                     self.info_requested.emit(s, i, p))
+                menu.addSeparator()
+                act_purge = menu.addAction("Papierkorb löschen…")
+                act_purge.triggered.connect(
+                    lambda _=False: self.purge_trash_requested.emit())
                 menu.exec(self.viewport().mapToGlobal(pos))
                 return
             # Plugin-Zeile (standalone/plugins) – nur Info aktiv
@@ -521,7 +543,8 @@ class MasterTree(QTreeWidget):
             plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
             act_info = menu.addAction("Service-Info anzeigen")
             act_info.triggered.connect(
-                lambda p=plugin_id: self.info_requested.emit("", "", p))
+                lambda _=False, p=plugin_id:
+                self.info_requested.emit("", "", p))
 
     # -------------------------------------------------------------------------
     # Bugfix 04.08.2026: '>'/'⌄'-Marker statt Branch-Dreiecke + Einfach-Klick

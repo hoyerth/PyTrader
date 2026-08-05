@@ -232,6 +232,9 @@ class ServiceSetRepository:
             "set_id": set_id,
             "display_name": display_name,
             "description": description,
+            # Bugfix 05.08.2026: Explizite Indikator-Zuordnung (Anlage-Dialog)
+            # wird in der Definition persistiert (kein Service noetig).
+            "indicator_id": definition.get("indicator_id"),
             "version": version,
             "schema_version": schema_version,
             "created_at": created_at,

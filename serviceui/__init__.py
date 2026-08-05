@@ -16,8 +16,8 @@ Phase 15.02 (Master-Tree & generischer ServiceSelector):
   * master_tree.py             – 2-Spalten MasterTree (Hierarchie + Badges)
   * toolbar.py                 – ServiceToolbar (Aktions-Buttons)
   * status_panel.py            – StatusPanel (Laufzeit/Fortschritt/Log)
-  * parameter_panel.py         – ParameterPanel (Parameter-Formular)
   * service_selector_widget.py – ServiceSelectorWidget (SELECT_ONLY/FULL_EDIT)
+  * new_set_dialog.py          – NewServiceSetDialog (Set + Indikator)
   * analytics/engine/service_selector_model.py – lesendes Datenmodell
 """
 
@@ -35,8 +35,8 @@ from serviceui.service_win import (
 from serviceui.master_tree import MasterTree
 from serviceui.toolbar import ServiceToolbar
 from serviceui.status_panel import StatusPanel
-from serviceui.parameter_panel import ParameterPanel
 from serviceui.service_selector_widget import ServiceSelectorWidget
+from serviceui.new_set_dialog import NewServiceSetDialog
 
 __all__ = [
     "ServiceWindow",
@@ -50,6 +50,6 @@ __all__ = [
     "MasterTree",
     "ServiceToolbar",
     "StatusPanel",
-    "ParameterPanel",
     "ServiceSelectorWidget",
+    "NewServiceSetDialog",
 ]
