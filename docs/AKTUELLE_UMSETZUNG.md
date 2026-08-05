@@ -270,3 +270,36 @@ Fix: Neue `_apply_set_badge()` – Set-Knoten mit Indikator-Zugehörigkeit zeige
 * `test/check_p15_s2_service_tree.py`: F5–F5s auf Button-Präsenz umgestellt (nur-Icon/Icon-Breite, Tooltip unverändert, Set-Button, Button auf ALLEN Zeilen, gelb bei Indikator-Relation + neutral bei injiziertem Plain-Plugin, Spalte auf `INFO_BUTTON_WIDTH`, `info_requested`-Emission für Service/Set/Plugin); neu H1–H4 (`from_set`/`from_plugin` rendern `header_line`) – **alle PASS** (3× stabil).
 * `test/test.py`: T4/T5 auf Info-Button-Checks umgestellt, T8b (Spaltenbreite) + T12 (`info_requested` Set-Zeile) neu; **Flakiness-Fix T9b/T10**: manuelle `QMouseEvent`-Synthetic-Clicks sind auf dem offscreen-Platform-Fenster timing-flaky (nachgewiesen: `itemAt`/`setExpanded` korrekt, `mousePressEvent` byte-identisch zu HEAD → vorbestehend) → Umstellung auf `QTest.mouseClick` → **5/5 Läufe stabil**.
 * `python -m py_compile` auf allen geänderten Dateien (Exit 0); UI-XML parst fehlerfrei.
+
+### 3.13 Schritt 13 – U15-D2: Toolbar-Refactoring & MasterTree-Kontextmenü (05.08.2026)
+
+**Anforderung (3 Punkte, vom Anwender entschieden – Punkt 3 „grid_lines-Alt-Rumpf-Bereinigung" wurde abgewählt, da `analytics/features/definitions/grid_lines_service.py` der AKTIVE Service ist; obsolet war nur das bereits in Schritt 9/10 archivierte `grid_liquidity.py`):**
+
+**A) Toolbar-Refactoring (`serviceui/toolbar.py`):**
+* Plugins-Button `btn_reload` und Signal `reload_plugins_requested` **entfernt** – der Hot-Reload bleibt über den UI-Button `btn_reload_plugins` (`service_win.ui`) erreichbar.
+* Order-Buttons heißen jetzt `Order ▲` / `Order ▼` (statt `▲`/`▼`) und sind ohne Service-in-Set-Auswahl deaktiviert (`set_order_enabled(bool)`).
+* Bifunktionaler `btn_add`: `[➕ Set]` (neues leeres Set anlegen, `add_set_requested`), `[➕ Service]` (Plugin-Popup, `request_add_popup`), `[➕]` deaktiviert – gesteuert über `set_add_mode("set"/"service"/"none")`.
+* Bifunktionaler `btn_remove`: `[🗑️ Set löschen]` (Papierkorb, P14-05), `[➖ Service entfernen]` (P14-04-Sperrprüfung), `[🗑️]` deaktiviert – gesteuert über `set_remove_mode("set"/"service"/"none")`.
+* `set_actions_enabled()` ist durch die Modus-Methoden ersetzt; neues Signal `add_set_requested = Signal()`.
+
+**B) MasterTree-Kontextmenü (`serviceui/master_tree.py`, strikt entkoppelt):**
+* `CustomContextMenu` + `_show_context_menu(pos)`: dynamisch je Knotentyp, Aktionen emittieren AUSSCHLIESSLICH Signale (kein ServiceWindow-Import in der UI-Klasse, IoC):
+  * Gruppe 📁 (sets) → `create_set_requested` ('Neues Set anlegen').
+  * Set-Knoten → `rename_set_requested(set_id)`, `add_set_service_requested(set_id)`, `delete_set_requested(set_id)`.
+  * Service-Knoten → `move_service_requested(set_id, service_id, delta)` (Order ▲/-1, ▼/+1), `remove_service_requested(set_id, service_id)`, 'Service-Info anzeigen' über das bestehende `info_requested`.
+  * Außerhalb eines Sets (Plugin-Zeilen, ⚡-/📦-Gruppen): Order/Entfernen/Umbenennen ausgegraut (`_add_outside_set_actions`, `setEnabled(False)`); 'Service-Info anzeigen' bleibt bei Plugin-Zeilen aktiv.
+* Neues Signal `group_activated(group)`: wird im `mousePressEvent` bei Klick auf einen (nicht selektierbaren) Gruppen-Knoten emittiert – die Toolbar braucht es, weil Gruppen-Knoten kein `selection_changed` feuern (kein `ItemIsSelectable`-Flag).
+
+**C) `serviceui/service_win.py` (Orchestrator):**
+* `QInputDialog` importiert (für den Namensdialog beim Umbenennen).
+* `_wire_selector_toolbar()` neu verdrahtet: `reload_plugins_requested`-Referenz entfernt; `add_set_requested` + alle 7 Kontextmenü-Signale auf neue Handler gelegt (DRY: Toolbar- und Kontextmenü-Aktionen teilen dieselben Handler).
+* `_on_master_selection` ruft jetzt `_update_toolbar_actions(set_id, service_id)` auf (bifunktionaler Toolbar-Zustand nach jeder Baum-Auswahl).
+* Neue Handler (`_current_tree_selection`, `_update_toolbar_actions`, `_on_group_activated`, `_on_toolbar_remove`, `_on_add_set`, `_on_rename_set`, `_on_add_set_service`, `_on_delete_set`, `_select_service_in_editor`, `_on_move_service`, `_on_remove_service`):
+  * `_on_add_set`/`_on_rename_set` laufen bewusst DIREKT über `set_repo.save_set()` – der `NamedItemAdapter._item_save_as()` verweigert leere `execution_order`, leere Sets wären sonst weder anleg- noch umbenennbar.
+  * `_on_delete_set` lädt das Set in den Editor und ruft das bestehende `delete_set()` auf (P14-04-E-Sperre 'letztes Set' + Papierkorb-Rückfrage greifen dort zentral).
+  * `_on_move_service`/`_on_remove_service` selektieren die Instanz im Editor (`_select_service_in_editor`) und reusen `move_order_item(delta)` bzw. `remove_instance()` (inkl. P14-04-Sperrprüfung).
+
+**Validierung (headless, grün):**
+* `python -m py_compile` auf `serviceui/toolbar.py`, `serviceui/master_tree.py`, `serviceui/service_win.py` (Exit 0).
+* Import-Smoke: `MasterTree`/`ServiceToolbar`/`ServiceWindow` mit allen neuen Signalen & Methoden vorhanden; `btn_reload`/`reload_plugins_requested`/`set_actions_enabled` vollständig entfernt (keine Rest-Referenzen im Produktionscode; `reload_plugins_requested` nur noch als Doku-Kommentar).
+* Projektweite Suche: keine Test-Abhängigkeiten auf das entfernte Toolbar-API.

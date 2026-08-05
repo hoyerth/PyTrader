@@ -42,13 +42,25 @@ Signale:
       Service-Zeile: set_id + service_id + plugin_id
       Set-Zeile:      set_id (service_id/plugin_id leer)
       Plugin-Zeile:   plugin_id (set_id/service_id leer)
+  * Kontextmenue (Bugfix 05.08.2026, strikt entkoppelt – der Orchestrator
+    verknuepft die Aktionen mit seinen Handlern):
+      create_set_requested()                          – 'Neues Set anlegen'
+      rename_set_requested(set_id)                    – 'Set umbenennen'
+      add_set_service_requested(set_id)               – 'Service hinzufuegen'
+      delete_set_requested(set_id)                    – 'Set loeschen (Papierkorb)'
+      move_service_requested(set_id, service_id, delta) – Order ▲ (-1) / ▼ (+1)
+      remove_service_requested(set_id, service_id)    – 'Service entfernen'
+    (Service-Info nutzt das bestehende `info_requested`-Signal.)
+  * group_activated(group) – Klick auf einen (nicht selektierbaren) Gruppen-
+    Knoten (z.B. 'sets' / 'standalone' / 'plugins'); der Orchestrator braucht
+    ihn, um den bifunktionalen Toolbar-Zustand zu aktualisieren.
 """
 
 from typing import Any, Dict, Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QHeaderView, QPushButton, QTreeWidget, QTreeWidgetItem,
+    QHeaderView, QMenu, QPushButton, QTreeWidget, QTreeWidgetItem,
 )
 
 # P15-Bugfix: shiboken6.isValid() schuetzt vor dem Zugriff auf bereits
@@ -138,6 +150,17 @@ class MasterTree(QTreeWidget):
     # Bugfix 05.08.2026: Klick auf den Info-Button (Spalte 1).
     # Argumente (set_id, service_id, plugin_id) – je nach Zeilentyp gefuellt.
     info_requested = Signal(str, str, str)
+    # Bugfix 05.08.2026: Kontextmenue (Rechtsklick) – entkoppelt; der
+    # Orchestrator (ServiceWindow) verknuepft die Aktionen mit seinen Handlern.
+    create_set_requested = Signal()
+    rename_set_requested = Signal(str)          # set_id
+    add_set_service_requested = Signal(str)     # set_id
+    delete_set_requested = Signal(str)          # set_id
+    move_service_requested = Signal(str, str, int)  # set_id, service_id, delta
+    remove_service_requested = Signal(str, str)     # set_id, service_id
+    # Bugfix 05.08.2026: Klick auf einen (nicht selektierbaren) Gruppen-Knoten
+    # (group id: 'sets' / 'standalone' / 'plugins') – fuer den Toolbar-State.
+    group_activated = Signal(str)
 
     def __init__(self, model, parent=None) -> None:
         super().__init__(parent)
@@ -174,6 +197,12 @@ class MasterTree(QTreeWidget):
         # blockSignals, refresht die Top-Level-Labels aber explizit am Ende.
         self.itemExpanded.connect(self._refresh_expand_label)
         self.itemCollapsed.connect(self._refresh_expand_label)
+
+        # Bugfix 05.08.2026: Kontextmenue per Rechtsklick (dynamisch je
+        # Knotentyp, siehe _show_context_menu). Die Aktionen sind entkoppelt
+        # (Signale) – der Orchestrator verknuepft sie mit seinen Handlern.
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
 
         self._populate()
         self.itemSelectionChanged.connect(self._emit_selection)
@@ -395,6 +424,106 @@ class MasterTree(QTreeWidget):
             pass
 
     # -------------------------------------------------------------------------
+    # Kontextmenue (Bugfix 05.08.2026, entkoppelt)
+    # -------------------------------------------------------------------------
+
+    def _show_context_menu(self, pos) -> None:
+        """Baut das Kontextmenue fuer den Rechtsklick dynamisch je Knotentyp.
+
+        Die Aktionen emittieren AUSSCHLIESSLICH Signale – der Orchestrator
+        (ServiceWindow) verknuepft sie mit seinen Handlern (DRY: Toolbar- und
+        Kontextmenue-Aktionen teilen sich dieselben Handler):
+
+          * Gruppe 📁 (sets)      -> 'Neues Set anlegen' (create_set_requested)
+          * Set-Knoten            -> 'Set umbenennen', 'Service hinzufuegen',
+                                     'Set loeschen' (rename/add/delete-requested)
+          * Service-Knoten        -> 'Order ▲/▼', 'Service entfernen',
+                                     'Service-Info anzeigen' (move/remove/
+                                     info_requested)
+          * Ausserhalb eines Sets (Plugin-Zeilen, ⚡-/📦-Gruppen):
+                                     Order/Entfernen/Umbenennen ausgegraut;
+                                     'Service-Info anzeigen' bleibt fuer
+                                     Plugin-Zeilen aktiv.
+
+        isValid-Guards: Bei wildem Klicken koennen Items zwischen itemAt() und
+        Datenzugriff C++-seitig zerstoert sein (Access-Violation-Schutz).
+        """
+        try:
+            item = self.itemAt(pos)
+            if item is None or not isValid(item):
+                return
+            node_type = item.data(0, ROLE_NODE_TYPE)
+            menu = QMenu(self)
+            if node_type == TYPE_GROUP:
+                group = str(item.data(0, ROLE_SET_ID) or "")
+                if group == self.model.GROUP_SETS:
+                    act = menu.addAction("Neues Set anlegen")
+                    act.triggered.connect(
+                        lambda: self.create_set_requested.emit())
+                else:
+                    self._add_outside_set_actions(menu, item)
+                menu.exec(self.viewport().mapToGlobal(pos))
+                return
+            if node_type == TYPE_SET:
+                set_id = str(item.data(0, ROLE_SET_ID) or "")
+                act_rename = menu.addAction("Set umbenennen")
+                act_rename.triggered.connect(
+                    lambda s=set_id: self.rename_set_requested.emit(s))
+                act_add = menu.addAction("Service hinzufügen")
+                act_add.triggered.connect(
+                    lambda s=set_id: self.add_set_service_requested.emit(s))
+                menu.addSeparator()
+                act_del = menu.addAction("Set löschen")
+                act_del.triggered.connect(
+                    lambda s=set_id: self.delete_set_requested.emit(s))
+                menu.exec(self.viewport().mapToGlobal(pos))
+                return
+            if node_type == TYPE_SERVICE:
+                set_id = str(item.data(0, ROLE_SET_ID) or "")
+                service_id = str(item.data(0, ROLE_INSTANCE_ID) or "")
+                plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
+                act_up = menu.addAction("Order ▲")
+                act_up.triggered.connect(
+                    lambda s=set_id, i=service_id:
+                    self.move_service_requested.emit(s, i, -1))
+                act_down = menu.addAction("Order ▼")
+                act_down.triggered.connect(
+                    lambda s=set_id, i=service_id:
+                    self.move_service_requested.emit(s, i, 1))
+                menu.addSeparator()
+                act_rem = menu.addAction("Service entfernen")
+                act_rem.triggered.connect(
+                    lambda s=set_id, i=service_id:
+                    self.remove_service_requested.emit(s, i))
+                act_info = menu.addAction("Service-Info anzeigen")
+                act_info.triggered.connect(
+                    lambda s=set_id, i=service_id, p=plugin_id:
+                    self.info_requested.emit(s, i, p))
+                menu.exec(self.viewport().mapToGlobal(pos))
+                return
+            # Plugin-Zeile (standalone/plugins) – nur Info aktiv
+            self._add_outside_set_actions(menu, item)
+            menu.exec(self.viewport().mapToGlobal(pos))
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _add_outside_set_actions(self, menu: QMenu, item) -> None:
+        """Fuegt die ausgegrauten Struktur-Aktionen fuer Knoten ausserhalb
+        eines Sets hinzu (Plugin-Zeilen sowie ⚡- und 📦-Gruppen). Bei
+        Plugin-Zeilen bleibt 'Service-Info anzeigen' aktiv."""
+        menu.addAction("Order ▲").setEnabled(False)
+        menu.addAction("Order ▼").setEnabled(False)
+        menu.addSeparator()
+        menu.addAction("Service entfernen").setEnabled(False)
+        if item is not None and isValid(item) and \
+                item.data(0, ROLE_NODE_TYPE) == TYPE_PLUGIN:
+            menu.addSeparator()
+            plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
+            act_info = menu.addAction("Service-Info anzeigen")
+            act_info.triggered.connect(
+                lambda p=plugin_id: self.info_requested.emit("", "", p))
+
+    # -------------------------------------------------------------------------
     # Bugfix 04.08.2026: '>'/'⌄'-Marker statt Branch-Dreiecke + Einfach-Klick
     # -------------------------------------------------------------------------
 
@@ -436,6 +565,12 @@ class MasterTree(QTreeWidget):
         (setExpandsOnDoubleClick(False)). Klicks auf Blatt-Knoten verhalten
         sich normal (Selektion). Das Symbol aktualisiert sich automatisch
         ueber itemExpanded/itemCollapsed (_refresh_expand_label).
+
+        Bugfix 05.08.2026: Klick auf einen (nicht selektierbaren) Gruppen-
+        Knoten emittiert zusaetzlich `group_activated(group)` – der
+        Orchestrator braucht das Signal, um den bifunktionalen Toolbar-Zustand
+        zu aktualisieren (Gruppen-Knoten feuern kein selection_changed, weil
+        sie kein ItemIsSelectable-Flag tragen).
         """
         try:
             pos = (event.position().toPoint() if hasattr(event, "position")
@@ -447,6 +582,9 @@ class MasterTree(QTreeWidget):
                 # Auswahl-API (current_set_id/current_service_id) funktioniert.
                 if item.flags() & Qt.ItemIsSelectable:
                     self.setCurrentItem(item)
+                if item.data(0, ROLE_NODE_TYPE) == TYPE_GROUP:
+                    self.group_activated.emit(
+                        str(item.data(0, ROLE_SET_ID) or ""))
                 event.accept()
                 return
         except (RuntimeError, AttributeError):

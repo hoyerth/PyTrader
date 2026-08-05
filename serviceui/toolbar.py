@@ -1,16 +1,25 @@
 # serviceui/toolbar.py
 """
-Service-UI: Aktions-Toolbar (Phase 15 15.02).
+Service-UI: Aktions-Toolbar (Phase 15 15.02, bifunktional 05.08.2026).
 
 Entkoppelte Button-Leiste fuer Struktur-Aktionen des Service-Fensters
 (Modus B / FULL_EDIT des ServiceSelectorWidget):
 
-  * [➕ Service]   – oeffnet ein Popup-Menue mit allen verfuegbaren Plugins
-                     (Auswahl emittiert `add_service_requested(plugin_id)`).
-  * [▲] / [▼]      – Aenderung der execution_order im aktiven Set.
-  * [🗑️ Entfernen] – Entfernen des markierten Services (P14-04-Sperrpruefung
-                     fuehrt der Orchestrator durch).
-  * [🔄 Plugins]   – Hot-Reload der Custom-Plugins (P14-02).
+  * [➕ Set] / [➕ Service] / [➕] – bifunktionaler Hinzufuegen-Button. Der
+    Orchestrator schaltet den Modus ueber `set_add_mode()`:
+      "set"     -> Text '[➕ Set]'     -> emittiert `add_set_requested`
+                   (neues leeres Service-Set anlegen)
+      "service" -> Text '[➕ Service]' -> oeffnet das Plugin-Popup
+                   (`request_add_popup`, emittiert `add_service_requested`)
+      "none"    -> Text '[➕]', deaktiviert
+  * [Order ▲] / [Order ▼] – Aenderung der execution_order im aktiven Set.
+    Nur aktiv, wenn ein Service innerhalb eines Sets gewaehlt ist
+    (`set_order_enabled()`).
+  * [🗑️ Set löschen] / [➖ Service entfernen] / [🗑️] – bifunktionaler
+    Entfernen-Button. Der Orchestrator schaltet den Modus ueber
+    `set_remove_mode()` und emittiert `remove_requested` (der Orchestrator
+    fuehrt die P14-04-Sperrpruefung aus und entscheidet, ob das Set oder der
+    Service entfernt wird).
 
 Die Toolbar emittiert NUR Signale – sie kennt weder das Repository noch die
 Datenbank (Invariante 4: kein SQL in UI; SRP: eine Aufgabe pro Klasse).
@@ -29,31 +38,33 @@ class ServiceToolbar(QWidget):
 
     #: Emittiert mit der plugin_id, wenn im [➕ Service]-Popup ein Plugin gewaehlt wird
     add_service_requested = Signal(str)
+    #: Emittiert im Modus 'set' des bifunktionalen Hinzufuegen-Buttons
+    #: (neues leeres Service-Set anlegen – Orchestrator fuehrt die Aktion aus).
+    add_set_requested = Signal()
     #: Ausfuehrungs-Reihenfolge: um -1 (hoch) bzw. +1 (runter) verschieben
     move_up_requested = Signal()
     move_down_requested = Signal()
-    #: Markierten Service entfernen (Orchestrator fuehrt P14-04-Sperrpruefung aus)
+    #: Markierten Service / das markierte Set entfernen (Orchestrator fuehrt
+    #: die P14-04-Sperrpruefung aus und entscheidet ueber Set vs. Service).
     remove_requested = Signal()
-    #: Plugins neu laden (P14-02 Hot-Reload)
-    reload_plugins_requested = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._menu: Optional[QMenu] = None
+        #: Modus des bifunktionalen Hinzufuegen-Buttons ("set"/"service"/"none")
+        self._add_mode: str = "none"
 
-        self.btn_add = QPushButton("➕ Service")
+        self.btn_add = QPushButton("➕")
         self.btn_add.setToolTip(
-            "Service zum aktiven Set hinzufuegen – waehlt das Plugin aus einem Popup.")
-        self.btn_move_up = QPushButton("▲")
+            "Hinzufuegen – abhaengig von der Auswahl: neues Set oder Service.")
+        self.btn_move_up = QPushButton("Order ▲")
         self.btn_move_up.setToolTip("Service in der Reihenfolge nach oben verschieben.")
-        self.btn_move_down = QPushButton("▼")
+        self.btn_move_down = QPushButton("Order ▼")
         self.btn_move_down.setToolTip("Service in der Reihenfolge nach unten verschieben.")
-        self.btn_remove = QPushButton("🗑️ Entfernen")
+        self.btn_remove = QPushButton("🗑️")
         self.btn_remove.setToolTip(
-            "Markierten Service aus dem Set entfernen (P14-04-Sperrpruefung).")
-        self.btn_reload = QPushButton("🔄 Plugins")
-        self.btn_reload.setToolTip(
-            "P14-02: Custom-Plugins aus data/custom_plugins/ neu laden (Hot-Reload).")
+            "Entfernen – abhaengig von der Auswahl: Set (Papierkorb) oder "
+            "Service (P14-04-Sperrpruefung).")
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -63,13 +74,16 @@ class ServiceToolbar(QWidget):
         lay.addWidget(self.btn_move_down)
         lay.addWidget(self.btn_remove)
         lay.addStretch(1)
-        lay.addWidget(self.btn_reload)
 
         self.btn_add.clicked.connect(self._on_add_clicked)
         self.btn_move_up.clicked.connect(self.move_up_requested)
         self.btn_move_down.clicked.connect(self.move_down_requested)
         self.btn_remove.clicked.connect(self.remove_requested)
-        self.btn_reload.clicked.connect(self.reload_plugins_requested)
+
+        # Bifunktional: ohne Auswahl sind alle Struktur-Buttons deaktiviert
+        self.set_add_mode("none")
+        self.set_remove_mode("none")
+        self.set_order_enabled(False)
 
     # -------------------------------------------------------------------------
     # Popup-Auswahl der Plugins ([➕ Service])
@@ -98,18 +112,80 @@ class ServiceToolbar(QWidget):
             self.add_service_requested.emit(str(chosen.data()))
 
     def _on_add_clicked(self) -> None:
-        """[➕ Service] geklickt – das Popup wird vom Orchestrator befuellt
-        (er kennt das Modell/die Registry). Ohne Plugin-Liste passiert nichts."""
-        if hasattr(self, "request_add_popup") and callable(self.request_add_popup):
-            self.request_add_popup()
+        """[➕]-Button geklickt – der bifunktionale Modus entscheidet:
+
+        * "set"     -> neues leeres Service-Set (add_set_requested)
+        * "service" -> Plugin-Popup (request_add_popup, vom Orchestrator
+                       befuellt; ohne Plugin-Liste passiert nichts)
+        * "none"    -> Button ist deaktiviert (kein Signal)
+        """
+        mode = getattr(self, "_add_mode", "none")
+        if mode == "set":
+            self.add_set_requested.emit()
+        elif mode == "service":
+            if hasattr(self, "request_add_popup") and callable(self.request_add_popup):
+                self.request_add_popup()
 
     # -------------------------------------------------------------------------
-    # Aktions-Zustaende (Orchestrator steuert die Aktivierung)
+    # Bifunktionale Aktions-Zustaende (Orchestrator steuert Modus + Aktivierung)
     # -------------------------------------------------------------------------
 
-    def set_actions_enabled(self, enabled: bool) -> None:
-        """Aktiviert/deaktiviert Struktur-Buttons (z.B. bei laufender Set-
-        Ausfuehrung oder leerem Set)."""
-        for btn in (self.btn_add, self.btn_move_up, self.btn_move_down,
-                    self.btn_remove):
-            btn.setEnabled(enabled)
+    def set_add_mode(self, mode: str) -> None:
+        """Schaltet den bifunktionalen [➕]-Button (Text + Funktion).
+
+        Args:
+            mode: "set"     -> '[➕ Set]'    (neues leeres Set anlegen)
+                  "service" -> '[➕ Service]' (Plugin zum aktiven Set hinzufuegen)
+                  "none"    -> '[➕]' deaktiviert
+        """
+        self._add_mode = mode
+        if mode == "set":
+            self.btn_add.setText("➕ Set")
+            self.btn_add.setEnabled(True)
+            self.btn_add.setToolTip("Neues leeres Service-Set anlegen.")
+        elif mode == "service":
+            self.btn_add.setText("➕ Service")
+            self.btn_add.setEnabled(True)
+            self.btn_add.setToolTip(
+                "Service zum aktiven Set hinzufuegen – waehlt das Plugin aus "
+                "einem Popup.")
+        else:
+            self.btn_add.setText("➕")
+            self.btn_add.setEnabled(False)
+            self.btn_add.setToolTip(
+                "Keine gueltige Auswahl – bitte ein Set oder einen Service "
+                "im Baum markieren.")
+
+    def set_remove_mode(self, mode: str) -> None:
+        """Schaltet den bifunktionalen [🗑️]-Button (Text + Funktion).
+
+        Args:
+            mode: "set"     -> '[🗑️ Set löschen]' (Papierkorb / Soft-Delete)
+                  "service" -> '[➖ Service entfernen]' (P14-04-Sperrpruefung)
+                  "none"    -> '[🗑️]' deaktiviert
+        """
+        if mode == "set":
+            self.btn_remove.setText("🗑️ Set löschen")
+            self.btn_remove.setEnabled(True)
+            self.btn_remove.setToolTip(
+                "Markiertes Service-Set in den Papierkorb verschieben (P14-05).")
+        elif mode == "service":
+            self.btn_remove.setText("➖ Service entfernen")
+            self.btn_remove.setEnabled(True)
+            self.btn_remove.setToolTip(
+                "Markierten Service aus dem Set entfernen (P14-04-Sperrpruefung).")
+        else:
+            self.btn_remove.setText("🗑️")
+            self.btn_remove.setEnabled(False)
+            self.btn_remove.setToolTip(
+                "Keine gueltige Auswahl – bitte ein Set oder einen Service "
+                "im Baum markieren.")
+
+    def set_order_enabled(self, enabled: bool) -> None:
+        """Aktiviert/deaktiviert die [Order ▲]/[Order ▼]-Buttons.
+
+        Nur aktiv, wenn ein Service INNERHALB eines Sets gewaehlt ist
+        (sonst gibt es keine execution_order zu schalten).
+        """
+        self.btn_move_up.setEnabled(enabled)
+        self.btn_move_down.setEnabled(enabled)

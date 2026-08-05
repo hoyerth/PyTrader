@@ -27,9 +27,10 @@ from typing import Any, Dict, Optional
 from PySide6.QtCore import QFile, QIODevice, QTimer, Qt, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QGroupBox, QHBoxLayout, QLabel,
-    QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar,
-    QPushButton, QSpinBox, QSplitter, QTextEdit, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDoubleSpinBox, QGroupBox, QHBoxLayout, QInputDialog,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox,
+    QProgressBar, QPushButton, QSpinBox, QSplitter, QTextEdit, QVBoxLayout,
+    QWidget,
 )
 
 # P15-Bugfix: shiboken6.isValid() schuetzt vor dem Zugriff auf bereits
@@ -365,23 +366,40 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
 
     def _wire_selector_toolbar(self) -> None:
         """Verdrahtet die ServiceSelectorWidget-Toolbar (Modus FULL_EDIT)
-        mit den bestehenden Set-Methoden (add/move/remove/reload)."""
+        mit den bestehenden Set-Methoden (add/move/remove/rename).
+
+        Bugfix 05.08.2026 (U15-D2-Stream): Der Plugins-Button der Toolbar
+        (btn_reload) und sein reload_plugins_requested-Signal sind entfernt
+        (Hot-Reload bleibt ueber den UI-Button btn_reload_plugins erreichbar).
+        Die bifunktionalen Buttons [➕] / [🗑️] und das MasterTree-Kontextmenue
+        teilen sich dieselben Handler (DRY)."""
         selector = getattr(self, "service_selector", None)
         if selector is None or selector.toolbar is None:
             return
         toolbar = selector.toolbar
         toolbar.request_add_popup = self._show_toolbar_add_popup
+        toolbar.add_set_requested.connect(self._on_add_set)
         toolbar.add_service_requested.connect(self._toolbar_add_service)
         toolbar.move_up_requested.connect(lambda: self.move_order_item(-1))
         toolbar.move_down_requested.connect(lambda: self.move_order_item(1))
-        toolbar.remove_requested.connect(self.remove_instance)
-        toolbar.reload_plugins_requested.connect(self.reload_plugins)
-        # MasterTree-Auswahl -> Editor + ParameterPanel synchronisieren
+        toolbar.remove_requested.connect(self._on_toolbar_remove)
+        # MasterTree-Auswahl + Kontextmenue (entkoppelt) -> Editor/Handler
         if selector.master_tree is not None:
-            selector.master_tree.selection_changed.connect(self._on_master_selection)
+            tree = selector.master_tree
+            tree.selection_changed.connect(self._on_master_selection)
             # Bugfix 05.08.2026: Info-Button-Klicks (Spalte 1) -> Beschreibungs-
             # Dialog (Service / Plugin / Set).
-            selector.master_tree.info_requested.connect(self._on_tree_info_requested)
+            tree.info_requested.connect(self._on_tree_info_requested)
+            # Kontextmenue-Aktionen (Rechtsklick im Baum) – entkoppelte
+            # Signale auf dieselben Handler wie die Toolbar (DRY).
+            tree.create_set_requested.connect(self._on_add_set)
+            tree.rename_set_requested.connect(self._on_rename_set)
+            tree.add_set_service_requested.connect(self._on_add_set_service)
+            tree.delete_set_requested.connect(self._on_delete_set)
+            tree.move_service_requested.connect(self._on_move_service)
+            tree.remove_service_requested.connect(self._on_remove_service)
+            # Gruppen-Klick -> Toolbar-State ([➕ Set] bei der 📁-Gruppe)
+            tree.group_activated.connect(self._on_group_activated)
         # ParameterPanel-Aenderungen -> Set-Definition + Spalten (Live-Edit)
         self.param_panel.params_changed.connect(self._on_param_panel_changed)
 
@@ -433,6 +451,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             except (RuntimeError, AttributeError):
                 pass
         self._sync_param_panel()
+        # Bugfix 05.08.2026: bifunktionalen Toolbar-Zustand nach der
+        # MasterTree-Auswahl aktualisieren (set/service/none + Order).
+        self._update_toolbar_actions(set_id, service_id)
 
     def _sync_param_panel(self) -> None:
         """Laedt die Parameter der markierten Service-Instanz ins ParameterPanel."""
@@ -501,6 +522,247 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                 ctrl.setText(str(value))
         except (RuntimeError, AttributeError):
             pass
+
+    # -------------------------------------------------------------------------
+    # Bugfix 05.08.2026: Toolbar-Zustand & Kontextmenue-Handler (U15-D2)
+    # -------------------------------------------------------------------------
+
+    def _current_tree_selection(self) -> tuple:
+        """Liefert (set_id, service_id) der aktuellen MasterTree-Auswahl –
+        Single Source of Truth fuer den bifunktionalen Toolbar-Zustand."""
+        selector = getattr(self, "service_selector", None)
+        if selector is not None and selector.master_tree is not None:
+            try:
+                return (selector.master_tree.current_set_id(),
+                        selector.master_tree.current_service_id())
+            except (RuntimeError, AttributeError):
+                pass
+        return "", ""
+
+    def _update_toolbar_actions(self, set_id: str, service_id: str) -> None:
+        """Setzt die bifunktionalen Toolbar-Zustaende nach der Baum-Auswahl.
+
+        * Service in einem Set markiert -> [➕ Service] + [➖ Service
+          entfernen] + Order ▲/▼ aktiv.
+        * Nur ein Set markiert          -> [➕ Service] + [🗑️ Set löschen]
+          (Order deaktiviert).
+        * Sonst (Gruppen-/Plugin-Klick) -> alle Struktur-Buttons deaktiviert
+          ([➕] none; die 📁-Gruppe aktiviert [➕ Set] – siehe
+          _on_group_activated).
+        """
+        selector = getattr(self, "service_selector", None)
+        if selector is None or selector.toolbar is None:
+            return
+        toolbar = selector.toolbar
+        try:
+            if service_id:
+                toolbar.set_add_mode("service")
+                toolbar.set_remove_mode("service")
+                toolbar.set_order_enabled(True)
+            elif set_id:
+                toolbar.set_add_mode("service")
+                toolbar.set_remove_mode("set")
+                toolbar.set_order_enabled(False)
+            else:
+                toolbar.set_add_mode("none")
+                toolbar.set_remove_mode("none")
+                toolbar.set_order_enabled(False)
+        except (RuntimeError, AttributeError):
+            pass
+
+    @Slot(str)
+    def _on_group_activated(self, group: str) -> None:
+        """Klick auf einen Gruppen-Knoten im MasterTree -> Toolbar-Zustand.
+
+        Die 📁-Gruppe ('sets') aktiviert [➕ Set] (neues leeres Set anlegen);
+        bei den Gruppen ⚡ (standalone) / 📦 (plugins) sind alle Struktur-
+        Buttons deaktiviert (kein Set-Kontext).
+        """
+        selector = getattr(self, "service_selector", None)
+        if selector is None or selector.toolbar is None:
+            return
+        toolbar = selector.toolbar
+        try:
+            model = getattr(selector, "model", None)
+            group_sets = getattr(model, "GROUP_SETS", "sets")
+            if group == group_sets:
+                toolbar.set_add_mode("set")
+                toolbar.set_remove_mode("none")
+                toolbar.set_order_enabled(False)
+            else:
+                toolbar.set_add_mode("none")
+                toolbar.set_remove_mode("none")
+                toolbar.set_order_enabled(False)
+        except (RuntimeError, AttributeError):
+            pass
+
+    @Slot()
+    def _on_toolbar_remove(self) -> None:
+        """[🗑️]-Button: Set (Papierkorb) ODER Service entfernen – je nach
+        aktueller MasterTree-Auswahl (die Toolbar-Aktivierung spiegelt exakt
+        diesen Zustand). Reuse der Kontextmenue-Handler (DRY)."""
+        set_id, service_id = self._current_tree_selection()
+        if service_id:
+            self._on_remove_service(set_id, service_id)
+        elif set_id:
+            self._on_delete_set(set_id)
+
+    @Slot()
+    def _on_add_set(self) -> None:
+        """Erzeugt ein NEUES LEERES Service-Set ([➕ Set] / Kontextmenue
+        'Neues Set anlegen').
+
+        Bewusst DIREKT ueber set_repo.save_set(): der NamedItemAdapter
+        (_item_save_as) verweigert leere execution_order, daher ist der
+        Umweg ueber save_named_item() fuer leere Sets nicht moeglich. Der
+        Name bleibt leer -> das Repository erzeugt den Default-Namen
+        ('Unbenanntes Set'); Umbenennen ueber das Kontextmenue.
+        """
+        definition = {
+            "set_id": "",
+            "display_name": "",
+            "description": "",
+            "execution_order": [],
+            "services": {},
+        }
+        try:
+            set_id = self.set_repo.save_set(definition)
+        except Exception as e:
+            self.log(f"FEHLER beim Anlegen des Sets: {e}")
+            return
+        if not set_id:
+            self.log("Set-Anlage fehlgeschlagen.")
+            return
+        self.log(f"Neues leeres Service-Set angelegt: {set_id}")
+        event_bus.service_set_changed.emit()
+        self.refresh_set_list()
+        if self.combo_set is not None:
+            idx = self.combo_set.findData(set_id)
+            if idx >= 0:
+                self.combo_set.setCurrentIndex(idx)
+
+    @Slot(str)
+    def _on_rename_set(self, set_id: str) -> None:
+        """Benennt ein Service-Set um (Kontextmenue 'Set umbenennen').
+
+        Direkt ueber set_repo: Namensdialog (vorbelegt), Kollisionspruefung
+        gegen die UEBRIGEN Sets, dann save_set() mit gleicher set_id und
+        neuem display_name. Bewusst NICHT ueber den NamedItemAdapter –
+        dessen _item_save_as() verweigert leere execution_order (leere Sets
+        waeren sonst nicht umbenennbar).
+        """
+        if not set_id:
+            return
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            self.log(f"FEHLER beim Laden des Sets: {e}")
+            return
+        if not definition:
+            self.log(f"Set '{set_id}' nicht gefunden – Umbenennen abgebrochen.")
+            return
+        current_name = str(definition.get("display_name") or "")
+        name, ok = QInputDialog.getText(
+            self, "Set umbenennen",
+            f"Neuer Name für das Service-Set '{current_name}':",
+            text=current_name,
+        )
+        if not ok:
+            return
+        clean = name.strip()
+        if not clean:
+            QMessageBox.warning(self, "Fehler", "Der Name darf nicht leer sein.")
+            return
+        collision = any(
+            (s.get("display_name") or "") == clean and s.get("set_id") != set_id
+            for s in self.set_repo.list_sets())
+        if collision:
+            QMessageBox.warning(
+                self, "Name vergeben",
+                f"Ein anderes Service-Set heißt bereits '{clean}'.")
+            return
+        definition["display_name"] = clean
+        try:
+            self.set_repo.save_set(definition)
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern des Sets: {e}")
+            return
+        self.log(f"Set umbenannt: '{current_name}' -> '{clean}'")
+        event_bus.service_set_changed.emit()
+        self.refresh_set_list()
+        if self.combo_set is not None:
+            idx = self.combo_set.findData(set_id)
+            if idx >= 0:
+                self.combo_set.setCurrentIndex(idx)
+
+    @Slot(str)
+    def _on_add_set_service(self, set_id: str) -> None:
+        """'Service hinzufuegen' (Kontextmenue): Set in den Editor laden und
+        das [➕ Service]-Plugin-Popup oeffnen (Reuse: _show_toolbar_add_popup
+        + _toolbar_add_service + add_instance)."""
+        if not set_id:
+            return
+        if self.combo_set is not None:
+            idx = self.combo_set.findData(set_id)
+            if idx >= 0:
+                self.combo_set.setCurrentIndex(idx)
+        self._show_toolbar_add_popup()
+
+    @Slot(str)
+    def _on_delete_set(self, set_id: str) -> None:
+        """'Set loeschen' (Kontextmenue / [🗑️ Set löschen]): Set in den
+        Editor laden und delete_set() aufrufen – die P14-04-E-Sperre
+        ('letztes Set') und die Rueckfrage (Papierkorb, P14-05) greifen
+        dort zentral."""
+        if not set_id:
+            return
+        if self.combo_set is not None:
+            idx = self.combo_set.findData(set_id)
+            if idx >= 0:
+                self.combo_set.setCurrentIndex(idx)
+        self.delete_set()
+
+    def _select_service_in_editor(self, set_id: str, service_id: str) -> None:
+        """Laedt das Set in den Editor und markiert die Service-Instanz in
+        der execution_order-Liste (gemeinsame Vorbereitung fuer Order-/
+        Entfernen-Aktionen aus Toolbar & Kontextmenue)."""
+        if self.combo_set is not None:
+            idx = self.combo_set.findData(set_id)
+            if idx >= 0:
+                self.combo_set.setCurrentIndex(idx)
+        if service_id and self.list_execution_order is not None:
+            try:
+                if not _qt_valid(self.list_execution_order):
+                    return
+                for i in range(self.list_execution_order.count()):
+                    item = self.list_execution_order.item(i)
+                    if item is None or not _qt_valid(item):
+                        continue
+                    if item.data(Qt.UserRole) == service_id:
+                        self.list_execution_order.setCurrentRow(i)
+                        self._current_list_iid = service_id
+                        break
+            except (RuntimeError, AttributeError):
+                pass
+
+    @Slot(str, str, int)
+    def _on_move_service(self, set_id: str, service_id: str, delta: int) -> None:
+        """Order ▲/▼ (Kontextmenue): Service in der execution_order des Sets
+        verschieben – Reuse von move_order_item(delta)."""
+        if not set_id or not service_id:
+            return
+        self._select_service_in_editor(set_id, service_id)
+        self.move_order_item(delta)
+
+    @Slot(str, str)
+    def _on_remove_service(self, set_id: str, service_id: str) -> None:
+        """'Service entfernen' (Kontextmenue / [➖ Service entfernen]): Reuse
+        von remove_instance() – inkl. P14-04-Sperrpruefung (gesperrte
+        Services werden mit Hinweis abgelehnt)."""
+        if not set_id or not service_id:
+            return
+        self._select_service_in_editor(set_id, service_id)
+        self.remove_instance()
 
     # --- Phase 15 15.01: Symbol- & Favoriten-Verwaltung ---
 
