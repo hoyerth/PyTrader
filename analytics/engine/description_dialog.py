@@ -49,6 +49,7 @@ class ServiceDescriptionDialog(QDialog):
         description_long: str = "",
         condition_rules: Optional[List[str]] = None,
         instance_description: str = "",
+        header_line: str = "",
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Service-Informationen")
@@ -70,6 +71,7 @@ class ServiceDescriptionDialog(QDialog):
             description_long=description_long,
             condition_rules=condition_rules,
             instance_description=instance_description,
+            header_line=header_line,
         ))
         layout.addWidget(browser)
 
@@ -90,9 +92,16 @@ class ServiceDescriptionDialog(QDialog):
         instance_id: str = "",
         config: Optional[Dict[str, Any]] = None,
         parent=None,
+        *,
+        header_line: str = "",
     ) -> "ServiceDescriptionDialog":
         """Baut den Dialog aus einem PluginFeature und einer optionalen
-        ServiceInstanceConfig (description der Instanz)."""
+        ServiceInstanceConfig (description der Instanz).
+
+        Args:
+            header_line: Optionale ERSTE Zeile (z.B. 'aktiv/im <Indikator>'
+                         aus dem Info-Button-Tooltip) – Bugfix 05.08.2026.
+        """
         meta = dict(getattr(plugin, "metadata", None) or {})
         cfg = dict(config or {})
         return cls(
@@ -107,6 +116,58 @@ class ServiceDescriptionDialog(QDialog):
             description_long=str(meta.get("description_long", "") or ""),
             condition_rules=list(meta.get("condition_rules") or []),
             instance_description=str(cfg.get("description", "") or ""),
+            header_line=header_line,
+        )
+
+    @classmethod
+    def from_set(
+        cls,
+        definition: Optional[Dict[str, Any]],
+        parent=None,
+        *,
+        header_line: str = "",
+    ) -> "ServiceDescriptionDialog":
+        """Baut den Dialog aus einer Service-Set-Definition (Set-Info).
+
+        Zeigt Set-Name (display_name), Set-Beschreibung (description) und die
+        Service-Liste (instance_id [plugin_id] in execution_order-Reihenfolge).
+
+        Args:
+            definition:  Set-Definition aus dem ServiceSetRepository (set_id,
+                         display_name, description, execution_order, services).
+            parent:      Qt-Parent (optional).
+            header_line: Optionale ERSTE Zeile (z.B. 'im GridLiquidityIndicator'
+                         aus dem Info-Button-Tooltip) – wird als fette Zeile
+                         gefolgt von einer Leerzeile vor dem Beschreibungstext
+                         gerendert (Bugfix 05.08.2026, Info-Button MasterTree).
+        """
+        d = dict(definition or {})
+        set_id = str(d.get("set_id") or "")
+        display_name = str(d.get("display_name") or set_id or "Unbenannt")
+        description = str(d.get("description") or "")
+        services = d.get("services") or {}
+        order = d.get("execution_order") or []
+        svc_lines = [
+            f"{iid} [{str((services.get(iid) or {}).get('plugin_id') or iid)}]"
+            for iid in order
+        ]
+        if svc_lines:
+            details = "<br>".join(svc_lines)
+        else:
+            details = ""
+        return cls(
+            parent=parent,
+            instance_id=None,
+            display_name=display_name,
+            plugin_id=set_id or "",
+            version="",
+            api_version="",
+            author="",
+            description=description,
+            description_long=details,
+            condition_rules=[],
+            instance_description="",
+            header_line=header_line,
         )
 
     # -------------------------------------------------------------------------
@@ -135,10 +196,17 @@ class ServiceDescriptionDialog(QDialog):
         description_long: str,
         condition_rules: Optional[List[str]],
         instance_description: str,
+        header_line: str = "",
     ) -> str:
         """Erzeugt das Read-Only-HTML des Dialogs (sauber strukturiert)."""
         e = self._html_escape
         parts: List[str] = []
+
+        # Bugfix 05.08.2026: optionale ERSTE Zeile (Info-Button-Tooltip,
+        # z.B. 'aktiv/im <Indikator>') + Leerzeile vor dem eigentlichen Text.
+        if header_line and str(header_line).strip():
+            parts.append(f"<p style='margin-bottom:0;'><b>{e(header_line)}</b></p>")
+            parts.append("<p>&nbsp;</p>")
 
         # Kopf: Instanz (falls vorhanden) + Plugin-Name + Version
         head = ""

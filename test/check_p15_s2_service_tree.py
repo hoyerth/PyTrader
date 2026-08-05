@@ -31,8 +31,13 @@ E) ServiceSelectorWidget (Modus SELECT_ONLY):
 
 F) ServiceSelectorWidget (Modus FULL_EDIT / MasterTree):
    - master_tree + toolbar vorhanden; 3 Top-Level-Gruppen (📁/⚡/📦).
-   - Service-Knoten tragen das Status-Badge in Spalte 1.
+   - Service-/Set-/Plugin-Zeilen tragen den Info-Button (QPushButton "ℹ",
+     Icon-Breite) in Spalte 1; Tooltip + gelbe Faerbung bei Indikator-
+     Zugehoerigkeit; info_requested-Signal bei Klick.
    - current_selection()/current_set_id() liefern die markierte Auswahl.
+
+H) Info-Dialog: ServiceDescriptionDialog.from_set()/from_plugin() rendern
+   die header_line (erste Zeile) + Beschreibungstext (headless pruefbar).
 
 G) Set-Updates & Umsortieren:
    - execution_order-Aenderung erscheint nach refresh() in der Hierarchie.
@@ -53,6 +58,8 @@ if os.path.exists(TEST_DB):
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 from PySide6.QtWidgets import QHeaderView  # noqa: E402
+from PySide6.QtWidgets import QPushButton  # noqa: E402
+from PySide6.QtWidgets import QTextBrowser  # noqa: E402
 
 _app = QApplication.instance() or QApplication(sys.argv)
 
@@ -61,7 +68,11 @@ from state_manager import StateManager  # noqa: E402
 from analytics.features.feature_builder import PluginRegistry  # noqa: E402
 from analytics.engine.service_selector_model import ServiceSelectorModel  # noqa: E402
 from serviceui.service_selector_widget import ServiceSelectorWidget  # noqa: E402
-from serviceui.master_tree import BADGE_TRUNCATE_ICON  # noqa: E402
+from serviceui.master_tree import (  # noqa: E402
+    BADGE_COLUMN_WIDTH, BADGE_TRUNCATE_ICON, INFO_BUTTON_TEXT,
+    INFO_BUTTON_WIDTH, INFO_BUTTON_SIZE,
+    INFO_BUTTON_COLOR_INDICATOR, INFO_BUTTON_COLOR_NEUTRAL, ROLE_PLUGIN_ID,
+)
 from config.event_bus import event_bus  # noqa: E402
 
 FAILURES: list = []
@@ -179,6 +190,30 @@ for pid in ("grid_lines", "proximity"):
           "in GridLiquidityIndicator" in b and "Grid Lines" not in b
           and "Proximity" not in b, b)
 
+# Bugfix 05.08.2026: Aktiv-Pruefung ueber die indicator_id des ZUGEHOERIGEN
+# Indikators. Realer App-Zustand: indicators_state-Key ist die indicator_id
+# ('grid_liquidity'), NICHT die Plugin-ID ('grid_lines'/'proximity'). Davor
+# griff die Tooltip-Variante a) ('aktiv <Indikator>') fuer Services nie.
+state_mgr.save_window_geometry("win_2", 0, 0, 800, 600, False)
+state_mgr.save_instance_state(
+    "win_2", "SILVER", "H1",
+    indicators_state={"grid_liquidity": {"active": True}},
+)
+model.refresh()
+check("C5) grid_lines aktiv via Indikator-ID (grid_liquidity)",
+      model.is_active_in_chart("grid_lines"))
+check("C6) proximity aktiv via Indikator-ID (grid_liquidity)",
+      model.is_active_in_chart("proximity"))
+check("C7) belongs_to_indicator fuer grid_lines/proximity",
+      model.belongs_to_indicator("grid_lines")
+      and model.belongs_to_indicator("proximity"))
+set_def = model.get_sets()[0]
+check("C8) Set-Indikator-Namen = [GridLiquidityIndicator]",
+      model.get_set_indicator_names(set_def) == ["GridLiquidityIndicator"],
+      str(model.get_set_indicator_names(set_def)))
+check("C9) Set aktiv (zugehoeriger Indikator aktiv)",
+      model.is_set_active(set_def))
+
 # ---------------------------------------------------------------------------
 # D) EventBus-Reaktivitaet
 # ---------------------------------------------------------------------------
@@ -217,6 +252,18 @@ check("E5) current_set_id/current_service_id",
 # ---------------------------------------------------------------------------
 # F) ServiceSelectorWidget – Modus FULL_EDIT (MasterTree)
 # ---------------------------------------------------------------------------
+# Test-Plugin OHNE Indikator-Zugehoerigkeit injizieren – damit gibt es eine
+# Zeile mit neutralem (nicht gelbem) Info-Button und leerem Tooltip.
+class _PlainPlugin:
+    plugin_id = "_test_plain"
+    version = "1.0.0"
+    capabilities: dict = {}
+    metadata = {"display_name": "Plain", "description": "Plain-Test-Plugin"}
+
+
+registry.plugins["_test_plain"] = _PlainPlugin()
+model.refresh()
+
 full = ServiceSelectorWidget(mode=ServiceSelectorWidget.MODE_FULL_EDIT,
                              model=model)
 check("F1) MasterTree vorhanden", full.master_tree is not None)
@@ -230,17 +277,109 @@ check("F4) Set-Gruppe hat Set-Knoten mit Services",
       set_group.childCount() == 1 and set_group.child(0).childCount() == 2,
       f"sets={set_group.childCount()} svcs={set_group.child(0).childCount()}")
 
-# Service-Knoten: Badge in Spalte 1 – sehr lange Badges werden auf das
-# ASCII-Info-Zeichen 'i' gekuerzt; der Indikator-Name steht im Tooltip.
+# Bugfix 05.08.2026 (Info-Button statt Text-Badge): JEDE Service-/Set-/
+# Plugin-Zeile traegt in Spalte 1 einen echten Info-Button (QPushButton "ℹ",
+# Icon-Breite) statt des Badge-Textes / gekuerzten 'i'-Zeichens.
+def _info_button(tree, item):
+    """Liefert den Item-Widget-Button von Spalte 1 (oder None)."""
+    if tree is None or item is None:
+        return None
+    return tree.itemWidget(item, 1)
+
+
 svc_item = set_group.child(0).child(0)
-badge_text = svc_item.text(1)
-check("F5) Lange Badges -> 'i' (ASCII-Info) in Spalte 1",
-      badge_text == BADGE_TRUNCATE_ICON and BADGE_TRUNCATE_ICON == "i",
-      f"text={badge_text!r}")
+btn_svc = _info_button(mt, svc_item)
+check("F5) Info-Button in Spalte 1 (statt Text-Badge)",
+      isinstance(btn_svc, QPushButton) and svc_item.text(1) == "",
+      f"btn={type(btn_svc).__name__} text={svc_item.text(1)!r}")
+check("F5a) Button nur Icon (ℹ) + Icon-Breite",
+      isinstance(btn_svc, QPushButton)
+      and btn_svc.text() == INFO_BUTTON_TEXT
+      and btn_svc.width() <= INFO_BUTTON_SIZE + 4,
+      f"text={btn_svc.text()!r} w={btn_svc.width()}")
 check("F5b) Tooltip der Status-Spalte: 'aktiv/im <Indikator>'",
-      svc_item.toolTip(1) in ("aktiv GridLiquidityIndicator",
-                              "im GridLiquidityIndicator"),
-      svc_item.toolTip(1))
+      isinstance(btn_svc, QPushButton)
+      and btn_svc.toolTip() in ("aktiv GridLiquidityIndicator",
+                                "im GridLiquidityIndicator")
+      and svc_item.toolTip(1) == btn_svc.toolTip(),
+      (btn_svc.toolTip() if isinstance(btn_svc, QPushButton) else "kein Button"))
+
+# Bugfix 05.08.2026 (Punkt 2): Auch Service-Sets, die einem Indikator
+# gehoeren, tragen den Info-Button in Spalte 1 mit derselben Tooltip-
+# Namenslogik wie die Services ('aktiv/im <Indikator>').
+set_item = set_group.child(0)
+btn_set = _info_button(mt, set_item)
+check("F5k) Set-Knoten (Indikator-Zugehoerigkeit) traegt Info-Button",
+      isinstance(btn_set, QPushButton) and set_item.text(1) == "",
+      f"btn={type(btn_set).__name__} text={set_item.text(1)!r}")
+check("F5l) Set-Button-Tooltip folgt Namenslogik 'aktiv/im <Indikator>'",
+      isinstance(btn_set, QPushButton)
+      and btn_set.toolTip() in ("aktiv GridLiquidityIndicator",
+                                "im GridLiquidityIndicator"),
+      (btn_set.toolTip() if isinstance(btn_set, QPushButton) else "kein Button"))
+
+# Bugfix 05.08.2026 (Punkt 1-4): Button auf ALLEN Zeilen, nur Icon-Breite,
+# Spalte 1 ganz rechts verkleinert, gelbe Faerbung bei Indikator-Relation.
+def _collect_rows(tree):
+    rows = []
+    for g in range(tree.topLevelItemCount()):
+        grp = tree.topLevelItem(g)
+        if grp is None:
+            continue
+        for i in range(grp.childCount()):
+            child = grp.child(i)
+            if child is None:
+                continue
+            rows.append(child)  # Set- oder Plugin-Zeile
+            for j in range(child.childCount()):
+                s = child.child(j)
+                if s is not None:
+                    rows.append(s)  # Service-Zeile
+    return rows
+
+
+_all_btns = [(r, mt.itemWidget(r, 1)) for r in _collect_rows(mt)]
+check("F5m) JEDE Service-/Set-/Plugin-Zeile hat einen Info-Button",
+      all(isinstance(b, QPushButton) for _, b in _all_btns),
+      str([(r.text(0), type(b).__name__ if b else None)
+           for r, b in _all_btns[:6]]))
+check("F5n) Indikator-Zeile: gelber Button (#FFD700)",
+      isinstance(btn_svc, QPushButton)
+      and INFO_BUTTON_COLOR_INDICATOR in btn_svc.styleSheet(),
+      btn_svc.styleSheet() if isinstance(btn_svc, QPushButton) else "")
+
+neutral = next((b for _, b in _all_btns
+                if isinstance(b, QPushButton) and not b.toolTip()), None)
+check("F5o) Zeile ohne Indikator-Relation: neutraler Button (kein Tooltip)",
+      neutral is not None
+      and INFO_BUTTON_COLOR_NEUTRAL in neutral.styleSheet(),
+      neutral.styleSheet() if neutral is not None else "keine neutrale Zeile")
+check("F5p) Status-Spalte auf Button-Breite verkleinert (INFO_BUTTON_WIDTH)",
+      mt.header().sectionSize(1) == INFO_BUTTON_WIDTH
+      and INFO_BUTTON_WIDTH < BADGE_COLUMN_WIDTH,
+      f"w={mt.header().sectionSize(1)} (width={INFO_BUTTON_WIDTH})")
+
+# Bugfix 05.08.2026 (Punkt 4): Klick auf den Button emittiert info_requested
+# mit den zeilenspezifischen Daten (Service/Set/Plugin).
+info_signals = []
+mt.info_requested.connect(lambda s, svc, p: info_signals.append((s, svc, p)))
+btn_svc.click()
+check("F5q) info_requested emittiert (Service-Zeile)",
+      info_signals and info_signals[-1] == (set_id, "grid_1", "grid_lines"),
+      str(info_signals))
+info_signals.clear()
+btn_set.click()
+check("F5r) info_requested emittiert (Set-Zeile)",
+      info_signals and info_signals[-1] == (set_id, "", ""), str(info_signals))
+info_signals.clear()
+plugin_row = mt.topLevelItem(2).child(0)
+btn_pl = mt.itemWidget(plugin_row, 1)
+if isinstance(btn_pl, QPushButton):
+    btn_pl.click()
+check("F5s) info_requested emittiert (Plugin-Zeile)",
+      info_signals and info_signals[-1]
+      == ("", "", plugin_row.data(0, ROLE_PLUGIN_ID)),
+      str(info_signals))
 
 # Auf-/Zuklapp-Marker (Bugfix 04.08.2026): eingeklappt '>' / ausgeklappt '⌄'.
 # Gruppen sind initial expandiert -> '⌄'; Sets sind zugeklappt -> '>'.
@@ -288,6 +427,39 @@ sel2 = mt.current_selection()
 check("F7) current_selection() liefert Set+Service",
       sel2["set_id"] == set_id and sel2["service_id"] == "grid_1",
       str(sel2))
+
+# ---------------------------------------------------------------------------
+# H) Info-Button -> Beschreibungs-Dialog (header_line / from_set / from_plugin)
+# ---------------------------------------------------------------------------
+from analytics.engine.description_dialog import ServiceDescriptionDialog  # noqa: E402
+
+
+def _dialog_html(dlg):
+    """HTML-Inhalt des Dialog-Browsers (headless pruefbar)."""
+    browser = dlg.findChild(QTextBrowser)
+    return browser.toHtml() if browser is not None else ""
+
+
+# Set-Dialog: erste Zeile = Tooltip-Text, dann Leerzeile, dann Beschreibung.
+dlg_set = ServiceDescriptionDialog.from_set(
+    model.get_sets()[0], header_line="im GridLiquidityIndicator")
+html_set = _dialog_html(dlg_set)
+check("H1) from_set rendert header_line als erste Zeile",
+      "im GridLiquidityIndicator" in html_set, "")
+check("H2) from_set zeigt Set-Name + Services",
+      "Grid-Basis" in html_set and "grid_1 [grid_lines]" in html_set
+      and "prox_1 [proximity]" in html_set, "")
+
+# Plugin/Service-Dialog: header_line via from_plugin (Instanz + Config).
+dlg_svc = ServiceDescriptionDialog.from_plugin(
+    model.get_plugin("grid_lines"), instance_id="grid_1",
+    config=model.find_service(set_id, "grid_1"),
+    header_line="aktiv GridLiquidityIndicator")
+html_svc = _dialog_html(dlg_svc)
+check("H3) from_plugin rendert header_line",
+      "aktiv GridLiquidityIndicator" in html_svc, "")
+check("H4) from_plugin zeigt Instanz + Plugin",
+      "grid_1" in html_svc and "Grid Lines" in html_svc, "")
 
 # ---------------------------------------------------------------------------
 # G) Set-Updates & Umsortieren

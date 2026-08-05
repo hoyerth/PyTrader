@@ -156,6 +156,38 @@ class ServiceSelectorModel(QObject):
         except Exception:
             return False
 
+    def get_indicator_id(self, plugin_id: str) -> str:
+        """Indikator-ID, in der das Plugin laeuft (metadata['indicator_id']).
+
+        Services (grid_lines/proximity) laufen IN einem Indikator
+        (GridLiquidityIndicator -> 'grid_liquidity'); aktiv im Chart sind
+        die indicators_state-Keys des Indikators, nicht die Plugin-ID.
+        Ohne Angabe faellt die Methode auf die plugin_id selbst zurueck.
+        """
+        plugin = self.get_plugin(plugin_id)
+        if plugin is None:
+            return plugin_id
+        try:
+            meta = plugin.metadata or {}
+            return str(meta.get("indicator_id") or plugin_id)
+        except Exception:
+            return plugin_id
+
+    def belongs_to_indicator(self, plugin_id: str) -> bool:
+        """True, wenn das Plugin explizit einem Indikator zugeordnet ist.
+
+        Signal: metadata['indicator_id'] ODER metadata['indicator_name'] sind
+        gesetzt (z.B. GridLiquidityIndicator fuer grid_lines/proximity).
+        """
+        plugin = self.get_plugin(plugin_id)
+        if plugin is None:
+            return False
+        try:
+            meta = plugin.metadata or {}
+            return bool(meta.get("indicator_id") or meta.get("indicator_name"))
+        except Exception:
+            return False
+
     def get_indicator_display_name(self, plugin_id: str) -> str:
         """Anzeige-Name des Indikators zu einer Plugin-ID.
 
@@ -174,9 +206,53 @@ class ServiceSelectorModel(QObject):
             return plugin_id
 
     def is_active_in_chart(self, plugin_id: str) -> bool:
-        """True, wenn das Plugin in mind. einem Chart-Fenster aktiv ist."""
+        """True, wenn das Plugin in mind. einem Chart-Fenster aktiv ist.
+
+        Bugfix 05.08.2026: Beruecksichtigt zusaetzlich den ZUGEHOERIGEN
+        Indikator (metadata['indicator_id']). Services laufen IN einem
+        Indikator – aktiv im Chart sind die indicators_state-Keys des
+        Indikators ('grid_liquidity'), nicht die Plugin-ID selbst. Dadurch
+        greift die Tooltip-Variante a) ('aktiv <Indikator>') auch fuer
+        Services wie grid_lines/proximity.
+        """
         key = str(plugin_id).lower()
-        return any(pid.lower() == key for pid in self._active_indicator_ids)
+        if any(pid.lower() == key for pid in self._active_indicator_ids):
+            return True
+        ind_id = self.get_indicator_id(plugin_id)
+        if ind_id and ind_id.lower() != key:
+            return any(pid.lower() == ind_id.lower()
+                       for pid in self._active_indicator_ids)
+        return False
+
+    def get_set_indicator_names(self, definition: Dict[str, Any]) -> List[str]:
+        """Distinkte Indikator-Namen aller Services eines Service-Sets
+        (in execution_order-Reihenfolge, nur Services mit Indikator-
+        Zugehoerigkeit). Leer, wenn das Set keinem Indikator gehoert.
+        """
+        names: List[str] = []
+        services = definition.get("services") or {}
+        order = definition.get("execution_order") or list(services.keys())
+        for iid in order:
+            cfg = services.get(iid) or {}
+            if not isinstance(cfg, dict):
+                continue
+            pid = str(cfg.get("plugin_id") or iid)
+            if not self.belongs_to_indicator(pid):
+                continue
+            nm = self.get_indicator_display_name(pid)
+            if nm and nm not in names:
+                names.append(nm)
+        return names
+
+    def is_set_active(self, definition: Dict[str, Any]) -> bool:
+        """True, wenn mindestens ein Service des Sets aktuell aktiv in einem
+        Chart verwendet wird (der zugehoerige Indikator ist aktiv)."""
+        services = definition.get("services") or {}
+        for cfg in services.values():
+            if isinstance(cfg, dict) and cfg.get("plugin_id"):
+                if self.is_active_in_chart(str(cfg["plugin_id"])):
+                    return True
+        return False
 
     def badge_for(self, plugin_id: str) -> str:
         """Kompaktes Status-Badge (Spalte 1 des MasterTree).

@@ -125,6 +125,11 @@ class GridLinesService(PluginFeature):
             # Bugfix (04.08.2026): Zugehoeriger Indikator-Name fuer die Status-
             # Badges im MasterTree (der Service laeuft IN GridLiquidityIndicator).
             "indicator_name": "GridLiquidityIndicator",
+            # Bugfix (05.08.2026): indicator_id = indicators_state-Key des
+            # zugehoerigen Indikators. ServiceSelectorModel.is_active_in_chart()
+            # prueft damit die Aktiv-Frage auf Indikator-Ebene (Tooltip
+            # 'aktiv <Indikator>' statt nur 'im <Indikator>').
+            "indicator_id": "grid_liquidity",
             "description": "Baut das Grid-Raster in Parität zum Alt-Grid (Center ± steps_around × step_size + Custom-Levels)",
             "author": "PyTrader AI",
             "tags": ["grid", "lines", "raster"],

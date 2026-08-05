@@ -17,12 +17,17 @@ Hierarchische Darstellung der Service-Landschaft:
               deaktiviert). Die Top-Level-Knoten beginnen ganz links an der
               Linie der umschliessenden Box (kein Icon/Spacer auf Ebene 0).
   * Spalte 1: Schmale Status-Spalte ganz RECHTS (Fixed-Spalte, fest am
-              rechten Rand verankert) – kompakte Badges
-              (`📌 im <Indikator> | 🟢 aktiv in <Indikator>` /
-              `⚪ inaktiv in <Indikator>`); sehr lange Badges werden auf das
-              ASCII-Info-Zeichen 'i' gekuerzt (Bugfix 04.08.2026 – Unicode
-              '🛈' U+1F5D8 rendert in den Qt-Fonts nicht zuverlaessig).
-              Der Tooltip der Spalte zeigt den Indikator-Namen.
+              rechten Rand verankert) – pro Zeile ein echter Info-Button
+              (QPushButton "ℹ", Icon-Breite ~20 px). Badge-TEXTE werden
+              NICHT mehr angezeigt (Bugfix 05.08.2026: der Button ersetzt
+              die frueheren Text-Badges bzw. das gekuerzte ASCII-'i').
+              Der Button-Tooltip zeigt den Indikator-Namen ('aktiv
+              <Indikator>' wenn der Indikator im Chart aktiv ist, sonst
+              'im <Indikator>' – Bugfix 05.08.2026: Aktiv-Pruefung ueber
+              die indicator_id des zugehoerigen Indikators). Gehoert eine
+              Zeile (Service/Plugin/Set) einem Indikator, ist der Button
+              gelb (#FFD700) eingefaerbt, sonst neutral. Klick oeffnet den
+              Beschreibungs-Dialog (Signal `info_requested`).
 
 Der Baum wird ausschliesslich aus dem `ServiceSelectorModel` befuellt
 (lesendes Datenmodell, Invariante 4: kein SQL in UI) und aktualisiert sich
@@ -32,13 +37,18 @@ den MasterTree im Modus `FULL_EDIT` (MasterTree + ServiceToolbar).
 Signale:
   * selection_changed(set_id, service_id) – bei jeder Baum-Selektion
     (set_id/service_id koennen leer sein, wenn nichts Konkretes gewaehlt ist).
+  * info_requested(set_id, service_id, plugin_id) – Klick auf den Info-Button
+    (Spalte 1). Je nach Zeilentyp sind nur die passenden Felder gefuellt:
+      Service-Zeile: set_id + service_id + plugin_id
+      Set-Zeile:      set_id (service_id/plugin_id leer)
+      Plugin-Zeile:   plugin_id (set_id/service_id leer)
 """
 
 from typing import Any, Dict, Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QHeaderView, QTreeWidget, QTreeWidgetItem,
+    QHeaderView, QPushButton, QTreeWidget, QTreeWidgetItem,
 )
 
 # P15-Bugfix: shiboken6.isValid() schuetzt vor dem Zugriff auf bereits
@@ -69,11 +79,26 @@ TYPE_PLUGIN = "plugin"
 MAX_BADGE_CELL_CHARS = 24
 # Bugfix 04.08.2026 (Punkt 5): ASCII 'i' statt Unicode '🛈' (U+1F5D8) – das
 # Emoji rendert in den Qt-Fonts unter Windows nicht zuverlaessig (tofu-Box).
+# WICHTIG (05.08.2026): Der Text-'i' ist durch den echten Info-Button ersetzt;
+# die Konstante bleibt nur als Test-Referenz erhalten (Historik).
 BADGE_TRUNCATE_ICON = "i"
 
+# Bugfix 05.08.2026: Echter Info-Button (QPushButton "ℹ", Icon-Breite) in
+# Spalte 1 statt Badge-Text/'i'-Zeichen. Die Status-Spalte wird auf die
+# Button-Breite verkleinert (Spalte 0 ist Stretch und bekommt den freien
+# Platz). Der Button erscheint auf ALLEN Service-/Plugin-/Set-Zeilen; gehoert
+# die Zeile einem Indikator, ist er gelb (#FFD700) und traegt den Tooltip
+# 'aktiv/im <Indikator>' (Namenslogik unveraendert aus _apply_badge).
+INFO_BUTTON_TEXT = "ℹ"
+INFO_BUTTON_SIZE = 20          # ~Icon-Breite
+INFO_BUTTON_WIDTH = 24         # Spaltenbreite (Status-Spalte)
+INFO_BUTTON_COLOR_INDICATOR = "#FFD700"   # gelb bei Indikator-Zugehoerigkeit
+INFO_BUTTON_COLOR_NEUTRAL = "#666666"     # neutral sonst
+
 # Bugfix 3.0 (04.08.2026): Status-Spalte (Spalte 1) ist eine schmale
-# Festbreiten-Spalte ganz rechts – nur Platz fuer das kompakte Badge bzw.
-# das 'i'-Zeichen, nicht fuer lange Relationstexte.
+# Festbreiten-Spalte ganz rechts. Die Breite richtet sich seit 05.08.2026
+# nach dem Info-Button (INFO_BUTTON_WIDTH); BADGE_COLUMN_WIDTH bleibt als
+# Test-Referenz fuer die historische Text-Badge-Breite erhalten.
 BADGE_COLUMN_WIDTH = 36
 
 # Bugfix 3.1 (04.08.2026, aktualisiert): Einrueckung + '>'/'⌄'-Marker.
@@ -110,6 +135,9 @@ class MasterTree(QTreeWidget):
     """2-Spalten-TreeWidget fuer die hierarchische Service-Darstellung."""
 
     selection_changed = Signal(str, str)  # set_id, service_id
+    # Bugfix 05.08.2026: Klick auf den Info-Button (Spalte 1).
+    # Argumente (set_id, service_id, plugin_id) – je nach Zeilentyp gefuellt.
+    info_requested = Signal(str, str, str)
 
     def __init__(self, model, parent=None) -> None:
         super().__init__(parent)
@@ -127,7 +155,7 @@ class MasterTree(QTreeWidget):
             header.setStretchLastSection(False)
             header.setSectionResizeMode(0, QHeaderView.Stretch)
             header.setSectionResizeMode(1, QHeaderView.Fixed)
-            header.resizeSection(1, BADGE_COLUMN_WIDTH)
+            header.resizeSection(1, INFO_BUTTON_WIDTH)
         # Bugfix (04.08.2026): Untereintraege werden per setIndentation()
         # eingerueckt (LEVEL_INDENT px je Ebene). rootIsDecorated=False –
         # die Top-Level-Knoten starten ganz links (keine zusaetzliche
@@ -194,6 +222,10 @@ class MasterTree(QTreeWidget):
             self._restore_selection(current)
         except Exception as e:
             print(f"WARN [MasterTree] Auswahl-Restore fehlgeschlagen: {e}")
+        # Bugfix 05.08.2026: Info-Buttons (Spalte 1) NACH dem vollstaendigen
+        # Baum-Aufbau anhaengen – setItemWidget() verlangt, dass das Item
+        # bereits Teil des TreeWidgets ist (sonst kein sichtbarer Button).
+        self._attach_item_buttons()
 
     def _safe_current_selection(self) -> Dict[str, str]:
         """Liess die aktuelle Auswahl defensiv (isValid-Guard gegen zerstoerte
@@ -232,6 +264,10 @@ class MasterTree(QTreeWidget):
         set_item.setData(0, ROLE_NODE_TYPE, TYPE_SET)
         set_item.setData(0, ROLE_SET_ID, child.get("set_id") or "")
         set_item.setToolTip(0, f"Service-Set: {child.get('set_id') or '?'}")
+        # Bugfix 05.08.2026: Gehoert das Set einem Indikator, traegt der
+        # Info-Button (Spalte 1) den Tooltip 'aktiv/im <Indikator>' (siehe
+        # _apply_set_badge und _attach_item_buttons).
+        self._apply_set_badge(set_item, child.get("definition") or child)
         for svc in services:
             # Keine fuehrenden Leerzeichen im Text: die Einrueckung der
             # Untereintraege kommt aus setIndentation(LEVEL_INDENT).
@@ -263,24 +299,100 @@ class MasterTree(QTreeWidget):
                      badge: str) -> None:
         """Setzt die Darstellung eines Service-/Plugin-Items (Spalte 0/1).
 
-        * Spalte 1: kompaktes Badge; laenger als MAX_BADGE_CELL_CHARS wird es
-          auf das ASCII-Info-Zeichen 'i' gekuerzt – die Status-Spalte zeigt
-          dann kein Warn-'!'-, sondern ein Info-Symbol.
-        * Tooltip der Spalte 1 (Bugfix 04.08.2026): unterscheidet, ob der
-          Indikator der Abhaengigkeit aktuell AKTIV im Chart ist
-          ('aktiv <Indikator>') oder nur eine reine Abhaengigkeit darstellt
-          ('im <Indikator>').
+        * Spalte 1: KEIN Badge-Text mehr (Bugfix 05.08.2026) – den Platz
+          nimmt der echte Info-Button ein (siehe _attach_item_buttons).
+        * Tooltip (Bugfix 05.08.2026): ODER-Logik auf Indikator-Basis –
+          a) Service wird aktiv von einem Indikator verwendet
+             -> 'aktiv <Indikator>'
+          b) sonst, wenn der Service zu einem Indikator gehoert
+             -> 'im <Indikator>'
+          Die Aktiv-Pruefung beruecksichtigt den ZUGEHOERIGEN Indikator
+          (metadata['indicator_id']), nicht nur die Plugin-ID selbst –
+          dadurch greift Variante a) auch fuer Services (grid_lines/
+          proximity), die IN einem aktiven Indikator (GridLiquidityIndicator)
+          laufen. Der Tooltip wird auf Spalte 0 UND Spalte 1 gesetzt
+          (Spalte 1 uebernimmt ihn der Info-Button).
         """
-        badge = str(badge or "")
-        if len(badge) > MAX_BADGE_CELL_CHARS:
-            item.setText(1, BADGE_TRUNCATE_ICON)
+        # Badge-Text entfaellt in Spalte 1 (Info-Button statt Text-Badge).
+        item.setText(1, "")
+        if self.model.belongs_to_indicator(plugin_id):
+            name = self.model.get_indicator_display_name(plugin_id)
+            tooltip = (f"aktiv {name}" if self.model.is_active_in_chart(plugin_id)
+                       else f"im {name}")
         else:
-            item.setText(1, badge)
-        name = self.model.get_indicator_display_name(plugin_id)
-        if self.model.is_active_in_chart(plugin_id):
-            item.setToolTip(1, f"aktiv {name}")
-        else:
-            item.setToolTip(1, f"im {name}")
+            tooltip = ""
+        item.setToolTip(0, tooltip)
+        item.setToolTip(1, tooltip)
+
+    def _apply_set_badge(self, item: QTreeWidgetItem,
+                         definition: Dict[str, Any]) -> None:
+        """Set-Badge (Bugfix 05.08.2026): gehoert ein Service-Set einem
+        Indikator, traegt der Info-Button (Spalte 1) die Tooltip-Namenslogik
+        aus _apply_badge ('aktiv <Indikator>' / 'im <Indikator>'). Mehrere
+        Indikatoren im Set werden mit ' + ' verknuepft. Ohne Indikator-
+        Zugehoerigkeit bleibt Spalte 1 leer (neutraler Button, kein Tooltip).
+        Spalte 0 behaelt den 'Service-Set: <set_id>'-Tooltip (siehe
+        _build_set_item) – der Set-Bezug bleibt erhalten.
+        """
+        names = self.model.get_set_indicator_names(definition or {})
+        if not names:
+            item.setToolTip(1, "")
+            return
+        label = " + ".join(names)
+        tooltip = (f"aktiv {label}" if self.model.is_set_active(definition or {})
+                   else f"im {label}")
+        item.setToolTip(1, tooltip)
+
+    def _attach_item_buttons(self) -> None:
+        """Haengt die Info-Buttons (Spalte 1) an alle Service-/Set-/Plugin-
+        Zeilen (Bugfix 05.08.2026).
+
+        Der Button ist ein kompakter QPushButton ("ℹ", Icon-Breite) und ersetzt
+        die frueheren Text-Badges. Gehoert die Zeile einem Indikator (Tooltip
+        aus _apply_badge/_apply_set_badge vorhanden), ist er gelb (#FFD700)
+        eingefaerbt und traegt den Tooltip; sonst neutral. Der Klick emittiert
+        `info_requested` mit den zeilenspezifischen Daten:
+          Service-Zeile -> (set_id, instance_id, plugin_id)
+          Set-Zeile      -> (set_id, "", "")
+          Plugin-Zeile   -> ("", "", plugin_id)
+        Gruppen-Knoten (📁/⚡/📦) erhalten bewusst KEINEN Button.
+        """
+        try:
+            for item in TreeItemIterator(self):
+                if item is None or not isValid(item):
+                    continue
+                node_type = item.data(0, ROLE_NODE_TYPE)
+                if node_type not in (TYPE_SERVICE, TYPE_SET, TYPE_PLUGIN):
+                    continue
+                tooltip = item.toolTip(1) or ""
+                set_id = str(item.data(0, ROLE_SET_ID) or "")
+                service_id = ""
+                plugin_id = ""
+                if node_type == TYPE_SERVICE:
+                    service_id = str(item.data(0, ROLE_INSTANCE_ID) or "")
+                    plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
+                elif node_type == TYPE_PLUGIN:
+                    # Plugin-Zeilen: set_id bewusst leer (die ROLE_SET_ID
+                    # traegt nur die Gruppenkennung 'standalone'/'plugins').
+                    set_id = ""
+                    plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
+
+                btn = QPushButton(INFO_BUTTON_TEXT, self)
+                btn.setFixedSize(INFO_BUTTON_SIZE, INFO_BUTTON_SIZE)
+                btn.setCursor(Qt.PointingHandCursor)
+                color = (INFO_BUTTON_COLOR_INDICATOR if tooltip
+                         else INFO_BUTTON_COLOR_NEUTRAL)
+                btn.setStyleSheet(
+                    f"QPushButton {{ color:{color}; border:none;"
+                    f" font-weight:bold; background:transparent; }}")
+                if tooltip:
+                    btn.setToolTip(tooltip)
+                btn.clicked.connect(
+                    lambda _=False, s=set_id, svc=service_id, pid=plugin_id:
+                    self.info_requested.emit(s, svc, pid))
+                self.setItemWidget(item, 1, btn)
+        except (RuntimeError, AttributeError):
+            pass
 
     # -------------------------------------------------------------------------
     # Bugfix 04.08.2026: '>'/'⌄'-Marker statt Branch-Dreiecke + Einfach-Klick

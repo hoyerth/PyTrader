@@ -239,3 +239,34 @@ Ergebnis-Semantik (identisch zu `chart_win`):
 * `PluginRegistry`-Smoke: `sorted(plugins.keys()) == ['grid_lines', 'proximity']`; `GridLiquidityIndicator.service_plugin_ids == ['grid_lines', 'proximity']`.
 * DB-Bestandskontrolle: keine `feature_id='grid_liquidity'` in `feature_store`; `service_sets`/`trash`/`history` ohne `grid_liquidity`-Referenzen; keine verwaisten `grid`-Keys in `symbol_tf_states`/`instance_states`.
 * `python -m py_compile` auf allen geänderten Dateien (Exit 0).
+
+### 3.11 Schritt 11 – Bugfix: MasterTree-Tooltip-Aktiv-Logik & Set-Badge (05.08.2026)
+
+**Bug 1 – Tooltip zeigte `'im <Indikator>'` auch für aktiv im Chart laufende Services:**
+Ursache: `_apply_badge()` prüfte `is_active_in_chart(plugin_id)` ausschließlich gegen die Plugin-ID (`grid_lines`/`proximity`). Aktiv im Chart sind aber die `indicators_state`-Keys des INDIKATORS (`grid_liquidity`), nicht die Plugin-ID – dadurch griff die Tooltip-Variante a) (`aktiv <Indikator>`) für Services nie.
+
+Fixes (4 Dateien):
+* **`analytics/engine/service_selector_model.py`:** Neue Lese-Methoden `get_indicator_id()` (metadata-Fallback `plugin_id`), `belongs_to_indicator()`, `get_set_indicator_names()`, `is_set_active()`; `is_active_in_chart()` prüft zusätzlich den zugehörigen Indikator (metadata `indicator_id`) – dadurch ist ein Service auch dann „aktiv im Chart", wenn sein Indikator (z. B. `GridLiquidityIndicator`) läuft.
+* **`analytics/features/definitions/grid_lines_service.py` & `proximity_service.py`:** Metadaten-Feld `indicator_id: "grid_liquidity"` ergänzt (bereits vorhandenes `indicator_name` bleibt).
+* **`serviceui/master_tree.py` `_apply_badge()`:** ODER-Logik „aktiv \<Indikator\>" / „im \<Indikator\>" auf Indikator-Basis; Tooltip wird auf Spalte 0 UND Spalte 1 gesetzt.
+
+**Bug 2 – Service-Sets mit Indikator-Zugehörigkeit zeigten kein Status-Symbol:**
+Fix: Neue `_apply_set_badge()` – Set-Knoten mit Indikator-Zugehörigkeit zeigen in Spalte 1 das Info-Zeichen (`'i'`) mit derselben Tooltip-Namenslogik wie Services; mehrere Indikatoren werden mit `' + '` verknüpft.
+
+**Validierung (`test/check_p15_s2_service_tree.py`, erweitert C5–C9/F5k/F5l, headless):** 49/49 Checks PASS – inkl. Aktiv-Prüfung via Indikator-ID (`grid_liquidity`), `belongs_to_indicator`, Set-Indikator-Namen und Set-Aktiv-Status.
+
+### 3.12 Schritt 12 – Info-Button im MasterTree statt Box-Button (05.08.2026)
+
+**Anforderung (5 Punkte, vom Anwender entschieden):** `btn_info_service` aus der Box „Service-Sets (Phase 13)" entfernen; stattdessen pro Zeile im MasterTree (Spalte 1) ein echter Info-Button `"ℹ"` auf Icon-Breite; Status-Spalte auf Button-Breite verkleinert und weiterhin ganz rechts (Spalte 0 = Stretch); Klick öffnet den Beschreibungs-Dialog mit **erster Zeile = bisheriger Tooltip-Text** (`aktiv/im <Indikator>`), dann Leerzeile, dann Beschreibungstext. Button auf ALLEN Service-/Plugin-/Set-Zeilen; **gelbe Färbung** (`#FFD700`) bei Indikator-Relation, sonst neutral; **Badge-Text entfällt** aus Spalte 1, Tooltip bleibt unverändert.
+
+**Umsetzung (6 Dateien):**
+* **`serviceui/master_tree.py`:** Neues Signal `info_requested(set_id, service_id, plugin_id)`; `_attach_item_buttons()` hängt nach jedem `_populate()` einen kompakten `QPushButton("ℹ")` (20×20, `border:none`, gelb `#FFD700` bei vorhandenem Indikator-Tooltip, sonst neutral `#666666`) an alle Service-/Set-/Plugin-Zeilen (Gruppen bewusst ohne Button). `_apply_badge()`/`_apply_set_badge()` setzen KEINEN Badge-Text mehr (Zelle leer); Tooltip-Logik unverändert. Spalte 1 `Fixed` + `resizeSection(1, INFO_BUTTON_WIDTH=24)` (vorher `BADGE_COLUMN_WIDTH=36`, bleibt als Test-Referenz). Neue Konstanten `INFO_BUTTON_TEXT/SIZE/WIDTH/COLOR_*`.
+* **`serviceui/service_selector_widget.py`:** `info_requested` des MasterTree wird re-emittiert (neues Widget-Signal).
+* **`serviceui/service_win.py`:** Neuer Slot `_on_tree_info_requested(set_id, service_id, plugin_id)` (Verdrahtung in `_wire_selector_toolbar()`); Helfer `_resolve_info_plugin()`/`_info_header_tooltip()`/`_info_set_tooltip()`. Öffnet je Zeilentyp: Service → `from_plugin(Instanz+Config)`, Plugin → `from_plugin()`, Set → `from_set()`. Alter `_show_service_info()` bleibt erhalten (Guard über `btn_info_service` ist nach UI-Entfernung `None` → kein Crash).
+* **`analytics/engine/description_dialog.py`:** Neuer `header_line`-Parameter (fette erste Zeile + Leerzeile vor dem Beschreibungstext) in `__init__`/`_render_html`/`from_plugin`; neue Klassenmethode `from_set()` (Set-Name, Set-Beschreibung, Service-Liste in `execution_order`).
+* **`ui/service_win.ui`:** `btn_info_service`-Block („ℹ Info" + Tooltip) aus `layout_order_buttons` entfernt.
+
+**Validierung (headless, grün):**
+* `test/check_p15_s2_service_tree.py`: F5–F5s auf Button-Präsenz umgestellt (nur-Icon/Icon-Breite, Tooltip unverändert, Set-Button, Button auf ALLEN Zeilen, gelb bei Indikator-Relation + neutral bei injiziertem Plain-Plugin, Spalte auf `INFO_BUTTON_WIDTH`, `info_requested`-Emission für Service/Set/Plugin); neu H1–H4 (`from_set`/`from_plugin` rendern `header_line`) – **alle PASS** (3× stabil).
+* `test/test.py`: T4/T5 auf Info-Button-Checks umgestellt, T8b (Spaltenbreite) + T12 (`info_requested` Set-Zeile) neu; **Flakiness-Fix T9b/T10**: manuelle `QMouseEvent`-Synthetic-Clicks sind auf dem offscreen-Platform-Fenster timing-flaky (nachgewiesen: `itemAt`/`setExpanded` korrekt, `mousePressEvent` byte-identisch zu HEAD → vorbestehend) → Umstellung auf `QTest.mouseClick` → **5/5 Läufe stabil**.
+* `python -m py_compile` auf allen geänderten Dateien (Exit 0); UI-XML parst fehlerfrei.

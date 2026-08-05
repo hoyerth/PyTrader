@@ -83,6 +83,11 @@ class ProximityService(PluginFeature):
             # Bugfix (04.08.2026): Zugehoeriger Indikator-Name fuer die Status-
             # Badges im MasterTree (der Service laeuft IN GridLiquidityIndicator).
             "indicator_name": "GridLiquidityIndicator",
+            # Bugfix (05.08.2026): indicator_id = indicators_state-Key des
+            # zugehoerigen Indikators. ServiceSelectorModel.is_active_in_chart()
+            # prueft damit die Aktiv-Frage auf Indikator-Ebene (Tooltip
+            # 'aktiv <Indikator>' statt nur 'im <Indikator>').
+            "indicator_id": "grid_liquidity",
             "description": "Prozentuale visit%-Treffer auf den Grid-Linien (Parität zu grid_math.py) inkl. Feature-Store-Records",
             "author": "PyTrader AI",
             "tags": ["grid", "proximity", "liquidity", "feature-store"],

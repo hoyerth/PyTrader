@@ -36,6 +36,9 @@ class ServiceSelectorWidget(QWidget):
     #: Emittiert (set_id, service_id) – service_id leer, wenn nur ein Set
     #: gewaehlt wurde (bzw. in SELECT_ONLY ohne aktives Set).
     selection_changed = Signal(str, str)
+    #: Bugfix 05.08.2026: Klick auf den Info-Button im MasterTree (FULL_EDIT)
+    #: wird an den Aufrufer weitergereicht (set_id, service_id, plugin_id).
+    info_requested = Signal(str, str, str)
 
     def __init__(self, mode: str = MODE_SELECT_ONLY, model: Optional[ServiceSelectorModel] = None,
                  parent: Optional[QWidget] = None) -> None:
@@ -108,6 +111,8 @@ class ServiceSelectorWidget(QWidget):
         self._layout.addWidget(self.master_tree, 1)
 
         self.master_tree.selection_changed.connect(self.selection_changed)
+        # Bugfix 05.08.2026: Info-Button-Klicks im MasterTree re-emittieren.
+        self.master_tree.info_requested.connect(self.info_requested)
 
     # -------------------------------------------------------------------------
     # Modell-Sync

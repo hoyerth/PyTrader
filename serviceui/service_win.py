@@ -379,6 +379,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # MasterTree-Auswahl -> Editor + ParameterPanel synchronisieren
         if selector.master_tree is not None:
             selector.master_tree.selection_changed.connect(self._on_master_selection)
+            # Bugfix 05.08.2026: Info-Button-Klicks (Spalte 1) -> Beschreibungs-
+            # Dialog (Service / Plugin / Set).
+            selector.master_tree.info_requested.connect(self._on_tree_info_requested)
         # ParameterPanel-Aenderungen -> Set-Definition + Spalten (Live-Edit)
         self.param_panel.params_changed.connect(self._on_param_panel_changed)
 
@@ -999,6 +1002,97 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             return
         dlg = ServiceDescriptionDialog.from_plugin(plugin, instance_id=iid, config=cfg, parent=self)
         dlg.exec()
+
+    @Slot(str, str, str)
+    def _on_tree_info_requested(self, set_id: str, service_id: str,
+                                plugin_id: str) -> None:
+        """Oeffnet den ServiceDescriptionDialog fuer die Info-Button-Zeile.
+
+        Bugfix 05.08.2026: Der Info-Button sitzt jetzt direkt im MasterTree
+        (Spalte 1) statt in der Box 'Service-Sets (Phase 13)'. Je nach
+        Zeilentyp wird der passende Dialog geoeffnet:
+
+          * Service-Zeile:  from_plugin (Instanz + Config + header_line)
+          * Plugin-Zeile:   from_plugin (ohne Instanz, header_line)
+          * Set-Zeile:      from_set (Set-Name/-Beschreibung/-Services,
+                            header_line)
+
+        Die ERSTE Dialog-Zeile ist der bisherige Tooltip-Text
+        ('aktiv/im <Indikator>'), danach folgt eine Leerzeile und dann der
+        Beschreibungstext (header_line-Rendering im Dialog).
+        """
+        model = getattr(self.service_selector, "model", None)
+        if model is None:
+            return
+        try:
+            # 1) Service-Zeile (set_id + service_id)
+            if service_id and set_id:
+                cfg = model.find_service(set_id, service_id) or {}
+                pid = str(cfg.get("plugin_id") or service_id)
+                plugin = self._resolve_info_plugin(pid)
+                if plugin is None:
+                    return
+                dlg = ServiceDescriptionDialog.from_plugin(
+                    plugin, instance_id=service_id, config=cfg, parent=self,
+                    header_line=self._info_header_tooltip(pid))
+                dlg.exec()
+                return
+            # 2) Plugin-Zeile (nur plugin_id; set_id = Gruppenkennung)
+            if plugin_id and not service_id:
+                plugin = self._resolve_info_plugin(plugin_id)
+                if plugin is None:
+                    return
+                dlg = ServiceDescriptionDialog.from_plugin(
+                    plugin, instance_id="", config=None, parent=self,
+                    header_line=self._info_header_tooltip(plugin_id))
+                dlg.exec()
+                return
+            # 3) Set-Zeile (nur set_id)
+            if set_id and not service_id and not plugin_id:
+                set_def = model.find_set(set_id)
+                if not set_def:
+                    self.log(f"Set '{set_id}' nicht gefunden.")
+                    return
+                dlg = ServiceDescriptionDialog.from_set(
+                    set_def, parent=self,
+                    header_line=self._info_set_tooltip(set_def))
+                dlg.exec()
+                return
+        except (RuntimeError, AttributeError) as e:
+            self.log(f"Info-Dialog nicht moeglich: {e}")
+
+    def _resolve_info_plugin(self, plugin_id: str):
+        """Liefert das Plugin aus der Registry (oder None + Log-Eintrag)."""
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            return PluginRegistry().get(plugin_id)
+        except KeyError:
+            self.log(f"Plugin '{plugin_id}' nicht gefunden.")
+            return None
+
+    def _info_header_tooltip(self, plugin_id: str) -> str:
+        """Erste Dialog-Zeile = bisheriger Tooltip-Text des Info-Buttons
+        ('aktiv <Indikator>' / 'im <Indikator>'); leer ohne Indikator-
+        Zugehoerigkeit."""
+        model = getattr(self.service_selector, "model", None)
+        if model is None or not model.belongs_to_indicator(plugin_id):
+            return ""
+        name = model.get_indicator_display_name(plugin_id)
+        return (f"aktiv {name}" if model.is_active_in_chart(plugin_id)
+                else f"im {name}")
+
+    def _info_set_tooltip(self, set_def: Dict[str, Any]) -> str:
+        """Erste Dialog-Zeile fuer Set-Zeilen (Tooltip-Namenslogik analog
+        _apply_set_badge: 'aktiv/im <Indikator>', mehrere mit ' + ')."""
+        model = getattr(self.service_selector, "model", None)
+        if model is None:
+            return ""
+        names = model.get_set_indicator_names(set_def or {})
+        if not names:
+            return ""
+        label = " + ".join(names)
+        return (f"aktiv {label}" if model.is_set_active(set_def or {})
+                else f"im {label}")
 
     @Slot()
     def save_set(self) -> None:
