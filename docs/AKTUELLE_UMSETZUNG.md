@@ -382,3 +382,32 @@ ew_set_dialog.py, param_columns.py, 	rash_dialog.py (Exit 0).
 * Import-Smoke: `serviceui` importierbar; `ServiceToolbar` NICHT mehr in `__all__`; `ServiceRunWorker` bleibt; `MasterTree` ohne `group_activated`, mit `run_service_requested`/`run_set_requested`/`info_requested`.
 * Projektweite Produktions-Referenz-Suche (ohne `docs/`, ohne `test/`): `group_activated`, `from serviceui.toolbar`, `self.toolbar`, `selector.toolbar` → **0 Treffer**; `ServiceToolbar` nur noch in der archivierten `.backup_service_toolbar/`-Datei und im `__init__`-Docstring (historischer Hinweis).
 * Zeilenenden: `service_selector_widget.py` auf CRLF normalisiert (gemischt CRLF/LF nach Edits), alle übrigen Dateien blieben LF – git-Diff minimal und sauber.
+
+### 3.17 Schritt 17 – Ausführungsdatum-Fixes: Legacy-Migration, Worker-Persistenz, Standalone-Datum (05.08.2026)
+
+**Anlass (vom Anwender entschieden – Punkte 1, 2 und 4 aus der Fehleranalyse; Punkt 3 „(kein Feature-Store-Payload)" ist erwartetes Verhalten und wurde NICHT verändert):**
+
+**A) Punkt 1 – „Keine Datumsangaben, obwohl Daten in der DB" (Ursache gefunden & behoben):**
+* **Root Cause (per DB-Probe verifiziert):** ALLE 673.235 `feature_store`-Zeilen in `analytics.duckdb` waren Legacy-Rows der alten Monolith-Pipeline (`FeatureBuilder.build()`) mit `feature_id = NULL`, `plugin_version = NULL`, `feature_data = NULL` – die Abfrage `WHERE feature_id IS NOT NULL` fand dadurch NICHTS → Baum zeigte überall `(--.--.--)`, obwohl 673.235 Zeilen existierten.
+* **`analytics/engine/feature_store_reader.py` (robustifiziert):** `fetch_last_execution_dates()` normalisiert jetzt `LOWER(TRIM(feature_id))` (Case-insensitiv + Whitespace-tolerant, Punkt 1-Kandidat 3), überspringt defensiv NULL/leere `feature_id` und NULL `created_at` (Kandidat 2).
+* **NEU `test/migrate_legacy_feature_store.py` (Migration, Dry-Run + `--apply`):** Legacy-Zeilen mit befüllten Grid-Spalten (`grid_nearest_level`/`grid_dist_abs`/`grid_dist_pct`) tragen exakt die Proximity-Semantik (Abstand des Preises zu Grid-Linien) → werden auf `feature_id='proximity'`, `plugin_version='legacy'` migriert. `created_at` bleibt unverändert (echtes Legacy-Datum). `feature_data` bleibt NULL → der Chart-Lesepfad (`read_proximity_from_feature_store` filtert `feature_data IS NOT NULL` + `is_hit`) ignoriert die migrierten Zeilen weiterhin (KEINE Änderung im Chart-Rendering).
+* **Angewendet:** **670.235 Zeilen → `feature_id='proximity'`**; 3.000 reine atr-Rows ohne Grid-Daten bleiben bewusst NULL (keine Proximity-Semantik, Exit-Code-Semantik des Skripts entsprechend: 0 = keine migrierbaren Grid-Zeilen mehr).
+* **Verifiziert:** `fetch_last_execution_dates()` → `{'proximity': '02.08.26'}`; `feature_data IS NOT NULL` bei proximity weiterhin 0.
+
+**B) Punkt 2 – „Nach Ausführen eines Services wird das Datum nicht aktualisiert" (ServiceSetRunWorker):**
+* **`serviceui/set_run_worker.py`:** Der `ServiceSetRunWorker` (btn_execute_set-Pfad) persistiert jetzt die erzeugten `feature_store_payloads` ZWINGEND via `FeatureBuilder.store_plugin_payload()` in `analytics.duckdb` (Log je Service: „N Feature-Row(s) gespeichert" / „kein Feature-Store-Payload") und emittiert danach `event_bus.service_set_changed` → `ServiceSelectorModel.refresh()` liest das neue `MAX(created_at)` und der Baum aktualisiert das Datum `(DD.MM.JJ)` live ohne Neustart. `grid_lines` liefert bewusst keinen `feature_store_payload` (reines Chart-Overlay, Punkt 3) – nur Services mit non-leeren `records` (z.B. `proximity`) schreiben Zeilen.
+* Der Kontextmenü-Worker `ServiceRunWorker` (Schritt 15) hatte die Persistenz+Emit-Logik bereits.
+
+**C) Punkt 4 – Datum für Standalone Services & Plugins:**
+* **`analytics/engine/service_selector_model.py`:** `build_tree()` liefert `"last_execution": self.last_execution_date(pid)` jetzt auch für die ⚡-Standalone-Gruppe und die 📦-Plugin-Gruppe (vorher nur in Service-Sets).
+* **`serviceui/master_tree.py`:** `_build_plugin_item()` hängt das Datum an den Plugin-Namen (`proximity (02.08.26)`); Modul-Docstring ergänzt.
+
+**D) Fallback-Konsistenz (doppelte Klammern behoben):** `last_execution_date()` liefert den Fallback als `--.--.--` OHNE Klammern; die Klammern setzt ausschließlich der MasterTree-Label-Aufbau (`Service_Name (DD.MM.JJ)` / `Service_Name (--.--.--)`) – vorher entstand `grid_1 ((--.--.--))`.
+
+**E) `test/check_p15_s2_service_tree.py` (aktualisiert, gezielt ausgeführt):** J2 auf `--.--.--`-Fallback korrigiert; neue Checks J8/J9: Plugin-Zeile `proximity (DD.MM.JJ)` und `grid_lines (--.--.--)` (Standalone nutzt denselben `_build_plugin_item`-Pfad).
+
+**Validierung (headless, grün):**
+* **`test/check_p15_s2_service_tree.py` gezielt ausgeführt** (offscreen, Test-DBs in `test/`): **ALLE PRÜFUNGEN BESTANDEN** (inkl. J1–J9: Datum, Fallback, Set-Service-Labels, Plugin-Labels, Run-Signale).
+* Echte DB-Verifikation: `fetch_last_execution_dates()` → `{'proximity': '02.08.26'}`; 670.235 proximity / 0 grid_lines / 3.000 NULL (atr-only); 0 proximity-Rows mit `feature_data` (Chart-Lesepfad unbeeinflusst).
+* `python -m py_compile` auf allen geänderten Dateien (Exit 0); EventBus-Import in beiden Workern erfolgreich; `data/analytics.duckdb` ist gitignored (DB-Änderung wird über das Migrationsskript + Doku nachvollzogen).
+* `docs/x_Exports.md` wurde vom Anwender selbst export-aktualisiert und bleibt wie immer unangetastet (nicht Bestandteil dieses Commits).

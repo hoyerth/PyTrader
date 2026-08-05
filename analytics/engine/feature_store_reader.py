@@ -362,17 +362,27 @@ class FeatureStoreReader:
         (ON CONFLICT DO UPDATE), damit der Zeitstempel die LETZTE Ausfuehrung
         widerspiegelt (nicht den Erst-Schreibzeitpunkt der Bar).
 
+        Robustheit (Bugfix 05.08.2026, Punkt 1):
+          * Case-insensitiv: feature_id wird per LOWER(TRIM(...)) normalisiert –
+            Registry-/Plugin-IDs (z.B. 'proximity') werden unabhaengig von der
+            in der DB gespeicherten Gross-/Kleinschreibung gefunden.
+          * Whitespace-tolerant: fuehrende/trailing Leerzeichen (z.B. durch
+            Alt-Schreibpfade) werden ignoriert.
+          * Defensiv: Zeilen mit NULL/leerer feature_id ODER NULL created_at
+            werden uebersprungen (Alt-Rows ohne Zeitstempel koennen kein
+            gueltiges Datum liefern).
+
         Returns:
-            Dict feature_id -> 'DD.MM.JJ' (z.B. {'proximity': '05.08.26'});
+            Dict feature_id (lower) -> 'DD.MM.JJ' (z.B. {'proximity': '05.08.26'});
             leer bei fehlender DB/Tabelle oder Fehler (defensiv).
         """
         con = self._get_connection()
         try:
             rows = con.execute("""
-                SELECT feature_id, MAX(created_at)
+                SELECT LOWER(TRIM(feature_id)) AS fid, MAX(created_at)
                 FROM feature_store
-                WHERE feature_id IS NOT NULL AND feature_id != ''
-                GROUP BY feature_id
+                WHERE feature_id IS NOT NULL AND TRIM(feature_id) != ''
+                GROUP BY LOWER(TRIM(feature_id))
             """).fetchall()
         except Exception as e:
             print(f"WARN [FeatureStoreReader] fetch_last_execution_dates "

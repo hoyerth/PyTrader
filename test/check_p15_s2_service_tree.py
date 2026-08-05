@@ -469,8 +469,8 @@ today_str = datetime.now().strftime("%d.%m.%y")
 check("J1) last_execution_date('proximity') = heute (DD.MM.JJ)",
       model.last_execution_date("proximity") == today_str,
       model.last_execution_date("proximity"))
-check("J2) Fallback '(--.--.--)' ohne feature_store-Eintrag",
-      model.last_execution_date("grid_lines") == "(--.--.--)",
+check("J2) Fallback '--.--.--' ohne feature_store-Eintrag",
+      model.last_execution_date("grid_lines") == "--.--.--",
       model.last_execution_date("grid_lines"))
 
 svc_nodes = model.build_tree()[0]["children"][0]["services"]
@@ -505,6 +505,24 @@ check("J6) run_service_requested(set_id, instance_id) emittierbar",
       run_svc_calls == [(set_id, "prox_1")], str(run_svc_calls))
 check("J7) run_set_requested(set_id) emittierbar",
       run_set_calls == [set_id], str(run_set_calls))
+
+# 05.08.2026 (Punkt 4): Auch Standalone-/Plugin-Zeilen tragen das Datum
+# '(DD.MM.JJ)' hinter dem Namen (gleiche feature_store-Semantik).
+model.refresh()
+_app.processEvents()
+standalone_group = mt.topLevelItem(1)
+plugin_group = mt.topLevelItem(2)
+plugin_labels = [plugin_group.child(i).text(0)
+                 for i in range(plugin_group.childCount())]
+prox_plugin_label = next(
+    (t for t in plugin_labels if t.startswith("proximity")), "")
+grid_plugin_label = next(
+    (t for t in plugin_labels if t.startswith("grid_lines")), "")
+check("J8) Plugin-Zeile 'proximity' zeigt '(DD.MM.JJ)'",
+      prox_plugin_label == f"proximity ({today_str})", prox_plugin_label)
+check("J9) Plugin-Zeile 'grid_lines' zeigt Fallback '(--.--.--)'",
+      grid_plugin_label == "grid_lines (--.--.--)", grid_plugin_label)
+
 
 # ---------------------------------------------------------------------------
 # H) Info-Button -> Beschreibungs-Dialog (header_line / from_set / from_plugin)

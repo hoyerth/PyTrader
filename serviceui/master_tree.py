@@ -20,6 +20,8 @@ Hierarchische Darstellung der Service-Landschaft:
               Knotens haengt das Datum der letzten Ausfuehrung in Klammern:
               'prox_1 (05.08.26)' (DD.MM.JJ aus MAX(created_at) des
               feature_store je feature_id) – ohne Eintrag '(--.--.--)'.
+              Gilt seit 05.08.2026 (Punkt 4) auch fuer Standalone-Services
+              und Plugin-Zeilen ('proximity (02.08.26)').
   * Spalte 1: Schmale Status-Spalte ganz RECHTS (Fixed-Spalte, fest am
               rechten Rand verankert) – pro Zeile ein echter Info-Button
               (QPushButton "ℹ", Icon-Breite ~20 px). Badge-TEXTE werden
@@ -316,7 +318,7 @@ class MasterTree(QTreeWidget):
             # Ausfuehrung (DD.MM.JJ, aus dem feature_store) haengt direkt am
             # Service-Namen: 'prox_1 (05.08.26)' – ohne Eintrag '(--.--.--)'.
             plugin_id = svc.get("plugin_id") or ""
-            last_exec = str(svc.get("last_execution") or "(--.--.--)")
+            last_exec = str(svc.get("last_execution") or "--.--.--")
             svc_item = QTreeWidgetItem([
                 f"{svc.get('instance_id')} ({last_exec})",
                 "",
@@ -332,8 +334,12 @@ class MasterTree(QTreeWidget):
     def _build_plugin_item(self, child: Dict[str, Any],
                            group: str) -> QTreeWidgetItem:
         pid = child.get("plugin_id") or ""
-        # Keine fuehrenden Leerzeichen: Einrueckung via setIndentation()
-        plugin_item = QTreeWidgetItem([pid, ""])
+        # Keine fuehrenden Leerzeichen: Einrueckung via setIndentation().
+        # 05.08.2026 (Punkt 4): Das Datum der letzten Ausfuehrung (DD.MM.JJ,
+        # aus dem feature_store) haengt auch an Standalone-/Plugin-Zeilen:
+        # 'proximity (02.08.26)' – ohne Eintrag '(--.--.--)'.
+        last_exec = str(child.get("last_execution") or "--.--.--")
+        plugin_item = QTreeWidgetItem([f"{pid} ({last_exec})", ""])
         plugin_item.setData(0, ROLE_NODE_TYPE, TYPE_PLUGIN)
         plugin_item.setData(0, ROLE_SET_ID, group)
         plugin_item.setData(0, ROLE_PLUGIN_ID, pid)

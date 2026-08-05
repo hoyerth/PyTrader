@@ -172,17 +172,22 @@ class ServiceSelectorModel(QObject):
 
     def last_execution_date(self, plugin_id: str) -> str:
         """Formatiertes Datum der letzten Ausfuehrung eines Services
-        ('DD.MM.JJ', z.B. '05.08.26') – Fallback '(--.--.--)' ohne Eintraege.
+        ('DD.MM.JJ', z.B. '05.08.26') – Fallback '--.--.--' ohne Eintraege.
 
         Der Zeitstempel stammt aus MAX(created_at) des feature_store fuer
         die feature_id (Plugin-ID) des Services. store_plugin_payload()
         aktualisiert created_at bei jedem Upsert, sodass der Wert die
         LETZTE Ausfuehrung widerspiegelt.
+
+        Achtung (05.08.2026, Punkt 1): Der Rueckgabewert enthaelt BEWUSST
+        KEINE Klammern – der MasterTree umschliesst ihn beim Label-Aufbau
+        ('Service_Name (DD.MM.JJ)' / 'Service_Name (--.--.--)'), damit der
+        Fallback nicht doppelt geklammert wird.
         """
         if not plugin_id:
-            return "(--.--.--)"
+            return "--.--.--"
         return self._last_execution_dates.get(
-            str(plugin_id).lower(), "(--.--.--)")
+            str(plugin_id).lower(), "--.--.--")
 
     def _collect_active_indicator_ids(self) -> Set[str]:
         """Sammelt alle indicator_ids/plugin_ids, die in offenen Chart-
@@ -432,12 +437,25 @@ class ServiceSelectorModel(QObject):
             })
 
         standalone_nodes = [
-            {"plugin_id": pid, "badge": self.badge_for(pid)}
+            {
+                "plugin_id": pid,
+                "badge": self.badge_for(pid),
+                # 05.08.2026 (Punkt 4): Datum der letzten Ausfuehrung auch fuer
+                # Standalone-Services – der MasterTree zeigt es hinter dem
+                # Plugin-Namen an (gleiche Semantik wie bei Set-Services).
+                "last_execution": self.last_execution_date(pid),
+            }
             for pid in self.get_standalone_plugin_ids()
         ]
 
         plugin_nodes = [
-            {"plugin_id": pid, "badge": self.badge_for(pid)}
+            {
+                "plugin_id": pid,
+                "badge": self.badge_for(pid),
+                # 05.08.2026 (Punkt 4): Datum der letzten Ausfuehrung auch in
+                # der 'Alle verfügbaren Plugins'-Gruppe (gleiche Semantik).
+                "last_execution": self.last_execution_date(pid),
+            }
             for pid in sorted(self.get_plugins().keys())
         ]
 
