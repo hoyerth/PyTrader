@@ -58,10 +58,6 @@ Signale:
       run_service_requested(set_id, instance_id)      – '▶️ Diesen Service ausführen'
       run_set_requested(set_id)                        – '▶️ Alle Services ausführen'
     (Service-Info nutzt das bestehende `info_requested`-Signal.)
-  * group_activated(group) – Klick auf einen (nicht selektierbaren) Gruppen-
-    Knoten (z.B. 'sets' / 'standalone' / 'plugins'). Das Signal bleibt fuer
-    potenzielle Aufrufer erhalten (die fruehere Toolbar-State-Nutzung ist
-    seit 05.08.2026 entfernt).
 """
 
 from typing import Any, Dict, Optional
@@ -169,10 +165,6 @@ class MasterTree(QTreeWidget):
     # Bugfix 05.08.2026: Kontextmenue 'Papierkorb löschen' – endgueltig
     # leeren (Orchestrator fuehrt die doppelte Sicherheitsabfrage aus).
     purge_trash_requested = Signal()
-    # Bugfix 05.08.2026: Klick auf einen (nicht selektierbaren) Gruppen-Knoten
-    # (group id: 'sets' / 'standalone' / 'plugins'). Das Signal bleibt fuer
-    # potenzielle Aufrufer erhalten (keine Toolbar-Verwendung mehr).
-    group_activated = Signal(str)
     # 05.08.2026 (Ausfuehrungsdatum & Kontextmenue-Ausfuehrung):
     #   run_service_requested(set_id, instance_id) – '▶️ Diesen Service ausfuehren'
     #   run_set_requested(set_id)                   – '▶️ Alle Services ausfuehren'
@@ -627,11 +619,6 @@ class MasterTree(QTreeWidget):
         (setExpandsOnDoubleClick(False)). Klicks auf Blatt-Knoten verhalten
         sich normal (Selektion). Das Symbol aktualisiert sich automatisch
         ueber itemExpanded/itemCollapsed (_refresh_expand_label).
-
-        Bugfix 05.08.2026: Klick auf einen (nicht selektierbaren) Gruppen-
-        Knoten emittiert zusaetzlich `group_activated(group)` – das Signal
-        bleibt fuer potenzielle Aufrufer erhalten (die fruehere Toolbar-State-
-        Nutzung ist seit 05.08.2026 entfernt).
         """
         try:
             pos = (event.position().toPoint() if hasattr(event, "position")
@@ -643,9 +630,6 @@ class MasterTree(QTreeWidget):
                 # Auswahl-API (current_set_id/current_service_id) funktioniert.
                 if item.flags() & Qt.ItemIsSelectable:
                     self.setCurrentItem(item)
-                if item.data(0, ROLE_NODE_TYPE) == TYPE_GROUP:
-                    self.group_activated.emit(
-                        str(item.data(0, ROLE_SET_ID) or ""))
                 event.accept()
                 return
         except (RuntimeError, AttributeError):

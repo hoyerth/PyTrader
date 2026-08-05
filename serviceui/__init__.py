@@ -20,6 +20,12 @@ Phase 15.02 (Master-Tree & generischer ServiceSelector):
   * service_selector_widget.py – ServiceSelectorWidget (SELECT_ONLY/FULL_EDIT)
   * new_set_dialog.py          – NewServiceSetDialog (Set + Indikator)
   * analytics/engine/service_selector_model.py – lesendes Datenmodell
+
+Die fruehere Aktions-Toolbar (serviceui/toolbar.py, ServiceToolbar) ist seit
+05.08.2026 komplett entfernt – alle Struktur-Aktionen laufen ueber das
+MasterTree-Kontextmenue. Die Datei ist unter .backup_service_toolbar/
+archiviert (gitignored, Konvention wie .backup_grid_liquidity und
+.backup_parameter_panel).
 """
 
 from serviceui.service_win import (
@@ -38,7 +44,6 @@ from serviceui.run_worker import ServiceRunWorker
 
 # Phase 15.02: Wiederverwendbare Sub-Widgets
 from serviceui.master_tree import MasterTree
-from serviceui.toolbar import ServiceToolbar
 from serviceui.status_panel import StatusPanel
 from serviceui.service_selector_widget import ServiceSelectorWidget
 from serviceui.new_set_dialog import NewServiceSetDialog
@@ -54,7 +59,6 @@ __all__ = [
     "BASE_DIR",
     # Phase 15.02
     "MasterTree",
-    "ServiceToolbar",
     "StatusPanel",
     "ServiceSelectorWidget",
     "NewServiceSetDialog",

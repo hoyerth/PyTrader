@@ -199,7 +199,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             right_layout = QVBoxLayout(self.right_panel)
             right_layout.setContentsMargins(0, 0, 0, 0)
             right_layout.setSpacing(6)
-            # MasterTree + Aktions-Toolbar (Modus B / FULL_EDIT)
+            # MasterTree im Modus B / FULL_EDIT (seit 05.08.2026 ohne Toolbar)
             self.service_selector = ServiceSelectorWidget(
                 mode=ServiceSelectorWidget.MODE_FULL_EDIT, parent=self)
             right_layout.addWidget(self.service_selector, 1)
@@ -743,7 +743,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             idx = self.combo_set.findData(set_id)
             if idx >= 0:
                 self.combo_set.setCurrentIndex(idx)
-        # Neues Set im MasterTree selektieren -> Toolbar [➕ Service]-Modus
+        # Neues Set im MasterTree selektieren (Editor-Sync via selection_changed)
         self._select_set_in_tree(set_id)
 
     @Slot(str)

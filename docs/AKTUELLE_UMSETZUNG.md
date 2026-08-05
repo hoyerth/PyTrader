@@ -355,3 +355,30 @@ ew_set_dialog.py, param_columns.py, 	rash_dialog.py (Exit 0).
 * `python -m py_compile` auf allen 8 geänderten + `run_worker.py` (Exit 0); Import-Smoke `serviceui`/`run_worker`/`service_selector_model`/`feature_store_reader` erfolgreich; `MasterTree.run_service_requested`/`run_set_requested` vorhanden.
 * Projektweite Suche: keine Rest-Referenzen auf `_update_toolbar_actions`, `_on_group_activated`, `_on_toolbar_remove`, `_show_toolbar_add_popup`, `selector.toolbar`-Methoden im Produktionscode (Attribut nur noch `None`).
 * `test/check_p15_s2_service_tree.py` statisch aktualisiert (neue Test-DB `p15_s2_execdate_test.duckdb` in `test/`, J1–J7 für Ausführungsdatum, Fallback, Tree-Labels `prox_1 (05.08.26)`/`grid_1 (--.--.--)` und Run-Signal-Emission) – wie immer nicht ausgeführt (Regel: keine Regressionstests ohne explizite Anforderung).
+
+### 3.16 Schritt 16 – Loose-Ends-Cleanup: ServiceToolbar archiviert & `group_activated` entfernt (05.08.2026)
+
+**Anlass (vom Anwender entschieden):** Nach Schritt 15 (CRUD-Buttons entfernt, alle Struktur-Aktionen via Kontextmenü) war die Aktions-Toolbar toter Produktionscode – kein Widget nutzte sie mehr. Bereinigung nach der Projekt-Konvention (`.backup_*/`-Archivierung wie `.backup_grid_liquidity` und `.backup_parameter_panel`):
+
+**A) `serviceui/toolbar.py` archiviert → `.backup_service_toolbar/serviceui/toolbar.py`:**
+* `git mv` (Datei bleibt im Repo-Historie; `.backup_service_toolbar/` ist gitignored, Zeile 231 `.backup_*/`).
+* `serviceui/__init__.py`: `from serviceui.toolbar import ServiceToolbar` + `"ServiceToolbar"` aus `__all__` entfernt; Paket-Docstring aktualisiert (Hinweis auf Archivierung, alle Struktur-Aktionen laufen über das MasterTree-Kontextmenü).
+
+**B) `group_activated`-Signal aus `serviceui/master_tree.py` entfernt:**
+* Deklaration (`group_activated = Signal(str)`), der Emit im `mousePressEvent` (Gruppen-Knoten-Klick) sowie alle Docstring-Erwähnungen (Modul-Doc, mousePressEvent-Doc) gelöscht – nach dem Toolbar-Abbau (Schritt 13/15) hat kein Consumer das Signal mehr verbunden.
+
+**C) `service_selector_widget.py`: `toolbar`-Attribut komplett entfernt:**
+* `self.toolbar = None` aus `__init__`, `set_mode()` und `_build_full_edit()` gelöscht (auch die Abwärtskompatibilitäts-Attribut bleibt nicht – kein Produktions-/Test-Code referenziert es mehr); `set_mode`-Docstring (`Tree+Toolbar` → `MasterTree`).
+
+**D) `service_win.py`: veraltete Kommentare bereinigt** (keine Logik):
+* Kommentar `# MasterTree + Aktions-Toolbar (Modus B / FULL_EDIT)` → `# MasterTree im Modus B / FULL_EDIT (seit 05.08.2026 ohne Toolbar)`.
+* Kommentar `# Neues Set im MasterTree selektieren -> Toolbar [➕ Service]-Modus` → `# Neues Set im MasterTree selektieren (Editor-Sync via selection_changed)`.
+* Methodennamen `_wire_selector_toolbar()` / `_toolbar_add_service()` bleiben als historische Namen erhalten (kein Consumer außerhalb; Umbenennung hätte historische Doku-Einträge 3.13–3.15 verfälscht).
+
+**E) `test/check_p15_s2_service_tree.py` (statisch):** F2-Check von `full.toolbar is None` auf `not hasattr(full, "toolbar")` umgestellt (Attribut existiert nicht mehr); Docstring-Zeile F aktualisiert.
+
+**Validierung (headless, grün):**
+* `python -m py_compile` auf allen geänderten Dateien (`__init__.py`, `master_tree.py`, `service_selector_widget.py`, `service_win.py`, `test/check_p15_s2_service_tree.py`; Exit 0).
+* Import-Smoke: `serviceui` importierbar; `ServiceToolbar` NICHT mehr in `__all__`; `ServiceRunWorker` bleibt; `MasterTree` ohne `group_activated`, mit `run_service_requested`/`run_set_requested`/`info_requested`.
+* Projektweite Produktions-Referenz-Suche (ohne `docs/`, ohne `test/`): `group_activated`, `from serviceui.toolbar`, `self.toolbar`, `selector.toolbar` → **0 Treffer**; `ServiceToolbar` nur noch in der archivierten `.backup_service_toolbar/`-Datei und im `__init__`-Docstring (historischer Hinweis).
+* Zeilenenden: `service_selector_widget.py` auf CRLF normalisiert (gemischt CRLF/LF nach Edits), alle übrigen Dateien blieben LF – git-Diff minimal und sauber.

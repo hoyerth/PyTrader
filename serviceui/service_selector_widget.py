@@ -53,9 +53,6 @@ class ServiceSelectorWidget(QWidget):
         # Modus-Bausteine (werden je nach Modus erzeugt/eingefuegt)
         self._compact_row: Optional[QWidget] = None
         self.master_tree: Optional[MasterTree] = None
-        # 05.08.2026: Toolbar entfernt (FULL_EDIT zeigt nur den MasterTree) –
-        # das Attribut bleibt als None fuer Abwaertskompatibilitaet erhalten.
-        self.toolbar = None
 
         self.model.data_changed.connect(self._on_model_changed)
         self.set_mode(mode)
@@ -68,7 +65,7 @@ class ServiceSelectorWidget(QWidget):
         """Baut das Widget fuer den gewuenschten Betriebsmodus auf.
 
         Args:
-            mode: MODE_SELECT_ONLY (Dropdown) oder MODE_FULL_EDIT (Tree+Toolbar).
+            mode: MODE_SELECT_ONLY (Dropdown) oder MODE_FULL_EDIT (MasterTree).
         """
         mode = mode or self.MODE_SELECT_ONLY
         # Alte Bausteine entfernen
@@ -80,7 +77,6 @@ class ServiceSelectorWidget(QWidget):
                 w.deleteLater()
         self._compact_row = None
         self.master_tree = None
-        self.toolbar = None
 
         if mode == self.MODE_FULL_EDIT:
             self._build_full_edit()
@@ -119,7 +115,6 @@ class ServiceSelectorWidget(QWidget):
         (entkoppelte Signale, der Orchestrator verknuepft sie mit seinen
         Handlern)."""
         self.master_tree = MasterTree(self.model, parent=self)
-        self.toolbar = None
         self._layout.addWidget(self.master_tree, 1)
 
         self.master_tree.selection_changed.connect(self.selection_changed)

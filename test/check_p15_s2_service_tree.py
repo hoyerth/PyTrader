@@ -30,7 +30,7 @@ E) ServiceSelectorWidget (Modus SELECT_ONLY):
    - selection_changed(set_id, service_id) wird bei Auswahl emittiert.
 
 F) ServiceSelectorWidget (Modus FULL_EDIT / MasterTree):
-   - master_tree + toolbar vorhanden; 3 Top-Level-Gruppen (📁/⚡/📦).
+   - master_tree vorhanden (ohne Toolbar, volle Hoehe); 3 Top-Level-Gruppen (📁/⚡/📦).
    - Service-/Set-/Plugin-Zeilen tragen den Info-Button (QPushButton "ℹ",
      Icon-Breite) in Spalte 1; Tooltip + gelbe Faerbung bei Indikator-
      Zugehoerigkeit; info_requested-Signal bei Klick.
@@ -295,7 +295,11 @@ full = ServiceSelectorWidget(mode=ServiceSelectorWidget.MODE_FULL_EDIT,
 check("F1) MasterTree vorhanden", full.master_tree is not None)
 # 05.08.2026: CRUD-/Order-Buttons oberhalb des Baums entfernt – der
 # MasterTree hat die volle vertikale Hoehe (alle Aktionen via Kontextmenue).
-check("F2) Keine Toolbar mehr (volle Baum-Hoehe)", full.toolbar is None)
+# Der ServiceToolbar wurde am 05.08.2026 vollstaendig entfernt (archiviert
+# unter .backup_service_toolbar/); auch das toolbar-Attribut existiert nicht
+# mehr.
+check("F2) Keine Toolbar mehr (volle Baum-Hoehe)",
+      not hasattr(full, "toolbar"))
 mt = full.master_tree
 check("F3) 3 Top-Level-Gruppen", mt.topLevelItemCount() == 3,
       str(mt.topLevelItemCount()))
