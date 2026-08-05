@@ -187,6 +187,14 @@ class ContentScrollMixin:
         überschrieb der Reflow nach restore_state() die persistierte Geometrie
         (Fenster schrumpfte auf Inhaltgröße), wodurch save_state() die falsche
         Größe speicherte und die letzte Fensterposition/-größe verloren ging.
+
+        05.08.2026 (Kleinere Einstellungen): Mit `_exact_fit_to_content = True`
+        (z. B. ServiceWindow) wird das Fenster IMMER exakt auf min(Inhalt,
+        Bildschirm) gesetzt – auch SCHRUMPFEND. Die Fenstergröße folgt dann
+        vollständig dem Inhalt (rechts = rechter Box-Rand, unten = Log-Unter-
+        kante); NUR die Position wird persistiert (ServiceWindow-Override).
+        Alle anderen Mixin-Nutzer (z. B. Indikator-Dialog) behalten das
+        wachse-nie-schrumpfe-Verhalten.
         """
         if self._content_widget is not None and self._content_widget.layout() is not None:
             self._content_widget.resize(self._content_widget.layout().sizeHint())
@@ -195,10 +203,16 @@ class ContentScrollMixin:
         desired = QSize(content.width() + frame.width(),
                         content.height() + frame.height())
         screen = QApplication.primaryScreen().availableGeometry()
-        # Nur wachsen, nie schrumpfen (unter aktuelle Größe) + Screen-Klemme.
-        current = self.size()
-        new_w = min(max(desired.width(), current.width()), screen.width())
-        new_h = min(max(desired.height(), current.height()), screen.height())
+        if getattr(self, '_exact_fit_to_content', False):
+            # EXACT-FIT: Fenster exakt auf min(Inhalt, Bildschirm) – auch
+            # schrumpfen, wenn der Inhalt kleiner wird (Punkte 3+4).
+            new_w = min(desired.width(), screen.width())
+            new_h = min(desired.height(), screen.height())
+        else:
+            # Nur wachsen, nie schrumpfen (unter aktuelle Größe) + Screen-Klemme.
+            current = self.size()
+            new_w = min(max(desired.width(), current.width()), screen.width())
+            new_h = min(max(desired.height(), current.height()), screen.height())
         self.resize(new_w, new_h)
 
     def _invalidate_content_caches(self) -> None:

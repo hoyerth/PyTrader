@@ -679,3 +679,28 @@ ew_set_dialog.py, param_columns.py, 	rash_dialog.py (Exit 0).
 * Temporaere Testdateien (`tmp_measure_param_width.py`, `tmp_diff.txt`) danach geloescht (Regel: Tests nur in `test/`).
 * Keine UI-Tests (Regel). Manuelle UI-Verifikation durch den Anwender.
 * `docs/x_Exports.md` bleibt unangetastet (Nutzer-Export, nicht Bestandteil dieses Commits).
+
+
+### 3.27 Schritt 27 - Kleinere Einstellungen: Position-Persistenz, doppelte Standard-Hoehe, Exact-Fit an Inhalt (05.08.2026)
+
+**Anlass (vom Anwender uebergeben - 5 Punkte):** (1) Die Fensterposition wird nicht mehr saved & restored. (2) Die Default-Hoehe von Tree und Parameter-Box soll verdoppelt werden. (3) Die Fenster-Hoehe soll exakt unter dem Log-Fenster enden. (4) Die Fenster-Breite soll exakt hinter dem rechten Ende der Parameter-Box enden. (5) Die Log-Hoehe soll auf 4 Zeilen begrenzt werden - die Log-Breite soll genauso breit sein wie der Tree.
+
+**Entscheidungen (AskQuestion, Option 1):** Die Fenster-GROESSE wird kuenftig IMMER exakt an den Inhalt angepasst (auch SCHRUMPFEND) - NUR die POSITION wird gespeichert und wiederhergestellt. Ein fester Groessenwert wuerde das exakte Anpassen an Tree/Log/Box (Punkte 3+4) unterlaufen. Zusaetzlich: auto_restore=False + _keep_history_on_close=True - die Position bleibt auch bei MANUELLEM Schliessen (X) erhalten, aber das Fenster poppt beim App-Start NICHT ungefragt wieder auf (nur ueber den Service-Button oeffnen).
+
+**A) `serviceui/service_win.py`:**
+* **Punkt 1 (Position):** `@register_persistent_window(auto_restore=False)`; neue Klassen-Attribute `_keep_history_on_close = True` und `_exact_fit_to_content = True`. Eigene `save_state()`/`restore_state()`-Overrides: speichern/wiederherstellen NUR `pos()` (move), KEINE resize() - die Groesse folgt dem Inhalt-Reflow. Symbol/Timeframe-Restore bleibt erhalten. Nach dem Oeffnen wird zusaetzlich `QTimer.singleShot(0, self._apply_reflow_size)` geplant (Initial-Exact-Fit).
+* **Punkt 2 (doppelte Hoehe):** `_param_scroll.setMaximumHeight(620 -> 1240)`; neues `_apply_reflow_size()`-Override setzt die Splitter-Mindest-Hoehe auf `2x` seiner natuerlichen Hoehe (nach setMinimumHeight werden die Layout-Caches erneut invalidiert - Qt-6.11-Quirk, sonst uebernimmt der vertikale Layout-sizeHint das neue Minimum nicht).
+* **Punkt 3 (Fenster-Hoehe endet unter dem Log):** Das Log (text_log) wandert in die LINKE Splitter-Spalte UNTER den MasterTree (`right_layout.addWidget(self.text_log, 0)`) - das Fenster endet dadurch unten exakt an der Log-Unterkante.
+* **Punkt 5 (Log):** Log-Hoehe font-basiert auf 4 Zeilen begrenzt (`fontMetrics().lineSpacing() * 4 + 12` statt der bisherigen fixen 120px); durch die Platzierung in der linken Spalte entspricht die Log-Breite exakt der Tree-Breite.
+
+**B) `scrollable_content.py` (Exact-Fit):**
+* `resize_to_clamped_content()`: mit `getattr(self, '_exact_fit_to_content', False)` wird das Fenster IMMER exakt auf `min(Inhalt, Bildschirm)` gesetzt - auch SCHRUMPFEND. Bisher galt "nur wachsen, nie schrumpfen". Alle anderen Mixin-Nutzer (z. B. `IndicatorSettingsDialog` in chart/indicator_dialog.py) behalten das bisherige Verhalten (Default False).
+
+**Validierung (headless, gruen):**
+* `python -m py_compile` auf `serviceui/service_win.py`, `scrollable_content.py` (Exit 0); UI-XML parsebar; Import-Smoke via venv-Python OK (ServiceWindow auto_restore=False / keep_history=True / exact_fit=True; IndicatorSettingsDialog exact_fit default False).
+* Echte `ServiceWindow`-Instanz (offscreen, Test-DB in `test/`, 1920-FakeScreen): Splitter-Hoehe 379 -> **758** (2x, min=758), Log-Hoehe **68px = 4 Zeilen**, Log-Breite **400px = Tree-Breite**, Log-/Box-Unterkanten alle 757 = Fenster-Unterkante (Punkt 3), Fenster 1386x808 (Breite = exakt Box-Rand, Punkt 4; Hoehe = Inhalt + Frame).
+* Position-Persistenz-Test (`tmp_geo_verify.py`): 7/7 PASS - Position restauriert (113,206), Groesse NICHT restauriert (exakt Inhalt statt 500x300), save_state speichert Position (250,300), Eintrag BLEIBT nach manuellem close() (keep_history=True), Wiedereroeffnung an (250,300).
+* `test/test.py` an die neue Semantik angepasst (Teil 1 P2/P3/P5, Teil 3 H2-H5/H7 - lokal in test/, nicht getrackt).
+* Temporaere Testdateien (`tmp_geo_verify.py`, `tmp_measure_h.py`, `tmp_debug_resize.py`, `tmp_qttest.py` u. a.) danach geloescht (Regel: Tests nur in `test/`).
+* Keine UI-Tests (Regel). Manuelle UI-Verifikation durch den Anwender.
+* `docs/x_Exports.md` bleibt unangetastet (Nutzer-Export, nicht Bestandteil dieses Commits).

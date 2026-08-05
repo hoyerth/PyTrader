@@ -27,7 +27,7 @@ from typing import Any, Dict, Optional
 from PySide6.QtCore import QFile, QIODevice, QTimer, Qt, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QGroupBox, QHBoxLayout,
+    QApplication, QComboBox, QDialog, QGroupBox, QHBoxLayout,
     QInputDialog, QMenu,
     QMessageBox, QPushButton, QSplitter, QTextEdit,
     QVBoxLayout, QWidget,
@@ -76,15 +76,20 @@ from serviceui.service_selector_widget import ServiceSelectorWidget
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
-@register_persistent_window()
+@register_persistent_window(auto_restore=False)
 class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActionsMixin, PersistentWindow):
     INSTANCE_ID = "win_service"
-    # Bugfix 04.08.2026 (Fenster-Historie): auto_restore=True – wie chart_win
-    # wird das ServiceWindow beim App-Start wiederhergestellt, wenn es beim
-    # Beenden der App OFFEN war (Geometrie/Position werden dann restauriert).
-    # _keep_history_on_close bleibt Default (False): ein MANUELL geschlossenes
-    # Fenster wird aus der aktiven History entfernt (delete_instance) und
-    # poppt beim naechsten Start NICHT wieder auf.
+    # 05.08.2026 (Kleinere Einstellungen): auto_restore=False + keep_history=True.
+    # Die FENSTERPOSITION wird in JEDEM Fall gespeichert und wiederhergestellt
+    # (auch nach manuellem Schliessen mit X) – _keep_history_on_close=True
+    # haelt den Geometrie-Eintrag in der DB. auto_restore=False verhindert das
+    # ungefragte Wiederoeffnen beim App-Start (das Fenster wird nur ueber den
+    # Service-Button geoeffnet und dort an der gespeicherten Position platziert).
+    _keep_history_on_close = True
+    # 05.08.2026: Die FensterGROESSE folgt immer exakt dem Inhalt (auch
+    # schrumpfen) – NUR die Position wird persistiert (save_state/restore_state
+    # Overrides weiter unten). Ermoeglicht durch ContentScrollMixin.
+    _exact_fit_to_content = True
 
     def __init__(self, parent=None, service_set_repo: Optional[ServiceSetRepository] = None):
         super().__init__(parent)
@@ -133,12 +138,14 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self.combo_tf: QComboBox = self.ui.findChild(QComboBox, "combo_tf")
         # Phase 14 P14-05: Papierkorb-Button (Soft-Delete/Wiederherstellung)
         self.btn_trash_sets: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_trash_sets")
-        # Bugfix 05.08.2026 (Punkt 1): Das Log (text_log) klebte am unteren
-        # Bildschirmrand, weil es unbegrenzt wuchs und das Fenster bis zum
-        # Screen-Cap aufging. Max. Hoehe ~5 Zeilen -> kompaktes Log, kein
-        # Bildschirmrand-Kleben (intern scrollt das QTextEdit).
+        # 05.08.2026 (Kleinere Einstellungen): Das Log wird in die LINKE
+        # Splitter-Spalte UNTER den MasterTree verschoben (Breite = Tree-Breite)
+        # und auf 4 Zeilen Hoehe begrenzt. Das Fenster endet dadurch exakt
+        # unter dem Log (siehe right_panel-Aufbau weiter unten).
         if self.text_log:
-            self.text_log.setMaximumHeight(120)
+            fm = self.text_log.fontMetrics()
+            self.text_log.setMaximumHeight(fm.lineSpacing() * 4 + 12)
+            self.text_log.setMinimumHeight(fm.lineSpacing() * 4 + 12)
 
         # Phase 13 5.4 Schritt 1: Dynamische Service-Spalten (Breite/Höhe aus
         # dem Inhalt – KEINE fixen Pixelwerte). Das Inhalt-Layout erhält
@@ -190,6 +197,13 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.service_selector = ServiceSelectorWidget(
                 mode=ServiceSelectorWidget.MODE_FULL_EDIT, parent=self)
             right_layout.addWidget(self.service_selector, 1)
+            # 05.08.2026 (Kleinere Einstellungen, Punkt 5): Das Log wandert
+            # UNTER den MasterTree in dieselbe Spalte – seine Breite entspricht
+            # damit exakt der Tree-Breite, und das Fenster endet unten exakt
+            # unter dem Log (Punkt 3). Das QTextEdit wird dabei automatisch aus
+            # dem central_layout (verticalLayout) umgehaengt.
+            if self.text_log:
+                right_layout.addWidget(self.text_log, 0)
             # Mindest-Breite, damit eingerueckte Texte (LEVEL_INDENT) lesbar
             # sind; die Maximalbreite entfaellt im 2-Spalten-Layout (der Tree
             # bekommt den groesseren Anteil, die Parameter-Spalte bleibt
@@ -209,14 +223,16 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             param_layout = QVBoxLayout(self._param_panel)
             param_layout.setContentsMargins(0, 0, 0, 0)
             param_layout.setSpacing(6)
-            # max. Hoehe der Parameter-Box; die max. BREITE ist so bemessen,
-            # dass ZWEI Service-Spalten nebeneinander OHNE horizontalen
-            # Scrollbalken passen - bei mehr Services/Spalten scrollt die
-            # ContentScrollArea.
+            # 05.08.2026 (Kleinere Einstellungen, Punkt 2): max. Hoehe der
+            # Parameter-Box VERDOPPELT (620 -> 1240), damit Tree UND Box
+            # standardmaessig doppelt so hoch sind; die max. BREITE bleibt so
+            # bemessen, dass ZWEI Service-Spalten nebeneinander OHNE
+            # horizontalen Scrollbalken passen - bei mehr Services/Spalten
+            # scrollt die ContentScrollArea.
             self._param_scroll = ContentScrollArea()
             self._param_scroll.setWidgetResizable(False)
             self._param_scroll.setWidget(self.widget_service_columns)
-            self._param_scroll.setMaximumHeight(620)
+            self._param_scroll.setMaximumHeight(1240)
             self._param_scroll.setMaximumWidth(1000)
             param_layout.addWidget(self._param_scroll, 1)
             # Aktions-Leiste direkt UNTER der Parameter-Box - [Speichern]
@@ -342,10 +358,87 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
 
         self.log(f"Verfügbare Plugins: {_available_plugin_ids()}")
 
-        # State asynchron wiederherstellen (nach show(), damit move/resize vom Window-Manager akzeptiert werden)
+        # State asynchron wiederherstellen (nach show(), damit move vom
+        # Window-Manager akzeptiert werden). Die POSITION wird restauriert
+        # (Punkt 1); direkt danach setzt der Reflow das Fenster exakt auf den
+        # Inhalt (Breite = Tree+Box, Hoehe = bis Log-Unterkante, Punkte 3+4).
         QTimer.singleShot(0, self.restore_state)
+        QTimer.singleShot(0, self._apply_reflow_size)
 
     # --- PersistentWindow-Interface ---
+
+    def save_state(self) -> None:
+        """Persistiert die Fenster-POSITION (05.08.2026, Punkt 1).
+
+        Die Fenster-GROESSE wird bewusst NICHT wiederhergestellt – sie folgt
+        immer exakt dem Inhalt (resize_to_clamped_content, _exact_fit_to_content).
+        Ein fester Groessenwert wuerde das exakte Anpassen an Tree/Log/Box
+        (Punkte 3+4) unterlaufen. Position + Symbol/Timeframe bleiben erhalten.
+        """
+        inst_id = self.get_instance_id()
+        if not inst_id:
+            return
+        p = self.pos()
+        self._state_manager.save_window_geometry(
+            inst_id, p.x(), p.y(), self.width(), self.height(), self.isMaximized())
+        symbol = self.get_persistent_symbol()
+        tf = self.get_persistent_timeframe()
+        if symbol and tf:
+            self._state_manager.save_instance_state(
+                instance_id=inst_id, symbol=symbol, timeframe=tf)
+
+    def restore_state(self) -> None:
+        """Stellt NUR die Fenster-POSITION wieder her (05.08.2026, Punkt 1).
+
+        Die Groesse wird hier bewusst NICHT angewendet – der Inhalt-Reflow
+        (resize_to_clamped_content) setzt das Fenster exakt auf min(Inhalt,
+        Bildschirm). Die gespeicherte Breite/Hoehe waere sonst stale
+        (z.B. schmaler als die Parameter-Box).
+        """
+        inst_id = self.get_instance_id()
+        if not inst_id:
+            return
+        # Window-Flags korrigieren (QUiLoader setzt oft Qt.Tool | Qt.Dialog).
+        self._fix_window_flags()
+        geom = self._state_manager.get_window_geometry(inst_id)
+        if geom:
+            pos_x = geom.get("pos_x")
+            pos_y = geom.get("pos_y")
+            screen_geo = QApplication.primaryScreen().availableGeometry()
+            if pos_x is not None and pos_y is not None:
+                if pos_x < screen_geo.x() - 100 or pos_x > screen_geo.right() or \
+                   pos_y < screen_geo.y() - 100 or pos_y > screen_geo.bottom():
+                    pos_x, pos_y = 100, 100
+                self.move(pos_x, pos_y)
+            self._restored_is_maximized = bool(geom.get("is_maximized", False))
+        # Symbol/Timeframe aus instance_states
+        all_inst = self._state_manager.load_all_instances()
+        matched = next((i for i in all_inst if i.get("instance_id") == inst_id), None)
+        if matched:
+            raw_symbol = matched.get("symbol")
+            raw_tf = matched.get("timeframe")
+            symbol = str(raw_symbol) if raw_symbol is not None else self.get_persistent_symbol()
+            tf = str(raw_tf) if raw_tf is not None else self.get_persistent_timeframe()
+            self._apply_persistent_filters(symbol, tf)
+
+    def _apply_reflow_size(self) -> None:
+        """Erweitert den Mixin-Reflow um Punkt 2 (05.08.2026).
+
+        Der Splitter (Tree | Parameter-Box) bekommt eine Mindest-Hoehe von
+        2x seiner natuerlichen Hoehe – dadurch oeffnet das Fenster
+        standardmaessig doppelt so hoch und Tree UND Box sind doppelt so
+        hoch. WICHTIG: Nach dem setMinimumHeight muessen die Layout-Caches
+        erneut invalidiert werden – der vertikale Layout-sizeHint ist sonst
+        veraltet (Qt 6.11-Caching) und uebernimmt das neue Minimum nicht
+        (Fenster bliebe auf der alten Hoehe).
+        """
+        sp = getattr(self, "main_splitter", None)
+        if sp is not None:
+            natural = sp.sizeHint().height()
+            sp.setMinimumHeight(natural * 2)
+            sp.updateGeometry()
+            self._invalidate_content_caches()
+        super()._apply_reflow_size()
 
     def get_persistent_symbol(self) -> str:
         return self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
