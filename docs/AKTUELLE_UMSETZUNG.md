@@ -522,3 +522,19 @@ ew_set_dialog.py, param_columns.py, 	rash_dialog.py (Exit 0).
 * `test/test.py` (designierte Verifikation, offscreen auf Test-DBs isoliert): **ALLE PRÜFUNGEN BESTANDEN** (inkl. V1–V11 Paritäts-/Performance-Checks, D1–D3 Editor, S1–S8 Sync-Guard).
 * **Hinweis (Betrieb):** Während der Verifikation hängengebliebene Offscreen-Dialog-Prozesse hielten die DuckDB-Locks (`IO Error: … wird von einem anderen Prozess verwendet` – App-Start fehlgeschlagen). Nach Beenden der hängenden Prozesse (PID 1864/30332) waren `app_data`/`analytics`/`market_data.duckdb` wieder lesbar und der App-Start funktionierte. Künftige Dialog-Verifikationen patchen `QDialog.exec` (sofortiger Return), damit sich keine modalen Dialoge im Offscreen-Modus aufhängen.
 * `docs/x_Exports.md` wurde vom Anwender selbst export-aktualisiert und bleibt wie immer unangetastet (nicht Bestandteil dieses Commits).
+
+### 3.22 Schritt 22 - Bugfix: Plugin-/Standalone-Info-Button nutzt denselben Beschreibungs-Editor wie Einzel-Services (05.08.2026, Commit `0ab1bde`)
+
+**Anlass (vom Anwender übergeben - "info button hinter Services in Plugin oder standalone: noch die alte Methode, bitte genau so umstellen wie bei den einzelservices in den sets"):** Der Info-Button (Spalte 1 des MasterTree) auf Plugin-Zeilen in den Gruppen ⚡ Standalone Services und 📦 Alle verfügbaren Plugins öffnete noch den alten Read-Only-Dialog (`ServiceDescriptionDialog`), während die Einzel-Services in den Sets bereits den neuen editierbaren `ServiceDescriptionEditDialog` nutzten (P16 3.20 hatte Plugin-Zeilen bewusst ausgenommen - Read-Only-Design, keine Plugin-Beschreibungen im Service Window).
+
+**Fix (`serviceui/service_win.py`, `_on_tree_info_requested` Fall 2):**
+* Plugin-/Standalone-Zeilen öffnen jetzt **denselben `ServiceDescriptionEditDialog`** wie die Einzel-Services der Sets (gleicher Titel "Service-Beschreibung bearbeiten", gleiche `header_line`-Logik via `_info_header_tooltip`).
+* Der Editor wird mit der **Plugin-Metadaten-Beschreibung** vorbefüllt (`metadata['description']`).
+* **Kein `save_requested`-Anschluss:** Ein Plugin ohne Instanz/Set hat kein Persistenz-Ziel (persistierbar sind nur Instanz- und Set-Beschreibung) - Speichern/Abbrechen schließen den Dialog konsistent, es wird nichts geschrieben.
+* Docstring entsprechend aktualisiert (Plugin-Zeile als editierbar dokumentiert).
+
+**Validierung (headless, grün):**
+* `python -m py_compile serviceui/service_win.py` (Exit 0).
+* Import `ServiceDescriptionDialog` bleibt gültig (weiterhin in `_show_service_info` für die markierte Instanz der execution_order-Liste genutzt).
+* Manueller UI-Test durch den Anwender: ℹ-Button auf Standalone-/Plugin-Zeile → Editor-Dialog erscheint (gleiches Verhalten wie Einzel-Services).
+* `docs/x_Exports.md` bleibt unangetastet (Nutzer-Export, nicht Bestandteil des Commits).
