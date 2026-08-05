@@ -22,6 +22,9 @@ PyTrader/
     .backup_parameter_panel/
         serviceui/
             parameter_panel.py
+    .backup_service_toolbar/
+        serviceui/
+            toolbar.py
     analytics/
         __init__.py
         statistics_repository.py
@@ -99,6 +102,7 @@ PyTrader/
         master_tree.py
         new_set_dialog.py
         param_columns.py
+        run_worker.py
         service_selector_widget.py
         service_set_utils.py
         service_win.py
@@ -106,11 +110,8 @@ PyTrader/
         set_run_worker.py
         status_panel.py
         symbols_win.py
-        toolbar.py
         trash_dialog.py
     test/
-        _apply_fix_round3.py
-        _apply_fix_round3_sw.py
         build_cont_map.py
         check_analytics_leak.py
         check_analytics_queries.py
@@ -121,6 +122,7 @@ PyTrader/
         check_app_state.py
         check_broker_tz.py
         check_chart_data.py
+        check_current_timestamp.py
         check_dialog_geometry.py
         check_duckdb_write_contention.py
         check_fixes_1503.py
@@ -178,6 +180,7 @@ PyTrader/
         check_plugin_time_filter.py
         check_race_guard.js
         check_resolve_realtime.js
+        check_service_run_fixes.py
         check_statistics_repo.py
         check_table_render_fix.py
         check_tf_change_all11.py
@@ -190,6 +193,7 @@ PyTrader/
         check_time_utils.js
         grid_ref.py
         migrate_grid_liquidity.py
+        migrate_legacy_feature_store.py
         simulate_chart_mapping.py
         test.py
         test_db_lock.py
@@ -1481,6 +1485,7 @@ from serviceui.service_win import ServiceWindow
 from analytics.ui.analytics_win import AnalyticsWindow
 from properties_win import PropertiesWindow
 from config.app_settings import AppSettings
+from config.event_bus import event_bus
 from analytics.background_workers.live_analyzer import LiveAnalyzer
 
 # ==============================================================================
@@ -1709,6 +1714,16 @@ class MainWindow(QMainWindow):
         self.sync_timer.setInterval(45000)
         self.sync_timer.timeout.connect(self.trigger_background_sync)
         self.sync_timer.start()
+
+        # Phase 16 (05.08.2026): Concurrency-Guard – solange im ServiceWindow
+        # intensive Service-Berechnungen laufen (SetRunWorker /
+        # ServiceRunWorker / HistoricalScanner), wird der 45s-sync_timer
+        # pausiert (EventBus, entkoppelt – kein Fenster-Wissen). Referenz-
+        # zaehler, damit mehrere parallele Runs den Timer nur EINMAL stoppen
+        # und erst nach dem letzten Abschluss wieder starten.
+        self._sync_pause_count: int = 0
+        event_bus.service_run_started.connect(self._on_service_run_started)
+        event_bus.service_run_finished.connect(self._on_service_run_finished)
 
         self.tick_worker: LiveTickWorker = LiveTickWorker(self.get_currently_active_pairs)
         self.tick_worker.ticks_ready.connect(self.on_ticks_ready)
@@ -1941,6 +1956,30 @@ class MainWindow(QMainWindow):
         self.sync_thread = DataSyncWorker()
         self.sync_thread.sync_completed.connect(self.on_sync_completed)
         self.sync_thread.start()
+
+    # -------------------------------------------------------------------------
+    # Phase 16 (05.08.2026): Concurrency-Guard für den 45s-sync_timer
+    # -------------------------------------------------------------------------
+    @Slot()
+    def _on_service_run_started(self) -> None:
+        """Pausiert den sync_timer, sobald eine Service-Berechnung startet."""
+        self._sync_pause_count += 1
+        if self._sync_pause_count == 1 and self.sync_timer.isActive():
+            self.sync_timer.stop()
+
+    @Slot()
+    def _on_service_run_finished(self) -> None:
+        """Startet den sync_timer, sobald die letzte Service-Berechnung
+        abgeschlossen ist (Referenzzähler auf 0)."""
+        if self._sync_pause_count > 0:
+            self._sync_pause_count -= 1
+        if self._sync_pause_count != 0:
+            return
+        app = QApplication.instance()
+        if getattr(app, '_is_quitting', False):
+            return
+        if not self.sync_timer.isActive():
+            self.sync_timer.start()
 
     def _dispatch_tick_map(self, ticks_map: Dict[str, Dict[str, float | int]]) -> None:
         """Verteilt Ticks an alle geöffneten Chartfenster."""
@@ -4247,6 +4286,204 @@ class ParameterPanel(ContentScrollMixin, ServiceParamColumnsMixin, QWidget):
 
 --------------------------------------------------
 
+### DATEI: .backup_service_toolbar/serviceui/toolbar.py
+```py
+# serviceui/toolbar.py
+"""
+Service-UI: Aktions-Toolbar (Phase 15 15.02, bifunktional 05.08.2026).
+
+Entkoppelte Button-Leiste fuer Struktur-Aktionen des Service-Fensters
+(Modus B / FULL_EDIT des ServiceSelectorWidget):
+
+  * [➕ Set] / [➕ Service] / [➕] – bifunktionaler Hinzufuegen-Button. Der
+    Orchestrator schaltet den Modus ueber `set_add_mode()`:
+      "set"     -> Text '[➕ Set]'     -> emittiert `add_set_requested`
+                   (neues leeres Service-Set anlegen)
+      "service" -> Text '[➕ Service]' -> oeffnet das Plugin-Popup
+                   (`request_add_popup`, emittiert `add_service_requested`)
+      "none"    -> Text '[➕]', deaktiviert
+  * [Order ▲] / [Order ▼] – Aenderung der execution_order im aktiven Set.
+    Nur aktiv, wenn ein Service innerhalb eines Sets gewaehlt ist
+    (`set_order_enabled()`).
+  * [🗑️ Set löschen] / [➖ Service entfernen] / [🗑️] – bifunktionaler
+    Entfernen-Button. Der Orchestrator schaltet den Modus ueber
+    `set_remove_mode()` und emittiert `remove_requested` (der Orchestrator
+    fuehrt die P14-04-Sperrpruefung aus und entscheidet, ob das Set oder der
+    Service entfernt wird).
+
+Die Toolbar emittiert NUR Signale – sie kennt weder das Repository noch die
+Datenbank (Invariante 4: kein SQL in UI; SRP: eine Aufgabe pro Klasse).
+"""
+
+from typing import List, Optional
+
+from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtWidgets import (
+    QHBoxLayout, QMenu, QPushButton, QWidget,
+)
+
+
+class ServiceToolbar(QWidget):
+    """Aktions-Buttons der Service-Verwaltung (schwellenfrei entkoppelt)."""
+
+    #: Emittiert mit der plugin_id, wenn im [➕ Service]-Popup ein Plugin gewaehlt wird
+    add_service_requested = Signal(str)
+    #: Emittiert im Modus 'set' des bifunktionalen Hinzufuegen-Buttons
+    #: (neues leeres Service-Set anlegen – Orchestrator fuehrt die Aktion aus).
+    add_set_requested = Signal()
+    #: Ausfuehrungs-Reihenfolge: um -1 (hoch) bzw. +1 (runter) verschieben
+    move_up_requested = Signal()
+    move_down_requested = Signal()
+    #: Markierten Service / das markierte Set entfernen (Orchestrator fuehrt
+    #: die P14-04-Sperrpruefung aus und entscheidet ueber Set vs. Service).
+    remove_requested = Signal()
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._menu: Optional[QMenu] = None
+        #: Modus des bifunktionalen Hinzufuegen-Buttons ("set"/"service"/"none")
+        self._add_mode: str = "none"
+
+        self.btn_add = QPushButton("➕")
+        self.btn_add.setToolTip(
+            "Hinzufuegen – abhaengig von der Auswahl: neues Set oder Service.")
+        self.btn_move_up = QPushButton("Order ▲")
+        self.btn_move_up.setToolTip("Service in der Reihenfolge nach oben verschieben.")
+        self.btn_move_down = QPushButton("Order ▼")
+        self.btn_move_down.setToolTip("Service in der Reihenfolge nach unten verschieben.")
+        self.btn_remove = QPushButton("🗑️")
+        self.btn_remove.setToolTip(
+            "Entfernen – abhaengig von der Auswahl: Set (Papierkorb) oder "
+            "Service (P14-04-Sperrpruefung).")
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        lay.addWidget(self.btn_add)
+        lay.addWidget(self.btn_move_up)
+        lay.addWidget(self.btn_move_down)
+        lay.addWidget(self.btn_remove)
+        lay.addStretch(1)
+
+        self.btn_add.clicked.connect(self._on_add_clicked)
+        self.btn_move_up.clicked.connect(self.move_up_requested)
+        self.btn_move_down.clicked.connect(self.move_down_requested)
+        self.btn_remove.clicked.connect(self.remove_requested)
+
+        # Bifunktional: ohne Auswahl sind alle Struktur-Buttons deaktiviert
+        self.set_add_mode("none")
+        self.set_remove_mode("none")
+        self.set_order_enabled(False)
+
+    # -------------------------------------------------------------------------
+    # Popup-Auswahl der Plugins ([➕ Service])
+    # -------------------------------------------------------------------------
+
+    def show_add_menu(self, plugin_ids: List[str],
+                      anchor: Optional[QWidget] = None) -> None:
+        """Zeigt das Popup-Menue mit den verfuegbaren Plugins.
+
+        Args:
+            plugin_ids: sortierte Liste der Plugin-IDs (aus dem Modell).
+            anchor:     Widget, an dem das Menue ausgerichtet wird (Default:
+                        der [➕ Service]-Button).
+        """
+        self._menu = QMenu(self)
+        if not plugin_ids:
+            self._menu.addAction("(keine Plugins verfuegbar)").setEnabled(False)
+        else:
+            for pid in plugin_ids:
+                action = self._menu.addAction(pid)
+                action.setData(pid)
+        target = anchor or self.btn_add
+        chosen = self._menu.exec(
+            target.mapToGlobal(QPoint(0, target.height())))
+        if chosen is not None and chosen.data():
+            self.add_service_requested.emit(str(chosen.data()))
+
+    def _on_add_clicked(self) -> None:
+        """[➕]-Button geklickt – der bifunktionale Modus entscheidet:
+
+        * "set"     -> neues leeres Service-Set (add_set_requested)
+        * "service" -> Plugin-Popup (request_add_popup, vom Orchestrator
+                       befuellt; ohne Plugin-Liste passiert nichts)
+        * "none"    -> Button ist deaktiviert (kein Signal)
+        """
+        mode = getattr(self, "_add_mode", "none")
+        if mode == "set":
+            self.add_set_requested.emit()
+        elif mode == "service":
+            if hasattr(self, "request_add_popup") and callable(self.request_add_popup):
+                self.request_add_popup()
+
+    # -------------------------------------------------------------------------
+    # Bifunktionale Aktions-Zustaende (Orchestrator steuert Modus + Aktivierung)
+    # -------------------------------------------------------------------------
+
+    def set_add_mode(self, mode: str) -> None:
+        """Schaltet den bifunktionalen [➕]-Button (Text + Funktion).
+
+        Args:
+            mode: "set"     -> '[➕ Set]'    (neues leeres Set anlegen)
+                  "service" -> '[➕ Service]' (Plugin zum aktiven Set hinzufuegen)
+                  "none"    -> '[➕]' deaktiviert
+        """
+        self._add_mode = mode
+        if mode == "set":
+            self.btn_add.setText("➕ Set")
+            self.btn_add.setEnabled(True)
+            self.btn_add.setToolTip("Neues leeres Service-Set anlegen.")
+        elif mode == "service":
+            self.btn_add.setText("➕ Service")
+            self.btn_add.setEnabled(True)
+            self.btn_add.setToolTip(
+                "Service zum aktiven Set hinzufuegen – waehlt das Plugin aus "
+                "einem Popup.")
+        else:
+            self.btn_add.setText("➕")
+            self.btn_add.setEnabled(False)
+            self.btn_add.setToolTip(
+                "Keine gueltige Auswahl – bitte ein Set oder einen Service "
+                "im Baum markieren.")
+
+    def set_remove_mode(self, mode: str) -> None:
+        """Schaltet den bifunktionalen [🗑️]-Button (Text + Funktion).
+
+        Args:
+            mode: "set"     -> '[🗑️ Set löschen]' (Papierkorb / Soft-Delete)
+                  "service" -> '[➖ Service entfernen]' (P14-04-Sperrpruefung)
+                  "none"    -> '[🗑️]' deaktiviert
+        """
+        if mode == "set":
+            self.btn_remove.setText("🗑️ Set löschen")
+            self.btn_remove.setEnabled(True)
+            self.btn_remove.setToolTip(
+                "Markiertes Service-Set in den Papierkorb verschieben (P14-05).")
+        elif mode == "service":
+            self.btn_remove.setText("➖ Service entfernen")
+            self.btn_remove.setEnabled(True)
+            self.btn_remove.setToolTip(
+                "Markierten Service aus dem Set entfernen (P14-04-Sperrpruefung).")
+        else:
+            self.btn_remove.setText("🗑️")
+            self.btn_remove.setEnabled(False)
+            self.btn_remove.setToolTip(
+                "Keine gueltige Auswahl – bitte ein Set oder einen Service "
+                "im Baum markieren.")
+
+    def set_order_enabled(self, enabled: bool) -> None:
+        """Aktiviert/deaktiviert die [Order ▲]/[Order ▼]-Buttons.
+
+        Nur aktiv, wenn ein Service INNERHALB eines Sets gewaehlt ist
+        (sonst gibt es keine execution_order zu schalten).
+        """
+        self.btn_move_up.setEnabled(enabled)
+        self.btn_move_down.setEnabled(enabled)
+
+```
+
+--------------------------------------------------
+
 ### DATEI: analytics/__init__.py
 ```py
 
@@ -5940,13 +6177,108 @@ Design-Regeln:
 
 from typing import Any, Dict, List, Optional
 
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
+    QLabel,
     QPushButton,
     QTextBrowser,
+    QTextEdit,
     QVBoxLayout,
 )
+
+
+class ServiceDescriptionEditDialog(QDialog):
+    """Modaler Bearbeitungs-Dialog für die Instanz-/Set-Beschreibung.
+
+    Phase 16 (05.08.2026): Ersetzt die Read-Only-Ansicht im Service Window
+    für editierbare Beschreibungen (ServiceInstanceConfig.description bzw.
+    ServiceSetDefinition.description). Reines UI-Widget (kein Repo-Zugriff,
+    kein EventBus – IoC): Der Aufrufer (ServiceWindow) verbindet das
+    `save_requested`-Signal und persistiert via ServiceSetRepository +
+    `event_bus.service_set_changed`.
+
+    Aufbau:
+      * Optionale Kopfzeile: header_line (z.B. 'aktiv/im <Indikator>') +
+        Instanz-ID / Plugin-ID.
+      * Mehrzeiliges QTextEdit für die Beschreibung.
+      * Buttons [Abbrechen] / [Speichern] – [Speichern] emittiert
+        `save_requested(neuer_Text)` und schliesst den Dialog mit accept().
+
+    Headless-fähig: Der Konstruktor startet KEINEN Event-Loop (kein
+    exec_()); der Aufrufer entscheidet, wann modal geöffnet wird.
+    """
+
+    #: Wird beim Klick auf [Speichern] mit dem neuen Beschreibungstext
+    #: emittiert (der Orchestrator persistiert via Repo + EventBus).
+    save_requested = Signal(str)
+
+    def __init__(
+        self,
+        parent=None,
+        *,
+        instance_id: str = "",
+        plugin_id: str = "",
+        header_line: str = "",
+        description: str = "",
+        title: str = "Beschreibung bearbeiten",
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(480)
+        self.setMinimumHeight(260)
+
+        layout = QVBoxLayout(self)
+
+        head_parts: List[str] = []
+        if header_line and str(header_line).strip():
+            head_parts.append(
+                f"<b>{self._html_escape(header_line)}</b>")
+        info_bits: List[str] = []
+        if instance_id:
+            info_bits.append(f"<b>Instanz:</b> {self._html_escape(instance_id)}")
+        if plugin_id:
+            info_bits.append(f"<i>({self._html_escape(plugin_id)})</i>")
+        if info_bits:
+            head_parts.append(" ".join(info_bits))
+        if head_parts:
+            head = QLabel("<br>".join(head_parts))
+            head.setWordWrap(True)
+            layout.addWidget(head)
+
+        self._editor = QTextEdit()
+        self._editor.setPlainText(str(description or ""))
+        self._editor.setPlaceholderText(
+            "Individuelle Anmerkung für diese Instanz (optional)")
+        layout.addWidget(self._editor, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        cancel_btn = QPushButton("Abbrechen")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        save_btn = QPushButton("Speichern")
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self._on_save)
+        btn_row.addWidget(save_btn)
+        layout.addLayout(btn_row)
+
+    @staticmethod
+    def _html_escape(value: str) -> str:
+        """Minimaler HTML-Escape für Kopfzeilen-Strings (kein externer Import)."""
+        return (
+            str(value)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
+    def _on_save(self) -> None:
+        """[Speichern]: Emittiert save_requested mit dem aktuellen Text und
+        schliesst den Dialog mit accept() (keine Repo-/DB-Logik hier)."""
+        self.save_requested.emit(self._editor.toPlainText())
+        self.accept()
 
 
 class ServiceDescriptionDialog(QDialog):
@@ -6537,6 +6869,55 @@ class FeatureStoreReader:
         }
 
     # ------------------------------------------------------------------
+    # Lesen: Datum der letzten Ausfuehrung (MasterTree, 05.08.2026)
+    # ------------------------------------------------------------------
+    def fetch_last_execution_dates(self) -> Dict[str, str]:
+        """Neuester Schreib-Zeitpunkt je feature_id – formatiert als 'DD.MM.JJ'.
+
+        Wird vom ServiceSelectorModel fuer die MasterTree-Anzeige
+        'Service_Name (DD.MM.JJ)' gelesen (Datum der letzten Ausfuehrung).
+        Quelle: MAX(created_at) je feature_id ueber ALLE Symbole/Timeframes.
+        store_plugin_payload() aktualisiert created_at bei jedem Upsert
+        (ON CONFLICT DO UPDATE), damit der Zeitstempel die LETZTE Ausfuehrung
+        widerspiegelt (nicht den Erst-Schreibzeitpunkt der Bar).
+
+        Robustheit (Bugfix 05.08.2026, Punkt 1):
+          * Case-insensitiv: feature_id wird per LOWER(TRIM(...)) normalisiert –
+            Registry-/Plugin-IDs (z.B. 'proximity') werden unabhaengig von der
+            in der DB gespeicherten Gross-/Kleinschreibung gefunden.
+          * Whitespace-tolerant: fuehrende/trailing Leerzeichen (z.B. durch
+            Alt-Schreibpfade) werden ignoriert.
+          * Defensiv: Zeilen mit NULL/leerer feature_id ODER NULL created_at
+            werden uebersprungen (Alt-Rows ohne Zeitstempel koennen kein
+            gueltiges Datum liefern).
+
+        Returns:
+            Dict feature_id (lower) -> 'DD.MM.JJ' (z.B. {'proximity': '05.08.26'});
+            leer bei fehlender DB/Tabelle oder Fehler (defensiv).
+        """
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT LOWER(TRIM(feature_id)) AS fid, MAX(created_at)
+                FROM feature_store
+                WHERE feature_id IS NOT NULL AND TRIM(feature_id) != ''
+                GROUP BY LOWER(TRIM(feature_id))
+            """).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_last_execution_dates "
+                  f"fehlgeschlagen: {e}")
+            return {}
+        out: Dict[str, str] = {}
+        for r in rows:
+            if r[0] is None or r[1] is None:
+                continue
+            try:
+                out[str(r[0])] = r[1].strftime("%d.%m.%y")
+            except (AttributeError, ValueError):
+                continue
+        return out
+
+    # ------------------------------------------------------------------
     # Lesen: Metadaten
     # ------------------------------------------------------------------
     def get_available_timeframes(self, symbol: str) -> List[str]:
@@ -6935,6 +7316,9 @@ generische Service-Auswahl (ServiceSelectorWidget) auf. Quellen:
   * `PluginRegistry`                          – alle verfuegbaren Plugins
   * `StateManager.load_all_instances()`       – Live-Status "aktiv im Chart"
     (indicators_state[*]['active'] == True)
+  * `FeatureStoreReader.fetch_last_execution_dates()` – Datum der letzten
+    Ausfuehrung je feature_id (MAX(created_at) in analytics.duckdb/
+    feature_store) fuer die MasterTree-Anzeige 'Service_Name (DD.MM.JJ)'
 
 Der Model hoert auf `EventBus.service_set_changed` und aktualisiert sich
 automatisch in allen Fenstern (Invariante 5: schwellenfreie Entkopplung).
@@ -7022,6 +7406,7 @@ class ServiceSelectorModel(QObject):
     GROUP_PLUGINS = "plugins"
 
     def __init__(self, set_repo=None, state_manager=None, registry=None,
+                 feature_store_reader=None,
                  parent: Optional[QObject] = None) -> None:
         """Erstellt das Modell.
 
@@ -7031,19 +7416,28 @@ class ServiceSelectorModel(QObject):
                            den Live-Status "aktiv im Chart".
             registry:      PluginRegistry (Default: echte Instanz) – Quelle der
                            verfuegbaren Plugins.
+            feature_store_reader: FeatureStoreReader (Default: echte Instanz) –
+                           rein lesende Quelle fuer das 'Datum der letzten
+                           Ausfuehrung' (MAX(created_at) je feature_id in
+                           analytics.duckdb/feature_store – MasterTree-Anzeige
+                           'Service_Name (DD.MM.JJ)').
             parent:        Qt-Parent (optional).
         """
         super().__init__(parent)
         from analytics.engine.service_set_repository import ServiceSetRepository
         from analytics.features.feature_builder import PluginRegistry
+        from analytics.engine.feature_store_reader import FeatureStoreReader
         from state_manager import StateManager
 
         self.set_repo = set_repo or ServiceSetRepository()
         self.state_manager = state_manager or StateManager()
         self.registry = registry or PluginRegistry()
+        self.feature_store_reader = feature_store_reader or FeatureStoreReader()
 
         self._sets: List[Dict[str, Any]] = []
         self._active_indicator_ids: Set[str] = set()
+        # 05.08.2026: Datum der letzten Ausfuehrung je feature_id (DD.MM.JJ)
+        self._last_execution_dates: Dict[str, str] = {}
 
         # Initialbefuellung + Live-Sync (schwellenfrei via EventBus)
         self.refresh()
@@ -7062,7 +7456,45 @@ class ServiceSelectorModel(QObject):
             print(f"WARN [ServiceSelectorModel] list_sets() fehlgeschlagen: {e}")
             self._sets = []
         self._active_indicator_ids = self._collect_active_indicator_ids()
+        # 05.08.2026: Datum der letzten Ausfuehrung je feature_id (DD.MM.JJ) –
+        # wird nach jedem Service-Run (ServiceRunWorker -> EventBus) neu
+        # gelesen, damit der MasterTree das Datum live aktualisiert.
+        self._last_execution_dates = self._load_last_execution_dates()
         self.data_changed.emit()
+
+    def _load_last_execution_dates(self) -> Dict[str, str]:
+        """Liest das Datum der letzten Ausfuehrung je feature_id aus dem
+        feature_store (rein lesend ueber den FeatureStoreReader, Invariante
+        4: kein SQL im Modell). Defensiv: Fehler -> leer (Baum zeigt dann
+        den Fallback '(--.--.--)')."""
+        try:
+            raw = self.feature_store_reader.fetch_last_execution_dates() or {}
+        except Exception as e:
+            print(f"WARN [ServiceSelectorModel] Ausfuehrungsdaten nicht "
+                  f"lesbar: {e}")
+            return {}
+        # Case-insensitive Zuordnung (feature_id ist die Plugin-ID, z.B.
+        # 'proximity' – Registry-IDs sind case-insensitiv).
+        return {str(k).lower(): v for k, v in raw.items()}
+
+    def last_execution_date(self, plugin_id: str) -> str:
+        """Formatiertes Datum der letzten Ausfuehrung eines Services
+        ('DD.MM.JJ', z.B. '05.08.26') – Fallback '--.--.--' ohne Eintraege.
+
+        Der Zeitstempel stammt aus MAX(created_at) des feature_store fuer
+        die feature_id (Plugin-ID) des Services. store_plugin_payload()
+        aktualisiert created_at bei jedem Upsert, sodass der Wert die
+        LETZTE Ausfuehrung widerspiegelt.
+
+        Achtung (05.08.2026, Punkt 1): Der Rueckgabewert enthaelt BEWUSST
+        KEINE Klammern – der MasterTree umschliesst ihn beim Label-Aufbau
+        ('Service_Name (DD.MM.JJ)' / 'Service_Name (--.--.--)'), damit der
+        Fallback nicht doppelt geklammert wird.
+        """
+        if not plugin_id:
+            return "--.--.--"
+        return self._last_execution_dates.get(
+            str(plugin_id).lower(), "--.--.--")
 
     def _collect_active_indicator_ids(self) -> Set[str]:
         """Sammelt alle indicator_ids/plugin_ids, die in offenen Chart-
@@ -7300,6 +7732,9 @@ class ServiceSelectorModel(QObject):
                     "instance_id": iid,
                     "plugin_id": pid,
                     "badge": self.badge_for(pid),
+                    # 05.08.2026: Datum der letzten Ausfuehrung (DD.MM.JJ) –
+                    # MasterTree haengt es direkt an den Service-Namen an.
+                    "last_execution": self.last_execution_date(pid),
                 })
             set_nodes.append({
                 "set_id": s.get("set_id"),
@@ -7309,12 +7744,25 @@ class ServiceSelectorModel(QObject):
             })
 
         standalone_nodes = [
-            {"plugin_id": pid, "badge": self.badge_for(pid)}
+            {
+                "plugin_id": pid,
+                "badge": self.badge_for(pid),
+                # 05.08.2026 (Punkt 4): Datum der letzten Ausfuehrung auch fuer
+                # Standalone-Services – der MasterTree zeigt es hinter dem
+                # Plugin-Namen an (gleiche Semantik wie bei Set-Services).
+                "last_execution": self.last_execution_date(pid),
+            }
             for pid in self.get_standalone_plugin_ids()
         ]
 
         plugin_nodes = [
-            {"plugin_id": pid, "badge": self.badge_for(pid)}
+            {
+                "plugin_id": pid,
+                "badge": self.badge_for(pid),
+                # 05.08.2026 (Punkt 4): Datum der letzten Ausfuehrung auch in
+                # der 'Alle verfügbaren Plugins'-Gruppe (gleiche Semantik).
+                "last_execution": self.last_execution_date(pid),
+            }
             for pid in sorted(self.get_plugins().keys())
         ]
 
@@ -8941,14 +9389,42 @@ class FeatureBuilder:
             if not rows:
                 return 0
 
-            con.executemany("""
-                INSERT INTO feature_store (symbol, timeframe, bar_time, feature_id, plugin_version, feature_data)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT (symbol, timeframe, bar_time) DO UPDATE SET
-                    feature_id = EXCLUDED.feature_id,
-                    plugin_version = EXCLUDED.plugin_version,
-                    feature_data = EXCLUDED.feature_data
-            """, rows)
+            # Bugfix 05.08.2026: `now()` statt `current_timestamp` im
+            # ON CONFLICT DO UPDATE SET – DuckDB 1.5.5 bindet das (lowercase)
+            # Keyword dort als SPALTENREFERENZ der feature_store-Tabelle und
+            # wirft 'Binder Error: Table "feature_store" does not have a column
+            # named "current_timestamp"'. `now()` (Funktionsaufruf) wird
+            # korrekt als Zeitfunktion aufgeloest (verifiziert in
+            # test/check_current_timestamp.py).
+            #
+            # Phase 16 (05.08.2026, Performance-Nachtrag): `executemany` mit
+            # einem parameterisierten INSERT pro Bar war der eigentliche
+            # Engpass der Service-Ausfuehrung (z.B. ~20 s fuer 8k D1-Bars,
+            # mehrere Minuten fuer 100k M1-Bars). Ersetzt durch einen
+            # BULK-INSERT via con.register + INSERT..SELECT (identisches
+            # ON CONFLICT-Upsert) – ~2000x schneller (8k Rows: ~10 ms).
+            df_rows = pd.DataFrame(
+                rows,
+                columns=["symbol", "timeframe", "bar_time", "feature_id",
+                         "plugin_version", "feature_data"],
+            )
+            con.register("df_temp", df_rows)
+            try:
+                con.execute("""
+                    INSERT INTO feature_store
+                        (symbol, timeframe, bar_time, feature_id,
+                         plugin_version, feature_data)
+                    SELECT symbol, timeframe, bar_time, feature_id,
+                           plugin_version, feature_data
+                    FROM df_temp
+                    ON CONFLICT (symbol, timeframe, bar_time) DO UPDATE SET
+                        feature_id = EXCLUDED.feature_id,
+                        plugin_version = EXCLUDED.plugin_version,
+                        feature_data = EXCLUDED.feature_data,
+                        created_at = now()
+                """)
+            finally:
+                con.unregister("df_temp")
             # P14-03 (Invariante 13): In-Memory-Cache für (symbol, timeframe)
             # explizit invalidieren (veraltete shared_state-Zustände vermeiden).
             invalidate_feature_cache(symbol, timeframe)
@@ -9332,7 +9808,18 @@ KEINE eigenen Zeitkonzepte: Das native UTC-Zeitfenster (Minute 0/30 ±
 time_window_mins) ist ausschließlich Sache des ProximityService (Farbgebung),
 nicht dieses Services.
 
-Capabilities: render=True, feature_store=False (schreibt NICHT in den Store).
+Capabilities: render=True, feature_store=True (schreibt Grid-Level je Bar in den Store).
+
+05.08.2026 (U15-E, echte Feature-Store-Payloads): `calculate()` erzeugt jetzt
+ZWINGEND ein gefuelltes `feature_store_payload` mit `feature_id="grid_lines"`,
+`plugin_version` und `records` je Bar:
+    {"bar_time", "grid_nearest_level", "grid_step", "upper_level", "lower_level"}
+  * grid_nearest_level = center = round(close / step_size) * step_size
+  * upper_level        = center + step_size
+  * lower_level        = center - step_size
+Dadurch schreibt grid_lines bei der Ausfuehrung echte mathematische Zeilen in
+analytics.duckdb (`feature_store`) – unabhaengig von `show_lines` (das nur die
+RENDER-Darstellung steuert, nicht die Daten-Mathematik).
 """
 
 from typing import Any, Dict, List, Optional
@@ -9464,7 +9951,9 @@ class GridLinesService(PluginFeature):
             "chart": True,
             "batch": True,
             "live": False,
-            "feature_store": False,  # GridLines rendert nur, schreibt NICHT in den Store
+            # 05.08.2026 (U15-E): grid_lines schreibt jetzt echte Grid-Level
+            # je Bar in den Store (feature_store_payload in calculate()).
+            "feature_store": True,
             "render": True,
         }
 
@@ -9541,7 +10030,15 @@ class GridLinesService(PluginFeature):
         context: Optional[PluginContext] = None,
     ) -> FeatureCalculateResult:
         """Baut das Raster in Parität zum Alt-Grid (grid_math.py) und schreibt
-        die Linienliste nach context.shared_state[self.instance_id] (Namespace-isoliert)."""
+        die Linienliste nach context.shared_state[self.instance_id] (Namespace-
+        isoliert).
+
+        05.08.2026 (U15-E): Zusaetzlich wird ein gefuelltes feature_store_payload
+        erzeugt (feature_id='grid_lines', plugin_version, records je Bar mit
+        bar_time / grid_nearest_level / grid_step / upper_level / lower_level) -
+        grid_lines schreibt damit echte mathematische Grid-Level in den
+        feature_store (unabhaengig von show_lines, das nur die Render-Darstellung
+        steuert)."""
         if df is None or df.empty:
             return {"feature_store_payload": {}, "chart_render_payload": {"lines": [], "hit_circles": []}}
 
@@ -9582,8 +10079,80 @@ class GridLinesService(PluginFeature):
         if context is not None and context.instance_id:
             context.shared_state[context.instance_id] = list(lines_payload)
 
+        # --- Feature-Store-Payload (05.08.2026, U15-E) -----------------------
+        # Pro Bar: grid_nearest_level = center (naechstes Grid-Level zum close),
+        # upper/lower = center +/- step_size (deterministische Klammer um den
+        # close). Unabhaengig von show_lines – die Mathematik gilt immer.
+        #
+        # Phase 16 (05.08.2026): Numpy-Vektorisierung statt df.iterrows() –
+        # 10k+ Lookback-Bars laufen in wenigen Millisekunden. Exakte Paritaet:
+        #   * NaN/Inf-close wird uebersprungen (Alt-Pfad: round(NaN) wirft
+        #     ValueError -> continue; np.isfinite liefert dieselbe Maske).
+        #   * np.round (half-to-even) ist identisch zu Pythons round() fuer
+        #     dieselben float64-Werte; step<=0 liefert close unveraendert
+        #     (f_round_to_custom_step-Parität).
+        #   * Nicht int-konvertierbare 'time'-Spalten (z.B. datetime64) fallen
+        #     auf den identischen Zeilenpfad zurueck.
+        feature_rows: List[Dict[str, Any]] = []
+        if "time" in df.columns and "close" in df.columns and len(df):
+            try:
+                import numpy as np
+                closes = df["close"].to_numpy(dtype=np.float64)
+                t_raw = df["time"].to_numpy()
+                if np.issubdtype(t_raw.dtype, np.datetime64):
+                    # Datetime-Spalte: Zeilenpfad (Paritaet zur Alt-Logik).
+                    raise TypeError("datetime-Spalte -> Zeilen-Fallback")
+                times = t_raw.astype(np.int64)
+                valid = np.isfinite(closes)
+                if step_size > 0:
+                    inv_step = 1.0 / step_size
+                    centers = np.round(closes[valid] * inv_step) / inv_step
+                else:
+                    centers = closes[valid]
+                ts_list = times[valid].tolist()
+                c_list = [float(c) for c in centers.tolist()]
+                for bar_ts_int, center in zip(ts_list, c_list):
+                    feature_rows.append({
+                        "bar_time": int(bar_ts_int),
+                        "grid_nearest_level": center,
+                        "grid_step": step_size,
+                        "upper_level": round(center + step_size, 6),
+                        "lower_level": round(center - step_size, 6),
+                    })
+            except (TypeError, ValueError):
+                # Fallback: Spalten nicht numpy-konvertierbar – identischer
+                # Zeilenpfad wie vor der Vektorisierung.
+                for _i, row in df.iterrows():
+                    try:
+                        close_val = float(row["close"])
+                        center = f_round_to_custom_step(close_val, step_size)
+                    except (TypeError, ValueError, KeyError):
+                        continue
+                    bar_ts = row.get("time")
+                    if bar_ts is None:
+                        continue
+                    try:
+                        bar_ts_int = int(bar_ts)
+                    except (TypeError, ValueError):
+                        continue
+                    feature_rows.append({
+                        "bar_time": bar_ts_int,
+                        "grid_nearest_level": center,
+                        "grid_step": step_size,
+                        "upper_level": round(center + step_size, 6),
+                        "lower_level": round(center - step_size, 6),
+                    })
+
         return {
-            "feature_store_payload": {},
+            "feature_store_payload": {
+                "feature_id": self.plugin_id,
+                "plugin_version": self.version,
+                "records": feature_rows,
+                "metadata": {
+                    "schema_version": "1.0.0",
+                    "step_size": step_size,
+                },
+            },
             "chart_render_payload": {
                 "lines": lines_payload,
                 "hit_circles": [],
@@ -9722,6 +10291,7 @@ from datetime import datetime, timezone as dt_timezone
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+import numpy as np
 
 from analytics.features.definitions.grid_math import (
     f_in_window_around,
@@ -9737,14 +10307,31 @@ from analytics.features.plugins.base_plugin import (
 
 
 def _bar_utc_minutes(df: pd.DataFrame) -> List[int]:
-    """UTC-Minute (0-59) jeder Bar – konsistent zu grid_liquidity.py."""
-    out: List[int] = []
+    """UTC-Minute (0-59) jeder Bar – konsistent zu grid_liquidity.py.
+
+    Phase 16 (05.08.2026): Vektorisierter Fast-Path fuer 'time'-Spalten
+    (epoch-Sekunden, int) – (t // 60) % 60 ist mathematisch identisch zu
+    datetime.fromtimestamp(t, tz=utc).minute (auch fuer negative Zeiten,
+    Python/numpy-Floor-Division). Bereichs-Guard: Zeiten ausserhalb des
+    datetime-basierten Alt-Bereichs fallen auf den OSError-Fallback zurueck
+    (dort wird 0 gesetzt – exakte Alt-Paritaet).
+    """
     if "time" in df.columns:
+        try:
+            import numpy as np
+            t = df["time"].to_numpy(dtype=np.int64)
+            if len(t) == 0 or (int(np.min(t)) >= -62135596800
+                               and int(np.max(t)) < 253402300799):
+                return [int(m) for m in ((t // 60) % 60).tolist()]
+        except (TypeError, ValueError, OSError):
+            pass
+        out: List[int] = []
         for t in df["time"]:
             try:
                 out.append(datetime.fromtimestamp(int(t), tz=dt_timezone.utc).minute)
             except (TypeError, ValueError, OSError):
                 out.append(0)
+        return out
     elif "bar_time" in df.columns:
         t = pd.to_datetime(df["bar_time"])
         if t.dt.tz is not None:
@@ -9803,6 +10390,22 @@ class ProximityService(PluginFeature):
             "feature_store": True,  # schreibt Hit-Records nach feature_data
             "render": True,
         }
+
+    @property
+    def dependencies(self) -> List[str]:
+        """Vorab berechnete Service-Plugins (PluginFeature.dependencies).
+
+        05.08.2026 (Bugfix Service-Run): proximity liest seine Linienliste aus
+        context.shared_state[depends_on[0]] – dafuer muss eine vorgelagerte
+        grid_lines-Instanz in execution_order stehen. Gespeicherte Sets aus
+        der UI-Pfade haben oft KEIN explizites depends_on; die Worker-
+        Aufbereitung (serviceui/service_set_utils.prepare_worker_definition)
+        loest daraus die implizite Abhaengigkeit auf (naechste VORHERIGE
+        Instanz mit plugin_id in dependencies). Explizit gesetzte
+        depends_on-Werte (z.B. Indikator-intern grid_1 -> prox_1) bleiben
+        unveraendert gueltig.
+        """
+        return ["grid_lines"]
 
     # --- Single Source of Truth fürs Prop-Fenster (Phase 13 Schritt 5) -------
     # Hinweis (Schritt 6-Korrektur 3): Die visuellen Parameter (show_circles,
@@ -9899,57 +10502,90 @@ class ProximityService(PluginFeature):
         tracked_levels = [float(l["price"]) for l in lines_payload]
 
         # --- Proximity & Hit-Logik (exakte Parität zu grid_math.py) ----------
+        # Phase 16 (05.08.2026): Numpy-Vektorisierung statt der O(n*m)-Double-
+        # Loop (df.iterrows() x tracked_levels). Bei 10k+ Lookback-Bars sinkt
+        # die Rechenzeit von mehreren Sekunden auf wenige Millisekunden.
+        # Parität:
+        #   * near = (visit_min <= high <= visit_max) | (visit_min <= low <=
+        #     visit_max) | (low <= lvl <= high) – identische Vergleichs-
+        #     Semantik zu grid_math.py.
+        #   * NaN high/low propagieren in den Vergleichen zu False (kein Hit)
+        #     – wie im Alt-Pfad (Float-Vergleich mit NaN ist False).
+        #   * Reihung hit_circles/levels_hit: zeilen-major, innerhalb einer
+        #     Zeile in tracked_levels-Reihenfolge (lexsort über Zeile+Level).
         hit_circles: List[Dict[str, Any]] = []
         active_hits: List[str] = []
         feature_rows: List[Dict[str, Any]] = []
 
+        n = len(scan_df)
         minutes = _bar_utc_minutes(scan_df)
-        last_idx = scan_df.index[-1] if len(scan_df) else None
+        if n:
+            times = scan_df["time"].to_numpy(dtype=np.int64)
+            high = scan_df["high"].to_numpy(dtype=np.float64)
+            low = scan_df["low"].to_numpy(dtype=np.float64)
+            levels_arr = np.array(tracked_levels, dtype=np.float64)
+            in_win = np.array([
+                (f_in_window_around(m, 0, time_window_mins)
+                 or f_in_window_around(m, 30, time_window_mins))
+                for m in minutes
+            ], dtype=bool)
 
-        for pos, (idx, row) in enumerate(scan_df.iterrows()):
-            time_val = int(row["time"])
-            c_high = float(row["high"])
-            c_low = float(row["low"])
+            levels_hit: List[List[float]] = [[] for _ in range(n)]
+            if len(levels_arr):
+                factor = visit_pct / 100.0
+                vmin = levels_arr * (1.0 - factor)
+                vmax = levels_arr * (1.0 + factor)
+                # Broadcasting: (len(levels), n)-Bool-Matrix – jede Zeile ist
+                # ein Level, jede Spalte eine Bar.
+                near = (
+                    ((vmin[:, None] <= high[None, :]) & (high[None, :] <= vmax[:, None]))
+                    | ((vmin[:, None] <= low[None, :]) & (low[None, :] <= vmax[:, None]))
+                    | ((low[None, :] <= levels_arr[:, None]) & (high[None, :] >= levels_arr[:, None]))
+                )
+                # np.nonzero liefert (Achse-0 = Level, Achse-1 = Bar).
+                lvl_idxs, bar_idxs = np.nonzero(near)
+                if len(lvl_idxs):
+                    # Zeilen-major (Bar aussen) + Level-Reihenfolge innen
+                    # (stabil) – identische Abfolge wie die Alt-Double-Loop.
+                    order = np.lexsort((lvl_idxs, bar_idxs))
+                    bar_sorted = bar_idxs[order]
+                    lvl_sorted = lvl_idxs[order]
+                    starts = np.concatenate(
+                        ([0], np.flatnonzero(np.diff(bar_sorted) != 0) + 1))
+                    ends = np.concatenate((starts[1:], [len(bar_sorted)]))
+                    last_pos = n - 1
+                    for s, e in zip(starts, ends):
+                        r = int(bar_sorted[s])
+                        lvls = [float(x) for x in levels_arr[lvl_sorted[s:e]]]
+                        levels_hit[r] = lvls
+                        t_val = int(times[r])
+                        win_flag = bool(in_win[r])
+                        for lvl in lvls:
+                            # hit_circles ohne Farbe – der INDIKATOR färbt auf
+                            # Basis seines eigenen Schemas (circle_color_std /
+                            # _active) und des in_window-Flags. in_window=True
+                            # wenn die Bar im UTC-Zeitfenster (0/30 ±
+                            # time_window_mins) liegt.
+                            hit_circles.append({
+                                "time": t_val,
+                                "price": lvl,
+                                "in_window": win_flag,
+                            })
+                        if r == last_pos:
+                            active_hits.extend(
+                                f_strip_trailing_zeros(v) for v in lvls)
 
-            row_m = minutes[pos]
-            row_in_time = (
-                f_in_window_around(row_m, 0, time_window_mins)
-                or f_in_window_around(row_m, 30, time_window_mins)
-            )
-
-            levels_hit: List[float] = []
-            for lvl in tracked_levels:
-                visit_min = lvl * (1.0 - visit_pct / 100.0)
-                visit_max = lvl * (1.0 + visit_pct / 100.0)
-
-                touch_high = visit_min <= c_high <= visit_max
-                touch_low = visit_min <= c_low <= visit_max
-                pierce = c_low <= lvl and c_high >= lvl
-                near = touch_high or touch_low or pierce
-
-                if near:
-                    levels_hit.append(lvl)
-                    # hit_circles ohne Farbe – der INDIKATOR färbt auf Basis
-                    # seines eigenen Schemas (circle_color_std / _active) und
-                    # des in_window-Flags. in_window=True wenn die Bar im
-                    # UTC-Zeitfenster (0/30 ± time_window_mins) liegt.
-                    hit_circles.append({
-                        "time": time_val,
-                        "price": lvl,
-                        "in_window": bool(row_in_time),
-                    })
-                    if last_idx is not None and idx == last_idx:
-                        active_hits.append(f_strip_trailing_zeros(lvl))
-
-            feature_rows.append({
-                "bar_time": time_val,
-                "levels_hit": levels_hit,
-                "is_hit": bool(levels_hit),
-                "in_time_window": bool(row_in_time),
-                "time_window_mins": time_window_mins,
-                "use_time_filter": use_time_filter,
-                "visit_pct": visit_pct,
-            })
+            feature_rows = []
+            for pos in range(n):
+                feature_rows.append({
+                    "bar_time": int(times[pos]),
+                    "levels_hit": levels_hit[pos],
+                    "is_hit": bool(levels_hit[pos]),
+                    "in_time_window": bool(in_win[pos]),
+                    "time_window_mins": time_window_mins,
+                    "use_time_filter": use_time_filter,
+                    "visit_pct": visit_pct,
+                })
 
         # --- Status-Info (letzte Bar des Scan-Fensters, Parität zu grid_math.py)
         if len(scan_df):
@@ -13742,7 +14378,13 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		self.group_expert.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
 		expert_layout = QVBoxLayout(self.group_expert)
 
-		meta = dict(plugin.metadata or {})
+		# Bugfix 05.08.2026: `metadata` ist eine PluginFeature-Property – der
+		# Plugin-Pfad (Branch 1 in _get_plugin) kann aber auch einen Indikator
+		# liefern, der parameter_schema+plugin_id implementiert (z.B.
+		# GridLiquidityIndicator), ohne PluginFeature zu sein (kein metadata).
+		# getattr-Guard: PluginFeature unveraendert, Indikator ohne metadata
+		# erhaelt leere Metadaten statt AttributeError.
+		meta = dict(getattr(plugin, "metadata", None) or {})
 		meta_text = (
 			f"<b>{meta.get('display_name', plugin.plugin_id)}</b> "
 			f"v{getattr(plugin, 'version', '1.0.0')}<br>"
@@ -15291,6 +15933,13 @@ class GridLiquidityIndicator(BaseIndicator):
             use_time_filter = _as_bool(p.get("use_time_filter"), True)
 
             def _colorize(c: Dict[str, Any]) -> Dict[str, Any]:
+                # Bugfix 05.08.2026: priority=10 ergänzen – der Feature-Store-
+                # Lesepfad (read_proximity_from_feature_store) und die Live-
+                # Punkte (update_live_candle) setzen priority=10, der Pipeline-
+                # Fallback (prox_crp.hit_circles aus dem ProximityService)
+                # liefert Kreise OHNE priority (nur time/price/in_window).
+                # Durch das additive Setzen sind BEIDE Pfade konsistent
+                # (ChartCircle-Vertrag, base_plugin.py).
                 return dict(
                     c,
                     color=(
@@ -15298,6 +15947,7 @@ class GridLiquidityIndicator(BaseIndicator):
                         if (use_time_filter and not bool(c.get("in_window", True)))
                         else circle_std
                     ),
+                    priority=10,
                 )
 
             if cached_circles:
@@ -17145,12 +17795,19 @@ class NamedItemActionsMixin:
         if new_id is not None:
             adapter._item_select(new_id)
 
-    def delete_named_item(self, adapter: NamedItemAdapter) -> None:
+    def delete_named_item(self, adapter: NamedItemAdapter,
+                          confirm: bool = True) -> None:
         """Löscht das aktuelle Element analog zur Preset-Verwaltung.
 
-        Ablauf: Schutz des reservierten Namens → Rückfrage → löschen
-        (adapter._item_delete_current) → nächstes Element auswählen
+        Ablauf: Schutz des reservierten Namens → (optional) Rückfrage →
+        löschen (adapter._item_delete_current) → nächstes Element auswählen
         (adapter._item_select(None)).
+
+        Bugfix 05.08.2026 (Papierkorb): Service-Sets werden soft-deleted –
+        der Aufrufer (ServiceWindow.delete_set) fragt bereits einmal nach
+        ('Set in den Papierkorb verschieben') und ruft diese Methode mit
+        confirm=False auf, damit KEINE zweite Rückfrage erscheint. Die
+        Preset-Verwaltung (ohne Papierkorb) behält confirm=True (Default).
         """
         scope = adapter._item_scope_label()
         current = adapter._item_current_name()
@@ -17163,14 +17820,15 @@ class NamedItemActionsMixin:
                                 f"'{reserved}' kann nicht gelöscht werden.")
             return
 
-        reply = QMessageBox.question(
-            self, "Löschen bestätigen",
-            f"Möchtest du {scope} '{current}' wirklich löschen?\n"
-            f"Dies kann nicht rückgängig gemacht werden.",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
-            return
+        if confirm:
+            reply = QMessageBox.question(
+                self, "Löschen bestätigen",
+                f"Möchtest du {scope} '{current}' wirklich löschen?\n"
+                f"Dies kann nicht rückgängig gemacht werden.",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
 
         adapter._item_delete_current()
         adapter._item_select(None)
@@ -17311,11 +17969,23 @@ class EventBus(QObject):
     - profile_changed   : Analytics-Profil wurde geaendert (15.03, Payload =
                           Profil-Name/-ID).
     - service_set_changed: Service-Set wurde gespeichert/geloescht (15.02).
+    - service_run_started: Intensiver Service-Run/Scan wurde gestartet
+                           (ServiceWindow) – MainWindow pausiert den 45s-
+                           sync_timer (Concurrency-Guard, 05.08.2026).
+    - service_run_finished: Alle gestarteten Service-Runs/Scans sind beendet
+                            (Referenzzähler auf 0) – MainWindow startet den
+                            sync_timer wieder.
     """
 
     favorites_changed = Signal()
     profile_changed = Signal(str)
     service_set_changed = Signal()
+    # Phase 16 (05.08.2026): Concurrency-Guard gegen Konflikte zwischen
+    # Service-Berechnungen (SetRunWorker/ServiceRunWorker/HistoricalScanner)
+    # und dem 45s-Hintergrund-Sync (sync_timer in main.py). Entkoppelt via
+    # EventBus – das ServiceWindow kennt den MainWindow NICHT (IoC).
+    service_run_started = Signal()
+    service_run_finished = Signal()
 
     _instance: ClassVar[Optional["EventBus"]] = None
 
@@ -17350,18 +18020,25 @@ Unterordner serviceui/ verschoben und in SRP-Module zerlegt:
 
   * service_set_utils.py   – _available_plugin_ids, _sets_using_plugin
   * set_run_worker.py      – ServiceSetRunWorker (QThread)
+  * run_worker.py          – ServiceRunWorker (QThread, gezielter Kontextmenue-
+                             Run mit FeatureStore-Persistenz, 05.08.2026)
   * set_item_adapter.py    – ServiceSetItemAdapter (NamedItemAdapter)
   * param_columns.py       – ServiceParamColumnsMixin (Parameter-Column-Builder)
   * trash_dialog.py        – ServiceSetTrashDialog (Papierkorb-Dialog)
   * service_win.py         – ServiceWindow (Hauptfenster, re-exportiert API)
 
 Phase 15.02 (Master-Tree & generischer ServiceSelector):
-  * master_tree.py             – 2-Spalten MasterTree (Hierarchie + Badges)
-  * toolbar.py                 – ServiceToolbar (Aktions-Buttons)
-  * status_panel.py            – StatusPanel (Laufzeit/Fortschritt/Log)
+  * master_tree.py             – 2-Spalten MasterTree (Hierarchie + Badges,
+                                 Ausfuehrungsdatum, Kontextmenue-Run-Aktionen)
   * service_selector_widget.py – ServiceSelectorWidget (SELECT_ONLY/FULL_EDIT)
   * new_set_dialog.py          – NewServiceSetDialog (Set + Indikator)
   * analytics/engine/service_selector_model.py – lesendes Datenmodell
+
+Die fruehere Aktions-Toolbar (serviceui/toolbar.py, ServiceToolbar) ist seit
+05.08.2026 komplett entfernt – alle Struktur-Aktionen laufen ueber das
+MasterTree-Kontextmenue. Die Datei ist unter .backup_service_toolbar/
+archiviert (gitignored, Konvention wie .backup_grid_liquidity und
+.backup_parameter_panel).
 """
 
 from serviceui.service_win import (
@@ -17374,9 +18051,12 @@ from serviceui.service_win import (
     BASE_DIR,
 )
 
+# 05.08.2026: Gezielter Run-Worker (MasterTree-Kontextmenue 'Service(s)
+# ausführen') – FeatureStore-Persistenz + EventBus-Sync.
+from serviceui.run_worker import ServiceRunWorker
+
 # Phase 15.02: Wiederverwendbare Sub-Widgets
 from serviceui.master_tree import MasterTree
-from serviceui.toolbar import ServiceToolbar
 from serviceui.status_panel import StatusPanel
 from serviceui.service_selector_widget import ServiceSelectorWidget
 from serviceui.new_set_dialog import NewServiceSetDialog
@@ -17384,6 +18064,7 @@ from serviceui.new_set_dialog import NewServiceSetDialog
 __all__ = [
     "ServiceWindow",
     "ServiceSetRunWorker",
+    "ServiceRunWorker",
     "ServiceSetItemAdapter",
     "_ServiceSetItemAdapter",
     "_available_plugin_ids",
@@ -17391,7 +18072,6 @@ __all__ = [
     "BASE_DIR",
     # Phase 15.02
     "MasterTree",
-    "ServiceToolbar",
     "StatusPanel",
     "ServiceSelectorWidget",
     "NewServiceSetDialog",
@@ -17421,6 +18101,12 @@ Hierarchische Darstellung der Service-Landschaft:
               einen aufklappbaren Knoten togglet auf/zu (Doppelklick ist
               deaktiviert). Die Top-Level-Knoten beginnen ganz links an der
               Linie der umschliessenden Box (kein Icon/Spacer auf Ebene 0).
+              05.08.2026 (Ausfuehrungsdatum): An den Namen jedes Service-
+              Knotens haengt das Datum der letzten Ausfuehrung in Klammern:
+              'prox_1 (05.08.26)' (DD.MM.JJ aus MAX(created_at) des
+              feature_store je feature_id) – ohne Eintrag '(--.--.--)'.
+              Gilt seit 05.08.2026 (Punkt 4) auch fuer Standalone-Services
+              und Plugin-Zeilen ('proximity (02.08.26)').
   * Spalte 1: Schmale Status-Spalte ganz RECHTS (Fixed-Spalte, fest am
               rechten Rand verankert) – pro Zeile ein echter Info-Button
               (QPushButton "ℹ", Icon-Breite ~20 px). Badge-TEXTE werden
@@ -17437,7 +18123,8 @@ Hierarchische Darstellung der Service-Landschaft:
 Der Baum wird ausschliesslich aus dem `ServiceSelectorModel` befuellt
 (lesendes Datenmodell, Invariante 4: kein SQL in UI) und aktualisiert sich
 automatisch ueber `data_changed`/EventBus. Der `ServiceSelectorWidget` nutzt
-den MasterTree im Modus `FULL_EDIT` (MasterTree + ServiceToolbar).
+den MasterTree im Modus `FULL_EDIT` (seit 05.08.2026 ohne Aktions-Toolbar –
+volle vertikale Hoehe, alle Aktionen via Kontextmenue).
 
 Signale:
   * selection_changed(set_id, service_id) – bei jeder Baum-Selektion
@@ -17455,10 +18142,10 @@ Signale:
       delete_set_requested(set_id)                    – 'Set loeschen (Papierkorb)'
       move_service_requested(set_id, service_id, delta) – Order ▲ (-1) / ▼ (+1)
       remove_service_requested(set_id, service_id)    – 'Service entfernen'
+      run_service_requested(set_id, instance_id)      – '▶️ Diesen Service ausführen'
+      run_set_requested(set_id)                        – '▶️ Alle Services ausführen'
+      open_trash_requested()                           – '🗑️ Papierkorb öffnen...'
     (Service-Info nutzt das bestehende `info_requested`-Signal.)
-  * group_activated(group) – Klick auf einen (nicht selektierbaren) Gruppen-
-    Knoten (z.B. 'sets' / 'standalone' / 'plugins'); der Orchestrator braucht
-    ihn, um den bifunktionalen Toolbar-Zustand zu aktualisieren.
 """
 
 from typing import Any, Dict, Optional
@@ -17566,9 +18253,19 @@ class MasterTree(QTreeWidget):
     # Bugfix 05.08.2026: Kontextmenue 'Papierkorb löschen' – endgueltig
     # leeren (Orchestrator fuehrt die doppelte Sicherheitsabfrage aus).
     purge_trash_requested = Signal()
-    # Bugfix 05.08.2026: Klick auf einen (nicht selektierbaren) Gruppen-Knoten
-    # (group id: 'sets' / 'standalone' / 'plugins') – fuer den Toolbar-State.
-    group_activated = Signal(str)
+    # Phase 15: Kontextmenue '🗑️ Papierkorb öffnen...' (Haupt-Gruppe
+    # 📁 Service-Sets) – oeffnet den Papierkorb-Dialog. Der Orchestrator
+    # (ServiceWindow) ruft dieselbe Methode auf wie der Papierkorb-Button
+    # in der Aktionsleiste (show_trash_dialog()).
+    open_trash_requested = Signal()
+    # 05.08.2026 (Ausfuehrungsdatum & Kontextmenue-Ausfuehrung):
+    #   run_service_requested(set_id, instance_id) – '▶️ Diesen Service ausfuehren'
+    #   run_set_requested(set_id)                   – '▶️ Alle Services ausfuehren'
+    # Der Orchestrator (ServiceWindow) startet dafuer den gezielten
+    # ServiceRunWorker (kein globaler Massen-Scan) und zeigt zuvor den
+    # Bestaetigungsdialog (Set/Service + Symbol/Timeframe).
+    run_service_requested = Signal(str, str)
+    run_set_requested = Signal(str)
 
     def __init__(self, model, parent=None) -> None:
         super().__init__(parent)
@@ -17611,6 +18308,12 @@ class MasterTree(QTreeWidget):
         # (Signale) – der Orchestrator verknuepft sie mit seinen Handlern.
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
+
+        # Phase 15 (Dirty-State): instance_ids mit ungespeicherten Parameter-
+        # Aenderungen. Die Sternchen-Markierung ('*' am Service-Knoten) wird
+        # bei jedem Baum-Neuaufbau aus diesem Set re-appliziert (set_instance_
+        # dirty / clear_dirty_markers halten es aktuell).
+        self._dirty_instance_ids: set = set()
 
         self._populate()
         self.itemSelectionChanged.connect(self._emit_selection)
@@ -17663,6 +18366,11 @@ class MasterTree(QTreeWidget):
         # Baum-Aufbau anhaengen – setItemWidget() verlangt, dass das Item
         # bereits Teil des TreeWidgets ist (sonst kein sichtbarer Button).
         self._attach_item_buttons()
+        # Phase 15 (Dirty-State): Sternchen-Markierungen ungespeicherter
+        # Parameter-Aenderungen nach einem Neuaufbau wieder anwenden
+        # (data_changed -> _populate wuerde sie sonst verlieren).
+        for iid in list(getattr(self, "_dirty_instance_ids", set())):
+            self._apply_dirty_label(iid, True)
 
     def _safe_current_selection(self) -> Dict[str, str]:
         """Liess die aktuelle Auswahl defensiv (isValid-Guard gegen zerstoerte
@@ -17708,9 +18416,13 @@ class MasterTree(QTreeWidget):
         for svc in services:
             # Keine fuehrenden Leerzeichen im Text: die Einrueckung der
             # Untereintraege kommt aus setIndentation(LEVEL_INDENT).
+            # 05.08.2026 (Ausfuehrungsdatum): Das Datum der letzten
+            # Ausfuehrung (DD.MM.JJ, aus dem feature_store) haengt direkt am
+            # Service-Namen: 'prox_1 (05.08.26)' – ohne Eintrag '(--.--.--)'.
             plugin_id = svc.get("plugin_id") or ""
+            last_exec = str(svc.get("last_execution") or "--.--.--")
             svc_item = QTreeWidgetItem([
-                f"{svc.get('instance_id')}  [{plugin_id}]",
+                f"{svc.get('instance_id')} ({last_exec})",
                 "",
             ])
             svc_item.setData(0, ROLE_NODE_TYPE, TYPE_SERVICE)
@@ -17724,8 +18436,12 @@ class MasterTree(QTreeWidget):
     def _build_plugin_item(self, child: Dict[str, Any],
                            group: str) -> QTreeWidgetItem:
         pid = child.get("plugin_id") or ""
-        # Keine fuehrenden Leerzeichen: Einrueckung via setIndentation()
-        plugin_item = QTreeWidgetItem([pid, ""])
+        # Keine fuehrenden Leerzeichen: Einrueckung via setIndentation().
+        # 05.08.2026 (Punkt 4): Das Datum der letzten Ausfuehrung (DD.MM.JJ,
+        # aus dem feature_store) haengt auch an Standalone-/Plugin-Zeilen:
+        # 'proximity (02.08.26)' – ohne Eintrag '(--.--.--)'.
+        last_exec = str(child.get("last_execution") or "--.--.--")
+        plugin_item = QTreeWidgetItem([f"{pid} ({last_exec})", ""])
         plugin_item.setData(0, ROLE_NODE_TYPE, TYPE_PLUGIN)
         plugin_item.setData(0, ROLE_SET_ID, group)
         plugin_item.setData(0, ROLE_PLUGIN_ID, pid)
@@ -17832,6 +18548,57 @@ class MasterTree(QTreeWidget):
             pass
 
     # -------------------------------------------------------------------------
+    # Phase 15 (Dirty-State): '*' am Service-Knoten bei ungespeicherten
+    # Parameter-Aenderungen (Format 'Service_Name* (DD.MM.JJ)')
+    # -------------------------------------------------------------------------
+
+    def set_instance_dirty(self, instance_id: str, dirty: bool) -> None:
+        """Markiert eine Service-Instanz als ungespeichert ('*' am Knoten).
+
+        Der Dirty-Zustand wird im RAM gehalten (self._dirty_instance_ids) und
+        bei jedem Baum-Neuaufbau (_populate) re-appliziert. Nach erfolgreichem
+        Speichern ruft der Orchestrator clear_dirty_markers() auf.
+        """
+        if not instance_id:
+            return
+        if dirty:
+            self._dirty_instance_ids.add(instance_id)
+        else:
+            self._dirty_instance_ids.discard(instance_id)
+        self._apply_dirty_label(instance_id, dirty)
+
+    def clear_dirty_markers(self) -> None:
+        """Entfernt ALLE Sternchen-Markierungen (nach Speichern).
+
+        Das Set wird geleert und die Knoten-Labels zurueckgesetzt; der
+        naechste Baum-Neuaufbau erzeugt damit saubere Labels.
+        """
+        for iid in list(self._dirty_instance_ids):
+            self._apply_dirty_label(iid, False)
+        self._dirty_instance_ids.clear()
+
+    def _apply_dirty_label(self, instance_id: str, dirty: bool) -> None:
+        """Setzt/entfernt das '*' im Label des Service-Knotens mit
+        instance_id. Das Ausfuehrungsdatum '(DD.MM.JJ)' bleibt erhalten."""
+        try:
+            for item in TreeItemIterator(self):
+                if item is None or not isValid(item):
+                    continue
+                if item.data(0, ROLE_NODE_TYPE) != TYPE_SERVICE:
+                    continue
+                if str(item.data(0, ROLE_INSTANCE_ID) or "") != instance_id:
+                    continue
+                text = item.text(0) or ""
+                name, sep, rest = text.partition(" (")
+                if not sep:
+                    continue
+                name = name.rstrip("*")
+                item.setText(0, f"{name}{'*' if dirty else ''} ({rest}")
+                break
+        except (RuntimeError, AttributeError):
+            pass
+
+    # -------------------------------------------------------------------------
     # Kontextmenue (Bugfix 05.08.2026, entkoppelt)
     # -------------------------------------------------------------------------
 
@@ -17839,13 +18606,14 @@ class MasterTree(QTreeWidget):
         """Baut das Kontextmenue fuer den Rechtsklick dynamisch je Knotentyp.
 
         Die Aktionen emittieren AUSSCHLIESSLICH Signale – der Orchestrator
-        (ServiceWindow) verknuepft sie mit seinen Handlern (DRY: Toolbar- und
-        Kontextmenue-Aktionen teilen sich dieselben Handler):
+        (ServiceWindow) verknuepft sie mit seinen Handlern:
 
           * Gruppe 📁 (sets)      -> 'Neues Set anlegen' (create_set_requested)
-          * Set-Knoten            -> 'Set umbenennen', 'Service hinzufuegen',
+          * Set-Knoten            -> '▶️ Alle Services ausführen' (run_set),
+                                     'Set umbenennen', 'Service hinzufuegen',
                                      'Set loeschen' (rename/add/delete-requested)
-          * Service-Knoten        -> 'Order ▲/▼', 'Service entfernen',
+          * Service-Knoten        -> '▶️ Diesen Service ausführen' (run_service),
+                                     'Order ▲/▼', 'Service entfernen',
                                      'Service-Info anzeigen' (move/remove/
                                      info_requested)
           * Ausserhalb eines Sets (Plugin-Zeilen, ⚡-/📦-Gruppen):
@@ -17876,12 +18644,24 @@ class MasterTree(QTreeWidget):
                     act = menu.addAction("Neues Set anlegen")
                     act.triggered.connect(
                         lambda _=False: self.create_set_requested.emit())
+                    menu.addSeparator()
+                    act_trash = menu.addAction("🗑️ Papierkorb öffnen...")
+                    act_trash.triggered.connect(
+                        lambda _=False: self.open_trash_requested.emit())
                 else:
                     self._add_outside_set_actions(menu, item)
                 menu.exec(self.viewport().mapToGlobal(pos))
                 return
             if node_type == TYPE_SET:
                 set_id = str(item.data(0, ROLE_SET_ID) or "")
+                # 05.08.2026: 'Alle Services ausführen' – gezielter Run des
+                # Sets (kein globaler Massen-Scan); der Orchestrator zeigt
+                # den Bestaetigungsdialog (Set + Symbol/Timeframe).
+                act_run = menu.addAction("▶️ Alle Services ausführen")
+                act_run.triggered.connect(
+                    lambda _=False, s=set_id:
+                    self.run_set_requested.emit(s))
+                menu.addSeparator()
                 act_rename = menu.addAction("Set umbenennen")
                 act_rename.triggered.connect(
                     lambda _=False, s=set_id:
@@ -17905,6 +18685,15 @@ class MasterTree(QTreeWidget):
                 set_id = str(item.data(0, ROLE_SET_ID) or "")
                 service_id = str(item.data(0, ROLE_INSTANCE_ID) or "")
                 plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
+                # 05.08.2026: 'Diesen Service ausführen' – gezielter Run des
+                # Einzel-Services (inkl. Upstream-Abhaengigkeiten im Set);
+                # der Orchestrator zeigt den Bestaetigungsdialog (Service +
+                # Symbol/Timeframe).
+                act_run = menu.addAction("▶️ Diesen Service ausführen")
+                act_run.triggered.connect(
+                    lambda _=False, s=set_id, i=service_id:
+                    self.run_service_requested.emit(s, i))
+                menu.addSeparator()
                 act_up = menu.addAction("Order ▲")
                 act_up.triggered.connect(
                     lambda _=False, s=set_id, i=service_id:
@@ -17993,12 +18782,6 @@ class MasterTree(QTreeWidget):
         (setExpandsOnDoubleClick(False)). Klicks auf Blatt-Knoten verhalten
         sich normal (Selektion). Das Symbol aktualisiert sich automatisch
         ueber itemExpanded/itemCollapsed (_refresh_expand_label).
-
-        Bugfix 05.08.2026: Klick auf einen (nicht selektierbaren) Gruppen-
-        Knoten emittiert zusaetzlich `group_activated(group)` – der
-        Orchestrator braucht das Signal, um den bifunktionalen Toolbar-Zustand
-        zu aktualisieren (Gruppen-Knoten feuern kein selection_changed, weil
-        sie kein ItemIsSelectable-Flag tragen).
         """
         try:
             pos = (event.position().toPoint() if hasattr(event, "position")
@@ -18010,9 +18793,6 @@ class MasterTree(QTreeWidget):
                 # Auswahl-API (current_set_id/current_service_id) funktioniert.
                 if item.flags() & Qt.ItemIsSelectable:
                     self.setCurrentItem(item)
-                if item.data(0, ROLE_NODE_TYPE) == TYPE_GROUP:
-                    self.group_activated.emit(
-                        str(item.data(0, ROLE_SET_ID) or ""))
                 event.accept()
                 return
         except (RuntimeError, AttributeError):
@@ -18233,10 +19013,11 @@ _service_lock/_build_tooltip (ServiceWindow).
 
 from typing import Any, Dict
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QCoreApplication, QEvent, Qt, QTimer
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QSizePolicy, QSpinBox, QVBoxLayout, QWidget,
+    QLabel, QLineEdit, QPushButton, QSizePolicy, QSpinBox, QVBoxLayout,
+    QWidget,
 )
 
 
@@ -18355,6 +19136,72 @@ class ServiceParamColumnsMixin:
             return ctrl.currentText()
         return ctrl.text()
 
+    # ------------------------------------------------------------------
+    # Phase 15 (Dirty-State): Aenderungs-Tracking der Parameter-Controls
+    # ------------------------------------------------------------------
+    def _connect_param_change(self, ctrl: QWidget, iid: str, key: str) -> None:
+        """Verbindet das Aenderungs-Signal eines Parameter-Controls mit dem
+        Dirty-State-Tracking (valueChanged/textChanged/toggled).
+
+        Jede Aenderung aktualisiert die ServiceSetDefinition im RAM
+        (_current_set_definition) und markiert die instance_id im MasterTree
+        als ungespeichert ('*' am Service-Knoten).
+        """
+        if isinstance(ctrl, QCheckBox):
+            ctrl.toggled.connect(
+                lambda _v, i=iid, k=key: self._on_param_changed(i, k))
+        elif isinstance(ctrl, (QSpinBox, QDoubleSpinBox)):
+            ctrl.valueChanged.connect(
+                lambda _v, i=iid, k=key: self._on_param_changed(i, k))
+        elif isinstance(ctrl, QComboBox):
+            ctrl.currentTextChanged.connect(
+                lambda _v, i=iid, k=key: self._on_param_changed(i, k))
+        else:  # QLineEdit (color/str)
+            ctrl.textChanged.connect(
+                lambda _t, i=iid, k=key: self._on_param_changed(i, k))
+
+    def _on_param_changed(self, iid: str, key: str) -> None:
+        """Aktualisiert die RAM-ServiceSetDefinition und markiert die
+        Instanz als dirty ('*' im MasterTree)."""
+        ctrl = self._service_param_controls.get((iid, key))
+        if ctrl is None:
+            return
+        value = self._ctrl_value(ctrl)
+        # RAM-Definition der geladenen ServiceSetDefinition aktualisieren
+        # (lookback ist eine Instanz-Einstellung, alle anderen gehoeren in
+        # params; Phase 15 Dirty-State).
+        definition = getattr(self, "_current_set_definition", None)
+        if definition is not None:
+            cfg = (definition.get("services") or {}).get(iid)
+            if isinstance(cfg, dict):
+                if key == "lookback":
+                    cfg["lookback"] = value
+                else:
+                    cfg.setdefault("params", {})[key] = value
+        self._mark_service_dirty(iid)
+
+    def _mark_service_dirty(self, iid: str) -> None:
+        """Versieht den Service-Knoten im MasterTree mit einem '*' (und
+        merkt den Dirty-Zustand fuer Baum-Neuaufbauten).
+
+        Bugfix 05.08.2026 (Punkt 2): Blendet zusaetzlich die Speicher-
+        Buttons der Parameter-Spalte ein (_set_param_actions_visible im
+        Orchestrator) - eine manuelle Parameter-Aenderung macht das
+        Speichern erst noetig/sichtbar.
+        """
+        try:
+            self._set_param_actions_visible(True)
+        except (RuntimeError, AttributeError):
+            pass
+        selector = getattr(self, "service_selector", None)
+        tree = getattr(selector, "master_tree", None)
+        if tree is None or not iid:
+            return
+        try:
+            tree.set_instance_dirty(iid, True)
+        except (RuntimeError, AttributeError):
+            pass
+
     def _setup_collapsible(self, group: QGroupBox) -> None:
         """Macht eine ausklappbare QGroupBox wirklich kollabierbar.
 
@@ -18389,8 +19236,56 @@ class ServiceParamColumnsMixin:
         daher fälschlich schrumpfen. _schedule_reflow() zerstört die
         deleteLater-Widgets und berechnet die Größe erst aus dem konsistenten
         Zustand (ContentScrollMixin).
+
+        Zusatz (Layout-Runde 2, 05.08.2026): Die Service-Parameter-Box liegt
+        in einer ContentScrollArea mit widgetResizable=False – die ScrollArea
+        resizet das Widget NICHT automatisch. Die Box wird daher DEFERRED
+        (nach dem Zerstören der deleteLater-Altspalten) auf ihre aktuelle
+        Layout-Größe gesetzt, damit die ScrollArea Scrollbalken anzeigen
+        kann, sobald die Box das max. Format übersteigt (Punkt 5).
         """
         self._schedule_reflow()
+        QTimer.singleShot(0, self._resize_param_box_deferred)
+
+    def _resize_param_box_deferred(self) -> None:
+        """Setzt die Service-Parameter-Box (in der ContentScrollArea) DEFERRED
+        auf ihre aktuelle Layout-Größe.
+
+        Muss NACH dem Zerstören der per deleteLater() markierten Alt-Spalten
+        laufen – ein synchrones resize in _reflow() würde den veralteten
+        QWidgetItemV2-sizeHint (18x18 für ein gerade geleertes Layout) lesen
+        und die Box auf 18x18 schrumpfen (Bugfix 05.08.2026, Punkt 5).
+        """
+        try:
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        except (RuntimeError, AttributeError):
+            pass
+        box = getattr(self, "widget_service_columns", None)
+        if box is None or box.layout() is None:
+            return
+        try:
+            box.updateGeometry()
+            box.resize(box.layout().sizeHint())
+            scroll = getattr(self, "_param_scroll", None)
+            if scroll is not None:
+                scroll.updateGeometry()
+            # Bugfix 05.08.2026 (Punkt 1): Der QSplitter fixiert die
+            # Spaltengroessen beim addWidget (VOR dem Spaltenaufbau) und
+            # aktualisiert sie nicht, wenn die sizeHints danach wachsen
+            # (Qt-Quirk, analog QWidgetItemV2). Nach dem Spaltenaufbau wird
+            # die Param-Spalte auf ihre aktuelle Layout-Breite gesetzt, damit
+            # 2 Services nebeneinander ohne horizontalen Scroll passen.
+            splitter = getattr(self, "main_splitter", None)
+            if splitter is not None and splitter.count() == 3:
+                hints = []
+                for i in range(splitter.count()):
+                    w = splitter.widget(i)
+                    if w is not None:
+                        hints.append(w.sizeHint().width())
+                if hints:
+                    splitter.setSizes(hints)
+        except (RuntimeError, AttributeError):
+            pass
 
     def _clear_service_columns(self) -> None:
         """Entfernt alle Service-Spalten aus dem service_columns_layout."""
@@ -18422,14 +19317,19 @@ class ServiceParamColumnsMixin:
             pid = cfg.get("plugin_id") or iid
             col = self._build_service_column(iid, pid, cfg)
             self.service_columns_layout.addWidget(col)
-        # Container erneut in die obere Zeile einfügen: Das QWidgetItem
-        # eines Widgets meldet dessen Größe zum Zeitpunkt des Einfügens und
-        # aktualisiert sich bei späterem Inhalts-Wachstum nicht (Qt-Quirk).
-        # Entfernen + erneutes Einfügen erzeugt ein frisches QWidgetItem mit
-        # der aktuellen Größe.
-        if self.top_row is not None and self.widget_service_columns is not None:
-            self.top_row.removeWidget(self.widget_service_columns)
-            self.top_row.addWidget(self.widget_service_columns)
+        # Bugfix 05.08.2026 (Layout-Runde 2): Die Service-Parameter-Box
+        # (widget_service_columns) liegt seit dem DREI-SPALTEN-Splitter FEST in
+        # einer ContentScrollArea (_param_scroll, rechte Splitter-Spalte, max.
+        # Hoehe/Breite mit Scrollbalken - Punkt 5). KEIN Reinsert mehr noetig
+        # (der fruehere Reinsert stammte aus dem Alt-Layout und verschob die
+        # Box aus dem Editor-Panel). Der Qt-6.11-QWidgetItemV2-Cache wird ueber
+        # updateGeometry() invalidiert, damit die ScrollArea/der Splitter die
+        # aktuelle Spaltenbreite/-hoehe live uebernehmen (vgl. _reflow).
+        if self.widget_service_columns is not None:
+            self.widget_service_columns.updateGeometry()
+        scroll = getattr(self, "_param_scroll", None)
+        if scroll is not None:
+            scroll.updateGeometry()
         self._reflow()
 
     def _build_service_column(self, iid: str, pid: str, cfg: Dict[str, Any]) -> QGroupBox:
@@ -18474,6 +19374,10 @@ class ServiceParamColumnsMixin:
         # Phase 14 P14-01: Individuelle Instanz-Beschreibung (bearbeitbar) –
         # wird in ServiceInstanceConfig.description gespeichert und in
         # Tooltip + Info-Dialog angezeigt.
+        # Phase 16 (05.08.2026): Stift-Button (✏️) neben dem Beschreibungsfeld
+        # oeffnet den modalen ServiceDescriptionEditDialog (mehrzeiliger
+        # QTextEdit); [Speichern] persistiert via Repo + EventBus. Die
+        # QLineEdit bleibt als schnelles Einzeilen-Feld erhalten.
         desc_row = QHBoxLayout()
         desc_label = QLabel("Beschreibung:")
         desc_edit = QLineEdit()
@@ -18481,8 +19385,20 @@ class ServiceParamColumnsMixin:
         desc_edit.setText(str(cfg.get("description") or ""))
         self._service_desc_controls[iid] = desc_edit
         desc_edit.textChanged.connect(lambda _t, iid=iid: self._update_service_tooltip(iid))
+        # Phase 15 (Dirty-State): auch die Instanz-Beschreibung ist Teil des
+        # Sets und wird erst beim Set-Speichern persistiert -> dirty markieren.
+        desc_edit.textChanged.connect(lambda _t, iid=iid: self._mark_service_dirty(iid))
         desc_row.addWidget(desc_label)
         desc_row.addWidget(desc_edit)
+        desc_edit_btn = QPushButton("✏️")
+        desc_edit_btn.setObjectName("btn_desc_edit")
+        desc_edit_btn.setToolTip(
+            "Beschreibung bearbeiten – öffnet den mehrzeiligen Editor")
+        desc_edit_btn.setFixedWidth(32)
+        desc_edit_btn.setCursor(Qt.PointingHandCursor)
+        desc_edit_btn.clicked.connect(
+            lambda _=False, iid=iid: self._open_service_desc_editor(iid))
+        desc_row.addWidget(desc_edit_btn)
         vl.addLayout(desc_row)
 
         # Normale (Nicht-Expert-, Nicht-Darstellungs-)Parameter
@@ -18503,6 +19419,8 @@ class ServiceParamColumnsMixin:
                     pass
             ctrl = self._create_param_control(key, cval, spec)
             self._service_param_controls[(iid, key)] = ctrl
+            # Phase 15 (Dirty-State): Aenderungen markieren die Instanz.
+            self._connect_param_change(ctrl, iid, key)
             form.addRow(labels.get(key, self._human(key)), ctrl)
         vl.addLayout(form)
 
@@ -18522,6 +19440,8 @@ class ServiceParamColumnsMixin:
                     cval = params.get(key, spec.get("default"))
                 ctrl = self._create_param_control(key, cval, spec)
                 self._service_param_controls[(iid, key)] = ctrl
+                # Phase 15 (Dirty-State): Aenderungen markieren die Instanz.
+                self._connect_param_change(ctrl, iid, key)
                 ef.addRow(labels.get(key, self._human(key)), ctrl)
             vl.addWidget(exp_grp)
             self._setup_collapsible(exp_grp)
@@ -18556,6 +19476,290 @@ class ServiceParamColumnsMixin:
 
 --------------------------------------------------
 
+### DATEI: serviceui/run_worker.py
+```py
+# serviceui/run_worker.py
+"""
+Service-UI: Gezielter Hintergrund-Worker fuer die MasterTree-Kontextmenue-
+Aktionen '▶️ Diesen Service ausfuehren' / '▶️ Alle Services ausfuehren'
+(Phase 15, 05.08.2026).
+
+Im Gegensatz zum historischen `ServiceSetRunWorker` (btn_execute_set, KEIN
+Feature-Store-Schreibpfad) persistiert dieser Worker den erzeugten
+`feature_store_payload` ZWINGEND in analytics.duckdb (`feature_store`, via
+FeatureBuilder.store_plugin_payload) und emittiert danach den EventBus
+(`service_set_changed`) – dadurch liest das `ServiceSelectorModel` beim
+automatischen refresh() das neue `MAX(created_at)` je feature_id und der
+MasterTree aktualisiert das Datum '(DD.MM.JJ)' am betroffenen Service-Knoten
+ohne App-Neustart (alle offenen Analytics-/Chart-Fenster folgen synchron).
+
+KEIN globaler Massen-Scan (HistoricalScanner wird bewusst NICHT verwendet):
+Der Run ist strikt zielgerichtet –
+  * laedt OHLCV nur fuer das aktive Symbol + den gewaehlten Timeframe
+    (FeatureBuilder.load_ohlcv),
+  * fuehrt nur die selektierte Instanz (Single) bzw. das selektierte Set
+    (Set) in execution_order aus (ServiceSetEvaluator.execute_set).
+
+Einzel-Service-Run (single): Es wird eine Mini-Definition gebildet, die den
+selektierten Service UND alle Upstream-Services (fruehere Positionen in der
+execution_order des Sets) enthaelt – damit liefern Abhaengigkeiten
+(depends_on, z.B. grid_1 -> prox_1) ihre shared_state-Eintraege und ein
+nachgelagerter Service (proximity) kann tatsaechlich Hits erzeugen und in
+den feature_store schreiben.
+
+Der Worker emittiert NUR Signale (log_message / run_finished / run_failed);
+den Bestaetigungsdialog zeigt der Orchestrator (ServiceWindow) VOR dem Start.
+"""
+
+from typing import Any, Dict, List, Optional
+
+from PySide6.QtCore import QThread, Signal
+
+# U15-E (05.08.2026): Sentinel-Wert der Timeframe-Filterleiste im
+# ServiceWindow. Wird der Kontextmenue-Run mit diesem Timeframe gestartet,
+# fuehrt der Worker ALLE verfuegbaren Timeframes nacheinander aus (Multi-TF).
+ALL_TIMEFRAMES = "ALLE Timeframes"
+
+
+class ServiceRunWorker(QThread):
+    """Fuehrt einen Einzel-Service oder ein ganzes Service-Set zielgerichtet
+    im Hintergrund aus und persistiert die Feature-Payloads im feature_store.
+
+    05.08.2026 (U15-E): Multi-Timeframe-Ausfuehrung – wenn `timeframe` den
+    Sentinel-Wert ALL_TIMEFRAMES ('ALLE Timeframes') traegt, laeuft der Worker
+    ALLE verfuegbaren Timeframes (get_timeframes, Fallback TF_SECONDS_MAP)
+    nacheinander durch: pro Timeframe OHLCV laden, Pipeline ausfuehren und
+    die Payloads mit dem jeweiligen Timeframe in den feature_store schreiben.
+    Der EventBus-Sync (`service_set_changed`) wird NUR EINMAL nach Abschluss
+    aller Timeframes emittiert.
+
+    Signals:
+        log_message(str)      – Fortschritts-/Ergebnis-Meldungen.
+        run_finished(str, int)– scope_id (set_id ODER instance_id), Anzahl
+                                geschriebener Feature-Rows (0 moeglich, wenn
+                                der Service keinen feature_store-Payload hat).
+        run_failed(str, str)  – scope_id, Fehlermeldung.
+    """
+
+    log_message = Signal(str)
+    run_finished = Signal(str, int)
+    run_failed = Signal(str, str)
+
+    def __init__(self, evaluator, symbol: str, timeframe: str,
+                 set_definition: Dict[str, Any],
+                 instance_id: Optional[str] = None,
+                 parent=None) -> None:
+        """Erstellt den Worker.
+
+        Args:
+            evaluator:      ServiceSetEvaluator (execute_set-Pipeline).
+            symbol:         Aktives Symbol (z.B. 'SILVER').
+            timeframe:      Gewaehlter Timeframe (z.B. 'M1').
+            set_definition: Vollstaendige ServiceSetDefinition des Sets.
+            instance_id:    Optional – bei Single-Run die selektierte
+                            instance_id; None = ganzes Set ausfuehren.
+            parent:         Qt-Parent (optional).
+        """
+        super().__init__(parent)
+        self.evaluator = evaluator
+        self.symbol = symbol
+        self.timeframe = timeframe
+        self.set_definition = set_definition
+        self.instance_id = instance_id
+
+    # ------------------------------------------------------------------
+    # Ausfuehrungs-Scope (Single vs. Set)
+    # ------------------------------------------------------------------
+    def _build_scope_definition(self) -> Dict[str, Any]:
+        """Liefert die auszufuehrende (Mini-)Definition.
+
+        * Set-Run: die vollstaendige Set-Definition.
+        * Single-Run: der selektierte Service + alle Upstream-Services
+          (vorherige Positionen in execution_order) – Abhaengigkeiten
+          (depends_on) bleiben gueltig, die Pipeline ist aber strikt auf
+          die selektierte Instanz ausgerichtet (kein globaler Massen-Scan).
+        """
+        if not self.instance_id:
+            return self.set_definition
+        order = list(self.set_definition.get("execution_order") or [])
+        services = dict(self.set_definition.get("services") or {})
+        if self.instance_id not in services:
+            raise ValueError(
+                f"Service '{self.instance_id}' nicht im Set vorhanden.")
+        if self.instance_id in order:
+            idx = order.index(self.instance_id)
+        else:
+            # Instanz nicht in der Reihenfolge -> nur die Instanz selbst
+            idx = 0
+            order = []
+        scope_order = order[:idx + 1]
+        scope_services = {
+            iid: services[iid] for iid in scope_order if iid in services
+        }
+        return {
+            "set_id": self.set_definition.get("set_id"),
+            "display_name": self.set_definition.get("display_name"),
+            "execution_order": scope_order,
+            "services": scope_services,
+        }
+
+    # ------------------------------------------------------------------
+    # U15-E (05.08.2026): Timeframe-Aufloesung (Single vs. Multi-TF)
+    # ------------------------------------------------------------------
+    def _resolve_timeframes(self) -> List[str]:
+        """Liefert die auszufuehrenden Timeframes in stabiler Reihenfolge.
+
+        * Spezifischer Timeframe: [self.timeframe] (Single-Run, unveraendert).
+        * ALL_TIMEFRAMES: alle verfuegbaren Timeframes aus get_timeframes()
+          (Fallback: TF_SECONDS_MAP; letzter Fallback: Basisliste).
+        """
+        if self.timeframe != ALL_TIMEFRAMES:
+            return [self.timeframe]
+        try:
+            from db_service import TF_SECONDS_MAP, get_timeframes
+            try:
+                return list(get_timeframes().keys())
+            except Exception:
+                return list(TF_SECONDS_MAP.keys())
+        except Exception:
+            return ["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
+
+    def _execute_timeframe(self, fb, settings, definition: Dict[str, Any],
+                           scope_label: str, tf: str) -> int:
+        """Fuehrt die Pipeline fuer EINEN Timeframe aus und persistiert die
+        Feature-Payloads im feature_store.
+
+        Returns:
+            Anzahl geschriebener Feature-Rows (0, wenn keine Daten oder kein
+            Payload vorhanden sind).
+        """
+        from analytics.features.feature_builder import prepare_plugin_df
+        from analytics.features.plugins.base_plugin import PluginContext
+
+        df = fb.load_ohlcv(self.symbol, tf,
+                           limit=settings.scanner_candle_limit)
+        if df is None or df.empty:
+            self.log_message.emit(
+                f"  {self.symbol} {tf}: keine OHLCV-Daten – uebersprungen")
+            return 0
+
+        df_plugin = prepare_plugin_df(df)
+        context = PluginContext(
+            symbol=self.symbol,
+            timeframe=tf,
+            mode="batch",
+            timestamp=int(df_plugin["time"].iloc[-1]) if len(df_plugin) else None,
+            settings=settings,
+        )
+
+        self.log_message.emit(
+            f"Ausfuehren: {scope_label} ({self.symbol} {tf})")
+        results = self.evaluator.execute_set(definition, df_plugin,
+                                             context=context)
+
+        stored = 0
+        for iid, result in results.items():
+            payload = (result or {}).get("feature_store_payload") or {}
+            records = payload.get("records") or []
+            if not records:
+                self.log_message.emit(
+                    f"  {iid}: fertig (kein Feature-Store-Payload)")
+                continue
+            fb.store_plugin_payload(self.symbol, tf, payload)
+            stored += len(records)
+            self.log_message.emit(
+                f"  {iid}: {len(records)} Feature-Row(s) gespeichert "
+                f"({self.symbol} {tf})")
+        return stored
+
+    # ------------------------------------------------------------------
+    # Worker-Loop
+    # ------------------------------------------------------------------
+    def run(self) -> None:
+        """Laedt OHLCV (ein oder alle Timeframes), fuehrt die Pipeline aus,
+        persistiert die Payloads im feature_store und stoesst den EventBus-
+        Sync an (einmalig nach Abschluss)."""
+        scope_id = self.instance_id or str(
+            self.set_definition.get("set_id") or "")
+        try:
+            from analytics.features.feature_builder import FeatureBuilder
+            from config.event_bus import event_bus
+            from state_manager import StateManager
+
+            settings = StateManager().get_app_settings()
+            fb = FeatureBuilder()
+            definition = self._build_scope_definition()
+            # 05.08.2026 (Bugfix Service-Run):
+            #  * Fehlende depends_on-Einträge (z.B. proximity -> grid_lines)
+            #    werden automatisch aufgelöst (sonst 'kein Feature-Store-
+            #    Payload' beim Single-Run eines nachgelagerten Services).
+            #  * Scanner-Candles (max) aus den App-Optionen als max Lookback
+            #    für ALLE Services (Datenbasis wie beim Historical Scanner).
+            from serviceui.service_set_utils import prepare_worker_definition
+            definition = prepare_worker_definition(
+                definition,
+                getattr(settings, "scanner_candle_limit", 100000),
+            )
+            display = str(definition.get("display_name")
+                          or self.set_definition.get("display_name")
+                          or scope_id or "Unbenannt")
+            scope_label = (f"Service '{self.instance_id}' im Set '{display}'"
+                           if self.instance_id else f"Set '{display}'")
+            self.log_message.emit(f"Ausfuehren: {scope_label}")
+
+            timeframes = self._resolve_timeframes()
+            if not timeframes:
+                self.run_failed.emit(
+                    scope_id, "Keine Timeframes verfuegbar.")
+                return
+
+            total_stored = 0
+            empty_tfs: List[str] = []
+            for tf in timeframes:
+                try:
+                    stored = self._execute_timeframe(
+                        fb, settings, definition, scope_label, tf)
+                except Exception as e:
+                    # U15-E (Multi-TF): Ein fehlgeschlagener Timeframe bricht
+                    # die Gesamt-Ausfuehrung NICHT ab – Fehler wird geloggt,
+                    # die restlichen Timeframes laufen weiter.
+                    if self.timeframe == ALL_TIMEFRAMES:
+                        self.log_message.emit(
+                            f"  {self.symbol} {tf}: FEHLER – {e}")
+                        continue
+                    raise
+                total_stored += stored
+                if stored == 0:
+                    empty_tfs.append(tf)
+
+            # Single-TF ohne Daten -> Fehler (bisheriges Verhalten erhalten).
+            if len(timeframes) == 1 and empty_tfs:
+                self.run_failed.emit(
+                    scope_id,
+                    f"Keine OHLCV-Daten fuer {self.symbol} {timeframes[0]}.")
+                return
+
+            self.log_message.emit(
+                f"Fertig: {total_stored} Feature-Row(s) im feature_store "
+                f"({self.symbol}).")
+
+            # UI-Sync: Nach Abschluss des Workers werden alle lauschenden
+            # ServiceSelectorModel-Instanzen (MasterTree, Analytics, ...)
+            # automatisch aktualisiert – sie lesen das neue MAX(created_at)
+            # und der Baum zeigt das Datum (DD.MM.JJ) live an.
+            try:
+                event_bus.service_set_changed.emit()
+            except Exception as e:  # pragma: no cover
+                print(f"WARN [ServiceRunWorker] EventBus-Emitt fehlgeschlagen: {e}")
+
+            self.run_finished.emit(scope_id, total_stored)
+        except Exception as e:
+            self.run_failed.emit(scope_id, str(e))
+
+```
+
+--------------------------------------------------
+
 ### DATEI: serviceui/service_selector_widget.py
 ```py
 # serviceui/service_selector_widget.py
@@ -18567,8 +19771,11 @@ Konfigurierbares PySide6-Widget mit zwei Betriebsmodi:
   * Modus A (SELECT_ONLY): Kompakte Dropdown-Auswahl (Set-Combo + Service-
     Combo) fuer die schwellenfreie Wiederverwendung in Analytics (15.03),
     Backtester oder Charts. Emittiert `selection_changed(set_id, service_id)`.
-  * Modus B (FULL_EDIT):  Vollstaendiges Master-Tree-Widget mit Aktions-
-    Toolbar fuer service_win.py (Erstellen, Umsortieren, Loeschen).
+  * Modus B (FULL_EDIT):  Vollstaendiges Master-Tree-Widget fuer service_win.py
+    (Erstellen, Umsortieren, Loeschen ueber das Kontextmenue). Seit
+    05.08.2026 OHNE Aktions-Toolbar: die CRUD-/Order-Buttons oberhalb des
+    Baums sind entfernt – der MasterTree hat die volle vertikale Hoehe der
+    linken Spalte und alle Struktur-Aktionen laufen ueber das Kontextmenue.
 
 Beide Modi werden ausschliesslich aus dem `ServiceSelectorModel` befuellt
 (lesendes Datenmodell, EventBus-Live-Sync, Invariante 4/5).
@@ -18583,7 +19790,6 @@ from PySide6.QtWidgets import (
 
 from analytics.engine.service_selector_model import ServiceSelectorModel
 from serviceui.master_tree import MasterTree
-from serviceui.toolbar import ServiceToolbar
 
 
 class ServiceSelectorWidget(QWidget):
@@ -18611,7 +19817,6 @@ class ServiceSelectorWidget(QWidget):
         # Modus-Bausteine (werden je nach Modus erzeugt/eingefuegt)
         self._compact_row: Optional[QWidget] = None
         self.master_tree: Optional[MasterTree] = None
-        self.toolbar: Optional[ServiceToolbar] = None
 
         self.model.data_changed.connect(self._on_model_changed)
         self.set_mode(mode)
@@ -18624,7 +19829,7 @@ class ServiceSelectorWidget(QWidget):
         """Baut das Widget fuer den gewuenschten Betriebsmodus auf.
 
         Args:
-            mode: MODE_SELECT_ONLY (Dropdown) oder MODE_FULL_EDIT (Tree+Toolbar).
+            mode: MODE_SELECT_ONLY (Dropdown) oder MODE_FULL_EDIT (MasterTree).
         """
         mode = mode or self.MODE_SELECT_ONLY
         # Alte Bausteine entfernen
@@ -18636,7 +19841,6 @@ class ServiceSelectorWidget(QWidget):
                 w.deleteLater()
         self._compact_row = None
         self.master_tree = None
-        self.toolbar = None
 
         if mode == self.MODE_FULL_EDIT:
             self._build_full_edit()
@@ -18664,10 +19868,17 @@ class ServiceSelectorWidget(QWidget):
         self._repopulate_select_only()
 
     def _build_full_edit(self) -> None:
-        """Modus B: MasterTree (2 Spalten) + ServiceToolbar."""
+        """Modus B: MasterTree (2 Spalten) – volle Hoehe, KEINE Toolbar.
+
+        05.08.2026: Die Aktions-Toolbar (btn_add/btn_remove/Order-Pfeile)
+        oberhalb des Baums ist entfernt – der MasterTree fuellt die gesamte
+        vertikale Hoehe der linken Spalte. Alle Struktur-Aktionen (Set
+        anlegen/umbenennen/loeschen, Service hinzufuegen/verschieben/
+        entfernen) und die neuen Run-Aktionen ('▶️ Diesen Service ausführen' /
+        '▶️ Alle Services ausführen') laufen ueber das Kontextmenue
+        (entkoppelte Signale, der Orchestrator verknuepft sie mit seinen
+        Handlern)."""
         self.master_tree = MasterTree(self.model, parent=self)
-        self.toolbar = ServiceToolbar(parent=self)
-        self._layout.addWidget(self.toolbar)
         self._layout.addWidget(self.master_tree, 1)
 
         self.master_tree.selection_changed.connect(self.selection_changed)
@@ -18801,6 +20012,86 @@ def _sets_using_plugin(plugin_id: str, sets: List[Dict[str, Any]]) -> List[str]:
             names.append(str(s.get("display_name") or s.get("set_id") or "?"))
     return names
 
+
+def prepare_worker_definition(
+    definition: Dict[str, Any],
+    lookback_limit: int,
+) -> Dict[str, Any]:
+    """Bereitet eine ServiceSetDefinition für die gezielte Worker-Ausführung
+    auf (serviceui/run_worker.py + serviceui/set_run_worker.py). Die übergebene
+    Definition bleibt unverändert – es wird eine Kopie zurückgegeben.
+
+    05.08.2026 (Bugfix Service-Run, zwei Korrekturen):
+
+    1. Implizite Abhängigkeiten (depends_on): Services OHNE expliziten
+       `depends_on`-Eintrag, deren Plugin `dependencies` deklariert
+       (z.B. proximity -> ['grid_lines']), erhalten die nächstliegende
+       VORHERIGE Instanz in execution_order mit passender plugin_id als
+       depends_on. Dadurch liest der ProximityService seine Linienliste
+       aus shared_state[depends_on[0]] (vorher: 'fertig (kein
+       Feature-Store-Payload)' bei UI-angelegten Sets, die kein depends_on
+       speichern). Explizit gesetzte Werte werden NIE überschrieben
+       (Indikator-intern grid_1 -> prox_1 bleibt unverändert).
+
+    2. Lookback-Override: Jede Service-Instanz läuft mit `lookback_limit`
+       (Scanner-Candles (max) aus den App-Optionen, AppSettings.
+       scanner_candle_limit) als Scan-Fenster – damit verwenden ALLE
+       Services dieselbe Datenbasis wie der Historical Scanner (vorher:
+       gespeicherter Service-lookback, z.B. 1000 Feature-Rows bei
+       grid_lines).
+    """
+    import copy as _copy
+    from analytics.features.feature_builder import PluginRegistry
+
+    order = list(definition.get("execution_order") or [])
+    services = dict(definition.get("services") or {})
+    out = dict(definition)
+    out["execution_order"] = order
+    out["services"] = services
+    if not order or not services:
+        return out
+
+    try:
+        lb = int(lookback_limit)
+        if lb < 1:
+            lb = 1
+    except (TypeError, ValueError):
+        lb = 1
+
+    registry = PluginRegistry()
+    resolved = _copy.deepcopy(services)
+    position = {iid: idx for idx, iid in enumerate(order)}
+
+    for iid in order:
+        cfg = resolved.get(iid)
+        if not isinstance(cfg, dict):
+            continue
+
+        # 1) Implizite depends_on-Auflösung (nur wenn NICHT explizit gesetzt)
+        if not cfg.get("depends_on"):
+            pid = str(cfg.get("plugin_id") or iid)
+            upstream: List[str] = []
+            try:
+                plugin = registry.get(pid)
+                upstream = list(getattr(plugin, "dependencies", None) or [])
+            except (KeyError, AttributeError):
+                upstream = []
+            if upstream:
+                for prev_iid in reversed(order[:position.get(iid, 0)]):
+                    prev_cfg = resolved.get(prev_iid)
+                    if not isinstance(prev_cfg, dict):
+                        continue
+                    if str(prev_cfg.get("plugin_id") or prev_iid) in upstream:
+                        cfg["depends_on"] = [prev_iid]
+                        break
+
+        # 2) Lookback-Override (Scanner-Candles (max) für alle Services)
+        cfg["lookback"] = lb
+
+    out["services"] = resolved
+    return out
+
+
 ```
 
 --------------------------------------------------
@@ -18852,11 +20143,14 @@ except ImportError:  # pragma: no cover
         return obj is not None
 
 from analytics.background_workers.historical_scanner import HistoricalScanner
-from analytics.engine.description_dialog import ServiceDescriptionDialog
+from analytics.engine.description_dialog import (
+    ServiceDescriptionDialog,
+    ServiceDescriptionEditDialog,
+)
 from analytics.engine.service_set_repository import ServiceSetRepository
 from analytics.engine.set_evaluator import ServiceSetEvaluator
 from persistent_win import PersistentWindow, register_persistent_window
-from scrollable_content import ContentScrollMixin
+from scrollable_content import ContentScrollArea, ContentScrollMixin
 from chart.widgets.named_item_actions import NamedItemActionsMixin
 
 # Phase 15 U15-D1: Submodule der Service-UI
@@ -18866,6 +20160,11 @@ from serviceui.set_item_adapter import ServiceSetItemAdapter, _ServiceSetItemAda
 from serviceui.param_columns import ServiceParamColumnsMixin
 from serviceui.trash_dialog import ServiceSetTrashDialog
 from serviceui.new_set_dialog import NewServiceSetDialog
+# 05.08.2026: Gezielter Run-Worker fuer die MasterTree-Kontextmenue-Aktionen
+# ('▶️ Diesen Service ausführen' / '▶️ Alle Services ausführen') – persistiert
+# den feature_store_payload und emittiert den EventBus (Datum live im Baum).
+# U15-E (05.08.2026): ALL_TIMEFRAMES = Sentinel fuer Multi-TF-Ausfuehrung.
+from serviceui.run_worker import ALL_TIMEFRAMES, ServiceRunWorker
 
 # Phase 15 15.01: Symbol- & Favoriten-Verwaltung (SymbolsWindow + EventBus)
 from serviceui.symbols_win import SymbolsWindow
@@ -18901,11 +20200,21 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self.set_repo: ServiceSetRepository = service_set_repo or ServiceSetRepository()
         self.set_evaluator = ServiceSetEvaluator()
         self._set_run_worker: Optional[ServiceSetRunWorker] = None
+        # 05.08.2026: Worker fuer die gezielte Kontextmenue-Ausfuehrung
+        # (MasterTree '▶️ Service(s) ausführen') – FeatureStore-Persistenz.
+        self._run_worker: Optional[ServiceRunWorker] = None
         self._current_set_id: Optional[str] = None
         self._current_set_definition: Optional[Dict[str, Any]] = None
         # USER-REQ (P14-03): Preisskala-Praezision je Symbol fuer die 6
         # Custom-Level-Eingabefelder (prox_level1..6). Lazy + gecacht.
         self._symbol_precision: Optional[int] = None
+        # Phase 16 (05.08.2026): Concurrency-Guard – Referenzzähler für die
+        # pausierten 45s-Hintergrund-Syncs (sync_timer in main.py). Bei
+        # jedem beginnenden Service-Run/Scan wird das EventBus-Signal
+        # service_run_started emittiert (nur beim Übergang 0→1), nach dem
+        # letzten Abschluss service_run_finished (1→0). Dadurch wird der
+        # Sync-Timer für die Dauer intensiver Berechnungen geblockt.
+        self._sync_guard_count: int = 0
 
         # Phase 13 Schritt 8: Service-Set-Adapler für die generische
         # Neu-/Speichern-/Löschen-Mechanik (NamedItemActionsMixin) – exakt
@@ -18936,6 +20245,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # Phase 13 Schritt 4: Service-Set-Controls
         self.combo_set: QComboBox = self.ui.findChild(QComboBox, "combo_set")
         self.combo_tf_set: QComboBox = self.ui.findChild(QComboBox, "combo_tf_set")
+        # 05.08.2026 (U15-E): Timeframe-Control in der Filterleiste (neben dem
+        # Symbol-Dropdown) – steuert die gezielte Kontextmenue-Ausfuehrung
+        # (MasterTree '▶️ Service(s) ausführen'). 'ALLE Timeframes' (Index 0,
+        # Sentinel ALL_TIMEFRAMES) fuehrt alle verfuegbaren Timeframes aus.
+        self.combo_tf: QComboBox = self.ui.findChild(QComboBox, "combo_tf")
         self.btn_refresh_sets: QPushButton = self.ui.findChild(QPushButton, "btn_refresh_sets")
         self.edit_set_name: QLineEdit = self.ui.findChild(QLineEdit, "edit_set_name")
         # Phase 14 P14-01: Set-Beschreibung + Info-Button (ServiceDescriptionDialog)
@@ -18956,6 +20270,12 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # Phase 14 P14-05: Papierkorb-Button (Soft-Delete/Wiederherstellung)
         self.btn_trash_sets: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_trash_sets")
         self.btn_execute_set: QPushButton = self.ui.findChild(QPushButton, "btn_execute_set")
+        # Bugfix 05.08.2026 (Punkt 1): Das Log (text_log) klebte am unteren
+        # Bildschirmrand, weil es unbegrenzt wuchs und das Fenster bis zum
+        # Screen-Cap aufging. Max. Hoehe ~5 Zeilen -> kompaktes Log, kein
+        # Bildschirmrand-Kleben (intern scrollt das QTextEdit).
+        if self.text_log:
+            self.text_log.setMaximumHeight(120)
 
         # Phase 13 5.4 Schritt 1: Dynamische Service-Spalten (Breite/Höhe aus
         # dem Inhalt – KEINE fixen Pixelwerte). Das Inhalt-Layout erhält
@@ -18979,10 +20299,20 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self.content_widget = self.ui.centralWidget()
         self.central_layout = self.content_widget.layout() if self.content_widget else None
         if self.central_layout is not None:
-            # Phase 15 15.02 (Orchestrator): QSplitter-Zusammensetzung.
-            #  * Links:  bestehender Set-Editor + dynamische Service-Spalten.
-            #  * Rechts: MasterTree (2-Spalten-Hierarchie, Live-Status-Badges,
-            #            ServiceSelectorWidget im Modus FULL_EDIT).
+            # Bugfix 05.08.2026 (Layout-Runde 2): DREI-SPALTEN-Splitter.
+            #  * Spalte 1 (links):  Service-Sets-Box (group_service_sets).
+            #  * Spalte 2 (Mitte):  MasterTree (Service tree) – Minimum-Breite,
+            #                       damit eingerueckte Texte lesbar sind
+            #                       (Punkt 4: Scrollbalken bei Ueberlauf).
+            #  * Spalte 3 (rechts): Service-Parameter-Box (widget_service_
+            #                       columns) in einer ContentScrollArea mit
+            #                       max. Hoehe/Breite + Scrollbalken (Punkt 5),
+            #                       darunter fest die Aktions-Leiste
+            #                       [💾 Speichern] / [▶️ Speichern & Ausführen]
+            #                       (Punkt 0: Buttons IMMER sichtbar, unab-
+            #                       haengig von Dirty-State/Set-Wechsel).
+            # Die Status-Zeile (Laufzeit/Fortschritt) bleibt im central_layout
+            # direkt UNTER dem Splitter (= unter der hoechsten Box, Punkt 3).
             self.top_row = QHBoxLayout()
             self.top_row.setSpacing(6)
             idx = self.central_layout.indexOf(self.group_service_sets)
@@ -18990,27 +20320,94 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                 idx = 0
             self.central_layout.removeWidget(self.group_service_sets)
 
+            # Spalte 1: Service-Sets-Box (keine Parameter-Spalten mehr)
             self._editor_panel = QWidget()
             editor_layout = QVBoxLayout(self._editor_panel)
             editor_layout.setContentsMargins(0, 0, 0, 0)
             editor_layout.setSpacing(6)
             editor_layout.addWidget(self.group_service_sets)
-            editor_layout.addWidget(self.widget_service_columns)
+            self._editor_panel.setMinimumWidth(380)
+            # Punkt 1 (Bugfix 05.08.2026): Maximalbreite begrenzen, damit die
+            # Service-Parameter-Spalte (2 Services nebeneinander) genug Platz
+            # im Splitter bekommt.
+            self._editor_panel.setMaximumWidth(700)
 
+            # Spalte 2: MasterTree (Service tree)
             self.right_panel = QWidget()
             right_layout = QVBoxLayout(self.right_panel)
             right_layout.setContentsMargins(0, 0, 0, 0)
             right_layout.setSpacing(6)
-            # MasterTree + Aktions-Toolbar (Modus B / FULL_EDIT)
+            # MasterTree im Modus B / FULL_EDIT (seit 05.08.2026 ohne Toolbar)
             self.service_selector = ServiceSelectorWidget(
                 mode=ServiceSelectorWidget.MODE_FULL_EDIT, parent=self)
             right_layout.addWidget(self.service_selector, 1)
+            # Punkt 4: Mindest-Breite, damit eingerueckte Texte (LEVEL_INDENT)
+            # lesbar sind; wird der Tree groesser (mehr Services), zeigt das
+            # QTreeWidget seine nativen Scrollbalken. Punkt 1: Maximalbreite
+            # begrenzen, damit die Parameter-Spalte Platz fuer 2 Services hat.
+            try:
+                self.service_selector.master_tree.setMinimumWidth(400)
+                self.service_selector.master_tree.setMaximumWidth(560)
+            except (RuntimeError, AttributeError):
+                pass
+
+            # Spalte 3: Service-Parameter-Box + Aktions-Leiste (Punkt 5/0)
+            self._param_panel = QWidget()
+            self._param_panel.setMinimumWidth(320)
+            param_layout = QVBoxLayout(self._param_panel)
+            param_layout.setContentsMargins(0, 0, 0, 0)
+            param_layout.setSpacing(6)
+            # Punkt 5/1: max. Hoehe der Parameter-Box; die max. BREITE ist so
+            # bemessen, dass ZWEI Service-Spalten nebeneinander OHNE
+            # horizontalen Scrollbalken passen (Bugfix 05.08.2026, Punkt 1) -
+            # bei mehr Services/Spalten scrollt die ContentScrollArea.
+            self._param_scroll = ContentScrollArea()
+            self._param_scroll.setWidgetResizable(False)
+            self._param_scroll.setWidget(self.widget_service_columns)
+            self._param_scroll.setMaximumHeight(620)
+            self._param_scroll.setMaximumWidth(1000)
+            param_layout.addWidget(self._param_scroll, 1)
+            # Phase 15 (Dirty-State): Aktions-Leiste direkt UNTER der
+            # Parameter-Box – [💾 Speichern] persistiert die Parameter-
+            # Aenderungen ohne Neuberechnung; [▶️ Speichern & Ausführen]
+            # speichert und stoesst sofort den Service-Run an (ServiceRun-
+            # Worker, kein Schwerlast-Scan). Feste Position ausserhalb der
+            # ScrollArea -> immer sichtbar (Punkt 0).
+            self._param_action_row = QHBoxLayout()
+            self._param_action_row.setSpacing(6)
+            self.btn_save_params = QPushButton("💾 Speichern")
+            self.btn_save_run_params = QPushButton("▶️ Speichern & Ausführen")
+            self.btn_save_params.setToolTip(
+                "Speichert die aktuellen Parameter-Aenderungen im Set "
+                "(app_data.duckdb) und entfernt das '*' im Baum.")
+            self.btn_save_run_params.setToolTip(
+                "Speichert die Aenderungen UND stoesst sofort die "
+                "Neuberechnung an (Bestätigungsabfrage mit Symbol/Timeframe).")
+            # Bugfix 05.08.2026 (Punkt 2): Die Speicher-Buttons sind NUR
+            # sichtbar, wenn eine manuelle Parameter-Aenderung stattgefunden
+            # hat (Dirty-State). Initial unsichtbar; _mark_service_dirty
+            # blendet sie ein, _clear_dirty_markers und der Auswahl-Wechsel
+            # blenden sie aus (Punkt 3).
+            self.btn_save_params.setVisible(False)
+            self.btn_save_run_params.setVisible(False)
+            self._param_action_row.addWidget(self.btn_save_params)
+            self._param_action_row.addWidget(self.btn_save_run_params)
+            self._param_action_row.addStretch(1)
+            param_layout.addLayout(self._param_action_row)
+            # Der Scroll (einziger Stretch) bekommt die volle Spaltenhoehe
+            # (bis max 620); ueberschuessiger Platz bleibt unter den Buttons.
 
             self.main_splitter = QSplitter(Qt.Horizontal)
             self.main_splitter.addWidget(self._editor_panel)
             self.main_splitter.addWidget(self.right_panel)
-            self.main_splitter.setStretchFactor(0, 3)
-            self.main_splitter.setStretchFactor(1, 2)
+            self.main_splitter.addWidget(self._param_panel)
+            self.main_splitter.setStretchFactor(0, 2)
+            self.main_splitter.setStretchFactor(1, 3)
+            self.main_splitter.setStretchFactor(2, 2)
+            # Keine Spalte unter ihre Mindestgroesse kollabieren lassen.
+            self.main_splitter.setCollapsible(0, False)
+            self.main_splitter.setCollapsible(1, False)
+            self.main_splitter.setCollapsible(2, False)
 
             self.top_row.addWidget(self.main_splitter)
             self.central_layout.insertLayout(idx, self.top_row)
@@ -19074,6 +20471,13 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.btn_trash_sets.clicked.connect(self.show_trash_dialog)
         if self.btn_execute_set:
             self.btn_execute_set.clicked.connect(self.execute_set)
+        # Phase 15 (Dirty-State): Parameter-Panel-Aktionsleiste (Speichern /
+        # Speichern & Ausführen) – siehe _save_params_from_panel /
+        # _save_and_run_from_panel.
+        if self.btn_save_params:
+            self.btn_save_params.clicked.connect(self._save_params_from_panel)
+        if self.btn_save_run_params:
+            self.btn_save_run_params.clicked.connect(self._save_and_run_from_panel)
 
         # U15-D2 (Bedien-Feinschliff): Log-Kontextmenü (Kopieren / Log leeren)
         # + Auto-Scroll ans Ende in log() – siehe _on_log_context_menu().
@@ -19087,6 +20491,10 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             # USER-REQ: Preisskala-Praezision ist je Symbol fix – beim
             # Symbol-Wechsel Cache invalidieren + Spalten neu bauen.
             self.combo_symbol.currentTextChanged.connect(self._on_symbol_changed)
+        # U15-E (05.08.2026): Timeframe-Control (Filterleiste) ebenfalls sofort
+        # speichern – get_persistent_timeframe() liest combo_tf.
+        if self.combo_tf:
+            self.combo_tf.currentTextChanged.connect(self.save_state)
 
         # Phase 15 15.01: Favoriten-Symbol-Verwaltung.
         # ★-Button rechts neben der Symbol-ComboBox oeffnet das nicht-modale
@@ -19110,6 +20518,10 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         event_bus.favorites_changed.connect(self._refresh_symbol_combo)
         self._refresh_symbol_combo()
 
+        # U15-E (05.08.2026): Timeframe-Dropdown der Filterleiste befuellen –
+        # 'ALLE Timeframes' (Index 0) + alle Timeframes aus get_timeframes().
+        self._refresh_timeframe_combo()
+
         # Set-Dropdown initial befüllen (list_sets() als Quelle)
         self.refresh_set_list()
 
@@ -19132,7 +20544,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.btn_reload_plugins.clicked.connect(self.reload_plugins)
 
         # Phase 15 15.02: MasterTree/ServiceSelector (FULL_EDIT) verdrahten –
-        # Toolbar-Aktionen auf die bestehenden Set-Methoden + EventBus-Sync.
+        # Kontextmenue-Aktionen auf die bestehenden Set-Methoden + EventBus-
+        # Sync. Die fruehere Aktions-Toolbar oberhalb des Baums ist entfernt
+        # (05.08.2026) – der MasterTree hat die volle vertikale Hoehe.
         self._wire_selector_toolbar()
 
         self.log(f"Verfügbare Plugins: {_available_plugin_ids()}")
@@ -19146,6 +20560,17 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         return self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
 
     def get_persistent_timeframe(self) -> str:
+        """Liefert den aktuell gewaehlten Timeframe der Filterleiste (combo_tf).
+
+        05.08.2026 (U15-E): 'ALLE Timeframes' ist eine reguläre, persistierbare
+        Auswahl (Sentinel ALL_TIMEFRAMES) – save_state() speichert sie 1:1,
+        damit beim naechsten Oeffnen exakt derselbe Modus wiederhergestellt
+        wird. Fallback: "H1", wenn kein Control existiert.
+        """
+        if self.combo_tf:
+            tf = self.combo_tf.currentText()
+            if tf:
+                return tf
         return "H1"
 
     def _apply_persistent_filters(self, symbol: str, timeframe: str) -> None:
@@ -19153,6 +20578,51 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             idx = self.combo_symbol.findText(symbol)
             if idx >= 0:
                 self.combo_symbol.setCurrentIndex(idx)
+        # U15-E: Timeframe der Filterleiste wiederherstellen (inkl. Sentinel
+        # 'ALLE Timeframes' – findText trifft den exakten Eintrag).
+        if self.combo_tf and timeframe:
+            idx = self.combo_tf.findText(timeframe)
+            if idx >= 0:
+                self.combo_tf.setCurrentIndex(idx)
+
+    def _refresh_timeframe_combo(self) -> None:
+        """Befuellt das Timeframe-Control der Filterleiste (U15-E).
+
+        Index 0 ist der Sentinel 'ALLE Timeframes' (Multi-TF-Ausfuehrung),
+        danach folgen alle Timeframes AUFSTEIGEND nach Dauer sortiert –
+        kuerzeste zuerst (M1, M2, M5, M10, M15, M30, H1, H4, D1, W1, MN1),
+        identische Reihenfolge wie im chart_win (Bugfix 05.08.2026).
+        get_timeframes() liefert intern die MT5-Reihenfolge (MN1..M1),
+        daher wird explizit ueber TF_SECONDS_MAP sortiert. Fallback bei
+        nicht verfuegbarem MT5: TF_SECONDS_MAP bzw. eine Basisliste. Die
+        aktuelle Auswahl bleibt erhalten, sofern sie noch existiert;
+        Default ist 'M1'.
+        """
+        if not self.combo_tf:
+            return
+        try:
+            from db_service import TF_SECONDS_MAP, get_timeframes
+            try:
+                tfs = list(get_timeframes().keys())
+            except Exception:
+                tfs = list(TF_SECONDS_MAP.keys())
+        except Exception:
+            tfs = ["M1", "M2", "M5", "M10", "M15", "M30",
+                   "H1", "H4", "D1", "W1", "MN1"]
+        # Bugfix 05.08.2026: Kuerzeste zuerst (M1..MN1) wie im chart_win.
+        tfs = sorted(tfs, key=lambda tf: TF_SECONDS_MAP.get(tf, 10**12))
+        current = self.combo_tf.currentText()
+        self.combo_tf.blockSignals(True)
+        self.combo_tf.clear()
+        self.combo_tf.addItem(ALL_TIMEFRAMES)
+        for tf in tfs:
+            if tf != ALL_TIMEFRAMES:
+                self.combo_tf.addItem(tf)
+        idx = self.combo_tf.findText(current)
+        if idx < 0:
+            idx = self.combo_tf.findText("M1")
+        self.combo_tf.setCurrentIndex(idx if idx >= 0 else 0)
+        self.combo_tf.blockSignals(False)
 
     def _on_symbol_changed(self, symbol: str) -> None:
         """USER-REQ: Preisskala-Praezision ist je Symbol fix. Beim Symbol-
@@ -19168,48 +20638,41 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
     # --- Phase 15 15.02: MasterTree / ServiceSelector (FULL_EDIT) ---
 
     def _wire_selector_toolbar(self) -> None:
-        """Verdrahtet die ServiceSelectorWidget-Toolbar (Modus FULL_EDIT)
-        mit den bestehenden Set-Methoden (add/move/remove/rename).
+        """Verdrahtet den ServiceSelectorWidget (Modus FULL_EDIT) mit den
+        bestehenden Set-Methoden (add/move/remove/rename).
 
-        Bugfix 05.08.2026 (U15-D2-Stream): Der Plugins-Button der Toolbar
-        (btn_reload) und sein reload_plugins_requested-Signal sind entfernt
-        (Hot-Reload bleibt ueber den UI-Button btn_reload_plugins erreichbar).
-        Die bifunktionalen Buttons [➕] / [🗑️] und das MasterTree-Kontextmenue
-        teilen sich dieselben Handler (DRY)."""
+        05.08.2026 (CRUD-Buttons entfernt): Die Aktions-Toolbar oberhalb des
+        MasterTrees (btn_add/btn_remove/Order-Pfeile) ist ersatzlos aus der
+        UI und aus allen Event-Verbindungen entfernt – alle Struktur-Aktionen
+        und die neuen Run-Aktionen laufen ueber das MasterTree-Kontextmenue
+        (entkoppelte Signale, DRY: dieselben Handler wie zuvor)."""
         selector = getattr(self, "service_selector", None)
-        if selector is None or selector.toolbar is None:
+        if selector is None or selector.master_tree is None:
             return
-        toolbar = selector.toolbar
-        toolbar.request_add_popup = self._show_toolbar_add_popup
-        toolbar.add_set_requested.connect(self._on_add_set)
-        toolbar.add_service_requested.connect(self._toolbar_add_service)
-        toolbar.move_up_requested.connect(lambda: self.move_order_item(-1))
-        toolbar.move_down_requested.connect(lambda: self.move_order_item(1))
-        toolbar.remove_requested.connect(self._on_toolbar_remove)
+        tree = selector.master_tree
         # MasterTree-Auswahl + Kontextmenue (entkoppelt) -> Editor/Handler
-        if selector.master_tree is not None:
-            tree = selector.master_tree
-            tree.selection_changed.connect(self._on_master_selection)
-            # Bugfix 05.08.2026: Info-Button-Klicks (Spalte 1) -> Beschreibungs-
-            # Dialog (Service / Plugin / Set).
-            tree.info_requested.connect(self._on_tree_info_requested)
-            # Kontextmenue-Aktionen (Rechtsklick im Baum) – entkoppelte
-            # Signale auf dieselben Handler wie die Toolbar (DRY).
-            tree.create_set_requested.connect(self._on_add_set)
-            tree.rename_set_requested.connect(self._on_rename_set)
-            tree.add_set_service_requested.connect(self._on_add_set_service)
-            tree.delete_set_requested.connect(self._on_delete_set)
-            tree.move_service_requested.connect(self._on_move_service)
-            tree.remove_service_requested.connect(self._on_remove_service)
-            tree.purge_trash_requested.connect(self._on_purge_trash)
-            # Gruppen-Klick -> Toolbar-State ([➕ Set] bei der 📁-Gruppe)
-            tree.group_activated.connect(self._on_group_activated)
-
-    def _show_toolbar_add_popup(self) -> None:
-        """Zeigt das [➕ Service]-Popup mit allen verfuegbaren Plugins."""
-        selector = getattr(self, "service_selector", None)
-        if selector is not None and selector.toolbar is not None:
-            selector.toolbar.show_add_menu(selector.get_plugin_ids())
+        tree.selection_changed.connect(self._on_master_selection)
+        # Bugfix 05.08.2026: Info-Button-Klicks (Spalte 1) -> Beschreibungs-
+        # Dialog (Service / Plugin / Set).
+        tree.info_requested.connect(self._on_tree_info_requested)
+        # Kontextmenue-Aktionen (Rechtsklick im Baum).
+        tree.create_set_requested.connect(self._on_add_set)
+        tree.rename_set_requested.connect(self._on_rename_set)
+        tree.add_set_service_requested.connect(self._on_add_set_service)
+        tree.delete_set_requested.connect(self._on_delete_set)
+        tree.move_service_requested.connect(self._on_move_service)
+        tree.remove_service_requested.connect(self._on_remove_service)
+        tree.purge_trash_requested.connect(self._on_purge_trash)
+        # Phase 15: Kontextmenue '🗑️ Papierkorb öffnen...' (Haupt-Gruppe
+        # 📁 Service-Sets) – gleiche Methode wie der Papierkorb-Button in
+        # der oberen Aktionsleiste (btn_trash_sets).
+        tree.open_trash_requested.connect(self.show_trash_dialog)
+        # 05.08.2026: Gezielte Ausfuehrung ('▶️ Diesen Service ausführen' /
+        # '▶️ Alle Services ausführen') -> ServiceRunWorker mit Sicherheits-
+        # abfrage (Set/Service + aktives Symbol/Timeframe) + FeatureStore-
+        # Persistenz + EventBus-Sync.
+        tree.run_service_requested.connect(self._on_run_service)
+        tree.run_set_requested.connect(self._on_run_set)
 
     @Slot(str)
     def _toolbar_add_service(self, plugin_id: str) -> None:
@@ -19230,7 +20693,12 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         list_execution_order waehrend des Handlers neu aufgebaut werden
         (setCurrentIndex -> _on_set_selected -> load_set_into_editor); der
         Zugriff auf geloeschte Items wuerde sonst crashen (0xC0000005).
+
+        Bugfix 05.08.2026 (Punkt 3): Bei Mausklick auf andere Services oder
+        Sets werden die Speicher-Buttons ausgeblendet (sie sind nur waehrend
+        einer manuellen Parameter-Aenderung sichtbar).
         """
+        self._set_param_actions_visible(False)
         try:
             if set_id and self.combo_set is not None and _qt_valid(self.combo_set):
                 idx = self.combo_set.findData(set_id)
@@ -19252,93 +20720,271 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                         break
             except (RuntimeError, AttributeError):
                 pass
-        # Bugfix 05.08.2026: bifunktionalen Toolbar-Zustand nach der
-        # MasterTree-Auswahl aktualisieren (set/service/none + Order).
-        self._update_toolbar_actions(set_id, service_id)
 
     # -------------------------------------------------------------------------
-    # Bugfix 05.08.2026: Toolbar-Zustand & Kontextmenue-Handler (U15-D2)
+    # Phase 16 (05.08.2026): Concurrency-Guard gegen den 45s-Hintergrund-Sync
     # -------------------------------------------------------------------------
+    def _begin_sync_guard(self) -> None:
+        """Blockt den 45s-Hintergrund-Sync (sync_timer in main.py).
 
-    def _current_tree_selection(self) -> tuple:
-        """Liefert (set_id, service_id) der aktuellen MasterTree-Auswahl –
-        Single Source of Truth fuer den bifunktionalen Toolbar-Zustand."""
-        selector = getattr(self, "service_selector", None)
-        if selector is not None and selector.master_tree is not None:
+        Erhoeht den Referenzzaehler und emittiert `service_run_started`
+        ausschliesslich beim Uebergang 0→1 – mehrere parallele Runs/Scans
+        (Worker + HistoricalScanner) pausieren den Sync nur EINMAL.
+        """
+        self._sync_guard_count += 1
+        if self._sync_guard_count == 1:
             try:
-                return (selector.master_tree.current_set_id(),
-                        selector.master_tree.current_service_id())
+                event_bus.service_run_started.emit()
             except (RuntimeError, AttributeError):
                 pass
-        return "", ""
 
-    def _update_toolbar_actions(self, set_id: str, service_id: str) -> None:
-        """Setzt die bifunktionalen Toolbar-Zustaende nach der Baum-Auswahl.
+    def _end_sync_guard(self) -> None:
+        """Gibt den 45s-Hintergrund-Sync wieder frei.
 
-        * Service in einem Set markiert -> [➕ Service] + [➖ Service
-          entfernen] + Order ▲/▼ aktiv.
-        * Nur ein Set markiert          -> [➕ Service] + [🗑️ Set löschen]
-          (Order deaktiviert).
-        * Sonst (Gruppen-/Plugin-Klick) -> alle Struktur-Buttons deaktiviert
-          ([➕] none; die 📁-Gruppe aktiviert [➕ Set] – siehe
-          _on_group_activated).
+        Senkt den Referenzzaehler; erst beim Uebergang 1→0 (alle
+        Service-Berechnungen abgeschlossen) wird `service_run_finished`
+        emittiert und der Sync-Timer im MainWindow wieder gestartet.
         """
-        selector = getattr(self, "service_selector", None)
-        if selector is None or selector.toolbar is None:
+        if self._sync_guard_count <= 0:
             return
-        toolbar = selector.toolbar
+        self._sync_guard_count -= 1
+        if self._sync_guard_count == 0:
+            try:
+                event_bus.service_run_finished.emit()
+            except (RuntimeError, AttributeError):
+                pass
+
+    # -------------------------------------------------------------------------
+    # 05.08.2026: Gezielte Kontextmenue-Ausfuehrung (Service(s) ausfuehren)
+    # -------------------------------------------------------------------------
+
+    def _start_run_worker(self, scope_id: str, set_definition: Dict[str, Any],
+                          instance_id: Optional[str]) -> None:
+        """Startet den gezielten ServiceRunWorker (Single/Set) im Hintergrund.
+
+        * Laedt OHLCV nur fuer das aktive Symbol + den gewaehlten Timeframe
+          (FeatureBuilder.load_ohlcv) – KEIN globaler Massen-Scan.
+        * Fuehrt die Pipeline via ServiceSetEvaluator.execute_set() aus und
+          persistiert die erzeugten feature_store_payloads ZWINGEND in
+          analytics.duckdb (feature_store, FeatureBuilder.store_plugin_payload).
+        * Der Worker emittiert nach Abschluss `event_bus.service_set_changed`
+          – alle ServiceSelectorModel-Instanzen (MasterTree, Analytics, ...)
+          aktualisieren dadurch live das Ausfuehrungsdatum '(DD.MM.JJ)'.
+        """
+        if self._run_worker and self._run_worker.isRunning():
+            self.log("Service-Ausführung läuft bereits.")
+            return
+        symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
+        # U15-E (05.08.2026): Timeframe-Control der Filterleiste (combo_tf) –
+        # 'ALLE Timeframes' startet die Multi-TF-Ausfuehrung im Worker.
+        timeframe = self.combo_tf.currentText() if self.combo_tf else "H1"
+        self._run_worker = ServiceRunWorker(
+            self.set_evaluator, symbol, timeframe, set_definition,
+            instance_id=instance_id, parent=self,
+        )
+        self._run_worker.log_message.connect(self.log)
+        self._run_worker.run_finished.connect(self._on_run_worker_finished)
+        self._run_worker.run_failed.connect(self._on_run_worker_failed)
+        # Phase 16: 45s-Hintergrund-Sync pausieren, solange der Run laeuft.
+        self._begin_sync_guard()
+        self._run_worker.start()
+
+    @Slot(str, str)
+    def _on_run_service(self, set_id: str, service_id: str) -> None:
+        """'▶️ Diesen Service ausführen' (MasterTree-Kontextmenue).
+
+        Sicherheitsabfrage mit Set-/Service-Name und dem aktuell gewaehlten
+        Symbol/Timeframe, danach gezielter Single-Run (inkl. Upstream-
+        Abhaengigkeiten im Set, damit z.B. proximity seine Linien hat).
+        """
+        if not set_id or not service_id:
+            return
         try:
-            if service_id:
-                toolbar.set_add_mode("service")
-                toolbar.set_remove_mode("service")
-                toolbar.set_order_enabled(True)
-            elif set_id:
-                toolbar.set_add_mode("service")
-                toolbar.set_remove_mode("set")
-                toolbar.set_order_enabled(False)
-            else:
-                toolbar.set_add_mode("none")
-                toolbar.set_remove_mode("none")
-                toolbar.set_order_enabled(False)
-        except (RuntimeError, AttributeError):
-            pass
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            self.log(f"FEHLER beim Laden des Sets: {e}")
+            return
+        if not definition:
+            self.log(f"Set '{set_id}' nicht gefunden – Ausführung abgebrochen.")
+            return
+        if service_id not in (definition.get("services") or {}):
+            self.log(f"Service '{service_id}' nicht im Set '{set_id}'.")
+            return
+        symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
+        # U15-E: Zeitachsen-Control der Filterleiste (combo_tf) – kann auch
+        # 'ALLE Timeframes' sein (Multi-TF-Ausfuehrung im Worker).
+        timeframe = self.combo_tf.currentText() if self.combo_tf else "H1"
+        set_name = str(definition.get("display_name") or set_id)
+        reply = QMessageBox.question(
+            self, "Service ausführen",
+            f"Service '{service_id}' aus dem Set '{set_name}' ausführen?\n\n"
+            f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+            f"Der erzeugte Feature-Store-Payload wird in analytics.duckdb "
+            f"geschrieben.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            self.log("Ausführung abgebrochen.")
+            return
+        self._start_run_worker(service_id, definition, instance_id=service_id)
 
     @Slot(str)
-    def _on_group_activated(self, group: str) -> None:
-        """Klick auf einen Gruppen-Knoten im MasterTree -> Toolbar-Zustand.
+    def _on_run_set(self, set_id: str) -> None:
+        """'▶️ Alle Services ausführen' (MasterTree-Kontextmenue).
 
-        Die 📁-Gruppe ('sets') aktiviert [➕ Set] (neues leeres Set anlegen);
-        bei den Gruppen ⚡ (standalone) / 📦 (plugins) sind alle Struktur-
-        Buttons deaktiviert (kein Set-Kontext).
+        Sicherheitsabfrage mit Set-Name und dem aktuell gewaehlten
+        Symbol/Timeframe, danach gezielter Set-Run (nur dieses Set).
         """
-        selector = getattr(self, "service_selector", None)
-        if selector is None or selector.toolbar is None:
+        if not set_id:
             return
-        toolbar = selector.toolbar
         try:
-            model = getattr(selector, "model", None)
-            group_sets = getattr(model, "GROUP_SETS", "sets")
-            if group == group_sets:
-                toolbar.set_add_mode("set")
-                toolbar.set_remove_mode("none")
-                toolbar.set_order_enabled(False)
-            else:
-                toolbar.set_add_mode("none")
-                toolbar.set_remove_mode("none")
-                toolbar.set_order_enabled(False)
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            self.log(f"FEHLER beim Laden des Sets: {e}")
+            return
+        if not definition:
+            self.log(f"Set '{set_id}' nicht gefunden – Ausführung abgebrochen.")
+            return
+        if not definition.get("execution_order"):
+            self.log(f"Set '{set_id}' hat keine Services – Ausführung abgebrochen.")
+            return
+        symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
+        # U15-E: Zeitachsen-Control der Filterleiste (combo_tf) – kann auch
+        # 'ALLE Timeframes' sein (Multi-TF-Ausfuehrung im Worker).
+        timeframe = self.combo_tf.currentText() if self.combo_tf else "H1"
+        set_name = str(definition.get("display_name") or set_id)
+        count = len(definition.get("execution_order") or [])
+        reply = QMessageBox.question(
+            self, "Set ausführen",
+            f"Alle Services ({count}) des Sets '{set_name}' ausführen?\n\n"
+            f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+            f"Die erzeugten Feature-Store-Payloads werden in analytics.duckdb "
+            f"geschrieben.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            self.log("Ausführung abgebrochen.")
+            return
+        self._start_run_worker(set_id, definition, instance_id=None)
+
+    @Slot(str, int)
+    def _on_run_worker_finished(self, scope_id: str, stored: int) -> None:
+        """Loggt den Abschluss des gezielten Runs (FeatureStore-Persistenz).
+
+        Der EventBus-Sync erfolgt bereits im Worker (service_set_changed) –
+        das ServiceSelectorModel hat dadurch das neue MAX(created_at) gelesen
+        und der MasterTree zeigt das Datum '(DD.MM.JJ)' live an.
+        """
+        # Phase 16: 45s-Hintergrund-Sync wieder freigeben.
+        self._end_sync_guard()
+        self.log(f"Ausführung abgeschlossen: {stored} Feature-Row(s) im "
+                 f"feature_store gespeichert ({scope_id}).")
+
+    @Slot(str, str)
+    def _on_run_worker_failed(self, scope_id: str, error: str) -> None:
+        # Phase 16: 45s-Hintergrund-Sync auch bei Fehler freigeben.
+        self._end_sync_guard()
+        self.log(f"FEHLER bei Ausführung ({scope_id}): {error}")
+
+    # -------------------------------------------------------------------------
+    # Phase 15 (Dirty-State): Parameter-Panel-Aktionsleiste
+    # -------------------------------------------------------------------------
+
+    @Slot()
+    def _save_params_from_panel(self) -> None:
+        """'[💾 Speichern]' – persistiert die aktuellen Parameter-Aenderungen
+        des aktiven Sets (ServiceSetRepository.save_set, ohne Neuberechnung),
+        entfernt den '*' -Dirty-Marker im Baum und emittiert den EventBus
+        (Live-Sync aller ServiceSelectorModel-Instanzen).
+        """
+        if not self._current_set_id:
+            self.log("Kein Set geladen – Speichern nicht möglich.")
+            return
+        definition = self.collect_set_definition()
+        try:
+            self.set_repo.save_set(definition)
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern der Parameter: {e}")
+            return
+        self._clear_dirty_markers()
+        event_bus.service_set_changed.emit()
+        self.log(f"Parameter gespeichert (P15): {self._current_set_id}")
+
+    @Slot()
+    def _save_and_run_from_panel(self) -> None:
+        """'[▶️ Speichern & Ausführen]' – speichert die Aenderungen und
+        stoesst nach Bestaetigungsabfrage (Symbol/Timeframe) sofort die
+        Neuberechnung an.
+
+        Die Neuberechnung laeuft ueber den gezielten ServiceRunWorker
+        (FeatureStore-Persistenz + EventBus-Sync): Dadurch wird der
+        '*' -Marker entfernt und nach Abschluss das Ausfuehrungsdatum
+        '(DD.MM.JJ)' im MasterTree live aktualisiert.
+        """
+        if not self._current_set_id:
+            self.log("Kein Set geladen – Speichern & Ausführen nicht möglich.")
+            return
+        definition = self.collect_set_definition()
+        if not definition.get("execution_order"):
+            self.log("Keine Services in der Ausführungs-Reihenfolge – "
+                     "Speichern & Ausführen abgebrochen.")
+            return
+        try:
+            self.set_repo.save_set(definition)
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern der Parameter: {e}")
+            return
+        self._clear_dirty_markers()
+        event_bus.service_set_changed.emit()
+        symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
+        # U15-E: Timeframe-Control der Filterleiste (combo_tf) – kann auch
+        # 'ALLE Timeframes' sein (Multi-TF-Ausfuehrung im Worker).
+        timeframe = self.combo_tf.currentText() if self.combo_tf else "H1"
+        set_name = str(definition.get("display_name") or self._current_set_id)
+        count = len(definition.get("execution_order") or [])
+        reply = QMessageBox.question(
+            self, "Speichern & Ausführen",
+            f"Set '{set_name}' wurde gespeichert.\n\n"
+            f"Jetzt ausführen?\n"
+            f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+            f"Alle Services ({count}) werden neu berechnet und die "
+            f"Feature-Store-Payloads in analytics.duckdb geschrieben.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            self.log("Ausführung abgebrochen (Parameter gespeichert).")
+            return
+        self._start_run_worker(self._current_set_id, definition, instance_id=None)
+
+    def _clear_dirty_markers(self) -> None:
+        """Entfernt alle '*' -Dirty-Marker im MasterTree (nach Speichern).
+
+        Bugfix 05.08.2026 (Punkt 2): Blendet zusaetzlich die Speicher-
+        Buttons aus - ohne manuelle Parameter-Aenderung sind sie nicht
+        sichtbar.
+        """
+        self._set_param_actions_visible(False)
+        selector = getattr(self, "service_selector", None)
+        tree = getattr(selector, "master_tree", None)
+        if tree is None:
+            return
+        try:
+            tree.clear_dirty_markers()
         except (RuntimeError, AttributeError):
             pass
 
-    @Slot()
-    def _on_toolbar_remove(self) -> None:
-        """[🗑️]-Button: Set (Papierkorb) ODER Service entfernen – je nach
-        aktueller MasterTree-Auswahl (die Toolbar-Aktivierung spiegelt exakt
-        diesen Zustand). Reuse der Kontextmenue-Handler (DRY)."""
-        set_id, service_id = self._current_tree_selection()
-        if service_id:
-            self._on_remove_service(set_id, service_id)
-        elif set_id:
-            self._on_delete_set(set_id)
+    def _set_param_actions_visible(self, visible: bool) -> None:
+        """Blendet die Speicher-Buttons der Parameter-Spalte ein/aus.
+
+        Bugfix 05.08.2026 (Punkt 2/3): Sichtbar NUR bei manueller
+        Parameter-Aenderung (Dirty), sonst unsichtbar. Wird von
+        _mark_service_dirty (param_columns) eingeblendet und von
+        _clear_dirty_markers / _on_master_selection ausgeblendet.
+        """
+        for name in ("btn_save_params", "btn_save_run_params"):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                try:
+                    btn.setVisible(bool(visible))
+                except (RuntimeError, AttributeError):
+                    pass
 
     def _persist_current_set(self, action: str) -> None:
         """Persistiert das aktuell geladene Service-Set zurueck in die DB.
@@ -19398,8 +21044,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
     def _select_set_in_tree(self, set_id: str) -> None:
         """Selektiert ein Set im MasterTree (Bugfix 05.08.2026).
 
-        Loest ueber selection_changed -> _on_master_selection auch den
-        Editor-Sync und den bifunktionalen Toolbar-Zustand ([➕ Service])
+        Loest ueber selection_changed -> _on_master_selection den Editor-Sync
         aus – direkt nach dem Anlegen eines neuen Sets.
         """
         selector = getattr(self, "service_selector", None)
@@ -19489,8 +21134,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         Indikator-Auswahl (NewServiceSetDialog). Der Name ist Pflicht; wird
         ein Indikator gewaehlt, wird er explizit zugewiesen (indicator_id)
         und die Basis-Services automatisch angelegt (_build_new_set_definition).
-        Das neue Set wird direkt im MasterTree selektiert, damit die Toolbar
-        in den [➕ Service]-Modus wechselt.
+        Das neue Set wird direkt im MasterTree selektiert.
         """
         try:
             from analytics.engine.service_selector_model import list_indicators
@@ -19525,7 +21169,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             idx = self.combo_set.findData(set_id)
             if idx >= 0:
                 self.combo_set.setCurrentIndex(idx)
-        # Neues Set im MasterTree selektieren -> Toolbar [➕ Service]-Modus
+        # Neues Set im MasterTree selektieren (Editor-Sync via selection_changed)
         self._select_set_in_tree(set_id)
 
     @Slot(str)
@@ -19587,8 +21231,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         """'Service hinzufuegen' (Kontextmenue): EIGENE Auswahlbox.
 
         Bugfix 05.08.2026: Eine eigene QInputDialog-Auswahlbox statt der
-        Toolbar-Auswahl (show_add_menu) – die Toolbar-Auswahl wird bald
-        entfernt. Nach der Auswahl wird der Service ueber den bestehenden
+        frueheren Toolbar-Auswahl (show_add_menu, Toolbar seit 05.08.2026
+        entfernt). Nach der Auswahl wird der Service ueber den bestehenden
         Pfad (edit_new_instance + add_instance) ins Set uebernommen und
         sofort persistiert.
         """
@@ -19627,7 +21271,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
     def _select_service_in_editor(self, set_id: str, service_id: str) -> None:
         """Laedt das Set in den Editor und markiert die Service-Instanz in
         der execution_order-Liste (gemeinsame Vorbereitung fuer Order-/
-        Entfernen-Aktionen aus Toolbar & Kontextmenue)."""
+        Entfernen-Aktionen aus dem Kontextmenue)."""
         if self.combo_set is not None:
             idx = self.combo_set.findData(set_id)
             if idx >= 0:
@@ -19782,6 +21426,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self.scanner.progress_updated.connect(self.on_progress)
         self.scanner.scan_finished.connect(self.on_finished)
         self.scanner.log_message.connect(self.log)
+        # Phase 16: 45s-Hintergrund-Sync pausieren, solange der Scan laeuft.
+        self._begin_sync_guard()
         self.scanner.start()
 
     @Slot(str, int, int)
@@ -19792,6 +21438,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
 
     @Slot(str, int)
     def on_finished(self, symbol: str, count: int):
+        # Phase 16: 45s-Hintergrund-Sync nach dem Scan wieder freigeben.
+        self._end_sync_guard()
         self._elapsed_timer.stop()
         self.btn_start.setEnabled(True)
         self.log(f"Scan für {symbol} beendet: {count} Feature-Rows geschrieben.")
@@ -19889,6 +21537,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.edit_set_description.clear()
         if self.list_execution_order:
             self.list_execution_order.clear()
+        # Phase 15 (Dirty-State): Marker des vorherigen Sets entfernen.
+        self._clear_dirty_markers()
         self._clear_service_columns()
 
     @Slot(int)
@@ -19910,6 +21560,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         Phase 13 5.4 Schritt 1: Baut zusätzlich die dynamischen Service-Spalten
         (eine QGroupBox pro Service mit Parameter-Formular) auf.
         """
+        # Phase 15 (Dirty-State): Marker des vorherigen Sets entfernen –
+        # ein frisch geladenes Set ist per Definition unverändert (kein '*').
+        self._clear_dirty_markers()
         self._current_set_id = definition.get("set_id")
         self._current_set_definition = definition
         self._current_list_iid = None
@@ -20183,7 +21836,13 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                        f"'{names[0]}' verwendet – Entfernen nicht möglich")
 
     def _on_order_item_clicked(self, item: QListWidgetItem) -> None:
-        """Merkt sich die aktuell markierte instance_id (itemClicked)."""
+        """Merkt sich die aktuell markierte instance_id (itemClicked).
+
+        Bugfix 05.08.2026 (Punkt 3): Klick auf einen anderen Service in der
+        Ausfuehrungs-Liste blendet die Speicher-Buttons aus (sie sind nur
+        waehrend einer manuellen Parameter-Aenderung sichtbar).
+        """
+        self._set_param_actions_visible(False)
         if item is not None:
             self._current_list_iid = item.data(Qt.UserRole)
 
@@ -20225,59 +21884,204 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         dlg = ServiceDescriptionDialog.from_plugin(plugin, instance_id=iid, config=cfg, parent=self)
         dlg.exec()
 
+    # -------------------------------------------------------------------------
+    # Phase 16 (05.08.2026): Modaler Beschreibungs-Editor (Service & Set)
+    # -------------------------------------------------------------------------
+    def _open_service_desc_editor(self, instance_id: str) -> None:
+        """Oeffnet den modalen ServiceDescriptionEditDialog fuer die Instanz-
+        Beschreibung (Stift-Button im Parameter-Panel).
+
+        Phase 16: Bearbeitet AUSSCHLIESSLICH die Instanz-Beschreibung
+        (ServiceInstanceConfig.description) – kein Plugin-Metadaten-Fallback,
+        keine Verarbeitung von Plugin-Beschreibungen im Service Window.
+        """
+        if not instance_id:
+            return
+        cfg: Dict[str, Any] = {}
+        if self._current_set_definition:
+            cfg = dict((self._current_set_definition.get("services") or {})
+                       .get(instance_id, {}))
+        desc_ctrl = self._service_desc_controls.get(instance_id)
+        if desc_ctrl is not None and _qt_valid(desc_ctrl):
+            cfg["description"] = desc_ctrl.text()
+        plugin_id = cfg.get("plugin_id") or instance_id
+        dlg = ServiceDescriptionEditDialog(
+            parent=self,
+            instance_id=instance_id,
+            plugin_id=plugin_id,
+            header_line=self._info_header_tooltip(str(plugin_id)),
+            description=str(cfg.get("description") or ""),
+            title="Service-Beschreibung bearbeiten",
+        )
+        dlg.save_requested.connect(
+            lambda desc, iid=instance_id:
+            self._save_instance_description(self._current_set_id or "", iid, desc))
+        dlg.exec()
+
+    def _save_instance_description(self, set_id: str, instance_id: str,
+                                   new_desc: str) -> None:
+        """Persistiert eine geaenderte Instanz-Beschreibung.
+
+        Phase 16 (05.08.2026): Single Source of Truth – die Instanz-
+        Beschreibung gehoert ausschliesslich in
+        `ServiceInstanceConfig.description` (JSON-Payload des Service-Sets in
+        app_data.duckdb, Feld definition['services'][instance_id]
+        ['description']). Kein Plugin-Fallback.
+
+        * Editor-Spalte (QLineEdit) + Tooltip werden live aktualisiert.
+        * Persistenz via ServiceSetRepository.save_set() + EventBus.
+        """
+        clean = (new_desc or "").strip()
+        # Live-Update im Editor (setText feuert textChanged → Tooltip-Sync)
+        desc_ctrl = self._service_desc_controls.get(instance_id)
+        if desc_ctrl is not None and _qt_valid(desc_ctrl):
+            desc_ctrl.setText(clean)
+        # In der geladenen Definition nachziehen (sofortige Folge-Speicherung)
+        if self._current_set_definition is not None:
+            cfg = (self._current_set_definition.get("services") or {}).get(instance_id)
+            if isinstance(cfg, dict):
+                cfg["description"] = clean
+        if not set_id:
+            self.log(f"Instanz-Beschreibung '{instance_id}' aktualisiert "
+                     f"(Set noch nicht gespeichert).")
+            return
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            self.log(f"FEHLER beim Laden des Sets ({set_id}): {e}")
+            return
+        if not definition:
+            self.log(f"Set '{set_id}' nicht gefunden – Beschreibung nicht "
+                     f"gespeichert.")
+            return
+        services = definition.get("services") or {}
+        if instance_id in services:
+            services[instance_id]["description"] = clean
+        definition["services"] = services
+        try:
+            self.set_repo.save_set(definition)
+            event_bus.service_set_changed.emit()
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern der Instanz-Beschreibung: {e}")
+            return
+        # Phase 15 (Dirty-State): explizites Set-Speichern -> '*' entfernen.
+        self._clear_dirty_markers()
+        self.log(f"Instanz-Beschreibung '{instance_id}' gespeichert.")
+
+    def _save_set_description(self, set_id: str, new_desc: str) -> None:
+        """Persistiert die Set-Beschreibung (ServiceSetDefinition.description).
+
+        Phase 16 (05.08.2026): analog zur Instanz-Beschreibung – Single
+        Source of Truth ist das JSON-Payload des Sets in app_data.duckdb.
+        """
+        clean = (new_desc or "").strip()
+        if self.edit_set_description is not None and _qt_valid(self.edit_set_description):
+            self.edit_set_description.setText(clean)
+        if self._current_set_definition is not None and \
+                self._current_set_definition.get("set_id") == set_id:
+            self._current_set_definition["description"] = clean
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            self.log(f"FEHLER beim Laden des Sets ({set_id}): {e}")
+            return
+        if not definition:
+            self.log(f"Set '{set_id}' nicht gefunden – Beschreibung nicht "
+                     f"gespeichert.")
+            return
+        definition["description"] = clean
+        try:
+            self.set_repo.save_set(definition)
+            event_bus.service_set_changed.emit()
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern der Set-Beschreibung: {e}")
+            return
+        # Phase 15 (Dirty-State): explizites Set-Speichern -> '*' entfernen.
+        self._clear_dirty_markers()
+        self.log(f"Set-Beschreibung '{set_id}' gespeichert.")
+
     @Slot(str, str, str)
     def _on_tree_info_requested(self, set_id: str, service_id: str,
                                 plugin_id: str) -> None:
-        """Oeffnet den ServiceDescriptionDialog fuer die Info-Button-Zeile.
+        """Oeffnet den Beschreibungs-Editor / -Dialog fuer die Info-Button-Zeile.
 
         Bugfix 05.08.2026: Der Info-Button sitzt jetzt direkt im MasterTree
         (Spalte 1) statt in der Box 'Service-Sets (Phase 13)'. Je nach
-        Zeilentyp wird der passende Dialog geoeffnet:
+        Zeilentyp:
 
-          * Service-Zeile:  from_plugin (Instanz + Config + header_line)
-          * Plugin-Zeile:   from_plugin (ohne Instanz, header_line)
-          * Set-Zeile:      from_set (Set-Name/-Beschreibung/-Services,
-                            header_line)
+          * Service-Zeile:  ServiceDescriptionEditDialog (Instanz-Beschreibung
+                            editierbar, header_line = 'aktiv/im <Indikator>').
+          * Set-Zeile:      ServiceDescriptionEditDialog (Set-Beschreibung
+                            editierbar, header_line aus _info_set_tooltip).
+          * Plugin-Zeile:   ServiceDescriptionEditDialog (Plugin-Info, ohne
+                            Instanz) – Bugfix 05.08.2026: derselbe Editor wie
+                            bei den Einzel-Services der Sets (vorbefuellt mit
+                            der Plugin-Beschreibung; kein Persistenz-Ziel).
 
-        Die ERSTE Dialog-Zeile ist der bisherige Tooltip-Text
-        ('aktiv/im <Indikator>'), danach folgt eine Leerzeile und dann der
-        Beschreibungstext (header_line-Rendering im Dialog).
+        Bugfix 05.08.2026: Auch Plugin-/Standalone-Zeilen oeffnen den
+        Beschreibungs-Editor (konsistent zu den Einzel-Services). Eine
+        persistierbare Beschreibung existiert nur fuer Instanzen (in Sets)
+        und fuer die Sets selbst.
         """
         model = getattr(self.service_selector, "model", None)
         if model is None:
             return
         try:
-            # 1) Service-Zeile (set_id + service_id)
+            # 1) Service-Zeile (set_id + service_id) – editierbar
             if service_id and set_id:
                 cfg = model.find_service(set_id, service_id) or {}
                 pid = str(cfg.get("plugin_id") or service_id)
-                plugin = self._resolve_info_plugin(pid)
-                if plugin is None:
-                    return
-                dlg = ServiceDescriptionDialog.from_plugin(
-                    plugin, instance_id=service_id, config=cfg, parent=self,
-                    header_line=self._info_header_tooltip(pid))
+                dlg = ServiceDescriptionEditDialog(
+                    parent=self,
+                    instance_id=service_id,
+                    plugin_id=pid,
+                    header_line=self._info_header_tooltip(pid),
+                    description=str(cfg.get("description") or ""),
+                    title="Service-Beschreibung bearbeiten",
+                )
+                dlg.save_requested.connect(
+                    lambda desc, s=set_id, i=service_id:
+                    self._save_instance_description(s, i, desc))
                 dlg.exec()
                 return
-            # 2) Plugin-Zeile (nur plugin_id; set_id = Gruppenkennung)
+            # 2) Plugin-Zeile (nur plugin_id; set_id = Gruppenkennung) –
+            #    EDITIERBAR wie die Einzel-Services der Sets (Bugfix
+            #    05.08.2026): derselbe ServiceDescriptionEditDialog. Ein
+            #    Plugin ohne Instanz/Set hat keine persistierbare Instanz-
+            #    Beschreibung – der Editor wird mit der Plugin-Metadaten-
+            #    Beschreibung vorbefuellt (kein save_requested: Speichern/
+            #    Abbrechen schliessen den Dialog, es gibt kein Ziel).
             if plugin_id and not service_id:
                 plugin = self._resolve_info_plugin(plugin_id)
                 if plugin is None:
                     return
-                dlg = ServiceDescriptionDialog.from_plugin(
-                    plugin, instance_id="", config=None, parent=self,
-                    header_line=self._info_header_tooltip(plugin_id))
+                meta = dict(getattr(plugin, "metadata", None) or {})
+                dlg = ServiceDescriptionEditDialog(
+                    parent=self,
+                    instance_id="",
+                    plugin_id=plugin_id,
+                    header_line=self._info_header_tooltip(plugin_id),
+                    description=str(meta.get("description") or ""),
+                    title="Service-Beschreibung bearbeiten",
+                )
                 dlg.exec()
                 return
-            # 3) Set-Zeile (nur set_id)
+            # 3) Set-Zeile (nur set_id) – editierbar (Set-Beschreibung)
             if set_id and not service_id and not plugin_id:
                 set_def = model.find_set(set_id)
                 if not set_def:
                     self.log(f"Set '{set_id}' nicht gefunden.")
                     return
-                dlg = ServiceDescriptionDialog.from_set(
-                    set_def, parent=self,
-                    header_line=self._info_set_tooltip(set_def))
+                dlg = ServiceDescriptionEditDialog(
+                    parent=self,
+                    instance_id="",
+                    plugin_id=str(set_def.get("display_name") or set_id),
+                    header_line=self._info_set_tooltip(set_def),
+                    description=str(set_def.get("description") or ""),
+                    title="Set-Beschreibung bearbeiten",
+                )
+                dlg.save_requested.connect(
+                    lambda desc, s=set_id: self._save_set_description(s, desc))
                 dlg.exec()
                 return
         except (RuntimeError, AttributeError) as e:
@@ -20373,9 +22177,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                         f"Service erhalten bleiben (P14-04).")
                     return
         # Bugfix 05.08.2026: Erste Bestaetigung – das Set wird in den
-        # Papierkorb (service_sets_trash) verschoben (zweite Abfrage folgt
-        # in delete_named_item; Wiederherstellung ueber den Papierkorb-
-        # Dialog).
+        # Papierkorb (service_sets_trash) verschoben (Wiederherstellung
+        # ueber den Papierkorb-Dialog moeglich).
         name = self._set_adapter._item_current_name()
         if not name:
             return
@@ -20386,7 +22189,10 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
-        self.delete_named_item(self._set_adapter)
+        # Bugfix 05.08.2026 (Papierkorb): KEINE zweite Nachfrage – das Set
+        # ist soft-deleted (Papierkorb), daher delete_named_item mit
+        # confirm=False (die Rueckfrage lief oben bereits).
+        self.delete_named_item(self._set_adapter, confirm=False)
 
     # =========================================================================
     # Phase 14 P14-05: Papierkorb (Soft-Delete / Wiederherstellung)
@@ -20469,10 +22275,14 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self._set_run_worker.log_message.connect(self.log)
         self._set_run_worker.run_finished.connect(self._on_set_run_finished)
         self._set_run_worker.run_failed.connect(self._on_set_run_failed)
+        # Phase 16: 45s-Hintergrund-Sync pausieren, solange der Run laeuft.
+        self._begin_sync_guard()
         self._set_run_worker.start()
 
     @Slot(str, int)
     def _on_set_run_finished(self, set_id: str, count: int) -> None:
+        # Phase 16: 45s-Hintergrund-Sync wieder freigeben.
+        self._end_sync_guard()
         if self.btn_execute_set:
             self.btn_execute_set.setEnabled(True)
             self.btn_execute_set.setText("Ausführen")
@@ -20480,6 +22290,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
 
     @Slot(str, str)
     def _on_set_run_failed(self, set_id: str, error: str) -> None:
+        # Phase 16: 45s-Hintergrund-Sync auch bei Fehler freigeben.
+        self._end_sync_guard()
         if self.btn_execute_set:
             self.btn_execute_set.setEnabled(True)
             self.btn_execute_set.setText("Ausführen")
@@ -20492,6 +22304,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.scanner.wait(2000)
         if self._set_run_worker and self._set_run_worker.isRunning():
             self._set_run_worker.wait(2000)
+        # 05.08.2026: Gezielter Kontextmenue-Run-Worker sauber beenden.
+        if self._run_worker and self._run_worker.isRunning():
+            self._run_worker.wait(2000)
         self._elapsed_timer.stop()
         super().closeEvent(event)
 
@@ -20626,8 +22441,19 @@ ServiceSetItemAdapter = _ServiceSetItemAdapter
 """
 Service-UI: Hintergrund-Worker für die Set-Ausführung.
 
-Phase 15, Kapitel 15.1 (U15-D1): Aus service_win.py ausgelagert –
-Verhalten unverändert.
+Phase 15, Kapitel 15.1 (U15-D1): Aus service_win.py ausgelagert.
+05.08.2026 (Punkt 2, Ausführungsdatum): Der Worker persistiert die
+erzeugten `feature_store_payloads` ZWINGEND in analytics.duckdb
+(`feature_store`, FeatureBuilder.store_plugin_payload) und emittiert danach
+`event_bus.service_set_changed` – dadurch liest das `ServiceSelectorModel`
+beim automatischen refresh() das neue MAX(created_at) je feature_id und der
+MasterTree aktualisiert das Datum '(DD.MM.JJ)' am betroffenen Service-Knoten
+ohne App-Neustart. Vorher schrieb nur der RAM-basierte Render-Pfad (kein
+Datum im Baum nach btn_execute_set).
+
+Hinweis: `grid_lines` liefert bewusst KEINEN feature_store_payload (reines
+Chart-Overlay) – nur Services mit non-leeren `records` (z.B. `proximity`)
+schreiben Zeilen.
 """
 
 from typing import Any, Dict
@@ -20640,8 +22466,9 @@ from analytics.engine.set_evaluator import ServiceSetEvaluator
 class ServiceSetRunWorker(QThread):
     """Phase 13 Schritt 4: Führt ein Service-Set im Hintergrund aus.
 
-    Lädt OHLCV (Symbol/Timeframe) und ruft ServiceSetEvaluator.execute_set()
-    in einem separaten Thread auf, damit die GUI nicht blockiert.
+    Lädt OHLCV (Symbol/Timeframe), ruft ServiceSetEvaluator.execute_set()
+    in einem separaten Thread auf (GUI blockiert nicht), persistiert die
+    Feature-Payloads im feature_store und stösst den EventBus-Sync an.
     """
 
     log_message = Signal(str)
@@ -20660,11 +22487,12 @@ class ServiceSetRunWorker(QThread):
         try:
             from analytics.features.feature_builder import FeatureBuilder, prepare_plugin_df
             from analytics.features.plugins.base_plugin import PluginContext
+            from config.event_bus import event_bus
             from state_manager import StateManager
 
             settings = StateManager().get_app_settings()
             fb = FeatureBuilder()
-            df = fb.load_ohlcv(self.symbol, self.timeframe, limit=settings.feature_builder_limit)
+            df = fb.load_ohlcv(self.symbol, self.timeframe, limit=settings.scanner_candle_limit)
             if df is None or df.empty:
                 self.run_failed.emit(
                     self.set_definition.get("set_id", ""),
@@ -20683,7 +22511,47 @@ class ServiceSetRunWorker(QThread):
             display = self.set_definition.get("display_name") or self.set_definition.get("set_id") or "Unbenannt"
             self.log_message.emit(f"Ausfuehren: {display} ({self.symbol} {self.timeframe})")
 
-            results = self.evaluator.execute_set(self.set_definition, df_plugin, context=context)
+            # 05.08.2026 (Bugfix Service-Run):
+            #  * Fehlende depends_on-Einträge (z.B. proximity -> grid_lines)
+            #    werden automatisch aufgelöst (sonst 'kein Feature-Store-
+            #    Payload' für nachgelagerte Services im Set).
+            #  * Scanner-Candles (max) aus den App-Optionen als max Lookback
+            #    für ALLE Services (Datenbasis wie beim Historical Scanner).
+            from serviceui.service_set_utils import prepare_worker_definition
+            definition = prepare_worker_definition(
+                self.set_definition,
+                getattr(settings, "scanner_candle_limit", 100000),
+            )
+
+            results = self.evaluator.execute_set(definition, df_plugin, context=context)
+
+            # Feature-Store-Persistenz (05.08.2026, Punkt 2): Jeder Service
+            # mit non-leerem feature_store_payload wird in analytics.duckdb
+            # geschrieben. created_at wird bei jedem Upsert aktualisiert
+            # (ON CONFLICT DO UPDATE) -> MAX(created_at) je feature_id
+            # liefert die LETZTE Ausfuehrung.
+            stored = 0
+            for iid, result in results.items():
+                payload = (result or {}).get("feature_store_payload") or {}
+                records = payload.get("records") or []
+                if not records:
+                    self.log_message.emit(
+                        f"  {iid}: fertig (kein Feature-Store-Payload)")
+                    continue
+                fb.store_plugin_payload(self.symbol, self.timeframe, payload)
+                stored += len(records)
+                self.log_message.emit(
+                    f"  {iid}: {len(records)} Feature-Row(s) gespeichert")
+
+            # UI-Sync: Nach Abschluss aktualisieren sich alle lauschenden
+            # ServiceSelectorModel-Instanzen (MasterTree, Analytics, ...)
+            # automatisch – sie lesen das neue MAX(created_at) und der Baum
+            # zeigt das Datum (DD.MM.JJ) live an.
+            try:
+                event_bus.service_set_changed.emit()
+            except Exception as e:  # pragma: no cover
+                print(f"WARN [ServiceSetRunWorker] EventBus-Emitt fehlgeschlagen: {e}")
+
             for iid in results:
                 self.log_message.emit(f"  {iid}: fertig")
             self.run_finished.emit(self.set_definition.get("set_id", ""), len(results))
@@ -20953,204 +22821,6 @@ class SymbolsWindow(PersistentWindow):
 
 --------------------------------------------------
 
-### DATEI: serviceui/toolbar.py
-```py
-# serviceui/toolbar.py
-"""
-Service-UI: Aktions-Toolbar (Phase 15 15.02, bifunktional 05.08.2026).
-
-Entkoppelte Button-Leiste fuer Struktur-Aktionen des Service-Fensters
-(Modus B / FULL_EDIT des ServiceSelectorWidget):
-
-  * [➕ Set] / [➕ Service] / [➕] – bifunktionaler Hinzufuegen-Button. Der
-    Orchestrator schaltet den Modus ueber `set_add_mode()`:
-      "set"     -> Text '[➕ Set]'     -> emittiert `add_set_requested`
-                   (neues leeres Service-Set anlegen)
-      "service" -> Text '[➕ Service]' -> oeffnet das Plugin-Popup
-                   (`request_add_popup`, emittiert `add_service_requested`)
-      "none"    -> Text '[➕]', deaktiviert
-  * [Order ▲] / [Order ▼] – Aenderung der execution_order im aktiven Set.
-    Nur aktiv, wenn ein Service innerhalb eines Sets gewaehlt ist
-    (`set_order_enabled()`).
-  * [🗑️ Set löschen] / [➖ Service entfernen] / [🗑️] – bifunktionaler
-    Entfernen-Button. Der Orchestrator schaltet den Modus ueber
-    `set_remove_mode()` und emittiert `remove_requested` (der Orchestrator
-    fuehrt die P14-04-Sperrpruefung aus und entscheidet, ob das Set oder der
-    Service entfernt wird).
-
-Die Toolbar emittiert NUR Signale – sie kennt weder das Repository noch die
-Datenbank (Invariante 4: kein SQL in UI; SRP: eine Aufgabe pro Klasse).
-"""
-
-from typing import List, Optional
-
-from PySide6.QtCore import QPoint, Qt, Signal
-from PySide6.QtWidgets import (
-    QHBoxLayout, QMenu, QPushButton, QWidget,
-)
-
-
-class ServiceToolbar(QWidget):
-    """Aktions-Buttons der Service-Verwaltung (schwellenfrei entkoppelt)."""
-
-    #: Emittiert mit der plugin_id, wenn im [➕ Service]-Popup ein Plugin gewaehlt wird
-    add_service_requested = Signal(str)
-    #: Emittiert im Modus 'set' des bifunktionalen Hinzufuegen-Buttons
-    #: (neues leeres Service-Set anlegen – Orchestrator fuehrt die Aktion aus).
-    add_set_requested = Signal()
-    #: Ausfuehrungs-Reihenfolge: um -1 (hoch) bzw. +1 (runter) verschieben
-    move_up_requested = Signal()
-    move_down_requested = Signal()
-    #: Markierten Service / das markierte Set entfernen (Orchestrator fuehrt
-    #: die P14-04-Sperrpruefung aus und entscheidet ueber Set vs. Service).
-    remove_requested = Signal()
-
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        self._menu: Optional[QMenu] = None
-        #: Modus des bifunktionalen Hinzufuegen-Buttons ("set"/"service"/"none")
-        self._add_mode: str = "none"
-
-        self.btn_add = QPushButton("➕")
-        self.btn_add.setToolTip(
-            "Hinzufuegen – abhaengig von der Auswahl: neues Set oder Service.")
-        self.btn_move_up = QPushButton("Order ▲")
-        self.btn_move_up.setToolTip("Service in der Reihenfolge nach oben verschieben.")
-        self.btn_move_down = QPushButton("Order ▼")
-        self.btn_move_down.setToolTip("Service in der Reihenfolge nach unten verschieben.")
-        self.btn_remove = QPushButton("🗑️")
-        self.btn_remove.setToolTip(
-            "Entfernen – abhaengig von der Auswahl: Set (Papierkorb) oder "
-            "Service (P14-04-Sperrpruefung).")
-
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(4)
-        lay.addWidget(self.btn_add)
-        lay.addWidget(self.btn_move_up)
-        lay.addWidget(self.btn_move_down)
-        lay.addWidget(self.btn_remove)
-        lay.addStretch(1)
-
-        self.btn_add.clicked.connect(self._on_add_clicked)
-        self.btn_move_up.clicked.connect(self.move_up_requested)
-        self.btn_move_down.clicked.connect(self.move_down_requested)
-        self.btn_remove.clicked.connect(self.remove_requested)
-
-        # Bifunktional: ohne Auswahl sind alle Struktur-Buttons deaktiviert
-        self.set_add_mode("none")
-        self.set_remove_mode("none")
-        self.set_order_enabled(False)
-
-    # -------------------------------------------------------------------------
-    # Popup-Auswahl der Plugins ([➕ Service])
-    # -------------------------------------------------------------------------
-
-    def show_add_menu(self, plugin_ids: List[str],
-                      anchor: Optional[QWidget] = None) -> None:
-        """Zeigt das Popup-Menue mit den verfuegbaren Plugins.
-
-        Args:
-            plugin_ids: sortierte Liste der Plugin-IDs (aus dem Modell).
-            anchor:     Widget, an dem das Menue ausgerichtet wird (Default:
-                        der [➕ Service]-Button).
-        """
-        self._menu = QMenu(self)
-        if not plugin_ids:
-            self._menu.addAction("(keine Plugins verfuegbar)").setEnabled(False)
-        else:
-            for pid in plugin_ids:
-                action = self._menu.addAction(pid)
-                action.setData(pid)
-        target = anchor or self.btn_add
-        chosen = self._menu.exec(
-            target.mapToGlobal(QPoint(0, target.height())))
-        if chosen is not None and chosen.data():
-            self.add_service_requested.emit(str(chosen.data()))
-
-    def _on_add_clicked(self) -> None:
-        """[➕]-Button geklickt – der bifunktionale Modus entscheidet:
-
-        * "set"     -> neues leeres Service-Set (add_set_requested)
-        * "service" -> Plugin-Popup (request_add_popup, vom Orchestrator
-                       befuellt; ohne Plugin-Liste passiert nichts)
-        * "none"    -> Button ist deaktiviert (kein Signal)
-        """
-        mode = getattr(self, "_add_mode", "none")
-        if mode == "set":
-            self.add_set_requested.emit()
-        elif mode == "service":
-            if hasattr(self, "request_add_popup") and callable(self.request_add_popup):
-                self.request_add_popup()
-
-    # -------------------------------------------------------------------------
-    # Bifunktionale Aktions-Zustaende (Orchestrator steuert Modus + Aktivierung)
-    # -------------------------------------------------------------------------
-
-    def set_add_mode(self, mode: str) -> None:
-        """Schaltet den bifunktionalen [➕]-Button (Text + Funktion).
-
-        Args:
-            mode: "set"     -> '[➕ Set]'    (neues leeres Set anlegen)
-                  "service" -> '[➕ Service]' (Plugin zum aktiven Set hinzufuegen)
-                  "none"    -> '[➕]' deaktiviert
-        """
-        self._add_mode = mode
-        if mode == "set":
-            self.btn_add.setText("➕ Set")
-            self.btn_add.setEnabled(True)
-            self.btn_add.setToolTip("Neues leeres Service-Set anlegen.")
-        elif mode == "service":
-            self.btn_add.setText("➕ Service")
-            self.btn_add.setEnabled(True)
-            self.btn_add.setToolTip(
-                "Service zum aktiven Set hinzufuegen – waehlt das Plugin aus "
-                "einem Popup.")
-        else:
-            self.btn_add.setText("➕")
-            self.btn_add.setEnabled(False)
-            self.btn_add.setToolTip(
-                "Keine gueltige Auswahl – bitte ein Set oder einen Service "
-                "im Baum markieren.")
-
-    def set_remove_mode(self, mode: str) -> None:
-        """Schaltet den bifunktionalen [🗑️]-Button (Text + Funktion).
-
-        Args:
-            mode: "set"     -> '[🗑️ Set löschen]' (Papierkorb / Soft-Delete)
-                  "service" -> '[➖ Service entfernen]' (P14-04-Sperrpruefung)
-                  "none"    -> '[🗑️]' deaktiviert
-        """
-        if mode == "set":
-            self.btn_remove.setText("🗑️ Set löschen")
-            self.btn_remove.setEnabled(True)
-            self.btn_remove.setToolTip(
-                "Markiertes Service-Set in den Papierkorb verschieben (P14-05).")
-        elif mode == "service":
-            self.btn_remove.setText("➖ Service entfernen")
-            self.btn_remove.setEnabled(True)
-            self.btn_remove.setToolTip(
-                "Markierten Service aus dem Set entfernen (P14-04-Sperrpruefung).")
-        else:
-            self.btn_remove.setText("🗑️")
-            self.btn_remove.setEnabled(False)
-            self.btn_remove.setToolTip(
-                "Keine gueltige Auswahl – bitte ein Set oder einen Service "
-                "im Baum markieren.")
-
-    def set_order_enabled(self, enabled: bool) -> None:
-        """Aktiviert/deaktiviert die [Order ▲]/[Order ▼]-Buttons.
-
-        Nur aktiv, wenn ein Service INNERHALB eines Sets gewaehlt ist
-        (sonst gibt es keine execution_order zu schalten).
-        """
-        self.btn_move_up.setEnabled(enabled)
-        self.btn_move_down.setEnabled(enabled)
-
-```
-
---------------------------------------------------
-
 ### DATEI: serviceui/trash_dialog.py
 ```py
 # serviceui/trash_dialog.py
@@ -21166,16 +22836,54 @@ Aktion über eine Log-Callback. Das endgültige Löschen/Bereinigen erfolgt
 IMMER mit doppelter Sicherheitsnachfrage (User-Vorgabe P14-05).
 """
 
+from datetime import datetime
 from typing import Callable, Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-    QMessageBox, QPushButton, QVBoxLayout,
+    QAbstractItemView, QDialog, QHBoxLayout, QHeaderView, QLabel,
+    QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
 from analytics.engine.service_set_repository import ServiceSetRepository
 from config.event_bus import event_bus
+
+#: Deutsche Wochenkürzel (Index = datetime.weekday(), 0=Montag) für das
+#: Datumsformat 'E. DD.MM.JJ HH:MM' (z.B. 'Mo. 04.07.26 14:34').
+_GERMAN_WEEKDAYS = ["Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa.", "So."]
+
+
+def _format_deleted_at(value: object) -> str:
+    """Formatiert den deleted_at-Zeitstempel als 'E. DD.MM.JJ HH:MM'.
+
+    DuckDB liefert TIMESTAMP als datetime-Objekt; alternativ werden
+    ISO-Strings (mit/ohne Z) akzeptiert. Nicht parsebare Werte werden als
+    Rohwert zurueckgegeben, fehlende Werte als leerer String (defensiv).
+    """
+    if isinstance(value, datetime):
+        dt = value
+    elif value:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return str(value)
+    else:
+        return ""
+    return f"{_GERMAN_WEEKDAYS[dt.weekday()]} {dt.strftime('%d.%m.%y %H:%M')}"
+
+
+def _deleted_at_sort_key(value: object) -> datetime:
+    """Normalisiert deleted_at zu einem vergleichbaren datetime für die
+    absteigende Sortierung (neueste zuerst). Nicht parsebare/fehlende Werte
+    gelten als älteste (datetime.min)."""
+    if isinstance(value, datetime):
+        return value
+    if value:
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return datetime.min
+    return datetime.min
 
 
 class ServiceSetTrashDialog(QDialog):
@@ -21212,12 +22920,26 @@ class ServiceSetTrashDialog(QDialog):
         self.hint.setWordWrap(True)
         layout.addWidget(self.hint)
 
-        self.trash_list = QListWidget()
-        layout.addWidget(self.trash_list, 1)
+        # Bugfix 05.08.2026: Tabelle statt Liste – das Löschdatum steht als
+        # EIGENE Spalte GANZ VORN ("Gelöscht am"), danach nur der Name des
+        # gelöschten Objekts (kein Datum hinter dem Namen). Sortierung:
+        # neueste zuerst (absteigend nach deleted_at, siehe _reload).
+        self.trash_table = QTableWidget()
+        self.trash_table.setColumnCount(2)
+        self.trash_table.setHorizontalHeaderLabels(["Gelöscht am", "Name"])
+        self.trash_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.trash_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.trash_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.trash_table.verticalHeader().setVisible(False)
+        header = self.trash_table.horizontalHeader()
+        if header is not None:
+            header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.Stretch)
+        layout.addWidget(self.trash_table, 1)
 
         btn_row = QHBoxLayout()
         self.btn_restore = QPushButton("Wiederherstellen")
-        self.btn_purge_one = QPushButton("Endgueltig loeschen")
+        self.btn_purge_one = QPushButton("Löschen")
         self.btn_purge_all = QPushButton("Papierkorb leeren")
         btn_close = QPushButton("Schliessen")
         for b in (self.btn_restore, self.btn_purge_one, self.btn_purge_all, btn_close):
@@ -21234,15 +22956,24 @@ class ServiceSetTrashDialog(QDialog):
     # --- intern ---
 
     def _reload(self) -> None:
-        self.trash_list.clear()
-        trash_items = self._repo.list_trash()
-        for item in trash_items:
-            name = item.get("display_name") or item.get("set_id") or "Unbenannt"
-            deleted_at = str(item.get("deleted_at") or "")
-            li = QListWidgetItem(f"{name}   (geloescht: {deleted_at})")
-            li.setData(Qt.UserRole, item.get("set_id"))
-            self.trash_list.addItem(li)
-        has_items = self.trash_list.count() > 0
+        self.trash_table.setRowCount(0)
+        trash_items = list(self._repo.list_trash())
+        # Bugfix 05.08.2026: Neueste zuerst – absteigend nach deleted_at
+        # (das Repository liefert aufsteigend).
+        trash_items.sort(
+            key=lambda it: _deleted_at_sort_key(it.get("deleted_at")),
+            reverse=True,
+        )
+        for row, item in enumerate(trash_items):
+            set_id = item.get("set_id")
+            name = item.get("display_name") or set_id or "Unbenannt"
+            deleted_at = _format_deleted_at(item.get("deleted_at"))
+            date_item = QTableWidgetItem(deleted_at)
+            date_item.setData(Qt.UserRole, set_id)
+            self.trash_table.insertRow(row)
+            self.trash_table.setItem(row, 0, date_item)
+            self.trash_table.setItem(row, 1, QTableWidgetItem(name))
+        has_items = self.trash_table.rowCount() > 0
         self.btn_restore.setEnabled(has_items)
         self.btn_purge_one.setEnabled(has_items)
         self.btn_purge_all.setEnabled(has_items)
@@ -21255,7 +22986,10 @@ class ServiceSetTrashDialog(QDialog):
         )
 
     def _selected_id(self) -> Optional[str]:
-        item = self.trash_list.currentItem()
+        row = self.trash_table.currentRow()
+        if row < 0:
+            return None
+        item = self.trash_table.item(row, 0)
         return item.data(Qt.UserRole) if item else None
 
     def _restore(self) -> None:
@@ -21297,17 +23031,20 @@ class ServiceSetTrashDialog(QDialog):
         if self._repo.purge_trash_set(set_id):
             self._log(f"Set endgueltig geloescht (P14-05): {set_id}")
             self._reload()
+            # Phase 15: Struktur-Aenderung -> EventBus (Live-Sync aller
+            # ServiceSelectorModel-Instanzen, Invariante 5).
+            event_bus.service_set_changed.emit()
         else:
             self._log(f"Set '{set_id}' nicht im Papierkorb gefunden.")
 
     def _purge_all(self) -> None:
-        if self.trash_list.count() == 0:
+        if self.trash_table.rowCount() == 0:
             return
         # Doppelte Sicherheitsnachfrage - endgueltiges Loeschen ist nicht
         # umkehrbar (User-Vorgabe P14-05).
         first = QMessageBox.question(
             self, "Papierkorb leeren?",
-            f"Alle {self.trash_list.count()} Sets im Papierkorb werden "
+            f"Alle {self.trash_table.rowCount()} Sets im Papierkorb werden "
             "ENDGUELTIG geloescht und koennen nicht wiederhergestellt "
             "werden. Fortfahren?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
@@ -21325,596 +23062,9 @@ class ServiceSetTrashDialog(QDialog):
         count = self._repo.purge_trash()
         self._log(f"Papierkorb geleert (P14-05): {count} Set(s) endgueltig entfernt.")
         self._reload()
-
-```
-
---------------------------------------------------
-
-### DATEI: test/_apply_fix_round3.py
-```py
-# test/_apply_fix_round3.py
-"""Temporaeres Bugfix-Patch-Skript (wird nach Anwendung geloescht).
-
-Runde 3 (Bugfix 05.08.2026):
-  1) master_tree: Rechtsklick togglet aufklappbare Knoten (Konsistenz mit
-     Linksklick) + Kontextmenue-Eintrag 'Papierkorb löschen…' (purge_trash).
-  2) service_win: _on_purge_trash (doppelte Sicherheitsabfrage), doppelte
-     Sicherheitsabfrage bei remove_instance/delete_set (Papierkorb-Flow).
-  3) ParameterPanel KOMPLETT entfernen (Code + Relationen; keine DB-Tabelle).
-"""
-
-# ---------- 1) master_tree.py ----------
-p1 = r"F:\Python\PyTrader\serviceui\master_tree.py"
-t1 = open(p1, encoding="utf-8").read()
-
-
-def rep1(old: str, new: str, must: int = 1) -> None:
-    global t1
-    n = t1.count(old)
-    print("  [master_tree]", old.split("\n")[0][:55], "->", n)
-    assert n == must, f"expected {must}, got {n}"
-    t1 = t1.replace(old, new, 1)
-
-
-# a) Neues Signal purge_trash_requested
-rep1(
-    "    remove_service_requested = Signal(str, str)     # set_id, service_id",
-    "    remove_service_requested = Signal(str, str)     # set_id, service_id\n"
-    "    # Bugfix 05.08.2026: Kontextmenue 'Papierkorb löschen' – endgueltig\n"
-    "    # leeren (Orchestrator fuehrt die doppelte Sicherheitsabfrage aus).\n"
-    "    purge_trash_requested = Signal()",
-)
-
-# b) Rechtsklick-Toggle nach itemAt/isValid
-rep1(
-    """            item = self.itemAt(pos)
-            if item is None or not isValid(item):
-                return
-            node_type = item.data(0, ROLE_NODE_TYPE)""",
-    """            item = self.itemAt(pos)
-            if item is None or not isValid(item):
-                return
-            # Bugfix 05.08.2026: Rechtsklick togglet aufklappbare Knoten
-            # (Konsistenz mit Linksklick), damit das Kontextmenue immer auf
-            # dem sichtbaren Knoten steht.
-            try:
-                if item.childCount() > 0:
-                    item.setExpanded(not item.isExpanded())
-            except (RuntimeError, AttributeError):
-                pass
-            node_type = item.data(0, ROLE_NODE_TYPE)""",
-)
-
-# c) Set-Knoten: Eintrag 'Papierkorb löschen…'
-rep1(
-    """                act_del = menu.addAction("Set löschen")
-                act_del.triggered.connect(
-                    lambda _=False, s=set_id:
-                    self.delete_set_requested.emit(s))
-                menu.exec(self.viewport().mapToGlobal(pos))""",
-    """                act_del = menu.addAction("Set löschen")
-                act_del.triggered.connect(
-                    lambda _=False, s=set_id:
-                    self.delete_set_requested.emit(s))
-                menu.addSeparator()
-                act_purge = menu.addAction("Papierkorb löschen…")
-                act_purge.triggered.connect(
-                    lambda _=False: self.purge_trash_requested.emit())
-                menu.exec(self.viewport().mapToGlobal(pos))""",
-)
-
-# d) Service-Knoten: Eintrag 'Papierkorb löschen…'
-rep1(
-    """                act_info = menu.addAction("Service-Info anzeigen")
-                act_info.triggered.connect(
-                    lambda _=False, s=set_id, i=service_id, p=plugin_id:
-                    self.info_requested.emit(s, i, p))
-                menu.exec(self.viewport().mapToGlobal(pos))""",
-    """                act_info = menu.addAction("Service-Info anzeigen")
-                act_info.triggered.connect(
-                    lambda _=False, s=set_id, i=service_id, p=plugin_id:
-                    self.info_requested.emit(s, i, p))
-                menu.addSeparator()
-                act_purge = menu.addAction("Papierkorb löschen…")
-                act_purge.triggered.connect(
-                    lambda _=False: self.purge_trash_requested.emit())
-                menu.exec(self.viewport().mapToGlobal(pos))""",
-)
-
-open(p1, "w", encoding="utf-8", newline="\n").write(t1)
-print("master_tree.py OK")
-
-# ---------- 2) service_win.py ----------
-p2 = r"F:\Python\PyTrader\serviceui\service_win.py"
-t2 = open(p2, encoding="utf-8").read()
-
-
-def rep2(old: str, new: str, must: int = 1) -> None:
-    global t2
-    n = t2.count(old)
-    print("  [service_win]", old.split("\n")[0][:55], "->", n)
-    assert n == must, f"expected {must}, got {n}"
-    t2 = t2.replace(old, new, 1)
-
-
-# a) Import ParameterPanel entfernen
-rep2(
-    """# ServiceSelector (ServiceSelectorWidget im Modus FULL_EDIT) + ParameterPanel.
-from serviceui.service_selector_widget import ServiceSelectorWidget
-from serviceui.parameter_panel import ParameterPanel""",
-    """# ServiceSelector (ServiceSelectorWidget im Modus FULL_EDIT).
-from serviceui.service_selector_widget import ServiceSelectorWidget""",
-)
-
-# b) param_panel Erzeugung + Layout entfernen
-rep2(
-    """            # Parameter-Formular fuer die markierte Service-Instanz
-            self.param_panel = ParameterPanel(parent=self)
-            right_layout.addWidget(self.service_selector, 2)
-            right_layout.addWidget(self.param_panel, 1)""",
-    """            right_layout.addWidget(self.service_selector, 1)""",
-)
-
-# c) _on_symbol_changed: param_panel-Block entfernen
-rep2(
-    """        # ParameterPanel-Praezision (prox_level1..6) je Symbol synchronisieren
-        if getattr(self, "param_panel", None) is not None:
-            self.param_panel.set_symbol_precision(self._get_symbol_precision())
-""",
-    "",
-)
-
-# d) _wire_selector_toolbar: params_changed-Verbindung entfernen
-rep2(
-    """        # ParameterPanel-Aenderungen -> Set-Definition + Spalten (Live-Edit)
-        self.param_panel.params_changed.connect(self._on_param_panel_changed)
-""",
-    "",
-)
-
-# e) _on_master_selection: _sync_param_panel()-Aufruf entfernen
-rep2(
-    """        self._sync_param_panel()
-        # Bugfix 05.08.2026: bifunktionalen Toolbar-Zustand nach der
-        # MasterTree-Auswahl aktualisieren (set/service/none + Order).
-        self._update_toolbar_actions(set_id, service_id)""",
-    """        # Bugfix 05.08.2026: bifunktionalen Toolbar-Zustand nach der
-        # MasterTree-Auswahl aktualisieren (set/service/none + Order).
-        self._update_toolbar_actions(set_id, service_id)""",
-)
-
-# f) Methoden _sync_param_panel / _on_param_panel_changed / _set_ctrl_value
-#    KOMPLETT entfernen (Block bis zur 15.01-Sektion).
-start_f = t2.index("    def _sync_param_panel(self) -> None:")
-end_f = t2.index("    # --- Phase 15 15.01: Symbol- & Favoriten-Verwaltung ---")
-t2 = t2[:start_f] + t2[end_f:]
-print("  [service_win] _sync_param_panel/_on_param_panel_changed/_set_ctrl_value entfernt")
-
-# g) purge_trash_requested verbinden (nach remove_service_requested)
-rep2(
-    """            tree.remove_service_requested.connect(self._on_remove_service)
-            # Gruppen-Klick -> Toolbar-State ([➕ Set] bei der 📁-Gruppe)""",
-    """            tree.remove_service_requested.connect(self._on_remove_service)
-            tree.purge_trash_requested.connect(self._on_purge_trash)
-            # Gruppen-Klick -> Toolbar-State ([➕ Set] bei der 📁-Gruppe)""",
-)
-
-# h) _on_purge_trash-Methode nach _on_remove_service einfuegen
-anchor_h = """        if not set_id or not service_id:
-            return
-        self._select_service_in_editor(set_id, service_id)
-        self.remove_instance()
-"""
-new_h = anchor_h + '''
-    @Slot()
-    def _on_purge_trash(self) -> None:
-        """Leert den Papierkorb ENDGUELTIG (Kontextmenue 'Papierkorb löschen').
-
-        Bugfix 05.08.2026: Doppelte Sicherheitsabfrage (P14-05) – der Vorgang
-        ist nicht umkehrbar. Einzelne Sets koennen weiterhin ueber den
-        Papierkorb-Dialog (btn_trash_sets) wiederhergestellt werden.
-        """
-        trash = self.set_repo.list_trash()
-        if not trash:
-            QMessageBox.information(
-                self, "Papierkorb",
-                "Der Papierkorb ist leer – es gibt nichts zu löschen.")
-            return
-        count = len(trash)
-        reply = QMessageBox.question(
-            self, "Papierkorb löschen",
-            f"{count} Set(s) liegen im Papierkorb.\\n"
-            f"Wirklich ENDGÜLTIG löschen?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply != QMessageBox.Yes:
-            return
-        reply2 = QMessageBox.question(
-            self, "Wirklich?",
-            "Diese Aktion kann nicht rückgängig gemacht werden.\\nFortfahren?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply2 != QMessageBox.Yes:
-            return
-        try:
-            n = self.set_repo.purge_trash()
-        except Exception as e:
-            self.log(f"FEHLER beim Leeren des Papierkorbs: {e}")
-            return
-        self.log(f"Papierkorb geleert: {n} Set(s) endgültig entfernt (P14-05).")
+        # Phase 15: Struktur-Aenderung -> EventBus (Live-Sync aller
+        # ServiceSelectorModel-Instanzen, Invariante 5).
         event_bus.service_set_changed.emit()
-'''
-rep2(anchor_h, new_h)
-
-# i) remove_instance: doppelte Sicherheitsabfrage vor takeItem
-rep2(
-    """                if not others:
-                QMessageBox.warning(
-                    self, "Service gesperrt",
-                    f"Der Service '{plugin_id}' ist der letzte in einem "
-                    f"gespeicherten Service-Set.\\n"
-                    f"Für den Indikator muss mindestens ein gültiges Set "
-                    f"mit diesem Service erhalten bleiben (P14-04).")
-                return
-        lw.takeItem(lw.currentRow())""",
-    """                if not others:
-                QMessageBox.warning(
-                    self, "Service gesperrt",
-                    f"Der Service '{plugin_id}' ist der letzte in einem "
-                    f"gespeicherten Service-Set.\\n"
-                    f"Für den Indikator muss mindestens ein gültiges Set "
-                    f"mit diesem Service erhalten bleiben (P14-04).")
-                return
-        # Bugfix 05.08.2026: Doppelte Sicherheitsabfrage (P14-05) – der
-        # bisherige Set-Stand wird als Snapshot in service_set_history
-        # gesichert, bevor der Service entfernt wird.
-        iid = str(item.data(Qt.UserRole) or "")
-        reply = QMessageBox.question(
-            self, "Service entfernen",
-            f"Service '{iid} [{plugin_id}]' aus dem Set entfernen?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply != QMessageBox.Yes:
-            return
-        reply2 = QMessageBox.question(
-            self, "Wirklich?",
-            "Der bisherige Set-Stand wird als Snapshot gesichert "
-            "(service_set_history). Fortfahren?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply2 != QMessageBox.Yes:
-            return
-        lw.takeItem(lw.currentRow())""",
-)
-
-# j) delete_set: erste Bestaetigung (zweite kommt aus delete_named_item)
-rep2(
-    """                    return
-        self.delete_named_item(self._set_adapter)""",
-    """                    return
-        # Bugfix 05.08.2026: Erste Bestaetigung – das Set wird in den
-        # Papierkorb (service_sets_trash) verschoben (zweite Abfrage folgt
-        # in delete_named_item; Wiederherstellung ueber den Papierkorb-
-        # Dialog).
-        name = self._set_adapter._item_current_name()
-        if not name:
-            return
-        reply = QMessageBox.question(
-            self, "Set in den Papierkorb verschieben",
-            f"Set '{name}' wirklich in den Papierkorb verschieben?\\n"
-            f"(Wiederherstellung über den Papierkorb-Dialog möglich.)",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply != QMessageBox.Yes:
-            return
-        self.delete_named_item(self._set_adapter)""",
-)
-
-# k) _clear_set_editor: _sync_param_panel entfernen
-rep2(
-    """        self._clear_service_columns()
-        # Phase 15.02: ParameterPanel leeren (kein Set mehr aktiv)
-        self._sync_param_panel()""",
-    """        self._clear_service_columns()""",
-)
-
-# l) load_set_into_editor: _sync_param_panel entfernen
-rep2(
-    """        self._build_service_columns(definition)
-        # Phase 15.02: ParameterPanel an das geladene Set angleichen
-        self._sync_param_panel()""",
-    """        self._build_service_columns(definition)""",
-)
-
-# m) _sync_list_selection: _sync_param_panel entfernen
-rep2(
-    """        if self.list_execution_order is not None:
-            row = self.list_execution_order.currentRow()
-            if row >= 0:
-                self._current_list_iid = self.list_execution_order.item(row).data(Qt.UserRole)
-        # Phase 15.02: ParameterPanel an die markierte Instanz angleichen
-        self._sync_param_panel()""",
-    """        if self.list_execution_order is not None:
-            row = self.list_execution_order.currentRow()
-            if row >= 0:
-                self._current_list_iid = self.list_execution_order.item(row).data(Qt.UserRole)""",
-)
-
-# n) Docstring in __init__-Bereich (Zeile 67) bereits in (a) behandelt;
-#    zusaetzliche Docstring-Erwaehnung (Zeile 177, rechter Panel)
-rep2(
-    """            # MasterTree + Aktions-Toolbar (Modus B / FULL_EDIT)
-            self.service_selector = ServiceSelectorWidget(
-                mode=ServiceSelectorWidget.MODE_FULL_EDIT, parent=self)
-""",
-    """            # MasterTree + Aktions-Toolbar (Modus B / FULL_EDIT)
-            self.service_selector = ServiceSelectorWidget(
-                mode=ServiceSelectorWidget.MODE_FULL_EDIT, parent=self)
-""",
-)
-# (n) war no-op – hier echten ueberfluessigen Kommentar 'Parameter-Formular...'
-#     entfernen (Teil von (b), bereits erledigt).
-
-open(p2, "w", encoding="utf-8", newline="\n").write(t2)
-print("service_win.py OK")
-
-# ---------- 3) serviceui/__init__.py ----------
-p3 = r"F:\Python\PyTrader\serviceui\__init__.py"
-t3 = open(p3, encoding="utf-8").read()
-
-
-def rep3(old: str, new: str, must: int = 1) -> None:
-    global t3
-    n = t3.count(old)
-    print("  [__init__]", old.split("\n")[0][:55], "->", n)
-    assert n == must, f"expected {must}, got {n}"
-    t3 = t3.replace(old, new, 1)
-
-
-rep3("  * parameter_panel.py         – ParameterPanel (Parameter-Formular)\n", "")
-rep3("from serviceui.parameter_panel import ParameterPanel\n", "")
-rep3('    "ParameterPanel",\n', "")
-open(p3, "w", encoding="utf-8", newline="\n").write(t3)
-print("serviceui/__init__.py OK")
-
-print("\nALLE PATCHES ANGEWENDET")
-
-```
-
---------------------------------------------------
-
-### DATEI: test/_apply_fix_round3_sw.py
-```py
-# test/_apply_fix_round3_sw.py
-"""Temporaeres Bugfix-Patch-Skript fuer service_win.py (Runde 3).
-
-Schreibt die Datei nur am Ende (konsistenter Zustand bei Fehlern).
-"""
-import sys
-
-p2 = r"F:\Python\PyTrader\serviceui\service_win.py"
-t2 = open(p2, encoding="utf-8").read()
-
-
-def rep(old: str, new: str, must: int = 1, label: str = "") -> None:
-    global t2
-    n = t2.count(old)
-    print(f"  [{label}] count={n}: {old.splitlines()[0][:55]!r}")
-    assert n == must, f"[{label}] expected {must}, got {n}"
-    t2 = t2.replace(old, new, 1)
-
-
-def insert_after(needle: str, addition: str, label: str) -> None:
-    global t2
-    pos = t2.index(needle)
-    pos += len(needle)
-    t2 = t2[:pos] + addition + t2[pos:]
-    print(f"  [{label}] inserted after {needle.splitlines()[0][:40]!r}")
-
-
-# a) Import ParameterPanel entfernen
-rep(
-    """# ServiceSelector (ServiceSelectorWidget im Modus FULL_EDIT) + ParameterPanel.
-from serviceui.service_selector_widget import ServiceSelectorWidget
-from serviceui.parameter_panel import ParameterPanel""",
-    """# ServiceSelector (ServiceSelectorWidget im Modus FULL_EDIT).
-from serviceui.service_selector_widget import ServiceSelectorWidget""",
-    label="a-import",
-)
-
-# b) param_panel Erzeugung + Layout entfernen
-rep(
-    """            # Parameter-Formular fuer die markierte Service-Instanz
-            self.param_panel = ParameterPanel(parent=self)
-            right_layout.addWidget(self.service_selector, 2)
-            right_layout.addWidget(self.param_panel, 1)""",
-    """            right_layout.addWidget(self.service_selector, 1)""",
-    label="b-erzeugung",
-)
-
-# c) _on_symbol_changed: param_panel-Block entfernen
-rep(
-    """        # ParameterPanel-Praezision (prox_level1..6) je Symbol synchronisieren
-        if getattr(self, "param_panel", None) is not None:
-            self.param_panel.set_symbol_precision(self._get_symbol_precision())
-""",
-    "",
-    label="c-on_symbol",
-)
-
-# d) _wire_selector_toolbar: params_changed-Verbindung entfernen
-rep(
-    """        # ParameterPanel-Aenderungen -> Set-Definition + Spalten (Live-Edit)
-        self.param_panel.params_changed.connect(self._on_param_panel_changed)
-""",
-    "",
-    label="d-wire",
-)
-
-# e) _on_master_selection: _sync_param_panel()-Aufruf entfernen
-rep(
-    """        self._sync_param_panel()
-        # Bugfix 05.08.2026: bifunktionalen Toolbar-Zustand nach der
-        # MasterTree-Auswahl aktualisieren (set/service/none + Order).
-        self._update_toolbar_actions(set_id, service_id)""",
-    """        # Bugfix 05.08.2026: bifunktionalen Toolbar-Zustand nach der
-        # MasterTree-Auswahl aktualisieren (set/service/none + Order).
-        self._update_toolbar_actions(set_id, service_id)""",
-    label="e-master_selection",
-)
-
-# f) Methoden _sync_param_panel / _on_param_panel_changed / _set_ctrl_value
-#    KOMPLETT entfernen (Block bis zur U15-D2-Sektion; die Handler
-#    _on_remove_service & Co. liegen NACH diesem Marker und bleiben erhalten).
-start_f = t2.index("    def _sync_param_panel(self) -> None:")
-end_f = t2.index(
-    "    # -------------------------------------------------------------------------\n"
-    "    # Bugfix 05.08.2026: Toolbar-Zustand & Kontextmenue-Handler (U15-D2)\n"
-)
-t2 = t2[:start_f] + t2[end_f:]
-print("  [f] _sync_param_panel/_on_param_panel_changed/_set_ctrl_value entfernt")
-
-# g) purge_trash_requested verbinden
-rep(
-    """            tree.remove_service_requested.connect(self._on_remove_service)
-            # Gruppen-Klick -> Toolbar-State ([➕ Set] bei der 📁-Gruppe)""",
-    """            tree.remove_service_requested.connect(self._on_remove_service)
-            tree.purge_trash_requested.connect(self._on_purge_trash)
-            # Gruppen-Klick -> Toolbar-State ([➕ Set] bei der 📁-Gruppe)""",
-    label="g-wire-purge",
-)
-
-# h) _on_purge_trash-Methode nach _on_remove_service-Block einfuegen
-purge_code = '''
-    @Slot()
-    def _on_purge_trash(self) -> None:
-        """Leert den Papierkorb ENDGUELTIG (Kontextmenue 'Papierkorb löschen').
-
-        Bugfix 05.08.2026: Doppelte Sicherheitsabfrage (P14-05) – der Vorgang
-        ist nicht umkehrbar. Einzelne Sets koennen weiterhin ueber den
-        Papierkorb-Dialog (btn_trash_sets) wiederhergestellt werden.
-        """
-        trash = self.set_repo.list_trash()
-        if not trash:
-            QMessageBox.information(
-                self, "Papierkorb",
-                "Der Papierkorb ist leer – es gibt nichts zu löschen.")
-            return
-        count = len(trash)
-        reply = QMessageBox.question(
-            self, "Papierkorb löschen",
-            f"{count} Set(s) liegen im Papierkorb.\\n"
-            f"Wirklich ENDGÜLTIG löschen?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply != QMessageBox.Yes:
-            return
-        reply2 = QMessageBox.question(
-            self, "Wirklich?",
-            "Diese Aktion kann nicht rückgängig gemacht werden.\\nFortfahren?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply2 != QMessageBox.Yes:
-            return
-        try:
-            n = self.set_repo.purge_trash()
-        except Exception as e:
-            self.log(f"FEHLER beim Leeren des Papierkorbs: {e}")
-            return
-        self.log(f"Papierkorb geleert: {n} Set(s) endgültig entfernt (P14-05).")
-        event_bus.service_set_changed.emit()
-'''
-insert_after(
-    "        self._select_service_in_editor(set_id, service_id)\n"
-    "        self.remove_instance()\n",
-    purge_code,
-    label="h-purge-trash",
-)
-
-# i) remove_instance: doppelte Sicherheitsabfrage vor takeItem
-rep(
-    """            if not others:
-                QMessageBox.warning(
-                    self, "Service gesperrt",
-                    f"Der Service '{plugin_id}' ist der letzte in einem "
-                    f"gespeicherten Service-Set.\\n"
-                    f"Für den Indikator muss mindestens ein gültiges Set "
-                    f"mit diesem Service erhalten bleiben (P14-04).")
-                return
-        lw.takeItem(lw.currentRow())""",
-    """            if not others:
-                QMessageBox.warning(
-                    self, "Service gesperrt",
-                    f"Der Service '{plugin_id}' ist der letzte in einem "
-                    f"gespeicherten Service-Set.\\n"
-                    f"Für den Indikator muss mindestens ein gültiges Set "
-                    f"mit diesem Service erhalten bleiben (P14-04).")
-                return
-        # Bugfix 05.08.2026: Doppelte Sicherheitsabfrage (P14-05) – der
-        # bisherige Set-Stand wird als Snapshot in service_set_history
-        # gesichert, bevor der Service entfernt wird.
-        iid = str(item.data(Qt.UserRole) or "")
-        reply = QMessageBox.question(
-            self, "Service entfernen",
-            f"Service '{iid} [{plugin_id}]' aus dem Set entfernen?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply != QMessageBox.Yes:
-            return
-        reply2 = QMessageBox.question(
-            self, "Wirklich?",
-            "Der bisherige Set-Stand wird als Snapshot gesichert "
-            "(service_set_history). Fortfahren?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply2 != QMessageBox.Yes:
-            return
-        lw.takeItem(lw.currentRow())""",
-    label="i-remove-double",
-)
-
-# j) delete_set: erste Bestaetigung vor delete_named_item
-rep(
-    """                    return
-        self.delete_named_item(self._set_adapter)""",
-    """                    return
-        # Bugfix 05.08.2026: Erste Bestaetigung – das Set wird in den
-        # Papierkorb (service_sets_trash) verschoben (zweite Abfrage folgt
-        # in delete_named_item; Wiederherstellung ueber den Papierkorb-
-        # Dialog).
-        name = self._set_adapter._item_current_name()
-        if not name:
-            return
-        reply = QMessageBox.question(
-            self, "Set in den Papierkorb verschieben",
-            f"Set '{name}' wirklich in den Papierkorb verschieben?\\n"
-            f"(Wiederherstellung über den Papierkorb-Dialog möglich.)",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply != QMessageBox.Yes:
-            return
-        self.delete_named_item(self._set_adapter)""",
-    label="j-delete-first",
-)
-
-# k) _clear_set_editor: _sync_param_panel entfernen
-rep(
-    """        self._clear_service_columns()
-        # Phase 15.02: ParameterPanel leeren (kein Set mehr aktiv)
-        self._sync_param_panel()""",
-    """        self._clear_service_columns()""",
-    label="k-clear_editor",
-)
-
-# l) load_set_into_editor: _sync_param_panel entfernen
-rep(
-    """        self._build_service_columns(definition)
-        # Phase 15.02: ParameterPanel an das geladene Set angleichen
-        self._sync_param_panel()""",
-    """        self._build_service_columns(definition)""",
-    label="l-load_set",
-)
-
-# m) _sync_list_selection: _sync_param_panel entfernen
-rep(
-    """        # Phase 15.02: ParameterPanel an die markierte Instanz angleichen
-        self._sync_param_panel()""",
-    "",
-    label="m-sync_list",
-)
-
-open(p2, "w", encoding="utf-8", newline="\n").write(t2)
-print("service_win.py OK (geschrieben)")
 
 ```
 
@@ -22655,6 +23805,72 @@ for sym, tf, fid in [("SILVER", "H1", "proximity"), ("SILVER", "M5", "proximity"
         print(f"{sym:7s} {tf:4s} {fid:20s} -> {len(rows)} markers")
     except Exception as e:
         print(f"{sym:7s} {tf:4s} {fid:20s} -> ERROR: {e}")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_current_timestamp.py
+```py
+# test/check_current_timestamp.py
+"""Bugfix-Verifikation: DuckDB Binder Error
+   'Table "feature_store" does not have a column named "current_timestamp"'.
+
+Root-Cause: DuckDB 1.5.5 loest `current_timestamp` (lowercase Keyword) im
+ON CONFLICT DO UPDATE SET als SPALTENREFERENZ der Ziel-Tabelle auf.
+Fix: `now()` (Funktionsaufruf) im DO UPDATE SET von store_plugin_payload.
+"""
+import duckdb
+
+con = duckdb.connect(":memory:")
+con.execute("""
+    CREATE TABLE feature_store (
+        symbol      VARCHAR NOT NULL,
+        timeframe   VARCHAR NOT NULL,
+        bar_time    TIMESTAMPTZ NOT NULL,
+        ema_diff    DOUBLE,
+        rsi_14      DOUBLE,
+        atr_normalized DOUBLE,
+        created_at  TIMESTAMP DEFAULT current_timestamp,
+        feature_id  VARCHAR,
+        plugin_version VARCHAR,
+        feature_data JSON,
+        PRIMARY KEY (symbol, timeframe, bar_time)
+    );
+""")
+
+# store_plugin_payload-Pfad (feature_builder.py): GEFIXT mit now()
+sql = """
+    INSERT INTO feature_store (symbol, timeframe, bar_time, feature_id, plugin_version, feature_data)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT (symbol, timeframe, bar_time) DO UPDATE SET
+        feature_id = EXCLUDED.feature_id,
+        plugin_version = EXCLUDED.plugin_version,
+        feature_data = EXCLUDED.feature_data,
+        created_at = now()
+"""
+params = ["SILVER", "M1", "2026-01-01 00:00:00+00", "grid_lines", "1.0.0", "{}"]
+try:
+    con.execute(sql, params)
+    con.execute(sql, params)  # zweiter Lauf -> Conflict-Pfad (DO UPDATE)
+    row = con.execute(
+        "SELECT feature_id, created_at FROM feature_store").fetchone()
+    assert row is not None and row[0] == "grid_lines" and row[1] is not None, row
+    print("PASS: store_plugin_payload mit now() (Insert + Upsert)")
+except Exception as e:
+    print(f"FAIL: {e}")
+    raise
+
+# SELECT MAX(created_at) path used by service_selector_model
+try:
+    row = con.execute(
+        "SELECT MAX(created_at) FROM feature_store "
+        "WHERE symbol=? AND timeframe=? AND feature_id=?",
+        ["SILVER", "M1", "grid_lines"]).fetchone()
+    print(f"PASS: SELECT MAX(created_at) -> {row[0]}")
+except Exception as e:
+    print(f"FAIL: {e}")
+    raise
 
 ```
 
@@ -33171,7 +34387,7 @@ E) ServiceSelectorWidget (Modus SELECT_ONLY):
    - selection_changed(set_id, service_id) wird bei Auswahl emittiert.
 
 F) ServiceSelectorWidget (Modus FULL_EDIT / MasterTree):
-   - master_tree + toolbar vorhanden; 3 Top-Level-Gruppen (📁/⚡/📦).
+   - master_tree vorhanden (ohne Toolbar, volle Hoehe); 3 Top-Level-Gruppen (📁/⚡/📦).
    - Service-/Set-/Plugin-Zeilen tragen den Info-Button (QPushButton "ℹ",
      Icon-Breite) in Spalte 1; Tooltip + gelbe Faerbung bei Indikator-
      Zugehoerigkeit; info_requested-Signal bei Klick.
@@ -33233,8 +34449,34 @@ set_repo = ServiceSetRepository(db_path=TEST_DB)
 state_mgr = StateManager(db_path=TEST_DB)
 registry = PluginRegistry()
 
+# 05.08.2026 (Ausfuehrungsdatum): Eigene Test-Feature-Store-DB unter test/
+# (Konvention: alle Test-DBs unter test/). Eine proximity-Row mit aktuellem
+# created_at simuliert die letzte Ausfuehrung -> 'DD.MM.JJ' im MasterTree.
+TEST_FS_DB = os.path.join(TEST_DIR, "p15_s2_execdate_test.duckdb")
+if os.path.exists(TEST_FS_DB):
+    os.remove(TEST_FS_DB)
+import duckdb as _duckdb  # noqa: E402
+_fs_con = _duckdb.connect(TEST_FS_DB)
+_fs_con.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR, timeframe VARCHAR, bar_time TIMESTAMPTZ,
+        ema_diff DOUBLE, rsi_14 DOUBLE, atr_normalized DOUBLE,
+        created_at TIMESTAMP DEFAULT current_timestamp,
+        feature_id VARCHAR, plugin_version VARCHAR, feature_data JSON
+    )
+""")
+_fs_con.execute("""
+    INSERT INTO feature_store (symbol, timeframe, bar_time, feature_id,
+                               plugin_version, feature_data)
+    VALUES ('SILVER', 'M1', current_timestamp, 'proximity', '1.0.0',
+            '{"schema_version":"1.0.0"}')
+""")
+_fs_con.close()
+from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
+fs_reader = FeatureStoreReader(db_path=TEST_FS_DB)
+
 model = ServiceSelectorModel(set_repo=set_repo, state_manager=state_mgr,
-                             registry=registry)
+                             registry=registry, feature_store_reader=fs_reader)
 
 plugins = model.get_plugins()
 print(f"   Plugins: {sorted(plugins.keys())}")
@@ -33408,7 +34650,13 @@ model.refresh()
 full = ServiceSelectorWidget(mode=ServiceSelectorWidget.MODE_FULL_EDIT,
                              model=model)
 check("F1) MasterTree vorhanden", full.master_tree is not None)
-check("F2) Toolbar vorhanden", full.toolbar is not None)
+# 05.08.2026: CRUD-/Order-Buttons oberhalb des Baums entfernt – der
+# MasterTree hat die volle vertikale Hoehe (alle Aktionen via Kontextmenue).
+# Der ServiceToolbar wurde am 05.08.2026 vollstaendig entfernt (archiviert
+# unter .backup_service_toolbar/); auch das toolbar-Attribut existiert nicht
+# mehr.
+check("F2) Keine Toolbar mehr (volle Baum-Hoehe)",
+      not hasattr(full, "toolbar"))
 mt = full.master_tree
 check("F3) 3 Top-Level-Gruppen", mt.topLevelItemCount() == 3,
       str(mt.topLevelItemCount()))
@@ -33570,6 +34818,70 @@ check("F7) current_selection() liefert Set+Service",
       str(sel2))
 
 # ---------------------------------------------------------------------------
+# J) Ausfuehrungsdatum (feature_store) + Kontextmenue-Run-Signale (05.08.2026)
+# ---------------------------------------------------------------------------
+from datetime import datetime  # noqa: E402
+today_str = datetime.now().strftime("%d.%m.%y")
+
+check("J1) last_execution_date('proximity') = heute (DD.MM.JJ)",
+      model.last_execution_date("proximity") == today_str,
+      model.last_execution_date("proximity"))
+check("J2) Fallback '--.--.--' ohne feature_store-Eintrag",
+      model.last_execution_date("grid_lines") == "--.--.--",
+      model.last_execution_date("grid_lines"))
+
+svc_nodes = model.build_tree()[0]["children"][0]["services"]
+check("J3) build_tree-Service-Node traegt last_execution",
+      all("last_execution" in s for s in svc_nodes),
+      str([s.get("last_execution") for s in svc_nodes]))
+
+# MasterTree-Label: 'instance_id (DD.MM.JJ)' – prox_1 (heute), grid_1 ohne
+# Store-Eintrag '(--.--.--)'. Der Baum repopuliert ueber data_changed.
+model.refresh()
+_app.processEvents()
+# Nach dem Repopulate sind die alten C++-Items zerstoert – set_group neu holen.
+set_group = mt.topLevelItem(0)
+svc_items = [set_group.child(0).child(i) for i in range(set_group.child(0).childCount())]
+prox_label = next((i.text(0) for i in svc_items if i.text(0).startswith("prox_1")), "")
+grid_label = next((i.text(0) for i in svc_items if i.text(0).startswith("grid_1")), "")
+check("J4) prox_1-Zeile zeigt '(DD.MM.JJ)'",
+      prox_label == f"prox_1 ({today_str})", prox_label)
+check("J5) grid_1-Zeile zeigt Fallback '(--.--.--)'",
+      grid_label == "grid_1 (--.--.--)", grid_label)
+
+# Kontextmenue-Run-Signale sind verbindbar (Emission erfolgt aus dem
+# Kontextmenue; der Orchestrator verknuepft sie mit seinen Run-Handlern).
+run_svc_calls = []
+run_set_calls = []
+mt.run_service_requested.connect(
+    lambda s, i: run_svc_calls.append((s, i)))
+mt.run_set_requested.connect(lambda s: run_set_calls.append(s))
+mt.run_service_requested.emit(set_id, "prox_1")
+mt.run_set_requested.emit(set_id)
+check("J6) run_service_requested(set_id, instance_id) emittierbar",
+      run_svc_calls == [(set_id, "prox_1")], str(run_svc_calls))
+check("J7) run_set_requested(set_id) emittierbar",
+      run_set_calls == [set_id], str(run_set_calls))
+
+# 05.08.2026 (Punkt 4): Auch Standalone-/Plugin-Zeilen tragen das Datum
+# '(DD.MM.JJ)' hinter dem Namen (gleiche feature_store-Semantik).
+model.refresh()
+_app.processEvents()
+standalone_group = mt.topLevelItem(1)
+plugin_group = mt.topLevelItem(2)
+plugin_labels = [plugin_group.child(i).text(0)
+                 for i in range(plugin_group.childCount())]
+prox_plugin_label = next(
+    (t for t in plugin_labels if t.startswith("proximity")), "")
+grid_plugin_label = next(
+    (t for t in plugin_labels if t.startswith("grid_lines")), "")
+check("J8) Plugin-Zeile 'proximity' zeigt '(DD.MM.JJ)'",
+      prox_plugin_label == f"proximity ({today_str})", prox_plugin_label)
+check("J9) Plugin-Zeile 'grid_lines' zeigt Fallback '(--.--.--)'",
+      grid_plugin_label == "grid_lines (--.--.--)", grid_plugin_label)
+
+
+# ---------------------------------------------------------------------------
 # H) Info-Button -> Beschreibungs-Dialog (header_line / from_set / from_plugin)
 # ---------------------------------------------------------------------------
 from analytics.engine.description_dialog import ServiceDescriptionDialog  # noqa: E402
@@ -33632,6 +34944,10 @@ check("G2) Modell reagiert auf EventBus (Set-Update)",
 # ---------------------------------------------------------------------------
 try:
     os.remove(TEST_DB)
+except OSError:
+    pass
+try:
+    os.remove(TEST_FS_DB)
 except OSError:
     pass
 
@@ -36216,6 +37532,176 @@ console.log('\nRESULT:', (ok === 3000 && newReal === 1785456060 && newLabel === 
 
 --------------------------------------------------
 
+### DATEI: test/check_service_run_fixes.py
+```py
+# test/check_service_run_fixes.py
+# Headless-Validierung der beiden Service-Run-Bugfixes (05.08.2026):
+#
+#   Bugfix 1: "ausfuehren service proximity -> fertig (kein Feature-Store-
+#             Payload)". UI-angelegte Sets speichern KEIN depends_on. Die
+#             Worker-Aufbereitung prepare_worker_definition() loest die
+#             implizite Abhaengigkeit proximity -> grid_lines anhand der
+#             Plugin-dependencies auf (naechste VORHERIGE Instanz in
+#             execution_order). Explizit gesetzte depends_on bleiben unveraendert.
+#
+#   Bugfix 2: "Scanner-Candles (max) aus den App-Optionen als max Lookback
+#             fuer ALLE Services". prepare_worker_definition() ueberschreibt
+#             den Service-lookback mit scanner_candle_limit (statt des
+#             gespeicherten 1000). Der Worker laedt OHLCV mit
+#             settings.scanner_candle_limit statt feature_builder_limit.
+#
+# KEINE UI-/DB-Tests: reine Logik auf synthetischen DataFrames (kein Schreiben
+# in data/), Evaluator-Pfad ohne Feature-Store-Persistenz.
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+import pandas as pd
+
+ok = True
+failures = []
+
+
+def check(cond, msg):
+    global ok
+    if cond:
+        print(f"   ✅ {msg}")
+    else:
+        ok = False
+        failures.append(msg)
+        print(f"   ❌ {msg}")
+
+
+def main() -> int:
+    global ok
+    print("=" * 70)
+    print("Service-Run-Bugfixes (depends_on-Aufloesung + Scanner-Lookback)")
+    print("=" * 70)
+
+    from serviceui.service_set_utils import prepare_worker_definition
+    from analytics.features.definitions.proximity_service import ProximityService
+
+    # ---------------------------------------------------------------- [1]
+    print("\n[1] ProximityService.dependencies deklariert grid_lines:")
+    svc = ProximityService()
+    check(svc.dependencies == ["grid_lines"],
+          f"ProximityService.dependencies == ['grid_lines'] (ist {svc.dependencies})")
+
+    # ---------------------------------------------------------------- [2]
+    print("\n[2] prepare_worker_definition – depends_on-Aufloesung:")
+    definition = {
+        "set_id": "s1",
+        "display_name": "UI-Set",
+        "execution_order": ["grid_lines", "proximity"],
+        "services": {
+            "grid_lines": {"plugin_id": "grid_lines", "lookback": 1000,
+                           "params": {"step_size": 0.5}},
+            "proximity": {"plugin_id": "proximity", "lookback": 500,
+                          "params": {"visit_pct": 0.05}},
+        },
+    }
+    prepared = prepare_worker_definition(definition, 100_000)
+
+    # Original bleibt unveraendert (Kopie)
+    check(definition["services"]["proximity"].get("depends_on") is None,
+          "Original-Definition unveraendert (kein depends_on nachgetragen)")
+    # proximity erhaelt implizites depends_on auf die VORHERIGE grid_lines-Instanz
+    deps = (prepared["services"]["proximity"] or {}).get("depends_on")
+    check(deps == ["grid_lines"],
+          f"proximity.depends_on automatisch auf ['grid_lines'] (ist {deps})")
+    # grid_lines (ohne dependencies) bekommt KEIN depends_on
+    check("depends_on" not in (prepared["services"]["grid_lines"] or {}),
+          "grid_lines ohne depends_on (keine Upstream-Plugins)")
+
+    # Lookback-Override fuer ALLE Services
+    lb_p = (prepared["services"]["proximity"] or {}).get("lookback")
+    lb_g = (prepared["services"]["grid_lines"] or {}).get("lookback")
+    check(lb_p == 100_000 and lb_g == 100_000,
+          f"Lookback-Override auf 100000 fuer alle Services (prox={lb_p}, grid={lb_g})")
+
+    # ---------------------------------------------------------------- [3]
+    print("\n[3] Explizites depends_on bleibt unveraendert:")
+    indi_def = {
+        "set_id": "grid_liquidity_internal",
+        "execution_order": ["grid_1", "prox_1"],
+        "services": {
+            "grid_1": {"plugin_id": "grid_lines", "lookback": 1000, "params": {}},
+            "prox_1": {"plugin_id": "proximity", "lookback": 1000,
+                       "depends_on": ["grid_1"], "params": {}},
+        },
+    }
+    prep2 = prepare_worker_definition(indi_def, 50_000)
+    check((prep2["services"]["prox_1"] or {}).get("depends_on") == ["grid_1"],
+          "explizites depends_on ['grid_1'] nicht ueberschrieben")
+
+    # ---------------------------------------------------------------- [4]
+    print("\n[4] End-to-End: Evaluator-Pipeline (depends_on-Aufloesung aktiv):")
+    from analytics.engine.set_evaluator import ServiceSetEvaluator
+    from analytics.features.plugins.base_plugin import PluginContext
+
+    # Synthetische OHLCV: 5 M1-Bars um 30.0 -> Grid-Level 30.0 wird getroffen
+    base = 1600000000
+    df = pd.DataFrame({
+        "time": [base + i * 60 for i in range(5)],
+        "open": [30.0] * 5,
+        "high": [30.02] * 5,
+        "low": [29.98] * 5,
+        "close": [30.0] * 5,
+    })
+    df_plugin = df.copy()
+    df_plugin["time"] = df_plugin["time"].astype(int)
+
+    evaluator = ServiceSetEvaluator()
+    ctx = PluginContext(symbol="SILVER", timeframe="M1", mode="batch")
+    results = evaluator.execute_set(prepared, df_plugin, context=ctx)
+
+    prox_res = results.get("proximity") or {}
+    fsp = prox_res.get("feature_store_payload") or {}
+    records = fsp.get("records") or []
+    check(bool(records), f"proximity liefert Feature-Store-Records (n={len(records)})")
+    check(fsp.get("feature_id") == "proximity",
+          f"feature_id='proximity' (ist {fsp.get('feature_id')})")
+    check(bool(fsp.get("metadata", {}).get("depends_on")),
+          f"metadata.depends_on im Payload gesetzt (ist {fsp.get('metadata', {}).get('depends_on')})")
+    grid_res = results.get("grid_lines") or {}
+    grid_recs = (grid_res.get("feature_store_payload") or {}).get("records") or []
+    check(len(grid_recs) == 5, f"grid_lines Records ueber 5 Bars (n={len(grid_recs)})")
+
+    # ---------------------------------------------------------------- [5]
+    print("\n[5] Worker-Load-Limit nutzt scanner_candle_limit (Code-Inspektion):")
+    rw_src = (Path(__file__).resolve().parent.parent / "serviceui" / "run_worker.py").read_text(
+        encoding="utf-8", errors="replace")
+    srw_src = (Path(__file__).resolve().parent.parent / "serviceui" / "set_run_worker.py").read_text(
+        encoding="utf-8", errors="replace")
+    check("limit=settings.scanner_candle_limit" in rw_src,
+          "run_worker.py: load_ohlcv mit scanner_candle_limit")
+    check("limit=settings.scanner_candle_limit" in srw_src,
+          "set_run_worker.py: load_ohlcv mit scanner_candle_limit")
+    check("prepare_worker_definition" in rw_src and "prepare_worker_definition" in srw_src,
+          "beide Worker rufen prepare_worker_definition() auf")
+
+    print()
+    if ok:
+        print("RESULT: ALLE CHECKS BESTANDEN ✅")
+        return 0
+    print(f"RESULT: {len(failures)} CHECK(S) FEHLGESCHLAGEN ❌")
+    for f in failures:
+        print(f"   - {f}")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/check_statistics_repo.py
 ```py
 ﻿# BEREIT FÜR PHASE 15
@@ -37689,6 +39175,137 @@ if __name__ == "__main__":
 
 --------------------------------------------------
 
+### DATEI: test/migrate_legacy_feature_store.py
+```py
+# test/migrate_legacy_feature_store.py
+"""
+Migration (05.08.2026, Punkt 1): Legacy-Rows im feature_store erhalten eine
+gueltige feature_id.
+
+Hintergrund:
+  Alle 673.235 Zeilen der analytics.duckdb/feature_store wurden von der ALTEN
+  Monolith-Pipeline (FeatureBuilder.build(), Phasen 12-13) geschrieben und
+  tragen KEINE Plugin-Identitaet (feature_id = NULL, plugin_version = NULL,
+  feature_data = NULL). Dadurch fand fetch_last_execution_dates() keine
+  Zeilen und der MasterTree zeigte ueberall '(--.--.--)', obwohl Daten
+  vorhanden sind.
+
+  Die Legacy-Zeilen mit befuellten grid_*-Spalten (grid_nearest_level /
+  grid_dist_abs / grid_dist_pct / is_time_window_active) tragen exakt die
+  Daten, die heute der `proximity`-Service erzeugt (Abstand des Preises zu
+  den Grid-Linien). Sie werden daher semantisch korrekt auf
+  feature_id = 'proximity' migriert.
+
+  WICHTIG (keine Verfaelschung):
+    * feature_data bleibt NULL – der Chart-Lesepfad
+      (read_proximity_from_feature_store) filtert `feature_data IS NOT NULL`
+      UND `is_hit == True` und ignoriert die migrierten Zeilen dadurch
+      weiterhin (keine Aenderung im Chart-Rendering).
+    * created_at bleibt unveraendert (liefert das echte Legacy-Datum).
+    * plugin_version = 'legacy' kennzeichnet die migrierten Zeilen
+      transparent (echte Plugin-Runs schreiben '1.0.0').
+
+Aufruf:
+    python test/migrate_legacy_feature_store.py            # Dry-Run
+    python test/migrate_legacy_feature_store.py --apply    # Migration
+
+Exit-Code:
+    0 = keine unklassifizierten Legacy-Zeilen (feature_id IS NULL) mehr
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+import duckdb
+
+PROJECT = Path(__file__).resolve().parent.parent
+ANALYTICS_DB = PROJECT / "data" / "analytics.duckdb"
+
+# Legacy-Zeilen mit grid_*-Spalten = Proximity-Semantik (Abfrage)
+GRID_ROWS_SQL = """
+    SELECT COUNT(*) FROM feature_store
+    WHERE feature_id IS NULL
+      AND (grid_nearest_level IS NOT NULL
+           OR grid_dist_abs IS NOT NULL
+           OR grid_dist_pct IS NOT NULL)
+"""
+
+APPLY_SQL = """
+    UPDATE feature_store
+    SET feature_id = 'proximity',
+        plugin_version = 'legacy'
+    WHERE feature_id IS NULL
+      AND (grid_nearest_level IS NOT NULL
+           OR grid_dist_abs IS NOT NULL
+           OR grid_dist_pct IS NOT NULL)
+"""
+
+
+def _count(con, sql: str, params=None) -> int:
+    row = con.execute(sql, params or []).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Legacy feature_store-Migration")
+    ap.add_argument("--apply", action="store_true",
+                    help="Migration tatsaechlich ausfuehren (sonst Dry-Run)")
+    ap.add_argument("--db", default=str(ANALYTICS_DB),
+                    help="Pfad zur analytics.duckdb")
+    args = ap.parse_args()
+
+    con = duckdb.connect(args.db)
+
+    total = _count(con, "SELECT COUNT(*) FROM feature_store")
+    null_fid = _count(con,
+                      "SELECT COUNT(*) FROM feature_store "
+                      "WHERE feature_id IS NULL")
+    grid_rows = _count(con, GRID_ROWS_SQL)
+    non_grid_legacy = null_fid - grid_rows
+
+    print(f"feature_store gesamt      : {total}")
+    print(f"feature_id IS NULL (Legacy): {null_fid}")
+    print(f"  davon grid_*-Zeilen      : {grid_rows}  -> werden 'proximity'")
+    print(f"  davon ohne grid_*        : {non_grid_legacy}  -> bleiben NULL")
+
+    if not args.apply:
+        print("\nDRY-RUN: keine Aenderung. Mit --apply ausfuehren.")
+        # Exit 0 = konsistent (keine migrierbaren Zeilen mehr erwartet)
+        return 0 if grid_rows == 0 else 1
+
+    # created_at defensiv nachziehen (falls Alt-Rows ohne Zeitstempel)
+    _count(con, """
+        UPDATE feature_store
+        SET created_at = current_timestamp
+        WHERE created_at IS NULL
+    """)
+    affected = _count(con, APPLY_SQL)
+    print(f"\nMigration angewendet: {affected} Zeilen -> feature_id='proximity'")
+
+    # Verifikation
+    remaining = _count(con,
+                       "SELECT COUNT(*) FROM feature_store "
+                       "WHERE feature_id IS NULL")
+    remaining_grid = _count(con, GRID_ROWS_SQL)
+    prox = _count(con,
+                  "SELECT COUNT(*) FROM feature_store "
+                  "WHERE feature_id = 'proximity'")
+    print(f"Verbleibende feature_id IS NULL: {remaining}")
+    print(f"  davon grid_*-Zeilen           : {remaining_grid}")
+    print(f"feature_id = 'proximity'       : {prox}")
+    # Exit 0 = keine migrierbaren Grid-Legacy-Zeilen mehr (atr-only Rows
+    # ohne grid_* bleiben bewusst NULL – sie tragen keine Proximity-Semantik).
+    return 0 if remaining_grid == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/simulate_chart_mapping.py
 ```py
 ﻿# BEREIT FÜR PHASE 15
@@ -37829,6 +39446,14 @@ import tempfile
 
 sys.path.insert(0, r"F:\Python\PyTrader")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+# UTF-8-Konsole erzwingen (wie main.py): unter Windows cp1252 wuerde die
+# Ausgabe bei Unicode-Zeichen (z.B. 'ℹ', '✏️') mit UnicodeEncodeError brechen.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 from PySide6.QtCore import QEventLoop, QTimer  # noqa: E402
@@ -38330,6 +39955,503 @@ pump()
 import shutil  # noqa: E402
 shutil.rmtree(tmp5, ignore_errors=True)
 shutil.rmtree(tmp4, ignore_errors=True)
+
+# ---------------------------------------------------------------------------
+# Teil 6 (U15-E, 05.08.2026): Timeframe-Control (combo_tf) & Multi-TF-Run
+#   - Filterleiste: combo_tf existiert, Index 0 = 'ALLE Timeframes' (Sentinel),
+#     danach alle get_timeframes()-Werte (Fallback TF_SECONDS_MAP).
+#   - get_persistent_timeframe()/save_state()/restore_state() runden den
+#     Sentinel 1:1 (Persistenz des 'ALLE Timeframes'-Modus).
+#   - ServiceRunWorker._resolve_timeframes(): Single vs. ALL (Sentinel).
+#   - grid_lines feature_store_payload: bar_time/grid_nearest_level/grid_step/
+#     upper_level/lower_level mathematisch korrekt (close 30.1, step 0.5).
+# ---------------------------------------------------------------------------
+print("\n=== Teil 6: U15-E Timeframe-Control & Multi-TF ===")
+from serviceui.run_worker import ALL_TIMEFRAMES, ServiceRunWorker  # noqa: E402
+
+expected_tfs = []
+try:
+    from db_service import TF_SECONDS_MAP, get_timeframes
+    try:
+        expected_tfs = list(get_timeframes().keys())
+    except Exception:
+        expected_tfs = list(TF_SECONDS_MAP.keys())
+except Exception:
+    expected_tfs = ["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
+
+# 6.1 combo_tf in der Filterleiste (frische ServiceWindow-Instanz)
+sm.save_window_geometry("win_service", 150, 120, 640, 400, False)
+sm.save_instance_state("win_service", "SILVER", "M1")
+w3 = ServiceWindow(parent=_Parent(), service_set_repo=repo)
+w3.service_selector.model.set_repo = repo
+w3.service_selector.model.refresh()
+w3.show()
+pump()
+pump()
+
+ctf = getattr(w3, "combo_tf", None)
+check("U1) combo_tf existiert in der Filterleiste", ctf is not None)
+check("U2) Index 0 = Sentinel 'ALLE Timeframes'",
+      ctf is not None and ctf.itemText(0) == ALL_TIMEFRAMES,
+      ctf.itemText(0) if ctf else "combo_tf=None")
+missing_tfs = [tf for tf in expected_tfs if ctf is not None and ctf.findText(tf) < 0]
+check("U3) Alle Timeframes im Dropdown enthalten", ctf is not None and not missing_tfs,
+      f"fehlend={missing_tfs}")
+idx_m1 = ctf.findText("M1") if ctf else -1
+check("U4) Default-Auswahl = M1",
+      ctf is not None and ctf.currentIndex() == idx_m1 and idx_m1 >= 0,
+      f"current={ctf.currentText() if ctf else None}")
+
+if ctf is not None:
+    ctf.setCurrentText(ALL_TIMEFRAMES)
+    pump()
+    check("U5) get_persistent_timeframe() liefert Sentinel",
+          w3.get_persistent_timeframe() == ALL_TIMEFRAMES,
+          w3.get_persistent_timeframe())
+    w3.save_state()
+    inst = [i for i in sm.load_all_instances() if i.get("instance_id") == "win_service"]
+    stored_tf = inst[0].get("timeframe") if inst else None
+    check("U6) save_state persistiert 'ALLE Timeframes'",
+          stored_tf == ALL_TIMEFRAMES, str(stored_tf))
+    # "App-Ende mit OFFENEM Fenster": w3 bleibt offen (save_state OHNE close),
+    # die Neustart-Simulation (w4) stellt den Sentinel wieder her.
+    w4 = ServiceWindow(parent=_Parent(), service_set_repo=repo)
+    w4.service_selector.model.set_repo = repo
+    w4.service_selector.model.refresh()
+    w4.show()
+    pump()
+    pump()
+    check("U7) restore_state stellt 'ALLE Timeframes' wieder her",
+          getattr(w4, "combo_tf", None) is not None
+          and w4.combo_tf.currentText() == ALL_TIMEFRAMES,
+          w4.combo_tf.currentText() if getattr(w4, "combo_tf", None) else None)
+    w4.close()
+    pump()
+    w3.close()
+    pump()
+else:
+    for _u in ("U5", "U6", "U7"):
+        check(_u, False, "combo_tf fehlt")
+
+# 6.2 ServiceRunWorker._resolve_timeframes (Single vs. Multi-TF)
+w_worker_def = {
+    "set_id": "set_1", "display_name": "Drei Services",
+    "execution_order": ["grid_1", "prox_1", "grid_2"],
+    "services": {},
+}
+wk_single = ServiceRunWorker(None, "SILVER", "M1", w_worker_def)
+check("U8) Single-TF: _resolve_timeframes -> ['M1']",
+      wk_single._resolve_timeframes() == ["M1"],
+      str(wk_single._resolve_timeframes()))
+wk_all = ServiceRunWorker(None, "SILVER", ALL_TIMEFRAMES, w_worker_def)
+tfs_all = wk_all._resolve_timeframes()
+check("U9) Multi-TF: _resolve_timeframes liefert ALLE Timeframes (ohne Sentinel)",
+      len(tfs_all) >= len(expected_tfs) and ALL_TIMEFRAMES not in tfs_all,
+      f"{len(tfs_all)} TFs")
+check("U10) Multi-TF: Reihenfolge = get_timeframes() (MN1..M1)",
+      tfs_all == expected_tfs, str(tfs_all))
+
+# 6.3 grid_lines feature_store_payload (Mathematik U15-E)
+from analytics.features.definitions.grid_lines_service import GridLinesService  # noqa: E402
+gl = GridLinesService()
+df_gl = pd.DataFrame({
+    "time": [1600000000, 1600000360],
+    "open": [30.0, 30.2],
+    "high": [30.15, 30.4],
+    "low": [29.85, 30.1],
+    "close": [30.1, 30.25],
+})
+res_gl = gl.calculate(df_gl, {"step_size": 0.5, "steps_around": 4})
+payload_gl = res_gl.get("feature_store_payload") or {}
+recs = payload_gl.get("records") or []
+check("U11) grid_lines feature_store_payload gefuellt",
+      bool(recs) and payload_gl.get("feature_id") == "grid_lines",
+      f"records={len(recs)}")
+check("U12) grid_lines records je Bar (bar_time + Levels)",
+      len(recs) == 2 and all(
+          {"bar_time", "grid_nearest_level", "grid_step",
+           "upper_level", "lower_level"} <= set(r) for r in recs),
+      str(recs))
+if recs:
+    # close 30.1 / step 0.5 -> center 30.0, upper 30.5, lower 29.5
+    r0 = recs[0]
+    check("U13) Level-Mathematik korrekt (center 30.0, +- step)",
+          abs(r0["grid_nearest_level"] - 30.0) < 1e-9
+          and abs(r0["upper_level"] - 30.5) < 1e-9
+          and abs(r0["lower_level"] - 29.5) < 1e-9,
+          str(r0))
+
+# ---------------------------------------------------------------------------
+# Teil 6.4: Multi-TF run()-Schleife (gekapselt: Fake-FeatureBuilder &
+#           Fake-Evaluator, KEINE echte DB – kein Schreiben in data/).
+# ---------------------------------------------------------------------------
+print("\n=== Teil 6.4: Multi-TF run()-Schleife (gekapselt) ===")
+import analytics.features.feature_builder as _fbm  # noqa: E402
+
+
+class _FakeFB:
+    """Immitiert FeatureBuilder: liefert OHLCV nur fuer M1/H1, sonst None
+    (keine Daten) – M30 wird uebersprungen. store_plugin_payload() zeichnet
+    die Aufrufe nur auf (kein DB-Zugriff)."""
+
+    def __init__(self):
+        self.calls = []
+        self._df = pd.DataFrame({
+            "bar_time": pd.to_datetime([1600000000, 1600000360], unit="s", utc=True),
+            "open": [30.0, 30.2],
+            "high": [30.15, 30.4],
+            "low": [29.85, 30.1],
+            "close": [30.1, 30.25],
+        })
+
+    def load_ohlcv(self, symbol, tf, limit=None):
+        return self._df if tf in ("M1", "H1") else None
+
+    def store_plugin_payload(self, symbol, tf, payload):
+        self.calls.append((symbol, tf, payload))
+
+
+class _FakeEval:
+    def execute_set(self, definition, df_plugin, context=None):
+        return {"g1": {"feature_store_payload": {
+            "feature_id": "grid_lines", "plugin_version": "1.0.0",
+            "records": [{"bar_time": 1600000000}]}}}
+
+
+fb_fake = _FakeFB()
+_orig_fb_cls = _fbm.FeatureBuilder
+_fbm.FeatureBuilder = lambda: fb_fake
+try:
+    logs = []
+    finish = []
+    fail = []
+
+    # Multi-TF: ALLE Timeframes -> M1+H1 gespeichert, M30 (keine Daten) uebersprungen
+    wk = ServiceRunWorker(_FakeEval(), "SILVER", ALL_TIMEFRAMES, w_worker_def)
+    wk.log_message.connect(lambda m: logs.append(m))
+    wk.run_finished.connect(lambda sid, n: finish.append((sid, n)))
+    wk.run_failed.connect(lambda sid, e: fail.append((sid, e)))
+    wk.run()  # direkt im Haupt-Thread (kein start()) – deterministisch
+    check("U14) Multi-TF run() -> genau 1x run_finished, kein run_failed",
+          len(finish) == 1 and not fail, f"finish={finish} fail={fail}")
+    check("U15) Multi-TF summiert Feature-Rows (M1+H1 je 1)",
+          bool(finish) and finish[0][1] == 2, str(finish))
+    check("U16) Multi-TF storet pro Timeframe (nur M1, H1)",
+          sorted(c[1] for c in fb_fake.calls) == ["H1", "M1"],
+          str([c[1] for c in fb_fake.calls]))
+
+    # Single-TF mit Daten -> run_finished
+    finish_s = []
+    wk_s = ServiceRunWorker(_FakeEval(), "SILVER", "M1", w_worker_def)
+    wk_s.run_finished.connect(lambda sid, n: finish_s.append((sid, n)))
+    wk_s.run()
+    check("U17) Single-TF mit Daten -> run_finished",
+          len(finish_s) == 1 and finish_s[0][1] == 1, str(finish_s))
+
+    # Single-TF ohne Daten -> run_failed (bisheriges Fehlerverhalten erhalten)
+    fail_s = []
+    wk_e = ServiceRunWorker(_FakeEval(), "SILVER", "M30", w_worker_def)
+    wk_e.run_failed.connect(lambda sid, e: fail_s.append((sid, e)))
+    wk_e.run()
+    check("U18) Single-TF ohne Daten -> run_failed",
+          len(fail_s) == 1 and "Keine OHLCV-Daten" in fail_s[0][1], str(fail_s))
+finally:
+    _fbm.FeatureBuilder = _orig_fb_cls
+
+# ---------------------------------------------------------------------------
+# Teil 7 (Phase 16, 05.08.2026): Service-Beschreibungs-Editor (modales
+#         Editier-Fenster) & Concurrency-Guard (45s-Sync-Timer) & Numpy-
+#         Vektorisierung der Service-Berechnungen (Parität + Performance).
+# ---------------------------------------------------------------------------
+print("\n=== Teil 7: Phase 16 – Editor, Sync-Guard, Vektorisierung ===")
+import time  # noqa: E402
+import numpy as np  # noqa: E402
+from datetime import datetime, timezone as dt_timezone  # noqa: E402
+from PySide6.QtWidgets import QDialog, QTextEdit  # noqa: E402
+from analytics.engine.description_dialog import ServiceDescriptionEditDialog  # noqa: E402
+from analytics.features.definitions.proximity_service import (  # noqa: E402
+    ProximityService, _bar_utc_minutes,
+)
+from analytics.features.plugins.base_plugin import PluginContext  # noqa: E402
+from analytics.features.definitions.grid_math import (  # noqa: E402
+    f_round_to_custom_step, f_in_window_around, f_strip_trailing_zeros,
+)
+from config.event_bus import event_bus  # noqa: E402
+
+# 7.1 ServiceDescriptionEditDialog – headless + save_requested-Signal
+_edit_dlg = ServiceDescriptionEditDialog(
+    instance_id="grid_1", plugin_id="grid_lines",
+    header_line="im GridLiquidityIndicator", description="Alt-Text",
+)
+_edit_editor = _edit_dlg.findChild(QTextEdit)
+check("D1) Editor: QTextEdit vorhanden + vorbelegt",
+      _edit_editor is not None and _edit_editor.toPlainText() == "Alt-Text", "")
+_saved_desc = []
+_edit_dlg.save_requested.connect(lambda t: _saved_desc.append(t))
+_edit_editor.setPlainText("Neue Instanz-Beschreibung")
+_edit_dlg._on_save()
+check("D2) [Speichern] emittiert save_requested mit neuem Text",
+      _saved_desc == ["Neue Instanz-Beschreibung"], str(_saved_desc))
+check("D3) [Speichern] schliesst Dialog mit accept()",
+      _edit_dlg.result() == QDialog.Accepted, str(_edit_dlg.result()))
+
+# 7.2 Concurrency-Guard: ServiceWindow-Referenzzaehler -> EventBus
+_started_c, _finished_c = [], []
+event_bus.service_run_started.connect(lambda: _started_c.append(1))
+event_bus.service_run_finished.connect(lambda: _finished_c.append(1))
+
+
+class _GuardHost:
+    def __init__(self):
+        self._sync_guard_count = 0
+
+
+_gh = _GuardHost()
+_gh._begin_sync_guard = ServiceWindow._begin_sync_guard.__get__(_gh, _GuardHost)
+_gh._end_sync_guard = ServiceWindow._end_sync_guard.__get__(_gh, _GuardHost)
+_gh._begin_sync_guard()
+check("S1) service_run_started genau 1x (0->1)", len(_started_c) == 1,
+      str(len(_started_c)))
+_gh._begin_sync_guard()  # zweiter paralleler Run
+check("S2) kein zweites started (Referenzzaehler)", len(_started_c) == 1,
+      str(len(_started_c)))
+_gh._end_sync_guard()
+check("S3) noch kein finished (ein Run laeuft weiter)", len(_finished_c) == 0,
+      str(len(_finished_c)))
+_gh._end_sync_guard()
+check("S4) finished genau 1x nach letztem Abschluss (1->0)",
+      len(_finished_c) == 1, str(len(_finished_c)))
+_gh._end_sync_guard()  # Unterlauf -> keine Negativ-Emission
+check("S5) finished bleibt 1x (Zaehler=0)", len(_finished_c) == 1,
+      str(len(_finished_c)))
+
+# 7.2b MainWindow-Guard: sync_timer stoppen/starten (echte Slot-Methoden,
+#      Instanz via __new__ – kein App-Start). Import von main.py nur moeglich,
+#      wenn MetaTrader5 verfuegbar ist (venv); sonst wird der Check uebersprungen.
+_mw_ok = True
+try:
+    import main as _main_mod  # noqa: E402
+except Exception as _e:  # pragma: no cover
+    _mw_ok = False
+    print(f"   (MainWindow-Guard-Test uebersprungen: {_e})")
+if _mw_ok:
+    _mw = _main_mod.MainWindow.__new__(_main_mod.MainWindow)
+
+
+    class _TimerStub:
+        def __init__(self):
+            self.active = True
+            self.stopped = 0
+            self.started = 0
+
+        def isActive(self):
+            return self.active
+
+        def stop(self):
+            self.active = False
+            self.stopped += 1
+
+        def start(self):
+            self.active = True
+            self.started += 1
+
+
+    _mw._sync_pause_count = 0
+    _mw.sync_timer = _TimerStub()
+    _mw._on_service_run_started()
+    _mw._on_service_run_started()
+    check("S6) 2x started -> Timer genau 1x gestoppt",
+          not _mw.sync_timer.active and _mw.sync_timer.stopped == 1,
+          f"active={_mw.sync_timer.active} stopped={_mw.sync_timer.stopped}")
+    _mw._on_service_run_finished()
+    check("S7) 1x finished -> Timer bleibt gestoppt (1 Run offen)",
+          not _mw.sync_timer.active, f"active={_mw.sync_timer.active}")
+    _mw._on_service_run_finished()
+    check("S8) 2x finished -> Timer wieder gestartet",
+          _mw.sync_timer.active and _mw.sync_timer.started == 1,
+          f"active={_mw.sync_timer.active} started={_mw.sync_timer.started}")
+
+# 7.3 Numpy-Vektorisierung: GridLinesService (Parität zur Alt-Loop)
+def _grid_ref(df, step_size):
+    rows = []
+    for _i, row in df.iterrows():
+        try:
+            close_val = float(row["close"])
+            center = f_round_to_custom_step(close_val, step_size)
+        except (TypeError, ValueError, KeyError):
+            continue
+        bar_ts = row.get("time")
+        if bar_ts is None:
+            continue
+        try:
+            bar_ts_int = int(bar_ts)
+        except (TypeError, ValueError):
+            continue
+        rows.append({
+            "bar_time": bar_ts_int,
+            "grid_nearest_level": center,
+            "grid_step": step_size,
+            "upper_level": round(center + step_size, 6),
+            "lower_level": round(center - step_size, 6),
+        })
+    return rows
+
+
+_df_gl = pd.DataFrame({
+    "time": [1600000000 + i * 60 for i in range(120)],
+    "open": [30.0] * 120,
+    "high": [30.15] * 120,
+    "low": [29.85] * 120,
+    "close": [30.0 + 0.1 * (i % 7) for i in range(120)],
+})
+_df_gl.loc[50, "close"] = float("nan")  # Alt-Pfad: round(NaN) -> skip
+_gl_res = gl.calculate(_df_gl, {"step_size": 0.5, "steps_around": 4})
+_gl_recs = (_gl_res.get("feature_store_payload") or {}).get("records") or []
+_gl_ref = _grid_ref(_df_gl, 0.5)
+check("V1) grid_lines: Anzahl Records = Referenz (inkl. NaN-Skip)",
+      len(_gl_recs) == len(_gl_ref), f"{len(_gl_recs)} vs {len(_gl_ref)}")
+if len(_gl_recs) == len(_gl_ref):
+    _gl_parity = all(
+        r["bar_time"] == ref["bar_time"]
+        and abs(r["grid_nearest_level"] - ref["grid_nearest_level"]) < 1e-9
+        and abs(r["upper_level"] - ref["upper_level"]) < 1e-9
+        and abs(r["lower_level"] - ref["lower_level"]) < 1e-9
+        for r, ref in zip(_gl_recs, _gl_ref)
+    )
+    check("V2) grid_lines: volle Paritaet zur Alt-Loop", _gl_parity,
+          str(_gl_recs[:2]))
+
+# datetime-Spalte -> Zeilen-Fallback (Parität)
+_df_dt = pd.DataFrame({
+    "time": pd.to_datetime([1600000000, 1600000360], unit="s", utc=True),
+    "open": [30.0, 30.2], "high": [30.15, 30.4],
+    "low": [29.85, 30.1], "close": [30.1, 30.25],
+})
+_res_dt = gl.calculate(_df_dt, {"step_size": 0.5, "steps_around": 4})
+_recs_dt = (_res_dt.get("feature_store_payload") or {}).get("records") or []
+_ref_dt = _grid_ref(_df_dt, 0.5)
+check("V3) grid_lines: datetime-Spalte -> Fallback-Paritaet",
+      len(_recs_dt) == len(_ref_dt) and all(
+          r["bar_time"] == ref["bar_time"]
+          for r, ref in zip(_recs_dt, _ref_dt)),
+      f"{len(_recs_dt)} vs {len(_ref_dt)}")
+
+# 7.4 Numpy-Vektorisierung: ProximityService (Parität zur Alt-Loop)
+def _prox_ref(df, lines_payload, visit_pct, time_window_mins, use_time_filter):
+    tracked_levels = [float(l["price"]) for l in lines_payload]
+    hit_circles, active_hits, feature_rows = [], [], []
+    minutes_ref = []
+    for t in df["time"]:
+        try:
+            minutes_ref.append(
+                datetime.fromtimestamp(int(t), tz=dt_timezone.utc).minute)
+        except (TypeError, ValueError, OSError):
+            minutes_ref.append(0)
+    last_idx = df.index[-1] if len(df) else None
+    for pos, (idx, row) in enumerate(df.iterrows()):
+        time_val = int(row["time"])
+        c_high = float(row["high"])
+        c_low = float(row["low"])
+        row_m = minutes_ref[pos]
+        row_in_time = (f_in_window_around(row_m, 0, time_window_mins)
+                       or f_in_window_around(row_m, 30, time_window_mins))
+        levels_hit = []
+        for lvl in tracked_levels:
+            visit_min = lvl * (1.0 - visit_pct / 100.0)
+            visit_max = lvl * (1.0 + visit_pct / 100.0)
+            touch_high = visit_min <= c_high <= visit_max
+            touch_low = visit_min <= c_low <= visit_max
+            pierce = c_low <= lvl and c_high >= lvl
+            if touch_high or touch_low or pierce:
+                levels_hit.append(lvl)
+                hit_circles.append({
+                    "time": time_val, "price": lvl,
+                    "in_window": bool(row_in_time),
+                })
+                if last_idx is not None and idx == last_idx:
+                    active_hits.append(f_strip_trailing_zeros(lvl))
+        feature_rows.append({
+            "bar_time": time_val, "levels_hit": levels_hit,
+            "is_hit": bool(levels_hit), "in_time_window": bool(row_in_time),
+            "time_window_mins": time_window_mins,
+            "use_time_filter": use_time_filter, "visit_pct": visit_pct,
+        })
+    return feature_rows, hit_circles, active_hits
+
+
+prox = ProximityService()
+_df_prox = pd.DataFrame({
+    "time": [1600000000 + i * 60 for i in range(90)],
+    "open": [30.0] * 90,
+    "high": [30.1] * 90,
+    "low": [29.9] * 90,
+    "close": [30.0] * 90,
+})
+_lines = [{"price": 30.0}, {"price": 30.5}, {"price": 29.5}]
+_ctx = PluginContext(
+    symbol="SILVER", timeframe="M1", mode="batch",
+    shared_state={"g1": _lines}, depends_on=["g1"], instance_id="p1",
+)
+_params_prox = {"visit_pct": 0.05, "time_window_mins": 5,
+                "use_time_filter": True}
+_res_prox = prox.calculate(_df_prox, _params_prox, context=_ctx)
+_rows_p = (_res_prox.get("feature_store_payload") or {}).get("records") or []
+_circles_p = (_res_prox.get("chart_render_payload") or {}).get("hit_circles") or []
+_status_p = (_res_prox.get("chart_render_payload") or {}).get("status_info") or {}
+_active_p = _status_p.get("active_hits") or []
+_ref_rows, _ref_circ, _ref_act = _prox_ref(_df_prox, _lines, 0.05, 5, True)
+check("V4) proximity: #Feature-Rows = Referenz", len(_rows_p) == len(_ref_rows),
+      f"{len(_rows_p)} vs {len(_ref_rows)}")
+check("V5) proximity: #hit_circles = Referenz", len(_circles_p) == len(_ref_circ),
+      f"{len(_circles_p)} vs {len(_ref_circ)}")
+check("V6) proximity: active_hits = Referenz", _active_p == _ref_act,
+      f"{_active_p} vs {_ref_act}")
+_rows_ok = all(
+    r["bar_time"] == ref["bar_time"]
+    and r["levels_hit"] == ref["levels_hit"]
+    and r["is_hit"] == ref["is_hit"]
+    and r["in_time_window"] == ref["in_time_window"]
+    for r, ref in zip(_rows_p, _ref_rows)
+)
+check("V7) proximity: Feature-Rows vollstaendige Paritaet", _rows_ok, "")
+_circ_ok = all(
+    c["time"] == ref["time"] and c["price"] == ref["price"]
+    and c["in_window"] == ref["in_window"]
+    for c, ref in zip(_circles_p, _ref_circ)
+)
+check("V8) proximity: hit_circles vollstaendige Paritaet", _circ_ok, "")
+
+# 7.5 _bar_utc_minutes: vektorisiert vs. datetime-basiert (inkl. neg. Zeiten)
+_ts_m = list(range(1600000000, 1600000000 + 7200, 60)) + [-1, -3600, 0]
+_df_m = pd.DataFrame({"time": _ts_m})
+_check_min = _bar_utc_minutes(_df_m)
+_ref_min = [datetime.fromtimestamp(int(t), tz=dt_timezone.utc).minute
+            for t in _ts_m]
+check("V9) _bar_utc_minutes vektorisiert = datetime-basiert",
+      _check_min == _ref_min, f"{_check_min[:5]} vs {_ref_min[:5]}")
+
+# 7.6 Performance: 10k Bars (Ziel: wenige Millisekunden)
+_big = pd.DataFrame({
+    "time": [1600000000 + i * 60 for i in range(10000)],
+    "open": [30.0] * 10000, "high": [30.1] * 10000,
+    "low": [29.9] * 10000, "close": [30.0] * 10000,
+})
+_ctx_big = PluginContext(
+    symbol="SILVER", timeframe="M1", mode="batch",
+    shared_state={"g1": _lines}, depends_on=["g1"], instance_id="p1",
+)
+_t0 = time.perf_counter()
+prox.calculate(_big, _params_prox, context=_ctx_big)
+_dt_prox = time.perf_counter() - _t0
+_t0 = time.perf_counter()
+gl.calculate(_big, {"step_size": 0.5, "steps_around": 4})
+_dt_gl = time.perf_counter() - _t0
+print(f"   Proximity 10k Bars: {_dt_prox*1000:.1f} ms | "
+      f"grid_lines 10k: {_dt_gl*1000:.1f} ms")
+check("V10) Proximity 10k Bars < 1s (vektorisiert)", _dt_prox < 1.0,
+      f"{_dt_prox:.3f}s")
+check("V11) grid_lines 10k Bars < 1s (vektorisiert)", _dt_gl < 1.0,
+      f"{_dt_gl:.3f}s")
 
 print("-" * 60)
 if FAILURES:
@@ -38909,6 +41031,31 @@ print("LOCKTEST FERTIG")
        </widget>
       </item>
       <item>
+       <widget class="QLabel" name="label_tf_filter">
+        <property name="text">
+         <string>Timeframe:</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QComboBox" name="combo_tf">
+        <property name="minimumSize">
+         <size>
+          <width>150</width>
+          <height>0</height>
+         </size>
+        </property>
+        <property name="toolTip">
+         <string>Timeframe für die gezielte Kontextmenü-Ausführung (MasterTree '▶️ Service(s) ausführen'). 'ALLE Timeframes' führt alle verfügbaren Timeframes nacheinander aus (Multi-TF).</string>
+        </property>
+        <item>
+         <property name="text">
+          <string>ALLE Timeframes</string>
+         </property>
+        </item>
+       </widget>
+      </item>
+      <item>
        <spacer name="horizontalSpacer">
         <property name="orientation">
          <enum>Qt::Orientation::Horizontal</enum>
@@ -38928,6 +41075,16 @@ print("LOCKTEST FERTIG")
         </property>
         <property name="toolTip">
          <string>Aktiviert: Löscht bestehende Feature-Rows und führt Komplett-Scan durch. Deaktiviert: Nur Delta-Update (fehlende Bars).</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="btn_trash_sets">
+        <property name="text">
+         <string>🗑️ Papierkorb</string>
+        </property>
+        <property name="toolTip">
+         <string>P14-05: Gelöschte Service-Sets einsehen, wiederherstellen oder endgültig entfernen (Soft-Delete).</string>
         </property>
        </widget>
       </item>
@@ -38995,7 +41152,17 @@ print("LOCKTEST FERTIG")
            </item>
            <item>
             <property name="text">
+             <string>M2</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
              <string>M5</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>M10</string>
             </property>
            </item>
            <item>
@@ -39021,6 +41188,16 @@ print("LOCKTEST FERTIG")
            <item>
             <property name="text">
              <string>D1</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>W1</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>MN1</string>
             </property>
            </item>
           </widget>
@@ -39188,16 +41365,6 @@ print("LOCKTEST FERTIG")
            </property>
            <property name="toolTip">
             <string>Set löschen (mit Rückfrage). Löschen ist final.</string>
-           </property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QPushButton" name="btn_trash_sets">
-           <property name="text">
-            <string>Papierkorb</string>
-           </property>
-           <property name="toolTip">
-            <string>P14-05: Gelöschte Service-Sets einsehen, wiederherstellen oder endgültig entfernen (Soft-Delete).</string>
            </property>
           </widget>
          </item>
