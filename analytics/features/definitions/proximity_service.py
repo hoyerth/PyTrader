@@ -33,6 +33,7 @@ from datetime import datetime, timezone as dt_timezone
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+import numpy as np
 
 from analytics.features.definitions.grid_math import (
     f_in_window_around,
@@ -48,14 +49,31 @@ from analytics.features.plugins.base_plugin import (
 
 
 def _bar_utc_minutes(df: pd.DataFrame) -> List[int]:
-    """UTC-Minute (0-59) jeder Bar – konsistent zu grid_liquidity.py."""
-    out: List[int] = []
+    """UTC-Minute (0-59) jeder Bar – konsistent zu grid_liquidity.py.
+
+    Phase 16 (05.08.2026): Vektorisierter Fast-Path fuer 'time'-Spalten
+    (epoch-Sekunden, int) – (t // 60) % 60 ist mathematisch identisch zu
+    datetime.fromtimestamp(t, tz=utc).minute (auch fuer negative Zeiten,
+    Python/numpy-Floor-Division). Bereichs-Guard: Zeiten ausserhalb des
+    datetime-basierten Alt-Bereichs fallen auf den OSError-Fallback zurueck
+    (dort wird 0 gesetzt – exakte Alt-Paritaet).
+    """
     if "time" in df.columns:
+        try:
+            import numpy as np
+            t = df["time"].to_numpy(dtype=np.int64)
+            if len(t) == 0 or (int(np.min(t)) >= -62135596800
+                               and int(np.max(t)) < 253402300799):
+                return [int(m) for m in ((t // 60) % 60).tolist()]
+        except (TypeError, ValueError, OSError):
+            pass
+        out: List[int] = []
         for t in df["time"]:
             try:
                 out.append(datetime.fromtimestamp(int(t), tz=dt_timezone.utc).minute)
             except (TypeError, ValueError, OSError):
                 out.append(0)
+        return out
     elif "bar_time" in df.columns:
         t = pd.to_datetime(df["bar_time"])
         if t.dt.tz is not None:
@@ -226,57 +244,90 @@ class ProximityService(PluginFeature):
         tracked_levels = [float(l["price"]) for l in lines_payload]
 
         # --- Proximity & Hit-Logik (exakte Parität zu grid_math.py) ----------
+        # Phase 16 (05.08.2026): Numpy-Vektorisierung statt der O(n*m)-Double-
+        # Loop (df.iterrows() x tracked_levels). Bei 10k+ Lookback-Bars sinkt
+        # die Rechenzeit von mehreren Sekunden auf wenige Millisekunden.
+        # Parität:
+        #   * near = (visit_min <= high <= visit_max) | (visit_min <= low <=
+        #     visit_max) | (low <= lvl <= high) – identische Vergleichs-
+        #     Semantik zu grid_math.py.
+        #   * NaN high/low propagieren in den Vergleichen zu False (kein Hit)
+        #     – wie im Alt-Pfad (Float-Vergleich mit NaN ist False).
+        #   * Reihung hit_circles/levels_hit: zeilen-major, innerhalb einer
+        #     Zeile in tracked_levels-Reihenfolge (lexsort über Zeile+Level).
         hit_circles: List[Dict[str, Any]] = []
         active_hits: List[str] = []
         feature_rows: List[Dict[str, Any]] = []
 
+        n = len(scan_df)
         minutes = _bar_utc_minutes(scan_df)
-        last_idx = scan_df.index[-1] if len(scan_df) else None
+        if n:
+            times = scan_df["time"].to_numpy(dtype=np.int64)
+            high = scan_df["high"].to_numpy(dtype=np.float64)
+            low = scan_df["low"].to_numpy(dtype=np.float64)
+            levels_arr = np.array(tracked_levels, dtype=np.float64)
+            in_win = np.array([
+                (f_in_window_around(m, 0, time_window_mins)
+                 or f_in_window_around(m, 30, time_window_mins))
+                for m in minutes
+            ], dtype=bool)
 
-        for pos, (idx, row) in enumerate(scan_df.iterrows()):
-            time_val = int(row["time"])
-            c_high = float(row["high"])
-            c_low = float(row["low"])
+            levels_hit: List[List[float]] = [[] for _ in range(n)]
+            if len(levels_arr):
+                factor = visit_pct / 100.0
+                vmin = levels_arr * (1.0 - factor)
+                vmax = levels_arr * (1.0 + factor)
+                # Broadcasting: (len(levels), n)-Bool-Matrix – jede Zeile ist
+                # ein Level, jede Spalte eine Bar.
+                near = (
+                    ((vmin[:, None] <= high[None, :]) & (high[None, :] <= vmax[:, None]))
+                    | ((vmin[:, None] <= low[None, :]) & (low[None, :] <= vmax[:, None]))
+                    | ((low[None, :] <= levels_arr[:, None]) & (high[None, :] >= levels_arr[:, None]))
+                )
+                # np.nonzero liefert (Achse-0 = Level, Achse-1 = Bar).
+                lvl_idxs, bar_idxs = np.nonzero(near)
+                if len(lvl_idxs):
+                    # Zeilen-major (Bar aussen) + Level-Reihenfolge innen
+                    # (stabil) – identische Abfolge wie die Alt-Double-Loop.
+                    order = np.lexsort((lvl_idxs, bar_idxs))
+                    bar_sorted = bar_idxs[order]
+                    lvl_sorted = lvl_idxs[order]
+                    starts = np.concatenate(
+                        ([0], np.flatnonzero(np.diff(bar_sorted) != 0) + 1))
+                    ends = np.concatenate((starts[1:], [len(bar_sorted)]))
+                    last_pos = n - 1
+                    for s, e in zip(starts, ends):
+                        r = int(bar_sorted[s])
+                        lvls = [float(x) for x in levels_arr[lvl_sorted[s:e]]]
+                        levels_hit[r] = lvls
+                        t_val = int(times[r])
+                        win_flag = bool(in_win[r])
+                        for lvl in lvls:
+                            # hit_circles ohne Farbe – der INDIKATOR färbt auf
+                            # Basis seines eigenen Schemas (circle_color_std /
+                            # _active) und des in_window-Flags. in_window=True
+                            # wenn die Bar im UTC-Zeitfenster (0/30 ±
+                            # time_window_mins) liegt.
+                            hit_circles.append({
+                                "time": t_val,
+                                "price": lvl,
+                                "in_window": win_flag,
+                            })
+                        if r == last_pos:
+                            active_hits.extend(
+                                f_strip_trailing_zeros(v) for v in lvls)
 
-            row_m = minutes[pos]
-            row_in_time = (
-                f_in_window_around(row_m, 0, time_window_mins)
-                or f_in_window_around(row_m, 30, time_window_mins)
-            )
-
-            levels_hit: List[float] = []
-            for lvl in tracked_levels:
-                visit_min = lvl * (1.0 - visit_pct / 100.0)
-                visit_max = lvl * (1.0 + visit_pct / 100.0)
-
-                touch_high = visit_min <= c_high <= visit_max
-                touch_low = visit_min <= c_low <= visit_max
-                pierce = c_low <= lvl and c_high >= lvl
-                near = touch_high or touch_low or pierce
-
-                if near:
-                    levels_hit.append(lvl)
-                    # hit_circles ohne Farbe – der INDIKATOR färbt auf Basis
-                    # seines eigenen Schemas (circle_color_std / _active) und
-                    # des in_window-Flags. in_window=True wenn die Bar im
-                    # UTC-Zeitfenster (0/30 ± time_window_mins) liegt.
-                    hit_circles.append({
-                        "time": time_val,
-                        "price": lvl,
-                        "in_window": bool(row_in_time),
-                    })
-                    if last_idx is not None and idx == last_idx:
-                        active_hits.append(f_strip_trailing_zeros(lvl))
-
-            feature_rows.append({
-                "bar_time": time_val,
-                "levels_hit": levels_hit,
-                "is_hit": bool(levels_hit),
-                "in_time_window": bool(row_in_time),
-                "time_window_mins": time_window_mins,
-                "use_time_filter": use_time_filter,
-                "visit_pct": visit_pct,
-            })
+            feature_rows = []
+            for pos in range(n):
+                feature_rows.append({
+                    "bar_time": int(times[pos]),
+                    "levels_hit": levels_hit[pos],
+                    "is_hit": bool(levels_hit[pos]),
+                    "in_time_window": bool(in_win[pos]),
+                    "time_window_mins": time_window_mins,
+                    "use_time_filter": use_time_filter,
+                    "visit_pct": visit_pct,
+                })
 
         # --- Status-Info (letzte Bar des Scan-Fensters, Parität zu grid_math.py)
         if len(scan_df):

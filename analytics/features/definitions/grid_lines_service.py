@@ -295,27 +295,65 @@ class GridLinesService(PluginFeature):
         # Pro Bar: grid_nearest_level = center (naechstes Grid-Level zum close),
         # upper/lower = center +/- step_size (deterministische Klammer um den
         # close). Unabhaengig von show_lines – die Mathematik gilt immer.
+        #
+        # Phase 16 (05.08.2026): Numpy-Vektorisierung statt df.iterrows() –
+        # 10k+ Lookback-Bars laufen in wenigen Millisekunden. Exakte Paritaet:
+        #   * NaN/Inf-close wird uebersprungen (Alt-Pfad: round(NaN) wirft
+        #     ValueError -> continue; np.isfinite liefert dieselbe Maske).
+        #   * np.round (half-to-even) ist identisch zu Pythons round() fuer
+        #     dieselben float64-Werte; step<=0 liefert close unveraendert
+        #     (f_round_to_custom_step-Parität).
+        #   * Nicht int-konvertierbare 'time'-Spalten (z.B. datetime64) fallen
+        #     auf den identischen Zeilenpfad zurueck.
         feature_rows: List[Dict[str, Any]] = []
-        for _i, row in df.iterrows():
+        if "time" in df.columns and "close" in df.columns and len(df):
             try:
-                close_val = float(row["close"])
-                center = f_round_to_custom_step(close_val, step_size)
-            except (TypeError, ValueError, KeyError):
-                continue
-            bar_ts = row.get("time")
-            if bar_ts is None:
-                continue
-            try:
-                bar_ts_int = int(bar_ts)
+                import numpy as np
+                closes = df["close"].to_numpy(dtype=np.float64)
+                t_raw = df["time"].to_numpy()
+                if np.issubdtype(t_raw.dtype, np.datetime64):
+                    # Datetime-Spalte: Zeilenpfad (Paritaet zur Alt-Logik).
+                    raise TypeError("datetime-Spalte -> Zeilen-Fallback")
+                times = t_raw.astype(np.int64)
+                valid = np.isfinite(closes)
+                if step_size > 0:
+                    inv_step = 1.0 / step_size
+                    centers = np.round(closes[valid] * inv_step) / inv_step
+                else:
+                    centers = closes[valid]
+                ts_list = times[valid].tolist()
+                c_list = [float(c) for c in centers.tolist()]
+                for bar_ts_int, center in zip(ts_list, c_list):
+                    feature_rows.append({
+                        "bar_time": int(bar_ts_int),
+                        "grid_nearest_level": center,
+                        "grid_step": step_size,
+                        "upper_level": round(center + step_size, 6),
+                        "lower_level": round(center - step_size, 6),
+                    })
             except (TypeError, ValueError):
-                continue
-            feature_rows.append({
-                "bar_time": bar_ts_int,
-                "grid_nearest_level": center,
-                "grid_step": step_size,
-                "upper_level": round(center + step_size, 6),
-                "lower_level": round(center - step_size, 6),
-            })
+                # Fallback: Spalten nicht numpy-konvertierbar – identischer
+                # Zeilenpfad wie vor der Vektorisierung.
+                for _i, row in df.iterrows():
+                    try:
+                        close_val = float(row["close"])
+                        center = f_round_to_custom_step(close_val, step_size)
+                    except (TypeError, ValueError, KeyError):
+                        continue
+                    bar_ts = row.get("time")
+                    if bar_ts is None:
+                        continue
+                    try:
+                        bar_ts_int = int(bar_ts)
+                    except (TypeError, ValueError):
+                        continue
+                    feature_rows.append({
+                        "bar_time": bar_ts_int,
+                        "grid_nearest_level": center,
+                        "grid_step": step_size,
+                        "upper_level": round(center + step_size, 6),
+                        "lower_level": round(center - step_size, 6),
+                    })
 
         return {
             "feature_store_payload": {

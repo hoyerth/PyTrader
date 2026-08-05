@@ -18,7 +18,8 @@ from typing import Any, Dict
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QSizePolicy, QSpinBox, QVBoxLayout, QWidget,
+    QLabel, QLineEdit, QPushButton, QSizePolicy, QSpinBox, QVBoxLayout,
+    QWidget,
 )
 
 
@@ -256,6 +257,10 @@ class ServiceParamColumnsMixin:
         # Phase 14 P14-01: Individuelle Instanz-Beschreibung (bearbeitbar) –
         # wird in ServiceInstanceConfig.description gespeichert und in
         # Tooltip + Info-Dialog angezeigt.
+        # Phase 16 (05.08.2026): Stift-Button (✏️) neben dem Beschreibungsfeld
+        # oeffnet den modalen ServiceDescriptionEditDialog (mehrzeiliger
+        # QTextEdit); [Speichern] persistiert via Repo + EventBus. Die
+        # QLineEdit bleibt als schnelles Einzeilen-Feld erhalten.
         desc_row = QHBoxLayout()
         desc_label = QLabel("Beschreibung:")
         desc_edit = QLineEdit()
@@ -265,6 +270,15 @@ class ServiceParamColumnsMixin:
         desc_edit.textChanged.connect(lambda _t, iid=iid: self._update_service_tooltip(iid))
         desc_row.addWidget(desc_label)
         desc_row.addWidget(desc_edit)
+        desc_edit_btn = QPushButton("✏️")
+        desc_edit_btn.setObjectName("btn_desc_edit")
+        desc_edit_btn.setToolTip(
+            "Beschreibung bearbeiten – öffnet den mehrzeiligen Editor")
+        desc_edit_btn.setFixedWidth(32)
+        desc_edit_btn.setCursor(Qt.PointingHandCursor)
+        desc_edit_btn.clicked.connect(
+            lambda _=False, iid=iid: self._open_service_desc_editor(iid))
+        desc_row.addWidget(desc_edit_btn)
         vl.addLayout(desc_row)
 
         # Normale (Nicht-Expert-, Nicht-Darstellungs-)Parameter

@@ -31,11 +31,23 @@ class EventBus(QObject):
     - profile_changed   : Analytics-Profil wurde geaendert (15.03, Payload =
                           Profil-Name/-ID).
     - service_set_changed: Service-Set wurde gespeichert/geloescht (15.02).
+    - service_run_started: Intensiver Service-Run/Scan wurde gestartet
+                           (ServiceWindow) – MainWindow pausiert den 45s-
+                           sync_timer (Concurrency-Guard, 05.08.2026).
+    - service_run_finished: Alle gestarteten Service-Runs/Scans sind beendet
+                            (Referenzzähler auf 0) – MainWindow startet den
+                            sync_timer wieder.
     """
 
     favorites_changed = Signal()
     profile_changed = Signal(str)
     service_set_changed = Signal()
+    # Phase 16 (05.08.2026): Concurrency-Guard gegen Konflikte zwischen
+    # Service-Berechnungen (SetRunWorker/ServiceRunWorker/HistoricalScanner)
+    # und dem 45s-Hintergrund-Sync (sync_timer in main.py). Entkoppelt via
+    # EventBus – das ServiceWindow kennt den MainWindow NICHT (IoC).
+    service_run_started = Signal()
+    service_run_finished = Signal()
 
     _instance: ClassVar[Optional["EventBus"]] = None
 

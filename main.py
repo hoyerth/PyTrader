@@ -44,6 +44,7 @@ from serviceui.service_win import ServiceWindow
 from analytics.ui.analytics_win import AnalyticsWindow
 from properties_win import PropertiesWindow
 from config.app_settings import AppSettings
+from config.event_bus import event_bus
 from analytics.background_workers.live_analyzer import LiveAnalyzer
 
 # ==============================================================================
@@ -272,6 +273,16 @@ class MainWindow(QMainWindow):
         self.sync_timer.setInterval(45000)
         self.sync_timer.timeout.connect(self.trigger_background_sync)
         self.sync_timer.start()
+
+        # Phase 16 (05.08.2026): Concurrency-Guard – solange im ServiceWindow
+        # intensive Service-Berechnungen laufen (SetRunWorker /
+        # ServiceRunWorker / HistoricalScanner), wird der 45s-sync_timer
+        # pausiert (EventBus, entkoppelt – kein Fenster-Wissen). Referenz-
+        # zaehler, damit mehrere parallele Runs den Timer nur EINMAL stoppen
+        # und erst nach dem letzten Abschluss wieder starten.
+        self._sync_pause_count: int = 0
+        event_bus.service_run_started.connect(self._on_service_run_started)
+        event_bus.service_run_finished.connect(self._on_service_run_finished)
 
         self.tick_worker: LiveTickWorker = LiveTickWorker(self.get_currently_active_pairs)
         self.tick_worker.ticks_ready.connect(self.on_ticks_ready)
@@ -504,6 +515,30 @@ class MainWindow(QMainWindow):
         self.sync_thread = DataSyncWorker()
         self.sync_thread.sync_completed.connect(self.on_sync_completed)
         self.sync_thread.start()
+
+    # -------------------------------------------------------------------------
+    # Phase 16 (05.08.2026): Concurrency-Guard für den 45s-sync_timer
+    # -------------------------------------------------------------------------
+    @Slot()
+    def _on_service_run_started(self) -> None:
+        """Pausiert den sync_timer, sobald eine Service-Berechnung startet."""
+        self._sync_pause_count += 1
+        if self._sync_pause_count == 1 and self.sync_timer.isActive():
+            self.sync_timer.stop()
+
+    @Slot()
+    def _on_service_run_finished(self) -> None:
+        """Startet den sync_timer, sobald die letzte Service-Berechnung
+        abgeschlossen ist (Referenzzähler auf 0)."""
+        if self._sync_pause_count > 0:
+            self._sync_pause_count -= 1
+        if self._sync_pause_count != 0:
+            return
+        app = QApplication.instance()
+        if getattr(app, '_is_quitting', False):
+            return
+        if not self.sync_timer.isActive():
+            self.sync_timer.start()
 
     def _dispatch_tick_map(self, ticks_map: Dict[str, Dict[str, float | int]]) -> None:
         """Verteilt Ticks an alle geöffneten Chartfenster."""

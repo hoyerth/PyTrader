@@ -18,13 +18,108 @@ Design-Regeln:
 
 from typing import Any, Dict, List, Optional
 
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
+    QLabel,
     QPushButton,
     QTextBrowser,
+    QTextEdit,
     QVBoxLayout,
 )
+
+
+class ServiceDescriptionEditDialog(QDialog):
+    """Modaler Bearbeitungs-Dialog für die Instanz-/Set-Beschreibung.
+
+    Phase 16 (05.08.2026): Ersetzt die Read-Only-Ansicht im Service Window
+    für editierbare Beschreibungen (ServiceInstanceConfig.description bzw.
+    ServiceSetDefinition.description). Reines UI-Widget (kein Repo-Zugriff,
+    kein EventBus – IoC): Der Aufrufer (ServiceWindow) verbindet das
+    `save_requested`-Signal und persistiert via ServiceSetRepository +
+    `event_bus.service_set_changed`.
+
+    Aufbau:
+      * Optionale Kopfzeile: header_line (z.B. 'aktiv/im <Indikator>') +
+        Instanz-ID / Plugin-ID.
+      * Mehrzeiliges QTextEdit für die Beschreibung.
+      * Buttons [Abbrechen] / [Speichern] – [Speichern] emittiert
+        `save_requested(neuer_Text)` und schliesst den Dialog mit accept().
+
+    Headless-fähig: Der Konstruktor startet KEINEN Event-Loop (kein
+    exec_()); der Aufrufer entscheidet, wann modal geöffnet wird.
+    """
+
+    #: Wird beim Klick auf [Speichern] mit dem neuen Beschreibungstext
+    #: emittiert (der Orchestrator persistiert via Repo + EventBus).
+    save_requested = Signal(str)
+
+    def __init__(
+        self,
+        parent=None,
+        *,
+        instance_id: str = "",
+        plugin_id: str = "",
+        header_line: str = "",
+        description: str = "",
+        title: str = "Beschreibung bearbeiten",
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(480)
+        self.setMinimumHeight(260)
+
+        layout = QVBoxLayout(self)
+
+        head_parts: List[str] = []
+        if header_line and str(header_line).strip():
+            head_parts.append(
+                f"<b>{self._html_escape(header_line)}</b>")
+        info_bits: List[str] = []
+        if instance_id:
+            info_bits.append(f"<b>Instanz:</b> {self._html_escape(instance_id)}")
+        if plugin_id:
+            info_bits.append(f"<i>({self._html_escape(plugin_id)})</i>")
+        if info_bits:
+            head_parts.append(" ".join(info_bits))
+        if head_parts:
+            head = QLabel("<br>".join(head_parts))
+            head.setWordWrap(True)
+            layout.addWidget(head)
+
+        self._editor = QTextEdit()
+        self._editor.setPlainText(str(description or ""))
+        self._editor.setPlaceholderText(
+            "Individuelle Anmerkung für diese Instanz (optional)")
+        layout.addWidget(self._editor, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        cancel_btn = QPushButton("Abbrechen")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        save_btn = QPushButton("Speichern")
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self._on_save)
+        btn_row.addWidget(save_btn)
+        layout.addLayout(btn_row)
+
+    @staticmethod
+    def _html_escape(value: str) -> str:
+        """Minimaler HTML-Escape für Kopfzeilen-Strings (kein externer Import)."""
+        return (
+            str(value)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
+    def _on_save(self) -> None:
+        """[Speichern]: Emittiert save_requested mit dem aktuellen Text und
+        schliesst den Dialog mit accept() (keine Repo-/DB-Logik hier)."""
+        self.save_requested.emit(self._editor.toPlainText())
+        self.accept()
 
 
 class ServiceDescriptionDialog(QDialog):

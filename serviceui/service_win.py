@@ -43,7 +43,10 @@ except ImportError:  # pragma: no cover
         return obj is not None
 
 from analytics.background_workers.historical_scanner import HistoricalScanner
-from analytics.engine.description_dialog import ServiceDescriptionDialog
+from analytics.engine.description_dialog import (
+    ServiceDescriptionDialog,
+    ServiceDescriptionEditDialog,
+)
 from analytics.engine.service_set_repository import ServiceSetRepository
 from analytics.engine.set_evaluator import ServiceSetEvaluator
 from persistent_win import PersistentWindow, register_persistent_window
@@ -105,6 +108,13 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # USER-REQ (P14-03): Preisskala-Praezision je Symbol fuer die 6
         # Custom-Level-Eingabefelder (prox_level1..6). Lazy + gecacht.
         self._symbol_precision: Optional[int] = None
+        # Phase 16 (05.08.2026): Concurrency-Guard – Referenzzähler für die
+        # pausierten 45s-Hintergrund-Syncs (sync_timer in main.py). Bei
+        # jedem beginnenden Service-Run/Scan wird das EventBus-Signal
+        # service_run_started emittiert (nur beim Übergang 0→1), nach dem
+        # letzten Abschluss service_run_finished (1→0). Dadurch wird der
+        # Sync-Timer für die Dauer intensiver Berechnungen geblockt.
+        self._sync_guard_count: int = 0
 
         # Phase 13 Schritt 8: Service-Set-Adapler für die generische
         # Neu-/Speichern-/Löschen-Mechanik (NamedItemActionsMixin) – exakt
@@ -513,6 +523,39 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                 pass
 
     # -------------------------------------------------------------------------
+    # Phase 16 (05.08.2026): Concurrency-Guard gegen den 45s-Hintergrund-Sync
+    # -------------------------------------------------------------------------
+    def _begin_sync_guard(self) -> None:
+        """Blockt den 45s-Hintergrund-Sync (sync_timer in main.py).
+
+        Erhoeht den Referenzzaehler und emittiert `service_run_started`
+        ausschliesslich beim Uebergang 0→1 – mehrere parallele Runs/Scans
+        (Worker + HistoricalScanner) pausieren den Sync nur EINMAL.
+        """
+        self._sync_guard_count += 1
+        if self._sync_guard_count == 1:
+            try:
+                event_bus.service_run_started.emit()
+            except (RuntimeError, AttributeError):
+                pass
+
+    def _end_sync_guard(self) -> None:
+        """Gibt den 45s-Hintergrund-Sync wieder frei.
+
+        Senkt den Referenzzaehler; erst beim Uebergang 1→0 (alle
+        Service-Berechnungen abgeschlossen) wird `service_run_finished`
+        emittiert und der Sync-Timer im MainWindow wieder gestartet.
+        """
+        if self._sync_guard_count <= 0:
+            return
+        self._sync_guard_count -= 1
+        if self._sync_guard_count == 0:
+            try:
+                event_bus.service_run_finished.emit()
+            except (RuntimeError, AttributeError):
+                pass
+
+    # -------------------------------------------------------------------------
     # 05.08.2026: Gezielte Kontextmenue-Ausfuehrung (Service(s) ausfuehren)
     # -------------------------------------------------------------------------
 
@@ -543,6 +586,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self._run_worker.log_message.connect(self.log)
         self._run_worker.run_finished.connect(self._on_run_worker_finished)
         self._run_worker.run_failed.connect(self._on_run_worker_failed)
+        # Phase 16: 45s-Hintergrund-Sync pausieren, solange der Run laeuft.
+        self._begin_sync_guard()
         self._run_worker.start()
 
     @Slot(str, str)
@@ -629,11 +674,15 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         das ServiceSelectorModel hat dadurch das neue MAX(created_at) gelesen
         und der MasterTree zeigt das Datum '(DD.MM.JJ)' live an.
         """
+        # Phase 16: 45s-Hintergrund-Sync wieder freigeben.
+        self._end_sync_guard()
         self.log(f"Ausführung abgeschlossen: {stored} Feature-Row(s) im "
                  f"feature_store gespeichert ({scope_id}).")
 
     @Slot(str, str)
     def _on_run_worker_failed(self, scope_id: str, error: str) -> None:
+        # Phase 16: 45s-Hintergrund-Sync auch bei Fehler freigeben.
+        self._end_sync_guard()
         self.log(f"FEHLER bei Ausführung ({scope_id}): {error}")
 
     def _persist_current_set(self, action: str) -> None:
@@ -1076,6 +1125,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self.scanner.progress_updated.connect(self.on_progress)
         self.scanner.scan_finished.connect(self.on_finished)
         self.scanner.log_message.connect(self.log)
+        # Phase 16: 45s-Hintergrund-Sync pausieren, solange der Scan laeuft.
+        self._begin_sync_guard()
         self.scanner.start()
 
     @Slot(str, int, int)
@@ -1086,6 +1137,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
 
     @Slot(str, int)
     def on_finished(self, symbol: str, count: int):
+        # Phase 16: 45s-Hintergrund-Sync nach dem Scan wieder freigeben.
+        self._end_sync_guard()
         self._elapsed_timer.stop()
         self.btn_start.setEnabled(True)
         self.log(f"Scan für {symbol} beendet: {count} Feature-Rows geschrieben.")
@@ -1519,41 +1572,163 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         dlg = ServiceDescriptionDialog.from_plugin(plugin, instance_id=iid, config=cfg, parent=self)
         dlg.exec()
 
+    # -------------------------------------------------------------------------
+    # Phase 16 (05.08.2026): Modaler Beschreibungs-Editor (Service & Set)
+    # -------------------------------------------------------------------------
+    def _open_service_desc_editor(self, instance_id: str) -> None:
+        """Oeffnet den modalen ServiceDescriptionEditDialog fuer die Instanz-
+        Beschreibung (Stift-Button im Parameter-Panel).
+
+        Phase 16: Bearbeitet AUSSCHLIESSLICH die Instanz-Beschreibung
+        (ServiceInstanceConfig.description) – kein Plugin-Metadaten-Fallback,
+        keine Verarbeitung von Plugin-Beschreibungen im Service Window.
+        """
+        if not instance_id:
+            return
+        cfg: Dict[str, Any] = {}
+        if self._current_set_definition:
+            cfg = dict((self._current_set_definition.get("services") or {})
+                       .get(instance_id, {}))
+        desc_ctrl = self._service_desc_controls.get(instance_id)
+        if desc_ctrl is not None and _qt_valid(desc_ctrl):
+            cfg["description"] = desc_ctrl.text()
+        plugin_id = cfg.get("plugin_id") or instance_id
+        dlg = ServiceDescriptionEditDialog(
+            parent=self,
+            instance_id=instance_id,
+            plugin_id=plugin_id,
+            header_line=self._info_header_tooltip(str(plugin_id)),
+            description=str(cfg.get("description") or ""),
+            title="Service-Beschreibung bearbeiten",
+        )
+        dlg.save_requested.connect(
+            lambda desc, iid=instance_id:
+            self._save_instance_description(self._current_set_id or "", iid, desc))
+        dlg.exec()
+
+    def _save_instance_description(self, set_id: str, instance_id: str,
+                                   new_desc: str) -> None:
+        """Persistiert eine geaenderte Instanz-Beschreibung.
+
+        Phase 16 (05.08.2026): Single Source of Truth – die Instanz-
+        Beschreibung gehoert ausschliesslich in
+        `ServiceInstanceConfig.description` (JSON-Payload des Service-Sets in
+        app_data.duckdb, Feld definition['services'][instance_id]
+        ['description']). Kein Plugin-Fallback.
+
+        * Editor-Spalte (QLineEdit) + Tooltip werden live aktualisiert.
+        * Persistenz via ServiceSetRepository.save_set() + EventBus.
+        """
+        clean = (new_desc or "").strip()
+        # Live-Update im Editor (setText feuert textChanged → Tooltip-Sync)
+        desc_ctrl = self._service_desc_controls.get(instance_id)
+        if desc_ctrl is not None and _qt_valid(desc_ctrl):
+            desc_ctrl.setText(clean)
+        # In der geladenen Definition nachziehen (sofortige Folge-Speicherung)
+        if self._current_set_definition is not None:
+            cfg = (self._current_set_definition.get("services") or {}).get(instance_id)
+            if isinstance(cfg, dict):
+                cfg["description"] = clean
+        if not set_id:
+            self.log(f"Instanz-Beschreibung '{instance_id}' aktualisiert "
+                     f"(Set noch nicht gespeichert).")
+            return
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            self.log(f"FEHLER beim Laden des Sets ({set_id}): {e}")
+            return
+        if not definition:
+            self.log(f"Set '{set_id}' nicht gefunden – Beschreibung nicht "
+                     f"gespeichert.")
+            return
+        services = definition.get("services") or {}
+        if instance_id in services:
+            services[instance_id]["description"] = clean
+        definition["services"] = services
+        try:
+            self.set_repo.save_set(definition)
+            event_bus.service_set_changed.emit()
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern der Instanz-Beschreibung: {e}")
+            return
+        self.log(f"Instanz-Beschreibung '{instance_id}' gespeichert.")
+
+    def _save_set_description(self, set_id: str, new_desc: str) -> None:
+        """Persistiert die Set-Beschreibung (ServiceSetDefinition.description).
+
+        Phase 16 (05.08.2026): analog zur Instanz-Beschreibung – Single
+        Source of Truth ist das JSON-Payload des Sets in app_data.duckdb.
+        """
+        clean = (new_desc or "").strip()
+        if self.edit_set_description is not None and _qt_valid(self.edit_set_description):
+            self.edit_set_description.setText(clean)
+        if self._current_set_definition is not None and \
+                self._current_set_definition.get("set_id") == set_id:
+            self._current_set_definition["description"] = clean
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            self.log(f"FEHLER beim Laden des Sets ({set_id}): {e}")
+            return
+        if not definition:
+            self.log(f"Set '{set_id}' nicht gefunden – Beschreibung nicht "
+                     f"gespeichert.")
+            return
+        definition["description"] = clean
+        try:
+            self.set_repo.save_set(definition)
+            event_bus.service_set_changed.emit()
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern der Set-Beschreibung: {e}")
+            return
+        self.log(f"Set-Beschreibung '{set_id}' gespeichert.")
+
     @Slot(str, str, str)
     def _on_tree_info_requested(self, set_id: str, service_id: str,
                                 plugin_id: str) -> None:
-        """Oeffnet den ServiceDescriptionDialog fuer die Info-Button-Zeile.
+        """Oeffnet den Beschreibungs-Editor / -Dialog fuer die Info-Button-Zeile.
 
         Bugfix 05.08.2026: Der Info-Button sitzt jetzt direkt im MasterTree
         (Spalte 1) statt in der Box 'Service-Sets (Phase 13)'. Je nach
-        Zeilentyp wird der passende Dialog geoeffnet:
+        Zeilentyp:
 
-          * Service-Zeile:  from_plugin (Instanz + Config + header_line)
-          * Plugin-Zeile:   from_plugin (ohne Instanz, header_line)
-          * Set-Zeile:      from_set (Set-Name/-Beschreibung/-Services,
-                            header_line)
+          * Service-Zeile:  ServiceDescriptionEditDialog (Instanz-Beschreibung
+                            editierbar, header_line = 'aktiv/im <Indikator>').
+          * Set-Zeile:      ServiceDescriptionEditDialog (Set-Beschreibung
+                            editierbar, header_line aus _info_set_tooltip).
+          * Plugin-Zeile:   Read-Only ServiceDescriptionDialog (Plugin-Info,
+                            ohne Instanz) – Phase 16: 'ohne Instanz ausgenommen'
+                            von der Editierbarkeit.
 
-        Die ERSTE Dialog-Zeile ist der bisherige Tooltip-Text
-        ('aktiv/im <Indikator>'), danach folgt eine Leerzeile und dann der
-        Beschreibungstext (header_line-Rendering im Dialog).
+        Phase 16 (05.08.2026): Im Service Window werden keine Plugin-
+        Beschreibungen verarbeitet – editierbar sind ausschliesslich die
+        Instanz- und die Set-Beschreibung.
         """
         model = getattr(self.service_selector, "model", None)
         if model is None:
             return
         try:
-            # 1) Service-Zeile (set_id + service_id)
+            # 1) Service-Zeile (set_id + service_id) – editierbar
             if service_id and set_id:
                 cfg = model.find_service(set_id, service_id) or {}
                 pid = str(cfg.get("plugin_id") or service_id)
-                plugin = self._resolve_info_plugin(pid)
-                if plugin is None:
-                    return
-                dlg = ServiceDescriptionDialog.from_plugin(
-                    plugin, instance_id=service_id, config=cfg, parent=self,
-                    header_line=self._info_header_tooltip(pid))
+                dlg = ServiceDescriptionEditDialog(
+                    parent=self,
+                    instance_id=service_id,
+                    plugin_id=pid,
+                    header_line=self._info_header_tooltip(pid),
+                    description=str(cfg.get("description") or ""),
+                    title="Service-Beschreibung bearbeiten",
+                )
+                dlg.save_requested.connect(
+                    lambda desc, s=set_id, i=service_id:
+                    self._save_instance_description(s, i, desc))
                 dlg.exec()
                 return
-            # 2) Plugin-Zeile (nur plugin_id; set_id = Gruppenkennung)
+            # 2) Plugin-Zeile (nur plugin_id; set_id = Gruppenkennung) –
+            #    Read-Only-Info (Phase 16: ohne Instanz von Editierung
+            #    ausgenommen; Plugin-Metadaten werden NICHT bearbeitet).
             if plugin_id and not service_id:
                 plugin = self._resolve_info_plugin(plugin_id)
                 if plugin is None:
@@ -1563,15 +1738,22 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                     header_line=self._info_header_tooltip(plugin_id))
                 dlg.exec()
                 return
-            # 3) Set-Zeile (nur set_id)
+            # 3) Set-Zeile (nur set_id) – editierbar (Set-Beschreibung)
             if set_id and not service_id and not plugin_id:
                 set_def = model.find_set(set_id)
                 if not set_def:
                     self.log(f"Set '{set_id}' nicht gefunden.")
                     return
-                dlg = ServiceDescriptionDialog.from_set(
-                    set_def, parent=self,
-                    header_line=self._info_set_tooltip(set_def))
+                dlg = ServiceDescriptionEditDialog(
+                    parent=self,
+                    instance_id="",
+                    plugin_id=str(set_def.get("display_name") or set_id),
+                    header_line=self._info_set_tooltip(set_def),
+                    description=str(set_def.get("description") or ""),
+                    title="Set-Beschreibung bearbeiten",
+                )
+                dlg.save_requested.connect(
+                    lambda desc, s=set_id: self._save_set_description(s, desc))
                 dlg.exec()
                 return
         except (RuntimeError, AttributeError) as e:
@@ -1763,10 +1945,14 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self._set_run_worker.log_message.connect(self.log)
         self._set_run_worker.run_finished.connect(self._on_set_run_finished)
         self._set_run_worker.run_failed.connect(self._on_set_run_failed)
+        # Phase 16: 45s-Hintergrund-Sync pausieren, solange der Run laeuft.
+        self._begin_sync_guard()
         self._set_run_worker.start()
 
     @Slot(str, int)
     def _on_set_run_finished(self, set_id: str, count: int) -> None:
+        # Phase 16: 45s-Hintergrund-Sync wieder freigeben.
+        self._end_sync_guard()
         if self.btn_execute_set:
             self.btn_execute_set.setEnabled(True)
             self.btn_execute_set.setText("Ausführen")
@@ -1774,6 +1960,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
 
     @Slot(str, str)
     def _on_set_run_failed(self, set_id: str, error: str) -> None:
+        # Phase 16: 45s-Hintergrund-Sync auch bei Fehler freigeben.
+        self._end_sync_guard()
         if self.btn_execute_set:
             self.btn_execute_set.setEnabled(True)
             self.btn_execute_set.setText("Ausführen")
