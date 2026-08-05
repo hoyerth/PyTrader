@@ -92,8 +92,34 @@ set_repo = ServiceSetRepository(db_path=TEST_DB)
 state_mgr = StateManager(db_path=TEST_DB)
 registry = PluginRegistry()
 
+# 05.08.2026 (Ausfuehrungsdatum): Eigene Test-Feature-Store-DB unter test/
+# (Konvention: alle Test-DBs unter test/). Eine proximity-Row mit aktuellem
+# created_at simuliert die letzte Ausfuehrung -> 'DD.MM.JJ' im MasterTree.
+TEST_FS_DB = os.path.join(TEST_DIR, "p15_s2_execdate_test.duckdb")
+if os.path.exists(TEST_FS_DB):
+    os.remove(TEST_FS_DB)
+import duckdb as _duckdb  # noqa: E402
+_fs_con = _duckdb.connect(TEST_FS_DB)
+_fs_con.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR, timeframe VARCHAR, bar_time TIMESTAMPTZ,
+        ema_diff DOUBLE, rsi_14 DOUBLE, atr_normalized DOUBLE,
+        created_at TIMESTAMP DEFAULT current_timestamp,
+        feature_id VARCHAR, plugin_version VARCHAR, feature_data JSON
+    )
+""")
+_fs_con.execute("""
+    INSERT INTO feature_store (symbol, timeframe, bar_time, feature_id,
+                               plugin_version, feature_data)
+    VALUES ('SILVER', 'M1', current_timestamp, 'proximity', '1.0.0',
+            '{"schema_version":"1.0.0"}')
+""")
+_fs_con.close()
+from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
+fs_reader = FeatureStoreReader(db_path=TEST_FS_DB)
+
 model = ServiceSelectorModel(set_repo=set_repo, state_manager=state_mgr,
-                             registry=registry)
+                             registry=registry, feature_store_reader=fs_reader)
 
 plugins = model.get_plugins()
 print(f"   Plugins: {sorted(plugins.keys())}")
@@ -267,7 +293,9 @@ model.refresh()
 full = ServiceSelectorWidget(mode=ServiceSelectorWidget.MODE_FULL_EDIT,
                              model=model)
 check("F1) MasterTree vorhanden", full.master_tree is not None)
-check("F2) Toolbar vorhanden", full.toolbar is not None)
+# 05.08.2026: CRUD-/Order-Buttons oberhalb des Baums entfernt – der
+# MasterTree hat die volle vertikale Hoehe (alle Aktionen via Kontextmenue).
+check("F2) Keine Toolbar mehr (volle Baum-Hoehe)", full.toolbar is None)
 mt = full.master_tree
 check("F3) 3 Top-Level-Gruppen", mt.topLevelItemCount() == 3,
       str(mt.topLevelItemCount()))
@@ -429,6 +457,52 @@ check("F7) current_selection() liefert Set+Service",
       str(sel2))
 
 # ---------------------------------------------------------------------------
+# J) Ausfuehrungsdatum (feature_store) + Kontextmenue-Run-Signale (05.08.2026)
+# ---------------------------------------------------------------------------
+from datetime import datetime  # noqa: E402
+today_str = datetime.now().strftime("%d.%m.%y")
+
+check("J1) last_execution_date('proximity') = heute (DD.MM.JJ)",
+      model.last_execution_date("proximity") == today_str,
+      model.last_execution_date("proximity"))
+check("J2) Fallback '(--.--.--)' ohne feature_store-Eintrag",
+      model.last_execution_date("grid_lines") == "(--.--.--)",
+      model.last_execution_date("grid_lines"))
+
+svc_nodes = model.build_tree()[0]["children"][0]["services"]
+check("J3) build_tree-Service-Node traegt last_execution",
+      all("last_execution" in s for s in svc_nodes),
+      str([s.get("last_execution") for s in svc_nodes]))
+
+# MasterTree-Label: 'instance_id (DD.MM.JJ)' – prox_1 (heute), grid_1 ohne
+# Store-Eintrag '(--.--.--)'. Der Baum repopuliert ueber data_changed.
+model.refresh()
+_app.processEvents()
+# Nach dem Repopulate sind die alten C++-Items zerstoert – set_group neu holen.
+set_group = mt.topLevelItem(0)
+svc_items = [set_group.child(0).child(i) for i in range(set_group.child(0).childCount())]
+prox_label = next((i.text(0) for i in svc_items if i.text(0).startswith("prox_1")), "")
+grid_label = next((i.text(0) for i in svc_items if i.text(0).startswith("grid_1")), "")
+check("J4) prox_1-Zeile zeigt '(DD.MM.JJ)'",
+      prox_label == f"prox_1 ({today_str})", prox_label)
+check("J5) grid_1-Zeile zeigt Fallback '(--.--.--)'",
+      grid_label == "grid_1 (--.--.--)", grid_label)
+
+# Kontextmenue-Run-Signale sind verbindbar (Emission erfolgt aus dem
+# Kontextmenue; der Orchestrator verknuepft sie mit seinen Run-Handlern).
+run_svc_calls = []
+run_set_calls = []
+mt.run_service_requested.connect(
+    lambda s, i: run_svc_calls.append((s, i)))
+mt.run_set_requested.connect(lambda s: run_set_calls.append(s))
+mt.run_service_requested.emit(set_id, "prox_1")
+mt.run_set_requested.emit(set_id)
+check("J6) run_service_requested(set_id, instance_id) emittierbar",
+      run_svc_calls == [(set_id, "prox_1")], str(run_svc_calls))
+check("J7) run_set_requested(set_id) emittierbar",
+      run_set_calls == [set_id], str(run_set_calls))
+
+# ---------------------------------------------------------------------------
 # H) Info-Button -> Beschreibungs-Dialog (header_line / from_set / from_plugin)
 # ---------------------------------------------------------------------------
 from analytics.engine.description_dialog import ServiceDescriptionDialog  # noqa: E402
@@ -491,6 +565,10 @@ check("G2) Modell reagiert auf EventBus (Set-Update)",
 # ---------------------------------------------------------------------------
 try:
     os.remove(TEST_DB)
+except OSError:
+    pass
+try:
+    os.remove(TEST_FS_DB)
 except OSError:
     pass
 

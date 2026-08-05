@@ -9,6 +9,9 @@ generische Service-Auswahl (ServiceSelectorWidget) auf. Quellen:
   * `PluginRegistry`                          – alle verfuegbaren Plugins
   * `StateManager.load_all_instances()`       – Live-Status "aktiv im Chart"
     (indicators_state[*]['active'] == True)
+  * `FeatureStoreReader.fetch_last_execution_dates()` – Datum der letzten
+    Ausfuehrung je feature_id (MAX(created_at) in analytics.duckdb/
+    feature_store) fuer die MasterTree-Anzeige 'Service_Name (DD.MM.JJ)'
 
 Der Model hoert auf `EventBus.service_set_changed` und aktualisiert sich
 automatisch in allen Fenstern (Invariante 5: schwellenfreie Entkopplung).
@@ -96,6 +99,7 @@ class ServiceSelectorModel(QObject):
     GROUP_PLUGINS = "plugins"
 
     def __init__(self, set_repo=None, state_manager=None, registry=None,
+                 feature_store_reader=None,
                  parent: Optional[QObject] = None) -> None:
         """Erstellt das Modell.
 
@@ -105,19 +109,28 @@ class ServiceSelectorModel(QObject):
                            den Live-Status "aktiv im Chart".
             registry:      PluginRegistry (Default: echte Instanz) – Quelle der
                            verfuegbaren Plugins.
+            feature_store_reader: FeatureStoreReader (Default: echte Instanz) –
+                           rein lesende Quelle fuer das 'Datum der letzten
+                           Ausfuehrung' (MAX(created_at) je feature_id in
+                           analytics.duckdb/feature_store – MasterTree-Anzeige
+                           'Service_Name (DD.MM.JJ)').
             parent:        Qt-Parent (optional).
         """
         super().__init__(parent)
         from analytics.engine.service_set_repository import ServiceSetRepository
         from analytics.features.feature_builder import PluginRegistry
+        from analytics.engine.feature_store_reader import FeatureStoreReader
         from state_manager import StateManager
 
         self.set_repo = set_repo or ServiceSetRepository()
         self.state_manager = state_manager or StateManager()
         self.registry = registry or PluginRegistry()
+        self.feature_store_reader = feature_store_reader or FeatureStoreReader()
 
         self._sets: List[Dict[str, Any]] = []
         self._active_indicator_ids: Set[str] = set()
+        # 05.08.2026: Datum der letzten Ausfuehrung je feature_id (DD.MM.JJ)
+        self._last_execution_dates: Dict[str, str] = {}
 
         # Initialbefuellung + Live-Sync (schwellenfrei via EventBus)
         self.refresh()
@@ -136,7 +149,40 @@ class ServiceSelectorModel(QObject):
             print(f"WARN [ServiceSelectorModel] list_sets() fehlgeschlagen: {e}")
             self._sets = []
         self._active_indicator_ids = self._collect_active_indicator_ids()
+        # 05.08.2026: Datum der letzten Ausfuehrung je feature_id (DD.MM.JJ) –
+        # wird nach jedem Service-Run (ServiceRunWorker -> EventBus) neu
+        # gelesen, damit der MasterTree das Datum live aktualisiert.
+        self._last_execution_dates = self._load_last_execution_dates()
         self.data_changed.emit()
+
+    def _load_last_execution_dates(self) -> Dict[str, str]:
+        """Liest das Datum der letzten Ausfuehrung je feature_id aus dem
+        feature_store (rein lesend ueber den FeatureStoreReader, Invariante
+        4: kein SQL im Modell). Defensiv: Fehler -> leer (Baum zeigt dann
+        den Fallback '(--.--.--)')."""
+        try:
+            raw = self.feature_store_reader.fetch_last_execution_dates() or {}
+        except Exception as e:
+            print(f"WARN [ServiceSelectorModel] Ausfuehrungsdaten nicht "
+                  f"lesbar: {e}")
+            return {}
+        # Case-insensitive Zuordnung (feature_id ist die Plugin-ID, z.B.
+        # 'proximity' – Registry-IDs sind case-insensitiv).
+        return {str(k).lower(): v for k, v in raw.items()}
+
+    def last_execution_date(self, plugin_id: str) -> str:
+        """Formatiertes Datum der letzten Ausfuehrung eines Services
+        ('DD.MM.JJ', z.B. '05.08.26') – Fallback '(--.--.--)' ohne Eintraege.
+
+        Der Zeitstempel stammt aus MAX(created_at) des feature_store fuer
+        die feature_id (Plugin-ID) des Services. store_plugin_payload()
+        aktualisiert created_at bei jedem Upsert, sodass der Wert die
+        LETZTE Ausfuehrung widerspiegelt.
+        """
+        if not plugin_id:
+            return "(--.--.--)"
+        return self._last_execution_dates.get(
+            str(plugin_id).lower(), "(--.--.--)")
 
     def _collect_active_indicator_ids(self) -> Set[str]:
         """Sammelt alle indicator_ids/plugin_ids, die in offenen Chart-
@@ -374,6 +420,9 @@ class ServiceSelectorModel(QObject):
                     "instance_id": iid,
                     "plugin_id": pid,
                     "badge": self.badge_for(pid),
+                    # 05.08.2026: Datum der letzten Ausfuehrung (DD.MM.JJ) –
+                    # MasterTree haengt es direkt an den Service-Namen an.
+                    "last_execution": self.last_execution_date(pid),
                 })
             set_nodes.append({
                 "set_id": s.get("set_id"),

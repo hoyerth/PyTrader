@@ -16,6 +16,10 @@ Hierarchische Darstellung der Service-Landschaft:
               einen aufklappbaren Knoten togglet auf/zu (Doppelklick ist
               deaktiviert). Die Top-Level-Knoten beginnen ganz links an der
               Linie der umschliessenden Box (kein Icon/Spacer auf Ebene 0).
+              05.08.2026 (Ausfuehrungsdatum): An den Namen jedes Service-
+              Knotens haengt das Datum der letzten Ausfuehrung in Klammern:
+              'prox_1 (05.08.26)' (DD.MM.JJ aus MAX(created_at) des
+              feature_store je feature_id) – ohne Eintrag '(--.--.--)'.
   * Spalte 1: Schmale Status-Spalte ganz RECHTS (Fixed-Spalte, fest am
               rechten Rand verankert) – pro Zeile ein echter Info-Button
               (QPushButton "ℹ", Icon-Breite ~20 px). Badge-TEXTE werden
@@ -32,7 +36,8 @@ Hierarchische Darstellung der Service-Landschaft:
 Der Baum wird ausschliesslich aus dem `ServiceSelectorModel` befuellt
 (lesendes Datenmodell, Invariante 4: kein SQL in UI) und aktualisiert sich
 automatisch ueber `data_changed`/EventBus. Der `ServiceSelectorWidget` nutzt
-den MasterTree im Modus `FULL_EDIT` (MasterTree + ServiceToolbar).
+den MasterTree im Modus `FULL_EDIT` (seit 05.08.2026 ohne Aktions-Toolbar –
+volle vertikale Hoehe, alle Aktionen via Kontextmenue).
 
 Signale:
   * selection_changed(set_id, service_id) – bei jeder Baum-Selektion
@@ -50,10 +55,13 @@ Signale:
       delete_set_requested(set_id)                    – 'Set loeschen (Papierkorb)'
       move_service_requested(set_id, service_id, delta) – Order ▲ (-1) / ▼ (+1)
       remove_service_requested(set_id, service_id)    – 'Service entfernen'
+      run_service_requested(set_id, instance_id)      – '▶️ Diesen Service ausführen'
+      run_set_requested(set_id)                        – '▶️ Alle Services ausführen'
     (Service-Info nutzt das bestehende `info_requested`-Signal.)
   * group_activated(group) – Klick auf einen (nicht selektierbaren) Gruppen-
-    Knoten (z.B. 'sets' / 'standalone' / 'plugins'); der Orchestrator braucht
-    ihn, um den bifunktionalen Toolbar-Zustand zu aktualisieren.
+    Knoten (z.B. 'sets' / 'standalone' / 'plugins'). Das Signal bleibt fuer
+    potenzielle Aufrufer erhalten (die fruehere Toolbar-State-Nutzung ist
+    seit 05.08.2026 entfernt).
 """
 
 from typing import Any, Dict, Optional
@@ -162,8 +170,17 @@ class MasterTree(QTreeWidget):
     # leeren (Orchestrator fuehrt die doppelte Sicherheitsabfrage aus).
     purge_trash_requested = Signal()
     # Bugfix 05.08.2026: Klick auf einen (nicht selektierbaren) Gruppen-Knoten
-    # (group id: 'sets' / 'standalone' / 'plugins') – fuer den Toolbar-State.
+    # (group id: 'sets' / 'standalone' / 'plugins'). Das Signal bleibt fuer
+    # potenzielle Aufrufer erhalten (keine Toolbar-Verwendung mehr).
     group_activated = Signal(str)
+    # 05.08.2026 (Ausfuehrungsdatum & Kontextmenue-Ausfuehrung):
+    #   run_service_requested(set_id, instance_id) – '▶️ Diesen Service ausfuehren'
+    #   run_set_requested(set_id)                   – '▶️ Alle Services ausfuehren'
+    # Der Orchestrator (ServiceWindow) startet dafuer den gezielten
+    # ServiceRunWorker (kein globaler Massen-Scan) und zeigt zuvor den
+    # Bestaetigungsdialog (Set/Service + Symbol/Timeframe).
+    run_service_requested = Signal(str, str)
+    run_set_requested = Signal(str)
 
     def __init__(self, model, parent=None) -> None:
         super().__init__(parent)
@@ -303,9 +320,13 @@ class MasterTree(QTreeWidget):
         for svc in services:
             # Keine fuehrenden Leerzeichen im Text: die Einrueckung der
             # Untereintraege kommt aus setIndentation(LEVEL_INDENT).
+            # 05.08.2026 (Ausfuehrungsdatum): Das Datum der letzten
+            # Ausfuehrung (DD.MM.JJ, aus dem feature_store) haengt direkt am
+            # Service-Namen: 'prox_1 (05.08.26)' – ohne Eintrag '(--.--.--)'.
             plugin_id = svc.get("plugin_id") or ""
+            last_exec = str(svc.get("last_execution") or "(--.--.--)")
             svc_item = QTreeWidgetItem([
-                f"{svc.get('instance_id')}  [{plugin_id}]",
+                f"{svc.get('instance_id')} ({last_exec})",
                 "",
             ])
             svc_item.setData(0, ROLE_NODE_TYPE, TYPE_SERVICE)
@@ -434,13 +455,14 @@ class MasterTree(QTreeWidget):
         """Baut das Kontextmenue fuer den Rechtsklick dynamisch je Knotentyp.
 
         Die Aktionen emittieren AUSSCHLIESSLICH Signale – der Orchestrator
-        (ServiceWindow) verknuepft sie mit seinen Handlern (DRY: Toolbar- und
-        Kontextmenue-Aktionen teilen sich dieselben Handler):
+        (ServiceWindow) verknuepft sie mit seinen Handlern:
 
           * Gruppe 📁 (sets)      -> 'Neues Set anlegen' (create_set_requested)
-          * Set-Knoten            -> 'Set umbenennen', 'Service hinzufuegen',
+          * Set-Knoten            -> '▶️ Alle Services ausführen' (run_set),
+                                     'Set umbenennen', 'Service hinzufuegen',
                                      'Set loeschen' (rename/add/delete-requested)
-          * Service-Knoten        -> 'Order ▲/▼', 'Service entfernen',
+          * Service-Knoten        -> '▶️ Diesen Service ausführen' (run_service),
+                                     'Order ▲/▼', 'Service entfernen',
                                      'Service-Info anzeigen' (move/remove/
                                      info_requested)
           * Ausserhalb eines Sets (Plugin-Zeilen, ⚡-/📦-Gruppen):
@@ -477,6 +499,14 @@ class MasterTree(QTreeWidget):
                 return
             if node_type == TYPE_SET:
                 set_id = str(item.data(0, ROLE_SET_ID) or "")
+                # 05.08.2026: 'Alle Services ausführen' – gezielter Run des
+                # Sets (kein globaler Massen-Scan); der Orchestrator zeigt
+                # den Bestaetigungsdialog (Set + Symbol/Timeframe).
+                act_run = menu.addAction("▶️ Alle Services ausführen")
+                act_run.triggered.connect(
+                    lambda _=False, s=set_id:
+                    self.run_set_requested.emit(s))
+                menu.addSeparator()
                 act_rename = menu.addAction("Set umbenennen")
                 act_rename.triggered.connect(
                     lambda _=False, s=set_id:
@@ -500,6 +530,15 @@ class MasterTree(QTreeWidget):
                 set_id = str(item.data(0, ROLE_SET_ID) or "")
                 service_id = str(item.data(0, ROLE_INSTANCE_ID) or "")
                 plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
+                # 05.08.2026: 'Diesen Service ausführen' – gezielter Run des
+                # Einzel-Services (inkl. Upstream-Abhaengigkeiten im Set);
+                # der Orchestrator zeigt den Bestaetigungsdialog (Service +
+                # Symbol/Timeframe).
+                act_run = menu.addAction("▶️ Diesen Service ausführen")
+                act_run.triggered.connect(
+                    lambda _=False, s=set_id, i=service_id:
+                    self.run_service_requested.emit(s, i))
+                menu.addSeparator()
                 act_up = menu.addAction("Order ▲")
                 act_up.triggered.connect(
                     lambda _=False, s=set_id, i=service_id:
@@ -590,10 +629,9 @@ class MasterTree(QTreeWidget):
         ueber itemExpanded/itemCollapsed (_refresh_expand_label).
 
         Bugfix 05.08.2026: Klick auf einen (nicht selektierbaren) Gruppen-
-        Knoten emittiert zusaetzlich `group_activated(group)` – der
-        Orchestrator braucht das Signal, um den bifunktionalen Toolbar-Zustand
-        zu aktualisieren (Gruppen-Knoten feuern kein selection_changed, weil
-        sie kein ItemIsSelectable-Flag tragen).
+        Knoten emittiert zusaetzlich `group_activated(group)` – das Signal
+        bleibt fuer potenzielle Aufrufer erhalten (die fruehere Toolbar-State-
+        Nutzung ist seit 05.08.2026 entfernt).
         """
         try:
             pos = (event.position().toPoint() if hasattr(event, "position")

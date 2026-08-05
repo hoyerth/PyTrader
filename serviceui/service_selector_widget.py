@@ -7,8 +7,11 @@ Konfigurierbares PySide6-Widget mit zwei Betriebsmodi:
   * Modus A (SELECT_ONLY): Kompakte Dropdown-Auswahl (Set-Combo + Service-
     Combo) fuer die schwellenfreie Wiederverwendung in Analytics (15.03),
     Backtester oder Charts. Emittiert `selection_changed(set_id, service_id)`.
-  * Modus B (FULL_EDIT):  Vollstaendiges Master-Tree-Widget mit Aktions-
-    Toolbar fuer service_win.py (Erstellen, Umsortieren, Loeschen).
+  * Modus B (FULL_EDIT):  Vollstaendiges Master-Tree-Widget fuer service_win.py
+    (Erstellen, Umsortieren, Loeschen ueber das Kontextmenue). Seit
+    05.08.2026 OHNE Aktions-Toolbar: die CRUD-/Order-Buttons oberhalb des
+    Baums sind entfernt – der MasterTree hat die volle vertikale Hoehe der
+    linken Spalte und alle Struktur-Aktionen laufen ueber das Kontextmenue.
 
 Beide Modi werden ausschliesslich aus dem `ServiceSelectorModel` befuellt
 (lesendes Datenmodell, EventBus-Live-Sync, Invariante 4/5).
@@ -23,7 +26,6 @@ from PySide6.QtWidgets import (
 
 from analytics.engine.service_selector_model import ServiceSelectorModel
 from serviceui.master_tree import MasterTree
-from serviceui.toolbar import ServiceToolbar
 
 
 class ServiceSelectorWidget(QWidget):
@@ -51,7 +53,9 @@ class ServiceSelectorWidget(QWidget):
         # Modus-Bausteine (werden je nach Modus erzeugt/eingefuegt)
         self._compact_row: Optional[QWidget] = None
         self.master_tree: Optional[MasterTree] = None
-        self.toolbar: Optional[ServiceToolbar] = None
+        # 05.08.2026: Toolbar entfernt (FULL_EDIT zeigt nur den MasterTree) –
+        # das Attribut bleibt als None fuer Abwaertskompatibilitaet erhalten.
+        self.toolbar = None
 
         self.model.data_changed.connect(self._on_model_changed)
         self.set_mode(mode)
@@ -104,10 +108,18 @@ class ServiceSelectorWidget(QWidget):
         self._repopulate_select_only()
 
     def _build_full_edit(self) -> None:
-        """Modus B: MasterTree (2 Spalten) + ServiceToolbar."""
+        """Modus B: MasterTree (2 Spalten) – volle Hoehe, KEINE Toolbar.
+
+        05.08.2026: Die Aktions-Toolbar (btn_add/btn_remove/Order-Pfeile)
+        oberhalb des Baums ist entfernt – der MasterTree fuellt die gesamte
+        vertikale Hoehe der linken Spalte. Alle Struktur-Aktionen (Set
+        anlegen/umbenennen/loeschen, Service hinzufuegen/verschieben/
+        entfernen) und die neuen Run-Aktionen ('▶️ Diesen Service ausführen' /
+        '▶️ Alle Services ausführen') laufen ueber das Kontextmenue
+        (entkoppelte Signale, der Orchestrator verknuepft sie mit seinen
+        Handlern)."""
         self.master_tree = MasterTree(self.model, parent=self)
-        self.toolbar = ServiceToolbar(parent=self)
-        self._layout.addWidget(self.toolbar)
+        self.toolbar = None
         self._layout.addWidget(self.master_tree, 1)
 
         self.master_tree.selection_changed.connect(self.selection_changed)

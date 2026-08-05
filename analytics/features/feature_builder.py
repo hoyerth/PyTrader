@@ -646,7 +646,8 @@ class FeatureBuilder:
                 ON CONFLICT (symbol, timeframe, bar_time) DO UPDATE SET
                     feature_id = EXCLUDED.feature_id,
                     plugin_version = EXCLUDED.plugin_version,
-                    feature_data = EXCLUDED.feature_data
+                    feature_data = EXCLUDED.feature_data,
+                    created_at = current_timestamp
             """, rows)
             # P14-03 (Invariante 13): In-Memory-Cache für (symbol, timeframe)
             # explizit invalidieren (veraltete shared_state-Zustände vermeiden).

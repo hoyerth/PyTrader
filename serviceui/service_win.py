@@ -57,6 +57,10 @@ from serviceui.set_item_adapter import ServiceSetItemAdapter, _ServiceSetItemAda
 from serviceui.param_columns import ServiceParamColumnsMixin
 from serviceui.trash_dialog import ServiceSetTrashDialog
 from serviceui.new_set_dialog import NewServiceSetDialog
+# 05.08.2026: Gezielter Run-Worker fuer die MasterTree-Kontextmenue-Aktionen
+# ('▶️ Diesen Service ausführen' / '▶️ Alle Services ausführen') – persistiert
+# den feature_store_payload und emittiert den EventBus (Datum live im Baum).
+from serviceui.run_worker import ServiceRunWorker
 
 # Phase 15 15.01: Symbol- & Favoriten-Verwaltung (SymbolsWindow + EventBus)
 from serviceui.symbols_win import SymbolsWindow
@@ -92,6 +96,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self.set_repo: ServiceSetRepository = service_set_repo or ServiceSetRepository()
         self.set_evaluator = ServiceSetEvaluator()
         self._set_run_worker: Optional[ServiceSetRunWorker] = None
+        # 05.08.2026: Worker fuer die gezielte Kontextmenue-Ausfuehrung
+        # (MasterTree '▶️ Service(s) ausführen') – FeatureStore-Persistenz.
+        self._run_worker: Optional[ServiceRunWorker] = None
         self._current_set_id: Optional[str] = None
         self._current_set_definition: Optional[Dict[str, Any]] = None
         # USER-REQ (P14-03): Preisskala-Praezision je Symbol fuer die 6
@@ -323,7 +330,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.btn_reload_plugins.clicked.connect(self.reload_plugins)
 
         # Phase 15 15.02: MasterTree/ServiceSelector (FULL_EDIT) verdrahten –
-        # Toolbar-Aktionen auf die bestehenden Set-Methoden + EventBus-Sync.
+        # Kontextmenue-Aktionen auf die bestehenden Set-Methoden + EventBus-
+        # Sync. Die fruehere Aktions-Toolbar oberhalb des Baums ist entfernt
+        # (05.08.2026) – der MasterTree hat die volle vertikale Hoehe.
         self._wire_selector_toolbar()
 
         self.log(f"Verfügbare Plugins: {_available_plugin_ids()}")
@@ -359,48 +368,37 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
     # --- Phase 15 15.02: MasterTree / ServiceSelector (FULL_EDIT) ---
 
     def _wire_selector_toolbar(self) -> None:
-        """Verdrahtet die ServiceSelectorWidget-Toolbar (Modus FULL_EDIT)
-        mit den bestehenden Set-Methoden (add/move/remove/rename).
+        """Verdrahtet den ServiceSelectorWidget (Modus FULL_EDIT) mit den
+        bestehenden Set-Methoden (add/move/remove/rename).
 
-        Bugfix 05.08.2026 (U15-D2-Stream): Der Plugins-Button der Toolbar
-        (btn_reload) und sein reload_plugins_requested-Signal sind entfernt
-        (Hot-Reload bleibt ueber den UI-Button btn_reload_plugins erreichbar).
-        Die bifunktionalen Buttons [➕] / [🗑️] und das MasterTree-Kontextmenue
-        teilen sich dieselben Handler (DRY)."""
+        05.08.2026 (CRUD-Buttons entfernt): Die Aktions-Toolbar oberhalb des
+        MasterTrees (btn_add/btn_remove/Order-Pfeile) ist ersatzlos aus der
+        UI und aus allen Event-Verbindungen entfernt – alle Struktur-Aktionen
+        und die neuen Run-Aktionen laufen ueber das MasterTree-Kontextmenue
+        (entkoppelte Signale, DRY: dieselben Handler wie zuvor)."""
         selector = getattr(self, "service_selector", None)
-        if selector is None or selector.toolbar is None:
+        if selector is None or selector.master_tree is None:
             return
-        toolbar = selector.toolbar
-        toolbar.request_add_popup = self._show_toolbar_add_popup
-        toolbar.add_set_requested.connect(self._on_add_set)
-        toolbar.add_service_requested.connect(self._toolbar_add_service)
-        toolbar.move_up_requested.connect(lambda: self.move_order_item(-1))
-        toolbar.move_down_requested.connect(lambda: self.move_order_item(1))
-        toolbar.remove_requested.connect(self._on_toolbar_remove)
+        tree = selector.master_tree
         # MasterTree-Auswahl + Kontextmenue (entkoppelt) -> Editor/Handler
-        if selector.master_tree is not None:
-            tree = selector.master_tree
-            tree.selection_changed.connect(self._on_master_selection)
-            # Bugfix 05.08.2026: Info-Button-Klicks (Spalte 1) -> Beschreibungs-
-            # Dialog (Service / Plugin / Set).
-            tree.info_requested.connect(self._on_tree_info_requested)
-            # Kontextmenue-Aktionen (Rechtsklick im Baum) – entkoppelte
-            # Signale auf dieselben Handler wie die Toolbar (DRY).
-            tree.create_set_requested.connect(self._on_add_set)
-            tree.rename_set_requested.connect(self._on_rename_set)
-            tree.add_set_service_requested.connect(self._on_add_set_service)
-            tree.delete_set_requested.connect(self._on_delete_set)
-            tree.move_service_requested.connect(self._on_move_service)
-            tree.remove_service_requested.connect(self._on_remove_service)
-            tree.purge_trash_requested.connect(self._on_purge_trash)
-            # Gruppen-Klick -> Toolbar-State ([➕ Set] bei der 📁-Gruppe)
-            tree.group_activated.connect(self._on_group_activated)
-
-    def _show_toolbar_add_popup(self) -> None:
-        """Zeigt das [➕ Service]-Popup mit allen verfuegbaren Plugins."""
-        selector = getattr(self, "service_selector", None)
-        if selector is not None and selector.toolbar is not None:
-            selector.toolbar.show_add_menu(selector.get_plugin_ids())
+        tree.selection_changed.connect(self._on_master_selection)
+        # Bugfix 05.08.2026: Info-Button-Klicks (Spalte 1) -> Beschreibungs-
+        # Dialog (Service / Plugin / Set).
+        tree.info_requested.connect(self._on_tree_info_requested)
+        # Kontextmenue-Aktionen (Rechtsklick im Baum).
+        tree.create_set_requested.connect(self._on_add_set)
+        tree.rename_set_requested.connect(self._on_rename_set)
+        tree.add_set_service_requested.connect(self._on_add_set_service)
+        tree.delete_set_requested.connect(self._on_delete_set)
+        tree.move_service_requested.connect(self._on_move_service)
+        tree.remove_service_requested.connect(self._on_remove_service)
+        tree.purge_trash_requested.connect(self._on_purge_trash)
+        # 05.08.2026: Gezielte Ausfuehrung ('▶️ Diesen Service ausführen' /
+        # '▶️ Alle Services ausführen') -> ServiceRunWorker mit Sicherheits-
+        # abfrage (Set/Service + aktives Symbol/Timeframe) + FeatureStore-
+        # Persistenz + EventBus-Sync.
+        tree.run_service_requested.connect(self._on_run_service)
+        tree.run_set_requested.connect(self._on_run_set)
 
     @Slot(str)
     def _toolbar_add_service(self, plugin_id: str) -> None:
@@ -443,93 +441,124 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                         break
             except (RuntimeError, AttributeError):
                 pass
-        # Bugfix 05.08.2026: bifunktionalen Toolbar-Zustand nach der
-        # MasterTree-Auswahl aktualisieren (set/service/none + Order).
-        self._update_toolbar_actions(set_id, service_id)
 
     # -------------------------------------------------------------------------
-    # Bugfix 05.08.2026: Toolbar-Zustand & Kontextmenue-Handler (U15-D2)
+    # 05.08.2026: Gezielte Kontextmenue-Ausfuehrung (Service(s) ausfuehren)
     # -------------------------------------------------------------------------
 
-    def _current_tree_selection(self) -> tuple:
-        """Liefert (set_id, service_id) der aktuellen MasterTree-Auswahl –
-        Single Source of Truth fuer den bifunktionalen Toolbar-Zustand."""
-        selector = getattr(self, "service_selector", None)
-        if selector is not None and selector.master_tree is not None:
-            try:
-                return (selector.master_tree.current_set_id(),
-                        selector.master_tree.current_service_id())
-            except (RuntimeError, AttributeError):
-                pass
-        return "", ""
+    def _start_run_worker(self, scope_id: str, set_definition: Dict[str, Any],
+                          instance_id: Optional[str]) -> None:
+        """Startet den gezielten ServiceRunWorker (Single/Set) im Hintergrund.
 
-    def _update_toolbar_actions(self, set_id: str, service_id: str) -> None:
-        """Setzt die bifunktionalen Toolbar-Zustaende nach der Baum-Auswahl.
-
-        * Service in einem Set markiert -> [➕ Service] + [➖ Service
-          entfernen] + Order ▲/▼ aktiv.
-        * Nur ein Set markiert          -> [➕ Service] + [🗑️ Set löschen]
-          (Order deaktiviert).
-        * Sonst (Gruppen-/Plugin-Klick) -> alle Struktur-Buttons deaktiviert
-          ([➕] none; die 📁-Gruppe aktiviert [➕ Set] – siehe
-          _on_group_activated).
+        * Laedt OHLCV nur fuer das aktive Symbol + den gewaehlten Timeframe
+          (FeatureBuilder.load_ohlcv) – KEIN globaler Massen-Scan.
+        * Fuehrt die Pipeline via ServiceSetEvaluator.execute_set() aus und
+          persistiert die erzeugten feature_store_payloads ZWINGEND in
+          analytics.duckdb (feature_store, FeatureBuilder.store_plugin_payload).
+        * Der Worker emittiert nach Abschluss `event_bus.service_set_changed`
+          – alle ServiceSelectorModel-Instanzen (MasterTree, Analytics, ...)
+          aktualisieren dadurch live das Ausfuehrungsdatum '(DD.MM.JJ)'.
         """
-        selector = getattr(self, "service_selector", None)
-        if selector is None or selector.toolbar is None:
+        if self._run_worker and self._run_worker.isRunning():
+            self.log("Service-Ausführung läuft bereits.")
             return
-        toolbar = selector.toolbar
+        symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
+        timeframe = self.combo_tf_set.currentText() if self.combo_tf_set else "H1"
+        self._run_worker = ServiceRunWorker(
+            self.set_evaluator, symbol, timeframe, set_definition,
+            instance_id=instance_id, parent=self,
+        )
+        self._run_worker.log_message.connect(self.log)
+        self._run_worker.run_finished.connect(self._on_run_worker_finished)
+        self._run_worker.run_failed.connect(self._on_run_worker_failed)
+        self._run_worker.start()
+
+    @Slot(str, str)
+    def _on_run_service(self, set_id: str, service_id: str) -> None:
+        """'▶️ Diesen Service ausführen' (MasterTree-Kontextmenue).
+
+        Sicherheitsabfrage mit Set-/Service-Name und dem aktuell gewaehlten
+        Symbol/Timeframe, danach gezielter Single-Run (inkl. Upstream-
+        Abhaengigkeiten im Set, damit z.B. proximity seine Linien hat).
+        """
+        if not set_id or not service_id:
+            return
         try:
-            if service_id:
-                toolbar.set_add_mode("service")
-                toolbar.set_remove_mode("service")
-                toolbar.set_order_enabled(True)
-            elif set_id:
-                toolbar.set_add_mode("service")
-                toolbar.set_remove_mode("set")
-                toolbar.set_order_enabled(False)
-            else:
-                toolbar.set_add_mode("none")
-                toolbar.set_remove_mode("none")
-                toolbar.set_order_enabled(False)
-        except (RuntimeError, AttributeError):
-            pass
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            self.log(f"FEHLER beim Laden des Sets: {e}")
+            return
+        if not definition:
+            self.log(f"Set '{set_id}' nicht gefunden – Ausführung abgebrochen.")
+            return
+        if service_id not in (definition.get("services") or {}):
+            self.log(f"Service '{service_id}' nicht im Set '{set_id}'.")
+            return
+        symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
+        timeframe = self.combo_tf_set.currentText() if self.combo_tf_set else "H1"
+        set_name = str(definition.get("display_name") or set_id)
+        reply = QMessageBox.question(
+            self, "Service ausführen",
+            f"Service '{service_id}' aus dem Set '{set_name}' ausführen?\n\n"
+            f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+            f"Der erzeugte Feature-Store-Payload wird in analytics.duckdb "
+            f"geschrieben.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            self.log("Ausführung abgebrochen.")
+            return
+        self._start_run_worker(service_id, definition, instance_id=service_id)
 
     @Slot(str)
-    def _on_group_activated(self, group: str) -> None:
-        """Klick auf einen Gruppen-Knoten im MasterTree -> Toolbar-Zustand.
+    def _on_run_set(self, set_id: str) -> None:
+        """'▶️ Alle Services ausführen' (MasterTree-Kontextmenue).
 
-        Die 📁-Gruppe ('sets') aktiviert [➕ Set] (neues leeres Set anlegen);
-        bei den Gruppen ⚡ (standalone) / 📦 (plugins) sind alle Struktur-
-        Buttons deaktiviert (kein Set-Kontext).
+        Sicherheitsabfrage mit Set-Name und dem aktuell gewaehlten
+        Symbol/Timeframe, danach gezielter Set-Run (nur dieses Set).
         """
-        selector = getattr(self, "service_selector", None)
-        if selector is None or selector.toolbar is None:
+        if not set_id:
             return
-        toolbar = selector.toolbar
         try:
-            model = getattr(selector, "model", None)
-            group_sets = getattr(model, "GROUP_SETS", "sets")
-            if group == group_sets:
-                toolbar.set_add_mode("set")
-                toolbar.set_remove_mode("none")
-                toolbar.set_order_enabled(False)
-            else:
-                toolbar.set_add_mode("none")
-                toolbar.set_remove_mode("none")
-                toolbar.set_order_enabled(False)
-        except (RuntimeError, AttributeError):
-            pass
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            self.log(f"FEHLER beim Laden des Sets: {e}")
+            return
+        if not definition:
+            self.log(f"Set '{set_id}' nicht gefunden – Ausführung abgebrochen.")
+            return
+        if not definition.get("execution_order"):
+            self.log(f"Set '{set_id}' hat keine Services – Ausführung abgebrochen.")
+            return
+        symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
+        timeframe = self.combo_tf_set.currentText() if self.combo_tf_set else "H1"
+        set_name = str(definition.get("display_name") or set_id)
+        count = len(definition.get("execution_order") or [])
+        reply = QMessageBox.question(
+            self, "Set ausführen",
+            f"Alle Services ({count}) des Sets '{set_name}' ausführen?\n\n"
+            f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+            f"Die erzeugten Feature-Store-Payloads werden in analytics.duckdb "
+            f"geschrieben.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            self.log("Ausführung abgebrochen.")
+            return
+        self._start_run_worker(set_id, definition, instance_id=None)
 
-    @Slot()
-    def _on_toolbar_remove(self) -> None:
-        """[🗑️]-Button: Set (Papierkorb) ODER Service entfernen – je nach
-        aktueller MasterTree-Auswahl (die Toolbar-Aktivierung spiegelt exakt
-        diesen Zustand). Reuse der Kontextmenue-Handler (DRY)."""
-        set_id, service_id = self._current_tree_selection()
-        if service_id:
-            self._on_remove_service(set_id, service_id)
-        elif set_id:
-            self._on_delete_set(set_id)
+    @Slot(str, int)
+    def _on_run_worker_finished(self, scope_id: str, stored: int) -> None:
+        """Loggt den Abschluss des gezielten Runs (FeatureStore-Persistenz).
+
+        Der EventBus-Sync erfolgt bereits im Worker (service_set_changed) –
+        das ServiceSelectorModel hat dadurch das neue MAX(created_at) gelesen
+        und der MasterTree zeigt das Datum '(DD.MM.JJ)' live an.
+        """
+        self.log(f"Ausführung abgeschlossen: {stored} Feature-Row(s) im "
+                 f"feature_store gespeichert ({scope_id}).")
+
+    @Slot(str, str)
+    def _on_run_worker_failed(self, scope_id: str, error: str) -> None:
+        self.log(f"FEHLER bei Ausführung ({scope_id}): {error}")
 
     def _persist_current_set(self, action: str) -> None:
         """Persistiert das aktuell geladene Service-Set zurueck in die DB.
@@ -589,8 +618,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
     def _select_set_in_tree(self, set_id: str) -> None:
         """Selektiert ein Set im MasterTree (Bugfix 05.08.2026).
 
-        Loest ueber selection_changed -> _on_master_selection auch den
-        Editor-Sync und den bifunktionalen Toolbar-Zustand ([➕ Service])
+        Loest ueber selection_changed -> _on_master_selection den Editor-Sync
         aus – direkt nach dem Anlegen eines neuen Sets.
         """
         selector = getattr(self, "service_selector", None)
@@ -680,8 +708,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         Indikator-Auswahl (NewServiceSetDialog). Der Name ist Pflicht; wird
         ein Indikator gewaehlt, wird er explizit zugewiesen (indicator_id)
         und die Basis-Services automatisch angelegt (_build_new_set_definition).
-        Das neue Set wird direkt im MasterTree selektiert, damit die Toolbar
-        in den [➕ Service]-Modus wechselt.
+        Das neue Set wird direkt im MasterTree selektiert.
         """
         try:
             from analytics.engine.service_selector_model import list_indicators
@@ -778,8 +805,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         """'Service hinzufuegen' (Kontextmenue): EIGENE Auswahlbox.
 
         Bugfix 05.08.2026: Eine eigene QInputDialog-Auswahlbox statt der
-        Toolbar-Auswahl (show_add_menu) – die Toolbar-Auswahl wird bald
-        entfernt. Nach der Auswahl wird der Service ueber den bestehenden
+        frueheren Toolbar-Auswahl (show_add_menu, Toolbar seit 05.08.2026
+        entfernt). Nach der Auswahl wird der Service ueber den bestehenden
         Pfad (edit_new_instance + add_instance) ins Set uebernommen und
         sofort persistiert.
         """
@@ -818,7 +845,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
     def _select_service_in_editor(self, set_id: str, service_id: str) -> None:
         """Laedt das Set in den Editor und markiert die Service-Instanz in
         der execution_order-Liste (gemeinsame Vorbereitung fuer Order-/
-        Entfernen-Aktionen aus Toolbar & Kontextmenue)."""
+        Entfernen-Aktionen aus dem Kontextmenue)."""
         if self.combo_set is not None:
             idx = self.combo_set.findData(set_id)
             if idx >= 0:
@@ -1683,5 +1710,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.scanner.wait(2000)
         if self._set_run_worker and self._set_run_worker.isRunning():
             self._set_run_worker.wait(2000)
+        # 05.08.2026: Gezielter Kontextmenue-Run-Worker sauber beenden.
+        if self._run_worker and self._run_worker.isRunning():
+            self._run_worker.wait(2000)
         self._elapsed_timer.stop()
         super().closeEvent(event)

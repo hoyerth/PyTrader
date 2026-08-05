@@ -350,6 +350,45 @@ class FeatureStoreReader:
         }
 
     # ------------------------------------------------------------------
+    # Lesen: Datum der letzten Ausfuehrung (MasterTree, 05.08.2026)
+    # ------------------------------------------------------------------
+    def fetch_last_execution_dates(self) -> Dict[str, str]:
+        """Neuester Schreib-Zeitpunkt je feature_id – formatiert als 'DD.MM.JJ'.
+
+        Wird vom ServiceSelectorModel fuer die MasterTree-Anzeige
+        'Service_Name (DD.MM.JJ)' gelesen (Datum der letzten Ausfuehrung).
+        Quelle: MAX(created_at) je feature_id ueber ALLE Symbole/Timeframes.
+        store_plugin_payload() aktualisiert created_at bei jedem Upsert
+        (ON CONFLICT DO UPDATE), damit der Zeitstempel die LETZTE Ausfuehrung
+        widerspiegelt (nicht den Erst-Schreibzeitpunkt der Bar).
+
+        Returns:
+            Dict feature_id -> 'DD.MM.JJ' (z.B. {'proximity': '05.08.26'});
+            leer bei fehlender DB/Tabelle oder Fehler (defensiv).
+        """
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT feature_id, MAX(created_at)
+                FROM feature_store
+                WHERE feature_id IS NOT NULL AND feature_id != ''
+                GROUP BY feature_id
+            """).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_last_execution_dates "
+                  f"fehlgeschlagen: {e}")
+            return {}
+        out: Dict[str, str] = {}
+        for r in rows:
+            if r[0] is None or r[1] is None:
+                continue
+            try:
+                out[str(r[0])] = r[1].strftime("%d.%m.%y")
+            except (AttributeError, ValueError):
+                continue
+        return out
+
+    # ------------------------------------------------------------------
     # Lesen: Metadaten
     # ------------------------------------------------------------------
     def get_available_timeframes(self, symbol: str) -> List[str]:
