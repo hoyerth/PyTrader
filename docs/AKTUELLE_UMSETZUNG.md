@@ -704,3 +704,35 @@ ew_set_dialog.py, param_columns.py, 	rash_dialog.py (Exit 0).
 * Temporaere Testdateien (`tmp_geo_verify.py`, `tmp_measure_h.py`, `tmp_debug_resize.py`, `tmp_qttest.py` u. a.) danach geloescht (Regel: Tests nur in `test/`).
 * Keine UI-Tests (Regel). Manuelle UI-Verifikation durch den Anwender.
 * `docs/x_Exports.md` bleibt unangetastet (Nutzer-Export, nicht Bestandteil dieses Commits).
+
+### 3.28 Schritt 28 - Bugfixing: ServiceWindow Save & Restore (Fenster-Historie) + Test-Ordner aufgeraeumt (05.08.2026)
+
+**Anlass (vom Anwender uebergeben, Bugfixing-Modus - 2 Aufgaben):**
+
+1. **Das ServiceWindow ist nicht in der Fenster-Historie mit Save & Restore:** Wenn die App abgebrochen und neu gestartet wird, wird das service_win nicht wiederhergestellt.
+2. **Ordner /test aufraeumen:** alles weg, was aktuell nicht genutzt wird.
+
+**A) Task 1 - ServiceWindow auto_restore=True (1 Datei + Test):**
+
+* **Ursache:** serviceui/service_win.py war seit Schritt 3.27 mit @register_persistent_window(auto_restore=False) registriert. estore_all_windows() in main.py prüft PersistentWindow.should_auto_restore(inst_id) und uebersprang win_service dadurch beim App-Start (Log: "Ueberspringe win_service (ServiceWindow): auto_restore=False"). Der Save-Pfad war bereits intakt (_keep_history_on_close=True haelt den Geometrie-/Instanz-Eintrag in window_instances/instance_states), nur der Restore-Gate blockierte.
+* **Fix (serviceui/service_win.py):** Registrierung auf @register_persistent_window() (auto_restore=True) umgestellt - Semantik identisch zu AnalyticsWindow/PropertiesWindow/chart_win: War das Fenster beim Beenden offen, wird es beim naechsten Start automatisch wiederhergestellt (inkl. Position via estore_state()/save_state()-Override + Symbol/Timeframe-Filter). _keep_history_on_close=True bleibt erhalten (Position wird auch nach manuellem Schliessen mit X behalten und beim naechsten Oeffnen ueber den Service-Button wiederhergestellt).
+* **	est/test.py angepasst:** Check H2 von should_auto_restore('win_service') == False auf == True umgestellt (Auto-Restore beim App-Start); Docstrings von Teil 3 aktualisiert.
+
+**B) Task 2 - Test-Ordner bereinigt (75 Dateien + __pycache__ entfernt):**
+
+**Behalten (19 Dateien):**
+* 	est.py (designierte Haupt-Verifikation, offscreen, Test-DBs isoliert)
+* Standard-Verifikations-Suite (M1-Zeitachse & Chart): check_time_utils.js, check_resolve_realtime.js, check_m1_consistency.py, check_m1_midnight.py, check_mt5_m1_boundary.py, check_chart_data.py, simulate_chart_mapping.py, 	est_db_lock.py, check_app_state.py, uild_cont_map.py + 	mp_cont_map.json
+* Im Produktionscode referenziert: check_broker_tz.py (chart/js/02_time_utils.js), check_html_template.py (chart/chart_basics.py), check_current_timestamp.py (analytics/features/feature_builder.py)
+* Aktive Phasen-15/16-Checks: check_p15_s2_service_tree.py, check_service_run_fixes.py
+* Migrations-Tools: migrate_grid_liquidity.py, migrate_legacy_feature_store.py
+
+**Entfernt (75):** alle obsoleten Phasen-Checks (P12-P15: check_analytics_*, check_p13_*, check_p14_*, check_p15_s1_*, check_p15_s3_*, check_grid_*, check_tf_*, check_phase14_regression, check_performance_p14, check_plugin_*, check_dialog_geometry, check_fixes_1503, check_generation_guard, check_duckdb_write_contention, check_statistics_repo, check_table_render_fix u. a.), grid_ref.py (eingefrorene Alt-Referenz), die JS-Legacy-Checks (check_marker_layers.js, check_measurement.js, check_p14_grid_incremental.js, check_race_guard.js, check_time_constants.js) und **alle 15 Test-DuckDBs** (ll11_app/sym, nalytics_test, p14_*, phase14_*, 	f_*) sowie 	est/__pycache__.
+
+**Validierung (headless, gruen):**
+* python -m py_compile auf serviceui/service_win.py + allen 17 behaltenen Test-.py (Exit 0).
+* 
+ode --check auf den behaltenen JS-Checks + Ausfuehrung: check_time_utils.js ("ALLE TESTS OK"), check_resolve_realtime.js ("RESULT: PASS").
+* 	est/test.py (offscreen, Test-DBs in 	est/): **H1/H2/H3 PASS** (auto_restore aktiv + should_auto_restore True), H4-H6 (Position-Persistenz) PASS. Die 3 verbleibenden Meldungen P2/P5/H7 sind vorbestehende Offscreen-Umgebungs-Artefakte (Test-Screen 800x800 vs. erwartete Inhaltsbreite >= 1300) und unabhaengig von diesem Fix.
+* Keine UI-Tests (Regel). Manuelle UI-Verifikation durch den Anwender (App beenden mit offenem ServiceWindow -> Neustart -> ServiceWindow erscheint wieder).
+* docs/x_Exports.md bleibt unangetastet (Nutzer-Export, nicht Bestandteil dieses Commits).

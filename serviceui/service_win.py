@@ -76,15 +76,16 @@ from serviceui.service_selector_widget import ServiceSelectorWidget
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
-@register_persistent_window(auto_restore=False)
+@register_persistent_window()  # auto_restore=True (Bugfix 05.08.2026)
 class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActionsMixin, PersistentWindow):
     INSTANCE_ID = "win_service"
-    # 05.08.2026 (Kleinere Einstellungen): auto_restore=False + keep_history=True.
-    # Die FENSTERPOSITION wird in JEDEM Fall gespeichert und wiederhergestellt
-    # (auch nach manuellem Schliessen mit X) – _keep_history_on_close=True
-    # haelt den Geometrie-Eintrag in der DB. auto_restore=False verhindert das
-    # ungefragte Wiederoeffnen beim App-Start (das Fenster wird nur ueber den
-    # Service-Button geoeffnet und dort an der gespeicherten Position platziert).
+    # Bugfix 05.08.2026 (User-Anweisung): auto_restore=True – das ServiceWindow
+    # gehoert vollwertig zur Fenster-Historie mit Save & Restore (wie
+    # AnalyticsWindow/PropertiesWindow): War das Fenster beim Beenden der App
+    # offen, wird es beim naechsten Start automatisch wiederhergestellt.
+    # _keep_history_on_close=True bleibt: Die FENSTERPOSITION wird auch nach
+    # manuellem Schliessen (X) behalten und beim naechsten Oeffnen ueber den
+    # Service-Button wiederhergestellt.
     _keep_history_on_close = True
     # 05.08.2026: Die FensterGROESSE folgt immer exakt dem Inhalt (auch
     # schrumpfen) – NUR die Position wird persistiert (save_state/restore_state
