@@ -60,7 +60,8 @@ from serviceui.new_set_dialog import NewServiceSetDialog
 # 05.08.2026: Gezielter Run-Worker fuer die MasterTree-Kontextmenue-Aktionen
 # ('▶️ Diesen Service ausführen' / '▶️ Alle Services ausführen') – persistiert
 # den feature_store_payload und emittiert den EventBus (Datum live im Baum).
-from serviceui.run_worker import ServiceRunWorker
+# U15-E (05.08.2026): ALL_TIMEFRAMES = Sentinel fuer Multi-TF-Ausfuehrung.
+from serviceui.run_worker import ALL_TIMEFRAMES, ServiceRunWorker
 
 # Phase 15 15.01: Symbol- & Favoriten-Verwaltung (SymbolsWindow + EventBus)
 from serviceui.symbols_win import SymbolsWindow
@@ -134,6 +135,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # Phase 13 Schritt 4: Service-Set-Controls
         self.combo_set: QComboBox = self.ui.findChild(QComboBox, "combo_set")
         self.combo_tf_set: QComboBox = self.ui.findChild(QComboBox, "combo_tf_set")
+        # 05.08.2026 (U15-E): Timeframe-Control in der Filterleiste (neben dem
+        # Symbol-Dropdown) – steuert die gezielte Kontextmenue-Ausfuehrung
+        # (MasterTree '▶️ Service(s) ausführen'). 'ALLE Timeframes' (Index 0,
+        # Sentinel ALL_TIMEFRAMES) fuehrt alle verfuegbaren Timeframes aus.
+        self.combo_tf: QComboBox = self.ui.findChild(QComboBox, "combo_tf")
         self.btn_refresh_sets: QPushButton = self.ui.findChild(QPushButton, "btn_refresh_sets")
         self.edit_set_name: QLineEdit = self.ui.findChild(QLineEdit, "edit_set_name")
         # Phase 14 P14-01: Set-Beschreibung + Info-Button (ServiceDescriptionDialog)
@@ -285,6 +291,10 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             # USER-REQ: Preisskala-Praezision ist je Symbol fix – beim
             # Symbol-Wechsel Cache invalidieren + Spalten neu bauen.
             self.combo_symbol.currentTextChanged.connect(self._on_symbol_changed)
+        # U15-E (05.08.2026): Timeframe-Control (Filterleiste) ebenfalls sofort
+        # speichern – get_persistent_timeframe() liest combo_tf.
+        if self.combo_tf:
+            self.combo_tf.currentTextChanged.connect(self.save_state)
 
         # Phase 15 15.01: Favoriten-Symbol-Verwaltung.
         # ★-Button rechts neben der Symbol-ComboBox oeffnet das nicht-modale
@@ -307,6 +317,10 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # EventBus: Favoriten-Aenderungen -> ComboBox neu befuellen
         event_bus.favorites_changed.connect(self._refresh_symbol_combo)
         self._refresh_symbol_combo()
+
+        # U15-E (05.08.2026): Timeframe-Dropdown der Filterleiste befuellen –
+        # 'ALLE Timeframes' (Index 0) + alle Timeframes aus get_timeframes().
+        self._refresh_timeframe_combo()
 
         # Set-Dropdown initial befüllen (list_sets() als Quelle)
         self.refresh_set_list()
@@ -346,6 +360,17 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         return self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
 
     def get_persistent_timeframe(self) -> str:
+        """Liefert den aktuell gewaehlten Timeframe der Filterleiste (combo_tf).
+
+        05.08.2026 (U15-E): 'ALLE Timeframes' ist eine reguläre, persistierbare
+        Auswahl (Sentinel ALL_TIMEFRAMES) – save_state() speichert sie 1:1,
+        damit beim naechsten Oeffnen exakt derselbe Modus wiederhergestellt
+        wird. Fallback: "H1", wenn kein Control existiert.
+        """
+        if self.combo_tf:
+            tf = self.combo_tf.currentText()
+            if tf:
+                return tf
         return "H1"
 
     def _apply_persistent_filters(self, symbol: str, timeframe: str) -> None:
@@ -353,6 +378,44 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             idx = self.combo_symbol.findText(symbol)
             if idx >= 0:
                 self.combo_symbol.setCurrentIndex(idx)
+        # U15-E: Timeframe der Filterleiste wiederherstellen (inkl. Sentinel
+        # 'ALLE Timeframes' – findText trifft den exakten Eintrag).
+        if self.combo_tf and timeframe:
+            idx = self.combo_tf.findText(timeframe)
+            if idx >= 0:
+                self.combo_tf.setCurrentIndex(idx)
+
+    def _refresh_timeframe_combo(self) -> None:
+        """Befuellt das Timeframe-Control der Filterleiste (U15-E).
+
+        Index 0 ist der Sentinel 'ALLE Timeframes' (Multi-TF-Ausfuehrung),
+        danach folgen alle Timeframes aus db_service.get_timeframes()
+        (MN1..M1). Fallback bei nicht verfuegbarem MT5: TF_SECONDS_MAP bzw.
+        eine Basisliste. Die aktuelle Auswahl bleibt erhalten, sofern sie
+        noch existiert; Default ist 'M1'.
+        """
+        if not self.combo_tf:
+            return
+        try:
+            from db_service import TF_SECONDS_MAP, get_timeframes
+            try:
+                tfs = list(get_timeframes().keys())
+            except Exception:
+                tfs = list(TF_SECONDS_MAP.keys())
+        except Exception:
+            tfs = ["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
+        current = self.combo_tf.currentText()
+        self.combo_tf.blockSignals(True)
+        self.combo_tf.clear()
+        self.combo_tf.addItem(ALL_TIMEFRAMES)
+        for tf in tfs:
+            if tf != ALL_TIMEFRAMES:
+                self.combo_tf.addItem(tf)
+        idx = self.combo_tf.findText(current)
+        if idx < 0:
+            idx = self.combo_tf.findText("M1")
+        self.combo_tf.setCurrentIndex(idx if idx >= 0 else 0)
+        self.combo_tf.blockSignals(False)
 
     def _on_symbol_changed(self, symbol: str) -> None:
         """USER-REQ: Preisskala-Praezision ist je Symbol fix. Beim Symbol-
@@ -463,7 +526,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.log("Service-Ausführung läuft bereits.")
             return
         symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
-        timeframe = self.combo_tf_set.currentText() if self.combo_tf_set else "H1"
+        # U15-E (05.08.2026): Timeframe-Control der Filterleiste (combo_tf) –
+        # 'ALLE Timeframes' startet die Multi-TF-Ausfuehrung im Worker.
+        timeframe = self.combo_tf.currentText() if self.combo_tf else "H1"
         self._run_worker = ServiceRunWorker(
             self.set_evaluator, symbol, timeframe, set_definition,
             instance_id=instance_id, parent=self,
@@ -495,7 +560,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.log(f"Service '{service_id}' nicht im Set '{set_id}'.")
             return
         symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
-        timeframe = self.combo_tf_set.currentText() if self.combo_tf_set else "H1"
+        # U15-E: Zeitachsen-Control der Filterleiste (combo_tf) – kann auch
+        # 'ALLE Timeframes' sein (Multi-TF-Ausfuehrung im Worker).
+        timeframe = self.combo_tf.currentText() if self.combo_tf else "H1"
         set_name = str(definition.get("display_name") or set_id)
         reply = QMessageBox.question(
             self, "Service ausführen",
@@ -530,7 +597,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.log(f"Set '{set_id}' hat keine Services – Ausführung abgebrochen.")
             return
         symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
-        timeframe = self.combo_tf_set.currentText() if self.combo_tf_set else "H1"
+        # U15-E: Zeitachsen-Control der Filterleiste (combo_tf) – kann auch
+        # 'ALLE Timeframes' sein (Multi-TF-Ausfuehrung im Worker).
+        timeframe = self.combo_tf.currentText() if self.combo_tf else "H1"
         set_name = str(definition.get("display_name") or set_id)
         count = len(definition.get("execution_order") or [])
         reply = QMessageBox.question(

@@ -50,6 +50,31 @@
        </widget>
       </item>
       <item>
+       <widget class="QLabel" name="label_tf_filter">
+        <property name="text">
+         <string>Timeframe:</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QComboBox" name="combo_tf">
+        <property name="minimumSize">
+         <size>
+          <width>150</width>
+          <height>0</height>
+         </size>
+        </property>
+        <property name="toolTip">
+         <string>Timeframe für die gezielte Kontextmenü-Ausführung (MasterTree '▶️ Service(s) ausführen'). 'ALLE Timeframes' führt alle verfügbaren Timeframes nacheinander aus (Multi-TF).</string>
+        </property>
+        <item>
+         <property name="text">
+          <string>ALLE Timeframes</string>
+         </property>
+        </item>
+       </widget>
+      </item>
+      <item>
        <spacer name="horizontalSpacer">
         <property name="orientation">
          <enum>Qt::Orientation::Horizontal</enum>

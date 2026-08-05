@@ -411,3 +411,38 @@ ew_set_dialog.py, param_columns.py, 	rash_dialog.py (Exit 0).
 * Echte DB-Verifikation: `fetch_last_execution_dates()` → `{'proximity': '02.08.26'}`; 670.235 proximity / 0 grid_lines / 3.000 NULL (atr-only); 0 proximity-Rows mit `feature_data` (Chart-Lesepfad unbeeinflusst).
 * `python -m py_compile` auf allen geänderten Dateien (Exit 0); EventBus-Import in beiden Workern erfolgreich; `data/analytics.duckdb` ist gitignored (DB-Änderung wird über das Migrationsskript + Doku nachvollzogen).
 * `docs/x_Exports.md` wurde vom Anwender selbst export-aktualisiert und bleibt wie immer unangetastet (nicht Bestandteil dieses Commits).
+
+### 3.18 Schritt 18 – U15-E: Timeframe-Control & Multi-TF-Ausführung (05.08.2026)
+
+**Anforderung (3 Teile, vom Anwender übergeben):**
+
+1. **`analytics/features/definitions/grid_lines_service.py`** → echter FeatureStore-Payload mit `feature_id="grid_lines"`, `plugin_version` und Records je Bar (`bar_time`, `grid_nearest_level`, `grid_step`, `upper_level`, `lower_level`).
+2. **`serviceui/service_win.py`** → neues Timeframe-Control `combo_tf` in der Filterleiste (neben dem Symbol-Dropdown) mit `'ALLE Timeframes'` (Index 0, Sentinel) + allen `get_timeframes()`-Werten (MN1..M1); Persistenz via `restore_state()`/`save_state()`.
+3. **`serviceui/run_worker.py`** → Multi-TF-Loop: spezifischer Timeframe → einmal ausführen; `'ALLE Timeframes'` → ALLE Timeframes nacheinander (OHLCV laden, Abhängigkeiten auflösen, ausführen, je Timeframe speichern); `event_bus.service_set_changed` NUR EINMAL am Ende.
+
+**Entscheidungen (Anwender-Frage 3; Fragen 1+2 wurden abgewählt → konservativ entschieden):** Die Kontextmenü-Run-Aktionen (`_start_run_worker`, `_on_run_service`, `_on_run_set`) lesen jetzt `combo_tf` (Filterleiste) statt `combo_tf_set`; `btn_execute_set`/`execute_set` (Set-Editor) bleibt unverändert auf `combo_tf_set`. Default-Auswahl `M1`. `upper_level = center + step_size`, `lower_level = center - step_size` (center = `f_round_to_custom_step(close, step_size)` = `grid_nearest_level`).
+
+**A) `analytics/features/definitions/grid_lines_service.py` (1 Datei):**
+* `capabilities["feature_store"] = True` (vorher `False` – GridLines rendert UND schreibt jetzt).
+* `calculate()` erzeugt pro Bar einen Record `{bar_time (epoch), grid_nearest_level=center, grid_step=step_size, upper_level=round(center+step,6), lower_level=round(center-step,6)}` und liefert `feature_store_payload` mit `feature_id=self.plugin_id` (`"grid_lines"`), `plugin_version=self.version` (`"1.0.0"`) und `metadata{schema_version:"1.0.0", step_size}` – unabhängig von `show_lines` (das nur die Render-Darstellung steuert). `chart_render_payload` (lines/hit_circles) und `shared_state`-Namespace bleiben unverändert.
+
+**B) `ui/service_win.ui` + `serviceui/service_win.py` (Filterleisten-Control):**
+* **`ui/service_win.ui`:** In `layout_symbol` (zwischen `combo_symbol` und dem Spacer) `label_tf_filter` + `combo_tf` eingefügt (minWidth 150, Tooltip erklärt den Multi-TF-Modus, Default-Item `'ALLE Timeframes'`).
+* **`serviceui/service_win.py`:**
+  * Neues Attribut `self.combo_tf` (`findChild(QComboBox, "combo_tf")`).
+  * `_refresh_timeframe_combo()`: füllt `'ALLE Timeframes'` (Index 0, Sentinel `ALL_TIMEFRAMES`) + `get_timeframes()`-Keys (Fallback `TF_SECONDS_MAP`, letzter Fallback Basisliste); aktuelle Auswahl bleibt erhalten, Default `M1`; blockSignals-geschützt. Aufruf im `__init__` nach `_refresh_symbol_combo()`.
+  * `combo_tf.currentTextChanged` → `save_state` (sofortiges Persistieren wie bei `combo_symbol`).
+  * `get_persistent_timeframe()` liest jetzt `combo_tf` (inkl. Sentinel 1:1 – `'ALLE Timeframes'` ist eine reguläre, persistierbare Auswahl); Fallback `"H1"`.
+  * `_apply_persistent_filters()` stellt zusätzlich `combo_tf` wieder her (`findText`, inkl. Sentinel).
+  * `_start_run_worker`, `_on_run_service`, `_on_run_set`: Timeframe aus `combo_tf` statt `combo_tf_set` (die `QMessageBox.question`-Bestätigungen zeigen den gewählten Timeframe bzw. den Multi-TF-Modus).
+
+**C) `serviceui/run_worker.py` (Multi-TF-Worker):**
+* Neue Konstante `ALL_TIMEFRAMES = "ALLE Timeframes"` (Sentinel).
+* `_resolve_timeframes()`: spezifischer TF → `[tf]`; `ALL_TIMEFRAMES` → `list(get_timeframes().keys())` (Fallback `TF_SECONDS_MAP`, letzter Fallback Basisliste MN1..M1).
+* `_execute_timeframe(fb, settings, definition, scope_label, tf)`: OHLCV laden → `prepare_plugin_df` → `PluginContext(symbol, tf, mode="batch")` → `evaluator.execute_set()` → non-leere `feature_store_payloads` via `fb.store_plugin_payload(symbol, tf, payload)` (Timeframe im Schreibpfad); liefert Anzahl geschriebener Rows, überspringt leere OHLCV-Daten mit Log.
+* `run()`: Loop über die aufgelösten Timeframes; im Multi-TF-Modus bricht ein fehlgeschlagener Timeframe die Gesamt-Ausführung NICHT ab (Fehler wird geloggt, Rest läuft weiter); Summe der Rows in `run_finished`; `event_bus.service_set_changed.emit()` NUR EINMAL nach Abschluss aller Timeframes. Single-TF ohne Daten → `run_failed` (bisheriges Verhalten unverändert).
+
+**Validierung (headless, grün):**
+* `python -m py_compile` auf `serviceui/service_win.py`, `serviceui/run_worker.py` (Exit 0); `ui/service_win.ui` parst als XML (Exit 0).
+* `test/test.py` Teil 6 (U1–U13) + Teil 6.4 (U14–U18), offscreen auf Test-DBs isoliert, **ALLE PRÜFUNGEN BESTANDEN**: `combo_tf` existiert in der Filterleiste, Index 0 = Sentinel, alle Timeframes enthalten, Default `M1`; Persistenz/Restore des Sentinel-Modus (`get_persistent_timeframe`/`save_state`/`restore_state`); `_resolve_timeframes()` Single vs. ALL (Reihenfolge = `get_timeframes()`); Multi-TF-`run()`-Schleife mit Fake-FeatureBuilder/-Evaluator (M1+H1 gespeichert, M30 ohne Daten übersprungen, Rows summiert, genau 1× `run_finished`, kein `run_failed`; Single-TF mit Daten → `run_finished`, Single-TF ohne Daten → `run_failed`); Grid-Level-Mathematik (close 30.1 / step 0.5 → center 30.0, upper 30.5, lower 29.5).
+* Zeilenenden: `.ui` auf LF normalisiert (Repo-Konvention für `*.ui`); git-Diff minimal (25 Insertions im `.ui`).

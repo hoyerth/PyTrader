@@ -31,14 +31,27 @@ Der Worker emittiert NUR Signale (log_message / run_finished / run_failed);
 den Bestaetigungsdialog zeigt der Orchestrator (ServiceWindow) VOR dem Start.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QThread, Signal
+
+# U15-E (05.08.2026): Sentinel-Wert der Timeframe-Filterleiste im
+# ServiceWindow. Wird der Kontextmenue-Run mit diesem Timeframe gestartet,
+# fuehrt der Worker ALLE verfuegbaren Timeframes nacheinander aus (Multi-TF).
+ALL_TIMEFRAMES = "ALLE Timeframes"
 
 
 class ServiceRunWorker(QThread):
     """Fuehrt einen Einzel-Service oder ein ganzes Service-Set zielgerichtet
     im Hintergrund aus und persistiert die Feature-Payloads im feature_store.
+
+    05.08.2026 (U15-E): Multi-Timeframe-Ausfuehrung – wenn `timeframe` den
+    Sentinel-Wert ALL_TIMEFRAMES ('ALLE Timeframes') traegt, laeuft der Worker
+    ALLE verfuegbaren Timeframes (get_timeframes, Fallback TF_SECONDS_MAP)
+    nacheinander durch: pro Timeframe OHLCV laden, Pipeline ausfuehren und
+    die Payloads mit dem jeweiligen Timeframe in den feature_store schreiben.
+    Der EventBus-Sync (`service_set_changed`) wird NUR EINMAL nach Abschluss
+    aller Timeframes emittiert.
 
     Signals:
         log_message(str)      – Fortschritts-/Ergebnis-Meldungen.
@@ -111,69 +124,133 @@ class ServiceRunWorker(QThread):
         }
 
     # ------------------------------------------------------------------
+    # U15-E (05.08.2026): Timeframe-Aufloesung (Single vs. Multi-TF)
+    # ------------------------------------------------------------------
+    def _resolve_timeframes(self) -> List[str]:
+        """Liefert die auszufuehrenden Timeframes in stabiler Reihenfolge.
+
+        * Spezifischer Timeframe: [self.timeframe] (Single-Run, unveraendert).
+        * ALL_TIMEFRAMES: alle verfuegbaren Timeframes aus get_timeframes()
+          (Fallback: TF_SECONDS_MAP; letzter Fallback: Basisliste).
+        """
+        if self.timeframe != ALL_TIMEFRAMES:
+            return [self.timeframe]
+        try:
+            from db_service import TF_SECONDS_MAP, get_timeframes
+            try:
+                return list(get_timeframes().keys())
+            except Exception:
+                return list(TF_SECONDS_MAP.keys())
+        except Exception:
+            return ["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
+
+    def _execute_timeframe(self, fb, settings, definition: Dict[str, Any],
+                           scope_label: str, tf: str) -> int:
+        """Fuehrt die Pipeline fuer EINEN Timeframe aus und persistiert die
+        Feature-Payloads im feature_store.
+
+        Returns:
+            Anzahl geschriebener Feature-Rows (0, wenn keine Daten oder kein
+            Payload vorhanden sind).
+        """
+        from analytics.features.feature_builder import prepare_plugin_df
+        from analytics.features.plugins.base_plugin import PluginContext
+
+        df = fb.load_ohlcv(self.symbol, tf,
+                           limit=settings.feature_builder_limit)
+        if df is None or df.empty:
+            self.log_message.emit(
+                f"  {self.symbol} {tf}: keine OHLCV-Daten – uebersprungen")
+            return 0
+
+        df_plugin = prepare_plugin_df(df)
+        context = PluginContext(
+            symbol=self.symbol,
+            timeframe=tf,
+            mode="batch",
+            timestamp=int(df_plugin["time"].iloc[-1]) if len(df_plugin) else None,
+            settings=settings,
+        )
+
+        self.log_message.emit(
+            f"Ausfuehren: {scope_label} ({self.symbol} {tf})")
+        results = self.evaluator.execute_set(definition, df_plugin,
+                                             context=context)
+
+        stored = 0
+        for iid, result in results.items():
+            payload = (result or {}).get("feature_store_payload") or {}
+            records = payload.get("records") or []
+            if not records:
+                self.log_message.emit(
+                    f"  {iid}: fertig (kein Feature-Store-Payload)")
+                continue
+            fb.store_plugin_payload(self.symbol, tf, payload)
+            stored += len(records)
+            self.log_message.emit(
+                f"  {iid}: {len(records)} Feature-Row(s) gespeichert "
+                f"({self.symbol} {tf})")
+        return stored
+
+    # ------------------------------------------------------------------
     # Worker-Loop
     # ------------------------------------------------------------------
     def run(self) -> None:
-        """Laedt OHLCV, fuehrt die Pipeline aus, persistiert die Payloads
-        im feature_store und stoesst den EventBus-Sync an."""
+        """Laedt OHLCV (ein oder alle Timeframes), fuehrt die Pipeline aus,
+        persistiert die Payloads im feature_store und stoesst den EventBus-
+        Sync an (einmalig nach Abschluss)."""
         scope_id = self.instance_id or str(
             self.set_definition.get("set_id") or "")
         try:
-            from analytics.features.feature_builder import (
-                FeatureBuilder, prepare_plugin_df)
-            from analytics.features.plugins.base_plugin import PluginContext
+            from analytics.features.feature_builder import FeatureBuilder
             from config.event_bus import event_bus
             from state_manager import StateManager
 
             settings = StateManager().get_app_settings()
             fb = FeatureBuilder()
-            df = fb.load_ohlcv(self.symbol, self.timeframe,
-                               limit=settings.feature_builder_limit)
-            if df is None or df.empty:
-                self.run_failed.emit(
-                    scope_id,
-                    f"Keine OHLCV-Daten fuer {self.symbol} {self.timeframe}.")
-                return
-
-            df_plugin = prepare_plugin_df(df)
-            context = PluginContext(
-                symbol=self.symbol,
-                timeframe=self.timeframe,
-                mode="batch",
-                timestamp=int(df_plugin["time"].iloc[-1]) if len(df_plugin) else None,
-                settings=settings,
-            )
-
             definition = self._build_scope_definition()
             display = str(definition.get("display_name")
                           or self.set_definition.get("display_name")
                           or scope_id or "Unbenannt")
             scope_label = (f"Service '{self.instance_id}' im Set '{display}'"
                            if self.instance_id else f"Set '{display}'")
+            self.log_message.emit(f"Ausfuehren: {scope_label}")
+
+            timeframes = self._resolve_timeframes()
+            if not timeframes:
+                self.run_failed.emit(
+                    scope_id, "Keine Timeframes verfuegbar.")
+                return
+
+            total_stored = 0
+            empty_tfs: List[str] = []
+            for tf in timeframes:
+                try:
+                    stored = self._execute_timeframe(
+                        fb, settings, definition, scope_label, tf)
+                except Exception as e:
+                    # U15-E (Multi-TF): Ein fehlgeschlagener Timeframe bricht
+                    # die Gesamt-Ausfuehrung NICHT ab – Fehler wird geloggt,
+                    # die restlichen Timeframes laufen weiter.
+                    if self.timeframe == ALL_TIMEFRAMES:
+                        self.log_message.emit(
+                            f"  {self.symbol} {tf}: FEHLER – {e}")
+                        continue
+                    raise
+                total_stored += stored
+                if stored == 0:
+                    empty_tfs.append(tf)
+
+            # Single-TF ohne Daten -> Fehler (bisheriges Verhalten erhalten).
+            if len(timeframes) == 1 and empty_tfs:
+                self.run_failed.emit(
+                    scope_id,
+                    f"Keine OHLCV-Daten fuer {self.symbol} {timeframes[0]}.")
+                return
+
             self.log_message.emit(
-                f"Ausfuehren: {scope_label} ({self.symbol} {self.timeframe})")
-
-            results = self.evaluator.execute_set(definition, df_plugin,
-                                                 context=context)
-
-            # Feature-Store-Persistenz: Jeder Service mit non-leerem
-            # feature_store_payload wird in analytics.duckdb geschrieben.
-            stored = 0
-            for iid, result in results.items():
-                payload = (result or {}).get("feature_store_payload") or {}
-                records = payload.get("records") or []
-                if not records:
-                    self.log_message.emit(
-                        f"  {iid}: fertig (kein Feature-Store-Payload)")
-                    continue
-                fb.store_plugin_payload(self.symbol, self.timeframe, payload)
-                stored += len(records)
-                self.log_message.emit(
-                    f"  {iid}: {len(records)} Feature-Row(s) gespeichert")
-
-            self.log_message.emit(
-                f"Fertig: {stored} Feature-Row(s) im feature_store "
-                f"({self.symbol} {self.timeframe}).")
+                f"Fertig: {total_stored} Feature-Row(s) im feature_store "
+                f"({self.symbol}).")
 
             # UI-Sync: Nach Abschluss des Workers werden alle lauschenden
             # ServiceSelectorModel-Instanzen (MasterTree, Analytics, ...)
@@ -184,6 +261,6 @@ class ServiceRunWorker(QThread):
             except Exception as e:  # pragma: no cover
                 print(f"WARN [ServiceRunWorker] EventBus-Emitt fehlgeschlagen: {e}")
 
-            self.run_finished.emit(scope_id, stored)
+            self.run_finished.emit(scope_id, total_stored)
         except Exception as e:
             self.run_failed.emit(scope_id, str(e))

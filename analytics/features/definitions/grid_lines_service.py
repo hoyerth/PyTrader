@@ -20,7 +20,18 @@ KEINE eigenen Zeitkonzepte: Das native UTC-Zeitfenster (Minute 0/30 ±
 time_window_mins) ist ausschließlich Sache des ProximityService (Farbgebung),
 nicht dieses Services.
 
-Capabilities: render=True, feature_store=False (schreibt NICHT in den Store).
+Capabilities: render=True, feature_store=True (schreibt Grid-Level je Bar in den Store).
+
+05.08.2026 (U15-E, echte Feature-Store-Payloads): `calculate()` erzeugt jetzt
+ZWINGEND ein gefuelltes `feature_store_payload` mit `feature_id="grid_lines"`,
+`plugin_version` und `records` je Bar:
+    {"bar_time", "grid_nearest_level", "grid_step", "upper_level", "lower_level"}
+  * grid_nearest_level = center = round(close / step_size) * step_size
+  * upper_level        = center + step_size
+  * lower_level        = center - step_size
+Dadurch schreibt grid_lines bei der Ausfuehrung echte mathematische Zeilen in
+analytics.duckdb (`feature_store`) – unabhaengig von `show_lines` (das nur die
+RENDER-Darstellung steuert, nicht die Daten-Mathematik).
 """
 
 from typing import Any, Dict, List, Optional
@@ -152,7 +163,9 @@ class GridLinesService(PluginFeature):
             "chart": True,
             "batch": True,
             "live": False,
-            "feature_store": False,  # GridLines rendert nur, schreibt NICHT in den Store
+            # 05.08.2026 (U15-E): grid_lines schreibt jetzt echte Grid-Level
+            # je Bar in den Store (feature_store_payload in calculate()).
+            "feature_store": True,
             "render": True,
         }
 
@@ -229,7 +242,15 @@ class GridLinesService(PluginFeature):
         context: Optional[PluginContext] = None,
     ) -> FeatureCalculateResult:
         """Baut das Raster in Parität zum Alt-Grid (grid_math.py) und schreibt
-        die Linienliste nach context.shared_state[self.instance_id] (Namespace-isoliert)."""
+        die Linienliste nach context.shared_state[self.instance_id] (Namespace-
+        isoliert).
+
+        05.08.2026 (U15-E): Zusaetzlich wird ein gefuelltes feature_store_payload
+        erzeugt (feature_id='grid_lines', plugin_version, records je Bar mit
+        bar_time / grid_nearest_level / grid_step / upper_level / lower_level) -
+        grid_lines schreibt damit echte mathematische Grid-Level in den
+        feature_store (unabhaengig von show_lines, das nur die Render-Darstellung
+        steuert)."""
         if df is None or df.empty:
             return {"feature_store_payload": {}, "chart_render_payload": {"lines": [], "hit_circles": []}}
 
@@ -270,8 +291,42 @@ class GridLinesService(PluginFeature):
         if context is not None and context.instance_id:
             context.shared_state[context.instance_id] = list(lines_payload)
 
+        # --- Feature-Store-Payload (05.08.2026, U15-E) -----------------------
+        # Pro Bar: grid_nearest_level = center (naechstes Grid-Level zum close),
+        # upper/lower = center +/- step_size (deterministische Klammer um den
+        # close). Unabhaengig von show_lines – die Mathematik gilt immer.
+        feature_rows: List[Dict[str, Any]] = []
+        for _i, row in df.iterrows():
+            try:
+                close_val = float(row["close"])
+                center = f_round_to_custom_step(close_val, step_size)
+            except (TypeError, ValueError, KeyError):
+                continue
+            bar_ts = row.get("time")
+            if bar_ts is None:
+                continue
+            try:
+                bar_ts_int = int(bar_ts)
+            except (TypeError, ValueError):
+                continue
+            feature_rows.append({
+                "bar_time": bar_ts_int,
+                "grid_nearest_level": center,
+                "grid_step": step_size,
+                "upper_level": round(center + step_size, 6),
+                "lower_level": round(center - step_size, 6),
+            })
+
         return {
-            "feature_store_payload": {},
+            "feature_store_payload": {
+                "feature_id": self.plugin_id,
+                "plugin_version": self.version,
+                "records": feature_rows,
+                "metadata": {
+                    "schema_version": "1.0.0",
+                    "step_size": step_size,
+                },
+            },
             "chart_render_payload": {
                 "lines": lines_payload,
                 "hit_circles": [],
