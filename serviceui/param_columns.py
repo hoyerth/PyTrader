@@ -8,8 +8,8 @@ weiterhin direkt `self._build_service_columns(...)` etc. aufrufen kann.
 
 Die Methoden greifen auf Host-Attribute zurück, die zur Laufzeit vorhanden
 sind: service_columns_layout, _service_param_controls, _service_desc_controls,
-top_row, widget_service_columns, combo_symbol, combo_tf_set, _symbol_precision,
-list_execution_order, collect_set_definition(), _schedule_reflow (ContentScrollMixin),
+widget_service_columns, combo_symbol, combo_tf, _symbol_precision,
+collect_set_definition(), _schedule_reflow (ContentScrollMixin),
 _service_lock/_build_tooltip (ServiceWindow).
 """
 
@@ -71,8 +71,8 @@ class ServiceParamColumnsMixin:
                 from db_service import get_symbol_precision
                 symbol = (self.combo_symbol.currentText()
                           if self.combo_symbol else "SILVER")
-                timeframe = (self.combo_tf_set.currentText()
-                             if self.combo_tf_set else "H1")
+                timeframe = (self.combo_tf.currentText()
+                             if self.combo_tf else "H1")
                 self._symbol_precision = get_symbol_precision(symbol, timeframe)
             except Exception:
                 self._symbol_precision = 2
@@ -278,7 +278,11 @@ class ServiceParamColumnsMixin:
             # die Param-Spalte auf ihre aktuelle Layout-Breite gesetzt, damit
             # 2 Services nebeneinander ohne horizontalen Scroll passen.
             splitter = getattr(self, "main_splitter", None)
-            if splitter is not None and splitter.count() == 3:
+            # 05.08.2026 (Layout-Runde 3): ZWEI-SPALTEN-Splitter seit der
+            # Phase-13-Bereinigung – der deferred setSizes greift erst mit
+            # count() == 2 (vorher 3 -> stale Spaltengroessen nach dem
+            # Spaltenaufbau, Bugfix Punkt 1).
+            if splitter is not None and splitter.count() == 2:
                 hints = []
                 for i in range(splitter.count()):
                     w = splitter.widget(i)
@@ -320,7 +324,7 @@ class ServiceParamColumnsMixin:
             col = self._build_service_column(iid, pid, cfg)
             self.service_columns_layout.addWidget(col)
         # Bugfix 05.08.2026 (Layout-Runde 2): Die Service-Parameter-Box
-        # (widget_service_columns) liegt seit dem DREI-SPALTEN-Splitter FEST in
+        # (widget_service_columns) liegt seit dem ZWEI-SPALTEN-Splitter FEST in
         # einer ContentScrollArea (_param_scroll, rechte Splitter-Spalte, max.
         # Hoehe/Breite mit Scrollbalken - Punkt 5). KEIN Reinsert mehr noetig
         # (der fruehere Reinsert stammte aus dem Alt-Layout und verschob die
@@ -386,7 +390,6 @@ class ServiceParamColumnsMixin:
         desc_edit.setPlaceholderText("Individuelle Anmerkung für diese Instanz (optional)")
         desc_edit.setText(str(cfg.get("description") or ""))
         self._service_desc_controls[iid] = desc_edit
-        desc_edit.textChanged.connect(lambda _t, iid=iid: self._update_service_tooltip(iid))
         # Phase 15 (Dirty-State): auch die Instanz-Beschreibung ist Teil des
         # Sets und wird erst beim Set-Speichern persistiert -> dirty markieren.
         desc_edit.textChanged.connect(lambda _t, iid=iid: self._mark_service_dirty(iid))
@@ -457,19 +460,3 @@ class ServiceParamColumnsMixin:
         definition = self.collect_set_definition()
         self._build_service_columns(definition)
 
-    def _update_service_tooltip(self, iid: str) -> None:
-        """Aktualisiert den Tooltip des Listen-Items live beim Tippen."""
-        if not self.list_execution_order:
-            return
-        for i in range(self.list_execution_order.count()):
-            item = self.list_execution_order.item(i)
-            if item.data(Qt.UserRole) == iid:
-                cfg: Dict[str, Any] = {"plugin_id": item.data(Qt.UserRole + 1) or iid}
-                desc_ctrl = self._service_desc_controls.get(iid)
-                if desc_ctrl is not None:
-                    cfg["description"] = desc_ctrl.text().strip()
-                # P14-04-E: Sperr-Nachtrag (🔒) beibehalten – der Live-Tooltip
-                # darf die Sperr-Kennzeichnung nicht überschreiben.
-                _prefix, lock_tip = self._service_lock(str(cfg.get("plugin_id") or ""))
-                item.setToolTip(self._build_tooltip(iid, cfg) + lock_tip)
-                break

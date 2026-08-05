@@ -140,14 +140,10 @@ def main() -> int:
     print("\n[5] Worker-Load-Limit nutzt scanner_candle_limit (Code-Inspektion):")
     rw_src = (Path(__file__).resolve().parent.parent / "serviceui" / "run_worker.py").read_text(
         encoding="utf-8", errors="replace")
-    srw_src = (Path(__file__).resolve().parent.parent / "serviceui" / "set_run_worker.py").read_text(
-        encoding="utf-8", errors="replace")
     check("limit=settings.scanner_candle_limit" in rw_src,
           "run_worker.py: load_ohlcv mit scanner_candle_limit")
-    check("limit=settings.scanner_candle_limit" in srw_src,
-          "set_run_worker.py: load_ohlcv mit scanner_candle_limit")
-    check("prepare_worker_definition" in rw_src and "prepare_worker_definition" in srw_src,
-          "beide Worker rufen prepare_worker_definition() auf")
+    check("prepare_worker_definition" in rw_src,
+          "run_worker.py ruft prepare_worker_definition() auf")
 
     print()
     if ok:

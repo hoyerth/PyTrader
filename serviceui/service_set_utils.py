@@ -46,8 +46,9 @@ def prepare_worker_definition(
     lookback_limit: int,
 ) -> Dict[str, Any]:
     """Bereitet eine ServiceSetDefinition für die gezielte Worker-Ausführung
-    auf (serviceui/run_worker.py + serviceui/set_run_worker.py). Die übergebene
-    Definition bleibt unverändert – es wird eine Kopie zurückgegeben.
+    auf (serviceui/run_worker.py; der historische ServiceSetRunWorker bzw.
+    set_run_worker.py wurde am 05.08.2026 mit der Phase-13-Box entfernt). Die
+    übergebene Definition bleibt unverändert – es wird eine Kopie zurückgegeben.
 
     05.08.2026 (Bugfix Service-Run, zwei Korrekturen):
 

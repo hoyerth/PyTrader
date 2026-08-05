@@ -1,7 +1,9 @@
 # serviceui/service_win.py
 """
 Service-Kontrollfenster für PyTrader.
-Steuert den Historical Scanner (Full-Scan / Delta-Update) über ein separates Fenster.
+Service-Set-Verwaltung, Parameter-Editor und gezielte Service-Ausführung
+(MasterTree-Kontextmenü -> ServiceRunWorker). Der globale Historical Scanner
+wurde am 05.08.2026 ersatzlos entfernt – Ausführung nur noch zielgerichtet.
 Mit automatischem State Persistence via PersistentWindow.
 
 Phase 13 Schritt 4: Zusätzlich Service-Set-Verwaltung (ServiceSetRepository +
@@ -13,8 +15,6 @@ Phase 15 Kapitel 15.1 (U15-D1): Modularisierung – die gewachsene Datei wurde
 in den Unterordner serviceui/ verschoben und in Module zerlegt (Verhalten
 unverändert):
   * service_set_utils.py   – _available_plugin_ids, _sets_using_plugin
-  * set_run_worker.py      – ServiceSetRunWorker (QThread)
-  * set_item_adapter.py    – ServiceSetItemAdapter (NamedItemAdapter)
   * param_columns.py       – ServiceParamColumnsMixin (Parameter-Column-Builder)
   * trash_dialog.py        – ServiceSetTrashDialog (Papierkorb-Dialog)
 Diese Datei re-exportiert die öffentliche API, damit bestehende Aufrufe
@@ -27,9 +27,9 @@ from typing import Any, Dict, Optional
 from PySide6.QtCore import QFile, QIODevice, QTimer, Qt, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QGroupBox, QHBoxLayout,
-    QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
-    QMessageBox, QProgressBar, QPushButton, QSpinBox, QSplitter, QTextEdit,
+    QComboBox, QDialog, QGroupBox, QHBoxLayout,
+    QInputDialog, QMenu,
+    QMessageBox, QPushButton, QSplitter, QTextEdit,
     QVBoxLayout, QWidget,
 )
 
@@ -42,7 +42,6 @@ except ImportError:  # pragma: no cover
     def _qt_valid(obj) -> bool:  # type: ignore
         return obj is not None
 
-from analytics.background_workers.historical_scanner import HistoricalScanner
 from analytics.engine.description_dialog import (
     ServiceDescriptionDialog,
     ServiceDescriptionEditDialog,
@@ -55,8 +54,6 @@ from chart.widgets.named_item_actions import NamedItemActionsMixin
 
 # Phase 15 U15-D1: Submodule der Service-UI
 from serviceui.service_set_utils import _available_plugin_ids, _sets_using_plugin
-from serviceui.set_run_worker import ServiceSetRunWorker
-from serviceui.set_item_adapter import ServiceSetItemAdapter, _ServiceSetItemAdapter
 from serviceui.param_columns import ServiceParamColumnsMixin
 from serviceui.trash_dialog import ServiceSetTrashDialog
 from serviceui.new_set_dialog import NewServiceSetDialog
@@ -91,15 +88,10 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
 
     def __init__(self, parent=None, service_set_repo: Optional[ServiceSetRepository] = None):
         super().__init__(parent)
-        self.scanner: Optional[HistoricalScanner] = None
-        self._elapsed_timer = QTimer(self)
-        self._elapsed_seconds = 0
-        self._elapsed_timer.timeout.connect(self._update_elapsed)
 
         # Phase 13 Schritt 4: Service-Set-Verwaltung
         self.set_repo: ServiceSetRepository = service_set_repo or ServiceSetRepository()
         self.set_evaluator = ServiceSetEvaluator()
-        self._set_run_worker: Optional[ServiceSetRunWorker] = None
         # 05.08.2026: Worker fuer die gezielte Kontextmenue-Ausfuehrung
         # (MasterTree '▶️ Service(s) ausführen') – FeatureStore-Persistenz.
         self._run_worker: Optional[ServiceRunWorker] = None
@@ -110,16 +102,12 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self._symbol_precision: Optional[int] = None
         # Phase 16 (05.08.2026): Concurrency-Guard – Referenzzähler für die
         # pausierten 45s-Hintergrund-Syncs (sync_timer in main.py). Bei
-        # jedem beginnenden Service-Run/Scan wird das EventBus-Signal
+        # jedem beginnenden Service-Run wird das EventBus-Signal
         # service_run_started emittiert (nur beim Übergang 0→1), nach dem
         # letzten Abschluss service_run_finished (1→0). Dadurch wird der
         # Sync-Timer für die Dauer intensiver Berechnungen geblockt.
         self._sync_guard_count: int = 0
 
-        # Phase 13 Schritt 8: Service-Set-Adapler für die generische
-        # Neu-/Speichern-/Löschen-Mechanik (NamedItemActionsMixin) – exakt
-        # analog zur Preset-Verwaltung im Indikator-Prop-Fenster.
-        self._set_adapter = _ServiceSetItemAdapter(self)
 
         # UI laden
         ui_file = QFile(str(BASE_DIR / "ui" / "service_win.ui"))
@@ -136,40 +124,15 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
 
         # Controls
         self.combo_symbol: QComboBox = self.ui.findChild(QComboBox, "combo_symbol")
-        self.check_new_scan: QCheckBox = self.ui.findChild(QCheckBox, "check_new_scan")
-        self.btn_start: QPushButton = self.ui.findChild(QPushButton, "btn_start_scan")
-        self.label_elapsed: QLabel = self.ui.findChild(QLabel, "label_elapsed_value")
-        self.progress_bar: QProgressBar = self.ui.findChild(QProgressBar, "progress_bar")
         self.text_log: QTextEdit = self.ui.findChild(QTextEdit, "text_log")
 
-        # Phase 13 Schritt 4: Service-Set-Controls
-        self.combo_set: QComboBox = self.ui.findChild(QComboBox, "combo_set")
-        self.combo_tf_set: QComboBox = self.ui.findChild(QComboBox, "combo_tf_set")
         # 05.08.2026 (U15-E): Timeframe-Control in der Filterleiste (neben dem
         # Symbol-Dropdown) – steuert die gezielte Kontextmenue-Ausfuehrung
         # (MasterTree '▶️ Service(s) ausführen'). 'ALLE Timeframes' (Index 0,
         # Sentinel ALL_TIMEFRAMES) fuehrt alle verfuegbaren Timeframes aus.
         self.combo_tf: QComboBox = self.ui.findChild(QComboBox, "combo_tf")
-        self.btn_refresh_sets: QPushButton = self.ui.findChild(QPushButton, "btn_refresh_sets")
-        self.edit_set_name: QLineEdit = self.ui.findChild(QLineEdit, "edit_set_name")
-        # Phase 14 P14-01: Set-Beschreibung + Info-Button (ServiceDescriptionDialog)
-        self.edit_set_description: Optional[QLineEdit] = self.ui.findChild(QLineEdit, "edit_set_description")
-        self.btn_info_service: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_info_service")
-        self.list_execution_order: QListWidget = self.ui.findChild(QListWidget, "list_execution_order")
-        self.btn_move_up: QPushButton = self.ui.findChild(QPushButton, "btn_move_up")
-        self.btn_move_down: QPushButton = self.ui.findChild(QPushButton, "btn_move_down")
-        self.btn_remove_instance: QPushButton = self.ui.findChild(QPushButton, "btn_remove_instance")
-        self.edit_new_instance: QLineEdit = self.ui.findChild(QLineEdit, "edit_new_instance")
-        self.btn_add_instance: QPushButton = self.ui.findChild(QPushButton, "btn_add_instance")
-        # Phase 14 P14-02: Hot-Reload-Button für Custom-Plugins
-        self.btn_reload_plugins: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_reload_plugins")
-        # Phase 13 Schritt 6-Korrektur: Dropdown mit ALLEN verfügbaren Services
-        self.combo_plugin_select: Optional[QComboBox] = self.ui.findChild(QComboBox, "combo_plugin_select")
-        self.btn_save_set: QPushButton = self.ui.findChild(QPushButton, "btn_save_set")
-        self.btn_delete_set: QPushButton = self.ui.findChild(QPushButton, "btn_delete_set")
         # Phase 14 P14-05: Papierkorb-Button (Soft-Delete/Wiederherstellung)
         self.btn_trash_sets: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_trash_sets")
-        self.btn_execute_set: QPushButton = self.ui.findChild(QPushButton, "btn_execute_set")
         # Bugfix 05.08.2026 (Punkt 1): Das Log (text_log) klebte am unteren
         # Bildschirmrand, weil es unbegrenzt wuchs und das Fenster bis zum
         # Screen-Cap aufging. Max. Hoehe ~5 Zeilen -> kompaktes Log, kein
@@ -189,7 +152,6 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # 18x18 bzw. alter Gruppenstand), wodurch die Fensterbreite nicht mit
         # der Spaltenanzahl wachsen würde. Im Code erzeugte Widgets (wie die
         # Spalten selbst) werden korrekt weitergereicht.
-        self.group_service_sets: Optional[QGroupBox] = self.ui.findChild(QGroupBox, "group_service_sets")
         self.widget_service_columns = QGroupBox("Service-Parameter")
         self.widget_service_columns.setObjectName("widget_service_columns")
         self.service_columns_layout = QHBoxLayout(self.widget_service_columns)
@@ -199,40 +161,27 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self.content_widget = self.ui.centralWidget()
         self.central_layout = self.content_widget.layout() if self.content_widget else None
         if self.central_layout is not None:
-            # Bugfix 05.08.2026 (Layout-Runde 2): DREI-SPALTEN-Splitter.
-            #  * Spalte 1 (links):  Service-Sets-Box (group_service_sets).
-            #  * Spalte 2 (Mitte):  MasterTree (Service tree) – Minimum-Breite,
-            #                       damit eingerueckte Texte lesbar sind
-            #                       (Punkt 4: Scrollbalken bei Ueberlauf).
-            #  * Spalte 3 (rechts): Service-Parameter-Box (widget_service_
+            # Bugfix 05.08.2026 (Layout-Bereinigung Phase 13): ZWEI-SPALTEN-
+            # Splitter statt Drei-Spalten - die Service-Sets-Box (Phase 13)
+            # ist ersatzlos entfernt (alle Funktionen im MasterTree/Kontext-
+            # menue bzw. im Parameterfenster der rechten Spalte).
+            #  * Spalte 1 (links):  MasterTree (Service tree) - volle Hoehe.
+            #  * Spalte 2 (rechts): Service-Parameter-Box (widget_service_
             #                       columns) in einer ContentScrollArea mit
-            #                       max. Hoehe/Breite + Scrollbalken (Punkt 5),
+            #                       max. Hoehe/Breite + Scrollbalken,
             #                       darunter fest die Aktions-Leiste
-            #                       [💾 Speichern] / [▶️ Speichern & Ausführen]
-            #                       (Punkt 0: Buttons IMMER sichtbar, unab-
-            #                       haengig von Dirty-State/Set-Wechsel).
+            #                       [Speichern] / [Speichern & Ausfuehren].
             # Die Status-Zeile (Laufzeit/Fortschritt) bleibt im central_layout
-            # direkt UNTER dem Splitter (= unter der hoechsten Box, Punkt 3).
+            # direkt UNTER dem Splitter (= unter der hoechsten Box).
             self.top_row = QHBoxLayout()
             self.top_row.setSpacing(6)
-            idx = self.central_layout.indexOf(self.group_service_sets)
-            if idx < 0:
-                idx = 0
-            self.central_layout.removeWidget(self.group_service_sets)
+            # Splitter direkt NACH der Filter-/Symbol-Zeile (layout_symbol,
+            # Index 0) einfuegen. Die frueheren Scan-Widgets (btn_start_scan,
+            # layout_status) sind am 05.08.2026 ersatzlos entfernt – Status
+            # + Log liegen darunter im central_layout.
+            idx = 1
 
-            # Spalte 1: Service-Sets-Box (keine Parameter-Spalten mehr)
-            self._editor_panel = QWidget()
-            editor_layout = QVBoxLayout(self._editor_panel)
-            editor_layout.setContentsMargins(0, 0, 0, 0)
-            editor_layout.setSpacing(6)
-            editor_layout.addWidget(self.group_service_sets)
-            self._editor_panel.setMinimumWidth(380)
-            # Punkt 1 (Bugfix 05.08.2026): Maximalbreite begrenzen, damit die
-            # Service-Parameter-Spalte (2 Services nebeneinander) genug Platz
-            # im Splitter bekommt.
-            self._editor_panel.setMaximumWidth(700)
-
-            # Spalte 2: MasterTree (Service tree)
+            # Spalte 1: MasterTree (Service tree)
             self.right_panel = QWidget()
             right_layout = QVBoxLayout(self.right_panel)
             right_layout.setContentsMargins(0, 0, 0, 0)
@@ -241,73 +190,67 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.service_selector = ServiceSelectorWidget(
                 mode=ServiceSelectorWidget.MODE_FULL_EDIT, parent=self)
             right_layout.addWidget(self.service_selector, 1)
-            # Punkt 4: Mindest-Breite, damit eingerueckte Texte (LEVEL_INDENT)
-            # lesbar sind; wird der Tree groesser (mehr Services), zeigt das
-            # QTreeWidget seine nativen Scrollbalken. Punkt 1: Maximalbreite
-            # begrenzen, damit die Parameter-Spalte Platz fuer 2 Services hat.
+            # Mindest-Breite, damit eingerueckte Texte (LEVEL_INDENT) lesbar
+            # sind; die Maximalbreite entfaellt im 2-Spalten-Layout (der Tree
+            # bekommt den groesseren Anteil, die Parameter-Spalte bleibt
+            # min. 320px breit).
             try:
                 self.service_selector.master_tree.setMinimumWidth(400)
-                self.service_selector.master_tree.setMaximumWidth(560)
             except (RuntimeError, AttributeError):
                 pass
 
-            # Spalte 3: Service-Parameter-Box + Aktions-Leiste (Punkt 5/0)
+            # Spalte 2: Service-Parameter-Box + Aktions-Leiste
             self._param_panel = QWidget()
-            self._param_panel.setMinimumWidth(320)
+            # Bugfix 05.08.2026 (Punkt 1+2): Mindestbreite etwas breiter als
+            # ZWEI Service-Spalten (942 px) - kein horizontaler Scrollbalken
+            # bei 2 Services. Die UI-Geometrie (1400) deckt Tree (min. 400) +
+            # Box (min. 960) + Splitter-Handle ab.
+            self._param_panel.setMinimumWidth(960)
             param_layout = QVBoxLayout(self._param_panel)
             param_layout.setContentsMargins(0, 0, 0, 0)
             param_layout.setSpacing(6)
-            # Punkt 5/1: max. Hoehe der Parameter-Box; die max. BREITE ist so
-            # bemessen, dass ZWEI Service-Spalten nebeneinander OHNE
-            # horizontalen Scrollbalken passen (Bugfix 05.08.2026, Punkt 1) -
-            # bei mehr Services/Spalten scrollt die ContentScrollArea.
+            # max. Hoehe der Parameter-Box; die max. BREITE ist so bemessen,
+            # dass ZWEI Service-Spalten nebeneinander OHNE horizontalen
+            # Scrollbalken passen - bei mehr Services/Spalten scrollt die
+            # ContentScrollArea.
             self._param_scroll = ContentScrollArea()
             self._param_scroll.setWidgetResizable(False)
             self._param_scroll.setWidget(self.widget_service_columns)
             self._param_scroll.setMaximumHeight(620)
             self._param_scroll.setMaximumWidth(1000)
             param_layout.addWidget(self._param_scroll, 1)
-            # Phase 15 (Dirty-State): Aktions-Leiste direkt UNTER der
-            # Parameter-Box – [💾 Speichern] persistiert die Parameter-
-            # Aenderungen ohne Neuberechnung; [▶️ Speichern & Ausführen]
-            # speichert und stoesst sofort den Service-Run an (ServiceRun-
-            # Worker, kein Schwerlast-Scan). Feste Position ausserhalb der
-            # ScrollArea -> immer sichtbar (Punkt 0).
+            # Aktions-Leiste direkt UNTER der Parameter-Box - [Speichern]
+            # persistiert die Parameter-Aenderungen ohne Neuberechnung;
+            # [Speichern & Ausfuehren] speichert und stoesst sofort den
+            # Service-Run an (ServiceRunWorker, kein Schwerlast-Scan).
+            # Feste Position ausserhalb der ScrollArea -> immer sichtbar.
             self._param_action_row = QHBoxLayout()
             self._param_action_row.setSpacing(6)
-            self.btn_save_params = QPushButton("💾 Speichern")
-            self.btn_save_run_params = QPushButton("▶️ Speichern & Ausführen")
+            self.btn_save_params = QPushButton("✔ Speichern")
+            self.btn_save_run_params = QPushButton(
+                "▶ Speichern & Ausführen")
             self.btn_save_params.setToolTip(
                 "Speichert die aktuellen Parameter-Aenderungen im Set "
                 "(app_data.duckdb) und entfernt das '*' im Baum.")
             self.btn_save_run_params.setToolTip(
                 "Speichert die Aenderungen UND stoesst sofort die "
-                "Neuberechnung an (Bestätigungsabfrage mit Symbol/Timeframe).")
-            # Bugfix 05.08.2026 (Punkt 2): Die Speicher-Buttons sind NUR
-            # sichtbar, wenn eine manuelle Parameter-Aenderung stattgefunden
-            # hat (Dirty-State). Initial unsichtbar; _mark_service_dirty
-            # blendet sie ein, _clear_dirty_markers und der Auswahl-Wechsel
-            # blenden sie aus (Punkt 3).
+                "Neuberechnung an (Bestaetigungsabfrage mit Symbol/Timeframe).")
+            # Nur bei manueller Parameter-Aenderung (Dirty) sichtbar.
             self.btn_save_params.setVisible(False)
             self.btn_save_run_params.setVisible(False)
             self._param_action_row.addWidget(self.btn_save_params)
             self._param_action_row.addWidget(self.btn_save_run_params)
             self._param_action_row.addStretch(1)
             param_layout.addLayout(self._param_action_row)
-            # Der Scroll (einziger Stretch) bekommt die volle Spaltenhoehe
-            # (bis max 620); ueberschuessiger Platz bleibt unter den Buttons.
 
             self.main_splitter = QSplitter(Qt.Horizontal)
-            self.main_splitter.addWidget(self._editor_panel)
             self.main_splitter.addWidget(self.right_panel)
             self.main_splitter.addWidget(self._param_panel)
-            self.main_splitter.setStretchFactor(0, 2)
-            self.main_splitter.setStretchFactor(1, 3)
-            self.main_splitter.setStretchFactor(2, 2)
+            self.main_splitter.setStretchFactor(0, 3)
+            self.main_splitter.setStretchFactor(1, 2)
             # Keine Spalte unter ihre Mindestgroesse kollabieren lassen.
             self.main_splitter.setCollapsible(0, False)
             self.main_splitter.setCollapsible(1, False)
-            self.main_splitter.setCollapsible(2, False)
 
             self.top_row.addWidget(self.main_splitter)
             self.central_layout.insertLayout(idx, self.top_row)
@@ -337,40 +280,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # Phase 14 P14-01: Beschreibungs-Eingabefelder der Service-Instanzen
         self._service_desc_controls: Dict[str, QWidget] = {}
 
-        if self.btn_start:
-            self.btn_start.clicked.connect(self.start_scan)
-
-        # Phase 13 Schritt 4: Service-Set-Signale
-        if self.combo_set:
-            self.combo_set.currentIndexChanged.connect(self._on_set_selected)
-        if self.btn_refresh_sets:
-            self.btn_refresh_sets.clicked.connect(self.refresh_set_list)
-        if self.btn_move_up:
-            self.btn_move_up.clicked.connect(lambda: self.move_order_item(-1))
-        if self.btn_move_down:
-            self.btn_move_down.clicked.connect(lambda: self.move_order_item(1))
-        if self.btn_remove_instance:
-            self.btn_remove_instance.clicked.connect(self.remove_instance)
-        # Phase 14 P14-01: Info-Button + itemClicked-Selektion der Instanzliste
-        self._current_list_iid: Optional[str] = None
-        if self.list_execution_order:
-            self.list_execution_order.itemClicked.connect(self._on_order_item_clicked)
-            self.list_execution_order.itemSelectionChanged.connect(self._sync_list_selection)
-        if self.btn_info_service:
-            self.btn_info_service.clicked.connect(self._show_service_info)
-        if self.btn_add_instance:
-            self.btn_add_instance.clicked.connect(self.add_instance)
-            if self.edit_new_instance:
-                self.edit_new_instance.returnPressed.connect(self.add_instance)
-        if self.btn_save_set:
-            self.btn_save_set.clicked.connect(self.save_set)
-        if self.btn_delete_set:
-            self.btn_delete_set.clicked.connect(self.delete_set)
         # Phase 14 P14-05: Papierkorb-Dialog (Soft-Delete)
         if self.btn_trash_sets:
             self.btn_trash_sets.clicked.connect(self.show_trash_dialog)
-        if self.btn_execute_set:
-            self.btn_execute_set.clicked.connect(self.execute_set)
         # Phase 15 (Dirty-State): Parameter-Panel-Aktionsleiste (Speichern /
         # Speichern & Ausführen) – siehe _save_params_from_panel /
         # _save_and_run_from_panel.
@@ -421,27 +333,6 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # U15-E (05.08.2026): Timeframe-Dropdown der Filterleiste befuellen –
         # 'ALLE Timeframes' (Index 0) + alle Timeframes aus get_timeframes().
         self._refresh_timeframe_combo()
-
-        # Set-Dropdown initial befüllen (list_sets() als Quelle)
-        self.refresh_set_list()
-
-        # Phase 13 Schritt 6-Korrektur: Verfügbare Services sichtbar machen –
-        # der Platzhalter im Eingabefeld zeigt jetzt grid_lines + proximity
-        # (die neuen Services aus Schritt 6) statt nur grid_liquidity.
-        if self.edit_new_instance:
-            self.edit_new_instance.setPlaceholderText(
-                "instance_id [plugin_id]  z.B. grid_1 [grid_lines] oder prox_1 [proximity]"
-            )
-        # Dropdown listet ALLE registrierten Services (grid_lines, grid_liquidity,
-        # proximity). Auswahl füllt das Instanz-Feld vor ("plugin_id [plugin_id]").
-        if self.combo_plugin_select:
-            from analytics.features.feature_builder import PluginRegistry
-            for pid in sorted(PluginRegistry().plugins.keys()):
-                self.combo_plugin_select.addItem(pid, pid)
-            self.combo_plugin_select.currentTextChanged.connect(self._on_plugin_select_changed)
-        # Phase 14 P14-02: Hot-Reload der Custom-Plugins (data/custom_plugins/)
-        if self.btn_reload_plugins:
-            self.btn_reload_plugins.clicked.connect(self.reload_plugins)
 
         # Phase 15 15.02: MasterTree/ServiceSelector (FULL_EDIT) verdrahten –
         # Kontextmenue-Aktionen auf die bestehenden Set-Methoden + EventBus-
@@ -531,7 +422,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         Custom-Level-Felder (prox_level1..6) die neue Preisskala-Praezision
         des Symbols anzeigen."""
         self._symbol_precision = None
-        if (self.combo_set is not None and self.combo_set.currentIndex() >= 0
+        if (self._current_set_definition is not None
                 and self.service_columns_layout is not None):
             self._rebuild_columns()
 
@@ -575,61 +466,53 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         tree.run_set_requested.connect(self._on_run_set)
 
     @Slot(str)
-    def _toolbar_add_service(self, plugin_id: str) -> None:
-        """Uebernimmt die Popup-Auswahl ins Instanz-Feld und fuegt den
-        Service zum aktiven Set hinzu (add_instance)."""
+    def _toolbar_add_service(self, plugin_id: str,
+                             set_id: Optional[str] = None) -> None:
+        """Fuegt einen Service (Plugin) in das Set ein (Kontextmenue
+        'Service hinzufuegen' -> eigene Auswahlbox).
+
+        Phase 13-Bereinigung (05.08.2026): Der fruehere Weg ueber das
+        Instanz-Eingabefeld der entfernten Service-Sets-Box entfaellt - der
+        Service wird direkt ueber die Plugin-Auswahl mit
+        Registry-Defaults angelegt (_add_service_to_set)."""
         if not plugin_id:
             return
-        if self.edit_new_instance:
-            self.edit_new_instance.setText(f"{plugin_id} [{plugin_id}]")
-        self.add_instance()
+        target = set_id or self._current_set_id
+        if not target:
+            self.log("Kein Set geladen - Service kann nicht hinzugefuegt werden.")
+            return
+        self._add_service_to_set(target, str(plugin_id))
 
     @Slot(str, str)
     def _on_master_selection(self, set_id: str, service_id: str) -> None:
-        """Synchronisiert Editor (Set-Combo/Liste) mit der
-        MasterTree-Auswahl.
+        """Laedt das im MasterTree gewaehlte Set direkt in den Parameter-
+        Editor (rechte Splitter-Spalte).
 
-        P15-Bugfix: isValid-Guards – bei wildem Klicken koennen combo_set /
-        list_execution_order waehrend des Handlers neu aufgebaut werden
-        (setCurrentIndex -> _on_set_selected -> load_set_into_editor); der
-        Zugriff auf geloeschte Items wuerde sonst crashen (0xC0000005).
-
-        Bugfix 05.08.2026 (Punkt 3): Bei Mausklick auf andere Services oder
-        Sets werden die Speicher-Buttons ausgeblendet (sie sind nur waehrend
-        einer manuellen Parameter-Aenderung sichtbar).
-        """
+        Phase 13-Bereinigung (05.08.2026): Der bisherige Umweg ueber das
+        Set-Dropdown der entfernten Service-Sets-Box entfaellt - die
+        Auswahl im MasterTree ist die alleinige Quelle. Bei Set-Auswahl
+        werden die Parameter-Spalten aufgebaut; ohne Auswahl (Plugin-/
+        Standalone-Zeilen) wird der Editor geleert."""
         self._set_param_actions_visible(False)
+        if not set_id:
+            self._clear_set_editor()
+            return
         try:
-            if set_id and self.combo_set is not None and _qt_valid(self.combo_set):
-                idx = self.combo_set.findData(set_id)
-                if idx >= 0 and self.combo_set.currentData() != set_id:
-                    self.combo_set.setCurrentIndex(idx)
-        except (RuntimeError, AttributeError):
-            pass
-        if service_id and self.list_execution_order is not None:
-            try:
-                if not _qt_valid(self.list_execution_order):
-                    return
-                for i in range(self.list_execution_order.count()):
-                    item = self.list_execution_order.item(i)
-                    if item is None or not _qt_valid(item):
-                        continue
-                    if item.data(Qt.UserRole) == service_id:
-                        self.list_execution_order.setCurrentRow(i)
-                        self._current_list_iid = service_id
-                        break
-            except (RuntimeError, AttributeError):
-                pass
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            self.log(f"FEHLER beim Laden des Sets: {e}")
+            return
+        if not definition:
+            self.log(f"Set '{set_id}' nicht gefunden.")
+            return
+        self.load_set_into_editor(definition)
 
-    # -------------------------------------------------------------------------
-    # Phase 16 (05.08.2026): Concurrency-Guard gegen den 45s-Hintergrund-Sync
-    # -------------------------------------------------------------------------
     def _begin_sync_guard(self) -> None:
         """Blockt den 45s-Hintergrund-Sync (sync_timer in main.py).
 
         Erhoeht den Referenzzaehler und emittiert `service_run_started`
-        ausschliesslich beim Uebergang 0→1 – mehrere parallele Runs/Scans
-        (Worker + HistoricalScanner) pausieren den Sync nur EINMAL.
+        ausschliesslich beim Uebergang 0→1 – mehrere parallele Runs
+        (ServiceRunWorker) pausieren den Sync nur EINMAL.
         """
         self._sync_guard_count += 1
         if self._sync_guard_count == 1:
@@ -886,31 +769,6 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                 except (RuntimeError, AttributeError):
                     pass
 
-    def _persist_current_set(self, action: str) -> None:
-        """Persistiert das aktuell geladene Service-Set zurueck in die DB.
-
-        Bugfix 05.08.2026: Struktur-Aenderungen (add/move/remove) werden
-        SOFORT gespeichert (P14-05: Snapshot beim Ueberschreiben) und der
-        EventBus emittiert `service_set_changed` – alle ServiceSelectorModel-
-        Instanzen (MasterTree, Analytics, ...) aktualisieren live. Verwaiste
-        services-Konfigurationen (nicht mehr in execution_order) werden dabei
-        bereinigt. Nur Sets MIT set_id werden persistiert (ein neues, noch
-        ungespeichertes Set lebt bis zum expliziten 'Speichern' im Editor).
-        """
-        if not self._current_set_id:
-            return
-        try:
-            definition = self.collect_set_definition()
-            order = definition.get("execution_order") or []
-            services = definition.get("services") or {}
-            definition["services"] = {
-                iid: cfg for iid, cfg in services.items() if iid in order
-            }
-            self.set_repo.save_set(definition)
-            event_bus.service_set_changed.emit()
-        except Exception as e:
-            self.log(f"FEHLER beim Speichern des Sets ({action}): {e}")
-
     def _plugin_belongs_to_indicator(self, plugin_id: str) -> bool:
         """True, wenn der Service einem Indikator zugeordnet ist
         (metadata['indicator_id']/['indicator_name']).
@@ -1064,11 +922,6 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self.log(f"Neues Service-Set angelegt: {set_id}"
                  + (f" (Indikator: {ind_id})" if ind_id else ""))
         event_bus.service_set_changed.emit()
-        self.refresh_set_list()
-        if self.combo_set is not None:
-            idx = self.combo_set.findData(set_id)
-            if idx >= 0:
-                self.combo_set.setCurrentIndex(idx)
         # Neues Set im MasterTree selektieren (Editor-Sync via selection_changed)
         self._select_set_in_tree(set_id)
 
@@ -1120,95 +973,144 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             return
         self.log(f"Set umbenannt: '{current_name}' -> '{clean}'")
         event_bus.service_set_changed.emit()
-        self.refresh_set_list()
-        if self.combo_set is not None:
-            idx = self.combo_set.findData(set_id)
-            if idx >= 0:
-                self.combo_set.setCurrentIndex(idx)
+        # Geladenes Set im Editor nachziehen (Baum-Label kommt aus dem Modell).
+        if self._current_set_id == set_id:
+            try:
+                self.load_set_into_editor(self.set_repo.get_set(set_id))
+            except Exception as e:
+                self.log(f"FEHLER beim Nachladen des Sets: {e}")
 
     @Slot(str)
     def _on_add_set_service(self, set_id: str) -> None:
         """'Service hinzufuegen' (Kontextmenue): EIGENE Auswahlbox.
 
         Bugfix 05.08.2026: Eine eigene QInputDialog-Auswahlbox statt der
-        frueheren Toolbar-Auswahl (show_add_menu, Toolbar seit 05.08.2026
-        entfernt). Nach der Auswahl wird der Service ueber den bestehenden
-        Pfad (edit_new_instance + add_instance) ins Set uebernommen und
-        sofort persistiert.
-        """
+        frueheren Toolbar-Auswahl. Nach der Auswahl wird der Service direkt
+        ins Set uebernommen und sofort persistiert (_add_service_to_set)."""
         if not set_id:
             return
-        if self.combo_set is not None:
-            idx = self.combo_set.findData(set_id)
-            if idx >= 0:
-                self.combo_set.setCurrentIndex(idx)
         selector = getattr(self, "service_selector", None)
         ids = sorted(selector.get_plugin_ids()) if selector is not None else []
         if not ids:
             self.log("Keine Services verfuegbar.")
             return
         pid, ok = QInputDialog.getItem(
-            self, "Service hinzufügen",
-            "Service wählen:", ids, 0, False)
+            self, "Service hinzufuegen",
+            "Service waehlen:", ids, 0, False)
         if not ok or not pid:
             return
-        self._toolbar_add_service(str(pid))
+        self._toolbar_add_service(str(pid), set_id)
 
     @Slot(str)
     def _on_delete_set(self, set_id: str) -> None:
-        """'Set loeschen' (Kontextmenue / [🗑️ Set löschen]): Set in den
-        Editor laden und delete_set() aufrufen – die P14-04-E-Sperre
-        ('letztes Set') und die Rueckfrage (Papierkorb, P14-05) greifen
-        dort zentral."""
+        """'Set loeschen' (Kontextmenue): Set laden (falls noetig) und
+        delete_set() aufrufen - die P14-04-E-Sperre ('letztes Set') und die
+        Rueckfrage (Papierkorb, P14-05) greifen dort zentral."""
         if not set_id:
             return
-        if self.combo_set is not None:
-            idx = self.combo_set.findData(set_id)
-            if idx >= 0:
-                self.combo_set.setCurrentIndex(idx)
-        self.delete_set()
-
-    def _select_service_in_editor(self, set_id: str, service_id: str) -> None:
-        """Laedt das Set in den Editor und markiert die Service-Instanz in
-        der execution_order-Liste (gemeinsame Vorbereitung fuer Order-/
-        Entfernen-Aktionen aus dem Kontextmenue)."""
-        if self.combo_set is not None:
-            idx = self.combo_set.findData(set_id)
-            if idx >= 0:
-                self.combo_set.setCurrentIndex(idx)
-        if service_id and self.list_execution_order is not None:
+        if self._current_set_id != set_id:
             try:
-                if not _qt_valid(self.list_execution_order):
-                    return
-                for i in range(self.list_execution_order.count()):
-                    item = self.list_execution_order.item(i)
-                    if item is None or not _qt_valid(item):
-                        continue
-                    if item.data(Qt.UserRole) == service_id:
-                        self.list_execution_order.setCurrentRow(i)
-                        self._current_list_iid = service_id
-                        break
-            except (RuntimeError, AttributeError):
-                pass
+                definition = self.set_repo.get_set(set_id)
+                if definition:
+                    self.load_set_into_editor(definition)
+            except Exception as e:
+                self.log(f"FEHLER beim Laden des Sets: {e}")
+                return
+        self.delete_set()
 
     @Slot(str, str, int)
     def _on_move_service(self, set_id: str, service_id: str, delta: int) -> None:
-        """Order ▲/▼ (Kontextmenue): Service in der execution_order des Sets
-        verschieben – Reuse von move_order_item(delta)."""
+        """Order / (Kontextmenue): Service in der execution_order des Sets
+        verschieben - arbeitet direkt auf der DB-Definition und persistiert
+        sofort (P14-05-Snapshot via set_repo.save_set)."""
         if not set_id or not service_id:
             return
-        self._select_service_in_editor(set_id, service_id)
-        self.move_order_item(delta)
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            self.log(f"FEHLER beim Laden des Sets: {e}")
+            return
+        if not definition:
+            self.log(f"Set '{set_id}' nicht gefunden.")
+            return
+        order = list(definition.get("execution_order") or [])
+        if service_id not in order:
+            return
+        i = order.index(service_id)
+        j = i + delta
+        if j < 0 or j >= len(order):
+            return
+        order[i], order[j] = order[j], order[i]
+        definition["execution_order"] = order
+        try:
+            self.set_repo.save_set(definition)
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern des Sets: {e}")
+            return
+        self.log(f"Reihenfolge geaendert: {service_id} "
+                 f"({'rauf' if delta < 0 else 'runter'})")
+        event_bus.service_set_changed.emit()
+        if self._current_set_id == set_id:
+            self.load_set_into_editor(definition)
 
     @Slot(str, str)
     def _on_remove_service(self, set_id: str, service_id: str) -> None:
-        """'Service entfernen' (Kontextmenue / [➖ Service entfernen]): Reuse
-        von remove_instance() – inkl. P14-04-Sperrpruefung (gesperrte
-        Services werden mit Hinweis abgelehnt)."""
+        """'Service entfernen' (Kontextmenue): P14-04-E-Sperrpruefung +
+        doppelte Nachfrage (P14-05-Snapshot), dann direkter Entzug aus der
+        DB-Definition (kein Umweg ueber die entfernte Service-Sets-Box)."""
         if not set_id or not service_id:
             return
-        self._select_service_in_editor(set_id, service_id)
-        self.remove_instance()
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            self.log(f"FEHLER beim Laden des Sets: {e}")
+            return
+        if not definition:
+            self.log(f"Set '{set_id}' nicht gefunden.")
+            return
+        services = dict(definition.get("services") or {})
+        cfg = services.get(service_id) or {}
+        plugin_id = str(cfg.get("plugin_id") or service_id)
+        # P14-04-E: Nur der LETZTE Vorkommen eines Indikator-Services ueber
+        # ALLE gespeicherten Sets ist gesperrt.
+        if self._plugin_belongs_to_indicator(plugin_id):
+            others = self._remaining_sets_with_plugin(
+                plugin_id, exclude_set_id=set_id)
+            if not others:
+                QMessageBox.warning(
+                    self, "Service gesperrt",
+                    f"Der Service '{plugin_id}' ist der letzte in einem "
+                    f"gespeicherten Service-Set.\n"
+                    f"Fuer den Indikator muss mindestens ein gueltiges Set "
+                    f"mit diesem Service erhalten bleiben (P14-04).")
+                return
+        reply = QMessageBox.question(
+            self, "Service entfernen",
+            f"Service '{service_id} [{plugin_id}]' aus dem Set entfernen?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        reply2 = QMessageBox.question(
+            self, "Wirklich?",
+            "Der bisherige Set-Stand wird als Snapshot gesichert "
+            "(service_set_history). Fortfahren?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply2 != QMessageBox.Yes:
+            return
+        order = [i for i in (definition.get("execution_order") or [])
+                 if i != service_id]
+        services.pop(service_id, None)
+        definition["execution_order"] = order
+        definition["services"] = services
+        try:
+            self.set_repo.save_set(definition)
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern des Sets: {e}")
+            return
+        self.log(f"Service entfernt: {service_id}")
+        event_bus.service_set_changed.emit()
+        if self._current_set_id == set_id:
+            self.load_set_into_editor(definition)
 
     @Slot()
     def _on_purge_trash(self) -> None:
@@ -1270,7 +1172,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         Wird beim Start und bei jedem `EventBus.favorites_changed`-Event
         aufgerufen (Verbindung im __init__). Fallback auf die Standard-
         Defaults (SILVER/GOLD/BTCUSD), falls keine Favoriten gesetzt sind –
-        damit der Scanner nie ohne Symbol-Auswahl steht. Die aktuelle
+        damit die Service-Ausführung nie ohne Symbol-Auswahl steht. Die aktuelle
         Auswahl bleibt erhalten, sofern sie noch Favorit ist.
         """
         if not self.combo_symbol:
@@ -1287,62 +1189,6 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         if idx >= 0:
             self.combo_symbol.setCurrentIndex(idx)
         self.combo_symbol.blockSignals(False)
-
-    # --- Scanner ---
-
-    @Slot()
-    def start_scan(self):
-        if self.scanner and self.scanner.isRunning():
-            self.log("Scan laeuft bereits.")
-            return
-
-        symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
-        new_scan = self.check_new_scan.isChecked() if self.check_new_scan else False
-
-        # U15-D2 (Bedien-Feinschliff): Bestätigungsdialog vor FULL SCAN.
-        # new_scan=True löscht bestehende Feature-Rows und berechnet neu
-        # (HistoricalScanner: "Modus: FULL SCAN ...") –
-        # dieser Overwrite ist unwiderruflich, daher Rückfrage.
-        if new_scan:
-            reply = QMessageBox.question(
-                self, "Voll-Scan bestätigen",
-                f"Voll-Scan für {symbol}?\n\n"
-                "Bestehende Feature-Rows werden überschrieben und neu "
-                "berechnet (unwiderruflich). Fortfahren?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            )
-            if reply != QMessageBox.Yes:
-                self.log("Voll-Scan abgebrochen.")
-                return
-
-        self.log(f"Starte Plugin-Batch: {symbol}, New Scan = {new_scan}")
-        self.btn_start.setEnabled(False)
-        self._elapsed_seconds = 0
-        self.label_elapsed.setText("00:00:00")
-        self.progress_bar.setValue(0)
-        self._elapsed_timer.start(1000)
-
-        self.scanner = HistoricalScanner(symbol, new_scan)
-        self.scanner.progress_updated.connect(self.on_progress)
-        self.scanner.scan_finished.connect(self.on_finished)
-        self.scanner.log_message.connect(self.log)
-        # Phase 16: 45s-Hintergrund-Sync pausieren, solange der Scan laeuft.
-        self._begin_sync_guard()
-        self.scanner.start()
-
-    @Slot(str, int, int)
-    def on_progress(self, message: str, current: int, total: int):
-        self.progress_bar.setMaximum(total)
-        self.progress_bar.setValue(current)
-        self.log(message)
-
-    @Slot(str, int)
-    def on_finished(self, symbol: str, count: int):
-        # Phase 16: 45s-Hintergrund-Sync nach dem Scan wieder freigeben.
-        self._end_sync_guard()
-        self._elapsed_timer.stop()
-        self.btn_start.setEnabled(True)
-        self.log(f"Scan für {symbol} beendet: {count} Feature-Rows geschrieben.")
 
     @Slot(str)
     def log(self, message: str):
@@ -1373,318 +1219,130 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         elif chosen == clear_action:
             self.text_log.clear()
 
-    def _update_elapsed(self):
-        self._elapsed_seconds += 1
-        h = self._elapsed_seconds // 3600
-        m = (self._elapsed_seconds % 3600) // 60
-        s = self._elapsed_seconds % 60
-        self.label_elapsed.setText(f"{h:02d}:{m:02d}:{s:02d}")
-
     # =========================================================================
     # Phase 13 Schritt 4: Service-Set-Verwaltung
     # =========================================================================
 
-    def refresh_set_list(self) -> None:
-        """Befüllt das Set-Dropdown aus ServiceSetRepository.list_sets().
-
-        Quelle für die Set-Auswahl (Roadmap §4.2). Behält die aktuelle
-        Auswahl bei, sofern sie noch existiert; andernfalls wird das erste
-        Set geladen und in den Editor übertragen.
-        """
-        if not self.combo_set:
-            return
-        sets = self.set_repo.list_sets()
-        current = self.combo_set.currentData()
-
-        self.combo_set.blockSignals(True)
-        self.combo_set.clear()
-        for s in sets:
-            label = s.get("display_name") or s.get("set_id") or "Unbenannt"
-            self.combo_set.addItem(label, s.get("set_id"))
-        self.combo_set.blockSignals(False)
-
-        # Aktuelle Auswahl beibehalten, falls noch vorhanden.
-        selected_id: Optional[str] = None
-        if current is not None:
-            idx = self.combo_set.findData(current)
-            if idx >= 0:
-                self.combo_set.setCurrentIndex(idx)
-                selected_id = current
-
-        if selected_id is None and sets:
-            # Achtung: addItem() setzt das erste Item automatisch auf Index 0,
-            # während die Signale blockiert sind -> setCurrentIndex(0) löst KEIN
-            # currentIndexChanged aus. Daher explizit in den Editor laden.
-            self.combo_set.setCurrentIndex(0)
-            selected_id = self.combo_set.itemData(0)
-
-        if selected_id:
-            definition = self.set_repo.get_set(selected_id)
-            if definition:
-                self.load_set_into_editor(definition)
-        else:
-            # Kein Set (mehr) vorhanden -> Editor leeren
-            self._clear_set_editor()
-
     def _clear_set_editor(self) -> None:
-        """Leert Name-Feld, Beschreibung und execution_order-Liste des Set-Editors."""
+        """Leert den Set-Zustand (ohne Phase-13-Box: nur interne Felder +
+        Parameter-Spalten)."""
         self._current_set_id = None
         self._current_set_definition = None
-        self._current_list_iid = None
-        if self.edit_set_name:
-            self.edit_set_name.clear()
-        if self.edit_set_description:
-            self.edit_set_description.clear()
-        if self.list_execution_order:
-            self.list_execution_order.clear()
         # Phase 15 (Dirty-State): Marker des vorherigen Sets entfernen.
         self._clear_dirty_markers()
         self._clear_service_columns()
 
-    @Slot(int)
-    def _on_set_selected(self, index: int) -> None:
-        """Lädt das im Dropdown gewählte Set in den Editor."""
-        if index < 0 or not self.combo_set:
-            return
-        set_id = self.combo_set.itemData(index)
-        if not set_id:
-            return
-        definition = self.set_repo.get_set(set_id)
-        if definition:
-            self.load_set_into_editor(definition)
-            self.log(f"Set geladen: {set_id}")
-
     def load_set_into_editor(self, definition: Dict[str, Any]) -> None:
-        """Überträgt eine ServiceSetDefinition in Name-Feld + execution_order-Liste.
-
-        Phase 13 5.4 Schritt 1: Baut zusätzlich die dynamischen Service-Spalten
-        (eine QGroupBox pro Service mit Parameter-Formular) auf.
-        """
-        # Phase 15 (Dirty-State): Marker des vorherigen Sets entfernen –
-        # ein frisch geladenes Set ist per Definition unverändert (kein '*').
+        """Uebernimmt eine ServiceSetDefinition in den internen Zustand und
+        baut die dynamischen Service-Spalten (Parameterfenster, rechte
+        Splitter-Spalte) neu auf."""
+        # Phase 15 (Dirty-State): Marker des vorherigen Sets entfernen - ein
+        # frisch geladenes Set ist per Definition unveraendert (kein '*').
         self._clear_dirty_markers()
         self._current_set_id = definition.get("set_id")
         self._current_set_definition = definition
-        self._current_list_iid = None
-        if self.edit_set_name:
-            self.edit_set_name.setText(definition.get("display_name") or "")
-        if self.edit_set_description:
-            self.edit_set_description.setText(definition.get("description") or "")
-        if self.list_execution_order:
-            self.list_execution_order.clear()
-            services = definition.get("services") or {}
-            for iid in (definition.get("execution_order") or []):
-                cfg = services.get(iid, {})
-                plugin_id = cfg.get("plugin_id", "?")
-                prefix, lock_tip = self._service_lock(plugin_id)
-                item = QListWidgetItem(f"{prefix}{iid}  [{plugin_id}]")
-                item.setData(Qt.UserRole, iid)
-                item.setData(Qt.UserRole + 1, plugin_id)
-                item.setToolTip(self._build_tooltip(iid, cfg) + lock_tip)
-                self.list_execution_order.addItem(item)
         self._build_service_columns(definition)
 
-    def collect_current_order(self) -> list:
-        """Liefert die instance_ids aus der Liste (aktuelle execution_order)."""
-        if not self.list_execution_order:
-            return []
-        return [
-            self.list_execution_order.item(i).data(Qt.UserRole)
-            for i in range(self.list_execution_order.count())
-        ]
+    def _next_instance_id(self, services: Dict[str, Any],
+                          plugin_id: str) -> str:
+        """Liefert die naechste freie instance_id fuer ein Plugin im Set.
 
-    @Slot()
-    def move_order_item(self, delta: int) -> None:
-        """Verschiebt das markierte Listenelement um delta (-1 = hoch, +1 = runter)."""
-        lw = self.list_execution_order
-        if not lw:
-            return
-        row = lw.currentRow()
-        if row < 0:
-            return
-        new_row = row + delta
-        if new_row < 0 or new_row >= lw.count():
-            return
-        item = lw.takeItem(row)
-        lw.insertItem(new_row, item)
-        lw.setCurrentRow(new_row)
-        self._rebuild_columns()
-        # Bugfix 05.08.2026: Reihenfolge SOFORT persistieren (P14-05-Snapshot)
-        # + EventBus-Live-Sync (MasterTree/Set-Anzeige zeigen die neue Order).
-        self._persist_current_set("Reihenfolge geaendert")
+        Basis ist der plugin_id selbst (z.B. 'proximity'); bei bereits
+        vorhandener Instanz werden '_2', '_3', ... angehaengt."""
+        base = plugin_id
+        if base not in services:
+            return base
+        i = 2
+        while f"{base}_{i}" in services:
+            i += 1
+        return f"{base}_{i}"
 
-    @Slot()
-    def remove_instance(self) -> None:
-        """Entfernt den markierten Service aus der Ausführungs-Reihenfolge.
+    def _add_service_to_set(self, set_id: str, plugin_id: str) -> None:
+        """Fuegt einen Service (Plugin) mit Registry-Defaults zum Set hinzu.
 
-        P14-04-E (Service-Sperre): Einzel-Services, die in einem gespeicherten
-        Service-Set vorkommen, dürfen NICHT entfernt werden – sonst würde das
-        Set invalide und der Indikator verlöre seine Basisservices. Beim
-        Löschversuch erscheint ein Hinweis mit dem Namen des verwendeten Sets.
-        """
-        lw = self.list_execution_order
-        if not lw or lw.currentRow() < 0:
+        Phase 13-Bereinigung (05.08.2026): ersetzt den frueheren
+        Eingabe-/Hinzufuegen-Pfad der entfernten Service-Sets-Box.
+        Die instance_id wird automatisch vergeben (plugin_id bzw.
+        plugin_id_2/_3/...), Duplikate werden dadurch ausgeschlossen.
+        Persistiert sofort (set_repo.save_set) + EventBus-Live-Sync."""
+        if not set_id or not plugin_id:
             return
-        item = lw.item(lw.currentRow())
-        plugin_id = str(item.data(Qt.UserRole + 1) or item.data(Qt.UserRole) or "")
-        # P14-04-E (Bugfix 05.08.2026): Nur der LETZTE Vorkommen eines
-        # Indikator-Services ueber ALLE gespeicherten Sets ist gesperrt –
-        # solange ein anderes gültiges Set den Service enthaelt, darf er
-        # entfernt werden.
-        if self._plugin_belongs_to_indicator(plugin_id):
-            others = self._remaining_sets_with_plugin(
-                plugin_id, exclude_set_id=self._current_set_id)
-            if not others:
-                QMessageBox.warning(
-                    self, "Service gesperrt",
-                    f"Der Service '{plugin_id}' ist der letzte in einem "
-                    f"gespeicherten Service-Set.\n"
-                    f"Für den Indikator muss mindestens ein gültiges Set "
-                    f"mit diesem Service erhalten bleiben (P14-04).")
-                return
-        # Bugfix 05.08.2026: Doppelte Sicherheitsabfrage (P14-05) – der
-        # bisherige Set-Stand wird als Snapshot in service_set_history
-        # gesichert, bevor der Service entfernt wird.
-        iid = str(item.data(Qt.UserRole) or "")
-        reply = QMessageBox.question(
-            self, "Service entfernen",
-            f"Service '{iid} [{plugin_id}]' aus dem Set entfernen?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply != QMessageBox.Yes:
-            return
-        reply2 = QMessageBox.question(
-            self, "Wirklich?",
-            "Der bisherige Set-Stand wird als Snapshot gesichert "
-            "(service_set_history). Fortfahren?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply2 != QMessageBox.Yes:
-            return
-        lw.takeItem(lw.currentRow())
-        self._rebuild_columns()
-        # Bugfix 05.08.2026: Entfernen SOFORT persistieren + EventBus-Sync.
-        self._persist_current_set("Service entfernt")
-
-    @Slot()
-    def _on_plugin_select_changed(self, plugin_id: str) -> None:
-        """Füllt das Instanz-Feld mit 'plugin_id [plugin_id]' vor, wenn der
-        User einen Service aus dem verfügbaren-Dropdown wählt (Schritt 6-
-        Korrektur: alle Services sichtbar + auswählbar)."""
-        if not plugin_id or not self.edit_new_instance:
-            return
-        self.edit_new_instance.setText(f"{plugin_id} [{plugin_id}]")
-
-    @Slot()
-    def add_instance(self) -> None:
-        """Fügt eine Service-Instanz 'instance_id [plugin_id]' zur Liste hinzu.
-
-        Plugin muss in der PluginRegistry existieren (Default-Params werden
-        beim Speichern eines neuen Sets verwendet). Duplikate werden abgelehnt.
-        """
-        if not self.edit_new_instance or not self.list_execution_order:
-            return
-        text = self.edit_new_instance.text().strip()
-        # Fallback: leeres Feld + Service im verfügbaren-Dropdown gewählt
-        if not text and self.combo_plugin_select:
-            plugin_id = self.combo_plugin_select.currentText()
-            if plugin_id:
-                text = f"{plugin_id} [{plugin_id}]"
-        if not text:
-            return
-        # Formate: "instance_id [plugin_id]", "instance_id:plugin_id" oder "instance_id"
-        import re
-        m = re.match(r"^([\w\-]+)\s*[\[:]\s*([\w\-]+)\s*\]?$", text)
-        if m:
-            iid, plugin_id = m.group(1), m.group(2)
-        else:
-            iid = text
-            plugin_id = text
-
         try:
             from analytics.features.feature_builder import PluginRegistry
-            PluginRegistry().get(plugin_id)
+            plugin = PluginRegistry().get(plugin_id)
         except KeyError:
             self.log(f"Plugin '{plugin_id}' nicht gefunden. "
-                     f"Verfügbare Plugins: {_available_plugin_ids()}")
+                     f"Verfuegbare Plugins: {_available_plugin_ids()}")
             return
-
-        for i in range(self.list_execution_order.count()):
-            if self.list_execution_order.item(i).data(Qt.UserRole) == iid:
-                self.log(f"instance_id '{iid}' existiert bereits.")
-                return
-
-        prefix, lock_tip = self._service_lock(plugin_id)
-        item = QListWidgetItem(f"{prefix}{iid}  [{plugin_id}]")
-        item.setData(Qt.UserRole, iid)
-        item.setData(Qt.UserRole + 1, plugin_id)
-        item.setToolTip(self._build_tooltip(iid, {"plugin_id": plugin_id}) + lock_tip)
-        self.list_execution_order.addItem(item)
-        self.edit_new_instance.clear()
-        self.log(f"Service hinzugefügt: {iid} [{plugin_id}]")
-        self._rebuild_columns()
-        # Bugfix 05.08.2026: Hinzufuegen SOFORT persistieren (nur bei
-        # geladenem Set) + EventBus-Live-Sync (Tree zeigt den neuen Service).
-        self._persist_current_set("Service hinzugefuegt")
-
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            self.log(f"FEHLER beim Laden des Sets ({set_id}): {e}")
+            return
+        if not definition:
+            self.log(f"Set '{set_id}' nicht gefunden.")
+            return
+        services = dict(definition.get("services") or {})
+        order = list(definition.get("execution_order") or [])
+        iid = self._next_instance_id(services, plugin_id)
+        params = dict(getattr(plugin, "default_params", None) or {})
+        lookback = 1000
+        if "lookback" in params:
+            try:
+                lookback = int(params.pop("lookback") or 1000)
+            except (TypeError, ValueError):
+                lookback = 1000
+        services[iid] = {
+            "plugin_id": plugin_id,
+            "lookback": lookback,
+            "params": params,
+            "version": getattr(plugin, "version", "0.0.0") or "0.0.0",
+        }
+        order.append(iid)
+        definition["execution_order"] = order
+        definition["services"] = services
+        try:
+            self.set_repo.save_set(definition)
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern des Sets: {e}")
+            return
+        self.log(f"Service hinzugefuegt: {iid} [{plugin_id}]")
+        event_bus.service_set_changed.emit()
+        # Aktuelle Editor-Spalten aktualisieren, wenn das Set geladen ist.
+        if self._current_set_id == set_id:
+            self.load_set_into_editor(definition)
     def collect_set_definition(self) -> Dict[str, Any]:
-        """Baut aus dem Editor eine ServiceSetDefinition.
+        """Baut aus dem internen Set-Zustand + Parameter-Spalten eine
+        ServiceSetDefinition.
 
-        Für ein geladenes Set werden die services aus der DB übernommen;
-        für neue Instanzen (bzw. neue Sets) werden die services aus den
-        Listeneinträgen aufgebaut (plugin_id + Default-Params aus der
-        Registry). Die Werte der dynamischen Service-Spalten (5.4 Schritt 1)
-        werden anschließend in die services-Konfiguration übernommen.
-        """
-        order = self.collect_current_order()
-        services: Dict[str, Any] = {}
-        if self._current_set_id:
-            existing = self.set_repo.get_set(self._current_set_id) or {}
-            services = dict(existing.get("services") or {})
+        Phase 13-Bereinigung (05.08.2026): Ohne die entfernte Service-Sets-
+        Box kommen Name/Beschreibung/Reihenfolge direkt aus der geladenen
+        DB-Definition (_current_set_definition); die Werte der dynamischen
+        Service-Spalten werden in die services-Konfiguration uebernommen."""
+        current = dict(self._current_set_definition or {})
+        order = list(current.get("execution_order") or [])
+        services = dict(current.get("services") or {})
 
-        # Jede Instanz in der Reihenfolge braucht eine services-Konfiguration –
-        # neue Instanzen erhalten Default-Params aus der Registry.
-        from analytics.features.feature_builder import PluginRegistry
-        registry = PluginRegistry()
-        if self.list_execution_order:
-            for i in range(self.list_execution_order.count()):
-                item = self.list_execution_order.item(i)
-                iid = item.data(Qt.UserRole)
-                plugin_id = item.data(Qt.UserRole + 1) or iid
-                if not iid:
-                    continue
-                if iid not in services:
-                    try:
-                        plugin = registry.get(plugin_id)
-                        cfg: Dict[str, Any] = {
-                            "plugin_id": plugin_id,
-                            "lookback": 1000,
-                            "params": dict(plugin.default_params),
-                        }
-                    except KeyError:
-                        cfg = {"plugin_id": plugin_id, "lookback": 1000, "params": {}}
-                    services[iid] = cfg
-
-        # Werte aus den dynamischen Service-Spalten übernehmen.
-        # lookback ist die Service-Instanz-Einstellung (ServiceInstanceConfig.
-        # lookback) und wird NICHT in params geschrieben.
+        # Werte aus den dynamischen Service-Spalten uebernehmen (lookback =
+        # Service-Instanz-Einstellung, wird NICHT in params geschrieben).
         for (iid, key), ctrl in self._service_param_controls.items():
-            cfg = services.setdefault(iid, {"plugin_id": "", "lookback": 1000, "params": {}})
+            cfg = services.setdefault(
+                iid, {"plugin_id": "", "lookback": 1000, "params": {}})
             if key == "lookback":
                 cfg["lookback"] = int(self._ctrl_value(ctrl))
             else:
                 cfg.setdefault("params", {})[key] = self._ctrl_value(ctrl)
 
-        # Phase 14 P14-01: Instanz-Beschreibung aus den Spalten übernehmen
-        # (ServiceInstanceConfig.description – gehört NICHT in params).
+        # Instanz-Beschreibung aus den Spalten uebernehmen
+        # (ServiceInstanceConfig.description - gehoert NICHT in params).
         for iid, ctrl in self._service_desc_controls.items():
-            cfg = services.setdefault(iid, {"plugin_id": "", "lookback": 1000, "params": {}})
+            cfg = services.setdefault(
+                iid, {"plugin_id": "", "lookback": 1000, "params": {}})
             cfg["description"] = ctrl.text().strip()
 
-        # Phase 14 P14-04: Semantische Versionierung – bei JEDER instance_id
-        # wird die aktuelle plugin.version aus der PluginRegistry eingestempelt
-        # (ServiceInstanceConfig.version). So trägt jede gespeicherte Instanz
-        # die Version des erzeugenden Plugins für den späteren Schema-Migrator.
-        # Kann ein Plugin nicht aufgelöst werden (z. B. deinstalliert), bleibt
-        # ein vorhandenes version-Feld bzw. dessen Fehlen unverändert erhalten.
+        # Semantische Versionierung: aktuelle plugin.version einstempeln.
+        from analytics.features.feature_builder import PluginRegistry
+        registry = PluginRegistry()
         for iid, cfg in services.items():
             pid = cfg.get("plugin_id") or iid
             try:
@@ -1695,19 +1353,12 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
 
         return {
             "set_id": self._current_set_id or "",
-            "display_name": self.edit_set_name.text().strip() if self.edit_set_name else "",
-            # Phase 14 P14-01: Set-Beschreibung wird mitgespeichert
-            "description": self.edit_set_description.text().strip() if self.edit_set_description else "",
-            # Bugfix 05.08.2026: explizite Indikator-Zuordnung erhalten
-            "indicator_id": (self._current_set_definition or {}).get("indicator_id"),
+            "display_name": str(current.get("display_name") or ""),
+            "description": str(current.get("description") or ""),
+            "indicator_id": current.get("indicator_id"),
             "execution_order": order,
             "services": services,
         }
-
-    # =========================================================================
-    # Phase 14 P14-01: Tooltips & Info-Dialog für Service-Instanzen
-    # =========================================================================
-
     def _build_tooltip(self, instance_id: str, config: Dict[str, Any]) -> str:
         """Baut einen Rich-Text-Tooltip (HTML) für eine Service-Instanz.
 
@@ -1735,58 +1386,6 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         return "🔒 ", (f"<br><b>Gesperrt (P14-04)</b>: wird vom Service-Set "
                        f"'{names[0]}' verwendet – Entfernen nicht möglich")
 
-    def _on_order_item_clicked(self, item: QListWidgetItem) -> None:
-        """Merkt sich die aktuell markierte instance_id (itemClicked).
-
-        Bugfix 05.08.2026 (Punkt 3): Klick auf einen anderen Service in der
-        Ausfuehrungs-Liste blendet die Speicher-Buttons aus (sie sind nur
-        waehrend einer manuellen Parameter-Aenderung sichtbar).
-        """
-        self._set_param_actions_visible(False)
-        if item is not None:
-            self._current_list_iid = item.data(Qt.UserRole)
-
-    def _sync_list_selection(self) -> None:
-        """Synchronisiert _current_list_iid mit der aktuellen Selektion."""
-        if self.list_execution_order is not None:
-            row = self.list_execution_order.currentRow()
-            if row >= 0:
-                self._current_list_iid = self.list_execution_order.item(row).data(Qt.UserRole)
-
-
-    @Slot()
-    def _show_service_info(self) -> None:
-        """Öffnet den ServiceDescriptionDialog für die markierte Instanz.
-
-        Phase 15 U15-D1: Der Info-/Beschreibungs-Dialog selbst ist bereits
-        extern ausgelagert (analytics/engine/description_dialog.py,
-        ServiceDescriptionDialog); diese Slot-Methode öffnet ihn nur noch.
-        """
-        iid = self._current_list_iid
-        if not iid or self.list_execution_order is None:
-            self.log("Keine Service-Instanz markiert.")
-            return
-        cfg: Dict[str, Any] = {}
-        plugin = None
-        if self._current_set_definition:
-            cfg = dict((self._current_set_definition.get("services") or {}).get(iid, {}))
-        # Live-Beschreibung aus dem Eingabefeld übernehmen (falls vorhanden)
-        desc_ctrl = self._service_desc_controls.get(iid)
-        if desc_ctrl is not None:
-            cfg["description"] = desc_ctrl.text().strip()
-        plugin_id = cfg.get("plugin_id") or iid
-        try:
-            from analytics.features.feature_builder import PluginRegistry
-            plugin = PluginRegistry().get(plugin_id)
-        except KeyError:
-            self.log(f"Plugin '{plugin_id}' nicht gefunden.")
-            return
-        dlg = ServiceDescriptionDialog.from_plugin(plugin, instance_id=iid, config=cfg, parent=self)
-        dlg.exec()
-
-    # -------------------------------------------------------------------------
-    # Phase 16 (05.08.2026): Modaler Beschreibungs-Editor (Service & Set)
-    # -------------------------------------------------------------------------
     def _open_service_desc_editor(self, instance_id: str) -> None:
         """Oeffnet den modalen ServiceDescriptionEditDialog fuer die Instanz-
         Beschreibung (Stift-Button im Parameter-Panel).
@@ -1875,8 +1474,6 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         Source of Truth ist das JSON-Payload des Sets in app_data.duckdb.
         """
         clean = (new_desc or "").strip()
-        if self.edit_set_description is not None and _qt_valid(self.edit_set_description):
-            self.edit_set_description.setText(clean)
         if self._current_set_definition is not None and \
                 self._current_set_definition.get("set_id") == set_id:
             self._current_set_definition["description"] = clean
@@ -1990,7 +1587,6 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
     def _resolve_info_plugin(self, plugin_id: str):
         """Liefert das Plugin aus der Registry (oder None + Log-Eintrag)."""
         try:
-            from analytics.features.feature_builder import PluginRegistry
             return PluginRegistry().get(plugin_id)
         except KeyError:
             self.log(f"Plugin '{plugin_id}' nicht gefunden.")
@@ -2021,83 +1617,66 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                 else f"im {label}")
 
     @Slot()
-    def save_set(self) -> None:
-        """Speichert das aktive Set – analog zur Preset-Verwaltung (generisch).
-
-        Namensdialog (vorbelegt), leerer Name → Auto-Name aus den instance_ids
-        (z.B. 'grid_1 + prox_1'), Überschreiben-Rückfrage bei doppeltem Namen.
-        Implementierung: NamedItemActionsMixin.save_named_item() mit dem
-        Service-Set-Adapter (ServiceSetItemAdapter).
-        """
-        self.save_named_item(
-            self._set_adapter,
-            dialog_title="Service-Set speichern",
-            prompt="Name für das Service-Set:",
-        )
-
-    @Slot()
     def delete_set(self) -> None:
-        """Löscht das gewählte Set – analog zur Preset-Verwaltung (generisch).
+        """Loescht das aktive Set in den Papierkorb (P14-05).
 
-        Rückfrage (QMessageBox.question), danach wird das nächstverfügbare Set
-        ausgewählt. Implementierung: NamedItemActionsMixin.delete_named_item()
-        mit dem Service-Set-Adapter.
-
-        P14-04-E (Set-Sperre): Es muss immer mindestens ein gültiges Service-
-        Set erhalten bleiben, damit der Indikator funktionsfähig bleibt. Das
-        Löschen des letzten verbliebenen Sets ist gesperrt.
-        """
-        # P14-04-E (Bugfix 05.08.2026): Ein Set darf gelöscht werden,
-        # solange für jeden Indikator-Service des Sets in einem ANDEREN
-        # gespeicherten Set noch ein Vorkommen existiert (gültiges Set für
-        # den Indikator bleibt erhalten). Enthält das Set den LETZTEN
-        # Vorkommen eines Indikator-Services, ist das Löschen gesperrt.
-        current_id = self._set_adapter._item_current_id()
-        current = next(
-            (s for s in self.set_repo.list_sets()
-             if s.get("set_id") == current_id),
-            None,
-        )
-        if current:
-            services = current.get("services") or {}
-            for cfg in services.values():
-                if not isinstance(cfg, dict):
-                    continue
-                pid = str(cfg.get("plugin_id") or "")
-                if not pid or not self._plugin_belongs_to_indicator(pid):
-                    continue
-                others = self._remaining_sets_with_plugin(
-                    pid, exclude_set_id=current_id)
-                if not others:
-                    QMessageBox.warning(
-                        self, "Löschen gesperrt",
-                        f"Dieses Service-Set enthält den letzten "
-                        f"gespeicherten Service '{pid}' für den Indikator.\n"
-                        f"Es muss mindestens ein gültiges Set mit diesem "
-                        f"Service erhalten bleiben (P14-04).")
-                    return
-        # Bugfix 05.08.2026: Erste Bestaetigung – das Set wird in den
-        # Papierkorb (service_sets_trash) verschoben (Wiederherstellung
-        # ueber den Papierkorb-Dialog moeglich).
-        name = self._set_adapter._item_current_name()
-        if not name:
+        Phase 13-Bereinigung (05.08.2026): Ohne die entfernte Service-Sets-
+        Box wird direkt auf die DB-Definition des geladenen Sets zugegriffen
+        (kein NamedItemAdapter mehr). P14-04-E-Sperre ('letztes Set') und
+        Papierkorb-Rueckfrage bleiben unveraendert."""
+        current_id = self._current_set_id
+        if not current_id:
+            self.log("Kein Set geladen - Loeschen nicht moeglich.")
             return
+        current = None
+        try:
+            current = self.set_repo.get_set(current_id)
+        except Exception as e:
+            self.log(f"FEHLER beim Laden des Sets: {e}")
+            return
+        if not current:
+            self.log(f"Set '{current_id}' nicht gefunden.")
+            return
+        # P14-04-E-Sperre: Letzter Vorkommen eines Indikator-Services.
+        services = current.get("services") or {}
+        for cfg in services.values():
+            if not isinstance(cfg, dict):
+                continue
+            pid = str(cfg.get("plugin_id") or "")
+            if not pid or not self._plugin_belongs_to_indicator(pid):
+                continue
+            others = self._remaining_sets_with_plugin(
+                pid, exclude_set_id=current_id)
+            if not others:
+                QMessageBox.warning(
+                    self, "Loeschen gesperrt",
+                    f"Dieses Service-Set enthaelt den letzten "
+                    f"gespeicherten Service '{pid}' fuer den Indikator.\n"
+                    f"Es muss mindestens ein gueltiges Set mit diesem "
+                    f"Service erhalten bleiben (P14-04).")
+                return
+        name = str(current.get("display_name") or current_id)
         reply = QMessageBox.question(
             self, "Set in den Papierkorb verschieben",
             f"Set '{name}' wirklich in den Papierkorb verschieben?\n"
-            f"(Wiederherstellung über den Papierkorb-Dialog möglich.)",
+            f"(Wiederherstellung ueber den Papierkorb-Dialog moeglich.)",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
-        # Bugfix 05.08.2026 (Papierkorb): KEINE zweite Nachfrage – das Set
-        # ist soft-deleted (Papierkorb), daher delete_named_item mit
-        # confirm=False (die Rueckfrage lief oben bereits).
-        self.delete_named_item(self._set_adapter, confirm=False)
-
-    # =========================================================================
-    # Phase 14 P14-05: Papierkorb (Soft-Delete / Wiederherstellung)
-    # =========================================================================
-
+        try:
+            ok = self.set_repo.delete_set(current_id)
+        except Exception as e:
+            self.log(f"FEHLER beim Loeschen des Sets: {e}")
+            return
+        if not ok:
+            self.log(f"Set '{current_id}' nicht gefunden.")
+            return
+        self.log(f"Set in den Papierkorb verschoben (P14-05): {current_id}")
+        event_bus.service_set_changed.emit()
+        self._current_set_id = None
+        self._current_set_definition = None
+        self._clear_dirty_markers()
+        self._clear_service_columns()
     @Slot()
     def show_trash_dialog(self) -> None:
         """Öffnet den Papierkorb-Dialog für Service-Sets (P14-05).
@@ -2109,7 +1688,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         dialog = ServiceSetTrashDialog(
             repo=self.set_repo,
             log_fn=self.log,
-            refresh_fn=self.refresh_set_list,
+            refresh_fn=lambda: None,
             parent=self,
         )
         dialog.exec()
@@ -2118,94 +1697,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
     # Phase 14 P14-02: Hot-Reload der Plugins (Dynamic Discovery)
     # =========================================================================
 
-    @Slot()
-    def reload_plugins(self) -> None:
-        """Lädt Custom-Plugins aus data/custom_plugins/ neu (Hot-Reload).
-
-        P14-02: Ruft PluginRegistry().reload() auf (unter RLock) und
-        aktualisiert das verfügbare-Services-Dropdown. Bereits laufende
-        Service-Ausführungen laufen auf ihren bisherigen Objektinstanzen
-        weiter; neue Instanziierungen nutzen die neuen Klassen.
-        """
-        try:
-            from analytics.features.feature_builder import PluginRegistry
-            registry = PluginRegistry()
-            registry.reload()
-            self.log("Plugins neu geladen.")
-        except Exception as e:
-            self.log(f"FEHLER beim Plugin-Reload: {e}")
-        # Dropdown aktualisieren (neue Custom-Plugins sichtbar machen)
-        if self.combo_plugin_select:
-            current = self.combo_plugin_select.currentText()
-            self.combo_plugin_select.blockSignals(True)
-            self.combo_plugin_select.clear()
-            for pid in sorted(PluginRegistry().plugins.keys()):
-                self.combo_plugin_select.addItem(pid, pid)
-            idx = self.combo_plugin_select.findText(current)
-            self.combo_plugin_select.setCurrentIndex(idx if idx >= 0 else 0)
-            self.combo_plugin_select.blockSignals(False)
-        self.log(f"Verfügbare Plugins: {_available_plugin_ids()}")
-
-    @Slot()
-    def execute_set(self) -> None:
-        """Startet den ServiceSetEvaluator für das aktive Set (Hintergrund-Thread)."""
-        definition = self.collect_set_definition()
-        if not definition.get("execution_order"):
-            self.log("Keine Services in der Ausführungs-Reihenfolge.")
-            return
-        if not definition.get("services"):
-            self.log("Set hat keine services-Konfiguration – Ausführung nicht möglich.")
-            return
-        if self._set_run_worker and self._set_run_worker.isRunning():
-            self.log("Set-Ausführung läuft bereits.")
-            return
-
-        symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
-        timeframe = self.combo_tf_set.currentText() if self.combo_tf_set else "H1"
-
-        if self.btn_execute_set:
-            # U15-D2 (Bedien-Feinschliff): sichtbarer Button-Lock – der
-            # Button wird deaktiviert und zeigt 'Läuft...', solange der
-            # Worker aktiv ist (verhindert doppeltes Ausführen).
-            self.btn_execute_set.setEnabled(False)
-            self.btn_execute_set.setText("Läuft...")
-        self._set_run_worker = ServiceSetRunWorker(
-            self.set_evaluator, symbol, timeframe, definition, parent=self,
-        )
-        self._set_run_worker.log_message.connect(self.log)
-        self._set_run_worker.run_finished.connect(self._on_set_run_finished)
-        self._set_run_worker.run_failed.connect(self._on_set_run_failed)
-        # Phase 16: 45s-Hintergrund-Sync pausieren, solange der Run laeuft.
-        self._begin_sync_guard()
-        self._set_run_worker.start()
-
-    @Slot(str, int)
-    def _on_set_run_finished(self, set_id: str, count: int) -> None:
-        # Phase 16: 45s-Hintergrund-Sync wieder freigeben.
-        self._end_sync_guard()
-        if self.btn_execute_set:
-            self.btn_execute_set.setEnabled(True)
-            self.btn_execute_set.setText("Ausführen")
-        self.log(f"Set-Ausführung abgeschlossen: {count} Services.")
-
-    @Slot(str, str)
-    def _on_set_run_failed(self, set_id: str, error: str) -> None:
-        # Phase 16: 45s-Hintergrund-Sync auch bei Fehler freigeben.
-        self._end_sync_guard()
-        if self.btn_execute_set:
-            self.btn_execute_set.setEnabled(True)
-            self.btn_execute_set.setText("Ausführen")
-        self.log(f"FEHLER bei Set-Ausführung: {error}")
-
     def closeEvent(self, event):
         # PersistentWindow.save_state() wird in super().closeEvent gerufen
-        if self.scanner and self.scanner.isRunning():
-            self.scanner.stop()
-            self.scanner.wait(2000)
-        if self._set_run_worker and self._set_run_worker.isRunning():
-            self._set_run_worker.wait(2000)
         # 05.08.2026: Gezielter Kontextmenue-Run-Worker sauber beenden.
         if self._run_worker and self._run_worker.isRunning():
             self._run_worker.wait(2000)
-        self._elapsed_timer.stop()
         super().closeEvent(event)
