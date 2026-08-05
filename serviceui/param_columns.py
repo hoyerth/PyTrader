@@ -15,7 +15,7 @@ _service_lock/_build_tooltip (ServiceWindow).
 
 from typing import Any, Dict
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QCoreApplication, QEvent, Qt, QTimer
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QSizePolicy, QSpinBox, QVBoxLayout,
@@ -184,7 +184,17 @@ class ServiceParamColumnsMixin:
 
     def _mark_service_dirty(self, iid: str) -> None:
         """Versieht den Service-Knoten im MasterTree mit einem '*' (und
-        merkt den Dirty-Zustand fuer Baum-Neuaufbauten)."""
+        merkt den Dirty-Zustand fuer Baum-Neuaufbauten).
+
+        Bugfix 05.08.2026 (Punkt 2): Blendet zusaetzlich die Speicher-
+        Buttons der Parameter-Spalte ein (_set_param_actions_visible im
+        Orchestrator) - eine manuelle Parameter-Aenderung macht das
+        Speichern erst noetig/sichtbar.
+        """
+        try:
+            self._set_param_actions_visible(True)
+        except (RuntimeError, AttributeError):
+            pass
         selector = getattr(self, "service_selector", None)
         tree = getattr(selector, "master_tree", None)
         if tree is None or not iid:
@@ -228,8 +238,56 @@ class ServiceParamColumnsMixin:
         daher fälschlich schrumpfen. _schedule_reflow() zerstört die
         deleteLater-Widgets und berechnet die Größe erst aus dem konsistenten
         Zustand (ContentScrollMixin).
+
+        Zusatz (Layout-Runde 2, 05.08.2026): Die Service-Parameter-Box liegt
+        in einer ContentScrollArea mit widgetResizable=False – die ScrollArea
+        resizet das Widget NICHT automatisch. Die Box wird daher DEFERRED
+        (nach dem Zerstören der deleteLater-Altspalten) auf ihre aktuelle
+        Layout-Größe gesetzt, damit die ScrollArea Scrollbalken anzeigen
+        kann, sobald die Box das max. Format übersteigt (Punkt 5).
         """
         self._schedule_reflow()
+        QTimer.singleShot(0, self._resize_param_box_deferred)
+
+    def _resize_param_box_deferred(self) -> None:
+        """Setzt die Service-Parameter-Box (in der ContentScrollArea) DEFERRED
+        auf ihre aktuelle Layout-Größe.
+
+        Muss NACH dem Zerstören der per deleteLater() markierten Alt-Spalten
+        laufen – ein synchrones resize in _reflow() würde den veralteten
+        QWidgetItemV2-sizeHint (18x18 für ein gerade geleertes Layout) lesen
+        und die Box auf 18x18 schrumpfen (Bugfix 05.08.2026, Punkt 5).
+        """
+        try:
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        except (RuntimeError, AttributeError):
+            pass
+        box = getattr(self, "widget_service_columns", None)
+        if box is None or box.layout() is None:
+            return
+        try:
+            box.updateGeometry()
+            box.resize(box.layout().sizeHint())
+            scroll = getattr(self, "_param_scroll", None)
+            if scroll is not None:
+                scroll.updateGeometry()
+            # Bugfix 05.08.2026 (Punkt 1): Der QSplitter fixiert die
+            # Spaltengroessen beim addWidget (VOR dem Spaltenaufbau) und
+            # aktualisiert sie nicht, wenn die sizeHints danach wachsen
+            # (Qt-Quirk, analog QWidgetItemV2). Nach dem Spaltenaufbau wird
+            # die Param-Spalte auf ihre aktuelle Layout-Breite gesetzt, damit
+            # 2 Services nebeneinander ohne horizontalen Scroll passen.
+            splitter = getattr(self, "main_splitter", None)
+            if splitter is not None and splitter.count() == 3:
+                hints = []
+                for i in range(splitter.count()):
+                    w = splitter.widget(i)
+                    if w is not None:
+                        hints.append(w.sizeHint().width())
+                if hints:
+                    splitter.setSizes(hints)
+        except (RuntimeError, AttributeError):
+            pass
 
     def _clear_service_columns(self) -> None:
         """Entfernt alle Service-Spalten aus dem service_columns_layout."""
@@ -261,33 +319,19 @@ class ServiceParamColumnsMixin:
             pid = cfg.get("plugin_id") or iid
             col = self._build_service_column(iid, pid, cfg)
             self.service_columns_layout.addWidget(col)
-        # BUGFIX 05.08.2026 (Dirty-State-Aktionsleiste): Die Parameter-Box
-        # (widget_service_columns) liegt seit dem 15.02-Splitter-Refactoring
-        # im _editor_panel (unter group_service_sets, über der Aktionsleiste).
-        # Der frühere Reinsert in die top_row (Alt-Layout, die Box lag direkt
-        # in der oberen Zeile) hat die Box bei JEDEM Spaltenaufbau AUS dem
-        # Editor-Panel in die top_row NEBEN den Splitter verschoben – die
-        # Speichern-Buttons lagen dadurch NICHT unter der Parameter-Box.
-        # Der Reinsert läuft daher jetzt in das Editor-Panel (frisches
-        # QWidgetItem gegen den Qt 6.11 QWidgetItemV2-Cache, vgl. _reflow()).
-        panel = getattr(self, "_editor_panel", None)
-        panel_layout = panel.layout() if panel is not None else None
-        if panel_layout is not None and self.widget_service_columns is not None:
-            # Falls die Box durch frühere Builds in der top_row gelandet ist,
-            # dort zuerst entfernen (defensiv, idempotent).
-            if self.top_row is not None and \
-                    self.top_row.indexOf(self.widget_service_columns) >= 0:
-                self.top_row.removeWidget(self.widget_service_columns)
-            panel_layout.removeWidget(self.widget_service_columns)
-            insert_idx = panel_layout.count()
-            action_row = getattr(self, "_param_action_row", None)
-            for i in range(panel_layout.count()):
-                item = panel_layout.itemAt(i)
-                if item is not None and action_row is not None and \
-                        item.layout() is action_row:
-                    insert_idx = i
-                    break
-            panel_layout.insertWidget(insert_idx, self.widget_service_columns)
+        # Bugfix 05.08.2026 (Layout-Runde 2): Die Service-Parameter-Box
+        # (widget_service_columns) liegt seit dem DREI-SPALTEN-Splitter FEST in
+        # einer ContentScrollArea (_param_scroll, rechte Splitter-Spalte, max.
+        # Hoehe/Breite mit Scrollbalken - Punkt 5). KEIN Reinsert mehr noetig
+        # (der fruehere Reinsert stammte aus dem Alt-Layout und verschob die
+        # Box aus dem Editor-Panel). Der Qt-6.11-QWidgetItemV2-Cache wird ueber
+        # updateGeometry() invalidiert, damit die ScrollArea/der Splitter die
+        # aktuelle Spaltenbreite/-hoehe live uebernehmen (vgl. _reflow).
+        if self.widget_service_columns is not None:
+            self.widget_service_columns.updateGeometry()
+        scroll = getattr(self, "_param_scroll", None)
+        if scroll is not None:
+            scroll.updateGeometry()
         self._reflow()
 
     def _build_service_column(self, iid: str, pid: str, cfg: Dict[str, Any]) -> QGroupBox:

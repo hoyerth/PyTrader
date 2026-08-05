@@ -50,7 +50,7 @@ from analytics.engine.description_dialog import (
 from analytics.engine.service_set_repository import ServiceSetRepository
 from analytics.engine.set_evaluator import ServiceSetEvaluator
 from persistent_win import PersistentWindow, register_persistent_window
-from scrollable_content import ContentScrollMixin
+from scrollable_content import ContentScrollArea, ContentScrollMixin
 from chart.widgets.named_item_actions import NamedItemActionsMixin
 
 # Phase 15 U15-D1: Submodule der Service-UI
@@ -170,6 +170,12 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # Phase 14 P14-05: Papierkorb-Button (Soft-Delete/Wiederherstellung)
         self.btn_trash_sets: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_trash_sets")
         self.btn_execute_set: QPushButton = self.ui.findChild(QPushButton, "btn_execute_set")
+        # Bugfix 05.08.2026 (Punkt 1): Das Log (text_log) klebte am unteren
+        # Bildschirmrand, weil es unbegrenzt wuchs und das Fenster bis zum
+        # Screen-Cap aufging. Max. Hoehe ~5 Zeilen -> kompaktes Log, kein
+        # Bildschirmrand-Kleben (intern scrollt das QTextEdit).
+        if self.text_log:
+            self.text_log.setMaximumHeight(120)
 
         # Phase 13 5.4 Schritt 1: Dynamische Service-Spalten (Breite/Höhe aus
         # dem Inhalt – KEINE fixen Pixelwerte). Das Inhalt-Layout erhält
@@ -193,10 +199,20 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self.content_widget = self.ui.centralWidget()
         self.central_layout = self.content_widget.layout() if self.content_widget else None
         if self.central_layout is not None:
-            # Phase 15 15.02 (Orchestrator): QSplitter-Zusammensetzung.
-            #  * Links:  bestehender Set-Editor + dynamische Service-Spalten.
-            #  * Rechts: MasterTree (2-Spalten-Hierarchie, Live-Status-Badges,
-            #            ServiceSelectorWidget im Modus FULL_EDIT).
+            # Bugfix 05.08.2026 (Layout-Runde 2): DREI-SPALTEN-Splitter.
+            #  * Spalte 1 (links):  Service-Sets-Box (group_service_sets).
+            #  * Spalte 2 (Mitte):  MasterTree (Service tree) – Minimum-Breite,
+            #                       damit eingerueckte Texte lesbar sind
+            #                       (Punkt 4: Scrollbalken bei Ueberlauf).
+            #  * Spalte 3 (rechts): Service-Parameter-Box (widget_service_
+            #                       columns) in einer ContentScrollArea mit
+            #                       max. Hoehe/Breite + Scrollbalken (Punkt 5),
+            #                       darunter fest die Aktions-Leiste
+            #                       [💾 Speichern] / [▶️ Speichern & Ausführen]
+            #                       (Punkt 0: Buttons IMMER sichtbar, unab-
+            #                       haengig von Dirty-State/Set-Wechsel).
+            # Die Status-Zeile (Laufzeit/Fortschritt) bleibt im central_layout
+            # direkt UNTER dem Splitter (= unter der hoechsten Box, Punkt 3).
             self.top_row = QHBoxLayout()
             self.top_row.setSpacing(6)
             idx = self.central_layout.indexOf(self.group_service_sets)
@@ -204,17 +220,59 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                 idx = 0
             self.central_layout.removeWidget(self.group_service_sets)
 
+            # Spalte 1: Service-Sets-Box (keine Parameter-Spalten mehr)
             self._editor_panel = QWidget()
             editor_layout = QVBoxLayout(self._editor_panel)
             editor_layout.setContentsMargins(0, 0, 0, 0)
             editor_layout.setSpacing(6)
             editor_layout.addWidget(self.group_service_sets)
-            editor_layout.addWidget(self.widget_service_columns)
-            # Phase 15 (Dirty-State): Aktions-Leiste am unteren Ende der
-            # Parameter-Spalten – [💾 Speichern] persistiert die Parameter-
+            self._editor_panel.setMinimumWidth(380)
+            # Punkt 1 (Bugfix 05.08.2026): Maximalbreite begrenzen, damit die
+            # Service-Parameter-Spalte (2 Services nebeneinander) genug Platz
+            # im Splitter bekommt.
+            self._editor_panel.setMaximumWidth(700)
+
+            # Spalte 2: MasterTree (Service tree)
+            self.right_panel = QWidget()
+            right_layout = QVBoxLayout(self.right_panel)
+            right_layout.setContentsMargins(0, 0, 0, 0)
+            right_layout.setSpacing(6)
+            # MasterTree im Modus B / FULL_EDIT (seit 05.08.2026 ohne Toolbar)
+            self.service_selector = ServiceSelectorWidget(
+                mode=ServiceSelectorWidget.MODE_FULL_EDIT, parent=self)
+            right_layout.addWidget(self.service_selector, 1)
+            # Punkt 4: Mindest-Breite, damit eingerueckte Texte (LEVEL_INDENT)
+            # lesbar sind; wird der Tree groesser (mehr Services), zeigt das
+            # QTreeWidget seine nativen Scrollbalken. Punkt 1: Maximalbreite
+            # begrenzen, damit die Parameter-Spalte Platz fuer 2 Services hat.
+            try:
+                self.service_selector.master_tree.setMinimumWidth(400)
+                self.service_selector.master_tree.setMaximumWidth(560)
+            except (RuntimeError, AttributeError):
+                pass
+
+            # Spalte 3: Service-Parameter-Box + Aktions-Leiste (Punkt 5/0)
+            self._param_panel = QWidget()
+            self._param_panel.setMinimumWidth(320)
+            param_layout = QVBoxLayout(self._param_panel)
+            param_layout.setContentsMargins(0, 0, 0, 0)
+            param_layout.setSpacing(6)
+            # Punkt 5/1: max. Hoehe der Parameter-Box; die max. BREITE ist so
+            # bemessen, dass ZWEI Service-Spalten nebeneinander OHNE
+            # horizontalen Scrollbalken passen (Bugfix 05.08.2026, Punkt 1) -
+            # bei mehr Services/Spalten scrollt die ContentScrollArea.
+            self._param_scroll = ContentScrollArea()
+            self._param_scroll.setWidgetResizable(False)
+            self._param_scroll.setWidget(self.widget_service_columns)
+            self._param_scroll.setMaximumHeight(620)
+            self._param_scroll.setMaximumWidth(1000)
+            param_layout.addWidget(self._param_scroll, 1)
+            # Phase 15 (Dirty-State): Aktions-Leiste direkt UNTER der
+            # Parameter-Box – [💾 Speichern] persistiert die Parameter-
             # Aenderungen ohne Neuberechnung; [▶️ Speichern & Ausführen]
             # speichert und stoesst sofort den Service-Run an (ServiceRun-
-            # Worker, kein Schwerlast-Scan).
+            # Worker, kein Schwerlast-Scan). Feste Position ausserhalb der
+            # ScrollArea -> immer sichtbar (Punkt 0).
             self._param_action_row = QHBoxLayout()
             self._param_action_row.setSpacing(6)
             self.btn_save_params = QPushButton("💾 Speichern")
@@ -225,25 +283,31 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.btn_save_run_params.setToolTip(
                 "Speichert die Aenderungen UND stoesst sofort die "
                 "Neuberechnung an (Bestätigungsabfrage mit Symbol/Timeframe).")
+            # Bugfix 05.08.2026 (Punkt 2): Die Speicher-Buttons sind NUR
+            # sichtbar, wenn eine manuelle Parameter-Aenderung stattgefunden
+            # hat (Dirty-State). Initial unsichtbar; _mark_service_dirty
+            # blendet sie ein, _clear_dirty_markers und der Auswahl-Wechsel
+            # blenden sie aus (Punkt 3).
+            self.btn_save_params.setVisible(False)
+            self.btn_save_run_params.setVisible(False)
             self._param_action_row.addWidget(self.btn_save_params)
             self._param_action_row.addWidget(self.btn_save_run_params)
             self._param_action_row.addStretch(1)
-            editor_layout.addLayout(self._param_action_row)
-
-            self.right_panel = QWidget()
-            right_layout = QVBoxLayout(self.right_panel)
-            right_layout.setContentsMargins(0, 0, 0, 0)
-            right_layout.setSpacing(6)
-            # MasterTree im Modus B / FULL_EDIT (seit 05.08.2026 ohne Toolbar)
-            self.service_selector = ServiceSelectorWidget(
-                mode=ServiceSelectorWidget.MODE_FULL_EDIT, parent=self)
-            right_layout.addWidget(self.service_selector, 1)
+            param_layout.addLayout(self._param_action_row)
+            # Der Scroll (einziger Stretch) bekommt die volle Spaltenhoehe
+            # (bis max 620); ueberschuessiger Platz bleibt unter den Buttons.
 
             self.main_splitter = QSplitter(Qt.Horizontal)
             self.main_splitter.addWidget(self._editor_panel)
             self.main_splitter.addWidget(self.right_panel)
-            self.main_splitter.setStretchFactor(0, 3)
-            self.main_splitter.setStretchFactor(1, 2)
+            self.main_splitter.addWidget(self._param_panel)
+            self.main_splitter.setStretchFactor(0, 2)
+            self.main_splitter.setStretchFactor(1, 3)
+            self.main_splitter.setStretchFactor(2, 2)
+            # Keine Spalte unter ihre Mindestgroesse kollabieren lassen.
+            self.main_splitter.setCollapsible(0, False)
+            self.main_splitter.setCollapsible(1, False)
+            self.main_splitter.setCollapsible(2, False)
 
             self.top_row.addWidget(self.main_splitter)
             self.central_layout.insertLayout(idx, self.top_row)
@@ -529,7 +593,12 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         list_execution_order waehrend des Handlers neu aufgebaut werden
         (setCurrentIndex -> _on_set_selected -> load_set_into_editor); der
         Zugriff auf geloeschte Items wuerde sonst crashen (0xC0000005).
+
+        Bugfix 05.08.2026 (Punkt 3): Bei Mausklick auf andere Services oder
+        Sets werden die Speicher-Buttons ausgeblendet (sie sind nur waehrend
+        einer manuellen Parameter-Aenderung sichtbar).
         """
+        self._set_param_actions_visible(False)
         try:
             if set_id and self.combo_set is not None and _qt_valid(self.combo_set):
                 idx = self.combo_set.findData(set_id)
@@ -785,7 +854,13 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self._start_run_worker(self._current_set_id, definition, instance_id=None)
 
     def _clear_dirty_markers(self) -> None:
-        """Entfernt alle '*' -Dirty-Marker im MasterTree (nach Speichern)."""
+        """Entfernt alle '*' -Dirty-Marker im MasterTree (nach Speichern).
+
+        Bugfix 05.08.2026 (Punkt 2): Blendet zusaetzlich die Speicher-
+        Buttons aus - ohne manuelle Parameter-Aenderung sind sie nicht
+        sichtbar.
+        """
+        self._set_param_actions_visible(False)
         selector = getattr(self, "service_selector", None)
         tree = getattr(selector, "master_tree", None)
         if tree is None:
@@ -794,6 +869,22 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             tree.clear_dirty_markers()
         except (RuntimeError, AttributeError):
             pass
+
+    def _set_param_actions_visible(self, visible: bool) -> None:
+        """Blendet die Speicher-Buttons der Parameter-Spalte ein/aus.
+
+        Bugfix 05.08.2026 (Punkt 2/3): Sichtbar NUR bei manueller
+        Parameter-Aenderung (Dirty), sonst unsichtbar. Wird von
+        _mark_service_dirty (param_columns) eingeblendet und von
+        _clear_dirty_markers / _on_master_selection ausgeblendet.
+        """
+        for name in ("btn_save_params", "btn_save_run_params"):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                try:
+                    btn.setVisible(bool(visible))
+                except (RuntimeError, AttributeError):
+                    pass
 
     def _persist_current_set(self, action: str) -> None:
         """Persistiert das aktuell geladene Service-Set zurueck in die DB.
@@ -1645,7 +1736,13 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                        f"'{names[0]}' verwendet – Entfernen nicht möglich")
 
     def _on_order_item_clicked(self, item: QListWidgetItem) -> None:
-        """Merkt sich die aktuell markierte instance_id (itemClicked)."""
+        """Merkt sich die aktuell markierte instance_id (itemClicked).
+
+        Bugfix 05.08.2026 (Punkt 3): Klick auf einen anderen Service in der
+        Ausfuehrungs-Liste blendet die Speicher-Buttons aus (sie sind nur
+        waehrend einer manuellen Parameter-Aenderung sichtbar).
+        """
+        self._set_param_actions_visible(False)
         if item is not None:
             self._current_list_iid = item.data(Qt.UserRole)
 

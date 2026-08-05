@@ -606,3 +606,39 @@ ew_set_dialog.py, param_columns.py, 	rash_dialog.py (Exit 0).
 * Temporaere Testdateien (`tmp_check_*.py`, `tmp_app_data.duckdb`) danach geloescht (Regel: Tests nur in `test/`).
 * Keine UI-Tests (Regel). Manuelle UI-Verifikation durch den Anwender.
 * `docs/x_Exports.md` bleibt unangetastet (Nutzer-Export, nicht Bestandteil dieses Commits).
+
+
+### 3.25 Schritt 25 - Layout-Runde 2: Drei-Spalten-Splitter & Button-Sichtbarkeit (05.08.2026)
+
+**Anlass (vom Anwender uebergeben - 6-Punkte-Bugfix fuer das ServiceWindow-Layout, danach 3-Punkte-Runde zur Button-Sichtbarkeit):** Nach der Dirty-State-Aktionsleiste (3.24) meldete der Anwender sechs Layout-Probleme: (1) text_log klebt am unteren Bildschirmrand (waechst unbegrenzt), (2) die beiden Service-Parameter-Spalten bekommen zu wenig Breite, (3) die Status-Zeile muss unter der hoechsten Box liegen, (4) der MasterTree braucht eine Mindest-Breite mit nativem Scrollbalken, (5) die Parameter-Box soll max. Hoehe/Breite mit Scrollbalken haben, (6) die Speichern-Buttons der Parameter-Spalte muessen IMMER sichtbar sein. In der Folge-Runde (Bugfixing-Modus) wurde die Sichtbarkeit praezisiert: Die Buttons sind NUR bei manueller Parameter-Aenderung (Dirty) sichtbar - initial versteckt, bei Aenderung eingeblendet, nach Speichern/Set-Wechsel ausgeblendet.
+
+**Entscheidungen:**
+* **DREI-SPALTEN-Splitter statt zwei:** Spalte 1 = Set-Editor-Box (Service-Sets), Spalte 2 = MasterTree (Service tree), Spalte 3 = Service-Parameter-Box + feste Aktions-Leiste. Die Status-Zeile bleibt im central_layout direkt UNTER dem Splitter (= unter der hoechsten Box, Punkt 3).
+* **Kein Reinsert mehr:** Der in 3.24 reparierte Reinsert (`_build_service_columns` -> Editor-Panel) entfaellt vollstaendig - die Parameter-Box liegt seit dieser Runde FEST in einer ContentScrollArea der rechten Splitter-Spalte und wird nie mehr verschoben (Qt-6.11-QWidgetItemV2-Cache wird stattdessen ueber `updateGeometry()` invalidiert).
+* **QSplitter-fixiert-Sizes-Quirk:** Der QSplitter fixiert die Spaltengroessen beim addWidget (VOR dem Spaltenaufbau) und aktualisiert sie nicht, wenn die sizeHints danach wachsen. Daher setzt der deferred Spaltenaufbau die Param-Spalte NACH dem Aufbau explizit auf ihre aktuelle Layout-Breite (`splitter.setSizes(hints)`) - nur so passen 2 Service-Spalten ohne horizontalen Scroll.
+
+**A) `serviceui/service_win.py` (Orchestrator, 3-Spalten-Splitter):**
+* **Punkt 1:** `self.text_log.setMaximumHeight(120)` (~5 Zeilen) - das QTextEdit scrollt intern, kein Bildschirmrand-Kleben mehr.
+* **Spalte 1 (`_editor_panel`):** nur noch `group_service_sets`; `setMinimumWidth(380)`, `setMaximumWidth(700)`.
+* **Spalte 2 (`right_panel`):** `ServiceSelectorWidget` (MODE_FULL_EDIT) wie bisher; `master_tree.setMinimumWidth(400)` + `setMaximumWidth(560)` (Punkt 4 - eingerueckte Texte lesbar, native Scrollbalken bei Ueberlauf).
+* **Spalte 3 (`_param_panel`, min 320):** `_param_scroll` (ContentScrollArea, `widgetResizable=False`, max. Hoehe 620 / max. Breite 1000) mit `widget_service_columns`; DARUNTER fest (ausserhalb der ScrollArea, Punkt 0) die `_param_action_row` mit [Speichern] / [Speichern & Ausfuehren].
+* **Splitter:** `Stretch (0:2, 1:3, 2:2)`, alle `setCollapsible(False)` (keine Spalte unter Mindestgroesse).
+
+**B) `serviceui/param_columns.py` (Spaltenaufbau + deferred Resize, Punkt 5):**
+* `_build_service_columns`: KEIN Reinsert mehr; nach dem Spaltenaufbau nur `updateGeometry()` auf Box und Scroll.
+* `_reflow()`: stoesst zusaetzlich `QTimer.singleShot(0, self._resize_param_box_deferred)` an.
+* `_resize_param_box_deferred` (neu): sendet zuerst die DeferredDelete-Events (sonst liest `layout().sizeHint()` den veralteten 18x18-QWidgetItemV2-sizeHint der gerade geleerten Alt-Spalten -> Box wuerde schrumpfen), dann `box.resize(box.layout().sizeHint())`, `scroll.updateGeometry()` und `splitter.setSizes(hints)` aus den aktuellen sizeHint-Breiten der 3 Spalten (Qt-Quirk-Fix, damit 2 Service-Spalten ohne hscroll passen; bei mehr Spalten scrollt die ScrollArea).
+
+**C) Button-Sichtbarkeit (Punkt 2/3 der Folge-Runde):**
+* `btn_save_params` / `btn_save_run_params` initial `setVisible(False)`.
+* `_mark_service_dirty` (param_columns) blendet beide ein via `self._set_param_actions_visible(True)` (try/except-guarded).
+* `_clear_dirty_markers` blendet beide aus (`_set_param_actions_visible(False)`).
+* `_on_master_selection` (MasterTree-Klick) und `_on_order_item_clicked` (Ausfuehrungs-Liste) blenden die Buttons beim Set-/Service-Wechsel aus.
+* `_set_param_actions_visible(visible)` (neu, Orchestrator): setVisible auf beide Buttons, try/except gegen RuntimeError/AttributeError.
+
+**Validierung (headless, gruen):**
+* `python -m py_compile` auf `serviceui/service_win.py` und `serviceui/param_columns.py` (Exit 0).
+* Echte `ServiceWindow`-Instanz (offscreen, Test-DB in `test/`): 1920-FakeScreen -> Splitter-Hints [700, 403, 961], Param-Spalte 961px, Box 948px, hscroll=0; 3 Services -> hscroll=418 aktiv (ScrollArea scrollt). Button-Test (`tmp_btn_visibility.py`, 11/11 PASS): initial unsichtbar -> nach Param-Aenderung sichtbar + '*' am Knoten -> nach Set-Wechsel unsichtbar -> wieder sichtbar (prox_2 dirty) -> nach Service-Klick unsichtbar -> maxW=1000.
+* Temporaere Testdateien (`tmp_btn_visibility.py`, `tmp_app_data.duckdb`, `tmp_layout_audit.py`) danach geloescht (Regel: Tests nur in `test/`).
+* Keine UI-Tests (Regel). Manuelle UI-Verifikation durch den Anwender.
+* `docs/x_Exports.md` bleibt unangetastet (Nutzer-Export, nicht Bestandteil dieses Commits).
