@@ -213,3 +213,29 @@ Ergebnis-Semantik (identisch zu `chart_win`):
 * `test/test.py`: T9a (zustandsabhängiger Marker), T9b/T10 (Einfach-Klick-Toggle), T11 (kein Icon), T4/T5 (`'i'`-Badge) – **alle PASS**.
 * `test/check_phase14_regression.py` (P14-02d: `grid_liquidity` NICHT mehr registriert), `test/check_plugin_batch_services.py`, `test/check_plugin_executor.py`, `test/check_p14_s2_discovery.py`, `test/check_grid_parity.py`, `test/check_p13_s1.py` – **alle PASS**.
 * `python -m py_compile` auf allen geänderten Dateien (Exit 0); Import-Smoke-Test der Produktionsmodule (Chart, Service-UI, Dialoge, Repository) erfolgreich.
+
+### 3.10 Schritt 10 – Restarbeiten: Service-`grid_liquidity`-Altlasten & verwaiste `grid`-Keys aus DBs entfernt (05.08.2026)
+
+**A) Verifikation: Service `grid_liquidity` gehört zum ausgemusterten Alt-Indikator:**
+* `analytics/features/definitions/grid_liquidity.py` ist seit Schritt 9 archiviert (`.backup_grid_liquidity/`, aus dem Discovery-Pfad entfernt). `PluginRegistry` findet final nur noch `grid_lines` + `proximity` → der Service erscheint **nicht mehr im ServiceTree**; `get('grid_liquidity')` wirft `KeyError` (erwartet).
+* **Fehlende Restarbeiten identifiziert:** Die in Schritt 9 dokumentierte Migration (`test/migrate_grid_liquidity.py`) hatte die PERSISTIERTEN falschen Relationen in `app_data.duckdb` nur teilweise abgedeckt. Kategorisierung per DB-Scan (`test/_probe_*`, temporär):
+  1. **`indicator_presets`:** Alt-Preset `('grid_liquidity', 'SILVER:M1 Test')` mit ALTER Service-Plugin-Struktur (`logic_params`/`display_params`/`set_id`) – kein gültiges Preset des neuen self-contained Indikators (der speichert flache Schema-Params).
+  2. **`symbol_tf_states` (7) + `instance_states` (1):** `grid_liquidity`-Sub-States mit alter Struktur (`preset='SILVER:M1 Test'`, `set_id` aus dem gelöschten Alt-Preset) – würden den neuen Indikator mit unverständlichen Parametern restaurieren.
+  3. **`symbol_tf_states` (11) + `instance_states` (1):** verwaiste `indicators_state`-Keys `'grid'` des am 04.08.2026 entfernten Alt-Indikators `chart/indicators/grid.py` (alle `active=false`; `chart_win.py` popt den Key zur Laufzeit bereits per U15-B4 – DB-Bereinigung ist reine Hygiene).
+
+**B) Bereinigung (`python test/migrate_grid_liquidity.py --apply`, headless):**
+* `indicator_presets`: Alt-Preset `'SILVER:M1 Test'` **gelöscht** (falsche Relation zum neuen Plugin-Grid-Indikator).
+* `symbol_tf_states` / `instance_states`: **7+1 falsche `grid_liquidity`-Relationen** (alte Struktur) und **11+1 verwaiste `grid`-Keys** aus den `indicators_state`-JSONs **entfernt**.
+* **`test/migrate_grid_liquidity.py` erweitert** (bleibt erhalten, `test/` gitignored):
+  * Abschnitt 3b: Alt-Presets mit `indicator_id='grid_liquidity'` UND alter Service-Plugin-Struktur werden erkannt und gelöscht; gültige flache Presets bleiben unangetastet.
+  * Abschnitt 5: falsche `grid_liquidity`-Relationen (alte Struktur) in `instance_states`/`symbol_tf_states` werden aus dem JSON entfernt.
+  * Abschnitt 6: verwaiste `'grid'`-Keys (U15-B4) werden aus dem JSON entfernt.
+  * Dry-Run/`--apply`-Logik & Exit-Code konsistent (0 = keine Alt-Referenzen mehr).
+* **Kommentar-Polish** (nur Doku, keine Logik): Beispiel `(z.B. 'grid_liquidity')` → `(z.B. 'grid_lines')` in `db_service.py`, `state_manager.py`, `analytics/features/plugins/base_plugin.py`.
+* **Stale Bytecode entfernt:** `analytics/features/definitions/__pycache__/grid_liquidity.cpython-314.pyc`, `chart/indicators/__pycache__/grid.cpython-314.pyc`.
+
+**Validierung (alle headless, grün):**
+* `python test/migrate_grid_liquidity.py` (Dry-Run): **exit 0** – Abschnitte 1–6 melden keine Alt-Referenzen mehr (vor Apply: 9 falsche Relationen + 12 verwaiste `grid`-Keys gefunden; nach Apply: 0).
+* `PluginRegistry`-Smoke: `sorted(plugins.keys()) == ['grid_lines', 'proximity']`; `GridLiquidityIndicator.service_plugin_ids == ['grid_lines', 'proximity']`.
+* DB-Bestandskontrolle: keine `feature_id='grid_liquidity'` in `feature_store`; `service_sets`/`trash`/`history` ohne `grid_liquidity`-Referenzen; keine verwaisten `grid`-Keys in `symbol_tf_states`/`instance_states`.
+* `python -m py_compile` auf allen geänderten Dateien (Exit 0).

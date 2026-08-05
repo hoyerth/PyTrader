@@ -87,7 +87,7 @@ class StateManager:
 
         # Phase 12 (Hybrid-Schema): Additive Erweiterung der indicator_presets
         # um die Plugin-Verknuepfung. plugin_id verknuepft ein Preset mit einem
-        # Plugin (z.B. 'grid_liquidity'), version fuehrt die Plugin-Version und
+        # Plugin (z.B. 'grid_lines'), version fuehrt die Plugin-Version und
         # is_active_batch markiert Presets, die von den Batch-Services
         # (HistoricalScanner/LiveAnalyzer) ueber den PluginExecutor aktiv
         # verarbeitet werden. Bestehende Presets und Daten bleiben unangetastet.

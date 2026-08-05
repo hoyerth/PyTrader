@@ -196,7 +196,7 @@ class PluginFeature(ABC):
     @property
     @abstractmethod
     def plugin_id(self) -> str:
-        """Dauerhaft stabile ID (z.B. 'grid_liquidity')."""
+        """Dauerhaft stabile ID (z.B. 'grid_lines')."""
         pass
 
     @property
