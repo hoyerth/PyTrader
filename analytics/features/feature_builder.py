@@ -647,15 +647,35 @@ class FeatureBuilder:
             # named "current_timestamp"'. `now()` (Funktionsaufruf) wird
             # korrekt als Zeitfunktion aufgeloest (verifiziert in
             # test/check_current_timestamp.py).
-            con.executemany("""
-                INSERT INTO feature_store (symbol, timeframe, bar_time, feature_id, plugin_version, feature_data)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT (symbol, timeframe, bar_time) DO UPDATE SET
-                    feature_id = EXCLUDED.feature_id,
-                    plugin_version = EXCLUDED.plugin_version,
-                    feature_data = EXCLUDED.feature_data,
-                    created_at = now()
-            """, rows)
+            #
+            # Phase 16 (05.08.2026, Performance-Nachtrag): `executemany` mit
+            # einem parameterisierten INSERT pro Bar war der eigentliche
+            # Engpass der Service-Ausfuehrung (z.B. ~20 s fuer 8k D1-Bars,
+            # mehrere Minuten fuer 100k M1-Bars). Ersetzt durch einen
+            # BULK-INSERT via con.register + INSERT..SELECT (identisches
+            # ON CONFLICT-Upsert) – ~2000x schneller (8k Rows: ~10 ms).
+            df_rows = pd.DataFrame(
+                rows,
+                columns=["symbol", "timeframe", "bar_time", "feature_id",
+                         "plugin_version", "feature_data"],
+            )
+            con.register("df_temp", df_rows)
+            try:
+                con.execute("""
+                    INSERT INTO feature_store
+                        (symbol, timeframe, bar_time, feature_id,
+                         plugin_version, feature_data)
+                    SELECT symbol, timeframe, bar_time, feature_id,
+                           plugin_version, feature_data
+                    FROM df_temp
+                    ON CONFLICT (symbol, timeframe, bar_time) DO UPDATE SET
+                        feature_id = EXCLUDED.feature_id,
+                        plugin_version = EXCLUDED.plugin_version,
+                        feature_data = EXCLUDED.feature_data,
+                        created_at = now()
+                """)
+            finally:
+                con.unregister("df_temp")
             # P14-03 (Invariante 13): In-Memory-Cache für (symbol, timeframe)
             # explizit invalidieren (veraltete shared_state-Zustände vermeiden).
             invalidate_feature_cache(symbol, timeframe)

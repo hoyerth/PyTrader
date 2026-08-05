@@ -480,3 +480,45 @@ ew_set_dialog.py, param_columns.py, 	rash_dialog.py (Exit 0).
 * `test/check_p13_proximity_cleanup.py` (vorher FAIL durch vorbestehenden `priority`-Crash, jetzt nach Folge-Fix 1+2 EXIT 0): **ALLE CHECKS BESTANDEN** – inkl. Prop-Fenster-Headless (kein `AttributeError: metadata`).
 * `test/check_plugin_batch_services.py`, `test/check_p13_s3.py`: **ALLE CHECKS BESTANDEN** (Scanner-/Evaluator-Pfad unverändert grün).
 * `docs/x_Exports.md` wurde vom Anwender selbst export-aktualisiert und bleibt wie immer unangetastet (nicht Bestandteil dieses Commits).
+
+### 3.20 Schritt 20 – P16: Service-Beschreibungs-Editor, Numpy-Vektorisierung & Sync-Guard (05.08.2026, Commit `1ae1a0e`)
+
+**Anlass (vom Anwender übergeben – „Service-Beschreibungs-Editor & Vektorisierung & Sync-Guard"):**
+
+**A) Modaler Beschreibungs-Editor (`analytics/engine/description_dialog.py` + `serviceui/param_columns.py` + `serviceui/service_win.py`):**
+* **NEU `ServiceDescriptionEditDialog`** (modales QTextEdit-Fenster, Phase 16): reines UI-Widget mit `save_requested(str)`-Signal (IoC – kein Repo-/EventBus-Zugriff im Dialog). Kopfzeile aus `header_line` (z. B. `aktiv/im <Indikator>`) + Instanz-/Plugin-ID.
+* MasterTree-Info-Button öffnet für **Service- und Set-Zeilen** den Editor (editierbar); **Plugin-/Standalone-Zeilen bleiben bewusst Read-Only** (`ServiceDescriptionDialog`, keine Plugin-Beschreibungen im Service Window – Phase-16-Design).
+* Stift-Icon (`✏️`) im Parameter-Panel (`serviceui/param_columns.py`) öffnet denselben Editor für die Instanz-Beschreibung.
+* Persistenz: `_save_instance_description()` / `_save_set_description()` schreiben ausschließlich in `definition['services'][iid]['description']` bzw. `definition['description']` (via `ServiceSetRepository.save_set()` + `event_bus.service_set_changed`); Editor-Spalte + Tooltip werden live aktualisiert.
+
+**B) Numpy-Vektorisierung der Service-Berechnungen (`grid_lines_service.py`, `proximity_service.py`):**
+* O(n·m)-Double-Loops durch Broadcasting/Maskierung ersetzt (inkl. vektorisiertes `_bar_utc_minutes`).
+* Gemessen: 10k Lookback-Bars – Proximity ~25 ms, grid_lines ~12 ms (vorher mehrere Sekunden).
+* Exakte Output-Parität zur Alt-Loop (Paritätstest in `test/test.py`, V1–V9).
+
+**C) Concurrency-Guard gegen den 45s-Hintergrund-Sync (`config/event_bus.py`, `main.py`, `serviceui/service_win.py`):**
+* Neue EventBus-Signale `service_run_started` / `service_run_finished`.
+* `ServiceWindow._begin_sync_guard()` / `_end_sync_guard()` (Referenzzähler, Übergang 0→1 bzw. 1→0) blocken den `sync_timer` in `main.py`, während `SetRunWorker`/`ServiceRunWorker`/`HistoricalScanner` laufen.
+
+**Validierung (headless, grün):**
+* `test/test.py` Teil 7: D1–D3 (Editor + save_requested), S1–S8 (Sync-Guard), V1–V11 (Vektorisierungs-Parität + Performance < 1 s bei 10k Bars) – **ALLE PRÜFUNGEN BESTANDEN**.
+
+### 3.21 Schritt 21 – Performance-Fix: Bulk-Insert statt `executemany` in `store_plugin_payload` (05.08.2026)
+
+**Anlass (vom Anwender übergeben – „ausführen Service grid_lines auf D1 dauert viel zu lang"):** Die numpy-Vektorisierung aus Schritt 20 (P16) war aktiv und schnell (grid_lines 10k ≈ 9 ms, 100k ≈ 102 ms) – der eigentliche Engpass lag im DB-Schreibpfad.
+
+**Ursache:** `FeatureBuilder.store_plugin_payload()` schrieb pro Bar einen einzelnen parameterisierten INSERT via `con.executemany(...)` → O(n) Round-Trips. Gemessen: **8.000 D1-Bars ≈ 20 s**, **100.000 Bars ≈ mehrere Minuten** (allein der Schreibpfad).
+
+**Fix (`analytics/features/feature_builder.py`):** Ersetzt durch Bulk-DataFrame-Insert (`con.register("df_temp", df)` + `INSERT … SELECT … FROM df_temp ON CONFLICT … DO UPDATE`), identische Upsert-Semantik (`feature_id`/`plugin_version`/`feature_data`/`created_at = now()`).
+
+**Messwerte nach Fix:**
+| Bars | vorher | nachher |
+| --- | --- | --- |
+| 8.000 (D1) | ~20 s | **~104 ms** (~190×) |
+| 100.000 (M1) | mehrere Minuten | **~675 ms** (~380×) |
+
+**Validierung (headless, grün):**
+* `python -m py_compile analytics/features/feature_builder.py` (Exit 0).
+* `test/test.py` (designierte Verifikation, offscreen auf Test-DBs isoliert): **ALLE PRÜFUNGEN BESTANDEN** (inkl. V1–V11 Paritäts-/Performance-Checks, D1–D3 Editor, S1–S8 Sync-Guard).
+* **Hinweis (Betrieb):** Während der Verifikation hängengebliebene Offscreen-Dialog-Prozesse hielten die DuckDB-Locks (`IO Error: … wird von einem anderen Prozess verwendet` – App-Start fehlgeschlagen). Nach Beenden der hängenden Prozesse (PID 1864/30332) waren `app_data`/`analytics`/`market_data.duckdb` wieder lesbar und der App-Start funktionierte. Künftige Dialog-Verifikationen patchen `QDialog.exec` (sofortiger Return), damit sich keine modalen Dialoge im Offscreen-Modus aufhängen.
+* `docs/x_Exports.md` wurde vom Anwender selbst export-aktualisiert und bleibt wie immer unangetastet (nicht Bestandteil dieses Commits).
