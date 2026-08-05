@@ -240,44 +240,71 @@ Zusätzlich: `py_compile` auf allen neuen/geänderten Dateien (Exit 0) und Impor
 
 6. **Headless-Test (`test/check_p15_s3_analytics.py`):** Validierung von Profiles-CRUD, SQL-Aggregationen, Reader & ViewModel ohne GUI.
 
-# 15.03-E Ergänzungskapitel: Generische Service-/Set-Auswahl (SELECT_ONLY) in Analytics
 
-## 1. SPEZIFIKATION (15.03-E)
 
-* **Integration `ServiceSelectorWidget` (Modus `SELECT_ONLY`):**
-* Einbindung des in 15.02 erstellten `ServiceSelectorWidget` im lesenden Modus (`SELECT_ONLY`) direkt in die Top-Bar von `AnalyticsWindow` (`analytics/ui/analytics_win.py`).
+# 15.03-E ERGÄNZUNGSKAPITEL: GENERISCHE SERVICE-/SET-AUSWAHL MIT POPOVER-SPLIT-VIEW
 
-* Bietet ein kompaktes Dropdown/Popover zur Selektion des aktiven **Service-Sets** oder **Einzel-Services**.
-
-* *Top-Bar Layout:* `[ Profile: ▾ Profile_Name ]` `|` `[ Set/Service: ▾ Scalper_Grid_v1 ]` `|` `Symbol: [ SILVER ▾ ] [★]` `TF: [ M1 ▾ ]` `[ Refresh 🔄 ]`.
-
-* **Datenfluss & SQL-Filterung:**
-* Das Signal `selection_changed(set_id, service_id)` des Widgets wird an das `AnalyticsViewModel` gekoppelt.
-
-* `FeatureStoreReader` und `AnalyticsRepository` nutzen die ausgewählte `set_id` / `service_id` als obligatorischen Filter in den SQL-Queries (`WHERE set_id = ?` bzw. `WHERE service_id = ?`) für alle Unterseiten (`table_page`, `heatmap_page`, `scatter_page`, `distribution_page`).
-
-* **EventBus-Reaktivität:**
-* Das im `ServiceSelectorWidget` hinterlegte `ServiceSelectorModel` reagiert automatisch auf `EventBus.service_set_changed`.
-* Wird im `ServiceWindow` ein Set erstellt, geändert oder gelöscht, aktualisiert sich das Auswahl-Dropdown im Analytics-Fenster ohne Neustart im laufenden Betrieb.
+> **Ziel:** Einbindung des in Phase 15.02 erstellten `ServiceSelectorWidget` im platzsparenden Top-Bar-Popover-Modus (`SELECT_ONLY`) in das `AnalyticsWindow`. Es ermöglicht die strukturierte Auswahl von Service-Sets/Services **inklusive direkter Einsicht der Parameter** in einer rechten Inspektions-Box, ohne wertvollen Bildschirmplatz für die Analytics-Charts (Heatmaps, Scatter, Tabellen) zu opfern.
 
 ---
 
-## 2. SCHRITT-FÜR-SCHRITT ANLEITUNG (15.03-E)
+## 1. ARCHITEKTUR & PLATZSPARENDES DESIGN-KONZEPT
 
-1. **Top-Bar Erweiterung in `analytics/ui/analytics_win.py`:**
-* Instanziierung von `ServiceSelectorWidget(mode=SelectorMode.SELECT_ONLY)`.
-* Plazierung in der oberen `QHBoxLayout`-Aktionsleiste zwischen Profil-Aktionen und Symbol-Auswahl.
+1. **Top-Bar Popover Button (0 Pixel Hauptfenster-Platzverlust):**
+   - In der Top-Bar von `AnalyticsWindow` befindet sich ein kompakter Aktions-Button: `[ Set/Service: ▾ Scalper_Grid_v1 ]`.
+   - Bei Klick auf den Button öffnet sich ein **schwebendes Overlay (Popover/Flyout)** direkt unterhalb des Buttons.
+   - Wenn das Popover geschlossen ist, behalten die Analytics-Diagramme 100 % der Bildschirmbreite.
 
-2. **Kopplung an `AnalyticsViewModel` & `FeatureStoreReader`:**
-* Verbinden des Signals `selection_changed` mit `AnalyticsViewModel.set_active_service_filter(set_id, service_id)`.
-* Anpassung der Abfragemethoden in `analytics/engine/feature_store_reader.py` (`get_heatmap_data`, `get_scatter_data`, `get_distribution_data`, `get_table_data`), sodass der `set_id`/`service_id`-Filter an die DuckDB-SQL-Queries übergeben wird.
+2. **Split-View im Popover (Struktur Links, Parameter Rechts):**
+   - **Linke Seite (~40 % Breite) – Schlanker MasterTree:**
+     - Nutzt den `MasterTree` im `SELECT_ONLY`-Modus (keine Inline-Parameter unter den Nodes, keine doppelten Dropdowns).
+     - Zeigt rein die Hierarchie: `📁 Service-Sets`, `⚡ Standalone Services`, `📦 Alle verfügbaren Plugins` mit den Status-Badges (`🟢 aktiv in Chart`).
+   - **Rechte Seite (~60 % Breite) – Kompaktes ParameterPanel:**
+     - Eingebundenes `ParameterPanel` (Read-Only via `setEnabled(False)`).
+     - Klickt der Anwender im Tree links einen Service-Knoten (z. B. `prox_1` oder `grid_1`) an, liest die rechte Seite sofort das Schema aus der `PluginRegistry` und zeigt die aktuellen Berechnungsparameter übersichtlich an.
 
-3. **Profil-Synchronisation:**
-* Beim Laden oder Speichern eines Analytics-Profils via `analytics_profile_repository.py` wird das aktuell gewählte Set (`"service_sets": [...]`) automatisch im `ServiceSelectorWidget` selektiert bzw. ausgelesen.
+3. **Integrierter Datenfluss & Filter-Logik:**
+   - **Auswahl:** Das Popover emittiert beim Selektieren das Signal `selection_changed(set_id, service_id)`.
+   - **SQL-Filterung:** `AnalyticsViewModel` koppelt das Signal an den `FeatureStoreReader`. Die SQL-Queries filtern im `feature_store` gezielt über `WHERE feature_id = ?` (bzw. `set_id`), sodass alle Unterseiten (`table_page`, `heatmap_page`, `scatter_page`, `distribution_page`) ausschließlich die Daten des gewählten Services/Sets auswerten.
+   - **EventBus-Reaktivität:** Das `ServiceSelectorModel` im Widget hört auf `EventBus.service_set_changed`. Änderungen im `ServiceWindow` (Erstellen, Ändern, Löschen von Sets) aktualisieren das Popover im Analytics-Fenster automatisch im laufenden Betrieb.
 
-4. **Headless-Test Erweiterung (`test/check_p15_s3_analytics.py`):**
-* Verifizierung, dass `FeatureStoreReader` bei Angabe einer `set_id` ausschließlich korrespondierende Eintragsdaten aus `feature_store` zurückliefert.
-* Verifizierung der Signalverarbeitung von `selection_changed` im `AnalyticsViewModel` ohne GUI-Ausführung.
+---
+
+## 2. SCHRITT-FÜR-SCHRITT UMSETZUNGS-ANLEITUNG
+
+### Schritt 1: Top-Bar Integration in `analytics/ui/analytics_win.py`
+- Instanziierung von `ServiceSelectorWidget` im Modus `SelectorMode.SELECT_ONLY` mit Popover-Konfiguration.
+- Platzierung des Popover-Buttons in der oberen `QHBoxLayout`-Aktionsleiste:
+  `[ Profile: ▾ Default ]` `|` **`[ Set/Service: ▾ Scalper_Grid_v1 ]`** `|` `Symbol: [ SILVER ▾ ] [★]` `TF: [ M1 ▾ ]` `[ Refresh 🔄 ]`.
+
+### Schritt 2: Signal-Kopplung an `AnalyticsViewModel`
+- Verbindung von `ServiceSelectorWidget.selection_changed` mit `AnalyticsViewModel.set_feature_id(feature_id)` (bzw. `set_active_service_filter(set_id, service_id)`).
+- Bei Signal-Empfang schließt sich das Popover und das `AnalyticsViewModel` stößt über den Debounce-QTimer (250 ms) die Neuberechnung aller aktiven Analytics-Unterseiten an.
+
+### Schritt 3: Parameter-Inspektion im Popover
+- Das rechte `ParameterPanel` im Popover abonniert das `tree.currentItemChanged`-Event des linken `MasterTree`s.
+- Wird ein Service selektiert, ruft das Panel `load_params(plugin_id, params, is_read_only=True)` auf und rendert die Werte gemäß `parameter_order` und `param_labels` des jeweiligen `PluginFeature`.
+
+### Schritt 4: Profil-Persistenz in `analytics_profile_repository.py`
+- Beim Erstellen/Speichern eines Analytics-Profils wird das aktuell gewählte Set/Service (`{"feature_id": "...", "set_id": "..."}`) im Profil-Payload JSON mitgespeichert.
+- Beim Profilwechsel wendet das `AnalyticsViewModel` die gespeicherten Filter-IDs an und aktualisiert den Popover-Button-Text entsprechend.
+
+---
+
+## 3. VERIFIKATION & HEADLESS-TESTING (`test/check_p15_s3_analytics.py`)
+
+1. **Headless-Funktionstest Popover-Selection:**
+   - Testweise Auslösung von `selection_changed("set_scalper", "prox_1")` am Widget ohne GUI-Anzeige.
+   - Verifikation, dass das `AnalyticsViewModel` den Parameter `feature_id` korrigiert und das `busy_changed`-Signal auslöst.
+
+2. **DuckDB-SQL-Filterprüfung:**
+   - Ausführung einer Abfrage via `FeatureStoreReader.fetch_rows(symbol, timeframe, feature_id="proximity")`.
+   - Verifikation, dass ausschließlich Datenzeilen mit `feature_id = 'proximity'` zurückgeliefert werden.
+
+3. **EventBus-Synchronisations-Check:**
+   - Simulation eines Set-Speichervorgangs via `ServiceSetRepository.save_set()`.
+   - Emission von `event_bus.service_set_changed.emit()`.
+   - Verifikation, dass das `ServiceSelectorModel` im Widget sein `data_changed`-Signal emittiert und den internen Baum aktualisiert.
 
 ---
 
