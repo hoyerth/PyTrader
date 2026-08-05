@@ -642,3 +642,40 @@ ew_set_dialog.py, param_columns.py, 	rash_dialog.py (Exit 0).
 * Temporaere Testdateien (`tmp_btn_visibility.py`, `tmp_app_data.duckdb`, `tmp_layout_audit.py`) danach geloescht (Regel: Tests nur in `test/`).
 * Keine UI-Tests (Regel). Manuelle UI-Verifikation durch den Anwender.
 * `docs/x_Exports.md` bleibt unangetastet (Nutzer-Export, nicht Bestandteil dieses Commits).
+
+
+### 3.26 Schritt 26 - Phase-13-Box-Bereinigung, 2-Spalten-Splitter & Layout-Bugfixes; New-Scan-Alt-Verdrahtung entfernt (05.08.2026, Commit `7f3d224`)
+
+**Anlass (vom Anwender uebergeben - zwei Aufgaben gemeinsam umgesetzt):** (1) Die Phase-13-Box (`group_service_sets`-Set-Editor-Spalte) wird aus dem ServiceWindow entfernt - die rechte Splitter-Spalte zeigt seitdem nur noch MasterTree + Parameter-Box (2-Spalten-Layout). Hot-Reload-Button `btn_reload_plugins` entfaellt bewusst; `execute_set`/`combo_tf_set`/`ServiceSetRunWorker` werden entfernt (Kontextmenue-Run ist alleiniger Ausfuehrungspfad). (2) Zwei Layout-Bugfixes: die Parameter-Box soll zwei Services ohne horizontalen Scrollbalken anzeigen (Bugfix 1) und die Fensterbreite soll etwas mehr sein als Tree- + Box-Breite zusammen (Bugfix 2). Dazu wird die Alt-Verdrahtung des globalen `HistoricalScanner` (Button `btn_start_scan`, Checkbox `check_new_scan`, Status-Zeile mit Laufzeit/Fortschritt) ersatzlos entfernt - die Ausfuehrung erfolgt nur noch ueber das MasterTree-Kontextmenue.
+
+**Entscheidungen:**
+* **2-Spalten-Splitter statt 3-Spalten:** Der Set-Editor (`group_service_sets`) entfaellt als Spalte; der Splitter haelt nur noch MasterTree (links) | Parameter-Box (rechts). Die rechte Spalte zeigt weiterhin ALLE Services des Sets (Lazy-Load, `param_columns.py` bleibt bestehen - Option A der Rueckfrage).
+* **Hot-Reload-Button entfaellt:** `btn_reload_plugins` wird nicht ersetzt; Plugin-Reload bleibt Entwickler-Thema.
+* **EIN Ausfuehrungspfad:** `execute_set`/`combo_tf_set`/`ServiceSetRunWorker` werden entfernt; der Kontextmenue-Run (`ServiceRunWorker` + `combo_tf` inkl. "ALLE Timeframes") ist alleiniger Weg.
+* **New-Scan ersatzlos entfernt (Option B):** `check_new_scan`, `btn_start_scan` und die Status-Zeile (`label_elapsed`/`progress_bar`) entfallen komplett; `HistoricalScanner` wird nicht mehr im ServiceWindow instanziiert. Die Scanner-Klasse selbst (`scanner/historical_scanner.py`) und `serviceui/status_panel.py` (separate, ungenutzte Komponente) bleiben unangetastet.
+
+**A) Phase-13-Box-Bereinigung (`service_win.py`, `ui/service_win.ui`, `__init__.py`, Loeschungen):**
+* Geloescht: `.backup_service_toolbar/`, `.backup_parameter_panel/`, `serviceui/set_item_adapter.py`, `serviceui/set_run_worker.py` sowie die Legacy-Tests `check_p13_s4.py`, `check_p13_ui_plugins.py`, `check_p13_s5.py`, `check_p13_s56.py`, `check_p13_service_win_geometry.py`, `check_p14_precision_levels.py`, `check_p14_prop_ui.py`.
+* `service_win.py`: `_on_master_selection` laedt das Set direkt (`set_repo.get_set` -> `load_set_into_editor`); Kontextmenue exklusiv (`_on_move_service`/`_on_remove_service`/`_on_add_set_service`/`_on_delete_set` auf DB-Definition, P14-04-E-Sperre + P14-05-Papierkorb erhalten); neue Helfer `_add_service_to_set()`/`_next_instance_id()`.
+* `param_columns.py`: `combo_tf_set` -> `combo_tf`; `_update_service_tooltip` entfernt.
+* `ui/service_win.ui`: `group_service_sets`-Block (299 Zeilen) entfernt.
+* `__init__.py`: Exports bereinigt (`ServiceSetRunWorker`/`ServiceSetItemAdapter` raus).
+
+**B) Layout-Bugfixes (Bugfix 1+2):**
+* Bugfix 1 (`service_win.py`): `_param_panel.setMinimumWidth(320)` -> `960` (Default etwas breiter als zwei Service-Spalten = 942 px gemessen) -> zwei Services passen ohne horizontalen Scrollbalken.
+* Bugfix 2 (`ui/service_win.ui`): Fenster-Geometrie `1280` -> `1400` Breite (etwas mehr als Tree-Minimum 400 + Box 960 + Splitter-Handle + Layout-Margins).
+* Stale-Bug (`param_columns.py`): `_resize_param_box_deferred` pruefte `splitter.count() == 3` (Alt-Layout) -> auf `== 2` korrigiert; erst dadurch greift der deferred `setSizes` nach dem Spaltenaufbau wieder (vorher behielt der Splitter veraltete Groessen [521, 817]).
+
+**C) New-Scan-Alt-Verdrahtung entfernt (`service_win.py`, `ui/service_win.ui`):**
+* `HistoricalScanner`-Import, `self.scanner`, `_elapsed_timer`/`_elapsed_seconds`, die Controls `check_new_scan`/`btn_start`/`label_elapsed`/`progress_bar`, die Methoden `start_scan`/`on_progress`/`on_finished`/`_update_elapsed`, die `btn_start.clicked`-Verdrahtung und der closeEvent-Scanner-Code ersatzlos entfernt.
+* `indexOf(self.btn_start)` -> festes `idx = 1` (Splitter-Einfuegeposition nach `layout_symbol`).
+* Imports bereinigt (`QCheckBox`, `QLabel`, `QProgressBar` raus).
+* `ui/service_win.ui`: `check_new_scan`, `btn_start_scan`, `layout_status` (Laufzeit/Fortschritt) entfernt; Placeholder "Scan-Log..." -> "Log...".
+
+**Validierung (headless, gruen):**
+* `python -m py_compile` auf `serviceui/service_win.py`, `serviceui/param_columns.py`, `serviceui/__init__.py` (Exit 0); `ui/service_win.ui` parsebar; Import-Smoke via venv-Python OK.
+* Echte `ServiceWindow`-Instanz (offscreen, Test-DB in `test/`, 1920-FakeScreen): Mess-Skript (`tmp_measure_param_width.py`) -> hscroll max 121 -> **0** (2 Services ohne Scrollbalken), `_param_panel` width/min 960, Splitter-Sizes **[400, 960]** (statt stale [521, 817]), Fenster 1386 px (etwas mehr als 400+960+Handle+Margins).
+* Keine verbleibenden Verweise auf entfernte Elemente (nur legitime Kommentare/Tests); `main.py` unberuehrt (greift auf keine entfernten Methoden zu).
+* Temporaere Testdateien (`tmp_measure_param_width.py`, `tmp_diff.txt`) danach geloescht (Regel: Tests nur in `test/`).
+* Keine UI-Tests (Regel). Manuelle UI-Verifikation durch den Anwender.
+* `docs/x_Exports.md` bleibt unangetastet (Nutzer-Export, nicht Bestandteil dieses Commits).
