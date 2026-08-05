@@ -161,12 +161,19 @@ class NamedItemActionsMixin:
         if new_id is not None:
             adapter._item_select(new_id)
 
-    def delete_named_item(self, adapter: NamedItemAdapter) -> None:
+    def delete_named_item(self, adapter: NamedItemAdapter,
+                          confirm: bool = True) -> None:
         """Löscht das aktuelle Element analog zur Preset-Verwaltung.
 
-        Ablauf: Schutz des reservierten Namens → Rückfrage → löschen
-        (adapter._item_delete_current) → nächstes Element auswählen
+        Ablauf: Schutz des reservierten Namens → (optional) Rückfrage →
+        löschen (adapter._item_delete_current) → nächstes Element auswählen
         (adapter._item_select(None)).
+
+        Bugfix 05.08.2026 (Papierkorb): Service-Sets werden soft-deleted –
+        der Aufrufer (ServiceWindow.delete_set) fragt bereits einmal nach
+        ('Set in den Papierkorb verschieben') und ruft diese Methode mit
+        confirm=False auf, damit KEINE zweite Rückfrage erscheint. Die
+        Preset-Verwaltung (ohne Papierkorb) behält confirm=True (Default).
         """
         scope = adapter._item_scope_label()
         current = adapter._item_current_name()
@@ -179,14 +186,15 @@ class NamedItemActionsMixin:
                                 f"'{reserved}' kann nicht gelöscht werden.")
             return
 
-        reply = QMessageBox.question(
-            self, "Löschen bestätigen",
-            f"Möchtest du {scope} '{current}' wirklich löschen?\n"
-            f"Dies kann nicht rückgängig gemacht werden.",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
-            return
+        if confirm:
+            reply = QMessageBox.question(
+                self, "Löschen bestätigen",
+                f"Möchtest du {scope} '{current}' wirklich löschen?\n"
+                f"Dies kann nicht rückgängig gemacht werden.",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
 
         adapter._item_delete_current()
         adapter._item_select(None)

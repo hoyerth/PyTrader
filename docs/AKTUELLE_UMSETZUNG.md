@@ -538,3 +538,37 @@ ew_set_dialog.py, param_columns.py, 	rash_dialog.py (Exit 0).
 * Import `ServiceDescriptionDialog` bleibt gültig (weiterhin in `_show_service_info` für die markierte Instanz der execution_order-Liste genutzt).
 * Manueller UI-Test durch den Anwender: ℹ-Button auf Standalone-/Plugin-Zeile → Editor-Dialog erscheint (gleiches Verhalten wie Einzel-Services).
 * `docs/x_Exports.md` bleibt unangetastet (Nutzer-Export, nicht Bestandteil des Commits).
+
+
+### 3.23 Schritt 23 - Papierkorb-Integration & Kontextmenue-Verknuepfung im ServiceWindow (05.08.2026)
+
+**Anlass (vom Anwender uebergeben - 'Papierkorb-Integration & Kontextmenue-Verknuepfung im ServiceWindow (Phase 15)'):** Die Papierkorb-Funktionalitaet (P14-05 Soft-Delete) war bereits vorhanden (Button in `layout_set_actions`, Dialog als `QListWidget`), wurde aber um drei Punkte erweitert: (1) Button-Platzierung in der oberen Aktionsleiste, (2) Anzeige/Sortierung/Buttons im `TrashDialog`, (3) Kontextmenue-Eintrag im `MasterTree`. In der Folge-Runde (Bugfixing-Modus) wurden zusaetzlich die doppelte Nachfrage beim Set-Loeschen (kein zweites Mal noetig, da Papierkorb), die Gleichheits-Pruefung der beiden Loesch-Buttons und die Datumsspalte im Papierkorb behandelt.
+
+**Entscheidungen:**
+* **Button 'Endgueltig Loeschen' vs. 'Papierkorb leeren':** NICHT identisch - `_purge_selected()` loescht NUR das selektierte Set (`purge_trash_set(set_id)`), `_purge_all()` loescht ALLE (`purge_trash()`). Beide bleiben erhalten; nur im 1-Zeilen-Fall wirken sie gleich. Button 'Endgueltig Loeschen' wurde auf Wunsch in **'Loeschen'** umbenannt.
+* **Loesch-Nachfrage im Tree:** Da Service-Sets soft-deleted werden (Papierkorb), genuegt EINE Nachfrage ('Set in den Papierkorb verschieben'). Die zweite Rueckfrage aus der generischen Preset-Mechanik entfaellt.
+* **Datumsformat:** `E. DD.MM.JJ HH:MM` (z.B. `Sa. 04.07.26 14:34`), eigene Spalte 'Geloescht am' GANZ VORN; Sortierung ABSTEIGEND (neueste zuerst).
+
+**A) `ui/service_win.ui` + `serviceui/service_win.py` (Button-Platzierung):**
+* `ui/service_win.ui`: `btn_trash_sets` aus `layout_set_actions` (neben Speichern/Loeschen) **entfernt** und in `layout_symbol` **direkt rechts neben `check_new_scan`** (`[New Scan]`) eingefuegt; Text **'🗑️ Papierkorb'** (Tooltip P14-05 unveraendert). Die bestehende Verdrahtung `btn_trash_sets.clicked -> show_trash_dialog()` (modales `exec_()`, Esc/X schliessen nativ) greift unveraendert.
+
+**B) `serviceui/trash_dialog.py` (Anzeige, Datum, Buttons, EventBus):**
+* **QTableWidget statt QListWidget:** Spalte 0 (ganz vorn) 'Geloescht am' (Format `E. DD.MM.JJ HH:MM` via `_format_deleted_at()`), Spalte 1 nur der Name des geloeschten Objekts (Datums-Anhang hinter dem Namen entfernt). Zeilenauswahl (SelectRows/SingleSelection, NoEditTriggers), Spalte 0 ResizeToContents, Spalte 1 Stretch.
+* **Sortierung:** `_reload()` sortiert die `list_trash()`-Daten ABSTEIGEND nach `deleted_at` (neueste zuerst) ueber `_deleted_at_sort_key()` (robust fuer datetime / ISO-Strings mit/ohne Z / None / unparsebare Werte -> `datetime.min`).
+* Button **'Endgueltig Loeschen' -> 'Loeschen'** (Wunsch Anwender).
+* **EventBus-Emit nach endgueltigem Loeschen (`purge_trash_set`) UND Leeren (`purge_trash`)** ergaenzt -> MasterTree + Dropdowns synchronisieren live (Restore-Emit war bereits vorhanden). Doppelte Sicherheitsabfrage fuer beide Loesch-Aktionen bleibt unveraendert (P14-05).
+
+**C) `serviceui/master_tree.py` + `serviceui/service_win.py` (Kontextmenue):**
+* Neues Signal `open_trash_requested = Signal()` im `MasterTree`.
+* Gruppen-Kontextmenue **'📁 Service-Sets'**: nach 'Neues Set anlegen' (mit Separator) neuer Eintrag **'🗑️ Papierkorb öffnen...'** -> emittiert `open_trash_requested`.
+* `_wire_selector_toolbar()`: `tree.open_trash_requested -> self.show_trash_dialog()` - dieselbe Methode wie der Aktionsleisten-Button.
+
+**D) `chart/widgets/named_item_actions.py` + `serviceui/service_win.py` (eine Nachfrage statt zwei):**
+* `delete_named_item(adapter, confirm: bool = True)`: neuer Parameter - `confirm=False` ueberspringt die Rueckfrage. Default `True` unveraendert (Presets im `indicator_dialog.py` behalten ihre Rueckfrage).
+* `ServiceWindow.delete_set()` ruft `delete_named_item(self._set_adapter, confirm=False)` - es bleibt NUR die erste Nachfrage ('Set in den Papierkorb verschieben', Soft-Delete).
+
+**Validierung (headless, gruen):**
+* `python -m py_compile` auf `chart/widgets/named_item_actions.py`, `serviceui/master_tree.py`, `serviceui/service_win.py`, `serviceui/trash_dialog.py` (Exit 0); `ui/service_win.ui` parst als XML (Exit 0).
+* Isolierte Logik-Checks in `test/` (temporaere Skripte, danach geloescht): `_format_deleted_at` (datetime/ISO/None/Rohwert -> `Sa. 04.07.26 14:34`, `Mo. 06.07.26 14:34`, leerer String, Rohwert), `_deleted_at_sort_key` (absteigend: neueste zuerst, None/unparsebar = aelteste, stabile Reihenfolge) - **ALLE PASS**.
+* Keine UI-Tests (Regel). Keine externen Referenzen auf das alte `trash_list`-Attribut (findstr-Check).
+* `docs/x_Exports.md` wurde vom Anwender selbst export-aktualisiert und bleibt wie immer unangetastet (nicht Bestandteil dieses Commits).

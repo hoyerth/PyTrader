@@ -473,6 +473,10 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         tree.move_service_requested.connect(self._on_move_service)
         tree.remove_service_requested.connect(self._on_remove_service)
         tree.purge_trash_requested.connect(self._on_purge_trash)
+        # Phase 15: Kontextmenue '🗑️ Papierkorb öffnen...' (Haupt-Gruppe
+        # 📁 Service-Sets) – gleiche Methode wie der Papierkorb-Button in
+        # der oberen Aktionsleiste (btn_trash_sets).
+        tree.open_trash_requested.connect(self.show_trash_dialog)
         # 05.08.2026: Gezielte Ausfuehrung ('▶️ Diesen Service ausführen' /
         # '▶️ Alle Services ausführen') -> ServiceRunWorker mit Sicherheits-
         # abfrage (Set/Service + aktives Symbol/Timeframe) + FeatureStore-
@@ -1861,9 +1865,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                         f"Service erhalten bleiben (P14-04).")
                     return
         # Bugfix 05.08.2026: Erste Bestaetigung – das Set wird in den
-        # Papierkorb (service_sets_trash) verschoben (zweite Abfrage folgt
-        # in delete_named_item; Wiederherstellung ueber den Papierkorb-
-        # Dialog).
+        # Papierkorb (service_sets_trash) verschoben (Wiederherstellung
+        # ueber den Papierkorb-Dialog moeglich).
         name = self._set_adapter._item_current_name()
         if not name:
             return
@@ -1874,7 +1877,10 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
-        self.delete_named_item(self._set_adapter)
+        # Bugfix 05.08.2026 (Papierkorb): KEINE zweite Nachfrage – das Set
+        # ist soft-deleted (Papierkorb), daher delete_named_item mit
+        # confirm=False (die Rueckfrage lief oben bereits).
+        self.delete_named_item(self._set_adapter, confirm=False)
 
     # =========================================================================
     # Phase 14 P14-05: Papierkorb (Soft-Delete / Wiederherstellung)

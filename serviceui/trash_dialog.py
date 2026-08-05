@@ -11,16 +11,54 @@ Aktion über eine Log-Callback. Das endgültige Löschen/Bereinigen erfolgt
 IMMER mit doppelter Sicherheitsnachfrage (User-Vorgabe P14-05).
 """
 
+from datetime import datetime
 from typing import Callable, Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-    QMessageBox, QPushButton, QVBoxLayout,
+    QAbstractItemView, QDialog, QHBoxLayout, QHeaderView, QLabel,
+    QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
 from analytics.engine.service_set_repository import ServiceSetRepository
 from config.event_bus import event_bus
+
+#: Deutsche Wochenkürzel (Index = datetime.weekday(), 0=Montag) für das
+#: Datumsformat 'E. DD.MM.JJ HH:MM' (z.B. 'Mo. 04.07.26 14:34').
+_GERMAN_WEEKDAYS = ["Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa.", "So."]
+
+
+def _format_deleted_at(value: object) -> str:
+    """Formatiert den deleted_at-Zeitstempel als 'E. DD.MM.JJ HH:MM'.
+
+    DuckDB liefert TIMESTAMP als datetime-Objekt; alternativ werden
+    ISO-Strings (mit/ohne Z) akzeptiert. Nicht parsebare Werte werden als
+    Rohwert zurueckgegeben, fehlende Werte als leerer String (defensiv).
+    """
+    if isinstance(value, datetime):
+        dt = value
+    elif value:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return str(value)
+    else:
+        return ""
+    return f"{_GERMAN_WEEKDAYS[dt.weekday()]} {dt.strftime('%d.%m.%y %H:%M')}"
+
+
+def _deleted_at_sort_key(value: object) -> datetime:
+    """Normalisiert deleted_at zu einem vergleichbaren datetime für die
+    absteigende Sortierung (neueste zuerst). Nicht parsebare/fehlende Werte
+    gelten als älteste (datetime.min)."""
+    if isinstance(value, datetime):
+        return value
+    if value:
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return datetime.min
+    return datetime.min
 
 
 class ServiceSetTrashDialog(QDialog):
@@ -57,12 +95,26 @@ class ServiceSetTrashDialog(QDialog):
         self.hint.setWordWrap(True)
         layout.addWidget(self.hint)
 
-        self.trash_list = QListWidget()
-        layout.addWidget(self.trash_list, 1)
+        # Bugfix 05.08.2026: Tabelle statt Liste – das Löschdatum steht als
+        # EIGENE Spalte GANZ VORN ("Gelöscht am"), danach nur der Name des
+        # gelöschten Objekts (kein Datum hinter dem Namen). Sortierung:
+        # neueste zuerst (absteigend nach deleted_at, siehe _reload).
+        self.trash_table = QTableWidget()
+        self.trash_table.setColumnCount(2)
+        self.trash_table.setHorizontalHeaderLabels(["Gelöscht am", "Name"])
+        self.trash_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.trash_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.trash_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.trash_table.verticalHeader().setVisible(False)
+        header = self.trash_table.horizontalHeader()
+        if header is not None:
+            header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.Stretch)
+        layout.addWidget(self.trash_table, 1)
 
         btn_row = QHBoxLayout()
         self.btn_restore = QPushButton("Wiederherstellen")
-        self.btn_purge_one = QPushButton("Endgueltig loeschen")
+        self.btn_purge_one = QPushButton("Löschen")
         self.btn_purge_all = QPushButton("Papierkorb leeren")
         btn_close = QPushButton("Schliessen")
         for b in (self.btn_restore, self.btn_purge_one, self.btn_purge_all, btn_close):
@@ -79,15 +131,24 @@ class ServiceSetTrashDialog(QDialog):
     # --- intern ---
 
     def _reload(self) -> None:
-        self.trash_list.clear()
-        trash_items = self._repo.list_trash()
-        for item in trash_items:
-            name = item.get("display_name") or item.get("set_id") or "Unbenannt"
-            deleted_at = str(item.get("deleted_at") or "")
-            li = QListWidgetItem(f"{name}   (geloescht: {deleted_at})")
-            li.setData(Qt.UserRole, item.get("set_id"))
-            self.trash_list.addItem(li)
-        has_items = self.trash_list.count() > 0
+        self.trash_table.setRowCount(0)
+        trash_items = list(self._repo.list_trash())
+        # Bugfix 05.08.2026: Neueste zuerst – absteigend nach deleted_at
+        # (das Repository liefert aufsteigend).
+        trash_items.sort(
+            key=lambda it: _deleted_at_sort_key(it.get("deleted_at")),
+            reverse=True,
+        )
+        for row, item in enumerate(trash_items):
+            set_id = item.get("set_id")
+            name = item.get("display_name") or set_id or "Unbenannt"
+            deleted_at = _format_deleted_at(item.get("deleted_at"))
+            date_item = QTableWidgetItem(deleted_at)
+            date_item.setData(Qt.UserRole, set_id)
+            self.trash_table.insertRow(row)
+            self.trash_table.setItem(row, 0, date_item)
+            self.trash_table.setItem(row, 1, QTableWidgetItem(name))
+        has_items = self.trash_table.rowCount() > 0
         self.btn_restore.setEnabled(has_items)
         self.btn_purge_one.setEnabled(has_items)
         self.btn_purge_all.setEnabled(has_items)
@@ -100,7 +161,10 @@ class ServiceSetTrashDialog(QDialog):
         )
 
     def _selected_id(self) -> Optional[str]:
-        item = self.trash_list.currentItem()
+        row = self.trash_table.currentRow()
+        if row < 0:
+            return None
+        item = self.trash_table.item(row, 0)
         return item.data(Qt.UserRole) if item else None
 
     def _restore(self) -> None:
@@ -142,17 +206,20 @@ class ServiceSetTrashDialog(QDialog):
         if self._repo.purge_trash_set(set_id):
             self._log(f"Set endgueltig geloescht (P14-05): {set_id}")
             self._reload()
+            # Phase 15: Struktur-Aenderung -> EventBus (Live-Sync aller
+            # ServiceSelectorModel-Instanzen, Invariante 5).
+            event_bus.service_set_changed.emit()
         else:
             self._log(f"Set '{set_id}' nicht im Papierkorb gefunden.")
 
     def _purge_all(self) -> None:
-        if self.trash_list.count() == 0:
+        if self.trash_table.rowCount() == 0:
             return
         # Doppelte Sicherheitsnachfrage - endgueltiges Loeschen ist nicht
         # umkehrbar (User-Vorgabe P14-05).
         first = QMessageBox.question(
             self, "Papierkorb leeren?",
-            f"Alle {self.trash_list.count()} Sets im Papierkorb werden "
+            f"Alle {self.trash_table.rowCount()} Sets im Papierkorb werden "
             "ENDGUELTIG geloescht und koennen nicht wiederhergestellt "
             "werden. Fortfahren?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
@@ -170,3 +237,6 @@ class ServiceSetTrashDialog(QDialog):
         count = self._repo.purge_trash()
         self._log(f"Papierkorb geleert (P14-05): {count} Set(s) endgueltig entfernt.")
         self._reload()
+        # Phase 15: Struktur-Aenderung -> EventBus (Live-Sync aller
+        # ServiceSelectorModel-Instanzen, Invariante 5).
+        event_bus.service_set_changed.emit()

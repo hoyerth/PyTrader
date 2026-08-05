@@ -59,6 +59,7 @@ Signale:
       remove_service_requested(set_id, service_id)    – 'Service entfernen'
       run_service_requested(set_id, instance_id)      – '▶️ Diesen Service ausführen'
       run_set_requested(set_id)                        – '▶️ Alle Services ausführen'
+      open_trash_requested()                           – '🗑️ Papierkorb öffnen...'
     (Service-Info nutzt das bestehende `info_requested`-Signal.)
 """
 
@@ -167,6 +168,11 @@ class MasterTree(QTreeWidget):
     # Bugfix 05.08.2026: Kontextmenue 'Papierkorb löschen' – endgueltig
     # leeren (Orchestrator fuehrt die doppelte Sicherheitsabfrage aus).
     purge_trash_requested = Signal()
+    # Phase 15: Kontextmenue '🗑️ Papierkorb öffnen...' (Haupt-Gruppe
+    # 📁 Service-Sets) – oeffnet den Papierkorb-Dialog. Der Orchestrator
+    # (ServiceWindow) ruft dieselbe Methode auf wie der Papierkorb-Button
+    # in der Aktionsleiste (show_trash_dialog()).
+    open_trash_requested = Signal()
     # 05.08.2026 (Ausfuehrungsdatum & Kontextmenue-Ausfuehrung):
     #   run_service_requested(set_id, instance_id) – '▶️ Diesen Service ausfuehren'
     #   run_set_requested(set_id)                   – '▶️ Alle Services ausfuehren'
@@ -491,6 +497,10 @@ class MasterTree(QTreeWidget):
                     act = menu.addAction("Neues Set anlegen")
                     act.triggered.connect(
                         lambda _=False: self.create_set_requested.emit())
+                    menu.addSeparator()
+                    act_trash = menu.addAction("🗑️ Papierkorb öffnen...")
+                    act_trash.triggered.connect(
+                        lambda _=False: self.open_trash_requested.emit())
                 else:
                     self._add_outside_set_actions(menu, item)
                 menu.exec(self.viewport().mapToGlobal(pos))

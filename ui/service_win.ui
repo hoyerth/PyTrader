@@ -97,6 +97,16 @@
         </property>
        </widget>
       </item>
+      <item>
+       <widget class="QPushButton" name="btn_trash_sets">
+        <property name="text">
+         <string>🗑️ Papierkorb</string>
+        </property>
+        <property name="toolTip">
+         <string>P14-05: Gelöschte Service-Sets einsehen, wiederherstellen oder endgültig entfernen (Soft-Delete).</string>
+        </property>
+       </widget>
+      </item>
      </layout>
     </item>
     <item>
@@ -374,16 +384,6 @@
            </property>
            <property name="toolTip">
             <string>Set löschen (mit Rückfrage). Löschen ist final.</string>
-           </property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QPushButton" name="btn_trash_sets">
-           <property name="text">
-            <string>Papierkorb</string>
-           </property>
-           <property name="toolTip">
-            <string>P14-05: Gelöschte Service-Sets einsehen, wiederherstellen oder endgültig entfernen (Soft-Delete).</string>
            </property>
           </widget>
          </item>
