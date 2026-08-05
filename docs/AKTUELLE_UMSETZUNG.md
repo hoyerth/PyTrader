@@ -446,3 +446,37 @@ ew_set_dialog.py, param_columns.py, 	rash_dialog.py (Exit 0).
 * `python -m py_compile` auf `serviceui/service_win.py`, `serviceui/run_worker.py` (Exit 0); `ui/service_win.ui` parst als XML (Exit 0).
 * `test/test.py` Teil 6 (U1–U13) + Teil 6.4 (U14–U18), offscreen auf Test-DBs isoliert, **ALLE PRÜFUNGEN BESTANDEN**: `combo_tf` existiert in der Filterleiste, Index 0 = Sentinel, alle Timeframes enthalten, Default `M1`; Persistenz/Restore des Sentinel-Modus (`get_persistent_timeframe`/`save_state`/`restore_state`); `_resolve_timeframes()` Single vs. ALL (Reihenfolge = `get_timeframes()`); Multi-TF-`run()`-Schleife mit Fake-FeatureBuilder/-Evaluator (M1+H1 gespeichert, M30 ohne Daten übersprungen, Rows summiert, genau 1× `run_finished`, kein `run_failed`; Single-TF mit Daten → `run_finished`, Single-TF ohne Daten → `run_failed`); Grid-Level-Mathematik (close 30.1 / step 0.5 → center 30.0, upper 30.5, lower 29.5).
 * Zeilenenden: `.ui` auf LF normalisiert (Repo-Konvention für `*.ui`); git-Diff minimal (25 Insertions im `.ui`).
+
+### 3.19 Schritt 19 – Service-Run-Bugfixes: depends_on-Auflösung & Scanner-Candles-Lookback (05.08.2026)
+
+**Anforderung (2 Bugs, vom Anwender übergeben):**
+
+1. **"ausführen service proximity" → Log "fertig (kein Feature-Store-Payload)"**: UI-angelegte Service-Sets speichern KEIN `depends_on`; `ProximityService.calculate()` liest die Linienliste aber ausschließlich aus `context.shared_state[depends_on[0]]` → leerer Payload. Der Indikator-interne Pfad (`_build_set_definition` in `chart/indicators/grid_liquidity.py`) setzt `depends_on` korrekt, die UI-Pfade (`_build_new_set_definition`, `add_instance`, `collect_set_definition` in `serviceui/service_win.py`) nicht.
+2. **"grid_lines: 1000 Feature-Row(s) gespeichert" → sollen Scanner-Candles (max) aus den App-Optionen als max Lookback für alle Services verwendet werden**: Die Worker luden OHLCV mit `limit=feature_builder_limit` (3000) und die Services liefen mit ihrem gespeicherten `lookback` (z. B. 1000).
+
+**Entscheidungen:** (a) Die implizite Abhängigkeit wird anhand der Plugin-Deklaration `PluginFeature.dependencies` aufgelöst (nächste VORHERIGE Instanz in `execution_order` mit passender plugin_id) – explizit gesetzte `depends_on` (Indikator-intern `grid_1` → `prox_1`) bleiben unverändert. Kein Hardcoding von Set-IDs/Instanz-Namen in zentralen Repositories (OOP-Regel: keine `if name == ...`-Checks). (b) `scanner_candle_limit` (Properties-Fenster "Scanner Candles (max)", `config/app_settings.py`, Default 100.000) ist die Datenbasis für ALLE Services (gleiche Datenmenge wie der Historical Scanner); die Service-`lookback`-Werte werden beim Worker-Run überschrieben.
+
+**A) `analytics/features/definitions/proximity_service.py`:** Neue Property `dependencies` → `["grid_lines"]` (deklarative Upstream-Semantik über den bestehenden `PluginFeature.dependencies`-Vertrag; dient hier als Info für die Worker-Auflösung).
+
+**B) `serviceui/service_set_utils.py`:** Neue Funktion `prepare_worker_definition(definition, lookback_limit)` (arbeitet auf einer Kopie, Original bleibt unverändert):
+* Fehlende `depends_on` automatisch auflösen: Service ohne `depends_on`, dessen Plugin `dependencies` deklariert (z. B. proximity → `['grid_lines']`), erhält die nächstliegende VORHERIGE Instanz in `execution_order` mit passender `plugin_id` als `depends_on`. Explizite Werte werden NIE überschrieben.
+* Lookback-Override: jede Service-Instanz läuft mit `lookback_limit` (= `scanner_candle_limit`).
+
+**C) `serviceui/run_worker.py` + `serviceui/set_run_worker.py`:** Beide Worker rufen `prepare_worker_definition(definition, settings.scanner_candle_limit)` vor `evaluator.execute_set()` auf und laden OHLCV mit `limit=settings.scanner_candle_limit` statt `feature_builder_limit`.
+
+**D) Folge-Fix 1 (vorbestehend, durch Runde-1-Verifikation sichtbar geworden): `chart/indicators/grid_liquidity.py`** – `_colorize()` ergänzt jetzt `priority=10`: der Pipeline-Fallback (`prox_crp.hit_circles` aus dem ProximityService) lieferte Kreise OHNE `priority` (nur time/price/in_window); der Feature-Store-Lesepfad und die Live-Punkte setzten `priority=10` bereits. Beide Pfade sind damit konsistent (ChartCircle-Vertrag, `base_plugin.py`).
+
+**E) Folge-Fix 2 (vorbestehend): `chart/indicator_dialog.py`** – `meta = dict(getattr(plugin, "metadata", None) or {})` statt `dict(plugin.metadata or {})`: `_get_plugin()` Branch 1 kann einen Indikator liefern, der `parameter_schema`+`plugin_id` implementiert, ohne `PluginFeature` zu sein (z. B. `GridLiquidityIndicator`, ein `BaseIndicator`) → kein `metadata`-Attribut. Der getattr-Guard verhindert den `AttributeError` im Experten-Optionen-Bereich.
+
+**Zusätzlich committete Vorrunden-Änderungen (derselbe Arbeitsstrom, 05.08.2026):**
+* `analytics/features/feature_builder.py`: `store_plugin_payload()` setzt `created_at = now()` statt `current_timestamp` im `ON CONFLICT DO UPDATE SET` (DuckDB 1.5.5 bindet lowercase `current_timestamp` dort als SPALTENREFERENZ → Binder Error; verifiziert in `test/check_current_timestamp.py`).
+* `serviceui/service_win.py` `_refresh_timeframe_combo()`: Timeframes AUFSTEIGEND nach Dauer sortiert (M1..MN1 via `TF_SECONDS_MAP`, kürzeste zuerst) – identische Reihenfolge wie im chart_win; Fallback-Liste auf alle 11 Timeframes erweitert.
+* `ui/service_win.ui` `combo_tf_set`: M2, M10, W1, MN1 ergänzt (alle 11 Timeframes).
+
+**Validierung (headless, grün):**
+* `python -m py_compile` auf allen geänderten Dateien (Exit 0).
+* **Neu `test/check_service_run_fixes.py`** (headless, in `test/`): ProximityService.dependencies == `['grid_lines']`; `prepare_worker_definition()` löst implizites `depends_on` auf (UI-Set ohne depends_on → proximity erhält `['grid_lines']`), überschreibt Lookback auf `scanner_candle_limit`, lässt explizites depends_on unangetastet; End-to-End-Evaluator liefert proximity-Feature-Rows mit `metadata.depends_on`; Code-Inspektion: beide Worker nutzen `scanner_candle_limit` + `prepare_worker_definition`. **ALLE CHECKS BESTANDEN.**
+* `test/test.py` (designierte Verifikation, offscreen isoliert, inkl. Worker-Loop U14–U18): **ALLE PRÜFUNGEN BESTANDEN**.
+* `test/check_p13_proximity_cleanup.py` (vorher FAIL durch vorbestehenden `priority`-Crash, jetzt nach Folge-Fix 1+2 EXIT 0): **ALLE CHECKS BESTANDEN** – inkl. Prop-Fenster-Headless (kein `AttributeError: metadata`).
+* `test/check_plugin_batch_services.py`, `test/check_p13_s3.py`: **ALLE CHECKS BESTANDEN** (Scanner-/Evaluator-Pfad unverändert grün).
+* `docs/x_Exports.md` wurde vom Anwender selbst export-aktualisiert und bleibt wie immer unangetastet (nicht Bestandteil dieses Commits).

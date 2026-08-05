@@ -640,6 +640,13 @@ class FeatureBuilder:
             if not rows:
                 return 0
 
+            # Bugfix 05.08.2026: `now()` statt `current_timestamp` im
+            # ON CONFLICT DO UPDATE SET – DuckDB 1.5.5 bindet das (lowercase)
+            # Keyword dort als SPALTENREFERENZ der feature_store-Tabelle und
+            # wirft 'Binder Error: Table "feature_store" does not have a column
+            # named "current_timestamp"'. `now()` (Funktionsaufruf) wird
+            # korrekt als Zeitfunktion aufgeloest (verifiziert in
+            # test/check_current_timestamp.py).
             con.executemany("""
                 INSERT INTO feature_store (symbol, timeframe, bar_time, feature_id, plugin_version, feature_data)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -647,7 +654,7 @@ class FeatureBuilder:
                     feature_id = EXCLUDED.feature_id,
                     plugin_version = EXCLUDED.plugin_version,
                     feature_data = EXCLUDED.feature_data,
-                    created_at = current_timestamp
+                    created_at = now()
             """, rows)
             # P14-03 (Invariante 13): In-Memory-Cache für (symbol, timeframe)
             # explizit invalidieren (veraltete shared_state-Zustände vermeiden).

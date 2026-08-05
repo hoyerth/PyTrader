@@ -115,6 +115,22 @@ class ProximityService(PluginFeature):
             "render": True,
         }
 
+    @property
+    def dependencies(self) -> List[str]:
+        """Vorab berechnete Service-Plugins (PluginFeature.dependencies).
+
+        05.08.2026 (Bugfix Service-Run): proximity liest seine Linienliste aus
+        context.shared_state[depends_on[0]] – dafuer muss eine vorgelagerte
+        grid_lines-Instanz in execution_order stehen. Gespeicherte Sets aus
+        der UI-Pfade haben oft KEIN explizites depends_on; die Worker-
+        Aufbereitung (serviceui/service_set_utils.prepare_worker_definition)
+        loest daraus die implizite Abhaengigkeit auf (naechste VORHERIGE
+        Instanz mit plugin_id in dependencies). Explizit gesetzte
+        depends_on-Werte (z.B. Indikator-intern grid_1 -> prox_1) bleiben
+        unveraendert gueltig.
+        """
+        return ["grid_lines"]
+
     # --- Single Source of Truth fürs Prop-Fenster (Phase 13 Schritt 5) -------
     # Hinweis (Schritt 6-Korrektur 3): Die visuellen Parameter (show_circles,
     # circle_color_std, circle_color_active, show_lines) sind KEINE

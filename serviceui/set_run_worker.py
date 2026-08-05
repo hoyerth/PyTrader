@@ -53,7 +53,7 @@ class ServiceSetRunWorker(QThread):
 
             settings = StateManager().get_app_settings()
             fb = FeatureBuilder()
-            df = fb.load_ohlcv(self.symbol, self.timeframe, limit=settings.feature_builder_limit)
+            df = fb.load_ohlcv(self.symbol, self.timeframe, limit=settings.scanner_candle_limit)
             if df is None or df.empty:
                 self.run_failed.emit(
                     self.set_definition.get("set_id", ""),
@@ -72,7 +72,19 @@ class ServiceSetRunWorker(QThread):
             display = self.set_definition.get("display_name") or self.set_definition.get("set_id") or "Unbenannt"
             self.log_message.emit(f"Ausfuehren: {display} ({self.symbol} {self.timeframe})")
 
-            results = self.evaluator.execute_set(self.set_definition, df_plugin, context=context)
+            # 05.08.2026 (Bugfix Service-Run):
+            #  * Fehlende depends_on-Einträge (z.B. proximity -> grid_lines)
+            #    werden automatisch aufgelöst (sonst 'kein Feature-Store-
+            #    Payload' für nachgelagerte Services im Set).
+            #  * Scanner-Candles (max) aus den App-Optionen als max Lookback
+            #    für ALLE Services (Datenbasis wie beim Historical Scanner).
+            from serviceui.service_set_utils import prepare_worker_definition
+            definition = prepare_worker_definition(
+                self.set_definition,
+                getattr(settings, "scanner_candle_limit", 100000),
+            )
+
+            results = self.evaluator.execute_set(definition, df_plugin, context=context)
 
             # Feature-Store-Persistenz (05.08.2026, Punkt 2): Jeder Service
             # mit non-leerem feature_store_payload wird in analytics.duckdb

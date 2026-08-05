@@ -495,6 +495,13 @@ class GridLiquidityIndicator(BaseIndicator):
             use_time_filter = _as_bool(p.get("use_time_filter"), True)
 
             def _colorize(c: Dict[str, Any]) -> Dict[str, Any]:
+                # Bugfix 05.08.2026: priority=10 ergänzen – der Feature-Store-
+                # Lesepfad (read_proximity_from_feature_store) und die Live-
+                # Punkte (update_live_candle) setzen priority=10, der Pipeline-
+                # Fallback (prox_crp.hit_circles aus dem ProximityService)
+                # liefert Kreise OHNE priority (nur time/price/in_window).
+                # Durch das additive Setzen sind BEIDE Pfade konsistent
+                # (ChartCircle-Vertrag, base_plugin.py).
                 return dict(
                     c,
                     color=(
@@ -502,6 +509,7 @@ class GridLiquidityIndicator(BaseIndicator):
                         if (use_time_filter and not bool(c.get("in_window", True)))
                         else circle_std
                     ),
+                    priority=10,
                 )
 
             if cached_circles:

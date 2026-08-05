@@ -389,10 +389,14 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         """Befuellt das Timeframe-Control der Filterleiste (U15-E).
 
         Index 0 ist der Sentinel 'ALLE Timeframes' (Multi-TF-Ausfuehrung),
-        danach folgen alle Timeframes aus db_service.get_timeframes()
-        (MN1..M1). Fallback bei nicht verfuegbarem MT5: TF_SECONDS_MAP bzw.
-        eine Basisliste. Die aktuelle Auswahl bleibt erhalten, sofern sie
-        noch existiert; Default ist 'M1'.
+        danach folgen alle Timeframes AUFSTEIGEND nach Dauer sortiert –
+        kuerzeste zuerst (M1, M2, M5, M10, M15, M30, H1, H4, D1, W1, MN1),
+        identische Reihenfolge wie im chart_win (Bugfix 05.08.2026).
+        get_timeframes() liefert intern die MT5-Reihenfolge (MN1..M1),
+        daher wird explizit ueber TF_SECONDS_MAP sortiert. Fallback bei
+        nicht verfuegbarem MT5: TF_SECONDS_MAP bzw. eine Basisliste. Die
+        aktuelle Auswahl bleibt erhalten, sofern sie noch existiert;
+        Default ist 'M1'.
         """
         if not self.combo_tf:
             return
@@ -403,7 +407,10 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             except Exception:
                 tfs = list(TF_SECONDS_MAP.keys())
         except Exception:
-            tfs = ["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
+            tfs = ["M1", "M2", "M5", "M10", "M15", "M30",
+                   "H1", "H4", "D1", "W1", "MN1"]
+        # Bugfix 05.08.2026: Kuerzeste zuerst (M1..MN1) wie im chart_win.
+        tfs = sorted(tfs, key=lambda tf: TF_SECONDS_MAP.get(tf, 10**12))
         current = self.combo_tf.currentText()
         self.combo_tf.blockSignals(True)
         self.combo_tf.clear()

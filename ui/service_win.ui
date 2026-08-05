@@ -161,7 +161,17 @@
            </item>
            <item>
             <property name="text">
+             <string>M2</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
              <string>M5</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>M10</string>
             </property>
            </item>
            <item>
@@ -187,6 +197,16 @@
            <item>
             <property name="text">
              <string>D1</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>W1</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>MN1</string>
             </property>
            </item>
           </widget>

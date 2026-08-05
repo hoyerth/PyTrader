@@ -785,7 +785,13 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		self.group_expert.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
 		expert_layout = QVBoxLayout(self.group_expert)
 
-		meta = dict(plugin.metadata or {})
+		# Bugfix 05.08.2026: `metadata` ist eine PluginFeature-Property – der
+		# Plugin-Pfad (Branch 1 in _get_plugin) kann aber auch einen Indikator
+		# liefern, der parameter_schema+plugin_id implementiert (z.B.
+		# GridLiquidityIndicator), ohne PluginFeature zu sein (kein metadata).
+		# getattr-Guard: PluginFeature unveraendert, Indikator ohne metadata
+		# erhaelt leere Metadaten statt AttributeError.
+		meta = dict(getattr(plugin, "metadata", None) or {})
 		meta_text = (
 			f"<b>{meta.get('display_name', plugin.plugin_id)}</b> "
 			f"v{getattr(plugin, 'version', '1.0.0')}<br>"

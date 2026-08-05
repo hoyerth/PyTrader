@@ -157,7 +157,7 @@ class ServiceRunWorker(QThread):
         from analytics.features.plugins.base_plugin import PluginContext
 
         df = fb.load_ohlcv(self.symbol, tf,
-                           limit=settings.feature_builder_limit)
+                           limit=settings.scanner_candle_limit)
         if df is None or df.empty:
             self.log_message.emit(
                 f"  {self.symbol} {tf}: keine OHLCV-Daten – uebersprungen")
@@ -209,6 +209,17 @@ class ServiceRunWorker(QThread):
             settings = StateManager().get_app_settings()
             fb = FeatureBuilder()
             definition = self._build_scope_definition()
+            # 05.08.2026 (Bugfix Service-Run):
+            #  * Fehlende depends_on-Einträge (z.B. proximity -> grid_lines)
+            #    werden automatisch aufgelöst (sonst 'kein Feature-Store-
+            #    Payload' beim Single-Run eines nachgelagerten Services).
+            #  * Scanner-Candles (max) aus den App-Optionen als max Lookback
+            #    für ALLE Services (Datenbasis wie beim Historical Scanner).
+            from serviceui.service_set_utils import prepare_worker_definition
+            definition = prepare_worker_definition(
+                definition,
+                getattr(settings, "scanner_candle_limit", 100000),
+            )
             display = str(definition.get("display_name")
                           or self.set_definition.get("display_name")
                           or scope_id or "Unbenannt")
