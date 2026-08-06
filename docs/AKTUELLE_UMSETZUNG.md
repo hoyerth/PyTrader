@@ -354,8 +354,8 @@ Bitte ersetze die alten Analytics-Dropdowns durch die Wiederverwendung des beste
 ### 06.08.2026 – Phase 16: Rollen- und Namens-Klarheit Grid-Indikator (Ind_FixedGridProximity)
 
 **Entscheidungen (vorab, User):**
-- .backup_grid_liquidity/ (Alt-Datei nalytics/features/definitions/grid_liquidity.py) wird vollständig gelöscht – keine Verwechslung beim Plugin-Loader.
-- Vollständige Umbenennung (Nutzer-Entscheidung): indicator_id grid_liquidity → ind_fixed_grid_proximity inkl. Migration für gespeicherte Window-States/Presets, Klassen-/Modul-Rename (GridLiquidityIndicator → FixedGridProximityIndicator, grid_liquidity.py → ixed_grid_proximity.py).
+- .backup_grid_liquidity/ (Alt-Datei `analytics/features/definitions/grid_liquidity.py`) wird vollständig gelöscht – keine Verwechslung beim Plugin-Loader.
+- Vollständige Umbenennung (Nutzer-Entscheidung): indicator_id grid_liquidity → ind_fixed_grid_proximity inkl. Migration für gespeicherte Window-States/Presets, Klassen-/Modul-Rename (GridLiquidityIndicator → FixedGridProximityIndicator, grid_liquidity.py → `fixed_grid_proximity.py`).
 - Rollen-Trennung: proximity = nur mathematische Abstandsberechnung; grid_lines = nur Raster-Generierung; Ind_FixedGridProximity = Indikator-Name (UI-Container).
 
 **Umsetzung (06.08.2026, ausgeführt):**
@@ -365,7 +365,7 @@ Bitte ersetze die alten Analytics-Dropdowns durch die Wiederverwendung des beste
 - **Geändert:** chart_win.py – Import/Registry-Key ind_fixed_grid_proximity, Methoden-/Kommentar-Rename, **Runtime-Normalisierung** _normalize_indicators_state() (Legacy-Key grid_liquidity → neu) an allen Load-Pfaden (__init__, on_symbol_changed, on_tf_changed).
 - **Geändert:** state_manager.py – idempotente **DB-Migration** in _init_db(): indicator_presets.indicator_id UPDATE + indicators_state-JSON-Remap in instance_states/symbol_tf_states.
 - **Geändert:** service_selector_model.py (Import/Instantierung/Referenzen), indicator_dialog.py, master_tree.py, service_set_utils.py, grid_math.py, description_dialog.py, chart/indicators/__init__.py (Kommentare/Referenzen).
-- **Tests:** 	est/check_p16_rename_migration.py (neu, M1–M6 PASS), check_p15_s4_infra.py (PASS), check_p15_s2_service_tree.py (PASS, A5b/C4-Assertions an Substring-Logik angepasst), check_service_run_fixes.py (PASS), 	est/test.py Teil 4 (C1–C5 PASS; Teil-1/3-Geometrie-Fehler vorbestehend/unabhängig).
+- **Tests:** `test/check_p16_rename_migration.py` (neu, M1–M6 PASS), check_p15_s4_infra.py (PASS), check_p15_s2_service_tree.py (PASS, A5b/C4-Assertions an Substring-Logik angepasst), check_service_run_fixes.py (PASS), `test/test.py` Teil 4 (C1–C5 PASS; Teil-1/3-Geometrie-Fehler vorbestehend/unabhängig).
 - **Verifikation:** py_compile auf allen geänderten Dateien; keine UI-/Regressionstests (harte Regel).
 - **Git:** Commit folgt nach Freigabe (nicht ohne expliziten Startschuss).
 
@@ -384,5 +384,5 @@ Bitte ersetze die alten Analytics-Dropdowns durch die Wiederverwendung des beste
   auf Phase-16-Rename aktualisiert.
 - **Verifikation:** py_compile + gezielte Backend-Checks (keine UI-/
   Regressionstests, harte Regel).
-- **Git:** Commit + Push (siehe unten, Commit-Kennung wird nach Ausfuehrung ergänzt).
+- **Git:** Commit + Push: `6c2fc07` (21 Dateien, gepusht auf `origin/main`).
 
