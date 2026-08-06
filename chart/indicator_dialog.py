@@ -374,6 +374,19 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		# ueberschrieben werden.
 		self._preset_logic_params: Dict[str, Any] = dict(logic_params or {})
 
+		# Bugfix (08.08.2026): Indikatoren OHNE deklarierte Services (z.B.
+		# Multi-MA) erzeugen die Service-UI-Attribute NICHT mehr (siehe
+		# _init_plugin_ui -> _init_plugin_ui_params_only). Die None-
+		# Vorbelegung macht die bestehenden 'if self.<attr>:'-Guards (z.B.
+		# in _build_preset_payload, on_preset_selected, refresh_service_set_
+		# list) None-sicher - ohne jede Aenderung an der Service-Pfad-Logik.
+		self.combo_service_set: Optional[QComboBox] = None
+		self.combo_service_sel: Optional[QComboBox] = None
+		self.stack_service_forms: Optional[QWidget] = None
+		self.edit_set_name: Optional[QLineEdit] = None
+		self.edit_set_description: Optional[QLineEdit] = None
+		self.group_expert: Optional[QGroupBox] = None
+
 		# Phase 13 Schritt 8: EIN NamedItemAdapter pro Sammlung (Presets +
 		# Service-Sets). Die _item_*-Protokoll-Methoden liegen NICHT auf der
 		# Dialog-Klasse, sondern in den Adaptern – zwei Callback-Sätze auf
@@ -573,6 +586,21 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			# marker-Modus nicht verloren geht (Typ-Mismatch im Widget würde
 			# sonst auf die Default-Farbe zurueckfallen).
 			style_type = str(spec.get("style_type", "line"))
+			# Bugfix (08.08.2026): Reiner Farbwaehler (color_only im Schema,
+			# z.B. Multi-MA maX_color) - KEIN StylePickerWidget-Composite.
+			# Diese Farb-Parameter besitzen keine Geschwister-Keys
+			# (style/width bzw. shape/size) und keine eigene
+			# Sichtbarkeits-Checkbox (die steuert show_maX).
+			if bool(spec.get("color_only", False)):
+				if style_type == "marker":
+					style_obj = MarkerStyle(color=str(val))
+				else:
+					style_obj = LineStyle(color=str(val))
+				ctrl = StylePickerWidget(
+					style=style_obj, enable_alpha=allow_alpha,
+					style_type=style_type, color_only=True)
+				ctrl.style_changed.connect(self.on_param_control_changed)
+				return ctrl
 			if style_type == "marker":
 				# P16.03-Bugfix: Marker-Form/-Groesse aus den Geschwister-Params
 				# vorbelegen (Konvention 'color' -> 'shape'/'size'), damit das
@@ -733,6 +761,19 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		self.plugin_labels = dict(getattr(plugin, "param_labels", None) or {})
 		for key, spec in base_schema.items():
 			self.plugin_labels.setdefault(key, spec.get("description") or self._human(key))
+
+		# Bugfix (08.08.2026): Plugin-Indikator OHNE deklarierte Services
+		# (service_plugin_ids leer, z.B. Multi-MA 'ind_moving_averages').
+		# Anwenderanforderung: "in diesem indikator gibt es keine services -
+		# dazu alles ausblenden". Alle Service-Boxen ('Service-Parameter',
+		# 'Service-Set Aktionen', 'Experten-Optionen') entfallen KOMPLETT;
+		# der selbst-contained Indikator rendert stattdessen ALLE Parameter
+		# direkt (param_layout-gruppiert, inkl. der vorher fehlenden
+		# maX_type/maX_period/maX_smooth_type/maX_alpha).
+		has_services = bool(self._indicator_service_ids())
+		if not has_services:
+			self._init_plugin_ui_params_only(main_layout)
+			return
 
 		# --- 1) Grid: Indi-Props + Service-Parameter links; rechts daneben auf
 		# gleicher Höhe 'Service-Set Aktionen' (darunter 'Experten-Optionen') ---
@@ -918,6 +959,82 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 
 		# Initiale Set-Liste befüllen (list_sets() als Quelle, Roadmap §5.2)
 		self.refresh_service_set_list()
+
+	def _init_plugin_ui_params_only(self, main_layout: QVBoxLayout) -> None:
+		"""Bugfix (08.08.2026): Plugin-Indikator OHNE deklarierte Services.
+
+		Rendert ALLE Parameter direkt - gruppiert nach `param_layout` (z.B.
+		Multi-MA: 'MA 1 (Führung)' .. 'MA 8'), sonst flach. Die Service-Boxen
+		('Service-Parameter', 'Service-Set Aktionen', 'Experten-Optionen')
+		entfallen komplett (Anwenderanforderung, siehe _init_plugin_ui). Die
+		Preset-Verwaltung bleibt erhalten (Speichern/Laden der Parameter).
+		Damit erscheinen auch die vorher fehlenden Nicht-Darstellungs-Parameter
+		(maX_type/maX_period/maX_smooth_type/maX_alpha) im Prop-Fenster.
+		"""
+		content_grid = QGridLayout()
+		content_grid.setSpacing(6)
+		left_col = QVBoxLayout()
+		left_col.setAlignment(Qt.AlignTop)
+
+		layout_schema = getattr(self.plugin, "param_layout", None)
+		groups: List[Any] = []
+		if isinstance(layout_schema, list) and layout_schema \
+				and isinstance(layout_schema[0], (tuple, list)):
+			groups = list(layout_schema)
+		else:
+			groups = [("Parameter", list(self.plugin_order))]
+
+		for title, keys in groups:
+			# Nur noch nicht gerenderte, nicht-expert Keys dieser Gruppe.
+			grp_keys = [
+				k for k in keys
+				if k not in self.param_controls
+				and not self.plugin_schema.get(k, {}).get("expert")
+			]
+			if not grp_keys:
+				continue
+			group = QGroupBox(str(title))
+			# Horizontal Expanding -> füllt die Spaltenbreite (wie die
+			# 'Anzeige & Farben'-Box im Service-Pfad); vertikal Maximum.
+			group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+			form = QFormLayout(group)
+			for key in grp_keys:
+				spec = self.plugin_schema.get(key, {})
+				cval = self.params.get(key, spec.get("default"))
+				ctrl = self.create_schema_control(key, cval, spec)
+				self.param_controls[key] = ctrl
+				form.addRow(self.plugin_labels.get(key, self._human(key)), ctrl)
+			left_col.addWidget(group)
+
+		# Nicht in param_layout enthaltene Keys flach nachtragen (Schutz).
+		remaining = [
+			k for k in self.plugin_order
+			if k not in self.param_controls
+			and not self.plugin_schema.get(k, {}).get("expert")
+		]
+		if remaining:
+			group = QGroupBox("Weitere Parameter")
+			group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+			form = QFormLayout(group)
+			for key in remaining:
+				spec = self.plugin_schema.get(key, {})
+				cval = self.params.get(key, spec.get("default"))
+				ctrl = self.create_schema_control(key, cval, spec)
+				self.param_controls[key] = ctrl
+				form.addRow(self.plugin_labels.get(key, self._human(key)), ctrl)
+			left_col.addWidget(group)
+
+		content_grid.addLayout(left_col, 0, 0, Qt.AlignTop)
+
+		# Rechte Spalte: NUR Preset-Verwaltung (keine Service-Boxen).
+		right_top = QVBoxLayout()
+		right_top.setAlignment(Qt.AlignTop)
+		right_top.addWidget(self._build_preset_group(), 0, Qt.AlignTop)
+		content_grid.addLayout(right_top, 0, 1, Qt.AlignTop)
+
+		# Linke Spalte bekommt beim manuellen Aufziehen den zusätzlichen Raum.
+		content_grid.setColumnStretch(0, 1)
+		main_layout.addLayout(content_grid)
 
 	# -------------------------------------------------------------------------
 	# Service-Set-UI (Phase 13 Schritt 5)
@@ -1358,8 +1475,12 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 				# P16.03-Bugfix: Form/Groesse bzw. Linienart/-staerke in
 				# display_params aufnehmen (Konvention 'color' -> 'shape'/'size'
 				# bzw. 'style'/'width'), damit Presets die Auswahl im
-				# StylePickerWidget round-trippen.
+				# StylePickerWidget round-trippen. Bugfix (08.08.2026):
+				# color_only-Waehler (Multi-MA) haben KEINE Geschwister-Keys
+				# und werden uebersprungen.
 				if isinstance(ctrl, StylePickerWidget):
+					if getattr(ctrl, "color_only", False):
+						continue
 					style_obj = ctrl.get_style()
 					if isinstance(style_obj, MarkerStyle):
 						shape_key, size_key = self._style_sibling_keys(key, "marker")
@@ -1763,6 +1884,10 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			elif isinstance(ctrl, StylePickerWidget):
 				style_obj = ctrl.get_style()
 				new_params[key] = style_obj.color
+				# Bugfix (08.08.2026): color_only-Waehler (Multi-MA) haben
+				# keine Geschwister-Keys -> Sibling-Schreiben ueberspringen.
+				if getattr(ctrl, "color_only", False):
+					continue
 				# P16.03-Bugfix: Form/Groesse bzw. Linienart/-staerke in die
 				# Geschwister-Keys schreiben (Konvention 'color' ->
 				# 'shape'/'size' bzw. 'style'/'width'), damit die Auswahl im
@@ -1797,6 +1922,10 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 					ctrl.setCurrentText(str(val))
 				elif isinstance(ctrl, StylePickerWidget) and isinstance(val, str):
 					ctrl.set_color(val)
+					# Bugfix (08.08.2026): color_only-Waehler (Multi-MA) haben
+					# keine Geschwister-Keys -> Restore-Schritt ueberspringen.
+					if getattr(ctrl, "color_only", False):
+						continue
 					# P16.03-Bugfix: Form/Groesse bzw. Linienart/-staerke aus
 					# den Geschwister-Params zurueckspielen (sonst zeigt das
 					# Widget beim Restore die Defaults, obwohl der Chart die

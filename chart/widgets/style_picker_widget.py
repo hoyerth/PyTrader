@@ -84,9 +84,17 @@ class StylePickerWidget(QWidget):
         enable_alpha: bool = True,
         parent=None,
         style_type: str = "line",
+        color_only: bool = False,
     ) -> None:
         super().__init__(parent)
         self._enable_alpha: bool = bool(enable_alpha)
+        # color_only (Bugfix 08.08.2026): Reiner Farbwaehler - das Composite
+        # (Sichtbarkeits-Checkbox, Linienstaerke/Groesse, Linienart/Markerform)
+        # wird NICHT angezeigt. Verwendet fuer reine Farb-Parameter (z.B.
+        # Multi-MA maX_color), deren Sichtbarkeit ein separater 'show_*'-
+        # Parameter steuert. get_style() liefert weiterhin ein Style-Objekt
+        # (Defaults fuer show/width/style) - der Dialog liest nur .color.
+        self._color_only: bool = bool(color_only)
         # style_type: "line" (LineStyle) | "marker" (MarkerStyle)
         self._style_type: str = "marker" if style_type == "marker" else "line"
         if self._style_type == "marker":
@@ -158,10 +166,14 @@ class StylePickerWidget(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
-        layout.addWidget(self._show_check)
-        layout.addWidget(self._color_btn)
-        layout.addWidget(self._width_spin)
-        layout.addWidget(self._style_combo)
+        # color_only: NUR den Farb-Button anzeigen (kein Composite).
+        if not self._color_only:
+            layout.addWidget(self._show_check)
+            layout.addWidget(self._color_btn)
+            layout.addWidget(self._width_spin)
+            layout.addWidget(self._style_combo)
+        else:
+            layout.addWidget(self._color_btn)
         layout.addStretch(1)
 
         self._update_swatch()
@@ -174,6 +186,16 @@ class StylePickerWidget(QWidget):
     def style_type(self) -> str:
         """Aktueller Widget-Modus: 'line' (LineStyle) oder 'marker' (MarkerStyle)."""
         return self._style_type
+
+    @property
+    def color_only(self) -> bool:
+        """True = reiner Farbwaehler (ohne Sichtbarkeits-/Stil-Composite).
+
+        Der Dialog nutzt dieses Flag, um die Geschwister-Keys (style/width
+        bzw. shape/size) beim Persistieren zu UEBERSPRINGEN - ein reiner
+        Farb-Parameter besitzt keine solchen Geschwister.
+        """
+        return self._color_only
 
     def get_style(self) -> Union[LineStyle, MarkerStyle]:
         """Liefert den aktuellen Stil als NEUES Style-Objekt (LineStyle bei

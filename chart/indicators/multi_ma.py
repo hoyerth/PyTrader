@@ -176,12 +176,18 @@ class MultiMovingAverageIndicator(BaseIndicator):
                     "default": _MA_COLORS[1],
                     "description": "MA 1 Farbe steigend",
                     "style_type": "line",
+                    # Bugfix (08.08.2026): REINER Farbwaehler - KEIN
+                    # StylePickerWidget-Composite (keine 'sichtbar'-Checkbox,
+                    # keine Linienart/-staerke). Die Sichtbarkeit steuert
+                    # ausschliesslich show_maX (Anzeige-Checkbox).
+                    "color_only": True,
                 }
                 schema["ma1_bear_color"] = {
                     "type": "color",
                     "default": _MA1_BEAR_COLOR,
                     "description": "MA 1 Farbe fallend (dual_color)",
                     "style_type": "line",
+                    "color_only": True,
                 }
             else:
                 # MA2..8: einfarbig (kein dual_color/bear_color).
@@ -190,6 +196,7 @@ class MultiMovingAverageIndicator(BaseIndicator):
                     "default": _MA_COLORS[x],
                     "description": f"MA {x} Farbe",
                     "style_type": "line",
+                    "color_only": True,
                 }
         return schema
 
