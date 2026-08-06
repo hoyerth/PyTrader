@@ -106,10 +106,50 @@ class StateManager:
         # Phase 15 (U15-B4): Alt-Indikator 'grid' (chart/indicators/grid.py)
         # wurde am 04.08.2026 entfernt. Persistierte Presets mit
         # indicator_id='grid' werden idempotent bereinigt (einmalig pro
-        # App-Start, additiv – bestehende 'grid_liquidity'-Presets bleiben
-        # unangetastet). Der Legacy-Pfad in _resolve_indicator_params()
+        # App-Start, additiv – bestehende 'ind_fixed_grid_proximity'-Presets
+        # bleiben unangetastet). Der Legacy-Pfad in _resolve_indicator_params()
         # bleibt fuer Abwaertskompatibilitaet bestehen.
         con.execute("DELETE FROM indicator_presets WHERE indicator_id = 'grid'")
+
+        # Phase 16 (06.08.2026): Rollen- und Namens-Klarheit – der Indikator
+        # 'grid_liquidity' wurde in 'ind_fixed_grid_proximity' umbenannt
+        # (indicator_id/indicators_state-Key). Persistierte Alt-Referenzen
+        # (indicator_presets.indicator_id sowie indicators_state-JSON in
+        # instance_states/symbol_tf_states) werden idempotent migriert.
+        _legacy_ind_id = "grid_liquidity"
+        _new_ind_id = "ind_fixed_grid_proximity"
+        try:
+            con.execute(
+                "UPDATE indicator_presets SET indicator_id = ? WHERE indicator_id = ?",
+                [_new_ind_id, _legacy_ind_id])
+            # indicators_state-JSON: Legacy-Key auf neuen Indikator-Key mappen.
+            for _row in con.execute(
+                    "SELECT instance_id, indicators_state FROM instance_states").fetchall():
+                _rid, _raw = _row[0], _row[1]
+                if _raw is None:
+                    continue
+                _data = _parse_json_field(_raw) if isinstance(_raw, str) else _raw
+                if not isinstance(_data, dict) or _legacy_ind_id not in _data:
+                    continue
+                _data.setdefault(_new_ind_id, _data.pop(_legacy_ind_id))
+                con.execute(
+                    "UPDATE instance_states SET indicators_state = ? WHERE instance_id = ?",
+                    [json.dumps(_data), _rid])
+            for _row in con.execute(
+                    "SELECT symbol, timeframe, indicators_state FROM symbol_tf_states").fetchall():
+                _sym, _tf, _raw = _row[0], _row[1], _row[2]
+                if _raw is None:
+                    continue
+                _data = _parse_json_field(_raw) if isinstance(_raw, str) else _raw
+                if not isinstance(_data, dict) or _legacy_ind_id not in _data:
+                    continue
+                _data.setdefault(_new_ind_id, _data.pop(_legacy_ind_id))
+                con.execute(
+                    "UPDATE symbol_tf_states SET indicators_state = ? WHERE symbol = ? AND timeframe = ?",
+                    [json.dumps(_data), _sym, _tf])
+        except Exception as e:
+            print(f"WARN [StateManager] Phase-16-Migration (grid_liquidity -> "
+                  f"ind_fixed_grid_proximity) fehlgeschlagen: {e}")
 
         # Explicit Column Check via information_schema
         tables_to_migrate = ["instance_states", "symbol_tf_states"]

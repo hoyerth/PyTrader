@@ -13,8 +13,8 @@ def _available_plugin_ids() -> str:
     """Alle registrierten Plugin-IDs (sortiert, kommasepariert).
 
     Phase 13 Schritt 6-Korrektur: Die Verfügbarkeit wird dynamisch aus der
-    PluginRegistry abgeleitet (grid_lines, proximity, grid_liquidity, ...),
-    NICHT hartkodiert auf 'grid_liquidity'.
+    PluginRegistry abgeleitet (grid_lines, proximity, ...),
+    NICHT hartkodiert auf einen Indikator-Namen.
     """
     try:
         from analytics.features.feature_builder import PluginRegistry

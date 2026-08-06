@@ -9,7 +9,7 @@ A) ServiceSelectorModel – Grunddaten:
    - get_sets() leer bei frischer DB.
    - get_plugins() liefert die PluginRegistry (grid_lines, ...).
    - is_chart_indicator()/get_indicator_display_name().
-   - Badges: '📌 im GridLiquidityIndicator | ⚪ inaktiv in GridLiquidityIndicator'
+   - Badges: '📌 im Ind_FixedGridProximity | ⚪ inaktiv in Ind_FixedGridProximity'
      fuer Chart-Indikatoren (Indikator-Name, KEIN Service-Name).
 
 B) ServiceSelectorModel – Set-Aufbau & Hierarchie:
@@ -20,7 +20,7 @@ B) ServiceSelectorModel – Set-Aufbau & Hierarchie:
 
 C) ServiceSelectorModel – Live-Status "Aktiv im Chart" (StateManager):
    - indicators_state['grid_lines'].active=True -> is_active_in_chart True.
-   - Badge wechselt auf '🟢 aktiv in GridLiquidityIndicator'.
+   - Badge wechselt auf '🟢 aktiv in Ind_FixedGridProximity'.
 
 D) EventBus-Reaktivitaet:
    - service_set_changed.emit() -> data_changed feuert + Modell refresht.
@@ -130,20 +130,23 @@ print(f"   Plugins: {sorted(plugins.keys())}")
 check("A1) get_sets() leer bei frischer DB", model.get_sets() == [])
 check("A2) get_plugins() liefert PluginRegistry",
       isinstance(plugins, dict) and len(plugins) > 0)
-# Bugfix 04.08.2026: grid_liquidity (Alt-Plugin) ist entfernt – grid_lines ist
-# der Chart-faehige Grid-Service und referenziert den Indikator-Namen.
+# Phase 16 (06.08.2026): Alt-Plugin 'grid_liquidity' ist entfernt (Rename zu
+# 'ind_fixed_grid_proximity'); grid_lines ist der Chart-faehige Grid-Service
+# und referenziert den Indikator-Namen.
 check("A3) grid_lines ist Chart-Indikator",
       model.is_chart_indicator("grid_lines"))
 ind_name = model.get_indicator_display_name("grid_lines")
-check("A4) Indikator-Name = GridLiquidityIndicator",
-      ind_name == "GridLiquidityIndicator", ind_name)
+check("A4) Indikator-Name = Ind_FixedGridProximity",
+      ind_name == "Ind_FixedGridProximity", ind_name)
 
 badge_inactive = model.badge_for("grid_lines")
 check("A5) Badge inaktiv: 'im' + 'inaktiv in' mit Indikator-Namen",
-      badge_inactive == "📌 im GridLiquidityIndicator | ⚪ inaktiv in GridLiquidityIndicator",
+      badge_inactive == "📌 im Ind_FixedGridProximity | ⚪ inaktiv in Ind_FixedGridProximity",
       badge_inactive)
 check("A5b) Kein Service-Name ('Grid Lines'/'Proximity') im Badge",
-      "Grid Lines" not in badge_inactive and "Proximity" not in badge_inactive,
+      "Grid Lines" not in badge_inactive
+      and "im Proximity" not in badge_inactive
+      and "in Proximity" not in badge_inactive,
       badge_inactive)
 check("A6) is_active_in_chart False ohne Chart-State",
       model.is_active_in_chart("grid_lines") is False)
@@ -205,37 +208,37 @@ check("C1) grid_lines ist aktiv im Chart",
       model.is_active_in_chart("grid_lines"))
 badge_active = model.badge_for("grid_lines")
 check("C2) Badge aktiv: 'aktiv in' mit Indikator-Namen",
-      badge_active == "📌 im GridLiquidityIndicator | 🟢 aktiv in GridLiquidityIndicator",
+      badge_active == "📌 im Ind_FixedGridProximity | 🟢 aktiv in Ind_FixedGridProximity",
       badge_active)
 check("C3) proximity bleibt inaktiv",
       not model.is_active_in_chart("proximity"))
 # Beide Grid-Services referenzieren denselben Indikator-Namen im Badge.
 for pid in ("grid_lines", "proximity"):
     b = model.badge_for(pid)
-    check(f"C4) Badge fuer '{pid}' referenziert GridLiquidityIndicator",
-          "in GridLiquidityIndicator" in b and "Grid Lines" not in b
-          and "Proximity" not in b, b)
+    check(f"C4) Badge fuer '{pid}' referenziert Ind_FixedGridProximity",
+          "in Ind_FixedGridProximity" in b and "Grid Lines" not in b
+          and "im Proximity" not in b and "in Proximity" not in b, b)
 
 # Bugfix 05.08.2026: Aktiv-Pruefung ueber die indicator_id des ZUGEHOERIGEN
 # Indikators. Realer App-Zustand: indicators_state-Key ist die indicator_id
-# ('grid_liquidity'), NICHT die Plugin-ID ('grid_lines'/'proximity'). Davor
+# ('ind_fixed_grid_proximity'), NICHT die Plugin-ID ('grid_lines'/'proximity'). Davor
 # griff die Tooltip-Variante a) ('aktiv <Indikator>') fuer Services nie.
 state_mgr.save_window_geometry("win_2", 0, 0, 800, 600, False)
 state_mgr.save_instance_state(
     "win_2", "SILVER", "H1",
-    indicators_state={"grid_liquidity": {"active": True}},
+    indicators_state={"ind_fixed_grid_proximity": {"active": True}},
 )
 model.refresh()
-check("C5) grid_lines aktiv via Indikator-ID (grid_liquidity)",
+check("C5) grid_lines aktiv via Indikator-ID (ind_fixed_grid_proximity)",
       model.is_active_in_chart("grid_lines"))
-check("C6) proximity aktiv via Indikator-ID (grid_liquidity)",
+check("C6) proximity aktiv via Indikator-ID (ind_fixed_grid_proximity)",
       model.is_active_in_chart("proximity"))
 check("C7) belongs_to_indicator fuer grid_lines/proximity",
       model.belongs_to_indicator("grid_lines")
       and model.belongs_to_indicator("proximity"))
 set_def = model.get_sets()[0]
-check("C8) Set-Indikator-Namen = [GridLiquidityIndicator]",
-      model.get_set_indicator_names(set_def) == ["GridLiquidityIndicator"],
+check("C8) Set-Indikator-Namen = [Ind_FixedGridProximity]",
+      model.get_set_indicator_names(set_def) == ["Ind_FixedGridProximity"],
       str(model.get_set_indicator_names(set_def)))
 check("C9) Set aktiv (zugehoeriger Indikator aktiv)",
       model.is_set_active(set_def))
@@ -331,8 +334,8 @@ check("F5a) Button nur Icon (ℹ) + Icon-Breite",
       f"text={btn_svc.text()!r} w={btn_svc.width()}")
 check("F5b) Tooltip der Status-Spalte: 'aktiv/im <Indikator>'",
       isinstance(btn_svc, QPushButton)
-      and btn_svc.toolTip() in ("aktiv GridLiquidityIndicator",
-                                "im GridLiquidityIndicator")
+      and btn_svc.toolTip() in ("aktiv Ind_FixedGridProximity",
+                                "im Ind_FixedGridProximity")
       and svc_item.toolTip(1) == btn_svc.toolTip(),
       (btn_svc.toolTip() if isinstance(btn_svc, QPushButton) else "kein Button"))
 
@@ -346,8 +349,8 @@ check("F5k) Set-Knoten (Indikator-Zugehoerigkeit) traegt Info-Button",
       f"btn={type(btn_set).__name__} text={set_item.text(1)!r}")
 check("F5l) Set-Button-Tooltip folgt Namenslogik 'aktiv/im <Indikator>'",
       isinstance(btn_set, QPushButton)
-      and btn_set.toolTip() in ("aktiv GridLiquidityIndicator",
-                                "im GridLiquidityIndicator"),
+      and btn_set.toolTip() in ("aktiv Ind_FixedGridProximity",
+                                "im Ind_FixedGridProximity"),
       (btn_set.toolTip() if isinstance(btn_set, QPushButton) else "kein Button"))
 
 # Bugfix 05.08.2026 (Punkt 1-4): Button auf ALLEN Zeilen, nur Icon-Breite,
@@ -538,10 +541,10 @@ def _dialog_html(dlg):
 
 # Set-Dialog: erste Zeile = Tooltip-Text, dann Leerzeile, dann Beschreibung.
 dlg_set = ServiceDescriptionDialog.from_set(
-    model.get_sets()[0], header_line="im GridLiquidityIndicator")
+    model.get_sets()[0], header_line="im Ind_FixedGridProximity")
 html_set = _dialog_html(dlg_set)
 check("H1) from_set rendert header_line als erste Zeile",
-      "im GridLiquidityIndicator" in html_set, "")
+      "im Ind_FixedGridProximity" in html_set, "")
 check("H2) from_set zeigt Set-Name + Services",
       "Grid-Basis" in html_set and "grid_1 [grid_lines]" in html_set
       and "prox_1 [proximity]" in html_set, "")
@@ -550,10 +553,10 @@ check("H2) from_set zeigt Set-Name + Services",
 dlg_svc = ServiceDescriptionDialog.from_plugin(
     model.get_plugin("grid_lines"), instance_id="grid_1",
     config=model.find_service(set_id, "grid_1"),
-    header_line="aktiv GridLiquidityIndicator")
+    header_line="aktiv Ind_FixedGridProximity")
 html_svc = _dialog_html(dlg_svc)
 check("H3) from_plugin rendert header_line",
-      "aktiv GridLiquidityIndicator" in html_svc, "")
+      "aktiv Ind_FixedGridProximity" in html_svc, "")
 check("H4) from_plugin zeigt Instanz + Plugin",
       "grid_1" in html_svc and "Grid Lines" in html_svc, "")
 

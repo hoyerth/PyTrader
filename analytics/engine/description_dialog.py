@@ -231,7 +231,7 @@ class ServiceDescriptionDialog(QDialog):
             definition:  Set-Definition aus dem ServiceSetRepository (set_id,
                          display_name, description, execution_order, services).
             parent:      Qt-Parent (optional).
-            header_line: Optionale ERSTE Zeile (z.B. 'im GridLiquidityIndicator'
+            header_line: Optionale ERSTE Zeile (z.B. 'im Ind_FixedGridProximity'
                          aus dem Info-Button-Tooltip) – wird als fette Zeile
                          gefolgt von einer Leerzeile vor dem Beschreibungstext
                          gerendert (Bugfix 05.08.2026, Info-Button MasterTree).

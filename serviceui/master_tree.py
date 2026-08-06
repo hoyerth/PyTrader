@@ -98,7 +98,7 @@ TYPE_SERVICE = "service"
 TYPE_PLUGIN = "plugin"
 
 # Bugfix 2.1 (04.08.2026, aktualisiert): Lange Relationstexte in der Badge-
-# Spalte (z. B. "📌 im GridLiquidityIndicator | ⚪ inaktiv in ...") werden auf
+# Spalte (z. B. "📌 im Ind_FixedGridProximity | ⚪ inaktiv in ...") werden auf
 # das Info-Zeichen 'i' gekuerzt – der Indikator-Name steht im Tooltip der
 # Spalte 1 (keine extrem breiten Spalten im MasterTree).
 MAX_BADGE_CELL_CHARS = 24
@@ -442,7 +442,7 @@ class MasterTree(QTreeWidget):
           Die Aktiv-Pruefung beruecksichtigt den ZUGEHOERIGEN Indikator
           (metadata['indicator_id']), nicht nur die Plugin-ID selbst –
           dadurch greift Variante a) auch fuer Services (grid_lines/
-          proximity), die IN einem aktiven Indikator (GridLiquidityIndicator)
+          proximity), die IN einem aktiven Indikator (Ind_FixedGridProximity)
           laufen. Der Tooltip wird auf Spalte 0 UND Spalte 1 gesetzt
           (Spalte 1 uebernimmt ihn der Info-Button).
         """

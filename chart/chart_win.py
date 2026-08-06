@@ -35,11 +35,11 @@ from PySide6.QtWidgets import (
 
 try:
     from chart.chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, build_html_template
-    from chart.indicators.grid_liquidity import GridLiquidityIndicator
+    from chart.indicators.fixed_grid_proximity import FixedGridProximityIndicator
     from chart.indicator_dialog import IndicatorSettingsDialog
 except ImportError:
     from chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, build_html_template
-    from indicators.grid_liquidity import GridLiquidityIndicator
+    from indicators.fixed_grid_proximity import FixedGridProximityIndicator
     from indicator_dialog import IndicatorSettingsDialog
 
 try:
@@ -143,6 +143,25 @@ class GridDataSerializer(QThread):
 class PyTraderChartWindow(QMainWindow):
     closed_signal = Signal(str)
 
+    # Phase 16 (06.08.2026): Rollen- und Namens-Klarheit - Indikator
+    # 'grid_liquidity' wurde in 'ind_fixed_grid_proximity' umbenannt
+    # (indicators_state-Key). Persistierte Alt-Keys (Legacy-DB-Stand)
+    # werden beim Laden idempotent auf den neuen Key gemappt.
+    _LEGACY_IND_ID = "grid_liquidity"
+    _NEW_IND_ID = "ind_fixed_grid_proximity"
+
+    @staticmethod
+    def _normalize_indicators_state(ind_state):
+        """Mappt den Legacy-Indikator-Key 'grid_liquidity' (alter DB-Stand)
+        auf 'ind_fixed_grid_proximity' (Phase 16). Idempotent."""
+        if not isinstance(ind_state, dict):
+            return ind_state
+        if PyTraderChartWindow._LEGACY_IND_ID in ind_state:
+            ind_state.setdefault(PyTraderChartWindow._NEW_IND_ID,
+                                ind_state.pop(PyTraderChartWindow._LEGACY_IND_ID))
+        return ind_state
+
+
     def __init__(self, instance_id="win_1", symbol="SILVER", timeframe="H1", visible_from=None, visible_to=None,
                  state_manager=None):
         super().__init__()
@@ -163,14 +182,14 @@ class PyTraderChartWindow(QMainWindow):
         self.df_data = None
 
         # Generische Indikator-Registry: indicator_id -> BaseIndicator.
-        # Phase 15: Alt-Indikator 'grid' (chart/indicators/grid.py) entfernt;
-        # verbleibender Plugin-Indikator 'grid_liquidity' (Phase 12).
+        # Phase 16: Alt-Indikator 'grid_liquidity' entfernt; der Plugin-
+        # Indikator 'Ind_FixedGridProximity' (fixed_grid_proximity) bleibt.
         self.indicators: Dict[str, BaseIndicator] = {
-            "grid_liquidity": GridLiquidityIndicator(),
+            "ind_fixed_grid_proximity": FixedGridProximityIndicator(),
         }
-        # Phase 13 Schritt 6: Neuer Close im grid_liquidity-Indikator → NUR ein
+        # Phase 13 Schritt 6: Neuer Close im Ind_FixedGridProximity-Indikator → NUR ein
         # debounced Refresh (Cache-Neuaufbau), nicht bei jedem Tick.
-        liq_ind = self.indicators.get("grid_liquidity")
+        liq_ind = self.indicators.get("ind_fixed_grid_proximity")
         if liq_ind is not None and hasattr(liq_ind, "set_new_candle_callback"):
             liq_ind.set_new_candle_callback(self.refresh_chart_data)
         self._settings_dialog: Optional[QDialog] = None
@@ -219,6 +238,9 @@ class PyTraderChartWindow(QMainWindow):
             ind_st = matched_inst.get("indicators_state")
             if ind_st is not None and not isinstance(ind_st, (int, float)):
                 self.indicators_state = _parse_json_field(ind_st) or {}
+                # Phase 16: Legacy-Key 'grid_liquidity' normalisieren.
+                self.indicators_state = self._normalize_indicators_state(
+                    self.indicators_state)
 
             # Mess-State (Messbox) aus dem Instanz-State laden (JSON-String)
             ms_raw = matched_inst.get("measurement_state")
@@ -241,6 +263,9 @@ class PyTraderChartWindow(QMainWindow):
                     ind_st_pair = pair_st.get("indicators_state")
                     if ind_st_pair is not None and not isinstance(ind_st_pair, (int, float)):
                         self.indicators_state = _parse_json_field(ind_st_pair) or {}
+                    # Phase 16: Legacy-Key 'grid_liquidity' normalisieren.
+                    self.indicators_state = self._normalize_indicators_state(
+                        self.indicators_state)
                 # Mess-State aus dem Symbol:TF-Fallback laden (falls kein Instanz-State)
                 if self.measurement_state is None and pair_st.get("measurement_state"):
                     self.measurement_state = pair_st.get("measurement_state")
@@ -320,10 +345,10 @@ class PyTraderChartWindow(QMainWindow):
             self.tf_combo.currentTextChanged.connect(self.on_tf_changed)
         if self.btn_reset:
             self.btn_reset.clicked.connect(self.fit_chart)
-        # Plugin-Grid-Button (btn_indicator_grid_liquidity) → Indikator 'grid_liquidity'
+        # Plugin-Grid-Button (btn_indicator_grid_liquidity) → Indikator 'ind_fixed_grid_proximity'
         if self.btn_indicator_liquidity:
             self.btn_indicator_liquidity.setCheckable(True)
-            self.btn_indicator_liquidity.clicked.connect(self.toggle_grid_liquidity_lines)
+            self.btn_indicator_liquidity.clicked.connect(self.toggle_fixed_grid_proximity_lines)
             self.btn_indicator_liquidity.installEventFilter(self)
         self.update_indicator_button_style()
 
@@ -349,16 +374,16 @@ class PyTraderChartWindow(QMainWindow):
         self.web_view.loadFinished.connect(self._on_page_loaded)
 
     def eventFilter(self, watched, event):
-        # Rechtsklick auf den Plugin-Grid-Button → Einstellungen für 'grid_liquidity'
+        # Rechtsklick auf den Plugin-Grid-Button → Einstellungen für 'ind_fixed_grid_proximity'
         if (self.btn_indicator_liquidity is not None and watched == self.btn_indicator_liquidity
                 and event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton):
-            self._toggle_settings_dialog("grid_liquidity")
+            self._toggle_settings_dialog("ind_fixed_grid_proximity")
             return True
         return super().eventFilter(watched, event)
 
     def _toggle_settings_dialog(self, ind_id: str) -> None:
         """Wenn der Einstellungs-Dialog offen ist, schliessen; sonst für den
-        jeweiligen Indikator ('grid_liquidity') öffnen."""
+        jeweiligen Indikator ('ind_fixed_grid_proximity') öffnen."""
         if self._settings_dialog is not None and self._settings_dialog.isVisible():
             self._settings_dialog.close()
             self._settings_dialog = None
@@ -371,8 +396,8 @@ class PyTraderChartWindow(QMainWindow):
 
     def update_indicator_button_style(self):
         """Aktualisiert die Färbung des Plugin-Indikator-Buttons
-        ('grid_liquidity') entsprechend seines An/Aus-Zustands."""
-        self._apply_indicator_button_style(self.btn_indicator_liquidity, "grid_liquidity")
+        ('ind_fixed_grid_proximity') entsprechend seines An/Aus-Zustands."""
+        self._apply_indicator_button_style(self.btn_indicator_liquidity, "ind_fixed_grid_proximity")
 
     def _apply_indicator_button_style(self, button: Optional[QPushButton], ind_id: str) -> None:
         """Setzt die Button-Farbe je nach Aktiv-Zustand des Indikators."""
@@ -383,9 +408,9 @@ class PyTraderChartWindow(QMainWindow):
         button.setStyleSheet(
             f"background-color: {color}; color: white; font-weight: bold; border-radius: 4px; padding: 3px 10px;")
 
-    def toggle_grid_liquidity_lines(self):
-        """Schaltet den NEUEN Plugin-Indikator ('grid_liquidity') an/aus."""
-        self._toggle_indicator("grid_liquidity")
+    def toggle_fixed_grid_proximity_lines(self):
+        """Schaltet den Plugin-Indikator ('Ind_FixedGridProximity') an/aus."""
+        self._toggle_indicator("ind_fixed_grid_proximity")
 
     def _toggle_indicator(self, ind_id: str) -> None:
         """Schaltet einen Indikator an/aus."""
@@ -474,7 +499,7 @@ class PyTraderChartWindow(QMainWindow):
     def _resolve_indicator_params(self, ind_id: str, st: Dict[str, Any]) -> Dict[str, Any]:
         """5.4 Schritt 2 + 5.5 Fix: Volles Parameter-Dict für plugin.calculate().
 
-        NEUES Format (Plugin, z.B. grid_liquidity): indicators_state speichert
+        NEUES Format (Plugin, z.B. ind_fixed_grid_proximity): indicators_state speichert
         set_id + display_params (+ optional logic_params als Live-Overlay aus
         dem Indikator-Dialog). Die Berechnungslogik (grid_step,
         proximity_threshold, lookback, ...) kommt LIVE aus dem Service-Set
@@ -572,8 +597,8 @@ class PyTraderChartWindow(QMainWindow):
                 # 5.4 Schritt 2: Parameter aus set_id (Logik) + display_params
                 # (Darstellung) auflösen – Legacy voller params bleibt erhalten.
                 res = plugin.calculate(self.df_data, self._resolve_indicator_params(ind_id, st))
-                # Grid-spezifische Render-Logik (Plugin 'grid_liquidity')
-                if ind_id == "grid_liquidity":
+                # Grid-spezifische Render-Logik (Plugin 'ind_fixed_grid_proximity')
+                if ind_id == "ind_fixed_grid_proximity":
                     lines = res.get("lines", [])
                     circles = res.get("hit_circles", [])
                     # Circle-Zeiten auf kontinuierlich mappen
@@ -738,7 +763,7 @@ class PyTraderChartWindow(QMainWindow):
         if self.df_data is not None and not self.df_data.empty:
             for ind_id, plugin in self.indicators.items():
                 st = self.indicators_state.get(ind_id, {})
-                if st.get("active") and ind_id == "grid_liquidity":
+                if st.get("active") and ind_id == "ind_fixed_grid_proximity":
                     if hasattr(plugin, "set_context"):
                         plugin.set_context(self.current_symbol, self.current_tf)
                     # 5.4 Schritt 2: Logik aus set_id + Darstellung aus
@@ -999,6 +1024,8 @@ class PyTraderChartWindow(QMainWindow):
                 if pair_st.get("indicators_state"):
                     ind_st = pair_st.get("indicators_state")
                     loaded_ind = _parse_json_field(ind_st) or {}
+                    # Phase 16: Legacy-Key 'grid_liquidity' normalisieren.
+                    loaded_ind = self._normalize_indicators_state(loaded_ind)
                     # Merge statt ersetzen, damit Grid-Fallback erhalten bleibt
                     self.indicators_state.update(loaded_ind)
                     # Phase 15 (U15-B4): Alt-'grid'-Einträge beim Symbol/TF-
@@ -1039,6 +1066,8 @@ class PyTraderChartWindow(QMainWindow):
                 if pair_st.get("indicators_state"):
                     ind_st = pair_st.get("indicators_state")
                     loaded_ind = _parse_json_field(ind_st) or {}
+                    # Phase 16: Legacy-Key 'grid_liquidity' normalisieren.
+                    loaded_ind = self._normalize_indicators_state(loaded_ind)
                     # Merge statt ersetzen, damit Grid-Fallback erhalten bleibt
                     self.indicators_state.update(loaded_ind)
                     # Phase 15 (U15-B4): Alt-'grid'-Einträge beim Symbol/TF-

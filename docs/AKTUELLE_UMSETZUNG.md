@@ -350,3 +350,39 @@ Bitte ersetze die alten Analytics-Dropdowns durch die Wiederverwendung des beste
    OK. `py_compile` auf allen geänderten Dateien. Keine UI-/
    Regressionstests (harte Regel).
  - **Git:** Commit folgt (siehe unten).
+
+### 06.08.2026 – Phase 16: Rollen- und Namens-Klarheit Grid-Indikator (Ind_FixedGridProximity)
+
+**Entscheidungen (vorab, User):**
+- .backup_grid_liquidity/ (Alt-Datei nalytics/features/definitions/grid_liquidity.py) wird vollständig gelöscht – keine Verwechslung beim Plugin-Loader.
+- Vollständige Umbenennung (Nutzer-Entscheidung): indicator_id grid_liquidity → ind_fixed_grid_proximity inkl. Migration für gespeicherte Window-States/Presets, Klassen-/Modul-Rename (GridLiquidityIndicator → FixedGridProximityIndicator, grid_liquidity.py → ixed_grid_proximity.py).
+- Rollen-Trennung: proximity = nur mathematische Abstandsberechnung; grid_lines = nur Raster-Generierung; Ind_FixedGridProximity = Indikator-Name (UI-Container).
+
+**Umsetzung (06.08.2026, ausgeführt):**
+- **Gelöscht:** .backup_grid_liquidity/ (gitignored, Alt-Ablage).
+- **Umbenannt:** chart/indicators/grid_liquidity.py → chart/indicators/fixed_grid_proximity.py; Klasse GridLiquidityIndicator → FixedGridProximityIndicator; indicator_id/plugin_id/_plugin_id grid_liquidity → ind_fixed_grid_proximity; display_name → Ind_FixedGridProximity; interne Schema-Konstanten _GRID_LIQUIDITY_SCHEMA/_ORDER → _FIXED_GRID_PROXIMITY_SCHEMA/_ORDER; interne set_id grid_liquidity_internal → ind_fixed_grid_proximity_internal.
+- **Geändert:** grid_lines_service.py + proximity_service.py – metadata['indicator_name'] → Ind_FixedGridProximity, metadata['indicator_id'] → ind_fixed_grid_proximity (MasterTree-Badges/Tooltips).
+- **Geändert:** chart_win.py – Import/Registry-Key ind_fixed_grid_proximity, Methoden-/Kommentar-Rename, **Runtime-Normalisierung** _normalize_indicators_state() (Legacy-Key grid_liquidity → neu) an allen Load-Pfaden (__init__, on_symbol_changed, on_tf_changed).
+- **Geändert:** state_manager.py – idempotente **DB-Migration** in _init_db(): indicator_presets.indicator_id UPDATE + indicators_state-JSON-Remap in instance_states/symbol_tf_states.
+- **Geändert:** service_selector_model.py (Import/Instantierung/Referenzen), indicator_dialog.py, master_tree.py, service_set_utils.py, grid_math.py, description_dialog.py, chart/indicators/__init__.py (Kommentare/Referenzen).
+- **Tests:** 	est/check_p16_rename_migration.py (neu, M1–M6 PASS), check_p15_s4_infra.py (PASS), check_p15_s2_service_tree.py (PASS, A5b/C4-Assertions an Substring-Logik angepasst), check_service_run_fixes.py (PASS), 	est/test.py Teil 4 (C1–C5 PASS; Teil-1/3-Geometrie-Fehler vorbestehend/unabhängig).
+- **Verifikation:** py_compile auf allen geänderten Dateien; keine UI-/Regressionstests (harte Regel).
+- **Git:** Commit folgt nach Freigabe (nicht ohne expliziten Startschuss).
+
+### 06.08.2026 – Phase 16 NACHZUG: Alte Tests entfernt + Commit/Push
+
+**Umsetzung (06.08.2026, ausgeführt):**
+- **Gelöscht:** `test/migrate_grid_liquidity.py` – obsoletes, einmaliges
+  Migrations-/Verifikationsskript fuer das Alt-Plugin 'grid_liquidity'
+  (referenzierte entfernte/umbenannte Pfade). Die Migration laeuft seit
+  Phase 16 idempotent in `StateManager._init_db()` und ist durch
+  `test/check_p16_rename_migration.py` abgedeckt.
+- **Geändert:** `test/check_chart_data.py` – veraltete
+  feature_store-Query (`feature_id='grid_liquidity'`) auf die aktive
+  Plugin-ID `grid_lines` umgestellt.
+- **Geändert:** `test/check_p15_s2_service_tree.py` – Kommentar-Referenz
+  auf Phase-16-Rename aktualisiert.
+- **Verifikation:** py_compile + gezielte Backend-Checks (keine UI-/
+  Regressionstests, harte Regel).
+- **Git:** Commit + Push (siehe unten, Commit-Kennung wird nach Ausfuehrung ergänzt).
+

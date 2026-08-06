@@ -15,7 +15,7 @@ Die Services (grid_lines_service.py, proximity_service.py) importieren diese
 Funktionen und garantieren damit identisches Verhalten zum historischen
 Alt-Indikator, ohne auf das gelöschte Modul zu verweisen.
 
-HINWEIS: Der Indikator-Adapter (chart/indicators/grid_liquidity.py) behält seine
+HINWEIS: Der Indikator-Adapter (chart/indicators/fixed_grid_proximity.py) behält seine
 private Kopie (`_f_in_window_around`) unverändert – sie wird nicht umgestellt.
 Das Alt-Plugin analytics/features/definitions/grid_liquidity.py wurde am
 04.08.2026 archiviert/entfernt (Schema ist im Indikator selbst hinterlegt).

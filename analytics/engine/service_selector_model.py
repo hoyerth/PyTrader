@@ -22,7 +22,7 @@ diese aufbereiteten Daten an (Invariante 4: kein SQL in UI).
 Verwendete Badge-Konvention (Spalte 1 des MasterTree):
   * `📌 im <Indikator>`     – Plugin mit capabilities['chart'] == True
                              (bezieht sich auf den echten Indikator-Namen,
-                             z.B. 'GridLiquidityIndicator' – KEIN Service-Name)
+                             z.B. 'Ind_FixedGridProximity' – KEIN Service-Name)
   * `🟢 aktiv in <Indikator>` – Indikator ist in mind. einem Chart-Fenster aktiv
   * `⚪ inaktiv in <Indikator>` – Indikator ist nirgends aktiv / kein Chart-Pflicht
 """
@@ -40,13 +40,13 @@ def list_indicators() -> List[Dict[str, Any]]:
     Liefert pro Indikator: {"indicator_id", "display_name",
     "service_plugin_ids"} – Grundlage der Indikator-Auswahl beim Anlegen
     neuer Service-Sets (Bugfix 05.08.2026). Aktuell existiert genau ein
-    Plugin-Indikator (GridLiquidityIndicator); weitere Indikatoren werden
+    Plugin-Indikator (Ind_FixedGridProximity); weitere Indikatoren werden
     hier Open/Closed ergaenzt (Registry-Prinzip).
     """
     result: List[Dict[str, Any]] = []
     try:
-        from chart.indicators.grid_liquidity import GridLiquidityIndicator
-        ind = GridLiquidityIndicator()
+        from chart.indicators.fixed_grid_proximity import FixedGridProximityIndicator
+        ind = FixedGridProximityIndicator()
         svc_ids = list(getattr(ind, "service_plugin_ids", []) or [])
         # Konsistenter Anzeigename: bevorzugt metadata['indicator_name'] des
         # ersten Indikator-Services (identisch zur Tree-Badge-Logik in
@@ -259,7 +259,7 @@ class ServiceSelectorModel(QObject):
         """Indikator-ID, in der das Plugin laeuft (metadata['indicator_id']).
 
         Services (grid_lines/proximity) laufen IN einem Indikator
-        (GridLiquidityIndicator -> 'grid_liquidity'); aktiv im Chart sind
+        (Ind_FixedGridProximity -> 'ind_fixed_grid_proximity'); aktiv im Chart sind
         die indicators_state-Keys des Indikators, nicht die Plugin-ID.
         Ohne Angabe faellt die Methode auf die plugin_id selbst zurueck.
         """
@@ -276,7 +276,7 @@ class ServiceSelectorModel(QObject):
         """True, wenn das Plugin explizit einem Indikator zugeordnet ist.
 
         Signal: metadata['indicator_id'] ODER metadata['indicator_name'] sind
-        gesetzt (z.B. GridLiquidityIndicator fuer grid_lines/proximity).
+        gesetzt (z.B. Ind_FixedGridProximity fuer grid_lines/proximity).
         """
         plugin = self.get_plugin(plugin_id)
         if plugin is None:
@@ -291,7 +291,7 @@ class ServiceSelectorModel(QObject):
         """Anzeige-Name des Indikators zu einer Plugin-ID.
 
         Bevorzugt metadata['indicator_name'] (echter Indikatorname, z.B.
-        'GridLiquidityIndicator'); Fallback metadata['display_name']
+        'Ind_FixedGridProximity'); Fallback metadata['display_name']
         (Service-Name) bzw. plugin_id.
         """
         plugin = self.get_plugin(plugin_id)
@@ -310,7 +310,7 @@ class ServiceSelectorModel(QObject):
         Bugfix 05.08.2026: Beruecksichtigt zusaetzlich den ZUGEHOERIGEN
         Indikator (metadata['indicator_id']). Services laufen IN einem
         Indikator – aktiv im Chart sind die indicators_state-Keys des
-        Indikators ('grid_liquidity'), nicht die Plugin-ID selbst. Dadurch
+        Indikators ('ind_fixed_grid_proximity'), nicht die Plugin-ID selbst. Dadurch
         greift die Tooltip-Variante a) ('aktiv <Indikator>') auch fuer
         Services wie grid_lines/proximity.
         """
@@ -366,13 +366,13 @@ class ServiceSelectorModel(QObject):
         """Kompaktes Status-Badge (Spalte 1 des MasterTree).
 
         Die Badges referenzieren den INDIKATOR-Namen (metadata['indicator_name'],
-        z.B. 'GridLiquidityIndicator') – Service-Namen erscheinen hier bewusst
+        z.B. 'Ind_FixedGridProximity') – Service-Namen erscheinen hier bewusst
         NICHT:
 
-            "📌 im GridLiquidityIndicator | 🟢 aktiv in GridLiquidityIndicator"
-            "📌 im GridLiquidityIndicator | ⚪ inaktiv in GridLiquidityIndicator"
-            "⚪ inaktiv in GridLiquidityIndicator"   (kein Chart-Indikator)
-            "🟢 aktiv in GridLiquidityIndicator"     (kein Chart-Indikator, aktiv)
+            "📌 im Ind_FixedGridProximity | 🟢 aktiv in Ind_FixedGridProximity"
+            "📌 im Ind_FixedGridProximity | ⚪ inaktiv in Ind_FixedGridProximity"
+            "⚪ inaktiv in Ind_FixedGridProximity"   (kein Chart-Indikator)
+            "🟢 aktiv in Ind_FixedGridProximity"     (kein Chart-Indikator, aktiv)
         """
         parts: List[str] = []
         name = self.get_indicator_display_name(plugin_id)

@@ -73,7 +73,7 @@ def _to_float(value: Any, default: float = 0.0) -> float:
 def _extract_prox_levels(params: Dict[str, Any]) -> List[float]:
     """Custom-Levels aus den EINZELPARAMETERN prox_level1..6 (nur > 0).
 
-    Parität zu grid_liquidity._extract_custom_levels(): Einzelwerte werden
+    Parität zu fixed_grid_proximity._extract_custom_levels(): Einzelwerte werden
     bevorzugt, wenn mindestens einer > 0 ist.
     """
     levels: List[float] = []
@@ -133,14 +133,15 @@ class GridLinesService(PluginFeature):
         return {
             "category": "Grid",
             "display_name": "Grid Lines",
-            # Bugfix (04.08.2026): Zugehoeriger Indikator-Name fuer die Status-
-            # Badges im MasterTree (der Service laeuft IN GridLiquidityIndicator).
-            "indicator_name": "GridLiquidityIndicator",
-            # Bugfix (05.08.2026): indicator_id = indicators_state-Key des
+            # Phase 16 (06.08.2026): Zugehoeriger Indikator-Name fuer die Status-
+            # Badges im MasterTree (der Service laeuft IN Ind_FixedGridProximity).
+            "indicator_name": "Ind_FixedGridProximity",
+            # Phase 16 (06.08.2026): indicator_id = indicators_state-Key des
             # zugehoerigen Indikators. ServiceSelectorModel.is_active_in_chart()
             # prueft damit die Aktiv-Frage auf Indikator-Ebene (Tooltip
             # 'aktiv <Indikator>' statt nur 'im <Indikator>').
-            "indicator_id": "grid_liquidity",
+            "indicator_id": "ind_fixed_grid_proximity",
+
             "description": "Baut das Grid-Raster in Parität zum Alt-Grid (Center ± steps_around × step_size + Custom-Levels)",
             "author": "PyTrader AI",
             "tags": ["grid", "lines", "raster"],
@@ -173,7 +174,7 @@ class GridLinesService(PluginFeature):
     @property
     def parameter_order(self) -> List[str]:
         # USER-REQ: P14-01 Nachtrag - die 6 Custom-Levels werden im Editor als
-        # EINZELPARAMETER prox_level1..6 (Level 1..6, wie grid_liquidity)
+        # EINZELPARAMETER prox_level1..6 (Level 1..6, wie fixed_grid_proximity)
         # gerendert. custom_levels bleibt im parameter_schema (interne Pipeline
         # & Aggregat-Speicherung), ist aber NICHT in der Darstellungs-Reihenfolge
         # -> wird im Editor nicht als Komma-Feld gerendert.
@@ -213,7 +214,7 @@ class GridLinesService(PluginFeature):
             # USER-REQ: P14-01 Nachtrag - die 6 Custom-Levels werden im Editor
             # als EINZELPARAMETER prox_level1..6 gerendert (Level 1..6). Das
             # Aggregat custom_levels bleibt im Schema erhalten - die interne
-            # Pipeline (GridLiquidityIndicator._build_set_definition) und
+            # Pipeline (FixedGridProximityIndicator._build_set_definition) und
             # Alt-Sets speichern die Level als Liste/String. calculate() liest
             # beide Formen (custom_levels_from_params).
             "custom_levels": {

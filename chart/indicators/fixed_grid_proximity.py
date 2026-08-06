@@ -1,4 +1,4 @@
-# chart/indicators/grid_liquidity.py
+# chart/indicators/fixed_grid_proximity.py
 """
 NEUER Grid-Indikator mit Service-Pipeline (Phase 13 Schritt 6).
 
@@ -18,7 +18,7 @@ grid_lines + proximity (analytics/features/definitions/):
 
 SELF-CONTAINED (Bugfix 04.08.2026): Das UI-Schema (grid_step /
 proximity_threshold / prox_level1-6 / Farben) ist direkt in diesem Modul
-hinterlegt (_GRID_LIQUIDITY_SCHEMA) – der Indikator ist dadurch die eigene
+hinterlegt (_FIXED_GRID_PROXIMITY_SCHEMA) – der Indikator ist dadurch die eigene
 Single Source of Truth für das Prop-Fenster (parameter_schema/plugin_id) und
 hängt NICHT mehr am entfernten Alt-Plugin 'grid_liquidity'
 (analytics/features/definitions/grid_liquidity.py, archiviert). Die Services
@@ -66,10 +66,10 @@ def _f_in_window_around(minute_val: int, center: int, span: int) -> bool:
 # 'grid_liquidity' (analytics/features/definitions/grid_liquidity.py) –
 # Reihenfolge: Indi-Props (Sichtbarkeit, Farben) zuerst, darunter die
 # Service-Props, expert-Felder am Ende. Der Indikator liefert damit
-# parameter_schema/parameter_order direkt (plugin_id='grid_liquidity') und
+# parameter_schema/parameter_order direkt (plugin_id='ind_fixed_grid_proximity') und
 # benötigt KEINEN PluginRegistry-Zugriff mehr.
 # ---------------------------------------------------------------------------
-_GRID_LIQUIDITY_SCHEMA: Dict[str, Dict[str, Any]] = {
+_FIXED_GRID_PROXIMITY_SCHEMA: Dict[str, Dict[str, Any]] = {
     "grid_step": {"type": "float", "default": 0.50, "min": 0.01, "max": 100.0, "step": 0.05, "description": "Rasterabstand"},
     "proximity_threshold": {"type": "float", "default": 0.05, "min": 0.001, "max": 10.0, "step": 0.005, "description": "Toleranzschwelle"},
     "use_time_filter": {"type": "bool", "default": True, "description": "Time Filter aktiv (Zeitfenster um ganze/halbe Stunde)"},
@@ -87,7 +87,7 @@ _GRID_LIQUIDITY_SCHEMA: Dict[str, Dict[str, Any]] = {
     "prox_level6": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 6"},
 }
 
-_GRID_LIQUIDITY_ORDER: List[str] = [
+_FIXED_GRID_PROXIMITY_ORDER: List[str] = [
     # Reine Indi-Props (oberhalb der Trennlinie)
     "show_lines", "show_circles",
     "line_color", "circle_color_std", "circle_color_active",
@@ -100,7 +100,7 @@ _GRID_LIQUIDITY_ORDER: List[str] = [
 ]
 
 
-class GridLiquidityIndicator(BaseIndicator):
+class FixedGridProximityIndicator(BaseIndicator):
 
     def __init__(self) -> None:
         super().__init__()
@@ -109,7 +109,7 @@ class GridLiquidityIndicator(BaseIndicator):
         self._settings: Any = None
         self._executor: PluginExecutor = PluginExecutor()
         self._evaluator: ServiceSetEvaluator = ServiceSetEvaluator(self._executor)
-        self._plugin_id: str = "grid_liquidity"
+        self._plugin_id: str = "ind_fixed_grid_proximity"
 
         # --- Thread-sicherer Cache (Phase 13 Schritt 6) ----------------------
         self._cache_lock = threading.Lock()
@@ -122,11 +122,11 @@ class GridLiquidityIndicator(BaseIndicator):
     # ------------------------------------------------------------------ Basis
     @property
     def indicator_id(self) -> str:
-        return "grid_liquidity"
+        return "ind_fixed_grid_proximity"
 
     @property
     def display_name(self) -> str:
-        return "Grid Liquidity (Plugin)"
+        return "Ind_FixedGridProximity"
 
     # --- Self-contained Plugin-Schnittstelle (Bugfix 04.08.2026) -------------
     # Der Indikator ist jetzt die eigene Single Source of Truth fürs Prop-
@@ -136,18 +136,18 @@ class GridLiquidityIndicator(BaseIndicator):
     # das Alt-Plugin 'grid_liquidity' ist entfernt.
     @property
     def plugin_id(self) -> str:
-        return "grid_liquidity"
+        return "ind_fixed_grid_proximity"
 
     @property
     def parameter_schema(self) -> Dict[str, Dict[str, Any]]:
         """UI-Schema (Indi-Props + Service-Props + Custom-Levels), exakt wie
         im archivierten Alt-Plugin 'grid_liquidity'."""
-        return {k: dict(v) for k, v in _GRID_LIQUIDITY_SCHEMA.items()}
+        return {k: dict(v) for k, v in _FIXED_GRID_PROXIMITY_SCHEMA.items()}
 
     @property
     def parameter_order(self) -> List[str]:
         """Darstellungs-Reihenfolge der Props im Prop-Fenster."""
-        return list(_GRID_LIQUIDITY_ORDER)
+        return list(_FIXED_GRID_PROXIMITY_ORDER)
 
     @property
     def base_parameter_schema(self) -> Dict[str, Dict[str, Any]]:
@@ -306,7 +306,7 @@ class GridLiquidityIndicator(BaseIndicator):
                 ORDER BY bar_time ASC
             """, [symbol, timeframe, feature_id, limit]).fetchall()
         except Exception as e:
-            print(f"WARN [GridLiquidityIndicator] feature_store-Lesepfad "
+            print(f"WARN [FixedGridProximityIndicator] feature_store-Lesepfad "
                   f"fehlgeschlagen: {e}")
             return []
 
@@ -390,8 +390,8 @@ class GridLiquidityIndicator(BaseIndicator):
         custom_levels = self._extract_custom_levels(params)
 
         return {
-            "set_id": "grid_liquidity_internal",
-            "display_name": "Grid Liquidity (intern)",
+            "set_id": "ind_fixed_grid_proximity_internal",
+            "display_name": "Ind_FixedGridProximity (intern)",
             "execution_order": ["grid_1", "prox_1"],
             "services": {
                 "grid_1": {
@@ -532,7 +532,7 @@ class GridLiquidityIndicator(BaseIndicator):
                 "status_info": status,
             }
         except Exception as e:
-            print(f"⚠️ [GridLiquidityIndicator] Service-Pipeline fehlgeschlagen: {e}")
+            print(f"⚠️ [FixedGridProximityIndicator] Service-Pipeline fehlgeschlagen: {e}")
             return empty_result
 
     def update_live_candle(self, candle: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -574,7 +574,7 @@ class GridLiquidityIndicator(BaseIndicator):
                 try:
                     self._on_new_candle()
                 except Exception as e:
-                    print(f"⚠️ [GridLiquidityIndicator] Cache-Neuaufbau fehlgeschlagen: {e}")
+                    print(f"⚠️ [FixedGridProximityIndicator] Cache-Neuaufbau fehlgeschlagen: {e}")
 
         try:
             price = float(candle.get("close", candle.get("price", 0.0)))

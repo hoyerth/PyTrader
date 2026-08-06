@@ -216,7 +216,7 @@ repo.save_symbol_tf_state(
     "SILVER", "M1",
     visible_range_from=1600000000, visible_range_to=1600003600,
     visible_price_from=30.0, visible_price_to=31.0,
-    indicators_state={"grid_liquidity": {"active": True}},
+    indicators_state={"ind_fixed_grid_proximity": {"active": True}},
     measurement_state={"x": 1},
 )
 st = repo.get_symbol_tf_state("SILVER", "M1")
@@ -224,7 +224,7 @@ check("W12) symbol_tf_state-Roundtrip",
       st is not None
       and st["visible_range_from"] == 1600000000
       and st["visible_price_to"] == 31.0
-      and st["indicators_state"] == {"grid_liquidity": {"active": True}}
+      and st["indicators_state"] == {"ind_fixed_grid_proximity": {"active": True}}
       and st["measurement_state"] == {"x": 1},
       str(st))
 repo.delete_symbol_tf_state("SILVER", "M1")

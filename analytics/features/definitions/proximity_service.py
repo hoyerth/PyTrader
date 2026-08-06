@@ -18,7 +18,7 @@ Das native UTC-Zeitfenster (Minute 0/30 ± time_window_mins) wird pro Hit als
 `in_window`-Flag in den hit_circles gemeldet. Die FARBE der Kreise (gelb im
 Fenster / fuchsia außerhalb) und die Sichtbarkeit (show_lines / show_circles)
 sind KEINE Service-Parameter – sie werden vom INDIKATOR gesteuert
-(chart/indicators/grid_liquidity.py), der die Circle-Farben auf Basis seines
+(chart/indicators/fixed_grid_proximity.py), der die Circle-Farben auf Basis seines
 eigenen Schemas (circle_color_std / circle_color_active) und des
 `in_window`-Flags setzt.
 
@@ -49,7 +49,7 @@ from analytics.features.plugins.base_plugin import (
 
 
 def _bar_utc_minutes(df: pd.DataFrame) -> List[int]:
-    """UTC-Minute (0-59) jeder Bar – konsistent zu grid_liquidity.py.
+    """UTC-Minute (0-59) jeder Bar – konsistent zu fixed_grid_proximity.py.
 
     Phase 16 (05.08.2026): Vektorisierter Fast-Path fuer 'time'-Spalten
     (epoch-Sekunden, int) – (t // 60) % 60 ist mathematisch identisch zu
@@ -98,14 +98,15 @@ class ProximityService(PluginFeature):
         return {
             "category": "Grid",
             "display_name": "Proximity",
-            # Bugfix (04.08.2026): Zugehoeriger Indikator-Name fuer die Status-
-            # Badges im MasterTree (der Service laeuft IN GridLiquidityIndicator).
-            "indicator_name": "GridLiquidityIndicator",
-            # Bugfix (05.08.2026): indicator_id = indicators_state-Key des
+            # Phase 16 (06.08.2026): Zugehoeriger Indikator-Name fuer die Status-
+            # Badges im MasterTree (der Service laeuft IN Ind_FixedGridProximity).
+            "indicator_name": "Ind_FixedGridProximity",
+            # Phase 16 (06.08.2026): indicator_id = indicators_state-Key des
             # zugehoerigen Indikators. ServiceSelectorModel.is_active_in_chart()
             # prueft damit die Aktiv-Frage auf Indikator-Ebene (Tooltip
             # 'aktiv <Indikator>' statt nur 'im <Indikator>').
-            "indicator_id": "grid_liquidity",
+            "indicator_id": "ind_fixed_grid_proximity",
+
             "description": "Prozentuale visit%-Treffer auf den Grid-Linien (Parität zu grid_math.py) inkl. Feature-Store-Records",
             "author": "PyTrader AI",
             "tags": ["grid", "proximity", "liquidity", "feature-store"],
@@ -153,7 +154,7 @@ class ProximityService(PluginFeature):
     # Hinweis (Schritt 6-Korrektur 3): Die visuellen Parameter (show_circles,
     # circle_color_std, circle_color_active, show_lines) sind KEINE
     # Service-Parameter – sie gehören zum Indikator-Schema und werden dort
-    # gesteuert (chart/indicators/grid_liquidity.py). Der Service meldet nur
+    # gesteuert (chart/indicators/fixed_grid_proximity.py). Der Service meldet nur
     # das in_window-Flag; der Indikator färbt die Kreise.
     @property
     def parameter_order(self) -> List[str]:

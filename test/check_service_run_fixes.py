@@ -91,7 +91,7 @@ def main() -> int:
     # ---------------------------------------------------------------- [3]
     print("\n[3] Explizites depends_on bleibt unveraendert:")
     indi_def = {
-        "set_id": "grid_liquidity_internal",
+        "set_id": "ind_fixed_grid_proximity_internal",
         "execution_order": ["grid_1", "prox_1"],
         "services": {
             "grid_1": {"plugin_id": "grid_lines", "lookback": 1000, "params": {}},

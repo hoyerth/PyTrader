@@ -788,7 +788,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		# Bugfix 05.08.2026: `metadata` ist eine PluginFeature-Property – der
 		# Plugin-Pfad (Branch 1 in _get_plugin) kann aber auch einen Indikator
 		# liefern, der parameter_schema+plugin_id implementiert (z.B.
-		# GridLiquidityIndicator), ohne PluginFeature zu sein (kein metadata).
+		# Ind_FixedGridProximity), ohne PluginFeature zu sein (kein metadata).
 		# getattr-Guard: PluginFeature unveraendert, Indikator ohne metadata
 		# erhaelt leere Metadaten statt AttributeError.
 		meta = dict(getattr(plugin, "metadata", None) or {})
@@ -870,7 +870,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 	# -------------------------------------------------------------------------
 	# Indikator-Services (Phase 13 Schritt 6-Korrektur): die Services, die der
 	# aktive Plugin-Indikator intern ausführt (z.B. grid_lines + proximity beim
-	# Grid-Liquidity-Indikator). grid_liquidity (Altbestand) ist nur Schema-
+	# Ind_FixedGridProximity-Indikator). grid_liquidity (Altbestand) ist nur Schema-
 	# Quelle und KEIN Service des Indikators.
 	# -------------------------------------------------------------------------
 
@@ -1361,10 +1361,10 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		"""Generiert einen vorgegebenen Namen aus Indikator-Name und Symbol.
 
 		Bugfix: Vorschlag im Format '<Indikator-Name>-<Symbol>-', getrennt
-		durch Bindestriche OHNE Leerzeichen (z. B. 'Grid Liquidity-BTCUSD-').
+		durch Bindestriche OHNE Leerzeichen (z. B. 'Ind_FixedGridProximity-BTCUSD-').
 		Als Vorgabe wird NUR der Indikator-Name genommen (display_name, ohne
 		'(Plugin)'-Suffix) – NICHT die Service-Namen (plugin.metadata
-		enthaelt z. B. 'Grid Liquidity & Proximity' und faellt als Quelle
+		enthaelt z. B. 'Ind_FixedGridProximity' und faellt als Quelle
 		weg). Fallback auf plugin_id bzw. 'Set'; Symbol aus dem Dialog-
 		Kontext, Fallback 'DEFAULT'.
 		"""

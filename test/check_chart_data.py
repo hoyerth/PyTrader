@@ -29,11 +29,11 @@ for sym, tf in pairs:
 
 # Marker-Query (feature_store, feature_id) – Phase 15: Alt-Signale
 # (grid_proximity_v1, ema_atr_set_v1) entfernt. Aktiv sind nur noch die
-# Plugin-IDs 'proximity' und 'grid_liquidity'.
+# Plugin-IDs 'grid_lines' und 'proximity'.
 acon = duckdb.connect(str(ANALYTICS), read_only=True)
 print("\n--- feature_store queries (feature_id, Plugin-Daten) ---")
 for sym, tf, fid in [("SILVER", "H1", "proximity"), ("SILVER", "M5", "proximity"),
-                     ("GOLD", "H1", "proximity"), ("SILVER", "H1", "grid_liquidity")]:
+                     ("GOLD", "H1", "proximity"), ("SILVER", "H1", "grid_lines")]:
     try:
         rows = acon.execute("""
             SELECT EXTRACT(epoch FROM bar_time)::BIGINT AS time_epoch, feature_data
