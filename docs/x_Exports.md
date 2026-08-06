@@ -77,8 +77,8 @@ PyTrader/
             __init__.py
         widgets/
             __init__.py
-            color_button.py
             named_item_actions.py
+            style_picker_widget.py
     config/
         __init__.py
         app_settings.py
@@ -101,27 +101,7 @@ PyTrader/
         symbols_win.py
         trash_dialog.py
     test/
-        build_cont_map.py
-        check_app_state.py
-        check_broker_tz.py
-        check_chart_data.py
-        check_current_timestamp.py
-        check_html_template.py
-        check_m1_consistency.py
-        check_m1_midnight.py
-        check_mt5_m1_boundary.py
-        check_p15_s2_service_tree.py
-        check_p15_s3_analytics.py
-        check_p15_s4_infra.py
-        check_p16_rename_migration.py
-        check_resolve_realtime.js
-        check_service_run_fixes.py
-        check_time_utils.js
-        migrate_legacy_feature_store.py
-        simulate_chart_mapping.py
         test.py
-        test_db_lock.py
-        tmp_cont_map.json
     ui/
         chart_win.ui
         main_win.ui
@@ -9373,16 +9353,19 @@ Referenz-Kopien):
     levels = {round(center + i * step_size, 6) | i in [-steps_around, steps_around]}
              + Custom-Levels (prox_level1..6, nur > 0)
 
-Der Service liefert den chart_render_payload (lines) in identischer Struktur
-wie der Alt-Indikator (is_custom-Färbung, width 1/3, style Solid) und schreibt
-die Linienliste zusätzlich nach context.shared_state[self.instance_id] – der
-nachgelagerte ProximityService liest sie von dort (depends_on).
+Der Service liefert KEINEN chart_render_payload mehr (Phase 16 P16.01, E2/E5:
+render=False) – er schreibt ausschliesslich eine REINE Level-Liste
+(`[{price}, ...]`, ohne Farben/Styling) nach context.shared_state[self.instance_id];
+der nachgelagerte ProximityService liest sie von dort (depends_on), der
+Indikator (chart/indicators/fixed_grid_proximity.py) baut daraus in
+`build_chart_render_payload()` das Styling (is_custom-Färbung, width 1/3,
+style Solid – Parität zum Alt-Grid).
 
 KEINE eigenen Zeitkonzepte: Das native UTC-Zeitfenster (Minute 0/30 ±
 time_window_mins) ist ausschließlich Sache des ProximityService (Farbgebung),
 nicht dieses Services.
 
-Capabilities: render=True, feature_store=True (schreibt Grid-Level je Bar in den Store).
+Capabilities: render=False (P16.01), feature_store=True (schreibt Grid-Level je Bar in den Store).
 
 05.08.2026 (U15-E, echte Feature-Store-Payloads): `calculate()` erzeugt jetzt
 ZWINGEND ein gefuelltes `feature_store_payload` mit `feature_id="grid_lines"`,
@@ -9529,7 +9512,9 @@ class GridLinesService(PluginFeature):
             # 05.08.2026 (U15-E): grid_lines schreibt jetzt echte Grid-Level
             # je Bar in den Store (feature_store_payload in calculate()).
             "feature_store": True,
-            "render": True,
+            # Phase 16 (P16.01, E5): render=False - der Service liefert KEINEN
+            # chart_render_payload mehr; der Indikator baut das Styling.
+            "render": False,
         }
 
     # --- Single Source of Truth fürs Prop-Fenster (Phase 13 Schritt 5) -------
@@ -9540,8 +9525,10 @@ class GridLinesService(PluginFeature):
         # gerendert. custom_levels bleibt im parameter_schema (interne Pipeline
         # & Aggregat-Speicherung), ist aber NICHT in der Darstellungs-Reihenfolge
         # -> wird im Editor nicht als Komma-Feld gerendert.
+        # Phase 16 (P16.01): show_lines/line_color sind KEINE Service-Parameter
+        # mehr (E1/E5) - sie steuern ausschliesslich die Render-Darstellung im
+        # Indikator (chart/indicators/fixed_grid_proximity.py).
         return [
-            "show_lines", "line_color",
             "step_size", "steps_around",
             "prox_level1", "prox_level2", "prox_level3",
             "prox_level4", "prox_level5", "prox_level6",
@@ -9550,8 +9537,6 @@ class GridLinesService(PluginFeature):
     @property
     def param_labels(self) -> Dict[str, str]:
         return {
-            "show_lines": "Linien anzeigen",
-            "line_color": "Linien-Farbe",
             "step_size": "Rasterabstand",
             "steps_around": "Level-Anzahl (je Seite)",
             "prox_level1": "Level 1",
@@ -9589,13 +9574,6 @@ class GridLinesService(PluginFeature):
             "prox_level4": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 4"},
             "prox_level5": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 5"},
             "prox_level6": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 6"},
-            "show_lines": {
-                "type": "bool", "default": True, "description": "Grid-Linien anzeigen",
-            },
-            "line_color": {
-                "type": "color", "default": "",
-                "description": "Linien-Farbe (leer = Paritäts-Styling aus grid_math.py)",
-            },
         }
 
     def calculate(
@@ -9605,23 +9583,26 @@ class GridLinesService(PluginFeature):
         context: Optional[PluginContext] = None,
     ) -> FeatureCalculateResult:
         """Baut das Raster in Parität zum Alt-Grid (grid_math.py) und schreibt
-        die Linienliste nach context.shared_state[self.instance_id] (Namespace-
-        isoliert).
+        die reine LEVEL-Liste nach context.shared_state[self.instance_id]
+        (Namespace-isoliert).
 
         05.08.2026 (U15-E): Zusaetzlich wird ein gefuelltes feature_store_payload
         erzeugt (feature_id='grid_lines', plugin_version, records je Bar mit
         bar_time / grid_nearest_level / grid_step / upper_level / lower_level) -
         grid_lines schreibt damit echte mathematische Grid-Level in den
-        feature_store (unabhaengig von show_lines, das nur die Render-Darstellung
-        steuert)."""
+        feature_store.
+
+        Phase 16 (P16.01, E2): Der Service liefert KEINEN chart_render_payload
+        mehr (render=False, E5). Die Level-Liste im shared_state enthaelt nur
+        noch {price} - OHNE Farben/width/style. Das Render-Styling (Farben,
+        Sichtbarkeit) baut ausschliesslich der Indikator
+        (build_chart_render_payload in fixed_grid_proximity.py)."""
         if df is None or df.empty:
-            return {"feature_store_payload": {}, "chart_render_payload": {"lines": [], "hit_circles": []}}
+            return {"feature_store_payload": {}}
 
         p = self.validate_params(params)
         step_size = float(p["step_size"])
         steps_around = int(p["steps_around"])
-        show_lines = bool(p["show_lines"])
-        line_color = str(p.get("line_color") or "").strip()
 
         custom_levels = custom_levels_from_params(p)
         sorted_levels = build_grid_levels(
@@ -9631,28 +9612,17 @@ class GridLinesService(PluginFeature):
             custom_levels=custom_levels,
         )
 
-        # --- Lines-Payload (exakte Parität zu grid.py) -----------------------
-        lines_payload: List[Dict[str, Any]] = []
-        if show_lines:
-            for lvl in sorted_levels:
-                is_custom = any(abs(lvl - c_lvl) < 0.0001 for c_lvl in custom_levels)
-                if line_color:
-                    color = line_color
-                else:
-                    # Paritäts-Styling: Custom-Levels kräftiger + dünner (mit ★)
-                    color = "rgba(33, 150, 243, 0.9)" if is_custom else "rgba(33, 150, 243, 0.5)"
-                lines_payload.append({
-                    "price": lvl,
-                    "color": color,
-                    "width": 1 if is_custom else 3,
-                    "style": "Solid",
-                    "is_custom": is_custom,
-                })
+        # --- Reine Level-Liste (P16.01/E2, exakte Parität zu grid.py) --------
+        # OHNE Farben/Styling - der nachgelagerte ProximityService liest nur
+        # {price} (tracked_levels), der Indikator baut das Styling daraus.
+        level_entries: List[Dict[str, Any]] = [
+            {"price": lvl} for lvl in sorted_levels
+        ]
 
-        # Linienliste in den Namespace schreiben – der ProximityService liest
+        # Level-Liste in den Namespace schreiben – der ProximityService liest
         # sie von dort (depends_on). Atomare Zuweisung (neue Liste).
         if context is not None and context.instance_id:
-            context.shared_state[context.instance_id] = list(lines_payload)
+            context.shared_state[context.instance_id] = list(level_entries)
 
         # --- Feature-Store-Payload (05.08.2026, U15-E) -----------------------
         # Pro Bar: grid_nearest_level = center (naechstes Grid-Level zum close),
@@ -9727,10 +9697,6 @@ class GridLinesService(PluginFeature):
                     "schema_version": "1.0.0",
                     "step_size": step_size,
                 },
-            },
-            "chart_render_payload": {
-                "lines": lines_payload,
-                "hit_circles": [],
             },
         }
 
@@ -9847,19 +9813,20 @@ und wendet die PROZENTUALE visit%-Semantik des Alt-Grid-Indikators an
 
 – NICHT die absolute threshold-Distanz des Alt-Plugins grid_liquidity.
 
-Das native UTC-Zeitfenster (Minute 0/30 ± time_window_mins) wird pro Hit als
-`in_window`-Flag in den hit_circles gemeldet. Die FARBE der Kreise (gelb im
-Fenster / fuchsia außerhalb) und die Sichtbarkeit (show_lines / show_circles)
-sind KEINE Service-Parameter – sie werden vom INDIKATOR gesteuert
+Das native UTC-Zeitfenster (Minute 0/30 ± time_window_mins) wird pro Bar als
+`in_time_window`-Flag in die Feature-Records geschrieben. Die FARBE der Kreise
+(gelb im Fenster / fuchsia außerhalb) und die Sichtbarkeit (show_lines /
+show_circles) sind KEINE Service-Parameter – sie werden vom INDIKATOR gesteuert
 (chart/indicators/fixed_grid_proximity.py), der die Circle-Farben auf Basis seines
 eigenen Schemas (circle_color_std / circle_color_active) und des
-`in_window`-Flags setzt.
+`in_time_window`-Flags setzt (P16.01: `status_info` liegt als
+metadata["statistics"] im feature_store_payload).
 
 lookback (Scan-Fenster von rechts nach links) = min(statistics_signal_limit,
 len(df)) aus context.settings. Der Service schreibt die Hit-Records nach
 feature_data (feature_store=True) für Schritt 7 (Marker/Statistik).
 
-Capabilities: render=True, feature_store=True.
+Capabilities: render=False (P16.01), feature_store=True.
 """
 
 from datetime import datetime, timezone as dt_timezone
@@ -9964,7 +9931,9 @@ class ProximityService(PluginFeature):
             "batch": True,
             "live": False,
             "feature_store": True,  # schreibt Hit-Records nach feature_data
-            "render": True,
+            # Phase 16 (P16.01, E5): render=False - der Service liefert KEINEN
+            # chart_render_payload mehr; der Indikator baut das Styling.
+            "render": False,
         }
 
     @property
@@ -10029,10 +9998,15 @@ class ProximityService(PluginFeature):
     ) -> FeatureCalculateResult:
         """Wendet die prozentuale visit%-Semantik der Paritätsfunktionen
         (grid_math.py) auf die Linien aus context.shared_state[depends_on[0]]
-        an und schreibt Hit-Records nach feature_data (feature_store=True)."""
+        an und schreibt Hit-Records nach feature_data (feature_store=True).
+
+        Phase 16 (P16.01, E3/E4/E5): Der Service liefert KEINEN
+        chart_render_payload mehr (render=False). `status_info`
+        {in_time_window, active_hits} wird in metadata["statistics"] des
+        feature_store_payload ausgelagert und vom Indikator
+        (build_chart_render_payload) uebernommen."""
         empty: FeatureCalculateResult = {
             "feature_store_payload": {},
-            "chart_render_payload": {"lines": [], "hit_circles": []},
         }
         if df is None or df.empty:
             return empty
@@ -10087,9 +10061,10 @@ class ProximityService(PluginFeature):
         #     Semantik zu grid_math.py.
         #   * NaN high/low propagieren in den Vergleichen zu False (kein Hit)
         #     – wie im Alt-Pfad (Float-Vergleich mit NaN ist False).
-        #   * Reihung hit_circles/levels_hit: zeilen-major, innerhalb einer
-        #     Zeile in tracked_levels-Reihenfolge (lexsort über Zeile+Level).
-        hit_circles: List[Dict[str, Any]] = []
+        #   * Reihung levels_hit: zeilen-major, innerhalb einer Zeile in
+        #     tracked_levels-Reihenfolge (lexsort über Zeile+Level).
+        # Phase 16 (P16.01, E4): hit_circles werden NICHT mehr erzeugt – der
+        # Indikator baut sie aus den feature_rows (levels_hit/in_time_window).
         active_hits: List[str] = []
         feature_rows: List[Dict[str, Any]] = []
 
@@ -10134,19 +10109,6 @@ class ProximityService(PluginFeature):
                         r = int(bar_sorted[s])
                         lvls = [float(x) for x in levels_arr[lvl_sorted[s:e]]]
                         levels_hit[r] = lvls
-                        t_val = int(times[r])
-                        win_flag = bool(in_win[r])
-                        for lvl in lvls:
-                            # hit_circles ohne Farbe – der INDIKATOR färbt auf
-                            # Basis seines eigenen Schemas (circle_color_std /
-                            # _active) und des in_window-Flags. in_window=True
-                            # wenn die Bar im UTC-Zeitfenster (0/30 ±
-                            # time_window_mins) liegt.
-                            hit_circles.append({
-                                "time": t_val,
-                                "price": lvl,
-                                "in_window": win_flag,
-                            })
                         if r == last_pos:
                             active_hits.extend(
                                 f_strip_trailing_zeros(v) for v in lvls)
@@ -10180,7 +10142,8 @@ class ProximityService(PluginFeature):
                 "plugin_version": self.version,
                 "records": feature_rows,
                 "metadata": {
-                    "total_hits": len(hit_circles),
+                    "total_hits": sum(
+                        len(r.get("levels_hit") or []) for r in feature_rows),
                     "depends_on": dep_id,
                     "scan_limit": limit,
                     "visit_pct": visit_pct,
@@ -10188,14 +10151,13 @@ class ProximityService(PluginFeature):
                     # Feature-Payload – der Indikator-Lesepfad (feature_data)
                     # prüft sie beim Chart-Re-Render.
                     "schema_version": "1.0.0",
-                },
-            },
-            "chart_render_payload": {
-                "lines": [],
-                "hit_circles": hit_circles,
-                "status_info": {
-                    "in_time_window": in_time_window,
-                    "active_hits": active_hits,
+                    # Phase 16 (P16.01, E4): status_info als Feature-Daten
+                    # (KEINE Farben) – der Indikator übernimmt sie in
+                    # build_chart_render_payload().
+                    "statistics": {
+                        "in_time_window": in_time_window,
+                        "active_hits": active_hits,
+                    },
                 },
             },
         }
@@ -13367,7 +13329,7 @@ from PySide6.QtWidgets import (
 )
 
 from chart.indicators.base_indicator import BaseIndicator
-from chart.widgets.color_button import ColorButton
+from chart.widgets.style_picker_widget import LineStyle, StylePickerWidget
 from chart.widgets.named_item_actions import NamedItemAdapter, NamedItemActionsMixin
 from analytics.engine.description_dialog import ServiceDescriptionDialog
 from state_manager import StateManager
@@ -13829,16 +13791,20 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			return combo
 
 		if p_type == "color":
-			# 5.5 Feintuning (VERBINDLICH): Farbparameter IMMER als kompakter
-			# ColorButton rendern – nie als freies Textfeld (QLineEdit).
+			# 5.5 Feintuning + Phase 16 (06.08.2026): Farbparameter werden als
+			# StylePickerWidget gerendert – das komplette Composite (Sichtbarkeit,
+			# Farbe, Stärke, Linienart). Der Dialog liest/schreibt NUR den
+			# Farbanteil via get_style()/set_color() (Refactoring-Anweisung
+			# ColorButton -> StylePickerWidget, Entscheidung: vollwertiges
+			# Composite, Dialog nutzt nur den Farbanteil).
 			# allow_alpha aus dem Schema (Default True) schaltet den
 			# Transparenz-Slider im QColorDialog (ShowAlphaChannel) frei.
-			# Der Button liefert '#RRGGBB' (Alpha=255) bzw. 'rgba(r,g,b,a)'
+			# Der Farb-Button liefert '#RRGGBB' (Alpha=255) bzw. 'rgba(r,g,b,a)'
 			# (Teil-Transparenz) – 1:1 kompatibel mit TradingView v5 / CSS.
 			allow_alpha = bool(spec.get("allow_alpha", True))
-			btn = ColorButton(default_color=str(val), enable_alpha=allow_alpha)
-			btn.colorChanged.connect(self.on_param_control_changed)
-			return btn
+			ctrl = StylePickerWidget(style=LineStyle(color=str(val)), enable_alpha=allow_alpha)
+			ctrl.style_changed.connect(self.on_param_control_changed)
+			return ctrl
 
 		# str / sonstiges
 		txt = QLineEdit()
@@ -13856,8 +13822,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			return ctrl.value()
 		if isinstance(ctrl, QComboBox):
 			return ctrl.currentText()
-		if isinstance(ctrl, ColorButton):
-			return ctrl.color()
+		if isinstance(ctrl, StylePickerWidget):
+			return ctrl.get_style().color
 		return ctrl.text()
 
 	# -------------------------------------------------------------------------
@@ -14971,8 +14937,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 						new_params[key] = default_val
 				else:
 					new_params[key] = raw_val
-			elif isinstance(ctrl, ColorButton):
-				new_params[key] = ctrl.color()
+			elif isinstance(ctrl, StylePickerWidget):
+				new_params[key] = ctrl.get_style().color
 			elif isinstance(ctrl, QLineEdit):
 				new_params[key] = ctrl.text()
 		return new_params
@@ -14989,8 +14955,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 					ctrl.setValue(val)
 				elif isinstance(ctrl, QComboBox):
 					ctrl.setCurrentText(str(val))
-				elif isinstance(ctrl, ColorButton) and isinstance(val, str):
-					ctrl.setColor(val)
+				elif isinstance(ctrl, StylePickerWidget) and isinstance(val, str):
+					ctrl.set_color(val)
 				elif isinstance(ctrl, QLineEdit) and isinstance(val, str):
 					ctrl.setText(val)
 
@@ -15547,8 +15513,6 @@ class FixedGridProximityIndicator(BaseIndicator):
         visit_pct = float(params.get("visit_pct", params.get("proximity_threshold", 0.05)))
         time_window_mins = int(params.get("time_window_mins", 5))
         use_time_filter = _as_bool(params.get("use_time_filter"), True)
-        show_lines = _as_bool(params.get("show_lines"), True)
-        line_color = str(params.get("line_color") or "").strip()
         custom_levels = self._extract_custom_levels(params)
 
         return {
@@ -15563,8 +15527,6 @@ class FixedGridProximityIndicator(BaseIndicator):
                         "step_size": step_size,
                         "steps_around": steps_around,
                         "custom_levels": custom_levels,
-                        "show_lines": show_lines,
-                        "line_color": line_color,
                     },
                 },
                 "prox_1": {
@@ -15593,18 +15555,123 @@ class FixedGridProximityIndicator(BaseIndicator):
             out.add(ti - (ti % t_sec))
         return out
 
+    # ------------------------------------------------- P16.01: Render-Payload
+    def build_chart_render_payload(
+        self,
+        raw_features: Dict[str, Any],
+        ui_params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """P16.01 (Architektur-Entkopplung): Baut den chart_render_payload aus
+        den ROHDATEN der Services – die Services selbst liefern KEINE Farben,
+        Sichtbarkeits-Flags oder Zeichen-Objekte mehr (E1–E5).
+
+        raw_features:
+          * "grid_levels":        reine Level-Liste [{price}, ...] aus
+                                  context.shared_state["grid_1"] (E2)
+          * "proximity_records":  feature_store_records des Proximity-Service
+                                  ({levels_hit, is_hit, in_time_window, ...},
+                                  E3)
+          * "status_info":        {"in_time_window", "active_hits"} aus
+                                  metadata["statistics"] (E4)
+
+        ui_params: Indikator-Parameter (show_lines / line_color /
+        show_circles / circle_color_std / circle_color_active /
+        use_time_filter).
+
+        Liefert {"lines", "hit_circles", "status_info"} für den JS-Bridge
+        (chart_win._serialize_and_render_grid) – Parität zum Alt-Grid:
+        * lines: {price, color, width, style:'Solid', is_custom}
+          (leere line_color = Paritäts-Styling des Alt-Grid:
+          rgba(33,150,243,0.9)/width 1 für Custom-Levels,
+          rgba(33,150,243,0.5)/width 3 für Normal-Levels).
+        * hit_circles: {time, price, in_window, color, priority:10}
+          circle_color_std wenn in_window=True (bzw. Time-Filter inaktiv),
+          circle_color_active sonst (E1).
+        * status_info: 1:1 aus raw_features["status_info"] (E4).
+        """
+        lines: List[Dict[str, Any]] = []
+        if _as_bool(ui_params.get("show_lines"), True):
+            line_color = str(ui_params.get("line_color") or "").strip()
+            custom_levels = self._extract_custom_levels(ui_params)
+            for lvl_item in (raw_features.get("grid_levels") or []):
+                if not isinstance(lvl_item, dict):
+                    continue
+                try:
+                    lvl = float(lvl_item.get("price"))
+                except (TypeError, ValueError):
+                    continue
+                is_custom = any(
+                    abs(lvl - c_lvl) < 0.0001 for c_lvl in custom_levels)
+                if line_color:
+                    color = line_color
+                else:
+                    # Paritäts-Styling: Custom-Levels kräftiger + dünner (★)
+                    color = ("rgba(33, 150, 243, 0.9)" if is_custom
+                             else "rgba(33, 150, 243, 0.5)")
+                lines.append({
+                    "price": lvl,
+                    "color": color,
+                    "width": 1 if is_custom else 3,
+                    "style": "Solid",
+                    "is_custom": is_custom,
+                })
+
+        use_time_filter = _as_bool(ui_params.get("use_time_filter"), True)
+        circle_std = str(ui_params.get("circle_color_std") or "#FFEB3B")
+        circle_active = str(ui_params.get("circle_color_active") or "#E91E63")
+        hit_circles: List[Dict[str, Any]] = []
+        if _as_bool(ui_params.get("show_circles"), True):
+            for rec in (raw_features.get("proximity_records") or []):
+                if not rec.get("is_hit"):
+                    continue
+                in_window = bool(rec.get("in_time_window"))
+                color = (circle_active if (use_time_filter and not in_window)
+                         else circle_std)
+                try:
+                    bar_time = int(rec.get("bar_time"))
+                except (TypeError, ValueError):
+                    continue
+                for lvl in (rec.get("levels_hit") or []):
+                    try:
+                        hit_circles.append({
+                            "time": bar_time,
+                            "price": float(lvl),
+                            "in_window": in_window,
+                            "color": color,
+                            "priority": 10,
+                        })
+                    except (TypeError, ValueError):
+                        continue
+
+        status_info = raw_features.get("status_info") or {}
+        return {
+            "lines": lines,
+            "hit_circles": hit_circles,
+            "status_info": {
+                "in_time_window": bool(
+                    status_info.get("in_time_window", False)),
+                "active_hits": list(status_info.get("active_hits") or []),
+            },
+        }
+
     def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
         """Führt die Service-Pipeline (grid_lines + proximity) für den
         Historical-Run aus, cached die Linien thread-sicher und liefert den
         Render-Payload (Parität zu grid.py).
 
+        Phase 16 (P16.01, Architektur-Entkopplung): Der Render-Payload wird
+        AUSSCHLIESSLICH von build_chart_render_payload() aus den ROHDATEN der
+        Services gebaut (shared_state["grid_1"]-Levels + feature_store_records
+        + metadata["statistics"]) – die Services selbst liefern keine Farben
+        oder Zeichen-Objekte mehr.
+
         Invariante 10 (Chart-Entkopplung, Phase 15 U15-A2/A3) – Lese-Kette:
-          1. Proximity-Hit-Circles werden AUSSCHLIESSLICH aus dem feature_store
+          1. Proximity-Hit-Circles werden PRIMÄR aus dem feature_store
              gelesen (read_proximity_from_feature_store) – der Chart führt
              KEINE Proximity-Berechnung aus, er liest vorberechnete Daten
              aus DuckDB. Ist der Store leer (noch kein Batch-Lauf
-             geschrieben), werden keine Circles gerendert (U15-A3: der
-             frühere Pipeline-Fallback wurde entfernt).
+             geschrieben), greift der definierte P16.01-Fallback auf die aus
+             den Rohdaten gebauten Circles (build_chart_render_payload).
           Die Grid-LINIEN (Live-Tick-Cache) kommen unabhängig davon immer
           aus der Pipeline (GridLinesService) – sie sind kein DB-Output.
         """
@@ -15629,26 +15696,37 @@ class FixedGridProximityIndicator(BaseIndicator):
             definition = self._build_set_definition(p, df)
             results = self._evaluator.execute_set(definition, df, context)
 
-            # Linien kommen aus dem Namespace grid_1 (GridLinesService schreibt
-            # die Linienliste dorthin) – atomare, thread-sichere Zuweisung.
-            grid_lines = context.shared_state.get("grid_1") or []
-            lines = list(grid_lines) if isinstance(grid_lines, list) else []
-
-            prox_result = results.get("prox_1") or {}
-            prox_crp = prox_result.get("chart_render_payload") or {}
+            # --- P16.01: Render-Payload aus ROHDATEN bauen ------------------
+            # grid_levels = reine Level-Liste aus shared_state["grid_1"] (E2),
+            # proximity_records = feature_store_records aus results["prox_1"]
+            # (E3), status_info = metadata["statistics"] (E4). Der Indikator
+            # (build_chart_render_payload) übernimmt das komplette Styling –
+            # die Services liefern KEINEN chart_render_payload mehr (E5).
+            prox_fsp = (results.get("prox_1") or {}).get(
+                "feature_store_payload") or {}
+            grid_levels = context.shared_state.get("grid_1") or []
+            raw_features: Dict[str, Any] = {
+                "grid_levels": (
+                    grid_levels if isinstance(grid_levels, list) else []
+                ),
+                "proximity_records": prox_fsp.get("records") or [],
+                "status_info": (prox_fsp.get("metadata") or {}).get(
+                    "statistics") or {},
+            }
+            render_payload = self.build_chart_render_payload(raw_features, p)
+            lines = render_payload.get("lines") or []
 
             # U15-A2 (Farb-Semantik) mit Bugfix 04.08.2026 (Circles wieder
             # sichtbar): PRIMÄR werden die Proximity-Hits aus dem feature_store
             # gelesen (read_proximity_from_feature_store – U15-A3-Lesepfad).
             # Ist der Store leer (noch kein Batch-Lauf mit aktivem
             # proximity-Preset geschrieben), greift der DEFINIERTE FALLBACK
-            # auf die pipeline-berechneten Circles des Proximity-Service
-            # (prox_crp.hit_circles) – der Chart führt die Pipeline intern
-            # ohnehin aus und verwirft die Treffer sonst ungenutzt. Beide
-            # Pfade liefern time/price/in_window ohne Farbe; die Farbe wird
-            # additiv aus dem Indikator-Schema angewendet:
+            # auf die aus den Rohdaten gebauten Circles
+            # (render_payload.hit_circles, P16.01) – der Chart führt die
+            # Pipeline intern ohnehin aus und verwirft die Treffer sonst
+            # ungenutzt. Beide Pfade liefern time/price/in_window; die Farbe
+            # wird additiv aus dem Indikator-Schema angewendet:
             #   in_window + use_time_filter → circle_color_std, sonst _active.
-            # show_circles=false (Indikator-Parameter) → keine Circles.
             cached_circles = self.read_proximity_from_feature_store(
                 self._symbol or "", self._timeframe or ""
             )
@@ -15659,9 +15737,9 @@ class FixedGridProximityIndicator(BaseIndicator):
             def _colorize(c: Dict[str, Any]) -> Dict[str, Any]:
                 # Bugfix 05.08.2026: priority=10 ergänzen – der Feature-Store-
                 # Lesepfad (read_proximity_from_feature_store) und die Live-
-                # Punkte (update_live_candle) setzen priority=10, der Pipeline-
-                # Fallback (prox_crp.hit_circles aus dem ProximityService)
-                # liefert Kreise OHNE priority (nur time/price/in_window).
+                # Punkte (update_live_candle) setzen priority=10. Der P16.01-
+                # Fallback (render_payload.hit_circles aus
+                # build_chart_render_payload) setzt priority=10 bereits selbst.
                 # Durch das additive Setzen sind BEIDE Pfade konsistent
                 # (ChartCircle-Vertrag, base_plugin.py).
                 return dict(
@@ -15677,12 +15755,9 @@ class FixedGridProximityIndicator(BaseIndicator):
             if cached_circles:
                 circles = [_colorize(c) for c in cached_circles]
             else:
-                circles_raw = prox_crp.get("hit_circles") or []
-                if _as_bool(p.get("show_circles"), True):
-                    circles = [_colorize(c) for c in circles_raw]
-                else:
-                    circles = []
-            status = dict(prox_crp.get("status_info") or empty_result["status_info"])
+                circles = render_payload.get("hit_circles") or []
+            status = dict(render_payload.get("status_info")
+                          or empty_result["status_info"])
 
             self._set_cached_lines(lines)
             self._known_times = self._compute_known_times(df)
@@ -17179,176 +17254,18 @@ var Measurement = (function() {
 # Wiederverwendbare kompakte UI-Widgets (Phase 13 Kapitel 5.5 + Schritt 9).
 #
 # HINWEIS: Bewusst MINIMAL gehalten – hier werden KEINE schweren Module
-# importiert (kein chart_win, keine Indikatoren). ColorButton ist ein
+# importiert (kein chart_win, keine Indikatoren). StylePickerWidget ist ein
 # eigenständiges PySide6-Widget und kann von indicator_dialog.py,
 # serviceui/service_win.py und Tests ohne Circular-Import-Risiko eingebunden werden.
 # NamedItemActionsMixin ist ein reines Qt-Mixin (nur QInputDialog/QMessageBox)
 # und ebenfalls import-schwerelos.
-from .color_button import ColorButton
+#
+# Phase 16 (06.08.2026): ColorButton wurde durch das generische
+# StylePickerWidget ersetzt (Farbe + Stärke + Stil + Sichtbarkeit).
+from .style_picker_widget import LineStyle, StylePickerWidget
 from .named_item_actions import NamedItemActionsMixin, NamedItemAdapter
 
-__all__ = ["ColorButton", "NamedItemActionsMixin", "NamedItemAdapter"]
-
-```
-
---------------------------------------------------
-
-### DATEI: chart/widgets/color_button.py
-```py
-# chart/widgets/color_button.py
-# Phase 13 Kapitel 5.5 Schritt 1: Kompakter Farbwähler mit Alpha-Kanal.
-#
-# Roadmap 5.5.1.2:
-#   - Baut zu 100 % auf PySide6 (QColorDialog + QPushButton) auf – keine
-#     externen UI-Bibliotheken.
-#   - Platzeffizient: kleines Farbquadrat (festgelegte Kompaktgröße 60x24 px),
-#     das die gewählte Farbe inklusive Deckkraft als Hintergrund anzeigt.
-#   - Transparenz: über QColorDialog.ShowAlphaChannel wird ein Schieberegler
-#     für die Deckkraft (0-255) freigeschaltet.
-#   - CSS/Chart-Kompatibilität: bei 100 % Deckkraft (Alpha=255) liefert color()
-#     ein Hex-Format '#RRGGBB'; bei Teil-Transparenz einen rgba(r,g,b,a)-String
-#     (a als Float 0..1). Beides ist 1:1 kompatibel mit TradingView Lightweight
-#     Charts v5 (WebEngine) und HTML/CSS.
-#
-# Roadmap 5.5.2.1 Prämisse 3 (Kompaktes Layout): Die feste Kompaktgröße ist
-# bewusst klein; Size-Policy = Fixed verhindert, dass das Widget in Layouts
-# gedehnt wird und die dynamische Höhe/Breite des Prop-Fensters blockiert.
-
-from typing import Optional
-
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QColorDialog, QPushButton, QSizePolicy
-
-
-class ColorButton(QPushButton):
-    """Kompakter Farbwähler (farbiges Quadrat) mit optionalem Alpha-Kanal.
-
-    Attributes:
-        _color: QColor        – aktuelle Farbe inkl. Alpha (0-255).
-        _enable_alpha: bool   – ob der QColorDialog den Alpha-Slider zeigt.
-
-    Signal:
-        colorChanged = Signal(str) – emittiert den Farb-String (hex oder
-        rgba(...)) bei jeder Änderung über den Farbdialog.
-    """
-
-    colorChanged = Signal(str)
-
-    def __init__(self, default_color: str = "#2196F3", enable_alpha: bool = True,
-                 parent=None) -> None:
-        super().__init__(parent)
-        # Eindeutiger ObjectName: Das Stylesheet in update_style() wird über
-        # 'QPushButton#ColorButtonSwatch' auf DIESEN Button gescoped. Ohne
-        # Scoping wuerde der breite Selektor 'QPushButton' auf alle
-        # Nachkommen-Buttons abfaerben - insbesondere auf die kleinen Buttons
-        # im QColorDialog (wird mit self als Parent geoeffnet), die dann die
-        # aktuell gewaehlte Farbe statt der Standard-UI-Farbe zeigen.
-        self.setObjectName("ColorButtonSwatch")
-        self._enable_alpha: bool = bool(enable_alpha)
-        self._color: QColor = QColor()
-        self.setColor(default_color)
-
-        # Kompakte Festgröße (Roadmap 5.5.1.2: "festgelegte Kompaktgröße z. B.
-        # 60x24 px"). Fixed-Size-Policy: das Widget wird in Layouts weder
-        # gedehnt noch gestaucht -> blockiert die Layout-Dynamik nicht.
-        self.setFixedSize(60, 24)
-        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("Farbe auswählen (inkl. Transparenz)")
-        self.clicked.connect(self._open_color_dialog)
-
-    # ------------------------------------------------------------------
-    # Öffentliche API
-    # ------------------------------------------------------------------
-
-    def color(self) -> str:
-        """Gibt die aktuelle Farbe als String zurück.
-
-        Alpha == 255 -> '#RRGGBB' (Hex, Großbuchstaben, volle Deckkraft).
-        Alpha < 255  -> 'rgba(r, g, b, a)' mit a als Float (0..1) –
-                        direkt kompatibel mit TradingView v5 / CSS.
-        """
-        c = self._color
-        if not c.isValid():
-            return "#000000"
-        if c.alpha() < 255:
-            a = round(c.alpha() / 255.0, 2)
-            return f"rgba({c.red()}, {c.green()}, {c.blue()}, {a})"
-        return c.name().upper()
-
-    def setColor(self, color_str: str) -> None:
-        """Setzt die Farbe aus einem Hex- oder rgba(...)-String.
-
-        Ungültige Eingaben werden ignoriert (bisherige Farbe bleibt erhalten).
-        Aktualisiert anschließend das Button-Styling.
-        """
-        parsed = self._parse_color(color_str)
-        if parsed is not None:
-            self._color = parsed
-            self.update_style()
-
-    def update_style(self) -> None:
-        """Setzt das Button-Stylesheet auf die aktuelle Farbe inkl. Deckkraft.
-
-        Hintergrund wird immer als rgba(...) gesetzt, damit die Transparenz
-        direkt im Button sichtbar ist (Deckkraft-Visualisierung).
-        """
-        c = self._color
-        if not c.isValid():
-            bg = "rgba(0, 0, 0, 1.0)"
-        else:
-            bg = f"rgba({c.red()}, {c.green()}, {c.blue()}, {c.alpha() / 255.0})"
-        self.setStyleSheet(
-            "QPushButton#ColorButtonSwatch { background-color: " + bg +
-            "; border: 1px solid #555555; border-radius: 3px; }"
-        )
-
-    # ------------------------------------------------------------------
-    # Intern
-    # ------------------------------------------------------------------
-
-    def _open_color_dialog(self) -> None:
-        """Öffnet QColorDialog.getColor() (mit Alpha-Slider, wenn aktiviert).
-
-        Bei gültiger Auswahl wird colorChanged mit dem neuen Farb-String
-        emittiert (hex oder rgba(...), je nach Alpha).
-        """
-        options = QColorDialog.ColorDialogOption(0)
-        if self._enable_alpha:
-            options |= QColorDialog.ColorDialogOption.ShowAlphaChannel
-        chosen = QColorDialog.getColor(self._color, self, "Farbe auswählen", options)
-        if chosen.isValid():
-            self._color = chosen
-            self.update_style()
-            self.colorChanged.emit(self.color())
-
-    @staticmethod
-    def _parse_color(color_str: str) -> Optional[QColor]:
-        """Parst Hex- oder rgba(...)-Strings in ein QColor (oder None)."""
-        s = (color_str or "").strip()
-        if not s:
-            return None
-        low = s.lower()
-        if low.startswith("rgba("):
-            try:
-                inner = s[s.index("(") + 1:s.rindex(")")]
-                parts = [p.strip() for p in inner.split(",")]
-                if len(parts) != 4:
-                    return None
-                r = int(round(float(parts[0])))
-                g = int(round(float(parts[1])))
-                b = int(round(float(parts[2])))
-                a_frac = float(parts[3])
-            except (ValueError, TypeError):
-                return None
-            r = max(0, min(255, r))
-            g = max(0, min(255, g))
-            b = max(0, min(255, b))
-            alpha = max(0, min(255, int(round(a_frac * 255))))
-            return QColor(r, g, b, alpha)
-        c = QColor(s)
-        return c if c.isValid() else None
+__all__ = ["LineStyle", "StylePickerWidget", "NamedItemActionsMixin", "NamedItemAdapter"]
 
 ```
 
@@ -17556,6 +17473,306 @@ class NamedItemActionsMixin:
 
         adapter._item_delete_current()
         adapter._item_select(None)
+
+```
+
+--------------------------------------------------
+
+### DATEI: chart/widgets/style_picker_widget.py
+```py
+# chart/widgets/style_picker_widget.py
+# Phase 16 (06.08.2026): Generischer Stil-Waehler - ersetzt ColorButton
+# (chart/widgets/color_button.py).
+#
+# Der bisherige ColorButton war ein reiner Farbwaehler (Phase 13 Kapitel 5.5).
+# Das neue StylePickerWidget buendelt zentral:
+#   1. QCheckBox      -> Sichtbarkeit (show)
+#   2. Farb-Button    -> Farbe (color) via QColorDialog (optional mit Alpha)
+#   3. QSpinBox       -> Linienstaerke (width, 1-10)
+#   4. QComboBox      -> Linienart (style: solid/dashed/dotted/dashdotted)
+#
+# API: get_style() -> LineStyle, set_style(style: LineStyle),
+#      set_color(str) fuer reine Farb-Updates (Dialog-Restore-Pfad).
+# Signal: style_changed = Signal(object) - emittiert das aktuelle LineStyle.
+#
+# Farb-Logik (Paritaet zum Alt-ColorButton):
+#   - Alpha == 255 -> '#RRGGBB' (Hex, Grossbuchstaben, volle Deckkraft).
+#   - Alpha < 255  -> 'rgba(r, g, b, a)' mit a als Float (0..1) -
+#                     1:1 kompatibel mit TradingView Lightweight Charts v5
+#                     (WebEngine) und HTML/CSS.
+#   - QColorDialog.ShowAlphaChannel schaltet den Deckkraft-Slider frei.
+#
+# HINWEIS (06.08.2026): Der Indikator-Pfad (fixed_grid_proximity.py) liefert
+# style-Werte in Schreibweise "Solid" (capitalized). Das StylePickerWidget
+# verwendet gemaeSS Refactoring-Anweisung lowercase-Werte
+# (solid/dashed/dotted/dashdotted). Eine Vereinheitlichung erfolgt bei der
+# Indikator-Anbindung (separates Kapitel).
+
+from dataclasses import dataclass
+from typing import Optional
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QColorDialog,
+    QComboBox,
+    QHBoxLayout,
+    QPushButton,
+    QSizePolicy,
+    QSpinBox,
+    QWidget,
+)
+
+
+@dataclass
+class LineStyle:
+    """Stil-Definition fuer Linien: Sichtbarkeit, Farbe, Staerke, Linienart.
+
+    Attributes:
+        show:  bool  – Linie sichtbar (QCheckBox).
+        color: str   – '#RRGGBB' (Alpha=255) oder 'rgba(r,g,b,a)' (Teil-Transparenz).
+        width: int   – Linienstaerke in px (1–10, QSpinBox).
+        style: str   – 'solid' | 'dashed' | 'dotted' | 'dashdotted' (QComboBox).
+    """
+
+    show: bool = True
+    color: str = "#2196F3"
+    width: int = 1
+    style: str = "solid"
+
+
+class StylePickerWidget(QWidget):
+    """Kombinierter Stil-Waehler: Sichtbarkeit + Farbe + Staerke + Linienart.
+
+    Kapselt intern:
+      1. QCheckBox  (Sichtbarkeit `show`)
+      2. kleiner Farb-Button (Farbe `color` via QColorDialog, optional Alpha)
+      3. QSpinBox   (Linienstaerke `width`, 1–10)
+      4. QComboBox  (Linienart `style`: solid/dashed/dotted/dashdotted)
+
+    Signal:
+        style_changed = Signal(object) – emittiert das aktualisierte
+        `LineStyle`-Objekt bei jeder Aenderung eines Teil-Widgets.
+    """
+
+    style_changed = Signal(object)
+
+    # Kompakte Festgroesse des Farb-Buttons (Paritaet zum Alt-ColorButton,
+    # Roadmap 5.5.1.2: "festgelegte Kompaktgroesse z. B. 60x24 px" – hier
+    # bewusst kleiner, da das Composite drei weitere Elemente enthaelt).
+    _SWATCH_W = 40
+    _SWATCH_H = 24
+
+    def __init__(self, style: Optional[LineStyle] = None,
+                 enable_alpha: bool = True, parent=None) -> None:
+        super().__init__(parent)
+        self._enable_alpha: bool = bool(enable_alpha)
+        self._style: LineStyle = style if style is not None else LineStyle()
+        self._color: QColor = QColor()
+
+        # --- Farb-Button ----------------------------------------------------
+        # Eindeutiger ObjectName: Das Stylesheet in _update_swatch() wird ueber
+        # 'QPushButton#StylePickerSwatch' auf DIESEN Button gescoped. Ohne
+        # Scoping wuerde der breite Selektor 'QPushButton' auf alle
+        # Nachkommen-Buttons abfaerben – insbesondere auf die kleinen Buttons
+        # im QColorDialog (wird mit self als Parent geoeffnet).
+        self._color_btn = QPushButton()
+        self._color_btn.setObjectName("StylePickerSwatch")
+        self._color_btn.setFixedSize(self._SWATCH_W, self._SWATCH_H)
+        self._color_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self._color_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._color_btn.setToolTip("Farbe auswählen (inkl. Transparenz)")
+
+        # --- Sichtbarkeit ---------------------------------------------------
+        self._show_check = QCheckBox("sichtbar")
+        self._show_check.setToolTip("Linie anzeigen")
+
+        # --- Staerke --------------------------------------------------------
+        self._width_spin = QSpinBox()
+        self._width_spin.setRange(1, 10)
+        self._width_spin.setToolTip("Linienstärke (px)")
+        self._width_spin.setSuffix(" px")
+
+        # --- Linienart ------------------------------------------------------
+        self._style_combo = QComboBox()
+        self._style_combo.addItems(["solid", "dashed", "dotted", "dashdotted"])
+        self._style_combo.setToolTip("Linienart")
+
+        # --- Initialwerte (Signale blockiert, damit keine fruehen Emissionen
+        #     waehrend der Konstruktion ausgeloest werden) --------------------
+        for w in (self._show_check, self._width_spin, self._style_combo):
+            w.blockSignals(True)
+        try:
+            self._show_check.setChecked(self._style.show)
+            self._width_spin.setValue(self._style.width)
+            if self._style.style in ("solid", "dashed", "dotted", "dashdotted"):
+                self._style_combo.setCurrentText(self._style.style)
+            else:
+                self._style_combo.setCurrentText("solid")
+            self._set_color_internal(self._style.color)
+        finally:
+            for w in (self._show_check, self._width_spin, self._style_combo):
+                w.blockSignals(False)
+
+        # --- Signalverbindungen ---------------------------------------------
+        self._color_btn.clicked.connect(self._open_color_dialog)
+        self._show_check.toggled.connect(self._on_part_changed)
+        self._width_spin.valueChanged.connect(self._on_part_changed)
+        self._style_combo.currentTextChanged.connect(self._on_part_changed)
+
+        # --- Layout ---------------------------------------------------------
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        layout.addWidget(self._show_check)
+        layout.addWidget(self._color_btn)
+        layout.addWidget(self._width_spin)
+        layout.addWidget(self._style_combo)
+        layout.addStretch(1)
+
+        self._update_swatch()
+
+    # ------------------------------------------------------------------
+    # Oeffentliche API
+    # ------------------------------------------------------------------
+
+    def get_style(self) -> LineStyle:
+        """Liefert den aktuellen Stil als neues LineStyle-Objekt.
+
+        Es wird eine frische Instanz zurueckgegeben, damit externe Aenderungen
+        den internen Zustand nicht unbeabsichtigt mutieren.
+        """
+        return LineStyle(
+            show=self._show_check.isChecked(),
+            color=self._color_button_value(),
+            width=int(self._width_spin.value()),
+            style=str(self._style_combo.currentText()),
+        )
+
+    def set_style(self, style: LineStyle) -> None:
+        """Setzt den Stil aus einem LineStyle-Objekt und aktualisiert die UI.
+
+        Emittiert bewusst KEIN style_changed (programmatisches Setzen) –
+        Aufrufer, die eine Signal-Reaktion wuenschen, koennen style_changed
+        selbst emittieren bzw. setzen die Teil-Widgets ueber die UI.
+        """
+        if style is None:
+            return
+        self._style = style
+        self._show_check.blockSignals(True)
+        self._width_spin.blockSignals(True)
+        self._style_combo.blockSignals(True)
+        try:
+            self._show_check.setChecked(bool(style.show))
+            self._width_spin.setValue(int(style.width))
+            if style.style in ("solid", "dashed", "dotted", "dashdotted"):
+                self._style_combo.setCurrentText(style.style)
+            self._set_color_internal(style.color)
+        finally:
+            self._show_check.blockSignals(False)
+            self._width_spin.blockSignals(False)
+            self._style_combo.blockSignals(False)
+
+    def set_color(self, color_str: str) -> None:
+        """Setzt ausschliesslich die Farbe (behaelt show/width/style).
+
+        Wird vom indicator_dialog-Restore-Pfad genutzt, der aus einem
+        Farb-Parameter ('type: color') nur den Farbanteil zurueckliest und
+        wiederherstellt. Emittiert KEIN style_changed.
+        """
+        self._set_color_internal(color_str)
+
+    def color(self) -> str:
+        """Kompatibilitaets-Shim: aktuelle Farbe als String (hex/rgba)."""
+        return self._color_button_value()
+
+    # ------------------------------------------------------------------
+    # Intern
+    # ------------------------------------------------------------------
+
+    def _color_button_value(self) -> str:
+        """Farb-String aus dem internen QColor (Paritaet zum Alt-ColorButton)."""
+        c = getattr(self, "_color", QColor())
+        if not c.isValid():
+            return "#000000"
+        if c.alpha() < 255:
+            a = round(c.alpha() / 255.0, 2)
+            return f"rgba({c.red()}, {c.green()}, {c.blue()}, {a})"
+        return c.name().upper()
+
+    def _set_color_internal(self, color_str: str) -> None:
+        """Parst einen Hex-/rgba()-String und aktualisiert Swatch + Zustand.
+
+        Ungueltige Eingaben werden ignoriert (bisherige Farbe bleibt erhalten).
+        """
+        parsed = self._parse_color(color_str)
+        if parsed is not None:
+            self._color = parsed
+            self._update_swatch()
+
+    def _update_swatch(self) -> None:
+        """Setzt das Swatch-Stylesheet auf die aktuelle Farbe inkl. Deckkraft."""
+        c = getattr(self, "_color", QColor())
+        if not c.isValid():
+            bg = "rgba(0, 0, 0, 1.0)"
+        else:
+            bg = f"rgba({c.red()}, {c.green()}, {c.blue()}, {c.alpha() / 255.0})"
+        self._color_btn.setStyleSheet(
+            "QPushButton#StylePickerSwatch { background-color: " + bg +
+            "; border: 1px solid #555555; border-radius: 3px; }"
+        )
+
+    def _open_color_dialog(self) -> None:
+        """Oeffnet QColorDialog.getColor() (mit Alpha-Slider, wenn aktiviert).
+
+        Bei gueltiger Auswahl werden Swatch + interner Zustand aktualisiert
+        und style_changed mit dem neuen LineStyle emittiert.
+        """
+        options = QColorDialog.ColorDialogOption(0)
+        if self._enable_alpha:
+            options |= QColorDialog.ColorDialogOption.ShowAlphaChannel
+        chosen = QColorDialog.getColor(self._color, self, "Farbe auswählen", options)
+        if chosen.isValid():
+            self._color = chosen
+            self._update_swatch()
+            self._on_part_changed()
+
+    def _on_part_changed(self, *args) -> None:
+        """Zentraler Handler aller Teil-Widget-Aenderungen.
+
+        Aktualisiert den internen Zustand und emittiert style_changed mit dem
+        aktuellen LineStyle-Objekt.
+        """
+        self._style = self.get_style()
+        self.style_changed.emit(self._style)
+
+    @staticmethod
+    def _parse_color(color_str: str) -> Optional[QColor]:
+        """Parst Hex- oder rgba(...)-Strings in ein QColor (oder None)."""
+        s = (color_str or "").strip()
+        if not s:
+            return None
+        low = s.lower()
+        if low.startswith("rgba("):
+            try:
+                inner = s[s.index("(") + 1:s.rindex(")")]
+                parts = [p.strip() for p in inner.split(",")]
+                if len(parts) != 4:
+                    return None
+                r = int(round(float(parts[0])))
+                g = int(round(float(parts[1])))
+                b = int(round(float(parts[2])))
+                a_frac = float(parts[3])
+            except (ValueError, TypeError):
+                return None
+            r = max(0, min(255, r))
+            g = max(0, min(255, g))
+            b = max(0, min(255, b))
+            alpha = max(0, min(255, int(round(a_frac * 255))))
+            return QColor(r, g, b, alpha)
+        c = QColor(s)
+        return c if c.isValid() else None
 
 ```
 
@@ -23157,3118 +23374,6 @@ class ServiceSetTrashDialog(QDialog):
 
 --------------------------------------------------
 
-### DATEI: test/build_cont_map.py
-```py
-﻿# BEREIT FÜR PHASE 15
-# test/build_cont_map.py
-"""Baut die kontinuierliche cont->real Map fuer die letzten 3000 SILVER M1 Bars
-(exakt wie chart_win._do_refresh_chart_data) und schreibt sie als JSON,
-damit der Node-Test die resolveRealTime-Logik mit echten Daten pruefen kann.
-KEIN UI-Test."""
-import json
-import sys
-from datetime import datetime, timezone
-
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
-import duckdb
-
-con = duckdb.connect("data/market_data.duckdb", read_only=True)
-rows = con.execute("""
-    SELECT EXTRACT(epoch FROM "time")::BIGINT AS e
-    FROM ohlcv_bars
-    WHERE LOWER(symbol)='silver' AND LOWER(timeframe)='m1'
-      AND "time" IS NOT NULL AND open IS NOT NULL AND high IS NOT NULL AND low IS NOT NULL AND close IS NOT NULL
-    ORDER BY "time" DESC LIMIT 3000
-""").fetchall()
-con.close()
-
-reals = [int(r[0]) for r in rows][::-1]
-base_time = reals[0]
-cont_to_real = {}
-for i, r in enumerate(reals):
-    cont_to_real[str(base_time + i * 60)] = r  # JSON keys muessen Strings sein
-
-out = {
-    "base_time": base_time,
-    "count": len(reals),
-    "map": cont_to_real,
-}
-with open("test/tmp_cont_map.json", "w", encoding="utf-8") as f:
-    json.dump(out, f)
-
-print(f"Map geschrieben: {len(cont_to_real)} Eintraege, base={base_time}")
-# Roh-Epochs sind Berlin-Wanduhr-encoded -> fromtimestamp(e, utc) direkt
-for probe in [base_time, base_time + 2307 * 60, base_time + 2308 * 60]:
-    b = datetime.fromtimestamp(int(cont_to_real[str(probe)]), tz=timezone.utc)
-    print(f"  cont={probe} -> real={cont_to_real[str(probe)]} (Wanduhr {b.strftime('%d.%m %H:%M')})")
-
-```
-
---------------------------------------------------
-
-### DATEI: test/check_app_state.py
-```py
-﻿# BEREIT FÜR PHASE 15
-# test/check_app_state.py
-"""Liest den gespeicherten App-State (visible ranges, Instanzen) fuer die Diagnose
-der Chart-Leerstelle. KEIN UI-Test."""
-import sys
-
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
-import duckdb
-
-con = duckdb.connect("data/app_data.duckdb", read_only=True)
-
-print("=== window_instances ===")
-try:
-    rows = con.execute("SELECT * FROM window_instances").fetchall()
-    cols = [d[0] for d in con.description]
-    for r in rows:
-        print("  " + ", ".join(f"{c}={v}" for c, v in zip(cols, r)))
-except Exception as e:
-    print("  Fehler:", e)
-
-print("\n=== instance_states ===")
-try:
-    rows = con.execute("SELECT * FROM instance_states").fetchall()
-    cols = [d[0] for d in con.description]
-    for r in rows:
-        print("  " + ", ".join(f"{c}={v}" for c, v in zip(cols, r)))
-except Exception as e:
-    print("  Fehler:", e)
-
-print("\n=== symbol_tf_states ===")
-try:
-    rows = con.execute("SELECT * FROM symbol_tf_states").fetchall()
-    cols = [d[0] for d in con.description]
-    for r in rows:
-        print("  " + ", ".join(f"{c}={v}" for c, v in zip(cols, r)))
-except Exception as e:
-    print("  Fehler:", e)
-
-print("\n=== global_settings ===")
-try:
-    rows = con.execute("SELECT * FROM global_settings").fetchall()
-    for r in rows:
-        print("  ", r)
-except Exception as e:
-    print("  Fehler:", e)
-
-con.close()
-
-```
-
---------------------------------------------------
-
-### DATEI: test/check_broker_tz.py
-```py
-﻿# BEREIT FÜR PHASE 15
-# test/check_broker_tz.py
-"""Klaert die Zeitzonen-Frage empirisch:
-1) MT5-Tick-Zeit vs. Systemzeit -> Offset des Broker-Timestamps
-   - diff ~ 0     -> Broker-Timestamp ist echte UTC (Chart muesste +DST rechnen)
-   - diff ~ +7200 -> Broker-Timestamp kodiert BEREITS Berlin/CEST-Wanduhr
-2) Vergleicht MT5-M1-Roh-Epoch mit dem DB-Epoch (speichert die DB Rohwerte?)
-3) Prueft DuckDB-EXTRACT(epoch)-Verhalten.
-Ergebnis (31.07.2026, empirisch): diff = +7200s -> MT5 liefert Berlin-Wanduhr.
-sync_market_data() schreibt die Roh-Epochs via pd.to_datetime(unit='s', utc=True)
-1:1 in die DB; EXTRACT(EPOCH) liefert exakt diese Wanduhr-encoded Epochs.
-=> Der Chart muss diese Epochs DIREKT als Wanduhr formatieren (KEIN +2h).
-KEIN UI-Test."""
-import sys
-import time
-from datetime import datetime, timezone
-
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
-import MetaTrader5 as mt5
-import duckdb
-
-print("=== 1) Broker-Timestamp vs Systemzeit ===")
-if not mt5.initialize():
-    print(f"MT5 init fehlgeschlagen: {mt5.last_error()}")
-    sys.exit(1)
-
-tick = mt5.symbol_info_tick("SILVER")
-now = time.time()
-if tick is None:
-    print(f"Kein Tick fuer SILVER: {mt5.last_error()}")
-else:
-    diff = tick.time - int(now)
-    print(f"  tick.time    = {tick.time}  -> als UTC gedeutet: {datetime.fromtimestamp(tick.time, tz=timezone.utc)}")
-    print(f"  time.time()  = {int(now)} -> als UTC gedeutet: {datetime.fromtimestamp(now, tz=timezone.utc)}")
-    print(f"  Diff (tick.time - time.time()) = {diff} s")
-    if diff > 1000:
-        print(f"  >>> Broker-Timestamp ist {diff/3600:.1f}h VOR der echten UTC")
-        print(f"  >>> D.h. der Broker liefert BEREITS Berlin/CEST-Wanduhrzeit (Wanduhr-encoded)")
-    elif diff < -1000:
-        print(f"  >>> Broker-Timestamp ist {diff/3600:.1f}h HINTER der echten UTC")
-    else:
-        print(f"  >>> Broker-Timestamp ist die echte UTC (Diff ~ 0)")
-
-print("\n=== 2) Letzte MT5-M1-Roh-Bars (raw epoch) ===")
-rates = mt5.copy_rates_from_pos("SILVER", mt5.TIMEFRAME_M1, 0, 5)
-if rates is None or len(rates) == 0:
-    print("  Keine Rates:", mt5.last_error())
-else:
-    for r in rates[-5:]:
-        print(f"  MT5 raw time={r['time']}  -> als UTC gedeutet: {datetime.fromtimestamp(int(r['time']), tz=timezone.utc)}  close={r['close']}")
-
-print("\n=== 3) DB-Epoch der letzten SILVER M1 Bars ===")
-con = duckdb.connect("data/market_data.duckdb", read_only=True)
-rows = con.execute("""
-    SELECT "time", EXTRACT(EPOCH FROM "time")::BIGINT AS e, close
-    FROM ohlcv_bars
-    WHERE LOWER(symbol)='silver' AND LOWER(timeframe)='m1'
-    ORDER BY "time" DESC LIMIT 5
-""").fetchall()
-for t, e, c in rows:
-    print(f"  DB time={t}  epoch={e}  (als Wanduhr gedeutet: {datetime.fromtimestamp(int(e), tz=timezone.utc)})  close={c}")
-con.close()
-
-print("\n=== 4) DuckDB-EXTRACT-Verhalten mit explizitem TIMESTAMPTZ-Literal ===")
-con2 = duckdb.connect()
-r = con2.execute("SELECT EXTRACT(EPOCH FROM TIMESTAMPTZ '2026-07-31 13:32:00+02:00') AS e").fetchone()
-print(f"  EXTRACT(EPOCH FROM '2026-07-31 13:32:00+02:00') = {r[0]}")
-print(f"  (Instanz 13:32+02:00 = 11:32 UTC, dessen korrektes UTC-Epoch = 1785497520)")
-r2 = con2.execute("SELECT EXTRACT(EPOCH FROM TIMESTAMPTZ '2026-07-31 13:32:00') AS e").fetchone()
-print(f"  EXTRACT(EPOCH FROM '2026-07-31 13:32:00' [ohne Offset]) = {r2[0]}")
-con2.close()
-
-mt5.shutdown()
-print("\nFazit:")
-print("  - MT5 liefert Wanduhr-encoded Epochs (diff ~ +7200).")
-print("  - sync_market_data() schreibt sie via pd.to_datetime(unit='s', utc=True) 1:1.")
-print("  - fetch_historical_candles() liefert diese Wanduhr-Epochs an den Chart.")
-print("  - getBerlinParts/formatDT muessen DIREKT formatieren (KEIN +2h-Offset).")
-
-```
-
---------------------------------------------------
-
-### DATEI: test/check_chart_data.py
-```py
-﻿# BEREIT FÜR PHASE 15
-# test/check_chart_data.py
-"""Kurzer Check: Verifiziert die DB-Queries, die das Chart-Fenster nutzt, fuer alle Symbol/TF-Kombos."""
-import duckdb
-from pathlib import Path
-
-MARKET = Path(r"F:\Python\PyTrader\data\market_data.duckdb")
-ANALYTICS = Path(r"F:\Python\PyTrader\data\analytics.duckdb")
-
-con = duckdb.connect(str(MARKET), read_only=True)
-pairs = [
-    ("SILVER", "H1"), ("SILVER", "M5"), ("SILVER", "M15"), ("SILVER", "D1"), ("SILVER", "W1"), ("SILVER", "MN1"),
-    ("GOLD", "H1"), ("GOLD", "M5"), ("GOLD", "M15"), ("GOLD", "D1"), ("GOLD", "W1"), ("GOLD", "MN1"),
-]
-
-for sym, tf in pairs:
-    try:
-        rows = con.execute("""
-            SELECT EXTRACT(epoch FROM "time")::BIGINT AS time_epoch, open, high, low, close
-            FROM (SELECT "time", open, high, low, close FROM ohlcv_bars
-                  WHERE LOWER(symbol)=LOWER(?) AND LOWER(timeframe)=LOWER(?)
-                  AND "time" IS NOT NULL AND open IS NOT NULL AND high IS NOT NULL
-                  AND low IS NOT NULL AND close IS NOT NULL
-                  ORDER BY "time" DESC LIMIT 3000) ORDER BY "time" ASC""", [sym, tf]).fetchall()
-        ok = len(rows) > 0 and all(r[0] > 0 and r[1] > 0 and r[2] > 0 and r[3] > 0 and r[4] > 0 for r in rows)
-        print(f"{sym:7s} {tf:4s} -> {len(rows):>5d} candles  valid={ok}")
-    except Exception as e:
-        print(f"{sym:7s} {tf:4s} -> ERROR: {e}")
-
-# Marker-Query (feature_store, feature_id) – Phase 15: Alt-Signale
-# (grid_proximity_v1, ema_atr_set_v1) entfernt. Aktiv sind nur noch die
-# Plugin-IDs 'grid_lines' und 'proximity'.
-acon = duckdb.connect(str(ANALYTICS), read_only=True)
-print("\n--- feature_store queries (feature_id, Plugin-Daten) ---")
-for sym, tf, fid in [("SILVER", "H1", "proximity"), ("SILVER", "M5", "proximity"),
-                     ("GOLD", "H1", "proximity"), ("SILVER", "H1", "grid_lines")]:
-    try:
-        rows = acon.execute("""
-            SELECT EXTRACT(epoch FROM bar_time)::BIGINT AS time_epoch, feature_data
-            FROM (SELECT bar_time, feature_data FROM feature_store
-                  WHERE symbol = ? AND timeframe = ? AND feature_id = ?
-                    AND feature_data IS NOT NULL
-                  ORDER BY bar_time DESC LIMIT 500) ORDER BY bar_time ASC""", [sym, tf, fid]).fetchall()
-        print(f"{sym:7s} {tf:4s} {fid:20s} -> {len(rows)} markers")
-    except Exception as e:
-        print(f"{sym:7s} {tf:4s} {fid:20s} -> ERROR: {e}")
-
-```
-
---------------------------------------------------
-
-### DATEI: test/check_current_timestamp.py
-```py
-# test/check_current_timestamp.py
-"""Bugfix-Verifikation: DuckDB Binder Error
-   'Table "feature_store" does not have a column named "current_timestamp"'.
-
-Root-Cause: DuckDB 1.5.5 loest `current_timestamp` (lowercase Keyword) im
-ON CONFLICT DO UPDATE SET als SPALTENREFERENZ der Ziel-Tabelle auf.
-Fix: `now()` (Funktionsaufruf) im DO UPDATE SET von store_plugin_payload.
-"""
-import duckdb
-
-con = duckdb.connect(":memory:")
-con.execute("""
-    CREATE TABLE feature_store (
-        symbol      VARCHAR NOT NULL,
-        timeframe   VARCHAR NOT NULL,
-        bar_time    TIMESTAMPTZ NOT NULL,
-        ema_diff    DOUBLE,
-        rsi_14      DOUBLE,
-        atr_normalized DOUBLE,
-        created_at  TIMESTAMP DEFAULT current_timestamp,
-        feature_id  VARCHAR,
-        plugin_version VARCHAR,
-        feature_data JSON,
-        PRIMARY KEY (symbol, timeframe, bar_time)
-    );
-""")
-
-# store_plugin_payload-Pfad (feature_builder.py): GEFIXT mit now()
-sql = """
-    INSERT INTO feature_store (symbol, timeframe, bar_time, feature_id, plugin_version, feature_data)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT (symbol, timeframe, bar_time) DO UPDATE SET
-        feature_id = EXCLUDED.feature_id,
-        plugin_version = EXCLUDED.plugin_version,
-        feature_data = EXCLUDED.feature_data,
-        created_at = now()
-"""
-params = ["SILVER", "M1", "2026-01-01 00:00:00+00", "grid_lines", "1.0.0", "{}"]
-try:
-    con.execute(sql, params)
-    con.execute(sql, params)  # zweiter Lauf -> Conflict-Pfad (DO UPDATE)
-    row = con.execute(
-        "SELECT feature_id, created_at FROM feature_store").fetchone()
-    assert row is not None and row[0] == "grid_lines" and row[1] is not None, row
-    print("PASS: store_plugin_payload mit now() (Insert + Upsert)")
-except Exception as e:
-    print(f"FAIL: {e}")
-    raise
-
-# SELECT MAX(created_at) path used by service_selector_model
-try:
-    row = con.execute(
-        "SELECT MAX(created_at) FROM feature_store "
-        "WHERE symbol=? AND timeframe=? AND feature_id=?",
-        ["SILVER", "M1", "grid_lines"]).fetchone()
-    print(f"PASS: SELECT MAX(created_at) -> {row[0]}")
-except Exception as e:
-    print(f"FAIL: {e}")
-    raise
-
-```
-
---------------------------------------------------
-
-### DATEI: test/check_html_template.py
-```py
-﻿# BEREIT FÜR PHASE 15
-# test/check_html_template.py
-"""Verifiziert, dass das gebaute Chart-HTML-Template die JS-Fixes enthaelt."""
-import sys
-import os
-
-sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from chart.chart_basics import HTML_TEMPLATE
-
-checks = {
-    "Guard getBerlinParts": "day: '--'" in HTML_TEMPLATE,
-    "Kein Berlin-Offset (+2h)": "t + offset" not in HTML_TEMPLATE and "t + 7200" not in HTML_TEMPLATE,
-    "Kein _isBerlinDST mehr": "_isBerlinDST" not in HTML_TEMPLATE,
-    "Fix timeFormatter": "typeof t === 'object'" in HTML_TEMPLATE,
-    "createSeriesMarkers (v5)": "createSeriesMarkers" in HTML_TEMPLATE,
-    "Measurement-Modul (05_measurement)": "var Measurement = (function()" in HTML_TEMPLATE,
-    "Measurement-Region DIV": "id=\"measurement-region\"" in HTML_TEMPLATE,
-    "Measurement-Box DIV": "id=\"measurement-box\"" in HTML_TEMPLATE,
-    "Measurement-Restore in applyFullChartUpdate": "Measurement.restore(data.measurementState)" in HTML_TEMPLATE,
-}
-
-all_ok = True
-for name, ok in checks.items():
-    print(("OK  " if ok else "FAIL") + " " + name)
-    all_ok = all_ok and ok
-
-print("HTML-Template-Laenge:", len(HTML_TEMPLATE))
-sys.exit(0 if all_ok else 1)
-
-```
-
---------------------------------------------------
-
-### DATEI: test/check_m1_consistency.py
-```py
-﻿# BEREIT FÜR PHASE 15
-# test/check_m1_consistency.py
-"""Prueft die SILVER M1-Daten auf Konsistenz: Luecken, Handelspause,
-Tagesgrenzen, ungueltige Candles. Kein UI-Test - nur DB-Logik.
-HINWEIS Handelspause: SILVER (XAG) handelt 24/5. Die einzige taegliche Pause
-ist Berlin-Wanduhr 23:00-23:59. Die DB-Roh-Epochs sind Wanduhr-encoded
-(MT5 liefert Wanduhr-Zeiten, sync_market_data schreibt sie via
-pd.to_datetime(unit='s', utc=True) 1:1) - deshalb liefert
-t.astimezone(timezone.utc) exakt diese Wanduhrzeit. Zusaetzlich
-Wochenend-Luecken (Fr 23:00 Wanduhr -> So/Mo 00:00 Wanduhr)."""
-import sys
-import os
-from datetime import datetime, timezone
-
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
-import duckdb
-
-DB = r"F:\Python\PyTrader\data\market_data.duckdb"
-SYMBOL = "SILVER"
-TF = "M1"
-
-con = duckdb.connect(DB, read_only=True)
-
-# 1) Zeitbereich letzte Tage
-print("=== Zeitbereich SILVER M1 (letzte 5 Tage) ===")
-rows = con.execute("""
-    SELECT EXTRACT(epoch FROM "time")::BIGINT AS e, "time" AS t, open, high, low, close
-    FROM ohlcv_bars
-    WHERE LOWER(symbol)=LOWER(?) AND LOWER(timeframe)=LOWER(?)
-    ORDER BY "time" DESC
-    LIMIT 5
-""", [SYMBOL, TF]).fetchall()
-for r in rows:
-    print(f"  {r[1]}  O={r[2]} H={r[3]} L={r[4]} C={r[5]}")
-
-# 2) Alle Bars ab 29.07. laden und Luecken pruefen
-print("\n=== Luecken-Analyse ab 2026-07-29 (Handelspause Wanduhr 23:00-23:59 erlaubt) ===")
-rows = con.execute("""
-    SELECT EXTRACT(epoch FROM "time")::BIGINT AS e, "time" AS t, open, high, low, close
-    FROM ohlcv_bars
-    WHERE LOWER(symbol)=LOWER(?) AND LOWER(timeframe)=LOWER(?)
-      AND "time" >= '2026-07-29 00:00:00+02:00'
-      AND "time" IS NOT NULL
-      AND open IS NOT NULL AND high IS NOT NULL AND low IS NOT NULL AND close IS NOT NULL
-    ORDER BY "time" ASC
-""", [SYMBOL, TF]).fetchall()
-
-print(f"Anzahl Bars: {len(rows)}")
-if rows:
-    print(f"Erste Bar: {rows[0][1]}")
-    print(f"Letzte Bar: {rows[-1][1]}")
-
-# Luecken finden (Differenz > 60s), Handelspause ignorieren
-gaps = []
-for i in range(1, len(rows)):
-    prev_e, prev_t = rows[i-1][0], rows[i-1][1]
-    curr_e, curr_t = rows[i][0], rows[i][1]
-    diff = curr_e - prev_e
-    if diff > 60:
-        # Pruefen ob die Luecke die Handelspause 23:00-23:59 abdeckt
-        prev_dt = prev_t.astimezone(timezone.utc)
-        curr_dt = curr_t.astimezone(timezone.utc)
-        gaps.append((prev_t, curr_t, diff, prev_dt, curr_dt))
-
-print(f"\nLuecken > 60s: {len(gaps)}")
-for prev_t, curr_t, diff, prev_dt, curr_dt in gaps[:40]:
-    # Handelspause-Erkennung: letzte Bar 22:xx Wanduhr, naechste 00:xx Wanduhr
-    # (Pause = Wanduhr 23:00-23:59; astimezone(utc) == Wanduhrzeit der DB-Epochs)
-    prev_hour = prev_dt.hour
-    curr_hour = curr_dt.hour
-    pause = (prev_hour >= 22 and curr_hour < 1)
-    print(f"  {prev_t} -> {curr_t}  diff={diff}s  (Wanduhr {prev_dt.hour}:{prev_dt.minute:02d} -> {curr_dt.hour}:{curr_dt.minute:02d}) {'[PAUSE]' if pause else '[!!! LUEKE]'}")
-
-# 3) Handelspausen genauer: pro Tag fehlt die Wanduhr-Stunde 23 (23:00-23:59).
-#    WICHTIG: Die Pause liegt bei Wanduhr 23:00-23:59 (keine Berlin-Offset-
-#    Umrechnung noetig - die DB-Epochs sind bereits Wanduhr-encoded).
-print("\n=== Handelspausen (Wanduhr 23:00-23:59) in den letzten Tagen ===")
-pause_rows = con.execute("""
-    SELECT "time", open, high, low, close
-    FROM ohlcv_bars
-    WHERE LOWER(symbol)=LOWER(?) AND LOWER(timeframe)=LOWER(?)
-      AND "time" >= '2026-07-28 00:00:00+02:00'
-      AND "time" <= '2026-07-31 23:59:59+02:00'
-    ORDER BY "time" ASC
-""", [SYMBOL, TF]).fetchall()
-
-from collections import defaultdict
-by_day = defaultdict(list)
-for t, o, h, l, c in pause_rows:
-    wall = t.astimezone(timezone.utc)  # == Wanduhrzeit der DB-Epochs
-    by_day[wall.date()].append((wall, o, h, l, c))
-
-for day in sorted(by_day.keys()):
-    bars = by_day[day]
-    first, last = bars[0][0], bars[-1][0]
-    # Bars mit Wanduhr-Stunde 23 (die Pausen-Stunde) - sollten 0 sein
-    in_pause = [b for b in bars if b[0].hour == 23]
-    # Letzte Bar vor der Pause (Wanduhr <= 22:59) und erste danach (00:xx)
-    last_before = None
-    first_after = None
-    for b in bars:
-        if b[0].hour == 22 and b[0].minute >= 55:
-            last_before = b
-        if b[0].hour == 0 and b[0].minute < 5:
-            first_after = b
-    print(f"  {day} (Wanduhr): erste={first.strftime('%H:%M')} letzte={last.strftime('%H:%M')} "
-          f"bars_in_Wanduhr23={len(in_pause)} "
-          f"letzte_vorPause={last_before[0].strftime('%H:%M') if last_before else '?'} "
-          f"erste_nachPause={first_after[0].strftime('%H:%M') if first_after else '?'}")
-
-# 4) Ungueltige Candles (open<=0, high<low, close ausserhalb, NaN)
-print("\n=== Ungueltige Candles (ab 29.07.) ===")
-invalid = con.execute("""
-    SELECT COUNT(*)
-    FROM ohlcv_bars
-    WHERE LOWER(symbol)=LOWER(?) AND LOWER(timeframe)=LOWER(?)
-      AND "time" >= '2026-07-29 00:00:00+02:00'
-      AND (open IS NULL OR high IS NULL OR low IS NULL OR close IS NULL
-           OR open <= 0 OR high <= 0 OR low <= 0 OR close <= 0
-           OR high < low OR close < low OR close > high)
-""", [SYMBOL, TF]).fetchone()[0]
-print(f"  Ungueltige Candles: {invalid}")
-
-# 5) Duplikate pruefen
-print("\n=== Duplikate (PRIMARY KEY verhindert, trotzdem pruefen) ===")
-dups = con.execute("""
-    SELECT COUNT(*) FROM (
-        SELECT symbol, timeframe, "time", COUNT(*) c
-        FROM ohlcv_bars
-        WHERE LOWER(symbol)=LOWER(?) AND LOWER(timeframe)=LOWER(?)
-        GROUP BY symbol, timeframe, "time"
-        HAVING COUNT(*) > 1
-    )
-""", [SYMBOL, TF]).fetchone()[0]
-print(f"  Duplikate: {dups}")
-
-con.close()
-
-```
-
---------------------------------------------------
-
-### DATEI: test/check_m1_midnight.py
-```py
-﻿# BEREIT FÜR PHASE 15
-# test/check_m1_midnight.py
-"""Prueft direkt, welche SILVER M1-Bars in der DB um Mitternacht 30.07->31.07 liegen.
-Die DB-Roh-Epochs (EXTRACT) sind Berlin-Wanduhr-encoded - datetime.fromtimestamp(e, tz=utc)
-liefert daher direkt die Wanduhrzeit (keine +2h-Umrechnung noetig).
-KEIN UI-Test."""
-import sys
-from datetime import datetime, timezone
-
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
-import duckdb
-
-con = duckdb.connect("data/market_data.duckdb", read_only=True)
-rows = con.execute("""
-    SELECT "time", open, high, low, close, EXTRACT(epoch FROM "time")::BIGINT AS e
-    FROM ohlcv_bars
-    WHERE LOWER(symbol)='silver' AND LOWER(timeframe)='m1'
-      AND "time" >= '2026-07-30 20:30:00+00:00'
-      AND "time" <= '2026-07-31 02:30:00+00:00'
-    ORDER BY "time" ASC
-""").fetchall()
-print(f"Bars gefunden: {len(rows)}")
-for t, o, h, l, c, e in rows:
-    wall = datetime.fromtimestamp(int(e), tz=timezone.utc)
-    print(f"  e={e}  Wanduhr={wall.strftime('%d.%m %H:%M')}  raw={t}  O={o} H={h} L={l} C={c}")
-
-# Jetzt ohne OHLC-Filter: gibt es Bars mit NULL/0 in dem Bereich?
-print("\nOhne OHLC-Filter:")
-rows2 = con.execute("""
-    SELECT "time", open, high, low, close, EXTRACT(epoch FROM "time")::BIGINT AS e
-    FROM ohlcv_bars
-    WHERE LOWER(symbol)='silver' AND LOWER(timeframe)='m1'
-      AND "time" >= '2026-07-30 20:30:00+00:00'
-      AND "time" <= '2026-07-31 02:30:00+00:00'
-    ORDER BY "time" ASC
-""").fetchall()
-print(f"Bars gefunden: {len(rows2)}")
-for t, o, h, l, c, e in rows2:
-    wall = datetime.fromtimestamp(int(e), tz=timezone.utc)
-    print(f"  e={e}  Wanduhr={wall.strftime('%d.%m %H:%M')}  raw={t}  O={o} H={h} L={l} C={c}")
-con.close()
-
-```
-
---------------------------------------------------
-
-### DATEI: test/check_mt5_m1_boundary.py
-```py
-﻿# BEREIT FÜR PHASE 15
-# test/check_mt5_m1_boundary.py
-"""Holt SILVER M1-Daten direkt von MT5 (Ground Truth) und analysiert die
-Tagesgrenzen der letzten Tage.
-WICHTIG: MT5 liefert Zeiten als BERLIN-WANDUHR-encoded Epochs (empirisch
-verifiziert: tick.time liegt bei echter UTC 10:00 bereits bei der Zahl "12:00").
-datetime.fromtimestamp(e, tz=utc) liefert daher direkt die Wanduhrzeit -
-eine zusaetzliche +2h-Umrechnung waere doppelt.
-KEIN UI-Test - nur Datenabruf + Logik."""
-import sys
-from datetime import datetime, timezone
-
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
-import MetaTrader5 as mt5
-
-print("Initialisiere MT5...")
-if not mt5.initialize():
-    print(f"MT5 initialize fehlgeschlagen: {mt5.last_error()}")
-    sys.exit(1)
-
-info = mt5.account_info()
-if info:
-    print(f"Konto: {info.company} | Server: {info.server} | Login: {info.login}")
-else:
-    print("Kein Konto (oder Fehler):", mt5.last_error())
-
-SYMBOL = "SILVER"
-N_BARS = 20000
-
-print(f"\n=== SILVER M1: letzte {N_BARS} Bars von MT5 ===")
-rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M1, 0, N_BARS)
-if rates is None:
-    print(f"copy_rates_from_pos Fehler: {mt5.last_error()}")
-    mt5.shutdown()
-    sys.exit(1)
-
-print(f"Bars erhalten: {len(rates)}")
-
-# rates ist numpy-Struktur. Felder: time, open, high, low, close, tick_volume, spread, real_volume
-import numpy as np
-
-t = rates["time"]  # Roh-Epoch (bereits Berlin-Wanduhr-encoded)
-o = rates["open"]
-h = rates["high"]
-l = rates["low"]
-c = rates["close"]
-
-def fmt_epoch(epoch):
-    wall = datetime.fromtimestamp(int(epoch), tz=timezone.utc)  # == Wanduhrzeit
-    return f"{wall.strftime('%d.%m.%y %H:%M')} (Wanduhr)"
-
-print(f"\n=== Erste/Letzte Bar ===")
-print(f"  Erste: {fmt_epoch(t[0])}")
-print(f"  Letzte: {fmt_epoch(t[-1])}")
-
-# Tagesgrenzen finden: Wanduhr-Tag wechselt
-print(f"\n=== Tagesgrenzen (Wanduhr) in den letzten Tagen ===")
-prev_day = None
-for i in range(len(t)):
-    wall = datetime.fromtimestamp(int(t[i]), tz=timezone.utc)
-    day = wall.date()
-    if prev_day is not None and day != prev_day:
-        # i ist die erste Bar des neuen Tages
-        j = i - 1
-        while j >= 0:
-            prev_wall = datetime.fromtimestamp(int(t[j]), tz=timezone.utc)
-            if prev_wall.date() == prev_day:
-                break
-            j -= 1
-        # letzten 3 Bars des Vortags und erste 3 Bars des neuen Tags
-        print(f"\n--- Grenze {prev_day} -> {day} ---")
-        for k in range(max(0, j - 2), min(len(t), j + 4)):
-            label = "VORTAG " if k <= j else "NEU-TAG"
-            print(f"  [{label}] idx={k} {fmt_epoch(t[k])}  O={o[k]:.3f} H={h[k]:.3f} L={l[k]:.3f} C={c[k]:.3f}")
-    prev_day = day
-
-# Luecken-Analyse (Differenz > 60s), letzte 3000 Bars
-print(f"\n=== Luecken > 60s (letzte 3000 Bars) ===")
-start_idx = max(0, len(t) - 3000)
-gaps = []
-for i in range(start_idx + 1, len(t)):
-    diff = int(t[i]) - int(t[i - 1])
-    if diff > 60:
-        prev_w = datetime.fromtimestamp(int(t[i - 1]), tz=timezone.utc)
-        curr_w = datetime.fromtimestamp(int(t[i]), tz=timezone.utc)
-        # Handelspause: letzte Bar 22:xx Wanduhr, naechste 00:xx Wanduhr
-        # (Pause = Wanduhr 23:00-23:59), diff = 3720s
-        is_pause = (prev_w.hour >= 22 and curr_w.hour <= 0 and curr_w.minute < 10) or diff > 3600
-        gaps.append((prev_w, curr_w, diff, is_pause))
-
-for prev_w, curr_w, diff, is_pause in gaps:
-    tag = "[PAUSE 23-24]" if is_pause else "[!!! LUEKE]"
-    print(f"  {prev_w.strftime('%d.%m %H:%M')} -> {curr_w.strftime('%d.%m %H:%M')}  diff={diff}s {tag}")
-
-print(f"\nLuecken gesamt: {len(gaps)}")
-
-# Bars in der Zeit 23:00-23:59 Wanduhr (innerhalb der Pause) - sollten 0 sein
-print(f"\n=== Bars zwischen Wanduhr 23:00-23:59 (innerhalb Pause?) ===")
-in_pause = 0
-for i in range(len(t)):
-    wall = datetime.fromtimestamp(int(t[i]), tz=timezone.utc)
-    if wall.hour == 23 and t[i] >= t[-3000] if len(t) >= 3000 else True:
-        in_pause += 1
-print(f"  Bars mit Wanduhr-Stunde 23: {in_pause} (in letzten {min(3000, len(t))} Bars)")
-
-mt5.shutdown()
-print("\nFertig.")
-
-```
-
---------------------------------------------------
-
-### DATEI: test/check_p15_s2_service_tree.py
-```py
-# test/check_p15_s2_service_tree.py
-"""
-Phase 15 15.02 – Headless Validierung (KEINE UI, KEIN QApplication.exec()).
-
-Prueft den generischen ServiceSelector (ServiceSelectorModel +
-ServiceSelectorWidget + MasterTree) rein auf Logik-/Widget-Ebene:
-
-A) ServiceSelectorModel – Grunddaten:
-   - get_sets() leer bei frischer DB.
-   - get_plugins() liefert die PluginRegistry (grid_lines, ...).
-   - is_chart_indicator()/get_indicator_display_name().
-   - Badges: '📌 im Ind_FixedGridProximity | ⚪ inaktiv in Ind_FixedGridProximity'
-     fuer Chart-Indikatoren (Indikator-Name, KEIN Service-Name).
-
-B) ServiceSelectorModel – Set-Aufbau & Hierarchie:
-   - Nach save_set() liefert build_tree() die Gruppen
-     📁 Service-Sets / ⚡ Standalone Services / 📦 Alle verfuegbaren Plugins.
-   - Set-Knoten enthalten ihre Service-Instanzen (instance_id, plugin_id, badge).
-   - Standalone enthaelt NICHT die im Set verwendeten Plugins.
-
-C) ServiceSelectorModel – Live-Status "Aktiv im Chart" (StateManager):
-   - indicators_state['grid_lines'].active=True -> is_active_in_chart True.
-   - Badge wechselt auf '🟢 aktiv in Ind_FixedGridProximity'.
-
-D) EventBus-Reaktivitaet:
-   - service_set_changed.emit() -> data_changed feuert + Modell refresht.
-
-E) ServiceSelectorWidget (Modus SELECT_ONLY):
-   - Set-/Service-Combos werden aus dem Modell befuellt.
-   - selection_changed(set_id, service_id) wird bei Auswahl emittiert.
-
-F) ServiceSelectorWidget (Modus FULL_EDIT / MasterTree):
-   - master_tree vorhanden (ohne Toolbar, volle Hoehe); 3 Top-Level-Gruppen (📁/⚡/📦).
-   - Service-/Set-/Plugin-Zeilen tragen den Info-Button (QPushButton "ℹ",
-     Icon-Breite) in Spalte 1; Tooltip + gelbe Faerbung bei Indikator-
-     Zugehoerigkeit; info_requested-Signal bei Klick.
-   - current_selection()/current_set_id() liefern die markierte Auswahl.
-
-H) Info-Dialog: ServiceDescriptionDialog.from_set()/from_plugin() rendern
-   die header_line (erste Zeile) + Beschreibungstext (headless pruefbar).
-
-G) Set-Updates & Umsortieren:
-   - execution_order-Aenderung erscheint nach refresh() in der Hierarchie.
-
-Test-DB liegt im Unterordner test/ (Regel: keine Test-DBs im Root/data).
-"""
-import os
-import sys
-
-sys.path.insert(0, r"F:\Python\PyTrader")
-
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-
-TEST_DIR = os.path.dirname(os.path.abspath(__file__))
-TEST_DB = os.path.join(TEST_DIR, "p15_s2_service_tree_test.duckdb")
-if os.path.exists(TEST_DB):
-    os.remove(TEST_DB)
-
-from PySide6.QtWidgets import QApplication  # noqa: E402
-from PySide6.QtWidgets import QHeaderView  # noqa: E402
-from PySide6.QtWidgets import QPushButton  # noqa: E402
-from PySide6.QtWidgets import QTextBrowser  # noqa: E402
-
-_app = QApplication.instance() or QApplication(sys.argv)
-
-from analytics.engine.service_set_repository import ServiceSetRepository  # noqa: E402
-from state_manager import StateManager  # noqa: E402
-from analytics.features.feature_builder import PluginRegistry  # noqa: E402
-from analytics.engine.service_selector_model import ServiceSelectorModel  # noqa: E402
-from serviceui.service_selector_widget import ServiceSelectorWidget  # noqa: E402
-from serviceui.master_tree import (  # noqa: E402
-    BADGE_COLUMN_WIDTH, BADGE_TRUNCATE_ICON, INFO_BUTTON_TEXT,
-    INFO_BUTTON_WIDTH, INFO_BUTTON_SIZE,
-    INFO_BUTTON_COLOR_INDICATOR, INFO_BUTTON_COLOR_NEUTRAL, ROLE_PLUGIN_ID,
-)
-from config.event_bus import event_bus  # noqa: E402
-
-FAILURES: list = []
-
-
-def check(name: str, cond: bool, detail: str = "") -> None:
-    status = "PASS" if cond else "FAIL"
-    print(f"[{status}] {name}" + (f" - {detail}" if detail and not cond else ""))
-    if not cond:
-        FAILURES.append(name)
-
-
-# ---------------------------------------------------------------------------
-# Test-Infrastruktur (frische Test-DB, injizierte Repos)
-# ---------------------------------------------------------------------------
-set_repo = ServiceSetRepository(db_path=TEST_DB)
-state_mgr = StateManager(db_path=TEST_DB)
-registry = PluginRegistry()
-
-# 05.08.2026 (Ausfuehrungsdatum): Eigene Test-Feature-Store-DB unter test/
-# (Konvention: alle Test-DBs unter test/). Eine proximity-Row mit aktuellem
-# created_at simuliert die letzte Ausfuehrung -> 'DD.MM.JJ' im MasterTree.
-TEST_FS_DB = os.path.join(TEST_DIR, "p15_s2_execdate_test.duckdb")
-if os.path.exists(TEST_FS_DB):
-    os.remove(TEST_FS_DB)
-import duckdb as _duckdb  # noqa: E402
-_fs_con = _duckdb.connect(TEST_FS_DB)
-_fs_con.execute("""
-    CREATE TABLE feature_store (
-        symbol VARCHAR, timeframe VARCHAR, bar_time TIMESTAMPTZ,
-        ema_diff DOUBLE, rsi_14 DOUBLE, atr_normalized DOUBLE,
-        created_at TIMESTAMP DEFAULT current_timestamp,
-        feature_id VARCHAR, plugin_version VARCHAR, feature_data JSON
-    )
-""")
-_fs_con.execute("""
-    INSERT INTO feature_store (symbol, timeframe, bar_time, feature_id,
-                               plugin_version, feature_data)
-    VALUES ('SILVER', 'M1', current_timestamp, 'proximity', '1.0.0',
-            '{"schema_version":"1.0.0"}')
-""")
-_fs_con.close()
-from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
-fs_reader = FeatureStoreReader(db_path=TEST_FS_DB)
-
-model = ServiceSelectorModel(set_repo=set_repo, state_manager=state_mgr,
-                             registry=registry, feature_store_reader=fs_reader)
-
-plugins = model.get_plugins()
-print(f"   Plugins: {sorted(plugins.keys())}")
-
-# ---------------------------------------------------------------------------
-# A) Grunddaten
-# ---------------------------------------------------------------------------
-check("A1) get_sets() leer bei frischer DB", model.get_sets() == [])
-check("A2) get_plugins() liefert PluginRegistry",
-      isinstance(plugins, dict) and len(plugins) > 0)
-# Phase 16 (06.08.2026): Alt-Plugin 'grid_liquidity' ist entfernt (Rename zu
-# 'ind_fixed_grid_proximity'); grid_lines ist der Chart-faehige Grid-Service
-# und referenziert den Indikator-Namen.
-check("A3) grid_lines ist Chart-Indikator",
-      model.is_chart_indicator("grid_lines"))
-ind_name = model.get_indicator_display_name("grid_lines")
-check("A4) Indikator-Name = Ind_FixedGridProximity",
-      ind_name == "Ind_FixedGridProximity", ind_name)
-
-badge_inactive = model.badge_for("grid_lines")
-check("A5) Badge inaktiv: 'im' + 'inaktiv in' mit Indikator-Namen",
-      badge_inactive == "📌 im Ind_FixedGridProximity | ⚪ inaktiv in Ind_FixedGridProximity",
-      badge_inactive)
-check("A5b) Kein Service-Name ('Grid Lines'/'Proximity') im Badge",
-      "Grid Lines" not in badge_inactive
-      and "im Proximity" not in badge_inactive
-      and "in Proximity" not in badge_inactive,
-      badge_inactive)
-check("A6) is_active_in_chart False ohne Chart-State",
-      model.is_active_in_chart("grid_lines") is False)
-
-# ---------------------------------------------------------------------------
-# B) Set-Aufbau & Hierarchie
-# ---------------------------------------------------------------------------
-set_id = set_repo.save_set({
-    "display_name": "Grid-Basis",
-    "execution_order": ["grid_1", "prox_1"],
-    "services": {
-        "grid_1": {"plugin_id": "grid_lines", "lookback": 1000,
-                   "params": {"step_size": 0.5}},
-        "prox_1": {"plugin_id": "proximity", "lookback": 500,
-                   "params": {"prox_level1": 1.0}},
-    },
-})
-model.refresh()
-
-check("B1) Set nach save_set() im Modell", len(model.get_sets()) == 1)
-
-tree = model.build_tree()
-group_labels = [g["label"] for g in tree]
-check("B2) 3 Gruppen (📁/⚡/📦)",
-      any("📁" in l for l in group_labels)
-      and any("⚡" in l for l in group_labels)
-      and any("📦" in l for l in group_labels), str(group_labels))
-
-set_nodes = tree[0]["children"]
-check("B3) Set-Knoten vorhanden", len(set_nodes) == 1)
-svcs = set_nodes[0]["services"]
-svc_ids = [s["instance_id"] for s in svcs]
-check("B4) Set enthaelt beide Services",
-      svc_ids == ["grid_1", "prox_1"], str(svc_ids))
-check("B5) Service-Badge gesetzt",
-      all(s["badge"] for s in svcs), str([s["badge"] for s in svcs]))
-
-standalone_ids = [s["plugin_id"] for s in tree[1]["children"]]
-check("B6) verwendete Plugins NICHT in Standalone",
-      "grid_lines" not in standalone_ids
-      and "proximity" not in standalone_ids, str(standalone_ids))
-
-plugin_ids = [p["plugin_id"] for p in tree[2]["children"]]
-check("B7) Alle Plugins in 📦-Gruppe",
-      "grid_lines" in plugin_ids and "proximity" in plugin_ids,
-      str(plugin_ids))
-
-# ---------------------------------------------------------------------------
-# C) Live-Status "Aktiv im Chart" (StateManager)
-# ---------------------------------------------------------------------------
-state_mgr.save_window_geometry("win_1", 0, 0, 800, 600, False)
-state_mgr.save_instance_state(
-    "win_1", "SILVER", "H1",
-    indicators_state={"grid_lines": {"active": True}},
-)
-model.refresh()
-
-check("C1) grid_lines ist aktiv im Chart",
-      model.is_active_in_chart("grid_lines"))
-badge_active = model.badge_for("grid_lines")
-check("C2) Badge aktiv: 'aktiv in' mit Indikator-Namen",
-      badge_active == "📌 im Ind_FixedGridProximity | 🟢 aktiv in Ind_FixedGridProximity",
-      badge_active)
-check("C3) proximity bleibt inaktiv",
-      not model.is_active_in_chart("proximity"))
-# Beide Grid-Services referenzieren denselben Indikator-Namen im Badge.
-for pid in ("grid_lines", "proximity"):
-    b = model.badge_for(pid)
-    check(f"C4) Badge fuer '{pid}' referenziert Ind_FixedGridProximity",
-          "in Ind_FixedGridProximity" in b and "Grid Lines" not in b
-          and "im Proximity" not in b and "in Proximity" not in b, b)
-
-# Bugfix 05.08.2026: Aktiv-Pruefung ueber die indicator_id des ZUGEHOERIGEN
-# Indikators. Realer App-Zustand: indicators_state-Key ist die indicator_id
-# ('ind_fixed_grid_proximity'), NICHT die Plugin-ID ('grid_lines'/'proximity'). Davor
-# griff die Tooltip-Variante a) ('aktiv <Indikator>') fuer Services nie.
-state_mgr.save_window_geometry("win_2", 0, 0, 800, 600, False)
-state_mgr.save_instance_state(
-    "win_2", "SILVER", "H1",
-    indicators_state={"ind_fixed_grid_proximity": {"active": True}},
-)
-model.refresh()
-check("C5) grid_lines aktiv via Indikator-ID (ind_fixed_grid_proximity)",
-      model.is_active_in_chart("grid_lines"))
-check("C6) proximity aktiv via Indikator-ID (ind_fixed_grid_proximity)",
-      model.is_active_in_chart("proximity"))
-check("C7) belongs_to_indicator fuer grid_lines/proximity",
-      model.belongs_to_indicator("grid_lines")
-      and model.belongs_to_indicator("proximity"))
-set_def = model.get_sets()[0]
-check("C8) Set-Indikator-Namen = [Ind_FixedGridProximity]",
-      model.get_set_indicator_names(set_def) == ["Ind_FixedGridProximity"],
-      str(model.get_set_indicator_names(set_def)))
-check("C9) Set aktiv (zugehoeriger Indikator aktiv)",
-      model.is_set_active(set_def))
-
-# ---------------------------------------------------------------------------
-# D) EventBus-Reaktivitaet
-# ---------------------------------------------------------------------------
-data_calls = []
-model.data_changed.connect(lambda: data_calls.append(1))
-event_bus.service_set_changed.emit()
-check("D1) data_changed feuert bei service_set_changed",
-      len(data_calls) >= 1, str(data_calls))
-check("D2) Modell nach EventBus-Refresh aktuell",
-      len(model.get_sets()) == 1 and model.is_active_in_chart("grid_lines"))
-
-# ---------------------------------------------------------------------------
-# E) ServiceSelectorWidget – Modus SELECT_ONLY
-# ---------------------------------------------------------------------------
-sel = ServiceSelectorWidget(mode=ServiceSelectorWidget.MODE_SELECT_ONLY,
-                            model=model)
-emitted = []
-sel.selection_changed.connect(lambda sid, svc: emitted.append((sid, svc)))
-
-check("E1) Set-Combo befuellt", sel.combo_set.count() == 2, str(sel.combo_set.count()))
-idx = sel.combo_set.findData(set_id)
-check("E2) Set auswaehlbar", idx >= 0)
-if idx >= 0:
-    sel.combo_set.setCurrentIndex(idx)
-check("E3) Service-Combo befuellt", sel.combo_service.count() == 3,
-      str(sel.combo_service.count()))  # Platzhalter + grid_1 + prox_1
-if sel.combo_service.count() > 1:
-    sel.combo_service.setCurrentIndex(1)
-check("E4) selection_changed emittiert (set_id, service_id)",
-      emitted and emitted[-1][0] == set_id and emitted[-1][1] == "grid_1",
-      str(emitted))
-check("E5) current_set_id/current_service_id",
-      sel.current_set_id() == set_id and sel.current_service_id() == "grid_1",
-      f"{sel.current_set_id()}/{sel.current_service_id()}")
-
-# ---------------------------------------------------------------------------
-# F) ServiceSelectorWidget – Modus FULL_EDIT (MasterTree)
-# ---------------------------------------------------------------------------
-# Test-Plugin OHNE Indikator-Zugehoerigkeit injizieren – damit gibt es eine
-# Zeile mit neutralem (nicht gelbem) Info-Button und leerem Tooltip.
-class _PlainPlugin:
-    plugin_id = "_test_plain"
-    version = "1.0.0"
-    capabilities: dict = {}
-    metadata = {"display_name": "Plain", "description": "Plain-Test-Plugin"}
-
-
-registry.plugins["_test_plain"] = _PlainPlugin()
-model.refresh()
-
-full = ServiceSelectorWidget(mode=ServiceSelectorWidget.MODE_FULL_EDIT,
-                             model=model)
-check("F1) MasterTree vorhanden", full.master_tree is not None)
-# 05.08.2026: CRUD-/Order-Buttons oberhalb des Baums entfernt – der
-# MasterTree hat die volle vertikale Hoehe (alle Aktionen via Kontextmenue).
-# Der ServiceToolbar wurde am 05.08.2026 vollstaendig entfernt (archiviert
-# unter .backup_service_toolbar/); auch das toolbar-Attribut existiert nicht
-# mehr.
-check("F2) Keine Toolbar mehr (volle Baum-Hoehe)",
-      not hasattr(full, "toolbar"))
-mt = full.master_tree
-check("F3) 3 Top-Level-Gruppen", mt.topLevelItemCount() == 3,
-      str(mt.topLevelItemCount()))
-
-set_group = mt.topLevelItem(0)
-check("F4) Set-Gruppe hat Set-Knoten mit Services",
-      set_group.childCount() == 1 and set_group.child(0).childCount() == 2,
-      f"sets={set_group.childCount()} svcs={set_group.child(0).childCount()}")
-
-# Bugfix 05.08.2026 (Info-Button statt Text-Badge): JEDE Service-/Set-/
-# Plugin-Zeile traegt in Spalte 1 einen echten Info-Button (QPushButton "ℹ",
-# Icon-Breite) statt des Badge-Textes / gekuerzten 'i'-Zeichens.
-def _info_button(tree, item):
-    """Liefert den Item-Widget-Button von Spalte 1 (oder None)."""
-    if tree is None or item is None:
-        return None
-    return tree.itemWidget(item, 1)
-
-
-svc_item = set_group.child(0).child(0)
-btn_svc = _info_button(mt, svc_item)
-check("F5) Info-Button in Spalte 1 (statt Text-Badge)",
-      isinstance(btn_svc, QPushButton) and svc_item.text(1) == "",
-      f"btn={type(btn_svc).__name__} text={svc_item.text(1)!r}")
-check("F5a) Button nur Icon (ℹ) + Icon-Breite",
-      isinstance(btn_svc, QPushButton)
-      and btn_svc.text() == INFO_BUTTON_TEXT
-      and btn_svc.width() <= INFO_BUTTON_SIZE + 4,
-      f"text={btn_svc.text()!r} w={btn_svc.width()}")
-check("F5b) Tooltip der Status-Spalte: 'aktiv/im <Indikator>'",
-      isinstance(btn_svc, QPushButton)
-      and btn_svc.toolTip() in ("aktiv Ind_FixedGridProximity",
-                                "im Ind_FixedGridProximity")
-      and svc_item.toolTip(1) == btn_svc.toolTip(),
-      (btn_svc.toolTip() if isinstance(btn_svc, QPushButton) else "kein Button"))
-
-# Bugfix 05.08.2026 (Punkt 2): Auch Service-Sets, die einem Indikator
-# gehoeren, tragen den Info-Button in Spalte 1 mit derselben Tooltip-
-# Namenslogik wie die Services ('aktiv/im <Indikator>').
-set_item = set_group.child(0)
-btn_set = _info_button(mt, set_item)
-check("F5k) Set-Knoten (Indikator-Zugehoerigkeit) traegt Info-Button",
-      isinstance(btn_set, QPushButton) and set_item.text(1) == "",
-      f"btn={type(btn_set).__name__} text={set_item.text(1)!r}")
-check("F5l) Set-Button-Tooltip folgt Namenslogik 'aktiv/im <Indikator>'",
-      isinstance(btn_set, QPushButton)
-      and btn_set.toolTip() in ("aktiv Ind_FixedGridProximity",
-                                "im Ind_FixedGridProximity"),
-      (btn_set.toolTip() if isinstance(btn_set, QPushButton) else "kein Button"))
-
-# Bugfix 05.08.2026 (Punkt 1-4): Button auf ALLEN Zeilen, nur Icon-Breite,
-# Spalte 1 ganz rechts verkleinert, gelbe Faerbung bei Indikator-Relation.
-def _collect_rows(tree):
-    rows = []
-    for g in range(tree.topLevelItemCount()):
-        grp = tree.topLevelItem(g)
-        if grp is None:
-            continue
-        for i in range(grp.childCount()):
-            child = grp.child(i)
-            if child is None:
-                continue
-            rows.append(child)  # Set- oder Plugin-Zeile
-            for j in range(child.childCount()):
-                s = child.child(j)
-                if s is not None:
-                    rows.append(s)  # Service-Zeile
-    return rows
-
-
-_all_btns = [(r, mt.itemWidget(r, 1)) for r in _collect_rows(mt)]
-check("F5m) JEDE Service-/Set-/Plugin-Zeile hat einen Info-Button",
-      all(isinstance(b, QPushButton) for _, b in _all_btns),
-      str([(r.text(0), type(b).__name__ if b else None)
-           for r, b in _all_btns[:6]]))
-check("F5n) Indikator-Zeile: gelber Button (#FFD700)",
-      isinstance(btn_svc, QPushButton)
-      and INFO_BUTTON_COLOR_INDICATOR in btn_svc.styleSheet(),
-      btn_svc.styleSheet() if isinstance(btn_svc, QPushButton) else "")
-
-neutral = next((b for _, b in _all_btns
-                if isinstance(b, QPushButton) and not b.toolTip()), None)
-check("F5o) Zeile ohne Indikator-Relation: neutraler Button (kein Tooltip)",
-      neutral is not None
-      and INFO_BUTTON_COLOR_NEUTRAL in neutral.styleSheet(),
-      neutral.styleSheet() if neutral is not None else "keine neutrale Zeile")
-check("F5p) Status-Spalte auf Button-Breite verkleinert (INFO_BUTTON_WIDTH)",
-      mt.header().sectionSize(1) == INFO_BUTTON_WIDTH
-      and INFO_BUTTON_WIDTH < BADGE_COLUMN_WIDTH,
-      f"w={mt.header().sectionSize(1)} (width={INFO_BUTTON_WIDTH})")
-
-# Bugfix 05.08.2026 (Punkt 4): Klick auf den Button emittiert info_requested
-# mit den zeilenspezifischen Daten (Service/Set/Plugin).
-info_signals = []
-mt.info_requested.connect(lambda s, svc, p: info_signals.append((s, svc, p)))
-btn_svc.click()
-check("F5q) info_requested emittiert (Service-Zeile)",
-      info_signals and info_signals[-1] == (set_id, "grid_1", "grid_lines"),
-      str(info_signals))
-info_signals.clear()
-btn_set.click()
-check("F5r) info_requested emittiert (Set-Zeile)",
-      info_signals and info_signals[-1] == (set_id, "", ""), str(info_signals))
-info_signals.clear()
-plugin_row = mt.topLevelItem(2).child(0)
-btn_pl = mt.itemWidget(plugin_row, 1)
-if isinstance(btn_pl, QPushButton):
-    btn_pl.click()
-check("F5s) info_requested emittiert (Plugin-Zeile)",
-      info_signals and info_signals[-1]
-      == ("", "", plugin_row.data(0, ROLE_PLUGIN_ID)),
-      str(info_signals))
-
-# Auf-/Zuklapp-Marker (Bugfix 04.08.2026): eingeklappt '>' / ausgeklappt '⌄'.
-# Gruppen sind initial expandiert -> '⌄'; Sets sind zugeklappt -> '>'.
-check("F5c) Gruppen-Knoten (expandiert) traegt '⌄'-Symbol",
-      set_group.text(0).startswith("⌄ "), repr(set_group.text(0)))
-check("F5d) Set-Knoten (zugeklappt) traegt '>'-Symbol",
-      set_group.child(0).text(0).startswith("> "),
-      repr(set_group.child(0).text(0)))
-check("F5e) Blatt-Knoten (Service) OHNE '>'-Symbol",
-      not svc_item.text(0).startswith("> "), repr(svc_item.text(0)))
-check("F5f) Untereintraege per setIndentation eingerueckt",
-      set_group.child(0).text(0) and svc_item.text(0),
-      "Indent=" + str(set_group.treeWidget().indentation()))
-
-# Layout (Bugfix 04.08.2026):
-# * rootIsDecorated=False -> Top-Level-Knoten starten ganz links (Ebene 0
-#   ohne zusaetzliche Branch-Einrueckung).
-# * Spalte 0 ist Stretch -> Status-Spalte (Spalte 1) liegt fest am rechten
-#   Rand und die Baum-Spalte fuellt die gesamte Breite bis dorthin.
-check("F5g) rootIsDecorated=False (Ebene 0 startet ganz links)",
-      mt.rootIsDecorated() is False)
-check("F5h) Status-Spalte liegt am RECHTEN Rand",
-      mt.header().sectionPosition(1) + mt.header().sectionSize(1)
-      >= mt.viewport().width() - 1,
-      f"pos={mt.header().sectionPosition(1)} size={mt.header().sectionSize(1)} "
-      f"vp={mt.viewport().width()}")
-check("F5i) Spalte 0 ist im Stretch-Modus",
-      mt.header().sectionResizeMode(0) == QHeaderView.Stretch
-      and mt.header().sectionResizeMode(1) == QHeaderView.Fixed,
-      f"mode0={mt.header().sectionResizeMode(0)} mode1={mt.header().sectionResizeMode(1)}")
-mt.resize(700, mt.height())
-_app.processEvents()
-check("F5j) Spalte 0 waechst mit dem Viewport (Status bleibt rechts)",
-      mt.header().sectionSize(0) > 400
-      and mt.header().sectionPosition(1) + mt.header().sectionSize(1)
-      >= mt.viewport().width() - 1,
-      f"size0={mt.header().sectionSize(0)} vp={mt.viewport().width()}")
-
-# Selektion: Set-Knoten markieren
-mt.setCurrentItem(set_group.child(0))
-check("F6) current_set_id aus MasterTree", mt.current_set_id() == set_id,
-      str(mt.current_set_id()))
-mt.setCurrentItem(svc_item)
-sel2 = mt.current_selection()
-check("F7) current_selection() liefert Set+Service",
-      sel2["set_id"] == set_id and sel2["service_id"] == "grid_1",
-      str(sel2))
-
-# ---------------------------------------------------------------------------
-# J) Ausfuehrungsdatum (feature_store) + Kontextmenue-Run-Signale (05.08.2026)
-# ---------------------------------------------------------------------------
-from datetime import datetime  # noqa: E402
-today_str = datetime.now().strftime("%d.%m.%y")
-
-check("J1) last_execution_date('proximity') = heute (DD.MM.JJ)",
-      model.last_execution_date("proximity") == today_str,
-      model.last_execution_date("proximity"))
-check("J2) Fallback '--.--.--' ohne feature_store-Eintrag",
-      model.last_execution_date("grid_lines") == "--.--.--",
-      model.last_execution_date("grid_lines"))
-
-svc_nodes = model.build_tree()[0]["children"][0]["services"]
-check("J3) build_tree-Service-Node traegt last_execution",
-      all("last_execution" in s for s in svc_nodes),
-      str([s.get("last_execution") for s in svc_nodes]))
-
-# MasterTree-Label: 'instance_id (DD.MM.JJ)' – prox_1 (heute), grid_1 ohne
-# Store-Eintrag '(--.--.--)'. Der Baum repopuliert ueber data_changed.
-model.refresh()
-_app.processEvents()
-# Nach dem Repopulate sind die alten C++-Items zerstoert – set_group neu holen.
-set_group = mt.topLevelItem(0)
-svc_items = [set_group.child(0).child(i) for i in range(set_group.child(0).childCount())]
-prox_label = next((i.text(0) for i in svc_items if i.text(0).startswith("prox_1")), "")
-grid_label = next((i.text(0) for i in svc_items if i.text(0).startswith("grid_1")), "")
-check("J4) prox_1-Zeile zeigt '(DD.MM.JJ)'",
-      prox_label == f"prox_1 ({today_str})", prox_label)
-check("J5) grid_1-Zeile zeigt Fallback '(--.--.--)'",
-      grid_label == "grid_1 (--.--.--)", grid_label)
-
-# Kontextmenue-Run-Signale sind verbindbar (Emission erfolgt aus dem
-# Kontextmenue; der Orchestrator verknuepft sie mit seinen Run-Handlern).
-run_svc_calls = []
-run_set_calls = []
-mt.run_service_requested.connect(
-    lambda s, i: run_svc_calls.append((s, i)))
-mt.run_set_requested.connect(lambda s: run_set_calls.append(s))
-mt.run_service_requested.emit(set_id, "prox_1")
-mt.run_set_requested.emit(set_id)
-check("J6) run_service_requested(set_id, instance_id) emittierbar",
-      run_svc_calls == [(set_id, "prox_1")], str(run_svc_calls))
-check("J7) run_set_requested(set_id) emittierbar",
-      run_set_calls == [set_id], str(run_set_calls))
-
-# 05.08.2026 (Punkt 4): Auch Standalone-/Plugin-Zeilen tragen das Datum
-# '(DD.MM.JJ)' hinter dem Namen (gleiche feature_store-Semantik).
-model.refresh()
-_app.processEvents()
-standalone_group = mt.topLevelItem(1)
-plugin_group = mt.topLevelItem(2)
-plugin_labels = [plugin_group.child(i).text(0)
-                 for i in range(plugin_group.childCount())]
-prox_plugin_label = next(
-    (t for t in plugin_labels if t.startswith("proximity")), "")
-grid_plugin_label = next(
-    (t for t in plugin_labels if t.startswith("grid_lines")), "")
-check("J8) Plugin-Zeile 'proximity' zeigt '(DD.MM.JJ)'",
-      prox_plugin_label == f"proximity ({today_str})", prox_plugin_label)
-check("J9) Plugin-Zeile 'grid_lines' zeigt Fallback '(--.--.--)'",
-      grid_plugin_label == "grid_lines (--.--.--)", grid_plugin_label)
-
-
-# ---------------------------------------------------------------------------
-# H) Info-Button -> Beschreibungs-Dialog (header_line / from_set / from_plugin)
-# ---------------------------------------------------------------------------
-from analytics.engine.description_dialog import ServiceDescriptionDialog  # noqa: E402
-
-
-def _dialog_html(dlg):
-    """HTML-Inhalt des Dialog-Browsers (headless pruefbar)."""
-    browser = dlg.findChild(QTextBrowser)
-    return browser.toHtml() if browser is not None else ""
-
-
-# Set-Dialog: erste Zeile = Tooltip-Text, dann Leerzeile, dann Beschreibung.
-dlg_set = ServiceDescriptionDialog.from_set(
-    model.get_sets()[0], header_line="im Ind_FixedGridProximity")
-html_set = _dialog_html(dlg_set)
-check("H1) from_set rendert header_line als erste Zeile",
-      "im Ind_FixedGridProximity" in html_set, "")
-check("H2) from_set zeigt Set-Name + Services",
-      "Grid-Basis" in html_set and "grid_1 [grid_lines]" in html_set
-      and "prox_1 [proximity]" in html_set, "")
-
-# Plugin/Service-Dialog: header_line via from_plugin (Instanz + Config).
-dlg_svc = ServiceDescriptionDialog.from_plugin(
-    model.get_plugin("grid_lines"), instance_id="grid_1",
-    config=model.find_service(set_id, "grid_1"),
-    header_line="aktiv Ind_FixedGridProximity")
-html_svc = _dialog_html(dlg_svc)
-check("H3) from_plugin rendert header_line",
-      "aktiv Ind_FixedGridProximity" in html_svc, "")
-check("H4) from_plugin zeigt Instanz + Plugin",
-      "grid_1" in html_svc and "Grid Lines" in html_svc, "")
-
-# ---------------------------------------------------------------------------
-# G) Set-Updates & Umsortieren
-# ---------------------------------------------------------------------------
-set_repo.save_set({
-    "set_id": set_id,
-    "display_name": "Grid-Basis",
-    "execution_order": ["prox_1", "grid_1"],  # Umsortieren
-    "services": {
-        "grid_1": {"plugin_id": "grid_lines", "lookback": 1000,
-                   "params": {}},
-        "prox_1": {"plugin_id": "proximity", "lookback": 500,
-                   "params": {}},
-    },
-})
-model.refresh()
-set_nodes = model.build_tree()[0]["children"]
-check("G1) Umsortieren sichtbar (prox_1 zuerst)",
-      [s["instance_id"] for s in set_nodes[0]["services"]] == ["prox_1", "grid_1"],
-      str([s["instance_id"] for s in set_nodes[0]["services"]]))
-
-event_bus.service_set_changed.emit()
-check("G2) Modell reagiert auf EventBus (Set-Update)",
-      [s["instance_id"] for s in model.build_tree()[0]["children"][0]["services"]]
-      == ["prox_1", "grid_1"])
-
-# ---------------------------------------------------------------------------
-# Aufraeumen
-# ---------------------------------------------------------------------------
-try:
-    os.remove(TEST_DB)
-except OSError:
-    pass
-try:
-    os.remove(TEST_FS_DB)
-except OSError:
-    pass
-
-print("-" * 60)
-if FAILURES:
-    print(f"FEHLER: {len(FAILURES)} Pruefung(en) fehlgeschlagen: {FAILURES}")
-    sys.exit(1)
-print("ALLE PRUEFUNGEN BESTANDEN (OK)")
-sys.exit(0)
-
-```
-
---------------------------------------------------
-
-### DATEI: test/check_p15_s3_analytics.py
-```py
-# test/check_p15_s3_analytics.py
-"""
-Phase 15.03-E – Headless Verifikation (Multi-Select Datenquellen im
-AnalyticsWindow). Ersetzt check_p15_s3_e_popover.py (Popover-Ansatz).
-
-Prueft ohne GUI-Start (offscreen, Temp-DBs unter test/ – Regel: keine
-Test-DBs im Root/data, KEINE UI-Ausfuehrung):
-
- 1. Ersetzungs-Entscheidung (06.08.2026): AnalyticsWindow hat KEIN
-    `combo_feature`/`btn_service_filter`/`service_popover` mehr; stattdessen
-    `btn_data_sources` + `ServiceSelectorDialog` (MODE_SELECT_MULTI,
-    Checkbox-MasterTree).
- 2. `AnalyticsViewModel.set_feature_ids(["grid_lines", "proximity"])` setzt
-    die Multi-Auswahl (Params, Dirty, Refresh).
- 3. `FeatureStoreReader.fetch_rows(..., feature_ids=[...])` filtert per
-    `WHERE feature_id IN (...)` (1-ID, 2-IDs, leere Liste/None = alle).
- 4. Dialog: Checkbox-API (`set_checked_feature_ids`/`checked_feature_ids`/
-    `checked_display_names`), Read-Only-Parameter-Panel (deaktivierte
-    QGroupBox), `services_selected`-Emit beim Anwenden, Filter-Zuruecksetzung
-    (`services_selected([], [])` -> feature_ids == []).
- 5. Durchreichung Repository/Worker + Profil-Payload-Migration
-    (`feature_id`-String -> `feature_ids`-Liste).
-"""
-import os
-import sys
-
-sys.path.insert(0, r"F:\Python\PyTrader")
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-
-# UTF-8-Konsole erzwingen (wie main.py / test.py)
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-
-TEST_DIR = os.path.dirname(os.path.abspath(__file__))
-TEST_DB = os.path.join(TEST_DIR, "p15_s3_analytics_app.duckdb")
-TEST_FS_DB = os.path.join(TEST_DIR, "p15_s3_analytics_fs.duckdb")
-
-for _db in (TEST_DB, TEST_FS_DB):
-    if os.path.exists(_db):
-        os.remove(_db)
-
-from PySide6.QtCore import Qt  # noqa: E402
-from PySide6.QtWidgets import QApplication, QGroupBox  # noqa: E402
-
-_app = QApplication.instance() or QApplication(sys.argv)
-
-import analytics.ui.analytics_win as aw_mod  # noqa: E402
-import state_manager as sm_mod  # noqa: E402
-import symbol_repository as sym_mod  # noqa: E402
-
-from config.event_bus import event_bus  # noqa: E402
-from state_manager import StateManager  # noqa: E402
-from symbol_repository import SymbolRepository  # noqa: E402
-from analytics.engine.service_set_repository import ServiceSetRepository  # noqa: E402
-from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
-from analytics.engine.analytics_repository import AnalyticsRepository  # noqa: E402
-from analytics.engine.analytics_view_model import AnalyticsViewModel  # noqa: E402
-from analytics.engine.analytics_worker import AnalyticsAsyncWorker, QUERY_TABLE  # noqa: E402
-from analytics.engine.service_selector_model import ServiceSelectorModel  # noqa: E402
-from analytics.features.feature_builder import PluginRegistry  # noqa: E402
-from analytics_profile_repository import AnalyticsProfileRepository  # noqa: E402
-from serviceui.service_selector_dialog import ServiceSelectorDialog  # noqa: E402
-from serviceui.service_selector_widget import ServiceSelectorWidget  # noqa: E402
-
-FAILURES = []
-
-
-def check(name, cond, detail=""):
-    s = "PASS" if cond else "FAIL"
-    print(f"[{s}] {name}" + (f" - {detail}" if detail and not cond else ""))
-    if not cond:
-        FAILURES.append(name)
-
-
-# ---------------------------------------------------------------------------
-# Test-Infrastruktur: Patch-Strategie analog check_p15_s3_e_popover.py
-# ---------------------------------------------------------------------------
-_orig_sm_init = sm_mod.StateManager.__init__
-
-
-def _patched_sm_init(self, db_path=None, *a, **kw):
-    _orig_sm_init(self, db_path or TEST_DB, *a, **kw)
-
-
-sm_mod.StateManager.__init__ = _patched_sm_init
-
-# get_symbol_repository() (AnalyticsWindow) -> Temp-App-DB statt app_data.
-aw_mod.get_symbol_repository = lambda: SymbolRepository(db_path=TEST_DB)
-
-# Feature-Store unter test/ (analytics.duckdb der App ist ggf. gesperrt).
-import duckdb  # noqa: E402
-_fs_con = duckdb.connect(TEST_FS_DB)
-_fs_con.execute("""
-    CREATE TABLE feature_store (
-        symbol VARCHAR, timeframe VARCHAR, bar_time TIMESTAMPTZ,
-        ema_diff DOUBLE, rsi_14 DOUBLE, atr_normalized DOUBLE,
-        feature_id VARCHAR, plugin_version VARCHAR, feature_data JSON,
-        created_at TIMESTAMPTZ
-    )
-""")
-_fs_con.execute("""
-    INSERT INTO feature_store (symbol, timeframe, bar_time, feature_id,
-                               plugin_version, feature_data, ema_diff, rsi_14,
-                               created_at)
-    VALUES ('SILVER', 'M1', TIMESTAMPTZ '2026-08-01 10:00:00+00', 'grid_lines',
-            '1.0.0', '{"step_size": 0.5}', 0.10, 60.0,
-            TIMESTAMPTZ '2026-08-05 09:00:00+00'),
-           ('SILVER', 'M1', TIMESTAMPTZ '2026-08-01 10:01:00+00', 'grid_lines',
-            '1.0.0', '{"step_size": 0.5}', 0.15, 61.0,
-            TIMESTAMPTZ '2026-08-05 09:00:00+00'),
-           ('SILVER', 'M1', TIMESTAMPTZ '2026-08-01 10:02:00+00', 'proximity',
-            '1.0.0', '{"visit_pct": 0.05}', 0.20, 62.0,
-            TIMESTAMPTZ '2026-08-05 09:05:00+00')
-""")
-_fs_con.close()
-
-# Ein gespeichertes Service-Set mit grid_lines + proximity (Temp-App-DB).
-set_repo = ServiceSetRepository(db_path=TEST_DB)
-set_id = set_repo.save_set({
-    "display_name": "Grid-Basis",
-    "execution_order": ["grid_1", "prox_1"],
-    "services": {
-        "grid_1": {"plugin_id": "grid_lines", "lookback": 1000,
-                   "params": {"step_size": 0.5}},
-        "prox_1": {"plugin_id": "proximity", "lookback": 500,
-                   "params": {"prox_level1": 1.0}},
-    },
-})
-
-# ServiceSelectorModel mit injizierten Temp-Repos (Invariante 4, lesend).
-model = ServiceSelectorModel(
-    set_repo=set_repo,
-    state_manager=StateManager(db_path=TEST_DB),
-    registry=PluginRegistry(),
-    feature_store_reader=FeatureStoreReader(db_path=TEST_FS_DB),
-)
-
-fs_reader = FeatureStoreReader(db_path=TEST_FS_DB)
-vm = AnalyticsViewModel(
-    analytics_repo=AnalyticsRepository(reader=fs_reader),
-    profile_repo=AnalyticsProfileRepository(db_path=TEST_DB),
-)
-
-win = aw_mod.AnalyticsWindow(view_model=vm, selector_model=model)
-
-# ---------------------------------------------------------------------------
-# 1) Ersetzungs-Entscheidung: Popover weg, Datenquellen-Dialog da
-# ---------------------------------------------------------------------------
-print("\n=== 1) Ersetzung Popover -> Datenquellen-Dialog ===")
-check("P1) combo_feature existiert NICHT mehr",
-      not hasattr(win, "combo_feature"))
-check("P2) btn_service_filter/service_popover existieren NICHT mehr",
-      not hasattr(win, "btn_service_filter") and not hasattr(win, "service_popover"))
-check("P3) btn_data_sources existiert",
-      hasattr(win, "btn_data_sources"))
-check("P4) Initialer Button-Text 'Keiner ausgewaehlt'",
-      win.btn_data_sources.text() == "[ 🛠️ Datenquellen: Keiner ausgewählt ▾ ]",
-      win.btn_data_sources.text())
-check("P5) Kein Param-Host/Filter-Tupel mehr im Fenster",
-      not hasattr(win, "_param_host") and not hasattr(win, "_active_filter"))
-check("P6) ViewModel startet mit feature_ids == []",
-      vm.params.get("feature_ids") == [])
-
-# ---------------------------------------------------------------------------
-# 2) ViewModel: set_feature_ids (Multi-Select)
-# ---------------------------------------------------------------------------
-print("\n=== 2) AnalyticsViewModel.set_feature_ids ===")
-check("V1) feature_ids initial leer", vm.params["feature_ids"] == [])
-vm.set_feature_ids(["grid_lines", "proximity"])
-check("V2) feature_ids gesetzt (2 IDs)",
-      vm.params["feature_ids"] == ["grid_lines", "proximity"],
-      str(vm.params["feature_ids"]))
-vm.set_feature_ids(["grid_lines", "grid_lines", "  ", "proximity"])
-check("V3) Duplikate/Whitespace normalisiert",
-      vm.params["feature_ids"] == ["grid_lines", "proximity"],
-      str(vm.params["feature_ids"]))
-vm.set_feature_ids([])
-check("V4) leere Liste = kein Filter",
-      vm.params["feature_ids"] == [])
-# Kompatibilitaets-Alias
-vm.set_feature_id("grid_lines")
-check("V5) Alias set_feature_id('grid_lines') -> ['grid_lines']",
-      vm.params["feature_ids"] == ["grid_lines"],
-      str(vm.params["feature_ids"]))
-
-# ---------------------------------------------------------------------------
-# 3) FeatureStoreReader: WHERE feature_id IN (...)
-# ---------------------------------------------------------------------------
-print("\n=== 3) FeatureStoreReader-Filter (IN-Clause) ===")
-rows_all = fs_reader.fetch_rows("SILVER", "M1")
-rows_gl = fs_reader.fetch_rows("SILVER", "M1", feature_id="grid_lines")
-rows_multi = fs_reader.fetch_rows(
-    "SILVER", "M1", feature_ids=["grid_lines", "proximity"])
-rows_one = fs_reader.fetch_rows("SILVER", "M1", feature_ids=["proximity"])
-rows_empty = fs_reader.fetch_rows("SILVER", "M1", feature_ids=[])
-check("F1) Ohne Filter 3 Zeilen", len(rows_all) == 3, str(len(rows_all)))
-check("F2) Legacy feature_id='grid_lines' 2 Zeilen",
-      len(rows_gl) == 2, str(len(rows_gl)))
-check("F3) feature_ids=[grid_lines, proximity] -> 3 Zeilen (IN-Union)",
-      len(rows_multi) == 3, str(len(rows_multi)))
-check("F4) feature_ids=[proximity] -> 1 Zeile",
-      len(rows_one) == 1, str(len(rows_one)))
-check("F5) feature_ids=[] -> alle 3 Zeilen (kein Filter)",
-      len(rows_empty) == 3, str(len(rows_empty)))
-check("F6) Alle IN-Zeilen gehoeren den gewaehlten IDs",
-      all(r.get("feature_id") in ("grid_lines", "proximity")
-          for r in rows_multi))
-# Repo-Durchreichung
-repo = AnalyticsRepository(reader=fs_reader)
-repo_multi = repo.get_table("SILVER", "M1",
-                            feature_ids=["grid_lines", "proximity"])
-check("F7) Repo.get_table reicht feature_ids durch (3 Zeilen)",
-      repo_multi["total"] == 3, str(repo_multi["total"]))
-# Worker-Durchreichung (synchroner Einmal-Lauf)
-w = AnalyticsAsyncWorker(repo, QUERY_TABLE,
-                         {"symbol": "SILVER", "timeframe": "M1",
-                          "feature_ids": ["proximity"]})
-w.run()
-# Ergebnis kommt ueber finished_ok-Signal; stattdessen direkt _execute pruefen
-w2 = AnalyticsAsyncWorker(repo, QUERY_TABLE,
-                          {"symbol": "SILVER", "timeframe": "M1",
-                           "feature_ids": ["proximity"]})
-res = w2._execute()
-check("F8) Worker uebergibt feature_ids (1 Zeile)",
-      res.get("total") == 1, str(res.get("total")))
-
-# ---------------------------------------------------------------------------
-# 4) Dialog: Checkbox-API + Read-Only-Panel + services_selected
-# ---------------------------------------------------------------------------
-print("\n=== 4) ServiceSelectorDialog (Multi-Select) ===")
-dlg = ServiceSelectorDialog(model=model)
-check("D1) Widget im Modus SELECT_MULTI",
-      isinstance(dlg.selector, ServiceSelectorWidget)
-      and dlg.selector.master_tree is not None)
-check("D2) MasterTree ist checkable",
-      dlg.selector.master_tree._checkable is True)
-
-tree = dlg.selector.master_tree
-tree.set_checked_feature_ids(["grid_lines", "proximity"])
-check("D3) checked_feature_ids (Reverse-Mapping, 2 IDs)",
-      sorted(tree.checked_feature_ids()) == ["grid_lines", "proximity"],
-      str(tree.checked_feature_ids()))
-names = tree.checked_display_names()
-check("D4) checked_display_names enthalten Set/Service + plugin_id",
-      any(n.startswith("Grid-Basis/") for n in names) and "proximity" in names,
-      str(names))
-# Bugfix-Runde 3 (06.08.2026): Das Panel folgt dem MAUSKLICK (nicht den
-# Checkboxen). Klick auf die Set-Zeile 'Grid-Basis' -> ALLE Services des
-# Sets (grid_1 + prox_1) als deaktivierte QGroupBox-Spalten.
-from serviceui.master_tree import (  # noqa: E402
-    ROLE_NODE_TYPE, ROLE_SET_ID, ROLE_PLUGIN_ID, TYPE_SET, TYPE_SERVICE,
-    TYPE_PLUGIN, TYPE_GROUP, TreeItemIterator)
-_tree = dlg.selector.master_tree
-
-
-def _panel_widgets():
-    """Alle Nicht-None-Widgets des Parameter-Panels (Stretch raus)."""
-    return [dlg.param_box_layout.itemAt(i).widget()
-            for i in range(dlg.param_box_layout.count())
-            if dlg.param_box_layout.itemAt(i).widget() is not None]
-
-
-def _find_item(node_type, set_id="", plugin_id=""):
-    for _it in TreeItemIterator(_tree):
-        if _it is None:
-            continue
-        if _it.data(0, ROLE_NODE_TYPE) != node_type:
-            continue
-        if node_type in (TYPE_SET, TYPE_SERVICE) and set_id \
-                and str(_it.data(0, ROLE_SET_ID) or "") != set_id:
-            continue
-        if node_type == TYPE_PLUGIN and plugin_id \
-                and str(_it.data(0, ROLE_PLUGIN_ID) or "") != plugin_id:
-            continue
-        return _it
-    return None
-
-
-def _click_item(item):
-    """Simuliert einen echten Mausklick in der Zeile (mousePressEvent).
-
-    Alle Eltern-Knoten werden vorher expandiert, damit die Zeile sichtbar
-    ist (visualItemRect/itemAt brauchen Viewport-Koordinaten der Zeile).
-    """
-    from PySide6.QtCore import QEvent, QPointF  # noqa: E402
-    from PySide6.QtGui import QMouseEvent  # noqa: E402
-    _p = item.parent()
-    while _p is not None:
-        _p.setExpanded(True)
-        _p = _p.parent()
-    _tree.scrollToItem(item)
-    _app.processEvents()
-    _rect = _tree.visualItemRect(item)
-    _ev = QMouseEvent(QEvent.Type.MouseButtonPress,
-                      QPointF(_rect.center()), Qt.LeftButton,
-                      Qt.LeftButton, Qt.NoModifier)
-    _tree.mousePressEvent(_ev)
-    _app.processEvents()
-
-
-_grid_set_item = _find_item(TYPE_SET, set_id=set_id)
-assert _grid_set_item is not None, "Grid-Basis Set-Item nicht gefunden"
-_click_item(_grid_set_item)
-check("D5) Klick auf Set-Zeile: Rechtes Panel hat >= 2 deaktivierte "
-      "QGroupBox-Spalten",
-      len(_panel_widgets()) >= 2,
-      str(len(_panel_widgets())))
-_boxes = _panel_widgets()
-check("D6) Panel-Spalten sind QGroupBox + deaktiviert (Read-Only)",
-      all(isinstance(b, QGroupBox) and not b.isEnabled() for b in _boxes))
-
-# Dedup: grid_1 + grid_2 (gleiche plugin_id) -> EIN feature_id
-zwei_id = set_repo.save_set({
-    "display_name": "Zwei Grids",
-    "execution_order": ["grid_a", "grid_b"],
-    "services": {
-        "grid_a": {"plugin_id": "grid_lines", "lookback": 999,
-                   "params": {}},
-        "grid_b": {"plugin_id": "grid_lines", "lookback": 999,
-                   "params": {}},
-    },
-})
-model.refresh()
-tree.set_checked_feature_ids(["grid_lines"])
-check("D7) Deduplikation: 3 Services + Plugin-Zeile -> 1 feature_id",
-      tree.checked_feature_ids() == ["grid_lines"],
-      str(tree.checked_feature_ids()))
-# Bugfix-Runde 3: Klick auf das Set 'Zwei Grids' -> NUR dessen 2 Services
-_zwei_item = _find_item(TYPE_SET, set_id=zwei_id)
-assert _zwei_item is not None, "Zwei-Grids Set-Item nicht gefunden"
-_click_item(_zwei_item)
-check("D8) Klick auf Set: Panel zeigt genau dessen Services (2 Spalten)",
-      len(_panel_widgets()) == 2,
-      str(len(_panel_widgets())))
-
-# services_selected-Emit beim Anwenden
-emitted = []
-dlg.services_selected.connect(lambda n, f: emitted.append((list(n), list(f))))
-dlg._on_apply()
-check("D9) Anwenden emittiert services_selected(display_names, feature_ids)",
-      len(emitted) == 1 and emitted[0][1] == ["grid_lines"],
-      str(emitted))
-
-# Filter-Zuruecksetzung (Sicherheitsabfrage gepatcht)
-_orig_question = aw_mod.QMessageBox.question
-dlg_mod = __import__("serviceui.service_selector_dialog", fromlist=["QMessageBox"])
-_orig_q2 = dlg_mod.QMessageBox.question
-dlg_mod.QMessageBox.question = staticmethod(lambda *a, **k: dlg_mod.QMessageBox.Yes)
-emitted.clear()
-try:
-    dlg._on_clear_filters()
-finally:
-    dlg_mod.QMessageBox.question = _orig_q2
-    aw_mod.QMessageBox.question = _orig_question
-check("D10) Leeren emittiert services_selected([], [])",
-      len(emitted) == 1 and emitted[0] == ([], []), str(emitted))
-check("D11) Baum ist leer nach clear",
-      tree.checked_feature_ids() == [])
-check("D12) Panel zeigt Hinweis 'Keine Auswahl'",
-      len(_panel_widgets()) == 1
-      and "Keine Auswahl" in (_panel_widgets()[0].text() or ""),
-      str(len(_panel_widgets())))
-
-# ---------------------------------------------------------------------------
-# 4b) Bugfix-Runde 06.08.2026 (Punkte 1-4): horizontales Panel, 2-Spalten-
-#     Default + Scrollbar, Fensterbreite == rechte Kante der Parameter-Box,
-#     Geometrie-Persistenz
-# ---------------------------------------------------------------------------
-print("\n=== 4b) Bugfix-Runde (06.08.2026): Panel-Layout + Geometrie ===")
-from PySide6.QtWidgets import QHBoxLayout  # noqa: E402
-from serviceui.service_selector_dialog import (  # noqa: E402
-    DIALOG_GEOMETRY_KEY, ServiceSelectorDialog as _SSD)
-check("B1) Parameter-Spalten liegen HORIZONTAL (QHBoxLayout)",
-      isinstance(dlg.param_box_layout, QHBoxLayout),
-      type(dlg.param_box_layout).__name__)
-# Dialog anzeigen, damit die Layout-Geometrie (Positionen/Breiten) berechnet
-# ist – die Pixel-Messung in B2/B4 braucht eine sichtbare Widget-Hierarchie.
-dlg.show()
-_app.processEvents()
-# Bugfix-Runde 3: Panel folgt dem Klick – Klick auf die Set-Zeile 'Grid-Basis'
-# (grid_1 + prox_1) -> Panel-Breite = Platz fuer 2 Spalten (Default)
-_click_item(_find_item(TYPE_SET, set_id=set_id))
-_app.processEvents()
-_panel_w = dlg.param_scroll.width()
-_check_w = [w.sizeHint().width() for w in _panel_widgets()][:2]
-check("B2) Panel-Breite = 2 Spalten nebeneinander (Default, ohne Scrollbar)",
-      len(_check_w) == 2 and _panel_w >= _check_w[0] + _check_w[1] + 6
-      and _panel_w <= _check_w[0] + _check_w[1] + 40,
-      f"panel={_panel_w}, 2col={_check_w[0] + _check_w[1] + 6}")
-check("B3) Container-Breite deckt ALLE Spalten (Scrollbar bei >2)",
-      dlg.param_container.minimumWidth() >= dlg.param_scroll.width(),
-      f"container={dlg.param_container.minimumWidth()}, "
-      f"panel={dlg.param_scroll.width()}")
-# Fensterbreite endet exakt an der rechten Kante der Parameter-Box (Punkt 3)
-_panel_widget = dlg.param_scroll.parentWidget()
-_right_edge = (_panel_widget.geometry().x()
-               + dlg.param_scroll.geometry().right())
-check("B4) Fensterbreite == rechte Kante der Parameter-Box",
-      abs(_right_edge - (dlg.width() - 8)) <= 3,
-      f"right={_right_edge}, width={dlg.width()}")
-# Geometrie-Persistenz (Punkt 4): save + restore ueber den AnalyticsWindow-
-# erzeugten Dialog (Parent -> state_manager vorhanden)
-win._open_service_dialog()
-_sd = win._service_dialog
-check("B5) Dialog am AnalyticsWindow haengt state_manager an",
-      _sd._state_manager is not None)
-# Breite ueber dem neuen Minimum (Tree 300 + Panel 2-Spalten ~954): kleinere
-# Breiten wuerden von Qt korrekt auf die Minimum-Breite geklemmt.
-_sd.resize(1400, 444)
-_sd.move(234, 67)
-_app.processEvents()
-_sd._save_geometry()
-_saved = win.state_manager.get_dialog_geometry(DIALOG_GEOMETRY_KEY)
-check("B6) Geometrie wurde in global_settings gesichert",
-      _saved is not None and _saved.get("width") == 1400
-      and _saved.get("pos_x") == 234,
-      str(_saved))
-_sd2 = _SSD(model=model, parent=win)
-_sd2.show()
-_app.processEvents()
-check("B7) Neuer Dialog restauriert Position/Groesse",
-      _sd2.pos().x() == 234 and _sd2.pos().y() == 67
-      and _sd2.width() == 1400 and _sd2.height() == 444,
-      f"pos=({_sd2.pos().x()},{_sd2.pos().y()}) "
-      f"size=({_sd2.width()}x{_sd2.height()})")
-_sd2.close()
-_app.processEvents()
-
-# ---------------------------------------------------------------------------
-# 4c) Bugfix-Runde 06.08.2026 (Punkt 5): ServiceWindow-Historie – manuelles
-#     Schliessen (X) loescht den Fenster-Eintrag (kein Auto-Restore beim
-#     Neustart); die POSITION ueberlebt in global_settings und wird beim
-#     naechsten manuellen Oeffnen wiederhergestellt (restore_state-Fallback).
-# ---------------------------------------------------------------------------
-print("\n=== 4c) Bugfix-Runde (06.08.2026): ServiceWindow-Historie ===")
-from serviceui.service_win import ServiceWindow  # noqa: E402
-check("H1) _keep_history_on_close=False (manuelles X loescht Eintrag)",
-      ServiceWindow._keep_history_on_close is False)
-check("H2) DIALOG_GEOMETRY_KEY == 'win_service'",
-      ServiceWindow.DIALOG_GEOMETRY_KEY == "win_service")
-_sw = ServiceWindow()
-_sw.move(321, 222)
-_sw.resize(900, 700)
-_sw.show()
-_app.processEvents()
-_sw.save_state()
-_sw_sm = _sw.state_manager
-check("H3) save_state schreibt window_geometry UND dialog_geometry",
-      _sw_sm.get_window_geometry("win_service") is not None
-      and _sw_sm.get_dialog_geometry("win_service") is not None,
-      str(_sw_sm.get_dialog_geometry("win_service")))
-_sw_sm.delete_instance("win_service")
-check("H4) delete_instance entfernt window_instances (kein Auto-Restore)",
-      _sw_sm.get_window_geometry("win_service") is None
-      and _sw_sm.get_dialog_geometry("win_service") is not None)
-_sw.close()
-_app.processEvents()
-# Neues Fenster (manuelles Oeffnen) -> Position aus global_settings (Fallback)
-_sw2 = ServiceWindow()
-_sw2.show()
-_app.processEvents()
-_sw2.restore_state()
-_app.processEvents()
-check("H5) restore_state-Fallback nutzt dialog_geometry (Position)",
-      _sw2.pos().x() == 321 and _sw2.pos().y() == 222,
-      f"pos=({_sw2.pos().x()},{_sw2.pos().y()})")
-_sw2.close()
-_app.processEvents()
-
-# ---------------------------------------------------------------------------
-# 4d) Bugfix-Runde 2 (06.08.2026): Haken-Stabilitaet (Zeilen-Klick darf die
-#     Checkboxen NICHT veraendern – Punkte 1/2/6), Set-Service-Spalten wie im
-#     service_win (Punkt 6), Tree-Breite fix (Punkt 4), Panel waechst mit bis
-#     zur 2-Spalten-Minimum-Groesse (Punkt 3), Limit-Textfeld (Punkt 5).
-# ---------------------------------------------------------------------------
-print("\n=== 4d) Bugfix-Runde 2 (06.08.2026): Haken, Tree-Breite, Limit ===")
-from PySide6.QtWidgets import QLineEdit  # noqa: E402
-from serviceui.master_tree import (  # noqa: E402
-    ROLE_NODE_TYPE, TYPE_SET, TreeItemIterator)
-from serviceui.service_selector_dialog import TREE_DEFAULT_WIDTH  # noqa: E402
-
-# C1) Kernfix: Ein gemischtes Set (nur grid_lines gecheckt -> Grid-Basis ist
-# PartiallyChecked) darf beim Auf-/Zuklappen (Zeilen-Klick) die Haken NICHT
-# verlieren. Vorher entfernte itemChanged (Text-Refresh) alle Kinder.
-_tree = dlg.selector.master_tree
-_tree.set_checked_feature_ids(["grid_lines"])
-_app.processEvents()
-_before = sorted(_tree.checked_feature_ids())
-_set_item = None
-for _it in TreeItemIterator(_tree):
-    if _it is not None and _it.data(0, ROLE_NODE_TYPE) == TYPE_SET:
-        _set_item = _it
-        break
-if _set_item is not None:
-    _set_item.setExpanded(False)  # itemCollapsed -> _refresh_expand_label
-    _app.processEvents()          # -> setText -> itemChanged (spurious)
-    _set_item.setExpanded(True)
-    _app.processEvents()
-check("C1) Zeilen-Klick (Auf-/Zuklappen) entfernt KEINE Haken",
-      sorted(_tree.checked_feature_ids()) == _before,
-      f"{_before} -> {sorted(_tree.checked_feature_ids())}")
-# C2) Bugfix-Runde 3: Klick auf die Set-Zeile 'Grid-Basis' -> Panel zeigt
-# ALLE Services des Sets (grid_1 + prox_1, service_win-Muster).
-_click_item(_find_item(TYPE_SET, set_id=set_id))
-_titles = [w.title() for w in _panel_widgets()]
-check("C2) Klick auf Set: Panel zeigt ALLE Set-Services (service_win-Muster)",
-      len(_panel_widgets()) == 2
-      and any("grid_1" in t for t in _titles)
-      and any("prox_1" in t for t in _titles),
-      f"{len(_panel_widgets())} Spalten: {_titles}")
-
-# --- Bugfix-Runde 3: Klick-Scope (Punkte 1-7) -------------------------------
-# C9) Klick auf eine SERVICE-Zeile IN einem Set -> ebenfalls ALLE Services
-#     des Sets (Punkt 5, analog service_win _on_master_selection).
-_svc_item = _find_item(TYPE_SERVICE, set_id=set_id)
-assert _svc_item is not None, "Service-Zeile grid_1 nicht gefunden"
-_click_item(_svc_item)
-_titles = [w.title() for w in _panel_widgets()]
-check("C9) Klick auf Service im Set -> Panel zeigt ALLE Services des Sets",
-      len(_panel_widgets()) == 2
-      and any("grid_1" in t for t in _titles)
-      and any("prox_1" in t for t in _titles),
-      f"{len(_panel_widgets())} Spalten: {_titles}")
-# C10) Klick auf eine PLUGIN-Zeile (⚡ Standalone / 📦 Plugins) -> NUR dieser
-#      eine Service (Punkt 6).
-_plugin_item = _find_item(TYPE_PLUGIN, plugin_id="grid_lines")
-assert _plugin_item is not None, "Plugin-Zeile grid_lines nicht gefunden"
-_click_item(_plugin_item)
-_titles = [w.title() for w in _panel_widgets()]
-check("C10) Klick auf Plugin-Zeile -> NUR dieser eine Service im Panel",
-      len(_panel_widgets()) == 1
-      and "grid_lines" in _titles[0],
-      f"{len(_panel_widgets())} Spalten: {_titles}")
-# C11) Klick auf eine GRUPPE (📁/⚡/📦) -> KEIN Service im Panel (Punkt 7).
-_group_item = _find_item(TYPE_GROUP)
-assert _group_item is not None, "Gruppen-Zeile nicht gefunden"
-_click_item(_group_item)
-check("C11) Klick auf Gruppe -> KEIN Service im Panel",
-      len(_panel_widgets()) == 1
-      and "Keine Auswahl" in (_panel_widgets()[0].text() or ""),
-      f"{len(_panel_widgets())} Widgets")
-# C12) Checkboxen bestimmen das Panel NICHT (Punkte 1+2): Haken setzen OHNE
-#      Klick laesst das Panel beim zuletzt geklickten Scope (Grid-Basis).
-_click_item(_find_item(TYPE_SET, set_id=set_id))  # Panel: Grid-Basis (2)
-_tree.set_checked_feature_ids(["grid_lines", "proximity"])
-_app.processEvents()
-_titles = [w.title() for w in _panel_widgets()]
-check("C12) Checkbox-Wechsel aendert das Panel NICHT (nur der Klick)",
-      len(_panel_widgets()) == 2
-      and any("grid_1" in t for t in _titles),
-      f"{len(_panel_widgets())} Spalten: {_titles}")
-# C13) Der Filter (feature_ids) folgt weiterhin den Checkboxen – der Klick
-#      aendert NUR das Panel, nicht die Auswahl (Entkopplung).
-check("C13) Klick aendert die feature_ids-Auswahl NICHT",
-      sorted(_tree.checked_feature_ids()) == ["grid_lines", "proximity"],
-      str(sorted(_tree.checked_feature_ids())))
-
-# C3-C5: Tree-Breite fix + Panel waechst/schrumpft bis 2-Spalten-Minimum
-_tree.set_checked_feature_ids(["grid_lines", "proximity"])
-_app.processEvents()
-check("C3) Tree-Breite ist fix (TREE_DEFAULT_WIDTH)",
-      dlg.selector.width() == TREE_DEFAULT_WIDTH,
-      f"tree={dlg.selector.width()}, default={TREE_DEFAULT_WIDTH}")
-_min_panel = dlg._panel_min_width
-_w0 = dlg.width()
-dlg.resize(_w0 + 250, dlg.height())
-_app.processEvents()
-check("C4) Vergroessern: Tree bleibt fix, Parameter-Box waechst mit",
-      dlg.selector.width() == TREE_DEFAULT_WIDTH
-      and dlg.param_panel.width() > _min_panel,
-      f"tree={dlg.selector.width()}, panel={dlg.param_panel.width()}, "
-      f"min={_min_panel}")
-# C14) Bugfix-Runde 3 (Nachtrag): Die einzelnen Service-Rahmen (QGroupBox)
-#      behalten beim Vergroessern ihre DEFAULT-Breite (sizeHint) – der
-#      abschliessende Stretch absorbiert den freien Platz (kein Strecken).
-
-
-def _column_widths():
-    _ws = []
-    for _i in range(dlg.param_box_layout.count()):
-        _w = dlg.param_box_layout.itemAt(_i).widget()
-        if _w is not None and isinstance(_w, QGroupBox):
-            _ws.append(_w.width())
-    return _ws
-
-
-_cols_before = _column_widths()
-dlg.resize(dlg.width() + 300, dlg.height())
-_app.processEvents()
-_cols_after = _column_widths()
-_sizes = []
-for _i in range(dlg.param_box_layout.count()):
-    _w = dlg.param_box_layout.itemAt(_i).widget()
-    if _w is not None and isinstance(_w, QGroupBox):
-        _sizes.append(_w.sizeHint().width())
-check("C14) Service-Rahmen behalten Default-Breite (kein Strecken)",
-      len(_cols_before) == len(_cols_after) == len(_sizes) >= 2
-      and all(_a <= _s + 2 for _a, _s in zip(_cols_after, _sizes)),
-      f"before={_cols_before}, after={_cols_after}, sizeHint={_sizes}")
-dlg.resize(400, dlg.height())
-_app.processEvents()
-check("C5) Verkleinern: Box nicht unter 2-Spalten-Minimum, Tree fix",
-      dlg.param_panel.width() >= _min_panel
-      and dlg.selector.width() == TREE_DEFAULT_WIDTH,
-      f"panel={dlg.param_panel.width()}, min={_min_panel}, "
-      f"tree={dlg.selector.width()}")
-
-# C6-C8: Limit-Feld (Punkt 5) – reines Textfeld, Default = AppSettings
-check("C6) Limit-Feld ist reines Textfeld (QLineEdit, keine Pfeile)",
-      isinstance(win.edit_limit, QLineEdit))
-check("C7) Limit-Default = AppSettings.statistics_signal_limit (10.000)",
-      win.edit_limit.text() == str(win._default_limit)
-      and win._default_limit == 10_000,
-      f"text={win.edit_limit.text()}, default={win._default_limit}")
-win.edit_limit.setText("2500")
-_app.processEvents()
-check("C8) Texteingabe uebernimmt Limit in den ViewModel",
-      vm.params.get("limit") == 2500, str(vm.params.get("limit")))
-win.edit_limit.setText(str(win._default_limit))
-_app.processEvents()
-
-# ---------------------------------------------------------------------------
-# 5) Fenster-Anbindung: Dialog-Signal -> VM + Button-Text
-# ---------------------------------------------------------------------------
-print("\n=== 5) AnalyticsWindow-Anbindung ===")
-win._open_service_dialog()
-check("W1) Dialog wurde lazy erzeugt",
-      win._service_dialog is not None)
-win._service_dialog.services_selected.emit(
-    ["Grid-Basis/prox_1", "Grid-Basis/grid_1"], ["proximity", "grid_lines"])
-check("W2) VM feature_ids ueber Dialog gesetzt",
-      sorted(vm.params["feature_ids"]) == ["grid_lines", "proximity"],
-      str(vm.params["feature_ids"]))
-check("W3) Button-Text zeigt display_names",
-      "Grid-Basis/prox_1" in win.btn_data_sources.text()
-      and "Grid-Basis/grid_1" in win.btn_data_sources.text(),
-      win.btn_data_sources.text())
-win._on_services_selected([], [])
-check("W4) Leer-Auswahl setzt feature_ids == []",
-      vm.params["feature_ids"] == [])
-check("W5) Button-Text 'Keiner ausgewaehlt' nach Leer-Auswahl",
-      win.btn_data_sources.text() == "[ 🛠️ Datenquellen: Keiner ausgewählt ▾ ]",
-      win.btn_data_sources.text())
-# Profilwechsel-Sync: feature_ids im VM -> resolve_display_names im Button
-vm.set_feature_ids(["proximity"])
-win._active_display_names = []
-event_bus.profile_changed.emit("profil_x")
-check("W6) profile_changed sync: Button zeigt resolved Namen",
-      "Grid-Basis/prox_1" in win.btn_data_sources.text(),
-      win.btn_data_sources.text())
-vm.set_feature_ids([])
-win._sync_service_filter_button()
-check("W7) Button-Reset nach feature_ids == []",
-      win.btn_data_sources.text() == "[ 🛠️ Datenquellen: Keiner ausgewählt ▾ ]",
-      win.btn_data_sources.text())
-
-# ---------------------------------------------------------------------------
-# 6) Profil-Payload-Migration: feature_id (Alt) -> feature_ids (Liste)
-# ---------------------------------------------------------------------------
-print("\n=== 6) Profil-Migration ===")
-profile_repo = AnalyticsProfileRepository(db_path=TEST_DB)
-pid = profile_repo.create_profile("Alt-Profil", {
-    "feature_id": "proximity",
-    "schema_version": 1,
-}, "alt")
-vm2 = AnalyticsViewModel(
-    analytics_repo=AnalyticsRepository(reader=fs_reader),
-    profile_repo=profile_repo,
-)
-profile_repo.set_active(pid)
-vm2.load_profiles()
-check("M1) Alt-Payload feature_id='proximity' -> feature_ids=['proximity']",
-      vm2.params.get("feature_ids") == ["proximity"],
-      str(vm2.params.get("feature_ids")))
-payload = vm2._current_payload()
-check("M2) Neuer Payload schreibt feature_ids (Liste), kein feature_id mehr",
-      payload.get("feature_ids") == ["proximity"]
-      and "feature_id" not in payload,
-      str({k: payload.get(k) for k in ("feature_id", "feature_ids")}))
-
-# ---------------------------------------------------------------------------
-# Aufraeumen (best effort – DbPool-Connections enden mit dem Prozess)
-# ---------------------------------------------------------------------------
-for _db in (TEST_DB, TEST_FS_DB):
-    try:
-        os.remove(_db)
-    except OSError:
-        pass
-
-print("-" * 60)
-if FAILURES:
-    print(f"FEHLER: {len(FAILURES)} Pruefung(en) fehlgeschlagen: {FAILURES}")
-    sys.exit(1)
-print("ALLE PRUEFUNGEN BESTANDEN (OK)")
-sys.exit(0)
-
-```
-
---------------------------------------------------
-
-### DATEI: test/check_p15_s4_infra.py
-```py
-# test/check_p15_s4_infra.py
-"""
-Phase 15.04 – Headless Verifikation (Infrastructure & EventBus Hardening).
-
-Prueft angepasst an den Ist-Stand (KEINE UI-Ausfuehrung, offscreen,
-Temp-DBs unter test/ – Regel: Tests nur in test/):
-
- 1. EventBus-Bestand (statt Implementierung):
-    - Alle 5 Signale existieren auf `event_bus` und sind per connect + emit
-      empfangbar (favorites_changed, profile_changed(str),
-      service_set_changed, service_run_started, service_run_finished).
-    - KEINE Aenderung an config/event_bus.py noetig (Ist-Analyse 05.08.2026).
-
- 2. WindowStateRepository (Temp-DB, Patch analog test/test.py):
-    - save_window_geometry/get_window_geometry-Roundtrip (inkl. is_maximized),
-    - save_instance_state + load_all_instances (String-Normalisierung),
-    - delete_instance (beide Tabellen),
-    - get_next_instance_id (win_1, win_2, ...),
-    - symbol_tf_state-Roundtrip.
-    - Fassaden-Delegation: `StateManager` liefert ueber seine Bestands-
-      Methoden identische Werte wie das Repository (gleiche DB).
-    - Patch-Strategie (test.py) auf WindowStateRepository erweitert
-      (gleiche Temp-DB).
-
- 3. schema_version (harmonisiert):
-    - GridLinesService.calculate() und ProximityService.calculate()
-      (synthetischer OHLCV-DataFrame) liefern
-      payload["metadata"]["schema_version"] == "1.0.0".
-    - FeatureStoreReader._normalize_feature_data(None) bzw. Alt-Row ohne
-      Feld -> "1.0.0" (Default); vorhandenes Feld bleibt unangetastet;
-      DB-Zeile unveraendert.
-"""
-import os
-import sys
-
-sys.path.insert(0, r"F:\Python\PyTrader")
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-
-# UTF-8-Konsole erzwingen (wie main.py / test.py)
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-
-TEST_DIR = os.path.dirname(os.path.abspath(__file__))
-TEST_DB = os.path.join(TEST_DIR, "p15_s4_infra_test.duckdb")
-TEST_FS_DB = os.path.join(TEST_DIR, "p15_s4_infra_fs_test.duckdb")
-
-from PySide6.QtWidgets import QApplication  # noqa: E402
-
-_app = QApplication.instance() or QApplication(sys.argv)
-
-from config.event_bus import event_bus  # noqa: E402
-from state_manager import StateManager  # noqa: E402
-from window_state_repository import WindowStateRepository  # noqa: E402
-from db_service import DbPool  # noqa: E402
-from analytics.engine.feature_store_reader import (  # noqa: E402
-    FeatureStoreReader,
-    SCHEMA_VERSION_DEFAULT,
-)
-
-FAILURES = []
-
-
-def check(name, cond, detail=""):
-    s = "PASS" if cond else "FAIL"
-    print(f"[{s}] {name}" + (f" - {detail}" if detail and not cond else ""))
-    if not cond:
-        FAILURES.append(name)
-
-
-# ---------------------------------------------------------------------------
-# Test-Infrastruktur: frische Temp-DBs unter test/ (Regel: keine Test-DBs im
-# Root/data). Die echten DBs (data/*.duckdb) sind durch die laufende App
-# gesperrt (DuckDB: Single-Writer) – alle Zugriffe laufen ueber Temp-DBs.
-# ---------------------------------------------------------------------------
-for _db in (TEST_DB, TEST_FS_DB):
-    if os.path.exists(_db):
-        os.remove(_db)
-
-# Patch-Strategie analog test/test.py: WindowStateRepository.__init__ wird
-# direkt gepatcht (nicht Modul-Attribut), damit ein no-arg-Konstruktor auf
-# die gleiche Temp-DB faellt (Test-Isolation gegen die laufende App).
-import window_state_repository as _wsr_mod  # noqa: E402
-_orig_wsr_init = _wsr_mod.WindowStateRepository.__init__
-def _patched_wsr_init(self, db_path=None, *a, **kw):
-    _orig_wsr_init(self, db_path or TEST_DB, *a, **kw)
-_wsr_mod.WindowStateRepository.__init__ = _patched_wsr_init
-
-sm = StateManager(db_path=TEST_DB)
-repo = WindowStateRepository(db_path=TEST_DB)
-check("I1) Patch erweitert: WindowStateRepository() faellt auf Temp-DB",
-      WindowStateRepository().db_path == TEST_DB, WindowStateRepository().db_path)
-
-# ---------------------------------------------------------------------------
-# 1) EventBus-Bestand: 5 Signale existieren, connect + emit empfangbar
-# ---------------------------------------------------------------------------
-print("\n=== 1) EventBus-Bestand ===")
-_fav, _prof, _set, _s_start, _s_fin = [], [], [], [], []
-event_bus.favorites_changed.connect(lambda: _fav.append(1))
-event_bus.profile_changed.connect(lambda s: _prof.append(s))
-event_bus.service_set_changed.connect(lambda: _set.append(1))
-event_bus.service_run_started.connect(lambda: _s_start.append(1))
-event_bus.service_run_finished.connect(lambda: _s_fin.append(1))
-
-event_bus.favorites_changed.emit()
-event_bus.profile_changed.emit("profil_42")
-event_bus.service_set_changed.emit()
-event_bus.service_run_started.emit()
-event_bus.service_run_finished.emit()
-
-check("B1) favorites_changed existiert + empfangbar",
-      hasattr(event_bus, "favorites_changed") and _fav == [1], str(_fav))
-check("B2) profile_changed(str) existiert + empfangbar (Payload)",
-      hasattr(event_bus, "profile_changed") and _prof == ["profil_42"],
-      str(_prof))
-check("B3) service_set_changed existiert + empfangbar",
-      hasattr(event_bus, "service_set_changed") and _set == [1], str(_set))
-check("B4) service_run_started existiert + empfangbar (Concurrency-Guard)",
-      hasattr(event_bus, "service_run_started") and _s_start == [1],
-      str(_s_start))
-check("B5) service_run_finished existiert + empfangbar (Concurrency-Guard)",
-      hasattr(event_bus, "service_run_finished") and _s_fin == [1],
-      str(_s_fin))
-
-# ---------------------------------------------------------------------------
-# 2) WindowStateRepository (Temp-DB)
-# ---------------------------------------------------------------------------
-print("\n=== 2) WindowStateRepository ===")
-
-# 2.1 save_window_geometry/get_window_geometry (inkl. is_maximized)
-repo.save_window_geometry("win_1", 150, 120, 640, 400, False, preset_id="p_a")
-geom = repo.get_window_geometry("win_1")
-check("W1) Geometry-Roundtrip (pos/size/is_maximized/preset_id)",
-      geom is not None
-      and geom["pos_x"] == 150 and geom["pos_y"] == 120
-      and geom["width"] == 640 and geom["height"] == 400
-      and geom["is_maximized"] is False,
-      str(geom))
-repo.save_window_geometry("win_1", 10, 20, 800, 600, True)
-geom2 = repo.get_window_geometry("win_1")
-check("W2) is_maximized=True + Upsert auf bestehende Instanz",
-      geom2 is not None and geom2["is_maximized"] is True
-      and geom2["pos_x"] == 10 and geom2["pos_y"] == 20
-      and geom2["width"] == 800 and geom2["height"] == 600,
-      str(geom2))
-check("W3) get_window_geometry(Unbekannte) == None",
-      repo.get_window_geometry("win_nope") is None)
-
-# 2.2 save_instance_state + load_all_instances (String-Normalisierung)
-repo.save_instance_state(
-    "win_1", "SILVER", "M1",
-    visible_range_from=1600000000, visible_range_to=1600003600,
-    visible_price_from=30.0, visible_price_to=31.0,
-    indicators_state={"grid_lines": {"active": True}},
-    measurement_state={"hits": 3},
-)
-insts = repo.load_all_instances()
-r1 = next((i for i in insts if i.get("instance_id") == "win_1"), None)
-check("W4) load_all_instances liefert Instanz mit Zustand",
-      r1 is not None
-      and r1["symbol"] == "SILVER" and r1["timeframe"] == "M1"
-      and r1["visible_range_from"] == 1600000000
-      and r1["visible_price_from"] == 30.0
-      and r1["is_maximized"] is True,
-      str(r1))
-# Bestandsverhalten EXAKT: load_all_instances (pandas-.df()-Leseart) liefert
-# indicators_state/measurement_state als rohe JSON-Strings (kein Parsing – die
-# Normalisierung betrifft NUR symbol/timeframe). Der String muss sich in das
-# urspruengliche Dict aufloesen lassen.
-import json as _json_wsr  # noqa: E402
-_ind_raw = r1.get("indicators_state") if r1 else None
-_meas_raw = r1.get("measurement_state") if r1 else None
-_ind_parsed = _json_wsr.loads(_ind_raw) if isinstance(_ind_raw, str) else _ind_raw
-_meas_parsed = _json_wsr.loads(_meas_raw) if isinstance(_meas_raw, str) else _meas_raw
-check("W5) indicators/measurement JSON im Bestandsformat (rohe Strings)",
-      _ind_parsed == {"grid_lines": {"active": True}}
-      and _meas_parsed == {"hits": 3},
-      f"ind={_ind_raw!r} meas={_meas_raw!r}")
-check("W6) String-Normalisierung: symbol/timeframe sind str",
-      r1 is not None and isinstance(r1["symbol"], str)
-      and isinstance(r1["timeframe"], str))
-
-# NaN->None-Normalisierung: Geometrie OHNE instance_state -> LEFT JOIN
-# liefert NULL-Spalten (pandas: NaN) -> werden auf None normalisiert.
-repo.save_window_geometry("win_no_state", 5, 6, 100, 100, False)
-r_ns = next((i for i in repo.load_all_instances()
-             if i.get("instance_id") == "win_no_state"), None)
-check("W7) LEFT JOIN ohne instance_state -> symbol/timeframe None (kein NaN)",
-      r_ns is not None and r_ns["symbol"] is None and r_ns["timeframe"] is None,
-      str(r_ns))
-
-# 2.3 get_next_instance_id (win_1, win_2, ...)
-check("W8) get_next_instance_id nach win_1 == 'win_2'",
-      repo.get_next_instance_id() == "win_2", repo.get_next_instance_id())
-repo.save_window_geometry("win_2", 0, 0, 100, 100, False)
-check("W9) get_next_instance_id nach win_2 == 'win_3'",
-      repo.get_next_instance_id() == "win_3", repo.get_next_instance_id())
-
-# 2.4 delete_instance (beide Tabellen)
-repo.save_instance_state("win_2", "GOLD", "H1")
-check("W10) Instanz vor delete vorhanden",
-      len([i for i in repo.load_all_instances() if i.get("instance_id") == "win_2"]) == 1)
-repo.delete_instance("win_2")
-con = DbPool.get(TEST_DB)
-inst_rows = con.execute(
-    "SELECT COUNT(*) FROM instance_states WHERE instance_id = 'win_2'").fetchone()[0]
-win_rows = con.execute(
-    "SELECT COUNT(*) FROM window_instances WHERE instance_id = 'win_2'").fetchone()[0]
-check("W11) delete_instance raeumt BEIDE Tabellen ab",
-      inst_rows == 0 and win_rows == 0, f"inst={inst_rows} win={win_rows}")
-
-# 2.5 symbol_tf_state-Roundtrip
-repo.save_symbol_tf_state(
-    "SILVER", "M1",
-    visible_range_from=1600000000, visible_range_to=1600003600,
-    visible_price_from=30.0, visible_price_to=31.0,
-    indicators_state={"ind_fixed_grid_proximity": {"active": True}},
-    measurement_state={"x": 1},
-)
-st = repo.get_symbol_tf_state("SILVER", "M1")
-check("W12) symbol_tf_state-Roundtrip",
-      st is not None
-      and st["visible_range_from"] == 1600000000
-      and st["visible_price_to"] == 31.0
-      and st["indicators_state"] == {"ind_fixed_grid_proximity": {"active": True}}
-      and st["measurement_state"] == {"x": 1},
-      str(st))
-repo.delete_symbol_tf_state("SILVER", "M1")
-check("W13) delete_symbol_tf_state entfernt Eintrag",
-      repo.get_symbol_tf_state("SILVER", "M1") is None)
-
-# ---------------------------------------------------------------------------
-# 2b) Fassaden-Delegation: StateManager liefert identische Werte (gleiche DB)
-# ---------------------------------------------------------------------------
-print("\n=== 2b) Fassaden-Delegation (StateManager -> Repository) ===")
-sm.save_window_geometry("win_10", 111, 222, 333, 444, True, preset_id="p_x")
-sm.save_instance_state("win_10", "BTCUSD", "D1",
-                       indicators_state={"k": "v"}, measurement_state={"m": 2})
-sm.save_symbol_tf_state("GOLD", "H1", visible_price_from=2000.0,
-                        indicators_state={"g": 1})
-check("F1) get_window_geometry Fassade == Repository",
-      sm.get_window_geometry("win_10") == repo.get_window_geometry("win_10"),
-      str(sm.get_window_geometry("win_10")))
-# ORDER BY s.updated_at ist sekundengenau – mehrere Writes in derselben
-# Sekunde haben identische Zeitstempel, daher deterministisch nach
-# instance_id sortiert vergleichen (Inhalts-Gleichheit der Fassaden).
-# NULL-DOUBLE-Spalten liest pandas als NaN (exaktes Bestandsverhalten) –
-# NaN != NaN, daher NaN->None normalisieren.
-import math as _math  # noqa: E402
-def _norm_nan(v):
-    if isinstance(v, float) and _math.isnan(v):
-        return None
-    return v
-
-def _sorted_instances(records):
-    return sorted(
-        [{k: _norm_nan(v) for k, v in r.items()} for r in records],
-        key=lambda r: r.get("instance_id") or "",
-    )
-
-check("F2) load_all_instances Fassade == Repository (sortiert)",
-      _sorted_instances(sm.load_all_instances())
-      == _sorted_instances(repo.load_all_instances()))
-check("F3) get_symbol_tf_state Fassade == Repository",
-      sm.get_symbol_tf_state("GOLD", "H1") == repo.get_symbol_tf_state("GOLD", "H1"),
-      str(sm.get_symbol_tf_state("GOLD", "H1")))
-check("F4) get_next_instance_id Fassade == Repository",
-      sm.get_next_instance_id() == repo.get_next_instance_id(),
-      f"{sm.get_next_instance_id()} vs {repo.get_next_instance_id()}")
-sm.delete_instance("win_10")
-check("F5) delete_instance via Fassade raeumt ab (beide Tabellen)",
-      sm.get_window_geometry("win_10") is None
-      and len([i for i in sm.load_all_instances()
-               if i.get("instance_id") == "win_10"]) == 0)
-sm.delete_symbol_tf_state("GOLD", "H1")
-check("F6) delete_symbol_tf_state via Fassade entfernt",
-      sm.get_symbol_tf_state("GOLD", "H1") is None)
-# Additive Fassade: die NICHT-instanzbezogenen Bestands-Methoden bleiben
-# (Preset-/Settings-CRUD) erhalten.
-for _m in ("save_indicator_preset", "get_indicator_preset",
-           "list_indicator_presets", "get_app_settings",
-           "save_app_settings", "save_dialog_geometry"):
-    check(f"F7) Fassade behaelt Bestands-Methode {_m}()",
-          hasattr(sm, _m) and callable(getattr(sm, _m)))
-
-# ---------------------------------------------------------------------------
-# 3) schema_version (harmonisiert)
-# ---------------------------------------------------------------------------
-print("\n=== 3) schema_version ===")
-import pandas as pd  # noqa: E402
-from analytics.features.definitions.grid_lines_service import GridLinesService  # noqa: E402
-from analytics.features.definitions.proximity_service import ProximityService  # noqa: E402
-from analytics.features.plugins.base_plugin import PluginContext  # noqa: E402
-
-check("V1) SCHEMA_VERSION_DEFAULT harmonisiert auf '1.0.0'",
-      SCHEMA_VERSION_DEFAULT == "1.0.0", SCHEMA_VERSION_DEFAULT)
-
-df_synth = pd.DataFrame({
-    "time": [1600000000, 1600000360],
-    "open": [30.0, 30.2],
-    "high": [30.15, 30.4],
-    "low": [29.85, 30.1],
-    "close": [30.1, 30.25],
-})
-
-gl = GridLinesService()
-res_gl = gl.calculate(df_synth, {"step_size": 0.5, "steps_around": 4})
-meta_gl = (res_gl.get("feature_store_payload") or {}).get("metadata") or {}
-check("V2) GridLinesService metadata.schema_version == '1.0.0'",
-      meta_gl.get("schema_version") == "1.0.0", str(meta_gl))
-
-_lines = [{"price": 30.0}, {"price": 30.5}, {"price": 29.5}]
-ctx = PluginContext(
-    symbol="SILVER", timeframe="M1", mode="batch",
-    shared_state={"g1": _lines}, depends_on=["g1"], instance_id="p1",
-)
-prox = ProximityService()
-res_prox = prox.calculate(
-    df_synth,
-    {"visit_pct": 0.05, "time_window_mins": 5, "use_time_filter": True},
-    context=ctx,
-)
-meta_prox = (res_prox.get("feature_store_payload") or {}).get("metadata") or {}
-check("V3) ProximityService metadata.schema_version == '1.0.0'",
-      meta_prox.get("schema_version") == "1.0.0", str(meta_prox))
-
-# _normalize_feature_data: None/Alt-Row -> "1.0.0"; vorhandenes Feld bleibt.
-check("V4) _normalize_feature_data(None) -> {'schema_version': '1.0.0'}",
-      FeatureStoreReader._normalize_feature_data(None)
-      == {"schema_version": "1.0.0"},
-      str(FeatureStoreReader._normalize_feature_data(None)))
-check("V5) vorhandenes schema_version bleibt unangetastet",
-      FeatureStoreReader._normalize_feature_data('{"schema_version":"1.2.3","a":1}')
-      == {"schema_version": "1.2.3", "a": 1},
-      str(FeatureStoreReader._normalize_feature_data('{"schema_version":"1.2.3","a":1}')))
-
-# DB-Zeile unveraendert: Alt-Row OHNE schema_version in feature_data wird
-# beim Lesen additiv ergaenzt, aber die DB-Zeile selbst bleibt identisch.
-import duckdb as _duckdb  # noqa: E402
-_fs_con = _duckdb.connect(TEST_FS_DB)
-_fs_con.execute("""
-    CREATE TABLE feature_store (
-        symbol VARCHAR, timeframe VARCHAR, bar_time TIMESTAMPTZ,
-        ema_diff DOUBLE, rsi_14 DOUBLE, atr_normalized DOUBLE,
-        feature_id VARCHAR, plugin_version VARCHAR, feature_data JSON
-    )
-""")
-_fs_con.execute("""
-    INSERT INTO feature_store (symbol, timeframe, bar_time, feature_id,
-                               plugin_version, feature_data)
-    VALUES ('SILVER', 'M1', TIMESTAMPTZ '2026-08-01 10:00:00+00', 'grid_lines',
-            '1.0.0', '{"step_size": 0.5}')
-""")
-_fs_con.close()
-
-fs_reader = FeatureStoreReader(db_path=TEST_FS_DB)
-rows = fs_reader.fetch_rows("SILVER", "M1", feature_id="grid_lines")
-check("V6) Alt-Row ohne schema_version -> Lesedefault '1.0.0'",
-      len(rows) == 1
-      and rows[0]["feature_data"].get("schema_version") == "1.0.0",
-      str([r.get("feature_data") for r in rows]))
-_raw = DbPool.get(TEST_FS_DB).execute(
-    "SELECT feature_data FROM feature_store LIMIT 1").fetchone()[0]
-import json as _json  # noqa: E402
-raw_dict = _raw if isinstance(_raw, dict) else (
-    _json.loads(_raw) if isinstance(_raw, str) else {})
-check("V7) DB-Zeile bleibt unveraendert (kein schema_version geschrieben)",
-      "schema_version" not in raw_dict and raw_dict.get("step_size") == 0.5,
-      str(raw_dict))
-
-# ---------------------------------------------------------------------------
-# Aufraeumen (best effort – DbPool-Connections enden mit dem Prozess)
-# ---------------------------------------------------------------------------
-for _db in (TEST_DB, TEST_FS_DB):
-    try:
-        os.remove(_db)
-    except OSError:
-        pass
-
-print("-" * 60)
-if FAILURES:
-    print(f"FEHLER: {len(FAILURES)} Pruefung(en) fehlgeschlagen: {FAILURES}")
-    sys.exit(1)
-print("ALLE PRUEFUNGEN BESTANDEN (OK)")
-sys.exit(0)
-
-```
-
---------------------------------------------------
-
-### DATEI: test/check_p16_rename_migration.py
-```py
-# test/check_p16_rename_migration.py
-"""
-Phase 16 (06.08.2026) – Headless Check: DB-Migration der Indikator-Umbenennung
-'grid_liquidity' -> 'ind_fixed_grid_proximity' (StateManager._init_db).
-
-Prueft:
-  1. indicator_presets: Legacy-Zeilen (indicator_id='grid_liquidity') werden
-     auf 'ind_fixed_grid_proximity' migriert (UPDATE, idempotent).
-  2. instance_states: indicators_state-JSON mit Legacy-Key 'grid_liquidity'
-     wird auf 'ind_fixed_grid_proximity' gemappt (Kopie der Sub-State-Daten).
-  3. symbol_tf_states: gleiche JSON-Migration.
-  4. Idempotenz: zweiter StateManager-Init aendert nichts mehr.
-  5. chart_win._normalize_indicators_state (statisch) mappt den Legacy-Key.
-"""
-import os
-import sys
-
-sys.path.insert(0, r"F:\Python\PyTrader")
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-
-import json  # noqa: E402
-
-TEST_DIR = os.path.dirname(os.path.abspath(__file__))
-TEST_DB = os.path.join(TEST_DIR, "p16_rename_migration_test.duckdb")
-if os.path.exists(TEST_DB):
-    os.remove(TEST_DB)
-
-from db_service import DbPool, _parse_json_field  # noqa: E402
-
-FAILURES: list = []
-
-
-def check(name: str, cond: bool, detail: str = "") -> None:
-    status = "PASS" if cond else "FAIL"
-    print(f"[{status}] {name}" + (f" - {detail}" if detail and not cond else ""))
-    if not cond:
-        FAILURES.append(name)
-
-
-# --- Legacy-Daten direkt in die frische DB schreiben --------------------------
-con = DbPool.get(TEST_DB)
-con.execute("""
-    CREATE TABLE IF NOT EXISTS window_instances (
-        instance_id VARCHAR PRIMARY KEY, preset_id VARCHAR, window_title VARCHAR,
-        pos_x INTEGER, pos_y INTEGER, width INTEGER, height INTEGER,
-        is_maximized BOOLEAN DEFAULT FALSE
-    )
-""")
-con.execute("""
-    CREATE TABLE IF NOT EXISTS instance_states (
-        instance_id VARCHAR PRIMARY KEY, symbol VARCHAR NOT NULL,
-        timeframe VARCHAR NOT NULL, visible_range_from BIGINT,
-        visible_range_to BIGINT, visible_price_from DOUBLE,
-        visible_price_to DOUBLE, indicators_state JSON,
-        measurement_state JSON, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-""")
-con.execute("""
-    CREATE TABLE IF NOT EXISTS symbol_tf_states (
-        symbol VARCHAR NOT NULL, timeframe VARCHAR NOT NULL,
-        visible_range_from BIGINT, visible_range_to BIGINT,
-        visible_price_from DOUBLE, visible_price_to DOUBLE,
-        indicators_state JSON, measurement_state JSON,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (symbol, timeframe)
-    )
-""")
-con.execute("""
-    CREATE TABLE IF NOT EXISTS indicator_presets (
-        indicator_id VARCHAR NOT NULL, preset_name VARCHAR NOT NULL,
-        params JSON NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (indicator_id, preset_name)
-    )
-""")
-
-# Legacy-Zustand (alter Key 'grid_liquidity')
-legacy_state = {"grid_liquidity": {"active": True, "preset": "Default",
-                                   "params": {"grid_step": 0.5}}}
-con.execute(
-    "INSERT INTO window_instances (instance_id) VALUES ('win_legacy')")
-con.execute(
-    "INSERT INTO instance_states (instance_id, symbol, timeframe, indicators_state) "
-    "VALUES (?, ?, ?, ?)",
-    ["win_legacy", "SILVER", "H1", json.dumps(legacy_state)])
-con.execute(
-    "INSERT INTO symbol_tf_states (symbol, timeframe, indicators_state) "
-    "VALUES (?, ?, ?)",
-    ["SILVER", "H1", json.dumps(legacy_state)])
-con.execute(
-    "INSERT INTO indicator_presets (indicator_id, preset_name, params) "
-    "VALUES (?, ?, ?)",
-    ["grid_liquidity", "Default", json.dumps({"grid_step": 0.5})])
-
-# --- StateManager-Init -> Migration laeuft ------------------------------------
-from state_manager import StateManager  # noqa: E402
-
-sm = StateManager(db_path=TEST_DB)
-
-# 1) indicator_presets migriert
-presets = con.execute(
-    "SELECT indicator_id FROM indicator_presets").fetchall()
-check("M1) indicator_presets: legacy -> ind_fixed_grid_proximity",
-      [r[0] for r in presets] == ["ind_fixed_grid_proximity"], str(presets))
-
-# 2) instance_states JSON gemappt
-row = con.execute(
-    "SELECT indicators_state FROM instance_states WHERE instance_id = 'win_legacy'"
-).fetchone()
-data = _parse_json_field(row[0]) if isinstance(row[0], str) else row[0]
-check("M2) instance_states: Legacy-Key entfernt",
-      isinstance(data, dict) and "grid_liquidity" not in data, repr(data))
-check("M3) instance_states: neuer Key mit Sub-State",
-      isinstance(data, dict)
-      and data.get("ind_fixed_grid_proximity") == legacy_state["grid_liquidity"],
-      repr(data))
-
-# 3) symbol_tf_states JSON gemappt
-row = con.execute(
-    "SELECT indicators_state FROM symbol_tf_states WHERE symbol='SILVER' AND timeframe='H1'"
-).fetchone()
-data = _parse_json_field(row[0]) if isinstance(row[0], str) else row[0]
-check("M4) symbol_tf_states: Legacy-Key entfernt + neuer Key",
-      isinstance(data, dict) and "grid_liquidity" not in data
-      and data.get("ind_fixed_grid_proximity", {}).get("active") is True,
-      repr(data))
-
-# 4) Idempotenz: zweiter Init aendert nichts (kein Fehler, Keys stabil)
-sm2 = StateManager(db_path=TEST_DB)
-row = con.execute(
-    "SELECT indicators_state FROM instance_states WHERE instance_id = 'win_legacy'"
-).fetchone()
-data = _parse_json_field(row[0]) if isinstance(row[0], str) else row[0]
-check("M5) Idempotenz: zweiter Init stabil",
-      isinstance(data, dict) and "grid_liquidity" not in data
-      and "ind_fixed_grid_proximity" in data, repr(data))
-
-# 5) chart_win._normalize_indicators_state (statischer Helfer)
-from chart.chart_win import PyTraderChartWindow  # noqa: E402
-out = PyTraderChartWindow._normalize_indicators_state(dict(legacy_state))
-check("M6) chart_win._normalize_indicators_state mappt Legacy-Key",
-      "grid_liquidity" not in out and "ind_fixed_grid_proximity" in out,
-      repr(out))
-
-# --- Aufraeumen ----------------------------------------------------------------
-con.close()
-try:
-    os.remove(TEST_DB)
-except OSError:
-    pass
-
-print("-" * 60)
-if FAILURES:
-    print(f"FEHLER: {len(FAILURES)} Pruefung(en) fehlgeschlagen: {FAILURES}")
-    sys.exit(1)
-print("ALLE PRUEFUNGEN BESTANDEN (OK)")
-sys.exit(0)
-
-```
-
---------------------------------------------------
-
-### DATEI: test/check_resolve_realtime.js
-```js
-﻿// BEREIT FÜR PHASE 15
-// test/check_resolve_realtime.js
-// Beweist den Fix fuer die "Leerstelle 30.7.26 23:58" (Wanduhr-Zeitachse):
-// 1) Laedt die echte cont->real Map (test/tmp_cont_map.json)
-// 2) Nutzt die ECHTEN Funktionen aus chart/js/02_time_utils.js (resolveRealTime,
-//    _rebuildTimeMaps, toReal/toCont) – Single Source of Truth, kein Duplikat.
-// 3) Zeigt den FIX: resolveRealTime(1785448739.5) -> naechste reale Candle
-//    -> formatDT -> "Fr 31.07.26 00:01" (erste reale Candle nach der Pause)
-// Hintergrund (empirisch verifiziert): Die Roh-Epochs sind bereits Berlin-
-// Wanduhr-encoded (MT5 liefert Wanduhr, sync_market_data schreibt 1:1 via
-// pd.to_datetime(unit="s", utc=True)). formatDT/getBerlinParts formatieren
-// deshalb OHNE Berlin-Offset direkt – sonst waeren alle Labels 2h zu spaet.
-// KEIN UI-Test - reine Logik-Pruefung.
-// Kein 'use strict' - sonst bleiben eval-deklarierte Funktionen lokal.
-const fs = require('fs');
-const path = require('path');
-
-// 02_time_utils.js ist self-contained (kein window/document) -> direkt laden
-const timeUtilsSrc = fs.readFileSync(path.join(__dirname, '..', 'chart', 'js', '02_time_utils.js'), 'utf8');
-eval(timeUtilsSrc);
-
-const mapData = JSON.parse(fs.readFileSync(path.join(__dirname, 'tmp_cont_map.json'), 'utf8'));
-
-// ECHTE _rebuildTimeMaps aus 02_time_utils.js verwenden (setzt beide Maps
-// inkl. inverser real->cont Map). Kein manuelles Map-Befüllen im Test.
-_rebuildTimeMaps(mapData.map);
-
-// Die Phantom-Zeit, die durch currTime-0.5 entsteht (Separator bei der 00:01-Candle)
-const PHANTOM_TS = 1785448739.5;
-const CANDLE_2307 = 1785448680; // cont der 22:59-Candle (i=2307, real 1785452340)
-const CANDLE_2308 = 1785448740; // cont der 00:01-Candle (i=2308, real 1785456060)
-
-console.log('=== BUG-Reproduktion (altes Verhalten: _continuousTimeMap[ts] || ts) ===');
-const oldReal = mapData.map[PHANTOM_TS] || PHANTOM_TS;
-const oldLabel = formatDT(oldReal);
-console.log(`  ts=${PHANTOM_TS} -> Fallback=${oldReal} -> Label="${oldLabel}"`);
-console.log(`  ${oldLabel === 'Do 30.07.26 21:58' ? '>>> BUG: Fake-Zeit (21:58 existiert nicht; echte letzte Candle = 22:59)' : '  (kein Match)'}`);
-
-console.log('\n=== FIX (resolveRealTime aus 02_time_utils.js) ===');
-const newReal = resolveRealTime(PHANTOM_TS);
-const newLabel = formatDT(newReal);
-console.log(`  ts=${PHANTOM_TS} -> real=${newReal} -> Label="${newLabel}"`);
-console.log(`  ${newReal === 1785456060 ? '>>> KORREKT: naechste reale Candle (31.07 00:01 Wanduhr, erste nach Pause 23:00-23:59)' : '  (andere reale Zeit)'}`);
-console.log(`  ${newLabel === 'Fr 31.07.26 00:01' ? '>>> KORREKT: Wanduhr-Label OHNE Berlin-Offset (+2h) ' : '  (Label weicht ab)'}`);
-
-console.log('\n=== toReal() = resolveRealTime() (Alias) ===');
-console.log(`  toReal(1785448739.5) -> ${toReal(PHANTOM_TS)} (muss 1785456060 sein)`);
-
-console.log('\n=== toCont() (inverse Zuordnung, real->cont) ===');
-const contOfReal = toCont(1785456060);
-console.log(`  toCont(1785456060) -> ${contOfReal} (muss 1785448740 sein)`);
-console.log(`  toCont(999999999) -> ${toCont(999999999)} (muss undefined sein)`);
-
-console.log('\n=== Genauigkeit: alle 3000 Candle-Zeiten muessen exakt matchen ===');
-let ok = 0, bad = 0;
-const keys = Object.keys(mapData.map).map(Number).sort((a, b) => a - b);
-for (const k of keys) {
-    const kNum = Number(k);
-    const r = resolveRealTime(kNum);
-    if (r === mapData.map[k]) ok++; else { bad++; if (bad < 5) console.log(`  MISMATCH cont=${kNum} -> ${r} erwartet ${mapData.map[k]}`); }
-}
-console.log(`  exakte Treffer: ${ok}, Mismatch: ${bad}`);
-
-console.log('\n=== Padding-Ticks (ausserhalb des Datensatzes) ===');
-const lastCont = keys[keys.length - 1];
-const padReal = resolveRealTime(lastCont + 3600);
-const padLabel = formatDT(padReal);
-console.log(`  ts=${lastCont + 3600} -> real=${padReal} -> Label="${padLabel}" (clamped auf letzte Candle)`);
-const firstCont = keys[0];
-const firstLabel = formatDT(resolveRealTime(firstCont - 3600));
-console.log(`  ts=${firstCont - 3600} -> Label="${firstLabel}" (clamped auf erste Candle)`);
-
-console.log('\n=== Pausen-Grenze (Wanduhr 22:59 -> 00:01, Pause = 23:00-23:59) ===');
-console.log(`  letzte vor Pause:  real=1785452340 -> Label="${formatDT(1785452340)}"`);
-console.log(`  erste nach Pause:  real=1785456060 -> Label="${formatDT(1785456060)}"`);
-
-console.log('\n=== Ungueltige Eingaben ===');
-console.log(`  undefined -> ${resolveRealTime(undefined)}`);
-console.log(`  NaN -> ${resolveRealTime(NaN)}`);
-console.log(`  null -> ${resolveRealTime(null)}`);
-
-console.log('\nRESULT:', (ok === 3000 && newReal === 1785456060 && newLabel === 'Fr 31.07.26 00:01' && formatDT(1785452340) === 'Do 30.07.26 22:59' && contOfReal === 1785448740) ? 'PASS' : 'FAIL');
-
-```
-
---------------------------------------------------
-
-### DATEI: test/check_service_run_fixes.py
-```py
-# test/check_service_run_fixes.py
-# Headless-Validierung der beiden Service-Run-Bugfixes (05.08.2026):
-#
-#   Bugfix 1: "ausfuehren service proximity -> fertig (kein Feature-Store-
-#             Payload)". UI-angelegte Sets speichern KEIN depends_on. Die
-#             Worker-Aufbereitung prepare_worker_definition() loest die
-#             implizite Abhaengigkeit proximity -> grid_lines anhand der
-#             Plugin-dependencies auf (naechste VORHERIGE Instanz in
-#             execution_order). Explizit gesetzte depends_on bleiben unveraendert.
-#
-#   Bugfix 2: "Scanner-Candles (max) aus den App-Optionen als max Lookback
-#             fuer ALLE Services". prepare_worker_definition() ueberschreibt
-#             den Service-lookback mit scanner_candle_limit (statt des
-#             gespeicherten 1000). Der Worker laedt OHLCV mit
-#             settings.scanner_candle_limit statt feature_builder_limit.
-#
-# KEINE UI-/DB-Tests: reine Logik auf synthetischen DataFrames (kein Schreiben
-# in data/), Evaluator-Pfad ohne Feature-Store-Persistenz.
-import os
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
-import pandas as pd
-
-ok = True
-failures = []
-
-
-def check(cond, msg):
-    global ok
-    if cond:
-        print(f"   ✅ {msg}")
-    else:
-        ok = False
-        failures.append(msg)
-        print(f"   ❌ {msg}")
-
-
-def main() -> int:
-    global ok
-    print("=" * 70)
-    print("Service-Run-Bugfixes (depends_on-Aufloesung + Scanner-Lookback)")
-    print("=" * 70)
-
-    from serviceui.service_set_utils import prepare_worker_definition
-    from analytics.features.definitions.proximity_service import ProximityService
-
-    # ---------------------------------------------------------------- [1]
-    print("\n[1] ProximityService.dependencies deklariert grid_lines:")
-    svc = ProximityService()
-    check(svc.dependencies == ["grid_lines"],
-          f"ProximityService.dependencies == ['grid_lines'] (ist {svc.dependencies})")
-
-    # ---------------------------------------------------------------- [2]
-    print("\n[2] prepare_worker_definition – depends_on-Aufloesung:")
-    definition = {
-        "set_id": "s1",
-        "display_name": "UI-Set",
-        "execution_order": ["grid_lines", "proximity"],
-        "services": {
-            "grid_lines": {"plugin_id": "grid_lines", "lookback": 1000,
-                           "params": {"step_size": 0.5}},
-            "proximity": {"plugin_id": "proximity", "lookback": 500,
-                          "params": {"visit_pct": 0.05}},
-        },
-    }
-    prepared = prepare_worker_definition(definition, 100_000)
-
-    # Original bleibt unveraendert (Kopie)
-    check(definition["services"]["proximity"].get("depends_on") is None,
-          "Original-Definition unveraendert (kein depends_on nachgetragen)")
-    # proximity erhaelt implizites depends_on auf die VORHERIGE grid_lines-Instanz
-    deps = (prepared["services"]["proximity"] or {}).get("depends_on")
-    check(deps == ["grid_lines"],
-          f"proximity.depends_on automatisch auf ['grid_lines'] (ist {deps})")
-    # grid_lines (ohne dependencies) bekommt KEIN depends_on
-    check("depends_on" not in (prepared["services"]["grid_lines"] or {}),
-          "grid_lines ohne depends_on (keine Upstream-Plugins)")
-
-    # Lookback-Override fuer ALLE Services
-    lb_p = (prepared["services"]["proximity"] or {}).get("lookback")
-    lb_g = (prepared["services"]["grid_lines"] or {}).get("lookback")
-    check(lb_p == 100_000 and lb_g == 100_000,
-          f"Lookback-Override auf 100000 fuer alle Services (prox={lb_p}, grid={lb_g})")
-
-    # ---------------------------------------------------------------- [3]
-    print("\n[3] Explizites depends_on bleibt unveraendert:")
-    indi_def = {
-        "set_id": "ind_fixed_grid_proximity_internal",
-        "execution_order": ["grid_1", "prox_1"],
-        "services": {
-            "grid_1": {"plugin_id": "grid_lines", "lookback": 1000, "params": {}},
-            "prox_1": {"plugin_id": "proximity", "lookback": 1000,
-                       "depends_on": ["grid_1"], "params": {}},
-        },
-    }
-    prep2 = prepare_worker_definition(indi_def, 50_000)
-    check((prep2["services"]["prox_1"] or {}).get("depends_on") == ["grid_1"],
-          "explizites depends_on ['grid_1'] nicht ueberschrieben")
-
-    # ---------------------------------------------------------------- [4]
-    print("\n[4] End-to-End: Evaluator-Pipeline (depends_on-Aufloesung aktiv):")
-    from analytics.engine.set_evaluator import ServiceSetEvaluator
-    from analytics.features.plugins.base_plugin import PluginContext
-
-    # Synthetische OHLCV: 5 M1-Bars um 30.0 -> Grid-Level 30.0 wird getroffen
-    base = 1600000000
-    df = pd.DataFrame({
-        "time": [base + i * 60 for i in range(5)],
-        "open": [30.0] * 5,
-        "high": [30.02] * 5,
-        "low": [29.98] * 5,
-        "close": [30.0] * 5,
-    })
-    df_plugin = df.copy()
-    df_plugin["time"] = df_plugin["time"].astype(int)
-
-    evaluator = ServiceSetEvaluator()
-    ctx = PluginContext(symbol="SILVER", timeframe="M1", mode="batch")
-    results = evaluator.execute_set(prepared, df_plugin, context=ctx)
-
-    prox_res = results.get("proximity") or {}
-    fsp = prox_res.get("feature_store_payload") or {}
-    records = fsp.get("records") or []
-    check(bool(records), f"proximity liefert Feature-Store-Records (n={len(records)})")
-    check(fsp.get("feature_id") == "proximity",
-          f"feature_id='proximity' (ist {fsp.get('feature_id')})")
-    check(bool(fsp.get("metadata", {}).get("depends_on")),
-          f"metadata.depends_on im Payload gesetzt (ist {fsp.get('metadata', {}).get('depends_on')})")
-    grid_res = results.get("grid_lines") or {}
-    grid_recs = (grid_res.get("feature_store_payload") or {}).get("records") or []
-    check(len(grid_recs) == 5, f"grid_lines Records ueber 5 Bars (n={len(grid_recs)})")
-
-    # ---------------------------------------------------------------- [5]
-    print("\n[5] Worker-Load-Limit nutzt scanner_candle_limit (Code-Inspektion):")
-    rw_src = (Path(__file__).resolve().parent.parent / "serviceui" / "run_worker.py").read_text(
-        encoding="utf-8", errors="replace")
-    check("limit=settings.scanner_candle_limit" in rw_src,
-          "run_worker.py: load_ohlcv mit scanner_candle_limit")
-    check("prepare_worker_definition" in rw_src,
-          "run_worker.py ruft prepare_worker_definition() auf")
-
-    print()
-    if ok:
-        print("RESULT: ALLE CHECKS BESTANDEN ✅")
-        return 0
-    print(f"RESULT: {len(failures)} CHECK(S) FEHLGESCHLAGEN ❌")
-    for f in failures:
-        print(f"   - {f}")
-    return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-
-```
-
---------------------------------------------------
-
-### DATEI: test/check_time_utils.js
-```js
-﻿// BEREIT FÜR PHASE 15
-// test/check_time_utils.js
-// Verifiziert: keine Endlosschleife bei ungueltigen Eingaben in getBerlinParts/formatDT
-// (Root Cause: timeFormatter erhielt UTCTimestamp-Zahl, Code griff auf t.time zu -> undefined
-//  -> formatDT(undefined) -> Endlosschleife im alten DST-Check -> Chart-Hang, kein Crosshair/Panning)
-// Hinweis: Seit dem Wanduhr-Fix gibt es keinen _isBerlinDST-Check mehr –
-// getBerlinParts formatiert die (bereits Wanduhr-encoded) Roh-Epochs direkt.
-const fs = require('fs');
-const path = require('path');
-
-// Gefixte Zeit-Utils laden
-const utils = fs.readFileSync(path.join(__dirname, '..', 'chart', 'js', '02_time_utils.js'), 'utf-8');
-eval(utils);
-
-let failures = 0;
-
-function check(label, fn, expectThrowFree) {
-    try {
-        const result = fn();
-        if (expectThrowFree) {
-            console.log(`OK   ${label} -> ${JSON.stringify(result)}`);
-        }
-    } catch (e) {
-        failures++;
-        console.error(`FAIL ${label} -> Exception: ${e.message}`);
-    }
-}
-
-console.log('--- Szenario 1: timeFormatter mit Zahl (der Bug-Fall, t.time = undefined) ---');
-check('formatDT mit Zahl (kein .time)', () => {
-    const t = 1770192000; // UTCTimestamp-Zahl
-    const ts = (t !== null && typeof t === 'object') ? t.time : t; // gefixter Zugriff
-    const realT = ({}[ts] || ts); // leere _continuousTimeMap
-    return formatDT(realT);
-}, true);
-
-console.log('--- Szenario 2: formatDT(undefined) (absoluter Crash-Fall) ---');
-check('formatDT(undefined)', () => formatDT(undefined), true);
-
-console.log('--- Szenario 3: valider Timestamp (normaler Betrieb) ---');
-check('formatDT(1770192000)', () => formatDT(1770192000), true);
-check('getBerlinParts(1770192000)', () => getBerlinParts(1770192000), true);
-
-console.log('--- Szenario 4: Wanduhr-Formatierung (kein Berlin-Offset) ---');
-// Roh-Epoch 1785456060 = erste Candle nach der Pause (Wanduhr 00:01 am 31.07.)
-// Ohne Berlin-Offset wird direkt "Fr 31.07.26 00:01" erwartet.
-check('formatDT(1785456060) Wanduhr 00:01', () => {
-    const lbl = formatDT(1785456060);
-    if (lbl !== 'Fr 31.07.26 00:01') throw new Error(`erwartet Fr 31.07.26 00:01, war ${lbl}`);
-    return lbl;
-}, true);
-// Letzte Candle vor der Pause: Wanduhr 22:59 am 30.07. (Pause = 23:00-23:59)
-check('formatDT(1785452340) Wanduhr 22:59', () => {
-    const lbl = formatDT(1785452340);
-    if (lbl !== 'Do 30.07.26 22:59') throw new Error(`erwartet Do 30.07.26 22:59, war ${lbl}`);
-    return lbl;
-}, true);
-
-if (failures === 0) {
-    console.log('\nALLE TESTS OK - KEINE ENDLOSSCHLEIFE');
-    process.exit(0);
-} else {
-    console.error(`\n${failures} TEST(S) FEHLGESCHLAGEN`);
-    process.exit(1);
-}
-
-```
-
---------------------------------------------------
-
-### DATEI: test/migrate_legacy_feature_store.py
-```py
-# test/migrate_legacy_feature_store.py
-"""
-Migration (05.08.2026, Punkt 1): Legacy-Rows im feature_store erhalten eine
-gueltige feature_id.
-
-Hintergrund:
-  Alle 673.235 Zeilen der analytics.duckdb/feature_store wurden von der ALTEN
-  Monolith-Pipeline (FeatureBuilder.build(), Phasen 12-13) geschrieben und
-  tragen KEINE Plugin-Identitaet (feature_id = NULL, plugin_version = NULL,
-  feature_data = NULL). Dadurch fand fetch_last_execution_dates() keine
-  Zeilen und der MasterTree zeigte ueberall '(--.--.--)', obwohl Daten
-  vorhanden sind.
-
-  Die Legacy-Zeilen mit befuellten grid_*-Spalten (grid_nearest_level /
-  grid_dist_abs / grid_dist_pct / is_time_window_active) tragen exakt die
-  Daten, die heute der `proximity`-Service erzeugt (Abstand des Preises zu
-  den Grid-Linien). Sie werden daher semantisch korrekt auf
-  feature_id = 'proximity' migriert.
-
-  WICHTIG (keine Verfaelschung):
-    * feature_data bleibt NULL – der Chart-Lesepfad
-      (read_proximity_from_feature_store) filtert `feature_data IS NOT NULL`
-      UND `is_hit == True` und ignoriert die migrierten Zeilen dadurch
-      weiterhin (keine Aenderung im Chart-Rendering).
-    * created_at bleibt unveraendert (liefert das echte Legacy-Datum).
-    * plugin_version = 'legacy' kennzeichnet die migrierten Zeilen
-      transparent (echte Plugin-Runs schreiben '1.0.0').
-
-Aufruf:
-    python test/migrate_legacy_feature_store.py            # Dry-Run
-    python test/migrate_legacy_feature_store.py --apply    # Migration
-
-Exit-Code:
-    0 = keine unklassifizierten Legacy-Zeilen (feature_id IS NULL) mehr
-"""
-
-import argparse
-import sys
-from pathlib import Path
-
-import duckdb
-
-PROJECT = Path(__file__).resolve().parent.parent
-ANALYTICS_DB = PROJECT / "data" / "analytics.duckdb"
-
-# Legacy-Zeilen mit grid_*-Spalten = Proximity-Semantik (Abfrage)
-GRID_ROWS_SQL = """
-    SELECT COUNT(*) FROM feature_store
-    WHERE feature_id IS NULL
-      AND (grid_nearest_level IS NOT NULL
-           OR grid_dist_abs IS NOT NULL
-           OR grid_dist_pct IS NOT NULL)
-"""
-
-APPLY_SQL = """
-    UPDATE feature_store
-    SET feature_id = 'proximity',
-        plugin_version = 'legacy'
-    WHERE feature_id IS NULL
-      AND (grid_nearest_level IS NOT NULL
-           OR grid_dist_abs IS NOT NULL
-           OR grid_dist_pct IS NOT NULL)
-"""
-
-
-def _count(con, sql: str, params=None) -> int:
-    row = con.execute(sql, params or []).fetchone()
-    return int(row[0]) if row and row[0] is not None else 0
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Legacy feature_store-Migration")
-    ap.add_argument("--apply", action="store_true",
-                    help="Migration tatsaechlich ausfuehren (sonst Dry-Run)")
-    ap.add_argument("--db", default=str(ANALYTICS_DB),
-                    help="Pfad zur analytics.duckdb")
-    args = ap.parse_args()
-
-    con = duckdb.connect(args.db)
-
-    total = _count(con, "SELECT COUNT(*) FROM feature_store")
-    null_fid = _count(con,
-                      "SELECT COUNT(*) FROM feature_store "
-                      "WHERE feature_id IS NULL")
-    grid_rows = _count(con, GRID_ROWS_SQL)
-    non_grid_legacy = null_fid - grid_rows
-
-    print(f"feature_store gesamt      : {total}")
-    print(f"feature_id IS NULL (Legacy): {null_fid}")
-    print(f"  davon grid_*-Zeilen      : {grid_rows}  -> werden 'proximity'")
-    print(f"  davon ohne grid_*        : {non_grid_legacy}  -> bleiben NULL")
-
-    if not args.apply:
-        print("\nDRY-RUN: keine Aenderung. Mit --apply ausfuehren.")
-        # Exit 0 = konsistent (keine migrierbaren Zeilen mehr erwartet)
-        return 0 if grid_rows == 0 else 1
-
-    # created_at defensiv nachziehen (falls Alt-Rows ohne Zeitstempel)
-    _count(con, """
-        UPDATE feature_store
-        SET created_at = current_timestamp
-        WHERE created_at IS NULL
-    """)
-    affected = _count(con, APPLY_SQL)
-    print(f"\nMigration angewendet: {affected} Zeilen -> feature_id='proximity'")
-
-    # Verifikation
-    remaining = _count(con,
-                       "SELECT COUNT(*) FROM feature_store "
-                       "WHERE feature_id IS NULL")
-    remaining_grid = _count(con, GRID_ROWS_SQL)
-    prox = _count(con,
-                  "SELECT COUNT(*) FROM feature_store "
-                  "WHERE feature_id = 'proximity'")
-    print(f"Verbleibende feature_id IS NULL: {remaining}")
-    print(f"  davon grid_*-Zeilen           : {remaining_grid}")
-    print(f"feature_id = 'proximity'       : {prox}")
-    # Exit 0 = keine migrierbaren Grid-Legacy-Zeilen mehr (atr-only Rows
-    # ohne grid_* bleiben bewusst NULL – sie tragen keine Proximity-Semantik).
-    return 0 if remaining_grid == 0 else 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-
-```
-
---------------------------------------------------
-
-### DATEI: test/simulate_chart_mapping.py
-```py
-﻿# BEREIT FÜR PHASE 15
-# test/simulate_chart_mapping.py
-"""Simuliert exakt den Chart-Mapping-Pfad aus chart_win._do_refresh_chart_data:
-1) laedt die letzten 3000 SILVER M1-Candles aus der DB
-2) baut kontinuierliche Zeiten (base + i*60)
-3) erzeugt timeMap cont->real
-4) berechnet, welche Labels der Chart anzeigen wuerde (Wanduhrzeit)
-5) sucht nach diskontinuitaeten / falschen Labels / Tagesseparator-Positionen.
-WICHTIG: Die DB-Epochs (EXTRACT) sind Berlin-Wanduhr-encoded -
-datetime.fromtimestamp(e, tz=utc) liefert direkt die Wanduhrzeit (keine +2h).
-KEIN UI-Test."""
-import sys
-from datetime import datetime, timezone
-
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
-import duckdb
-
-DB = r"F:\Python\PyTrader\data\market_data.duckdb"
-LIMIT = 3000
-TF_SEC = 60
-
-con = duckdb.connect(DB, read_only=True)
-rows = con.execute("""
-    SELECT EXTRACT(epoch FROM "time")::BIGINT AS e, "time"
-    FROM ohlcv_bars
-    WHERE LOWER(symbol)='silver' AND LOWER(timeframe)='m1'
-      AND "time" IS NOT NULL AND open IS NOT NULL AND high IS NOT NULL AND low IS NOT NULL AND close IS NOT NULL
-    ORDER BY "time" DESC LIMIT ?
-""", [LIMIT]).fetchall()
-con.close()
-
-# aufsteigend sortieren (wie fetch_historical_candles)
-rows = list(reversed(rows))
-reals = [int(r[0]) for r in rows]
-print(f"Candles: {len(rows)}")
-print(f"  erste real: {datetime.fromtimestamp(reals[0], tz=timezone.utc)} (Wanduhr)")
-print(f"  letzte real: {datetime.fromtimestamp(reals[-1], tz=timezone.utc)} (Wanduhr)")
-
-# Kontinuierliches Mapping exakt wie in chart_win.py
-base_time = reals[0]
-cont_to_real = {}
-real_to_cont = {}
-cont_candles = []
-for i, c in enumerate(rows):
-    cont_time = base_time + i * TF_SEC
-    real_time = int(c[0])
-    cont_to_real[cont_time] = real_time
-    real_to_cont[real_time] = cont_time
-    cont_candles.append(cont_time)
-
-print(f"\nKontinuierliche Zeit: base={base_time} ({datetime.fromtimestamp(base_time, tz=timezone.utc)} Wanduhr)")
-print(f"  cont-Minimum={cont_candles[0]}  cont-Maximum={cont_candles[-1]}")
-
-# Pruefen: kontinuierlich?
-issues = 0
-for i in range(1, len(cont_candles)):
-    if cont_candles[i] - cont_candles[i-1] != TF_SEC:
-        print(f"  [!!!] cont-Luecke bei i={i}: {cont_candles[i-1]} -> {cont_candles[i]}")
-        issues += 1
-print(f"  cont-Luecken: {issues}")
-
-# Zeitbereich um die Tagesgrenze 30.07->31.07 (Wanduhr) ausgeben
-print("\n=== Bars im Bereich 30.07 23:40 Wanduhr bis 31.07 02:10 Wanduhr ===")
-t0 = datetime(2026, 7, 30, 23, 40, tzinfo=timezone.utc)
-t1 = datetime(2026, 7, 31, 2, 10, tzinfo=timezone.utc)
-for i, e in enumerate(reals):
-    wall = datetime.fromtimestamp(e, tz=timezone.utc)
-    if t0 <= wall <= t1:
-        cont = cont_candles[i]
-        # Label, das der Chart anzeigen wuerde
-        realT = cont_to_real.get(cont, cont)
-        b = datetime.fromtimestamp(realT, tz=timezone.utc)
-        label = f"{b.strftime('%w')} {b.strftime('%d.%m.%y %H:%M')}"
-        # Wochenende/Wanduhr-Tag-Wechsel?
-        prev_real = reals[i-1] if i > 0 else None
-        sep = ""
-        if prev_real is not None and (int(prev_real)//86400 != e//86400):
-            sep = "  <== WANDUHR-TAGWECHSEL"
-        print(f"  i={i:4d} real={wall.strftime('%d.%m %H:%M')}  cont={cont}  label={label}{sep}")
-
-# Tagesseparator-Positionen (wie DaySeparator.computeDaySeparatorTimes in
-# chart/js/03_chart_rendering.js - reine Logik-Referenz, kein UI-Test)
-print("\n=== Tagesseparatoren (Wanduhr-Tagwechsel) im Fenster ===")
-last_line_time = 0
-for i in range(1, len(reals)):
-    prevReal = cont_to_real.get(cont_candles[i-1], cont_candles[i-1])
-    currReal = cont_to_real.get(cont_candles[i], cont_candles[i])
-    prevUtcDay = int(prevReal) // 86400
-    currUtcDay = int(currReal) // 86400
-    isUtcDayChange = currUtcDay != prevUtcDay
-    isWeekendGap = currReal - prevReal > 43200
-    isTooClose = (last_line_time > 0 and (cont_candles[i] - last_line_time) < 21600)
-    if (isUtcDayChange or isWeekendGap) and not isTooClose:
-        last_line_time = cont_candles[i]
-        wall = datetime.fromtimestamp(int(currReal), tz=timezone.utc)
-        print(f"  Separator bei cont={cont_candles[i]}  (real Wanduhr {wall.strftime('%d.%m.%y %H:%M')})  currTime-0.5={cont_candles[i]-0.5}  currTime+0.5={cont_candles[i]+0.5}")
-
-# Fallback-Labels: kontinuierliche Zeit ohne Real-Mapping? (tickMarkFormatter-Fallback)
-print("\n=== Tick-Labels: kontinuierliche Zeiten OHNE Real-Mapping? ===")
-# Tickmarken, die LWC bei jedem vollen cont-stunde generieren wuerde
-missing = 0
-for tick in range(cont_candles[0] - cont_candles[0] % 3600, cont_candles[-1], 3600):
-    if tick in cont_to_real:
-        realT = cont_to_real[tick]
-        b = datetime.fromtimestamp(realT, tz=timezone.utc)
-        print(f"  Tick {tick} -> real {b.strftime('%d.%m.%y %H:%M')} OK")
-    else:
-        missing += 1
-        print(f"  Tick {tick} -> [FALLBACK fake] {tick}  => label {datetime.fromtimestamp(tick, tz=timezone.utc)}")
-print(f"  Ticks ohne Mapping: {missing}")
-
-```
-
---------------------------------------------------
-
 ### DATEI: test/test.py
 ```py
 # test/test.py
@@ -27243,15 +24348,20 @@ _params_prox = {"visit_pct": 0.05, "time_window_mins": 5,
                 "use_time_filter": True}
 _res_prox = prox.calculate(_df_prox, _params_prox, context=_ctx)
 _rows_p = (_res_prox.get("feature_store_payload") or {}).get("records") or []
-_circles_p = (_res_prox.get("chart_render_payload") or {}).get("hit_circles") or []
-_status_p = (_res_prox.get("chart_render_payload") or {}).get("status_info") or {}
-_active_p = _status_p.get("active_hits") or []
+_meta_p = (_res_prox.get("feature_store_payload") or {}).get("metadata") or {}
+_stats_p = _meta_p.get("statistics") or {}
+_active_p = _stats_p.get("active_hits") or []
 _ref_rows, _ref_circ, _ref_act = _prox_ref(_df_prox, _lines, 0.05, 5, True)
 check("V4) proximity: #Feature-Rows = Referenz", len(_rows_p) == len(_ref_rows),
       f"{len(_rows_p)} vs {len(_ref_rows)}")
-check("V5) proximity: #hit_circles = Referenz", len(_circles_p) == len(_ref_circ),
-      f"{len(_circles_p)} vs {len(_ref_circ)}")
-check("V6) proximity: active_hits = Referenz", _active_p == _ref_act,
+# P16.01 (Architektur-Entkopplung): Der Service liefert KEINEN
+# chart_render_payload mehr – hit_circles/status_info baut der Indikator
+# (build_chart_render_payload) aus den Rohdaten (E4/E5).
+check("V5) proximity: KEIN chart_render_payload mehr (P16.01)",
+      "chart_render_payload" not in _res_prox,
+      f"keys={list(_res_prox.keys())}")
+check("V6) proximity: active_hits = Referenz (metadata.statistics, E4)",
+      _active_p == _ref_act,
       f"{_active_p} vs {_ref_act}")
 _rows_ok = all(
     r["bar_time"] == ref["bar_time"]
@@ -27261,12 +24371,26 @@ _rows_ok = all(
     for r, ref in zip(_rows_p, _ref_rows)
 )
 check("V7) proximity: Feature-Rows vollstaendige Paritaet", _rows_ok, "")
-_circ_ok = all(
-    c["time"] == ref["time"] and c["price"] == ref["price"]
-    and c["in_window"] == ref["in_window"]
-    for c, ref in zip(_circles_p, _ref_circ)
-)
-check("V8) proximity: hit_circles vollstaendige Paritaet", _circ_ok, "")
+# P16.01: hit_circles aus den ROHDATEN via build_chart_render_payload
+# (Prioritaet 10, in_window-Flag, Paritaet zur Referenz).
+from chart.indicators.fixed_grid_proximity import FixedGridProximityIndicator  # noqa: E402
+_indi = FixedGridProximityIndicator()
+_circ_p = (_indi.build_chart_render_payload(
+    {"grid_levels": _lines, "proximity_records": _rows_p,
+     "status_info": _stats_p},
+    {"show_lines": True, "line_color": "", "show_circles": True,
+     "circle_color_std": "#FFEB3B", "circle_color_active": "#E91E63",
+     "use_time_filter": True},
+) or {}).get("hit_circles") or []
+check("V8) proximity: hit_circles (build_chart_render_payload) = Referenz",
+      len(_circ_p) == len(_ref_circ)
+      and all(
+          c["time"] == ref["time"] and c["price"] == ref["price"]
+          and c["in_window"] == ref["in_window"]
+          and c.get("priority") == 10
+          for c, ref in zip(_circ_p, _ref_circ)
+      ),
+      f"{len(_circ_p)} vs {len(_ref_circ)}")
 
 # 7.5 _bar_utc_minutes: vektorisiert vs. datetime-basiert (inkl. neg. Zeiten)
 _ts_m = list(range(1600000000, 1600000000 + 7200, 60)) + [-1, -3600, 0]
@@ -27307,85 +24431,6 @@ if FAILURES:
 print("ALLE PRUEFUNGEN BESTANDEN (OK)")
 sys.exit(0)
 
-```
-
---------------------------------------------------
-
-### DATEI: test/test_db_lock.py
-```py
-﻿# BEREIT FÜR PHASE 15
-# test/test_db_lock.py
-"""Test: Kann ein paralleler Schreiber (INSERT-Loop) neue Lese-Verbindungen blockieren?
-Simuliert DataSyncWorker (schreibt) vs. MarketDataRepository (liest via db_connect)."""
-import os
-import sys
-import threading
-import time
-
-sys.path.insert(0, r"F:\Python\PyTrader")
-
-import duckdb
-
-DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "locktest.duckdb")
-if os.path.exists(DB):
-    os.remove(DB)
-
-con = duckdb.connect(DB)
-con.execute("CREATE TABLE t (id INT, val DOUBLE)")
-con.execute("INSERT INTO t SELECT i, i*1.0 FROM range(100000) r(i)")
-con.close()
-
-failures = []
-stop = threading.Event()
-
-def writer():
-    wc = duckdb.connect(DB)
-    i = 0
-    while not stop.is_set():
-        wc.execute("INSERT INTO t SELECT ? + i, i*1.0 FROM range(1000) r(i)", [i])
-        i += 1000
-        wc.execute("DELETE FROM t WHERE id < ?", [i])
-    wc.close()
-
-t = threading.Thread(target=writer, daemon=True)
-t.start()
-
-# Reader: wiederholt neue Verbindung oeffnen und lesen (wie db_connect)
-attempts = 0
-errors = 0
-time.sleep(0.2)
-for _ in range(50):
-    try:
-        rc = duckdb.connect(DB)
-        row = rc.execute("SELECT COUNT(*) FROM t").fetchone()
-        rc.close()
-        if row is None:
-            errors += 1
-    except Exception as e:
-        errors += 1
-        failures.append(str(e))
-    attempts += 1
-    time.sleep(0.05)
-
-stop.set()
-t.join(timeout=2)
-
-print(f"Attempts: {attempts}, Errors: {errors}")
-if failures:
-    print("Erste Fehler:")
-    for f in failures[:5]:
-        print("  ", f)
-
-os.remove(DB)
-print("LOCKTEST FERTIG")
-
-```
-
---------------------------------------------------
-
-### DATEI: test/tmp_cont_map.json
-```json
-{"base_time": 1785310260, "count": 3000, "map": {"1785310260": 1785310260, "1785310320": 1785310320, "1785310380": 1785310380, "1785310440": 1785310440, "1785310500": 1785310500, "1785310560": 1785310560, "1785310620": 1785310620, "1785310680": 1785310680, "1785310740": 1785310740, "1785310800": 1785310800, "1785310860": 1785310860, "1785310920": 1785310920, "1785310980": 1785310980, "1785311040": 1785311040, "1785311100": 1785311100, "1785311160": 1785311160, "1785311220": 1785311220, "1785311280": 1785311280, "1785311340": 1785311340, "1785311400": 1785311400, "1785311460": 1785311460, "1785311520": 1785311520, "1785311580": 1785311580, "1785311640": 1785311640, "1785311700": 1785311700, "1785311760": 1785311760, "1785311820": 1785311820, "1785311880": 1785311880, "1785311940": 1785311940, "1785312000": 1785312000, "1785312060": 1785312060, "1785312120": 1785312120, "1785312180": 1785312180, "1785312240": 1785312240, "1785312300": 1785312300, "1785312360": 1785312360, "1785312420": 1785312420, "1785312480": 1785312480, "1785312540": 1785312540, "1785312600": 1785312600, "1785312660": 1785312660, "1785312720": 1785312720, "1785312780": 1785312780, "1785312840": 1785312840, "1785312900": 1785312900, "1785312960": 1785312960, "1785313020": 1785313020, "1785313080": 1785313080, "1785313140": 1785313140, "1785313200": 1785313200, "1785313260": 1785313260, "1785313320": 1785313320, "1785313380": 1785313380, "1785313440": 1785313440, "1785313500": 1785313500, "1785313560": 1785313560, "1785313620": 1785313620, "1785313680": 1785313680, "1785313740": 1785313740, "1785313800": 1785313800, "1785313860": 1785313860, "1785313920": 1785313920, "1785313980": 1785313980, "1785314040": 1785314040, "1785314100": 1785314100, "1785314160": 1785314160, "1785314220": 1785314220, "1785314280": 1785314280, "1785314340": 1785314340, "1785314400": 1785314400, "1785314460": 1785314460, "1785314520": 1785314520, "1785314580": 1785314580, "1785314640": 1785314640, "1785314700": 1785314700, "1785314760": 1785314760, "1785314820": 1785314820, "1785314880": 1785314880, "1785314940": 1785314940, "1785315000": 1785315000, "1785315060": 1785315060, "1785315120": 1785315120, "1785315180": 1785315180, "1785315240": 1785315240, "1785315300": 1785315300, "1785315360": 1785315360, "1785315420": 1785315420, "1785315480": 1785315480, "1785315540": 1785315540, "1785315600": 1785315600, "1785315660": 1785315660, "1785315720": 1785315720, "1785315780": 1785315780, "1785315840": 1785315840, "1785315900": 1785315900, "1785315960": 1785315960, "1785316020": 1785316020, "1785316080": 1785316080, "1785316140": 1785316140, "1785316200": 1785316200, "1785316260": 1785316260, "1785316320": 1785316320, "1785316380": 1785316380, "1785316440": 1785316440, "1785316500": 1785316500, "1785316560": 1785316560, "1785316620": 1785316620, "1785316680": 1785316680, "1785316740": 1785316740, "1785316800": 1785316800, "1785316860": 1785316860, "1785316920": 1785316920, "1785316980": 1785316980, "1785317040": 1785317040, "1785317100": 1785317100, "1785317160": 1785317160, "1785317220": 1785317220, "1785317280": 1785317280, "1785317340": 1785317340, "1785317400": 1785317400, "1785317460": 1785317460, "1785317520": 1785317520, "1785317580": 1785317580, "1785317640": 1785317640, "1785317700": 1785317700, "1785317760": 1785317760, "1785317820": 1785317820, "1785317880": 1785317880, "1785317940": 1785317940, "1785318000": 1785318000, "1785318060": 1785318060, "1785318120": 1785318120, "1785318180": 1785318180, "1785318240": 1785318240, "1785318300": 1785318300, "1785318360": 1785318360, "1785318420": 1785318420, "1785318480": 1785318480, "1785318540": 1785318540, "1785318600": 1785318600, "1785318660": 1785318660, "1785318720": 1785318720, "1785318780": 1785318780, "1785318840": 1785318840, "1785318900": 1785318900, "1785318960": 1785318960, "1785319020": 1785319020, "1785319080": 1785319080, "1785319140": 1785319140, "1785319200": 1785319200, "1785319260": 1785319260, "1785319320": 1785319320, "1785319380": 1785319380, "1785319440": 1785319440, "1785319500": 1785319500, "1785319560": 1785319560, "1785319620": 1785319620, "1785319680": 1785319680, "1785319740": 1785319740, "1785319800": 1785319800, "1785319860": 1785319860, "1785319920": 1785319920, "1785319980": 1785319980, "1785320040": 1785320040, "1785320100": 1785320100, "1785320160": 1785320160, "1785320220": 1785320220, "1785320280": 1785320280, "1785320340": 1785320340, "1785320400": 1785320400, "1785320460": 1785320460, "1785320520": 1785320520, "1785320580": 1785320580, "1785320640": 1785320640, "1785320700": 1785320700, "1785320760": 1785320760, "1785320820": 1785320820, "1785320880": 1785320880, "1785320940": 1785320940, "1785321000": 1785321000, "1785321060": 1785321060, "1785321120": 1785321120, "1785321180": 1785321180, "1785321240": 1785321240, "1785321300": 1785321300, "1785321360": 1785321360, "1785321420": 1785321420, "1785321480": 1785321480, "1785321540": 1785321540, "1785321600": 1785321600, "1785321660": 1785321660, "1785321720": 1785321720, "1785321780": 1785321780, "1785321840": 1785321840, "1785321900": 1785321900, "1785321960": 1785321960, "1785322020": 1785322020, "1785322080": 1785322080, "1785322140": 1785322140, "1785322200": 1785322200, "1785322260": 1785322260, "1785322320": 1785322320, "1785322380": 1785322380, "1785322440": 1785322440, "1785322500": 1785322500, "1785322560": 1785322560, "1785322620": 1785322620, "1785322680": 1785322680, "1785322740": 1785322740, "1785322800": 1785322800, "1785322860": 1785322860, "1785322920": 1785322920, "1785322980": 1785322980, "1785323040": 1785323040, "1785323100": 1785323100, "1785323160": 1785323160, "1785323220": 1785323220, "1785323280": 1785323280, "1785323340": 1785323340, "1785323400": 1785323400, "1785323460": 1785323460, "1785323520": 1785323520, "1785323580": 1785323580, "1785323640": 1785323640, "1785323700": 1785323700, "1785323760": 1785323760, "1785323820": 1785323820, "1785323880": 1785323880, "1785323940": 1785323940, "1785324000": 1785324000, "1785324060": 1785324060, "1785324120": 1785324120, "1785324180": 1785324180, "1785324240": 1785324240, "1785324300": 1785324300, "1785324360": 1785324360, "1785324420": 1785324420, "1785324480": 1785324480, "1785324540": 1785324540, "1785324600": 1785324600, "1785324660": 1785324660, "1785324720": 1785324720, "1785324780": 1785324780, "1785324840": 1785324840, "1785324900": 1785324900, "1785324960": 1785324960, "1785325020": 1785325020, "1785325080": 1785325080, "1785325140": 1785325140, "1785325200": 1785325200, "1785325260": 1785325260, "1785325320": 1785325320, "1785325380": 1785325380, "1785325440": 1785325440, "1785325500": 1785325500, "1785325560": 1785325560, "1785325620": 1785325620, "1785325680": 1785325680, "1785325740": 1785325740, "1785325800": 1785325800, "1785325860": 1785325860, "1785325920": 1785325920, "1785325980": 1785325980, "1785326040": 1785326040, "1785326100": 1785326100, "1785326160": 1785326160, "1785326220": 1785326220, "1785326280": 1785326280, "1785326340": 1785326340, "1785326400": 1785326400, "1785326460": 1785326460, "1785326520": 1785326520, "1785326580": 1785326580, "1785326640": 1785326640, "1785326700": 1785326700, "1785326760": 1785326760, "1785326820": 1785326820, "1785326880": 1785326880, "1785326940": 1785326940, "1785327000": 1785327000, "1785327060": 1785327060, "1785327120": 1785327120, "1785327180": 1785327180, "1785327240": 1785327240, "1785327300": 1785327300, "1785327360": 1785327360, "1785327420": 1785327420, "1785327480": 1785327480, "1785327540": 1785327540, "1785327600": 1785327600, "1785327660": 1785327660, "1785327720": 1785327720, "1785327780": 1785327780, "1785327840": 1785327840, "1785327900": 1785327900, "1785327960": 1785327960, "1785328020": 1785328020, "1785328080": 1785328080, "1785328140": 1785328140, "1785328200": 1785328200, "1785328260": 1785328260, "1785328320": 1785328320, "1785328380": 1785328380, "1785328440": 1785328440, "1785328500": 1785328500, "1785328560": 1785328560, "1785328620": 1785328620, "1785328680": 1785328680, "1785328740": 1785328740, "1785328800": 1785328800, "1785328860": 1785328860, "1785328920": 1785328920, "1785328980": 1785328980, "1785329040": 1785329040, "1785329100": 1785329100, "1785329160": 1785329160, "1785329220": 1785329220, "1785329280": 1785329280, "1785329340": 1785329340, "1785329400": 1785329400, "1785329460": 1785329460, "1785329520": 1785329520, "1785329580": 1785329580, "1785329640": 1785329640, "1785329700": 1785329700, "1785329760": 1785329760, "1785329820": 1785329820, "1785329880": 1785329880, "1785329940": 1785329940, "1785330000": 1785330000, "1785330060": 1785330060, "1785330120": 1785330120, "1785330180": 1785330180, "1785330240": 1785330240, "1785330300": 1785330300, "1785330360": 1785330360, "1785330420": 1785330420, "1785330480": 1785330480, "1785330540": 1785330540, "1785330600": 1785330600, "1785330660": 1785330660, "1785330720": 1785330720, "1785330780": 1785330780, "1785330840": 1785330840, "1785330900": 1785330900, "1785330960": 1785330960, "1785331020": 1785331020, "1785331080": 1785331080, "1785331140": 1785331140, "1785331200": 1785331200, "1785331260": 1785331260, "1785331320": 1785331320, "1785331380": 1785331380, "1785331440": 1785331440, "1785331500": 1785331500, "1785331560": 1785331560, "1785331620": 1785331620, "1785331680": 1785331680, "1785331740": 1785331740, "1785331800": 1785331800, "1785331860": 1785331860, "1785331920": 1785331920, "1785331980": 1785331980, "1785332040": 1785332040, "1785332100": 1785332100, "1785332160": 1785332160, "1785332220": 1785332220, "1785332280": 1785332280, "1785332340": 1785332340, "1785332400": 1785332400, "1785332460": 1785332460, "1785332520": 1785332520, "1785332580": 1785332580, "1785332640": 1785332640, "1785332700": 1785332700, "1785332760": 1785332760, "1785332820": 1785332820, "1785332880": 1785332880, "1785332940": 1785332940, "1785333000": 1785333000, "1785333060": 1785333060, "1785333120": 1785333120, "1785333180": 1785333180, "1785333240": 1785333240, "1785333300": 1785333300, "1785333360": 1785333360, "1785333420": 1785333420, "1785333480": 1785333480, "1785333540": 1785333540, "1785333600": 1785333600, "1785333660": 1785333660, "1785333720": 1785333720, "1785333780": 1785333780, "1785333840": 1785333840, "1785333900": 1785333900, "1785333960": 1785333960, "1785334020": 1785334020, "1785334080": 1785334080, "1785334140": 1785334140, "1785334200": 1785334200, "1785334260": 1785334260, "1785334320": 1785334320, "1785334380": 1785334380, "1785334440": 1785334440, "1785334500": 1785334500, "1785334560": 1785334560, "1785334620": 1785334620, "1785334680": 1785334680, "1785334740": 1785334740, "1785334800": 1785334800, "1785334860": 1785334860, "1785334920": 1785334920, "1785334980": 1785334980, "1785335040": 1785335040, "1785335100": 1785335100, "1785335160": 1785335160, "1785335220": 1785335220, "1785335280": 1785335280, "1785335340": 1785335340, "1785335400": 1785335400, "1785335460": 1785335460, "1785335520": 1785335520, "1785335580": 1785335580, "1785335640": 1785335640, "1785335700": 1785335700, "1785335760": 1785335760, "1785335820": 1785335820, "1785335880": 1785335880, "1785335940": 1785335940, "1785336000": 1785336000, "1785336060": 1785336060, "1785336120": 1785336120, "1785336180": 1785336180, "1785336240": 1785336240, "1785336300": 1785336300, "1785336360": 1785336360, "1785336420": 1785336420, "1785336480": 1785336480, "1785336540": 1785336540, "1785336600": 1785336600, "1785336660": 1785336660, "1785336720": 1785336720, "1785336780": 1785336780, "1785336840": 1785336840, "1785336900": 1785336900, "1785336960": 1785336960, "1785337020": 1785337020, "1785337080": 1785337080, "1785337140": 1785337140, "1785337200": 1785337200, "1785337260": 1785337260, "1785337320": 1785337320, "1785337380": 1785337380, "1785337440": 1785337440, "1785337500": 1785337500, "1785337560": 1785337560, "1785337620": 1785337620, "1785337680": 1785337680, "1785337740": 1785337740, "1785337800": 1785337800, "1785337860": 1785337860, "1785337920": 1785337920, "1785337980": 1785337980, "1785338040": 1785338040, "1785338100": 1785338100, "1785338160": 1785338160, "1785338220": 1785338220, "1785338280": 1785338280, "1785338340": 1785338340, "1785338400": 1785338400, "1785338460": 1785338460, "1785338520": 1785338520, "1785338580": 1785338580, "1785338640": 1785338640, "1785338700": 1785338700, "1785338760": 1785338760, "1785338820": 1785338820, "1785338880": 1785338880, "1785338940": 1785338940, "1785339000": 1785339000, "1785339060": 1785339060, "1785339120": 1785339120, "1785339180": 1785339180, "1785339240": 1785339240, "1785339300": 1785339300, "1785339360": 1785339360, "1785339420": 1785339420, "1785339480": 1785339480, "1785339540": 1785339540, "1785339600": 1785339600, "1785339660": 1785339660, "1785339720": 1785339720, "1785339780": 1785339780, "1785339840": 1785339840, "1785339900": 1785339900, "1785339960": 1785339960, "1785340020": 1785340020, "1785340080": 1785340080, "1785340140": 1785340140, "1785340200": 1785340200, "1785340260": 1785340260, "1785340320": 1785340320, "1785340380": 1785340380, "1785340440": 1785340440, "1785340500": 1785340500, "1785340560": 1785340560, "1785340620": 1785340620, "1785340680": 1785340680, "1785340740": 1785340740, "1785340800": 1785340800, "1785340860": 1785340860, "1785340920": 1785340920, "1785340980": 1785340980, "1785341040": 1785341040, "1785341100": 1785341100, "1785341160": 1785341160, "1785341220": 1785341220, "1785341280": 1785341280, "1785341340": 1785341340, "1785341400": 1785341400, "1785341460": 1785341460, "1785341520": 1785341520, "1785341580": 1785341580, "1785341640": 1785341640, "1785341700": 1785341700, "1785341760": 1785341760, "1785341820": 1785341820, "1785341880": 1785341880, "1785341940": 1785341940, "1785342000": 1785342000, "1785342060": 1785342060, "1785342120": 1785342120, "1785342180": 1785342180, "1785342240": 1785342240, "1785342300": 1785342300, "1785342360": 1785342360, "1785342420": 1785342420, "1785342480": 1785342480, "1785342540": 1785342540, "1785342600": 1785342600, "1785342660": 1785342660, "1785342720": 1785342720, "1785342780": 1785342780, "1785342840": 1785342840, "1785342900": 1785342900, "1785342960": 1785342960, "1785343020": 1785343020, "1785343080": 1785343080, "1785343140": 1785343140, "1785343200": 1785343200, "1785343260": 1785343260, "1785343320": 1785343320, "1785343380": 1785343380, "1785343440": 1785343440, "1785343500": 1785343500, "1785343560": 1785343560, "1785343620": 1785343620, "1785343680": 1785343680, "1785343740": 1785343740, "1785343800": 1785343800, "1785343860": 1785343860, "1785343920": 1785343920, "1785343980": 1785343980, "1785344040": 1785344040, "1785344100": 1785344100, "1785344160": 1785344160, "1785344220": 1785344220, "1785344280": 1785344280, "1785344340": 1785344340, "1785344400": 1785344400, "1785344460": 1785344460, "1785344520": 1785344520, "1785344580": 1785344580, "1785344640": 1785344640, "1785344700": 1785344700, "1785344760": 1785344760, "1785344820": 1785344820, "1785344880": 1785344880, "1785344940": 1785344940, "1785345000": 1785345000, "1785345060": 1785345060, "1785345120": 1785345120, "1785345180": 1785345180, "1785345240": 1785345240, "1785345300": 1785345300, "1785345360": 1785345360, "1785345420": 1785345420, "1785345480": 1785345480, "1785345540": 1785345540, "1785345600": 1785345600, "1785345660": 1785345660, "1785345720": 1785345720, "1785345780": 1785345780, "1785345840": 1785345840, "1785345900": 1785345900, "1785345960": 1785345960, "1785346020": 1785346020, "1785346080": 1785346080, "1785346140": 1785346140, "1785346200": 1785346200, "1785346260": 1785346260, "1785346320": 1785346320, "1785346380": 1785346380, "1785346440": 1785346440, "1785346500": 1785346500, "1785346560": 1785346560, "1785346620": 1785346620, "1785346680": 1785346680, "1785346740": 1785346740, "1785346800": 1785346800, "1785346860": 1785346860, "1785346920": 1785346920, "1785346980": 1785346980, "1785347040": 1785347040, "1785347100": 1785347100, "1785347160": 1785347160, "1785347220": 1785347220, "1785347280": 1785347280, "1785347340": 1785347340, "1785347400": 1785347400, "1785347460": 1785347460, "1785347520": 1785347520, "1785347580": 1785347580, "1785347640": 1785347640, "1785347700": 1785347700, "1785347760": 1785347760, "1785347820": 1785347820, "1785347880": 1785347880, "1785347940": 1785347940, "1785348000": 1785348000, "1785348060": 1785348060, "1785348120": 1785348120, "1785348180": 1785348180, "1785348240": 1785348240, "1785348300": 1785348300, "1785348360": 1785348360, "1785348420": 1785348420, "1785348480": 1785348480, "1785348540": 1785348540, "1785348600": 1785348600, "1785348660": 1785348660, "1785348720": 1785348720, "1785348780": 1785348780, "1785348840": 1785348840, "1785348900": 1785348900, "1785348960": 1785348960, "1785349020": 1785349020, "1785349080": 1785349080, "1785349140": 1785349140, "1785349200": 1785349200, "1785349260": 1785349260, "1785349320": 1785349320, "1785349380": 1785349380, "1785349440": 1785349440, "1785349500": 1785349500, "1785349560": 1785349560, "1785349620": 1785349620, "1785349680": 1785349680, "1785349740": 1785349740, "1785349800": 1785349800, "1785349860": 1785349860, "1785349920": 1785349920, "1785349980": 1785349980, "1785350040": 1785350040, "1785350100": 1785350100, "1785350160": 1785350160, "1785350220": 1785350220, "1785350280": 1785350280, "1785350340": 1785350340, "1785350400": 1785350400, "1785350460": 1785350460, "1785350520": 1785350520, "1785350580": 1785350580, "1785350640": 1785350640, "1785350700": 1785350700, "1785350760": 1785350760, "1785350820": 1785350820, "1785350880": 1785350880, "1785350940": 1785350940, "1785351000": 1785351000, "1785351060": 1785351060, "1785351120": 1785351120, "1785351180": 1785351180, "1785351240": 1785351240, "1785351300": 1785351300, "1785351360": 1785351360, "1785351420": 1785351420, "1785351480": 1785351480, "1785351540": 1785351540, "1785351600": 1785351600, "1785351660": 1785351660, "1785351720": 1785351720, "1785351780": 1785351780, "1785351840": 1785351840, "1785351900": 1785351900, "1785351960": 1785351960, "1785352020": 1785352020, "1785352080": 1785352080, "1785352140": 1785352140, "1785352200": 1785352200, "1785352260": 1785352260, "1785352320": 1785352320, "1785352380": 1785352380, "1785352440": 1785352440, "1785352500": 1785352500, "1785352560": 1785352560, "1785352620": 1785352620, "1785352680": 1785352680, "1785352740": 1785352740, "1785352800": 1785352800, "1785352860": 1785352860, "1785352920": 1785352920, "1785352980": 1785352980, "1785353040": 1785353040, "1785353100": 1785353100, "1785353160": 1785353160, "1785353220": 1785353220, "1785353280": 1785353280, "1785353340": 1785353340, "1785353400": 1785353400, "1785353460": 1785353460, "1785353520": 1785353520, "1785353580": 1785353580, "1785353640": 1785353640, "1785353700": 1785353700, "1785353760": 1785353760, "1785353820": 1785353820, "1785353880": 1785353880, "1785353940": 1785353940, "1785354000": 1785354000, "1785354060": 1785354060, "1785354120": 1785354120, "1785354180": 1785354180, "1785354240": 1785354240, "1785354300": 1785354300, "1785354360": 1785354360, "1785354420": 1785354420, "1785354480": 1785354480, "1785354540": 1785354540, "1785354600": 1785354600, "1785354660": 1785354660, "1785354720": 1785354720, "1785354780": 1785354780, "1785354840": 1785354840, "1785354900": 1785354900, "1785354960": 1785354960, "1785355020": 1785355020, "1785355080": 1785355080, "1785355140": 1785355140, "1785355200": 1785355200, "1785355260": 1785355260, "1785355320": 1785355320, "1785355380": 1785355380, "1785355440": 1785355440, "1785355500": 1785355500, "1785355560": 1785355560, "1785355620": 1785355620, "1785355680": 1785355680, "1785355740": 1785355740, "1785355800": 1785355800, "1785355860": 1785355860, "1785355920": 1785355920, "1785355980": 1785355980, "1785356040": 1785356040, "1785356100": 1785356100, "1785356160": 1785356160, "1785356220": 1785356220, "1785356280": 1785356280, "1785356340": 1785356340, "1785356400": 1785356400, "1785356460": 1785356460, "1785356520": 1785356520, "1785356580": 1785356580, "1785356640": 1785356640, "1785356700": 1785356700, "1785356760": 1785356760, "1785356820": 1785356820, "1785356880": 1785356880, "1785356940": 1785356940, "1785357000": 1785357000, "1785357060": 1785357060, "1785357120": 1785357120, "1785357180": 1785357180, "1785357240": 1785357240, "1785357300": 1785357300, "1785357360": 1785357360, "1785357420": 1785357420, "1785357480": 1785357480, "1785357540": 1785357540, "1785357600": 1785357600, "1785357660": 1785357660, "1785357720": 1785357720, "1785357780": 1785357780, "1785357840": 1785357840, "1785357900": 1785357900, "1785357960": 1785357960, "1785358020": 1785358020, "1785358080": 1785358080, "1785358140": 1785358140, "1785358200": 1785358200, "1785358260": 1785358260, "1785358320": 1785358320, "1785358380": 1785358380, "1785358440": 1785358440, "1785358500": 1785358500, "1785358560": 1785358560, "1785358620": 1785358620, "1785358680": 1785358680, "1785358740": 1785358740, "1785358800": 1785358800, "1785358860": 1785358860, "1785358920": 1785358920, "1785358980": 1785358980, "1785359040": 1785359040, "1785359100": 1785359100, "1785359160": 1785359160, "1785359220": 1785359220, "1785359280": 1785359280, "1785359340": 1785359340, "1785359400": 1785359400, "1785359460": 1785359460, "1785359520": 1785359520, "1785359580": 1785359580, "1785359640": 1785359640, "1785359700": 1785359700, "1785359760": 1785359760, "1785359820": 1785359820, "1785359880": 1785359880, "1785359940": 1785359940, "1785360000": 1785360000, "1785360060": 1785360060, "1785360120": 1785360120, "1785360180": 1785360180, "1785360240": 1785360240, "1785360300": 1785360300, "1785360360": 1785360360, "1785360420": 1785360420, "1785360480": 1785360480, "1785360540": 1785360540, "1785360600": 1785360600, "1785360660": 1785360660, "1785360720": 1785360720, "1785360780": 1785360780, "1785360840": 1785360840, "1785360900": 1785360900, "1785360960": 1785360960, "1785361020": 1785361020, "1785361080": 1785361080, "1785361140": 1785361140, "1785361200": 1785361200, "1785361260": 1785361260, "1785361320": 1785361320, "1785361380": 1785361380, "1785361440": 1785361440, "1785361500": 1785361500, "1785361560": 1785361560, "1785361620": 1785361620, "1785361680": 1785361680, "1785361740": 1785361740, "1785361800": 1785361800, "1785361860": 1785361860, "1785361920": 1785361920, "1785361980": 1785361980, "1785362040": 1785362040, "1785362100": 1785362100, "1785362160": 1785362160, "1785362220": 1785362220, "1785362280": 1785362280, "1785362340": 1785362340, "1785362400": 1785362400, "1785362460": 1785362460, "1785362520": 1785362520, "1785362580": 1785362580, "1785362640": 1785362640, "1785362700": 1785362700, "1785362760": 1785362760, "1785362820": 1785362820, "1785362880": 1785362880, "1785362940": 1785362940, "1785363000": 1785363000, "1785363060": 1785363060, "1785363120": 1785363120, "1785363180": 1785363180, "1785363240": 1785363240, "1785363300": 1785363300, "1785363360": 1785363360, "1785363420": 1785363420, "1785363480": 1785363480, "1785363540": 1785363540, "1785363600": 1785363600, "1785363660": 1785363660, "1785363720": 1785363720, "1785363780": 1785363780, "1785363840": 1785363840, "1785363900": 1785363900, "1785363960": 1785363960, "1785364020": 1785364020, "1785364080": 1785364080, "1785364140": 1785364140, "1785364200": 1785364200, "1785364260": 1785364260, "1785364320": 1785364320, "1785364380": 1785364380, "1785364440": 1785364440, "1785364500": 1785364500, "1785364560": 1785364560, "1785364620": 1785364620, "1785364680": 1785364680, "1785364740": 1785364740, "1785364800": 1785364800, "1785364860": 1785364860, "1785364920": 1785364920, "1785364980": 1785364980, "1785365040": 1785365040, "1785365100": 1785365100, "1785365160": 1785365160, "1785365220": 1785365220, "1785365280": 1785365280, "1785365340": 1785365340, "1785365400": 1785365400, "1785365460": 1785365460, "1785365520": 1785365520, "1785365580": 1785365580, "1785365640": 1785365640, "1785365700": 1785365700, "1785365760": 1785365760, "1785365820": 1785365820, "1785365880": 1785365880, "1785365940": 1785365940, "1785366000": 1785369660, "1785366060": 1785369720, "1785366120": 1785369780, "1785366180": 1785369840, "1785366240": 1785369900, "1785366300": 1785369960, "1785366360": 1785370020, "1785366420": 1785370080, "1785366480": 1785370140, "1785366540": 1785370200, "1785366600": 1785370260, "1785366660": 1785370320, "1785366720": 1785370380, "1785366780": 1785370440, "1785366840": 1785370500, "1785366900": 1785370560, "1785366960": 1785370620, "1785367020": 1785370680, "1785367080": 1785370740, "1785367140": 1785370800, "1785367200": 1785370860, "1785367260": 1785370920, "1785367320": 1785370980, "1785367380": 1785371040, "1785367440": 1785371100, "1785367500": 1785371160, "1785367560": 1785371220, "1785367620": 1785371280, "1785367680": 1785371340, "1785367740": 1785371400, "1785367800": 1785371460, "1785367860": 1785371520, "1785367920": 1785371580, "1785367980": 1785371640, "1785368040": 1785371700, "1785368100": 1785371760, "1785368160": 1785371820, "1785368220": 1785371880, "1785368280": 1785371940, "1785368340": 1785372000, "1785368400": 1785372060, "1785368460": 1785372120, "1785368520": 1785372180, "1785368580": 1785372240, "1785368640": 1785372300, "1785368700": 1785372360, "1785368760": 1785372420, "1785368820": 1785372480, "1785368880": 1785372540, "1785368940": 1785372600, "1785369000": 1785372660, "1785369060": 1785372720, "1785369120": 1785372780, "1785369180": 1785372840, "1785369240": 1785372900, "1785369300": 1785372960, "1785369360": 1785373020, "1785369420": 1785373080, "1785369480": 1785373140, "1785369540": 1785373200, "1785369600": 1785373260, "1785369660": 1785373320, "1785369720": 1785373380, "1785369780": 1785373440, "1785369840": 1785373500, "1785369900": 1785373560, "1785369960": 1785373620, "1785370020": 1785373680, "1785370080": 1785373740, "1785370140": 1785373800, "1785370200": 1785373860, "1785370260": 1785373920, "1785370320": 1785373980, "1785370380": 1785374040, "1785370440": 1785374100, "1785370500": 1785374160, "1785370560": 1785374220, "1785370620": 1785374280, "1785370680": 1785374340, "1785370740": 1785374400, "1785370800": 1785374460, "1785370860": 1785374520, "1785370920": 1785374580, "1785370980": 1785374640, "1785371040": 1785374700, "1785371100": 1785374760, "1785371160": 1785374820, "1785371220": 1785374880, "1785371280": 1785374940, "1785371340": 1785375000, "1785371400": 1785375060, "1785371460": 1785375120, "1785371520": 1785375180, "1785371580": 1785375240, "1785371640": 1785375300, "1785371700": 1785375360, "1785371760": 1785375420, "1785371820": 1785375480, "1785371880": 1785375540, "1785371940": 1785375600, "1785372000": 1785375660, "1785372060": 1785375720, "1785372120": 1785375780, "1785372180": 1785375840, "1785372240": 1785375900, "1785372300": 1785375960, "1785372360": 1785376020, "1785372420": 1785376080, "1785372480": 1785376140, "1785372540": 1785376200, "1785372600": 1785376260, "1785372660": 1785376320, "1785372720": 1785376380, "1785372780": 1785376440, "1785372840": 1785376500, "1785372900": 1785376560, "1785372960": 1785376620, "1785373020": 1785376680, "1785373080": 1785376740, "1785373140": 1785376800, "1785373200": 1785376860, "1785373260": 1785376920, "1785373320": 1785376980, "1785373380": 1785377040, "1785373440": 1785377100, "1785373500": 1785377160, "1785373560": 1785377220, "1785373620": 1785377280, "1785373680": 1785377340, "1785373740": 1785377400, "1785373800": 1785377460, "1785373860": 1785377520, "1785373920": 1785377580, "1785373980": 1785377640, "1785374040": 1785377700, "1785374100": 1785377760, "1785374160": 1785377820, "1785374220": 1785377880, "1785374280": 1785377940, "1785374340": 1785378000, "1785374400": 1785378060, "1785374460": 1785378120, "1785374520": 1785378180, "1785374580": 1785378240, "1785374640": 1785378300, "1785374700": 1785378360, "1785374760": 1785378420, "1785374820": 1785378480, "1785374880": 1785378540, "1785374940": 1785378600, "1785375000": 1785378660, "1785375060": 1785378720, "1785375120": 1785378780, "1785375180": 1785378840, "1785375240": 1785378900, "1785375300": 1785378960, "1785375360": 1785379020, "1785375420": 1785379080, "1785375480": 1785379140, "1785375540": 1785379200, "1785375600": 1785379260, "1785375660": 1785379320, "1785375720": 1785379380, "1785375780": 1785379440, "1785375840": 1785379500, "1785375900": 1785379560, "1785375960": 1785379620, "1785376020": 1785379680, "1785376080": 1785379740, "1785376140": 1785379800, "1785376200": 1785379860, "1785376260": 1785379920, "1785376320": 1785379980, "1785376380": 1785380040, "1785376440": 1785380100, "1785376500": 1785380160, "1785376560": 1785380220, "1785376620": 1785380280, "1785376680": 1785380340, "1785376740": 1785380400, "1785376800": 1785380460, "1785376860": 1785380520, "1785376920": 1785380580, "1785376980": 1785380640, "1785377040": 1785380700, "1785377100": 1785380760, "1785377160": 1785380820, "1785377220": 1785380880, "1785377280": 1785380940, "1785377340": 1785381000, "1785377400": 1785381060, "1785377460": 1785381120, "1785377520": 1785381180, "1785377580": 1785381240, "1785377640": 1785381300, "1785377700": 1785381360, "1785377760": 1785381420, "1785377820": 1785381480, "1785377880": 1785381540, "1785377940": 1785381600, "1785378000": 1785381660, "1785378060": 1785381720, "1785378120": 1785381780, "1785378180": 1785381840, "1785378240": 1785381900, "1785378300": 1785381960, "1785378360": 1785382020, "1785378420": 1785382080, "1785378480": 1785382140, "1785378540": 1785382200, "1785378600": 1785382260, "1785378660": 1785382320, "1785378720": 1785382380, "1785378780": 1785382440, "1785378840": 1785382500, "1785378900": 1785382560, "1785378960": 1785382620, "1785379020": 1785382680, "1785379080": 1785382740, "1785379140": 1785382800, "1785379200": 1785382860, "1785379260": 1785382920, "1785379320": 1785382980, "1785379380": 1785383040, "1785379440": 1785383100, "1785379500": 1785383160, "1785379560": 1785383220, "1785379620": 1785383280, "1785379680": 1785383340, "1785379740": 1785383400, "1785379800": 1785383460, "1785379860": 1785383520, "1785379920": 1785383580, "1785379980": 1785383640, "1785380040": 1785383700, "1785380100": 1785383760, "1785380160": 1785383820, "1785380220": 1785383880, "1785380280": 1785383940, "1785380340": 1785384000, "1785380400": 1785384060, "1785380460": 1785384120, "1785380520": 1785384180, "1785380580": 1785384240, "1785380640": 1785384300, "1785380700": 1785384360, "1785380760": 1785384420, "1785380820": 1785384480, "1785380880": 1785384540, "1785380940": 1785384600, "1785381000": 1785384660, "1785381060": 1785384720, "1785381120": 1785384780, "1785381180": 1785384840, "1785381240": 1785384900, "1785381300": 1785384960, "1785381360": 1785385020, "1785381420": 1785385080, "1785381480": 1785385140, "1785381540": 1785385200, "1785381600": 1785385260, "1785381660": 1785385320, "1785381720": 1785385380, "1785381780": 1785385440, "1785381840": 1785385500, "1785381900": 1785385560, "1785381960": 1785385620, "1785382020": 1785385680, "1785382080": 1785385740, "1785382140": 1785385800, "1785382200": 1785385860, "1785382260": 1785385920, "1785382320": 1785385980, "1785382380": 1785386040, "1785382440": 1785386100, "1785382500": 1785386160, "1785382560": 1785386220, "1785382620": 1785386280, "1785382680": 1785386340, "1785382740": 1785386400, "1785382800": 1785386460, "1785382860": 1785386520, "1785382920": 1785386580, "1785382980": 1785386640, "1785383040": 1785386700, "1785383100": 1785386760, "1785383160": 1785386820, "1785383220": 1785386880, "1785383280": 1785386940, "1785383340": 1785387000, "1785383400": 1785387060, "1785383460": 1785387120, "1785383520": 1785387180, "1785383580": 1785387240, "1785383640": 1785387300, "1785383700": 1785387360, "1785383760": 1785387420, "1785383820": 1785387480, "1785383880": 1785387540, "1785383940": 1785387600, "1785384000": 1785387660, "1785384060": 1785387720, "1785384120": 1785387780, "1785384180": 1785387840, "1785384240": 1785387900, "1785384300": 1785387960, "1785384360": 1785388020, "1785384420": 1785388080, "1785384480": 1785388140, "1785384540": 1785388200, "1785384600": 1785388260, "1785384660": 1785388320, "1785384720": 1785388380, "1785384780": 1785388440, "1785384840": 1785388500, "1785384900": 1785388560, "1785384960": 1785388620, "1785385020": 1785388680, "1785385080": 1785388740, "1785385140": 1785388800, "1785385200": 1785388860, "1785385260": 1785388920, "1785385320": 1785388980, "1785385380": 1785389040, "1785385440": 1785389100, "1785385500": 1785389160, "1785385560": 1785389220, "1785385620": 1785389280, "1785385680": 1785389340, "1785385740": 1785389400, "1785385800": 1785389460, "1785385860": 1785389520, "1785385920": 1785389580, "1785385980": 1785389640, "1785386040": 1785389700, "1785386100": 1785389760, "1785386160": 1785389820, "1785386220": 1785389880, "1785386280": 1785389940, "1785386340": 1785390000, "1785386400": 1785390060, "1785386460": 1785390120, "1785386520": 1785390180, "1785386580": 1785390240, "1785386640": 1785390300, "1785386700": 1785390360, "1785386760": 1785390420, "1785386820": 1785390480, "1785386880": 1785390540, "1785386940": 1785390600, "1785387000": 1785390660, "1785387060": 1785390720, "1785387120": 1785390780, "1785387180": 1785390840, "1785387240": 1785390900, "1785387300": 1785390960, "1785387360": 1785391020, "1785387420": 1785391080, "1785387480": 1785391140, "1785387540": 1785391200, "1785387600": 1785391260, "1785387660": 1785391320, "1785387720": 1785391380, "1785387780": 1785391440, "1785387840": 1785391500, "1785387900": 1785391560, "1785387960": 1785391620, "1785388020": 1785391680, "1785388080": 1785391740, "1785388140": 1785391800, "1785388200": 1785391860, "1785388260": 1785391920, "1785388320": 1785391980, "1785388380": 1785392040, "1785388440": 1785392100, "1785388500": 1785392160, "1785388560": 1785392220, "1785388620": 1785392280, "1785388680": 1785392340, "1785388740": 1785392400, "1785388800": 1785392460, "1785388860": 1785392520, "1785388920": 1785392580, "1785388980": 1785392640, "1785389040": 1785392700, "1785389100": 1785392760, "1785389160": 1785392820, "1785389220": 1785392880, "1785389280": 1785392940, "1785389340": 1785393000, "1785389400": 1785393060, "1785389460": 1785393120, "1785389520": 1785393180, "1785389580": 1785393240, "1785389640": 1785393300, "1785389700": 1785393360, "1785389760": 1785393420, "1785389820": 1785393480, "1785389880": 1785393540, "1785389940": 1785393600, "1785390000": 1785393660, "1785390060": 1785393720, "1785390120": 1785393780, "1785390180": 1785393840, "1785390240": 1785393900, "1785390300": 1785393960, "1785390360": 1785394020, "1785390420": 1785394080, "1785390480": 1785394140, "1785390540": 1785394200, "1785390600": 1785394260, "1785390660": 1785394320, "1785390720": 1785394380, "1785390780": 1785394440, "1785390840": 1785394500, "1785390900": 1785394560, "1785390960": 1785394620, "1785391020": 1785394680, "1785391080": 1785394740, "1785391140": 1785394800, "1785391200": 1785394860, "1785391260": 1785394920, "1785391320": 1785394980, "1785391380": 1785395040, "1785391440": 1785395100, "1785391500": 1785395160, "1785391560": 1785395220, "1785391620": 1785395280, "1785391680": 1785395340, "1785391740": 1785395400, "1785391800": 1785395460, "1785391860": 1785395520, "1785391920": 1785395580, "1785391980": 1785395640, "1785392040": 1785395700, "1785392100": 1785395760, "1785392160": 1785395820, "1785392220": 1785395880, "1785392280": 1785395940, "1785392340": 1785396000, "1785392400": 1785396060, "1785392460": 1785396120, "1785392520": 1785396180, "1785392580": 1785396240, "1785392640": 1785396300, "1785392700": 1785396360, "1785392760": 1785396420, "1785392820": 1785396480, "1785392880": 1785396540, "1785392940": 1785396600, "1785393000": 1785396660, "1785393060": 1785396720, "1785393120": 1785396780, "1785393180": 1785396840, "1785393240": 1785396900, "1785393300": 1785396960, "1785393360": 1785397020, "1785393420": 1785397080, "1785393480": 1785397140, "1785393540": 1785397200, "1785393600": 1785397260, "1785393660": 1785397320, "1785393720": 1785397380, "1785393780": 1785397440, "1785393840": 1785397500, "1785393900": 1785397560, "1785393960": 1785397620, "1785394020": 1785397680, "1785394080": 1785397740, "1785394140": 1785397800, "1785394200": 1785397860, "1785394260": 1785397920, "1785394320": 1785397980, "1785394380": 1785398040, "1785394440": 1785398100, "1785394500": 1785398160, "1785394560": 1785398220, "1785394620": 1785398280, "1785394680": 1785398340, "1785394740": 1785398400, "1785394800": 1785398460, "1785394860": 1785398520, "1785394920": 1785398580, "1785394980": 1785398640, "1785395040": 1785398700, "1785395100": 1785398760, "1785395160": 1785398820, "1785395220": 1785398880, "1785395280": 1785398940, "1785395340": 1785399000, "1785395400": 1785399060, "1785395460": 1785399120, "1785395520": 1785399180, "1785395580": 1785399240, "1785395640": 1785399300, "1785395700": 1785399360, "1785395760": 1785399420, "1785395820": 1785399480, "1785395880": 1785399540, "1785395940": 1785399600, "1785396000": 1785399660, "1785396060": 1785399720, "1785396120": 1785399780, "1785396180": 1785399840, "1785396240": 1785399900, "1785396300": 1785399960, "1785396360": 1785400020, "1785396420": 1785400080, "1785396480": 1785400140, "1785396540": 1785400200, "1785396600": 1785400260, "1785396660": 1785400320, "1785396720": 1785400380, "1785396780": 1785400440, "1785396840": 1785400500, "1785396900": 1785400560, "1785396960": 1785400620, "1785397020": 1785400680, "1785397080": 1785400740, "1785397140": 1785400800, "1785397200": 1785400860, "1785397260": 1785400920, "1785397320": 1785400980, "1785397380": 1785401040, "1785397440": 1785401100, "1785397500": 1785401160, "1785397560": 1785401220, "1785397620": 1785401280, "1785397680": 1785401340, "1785397740": 1785401400, "1785397800": 1785401460, "1785397860": 1785401520, "1785397920": 1785401580, "1785397980": 1785401640, "1785398040": 1785401700, "1785398100": 1785401760, "1785398160": 1785401820, "1785398220": 1785401880, "1785398280": 1785401940, "1785398340": 1785402000, "1785398400": 1785402060, "1785398460": 1785402120, "1785398520": 1785402180, "1785398580": 1785402240, "1785398640": 1785402300, "1785398700": 1785402360, "1785398760": 1785402420, "1785398820": 1785402480, "1785398880": 1785402540, "1785398940": 1785402600, "1785399000": 1785402660, "1785399060": 1785402720, "1785399120": 1785402780, "1785399180": 1785402840, "1785399240": 1785402900, "1785399300": 1785402960, "1785399360": 1785403020, "1785399420": 1785403080, "1785399480": 1785403140, "1785399540": 1785403200, "1785399600": 1785403260, "1785399660": 1785403320, "1785399720": 1785403380, "1785399780": 1785403440, "1785399840": 1785403500, "1785399900": 1785403560, "1785399960": 1785403620, "1785400020": 1785403680, "1785400080": 1785403740, "1785400140": 1785403800, "1785400200": 1785403860, "1785400260": 1785403920, "1785400320": 1785403980, "1785400380": 1785404040, "1785400440": 1785404100, "1785400500": 1785404160, "1785400560": 1785404220, "1785400620": 1785404280, "1785400680": 1785404340, "1785400740": 1785404400, "1785400800": 1785404460, "1785400860": 1785404520, "1785400920": 1785404580, "1785400980": 1785404640, "1785401040": 1785404700, "1785401100": 1785404760, "1785401160": 1785404820, "1785401220": 1785404880, "1785401280": 1785404940, "1785401340": 1785405000, "1785401400": 1785405060, "1785401460": 1785405120, "1785401520": 1785405180, "1785401580": 1785405240, "1785401640": 1785405300, "1785401700": 1785405360, "1785401760": 1785405420, "1785401820": 1785405480, "1785401880": 1785405540, "1785401940": 1785405600, "1785402000": 1785405660, "1785402060": 1785405720, "1785402120": 1785405780, "1785402180": 1785405840, "1785402240": 1785405900, "1785402300": 1785405960, "1785402360": 1785406020, "1785402420": 1785406080, "1785402480": 1785406140, "1785402540": 1785406200, "1785402600": 1785406260, "1785402660": 1785406320, "1785402720": 1785406380, "1785402780": 1785406440, "1785402840": 1785406500, "1785402900": 1785406560, "1785402960": 1785406620, "1785403020": 1785406680, "1785403080": 1785406740, "1785403140": 1785406800, "1785403200": 1785406860, "1785403260": 1785406920, "1785403320": 1785406980, "1785403380": 1785407040, "1785403440": 1785407100, "1785403500": 1785407160, "1785403560": 1785407220, "1785403620": 1785407280, "1785403680": 1785407340, "1785403740": 1785407400, "1785403800": 1785407460, "1785403860": 1785407520, "1785403920": 1785407580, "1785403980": 1785407640, "1785404040": 1785407700, "1785404100": 1785407760, "1785404160": 1785407820, "1785404220": 1785407880, "1785404280": 1785407940, "1785404340": 1785408000, "1785404400": 1785408060, "1785404460": 1785408120, "1785404520": 1785408180, "1785404580": 1785408240, "1785404640": 1785408300, "1785404700": 1785408360, "1785404760": 1785408420, "1785404820": 1785408480, "1785404880": 1785408540, "1785404940": 1785408600, "1785405000": 1785408660, "1785405060": 1785408720, "1785405120": 1785408780, "1785405180": 1785408840, "1785405240": 1785408900, "1785405300": 1785408960, "1785405360": 1785409020, "1785405420": 1785409080, "1785405480": 1785409140, "1785405540": 1785409200, "1785405600": 1785409260, "1785405660": 1785409320, "1785405720": 1785409380, "1785405780": 1785409440, "1785405840": 1785409500, "1785405900": 1785409560, "1785405960": 1785409620, "1785406020": 1785409680, "1785406080": 1785409740, "1785406140": 1785409800, "1785406200": 1785409860, "1785406260": 1785409920, "1785406320": 1785409980, "1785406380": 1785410040, "1785406440": 1785410100, "1785406500": 1785410160, "1785406560": 1785410220, "1785406620": 1785410280, "1785406680": 1785410340, "1785406740": 1785410400, "1785406800": 1785410460, "1785406860": 1785410520, "1785406920": 1785410580, "1785406980": 1785410640, "1785407040": 1785410700, "1785407100": 1785410760, "1785407160": 1785410820, "1785407220": 1785410880, "1785407280": 1785410940, "1785407340": 1785411000, "1785407400": 1785411060, "1785407460": 1785411120, "1785407520": 1785411180, "1785407580": 1785411240, "1785407640": 1785411300, "1785407700": 1785411360, "1785407760": 1785411420, "1785407820": 1785411480, "1785407880": 1785411540, "1785407940": 1785411600, "1785408000": 1785411660, "1785408060": 1785411720, "1785408120": 1785411780, "1785408180": 1785411840, "1785408240": 1785411900, "1785408300": 1785411960, "1785408360": 1785412020, "1785408420": 1785412080, "1785408480": 1785412140, "1785408540": 1785412200, "1785408600": 1785412260, "1785408660": 1785412320, "1785408720": 1785412380, "1785408780": 1785412440, "1785408840": 1785412500, "1785408900": 1785412560, "1785408960": 1785412620, "1785409020": 1785412680, "1785409080": 1785412740, "1785409140": 1785412800, "1785409200": 1785412860, "1785409260": 1785412920, "1785409320": 1785412980, "1785409380": 1785413040, "1785409440": 1785413100, "1785409500": 1785413160, "1785409560": 1785413220, "1785409620": 1785413280, "1785409680": 1785413340, "1785409740": 1785413400, "1785409800": 1785413460, "1785409860": 1785413520, "1785409920": 1785413580, "1785409980": 1785413640, "1785410040": 1785413700, "1785410100": 1785413760, "1785410160": 1785413820, "1785410220": 1785413880, "1785410280": 1785413940, "1785410340": 1785414000, "1785410400": 1785414060, "1785410460": 1785414120, "1785410520": 1785414180, "1785410580": 1785414240, "1785410640": 1785414300, "1785410700": 1785414360, "1785410760": 1785414420, "1785410820": 1785414480, "1785410880": 1785414540, "1785410940": 1785414600, "1785411000": 1785414660, "1785411060": 1785414720, "1785411120": 1785414780, "1785411180": 1785414840, "1785411240": 1785414900, "1785411300": 1785414960, "1785411360": 1785415020, "1785411420": 1785415080, "1785411480": 1785415140, "1785411540": 1785415200, "1785411600": 1785415260, "1785411660": 1785415320, "1785411720": 1785415380, "1785411780": 1785415440, "1785411840": 1785415500, "1785411900": 1785415560, "1785411960": 1785415620, "1785412020": 1785415680, "1785412080": 1785415740, "1785412140": 1785415800, "1785412200": 1785415860, "1785412260": 1785415920, "1785412320": 1785415980, "1785412380": 1785416040, "1785412440": 1785416100, "1785412500": 1785416160, "1785412560": 1785416220, "1785412620": 1785416280, "1785412680": 1785416340, "1785412740": 1785416400, "1785412800": 1785416460, "1785412860": 1785416520, "1785412920": 1785416580, "1785412980": 1785416640, "1785413040": 1785416700, "1785413100": 1785416760, "1785413160": 1785416820, "1785413220": 1785416880, "1785413280": 1785416940, "1785413340": 1785417000, "1785413400": 1785417060, "1785413460": 1785417120, "1785413520": 1785417180, "1785413580": 1785417240, "1785413640": 1785417300, "1785413700": 1785417360, "1785413760": 1785417420, "1785413820": 1785417480, "1785413880": 1785417540, "1785413940": 1785417600, "1785414000": 1785417660, "1785414060": 1785417720, "1785414120": 1785417780, "1785414180": 1785417840, "1785414240": 1785417900, "1785414300": 1785417960, "1785414360": 1785418020, "1785414420": 1785418080, "1785414480": 1785418140, "1785414540": 1785418200, "1785414600": 1785418260, "1785414660": 1785418320, "1785414720": 1785418380, "1785414780": 1785418440, "1785414840": 1785418500, "1785414900": 1785418560, "1785414960": 1785418620, "1785415020": 1785418680, "1785415080": 1785418740, "1785415140": 1785418800, "1785415200": 1785418860, "1785415260": 1785418920, "1785415320": 1785418980, "1785415380": 1785419040, "1785415440": 1785419100, "1785415500": 1785419160, "1785415560": 1785419220, "1785415620": 1785419280, "1785415680": 1785419340, "1785415740": 1785419400, "1785415800": 1785419460, "1785415860": 1785419520, "1785415920": 1785419580, "1785415980": 1785419640, "1785416040": 1785419700, "1785416100": 1785419760, "1785416160": 1785419820, "1785416220": 1785419880, "1785416280": 1785419940, "1785416340": 1785420000, "1785416400": 1785420060, "1785416460": 1785420120, "1785416520": 1785420180, "1785416580": 1785420240, "1785416640": 1785420300, "1785416700": 1785420360, "1785416760": 1785420420, "1785416820": 1785420480, "1785416880": 1785420540, "1785416940": 1785420600, "1785417000": 1785420660, "1785417060": 1785420720, "1785417120": 1785420780, "1785417180": 1785420840, "1785417240": 1785420900, "1785417300": 1785420960, "1785417360": 1785421020, "1785417420": 1785421080, "1785417480": 1785421140, "1785417540": 1785421200, "1785417600": 1785421260, "1785417660": 1785421320, "1785417720": 1785421380, "1785417780": 1785421440, "1785417840": 1785421500, "1785417900": 1785421560, "1785417960": 1785421620, "1785418020": 1785421680, "1785418080": 1785421740, "1785418140": 1785421800, "1785418200": 1785421860, "1785418260": 1785421920, "1785418320": 1785421980, "1785418380": 1785422040, "1785418440": 1785422100, "1785418500": 1785422160, "1785418560": 1785422220, "1785418620": 1785422280, "1785418680": 1785422340, "1785418740": 1785422400, "1785418800": 1785422460, "1785418860": 1785422520, "1785418920": 1785422580, "1785418980": 1785422640, "1785419040": 1785422700, "1785419100": 1785422760, "1785419160": 1785422820, "1785419220": 1785422880, "1785419280": 1785422940, "1785419340": 1785423000, "1785419400": 1785423060, "1785419460": 1785423120, "1785419520": 1785423180, "1785419580": 1785423240, "1785419640": 1785423300, "1785419700": 1785423360, "1785419760": 1785423420, "1785419820": 1785423480, "1785419880": 1785423540, "1785419940": 1785423600, "1785420000": 1785423660, "1785420060": 1785423720, "1785420120": 1785423780, "1785420180": 1785423840, "1785420240": 1785423900, "1785420300": 1785423960, "1785420360": 1785424020, "1785420420": 1785424080, "1785420480": 1785424140, "1785420540": 1785424200, "1785420600": 1785424260, "1785420660": 1785424320, "1785420720": 1785424380, "1785420780": 1785424440, "1785420840": 1785424500, "1785420900": 1785424560, "1785420960": 1785424620, "1785421020": 1785424680, "1785421080": 1785424740, "1785421140": 1785424800, "1785421200": 1785424860, "1785421260": 1785424920, "1785421320": 1785424980, "1785421380": 1785425040, "1785421440": 1785425100, "1785421500": 1785425160, "1785421560": 1785425220, "1785421620": 1785425280, "1785421680": 1785425340, "1785421740": 1785425400, "1785421800": 1785425460, "1785421860": 1785425520, "1785421920": 1785425580, "1785421980": 1785425640, "1785422040": 1785425700, "1785422100": 1785425760, "1785422160": 1785425820, "1785422220": 1785425880, "1785422280": 1785425940, "1785422340": 1785426000, "1785422400": 1785426060, "1785422460": 1785426120, "1785422520": 1785426180, "1785422580": 1785426240, "1785422640": 1785426300, "1785422700": 1785426360, "1785422760": 1785426420, "1785422820": 1785426480, "1785422880": 1785426540, "1785422940": 1785426600, "1785423000": 1785426660, "1785423060": 1785426720, "1785423120": 1785426780, "1785423180": 1785426840, "1785423240": 1785426900, "1785423300": 1785426960, "1785423360": 1785427020, "1785423420": 1785427080, "1785423480": 1785427140, "1785423540": 1785427200, "1785423600": 1785427260, "1785423660": 1785427320, "1785423720": 1785427380, "1785423780": 1785427440, "1785423840": 1785427500, "1785423900": 1785427560, "1785423960": 1785427620, "1785424020": 1785427680, "1785424080": 1785427740, "1785424140": 1785427800, "1785424200": 1785427860, "1785424260": 1785427920, "1785424320": 1785427980, "1785424380": 1785428040, "1785424440": 1785428100, "1785424500": 1785428160, "1785424560": 1785428220, "1785424620": 1785428280, "1785424680": 1785428340, "1785424740": 1785428400, "1785424800": 1785428460, "1785424860": 1785428520, "1785424920": 1785428580, "1785424980": 1785428640, "1785425040": 1785428700, "1785425100": 1785428760, "1785425160": 1785428820, "1785425220": 1785428880, "1785425280": 1785428940, "1785425340": 1785429000, "1785425400": 1785429060, "1785425460": 1785429120, "1785425520": 1785429180, "1785425580": 1785429240, "1785425640": 1785429300, "1785425700": 1785429360, "1785425760": 1785429420, "1785425820": 1785429480, "1785425880": 1785429540, "1785425940": 1785429600, "1785426000": 1785429660, "1785426060": 1785429720, "1785426120": 1785429780, "1785426180": 1785429840, "1785426240": 1785429900, "1785426300": 1785429960, "1785426360": 1785430020, "1785426420": 1785430080, "1785426480": 1785430140, "1785426540": 1785430200, "1785426600": 1785430260, "1785426660": 1785430320, "1785426720": 1785430380, "1785426780": 1785430440, "1785426840": 1785430500, "1785426900": 1785430560, "1785426960": 1785430620, "1785427020": 1785430680, "1785427080": 1785430740, "1785427140": 1785430800, "1785427200": 1785430860, "1785427260": 1785430920, "1785427320": 1785430980, "1785427380": 1785431040, "1785427440": 1785431100, "1785427500": 1785431160, "1785427560": 1785431220, "1785427620": 1785431280, "1785427680": 1785431340, "1785427740": 1785431400, "1785427800": 1785431460, "1785427860": 1785431520, "1785427920": 1785431580, "1785427980": 1785431640, "1785428040": 1785431700, "1785428100": 1785431760, "1785428160": 1785431820, "1785428220": 1785431880, "1785428280": 1785431940, "1785428340": 1785432000, "1785428400": 1785432060, "1785428460": 1785432120, "1785428520": 1785432180, "1785428580": 1785432240, "1785428640": 1785432300, "1785428700": 1785432360, "1785428760": 1785432420, "1785428820": 1785432480, "1785428880": 1785432540, "1785428940": 1785432600, "1785429000": 1785432660, "1785429060": 1785432720, "1785429120": 1785432780, "1785429180": 1785432840, "1785429240": 1785432900, "1785429300": 1785432960, "1785429360": 1785433020, "1785429420": 1785433080, "1785429480": 1785433140, "1785429540": 1785433200, "1785429600": 1785433260, "1785429660": 1785433320, "1785429720": 1785433380, "1785429780": 1785433440, "1785429840": 1785433500, "1785429900": 1785433560, "1785429960": 1785433620, "1785430020": 1785433680, "1785430080": 1785433740, "1785430140": 1785433800, "1785430200": 1785433860, "1785430260": 1785433920, "1785430320": 1785433980, "1785430380": 1785434040, "1785430440": 1785434100, "1785430500": 1785434160, "1785430560": 1785434220, "1785430620": 1785434280, "1785430680": 1785434340, "1785430740": 1785434400, "1785430800": 1785434460, "1785430860": 1785434520, "1785430920": 1785434580, "1785430980": 1785434640, "1785431040": 1785434700, "1785431100": 1785434760, "1785431160": 1785434820, "1785431220": 1785434880, "1785431280": 1785434940, "1785431340": 1785435000, "1785431400": 1785435060, "1785431460": 1785435120, "1785431520": 1785435180, "1785431580": 1785435240, "1785431640": 1785435300, "1785431700": 1785435360, "1785431760": 1785435420, "1785431820": 1785435480, "1785431880": 1785435540, "1785431940": 1785435600, "1785432000": 1785435660, "1785432060": 1785435720, "1785432120": 1785435780, "1785432180": 1785435840, "1785432240": 1785435900, "1785432300": 1785435960, "1785432360": 1785436020, "1785432420": 1785436080, "1785432480": 1785436140, "1785432540": 1785436200, "1785432600": 1785436260, "1785432660": 1785436320, "1785432720": 1785436380, "1785432780": 1785436440, "1785432840": 1785436500, "1785432900": 1785436560, "1785432960": 1785436620, "1785433020": 1785436680, "1785433080": 1785436740, "1785433140": 1785436800, "1785433200": 1785436860, "1785433260": 1785436920, "1785433320": 1785436980, "1785433380": 1785437040, "1785433440": 1785437100, "1785433500": 1785437160, "1785433560": 1785437220, "1785433620": 1785437280, "1785433680": 1785437340, "1785433740": 1785437400, "1785433800": 1785437460, "1785433860": 1785437520, "1785433920": 1785437580, "1785433980": 1785437640, "1785434040": 1785437700, "1785434100": 1785437760, "1785434160": 1785437820, "1785434220": 1785437880, "1785434280": 1785437940, "1785434340": 1785438000, "1785434400": 1785438060, "1785434460": 1785438120, "1785434520": 1785438180, "1785434580": 1785438240, "1785434640": 1785438300, "1785434700": 1785438360, "1785434760": 1785438420, "1785434820": 1785438480, "1785434880": 1785438540, "1785434940": 1785438600, "1785435000": 1785438660, "1785435060": 1785438720, "1785435120": 1785438780, "1785435180": 1785438840, "1785435240": 1785438900, "1785435300": 1785438960, "1785435360": 1785439020, "1785435420": 1785439080, "1785435480": 1785439140, "1785435540": 1785439200, "1785435600": 1785439260, "1785435660": 1785439320, "1785435720": 1785439380, "1785435780": 1785439440, "1785435840": 1785439500, "1785435900": 1785439560, "1785435960": 1785439620, "1785436020": 1785439680, "1785436080": 1785439740, "1785436140": 1785439800, "1785436200": 1785439860, "1785436260": 1785439920, "1785436320": 1785439980, "1785436380": 1785440040, "1785436440": 1785440100, "1785436500": 1785440160, "1785436560": 1785440220, "1785436620": 1785440280, "1785436680": 1785440340, "1785436740": 1785440400, "1785436800": 1785440460, "1785436860": 1785440520, "1785436920": 1785440580, "1785436980": 1785440640, "1785437040": 1785440700, "1785437100": 1785440760, "1785437160": 1785440820, "1785437220": 1785440880, "1785437280": 1785440940, "1785437340": 1785441000, "1785437400": 1785441060, "1785437460": 1785441120, "1785437520": 1785441180, "1785437580": 1785441240, "1785437640": 1785441300, "1785437700": 1785441360, "1785437760": 1785441420, "1785437820": 1785441480, "1785437880": 1785441540, "1785437940": 1785441600, "1785438000": 1785441660, "1785438060": 1785441720, "1785438120": 1785441780, "1785438180": 1785441840, "1785438240": 1785441900, "1785438300": 1785441960, "1785438360": 1785442020, "1785438420": 1785442080, "1785438480": 1785442140, "1785438540": 1785442200, "1785438600": 1785442260, "1785438660": 1785442320, "1785438720": 1785442380, "1785438780": 1785442440, "1785438840": 1785442500, "1785438900": 1785442560, "1785438960": 1785442620, "1785439020": 1785442680, "1785439080": 1785442740, "1785439140": 1785442800, "1785439200": 1785442860, "1785439260": 1785442920, "1785439320": 1785442980, "1785439380": 1785443040, "1785439440": 1785443100, "1785439500": 1785443160, "1785439560": 1785443220, "1785439620": 1785443280, "1785439680": 1785443340, "1785439740": 1785443400, "1785439800": 1785443460, "1785439860": 1785443520, "1785439920": 1785443580, "1785439980": 1785443640, "1785440040": 1785443700, "1785440100": 1785443760, "1785440160": 1785443820, "1785440220": 1785443880, "1785440280": 1785443940, "1785440340": 1785444000, "1785440400": 1785444060, "1785440460": 1785444120, "1785440520": 1785444180, "1785440580": 1785444240, "1785440640": 1785444300, "1785440700": 1785444360, "1785440760": 1785444420, "1785440820": 1785444480, "1785440880": 1785444540, "1785440940": 1785444600, "1785441000": 1785444660, "1785441060": 1785444720, "1785441120": 1785444780, "1785441180": 1785444840, "1785441240": 1785444900, "1785441300": 1785444960, "1785441360": 1785445020, "1785441420": 1785445080, "1785441480": 1785445140, "1785441540": 1785445200, "1785441600": 1785445260, "1785441660": 1785445320, "1785441720": 1785445380, "1785441780": 1785445440, "1785441840": 1785445500, "1785441900": 1785445560, "1785441960": 1785445620, "1785442020": 1785445680, "1785442080": 1785445740, "1785442140": 1785445800, "1785442200": 1785445860, "1785442260": 1785445920, "1785442320": 1785445980, "1785442380": 1785446040, "1785442440": 1785446100, "1785442500": 1785446160, "1785442560": 1785446220, "1785442620": 1785446280, "1785442680": 1785446340, "1785442740": 1785446400, "1785442800": 1785446460, "1785442860": 1785446520, "1785442920": 1785446580, "1785442980": 1785446640, "1785443040": 1785446700, "1785443100": 1785446760, "1785443160": 1785446820, "1785443220": 1785446880, "1785443280": 1785446940, "1785443340": 1785447000, "1785443400": 1785447060, "1785443460": 1785447120, "1785443520": 1785447180, "1785443580": 1785447240, "1785443640": 1785447300, "1785443700": 1785447360, "1785443760": 1785447420, "1785443820": 1785447480, "1785443880": 1785447540, "1785443940": 1785447600, "1785444000": 1785447660, "1785444060": 1785447720, "1785444120": 1785447780, "1785444180": 1785447840, "1785444240": 1785447900, "1785444300": 1785447960, "1785444360": 1785448020, "1785444420": 1785448080, "1785444480": 1785448140, "1785444540": 1785448200, "1785444600": 1785448260, "1785444660": 1785448320, "1785444720": 1785448380, "1785444780": 1785448440, "1785444840": 1785448500, "1785444900": 1785448560, "1785444960": 1785448620, "1785445020": 1785448680, "1785445080": 1785448740, "1785445140": 1785448800, "1785445200": 1785448860, "1785445260": 1785448920, "1785445320": 1785448980, "1785445380": 1785449040, "1785445440": 1785449100, "1785445500": 1785449160, "1785445560": 1785449220, "1785445620": 1785449280, "1785445680": 1785449340, "1785445740": 1785449400, "1785445800": 1785449460, "1785445860": 1785449520, "1785445920": 1785449580, "1785445980": 1785449640, "1785446040": 1785449700, "1785446100": 1785449760, "1785446160": 1785449820, "1785446220": 1785449880, "1785446280": 1785449940, "1785446340": 1785450000, "1785446400": 1785450060, "1785446460": 1785450120, "1785446520": 1785450180, "1785446580": 1785450240, "1785446640": 1785450300, "1785446700": 1785450360, "1785446760": 1785450420, "1785446820": 1785450480, "1785446880": 1785450540, "1785446940": 1785450600, "1785447000": 1785450660, "1785447060": 1785450720, "1785447120": 1785450780, "1785447180": 1785450840, "1785447240": 1785450900, "1785447300": 1785450960, "1785447360": 1785451020, "1785447420": 1785451080, "1785447480": 1785451140, "1785447540": 1785451200, "1785447600": 1785451260, "1785447660": 1785451320, "1785447720": 1785451380, "1785447780": 1785451440, "1785447840": 1785451500, "1785447900": 1785451560, "1785447960": 1785451620, "1785448020": 1785451680, "1785448080": 1785451740, "1785448140": 1785451800, "1785448200": 1785451860, "1785448260": 1785451920, "1785448320": 1785451980, "1785448380": 1785452040, "1785448440": 1785452100, "1785448500": 1785452160, "1785448560": 1785452220, "1785448620": 1785452280, "1785448680": 1785452340, "1785448740": 1785456060, "1785448800": 1785456120, "1785448860": 1785456180, "1785448920": 1785456240, "1785448980": 1785456300, "1785449040": 1785456360, "1785449100": 1785456420, "1785449160": 1785456480, "1785449220": 1785456540, "1785449280": 1785456600, "1785449340": 1785456660, "1785449400": 1785456720, "1785449460": 1785456780, "1785449520": 1785456840, "1785449580": 1785456900, "1785449640": 1785456960, "1785449700": 1785457020, "1785449760": 1785457080, "1785449820": 1785457140, "1785449880": 1785457200, "1785449940": 1785457260, "1785450000": 1785457320, "1785450060": 1785457380, "1785450120": 1785457440, "1785450180": 1785457500, "1785450240": 1785457560, "1785450300": 1785457620, "1785450360": 1785457680, "1785450420": 1785457740, "1785450480": 1785457800, "1785450540": 1785457860, "1785450600": 1785457920, "1785450660": 1785457980, "1785450720": 1785458040, "1785450780": 1785458100, "1785450840": 1785458160, "1785450900": 1785458220, "1785450960": 1785458280, "1785451020": 1785458340, "1785451080": 1785458400, "1785451140": 1785458460, "1785451200": 1785458520, "1785451260": 1785458580, "1785451320": 1785458640, "1785451380": 1785458700, "1785451440": 1785458760, "1785451500": 1785458820, "1785451560": 1785458880, "1785451620": 1785458940, "1785451680": 1785459000, "1785451740": 1785459060, "1785451800": 1785459120, "1785451860": 1785459180, "1785451920": 1785459240, "1785451980": 1785459300, "1785452040": 1785459360, "1785452100": 1785459420, "1785452160": 1785459480, "1785452220": 1785459540, "1785452280": 1785459600, "1785452340": 1785459660, "1785452400": 1785459720, "1785452460": 1785459780, "1785452520": 1785459840, "1785452580": 1785459900, "1785452640": 1785459960, "1785452700": 1785460020, "1785452760": 1785460080, "1785452820": 1785460140, "1785452880": 1785460200, "1785452940": 1785460260, "1785453000": 1785460320, "1785453060": 1785460380, "1785453120": 1785460440, "1785453180": 1785460500, "1785453240": 1785460560, "1785453300": 1785460620, "1785453360": 1785460680, "1785453420": 1785460740, "1785453480": 1785460800, "1785453540": 1785460860, "1785453600": 1785460920, "1785453660": 1785460980, "1785453720": 1785461040, "1785453780": 1785461100, "1785453840": 1785461160, "1785453900": 1785461220, "1785453960": 1785461280, "1785454020": 1785461340, "1785454080": 1785461400, "1785454140": 1785461460, "1785454200": 1785461520, "1785454260": 1785461580, "1785454320": 1785461640, "1785454380": 1785461700, "1785454440": 1785461760, "1785454500": 1785461820, "1785454560": 1785461880, "1785454620": 1785461940, "1785454680": 1785462000, "1785454740": 1785462060, "1785454800": 1785462120, "1785454860": 1785462180, "1785454920": 1785462240, "1785454980": 1785462300, "1785455040": 1785462360, "1785455100": 1785462420, "1785455160": 1785462480, "1785455220": 1785462540, "1785455280": 1785462600, "1785455340": 1785462660, "1785455400": 1785462720, "1785455460": 1785462780, "1785455520": 1785462840, "1785455580": 1785462900, "1785455640": 1785462960, "1785455700": 1785463020, "1785455760": 1785463080, "1785455820": 1785463140, "1785455880": 1785463200, "1785455940": 1785463260, "1785456000": 1785463320, "1785456060": 1785463380, "1785456120": 1785463440, "1785456180": 1785463500, "1785456240": 1785463560, "1785456300": 1785463620, "1785456360": 1785463680, "1785456420": 1785463740, "1785456480": 1785463800, "1785456540": 1785463860, "1785456600": 1785463920, "1785456660": 1785463980, "1785456720": 1785464040, "1785456780": 1785464100, "1785456840": 1785464160, "1785456900": 1785464220, "1785456960": 1785464280, "1785457020": 1785464340, "1785457080": 1785464400, "1785457140": 1785464460, "1785457200": 1785464520, "1785457260": 1785464580, "1785457320": 1785464640, "1785457380": 1785464700, "1785457440": 1785464760, "1785457500": 1785464820, "1785457560": 1785464880, "1785457620": 1785464940, "1785457680": 1785465000, "1785457740": 1785465060, "1785457800": 1785465120, "1785457860": 1785465180, "1785457920": 1785465240, "1785457980": 1785465300, "1785458040": 1785465360, "1785458100": 1785465420, "1785458160": 1785465480, "1785458220": 1785465540, "1785458280": 1785465600, "1785458340": 1785465660, "1785458400": 1785465720, "1785458460": 1785465780, "1785458520": 1785465840, "1785458580": 1785465900, "1785458640": 1785465960, "1785458700": 1785466020, "1785458760": 1785466080, "1785458820": 1785466140, "1785458880": 1785466200, "1785458940": 1785466260, "1785459000": 1785466320, "1785459060": 1785466380, "1785459120": 1785466440, "1785459180": 1785466500, "1785459240": 1785466560, "1785459300": 1785466620, "1785459360": 1785466680, "1785459420": 1785466740, "1785459480": 1785466800, "1785459540": 1785466860, "1785459600": 1785466920, "1785459660": 1785466980, "1785459720": 1785467040, "1785459780": 1785467100, "1785459840": 1785467160, "1785459900": 1785467220, "1785459960": 1785467280, "1785460020": 1785467340, "1785460080": 1785467400, "1785460140": 1785467460, "1785460200": 1785467520, "1785460260": 1785467580, "1785460320": 1785467640, "1785460380": 1785467700, "1785460440": 1785467760, "1785460500": 1785467820, "1785460560": 1785467880, "1785460620": 1785467940, "1785460680": 1785468000, "1785460740": 1785468060, "1785460800": 1785468120, "1785460860": 1785468180, "1785460920": 1785468240, "1785460980": 1785468300, "1785461040": 1785468360, "1785461100": 1785468420, "1785461160": 1785468480, "1785461220": 1785468540, "1785461280": 1785468600, "1785461340": 1785468660, "1785461400": 1785468720, "1785461460": 1785468780, "1785461520": 1785468840, "1785461580": 1785468900, "1785461640": 1785468960, "1785461700": 1785469020, "1785461760": 1785469080, "1785461820": 1785469140, "1785461880": 1785469200, "1785461940": 1785469260, "1785462000": 1785469320, "1785462060": 1785469380, "1785462120": 1785469440, "1785462180": 1785469500, "1785462240": 1785469560, "1785462300": 1785469620, "1785462360": 1785469680, "1785462420": 1785469740, "1785462480": 1785469800, "1785462540": 1785469860, "1785462600": 1785469920, "1785462660": 1785469980, "1785462720": 1785470040, "1785462780": 1785470100, "1785462840": 1785470160, "1785462900": 1785470220, "1785462960": 1785470280, "1785463020": 1785470340, "1785463080": 1785470400, "1785463140": 1785470460, "1785463200": 1785470520, "1785463260": 1785470580, "1785463320": 1785470640, "1785463380": 1785470700, "1785463440": 1785470760, "1785463500": 1785470820, "1785463560": 1785470880, "1785463620": 1785470940, "1785463680": 1785471000, "1785463740": 1785471060, "1785463800": 1785471120, "1785463860": 1785471180, "1785463920": 1785471240, "1785463980": 1785471300, "1785464040": 1785471360, "1785464100": 1785471420, "1785464160": 1785471480, "1785464220": 1785471540, "1785464280": 1785471600, "1785464340": 1785471660, "1785464400": 1785471720, "1785464460": 1785471780, "1785464520": 1785471840, "1785464580": 1785471900, "1785464640": 1785471960, "1785464700": 1785472020, "1785464760": 1785472080, "1785464820": 1785472140, "1785464880": 1785472200, "1785464940": 1785472260, "1785465000": 1785472320, "1785465060": 1785472380, "1785465120": 1785472440, "1785465180": 1785472500, "1785465240": 1785472560, "1785465300": 1785472620, "1785465360": 1785472680, "1785465420": 1785472740, "1785465480": 1785472800, "1785465540": 1785472860, "1785465600": 1785472920, "1785465660": 1785472980, "1785465720": 1785473040, "1785465780": 1785473100, "1785465840": 1785473160, "1785465900": 1785473220, "1785465960": 1785473280, "1785466020": 1785473340, "1785466080": 1785473400, "1785466140": 1785473460, "1785466200": 1785473520, "1785466260": 1785473580, "1785466320": 1785473640, "1785466380": 1785473700, "1785466440": 1785473760, "1785466500": 1785473820, "1785466560": 1785473880, "1785466620": 1785473940, "1785466680": 1785474000, "1785466740": 1785474060, "1785466800": 1785474120, "1785466860": 1785474180, "1785466920": 1785474240, "1785466980": 1785474300, "1785467040": 1785474360, "1785467100": 1785474420, "1785467160": 1785474480, "1785467220": 1785474540, "1785467280": 1785474600, "1785467340": 1785474660, "1785467400": 1785474720, "1785467460": 1785474780, "1785467520": 1785474840, "1785467580": 1785474900, "1785467640": 1785474960, "1785467700": 1785475020, "1785467760": 1785475080, "1785467820": 1785475140, "1785467880": 1785475200, "1785467940": 1785475260, "1785468000": 1785475320, "1785468060": 1785475380, "1785468120": 1785475440, "1785468180": 1785475500, "1785468240": 1785475560, "1785468300": 1785475620, "1785468360": 1785475680, "1785468420": 1785475740, "1785468480": 1785475800, "1785468540": 1785475860, "1785468600": 1785475920, "1785468660": 1785475980, "1785468720": 1785476040, "1785468780": 1785476100, "1785468840": 1785476160, "1785468900": 1785476220, "1785468960": 1785476280, "1785469020": 1785476340, "1785469080": 1785476400, "1785469140": 1785476460, "1785469200": 1785476520, "1785469260": 1785476580, "1785469320": 1785476640, "1785469380": 1785476700, "1785469440": 1785476760, "1785469500": 1785476820, "1785469560": 1785476880, "1785469620": 1785476940, "1785469680": 1785477000, "1785469740": 1785477060, "1785469800": 1785477120, "1785469860": 1785477180, "1785469920": 1785477240, "1785469980": 1785477300, "1785470040": 1785477360, "1785470100": 1785477420, "1785470160": 1785477480, "1785470220": 1785477540, "1785470280": 1785477600, "1785470340": 1785477660, "1785470400": 1785477720, "1785470460": 1785477780, "1785470520": 1785477840, "1785470580": 1785477900, "1785470640": 1785477960, "1785470700": 1785478020, "1785470760": 1785478080, "1785470820": 1785478140, "1785470880": 1785478200, "1785470940": 1785478260, "1785471000": 1785478320, "1785471060": 1785478380, "1785471120": 1785478440, "1785471180": 1785478500, "1785471240": 1785478560, "1785471300": 1785478620, "1785471360": 1785478680, "1785471420": 1785478740, "1785471480": 1785478800, "1785471540": 1785478860, "1785471600": 1785478920, "1785471660": 1785478980, "1785471720": 1785479040, "1785471780": 1785479100, "1785471840": 1785479160, "1785471900": 1785479220, "1785471960": 1785479280, "1785472020": 1785479340, "1785472080": 1785479400, "1785472140": 1785479460, "1785472200": 1785479520, "1785472260": 1785479580, "1785472320": 1785479640, "1785472380": 1785479700, "1785472440": 1785479760, "1785472500": 1785479820, "1785472560": 1785479880, "1785472620": 1785479940, "1785472680": 1785480000, "1785472740": 1785480060, "1785472800": 1785480120, "1785472860": 1785480180, "1785472920": 1785480240, "1785472980": 1785480300, "1785473040": 1785480360, "1785473100": 1785480420, "1785473160": 1785480480, "1785473220": 1785480540, "1785473280": 1785480600, "1785473340": 1785480660, "1785473400": 1785480720, "1785473460": 1785480780, "1785473520": 1785480840, "1785473580": 1785480900, "1785473640": 1785480960, "1785473700": 1785481020, "1785473760": 1785481080, "1785473820": 1785481140, "1785473880": 1785481200, "1785473940": 1785481260, "1785474000": 1785481320, "1785474060": 1785481380, "1785474120": 1785481440, "1785474180": 1785481500, "1785474240": 1785481560, "1785474300": 1785481620, "1785474360": 1785481680, "1785474420": 1785481740, "1785474480": 1785481800, "1785474540": 1785481860, "1785474600": 1785481920, "1785474660": 1785481980, "1785474720": 1785482040, "1785474780": 1785482100, "1785474840": 1785482160, "1785474900": 1785482220, "1785474960": 1785482280, "1785475020": 1785482340, "1785475080": 1785482400, "1785475140": 1785482460, "1785475200": 1785482520, "1785475260": 1785482580, "1785475320": 1785482640, "1785475380": 1785482700, "1785475440": 1785482760, "1785475500": 1785482820, "1785475560": 1785482880, "1785475620": 1785482940, "1785475680": 1785483000, "1785475740": 1785483060, "1785475800": 1785483120, "1785475860": 1785483180, "1785475920": 1785483240, "1785475980": 1785483300, "1785476040": 1785483360, "1785476100": 1785483420, "1785476160": 1785483480, "1785476220": 1785483540, "1785476280": 1785483600, "1785476340": 1785483660, "1785476400": 1785483720, "1785476460": 1785483780, "1785476520": 1785483840, "1785476580": 1785483900, "1785476640": 1785483960, "1785476700": 1785484020, "1785476760": 1785484080, "1785476820": 1785484140, "1785476880": 1785484200, "1785476940": 1785484260, "1785477000": 1785484320, "1785477060": 1785484380, "1785477120": 1785484440, "1785477180": 1785484500, "1785477240": 1785484560, "1785477300": 1785484620, "1785477360": 1785484680, "1785477420": 1785484740, "1785477480": 1785484800, "1785477540": 1785484860, "1785477600": 1785484920, "1785477660": 1785484980, "1785477720": 1785485040, "1785477780": 1785485100, "1785477840": 1785485160, "1785477900": 1785485220, "1785477960": 1785485280, "1785478020": 1785485340, "1785478080": 1785485400, "1785478140": 1785485460, "1785478200": 1785485520, "1785478260": 1785485580, "1785478320": 1785485640, "1785478380": 1785485700, "1785478440": 1785485760, "1785478500": 1785485820, "1785478560": 1785485880, "1785478620": 1785485940, "1785478680": 1785486000, "1785478740": 1785486060, "1785478800": 1785486120, "1785478860": 1785486180, "1785478920": 1785486240, "1785478980": 1785486300, "1785479040": 1785486360, "1785479100": 1785486420, "1785479160": 1785486480, "1785479220": 1785486540, "1785479280": 1785486600, "1785479340": 1785486660, "1785479400": 1785486720, "1785479460": 1785486780, "1785479520": 1785486840, "1785479580": 1785486900, "1785479640": 1785486960, "1785479700": 1785487020, "1785479760": 1785487080, "1785479820": 1785487140, "1785479880": 1785487200, "1785479940": 1785487260, "1785480000": 1785487320, "1785480060": 1785487380, "1785480120": 1785487440, "1785480180": 1785487500, "1785480240": 1785487560, "1785480300": 1785487620, "1785480360": 1785487680, "1785480420": 1785487740, "1785480480": 1785487800, "1785480540": 1785487860, "1785480600": 1785487920, "1785480660": 1785487980, "1785480720": 1785488040, "1785480780": 1785488100, "1785480840": 1785488160, "1785480900": 1785488220, "1785480960": 1785488280, "1785481020": 1785488340, "1785481080": 1785488400, "1785481140": 1785488460, "1785481200": 1785488520, "1785481260": 1785488580, "1785481320": 1785488640, "1785481380": 1785488700, "1785481440": 1785488760, "1785481500": 1785488820, "1785481560": 1785488880, "1785481620": 1785488940, "1785481680": 1785489000, "1785481740": 1785489060, "1785481800": 1785489120, "1785481860": 1785489180, "1785481920": 1785489240, "1785481980": 1785489300, "1785482040": 1785489360, "1785482100": 1785489420, "1785482160": 1785489480, "1785482220": 1785489540, "1785482280": 1785489600, "1785482340": 1785489660, "1785482400": 1785489720, "1785482460": 1785489780, "1785482520": 1785489840, "1785482580": 1785489900, "1785482640": 1785489960, "1785482700": 1785490020, "1785482760": 1785490080, "1785482820": 1785490140, "1785482880": 1785490200, "1785482940": 1785490260, "1785483000": 1785490320, "1785483060": 1785490380, "1785483120": 1785490440, "1785483180": 1785490500, "1785483240": 1785490560, "1785483300": 1785490620, "1785483360": 1785490680, "1785483420": 1785490740, "1785483480": 1785490800, "1785483540": 1785490860, "1785483600": 1785490920, "1785483660": 1785490980, "1785483720": 1785491040, "1785483780": 1785491100, "1785483840": 1785491160, "1785483900": 1785491220, "1785483960": 1785491280, "1785484020": 1785491340, "1785484080": 1785491400, "1785484140": 1785491460, "1785484200": 1785491520, "1785484260": 1785491580, "1785484320": 1785491640, "1785484380": 1785491700, "1785484440": 1785491760, "1785484500": 1785491820, "1785484560": 1785491880, "1785484620": 1785491940, "1785484680": 1785492000, "1785484740": 1785492060, "1785484800": 1785492120, "1785484860": 1785492180, "1785484920": 1785492240, "1785484980": 1785492300, "1785485040": 1785492360, "1785485100": 1785492420, "1785485160": 1785492480, "1785485220": 1785492540, "1785485280": 1785492600, "1785485340": 1785492660, "1785485400": 1785492720, "1785485460": 1785492780, "1785485520": 1785492840, "1785485580": 1785492900, "1785485640": 1785492960, "1785485700": 1785493020, "1785485760": 1785493080, "1785485820": 1785493140, "1785485880": 1785493200, "1785485940": 1785493260, "1785486000": 1785493320, "1785486060": 1785493380, "1785486120": 1785493440, "1785486180": 1785493500, "1785486240": 1785493560, "1785486300": 1785493620, "1785486360": 1785493680, "1785486420": 1785493740, "1785486480": 1785493800, "1785486540": 1785493860, "1785486600": 1785493920, "1785486660": 1785493980, "1785486720": 1785494040, "1785486780": 1785494100, "1785486840": 1785494160, "1785486900": 1785494220, "1785486960": 1785494280, "1785487020": 1785494340, "1785487080": 1785494400, "1785487140": 1785494460, "1785487200": 1785494520, "1785487260": 1785494580, "1785487320": 1785494640, "1785487380": 1785494700, "1785487440": 1785494760, "1785487500": 1785494820, "1785487560": 1785494880, "1785487620": 1785494940, "1785487680": 1785495000, "1785487740": 1785495060, "1785487800": 1785495120, "1785487860": 1785495180, "1785487920": 1785495240, "1785487980": 1785495300, "1785488040": 1785495360, "1785488100": 1785495420, "1785488160": 1785495480, "1785488220": 1785495540, "1785488280": 1785495600, "1785488340": 1785495660, "1785488400": 1785495720, "1785488460": 1785495780, "1785488520": 1785495840, "1785488580": 1785495900, "1785488640": 1785495960, "1785488700": 1785496020, "1785488760": 1785496080, "1785488820": 1785496140, "1785488880": 1785496200, "1785488940": 1785496260, "1785489000": 1785496320, "1785489060": 1785496380, "1785489120": 1785496440, "1785489180": 1785496500, "1785489240": 1785496560, "1785489300": 1785496620, "1785489360": 1785496680, "1785489420": 1785496740, "1785489480": 1785496800, "1785489540": 1785496860, "1785489600": 1785496920, "1785489660": 1785496980, "1785489720": 1785497040, "1785489780": 1785497100, "1785489840": 1785497160, "1785489900": 1785497220, "1785489960": 1785497280, "1785490020": 1785497340, "1785490080": 1785497400, "1785490140": 1785497460, "1785490200": 1785497520}}
 ```
 
 --------------------------------------------------

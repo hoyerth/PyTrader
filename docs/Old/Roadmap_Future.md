@@ -53,8 +53,7 @@ Others Topics -
 
 - ## ANALYTICS NACHGELAGERTE ARBEITEN (ERST SPÄTER IMPLEMENTIERT)
 
-- default symbols entfernen - Vorgabe Favoriten sind SILVER, GOLD
-- prüfen ob numpy im code noch weitere einsatzmöglichkeiten hat - ist es generisch implementiert?
+
 - Multiservice Darstellung in Analytics mit Legenden auf den Graphics
 - Analytics Service Parameter editierbar (What-If, in-memory calculation) -  ggf. auch persistieren und in Chart_win
 
