@@ -64,7 +64,7 @@ Implementiere die Klasse `MATemplateEngine` mit folgenden Methoden:
 
 ## Konsistenz-Check, Entscheidungen & Ergänzungen (06.08.2026, Doku-Analyse)
 
-> **Status:** Spezifikation analysiert, Projekt-Ist-Stand verifiziert. Implementierung erfolgt erst auf ausdrücklichen Startbefehl. Vor der Umsetzung wird gemäß Invariante 1 ein Git-Commit/Tag gesetzt (Vorschlag: `phase16_step4`).
+> **Status:** ✅ UMGESETZT & COMMITTET (06.08.2026 21:09). Spezifikation analysiert, Projekt-Ist-Stand verifiziert, Implementierung abgeschlossen (Invariante-1-Backup/Tag `phase16_step4` auf Commit `edc823d`, danach Umsetzungs-Commit). Verifikation headless über `test/test_ma_template.py` (61/61 Checks PASS, inkl. VWMA-DB-Test gegen echte `market_data.duckdb`).
 
 ### A. Konsistenz-Check (verifiziert am Ist-Stand des Projekts)
 
@@ -94,6 +94,25 @@ Implementiere die Klasse `MATemplateEngine` mit folgenden Methoden:
 4. **KAMA/ALMA/RMA-Details:** KAMA nutzt `period` als ER-Periode (Default 10) mit Standard fast `2/(2+1)` und slow `2/(30+1)`; `alpha_factor` entfällt bei KAMA. ALMA nutzt TradingView-Defaults (Offset 0.85, Sigma = `period/6`). RMA = Wilder: `ewm(alpha=1/period, adjust=False)`.
 5. **VWMA-Nullschutz:** Volumen wird mit `fillna(0)` normalisiert; ist die rollierende Volumen-Summe eines Fensters ≤ 0, fällt dieses Fenster auf den SMA-Wert zurück (kein Division-by-Zero).
 6. **Testabdeckung `test/test_ma_template.py`:** Längen-/Paritätsprüfung aller 12 Typen gegen eine einfache Referenzimplementierung (defensive Formeln), Farbumschlag (E6), `VWMA` mit `tick_volume` aus `market_data.duckdb` (read-only via `DbPool`, nur Lesen – keine Schreibzugriffe auf `data/`), NaN-Filter von `build_chart_payload`, VWMA-Fallback (E5), Warmup-Länge = `period-1`.
+
+---
+
+## Implementierungs-Log Phase 16.04 (06.08.2026 21:09)
+
+**Schritt 1–3 – Modul erstellt (`chart/indicators/utils/ma_template.py` + `utils/__init__.py`):**
+* `MAType`-Literal + `MA_TYPES`-Tuple (12er-Satz, E2), `MATemplateEngine` (stateless, ohne Engine-Abhängigkeiten).
+* `get_ma_parameter_schema()` – 7 Parameter in Projekt-Schema-Konvention (`choice`/`int`/`float`/`bool`/`color`, `style_type`), Defaults nach E3.
+* `resolve_bull_color()` – bedingter bull-Default (E7/Ergänzung 2): Schema `#2196F3`, dual=True + ungesetzt → `#26A69A`.
+* `crop_dataframe()` – `df.tail(max_limit)`, `calculate_ma()` – alle 12 Typen vektorisiert (SMA/WMA/HMA/ALMA/VWMA via np.convolve, EMA/RMA/DEMA/TEMA/EHMA via pandas ewm, KAMA ER-basiert mit kompakter Schleife, ZLEMA mit lag), α-Pfad nach E4.
+* `build_color_series()` – dual_color-Semantik (E6), NaN-Vergleich = bull. `build_chart_payload()` – LWC-v5-Array, NaN/Inf-Skip (Warmup), Mismatch-Toleranz (Ergänzung 3).
+* **Bugfix-Faltung:** `np.convolve` wendet Gewichte rückwärts an – `_wma_values` nutzt daher absteigende Gewichte `[p..1]`, `_alma_values` faltet `weights[::-1]` (Parität zur Referenzschleife).
+* **pandas-3.0-Kompatibilität:** `ewm(...).to_numpy()` liefert read-only Arrays → `_ema_alpha/_ema_span/_rma` liefern beschreibbare Kopien (wichtig für ZLEMA-Warmup-Overwrite).
+
+**Schritt 4 – Backend-Logiktest (`test/test_ma_template.py`, temporär):**
+* **61/61 Checks PASS** – Schema-Defaults & resolve_bull_color (S1–S12), Länge/Warmup aller 12 Typen (L1/L2, typspezifisch tolerant: EWM-Typen seeden ab Index 0), volle Parität aller 12 Typen gegen defensive Referenzimplementierung (P1, period=10), VWMA mit echten `tick_volume`-Daten aus `market_data.duckdb` (D1–D3, weicht vom SMA ab), VWMA-Fallback exakt SMA (E5), Null-Volumen-SMA-Fallback (E5b), Farbumschlag (C1–C3), Payload-Vertrag (Q1–Q5), crop/Edge-Cases (R1–R4).
+* Verifikation: `python -m py_compile` auf Modul + `utils/__init__.py` + Test → OK; Import-Smoke `chart.indicators.utils.ma_template` → OK.
+
+**Cleanup (Invariante 10):** `test/test_ma_template.py` wird erst nach bestätigter Freigabe des Kapitels entfernt (Verifikation erfolgte VOR der Bereinigung). Dauerhaft bleibt nur `test/test.py`.
 
 ---
 
