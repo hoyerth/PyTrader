@@ -8,11 +8,15 @@ import json
 import os
 from typing import Any, Dict, List, Optional
 import duckdb
-import pandas as pd
 
 from db_service import _parse_json_field, DbPool
 from config.base_state_model import AbstractStateModel
 from config.app_settings import AppSettings
+# Phase 15.04: Instanz-/Fenster-SQL-Zugriffe sind in das
+# WindowStateRepository ausgelagert (window_state_repository.py). Der
+# StateManager ist seitdem eine additive Fassade – alle Bestands-Methoden
+# bleiben mit identischen Signaturen erhalten und delegieren intern.
+from window_state_repository import WindowStateRepository
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_DB_PATH = os.path.join(BASE_DIR, "data", "app_data.duckdb")
@@ -25,6 +29,10 @@ class StateManager:
     def __init__(self, db_path: str = APP_DB_PATH) -> None:
         self.db_path = db_path
         self._init_db()
+        # Phase 15.04: Fassaden-Delegation an das WindowStateRepository.
+        # Die DB-Pfad-Aufloesung verbleibt beim StateManager und wird an das
+        # Repository durchgereicht (Test-Isolation: Temp-DBs bleiben getrennt).
+        self._window_repo = WindowStateRepository(db_path)
 
     def _get_connection(self) -> duckdb.DuckDBPyConnection:
         return DbPool.get(self.db_path)
@@ -124,25 +132,16 @@ class StateManager:
                         print(f"[MIGRATION WARNUNG] Spalte '{col_name}' konnte nicht hinzugefuegt werden: {e}")
 
     def get_next_instance_id(self) -> str:
-        con = self._get_connection()
-        res = con.execute("SELECT instance_id FROM window_instances").fetchall()
-        existing_ids = [r[0] for r in res]
-        count = 1
-        while f"win_{count}" in existing_ids:
-            count += 1
-        return f"win_{count}"
+        # Phase 15.04: Delegation an das WindowStateRepository.
+        return self._window_repo.get_next_instance_id()
 
     def delete_instance(self, instance_id: str) -> None:
-        con = self._get_connection()
-        con.execute("DELETE FROM instance_states WHERE instance_id = ?", [instance_id])
-        con.execute("DELETE FROM window_instances WHERE instance_id = ?", [instance_id])
+        # Phase 15.04: Delegation an das WindowStateRepository.
+        self._window_repo.delete_instance(instance_id)
 
     def delete_symbol_tf_state(self, symbol: str, timeframe: str) -> None:
-        con = self._get_connection()
-        con.execute(
-            "DELETE FROM symbol_tf_states WHERE symbol = CAST(? AS VARCHAR) AND timeframe = CAST(? AS VARCHAR)",
-            [symbol, timeframe]
-        )
+        # Phase 15.04: Delegation an das WindowStateRepository.
+        self._window_repo.delete_symbol_tf_state(symbol, timeframe)
 
     def save_instance_state(
         self,
@@ -156,28 +155,13 @@ class StateManager:
         indicators_state: Optional[Dict[str, Any]] = None,
         measurement_state: Optional[Dict[str, Any]] = None
     ) -> None:
-        con = self._get_connection()
-        ind_json = json.dumps(indicators_state) if indicators_state is not None else None
-        meas_json = json.dumps(measurement_state) if measurement_state is not None else None
-        con.execute("""
-            INSERT INTO instance_states (
-                instance_id, symbol, timeframe, visible_range_from, visible_range_to,
-                visible_price_from, visible_price_to, indicators_state, measurement_state, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT (instance_id) DO UPDATE SET
-                symbol = EXCLUDED.symbol,
-                timeframe = EXCLUDED.timeframe,
-                visible_range_from = EXCLUDED.visible_range_from,
-                visible_range_to = EXCLUDED.visible_range_to,
-                visible_price_from = EXCLUDED.visible_price_from,
-                visible_price_to = EXCLUDED.visible_price_to,
-                indicators_state = EXCLUDED.indicators_state,
-                measurement_state = EXCLUDED.measurement_state,
-                updated_at = EXCLUDED.updated_at;
-        """, [
-            instance_id, symbol, timeframe, visible_range_from, visible_range_to,
-            visible_price_from, visible_price_to, ind_json, meas_json
-        ])
+        # Phase 15.04: Delegation an das WindowStateRepository.
+        self._window_repo.save_instance_state(
+            instance_id, symbol, timeframe,
+            visible_range_from, visible_range_to,
+            visible_price_from, visible_price_to,
+            indicators_state, measurement_state,
+        )
 
     def save_symbol_tf_state(
         self,
@@ -190,48 +174,17 @@ class StateManager:
         indicators_state: Optional[Dict[str, Any]] = None,
         measurement_state: Optional[Dict[str, Any]] = None
     ) -> None:
-        con = self._get_connection()
-        ind_json = json.dumps(indicators_state) if indicators_state is not None else None
-        meas_json = json.dumps(measurement_state) if measurement_state is not None else None
-        con.execute("""
-            INSERT INTO symbol_tf_states (
-                symbol, timeframe, visible_range_from, visible_range_to,
-                visible_price_from, visible_price_to, indicators_state, measurement_state, updated_at
-            ) VALUES (CAST(? AS VARCHAR), CAST(? AS VARCHAR), ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT (symbol, timeframe) DO UPDATE SET
-                visible_range_from = EXCLUDED.visible_range_from,
-                visible_range_to = EXCLUDED.visible_range_to,
-                visible_price_from = EXCLUDED.visible_price_from,
-                visible_price_to = EXCLUDED.visible_price_to,
-                indicators_state = EXCLUDED.indicators_state,
-                measurement_state = EXCLUDED.measurement_state,
-                updated_at = EXCLUDED.updated_at;
-        """, [
-            symbol, timeframe, visible_range_from, visible_range_to,
-            visible_price_from, visible_price_to, ind_json, meas_json
-        ])
+        # Phase 15.04: Delegation an das WindowStateRepository.
+        self._window_repo.save_symbol_tf_state(
+            symbol, timeframe,
+            visible_range_from, visible_range_to,
+            visible_price_from, visible_price_to,
+            indicators_state, measurement_state,
+        )
 
     def get_symbol_tf_state(self, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
-        con = self._get_connection()
-        res = con.execute("""
-            SELECT visible_range_from, visible_range_to, visible_price_from, visible_price_to, indicators_state, measurement_state
-            FROM symbol_tf_states
-            WHERE symbol = CAST(? AS VARCHAR) AND timeframe = CAST(? AS VARCHAR)
-        """, [symbol, timeframe]).fetchone()
-
-        if res:
-            v_from, v_to, p_from, p_to, ind_json, meas_json = res
-            ind_state = _parse_json_field(ind_json)
-            meas_state = _parse_json_field(meas_json)
-            return {
-                "visible_range_from": v_from,
-                "visible_range_to": v_to,
-                "visible_price_from": p_from,
-                "visible_price_to": p_to,
-                "indicators_state": ind_state,
-                "measurement_state": meas_state
-            }
-        return None
+        # Phase 15.04: Delegation an das WindowStateRepository.
+        return self._window_repo.get_symbol_tf_state(symbol, timeframe)
 
     def save_window_geometry(
         self,
@@ -243,60 +196,23 @@ class StateManager:
         is_maximized: bool,
         preset_id: Optional[str] = None
     ) -> None:
-        con = self._get_connection()
-        con.execute("""
-            INSERT INTO window_instances (
-                instance_id, preset_id, window_title, pos_x, pos_y, width, height, is_maximized
-            ) VALUES (?, ?, 'PyTrader Window', ?, ?, ?, ?, ?)
-            ON CONFLICT (instance_id) DO UPDATE SET
-                pos_x = EXCLUDED.pos_x,
-                pos_y = EXCLUDED.pos_y,
-                width = EXCLUDED.width,
-                height = EXCLUDED.height,
-                is_maximized = EXCLUDED.is_maximized,
-                preset_id = EXCLUDED.preset_id;
-        """, [instance_id, preset_id, x, y, width, height, is_maximized])
+        # Phase 15.04: Delegation an das WindowStateRepository.
+        self._window_repo.save_window_geometry(
+            instance_id, x, y, width, height, is_maximized, preset_id,
+        )
 
     def get_window_geometry(self, instance_id: str) -> Optional[Dict[str, Any]]:
-        """Liest die gespeicherte Fenstergeometrie einer spezifischen Instanz aus."""
-        con = self._get_connection()
-        res = con.execute("""
-            SELECT pos_x, pos_y, width, height, is_maximized
-            FROM window_instances
-            WHERE instance_id = ?
-        """, [instance_id]).fetchone()
-        if res and res[0] is not None:
-            return {
-                "pos_x": res[0],
-                "pos_y": res[1],
-                "width": res[2],
-                "height": res[3],
-                "is_maximized": bool(res[4])
-            }
-        return None
+        """Liest die gespeicherte Fenstergeometrie einer spezifischen Instanz aus.
+
+        Phase 15.04: Delegation an das WindowStateRepository (Bestandsverhalten
+        exakt reproduziert).
+        """
+        return self._window_repo.get_window_geometry(instance_id)
 
     def load_all_instances(self) -> List[Dict[str, Any]]:
-        con = self._get_connection()
-        query = """
-            SELECT
-                w.instance_id, w.preset_id, w.pos_x, w.pos_y, w.width, w.height, w.is_maximized,
-                CAST(s.symbol AS VARCHAR) AS symbol,
-                CAST(s.timeframe AS VARCHAR) AS timeframe,
-                s.visible_range_from, s.visible_range_to,
-                s.visible_price_from, s.visible_price_to, s.indicators_state, s.measurement_state,
-                s.updated_at
-            FROM window_instances w
-            LEFT JOIN instance_states s ON w.instance_id = s.instance_id
-            ORDER BY s.updated_at ASC;
-        """
-        df = con.execute(query).df()
-        records = df.to_dict(orient="records")
-        for rec in records:
-            if "symbol" in rec and rec["symbol"] is not None and not isinstance(rec["symbol"], str):
-                rec["symbol"] = str(rec["symbol"]) if not pd.isna(rec["symbol"]) else None
-            if "timeframe" in rec and rec["timeframe"] is not None and not isinstance(rec["timeframe"], str):
-                rec["timeframe"] = str(rec["timeframe"]) if not pd.isna(rec["timeframe"]) else None
-        return records
+        # Phase 15.04: Delegation an das WindowStateRepository (pandas-.df()-
+        # Leseart + String-Normalisierung exakt wie im Bestand).
+        return self._window_repo.load_all_instances()
 
     def get_indicator_preset(self, indicator_id: str, preset_name: str) -> Optional[Dict[str, Any]]:
         """Liest die Parametervalue eines Indikator-Presets (RÜCKWÄRTSKOMPATIBEL:

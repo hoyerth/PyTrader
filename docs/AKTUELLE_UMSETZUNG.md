@@ -25,7 +25,7 @@ Ziel von **Phase 15** ist die Weiterentwicklung der Service-UI (`service_win.py`
 | --- | --- | --- |
 | E-1 | Legacy-Alias `../../analytics/statistics_repository.py` | Bleibt bis auf Weiteres unverändert bestehen; kompletter Ersatz erst in einer späteren Phase |
 | E-2 | Persistenz `win_statistics` | Fenstergeometrie & Instanz-Zustände werden beim Ersetzen nach `win_analytics` migriert |
-| E-3 | `schema_version` Pflichtfeld | Pflichtfeld im `FeatureStorePayload`; alte `feature_store`-Rows erhalten beim Lesen den Default `"1.0"` |
+| E-3 | `schema_version` Pflichtfeld | Pflichtfeld im `FeatureStorePayload`; alte `feature_store`-Rows erhalten beim Lesen den Default `"1.0.0"` (harmonisiert am 06.08.2026) |
 | E-4 | Schutzregel Grid-Liquidity | Schutz für `../../chart/indicators/grid_liquidity.py` aufgehoben; Anpassungen erlaubt, wenn der Fallback-Abbau sie erfordert |
 | E-5 | Zeilenzahl `service_win.py` | Doku-Korrektur: 864 Zeilen (statt 1.400) |
 | E-6 | Pfad-Konvention | Dateien werden einheitlich vom Projekt-Root referenziert (ohne `../..`) |
@@ -58,7 +58,7 @@ Bitte setze das Infrastruktur-Upgrading und das Cleanup der Repositories/Payload
 
 ---
 
-### 2. WindowStateRepository herauslösen (window_state_repository.py) – KORRIGIERTE FASSUNG
+### 2. WindowStateRepository herauslösen (window_state_repository.py) – UMGESETZT (06.08.2026)
 
  1. **Erstelle `window_state_repository.py` im Root:**
     - Kapselt die SQL-Zugriffe auf `window_instances`, `instance_states` UND
@@ -97,36 +97,41 @@ Bitte setze das Infrastruktur-Upgrading und das Cleanup der Repositories/Payload
 
 ---
 
-### 3. Schema-Version & FeatureStore-Payload – STATUS + EINE Code-Änderung
+### 3. Schema-Version & FeatureStore-Payload – UMGESETZT (06.08.2026)
 
- 1. **Pflichtfeld `schema_version` im Payload – BEREITS ERFÜLLT (nur verifizieren):**
+ 1. **Pflichtfeld `schema_version` im Payload – BEREITS ERFÜLLT (nur verifiziert):**
     - `grid_lines_service.py` und `proximity_service.py` setzen bereits
       `"schema_version": "1.0.0"` in `feature_store_payload["metadata"]`.
-    - KEINE Änderung an den Plugins nötig; Verifikation im Headless-Check.
+    - KEINE Änderung an den Plugins nötig; verifiziert im Headless-Check
+      (`test/check_p15_s4_infra.py`, V2/V3).
 
- 2. **Alt-Data Default im Lesepfad – HARMONISIEREN (1 konkrete Änderung):**
-    - `feature_store_reader.py` nutzt aktuell `SCHEMA_VERSION_DEFAULT = "1.0"`
+ 2. **Alt-Data Default im Lesepfad – HARMONISIERT (1 konkrete Änderung):**
+    - `feature_store_reader.py` nutzte `SCHEMA_VERSION_DEFAULT = "1.0"`
       (zweistellig) – die Spezifikation und die Plugins verwenden `"1.0.0"`
-      (dreistellig). Damit Reader-Default und Plugin-Vertrag identisch sind,
-      wird der Default auf `"1.0.0"` vereinheitlicht (inkl. Docstring/Kommentar
-      E-3 in feature_store_reader.py und docs/AKTUELLE_UMSETZUNG.md).
+      (dreistellig). Seit 06.08.2026 ist der Default auf `"1.0.0"`
+      vereinheitlicht (inkl. Docstring/Kommentar E-3 in `feature_store_reader.py`
+      und diesem Dokument).
     - Verhalten bleibt additiv: `_normalize_feature_data()` ergänzt fehlende
-      `schema_version` beim Lesen – die DB-Zeile wird NICHT überschrieben.
+      `schema_version` beim Lesen – die DB-Zeile wird NICHT überschrieben
+      (verifiziert in V4–V7).
 
- 3. **Konzeptionelle Lücke dokumentieren (Entscheidung nötig):**
+ 3. **Konzeptionelle Lücke dokumentiert (abgeschlossen 06.08.2026):**
     - `store_plugin_payload()` persistiert NUR die Records in `feature_data`;
       das `metadata`-Dict inkl. `schema_version` wird NICHT in die DB
-      geschrieben. Der Reader-Default greift daher immer.
-    - `schema_version` als reinen
-      In-Memory-Vertrag des `feature_store_payload` dokumentieren – Abschnitt 3
-      ist damit vollständig abgeschlossen.
+      geschrieben. Der Reader-Default greift daher beim Lesen immer.
+    - **`schema_version` ist ein reiner In-Memory-Vertrag des
+      `feature_store_payload`** (Plugin-Ausgabe → Evaluator → Indikator-Lesepfad).
+      Die Persistenzschicht kennt sie nicht; die DB enthält die Records inkl.
+      nativer Spalten, aber ohne das metadata-Payload. Dieser Umstand ist
+      gewollt und wird bewusst nicht geändert – Abschnitt 3 ist damit
+      vollständig abgeschlossen.
 
 ---
 
-### 4. Headless Verifikation (test/check_p15_s4_infra.py) – ERWEITERT
+### 4. Headless Verifikation (test/check_p15_s4_infra.py) – UMGESETZT (06.08.2026)
 
- Erstelle `test/check_p15_s4_infra.py` (offscreen, Temp-DBs – Regel: Tests
- nur in test/). Prüft – angepasst an den Ist-Stand:
+ Erstellt: `test/check_p15_s4_infra.py` (offscreen, Temp-DBs unter test/ –
+ Regel: Tests nur in test/). Prüft – angepasst an den Ist-Stand:
 
  1. **EventBus-Bestand (statt Implementierung):**
     - Alle 5 Signale existieren auf `event_bus` und sind per `connect` +
@@ -154,3 +159,50 @@ Bitte setze das Infrastruktur-Upgrading und das Cleanup der Repositories/Payload
 ### ⚠️ Richtlinien
 - **Keine UI-Tests starten!** Verifikation ausschließlich über den Headless-Check (`python test/check_p15_s4_infra.py`) und `py_compile`.
 - Erzeuge gezielte, saubere Code-Snippets/Patches.
+
+---
+
+## Implementierungs-Log (Taxonomie: Phase 15.04)
+
+### 06.08.2026 – 15.04 Infrastructure & EventBus Hardening (UMGESETZT)
+
+**1) EventBus verifiziert (keine Änderung an `config/event_bus.py`):**
+Alle 5 Signale (`favorites_changed`, `profile_changed(str)`,
+`service_set_changed`, `service_run_started`, `service_run_finished`)
+existieren und sind per connect/emit empfängbar (Check B1–B5 in
+`test/check_p15_s4_infra.py`).
+
+**2) `window_state_repository.py` im Root erstellt:**
+- Kapselt alle instanz-/fensterbezogenen SQL-Zugriffe (`window_instances`,
+  `instance_states`, `symbol_tf_states`) aus `app_data.duckdb`.
+- Nutzt `DbPool.get(db_path)` (Thread-local, lock-frei) – keine eigene
+  Connection-Verwaltung.
+- 9 Methoden (save/get_window_geometry, save_instance_state,
+  load_all_instances, delete_instance, get_next_instance_id,
+  save/get/delete_symbol_tf_state). `load_all_instances()` reproduziert das
+  Bestandsverhalten EXAKT (pandas-`.df()`-Leseart + String-Normalisierung).
+- Schema-Anlage/-Migration bleibt im StateManager (keine DDL im Repository).
+
+**3) `state_manager.py` als additive Fassade:**
+- Alle Bestands-Methoden mit identischen Signaturen erhalten (Rückwärts-
+  kompatibilität – keine Aufrufer-Änderung). Die 9 Instanz-/Fenster-Methoden
+  delegieren intern an das WindowStateRepository.
+- DB-Pfad-Auflösung bleibt beim StateManager und wird an das Repository
+  durchgereicht (Test-Isolation). Patch-Strategie aus `test/test.py` auf
+  WindowStateRepository erweitert (gleiche Temp-DB, Check I1/F7).
+
+**4) `schema_version` harmonisiert:**
+- `feature_store_reader.py`: `SCHEMA_VERSION_DEFAULT` von `"1.0"` auf
+  `"1.0.0"` vereinheitlicht (E-3-Kommentare + Docstring aktualisiert).
+- Reader-Default und Plugin-Vertrag (grid_lines/proximity, `metadata`) sind
+  jetzt identisch. `_normalize_feature_data()` bleibt additiv – DB-Zeile wird
+  nicht überschrieben.
+
+**5) Headless-Verifikation (`test/check_p15_s4_infra.py`):**
+- 33 Checks bestanden: EventBus (B1–B5), WindowStateRepository (W1–W13,
+  I1), Fassaden-Delegation (F1–F7), schema_version (V1–V7).
+- Zusätzlich `python test/test.py` ausgeführt: keine neuen Regressionen
+  (die 3 vorbestehenden Breiten-Checks P2/P5/H7 scheitern auch ohne diese
+  Änderung – offscreen-Screen 800×800 vs. Breiten-Annahme ≥ 1300 px).
+
+**Git:** Tag `phase15_04_backup` vor der Umsetzung; Commit nach Freigabe.

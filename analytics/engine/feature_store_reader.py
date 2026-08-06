@@ -22,7 +22,7 @@ Wanduhr-Garantie (Invariante 7, 15.03-Spez: Heatmap X/Y):
     Heatmap waere um den Offset verschoben (DST-bruchig, Invariante 7).
 
 E-3 (schema_version-Pflichtfeld): Alte feature_store-Rows ohne
-`schema_version` in feature_data erhalten beim Lesen den Default `"1.0"` –
+`schema_version` in feature_data erhalten beim Lesen den Default `"1.0.0"` –
 die DB-Zeile bleibt unveraendert (Lesen ist rein).
 """
 
@@ -38,9 +38,13 @@ from db_service import DbPool, _parse_json_field
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DB_ANALYTICS = str(BASE_DIR / "data" / "analytics.duckdb")
 
-# E-3: schema_version-Default fuer Alt-Rows ohne Pflichtfeld (analog
-# GridLiquidityIndicator-Lesepfad: Default "1.0").
-SCHEMA_VERSION_DEFAULT = "1.0"
+# E-3 (Phase 15.04, harmonisiert): schema_version-Default fuer Alt-Rows ohne
+# Pflichtfeld. 15.04 vereinheitlicht den Default auf "1.0.0" (dreistellig,
+# Semantic Versioning major.minor.patch) – identisch zum Plugin-Vertrag
+# (grid_lines/proximity/metadata) und zur base_plugin-Spezifikation.
+# Zuvor stand hier "1.0" (zweistellig) – Reader-Default und Plugin-Vertrag
+# sind seit 15.04 deckungsgleich.
+SCHEMA_VERSION_DEFAULT = "1.0.0"
 
 # Native Feature-Spalten der feature_store-Tabelle (fuer Heatmap-Metriken,
 # Scatter-/Verteilungs-Achsen). Keine JSON-Feld-Pfade – nur echte Spalten.
@@ -70,7 +74,7 @@ class FeatureStoreReader:
         """Parst feature_data (str->dict) und stellt schema_version sicher.
 
         E-3: Fehlt das Pflichtfeld `schema_version` (Alt-Rows), wird es beim
-        Lesen additiv mit dem Default `"1.0"` ergaenzt – die DB-Zeile bleibt
+        Lesen additiv mit dem Default `"1.0.0"` ergaenzt – die DB-Zeile bleibt
         unveraendert (rein lesender Reader).
         """
         data = _parse_json_field(raw) or {}
