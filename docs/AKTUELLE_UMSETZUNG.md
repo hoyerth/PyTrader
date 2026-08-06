@@ -291,4 +291,62 @@ Bitte ersetze die alten Analytics-Dropdowns durch die Wiederverwendung des beste
    Regression `check_p15_s2_service_tree.py`, `check_p15_s4_infra.py`,
    `check_service_run_fixes.py` OK. `py_compile` auf allen geänderten
    Dateien. Keine UI-/Regressionstests (harte Regel).
+ - **Git:** Commit `b62d3ed`.
+
+ ### 06.08.2026 – Bugfix-Runde 3 Datenquellen-Dialog (Punkte 1–7 + Stretch-Nachtrag)
+
+ **User-Anweisung (7 Punkte):**
+ 1. **NICHT** alle gewählten Services in der Parameter-Box anzeigen.
+ 2. Die Wahl, welche Services angezeigt werden, hängt **NICHT von den
+    Checkboxen** ab.
+ 3. Die Wahl der angezeigten Parameter hängt vom **einfachen Mausklick im
+    Baum** ab (Mausklick beliebig in einer Tree-Zeile).
+ 4. Mausklick auf eine **Set-Zeile** → die Services des Sets werden in der
+    Parameter-Box angezeigt.
+ 5. Mausklick auf eine **Service-Zeile in einem Set** → ebenfalls die
+    Services des Sets.
+ 6. Mausklick auf eine **Service-Zeile unter ⚡ Standalone / 📦 Plugins** →
+    nur dieser eine Service.
+ 7. Alle anderen Zeilen → **KEIN Service** in der Parameter-Box (analog zur
+    Implementierung im `service_win`).
+ **Nachtrag (User):** Die einzelnen Service-Rahmen sollen in der
+ Parameter-Box **nicht gestreckt** werden, sondern ihre **Default-Breite**
+ behalten.
+
+ **Umsetzung (06.08.2026, ausgeführt):**
+ - `serviceui/master_tree.py`:
+   * Neues Signal **`selection_details(node_type, set_id, service_id,
+     plugin_id)`** – Klick-Scope der geklickten Zeile.
+   * `mousePressEvent` emittiert es bei **JEDEM** Mausklick auf eine gültige
+     Zeile (auch Checkbox-Zone / Expand-Toggle, unabhängig von der Qt-
+     Selektion – ein Klick auf eine bereits selektierte Zeile feuert sonst
+     kein `itemSelectionChanged`). Neue Methode `_emit_selection_details`
+     (liest die Rollen der Zeile; Plugin-Zeilen ohne set_id, Gruppen nur
+     node_type).
+ - `serviceui/service_selector_dialog.py`:
+   * **`checked_changed`-Verbindung entfernt** – das Read-Only-Panel ist
+     vollständig klick-basiert (Checkboxen bestimmen weiterhin nur den
+     Analytics-Filter `feature_ids`).
+   * Neu `_on_tree_selection_details(...)` + `_entries_for_scope(...)`:
+     Set-Zeile ODER Service-in-Set → ALLE Services des Sets (Punkt 4+5,
+     service_win-Muster `_on_master_selection`); Plugin-Zeile → NUR dieser
+     Service (Punkt 6); sonst leer (Punkt 7).
+   * `_last_scope` bleibt über Modell-Refreshes erhalten
+     (`_on_model_data_changed` zieht das Panel mit dem zuletzt geklickten
+     Scope nach); `_on_clear_filters` leert das Panel.
+   * **Stretch-Nachtrag:** `_rebuild_param_panel` hängt abschließend
+     `param_box_layout.addStretch(1)` an (in beiden Zweigen) – ohne den
+     Stretch verteilt `QHBoxLayout` den freien Platz beim Vergrößern
+     gleichmäßig auf alle Spalten (Stretch-Faktor 0 = Ueberschuss-
+     Verteilung); der Stretch (Faktor 1) absorbiert ihn → die Service-
+     Rahmen behalten ihre Default-Breite (sizeHint), linksbündig.
+ - **Verifikation:** `test/check_p15_s3_analytics.py` umgestellt/erweitert
+   (D5/D8/C2 klick-basiert mit echter `QMouseEvent`-Simulation auf die
+   Zeile; neu C9–C13: Service-in-Set → alle Set-Services, Plugin-Zeile →
+   nur dieser, Gruppe → leer, Checkbox-Wechsel ändert Panel NICHT, Klick
+   ändert feature_ids NICHT; neu C14: Rahmen behalten Default-Breite nach
+   Vergrößern; `_panel_widgets()`-Helper filtert Stretch-Items) → **66/66
+   PASS**. Regression `check_p15_s2_service_tree.py`, `check_p15_s4_infra.py`
+   OK. `py_compile` auf allen geänderten Dateien. Keine UI-/
+   Regressionstests (harte Regel).
  - **Git:** Commit folgt (siehe unten).

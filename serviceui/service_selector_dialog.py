@@ -31,8 +31,27 @@ Datenvertrag (Entscheidung 06.08.2026):
 Live-Sync (Invariante 5): Das `ServiceSelectorModel` hoert auf
 `event_bus.service_set_changed` und refresht den Baum automatisch; der
 Checkbox-Zustand bleibt dank MasterTree-internem `_checked_items` ueber
-Neuaufbauten erhalten. Das rechte Panel wird bei jeder Checkbox-Aenderung
-und jedem Modell-Refresh neu gebaut.
+Neuaufbauten erhalten. Das rechte Panel wird nach einem Modell-Refresh mit
+dem zuletzt GEKLICKTEN Scope neu gebaut.
+
+Bugfix-Runde 3 (06.08.2026, User-Anweisung Punkte 1-7): Das Read-Only-Panel
+folgt dem MAUSKLICK auf eine Tree-Zeile (analog service_win), NICHT den
+Checkboxen:
+  1. Angezeigt werden NICHT mehr alle angehakten Services, sondern die
+     Parameter der GEKLICKTEN Zeile.
+  2. Die Anzeige haengt NICHT von den Checkboxen ab (die Checkboxen
+     bestimmen weiterhin nur den Analytics-Filter feature_ids).
+  3. Jeder einfache Mausklick in einer Tree-Zeile waehlt die Anzeige
+     (`MasterTree.selection_details`, wird aus mousePressEvent emittiert).
+  4. Klick auf eine SET-Zeile -> Parameter aller Services des Sets.
+  5. Klick auf eine SERVICE-Zeile IN einem Set -> ebenfalls alle Services
+     des Sets (service_win-Muster `_on_master_selection`).
+  6. Klick auf eine PLUGIN-Zeile (⚡ Standalone / 📦 Plugins) -> NUR dieser
+     eine Service wird angezeigt.
+  7. Alle anderen Zeilen (Gruppen, leere Auswahl) -> KEIN Service im Panel.
+  8. (Nachtrag) Die einzelnen Service-Rahmen (QGroupBox) behalten beim
+     Vergroessern ihre DEFAULT-Breite (sizeHint) – der abschliessende
+     Stretch im QHBoxLayout absorbiert den freien Platz (kein Strecken).
 
 Bugfix-Runde 06.08.2026 (User-Anweisung, Punkte 1-4):
   1. Services im Parameter-Panel liegen HORIZONTAL nebeneinander
@@ -63,6 +82,9 @@ from PySide6.QtWidgets import (
 )
 
 from analytics.engine.service_selector_model import ServiceSelectorModel
+from serviceui.master_tree import (
+    TYPE_PLUGIN, TYPE_SERVICE, TYPE_SET,
+)
 from serviceui.param_columns import ServiceParamColumnsMixin
 from serviceui.service_selector_widget import ServiceSelectorWidget
 
@@ -127,6 +149,12 @@ class ServiceSelectorDialog(QDialog):
         super().__init__(parent)
         self.model = model or ServiceSelectorModel(parent=self)
         self._param_host = _DialogParamHost()
+        # 06.08.2026 (Bugfix-Runde 3, Punkte 1-7): Zuletzt GEKLICKTE
+        # Tree-Zeile (node_type, set_id, service_id, plugin_id) – Grundlage
+        # des Read-Only-Panels (analog service_win). Bleibt nach
+        # Modell-Refreshes erhalten, damit das Panel nicht ungewollt
+        # zurueckspringt.
+        self._last_scope: Optional[tuple] = None
         # 06.08.2026 (Punkt 4): StateManager fuer die Dialog-Geometrie.
         # Der Parent (AnalyticsWindow) ist ein PersistentWindow mit
         # `state_manager`-Property; ohne Parent bleiben Save/Restore no-ops.
@@ -196,11 +224,13 @@ class ServiceSelectorDialog(QDialog):
         self.btn_apply.clicked.connect(self._on_apply)
         tree = self.selector.master_tree
         if tree is not None:
-            tree.checked_changed.connect(self._rebuild_param_panel)
+            # Bugfix-Runde 3 (06.08.2026): Das Read-Only-Panel folgt dem
+            # MAUSKLICK auf eine Tree-Zeile (selection_details), NICHT den
+            # Checkboxen (checked_changed-Verbindung entfernt – Punkte 1-7).
+            tree.selection_details.connect(self._on_tree_selection_details)
         # Live-Sync: Modell-Refresh (EventBus -> data_changed) baut den Baum
-        # neu; das Panel wird hier explizit nachgezogen (checked_changed
-        # feuert waehrend des blockierten Neuaufbaus nicht).
-        self.model.data_changed.connect(self._rebuild_param_panel)
+        # neu; das Panel wird mit dem zuletzt geklickten Scope nachgezogen.
+        self.model.data_changed.connect(self._on_model_data_changed)
 
         # Punkt 4: Letzte Position/Groesse wiederherstellen.
         self._restore_geometry()
@@ -250,6 +280,10 @@ class ServiceSelectorDialog(QDialog):
         tree = self.selector.master_tree
         if tree is not None:
             tree.clear_checks()
+        # Bugfix-Runde 3 (06.08.2026): Filter entfernen leert auch das
+        # Klick-Panel (kein Scope mehr, Hinweis-Text).
+        self._last_scope = None
+        self._rebuild_param_panel([])
         self.services_selected.emit([], [])
 
     def _on_apply(self) -> None:
@@ -264,31 +298,100 @@ class ServiceSelectorDialog(QDialog):
     # Read-Only-Parameter-Panel (Punkte 1-3: horizontal, 2-Spalten-Default,
     # Fensterbreite == rechte Kante der Parameter-Box)
     # ------------------------------------------------------------------
-    def _rebuild_param_panel(self) -> None:
-        """Baut das rechte Parameter-Panel aus den angehakten Services neu.
+    def _on_tree_selection_details(self, node_type: str, set_id: str,
+                                   service_id: str, plugin_id: str) -> None:
+        """Slot fuer `MasterTree.selection_details` (Mausklick in einer Zeile).
 
-        Fuer jeden angehakten Service wird eine deaktivierte QGroupBox-
-        Spalte ueber `ServiceParamColumnsMixin._build_service_column()`
-        erzeugt – seit 06.08.2026 HORIZONTAL nebeneinander (Punkt 1):
+        Bugfix-Runde 3 (06.08.2026, Punkte 1-7): Das Read-Only-Panel folgt
+        der GEKLICKTEN Zeile, NICHT den Checkboxen (analog service_win
+        `_on_master_selection`):
+
+          * Set-Zeile ODER Service-Zeile IN einem Set -> ALLE Services des
+            Sets nebeneinander (`_entries_for_scope`, Punkt 4+5).
+          * Plugin-Zeile (⚡ Standalone / 📦 Plugins) -> NUR dieser eine
+            Service (Punkt 6).
+          * Gruppen-/sonstige Zeilen -> KEIN Service (Punkt 7).
+        """
+        self._last_scope = (node_type, set_id, service_id, plugin_id)
+        self._rebuild_param_panel(self._entries_for_scope(
+            node_type, set_id, service_id, plugin_id))
+
+    def _on_model_data_changed(self) -> None:
+        """Modell-Refresh (EventBus -> data_changed): Panel neu aufbauen.
+
+        Nach einem Baum-Neuaufbau (neues Set, Ausfuehrungsdatum, ...) wird
+        das Panel mit dem zuletzt GEKLICKTEN Scope nachgezogen; ohne Scope
+        (noch nichts angeklickt) bleibt das Panel leer.
+        """
+        scope = getattr(self, "_last_scope", None)
+        if scope:
+            self._on_tree_selection_details(*scope)
+        else:
+            self._rebuild_param_panel([])
+
+    def _entries_for_scope(self, node_type: str, set_id: str, service_id: str,
+                           plugin_id: str) -> List[Dict[str, str]]:
+        """Panel-Entries fuer die geklickte Tree-Zeile (service_win-Muster).
+
+        Returns:
+            Liste von {"node_type", "set_id", "instance_id", "plugin_id"} –
+            leer fuer Zeilen ohne Parameter-Anzeige (Gruppen, leere Auswahl).
+        """
+        if node_type == TYPE_PLUGIN and plugin_id:
+            return [{
+                "node_type": TYPE_PLUGIN,
+                "set_id": "",
+                "instance_id": "",
+                "plugin_id": str(plugin_id),
+            }]
+        if node_type in (TYPE_SET, TYPE_SERVICE) and set_id:
+            definition = self.model.find_set(set_id) or {}
+            services = definition.get("services") or {}
+            order = definition.get("execution_order") or list(services.keys())
+            entries: List[Dict[str, str]] = []
+            for iid in order:
+                cfg = services.get(iid) or {}
+                if not isinstance(cfg, dict):
+                    continue
+                entries.append({
+                    "node_type": TYPE_SERVICE,
+                    "set_id": str(set_id),
+                    "instance_id": str(iid),
+                    "plugin_id": str(cfg.get("plugin_id") or iid),
+                })
+            return entries
+        return []
+
+    def _rebuild_param_panel(self,
+                             entries: Optional[List[Dict[str, str]]] = None
+                             ) -> None:
+        """Baut das rechte Parameter-Panel aus den uebergebenen Entries neu.
+
+        Bugfix-Runde 3 (06.08.2026): Die Entries kommen aus `_entries_for_scope`
+        (GEKLICKTE Zeile, service_win-Muster) – NICHT mehr aus
+        `tree.checked_services()` (Checkboxen). Fuer jeden Eintrag wird eine
+        deaktivierte QGroupBox-Spalte ueber
+        `ServiceParamColumnsMixin._build_service_column()` erzeugt (seit
+        06.08.2026 HORIZONTAL nebeneinander, Punkt 1):
           * Set-Service:  cfg aus der Set-Definition (instance_id + params)
-          * Standalone-/Plugin-Zeile: cfg {"plugin_id": pid} (Schema-Defaults)
+          * Plugin-Zeile: cfg {"plugin_id": pid} (Schema-Defaults)
         Danach werden Panel-Breite (Default: 2 Spalten, Punkt 2) und
         Fensterbreite (Punkt 3) angepasst.
         """
         self._clear_panel()
-        tree = self.selector.master_tree
-        if tree is None:
-            return
-        entries = tree.checked_services()
+        entries = list(entries or [])
         if not entries:
             self.param_box_layout.addWidget(
-                QLabel("Keine Datenquellen ausgewählt."))
+                QLabel("Keine Auswahl – klicke eine Zeile im Baum."))
+            # Bugfix 06.08.2026 (Runde 3): Der abschliessende Stretch nimmt
+            # den freien Platz auf – der Hinweis behaelt seine Default-Breite.
+            self.param_box_layout.addStretch(1)
             self._apply_panel_size(0)
             return
         host = self._param_host
         for entry in entries:
             pid = str(entry.get("plugin_id") or "")
-            if entry["node_type"] == "service":
+            if entry["node_type"] == TYPE_SERVICE:
                 iid = str(entry.get("instance_id") or "")
                 cfg = self.model.find_service(
                     str(entry.get("set_id") or ""), iid) or {}
@@ -305,6 +408,13 @@ class ServiceSelectorDialog(QDialog):
                 box.setEnabled(False)
                 box.setToolTip("Read-Only – Parameter der gewählten Datenquelle")
                 self.param_box_layout.addWidget(box)
+        # Bugfix 06.08.2026 (Runde 3): Die einzelnen Service-Rahmen
+        # (QGroupBox) werden beim Vergroessern NICHT gestreckt – sie behalten
+        # ihre Default-Breite (sizeHint). Ohne abschliessenden Stretch
+        # verteilt QHBoxLayout den freien Platz gleichmaessig auf alle
+        # Spalten (Stretch-Faktor 0 = Aufteilung des Ueberschusses). Der
+        # Stretch (Faktor 1) absorbiert den gesamten freien Platz.
+        self.param_box_layout.addStretch(1)
         self._apply_panel_size(len(entries))
 
     def _apply_panel_size(self, col_count: int) -> None:

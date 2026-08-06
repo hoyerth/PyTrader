@@ -160,6 +160,14 @@ class MasterTree(QTreeWidget):
     """2-Spalten-TreeWidget fuer die hierarchische Service-Darstellung."""
 
     selection_changed = Signal(str, str)  # set_id, service_id
+    # Bugfix 06.08.2026 (Bugfix-Runde 3, Punkte 1-7): Klick-Scope der
+    # geklickten Zeile (node_type, set_id, service_id, plugin_id). Wird aus
+    # `mousePressEvent` bei JEDEM Mausklick auf eine gueltige Zeile emittiert
+    # (auch Checkbox-Zone / Expand-Toggle, unabhaengig von einer Selektion).
+    # Der ServiceSelectorDialog zeigt daraus die Parameter im Read-Only-Panel
+    # (analog service_win: Set/Service-in-Set -> alle Set-Services; Plugin-
+    # Zeile -> nur dieser Service; sonst leer).
+    selection_details = Signal(str, str, str, str)
     # Bugfix 05.08.2026: Klick auf den Info-Button (Spalte 1).
     # Argumente (set_id, service_id, plugin_id) – je nach Zeilentyp gefuellt.
     info_requested = Signal(str, str, str)
@@ -1062,6 +1070,12 @@ class MasterTree(QTreeWidget):
         dem Qt-Default ueberlassen, damit die Checkbox togglet
         (itemChanged feuert); nur Klicks rechts der Zone togglen das
         Auf-/Zuklappen.
+
+        Bugfix 06.08.2026 (Bugfix-Runde 3, Punkte 1-7): JEDER Mausklick auf
+        eine gueltige Zeile emittiert `selection_details` (vor der
+        Verzweigung, damit auch Checkbox-Zonen- und Expand-Klicks den
+        Klick-Scope liefern) – das Read-Only-Panel des Dialogs folgt damit
+        dem Klick, NICHT den Checkboxen.
         """
         try:
             pos = (event.position().toPoint() if hasattr(event, "position")
@@ -1070,6 +1084,8 @@ class MasterTree(QTreeWidget):
             if item is None or not isValid(item):
                 super().mousePressEvent(event)
                 return
+            # Klick-Scope fuer das Read-Only-Panel (Bugfix 06.08.2026).
+            self._emit_selection_details(item)
             # Checkbox-Klick hat Vorrang vor dem Expand-Toggle
             if self._checkable and (item.flags() & Qt.ItemIsUserCheckable):
                 rect = self.visualItemRect(item)
@@ -1087,6 +1103,36 @@ class MasterTree(QTreeWidget):
         except (RuntimeError, AttributeError):
             pass
         super().mousePressEvent(event)
+
+    def _emit_selection_details(self, item) -> None:
+        """Emittiert `selection_details` fuer die geklickte Zeile.
+
+        Liefert die Zeilen-Daten (node_type, set_id, service_id, plugin_id)
+        je Knotentyp – Service-Zeilen tragen alle vier Rollen, Set-Zeilen nur
+        node_type+set_id, Plugin-Zeilen nur node_type+plugin_id (set_id ist
+        hier bewusst leer, die ROLE_SET_ID haelt nur die Gruppenkennung),
+        Gruppen-/sonstige Zeilen nur node_type. Der Dialog entscheidet aus
+        diesem Scope, welche Parameter angezeigt werden.
+        """
+        if item is None or not isValid(item):
+            return
+        try:
+            node_type = str(item.data(0, ROLE_NODE_TYPE) or "")
+            set_id = ""
+            service_id = ""
+            plugin_id = ""
+            if node_type == TYPE_SERVICE:
+                set_id = str(item.data(0, ROLE_SET_ID) or "")
+                service_id = str(item.data(0, ROLE_INSTANCE_ID) or "")
+                plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
+            elif node_type == TYPE_SET:
+                set_id = str(item.data(0, ROLE_SET_ID) or "")
+            elif node_type == TYPE_PLUGIN:
+                plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
+            self.selection_details.emit(node_type, set_id, service_id,
+                                        plugin_id)
+        except (RuntimeError, AttributeError):
+            pass
 
     # -------------------------------------------------------------------------
     # Selektion / Auswertung
