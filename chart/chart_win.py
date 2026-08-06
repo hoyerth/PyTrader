@@ -36,10 +36,12 @@ from PySide6.QtWidgets import (
 try:
     from chart.chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, build_html_template
     from chart.indicators.fixed_grid_proximity import FixedGridProximityIndicator
+    from chart.indicators.multi_ma import MultiMovingAverageIndicator
     from chart.indicator_dialog import IndicatorSettingsDialog
 except ImportError:
     from chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, build_html_template
     from indicators.fixed_grid_proximity import FixedGridProximityIndicator
+    from indicators.multi_ma import MultiMovingAverageIndicator
     from indicator_dialog import IndicatorSettingsDialog
 
 try:
@@ -188,8 +190,10 @@ class PyTraderChartWindow(QMainWindow):
         # Generische Indikator-Registry: indicator_id -> BaseIndicator.
         # Phase 16: Alt-Indikator 'grid_liquidity' entfernt; der Plugin-
         # Indikator 'Ind_FixedGridProximity' (fixed_grid_proximity) bleibt.
+        # Phase 16.05 (D1): Multi-MA-Indikator 'ind_moving_averages' additiv.
         self.indicators: Dict[str, BaseIndicator] = {
             "ind_fixed_grid_proximity": FixedGridProximityIndicator(),
+            "ind_moving_averages": MultiMovingAverageIndicator(),
         }
         # Phase 13 Schritt 6: Neuer Close im Ind_FixedGridProximity-Indikator → NUR ein
         # debounced Refresh (Cache-Neuaufbau), nicht bei jedem Tick.
@@ -318,6 +322,8 @@ class PyTraderChartWindow(QMainWindow):
         self.tf_combo = self.ui_widget.findChild(QComboBox, "combo_tf")
         self.btn_reset = self.ui_widget.findChild(QPushButton, "btn_reset_chart")
         self.btn_indicator_liquidity = self.ui_widget.findChild(QPushButton, "btn_indicator_grid_liquidity")
+        # Phase 16.05 (D1): Multi-MA-Button (btn_indicator_ma, Text "MA").
+        self.btn_indicator_ma = self.ui_widget.findChild(QPushButton, "btn_indicator_ma")
         self.chart_container = self.ui_widget.findChild(QWidget, "web_container")
 
         if self.symbol_combo:
@@ -354,6 +360,12 @@ class PyTraderChartWindow(QMainWindow):
             self.btn_indicator_liquidity.setCheckable(True)
             self.btn_indicator_liquidity.clicked.connect(self.toggle_fixed_grid_proximity_lines)
             self.btn_indicator_liquidity.installEventFilter(self)
+        # Phase 16.05 (D1): Multi-MA-Button (btn_indicator_ma) → Indikator
+        # 'ind_moving_averages' (Muster btn_indicator_grid_liquidity).
+        if self.btn_indicator_ma:
+            self.btn_indicator_ma.setCheckable(True)
+            self.btn_indicator_ma.clicked.connect(self.toggle_moving_averages)
+            self.btn_indicator_ma.installEventFilter(self)
         self.update_indicator_button_style()
 
         self.web_view = QWebEngineView()
@@ -378,11 +390,16 @@ class PyTraderChartWindow(QMainWindow):
         self.web_view.loadFinished.connect(self._on_page_loaded)
 
     def eventFilter(self, watched, event):
-        # Rechtsklick auf den Plugin-Grid-Button → Einstellungen für 'ind_fixed_grid_proximity'
-        if (self.btn_indicator_liquidity is not None and watched == self.btn_indicator_liquidity
-                and event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton):
-            self._toggle_settings_dialog("ind_fixed_grid_proximity")
-            return True
+        # Rechtsklick auf Plugin-Indikator-Buttons → Einstellungen.
+        # Phase 16.05 (D1): MA-Button additiv (btn_indicator_ma).
+        if (event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton):
+            for button, ind_id in (
+                (self.btn_indicator_liquidity, "ind_fixed_grid_proximity"),
+                (self.btn_indicator_ma, "ind_moving_averages"),
+            ):
+                if button is not None and watched == button:
+                    self._toggle_settings_dialog(ind_id)
+                    return True
         return super().eventFilter(watched, event)
 
     def _toggle_settings_dialog(self, ind_id: str) -> None:
@@ -399,9 +416,13 @@ class PyTraderChartWindow(QMainWindow):
         return self.indicators.get(ind_id)
 
     def update_indicator_button_style(self):
-        """Aktualisiert die Färbung des Plugin-Indikator-Buttons
-        ('ind_fixed_grid_proximity') entsprechend seines An/Aus-Zustands."""
-        self._apply_indicator_button_style(self.btn_indicator_liquidity, "ind_fixed_grid_proximity")
+        """Aktualisiert die Färbung aller Plugin-Indikator-Buttons
+        entsprechend ihres An/Aus-Zustands."""
+        for button, ind_id in (
+            (self.btn_indicator_liquidity, "ind_fixed_grid_proximity"),
+            (self.btn_indicator_ma, "ind_moving_averages"),
+        ):
+            self._apply_indicator_button_style(button, ind_id)
 
     def _apply_indicator_button_style(self, button: Optional[QPushButton], ind_id: str) -> None:
         """Setzt die Button-Farbe je nach Aktiv-Zustand des Indikators."""
@@ -415,6 +436,11 @@ class PyTraderChartWindow(QMainWindow):
     def toggle_fixed_grid_proximity_lines(self):
         """Schaltet den Plugin-Indikator ('Ind_FixedGridProximity') an/aus."""
         self._toggle_indicator("ind_fixed_grid_proximity")
+
+    def toggle_moving_averages(self):
+        """Phase 16.05 (D1): Schaltet den Multi-MA-Indikator
+        ('ind_moving_averages') an/aus."""
+        self._toggle_indicator("ind_moving_averages")
 
     def _toggle_indicator(self, ind_id: str) -> None:
         """Schaltet einen Indikator an/aus."""
