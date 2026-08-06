@@ -553,6 +553,12 @@ class PyTraderChartWindow(QMainWindow):
         Service-Set, die Darstellung (Farben, Sichtbarkeiten) im Chart-State.
         Legacy (voller params-Dict ohne set_id) wird unverändert gespeichert
         (Abwärtskompatibilität).
+
+        Anwender-Anweisung 06.08.2026: Das Preset 'Default' ist GENAU WIE
+        JEDES ANDERE PRESET ÜBERSCHREIBBAR – Änderungen unter 'Default'
+        (Parameter-Änderungen im Dialog, Preset-Auswahl) werden regulär in
+        indicators_state geschrieben und persistiert. Beim nächsten Öffnen
+        zeigt der Dialog die überschriebenen Default-Werte.
         """
         if isinstance(payload, dict) and ("set_id" in payload or "display_params" in payload):
             self.indicators_state[ind_id] = {

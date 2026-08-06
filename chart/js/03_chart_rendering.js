@@ -8,6 +8,18 @@ function clearGridLines() {
     gridPriceLines = [];
 }
 
+// P16.03-Bugfix: Python-Linienart (lowercase: solid/dashed/dotted/dashdotted)
+// auf LWC-v5-LineStyle mappen. 'dashdotted' -> LargeDashed (beste Naeherung).
+function _lwcLineStyle(styleName) {
+    switch ((styleName || 'solid').toLowerCase()) {
+        case 'dashed': return LightweightCharts.LineStyle.Dashed;
+        case 'dotted': return LightweightCharts.LineStyle.Dotted;
+        case 'dashdotted': return LightweightCharts.LineStyle.LargeDashed;
+        case 'solid':
+        default: return LightweightCharts.LineStyle.Solid;
+    }
+}
+
 function renderGridLines(lines) {
     clearGridLines();
     if (!candleSeries || !lines) return;
@@ -16,7 +28,7 @@ function renderGridLines(lines) {
         if (l && typeof l.price === 'number' && !isNaN(l.price)) {
             var pl = candleSeries.createPriceLine({
                 price: l.price, color: l.color, lineWidth: l.width,
-                lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true,
+                lineStyle: _lwcLineStyle(l.style), axisLabelVisible: true,
                 title: l.is_custom ? '\u2605' : ''
             });
             gridPriceLines.push(pl);
@@ -100,8 +112,11 @@ function renderGridCircles(circles) {
                 time: cc.time,
                 position: 'inBar',
                 color: cc.color || '#E91E63',
-                shape: 'circle',
-                size: 1,
+                // P16.03-Bugfix: Form/Groesse aus dem Python-Payload uebernehmen
+                // (vorher hart 'circle'/1) - die Auswahl im StylePickerWidget
+                // (circle/square/arrowUp/arrowDown) wirkt damit endlich.
+                shape: cc.shape || 'circle',
+                size: (cc.size && cc.size > 0) ? cc.size : 1,
                 priority: 10
             });
         }

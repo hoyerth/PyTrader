@@ -34,6 +34,12 @@ from typing import Any, Callable, Dict, List, Optional
 import pandas as pd
 
 from db_service import TF_SECONDS_MAP
+from chart.overlays.style_models import (
+    LINE_STYLES,
+    MARKER_SHAPES,
+    LineStyle,
+    MarkerStyle,
+)
 from .base_indicator import BaseIndicator
 from analytics.features.feature_builder import PluginExecutor
 from analytics.features.plugins.base_plugin import PluginContext
@@ -46,6 +52,36 @@ def _as_bool(value: Any, default: bool = True) -> bool:
     if value is None:
         return default
     return bool(value)
+
+
+def _marker_shape(value: Any, default: str = "circle") -> str:
+    """P16.03-Bugfix: Validiert einen Marker-Shape-Wert gegen MARKER_SHAPES
+    (tolerant: ungueltige Werte fallen auf den Default zurueck)."""
+    s = str(value or default)
+    return s if s in MARKER_SHAPES else default
+
+
+def _marker_size(value: Any, default: int = 6) -> int:
+    """P16.03-Bugfix: Validiert/klammert eine Markergroesse auf 1..20 px."""
+    try:
+        return max(1, min(20, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _line_style(value: Any, default: str = "solid") -> str:
+    """P16.03-Bugfix: Validiert einen Linienart-Wert gegen LINE_STYLES
+    (tolerant: ungueltige Werte fallen auf den Default zurueck)."""
+    s = str(value or default)
+    return s if s in LINE_STYLES else default
+
+
+def _line_width(value: Any, default: int = 1) -> int:
+    """P16.03-Bugfix: Validiert/klammert eine Linienstaerke auf 1..10 px."""
+    try:
+        return max(1, min(10, int(value)))
+    except (TypeError, ValueError):
+        return default
 
 
 def _f_in_window_around(minute_val: int, center: int, span: int) -> bool:
@@ -74,9 +110,24 @@ _FIXED_GRID_PROXIMITY_SCHEMA: Dict[str, Dict[str, Any]] = {
     "proximity_threshold": {"type": "float", "default": 0.05, "min": 0.001, "max": 10.0, "step": 0.005, "description": "Toleranzschwelle"},
     "use_time_filter": {"type": "bool", "default": True, "description": "Time Filter aktiv (Zeitfenster um ganze/halbe Stunde)"},
     "time_window_mins": {"type": "int", "default": 5, "min": 0, "max": 30, "step": 1, "description": "Time Filter Minuten (0 oder 30 um ganze/halbe Stunde)"},
-    "line_color": {"type": "color", "default": "#2196F3", "description": "Farbe Grid-Linien"},
-    "circle_color_std": {"type": "color", "default": "#FFEB3B", "description": "Farbe Standard-Hit (im Zeitfenster)"},
-    "circle_color_active": {"type": "color", "default": "#E91E63", "description": "Farbe Hit in Aktivitätsfenster"},
+    "line_color": {"type": "color", "default": "#2196F3", "description": "Farbe Grid-Linien", "style_type": "line"},
+    # P16.03-Bugfix (06.08.2026): Linienart/-staerke werden NICHT als eigene
+    # Controls gerendert (nicht in parameter_order) - der StylePickerWidget
+    # (line-Modus) steuert sie direkt ueber die Geschwister-Keys (Konvention
+    # 'color' -> 'style'/'width'). Old-Presets ohne diese Keys fallen auf die
+    # Defaults zurueck (solid / 1 px).
+    "line_style": {"type": "choice", "options": list(LINE_STYLES), "default": "solid", "description": "Linienart"},
+    "line_width": {"type": "int", "default": 1, "min": 1, "max": 10, "step": 1, "description": "Linienstärke (px)"},
+    "circle_color_std": {"type": "color", "default": "#FFEB3B", "description": "Farbe Standard-Hit (im Zeitfenster)", "style_type": "marker"},
+    "circle_color_active": {"type": "color", "default": "#E91E63", "description": "Farbe Hit in Aktivitätsfenster", "style_type": "marker"},
+    # P16.03-Bugfix (06.08.2026): Marker-Form/-Groesse werden NICHT als eigene
+    # Controls gerendert (nicht in parameter_order) - der StylePickerWidget
+    # steuert sie direkt ueber die Geschwister-Keys (Konvention 'color' ->
+    # 'shape'/'size'). Old-Presets ohne diese Keys fallen auf die Defaults zurueck.
+    "circle_shape_std": {"type": "choice", "options": list(MARKER_SHAPES), "default": "circle", "description": "Symbol Standard-Hit (im Zeitfenster)"},
+    "circle_shape_active": {"type": "choice", "options": list(MARKER_SHAPES), "default": "circle", "description": "Symbol Aktiv-Hit (ausserhalb)"},
+    "circle_size_std": {"type": "int", "default": 6, "min": 1, "max": 20, "step": 1, "description": "Groesse Standard-Hit (px)"},
+    "circle_size_active": {"type": "int", "default": 6, "min": 1, "max": 20, "step": 1, "description": "Groesse Aktiv-Hit (px)"},
     "show_lines": {"type": "bool", "default": True, "description": "Grid-Linien anzeigen"},
     "show_circles": {"type": "bool", "default": True, "description": "Hits anzeigen"},
     "prox_level1": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 1"},
@@ -197,8 +248,14 @@ class FixedGridProximityIndicator(BaseIndicator):
             "use_time_filter": "Time Filter aktiv",
             "time_window_mins": "Time Filter Minuten (0/30)",
             "line_color": "Linien-Farbe",
+            "line_style": "Linienart",
+            "line_width": "Linienstärke (px)",
             "circle_color_std": "Std-Hit-Farbe (im Fenster)",
             "circle_color_active": "Aktiv-Hit-Farbe (ausserhalb)",
+            "circle_shape_std": "Symbol Std-Hit",
+            "circle_shape_active": "Symbol Aktiv-Hit",
+            "circle_size_std": "Groesse Std-Hit (px)",
+            "circle_size_active": "Groesse Aktiv-Hit (px)",
             "show_lines": "Linien anzeigen",
             "show_circles": "Circles anzeigen",
             "prox_level1": "Level 1",
@@ -428,6 +485,51 @@ class FixedGridProximityIndicator(BaseIndicator):
         return out
 
     # ------------------------------------------------- P16.01: Render-Payload
+    def _build_style_objects(
+        self, ui_params: Dict[str, Any]
+    ) -> tuple:
+        """P16.03 (Schritt 3): Baut die generischen Style-Vertraege aus den
+        Indikator-UI-Params (P16.01-konform – die Services selbst haben seit
+        P16.01 KEINE Style-UI-Params mehr, das komplette Render-Styling liegt
+        ausschliesslich im Indikator).
+
+        Abbildung der UI-Params auf die Style-Vertraege:
+          * `grid_style`     (LineStyle):    show_lines / line_color
+          * `std_marker`     (MarkerStyle):  show_circles / circle_color_std
+          * `active_marker`  (MarkerStyle):  show_circles / circle_color_active
+
+        width/style kommen seit dem P16.03-Bugfix (06.08.2026) aus den
+        Geschwister-UI-Params (Konvention 'color' -> 'style'/'width'):
+        line_style (choice, LINE_STYLES) und line_width (int 1..10).
+        Ebenso shape/size der Marker aus circle_shape_* (choice,
+        MARKER_SHAPES) und circle_size_* (int 1..20). Fehlen die Params
+        (Old-Presets), fallen sie auf die P16.03-Defaults zurueck
+        (LineStyle: width 1, style 'solid'; MarkerStyle: shape 'circle',
+        size 6).
+
+        Returns:
+            (grid_style, std_marker, active_marker) – frische Instanzen.
+        """
+        grid_style = LineStyle(
+            show=_as_bool(ui_params.get("show_lines"), True),
+            color=str(ui_params.get("line_color") or "").strip(),
+            width=_line_width(ui_params.get("line_width"), 1),
+            style=_line_style(ui_params.get("line_style"), "solid"),
+        )
+        std_marker = MarkerStyle(
+            show=_as_bool(ui_params.get("show_circles"), True),
+            color=str(ui_params.get("circle_color_std") or "#FFEB3B"),
+            shape=_marker_shape(ui_params.get("circle_shape_std"), "circle"),
+            size=_marker_size(ui_params.get("circle_size_std"), 6),
+        )
+        active_marker = MarkerStyle(
+            show=_as_bool(ui_params.get("show_circles"), True),
+            color=str(ui_params.get("circle_color_active") or "#E91E63"),
+            shape=_marker_shape(ui_params.get("circle_shape_active"), "circle"),
+            size=_marker_size(ui_params.get("circle_size_active"), 6),
+        )
+        return grid_style, std_marker, active_marker
+
     def build_chart_render_payload(
         self,
         raw_features: Dict[str, Any],
@@ -436,6 +538,15 @@ class FixedGridProximityIndicator(BaseIndicator):
         """P16.01 (Architektur-Entkopplung): Baut den chart_render_payload aus
         den ROHDATEN der Services – die Services selbst liefern KEINE Farben,
         Sichtbarkeits-Flags oder Zeichen-Objekte mehr (E1–E5).
+
+        P16.03 (Schritt 3 + Bugfix 06.08.2026): Das Styling wird ueber die
+        generischen Style-Vertraege abgebildet – `LineStyle` (Grid-Linien)
+        bzw. `MarkerStyle` (Std-/Aktiv-Hit) werden aus den UI-Params gebaut
+        (_build_style_objects) und via .to_js_dict() in den Payload uebersetzt
+        (lowercase style-Werte, LWC-v5-Konvention; shape/size fuer die
+        Marker). Die JS-Bridge uebernimmt shape/size aus dem Payload
+        (renderGridCircles) – das style-Feld der Lines bleibt ignoriert
+        (hardcoded LineStyle.Solid in renderGridLines).
 
         raw_features:
           * "grid_levels":        reine Level-Liste [{price}, ...] aus
@@ -452,19 +563,31 @@ class FixedGridProximityIndicator(BaseIndicator):
 
         Liefert {"lines", "hit_circles", "status_info"} für den JS-Bridge
         (chart_win._serialize_and_render_grid) – Parität zum Alt-Grid:
-        * lines: {price, color, width, style:'Solid', is_custom}
+        * lines: {price, color, width, style:'solid', is_custom}
           (leere line_color = Paritäts-Styling des Alt-Grid:
-          rgba(33,150,243,0.9)/width 1 für Custom-Levels,
-          rgba(33,150,243,0.5)/width 3 für Normal-Levels).
-        * hit_circles: {time, price, in_window, color, priority:10}
-          circle_color_std wenn in_window=True (bzw. Time-Filter inaktiv),
-          circle_color_active sonst (E1).
+          rgba(33,150,243,0.9) für Custom-Levels, rgba(33,150,243,0.5) für
+          Normal-Levels; width/style seit P16.03-Bugfix aus line_width/
+          line_style – User-Einstellung, Default 1/solid).
+        * hit_circles: {time, price, in_window, color, shape, size, priority:10}
+          circle_color_std/shape/size wenn in_window=True (bzw. Time-Filter
+          inaktiv), circle_color_active/_shape/_size sonst (E1/E3).
         * status_info: 1:1 aus raw_features["status_info"] (E4).
         """
         lines: List[Dict[str, Any]] = []
-        if _as_bool(ui_params.get("show_lines"), True):
-            line_color = str(ui_params.get("line_color") or "").strip()
+        # P16.03: Grid-Linien-Style aus dem generischen Style-Vertrag
+        # (LineStyle.to_js_dict -> lowercase style, LWC-v5-Konvention).
+        grid_style, std_marker, active_marker = self._build_style_objects(ui_params)
+        if grid_style.show:
+            line_color = grid_style.color
             custom_levels = self._extract_custom_levels(ui_params)
+            # P16.03-Bugfix: width/style aus dem LineStyle-Vertrag (User-
+            # Einstellung im StylePickerWidget) - vorher wurde die width vom
+            # Paritaets-Styling (custom=1/normal=3) ueberschrieben und der
+            # style war immer 'solid'. Die color-Paritaet (leere line_color ->
+            # custom/normal unterschiedliche Transparenz) bleibt bestehen.
+            js_line = grid_style.to_js_dict()
+            js_line_style = js_line["style"]
+            js_line_width = js_line["width"]
             for lvl_item in (raw_features.get("grid_levels") or []):
                 if not isinstance(lvl_item, dict):
                     continue
@@ -483,22 +606,28 @@ class FixedGridProximityIndicator(BaseIndicator):
                 lines.append({
                     "price": lvl,
                     "color": color,
-                    "width": 1 if is_custom else 3,
-                    "style": "Solid",
+                    "width": js_line_width,
+                    "style": js_line_style,
                     "is_custom": is_custom,
                 })
 
         use_time_filter = _as_bool(ui_params.get("use_time_filter"), True)
-        circle_std = str(ui_params.get("circle_color_std") or "#FFEB3B")
-        circle_active = str(ui_params.get("circle_color_active") or "#E91E63")
+        # P16.03-Bugfix: Hit-Marker-Styling aus den generischen Style-Vertraegen
+        # (MarkerStyle.to_js_dict -> LWC-v5-kompatible color/shape/size).
+        js_std = std_marker.to_js_dict()
+        js_active = active_marker.to_js_dict()
+        circle_std = js_std["color"]
+        circle_active = js_active["color"]
         hit_circles: List[Dict[str, Any]] = []
-        if _as_bool(ui_params.get("show_circles"), True):
+        if std_marker.show and active_marker.show:
             for rec in (raw_features.get("proximity_records") or []):
                 if not rec.get("is_hit"):
                     continue
                 in_window = bool(rec.get("in_time_window"))
-                color = (circle_active if (use_time_filter and not in_window)
-                         else circle_std)
+                is_active = bool(use_time_filter and not in_window)
+                color = circle_active if is_active else circle_std
+                shape = js_active["shape"] if is_active else js_std["shape"]
+                size = js_active["size"] if is_active else js_std["size"]
                 try:
                     bar_time = int(rec.get("bar_time"))
                 except (TypeError, ValueError):
@@ -510,6 +639,8 @@ class FixedGridProximityIndicator(BaseIndicator):
                             "price": float(lvl),
                             "in_window": in_window,
                             "color": color,
+                            "shape": shape,
+                            "size": size,
                             "priority": 10,
                         })
                     except (TypeError, ValueError):
@@ -604,6 +735,10 @@ class FixedGridProximityIndicator(BaseIndicator):
             )
             circle_std = str(p.get("circle_color_std") or "#FFEB3B")
             circle_active = str(p.get("circle_color_active") or "#E91E63")
+            shape_std = _marker_shape(p.get("circle_shape_std"), "circle")
+            shape_active = _marker_shape(p.get("circle_shape_active"), "circle")
+            size_std = _marker_size(p.get("circle_size_std"), 6)
+            size_active = _marker_size(p.get("circle_size_active"), 6)
             use_time_filter = _as_bool(p.get("use_time_filter"), True)
 
             def _colorize(c: Dict[str, Any]) -> Dict[str, Any]:
@@ -614,13 +749,14 @@ class FixedGridProximityIndicator(BaseIndicator):
                 # build_chart_render_payload) setzt priority=10 bereits selbst.
                 # Durch das additive Setzen sind BEIDE Pfade konsistent
                 # (ChartCircle-Vertrag, base_plugin.py).
+                # P16.03-Bugfix: Auch shape/size additiv setzen – der
+                # Feature-Store-Lesepfad liefert die Kreise ohne Form/Groesse.
+                is_active = bool(use_time_filter and not bool(c.get("in_window", True)))
                 return dict(
                     c,
-                    color=(
-                        circle_active
-                        if (use_time_filter and not bool(c.get("in_window", True)))
-                        else circle_std
-                    ),
+                    color=(circle_active if is_active else circle_std),
+                    shape=(shape_active if is_active else shape_std),
+                    size=(size_active if is_active else size_std),
                     priority=10,
                 )
 
@@ -696,13 +832,20 @@ class FixedGridProximityIndicator(BaseIndicator):
         time_window_mins = int(p.get("time_window_mins", 5))
         circle_std = str(p.get("circle_color_std") or "#FFEB3B")
         circle_active = str(p.get("circle_color_active") or "#E91E63")
+        shape_std = _marker_shape(p.get("circle_shape_std"), "circle")
+        shape_active = _marker_shape(p.get("circle_shape_active"), "circle")
+        size_std = _marker_size(p.get("circle_size_std"), 6)
+        size_active = _marker_size(p.get("circle_size_active"), 6)
 
         row_m = datetime.fromtimestamp(rounded, tz=dt_timezone.utc).minute
         row_in_time = (
             _f_in_window_around(row_m, 0, time_window_mins)
             or _f_in_window_around(row_m, 30, time_window_mins)
         )
-        color = circle_active if (use_time_filter and not row_in_time) else circle_std
+        is_active = bool(use_time_filter and not row_in_time)
+        color = circle_active if is_active else circle_std
+        shape = shape_active if is_active else shape_std
+        size = size_active if is_active else size_std
 
         points: List[Dict[str, Any]] = []
         for line in cached_lines:
@@ -717,7 +860,7 @@ class FixedGridProximityIndicator(BaseIndicator):
             visit_max = lvl * (1.0 + visit_pct / 100.0)
             if visit_min <= price <= visit_max:
                 points.append({"time": rounded, "price": lvl, "color": color,
-                               "priority": 10})
+                               "shape": shape, "size": size, "priority": 10})
 
         self._live_points = list(points)  # atomare Zuweisung
         return points

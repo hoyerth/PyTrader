@@ -50,7 +50,8 @@ from PySide6.QtWidgets import (
 )
 
 from chart.indicators.base_indicator import BaseIndicator
-from chart.widgets.color_button import ColorButton
+from chart.overlays.style_models import LINE_STYLES, LineStyle, MarkerStyle, MARKER_SHAPES
+from chart.widgets.style_picker_widget import StylePickerWidget
 from chart.widgets.named_item_actions import NamedItemAdapter, NamedItemActionsMixin
 from analytics.engine.description_dialog import ServiceDescriptionDialog
 from state_manager import StateManager
@@ -135,6 +136,27 @@ class _ServiceStack(QStackedWidget):
 		self.updateGeometry()
 
 
+def _jsonify_style_objects(obj: Any) -> Any:
+	"""P16.03 Schritt 4: Konvertiert LineStyle/MarkerStyle-Objekte rekursiv
+	via .to_dict() in JSON-kompatible Dicts (vor save_indicator_preset).
+
+	Der aktuelle Preset-Payload (_build_preset_payload) enthält nur primitive
+	Werte (Farb-Strings, shape/size/style/width-Geschwister-Keys) – dieser
+	Helfer ist eine DEFENSIVE Absicherung: Sollte jemals ein Style-Vertrag
+	(Dataclass) direkt im Payload landen (z. B. durch ein zukünftiges
+	Control), schlägt json.dumps in state_manager.save_indicator_preset
+	nicht fehl, sondern speichert den JSON-Standard
+	(show/color/width/style bzw. show/color/shape/size).
+	"""
+	if isinstance(obj, (LineStyle, MarkerStyle)):
+		return obj.to_dict()
+	if isinstance(obj, dict):
+		return {k: _jsonify_style_objects(v) for k, v in obj.items()}
+	if isinstance(obj, (list, tuple)):
+		return [_jsonify_style_objects(v) for v in obj]
+	return obj
+
+
 class _PresetItemAdapter(NamedItemAdapter):
 	"""Adapter für die PRESET-Sammlung (Referenz-Mechanik) im Prop-Fenster.
 
@@ -169,6 +191,10 @@ class _PresetItemAdapter(NamedItemAdapter):
 	def _item_save_as(self, name: str) -> str:
 		"""Speichert das Preset unter 'name' (getrenntes Dict {set_id, display_params})."""
 		payload = self.dlg._build_preset_payload()
+		# P16.03 Schritt 4: Style-Objekte vor dem JSON-Speichern via .to_dict()
+		# in JSON-kompatible Dicts konvertieren (defensive Absicherung gegen
+		# TypeError in state_manager.save_indicator_preset -> json.dumps).
+		payload = _jsonify_style_objects(payload)
 		self.dlg.state_manager.save_indicator_preset(
 			self.dlg.indicator.indicator_id, name, payload)
 		return name
@@ -203,7 +229,9 @@ class _PresetItemAdapter(NamedItemAdapter):
 		self.dlg.on_preset_selected(nxt)
 
 	def _item_reserved_name(self) -> Optional[str]:
-		return "Default"
+		# Anwender-Anweisung 06.08.2026: 'Default' ist wie jedes andere Preset
+		# überschreibbar (und löschbar) – KEIN geschützter Name mehr.
+		return None
 
 
 class _ServiceSetItemAdapter(NamedItemAdapter):
@@ -457,6 +485,20 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		return False
 
 	@staticmethod
+	def _style_sibling_keys(key: str, style_type: str) -> tuple:
+		"""P16.03-Bugfix: Leitet die Geschwister-Keys eines StylePickerWidget-
+		Params her (Konvention: 'color' im Key -> 'shape'/'size' bei marker,
+		'style'/'width' bei line). Liefert (None, None), wenn keine Konvention
+		passt. Die Marker-Form/-Groesse wird NICHT als separates Control
+		gerendert (der StylePickerWidget zeigt sie bereits), sondern ueber
+		diese Geschwister-Params persistiert (nicht in parameter_order)."""
+		if "color" not in key:
+			return None, None
+		if style_type == "marker":
+			return key.replace("color", "shape"), key.replace("color", "size")
+		return key.replace("color", "style"), key.replace("color", "width")
+
+	@staticmethod
 	def _human(key: str) -> str:
 		return key.replace("_", " ").title()
 
@@ -512,16 +554,62 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			return combo
 
 		if p_type == "color":
-			# 5.5 Feintuning (VERBINDLICH): Farbparameter IMMER als kompakter
-			# ColorButton rendern – nie als freies Textfeld (QLineEdit).
+			# 5.5 Feintuning + Phase 16 (06.08.2026): Farbparameter werden als
+			# StylePickerWidget gerendert – das komplette Composite (Sichtbarkeit,
+			# Farbe, Stärke, Linienart). Der Dialog liest/schreibt NUR den
+			# Farbanteil via get_style()/set_color() (Refactoring-Anweisung
+			# ColorButton -> StylePickerWidget, Entscheidung: vollwertiges
+			# Composite, Dialog nutzt nur den Farbanteil).
 			# allow_alpha aus dem Schema (Default True) schaltet den
 			# Transparenz-Slider im QColorDialog (ShowAlphaChannel) frei.
-			# Der Button liefert '#RRGGBB' (Alpha=255) bzw. 'rgba(r,g,b,a)'
+			# Der Farb-Button liefert '#RRGGBB' (Alpha=255) bzw. 'rgba(r,g,b,a)'
 			# (Teil-Transparenz) – 1:1 kompatibel mit TradingView v5 / CSS.
 			allow_alpha = bool(spec.get("allow_alpha", True))
-			btn = ColorButton(default_color=str(val), enable_alpha=allow_alpha)
-			btn.colorChanged.connect(self.on_param_control_changed)
-			return btn
+			# P16.03-Bugfix (06.08.2026): style_type aus der Schema-Spec
+			# (Default 'line'). Circle-Farbparameter (circle_color_std/_active)
+			# deklarieren "style_type": "marker" -> das Prop-Fenster zeigt
+			# den MARKER-Modus (Markergröße + Form) statt Linienmodus. Der
+			# passende Style-Typ wird übergeben, damit die Initialfarbe beim
+			# marker-Modus nicht verloren geht (Typ-Mismatch im Widget würde
+			# sonst auf die Default-Farbe zurueckfallen).
+			style_type = str(spec.get("style_type", "line"))
+			if style_type == "marker":
+				# P16.03-Bugfix: Marker-Form/-Groesse aus den Geschwister-Params
+				# vorbelegen (Konvention 'color' -> 'shape'/'size'), damit das
+				# Widget beim Oeffnen die gespeicherte Form/Groesse zeigt.
+				shape_key, size_key = self._style_sibling_keys(key, "marker")
+				shape_val = "circle"
+				if shape_key and shape_key in self.params:
+					shape_val = str(self.params.get(shape_key) or "circle")
+					if shape_val not in MARKER_SHAPES:
+						shape_val = "circle"
+				size_val = 6
+				if size_key and size_key in self.params:
+					try:
+						size_val = int(self.params.get(size_key))
+					except (TypeError, ValueError):
+						size_val = 6
+				style_obj = MarkerStyle(color=str(val), shape=shape_val, size=size_val)
+			else:
+				# P16.03-Bugfix: Linienart/-staerke aus den Geschwister-Params
+				# vorbelegen (Konvention 'color' -> 'style'/'width'), damit das
+				# Widget beim Oeffnen die gespeicherte Linienart/-staerke zeigt.
+				style_key, width_key = self._style_sibling_keys(key, "line")
+				style_val = "solid"
+				if style_key and style_key in self.params:
+					style_val = str(self.params.get(style_key) or "solid")
+					if style_val not in LINE_STYLES:
+						style_val = "solid"
+				width_val = 1
+				if width_key and width_key in self.params:
+					try:
+						width_val = int(self.params.get(width_key))
+					except (TypeError, ValueError):
+						width_val = 1
+				style_obj = LineStyle(color=str(val), style=style_val, width=width_val)
+			ctrl = StylePickerWidget(style=style_obj, enable_alpha=allow_alpha, style_type=style_type)
+			ctrl.style_changed.connect(self.on_param_control_changed)
+			return ctrl
 
 		# str / sonstiges
 		txt = QLineEdit()
@@ -539,8 +627,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			return ctrl.value()
 		if isinstance(ctrl, QComboBox):
 			return ctrl.currentText()
-		if isinstance(ctrl, ColorButton):
-			return ctrl.color()
+		if isinstance(ctrl, StylePickerWidget):
+			return ctrl.get_style().color
 		return ctrl.text()
 
 	# -------------------------------------------------------------------------
@@ -1267,6 +1355,24 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		for key, ctrl in self.param_controls.items():
 			if self._is_visual_key(key):
 				display[key] = self._ctrl_value(ctrl)
+				# P16.03-Bugfix: Form/Groesse bzw. Linienart/-staerke in
+				# display_params aufnehmen (Konvention 'color' -> 'shape'/'size'
+				# bzw. 'style'/'width'), damit Presets die Auswahl im
+				# StylePickerWidget round-trippen.
+				if isinstance(ctrl, StylePickerWidget):
+					style_obj = ctrl.get_style()
+					if isinstance(style_obj, MarkerStyle):
+						shape_key, size_key = self._style_sibling_keys(key, "marker")
+						if shape_key:
+							display[shape_key] = style_obj.shape
+						if size_key:
+							display[size_key] = style_obj.size
+					elif isinstance(style_obj, LineStyle):
+						style_key, width_key = self._style_sibling_keys(key, "line")
+						if style_key:
+							display[style_key] = style_obj.style
+						if width_key:
+							display[width_key] = style_obj.width
 		return {"set_id": set_id or "", "logic_params": self._collect_logic_params(),
 		        "display_params": display}
 
@@ -1654,8 +1760,25 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 						new_params[key] = default_val
 				else:
 					new_params[key] = raw_val
-			elif isinstance(ctrl, ColorButton):
-				new_params[key] = ctrl.color()
+			elif isinstance(ctrl, StylePickerWidget):
+				style_obj = ctrl.get_style()
+				new_params[key] = style_obj.color
+				# P16.03-Bugfix: Form/Groesse bzw. Linienart/-staerke in die
+				# Geschwister-Keys schreiben (Konvention 'color' ->
+				# 'shape'/'size' bzw. 'style'/'width'), damit die Auswahl im
+				# Widget persistiert und der Indikator sie in den Payload gibt.
+				if isinstance(style_obj, MarkerStyle):
+					shape_key, size_key = self._style_sibling_keys(key, "marker")
+					if shape_key:
+						new_params[shape_key] = style_obj.shape
+					if size_key:
+						new_params[size_key] = style_obj.size
+				elif isinstance(style_obj, LineStyle):
+					style_key, width_key = self._style_sibling_keys(key, "line")
+					if style_key:
+						new_params[style_key] = style_obj.style
+					if width_key:
+						new_params[width_key] = style_obj.width
 			elif isinstance(ctrl, QLineEdit):
 				new_params[key] = ctrl.text()
 		return new_params
@@ -1672,8 +1795,37 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 					ctrl.setValue(val)
 				elif isinstance(ctrl, QComboBox):
 					ctrl.setCurrentText(str(val))
-				elif isinstance(ctrl, ColorButton) and isinstance(val, str):
-					ctrl.setColor(val)
+				elif isinstance(ctrl, StylePickerWidget) and isinstance(val, str):
+					ctrl.set_color(val)
+					# P16.03-Bugfix: Form/Groesse bzw. Linienart/-staerke aus
+					# den Geschwister-Params zurueckspielen (sonst zeigt das
+					# Widget beim Restore die Defaults, obwohl der Chart die
+					# gespeicherte Form nutzt).
+					style_obj = ctrl.get_style()
+					if isinstance(style_obj, MarkerStyle):
+						shape_key, size_key = self._style_sibling_keys(key, "marker")
+						if shape_key and shape_key in params_dict:
+							shp = str(params_dict.get(shape_key) or "circle")
+							if shp in MARKER_SHAPES:
+								style_obj.shape = shp
+						if size_key and size_key in params_dict:
+							try:
+								style_obj.size = int(params_dict.get(size_key))
+							except (TypeError, ValueError):
+								pass
+						ctrl.set_style(style_obj)
+					elif isinstance(style_obj, LineStyle):
+						style_key, width_key = self._style_sibling_keys(key, "line")
+						if style_key and style_key in params_dict:
+							stl = str(params_dict.get(style_key) or "solid")
+							if stl in LINE_STYLES:
+								style_obj.style = stl
+						if width_key and width_key in params_dict:
+							try:
+								style_obj.width = int(params_dict.get(width_key))
+							except (TypeError, ValueError):
+								pass
+						ctrl.set_style(style_obj)
 				elif isinstance(ctrl, QLineEdit) and isinstance(val, str):
 					ctrl.setText(val)
 
@@ -1730,8 +1882,9 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		"""Speichert das aktive Preset (generische Preset-Mechanik).
 
 		Implementierung: NamedItemActionsMixin.save_named_item() mit dem
-		Preset-Adapter (_PresetItemAdapter) – Namensdialog, 'Default'-Schutz,
-		Überschreiben-Rückfrage bei doppeltem Namen.
+		Preset-Adapter (_PresetItemAdapter) – Namensdialog, Überschreiben-
+		Rückfrage bei doppeltem Namen. 'Default' ist überschreibbar
+		(Anwender-Anweisung 06.08.2026).
 		"""
 		self.params = self.collect_params_from_ui()
 		self.save_named_item(
@@ -1744,7 +1897,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		"""Löscht das aktive Preset (generische Preset-Mechanik).
 
 		Implementierung: NamedItemActionsMixin.delete_named_item() mit dem
-		Preset-Adapter – 'Default'-Schutz, Rückfrage, danach nächstverfügbares
-		Preset laden.
+		Preset-Adapter – Rückfrage, danach nächstverfügbares Preset laden.
+		'Default' ist löschbar (Anwender-Anweisung 06.08.2026).
 		"""
 		self.delete_named_item(self._preset_adapter)
