@@ -361,3 +361,42 @@ Jeder aktive MA (1–8) wird als eigener Linien-Eintrag im `lines`-Array des Pay
 
 ---
 
+# Phase 16.05 – Implementierungs-Log: Multi-MA Prop-Fenster Layout (06.08.2026)
+
+> **Status:** Umsetzung **abgeschlossen** (Commit `d3e7f7e`, nach Benutzer-Freigabe im Bugfixing-Modus). Die vier Layout-Anforderungen am Multi-MA-Prop-Fenster sind behoben und per gezieltem Logik-Test in `test/test.py` (Teil 10, D7) verifiziert. Vorheriger Commit: `6cecb11`/`6566945` (Dialog-Bugfix + Doku).
+
+## Anwenderanforderungen (Bugfixing-Modus, 4 Layout-Punkte)
+
+1. **Preset-Box ganz oben links.**
+2. **Darunter immer zwei MA-Boxen nebeneinander** (1-2, 3-4, 5-6, 7-8).
+3. **Das Fenster ist immer nur etwas breiter als die zwei MA-Boxen nebeneinander.**
+4. **Das Fenster ist genauso hoch wie der untere Rand der MA-Boxen 7 und 8.**
+
+## Ausgangslage (Ist-Stand)
+
+- `_init_plugin_ui_params_only` baute eine linke Spalte (`QVBoxLayout`) mit allen Parameter-Boxen untereinander und platzierte die Preset-Box rechts daneben (rechte Spalte). Der Schließen-Button hing am Ende von `init_ui` (unterhalb des Inhalts).
+- **Problem 1/2:** Die MA-Boxen standen untereinander (eine Spalte), nicht paarweise nebeneinander.
+- **Problem 3:** Die Preset-Box war **508px breit** und stand in einer eigenen Grid-Spalte – dadurch wurde die Gesamtbreite auf ~800px aufgebläht (die zwei MA-Boxen brauchen nur ~684px). Gemessen: Fenster 800px vs. MA-Boxen 684px.
+- **Problem 4:** Der Schließen-Button unterhalb der Boxen + `_build_preset_group` rechts verlängerten das Fenster unter den unteren Rand von MA7/MA8.
+
+## Umsetzung (Commit `d3e7f7e`)
+
+`_init_plugin_ui_params_only` wurde auf ein **kompaktes `QGridLayout`** umgestellt:
+
+1. **Zeile 0 – Preset oben links + Schließen oben rechts:** Eine `QHBoxLayout`-Zeile, die über **beide** Spalten spannt (`addLayout(top_row, 0, 0, 1, 2, Qt.AlignTop)`): Preset-Box links, `addStretch(1)`, Schließen-Button rechts. Der Button sitzt damit oben rechts (Anforderung 1) – kein separates Element unterhalb mehr.
+2. **MA-Boxen in 2er-Zeilen:** Die Parameter-Boxen werden zunächst gesammelt (`rendered_groups`) und dann **paarweise** ins Grid gesetzt (`for i in range(0, len, 2)` → Zeile 1: MA1+MA2, Zeile 2: MA3+MA4, Zeile 3: MA5+MA6, Zeile 4: MA7+MA8). Anforderung 2.
+3. **Breite nur „etwas breiter" als 2 MA-Boxen:** Weil die Top-Zeile über beide Spalten spannt und `addStretch(1)` den Restplatz aufnimmt, verbreitert die 508px-Preset-Box das Grid **nicht** mehr. Die Spaltenbreiten bestimmen die MA-Boxen (`setColumnStretch(0/1, 1)` gleichmäßig). **Gemessen:** Fenster 712px vs. zwei MA-Boxen 684px (nur Fensterrahmen) – vorher 800px. Anforderung 3.
+4. **Höhe = unterer Rand MA7/MA8:** Nichts unterhalb der letzten Boxen-Zeile; `init_ui` fügt den Schließen-Button nur noch an, wenn er nicht bereits im Plugin-Grid platziert wurde (`_close_placed_in_plugin_ui`-Guard). Das `ContentScrollMixin` klemmt die Fenstergröße exakt auf den Inhalt → Fensterhöhe = unterer Rand von MA7/MA8. Anforderung 4.
+
+## Verifikation (F2, gezielter Logik-Test in `test/test.py` Teil 10, D7)
+
+- **D7 Grid-Layout gefunden:** `_init_plugin_ui_params_only` erzeugt ein `QGridLayout` im Inhalt. ✅
+- **D7 Preset oben links + Schließen oben rechts** (Zeile 0, HBox span 2). ✅
+- **D7 Kein separater Button unterhalb** (nur das Grid im Inhalt). ✅
+- **D7 MA-Boxen 2er-Zeilen:** Zeile 1 = MA 1 (Führung)+MA 2, Zeile 2 = MA 3+MA 4, Zeile 3 = MA 5+MA 6, Zeile 4 = MA 7+MA 8. ✅
+- **D7 Nichts unterhalb MA7/MA8** (Grid-Zeile 5 leer). ✅
+- **Geometrie-Messung (offscreen):** Fensterbreite 712px ≈ 2 MA-Boxen (684px) + Rahmen; Inhalt endet am unteren Rand 937px (MA7/MA8). ✅
+- **Zusätzlich:** `python -m py_compile` auf `chart/indicator_dialog.py` + `test/test.py` erfolgreich. Die 6 vorbestehenden Fehlschläge (P2/P5/H3–H5/H7, ServiceWindow) sind unverändert und **nicht** durch diese Änderung verursacht.
+
+---
+
