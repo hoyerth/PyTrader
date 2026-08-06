@@ -85,6 +85,12 @@ ROLE_SET_ID = Qt.UserRole + 1
 ROLE_INSTANCE_ID = Qt.UserRole + 2
 ROLE_PLUGIN_ID = Qt.UserRole + 3
 
+# 15.03-E (Multi-Select): Klickzone der Checkbox-Indikatoren in Spalte 0.
+# Klicks links dieser Zone (innerhalb der Item-Zeile) werden dem Qt-Default
+# ueberlassen, damit die Checkbox togglet (itemChanged feuert); Klicks
+# rechts davon togglen weiterhin das Auf-/Zuklappen (mousePressEvent).
+CHECKBOX_ZONE_WIDTH = 24
+
 #: Knotentypen
 TYPE_GROUP = "group"
 TYPE_SET = "set"
@@ -173,6 +179,10 @@ class MasterTree(QTreeWidget):
     # (ServiceWindow) ruft dieselbe Methode auf wie der Papierkorb-Button
     # in der Aktionsleiste (show_trash_dialog()).
     open_trash_requested = Signal()
+    # 15.03-E (Multi-Select): Checkbox-Zustand wurde geaendert (SELECT_MULTI).
+    # Der ServiceSelectorDialog lauscht darauf und baut sein rechter
+    # Read-Only-Parameter-Panel neu auf.
+    checked_changed = Signal()
     # 05.08.2026 (Ausfuehrungsdatum & Kontextmenue-Ausfuehrung):
     #   run_service_requested(set_id, instance_id) – '▶️ Diesen Service ausfuehren'
     #   run_set_requested(set_id)                   – '▶️ Alle Services ausfuehren'
@@ -230,8 +240,21 @@ class MasterTree(QTreeWidget):
         # dirty / clear_dirty_markers halten es aktuell).
         self._dirty_instance_ids: set = set()
 
+        # 15.03-E (Multi-Select): Checkbox-Modus (SELECT_MULTI, nur im
+        # ServiceSelectorDialog). _checked_items haelt die angehakten Knoten
+        # als (node_type, set_id, key_id)-Tupel – key_id = instance_id bei
+        # Services bzw. plugin_id bei Standalone-/Plugin-Zeilen. Der Zustand
+        # bleibt ueber data_changed-Baum-Neuaufbauten erhalten (analog zum
+        # Dirty-Set); Set-Knoten sind Tri-State und werden IMMER aus ihren
+        # Service-Kindern abgeleitet (kein eigener Key).
+        self._checkable: bool = False
+        self._checked_items: set = set()
+        self._updating_checks: bool = False
+
         self._populate()
         self.itemSelectionChanged.connect(self._emit_selection)
+        # 15.03-E: Checkbox-Aenderungen (Klick) -> Tri-State + Signal.
+        self.itemChanged.connect(self._on_item_changed)
         self.model.data_changed.connect(self._populate)
 
     # -------------------------------------------------------------------------
@@ -281,11 +304,20 @@ class MasterTree(QTreeWidget):
         # Baum-Aufbau anhaengen – setItemWidget() verlangt, dass das Item
         # bereits Teil des TreeWidgets ist (sonst kein sichtbarer Button).
         self._attach_item_buttons()
+        # 15.03-E (Multi-Select): _checked_items mit dem IST-Baum abgleichen
+        # (stale Keys geloeschter Services/Plugins entfernen).
+        self._sync_checked_from_tree()
         # Phase 15 (Dirty-State): Sternchen-Markierungen ungespeicherter
         # Parameter-Aenderungen nach einem Neuaufbau wieder anwenden
-        # (data_changed -> _populate wuerde sie sonst verlieren).
-        for iid in list(getattr(self, "_dirty_instance_ids", set())):
-            self._apply_dirty_label(iid, True)
+        # (data_changed -> _populate wuerde sie sonst verlieren). Waehrend
+        # dessen ist die Checkbox-Verarbeitung gesperrt (die Text-Aenderung
+        # wuerde sonst ein spurious checked_changed emittieren).
+        self._updating_checks = True
+        try:
+            for iid in list(getattr(self, "_dirty_instance_ids", set())):
+                self._apply_dirty_label(iid, True)
+        finally:
+            self._updating_checks = False
 
     def _safe_current_selection(self) -> Dict[str, str]:
         """Liess die aktuelle Auswahl defensiv (isValid-Guard gegen zerstoerte
@@ -324,6 +356,11 @@ class MasterTree(QTreeWidget):
         set_item.setData(0, ROLE_NODE_TYPE, TYPE_SET)
         set_item.setData(0, ROLE_SET_ID, child.get("set_id") or "")
         set_item.setToolTip(0, f"Service-Set: {child.get('set_id') or '?'}")
+        # 15.03-E (Multi-Select): Set-Knoten anhakbar – der Tri-State wird
+        # NACH dem Anhaengen der Service-Kinder aus deren Zustaenden
+        # abgeleitet (_apply_set_state).
+        if self._checkable:
+            set_item.setFlags(set_item.flags() | Qt.ItemIsUserCheckable)
         # Bugfix 05.08.2026: Gehoert das Set einem Indikator, traegt der
         # Info-Button (Spalte 1) den Tooltip 'aktiv/im <Indikator>' (siehe
         # _apply_set_badge und _attach_item_buttons).
@@ -344,8 +381,20 @@ class MasterTree(QTreeWidget):
             svc_item.setData(0, ROLE_SET_ID, child.get("set_id") or "")
             svc_item.setData(0, ROLE_INSTANCE_ID, svc.get("instance_id") or "")
             svc_item.setData(0, ROLE_PLUGIN_ID, plugin_id)
+            # 15.03-E (Multi-Select): Service-Knoten anhakbar – Zustand aus
+            # _checked_items re-applizieren (bleibt ueber Neuaufbauten erhalten).
+            if self._checkable:
+                svc_item.setFlags(svc_item.flags() | Qt.ItemIsUserCheckable)
+                key = (TYPE_SERVICE,
+                       str(child.get("set_id") or ""),
+                       str(svc.get("instance_id") or ""))
+                state = (Qt.Checked if key in self._checked_items
+                         else Qt.Unchecked)
+                svc_item.setData(0, Qt.CheckStateRole, state)
             self._apply_badge(svc_item, plugin_id, svc.get("badge") or "")
             set_item.addChild(svc_item)
+        if self._checkable:
+            self._apply_set_state(set_item)
         return set_item
 
     def _build_plugin_item(self, child: Dict[str, Any],
@@ -360,6 +409,14 @@ class MasterTree(QTreeWidget):
         plugin_item.setData(0, ROLE_NODE_TYPE, TYPE_PLUGIN)
         plugin_item.setData(0, ROLE_SET_ID, group)
         plugin_item.setData(0, ROLE_PLUGIN_ID, pid)
+        # 15.03-E (Multi-Select): Standalone-/Plugin-Zeilen anhakbar
+        # (feature_id des Feature-Store IST die plugin_id).
+        if self._checkable:
+            plugin_item.setFlags(plugin_item.flags() | Qt.ItemIsUserCheckable)
+            key = (TYPE_PLUGIN, "", pid)
+            state = (Qt.Checked if key in self._checked_items
+                     else Qt.Unchecked)
+            plugin_item.setData(0, Qt.CheckStateRole, state)
         self._apply_badge(plugin_item, pid, child.get("badge") or "")
         return plugin_item
 
@@ -512,6 +569,263 @@ class MasterTree(QTreeWidget):
                 break
         except (RuntimeError, AttributeError):
             pass
+
+    # -------------------------------------------------------------------------
+    # 15.03-E (Multi-Select): Checkbox-Modus (ServiceSelectorDialog)
+    # -------------------------------------------------------------------------
+
+    def set_checkable(self, checkable: bool) -> None:
+        """Schaltet den Checkbox-Modus ein/aus (SELECT_MULTI).
+
+        Im Normalbetrieb (FULL_EDIT, ServiceWindow) ist der Baum NICHT
+        anhakbar – `set_checkable(True)` aktiviert die Checkboxen fuer den
+        ServiceSelectorDialog und baut den Baum neu auf (Zustand beginnt
+        leer). `set_checkable(False)` deaktiviert und leert den Zustand.
+        """
+        checkable = bool(checkable)
+        if checkable == self._checkable:
+            return
+        self._checkable = checkable
+        if not checkable:
+            self._checked_items.clear()
+        self._populate()
+
+    def _on_item_changed(self, item, column: int) -> None:
+        """Aktualisiert die Checkbox-Zustaende (15.03-E, SELECT_MULTI).
+
+        itemChanged feuert bei JEDER Daten-Aenderung eines Items; die Guards
+        (`_checkable`, `_updating_checks`, Knotentyp) halten den Handler
+        schlank. Set-Knoten propagieren ihren Zustand auf alle Service-
+        Kinder; der Tri-State der Sets wird IMMER aus den Kindern abgeleitet
+        (Qt bietet in QTreeWidget keine automatische Synchronisation).
+        """
+        if column != 0 or not self._checkable or self._updating_checks:
+            return
+        if item is None or not isValid(item):
+            return
+        node_type = item.data(0, ROLE_NODE_TYPE)
+        if node_type not in (TYPE_SET, TYPE_SERVICE, TYPE_PLUGIN):
+            return
+        self._updating_checks = True
+        try:
+            state = item.checkState(0)
+            if node_type == TYPE_SERVICE:
+                key = (TYPE_SERVICE,
+                       str(item.data(0, ROLE_SET_ID) or ""),
+                       str(item.data(0, ROLE_INSTANCE_ID) or ""))
+                if state == Qt.Checked:
+                    self._checked_items.add(key)
+                else:
+                    self._checked_items.discard(key)
+                parent = item.parent()
+                if parent is not None and isValid(parent):
+                    self._apply_set_state(parent)
+            elif node_type == TYPE_PLUGIN:
+                key = (TYPE_PLUGIN, "",
+                       str(item.data(0, ROLE_PLUGIN_ID) or ""))
+                if state == Qt.Checked:
+                    self._checked_items.add(key)
+                else:
+                    self._checked_items.discard(key)
+            elif node_type == TYPE_SET:
+                set_id = str(item.data(0, ROLE_SET_ID) or "")
+                for i in range(item.childCount()):
+                    child = item.child(i)
+                    if child is None or not isValid(child):
+                        continue
+                    if child.data(0, ROLE_NODE_TYPE) != TYPE_SERVICE:
+                        continue
+                    key = (TYPE_SERVICE, set_id,
+                           str(child.data(0, ROLE_INSTANCE_ID) or ""))
+                    if state == Qt.Checked:
+                        self._checked_items.add(key)
+                        child.setData(0, Qt.CheckStateRole, Qt.Checked)
+                    else:
+                        self._checked_items.discard(key)
+                        child.setData(0, Qt.CheckStateRole, Qt.Unchecked)
+                self._apply_set_state(item)
+            self.checked_changed.emit()
+        finally:
+            self._updating_checks = False
+
+    def _apply_set_state(self, set_item) -> None:
+        """Setzt den Tri-State eines Set-Knotens aus seinen Service-Kindern.
+
+        Checked = alle Kinder gecheckt, PartiallyChecked = gemischt,
+        Unchecked = keines. Sets ohne Service-Kinder sind Unchecked.
+        """
+        if set_item is None or not isValid(set_item):
+            return
+        if not self._checkable:
+            return
+        checked = 0
+        total = 0
+        for i in range(set_item.childCount()):
+            child = set_item.child(i)
+            if child is None or not isValid(child):
+                continue
+            if child.data(0, ROLE_NODE_TYPE) != TYPE_SERVICE:
+                continue
+            total += 1
+            if child.checkState(0) == Qt.Checked:
+                checked += 1
+        if total > 0 and checked == total:
+            state = Qt.Checked
+        elif checked > 0:
+            state = Qt.PartiallyChecked
+        else:
+            state = Qt.Unchecked
+        set_item.setData(0, Qt.CheckStateRole, state)
+
+    def _sync_checked_from_tree(self) -> None:
+        """Gleicht `_checked_items` mit dem IST-Baum ab (stale Keys raus).
+
+        Wird am Ende von `_populate()` gerufen: Nach einem Neuaufbau haelt
+        das Set nur noch Keys tatsaechlich vorhandener, angehakter Knoten
+        (geloeschte Sets/Services/Plugins verschwinden automatisch).
+        """
+        if not self._checkable:
+            return
+        synced: set = set()
+        for item in TreeItemIterator(self):
+            if item is None or not isValid(item):
+                continue
+            if item.checkState(0) != Qt.Checked:
+                continue
+            node_type = item.data(0, ROLE_NODE_TYPE)
+            if node_type == TYPE_SERVICE:
+                synced.add((TYPE_SERVICE,
+                            str(item.data(0, ROLE_SET_ID) or ""),
+                            str(item.data(0, ROLE_INSTANCE_ID) or "")))
+            elif node_type == TYPE_PLUGIN:
+                synced.add((TYPE_PLUGIN, "",
+                            str(item.data(0, ROLE_PLUGIN_ID) or "")))
+        self._checked_items = synced
+
+    def checked_services(self) -> List[Dict[str, str]]:
+        """Alle angehakten Service-/Plugin-Knoten (deterministisch sortiert).
+
+        Returns:
+            Pro Eintrag: {"node_type", "set_id", "instance_id", "plugin_id"}.
+            Bei Service-Knoten ist instance_id die Set-Instanz; bei
+            Standalone-/Plugin-Zeilen ist plugin_id gesetzt (set_id/instance_id
+            leer).
+        """
+        result: List[Dict[str, str]] = []
+        for node_type, set_id, key_id in sorted(self._checked_items):
+            if node_type == TYPE_SERVICE:
+                cfg = self.model.find_service(set_id, key_id) or {}
+                result.append({
+                    "node_type": TYPE_SERVICE,
+                    "set_id": set_id,
+                    "instance_id": key_id,
+                    "plugin_id": str(cfg.get("plugin_id") or key_id),
+                })
+            elif node_type == TYPE_PLUGIN:
+                result.append({
+                    "node_type": TYPE_PLUGIN,
+                    "set_id": "",
+                    "instance_id": "",
+                    "plugin_id": key_id,
+                })
+        return result
+
+    def checked_feature_ids(self) -> List[str]:
+        """Deduplizierte plugin_ids aller Haken (SQL-Vertrag `IN (...)`).
+
+        Mehrere Services mit derselben plugin_id (z. B. grid_1 + grid_2)
+        ergeben EINEN feature_id-Eintrag ('grid_lines').
+        """
+        ids: List[str] = []
+        for entry in self.checked_services():
+            pid = entry["plugin_id"]
+            if pid and pid not in ids:
+                ids.append(pid)
+        return ids
+
+    def checked_display_names(self) -> List[str]:
+        """Lesbare Namen fuer die Button-Anzeige (Top-Bar).
+
+        Set-Services: '<Set-Anzeigename>/<instance_id>'
+        (z. B. 'Mein Scalper/prox_1'); Standalone-/Plugin-Zeilen: plugin_id
+        (z. B. 'proximity').
+        """
+        names: List[str] = []
+        for entry in self.checked_services():
+            if entry["node_type"] == TYPE_SERVICE:
+                s = self.model.find_set(entry["set_id"]) or {}
+                set_name = s.get("display_name") or entry["set_id"] or "?"
+                names.append(f"{set_name}/{entry['instance_id']}")
+            else:
+                names.append(entry["plugin_id"])
+        return names
+
+    def clear_checks(self) -> None:
+        """Entfernt ALLE Checkbox-Haken (Dialog-'Filter entfernen').
+
+        Set-Knoten werden mit ihren Service-Kindern zurueckgesetzt; das
+        Signal `checked_changed` wird anschliessend emittiert.
+        """
+        if not self._checkable:
+            return
+        self._updating_checks = True
+        try:
+            self._checked_items.clear()
+            for item in TreeItemIterator(self):
+                if item is None or not isValid(item):
+                    continue
+                if item.data(0, ROLE_NODE_TYPE) in (TYPE_SET, TYPE_SERVICE,
+                                                    TYPE_PLUGIN):
+                    item.setData(0, Qt.CheckStateRole, Qt.Unchecked)
+        finally:
+            self._updating_checks = False
+        self.checked_changed.emit()
+
+    def set_checked_feature_ids(self, feature_ids) -> None:
+        """Setzt die Haken anhand von plugin_ids (Reverse-Mapping).
+
+        Wird beim Oeffnen des Dialogs aufgerufen, damit die aktuelle
+        ViewModel-Auswahl (Profil/Filter) im Baum widergespiegelt wird.
+        Matcht Services ueber ihre plugin_id UND Standalone-/Plugin-Zeilen;
+        nicht gematchte Haken werden entfernt.
+        """
+        if not self._checkable:
+            return
+        wanted = {str(f).strip().lower() for f in (feature_ids or []) if str(f).strip()}
+        self._updating_checks = True
+        try:
+            self._checked_items.clear()
+            for item in TreeItemIterator(self):
+                if item is None or not isValid(item):
+                    continue
+                node_type = item.data(0, ROLE_NODE_TYPE)
+                if node_type == TYPE_SERVICE:
+                    set_id = str(item.data(0, ROLE_SET_ID) or "")
+                    instance_id = str(item.data(0, ROLE_INSTANCE_ID) or "")
+                    cfg = self.model.find_service(set_id, instance_id) or {}
+                    pid = str(cfg.get("plugin_id") or instance_id)
+                    checked = pid.lower() in wanted
+                    if checked:
+                        self._checked_items.add((TYPE_SERVICE, set_id,
+                                                 instance_id))
+                    item.setData(0, Qt.CheckStateRole,
+                                 Qt.Checked if checked else Qt.Unchecked)
+                elif node_type == TYPE_PLUGIN:
+                    pid = str(item.data(0, ROLE_PLUGIN_ID) or "")
+                    checked = pid.lower() in wanted
+                    if checked:
+                        self._checked_items.add((TYPE_PLUGIN, "", pid))
+                    item.setData(0, Qt.CheckStateRole,
+                                 Qt.Checked if checked else Qt.Unchecked)
+            # Tri-States der Sets aus den Kindern ableiten
+            for item in TreeItemIterator(self):
+                if item is None or not isValid(item):
+                    continue
+                if item.data(0, ROLE_NODE_TYPE) == TYPE_SET:
+                    self._apply_set_state(item)
+        finally:
+            self._updating_checks = False
+        self.checked_changed.emit()
 
     # -------------------------------------------------------------------------
     # Kontextmenue (Bugfix 05.08.2026, entkoppelt)
@@ -697,12 +1011,27 @@ class MasterTree(QTreeWidget):
         (setExpandsOnDoubleClick(False)). Klicks auf Blatt-Knoten verhalten
         sich normal (Selektion). Das Symbol aktualisiert sich automatisch
         ueber itemExpanded/itemCollapsed (_refresh_expand_label).
+
+        Erweiterung 15.03-E (Multi-Select): Klicks in die Checkbox-Zone
+        (CHECKBOX_ZONE_WIDTH, linke Kante der Item-Zeile in Spalte 0) werden
+        dem Qt-Default ueberlassen, damit die Checkbox togglet
+        (itemChanged feuert); nur Klicks rechts der Zone togglen das
+        Auf-/Zuklappen.
         """
         try:
             pos = (event.position().toPoint() if hasattr(event, "position")
                    else event.pos())
             item = self.itemAt(pos)
-            if item is not None and isValid(item) and item.childCount() > 0:
+            if item is None or not isValid(item):
+                super().mousePressEvent(event)
+                return
+            # Checkbox-Klick hat Vorrang vor dem Expand-Toggle
+            if self._checkable and (item.flags() & Qt.ItemIsUserCheckable):
+                rect = self.visualItemRect(item)
+                if pos.x() < rect.left() + CHECKBOX_ZONE_WIDTH:
+                    super().mousePressEvent(event)
+                    return
+            if item.childCount() > 0:
                 item.setExpanded(not item.isExpanded())
                 # Selektierbare Knoten (Sets) trotzdem auswaehlen, damit die
                 # Auswahl-API (current_set_id/current_service_id) funktioniert.

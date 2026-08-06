@@ -136,26 +136,33 @@ class AnalyticsAsyncWorker(QThread):
         p = self._params
         symbol = str(p.get("symbol", "") or "")
         timeframe = str(p.get("timeframe", "") or "")
-        feature_id = p.get("feature_id")
+        # 15.03-E (Multi-Select): feature_ids (Liste) bevorzugt; Legacy-
+        # Einzelwert feature_id dient als Fallback (Alt-Aufrufer/Profil).
+        feature_ids = p.get("feature_ids")
+        if not feature_ids and p.get("feature_id"):
+            feature_ids = [p["feature_id"]]
 
         if self._query_kind == QUERY_TABLE:
             return repo.get_table(
                 symbol, timeframe,
-                feature_id=feature_id,
+                feature_id=p.get("feature_id"),
+                feature_ids=feature_ids,
                 limit=cap_lookback_limit(p.get("limit")),
             )
         if self._query_kind == QUERY_HEATMAP:
             return repo.get_heatmap(
                 symbol, timeframe,
                 metric=str(p.get("metric", "count") or "count"),
-                feature_id=feature_id,
+                feature_id=p.get("feature_id"),
+                feature_ids=feature_ids,
             )
         if self._query_kind == QUERY_SCATTER:
             return repo.get_scatter(
                 symbol, timeframe,
                 x_column=str(p.get("x_column", "ema_diff") or "ema_diff"),
                 y_column=str(p.get("y_column", "rsi_14") or "rsi_14"),
-                feature_id=feature_id,
+                feature_id=p.get("feature_id"),
+                feature_ids=feature_ids,
                 limit=cap_lookback_limit(p.get("limit")),
             )
         if self._query_kind == QUERY_DISTRIBUTION:
@@ -163,7 +170,8 @@ class AnalyticsAsyncWorker(QThread):
                 symbol, timeframe,
                 column=str(p.get("column", "atr_normalized") or "atr_normalized"),
                 bins=p.get("bins", 20),
-                feature_id=feature_id,
+                feature_id=p.get("feature_id"),
+                feature_ids=feature_ids,
                 limit=cap_lookback_limit(p.get("limit")),
             )
         if self._query_kind == QUERY_FEATURES:

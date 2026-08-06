@@ -94,6 +94,30 @@ class FeatureStoreReader:
             return int(bar_time.timestamp())
         return int(bar_time)
 
+    @staticmethod
+    def _apply_feature_filter(
+        feature_ids: Optional[List[str]],
+        feature_id: Optional[str],
+        conditions: List[str],
+        params: List[Any],
+    ) -> None:
+        """Erweitert WHERE um einen feature_id-Filter (IN-Clause bzw. Einzel-ID).
+
+        15.03-E (Multi-Select): Bevorzugt wird `feature_ids` – die
+        Analytics-Engine filtert per `WHERE feature_id IN (...)` ueber alle
+        gewaehlten Datenquellen. Der Legacy-Parameter `feature_id` bleibt
+        fuer Alt-Aufrufer (z. B. test/check_p15_s4_infra.py) erhalten.
+        Leere Liste/None = KEIN Filter (alle Rows).
+        """
+        ids = [str(i) for i in (feature_ids or []) if str(i).strip()]
+        if ids:
+            placeholders = ", ".join("?" for _ in ids)
+            conditions.append(f"feature_id IN ({placeholders})")
+            params.extend(ids)
+        elif feature_id:
+            conditions.append("feature_id = ?")
+            params.append(feature_id)
+
     # ------------------------------------------------------------------
     # Lesen: Roh-Zeilen
     # ------------------------------------------------------------------
@@ -102,6 +126,7 @@ class FeatureStoreReader:
         symbol: str,
         timeframe: str,
         feature_id: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Liefert Feature-Store-Zeilen als Dicts (zeilen-aufwaerts sortiert).
@@ -117,7 +142,9 @@ class FeatureStoreReader:
         Args:
             symbol: Symbol-Name (case-insensitive)
             timeframe: Timeframe (case-insensitive)
-            feature_id: Optionaler Filter auf die Plugin-ID
+            feature_id: Optionaler Einzel-Filter auf die Plugin-ID (Legacy)
+            feature_ids: Optionaler Multi-Filter (15.03-E) – filtert per
+                `feature_id IN (...)`. Leere Liste/None = kein Filter.
             limit: Maximale Anzahl Zeilen (Default 1000)
         """
         if not symbol or not timeframe:
@@ -126,9 +153,7 @@ class FeatureStoreReader:
             limit = 1000
         conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
         params: List[Any] = [symbol, timeframe]
-        if feature_id:
-            conditions.append("feature_id = ?")
-            params.append(feature_id)
+        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
 
         con = self._get_connection()
         try:
@@ -186,6 +211,7 @@ class FeatureStoreReader:
         timeframe: str,
         columns: List[str],
         feature_id: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> List[Dict[str, float]]:
         """Liefert nur die angeforderten nativen Spalten (non-null).
@@ -193,7 +219,9 @@ class FeatureStoreReader:
         Args:
             symbol/timeframe: Filter (case-insensitive)
             columns: Nur native Spalten (ema_diff, rsi_14, atr_normalized)
-            feature_id: Optionaler Plugin-Filter
+            feature_id: Optionaler Einzel-Filter auf die Plugin-ID (Legacy)
+            feature_ids: Optionaler Multi-Filter (15.03-E) per
+                `feature_id IN (...)`. Leere Liste/None = kein Filter.
             limit: Maximale Zeilen (Default 1000)
 
         Returns:
@@ -210,9 +238,7 @@ class FeatureStoreReader:
         col_sql = ", ".join(f'"{c}"' for c in valid)
         conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
         params: List[Any] = [symbol, timeframe]
-        if feature_id:
-            conditions.append("feature_id = ?")
-            params.append(feature_id)
+        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
 
         con = self._get_connection()
         try:
@@ -251,6 +277,7 @@ class FeatureStoreReader:
         timeframe: str,
         metric: str = "count",
         feature_id: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Aggregiert eine 2D-Matrix (X: Wochentage, Y: Tagesstunden).
@@ -265,7 +292,9 @@ class FeatureStoreReader:
             symbol/timeframe: Filter (case-insensitive)
             metric: "count" (Anzahl Zeilen je Zelle) ODER eine native Spalte
                 (ema_diff, rsi_14, atr_normalized) -> AVG je Zelle.
-            feature_id: Optionaler Plugin-Filter
+            feature_id: Optionaler Einzel-Filter auf die Plugin-ID (Legacy)
+            feature_ids: Optionaler Multi-Filter (15.03-E) per
+                `feature_id IN (...)`. Leere Liste/None = kein Filter.
             limit: Optionaler Deckel (nur fuer konsistente Semantik; die
                 Aggregation erfolgt in SQL ueber den Filter).
 
@@ -298,9 +327,7 @@ class FeatureStoreReader:
 
         conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
         params: List[Any] = [symbol, timeframe]
-        if feature_id:
-            conditions.append("feature_id = ?")
-            params.append(feature_id)
+        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
 
         con = self._get_connection()
         try:
@@ -469,6 +496,7 @@ class FeatureStoreReader:
         symbol: str,
         timeframe: str,
         feature_id: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
     ) -> Optional[int]:
         """Neuester Wanduhr-Epoch (int) der Feature-Rows (oder None).
 
@@ -476,14 +504,15 @@ class FeatureStoreReader:
         Ein Klick auf einen Punkt/eine Zelle oeffnet das Chart-Fenster an der
         zugehoerigen Bar-Position. Wanduhr-Garantie: EXTRACT('epoch') liefert
         exakt die gespeicherte Wanduhr-Epoch (Invariante 7).
+
+        15.03-E (Multi-Select): Ueber `feature_ids` wird der neueste
+        bar_time ueber ALLE gewaehlten Datenquellen gesucht (OR-Semantik).
         """
         if not symbol or not timeframe:
             return None
         conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
         params: List[Any] = [symbol, timeframe]
-        if feature_id:
-            conditions.append("feature_id = ?")
-            params.append(feature_id)
+        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
         con = self._get_connection()
         try:
             row = con.execute(f"""
@@ -506,6 +535,7 @@ class FeatureStoreReader:
         dow: int,
         hour: int,
         feature_id: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
     ) -> Optional[int]:
         """Neuester Wanduhr-Epoch einer (dow, hour)-Heatmap-Zelle (oder None).
 
@@ -514,6 +544,9 @@ class FeatureStoreReader:
         Feature-Bar dieser Zelle. DOW/HOUR werden mit
         `bar_time AT TIME ZONE 'UTC'` extrahiert (Wanduhr-Garantie,
         Invariante 7 – identisch zu fetch_heatmap).
+
+        15.03-E (Multi-Select): Ueber `feature_ids` wird die Zelle ueber
+        ALLE gewaehlten Datenquellen abgefragt (OR-Semantik).
         """
         if not symbol or not timeframe:
             return None
@@ -531,9 +564,7 @@ class FeatureStoreReader:
             "EXTRACT(HOUR FROM bar_time AT TIME ZONE 'UTC')::INTEGER = ?",
         ]
         params: List[Any] = [symbol, timeframe, dow, hour]
-        if feature_id:
-            conditions.append("feature_id = ?")
-            params.append(feature_id)
+        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
         con = self._get_connection()
         try:
             row = con.execute(f"""

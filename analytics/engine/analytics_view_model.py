@@ -81,7 +81,9 @@ class AnalyticsViewModel(QObject):
         self._params: Dict[str, Any] = {
             "symbol": "",
             "timeframe": "M1",
-            "feature_id": None,
+            # 15.03-E (Multi-Select): feature_ids = Liste der plugin_ids
+            # (Datenquellen-Filter, `WHERE feature_id IN (...)`); leer = alle.
+            "feature_ids": [],
             "heatmap_metric": "count",
             "scatter_x": "ema_diff",
             "scatter_y": "rsi_14",
@@ -161,9 +163,36 @@ class AnalyticsViewModel(QObject):
                          QUERY_DISTRIBUTION, QUERY_FEATURES))
 
     def set_feature_id(self, feature_id: Optional[str]) -> None:
-        self._set_param("feature_id", feature_id or None,
-                        (QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
-                         QUERY_DISTRIBUTION))
+        """Kompatibilitaets-Alias (Legacy): Einzel-ID -> Multi-Liste."""
+        self.set_feature_ids([feature_id] if feature_id else [])
+
+    def set_feature_ids(self, feature_ids) -> None:
+        """Setzt die Multi-Auswahl der Datenquellen (15.03-E).
+
+        `feature_ids` sind die plugin_ids des Feature-Store (z. B.
+        ["grid_lines", "proximity"]); leer = kein Filter (alle Features).
+        Typen-/Duplikat-normalisiert; ohne Aenderung wird kein Refresh
+        ausgeloest (idempotent, wie set_symbol/set_timeframe).
+        """
+        ids = self._normalize_feature_ids(feature_ids)
+        if ids == self._params.get("feature_ids"):
+            return
+        self._params["feature_ids"] = ids
+        self._mark_dirty()
+        self._refresh((QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
+                       QUERY_DISTRIBUTION))
+
+    @staticmethod
+    def _normalize_feature_ids(value) -> List[str]:
+        """Normalisiert feature_ids (Liste[str], dedupliziert, getrimmt)."""
+        if not value:
+            return []
+        out: List[str] = []
+        for v in value:
+            s = str(v).strip()
+            if s and s not in out:
+                out.append(s)
+        return out
 
     def set_heatmap_metric(self, metric: str) -> None:
         self._set_param("heatmap_metric", str(metric or "count"),
@@ -269,7 +298,7 @@ class AnalyticsViewModel(QObject):
         base: Dict[str, Any] = {
             "symbol": p["symbol"],
             "timeframe": p["timeframe"],
-            "feature_id": p["feature_id"],
+            "feature_ids": p["feature_ids"],
         }
         if kind == QUERY_TABLE:
             base["limit"] = p["limit"]
@@ -413,6 +442,13 @@ class AnalyticsViewModel(QObject):
         for key in list(self._params.keys()):
             if key in payload and payload[key] is not None:
                 self._params[key] = payload[key]
+        # 15.03-E (Profil-Migration): Alt-Payloads speicherten den Filter als
+        # Einzelwert `feature_id` (String) – in `feature_ids` (Liste) wandeln.
+        if "feature_ids" not in payload and payload.get("feature_id"):
+            self._params["feature_ids"] = self._normalize_feature_ids(
+                [payload["feature_id"]])
+        self._params["feature_ids"] = self._normalize_feature_ids(
+            self._params.get("feature_ids"))
         self._params["bins"] = self._clamp_bins(self._params.get("bins"))
         self._params["limit"] = self._clamp_limit(self._params.get("limit"))
         if not mark_dirty:
@@ -444,7 +480,8 @@ class AnalyticsViewModel(QObject):
         im ViewModel).
         """
         return self._repo.get_latest_bar_time(
-            symbol, timeframe, feature_id=self._params.get("feature_id")
+            symbol, timeframe,
+            feature_ids=self._params.get("feature_ids"),
         )
 
     def resolve_recent_bar_time_for_cell(
@@ -457,7 +494,7 @@ class AnalyticsViewModel(QObject):
         """
         return self._repo.get_recent_bar_time_for_cell(
             symbol, timeframe, dow, hour,
-            feature_id=self._params.get("feature_id"),
+            feature_ids=self._params.get("feature_ids"),
         )
 
     # ------------------------------------------------------------------

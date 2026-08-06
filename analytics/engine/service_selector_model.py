@@ -481,3 +481,36 @@ class ServiceSelectorModel(QObject):
         if not s:
             return None
         return (s.get("services") or {}).get(instance_id)
+
+    # ------------------------------------------------------------------
+    # 15.03-E (Multi-Select): Anzeigenamen zu feature_ids (Reverse-Mapping)
+    # ------------------------------------------------------------------
+    def resolve_display_names(self, feature_ids) -> List[str]:
+        """Leitbare Anzeigenamen zu plugin_ids (Fallback: die id selbst).
+
+        Wird vom AnalyticsWindow genutzt, wenn nach einem Profilwechsel nur
+        die persistierten feature_ids (plugin_ids) vorliegen, aber keine
+        display_names (der Dialog wurde nicht geoeffnet). Matcht Set-Services
+        deterministisch (erster Treffer in Set-Reihenfolge) und liefert
+        '<Set-Anzeigename>/<instance_id>'; ohne Treffer die plugin_id.
+        """
+        names: List[str] = []
+        for fid in feature_ids or []:
+            target = str(fid).strip().lower()
+            if not target:
+                continue
+            found: Optional[str] = None
+            for s in self._sets:
+                services = s.get("services") or {}
+                for iid, cfg in services.items():
+                    if not isinstance(cfg, dict):
+                        continue
+                    pid = str(cfg.get("plugin_id") or iid).strip().lower()
+                    if pid == target:
+                        set_name = s.get("display_name") or s.get("set_id") or "?"
+                        found = f"{set_name}/{iid}"
+                        break
+                if found:
+                    break
+            names.append(found if found else str(fid))
+        return names

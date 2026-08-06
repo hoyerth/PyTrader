@@ -12,6 +12,11 @@ Konfigurierbares PySide6-Widget mit zwei Betriebsmodi:
     05.08.2026 OHNE Aktions-Toolbar: die CRUD-/Order-Buttons oberhalb des
     Baums sind entfernt – der MasterTree hat die volle vertikale Hoehe der
     linken Spalte und alle Struktur-Aktionen laufen ueber das Kontextmenue.
+  * Modus C (SELECT_MULTI): MasterTree mit Checkboxen (15.03-E) – alle Set-,
+    Service-, Standalone- und Plugin-Knoten sind anhakbar; wird vom
+    `ServiceSelectorDialog` (Analytics-Datenquellen) eingebettet. Die
+    Auswahl-API (`checked_services`/`checked_feature_ids`/...) liegt im
+    MasterTree.
 
 Beide Modi werden ausschliesslich aus dem `ServiceSelectorModel` befuellt
 (lesendes Datenmodell, EventBus-Live-Sync, Invariante 4/5).
@@ -34,6 +39,9 @@ class ServiceSelectorWidget(QWidget):
     #: Betriebsmodi
     MODE_SELECT_ONLY = "SELECT_ONLY"
     MODE_FULL_EDIT = "FULL_EDIT"
+    # 15.03-E: Multi-Select (Checkbox-MasterTree) fuer den
+    # ServiceSelectorDialog (Analytics-Datenquellen).
+    MODE_SELECT_MULTI = "SELECT_MULTI"
 
     #: Emittiert (set_id, service_id) – service_id leer, wenn nur ein Set
     #: gewaehlt wurde (bzw. in SELECT_ONLY ohne aktives Set).
@@ -80,8 +88,26 @@ class ServiceSelectorWidget(QWidget):
 
         if mode == self.MODE_FULL_EDIT:
             self._build_full_edit()
+        elif mode == self.MODE_SELECT_MULTI:
+            self._build_select_multi()
         else:
             self._build_select_only()
+
+    def _build_select_multi(self) -> None:
+        """Modus C (15.03-E): MasterTree mit Checkboxen (Multi-Select).
+
+        Fuer den ServiceSelectorDialog (Analytics-Datenquellen): Alle Set-,
+        Service-, Standalone- und Plugin-Knoten sind anhakbar
+        (MasterTree.set_checkable(True)). Kein CRUD-/Run-Kontextmenue –
+        der Dialog zeigt ausschliesslich die Auswahl + Read-Only-Parameter.
+        """
+        self.master_tree = MasterTree(self.model, parent=self)
+        self.master_tree.set_checkable(True)
+        self._layout.addWidget(self.master_tree, 1)
+
+        self.master_tree.selection_changed.connect(self.selection_changed)
+        # Bugfix 05.08.2026: Info-Button-Klicks im MasterTree re-emittieren.
+        self.master_tree.info_requested.connect(self.info_requested)
 
     def _build_select_only(self) -> None:
         """Modus A: kompakte Set-/Service-Combos."""

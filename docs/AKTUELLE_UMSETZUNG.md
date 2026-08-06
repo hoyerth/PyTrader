@@ -32,105 +32,51 @@ Ziel von **Phase 15** ist die Weiterentwicklung der Service-UI (`service_win.py`
 
 ---
 
- # TASK: Phase 15.03-E – Popover-ServiceSelector im AnalyticsWindow (ÜBERARBEITET 06.08.2026)
+ # TASK: Phase 15.03-E – Wiederverwendbare Service-Auswahl im AnalyticsWindow (Multi-Select & Popover)
 
- > **Ist-Analyse 06.08.2026 (Code-konsistente Korrektur):**
- > Der Ursprungsentwurf referenzierte ein nicht existentes `SelectorMode`-Enum,
- > einen `MasterTree` im `SELECT_ONLY`-Modus und eine `ParameterPanel`-Klasse
- > (entfernt, `.backup_parameter_panel` leer). Real:
- > * `ServiceSelectorWidget.MODE_SELECT_ONLY` (String-Konstante) baut eine
- >   KOMPAKTE DROPDOWN-Zeile (Set-Combo + Service-Combo), KEINEN Tree.
- > * Parameter-Anzeige baut `ServiceParamColumnsMixin._build_service_column()`
- >   (eine QGroupBox-Spalte je Service) – es gibt keine `set_service()`-API.
- > * `AnalyticsWindow` hat BEREITS ein Feature-Filter-Dropdown (`combo_feature`).
- > **Entscheidung (User, 06.08.2026):** Das Popover ERSETZT `combo_feature` –
- > keine Doppelsteuerung von `AnalyticsViewModel.set_feature_id()`.
+Bitte ersetze die alten Analytics-Dropdowns durch die Wiederverwendung des bestehenden `ServiceSelectorWidget` im Popover/Dialog-Modus:
 
- Bitte binde das `ServiceSelectorWidget` (Modus `MODE_SELECT_ONLY`) als
- platzsparendes Top-Bar-Popover im `AnalyticsWindow` (`analytics/ui/analytics_win.py`)
- ein und ersetze das bestehende Feature-Filter-Dropdown:
+---
 
- ---
+### 1. Erstellung `ServiceSelectorDialog` (`serviceui/service_selector_dialog.py`)
+1. **Wiederverwendung des bestehenden Widgets:**
+   - Erstelle eine Dialog/Popover-Klasse `ServiceSelectorDialog(QDialog)`, die das bereits existierende `ServiceSelectorWidget` einbettet (DRY-Prinzip).
+   - Konfiguriere das `ServiceSelectorWidget` im Modus `SELECT_MULTI`:
+     * **Links:** `MasterTree` mit **Checkboxes (`[x]`)** an allen Set- und Service-Knoten.
+     * **Rechts:** `ParameterPanel` im Read-Only-Modus (`setEnabled(False)`).
+2. **Aktions-Zeile unten im Dialog:**
+   - `[ 🗑️ Aktive Filter entfernen ]`: Zeigt modale Sicherheitsabfrage (`QMessageBox.question`), setzt alle Checkboxes zurück und emittiert eine leere Auswahl.
+   - `[ 💾 Anwenden & Schließen ]`: Emittiert das Signal `services_selected(display_names, feature_ids)`.
+     * `display_names`: Liste der lesbaren Namen für die Button-Anzeige (z.B. `["Mein Scalper", "RSI"]`).
+     * `feature_ids`: Liste der technischen IDs für die SQL-Abfrage (z.B. `["prox_1", "rsi_14"]`).
 
- ### 1. Top-Bar Popover Button (ersetzt `combo_feature`)
- 1. **Button-Platzierung (`analytics/ui/analytics_win.py`, Filter-Zeile):**
-    - Ersetze das bestehende `combo_feature`-Dropdown durch einen Popover-Button:
-      `[ Set/Service: ▾ Keiner ausgewählt ]`
-    - Die bisherigen Slots `_on_feature_changed()` / `_populate_feature_combo()`
-      entfallen (Redundanz, Entscheidung 06.08.2026). Die Verkabelung
-      `combo_feature.currentIndexChanged → set_feature_id` wird durch das
-      Popover übernommen.
- 2. **Flyout/Popover-Widget:**
-    - Klick auf den Button öffnet ein schwebendes Popover direkt unter dem Button.
-    - Inhalt (manuell anpassbar – Variante „minimal-invasiv"):
-      * **Oben:** `ServiceSelectorWidget` im Modus `MODE_SELECT_ONLY`
-        (Set-/Service-Combos), Signale `selection_changed(set_id, service_id)`.
-      * **Unten:** Read-Only-Parameteranzeige für den gewählten Service über
-        `ServiceParamColumnsMixin._build_service_column(iid, pid, cfg)` in einem
-        deaktivierten `QGroupBox`-Container (`setEnabled(False)`).
-    - Alternativ (falls gewünscht): Read-Only-`MasterTree` statt Combos – dann
-      muss ein neues Widget gebaut werden (nicht Teil dieses minimal-invasiven
-      Tasks).
-    - Enthält den Aktions-Button `[ 🗑️ Aktiven Service-Filter entfernen ]`.
+---
 
- ---
+### 2. Einbindung in `AnalyticsWindow` (`analytics/ui/analytics_win.py`)
+1. **Entfernen alter Dropdowns:**
+   - Lösche alle verbliebenen Alt-Dropdowns für Services/Sets aus `analytics_win.py` und den Subseiten.
+2. **Top-Bar Button (Die Anzeige):**
+   - Platziere in der Top-Bar den Button: `[ 🛠️ Datenquellen: Keiner ausgewählt ▾ ]`.
+   - Klick auf den Button öffnet den `ServiceSelectorDialog`.
+   - Wenn der Dialog `services_selected` emittiert, wird der Button-Text mit den `display_names` aktualisiert (z. B. `[ 🛠️ Datenquellen: Mein Scalper, RSI ▾ ]`).
+3. **ViewModel-Anbindung (Die Logik):**
+   - Verdrahte das Signal mit `AnalyticsViewModel.set_feature_ids(feature_ids)`.
+   - Das ViewModel reicht diese IDs an den `FeatureStoreReader` weiter, der die Charts via SQL-Query (`WHERE feature_id IN (...)`) filtert.
+   - Der Dialog hört auf `event_bus.service_set_changed` und hält den Baum automatisch aktuell.
 
- ### 2. Inspektion, Filter-Entfernung & Sicherheitsabfrage
- 1. **Parameter-Inspektion im Popover:**
-    - `selection_changed(set_id, service_id)` lädt die rechte Parameteranzeige:python
-      cfg = self.model.find_service(setid, serviceid) or {}
-      pid = cfg.get("pluginid") or serviceid
-      box = self.buildservicecolumn(serviceid, pid, cfg)   # ServiceParamColumnsMixin
-      box.setEnabled(False)                                    # Read-Only
-      2. **feature_id-Auflösung (Lücke im Ursprungsentwurf):**
-    - Das Widget-Signal liefert `set_id`/`service_id`, NICHT die `feature_id`.
-    - Auflösung über das Modell: `plugin_id = model.find_service(set_id, service_id).get("plugin_id")`
-    - Dann `AnalyticsViewModel.set_feature_id(plugin_id)` – der `feature_id` im
-      Feature-Store IST die `plugin_id` (grid_lines / proximity).
- 3. **Aktion "Service-Filter entfernen" + Sicherheitsabfrage:**
-    - **Niemals automatisch alle Services vermischen!** (einzelner `feature_id`)
-    - Vor dem Entfernen modale Abfrage (`QMessageBox.question`):
-      > *"Möchtest du den aktiven Service-Filter wirklich entfernen? Die Anzeige
-      > im Analytics-Fenster zeigt danach wieder alle Features."*
-      (Korrektur: `set_feature_id(None)` entfernt den Filter → ALLE Feature-Rows
-      sichtbar, kein „leeres Raster".)
-    - Bei Bestätigung: `AnalyticsViewModel.set_feature_id(None)`, Popover
-      schließen, Button-Text auf `[ Set/Service: ▾ Keiner ausgewählt ]`.
- 4. **Button-Text & Profil-Persistenz:**
-    - Der Button-Text zeigt den aktiven Filter: `[ Set/Service: ▾ <plugin_id> ]`
-      bzw. `[ Set/Service: ▾ <set_id>/<service_id> ]` (manuell anpassbar).
-    - `feature_id` wird über `AnalyticsViewModel._current_payload()` bereits im
-      Profil-Payload persistiert (dict(self._params) inkl. feature_id) ✔.
-    - Bei Profilwechsel übernimmt `_apply_profile()` die Profil-Parameter inkl.
-      `feature_id` in den VM ✔ – der Button-Text muss danach synchronisiert
-      werden (z. B. im `active_profile_changed`-Slot oder über
-      `event_bus.profile_changed`).
+---
 
- ---
+### 3. Headless Verification (`test/check_p15_s3_analytics.py`)
+- Testet ohne GUI-Start (offscreen/Temp-DB):
+  1. `AnalyticsViewModel.set_feature_ids(["prox_1", "rsi_14"])` setzt die Multi-Auswahl.
+  2. `FeatureStoreReader.fetch_rows(..., feature_ids=[...])` filtert per `WHERE feature_id IN (...)`.
+  3. Dialog-Filter-Zurücksetzung setzt `feature_ids = []` sauber zurück.
 
- ### 3. EventBus-Integration
- - `event_bus.service_set_changed` → `ServiceSelectorModel.data_changed` →
-   Popover-Refresh (besteht, ServiceSelectorWidget verbindet das Modell).
- - `event_bus.profile_changed` → Button-Text mit dem gespeicherten
-   `feature_id`-Filter aktualisieren (NEU zu verdrahten im AnalyticsWindow).
+---
 
- ---
-
- ### 4. Headless Verification (`test/check_p15_s3_e_popover.py` – NEU)
- - Testet ohne GUI-Start (offscreen/Temp-DB unter test/):
-   1. `selection_changed(set_id, service_id)` → Auflösung der plugin_id →
-      `AnalyticsViewModel.set_feature_id()` wird gerufen.
-   2. `FeatureStoreReader.fetch_rows(..., feature_id=...)` filtert korrekt.
-   3. Entfernen-Logik setzt `feature_id = None` zurück (Button-Text-Reset).
-   4. `event_bus.service_set_changed` aktualisiert das `ServiceSelectorModel`.
-   5. `combo_feature` existiert NICHT mehr (Ersetzungs-Entscheidung).
-
- ---
-
- ### ⚠️ Richtlinien
- - **Keine UI-Tests starten!** Verifikation ausschließlich über Headless-Checks
-   in `test/` und `py_compile`.
- - Erzeuge gezielte, saubere Code-Snippets/Patches.
+### ⚠️ Richtlinien
+- **Keine UI-Tests starten!** Verifikation ausschließlich über Headless-Checks in `test/` und `py_compile`.
+- Erzeuge gezielte, saubere Code-Snippets/Patches.
 
 ---
 
@@ -186,8 +132,102 @@ Ziel von **Phase 15** ist die Weiterentwicklung der Service-UI (`service_win.py`
      (injizierbar für Headless-Tests; Standard `ServiceSelectorModel(parent)`).
  - **Neu:** `test/check_p15_s3_e_popover.py` (headless, Temp-DBs unter `test/`):
    28/28 Prüfungen PASS (P1–P7, S1–S4, R1–R6, X1–X4, F1–F4, E1–E4).
- - **Verifikation:** `.venv\Scripts\python.exe -m py_compile` auf
+  - **Verifikation:** `.venv\Scripts\python.exe -m py_compile` auf
    `analytics/ui/analytics_win.py` + Testdatei; Testlauf
    `test/check_p15_s3_e_popover.py` → „ALLE PRUEFUNGEN BESTANDEN (OK)".
    Keine UI-/Regressionstests (harte Regel).
  - **Git:** Commit + Tag `phase15_03e` (siehe unten).
+
+ ### 06.08.2026 – 15.03-E NACHZUG: Popover ersetzt durch `ServiceSelectorDialog` (Multi-Select, Checkbox-MasterTree)
+
+ **Entscheidungen (vorab, User):**
+ - `feature_ids` = **plugin_ids** (DB-konform; `feature_store.feature_id` IST
+   die plugin_id) – NICHT instance_ids wie im Anleitungs-Beispiel
+   `["prox_1","rsi_14"]`.
+ - Rechtes Panel = Read-Only-"Service-Parameter"-Box aus
+   `ServiceParamColumnsMixin._build_service_column()` (deaktivierte QGroupBox
+   je angehakten Service, gestapelt); alle angehakten Services inkl.
+   ⚡ Standalone-/📦 Plugin-Zeilen.
+ - Neue Testdatei `test/check_p15_s3_analytics.py`; die alte
+   `check_p15_s3_e_popover.py` wird gelöscht.
+
+ **Umsetzung (06.08.2026, ausgeführt):**
+ - **Neu:** `serviceui/service_selector_dialog.py` – `ServiceSelectorDialog`
+   (QDialog, `services_selected(display_names, feature_ids)`), links
+   `ServiceSelectorWidget.MODE_SELECT_MULTI` (Checkbox-MasterTree), rechts
+   Read-Only-Panel (`_DialogParamHost`, `setEnabled(False)`), unten
+   `[ 🗑️ Aktive Filter entfernen ]` (Sicherheitsabfrage) +
+   `[ 💾 Anwenden & Schließen ]`; lazy am AnalyticsWindow, `WA_DeleteOnClose`.
+ - **Geändert:** `serviceui/master_tree.py` – Checkbox-Modus (`set_checkable`,
+   Tri-State, `_checked_items`-Persistenz über `_populate`,
+   `checked_changed`-Signal, `checked_services/checked_feature_ids/
+   checked_display_names/clear_checks/set_checked_feature_ids`,
+   `CHECKBOX_ZONE_WIDTH` im `mousePressEvent`, `_sync_checked_from_tree`,
+   `_on_item_changed`, `_apply_set_state`).
+ - **Geändert:** `serviceui/service_selector_widget.py` – neuer Modus
+   `MODE_SELECT_MULTI` + `_build_select_multi()`.
+ - **Geändert:** `analytics/engine/service_selector_model.py` –
+   `resolve_display_names(feature_ids)` (Reverse-Mapping → SetName/instance_id).
+ - **Geändert:** `analytics/engine/feature_store_reader.py` –
+   `feature_ids`-Parameter (IN-Clause via `_apply_feature_filter`; Legacy
+   `feature_id` bleibt) in `fetch_rows/fetch_columns/fetch_heatmap/
+   fetch_latest_bar_time/fetch_recent_bar_time_for_cell`.
+ - **Geändert:** `analytics/engine/analytics_repository.py` (get_table/
+   get_heatmap/get_scatter/get_distribution/get_latest_bar_time/
+   get_recent_bar_time_for_cell), `analytics_worker.py` (Durchreichung) und
+   `analytics_view_model.py` (Param `feature_ids`, `set_feature_ids` + Alias,
+   Profil-Migration Alt-`feature_id`-String → Liste, Jump-to-Chart nutzt
+   `feature_ids`).
+ - **Geändert:** `analytics/ui/analytics_win.py` – Popover/`_active_filter`/
+   `_param_host` entfernt; Button `[ 🛠️ Datenquellen: … ▾ ]`, lazy-erzeugter
+   Dialog, `_on_services_selected`, `_sync_service_filter_button` mit
+   `resolve_display_names`.
+ - **Verifikation:** `test/check_p15_s3_analytics.py` (headless, Temp-DBs
+   unter `test/`) – **43/43 PASS**; Regression `check_p15_s2_service_tree.py`
+   + `check_p15_s4_infra.py` OK. `py_compile` auf allen geänderten Dateien.
+   Keine UI-/Regressionstests (harte Regel).
+ - **Git:** noch nicht committet (folgt gemeinsam mit der Bugfix-Runde).
+
+ ### 06.08.2026 – Bugfix-Runde Datenquellen-Dialog (Punkte 1–5)
+
+ **User-Anweisung (5 Punkte):**
+ 1. Services im Parameter-Panel **horizontal nebeneinander** (statt vertikal).
+ 2. Panel-Default-Breite = Platz für **2 Parameter-Spalten**; bei mehr →
+    horizontale Scrollbar.
+ 3. Fensterbreite endet **exakt an der rechten Kante der Parameter-Box**.
+ 4. Letzte Fensterposition/-größe von "Datenquellen auswählen" **persistieren
+    & beim nächsten Öffnen restaurieren**.
+ 5. **History-Bug:** Beim Schließen + App schließen + Neustart wird das
+    ServiceWindow fälschlich restauriert – soll in diesem Fall NICHT
+    wiederhergestellt werden; nur die Position beim manuellen Öffnen.
+
+ **Umsetzung (06.08.2026, ausgeführt):**
+ - `serviceui/service_selector_dialog.py`:
+   * `param_box_layout` → **QHBoxLayout** (Punkt 1).
+   * `_apply_panel_size`: Panel-Breite = 1 Spalte bzw. Default **2 Spalten**
+     (Spalten-SizeHints + Spacing + `PANEL_BUFFER`); Container-Minimum = volle
+     Inhaltbreite → horizontale Scrollbar (`ScrollBarAsNeeded`) bei >2
+     Spalten (Punkt 2).
+   * Feste Breite auf dem **Panel-Widget** (`param_panel.setFixedWidth`), nicht
+     nur der ScrollArea – sonst schnitt der 2/5-Body-Stretch das Panel ab
+     (Overflow). `_fit_dialog_width` misst die rechte Panel-Kante und zieht
+     das Fenster nach; `showEvent` + deferred Fit (Punkt 3).
+   * `_restore_geometry`/`_save_geometry` + `done()`-Override, Key
+     `service_selector` in `global_settings` (Muster
+     `IndicatorSettingsDialog`) – Position **und** Größe (Punkt 4).
+ - `serviceui/service_win.py`:
+   * `_keep_history_on_close = False` → manuelles X löscht den
+     `window_instances`-Eintrag (kein Auto-Restore nach Neustart).
+   * `save_state()` schreibt zusätzlich
+     `save_dialog_geometry("win_service", …)`; `restore_state()` nutzt den
+     Fallback auf `get_dialog_geometry("win_service")` → Position überlebt
+     das manuelle Schließen und wird beim erneuten Öffnen wiederhergestellt
+     (Punkt 5). App-Beenden mit OFFENEM Fenster behält den Eintrag (gewollt).
+ - **Verifikation:** `test/check_p15_s3_analytics.py` erweitert um B1–B7
+   (QHBoxLayout, 2-Spalten-Default, Scrollbar-Bedingung, exakte Kante,
+   Geometrie-Save/Restore) + H1–H5 (History-Fall: delete_instance → kein
+   Auto-Restore, Position-Fallback) → **57/57 PASS**. Regression
+   `check_p15_s2_service_tree.py`, `check_p15_s4_infra.py`,
+   `check_service_run_fixes.py` OK. `py_compile` auf allen geänderten
+   Dateien. Keine UI-/Regressionstests (harte Regel).
+ - **Git:** Commit folgt (siehe unten).

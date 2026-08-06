@@ -79,14 +79,20 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 @register_persistent_window()  # auto_restore=True (Bugfix 05.08.2026)
 class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActionsMixin, PersistentWindow):
     INSTANCE_ID = "win_service"
-    # Bugfix 05.08.2026 (User-Anweisung): auto_restore=True – das ServiceWindow
-    # gehoert vollwertig zur Fenster-Historie mit Save & Restore (wie
-    # AnalyticsWindow/PropertiesWindow): War das Fenster beim Beenden der App
-    # offen, wird es beim naechsten Start automatisch wiederhergestellt.
-    # _keep_history_on_close=True bleibt: Die FENSTERPOSITION wird auch nach
-    # manuellem Schliessen (X) behalten und beim naechsten Oeffnen ueber den
-    # Service-Button wiederhergestellt.
-    _keep_history_on_close = True
+    # Bugfix 06.08.2026 (User-Anweisung, History-Bug): auto_restore=True
+    # bleibt – war das Fenster beim Beenden der App OFFEN, wird es beim
+    # naechsten Start wiederhergestellt (Save & Restore wie AnalyticsWindow).
+    # _keep_history_on_close=False (NEU): Ein MANUELL geschlossenes
+    # ServiceWindow (X) wird aus der Fenster-Historie entfernt
+    # (delete_instance) und beim naechsten App-Start NICHT wiederhergestellt.
+    # Die FENSTERPOSITION ueberlebt das manuelle Schliessen ueber
+    # global_settings (save_dialog_geometry in save_state) und wird beim
+    # naechsten manuellen Oeffnen ueber den Service-Button wiederhergestellt
+    # (Fallback in restore_state, DIALOG_GEOMETRY_KEY).
+    _keep_history_on_close = False
+    #: Geometrie-Key fuer die POSITION, die ein manuelles Schliessen
+    #: ueberlebt (global_settings, vgl. IndicatorSettingsDialog-Muster).
+    DIALOG_GEOMETRY_KEY = "win_service"
     # 05.08.2026: Die FensterGROESSE folgt immer exakt dem Inhalt (auch
     # schrumpfen) – NUR die Position wird persistiert (save_state/restore_state
     # Overrides weiter unten). Ermoeglicht durch ContentScrollMixin.
@@ -375,6 +381,13 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         immer exakt dem Inhalt (resize_to_clamped_content, _exact_fit_to_content).
         Ein fester Groessenwert wuerde das exakte Anpassen an Tree/Log/Box
         (Punkte 3+4) unterlaufen. Position + Symbol/Timeframe bleiben erhalten.
+
+        06.08.2026 (History-Bug): Die POSITION wird zusaetzlich in
+        global_settings gesichert (save_dialog_geometry). Beim manuellen
+        Schliessen loescht delete_instance den window_instances-Eintrag
+        (_keep_history_on_close=False) – die Position ueberlebt das und wird
+        beim naechsten manuellen Oeffnen ueber den Fallback in
+        restore_state() wiederhergestellt (User-Anweisung 06.08.2026).
         """
         inst_id = self.get_instance_id()
         if not inst_id:
@@ -382,6 +395,12 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         p = self.pos()
         self._state_manager.save_window_geometry(
             inst_id, p.x(), p.y(), self.width(), self.height(), self.isMaximized())
+        try:
+            self._state_manager.save_dialog_geometry(
+                self.DIALOG_GEOMETRY_KEY, p.x(), p.y(),
+                self.width(), self.height())
+        except Exception:
+            pass
         symbol = self.get_persistent_symbol()
         tf = self.get_persistent_timeframe()
         if symbol and tf:
@@ -395,6 +414,13 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         (resize_to_clamped_content) setzt das Fenster exakt auf min(Inhalt,
         Bildschirm). Die gespeicherte Breite/Hoehe waere sonst stale
         (z.B. schmaler als die Parameter-Box).
+
+        06.08.2026 (History-Bug): Nach einem MANUELLEN Schliessen wurde der
+        window_instances-Eintrag geloescht (delete_instance). Die Position
+        liegt dann in global_settings (save_dialog_geometry in save_state)
+        und wird hier als Fallback wiederhergestellt – so bleibt die
+        Fensterposition beim erneuten manuellen Oeffnen erhalten, ohne dass
+        das Fenster beim App-Start automatisch restauriert wird.
         """
         inst_id = self.get_instance_id()
         if not inst_id:
@@ -402,6 +428,12 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # Window-Flags korrigieren (QUiLoader setzt oft Qt.Tool | Qt.Dialog).
         self._fix_window_flags()
         geom = self._state_manager.get_window_geometry(inst_id)
+        if not geom:
+            try:
+                geom = self._state_manager.get_dialog_geometry(
+                    self.DIALOG_GEOMETRY_KEY)
+            except Exception:
+                geom = None
         if geom:
             pos_x = geom.get("pos_x")
             pos_y = geom.get("pos_y")

@@ -52,6 +52,7 @@ class AnalyticsRepository:
         symbol: str,
         timeframe: str,
         feature_id: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
         limit: Optional[int] = 1000,
     ) -> Dict[str, Any]:
         """Rohe Feature-Zeilen fuer die Tabellen-Seite.
@@ -59,8 +60,9 @@ class AnalyticsRepository:
         Returns:
             {"rows": [FeatureStoreReader-Zeilen...], "total": n}
         """
-        rows = self.reader.fetch_rows(symbol, timeframe, feature_id=feature_id,
-                                      limit=limit)
+        rows = self.reader.fetch_rows(
+            symbol, timeframe, feature_id=feature_id, feature_ids=feature_ids,
+            limit=limit)
         return {"rows": rows, "total": len(rows)}
 
     # ------------------------------------------------------------------
@@ -72,6 +74,7 @@ class AnalyticsRepository:
         timeframe: str,
         metric: str = "count",
         feature_id: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """2D-Matrix (Wochentag x Tagesstunde) fuer die Heatmap-Seite.
 
@@ -88,7 +91,8 @@ class AnalyticsRepository:
             }
         """
         return self.reader.fetch_heatmap(
-            symbol, timeframe, metric=metric, feature_id=feature_id
+            symbol, timeframe, metric=metric, feature_id=feature_id,
+            feature_ids=feature_ids
         )
 
     # ------------------------------------------------------------------
@@ -101,6 +105,7 @@ class AnalyticsRepository:
         x_column: str = "ema_diff",
         y_column: str = "rsi_14",
         feature_id: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
         limit: Optional[int] = 1000,
     ) -> Dict[str, Any]:
         """X/Y-Paare zweier nativer Spalten fuer die Scatter-Seite.
@@ -121,7 +126,7 @@ class AnalyticsRepository:
             )
         rows = self.reader.fetch_columns(
             symbol, timeframe, [x_column, y_column],
-            feature_id=feature_id, limit=limit,
+            feature_id=feature_id, feature_ids=feature_ids, limit=limit,
         )
         points: List[Dict[str, float]] = []
         for r in rows:
@@ -151,6 +156,7 @@ class AnalyticsRepository:
         column: str = "atr_normalized",
         bins: int = 20,
         feature_id: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
         limit: Optional[int] = 1000,
     ) -> Dict[str, Any]:
         """Histogramm einer nativen Spalte fuer die Verteilungs-Seite.
@@ -173,7 +179,8 @@ class AnalyticsRepository:
             n_bins = 20
 
         rows = self.reader.fetch_columns(
-            symbol, timeframe, [column], feature_id=feature_id, limit=limit,
+            symbol, timeframe, [column], feature_id=feature_id,
+            feature_ids=feature_ids, limit=limit,
         )
         values = [r[column] for r in rows if r.get(column) is not None]
         values = [v for v in values if np.isfinite(v)]
@@ -201,6 +208,7 @@ class AnalyticsRepository:
         symbol: str,
         timeframe: str,
         feature_id: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
     ) -> Optional[int]:
         """Neuester Wanduhr-Epoch (int) der Feature-Rows (oder None).
 
@@ -208,7 +216,7 @@ class AnalyticsRepository:
         das Chart an der neuesten Feature-Bar des Symbol/Timeframe).
         """
         return self.reader.fetch_latest_bar_time(
-            symbol, timeframe, feature_id=feature_id
+            symbol, timeframe, feature_id=feature_id, feature_ids=feature_ids
         )
 
     def get_recent_bar_time_for_cell(
@@ -218,6 +226,7 @@ class AnalyticsRepository:
         dow: int,
         hour: int,
         feature_id: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
     ) -> Optional[int]:
         """Neuester Wanduhr-Epoch einer (dow, hour)-Heatmap-Zelle (oder None).
 
@@ -226,7 +235,8 @@ class AnalyticsRepository:
         Feature-Bar dieser Zelle (Wanduhr-Garantie, Invariante 7).
         """
         return self.reader.fetch_recent_bar_time_for_cell(
-            symbol, timeframe, dow, hour, feature_id=feature_id
+            symbol, timeframe, dow, hour,
+            feature_id=feature_id, feature_ids=feature_ids
         )
 
     # ------------------------------------------------------------------
