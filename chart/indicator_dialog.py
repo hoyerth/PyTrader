@@ -691,9 +691,13 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			# Preset-Verwaltung (Legacy: unten, im eigenen Rahmen)
 			content_layout.addWidget(self._build_preset_group())
 
-		btn_close = QPushButton("Schließen")
-		btn_close.clicked.connect(self.accept)
-		content_layout.addWidget(btn_close)
+		# Bugfix (06.08.2026): _init_plugin_ui_params_only platziert den
+		# Schließen-Button bereits oben rechts (Zeile 0) - hier NUR anfügen,
+		# wenn er nicht schon im Plugin-Grid sitzt (sonst Doppel-Button).
+		if not getattr(self, "_close_placed_in_plugin_ui", False):
+			btn_close = QPushButton("Schließen")
+			btn_close.clicked.connect(self.accept)
+			content_layout.addWidget(btn_close)
 
 		# ScrollArea umschließt den Inhalt (natürliche Größe); das Fenster wird
 		# auf den Bildschirm geklemmt (Scrollbars bei Überlänge, sonst exakt
@@ -970,11 +974,35 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		Preset-Verwaltung bleibt erhalten (Speichern/Laden der Parameter).
 		Damit erscheinen auch die vorher fehlenden Nicht-Darstellungs-Parameter
 		(maX_type/maX_period/maX_smooth_type/maX_alpha) im Prop-Fenster.
+
+		Layout (Bugfix 06.08.2026, Anwenderanforderungen):
+		  * Zeile 0: Preset-Box ganz oben LINKS; rechts daneben der
+		    Schließen-Button (oben rechts) - kein Button mehr unterhalb.
+		  * Darunter: IMMER zwei Parameter-Boxen nebeneinander
+		    (1-2, 3-4, 5-6, 7-8), je eine Grid-Zeile.
+		  * Nichts unterhalb der letzten Boxen-Zeile -> das Fenster endet
+		    exakt am unteren Rand der letzten Boxen (Höhe = MA7/MA8-Rand).
+		  * Das kompakte 2-Spalten-Grid macht das Fenster nur etwas breiter
+		    als die zwei Boxen nebeneinander (ContentScrollMixin klemmt die
+		    Größe auf den Inhalt).
 		"""
 		content_grid = QGridLayout()
 		content_grid.setSpacing(6)
-		left_col = QVBoxLayout()
-		left_col.setAlignment(Qt.AlignTop)
+
+		# --- Zeile 0: Preset-Box oben LINKS, Schließen-Button oben rechts ---
+		# Die Zeile spannt ueber BEIDE Spalten (span 2) und verbreitert das
+		# Fenster dadurch NICHT: die Spaltenbreiten bestimmen die MA-Boxen
+		# (Zeilen 1-4), der addStretch(1) faengt den Restplatz auf. Ergebnis:
+		# das Fenster ist nur etwas breiter als die zwei MA-Boxen nebeneinander.
+		self._close_placed_in_plugin_ui = True
+		top_row = QHBoxLayout()
+		top_row.setSpacing(6)
+		top_row.addWidget(self._build_preset_group())
+		top_row.addStretch(1)
+		btn_close = QPushButton("Schließen")
+		btn_close.clicked.connect(self.accept)
+		top_row.addWidget(btn_close)
+		content_grid.addLayout(top_row, 0, 0, 1, 2, Qt.AlignTop)
 
 		layout_schema = getattr(self.plugin, "param_layout", None)
 		groups: List[Any] = []
@@ -984,6 +1012,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		else:
 			groups = [("Parameter", list(self.plugin_order))]
 
+		# Parameter-Boxen bauen (gefiltert: noch nicht gerendert, nicht expert).
+		rendered_groups: List[QGroupBox] = []
 		for title, keys in groups:
 			# Nur noch nicht gerenderte, nicht-expert Keys dieser Gruppe.
 			grp_keys = [
@@ -1004,7 +1034,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 				ctrl = self.create_schema_control(key, cval, spec)
 				self.param_controls[key] = ctrl
 				form.addRow(self.plugin_labels.get(key, self._human(key)), ctrl)
-			left_col.addWidget(group)
+			rendered_groups.append(group)
 
 		# Nicht in param_layout enthaltene Keys flach nachtragen (Schutz).
 		remaining = [
@@ -1022,18 +1052,19 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 				ctrl = self.create_schema_control(key, cval, spec)
 				self.param_controls[key] = ctrl
 				form.addRow(self.plugin_labels.get(key, self._human(key)), ctrl)
-			left_col.addWidget(group)
+			rendered_groups.append(group)
 
-		content_grid.addLayout(left_col, 0, 0, Qt.AlignTop)
+		# --- IMMER zwei Boxen nebeneinander (1-2, 3-4, 5-6, 7-8) ---
+		for i in range(0, len(rendered_groups), 2):
+			row = i // 2 + 1  # Zeile 1 beginnt unter der Preset-Zeile
+			content_grid.addWidget(rendered_groups[i], row, 0, Qt.AlignTop)
+			if i + 1 < len(rendered_groups):
+				content_grid.addWidget(rendered_groups[i + 1], row, 1, Qt.AlignTop)
 
-		# Rechte Spalte: NUR Preset-Verwaltung (keine Service-Boxen).
-		right_top = QVBoxLayout()
-		right_top.setAlignment(Qt.AlignTop)
-		right_top.addWidget(self._build_preset_group(), 0, Qt.AlignTop)
-		content_grid.addLayout(right_top, 0, 1, Qt.AlignTop)
-
-		# Linke Spalte bekommt beim manuellen Aufziehen den zusätzlichen Raum.
+		# Beide Spalten wachsen beim Aufziehen gleichmäßig; die Breite ergibt
+		# sich aus den zwei Boxen nebeneinander ("nur etwas breiter").
 		content_grid.setColumnStretch(0, 1)
+		content_grid.setColumnStretch(1, 1)
 		main_layout.addLayout(content_grid)
 
 	# -------------------------------------------------------------------------
