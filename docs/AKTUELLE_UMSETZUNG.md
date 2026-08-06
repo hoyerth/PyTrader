@@ -121,11 +121,30 @@
 
  ## Implementierungs-Log (nach Freigabe auszufüllen)
 
- - **P16.01 – Architektur-Refactoring Visualisierungs-Entkopplung**
-   - Datum/Uhrzeit: _TT.MM.JJJJ HH:MM_ (MD)
-   - Umgesetzt: Schritt 2 (`build_chart_render_payload`), Schritt 3
-     (Service-Bereinigung gemäß E1–E5), Schritt 4 (Test
-     `check_p16_s1_decoupling.py`, `test.py`-Anpassung).
-   - Validierung: `python -m py_compile` der geänderten Dateien +
-     `test/check_p16_s1_decoupling.py`.
-   - Commit/Tag: `phase16_p16-01` (folgt).
+- **P16.01 – Architektur-Refactoring Visualisierungs-Entkopplung**
+  - Datum/Uhrzeit: 06.08.2026 13:38 (MD)
+  - Umgesetzt:
+    * Schritt 2: `FixedGridProximityIndicator.build_chart_render_payload()`
+      implementiert (Lines inkl. Paritäts-Styling, hit_circles mit
+      `priority=10` + E1-Farbzuteilung, status_info aus
+      `metadata["statistics"]`); `calculate()` baut den Render-Payload nur
+      noch aus Rohdaten (shared_state-Levels + Feature-Records).
+    * Schritt 3: `grid_lines_service.py` (UI-Parameter `show_lines`/
+      `line_color` aus Schema/Order/Labels entfernt, `render=False`,
+      `chart_render_payload` ersatzlos entfernt, reine Level-Liste
+      `[{price}, ...]` in shared_state gemäß E2); `proximity_service.py`
+      (`hit_circles`/`status_info` aus `calculate()` entfernt, nur
+      `feature_store_payload` mit E3-Schema, `status_info` →
+      `metadata["statistics"]` gemäß E4, `render=False` gemäß E5).
+    * Schritt 4: `test/check_p16_s1_decoupling.py` neu (32 Checks, alle
+      PASS); `test/test.py` V5/V6/V8 auf die neuen Pfade umgestellt
+      (kein chart_render_payload im Service, hit_circles via
+      `build_chart_render_payload`).
+  - Validierung: `python -m py_compile` der 4 geänderten Dateien (OK);
+    `test/check_p16_s1_decoupling.py` (32/32 PASS);
+    `test/test.py` Teil 7 V4–V8 (PASS; Teil 1–3 P2/P5/H3/H4/H5/H7 sind
+    vorbestehende offscreen-Screen-Größen-/keep_history-Divergenzen,
+    unabhängig von P16.01);
+    `test/check_p15_s4_infra.py` + `test/check_p16_rename_migration.py`
+    (PASS).
+  - Commit/Tag: `phase16_p16-01`.

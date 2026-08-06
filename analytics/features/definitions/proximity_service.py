@@ -14,19 +14,20 @@ und wendet die PROZENTUALE visit%-Semantik des Alt-Grid-Indikators an
 
 – NICHT die absolute threshold-Distanz des Alt-Plugins grid_liquidity.
 
-Das native UTC-Zeitfenster (Minute 0/30 ± time_window_mins) wird pro Hit als
-`in_window`-Flag in den hit_circles gemeldet. Die FARBE der Kreise (gelb im
-Fenster / fuchsia außerhalb) und die Sichtbarkeit (show_lines / show_circles)
-sind KEINE Service-Parameter – sie werden vom INDIKATOR gesteuert
+Das native UTC-Zeitfenster (Minute 0/30 ± time_window_mins) wird pro Bar als
+`in_time_window`-Flag in die Feature-Records geschrieben. Die FARBE der Kreise
+(gelb im Fenster / fuchsia außerhalb) und die Sichtbarkeit (show_lines /
+show_circles) sind KEINE Service-Parameter – sie werden vom INDIKATOR gesteuert
 (chart/indicators/fixed_grid_proximity.py), der die Circle-Farben auf Basis seines
 eigenen Schemas (circle_color_std / circle_color_active) und des
-`in_window`-Flags setzt.
+`in_time_window`-Flags setzt (P16.01: `status_info` liegt als
+metadata["statistics"] im feature_store_payload).
 
 lookback (Scan-Fenster von rechts nach links) = min(statistics_signal_limit,
 len(df)) aus context.settings. Der Service schreibt die Hit-Records nach
 feature_data (feature_store=True) für Schritt 7 (Marker/Statistik).
 
-Capabilities: render=True, feature_store=True.
+Capabilities: render=False (P16.01), feature_store=True.
 """
 
 from datetime import datetime, timezone as dt_timezone
@@ -131,7 +132,9 @@ class ProximityService(PluginFeature):
             "batch": True,
             "live": False,
             "feature_store": True,  # schreibt Hit-Records nach feature_data
-            "render": True,
+            # Phase 16 (P16.01, E5): render=False - der Service liefert KEINEN
+            # chart_render_payload mehr; der Indikator baut das Styling.
+            "render": False,
         }
 
     @property
@@ -196,10 +199,15 @@ class ProximityService(PluginFeature):
     ) -> FeatureCalculateResult:
         """Wendet die prozentuale visit%-Semantik der Paritätsfunktionen
         (grid_math.py) auf die Linien aus context.shared_state[depends_on[0]]
-        an und schreibt Hit-Records nach feature_data (feature_store=True)."""
+        an und schreibt Hit-Records nach feature_data (feature_store=True).
+
+        Phase 16 (P16.01, E3/E4/E5): Der Service liefert KEINEN
+        chart_render_payload mehr (render=False). `status_info`
+        {in_time_window, active_hits} wird in metadata["statistics"] des
+        feature_store_payload ausgelagert und vom Indikator
+        (build_chart_render_payload) uebernommen."""
         empty: FeatureCalculateResult = {
             "feature_store_payload": {},
-            "chart_render_payload": {"lines": [], "hit_circles": []},
         }
         if df is None or df.empty:
             return empty
@@ -254,9 +262,10 @@ class ProximityService(PluginFeature):
         #     Semantik zu grid_math.py.
         #   * NaN high/low propagieren in den Vergleichen zu False (kein Hit)
         #     – wie im Alt-Pfad (Float-Vergleich mit NaN ist False).
-        #   * Reihung hit_circles/levels_hit: zeilen-major, innerhalb einer
-        #     Zeile in tracked_levels-Reihenfolge (lexsort über Zeile+Level).
-        hit_circles: List[Dict[str, Any]] = []
+        #   * Reihung levels_hit: zeilen-major, innerhalb einer Zeile in
+        #     tracked_levels-Reihenfolge (lexsort über Zeile+Level).
+        # Phase 16 (P16.01, E4): hit_circles werden NICHT mehr erzeugt – der
+        # Indikator baut sie aus den feature_rows (levels_hit/in_time_window).
         active_hits: List[str] = []
         feature_rows: List[Dict[str, Any]] = []
 
@@ -301,19 +310,6 @@ class ProximityService(PluginFeature):
                         r = int(bar_sorted[s])
                         lvls = [float(x) for x in levels_arr[lvl_sorted[s:e]]]
                         levels_hit[r] = lvls
-                        t_val = int(times[r])
-                        win_flag = bool(in_win[r])
-                        for lvl in lvls:
-                            # hit_circles ohne Farbe – der INDIKATOR färbt auf
-                            # Basis seines eigenen Schemas (circle_color_std /
-                            # _active) und des in_window-Flags. in_window=True
-                            # wenn die Bar im UTC-Zeitfenster (0/30 ±
-                            # time_window_mins) liegt.
-                            hit_circles.append({
-                                "time": t_val,
-                                "price": lvl,
-                                "in_window": win_flag,
-                            })
                         if r == last_pos:
                             active_hits.extend(
                                 f_strip_trailing_zeros(v) for v in lvls)
@@ -347,7 +343,8 @@ class ProximityService(PluginFeature):
                 "plugin_version": self.version,
                 "records": feature_rows,
                 "metadata": {
-                    "total_hits": len(hit_circles),
+                    "total_hits": sum(
+                        len(r.get("levels_hit") or []) for r in feature_rows),
                     "depends_on": dep_id,
                     "scan_limit": limit,
                     "visit_pct": visit_pct,
@@ -355,14 +352,13 @@ class ProximityService(PluginFeature):
                     # Feature-Payload – der Indikator-Lesepfad (feature_data)
                     # prüft sie beim Chart-Re-Render.
                     "schema_version": "1.0.0",
-                },
-            },
-            "chart_render_payload": {
-                "lines": [],
-                "hit_circles": hit_circles,
-                "status_info": {
-                    "in_time_window": in_time_window,
-                    "active_hits": active_hits,
+                    # Phase 16 (P16.01, E4): status_info als Feature-Daten
+                    # (KEINE Farben) – der Indikator übernimmt sie in
+                    # build_chart_render_payload().
+                    "statistics": {
+                        "in_time_window": in_time_window,
+                        "active_hits": active_hits,
+                    },
                 },
             },
         }

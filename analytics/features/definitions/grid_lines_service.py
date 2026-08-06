@@ -11,16 +11,19 @@ Referenz-Kopien):
     levels = {round(center + i * step_size, 6) | i in [-steps_around, steps_around]}
              + Custom-Levels (prox_level1..6, nur > 0)
 
-Der Service liefert den chart_render_payload (lines) in identischer Struktur
-wie der Alt-Indikator (is_custom-Färbung, width 1/3, style Solid) und schreibt
-die Linienliste zusätzlich nach context.shared_state[self.instance_id] – der
-nachgelagerte ProximityService liest sie von dort (depends_on).
+Der Service liefert KEINEN chart_render_payload mehr (Phase 16 P16.01, E2/E5:
+render=False) – er schreibt ausschliesslich eine REINE Level-Liste
+(`[{price}, ...]`, ohne Farben/Styling) nach context.shared_state[self.instance_id];
+der nachgelagerte ProximityService liest sie von dort (depends_on), der
+Indikator (chart/indicators/fixed_grid_proximity.py) baut daraus in
+`build_chart_render_payload()` das Styling (is_custom-Färbung, width 1/3,
+style Solid – Parität zum Alt-Grid).
 
 KEINE eigenen Zeitkonzepte: Das native UTC-Zeitfenster (Minute 0/30 ±
 time_window_mins) ist ausschließlich Sache des ProximityService (Farbgebung),
 nicht dieses Services.
 
-Capabilities: render=True, feature_store=True (schreibt Grid-Level je Bar in den Store).
+Capabilities: render=False (P16.01), feature_store=True (schreibt Grid-Level je Bar in den Store).
 
 05.08.2026 (U15-E, echte Feature-Store-Payloads): `calculate()` erzeugt jetzt
 ZWINGEND ein gefuelltes `feature_store_payload` mit `feature_id="grid_lines"`,
@@ -167,7 +170,9 @@ class GridLinesService(PluginFeature):
             # 05.08.2026 (U15-E): grid_lines schreibt jetzt echte Grid-Level
             # je Bar in den Store (feature_store_payload in calculate()).
             "feature_store": True,
-            "render": True,
+            # Phase 16 (P16.01, E5): render=False - der Service liefert KEINEN
+            # chart_render_payload mehr; der Indikator baut das Styling.
+            "render": False,
         }
 
     # --- Single Source of Truth fürs Prop-Fenster (Phase 13 Schritt 5) -------
@@ -178,8 +183,10 @@ class GridLinesService(PluginFeature):
         # gerendert. custom_levels bleibt im parameter_schema (interne Pipeline
         # & Aggregat-Speicherung), ist aber NICHT in der Darstellungs-Reihenfolge
         # -> wird im Editor nicht als Komma-Feld gerendert.
+        # Phase 16 (P16.01): show_lines/line_color sind KEINE Service-Parameter
+        # mehr (E1/E5) - sie steuern ausschliesslich die Render-Darstellung im
+        # Indikator (chart/indicators/fixed_grid_proximity.py).
         return [
-            "show_lines", "line_color",
             "step_size", "steps_around",
             "prox_level1", "prox_level2", "prox_level3",
             "prox_level4", "prox_level5", "prox_level6",
@@ -188,8 +195,6 @@ class GridLinesService(PluginFeature):
     @property
     def param_labels(self) -> Dict[str, str]:
         return {
-            "show_lines": "Linien anzeigen",
-            "line_color": "Linien-Farbe",
             "step_size": "Rasterabstand",
             "steps_around": "Level-Anzahl (je Seite)",
             "prox_level1": "Level 1",
@@ -227,13 +232,6 @@ class GridLinesService(PluginFeature):
             "prox_level4": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 4"},
             "prox_level5": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 5"},
             "prox_level6": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 6"},
-            "show_lines": {
-                "type": "bool", "default": True, "description": "Grid-Linien anzeigen",
-            },
-            "line_color": {
-                "type": "color", "default": "",
-                "description": "Linien-Farbe (leer = Paritäts-Styling aus grid_math.py)",
-            },
         }
 
     def calculate(
@@ -243,23 +241,26 @@ class GridLinesService(PluginFeature):
         context: Optional[PluginContext] = None,
     ) -> FeatureCalculateResult:
         """Baut das Raster in Parität zum Alt-Grid (grid_math.py) und schreibt
-        die Linienliste nach context.shared_state[self.instance_id] (Namespace-
-        isoliert).
+        die reine LEVEL-Liste nach context.shared_state[self.instance_id]
+        (Namespace-isoliert).
 
         05.08.2026 (U15-E): Zusaetzlich wird ein gefuelltes feature_store_payload
         erzeugt (feature_id='grid_lines', plugin_version, records je Bar mit
         bar_time / grid_nearest_level / grid_step / upper_level / lower_level) -
         grid_lines schreibt damit echte mathematische Grid-Level in den
-        feature_store (unabhaengig von show_lines, das nur die Render-Darstellung
-        steuert)."""
+        feature_store.
+
+        Phase 16 (P16.01, E2): Der Service liefert KEINEN chart_render_payload
+        mehr (render=False, E5). Die Level-Liste im shared_state enthaelt nur
+        noch {price} - OHNE Farben/width/style. Das Render-Styling (Farben,
+        Sichtbarkeit) baut ausschliesslich der Indikator
+        (build_chart_render_payload in fixed_grid_proximity.py)."""
         if df is None or df.empty:
-            return {"feature_store_payload": {}, "chart_render_payload": {"lines": [], "hit_circles": []}}
+            return {"feature_store_payload": {}}
 
         p = self.validate_params(params)
         step_size = float(p["step_size"])
         steps_around = int(p["steps_around"])
-        show_lines = bool(p["show_lines"])
-        line_color = str(p.get("line_color") or "").strip()
 
         custom_levels = custom_levels_from_params(p)
         sorted_levels = build_grid_levels(
@@ -269,28 +270,17 @@ class GridLinesService(PluginFeature):
             custom_levels=custom_levels,
         )
 
-        # --- Lines-Payload (exakte Parität zu grid.py) -----------------------
-        lines_payload: List[Dict[str, Any]] = []
-        if show_lines:
-            for lvl in sorted_levels:
-                is_custom = any(abs(lvl - c_lvl) < 0.0001 for c_lvl in custom_levels)
-                if line_color:
-                    color = line_color
-                else:
-                    # Paritäts-Styling: Custom-Levels kräftiger + dünner (mit ★)
-                    color = "rgba(33, 150, 243, 0.9)" if is_custom else "rgba(33, 150, 243, 0.5)"
-                lines_payload.append({
-                    "price": lvl,
-                    "color": color,
-                    "width": 1 if is_custom else 3,
-                    "style": "Solid",
-                    "is_custom": is_custom,
-                })
+        # --- Reine Level-Liste (P16.01/E2, exakte Parität zu grid.py) --------
+        # OHNE Farben/Styling - der nachgelagerte ProximityService liest nur
+        # {price} (tracked_levels), der Indikator baut das Styling daraus.
+        level_entries: List[Dict[str, Any]] = [
+            {"price": lvl} for lvl in sorted_levels
+        ]
 
-        # Linienliste in den Namespace schreiben – der ProximityService liest
+        # Level-Liste in den Namespace schreiben – der ProximityService liest
         # sie von dort (depends_on). Atomare Zuweisung (neue Liste).
         if context is not None and context.instance_id:
-            context.shared_state[context.instance_id] = list(lines_payload)
+            context.shared_state[context.instance_id] = list(level_entries)
 
         # --- Feature-Store-Payload (05.08.2026, U15-E) -----------------------
         # Pro Bar: grid_nearest_level = center (naechstes Grid-Level zum close),
@@ -365,9 +355,5 @@ class GridLinesService(PluginFeature):
                     "schema_version": "1.0.0",
                     "step_size": step_size,
                 },
-            },
-            "chart_render_payload": {
-                "lines": lines_payload,
-                "hit_circles": [],
             },
         }

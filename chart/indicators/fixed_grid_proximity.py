@@ -385,8 +385,6 @@ class FixedGridProximityIndicator(BaseIndicator):
         visit_pct = float(params.get("visit_pct", params.get("proximity_threshold", 0.05)))
         time_window_mins = int(params.get("time_window_mins", 5))
         use_time_filter = _as_bool(params.get("use_time_filter"), True)
-        show_lines = _as_bool(params.get("show_lines"), True)
-        line_color = str(params.get("line_color") or "").strip()
         custom_levels = self._extract_custom_levels(params)
 
         return {
@@ -401,8 +399,6 @@ class FixedGridProximityIndicator(BaseIndicator):
                         "step_size": step_size,
                         "steps_around": steps_around,
                         "custom_levels": custom_levels,
-                        "show_lines": show_lines,
-                        "line_color": line_color,
                     },
                 },
                 "prox_1": {
@@ -431,18 +427,123 @@ class FixedGridProximityIndicator(BaseIndicator):
             out.add(ti - (ti % t_sec))
         return out
 
+    # ------------------------------------------------- P16.01: Render-Payload
+    def build_chart_render_payload(
+        self,
+        raw_features: Dict[str, Any],
+        ui_params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """P16.01 (Architektur-Entkopplung): Baut den chart_render_payload aus
+        den ROHDATEN der Services – die Services selbst liefern KEINE Farben,
+        Sichtbarkeits-Flags oder Zeichen-Objekte mehr (E1–E5).
+
+        raw_features:
+          * "grid_levels":        reine Level-Liste [{price}, ...] aus
+                                  context.shared_state["grid_1"] (E2)
+          * "proximity_records":  feature_store_records des Proximity-Service
+                                  ({levels_hit, is_hit, in_time_window, ...},
+                                  E3)
+          * "status_info":        {"in_time_window", "active_hits"} aus
+                                  metadata["statistics"] (E4)
+
+        ui_params: Indikator-Parameter (show_lines / line_color /
+        show_circles / circle_color_std / circle_color_active /
+        use_time_filter).
+
+        Liefert {"lines", "hit_circles", "status_info"} für den JS-Bridge
+        (chart_win._serialize_and_render_grid) – Parität zum Alt-Grid:
+        * lines: {price, color, width, style:'Solid', is_custom}
+          (leere line_color = Paritäts-Styling des Alt-Grid:
+          rgba(33,150,243,0.9)/width 1 für Custom-Levels,
+          rgba(33,150,243,0.5)/width 3 für Normal-Levels).
+        * hit_circles: {time, price, in_window, color, priority:10}
+          circle_color_std wenn in_window=True (bzw. Time-Filter inaktiv),
+          circle_color_active sonst (E1).
+        * status_info: 1:1 aus raw_features["status_info"] (E4).
+        """
+        lines: List[Dict[str, Any]] = []
+        if _as_bool(ui_params.get("show_lines"), True):
+            line_color = str(ui_params.get("line_color") or "").strip()
+            custom_levels = self._extract_custom_levels(ui_params)
+            for lvl_item in (raw_features.get("grid_levels") or []):
+                if not isinstance(lvl_item, dict):
+                    continue
+                try:
+                    lvl = float(lvl_item.get("price"))
+                except (TypeError, ValueError):
+                    continue
+                is_custom = any(
+                    abs(lvl - c_lvl) < 0.0001 for c_lvl in custom_levels)
+                if line_color:
+                    color = line_color
+                else:
+                    # Paritäts-Styling: Custom-Levels kräftiger + dünner (★)
+                    color = ("rgba(33, 150, 243, 0.9)" if is_custom
+                             else "rgba(33, 150, 243, 0.5)")
+                lines.append({
+                    "price": lvl,
+                    "color": color,
+                    "width": 1 if is_custom else 3,
+                    "style": "Solid",
+                    "is_custom": is_custom,
+                })
+
+        use_time_filter = _as_bool(ui_params.get("use_time_filter"), True)
+        circle_std = str(ui_params.get("circle_color_std") or "#FFEB3B")
+        circle_active = str(ui_params.get("circle_color_active") or "#E91E63")
+        hit_circles: List[Dict[str, Any]] = []
+        if _as_bool(ui_params.get("show_circles"), True):
+            for rec in (raw_features.get("proximity_records") or []):
+                if not rec.get("is_hit"):
+                    continue
+                in_window = bool(rec.get("in_time_window"))
+                color = (circle_active if (use_time_filter and not in_window)
+                         else circle_std)
+                try:
+                    bar_time = int(rec.get("bar_time"))
+                except (TypeError, ValueError):
+                    continue
+                for lvl in (rec.get("levels_hit") or []):
+                    try:
+                        hit_circles.append({
+                            "time": bar_time,
+                            "price": float(lvl),
+                            "in_window": in_window,
+                            "color": color,
+                            "priority": 10,
+                        })
+                    except (TypeError, ValueError):
+                        continue
+
+        status_info = raw_features.get("status_info") or {}
+        return {
+            "lines": lines,
+            "hit_circles": hit_circles,
+            "status_info": {
+                "in_time_window": bool(
+                    status_info.get("in_time_window", False)),
+                "active_hits": list(status_info.get("active_hits") or []),
+            },
+        }
+
     def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
         """Führt die Service-Pipeline (grid_lines + proximity) für den
         Historical-Run aus, cached die Linien thread-sicher und liefert den
         Render-Payload (Parität zu grid.py).
 
+        Phase 16 (P16.01, Architektur-Entkopplung): Der Render-Payload wird
+        AUSSCHLIESSLICH von build_chart_render_payload() aus den ROHDATEN der
+        Services gebaut (shared_state["grid_1"]-Levels + feature_store_records
+        + metadata["statistics"]) – die Services selbst liefern keine Farben
+        oder Zeichen-Objekte mehr.
+
         Invariante 10 (Chart-Entkopplung, Phase 15 U15-A2/A3) – Lese-Kette:
-          1. Proximity-Hit-Circles werden AUSSCHLIESSLICH aus dem feature_store
+          1. Proximity-Hit-Circles werden PRIMÄR aus dem feature_store
              gelesen (read_proximity_from_feature_store) – der Chart führt
              KEINE Proximity-Berechnung aus, er liest vorberechnete Daten
              aus DuckDB. Ist der Store leer (noch kein Batch-Lauf
-             geschrieben), werden keine Circles gerendert (U15-A3: der
-             frühere Pipeline-Fallback wurde entfernt).
+             geschrieben), greift der definierte P16.01-Fallback auf die aus
+             den Rohdaten gebauten Circles (build_chart_render_payload).
           Die Grid-LINIEN (Live-Tick-Cache) kommen unabhängig davon immer
           aus der Pipeline (GridLinesService) – sie sind kein DB-Output.
         """
@@ -467,26 +568,37 @@ class FixedGridProximityIndicator(BaseIndicator):
             definition = self._build_set_definition(p, df)
             results = self._evaluator.execute_set(definition, df, context)
 
-            # Linien kommen aus dem Namespace grid_1 (GridLinesService schreibt
-            # die Linienliste dorthin) – atomare, thread-sichere Zuweisung.
-            grid_lines = context.shared_state.get("grid_1") or []
-            lines = list(grid_lines) if isinstance(grid_lines, list) else []
-
-            prox_result = results.get("prox_1") or {}
-            prox_crp = prox_result.get("chart_render_payload") or {}
+            # --- P16.01: Render-Payload aus ROHDATEN bauen ------------------
+            # grid_levels = reine Level-Liste aus shared_state["grid_1"] (E2),
+            # proximity_records = feature_store_records aus results["prox_1"]
+            # (E3), status_info = metadata["statistics"] (E4). Der Indikator
+            # (build_chart_render_payload) übernimmt das komplette Styling –
+            # die Services liefern KEINEN chart_render_payload mehr (E5).
+            prox_fsp = (results.get("prox_1") or {}).get(
+                "feature_store_payload") or {}
+            grid_levels = context.shared_state.get("grid_1") or []
+            raw_features: Dict[str, Any] = {
+                "grid_levels": (
+                    grid_levels if isinstance(grid_levels, list) else []
+                ),
+                "proximity_records": prox_fsp.get("records") or [],
+                "status_info": (prox_fsp.get("metadata") or {}).get(
+                    "statistics") or {},
+            }
+            render_payload = self.build_chart_render_payload(raw_features, p)
+            lines = render_payload.get("lines") or []
 
             # U15-A2 (Farb-Semantik) mit Bugfix 04.08.2026 (Circles wieder
             # sichtbar): PRIMÄR werden die Proximity-Hits aus dem feature_store
             # gelesen (read_proximity_from_feature_store – U15-A3-Lesepfad).
             # Ist der Store leer (noch kein Batch-Lauf mit aktivem
             # proximity-Preset geschrieben), greift der DEFINIERTE FALLBACK
-            # auf die pipeline-berechneten Circles des Proximity-Service
-            # (prox_crp.hit_circles) – der Chart führt die Pipeline intern
-            # ohnehin aus und verwirft die Treffer sonst ungenutzt. Beide
-            # Pfade liefern time/price/in_window ohne Farbe; die Farbe wird
-            # additiv aus dem Indikator-Schema angewendet:
+            # auf die aus den Rohdaten gebauten Circles
+            # (render_payload.hit_circles, P16.01) – der Chart führt die
+            # Pipeline intern ohnehin aus und verwirft die Treffer sonst
+            # ungenutzt. Beide Pfade liefern time/price/in_window; die Farbe
+            # wird additiv aus dem Indikator-Schema angewendet:
             #   in_window + use_time_filter → circle_color_std, sonst _active.
-            # show_circles=false (Indikator-Parameter) → keine Circles.
             cached_circles = self.read_proximity_from_feature_store(
                 self._symbol or "", self._timeframe or ""
             )
@@ -497,9 +609,9 @@ class FixedGridProximityIndicator(BaseIndicator):
             def _colorize(c: Dict[str, Any]) -> Dict[str, Any]:
                 # Bugfix 05.08.2026: priority=10 ergänzen – der Feature-Store-
                 # Lesepfad (read_proximity_from_feature_store) und die Live-
-                # Punkte (update_live_candle) setzen priority=10, der Pipeline-
-                # Fallback (prox_crp.hit_circles aus dem ProximityService)
-                # liefert Kreise OHNE priority (nur time/price/in_window).
+                # Punkte (update_live_candle) setzen priority=10. Der P16.01-
+                # Fallback (render_payload.hit_circles aus
+                # build_chart_render_payload) setzt priority=10 bereits selbst.
                 # Durch das additive Setzen sind BEIDE Pfade konsistent
                 # (ChartCircle-Vertrag, base_plugin.py).
                 return dict(
@@ -515,12 +627,9 @@ class FixedGridProximityIndicator(BaseIndicator):
             if cached_circles:
                 circles = [_colorize(c) for c in cached_circles]
             else:
-                circles_raw = prox_crp.get("hit_circles") or []
-                if _as_bool(p.get("show_circles"), True):
-                    circles = [_colorize(c) for c in circles_raw]
-                else:
-                    circles = []
-            status = dict(prox_crp.get("status_info") or empty_result["status_info"])
+                circles = render_payload.get("hit_circles") or []
+            status = dict(render_payload.get("status_info")
+                          or empty_result["status_info"])
 
             self._set_cached_lines(lines)
             self._known_times = self._compute_known_times(df)
