@@ -264,6 +264,9 @@ function applyFullChartUpdate(data) {
         _circleSeries = [];
         _circleMarkerPlugins = [];
         _circleLevelSeries = {};
+        // P16.05 (Prework Schritt 2): LineSeries-Registry nach Chart-Rebuild
+        // leeren (die alten Serien haengen am entfernten chart-Objekt).
+        _activeLineSeries = {};
         try { DaySeparator.clear(); } catch(e) {}
 
         var container = document.getElementById('chart-container');
@@ -347,8 +350,11 @@ function applyFullChartUpdate(data) {
         }
         rawCandleData = validCandles;
         lastClosePrice = validCandles[validCandles.length - 1].close;
-        // P14-03-E: Circle-Cache für Merged-Render aus dem Refresh-Payload.
-        _gridCirclesCache = (data.gridCircles || []).slice();
+        // P16.05 (P-C3): Circle-Cache für Merged-Render aus dem generischen
+        // Render-Payload (chartRenderPayload.hit_circles) statt gridCircles.
+        var renderPayload = (typeof data.chartRenderPayload === 'string')
+            ? JSON.parse(data.chartRenderPayload) : (data.chartRenderPayload || {});
+        _gridCirclesCache = (renderPayload.hit_circles || []).slice();
         // P14-03-E (Flacker-Fix): Live-Circle-Change-Detection nach Full-Update
         // zurücksetzen – der erste Tick nach dem Refresh rendert wieder.
         _lastLiveCirclesJson = '[]';
@@ -383,15 +389,13 @@ function applyFullChartUpdate(data) {
             try { updateCountdownDisplay(); } catch(e) {}
         }, 1000);
 
-        // Schritt 5: Grid-Linien
-        try { if (data.gridLines) renderGridLines(data.gridLines); } catch(e) {
-            console.warn('[applyFullChartUpdate] Schritt 5 (gridLines) fehlgeschlagen:', e.message || e);
-        }
-
-        // Schritt 6: Grid-Circles – unsichtbare LineSeries je Level-Preis;
-        // Circle-Marker der Engine liegen damit direkt auf den Liq-Lines.
-        try { if (data.gridCircles) renderGridCircles(data.gridCircles); } catch(e) {
-            console.warn('[applyFullChartUpdate] Schritt 6 (gridCircles) fehlgeschlagen:', e.message || e);
+        // P16.05 (P-C3): Schritt 5+6 – generische Render-Pipeline statt
+        // getrennter renderGridLines/renderGridCircles. Das aggregierte
+        // Indikator-Payload (chartRenderPayload) wird 1:1 an
+        // applyChartRenderPayload geroutet (price_lines→renderPriceLines,
+        // lines→renderLineSeries, hit_circles→renderMarkers).
+        try { if (data.chartRenderPayload) applyChartRenderPayload(data.chartRenderPayload); } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 5+6 (chartRenderPayload) fehlgeschlagen:', e.message || e);
         }
 
         // Schritt 7: Range

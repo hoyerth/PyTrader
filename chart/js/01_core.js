@@ -16,8 +16,9 @@ let gridPriceLines = [], dayLinesSeries = [];
 // Liq-Lines statt auf der Bar (native Engine-Positionierung, kein CSS-Overlay).
 let _circleSeries = [], _circleMarkerPlugins = [];
 // P14-03-E: Circle-Cache für Merged-Render (historische + Live-Circles).
-// Wird in applyFullChartUpdate() aus data.gridCircles befüllt; applyLiveOverlays()
-// ersetzt nur die Live-Zeit-Einträge und rendert den Cache neu.
+// Wird in applyFullChartUpdate() aus data.chartRenderPayload.hit_circles
+// (P16.05) befüllt; applyLiveOverlays() ersetzt nur die Live-Zeit-Einträge
+// und rendert den Cache neu.
 let _gridCirclesCache = [];
 // P14-03-E (Flacker-Fix): Level-Registry für INKREMENTELLES Circle-Rendering.
 // renderGridCircles() aktualisiert nur veränderte Level per setData/setMarkers,
@@ -25,6 +26,11 @@ let _gridCirclesCache = [];
 // dieser Full-Layer-Rebuild pro Live-Tick (sobald die Proximity-Bedingung erfüllt
 // war) verursachte das Live-Flackern. Schluessel = String(c.price).
 let _circleLevelSeries = {};
+// P16.05 (Prework Schritt 2, P-D2): Registry für Zeitreihen-LineSeries
+// (z. B. Multi-MA). renderLineSeries() pflegt je Linie eine LWC-LineSeries
+// unter `_activeLineSeries[id]` – incrementelles setData für vorhandene IDs,
+// chart.removeSeries() für verschwundene IDs (kein Full-Layer-Rebuild).
+let _activeLineSeries = {};
 // P14-03-E (Flacker-Fix): Change-Detection für Live-Circles. Identische Circle-
 // Sets zwischen Ticks (gleiche Level-Hits, gleiche Farbe) lösen KEINEN Re-Render
 // aus – sonst re-rendert jeder Tick mit erfüllter Bedingung den ganzen Layer.

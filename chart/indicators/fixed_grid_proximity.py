@@ -561,9 +561,13 @@ class FixedGridProximityIndicator(BaseIndicator):
         show_circles / circle_color_std / circle_color_active /
         use_time_filter).
 
-        Liefert {"lines", "hit_circles", "status_info"} für den JS-Bridge
-        (chart_win._serialize_and_render_grid) – Parität zum Alt-Grid:
-        * lines: {price, color, width, style:'solid', is_custom}
+        Liefert {"price_lines", "hit_circles", "status_info"} für den JS-Bridge
+        (chart_win._serialize_and_render_grid) – Parität zum Alt-Grid.
+        P16.05 (F1-Beschluss): Die Preislinien liegen unter dem Key
+        "price_lines" (eigener Key für horizontale Grid-Preislinien); der
+        "lines"-Key ist ausschließlich für Zeitreihen-LineSeries (Multi-MA)
+        reserviert.
+        * price_lines: {price, color, width, style:'solid', is_custom}
           (leere line_color = Paritäts-Styling des Alt-Grid:
           rgba(33,150,243,0.9) für Custom-Levels, rgba(33,150,243,0.5) für
           Normal-Levels; width/style seit P16.03-Bugfix aus line_width/
@@ -648,7 +652,7 @@ class FixedGridProximityIndicator(BaseIndicator):
 
         status_info = raw_features.get("status_info") or {}
         return {
-            "lines": lines,
+            "price_lines": lines,
             "hit_circles": hit_circles,
             "status_info": {
                 "in_time_window": bool(
@@ -679,7 +683,7 @@ class FixedGridProximityIndicator(BaseIndicator):
           aus der Pipeline (GridLinesService) – sie sind kein DB-Output.
         """
         empty_result: Dict[str, Any] = {
-            "lines": [],
+            "price_lines": [],
             "hit_circles": [],
             "status_info": {"in_time_window": False, "active_hits": []},
         }
@@ -717,7 +721,7 @@ class FixedGridProximityIndicator(BaseIndicator):
                     "statistics") or {},
             }
             render_payload = self.build_chart_render_payload(raw_features, p)
-            lines = render_payload.get("lines") or []
+            lines = render_payload.get("price_lines") or []
 
             # U15-A2 (Farb-Semantik) mit Bugfix 04.08.2026 (Circles wieder
             # sichtbar): PRIMÄR werden die Proximity-Hits aus dem feature_store
@@ -772,7 +776,7 @@ class FixedGridProximityIndicator(BaseIndicator):
             self._live_points = []
 
             return {
-                "lines": lines,
+                "price_lines": lines,
                 "hit_circles": circles,
                 "status_info": status,
             }

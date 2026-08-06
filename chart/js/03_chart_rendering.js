@@ -20,7 +20,10 @@ function _lwcLineStyle(styleName) {
     }
 }
 
-function renderGridLines(lines) {
+// P16.05 (Prework Schritt 2, F1/P-D2/P-D3): Generisches Preislinien-Primitiv.
+// Zeichnet horizontale Preislinien (Grid-Legacy) via candleSeries.createPriceLine.
+// Legacy-Alias renderGridLines() bleibt für Abwärtskompatibilität (P-D3).
+function renderPriceLines(lines) {
     clearGridLines();
     if (!candleSeries || !lines) return;
     var data = (typeof lines === 'string') ? JSON.parse(lines) : lines;
@@ -35,6 +38,7 @@ function renderGridLines(lines) {
         }
     });
 }
+function renderGridLines(lines) { renderPriceLines(lines); }
 
 // NOTE: Die Proximity-Circles werden auf der ZUGEHOERIGEN LIQ-LINE geplottet:
 // Je Level-Preis wird eine UNSICHTBARE LineSeries erzeugt (lineVisible:false,
@@ -58,7 +62,11 @@ function clearGridCircles() {
 // für unveränderte Level => kein Full-Layer-Rebuild pro Live-Tick (bisher rief
 // jede applyLiveOverlays renderGridCircles -> clearGridCircles auf, das ALLE
 // Circle-Serien wegwarf und neu aufbaute = Flackern bei erfüllter Proximity).
-function renderGridCircles(circles) {
+// P16.05 (Prework Schritt 2, P-D2/P-D3): Generisches Marker-Primitiv.
+// Übernimmt die bestehende inkrementelle Circle-Logik (je Level-Preis eine
+// unsichtbare LineSeries + SeriesMarkers-Plugin). renderGridCircles() bleibt
+// als Legacy-Alias für den Live-Overlay-Pfad (P-C4) erhalten (P-D3).
+function renderMarkers(circles) {
     if (!chart || !circles) return;
     var data = (typeof circles === 'string') ? JSON.parse(circles) : circles;
     if (!data || data.length === 0) {
@@ -158,6 +166,100 @@ function renderGridCircles(circles) {
             if (plugin) {
                 try { plugin.setMarkers(markers); } catch(e) {}
             }
+        }
+    }
+}
+function renderGridCircles(circles) { renderMarkers(circles); }
+
+// P16.05 (Prework Schritt 2, P-D2): Generisches Zeitreihen-Linien-Primitiv.
+// Pflegt eine Registry `_activeLineSeries[id]`: vorhandene LineSeries werden
+// per setData() in-place aktualisiert (incrementell, kein Flackern), IDs, die
+// im neuen Payload nicht mehr vorkommen, werden per chart.removeSeries()
+// entfernt. `data` ist direkt LWC-v5-setData-Input ([{time, value, color}]
+// mit optionalem Pro-Punkt-color – v5-konform, P16.04 build_chart_payload).
+function renderLineSeries(linesArray) {
+    if (!chart || !linesArray) return;
+    var data = (typeof linesArray === 'string') ? JSON.parse(linesArray) : linesArray;
+    if (!data || data.length === 0) {
+        // Kein Linien-Eintrag -> alle aktiven Zeitreihen-Serien entfernen.
+        for (var lid in _activeLineSeries) {
+            if (Object.prototype.hasOwnProperty.call(_activeLineSeries, lid)) {
+                try { if (_activeLineSeries[lid]) chart.removeSeries(_activeLineSeries[lid]); } catch(e) {}
+            }
+        }
+        _activeLineSeries = {};
+        return;
+    }
+
+    // 1) IDs entfernen, die im neuen Satz nicht mehr existieren.
+    var newIds = {};
+    for (var n = 0; n < data.length; n++) {
+        var l0 = data[n];
+        if (l0 && l0.id) newIds[l0.id] = true;
+    }
+    for (var oldId in _activeLineSeries) {
+        if (Object.prototype.hasOwnProperty.call(_activeLineSeries, oldId) && !newIds[oldId]) {
+            try { if (_activeLineSeries[oldId]) chart.removeSeries(_activeLineSeries[oldId]); } catch(e) {}
+            delete _activeLineSeries[oldId];
+        }
+    }
+
+    // 2) Upsert pro Linie.
+    for (var m = 0; m < data.length; m++) {
+        var line = data[m];
+        if (!line || !line.id || !line.data) continue;
+        var series = _activeLineSeries[line.id];
+        if (!series) {
+            try {
+                series = chart.addSeries(LightweightCharts.LineSeries, {
+                    lineWidth: (line.width && line.width > 0) ? line.width : 1,
+                    lineStyle: _lwcLineStyle(line.style),
+                    color: line.color || '#26A69A',
+                    lastValueVisible: false,
+                    priceLineVisible: false,
+                    crosshairMarkerVisible: false,
+                    priceScaleId: 'right'
+                });
+                _activeLineSeries[line.id] = series;
+            } catch(e) { continue; }
+        }
+        // Daten ersetzen (inkl. optionaler Pro-Punkt-Farbe für dual_color-MAs).
+        try { series.setData(line.data); } catch(e) { continue; }
+        // Style-Änderungen (width/style/color) nachziehen.
+        try {
+            series.applyOptions({
+                lineWidth: (line.width && line.width > 0) ? line.width : 1,
+                lineStyle: _lwcLineStyle(line.style),
+                color: line.color || '#26A69A'
+            });
+        } catch(e) {}
+    }
+}
+
+// P16.05 (Prework Schritt 2, P-D1/F1): Generische Render-Pipeline – die
+// Haupt-Schnittstelle, die das aggregierte Indikator-Payload 1:1 an die
+// Grafik-Primitive routet:
+//   payload.price_lines -> renderPriceLines() (horizontale Preislinien)
+//   payload.lines       -> renderLineSeries() (Zeitreihen-LineSeries)
+//   payload.hit_circles -> renderMarkers()    (Marker/Circles)
+// Keys werden nur geroutet, wenn sie im Payload vorhanden sind (leere Arrays
+// clearen den jeweiligen Layer). Kein Feld-Dispatch, kein kind-Feld (F1).
+function applyChartRenderPayload(payload) {
+    if (!chart || !candleSeries) return;
+    var p = (typeof payload === 'string') ? JSON.parse(payload) : (payload || {});
+    if (Object.prototype.hasOwnProperty.call(p, 'price_lines')) {
+        try { renderPriceLines(p.price_lines || []); } catch(e) {
+            console.warn('[applyChartRenderPayload] price_lines fehlgeschlagen:', e.message || e);
+        }
+    }
+    if (Object.prototype.hasOwnProperty.call(p, 'lines')) {
+        try { renderLineSeries(p.lines || []); } catch(e) {
+            console.warn('[applyChartRenderPayload] lines fehlgeschlagen:', e.message || e);
+        }
+    }
+    if (Object.prototype.hasOwnProperty.call(p, 'hit_circles')) {
+        try { renderMarkers(p.hit_circles || []); } catch(e) {
+            console.warn('[applyChartRenderPayload] hit_circles fehlgeschlagen:', e.message || e);
         }
     }
 }

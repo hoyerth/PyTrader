@@ -121,23 +121,27 @@ class ChartDataSerializer(QThread):
 
 
 class GridDataSerializer(QThread):
-    """Serialisiert Grid-Linien/Circles im Hintergrund-Thread."""
-    done = Signal(str, str, int)  # lines_json, circles_json, gridGen
+    """Serialisiert das aggregierte Indikator-Render-Payload im Hintergrund-Thread.
 
-    def __init__(self, lines: list, circles: list, grid_gen: int, parent=None):
+    P16.05 (F4-Beschluss): Threading-Muster exakt beibehalten (QThread +
+    done-Signal + Generations-Guard), nur das Payload-Format ist generisch:
+    done liefert EIN payload_json (das komplette aggregierte Render-Payload
+    {"lines", "price_lines", "hit_circles"}) statt getrennter lines/circles.
+    """
+    done = Signal(str, int)  # payload_json, gridGen
+
+    def __init__(self, payload: dict, grid_gen: int, parent=None):
         super().__init__(parent)
-        self.lines = lines
-        self.circles = circles
+        self.payload = payload
         self.grid_gen = grid_gen
 
     def run(self):
         try:
-            lj = json.dumps(self.lines, allow_nan=False)
-            cj = json.dumps(self.circles, allow_nan=False)
-            self.done.emit(lj, cj, self.grid_gen)
+            pj = json.dumps(self.payload, allow_nan=False)
+            self.done.emit(pj, self.grid_gen)
         except (ValueError, TypeError) as e:
             print(f"⚠️ [GridSerializer] JSON-Fehler: {e}")
-            self.done.emit("", "", self.grid_gen)
+            self.done.emit("", self.grid_gen)
 
 
 class PyTraderChartWindow(QMainWindow):
@@ -580,17 +584,22 @@ class PyTraderChartWindow(QMainWindow):
         self.save_state()
         self.render_indicators()
 
-    def render_indicators(self):
-        """Rendert alle aktiven Indikatoren via JS-Bridge."""
-        if self.df_data is None or self.df_data.empty:
-            return
+    def _collect_render_payload(self) -> Dict[str, list]:
+        """P16.05 (Prework Schritt 1, F1/P-C2): Sammelt das generische
+        Render-Payload über ALLE aktiven Indikatoren.
 
-        # Zuerst alle Indikator-Layer clearen
-        try:
-            self.web_view.page().runJavaScript("if(window.clearGridLines) clearGridLines();")
-            self.web_view.page().runJavaScript("if(window.clearGridCircles) clearGridCircles();")
-        except (RuntimeError, AttributeError):
-            pass
+        Aggregiert die Keys `lines` (Zeitreihen-LineSeries, z. B. Multi-MA),
+        `price_lines` (horizontale Grid-Preislinien) und `hit_circles`
+        (Marker) zu einem einzigen Dict. Keine Indikator-spezifischen
+        Branches mehr (Open/Closed, Invariante 9). Circle- und Linien-Zeiten
+        (reale Wanduhr-Epochs) werden generisch auf kontinuierliche Zeiten
+        gemappt (P-D1 / Ergänzung 1: `_time_real_to_cont.get(ts, ts)`).
+        """
+        payload: Dict[str, list] = {
+            "lines": [], "price_lines": [], "hit_circles": [],
+        }
+        if self.df_data is None or self.df_data.empty:
+            return payload
 
         for ind_id, plugin in self.indicators.items():
             st = self.indicators_state.get(ind_id, {})
@@ -602,26 +611,72 @@ class PyTraderChartWindow(QMainWindow):
                     plugin.set_context(self.current_symbol, self.current_tf)
                 # 5.4 Schritt 2: Parameter aus set_id (Logik) + display_params
                 # (Darstellung) auflösen – Legacy voller params bleibt erhalten.
-                res = plugin.calculate(self.df_data, self._resolve_indicator_params(ind_id, st))
-                # Grid-spezifische Render-Logik (Plugin 'ind_fixed_grid_proximity')
-                if ind_id == "ind_fixed_grid_proximity":
-                    lines = res.get("lines", [])
-                    circles = res.get("hit_circles", [])
-                    # Circle-Zeiten auf kontinuierlich mappen
-                    if circles and self._time_real_to_cont:
-                        for gc in circles:
-                            gc_t = gc.get("time")
-                            if gc_t is not None and int(gc_t) in self._time_real_to_cont:
-                                gc["time"] = self._time_real_to_cont[int(gc_t)]
-                    # JSON-Encoding im Hintergrund
-                    self._serialize_and_render_grid(lines, circles)
+                res = plugin.calculate(
+                    self.df_data, self._resolve_indicator_params(ind_id, st))
             except (RuntimeError, AttributeError):
-                pass
+                continue
+            if not isinstance(res, dict):
+                continue
+            for key in ("lines", "price_lines", "hit_circles"):
+                items = res.get(key)
+                if not items:
+                    continue
+                # Zeit-Mapping real→kontinuierlich (nur Zeitreihen-Keys;
+                # price_lines sind horizontale Preislinien ohne Zeit).
+                if key in ("lines", "hit_circles") and self._time_real_to_cont:
+                    if key == "lines":
+                        # LineSeries-Format: {id, data:[{time, value, color}]}
+                        # – die Zeit steckt in den Datenpunkten (data).
+                        for item in items:
+                            if not isinstance(item, dict):
+                                continue
+                            for pt in (item.get("data") or []):
+                                if not isinstance(pt, dict):
+                                    continue
+                                pt_t = pt.get("time")
+                                if pt_t is None:
+                                    continue
+                                try:
+                                    pt_t = int(pt_t)
+                                except (TypeError, ValueError):
+                                    continue
+                                pt["time"] = self._time_real_to_cont.get(pt_t, pt_t)
+                    else:
+                        # Marker-Format: {time, price, ...} – Zeit auf oberster
+                        # Ebene des Items (Circle).
+                        for item in items:
+                            if not isinstance(item, dict):
+                                continue
+                            gc_t = item.get("time")
+                            if gc_t is None:
+                                continue
+                            try:
+                                gc_t = int(gc_t)
+                            except (TypeError, ValueError):
+                                continue
+                            item["time"] = self._time_real_to_cont.get(gc_t, gc_t)
+                payload[key].extend(items)
+        return payload
+
+    def render_indicators(self):
+        """Rendert alle aktiven Indikatoren via JS-Bridge.
+
+        P16.05 (Prework Schritt 1): Generische Pipeline statt Indikator-
+        Branches – das aggregierte Render-Payload wird 1:1 per
+        applyChartRenderPayload an JS durchgereicht (P-D1, F1).
+        """
+        if self.df_data is None or self.df_data.empty:
+            return
+
+        payload = self._collect_render_payload()
 
         # P14-03-E (Flacker-Fix): calculate() resettet die _known_times der
         # Indikatoren – die offene Live-Bar generisch wieder einfügen, damit
         # der New-Candle-Callback nicht erneut feuert (Flacker-Zyklus).
         self._reinject_live_bar_to_indicators()
+
+        # JSON-Encoding im Hintergrund (F4: Threading-Muster exakt beibehalten)
+        self._serialize_and_render_grid(payload)
 
     def _reinject_live_bar_to_indicators(self) -> None:
         """P14-03-E (Flacker-Fix): Fügt die offene Live-Bar-Zeit generisch in
@@ -643,8 +698,13 @@ class PyTraderChartWindow(QMainWindow):
             except Exception:
                 continue
 
-    def _serialize_and_render_grid(self, lines: list, circles: list) -> None:
-        """Serialisiert Grid-Daten im Hintergrund-Thread und rendert sie.
+    def _serialize_and_render_grid(self, payload: dict) -> None:
+        """Serialisiert das aggregierte Indikator-Render-Payload im
+        Hintergrund-Thread und rendert es.
+
+        P16.05 (F4-Beschluss): Threading-Muster exakt beibehalten (QThread +
+        done-Signal + Generations-Guard) – nur das Payload-Format ist
+        generisch (EIN payload_json statt getrennter lines/circles).
         Alter Thread wird vor Neustart sauber beendet.
         Generations-Guard: jede Render-Anforderung bekommt eine steigende ID;
         veraltete Ergebnisse (langsamer Thread) werden verworfen."""
@@ -661,25 +721,26 @@ class PyTraderChartWindow(QMainWindow):
 
         self._grid_generation += 1
         grid_gen = self._grid_generation
-        self._grid_serializer = GridDataSerializer(lines, circles, grid_gen)
+        self._grid_serializer = GridDataSerializer(payload, grid_gen)
         self._grid_serializer.done.connect(self._apply_grid_render)
         self._grid_serializer.start()
 
-    def _apply_grid_render(self, lines_json: str, circles_json: str, grid_gen: int) -> None:
-        """Übergibt serialisierte Grid-Daten an JS (wird im GUI-Thread aufgerufen).
-        Verwirft veraltete Ergebnisse, falls inzwischen ein neuerer Render lief."""
+    def _apply_grid_render(self, payload_json: str, grid_gen: int) -> None:
+        """Übergibt das serialisierte Render-Payload an JS (GUI-Thread).
+
+        P16.05 (F4-Beschluss): Generations-Guard unverändert; geroutet wird
+        über die generische JS-Pipeline `applyChartRenderPayload(payload)`
+        (P-D1/F1: price_lines→renderPriceLines, lines→renderLineSeries,
+        hit_circles→renderMarkers). Verwirft veraltete Ergebnisse, falls
+        inzwischen ein neuerer Render lief."""
         if grid_gen < self._grid_generation:
             print(f"⚠️ [GridRender] Veraltetes Ergebnis verworfen (gen={grid_gen} < {self._grid_generation})")
             return
-        if not lines_json and not circles_json:
+        if not payload_json:
             return
         try:
-            if lines_json:
-                self.web_view.page().runJavaScript(
-                    f"if(window.renderGridLines) renderGridLines('{lines_json}');")
-            if circles_json:
-                self.web_view.page().runJavaScript(
-                    f"if(window.renderGridCircles) renderGridCircles('{circles_json}');")
+            self.web_view.page().runJavaScript(
+                f"if(window.applyChartRenderPayload) applyChartRenderPayload({payload_json});")
         except (RuntimeError, AttributeError):
             pass
 
@@ -717,6 +778,22 @@ class PyTraderChartWindow(QMainWindow):
                         not math.isnan(c["high"]) and
                         not math.isnan(c["low"]) and
                         not math.isnan(c["close"])):
+                        # P16.05 (F3-Beschluss): tick_volume NaN/None -> 0,
+                        # die Candle bleibt gültig. Doppel-Absicherung zur
+                        # Normalisierung in fetch_historical_candles, damit
+                        # json.dumps(allow_nan=False) nie an tick_volume
+                        # scheitert und df_data["tick_volume"] sauber ist.
+                        tv = c.get("tick_volume")
+                        if tv is None:
+                            tv = 0.0
+                        else:
+                            try:
+                                tv = float(tv)
+                            except (TypeError, ValueError):
+                                tv = 0.0
+                            if math.isnan(tv):
+                                tv = 0.0
+                        c["tick_volume"] = tv
                         clean_candles.append(c)
 
             # ======================================================================
@@ -763,26 +840,12 @@ class PyTraderChartWindow(QMainWindow):
             self.df_data = None
             continuous_candles = []
 
-        grid_lines = []
-        grid_circles = []
-
-        if self.df_data is not None and not self.df_data.empty:
-            for ind_id, plugin in self.indicators.items():
-                st = self.indicators_state.get(ind_id, {})
-                if st.get("active") and ind_id == "ind_fixed_grid_proximity":
-                    if hasattr(plugin, "set_context"):
-                        plugin.set_context(self.current_symbol, self.current_tf)
-                    # 5.4 Schritt 2: Logik aus set_id + Darstellung aus
-                    # display_params auflösen (Legacy volle params bleibt).
-                    res = plugin.calculate(self.df_data, self._resolve_indicator_params(ind_id, st))
-                    grid_lines = res.get("lines", [])
-                    grid_circles = res.get("hit_circles", [])
-                    # Circle-Zeiten auf kontinuierlich mappen
-                    if grid_circles and self._time_real_to_cont:
-                        for gc in grid_circles:
-                            gc_t = gc.get("time")
-                            if gc_t is not None and int(gc_t) in self._time_real_to_cont:
-                                gc["time"] = self._time_real_to_cont[int(gc_t)]
+        # P16.05 (Prework Schritt 1): Generische Payload-Aggregation über
+        # ALLE aktiven Indikatoren (P-D1/F1/P-C2) – keine Indikator-
+        # spezifischen Branches mehr (Open/Closed, Invariante 9). Circle-/
+        # Linien-Zeiten werden in _collect_render_payload auf kontinuierlich
+        # gemappt (real→cont via _time_real_to_cont).
+        render_payload = self._collect_render_payload()
 
         # P14-03-E (Flacker-Fix, generisch): plugin.calculate() setzt die
         # _known_times der Indikatoren auf die DB-Bars zurück – die offene
@@ -799,8 +862,10 @@ class PyTraderChartWindow(QMainWindow):
             "timeframe": self.current_tf,
             "candles": continuous_candles,
             "precision": precision,
-            "gridLines": grid_lines,
-            "gridCircles": grid_circles,
+            # P16.05 (P-C3/F4): chartRenderPayload (analog gridLines/
+            # gridCircles) – applyFullChartUpdate ruft die generische
+            # JS-Pipeline applyChartRenderPayload(chartRenderPayload) auf.
+            "chartRenderPayload": render_payload,
             "measurementState": self.measurement_state,
             "timeMap": self._time_cont_to_real,
             # TF_SECONDS_MAP: Python ist die Single Source of Truth. JS nutzt

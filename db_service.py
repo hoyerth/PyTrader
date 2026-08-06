@@ -561,9 +561,9 @@ class MarketDataRepository:
 
 				query = """
 					SELECT EXTRACT('epoch' FROM "time")::BIGINT AS time_epoch,
-					       open, high, low, close 
+					       open, high, low, close, tick_volume 
 					FROM (
-						SELECT "time", open, high, low, close 
+						SELECT "time", open, high, low, close, tick_volume 
 						FROM ohlcv_bars 
 						WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
 						  AND "time" IS NOT NULL 
@@ -581,12 +581,18 @@ class MarketDataRepository:
 
 				for r in rows:
 					t_epoch = int(r[0])  # Bereits epoch-Integer aus DuckDB
+					# P16.05 VWMA-Fix (P-D4): tick_volume wird mitgeliefert.
+					# Entscheidung F3: NaN/None -> 0, Candle bleibt gueltig
+					# (kein WHERE-Filter auf tick_volume, damit Candles mit
+					# NULL-Volumen nicht wegfallen).
+					vol_raw = r[5]
 					candles.append({
 						"time": t_epoch,
 						"open": float(r[1]),
 						"high": float(r[2]),
 						"low": float(r[3]),
-						"close": float(r[4])
+						"close": float(r[4]),
+						"tick_volume": float(vol_raw) if vol_raw is not None else 0.0
 					})
 				break
 
