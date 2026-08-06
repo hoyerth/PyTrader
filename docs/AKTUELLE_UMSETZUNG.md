@@ -324,3 +324,40 @@ Jeder aktive MA (1–8) wird als eigener Linien-Eintrag im `lines`-Array des Pay
 6. **16.05 Verifikation (F2):** gezielter Logik-Test in `test/test.py` + `py_compile` + Import-Smoke.
 
 ---
+
+# Phase 16.05 – Implementierungs-Log: Indikator-Dialog Bugfix Multi-MA (06.08.2026)
+
+> **Status:** Umsetzung **abgeschlossen** (Commit `6cecb11`, nach Benutzer-Freigabe im Bugfixing-Modus). Die drei Anwenderanforderungen am Multi-MA-Prop-Fenster sind behoben und per gezieltem Logik-Test in `test/test.py` (Teil 10, D1–D6) verifiziert. Git-Backup vor der Umsetzung: `6cecb11`; Vor-Kapitel: Prework + Multi-MA (Commits `16a5838`, `ba60361`, `370031f`).
+
+## Ausgangslage (Bugfixing-Modus, 3 Anwenderanforderungen)
+
+1. **„in diesem indikator gibt es keine services – dazu alles ausblenden":** Das Prop-Fenster des Multi-MA zeigte trotz `service_plugin_ids=[]` die komplette Service-UI (`Service-Parameter`, `Service-Set Aktionen`, `Experten-Optionen`).
+2. **„ma_farbe hat eine checkbox, das ist nicht richtig ... bitte entfernen":** Farb-Parameter wurden als `StylePickerWidget`-Composite gerendert – inklusive der „sichtbar"-Checkbox. Sie hat keine Funktion (die Sichtbarkeit steuert ausschließlich `show_maX`) und war vom Benutzer nicht definiert.
+3. **„für jeden ma fehlen parameter: a. die länge, b. der ma type, c. der glättungstyp, d. der alpha wert":** Die Nicht-Darstellungs-Parameter (`maX_type`/`maX_period`/`maX_smooth_type`/`maX_alpha`) wurden im Plugin-Pfad von `_init_plugin_ui` über `_is_visual_key()` gefiltert und erschienen **nirgends** – die Service-Parameter-Box rendert nur Service-Seiten.
+
+## Ursachenanalyse (Ist-Stand)
+
+- `indicator_dialog._init_plugin_ui` baute `indi_group` („Anzeige & Farben") nur aus `_is_visual_key()`-Keys (`show_*` / `color`) und danach **immer** die drei Service-Boxen – unabhängig davon, ob der Indikator Services deklariert.
+- `_is_visual_key` ordnet alle `color`-Keys als visuell ein → sie landen im `StylePickerWidget`-Composite (mit „sichtbar"-Checkbox). Das Composite ist für Grid-Farben (Linienstil/-stärke) korrekt, für reine MA-Farben nicht.
+- Die Nicht-Darstellungs-Parameter des Multi-MA hatten im Plugin-Pfad **keinen** Render-Ort.
+
+## Umsetzung (Commit `6cecb11`)
+
+1. **Service-UI ausblenden (Anforderung 1):** `_init_plugin_ui` prüft `self._indicator_service_ids()`. Ohne Services wird die neue Methode `_init_plugin_ui_params_only(main_layout)` aufgerufen: rendert **alle** Parameter direkt, gruppiert nach `param_layout` (Multi-MA: „MA 1 (Führung)" … „MA 8"), plus Preset-Verwaltung rechts. Die drei Service-Boxen entfallen komplett. **Additiv:** Der Service-Pfad für Grid-Indikatoren bleibt unverändert.
+2. **Reiner Farbwähler (Anforderung 2):** `StylePickerWidget` erhält den Konstruktor-Parameter `color_only` (nur der Farb-Button wird gerendert; keine „sichtbar"-Checkbox, keine Linienart/-stärke) + Property `color_only`. Die Multi-MA-Farbparameter (`ma1_bull_color`/`ma1_bear_color`/`ma2..8_color`) deklarieren `"color_only": True`; `create_schema_control` rendert sie als reinen Farbwähler. Die drei Round-Trip-Pfade (`_build_preset_payload`, `collect_params_from_ui`, `update_ui_from_params`) überspringen für `color_only` die Geschwister-Keys (`maX_style`/`maX_width`).
+3. **Fehlende MA-Parameter (Anforderung 3):** Durch `_init_plugin_ui_params_only` erscheinen jetzt `maX_type` (Choice), `maX_period`/Länge (SpinBox), `maX_smooth_type` (Choice) und `maX_alpha` (DoubleSpinBox) mit den Defaults (D7): MA1 `EHMA/4/EHMA/2.0`, MA2..8 `EMA/10·X/EMA/2.0`.
+4. **None-Vorbelegung der Service-Attribute in `__init__`:** `combo_service_set`, `combo_service_sel`, `stack_service_forms`, `edit_set_name`, `edit_set_description`, `group_expert` werden mit `None` initialisiert → alle bestehenden `if self.<attr>:`-Guards (z. B. `_build_preset_payload`, `on_preset_selected`, `refresh_service_set_list`) werden None-sicher, ohne den Service-Pfad zu verändern.
+
+## Verifikation (F2, gezielter Logik-Test in `test/test.py` Teil 10)
+
+- **D1:** `_get_plugin` liefert den Indikator selbst; `_indicator_service_ids()` leer. ✅
+- **D2:** Keine Service-UI (`combo_service_set`/`edit_set_name`/`group_expert` sind `None`). ✅
+- **D3:** Alle 50 Parameter in `param_controls`; `maX_type`/`maX_smooth_type` = ComboBox, `maX_period` = SpinBox, `maX_alpha` = DoubleSpinBox; Defaults MA1/MA2 korrekt. ✅
+- **D4:** Farb-Controls = `StylePickerWidget` mit `color_only=True`. ✅
+- **D5:** Preset-Payload: `logic_params` enthält `maX_type/period/smooth_type/alpha`; `display_params` enthält `show_maX` + Farben; keine Sibling-Keys (`maX_style`/`maX_width`). ✅
+- **D6 (Kontrolle):** Grid-Indikator (mit Services) behält die Service-UI unverändert. ✅
+- **Zusätzlich:** `python -m py_compile` auf allen 4 geänderten Dateien erfolgreich. Die 6 vorbestehenden Fehlschläge (P2/P5/H3–H5/H7, ServiceWindow) sind unverändert und **nicht** durch diese Änderung verursacht.
+- **Datumskorrektur:** Die Code-Kommentare trugen zunächst fälschlich „08.08.2026" – auf das tatsächliche Datum **06.08.2026** korrigiert (nachgelagerter Commit).
+
+---
+

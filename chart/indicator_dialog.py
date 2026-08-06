@@ -374,7 +374,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		# ueberschrieben werden.
 		self._preset_logic_params: Dict[str, Any] = dict(logic_params or {})
 
-		# Bugfix (08.08.2026): Indikatoren OHNE deklarierte Services (z.B.
+		# Bugfix (06.08.2026): Indikatoren OHNE deklarierte Services (z.B.
 		# Multi-MA) erzeugen die Service-UI-Attribute NICHT mehr (siehe
 		# _init_plugin_ui -> _init_plugin_ui_params_only). Die None-
 		# Vorbelegung macht die bestehenden 'if self.<attr>:'-Guards (z.B.
@@ -586,7 +586,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			# marker-Modus nicht verloren geht (Typ-Mismatch im Widget würde
 			# sonst auf die Default-Farbe zurueckfallen).
 			style_type = str(spec.get("style_type", "line"))
-			# Bugfix (08.08.2026): Reiner Farbwaehler (color_only im Schema,
+			# Bugfix (06.08.2026): Reiner Farbwaehler (color_only im Schema,
 			# z.B. Multi-MA maX_color) - KEIN StylePickerWidget-Composite.
 			# Diese Farb-Parameter besitzen keine Geschwister-Keys
 			# (style/width bzw. shape/size) und keine eigene
@@ -762,7 +762,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		for key, spec in base_schema.items():
 			self.plugin_labels.setdefault(key, spec.get("description") or self._human(key))
 
-		# Bugfix (08.08.2026): Plugin-Indikator OHNE deklarierte Services
+		# Bugfix (06.08.2026): Plugin-Indikator OHNE deklarierte Services
 		# (service_plugin_ids leer, z.B. Multi-MA 'ind_moving_averages').
 		# Anwenderanforderung: "in diesem indikator gibt es keine services -
 		# dazu alles ausblenden". Alle Service-Boxen ('Service-Parameter',
@@ -961,7 +961,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		self.refresh_service_set_list()
 
 	def _init_plugin_ui_params_only(self, main_layout: QVBoxLayout) -> None:
-		"""Bugfix (08.08.2026): Plugin-Indikator OHNE deklarierte Services.
+		"""Bugfix (06.08.2026): Plugin-Indikator OHNE deklarierte Services.
 
 		Rendert ALLE Parameter direkt - gruppiert nach `param_layout` (z.B.
 		Multi-MA: 'MA 1 (Führung)' .. 'MA 8'), sonst flach. Die Service-Boxen
@@ -1475,7 +1475,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 				# P16.03-Bugfix: Form/Groesse bzw. Linienart/-staerke in
 				# display_params aufnehmen (Konvention 'color' -> 'shape'/'size'
 				# bzw. 'style'/'width'), damit Presets die Auswahl im
-				# StylePickerWidget round-trippen. Bugfix (08.08.2026):
+				# StylePickerWidget round-trippen. Bugfix (06.08.2026):
 				# color_only-Waehler (Multi-MA) haben KEINE Geschwister-Keys
 				# und werden uebersprungen.
 				if isinstance(ctrl, StylePickerWidget):
@@ -1884,7 +1884,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			elif isinstance(ctrl, StylePickerWidget):
 				style_obj = ctrl.get_style()
 				new_params[key] = style_obj.color
-				# Bugfix (08.08.2026): color_only-Waehler (Multi-MA) haben
+				# Bugfix (06.08.2026): color_only-Waehler (Multi-MA) haben
 				# keine Geschwister-Keys -> Sibling-Schreiben ueberspringen.
 				if getattr(ctrl, "color_only", False):
 					continue
@@ -1922,7 +1922,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 					ctrl.setCurrentText(str(val))
 				elif isinstance(ctrl, StylePickerWidget) and isinstance(val, str):
 					ctrl.set_color(val)
-					# Bugfix (08.08.2026): color_only-Waehler (Multi-MA) haben
+					# Bugfix (06.08.2026): color_only-Waehler (Multi-MA) haben
 					# keine Geschwister-Keys -> Restore-Schritt ueberspringen.
 					if getattr(ctrl, "color_only", False):
 						continue

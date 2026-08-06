@@ -88,7 +88,7 @@ class StylePickerWidget(QWidget):
     ) -> None:
         super().__init__(parent)
         self._enable_alpha: bool = bool(enable_alpha)
-        # color_only (Bugfix 08.08.2026): Reiner Farbwaehler - das Composite
+        # color_only (Bugfix 06.08.2026): Reiner Farbwaehler - das Composite
         # (Sichtbarkeits-Checkbox, Linienstaerke/Groesse, Linienart/Markerform)
         # wird NICHT angezeigt. Verwendet fuer reine Farb-Parameter (z.B.
         # Multi-MA maX_color), deren Sichtbarkeit ein separater 'show_*'-
