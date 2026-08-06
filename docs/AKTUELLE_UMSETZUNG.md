@@ -32,177 +32,162 @@ Ziel von **Phase 15** ist die Weiterentwicklung der Service-UI (`service_win.py`
 
 ---
 
-# TASK: Phase 15.04 – Infrastructure & EventBus Hardening
+ # TASK: Phase 15.03-E – Popover-ServiceSelector im AnalyticsWindow (ÜBERARBEITET 06.08.2026)
 
-Bitte setze das Infrastruktur-Upgrading und das Cleanup der Repositories/Payloads gemäß den folgenden Spezifikationen um:
+ > **Ist-Analyse 06.08.2026 (Code-konsistente Korrektur):**
+ > Der Ursprungsentwurf referenzierte ein nicht existentes `SelectorMode`-Enum,
+ > einen `MasterTree` im `SELECT_ONLY`-Modus und eine `ParameterPanel`-Klasse
+ > (entfernt, `.backup_parameter_panel` leer). Real:
+ > * `ServiceSelectorWidget.MODE_SELECT_ONLY` (String-Konstante) baut eine
+ >   KOMPAKTE DROPDOWN-Zeile (Set-Combo + Service-Combo), KEINEN Tree.
+ > * Parameter-Anzeige baut `ServiceParamColumnsMixin._build_service_column()`
+ >   (eine QGroupBox-Spalte je Service) – es gibt keine `set_service()`-API.
+ > * `AnalyticsWindow` hat BEREITS ein Feature-Filter-Dropdown (`combo_feature`).
+ > **Entscheidung (User, 06.08.2026):** Das Popover ERSETZT `combo_feature` –
+ > keine Doppelsteuerung von `AnalyticsViewModel.set_feature_id()`.
 
----
+ Bitte binde das `ServiceSelectorWidget` (Modus `MODE_SELECT_ONLY`) als
+ platzsparendes Top-Bar-Popover im `AnalyticsWindow` (`analytics/ui/analytics_win.py`)
+ ein und ersetze das bestehende Feature-Filter-Dropdown:
 
- ### 1. EventBus verifizieren statt ergänzen (config/event_bus.py) – STATUS: bereits umgesetzt
+ ---
 
- ACHTUNG (Ist-Analyse 05.08.2026): Alle geforderten Core-Signale existieren
- bereits in `config/event_bus.py` – inkl. des Concurrency-Guards (Phase 16,
- getestet in test/test.py S1–S8). Dieser Abschnitt ist KEIN Implementierungs-
- auftrag mehr, sondern eine reine Bestands-Verifikation:
+ ### 1. Top-Bar Popover Button (ersetzt `combo_feature`)
+ 1. **Button-Platzierung (`analytics/ui/analytics_win.py`, Filter-Zeile):**
+    - Ersetze das bestehende `combo_feature`-Dropdown durch einen Popover-Button:
+      `[ Set/Service: ▾ Keiner ausgewählt ]`
+    - Die bisherigen Slots `_on_feature_changed()` / `_populate_feature_combo()`
+      entfallen (Redundanz, Entscheidung 06.08.2026). Die Verkabelung
+      `combo_feature.currentIndexChanged → set_feature_id` wird durch das
+      Popover übernommen.
+ 2. **Flyout/Popover-Widget:**
+    - Klick auf den Button öffnet ein schwebendes Popover direkt unter dem Button.
+    - Inhalt (manuell anpassbar – Variante „minimal-invasiv"):
+      * **Oben:** `ServiceSelectorWidget` im Modus `MODE_SELECT_ONLY`
+        (Set-/Service-Combos), Signale `selection_changed(set_id, service_id)`.
+      * **Unten:** Read-Only-Parameteranzeige für den gewählten Service über
+        `ServiceParamColumnsMixin._build_service_column(iid, pid, cfg)` in einem
+        deaktivierten `QGroupBox`-Container (`setEnabled(False)`).
+    - Alternativ (falls gewünscht): Read-Only-`MasterTree` statt Combos – dann
+      muss ein neues Widget gebaut werden (nicht Teil dieses minimal-invasiven
+      Tasks).
+    - Enthält den Aktions-Button `[ 🗑️ Aktiven Service-Filter entfernen ]`.
 
- - `favorites_changed = Signal()`
- - `profile_changed = Signal(str)`
- - `service_set_changed = Signal()`
- - `service_run_started = Signal()`   # Concurrency-Guard (Timer-Stop, main.py)
- - `service_run_finished = Signal()`  # Concurrency-Guard (Timer-Start, main.py)
+ ---
 
- Erwartete Aktion:
- - KEINE Änderung an config/event_bus.py.
- - Verifikation nur über den Headless-Check (Abschnitt 4): prüft, dass alle
-   5 Signale existieren und per connect/emit empfangen werden können.
+ ### 2. Inspektion, Filter-Entfernung & Sicherheitsabfrage
+ 1. **Parameter-Inspektion im Popover:**
+    - `selection_changed(set_id, service_id)` lädt die rechte Parameteranzeige:python
+      cfg = self.model.find_service(setid, serviceid) or {}
+      pid = cfg.get("pluginid") or serviceid
+      box = self.buildservicecolumn(serviceid, pid, cfg)   # ServiceParamColumnsMixin
+      box.setEnabled(False)                                    # Read-Only
+      2. **feature_id-Auflösung (Lücke im Ursprungsentwurf):**
+    - Das Widget-Signal liefert `set_id`/`service_id`, NICHT die `feature_id`.
+    - Auflösung über das Modell: `plugin_id = model.find_service(set_id, service_id).get("plugin_id")`
+    - Dann `AnalyticsViewModel.set_feature_id(plugin_id)` – der `feature_id` im
+      Feature-Store IST die `plugin_id` (grid_lines / proximity).
+ 3. **Aktion "Service-Filter entfernen" + Sicherheitsabfrage:**
+    - **Niemals automatisch alle Services vermischen!** (einzelner `feature_id`)
+    - Vor dem Entfernen modale Abfrage (`QMessageBox.question`):
+      > *"Möchtest du den aktiven Service-Filter wirklich entfernen? Die Anzeige
+      > im Analytics-Fenster zeigt danach wieder alle Features."*
+      (Korrektur: `set_feature_id(None)` entfernt den Filter → ALLE Feature-Rows
+      sichtbar, kein „leeres Raster".)
+    - Bei Bestätigung: `AnalyticsViewModel.set_feature_id(None)`, Popover
+      schließen, Button-Text auf `[ Set/Service: ▾ Keiner ausgewählt ]`.
+ 4. **Button-Text & Profil-Persistenz:**
+    - Der Button-Text zeigt den aktiven Filter: `[ Set/Service: ▾ <plugin_id> ]`
+      bzw. `[ Set/Service: ▾ <set_id>/<service_id> ]` (manuell anpassbar).
+    - `feature_id` wird über `AnalyticsViewModel._current_payload()` bereits im
+      Profil-Payload persistiert (dict(self._params) inkl. feature_id) ✔.
+    - Bei Profilwechsel übernimmt `_apply_profile()` die Profil-Parameter inkl.
+      `feature_id` in den VM ✔ – der Button-Text muss danach synchronisiert
+      werden (z. B. im `active_profile_changed`-Slot oder über
+      `event_bus.profile_changed`).
 
----
+ ---
 
-### 2. WindowStateRepository herauslösen (window_state_repository.py) – UMGESETZT (06.08.2026)
+ ### 3. EventBus-Integration
+ - `event_bus.service_set_changed` → `ServiceSelectorModel.data_changed` →
+   Popover-Refresh (besteht, ServiceSelectorWidget verbindet das Modell).
+ - `event_bus.profile_changed` → Button-Text mit dem gespeicherten
+   `feature_id`-Filter aktualisieren (NEU zu verdrahten im AnalyticsWindow).
 
- 1. **Erstelle `window_state_repository.py` im Root:**
-    - Kapselt die SQL-Zugriffe auf `window_instances`, `instance_states` UND
-      `symbol_tf_states` aus `app_data.duckdb` (alle instanz-/fensterbezogenen
-      Tabellen – nicht nur die zwei im Ursprungsentwurf genannten).
-    - Nutzt zwingend `DbPool.get(db_path)` (Thread-local, lock-frei, wie
-      StateManager) – KEINE eigene Connection-Verwaltung.
-    - Methoden: `save_window_geometry()`, `get_window_geometry()`,
-      `save_instance_state()`, `load_all_instances()`, `delete_instance()`,
-      `get_next_instance_id()`, `save_symbol_tf_state()`,
-      `get_symbol_tf_state()`, `delete_symbol_tf_state()`.
-    - `load_all_instances()` reproduziert das Bestandsverhalten EXAKT
-      (pandas-`.df()`-Leseart + String-Normalisierung von symbol/timeframe).
-    - Das Repository ist REIN lesend/schreibend – die Schema-Anlage und
-      -Migration (DDL in `_init_db()`) verbleibt im StateManager
-      (keine Verantwortungs-Verdopplung).
+ ---
 
- 2. **`state_manager.py` zur additiven Fassade verschlanken (Verbotsregel):**
-    - ALLE bestehenden Methoden bleiben mit identischen Signaturen erhalten
-      (Rückwärtskompatibilität – keine Aufrufer-Änderung in main.py,
-      persistent_win.py, chart_win.py, service_win.py, Analytics, Tests).
-    - Die Instanz-/Fenster-Methoden delegieren intern an das neue
-      WindowStateRepository; die DB-Pfad-Auflösung bleibt beim StateManager
-      und wird an das Repository durchgereicht (Test-Isolation!).
-    - NICHT umsetzen (falsche Prämisse im Ursprungsentwurf): „Delegiert
-      Profil-Abfragen an AnalyticsProfileRepository und Symbol-Abfragen an
-      SymbolRepository" – StateManager hat KEINE solchen Methoden; beide
-      Repositories sind bereits eigenständig im Root vorhanden und werden
-      direkt genutzt. Es gibt nichts zu delegieren.
+ ### 4. Headless Verification (`test/check_p15_s3_e_popover.py` – NEU)
+ - Testet ohne GUI-Start (offscreen/Temp-DB unter test/):
+   1. `selection_changed(set_id, service_id)` → Auflösung der plugin_id →
+      `AnalyticsViewModel.set_feature_id()` wird gerufen.
+   2. `FeatureStoreReader.fetch_rows(..., feature_id=...)` filtert korrekt.
+   3. Entfernen-Logik setzt `feature_id = None` zurück (Button-Text-Reset).
+   4. `event_bus.service_set_changed` aktualisiert das `ServiceSelectorModel`.
+   5. `combo_feature` existiert NICHT mehr (Ersetzungs-Entscheidung).
 
- 3. **Test-Isolation sicherstellen:**
-    - `test/test.py` patcht `StateManager.__init__` auf eine Temp-DB. Diese
-      Patch-Strategie wird auf das neue WindowStateRepository erweitert
-      (gleiche Temp-DB), damit alle Fenster-/Repository-Checks weiterhin
-      unabhängig von der laufenden App laufen (DuckDB-Single-Writer).
+ ---
 
----
-
-### 3. Schema-Version & FeatureStore-Payload – UMGESETZT (06.08.2026)
-
- 1. **Pflichtfeld `schema_version` im Payload – BEREITS ERFÜLLT (nur verifiziert):**
-    - `grid_lines_service.py` und `proximity_service.py` setzen bereits
-      `"schema_version": "1.0.0"` in `feature_store_payload["metadata"]`.
-    - KEINE Änderung an den Plugins nötig; verifiziert im Headless-Check
-      (`test/check_p15_s4_infra.py`, V2/V3).
-
- 2. **Alt-Data Default im Lesepfad – HARMONISIERT (1 konkrete Änderung):**
-    - `feature_store_reader.py` nutzte `SCHEMA_VERSION_DEFAULT = "1.0"`
-      (zweistellig) – die Spezifikation und die Plugins verwenden `"1.0.0"`
-      (dreistellig). Seit 06.08.2026 ist der Default auf `"1.0.0"`
-      vereinheitlicht (inkl. Docstring/Kommentar E-3 in `feature_store_reader.py`
-      und diesem Dokument).
-    - Verhalten bleibt additiv: `_normalize_feature_data()` ergänzt fehlende
-      `schema_version` beim Lesen – die DB-Zeile wird NICHT überschrieben
-      (verifiziert in V4–V7).
-
- 3. **Konzeptionelle Lücke dokumentiert (abgeschlossen 06.08.2026):**
-    - `store_plugin_payload()` persistiert NUR die Records in `feature_data`;
-      das `metadata`-Dict inkl. `schema_version` wird NICHT in die DB
-      geschrieben. Der Reader-Default greift daher beim Lesen immer.
-    - **`schema_version` ist ein reiner In-Memory-Vertrag des
-      `feature_store_payload`** (Plugin-Ausgabe → Evaluator → Indikator-Lesepfad).
-      Die Persistenzschicht kennt sie nicht; die DB enthält die Records inkl.
-      nativer Spalten, aber ohne das metadata-Payload. Dieser Umstand ist
-      gewollt und wird bewusst nicht geändert – Abschnitt 3 ist damit
-      vollständig abgeschlossen.
-
----
-
-### 4. Headless Verifikation (test/check_p15_s4_infra.py) – UMGESETZT (06.08.2026)
-
- Erstellt: `test/check_p15_s4_infra.py` (offscreen, Temp-DBs unter test/ –
- Regel: Tests nur in test/). Prüft – angepasst an den Ist-Stand:
-
- 1. **EventBus-Bestand (statt Implementierung):**
-    - Alle 5 Signale existieren auf `event_bus` und sind per `connect` +
-      `emit` empfängbar (favorites_changed, profile_changed(str),
-      service_set_changed, service_run_started, service_run_finished).
-
- 2. **WindowStateRepository (Temp-DB, Patch analog test/test.py):**
-    - `save_window_geometry`/`get_window_geometry`-Roundtrip (inkl.
-      is_maximized), `save_instance_state` + `load_all_instances`
-      (String-Normalisierung), `delete_instance` (beide Tabellen),
-      `get_next_instance_id` (win_1, win_2, ...), symbol_tf_state-Roundtrip.
-    - Fassaden-Delegation: `StateManager` liefert über seine Bestands-Methoden
-      identische Werte wie das Repository (gleiche DB).
-
- 3. **schema_version (harmonisiert):**
-    - `GridLinesService.calculate()` und `ProximityService.calculate()`
-      (synthetischer OHLCV-DataFrame) liefern
-      `payload["metadata"]["schema_version"] == "1.0.0"`.
-    - `FeatureStoreReader._normalize_feature_data(None)` bzw. Alt-Row ohne
-      Feld → `"1.0.0"` (Default); vorhandenes Feld bleibt unangetastet;
-      DB-Zeile unverändert.
+ ### ⚠️ Richtlinien
+ - **Keine UI-Tests starten!** Verifikation ausschließlich über Headless-Checks
+   in `test/` und `py_compile`.
+ - Erzeuge gezielte, saubere Code-Snippets/Patches.
 
 ---
 
-### ⚠️ Richtlinien
-- **Keine UI-Tests starten!** Verifikation ausschließlich über den Headless-Check (`python test/check_p15_s4_infra.py`) und `py_compile`.
-- Erzeuge gezielte, saubere Code-Snippets/Patches.
+ ## Implementierungs-Log (Taxonomie: Phase 15.03-E)
 
----
+ ### 06.08.2026 – 15.03-E Popover-ServiceSelector im AnalyticsWindow
 
-## Implementierungs-Log (Taxonomie: Phase 15.04)
+ **Entscheidungen (vorab, User):**
+ - Popover ERSETZT das bestehende `combo_feature`-Dropdown – keine
+   Doppelsteuerung von `AnalyticsViewModel.set_feature_id()`.
+ - Minimal-invasiver Aufbau: `ServiceSelectorWidget` im Modus
+   `MODE_SELECT_ONLY` (Set/Service-Combos) + Read-Only-Parameteranzeige über
+   `ServiceParamColumnsMixin._build_service_column()` (deaktivierte QGroupBox).
+   Kein neues Popover-Widget, kein MasterTree.
 
-### 06.08.2026 – 15.04 Infrastructure & EventBus Hardening (UMGESETZT)
+ **Korrekturen am Ursprungsentwurf (Ist-Analyse 06.08.2026):**
+ - `SelectorMode.SELECT_ONLY` → real `ServiceSelectorWidget.MODE_SELECT_ONLY`.
+ - `parameter_panel.set_service(...)` → real `_build_service_column(iid, pid, cfg)`
+   (ParameterPanel-Klasse existiert nicht mehr).
+ - feature_id-Auflösung ergänzt: `selection_changed` liefert set_id/service_id,
+   die plugin_id wird via `model.find_service(...)` aufgelöst.
+ - Warn-Text präzisiert: `set_feature_id(None)` zeigt ALLE Features (kein
+   „leeres Raster").
 
-**1) EventBus verifiziert (keine Änderung an `config/event_bus.py`):**
-Alle 5 Signale (`favorites_changed`, `profile_changed(str)`,
-`service_set_changed`, `service_run_started`, `service_run_finished`)
-existieren und sind per connect/emit empfängbar (Check B1–B5 in
-`test/check_p15_s4_infra.py`).
+  **Umsetzung (geplant):** [Hier nach Umsetzung ergänzen: Dateien, Änderungen,
+   Test-Ergebnisse, Git-Commit/Tag.]
 
-**2) `window_state_repository.py` im Root erstellt:**
-- Kapselt alle instanz-/fensterbezogenen SQL-Zugriffe (`window_instances`,
-  `instance_states`, `symbol_tf_states`) aus `app_data.duckdb`.
-- Nutzt `DbPool.get(db_path)` (Thread-local, lock-frei) – keine eigene
-  Connection-Verwaltung.
-- 9 Methoden (save/get_window_geometry, save_instance_state,
-  load_all_instances, delete_instance, get_next_instance_id,
-  save/get/delete_symbol_tf_state). `load_all_instances()` reproduziert das
-  Bestandsverhalten EXAKT (pandas-`.df()`-Leseart + String-Normalisierung).
-- Schema-Anlage/-Migration bleibt im StateManager (keine DDL im Repository).
-
-**3) `state_manager.py` als additive Fassade:**
-- Alle Bestands-Methoden mit identischen Signaturen erhalten (Rückwärts-
-  kompatibilität – keine Aufrufer-Änderung). Die 9 Instanz-/Fenster-Methoden
-  delegieren intern an das WindowStateRepository.
-- DB-Pfad-Auflösung bleibt beim StateManager und wird an das Repository
-  durchgereicht (Test-Isolation). Patch-Strategie aus `test/test.py` auf
-  WindowStateRepository erweitert (gleiche Temp-DB, Check I1/F7).
-
-**4) `schema_version` harmonisiert:**
-- `feature_store_reader.py`: `SCHEMA_VERSION_DEFAULT` von `"1.0"` auf
-  `"1.0.0"` vereinheitlicht (E-3-Kommentare + Docstring aktualisiert).
-- Reader-Default und Plugin-Vertrag (grid_lines/proximity, `metadata`) sind
-  jetzt identisch. `_normalize_feature_data()` bleibt additiv – DB-Zeile wird
-  nicht überschrieben.
-
-**5) Headless-Verifikation (`test/check_p15_s4_infra.py`):**
-- 33 Checks bestanden: EventBus (B1–B5), WindowStateRepository (W1–W13,
-  I1), Fassaden-Delegation (F1–F7), schema_version (V1–V7).
-- Zusätzlich `python test/test.py` ausgeführt: keine neuen Regressionen
-  (die 3 vorbestehenden Breiten-Checks P2/P5/H7 scheitern auch ohne diese
-  Änderung – offscreen-Screen 800×800 vs. Breiten-Annahme ≥ 1300 px).
-
-**Git:** Tag `phase15_04_backup` vor der Umsetzung; Commit nach Freigabe.
+ **Umsetzung (06.08.2026, ausgeführt):**
+ - **Geändert:** `analytics/ui/analytics_win.py`
+   * `combo_feature`-Dropdown entfernt (Entscheidung: Popover ersetzt es);
+     `_populate_feature_combo()`, `_on_feature_changed()`,
+     `_on_vm_data_ready()` und der `QUERY_FEATURES`-Import entfallen.
+   * `_initial_load()` fragt keine Feature-Metadaten mehr ab
+     (`request_features()` entfernt – speiste nur das alte Dropdown).
+   * Neuer Filter-Zeilen-Button `btn_service_filter`
+     `[ Set/Service: ▾ Keiner ausgewählt ]` + Popover (`_build_service_popover`):
+     `QFrame` mit `Qt.Popup`, oben `ServiceSelectorWidget` (MODE_SELECT_ONLY,
+     Set-/Service-Combos), Mitte Read-Only-Parameteranzeige
+     (`ServiceParamColumnsMixin._build_service_column()` in deaktivierter
+     QGroupBox, `QScrollArea` max. 320 px), unten
+     `[ 🗑️ Aktiven Service-Filter entfernen ]`.
+   * Neue Methoden: `_toggle_service_popover`, `_restore_popover_selection`,
+     `_clear_param_display`, `_build_readonly_param_display`,
+     `_on_popover_selection_changed` (plugin_id-Auflösung via
+     `model.find_service()` → `vm.set_feature_id(plugin_id)`),
+     `_remove_service_filter` (Sicherheitsabfrage, korrigierter Hinweistext:
+     „zeigt danach wieder alle Features"), `_sync_service_filter_button`.
+   * Button-Text-Sync bei Profilwechsel (`active_profile_changed`) und über
+     `event_bus.profile_changed`.
+   * Neu: `_ReadOnlyServiceParamHost` (Minimal-Host des
+     `ServiceParamColumnsMixin`; Read-Only, alle Editier-Pfade no-op).
+   * `AnalyticsWindow.__init__` akzeptiert optional `selector_model`
+     (injizierbar für Headless-Tests; Standard `ServiceSelectorModel(parent)`).
+ - **Neu:** `test/check_p15_s3_e_popover.py` (headless, Temp-DBs unter `test/`):
+   28/28 Prüfungen PASS (P1–P7, S1–S4, R1–R6, X1–X4, F1–F4, E1–E4).
+ - **Verifikation:** `.venv\Scripts\python.exe -m py_compile` auf
+   `analytics/ui/analytics_win.py` + Testdatei; Testlauf
+   `test/check_p15_s3_e_popover.py` → „ALLE PRUEFUNGEN BESTANDEN (OK)".
+   Keine UI-/Regressionstests (harte Regel).
+ - **Git:** Commit + Tag `phase15_03e` (siehe unten).

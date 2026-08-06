@@ -14,6 +14,10 @@ MVVM-Orchestrator (Invariante 4, kein SQL in der UI):
 Aufgaben (15.03-Spezifikation):
 - Top-Bar: Profil-CRUD (Option B – Explicit Save, Dirty-Flag '*').
 - Sidebar-Navigation: Tabelle, Heatmap, Scatter, Verteilung, Equity.
+- 15.03-E: Service-Filter-Popover (ServiceSelectorWidget, MODE_SELECT_ONLY)
+  ersetzt das alte combo_feature-Dropdown – feature_id-Aufloesung ueber das
+  ServiceSelectorModel (plugin_id = feature_id), Read-Only-Parameteranzeige
+  via ServiceParamColumnsMixin._build_service_column().
 - Jump-to-Chart (Variante 2): open_chart_at_bar(symbol, tf, bar_time)
   und Chart-Fenster in den Vordergrund holen.
 - E-2: Migration der win_statistics-Persistenz nach win_analytics
@@ -21,12 +25,13 @@ Aufgaben (15.03-Spezifikation):
 - EventBus (Invariante 5): Profilwechsel + Favoriten-Aenderungen.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import QTimer, Slot
+from PySide6.QtCore import Qt, QTimer, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -36,6 +41,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QStackedWidget,
     QVBoxLayout,
@@ -43,7 +49,7 @@ from PySide6.QtWidgets import (
 )
 
 from analytics.engine.analytics_view_model import AnalyticsViewModel
-from analytics.engine.analytics_worker import QUERY_FEATURES
+from analytics.engine.service_selector_model import ServiceSelectorModel
 from analytics.ui.table_page import TablePage
 from analytics.ui.heatmap_page import HeatmapPage
 from analytics.ui.scatter_page import ScatterPage
@@ -53,6 +59,8 @@ from persistent_win import PersistentWindow, register_persistent_window
 from state_manager import StateManager
 from symbol_repository import SymbolRepository, get_symbol_repository
 from config.event_bus import event_bus
+from serviceui.param_columns import ServiceParamColumnsMixin
+from serviceui.service_selector_widget import ServiceSelectorWidget
 from serviceui.symbols_win import SymbolsWindow
 
 # Im AnalyticsWindow angebotene Timeframes (Feature-Store-Auswahl).
@@ -129,6 +137,37 @@ def migrate_statistics_persistence(
     return migrated
 
 
+class _ReadOnlyServiceParamHost(ServiceParamColumnsMixin):
+    """Minimaler Mixin-Host fuer die Read-Only-Parameteranzeige (15.03-E).
+
+    `ServiceParamColumnsMixin._build_service_column()` erwartet Host-
+    Attribute des ServiceWindow (Parameter-Controls, Sperr-Lookup usw.).
+    Dieser Mini-Host stellt nur die benoetigten Attribute/Methoden bereit;
+    alle Bearbeitungs-/Persistenz-Pfade sind no-op – das Analytics-Popover
+    zeigt die Parameter-Spalte ausschliesslich Read-Only an (deaktivierte
+    QGroupBox, kein Dirty-Tracking, kein Speichern).
+    """
+
+    def __init__(self) -> None:
+        self._service_param_controls: Dict[str, Any] = {}
+        self._service_desc_controls: Dict[str, Any] = {}
+        self._symbol_precision: Optional[int] = None
+        self.combo_symbol = None
+        self.combo_tf = None
+
+    def _service_lock(self, plugin_id: str) -> Tuple[str, str]:
+        """Keine Set-Sperre im Analytics-Popover (Read-Only-Anzeige)."""
+        return "", ""
+
+    def _open_service_desc_editor(self, instance_id: str) -> None:
+        """Read-Only: kein Beschreibungs-Editor im Popover."""
+        pass
+
+    def _schedule_reflow(self) -> None:
+        """Read-Only: kein Editor-Reflow noetig."""
+        pass
+
+
 @register_persistent_window()
 class AnalyticsWindow(PersistentWindow):
     """Analytics-Hauptfenster (win_analytics, 1280 x 800, nicht-modal)."""
@@ -147,6 +186,7 @@ class AnalyticsWindow(PersistentWindow):
         view_model: Optional[AnalyticsViewModel] = None,
         analytics_repo: Any = None,
         profile_repo: Any = None,
+        selector_model: Optional[ServiceSelectorModel] = None,
     ) -> None:
         super().__init__(parent)
         self._vm = view_model or AnalyticsViewModel(
@@ -156,6 +196,15 @@ class AnalyticsWindow(PersistentWindow):
         )
         self._symbol_repo: SymbolRepository = get_symbol_repository()
         self._profile_combo_syncing: bool = False
+
+        # 15.03-E: Popover-ServiceSelector ersetzt das alte combo_feature-
+        # Dropdown. Das ServiceSelectorModel ist injizierbar (Headless-Tests);
+        # der Read-Only-Mixin-Host liefert die Parameter-Spalte.
+        self._selector_model: ServiceSelectorModel = (
+            selector_model or ServiceSelectorModel(parent=self))
+        self._param_host = _ReadOnlyServiceParamHost()
+        #: Aktiver Filter (set_id, service_id) fuer den Button-Text – None = kein Filter.
+        self._active_filter: Optional[Tuple[str, str]] = None
 
         self.setWindowTitle(WINDOW_TITLE_BASE)
         self.resize(1280, 800)
@@ -218,7 +267,10 @@ class AnalyticsWindow(PersistentWindow):
         top.addWidget(self.progress_busy)
         root.addLayout(top)
 
-        # --- Filter-Zeile: Symbol / TF / Feature / Limit ---
+        # --- Filter-Zeile: Symbol / TF / Service-Filter (Popover) / Limit ---
+        # 15.03-E: Der Service-Filter (Popover-ServiceSelector) ersetzt das
+        # alte combo_feature-Dropdown (Entscheidung 06.08.2026 – keine
+        # Doppelsteuerung von AnalyticsViewModel.set_feature_id()).
         filt = QHBoxLayout()
         self.combo_symbol = QComboBox()
         self.btn_symbol_fav = QPushButton("★")
@@ -228,8 +280,10 @@ class AnalyticsWindow(PersistentWindow):
         self.combo_tf = QComboBox()
         for tf in TIMEFRAMES:
             self.combo_tf.addItem(tf, tf)
-        self.combo_feature = QComboBox()
-        self.combo_feature.addItem("Alle", None)
+        self.btn_service_filter = QPushButton(
+            "[ Set/Service: ▾ Keiner ausgewählt ]")
+        self.btn_service_filter.setToolTip(
+            "Service-Filter setzen/ändern – öffnet das Auswahl-Popover.")
         self.spin_limit = QSpinBox()
         self.spin_limit.setRange(1, self._vm.max_lookback_limit)
         self.spin_limit.setValue(int(self._vm.params.get("limit") or 5000))
@@ -240,8 +294,8 @@ class AnalyticsWindow(PersistentWindow):
         filt.addWidget(self.btn_symbol_fav)
         filt.addWidget(QLabel("Timeframe:"))
         filt.addWidget(self.combo_tf)
-        filt.addWidget(QLabel("Feature:"))
-        filt.addWidget(self.combo_feature)
+        filt.addWidget(QLabel("Service:"))
+        filt.addWidget(self.btn_service_filter)
         filt.addWidget(QLabel("Limit:"))
         filt.addWidget(self.spin_limit)
         filt.addStretch(1)
@@ -270,6 +324,191 @@ class AnalyticsWindow(PersistentWindow):
 
         self.setCentralWidget(central)
 
+        # 15.03-E: Popover-Widget (ServiceSelectorWidget + Read-Only-Parameter)
+        self._build_service_popover()
+
+    # ------------------------------------------------------------------
+    # Popover-ServiceSelector (15.03-E, ersetzt combo_feature)
+    # ------------------------------------------------------------------
+    def _build_service_popover(self) -> None:
+        """Baut das schwebende Popover unter dem Service-Filter-Button.
+
+        Inhalt (minimal-invasiv, Entscheidung 06.08.2026):
+          * Oben:  ServiceSelectorWidget im Modus MODE_SELECT_ONLY
+                   (Set-Combo + Service-Combo) – Signal selection_changed.
+          * Mitte: Read-Only-Parameteranzeige des gewaehlten Services via
+                   ServiceParamColumnsMixin._build_service_column() in einer
+                   deaktivierten QGroupBox (ScrollArea, max. 320 px hoch).
+          * Unten: Button '[ 🗑️ Aktiven Service-Filter entfernen ]'.
+
+        Qt.Popup-Flag: Das Popover schliesst sich beim Klick ausserhalb
+        (Standard-Popup-Verhalten) und hat keinen eigenen Taskleisten-Eintrag.
+        """
+        self.service_popover = QFrame(self)
+        self.service_popover.setWindowFlags(Qt.Popup)
+        self.service_popover.setFrameShape(QFrame.StyledPanel)
+        self.service_popover.setMinimumWidth(420)
+        pop = QVBoxLayout(self.service_popover)
+        pop.setContentsMargins(6, 6, 6, 6)
+        pop.setSpacing(6)
+
+        self.popover_selector = ServiceSelectorWidget(
+            ServiceSelectorWidget.MODE_SELECT_ONLY,
+            model=self._selector_model,
+            parent=self.service_popover,
+        )
+        pop.addWidget(self.popover_selector)
+
+        self.param_scroll = QScrollArea(self.service_popover)
+        self.param_scroll.setWidgetResizable(True)
+        self.param_scroll.setMaximumHeight(320)
+        self.param_container = QWidget()
+        self.param_box_layout = QVBoxLayout(self.param_container)
+        self.param_box_layout.setContentsMargins(0, 0, 0, 0)
+        self.param_box_layout.setSpacing(4)
+        self.param_scroll.setWidget(self.param_container)
+        pop.addWidget(self.param_scroll, 1)
+
+        self.btn_filter_remove = QPushButton(
+            "🗑️ Aktiven Service-Filter entfernen")
+        pop.addWidget(self.btn_filter_remove)
+
+    @Slot()
+    def _toggle_service_popover(self) -> None:
+        """Oeffnet/schliesst das Popover direkt unter dem Filter-Button."""
+        if self.service_popover.isVisible():
+            self.service_popover.hide()
+            return
+        self._restore_popover_selection()
+        btn = self.btn_service_filter
+        self.service_popover.adjustSize()
+        self.service_popover.move(btn.mapToGlobal(btn.rect().bottomLeft()))
+        self.service_popover.show()
+        self.service_popover.raise_()
+
+    def _restore_popover_selection(self) -> None:
+        """Stellt Combos + Parameteranzeige auf den aktiven Filter ein.
+
+        Beim erneuten Oeffnen des Popovers sollen die Set-/Service-Combos
+        und die Read-Only-Parameteranzeige den zuletzt gesetzten Filter
+        widerspiegeln (kein leerer Zustand bei aktivem Filter).
+        """
+        if self._active_filter is None:
+            self._clear_param_display()
+            return
+        set_id, service_id = self._active_filter
+        model = self.popover_selector.model
+        cfg = model.find_service(set_id, service_id) or {}
+        if not cfg:
+            self._clear_param_display()
+            return
+        combo_set = self.popover_selector.combo_set
+        combo_svc = self.popover_selector.combo_service
+        idx_set = combo_set.findData(set_id)
+        idx_svc = combo_svc.findData(service_id)
+        if idx_set >= 0:
+            combo_set.blockSignals(True)
+            combo_set.setCurrentIndex(idx_set)
+            combo_set.blockSignals(False)
+            self.popover_selector._fill_service_combo(set_id)
+        if idx_svc >= 0:
+            combo_svc.blockSignals(True)
+            combo_svc.setCurrentIndex(idx_svc)
+            combo_svc.blockSignals(False)
+        self._build_readonly_param_display(service_id, cfg)
+
+    def _clear_param_display(self) -> None:
+        """Leert die Read-Only-Parameteranzeige des Popovers."""
+        while self.param_box_layout.count():
+            item = self.param_box_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        self._param_host._service_param_controls.clear()
+        self._param_host._service_desc_controls.clear()
+
+    def _build_readonly_param_display(
+        self, service_id: str, cfg: Dict[str, Any]
+    ) -> None:
+        """Baut die Read-Only-Parameteranzeige (deaktivierte QGroupBox)."""
+        self._clear_param_display()
+        pid = str(cfg.get("plugin_id") or service_id)
+        try:
+            box = self._param_host._build_service_column(service_id, pid, cfg)
+        except Exception as e:  # defensiv: Plugin/Schema-Fehler
+            self.param_box_layout.addWidget(
+                QLabel(f"Parameteranzeige nicht verfügbar: {e}"))
+            return
+        box.setEnabled(False)
+        box.setToolTip("Read-Only – Parameter des gewählten Services")
+        self.param_box_layout.addWidget(box)
+
+    @Slot(str, str)
+    def _on_popover_selection_changed(
+        self, set_id: str, service_id: str
+    ) -> None:
+        """Setzt den Service-Filter ueber die aufgeloeste plugin_id.
+
+        Das Widget-Signal liefert set_id/service_id – die feature_id des
+        Feature-Store IST die plugin_id (grid_lines/proximity); die
+        Aufloesung laeuft ueber das ServiceSelectorModel (find_service).
+        """
+        if not set_id or not service_id:
+            self._clear_param_display()
+            return
+        cfg = self.popover_selector.model.find_service(set_id, service_id) or {}
+        if not cfg:
+            self._clear_param_display()
+            return
+        self._build_readonly_param_display(service_id, cfg)
+        pid = str(cfg.get("plugin_id") or service_id)
+        self._vm.set_feature_id(pid)
+        self._active_filter = (set_id, service_id)
+        self._sync_service_filter_button()
+
+    @Slot()
+    def _remove_service_filter(self) -> None:
+        """Entfernt den aktiven Service-Filter (mit Sicherheitsabfrage).
+
+        Korrektur 06.08.2026: `set_feature_id(None)` zeigt danach ALLE
+        Feature-Rows im Analytics-Fenster (kein leeres Raster).
+        """
+        if self._vm.params.get("feature_id") is None:
+            self.service_popover.hide()
+            return
+        reply = QMessageBox.question(
+            self, "Service-Filter entfernen",
+            "Möchtest du den aktiven Service-Filter wirklich entfernen? Die "
+            "Anzeige im Analytics-Fenster zeigt danach wieder alle Features.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self._vm.set_feature_id(None)
+        self._active_filter = None
+        self._clear_param_display()
+        self._sync_service_filter_button()
+        self.service_popover.hide()
+
+    def _sync_service_filter_button(self) -> None:
+        """Synchronisiert den Button-Text mit dem VM-Parameter feature_id.
+
+        Wird beim Setzen/Entfernen des Filters, bei Profilwechseln
+        (active_profile_changed) und ueber `event_bus.profile_changed`
+        aufgerufen (Profil-Payload persistiert die feature_id).
+        """
+        fid = self._vm.params.get("feature_id")
+        if not fid:
+            self.btn_service_filter.setText(
+                "[ Set/Service: ▾ Keiner ausgewählt ]")
+        elif self._active_filter:
+            set_id, service_id = self._active_filter
+            self.btn_service_filter.setText(
+                f"[ Set/Service: ▾ {set_id}/{service_id} ]")
+        else:
+            self.btn_service_filter.setText(f"[ Set/Service: ▾ {fid} ]")
+
     # ------------------------------------------------------------------
     # MVVM + Steuerung verdrahten
     # ------------------------------------------------------------------
@@ -282,7 +521,6 @@ class AnalyticsWindow(PersistentWindow):
         vm.active_profile_changed.connect(self._on_active_profile_changed)
         vm.dirty_changed.connect(self._on_dirty_changed)
         vm.busy_changed.connect(self._on_busy_changed)
-        vm.data_ready.connect(self._on_vm_data_ready)
         vm.query_failed.connect(self._on_query_failed)
 
         # Jump-to-Chart (Variante 2): open_chart_at_bar + Aufloesung
@@ -300,7 +538,12 @@ class AnalyticsWindow(PersistentWindow):
         # ausgrauen (nicht auswaehlbar).
         self.combo_symbol.currentTextChanged.connect(self._refresh_timeframe_combo)
         self.combo_tf.currentTextChanged.connect(self._vm.set_timeframe)
-        self.combo_feature.currentIndexChanged.connect(self._on_feature_changed)
+        # 15.03-E: Service-Filter-Popover (ersetzt combo_feature)
+        self.btn_service_filter.clicked.connect(self._toggle_service_popover)
+        self.popover_selector.selection_changed.connect(
+            self._on_popover_selection_changed)
+        self.btn_filter_remove.clicked.connect(self._remove_service_filter)
+        event_bus.profile_changed.connect(self._sync_service_filter_button)
         self.spin_limit.valueChanged.connect(self._vm.set_limit)
         self.btn_symbol_fav.clicked.connect(self.open_symbols_window)
         self.btn_profile_new.clicked.connect(self._on_profile_new)
@@ -430,26 +673,6 @@ class AnalyticsWindow(PersistentWindow):
             if hasattr(page, "request_data"):
                 page.request_data()
 
-    def _populate_feature_combo(self, feature_ids: List[str]) -> None:
-        current = self.combo_feature.currentData()
-        self.combo_feature.blockSignals(True)
-        self.combo_feature.clear()
-        self.combo_feature.addItem("Alle", None)
-        for fid in feature_ids:
-            self.combo_feature.addItem(fid, fid)
-        idx = self.combo_feature.findData(current)
-        self.combo_feature.setCurrentIndex(idx if idx >= 0 else 0)
-        self.combo_feature.blockSignals(False)
-
-    @Slot(int)
-    def _on_feature_changed(self, _index: int) -> None:
-        self._vm.set_feature_id(self.combo_feature.currentData())
-
-    @Slot(str, dict)
-    def _on_vm_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
-        if kind == QUERY_FEATURES:
-            self._populate_feature_combo(data.get("feature_ids") or [])
-
     @Slot(str, str)
     def _on_query_failed(self, kind: str, error: str) -> None:
         print(f"WARN [AnalyticsWindow] Abfrage '{kind}' fehlgeschlagen: {error}")
@@ -496,6 +719,7 @@ class AnalyticsWindow(PersistentWindow):
         if profile is None:
             self.edit_profile_name.clear()
             self.edit_profile_desc.clear()
+            self._sync_service_filter_button()
             return
         self.edit_profile_name.setText(profile.get("name") or "")
         self.edit_profile_desc.setText(profile.get("description") or "")
@@ -505,6 +729,9 @@ class AnalyticsWindow(PersistentWindow):
             self.combo_profile.blockSignals(True)
             self.combo_profile.setCurrentIndex(idx)
             self.combo_profile.blockSignals(False)
+        # 15.03-E: Profilwechsel uebernimmt feature_id in den VM – Button-Text
+        # synchronisieren (der gespeicherte Service-Filter bleibt sichtbar).
+        self._sync_service_filter_button()
 
     @Slot(bool)
     def _on_dirty_changed(self, dirty: bool) -> None:
@@ -588,7 +815,8 @@ class AnalyticsWindow(PersistentWindow):
         self._vm.set_timeframe(self.combo_tf.currentText())
         self._vm.load_profiles()
         self._on_page_changed(self.sidebar.currentRow())
-        self._vm.request_features()
+        # 15.03-E: QUERY_FEATURES speiste das entfernte combo_feature-Dropdown –
+        # ohne Feature-Dropdown ist keine Features-Metadaten-Abfrage noetig.
 
     def closeEvent(self, event) -> None:
         """Stoppt Debounce + laufenden Worker (PersistentWindow speichert).
