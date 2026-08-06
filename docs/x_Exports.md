@@ -67,6 +67,9 @@ PyTrader/
             __init__.py
             base_indicator.py
             fixed_grid_proximity.py
+            utils/
+                __init__.py
+                ma_template.py
         js/
             01_core.js
             02_time_utils.js
@@ -75,6 +78,7 @@ PyTrader/
             05_measurement.js
         overlays/
             __init__.py
+            style_models.py
         widgets/
             __init__.py
             named_item_actions.py
@@ -12683,6 +12687,12 @@ class PyTraderChartWindow(QMainWindow):
         Service-Set, die Darstellung (Farben, Sichtbarkeiten) im Chart-State.
         Legacy (voller params-Dict ohne set_id) wird unverändert gespeichert
         (Abwärtskompatibilität).
+
+        Anwender-Anweisung 06.08.2026: Das Preset 'Default' ist GENAU WIE
+        JEDES ANDERE PRESET ÜBERSCHREIBBAR – Änderungen unter 'Default'
+        (Parameter-Änderungen im Dialog, Preset-Auswahl) werden regulär in
+        indicators_state geschrieben und persistiert. Beim nächsten Öffnen
+        zeigt der Dialog die überschriebenen Default-Werte.
         """
         if isinstance(payload, dict) and ("set_id" in payload or "display_params" in payload):
             self.indicators_state[ind_id] = {
@@ -13329,7 +13339,8 @@ from PySide6.QtWidgets import (
 )
 
 from chart.indicators.base_indicator import BaseIndicator
-from chart.widgets.style_picker_widget import LineStyle, StylePickerWidget
+from chart.overlays.style_models import LINE_STYLES, LineStyle, MarkerStyle, MARKER_SHAPES
+from chart.widgets.style_picker_widget import StylePickerWidget
 from chart.widgets.named_item_actions import NamedItemAdapter, NamedItemActionsMixin
 from analytics.engine.description_dialog import ServiceDescriptionDialog
 from state_manager import StateManager
@@ -13414,6 +13425,27 @@ class _ServiceStack(QStackedWidget):
 		self.updateGeometry()
 
 
+def _jsonify_style_objects(obj: Any) -> Any:
+	"""P16.03 Schritt 4: Konvertiert LineStyle/MarkerStyle-Objekte rekursiv
+	via .to_dict() in JSON-kompatible Dicts (vor save_indicator_preset).
+
+	Der aktuelle Preset-Payload (_build_preset_payload) enthält nur primitive
+	Werte (Farb-Strings, shape/size/style/width-Geschwister-Keys) – dieser
+	Helfer ist eine DEFENSIVE Absicherung: Sollte jemals ein Style-Vertrag
+	(Dataclass) direkt im Payload landen (z. B. durch ein zukünftiges
+	Control), schlägt json.dumps in state_manager.save_indicator_preset
+	nicht fehl, sondern speichert den JSON-Standard
+	(show/color/width/style bzw. show/color/shape/size).
+	"""
+	if isinstance(obj, (LineStyle, MarkerStyle)):
+		return obj.to_dict()
+	if isinstance(obj, dict):
+		return {k: _jsonify_style_objects(v) for k, v in obj.items()}
+	if isinstance(obj, (list, tuple)):
+		return [_jsonify_style_objects(v) for v in obj]
+	return obj
+
+
 class _PresetItemAdapter(NamedItemAdapter):
 	"""Adapter für die PRESET-Sammlung (Referenz-Mechanik) im Prop-Fenster.
 
@@ -13448,6 +13480,10 @@ class _PresetItemAdapter(NamedItemAdapter):
 	def _item_save_as(self, name: str) -> str:
 		"""Speichert das Preset unter 'name' (getrenntes Dict {set_id, display_params})."""
 		payload = self.dlg._build_preset_payload()
+		# P16.03 Schritt 4: Style-Objekte vor dem JSON-Speichern via .to_dict()
+		# in JSON-kompatible Dicts konvertieren (defensive Absicherung gegen
+		# TypeError in state_manager.save_indicator_preset -> json.dumps).
+		payload = _jsonify_style_objects(payload)
 		self.dlg.state_manager.save_indicator_preset(
 			self.dlg.indicator.indicator_id, name, payload)
 		return name
@@ -13482,7 +13518,9 @@ class _PresetItemAdapter(NamedItemAdapter):
 		self.dlg.on_preset_selected(nxt)
 
 	def _item_reserved_name(self) -> Optional[str]:
-		return "Default"
+		# Anwender-Anweisung 06.08.2026: 'Default' ist wie jedes andere Preset
+		# überschreibbar (und löschbar) – KEIN geschützter Name mehr.
+		return None
 
 
 class _ServiceSetItemAdapter(NamedItemAdapter):
@@ -13736,6 +13774,20 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		return False
 
 	@staticmethod
+	def _style_sibling_keys(key: str, style_type: str) -> tuple:
+		"""P16.03-Bugfix: Leitet die Geschwister-Keys eines StylePickerWidget-
+		Params her (Konvention: 'color' im Key -> 'shape'/'size' bei marker,
+		'style'/'width' bei line). Liefert (None, None), wenn keine Konvention
+		passt. Die Marker-Form/-Groesse wird NICHT als separates Control
+		gerendert (der StylePickerWidget zeigt sie bereits), sondern ueber
+		diese Geschwister-Params persistiert (nicht in parameter_order)."""
+		if "color" not in key:
+			return None, None
+		if style_type == "marker":
+			return key.replace("color", "shape"), key.replace("color", "size")
+		return key.replace("color", "style"), key.replace("color", "width")
+
+	@staticmethod
 	def _human(key: str) -> str:
 		return key.replace("_", " ").title()
 
@@ -13802,7 +13854,49 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			# Der Farb-Button liefert '#RRGGBB' (Alpha=255) bzw. 'rgba(r,g,b,a)'
 			# (Teil-Transparenz) – 1:1 kompatibel mit TradingView v5 / CSS.
 			allow_alpha = bool(spec.get("allow_alpha", True))
-			ctrl = StylePickerWidget(style=LineStyle(color=str(val)), enable_alpha=allow_alpha)
+			# P16.03-Bugfix (06.08.2026): style_type aus der Schema-Spec
+			# (Default 'line'). Circle-Farbparameter (circle_color_std/_active)
+			# deklarieren "style_type": "marker" -> das Prop-Fenster zeigt
+			# den MARKER-Modus (Markergröße + Form) statt Linienmodus. Der
+			# passende Style-Typ wird übergeben, damit die Initialfarbe beim
+			# marker-Modus nicht verloren geht (Typ-Mismatch im Widget würde
+			# sonst auf die Default-Farbe zurueckfallen).
+			style_type = str(spec.get("style_type", "line"))
+			if style_type == "marker":
+				# P16.03-Bugfix: Marker-Form/-Groesse aus den Geschwister-Params
+				# vorbelegen (Konvention 'color' -> 'shape'/'size'), damit das
+				# Widget beim Oeffnen die gespeicherte Form/Groesse zeigt.
+				shape_key, size_key = self._style_sibling_keys(key, "marker")
+				shape_val = "circle"
+				if shape_key and shape_key in self.params:
+					shape_val = str(self.params.get(shape_key) or "circle")
+					if shape_val not in MARKER_SHAPES:
+						shape_val = "circle"
+				size_val = 6
+				if size_key and size_key in self.params:
+					try:
+						size_val = int(self.params.get(size_key))
+					except (TypeError, ValueError):
+						size_val = 6
+				style_obj = MarkerStyle(color=str(val), shape=shape_val, size=size_val)
+			else:
+				# P16.03-Bugfix: Linienart/-staerke aus den Geschwister-Params
+				# vorbelegen (Konvention 'color' -> 'style'/'width'), damit das
+				# Widget beim Oeffnen die gespeicherte Linienart/-staerke zeigt.
+				style_key, width_key = self._style_sibling_keys(key, "line")
+				style_val = "solid"
+				if style_key and style_key in self.params:
+					style_val = str(self.params.get(style_key) or "solid")
+					if style_val not in LINE_STYLES:
+						style_val = "solid"
+				width_val = 1
+				if width_key and width_key in self.params:
+					try:
+						width_val = int(self.params.get(width_key))
+					except (TypeError, ValueError):
+						width_val = 1
+				style_obj = LineStyle(color=str(val), style=style_val, width=width_val)
+			ctrl = StylePickerWidget(style=style_obj, enable_alpha=allow_alpha, style_type=style_type)
 			ctrl.style_changed.connect(self.on_param_control_changed)
 			return ctrl
 
@@ -14550,6 +14644,24 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		for key, ctrl in self.param_controls.items():
 			if self._is_visual_key(key):
 				display[key] = self._ctrl_value(ctrl)
+				# P16.03-Bugfix: Form/Groesse bzw. Linienart/-staerke in
+				# display_params aufnehmen (Konvention 'color' -> 'shape'/'size'
+				# bzw. 'style'/'width'), damit Presets die Auswahl im
+				# StylePickerWidget round-trippen.
+				if isinstance(ctrl, StylePickerWidget):
+					style_obj = ctrl.get_style()
+					if isinstance(style_obj, MarkerStyle):
+						shape_key, size_key = self._style_sibling_keys(key, "marker")
+						if shape_key:
+							display[shape_key] = style_obj.shape
+						if size_key:
+							display[size_key] = style_obj.size
+					elif isinstance(style_obj, LineStyle):
+						style_key, width_key = self._style_sibling_keys(key, "line")
+						if style_key:
+							display[style_key] = style_obj.style
+						if width_key:
+							display[width_key] = style_obj.width
 		return {"set_id": set_id or "", "logic_params": self._collect_logic_params(),
 		        "display_params": display}
 
@@ -14938,7 +15050,24 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 				else:
 					new_params[key] = raw_val
 			elif isinstance(ctrl, StylePickerWidget):
-				new_params[key] = ctrl.get_style().color
+				style_obj = ctrl.get_style()
+				new_params[key] = style_obj.color
+				# P16.03-Bugfix: Form/Groesse bzw. Linienart/-staerke in die
+				# Geschwister-Keys schreiben (Konvention 'color' ->
+				# 'shape'/'size' bzw. 'style'/'width'), damit die Auswahl im
+				# Widget persistiert und der Indikator sie in den Payload gibt.
+				if isinstance(style_obj, MarkerStyle):
+					shape_key, size_key = self._style_sibling_keys(key, "marker")
+					if shape_key:
+						new_params[shape_key] = style_obj.shape
+					if size_key:
+						new_params[size_key] = style_obj.size
+				elif isinstance(style_obj, LineStyle):
+					style_key, width_key = self._style_sibling_keys(key, "line")
+					if style_key:
+						new_params[style_key] = style_obj.style
+					if width_key:
+						new_params[width_key] = style_obj.width
 			elif isinstance(ctrl, QLineEdit):
 				new_params[key] = ctrl.text()
 		return new_params
@@ -14957,6 +15086,35 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 					ctrl.setCurrentText(str(val))
 				elif isinstance(ctrl, StylePickerWidget) and isinstance(val, str):
 					ctrl.set_color(val)
+					# P16.03-Bugfix: Form/Groesse bzw. Linienart/-staerke aus
+					# den Geschwister-Params zurueckspielen (sonst zeigt das
+					# Widget beim Restore die Defaults, obwohl der Chart die
+					# gespeicherte Form nutzt).
+					style_obj = ctrl.get_style()
+					if isinstance(style_obj, MarkerStyle):
+						shape_key, size_key = self._style_sibling_keys(key, "marker")
+						if shape_key and shape_key in params_dict:
+							shp = str(params_dict.get(shape_key) or "circle")
+							if shp in MARKER_SHAPES:
+								style_obj.shape = shp
+						if size_key and size_key in params_dict:
+							try:
+								style_obj.size = int(params_dict.get(size_key))
+							except (TypeError, ValueError):
+								pass
+						ctrl.set_style(style_obj)
+					elif isinstance(style_obj, LineStyle):
+						style_key, width_key = self._style_sibling_keys(key, "line")
+						if style_key and style_key in params_dict:
+							stl = str(params_dict.get(style_key) or "solid")
+							if stl in LINE_STYLES:
+								style_obj.style = stl
+						if width_key and width_key in params_dict:
+							try:
+								style_obj.width = int(params_dict.get(width_key))
+							except (TypeError, ValueError):
+								pass
+						ctrl.set_style(style_obj)
 				elif isinstance(ctrl, QLineEdit) and isinstance(val, str):
 					ctrl.setText(val)
 
@@ -15013,8 +15171,9 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		"""Speichert das aktive Preset (generische Preset-Mechanik).
 
 		Implementierung: NamedItemActionsMixin.save_named_item() mit dem
-		Preset-Adapter (_PresetItemAdapter) – Namensdialog, 'Default'-Schutz,
-		Überschreiben-Rückfrage bei doppeltem Namen.
+		Preset-Adapter (_PresetItemAdapter) – Namensdialog, Überschreiben-
+		Rückfrage bei doppeltem Namen. 'Default' ist überschreibbar
+		(Anwender-Anweisung 06.08.2026).
 		"""
 		self.params = self.collect_params_from_ui()
 		self.save_named_item(
@@ -15027,8 +15186,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		"""Löscht das aktive Preset (generische Preset-Mechanik).
 
 		Implementierung: NamedItemActionsMixin.delete_named_item() mit dem
-		Preset-Adapter – 'Default'-Schutz, Rückfrage, danach nächstverfügbares
-		Preset laden.
+		Preset-Adapter – Rückfrage, danach nächstverfügbares Preset laden.
+		'Default' ist löschbar (Anwender-Anweisung 06.08.2026).
 		"""
 		self.delete_named_item(self._preset_adapter)
 
@@ -15162,6 +15321,12 @@ from typing import Any, Callable, Dict, List, Optional
 import pandas as pd
 
 from db_service import TF_SECONDS_MAP
+from chart.overlays.style_models import (
+    LINE_STYLES,
+    MARKER_SHAPES,
+    LineStyle,
+    MarkerStyle,
+)
 from .base_indicator import BaseIndicator
 from analytics.features.feature_builder import PluginExecutor
 from analytics.features.plugins.base_plugin import PluginContext
@@ -15174,6 +15339,36 @@ def _as_bool(value: Any, default: bool = True) -> bool:
     if value is None:
         return default
     return bool(value)
+
+
+def _marker_shape(value: Any, default: str = "circle") -> str:
+    """P16.03-Bugfix: Validiert einen Marker-Shape-Wert gegen MARKER_SHAPES
+    (tolerant: ungueltige Werte fallen auf den Default zurueck)."""
+    s = str(value or default)
+    return s if s in MARKER_SHAPES else default
+
+
+def _marker_size(value: Any, default: int = 6) -> int:
+    """P16.03-Bugfix: Validiert/klammert eine Markergroesse auf 1..20 px."""
+    try:
+        return max(1, min(20, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _line_style(value: Any, default: str = "solid") -> str:
+    """P16.03-Bugfix: Validiert einen Linienart-Wert gegen LINE_STYLES
+    (tolerant: ungueltige Werte fallen auf den Default zurueck)."""
+    s = str(value or default)
+    return s if s in LINE_STYLES else default
+
+
+def _line_width(value: Any, default: int = 1) -> int:
+    """P16.03-Bugfix: Validiert/klammert eine Linienstaerke auf 1..10 px."""
+    try:
+        return max(1, min(10, int(value)))
+    except (TypeError, ValueError):
+        return default
 
 
 def _f_in_window_around(minute_val: int, center: int, span: int) -> bool:
@@ -15202,9 +15397,24 @@ _FIXED_GRID_PROXIMITY_SCHEMA: Dict[str, Dict[str, Any]] = {
     "proximity_threshold": {"type": "float", "default": 0.05, "min": 0.001, "max": 10.0, "step": 0.005, "description": "Toleranzschwelle"},
     "use_time_filter": {"type": "bool", "default": True, "description": "Time Filter aktiv (Zeitfenster um ganze/halbe Stunde)"},
     "time_window_mins": {"type": "int", "default": 5, "min": 0, "max": 30, "step": 1, "description": "Time Filter Minuten (0 oder 30 um ganze/halbe Stunde)"},
-    "line_color": {"type": "color", "default": "#2196F3", "description": "Farbe Grid-Linien"},
-    "circle_color_std": {"type": "color", "default": "#FFEB3B", "description": "Farbe Standard-Hit (im Zeitfenster)"},
-    "circle_color_active": {"type": "color", "default": "#E91E63", "description": "Farbe Hit in Aktivitätsfenster"},
+    "line_color": {"type": "color", "default": "#2196F3", "description": "Farbe Grid-Linien", "style_type": "line"},
+    # P16.03-Bugfix (06.08.2026): Linienart/-staerke werden NICHT als eigene
+    # Controls gerendert (nicht in parameter_order) - der StylePickerWidget
+    # (line-Modus) steuert sie direkt ueber die Geschwister-Keys (Konvention
+    # 'color' -> 'style'/'width'). Old-Presets ohne diese Keys fallen auf die
+    # Defaults zurueck (solid / 1 px).
+    "line_style": {"type": "choice", "options": list(LINE_STYLES), "default": "solid", "description": "Linienart"},
+    "line_width": {"type": "int", "default": 1, "min": 1, "max": 10, "step": 1, "description": "Linienstärke (px)"},
+    "circle_color_std": {"type": "color", "default": "#FFEB3B", "description": "Farbe Standard-Hit (im Zeitfenster)", "style_type": "marker"},
+    "circle_color_active": {"type": "color", "default": "#E91E63", "description": "Farbe Hit in Aktivitätsfenster", "style_type": "marker"},
+    # P16.03-Bugfix (06.08.2026): Marker-Form/-Groesse werden NICHT als eigene
+    # Controls gerendert (nicht in parameter_order) - der StylePickerWidget
+    # steuert sie direkt ueber die Geschwister-Keys (Konvention 'color' ->
+    # 'shape'/'size'). Old-Presets ohne diese Keys fallen auf die Defaults zurueck.
+    "circle_shape_std": {"type": "choice", "options": list(MARKER_SHAPES), "default": "circle", "description": "Symbol Standard-Hit (im Zeitfenster)"},
+    "circle_shape_active": {"type": "choice", "options": list(MARKER_SHAPES), "default": "circle", "description": "Symbol Aktiv-Hit (ausserhalb)"},
+    "circle_size_std": {"type": "int", "default": 6, "min": 1, "max": 20, "step": 1, "description": "Groesse Standard-Hit (px)"},
+    "circle_size_active": {"type": "int", "default": 6, "min": 1, "max": 20, "step": 1, "description": "Groesse Aktiv-Hit (px)"},
     "show_lines": {"type": "bool", "default": True, "description": "Grid-Linien anzeigen"},
     "show_circles": {"type": "bool", "default": True, "description": "Hits anzeigen"},
     "prox_level1": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 1"},
@@ -15325,8 +15535,14 @@ class FixedGridProximityIndicator(BaseIndicator):
             "use_time_filter": "Time Filter aktiv",
             "time_window_mins": "Time Filter Minuten (0/30)",
             "line_color": "Linien-Farbe",
+            "line_style": "Linienart",
+            "line_width": "Linienstärke (px)",
             "circle_color_std": "Std-Hit-Farbe (im Fenster)",
             "circle_color_active": "Aktiv-Hit-Farbe (ausserhalb)",
+            "circle_shape_std": "Symbol Std-Hit",
+            "circle_shape_active": "Symbol Aktiv-Hit",
+            "circle_size_std": "Groesse Std-Hit (px)",
+            "circle_size_active": "Groesse Aktiv-Hit (px)",
             "show_lines": "Linien anzeigen",
             "show_circles": "Circles anzeigen",
             "prox_level1": "Level 1",
@@ -15556,6 +15772,51 @@ class FixedGridProximityIndicator(BaseIndicator):
         return out
 
     # ------------------------------------------------- P16.01: Render-Payload
+    def _build_style_objects(
+        self, ui_params: Dict[str, Any]
+    ) -> tuple:
+        """P16.03 (Schritt 3): Baut die generischen Style-Vertraege aus den
+        Indikator-UI-Params (P16.01-konform – die Services selbst haben seit
+        P16.01 KEINE Style-UI-Params mehr, das komplette Render-Styling liegt
+        ausschliesslich im Indikator).
+
+        Abbildung der UI-Params auf die Style-Vertraege:
+          * `grid_style`     (LineStyle):    show_lines / line_color
+          * `std_marker`     (MarkerStyle):  show_circles / circle_color_std
+          * `active_marker`  (MarkerStyle):  show_circles / circle_color_active
+
+        width/style kommen seit dem P16.03-Bugfix (06.08.2026) aus den
+        Geschwister-UI-Params (Konvention 'color' -> 'style'/'width'):
+        line_style (choice, LINE_STYLES) und line_width (int 1..10).
+        Ebenso shape/size der Marker aus circle_shape_* (choice,
+        MARKER_SHAPES) und circle_size_* (int 1..20). Fehlen die Params
+        (Old-Presets), fallen sie auf die P16.03-Defaults zurueck
+        (LineStyle: width 1, style 'solid'; MarkerStyle: shape 'circle',
+        size 6).
+
+        Returns:
+            (grid_style, std_marker, active_marker) – frische Instanzen.
+        """
+        grid_style = LineStyle(
+            show=_as_bool(ui_params.get("show_lines"), True),
+            color=str(ui_params.get("line_color") or "").strip(),
+            width=_line_width(ui_params.get("line_width"), 1),
+            style=_line_style(ui_params.get("line_style"), "solid"),
+        )
+        std_marker = MarkerStyle(
+            show=_as_bool(ui_params.get("show_circles"), True),
+            color=str(ui_params.get("circle_color_std") or "#FFEB3B"),
+            shape=_marker_shape(ui_params.get("circle_shape_std"), "circle"),
+            size=_marker_size(ui_params.get("circle_size_std"), 6),
+        )
+        active_marker = MarkerStyle(
+            show=_as_bool(ui_params.get("show_circles"), True),
+            color=str(ui_params.get("circle_color_active") or "#E91E63"),
+            shape=_marker_shape(ui_params.get("circle_shape_active"), "circle"),
+            size=_marker_size(ui_params.get("circle_size_active"), 6),
+        )
+        return grid_style, std_marker, active_marker
+
     def build_chart_render_payload(
         self,
         raw_features: Dict[str, Any],
@@ -15564,6 +15825,15 @@ class FixedGridProximityIndicator(BaseIndicator):
         """P16.01 (Architektur-Entkopplung): Baut den chart_render_payload aus
         den ROHDATEN der Services – die Services selbst liefern KEINE Farben,
         Sichtbarkeits-Flags oder Zeichen-Objekte mehr (E1–E5).
+
+        P16.03 (Schritt 3 + Bugfix 06.08.2026): Das Styling wird ueber die
+        generischen Style-Vertraege abgebildet – `LineStyle` (Grid-Linien)
+        bzw. `MarkerStyle` (Std-/Aktiv-Hit) werden aus den UI-Params gebaut
+        (_build_style_objects) und via .to_js_dict() in den Payload uebersetzt
+        (lowercase style-Werte, LWC-v5-Konvention; shape/size fuer die
+        Marker). Die JS-Bridge uebernimmt shape/size aus dem Payload
+        (renderGridCircles) – das style-Feld der Lines bleibt ignoriert
+        (hardcoded LineStyle.Solid in renderGridLines).
 
         raw_features:
           * "grid_levels":        reine Level-Liste [{price}, ...] aus
@@ -15580,19 +15850,31 @@ class FixedGridProximityIndicator(BaseIndicator):
 
         Liefert {"lines", "hit_circles", "status_info"} für den JS-Bridge
         (chart_win._serialize_and_render_grid) – Parität zum Alt-Grid:
-        * lines: {price, color, width, style:'Solid', is_custom}
+        * lines: {price, color, width, style:'solid', is_custom}
           (leere line_color = Paritäts-Styling des Alt-Grid:
-          rgba(33,150,243,0.9)/width 1 für Custom-Levels,
-          rgba(33,150,243,0.5)/width 3 für Normal-Levels).
-        * hit_circles: {time, price, in_window, color, priority:10}
-          circle_color_std wenn in_window=True (bzw. Time-Filter inaktiv),
-          circle_color_active sonst (E1).
+          rgba(33,150,243,0.9) für Custom-Levels, rgba(33,150,243,0.5) für
+          Normal-Levels; width/style seit P16.03-Bugfix aus line_width/
+          line_style – User-Einstellung, Default 1/solid).
+        * hit_circles: {time, price, in_window, color, shape, size, priority:10}
+          circle_color_std/shape/size wenn in_window=True (bzw. Time-Filter
+          inaktiv), circle_color_active/_shape/_size sonst (E1/E3).
         * status_info: 1:1 aus raw_features["status_info"] (E4).
         """
         lines: List[Dict[str, Any]] = []
-        if _as_bool(ui_params.get("show_lines"), True):
-            line_color = str(ui_params.get("line_color") or "").strip()
+        # P16.03: Grid-Linien-Style aus dem generischen Style-Vertrag
+        # (LineStyle.to_js_dict -> lowercase style, LWC-v5-Konvention).
+        grid_style, std_marker, active_marker = self._build_style_objects(ui_params)
+        if grid_style.show:
+            line_color = grid_style.color
             custom_levels = self._extract_custom_levels(ui_params)
+            # P16.03-Bugfix: width/style aus dem LineStyle-Vertrag (User-
+            # Einstellung im StylePickerWidget) - vorher wurde die width vom
+            # Paritaets-Styling (custom=1/normal=3) ueberschrieben und der
+            # style war immer 'solid'. Die color-Paritaet (leere line_color ->
+            # custom/normal unterschiedliche Transparenz) bleibt bestehen.
+            js_line = grid_style.to_js_dict()
+            js_line_style = js_line["style"]
+            js_line_width = js_line["width"]
             for lvl_item in (raw_features.get("grid_levels") or []):
                 if not isinstance(lvl_item, dict):
                     continue
@@ -15611,22 +15893,28 @@ class FixedGridProximityIndicator(BaseIndicator):
                 lines.append({
                     "price": lvl,
                     "color": color,
-                    "width": 1 if is_custom else 3,
-                    "style": "Solid",
+                    "width": js_line_width,
+                    "style": js_line_style,
                     "is_custom": is_custom,
                 })
 
         use_time_filter = _as_bool(ui_params.get("use_time_filter"), True)
-        circle_std = str(ui_params.get("circle_color_std") or "#FFEB3B")
-        circle_active = str(ui_params.get("circle_color_active") or "#E91E63")
+        # P16.03-Bugfix: Hit-Marker-Styling aus den generischen Style-Vertraegen
+        # (MarkerStyle.to_js_dict -> LWC-v5-kompatible color/shape/size).
+        js_std = std_marker.to_js_dict()
+        js_active = active_marker.to_js_dict()
+        circle_std = js_std["color"]
+        circle_active = js_active["color"]
         hit_circles: List[Dict[str, Any]] = []
-        if _as_bool(ui_params.get("show_circles"), True):
+        if std_marker.show and active_marker.show:
             for rec in (raw_features.get("proximity_records") or []):
                 if not rec.get("is_hit"):
                     continue
                 in_window = bool(rec.get("in_time_window"))
-                color = (circle_active if (use_time_filter and not in_window)
-                         else circle_std)
+                is_active = bool(use_time_filter and not in_window)
+                color = circle_active if is_active else circle_std
+                shape = js_active["shape"] if is_active else js_std["shape"]
+                size = js_active["size"] if is_active else js_std["size"]
                 try:
                     bar_time = int(rec.get("bar_time"))
                 except (TypeError, ValueError):
@@ -15638,6 +15926,8 @@ class FixedGridProximityIndicator(BaseIndicator):
                             "price": float(lvl),
                             "in_window": in_window,
                             "color": color,
+                            "shape": shape,
+                            "size": size,
                             "priority": 10,
                         })
                     except (TypeError, ValueError):
@@ -15732,6 +16022,10 @@ class FixedGridProximityIndicator(BaseIndicator):
             )
             circle_std = str(p.get("circle_color_std") or "#FFEB3B")
             circle_active = str(p.get("circle_color_active") or "#E91E63")
+            shape_std = _marker_shape(p.get("circle_shape_std"), "circle")
+            shape_active = _marker_shape(p.get("circle_shape_active"), "circle")
+            size_std = _marker_size(p.get("circle_size_std"), 6)
+            size_active = _marker_size(p.get("circle_size_active"), 6)
             use_time_filter = _as_bool(p.get("use_time_filter"), True)
 
             def _colorize(c: Dict[str, Any]) -> Dict[str, Any]:
@@ -15742,13 +16036,14 @@ class FixedGridProximityIndicator(BaseIndicator):
                 # build_chart_render_payload) setzt priority=10 bereits selbst.
                 # Durch das additive Setzen sind BEIDE Pfade konsistent
                 # (ChartCircle-Vertrag, base_plugin.py).
+                # P16.03-Bugfix: Auch shape/size additiv setzen – der
+                # Feature-Store-Lesepfad liefert die Kreise ohne Form/Groesse.
+                is_active = bool(use_time_filter and not bool(c.get("in_window", True)))
                 return dict(
                     c,
-                    color=(
-                        circle_active
-                        if (use_time_filter and not bool(c.get("in_window", True)))
-                        else circle_std
-                    ),
+                    color=(circle_active if is_active else circle_std),
+                    shape=(shape_active if is_active else shape_std),
+                    size=(size_active if is_active else size_std),
                     priority=10,
                 )
 
@@ -15824,13 +16119,20 @@ class FixedGridProximityIndicator(BaseIndicator):
         time_window_mins = int(p.get("time_window_mins", 5))
         circle_std = str(p.get("circle_color_std") or "#FFEB3B")
         circle_active = str(p.get("circle_color_active") or "#E91E63")
+        shape_std = _marker_shape(p.get("circle_shape_std"), "circle")
+        shape_active = _marker_shape(p.get("circle_shape_active"), "circle")
+        size_std = _marker_size(p.get("circle_size_std"), 6)
+        size_active = _marker_size(p.get("circle_size_active"), 6)
 
         row_m = datetime.fromtimestamp(rounded, tz=dt_timezone.utc).minute
         row_in_time = (
             _f_in_window_around(row_m, 0, time_window_mins)
             or _f_in_window_around(row_m, 30, time_window_mins)
         )
-        color = circle_active if (use_time_filter and not row_in_time) else circle_std
+        is_active = bool(use_time_filter and not row_in_time)
+        color = circle_active if is_active else circle_std
+        shape = shape_active if is_active else shape_std
+        size = size_active if is_active else size_std
 
         points: List[Dict[str, Any]] = []
         for line in cached_lines:
@@ -15845,7 +16147,7 @@ class FixedGridProximityIndicator(BaseIndicator):
             visit_max = lvl * (1.0 + visit_pct / 100.0)
             if visit_min <= price <= visit_max:
                 points.append({"time": rounded, "price": lvl, "color": color,
-                               "priority": 10})
+                               "shape": shape, "size": size, "priority": 10})
 
         self._live_points = list(points)  # atomare Zuweisung
         return points
@@ -15866,6 +16168,554 @@ class FixedGridProximityIndicator(BaseIndicator):
             self._known_times.add(int(ts))
         except (TypeError, ValueError):
             pass
+
+```
+
+--------------------------------------------------
+
+### DATEI: chart/indicators/utils/__init__.py
+```py
+# ==============================================================================
+# chart/indicators/utils/__init__.py
+# ==============================================================================
+# Phase 16.04: Reine Utility-Helfer für Indikatoren (keine Analytics-Plugins,
+# keine Feature-Store-Schreibzugriffe). Exportfrei – Module werden direkt
+# importiert (z. B. chart.indicators.utils.ma_template.MATemplateEngine),
+# analog zum exportfreien chart/indicators/__init__.py (Phase 15).
+
+```
+
+--------------------------------------------------
+
+### DATEI: chart/indicators/utils/ma_template.py
+```py
+# chart/indicators/utils/ma_template.py
+"""
+Phase 16.04 – Generisches MA-Template-Modul
+============================================
+
+Wiederverwendbare Moving-Average-Utility für Chart-Indikatoren.
+
+WICHTIG (Entscheidungen 06.08.2026, Doku-Analyse 16.04):
+  * KEIN Analytics-Plugin, KEINE Feature-Store-Schreibzugriffe – reine
+    Utility-Klasse (P16.01-Philosophie: Darstellung additiv im Indikator).
+  * MAType = TradingView-konformer 12er-Satz in exakter Reihenfolge
+    (E2): SMA, EMA, WMA, DEMA, TEMA, HMA, EHMA, ZLEMA, RMA, KAMA, ALMA, VWMA.
+  * Defaults (E3): ma_type="EHMA", period=4, alpha_factor=2.0,
+    smooth_type="EHMA", dual_color=False, bull_color="#2196F3",
+    bear_color="#EF5350".
+  * Alpha-MAs (E4): DEMA, TEMA, EHMA verwenden den dynamischen Decay-Faktor
+    alpha = alpha_factor / (period + 1).
+  * VWMA (E5): ohne gültiges Volumen (fehlend/Null) Fallback auf SMA.
+  * smooth_type (Ergänzung 1): reiner Schema-Vertrag für spätere
+    MA-Indikatoren – wird von der Engine hier NICHT konsumiert
+    (Forward-Compatibility). EHMA = EMA_alpha(HMA(src, len), len).
+  * bull_color-Default bedingt (E7/Ergänzung 2): Schema liefert "#2196F3";
+    der Konsument wendet "#26A69A" an, wenn dual_color=True UND bull_color
+    nicht vom User gesetzt wurde (leer/None).
+  * NaN-Handling (Ergänzung 3): build_chart_payload überspringt Zeilen mit
+    NaN/None in time oder value (Warmup period-1); Längen-Mismatch bei colors
+    wird defensiv toleriert (Fallback = bull_color).
+
+Alle 12 MA-Typen sind vektorisiert via NumPy/Pandas (numpy 2.5.1 /
+pandas 3.0.5 in .venv). KAMA ist inhärent rekursiv (ER-basiert) und läuft
+über eine kompakte Python-Schleife auf dem NumPy-Array; alle anderen Typen
+über rolling/ewm/convolve.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Literal, Optional
+
+import numpy as np
+import pandas as pd
+
+# ---------------------------------------------------------------------------
+# Kerntypen & Konstanten
+# ---------------------------------------------------------------------------
+
+MAType = Literal[
+    "SMA",
+    "EMA",
+    "WMA",
+    "DEMA",
+    "TEMA",
+    "HMA",
+    "EHMA",
+    "ZLEMA",
+    "RMA",
+    "KAMA",
+    "ALMA",
+    "VWMA",
+]
+
+MA_TYPES: tuple = (
+    "SMA",
+    "EMA",
+    "WMA",
+    "DEMA",
+    "TEMA",
+    "HMA",
+    "EHMA",
+    "ZLEMA",
+    "RMA",
+    "KAMA",
+    "ALMA",
+    "VWMA",
+)
+
+# Standardfarben (E3/E7)
+_DEFAULT_BULL_COLOR: str = "#2196F3"
+_DEFAULT_BULL_COLOR_DUAL: str = "#26A69A"
+_DEFAULT_BEAR_COLOR: str = "#EF5350"
+
+# KAMA-Standardkonstanten (Ergänzung 4): period = ER-Periode; fast/slow
+# fest nach Kaufman (2/3 bzw. 2/31).
+_KAMA_FAST_ALPHA: float = 2.0 / (2.0 + 1.0)
+_KAMA_SLOW_ALPHA: float = 2.0 / (30.0 + 1.0)
+
+# ALMA-Defaults (Ergänzung 4, TradingView): Offset 0.85, Sigma = period/6.
+_ALMA_OFFSET: float = 0.85
+
+
+def resolve_bull_color(
+    dual_color: bool,
+    bull_color: Optional[str] = None,
+    default: str = _DEFAULT_BULL_COLOR,
+) -> str:
+    """Ergänzung 2 (E7): Löst den bedingten bull_color-Default auf.
+
+    Schema-Default ist "#2196F3". Bei dual_color=True UND nicht gesetztem
+    (leer/None) User-Wert wird der dual-freundliche Default "#26A69A"
+    angewendet. Leerstring/whitespace wird wie "nicht gesetzt" behandelt.
+    """
+    if bull_color is not None and str(bull_color).strip():
+        return str(bull_color).strip()
+    if dual_color:
+        return _DEFAULT_BULL_COLOR_DUAL
+    return default
+
+
+# ---------------------------------------------------------------------------
+# Vektorisierte Kern-Bausteine (NumPy)
+# ---------------------------------------------------------------------------
+
+
+def _sma_values(values: np.ndarray, period: int) -> np.ndarray:
+    """SMA über rollierende Fenster (konstanter Gewichtsvektor)."""
+    if period <= 1:
+        return values.astype(float, copy=True)
+    window = np.ones(period, dtype=float)
+    conv = np.convolve(values, window, mode="valid") / float(period)
+    result = np.full(len(values), np.nan, dtype=float)
+    result[period - 1:] = conv
+    return result
+
+
+def _wma_values(values: np.ndarray, period: int) -> np.ndarray:
+    """WMA (linear gewichtet, jüngster Wert = höchstes Gewicht) via Faltung.
+
+    np.convolve wendet die Gewichte rückwärts an (v[0] trifft den ältesten
+    Wert). Daher wird der Gewichtsvektor absteigend angelegt ([p, p-1, .., 1]),
+    damit der jüngste Wert das höchste Gewicht p erhält. result[t] ist am
+    Fensterende positioniert (Warmup = period-1 NaNs).
+    """
+    if period <= 1:
+        return values.astype(float, copy=True)
+    weights = np.arange(period, 0, -1, dtype=float)
+    conv = np.convolve(values, weights, mode="valid") / weights.sum()
+    result = np.full(len(values), np.nan, dtype=float)
+    result[period - 1:] = conv
+    return result
+
+
+def _ema_alpha_values(values: np.ndarray, alpha: float) -> np.ndarray:
+    """EMA mit explizitem Decay-Faktor alpha (E4).
+
+    Nutzt pandas ewm(alpha=alpha, adjust=False) – vektorisiert und exakt.
+    """
+    return np.array(
+        pd.Series(values).ewm(alpha=alpha, adjust=False).mean().to_numpy(),
+        dtype=float,
+        copy=True,
+    )
+
+
+def _ema_span_values(values: np.ndarray, period: int) -> np.ndarray:
+    """Standard-EMA (span=period) für Nicht-Alpha-MAs (EMA, ZLEMA)."""
+    return np.array(
+        pd.Series(values).ewm(span=period, adjust=False).mean().to_numpy(),
+        dtype=float,
+        copy=True,
+    )
+
+
+def _rma_values(values: np.ndarray, period: int) -> np.ndarray:
+    """RMA (Wilder): ewm(alpha=1/period, adjust=False) (Ergänzung 4)."""
+    if period <= 1:
+        return values.astype(float, copy=True)
+    return np.array(
+        pd.Series(values).ewm(alpha=1.0 / period, adjust=False).mean().to_numpy(),
+        dtype=float,
+        copy=True,
+    )
+
+
+def _hma_values(values: np.ndarray, period: int) -> np.ndarray:
+    """HMA (Hull): WMA(2*WMA(half) - WMA(len), sqrt(len)).
+
+    sqrt(len) wird auf eine ungerade Ganzzahl gerundet (min 1).
+    """
+    if period <= 1:
+        return values.astype(float, copy=True)
+    half = max(period // 2, 1)
+    sqrt_period = max(int(np.sqrt(period)), 1)
+    if sqrt_period % 2 == 0:
+        sqrt_period += 1
+    inner = 2.0 * _wma_values(values, half) - _wma_values(values, period)
+    return _wma_values(inner, sqrt_period)
+
+
+def _dema_values(values: np.ndarray, period: int, alpha: float) -> np.ndarray:
+    """DEMA: 2*EMA_alpha - EMA_alpha(EMA_alpha) (E4)."""
+    ema1 = _ema_alpha_values(values, alpha)
+    return 2.0 * ema1 - _ema_alpha_values(ema1, alpha)
+
+
+def _tema_values(values: np.ndarray, period: int, alpha: float) -> np.ndarray:
+    """TEMA: 3*E1 - 3*E2 + E3 (E4)."""
+    ema1 = _ema_alpha_values(values, alpha)
+    ema2 = _ema_alpha_values(ema1, alpha)
+    ema3 = _ema_alpha_values(ema2, alpha)
+    return 3.0 * ema1 - 3.0 * ema2 + ema3
+
+
+def _ehma_values(values: np.ndarray, period: int, alpha: float) -> np.ndarray:
+    """EHMA: EMA_alpha(HMA(src, len), len) (Ergänzung 1, E4)."""
+    return _ema_alpha_values(_hma_values(values, period), alpha)
+
+
+def _zlema_values(values: np.ndarray, period: int) -> np.ndarray:
+    """ZLEMA: EMA(xt, len) mit xt = src + (src - src[lag]), lag=(len-1)/2."""
+    if period <= 1:
+        return values.astype(float, copy=True)
+    lag = int((period - 1) / 2)
+    if lag < 1:
+        lag = 1
+    shifted = np.empty_like(values, dtype=float)
+    shifted[:lag] = np.nan
+    shifted[lag:] = values[:-lag]
+    xt = values + (values - shifted)
+    result = _ema_span_values(xt, period)
+    # Warmup: xt ist erst ab Index lag definiert; die EMA läuft über die
+    # NaN-Periode ohnehin erst ab period-1 vollständig auf. Defensiv werden
+    # die ersten period-1 Werte als NaN markiert (Warmup-Vertrag).
+    result[: max(period - 1, 0)] = np.nan
+    return result
+
+
+def _kama_values(values: np.ndarray, period: int) -> np.ndarray:
+    """KAMA (Kaufman Adaptive MA), ER-basiert (Ergänzung 4).
+
+    - period dient als ER-Periode (Change vs. Volatilität, Default 10).
+    - alpha_factor entfällt bei KAMA.
+    - Seed = values[length] (erster Wert mit definierter ER).
+    - Inhärent rekursiv -> kompakte Python-Schleife über das NumPy-Array.
+    """
+    length = max(int(period), 1)
+    n = len(values)
+    result = np.full(n, np.nan, dtype=float)
+    if n <= length:
+        return result
+
+    diff = np.abs(np.diff(values))  # len n-1
+    # vol[i-length] = Summe der letzten `length` Bar-Diffs bis Index i
+    vol = np.convolve(diff, np.ones(length, dtype=float), mode="valid")  # len n-length
+    change = np.abs(values[length:] - values[:-length])  # len n-length
+    er = np.divide(
+        change, vol, out=np.zeros_like(change, dtype=float), where=vol > 0.0
+    )
+    sc = np.square(er * (_KAMA_FAST_ALPHA - _KAMA_SLOW_ALPHA) + _KAMA_SLOW_ALPHA)
+
+    m = n - length
+    kama = np.empty(m, dtype=float)
+    prev = float(values[length])
+    kama[0] = prev
+    for i in range(1, m):
+        val = float(values[length + i])
+        prev = prev + sc[i] * (val - prev)
+        kama[i] = prev
+    result[length:] = kama
+    return result
+
+
+def _alma_values(values: np.ndarray, period: int) -> np.ndarray:
+    """ALMA (Arnaud Legoux MA) mit TradingView-Defaults (Ergänzung 4).
+
+    Gewichte werden über np.convolve angewendet – wegen der rückwärtigen
+    Faltungs-Orientierung (v[0] trifft den ältesten Wert) wird weights[::-1]
+    gefaltet, damit weights[0] auf den ältesten und weights[period-1] auf den
+    jüngsten Wert des Fensters wirken (identisch zur Referenzschleife).
+    """
+    if period <= 1:
+        return values.astype(float, copy=True)
+    offset = (period - 1) * _ALMA_OFFSET
+    sigma = period / 6.0
+    m = np.arange(period, dtype=float) - offset
+    weights = np.exp(-(m * m) / (2.0 * sigma * sigma))
+    weights = weights / weights.sum()
+    conv = np.convolve(values, weights[::-1], mode="valid")
+    result = np.full(len(values), np.nan, dtype=float)
+    result[period - 1:] = conv
+    return result
+
+
+def _vwma_values(
+    values: np.ndarray, volume: np.ndarray, period: int
+) -> np.ndarray:
+    """VWMA: sum(price*volume) / sum(volume) über das Fenster.
+
+    Null-/NaN-Volumen wird mit 0 normalisiert (Ergänzung 5). Ist die
+    rollierende Volumen-Summe eines Fensters <= 0, fällt dieses Fenster auf
+    den SMA-Wert zurück (kein Division-by-Zero).
+    """
+    if period <= 1:
+        return values.astype(float, copy=True)
+    vol = np.where(np.isnan(volume), 0.0, volume)
+    pv = values * vol
+    pv_sum = np.convolve(pv, np.ones(period, dtype=float), mode="valid")
+    vol_sum = np.convolve(vol, np.ones(period, dtype=float), mode="valid")
+    sma_tail = _sma_values(values, period)[period - 1:]
+    valid = vol_sum > 0.0
+    wv = np.full(len(vol_sum), np.nan, dtype=float)
+    wv[valid] = pv_sum[valid] / vol_sum[valid]
+    wv[~valid] = sma_tail[~valid]
+    result = np.full(len(values), np.nan, dtype=float)
+    result[period - 1:] = wv
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Öffentliche Klasse
+# ---------------------------------------------------------------------------
+
+
+class MATemplateEngine:
+    """Vektorisierte Moving-Average-Utility für Indikatoren (Phase 16.04).
+
+    Rein stateless – alle Methoden sind abhängigkeitsfrei und können direkt
+    aus Indikator-Plugins heraus genutzt werden (Open/Closed, additiv).
+    """
+
+    # ------------------------------------------------------------ Schema-API
+    @staticmethod
+    def get_ma_parameter_schema() -> Dict[str, Dict[str, Any]]:
+        """Standard-Parameter-Schema für MA-basierte Indikatoren.
+
+        Konvention exakt wie im Projekt üblich (vgl. _FIXED_GRID_PROXIMITY_SCHEMA
+        in chart/indicators/fixed_grid_proximity.py und dem Schema-Renderer in
+        chart/indicator_dialog.py): {"type": "...", "default": ...,
+        "min"/"max"/"step", "options", "description", "style_type"}.
+
+        Hinweis (E7/Ergänzung 2): bull_color-Default ist "#2196F3" – der
+        dual_color-abhängige Default "#26A69A" wird zur Laufzeit über
+        resolve_bull_color() aufgelöst.
+        """
+        return {
+            "ma_type": {
+                "type": "choice",
+                "options": list(MA_TYPES),
+                "default": "EHMA",
+                "description": "Moving-Average-Typ",
+            },
+            "period": {
+                "type": "int",
+                "default": 4,
+                "min": 1,
+                "max": 500,
+                "step": 1,
+                "description": "MA-Periode",
+            },
+            "smooth_type": {
+                "type": "choice",
+                "options": list(MA_TYPES),
+                "default": "EHMA",
+                "description": "Smoothing-Typ (Forward-Compatibility, 16.04 noch nicht konsumiert)",
+            },
+            "alpha_factor": {
+                "type": "float",
+                "default": 2.0,
+                "min": 0.1,
+                "max": 10.0,
+                "step": 0.1,
+                "description": "Decay-Faktor für Alpha-MAs (EHMA/DEMA/TEMA)",
+            },
+            "dual_color": {
+                "type": "bool",
+                "default": False,
+                "description": "Auf/Ab-Färbung aktiv (t vs. t-1)",
+            },
+            "bull_color": {
+                "type": "color",
+                "default": _DEFAULT_BULL_COLOR,
+                "description": "Farbe steigender MA (dual_color=False durchgehend)",
+                "style_type": "line",
+            },
+            "bear_color": {
+                "type": "color",
+                "default": _DEFAULT_BEAR_COLOR,
+                "description": "Farbe fallender MA (dual_color=True)",
+                "style_type": "line",
+            },
+        }
+
+    # ------------------------------------------------------------ Berechnung
+    @staticmethod
+    def crop_dataframe(df: pd.DataFrame, max_limit: int) -> pd.DataFrame:
+        """Schneidet den DataFrame auf die letzten `max_limit` Zeilen zu."""
+        if df is None or max_limit is None:
+            return df
+        if len(df) <= max_limit:
+            return df
+        return df.tail(int(max_limit))
+
+    @classmethod
+    def calculate_ma(
+        cls,
+        source: pd.Series,
+        ma_type: MAType,
+        period: int,
+        alpha_factor: float = 2.0,
+        volume: Optional[pd.Series] = None,
+    ) -> pd.Series:
+        """Berechnet einen der 12 MA-Typen vektorisiert.
+
+        Args:
+            source: Preis-Serie (z. B. df['close']).
+            ma_type: Einer der 12 MA-Typen (MAType).
+            period: MA-Periode (min 1).
+            alpha_factor: Decay-Faktor für Alpha-MAs (E4); entfällt bei KAMA.
+            volume: Volumen-Serie für VWMA (z. B. df['tick_volume']). Fehlt
+                    sie oder ist sie Null/NaN, fällt VWMA auf SMA zurück (E5).
+
+        Returns:
+            pd.Series mit demselben Index wie `source`; die ersten
+            `period - 1` Werte sind NaN (Warmup).
+        """
+        if source is None:
+            return pd.Series(dtype=float)
+        src = pd.to_numeric(source, errors="coerce")
+        period_int = max(int(period), 1)
+        values = src.to_numpy(dtype=float, na_value=np.nan)
+        n = len(values)
+        if n == 0:
+            return pd.Series(index=src.index, dtype=float)
+
+        alpha = float(alpha_factor) / (period_int + 1.0)
+
+        key = str(ma_type or "").strip().upper()
+        if key == "SMA":
+            result = _sma_values(values, period_int)
+        elif key == "EMA":
+            result = _ema_span_values(values, period_int)
+        elif key == "WMA":
+            result = _wma_values(values, period_int)
+        elif key == "DEMA":
+            result = _dema_values(values, period_int, alpha)
+        elif key == "TEMA":
+            result = _tema_values(values, period_int, alpha)
+        elif key == "HMA":
+            result = _hma_values(values, period_int)
+        elif key == "EHMA":
+            result = _ehma_values(values, period_int, alpha)
+        elif key == "ZLEMA":
+            result = _zlema_values(values, period_int)
+        elif key == "RMA":
+            result = _rma_values(values, period_int)
+        elif key == "KAMA":
+            result = _kama_values(values, period_int)
+        elif key == "ALMA":
+            result = _alma_values(values, period_int)
+        elif key == "VWMA":
+            if volume is None or len(volume) != n:
+                result = _sma_values(values, period_int)  # E5-Fallback
+            else:
+                vol = pd.to_numeric(volume, errors="coerce").to_numpy(
+                    dtype=float, na_value=np.nan
+                )
+                result = _vwma_values(values, vol, period_int)
+        else:
+            raise ValueError(
+                f"Unbekannter MA-Typ '{ma_type}'. Gültig: {MA_TYPES}"
+            )
+
+        return pd.Series(result, index=src.index, dtype=float)
+
+    # ------------------------------------------------------------ Darstellung
+    @staticmethod
+    def build_color_series(
+        ma_series: pd.Series,
+        dual_color: bool,
+        bull_color: str,
+        bear_color: str,
+    ) -> List[str]:
+        """Färbt die MA-Serie gemäß dual_color-Semantik (E6).
+
+        - dual_color=False: durchgehend bull_color.
+        - dual_color=True: ma_t >= ma_{t-1} -> bull_color, sonst bear_color.
+        - NaN-Vergleiche (Warmup) gelten als bull_color (defensiv).
+        - Index 0 hat keinen Vorgänger -> bull_color.
+        """
+        n = len(ma_series)
+        if n == 0:
+            return []
+        if not dual_color:
+            return [str(bull_color)] * n
+        values = pd.to_numeric(ma_series, errors="coerce").to_numpy(
+            dtype=float, na_value=np.nan
+        )
+        diff = np.diff(values)  # len n-1; NaN propagiert
+        is_up = np.ones(n, dtype=bool)
+        finite = ~np.isnan(diff)
+        is_up[1:] = np.where(finite, diff >= 0.0, True)
+        return np.where(is_up, str(bull_color), str(bear_color)).tolist()
+
+    @staticmethod
+    def build_chart_payload(
+        time_series: pd.Series,
+        ma_series: pd.Series,
+        colors: List[str],
+    ) -> List[Dict[str, Any]]:
+        """Baut ein LWC-v5-kompatibles Objekt-Array (Ergänzung 3).
+
+        Vertrag:
+          * [{"time": int(epoch-Sekunden, Wanduhr), "value": float,
+             "color": str}, ...]
+          * Zeilen mit NaN/None in time oder value werden übersprungen
+            (Warmup period-1).
+          * Längen-Mismatch (len(colors) < len(ma_series)) wird defensiv
+            toleriert: fehlende Farbe fällt auf bull_color zurück.
+        """
+        payload: List[Dict[str, Any]] = []
+        n = len(ma_series)
+        if n == 0:
+            return payload
+        times = time_series.to_numpy()
+        values = pd.to_numeric(ma_series, errors="coerce").to_numpy(
+            dtype=float, na_value=np.nan
+        )
+        default_color = str(colors[0]) if colors else _DEFAULT_BULL_COLOR
+        for i in range(n):
+            try:
+                ts = int(times[i])
+            except (TypeError, ValueError):
+                continue
+            v = values[i]
+            if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
+                continue
+            color = str(colors[i]) if i < len(colors) and colors[i] else default_color
+            payload.append({"time": ts, "value": float(v), "color": color})
+        return payload
 
 ```
 
@@ -16078,6 +16928,18 @@ function clearGridLines() {
     gridPriceLines = [];
 }
 
+// P16.03-Bugfix: Python-Linienart (lowercase: solid/dashed/dotted/dashdotted)
+// auf LWC-v5-LineStyle mappen. 'dashdotted' -> LargeDashed (beste Naeherung).
+function _lwcLineStyle(styleName) {
+    switch ((styleName || 'solid').toLowerCase()) {
+        case 'dashed': return LightweightCharts.LineStyle.Dashed;
+        case 'dotted': return LightweightCharts.LineStyle.Dotted;
+        case 'dashdotted': return LightweightCharts.LineStyle.LargeDashed;
+        case 'solid':
+        default: return LightweightCharts.LineStyle.Solid;
+    }
+}
+
 function renderGridLines(lines) {
     clearGridLines();
     if (!candleSeries || !lines) return;
@@ -16086,7 +16948,7 @@ function renderGridLines(lines) {
         if (l && typeof l.price === 'number' && !isNaN(l.price)) {
             var pl = candleSeries.createPriceLine({
                 price: l.price, color: l.color, lineWidth: l.width,
-                lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true,
+                lineStyle: _lwcLineStyle(l.style), axisLabelVisible: true,
                 title: l.is_custom ? '\u2605' : ''
             });
             gridPriceLines.push(pl);
@@ -16170,8 +17032,11 @@ function renderGridCircles(circles) {
                 time: cc.time,
                 position: 'inBar',
                 color: cc.color || '#E91E63',
-                shape: 'circle',
-                size: 1,
+                // P16.03-Bugfix: Form/Groesse aus dem Python-Payload uebernehmen
+                // (vorher hart 'circle'/1) - die Auswahl im StylePickerWidget
+                // (circle/square/arrowUp/arrowDown) wirkt damit endlich.
+                shape: cc.shape || 'circle',
+                size: (cc.size && cc.size > 0) ? cc.size : 1,
                 priority: 10
             });
         }
@@ -17243,6 +18108,202 @@ var Measurement = (function() {
 
 ### DATEI: chart/overlays/__init__.py
 ```py
+# chart/overlays/__init__.py
+# Phase 16 P16.03 (06.08.2026): Generische Zeichnungsobjekte & Style-Vertraege.
+#
+# LineStyle / MarkerStyle kapseln Styling-Attribute (Farbe, Dicke, Stil, Form,
+# Sichtbarkeit) und konvertieren sich via .to_js_dict() direkt fuer das
+# Canvas-Frontend sowie via .to_dict()/.from_dict() fuer die JSON-Persistenz
+# (indicator_presets im StateManager).
+from .style_models import (
+    LINE_STYLES,
+    MARKER_SHAPES,
+    LineStyle,
+    MarkerStyle,
+)
+
+__all__ = [
+    "LINE_STYLES",
+    "MARKER_SHAPES",
+    "LineStyle",
+    "MarkerStyle",
+]
+
+```
+
+--------------------------------------------------
+
+### DATEI: chart/overlays/style_models.py
+```py
+# chart/overlays/style_models.py
+# Phase 16 P16.03 (06.08.2026): Generische Style-Vertraege (Dataclasses).
+#
+# Visuelle Attribute (Farbe, Dicke, Stil, Form) werden nicht mehr als flache
+# Einzelparameter (line_color, line_width, ...) durch das System gereicht,
+# sondern in typisierten Styling-Klassen gebuendelt:
+#
+#   * LineStyle   - Linien: show / color / width / style
+#   * MarkerStyle - Punkte (Hit-Circles u. a.): show / color / shape / size
+#
+# Konvertierungen:
+#   * to_js_dict()  - direkt fuer die JS-Bridge (TradingView Lightweight
+#                     Charts v5): style-Werte lowercase (solid/dashed/dotted/
+#                     dashdotted), shape-Werte LWC-kompatibel
+#                     (circle/square/arrowUp/arrowDown).
+#   * to_dict()     - JSON-kompatibles Dict (Preset-Persistenz im
+#                     StateManager / indicator_presets).
+#   * from_dict()   - Rueck-Konvertierung (tolerant gegen fehlende Felder:
+#                     Defaults werden ergaenzt).
+#
+# Farb-Logik (Paritaet zum ColorButton / StylePickerWidget):
+#   - Alpha == 255 -> '#RRGGBB' (Hex, Grossbuchstaben, volle Deckkraft).
+#   - Alpha < 255  -> 'rgba(r, g, b, a)' mit a als Float (0..1) -
+#                     1:1 kompatibel mit TradingView Lightweight Charts v5
+#                     (WebEngine) und HTML/CSS.
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+
+# ---------------------------------------------------------------------------
+# Konvertierungs-Helfer
+# ---------------------------------------------------------------------------
+
+def _as_bool(value: Any, default: bool = True) -> bool:
+    if isinstance(value, str):
+        return value.lower() in ("true", "1", "yes")
+    if value is None:
+        return default
+    return bool(value)
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_str(value: Any, default: str) -> str:
+    if value is None:
+        return default
+    return str(value)
+
+
+# ---------------------------------------------------------------------------
+# LineStyle
+# ---------------------------------------------------------------------------
+
+#: Gueltige Linienarten (lowercase, JS-Bridge-Konvention).
+LINE_STYLES: List[str] = ["solid", "dashed", "dotted", "dashdotted"]
+
+
+@dataclass
+class LineStyle:
+    """Stil-Definition fuer Linien: Sichtbarkeit, Farbe, Staerke, Linienart.
+
+    Attributes:
+        show:  bool  – Linie sichtbar (QCheckBox).
+        color: str   – '#RRGGBB' (Alpha=255) oder 'rgba(r,g,b,a)' (Teil-Transparenz).
+        width: int   – Linienstaerke in px (1–10, QSpinBox).
+        style: str   – 'solid' | 'dashed' | 'dotted' | 'dashdotted' (QComboBox).
+    """
+
+    show: bool = True
+    color: str = "#2196F3"
+    width: int = 1
+    style: str = "solid"
+
+    # -- JS-Bridge -----------------------------------------------------------
+    def to_js_dict(self) -> Dict[str, Any]:
+        """JS-Bridge-Darstellung (LWC v5): lowercase style-Werte."""
+        return {
+            "show": bool(self.show),
+            "color": str(self.color),
+            "width": int(self.width),
+            "style": str(self.style) if str(self.style) in LINE_STYLES else "solid",
+        }
+
+    # -- JSON-Persistenz -----------------------------------------------------
+    def to_dict(self) -> Dict[str, Any]:
+        """JSON-kompatibles Dict (Presets im StateManager)."""
+        return self.to_js_dict()
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> "LineStyle":
+        """Erzeugt eine LineStyle aus einem (JSON-)Dict – tolerant: fehlende
+        Felder erhalten ihre Defaults, ungueltige style-Werte fallen auf
+        'solid' zurueck. None -> Default-Instanz.
+        """
+        if not isinstance(data, dict):
+            return cls()
+        style = _as_str(data.get("style"), "solid")
+        if style not in LINE_STYLES:
+            style = "solid"
+        return cls(
+            show=_as_bool(data.get("show"), True),
+            color=_as_str(data.get("color"), "#2196F3"),
+            width=_as_int(data.get("width"), 1),
+            style=style,
+        )
+
+
+# ---------------------------------------------------------------------------
+# MarkerStyle
+# ---------------------------------------------------------------------------
+
+#: Gueltige Marker-Formen (LWC v5-kompatibel fuer die JS-Bridge).
+MARKER_SHAPES: List[str] = ["circle", "square", "arrowUp", "arrowDown"]
+
+
+@dataclass
+class MarkerStyle:
+    """Stil-Definition fuer Marker/Punkte: Sichtbarkeit, Farbe, Form, Groesse.
+
+    Attributes:
+        show:  bool  – Marker sichtbar (QCheckBox).
+        color: str   – '#RRGGBB' (Alpha=255) oder 'rgba(r,g,b,a)' (Teil-Transparenz).
+        shape: str   – 'circle' | 'square' | 'arrowUp' | 'arrowDown' (QComboBox).
+        size:  int   – Markergroesse in px (QSpinBox).
+    """
+
+    show: bool = True
+    color: str = "#FFEB3B"
+    shape: str = "circle"
+    size: int = 6
+
+    # -- JS-Bridge -----------------------------------------------------------
+    def to_js_dict(self) -> Dict[str, Any]:
+        """JS-Bridge-Darstellung (LWC v5): shape-Werte LWC-kompatibel."""
+        return {
+            "show": bool(self.show),
+            "color": str(self.color),
+            "shape": str(self.shape) if str(self.shape) in MARKER_SHAPES else "circle",
+            "size": int(self.size),
+        }
+
+    # -- JSON-Persistenz -----------------------------------------------------
+    def to_dict(self) -> Dict[str, Any]:
+        """JSON-kompatibles Dict (Presets im StateManager)."""
+        return self.to_js_dict()
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> "MarkerStyle":
+        """Erzeugt eine MarkerStyle aus einem (JSON-)Dict – tolerant: fehlende
+        Felder erhalten ihre Defaults, ungueltige shape-Werte fallen auf
+        'circle' zurueck. None -> Default-Instanz.
+        """
+        if not isinstance(data, dict):
+            return cls()
+        shape = _as_str(data.get("shape"), "circle")
+        if shape not in MARKER_SHAPES:
+            shape = "circle"
+        return cls(
+            show=_as_bool(data.get("show"), True),
+            color=_as_str(data.get("color"), "#FFEB3B"),
+            shape=shape,
+            size=_as_int(data.get("size"), 6),
+        )
 
 ```
 
@@ -17262,10 +18323,16 @@ var Measurement = (function() {
 #
 # Phase 16 (06.08.2026): ColorButton wurde durch das generische
 # StylePickerWidget ersetzt (Farbe + Stärke + Stil + Sichtbarkeit).
-from .style_picker_widget import LineStyle, StylePickerWidget
+#
+# Phase 16 P16.03 (06.08.2026): Die Style-Vertraege LineStyle/MarkerStyle
+# leben seitdem zentral in `chart/overlays/style_models.py` und werden hier
+# re-exportiert (rueckwaertskompatibler Importweg). StylePickerWidget selbst
+# importiert sie bereits direkt aus den overlays.
+from chart.overlays.style_models import LineStyle, MarkerStyle
+from .style_picker_widget import StylePickerWidget
 from .named_item_actions import NamedItemActionsMixin, NamedItemAdapter
 
-__all__ = ["LineStyle", "StylePickerWidget", "NamedItemActionsMixin", "NamedItemAdapter"]
+__all__ = ["LineStyle", "MarkerStyle", "StylePickerWidget", "NamedItemActionsMixin", "NamedItemAdapter"]
 
 ```
 
@@ -17485,15 +18552,23 @@ class NamedItemActionsMixin:
 # (chart/widgets/color_button.py).
 #
 # Der bisherige ColorButton war ein reiner Farbwaehler (Phase 13 Kapitel 5.5).
-# Das neue StylePickerWidget buendelt zentral:
+# Das StylePickerWidget buendelt zentral:
 #   1. QCheckBox      -> Sichtbarkeit (show)
 #   2. Farb-Button    -> Farbe (color) via QColorDialog (optional mit Alpha)
-#   3. QSpinBox       -> Linienstaerke (width, 1-10)
+#   3. QSpinBox       -> Linienstaerke (width, 1-10) bzw. Markergroesse (size)
 #   4. QComboBox      -> Linienart (style: solid/dashed/dotted/dashdotted)
+#                        bzw. Marker-Form (shape: circle/square/arrowUp/arrowDown)
 #
-# API: get_style() -> LineStyle, set_style(style: LineStyle),
+# Phase 16 P16.03 (06.08.2026): Die Style-Vertraege LineStyle/MarkerStyle
+# leben jetzt zentral in `chart/overlays/style_models.py` (to_js_dict /
+# to_dict / from_dict). Das Widget unterstuetzt beide Typen ueber den
+# Konstruktor-Parameter `style_type`:
+#   * style_type="line"   -> get_style()/set_style() arbeiten mit LineStyle
+#   * style_type="marker" -> get_style()/set_style() arbeiten mit MarkerStyle
+#
+# API: get_style() -> LineStyle|MarkerStyle, set_style(...),
 #      set_color(str) fuer reine Farb-Updates (Dialog-Restore-Pfad).
-# Signal: style_changed = Signal(object) - emittiert das aktuelle LineStyle.
+# Signal: style_changed = Signal(object) - emittiert das aktuelle Style-Objekt.
 #
 # Farb-Logik (Paritaet zum Alt-ColorButton):
 #   - Alpha == 255 -> '#RRGGBB' (Hex, Grossbuchstaben, volle Deckkraft).
@@ -17503,13 +18578,11 @@ class NamedItemActionsMixin:
 #   - QColorDialog.ShowAlphaChannel schaltet den Deckkraft-Slider frei.
 #
 # HINWEIS (06.08.2026): Der Indikator-Pfad (fixed_grid_proximity.py) liefert
-# style-Werte in Schreibweise "Solid" (capitalized). Das StylePickerWidget
-# verwendet gemaeSS Refactoring-Anweisung lowercase-Werte
-# (solid/dashed/dotted/dashdotted). Eine Vereinheitlichung erfolgt bei der
-# Indikator-Anbindung (separates Kapitel).
+# style-Werte in Schreibweise "Solid" (capitalized). Die Style-Vertraege
+# verwenden gemaeSS P16.03 lowercase-Werte (solid/dashed/dotted/dashdotted).
+# Eine Vereinheitlichung erfolgt bei der Indikator-Anbindung (Schritt 3).
 
-from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
@@ -17524,36 +18597,26 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-
-@dataclass
-class LineStyle:
-    """Stil-Definition fuer Linien: Sichtbarkeit, Farbe, Staerke, Linienart.
-
-    Attributes:
-        show:  bool  – Linie sichtbar (QCheckBox).
-        color: str   – '#RRGGBB' (Alpha=255) oder 'rgba(r,g,b,a)' (Teil-Transparenz).
-        width: int   – Linienstaerke in px (1–10, QSpinBox).
-        style: str   – 'solid' | 'dashed' | 'dotted' | 'dashdotted' (QComboBox).
-    """
-
-    show: bool = True
-    color: str = "#2196F3"
-    width: int = 1
-    style: str = "solid"
+from chart.overlays.style_models import (
+    LINE_STYLES,
+    MARKER_SHAPES,
+    LineStyle,
+    MarkerStyle,
+)
 
 
 class StylePickerWidget(QWidget):
-    """Kombinierter Stil-Waehler: Sichtbarkeit + Farbe + Staerke + Linienart.
+    """Kombinierter Stil-Waehler: Sichtbarkeit + Farbe + Staerke/Groesse + Art.
 
     Kapselt intern:
       1. QCheckBox  (Sichtbarkeit `show`)
       2. kleiner Farb-Button (Farbe `color` via QColorDialog, optional Alpha)
-      3. QSpinBox   (Linienstaerke `width`, 1–10)
-      4. QComboBox  (Linienart `style`: solid/dashed/dotted/dashdotted)
+      3. QSpinBox   (Linienstaerke `width` bzw. Markergroesse `size`)
+      4. QComboBox  (Linienart `style` bzw. Marker-Form `shape`)
 
     Signal:
         style_changed = Signal(object) – emittiert das aktualisierte
-        `LineStyle`-Objekt bei jeder Aenderung eines Teil-Widgets.
+        `LineStyle`- bzw. `MarkerStyle`-Objekt bei jeder Aenderung.
     """
 
     style_changed = Signal(object)
@@ -17564,11 +18627,25 @@ class StylePickerWidget(QWidget):
     _SWATCH_W = 40
     _SWATCH_H = 24
 
-    def __init__(self, style: Optional[LineStyle] = None,
-                 enable_alpha: bool = True, parent=None) -> None:
+    def __init__(
+        self,
+        style: Optional[Union[LineStyle, MarkerStyle]] = None,
+        enable_alpha: bool = True,
+        parent=None,
+        style_type: str = "line",
+    ) -> None:
         super().__init__(parent)
         self._enable_alpha: bool = bool(enable_alpha)
-        self._style: LineStyle = style if style is not None else LineStyle()
+        # style_type: "line" (LineStyle) | "marker" (MarkerStyle)
+        self._style_type: str = "marker" if style_type == "marker" else "line"
+        if self._style_type == "marker":
+            self._style: MarkerStyle = (
+                style if isinstance(style, MarkerStyle) else MarkerStyle()
+            )
+        else:
+            self._style: LineStyle = (
+                style if isinstance(style, LineStyle) else LineStyle()
+            )
         self._color: QColor = QColor()
 
         # --- Farb-Button ----------------------------------------------------
@@ -17586,30 +18663,35 @@ class StylePickerWidget(QWidget):
 
         # --- Sichtbarkeit ---------------------------------------------------
         self._show_check = QCheckBox("sichtbar")
-        self._show_check.setToolTip("Linie anzeigen")
+        self._show_check.setToolTip("Linie anzeigen" if self._style_type == "line"
+                                    else "Marker anzeigen")
 
-        # --- Staerke --------------------------------------------------------
+        # --- Staerke / Groesse ---------------------------------------------
         self._width_spin = QSpinBox()
-        self._width_spin.setRange(1, 10)
-        self._width_spin.setToolTip("Linienstärke (px)")
-        self._width_spin.setSuffix(" px")
+        if self._style_type == "marker":
+            self._width_spin.setRange(1, 20)
+            self._width_spin.setToolTip("Markergröße (px)")
+            self._width_spin.setSuffix(" px")
+        else:
+            self._width_spin.setRange(1, 10)
+            self._width_spin.setToolTip("Linienstärke (px)")
+            self._width_spin.setSuffix(" px")
 
-        # --- Linienart ------------------------------------------------------
+        # --- Linienart / Marker-Form ---------------------------------------
         self._style_combo = QComboBox()
-        self._style_combo.addItems(["solid", "dashed", "dotted", "dashdotted"])
-        self._style_combo.setToolTip("Linienart")
+        if self._style_type == "marker":
+            self._style_combo.addItems(list(MARKER_SHAPES))
+            self._style_combo.setToolTip("Marker-Form")
+        else:
+            self._style_combo.addItems(list(LINE_STYLES))
+            self._style_combo.setToolTip("Linienart")
 
         # --- Initialwerte (Signale blockiert, damit keine fruehen Emissionen
         #     waehrend der Konstruktion ausgeloest werden) --------------------
         for w in (self._show_check, self._width_spin, self._style_combo):
             w.blockSignals(True)
         try:
-            self._show_check.setChecked(self._style.show)
-            self._width_spin.setValue(self._style.width)
-            if self._style.style in ("solid", "dashed", "dotted", "dashdotted"):
-                self._style_combo.setCurrentText(self._style.style)
-            else:
-                self._style_combo.setCurrentText("solid")
+            self._apply_style_to_ui(self._style)
             self._set_color_internal(self._style.color)
         finally:
             for w in (self._show_check, self._width_spin, self._style_combo):
@@ -17637,12 +18719,25 @@ class StylePickerWidget(QWidget):
     # Oeffentliche API
     # ------------------------------------------------------------------
 
-    def get_style(self) -> LineStyle:
-        """Liefert den aktuellen Stil als neues LineStyle-Objekt.
+    @property
+    def style_type(self) -> str:
+        """Aktueller Widget-Modus: 'line' (LineStyle) oder 'marker' (MarkerStyle)."""
+        return self._style_type
+
+    def get_style(self) -> Union[LineStyle, MarkerStyle]:
+        """Liefert den aktuellen Stil als NEUES Style-Objekt (LineStyle bei
+        style_type='line', MarkerStyle bei style_type='marker').
 
         Es wird eine frische Instanz zurueckgegeben, damit externe Aenderungen
         den internen Zustand nicht unbeabsichtigt mutieren.
         """
+        if self._style_type == "marker":
+            return MarkerStyle(
+                show=self._show_check.isChecked(),
+                color=self._color_button_value(),
+                shape=str(self._style_combo.currentText()),
+                size=int(self._width_spin.value()),
+            )
         return LineStyle(
             show=self._show_check.isChecked(),
             color=self._color_button_value(),
@@ -17650,12 +18745,14 @@ class StylePickerWidget(QWidget):
             style=str(self._style_combo.currentText()),
         )
 
-    def set_style(self, style: LineStyle) -> None:
-        """Setzt den Stil aus einem LineStyle-Objekt und aktualisiert die UI.
+    def set_style(self, style: Union[LineStyle, MarkerStyle]) -> None:
+        """Setzt den Stil aus einem Style-Objekt und aktualisiert die UI.
 
-        Emittiert bewusst KEIN style_changed (programmatisches Setzen) –
-        Aufrufer, die eine Signal-Reaktion wuenschen, koennen style_changed
-        selbst emittieren bzw. setzen die Teil-Widgets ueber die UI.
+        Akzeptiert LineStyle und MarkerStyle. Passt der Typ nicht zum Modus,
+        werden show/color uebernommen und die restlichen Felder auf den
+        Modus-Default zurueckgesetzt (defensive Toleranz).
+
+        Emittiert bewusst KEIN style_changed (programmatisches Setzen).
         """
         if style is None:
             return
@@ -17664,10 +18761,7 @@ class StylePickerWidget(QWidget):
         self._width_spin.blockSignals(True)
         self._style_combo.blockSignals(True)
         try:
-            self._show_check.setChecked(bool(style.show))
-            self._width_spin.setValue(int(style.width))
-            if style.style in ("solid", "dashed", "dotted", "dashdotted"):
-                self._style_combo.setCurrentText(style.style)
+            self._apply_style_to_ui(style)
             self._set_color_internal(style.color)
         finally:
             self._show_check.blockSignals(False)
@@ -17675,7 +18769,7 @@ class StylePickerWidget(QWidget):
             self._style_combo.blockSignals(False)
 
     def set_color(self, color_str: str) -> None:
-        """Setzt ausschliesslich die Farbe (behaelt show/width/style).
+        """Setzt ausschliesslich die Farbe (behaelt show/width|size/style|shape).
 
         Wird vom indicator_dialog-Restore-Pfad genutzt, der aus einem
         Farb-Parameter ('type: color') nur den Farbanteil zurueckliest und
@@ -17690,6 +18784,39 @@ class StylePickerWidget(QWidget):
     # ------------------------------------------------------------------
     # Intern
     # ------------------------------------------------------------------
+
+    def _apply_style_to_ui(
+        self, style: Union[LineStyle, MarkerStyle]
+    ) -> None:
+        """Uebernimmt ein Style-Objekt in die Teil-Widgets (Signale blockiert).
+
+        Bei Typ-Mismatch zum Modus werden show/color uebernommen, die
+        modusspezifischen Felder (width|size, style|shape) auf Defaults
+        gesetzt (defensive Toleranz).
+        """
+        if self._style_type == "marker" and isinstance(style, MarkerStyle):
+            self._show_check.setChecked(bool(style.show))
+            self._width_spin.setValue(int(style.size))
+            if style.shape in MARKER_SHAPES:
+                self._style_combo.setCurrentText(style.shape)
+            else:
+                self._style_combo.setCurrentText("circle")
+        elif self._style_type == "line" and isinstance(style, LineStyle):
+            self._show_check.setChecked(bool(style.show))
+            self._width_spin.setValue(int(style.width))
+            if style.style in LINE_STYLES:
+                self._style_combo.setCurrentText(style.style)
+            else:
+                self._style_combo.setCurrentText("solid")
+        else:
+            # Typ-Mismatch: show uebernehmen, modusspezifische Felder = Defaults
+            self._show_check.setChecked(bool(style.show))
+            if self._style_type == "marker":
+                self._width_spin.setValue(6)
+                self._style_combo.setCurrentText("circle")
+            else:
+                self._width_spin.setValue(1)
+                self._style_combo.setCurrentText("solid")
 
     def _color_button_value(self) -> str:
         """Farb-String aus dem internen QColor (Paritaet zum Alt-ColorButton)."""
@@ -17727,7 +18854,7 @@ class StylePickerWidget(QWidget):
         """Oeffnet QColorDialog.getColor() (mit Alpha-Slider, wenn aktiviert).
 
         Bei gueltiger Auswahl werden Swatch + interner Zustand aktualisiert
-        und style_changed mit dem neuen LineStyle emittiert.
+        und style_changed mit dem neuen Style-Objekt emittiert.
         """
         options = QColorDialog.ColorDialogOption(0)
         if self._enable_alpha:
@@ -17742,7 +18869,7 @@ class StylePickerWidget(QWidget):
         """Zentraler Handler aller Teil-Widget-Aenderungen.
 
         Aktualisiert den internen Zustand und emittiert style_changed mit dem
-        aktuellen LineStyle-Objekt.
+        aktuellen Style-Objekt.
         """
         self._style = self.get_style()
         self.style_changed.emit(self._style)
