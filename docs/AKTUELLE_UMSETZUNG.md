@@ -230,4 +230,65 @@ Bitte ersetze die alten Analytics-Dropdowns durch die Wiederverwendung des beste
    `check_p15_s2_service_tree.py`, `check_p15_s4_infra.py`,
    `check_service_run_fixes.py` OK. `py_compile` auf allen geänderten
    Dateien. Keine UI-/Regressionstests (harte Regel).
+ - **Git:** Commit `2579410` (mit der 15.03-E-NACHZUG-Umsetzung, 11 Dateien).
+
+ ### 06.08.2026 – Bugfix-Runde 2 Datenquellen-Dialog (Punkte 1–6)
+
+ **User-Anweisung (6 Punkte):**
+ 1. Parameter-Box zeigt nur die Parameter **eines einzigen Sets/Services**
+    (abhängig vom letzten Mausklick) – soll ALLE angehakten Services zeigen.
+ 2. Box zeigt nie alle geklickten Service-Parameter – es zählt der
+    **Zeilen-Klick**, nicht die **Checkbox**.
+ 3. Beim manuellen Vergrößern behält der Tree seine **feste Default-Breite**;
+    nur die Parameter-Box wächst mit (bzw. schrumpft bis Minimum =
+    2 Service-Parameter nebeneinander).
+ 4. Breite des Trees ist **fix**.
+ 5. Limit-Feld ist **reine Texteingabe** (keine Up/Down-Pfeile); Default =
+    Statistik-Signale aus den App-Optionen.
+ 6. Bei Set-Auswahl: Parameter der enthaltenen Services **nebeneinander**,
+    wie im `service_win`.
+
+ **Ursache Punkte 1/2/6 (gefunden & behoben):**
+ - `serviceui/master_tree.py` `_on_item_changed` verarbeitete **jedes**
+   `itemChanged`-Signal – auch das vom Zeilen-Klick (Auf-/Zuklappen via
+   `_refresh_expand_label`) ausgelöste Text-Refresh – und entfernte dabei
+   fälschlich die Haken (bzw. ließ nur den zuletzt geklickten Eintrag stehen).
+ - **Fix:** `_on_item_changed` verarbeitet nur **echte Checkbox-Wechsel**:
+   Vergleich `state == expected` aus `_checked_items` (Service-/Plugin-Zeile)
+   bzw. neuer `_derive_set_state()` (Set-Zeile). Der Zeilen-Klick ändert die
+   Haken nicht mehr; das Panel zeigt alle angehakten Set-Services
+   nebeneinander (service_win-Muster, Punkt 6).
+
+ **Umsetzung (06.08.2026, ausgeführt):**
+ - `serviceui/master_tree.py` (Punkte 1/2/6):
+   * `_on_item_changed` nur noch bei Checkbox-Zustandswechsel
+     (`_derive_set_state()` für Set-Knoten, erwarteter Zustand aus
+     `_checked_items` für Blätter); `_refresh_expand_label`-bedingte
+     Text-Refreshes werden ignoriert.
+   * `_apply_set_state` behält die Tri-State-Logik (alle/nur Teil-Services).
+ - `serviceui/service_selector_dialog.py` (Punkte 3/4):
+   * `TREE_DEFAULT_WIDTH = 300`; `self.selector.setFixedWidth(TREE_DEFAULT_WIDTH)`
+     + `body.addWidget(self.selector, 0)` → Tree bleibt exakt fix, der
+     5-Anteil des Body-Stretch wächst allein der Parameter-Box zu.
+   * `_apply_panel_size`: `setFixedWidth` → `setMinimumWidth` (Panel wächst
+     mit dem Fenster, schrumpft aber nie unter 2-Spalten-Minimum);
+     `_panel_fixed_width` → `_panel_min_width`; `_fit_dialog_width` und
+     Geometrie-Restore darauf abgestimmt.
+ - `analytics/ui/analytics_win.py` (Punkt 5):
+   * `QSpinBox` → `QLineEdit` (`edit_limit`) – keine Up/Down-Pfeile mehr.
+   * Default im `__init__` aus `state_manager.get_app_settings()`
+     (`statistics_signal_limit`, 10.000) → `_default_limit`;
+     `_wire_controls` setzt `self._vm.set_limit(self._default_limit)`.
+   * Neuer Slot `_on_limit_text_changed` (int-Parsing, leere/ungültige
+     Eingabe → kein Update); `edit_limit.textChanged` verdrahtet.
+   * `_on_active_profile_changed` synchronisiert `edit_limit` aus `vm.params`
+     beim Profilwechsel; `QSpinBox`-Import entfernt.
+ - **Verifikation:** `test/check_p15_s3_analytics.py` erweitert um C1–C8
+   (Zeilen-Klick entfernt keine Haken; Panel zeigt alle Set-Services; Tree
+   fix; Vergrößern → Panel wächst; Verkleinern → 2-Spalten-Minimum; QLineEdit
+   ohne Pfeile; Default 10.000; Texteingabe → ViewModel) → **60/60 PASS**.
+   B6/B7 angepasst (`resize(1400, 444)` – Größe wird auf Tree+Minimum geklemmt).
+   Regression `check_p15_s2_service_tree.py`, `check_p15_s4_infra.py`,
+   `check_service_run_fixes.py` OK. `py_compile` auf allen geänderten
+   Dateien. Keine UI-/Regressionstests (harte Regel).
  - **Git:** Commit folgt (siehe unten).

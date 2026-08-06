@@ -74,6 +74,11 @@ DIALOG_GEOMETRY_KEY = "service_selector"
 PANEL_BUFFER = 24
 #: Body-Spacing (body.setSpacing(8) unten) – fuer die Breiten-Rechnung (Punkt 3).
 BODY_SPACING = 8
+#: 06.08.2026 (Punkte 3+4): FESTE Default-Breite des MasterTree (links).
+#: Beim manuellen Vergroessern des Fensters behaelt der Tree diese Breite;
+#: nur die Parameter-Box waechst mit (bzw. schrumpft bis zu ihrer
+#: Minimum-Breite = Platz fuer zwei Service-Spalten nebeneinander).
+TREE_DEFAULT_WIDTH = 300
 
 
 class _DialogParamHost(ServiceParamColumnsMixin):
@@ -126,7 +131,9 @@ class ServiceSelectorDialog(QDialog):
         # Der Parent (AnalyticsWindow) ist ein PersistentWindow mit
         # `state_manager`-Property; ohne Parent bleiben Save/Restore no-ops.
         self._state_manager = getattr(parent, "state_manager", None)
-        self._panel_fixed_width: int = 0
+        # 06.08.2026 (Punkte 3+4): Minimum-Breite der Parameter-Box
+        # (Default: Platz fuer 2 Service-Spalten nebeneinander).
+        self._panel_min_width: int = 0
 
         self.setWindowTitle("Datenquellen auswählen")
         self.resize(980, 600)
@@ -144,7 +151,11 @@ class ServiceSelectorDialog(QDialog):
             model=self.model,
             parent=self,
         )
-        body.addWidget(self.selector, 3)
+        # Punkt 4: Die BREITE DES TREES IST FIX (TREE_DEFAULT_WIDTH) – beim
+        # manuellen Vergroessern des Fensters bleibt der Tree stehen und nur
+        # die Parameter-Box waechst mit (Punkt 3).
+        self.selector.setFixedWidth(TREE_DEFAULT_WIDTH)
+        body.addWidget(self.selector, 0)
 
         panel = QWidget(self)
         panel_layout = QVBoxLayout(panel)
@@ -297,12 +308,15 @@ class ServiceSelectorDialog(QDialog):
         self._apply_panel_size(len(entries))
 
     def _apply_panel_size(self, col_count: int) -> None:
-        """Punkt 2: Setzt die Panel-Breite (Default: ZWEI Spalten).
+        """Punkt 2+3: Panel-MINIMUM-Breite (Default: ZWEI Spalten).
 
-        Bei 1 Spalte wird die Box auf die Spaltenbreite geschrumpft; ab 2
+        Bei 1 Spalte wird das Minimum auf die Spaltenbreite gesetzt; ab 2
         Spalten gilt der Default (Platz fuer 2 nebeneinander). Mehr Spalten
-        erzeugen eine horizontale Scrollbar (QScrollArea, AsNeeded) – die
-        Panel-Breite bleibt auf dem 2-Spalten-Default.
+        erzeugen eine horizontale Scrollbar (QScrollArea, AsNeeded). Die Box
+        ist seit 06.08.2026 NICHT mehr fix: Der Benutzer kann das Fenster
+        verzoegern/vergroessern – der Tree behaelt seine feste Breite
+        (Punkt 4), die Parameter-Box waechst mit bzw. schrumpft bis zu
+        diesem Minimum (Punkt 3).
         """
         widths = []
         for i in range(self.param_box_layout.count()):
@@ -320,12 +334,12 @@ class ServiceSelectorDialog(QDialog):
         else:
             panel_w = widths[0] + PANEL_BUFFER
         panel_w = max(panel_w, 280)
-        self._panel_fixed_width = panel_w
-        # Die feste Breite gehoert auf das PANEL-WIDGET (Direkt-Kind im Body-
-        # Layout): `param_scroll` allein wuerde sonst vom 2/5-Stretch des
-        # Body-Layouts abgeschnitten (Overflow nach rechts).
-        self.param_panel.setFixedWidth(panel_w)
-        self.param_scroll.setFixedWidth(panel_w)
+        self._panel_min_width = panel_w
+        # Minimum auf dem PANEL-WIDGET (Direkt-Kind im Body-Layout) UND der
+        # ScrollArea: das Panel kann beim Fenster-Vergroessern mitwachsen,
+        # aber nicht unter die 2-Spalten-Default-Groesse schrumpfen.
+        self.param_panel.setMinimumWidth(panel_w)
+        self.param_scroll.setMinimumWidth(panel_w)
         # Container-Minimum: volle Breite aller Spalten -> horizontale
         # Scrollbar, sobald der Inhalt breiter als das Panel ist (Punkt 2).
         total_w = sum(widths) + self.param_box_layout.spacing() * max(
@@ -338,9 +352,10 @@ class ServiceSelectorDialog(QDialog):
         """Punkt 3: Fensterbreite == rechte Kante der Parameter-Box.
 
         Misst die tatsaechliche rechte Kante des Panel-Widgets (Direkt-Kind
-        des Dialogs, feste Breite) und zieht das Fenster nach, falls die
-        Kante ueber die Dialogkante hinauslaeuft (Selector-Minimum erzwungen
-        -> Overflow). Eine bewusst groessere Breite (gespeicherte Geometrie,
+        des Dialogs, Minimum-Breite) und zieht das Fenster nach, falls die
+        Kante ueber die Dialogkante hinauslaeuft. Beim Oeffnen gilt:
+        Breite = Margins + fester Tree + Spacing + Panel-Minimum (2 Spalten).
+        Eine vom Benutzer bewusst groessere Breite (gespeicherte Geometrie,
         Punkt 4) bleibt erhalten. Nach dem Anzeigen wird der Fit ueber
         `showEvent` + QTimer erneut angestossen (stabile Layout-Geometrie).
         """

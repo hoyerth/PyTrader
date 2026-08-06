@@ -40,7 +40,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QSpinBox,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -162,6 +161,15 @@ class AnalyticsWindow(PersistentWindow):
         )
         self._symbol_repo: SymbolRepository = get_symbol_repository()
         self._profile_combo_syncing: bool = False
+        # 06.08.2026 (Punkt 5): Default-Limit = 'Statistik-Signale' aus den
+        # App-Optionen (AppSettings.statistics_signal_limit). Das Limit-Feld
+        # ist seitdem ein reines Textfeld (keine Up/Down-Pfeile).
+        try:
+            _app_settings = self.state_manager.get_app_settings()
+            self._default_limit: int = int(
+                getattr(_app_settings, "statistics_signal_limit", 10_000))
+        except Exception:
+            self._default_limit = 10_000
 
         # 15.03-E: Datenquellen-Dialog (ServiceSelectorDialog, Multi-Select)
         # ersetzt das fruehere Service-Filter-Popover. Das
@@ -255,10 +263,16 @@ class AnalyticsWindow(PersistentWindow):
         self.btn_data_sources.setToolTip(
             "Datenquellen wählen – öffnet den Multi-Select-Dialog "
             "(Sets/Services/Plugins).")
-        self.spin_limit = QSpinBox()
-        self.spin_limit.setRange(1, self._vm.max_lookback_limit)
-        self.spin_limit.setValue(int(self._vm.params.get("limit") or 5000))
-        self.spin_limit.setSuffix(" Bars")
+        # 06.08.2026 (Punkt 5): Limit als reines TEXTFELD (keine Up/Down-
+        # Pfeile). Default = 'Statistik-Signale' aus den App-Optionen
+        # (statistics_signal_limit, siehe __init__).
+        self.edit_limit = QLineEdit()
+        self.edit_limit.setText(str(self._default_limit))
+        self.edit_limit.setPlaceholderText("Signale")
+        self.edit_limit.setMaximumWidth(120)
+        self.edit_limit.setToolTip(
+            "Maximale Signale für die Detail-Tabelle – Default aus den "
+            "App-Optionen ('Statistik-Signale'). Nur Zahleneingabe.")
 
         filt.addWidget(QLabel("Symbol:"))
         filt.addWidget(self.combo_symbol)
@@ -268,7 +282,7 @@ class AnalyticsWindow(PersistentWindow):
         filt.addWidget(QLabel("Datenquellen:"))
         filt.addWidget(self.btn_data_sources)
         filt.addWidget(QLabel("Limit:"))
-        filt.addWidget(self.spin_limit)
+        filt.addWidget(self.edit_limit)
         filt.addStretch(1)
         root.addLayout(filt)
 
@@ -392,7 +406,11 @@ class AnalyticsWindow(PersistentWindow):
         # 15.03-E: Datenquellen-Dialog (Multi-Select, ersetzt Popover)
         self.btn_data_sources.clicked.connect(self._open_service_dialog)
         event_bus.profile_changed.connect(self._sync_service_filter_button)
-        self.spin_limit.valueChanged.connect(self._vm.set_limit)
+        # 06.08.2026 (Punkt 5): Limit-Textfeld -> ViewModel. Der Default
+        # (App-Optionen 'Statistik-Signale') wird beim Start gesetzt, damit
+        # Feld und VM-Parameter konsistent sind.
+        self.edit_limit.textChanged.connect(self._on_limit_text_changed)
+        self._vm.set_limit(self._default_limit)
         self.btn_symbol_fav.clicked.connect(self.open_symbols_window)
         self.btn_profile_new.clicked.connect(self._on_profile_new)
         self.btn_profile_save.clicked.connect(self._on_profile_save)
@@ -402,6 +420,23 @@ class AnalyticsWindow(PersistentWindow):
         event_bus.favorites_changed.connect(self._refresh_symbol_combo)
         self._refresh_symbol_combo()
         self._refresh_timeframe_combo()
+
+    @Slot(str)
+    def _on_limit_text_changed(self, text: str) -> None:
+        """Uebernimmt die Limit-Texteingabe (Punkt 5, reines Textfeld).
+
+        Nur ganzzahlige Werte werden an das ViewModel gereicht (das clamt
+        auf 1..MAX_LOOKBACK_LIMIT); leere oder ungueltige Eingaben lassen den
+        letzten gueltigen Wert unveraendert.
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        try:
+            val = int(text)
+        except ValueError:
+            return
+        self._vm.set_limit(val)
 
     def _refresh_timeframe_combo(self, symbol: Optional[str] = None) -> None:
         """Graut Timeframes ohne Feature-Store-Daten aus (nicht auswaehlbar).
@@ -583,6 +618,11 @@ class AnalyticsWindow(PersistentWindow):
         # (resolve_display_names) und der Button-Text synchronisiert.
         self._active_display_names = []
         self._sync_service_filter_button()
+        # 06.08.2026 (Punkt 5): Limit-Feld mit dem (ggf. aus dem Profil
+        # geladenen) VM-Wert synchronisieren.
+        if hasattr(self, "edit_limit"):
+            self.edit_limit.setText(
+                str(int(self._vm.params.get("limit") or self._default_limit)))
 
     @Slot(bool)
     def _on_dirty_changed(self, dirty: bool) -> None:

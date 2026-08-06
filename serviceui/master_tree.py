@@ -598,6 +598,14 @@ class MasterTree(QTreeWidget):
         schlank. Set-Knoten propagieren ihren Zustand auf alle Service-
         Kinder; der Tri-State der Sets wird IMMER aus den Kindern abgeleitet
         (Qt bietet in QTreeWidget keine automatische Synchronisation).
+
+        Bugfix 06.08.2026 (Punkte 1/2/6): `itemChanged` feuert auch bei
+        TEXT-Aenderungen – z. B. `_refresh_expand_label` nach einem
+        Zeilen-Klick auf einen Set-Knoten (Auf-/Zuklappen). Solche spurious
+        Events duerfen die Haken NICHT veraendern: Es wird nur verarbeitet,
+        wenn sich der CheckState tatsaechlich vom erwarteten Zustand
+        unterscheidet (erwartet = aus `_checked_items` bzw. den Service-
+        Kindern des Sets abgeleitet).
         """
         if column != 0 or not self._checkable or self._updating_checks:
             return
@@ -613,6 +621,11 @@ class MasterTree(QTreeWidget):
                 key = (TYPE_SERVICE,
                        str(item.data(0, ROLE_SET_ID) or ""),
                        str(item.data(0, ROLE_INSTANCE_ID) or ""))
+                # Kein echter Checkbox-Wechsel (z. B. Text-Refresh)? -> return.
+                expected = (Qt.Checked if key in self._checked_items
+                            else Qt.Unchecked)
+                if state == expected:
+                    return
                 if state == Qt.Checked:
                     self._checked_items.add(key)
                 else:
@@ -623,12 +636,19 @@ class MasterTree(QTreeWidget):
             elif node_type == TYPE_PLUGIN:
                 key = (TYPE_PLUGIN, "",
                        str(item.data(0, ROLE_PLUGIN_ID) or ""))
+                expected = (Qt.Checked if key in self._checked_items
+                            else Qt.Unchecked)
+                if state == expected:
+                    return
                 if state == Qt.Checked:
                     self._checked_items.add(key)
                 else:
                     self._checked_items.discard(key)
             elif node_type == TYPE_SET:
                 set_id = str(item.data(0, ROLE_SET_ID) or "")
+                # Nur bei ECHTEM Wechsel verarbeiten (Tri-State-Ableitung).
+                if state == self._derive_set_state(item):
+                    return
                 for i in range(item.childCount()):
                     child = item.child(i)
                     if child is None or not isValid(child):
@@ -647,6 +667,31 @@ class MasterTree(QTreeWidget):
             self.checked_changed.emit()
         finally:
             self._updating_checks = False
+
+    def _derive_set_state(self, set_item) -> int:
+        """Erwarteter Tri-State eines Set-Knotens aus seinen Service-Kindern.
+
+        Checked = alle Kinder gecheckt, PartiallyChecked = gemischt,
+        Unchecked = keines (Sets ohne Service-Kinder = Unchecked). Dient als
+        Vergleichswert in `_on_item_changed`, um spurious itemChanged-Events
+        (Text-/Tooltip-Refresh) von echten Checkbox-Klicks zu unterscheiden.
+        """
+        checked = 0
+        total = 0
+        for i in range(set_item.childCount()):
+            child = set_item.child(i)
+            if child is None or not isValid(child):
+                continue
+            if child.data(0, ROLE_NODE_TYPE) != TYPE_SERVICE:
+                continue
+            total += 1
+            if child.checkState(0) == Qt.Checked:
+                checked += 1
+        if total > 0 and checked == total:
+            return Qt.Checked
+        if checked > 0:
+            return Qt.PartiallyChecked
+        return Qt.Unchecked
 
     def _apply_set_state(self, set_item) -> None:
         """Setzt den Tri-State eines Set-Knotens aus seinen Service-Kindern.
