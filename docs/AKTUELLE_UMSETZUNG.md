@@ -64,7 +64,7 @@ Implementiere die Klasse `MATemplateEngine` mit folgenden Methoden:
 
 ## Konsistenz-Check, Entscheidungen & Ergänzungen (06.08.2026, Doku-Analyse)
 
-> **Status:** ✅ UMGESETZT & COMMITTET (06.08.2026 21:09). Spezifikation analysiert, Projekt-Ist-Stand verifiziert, Implementierung abgeschlossen (Invariante-1-Backup/Tag `phase16_step4` auf Commit `edc823d`, danach Umsetzungs-Commit). Verifikation headless über `test/test_ma_template.py` (61/61 Checks PASS, inkl. VWMA-DB-Test gegen echte `market_data.duckdb`).
+> **Status:** ✅ UMGESETZT, COMMITTET & CLEANED UP (06.08.2026). Spezifikation analysiert, Projekt-Ist-Stand verifiziert, Implementierung abgeschlossen (Invariante-1-Backup/Tag `phase16_step4` auf Commit `edc823d`, Umsetzungs-Commit `092cc57`). Verifikation headless über `test/test_ma_template.py` (61/61 Checks PASS, inkl. VWMA-DB-Test gegen echte `market_data.duckdb`). Test-Cleanup gemäß Invariante 10 ausgeführt – `test/` enthält wieder ausschließlich `test/test.py`.
 
 ### A. Konsistenz-Check (verifiziert am Ist-Stand des Projekts)
 
@@ -112,7 +112,7 @@ Implementiere die Klasse `MATemplateEngine` mit folgenden Methoden:
 * **61/61 Checks PASS** – Schema-Defaults & resolve_bull_color (S1–S12), Länge/Warmup aller 12 Typen (L1/L2, typspezifisch tolerant: EWM-Typen seeden ab Index 0), volle Parität aller 12 Typen gegen defensive Referenzimplementierung (P1, period=10), VWMA mit echten `tick_volume`-Daten aus `market_data.duckdb` (D1–D3, weicht vom SMA ab), VWMA-Fallback exakt SMA (E5), Null-Volumen-SMA-Fallback (E5b), Farbumschlag (C1–C3), Payload-Vertrag (Q1–Q5), crop/Edge-Cases (R1–R4).
 * Verifikation: `python -m py_compile` auf Modul + `utils/__init__.py` + Test → OK; Import-Smoke `chart.indicators.utils.ma_template` → OK.
 
-**Cleanup (Invariante 10):** `test/test_ma_template.py` wird erst nach bestätigter Freigabe des Kapitels entfernt (Verifikation erfolgte VOR der Bereinigung). Dauerhaft bleibt nur `test/test.py`.
+**Cleanup (Invariante 10) – AUSGEFÜHRT (06.08.2026):** `test/test_ma_template.py` wurde nach bestätigter Verifikation (61/61 PASS, VOR der Bereinigung) entfernt. `test/` enthält wieder ausschließlich `test/test.py` (dauerhafter Test-Harness). Das Kapitel Phase 16.04 ist damit vollständig abgeschlossen.
 
 ---
 
