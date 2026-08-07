@@ -5,7 +5,7 @@ Service-UI: 2-Spalten-MasterTree (Phase 15 15.02).
 Hierarchische Darstellung der Service-Landschaft:
 
   * Spalte 0: Knoten – 📁 Service-Sets (mit ihren Service-Instanzen),
-              ⚡ Standalone Services, 📦 Alle verfuegbaren Plugins.
+              📦 Alle verfuegbaren Services (kategorisierte Ordner).
               Die Spalte ist Stretch und fuellt die gesamte Breite bis zur
               Status-Spalte. Untereintraege sind per setIndentation()
               eingerueckt (Bugfix 04.08.2026); die Top-Level-Knoten starten
@@ -363,7 +363,9 @@ class MasterTree(QTreeWidget):
             return self._build_category_item(child, group)
         if group == self.model.GROUP_SETS:
             return self._build_set_item(child)
-        if group in (self.model.GROUP_STANDALONE, self.model.GROUP_PLUGINS):
+        # 17.01.01: GROUP_STANDALONE entfaellt ersatzlos – Plugin-Zeilen
+        # existieren nur noch in GROUP_PLUGINS (Kategorien-Ordner inklusive).
+        if group == self.model.GROUP_PLUGINS:
             return self._build_plugin_item(child, group)
         return None
 

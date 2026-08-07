@@ -497,3 +497,62 @@ python -m py_compile analytics/engine/service_selector_model.py serviceui/master
 
 3. **Keine GUI-Tests ausführen (Rule 4).**
 
+
+
+---
+
+# 8. Implementierungs-Log 17.01.01 (07.08.2026, ~19:40) - MasterTree Refactoring UMGESETZT
+
+**Ziel:** Die ehemalige Root-Gruppe `⚡ Standalone Services` (`GROUP_STANDALONE`)
+entfaellt ersatzlos; der MasterTree besitzt danach genau **2 Root-Gruppen**:
+`📁 Sets` und `📦 Services` (Root-Label-Rename von
+`📦 Alle verfuegbaren Plugins`). Alle Plugins werden ausschliesslich ueber
+`metadata["category"]` in Kategorie-Ordner einsortiert (K1/K2, 16.08).
+
+## 8.1 Aenderungen in `analytics/engine/service_selector_model.py`
+
+* **Konstante `GROUP_STANDALONE = "standalone"` entfernt** (ersatzlos; Kommentar
+  an der Gruppen-Konstanten-Stelle dokumentiert die Entscheidung).
+* **Hilfsmethode `get_standalone_plugin_ids()` entfernt** (keine Aufrufer mehr).
+* **`build_tree()`** liefert nur noch 2 Root-Dicts:
+  1. `{"group": GROUP_SETS, "label": "📁 Sets", "children": set_nodes}`
+  2. `{"group": GROUP_PLUGINS, "label": "📦 Services", "children": plugin_nodes}`
+  – `plugin_nodes` weiterhin via `_category_nodes(sorted(plugins.keys()))`
+  (Kategorie-Ordner + flache Blaetter, sortiert nach K8).
+* Docstring der Methode aktualisiert (2-Gruppen-Kontrakt).
+
+## 8.2 Aenderungen in `serviceui/master_tree.py`
+
+* **`_build_child_item()`:** Bedingung
+  `if group in (self.model.GROUP_STANDALONE, self.model.GROUP_PLUGINS):`
+  ersetzt durch `if group == self.model.GROUP_PLUGINS:` (die Standalone-Gruppe
+  existiert nicht mehr; Plugin-Zeilen kommen nur noch aus `GROUP_PLUGINS`).
+* **Header-Docstring (Spalte 0):** `⚡ Standalone Services` entfernt,
+  Plugin-Gruppe als `📦 Alle verfuegbaren Services (kategorisierte Ordner)`
+  beschrieben.
+* `_populate()` und Kontextmenue-Logik sind generisch ueber `build_tree()` –
+  keine weiteren Anpassungen noetig.
+
+## 8.3 Verifikation (headless, keine UI-Tests)
+
+* **Syntax:** `py_compile` auf beiden Dateien – PASS.
+* **`test/test.py` Teil 15 (NEU, 4 Checks):**
+  * T1) `GROUP_STANDALONE` existiert nicht mehr – PASS.
+  * T2) build_tree liefert genau 2 Root-Gruppen mit Labels
+    `📁 Sets` / `📦 Services` – PASS.
+  * T3) Keine Gruppe `"standalone"` in build_tree – PASS.
+  * T4) Swing-Services (Teil 14) in der Hauptgruppe: Kategorie-Ordner
+    `Swing Points/...` + flache Blaetter koexistieren, keine leeren Ordner – PASS.
+* **`test/test.py` Teil 13/14 angepasst:** `P16.08 T5` erwartete 4 Ordner-
+  Knoten (plugin_a mit Kategorie A/B in BEIDEN Gruppen). Da die Standalone-
+  Gruppe entfaellt, erscheint plugin_a nur noch einmal -> Erwartung auf
+  **2 Ordner-Knoten** korrigiert (Kommentar aktualisiert). Alle P16.08 T1..T5
+  und 17.01 T1..T4 weiterhin PASS.
+* **Verbleibende 6 Harness-FAILURES** (unbeteiligt, PersistentWindow-Position/
+  -Groesse, vor 17.01 bereits vorhanden): P2, P5, H3, H4, H5, H7.
+
+## 8.4 Offen
+
+* 7.5 Test-Cleanup (Invariante 10) weiterhin bis Kapitel-Abnahme offen;
+  temporaere Helfer in `test/` (`_insert_part15.py`, `_fix_part15_t5.py`,
+  `_inspect_tree_lines.py`, `_tree_lines_out.txt`) werden beim Cleanup entfernt.

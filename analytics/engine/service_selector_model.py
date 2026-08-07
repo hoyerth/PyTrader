@@ -94,8 +94,9 @@ class ServiceSelectorModel(QObject):
     data_changed = Signal()
 
     #: Gruppen-Kennungen der Hierarchie (build_tree)
+    # 17.01.01: GROUP_STANDALONE entfällt ersatzlos – alle Plugins werden über
+    # metadata["category"] in Ordner einsortiert (2 Root-Gruppen: sets, plugins).
     GROUP_SETS = "sets"
-    GROUP_STANDALONE = "standalone"
     GROUP_PLUGINS = "plugins"
     # 16.08 (K2): Kategorie-Ordner-Knoten (Dynamic Category Trees).
     # Ein Ordner-Dict besitzt das Format:
@@ -386,20 +387,6 @@ class ServiceSelectorModel(QObject):
                      else f"⚪ inaktiv in {name}")
         return " | ".join(parts)
 
-    def get_standalone_plugin_ids(self) -> List[str]:
-        """Plugin-IDs, die in KEINEM gespeicherten Service-Set vorkommen
-        (⚡ Standalone Services – frei verfuegbare Plugins)."""
-        used: Set[str] = set()
-        for s in self._sets:
-            services = s.get("services") or {}
-            for cfg in services.values():
-                if isinstance(cfg, dict) and cfg.get("plugin_id"):
-                    used.add(str(cfg["plugin_id"]).lower())
-        return sorted(
-            pid for pid in self.get_plugins().keys()
-            if pid.lower() not in used
-        )
-
     # ------------------------------------------------------------------
     # 16.08 (K1/K2/K8/K9): Kategorie-Ordner (Dynamic Category Trees)
     # ------------------------------------------------------------------
@@ -501,14 +488,17 @@ class ServiceSelectorModel(QObject):
     def build_tree(self) -> List[Dict[str, Any]]:
         """Baut die vollstaendige Hierarchie fuer das 2-Spalten-MasterTree.
 
+        17.01.01: NUR noch 2 Root-Gruppen – die ehemalige Gruppe
+        '⚡ Standalone Services' (GROUP_STANDALONE) entfaellt ersatzlos, da
+        alle Plugins ueber metadata['category'] in Ordner einsortiert werden.
+        Root-Label kompakt: '📁 Sets' und '📦 Services'.
+
         Rueckgabe (pro Gruppe ein Dict):
-            [{"group": "sets", "label": "📁 Service-Sets", "children": [
+            [{"group": "sets", "label": "📁 Sets", "children": [
                  {"set_id": ..., "display_name": ..., "definition": {...},
                   "services": [{"instance_id": ..., "plugin_id": ...,
                                 "badge": ...}, ...]}, ...]},
-             {"group": "standalone", "label": "⚡ Standalone Services",
-              "children": [Blatt- und/oder Ordner-Knoten ...]},
-             {"group": "plugins", "label": "📦 Alle verfügbaren Plugins",
+             {"group": "plugins", "label": "📦 Services",
               "children": [Blatt- und/oder Ordner-Knoten ...]}]
 
         Deterministisch sortiert (Sets nach display_name; Plugins/Ordner
@@ -517,7 +507,7 @@ class ServiceSelectorModel(QObject):
         ({plugin_id, badge, last_execution}) und verschachtelten
         Ordner-Dicts ({"group": GROUP_CATEGORY, "label": "📁 <Name>",
         "children": [...]} – rekursiv), gesteuert ueber das Metadaten-Feld
-        `category` der Plugins (K1). GROUP_SETS bleibt unveraendert.
+        `category` der Plugins (K1).
         """
         sets = sorted(self._sets,
                       key=lambda s: str(s.get("display_name") or s.get("set_id") or "").lower())
@@ -544,18 +534,16 @@ class ServiceSelectorModel(QObject):
                 "services": service_nodes,
             })
 
-        # 16.08 (K2/K8): Kinder der Plugin-Gruppen via _category_nodes –
+        # 16.08 (K2/K8) + 17.01.01: EINE kategorisierte Services-Gruppe –
         # Plugins mit `category`-Metadatum werden in 📁-Ordner verschachtelt
         # (K1), ohne Kategorie bleiben sie flache Blaetter auf oberster Ebene.
-        standalone_nodes = self._category_nodes(self.get_standalone_plugin_ids())
+        # Die fruehere Standalone-Gruppe (separate Knoten) ist entfallen.
         plugin_nodes = self._category_nodes(sorted(self.get_plugins().keys()))
 
         return [
-            {"group": self.GROUP_SETS, "label": "📁 Service-Sets",
+            {"group": self.GROUP_SETS, "label": "📁 Sets",
              "children": set_nodes},
-            {"group": self.GROUP_STANDALONE, "label": "⚡ Standalone Services",
-             "children": standalone_nodes},
-            {"group": self.GROUP_PLUGINS, "label": "📦 Alle verfügbaren Plugins",
+            {"group": self.GROUP_PLUGINS, "label": "📦 Services",
              "children": plugin_nodes},
         ]
 
