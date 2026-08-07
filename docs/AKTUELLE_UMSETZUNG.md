@@ -842,3 +842,178 @@ Services, die erstmals oder ueber einen Kategorie-Ordner ausgefuehrt wurden.
 * **Doku-Freigabe:** Dieser Eintrag wurde erst nach erfolgreichem manuellem
   Funktionstest des Anwenders erstellt (Regel C: Doku nach Freigabe).
 * Naechste Kapitel (Roadmap): 17.02 Trend Services.
+
+---
+
+# 11. Implementierungs-Log 17.01.04 (07.08.2026) - Dynamic Parameter Schema Exposure fuer die 3 Swing-Services UMGESETZT
+
+**Ziel:** Die Spalten-UI (`serviceui/param_columns.py` / `ServiceSelectorWidget`)
+liest Parameter-Definitionen ueber `plugin.full_parameter_schema()` bzw.
+`plugin.default_params`. Damit die Swing-Services ihr `parameter_schema`
+unabhaengig von der jeweiligen Definitions-Art (Property ODER Klassen-Attribut)
+zuverlaessig ueber die Basisklassen-Methoden bereitstellen, wurden die
+Schema-Exposure-Eigenschaften explizit in allen 3 Service-Klassen verankert.
+
+---
+
+## 11.1 Befund (Pruefung der Anweisung gegen den Ist-Code)
+
+* **Kein akuter UI-Bug:** Alle 3 Services (`srv_swing_structure.py`,
+  `srv_swing_momentum.py`, `srv_swing_volume_profile.py`) definieren
+  `parameter_schema` bereits als **Property** (flache Kopie der Modul-Konstante
+  `_SWING_*_SCHEMA`, M1-konform). `full_parameter_schema()` und
+  `default_params` funktionieren damit bereits ueber die Basisklasse
+  (`base_plugin.PluginFeature`) – der in der Aufgabe beschriebene Leer-Spalten-
+  Fall (parameter_schema als reines Klassen-Attribut ohne Basisklassen-Anbindung)
+  existiert im Ist-Stand nicht (verifiziert per Registry-Lauf).
+* **Praeventiver Fix:** Die expliziten Overrides machen den Vertrag
+  selbst-dokumentierend und robust gegen spaetere Refactorings (z. B.
+  Umstellung auf Klassen-Attribut-Schema wie in den §3-Snippets).
+* **Basisklassen-Vertrag bewahrt:** Die exakt vorgeschlagene Variante
+  `full_parameter_schema() -> self.parameter_schema` wuerde den Basis-Parameter
+  `lookback` aus dem vollstaendigen Schema verwerfen. `SchemaMigrator.
+  migrate_instance_config()` (`analytics/engine/schema_migrator.py`) verlaesst
+  sich jedoch auf `lookback` im Voll-Schema. Daher wird die **Basisklassen-
+  Semantik** beibehalten: `full_parameter_schema()` = `base_parameter_schema`
+  (lookback) + `parameter_schema` (Plugin). `default_params` liefert die
+  Plugin-Defaults (bewusst OHNE lookback, da lookback eine Instanz-
+  Einstellung `cfg['lookback']` ist und nie in `params` geschrieben wird,
+  vgl. `param_columns._on_param_changed` / `service_win.collect_set_definition`).
+
+## 11.2 Aenderungen in den 3 Service-Klassen
+
+* **`analytics/features/definitions/srv_swing_structure.py`** (`SrvSwingStructure`),
+  **`srv_swing_momentum.py`** (`SrvSwingMomentum`),
+  **`srv_swing_volume_profile.py`** (`SrvSwingVolumeProfile`):
+  jeweils direkt unter der `parameter_schema`-Property ergaenzt:
+  * `@property def default_params` – extrahiert die Defaults aus
+    `parameter_schema` (`{k: v.get("default") for k, v in ... if "default" in v}`).
+  * `def full_parameter_schema()` – liefert das vollstaendige Schema
+    (Basis-Parameter wie `lookback` + plugin-spezifisch) inkl. Min/Max/Typ
+    fuer die UI-Spalten (Basisklassen-Vertrag, `dict(self.base_parameter_schema)`
+    gemerged mit `dict(self.parameter_schema or {})`).
+* Kommentarblock `# 2. SCHEMA-EXPOSURE FÜR DIE UI (07.08.2026, Bugfix)`
+  dokumentiert Zweck und Vertrag in jeder Klasse.
+
+## 11.3 Verifikation (headless, keine UI-Tests)
+
+* **Syntax:** `python -m py_compile` auf den 3 Service-Dateien + `test/test.py` – PASS.
+* **`test/test.py` Teil 20 (NEU, 12 Checks, alle PASS):** fuer alle 3 Services:
+  * T1) `full_parameter_schema()` nicht leer.
+  * T2) `default_params` befuellt (`left_bars` / `period` / `grid_step`).
+  * T3) `lookback` im `full_parameter_schema()` enthalten (Basisklassen-Vertrag,
+    `SchemaMigrator`-Kompatibilitaet).
+  * T4) `lookback` NICHT in `default_params` (Instanz-Einstellung, gehoert
+    nicht in `params`).
+* **Isolierter Registry-Check:** `PluginRegistry().get(...)` fuer alle 3 IDs
+  mit den Assertions aus der Aufgaben-Verifikation – PASS.
+* **Gesamtlauf `test/test.py`:** 351 PASS; unveraenderte 6 vorbestehende
+  Harness-FAILURES (P2, P5, H3, H4, H5, H7 - PersistentWindow-Position/
+  -Groesse, offscreen-bedingt, dokumentierte Baseline) – keine neuen Fehler.
+* **Test-Cleanup (Invariante 10):** temporaeres Helfer-Skript
+  (`test/_fix_part20_comments.py`) entfernt; `test/` enthaelt wieder nur
+  `test/test.py` (Teil 20 ergaenzt).
+* Naechste Kapitel (Roadmap): 17.02 Trend Services.
+
+---
+
+# 12. Implementierungs-Log 17.01.05 (07.08.2026) - Bugfix: Standalone-Plugin-Editor im ServiceWindow (Parameter anzeigen/editieren/speichern unter "Services") UMGESETZT
+
+**Ziel:** User-Meldung aus der Testrunde aufloesen: Ein Klick auf einen
+Service unter dem Knoten "Services" (auch in Kategorie-Ordnern wie
+`Swing Points/Geometrie`) zeigte **keine Parameter** in der rechten
+Parameter-Spalte. Anforderungen:
+a) Parameter in der Box anzeigen,
+b) voll editierbar inkl. Speichern,
+c) Edit-/Speichern-Buttons nur bei Wert-Aenderung sichtbar (wie bei "Sets").
+
+---
+
+## 12.1 Root Cause
+
+* `MasterTree` emittiert bei einem Klick auf eine Plugin-Zeile
+  `selection_changed("", "")` (leere IDs – Plugin-Zeilen haben kein Set) UND
+  `selection_details(node_type, set_id, service_id, plugin_id)`.
+* `_on_master_selection()` im ServiceWindow leerte bei leerem `set_id` sofort
+  den Editor (`_clear_set_editor()`).
+* Das `selection_details`-Signal (traegt die `plugin_id`) war im ServiceWindow
+  **nicht verdrahtet** (nur im `ServiceSelectorDialog`). Dadurch ging die
+  Plugin-Auswahl verloren und die Parameter-Spalte blieb leer.
+
+## 12.2 Aenderungen
+
+### `state_manager.py` (additiv, +29 Zeilen)
+* **NEU `save_global_value(key, value)`** – persistiert einen beliebigen
+  JSON-faehigen Wert unter `key` in `global_settings` (INSERT ... ON CONFLICT).
+* **NEU `get_global_value(key, default=None)`** – liest den Wert (oder `default`).
+* Verwendet fuer die Standalone-Plugin-Parameter des ServiceWindows
+  (Key `plugin_params_<plugin_id>`): Parameter + lookback + Beschreibung eines
+  Plugins ohne Set werden hier persistiert (NICHT in Service-Sets).
+
+### `serviceui/service_win.py` (additiv, +203 Zeilen)
+* **NEU Feld `_current_plugin_editing: Optional[str] = None`** – haelt die
+  `plugin_id`, sofern gerade ein Standalone-Plugin im Editor geladen ist.
+* **`_wire_selector_toolbar()`:** `tree.selection_details` jetzt mit
+  `_on_master_selection_details` verdrahtet (vorher nur im Dialog).
+* **`_on_master_selection()`:** Guard – bei leerem `set_id` wird der
+  Plugin-Editor NICHT geleert, wenn `_current_plugin_editing` gesetzt ist
+  (sonst ueberschreibt die leere `selection_changed` den gerade geladenen
+  Plugin-Editor).
+* **NEU `_on_master_selection_details(node_type, set_id, service_id, plugin_id)`:**
+  Slot fuer das `selection_details`-Signal. Bei `node_type == "plugin"` wird
+  `_load_plugin_editor(plugin_id)` aufgerufen; jede andere Zeile beendet den
+  Plugin-Modus.
+* **NEU `_plugin_config(plugin_id)`** – baut eine `ServiceInstanceConfig`:
+  Registry-Defaults (params/lookback/version) gemerged mit gespeicherten
+  Werten aus `global_settings` (`plugin_params_<pid>`: lookback, params,
+  optionale description).
+* **NEU `_load_plugin_editor(plugin_id)`** – baut eine Ad-hoc-Definition
+  (nur dieser eine Service) und zeigt sie editierbar in der rechten Spalte
+  (`load_set_into_editor`). Unbekanntes Plugin -> Log + Editor leeren.
+* **NEU `_save_plugin_params() -> bool`** – persistiert die aktuellen
+  Editor-Werte via `collect_set_definition()` nach `global_settings`
+  (Key `plugin_params_<pid>`), entfernt die Dirty-Marker.
+* **`_save_params_from_panel()`:** Plugin-Modus -> `_save_plugin_params()`
+  statt `ServiceSetRepository.save_set`.
+* **`_save_and_run_from_panel()`:** Plugin-Modus -> speichert und startet NUR
+  den einen Service (Bestätigungsdialog wie beim Set-Run).
+* **`_on_run_plugin()` / `_on_run_category()`:** nutzen jetzt
+  `self._plugin_config(pid)` (gespeicherte Werte statt leerer Config).
+* **`_clear_set_editor()`:** setzt `_current_plugin_editing = None`.
+* **`_save_instance_description()`:** Plugin-Modus -> `_save_plugin_params()`.
+
+### Dirty-State / Buttons (bestehender Mechanismus, keine neue Logik)
+* Die Speichern-Buttons (`btn_save_params` / `btn_save_run_params`) werden
+  weiterhin nur bei einer manuellen Parameter-Aenderung eingeblendet
+  (`_mark_service_dirty` -> `_set_param_actions_visible(True)`) und nach dem
+  Speichern wieder ausgeblendet (`_clear_dirty_markers`).
+
+## 12.3 Verifikation (headless, keine UI-Tests)
+
+* **Syntax:** `python -m py_compile` auf `serviceui/service_win.py`,
+  `state_manager.py`, `test/test.py` – PASS.
+* **`test/test.py` Teil 21 (NEU, 19 Checks, alle PASS):**
+  * T1-T3) `_plugin_config` Defaults (params befuellt, lookback=1000, version).
+  * T4) Plugin-Zeile `srv_swing_structure` im MasterTree gefunden
+    (Kategorie-Ordner, rekursive Suche).
+  * T5-T7) Klick-Simulation (`_emit_selection_details`) -> `_current_plugin_editing`
+    gesetzt, Editor geladen (execution_order = nur das Plugin), Parameter-
+    Spalten aufgebaut.
+  * T8) **Guard:** `_on_master_selection("", "")` leert den Plugin-Editor NICHT.
+  * T9-T11) Parameter aendern (User-Pfad) -> Dirty-State, Speichern-Buttons
+    sichtbar.
+  * T12-T15) `_save_plugin_params()` -> `global_settings` (`plugin_params_<pid>`),
+    gespeicherte Werte in `_plugin_config` gemerged.
+  * T16-T17) `_save_and_run_from_panel` im Plugin-Modus (QMessageBox gefaket):
+    speichert + startet Worker mit `plugin_id` und gespeicherten Werten.
+  * T18) `_on_run_plugin` nutzt gespeicherte Params.
+  * T19) Nicht-Plugin-Zeile beendet den Plugin-Modus.
+* **Gesamtlauf `test/test.py`:** 370 PASS; unveraenderte 6 vorbestehende
+  Harness-FAILURES (P2, P5, H3, H4, H5, H7 - PersistentWindow-Position/
+  -Groesse, offscreen-bedingt, dokumentierte Baseline) – keine neuen Fehler.
+* **Test-Cleanup (Invariante 10):** temporaere Helfer
+  (`test/_tmp_insert21.py`, `test/_part21_block.txt`) entfernt; `test/`
+  enthaelt wieder nur `test/test.py` (Teil 21 ergaenzt).
+* **Doku-Freigabe:** Dieser Eintrag wurde erst nach erfolgreichem manuellem
+  Funktionstest des Anwenders erstellt (Regel C: Doku nach Freigabe).
+* Naechste Kapitel (Roadmap): 17.02 Trend Services.

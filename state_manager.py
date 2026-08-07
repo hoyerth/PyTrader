@@ -455,6 +455,35 @@ class StateManager:
         """, [KEY_APP_SETTINGS, json.dumps(settings.to_dict())])
 
     # =========================================================================
+    # Generische global_settings-Zugriffe (17.01.04, Plugin-Parameter-Presets)
+    # -------------------------------------------------------------------------
+    # Speichert/liest beliebige JSON-Werte unter einem Key in global_settings.
+    # Verwendet fuer die Standalone-Plugin-Parameter des ServiceWindows
+    # (Key 'plugin_params_<plugin_id>'): Parameter + lookback + Beschreibung
+    # eines Plugin ohne Set werden hier persistiert, damit die Parameter-Spalte
+    # beim Klick auf eine Plugin-Zeile unter 'Services' die gespeicherten
+    # Werte anzeigt und die Ausfuehrung sie nutzt.
+    # =========================================================================
+    def save_global_value(self, key: str, value: Any) -> None:
+        """Speichert einen beliebigen JSON-faehigen Wert unter `key`."""
+        con = self._get_connection()
+        con.execute("""
+            INSERT INTO global_settings (key, value)
+            VALUES (?, ?)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """, [key, json.dumps(value)])
+
+    def get_global_value(self, key: str, default: Any = None) -> Any:
+        """Liest den unter `key` gespeicherten Wert (oder `default`)."""
+        con = self._get_connection()
+        row = con.execute(
+            "SELECT value FROM global_settings WHERE key = ?", [key]
+        ).fetchone()
+        if row and row[0]:
+            return _parse_json_field(row[0])
+        return default
+
+    # =========================================================================
     # Dialog-Geometrie (nicht-modale Dialoge, z. B. IndicatorSettingsDialog)
     # -------------------------------------------------------------------------
     # Speichert Position/Groesse eines nicht-modalen Dialogs in global_settings,

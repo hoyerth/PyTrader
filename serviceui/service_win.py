@@ -109,6 +109,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self._run_worker: Optional[ServiceRunWorker] = None
         self._current_set_id: Optional[str] = None
         self._current_set_definition: Optional[Dict[str, Any]] = None
+        # 17.01.04 (Bugfix): Standalone-Plugin-Editierung – ist eine
+        # Plugin-Zeile unter 'Services' (Kategorie-Ordner) im Parameter-
+        # Editor geladen, haelt dieses Feld die plugin_id. Die gespeicherten
+        # Parameter liegen in global_settings (Key 'plugin_params_<pid>').
+        self._current_plugin_editing: Optional[str] = None
         # USER-REQ (P14-03): Preisskala-Praezision je Symbol fuer die 6
         # Custom-Level-Eingabefelder (prox_level1..6). Lazy + gecacht.
         self._symbol_precision: Optional[int] = None
@@ -569,6 +574,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         tree = selector.master_tree
         # MasterTree-Auswahl + Kontextmenue (entkoppelt) -> Editor/Handler
         tree.selection_changed.connect(self._on_master_selection)
+        # 17.01.04 (Bugfix): Klick-Scope (node_type, set_id, service_id,
+        # plugin_id) – traegt auch die plugin_id von Plugin-Zeilen unter
+        # 'Services'. Daraus wird der Standalone-Plugin-Editor geladen
+        # (Parameter anzeigen/editieren/speichern wie bei Sets).
+        tree.selection_details.connect(self._on_master_selection_details)
         # Bugfix 05.08.2026: Info-Button-Klicks (Spalte 1) -> Beschreibungs-
         # Dialog (Service / Plugin / Set).
         tree.info_requested.connect(self._on_tree_info_requested)
@@ -623,9 +633,16 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         Set-Dropdown der entfernten Service-Sets-Box entfaellt - die
         Auswahl im MasterTree ist die alleinige Quelle. Bei Set-Auswahl
         werden die Parameter-Spalten aufgebaut; ohne Auswahl (Plugin-/
-        Standalone-Zeilen) wird der Editor geleert."""
+        Standalone-Zeilen) wird der Editor geleert.
+
+        17.01.04 (Bugfix): Bei einer Plugin-Zeile unter 'Services' feuert
+        selection_changed mit leeren IDs NACH selection_details. Der
+        Plugin-Editor wurde dort bereits geladen (_current_plugin_editing) –
+        der Editor darf in diesem Fall NICHT geleert werden."""
         self._set_param_actions_visible(False)
         if not set_id:
+            if self._current_plugin_editing:
+                return  # Plugin-Editor bleibt (via selection_details geladen)
             self._clear_set_editor()
             return
         try:
@@ -637,6 +654,141 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.log(f"Set '{set_id}' nicht gefunden.")
             return
         self.load_set_into_editor(definition)
+
+    # -------------------------------------------------------------------------
+    # 17.01.04 (Bugfix): Standalone-Plugin-Editor (Parameter-Spalte fuer
+    # Plugin-Zeilen unter 'Services' – anzeigen/editieren/speichern wie bei
+    # Sets; Persistenz in global_settings, Key 'plugin_params_<pid>').
+    # -------------------------------------------------------------------------
+
+    @Slot(str, str, str, str)
+    def _on_master_selection_details(self, node_type: str, set_id: str,
+                                     service_id: str, plugin_id: str) -> None:
+        """Slot fuer `MasterTree.selection_details` (Mausklick in einer Zeile).
+
+        17.01.04 (Bugfix): Klick auf eine Plugin-Zeile (TYPE_PLUGIN) unter
+        'Services' (auch in Kategorie-Ordnern) laedt den Standalone-Plugin-
+        Editor in die rechte Parameter-Spalte – editierbar, mit Speichern.
+        Set-/Service-Zeilen verhalten sich unveraendert (der eigentliche
+        Set-Load laeuft ueber selection_changed); hier wird nur der
+        Plugin-Modus zurueckgesetzt.
+        """
+        if node_type == "plugin" and plugin_id:
+            self._load_plugin_editor(str(plugin_id))
+            return
+        # Jede andere Zeile beendet den Plugin-Editor-Modus; der Set-Editor
+        # wird weiterhin ueber selection_changed gesteuert (Bestandslogik).
+        if self._current_plugin_editing:
+            self._current_plugin_editing = None
+
+    def _plugin_config(self, plugin_id: str) -> Dict[str, Any]:
+        """ServiceInstanceConfig eines Standalone-Plugins.
+
+        Liefert {"plugin_id", "lookback", "params", "version"} – Basis sind
+        die Registry-Defaults; gespeicherte Werte aus global_settings
+        (Key 'plugin_params_<pid>') ueberschreiben lookback/params und
+        ergaenzen eine optionale Beschreibung.
+        """
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            plugin = PluginRegistry().get(plugin_id)
+        except KeyError:
+            plugin = None
+        params = dict(getattr(plugin, "default_params", None) or {}) if plugin else {}
+        lookback: int = 1000
+        if "lookback" in params:
+            try:
+                lookback = int(params.pop("lookback") or 1000)
+            except (TypeError, ValueError):
+                lookback = 1000
+        cfg: Dict[str, Any] = {
+            "plugin_id": plugin_id,
+            "lookback": lookback,
+            "params": params,
+            "version": getattr(plugin, "version", "0.0.0") or "0.0.0",
+        }
+        try:
+            saved = self._state_manager.get_global_value(
+                f"plugin_params_{plugin_id}", None)
+        except Exception:
+            saved = None
+        if isinstance(saved, dict):
+            lb = saved.get("lookback")
+            if lb is not None:
+                try:
+                    cfg["lookback"] = int(lb)
+                except (TypeError, ValueError):
+                    pass
+            saved_params = saved.get("params")
+            if isinstance(saved_params, dict):
+                merged = dict(params)
+                merged.update(saved_params)
+                cfg["params"] = merged
+            desc = saved.get("description")
+            if desc:
+                cfg["description"] = str(desc)
+        return cfg
+
+    def _load_plugin_editor(self, plugin_id: str) -> None:
+        """Laedt die Parameter eines Standalone-Plugins in den Editor.
+
+        Baut eine Ad-hoc-Definition (nur dieser eine Service) aus
+        `_plugin_config` und zeigt sie editierbar in der rechten Spalte.
+        Der Speicherpfad laeuft bei Aenderungen ueber `_save_plugin_params`
+        (global_settings) statt ueber ServiceSetRepository.
+        """
+        if not plugin_id:
+            return
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            PluginRegistry().get(plugin_id)
+        except KeyError:
+            self.log(f"Plugin '{plugin_id}' nicht gefunden.")
+            self._current_plugin_editing = None
+            self._clear_set_editor()
+            return
+        cfg = self._plugin_config(plugin_id)
+        definition: Dict[str, Any] = {
+            "set_id": "",
+            "display_name": plugin_id,
+            "description": str(cfg.get("description") or ""),
+            "execution_order": [plugin_id],
+            "services": {plugin_id: cfg},
+        }
+        self._current_plugin_editing = plugin_id
+        self.load_set_into_editor(definition)
+
+    def _save_plugin_params(self) -> bool:
+        """Persistiert die Parameter des aktuell editierten Standalone-
+        Plugins in global_settings (Key 'plugin_params_<pid>').
+
+        Returns: True bei Erfolg (Dirty-Marker entfernt).
+        """
+        plugin_id = self._current_plugin_editing
+        if not plugin_id:
+            return False
+        definition = self.collect_set_definition()
+        services = definition.get("services") or {}
+        cfg = next(iter(services.values()), None)
+        if not isinstance(cfg, dict):
+            self.log(f"FEHLER beim Speichern der Plugin-Parameter: "
+                     f"keine Service-Config.")
+            return False
+        data: Dict[str, Any] = {
+            "plugin_id": plugin_id,
+            "lookback": int(cfg.get("lookback") or 1000),
+            "params": dict(cfg.get("params") or {}),
+            "description": str(cfg.get("description") or ""),
+        }
+        try:
+            self._state_manager.save_global_value(
+                f"plugin_params_{plugin_id}", data)
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern der Plugin-Parameter: {e}")
+            return False
+        self._clear_dirty_markers()
+        self.log(f"Parameter gespeichert (Plugin): {plugin_id}")
+        return True
 
     def _begin_sync_guard(self) -> None:
         """Blockt den 45s-Hintergrund-Sync (sync_timer in main.py).
@@ -810,7 +962,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             "set_id": f"plugin_{plugin_id}",
             "display_name": plugin_id,
             "execution_order": [plugin_id],
-            "services": {plugin_id: {"plugin_id": plugin_id}},
+            # 17.01.04: Gespeicherte Plugin-Parameter (global_settings)
+            # verwenden, falls vorhanden – sonst Registry-Defaults.
+            "services": {plugin_id: self._plugin_config(plugin_id)},
         }
         self._start_run_worker(plugin_id, definition, instance_id=plugin_id)
 
@@ -855,7 +1009,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             "set_id": f"category_{category_path}",
             "display_name": category_path,
             "execution_order": list(plugin_ids),
-            "services": {pid: {"plugin_id": pid} for pid in plugin_ids},
+            # 17.01.04: Gespeicherte Plugin-Parameter je Service verwenden
+            # (falls vorhanden), sonst Registry-Defaults.
+            "services": {pid: self._plugin_config(pid) for pid in plugin_ids},
         }
         self._start_run_worker(category_path, definition, instance_id=None)
 
@@ -915,7 +1071,14 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         des aktiven Sets (ServiceSetRepository.save_set, ohne Neuberechnung),
         entfernt den '*' -Dirty-Marker im Baum und emittiert den EventBus
         (Live-Sync aller ServiceSelectorModel-Instanzen).
+
+        17.01.04: Im Standalone-Plugin-Modus (_current_plugin_editing)
+        laeuft die Persistenz ueber global_settings (_save_plugin_params)
+        statt ueber ServiceSetRepository.
         """
+        if self._current_plugin_editing:
+            self._save_plugin_params()
+            return
         if not self._current_set_id:
             self.log("Kein Set geladen – Speichern nicht möglich.")
             return
@@ -939,7 +1102,32 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         (FeatureStore-Persistenz + EventBus-Sync): Dadurch wird der
         '*' -Marker entfernt und nach Abschluss das Ausfuehrungsdatum
         '(DD.MM.JJ)' im MasterTree live aktualisiert.
+
+        17.01.04: Im Standalone-Plugin-Modus wird nur der eine Service
+        gespeichert (global_settings) und ausgefuehrt.
         """
+        if self._current_plugin_editing:
+            plugin_id = self._current_plugin_editing
+            if not self._save_plugin_params():
+                return
+            definition = self.collect_set_definition()
+            symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
+            # U15-E: Zeitachsen-Control der Filterleiste (combo_tf) – kann
+            # auch 'ALLE Timeframes' sein (Multi-TF-Ausfuehrung im Worker).
+            timeframe = self.combo_tf.currentText() if self.combo_tf else "H1"
+            reply = QMessageBox.question(
+                self, "Speichern & Ausführen",
+                f"Plugin '{plugin_id}' wurde gespeichert.\n\n"
+                f"Jetzt ausführen?\n"
+                f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+                f"Der Service wird neu berechnet und der Feature-Store-Payload "
+                f"in analytics.duckdb geschrieben.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                self.log("Ausführung abgebrochen (Parameter gespeichert).")
+                return
+            self._start_run_worker(plugin_id, definition, instance_id=plugin_id)
+            return
         if not self._current_set_id:
             self.log("Kein Set geladen – Speichern & Ausführen nicht möglich.")
             return
@@ -1466,6 +1654,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         Parameter-Spalten)."""
         self._current_set_id = None
         self._current_set_definition = None
+        # 17.01.04: Auch den Standalone-Plugin-Editor-Modus beenden.
+        self._current_plugin_editing = None
         # Phase 15 (Dirty-State): Marker des vorherigen Sets entfernen.
         self._clear_dirty_markers()
         self._clear_service_columns()
@@ -1678,6 +1868,13 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             cfg = (self._current_set_definition.get("services") or {}).get(instance_id)
             if isinstance(cfg, dict):
                 cfg["description"] = clean
+        # 17.01.04: Standalone-Plugin-Editor – Beschreibung in die Plugin-
+        # Konfiguration (global_settings) uebernehmen statt in ein Set.
+        if self._current_plugin_editing:
+            if self._save_plugin_params():
+                self.log(f"Instanz-Beschreibung '{instance_id}' gespeichert "
+                         f"(Plugin).")
+            return
         if not set_id:
             self.log(f"Instanz-Beschreibung '{instance_id}' aktualisiert "
                      f"(Set noch nicht gespeichert).")

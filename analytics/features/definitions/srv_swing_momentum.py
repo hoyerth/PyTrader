@@ -309,6 +309,26 @@ class SrvSwingMomentum(PluginFeature):
         (PineScript-Input-Zone am Dateianfang, M1: kein geteiltes Dict)."""
         return {k: dict(v) for k, v in _SWING_MOMENTUM_SCHEMA.items()}
 
+    # 2. SCHEMA-EXPOSURE FÜR DIE UI (07.08.2026, Bugfix): Die Spalten-UI
+    # (serviceui/param_columns.py & ServiceSelectorWidget) liest Parameter-
+    # Definitionen über `default_params` / `full_parameter_schema()`. Diese
+    # expliziten Overrides stellen das Schema unabhängig von der jeweiligen
+    # parameter_schema-Definition (Property/Klassen-Attribut) bereit und
+    # erhalten den Basisklassen-Vertrag (Basis-Parameter wie lookback + 
+    # plugin-spezifische Parameter, vgl. base_plugin.PluginFeature).
+    @property
+    def default_params(self) -> Dict[str, Any]:
+        """Extrahiert die Default-Werte aus dem parameter_schema für die Engine."""
+        return {k: v.get("default") for k, v in self.parameter_schema.items()
+                if "default" in v}
+
+    def full_parameter_schema(self) -> Dict[str, ParameterSchema]:
+        """Liefert das vollständige Schema (Basis + plugin-spezifisch) inkl.
+        Min/Max/Typ für die UI-Spalten (Basisklassen-Vertrag)."""
+        merged = dict(self.base_parameter_schema)
+        merged.update(dict(self.parameter_schema or {}))
+        return merged
+
     def calculate(
         self,
         df: pd.DataFrame,
