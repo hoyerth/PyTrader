@@ -46,6 +46,9 @@ PyTrader/
                 grid_math.py
                 srv_grid_lines.py
                 srv_proximity.py
+                srv_swing_momentum.py
+                srv_swing_structure.py
+                srv_swing_volume_profile.py
             plugins/
                 __init__.py
                 base_plugin.py
@@ -108,7 +111,8 @@ PyTrader/
         symbols_win.py
         trash_dialog.py
     test/
-        check_stylepicker_16_06.py
+        _probe_meta.py
+        _probe_sets.py
         test.py
     ui/
         chart_win.ui
@@ -139,10 +143,10 @@ Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukture
 - Abweichungen davon nur auf ausdrückliche Einzelanweisung des Benutzers.
 - Anpassungen, ob aus dieser Datei oder manuell eingegeben, werden hier in weiteren Kapiteln nach gegebener Taxonomie als Implementierungs-Log mit datum/uhrzeit im Format MD dokumentiert
 
-### 0b. WICHTIG: `docs/Old` NICHT BEACHTEN (Standard)
-- **Alle Dateien im Unterordner `docs/Old` (`docs/Old/x_Architektur.md`, `docs/Old/x_Roadmap.md`, ...) sind archivierte/abgelegte Alt-Dokumente und werden NICHT beachtet.**
+### 0b. WICHTIG: `docs/Current` NICHT BEACHTEN (Standard)
+- **Alle Dateien im Unterordner `docs/Current` und `docs/Archiv` (`docs/Current/x_Architektur.md`, `docs/Current/x_Roadmap.md`, ...) sind archivierte/abgelegte Alt-Dokumente und werden NICHT beachtet.**
 - **Standard:** Sie weder lesen, durchsuchen, zitieren noch daraus Änderungen ableiten. Sie spiegeln NICHT den aktuellen Stand des Projekts wider.
-- **Ausnahme:** Nur auf temporäre, ausdrückliche Einzelanweisung des Benutzers darf eine bestimmte Datei aus `docs/Old` ausnahmsweise herangezogen werden.
+- **Ausnahme:** Nur auf temporäre, ausdrückliche Einzelanweisung des Benutzers darf eine bestimmte Datei aus `docs/Current` ausnahmsweise herangezogen werden.
 
 ---
 
@@ -603,7 +607,7 @@ def get_analytics_profile_repository() -> AnalyticsProfileRepository:
 # Architektur-Dokumentation: PyTrader System-Architektur
 
 > **Single Point of Truth:** Dieses Dokument ist die verbindliche Architektur-Datei.
-> Archiv-/Alt-Fassungen (`docs/Old/`) werden nicht mehr gepflegt. Detaillierte
+> Archiv-/Alt-Fassungen (`docs/Current/`) werden nicht mehr gepflegt. Detaillierte
 > Modul- und Tabellen-Beschreibungen liegen direkt im Code (Modul-Docstrings,
 > `db_service.py` als Schema-Source-of-Truth).
 
@@ -984,6 +988,13 @@ def check_and_init_databases() -> None:
 	""")
 
 	# Analytics-Tabelle für Feature-/Plugin-Daten
+	# 17.01 (E-1, 07.08.2026): 4-Spalten-PK (symbol, timeframe, bar_time,
+	# feature_id) – erlaubt die konfliktfreie Speicherung MEHRERER Services auf
+	# derselben Kerze (feature_id identifiziert das erzeugende Plugin, Default
+	# 'native' fuer den klassischen Feature-Builder-Pfad). Bei bestehenden DBs
+	# ist CREATE TABLE IF NOT EXISTS ein No-op; die Migration existierender
+	# Tabellen erfolgt ueber test/migrate_pk.py (Table-Rewrite + RENAME, da
+	# DuckDB 1.5.5 kein DROP PRIMARY KEY unterstuetzt).
 	con_analytics.execute("""
 		CREATE TABLE IF NOT EXISTS feature_store (
 			symbol      VARCHAR NOT NULL,
@@ -993,7 +1004,10 @@ def check_and_init_databases() -> None:
 			rsi_14      DOUBLE,
 			atr_normalized DOUBLE,
 			created_at  TIMESTAMP DEFAULT current_timestamp,
-			PRIMARY KEY (symbol, timeframe, bar_time)
+			feature_id  VARCHAR NOT NULL DEFAULT 'native',
+			plugin_version VARCHAR,
+			feature_data JSON,
+			PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
 		);
 	""")
 
@@ -1005,6 +1019,19 @@ def check_and_init_databases() -> None:
 	con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_id VARCHAR;")
 	con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS plugin_version VARCHAR;")
 	con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_data JSON;")
+	# Bugfix 07.08.2026 (Phase 17 Bugfix-Runde 2): Der Spalten-DEFAULT von
+	# created_at wurde durch die PK-Migration (17.01 E-1, test/migrate_pk.py –
+	# Table-Rewrite + RENAME) entfernt. Seitdem bleiben NEUE feature_store-Rows
+	# ohne explizites created_at NULL und das 'Datum der letzten Ausfuehrung'
+	# (MasterTree, MAX(created_at) je feature_id) zeigt '--.--.--'. Der DEFAULT
+	# wird hier idempotent wiederhergestellt (No-op bei korrekter DB).
+	try:
+		con_analytics.execute(
+			"ALTER TABLE feature_store ALTER created_at "
+			"SET DEFAULT current_timestamp")
+	except Exception as e:
+		print(f"⚠️ [MIGRATION WARNUNG] created_at-Default des feature_store "
+		      f"konnte nicht wiederhergestellt werden: {e}")
 
 	con_app = DbPool.get(DB_APP_DATA)
 	con_app.execute("""
@@ -3141,6 +3168,35 @@ class StateManager:
             VALUES (?, ?)
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
         """, [KEY_APP_SETTINGS, json.dumps(settings.to_dict())])
+
+    # =========================================================================
+    # Generische global_settings-Zugriffe (17.01.04, Plugin-Parameter-Presets)
+    # -------------------------------------------------------------------------
+    # Speichert/liest beliebige JSON-Werte unter einem Key in global_settings.
+    # Verwendet fuer die Standalone-Plugin-Parameter des ServiceWindows
+    # (Key 'plugin_params_<plugin_id>'): Parameter + lookback + Beschreibung
+    # eines Plugin ohne Set werden hier persistiert, damit die Parameter-Spalte
+    # beim Klick auf eine Plugin-Zeile unter 'Services' die gespeicherten
+    # Werte anzeigt und die Ausfuehrung sie nutzt.
+    # =========================================================================
+    def save_global_value(self, key: str, value: Any) -> None:
+        """Speichert einen beliebigen JSON-faehigen Wert unter `key`."""
+        con = self._get_connection()
+        con.execute("""
+            INSERT INTO global_settings (key, value)
+            VALUES (?, ?)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """, [key, json.dumps(value)])
+
+    def get_global_value(self, key: str, default: Any = None) -> Any:
+        """Liest den unter `key` gespeicherten Wert (oder `default`)."""
+        con = self._get_connection()
+        row = con.execute(
+            "SELECT value FROM global_settings WHERE key = ?", [key]
+        ).fetchone()
+        if row and row[0]:
+            return _parse_json_field(row[0])
+        return default
 
     # =========================================================================
     # Dialog-Geometrie (nicht-modale Dialoge, z. B. IndicatorSettingsDialog)
@@ -6175,6 +6231,12 @@ DB_ANALYTICS = str(BASE_DIR / "data" / "analytics.duckdb")
 # sind seit 15.04 deckungsgleich.
 SCHEMA_VERSION_DEFAULT = "1.0.0"
 
+# 17.01 (E-1, 07.08.2026): Sentinel feature_id fuer native Feature-Builder-Rows
+# (ohne Plugin). Seit der PK-Migration (symbol, timeframe, bar_time,
+# feature_id) tragen sie feature_id='native' und werden in allen UI-Listen
+# (feature_ids / letzte Ausfuehrung) ausgeblendet.
+SENTINEL_NATIVE = "native"
+
 # Native Feature-Spalten der feature_store-Tabelle (fuer Heatmap-Metriken,
 # Scatter-/Verteilungs-Achsen). Keine JSON-Feld-Pfade – nur echte Spalten.
 NATIVE_COLUMNS = ("ema_diff", "rsi_14", "atr_normalized")
@@ -6542,8 +6604,9 @@ class FeatureStoreReader:
                 SELECT LOWER(TRIM(feature_id)) AS fid, MAX(created_at)
                 FROM feature_store
                 WHERE feature_id IS NOT NULL AND TRIM(feature_id) != ''
+                  AND feature_id != ?
                 GROUP BY LOWER(TRIM(feature_id))
-            """).fetchall()
+            """, [SENTINEL_NATIVE]).fetchall()
         except Exception as e:
             print(f"WARN [FeatureStoreReader] fetch_last_execution_dates "
                   f"fehlgeschlagen: {e}")
@@ -6599,8 +6662,9 @@ class FeatureStoreReader:
             ids = [r[0] for r in con.execute("""
                 SELECT DISTINCT feature_id FROM feature_store
                 WHERE feature_id IS NOT NULL AND feature_id != ''
+                  AND feature_id != ?
                 ORDER BY feature_id
-            """).fetchall()]
+            """, [SENTINEL_NATIVE]).fetchall()]
             total = con.execute("""
                 SELECT COUNT(*) FROM feature_store
                 WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
@@ -7046,8 +7110,9 @@ class ServiceSelectorModel(QObject):
     data_changed = Signal()
 
     #: Gruppen-Kennungen der Hierarchie (build_tree)
+    # 17.01.01: GROUP_STANDALONE entfällt ersatzlos – alle Plugins werden über
+    # metadata["category"] in Ordner einsortiert (2 Root-Gruppen: sets, plugins).
     GROUP_SETS = "sets"
-    GROUP_STANDALONE = "standalone"
     GROUP_PLUGINS = "plugins"
     # 16.08 (K2): Kategorie-Ordner-Knoten (Dynamic Category Trees).
     # Ein Ordner-Dict besitzt das Format:
@@ -7338,20 +7403,6 @@ class ServiceSelectorModel(QObject):
                      else f"⚪ inaktiv in {name}")
         return " | ".join(parts)
 
-    def get_standalone_plugin_ids(self) -> List[str]:
-        """Plugin-IDs, die in KEINEM gespeicherten Service-Set vorkommen
-        (⚡ Standalone Services – frei verfuegbare Plugins)."""
-        used: Set[str] = set()
-        for s in self._sets:
-            services = s.get("services") or {}
-            for cfg in services.values():
-                if isinstance(cfg, dict) and cfg.get("plugin_id"):
-                    used.add(str(cfg["plugin_id"]).lower())
-        return sorted(
-            pid for pid in self.get_plugins().keys()
-            if pid.lower() not in used
-        )
-
     # ------------------------------------------------------------------
     # 16.08 (K1/K2/K8/K9): Kategorie-Ordner (Dynamic Category Trees)
     # ------------------------------------------------------------------
@@ -7429,6 +7480,32 @@ class ServiceSelectorModel(QObject):
                 n["children"] = self._sort_category_nodes(n.get("children") or [])
         return result
 
+    def category_plugin_ids(self, category_path: str) -> List[str]:
+        """Alle Plugin-IDs unter einem Kategorie-Pfad (rekursiv, 17.01.02).
+
+        Liefert deterministisch (alphabetisch) alle Plugins, deren
+        `metadata['category']`-Pfad mit `category_path` beginnt – d.h. auch
+        Plugins in UNTER-Ordnern (z.B. Pfad 'Swing Points' liefert auch
+        Plugins aus 'Swing Points/Geometrie'). Pfad-Format: slash-separiert
+        OHNE '📁 '-Praefixe (z.B. 'Swing Points/Geometrie'), case-insensitiv.
+
+        Grundlage fuer:
+          * Kontextmenue '▶️ Alle Services ausführen' auf Ordner-Knoten
+            (run_category_requested).
+          * Info-Button auf Ordner-Knoten (category_info_requested).
+        """
+        target = [p.strip().lower() for p in str(category_path or "").split("/")
+                  if p.strip()]
+        if not target:
+            return []
+        plugins = self.get_plugins()
+        result: List[str] = []
+        for pid in sorted(plugins.keys()):
+            parts = [p.lower() for p in self._category_parts(plugins.get(pid))]
+            if len(parts) >= len(target) and parts[:len(target)] == target:
+                result.append(pid)
+        return result
+
     def _category_nodes(self, plugin_ids: List[str]) -> List[Dict[str, Any]]:
         """Baut die (ggf. verschachtelte) Kinderliste einer Plugin-Gruppe.
 
@@ -7453,14 +7530,17 @@ class ServiceSelectorModel(QObject):
     def build_tree(self) -> List[Dict[str, Any]]:
         """Baut die vollstaendige Hierarchie fuer das 2-Spalten-MasterTree.
 
+        17.01.01: NUR noch 2 Root-Gruppen – die ehemalige Gruppe
+        '⚡ Standalone Services' (GROUP_STANDALONE) entfaellt ersatzlos, da
+        alle Plugins ueber metadata['category'] in Ordner einsortiert werden.
+        Root-Label kompakt: '📁 Sets' und '📦 Services'.
+
         Rueckgabe (pro Gruppe ein Dict):
-            [{"group": "sets", "label": "📁 Service-Sets", "children": [
+            [{"group": "sets", "label": "📁 Sets", "children": [
                  {"set_id": ..., "display_name": ..., "definition": {...},
                   "services": [{"instance_id": ..., "plugin_id": ...,
                                 "badge": ...}, ...]}, ...]},
-             {"group": "standalone", "label": "⚡ Standalone Services",
-              "children": [Blatt- und/oder Ordner-Knoten ...]},
-             {"group": "plugins", "label": "📦 Alle verfügbaren Plugins",
+             {"group": "plugins", "label": "📦 Services",
               "children": [Blatt- und/oder Ordner-Knoten ...]}]
 
         Deterministisch sortiert (Sets nach display_name; Plugins/Ordner
@@ -7469,7 +7549,7 @@ class ServiceSelectorModel(QObject):
         ({plugin_id, badge, last_execution}) und verschachtelten
         Ordner-Dicts ({"group": GROUP_CATEGORY, "label": "📁 <Name>",
         "children": [...]} – rekursiv), gesteuert ueber das Metadaten-Feld
-        `category` der Plugins (K1). GROUP_SETS bleibt unveraendert.
+        `category` der Plugins (K1).
         """
         sets = sorted(self._sets,
                       key=lambda s: str(s.get("display_name") or s.get("set_id") or "").lower())
@@ -7496,18 +7576,16 @@ class ServiceSelectorModel(QObject):
                 "services": service_nodes,
             })
 
-        # 16.08 (K2/K8): Kinder der Plugin-Gruppen via _category_nodes –
+        # 16.08 (K2/K8) + 17.01.01: EINE kategorisierte Services-Gruppe –
         # Plugins mit `category`-Metadatum werden in 📁-Ordner verschachtelt
         # (K1), ohne Kategorie bleiben sie flache Blaetter auf oberster Ebene.
-        standalone_nodes = self._category_nodes(self.get_standalone_plugin_ids())
+        # Die fruehere Standalone-Gruppe (separate Knoten) ist entfallen.
         plugin_nodes = self._category_nodes(sorted(self.get_plugins().keys()))
 
         return [
-            {"group": self.GROUP_SETS, "label": "📁 Service-Sets",
+            {"group": self.GROUP_SETS, "label": "📁 Sets",
              "children": set_nodes},
-            {"group": self.GROUP_STANDALONE, "label": "⚡ Standalone Services",
-             "children": standalone_nodes},
-            {"group": self.GROUP_PLUGINS, "label": "📦 Alle verfügbaren Plugins",
+            {"group": self.GROUP_PLUGINS, "label": "📦 Services",
              "children": plugin_nodes},
         ]
 
@@ -9083,6 +9161,11 @@ class FeatureBuilder:
         df = features_df.copy()
         df["symbol"] = symbol
         df["timeframe"] = timeframe
+        # 17.01 (E-1, 07.08.2026): Der nativen Feature-Builder-Pfad schreibt
+        # mit feature_id='native' (Sentinel) – der PK ist seit der Migration
+        # (symbol, timeframe, bar_time, feature_id), damit mehrere Services auf
+        # derselben Bar koexistieren koennen.
+        df["feature_id"] = "native"
 
         own_connection = False
         if con is None:
@@ -9093,19 +9176,19 @@ class FeatureBuilder:
         try:
             con.register("df_temp", df)
 
-            feature_cols = [c for c in df.columns if c not in ("bar_time", "symbol", "timeframe")]
+            feature_cols = [c for c in df.columns if c not in ("bar_time", "symbol", "timeframe", "feature_id")]
             if not feature_cols:
                 return 0
 
-            insert_cols = ", ".join(['"symbol"', '"timeframe"', '"bar_time"'] + [f'"{c}"' for c in feature_cols])
-            select_cols = ", ".join(['"symbol"', '"timeframe"', '"bar_time"'] + [f'"{c}"' for c in feature_cols])
+            insert_cols = ", ".join(['"symbol"', '"timeframe"', '"bar_time"', '"feature_id"'] + [f'"{c}"' for c in feature_cols])
+            select_cols = ", ".join(['"symbol"', '"timeframe"', '"bar_time"', '"feature_id"'] + [f'"{c}"' for c in feature_cols])
             set_clause = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in feature_cols])
 
             sql = f"""
                 INSERT INTO feature_store ({insert_cols})
                 SELECT {select_cols}
                 FROM df_temp
-                ON CONFLICT (symbol, timeframe, bar_time) DO UPDATE SET
+                ON CONFLICT (symbol, timeframe, bar_time, feature_id) DO UPDATE SET
                     {set_clause}
             """
             con.execute(sql)
@@ -9129,8 +9212,10 @@ class FeatureBuilder:
 
         Setzt/aktualisiert NUR die Plugin-Spalten (feature_id, plugin_version,
         feature_data); native Feature-Spalten bleiben unberuehrt. Dadurch ist
-        der Plugin-Pfad parallel zum Alt-Pfad betreibbar (derselbe (symbol,
-        timeframe, bar_time)-Schluessel kann beide Informationsarten tragen).
+        der Plugin-Pfad parallel zum Alt-Pfad betreibbar – seit 17.01 (E-1,
+        PK-Migration auf (symbol, timeframe, bar_time, feature_id)) koennen
+        MEHRERE Services denselben (symbol, timeframe, bar_time)-Schluessel
+        tragen; feature_id des Payloads ist der Trenner.
 
         payload: {"feature_id", "plugin_version", "records": [{bar_time, ...}]}
         """
@@ -9179,14 +9264,22 @@ class FeatureBuilder:
             )
             con.register("df_temp", df_rows)
             try:
+                # Bugfix 07.08.2026 (Phase 17 Bugfix-Runde 2): created_at wird
+                # JETZT auch fuer NEUE Rows explizit mit now() geschrieben
+                # (nicht nur im ON CONFLICT-Zweig). Die PK-Migration
+                # (17.01 E-1, test/migrate_pk.py) hat den Spalten-DEFAULT
+                # (current_timestamp) der feature_store-Tabelle entfernt –
+                # ohne die explizite Spalte waeren neue Rows created_at=NULL
+                # und das Datum der letzten Ausfuehrung ('DD.MM.JJ' im
+                # MasterTree) bliebe fuer neu berechnete Services '--.--.--'.
                 con.execute("""
                     INSERT INTO feature_store
                         (symbol, timeframe, bar_time, feature_id,
-                         plugin_version, feature_data)
+                         plugin_version, feature_data, created_at)
                     SELECT symbol, timeframe, bar_time, feature_id,
-                           plugin_version, feature_data
+                           plugin_version, feature_data, now()
                     FROM df_temp
-                    ON CONFLICT (symbol, timeframe, bar_time) DO UPDATE SET
+                    ON CONFLICT (symbol, timeframe, bar_time, feature_id) DO UPDATE SET
                         feature_id = EXCLUDED.feature_id,
                         plugin_version = EXCLUDED.plugin_version,
                         feature_data = EXCLUDED.feature_data,
@@ -10416,6 +10509,1697 @@ class ProximityService(PluginFeature):
                         "in_time_window": in_time_window,
                         "active_hits": active_hits,
                     },
+                },
+            },
+        }
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/features/definitions/srv_swing_momentum.py
+```py
+# analytics/features/definitions/srv_swing_momentum.py
+# ==============================================================================
+# DEFINITION: srv_swing_momentum
+# ==============================================================================
+# NAME:        Swing Momentum Service
+# KATEGORIE:   Swing Points/Dynamik & Filter
+# BESCHREIBUNG: Wendepunkts-Erkennung über MA-Hysteresen, Steigungswechsel & Chande-Kroll
+# ==============================================================================
+"""
+Service: SwingMomentum (Phase 17.01) – Naming Convention 16.08.01: srv_
+
+Erfasst Richtungswechsel ueber Glättungs-Hysteresen (alle 12 MA-Typen des
+MA-Templates 16.04), Steigungswechsel und Trailing-Stops (Chande Kroll).
+Reiner Datenlieferant fuer die Analytics-UI und spaetere ML-Pipelines –
+KEINE Chart-Visualisierung in diesem Kapitel (17.01, §1).
+
+Causal Timestamping (Kein Look-ahead Bias, 17.01 §2.4):
+  * event_bar_time:        Zeitpunkt des tatsaechlichen Extremums.
+  * confirmation_bar_time: Zeitpunkt, an dem das Signal kausal feststand
+                           (bar_time der aktuellen Kerze).
+  * confirmation_lag_bars: dynamische Differenz in Bars
+                           (params['period'] bzw. Modus-Verzoegerung).
+  * Kerzen am Serienanfang ohne ausreichenden Lookback/Lookahead erhalten
+    calculation_status = 'INSUFFICIENT_DATA' und is_swing_* = False.
+
+Persistenz: feature_store_payload mit feature_id='srv_swing_momentum'
+(Datenvertrag 17.01 §4). Seit 17.01 (E-1, PK-Migration) koennen mehrere
+Services konfliktfrei auf derselben Kerze gespeichert werden.
+
+Capabilities (E-5, 07.08.2026): chart=False, batch=True, live=False,
+feature_store=True, render=False.
+metadata['category'] = 'Swing Points/Dynamik & Filter' fuer den MasterTree.
+
+PARAMETER (PineScript-Input-Zone, 17.01 §2.2): Alle Inputs/Defaults stehen
+als Modul-Konstante `_SWING_MOMENTUM_SCHEMA` direkt unter diesem Header.
+`parameter_schema` gibt eine flache Kopie zurueck (M1).
+E-2 (07.08.2026): type-Werte als Strings.
+"""
+
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+from analytics.features.plugins.base_plugin import (
+    FeatureCalculateResult,
+    ParameterSchema,
+    PluginCapabilities,
+    PluginContext,
+    PluginFeature,
+)
+
+# ---------------------------------------------------------------------------
+# PARAMETER (PineScript-Input-Zone, 17.01): Single Source of Truth fuer das
+# Prop-Fenster. Inputs/Defaults stehen hier direkt am Dateianfang.
+# `parameter_schema` gibt eine flache Kopie zurueck (M1).
+# E-2 (07.08.2026): type-Werte als Strings.
+# ---------------------------------------------------------------------------
+_SWING_MOMENTUM_SCHEMA: Dict[str, ParameterSchema] = {
+    "mode": {
+        "type": "str",
+        "default": "MA_Peak_Hysteresis",
+        "options": [
+            "MA_Peak_Hysteresis", "MA_Slope_Change", "Chande_Kroll_Ratchet",
+        ],
+        "description": "Algorithmus-Modus für Momentum-Swings",
+    },
+    "ma_type": {
+        "type": "str",
+        "default": "EHMA",
+        "options": [
+            "SMA", "EMA", "WMA", "DEMA", "TEMA", "HMA", "EHMA",
+            "ZLEMA", "RMA", "KAMA", "ALMA", "VWMA",
+        ],
+        "description": "Gleitender Durchschnittstyp (MA-Template 16.04)",
+        "visible_when": {"mode": ["MA_Peak_Hysteresis", "MA_Slope_Change"]},
+    },
+    "period": {
+        "type": "int", "default": 14, "min": 2,
+        "description": "Berechnungsperiode für Glättungs-MA",
+        "visible_when": {"mode": ["MA_Peak_Hysteresis", "MA_Slope_Change"]},
+    },
+    "piv_maxMaMovePct": {
+        "type": "float", "default": 0.2, "min": 0.01,
+        "description": "Erforderliche Gegenbewegung in % für MA Peak Pivot (gültig für alle ma_type-Optionen)",
+        "visible_when": {"mode": "MA_Peak_Hysteresis"},
+    },
+    "chande_lookback": {
+        "type": "int", "default": 10, "min": 1,
+        "description": "Lookback-Periode für Highest-High/Lowest-Low im Chande_Kroll_Ratchet Modus",
+        "visible_when": {"mode": "Chande_Kroll_Ratchet"},
+    },
+    "x_atr": {
+        "type": "float", "default": 3.0, "min": 0.5,
+        "description": "ATR-Multiplikator für Chande Kroll Stops",
+        "visible_when": {"mode": "Chande_Kroll_Ratchet"},
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Modul-Helfer (17.01.02: echte Swing-Erkennung statt Scaffold)
+# ---------------------------------------------------------------------------
+
+def _atr_series(df: pd.DataFrame, period: int) -> pd.Series:
+    """Wilder-ATR (EMA-alpha 1/period, adjust=False) ueber OHLCV.
+
+    Liefert NaN fuer Bars ohne ausreichende Historie (min_periods=period) –
+    diese Bars werden als INSUFFICIENT_DATA markiert (Chande_Kroll_Ratchet).
+    """
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1.0 / max(1, period), min_periods=max(1, period),
+                  adjust=False).mean()
+
+
+def _detect_ma_hysteresis(ma: np.ndarray,
+                          change_pct: float,
+                          ) -> Tuple[np.ndarray, np.ndarray,
+                                     Dict[int, Tuple[int, str, float]]]:
+    """MA-Peak-Hysterese: alternierend wird ein laufendes MA-Extremum
+    mitgefuehrt; erst wenn sich das MA um >= `change_pct` % gegen das
+    Extremum bewegt, ist der Pivot bestaetigt (kausal am aktuellen Bar).
+
+    Rueckgabe: (is_swing_high, is_swing_low, pivot_info) –
+    pivot_info {ext_idx: (conf_idx, 'high'|'low', move_pct)}.
+    """
+    n = len(ma)
+    is_high = np.zeros(n, dtype=bool)
+    is_low = np.zeros(n, dtype=bool)
+    pivot_info: Dict[int, Tuple[int, str, float]] = {}
+    if n < 2:
+        return is_high, is_low, pivot_info
+    direction = 1  # 1 = auf der Jagd nach Swing-High, -1 = Swing-Low
+    ext_idx = -1
+    ext_price = np.nan
+    for i in range(1, n):
+        cur = float(ma[i])
+        if not np.isfinite(cur):
+            continue
+        # Warmup-NaN (MA-Typen ohne Fruehwert) ueberspringen: erstes finites
+        # MA-Extremum als Startpunkt setzen (17.01.02 Bugfix – sonst bleibt
+        # der Zustand dauerhaft auf NaN haengen -> 0 Swings).
+        if not np.isfinite(ext_price):
+            ext_idx, ext_price = i, cur
+            continue
+        if direction == 1:
+            if cur > ext_price:
+                ext_idx, ext_price = i, cur
+            elif abs(ext_price) > 0.0 and (ext_price - cur) / abs(ext_price) * 100.0 >= change_pct:
+                is_high[ext_idx] = True
+                pivot_info[ext_idx] = (i, "high",
+                                       (ext_price - cur) / abs(ext_price) * 100.0)
+                direction = -1
+                ext_idx, ext_price = i, cur
+        else:
+            if cur < ext_price:
+                ext_idx, ext_price = i, cur
+            elif abs(ext_price) > 0.0 and (cur - ext_price) / abs(ext_price) * 100.0 >= change_pct:
+                is_low[ext_idx] = True
+                pivot_info[ext_idx] = (i, "low",
+                                       (cur - ext_price) / abs(ext_price) * 100.0)
+                direction = 1
+                ext_idx, ext_price = i, cur
+    return is_high, is_low, pivot_info
+
+
+def _detect_ma_slope(ma: np.ndarray,
+                     ) -> Tuple[np.ndarray, np.ndarray,
+                                Dict[int, Tuple[int, str, float]]]:
+    """MA-Steigungswechsel: Swing-High, wenn die MA-Steigung von positiv auf
+    <= 0 dreht (MA-Peak), Swing-Low beim Uebergang von negativ auf >= 0.
+    Event = letzte Bar des alten Vorzeichens (Peak/Tief), Confirmation =
+    aktuelle Bar (kausal)."""
+    n = len(ma)
+    is_high = np.zeros(n, dtype=bool)
+    is_low = np.zeros(n, dtype=bool)
+    pivot_info: Dict[int, Tuple[int, str, float]] = {}
+    if n < 3:
+        return is_high, is_low, pivot_info
+    slope = np.diff(ma)
+    for i in range(1, n):
+        if not np.isfinite(ma[i]) or not np.isfinite(ma[i - 1]):
+            continue
+        if i - 1 >= 1 and np.isfinite(slope[i - 2]):
+            if slope[i - 2] > 0 and slope[i - 1] <= 0:
+                is_high[i - 1] = True
+                pivot_info[i - 1] = (i, "high", float(slope[i - 1]))
+            elif slope[i - 2] < 0 and slope[i - 1] >= 0:
+                is_low[i - 1] = True
+                pivot_info[i - 1] = (i, "low", abs(float(slope[i - 1])))
+    return is_high, is_low, pivot_info
+
+
+def _detect_chande_kroll(df: pd.DataFrame, lookback: int, x_atr: float,
+                         atr: np.ndarray,
+                         ) -> Tuple[np.ndarray, np.ndarray,
+                                    Dict[int, Tuple[int, str, float]]]:
+    """Chande-Kroll-Ratchet: Trailing-Stop = Highest-High/Lowest-Low ueber
+    `lookback` ± x_atr × ATR. Verlassen des Stopps durch den Schlusskurs
+    bestaetigt das vorherige Extremum (kausal am aktuellen Bar)."""
+    n = len(df)
+    hi = df["high"].to_numpy(dtype=float)
+    lo = df["low"].to_numpy(dtype=float)
+    close = df["close"].to_numpy(dtype=float)
+    is_high = np.zeros(n, dtype=bool)
+    is_low = np.zeros(n, dtype=bool)
+    pivot_info: Dict[int, Tuple[int, str, float]] = {}
+    if n < 2:
+        return is_high, is_low, pivot_info
+    s_hi = pd.Series(hi).rolling(lookback, min_periods=1).max().to_numpy()
+    s_lo = pd.Series(lo).rolling(lookback, min_periods=1).min().to_numpy()
+    direction = 1  # 1 = Aufwaerts-Ratchet (Swing-Highs), -1 = Abwaerts
+    for i in range(1, n):
+        a = atr[i]
+        if not np.isfinite(a) or a <= 0:
+            continue
+        if direction == 1:
+            stop = s_hi[i] - x_atr * a
+            if close[i] < stop:
+                j0 = max(0, i - lookback + 1)
+                ext_idx = j0 + int(np.argmax(hi[j0:i + 1]))
+                is_high[ext_idx] = True
+                pivot_info[ext_idx] = (i, "high", s_hi[i] - stop)
+                direction = -1
+        else:
+            stop = s_lo[i] + x_atr * a
+            if close[i] > stop:
+                j0 = max(0, i - lookback + 1)
+                ext_idx = j0 + int(np.argmin(lo[j0:i + 1]))
+                is_low[ext_idx] = True
+                pivot_info[ext_idx] = (i, "low", stop - s_lo[i])
+                direction = 1
+    return is_high, is_low, pivot_info
+
+
+class SrvSwingMomentum(PluginFeature):
+    """Dynamik- & MA-Hysterese-Swings.
+
+    Stateless (Basisklassen-Vertrag): Berechnung ist eine reine Funktion
+    calculate(df, params, context) – keine eigenen Zustaende.
+    """
+
+    @property
+    def plugin_id(self) -> str:
+        return "srv_swing_momentum"
+
+    @property
+    def version(self) -> str:
+        return "1.0.0"
+
+    @property
+    def metadata(self) -> Dict[str, Any]:
+        return {
+            "category": "Swing Points/Dynamik & Filter",
+            "display_name": "Swing Momentum Service",
+            "description": "Dynamische Momentum-Swings via MA-Hysterese, Steigung & Chande Kroll",
+            "author": "PyTrader AI",
+            "tags": ["swing", "momentum", "ma", "hysteresis", "chande-kroll"],
+            # Phase 14 P14-01: Erweiterte Beschreibungsfelder
+            "description_long": "Reiner Datenlieferant (feature_store=True) für "
+                                "die Analytics-UI und ML-Pipelines. Erkennt "
+                                "Richtungswechsel über MA-Peak-Hysterese (alle "
+                                "12 MA-Typen des Templates 16.04), "
+                                "MA-Steigungswechsel und Chande-Kroll-Ratchet "
+                                "(ATR-Stopps). Keine Chart-Visualisierung in "
+                                "Kapitel 17.01.",
+            "condition_rules": [
+                "MA_Peak_Hysteresis: Pivot erst bei Gegenbewegung >= piv_maxMaMovePct %",
+                "MA_Slope_Change: Richtungswechsel der MA-Steigung (Vorzeichen des Differentials)",
+                "Chande_Kroll_Ratchet: Stopps = Highest-High/Lowest-Low über chande_lookback ± x_atr × ATR",
+                "alle 12 MA-Typen: SMA/EMA/WMA/DEMA/TEMA/HMA/EHMA/ZLEMA/RMA/KAMA/ALMA/VWMA",
+                "Causal Timestamps: event/confirmation_bar_time, confirmation_lag_bars, INSUFFICIENT_DATA",
+            ],
+            "api_version": "1",
+        }
+
+    @property
+    def capabilities(self) -> PluginCapabilities:
+        return {
+            "chart": False,   # E-5: kein Indikator in Kapitel 17.01
+            "batch": True,
+            "live": False,
+            "feature_store": True,
+            "render": False,  # E-5: reine Datenlieferanten
+        }
+
+    # --- Single Source of Truth fürs Prop-Fenster (17.01 §2.2, PineScript-Zone)
+    @property
+    def parameter_order(self) -> List[str]:
+        return list(_SWING_MOMENTUM_SCHEMA.keys())
+
+    @property
+    def param_labels(self) -> Dict[str, str]:
+        return {
+            "mode": "Algorithmus-Modus",
+            "ma_type": "Gleitender Durchschnittstyp",
+            "period": "Berechnungsperiode",
+            "piv_maxMaMovePct": "Gegenbewegung % (MA Peak Pivot)",
+            "chande_lookback": "Lookback (Chande Kroll)",
+            "x_atr": "ATR-Multiplikator (Chande Kroll Stops)",
+        }
+
+    @property
+    def parameter_schema(self) -> Dict[str, ParameterSchema]:
+        """Flache Kopie der Modul-Konstante `_SWING_MOMENTUM_SCHEMA`
+        (PineScript-Input-Zone am Dateianfang, M1: kein geteiltes Dict)."""
+        return {k: dict(v) for k, v in _SWING_MOMENTUM_SCHEMA.items()}
+
+    # 2. SCHEMA-EXPOSURE FÜR DIE UI (07.08.2026, Bugfix): Die Spalten-UI
+    # (serviceui/param_columns.py & ServiceSelectorWidget) liest Parameter-
+    # Definitionen über `default_params` / `full_parameter_schema()`. Diese
+    # expliziten Overrides stellen das Schema unabhängig von der jeweiligen
+    # parameter_schema-Definition (Property/Klassen-Attribut) bereit und
+    # erhalten den Basisklassen-Vertrag (Basis-Parameter wie lookback + 
+    # plugin-spezifische Parameter, vgl. base_plugin.PluginFeature).
+    @property
+    def default_params(self) -> Dict[str, Any]:
+        """Extrahiert die Default-Werte aus dem parameter_schema für die Engine."""
+        return {k: v.get("default") for k, v in self.parameter_schema.items()
+                if "default" in v}
+
+    def full_parameter_schema(self) -> Dict[str, ParameterSchema]:
+        """Liefert das vollständige Schema (Basis + plugin-spezifisch) inkl.
+        Min/Max/Typ für die UI-Spalten (Basisklassen-Vertrag)."""
+        merged = dict(self.base_parameter_schema)
+        merged.update(dict(self.parameter_schema or {}))
+        return merged
+
+    def calculate(
+        self,
+        df: pd.DataFrame,
+        params: Dict[str, Any],
+        context: Optional[PluginContext] = None,
+    ) -> FeatureCalculateResult:
+        """Berechnet Momentum-Swings (MA-Hysterese, Steigung, Chande Kroll).
+
+        17.01.02 (Bugfix-Runde): Echte Erkennung ersetzt den Scaffold
+        (vorher records=[], daher '0 Feature-Row(s)' im Store + irrefuehrende
+        Meldung 'Keine OHLCV-Daten' im ServiceRunWorker).
+
+        Datenvertrag (17.01 §4): JEDER Bar entspricht genau EIN Record
+        (dichte Label-Reihe). Swing-Bars tragen is_swing_high/is_swing_low
+        sowie kausale Zeitstempel. Bars am Serienanfang ohne ausreichenden
+        Lookback (MA-/ATR-Warmup) erhalten calculation_status=
+        'INSUFFICIENT_DATA' (is_swing_* = False).
+
+        Modi (params['mode']):
+          * MA_Peak_Hysteresis: MA (alle 12 Typen, Template 16.04) – Pivot
+            erst bei Gegenbewegung >= piv_maxMaMovePct % (strength PERCENT).
+          * MA_Slope_Change: Vorzeichenwechsel der MA-Steigung (strength
+            NORMALIZED, |Steigung|).
+          * Chande_Kroll_Ratchet: Trailing-Stop = Highest-High/Lowest-Low
+            ueber chande_lookback ± x_atr × ATR (strength ATR_MULTIPLE).
+        """
+        empty: FeatureCalculateResult = {"feature_store_payload": {}}
+        if df is None or df.empty:
+            return empty
+
+        # Defensive Normalisierung: 'time'-Spalte (epoch) sicherstellen.
+        work = df.copy()
+        if "time" not in work.columns:
+            if "bar_time" in work.columns:
+                work["time"] = work["bar_time"].apply(
+                    lambda v: int(v.timestamp())
+                    if hasattr(v, "timestamp") else int(v))
+            else:
+                return empty
+
+        p = self.validate_params(params)
+        mode = str(p.get("mode") or "MA_Peak_Hysteresis")
+        ma_type = str(p.get("ma_type") or "EHMA")
+        period = int(p.get("period") or 14)
+        move_pct = float(p.get("piv_maxMaMovePct") or 0.2)
+        chande_lookback = int(p.get("chande_lookback") or 10)
+        x_atr = float(p.get("x_atr") or 3.0)
+
+        n = len(work)
+        times = work["time"].to_numpy(dtype=np.int64)
+        close = work["close"].to_numpy(dtype=float)
+        atr = _atr_series(work, period).to_numpy(dtype=float)
+
+        # MA-Serie (Template 16.04, alle 12 Typen; VWMA nutzt tick_volume).
+        try:
+            from chart.indicators.utils.ma_template import MATemplateEngine
+        except Exception:
+            MATemplateEngine = None  # type: ignore
+        if MATemplateEngine is not None and ma_type in (
+                "SMA", "EMA", "WMA", "DEMA", "TEMA", "HMA", "EHMA",
+                "ZLEMA", "RMA", "KAMA", "ALMA", "VWMA"):
+            volume = work["tick_volume"] if "tick_volume" in work.columns else None
+            ma = MATemplateEngine.calculate_ma(
+                work["close"], ma_type, period, volume=volume,
+            ).to_numpy(dtype=float)
+        else:
+            # Fallback: einfacher SMA (defensiv, kein Crash).
+            ma = pd.Series(close).rolling(period, min_periods=1).mean().to_numpy()
+
+        is_high = np.zeros(n, dtype=bool)
+        is_low = np.zeros(n, dtype=bool)
+        # Kausale Bestaetigung je Swing-Bar: {idx: (conf_idx, lag, price)}
+        swing_meta: Dict[int, Tuple[int, int, float]] = {}
+        status = np.full(n, "OK", dtype=object)
+        strength = np.zeros(n, dtype=float)
+        strength_type = "NORMALIZED"
+        conf_type = "CAUSAL"
+
+        # MA-Warmup-Bars ohne Wert -> INSUFFICIENT_DATA.
+        ma_nan = ~np.isfinite(ma)
+        if ma_nan.any():
+            status[ma_nan] = "INSUFFICIENT_DATA"
+
+        if mode == "MA_Peak_Hysteresis":
+            is_high, is_low, pivot_info = _detect_ma_hysteresis(ma, move_pct)
+            strength_type = "PERCENT"
+            for idx, (conf_idx, kind, move) in pivot_info.items():
+                price = float(ma[idx])
+                swing_meta[idx] = (conf_idx, conf_idx - idx, price)
+                strength[idx] = move
+
+        elif mode == "MA_Slope_Change":
+            is_high, is_low, pivot_info = _detect_ma_slope(ma)
+            for idx, (conf_idx, _kind, move) in pivot_info.items():
+                price = float(ma[idx])
+                swing_meta[idx] = (conf_idx, conf_idx - idx, price)
+                strength[idx] = move
+
+        elif mode == "Chande_Kroll_Ratchet":
+            atr_nan = ~np.isfinite(atr)
+            if atr_nan.any():
+                status[atr_nan] = "INSUFFICIENT_DATA"
+            is_high, is_low, pivot_info = _detect_chande_kroll(
+                work, chande_lookback, x_atr, atr)
+            strength_type = "ATR_MULTIPLE"
+            for idx, (conf_idx, kind, move) in pivot_info.items():
+                price = float(work["high"].iloc[idx] if kind == "high"
+                              else work["low"].iloc[idx])
+                swing_meta[idx] = (conf_idx, conf_idx - idx, price)
+                strength[idx] = move / atr[idx] if np.isfinite(atr[idx]) and atr[idx] > 0 else 0.0
+
+        else:
+            # Unbekannter Modus: defensiv leer (kein Crash, 0 Rows).
+            return empty
+
+        # --- Records bauen (dicht: 1 Record pro Bar, 17.01 §4) ----------------
+        records: List[Dict[str, Any]] = []
+        total_high = int(is_high.sum())
+        total_low = int(is_low.sum())
+        for i in range(n):
+            is_sh = bool(is_high[i])
+            is_sl = bool(is_low[i])
+            conf_idx, lag, price = swing_meta.get(i, (i, 0, 0.0))
+            conf_idx = min(max(conf_idx, 0), n - 1)
+            if not (is_sh or is_sl):
+                price = float(close[i])
+            records.append({
+                "bar_time": int(times[i]),
+                "result_type": "SWING",
+                "source_mode": mode,
+                "calculation_status": str(status[i]),
+                "is_swing_high": is_sh,
+                "is_swing_low": is_sl,
+                "is_rejection": False,
+                "event_bar_time": int(times[i]),
+                "confirmation_bar_time": int(times[conf_idx]),
+                "confirmation_lag_bars": int(lag),
+                "confirmation_type": conf_type,
+                "price": float(price),
+                "strength_value": float(strength[i]),
+                "strength_type": strength_type,
+            })
+
+        return {
+            "feature_store_payload": {
+                "feature_id": self.plugin_id,
+                "plugin_version": self.version,
+                "records": records,
+                "metadata": {
+                    # E-7 / base_plugin (U15-A1, Invariante 5): schema_version
+                    # ist Pflichtfeld fuer alle feature_store=True-Plugins.
+                    "schema_version": "1.0.0",
+                    "source_mode": mode,
+                    "total_swing_highs": total_high,
+                    "total_swing_lows": total_low,
+                    "bars": n,
+                },
+            },
+        }
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/features/definitions/srv_swing_structure.py
+```py
+# analytics/features/definitions/srv_swing_structure.py
+# ==============================================================================
+# DEFINITION: srv_swing_structure
+# ==============================================================================
+# NAME:        Swing Structure Service
+# KATEGORIE:   Swing Points/Geometrie
+# BESCHREIBUNG: Extrahierte Swing Highs/Lows über Fraktale, Pivots, Gann & ZigZag
+# ==============================================================================
+"""
+Service: SwingStructure (Phase 17.01) – Naming Convention 16.08.01: srv_
+
+Erfasst lokale Extrema ueber Fraktale, Pivots, Gann Swings, Period Extrema
+(PDH/PWH) und ZigZag. Reiner Datenlieferant fuer die Analytics-UI und
+spaetere ML-Pipelines (XGBoost/LightGBM) – KEINE Chart-Visualisierung in
+diesem Kapitel (17.01, §1); dedizierte Chart-Indikatoren (ind_...) folgen
+erst nach statistischer Validierung der erzeugten Features.
+
+Causal Timestamping (Kein Look-ahead Bias, 17.01 §2.4):
+  * event_bar_time:        Zeitpunkt (Epoch) des tatsaechlichen Extremums.
+  * confirmation_bar_time: Zeitpunkt, an dem das Signal mathematisch/kausal
+                           feststand (bar_time der aktuellen Kerze).
+  * confirmation_lag_bars: dynamisch berechnete Differenz in Bars
+                           (params['right_bars'] bzw. Modus-Verzoegerung).
+  * Kerzen am Serienanfang ohne ausreichenden Lookback/Lookahead erhalten
+    calculation_status = 'INSUFFICIENT_DATA' und is_swing_* = False.
+
+Persistenz: feature_store_payload mit feature_id='srv_swing_structure'
+(Datenvertrag 17.01 §4). Seit 17.01 (E-1, PK-Migration) koennen mehrere
+Services konfliktfrei auf derselben Kerze gespeichert werden
+(PK (symbol, timeframe, bar_time, feature_id)).
+
+Capabilities (E-5, 07.08.2026): chart=False (kein Indikator in diesem
+Kapitel), batch=True, live=False, feature_store=True, render=False.
+metadata['category'] = 'Swing Points/Geometrie' fuer den MasterTree.
+
+PARAMETER (PineScript-Input-Zone, 17.01 §2.2): Alle Inputs/Defaults stehen
+als Modul-Konstante `_SWING_STRUCTURE_SCHEMA` direkt unter diesem Header
+(siehe dort) und sind wie in PineScript am Dateianfang anpassbar.
+`parameter_schema` gibt eine flache Kopie zurueck (M1: kein geteiltes
+mutable Dict ueber Instanzen).
+"""
+
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+from analytics.features.plugins.base_plugin import (
+    FeatureCalculateResult,
+    ParameterSchema,
+    PluginCapabilities,
+    PluginContext,
+    PluginFeature,
+)
+
+# ---------------------------------------------------------------------------
+# PARAMETER (PineScript-Input-Zone, 17.01): Single Source of Truth fuer das
+# Prop-Fenster. Inputs/Defaults stehen hier direkt am Dateianfang.
+# `parameter_schema` gibt eine flache Kopie zurueck (M1).
+# E-2 (07.08.2026): type-Werte als Strings ("int"/"float"/"str") – die
+# Basisklasse (base_plugin.validate_params) vergleicht string-basiert.
+# ---------------------------------------------------------------------------
+_SWING_STRUCTURE_SCHEMA: Dict[str, ParameterSchema] = {
+    "mode": {
+        "type": "str",
+        "default": "Williams_Fractal",
+        "options": [
+            "Williams_Fractal", "Standard_Pivot", "Gann_Mechanical",
+            "ZigZag_ATR", "ZigZag_Pct", "Period_Extrema",
+        ],
+        "description": "Erkennungs-Modus für Strukturswings",
+    },
+    "left_bars": {
+        "type": "int", "default": 2, "min": 1,
+        "description": "Anzahl erforderlicher Kerzen links mit niedrigeren Hochs / höheren Tiefs",
+        "visible_when": {"mode": ["Williams_Fractal", "Standard_Pivot", "Gann_Mechanical"]},
+    },
+    "right_bars": {
+        "type": "int", "default": 2, "min": 1,
+        "description": "Anzahl Bestätigungskerzen rechts (bestimmt dynamisch confirmation_lag_bars)",
+        "visible_when": {"mode": ["Williams_Fractal", "Standard_Pivot", "Gann_Mechanical"]},
+    },
+    "atr_period": {
+        "type": "int", "default": 14, "min": 1,
+        "description": "ATR-Periode für ZigZag_ATR",
+        "visible_when": {"mode": "ZigZag_ATR"},
+    },
+    "atr_mult": {
+        "type": "float", "default": 2.0, "min": 0.1,
+        "description": "ATR-Multiplikator für ZigZag_ATR",
+        "visible_when": {"mode": "ZigZag_ATR"},
+    },
+    "change_pct": {
+        "type": "float", "default": 0.5, "min": 0.05,
+        "description": "Mindestprozentbewegung für ZigZag_Pct",
+        "visible_when": {"mode": "ZigZag_Pct"},
+    },
+    "period_extrema_type": {
+        "type": "str",
+        "default": "PREVIOUS_CLOSED",
+        "options": ["PREVIOUS_CLOSED", "CURRENT_DEVELOPING"],
+        "description": "PREVIOUS_CLOSED (z. B. PDH/PWH final) oder CURRENT_DEVELOPING",
+        "visible_when": {"mode": "Period_Extrema"},
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Modul-Helfer (17.01.02: echte Swing-Erkennung statt Scaffold)
+# ---------------------------------------------------------------------------
+
+def _atr_series(df: pd.DataFrame, period: int) -> pd.Series:
+    """Wilder-ATR (EMA-alpha 1/period, adjust=False) ueber OHLCV.
+
+    Liefert NaN fuer Bars ohne ausreichende Historie (min_periods=period) –
+    diese Bars werden als INSUFFICIENT_DATA markiert (ZigZag_ATR).
+    """
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1.0 / max(1, period), min_periods=max(1, period),
+                  adjust=False).mean()
+
+
+def _detect_fractal(df: pd.DataFrame, left: int, right: int,
+                    ) -> Tuple[np.ndarray, np.ndarray]:
+    """Williams-Fraktal / Standard-Pivot: lokale Extrema mit links/rechts
+    tieferen Hochs bzw. hoeheren Tiefs (kausale Bestaetigung nach `right`
+    Bars). Liefert (is_swing_high, is_swing_low) als bool-Arrays."""
+    n = len(df)
+    hi = df["high"].to_numpy(dtype=float)
+    lo = df["low"].to_numpy(dtype=float)
+    is_high = np.zeros(n, dtype=bool)
+    is_low = np.zeros(n, dtype=bool)
+    for i in range(left, n - right):
+        if hi[i] > hi[i - left:i].max() and hi[i] > hi[i + 1:i + right + 1].max():
+            is_high[i] = True
+        if lo[i] < lo[i - left:i].min() and lo[i] < lo[i + 1:i + right + 1].min():
+            is_low[i] = True
+    return is_high, is_low
+
+
+def _detect_gann(df: pd.DataFrame, left: int, right: int,
+                 ) -> Tuple[np.ndarray, np.ndarray]:
+    """Gann_Mechanical: mechanische Swing-Bestaetigung – das Extremum ist
+    zugleich Fenster-Extremum UND der Schlusskurs `right` Bars spaeter liegt
+    gegen die Extremum-Richtung (Reversal bestaetigt)."""
+    n = len(df)
+    hi = df["high"].to_numpy(dtype=float)
+    lo = df["low"].to_numpy(dtype=float)
+    close = df["close"].to_numpy(dtype=float)
+    is_high = np.zeros(n, dtype=bool)
+    is_low = np.zeros(n, dtype=bool)
+    for i in range(left, n - right):
+        if (hi[i] >= hi[i - left:i + right + 1].max()
+                and close[i + right] < hi[i]):
+            is_high[i] = True
+        if (lo[i] <= lo[i - left:i + right + 1].min()
+                and close[i + right] > lo[i]):
+            is_low[i] = True
+    return is_high, is_low
+
+
+def _detect_zigzag(df: pd.DataFrame, threshold_for: Callable[[int, float], Optional[float]],
+                   ) -> Tuple[np.ndarray, np.ndarray, Dict[int, Tuple[int, str, float]]]:
+    """Klassischer ZigZag (alternierende Swings).
+
+    `threshold_for(i, ext_price)` liefert die aktuelle Umkehr-Schwelle
+    (oder None, wenn keine Umkehr moeglich ist – z.B. ATR noch NaN).
+    Rueckgabe: (is_swing_high, is_swing_low, pivot_info) – pivot_info
+    {ext_idx: (conf_idx, 'high'|'low', move_amount)} fuer die kausale
+    Bestaetigung (confirmation_bar_time = times[conf_idx]).
+    """
+    n = len(df)
+    hi = df["high"].to_numpy(dtype=float)
+    lo = df["low"].to_numpy(dtype=float)
+    is_high = np.zeros(n, dtype=bool)
+    is_low = np.zeros(n, dtype=bool)
+    pivot_info: Dict[int, Tuple[int, str, float]] = {}
+    if n < 2:
+        return is_high, is_low, pivot_info
+    direction = 1  # 1 = aufsteigend (Swing-Highs), -1 = absteigend (Swing-Lows)
+    ext_idx = 0
+    ext_price = hi[0]
+    for i in range(1, n):
+        if direction == 1:
+            if hi[i] > ext_price:
+                ext_idx, ext_price = i, hi[i]
+            else:
+                th = threshold_for(i, ext_price)
+                if th is not None and (ext_price - lo[i]) >= th:
+                    is_high[ext_idx] = True
+                    pivot_info[ext_idx] = (i, "high", ext_price - lo[i])
+                    direction = -1
+                    ext_idx, ext_price = i, lo[i]
+        else:
+            if lo[i] < ext_price:
+                ext_idx, ext_price = i, lo[i]
+            else:
+                th = threshold_for(i, ext_price)
+                if th is not None and (hi[i] - ext_price) >= th:
+                    is_low[ext_idx] = True
+                    pivot_info[ext_idx] = (i, "low", hi[i] - ext_price)
+                    direction = 1
+                    ext_idx, ext_price = i, hi[i]
+    return is_high, is_low, pivot_info
+
+
+def _detect_period_extrema(df: pd.DataFrame, extrema_type: str,
+                           ) -> Tuple[np.ndarray, np.ndarray, Dict[int, Tuple[int, int, int, float, float]]]:
+    """Period-Extrema (PDH/PWH).
+
+    * CURRENT_DEVELOPING: Flag an jeder Bar, die ein NEUES laufendes
+      Tages-Hoch/Tief setzt (event == confirmation, lag 0, CAUSAL).
+    * PREVIOUS_CLOSED: Flag an jeder Bar, die das Hoch/Tief der VORHERIGEN
+      (abgeschlossenen) Periode beruehrt (event = Vortages-Extremum-Bar,
+      confirmation = die beruehrende Bar selbst, SESSION_CLOSE).
+    Rueckgabe: (is_swing_high, is_swing_low, ext_info) – ext_info
+    {bar_idx: (event_idx, conf_idx, lag, price_high, price_low)} fuer die
+    kausale Bestaetigung der geflaggten Bars.
+    """
+    n = len(df)
+    hi = df["high"].to_numpy(dtype=float)
+    lo = df["low"].to_numpy(dtype=float)
+    times = df["time"].to_numpy(dtype=np.int64)
+    is_high = np.zeros(n, dtype=bool)
+    is_low = np.zeros(n, dtype=bool)
+    ext_info: Dict[int, Tuple[int, int, int, float, float]] = {}
+    if n == 0:
+        return is_high, is_low, ext_info
+    # pd.to_datetime(...) liefert einen DatetimeIndex (kein Series) -> .dt
+    # existiert dort nicht; der Zugriff erfolgt ueber .date (ndarray aus
+    # datetime.date-Objekten, 17.01.02 Bugfix).
+    days = pd.to_datetime(times, unit="s", utc=True).date
+    day_str = [str(d) for d in days]
+
+    if extrema_type == "CURRENT_DEVELOPING":
+        cur_day: Optional[str] = None
+        day_high = -np.inf
+        day_low = np.inf
+        for i in range(n):
+            d = day_str[i]
+            if d != cur_day:
+                cur_day, day_high, day_low = d, -np.inf, np.inf
+            if hi[i] > day_high:
+                day_high = hi[i]
+                is_high[i] = True
+                ext_info[i] = (i, i, 0, hi[i], 0.0)
+            if lo[i] < day_low:
+                day_low = lo[i]
+                is_low[i] = True
+                ext_info[i] = (i, i, 0, hi[i], lo[i])
+        return is_high, is_low, ext_info
+
+    # PREVIOUS_CLOSED: Tages-Extrema (Preis + Index + letzte Bar) sammeln
+    day_hl: Dict[str, Dict[str, Any]] = {}
+    for i in range(n):
+        d = day_str[i]
+        entry = day_hl.setdefault(d, {
+            "high": -np.inf, "low": np.inf,
+            "high_idx": i, "low_idx": i, "last_idx": i,
+        })
+        if hi[i] > entry["high"]:
+            entry["high"], entry["high_idx"] = hi[i], i
+        if lo[i] < entry["low"]:
+            entry["low"], entry["low_idx"] = lo[i], i
+        entry["last_idx"] = i
+    day_order = list(day_hl.keys())
+    for k in range(1, len(day_order)):
+        prev = day_hl[day_order[k - 1]]
+        cur_d = day_order[k]
+        for i in range(n):
+            if day_str[i] != cur_d:
+                continue
+            if hi[i] >= prev["high"]:
+                is_high[i] = True
+                # event = Vortages-Extremum-Bar, confirmation = beruehrende Bar
+                ext_info[i] = (prev["high_idx"], i, i - prev["high_idx"],
+                               prev["high"], prev["low"])
+            if lo[i] <= prev["low"]:
+                is_low[i] = True
+                ext_info[i] = (prev["low_idx"], i, i - prev["low_idx"],
+                               prev["high"], prev["low"])
+    return is_high, is_low, ext_info
+
+
+class SrvSwingStructure(PluginFeature):
+    """Geometrische & Preis-Swings (Fraktale, Pivots, Gann, ZigZag).
+
+    Stateless (Basisklassen-Vertrag): Berechnung ist eine reine Funktion
+    calculate(df, params, context) – keine eigenen Zustaende.
+    """
+
+    @property
+    def plugin_id(self) -> str:
+        return "srv_swing_structure"
+
+    @property
+    def version(self) -> str:
+        return "1.0.0"
+
+    @property
+    def metadata(self) -> Dict[str, Any]:
+        return {
+            "category": "Swing Points/Geometrie",
+            "display_name": "Swing Structure Service",
+            "description": "Erfasst Fraktal-, Pivot-, Gann- und ZigZag-Extrema für die Struktur-Analyse",
+            "author": "PyTrader AI",
+            "tags": ["swing", "fractal", "pivot", "zigzag", "structure"],
+            # Phase 14 P14-01: Erweiterte Beschreibungsfelder
+            "description_long": "Reiner Datenlieferant (feature_store=True) für "
+                                "die Analytics-UI und ML-Pipelines. Erkennt "
+                                "lokale Extrema über Williams-Fraktale, "
+                                "Standard-Pivots, Gann-Mechanik, ZigZag "
+                                "(ATR/Prozent) und Period-Extrema (PDH/PWH). "
+                                "Keine Chart-Visualisierung in Kapitel 17.01.",
+            "condition_rules": [
+                "Williams_Fractal: high[i] > high[i±k] / low[i] < low[i±k] für k in 1..left/right_bars",
+                "Standard_Pivot: lokales Extremum mit links/rechts tieferen Hochs bzw. höheren Tiefs",
+                "Gann_Mechanical: mechanische Swing-Bestätigung über links/rechts-Zählung",
+                "ZigZag_ATR: Richtungswechsel erst bei |move| >= atr_mult × ATR(atr_period)",
+                "ZigZag_Pct: Richtungswechsel erst bei |move| >= change_pct %",
+                "Period_Extrema: PDH/PWH (PREVIOUS_CLOSED) bzw. laufende Periode (CURRENT_DEVELOPING)",
+                "Causal Timestamps: event/confirmation_bar_time, confirmation_lag_bars, INSUFFICIENT_DATA",
+            ],
+            "api_version": "1",
+        }
+
+    @property
+    def capabilities(self) -> PluginCapabilities:
+        return {
+            "chart": False,   # E-5: kein Indikator in Kapitel 17.01
+            "batch": True,
+            "live": False,
+            "feature_store": True,
+            "render": False,  # E-5: reine Datenlieferanten
+        }
+
+    # --- Single Source of Truth fürs Prop-Fenster (17.01 §2.2, PineScript-Zone)
+    @property
+    def parameter_order(self) -> List[str]:
+        return list(_SWING_STRUCTURE_SCHEMA.keys())
+
+    @property
+    def param_labels(self) -> Dict[str, str]:
+        return {
+            "mode": "Erkennungs-Modus",
+            "left_bars": "Kerzen links",
+            "right_bars": "Kerzen rechts (Bestätigung)",
+            "atr_period": "ATR-Periode (ZigZag_ATR)",
+            "atr_mult": "ATR-Multiplikator (ZigZag_ATR)",
+            "change_pct": "Mindestbewegung % (ZigZag_Pct)",
+            "period_extrema_type": "Period-Extrema-Typ",
+        }
+
+    @property
+    def parameter_schema(self) -> Dict[str, ParameterSchema]:
+        """Flache Kopie der Modul-Konstante `_SWING_STRUCTURE_SCHEMA`
+        (PineScript-Input-Zone am Dateianfang, M1: kein geteiltes Dict)."""
+        return {k: dict(v) for k, v in _SWING_STRUCTURE_SCHEMA.items()}
+
+    # 2. SCHEMA-EXPOSURE FÜR DIE UI (07.08.2026, Bugfix): Die Spalten-UI
+    # (serviceui/param_columns.py & ServiceSelectorWidget) liest Parameter-
+    # Definitionen über `default_params` / `full_parameter_schema()`. Diese
+    # expliziten Overrides stellen das Schema unabhängig von der jeweiligen
+    # parameter_schema-Definition (Property/Klassen-Attribut) bereit und
+    # erhalten den Basisklassen-Vertrag (Basis-Parameter wie lookback + 
+    # plugin-spezifische Parameter, vgl. base_plugin.PluginFeature).
+    @property
+    def default_params(self) -> Dict[str, Any]:
+        """Extrahiert die Default-Werte aus dem parameter_schema für die Engine."""
+        return {k: v.get("default") for k, v in self.parameter_schema.items()
+                if "default" in v}
+
+    def full_parameter_schema(self) -> Dict[str, ParameterSchema]:
+        """Liefert das vollständige Schema (Basis + plugin-spezifisch) inkl.
+        Min/Max/Typ für die UI-Spalten (Basisklassen-Vertrag)."""
+        merged = dict(self.base_parameter_schema)
+        merged.update(dict(self.parameter_schema or {}))
+        return merged
+
+    def calculate(
+        self,
+        df: pd.DataFrame,
+        params: Dict[str, Any],
+        context: Optional[PluginContext] = None,
+    ) -> FeatureCalculateResult:
+        """Berechnet Struktur-Swings (Fraktale/Pivots/Gann/ZigZag/Period).
+
+        17.01.02 (Bugfix-Runde): Die echte Swing-Erkennung ersetzt den
+        Scaffold (vorher records=[], daher '0 Feature-Row(s)' im Store).
+
+        Datenvertrag (17.01 §4): JEDER Bar entspricht genau EIN Record
+        (dichte Label-Reihe fuer ML/Analytics). Swing-Bars tragen
+        is_swing_high/is_swing_low=True sowie kausale Zeitstempel
+        (event/confirmation_bar_time, confirmation_lag_bars). Bars am
+        Serienanfang ohne ausreichenden Lookback/Lookahead erhalten
+        calculation_status='INSUFFICIENT_DATA' (is_swing_* = False).
+
+        Modi (params['mode']):
+          * Williams_Fractal: lokale Extrema mit links/rechts tieferen Hochs
+            bzw. hoeheren Tiefs (left/right_bars), Bestaetigung nach right_bars.
+          * Standard_Pivot: identische Extremum-Logik (Pivot = Fraktal mit
+            konfigurierbaren Fenstern).
+          * Gann_Mechanical: Fenster-Extremum + Schlusskurs-Reversal
+            (`right` Bars spaeter) gegen die Extremum-Richtung.
+          * ZigZag_ATR: Richtungswechsel erst bei |move| >= atr_mult × ATR.
+          * ZigZag_Pct: Richtungswechsel erst bei |move| >= change_pct %.
+          * Period_Extrema: PDH/PWH (PREVIOUS_CLOSED = Vortages-Level-Touch)
+            bzw. laufende Periode (CURRENT_DEVELOPING = neue Tages-Extrema).
+        """
+        empty: FeatureCalculateResult = {"feature_store_payload": {}}
+        if df is None or df.empty:
+            return empty
+
+        # Defensive Normalisierung: 'time'-Spalte (epoch) sicherstellen.
+        work = df.copy()
+        if "time" not in work.columns:
+            if "bar_time" in work.columns:
+                work["time"] = work["bar_time"].apply(
+                    lambda v: int(v.timestamp())
+                    if hasattr(v, "timestamp") else int(v))
+            else:
+                return empty
+
+        p = self.validate_params(params)
+        mode = str(p.get("mode") or "Williams_Fractal")
+        left = int(p.get("left_bars") or 2)
+        right = int(p.get("right_bars") or 2)
+        atr_period = int(p.get("atr_period") or 14)
+        atr_mult = float(p.get("atr_mult") or 2.0)
+        change_pct = float(p.get("change_pct") or 0.5)
+        extrema_type = str(p.get("period_extrema_type") or "PREVIOUS_CLOSED")
+
+        n = len(work)
+        times = work["time"].to_numpy(dtype=np.int64)
+        close = work["close"].to_numpy(dtype=float)
+        atr = _atr_series(work, atr_period).to_numpy(dtype=float)
+
+        is_high = np.zeros(n, dtype=bool)
+        is_low = np.zeros(n, dtype=bool)
+        # Kausale Bestaetigung je Swing-Bar: {idx: (event_idx, conf_idx,
+        # lag, price)} – event = tatsaechliches Extremum, conf = kausale
+        # Feststellung (fuer PREVIOUS_CLOSED liegt event VOR der Flag-Bar).
+        swing_meta: Dict[int, Tuple[int, int, int, float]] = {}
+        status = np.full(n, "OK", dtype=object)
+        strength = np.zeros(n, dtype=float)
+        strength_type = "NORMALIZED"
+        conf_type = "PIVOT"
+
+        if mode in ("Williams_Fractal", "Standard_Pivot"):
+            is_high, is_low = _detect_fractal(work, left, right)
+            status[:left] = "INSUFFICIENT_DATA"
+            status[n - right:] = "INSUFFICIENT_DATA"
+            conf_type = "FRACTAL" if mode == "Williams_Fractal" else "PIVOT"
+            for i in range(n):
+                if not (is_high[i] or is_low[i]):
+                    continue
+                conf = min(i + right, n - 1)
+                price = float(work["high"].iloc[i] if is_high[i]
+                              else work["low"].iloc[i])
+                swing_meta[i] = (i, conf, right, price)
+                if np.isfinite(atr[i]) and atr[i] > 0:
+                    strength[i] = abs(
+                        price - (float(work["low"].iloc[i])
+                                 if is_high[i] else float(work["high"].iloc[i]))
+                    ) / atr[i]
+                    strength_type = "ATR_MULTIPLE"
+
+        elif mode == "Gann_Mechanical":
+            is_high, is_low = _detect_gann(work, left, right)
+            status[:left] = "INSUFFICIENT_DATA"
+            status[n - right:] = "INSUFFICIENT_DATA"
+            conf_type = "PIVOT"
+            for i in range(n):
+                if not (is_high[i] or is_low[i]):
+                    continue
+                conf = min(i + right, n - 1)
+                price = float(work["high"].iloc[i] if is_high[i]
+                              else work["low"].iloc[i])
+                swing_meta[i] = (i, conf, right, price)
+                if np.isfinite(atr[i]) and atr[i] > 0:
+                    strength[i] = abs(
+                        price - (float(work["low"].iloc[i])
+                                 if is_high[i] else float(work["high"].iloc[i]))
+                    ) / atr[i]
+                    strength_type = "ATR_MULTIPLE"
+
+        elif mode == "ZigZag_ATR":
+            def _thr_atr(i: int, _ext_price: float) -> Optional[float]:
+                if not np.isfinite(atr[i]):
+                    return None
+                return atr_mult * atr[i]
+
+            is_high, is_low, pivot_info = _detect_zigzag(work, _thr_atr)
+            status[~np.isfinite(atr)] = "INSUFFICIENT_DATA"
+            conf_type = "CAUSAL"
+            strength_type = "ATR_MULTIPLE"
+            for idx, (conf_idx, kind, move) in pivot_info.items():
+                price = float(work["high"].iloc[idx] if kind == "high"
+                              else work["low"].iloc[idx])
+                swing_meta[idx] = (idx, conf_idx, conf_idx - idx, price)
+                strength[idx] = move / atr[idx] if np.isfinite(atr[idx]) and atr[idx] > 0 else 0.0
+
+        elif mode == "ZigZag_Pct":
+            def _thr_pct(_i: int, ext_price: float) -> Optional[float]:
+                return abs(ext_price) * change_pct / 100.0
+
+            is_high, is_low, pivot_info = _detect_zigzag(work, _thr_pct)
+            conf_type = "CAUSAL"
+            strength_type = "PERCENT"
+            for idx, (conf_idx, kind, move) in pivot_info.items():
+                price = float(work["high"].iloc[idx] if kind == "high"
+                              else work["low"].iloc[idx])
+                swing_meta[idx] = (idx, conf_idx, conf_idx - idx, price)
+                strength[idx] = (move / price * 100.0) if price else 0.0
+
+        elif mode == "Period_Extrema":
+            is_high, is_low, ext_info = _detect_period_extrema(work, extrema_type)
+            status[0] = "INSUFFICIENT_DATA"  # erste Bar ohne Vortag/Historie
+            conf_type = "CAUSAL" if extrema_type == "CURRENT_DEVELOPING" \
+                else "SESSION_CLOSE"
+            strength_type = "PRICE_DISTANCE"
+            for idx, (event_idx, conf_idx, lag, price_high, price_low) in ext_info.items():
+                price = float(price_high if is_high[idx] else price_low)
+                swing_meta[idx] = (event_idx, conf_idx, lag, price)
+                strength[idx] = abs(
+                    float(work["high"].iloc[idx] if is_high[idx]
+                          else work["low"].iloc[idx]) - price)
+
+        else:
+            # Unbekannter Modus: defensiv leer (kein Crash, 0 Rows).
+            return empty
+
+        # --- Records bauen (dicht: 1 Record pro Bar, 17.01 §4) ----------------
+        records: List[Dict[str, Any]] = []
+        total_high = int(is_high.sum())
+        total_low = int(is_low.sum())
+        for i in range(n):
+            is_sh = bool(is_high[i])
+            is_sl = bool(is_low[i])
+            event_idx, conf_idx, lag, price = swing_meta.get(i, (i, i, 0, 0.0))
+            event_idx = min(max(event_idx, 0), n - 1)
+            conf_idx = min(max(conf_idx, 0), n - 1)
+            if not (is_sh or is_sl):
+                price = float(close[i])
+            records.append({
+                "bar_time": int(times[i]),
+                "result_type": "SWING",
+                "source_mode": mode,
+                "calculation_status": str(status[i]),
+                "is_swing_high": is_sh,
+                "is_swing_low": is_sl,
+                "is_rejection": False,
+                "event_bar_time": int(times[event_idx]),
+                "confirmation_bar_time": int(times[conf_idx]),
+                "confirmation_lag_bars": int(lag),
+                "confirmation_type": conf_type,
+                "price": float(price),
+                "strength_value": float(strength[i]),
+                "strength_type": strength_type,
+            })
+
+        return {
+            "feature_store_payload": {
+                "feature_id": self.plugin_id,
+                "plugin_version": self.version,
+                "records": records,
+                "metadata": {
+                    # E-7 / base_plugin (U15-A1, Invariante 5): schema_version
+                    # ist Pflichtfeld fuer alle feature_store=True-Plugins.
+                    "schema_version": "1.0.0",
+                    "source_mode": mode,
+                    "total_swing_highs": total_high,
+                    "total_swing_lows": total_low,
+                    "bars": n,
+                },
+            },
+        }
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/features/definitions/srv_swing_volume_profile.py
+```py
+# analytics/features/definitions/srv_swing_volume_profile.py
+# ==============================================================================
+# DEFINITION: srv_swing_volume_profile
+# ==============================================================================
+# NAME:        Swing Volume Profile Service
+# KATEGORIE:   Swing Points/Volumen & Grid
+# BESCHREIBUNG: Berechnet POC/VAH/VAL, LVN-Rejections, Grid-Proximity und Anchored VWAP
+# ==============================================================================
+"""
+Service: SwingVolumeProfile (Phase 17.01) – Naming Convention 16.08.01: srv_
+
+Berechnet POC/VAH/VAL, Low Volume Nodes (LVNs), Raster-Annäherungen
+(Grid_Proximity) und Anchored VWAP Bänder. Reiner Datenlieferant fuer die
+Analytics-UI und spaetere ML-Pipelines – KEINE Chart-Visualisierung in
+diesem Kapitel (17.01, §1).
+
+Causal Timestamping (Kein Look-ahead Bias, 17.01 §2.4):
+  * event_bar_time:        Zeitpunkt des tatsaechlichen Extremums (z. B.
+                           Session_Start beim Anchored VWAP).
+  * confirmation_bar_time: Zeitpunkt, an dem das Signal kausal feststand.
+  * confirmation_lag_bars: dynamische Differenz in Bars (Modus-Verzoegerung).
+  * Profile am Serienanfang ohne ausreichenden Lookback erhalten
+    calculation_status = 'INSUFFICIENT_DATA'.
+
+Persistenz: feature_store_payload mit feature_id='srv_swing_volume_profile'
+(Datenvertrag 17.01 §4, modus-spezifische Zusatzfelder §4.2). Seit 17.01
+(E-1, PK-Migration) koennen mehrere Services konfliktfrei auf derselben
+Kerze gespeichert werden.
+
+Capabilities (E-5, 07.08.2026): chart=False, batch=True, live=False,
+feature_store=True, render=False.
+metadata['category'] = 'Swing Points/Volumen & Grid' fuer den MasterTree.
+
+PARAMETER (PineScript-Input-Zone, 17.01 §2.2): Alle Inputs/Defaults stehen
+als Modul-Konstante `_SWING_VOLUME_PROFILE_SCHEMA` direkt unter diesem Header.
+`parameter_schema` gibt eine flache Kopie zurueck (M1).
+E-2 (07.08.2026): type-Werte als Strings.
+
+Hinweis (17.01.02): 'Sessions' wird ohne Session-Kalender als Kalendertag
+(24h-Periode) behandelt – Dokumentation der Vereinfachung fuer den
+Batch-Datenlieferanten.
+"""
+
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+from analytics.features.plugins.base_plugin import (
+    FeatureCalculateResult,
+    ParameterSchema,
+    PluginCapabilities,
+    PluginContext,
+    PluginFeature,
+)
+
+# ---------------------------------------------------------------------------
+# PARAMETER (PineScript-Input-Zone, 17.01): Single Source of Truth fuer das
+# Prop-Fenster. Inputs/Defaults stehen hier direkt am Dateianfang.
+# `parameter_schema` gibt eine flache Kopie zurueck (M1).
+# E-2 (07.08.2026): type-Werte als Strings.
+# ---------------------------------------------------------------------------
+_SWING_VOLUME_PROFILE_SCHEMA: Dict[str, ParameterSchema] = {
+    "mode": {
+        "type": "str",
+        "default": "Volume_Profile",
+        "options": ["Volume_Profile", "Grid_Proximity", "Anchored_VWAP"],
+        "description": "Haupt-Berechnungsmodus",
+    },
+    "profile_period": {
+        "type": "str",
+        "default": "Sessions",
+        "options": ["Bars", "Sessions", "Days", "Weeks", "Months"],
+        "description": "Profil-Zeitraum (nur aktiv bei mode == 'Volume_Profile')",
+        "visible_when": {"mode": "Volume_Profile"},
+    },
+    "period_val": {
+        "type": "int", "default": 1, "min": 1,
+        "description": "Multiplier für profile_period",
+        "visible_when": {"mode": "Volume_Profile"},
+    },
+    "volume_source": {
+        "type": "str",
+        "default": "tick_volume",
+        "options": ["tick_volume", "real_volume"],
+        "description": "Volumenquelle aus MT5 (standardmäßig tick_volume)",
+        "visible_when": {"mode": "Volume_Profile"},
+    },
+    "volume_thresh_pct": {
+        "type": "float", "default": 5.0, "min": 0.5,
+        "description": "Mindestvolumenanteil in % für Cluster",
+        "visible_when": {"mode": "Volume_Profile"},
+    },
+    "value_area_pct": {
+        "type": "float", "default": 0.70, "min": 0.1, "max": 1.0,
+        "description": "Value Area Abdeckung (0.70 = 70%)",
+        "visible_when": {"mode": "Volume_Profile"},
+    },
+    "lvn_sensitivity": {
+        "type": "float", "default": 0.20, "min": 0.05,
+        "description": "Schwellwert für Low Volume Nodes",
+        "visible_when": {"mode": "Volume_Profile"},
+    },
+    "grid_step": {
+        "type": "float", "default": 0.5, "min": 0.01,
+        "description": "Rasterabstand (nur bei mode == 'Grid_Proximity')",
+        "visible_when": {"mode": "Grid_Proximity"},
+    },
+    "vwap_anchor": {
+        "type": "str",
+        "default": "Session_Start",
+        "options": ["Session_Start", "Week_Start", "Month_Start"],
+        "description": "Ankerpunkt (nur bei mode == 'Anchored_VWAP')",
+        "visible_when": {"mode": "Anchored_VWAP"},
+    },
+    "vwap_band_mult": {
+        "type": "float", "default": 2.0, "min": 0.1,
+        "description": "StDev-Multiplikator für VWAP-Bänder",
+        "visible_when": {"mode": "Anchored_VWAP"},
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Modul-Helfer (17.01.02: echte Erkennung statt Scaffold)
+# ---------------------------------------------------------------------------
+
+def _volume_series(work: pd.DataFrame, source: str) -> np.ndarray:
+    """Volumen-Serie (tick_volume/real_volume); fehlt die Spalte, Fallback
+    auf gleichbleibendes Volumen 1.0 (defensiv, kein Crash)."""
+    col = "real_volume" if source == "real_volume" else "tick_volume"
+    if col in work.columns:
+        v = pd.to_numeric(work[col], errors="coerce").fillna(0.0).to_numpy()
+    else:
+        v = np.ones(len(work), dtype=float)
+    return v
+
+
+def _profile_for(hi: np.ndarray, lo: np.ndarray, close: np.ndarray,
+                 vol: np.ndarray, value_area_pct: float,
+                 lvn_sensitivity: float, n_bins: int = 80,
+                 ) -> Optional[Tuple[float, float, float, List[float],
+                                     float, float]]:
+    """Baut ein Volume-Profil ueber die uebergebenen Bars (entwickelnd).
+
+    Rueckgabe: (poc_price, vah_price, val_price, lvn_prices, total_vol,
+    max_bin_vol) oder None, wenn kein sinnvolles Profil konstruierbar ist
+    (weniger als 2 Bars, flache Range oder Null-Gesamtvolumen)."""
+    n = len(hi)
+    if n < 2:
+        return None
+    hi_min = float(np.nanmin(hi))
+    lo_max = float(np.nanmax(lo))
+    lo_min = float(np.nanmin(lo))
+    hi_max = float(np.nanmax(hi))
+    total = float(np.sum(vol))
+    if not np.isfinite(total) or total <= 0.0:
+        return None
+    lower = lo_min
+    upper = hi_max
+    if not (np.isfinite(lower) and np.isfinite(upper)) or upper <= lower:
+        return None
+    edges = np.linspace(lower, upper, n_bins + 1)
+    typ = (hi + lo + close) / 3.0
+    idx = np.clip(np.floor((typ - lower) / (upper - lower) * n_bins),
+                  0, n_bins - 1).astype(int)
+    bins_vol = np.zeros(n_bins, dtype=float)
+    np.add.at(bins_vol, idx, vol)
+    poc_bin = int(np.argmax(bins_vol))
+    poc = float((edges[poc_bin] + edges[poc_bin + 1]) / 2.0)
+    max_vol = float(bins_vol[poc_bin])
+    # Value Area: ab POC beidseitig expandieren bis value_area_pct erreicht.
+    cum = bins_vol[poc_bin]
+    lo_b = hi_b = poc_bin
+    target = total * float(value_area_pct)
+    while cum < target and (lo_b > 0 or hi_b < n_bins - 1):
+        left_v = bins_vol[lo_b - 1] if lo_b > 0 else -1.0
+        right_v = bins_vol[hi_b + 1] if hi_b < n_bins - 1 else -1.0
+        if lo_b > 0 and left_v >= right_v:
+            lo_b -= 1
+            cum += left_v
+        elif hi_b < n_bins - 1:
+            hi_b += 1
+            cum += right_v
+        else:
+            break
+    vah = float(edges[hi_b + 1])
+    val = float(edges[lo_b])
+    # LVN: Bins mit Volumen < lvn_sensitivity × POC-Volumen (aber > 0).
+    lvn_mask = (bins_vol > 0.0) & (bins_vol < lvn_sensitivity * max_vol)
+    lvn_prices = [float((edges[b] + edges[b + 1]) / 2.0)
+                  for b in np.where(lvn_mask)[0]]
+    return poc, vah, val, lvn_prices, total, max_vol
+
+
+def _group_ids(times: np.ndarray, spec: str, period_val: int,
+               ) -> np.ndarray:
+    """Gruppen-IDs je Bar fuer die Profilperioden.
+
+    * Bars:     i // period_val
+    * Sessions: Kalendertag (Vereinfachung ohne Session-Kalender, 24h).
+    * Days:     Kalendertag.
+    * Weeks:    ISO-Jahr-Woche.
+    * Months:   Kalender-Jahr-Monat.
+    """
+    n = len(times)
+    if spec == "Bars":
+        return np.floor(np.arange(n) / max(1, int(period_val))).astype(np.int64)
+    # pd.to_datetime(...) liefert einen DatetimeIndex (kein Series) -> .dt
+    # existiert dort nicht; die Formatierung erfolgt direkt via .strftime
+    # (17.01.02 Bugfix, identisch zu srv_swing_structure).
+    dates = pd.to_datetime(times, unit="s", utc=True)
+    if spec in ("Sessions", "Days"):
+        return dates.strftime("%Y-%m-%d").to_numpy()
+    if spec == "Weeks":
+        return dates.strftime("%G-W%V").to_numpy()
+    if spec == "Months":
+        return dates.strftime("%Y-%m").to_numpy()
+    return dates.strftime("%Y-%m-%d").to_numpy()
+
+
+def _anchored_vwap(work: pd.DataFrame, times: np.ndarray, vol: np.ndarray,
+                   anchor: str, band_mult: float,
+                   ) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
+                              np.ndarray, np.ndarray]:
+    """Anchored VWAP (entwickelnd ab Perioden-Start).
+
+    Rueckgabe: (vwap, upper, lower, anchor_idx, stdev). anchor_idx[i] =
+    Index der Anker-Bar (Session/Week/Month-Start), 0 fuer die erste Bar.
+    """
+    n = len(work)
+    hi = work["high"].to_numpy(dtype=float)
+    lo = work["low"].to_numpy(dtype=float)
+    close = work["close"].to_numpy(dtype=float)
+    typ = (hi + lo + close) / 3.0
+    if anchor == "Week_Start":
+        spec = "Weeks"
+    elif anchor == "Month_Start":
+        spec = "Months"
+    else:
+        spec = "Sessions"
+    groups = _group_ids(times, spec, 1)
+    # Neue Periode erkennen (causal: letzte Gruppe bis i).
+    new_period = np.zeros(n, dtype=bool)
+    new_period[0] = True
+    for i in range(1, n):
+        if groups[i] != groups[i - 1]:
+            new_period[i] = True
+    anchor_idx = np.zeros(n, dtype=np.int64)
+    cur = 0
+    for i in range(n):
+        if new_period[i]:
+            cur = i
+        anchor_idx[i] = cur
+    # Kumulativ ab Anker: Summe(typ*vol) / Summe(vol).
+    cum_pv = np.zeros(n, dtype=float)
+    cum_v = np.zeros(n, dtype=float)
+    pv = 0.0
+    cv = 0.0
+    for i in range(n):
+        if new_period[i]:
+            pv = 0.0
+            cv = 0.0
+        pv += typ[i] * vol[i]
+        cv += vol[i]
+        cum_pv[i] = pv
+        cum_v[i] = cv
+    vwap = np.where(cum_v > 0.0, cum_pv / np.maximum(cum_v, 1e-12), 0.0)
+    # Entwickelnde Varianz (gewichtete Quadrat-Abweichung ab Anker).
+    dev2 = ((typ - vwap) ** 2) * vol
+    cum_d2 = np.zeros(n, dtype=float)
+    cd2 = 0.0
+    for i in range(n):
+        if new_period[i]:
+            cd2 = 0.0
+        cd2 += dev2[i]
+        cum_d2[i] = cd2
+    var = np.where(cum_v > 0.0, cum_d2 / np.maximum(cum_v, 1e-12), 0.0)
+    stdev = np.sqrt(np.maximum(var, 0.0))
+    upper = vwap + band_mult * stdev
+    lower = vwap - band_mult * stdev
+    return vwap, upper, lower, anchor_idx, stdev
+
+
+class SrvSwingVolumeProfile(PluginFeature):
+    """Volumen-, Grid- & VWAP-Swings.
+
+    Stateless (Basisklassen-Vertrag): Berechnung ist eine reine Funktion
+    calculate(df, params, context) – keine eigenen Zustaende.
+    """
+
+    @property
+    def plugin_id(self) -> str:
+        return "srv_swing_volume_profile"
+
+    @property
+    def version(self) -> str:
+        return "1.0.0"
+
+    @property
+    def metadata(self) -> Dict[str, Any]:
+        return {
+            "category": "Swing Points/Volumen & Grid",
+            "display_name": "Swing Volume Profile Service",
+            "description": "Volumengewichtetes Profil mit POC/VAH/VAL, LVNs, Grid & Anchored VWAP",
+            "author": "PyTrader AI",
+            "tags": ["swing", "volume", "profile", "lvn", "vwap", "grid"],
+            # Phase 14 P14-01: Erweiterte Beschreibungsfelder
+            "description_long": "Reiner Datenlieferant (feature_store=True) für "
+                                "die Analytics-UI und ML-Pipelines. Berechnet "
+                                "POC/VAH/VAL und Low Volume Nodes (LVNs) je "
+                                "Profil, Raster-Annäherungen (Grid_Proximity) "
+                                "und Anchored-VWAP-Bänder. Keine "
+                                "Chart-Visualisierung in Kapitel 17.01.",
+            "condition_rules": [
+                "Volume_Profile: POC/VAH/VAL über value_area_pct, Cluster ab volume_thresh_pct, LVNs ab lvn_sensitivity",
+                "Grid_Proximity: Abstand des Preises zum naechsten Rasterlevel (grid_step)",
+                "Anchored_VWAP: VWAP ab Session/Week/Month_Start ± vwap_band_mult × StDev",
+                "volume_source: tick_volume (Standard) oder real_volume",
+                "Causal Timestamps: event/confirmation_bar_time, confirmation_lag_bars, INSUFFICIENT_DATA/MISSING_MTF_CONTEXT",
+            ],
+            "api_version": "1",
+        }
+
+    @property
+    def capabilities(self) -> PluginCapabilities:
+        return {
+            "chart": False,   # E-5: kein Indikator in Kapitel 17.01
+            "batch": True,
+            "live": False,
+            "feature_store": True,
+            "render": False,  # E-5: reine Datenlieferanten
+        }
+
+    # --- Single Source of Truth fürs Prop-Fenster (17.01 §2.2, PineScript-Zone)
+    @property
+    def parameter_order(self) -> List[str]:
+        return list(_SWING_VOLUME_PROFILE_SCHEMA.keys())
+
+    @property
+    def param_labels(self) -> Dict[str, str]:
+        return {
+            "mode": "Haupt-Berechnungsmodus",
+            "profile_period": "Profil-Zeitraum (Volume_Profile)",
+            "period_val": "Multiplier (Profil-Zeitraum)",
+            "volume_source": "Volumenquelle",
+            "volume_thresh_pct": "Mindestvolumenanteil % (Cluster)",
+            "value_area_pct": "Value Area Abdeckung",
+            "lvn_sensitivity": "LVN-Schwellwert",
+            "grid_step": "Rasterabstand (Grid_Proximity)",
+            "vwap_anchor": "VWAP-Ankerpunkt",
+            "vwap_band_mult": "VWAP-Band-Multiplikator",
+        }
+
+    @property
+    def parameter_schema(self) -> Dict[str, ParameterSchema]:
+        """Flache Kopie der Modul-Konstante `_SWING_VOLUME_PROFILE_SCHEMA`
+        (PineScript-Input-Zone am Dateianfang, M1: kein geteiltes Dict)."""
+        return {k: dict(v) for k, v in _SWING_VOLUME_PROFILE_SCHEMA.items()}
+
+    # 2. SCHEMA-EXPOSURE FÜR DIE UI (07.08.2026, Bugfix): Die Spalten-UI
+    # (serviceui/param_columns.py & ServiceSelectorWidget) liest Parameter-
+    # Definitionen über `default_params` / `full_parameter_schema()`. Diese
+    # expliziten Overrides stellen das Schema unabhängig von der jeweiligen
+    # parameter_schema-Definition (Property/Klassen-Attribut) bereit und
+    # erhalten den Basisklassen-Vertrag (Basis-Parameter wie lookback + 
+    # plugin-spezifische Parameter, vgl. base_plugin.PluginFeature).
+    @property
+    def default_params(self) -> Dict[str, Any]:
+        """Extrahiert die Default-Werte aus dem parameter_schema für die Engine."""
+        return {k: v.get("default") for k, v in self.parameter_schema.items()
+                if "default" in v}
+
+    def full_parameter_schema(self) -> Dict[str, ParameterSchema]:
+        """Liefert das vollständige Schema (Basis + plugin-spezifisch) inkl.
+        Min/Max/Typ für die UI-Spalten (Basisklassen-Vertrag)."""
+        merged = dict(self.base_parameter_schema)
+        merged.update(dict(self.parameter_schema or {}))
+        return merged
+
+    def calculate(
+        self,
+        df: pd.DataFrame,
+        params: Dict[str, Any],
+        context: Optional[PluginContext] = None,
+    ) -> FeatureCalculateResult:
+        """Berechnet Volume-Profile/Grid/VWAP-Swings.
+
+        17.01.02 (Bugfix-Runde): Echte Erkennung ersetzt den Scaffold
+        (vorher records=[], daher '0 Feature-Row(s)' im Store + irrefuehrende
+        Meldung 'Keine OHLCV-Daten' im ServiceRunWorker).
+
+        Datenvertrag (17.01 §4): JEDER Bar entspricht genau EIN Record.
+        Modus-spezifische Zusatzfelder (§4.2):
+          * Volume_Profile:  volume_source, poc_price, vah_price, val_price,
+                             lvn_price, is_lvn_swing (result_type LEVEL).
+          * Grid_Proximity:  grid_price (result_type LEVEL).
+          * Anchored_VWAP:   vwap_price, vwap_upper, vwap_lower
+                             (result_type VWAP).
+        """
+        empty: FeatureCalculateResult = {"feature_store_payload": {}}
+        if df is None or df.empty:
+            return empty
+
+        # Defensive Normalisierung: 'time'-Spalte (epoch) sicherstellen.
+        work = df.copy()
+        if "time" not in work.columns:
+            if "bar_time" in work.columns:
+                work["time"] = work["bar_time"].apply(
+                    lambda v: int(v.timestamp())
+                    if hasattr(v, "timestamp") else int(v))
+            else:
+                return empty
+
+        p = self.validate_params(params)
+        mode = str(p.get("mode") or "Volume_Profile")
+        profile_period = str(p.get("profile_period") or "Sessions")
+        period_val = int(p.get("period_val") or 1)
+        volume_source = str(p.get("volume_source") or "tick_volume")
+        value_area_pct = float(p.get("value_area_pct") or 0.70)
+        lvn_sensitivity = float(p.get("lvn_sensitivity") or 0.20)
+        grid_step = float(p.get("grid_step") or 0.5)
+        vwap_anchor = str(p.get("vwap_anchor") or "Session_Start")
+        vwap_band_mult = float(p.get("vwap_band_mult") or 2.0)
+
+        n = len(work)
+        times = work["time"].to_numpy(dtype=np.int64)
+        close = work["close"].to_numpy(dtype=float)
+        hi = work["high"].to_numpy(dtype=float)
+        lo = work["low"].to_numpy(dtype=float)
+        vol = _volume_series(work, volume_source)
+
+        records: List[Dict[Any, Any]] = []
+        total_high = 0
+        total_low = 0
+
+        if mode == "Volume_Profile":
+            groups = _group_ids(times, profile_period, period_val)
+            # Serienanfang: erste Bar jeder Gruppe ohne Historie.
+            is_first = np.zeros(n, dtype=bool)
+            is_first[0] = True
+            for i in range(1, n):
+                if groups[i] != groups[i - 1]:
+                    is_first[i] = True
+            group_start = 0
+            for i in range(n):
+                if is_first[i]:
+                    group_start = i
+                prof = _profile_for(hi[group_start:i + 1], lo[group_start:i + 1],
+                                    close[group_start:i + 1], vol[group_start:i + 1],
+                                    value_area_pct, lvn_sensitivity)
+                if prof is None or is_first[i]:
+                    records.append({
+                        "bar_time": int(times[i]),
+                        "result_type": "LEVEL",
+                        "source_mode": mode,
+                        "calculation_status": "INSUFFICIENT_DATA",
+                        "is_swing_high": False,
+                        "is_swing_low": False,
+                        "is_rejection": False,
+                        "event_bar_time": int(times[i]),
+                        "confirmation_bar_time": int(times[i]),
+                        "confirmation_lag_bars": 0,
+                        "confirmation_type": "CAUSAL",
+                        "price": float(close[i]),
+                        "strength_value": 0.0,
+                        "strength_type": "VOLUME_RATIO",
+                        "volume_source": volume_source,
+                        "poc_price": None,
+                        "vah_price": None,
+                        "val_price": None,
+                        "lvn_price": None,
+                        "is_lvn_swing": False,
+                    })
+                    continue
+                poc, vah, val, lvn_prices, total, max_vol = prof
+                # Naechster LVN am aktuellen Preis (kausal).
+                lvn_price: Optional[float] = None
+                if lvn_prices:
+                    lvn_price = min(lvn_prices,
+                                    key=lambda x: abs(x - float(close[i])))
+                is_lvn_swing = lvn_price is not None and abs(
+                    float(close[i]) - lvn_price) <= (vah - val) / 20.0
+                is_sh = float(close[i]) >= vah
+                is_sl = float(close[i]) <= val
+                total_high += int(is_sh)
+                total_low += int(is_sl)
+                records.append({
+                    "bar_time": int(times[i]),
+                    "result_type": "LEVEL",
+                    "source_mode": mode,
+                    "calculation_status": "OK",
+                    "is_swing_high": bool(is_sh),
+                    "is_swing_low": bool(is_sl),
+                    "is_rejection": bool(is_lvn_swing),
+                    "event_bar_time": int(times[i]),
+                    "confirmation_bar_time": int(times[i]),
+                    "confirmation_lag_bars": 0,
+                    "confirmation_type": "CAUSAL",
+                    "price": float(close[i]),
+                    "strength_value": float(vol[i] / max_vol) if max_vol > 0 else 0.0,
+                    "strength_type": "VOLUME_RATIO",
+                    "volume_source": volume_source,
+                    "poc_price": poc,
+                    "vah_price": vah,
+                    "val_price": val,
+                    "lvn_price": lvn_price,
+                    "is_lvn_swing": bool(is_lvn_swing),
+                })
+
+        elif mode == "Grid_Proximity":
+            grid_price = np.round(close / grid_step) * grid_step
+            for i in range(n):
+                gp = float(grid_price[i])
+                dist = float(close[i]) - gp
+                is_sh = i > 0 and float(close[i]) >= gp and float(close[i - 1]) < gp
+                is_sl = i > 0 and float(close[i]) <= gp and float(close[i - 1]) > gp
+                total_high += int(is_sh)
+                total_low += int(is_sl)
+                records.append({
+                    "bar_time": int(times[i]),
+                    "result_type": "LEVEL",
+                    "source_mode": mode,
+                    "calculation_status": "OK",
+                    "is_swing_high": bool(is_sh),
+                    "is_swing_low": bool(is_sl),
+                    "is_rejection": False,
+                    "event_bar_time": int(times[i]),
+                    "confirmation_bar_time": int(times[i]),
+                    "confirmation_lag_bars": 0,
+                    "confirmation_type": "CAUSAL",
+                    "price": float(close[i]),
+                    "strength_value": abs(dist) / grid_step if grid_step > 0 else 0.0,
+                    "strength_type": "NORMALIZED",
+                    "grid_price": gp,
+                })
+
+        elif mode == "Anchored_VWAP":
+            vwap, upper, lower, anchor_idx, stdev = _anchored_vwap(
+                work, times, vol, vwap_anchor, vwap_band_mult)
+            for i in range(n):
+                vw = float(vwap[i])
+                up = float(upper[i])
+                lw = float(lower[i])
+                is_sh = float(close[i]) > up
+                is_sl = float(close[i]) < lw
+                total_high += int(is_sh)
+                total_low += int(is_sl)
+                status = "INSUFFICIENT_DATA" if i == int(anchor_idx[i]) else "OK"
+                records.append({
+                    "bar_time": int(times[i]),
+                    "result_type": "VWAP",
+                    "source_mode": mode,
+                    "calculation_status": status,
+                    "is_swing_high": bool(is_sh),
+                    "is_swing_low": bool(is_sl),
+                    "is_rejection": False,
+                    "event_bar_time": int(times[int(anchor_idx[i])]),
+                    "confirmation_bar_time": int(times[i]),
+                    "confirmation_lag_bars": int(i - int(anchor_idx[i])),
+                    "confirmation_type": "CAUSAL",
+                    "price": float(close[i]),
+                    "strength_value": (float(close[i]) - vw) / stdev[i]
+                    if np.isfinite(stdev[i]) and stdev[i] > 0 else 0.0,
+                    "strength_type": "PRICE_DISTANCE",
+                    "vwap_price": vw,
+                    "vwap_upper": up,
+                    "vwap_lower": lw,
+                })
+
+        else:
+            # Unbekannter Modus: defensiv leer (kein Crash, 0 Rows).
+            return empty
+
+        return {
+            "feature_store_payload": {
+                "feature_id": self.plugin_id,
+                "plugin_version": self.version,
+                "records": records,
+                "metadata": {
+                    # E-7 / base_plugin (U15-A1, Invariante 5): schema_version
+                    # ist Pflichtfeld fuer alle feature_store=True-Plugins.
+                    "schema_version": "1.0.0",
+                    "source_mode": mode,
+                    "total_swing_highs": total_high,
+                    "total_swing_lows": total_low,
+                    "bars": n,
                 },
             },
         }
@@ -21599,7 +23383,7 @@ Service-UI: 2-Spalten-MasterTree (Phase 15 15.02).
 Hierarchische Darstellung der Service-Landschaft:
 
   * Spalte 0: Knoten – 📁 Service-Sets (mit ihren Service-Instanzen),
-              ⚡ Standalone Services, 📦 Alle verfuegbaren Plugins.
+              📦 Alle verfuegbaren Services (kategorisierte Ordner).
               Die Spalte ist Stretch und fuellt die gesamte Breite bis zur
               Status-Spalte. Untereintraege sind per setIndentation()
               eingerueckt (Bugfix 04.08.2026); die Top-Level-Knoten starten
@@ -21797,6 +23581,16 @@ class MasterTree(QTreeWidget):
     # Bestaetigungsdialog (Set/Service + Symbol/Timeframe).
     run_service_requested = Signal(str, str)
     run_set_requested = Signal(str)
+    # 17.01.02 (Bugfix-Runde): Run-/Info-Aktionen fuer die Services-Gruppe.
+    #   run_plugin_requested(plugin_id)  – '▶️ Diesen Service ausführen'
+    #                                      (Einzel-Plugin-Zeile, ohne Set)
+    #   run_category_requested(path)     – '▶️ Alle Services ausführen'
+    #                                      (Kategorie-Ordner, rekursiv; path
+    #                                      z.B. 'Swing Points/Geometrie')
+    #   category_info_requested(path)    – Info-Button auf Kategorie-Ordnern
+    run_plugin_requested = Signal(str)
+    run_category_requested = Signal(str)
+    category_info_requested = Signal(str)
 
     def __init__(self, model, parent=None) -> None:
         super().__init__(parent)
@@ -21957,7 +23751,9 @@ class MasterTree(QTreeWidget):
             return self._build_category_item(child, group)
         if group == self.model.GROUP_SETS:
             return self._build_set_item(child)
-        if group in (self.model.GROUP_STANDALONE, self.model.GROUP_PLUGINS):
+        # 17.01.01: GROUP_STANDALONE entfaellt ersatzlos – Plugin-Zeilen
+        # existieren nur noch in GROUP_PLUGINS (Kategorien-Ordner inklusive).
+        if group == self.model.GROUP_PLUGINS:
             return self._build_plugin_item(child, group)
         return None
 
@@ -22107,9 +23903,31 @@ class MasterTree(QTreeWidget):
                    else f"im {label}")
         item.setToolTip(1, tooltip)
 
+    def _category_path_of(self, item) -> str:
+        """Voller Kategorie-Pfad eines Ordner-Items (17.01.02).
+
+        Sammelt die Ordner-Labels von der Wurzel bis zum Item und verkettet
+        sie slash-separiert OHNE '📁 '-Praefix (z.B. 'Swing Points/Geometrie').
+        Liefert '' fuer Nicht-Ordner-Items oder leere Ketten. Das Format
+        entspricht exakt `ServiceSelectorModel.category_plugin_ids()`.
+        """
+        parts: List[str] = []
+        node = item
+        hops = 0
+        while node is not None and isValid(node) and hops < 64:
+            if node.data(0, ROLE_NODE_TYPE) == TYPE_CATEGORY:
+                label = str(node.data(0, ROLE_SET_ID) or "").strip()
+                if label.startswith("📁"):
+                    label = label[len("📁"):].lstrip()
+                if label:
+                    parts.append(label)
+            node = node.parent()
+            hops += 1
+        return "/".join(reversed(parts))
+
     def _attach_item_buttons(self) -> None:
         """Haengt die Info-Buttons (Spalte 1) an alle Service-/Set-/Plugin-
-        Zeilen (Bugfix 05.08.2026).
+        Zeilen UND Kategorie-Ordner (Bugfix 05.08.2026 / 17.01.02).
 
         Der Button ist ein kompakter QPushButton ("ℹ", Icon-Breite) und ersetzt
         die frueheren Text-Badges. Gehoert die Zeile einem Indikator (Tooltip
@@ -22119,14 +23937,19 @@ class MasterTree(QTreeWidget):
           Service-Zeile -> (set_id, instance_id, plugin_id)
           Set-Zeile      -> (set_id, "", "")
           Plugin-Zeile   -> ("", "", plugin_id)
-        Gruppen-Knoten (📁/⚡/📦) erhalten bewusst KEINEN Button.
+          Kategorie-Ordner -> `category_info_requested(Kategorie-Pfad)`
+            (17.01.02: wie bei Sets – der Ordner-Button zeigt die Kategorie-
+            Info mit allen Services unter dem Ordner).
+        Gruppen-Knoten (📁 Sets / 📦 Services, TYPE_GROUP) erhalten bewusst
+        KEINEN Button.
         """
         try:
             for item in TreeItemIterator(self):
                 if item is None or not isValid(item):
                     continue
                 node_type = item.data(0, ROLE_NODE_TYPE)
-                if node_type not in (TYPE_SERVICE, TYPE_SET, TYPE_PLUGIN):
+                if node_type not in (TYPE_SERVICE, TYPE_SET, TYPE_PLUGIN,
+                                     TYPE_CATEGORY):
                     continue
                 tooltip = item.toolTip(1) or ""
                 set_id = str(item.data(0, ROLE_SET_ID) or "")
@@ -22151,9 +23974,19 @@ class MasterTree(QTreeWidget):
                     f" font-weight:bold; background:transparent; }}")
                 if tooltip:
                     btn.setToolTip(tooltip)
-                btn.clicked.connect(
-                    lambda _=False, s=set_id, svc=service_id, pid=plugin_id:
-                    self.info_requested.emit(s, svc, pid))
+                # 17.01.02: Kategorie-Ordner emittieren category_info_requested
+                # mit dem vollen Kategorie-Pfad (analog Set-Info).
+                if node_type == TYPE_CATEGORY:
+                    cat_path = self._category_path_of(item)
+                    btn.setToolTip(
+                        f"Kategorie: {cat_path or '?'}")
+                    btn.clicked.connect(
+                        lambda _=False, cp=cat_path:
+                        self.category_info_requested.emit(cp))
+                else:
+                    btn.clicked.connect(
+                        lambda _=False, s=set_id, svc=service_id, pid=plugin_id:
+                        self.info_requested.emit(s, svc, pid))
                 self.setItemWidget(item, 1, btn)
         except (RuntimeError, AttributeError):
             pass
@@ -22529,10 +24362,13 @@ class MasterTree(QTreeWidget):
                                      'Order ▲/▼', 'Service entfernen',
                                      'Service-Info anzeigen' (move/remove/
                                      info_requested)
-          * Ausserhalb eines Sets (Plugin-Zeilen, ⚡-/📦-Gruppen):
-                                     Order/Entfernen/Umbenennen ausgegraut;
-                                     'Service-Info anzeigen' bleibt fuer
-                                     Plugin-Zeilen aktiv.
+          * Plugin-Zeile (Services) -> '▶️ Diesen Service ausführen'
+                                     (run_plugin_requested, einzeln) +
+                                     'Service-Info anzeigen' (17.01.02)
+          * Kategorie-Ordner      -> '▶️ Alle Services ausführen'
+                                     (run_category_requested, rekursiv) +
+                                     'Ordner-Info anzeigen' (17.01.02)
+          * Sonstige Gruppen      -> Order/Entfernen ausgegraut (17.01.02).
 
         isValid-Guards: Bei wildem Klicken koennen Items zwischen itemAt() und
         Datenzugriff C++-seitig zerstoert sein (Access-Violation-Schutz).
@@ -22550,9 +24386,25 @@ class MasterTree(QTreeWidget):
             except (RuntimeError, AttributeError):
                 pass
             node_type = item.data(0, ROLE_NODE_TYPE)
-            # 16.08 (K6): Ordnerknoten erhalten KEIN Kontextmenue (kein
-            # run_service/info/move/remove auf Ordnern).
+            # 17.01.02 (Bugfix-Runde): Kategorie-Ordner erhalten jetzt ein
+            # Kontextmenue mit '▶️ Alle Services ausführen' (rekursiv, alle
+            # Services unter dem Ordner) + 'Ordner-Info anzeigen' (analog zu
+            # den Set-Aktionen in der 📁-Gruppe).
             if node_type == TYPE_CATEGORY:
+                cat_path = self._category_path_of(item)
+                if not cat_path:
+                    return
+                menu = QMenu(self)
+                act_run = menu.addAction("▶️ Alle Services ausführen")
+                act_run.triggered.connect(
+                    lambda _=False, cp=cat_path:
+                    self.run_category_requested.emit(cp))
+                menu.addSeparator()
+                act_info = menu.addAction("Ordner-Info anzeigen")
+                act_info.triggered.connect(
+                    lambda _=False, cp=cat_path:
+                    self.category_info_requested.emit(cp))
+                menu.exec(self.viewport().mapToGlobal(pos))
                 return
             menu = QMenu(self)
             if node_type == TYPE_GROUP:
@@ -22634,7 +24486,25 @@ class MasterTree(QTreeWidget):
                     lambda _=False: self.purge_trash_requested.emit())
                 menu.exec(self.viewport().mapToGlobal(pos))
                 return
-            # Plugin-Zeile (standalone/plugins) – nur Info aktiv
+            # Plugin-Zeile (Services-Gruppe / Kategorie-Ordner):
+            # 17.01.02 (Bugfix-Runde) – '▶️ Diesen Service ausführen' wie bei
+            # den Set-Service-Zeilen (einzelner Run, Sicherheitsabfrage durch
+            # den Orchestrator); 'Service-Info anzeigen' bleibt aktiv.
+            if node_type == TYPE_PLUGIN:
+                plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
+                menu = QMenu(self)
+                act_run = menu.addAction("▶️ Diesen Service ausführen")
+                act_run.triggered.connect(
+                    lambda _=False, p=plugin_id:
+                    self.run_plugin_requested.emit(p))
+                menu.addSeparator()
+                act_info = menu.addAction("Service-Info anzeigen")
+                act_info.triggered.connect(
+                    lambda _=False, p=plugin_id:
+                    self.info_requested.emit("", "", p))
+                menu.exec(self.viewport().mapToGlobal(pos))
+                return
+            # Sonstige Nicht-Set-Knoten (Gruppen der Services-Seite)
             self._add_outside_set_actions(menu, item)
             menu.exec(self.viewport().mapToGlobal(pos))
         except (RuntimeError, AttributeError):
@@ -22984,10 +24854,11 @@ _service_lock/_build_tooltip (ServiceWindow).
 from typing import Any, Dict
 
 from PySide6.QtCore import QCoreApplication, QEvent, Qt, QTimer
+from PySide6.QtGui import QTextCursor, QTextOption
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QSizePolicy, QSpinBox, QVBoxLayout,
-    QWidget,
+    QLabel, QLineEdit, QPushButton, QSizePolicy, QSpinBox, QTextEdit,
+    QVBoxLayout, QWidget,
 )
 
 
@@ -23052,7 +24923,23 @@ class ServiceParamColumnsMixin:
         float -> QDoubleSpinBox, int -> QSpinBox, bool -> QCheckBox,
         choice -> QComboBox, color/str -> QLineEdit. min/max/step werden 1:1
         übertragen (Roadmap 5.4.2.2).
+
+        17.01.05 (Bugfix, UI-Dropdown-Extension): Deklariert der Schema-
+        Eintrag `options` (Liste/Tupel), wird VOR der Datentyp-Prüfung eine
+        QComboBox gerendert – unabhängig vom type-Wert ("str"/"choice").
+        Dadurch werden z. B. die mode-/ma_type-/period_extrema_type-Felder
+        der Swing-Services (type="str" + options) als Dropdown statt als
+        QLineEdit angezeigt.
         """
+        options = spec.get("options")
+        if options and isinstance(options, (list, tuple)):
+            combo = QComboBox()
+            combo.addItems([str(o) for o in options])
+            val_str = str(val if val is not None else spec.get("default", ""))
+            idx = combo.findText(val_str)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            return combo
         p_type = spec.get("type")
         if p_type == "float":
             spin = QDoubleSpinBox()
@@ -23105,6 +24992,146 @@ class ServiceParamColumnsMixin:
         if isinstance(ctrl, QComboBox):
             return ctrl.currentText()
         return ctrl.text()
+
+    @staticmethod
+    def _scroll_textedit_top(editor: QTextEdit) -> None:
+        """Scrollt eine Read-Only-QTextEdit HART nach oben (Cursor + Scroll).
+
+        Qt setzt nach `setHtml` den Text-Cursor intern ans Dokument-ENDE und
+        scrollt beim finalen Layout dorthin – dadurch ist die erste Zeile
+        verdeckt. Fix (17.01.06):
+          1. Cursor ans Dokument-Anfang (`QTextCursor.MoveOperation.Start`).
+          2. Vertikalen Scrollbalken erst auf Maximum setzen (erzwingt die
+             Neuberechnung des Viewports) und dann auf 0 (ganz oben).
+        Wirkt nur dauerhaft, wenn es NACH dem endgueltigen Layout/Resize
+        ausgefuehrt wird (Qt wrappt das Dokument nach setHtml erst in einer
+        spaeteren Event-Loop-Runde um und scrollt dann ggf. erneut).
+        """
+        if editor is None:
+            return
+        try:
+            cur = editor.textCursor()
+            cur.setPosition(0)
+            editor.setTextCursor(cur)
+            editor.moveCursor(QTextCursor.MoveOperation.Start)
+            sb = editor.verticalScrollBar()
+            if sb is not None:
+                sb.setValue(sb.maximum())  # unten -> Viewport neu berechnen
+                sb.setValue(0)             # ganz nach oben (erste Zeile)
+            editor.ensureCursorVisible()
+        except (RuntimeError, AttributeError):
+            pass  # Widget bereits zerstoert (deleteLater) – ignorieren
+
+    # ------------------------------------------------------------------
+    # 17.01.05 (Bugfix): Conditional Visibility (Modus-abhaengige Parameter)
+    # ------------------------------------------------------------------
+    def _apply_conditional_visibility(self, iid: str) -> None:
+        """Blendet Parameter mit `visible_when`-Schema-Deklaration ein/aus.
+
+        Konvention (additiv, 17.01.05): Ein Parameter-Schema-Eintrag kann
+        zusaetzlich tragen:
+            "visible_when": {"mode": ["Algo_A", "Algo_B"]}
+        (auch einzelner String erlaubt). Liegt der aktuelle Wert des
+        `mode`-Controls (Dropdown) NICHT in der Liste, werden Control + Label
+        ausgeblendet; sonst eingeblendet. Parameter ohne `visible_when`
+        bleiben immer sichtbar. Wird beim Spaltenaufbau und bei jedem
+        Mode-Wechsel aufgerufen.
+        """
+        schema = getattr(self, "_mode_schemas", {}).get(iid)
+        if not schema:
+            return
+        mode_ctrl = self._service_param_controls.get((iid, "mode"))
+        mode_val = (str(self._ctrl_value(mode_ctrl))
+                    if mode_ctrl is not None else "")
+        for key, spec in schema.items():
+            vw = spec.get("visible_when")
+            if not isinstance(vw, dict) or "mode" not in vw:
+                continue
+            allowed = vw["mode"]
+            if isinstance(allowed, str):
+                allowed = [allowed]
+            visible = mode_val in {str(a) for a in allowed}
+            ctrl = self._service_param_controls.get((iid, key))
+            if ctrl is None:
+                continue
+            try:
+                ctrl.setVisible(visible)
+            except (RuntimeError, AttributeError):
+                pass
+            lbl = getattr(self, "_service_param_labels", {}).get((iid, key))
+            if lbl is not None:
+                try:
+                    lbl.setVisible(visible)
+                except (RuntimeError, AttributeError):
+                    pass
+        # 17.01.05 (Bugfix): Auch das Info-Label (Service-/Algo-Beschreibung)
+        # auf den aktuellen Modus aktualisieren.
+        self._update_service_info_label(iid)
+
+    # ------------------------------------------------------------------
+    # 17.01.05 (Bugfix): Read-only Info-Label unter dem individuellen
+    # Beschreibungsfeld – zeigt die in der Definition vorgefuellte
+    # Service-Beschreibung + die Beschreibung des aktuell gewaehlten
+    # Algorithmus (mode) an. Wird beim Spaltenaufbau und bei jedem
+    # Mode-Wechsel aktualisiert.
+    # ------------------------------------------------------------------
+    def _update_service_info_label(self, iid: str) -> None:
+        """Setzt den Rich-Text des Info-Labels fuer eine Service-Instanz.
+
+        Angezeigt werden (read-only, unter dem editierbaren Beschreibungs-
+        Feld): display_name/plugin_id, die Service-Beschreibung aus den
+        Plugin-Metadaten (description_long, sonst description) sowie der
+        aktuell gewaehlte Algorithmus (mode) inkl. Schema-Beschreibung.
+        """
+        label = getattr(self, "_service_info_labels", {}).get(iid)
+        if label is None:
+            return
+        pid = getattr(self, "_service_info_pids", {}).get(iid, iid)
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            plugin = PluginRegistry().get(pid)
+        except (KeyError, AttributeError):
+            plugin = None
+        meta = dict(getattr(plugin, "metadata", None) or {})
+        display = str(meta.get("display_name") or pid)
+        desc = str(meta.get("description_long")
+                   or meta.get("description") or "").strip()
+        schema = getattr(self, "_mode_schemas", {}).get(iid, {})
+        mode_spec = schema.get("mode", {}) if isinstance(schema, dict) else {}
+        mode_ctrl = self._service_param_controls.get((iid, "mode"))
+        mode_val = (str(self._ctrl_value(mode_ctrl)) if mode_ctrl is not None
+                    else str(mode_spec.get("default") or ""))
+        labels = dict(getattr(plugin, "param_labels", None) or {})
+        mode_label = str(labels.get("mode")
+                         or mode_spec.get("description") or "Algorithmus")
+        mode_desc = str(mode_spec.get("description") or "")
+
+        import html as _html
+        parts = [f"<b>{_html.escape(display)}</b>"]
+        if desc:
+            parts.append(_html.escape(desc))
+        if mode_val:
+            parts.append(f"<b>{_html.escape(mode_label)}:</b> "
+                         f"{_html.escape(mode_val)}")
+        if mode_desc and mode_desc != mode_label:
+            parts.append(f"<i>{_html.escape(mode_desc)}</i>")
+        try:
+            # QTextEdit (read-only): HTML setzen – bei langem Text scrollt
+            # die Anzeige vertikal (max. Hoehe gedeckelt).
+            label.setHtml("<br>".join(parts))
+            # 17.01.06 (Bugfix): Nach dem Text-Update die Anzeige IMMER ganz
+            # nach oben scrollen (Cursor->Start + Scrollbar->0). Synchrone
+            # Ausfuehrung + DEFERRED (QTimer singleShot 0): Qt setzt nach
+            # setHtml den Cursor ans Dokument-Ende und wrappt das Dokument
+            # erst in einer spaeteren Event-Loop-Runde um (dann scrollt es
+            # ggf. erneut zum Cursor). Der deferred Reset wirkt daher erst
+            # nach dem finalen Layout; zusaetzlich wird der Reset nach dem
+            # finalen Box-Resize in _resize_param_box_deferred ausgefuehrt.
+            self._scroll_textedit_top(label)
+            QTimer.singleShot(
+                0, lambda l=label: self._scroll_textedit_top(l))
+        except (RuntimeError, AttributeError):
+            pass
 
     # ------------------------------------------------------------------
     # Phase 15 (Dirty-State): Aenderungs-Tracking der Parameter-Controls
@@ -23260,6 +25287,16 @@ class ServiceParamColumnsMixin:
                     splitter.setSizes(hints)
         except (RuntimeError, AttributeError):
             pass
+        # 17.01.06 (Bugfix): Nach dem FINALEN Box-Resize (DeferredDelete +
+        # box.resize) alle Read-only-Info-Anzeigen wieder ganz nach oben
+        # scrollen. Durch das Resize wrappt das Dokument der QTextEdit um;
+        # Qt scrollt dabei (weil der Cursor von setHtml intern am Dokument-
+        # Ende stand) um einige Zeilen nach unten – die erste Zeile waere
+        # sonst verdeckt. Dieser Aufruf laeuft NACH dem Layout, sodass die
+        # Scroll-Position oben haelt.
+        for _info in list(
+                getattr(self, "_service_info_labels", {}).values()):
+            self._scroll_textedit_top(_info)
 
     def _clear_service_columns(self) -> None:
         """Entfernt alle Service-Spalten aus dem service_columns_layout."""
@@ -23272,6 +25309,14 @@ class ServiceParamColumnsMixin:
                 w.deleteLater()
         self._service_param_controls = {}
         self._service_desc_controls = {}
+        # 17.01.05 (Bugfix): Conditional-Visibility-Zustand je Instanz
+        # (Modus-abhaengige Parameter-Ein-/Ausblendung) zuruecksetzen.
+        self._mode_schemas = {}
+        self._service_param_labels = {}
+        # 17.01.05 (Bugfix): Read-only Info-Label (vorgefuellte Service-/Algo-
+        # Beschreibung) je Instanz zuruecksetzen.
+        self._service_info_labels = {}
+        self._service_info_pids = {}
 
     def _build_service_columns(self, set_definition: Dict[str, Any]) -> None:
         """Baut die dynamischen Service-Spalten (Roadmap 5.4.2.2).
@@ -23334,6 +25379,10 @@ class ServiceParamColumnsMixin:
 
         full_schema: Dict[str, Any] = dict(getattr(plugin, "base_parameter_schema", None) or {})
         full_schema.update(dict(plugin.parameter_schema or {}))
+        # 17.01.05 (Bugfix): Conditional Visibility – Schema je Instanz merken,
+        # um Parameter mit "visible_when"-Deklaration modus-abhaengig
+        # ein-/auszublenden (_apply_conditional_visibility).
+        self._mode_schemas[iid] = full_schema
         order = list(getattr(plugin, "parameter_order", None) or (plugin.parameter_schema or {}).keys())
         for key in (getattr(plugin, "base_parameter_schema", None) or {}):
             if key not in order:
@@ -23374,6 +25423,33 @@ class ServiceParamColumnsMixin:
         desc_row.addWidget(desc_edit_btn)
         vl.addLayout(desc_row)
 
+        # 17.01.05 (Bugfix): Read-only Info-Anzeige unter dem individuellen
+        # Beschreibungsfeld – zeigt die in der Definition vorgefuellte
+        # Service-Beschreibung + die Beschreibung des aktuell gewaehlten
+        # Algorithmus (mode). Rein informativ (kein Input), wird beim
+        # Mode-Wechsel live aktualisiert (_update_service_info_label).
+        # Ergaenzung: Als QTextEdit (read-only) mit gedeckelter Hoehe – wird
+        # der Text zu lang, erscheint eine vertikale Scrollbar (kein
+        # Aufblahen der Spalte).
+        info_label = QTextEdit()
+        info_label.setReadOnly(True)
+        info_label.setAcceptRichText(True)
+        info_label.setFrameShape(QTextEdit.NoFrame)
+        info_label.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        info_label.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        info_label.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        info_label.setTabChangesFocus(True)
+        info_label.setStyleSheet(
+            "QTextEdit { background: transparent; border: none; "
+            "color: #666; font-size: 11px; }")
+        info_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        # Deckelhoehe: ~3 Textzeilen – darueber scrollt der Text vertikal.
+        fm = info_label.fontMetrics()
+        info_label.setMaximumHeight(fm.lineSpacing() * 3 + 12)
+        self._service_info_labels[iid] = info_label
+        self._service_info_pids[iid] = pid
+        vl.addWidget(info_label)
+
         # Normale (Nicht-Expert-, Nicht-Darstellungs-)Parameter
         form = QFormLayout()
         for key in order:
@@ -23395,7 +25471,20 @@ class ServiceParamColumnsMixin:
             # Phase 15 (Dirty-State): Aenderungen markieren die Instanz.
             self._connect_param_change(ctrl, iid, key)
             form.addRow(labels.get(key, self._human(key)), ctrl)
+            # 17.01.05 (Bugfix): Label-Referenz fuer die modus-abhaengige
+            # Ein-/Ausblendung merken.
+            lbl = form.labelForField(ctrl)
+            if lbl is not None:
+                self._service_param_labels[(iid, key)] = lbl
+            # 17.01.05 (Bugfix): Mode-Wechsel (Dropdown) blendet die
+            # modus-spezifischen Parameter passend ein/aus.
+            if key == "mode" and isinstance(ctrl, QComboBox):
+                ctrl.currentTextChanged.connect(
+                    lambda _v, i=iid: self._apply_conditional_visibility(i))
         vl.addLayout(form)
+        # 17.01.05 (Bugfix): Initialzustand der Modus-Sichtbarkeit anwenden
+        # (ein geladenes Set kann einen nicht-Default-Mode besitzen).
+        self._apply_conditional_visibility(iid)
 
         # Expert-Parameter (inkl. lookback als Service-Instanz-Einstellung)
         expert_keys = [k for k in order if full_schema.get(k, {}).get("expert")]
@@ -23468,7 +25557,7 @@ Der Worker emittiert NUR Signale (log_message / run_finished / run_failed);
 den Bestaetigungsdialog zeigt der Orchestrator (ServiceWindow) VOR dem Start.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QThread, Signal
 
@@ -23582,13 +25671,15 @@ class ServiceRunWorker(QThread):
             return ["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
 
     def _execute_timeframe(self, fb, settings, definition: Dict[str, Any],
-                           scope_label: str, tf: str) -> int:
+                           scope_label: str, tf: str) -> Tuple[int, bool]:
         """Fuehrt die Pipeline fuer EINEN Timeframe aus und persistiert die
         Feature-Payloads im feature_store.
 
         Returns:
-            Anzahl geschriebener Feature-Rows (0, wenn keine Daten oder kein
-            Payload vorhanden sind).
+            (stored, had_data) – Anzahl geschriebener Feature-Rows (0, wenn
+            kein Payload vorhanden ist) und ob OHLCV-Daten geladen wurden
+            (False, wenn die Quelle leer war – NUR dann ist die Meldung
+            'Keine OHLCV-Daten' korrekt, 17.01.02 Bugfix).
         """
         from analytics.features.feature_builder import prepare_plugin_df
         from analytics.features.plugins.base_plugin import PluginContext
@@ -23598,7 +25689,7 @@ class ServiceRunWorker(QThread):
         if df is None or df.empty:
             self.log_message.emit(
                 f"  {self.symbol} {tf}: keine OHLCV-Daten – uebersprungen")
-            return 0
+            return 0, False
 
         df_plugin = prepare_plugin_df(df)
         context = PluginContext(
@@ -23627,7 +25718,7 @@ class ServiceRunWorker(QThread):
             self.log_message.emit(
                 f"  {iid}: {len(records)} Feature-Row(s) gespeichert "
                 f"({self.symbol} {tf})")
-        return stored
+        return stored, True
 
     # ------------------------------------------------------------------
     # Worker-Loop
@@ -23671,10 +25762,11 @@ class ServiceRunWorker(QThread):
                 return
 
             total_stored = 0
-            empty_tfs: List[str] = []
+            no_data_tfs: List[str] = []
+            no_payload_tfs: List[str] = []
             for tf in timeframes:
                 try:
-                    stored = self._execute_timeframe(
+                    stored, had_data = self._execute_timeframe(
                         fb, settings, definition, scope_label, tf)
                 except Exception as e:
                     # U15-E (Multi-TF): Ein fehlgeschlagener Timeframe bricht
@@ -23686,15 +25778,29 @@ class ServiceRunWorker(QThread):
                         continue
                     raise
                 total_stored += stored
-                if stored == 0:
-                    empty_tfs.append(tf)
+                if not had_data:
+                    no_data_tfs.append(tf)
+                elif stored == 0:
+                    no_payload_tfs.append(tf)
 
-            # Single-TF ohne Daten -> Fehler (bisheriges Verhalten erhalten).
-            if len(timeframes) == 1 and empty_tfs:
-                self.run_failed.emit(
-                    scope_id,
-                    f"Keine OHLCV-Daten fuer {self.symbol} {timeframes[0]}.")
-                return
+            # Single-TF-Fehler differenzieren (17.01.02 Bugfix): Die
+            # Meldung 'Keine OHLCV-Daten' ist NUR korrekt, wenn die Quelle
+            # leer war. Waren Daten vorhanden, aber der Service hat keinen
+            # Feature-Store-Payload erzeugt, wird das praezise gemeldet
+            # (z. B. Scaffold mit records=[], unbekannter Modus).
+            if len(timeframes) == 1:
+                if no_data_tfs:
+                    self.run_failed.emit(
+                        scope_id,
+                        f"Keine OHLCV-Daten fuer {self.symbol} {timeframes[0]}.")
+                    return
+                if no_payload_tfs:
+                    self.run_failed.emit(
+                        scope_id,
+                        f"Kein Feature-Store-Payload erzeugt fuer "
+                        f"{self.symbol} {timeframes[0]} (Service lieferte "
+                        f"0 Records – Daten waren vorhanden).")
+                    return
 
             self.log_message.emit(
                 f"Fertig: {total_stored} Feature-Row(s) im feature_store "
@@ -24758,6 +26864,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self._run_worker: Optional[ServiceRunWorker] = None
         self._current_set_id: Optional[str] = None
         self._current_set_definition: Optional[Dict[str, Any]] = None
+        # 17.01.04 (Bugfix): Standalone-Plugin-Editierung – ist eine
+        # Plugin-Zeile unter 'Services' (Kategorie-Ordner) im Parameter-
+        # Editor geladen, haelt dieses Feld die plugin_id. Die gespeicherten
+        # Parameter liegen in global_settings (Key 'plugin_params_<pid>').
+        self._current_plugin_editing: Optional[str] = None
         # USER-REQ (P14-03): Preisskala-Praezision je Symbol fuer die 6
         # Custom-Level-Eingabefelder (prox_level1..6). Lazy + gecacht.
         self._symbol_precision: Optional[int] = None
@@ -25218,6 +27329,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         tree = selector.master_tree
         # MasterTree-Auswahl + Kontextmenue (entkoppelt) -> Editor/Handler
         tree.selection_changed.connect(self._on_master_selection)
+        # 17.01.04 (Bugfix): Klick-Scope (node_type, set_id, service_id,
+        # plugin_id) – traegt auch die plugin_id von Plugin-Zeilen unter
+        # 'Services'. Daraus wird der Standalone-Plugin-Editor geladen
+        # (Parameter anzeigen/editieren/speichern wie bei Sets).
+        tree.selection_details.connect(self._on_master_selection_details)
         # Bugfix 05.08.2026: Info-Button-Klicks (Spalte 1) -> Beschreibungs-
         # Dialog (Service / Plugin / Set).
         tree.info_requested.connect(self._on_tree_info_requested)
@@ -25239,6 +27355,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # Persistenz + EventBus-Sync.
         tree.run_service_requested.connect(self._on_run_service)
         tree.run_set_requested.connect(self._on_run_set)
+        # 17.01.02 (Bugfix-Runde): Run-/Info-Aktionen der Services-Gruppe
+        # (Plugin-Zeilen einzeln, Kategorie-Ordner rekursiv, Ordner-Info).
+        tree.run_plugin_requested.connect(self._on_run_plugin)
+        tree.run_category_requested.connect(self._on_run_category)
+        tree.category_info_requested.connect(self._on_category_info_requested)
 
     @Slot(str)
     def _toolbar_add_service(self, plugin_id: str,
@@ -25267,9 +27388,16 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         Set-Dropdown der entfernten Service-Sets-Box entfaellt - die
         Auswahl im MasterTree ist die alleinige Quelle. Bei Set-Auswahl
         werden die Parameter-Spalten aufgebaut; ohne Auswahl (Plugin-/
-        Standalone-Zeilen) wird der Editor geleert."""
+        Standalone-Zeilen) wird der Editor geleert.
+
+        17.01.04 (Bugfix): Bei einer Plugin-Zeile unter 'Services' feuert
+        selection_changed mit leeren IDs NACH selection_details. Der
+        Plugin-Editor wurde dort bereits geladen (_current_plugin_editing) –
+        der Editor darf in diesem Fall NICHT geleert werden."""
         self._set_param_actions_visible(False)
         if not set_id:
+            if self._current_plugin_editing:
+                return  # Plugin-Editor bleibt (via selection_details geladen)
             self._clear_set_editor()
             return
         try:
@@ -25281,6 +27409,141 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.log(f"Set '{set_id}' nicht gefunden.")
             return
         self.load_set_into_editor(definition)
+
+    # -------------------------------------------------------------------------
+    # 17.01.04 (Bugfix): Standalone-Plugin-Editor (Parameter-Spalte fuer
+    # Plugin-Zeilen unter 'Services' – anzeigen/editieren/speichern wie bei
+    # Sets; Persistenz in global_settings, Key 'plugin_params_<pid>').
+    # -------------------------------------------------------------------------
+
+    @Slot(str, str, str, str)
+    def _on_master_selection_details(self, node_type: str, set_id: str,
+                                     service_id: str, plugin_id: str) -> None:
+        """Slot fuer `MasterTree.selection_details` (Mausklick in einer Zeile).
+
+        17.01.04 (Bugfix): Klick auf eine Plugin-Zeile (TYPE_PLUGIN) unter
+        'Services' (auch in Kategorie-Ordnern) laedt den Standalone-Plugin-
+        Editor in die rechte Parameter-Spalte – editierbar, mit Speichern.
+        Set-/Service-Zeilen verhalten sich unveraendert (der eigentliche
+        Set-Load laeuft ueber selection_changed); hier wird nur der
+        Plugin-Modus zurueckgesetzt.
+        """
+        if node_type == "plugin" and plugin_id:
+            self._load_plugin_editor(str(plugin_id))
+            return
+        # Jede andere Zeile beendet den Plugin-Editor-Modus; der Set-Editor
+        # wird weiterhin ueber selection_changed gesteuert (Bestandslogik).
+        if self._current_plugin_editing:
+            self._current_plugin_editing = None
+
+    def _plugin_config(self, plugin_id: str) -> Dict[str, Any]:
+        """ServiceInstanceConfig eines Standalone-Plugins.
+
+        Liefert {"plugin_id", "lookback", "params", "version"} – Basis sind
+        die Registry-Defaults; gespeicherte Werte aus global_settings
+        (Key 'plugin_params_<pid>') ueberschreiben lookback/params und
+        ergaenzen eine optionale Beschreibung.
+        """
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            plugin = PluginRegistry().get(plugin_id)
+        except KeyError:
+            plugin = None
+        params = dict(getattr(plugin, "default_params", None) or {}) if plugin else {}
+        lookback: int = 1000
+        if "lookback" in params:
+            try:
+                lookback = int(params.pop("lookback") or 1000)
+            except (TypeError, ValueError):
+                lookback = 1000
+        cfg: Dict[str, Any] = {
+            "plugin_id": plugin_id,
+            "lookback": lookback,
+            "params": params,
+            "version": getattr(plugin, "version", "0.0.0") or "0.0.0",
+        }
+        try:
+            saved = self._state_manager.get_global_value(
+                f"plugin_params_{plugin_id}", None)
+        except Exception:
+            saved = None
+        if isinstance(saved, dict):
+            lb = saved.get("lookback")
+            if lb is not None:
+                try:
+                    cfg["lookback"] = int(lb)
+                except (TypeError, ValueError):
+                    pass
+            saved_params = saved.get("params")
+            if isinstance(saved_params, dict):
+                merged = dict(params)
+                merged.update(saved_params)
+                cfg["params"] = merged
+            desc = saved.get("description")
+            if desc:
+                cfg["description"] = str(desc)
+        return cfg
+
+    def _load_plugin_editor(self, plugin_id: str) -> None:
+        """Laedt die Parameter eines Standalone-Plugins in den Editor.
+
+        Baut eine Ad-hoc-Definition (nur dieser eine Service) aus
+        `_plugin_config` und zeigt sie editierbar in der rechten Spalte.
+        Der Speicherpfad laeuft bei Aenderungen ueber `_save_plugin_params`
+        (global_settings) statt ueber ServiceSetRepository.
+        """
+        if not plugin_id:
+            return
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            PluginRegistry().get(plugin_id)
+        except KeyError:
+            self.log(f"Plugin '{plugin_id}' nicht gefunden.")
+            self._current_plugin_editing = None
+            self._clear_set_editor()
+            return
+        cfg = self._plugin_config(plugin_id)
+        definition: Dict[str, Any] = {
+            "set_id": "",
+            "display_name": plugin_id,
+            "description": str(cfg.get("description") or ""),
+            "execution_order": [plugin_id],
+            "services": {plugin_id: cfg},
+        }
+        self._current_plugin_editing = plugin_id
+        self.load_set_into_editor(definition)
+
+    def _save_plugin_params(self) -> bool:
+        """Persistiert die Parameter des aktuell editierten Standalone-
+        Plugins in global_settings (Key 'plugin_params_<pid>').
+
+        Returns: True bei Erfolg (Dirty-Marker entfernt).
+        """
+        plugin_id = self._current_plugin_editing
+        if not plugin_id:
+            return False
+        definition = self.collect_set_definition()
+        services = definition.get("services") or {}
+        cfg = next(iter(services.values()), None)
+        if not isinstance(cfg, dict):
+            self.log(f"FEHLER beim Speichern der Plugin-Parameter: "
+                     f"keine Service-Config.")
+            return False
+        data: Dict[str, Any] = {
+            "plugin_id": plugin_id,
+            "lookback": int(cfg.get("lookback") or 1000),
+            "params": dict(cfg.get("params") or {}),
+            "description": str(cfg.get("description") or ""),
+        }
+        try:
+            self._state_manager.save_global_value(
+                f"plugin_params_{plugin_id}", data)
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern der Plugin-Parameter: {e}")
+            return False
+        self._clear_dirty_markers()
+        self.log(f"Parameter gespeichert (Plugin): {plugin_id}")
+        return True
 
     def _begin_sync_guard(self) -> None:
         """Blockt den 45s-Hintergrund-Sync (sync_timer in main.py).
@@ -25423,6 +27686,117 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             return
         self._start_run_worker(set_id, definition, instance_id=None)
 
+    @Slot(str)
+    def _on_run_plugin(self, plugin_id: str) -> None:
+        """'▶️ Diesen Service ausführen' (Plugin-Zeile unter 📦 Services).
+
+        17.01.02 (Bugfix-Runde): Einzel-Services ausserhalb von Sets (z.B.
+        unter Kategorie-Ordnern) erhalten dieselbe Run-Aktion wie die
+        Service-Zeilen der Sets. Sicherheitsabfrage mit Plugin-Name und dem
+        aktuell gewaehlten Symbol/Timeframe, danach gezielter Single-Run via
+        ServiceRunWorker mit einer Ad-hoc-Mini-Definition (nur dieser
+        Service; prepare_worker_definition loest ggf. dependencies auf).
+        """
+        if not plugin_id:
+            return
+        symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
+        # U15-E: Timeframe-Control der Filterleiste (combo_tf) – kann auch
+        # 'ALLE Timeframes' sein (Multi-TF-Ausfuehrung im Worker).
+        timeframe = self.combo_tf.currentText() if self.combo_tf else "H1"
+        reply = QMessageBox.question(
+            self, "Service ausführen",
+            f"Service '{plugin_id}' ausführen?\n\n"
+            f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+            f"Der erzeugte Feature-Store-Payload wird in analytics.duckdb "
+            f"geschrieben.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            self.log("Ausführung abgebrochen.")
+            return
+        definition = {
+            "set_id": f"plugin_{plugin_id}",
+            "display_name": plugin_id,
+            "execution_order": [plugin_id],
+            # 17.01.04: Gespeicherte Plugin-Parameter (global_settings)
+            # verwenden, falls vorhanden – sonst Registry-Defaults.
+            "services": {plugin_id: self._plugin_config(plugin_id)},
+        }
+        self._start_run_worker(plugin_id, definition, instance_id=plugin_id)
+
+    @Slot(str)
+    def _on_run_category(self, category_path: str) -> None:
+        """'▶️ Alle Services ausführen' (Kategorie-Ordner unter 📦 Services).
+
+        17.01.02 (Bugfix-Runde): Ordner-Knoten erhalten dieselbe Run-Aktion
+        wie die Sets. Es werden ALLE Services unter dem Ordner ausgefuehrt
+        (rekursiv, inkl. Unter-Ordner – via
+        ServiceSelectorModel.category_plugin_ids). Sicherheitsabfrage mit
+        Kategorie-Name und dem aktuell gewaehlten Symbol/Timeframe, danach
+        gezielter Set-Run mit einer Ad-hoc-Definition.
+        """
+        if not category_path:
+            return
+        model = getattr(self.service_selector, "model", None)
+        if model is None:
+            return
+        plugin_ids = model.category_plugin_ids(category_path)
+        if not plugin_ids:
+            self.log(f"Kategorie '{category_path}' hat keine Services – "
+                     f"Ausführung abgebrochen.")
+            return
+        symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
+        # U15-E: Timeframe-Control der Filterleiste (combo_tf) – kann auch
+        # 'ALLE Timeframes' sein (Multi-TF-Ausfuehrung im Worker).
+        timeframe = self.combo_tf.currentText() if self.combo_tf else "H1"
+        count = len(plugin_ids)
+        reply = QMessageBox.question(
+            self, "Alle Services ausführen",
+            f"Alle Services ({count}) der Kategorie '{category_path}' "
+            f"ausführen?\n\n"
+            f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+            f"Die erzeugten Feature-Store-Payloads werden in analytics.duckdb "
+            f"geschrieben.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            self.log("Ausführung abgebrochen.")
+            return
+        definition = {
+            "set_id": f"category_{category_path}",
+            "display_name": category_path,
+            "execution_order": list(plugin_ids),
+            # 17.01.04: Gespeicherte Plugin-Parameter je Service verwenden
+            # (falls vorhanden), sonst Registry-Defaults.
+            "services": {pid: self._plugin_config(pid) for pid in plugin_ids},
+        }
+        self._start_run_worker(category_path, definition, instance_id=None)
+
+    @Slot(str)
+    def _on_category_info_requested(self, category_path: str) -> None:
+        """Info-Dialog fuer einen Kategorie-Ordner (17.01.02, wie Set-Info).
+
+        Read-Only-Liste aller Services unter dem Ordner (rekursiv) mit dem
+        Kategorie-Pfad als Titel – analog zur Set-Info (ServiceDescription
+        Dialog.from_set, keine persistierbare Beschreibung).
+        """
+        if not category_path:
+            return
+        model = getattr(self.service_selector, "model", None)
+        if model is None:
+            return
+        plugin_ids = model.category_plugin_ids(category_path)
+        definition = {
+            "set_id": f"category_{category_path}",
+            "display_name": category_path,
+            "description": f"Kategorie-Ordner: {category_path}",
+            "execution_order": list(plugin_ids),
+            "services": {pid: {"plugin_id": pid} for pid in plugin_ids},
+        }
+        try:
+            dlg = ServiceDescriptionDialog.from_set(definition, parent=self)
+            dlg.exec()
+        except (RuntimeError, AttributeError) as e:
+            self.log(f"Info-Dialog nicht möglich: {e}")
+
     @Slot(str, int)
     def _on_run_worker_finished(self, scope_id: str, stored: int) -> None:
         """Loggt den Abschluss des gezielten Runs (FeatureStore-Persistenz).
@@ -25452,7 +27826,14 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         des aktiven Sets (ServiceSetRepository.save_set, ohne Neuberechnung),
         entfernt den '*' -Dirty-Marker im Baum und emittiert den EventBus
         (Live-Sync aller ServiceSelectorModel-Instanzen).
+
+        17.01.04: Im Standalone-Plugin-Modus (_current_plugin_editing)
+        laeuft die Persistenz ueber global_settings (_save_plugin_params)
+        statt ueber ServiceSetRepository.
         """
+        if self._current_plugin_editing:
+            self._save_plugin_params()
+            return
         if not self._current_set_id:
             self.log("Kein Set geladen – Speichern nicht möglich.")
             return
@@ -25476,7 +27857,32 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         (FeatureStore-Persistenz + EventBus-Sync): Dadurch wird der
         '*' -Marker entfernt und nach Abschluss das Ausfuehrungsdatum
         '(DD.MM.JJ)' im MasterTree live aktualisiert.
+
+        17.01.04: Im Standalone-Plugin-Modus wird nur der eine Service
+        gespeichert (global_settings) und ausgefuehrt.
         """
+        if self._current_plugin_editing:
+            plugin_id = self._current_plugin_editing
+            if not self._save_plugin_params():
+                return
+            definition = self.collect_set_definition()
+            symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
+            # U15-E: Zeitachsen-Control der Filterleiste (combo_tf) – kann
+            # auch 'ALLE Timeframes' sein (Multi-TF-Ausfuehrung im Worker).
+            timeframe = self.combo_tf.currentText() if self.combo_tf else "H1"
+            reply = QMessageBox.question(
+                self, "Speichern & Ausführen",
+                f"Plugin '{plugin_id}' wurde gespeichert.\n\n"
+                f"Jetzt ausführen?\n"
+                f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+                f"Der Service wird neu berechnet und der Feature-Store-Payload "
+                f"in analytics.duckdb geschrieben.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                self.log("Ausführung abgebrochen (Parameter gespeichert).")
+                return
+            self._start_run_worker(plugin_id, definition, instance_id=plugin_id)
+            return
         if not self._current_set_id:
             self.log("Kein Set geladen – Speichern & Ausführen nicht möglich.")
             return
@@ -26003,6 +28409,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         Parameter-Spalten)."""
         self._current_set_id = None
         self._current_set_definition = None
+        # 17.01.04: Auch den Standalone-Plugin-Editor-Modus beenden.
+        self._current_plugin_editing = None
         # Phase 15 (Dirty-State): Marker des vorherigen Sets entfernen.
         self._clear_dirty_markers()
         self._clear_service_columns()
@@ -26215,6 +28623,13 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             cfg = (self._current_set_definition.get("services") or {}).get(instance_id)
             if isinstance(cfg, dict):
                 cfg["description"] = clean
+        # 17.01.04: Standalone-Plugin-Editor – Beschreibung in die Plugin-
+        # Konfiguration (global_settings) uebernehmen statt in ein Set.
+        if self._current_plugin_editing:
+            if self._save_plugin_params():
+                self.log(f"Instanz-Beschreibung '{instance_id}' gespeichert "
+                         f"(Plugin).")
+            return
         if not set_id:
             self.log(f"Instanz-Beschreibung '{instance_id}' aktualisiert "
                      f"(Set noch nicht gespeichert).")
@@ -26362,6 +28777,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
     def _resolve_info_plugin(self, plugin_id: str):
         """Liefert das Plugin aus der Registry (oder None + Log-Eintrag)."""
         try:
+            from analytics.features.feature_builder import PluginRegistry
             return PluginRegistry().get(plugin_id)
         except KeyError:
             self.log(f"Plugin '{plugin_id}' nicht gefunden.")
@@ -26991,256 +29407,71 @@ class ServiceSetTrashDialog(QDialog):
 
 --------------------------------------------------
 
-### DATEI: test/check_stylepicker_16_06.py
+### DATEI: test/_probe_meta.py
 ```py
-# test/check_stylepicker_16_06.py
-"""Phase 16.06.01 – Verifikation des Popover-StylePicker-Refactorings.
+# test/_probe_meta.py - temporary probe (deleted after use)
+# Lists all plugins with empty/missing description fields.
+import sys, io, os
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-Headless-Beweis fuer die Refactoring-Anweisung (Popover StylePickerDialog &
-Cleanup) und die praezisierten Entscheidungen (Kapitel 5):
-  1) Die StylePickerWidgets im Indikator-Prop-Fenster bestehen AUSSCHLIESSLICH
-     aus einem QPushButton (keine Inline-QSpinBox/QComboBox/QCheckBox mehr).
-  2) Der StylePickerDialog ist vertikal zweigeteilt (Color-Grid oben,
-     QFrame.HLine-Trennlinie, Zeichnungsparameter unten) und besitzt
-     [Übernehmen]/[Abbrechen].
-  3) color_only=True blendet Trennlinie + unteren Bereich aus (kompakt).
-  4) API-Invariante: get_style()/set_style()/set_color() + Properties
-     style_type/color_only/show_visibility + Signal style_changed bleiben
-     erhalten; ctrl.get_style().color funktioniert.
-  5) Die Alt-Felder (line_style/line_width/circle_shape_*/circle_size_*)
-     werden in KEINEM Indikator mehr als eigene Controls gerendert.
-  6) Das Fenster-X (WindowCloseButtonHint) ist fuer alle Indikator-
-     Prop-Fenster gesetzt (generisch).
+from analytics.features.feature_builder import PluginRegistry
 
-KEINE GUI-Ausfuehrung (offscreen, kein exec).
-"""
-import os
-import sys
-import tempfile
+reg = PluginRegistry()
+all_pids = sorted(reg.plugins.keys())
+print(f"PLUGIN COUNT: {len(all_pids)}")
+empty = []
+for pid in all_pids:
+    try:
+        p = reg.get(pid)
+        meta = dict(getattr(p, "metadata", None) or {})
+        desc = str(meta.get("description") or "").strip()
+        if not desc:
+            empty.append(pid)
+        if "swing" in pid.lower():
+            print(f"{pid}: desc={desc[:70]!r} cat={meta.get('category')!r}")
+    except Exception as e:
+        print(f"{pid}: ERROR {e!r}")
+print(f"EMPTY DESCRIPTIONS ({len(empty)}): {empty}")
+print("PROBE DONE")
 
-sys.path.insert(0, r"F:\Python\PyTrader")
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+```
 
-from PySide6.QtWidgets import (  # noqa: E402
-    QApplication, QCheckBox, QComboBox, QDialog, QFrame, QPushButton,
-    QSpinBox,
-)
-from PySide6.QtCore import Qt  # noqa: E402
+--------------------------------------------------
 
-_app = QApplication.instance() or QApplication(sys.argv)
+### DATEI: test/_probe_sets.py
+```py
+# test/_probe_sets.py - temporary probe (deleted after use)
+# Inspects service_sets in app_data.duckdb for swing-service instances.
+import sys, io, os, json
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from state_manager import StateManager  # noqa: E402
-from chart.indicators.multi_ma import MultiMovingAverageIndicator  # noqa: E402
-from chart.indicators.fixed_grid_proximity import FixedGridProximityIndicator  # noqa: E402
-from chart.indicator_dialog import IndicatorSettingsDialog  # noqa: E402
-from chart.widgets.style_picker_widget import (  # noqa: E402
-    LINE_STYLES, MARKER_SHAPES, LineStyle, MarkerStyle, StylePickerDialog,
-    StylePickerWidget,
-)
+from db_service import DbPool
 
-tmp = tempfile.mkdtemp(prefix="sp16_")
-sm = StateManager(db_path=os.path.join(tmp, "app_data.duckdb"))
+db = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "app_data.duckdb")
+con = DbPool.get(db)
+tables = con.execute("SELECT table_name FROM information_schema.tables ORDER BY 1").fetchall()
+print("TABLES:", [t[0] for t in tables])
 
-# ServiceSetRepository auf Test-DB umleiten (analog test/test.py), damit der
-# FixedGridProximity-Dialog (Service-Pfad) nicht auf die echte sets.duckdb
-# zugreift (DuckDB Single-Writer / laufende App).
-import analytics.engine.service_set_repository as _ssr_mod  # noqa: E402
-_orig_ssr_init = _ssr_mod.ServiceSetRepository.__init__
-def _patched_ssr_init(self, db_path=None, *a, **kw):
-    _orig_ssr_init(self, db_path or os.path.join(tmp, "sets.duckdb"), *a, **kw)
-_ssr_mod.ServiceSetRepository.__init__ = _patched_ssr_init
-
-FAILURES = []
-
-
-def check(name, cond, detail=""):
-    s = "PASS" if cond else "FAIL"
-    print(f"[{s}] {name}" + (f" - {detail}" if detail and not cond else ""))
-    if not cond:
-        FAILURES.append(name)
-
-
-def widget_children(ctrl):
-    """Direkte QWidget-Kinder des Picker-Widgets (ohne Layout-Abstraktion)."""
-    return [ctrl.layout().itemAt(i).widget()
-            for i in range(ctrl.layout().count())
-            if ctrl.layout().itemAt(i).widget() is not None]
-
-
-def only_button(ctrl):
-    """True, wenn das Widget ausschliesslich aus einem QPushButton besteht
-    und KEINE Inline-SpinBox/ComboBox/CheckBox mehr direkt anzeigt."""
-    kids = widget_children(ctrl)
-    buttons = [w for w in kids if isinstance(w, QPushButton)]
-    extras = [w for w in kids
-              if isinstance(w, (QSpinBox, QComboBox, QCheckBox))]
-    return len(kids) == 1 and len(buttons) == 1 and not extras
-
-
-def dialog_line(ctrl):
-    """Erzeugt den (nicht ausgefuehrten) LineStyle-Dialog wie beim Klick."""
-    return StylePickerDialog(
-        ctrl.get_style(), style_type=ctrl.style_type,
-        color_only=ctrl.color_only, enable_alpha=True,
-        show_visibility=ctrl.show_visibility, parent=ctrl)
-
-
-# ---------------------------------------------------------------------------
-# Teil A: Multi-MA – Button-Only-Picker + API-Invariante + Defaults
-# ---------------------------------------------------------------------------
-print("\n=== A) Multi-MA: Button-Only StylePicker ===")
-ma = MultiMovingAverageIndicator()
-dlg_ma = IndicatorSettingsDialog(ma, dict(ma.default_params), "Default", sm,
-                                 lambda p, pr: None, symbol="SILVER", timeframe="H1")
-
-ma_color_keys = ["ma1_bull_color"] + [f"ma{x}_color" for x in range(2, 9)]
-check("A1) maX_color/ma1_bull_color = Button-Only-Picker (kein Inline-Composite)",
-      all(isinstance(dlg_ma.param_controls[k], StylePickerWidget)
-          and not dlg_ma.param_controls[k].color_only
-          and only_button(dlg_ma.param_controls[k])
-          for k in ma_color_keys), "")
-
-# API-Invariante: get_style().color liefert weiterhin einen Farb-String.
-_ma1 = dlg_ma.param_controls["ma1_bull_color"]
-check("A2) API: ctrl.get_style().color funktioniert (Invariante 16.06.01)",
-      isinstance(_ma1.get_style(), LineStyle)
-      and isinstance(_ma1.get_style().color, str)
-      and _ma1.get_style().color.startswith("#"), "")
-
-# Defaults: MA1 w2/solid, MA2 w1/solid (Sibling-Defaults aus dem Schema).
-check("A3) Picker-Werte: MA1 w2/solid, MA2 w1/solid",
-      _ma1.get_style().width == 2 and _ma1.get_style().style == "solid"
-      and dlg_ma.param_controls["ma2_color"].get_style().width == 1
-      and dlg_ma.param_controls["ma2_color"].get_style().style == "solid",
-      f"MA1={_ma1.get_style().width}/{_ma1.get_style().style}")
-
-# Button-Vorschau-Text: '● 2px Solid' (Anweisung 16.06.01).
-check("A4) Button-Vorschau '● 2px Solid'",
-      _ma1._btn.text() == "● 2px Solid",
-      repr(_ma1._btn.text()))
-
-# ---------------------------------------------------------------------------
-# Teil B: FixedGridProximity – Button-Only + KEINE Alt-Einzelfelder
-# ---------------------------------------------------------------------------
-print("\n=== B) FixedGridProximity: Button-Only-Picker, Alt-Felder weg ===")
-fgp = FixedGridProximityIndicator()
-dlg_fgp = IndicatorSettingsDialog(fgp, dict(fgp.default_params), "Default", sm,
-                                  lambda p, pr: None, symbol="SILVER", timeframe="H1")
-
-line_p = dlg_fgp.param_controls.get("line_color")
-std_p = dlg_fgp.param_controls.get("circle_color_std")
-act_p = dlg_fgp.param_controls.get("circle_color_active")
-check("B1) line_color = LineStyle-Picker (Button-Only, style_type line)",
-      line_p is not None and isinstance(line_p, StylePickerWidget)
-      and line_p.style_type == "line" and only_button(line_p), "")
-check("B2) circle_color_std/_active = MarkerStyle-Picker (Button-Only)",
-      std_p is not None and act_p is not None
-      and isinstance(std_p, StylePickerWidget)
-      and isinstance(act_p, StylePickerWidget)
-      and std_p.style_type == "marker" and act_p.style_type == "marker"
-      and only_button(std_p) and only_button(act_p), "")
-
-alt_keys = ("line_style", "line_width", "circle_shape_std", "circle_shape_active",
-            "circle_size_std", "circle_size_active")
-rendered_alt = [k for k in alt_keys
-                if k in dlg_fgp.param_controls or k in dlg_fgp.params]
-check("B3) KEINE Alt-Einzelfelder gerendert/persistiert",
-      not rendered_alt, str(rendered_alt))
-check("B4) Schema ohne Alt-Keys",
-      not any(k in fgp.parameter_schema for k in alt_keys),
-      str([k for k in alt_keys if k in fgp.parameter_schema]))
-
-# ---------------------------------------------------------------------------
-# Teil C: StylePickerDialog – zweigeteilt, color_only kompakt, API
-# ---------------------------------------------------------------------------
-print("\n=== C) StylePickerDialog (Popover) ===")
-
-# C1: LineStyle-Dialog (voll) – Spin 1-10, Combo LINE_STYLES, HLine sichtbar,
-#     unterer Bereich sichtbar, [Übernehmen]/[Abbrechen].
-_dlg_line = StylePickerDialog(LineStyle(), style_type="line")
-_spin_line = _dlg_line._param_spin
-_combo_line = _dlg_line._param_combo
-check("C1) Line-Dialog: Spin 1-10 px + Combo LINE_STYLES + HLine + Params sichtbar",
-      _dlg_line._separator.isVisibleTo(_dlg_line)
-      and _dlg_line._params_widget.isVisibleTo(_dlg_line)
-      and _spin_line.minimum() == 1 and _spin_line.maximum() == 10
-      and [_combo_line.itemText(i) for i in range(_combo_line.count())] == LINE_STYLES
-      and _dlg_line._separator.frameShape() == QFrame.HLine, "")
-
-# C2: MarkerStyle-Dialog – Spin 1-20, Combo MARKER_SHAPES.
-_dlg_marker = StylePickerDialog(MarkerStyle(), style_type="marker")
-_spin_marker = _dlg_marker._param_spin
-_combo_marker = _dlg_marker._param_combo
-check("C2) Marker-Dialog: Spin 1-20 px + Combo MARKER_SHAPES",
-      _spin_marker.minimum() == 1 and _spin_marker.maximum() == 20
-      and [_combo_marker.itemText(i) for i in range(_combo_marker.count())] == MARKER_SHAPES, "")
-
-# C3: color_only -> HLine + unterer Bereich ausgeblendet (kompakt).
-_dlg_co = StylePickerDialog(LineStyle(), style_type="line", color_only=True)
-check("C3) color_only: HLine + unterer Bereich setVisible(False)",
-      not _dlg_co._separator.isVisibleTo(_dlg_co)
-      and not _dlg_co._params_widget.isVisibleTo(_dlg_co), "")
-
-# C4: Dialog-API – get_style() nach Aenderung (Spin=4, Combo=dashed).
-_dlg_edit = StylePickerDialog(LineStyle(width=2, style="solid"), style_type="line")
-_dlg_edit._param_spin.setValue(4)
-_dlg_edit._param_combo.setCurrentText("dashed")
-_dlg_edit.accept()  # Uebernehmen
-_edited = _dlg_edit.get_style()
-check("C4) Dialog get_style() nach Uebernahme (width 4 / dashed)",
-      isinstance(_edited, LineStyle)
-      and _edited.width == 4 and _edited.style == "dashed", "")
-
-# C5: Dialog-Farbbereich – Palette + Hex-Feld + Alpha-Slider + Anpassen-Button.
-check("C5) Farbbereich: Palette-Buttons + Hex-Feld + Alpha-Slider + [Anpassen...]",
-      len(_dlg_line.findChildren(QPushButton)) >= 16
-      and _dlg_line._hex_edit is not None
-      and _dlg_line._alpha_slider is not None
-      and _dlg_line._custom_btn.text() == "Anpassen...", "")
-
-# C6: set_color()/set_style() des Widgets (keine Signal-Emission) + Preview.
-_spw = StylePickerWidget(style=LineStyle(), style_type="line")
-_spw.set_style(LineStyle(show=True, color="#FF0000", width=3, style="dashed"))
-check("C6) set_style: get_style() + Button-Preview aktualisiert (w3/dashed/#FF0000)",
-      _spw.get_style().width == 3 and _spw.get_style().style == "dashed"
-      and _spw.get_style().color == "#FF0000"
-      and _spw._btn.text() == "● 3px Dashed", "")
-
-# C7: style_changed wird bei Uebernahme emittiert (Widget-Klick simuliert,
-#     exec() durch Auto-Accept ersetzt, ohne GUI).
-_emitted = []
-_spw2 = StylePickerWidget(style=LineStyle(), style_type="line")
-_spw2.style_changed.connect(_emitted.append)
-_orig_exec = StylePickerDialog.exec
-def _auto_accept(dlg):
-    dlg._param_spin.setValue(5)
-    dlg.accept()
-    return QDialog.Accepted
-StylePickerDialog.exec = _auto_accept
 try:
-    _spw2._btn.click()
-finally:
-    StylePickerDialog.exec = _orig_exec
-check("C7) Klick -> Dialog akzeptiert -> style_changed(w5) + Widget-Update",
-      len(_emitted) == 1 and _emitted[0].width == 5
-      and _spw2.get_style().width == 5, "")
-
-# ---------------------------------------------------------------------------
-# Teil D: Fenster-X (WindowCloseButtonHint) generisch gesetzt
-# ---------------------------------------------------------------------------
-print("\n=== D) Fenster-X fuer alle Indikator-Prop-Fenster ===")
-for name, dlg in (("Multi-MA", dlg_ma), ("FixedGridProximity", dlg_fgp)):
-    flags = dlg.windowFlags()
-    has_x = bool(flags & Qt.WindowCloseButtonHint)
-    check(f"D1) {name}: WindowCloseButtonHint gesetzt", has_x,
-          f"flags={int(flags)}")
-
-print("-" * 60)
-if FAILURES:
-    print(f"FEHLER: {len(FAILURES)}: {FAILURES}")
-    sys.exit(1)
-print("ALLE PRUEFUNGEN BESTANDEN (OK)")
-sys.exit(0)
+    rows = con.execute("SELECT set_id, display_name, definition, description, updated_at FROM service_sets").fetchall()
+    print(f"SETS: {len(rows)}")
+    for r in rows:
+        try:
+            defi = json.loads(r[2]) if r[2] else {}
+        except Exception:
+            defi = {}
+        instances = defi.get("instances") or []
+        swing = [i for i in instances if "srv_swing" in str(i.get("plugin_id", ""))]
+        print(f"- set_id={r[0]!r} display={r[1]!r} desc={r[3]!r} instances={len(instances)} swing_instances={len(swing)}")
+        for i in swing:
+            print(f"    inst service_id={i.get('service_id')!r} plugin={i.get('plugin_id')!r} "
+                  f"description={str(i.get('description'))[:80]!r}")
+except Exception as e:
+    print("ERROR service_sets:", repr(e))
+con.close()
+print("PROBE DONE")
 
 ```
 
@@ -29450,16 +31681,19 @@ pump()
 _cat_items13 = [i for i in TreeItemIterator(_tree13d)
                 if i is not None
                 and i.data(0, ROLE_NODE_TYPE) == TYPE_CATEGORY]
-# plugin_a mit Kategorie 'A/B' erscheint in BEIDEN Gruppen (⚡ Standalone +
-# 📦 Plugins) -> 2 Baeume x 2 Ordner (A, B) = 4 Ordner-Knoten.
+# 17.01.01: plugin_a mit Kategorie 'A/B' erscheint NUR noch in der
+# Services-Gruppe (Standalone-Gruppe entfaellt) -> 1 Baum x 2 Ordner
+# (A, B) = 2 Ordner-Knoten.
 check("P16.08 T5) Ordner-Knoten im Baum vorhanden",
-      len(_cat_items13) == 4, str(len(_cat_items13)))
+      len(_cat_items13) == 2, str(len(_cat_items13)))
 if _cat_items13:
     _cat13 = _cat_items13[0]
     check("P16.08 T5) Ordner nicht auswaehlbar (K3)",
           not (_cat13.flags() & Qt.ItemIsSelectable), "")
-    check("P16.08 T5) Ordner ohne Info-Button (K5)",
-          _tree13d.itemWidget(_cat13, 1) is None, "")
+    # 17.01.02 (Bugfix-Runde): Kategorie-Ordner tragen jetzt einen
+# Info-Button (wie Set-Zeilen) – emittiert category_info_requested.
+check("P16.08 T5) Ordner MIT Info-Button (17.01.02)",
+      _tree13d.itemWidget(_cat13, 1) is not None, "")
 # Checkbox-Modus: Ordner nicht anhakbar (K4); Plugin-Blatt in Ordner bleibt
 # checked_services-faehig.
 _tree13d.set_checkable(True)
@@ -29483,7 +31717,1198 @@ if _cat_items13b:
 _tree13d.hide()
 pump()
 
+
+# ---------------------------------------------------------------------------
+# Teil 14 (Phase 17.01, 07.08.2026): Grouped Swing Services (E-1..E-8).
+#   T1) PluginRegistry enthaelt srv_swing_structure / _momentum / _volume_profile
+#   T2) MasterTree-Kategorien (build_tree, echte Plugin-Instanzen + Duck-Typ-
+#       Stubs wie Teil 13): 'Swing Points/Geometrie', 'Swing Points/Dynamik &
+#       Filter', 'Swing Points/Volumen & Grid'
+#   T3) PK-Migration: 2 Services koexistieren auf derselben Bar
+#       (store_plugin_payload, 4-Spalten-Upsert auf Test-DB)
+#   T4) Negativtest: 3-Spalten-ON CONFLICT wirft nach Migration BinderException
+# ---------------------------------------------------------------------------
+print("\n=== Teil 14: Phase 17.01 Swing Services (E-1..E-8) ===")
+from analytics.features.feature_builder import (  # noqa: E402
+    PluginRegistry, FeatureBuilder,
+)
+
+# --- T1: Registry-Registrierung --------------------------------------------
+_reg1701 = PluginRegistry()
+_p1701_ids = [
+    "srv_swing_structure",
+    "srv_swing_momentum",
+    "srv_swing_volume_profile",
+]
+_p1701_plugins = {}
+for _pid1701 in _p1701_ids:
+    try:
+        _p1701_plugins[_pid1701] = _reg1701.get(_pid1701)
+        check(f"17.01 T1) Registry {_pid1701}", True, "")
+    except KeyError:
+        check(f"17.01 T1) Registry {_pid1701}", False, "nicht registriert")
+
+# --- T2: MasterTree-Kategorien (build_tree, echte Plugins) ------------------
+_p1701_model = ServiceSelectorModel(
+    set_repo=_P1608SetRepo(), state_manager=_P1608StateMgr(),
+    registry=_P1608Registry(_p1701_plugins), feature_store_reader=_P1608FSReader())
+_p1701_tree = _p1701_model.build_tree()
+_p1701_group = _p1608_group(_p1701_tree, ServiceSelectorModel.GROUP_PLUGINS)
+
+
+def _p1701_categories(node, prefix, acc):
+    """Sammelt rekursiv alle Ordner-Pfade (z. B. 'Swing Points/Geometrie')."""
+    for n in node.get("children") or []:
+        if n.get("group") == ServiceSelectorModel.GROUP_CATEGORY:
+            label = n.get("label", "").replace("📁 ", "").strip()
+            full = f"{prefix}/{label}" if prefix else label
+            acc.append(full)
+            _p1701_categories(n, full, acc)
+
+
+_p1701_paths = []
+_p1701_categories(_p1701_group or {}, "", _p1701_paths)
+for _cat1701 in ["Swing Points/Geometrie", "Swing Points/Dynamik & Filter",
+                 "Swing Points/Volumen & Grid"]:
+    check(f"17.01 T2) Kategorie '{_cat1701}' im MasterTree",
+          any(_cat1701.lower() == p.lower() for p in _p1701_paths),
+          f"paths={_p1701_paths}")
+
+# --- T3/T4: PK-Migration – Koexistenz + Negativtest (Test-DB) ---------------
+_p1701_tmp = tempfile.mkdtemp(prefix="p1701_")
+_p1701_db = os.path.join(_p1701_tmp, "analytics_17.duckdb")
+_p1701_db = os.path.join(_p1701_tmp, "analytics_17.duckdb")
+# ACHTUNG: store_plugin_payload() schliesst eine uebergebene Connection
+# (Bestandsverhalten own_connection=True) -> pro Aufruf frisch oeffnen.
+_p1701_con = duckdb.connect(_p1701_db)
+_p1701_con.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR NOT NULL,
+        timeframe VARCHAR NOT NULL,
+        bar_time TIMESTAMPTZ NOT NULL,
+        ema_diff DOUBLE,
+        rsi_14 DOUBLE,
+        atr_normalized DOUBLE,
+        created_at TIMESTAMP DEFAULT current_timestamp,
+        feature_id VARCHAR NOT NULL DEFAULT 'native',
+        plugin_version VARCHAR,
+        feature_data JSON,
+        PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
+    )
+""")
+_p1701_con.close()
+_p1701_fb = object.__new__(FeatureBuilder)  # ohne __init__ (kein StateManager)
+_p1701_payload1 = {
+    "feature_id": "srv_swing_structure",
+    "plugin_version": "1.0.0",
+    "records": [{"bar_time": 1770000000, "is_swing_high": True}],
+}
+_p1701_payload2 = {
+    "feature_id": "srv_swing_momentum",
+    "plugin_version": "1.0.0",
+    "records": [{"bar_time": 1770000000, "is_swing_high": False}],
+}
+_p1701_con = duckdb.connect(_p1701_db)
+_n1701_1 = FeatureBuilder.store_plugin_payload(
+    _p1701_fb, "XAGUSD", "M1", _p1701_payload1, con=_p1701_con)
+_p1701_con = duckdb.connect(_p1701_db)
+_n1701_2 = FeatureBuilder.store_plugin_payload(
+    _p1701_fb, "XAGUSD", "M1", _p1701_payload2, con=_p1701_con)
+_p1701_con = duckdb.connect(_p1701_db)
+_p1701_rows = _p1701_con.execute("""
+    SELECT feature_id FROM feature_store
+    WHERE LOWER(symbol)='xagusd' AND LOWER(timeframe)='m1'
+      AND EXTRACT('epoch' FROM bar_time)::BIGINT = 1770000000
+    ORDER BY feature_id
+""").fetchall()
+_p1701_fids = [r[0] for r in _p1701_rows]
+check("17.01 T3) Zwei Services koexistieren auf derselben Bar",
+      _n1701_1 == 1 and _n1701_2 == 1 and set(_p1701_fids) == {
+          "srv_swing_structure", "srv_swing_momentum"},
+      f"rows={_p1701_fids}")
+try:
+    _p1701_con.execute("""
+        INSERT INTO feature_store (symbol, timeframe, bar_time, feature_id, feature_data)
+        VALUES ('XAGUSD','M1', to_timestamp(1770000000), 'srv_grid_lines', '{"x":1}')
+        ON CONFLICT (symbol, timeframe, bar_time) DO UPDATE SET
+            feature_data = EXCLUDED.feature_data
+    """)
+    check("17.01 T4) 3-Spalten-ON CONFLICT wirft nach Migration",
+          False, "kein Fehler geworfen")
+except duckdb.BinderException:
+    check("17.01 T4) 3-Spalten-ON CONFLICT wirft nach Migration", True, "")
+_p1701_con.close()
+import shutil  # noqa: E402
+shutil.rmtree(_p1701_tmp, ignore_errors=True)
+
+# ---------------------------------------------------------------------------
+# Teil 15 (Phase 17.01.01, 07.08.2026): MasterTree Refactoring.
+#   T1) GROUP_STANDALONE existiert nicht mehr (Konstante entfernt)
+#   T2) build_tree liefert genau 2 Root-Gruppen ('📁 Sets', '📦 Services')
+#   T3) Keine Gruppe 'standalone' mehr in der Hierarchie
+#   T4) Swing-Services (Teil 14) wandern in die Hauptgruppe: Kategorie-Ordner
+#       'Swing Points/...' + flache Blaetter koexistieren (K9: keine leeren)
+# ---------------------------------------------------------------------------
+print("\n=== Teil 15: Phase 17.01.01 MasterTree Refactoring ===")
+
+# --- T1: GROUP_STANDALONE entfernt ----------------------------------------
+check("17.01.01 T1) GROUP_STANDALONE existiert nicht mehr",
+      not hasattr(ServiceSelectorModel, "GROUP_STANDALONE"), "")
+
+# --- T2: Genau 2 Root-Gruppen mit kompakten Labels -------------------------
+_p170101_tree = _p1701_model.build_tree()
+_p170101_labels = [(g.get("group"), g.get("label")) for g in _p170101_tree]
+check("17.01.01 T2) Genau 2 Root-Gruppen (Sets/Services)",
+      len(_p170101_tree) == 2
+      and _p170101_labels == [
+          (ServiceSelectorModel.GROUP_SETS, "📁 Sets"),
+          (ServiceSelectorModel.GROUP_PLUGINS, "📦 Services")],
+      str(_p170101_labels))
+
+# --- T3: Keine Standalone-Gruppe in der Hierarchie -------------------------
+check("17.01.01 T3) Keine Gruppe 'standalone' in build_tree",
+      all(g.get("group") != "standalone" for g in _p170101_tree),
+      str(_p170101_labels))
+
+# --- T4: Swing-Services in der Hauptgruppe (Ordner + flache Blaetter) ------
+_p170101_group = _p1608_group(_p170101_tree, ServiceSelectorModel.GROUP_PLUGINS)
+_p170101_paths15 = []
+_p1701_categories(_p170101_group or {}, "", _p170101_paths15)
+_p170101_ids = set()
+
+
+def _p170101_collect_ids(node, acc):
+    for n in node.get("children") or []:
+        if n.get("group") == ServiceSelectorModel.GROUP_CATEGORY:
+            _p170101_collect_ids(n, acc)
+        else:
+            acc.add(n.get("plugin_id"))
+
+
+_p170101_collect_ids(_p170101_group or {}, _p170101_ids)
+check("17.01.01 T4) Swing-Services in Hauptgruppe (Ordner + Blaetter)",
+      "Swing Points/Geometrie" in _p170101_paths15
+      and set(_p1701_ids) <= _p170101_ids
+      and _p1608_no_empty(_p170101_group["children"]),
+      f"paths={_p170101_paths15} ids={sorted(_p170101_ids)}")
+
+# ---------------------------------------------------------------------------
+# Teil 16 (Phase 17.01.02, 07.08.2026): Services-Gruppen-Funktionalitaet.
+#   T1) ServiceSelectorModel.category_plugin_ids(): rekursiv (Praefix-Pfad),
+#       deterministisch sortiert, case-insensitiv.
+#   T2) Kategorie-Ordner tragen einen Info-Button und emittieren
+#       category_info_requested mit dem vollen Kategorie-Pfad.
+#   T3) run_plugin_requested / run_category_requested-Signale vorhanden.
+#   T4) Ad-hoc-Definitionen (Plugin-/Kategorie-Run) sind evaluator-tauglich:
+#       execution_order/services-konsistent + prepare_worker_definition ok.
+# ---------------------------------------------------------------------------
+print("\n=== Teil 16: Phase 17.01.02 Services-Gruppen-Funktionalitaet ===")
+
+# --- T1: category_plugin_ids (rekursiv) -------------------------------------
+_p170102_model = _p1608_model({
+    "srv_a": _P1608Plugin("srv_a", category="Swing Points/Geometrie"),
+    "srv_b": _P1608Plugin("srv_b", category="Swing Points/Dynamik & Filter"),
+    "srv_c": _P1608Plugin("srv_c", category="Swing Points/Geometrie"),
+    "srv_flat": _P1608Plugin("srv_flat", category="Grid"),
+    "srv_none": _P1608Plugin("srv_none", category=""),
+})
+check("17.01.02 T1) category_plugin_ids('Swing Points/Geometrie')",
+      _p170102_model.category_plugin_ids("Swing Points/Geometrie")
+      == ["srv_a", "srv_c"],
+      str(_p170102_model.category_plugin_ids("Swing Points/Geometrie")))
+check("17.01.02 T1) category_plugin_ids('Swing Points') rekursiv",
+      _p170102_model.category_plugin_ids("Swing Points")
+      == ["srv_a", "srv_b", "srv_c"],
+      str(_p170102_model.category_plugin_ids("Swing Points")))
+check("17.01.02 T1) category_plugin_ids case-insensitiv",
+      _p170102_model.category_plugin_ids("swing points/geometrie")
+      == ["srv_a", "srv_c"],
+      str(_p170102_model.category_plugin_ids("swing points/geometrie")))
+check("17.01.02 T1) category_plugin_ids leer -> []",
+      _p170102_model.category_plugin_ids("") == [])
+
+# --- T2: Ordner-Info-Button + category_info_requested -----------------------
+_p170102_tree = MasterTree(_p170102_model)
+_p170102_tree.expandAll()
+pump()
+_p170102_cat_items = [i for i in TreeItemIterator(_p170102_tree)
+                      if i is not None
+                      and i.data(0, ROLE_NODE_TYPE) == TYPE_CATEGORY]
+_p170102_cat_sigs = []
+_p170102_tree.category_info_requested.connect(_p170102_cat_sigs.append)
+_cat_btn_ok = False
+_cat_path_ok = False
+for _ci in _p170102_cat_items:
+    _btn = _p170102_tree.itemWidget(_ci, 1)
+    if isinstance(_btn, QPushButton):
+        _cat_btn_ok = True
+        _btn.click()
+        if _p170102_cat_sigs:
+            _cat_path_ok = (_p170102_cat_sigs[-1]
+                            == "Swing Points/Geometrie")
+check("17.01.02 T2) Ordner-Info-Button vorhanden",
+      _cat_btn_ok, "")
+check("17.01.02 T2) category_info_requested Pfad korrekt",
+      _cat_path_ok, "sigs=" + str(_p170102_cat_sigs))
+check("17.01.02 T2) category_plugin_ids stimmt mit Pfad ueberein",
+      _p170102_cat_sigs and _p170102_model.category_plugin_ids(
+          _p170102_cat_sigs[-1]) == ["srv_a", "srv_c"],
+      "sigs=" + str(_p170102_cat_sigs))
+
+# --- T3: Run-Signale vorhanden ----------------------------------------------
+_p170102_plugin_items = [i for i in TreeItemIterator(_p170102_tree)
+                         if i is not None
+                         and i.data(0, ROLE_NODE_TYPE) == TYPE_PLUGIN]
+check("17.01.02 T3) Plugin-Zeilen vorhanden",
+      any(i.data(0, ROLE_PLUGIN_ID) == "srv_a"
+          for i in _p170102_plugin_items), "")
+check("17.01.02 T3) run_plugin_requested-Signal vorhanden",
+      hasattr(_p170102_tree, "run_plugin_requested"), "")
+check("17.01.02 T3) run_category_requested-Signal vorhanden",
+      hasattr(_p170102_tree, "run_category_requested"), "")
+check("17.01.02 T3) category_info_requested-Signal vorhanden",
+      hasattr(_p170102_tree, "category_info_requested"), "")
+
+# --- T4: Ad-hoc-Definitionen evaluator-tauglich -----------------------------
+from serviceui.service_set_utils import prepare_worker_definition  # noqa: E402
+_p170102_def_plugin = {
+    "set_id": "plugin_srv_a",
+    "display_name": "srv_a",
+    "execution_order": ["srv_a"],
+    "services": {"srv_a": {"plugin_id": "srv_a"}},
+}
+_p170102_def_cat = {
+    "set_id": "category_Swing Points/Geometrie",
+    "display_name": "Swing Points/Geometrie",
+    "execution_order": ["srv_a", "srv_c"],
+    "services": {
+        "srv_a": {"plugin_id": "srv_a"},
+        "srv_c": {"plugin_id": "srv_c"},
+    },
+}
+for _label, _def in (("Plugin", _p170102_def_plugin),
+                     ("Kategorie", _p170102_def_cat)):
+    _order = _def["execution_order"]
+    _ok = (bool(_order)
+           and all(iid in _def["services"] for iid in _order)
+           and all((_def["services"][iid].get("plugin_id"))
+                   for iid in _order))
+    check("17.01.02 T4) " + _label + "-Definition konsistent", _ok,
+          str(_def))
+    _prep = prepare_worker_definition(dict(_def), 100000)
+    check("17.01.02 T4) " + _label + "-Definition prepare_worker ok",
+          _prep["execution_order"] == _def["execution_order"]
+          and set(_prep["services"]) == set(_def["services"]), "")
+
+_p170102_tree.hide()
+pump()
+
+
+# ===========================================================================
+# Teil 17: Phase 17.01.02 - srv_swing_structure echte Swing-Erkennung
+#   T1) Alle 6 Erkennungs-Modi liefern einen dichten Record-Satz
+#       (1 Record/Bar, Datenvertrag 17.01 §4) mit Swing-Highs/Lows,
+#       kausalen Zeitstempeln (confirmation >= event) und
+#       INSUFFICIENT_DATA am Serienanfang (Lookback-Modi).
+#   T2) store_plugin_payload persistiert den Payload in einer Test-DuckDB
+#       (feature_store, 4-Spalten-PK) -> Rows > 0
+#       (Bugfix '0 Feature-Row(s)' im Store, SILVER).
+# ===========================================================================
+print("\n=== Teil 17: Phase 17.01.02 Swing-Erkennung srv_swing_structure ===")
+
+from analytics.features.definitions.srv_swing_structure import SrvSwingStructure  # noqa: E402
+from analytics.features.feature_builder import FeatureBuilder  # noqa: E402
+import json as _json17  # noqa: E402
+
+_srv_sw = SrvSwingStructure()
+check("17 T0) plugin_id", _srv_sw.plugin_id == "srv_swing_structure",
+      _srv_sw.plugin_id)
+check("17 T0) capability feature_store",
+      bool(_srv_sw.capabilities.get("feature_store")), "")
+
+# --- Synthetische OHLCV-Serie (3 Tage M5, 864 Bars) mit klaren Swings ------
+# Sinusfoermige Preisbewegung (Amplitude 1.5) + kleines Wobble -> Fraktal-,
+# Pivot-, Gann-, ZigZag- und Period-Extrema-Swings sind garantiert erkennbar.
+_p17_n = 864
+_p17_period = 300  # M5
+_p17_t0 = 1700000000  # 2023-11-14, UTC
+_p17_ts = _p17_t0 + np.arange(_p17_n) * _p17_period
+_p17_ph = np.linspace(0.0, 6.0 * np.pi, _p17_n)
+_p17_close = 30.0 + 1.5 * np.sin(_p17_ph) + 0.02 * np.sin(_p17_ph * 7.0)
+_p17_open = _p17_close - 0.02  # konstanter Gap: high/low folgen
+                              # streng dem close -> Fraktal-Plateaus vermeiden
+_p17_high = np.maximum(_p17_open, _p17_close) + 0.08
+_p17_low = np.minimum(_p17_open, _p17_close) - 0.08
+_p17_df = pd.DataFrame({
+    "time": _p17_ts.astype(np.int64),
+    "open": _p17_open,
+    "high": _p17_high,
+    "low": _p17_low,
+    "close": _p17_close,
+})
+
+# --- T1: Alle Erkennungs-Modi -------------------------------------------------
+_p17_modes = [
+    ("Williams_Fractal", {"mode": "Williams_Fractal", "left_bars": 2, "right_bars": 2}),
+    ("Standard_Pivot", {"mode": "Standard_Pivot", "left_bars": 3, "right_bars": 3}),
+    ("Gann_Mechanical", {"mode": "Gann_Mechanical", "left_bars": 2, "right_bars": 2}),
+    ("ZigZag_ATR", {"mode": "ZigZag_ATR", "atr_period": 14, "atr_mult": 1.5}),
+    ("ZigZag_Pct", {"mode": "ZigZag_Pct", "change_pct": 0.5}),
+    ("Period_Extrema/Current", {"mode": "Period_Extrema", "period_extrema_type": "CURRENT_DEVELOPING"}),
+    ("Period_Extrema/PrevClosed", {"mode": "Period_Extrema", "period_extrema_type": "PREVIOUS_CLOSED"}),
+]
+_p17_payloads = {}
+for _label, _params in _p17_modes:
+    _res = _srv_sw.calculate(_p17_df, dict(_params))
+    _payload = _res.get("feature_store_payload") or {}
+    _recs = _payload.get("records") or []
+    _p17_payloads[_label] = _payload
+    check("17 T1) " + _label + ": records dicht",
+          len(_recs) == _p17_n, f"{len(_recs)}/{_p17_n}")
+    _n_hi = sum(1 for r in _recs if r["is_swing_high"])
+    _n_lo = sum(1 for r in _recs if r["is_swing_low"])
+    check("17 T1) " + _label + ": swing highs > 0", _n_hi > 0, str(_n_hi))
+    check("17 T1) " + _label + ": swing lows > 0", _n_lo > 0, str(_n_lo))
+    check("17 T1) " + _label + ": kausale Zeitstempel",
+          all(int(r["confirmation_bar_time"]) >= int(r["event_bar_time"])
+              for r in _recs), "")
+    _meta = _payload.get("metadata") or {}
+    check("17 T1) " + _label + ": schema_version",
+          _meta.get("schema_version") == "1.0.0",
+          str(_meta.get("schema_version")))
+    check("17 T1) " + _label + ": Metadata totals",
+          _meta.get("total_swing_highs") == _n_hi
+          and _meta.get("total_swing_lows") == _n_lo,
+          str(_meta))
+
+# INSUFFICIENT_DATA am Serienanfang (nur Lookback-Modi / Period-Extrema)
+for _label in ("Williams_Fractal", "Standard_Pivot", "Gann_Mechanical",
+               "ZigZag_ATR", "Period_Extrema/Current",
+               "Period_Extrema/PrevClosed"):
+    _recs = (_p17_payloads.get(_label) or {}).get("records") or []
+    _st = str(_recs[0]["calculation_status"]) if _recs else "no records"
+    check("17 T1) " + _label + ": Start INSUFFICIENT_DATA",
+          bool(_recs) and _recs[0]["calculation_status"] == "INSUFFICIENT_DATA",
+          _st)
+
+# --- T2: store_plugin_payload auf Test-DuckDB (feature_store) ----------------
+# Test-DB im test/-Ordner (Regel: Test-Datenbanken nie im Projekt-Root/data).
+_p17_db = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "test_p17_swing.duckdb")
+if os.path.exists(_p17_db):
+    os.remove(_p17_db)
+_con17 = duckdb.connect(_p17_db)
+_con17.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR NOT NULL,
+        timeframe VARCHAR NOT NULL,
+        bar_time TIMESTAMPTZ NOT NULL,
+        ema_diff DOUBLE,
+        rsi_14 DOUBLE,
+        atr_normalized DOUBLE,
+        created_at TIMESTAMP DEFAULT current_timestamp,
+        feature_id VARCHAR NOT NULL DEFAULT 'native',
+        plugin_version VARCHAR,
+        feature_data JSON,
+        PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
+    )
+""")
+_fb17 = FeatureBuilder()
+_p17_payload = _p17_payloads["Williams_Fractal"]
+_n_written = _fb17.store_plugin_payload("SILVER_TEST", "M5", _p17_payload,
+                                        con=_con17)
+# store_plugin_payload schliesst uebergebene Conns selbst (own_connection) ->
+# fuer die Verifikation neu verbinden.
+_con17_check = duckdb.connect(_p17_db)
+_p17_rows = _con17_check.execute(
+    "SELECT count(*) FROM feature_store WHERE symbol='SILVER_TEST' "
+    "AND timeframe='M5' AND feature_id='srv_swing_structure'"
+).fetchone()[0]
+_p17_feat = _con17_check.execute(
+    "SELECT feature_data FROM feature_store WHERE symbol='SILVER_TEST' "
+    "AND timeframe='M5' AND feature_id='srv_swing_structure' LIMIT 1"
+).fetchone()
+_con17_check.close()
+check("17 T2) store_plugin_payload rows > 0", _n_written == _p17_n,
+      str(_n_written))
+check("17 T2) feature_store rows == bars", _p17_rows == _p17_n,
+      str(_p17_rows))
+check("17 T2) feature_data ist JSON mit result_type",
+      bool(_p17_feat)
+      and _json17.loads(_p17_feat[0]).get("result_type") == "SWING",
+      str(_p17_feat[0] if _p17_feat else None)[:120])
+
+# Cleanup der Test-DB
+try:
+    os.remove(_p17_db)
+except OSError as _e17:
+    print("  [17] Cleanup Test-DB uebersprungen:", _e17)
+
+
+# ===========================================================================
+# Teil 18: Phase 17.01.02 - srv_swing_momentum + srv_swing_volume_profile
+#   T1) srv_swing_momentum (3 Modi, alle 12 MA-Typen) liefert dichte
+#       Record-Saetze mit Swing-Highs/Lows, kausalen Zeitstempeln,
+#       schema_version und INSUFFICIENT_DATA am Serienanfang (MA-/ATR-
+#       Warmup). Bugfix: Warmup-NaN darf die Hysterese-Erkennung nicht
+#       blockieren (vorher 0 Swings fuer SMA/WMA/HMA/...).
+#   T2) srv_swing_volume_profile (3 Modi) liefert dichte Record-Saetze mit
+#       den modus-spezifischen Zusatzfeldern (17.01 §4.2) und kausalen
+#       Zeitstempeln.
+#   T3) store_plugin_payload persistiert beide Payloads in einer
+#       Test-DuckDB (feature_store, 4-Spalten-PK) -> Rows == bars je
+#       feature_id (konfliktfreie Koexistenz auf derselben Kerze).
+#   T4) Bugfix 'Keine OHLCV-Daten'-Meldung (run_worker.py): Daten vorhanden
+#       + 0 Records -> praezise Meldung 'Kein Feature-Store-Payload';
+#       nur wenn die Quelle leer ist -> 'Keine OHLCV-Daten' (U18 bleibt).
+# ===========================================================================
+print("\n=== Teil 18: Phase 17.01.02 Momentum- + Volume-Profile-Erkennung ===")
+
+from analytics.features.definitions.srv_swing_momentum import SrvSwingMomentum  # noqa: E402
+from analytics.features.definitions.srv_swing_volume_profile import SrvSwingVolumeProfile  # noqa: E402
+
+_srv_mom = SrvSwingMomentum()
+_srv_vp = SrvSwingVolumeProfile()
+check("18 T0) plugin_ids", _srv_mom.plugin_id == "srv_swing_momentum"
+      and _srv_vp.plugin_id == "srv_swing_volume_profile",
+      _srv_mom.plugin_id + "/" + _srv_vp.plugin_id)
+check("18 T0) capability feature_store",
+      bool(_srv_mom.capabilities.get("feature_store"))
+      and bool(_srv_vp.capabilities.get("feature_store")), "")
+
+# --- Synthetische OHLCV-Serie (3 Tage M5, 864 Bars) mit Volumen -----------
+_p18_n = 864
+_p18_period = 300
+_p18_t0 = 1700000000
+_p18_ts = _p18_t0 + np.arange(_p18_n) * _p18_period
+_p18_ph = np.linspace(0.0, 6.0 * np.pi, _p18_n)
+_p18_close = 30.0 + 1.5 * np.sin(_p18_ph) + 0.02 * np.sin(_p18_ph * 7.0)
+_p18_open = _p18_close - 0.02
+_p18_high = np.maximum(_p18_open, _p18_close) + 0.08
+_p18_low = np.minimum(_p18_open, _p18_close) - 0.08
+_p18_vol = (1000.0 + 500.0 * np.abs(np.sin(_p18_ph * 3.0)) + 50.0).astype(np.int64)
+_p18_df = pd.DataFrame({
+    "time": _p18_ts.astype(np.int64),
+    "open": _p18_open,
+    "high": _p18_high,
+    "low": _p18_low,
+    "close": _p18_close,
+    "tick_volume": _p18_vol,
+})
+
+# --- T1: srv_swing_momentum -------------------------------------------------
+_p18_mom_modes = [
+    ("MA_Peak_Hysteresis",
+     {"mode": "MA_Peak_Hysteresis", "ma_type": "EMA", "period": 10,
+      "piv_maxMaMovePct": 0.1}),
+    ("MA_Slope_Change",
+     {"mode": "MA_Slope_Change", "ma_type": "SMA", "period": 10}),
+    ("Chande_Kroll_Ratchet",
+     {"mode": "Chande_Kroll_Ratchet", "chande_lookback": 10, "x_atr": 1.5,
+      "period": 14}),
+]
+_p18_mom_payloads = {}
+for _label, _params in _p18_mom_modes:
+    _payload = _srv_mom.calculate(_p18_df, dict(_params)).get(
+        "feature_store_payload") or {}
+    _recs = _payload.get("records") or []
+    _p18_mom_payloads[_label] = _payload
+    check("18 T1) mom " + _label + ": records dicht",
+          len(_recs) == _p18_n, f"{len(_recs)}/{_p18_n}")
+    _hi = sum(1 for r in _recs if r["is_swing_high"])
+    _lo = sum(1 for r in _recs if r["is_swing_low"])
+    check("18 T1) mom " + _label + ": highs > 0", _hi > 0, str(_hi))
+    check("18 T1) mom " + _label + ": lows > 0", _lo > 0, str(_lo))
+    check("18 T1) mom " + _label + ": kausale Zeitstempel",
+          all(int(r["confirmation_bar_time"]) >= int(r["event_bar_time"])
+              for r in _recs), "")
+    check("18 T1) mom " + _label + ": schema_version",
+          (_payload.get("metadata") or {}).get("schema_version") == "1.0.0",
+          str((_payload.get("metadata") or {}).get("schema_version")))
+
+# Alle 12 MA-Typen im MA_Peak_Hysteresis-Modus (Bugfix 0-Swings bei
+# Warmup-NaN, z. B. SMA/WMA/HMA/EHMA/ZLEMA/KAMA/ALMA/VWMA).
+_p18_ma_types = ["SMA", "EMA", "WMA", "DEMA", "TEMA", "HMA", "EHMA",
+                 "ZLEMA", "RMA", "KAMA", "ALMA", "VWMA"]
+for _mt in _p18_ma_types:
+    _payload = _srv_mom.calculate(_p18_df, {
+        "mode": "MA_Peak_Hysteresis", "ma_type": _mt, "period": 10,
+        "piv_maxMaMovePct": 0.1}).get("feature_store_payload") or {}
+    _recs = _payload.get("records") or []
+    _hi = sum(1 for r in _recs if r["is_swing_high"])
+    check("18 T1) mom MA-Typ " + _mt + ": highs > 0",
+          _hi > 0, f"{_hi}/{len(_recs)}")
+
+# Start-Status: Warmup-MA/ATR -> INSUFFICIENT_DATA am Serienanfang.
+_p18_start_mom = _srv_mom.calculate(_p18_df, {
+    "mode": "MA_Slope_Change", "ma_type": "SMA", "period": 10}).get(
+    "feature_store_payload") or {}
+_p18_start_recs = _p18_start_mom.get("records") or []
+check("18 T1) mom MA_Slope_Change/SMA: Start INSUFFICIENT_DATA",
+      bool(_p18_start_recs)
+      and _p18_start_recs[0]["calculation_status"] == "INSUFFICIENT_DATA",
+      str(_p18_start_recs[0]["calculation_status"]) if _p18_start_recs else "")
+_p18_start_ck = _srv_mom.calculate(_p18_df, {
+    "mode": "Chande_Kroll_Ratchet", "chande_lookback": 10, "x_atr": 1.5,
+    "period": 14}).get("feature_store_payload") or {}
+_p18_start_ck_recs = _p18_start_ck.get("records") or []
+check("18 T1) mom Chande_Kroll: Start INSUFFICIENT_DATA",
+      bool(_p18_start_ck_recs)
+      and _p18_start_ck_recs[0]["calculation_status"] == "INSUFFICIENT_DATA",
+      str(_p18_start_ck_recs[0]["calculation_status"])
+      if _p18_start_ck_recs else "")
+
+# --- T2: srv_swing_volume_profile -------------------------------------------
+_p18_vp_modes = [
+    ("Volume_Profile",
+     {"mode": "Volume_Profile", "profile_period": "Sessions",
+      "value_area_pct": 0.7, "lvn_sensitivity": 0.2,
+      "volume_source": "tick_volume"}),
+    ("Grid_Proximity", {"mode": "Grid_Proximity", "grid_step": 0.5}),
+    ("Anchored_VWAP",
+     {"mode": "Anchored_VWAP", "vwap_anchor": "Session_Start",
+      "vwap_band_mult": 2.0}),
+]
+_p18_vp_payloads = {}
+for _label, _params in _p18_vp_modes:
+    _payload = _srv_vp.calculate(_p18_df, dict(_params)).get(
+        "feature_store_payload") or {}
+    _recs = _payload.get("records") or []
+    _p18_vp_payloads[_label] = _payload
+    check("18 T2) vp " + _label + ": records dicht",
+          len(_recs) == _p18_n, f"{len(_recs)}/{_p18_n}")
+    check("18 T2) vp " + _label + ": kausale Zeitstempel",
+          all(int(r["confirmation_bar_time"]) >= int(r["event_bar_time"])
+              for r in _recs), "")
+    check("18 T2) vp " + _label + ": schema_version",
+          (_payload.get("metadata") or {}).get("schema_version") == "1.0.0",
+          str((_payload.get("metadata") or {}).get("schema_version")))
+    _ok = [r for r in _recs if r["calculation_status"] == "OK"]
+    check("18 T2) vp " + _label + ": OK-Bars vorhanden",
+          len(_ok) > 0, str(len(_ok)))
+    if _label == "Volume_Profile":
+        check("18 T2) vp Volume_Profile: Felder §4.2",
+              all({"poc_price", "vah_price", "val_price", "lvn_price",
+                   "is_lvn_swing", "volume_source"} <= set(r)
+                  for r in _ok), "")
+        check("18 T2) vp Volume_Profile: POC/VAH/VAL numerisch",
+              all(r["poc_price"] is not None and r["vah_price"] is not None
+                  and r["val_price"] is not None for r in _ok), "")
+        check("18 T2) vp Volume_Profile: VA-Grenzen konsistent",
+              all(r["vah_price"] >= r["poc_price"] >= r["val_price"]
+                  for r in _ok), "")
+        check("18 T2) vp Volume_Profile: LVN-Swings + Preis-Swings > 0",
+              any(r["is_lvn_swing"] for r in _ok)
+              and any(r["is_swing_high"] for r in _ok)
+              and any(r["is_swing_low"] for r in _ok), "")
+    elif _label == "Grid_Proximity":
+        check("18 T2) vp Grid_Proximity: grid_price-Feld",
+              all("grid_price" in r for r in _ok), "")
+        check("18 T2) vp Grid_Proximity: Crossings > 0",
+              any(r["is_swing_high"] for r in _recs)
+              and any(r["is_swing_low"] for r in _recs), "")
+    else:  # Anchored_VWAP
+        check("18 T2) vp Anchored_VWAP: vwap-Felder §4.2",
+              all({"vwap_price", "vwap_upper", "vwap_lower"} <= set(r)
+                  for r in _ok), "")
+        check("18 T2) vp Anchored_VWAP: upper >= vwap >= lower",
+              all(r["vwap_upper"] >= r["vwap_price"] >= r["vwap_lower"]
+                  for r in _ok), "")
+        check("18 T2) vp Anchored_VWAP: event=Anker <= confirmation",
+              all(int(r["event_bar_time"]) <= int(r["confirmation_bar_time"])
+                  for r in _recs), "")
+
+# --- T3: store_plugin_payload auf Test-DuckDB --------------------------------
+_p18_db = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "test_p18_swing.duckdb")
+if os.path.exists(_p18_db):
+    os.remove(_p18_db)
+_con18 = duckdb.connect(_p18_db)
+_con18.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR NOT NULL,
+        timeframe VARCHAR NOT NULL,
+        bar_time TIMESTAMPTZ NOT NULL,
+        ema_diff DOUBLE,
+        rsi_14 DOUBLE,
+        atr_normalized DOUBLE,
+        created_at TIMESTAMP DEFAULT current_timestamp,
+        feature_id VARCHAR NOT NULL DEFAULT 'native',
+        plugin_version VARCHAR,
+        feature_data JSON,
+        PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
+    )
+""")
+_fb18 = FeatureBuilder()
+_p18_store_payloads = [
+    ("srv_swing_momentum", _p18_mom_payloads["MA_Peak_Hysteresis"]),
+    ("srv_swing_volume_profile", _p18_vp_payloads["Volume_Profile"]),
+]
+for _fid18, _payload18 in _p18_store_payloads:
+    # store_plugin_payload schliesst uebergebene Conns selbst
+    # (own_connection=True) -> pro Store eine frische Connection.
+    _con18 = duckdb.connect(_p18_db)
+    _n18 = _fb18.store_plugin_payload("SILVER_TEST", "H1", _payload18,
+                                      con=_con18)
+    check("18 T3) store " + _fid18 + " rows == bars", _n18 == _p18_n,
+          str(_n18))
+_con18_check = duckdb.connect(_p18_db)
+for _fid18 in ("srv_swing_momentum", "srv_swing_volume_profile"):
+    _cnt18 = _con18_check.execute(
+        "SELECT count(*) FROM feature_store WHERE symbol='SILVER_TEST' "
+        "AND timeframe='H1' AND feature_id='" + _fid18 + "'").fetchone()[0]
+    check("18 T3) DB rows " + _fid18, _cnt18 == _p18_n, str(_cnt18))
+_con18_check.close()
+try:
+    os.remove(_p18_db)
+except OSError as _e18:
+    print("  [18] Cleanup Test-DB uebersprungen:", _e18)
+
+# --- T4: Worker-Meldung differenzieren (Bugfix run_worker.py) ---------------
+class _FB18:
+    """Fake-FeatureBuilder mit Daten (H1/M30) – kein DB-Zugriff."""
+
+    def __init__(self):
+        self.calls = []
+
+    def load_ohlcv(self, symbol, tf, limit=None):
+        return _p18_df.copy() if tf in ("H1", "M30") else None
+
+    def store_plugin_payload(self, symbol, tf, payload):
+        self.calls.append((symbol, tf, payload))
+
+
+class _Eval18Empty:
+    """Fake-Evaluator: Service liefert 0 Records (wie Scaffold)."""
+
+    def execute_set(self, definition, df_plugin, context=None):
+        return {"srv_a": {"feature_store_payload": {
+            "feature_id": "srv_a", "plugin_version": "1.0.0",
+            "records": []}}}
+
+
+import analytics.features.feature_builder as _fbm18  # noqa: E402
+_orig_fb18 = _fbm18.FeatureBuilder
+_fbm18.FeatureBuilder = lambda: _FB18()
+try:
+    # Daten vorhanden + 0 Records -> praezise Meldung, KEIN 'Keine OHLCV'
+    _fail18 = []
+    _wk18 = ServiceRunWorker(_Eval18Empty(), "SILVER", "H1", w_worker_def)
+    _wk18.run_failed.connect(lambda sid, e: _fail18.append((sid, e)))
+    _wk18.run()
+    check("18 T4) Daten + 0 Records -> 'Kein Feature-Store-Payload'",
+          len(_fail18) == 1
+          and "Kein Feature-Store-Payload" in _fail18[0][1]
+          and "Keine OHLCV-Daten" not in _fail18[0][1], str(_fail18))
+finally:
+    _fbm18.FeatureBuilder = _orig_fb18
+
 print("-" * 60)
+
+# ===========================================================================
+# Teil 19 (Bugfix-Runde 2, 07.08.2026):
+#   T1) i-Button Plugin-Zeilen unter 'Services' – _on_tree_info_requested
+#       ohne NameError (fehlender PluginRegistry-Import in _resolve_info_plugin)
+#   T2) store_plugin_payload setzt created_at auch fuer NEUE Rows
+#       (PK-Migration hatte den Spalten-DEFAULT entfernt -> 'Datum letzter
+#       Run' im MasterTree blieb '--.--.--'; Fix 1 + Fix 2)
+# ===========================================================================
+print("\n=== Teil 19: Bugfix i-Button Plugin-Zeilen + Datum letzter Run ===")
+
+# --- 19 T1: Plugin-Info-Dialog (Bug a) --------------------------------------
+from analytics.engine.description_dialog import (  # noqa: E402
+    ServiceDescriptionEditDialog,
+)
+
+_p19_dlg_calls = []
+
+
+def _fake_exec19(self):
+    _p19_dlg_calls.append(self.windowTitle())
+    return 1  # QDialog.Accepted
+
+
+_orig_exec19 = ServiceDescriptionEditDialog.exec
+ServiceDescriptionEditDialog.exec = _fake_exec19
+try:
+    _p19_plugin_id = "srv_grid_lines"
+    # Signal-Handler-Pfad: info_requested("", "", plugin_id) -> Plugin-Zweig
+    w._on_tree_info_requested("", "", _p19_plugin_id)
+    check("19 T1) i-Button Plugin-Zeile oeffnet Dialog (kein NameError)",
+          len(_p19_dlg_calls) == 1
+          and "Service-Beschreibung bearbeiten" in _p19_dlg_calls[0],
+          str(_p19_dlg_calls))
+    # Regressionskontrolle: _resolve_info_plugin liefert das Plugin direkt
+    _p19_pl = w._resolve_info_plugin(_p19_plugin_id)
+    check("19 T1) _resolve_info_plugin liefert Plugin",
+          _p19_pl is not None
+          and getattr(_p19_pl, "plugin_id", "") == _p19_plugin_id,
+          str(_p19_pl))
+finally:
+    ServiceDescriptionEditDialog.exec = _orig_exec19
+
+# --- 19 T2: created_at fuer NEUE Rows (Bug b) --------------------------------
+_p19_db = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "test_p19_created_at.duckdb")
+if os.path.exists(_p19_db):
+    os.remove(_p19_db)
+_p19_con = duckdb.connect(_p19_db)
+# Tabelle OHNE created_at-DEFAULT (simuliert den Zustand nach der PK-Migration
+# 17.01 E-1 – der Table-Rewrite hat den Spalten-DEFAULT entfernt).
+_p19_con.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR NOT NULL,
+        timeframe VARCHAR NOT NULL,
+        bar_time TIMESTAMPTZ NOT NULL,
+        ema_diff DOUBLE,
+        rsi_14 DOUBLE,
+        atr_normalized DOUBLE,
+        created_at TIMESTAMP,
+        feature_id VARCHAR NOT NULL DEFAULT 'native',
+        plugin_version VARCHAR,
+        feature_data JSON,
+        PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
+    )
+""")
+_p19_con.close()
+
+# Fix 2: Idempotente Schema-Reparatur (check_and_init_databases-Pfad)
+_p19_con = duckdb.connect(_p19_db)
+_p19_con.execute(
+    "ALTER TABLE feature_store ALTER created_at SET DEFAULT current_timestamp")
+_p19_def19 = _p19_con.execute(
+    "SELECT column_default FROM information_schema.columns "
+    "WHERE table_name='feature_store' AND column_name='created_at'").fetchone()
+_p19_con.close()
+check("19 T2) created_at-Default wiederhergestellt (ALTER SET DEFAULT)",
+      _p19_def19 and str(_p19_def19[0]).lower() == "current_timestamp",
+      str(_p19_def19))
+
+# Fix 1: store_plugin_payload schreibt created_at=now() auch fuer NEUE Rows
+_p19_payload = {
+    "feature_id": "srv_swing_momentum",
+    "plugin_version": "1.0.0",
+    "records": [{"bar_time": 1750000000, "mom": 2.0}],
+}
+_p19_con = duckdb.connect(_p19_db)
+_p19_n = FeatureBuilder().store_plugin_payload("SILVER", "M1", _p19_payload,
+                                               con=_p19_con)
+check("19 T2) store_plugin_payload schreibt 1 Row",
+      _p19_n == 1, str(_p19_n))
+
+from analytics.engine.feature_store_reader import (  # noqa: E402
+    FeatureStoreReader,
+)
+_p19_dates = FeatureStoreReader(_p19_db).fetch_last_execution_dates()
+check("19 T2) Datum der letzten Ausfuehrung lesbar (created_at gesetzt)",
+      bool(_p19_dates.get("srv_swing_momentum")),
+      str(_p19_dates))
+
+_p19_con = duckdb.connect(_p19_db)
+_p19_ca = _p19_con.execute(
+    "SELECT created_at FROM feature_store "
+    "WHERE feature_id='srv_swing_momentum'").fetchone()
+_p19_con.close()
+check("19 T2) created_at in DB nicht NULL",
+      _p19_ca is not None and _p19_ca[0] is not None, str(_p19_ca))
+
+try:
+    os.remove(_p19_db)
+except OSError as _e19:
+    print("  [19] Cleanup Test-DB uebersprungen:", _e19)
+
+# ===========================================================================
+# Teil 20 (Bugfix 07.08.2026): Dynamic Parameter Schema Exposure fuer die
+#   3 Swing-Services (srv_swing_structure / srv_swing_momentum /
+#   srv_swing_volume_profile).
+#   - `full_parameter_schema()` liefert das vollstaendige Schema (Basis-
+#     Parameter wie lookback + plugin-spezifisch) inkl. Min/Max/Typ.
+#   - `default_params` ist befuellt (Plugin-Parameter; lookback ist eine
+#     Instanz-Einstellung und gehoert NICHT in params, vgl. UI-Spalten).
+# ===========================================================================
+print("\n=== Teil 20: Dynamic Parameter Schema Exposure (Swing Services) ===")
+
+from analytics.features.feature_builder import PluginRegistry  # noqa: E402
+
+_p20_reg = PluginRegistry()
+_p20_cases = [
+    ("srv_swing_structure", "left_bars"),
+    ("srv_swing_momentum", "period"),
+    ("srv_swing_volume_profile", "grid_step"),
+]
+for _p20_pid, _p20_key in _p20_cases:
+    _p20_p = _p20_reg.get(_p20_pid)
+    _p20_schema = _p20_p.full_parameter_schema()
+    _p20_defaults = _p20_p.default_params
+    check(f"20 T1) {_p20_pid}: full_parameter_schema nicht leer",
+          len(_p20_schema) > 0, str(list(_p20_schema.keys())))
+    check(f"20 T2) {_p20_pid}: default_params befuellt ('{_p20_key}')",
+          _p20_key in _p20_defaults, str(list(_p20_defaults.keys())))
+    # Basisklassen-Vertrag: lookback bleibt im VOLLSTAENDIGEN Schema erhalten
+    # (SchemaMigrator.migrate_instance_config verlaesst sich darauf), gehoert
+    # aber nicht in default_params (Instanz-Einstellung cfg['lookback']).
+    check(f"20 T3) {_p20_pid}: lookback im full-Schema enthalten",
+          "lookback" in _p20_schema, str("lookback" in _p20_schema))
+    check(f"20 T4) {_p20_pid}: lookback NICHT in default_params",
+          "lookback" not in _p20_defaults, str("lookback" in _p20_defaults))
+
+# ===========================================================================
+# Teil 21 (Bugfix 17.01.04, 07.08.2026): Standalone-Plugin-Editor im
+#   ServiceWindow - Klick auf eine Plugin-Zeile unter 'Services' (auch in
+#   Kategorie-Ordnern) laedt die Parameter editierbar in die rechte Spalte.
+#   Persistenz laeuft ueber global_settings (Key 'plugin_params_<pid>'),
+#   nicht ueber ServiceSetRepository; Run-Aktionen verwenden die
+#   gespeicherten Werte. Abgedeckt:
+#     * _on_master_selection_details(node_type='plugin') -> _load_plugin_editor
+#     * Guard: selection_changed mit leeren IDs leert den Editor NICHT
+#     * _save_plugin_params() -> global_settings (lookback/params/description)
+#     * _plugin_config() liefert gespeicherte Werte (Merge ueber Defaults)
+#     * _save_and_run_from_panel() / _on_run_plugin() nutzen die Config
+#     * Nicht-Plugin-Zeile beendet den Plugin-Modus
+# ===========================================================================
+print("\n=== Teil 21: Standalone-Plugin-Editor (ServiceWindow) ===")
+
+from PySide6.QtWidgets import (  # noqa: E402
+    QMessageBox, QCheckBox, QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox)
+from serviceui.master_tree import (  # noqa: E402
+    ROLE_NODE_TYPE, ROLE_PLUGIN_ID, TYPE_PLUGIN)
+
+
+def _find_plugin_item(item, plugin_id):
+    """Rekursive Suche nach der Plugin-Zeile mit plugin_id im MasterTree."""
+    for _k in range(item.childCount()):
+        _ch = item.child(_k)
+        if (_ch.data(0, ROLE_NODE_TYPE) == TYPE_PLUGIN
+                and str(_ch.data(0, ROLE_PLUGIN_ID) or "") == plugin_id):
+            return _ch
+        _hit = _find_plugin_item(_ch, plugin_id)
+        if _hit is not None:
+            return _hit
+    return None
+
+
+_p21 = "srv_swing_structure"
+
+# Frisches, isoliertes Fenster (Patches lenken auf Test-DBs um).
+w5 = ServiceWindow(parent=_Parent(), service_set_repo=repo)
+w5.service_selector.model.set_repo = repo
+w5.service_selector.model.refresh()
+w5.show()
+pump()
+pump()
+
+# --- 1) Default-Config ohne gespeicherte Werte -----------------------------
+_cfg21 = w5._plugin_config(_p21)
+check("21 T1) _plugin_config Defaults: params befuellt",
+      bool(_cfg21.get("params")), str(_cfg21.get("params")))
+check("21 T2) _plugin_config Defaults: lookback == 1000",
+      _cfg21.get("lookback") == 1000, str(_cfg21.get("lookback")))
+check("21 T3) _plugin_config Defaults: plugin_id + version",
+      _cfg21.get("plugin_id") == _p21 and bool(_cfg21.get("version")),
+      str(_cfg21))
+
+# --- 2) Plugin-Zeile im MasterTree finden (Kategorie-Ordner) ---------------
+_plugin_item21 = None
+for _gi21 in range(w5.service_selector.master_tree.topLevelItemCount()):
+    _hit21 = _find_plugin_item(
+        w5.service_selector.master_tree.topLevelItem(_gi21), _p21)
+    if _hit21 is not None:
+        _plugin_item21 = _hit21
+        break
+check("21 T4) Plugin-Zeile 'srv_swing_structure' im MasterTree",
+      _plugin_item21 is not None,
+      str(w5.service_selector.master_tree.topLevelItemCount()))
+
+# --- 3) Klick-Simulation: selection_details(node_type='plugin') ------------
+if _plugin_item21 is not None:
+    w5.service_selector.master_tree._emit_selection_details(_plugin_item21)
+check("21 T5) _current_plugin_editing gesetzt",
+      w5._current_plugin_editing == _p21, str(w5._current_plugin_editing))
+_def21 = w5._current_set_definition or {}
+check("21 T6) Editor geladen (execution_order = nur das Plugin)",
+      list(_def21.get("execution_order") or []) == [_p21],
+      str(_def21.get("execution_order")))
+check("21 T7) Parameter-Spalten aufgebaut (Controls vorhanden)",
+      bool(w5._service_param_controls),
+      str(list(w5._service_param_controls.keys())[:4]))
+
+# --- 4) Guard: selection_changed mit leeren IDs leert den Editor NICHT ----
+w5._on_master_selection("", "")
+check("21 T8) Guard: leere selection_changed leert Plugin-Editor nicht",
+      w5._current_plugin_editing == _p21, str(w5._current_plugin_editing))
+
+# --- 5) Parameter aendern (User-Pfad) -> Dirty-Buttons sichtbar ------------
+_ctrl_key21 = next(iter(w5._service_param_controls), None)
+_ctrl21 = w5._service_param_controls.get(_ctrl_key21) if _ctrl_key21 else None
+check("21 T9) Editor-Control vorhanden", _ctrl21 is not None,
+      str(_ctrl_key21))
+_after = None
+if _ctrl21 is not None:
+    _before = w5._ctrl_value(_ctrl21)
+    # Typ-abhaengig einen Wert setzen (setValue/setCurrentText feuern das
+    # Aenderungs-Signal -> _on_param_changed -> Dirty + Buttons sichtbar).
+    if isinstance(_ctrl21, QComboBox):
+        _items = [_ctrl21.itemText(i) for i in range(_ctrl21.count())]
+        _new_val = (_items[1] if len(_items) > 1 and _items[1] != _before
+                    else _items[0])
+        _ctrl21.setCurrentText(_new_val)
+    elif isinstance(_ctrl21, QCheckBox):
+        _ctrl21.setChecked(not _before)
+    elif isinstance(_ctrl21, (QSpinBox, QDoubleSpinBox)):
+        _new_val = (_ctrl21.minimum() if _before != _ctrl21.minimum()
+                    else _ctrl21.maximum())
+        _ctrl21.setValue(_new_val)
+    elif isinstance(_ctrl21, QLineEdit):
+        _ctrl21.setText(str(_before) + "x")
+    _after = w5._ctrl_value(_ctrl21)
+    check("21 T10) Parameter-Wert geaendert", _after != _before,
+          f"{_before} -> {_after}")
+    check("21 T11) Dirty: Speichern-Buttons sichtbar",
+          w5.btn_save_params is not None and w5.btn_save_params.isVisible()
+          and w5.btn_save_run_params is not None
+          and w5.btn_save_run_params.isVisible(), "")
+
+# --- 6) Speichern via _save_plugin_params (global_settings) ----------------
+_ok21 = w5._save_plugin_params()
+check("21 T12) _save_plugin_params() liefert True", _ok21 is True, str(_ok21))
+_saved21 = sm.get_global_value(f"plugin_params_{_p21}", None)
+check("21 T13) global_settings: plugin_params_<pid> gespeichert",
+      isinstance(_saved21, dict) and _saved21.get("plugin_id") == _p21,
+      str(_saved21))
+check("21 T14) gespeicherte params enthalten den geaenderten Wert",
+      isinstance(_saved21, dict) and _ctrl_key21 is not None
+      and _saved21.get("params", {}).get(_ctrl_key21[1]) == _after,
+      str(_saved21))
+_cfg21b = w5._plugin_config(_p21)
+check("21 T15) _plugin_config liefert gespeicherte Werte (Merge)",
+      isinstance(_saved21, dict)
+      and _cfg21b.get("params") == _saved21.get("params"),
+      str(_cfg21b.get("params")))
+
+# --- 7) Speichern & Ausfuehren (Plugin-Modus) -------------------------------
+_captured21: dict = {}
+
+
+def _fake_start_run_worker(scope_id, set_definition, instance_id=None):
+    _captured21["scope_id"] = scope_id
+    _captured21["definition"] = set_definition
+    _captured21["instance_id"] = instance_id
+
+
+w5._start_run_worker = _fake_start_run_worker
+_orig_question21 = QMessageBox.question
+try:
+    QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
+    w5._save_and_run_from_panel()
+finally:
+    QMessageBox.question = _orig_question21
+
+check("21 T16) Speichern&Ausfuehren: Worker mit plugin_id gestartet",
+      _captured21.get("scope_id") == _p21, str(_captured21.get("scope_id")))
+_run_def21 = _captured21.get("definition") or {}
+_run_cfg21 = (_run_def21.get("services") or {}).get(_p21) or {}
+check("21 T17) Run-Definition: lookback aus global_settings",
+      _run_cfg21.get("lookback") == (_saved21 or {}).get("lookback"),
+      str(_run_cfg21.get("lookback")))
+
+# --- 8) _on_run_plugin nutzt gespeicherte Params ----------------------------
+_captured21.clear()
+try:
+    QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
+    w5._on_run_plugin(_p21)
+finally:
+    QMessageBox.question = _orig_question21
+_run_def21b = _captured21.get("definition") or {}
+_run_cfg21b = (_run_def21b.get("services") or {}).get(_p21) or {}
+check("21 T18) _on_run_plugin nutzt gespeicherte Params",
+      _run_cfg21b.get("params") == (_saved21 or {}).get("params"),
+      str(_run_cfg21b.get("params")))
+
+# --- 9) Nicht-Plugin-Zeile beendet den Plugin-Modus -------------------------
+w5._on_master_selection_details("set", "set_1", "", "")
+check("21 T19) Nicht-Plugin-Zeile beendet Plugin-Modus",
+      w5._current_plugin_editing is None, str(w5._current_plugin_editing))
+
+# ===========================================================================
+# Teil 22 (Bugfix 17.01.05, 07.08.2026): UI-Dropdown-Extension +
+#   Conditional Visibility fuer die Swing-Services.
+#   - Schema-Parameter mit `options` werden als QComboBox gerendert
+#     (unabhaengig vom type-Wert; vorher NUR bei type=="choice" -> die
+#     Swing-Services mit type=="str"+options zeigten QLineEdit statt Dropdown).
+#   - Parameter mit `visible_when: {"mode": [...]}` werden beim Mode-Wechsel
+#     ein-/ausgeblendet (Control + Label), damit beim Auswaehlen eines
+#     Algorithmus nur seine relevanten Parameter sichtbar/editierbar sind.
+# ===========================================================================
+print("\n=== Teil 22: UI-Dropdown + Conditional Visibility (Swing Services) ===")
+
+from PySide6.QtWidgets import QComboBox as _QComboBox22  # noqa: E402
+
+_p22_reg = PluginRegistry()
+_p22_cases = [
+    ("srv_swing_structure", "mode", "ZigZag_ATR"),
+    ("srv_swing_momentum", "mode", "Chande_Kroll_Ratchet"),
+    ("srv_swing_volume_profile", "mode", "Grid_Proximity"),
+]
+for _p22_pid, _p22_key, _p22_opt in _p22_cases:
+    _p22_p = _p22_reg.get(_p22_pid)
+    _p22_schema = _p22_p.full_parameter_schema()
+    _p22_opts = _p22_schema.get(_p22_key, {}).get("options")
+    check(f"22 T1) {_p22_pid}: options fuer '{_p22_key}' als Liste",
+          isinstance(_p22_opts, (list, tuple)) and len(_p22_opts) > 0,
+          str(_p22_opts))
+    _p22_vw = [k for k, s in _p22_schema.items()
+               if isinstance(s.get("visible_when"), dict)
+               and "mode" in s["visible_when"]]
+    check(f"22 T2) {_p22_pid}: visible_when-Deklarationen vorhanden",
+          len(_p22_vw) > 0, str(_p22_vw))
+
+# _create_param_control: options -> QComboBox (auch bei type=='str')
+_p22_spec = _p22_reg.get("srv_swing_structure").full_parameter_schema()["mode"]
+w6 = ServiceWindow(parent=_Parent(), service_set_repo=repo)
+w6.service_selector.model.set_repo = repo
+w6.service_selector.model.refresh()
+_ctrl22 = w6._create_param_control("mode", "ZigZag_ATR", _p22_spec)
+check("22 T3) _create_param_control(mode) -> QComboBox",
+      isinstance(_ctrl22, _QComboBox22)
+      and _ctrl22.currentText() == "ZigZag_ATR",
+      str(type(_ctrl22).__name__))
+
+# Plugin-Editor laden (srv_swing_structure) -> Dropdown + Visibility
+_p22_pid = "srv_swing_structure"
+w6.show()
+pump()
+w6._load_plugin_editor(_p22_pid)
+pump()
+_iid22 = _p22_pid
+_mode_ctrl22 = w6._service_param_controls.get((_iid22, "mode"))
+check("22 T4) Plugin-Editor: mode-Control ist QComboBox",
+      isinstance(_mode_ctrl22, _QComboBox22),
+      str(type(_mode_ctrl22).__name__))
+if isinstance(_mode_ctrl22, _QComboBox22):
+    _opts22 = [_mode_ctrl22.itemText(i)
+               for i in range(_mode_ctrl22.count())]
+    check("22 T5) Dropdown enthaelt alle Algo-Optionen",
+          "Williams_Fractal" in _opts22 and "ZigZag_ATR" in _opts22
+          and "Period_Extrema" in _opts22, str(_opts22))
+
+# Initial (Default-Mode Williams_Fractal): left sichtbar, atr ausgeblendet
+_left22 = w6._service_param_controls.get((_iid22, "left_bars"))
+_atr22 = w6._service_param_controls.get((_iid22, "atr_period"))
+_chg22 = w6._service_param_controls.get((_iid22, "change_pct"))
+check("22 T6) Default Williams_Fractal: left_bars sichtbar",
+      _left22 is not None and _left22.isVisible(), "")
+check("22 T7) Default Williams_Fractal: atr_period ausgeblendet",
+      _atr22 is not None and not _atr22.isVisible(), "")
+
+# Mode-Wechsel -> ZigZag_ATR (Signal-Pfad: currentTextChanged -> Visibility)
+if isinstance(_mode_ctrl22, _QComboBox22):
+    _mode_ctrl22.setCurrentText("ZigZag_ATR")
+    pump()
+check("22 T8) Mode=ZigZag_ATR: atr_period sichtbar",
+      _atr22 is not None and _atr22.isVisible(), "")
+check("22 T9) Mode=ZigZag_ATR: left_bars ausgeblendet",
+      _left22 is not None and not _left22.isVisible(), "")
+check("22 T10) Mode=ZigZag_ATR: change_pct ausgeblendet",
+      _chg22 is not None and not _chg22.isVisible(), "")
+
+# Mode-Wechsel -> Period_Extrema: period_extrema_type sichtbar
+_pe22 = w6._service_param_controls.get((_iid22, "period_extrema_type"))
+if isinstance(_mode_ctrl22, _QComboBox22):
+    _mode_ctrl22.setCurrentText("Period_Extrema")
+    pump()
+check("22 T11) Mode=Period_Extrema: period_extrema_type sichtbar",
+      _pe22 is not None and _pe22.isVisible(), "")
+check("22 T12) Mode=Period_Extrema: atr_period ausgeblendet",
+      _atr22 is not None and not _atr22.isVisible(), "")
+
+# collect_set_definition liefert den geaenderten mode (editierbar/speicherbar)
+_def22 = w6.collect_set_definition()
+_cfg22 = (_def22.get("services") or {}).get(_iid22, {})
+check("22 T13) collect_set_definition: mode aktualisiert (Period_Extrema)",
+      (_cfg22.get("params") or {}).get("mode") == "Period_Extrema",
+      str((_cfg22.get("params") or {}).get("mode")))
+
+# ===========================================================================
+# Teil 23 (Bugfix 17.01.05, 07.08.2026): Read-only Info-Label unter dem
+#   individuellen Beschreibungsfeld – zeigt die in der Definition
+#   vorgefuellte Service-Beschreibung + die Beschreibung des aktuell
+#   gewaehlten Algorithmus (mode). Rein informativ (kein Input), wird beim
+#   Mode-Wechsel live aktualisiert.
+# ===========================================================================
+print("\n=== Teil 23: Read-only Service-/Algo-Beschreibungs-Label ===")
+
+from PySide6.QtWidgets import QComboBox as _QComboBox23  # noqa: E402
+from PySide6.QtWidgets import QTextEdit as _QTextEdit23  # noqa: E402
+from PySide6.QtCore import Qt as _Qt23  # noqa: E402
+
+_p23_pid = "srv_swing_structure"
+w7 = ServiceWindow(parent=_Parent(), service_set_repo=repo)
+w7.service_selector.model.set_repo = repo
+w7.service_selector.model.refresh()
+w7.show()
+pump()
+w7._load_plugin_editor(_p23_pid)
+pump()
+
+_iid23 = _p23_pid
+_info23 = w7._service_info_labels.get(_iid23)
+check("23 T1) Info-Anzeige je Instanz vorhanden (QTextEdit)",
+      isinstance(_info23, _QTextEdit23), str(type(_info23).__name__))
+
+if isinstance(_info23, _QTextEdit23):
+    _text23 = _info23.toPlainText() or ""
+    _mode_ctrl23 = w7._service_param_controls.get((_iid23, "mode"))
+    _mode_val23 = (str(_mode_ctrl23.currentText())
+                   if isinstance(_mode_ctrl23, _QComboBox23) else "")
+    check("23 T2) Label enthaelt display_name (Swing Structure Service)",
+          "Swing Structure Service" in _text23, _text23[:120])
+    check("23 T3) Label enthaelt Service-Beschreibung (description_long)",
+          "lokale Extrema" in _text23, _text23[:120])
+    check("23 T4) Label enthaelt aktuell gewaehlten Algorithmus (mode)",
+          bool(_mode_val23) and _mode_val23 in _text23,
+          f"mode={_mode_val23!r} -> {_text23[:120]}")
+    # Mode-Wechsel -> Anzeige aktualisiert sich (Algo-Beschreibung)
+    if isinstance(_mode_ctrl23, _QComboBox23):
+        _mode_ctrl23.setCurrentText("Period_Extrema")
+        pump()
+        _text23b = _info23.toPlainText() or ""
+        check("23 T5) Mode-Wechsel aktualisiert Label (Period_Extrema)",
+              "Period_Extrema" in _text23b
+              and "Williams_Fractal" not in _text23b,
+              _text23b[:120])
+        check("23 T6) Algo-Beschreibung im Label (PDH/PWH)",
+              "PDH/PWH" in _text23b, _text23b[:160])
+    # Anzeige ist read-only und informativ
+    check("23 T7) Anzeige sichtbar", _info23.isVisible(), "")
+    check("23 T8) Anzeige ist read-only (kein Edit)",
+          _info23.isReadOnly(), "")
+    check("23 T9) vertikale Scrollbar bei Bedarf (Policy AsNeeded)",
+          _info23.verticalScrollBarPolicy() == _Qt23.ScrollBarAsNeeded,
+          str(_info23.verticalScrollBarPolicy()))
+    # Deferred Scroll-oben-Reset (QTimer singleShot 0) abarbeiten lassen,
+    # bevor die Scrollposition geprueft wird.
+    pump()
+    pump()
+    # Initial-Scrollposition ganz oben (erste Zeile lesbar)
+    _sb23 = _info23.verticalScrollBar()
+    check("23 T9b) Scrollbar initial ganz oben (value == 0)",
+          _sb23 is not None and _sb23.value() == 0,
+          str(_sb23.value()) if _sb23 is not None else "None")
+    # Auch NACH Mode-Wechsel bleibt die Anzeige oben (setHtml -> Scroll 0)
+    _sb23b = _info23.verticalScrollBar()
+    check("23 T9c) nach Mode-Wechsel weiterhin oben (value == 0)",
+          _sb23b is not None and _sb23b.value() == 0,
+          str(_sb23b.value()) if _sb23b is not None else "None")
+
+# Mehrere Services nebeneinander: auch fuer srv_swing_momentum vorhanden
+w7._load_plugin_editor("srv_swing_momentum")
+pump()
+_info23b = w7._service_info_labels.get("srv_swing_momentum")
+check("23 T10) Info-Anzeige auch fuer srv_swing_momentum",
+      isinstance(_info23b, _QTextEdit23)
+      and "Swing Momentum Service" in (_info23b.toPlainText() or ""),
+      (_info23b.toPlainText() or "")[:120])
+
 if FAILURES:
     print(f"FEHLER: {len(FAILURES)}: {FAILURES}")
     sys.exit(1)
