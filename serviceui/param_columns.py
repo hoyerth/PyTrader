@@ -205,6 +205,10 @@ class ServiceParamColumnsMixin:
         mode_ctrl = self._service_param_controls.get((iid, "mode"))
         mode_val = (str(self._ctrl_value(mode_ctrl))
                     if mode_ctrl is not None else "")
+        # Bugfix (Mode-Wechsel): Spalten (QGroupBox), deren Controls durch
+        # die Ein-/Ausblendung beruehrt wurden – deren Geometrie-Caches werden
+        # NACH der Sichtbarkeits-Aenderung invalidiert (s. u.).
+        touched_cols: set = set()
         for key, spec in schema.items():
             vw = spec.get("visible_when")
             if not isinstance(vw, dict) or "mode" not in vw:
@@ -220,6 +224,9 @@ class ServiceParamColumnsMixin:
                 ctrl.setVisible(visible)
             except (RuntimeError, AttributeError):
                 pass
+            col = ctrl.parentWidget()
+            if col is not None:
+                touched_cols.add(col)
             lbl = getattr(self, "_service_param_labels", {}).get((iid, key))
             if lbl is not None:
                 try:
@@ -229,6 +236,24 @@ class ServiceParamColumnsMixin:
         # 17.01.05 (Bugfix): Auch das Info-Label (Service-/Algo-Beschreibung)
         # auf den aktuellen Modus aktualisieren.
         self._update_service_info_label(iid)
+        # Bugfix (Mode-Wechsel, Hoehe der Box): Nach dem Ein-/Ausblenden der
+        # modus-abhaengigen Parameter muss die BOX-HOEHE der neuen Parameter-
+        # zahl folgen (nicht die Hoehe der Einzelfelder). Qt 6.11 cached den
+        # QWidgetItemV2-sizeHint – ohne updateGeometry()/Re-Indexierung bleibt
+        # die alte Hoehe stehen und der QFormLayout streckt die verbliebenen
+        # Zeilen (gestreckte Einzelfelder). Analog zu _setup_collapsible/
+        # _build_service_columns werden daher die Caches der betroffenen
+        # Spalten + der Service-Parameter-Box invalidiert und der deferred
+        # Reflow (Fenster + Box-Resize) angestossen.
+        try:
+            for col in touched_cols:
+                col.updateGeometry()
+            box = getattr(self, "widget_service_columns", None)
+            if box is not None:
+                box.updateGeometry()
+            self._reflow()
+        except (RuntimeError, AttributeError):
+            pass
 
     # ------------------------------------------------------------------
     # 17.01.05 (Bugfix): Read-only Info-Label unter dem individuellen
