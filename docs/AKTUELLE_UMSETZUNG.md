@@ -427,10 +427,19 @@ python -m py_compile analytics/features/definitions/srv_swing_structure.py analy
   * `check_and_init_databases()` läuft mit der migrierten DB fehlerfrei (Schema/Constraint-Verifikation).
 * Vorbestehende Harness-FAILURES (P2/P5/H3/H4/H5/H7/T5 – Fenster-Geometrie/Info-Button aus früheren Teilen) sind unabhängig von 17.01 (keine berührten Komponenten; kein Regressionstest gemäß Harte Regel 4).
 
-### 7.5 Test-Cleanup (Invariante 10, ausstehend bis Kapitelabschluss)
+### 7.5 Test-Cleanup (Invariante 10, DURCHGEFUEHRT am 07.08.2026)
 
-* Dauerhaft: `test/test.py` (inkl. Teil 14).
-* Temporär (verbleiben bis zur Abnahme des Kapitels, werden danach entfernt): `test/check_pk_migration.py` (Referenz für E-1), `test/migrate_pk.py`, `test/check_init_compat.py`, `test/_insert_part14.py`, `test/_fix_part14.py`, `test/_fix_part14b.py`.
+* **Durchgefuehrt** (Kapitel 17.01 + 17.01.01 abgeschlossen): Der Ordner `test/`
+  enthaelt ausschliesslich `test/test.py` (dauerhafter Harness, inkl. Teile 13-15).
+* Entfernt: `check_pk_migration.py` (E-1-Referenz), `migrate_pk.py`,
+  `check_init_compat.py`, `check_stylepicker_16_06.py`, `_insert_part14.py`,
+  `_fix_part14.py`, `_fix_part14b.py`, `_insert_part15.py`, `_fix_part15_t5.py`,
+  `_inspect_tree_lines.py`, `_append_doc_part8.py`, `_commit_msg_step3.txt`,
+  `_tree_lines_out.txt`, Laufprotokolle (`_part15_run.txt`, `_baseline_run.txt`,
+  `_verify_run.txt`), `__pycache__`.
+* Verifiziert nach Cleanup: `py_compile test/test.py` PASS; Testlauf identisch
+  zur Baseline (17.01/17.01.01 T1-T4 PASS, nur die 6 bekannten, unbeteiligten
+  Harness-FAILURES P2/P5/H3/H4/H5/H7).
 
 ---
 
@@ -551,8 +560,8 @@ entfaellt ersatzlos; der MasterTree besitzt danach genau **2 Root-Gruppen**:
 * **Verbleibende 6 Harness-FAILURES** (unbeteiligt, PersistentWindow-Position/
   -Groesse, vor 17.01 bereits vorhanden): P2, P5, H3, H4, H5, H7.
 
-## 8.4 Offen
+## 8.4 Test-Cleanup (DURCHGEFUEHRT, Invariante 10)
 
-* 7.5 Test-Cleanup (Invariante 10) weiterhin bis Kapitel-Abnahme offen;
-  temporaere Helfer in `test/` (`_insert_part15.py`, `_fix_part15_t5.py`,
-  `_inspect_tree_lines.py`, `_tree_lines_out.txt`) werden beim Cleanup entfernt.
+* Test-Cleanup durchgefuehrt (siehe 7.5): `test/` enthaelt nur noch
+  `test/test.py`. Kapitel 17.01 + 17.01.01 sind damit abgeschlossen.
+* Naechste Kapitel (Roadmap): 17.02 Trend Services.
