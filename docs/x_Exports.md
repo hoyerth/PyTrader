@@ -67,6 +67,7 @@ PyTrader/
             __init__.py
             base_indicator.py
             fixed_grid_proximity.py
+            multi_ma.py
             utils/
                 __init__.py
                 ma_template.py
@@ -1297,9 +1298,9 @@ class MarketDataRepository:
 
 				query = """
 					SELECT EXTRACT('epoch' FROM "time")::BIGINT AS time_epoch,
-					       open, high, low, close 
+					       open, high, low, close, tick_volume 
 					FROM (
-						SELECT "time", open, high, low, close 
+						SELECT "time", open, high, low, close, tick_volume 
 						FROM ohlcv_bars 
 						WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
 						  AND "time" IS NOT NULL 
@@ -1317,12 +1318,18 @@ class MarketDataRepository:
 
 				for r in rows:
 					t_epoch = int(r[0])  # Bereits epoch-Integer aus DuckDB
+					# P16.05 VWMA-Fix (P-D4): tick_volume wird mitgeliefert.
+					# Entscheidung F3: NaN/None -> 0, Candle bleibt gueltig
+					# (kein WHERE-Filter auf tick_volume, damit Candles mit
+					# NULL-Volumen nicht wegfallen).
+					vol_raw = r[5]
 					candles.append({
 						"time": t_epoch,
 						"open": float(r[1]),
 						"high": float(r[2]),
 						"low": float(r[3]),
-						"close": float(r[4])
+						"close": float(r[4]),
+						"tick_volume": float(vol_raw) if vol_raw is not None else 0.0
 					})
 				break
 
@@ -12170,10 +12177,12 @@ from PySide6.QtWidgets import (
 try:
     from chart.chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, build_html_template
     from chart.indicators.fixed_grid_proximity import FixedGridProximityIndicator
+    from chart.indicators.multi_ma import MultiMovingAverageIndicator
     from chart.indicator_dialog import IndicatorSettingsDialog
 except ImportError:
     from chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, build_html_template
     from indicators.fixed_grid_proximity import FixedGridProximityIndicator
+    from indicators.multi_ma import MultiMovingAverageIndicator
     from indicator_dialog import IndicatorSettingsDialog
 
 try:
@@ -12255,23 +12264,27 @@ class ChartDataSerializer(QThread):
 
 
 class GridDataSerializer(QThread):
-    """Serialisiert Grid-Linien/Circles im Hintergrund-Thread."""
-    done = Signal(str, str, int)  # lines_json, circles_json, gridGen
+    """Serialisiert das aggregierte Indikator-Render-Payload im Hintergrund-Thread.
 
-    def __init__(self, lines: list, circles: list, grid_gen: int, parent=None):
+    P16.05 (F4-Beschluss): Threading-Muster exakt beibehalten (QThread +
+    done-Signal + Generations-Guard), nur das Payload-Format ist generisch:
+    done liefert EIN payload_json (das komplette aggregierte Render-Payload
+    {"lines", "price_lines", "hit_circles"}) statt getrennter lines/circles.
+    """
+    done = Signal(str, int)  # payload_json, gridGen
+
+    def __init__(self, payload: dict, grid_gen: int, parent=None):
         super().__init__(parent)
-        self.lines = lines
-        self.circles = circles
+        self.payload = payload
         self.grid_gen = grid_gen
 
     def run(self):
         try:
-            lj = json.dumps(self.lines, allow_nan=False)
-            cj = json.dumps(self.circles, allow_nan=False)
-            self.done.emit(lj, cj, self.grid_gen)
+            pj = json.dumps(self.payload, allow_nan=False)
+            self.done.emit(pj, self.grid_gen)
         except (ValueError, TypeError) as e:
             print(f"⚠️ [GridSerializer] JSON-Fehler: {e}")
-            self.done.emit("", "", self.grid_gen)
+            self.done.emit("", self.grid_gen)
 
 
 class PyTraderChartWindow(QMainWindow):
@@ -12318,8 +12331,10 @@ class PyTraderChartWindow(QMainWindow):
         # Generische Indikator-Registry: indicator_id -> BaseIndicator.
         # Phase 16: Alt-Indikator 'grid_liquidity' entfernt; der Plugin-
         # Indikator 'Ind_FixedGridProximity' (fixed_grid_proximity) bleibt.
+        # Phase 16.05 (D1): Multi-MA-Indikator 'ind_moving_averages' additiv.
         self.indicators: Dict[str, BaseIndicator] = {
             "ind_fixed_grid_proximity": FixedGridProximityIndicator(),
+            "ind_moving_averages": MultiMovingAverageIndicator(),
         }
         # Phase 13 Schritt 6: Neuer Close im Ind_FixedGridProximity-Indikator → NUR ein
         # debounced Refresh (Cache-Neuaufbau), nicht bei jedem Tick.
@@ -12448,6 +12463,8 @@ class PyTraderChartWindow(QMainWindow):
         self.tf_combo = self.ui_widget.findChild(QComboBox, "combo_tf")
         self.btn_reset = self.ui_widget.findChild(QPushButton, "btn_reset_chart")
         self.btn_indicator_liquidity = self.ui_widget.findChild(QPushButton, "btn_indicator_grid_liquidity")
+        # Phase 16.05 (D1): Multi-MA-Button (btn_indicator_ma, Text "MA").
+        self.btn_indicator_ma = self.ui_widget.findChild(QPushButton, "btn_indicator_ma")
         self.chart_container = self.ui_widget.findChild(QWidget, "web_container")
 
         if self.symbol_combo:
@@ -12484,6 +12501,12 @@ class PyTraderChartWindow(QMainWindow):
             self.btn_indicator_liquidity.setCheckable(True)
             self.btn_indicator_liquidity.clicked.connect(self.toggle_fixed_grid_proximity_lines)
             self.btn_indicator_liquidity.installEventFilter(self)
+        # Phase 16.05 (D1): Multi-MA-Button (btn_indicator_ma) → Indikator
+        # 'ind_moving_averages' (Muster btn_indicator_grid_liquidity).
+        if self.btn_indicator_ma:
+            self.btn_indicator_ma.setCheckable(True)
+            self.btn_indicator_ma.clicked.connect(self.toggle_moving_averages)
+            self.btn_indicator_ma.installEventFilter(self)
         self.update_indicator_button_style()
 
         self.web_view = QWebEngineView()
@@ -12508,11 +12531,16 @@ class PyTraderChartWindow(QMainWindow):
         self.web_view.loadFinished.connect(self._on_page_loaded)
 
     def eventFilter(self, watched, event):
-        # Rechtsklick auf den Plugin-Grid-Button → Einstellungen für 'ind_fixed_grid_proximity'
-        if (self.btn_indicator_liquidity is not None and watched == self.btn_indicator_liquidity
-                and event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton):
-            self._toggle_settings_dialog("ind_fixed_grid_proximity")
-            return True
+        # Rechtsklick auf Plugin-Indikator-Buttons → Einstellungen.
+        # Phase 16.05 (D1): MA-Button additiv (btn_indicator_ma).
+        if (event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton):
+            for button, ind_id in (
+                (self.btn_indicator_liquidity, "ind_fixed_grid_proximity"),
+                (self.btn_indicator_ma, "ind_moving_averages"),
+            ):
+                if button is not None and watched == button:
+                    self._toggle_settings_dialog(ind_id)
+                    return True
         return super().eventFilter(watched, event)
 
     def _toggle_settings_dialog(self, ind_id: str) -> None:
@@ -12529,9 +12557,13 @@ class PyTraderChartWindow(QMainWindow):
         return self.indicators.get(ind_id)
 
     def update_indicator_button_style(self):
-        """Aktualisiert die Färbung des Plugin-Indikator-Buttons
-        ('ind_fixed_grid_proximity') entsprechend seines An/Aus-Zustands."""
-        self._apply_indicator_button_style(self.btn_indicator_liquidity, "ind_fixed_grid_proximity")
+        """Aktualisiert die Färbung aller Plugin-Indikator-Buttons
+        entsprechend ihres An/Aus-Zustands."""
+        for button, ind_id in (
+            (self.btn_indicator_liquidity, "ind_fixed_grid_proximity"),
+            (self.btn_indicator_ma, "ind_moving_averages"),
+        ):
+            self._apply_indicator_button_style(button, ind_id)
 
     def _apply_indicator_button_style(self, button: Optional[QPushButton], ind_id: str) -> None:
         """Setzt die Button-Farbe je nach Aktiv-Zustand des Indikators."""
@@ -12545,6 +12577,11 @@ class PyTraderChartWindow(QMainWindow):
     def toggle_fixed_grid_proximity_lines(self):
         """Schaltet den Plugin-Indikator ('Ind_FixedGridProximity') an/aus."""
         self._toggle_indicator("ind_fixed_grid_proximity")
+
+    def toggle_moving_averages(self):
+        """Phase 16.05 (D1): Schaltet den Multi-MA-Indikator
+        ('ind_moving_averages') an/aus."""
+        self._toggle_indicator("ind_moving_averages")
 
     def _toggle_indicator(self, ind_id: str) -> None:
         """Schaltet einen Indikator an/aus."""
@@ -12714,17 +12751,22 @@ class PyTraderChartWindow(QMainWindow):
         self.save_state()
         self.render_indicators()
 
-    def render_indicators(self):
-        """Rendert alle aktiven Indikatoren via JS-Bridge."""
-        if self.df_data is None or self.df_data.empty:
-            return
+    def _collect_render_payload(self) -> Dict[str, list]:
+        """P16.05 (Prework Schritt 1, F1/P-C2): Sammelt das generische
+        Render-Payload über ALLE aktiven Indikatoren.
 
-        # Zuerst alle Indikator-Layer clearen
-        try:
-            self.web_view.page().runJavaScript("if(window.clearGridLines) clearGridLines();")
-            self.web_view.page().runJavaScript("if(window.clearGridCircles) clearGridCircles();")
-        except (RuntimeError, AttributeError):
-            pass
+        Aggregiert die Keys `lines` (Zeitreihen-LineSeries, z. B. Multi-MA),
+        `price_lines` (horizontale Grid-Preislinien) und `hit_circles`
+        (Marker) zu einem einzigen Dict. Keine Indikator-spezifischen
+        Branches mehr (Open/Closed, Invariante 9). Circle- und Linien-Zeiten
+        (reale Wanduhr-Epochs) werden generisch auf kontinuierliche Zeiten
+        gemappt (P-D1 / Ergänzung 1: `_time_real_to_cont.get(ts, ts)`).
+        """
+        payload: Dict[str, list] = {
+            "lines": [], "price_lines": [], "hit_circles": [],
+        }
+        if self.df_data is None or self.df_data.empty:
+            return payload
 
         for ind_id, plugin in self.indicators.items():
             st = self.indicators_state.get(ind_id, {})
@@ -12736,26 +12778,72 @@ class PyTraderChartWindow(QMainWindow):
                     plugin.set_context(self.current_symbol, self.current_tf)
                 # 5.4 Schritt 2: Parameter aus set_id (Logik) + display_params
                 # (Darstellung) auflösen – Legacy voller params bleibt erhalten.
-                res = plugin.calculate(self.df_data, self._resolve_indicator_params(ind_id, st))
-                # Grid-spezifische Render-Logik (Plugin 'ind_fixed_grid_proximity')
-                if ind_id == "ind_fixed_grid_proximity":
-                    lines = res.get("lines", [])
-                    circles = res.get("hit_circles", [])
-                    # Circle-Zeiten auf kontinuierlich mappen
-                    if circles and self._time_real_to_cont:
-                        for gc in circles:
-                            gc_t = gc.get("time")
-                            if gc_t is not None and int(gc_t) in self._time_real_to_cont:
-                                gc["time"] = self._time_real_to_cont[int(gc_t)]
-                    # JSON-Encoding im Hintergrund
-                    self._serialize_and_render_grid(lines, circles)
+                res = plugin.calculate(
+                    self.df_data, self._resolve_indicator_params(ind_id, st))
             except (RuntimeError, AttributeError):
-                pass
+                continue
+            if not isinstance(res, dict):
+                continue
+            for key in ("lines", "price_lines", "hit_circles"):
+                items = res.get(key)
+                if not items:
+                    continue
+                # Zeit-Mapping real→kontinuierlich (nur Zeitreihen-Keys;
+                # price_lines sind horizontale Preislinien ohne Zeit).
+                if key in ("lines", "hit_circles") and self._time_real_to_cont:
+                    if key == "lines":
+                        # LineSeries-Format: {id, data:[{time, value, color}]}
+                        # – die Zeit steckt in den Datenpunkten (data).
+                        for item in items:
+                            if not isinstance(item, dict):
+                                continue
+                            for pt in (item.get("data") or []):
+                                if not isinstance(pt, dict):
+                                    continue
+                                pt_t = pt.get("time")
+                                if pt_t is None:
+                                    continue
+                                try:
+                                    pt_t = int(pt_t)
+                                except (TypeError, ValueError):
+                                    continue
+                                pt["time"] = self._time_real_to_cont.get(pt_t, pt_t)
+                    else:
+                        # Marker-Format: {time, price, ...} – Zeit auf oberster
+                        # Ebene des Items (Circle).
+                        for item in items:
+                            if not isinstance(item, dict):
+                                continue
+                            gc_t = item.get("time")
+                            if gc_t is None:
+                                continue
+                            try:
+                                gc_t = int(gc_t)
+                            except (TypeError, ValueError):
+                                continue
+                            item["time"] = self._time_real_to_cont.get(gc_t, gc_t)
+                payload[key].extend(items)
+        return payload
+
+    def render_indicators(self):
+        """Rendert alle aktiven Indikatoren via JS-Bridge.
+
+        P16.05 (Prework Schritt 1): Generische Pipeline statt Indikator-
+        Branches – das aggregierte Render-Payload wird 1:1 per
+        applyChartRenderPayload an JS durchgereicht (P-D1, F1).
+        """
+        if self.df_data is None or self.df_data.empty:
+            return
+
+        payload = self._collect_render_payload()
 
         # P14-03-E (Flacker-Fix): calculate() resettet die _known_times der
         # Indikatoren – die offene Live-Bar generisch wieder einfügen, damit
         # der New-Candle-Callback nicht erneut feuert (Flacker-Zyklus).
         self._reinject_live_bar_to_indicators()
+
+        # JSON-Encoding im Hintergrund (F4: Threading-Muster exakt beibehalten)
+        self._serialize_and_render_grid(payload)
 
     def _reinject_live_bar_to_indicators(self) -> None:
         """P14-03-E (Flacker-Fix): Fügt die offene Live-Bar-Zeit generisch in
@@ -12777,8 +12865,13 @@ class PyTraderChartWindow(QMainWindow):
             except Exception:
                 continue
 
-    def _serialize_and_render_grid(self, lines: list, circles: list) -> None:
-        """Serialisiert Grid-Daten im Hintergrund-Thread und rendert sie.
+    def _serialize_and_render_grid(self, payload: dict) -> None:
+        """Serialisiert das aggregierte Indikator-Render-Payload im
+        Hintergrund-Thread und rendert es.
+
+        P16.05 (F4-Beschluss): Threading-Muster exakt beibehalten (QThread +
+        done-Signal + Generations-Guard) – nur das Payload-Format ist
+        generisch (EIN payload_json statt getrennter lines/circles).
         Alter Thread wird vor Neustart sauber beendet.
         Generations-Guard: jede Render-Anforderung bekommt eine steigende ID;
         veraltete Ergebnisse (langsamer Thread) werden verworfen."""
@@ -12795,25 +12888,26 @@ class PyTraderChartWindow(QMainWindow):
 
         self._grid_generation += 1
         grid_gen = self._grid_generation
-        self._grid_serializer = GridDataSerializer(lines, circles, grid_gen)
+        self._grid_serializer = GridDataSerializer(payload, grid_gen)
         self._grid_serializer.done.connect(self._apply_grid_render)
         self._grid_serializer.start()
 
-    def _apply_grid_render(self, lines_json: str, circles_json: str, grid_gen: int) -> None:
-        """Übergibt serialisierte Grid-Daten an JS (wird im GUI-Thread aufgerufen).
-        Verwirft veraltete Ergebnisse, falls inzwischen ein neuerer Render lief."""
+    def _apply_grid_render(self, payload_json: str, grid_gen: int) -> None:
+        """Übergibt das serialisierte Render-Payload an JS (GUI-Thread).
+
+        P16.05 (F4-Beschluss): Generations-Guard unverändert; geroutet wird
+        über die generische JS-Pipeline `applyChartRenderPayload(payload)`
+        (P-D1/F1: price_lines→renderPriceLines, lines→renderLineSeries,
+        hit_circles→renderMarkers). Verwirft veraltete Ergebnisse, falls
+        inzwischen ein neuerer Render lief."""
         if grid_gen < self._grid_generation:
             print(f"⚠️ [GridRender] Veraltetes Ergebnis verworfen (gen={grid_gen} < {self._grid_generation})")
             return
-        if not lines_json and not circles_json:
+        if not payload_json:
             return
         try:
-            if lines_json:
-                self.web_view.page().runJavaScript(
-                    f"if(window.renderGridLines) renderGridLines('{lines_json}');")
-            if circles_json:
-                self.web_view.page().runJavaScript(
-                    f"if(window.renderGridCircles) renderGridCircles('{circles_json}');")
+            self.web_view.page().runJavaScript(
+                f"if(window.applyChartRenderPayload) applyChartRenderPayload({payload_json});")
         except (RuntimeError, AttributeError):
             pass
 
@@ -12851,6 +12945,22 @@ class PyTraderChartWindow(QMainWindow):
                         not math.isnan(c["high"]) and
                         not math.isnan(c["low"]) and
                         not math.isnan(c["close"])):
+                        # P16.05 (F3-Beschluss): tick_volume NaN/None -> 0,
+                        # die Candle bleibt gültig. Doppel-Absicherung zur
+                        # Normalisierung in fetch_historical_candles, damit
+                        # json.dumps(allow_nan=False) nie an tick_volume
+                        # scheitert und df_data["tick_volume"] sauber ist.
+                        tv = c.get("tick_volume")
+                        if tv is None:
+                            tv = 0.0
+                        else:
+                            try:
+                                tv = float(tv)
+                            except (TypeError, ValueError):
+                                tv = 0.0
+                            if math.isnan(tv):
+                                tv = 0.0
+                        c["tick_volume"] = tv
                         clean_candles.append(c)
 
             # ======================================================================
@@ -12897,26 +13007,12 @@ class PyTraderChartWindow(QMainWindow):
             self.df_data = None
             continuous_candles = []
 
-        grid_lines = []
-        grid_circles = []
-
-        if self.df_data is not None and not self.df_data.empty:
-            for ind_id, plugin in self.indicators.items():
-                st = self.indicators_state.get(ind_id, {})
-                if st.get("active") and ind_id == "ind_fixed_grid_proximity":
-                    if hasattr(plugin, "set_context"):
-                        plugin.set_context(self.current_symbol, self.current_tf)
-                    # 5.4 Schritt 2: Logik aus set_id + Darstellung aus
-                    # display_params auflösen (Legacy volle params bleibt).
-                    res = plugin.calculate(self.df_data, self._resolve_indicator_params(ind_id, st))
-                    grid_lines = res.get("lines", [])
-                    grid_circles = res.get("hit_circles", [])
-                    # Circle-Zeiten auf kontinuierlich mappen
-                    if grid_circles and self._time_real_to_cont:
-                        for gc in grid_circles:
-                            gc_t = gc.get("time")
-                            if gc_t is not None and int(gc_t) in self._time_real_to_cont:
-                                gc["time"] = self._time_real_to_cont[int(gc_t)]
+        # P16.05 (Prework Schritt 1): Generische Payload-Aggregation über
+        # ALLE aktiven Indikatoren (P-D1/F1/P-C2) – keine Indikator-
+        # spezifischen Branches mehr (Open/Closed, Invariante 9). Circle-/
+        # Linien-Zeiten werden in _collect_render_payload auf kontinuierlich
+        # gemappt (real→cont via _time_real_to_cont).
+        render_payload = self._collect_render_payload()
 
         # P14-03-E (Flacker-Fix, generisch): plugin.calculate() setzt die
         # _known_times der Indikatoren auf die DB-Bars zurück – die offene
@@ -12933,8 +13029,10 @@ class PyTraderChartWindow(QMainWindow):
             "timeframe": self.current_tf,
             "candles": continuous_candles,
             "precision": precision,
-            "gridLines": grid_lines,
-            "gridCircles": grid_circles,
+            # P16.05 (P-C3/F4): chartRenderPayload (analog gridLines/
+            # gridCircles) – applyFullChartUpdate ruft die generische
+            # JS-Pipeline applyChartRenderPayload(chartRenderPayload) auf.
+            "chartRenderPayload": render_payload,
             "measurementState": self.measurement_state,
             "timeMap": self._time_cont_to_real,
             # TF_SECONDS_MAP: Python ist die Single Source of Truth. JS nutzt
@@ -13663,6 +13761,19 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		# ueberschrieben werden.
 		self._preset_logic_params: Dict[str, Any] = dict(logic_params or {})
 
+		# Bugfix (06.08.2026): Indikatoren OHNE deklarierte Services (z.B.
+		# Multi-MA) erzeugen die Service-UI-Attribute NICHT mehr (siehe
+		# _init_plugin_ui -> _init_plugin_ui_params_only). Die None-
+		# Vorbelegung macht die bestehenden 'if self.<attr>:'-Guards (z.B.
+		# in _build_preset_payload, on_preset_selected, refresh_service_set_
+		# list) None-sicher - ohne jede Aenderung an der Service-Pfad-Logik.
+		self.combo_service_set: Optional[QComboBox] = None
+		self.combo_service_sel: Optional[QComboBox] = None
+		self.stack_service_forms: Optional[QWidget] = None
+		self.edit_set_name: Optional[QLineEdit] = None
+		self.edit_set_description: Optional[QLineEdit] = None
+		self.group_expert: Optional[QGroupBox] = None
+
 		# Phase 13 Schritt 8: EIN NamedItemAdapter pro Sammlung (Presets +
 		# Service-Sets). Die _item_*-Protokoll-Methoden liegen NICHT auf der
 		# Dialog-Klasse, sondern in den Adaptern – zwei Callback-Sätze auf
@@ -13862,6 +13973,21 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			# marker-Modus nicht verloren geht (Typ-Mismatch im Widget würde
 			# sonst auf die Default-Farbe zurueckfallen).
 			style_type = str(spec.get("style_type", "line"))
+			# Bugfix (06.08.2026): Reiner Farbwaehler (color_only im Schema,
+			# z.B. Multi-MA maX_color) - KEIN StylePickerWidget-Composite.
+			# Diese Farb-Parameter besitzen keine Geschwister-Keys
+			# (style/width bzw. shape/size) und keine eigene
+			# Sichtbarkeits-Checkbox (die steuert show_maX).
+			if bool(spec.get("color_only", False)):
+				if style_type == "marker":
+					style_obj = MarkerStyle(color=str(val))
+				else:
+					style_obj = LineStyle(color=str(val))
+				ctrl = StylePickerWidget(
+					style=style_obj, enable_alpha=allow_alpha,
+					style_type=style_type, color_only=True)
+				ctrl.style_changed.connect(self.on_param_control_changed)
+				return ctrl
 			if style_type == "marker":
 				# P16.03-Bugfix: Marker-Form/-Groesse aus den Geschwister-Params
 				# vorbelegen (Konvention 'color' -> 'shape'/'size'), damit das
@@ -13952,9 +14078,15 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			# Preset-Verwaltung (Legacy: unten, im eigenen Rahmen)
 			content_layout.addWidget(self._build_preset_group())
 
-		btn_close = QPushButton("Schließen")
-		btn_close.clicked.connect(self.accept)
-		content_layout.addWidget(btn_close)
+		# Bugfix (06.08.2026): _init_plugin_ui_params_only platziert den
+		# Schließen-Button bereits im Plugin-Grid (Zeile 0, Spalte 2, rechts
+		# mittig neben der Preset-Box) - hier NUR anfügen, wenn er nicht
+		# schon im Plugin-Grid sitzt (sonst
+		# Doppel-Button).
+		if not getattr(self, "_close_placed_in_plugin_ui", False):
+			btn_close = QPushButton("Schließen")
+			btn_close.clicked.connect(self.accept)
+			content_layout.addWidget(btn_close)
 
 		# ScrollArea umschließt den Inhalt (natürliche Größe); das Fenster wird
 		# auf den Bildschirm geklemmt (Scrollbars bei Überlänge, sonst exakt
@@ -14022,6 +14154,19 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		self.plugin_labels = dict(getattr(plugin, "param_labels", None) or {})
 		for key, spec in base_schema.items():
 			self.plugin_labels.setdefault(key, spec.get("description") or self._human(key))
+
+		# Bugfix (06.08.2026): Plugin-Indikator OHNE deklarierte Services
+		# (service_plugin_ids leer, z.B. Multi-MA 'ind_moving_averages').
+		# Anwenderanforderung: "in diesem indikator gibt es keine services -
+		# dazu alles ausblenden". Alle Service-Boxen ('Service-Parameter',
+		# 'Service-Set Aktionen', 'Experten-Optionen') entfallen KOMPLETT;
+		# der selbst-contained Indikator rendert stattdessen ALLE Parameter
+		# direkt (param_layout-gruppiert, inkl. der vorher fehlenden
+		# maX_type/maX_period/maX_smooth_type/maX_alpha).
+		has_services = bool(self._indicator_service_ids())
+		if not has_services:
+			self._init_plugin_ui_params_only(main_layout)
+			return
 
 		# --- 1) Grid: Indi-Props + Service-Parameter links; rechts daneben auf
 		# gleicher Höhe 'Service-Set Aktionen' (darunter 'Experten-Optionen') ---
@@ -14207,6 +14352,113 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 
 		# Initiale Set-Liste befüllen (list_sets() als Quelle, Roadmap §5.2)
 		self.refresh_service_set_list()
+
+	def _init_plugin_ui_params_only(self, main_layout: QVBoxLayout) -> None:
+		"""Bugfix (06.08.2026): Plugin-Indikator OHNE deklarierte Services.
+
+		Rendert ALLE Parameter direkt - gruppiert nach `param_layout` (z.B.
+		Multi-MA: 'MA 1 (Führung)' .. 'MA 8'), sonst flach. Die Service-Boxen
+		('Service-Parameter', 'Service-Set Aktionen', 'Experten-Optionen')
+		entfallen komplett (Anwenderanforderung, siehe _init_plugin_ui). Die
+		Preset-Verwaltung bleibt erhalten (Speichern/Laden der Parameter).
+		Damit erscheinen auch die vorher fehlenden Nicht-Darstellungs-Parameter
+		(maX_type/maX_period/maX_smoothing/maX_alpha) im Prop-Fenster.
+
+		Layout (Vertrag C, 07.08.2026, Anwenderanforderungen):
+		  * Zeile 0: Preset-Box ganz oben links, so breit wie MA1+MA2
+		    (Spalten 0-1, span 2); rechts daneben (Spalte 2) vertikal
+		    zentriert der Schließen-Button.
+		  * Zeile 1: die ersten zwei Parameter-Boxen nebeneinander (MA1/MA2).
+		  * Danach: je 3 Parameter-Boxen pro Zeile (Multi-MA: Zeile 2 =
+		    MA3/MA4/MA5, Zeile 3 = MA6/MA7/MA8).
+		  * Nichts unterhalb der letzten Boxen-Zeile -> das Fenster endet
+		    exakt am unteren Rand der letzten Boxen.
+		  * Das kompakte 3-Spalten-Grid ergibt ~900px Breite (ContentScroll-
+		    Mixin klemmt die Groesse auf den Inhalt bzw. den Bildschirm).
+		"""
+		content_grid = QGridLayout()
+		content_grid.setSpacing(6)
+
+		# --- Zeile 0: Preset-Box oben links (Spalten 0-1, span 2 = bis zum
+		# Ende von MA2); rechts daneben in Spalte 2 vertikal zentriert der
+		# Schließen-Button (rechts mittig neben der Preset-Box). ---
+		self._close_placed_in_plugin_ui = True
+		content_grid.addWidget(
+			self._build_preset_group(), 0, 0, 1, 2, Qt.AlignTop)
+
+		layout_schema = getattr(self.plugin, "param_layout", None)
+		groups: List[Any] = []
+		if isinstance(layout_schema, list) and layout_schema \
+				and isinstance(layout_schema[0], (tuple, list)):
+			groups = list(layout_schema)
+		else:
+			groups = [("Parameter", list(self.plugin_order))]
+
+		# Parameter-Boxen bauen (gefiltert: noch nicht gerendert, nicht expert).
+		rendered_groups: List[QGroupBox] = []
+		for title, keys in groups:
+			# Nur noch nicht gerenderte, nicht-expert Keys dieser Gruppe.
+			grp_keys = [
+				k for k in keys
+				if k not in self.param_controls
+				and not self.plugin_schema.get(k, {}).get("expert")
+			]
+			if not grp_keys:
+				continue
+			group = QGroupBox(str(title))
+			# Horizontal Expanding -> füllt die Spaltenbreite (wie die
+			# 'Anzeige & Farben'-Box im Service-Pfad); vertikal Maximum.
+			group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+			form = QFormLayout(group)
+			for key in grp_keys:
+				spec = self.plugin_schema.get(key, {})
+				cval = self.params.get(key, spec.get("default"))
+				ctrl = self.create_schema_control(key, cval, spec)
+				self.param_controls[key] = ctrl
+				form.addRow(self.plugin_labels.get(key, self._human(key)), ctrl)
+			rendered_groups.append(group)
+
+		# Nicht in param_layout enthaltene Keys flach nachtragen (Schutz).
+		remaining = [
+			k for k in self.plugin_order
+			if k not in self.param_controls
+			and not self.plugin_schema.get(k, {}).get("expert")
+		]
+		if remaining:
+			group = QGroupBox("Weitere Parameter")
+			group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+			form = QFormLayout(group)
+			for key in remaining:
+				spec = self.plugin_schema.get(key, {})
+				cval = self.params.get(key, spec.get("default"))
+				ctrl = self.create_schema_control(key, cval, spec)
+				self.param_controls[key] = ctrl
+				form.addRow(self.plugin_labels.get(key, self._human(key)), ctrl)
+			rendered_groups.append(group)
+
+		# --- 3-Spalten-Grid (Vertrag C, Bugfix 07.08.2026) ---
+		# Zeile 1: Gruppe 1 (Spalte 0) + Gruppe 2 (Spalte 1) nebeneinander
+		# (MA1/MA2). Ab Gruppe 3 folgen je 3 Boxen pro Zeile (Zeile 2:
+		# G3/G4/G5, Zeile 3: G6/G7/G8). Der Schliessen-Button sitzt in
+		# Zeile 0 Spalte 2 (rechts mittig neben der Preset-Box).
+		btn_close = QPushButton("Schließen")
+		btn_close.clicked.connect(self.accept)
+		if rendered_groups:
+			content_grid.addWidget(rendered_groups[0], 1, 0, Qt.AlignTop)
+			if len(rendered_groups) > 1:
+				content_grid.addWidget(rendered_groups[1], 1, 1, Qt.AlignTop)
+			content_grid.addWidget(btn_close, 0, 2, Qt.AlignCenter)
+			for i in range(2, len(rendered_groups)):
+				g = i - 2
+				content_grid.addWidget(
+					rendered_groups[i], g // 3 + 2, g % 3, Qt.AlignTop)
+
+		# Alle 3 Spalten wachsen beim Aufziehen gleichmaessig; die Breite
+		# ergibt sich aus den drei Boxen nebeneinander ("~900px", Vertrag C).
+		content_grid.setColumnStretch(0, 1)
+		content_grid.setColumnStretch(1, 1)
+		content_grid.setColumnStretch(2, 1)
+		main_layout.addLayout(content_grid)
 
 	# -------------------------------------------------------------------------
 	# Service-Set-UI (Phase 13 Schritt 5)
@@ -14647,8 +14899,12 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 				# P16.03-Bugfix: Form/Groesse bzw. Linienart/-staerke in
 				# display_params aufnehmen (Konvention 'color' -> 'shape'/'size'
 				# bzw. 'style'/'width'), damit Presets die Auswahl im
-				# StylePickerWidget round-trippen.
+				# StylePickerWidget round-trippen. Bugfix (06.08.2026):
+				# color_only-Waehler (Multi-MA) haben KEINE Geschwister-Keys
+				# und werden uebersprungen.
 				if isinstance(ctrl, StylePickerWidget):
+					if getattr(ctrl, "color_only", False):
+						continue
 					style_obj = ctrl.get_style()
 					if isinstance(style_obj, MarkerStyle):
 						shape_key, size_key = self._style_sibling_keys(key, "marker")
@@ -15052,6 +15308,10 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			elif isinstance(ctrl, StylePickerWidget):
 				style_obj = ctrl.get_style()
 				new_params[key] = style_obj.color
+				# Bugfix (06.08.2026): color_only-Waehler (Multi-MA) haben
+				# keine Geschwister-Keys -> Sibling-Schreiben ueberspringen.
+				if getattr(ctrl, "color_only", False):
+					continue
 				# P16.03-Bugfix: Form/Groesse bzw. Linienart/-staerke in die
 				# Geschwister-Keys schreiben (Konvention 'color' ->
 				# 'shape'/'size' bzw. 'style'/'width'), damit die Auswahl im
@@ -15086,6 +15346,10 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 					ctrl.setCurrentText(str(val))
 				elif isinstance(ctrl, StylePickerWidget) and isinstance(val, str):
 					ctrl.set_color(val)
+					# Bugfix (06.08.2026): color_only-Waehler (Multi-MA) haben
+					# keine Geschwister-Keys -> Restore-Schritt ueberspringen.
+					if getattr(ctrl, "color_only", False):
+						continue
 					# P16.03-Bugfix: Form/Groesse bzw. Linienart/-staerke aus
 					# den Geschwister-Params zurueckspielen (sonst zeigt das
 					# Widget beim Restore die Defaults, obwohl der Chart die
@@ -15848,9 +16112,13 @@ class FixedGridProximityIndicator(BaseIndicator):
         show_circles / circle_color_std / circle_color_active /
         use_time_filter).
 
-        Liefert {"lines", "hit_circles", "status_info"} für den JS-Bridge
-        (chart_win._serialize_and_render_grid) – Parität zum Alt-Grid:
-        * lines: {price, color, width, style:'solid', is_custom}
+        Liefert {"price_lines", "hit_circles", "status_info"} für den JS-Bridge
+        (chart_win._serialize_and_render_grid) – Parität zum Alt-Grid.
+        P16.05 (F1-Beschluss): Die Preislinien liegen unter dem Key
+        "price_lines" (eigener Key für horizontale Grid-Preislinien); der
+        "lines"-Key ist ausschließlich für Zeitreihen-LineSeries (Multi-MA)
+        reserviert.
+        * price_lines: {price, color, width, style:'solid', is_custom}
           (leere line_color = Paritäts-Styling des Alt-Grid:
           rgba(33,150,243,0.9) für Custom-Levels, rgba(33,150,243,0.5) für
           Normal-Levels; width/style seit P16.03-Bugfix aus line_width/
@@ -15935,7 +16203,7 @@ class FixedGridProximityIndicator(BaseIndicator):
 
         status_info = raw_features.get("status_info") or {}
         return {
-            "lines": lines,
+            "price_lines": lines,
             "hit_circles": hit_circles,
             "status_info": {
                 "in_time_window": bool(
@@ -15966,7 +16234,7 @@ class FixedGridProximityIndicator(BaseIndicator):
           aus der Pipeline (GridLinesService) – sie sind kein DB-Output.
         """
         empty_result: Dict[str, Any] = {
-            "lines": [],
+            "price_lines": [],
             "hit_circles": [],
             "status_info": {"in_time_window": False, "active_hits": []},
         }
@@ -16004,7 +16272,7 @@ class FixedGridProximityIndicator(BaseIndicator):
                     "statistics") or {},
             }
             render_payload = self.build_chart_render_payload(raw_features, p)
-            lines = render_payload.get("lines") or []
+            lines = render_payload.get("price_lines") or []
 
             # U15-A2 (Farb-Semantik) mit Bugfix 04.08.2026 (Circles wieder
             # sichtbar): PRIMÄR werden die Proximity-Hits aus dem feature_store
@@ -16059,7 +16327,7 @@ class FixedGridProximityIndicator(BaseIndicator):
             self._live_points = []
 
             return {
-                "lines": lines,
+                "price_lines": lines,
                 "hit_circles": circles,
                 "status_info": status,
             }
@@ -16173,6 +16441,441 @@ class FixedGridProximityIndicator(BaseIndicator):
 
 --------------------------------------------------
 
+### DATEI: chart/indicators/multi_ma.py
+```py
+# chart/indicators/multi_ma.py
+"""
+Phase 16.05 – Multi-MA-Indikator (8x Moving Averages)
+======================================================
+
+Selbst-contained Indikator (BaseIndicator) für den Chart: zeichnet bis zu
+8 Moving Averages als LWC-v5-LineSeries über die GENERISCHE Render-Pipeline
+(Prework, 16.05) – KEIN Indikator-spezifischer JS-/chart_win-Branch mehr.
+
+  * Nutzt die `MATemplateEngine` aus Phase 16.04
+    (chart/indicators/utils/ma_template.py) für die Berechnung (12 MA-Typen,
+    vektorisiert), Farb-Serien (dual_color-Semantik) und den LWC-v5-Payload.
+  * `calculate()` liefert den generischen Render-Payload
+    `{"lines": [{"id": "ma1".."ma8", "data": [{time, value, color}],
+                 "width", "style", "title"}, ...]}` (Entscheidung D6,
+    P-C5: `lines` statt `maLines` – der `lines`-Key ist ausschließlich für
+    Zeitreihen-LineSeries reserviert, F1-Beschluss).
+  * Das Parameter-Schema (50 Parameter: MA1 8 Keys, MA2..8 je 6 Keys) wird
+    PROGRAMMATISCH in einer Schleife `for x in range(1, 9)` erzeugt
+    (Ergänzung C3), nicht manuell ausgeschrieben. `maX_smoothing` (Vertrag C,
+    16.05): int-Glättungslänge (min 0, max 500, Default 10 laut Konzept) –
+    der EMA-Doppelpass läuft über `MATemplateEngine.calculate_ma(..., 
+    smoothing=smoothing)`. `smoothing <= 1` = keine Glättung (die frühere
+    Option " - no Smoothing" sowie `maX_smooth_type` sind damit überholt
+    und ersatzlos entfernt).
+  * Defaults (Entscheidung D7): MA1 `EHMA/4/alpha 2.0/dual_color=False`,
+    MA2..8 `EMA/10*X/alpha 2.0`, alle `show=False` außer MA1.
+  * Kontrastfarben (Entscheidung D4): MA1 teal #26A69A (Führungslinie),
+    MA2 #2962FF, MA3 #FF6D00, MA4 #AB47BC, MA5 #FDD835, MA6 #FF5252,
+    MA7 #00E5FF, MA8 #B0BEC5.
+  * VWMA (P-D4/F3): nutzt `df["tick_volume"]` aus `fetch_historical_candles`
+    (None/NaN -> 0 normalisiert). Fehlt die Spalte oder ist das Volumen
+    Null, greift der Engine-interne E5-Fallback (SMA).
+
+Keine Analytics-/Feature-Store-Schreibzugriffe (reine Darstellung, P16.01).
+"""
+
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+
+from .base_indicator import BaseIndicator
+from .utils.ma_template import MATemplateEngine, MA_TYPES, resolve_bull_color
+
+# ---------------------------------------------------------------------------
+# Konstanten & Defaults (Entscheidungen D4/D7)
+# ---------------------------------------------------------------------------
+_INDICATOR_ID: str = "ind_moving_averages"
+_DISPLAY_NAME: str = "Multi Moving Average (8x)"
+
+# Kontrastfarben MA1..MA8 (D4) – MA1 teal bleibt Führungslinie.
+_MA_COLORS: Dict[int, str] = {
+    1: "#26A69A",   # teal (Führung)
+    2: "#2962FF",   # Blau
+    3: "#FF6D00",   # Orange
+    4: "#AB47BC",   # Violett
+    5: "#FDD835",   # Gelb
+    6: "#FF5252",   # Rot
+    7: "#00E5FF",   # Cyan
+    8: "#B0BEC5",   # Blaugrau
+}
+_MA1_BEAR_COLOR: str = "#EF5350"
+
+# Strichstärke: MA1 (Führungslinie) kräftiger, MA2..8 dünner.
+_MA1_WIDTH: int = 2
+_MA_WIDTH: int = 1
+_LINE_STYLE: str = "solid"
+
+# Glättung (Vertrag C, 16.05): Default 10 laut Konzept (16.04 Schritt 3).
+# smoothing <= 1 = keine Glättung (Bypass in MATemplateEngine.calculate_ma).
+_MA_SMOOTHING_DEFAULT: int = 10
+
+
+def _as_bool(value: Any, default: bool = True) -> bool:
+    if isinstance(value, str):
+        return value.lower() in ("true", "1", "yes")
+    if value is None:
+        return default
+    return bool(value)
+
+
+def _as_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+class MultiMovingAverageIndicator(BaseIndicator):
+    """Multi-MA-Indikator (8 MAs) – generische `lines`-LineSeries via
+    MATemplateEngine (Phase 16.04)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._symbol: Optional[str] = None
+        self._timeframe: Optional[str] = None
+        self._settings: Any = None
+        self._plugin_id: str = _INDICATOR_ID
+
+    # ------------------------------------------------------------- Identität
+    @property
+    def indicator_id(self) -> str:
+        return _INDICATOR_ID
+
+    @property
+    def display_name(self) -> str:
+        return _DISPLAY_NAME
+
+    @property
+    def plugin_id(self) -> str:
+        """Selbst-contained Plugin-Schnittstelle (Branch 1 in
+        indicator_dialog._get_plugin: parameter_schema + plugin_id)."""
+        return _INDICATOR_ID
+
+    @property
+    def service_plugin_ids(self) -> List[str]:
+        """Keine Services – reiner Darstellungs-Indikator."""
+        return []
+
+    # ----------------------------------------------------- Parameter-Schema
+    @staticmethod
+    def _build_schema() -> Dict[str, Dict[str, Any]]:
+        """Programmatische Schema-Erzeugung (Ergänzung C3): 8 MAs, 50 Keys.
+
+        MA1 (Führung, mit DualColor): show_ma1, ma1_type, ma1_period,
+        ma1_smoothing, ma1_alpha, ma1_dual_color, ma1_bull_color,
+        ma1_bear_color.
+        MA2..8 (Standard): show_maX, maX_type, maX_period,
+        maX_smoothing, maX_alpha, maX_color (kein dual_color/bear_color).
+        """
+        schema: Dict[str, Dict[str, Any]] = {}
+        for x in range(1, 9):
+            prefix = f"ma{x}"
+            schema[f"show_{prefix}"] = {
+                "type": "bool",
+                "default": (x == 1),  # D7: nur MA1 sichtbar
+                "description": f"MA {x} anzeigen",
+            }
+            schema[f"{prefix}_type"] = {
+                "type": "choice",
+                "options": list(MA_TYPES),
+                "default": ("EHMA" if x == 1 else "EMA"),  # D7
+                "description": f"MA {x} Typ",
+            }
+            schema[f"{prefix}_period"] = {
+                "type": "int",
+                "default": (4 if x == 1 else 10 * x),  # D7
+                "min": 1,
+                "max": 500,
+                "step": 1,
+                "description": f"MA {x} Periode",
+            }
+            schema[f"{prefix}_smoothing"] = {
+                "type": "int",
+                # Vertrag C (16.05): int-Glättungslänge, EMA-Doppelpass in der
+                # Engine (MATemplateEngine.calculate_ma, smoothing=...).
+                # smoothing <= 1 = keine Glättung.
+                "default": _MA_SMOOTHING_DEFAULT,
+                "min": 0,
+                "max": 500,
+                "step": 1,
+                "description": f"MA {x} Glättung (zweiter EMA-Pass über die MA-Serie; <= 1 = keine Glättung)",
+            }
+            schema[f"{prefix}_alpha"] = {
+                "type": "float",
+                "default": 2.0,
+                "min": 0.1,
+                "max": 10.0,
+                "step": 0.1,
+                "description": f"MA {x} Decay-Faktor (Alpha-MAs)",
+            }
+            if x == 1:
+                # MA1: NUR DualColor-Schalter + bull/bear (Spezial-Führung).
+                schema["ma1_dual_color"] = {
+                    "type": "bool",
+                    "default": False,  # D7
+                    "description": "MA 1 Auf/Ab-Färbung",
+                }
+                schema["ma1_bull_color"] = {
+                    "type": "color",
+                    "default": _MA_COLORS[1],
+                    "description": "MA 1 Farbe steigend",
+                    "style_type": "line",
+                    # Bugfix (06.08.2026): REINER Farbwaehler - KEIN
+                    # StylePickerWidget-Composite (keine 'sichtbar'-Checkbox,
+                    # keine Linienart/-staerke). Die Sichtbarkeit steuert
+                    # ausschliesslich show_maX (Anzeige-Checkbox).
+                    "color_only": True,
+                }
+                schema["ma1_bear_color"] = {
+                    "type": "color",
+                    "default": _MA1_BEAR_COLOR,
+                    "description": "MA 1 Farbe fallend (dual_color)",
+                    "style_type": "line",
+                    "color_only": True,
+                }
+            else:
+                # MA2..8: einfarbig (kein dual_color/bear_color).
+                schema[f"{prefix}_color"] = {
+                    "type": "color",
+                    "default": _MA_COLORS[x],
+                    "description": f"MA {x} Farbe",
+                    "style_type": "line",
+                    "color_only": True,
+                }
+        return schema
+
+    @property
+    def parameter_schema(self) -> Dict[str, Dict[str, Any]]:
+        return {k: dict(v) for k, v in self._build_schema().items()}
+
+    @property
+    def parameter_order(self) -> List[str]:
+        """Darstellungs-Reihenfolge: MA1-Gruppe, dann MA2..8."""
+        order: List[str] = []
+        for x in range(1, 9):
+            order.append(f"show_ma{x}")
+            order.append(f"ma{x}_type")
+            order.append(f"ma{x}_period")
+            order.append(f"ma{x}_smoothing")
+            order.append(f"ma{x}_alpha")
+            if x == 1:
+                order.extend(["ma1_dual_color", "ma1_bull_color", "ma1_bear_color"])
+            else:
+                order.append(f"ma{x}_color")
+        return order
+
+    @property
+    def base_parameter_schema(self) -> Dict[str, Dict[str, Any]]:
+        """Kein lookback nötig – reiner Darstellungs-Indikator über alle
+        Candles des Charts (keine Service-Pipeline)."""
+        return {}
+
+    def full_parameter_schema(self) -> Dict[str, Dict[str, Any]]:
+        merged = dict(self.base_parameter_schema)
+        merged.update(dict(self.parameter_schema or {}))
+        return merged
+
+    @property
+    def default_params(self) -> Dict[str, Any]:
+        return {
+            k: v["default"]
+            for k, v in self.full_parameter_schema().items()
+            if "default" in v
+        }
+
+    @property
+    def param_options(self) -> Dict[str, List[Any]]:
+        return {}
+
+    @property
+    def param_labels(self) -> Dict[str, str]:
+        labels: Dict[str, str] = {}
+        for x in range(1, 9):
+            labels[f"show_ma{x}"] = f"MA {x} anzeigen"
+            labels[f"ma{x}_type"] = f"MA {x} Typ"
+            labels[f"ma{x}_period"] = f"MA {x} Periode"
+            # Vertrag C (16.05): maX_smoothing mit Label 'Smooth'
+            # (Anwenderanforderung).
+            labels[f"ma{x}_smoothing"] = f"MA {x} Smooth"
+            labels[f"ma{x}_alpha"] = f"MA {x} Decay-Faktor"
+            if x == 1:
+                labels["ma1_dual_color"] = "MA 1 Auf/Ab-Färbung"
+                labels["ma1_bull_color"] = "MA 1 Farbe steigend"
+                labels["ma1_bear_color"] = "MA 1 Farbe fallend"
+            else:
+                labels[f"ma{x}_color"] = f"MA {x} Farbe"
+        return labels
+
+    @property
+    def param_layout(self) -> Optional[List[Any]]:
+        """Gruppen: 'MA 1 (Führung)' + 'MA 2'..'MA 8' (Ergänzung C3)."""
+        layout: List[Any] = []
+        for x in range(1, 9):
+            keys = [
+                f"show_ma{x}", f"ma{x}_type", f"ma{x}_period",
+                f"ma{x}_smoothing", f"ma{x}_alpha",
+            ]
+            if x == 1:
+                keys.extend(["ma1_dual_color", "ma1_bull_color", "ma1_bear_color"])
+                title = "MA 1 (Führung)"
+            else:
+                keys.append(f"ma{x}_color")
+                title = f"MA {x}"
+            layout.append((title, keys))
+        return layout
+
+    # ------------------------------------------------------------- Kontext
+    def set_context(self, symbol: str, timeframe: str) -> None:
+        self._symbol = symbol
+        self._timeframe = timeframe
+
+    def set_settings(self, settings: Any) -> None:
+        """Injiziert AppSettings (Kopie) – sonst lazy aus dem StateManager."""
+        self._settings = settings
+
+    def _get_app_settings(self) -> Any:
+        if self._settings is not None:
+            return self._settings
+        try:
+            from state_manager import StateManager
+            return StateManager().get_app_settings()
+        except Exception:
+            return None
+
+    def _get_candle_limit(self) -> int:
+        """chart_candle_limit aus den AppSettings (Default 3000)."""
+        try:
+            settings = self._get_app_settings()
+            limit = int(getattr(settings, "chart_candle_limit", 3000))
+            return max(limit, 1)
+        except Exception:
+            return 3000
+
+    # ------------------------------------------------------------ Berechnung
+    def build_chart_render_payload(
+        self,
+        df: pd.DataFrame,
+        params: Dict[str, Any],
+    ) -> Dict[str, List[Any]]:
+        """Baut den generischen Render-Payload (alle aktiven MAs).
+
+        Args:
+            df: OHLCV-DataFrame mit Spalten time/open/high/low/close (und
+                optional tick_volume für VWMA, P-D4/F3) – reale
+                Wanduhr-Epochs. Wird auf AppSettings.chart_candle_limit
+                zugeschnitten (crop_dataframe).
+            params: Indikator-Parameter (show_maX / maX_type / maX_period /
+                maX_smoothing (Vertrag C: EMA-Doppelpass in der Engine,
+                smoothing <= 1 = keine Glättung) / maX_alpha /
+                ma1_dual_color / ma1_bull_color / ma1_bear_color /
+                maX_color).
+
+        Returns:
+            {"lines": [{id, data, width, style, title}, ...]} – data ist
+            direkt LWC-v5-setData-Input ([{time, value, color}] mit
+            Pro-Punkt-color für dual_color-MA1, P16.04 build_chart_payload).
+            Zeiten sind reale Wanduhr-Epochs; das Mapping real→kontinuierlich
+            übernimmt chart_win._collect_render_payload generisch
+            (Ergänzung C1).
+        """
+        lines: List[Dict[str, Any]] = []
+        if df is None or df.empty:
+            return {"lines": lines}
+
+        # Daten-Zuschnitt (Ergänzung C3 / Spezifikation Punkt 2.1).
+        df_crop = MATemplateEngine.crop_dataframe(df, self._get_candle_limit())
+        if df_crop is None or df_crop.empty:
+            return {"lines": lines}
+        if "close" not in df_crop.columns:
+            return {"lines": lines}
+
+        close: pd.Series = df_crop["close"]
+        volume: Optional[pd.Series] = None
+        if "tick_volume" in df_crop.columns:
+            volume = df_crop["tick_volume"]
+
+        for x in range(1, 9):
+            prefix = f"ma{x}"
+            if not _as_bool(params.get(f"show_{prefix}"), x == 1):
+                continue
+            ma_type = str(params.get(f"{prefix}_type") or ("EHMA" if x == 1 else "EMA"))
+            period = _as_int(params.get(f"{prefix}_period"), 4 if x == 1 else 10 * x)
+            alpha = _as_float(params.get(f"{prefix}_alpha"), 2.0)
+            smoothing = _as_int(
+                params.get(f"{prefix}_smoothing"), _MA_SMOOTHING_DEFAULT
+            )
+
+            # Berechnung + optionale Alpha-EMA-Glättung (Vertrag C, 16.05):
+            # der EMA-Doppelpass läuft in der Engine (smoothing=...), KEIN
+            # Inline-Zweitpass mehr. smoothing <= 1 = keine Glättung.
+            ma_series = MATemplateEngine.calculate_ma(
+                close, ma_type, period, alpha_factor=alpha, volume=volume,
+                smoothing=smoothing,
+            )
+            smoothing_active = smoothing > 1
+
+            if x == 1:
+                # MA1: dual_color-Semantik (E6) – bull/bear aus den Params.
+                dual_color = _as_bool(params.get("ma1_dual_color"), False)
+                bull_color = resolve_bull_color(
+                    dual_color, params.get("ma1_bull_color"),
+                    default=_MA_COLORS[1],
+                )
+                bear_color = str(params.get("ma1_bear_color") or _MA1_BEAR_COLOR)
+                colors = MATemplateEngine.build_color_series(
+                    ma_series, dual_color, bull_color, bear_color
+                )
+                width = _MA1_WIDTH
+                title = f"MA1 {str(ma_type).upper()} {period}"
+            else:
+                # MA2..8: einfarbige Farbliste (maX_color).
+                color = str(params.get(f"{prefix}_color") or _MA_COLORS[x])
+                n = len(ma_series)
+                colors = [color] * n
+                width = _MA_WIDTH
+                title = f"MA{x} {str(ma_type).upper()} {period}"
+
+            # Aktive Glättung im Linien-Titel sichtbar machen (Chart-Legende).
+            # Vertrag C: nur die Länge, kein Typ mehr (' | S 10').
+            if smoothing_active:
+                title += f" | S {smoothing}"
+
+            data = MATemplateEngine.build_chart_payload(
+                df_crop["time"], ma_series, colors
+            )
+            lines.append({
+                "id": prefix,
+                "data": data,
+                "width": width,
+                "style": _LINE_STYLE,
+                "title": title,
+            })
+        return {"lines": lines}
+
+    def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Berechnet alle aktiven MAs und liefert den generischen
+        Render-Payload {"lines": [...]} (D6/P-C5)."""
+        if df is None or df.empty:
+            return {"lines": []}
+        return self.build_chart_render_payload(df, params)
+
+```
+
+--------------------------------------------------
+
 ### DATEI: chart/indicators/utils/__init__.py
 ```py
 # ==============================================================================
@@ -16202,14 +16905,16 @@ WICHTIG (Entscheidungen 06.08.2026, Doku-Analyse 16.04):
   * MAType = TradingView-konformer 12er-Satz in exakter Reihenfolge
     (E2): SMA, EMA, WMA, DEMA, TEMA, HMA, EHMA, ZLEMA, RMA, KAMA, ALMA, VWMA.
   * Defaults (E3): ma_type="EHMA", period=4, alpha_factor=2.0,
-    smooth_type="EHMA", dual_color=False, bull_color="#2196F3",
+    smoothing=10, dual_color=False, bull_color="#2196F3",
     bear_color="#EF5350".
   * Alpha-MAs (E4): DEMA, TEMA, EHMA verwenden den dynamischen Decay-Faktor
     alpha = alpha_factor / (period + 1).
   * VWMA (E5): ohne gültiges Volumen (fehlend/Null) Fallback auf SMA.
-  * smooth_type (Ergänzung 1): reiner Schema-Vertrag für spätere
-    MA-Indikatoren – wird von der Engine hier NICHT konsumiert
-    (Forward-Compatibility). EHMA = EMA_alpha(HMA(src, len), len).
+  * smoothing (Vertrag B, 16.04 Schritt 5): optionaler zweiter EMA-Pass
+    über die Basis-MA-Serie (auf alle 12 Typen anwendbar). smoothing > 1 =
+    aktiv (ema_first = EMA(base, span=smoothing); base = EMA(ema_first,
+    alpha=alpha_calc) mit alpha_calc = alpha_factor / (period + 1));
+    smoothing <= 1 = keine Glättung (Basis-Serie unverändert).
   * bull_color-Default bedingt (E7/Ergänzung 2): Schema liefert "#2196F3";
     der Konsument wendet "#26A69A" an, wenn dual_color=True UND bull_color
     nicht vom User gesetzt wurde (leer/None).
@@ -16536,11 +17241,13 @@ class MATemplateEngine:
                 "step": 1,
                 "description": "MA-Periode",
             },
-            "smooth_type": {
-                "type": "choice",
-                "options": list(MA_TYPES),
-                "default": "EHMA",
-                "description": "Smoothing-Typ (Forward-Compatibility, 16.04 noch nicht konsumiert)",
+            "smoothing": {
+                "type": "int",
+                "default": 10,
+                "min": 0,
+                "max": 500,
+                "step": 1,
+                "description": "Glättung (zweiter EMA-Pass über die MA-Serie; <= 1 = keine Glättung)",
             },
             "alpha_factor": {
                 "type": "float",
@@ -16587,8 +17294,9 @@ class MATemplateEngine:
         period: int,
         alpha_factor: float = 2.0,
         volume: Optional[pd.Series] = None,
+        smoothing: int = 1,
     ) -> pd.Series:
-        """Berechnet einen der 12 MA-Typen vektorisiert.
+        """Berechnet einen der 12 MA-Typen vektorisiert (Vertrag B).
 
         Args:
             source: Preis-Serie (z. B. df['close']).
@@ -16597,6 +17305,13 @@ class MATemplateEngine:
             alpha_factor: Decay-Faktor für Alpha-MAs (E4); entfällt bei KAMA.
             volume: Volumen-Serie für VWMA (z. B. df['tick_volume']). Fehlt
                     sie oder ist sie Null/NaN, fällt VWMA auf SMA zurück (E5).
+            smoothing: Optionale Alpha-EMA-Glättung (Vertrag B, 16.04 Schritt
+                    5) auf die Basis-MA-Serie (alle 12 Typen anwendbar):
+                      * smoothing > 1 (aktiv): ema_first = EMA(base,
+                        span=smoothing); base = EMA(ema_first, alpha=alpha_calc)
+                        mit alpha_calc = alpha_factor / (period + 1).
+                      * smoothing <= 1: keine Glättung (Basis-Serie
+                        unverändert, Default).
 
         Returns:
             pd.Series mit demselben Index wie `source`; die ersten
@@ -16648,6 +17363,14 @@ class MATemplateEngine:
             raise ValueError(
                 f"Unbekannter MA-Typ '{ma_type}'. Gültig: {MA_TYPES}"
             )
+
+        # Optionale Alpha-EMA-Glättung (Vertrag B, 16.04 Schritt 5):
+        # zweifach verschachtelte EMA-Filterung auf die Basis-MA-Serie.
+        # smoothing > 1 = aktiv; smoothing <= 1 = keine Glättung.
+        smoothing_int = max(int(smoothing or 0), 0)
+        if smoothing_int > 1:
+            ema_first = _ema_span_values(result, smoothing_int)
+            result = _ema_alpha_values(ema_first, alpha)
 
         return pd.Series(result, index=src.index, dtype=float)
 
@@ -16741,8 +17464,9 @@ let gridPriceLines = [], dayLinesSeries = [];
 // Liq-Lines statt auf der Bar (native Engine-Positionierung, kein CSS-Overlay).
 let _circleSeries = [], _circleMarkerPlugins = [];
 // P14-03-E: Circle-Cache für Merged-Render (historische + Live-Circles).
-// Wird in applyFullChartUpdate() aus data.gridCircles befüllt; applyLiveOverlays()
-// ersetzt nur die Live-Zeit-Einträge und rendert den Cache neu.
+// Wird in applyFullChartUpdate() aus data.chartRenderPayload.hit_circles
+// (P16.05) befüllt; applyLiveOverlays() ersetzt nur die Live-Zeit-Einträge
+// und rendert den Cache neu.
 let _gridCirclesCache = [];
 // P14-03-E (Flacker-Fix): Level-Registry für INKREMENTELLES Circle-Rendering.
 // renderGridCircles() aktualisiert nur veränderte Level per setData/setMarkers,
@@ -16750,6 +17474,11 @@ let _gridCirclesCache = [];
 // dieser Full-Layer-Rebuild pro Live-Tick (sobald die Proximity-Bedingung erfüllt
 // war) verursachte das Live-Flackern. Schluessel = String(c.price).
 let _circleLevelSeries = {};
+// P16.05 (Prework Schritt 2, P-D2): Registry für Zeitreihen-LineSeries
+// (z. B. Multi-MA). renderLineSeries() pflegt je Linie eine LWC-LineSeries
+// unter `_activeLineSeries[id]` – incrementelles setData für vorhandene IDs,
+// chart.removeSeries() für verschwundene IDs (kein Full-Layer-Rebuild).
+let _activeLineSeries = {};
 // P14-03-E (Flacker-Fix): Change-Detection für Live-Circles. Identische Circle-
 // Sets zwischen Ticks (gleiche Level-Hits, gleiche Farbe) lösen KEINEN Re-Render
 // aus – sonst re-rendert jeder Tick mit erfüllter Bedingung den ganzen Layer.
@@ -16940,7 +17669,10 @@ function _lwcLineStyle(styleName) {
     }
 }
 
-function renderGridLines(lines) {
+// P16.05 (Prework Schritt 2, F1/P-D2/P-D3): Generisches Preislinien-Primitiv.
+// Zeichnet horizontale Preislinien (Grid-Legacy) via candleSeries.createPriceLine.
+// Legacy-Alias renderGridLines() bleibt für Abwärtskompatibilität (P-D3).
+function renderPriceLines(lines) {
     clearGridLines();
     if (!candleSeries || !lines) return;
     var data = (typeof lines === 'string') ? JSON.parse(lines) : lines;
@@ -16955,6 +17687,7 @@ function renderGridLines(lines) {
         }
     });
 }
+function renderGridLines(lines) { renderPriceLines(lines); }
 
 // NOTE: Die Proximity-Circles werden auf der ZUGEHOERIGEN LIQ-LINE geplottet:
 // Je Level-Preis wird eine UNSICHTBARE LineSeries erzeugt (lineVisible:false,
@@ -16978,7 +17711,11 @@ function clearGridCircles() {
 // für unveränderte Level => kein Full-Layer-Rebuild pro Live-Tick (bisher rief
 // jede applyLiveOverlays renderGridCircles -> clearGridCircles auf, das ALLE
 // Circle-Serien wegwarf und neu aufbaute = Flackern bei erfüllter Proximity).
-function renderGridCircles(circles) {
+// P16.05 (Prework Schritt 2, P-D2/P-D3): Generisches Marker-Primitiv.
+// Übernimmt die bestehende inkrementelle Circle-Logik (je Level-Preis eine
+// unsichtbare LineSeries + SeriesMarkers-Plugin). renderGridCircles() bleibt
+// als Legacy-Alias für den Live-Overlay-Pfad (P-C4) erhalten (P-D3).
+function renderMarkers(circles) {
     if (!chart || !circles) return;
     var data = (typeof circles === 'string') ? JSON.parse(circles) : circles;
     if (!data || data.length === 0) {
@@ -17078,6 +17815,100 @@ function renderGridCircles(circles) {
             if (plugin) {
                 try { plugin.setMarkers(markers); } catch(e) {}
             }
+        }
+    }
+}
+function renderGridCircles(circles) { renderMarkers(circles); }
+
+// P16.05 (Prework Schritt 2, P-D2): Generisches Zeitreihen-Linien-Primitiv.
+// Pflegt eine Registry `_activeLineSeries[id]`: vorhandene LineSeries werden
+// per setData() in-place aktualisiert (incrementell, kein Flackern), IDs, die
+// im neuen Payload nicht mehr vorkommen, werden per chart.removeSeries()
+// entfernt. `data` ist direkt LWC-v5-setData-Input ([{time, value, color}]
+// mit optionalem Pro-Punkt-color – v5-konform, P16.04 build_chart_payload).
+function renderLineSeries(linesArray) {
+    if (!chart || !linesArray) return;
+    var data = (typeof linesArray === 'string') ? JSON.parse(linesArray) : linesArray;
+    if (!data || data.length === 0) {
+        // Kein Linien-Eintrag -> alle aktiven Zeitreihen-Serien entfernen.
+        for (var lid in _activeLineSeries) {
+            if (Object.prototype.hasOwnProperty.call(_activeLineSeries, lid)) {
+                try { if (_activeLineSeries[lid]) chart.removeSeries(_activeLineSeries[lid]); } catch(e) {}
+            }
+        }
+        _activeLineSeries = {};
+        return;
+    }
+
+    // 1) IDs entfernen, die im neuen Satz nicht mehr existieren.
+    var newIds = {};
+    for (var n = 0; n < data.length; n++) {
+        var l0 = data[n];
+        if (l0 && l0.id) newIds[l0.id] = true;
+    }
+    for (var oldId in _activeLineSeries) {
+        if (Object.prototype.hasOwnProperty.call(_activeLineSeries, oldId) && !newIds[oldId]) {
+            try { if (_activeLineSeries[oldId]) chart.removeSeries(_activeLineSeries[oldId]); } catch(e) {}
+            delete _activeLineSeries[oldId];
+        }
+    }
+
+    // 2) Upsert pro Linie.
+    for (var m = 0; m < data.length; m++) {
+        var line = data[m];
+        if (!line || !line.id || !line.data) continue;
+        var series = _activeLineSeries[line.id];
+        if (!series) {
+            try {
+                series = chart.addSeries(LightweightCharts.LineSeries, {
+                    lineWidth: (line.width && line.width > 0) ? line.width : 1,
+                    lineStyle: _lwcLineStyle(line.style),
+                    color: line.color || '#26A69A',
+                    lastValueVisible: false,
+                    priceLineVisible: false,
+                    crosshairMarkerVisible: false,
+                    priceScaleId: 'right'
+                });
+                _activeLineSeries[line.id] = series;
+            } catch(e) { continue; }
+        }
+        // Daten ersetzen (inkl. optionaler Pro-Punkt-Farbe für dual_color-MAs).
+        try { series.setData(line.data); } catch(e) { continue; }
+        // Style-Änderungen (width/style/color) nachziehen.
+        try {
+            series.applyOptions({
+                lineWidth: (line.width && line.width > 0) ? line.width : 1,
+                lineStyle: _lwcLineStyle(line.style),
+                color: line.color || '#26A69A'
+            });
+        } catch(e) {}
+    }
+}
+
+// P16.05 (Prework Schritt 2, P-D1/F1): Generische Render-Pipeline – die
+// Haupt-Schnittstelle, die das aggregierte Indikator-Payload 1:1 an die
+// Grafik-Primitive routet:
+//   payload.price_lines -> renderPriceLines() (horizontale Preislinien)
+//   payload.lines       -> renderLineSeries() (Zeitreihen-LineSeries)
+//   payload.hit_circles -> renderMarkers()    (Marker/Circles)
+// Keys werden nur geroutet, wenn sie im Payload vorhanden sind (leere Arrays
+// clearen den jeweiligen Layer). Kein Feld-Dispatch, kein kind-Feld (F1).
+function applyChartRenderPayload(payload) {
+    if (!chart || !candleSeries) return;
+    var p = (typeof payload === 'string') ? JSON.parse(payload) : (payload || {});
+    if (Object.prototype.hasOwnProperty.call(p, 'price_lines')) {
+        try { renderPriceLines(p.price_lines || []); } catch(e) {
+            console.warn('[applyChartRenderPayload] price_lines fehlgeschlagen:', e.message || e);
+        }
+    }
+    if (Object.prototype.hasOwnProperty.call(p, 'lines')) {
+        try { renderLineSeries(p.lines || []); } catch(e) {
+            console.warn('[applyChartRenderPayload] lines fehlgeschlagen:', e.message || e);
+        }
+    }
+    if (Object.prototype.hasOwnProperty.call(p, 'hit_circles')) {
+        try { renderMarkers(p.hit_circles || []); } catch(e) {
+            console.warn('[applyChartRenderPayload] hit_circles fehlgeschlagen:', e.message || e);
         }
     }
 }
@@ -17532,6 +18363,9 @@ function applyFullChartUpdate(data) {
         _circleSeries = [];
         _circleMarkerPlugins = [];
         _circleLevelSeries = {};
+        // P16.05 (Prework Schritt 2): LineSeries-Registry nach Chart-Rebuild
+        // leeren (die alten Serien haengen am entfernten chart-Objekt).
+        _activeLineSeries = {};
         try { DaySeparator.clear(); } catch(e) {}
 
         var container = document.getElementById('chart-container');
@@ -17615,8 +18449,11 @@ function applyFullChartUpdate(data) {
         }
         rawCandleData = validCandles;
         lastClosePrice = validCandles[validCandles.length - 1].close;
-        // P14-03-E: Circle-Cache für Merged-Render aus dem Refresh-Payload.
-        _gridCirclesCache = (data.gridCircles || []).slice();
+        // P16.05 (P-C3): Circle-Cache für Merged-Render aus dem generischen
+        // Render-Payload (chartRenderPayload.hit_circles) statt gridCircles.
+        var renderPayload = (typeof data.chartRenderPayload === 'string')
+            ? JSON.parse(data.chartRenderPayload) : (data.chartRenderPayload || {});
+        _gridCirclesCache = (renderPayload.hit_circles || []).slice();
         // P14-03-E (Flacker-Fix): Live-Circle-Change-Detection nach Full-Update
         // zurücksetzen – der erste Tick nach dem Refresh rendert wieder.
         _lastLiveCirclesJson = '[]';
@@ -17651,15 +18488,13 @@ function applyFullChartUpdate(data) {
             try { updateCountdownDisplay(); } catch(e) {}
         }, 1000);
 
-        // Schritt 5: Grid-Linien
-        try { if (data.gridLines) renderGridLines(data.gridLines); } catch(e) {
-            console.warn('[applyFullChartUpdate] Schritt 5 (gridLines) fehlgeschlagen:', e.message || e);
-        }
-
-        // Schritt 6: Grid-Circles – unsichtbare LineSeries je Level-Preis;
-        // Circle-Marker der Engine liegen damit direkt auf den Liq-Lines.
-        try { if (data.gridCircles) renderGridCircles(data.gridCircles); } catch(e) {
-            console.warn('[applyFullChartUpdate] Schritt 6 (gridCircles) fehlgeschlagen:', e.message || e);
+        // P16.05 (P-C3): Schritt 5+6 – generische Render-Pipeline statt
+        // getrennter renderGridLines/renderGridCircles. Das aggregierte
+        // Indikator-Payload (chartRenderPayload) wird 1:1 an
+        // applyChartRenderPayload geroutet (price_lines→renderPriceLines,
+        // lines→renderLineSeries, hit_circles→renderMarkers).
+        try { if (data.chartRenderPayload) applyChartRenderPayload(data.chartRenderPayload); } catch(e) {
+            console.warn('[applyFullChartUpdate] Schritt 5+6 (chartRenderPayload) fehlgeschlagen:', e.message || e);
         }
 
         // Schritt 7: Range
@@ -18633,9 +19468,17 @@ class StylePickerWidget(QWidget):
         enable_alpha: bool = True,
         parent=None,
         style_type: str = "line",
+        color_only: bool = False,
     ) -> None:
         super().__init__(parent)
         self._enable_alpha: bool = bool(enable_alpha)
+        # color_only (Bugfix 06.08.2026): Reiner Farbwaehler - das Composite
+        # (Sichtbarkeits-Checkbox, Linienstaerke/Groesse, Linienart/Markerform)
+        # wird NICHT angezeigt. Verwendet fuer reine Farb-Parameter (z.B.
+        # Multi-MA maX_color), deren Sichtbarkeit ein separater 'show_*'-
+        # Parameter steuert. get_style() liefert weiterhin ein Style-Objekt
+        # (Defaults fuer show/width/style) - der Dialog liest nur .color.
+        self._color_only: bool = bool(color_only)
         # style_type: "line" (LineStyle) | "marker" (MarkerStyle)
         self._style_type: str = "marker" if style_type == "marker" else "line"
         if self._style_type == "marker":
@@ -18707,10 +19550,14 @@ class StylePickerWidget(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
-        layout.addWidget(self._show_check)
-        layout.addWidget(self._color_btn)
-        layout.addWidget(self._width_spin)
-        layout.addWidget(self._style_combo)
+        # color_only: NUR den Farb-Button anzeigen (kein Composite).
+        if not self._color_only:
+            layout.addWidget(self._show_check)
+            layout.addWidget(self._color_btn)
+            layout.addWidget(self._width_spin)
+            layout.addWidget(self._style_combo)
+        else:
+            layout.addWidget(self._color_btn)
         layout.addStretch(1)
 
         self._update_swatch()
@@ -18723,6 +19570,16 @@ class StylePickerWidget(QWidget):
     def style_type(self) -> str:
         """Aktueller Widget-Modus: 'line' (LineStyle) oder 'marker' (MarkerStyle)."""
         return self._style_type
+
+    @property
+    def color_only(self) -> bool:
+        """True = reiner Farbwaehler (ohne Sichtbarkeits-/Stil-Composite).
+
+        Der Dialog nutzt dieses Flag, um die Geschwister-Keys (style/width
+        bzw. shape/size) beim Persistieren zu UEBERSPRINGEN - ein reiner
+        Farb-Parameter besitzt keine solchen Geschwister.
+        """
+        return self._color_only
 
     def get_style(self) -> Union[LineStyle, MarkerStyle]:
         """Liefert den aktuellen Stil als NEUES Style-Objekt (LineStyle bei
@@ -25551,6 +26408,607 @@ check("V10) Proximity 10k Bars < 1s (vektorisiert)", _dt_prox < 1.0,
 check("V11) grid_lines 10k Bars < 1s (vektorisiert)", _dt_gl < 1.0,
       f"{_dt_gl:.3f}s")
 
+# ---------------------------------------------------------------------------
+# Teil 8 (Phase 16.05, 06.08.2026): Prework Render-Engine – gezielte Logik-
+#   Tests (F2-Beschluss, permanent in test/test.py statt Check-Skripten):
+#   T1) fetch_historical_candles liefert tick_volume (None -> 0, F3/P-D4)
+#   T2) _collect_render_payload aggregiert generisch lines/price_lines/
+#       hit_circles ueber ALLE aktiven Indikatoren (P-D1/F1) inkl. Zeit-
+#       Mapping real->kontinuierlich und Inaktiv-Ueberspringung
+#   T3) FixedGridProximityIndicator liefert price_lines statt lines (F1)
+# ---------------------------------------------------------------------------
+print("\n=== Teil 8: P16.05 Prework (Payload-Aggregation, tick_volume, price_lines) ===")
+from PySide6.QtWidgets import QMainWindow  # noqa: E402
+from chart.chart_win import PyTraderChartWindow  # noqa: E402
+from db_service import MarketDataRepository  # noqa: E402
+
+# --- T1: tick_volume-Spalte (F3/P-D4) -----------------------------------------
+_p1605_tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp_p1605_db")
+os.makedirs(_p1605_tmp, exist_ok=True)
+_p1605_db = os.path.join(_p1605_tmp, "tv_test.duckdb")
+if os.path.exists(_p1605_db):
+    os.remove(_p1605_db)
+try:
+    _con = duckdb.connect(_p1605_db)
+    _con.execute("""
+        CREATE TABLE ohlcv_bars (
+            symbol VARCHAR NOT NULL,
+            timeframe VARCHAR NOT NULL,
+            time TIMESTAMPTZ NOT NULL,
+            open DOUBLE NOT NULL,
+            high DOUBLE NOT NULL,
+            low DOUBLE NOT NULL,
+            close DOUBLE NOT NULL,
+            tick_volume BIGINT,
+            spread INTEGER,
+            real_volume BIGINT,
+            PRIMARY KEY (symbol, timeframe, time)
+        );
+    """)
+    _con.execute("""
+        INSERT INTO ohlcv_bars (symbol, timeframe, time, open, high, low, close, tick_volume)
+        VALUES ('TESTTV', 'M1', TIMESTAMPTZ '2026-01-01 00:00:00+00', 10.0, 11.0, 9.0, 10.5, 100),
+               ('TESTTV', 'M1', TIMESTAMPTZ '2026-01-01 00:01:00+00', 10.5, 11.5, 10.0, 11.0, NULL),
+               ('TESTTV', 'M1', TIMESTAMPTZ '2026-01-01 00:02:00+00', 11.0, 12.0, 10.5, 11.5, 250);
+    """)
+    _con.close()
+    _repo_tv = MarketDataRepository(_p1605_db)
+    _candles_tv, _prec_tv = _repo_tv.fetch_historical_candles(
+        "TESTTV", "M1", limit=10)
+    check("P16.05 T1) tick_volume-Spalte geliefert (alle Candles)",
+          len(_candles_tv) == 3 and all("tick_volume" in c for c in _candles_tv),
+          f"{len(_candles_tv)} Candles")
+    check("P16.05 T1) tick_volume None -> 0 (F3)",
+          any(c["tick_volume"] == 0.0 for c in _candles_tv), "")
+    check("P16.05 T1) tick_volume Werte erhalten",
+          any(c["tick_volume"] == 100.0 for c in _candles_tv)
+          and any(c["tick_volume"] == 250.0 for c in _candles_tv), "")
+finally:
+    shutil.rmtree(_p1605_tmp, ignore_errors=True)
+
+# --- T2: _collect_render_payload (P-D1/F1/P-C2) --------------------------------
+class _P1605Harness(QMainWindow):
+    """Minimaler headless Host fuer _collect_render_payload (kein Chart-UI)."""
+
+    def __init__(self):
+        super().__init__()
+        self.indicators = {}
+        self.indicators_state = {}
+        self.df_data = pd.DataFrame({"time": [1000]})
+        self.current_symbol = "SILVER"
+        self.current_tf = "M1"
+        self._time_real_to_cont = {1000: 5000}
+        self._resolve_indicator_params = lambda ind_id, st: {}
+
+
+class _P1605FakeGrid:
+    def set_context(self, s, tf):
+        pass
+
+    def calculate(self, df, params):
+        return {"price_lines": [{"price": 24.5, "color": "#2196F3", "width": 1,
+                                 "style": "solid", "is_custom": False}],
+                "hit_circles": [{"time": 1000, "price": 24.5,
+                                 "color": "#FFEB3B"}]}
+
+
+class _P1605FakeMA:
+    def set_context(self, s, tf):
+        pass
+
+    def calculate(self, df, params):
+        return {"lines": [{"id": "ma1",
+                           "data": [{"time": 1000, "value": 24.4,
+                                     "color": "#26A69A"}],
+                           "width": 2, "style": "solid", "title": "MA1"}]}
+
+
+_win_p1605 = _P1605Harness()
+_win_p1605.indicators = {"ind_grid": _P1605FakeGrid(), "ind_ma": _P1605FakeMA()}
+_win_p1605.indicators_state = {
+    "ind_grid": {"active": True}, "ind_ma": {"active": True}}
+_payload_p1605 = PyTraderChartWindow._collect_render_payload(_win_p1605)
+check("P16.05 T2) Payload-Keys lines/price_lines/hit_circles",
+      set(_payload_p1605) == {"lines", "price_lines", "hit_circles"},
+      str(sorted(_payload_p1605)))
+check("P16.05 T2) price_lines geroutet (Grid)",
+      len(_payload_p1605["price_lines"]) == 1, "")
+check("P16.05 T2) lines geroutet (MA)",
+      len(_payload_p1605["lines"]) == 1, "")
+check("P16.05 T2) hit_circles geroutet (Grid)",
+      len(_payload_p1605["hit_circles"]) == 1, "")
+check("P16.05 T2) Zeit-Mapping real->kontinuierlich (hit_circles)",
+      _payload_p1605["hit_circles"][0]["time"] == 5000, "")
+check("P16.05 T2) Zeit-Mapping real->kontinuierlich (lines)",
+      _payload_p1605["lines"][0]["data"][0]["time"] == 5000, "")
+_win_p1605.indicators_state["ind_ma"]["active"] = False
+_payload_p1605b = PyTraderChartWindow._collect_render_payload(_win_p1605)
+check("P16.05 T2) inaktiver Indikator wird uebersprungen",
+      len(_payload_p1605b["lines"]) == 0, "")
+
+# --- T3: price_lines-Key in fixed_grid_proximity (F1) ---------------------------
+_pl_p1605 = _indi.build_chart_render_payload(
+    {"grid_levels": [{"price": 24.5}], "proximity_records": [],
+     "status_info": {}},
+    {"show_lines": True, "line_color": "#2196F3", "show_circles": True,
+     "circle_color_std": "#FFEB3B", "circle_color_active": "#E91E63",
+     "use_time_filter": True, "line_width": 1, "line_style": "solid",
+     "circle_shape_std": "circle", "circle_shape_active": "circle",
+     "circle_size_std": 6, "circle_size_active": 6})
+check("P16.05 T3) price_lines-Key vorhanden (F1)",
+      "price_lines" in _pl_p1605, "")
+check("P16.05 T3) kein lines-Key mehr (F1)",
+      "lines" not in _pl_p1605, "")
+check("P16.05 T3) price_lines Inhalt",
+      len(_pl_p1605.get("price_lines") or []) == 1, "")
+
+# ---------------------------------------------------------------------------
+# Teil 9 (Phase 16.05, 06.08.2026; Bugfix 07.08.2026; Vertrag C 07.08.2026):
+# Multi-MA-Indikator – gezielte Logik-Tests (F2-Beschluss, permanent in
+# test/test.py statt Check-Skripten):
+#   M1) Schema-Vollstaendigkeit (50 Parameter) + Defaults MA1/MA2..8 (D4/D7,
+#       maX_smoothing statt smooth_type/smooth_length, Vertrag C)
+#   M2) Payload MA1 dual_color=True vs False (Farbumschlag korrekt, E6)
+#   M3) Alle 8 MAs einzeln + kombiniert (show an/aus)
+#   M4) crop_dataframe auf chart_candle_limit (Daten-Zuschnitt)
+#   M5) LWC-Konformitaet (time int, value float, color str)
+#   M6) VWMA mit tick_volume aus df_data (P-D4/F3)
+#   M7) Glaettung (Vertrag C): smoothing<=1 = Roh-MA (Bypass);
+#       smoothing>1 = EMA-Doppelpass in der Engine, Titel ' | S <Laenge>'
+# ---------------------------------------------------------------------------
+print("\n=== Teil 9: P16.05 Multi-MA-Indikator ===")
+from chart.indicators.multi_ma import (  # noqa: E402
+    MultiMovingAverageIndicator, _MA_COLORS, _MA1_BEAR_COLOR,
+    _MA_SMOOTHING_DEFAULT,
+)
+from chart.indicators.utils.ma_template import MATemplateEngine  # noqa: E402
+
+_ma_ind = MultiMovingAverageIndicator()
+_ma_schema = _ma_ind.parameter_schema
+_ma_defaults = _ma_ind.default_params
+
+# M1: Schema-Vollstaendigkeit (MA1: 8 Keys, MA2..8: je 6 Keys = 50, Vertrag C)
+check("M1) Schema 50 Parameter (MA1 8 + MA2..8 je 6)",
+      len(_ma_schema) == 50, str(len(_ma_schema)))
+check("M1) MA1-Defaults (EHMA/4/dual=False, D7)",
+      _ma_defaults.get("ma1_type") == "EHMA"
+      and _ma_defaults.get("ma1_period") == 4
+      and _ma_defaults.get("ma1_dual_color") is False
+      and _ma_defaults.get("show_ma1") is True,
+      str({k: _ma_defaults.get(k) for k in ("ma1_type", "ma1_period",
+                                             "ma1_dual_color", "show_ma1")}))
+check("M1) MA2..8-Defaults (EMA/10*X/show=False, D7)",
+      all(_ma_defaults.get(f"ma{x}_type") == "EMA"
+          and _ma_defaults.get(f"ma{x}_period") == 10 * x
+          and _ma_defaults.get(f"show_ma{x}") is False
+          for x in range(2, 9)),
+      str({f"ma{x}_period": _ma_defaults.get(f"ma{x}_period")
+           for x in range(2, 9)}))
+check("M1) Kontrastfarben D4 (MA2..8)",
+      all(_ma_defaults.get(f"ma{x}_color") == _MA_COLORS[x]
+          for x in range(2, 9)),
+      str({f"ma{x}": _ma_defaults.get(f"ma{x}_color") for x in range(2, 9)}))
+check("M1) MA1 bull/bear Defaults (D7)",
+      _ma_defaults.get("ma1_bull_color") == "#26A69A"
+      and _ma_defaults.get("ma1_bear_color") == _MA1_BEAR_COLOR, "")
+check("M1) kein smooth_type/smooth_length im Schema (Vertrag C)",
+      "ma1_smooth_type" not in _ma_schema
+      and "ma1_smooth_length" not in _ma_schema
+      and "ma4_smooth_length" not in _ma_schema, "")
+check("M1) maX_smoothing im Schema (int, Def 10, min 0, max 500, Vertrag C)",
+      all(f"ma{x}_smoothing" in _ma_schema for x in range(1, 9))
+      and all(_ma_defaults.get(f"ma{x}_smoothing") == _MA_SMOOTHING_DEFAULT == 10
+              for x in range(1, 9))
+      and all(_ma_schema[f"ma{x}_smoothing"]["min"] == 0
+              and _ma_schema[f"ma{x}_smoothing"]["max"] == 500
+              for x in range(1, 9)),
+      str({f"ma{x}": _ma_defaults.get(f"ma{x}_smoothing")
+           for x in range(1, 9)}))
+
+# Synthetischer OHLCV-DataFrame mit tick_volume (VWMA-Test M6).
+_ma_n = 120
+_ma_base = 1700000000
+_df_ma = pd.DataFrame({
+    "time": [_ma_base + i * 60 for i in range(_ma_n)],
+    "open": [30.0] * _ma_n,
+    "high": [30.1] * _ma_n,
+    "low": [29.9] * _ma_n,
+    "close": [30.0 + 0.1 * (i % 5) for i in range(_ma_n)],
+    "tick_volume": [100 + i for i in range(_ma_n)],
+})
+
+# M5: LWC-Konformitaet des Basis-Payloads (nur MA1 aktiv)
+_pay_ma = _ma_ind.calculate(_df_ma, _ma_defaults)
+_ma1_line = _pay_ma["lines"][0]
+_lwc_ok = (
+    _ma1_line["id"] == "ma1"
+    and isinstance(_ma1_line["data"], list)
+    and all(isinstance(p["time"], int) and isinstance(p["value"], float)
+            and isinstance(p["color"], str) for p in _ma1_line["data"])
+)
+check("M5) LWC-Konformitaet (time int, value float, color str)",
+      _lwc_ok, "")
+check("M5) Warmup-NaNs uebersprungen (Payload kuerzer als DF)",
+      len(_ma1_line["data"]) < _ma_n
+      and len(_ma1_line["data"]) > 0,
+      f"{len(_ma1_line['data'])} Punkte")
+check("M5) nur MA1 aktiv (Default), lines-Laenge 1",
+      len(_pay_ma["lines"]) == 1 and _ma1_line["width"] == 2, "")
+
+# M2: dual_color=True vs False (Farbumschlag E6)
+_params_dual = dict(_ma_defaults, ma1_dual_color=True)
+_pay_dual = _ma_ind.calculate(_df_ma, _params_dual)
+_line_dual = _pay_dual["lines"][0]
+_params_plain = dict(_ma_defaults, ma1_dual_color=False)
+_pay_plain = _ma_ind.calculate(_df_ma, _params_plain)
+_line_plain = _pay_plain["lines"][0]
+_colors_dual = set(p["color"] for p in _line_dual["data"])
+_colors_plain = set(p["color"] for p in _line_plain["data"])
+check("M2) dual_color=True liefert bull UND bear",
+      "#26A69A" in _colors_dual and _MA1_BEAR_COLOR in _colors_dual,
+      str(sorted(_colors_dual)))
+check("M2) dual_color=False durchgehend bull",
+      _colors_plain == {"#26A69A"}, str(_colors_plain))
+
+# M3: Alle 8 MAs einzeln + kombiniert (show an/aus)
+for _x in range(1, 9):
+    _params_one = dict(_ma_defaults)
+    for _y in range(1, 9):
+        _params_one[f"show_ma{_y}"] = (_y == _x)
+    _pay_one = _ma_ind.calculate(_df_ma, _params_one)
+    check(f"M3) Nur MA{_x} aktiv -> genau 1 Linie",
+          len(_pay_one["lines"]) == 1
+          and _pay_one["lines"][0]["id"] == f"ma{_x}", "")
+_params_all = dict(_ma_defaults)
+for _x in range(1, 9):
+    _params_all[f"show_ma{_x}"] = True
+_pay_all = _ma_ind.calculate(_df_ma, _params_all)
+check("M3) Alle 8 MAs aktiv -> 8 Linien (ma1..ma8)",
+      len(_pay_all["lines"]) == 8
+      and [l["id"] for l in _pay_all["lines"]] == [f"ma{x}" for x in range(1, 9)],
+      str([l["id"] for l in _pay_all["lines"]]))
+check("M3) MA2..8 width=1, MA1 width=2",
+      all(l["width"] == 1 for l in _pay_all["lines"][1:])
+      and _pay_all["lines"][0]["width"] == 2, "")
+
+# M4: crop_dataframe auf chart_candle_limit (Daten-Zuschnitt)
+_df_ma_big = pd.DataFrame({
+    "time": [_ma_base + i * 60 for i in range(200)],
+    "open": [30.0] * 200, "high": [30.1] * 200,
+    "low": [29.9] * 200, "close": [30.0] * 200,
+    "tick_volume": [100] * 200,
+})
+_params_limit = dict(_ma_defaults, show_ma2=True)
+_cropped = MATemplateEngine.crop_dataframe(_df_ma_big, 3000)
+check("M4) crop_dataframe: kleiner als Limit -> unveraendert",
+      len(_cropped) == 200, str(len(_cropped)))
+_cropped_small = MATemplateEngine.crop_dataframe(_df_ma_big, 50)
+check("M4) crop_dataframe: tail(50) bei Limit 50",
+      len(_cropped_small) == 50, str(len(_cropped_small)))
+# Settings-Injection: chart_candle_limit wird beim Payload-Bau genutzt.
+
+
+class _P1605Settings:
+    chart_candle_limit = 60
+
+
+_ma_ind2 = MultiMovingAverageIndicator()
+_ma_ind2.set_settings(_P1605Settings())
+_pay_limit = _ma_ind2.calculate(_df_ma_big, dict(_ma_defaults, show_ma2=True))
+check("M4) chart_candle_limit=60 via set_settings wirkt (crop)",
+      len(_pay_limit["lines"]) == 2
+      and len(_pay_limit["lines"][0]["data"]) <= 60,
+      str([len(l["data"]) for l in _pay_limit["lines"]]))
+
+# M6: VWMA mit tick_volume (P-D4/F3) – kein SMA-Fallback bei gueltigem Volumen
+_params_vwma = dict(_ma_defaults, show_ma2=True, ma2_type="VWMA")
+_pay_vwma = _ma_ind.calculate(_df_ma, _params_vwma)
+_vwma_line = [l for l in _pay_vwma["lines"] if l["id"] == "ma2"]
+check("M6) VWMA liefert Linie mit tick_volume (kein Crash/leer)",
+      len(_vwma_line) == 1 and len(_vwma_line[0]["data"]) > 0,
+      str(len(_vwma_line[0]["data"]) if _vwma_line else 0))
+# VWMA ist gewichtet (erster definierter Wert != erster close-Wert bei
+# steigendem Volumen) – Referenz via Engine direkt.
+_vwma_ref = MATemplateEngine.calculate_ma(
+    _df_ma["close"], "VWMA", 10, alpha_factor=2.0,
+    volume=_df_ma["tick_volume"],
+)
+_first_valid = _vwma_ref.dropna().iloc[0]
+check("M6) VWMA-Referenz erste gueltige Werte vorhanden (period warmup)",
+      pd.notna(_first_valid), str(_first_valid))
+
+# M7 (Vertrag C, 07.08.2026): Glaettung laeuft in der Engine.
+#   a) smoothing<=1 (Bypass) -> Linie identisch zur Roh-MA (Engine-Referenz)
+#   b) smoothing>1 -> EMA-Doppelpass in der Engine, Linie veraendert,
+#      Titel traegt ' | S <Laenge>' (kein Typ mehr)
+_params_sm = dict(_ma_defaults, show_ma2=True, ma2_type="SMA", ma2_period=4,
+                  ma2_smoothing=1)
+_pay_sm_none = _ma_ind.calculate(_df_ma, _params_sm)
+_line_sm_none = [l for l in _pay_sm_none["lines"] if l["id"] == "ma2"][0]
+_ref_sm = MATemplateEngine.calculate_ma(_df_ma["close"], "SMA", 4)
+_pay_sm_ref = MATemplateEngine.build_chart_payload(
+    _df_ma["time"], _ref_sm, ["#2962FF"])
+check("M7) smoothing=1 (Bypass) = exakt Roh-MA (SMA 4)",
+      [p["value"] for p in _line_sm_none["data"]]
+      == [p["value"] for p in _pay_sm_ref],
+      f"{len(_line_sm_none['data'])} vs {len(_pay_sm_ref)} Punkte")
+check("M7) Titel OHNE Glaettung (smoothing=1)",
+      _line_sm_none["title"] == "MA2 SMA 4", _line_sm_none["title"])
+# smoothing=10 (Vertrag-C-Default) -> Engine-Doppelpass, Linie veraendert.
+_params_sm_on = dict(_params_sm, ma2_smoothing=10)
+_pay_sm_on = _ma_ind.calculate(_df_ma, _params_sm_on)
+_line_sm_on = [l for l in _pay_sm_on["lines"] if l["id"] == "ma2"][0]
+check("M7) smoothing=10 aendert die Linie (sichtbarer Einfluss)",
+      [p["value"] for p in _line_sm_on["data"]]
+      != [p["value"] for p in _line_sm_none["data"]],
+      "")
+check("M7) Titel traegt Glaettung '| S 10' (ohne Typ)",
+      _line_sm_on["title"].startswith("MA2 SMA 4")
+      and "| S 10" in _line_sm_on["title"],
+      _line_sm_on["title"])
+# Smoothing per Engine-Referenz: EMA(EMA(SMA4, span=10), alpha=0.4).
+_alpha_calc_m7 = 2.0 / (4 + 1)  # 0.4
+_ema_first_m7 = pd.Series(_ref_sm).ewm(span=10, adjust=False).mean()
+_ema_second_m7 = _ema_first_m7.ewm(alpha=_alpha_calc_m7, adjust=False).mean()
+_pay_sm_ref2 = MATemplateEngine.build_chart_payload(
+    _df_ma["time"], _ema_second_m7, ["#2962FF"])
+check("M7) smoothing-Werte = Engine-Referenz EMA(EMA(SMA4,span=10),alpha=0.4)",
+      [p["value"] for p in _line_sm_on["data"]]
+      == [p["value"] for p in _pay_sm_ref2], "")
+
+# M8 (16.04 Vertrag B, 07.08.2026): Engine-Smoothing-Pass in
+# MATemplateEngine.calculate_ma(..., smoothing=...).
+#   a) smoothing <= 1 -> Bypass (Basis-Serie exakt unveraendert)
+#   b) smoothing > 1 -> EMA(EMA(base, span=smoothing), alpha=alpha_calc)
+#      mit alpha_calc = alpha_factor / (period + 1) – Referenz via pandas ewm
+#   c) Default (kein kwarg) = smoothing 1 = Bypass
+_tpl_schema = MATemplateEngine.get_ma_parameter_schema()
+check("M8) Template-Schema 7 Keys (smoothing statt smooth_type/smooth_length)",
+      len(_tpl_schema) == 7
+      and "smoothing" in _tpl_schema
+      and "smooth_type" not in _tpl_schema
+      and "smooth_length" not in _tpl_schema,
+      str(sorted(_tpl_schema.keys())))
+check("M8) Template-Schema smoothing-Default 10 (min 0, max 500)",
+      _tpl_schema["smoothing"]["default"] == 10
+      and _tpl_schema["smoothing"]["min"] == 0
+      and _tpl_schema["smoothing"]["max"] == 500,
+      str(_tpl_schema["smoothing"]))
+
+_src_ma = _df_ma["close"]
+_ref_sma4_t = MATemplateEngine.calculate_ma(_src_ma, "SMA", 4)
+_sm_off = MATemplateEngine.calculate_ma(_src_ma, "SMA", 4, smoothing=1)
+_sm_off0 = MATemplateEngine.calculate_ma(_src_ma, "SMA", 4, smoothing=0)
+_sm_def = MATemplateEngine.calculate_ma(_src_ma, "SMA", 4)
+check("M8) smoothing<=1 = Bypass (Basis-MA exakt unveraendert)",
+      _sm_off.equals(_ref_sma4_t) and _sm_off0.equals(_ref_sma4_t), "")
+check("M8) Default (kein kwarg) = smoothing 1 = Bypass",
+      _sm_def.equals(_ref_sma4_t), "")
+
+_sm_on = MATemplateEngine.calculate_ma(
+    _src_ma, "SMA", 4, alpha_factor=2.0, smoothing=10)
+_alpha_calc_t = 2.0 / (4 + 1)  # 0.4
+_base4_t = _ref_sma4_t.to_numpy()
+_ema_first_t = pd.Series(_base4_t).ewm(span=10, adjust=False).mean().to_numpy()
+_ema_second_t = pd.Series(_ema_first_t).ewm(
+    alpha=_alpha_calc_t, adjust=False).mean().to_numpy()
+_ref_smT = pd.Series(_ema_second_t, index=_src_ma.index)
+check("M8) smoothing=10 = EMA(EMA(SMA4, span=10), alpha=0.4)",
+      np.allclose(_sm_on.to_numpy(), _ref_smT.to_numpy(), equal_nan=True),
+      f"max-abweichung={np.nanmax(np.abs(_sm_on.to_numpy()-_ref_smT.to_numpy())) if len(_sm_on) else 'n/a'}")
+
+# ---------------------------------------------------------------------------
+# Teil 10 (Phase 16.05, 06.08.2026; Bugfix 07.08.2026; Vertrag C 07.08.2026):
+# Bugfixing-Modus - Indikator-Dialog Multi-MA (OHNE Services). Anwender-
+# anforderungen:
+#   1) keine Services -> Service-UI komplett ausblenden
+#   2) Farb-Parameter = reiner Farbwaehler (color_only, KEINE 'sichtbar'-
+#      Checkbox im Composite; nur die show_maX-Anzeige-Checkbox ist korrekt)
+#   3) fehlende MA-Parameter jetzt sichtbar: Typ, Periode (Laenge),
+#      Smoothing (maX_smoothing, Label 'Smooth', Vertrag C), Alpha - mit den
+#      Defaults (D7)
+# D1) _get_plugin erkennt den Indikator als Plugin (parameter_schema+plugin_id)
+# D2) _indicator_service_ids leer -> keine Service-Attribute (combo_service_set,
+#     edit_set_name, group_expert existieren NICHT)
+# D3) ALLE 50 Parameter in param_controls (vorher fehlende inklusive)
+# D4) Farb-Controls = StylePickerWidget mit color_only=True
+# D5) Preset-Payload: logic_params (Typ/Periode/Smoothing/Alpha)
+#     + display_params (show_*/Farben), ohne Sibling-Keys (maX_style/maX_width)
+# D6) Kontrolle: Grid-Indikator (MIT Services) behaelt den Service-Pfad
+# ---------------------------------------------------------------------------
+print("\n=== Teil 10: P16.05 Dialog-Bugfix (Multi-MA ohne Services) ===")
+from chart.indicators.multi_ma import (  # noqa: E402
+    MultiMovingAverageIndicator,
+)
+from chart.indicators.fixed_grid_proximity import FixedGridProximityIndicator  # noqa: E402
+from chart.indicator_dialog import IndicatorSettingsDialog  # noqa: E402
+from chart.widgets.style_picker_widget import StylePickerWidget  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QSpinBox,
+)
+
+_dlg_results: list = []
+
+
+def _dlg_cb(payload, preset):
+    _dlg_results.append((payload, preset))
+
+
+_ma_ind_dlg = MultiMovingAverageIndicator()
+_dlg_ma = IndicatorSettingsDialog(
+    _ma_ind_dlg,
+    dict(_ma_ind_dlg.default_params),
+    "Default",
+    sm,
+    _dlg_cb,
+    symbol="SILVER", timeframe="H1",
+    service_set_repo=repo,
+)
+
+check("D1) _get_plugin liefert den Indikator selbst",
+      _dlg_ma._get_plugin() is _ma_ind_dlg, "")
+check("D1) _indicator_service_ids leer (keine Services)",
+      _dlg_ma._indicator_service_ids() == [], "")
+
+# D2: Service-UI komplett ausgeblendet (Anforderung 1)
+check("D2) Kein Service-UI (combo_service_set is None)",
+      _dlg_ma.combo_service_set is None, "")
+check("D2) Kein Service-UI (edit_set_name is None)",
+      _dlg_ma.edit_set_name is None, "")
+check("D2) Kein Service-UI (group_expert is None)",
+      _dlg_ma.group_expert is None, "")
+
+# D3: Alle 50 Parameter gerendert (Anforderung 3, Vertrag C)
+_schema10 = _ma_ind_dlg.parameter_schema
+_all_in_controls = all(k in _dlg_ma.param_controls for k in _schema10)
+check("D3) Alle 50 Parameter in param_controls",
+      len(_dlg_ma.param_controls) == len(_schema10) == 50 and _all_in_controls,
+      f"{len(_dlg_ma.param_controls)}/{len(_schema10)}")
+
+# D4: Farb-Controls = reiner Farbwaehler (Anforderung 2)
+_color_keys10 = (["ma1_bull_color", "ma1_bear_color"]
+                 + [f"ma{x}_color" for x in range(2, 9)])
+_color_ok = all(
+    isinstance(_dlg_ma.param_controls[k], StylePickerWidget)
+    and _dlg_ma.param_controls[k].color_only
+    for k in _color_keys10
+)
+check("D4) Farb-Controls = color_only (ohne Composite-Checkbox)", _color_ok, "")
+
+# D3: Die zuvor fehlenden Parametertypen (Anforderung 3)
+_type_ok = all(isinstance(_dlg_ma.param_controls[f"ma{x}_type"], QComboBox)
+               for x in range(1, 9))
+_period_ok = all(isinstance(_dlg_ma.param_controls[f"ma{x}_period"], QSpinBox)
+                 for x in range(1, 9))
+_alpha_ok = all(isinstance(_dlg_ma.param_controls[f"ma{x}_alpha"], QDoubleSpinBox)
+                for x in range(1, 9))
+_smooth_spin_ok = all(
+    isinstance(_dlg_ma.param_controls[f"ma{x}_smoothing"], QSpinBox)
+    for x in range(1, 9))
+check("D3) maX_type = ComboBox (alle 8)", _type_ok, "")
+check("D3) maX_period / maX_smoothing = SpinBox (alle 8)",
+      _period_ok and _smooth_spin_ok, "")
+check("D3) maX_alpha = DoubleSpinBox (alle 8)", _alpha_ok, "")
+check("D3) kein maX_smooth_type-Control (Combo entfaellt, Vertrag C)",
+      all(f"ma{x}_smooth_type" not in _dlg_ma.param_controls
+          for x in range(1, 9)), "")
+
+# D3: Defaults der Parameter im Control (D7; Vertrag C: smoothing 10)
+check("D3) Defaults MA1 (EHMA / Periode 4 / Smoothing 10 / Alpha 2.0)",
+      _dlg_ma.param_controls["ma1_type"].currentText() == "EHMA"
+      and _dlg_ma.param_controls["ma1_period"].value() == 4
+      and _dlg_ma.param_controls["ma1_smoothing"].value() == 10
+      and abs(_dlg_ma.param_controls["ma1_alpha"].value() - 2.0) < 1e-9,
+      "")
+check("D3) Defaults MA2 (EMA / Periode 20 / Smoothing 10 / Alpha 2.0)",
+      _dlg_ma.param_controls["ma2_type"].currentText() == "EMA"
+      and _dlg_ma.param_controls["ma2_period"].value() == 20
+      and _dlg_ma.param_controls["ma2_smoothing"].value() == 10
+      and abs(_dlg_ma.param_controls["ma2_alpha"].value() - 2.0) < 1e-9,
+      "")
+
+# D5: Preset-Payload - Logik (Typ/Periode/Smoothing/Alpha) vs Darstellung
+_payload10 = _dlg_ma._build_preset_payload()
+_logic10 = _payload10.get("logic_params") or {}
+_display10 = _payload10.get("display_params") or {}
+_logic_keys10 = [f"ma{x}_{s}" for x in range(1, 9)
+                 for s in ("type", "period", "smoothing", "alpha")]
+check("D5) logic_params enthaelt maX_type/period/smoothing/alpha",
+      all(k in _logic10 for k in _logic_keys10),
+      str(sorted(_logic10.keys())))
+check("D5) display_params enthaelt show_maX + Farben",
+      all(f"show_ma{x}" in _display10 for x in range(1, 9))
+      and "ma1_bull_color" in _display10 and "ma1_bear_color" in _display10
+      and all(f"ma{x}_color" in _display10 for x in range(2, 9)),
+      str(sorted(_display10.keys())))
+_sibling_noise10 = [k for k in _display10
+                    if k.endswith("_style") or k.endswith("_width")]
+check("D5) Keine Sibling-Keys (maX_style/maX_width) in display_params",
+      not _sibling_noise10, str(_sibling_noise10))
+
+# D6: Grid-Indikator (MIT Services) behaelt den Service-Pfad unveraendert.
+_dlg_grid = IndicatorSettingsDialog(
+    FixedGridProximityIndicator(),
+    dict(FixedGridProximityIndicator().default_params),
+    "Default",
+    sm,
+    _dlg_cb,
+    symbol="SILVER", timeframe="H1",
+    service_set_repo=repo,
+)
+check("D6) Grid-Indikator (mit Services): Service-UI bleibt erhalten",
+      hasattr(_dlg_grid, "combo_service_set")
+      and hasattr(_dlg_grid, "edit_set_name")
+      and hasattr(_dlg_grid, "group_expert"),
+      "")
+
+# D7 (Vertrag C + Bugfix 07.08.2026): Layout - 3-Spalten-Grid. Preset-Box
+# Zeile 0 Spalten 0-1 (span 2 = so breit wie MA1+MA2); Schliessen-Button
+# Zeile 0 Spalte 2 (rechts mittig neben der Preset-Box); Zeile 1 = MA1 (Sp.0)
+# + MA2 (Sp.1); danach je 3 Boxen pro Zeile (Zeile 2 = MA3/MA4/MA5, Zeile 3 =
+# MA6/MA7/MA8); Zeile 4 leer -> kompaktes Fenster (~900px), nichts unterhalb
+# der letzten Boxen-Zeile.
+from PySide6.QtWidgets import QGridLayout, QGroupBox, QPushButton  # noqa: E402
+
+_main_lay10 = _dlg_ma._content_widget.layout()
+_grid_lay10 = None
+for _i10 in range(_main_lay10.count()):
+    _sub10 = _main_lay10.itemAt(_i10).layout()
+    if isinstance(_sub10, QGridLayout):
+        _grid_lay10 = _sub10
+        break
+
+check("D7) Grid-Layout im Inhalt gefunden", _grid_lay10 is not None, "")
+
+# Zeile 0 Spalten 0-1 = Preset-Box (span 2, bis zum Ende von MA2).
+_item00 = _grid_lay10.itemAtPosition(0, 0)
+_item01 = _grid_lay10.itemAtPosition(0, 1)
+_preset10 = _item00.widget() if _item00 is not None else None
+_w01 = _item01.widget() if _item01 is not None else None
+check("D7) Preset-Box Zeile 0 Spalten 0-1 (span 2, bis MA2-Ende)",
+      isinstance(_preset10, QGroupBox) and _preset10.title() == "Preset"
+      and isinstance(_w01, QGroupBox) and _w01.title() == "Preset", "")
+
+# Zeile 0 Spalte 2 = Schliessen-Button (rechts mittig neben der Preset-Box).
+_btn10 = None
+_item02 = _grid_lay10.itemAtPosition(0, 2)
+if _item02 is not None:
+    _w02 = _item02.widget()
+    if isinstance(_w02, QPushButton):
+        _btn10 = _w02
+check("D7) Schliessen-Button Zeile 0 Spalte 2 (rechts mittig neben Preset)",
+      isinstance(_btn10, QPushButton) and _btn10.text() == "Schließen", "")
+check("D7) Kein separater Button unterhalb (nur Grid im Inhalt)",
+      _main_lay10.count() == 1, str(_main_lay10.count()))
+
+# 3-Spalten-Grid: (1,0)=MA1 (1,1)=MA2 | (2,0)=MA3 (2,1)=MA4 (2,2)=MA5 |
+# (3,0)=MA6 (3,1)=MA7 (3,2)=MA8.
+def _grid_title10(r, c):
+    if _grid_lay10 is None or _grid_lay10.itemAtPosition(r, c) is None:
+        return None
+    w = _grid_lay10.itemAtPosition(r, c).widget()
+    return w.title() if isinstance(w, QGroupBox) else w.text()
+
+_titles_exp10 = {
+    (1, 0): "MA 1 (Führung)", (1, 1): "MA 2",
+    (2, 0): "MA 3", (2, 1): "MA 4", (2, 2): "MA 5",
+    (3, 0): "MA 6", (3, 1): "MA 7", (3, 2): "MA 8",
+}
+_grid_ok10 = all(
+    _grid_title10(r, c) == title for (r, c), title in _titles_exp10.items())
+check("D7) MA-Boxen 3-Spalten-Grid (MA1/2, MA3/4/5, MA6/7/8)",
+      _grid_ok10, str({k: _grid_title10(*k) for k in _titles_exp10}))
+
+# Nichts unterhalb der letzten Boxen-Zeile (Zeile 4 leer) -> Fenster endet
+# exakt am unteren Rand von MA6/MA7/MA8.
+check("D7) Nichts unterhalb MA6/MA7/MA8 (Zeile 4 leer)",
+      _grid_lay10.itemAtPosition(4, 0) is None
+      and _grid_lay10.itemAtPosition(4, 1) is None
+      and _grid_lay10.itemAtPosition(4, 2) is None, "")
+
 print("-" * 60)
 if FAILURES:
     print(f"FEHLER: {len(FAILURES)}: {FAILURES}")
@@ -25765,6 +27223,34 @@ sys.exit(0)
            </property>
            <property name="text">
             <string>◆</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btn_indicator_ma">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+           <property name="minimumSize">
+            <size>
+             <width>28</width>
+             <height>28</height>
+            </size>
+           </property>
+           <property name="maximumSize">
+            <size>
+             <width>28</width>
+             <height>28</height>
+            </size>
+           </property>
+           <property name="toolTip">
+            <string>Multi Moving Average (Linksklick: An/Aus, Rechtsklick: Einstellungen)</string>
+           </property>
+           <property name="text">
+            <string>MA</string>
            </property>
           </widget>
          </item>
