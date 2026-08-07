@@ -72,42 +72,51 @@ _SWING_VOLUME_PROFILE_SCHEMA: Dict[str, ParameterSchema] = {
         "default": "Sessions",
         "options": ["Bars", "Sessions", "Days", "Weeks", "Months"],
         "description": "Profil-Zeitraum (nur aktiv bei mode == 'Volume_Profile')",
+        "visible_when": {"mode": "Volume_Profile"},
     },
     "period_val": {
         "type": "int", "default": 1, "min": 1,
         "description": "Multiplier für profile_period",
+        "visible_when": {"mode": "Volume_Profile"},
     },
     "volume_source": {
         "type": "str",
         "default": "tick_volume",
         "options": ["tick_volume", "real_volume"],
         "description": "Volumenquelle aus MT5 (standardmäßig tick_volume)",
+        "visible_when": {"mode": "Volume_Profile"},
     },
     "volume_thresh_pct": {
         "type": "float", "default": 5.0, "min": 0.5,
         "description": "Mindestvolumenanteil in % für Cluster",
+        "visible_when": {"mode": "Volume_Profile"},
     },
     "value_area_pct": {
         "type": "float", "default": 0.70, "min": 0.1, "max": 1.0,
         "description": "Value Area Abdeckung (0.70 = 70%)",
+        "visible_when": {"mode": "Volume_Profile"},
     },
     "lvn_sensitivity": {
         "type": "float", "default": 0.20, "min": 0.05,
         "description": "Schwellwert für Low Volume Nodes",
+        "visible_when": {"mode": "Volume_Profile"},
     },
     "grid_step": {
         "type": "float", "default": 0.5, "min": 0.01,
         "description": "Rasterabstand (nur bei mode == 'Grid_Proximity')",
+        "visible_when": {"mode": "Grid_Proximity"},
     },
     "vwap_anchor": {
         "type": "str",
         "default": "Session_Start",
         "options": ["Session_Start", "Week_Start", "Month_Start"],
         "description": "Ankerpunkt (nur bei mode == 'Anchored_VWAP')",
+        "visible_when": {"mode": "Anchored_VWAP"},
     },
     "vwap_band_mult": {
         "type": "float", "default": 2.0, "min": 0.1,
         "description": "StDev-Multiplikator für VWAP-Bänder",
+        "visible_when": {"mode": "Anchored_VWAP"},
     },
 }
 

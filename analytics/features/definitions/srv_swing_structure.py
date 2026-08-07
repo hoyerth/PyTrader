@@ -73,28 +73,34 @@ _SWING_STRUCTURE_SCHEMA: Dict[str, ParameterSchema] = {
     "left_bars": {
         "type": "int", "default": 2, "min": 1,
         "description": "Anzahl erforderlicher Kerzen links mit niedrigeren Hochs / höheren Tiefs",
+        "visible_when": {"mode": ["Williams_Fractal", "Standard_Pivot", "Gann_Mechanical"]},
     },
     "right_bars": {
         "type": "int", "default": 2, "min": 1,
         "description": "Anzahl Bestätigungskerzen rechts (bestimmt dynamisch confirmation_lag_bars)",
+        "visible_when": {"mode": ["Williams_Fractal", "Standard_Pivot", "Gann_Mechanical"]},
     },
     "atr_period": {
         "type": "int", "default": 14, "min": 1,
         "description": "ATR-Periode für ZigZag_ATR",
+        "visible_when": {"mode": "ZigZag_ATR"},
     },
     "atr_mult": {
         "type": "float", "default": 2.0, "min": 0.1,
         "description": "ATR-Multiplikator für ZigZag_ATR",
+        "visible_when": {"mode": "ZigZag_ATR"},
     },
     "change_pct": {
         "type": "float", "default": 0.5, "min": 0.05,
         "description": "Mindestprozentbewegung für ZigZag_Pct",
+        "visible_when": {"mode": "ZigZag_Pct"},
     },
     "period_extrema_type": {
         "type": "str",
         "default": "PREVIOUS_CLOSED",
         "options": ["PREVIOUS_CLOSED", "CURRENT_DEVELOPING"],
         "description": "PREVIOUS_CLOSED (z. B. PDH/PWH final) oder CURRENT_DEVELOPING",
+        "visible_when": {"mode": "Period_Extrema"},
     },
 }
 

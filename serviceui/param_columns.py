@@ -16,10 +16,11 @@ _service_lock/_build_tooltip (ServiceWindow).
 from typing import Any, Dict
 
 from PySide6.QtCore import QCoreApplication, QEvent, Qt, QTimer
+from PySide6.QtGui import QTextCursor, QTextOption
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QSizePolicy, QSpinBox, QVBoxLayout,
-    QWidget,
+    QLabel, QLineEdit, QPushButton, QSizePolicy, QSpinBox, QTextEdit,
+    QVBoxLayout, QWidget,
 )
 
 
@@ -84,7 +85,23 @@ class ServiceParamColumnsMixin:
         float -> QDoubleSpinBox, int -> QSpinBox, bool -> QCheckBox,
         choice -> QComboBox, color/str -> QLineEdit. min/max/step werden 1:1
         übertragen (Roadmap 5.4.2.2).
+
+        17.01.05 (Bugfix, UI-Dropdown-Extension): Deklariert der Schema-
+        Eintrag `options` (Liste/Tupel), wird VOR der Datentyp-Prüfung eine
+        QComboBox gerendert – unabhängig vom type-Wert ("str"/"choice").
+        Dadurch werden z. B. die mode-/ma_type-/period_extrema_type-Felder
+        der Swing-Services (type="str" + options) als Dropdown statt als
+        QLineEdit angezeigt.
         """
+        options = spec.get("options")
+        if options and isinstance(options, (list, tuple)):
+            combo = QComboBox()
+            combo.addItems([str(o) for o in options])
+            val_str = str(val if val is not None else spec.get("default", ""))
+            idx = combo.findText(val_str)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            return combo
         p_type = spec.get("type")
         if p_type == "float":
             spin = QDoubleSpinBox()
@@ -137,6 +154,146 @@ class ServiceParamColumnsMixin:
         if isinstance(ctrl, QComboBox):
             return ctrl.currentText()
         return ctrl.text()
+
+    @staticmethod
+    def _scroll_textedit_top(editor: QTextEdit) -> None:
+        """Scrollt eine Read-Only-QTextEdit HART nach oben (Cursor + Scroll).
+
+        Qt setzt nach `setHtml` den Text-Cursor intern ans Dokument-ENDE und
+        scrollt beim finalen Layout dorthin – dadurch ist die erste Zeile
+        verdeckt. Fix (17.01.06):
+          1. Cursor ans Dokument-Anfang (`QTextCursor.MoveOperation.Start`).
+          2. Vertikalen Scrollbalken erst auf Maximum setzen (erzwingt die
+             Neuberechnung des Viewports) und dann auf 0 (ganz oben).
+        Wirkt nur dauerhaft, wenn es NACH dem endgueltigen Layout/Resize
+        ausgefuehrt wird (Qt wrappt das Dokument nach setHtml erst in einer
+        spaeteren Event-Loop-Runde um und scrollt dann ggf. erneut).
+        """
+        if editor is None:
+            return
+        try:
+            cur = editor.textCursor()
+            cur.setPosition(0)
+            editor.setTextCursor(cur)
+            editor.moveCursor(QTextCursor.MoveOperation.Start)
+            sb = editor.verticalScrollBar()
+            if sb is not None:
+                sb.setValue(sb.maximum())  # unten -> Viewport neu berechnen
+                sb.setValue(0)             # ganz nach oben (erste Zeile)
+            editor.ensureCursorVisible()
+        except (RuntimeError, AttributeError):
+            pass  # Widget bereits zerstoert (deleteLater) – ignorieren
+
+    # ------------------------------------------------------------------
+    # 17.01.05 (Bugfix): Conditional Visibility (Modus-abhaengige Parameter)
+    # ------------------------------------------------------------------
+    def _apply_conditional_visibility(self, iid: str) -> None:
+        """Blendet Parameter mit `visible_when`-Schema-Deklaration ein/aus.
+
+        Konvention (additiv, 17.01.05): Ein Parameter-Schema-Eintrag kann
+        zusaetzlich tragen:
+            "visible_when": {"mode": ["Algo_A", "Algo_B"]}
+        (auch einzelner String erlaubt). Liegt der aktuelle Wert des
+        `mode`-Controls (Dropdown) NICHT in der Liste, werden Control + Label
+        ausgeblendet; sonst eingeblendet. Parameter ohne `visible_when`
+        bleiben immer sichtbar. Wird beim Spaltenaufbau und bei jedem
+        Mode-Wechsel aufgerufen.
+        """
+        schema = getattr(self, "_mode_schemas", {}).get(iid)
+        if not schema:
+            return
+        mode_ctrl = self._service_param_controls.get((iid, "mode"))
+        mode_val = (str(self._ctrl_value(mode_ctrl))
+                    if mode_ctrl is not None else "")
+        for key, spec in schema.items():
+            vw = spec.get("visible_when")
+            if not isinstance(vw, dict) or "mode" not in vw:
+                continue
+            allowed = vw["mode"]
+            if isinstance(allowed, str):
+                allowed = [allowed]
+            visible = mode_val in {str(a) for a in allowed}
+            ctrl = self._service_param_controls.get((iid, key))
+            if ctrl is None:
+                continue
+            try:
+                ctrl.setVisible(visible)
+            except (RuntimeError, AttributeError):
+                pass
+            lbl = getattr(self, "_service_param_labels", {}).get((iid, key))
+            if lbl is not None:
+                try:
+                    lbl.setVisible(visible)
+                except (RuntimeError, AttributeError):
+                    pass
+        # 17.01.05 (Bugfix): Auch das Info-Label (Service-/Algo-Beschreibung)
+        # auf den aktuellen Modus aktualisieren.
+        self._update_service_info_label(iid)
+
+    # ------------------------------------------------------------------
+    # 17.01.05 (Bugfix): Read-only Info-Label unter dem individuellen
+    # Beschreibungsfeld – zeigt die in der Definition vorgefuellte
+    # Service-Beschreibung + die Beschreibung des aktuell gewaehlten
+    # Algorithmus (mode) an. Wird beim Spaltenaufbau und bei jedem
+    # Mode-Wechsel aktualisiert.
+    # ------------------------------------------------------------------
+    def _update_service_info_label(self, iid: str) -> None:
+        """Setzt den Rich-Text des Info-Labels fuer eine Service-Instanz.
+
+        Angezeigt werden (read-only, unter dem editierbaren Beschreibungs-
+        Feld): display_name/plugin_id, die Service-Beschreibung aus den
+        Plugin-Metadaten (description_long, sonst description) sowie der
+        aktuell gewaehlte Algorithmus (mode) inkl. Schema-Beschreibung.
+        """
+        label = getattr(self, "_service_info_labels", {}).get(iid)
+        if label is None:
+            return
+        pid = getattr(self, "_service_info_pids", {}).get(iid, iid)
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            plugin = PluginRegistry().get(pid)
+        except (KeyError, AttributeError):
+            plugin = None
+        meta = dict(getattr(plugin, "metadata", None) or {})
+        display = str(meta.get("display_name") or pid)
+        desc = str(meta.get("description_long")
+                   or meta.get("description") or "").strip()
+        schema = getattr(self, "_mode_schemas", {}).get(iid, {})
+        mode_spec = schema.get("mode", {}) if isinstance(schema, dict) else {}
+        mode_ctrl = self._service_param_controls.get((iid, "mode"))
+        mode_val = (str(self._ctrl_value(mode_ctrl)) if mode_ctrl is not None
+                    else str(mode_spec.get("default") or ""))
+        labels = dict(getattr(plugin, "param_labels", None) or {})
+        mode_label = str(labels.get("mode")
+                         or mode_spec.get("description") or "Algorithmus")
+        mode_desc = str(mode_spec.get("description") or "")
+
+        import html as _html
+        parts = [f"<b>{_html.escape(display)}</b>"]
+        if desc:
+            parts.append(_html.escape(desc))
+        if mode_val:
+            parts.append(f"<b>{_html.escape(mode_label)}:</b> "
+                         f"{_html.escape(mode_val)}")
+        if mode_desc and mode_desc != mode_label:
+            parts.append(f"<i>{_html.escape(mode_desc)}</i>")
+        try:
+            # QTextEdit (read-only): HTML setzen – bei langem Text scrollt
+            # die Anzeige vertikal (max. Hoehe gedeckelt).
+            label.setHtml("<br>".join(parts))
+            # 17.01.06 (Bugfix): Nach dem Text-Update die Anzeige IMMER ganz
+            # nach oben scrollen (Cursor->Start + Scrollbar->0). Synchrone
+            # Ausfuehrung + DEFERRED (QTimer singleShot 0): Qt setzt nach
+            # setHtml den Cursor ans Dokument-Ende und wrappt das Dokument
+            # erst in einer spaeteren Event-Loop-Runde um (dann scrollt es
+            # ggf. erneut zum Cursor). Der deferred Reset wirkt daher erst
+            # nach dem finalen Layout; zusaetzlich wird der Reset nach dem
+            # finalen Box-Resize in _resize_param_box_deferred ausgefuehrt.
+            self._scroll_textedit_top(label)
+            QTimer.singleShot(
+                0, lambda l=label: self._scroll_textedit_top(l))
+        except (RuntimeError, AttributeError):
+            pass
 
     # ------------------------------------------------------------------
     # Phase 15 (Dirty-State): Aenderungs-Tracking der Parameter-Controls
@@ -292,6 +449,16 @@ class ServiceParamColumnsMixin:
                     splitter.setSizes(hints)
         except (RuntimeError, AttributeError):
             pass
+        # 17.01.06 (Bugfix): Nach dem FINALEN Box-Resize (DeferredDelete +
+        # box.resize) alle Read-only-Info-Anzeigen wieder ganz nach oben
+        # scrollen. Durch das Resize wrappt das Dokument der QTextEdit um;
+        # Qt scrollt dabei (weil der Cursor von setHtml intern am Dokument-
+        # Ende stand) um einige Zeilen nach unten – die erste Zeile waere
+        # sonst verdeckt. Dieser Aufruf laeuft NACH dem Layout, sodass die
+        # Scroll-Position oben haelt.
+        for _info in list(
+                getattr(self, "_service_info_labels", {}).values()):
+            self._scroll_textedit_top(_info)
 
     def _clear_service_columns(self) -> None:
         """Entfernt alle Service-Spalten aus dem service_columns_layout."""
@@ -304,6 +471,14 @@ class ServiceParamColumnsMixin:
                 w.deleteLater()
         self._service_param_controls = {}
         self._service_desc_controls = {}
+        # 17.01.05 (Bugfix): Conditional-Visibility-Zustand je Instanz
+        # (Modus-abhaengige Parameter-Ein-/Ausblendung) zuruecksetzen.
+        self._mode_schemas = {}
+        self._service_param_labels = {}
+        # 17.01.05 (Bugfix): Read-only Info-Label (vorgefuellte Service-/Algo-
+        # Beschreibung) je Instanz zuruecksetzen.
+        self._service_info_labels = {}
+        self._service_info_pids = {}
 
     def _build_service_columns(self, set_definition: Dict[str, Any]) -> None:
         """Baut die dynamischen Service-Spalten (Roadmap 5.4.2.2).
@@ -366,6 +541,10 @@ class ServiceParamColumnsMixin:
 
         full_schema: Dict[str, Any] = dict(getattr(plugin, "base_parameter_schema", None) or {})
         full_schema.update(dict(plugin.parameter_schema or {}))
+        # 17.01.05 (Bugfix): Conditional Visibility – Schema je Instanz merken,
+        # um Parameter mit "visible_when"-Deklaration modus-abhaengig
+        # ein-/auszublenden (_apply_conditional_visibility).
+        self._mode_schemas[iid] = full_schema
         order = list(getattr(plugin, "parameter_order", None) or (plugin.parameter_schema or {}).keys())
         for key in (getattr(plugin, "base_parameter_schema", None) or {}):
             if key not in order:
@@ -406,6 +585,33 @@ class ServiceParamColumnsMixin:
         desc_row.addWidget(desc_edit_btn)
         vl.addLayout(desc_row)
 
+        # 17.01.05 (Bugfix): Read-only Info-Anzeige unter dem individuellen
+        # Beschreibungsfeld – zeigt die in der Definition vorgefuellte
+        # Service-Beschreibung + die Beschreibung des aktuell gewaehlten
+        # Algorithmus (mode). Rein informativ (kein Input), wird beim
+        # Mode-Wechsel live aktualisiert (_update_service_info_label).
+        # Ergaenzung: Als QTextEdit (read-only) mit gedeckelter Hoehe – wird
+        # der Text zu lang, erscheint eine vertikale Scrollbar (kein
+        # Aufblahen der Spalte).
+        info_label = QTextEdit()
+        info_label.setReadOnly(True)
+        info_label.setAcceptRichText(True)
+        info_label.setFrameShape(QTextEdit.NoFrame)
+        info_label.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        info_label.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        info_label.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        info_label.setTabChangesFocus(True)
+        info_label.setStyleSheet(
+            "QTextEdit { background: transparent; border: none; "
+            "color: #666; font-size: 11px; }")
+        info_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        # Deckelhoehe: ~3 Textzeilen – darueber scrollt der Text vertikal.
+        fm = info_label.fontMetrics()
+        info_label.setMaximumHeight(fm.lineSpacing() * 3 + 12)
+        self._service_info_labels[iid] = info_label
+        self._service_info_pids[iid] = pid
+        vl.addWidget(info_label)
+
         # Normale (Nicht-Expert-, Nicht-Darstellungs-)Parameter
         form = QFormLayout()
         for key in order:
@@ -427,7 +633,20 @@ class ServiceParamColumnsMixin:
             # Phase 15 (Dirty-State): Aenderungen markieren die Instanz.
             self._connect_param_change(ctrl, iid, key)
             form.addRow(labels.get(key, self._human(key)), ctrl)
+            # 17.01.05 (Bugfix): Label-Referenz fuer die modus-abhaengige
+            # Ein-/Ausblendung merken.
+            lbl = form.labelForField(ctrl)
+            if lbl is not None:
+                self._service_param_labels[(iid, key)] = lbl
+            # 17.01.05 (Bugfix): Mode-Wechsel (Dropdown) blendet die
+            # modus-spezifischen Parameter passend ein/aus.
+            if key == "mode" and isinstance(ctrl, QComboBox):
+                ctrl.currentTextChanged.connect(
+                    lambda _v, i=iid: self._apply_conditional_visibility(i))
         vl.addLayout(form)
+        # 17.01.05 (Bugfix): Initialzustand der Modus-Sichtbarkeit anwenden
+        # (ein geladenes Set kann einen nicht-Default-Mode besitzen).
+        self._apply_conditional_visibility(iid)
 
         # Expert-Parameter (inkl. lookback als Service-Instanz-Einstellung)
         expert_keys = [k for k in order if full_schema.get(k, {}).get("expert")]

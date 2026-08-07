@@ -73,22 +73,27 @@ _SWING_MOMENTUM_SCHEMA: Dict[str, ParameterSchema] = {
             "ZLEMA", "RMA", "KAMA", "ALMA", "VWMA",
         ],
         "description": "Gleitender Durchschnittstyp (MA-Template 16.04)",
+        "visible_when": {"mode": ["MA_Peak_Hysteresis", "MA_Slope_Change"]},
     },
     "period": {
         "type": "int", "default": 14, "min": 2,
         "description": "Berechnungsperiode für Glättungs-MA",
+        "visible_when": {"mode": ["MA_Peak_Hysteresis", "MA_Slope_Change"]},
     },
     "piv_maxMaMovePct": {
         "type": "float", "default": 0.2, "min": 0.01,
         "description": "Erforderliche Gegenbewegung in % für MA Peak Pivot (gültig für alle ma_type-Optionen)",
+        "visible_when": {"mode": "MA_Peak_Hysteresis"},
     },
     "chande_lookback": {
         "type": "int", "default": 10, "min": 1,
         "description": "Lookback-Periode für Highest-High/Lowest-Low im Chande_Kroll_Ratchet Modus",
+        "visible_when": {"mode": "Chande_Kroll_Ratchet"},
     },
     "x_atr": {
         "type": "float", "default": 3.0, "min": 0.5,
         "description": "ATR-Multiplikator für Chande Kroll Stops",
+        "visible_when": {"mode": "Chande_Kroll_Ratchet"},
     },
 }
 

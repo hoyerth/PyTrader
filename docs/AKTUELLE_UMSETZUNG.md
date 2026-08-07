@@ -1017,3 +1017,120 @@ c) Edit-/Speichern-Buttons nur bei Wert-Aenderung sichtbar (wie bei "Sets").
 * **Doku-Freigabe:** Dieser Eintrag wurde erst nach erfolgreichem manuellem
   Funktionstest des Anwenders erstellt (Regel C: Doku nach Freigabe).
 * Naechste Kapitel (Roadmap): 17.02 Trend Services.
+
+---
+
+# 13. Implementierungs-Log 17.01.05 (07.08.2026) - UI-Dropdown + Conditional Visibility + Read-only Info-Label im ServiceWindow UMGESETZT
+
+**Ziel:** Die Parameter-Spalte des ServiceWindows fuer die Swing-Services
+benutzerfreundlich ausbauen:
+a) `options`-Schema-Felder (z. B. `mode`, `ma_type`, `vwap_anchor`) als
+   **Dropdown (QComboBox)** statt QLineEdit anzeigen,
+b) Parameter mit `visible_when`-Deklaration **modus-abhaengig ein-/ausblenden**
+   (nur die fuer den gewaehlten Algorithmus relevanten Parameter zeigen),
+c) eine **Read-only-Beschreibung** unter den Parametern anzeigen (display_name
+   + description_long + aktueller Algorithmus + Algo-Beschreibung), die beim
+   Mode-Wechsel live aktualisiert wird und bei langem Text sauber scrollt
+   (behebt den „Text ab zweiter Zeile abgeschnitten"-Bug).
+
+---
+
+## 13.1 Aenderungen in `serviceui/param_columns.py`
+
+### UI-Dropdown (QComboBox) fuer `options`-Schema-Felder
+* **`_create_param_control()`:** Rendert jetzt **VOR** der Datentyp-Pruefung
+  eine `QComboBox`, wenn `spec.get("options")` eine Liste/Tupel ist
+  (`combo.addItems([str(o) for o in options])`). Dadurch erscheinen
+  `type="str"` + `options`-Felder der Swing-Services (z. B. `mode`,
+  `ma_type`) als Dropdown statt als unbequemes QLineEdit (vorher fiel nur
+  `type=="choice"` in die Dropdown-Branch).
+
+### Conditional Visibility (`visible_when`)
+* **NEU `_apply_conditional_visibility(iid)`:** Blendet Parameter, deren
+  Schema-Eintrag `visible_when` traegt (z. B. `{"mode": ["ZigZag_ATR"]}`),
+  modus-abhaengig ein/aus: passt der aktuelle Mode des i-ten Services zur
+  deklarierten Mode-Liste -> Parameter sichtbar (Control + zugehoeriges
+  Label), sonst ausgeblendet. Parameter OHNE `visible_when` bleiben immer
+  sichtbar.
+* **`_build_service_column()`:** Verdrahtet den `mode`-Combo via
+  `currentTextChanged -> _apply_conditional_visibility(iid)`; das
+  Voll-Schema des Services wird in `_mode_schemas[iid]` gespeichert.
+  Labels werden in `_service_param_labels[(iid, key)]` referenziert.
+* **`_clear_service_columns()`:** Setzt `_mode_schemas` und
+  `_service_param_labels` zurueck (keine Alt-Referenzen beim naechsten Laden).
+* **`visible_when`-Deklarationen in den 3 Swing-Services** (PineScript-Zone
+  des `parameter_schema`, additiv):
+  * `srv_swing_structure.py`: `atr_period`/`atr_mult` -> nur `ZigZag_ATR`,
+    `change_pct` -> nur `ZigZag_Pct`, `left_bars`/`right_bars` -> nur
+    Williams_Fractal/Standard_Pivot/Gann_Mechanical.
+  * `srv_swing_momentum.py`: `piv_maxMaMovePct` -> nur `MA_Peak_Hysteresis`,
+    `chande_lookback`/`x_atr` -> nur `Chande_Kroll_Ratchet`.
+  * `srv_swing_volume_profile.py`: `profile_period`/`period_val`/
+    `volume_source`/`volume_thresh_pct`/`value_area_pct`/`lvn_sensitivity`
+    -> nur `Volume_Profile`, `grid_step` -> nur `Grid_Proximity`,
+    `vwap_anchor`/`vwap_band_mult` -> nur `Anchored_VWAP`.
+
+### Read-only Info-Label (QTextEdit + Scrollbar + Scroll-Top-Fix)
+* **`_build_service_column()`:** Die Beschreibung wird jetzt als **read-only
+  `QTextEdit`** gerendert (vorher QLabel): `setFrameShape(QTextEdit.NoFrame)`,
+  transparenter Hintergrund via Stylesheet, `setWordWrapMode(
+  QTextOption.WrapAtWordBoundaryOrAnywhere)`, horizontale Scrollbar aus,
+  vertikale `ScrollBarAsNeeded`, Hoehe auf ~3 Zeilen gedeckelt
+  (`setMaximumHeight`), damit die Spalte kompakt bleibt.
+* **NEU `_update_service_info_label(iid)`:** Baut die HTML-Beschreibung aus
+  dem `_mode_schemas[iid]`-Eintrag (display_name + description_long +
+  aktueller `mode`-Algorithmus + Algo-Beschreibung) und setzt sie via
+  `setHtml`. Wird beim Mode-Wechsel live aktualisiert.
+* **NEU `_scroll_textedit_top(editor)`:** Scrollt die Read-Only-QTextEdit HART
+  nach oben (Cursor -> Dokument-Anfang via
+  `QTextCursor.MoveOperation.Start`, danach Scrollbar erst auf Maximum und
+  dann auf 0, abschliessend `ensureCursorVisible`).
+* **Root Cause der urspruenglichen „ab zweiter Zeile"-Bugs:** `setHtml`
+  setzt den Cursor intern ans Dokument-Ende; Qt wrappt das Dokument erst in
+  einer spaeteren Event-Loop-Runde um und scrollt dann zum Cursor.
+  `_resize_param_box_deferred` resizete die Box danach -> der Reset verpuffte.
+  Fix: `_scroll_textedit_top` wird (1) synchron nach `setHtml`, (2) deferred
+  via `QTimer.singleShot(0)` und (3) nach dem finalen Box-Resize in
+  `_resize_param_box_deferred` aufgerufen.
+* **Imports ergaenzt:** `QTextEdit` (QtWidgets), `QTextOption`/`QTextCursor`
+  (QtGui).
+* **Verifikation (Real-Window-Reproduktion, headless):** nach Laden und
+  Mode-Wechsel `sb value: 0` / `cursorRect y=4` (vorher 17/-13).
+
+## 13.2 Verifikation (headless, keine UI-Tests)
+
+* **Syntax:** `python -m py_compile` auf `serviceui/param_columns.py`, den
+  3 Swing-Services + `test/test.py` – PASS.
+* **`test/test.py` Teil 22 (NEU, 17 Checks, alle PASS):**
+  * T1-T2) Fuer alle 3 Swing-Services: `options` als Liste vorhanden und
+    `visible_when`-Deklarationen im `full_parameter_schema()`.
+  * T3) `_create_param_control("mode", ...)` liefert eine `QComboBox`
+    (auch bei `type=="str"` + `options`).
+  * T4-T5) Plugin-Editor: mode-Control ist QComboBox und enthaelt alle
+    Algo-Optionen.
+  * T6-T7) Default `Williams_Fractal`: `left_bars` sichtbar,
+    `atr_period` ausgeblendet.
+  * T8-T10) Mode-Wechsel via `currentTextChanged` -> `ZigZag_ATR`:
+    `atr_period` sichtbar, `left_bars`/`change_pct` ausgeblendet.
+  * T11-T12) Mode `Period_Extrema`: `period_extrema_type` sichtbar,
+    `atr_period` ausgeblendet.
+  * T13) `collect_set_definition()` liefert den geaenderten mode
+    (editierbar/speicherbar).
+* **`test/test.py` Teil 23 (NEU, 12 Checks, alle PASS):**
+  * T1) Info-Anzeige je Instanz vorhanden (QTextEdit).
+  * T2-T4) Label enthaelt display_name + description_long + aktuellen
+    Algorithmus (mode).
+  * T5-T6) Mode-Wechsel aktualisiert Label (Period_Extrema inkl.
+    PDH/PWH-Algo-Beschreibung; Williams_Fractal verschwunden).
+  * T7-T8) Anzeige sichtbar und read-only.
+  * T9) vertikale Scrollbar Policy `AsNeeded`.
+  * T9b) Scrollbar initial ganz oben (value == 0).
+  * T9c) nach Mode-Wechsel weiterhin ganz oben (value == 0) – kein Sprung
+    ans Dokument-Ende.
+  * T10) Info-Anzeige auch fuer `srv_swing_momentum`.
+* **Gesamtlauf `test/test.py`:** 399 PASS; unveraenderte 6 vorbestehende
+  Harness-FAILURES (P2, P5, H3, H4, H5, H7 - PersistentWindow-Position/
+  -Groesse, offscreen-bedingt, dokumentierte Baseline) – keine neuen Fehler.
+* **Test-Cleanup (Invariante 10):** temporaere Helfer/Test-DBs entfernt;
+  `test/` enthaelt wieder nur `test/test.py` (Teile 22 + 23 ergaenzt).
+* Naechste Kapitel (Roadmap): 17.02 Trend Services.
