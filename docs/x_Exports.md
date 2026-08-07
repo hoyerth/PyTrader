@@ -70,6 +70,7 @@ PyTrader/
             multi_ma.py
             utils/
                 __init__.py
+                chart_data_buffer.py
                 ma_template.py
         js/
             01_core.js
@@ -77,6 +78,7 @@ PyTrader/
             03_chart_rendering.js
             04_live_updates.js
             05_measurement.js
+            06_two_tier.js
         overlays/
             __init__.py
             style_models.py
@@ -1266,7 +1268,18 @@ class MarketDataRepository:
 	def __init__(self, db_path: str = DB_MARKET_DATA) -> None:
 		self.db_path = db_path
 
-	def fetch_historical_candles(self, symbol: str, timeframe: str, limit: int = 3000) -> Tuple[List[Dict[str, Any]], int]:
+	def fetch_historical_candles(self, symbol: str, timeframe: str, limit: int = 3000,
+	                             before_epoch: Optional[int] = None) -> Tuple[List[Dict[str, Any]], int]:
+		"""Liest OHLCV-Kerzen aus der Marktdatenbank (aufsteigend sortiert).
+
+		Phase 16.07 (Two-Tier Caching, D4): Additiver Parameter `before_epoch`.
+		Ist er gesetzt, werden ausschliesslich KERZEN GELADEN, DIE ÄLTER ALS
+		diese Wanduhr-Epoch sind (WHERE "time" < to_timestamp(?)) – das
+		Chunk-Nachladen des `ChartDataBuffer` (Tier 2 -> DuckDB) nutzt genau
+		diesen Pfad, um den naechsten Block alter Geschichte vorzuladen.
+		Ohne `before_epoch` ist das Verhalten unveraendert (letzte `limit`
+		Kerzen, Abwaertskompatibilitaet).
+		"""
 		candles: List[Dict[str, Any]] = []
 		precision: int = 2
 
@@ -1297,6 +1310,17 @@ class MarketDataRepository:
 				if p_row and p_row[0] is not None:
 					precision = int(p_row[0])
 
+				# Phase 16.07: before_epoch filtert additiv auf ältere Kerzen
+				# (Wanduhr-Epoch; "time" ist TIMESTAMPTZ, daher to_timestamp-
+				# Vergleich). Die WHERE-Bedingung wird nur bei gesetztem
+				# before_epoch ergänzt (Abwaertskompatibilität).
+				older_filter = ""
+				params: List[Any] = [symbol, timeframe]
+				if before_epoch is not None:
+					older_filter = ' AND "time" < to_timestamp(?)'
+					params.append(int(before_epoch))
+				params.append(limit)
+
 				query = """
 					SELECT EXTRACT('epoch' FROM "time")::BIGINT AS time_epoch,
 					       open, high, low, close, tick_volume 
@@ -1309,12 +1333,13 @@ class MarketDataRepository:
 						  AND high IS NOT NULL 
 						  AND low IS NOT NULL 
 						  AND close IS NOT NULL
+						""" + older_filter + """
 						ORDER BY "time" DESC 
 						LIMIT ?
 					) 
 					ORDER BY "time" ASC;
 				"""
-				rows = con.execute(query, [symbol, timeframe, limit]).fetchall()
+				rows = con.execute(query, params).fetchall()
 				con.close()
 
 				for r in rows:
@@ -6937,6 +6962,10 @@ class ServiceSelectorModel(QObject):
     GROUP_SETS = "sets"
     GROUP_STANDALONE = "standalone"
     GROUP_PLUGINS = "plugins"
+    # 16.08 (K2): Kategorie-Ordner-Knoten (Dynamic Category Trees).
+    # Ein Ordner-Dict besitzt das Format:
+    #   {"group": GROUP_CATEGORY, "label": "📁 <Name>", "children": [...]}
+    GROUP_CATEGORY = "category_node"
 
     def __init__(self, set_repo=None, state_manager=None, registry=None,
                  feature_store_reader=None,
@@ -7236,6 +7265,104 @@ class ServiceSelectorModel(QObject):
             if pid.lower() not in used
         )
 
+    # ------------------------------------------------------------------
+    # 16.08 (K1/K2/K8/K9): Kategorie-Ordner (Dynamic Category Trees)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cat_key(label: str) -> str:
+        """Case-insensitiver Sortier-/Vergleichsschluessel eines Ordners.
+
+        Entfernt das '📁 '-Praefix des Ordnerlabels (K2-Format), damit
+        Sortierung (K8) und Pfad-Lookup stabil auf dem reinen Namen laufen.
+        """
+        s = str(label or "").strip()
+        if s.startswith("📁"):
+            s = s[len("📁"):].lstrip()
+        return s.lower()
+
+    def _category_parts(self, plugin: Optional[Any]) -> List[str]:
+        """Kategorienpfad eines Plugins (K1, 16.08).
+
+        Lese `metadata.get('category')` -> Slash-Pfad in saubere Teile
+        zerlegt. Leer ODER der Ist-Default `"General"` (base_plugin.py)
+        gelten als "keine Kategorie" -> das Plugin bleibt auf der obersten
+        Ebene der Hauptgruppe.
+        """
+        try:
+            meta = getattr(plugin, "metadata", None) or {}
+            category = str(meta.get("category") or "").strip()
+        except Exception:
+            return []
+        if not category or category.lower() == "general":
+            return []
+        return [p.strip() for p in category.split("/") if p.strip()]
+
+    def _insert_into_category_tree(self, nodes: List[Dict[str, Any]],
+                                   parts: List[str],
+                                   leaf: Dict[str, Any]) -> None:
+        """Fuegt ein Plugin-Blatt rekursiv in die Ordnerstruktur ein (K2).
+
+        Erzeugt fehlende Ordner entlang des Pfads. Ordner entstehen NUR
+        durch eine tatsaechliche Blatt-Einfuegung -> keine leeren Ordner
+        (K9). Ordner-Label folgt dem K2-Format '📁 <Name>'.
+        """
+        if not parts:
+            nodes.append(leaf)
+            return
+        key = self._cat_key(parts[0])
+        folder = None
+        for n in nodes:
+            if (n.get("group") == self.GROUP_CATEGORY
+                    and self._cat_key(n.get("label")) == key):
+                folder = n
+                break
+        if folder is None:
+            folder = {"group": self.GROUP_CATEGORY,
+                      "label": f"📁 {parts[0]}", "children": []}
+            nodes.append(folder)
+        self._insert_into_category_tree(folder["children"], parts[1:], leaf)
+
+    def _sort_category_nodes(self,
+                             nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Sortiert eine Ordner-Ebene (K8, 16.08).
+
+        Deterministisch: Ordner zuerst, dann Blaetter; jeweils alphabetisch
+        (case-insensitiv). Innerhalb der Ordner rekursiv dieselbe Regel.
+        """
+        def sort_key(n: Dict[str, Any]) -> tuple:
+            is_folder = n.get("group") == self.GROUP_CATEGORY
+            name = (self._cat_key(n.get("label"))
+                    if is_folder else str(n.get("plugin_id") or "").lower())
+            return (0 if is_folder else 1, name)
+
+        result = sorted(nodes, key=sort_key)
+        for n in result:
+            if n.get("group") == self.GROUP_CATEGORY:
+                n["children"] = self._sort_category_nodes(n.get("children") or [])
+        return result
+
+    def _category_nodes(self, plugin_ids: List[str]) -> List[Dict[str, Any]]:
+        """Baut die (ggf. verschachtelte) Kinderliste einer Plugin-Gruppe.
+
+        Plugins mit Kategorienpfad werden in 📁-Ordner einsortiert; Plugins
+        ohne Kategorie (bzw. Default 'General') bleiben auf oberster Ebene
+        (K1). Blatt-Dicts unveraendert ({plugin_id, badge, last_execution}).
+        Sortierung pro Ebene: Ordner vor Blaettern, alphabetisch (K8).
+        """
+        plugins = self.get_plugins()
+        root: List[Dict[str, Any]] = []
+        for pid in plugin_ids:
+            plugin = plugins.get(pid)
+            parts = self._category_parts(plugin)
+            leaf = {
+                "plugin_id": pid,
+                "badge": self.badge_for(pid),
+                "last_execution": self.last_execution_date(pid),
+            }
+            self._insert_into_category_tree(root, parts, leaf)
+        return self._sort_category_nodes(root)
+
     def build_tree(self) -> List[Dict[str, Any]]:
         """Baut die vollstaendige Hierarchie fuer das 2-Spalten-MasterTree.
 
@@ -7245,11 +7372,17 @@ class ServiceSelectorModel(QObject):
                   "services": [{"instance_id": ..., "plugin_id": ...,
                                 "badge": ...}, ...]}, ...]},
              {"group": "standalone", "label": "⚡ Standalone Services",
-              "children": [{"plugin_id": ..., "badge": ...}, ...]},
+              "children": [Blatt- und/oder Ordner-Knoten ...]},
              {"group": "plugins", "label": "📦 Alle verfügbaren Plugins",
-              "children": [{"plugin_id": ..., "badge": ...}, ...]}]
+              "children": [Blatt- und/oder Ordner-Knoten ...]}]
 
-        Deterministisch sortiert (Sets nach display_name, Plugins alphabetisch).
+        Deterministisch sortiert (Sets nach display_name; Plugins/Ordner
+        alphabetisch, 16.08 K8). Seit 16.08 (K2) sind die Kinder der
+        Plugin-Gruppen eine Mischung aus flachen Blatt-Dicts
+        ({plugin_id, badge, last_execution}) und verschachtelten
+        Ordner-Dicts ({"group": GROUP_CATEGORY, "label": "📁 <Name>",
+        "children": [...]} – rekursiv), gesteuert ueber das Metadaten-Feld
+        `category` der Plugins (K1). GROUP_SETS bleibt unveraendert.
         """
         sets = sorted(self._sets,
                       key=lambda s: str(s.get("display_name") or s.get("set_id") or "").lower())
@@ -7276,28 +7409,11 @@ class ServiceSelectorModel(QObject):
                 "services": service_nodes,
             })
 
-        standalone_nodes = [
-            {
-                "plugin_id": pid,
-                "badge": self.badge_for(pid),
-                # 05.08.2026 (Punkt 4): Datum der letzten Ausfuehrung auch fuer
-                # Standalone-Services – der MasterTree zeigt es hinter dem
-                # Plugin-Namen an (gleiche Semantik wie bei Set-Services).
-                "last_execution": self.last_execution_date(pid),
-            }
-            for pid in self.get_standalone_plugin_ids()
-        ]
-
-        plugin_nodes = [
-            {
-                "plugin_id": pid,
-                "badge": self.badge_for(pid),
-                # 05.08.2026 (Punkt 4): Datum der letzten Ausfuehrung auch in
-                # der 'Alle verfügbaren Plugins'-Gruppe (gleiche Semantik).
-                "last_execution": self.last_execution_date(pid),
-            }
-            for pid in sorted(self.get_plugins().keys())
-        ]
+        # 16.08 (K2/K8): Kinder der Plugin-Gruppen via _category_nodes –
+        # Plugins mit `category`-Metadatum werden in 📁-Ordner verschachtelt
+        # (K1), ohne Kategorie bleiben sie flache Blaetter auf oberster Ebene.
+        standalone_nodes = self._category_nodes(self.get_standalone_plugin_ids())
+        plugin_nodes = self._category_nodes(sorted(self.get_plugins().keys()))
 
         return [
             {"group": self.GROUP_SETS, "label": "📁 Service-Sets",
@@ -12070,6 +12186,8 @@ CSS_STYLE = """
 	#measurement-box { display: none; position: absolute; background: #1e222d; border: 1px solid #2962FF; border-radius: 6px; padding: 8px 12px; color: #d1d4dc; font-size: 12px; pointer-events: none; z-index: 1000; line-height: 1.5; white-space: nowrap; }
 	#price-badge { display: none; position: absolute; right: 2px; background: #2962FF; color: white; font-size: 11px; font-weight: bold; padding: 2px 6px; border-radius: 3px; pointer-events: none; z-index: 1000; will-change: transform, top; }
 	#countdown-badge { display: none; position: absolute; right: 62px; background: #1e222d; border: 1px solid #2962FF; color: #2962FF; font-size: 11px; font-weight: bold; padding: 2px 6px; border-radius: 3px; pointer-events: none; z-index: 1000; will-change: transform, top; }
+	#live-button { display: none; position: absolute; top: 4px; right: 4px; background: #2962FF; color: white; border: none; border-radius: 4px; font-size: 11px; font-weight: bold; padding: 3px 10px; cursor: pointer; z-index: 1001; }
+	#live-button:hover { background: #1e4fcc; }
 """
 
 JS_DIR = Path(__file__).resolve().parent / "js"
@@ -12080,6 +12198,10 @@ JS_FILES = [
     "03_chart_rendering.js",
     "04_live_updates.js",
     "05_measurement.js",
+    # Phase 16.07 (Two-Tier Caching): Sliding-Window-, Nachlade- und
+    # Live-Button-Logik (D1/D3/D4/D7/D8/D9/D10). Muss NACH 04 geladen
+    # werden (hängt sich über optionale Hooks in 04 ein).
+    "06_two_tier.js",
 ]
 
 
@@ -12113,6 +12235,7 @@ def _build_html_template() -> str:
 		<div id="measurement-box"></div>
 		<div id="price-badge"></div>
 		<div id="countdown-badge"></div>
+		<button id="live-button" title="Zurück zum Live-Ende">● Live</button>
 	</div>
 	<script>
 {js_code}
@@ -12186,6 +12309,13 @@ except ImportError:
     from indicators.multi_ma import MultiMovingAverageIndicator
     from indicator_dialog import IndicatorSettingsDialog
 
+# Phase 16.07 (D2): Tier-2-RAM-Puffer als eigene Engine-Klasse (SRP – Rule 2.3).
+# Die UI-Klasse haelt nur eine Referenz auf das Backend-Puffer-Objekt.
+try:
+    from chart.indicators.utils.chart_data_buffer import ChartDataBuffer
+except ImportError:
+    from indicators.utils.chart_data_buffer import ChartDataBuffer
+
 try:
     from state_manager import StateManager
 except ImportError:
@@ -12232,18 +12362,35 @@ class WebEngineConsolePage(QWebEnginePage):
 
 
 class ChartBridge(QObject):
-    rangeChanged = Signal(float, float)
+    """QWebChannel-Bridge zwischen JS (LWC v5) und Python (GUI-Thread).
+
+    Phase 16.07 (D3/D4/D10): Additiv erweitert um
+      * rangeChanged(f, t, totalBars) – totalBars für D10-Offset-Restore
+      * olderDataRequested(from_time_epoch, count, request_id, window_right_epoch)
+        – JS fordert ältere Daten an (zeitbasiert, Wanduhr-Epoch, D4)
+      * jumpToLiveRequested – D9 „Live"-Button (Rücksprung ans Live-Ende)
+    """
+    rangeChanged = Signal(float, float, float)
     priceRangeChanged = Signal(float, float)
     measurementChanged = Signal(str)
+    olderDataRequested = Signal(int, int, int, int)
+    jumpToLiveRequested = Signal()
 
-    @Slot(float, float)
-    def onRangeChanged(self, f, t): self.rangeChanged.emit(f, t)
+    @Slot(float, float, float)
+    def onRangeChanged(self, f, t, total): self.rangeChanged.emit(f, t, total)
 
     @Slot(float, float)
     def onPriceRangeChanged(self, f, t): self.priceRangeChanged.emit(f, t)
 
     @Slot(str)
     def onMeasurementChanged(self, m): self.measurementChanged.emit(m)
+
+    @Slot(int, int, int, int)
+    def onRequestOlderData(self, from_time_epoch, count, request_id, window_right_epoch):
+        self.olderDataRequested.emit(from_time_epoch, count, request_id, window_right_epoch)
+
+    @Slot()
+    def onJumpToLive(self): self.jumpToLiveRequested.emit()
 
 
 class ChartDataSerializer(QThread):
@@ -12288,6 +12435,39 @@ class GridDataSerializer(QThread):
             self.done.emit("", self.grid_gen)
 
 
+class OlderDataWorker(QThread):
+    """Phase 16.07 (D7): Holt den nächsten DB-Chunk (ältere Kerzen) im
+    Hintergrund-Thread – der GUI-Thread bleibt reaktionsfähig.
+
+    Führt NUR den reinen Lese-Fetch aus (MarketDataRepository,
+    before_epoch-Pfad). Die Puffer-Merge und das Delta-Payload werden im
+    GUI-Thread erledigt (Buffer/Indikator-Zustand ist nicht thread-safe).
+
+    Generations-Guard über request_id: Veraltete Worker-Ergebnisse (schneller
+    Wechsel / neuerer Request) werden in _on_older_db_fetched verworfen.
+    """
+    done = Signal(int, list, bool)  # request_id, candles, success
+
+    def __init__(self, repo, symbol, timeframe, before_epoch, count, request_id, parent=None):
+        super().__init__(parent)
+        self.repo = repo
+        self.symbol = symbol
+        self.timeframe = timeframe
+        self.before_epoch = before_epoch
+        self.count = count
+        self.request_id = request_id
+
+    def run(self):
+        try:
+            candles, _precision = self.repo.fetch_historical_candles(
+                self.symbol, self.timeframe, limit=self.count,
+                before_epoch=self.before_epoch)
+            self.done.emit(self.request_id, candles, True)
+        except Exception as e:
+            print(f"⚠️ [OlderDataWorker] DB-Fetch-Fehler: {e}")
+            self.done.emit(self.request_id, [], False)
+
+
 class PyTraderChartWindow(QMainWindow):
     closed_signal = Signal(str)
 
@@ -12326,6 +12506,10 @@ class PyTraderChartWindow(QMainWindow):
         self.state_manager = state_manager or StateManager()
         self.settings = self.state_manager.get_app_settings()
         self.market_repo = MarketDataRepository()
+        # Phase 16.07 (D2): Tier-2-RAM-Puffer als eigene Engine-Klasse (SRP –
+        # Rule 2.3). Die UI-Klasse haelt NUR eine Referenz; schwere DataFrames
+        # und die Zeit-Maps leben ausschliesslich im Buffer.
+        self.chart_buffer: ChartDataBuffer = ChartDataBuffer(market_repo=self.market_repo)
         self._is_loading_data = False
         self.df_data = None
 
@@ -12358,9 +12542,12 @@ class PyTraderChartWindow(QMainWindow):
         self._loading_watchdog.setSingleShot(True)
         self._loading_watchdog.setInterval(15000)
         self._loading_watchdog.timeout.connect(self._on_loading_watchdog)
-        # Mapping: kontinuierliche Zeit -> originale epoch (für JS tickMarkFormatter)
-        self._time_cont_to_real: Dict[int, int] = {}
-        self._time_real_to_cont: Dict[int, int] = {}
+        # Mapping: kontinuierliche Zeit -> originale epoch (für JS tickMarkFormatter).
+        # Phase 16.07 (D2): Referenzen auf die Buffer-Maps – der Buffer pflegt
+        # sie IN-PLACE (clear/update), damit diese Referenzen dauerhaft gültig
+        # bleiben (auch update_live_candle ergänzt live Einträge direkt).
+        self._time_cont_to_real: Dict[int, int] = self.chart_buffer.time_cont_to_real
+        self._time_real_to_cont: Dict[int, int] = self.chart_buffer.time_real_to_cont
         # P14-03-E: Live-Kerzen-State für die Pflicht-Re-Injektion (Flacker-Fix).
         self._live_bar_time: Optional[int] = None   # reale, gerundete Bar-Zeit der offenen Kerze
         self._live_candle_cont: Optional[Dict[str, Any]] = None  # letzter Live-Candle (kont. Zeit + OHLC)
@@ -12369,6 +12556,23 @@ class PyTraderChartWindow(QMainWindow):
         # Symbol/TF-Stand) werden in _apply_chart_update/_apply_grid_render verworfen.
         self._update_generation: int = 0
         self._grid_generation: int = 0
+
+        # Phase 16.07 (D7): Debounce für JS-Nachlade-Requests (300 ms, JS und
+        # Python debouncen – geteilte Verantwortung). Der DuckDB-I/O-Fetch
+        # laeuft zusätzlich im OlderDataWorker (Hintergrund-Thread).
+        self._older_debounce_timer: QTimer = QTimer(self)
+        self._older_debounce_timer.setSingleShot(True)
+        self._older_debounce_timer.setInterval(300)
+        self._older_debounce_timer.timeout.connect(self._do_older_data_load)
+        self._older_worker: Optional[OlderDataWorker] = None
+        # JS-Request-Tracking (D4/D7): request_id = JS-Seitiges Serial; nur
+        # der neueste Request wird ausgeführt/angewendet (Race-Guard).
+        self._older_request_serial: int = 0
+        self._pending_older: Optional[Tuple[int, int, int, int]] = None
+        # JS-Fenster-Bounds (reale Wanduhr-Epochs) für den Render-Payload-
+        # Filter (Tier-1-Fenster, D1) bei render_indicators und Chunk-Deltas.
+        self._js_window_first_real: Optional[int] = None
+        self._js_window_last_real: Optional[int] = None
 
                 # 1. ZUERST versuchen, spezifischen Instanz-Status aus der DB zu laden
         saved_inst_st = self.state_manager.load_all_instances()
@@ -12525,6 +12729,10 @@ class PyTraderChartWindow(QMainWindow):
         self.bridge.rangeChanged.connect(self.handle_range_changed)
         self.bridge.priceRangeChanged.connect(self.handle_price_range_changed)
         self.bridge.measurementChanged.connect(self.handle_measurement_changed)
+        # Phase 16.07 (D3/D4/D9): JS fordert ältere Daten an bzw. springt ans
+        # Live-Ende („Live"-Button).
+        self.bridge.olderDataRequested.connect(self._on_older_data_requested)
+        self.bridge.jumpToLiveRequested.connect(self._on_jump_to_live)
         self.channel = QWebChannel()
         self.channel.registerObject("pyBridge", self.bridge)
         self.web_view.page().setWebChannel(self.channel)
@@ -12752,7 +12960,8 @@ class PyTraderChartWindow(QMainWindow):
         self.save_state()
         self.render_indicators()
 
-    def _collect_render_payload(self) -> Dict[str, list]:
+    def _collect_render_payload(self, time_from: Optional[int] = None,
+                                time_to: Optional[int] = None) -> Dict[str, list]:
         """P16.05 (Prework Schritt 1, F1/P-C2): Sammelt das generische
         Render-Payload über ALLE aktiven Indikatoren.
 
@@ -12762,6 +12971,14 @@ class PyTraderChartWindow(QMainWindow):
         Branches mehr (Open/Closed, Invariante 9). Circle- und Linien-Zeiten
         (reale Wanduhr-Epochs) werden generisch auf kontinuierliche Zeiten
         gemappt (P-D1 / Ergänzung 1: `_time_real_to_cont.get(ts, ts)`).
+
+        Phase 16.07 (D1/D5): `time_from`/`time_to` (reale Wanduhr-Epochs,
+        inklusiv) grenzen den Render-Payload auf ein Zeitfenster ein:
+        * render_indicators(): Tier-1-Fenster [self._js_window_first_real,
+          self._js_window_last_real] – verhindert, dass Linien/Circles über
+          die sichtbaren Kerzen hinausragen (Two-Tier, D1).
+        * Chunk-Delta: [neue linke Kante, Fenster-Rechtskante].
+        None = keine Filterung (Bestandsverhalten, P16.05-Tests).
         """
         payload: Dict[str, list] = {
             "lines": [], "price_lines": [], "hit_circles": [],
@@ -12798,6 +13015,7 @@ class PyTraderChartWindow(QMainWindow):
                         for item in items:
                             if not isinstance(item, dict):
                                 continue
+                            keep_pts = []
                             for pt in (item.get("data") or []):
                                 if not isinstance(pt, dict):
                                     continue
@@ -12808,7 +13026,16 @@ class PyTraderChartWindow(QMainWindow):
                                     pt_t = int(pt_t)
                                 except (TypeError, ValueError):
                                     continue
+                                # Phase 16.07: Zeitfenster-Filter (real,
+                                # inklusiv) – Warmup-Punkte (D6, verworfen)
+                                # und Punkte ausserhalb des Fensters fallen weg.
+                                if time_from is not None and pt_t < time_from:
+                                    continue
+                                if time_to is not None and pt_t > time_to:
+                                    continue
                                 pt["time"] = self._time_real_to_cont.get(pt_t, pt_t)
+                                keep_pts.append(pt)
+                            item["data"] = keep_pts
                     else:
                         # Marker-Format: {time, price, ...} – Zeit auf oberster
                         # Ebene des Items (Circle).
@@ -12822,6 +13049,10 @@ class PyTraderChartWindow(QMainWindow):
                                 gc_t = int(gc_t)
                             except (TypeError, ValueError):
                                 continue
+                            if time_from is not None and gc_t < time_from:
+                                continue
+                            if time_to is not None and gc_t > time_to:
+                                continue
                             item["time"] = self._time_real_to_cont.get(gc_t, gc_t)
                 payload[key].extend(items)
         return payload
@@ -12832,11 +13063,18 @@ class PyTraderChartWindow(QMainWindow):
         P16.05 (Prework Schritt 1): Generische Pipeline statt Indikator-
         Branches – das aggregierte Render-Payload wird 1:1 per
         applyChartRenderPayload an JS durchgereicht (P-D1, F1).
+
+        Phase 16.07 (D1): Das Payload wird auf das Tier-1-Fenster
+        [self._js_window_first_real, self._js_window_last_real] begrenzt,
+        damit Linien/Circles nicht über die sichtbaren Kerzen hinausragen
+        (Two-Tier; die Berechnung selbst läuft über den vollen Tier-2-Puffer).
         """
         if self.df_data is None or self.df_data.empty:
             return
 
-        payload = self._collect_render_payload()
+        payload = self._collect_render_payload(
+            time_from=self._js_window_first_real,
+            time_to=self._js_window_last_real)
 
         # P14-03-E (Flacker-Fix): calculate() resettet die _known_times der
         # Indikatoren – die offene Live-Bar generisch wieder einfügen, damit
@@ -12921,99 +13159,73 @@ class PyTraderChartWindow(QMainWindow):
         self._debounce_timer.start()
 
     def _do_refresh_chart_data(self) -> None:
-        """Führt den tatsächlichen Chart-Refresh aus (nur via Debounce-Timer)."""
+        """Führt den tatsächlichen Chart-Refresh aus (nur via Debounce-Timer).
+
+        Phase 16.07 (Two-Tier, D1/D2/D5/D6/D8/D10):
+          * Tier 2: `ChartDataBuffer.load_initial()` lädt M + Warmup aus
+            DuckDB (D2: M=10000; D6: reiner Lese-Vorlauf für MAs).
+          * Tier 1: JS erhält das letzte Tier-1-Fenster (D1: N=1000).
+          * Indikator-Berechnung läuft über den vollen Tier-2-Puffer (D5),
+            das Render-Payload wird auf das Tier-1-Fenster begrenzt.
+          * `hasMoreHistory` (D8) und `rangeFrom/rangeTo` (D10, offsetbasiert
+            relativ zum rechten Rand) gehen in den Payload.
+        """
         if self._is_loading_data:
             self._debounce_timer.start()
             return
 
         self._set_loading(True)
 
-        print(f"📊 Lade Chart-Daten: {self.current_symbol} {self.current_tf}")
-        candles, precision = self.market_repo.fetch_historical_candles(self.current_symbol, self.current_tf, limit=self.settings.chart_candle_limit)
-        print(f"   → {len(candles)} Candles geladen, precision={precision}")
+        print(f"📊 Lade Chart-Daten (Two-Tier): {self.current_symbol} {self.current_tf}")
 
-        # NaN-Werte aus den Candles entfernen
-        clean_candles = []
-        if candles:
-            import math
-            for c in candles:
-                if (c.get("time") is not None and
-                    c.get("open") is not None and
-                    c.get("high") is not None and
-                    c.get("low") is not None and
-                    c.get("close") is not None):
-                    if (not math.isnan(c["open"]) and
-                        not math.isnan(c["high"]) and
-                        not math.isnan(c["low"]) and
-                        not math.isnan(c["close"])):
-                        # P16.05 (F3-Beschluss): tick_volume NaN/None -> 0,
-                        # die Candle bleibt gültig. Doppel-Absicherung zur
-                        # Normalisierung in fetch_historical_candles, damit
-                        # json.dumps(allow_nan=False) nie an tick_volume
-                        # scheitert und df_data["tick_volume"] sauber ist.
-                        tv = c.get("tick_volume")
-                        if tv is None:
-                            tv = 0.0
-                        else:
-                            try:
-                                tv = float(tv)
-                            except (TypeError, ValueError):
-                                tv = 0.0
-                            if math.isnan(tv):
-                                tv = 0.0
-                        c["tick_volume"] = tv
-                        clean_candles.append(c)
+        # D6: Warmup-Vorlauf (period*4 + smoothing*3) nur für aktive
+        # Gleitdurchschnitts-Indikatoren; Grid/Proximity => 0.
+        warmup = self._compute_warmup()
 
-            # ======================================================================
-            # Kontinuierliche Candle-Zeiten (keinerlei Lücken/Whitespace im Chart)
-            # Jede Candle bekommt: base_time + i * tf_sec
-            # Mapping cont -> real für JS tickMarkFormatter.
-            # ======================================================================
-            t_sec = TF_SECONDS_MAP.get(str(self.current_tf).upper(), 60)
-            self._time_cont_to_real = {}
-            self._time_real_to_cont = {}
-            continuous_candles = []
-            if clean_candles:
-                base_time = clean_candles[0]["time"]
-                for i, c in enumerate(clean_candles):
-                    cont_time = base_time + i * t_sec
-                    real_time = int(c["time"])
-                    self._time_cont_to_real[cont_time] = real_time
-                    self._time_real_to_cont[real_time] = cont_time
-                    dc = dict(c)
-                    dc["time"] = cont_time
-                    continuous_candles.append(dc)
+        # Tier 2: RAM-Puffer (M + Warmup) aus DuckDB füllen (D2/D6).
+        self.chart_buffer.load_initial(
+            self.current_symbol, self.current_tf, warmup=warmup,
+            limit=self.chart_buffer.TIER2_CAPACITY)
+        # D6: Datenfenster-Grösse (M + Warmup) an den MA-Indikator melden,
+        # damit die Berechnung über den vollen Tier-2-Puffer läuft (D5).
+        self._apply_data_window_size()
+        self.df_data = self.chart_buffer.df
 
-            # P14-03-E (PFLICHT, Pruefprotokoll P5): Offene Live-Kerze nach dem
-            # Map-Rebuild re-injizieren – sonst feuert der New-Candle-Callback
-            # bei jedem Tick erneut und die Flacker-Schleife bleibt bestehen.
-            # (remember_live_time-Re-Injektion erfolgt GENERISCH NACH dem
-            # calculate()-Loop weiter unten – calculate setzt die _known_times
-            # der Indikatoren aus den DB-Bars zurück und wuerde eine Re-Injektion
-            # VOR dem Loop wieder zunichte machen.)
-            if (self._live_bar_time is not None
-                    and self._live_bar_time not in self._time_real_to_cont):
-                last_cont = max(self._time_cont_to_real.keys())
-                cont = last_cont + t_sec
-                self._time_cont_to_real[cont] = self._live_bar_time
-                self._time_real_to_cont[self._live_bar_time] = cont
-                if self._live_candle_cont is not None:
-                    lc = dict(self._live_candle_cont)
-                    lc["time"] = cont
-                    continuous_candles.append(lc)
+        # Tier-1-Fenster (D1: letzte N Kerzen) mit kontinuierlichen Zeiten.
+        continuous_candles = self.chart_buffer.window_candles(
+            self.chart_buffer.TIER1_WINDOW)
+        precision = self.chart_buffer.precision
+        print(f"   → Tier2={len(self.chart_buffer.candles)} (warmup={warmup}), "
+              f"Tier1={len(continuous_candles)} Candles, precision={precision}")
 
-            import pandas as pd
-            self.df_data = pd.DataFrame(clean_candles)
-        else:
-            self.df_data = None
-            continuous_candles = []
+        # JS-Fenster-Bounds (reale Wanduhr-Epochs) für Render-Payload-Filter.
+        n_win = min(self.chart_buffer.TIER1_WINDOW, len(self.chart_buffer.candles))
+        self._js_window_first_real = (
+            int(self.chart_buffer.candles[-n_win]["time"]) if n_win > 0 else None)
+        self._js_window_last_real = self.chart_buffer.last_real
+
+        # P14-03-E (PFLICHT, Pruefprotokoll P5): Offene Live-Kerze nach dem
+        # Map-Rebuild (load_initial hat die Maps IN-PLACE neu aufgebaut)
+        # re-injizieren – sonst feuert der New-Candle-Callback bei jedem Tick
+        # erneut und die Flacker-Schleife bleibt bestehen.
+        t_sec = self.chart_buffer.tf_seconds
+        if (self._live_bar_time is not None
+                and self._live_bar_time not in self._time_real_to_cont):
+            last_cont = max(self._time_cont_to_real.keys()) if self._time_cont_to_real else 0
+            cont = last_cont + t_sec
+            self._time_cont_to_real[cont] = self._live_bar_time
+            self._time_real_to_cont[self._live_bar_time] = cont
+            if self._live_candle_cont is not None:
+                lc = dict(self._live_candle_cont)
+                lc["time"] = cont
+                continuous_candles.append(lc)
 
         # P16.05 (Prework Schritt 1): Generische Payload-Aggregation über
-        # ALLE aktiven Indikatoren (P-D1/F1/P-C2) – keine Indikator-
-        # spezifischen Branches mehr (Open/Closed, Invariante 9). Circle-/
-        # Linien-Zeiten werden in _collect_render_payload auf kontinuierlich
-        # gemappt (real→cont via _time_real_to_cont).
-        render_payload = self._collect_render_payload()
+        # ALLE aktiven Indikatoren (P-D1/F1/P-C2). Phase 16.07 (D1): auf das
+        # Tier-1-Fenster begrenzt (die Berechnung lief über den vollen Puffer).
+        render_payload = self._collect_render_payload(
+            time_from=self._js_window_first_real,
+            time_to=self._js_window_last_real)
 
         # P14-03-E (Flacker-Fix, generisch): plugin.calculate() setzt die
         # _known_times der Indikatoren auf die DB-Bars zurück – die offene
@@ -13040,6 +13252,9 @@ class PyTraderChartWindow(QMainWindow):
             # diesen Payload, statt sich auf seine eingebettete Offline-Map zu
             # verlassen (kein Duplikat-Pflege-Problem mehr).
             "tfSecondsMap": TF_SECONDS_MAP,
+            # D8: Stop-Flag – JS stellt am linken Rand keine weiteren
+            # Nachlade-Requests, wenn die DB keine ältere Geschichte mehr hat.
+            "hasMoreHistory": self.chart_buffer.has_more_history,
         }
 
         # Generations-Guard: monotone Update-ID für Race-Schutz im JS.
@@ -13049,10 +13264,13 @@ class PyTraderChartWindow(QMainWindow):
         update_id = self._update_generation
         update_package["updateId"] = update_id
 
-        # Nur hinzufügen, wenn echte Werte da sind – nie null/0 übergeben (sonst "Value is null" in JS)
-        if self.visible_from is not None and self.visible_to is not None:
-            update_package["rangeFrom"] = int(self.visible_from)
-            update_package["rangeTo"] = int(self.visible_to)
+        # D10: Restore offsetbasiert relativ zum rechten Rand (Chunk-
+        # Koordinaten, umbruchfest) – in logische Indizes übersetzen.
+        range_from, range_to = self._resolve_visible_logical_range(
+            len(continuous_candles))
+        if range_from is not None and range_to is not None:
+            update_package["rangeFrom"] = range_from
+            update_package["rangeTo"] = range_to
 
         if self.visible_price_from is not None and self.visible_price_to is not None:
             update_package["priceFrom"] = float(self.visible_price_from)
@@ -13118,6 +13336,254 @@ class PyTraderChartWindow(QMainWindow):
         try:
             self._set_loading(False)
             self.update_indicator_button_style()
+        except (RuntimeError, AttributeError):
+            pass
+
+    # ======================================================================
+    # Phase 16.07 – Two-Tier Caching (D1–D10)
+    # ======================================================================
+
+    def _compute_warmup(self) -> int:
+        """D6: Warmup-Vorlauf = period*4 + smoothing*3 – NUR für aktive
+        Gleitdurchschnitts-Indikatoren (Multi-MA). Grid-/Proximity-
+        Indikatoren brauchen keinen Vorlauf (Warmup = 0).
+
+        Der Vorlauf ist ein REINER LESE-Vorlauf (verworfen; der NaN-Vertrag
+        period−1 bleibt unverändert) – er stellt sicher, dass die MA-Werte an
+        der linken Tier-1-Kante voll eingeschwungen sind."""
+        warmup = 0
+        st = self.indicators_state.get("ind_moving_averages", {})
+        if not st.get("active"):
+            return 0
+        try:
+            params = self._resolve_indicator_params("ind_moving_averages", st)
+        except Exception:
+            return 0
+        for x in range(1, 9):
+            show = params.get(f"show_ma{x}")
+            if x == 1:
+                if show in (False, 0, "false", "False"):
+                    continue
+            else:
+                if not show or show in (False, 0, "false", "False"):
+                    continue
+            try:
+                period = int(params.get(f"ma{x}_period") or 0)
+            except (TypeError, ValueError):
+                period = 0
+            try:
+                smoothing = int(params.get(f"ma{x}_smoothing") or 0)
+            except (TypeError, ValueError):
+                smoothing = 0
+            warmup = max(warmup, period * 4 + smoothing * 3)
+        return warmup
+
+    def _apply_data_window_size(self) -> None:
+        """D6: Meldet die Tier-2-Datenfenster-Grösse (M + Warmup) an den
+        Multi-MA-Indikator, damit die Berechnung über den VOLLEN Puffer läuft
+        (D5) statt über den alten chart_candle_limit-Zuschnitt (3000)."""
+        ind = self.indicators.get("ind_moving_averages")
+        setter = getattr(ind, "set_data_window_size", None)
+        if not callable(setter):
+            return
+        size = len(self.chart_buffer.df) if self.chart_buffer.df is not None else None
+        try:
+            setter(size)
+        except Exception:
+            pass
+
+    def _resolve_visible_logical_range(self, total: int):
+        """D10: Übersetzt die persistierten visible_from/visible_to in
+        logische Indizes des aktuellen Tier-1-Fensters.
+
+        NEUES Format (16.07): Offsets relativ zum rechten Rand (Chunk-
+        Koordinaten, umbruchfest) – erkennbar an `visible_from > visible_to`
+        (logisches from < to, daher ist der Abstand-von-rechts von from
+        grösser als der von to).
+        ALTES Format (Bestand): absolute logische Indizes (from < to) – wird
+        auf das aktuelle Fenster geklemmt (Abwärtskompatibilität).
+
+        Returns:
+            (range_from, range_to) als ints oder (None, None).
+        """
+        if self.visible_from is None or self.visible_to is None:
+            return None, None
+        if not total or total <= 0:
+            return None, None
+        vf, vt = int(self.visible_from), int(self.visible_to)
+        if vf > vt:
+            # Neues Offset-Format: Abstand vom rechten Rand.
+            f = max(0, total - vf)
+            t = min(total - 1, total - vt)
+            if t < f:
+                f, t = total - 1, total - 1
+            return f, t
+        # Alt-Format: absolute Indizes -> klemmen.
+        f = max(0, min(vf, total - 1))
+        t = max(f + 1, min(vt, total))
+        return f, t
+
+    def _on_jump_to_live(self) -> None:
+        """D9: „Live"-Button in JS -> vollständiger Refresh. Der Tier-2-Puffer
+        wird aus DuckDB neu geladen, das Fenster springt ans Live-Ende."""
+        if self._is_loading_data:
+            return
+        self.refresh_chart_data()
+
+    def _on_older_data_requested(self, from_time_epoch: int, count: int,
+                                 request_id: int, window_right_epoch: int) -> None:
+        """D3/D4/D7: JS fordert ältere Daten an (zeitbasiert, Wanduhr-Epoch).
+
+        Debounce (300 ms, D7): Nur der letzte Request innerhalb des
+        Debounce-Fensters wird ausgeführt (schnelles Wischen erzeugt viele
+        Range-Events). `request_id` = JS-seitiges Serial (Race-Guard)."""
+        if self._is_loading_data:
+            return
+        self._older_request_serial = int(request_id)
+        self._pending_older = (
+            int(from_time_epoch), int(count), int(request_id),
+            int(window_right_epoch or 0))
+        self._older_debounce_timer.start()
+
+    def _do_older_data_load(self) -> None:
+        """Führt den debounced Nachlade-Request aus (GUI-Thread).
+
+        Priorität 1: RAM-Serve aus dem Tier-2-Puffer (0 ms I/O, D3/D4).
+        Priorität 2: Puffer nach links erschöpft -> DB-Chunk im
+        OlderDataWorker (D7, Hintergrund-Thread), danach merge + serve.
+        """
+        if not self._pending_older:
+            return
+        from_epoch, count, request_id, _wr = self._pending_older
+        self._pending_older = None
+        if self._is_loading_data:
+            return
+
+        # Priorität 1: RAM-Serve (Tier 2 -> Tier 1, keine DB-I/O).
+        result = self.chart_buffer.serve_older(from_epoch, count)
+        if result is not None:
+            new_candles, window_right, has_more = result
+            first_cont = int(new_candles[0]["time"])
+            self._js_window_first_real = self._time_cont_to_real.get(
+                first_cont, first_cont)
+            self._send_older_chunk(new_candles, window_right, has_more, request_id)
+            return
+
+        # Priorität 2: Puffer erschöpft -> DB-Chunk (D7).
+        self._last_older_count = int(count)
+        self._last_older_warmup = self._compute_warmup()
+        if self._older_worker is not None and self._older_worker.isRunning():
+            # Ein alter Fetch läuft noch – abbrechen (neuer Request gewinnt).
+            try:
+                self._older_worker.done.disconnect(self._on_older_db_fetched)
+            except (RuntimeError, TypeError):
+                pass
+            self._older_worker.quit()
+            self._older_worker.wait(300)
+        worker = OlderDataWorker(
+            self.market_repo, self.current_symbol, self.current_tf,
+            from_epoch, self._last_older_count + self._last_older_warmup,
+            request_id, self)
+        self._older_worker = worker
+        worker.done.connect(self._on_older_db_fetched)
+        worker.start()
+
+    def _on_older_db_fetched(self, request_id: int, fetched: list, success: bool) -> None:
+        """Merge + Serve nach DB-Fetch (GUI-Thread).
+
+        Generations-Guard über request_id (D7): Veraltete Worker-Ergebnisse
+        (inzwischen neuerer Request / Symbol/TF-Wechsel) werden verworfen."""
+        worker = self._older_worker
+        self._older_worker = None
+        if not success or request_id != self._older_request_serial:
+            return
+        if self._is_loading_data:
+            return
+        new_candles, window_right, has_more = self.chart_buffer.merge_older(
+            fetched, serve_count=self._last_older_count,
+            warmup=self._last_older_warmup)
+        self._apply_data_window_size()
+        self.df_data = self.chart_buffer.df
+        if new_candles:
+            first_cont = int(new_candles[0]["time"])
+            self._js_window_first_real = self._time_cont_to_real.get(
+                first_cont, first_cont)
+        # D10/Right-Edge-Sync: Nach evtl. Capacity-Trim ist die Puffer-Rechts-
+        # kante die neue JS-Fenster-Rechtskante (JS kürzt in applyOlderDataChunk).
+        if window_right:
+            self._js_window_last_real = int(window_right)
+        self._send_older_chunk(new_candles, window_right, has_more, request_id)
+
+    def _send_older_chunk(self, new_candles: List[Dict[str, Any]],
+                          window_right: int, has_more: bool, request_id: int) -> None:
+        """Baut das Delta-Payload (D4) und sendet es an JS.
+
+        Vertrag: {updateId, symbol, timeframe, candles, timeMapDelta,
+        windowRightEpoch, hasMoreHistory, chartRenderPayloadDelta}.
+
+        `chartRenderPayloadDelta.lines/hit_circles` = vollständig neu
+        berechnetes Render-Payload über den vollen Tier-2-Puffer (D5),
+        begrenzt auf das aktuelle Tier-1-Fenster [neue linke Kante, rechte
+        Kante] – JS ersetzt die Linien/Marker damit nahtlos (kein Seam)."""
+        if not new_candles:
+            # DB-Ende / keine neuen Daten -> nur Stop-Flag senden (D8).
+            payload = {
+                "updateId": int(request_id),
+                "symbol": self.current_symbol,
+                "timeframe": self.current_tf,
+                "candles": [],
+                "timeMapDelta": {},
+                "windowRightEpoch": int(window_right or 0),
+                "hasMoreHistory": False,
+                "chartRenderPayloadDelta": {"lines": [], "hit_circles": []},
+            }
+            self._send_older_json(payload)
+            return
+
+        first_cont = int(new_candles[0]["time"])
+        window_left_real = self._time_cont_to_real.get(first_cont, first_cont)
+        window_right_real = int(window_right or self._js_window_last_real or 0)
+
+        render_payload = self._collect_render_payload(
+            time_from=window_left_real, time_to=window_right_real)
+
+        # P14-03-E (Flacker-Fix): Live-Bar-Re-Injektion nach dem calculate()-Loop.
+        self._reinject_live_bar_to_indicators()
+
+        # timeMapDelta: NUR die neuen (geprependeten) cont->real Einträge –
+        # die bestehenden Kerzen behalten ihre cont-Zeiten (JS erweitert nur).
+        time_map_delta: Dict[int, int] = {}
+        for c in new_candles:
+            cont = int(c["time"])
+            real = self._time_cont_to_real.get(cont)
+            if real is not None:
+                time_map_delta[cont] = real
+
+        payload = {
+            "updateId": int(request_id),
+            "symbol": self.current_symbol,
+            "timeframe": self.current_tf,
+            "candles": new_candles,
+            "timeMapDelta": time_map_delta,
+            "windowRightEpoch": window_right_real,
+            "hasMoreHistory": bool(has_more),
+            "chartRenderPayloadDelta": {
+                "lines": render_payload.get("lines") or [],
+                "hit_circles": render_payload.get("hit_circles") or [],
+            },
+        }
+        self._send_older_json(_clean_nan(payload))
+
+    def _send_older_json(self, payload: dict) -> None:
+        """Serialisiert und sendet ein Chunk-Payload an JS (mit Fehler-Schutz)."""
+        try:
+            payload_json = json.dumps(payload, allow_nan=False)
+        except (ValueError, TypeError) as e:
+            print(f"⚠️ [OlderData] JSON-Fehler: {e}")
+            return
+        try:
+            self.web_view.page().runJavaScript(
+                f"if(window.applyOlderDataChunk) applyOlderDataChunk({payload_json});")
         except (RuntimeError, AttributeError):
             pass
 
@@ -13338,9 +13804,24 @@ class PyTraderChartWindow(QMainWindow):
         except (RuntimeError, AttributeError):
             pass
 
-    def handle_range_changed(self, f, t):
+    def handle_range_changed(self, f, t, total=0):
+        """Phase 16.07 (D10): Speichert den Viewport OFFSETBASIERT relativ
+        zum rechten Rand (Chunk-Koordinaten, umbruchfest).
+
+        Da im Hintergrund ständig neue Ticks / Chunks hinzukommen, verändern
+        sich absolute Bar-Indizes. `visible_from`/`visible_to` werden daher
+        als Abstand vom rechten Rand des JS-Datenfensters persistiert
+        (visible_from > visible_to) – beim Restore wird daraus die logische
+        Range des aktuellen Fensters zurückgerechnet
+        (_resolve_visible_logical_range).
+        """
         if not self._is_loading_data:
-            self.visible_from, self.visible_to = f, t
+            total = int(total or 0)
+            if total > 0:
+                self.visible_from = total - int(f)
+                self.visible_to = total - int(t)
+            else:
+                self.visible_from, self.visible_to = f, t
             self.save_state()
 
     def handle_price_range_changed(self, f, t):
@@ -16577,6 +17058,10 @@ class MultiMovingAverageIndicator(BaseIndicator):
         self._timeframe: Optional[str] = None
         self._settings: Any = None
         self._plugin_id: str = _INDICATOR_ID
+        # Phase 16.07 (Two-Tier, D6): Datenfenster-Grösse für die Tier-2-
+        # Berechnung (Buffergrösse M + Warmup). None = Fallback auf
+        # chart_candle_limit (Bestandsverhalten / Tests, z. B. P16.05 M4).
+        self._data_window_size: Optional[int] = None
 
     # ------------------------------------------------------------- Identität
     @property
@@ -16803,6 +17288,18 @@ class MultiMovingAverageIndicator(BaseIndicator):
         """Injiziert AppSettings (Kopie) – sonst lazy aus dem StateManager."""
         self._settings = settings
 
+    def set_data_window_size(self, n: Optional[int]) -> None:
+        """Phase 16.07 (D6): Setzt die Datenfenster-Grösse für die Tier-2-
+        Berechnung (Buffergrösse M + Warmup-Vorlauf, verworfen).
+
+        Der ChartWindow ruft diese Methode nach jedem Buffer-Load/Merge auf,
+        damit die MA-Berechnung über den VOLLEN Tier-2-Puffer läuft (D5:
+        vollständige vektorisierte Neuberechnung auf M) statt über den alten
+        chart_candle_limit-Zuschnitt (3000). None = Fallback auf
+        chart_candle_limit (Bestandsverhalten, Tests).
+        """
+        self._data_window_size = int(n) if n else None
+
     def _get_app_settings(self) -> Any:
         if self._settings is not None:
             return self._settings
@@ -16813,7 +17310,16 @@ class MultiMovingAverageIndicator(BaseIndicator):
             return None
 
     def _get_candle_limit(self) -> int:
-        """chart_candle_limit aus den AppSettings (Default 3000)."""
+        """Datenfenster-Limit für die Berechnung.
+
+        Phase 16.07 (D6): Wenn `set_data_window_size()` gesetzt wurde
+        (Tier-2-Buffergrösse M + Warmup), wird DIESES Limit verwendet –
+        die MA-Berechnung läuft dann über den vollen Puffer (D5).
+        Sonst Fallback auf chart_candle_limit (Default 3000,
+        Bestandsverhalten / Tests, z. B. P16.05 M4).
+        """
+        if getattr(self, "_data_window_size", None):
+            return max(int(self._data_window_size), 1)
         try:
             settings = self._get_app_settings()
             limit = int(getattr(settings, "chart_candle_limit", 3000))
@@ -16951,6 +17457,359 @@ class MultiMovingAverageIndicator(BaseIndicator):
 # keine Feature-Store-Schreibzugriffe). Exportfrei – Module werden direkt
 # importiert (z. B. chart.indicators.utils.ma_template.MATemplateEngine),
 # analog zum exportfreien chart/indicators/__init__.py (Phase 15).
+
+```
+
+--------------------------------------------------
+
+### DATEI: chart/indicators/utils/chart_data_buffer.py
+```py
+# chart/indicators/utils/chart_data_buffer.py
+"""
+Phase 16.07 – ChartDataBuffer (Two-Tier Caching, Tier-2-RAM-Puffer)
+====================================================================
+
+Eigene Engine-Klasse (D2, SRP – Rule 2.3) für den Tier-2-Datenpuffer der
+Two-Tier-Architektur. `PyTraderChartWindow` (PySide6-UI) hält nur eine
+**Referenz** auf dieses Backend-Puffer-Objekt; schwere DataFrames und die
+Zeit-Map-Verwaltung leben ausschliesslich hier.
+
+Konzepte (verbindliche Entscheidungen D1–D10, docs/AKTUELLE_UMSETZUNG.md):
+  * **M = 10.000** served Kerzen im RAM (D2). Rechte Kante = Live-Ende.
+  * **N = 1.000** = Tier-1-Fenster-/Chunk-Grösse (D1).
+  * **Warmup (D6):** Reiner Lese-Vorlauf `period*4 + smoothing*3` NUR für
+    Gleitdurchschnitts-Indikatoren. Die Warmup-Kerzen liegen als
+    `_warmup_candles` links vom served Bereich und werden ausschliesslich
+    für die DataFrame-Berechnung genutzt (danach verworfen – sie werden
+    NIE an JS gesendet, NIE als Tier-1-Candles geführt).
+  * **Kontinuierliche Zeit (Wanduhr):** `time_cont_to_real`/`time_real_to_cont`
+    werden IN-PLACE gepflegt (ChartWindow hält gültige Referenzen).
+    Beim Prepend neuer (älterer) Kerzen bleiben die cont-Zeiten der
+    BESTEHENDEN Kerzen unverändert (neuer Block erhält cont-Zeiten
+    unterhalb des bisherigen Minimums) – dadurch ist der JS-Ausschnitt
+    inkrementell ergänzbar, ohne dass die Chart-Zeitskala springt.
+  * **serve_older():** RAM-Serve mit 0 ms I/O-Latenz (D3/D4) – solange der
+    Puffer nach links reicht. None = Puffer erschöpft.
+  * **merge_older():** DB-Fetch-Ergebnis (Chunk) wird vorne eingefügt;
+    überschreitet der Puffer die Kapazität M, werden die rechtesten
+    (neuesten) Kerzen abgeworfen (Sliding Window) und ihre Map-Einträge
+    entfernt.
+  * **has_more_history (D8):** Stop-Flag bei 0 neuen Zeilen (DB-Ende) –
+    kein Endlos-Loop.
+
+Reine Backend-Engine (kein UI-Import), abhängig nur von `db_service`
+(MarketDataRepository) und `pandas` – kompatibel mit Rule 2.3 (SRP).
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
+
+from db_service import MarketDataRepository, TF_SECONDS_MAP
+
+
+class ChartDataBuffer:
+    """Tier-2-RAM-Datenpuffer für historische OHLCV-Kerzen (Wanduhr-Epochs).
+
+    Stateful Backend-Engine – ein Objekt pro Chart-Fenster (Referenz aus der
+    UI-Klasse, D2). Enthält KEINE Qt-/UI-Abhängigkeiten und ist headless
+    testbar (test/test.py).
+    """
+
+    # --- Verbindliche Grössen (D1/D2) -------------------------------------
+    TIER2_CAPACITY: int = 10000   # M: served Kerzen im RAM (Faktor 10)
+    TIER1_WINDOW: int = 1000      # N: Tier-1-Fenster-/Chunk-Grösse
+
+    def __init__(self, market_repo: Optional[MarketDataRepository] = None) -> None:
+        self.market_repo: MarketDataRepository = market_repo or MarketDataRepository()
+        self.symbol: Optional[str] = None
+        self.timeframe: Optional[str] = None
+        self.tf_seconds: int = 60
+        self.precision: int = 2
+
+        # Served (sichtbare) Kerzen – reale Wanduhr-Epochs, aufsteigend.
+        self.candles: List[Dict[str, Any]] = []
+        # Reiner Lese-Vorlauf (D6) – NUR für die DataFrame-Berechnung,
+        # wird NIE an JS gesendet / als Tier-1-Candle geführt.
+        self._warmup_candles: List[Dict[str, Any]] = []
+        # DataFrame über Warmup + served (Indikator-Berechnung, D5).
+        self.df: Optional[pd.DataFrame] = None
+
+        self.has_more_history: bool = True
+        self.warmup_needed: int = 0
+
+        # Kontinuierliche Zeit-Maps (Wanduhr-Epochs). Werden IN-PLACE
+        # gepflegt, damit externe Referenzen (ChartWindow) dauerhaft gültig
+        # bleiben.
+        self.time_cont_to_real: Dict[int, int] = {}
+        self.time_real_to_cont: Dict[int, int] = {}
+
+    # ------------------------------------------------------------------
+    # Defensive Candle-Sanitisierung (analog Bestandscode in chart_win)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _sanitize_candles(candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Entfernt NaN/Inf/None aus OHLC und normalisiert tick_volume.
+
+        Doppel-Absicherung zur Normalisierung in fetch_historical_candles,
+        damit json.dumps(allow_nan=False) nie scheitert und df-Spalten
+        (tick_volume fuer VWMA, P16.05 F3) sauber sind. NaN/None in
+        tick_volume -> 0, die Candle bleibt gueltig.
+        """
+        import math
+        out: List[Dict[str, Any]] = []
+        for c in candles or []:
+            try:
+                t = int(c.get("time"))
+            except (TypeError, ValueError):
+                continue
+            try:
+                o = float(c.get("open"))
+                h = float(c.get("high"))
+                lo = float(c.get("low"))
+                cl = float(c.get("close"))
+            except (TypeError, ValueError):
+                continue
+            if (math.isnan(o) or math.isnan(h) or math.isnan(lo) or math.isnan(cl)):
+                continue
+            tv_raw = c.get("tick_volume")
+            if tv_raw is None:
+                tv = 0.0
+            else:
+                try:
+                    tv = float(tv_raw)
+                except (TypeError, ValueError):
+                    tv = 0.0
+                if math.isnan(tv):
+                    tv = 0.0
+            out.append({
+                "time": t, "open": o, "high": h, "low": lo,
+                "close": cl, "tick_volume": tv,
+            })
+        return out
+
+    # ------------------------------------------------------------------
+    # Initial-Load (vollständiger Reset)
+    # ------------------------------------------------------------------
+    def load_initial(self, symbol: str, timeframe: str,
+                     warmup: int = 0, limit: Optional[int] = None) -> None:
+        """Lädt die letzten `M + warmup` Kerzen aus DuckDB in den Puffer.
+
+        - `self.candles` (served): die letzten `M` Kerzen.
+        - `self._warmup_candles`: der ältere Vorlauf (D6, verworfen).
+        - `has_more_history`: False, wenn die DB kürzer als das
+          angeforderte Limit ist (DB-Anfang erreicht).
+        """
+        self.symbol = symbol
+        self.timeframe = timeframe
+        self.tf_seconds = TF_SECONDS_MAP.get(str(timeframe).upper(), 60)
+        self.warmup_needed = max(int(warmup or 0), 0)
+        limit = int(limit or self.TIER2_CAPACITY)
+        fetch_limit = limit + self.warmup_needed
+
+        candles, precision = self.market_repo.fetch_historical_candles(
+            symbol, timeframe, limit=fetch_limit)
+        candles = self._sanitize_candles(candles)
+        self.precision = precision
+        self.has_more_history = len(candles) >= fetch_limit
+
+        if not candles:
+            self.candles = []
+            self._warmup_candles = []
+            self.df = None
+            self.time_cont_to_real.clear()
+            self.time_real_to_cont.clear()
+            return
+
+        if self.warmup_needed > 0 and len(candles) > limit:
+            self._warmup_candles = candles[:self.warmup_needed]
+            self.candles = candles[self.warmup_needed:]
+        else:
+            warmup_take = min(self.warmup_needed, max(0, len(candles) - limit))
+            self._warmup_candles = candles[:warmup_take]
+            self.candles = candles[warmup_take:]
+
+        # served auf Kapazität kappen (rechte Kante = Live-Ende behalten)
+        if len(self.candles) > limit:
+            self.candles = self.candles[-limit:]
+
+        self._rebuild_maps()
+        self._rebuild_df()
+
+    # ------------------------------------------------------------------
+    # RAM-Serve (D3/D4: 0 ms I/O-Latenz)
+    # ------------------------------------------------------------------
+    def serve_older(self, from_epoch: int, count: int) -> Optional[Tuple[List[Dict[str, Any]], int, bool]]:
+        """Bedient bis zu `count` Kerzen, die ÄLTER als `from_epoch` sind,
+        direkt aus dem RAM-Puffer.
+
+        Returns:
+            (new_cont_candles, window_right_epoch, has_more) – oder None,
+            wenn der Puffer nach links erschöpft ist (DB-Fetch nötig, D7).
+        """
+        if not self.candles or from_epoch is None:
+            return None
+        if int(from_epoch) <= self.candles[0]["time"]:
+            return None
+        eligible = [c for c in self.candles if c["time"] < int(from_epoch)]
+        selected = eligible[-count:]
+        if not selected:
+            return None
+        new_candles: List[Dict[str, Any]] = []
+        for c in selected:
+            real = int(c["time"])
+            cont = self.time_real_to_cont.get(real)
+            if cont is None:
+                continue
+            cc = dict(c)
+            cc["time"] = cont
+            new_candles.append(cc)
+        if not new_candles:
+            return None
+        window_right = self.candles[-1]["time"] if self.candles else 0
+        # has_more=True: die Erschöpfung (DB-Ende) wird erst beim nächsten
+        # Request / beim DB-Merge detektiert (D8, selbstkorrigierend).
+        return new_candles, int(window_right), True
+
+    # ------------------------------------------------------------------
+    # DB-Merge (Sliding Window, D7/D8)
+    # ------------------------------------------------------------------
+    def merge_older(self, fetched: List[Dict[str, Any]],
+                    serve_count: Optional[int] = None,
+                    warmup: Optional[int] = None) -> Tuple[List[Dict[str, Any]], int, bool]:
+        """Fügt ein DB-Fetch-Ergebnis (Chunk, aufsteigend, ALLE jünger als
+        die bisher älteste served Kerze) vorne in den Puffer ein.
+
+        - `serve_count` Kerzen werden served (JS bekommt sie); der ältere
+          Rest (bis `warmup`) wird als reiner Lese-Vorlauf übernommen (D6).
+        - Überschreitet der Puffer die Kapazität M, werden die rechtesten
+          Kerzen abgeworfen und ihre Map-Einträge entfernt (Sliding Window).
+        - Liefert 0 neue Kerzen bei DB-Ende -> `has_more_history=False` (D8).
+
+        Returns:
+            (new_cont_candles, window_right_epoch, has_more)
+        """
+        serve_count = int(serve_count or self.TIER1_WINDOW)
+        warmup = max(int(warmup or 0), 0)
+
+        if not fetched:
+            self.has_more_history = False
+            return [], int(self.candles[-1]["time"]) if self.candles else 0, False
+
+        fetched = self._sanitize_candles(fetched)
+        if not fetched:
+            self.has_more_history = False
+            return [], int(self.candles[-1]["time"]) if self.candles else 0, False
+
+        prev_oldest = self.candles[0]["time"] if self.candles else None
+        if prev_oldest is not None:
+            fetched = [c for c in fetched if c["time"] < prev_oldest]
+        if not fetched:
+            # Alles bereits im Puffer (doppelter Request) – keine Erschöpfung.
+            return [], int(self.candles[-1]["time"]) if self.candles else 0, self.has_more_history
+
+        if len(fetched) <= serve_count:
+            served = fetched
+            new_warmup: List[Dict[str, Any]] = []
+        else:
+            served = fetched[-serve_count:]
+            new_warmup = fetched[:-serve_count][-warmup:] if warmup > 0 else []
+
+        k = len(served)
+        min_cont = min(self.time_cont_to_real.keys()) if self.time_cont_to_real else 0
+        new_cont_candles: List[Dict[str, Any]] = []
+        for j, c in enumerate(served):
+            cont = min_cont - (k - j) * self.tf_seconds
+            real = int(c["time"])
+            self.time_cont_to_real[cont] = real
+            self.time_real_to_cont[real] = cont
+            cc = dict(c)
+            cc["time"] = cont
+            new_cont_candles.append(cc)
+
+        self.candles = served + self.candles
+
+        # Kapazitäts-Grenze M: rechteste (neueste) Überschuss-Kerzen abwerfen
+        if len(self.candles) > self.TIER2_CAPACITY:
+            drop = self.candles[self.TIER2_CAPACITY:]
+            self.candles = self.candles[:self.TIER2_CAPACITY]
+            for dc in drop:
+                real = int(dc["time"])
+                old_cont = self.time_real_to_cont.pop(real, None)
+                if old_cont is not None:
+                    self.time_cont_to_real.pop(old_cont, None)
+
+        # D6: Warmup-Vorlauf ersetzen (nur für Berechnung, verworfen).
+        self._warmup_candles = new_warmup
+        self.has_more_history = len(fetched) >= (serve_count + warmup)
+        self._rebuild_df()
+
+        window_right = int(self.candles[-1]["time"]) if self.candles else 0
+        return new_cont_candles, window_right, self.has_more_history
+
+    # ------------------------------------------------------------------
+    # Tier-1-Zugriff (D1)
+    # ------------------------------------------------------------------
+    def window_candles(self, count: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Liefert die letzten `count` served Kerzen kont-zeit-gemappt
+        (Tier-1-Fenster, D1: N=1000)."""
+        count = int(count or self.TIER1_WINDOW)
+        if not self.candles:
+            return []
+        selected = self.candles[-count:]
+        out: List[Dict[str, Any]] = []
+        for c in selected:
+            real = int(c["time"])
+            cont = self.time_real_to_cont.get(real)
+            if cont is None:
+                continue
+            cc = dict(c)
+            cc["time"] = cont
+            out.append(cc)
+        return out
+
+    @property
+    def first_real(self) -> Optional[int]:
+        """Reale Wanduhr-Epoch der ältesten served Kerze (JS-Fenster-Linkskante)."""
+        return int(self.candles[0]["time"]) if self.candles else None
+
+    @property
+    def last_real(self) -> Optional[int]:
+        """Reale Wanduhr-Epoch der jüngsten served Kerze (rechte Kante / Live-Ende)."""
+        return int(self.candles[-1]["time"]) if self.candles else None
+
+    # ------------------------------------------------------------------
+    # Interne Helfer
+    # ------------------------------------------------------------------
+    def _rebuild_maps(self) -> None:
+        """Baut beide cont-Zeit-Maps aus den served Kerzen NEU auf (IN-PLACE).
+
+        Kontinuierliche Zeit = base_time + i*tf_sec (indexbasiert, lückenlos).
+        base_time = reale Zeit der ältesten served Kerze (Wanduhr-Konvention:
+        MT5/Epochs sind bereits Berlin-Wanduhr-encoded, kein Offset – vgl.
+        02_time_utils.js / check_broker_tz.py).
+        """
+        self.time_cont_to_real.clear()
+        self.time_real_to_cont.clear()
+        candles = self.candles
+        if not candles:
+            return
+        base = candles[0]["time"]
+        for i, c in enumerate(candles):
+            cont = base + i * self.tf_seconds
+            real = int(c["time"])
+            self.time_cont_to_real[cont] = real
+            self.time_real_to_cont[real] = cont
+
+    def _rebuild_df(self) -> None:
+        """Baut `self.df` aus Warmup-Vorlauf + served Kerzen neu auf (D5)."""
+        combined = list(self._warmup_candles) + list(self.candles)
+        if not combined:
+            self.df = None
+            return
+        self.df = pd.DataFrame(combined)
 
 ```
 
@@ -18171,7 +19030,9 @@ function syncRanges() {
     try {
         var lr = chart.timeScale().getVisibleLogicalRange();
         if (lr && lr.from !== null && lr.to !== null && !isNaN(lr.from) && !isNaN(lr.to)) {
-            pyBridge.onRangeChanged(Math.floor(lr.from), Math.floor(lr.to));
+            // P16.07 (D10): Gesamt-Kerzenzahl mitliefern, damit Python den
+            // Viewport offsetbasiert (Abstand vom rechten Rand) persistieren kann.
+            pyBridge.onRangeChanged(Math.floor(lr.from), Math.floor(lr.to), rawCandleData.length);
         }
         var pr = chart.priceScale('right').getVisibleRange();
         if (pr && pr.from !== null && pr.to !== null && !isNaN(pr.from) && !isNaN(pr.to)) {
@@ -18268,6 +19129,10 @@ function updateLiveCandle(json) {
         if (c.timeframe !== undefined && c.timeframe !== null && c.timeframe !== currentTimeframe) return;
         if (c.open === null || c.high === null || c.low === null || c.close === null) return;
         if (rawCandleData.length > 0 && c.time < rawCandleData[rawCandleData.length-1].time) return;
+        // P16.07 (D9): Befindet sich der Viewport in der Historie (nicht am
+        // Live-Ende), wird der Tick unterdrückt (stummer Tier-2-Update) –
+        // der Scroll-Fokus zuckt nicht. Der „Live"-Button springt zurück.
+        if (window._isHistoryView && window._isHistoryView()) return;
         candleSeries.update(c);
         lastClosePrice = c.close;
         updateCountdownDisplay();
@@ -18515,6 +19380,9 @@ function applyFullChartUpdate(data) {
         }
         rawCandleData = validCandles;
         lastClosePrice = validCandles[validCandles.length - 1].close;
+        // P16.07 (Two-Tier): State-Reset für Nachlade-/Live-System
+        // (hasMoreHistory D8, _atLiveEdge D9, Request-Serial D4, Live-Button).
+        try { if (window._onFullChartUpdateApplied) window._onFullChartUpdateApplied(data); } catch(e) {}
         // P16.05 (P-C3): Circle-Cache für Merged-Render aus dem generischen
         // Render-Payload (chartRenderPayload.hit_circles) statt gridCircles.
         var renderPayload = (typeof data.chartRenderPayload === 'string')
@@ -18533,6 +19401,9 @@ function applyFullChartUpdate(data) {
                     try { updateCountdownDisplay(); } catch(e) {}
                     try { DaySeparator.updatePositions(); } catch(e) {}
                     try { Measurement.updatePositions(); } catch(e) {}
+                    // P16.07 (D7/D9): Live-Ende-Detektion + Nachlade-Trigger
+                    // (< 100 Kerzen links, debounced) via Two-Tier-Modul.
+                    try { if (window._onVisibleRangeChanged) window._onVisibleRangeChanged(); } catch(e) {}
                 }
             });
 
@@ -19007,6 +19878,259 @@ var Measurement = (function() {
 
 --------------------------------------------------
 
+### DATEI: chart/js/06_two_tier.js
+```js
+// chart/js/06_two_tier.js
+// Phase 16.07 – Two-Tier Caching & Dynamic Range Management (JS-Tier)
+//
+// D1/D3/D4/D5/D7/D8/D9/D10 – Sliding Window auf der JS-Seite:
+//   * Tier-1-Fenster N = 1000 (initial + Chunk-Grösse), linke Kante wird
+//     beim Scrollen dynamisch erweitert (kein Full-Chart-Rebuild).
+//   * Trigger (D7): < 100 verbleibende Kerzen links im Canvas -> Request an
+//     Python (pyBridge.onRequestOlderData), debounced mit 300 ms.
+//   * Antwort (D4): applyOlderDataChunk(payload) mit updateId (Request-Serial,
+//     Race-Guard), candles (Prepend), timeMapDelta, chartRenderPayloadDelta,
+//     windowRightEpoch (Sliding-Window-Kante), hasMoreHistory (D8).
+//   * Die Candles werden vorne angehängt (setData, KEIN chart.remove()/
+//     createChart), die logische Range um +k verschoben -> Viewport bleibt
+//     stabil (kein Sprung).
+//   * Linien/Marker (D5): Python sendet das VOLLSTÄNDIG neu berechnete
+//     Render-Payload für das aktuelle Fenster; JS ersetzt per renderLineSeries
+//     / renderMarkers (bestehende inkrementelle Serien-Registry, kein
+//     Full-Layer-Rebuild).
+//   * Live-Ticks (D9): Befindet sich der Viewport nicht am rechten Rand
+//     (_atLiveEdge == false), wird updateLiveCandle() in 04_live_updates.js
+//     unterdrückt (stummer Tier-2-Update); ein dezenter „Live"-Button springt
+//     bei Klick ans Live-Ende (Python-Full-Refresh via onJumpToLive).
+//   * D10: syncRanges liefert zusätzlich die Gesamt-Kerzenzahl, damit Python
+//     den Viewport offsetbasiert (Abstand vom rechten Rand) persistieren kann.
+//
+// Dieses Modul wird NACH 04_live_updates.js geladen (chart_basics.JS_FILES)
+// und hängt sich über optionale Hooks in 04 ein:
+//   window._onFullChartUpdateApplied(data) – State-Reset nach Full-Update
+//   window._onVisibleRangeChanged()        – Range-Änderung (Live-Detektion +
+//                                            Nachlade-Trigger)
+//   window._isHistoryView()                – Live-Tick-Suppression (D9)
+
+// =============================================================================
+// Konstanten (D1/D7)
+// =============================================================================
+const TIER1_WINDOW = 1000;        // N: Tier-1-Fenster-/Chunk-Grösse (D1)
+const LEFT_EDGE_THRESHOLD = 100;  // D7: < 100 verbleibende Kerzen im Canvas
+const OLDER_REQUEST_DEBOUNCE_MS = 300; // D7: JS-Debounce
+
+// =============================================================================
+// Zustand (durch applyFullChartUpdate via Hook zurückgesetzt)
+// =============================================================================
+let _hasMoreHistory = true;       // D8: Stop-Flag (kein Endlos-Loop)
+let _atLiveEdge = true;           // D9: Viewport am rechten Rand (Live)
+let _requestSerial = 0;           // monoton steigendes Request-Serial (D4)
+let _pendingRequestSerial = 0;    // letztes an Python gesendetes Serial
+let _olderRequestTimer = null;    // JS-Debounce-Timer (D7)
+
+// =============================================================================
+// Live-Button (D9) – dezenter Overlay-Button, nur in der Historie sichtbar
+// =============================================================================
+function _updateLiveButton() {
+    var btn = document.getElementById('live-button');
+    if (!btn) return;
+    btn.style.display = _atLiveEdge ? 'none' : 'block';
+}
+
+var _liveButtonEl = document.getElementById('live-button');
+if (_liveButtonEl) {
+    _liveButtonEl.addEventListener('click', function() {
+        try {
+            if (pyBridge && pyBridge.onJumpToLive) pyBridge.onJumpToLive();
+        } catch(e) {}
+    });
+}
+
+// =============================================================================
+// Hook: Full-Update angewendet (04_live_updates.js ruft optional auf)
+// =============================================================================
+function _onFullChartUpdateApplied(data) {
+    _hasMoreHistory = (data && data.hasMoreHistory !== false);
+    _atLiveEdge = true;
+    _requestSerial = 0;
+    _pendingRequestSerial = 0;
+    if (_olderRequestTimer) { clearTimeout(_olderRequestTimer); _olderRequestTimer = null; }
+    _updateLiveButton();
+}
+
+// =============================================================================
+// Hook: sichtbare logische Range geändert (04_live_updates.js ruft optional auf)
+// =============================================================================
+function _onVisibleRangeChanged() {
+    try {
+        var lr = chart.timeScale().getVisibleLogicalRange();
+        if (lr && lr.from !== null && lr.to !== null && !isNaN(lr.from) && !isNaN(lr.to)) {
+            // D9: Live-Ende, wenn die rechte Viewport-Kante nahe dem Datenende liegt.
+            _atLiveEdge = (rawCandleData.length > 0 && lr.to >= rawCandleData.length - 5);
+            _updateLiveButton();
+        }
+    } catch(e) {}
+    _maybeRequestOlderData();
+}
+
+// =============================================================================
+// D7: Nachlade-Trigger (debounced, < 100 Kerzen links im Canvas)
+// =============================================================================
+function _maybeRequestOlderData() {
+    if (!pyBridge || !chart || !rawCandleData || rawCandleData.length === 0) return;
+    if (!_hasMoreHistory) return;   // D8: Stop-Flag
+    if (isUpdatingChart) return;
+    try {
+        var lr = chart.timeScale().getVisibleLogicalRange();
+        if (!lr || lr.from === null || isNaN(lr.from)) return;
+        if (lr.from > LEFT_EDGE_THRESHOLD) return;
+
+        var leftReal = toReal(rawCandleData[0].time);
+        var rightReal = toReal(rawCandleData[rawCandleData.length - 1].time);
+
+        // Debounce (300 ms): nur der letzte Request innerhalb des Fensters.
+        if (_olderRequestTimer) clearTimeout(_olderRequestTimer);
+        _pendingRequestSerial = ++_requestSerial;
+        var serial = _pendingRequestSerial;
+        var fromEpoch = leftReal;
+        var count = TIER1_WINDOW;
+        var winRight = rightReal;
+        _olderRequestTimer = setTimeout(function() {
+            _olderRequestTimer = null;
+            try {
+                if (pyBridge && pyBridge.onRequestOlderData) {
+                    pyBridge.onRequestOlderData(fromEpoch, count, serial, winRight);
+                }
+            } catch(e) {}
+        }, OLDER_REQUEST_DEBOUNCE_MS);
+    } catch(e) {}
+}
+
+// =============================================================================
+// D4: Chunk-Antwort aus Python – inkrementelles Prepend (Sliding Window)
+// =============================================================================
+function applyOlderDataChunk(payload) {
+    if (!payload || typeof payload !== 'object') return;
+    // Race-Guard 1 (D4): nur der NEUESTE Request wird angewendet (doppelte
+    // Requests bei schnellem Scrollen / verspätete Antworten).
+    if (typeof payload.updateId === 'number' && payload.updateId !== _pendingRequestSerial) {
+        console.warn('[TwoTier] Veraltete Chunk-Antwort verworfen (id=' + payload.updateId + ' != ' + _pendingRequestSerial + ')');
+        return;
+    }
+    // Race-Guard 2: Chunk aus einem früheren Symbol/TF-Stand verwerfen.
+    if (payload.symbol !== undefined && payload.symbol !== null && payload.symbol !== currentSymbol) return;
+    if (payload.timeframe !== undefined && payload.timeframe !== null && payload.timeframe !== currentTimeframe) return;
+
+    var newCandles = payload.candles || [];
+    var k = newCandles.length;
+    _hasMoreHistory = (payload.hasMoreHistory !== false);  // D8
+    if (k === 0) {
+        // Keine ältere Geschichte mehr (DB-Ende) – Stop-Flag gesetzt.
+        return;
+    }
+
+    try {
+        // Aktuelle logische Range VOR dem Prepend merken (Viewport-Stabilität).
+        var lr = null;
+        try { lr = chart.timeScale().getVisibleLogicalRange(); } catch(e) {}
+
+        // TimeMap erweitern: nur NEUE Einträge (bestehende cont-Zeiten bleiben
+        // unverändert, daher bleibt der Chart-Zeitstrahl konsistent).
+        var delta = payload.timeMapDelta || {};
+        for (var key in delta) {
+            if (Object.prototype.hasOwnProperty.call(delta, key)) {
+                var cKey = Number(key);
+                _continuousTimeMap[cKey] = delta[key];
+                _realToContMap[delta[key]] = cKey;
+            }
+        }
+        _continuousKeys = Object.keys(_continuousTimeMap).map(Number).sort(function(a, b) { return a - b; });
+
+        // Candles vorne anhängen (aufsteigend, kontinuierliche Zeit).
+        rawCandleData = newCandles.concat(rawCandleData);
+
+        // Sliding Window (D2): Rechte Kante ggf. kürzen, falls der Tier-2-
+        // Puffer nach links geschoben wurde (windowRightEpoch < bisheriges
+        // Fenster-Ende). Sonst bleibt das Live-Ende erhalten.
+        if (payload.windowRightEpoch && payload.windowRightEpoch > 0) {
+            var rightCont = toCont(payload.windowRightEpoch);
+            if (rightCont !== undefined && rawCandleData.length) {
+                var lastCont = rawCandleData[rawCandleData.length - 1].time;
+                if (lastCont > rightCont) {
+                    var keepIdx = 0;
+                    for (var i = 0; i < rawCandleData.length; i++) {
+                        if (rawCandleData[i].time <= rightCont) keepIdx = i + 1;
+                    }
+                    var dropped = rawCandleData.slice(keepIdx);
+                    rawCandleData = rawCandleData.slice(0, keepIdx);
+                    for (var d = 0; d < dropped.length; d++) {
+                        var dCont = dropped[d].time;
+                        var dReal = _continuousTimeMap[dCont];
+                        if (dReal !== undefined) {
+                            delete _continuousTimeMap[dCont];
+                            delete _realToContMap[dReal];
+                        }
+                    }
+                    _continuousKeys = Object.keys(_continuousTimeMap).map(Number).sort(function(a, b) { return a - b; });
+                }
+            }
+        }
+
+        // Candle-Serie ersetzen – KEIN chart.remove()/createChart (kein Sprung).
+        candleSeries.setData(rawCandleData);
+
+        // D5: Render-Delta anwenden – Python sendet das VOLLSTÄNDIG neu
+        // berechnete Fenster-Payload; JS ersetzt Linien/Marker nahtlos über
+        // die bestehenden inkrementellen Serien-Registrys.
+        var rp = payload.chartRenderPayloadDelta || {};
+        if (rp.lines) {
+            try { renderLineSeries(rp.lines); } catch(e) {
+                console.warn('[TwoTier] lines fehlgeschlagen:', e.message || e);
+            }
+        }
+        if (rp.hit_circles) {
+            _gridCirclesCache = rp.hit_circles.slice();
+            _lastLiveCirclesJson = '[]';
+            try { renderMarkers(_gridCirclesCache); } catch(e) {
+                console.warn('[TwoTier] hit_circles fehlgeschlagen:', e.message || e);
+            }
+        }
+
+        // DaySeparator neu berechnen (Tagesgrenzen im vorderen Bereich).
+        try { DaySeparator.render(rawCandleData); } catch(e) {}
+
+        // Viewport stabil halten: logische Range um k nach rechts verschieben
+        // (die bestehenden Kerzen sind durch das Prepend um k Indizes gerutscht).
+        if (lr && lr.from !== null && lr.to !== null && !isNaN(lr.from) && !isNaN(lr.to)) {
+            var newFrom = lr.from + k;
+            var newTo = lr.to + k;
+            if (newTo > rawCandleData.length - 1) newTo = rawCandleData.length - 1;
+            if (newFrom > newTo) newFrom = newTo;
+            if (newFrom < 0) newFrom = 0;
+            try { chart.timeScale().setVisibleLogicalRange({ from: newFrom, to: newTo }); } catch(e) {}
+        }
+
+        // Nun in der Historie (nicht am Live-Ende) – D9: Ticks stumm.
+        _atLiveEdge = false;
+        _updateLiveButton();
+
+        try { syncRanges(); } catch(e) {}
+    } catch(e) {
+        console.error('[TwoTier] applyOlderDataChunk Error:', e.message || e);
+    }
+}
+
+// =============================================================================
+// D9: Live-Tick-Suppression – 04_live_updates.js fragt optional ab
+// =============================================================================
+function _isHistoryView() {
+    return _atLiveEdge === false;
+}
+
+```
+
+--------------------------------------------------
+
 ### DATEI: chart/overlays/__init__.py
 ```py
 # chart/overlays/__init__.py
@@ -19230,10 +20354,10 @@ class MarkerStyle:
 # re-exportiert (rueckwaertskompatibler Importweg). StylePickerWidget selbst
 # importiert sie bereits direkt aus den overlays.
 from chart.overlays.style_models import LineStyle, MarkerStyle
-from .style_picker_widget import StylePickerWidget
+from .style_picker_widget import StylePickerDialog, StylePickerWidget
 from .named_item_actions import NamedItemActionsMixin, NamedItemAdapter
 
-__all__ = ["LineStyle", "MarkerStyle", "StylePickerWidget", "NamedItemActionsMixin", "NamedItemAdapter"]
+__all__ = ["LineStyle", "MarkerStyle", "StylePickerDialog", "StylePickerWidget", "NamedItemActionsMixin", "NamedItemAdapter"]
 
 ```
 
@@ -19452,49 +20576,66 @@ class NamedItemActionsMixin:
 # Phase 16 (06.08.2026): Generischer Stil-Waehler - ersetzt ColorButton
 # (chart/widgets/color_button.py).
 #
-# Der bisherige ColorButton war ein reiner Farbwaehler (Phase 13 Kapitel 5.5).
-# Das StylePickerWidget buendelt zentral:
-#   1. QCheckBox      -> Sichtbarkeit (show)
-#   2. Farb-Button    -> Farbe (color) via QColorDialog (optional mit Alpha)
-#   3. QSpinBox       -> Linienstaerke (width, 1-10) bzw. Markergroesse (size)
-#   4. QComboBox      -> Linienart (style: solid/dashed/dotted/dashdotted)
-#                        bzw. Marker-Form (shape: circle/square/arrowUp/arrowDown)
+# Phase 16.06.01 (07.08.2026): Popover StylePickerDialog & Button-Only-Cleanup.
+# Das bisherige Inline-Composite (QCheckBox + Farb-Button + QSpinBox +
+# QComboBox direkt in der Formularzeile) wurde entfernt: Das StylePickerWidget
+# besteht jetzt AUSSCHLIESSLICH aus einem kompakten QPushButton (Farb-Swatch
+# als Icon + Vorschau-Text, z.B. '● 2px Solid' bzw. '● Circle'). Erst ein
+# Klick oeffnet den modalen StylePickerDialog (exec):
+#   * Oberer Bereich: kompaktes Custom-Color-Grid (TradingView-Palette +
+#     Hex/RGB-Eingabe + Transparenz-Slider 0-100% + [Anpassen...]-Fallback
+#     auf QColorDialog.getColor()). KEIN QColorDialog(Qt.Widget).
+#   * QFrame.HLine-Trennlinie.
+#   * Unterer Bereich (QFormLayout): Zeichnungsparameter (style_type='line':
+#     Linienstaerke 1-10 px + Linienart solid/dashed/dotted/dashdotted;
+#     style_type='marker': Markergroesse 1-20 px + Markerform
+#     circle/square/arrowUp/arrowDown). Optional 'sichtbar'-Checkbox, wenn
+#     show_visibility=True.
+#   * QDialogButtonBox [Abbrechen] / [Übernehmen].
+# Bei color_only=True werden Trennlinie und unterer Bereich per
+# setVisible(False) ausgeblendet und der Dialog auf die reine Farbwahl
+# verkleinert.
 #
-# Phase 16 P16.03 (06.08.2026): Die Style-Vertraege LineStyle/MarkerStyle
-# leben jetzt zentral in `chart/overlays/style_models.py` (to_js_dict /
-# to_dict / from_dict). Das Widget unterstuetzt beide Typen ueber den
-# Konstruktor-Parameter `style_type`:
-#   * style_type="line"   -> get_style()/set_style() arbeiten mit LineStyle
-#   * style_type="marker" -> get_style()/set_style() arbeiten mit MarkerStyle
+# SCHNITTSTELLEN-INVARIANTE (Refactoring-Anweisung 16.06.01, Kapitel 5):
+# Die Fassade von StylePickerWidget bleibt 1:1 erhalten, damit
+# indicator_dialog.py (get_style/set_style/set_color, style_type/color_only/
+# show_visibility, Signal style_changed, innerer Zugriff
+# ctrl.get_style().color) unveraendert weiterlaeuft:
+#   * Methoden: get_style(), set_style(obj), set_color(color_str), color()
+#   * Properties: style_type ("line"|"marker"), color_only (bool),
+#     show_visibility (bool)
+#   * Signal: style_changed(object) - emittiert bei Uebernahme im Dialog das
+#     aktualisierte LineStyle- bzw. MarkerStyle-Objekt.
 #
-# API: get_style() -> LineStyle|MarkerStyle, set_style(...),
-#      set_color(str) fuer reine Farb-Updates (Dialog-Restore-Pfad).
-# Signal: style_changed = Signal(object) - emittiert das aktuelle Style-Objekt.
+# Die Style-Vertraege LineStyle/MarkerStyle leben zentral in
+# `chart/overlays/style_models.py` (to_js_dict / to_dict / from_dict).
 #
-# Farb-Logik (Paritaet zum Alt-ColorButton):
+# Farb-Logik (Paritaet zum Alt-ColorButton / Inline-Composite):
 #   - Alpha == 255 -> '#RRGGBB' (Hex, Grossbuchstaben, volle Deckkraft).
 #   - Alpha < 255  -> 'rgba(r, g, b, a)' mit a als Float (0..1) -
 #                     1:1 kompatibel mit TradingView Lightweight Charts v5
 #                     (WebEngine) und HTML/CSS.
-#   - QColorDialog.ShowAlphaChannel schaltet den Deckkraft-Slider frei.
-#
-# HINWEIS (06.08.2026): Der Indikator-Pfad (fixed_grid_proximity.py) liefert
-# style-Werte in Schreibweise "Solid" (capitalized). Die Style-Vertraege
-# verwenden gemaeSS P16.03 lowercase-Werte (solid/dashed/dotted/dashdotted).
-# Eine Vereinheitlichung erfolgt bei der Indikator-Anbindung (Schritt 3).
 
 from typing import Optional, Union
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QColorDialog,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QFrame,
+    QGridLayout,
     QHBoxLayout,
+    QLabel,
+    QLineEdit,
     QPushButton,
-    QSizePolicy,
+    QSlider,
     QSpinBox,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -19506,28 +20647,396 @@ from chart.overlays.style_models import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Modul-Helfer (Palette + Farb-Konvertierung)
+# ---------------------------------------------------------------------------
+
+#: Kompakte Schnell-Auswahl-Palette (TradingView-Standardfarben).
+_PALETTE_COLORS: list = [
+    "#2962FF", "#089981", "#FF6D00", "#F23645",
+    "#B47157", "#FF9800", "#FFEB3B", "#787B86",
+    "#E91E63", "#9C27B0", "#3F51B5", "#009688",
+    "#4CAF50", "#FF5722", "#795548", "#607D8B",
+]
+
+
+def _format_color(color: QColor) -> str:
+    """Farb-String aus einem QColor (Paritaet zum Alt-ColorButton):
+    Alpha == 255 -> '#RRGGBB' (Hex, Grossbuchstaben), sonst
+    'rgba(r, g, b, a)' mit a als Float (0..1, LWC-v5-kompatibel).
+    """
+    if not color.isValid():
+        return "#000000"
+    if color.alpha() < 255:
+        a = round(color.alpha() / 255.0, 2)
+        return f"rgba({color.red()}, {color.green()}, {color.blue()}, {a})"
+    return color.name().upper()
+
+
+def _parse_color(color_str: str) -> Optional[QColor]:
+    """Parst Hex- oder rgba(...)-Strings in ein QColor (oder None)."""
+    s = (color_str or "").strip()
+    if not s:
+        return None
+    low = s.lower()
+    if low.startswith("rgba("):
+        try:
+            inner = s[s.index("(") + 1:s.rindex(")")]
+            parts = [p.strip() for p in inner.split(",")]
+            if len(parts) != 4:
+                return None
+            r = int(round(float(parts[0])))
+            g = int(round(float(parts[1])))
+            b = int(round(float(parts[2])))
+            a_frac = float(parts[3])
+        except (ValueError, TypeError):
+            return None
+        r = max(0, min(255, r))
+        g = max(0, min(255, g))
+        b = max(0, min(255, b))
+        alpha = max(0, min(255, int(round(a_frac * 255))))
+        return QColor(r, g, b, alpha)
+    c = QColor(s)
+    return c if c.isValid() else None
+
+
+# ---------------------------------------------------------------------------
+# StylePickerDialog (modaler Popover)
+# ---------------------------------------------------------------------------
+
+class StylePickerDialog(QDialog):
+    """Modaler Popover-Dialog fuer den StylePicker (Phase 16.06.01).
+
+    Vertikal zweigeteilt:
+      1. **Oberer Bereich:** kompaktes Custom-Color-Grid (Palette-Schnellwahl
+         + Hex/RGB-Eingabefeld + Transparenz-Slider 0-100% +
+         [Anpassen...]-Fallback auf QColorDialog.getColor()).
+      2. **Trennlinie:** QFrame.HLine (Sunken).
+      3. **Unterer Bereich (QFormLayout):** Zeichnungsparameter.
+         * style_type='line':  Linienstaerke (QSpinBox 1-10 px) + Linienart
+           (QComboBox: solid/dashed/dotted/dashdotted).
+         * style_type='marker': Markergroesse (QSpinBox 1-20 px) +
+           Markerform (QComboBox: circle/square/arrowUp/arrowDown).
+         * Optional 'sichtbar'-Checkbox, wenn show_visibility=True.
+      4. **Buttons:** QDialogButtonBox [Abbrechen] / [Übernehmen].
+
+    Bei color_only=True werden Trennlinie und unterer Bereich per
+    setVisible(False) ausgeblendet und der Dialog auf die reine Farbwahl
+    verkleinert (adjustSize).
+
+    get_style() liefert nach Uebernahme (accept) ein frisches
+    LineStyle-/MarkerStyle-Objekt mit allen uebernommenen Werten.
+    """
+
+    def __init__(
+        self,
+        style: Optional[Union[LineStyle, MarkerStyle]] = None,
+        style_type: str = "line",
+        color_only: bool = False,
+        enable_alpha: bool = True,
+        show_visibility: bool = True,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._style_type: str = "marker" if style_type == "marker" else "line"
+        self._color_only: bool = bool(color_only)
+        self._enable_alpha: bool = bool(enable_alpha)
+        self._show_visibility: bool = bool(show_visibility)
+
+        # Arbeitskopie des Style-Objekts (Typ passend zum Modus).
+        if self._style_type == "marker":
+            self._style: MarkerStyle = (
+                style if isinstance(style, MarkerStyle) else MarkerStyle()
+            )
+        else:
+            self._style: LineStyle = (
+                style if isinstance(style, LineStyle) else LineStyle()
+            )
+        self._color: QColor = QColor()
+
+        self.setWindowTitle("Farbe & Stil" if not self._color_only else "Farbe")
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        # --- Oberer Bereich: Farbe -----------------------------------------
+        layout.addLayout(self._build_color_area())
+
+        # --- Trennlinie ----------------------------------------------------
+        self._separator = QFrame()
+        self._separator.setFrameShape(QFrame.HLine)
+        self._separator.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(self._separator)
+
+        # --- Unterer Bereich: Zeichnungsparameter --------------------------
+        self._params_widget = self._build_params_widget()
+        layout.addWidget(self._params_widget)
+
+        # --- Buttons -------------------------------------------------------
+        self._button_box = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        ok_btn = self._button_box.button(QDialogButtonBox.Ok)
+        cancel_btn = self._button_box.button(QDialogButtonBox.Cancel)
+        ok_btn.setText("Übernehmen")
+        cancel_btn.setText("Abbrechen")
+        self._button_box.accepted.connect(self.accept)
+        self._button_box.rejected.connect(self.reject)
+        layout.addWidget(self._button_box)
+
+        # --- Initialwerte aus dem uebergebenen Style ------------------------
+        self._apply_style_to_ui(self._style)
+        self._set_color_internal(self._style.color)
+
+        # --- color_only: Trennlinie + unterer Bereich ausblenden, kompakt ---
+        if self._color_only:
+            self._separator.setVisible(False)
+            self._params_widget.setVisible(False)
+        self.adjustSize()
+
+    # ------------------------------------------------------------------
+    # UI-Aufbau
+    # ------------------------------------------------------------------
+
+    def _build_color_area(self) -> QVBoxLayout:
+        """Oberer Farbbereich: Palette-Grid + Hex/RGB-Eingabe + Alpha-Slider.
+
+        Bewusst KEIN QColorDialog(Qt.Widget)-Trick: Der native Dialog zeigt
+        unter Windows 11 / Qt 6 Rendering-Macken und einen grossen Footprint.
+        Der [Anpassen...]-Button oeffnet QColorDialog.getColor() nur als
+        modalen Fallback.
+        """
+        area = QVBoxLayout()
+        area.setSpacing(6)
+
+        # 1) Palette-Grid (TradingView-Schnellwahl, Quick-Click)
+        grid = QGridLayout()
+        grid.setSpacing(3)
+        for i, hex_color in enumerate(_PALETTE_COLORS):
+            btn = QPushButton()
+            btn.setFixedSize(22, 22)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(hex_color)
+            btn.setStyleSheet(
+                f"QPushButton {{ background-color: {hex_color}; "
+                f"border: 1px solid #555555; border-radius: 3px; }}")
+            btn.clicked.connect(
+                lambda _=False, c=hex_color: self._set_color_internal(c))
+            grid.addWidget(btn, i // 8, i % 8)
+        area.addLayout(grid)
+
+        # 2) Vorschau-Swatch + Hex/RGB-Eingabe + [Anpassen...]
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self._preview = QLabel()
+        self._preview.setObjectName("StylePickerPreview")
+        self._preview.setFixedSize(40, 24)
+        self._preview.setAlignment(Qt.AlignCenter)
+        self._preview.setToolTip("Aktuelle Farbe")
+        row.addWidget(self._preview)
+
+        self._hex_edit = QLineEdit()
+        self._hex_edit.setPlaceholderText("#RRGGBB / rgb(r,g,b)")
+        self._hex_edit.setToolTip("Exakter Farbcode (Hex oder rgb/rgba)")
+        self._hex_edit.editingFinished.connect(self._on_hex_edited)
+        row.addWidget(self._hex_edit, 1)
+
+        self._custom_btn = QPushButton("Anpassen...")
+        self._custom_btn.setToolTip("System-Farbpalette öffnen (QColorDialog)")
+        self._custom_btn.clicked.connect(self._open_custom_color_dialog)
+        row.addWidget(self._custom_btn)
+        area.addLayout(row)
+
+        # 3) Transparenz-Slider (0-100 %)
+        self._alpha_container = QWidget()
+        alpha_layout = QHBoxLayout(self._alpha_container)
+        alpha_layout.setContentsMargins(0, 0, 0, 0)
+        alpha_layout.setSpacing(6)
+        alpha_layout.addWidget(QLabel("Transparenz:"))
+        self._alpha_slider = QSlider(Qt.Horizontal)
+        self._alpha_slider.setRange(0, 100)
+        self._alpha_slider.setToolTip(
+            "Transparenz (0% = deckend, 100% = unsichtbar)")
+        self._alpha_slider.valueChanged.connect(self._on_alpha_changed)
+        alpha_layout.addWidget(self._alpha_slider, 1)
+        self._alpha_label = QLabel("0%")
+        self._alpha_label.setFixedWidth(36)
+        alpha_layout.addWidget(self._alpha_label)
+        # enable_alpha=False: Slider ausblenden (Schema-Flag 'allow_alpha').
+        self._alpha_container.setVisible(self._enable_alpha)
+        area.addWidget(self._alpha_container)
+
+        return area
+
+    def _build_params_widget(self) -> QWidget:
+        """Unterer Bereich: Zeichnungsparameter (width|size + style|shape).
+
+        Optional eine 'sichtbar'-Checkbox (show_visibility=True), wenn die
+        Sichtbarkeit nicht ueber einen separaten 'show_*'-Parameter laeuft.
+        """
+        w = QWidget()
+        form = QFormLayout(w)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(6)
+
+        self._show_check = QCheckBox("sichtbar")
+        self._show_check.setToolTip(
+            "Element anzeigen" if self._style_type == "line"
+            else "Marker anzeigen")
+        if self._show_visibility:
+            form.addRow("", self._show_check)
+
+        self._param_spin = QSpinBox()
+        if self._style_type == "marker":
+            self._param_spin.setRange(1, 20)
+            self._param_spin.setSuffix(" px")
+            self._param_spin.setToolTip("Markergröße in Pixel")
+            form.addRow("Markergröße:", self._param_spin)
+        else:
+            self._param_spin.setRange(1, 10)
+            self._param_spin.setSuffix(" px")
+            self._param_spin.setToolTip("Linienstärke in Pixel")
+            form.addRow("Linienstärke:", self._param_spin)
+
+        self._param_combo = QComboBox()
+        if self._style_type == "marker":
+            self._param_combo.addItems(list(MARKER_SHAPES))
+            self._param_combo.setToolTip("Marker-Form")
+            form.addRow("Markerform:", self._param_combo)
+        else:
+            self._param_combo.addItems(list(LINE_STYLES))
+            self._param_combo.setToolTip("Linienart")
+            form.addRow("Linienart:", self._param_combo)
+
+        return w
+
+    # ------------------------------------------------------------------
+    # Oeffentliche API
+    # ------------------------------------------------------------------
+
+    def get_style(self) -> Union[LineStyle, MarkerStyle]:
+        """Liefert den aktuell im Dialog eingestellten Stil als NEUES Objekt.
+
+        Beruecksichtigt Farbe (inkl. Transparenz), width|size und style|shape
+        sowie - falls show_visibility=True - den Zustand der
+        'sichtbar'-Checkbox.
+        """
+        show = (self._show_check.isChecked()
+                if self._show_visibility else bool(self._style.show))
+        if self._style_type == "marker":
+            return MarkerStyle(
+                show=show,
+                color=self._color_str(),
+                shape=str(self._param_combo.currentText()),
+                size=int(self._param_spin.value()),
+            )
+        return LineStyle(
+            show=show,
+            color=self._color_str(),
+            width=int(self._param_spin.value()),
+            style=str(self._param_combo.currentText()),
+        )
+
+    # ------------------------------------------------------------------
+    # Intern
+    # ------------------------------------------------------------------
+
+    def _apply_style_to_ui(
+        self, style: Union[LineStyle, MarkerStyle]
+    ) -> None:
+        """Uebernimmt ein Style-Objekt in die Dialog-Controls."""
+        if self._style_type == "marker" and isinstance(style, MarkerStyle):
+            self._show_check.setChecked(bool(style.show))
+            self._param_spin.setValue(int(style.size))
+            self._param_combo.setCurrentText(
+                style.shape if style.shape in MARKER_SHAPES else "circle")
+        elif self._style_type == "line" and isinstance(style, LineStyle):
+            self._show_check.setChecked(bool(style.show))
+            self._param_spin.setValue(int(style.width))
+            self._param_combo.setCurrentText(
+                style.style if style.style in LINE_STYLES else "solid")
+
+    def _set_color_internal(self, color_str: str) -> None:
+        """Setzt die Farbe aus einem Hex-/rgba()-String (ungueltig -> ignoriert)."""
+        parsed = _parse_color(color_str)
+        if parsed is not None:
+            self._set_color_qcolor(parsed)
+
+    def _set_color_qcolor(self, color: QColor) -> None:
+        """Uebernimmt ein QColor in Hex-Feld, Alpha-Slider und Vorschau."""
+        self._color = QColor(color)
+        self._hex_edit.blockSignals(True)
+        self._hex_edit.setText(_format_color(self._color))
+        self._hex_edit.blockSignals(False)
+        transparency = 100 - int(round(self._color.alpha() * 100 / 255))
+        self._alpha_slider.blockSignals(True)
+        self._alpha_slider.setValue(transparency)
+        self._alpha_slider.blockSignals(False)
+        self._alpha_label.setText(f"{transparency}%")
+        self._update_preview()
+
+    def _color_str(self) -> str:
+        """Aktuelle Dialog-Farbe als String (hex/rgba, Paritaet)."""
+        return _format_color(getattr(self, "_color", QColor()))
+
+    def _update_preview(self) -> None:
+        """Setzt das Vorschau-Swatch auf die aktuelle Farbe inkl. Deckkraft."""
+        c = self._color if self._color.isValid() else QColor("#000000")
+        self._preview.setStyleSheet(
+            "QLabel#StylePickerPreview { background-color: "
+            f"rgba({c.red()}, {c.green()}, {c.blue()}, {c.alpha() / 255.0}); "
+            "border: 1px solid #555555; border-radius: 3px; }"
+        )
+
+    def _on_hex_edited(self) -> None:
+        """Hex/RGB-Eingabe: gueltiger Farbcode wird uebernommen."""
+        parsed = _parse_color(self._hex_edit.text())
+        if parsed is not None:
+            self._set_color_qcolor(parsed)
+
+    def _on_alpha_changed(self, value: int) -> None:
+        """Transparenz-Slider (0-100%) -> Alpha-Kanal (255-0)."""
+        self._alpha_label.setText(f"{value}%")
+        c = QColor(self._color)
+        c.setAlpha(int(round((100 - value) * 255 / 100)))
+        self._set_color_qcolor(c)
+
+    def _open_custom_color_dialog(self) -> None:
+        """Fallback: modaler QColorDialog.getColor() (optional mit Alpha)."""
+        options = QColorDialog.ColorDialogOption(0)
+        if self._enable_alpha:
+            options |= QColorDialog.ColorDialogOption.ShowAlphaChannel
+        chosen = QColorDialog.getColor(
+            self._color, self, "Farbe anpassen", options)
+        if chosen.isValid():
+            self._set_color_qcolor(chosen)
+
+
+# ---------------------------------------------------------------------------
+# StylePickerWidget (Button-Only)
+# ---------------------------------------------------------------------------
+
 class StylePickerWidget(QWidget):
-    """Kombinierter Stil-Waehler: Sichtbarkeit + Farbe + Staerke/Groesse + Art.
+    """Kombinierter Stil-Waehler – kompakter Button (Phase 16.06.01).
 
-    Kapselt intern:
-      1. QCheckBox  (Sichtbarkeit `show`) – per `show_visibility=False`
-         ausblendbar (Sichtbarkeit steuert dann ein separater `show_*`-Param)
-      2. kleiner Farb-Button (Farbe `color` via QColorDialog, optional Alpha)
-      3. QSpinBox   (Linienstaerke `width` bzw. Markergroesse `size`)
-      4. QComboBox  (Linienart `style` bzw. Marker-Form `shape`)
+    Das Widget besteht ausschliesslich aus einem QPushButton (Farb-Swatch als
+    Icon + Vorschau-Text, z.B. '● 2px Solid' bzw. '● Circle'). Ein Klick
+    oeffnet den modalen StylePickerDialog (exec); bei Uebernahme wird das
+    geaenderte LineStyle-/MarkerStyle-Objekt uebernommen und style_changed
+    emittiert.
 
-    Signal:
-        style_changed = Signal(object) – emittiert das aktualisierte
-        `LineStyle`- bzw. `MarkerStyle`-Objekt bei jeder Aenderung.
+    SCHNITTSTELLEN-INVARIANTE (16.06.01): Die Fassade bleibt 1:1 gegenueber
+    dem frueheren Inline-Composite erhalten (indicator_dialog.py haengt daran):
+      * get_style()/set_style()/set_color()/color()
+      * Properties style_type, color_only, show_visibility
+      * Signal style_changed(object)
     """
 
     style_changed = Signal(object)
 
-    # Kompakte Festgroesse des Farb-Buttons (Paritaet zum Alt-ColorButton,
-    # Roadmap 5.5.1.2: "festgelegte Kompaktgroesse z. B. 60x24 px" – hier
-    # bewusst kleiner, da das Composite drei weitere Elemente enthaelt).
-    _SWATCH_W = 40
-    _SWATCH_H = 24
+    # Kompakter Button: Swatch-Icon (16x16) + Vorschau-Text.
+    _SWATCH_W = 16
+    _SWATCH_H = 16
 
     def __init__(
         self,
@@ -19540,18 +21049,13 @@ class StylePickerWidget(QWidget):
     ) -> None:
         super().__init__(parent)
         self._enable_alpha: bool = bool(enable_alpha)
-        # color_only (Bugfix 06.08.2026): Reiner Farbwaehler - das Composite
-        # (Sichtbarkeits-Checkbox, Linienstaerke/Groesse, Linienart/Markerform)
-        # wird NICHT angezeigt. Verwendet fuer reine Farb-Parameter (z.B.
-        # Multi-MA ma1_bear_color), deren Sichtbarkeit ein separater 'show_*'-
-        # Parameter steuert. get_style() liefert weiterhin ein Style-Objekt
-        # (Defaults fuer show/width/style) - der Dialog liest nur .color.
+        # color_only: Reiner Farbwaehler - der Dialog zeigt dann NUR den
+        # Farbbereich (Trennlinie + Zeichnungsparameter werden ausgeblendet).
         self._color_only: bool = bool(color_only)
-        # show_visibility (Phase 16.06, 07.08.2026): Blendet die interne
-        # 'sichtbar'-Checkbox aus, wenn die Sichtbarkeit ueber einen separaten
+        # show_visibility: Wenn die Sichtbarkeit ueber einen separaten
         # 'show_*'-Parameter laeuft (Multi-MA: show_maX, FixedGridProximity:
-        # show_lines/show_circles). get_style() liefert dann immer show=True.
-        # Damit entfaellt die doppelte Sichtbarkeits-Steuerung im Dialog.
+        # show_lines/show_circles), zeigt der Dialog KEINE 'sichtbar'-
+        # Checkbox (get_style() liefert dann show=True aus dem Style-Objekt).
         self._show_visibility: bool = bool(show_visibility)
         # style_type: "line" (LineStyle) | "marker" (MarkerStyle)
         self._style_type: str = "marker" if style_type == "marker" else "line"
@@ -19565,80 +21069,30 @@ class StylePickerWidget(QWidget):
             )
         self._color: QColor = QColor()
 
-        # --- Farb-Button ----------------------------------------------------
-        # Eindeutiger ObjectName: Das Stylesheet in _update_swatch() wird ueber
-        # 'QPushButton#StylePickerSwatch' auf DIESEN Button gescoped. Ohne
-        # Scoping wuerde der breite Selektor 'QPushButton' auf alle
-        # Nachkommen-Buttons abfaerben – insbesondere auf die kleinen Buttons
-        # im QColorDialog (wird mit self als Parent geoeffnet).
-        self._color_btn = QPushButton()
-        self._color_btn.setObjectName("StylePickerSwatch")
-        self._color_btn.setFixedSize(self._SWATCH_W, self._SWATCH_H)
-        self._color_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self._color_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._color_btn.setToolTip("Farbe auswählen (inkl. Transparenz)")
+        # --- Einziger sichtbarer Bestandteil: der kompakte Button ------------
+        self._btn = QPushButton()
+        self._btn.setObjectName("StylePickerSwatch")
+        self._btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn.setToolTip(
+            "Stil festlegen (Farbe, Stärke, Art)" if not self._color_only
+            else "Farbe auswählen (inkl. Transparenz)")
+        self._btn.setStyleSheet(
+            "QPushButton#StylePickerSwatch { border: 1px solid #555555; "
+            "border-radius: 3px; padding: 2px 8px; }"
+        )
+        self._btn.clicked.connect(self._open_picker_dialog)
 
-        # --- Sichtbarkeit ---------------------------------------------------
-        self._show_check = QCheckBox("sichtbar")
-        self._show_check.setToolTip("Linie anzeigen" if self._style_type == "line"
-                                    else "Marker anzeigen")
-
-        # --- Staerke / Groesse ---------------------------------------------
-        self._width_spin = QSpinBox()
-        if self._style_type == "marker":
-            self._width_spin.setRange(1, 20)
-            self._width_spin.setToolTip("Markergröße (px)")
-            self._width_spin.setSuffix(" px")
-        else:
-            self._width_spin.setRange(1, 10)
-            self._width_spin.setToolTip("Linienstärke (px)")
-            self._width_spin.setSuffix(" px")
-
-        # --- Linienart / Marker-Form ---------------------------------------
-        self._style_combo = QComboBox()
-        if self._style_type == "marker":
-            self._style_combo.addItems(list(MARKER_SHAPES))
-            self._style_combo.setToolTip("Marker-Form")
-        else:
-            self._style_combo.addItems(list(LINE_STYLES))
-            self._style_combo.setToolTip("Linienart")
-
-        # --- Initialwerte (Signale blockiert, damit keine fruehen Emissionen
-        #     waehrend der Konstruktion ausgeloest werden) --------------------
-        for w in (self._show_check, self._width_spin, self._style_combo):
-            w.blockSignals(True)
-        try:
-            self._apply_style_to_ui(self._style)
-            self._set_color_internal(self._style.color)
-        finally:
-            for w in (self._show_check, self._width_spin, self._style_combo):
-                w.blockSignals(False)
-
-        # --- Signalverbindungen ---------------------------------------------
-        self._color_btn.clicked.connect(self._open_color_dialog)
-        self._show_check.toggled.connect(self._on_part_changed)
-        self._width_spin.valueChanged.connect(self._on_part_changed)
-        self._style_combo.currentTextChanged.connect(self._on_part_changed)
-
-        # --- Layout ---------------------------------------------------------
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-        # color_only: NUR den Farb-Button anzeigen (kein Composite).
-        if not self._color_only:
-            if self._show_visibility:
-                layout.addWidget(self._show_check)
-            layout.addWidget(self._color_btn)
-            layout.addWidget(self._width_spin)
-            layout.addWidget(self._style_combo)
-        else:
-            layout.addWidget(self._color_btn)
+        layout.setSpacing(0)
+        layout.addWidget(self._btn)
         layout.addStretch(1)
 
+        self._set_color_internal(self._style.color)
         self._update_swatch()
 
     # ------------------------------------------------------------------
-    # Oeffentliche API
+    # Oeffentliche API (Invariante 16.06.01)
     # ------------------------------------------------------------------
 
     @property
@@ -19648,7 +21102,7 @@ class StylePickerWidget(QWidget):
 
     @property
     def color_only(self) -> bool:
-        """True = reiner Farbwaehler (ohne Sichtbarkeits-/Stil-Composite).
+        """True = reiner Farbwaehler (Dialog zeigt nur den Farbbereich).
 
         Der Dialog nutzt dieses Flag, um die Geschwister-Keys (style/width
         bzw. shape/size) beim Persistieren zu UEBERSPRINGEN - ein reiner
@@ -19658,12 +21112,11 @@ class StylePickerWidget(QWidget):
 
     @property
     def show_visibility(self) -> bool:
-        """True = interne 'sichtbar'-Checkbox wird angezeigt (Default).
+        """True = Dialog zeigt eine 'sichtbar'-Checkbox (Default).
 
-        False = Checkbox ausgeblendet; get_style() liefert dann immer
-        show=True, weil die Sichtbarkeit ein separater 'show_*'-Parameter
-        steuert (Multi-MA: show_maX, FixedGridProximity: show_lines/
-        show_circles).
+        False = keine Checkbox; get_style() liefert dann show=True, weil die
+        Sichtbarkeit ein separater 'show_*'-Parameter steuert (Multi-MA:
+        show_maX, FixedGridProximity: show_lines/show_circles).
         """
         return self._show_visibility
 
@@ -19676,40 +21129,29 @@ class StylePickerWidget(QWidget):
         """
         if self._style_type == "marker":
             return MarkerStyle(
-                show=(self._show_check.isChecked() if self._show_visibility else True),
+                show=bool(self._style.show),
                 color=self._color_button_value(),
-                shape=str(self._style_combo.currentText()),
-                size=int(self._width_spin.value()),
+                shape=str(self._style.shape),
+                size=int(self._style.size),
             )
         return LineStyle(
-            show=(self._show_check.isChecked() if self._show_visibility else True),
+            show=bool(self._style.show),
             color=self._color_button_value(),
-            width=int(self._width_spin.value()),
-            style=str(self._style_combo.currentText()),
+            width=int(self._style.width),
+            style=str(self._style.style),
         )
 
     def set_style(self, style: Union[LineStyle, MarkerStyle]) -> None:
-        """Setzt den Stil aus einem Style-Objekt und aktualisiert die UI.
+        """Setzt den Stil aus einem Style-Objekt und aktualisiert die Vorschau.
 
-        Akzeptiert LineStyle und MarkerStyle. Passt der Typ nicht zum Modus,
-        werden show/color uebernommen und die restlichen Felder auf den
-        Modus-Default zurueckgesetzt (defensive Toleranz).
-
-        Emittiert bewusst KEIN style_changed (programmatisches Setzen).
+        Akzeptiert LineStyle und MarkerStyle. Emittiert bewusst KEIN
+        style_changed (programmatisches Setzen).
         """
         if style is None:
             return
         self._style = style
-        self._show_check.blockSignals(True)
-        self._width_spin.blockSignals(True)
-        self._style_combo.blockSignals(True)
-        try:
-            self._apply_style_to_ui(style)
-            self._set_color_internal(style.color)
-        finally:
-            self._show_check.blockSignals(False)
-            self._width_spin.blockSignals(False)
-            self._style_combo.blockSignals(False)
+        self._set_color_internal(style.color)
+        self._update_swatch()
 
     def set_color(self, color_str: str) -> None:
         """Setzt ausschliesslich die Farbe (behaelt show/width|size/style|shape).
@@ -19728,121 +21170,51 @@ class StylePickerWidget(QWidget):
     # Intern
     # ------------------------------------------------------------------
 
-    def _apply_style_to_ui(
-        self, style: Union[LineStyle, MarkerStyle]
-    ) -> None:
-        """Uebernimmt ein Style-Objekt in die Teil-Widgets (Signale blockiert).
-
-        Bei Typ-Mismatch zum Modus werden show/color uebernommen, die
-        modusspezifischen Felder (width|size, style|shape) auf Defaults
-        gesetzt (defensive Toleranz).
-        """
-        if self._style_type == "marker" and isinstance(style, MarkerStyle):
-            self._show_check.setChecked(bool(style.show))
-            self._width_spin.setValue(int(style.size))
-            if style.shape in MARKER_SHAPES:
-                self._style_combo.setCurrentText(style.shape)
-            else:
-                self._style_combo.setCurrentText("circle")
-        elif self._style_type == "line" and isinstance(style, LineStyle):
-            self._show_check.setChecked(bool(style.show))
-            self._width_spin.setValue(int(style.width))
-            if style.style in LINE_STYLES:
-                self._style_combo.setCurrentText(style.style)
-            else:
-                self._style_combo.setCurrentText("solid")
-        else:
-            # Typ-Mismatch: show uebernehmen, modusspezifische Felder = Defaults
-            self._show_check.setChecked(bool(style.show))
-            if self._style_type == "marker":
-                self._width_spin.setValue(6)
-                self._style_combo.setCurrentText("circle")
-            else:
-                self._width_spin.setValue(1)
-                self._style_combo.setCurrentText("solid")
+    def _open_picker_dialog(self) -> None:
+        """Oeffnet den modalen StylePickerDialog (exec) und uebernimmt das
+        geaenderte Style-Objekt bei 'Übernehmen'. Emittiert style_changed."""
+        dlg = StylePickerDialog(
+            self.get_style(), style_type=self._style_type,
+            color_only=self._color_only, enable_alpha=self._enable_alpha,
+            show_visibility=self._show_visibility, parent=self)
+        if dlg.exec() == QDialog.Accepted:
+            new_style = dlg.get_style()
+            self._style = new_style
+            self._set_color_internal(new_style.color)
+            self._update_swatch()
+            self.style_changed.emit(new_style)
 
     def _color_button_value(self) -> str:
         """Farb-String aus dem internen QColor (Paritaet zum Alt-ColorButton)."""
-        c = getattr(self, "_color", QColor())
-        if not c.isValid():
-            return "#000000"
-        if c.alpha() < 255:
-            a = round(c.alpha() / 255.0, 2)
-            return f"rgba({c.red()}, {c.green()}, {c.blue()}, {a})"
-        return c.name().upper()
+        return _format_color(getattr(self, "_color", QColor()))
 
     def _set_color_internal(self, color_str: str) -> None:
         """Parst einen Hex-/rgba()-String und aktualisiert Swatch + Zustand.
 
         Ungueltige Eingaben werden ignoriert (bisherige Farbe bleibt erhalten).
         """
-        parsed = self._parse_color(color_str)
+        parsed = _parse_color(color_str)
         if parsed is not None:
             self._color = parsed
             self._update_swatch()
 
+    def _make_swatch_icon(self) -> QIcon:
+        """Farb-Swatch-Icon (16x16) in der aktuellen Farbe inkl. Deckkraft."""
+        c = self._color if self._color.isValid() else QColor("#000000")
+        pm = QPixmap(self._SWATCH_W, self._SWATCH_H)
+        pm.fill(QColor(c.red(), c.green(), c.blue(), c.alpha()))
+        return QIcon(pm)
+
+    def _preview_text(self) -> str:
+        """Vorschau-Text des Buttons: '● 2px Solid' bzw. '● Circle'."""
+        if self._style_type == "marker":
+            return f"● {self._style.shape.capitalize()}"
+        return f"● {int(self._style.width)}px {self._style.style.capitalize()}"
+
     def _update_swatch(self) -> None:
-        """Setzt das Swatch-Stylesheet auf die aktuelle Farbe inkl. Deckkraft."""
-        c = getattr(self, "_color", QColor())
-        if not c.isValid():
-            bg = "rgba(0, 0, 0, 1.0)"
-        else:
-            bg = f"rgba({c.red()}, {c.green()}, {c.blue()}, {c.alpha() / 255.0})"
-        self._color_btn.setStyleSheet(
-            "QPushButton#StylePickerSwatch { background-color: " + bg +
-            "; border: 1px solid #555555; border-radius: 3px; }"
-        )
-
-    def _open_color_dialog(self) -> None:
-        """Oeffnet QColorDialog.getColor() (mit Alpha-Slider, wenn aktiviert).
-
-        Bei gueltiger Auswahl werden Swatch + interner Zustand aktualisiert
-        und style_changed mit dem neuen Style-Objekt emittiert.
-        """
-        options = QColorDialog.ColorDialogOption(0)
-        if self._enable_alpha:
-            options |= QColorDialog.ColorDialogOption.ShowAlphaChannel
-        chosen = QColorDialog.getColor(self._color, self, "Farbe auswählen", options)
-        if chosen.isValid():
-            self._color = chosen
-            self._update_swatch()
-            self._on_part_changed()
-
-    def _on_part_changed(self, *args) -> None:
-        """Zentraler Handler aller Teil-Widget-Aenderungen.
-
-        Aktualisiert den internen Zustand und emittiert style_changed mit dem
-        aktuellen Style-Objekt.
-        """
-        self._style = self.get_style()
-        self.style_changed.emit(self._style)
-
-    @staticmethod
-    def _parse_color(color_str: str) -> Optional[QColor]:
-        """Parst Hex- oder rgba(...)-Strings in ein QColor (oder None)."""
-        s = (color_str or "").strip()
-        if not s:
-            return None
-        low = s.lower()
-        if low.startswith("rgba("):
-            try:
-                inner = s[s.index("(") + 1:s.rindex(")")]
-                parts = [p.strip() for p in inner.split(",")]
-                if len(parts) != 4:
-                    return None
-                r = int(round(float(parts[0])))
-                g = int(round(float(parts[1])))
-                b = int(round(float(parts[2])))
-                a_frac = float(parts[3])
-            except (ValueError, TypeError):
-                return None
-            r = max(0, min(255, r))
-            g = max(0, min(255, g))
-            b = max(0, min(255, b))
-            alpha = max(0, min(255, int(round(a_frac * 255))))
-            return QColor(r, g, b, alpha)
-        c = QColor(s)
-        return c if c.isValid() else None
+        """Setzt Swatch-Icon + Vorschau-Text des Buttons auf den aktuellen Stil."""
+        self._btn.setIcon(self._make_swatch_icon())
+        self._btn.setText(self._preview_text())
 
 ```
 
@@ -20184,6 +21556,10 @@ TYPE_GROUP = "group"
 TYPE_SET = "set"
 TYPE_SERVICE = "service"
 TYPE_PLUGIN = "plugin"
+# 16.08 (K3): Kategorie-Ordner-Knoten (Dynamic Category Trees). Nicht
+# auswaehlbar, expandierbar; traegt KEINEN Info-Button (K5), keine Badges
+# und ist im Checkbox-Modus nicht anhakbar (K4).
+TYPE_CATEGORY = "category"
 
 # Bugfix 2.1 (04.08.2026, aktualisiert): Lange Relationstexte in der Badge-
 # Spalte (z. B. "📌 im Ind_FixedGridProximity | ⚪ inaktiv in ...") werden auf
@@ -20435,14 +21811,47 @@ class MasterTree(QTreeWidget):
 
     def _build_child_item(self, group: str,
                           child: Dict[str, Any]) -> Optional[QTreeWidgetItem]:
-        """Erzeugt das Kind-Item fuer einen Knoten der Gruppe `group`."""
+        """Erzeugt das Kind-Item fuer einen Knoten der Gruppe `group`.
+
+        16.08 (K2/K3): Ordner-Knoten (group == GROUP_CATEGORY) werden
+        rekursiv aufgebaut; Plugin-Blaetter in Ordnern nutzen weiterhin
+        _build_plugin_item (Badge/Ausfuehrungsdatum unveraendert). Die
+        Original-Gruppe (standalone/plugins) wird durch die Rekursion
+        durchgereicht, damit ROLE_SET_ID der Blaetter stabil bleibt.
+        """
+        if isinstance(child, dict) and child.get("group") == self.model.GROUP_CATEGORY:
+            return self._build_category_item(child, group)
         if group == self.model.GROUP_SETS:
             return self._build_set_item(child)
-        if group == self.model.GROUP_STANDALONE:
-            return self._build_plugin_item(child, group)
-        if group == self.model.GROUP_PLUGINS:
+        if group in (self.model.GROUP_STANDALONE, self.model.GROUP_PLUGINS):
             return self._build_plugin_item(child, group)
         return None
+
+    def _build_category_item(self, child: Dict[str, Any],
+                             group: str) -> QTreeWidgetItem:
+        """Erzeugt einen Ordner-Knoten (K3, 16.08).
+
+        Nicht auswaehlbar, expandierbar, '📁 <Name>' im Label (aus dem
+        Modell, K2-Format); Kinder rekursiv ueber _build_child_item.
+        Ordner tragen KEINEN Info-Button (K5 – _attach_item_buttons
+        ueberspringt TYPE_CATEGORY automatisch), keine Badges/Datum (K2)
+        und sind im Checkbox-Modus nicht anhakbar (K4 – kein
+        ItemIsUserCheckable). Die Selektion liefert fuer Ordner den
+        Default-Pfad zurueck (K7).
+        """
+        label = _expandable_label(str(child.get("label") or "?"), True, False)
+        cat_item = QTreeWidgetItem([label, ""])
+        cat_item.setData(0, ROLE_NODE_TYPE, TYPE_CATEGORY)
+        cat_item.setData(0, ROLE_SET_ID, str(child.get("label") or ""))
+        # K3/K4: nicht auswaehlbar UND nicht anhakbar – Qt setzt
+        # ItemIsUserCheckable standardmaessig, daher beide Flags entfernen.
+        cat_item.setFlags(cat_item.flags()
+                          & ~(Qt.ItemIsSelectable | Qt.ItemIsUserCheckable))
+        for sub in child.get("children") or []:
+            item = self._build_child_item(group, sub)
+            if item is not None:
+                cat_item.addChild(item)
+        return cat_item
 
     def _build_set_item(self, child: Dict[str, Any]) -> QTreeWidgetItem:
         services = child.get("services", [])
@@ -21007,6 +22416,10 @@ class MasterTree(QTreeWidget):
             except (RuntimeError, AttributeError):
                 pass
             node_type = item.data(0, ROLE_NODE_TYPE)
+            # 16.08 (K6): Ordnerknoten erhalten KEIN Kontextmenue (kein
+            # run_service/info/move/remove auf Ordnern).
+            if node_type == TYPE_CATEGORY:
+                return
             menu = QMenu(self)
             if node_type == TYPE_GROUP:
                 group = str(item.data(0, ROLE_SET_ID) or "")
@@ -25447,14 +26860,22 @@ class ServiceSetTrashDialog(QDialog):
 ### DATEI: test/check_stylepicker_16_06.py
 ```py
 # test/check_stylepicker_16_06.py
-"""Phase 16.06 – Verifikation der StylePicker-Integration (07.08.2026).
+"""Phase 16.06.01 – Verifikation des Popover-StylePicker-Refactorings.
 
-Headless-Beweis fuer die Anwender-Punkte:
-  1) Die StylePickerWidgets im Indikator-Prop-Fenster enthalten die
-     Linien-/Symbol-/Staerke-Felder (QSpinBox + QComboBox, sichtbar).
-  2) Die Alt-Felder (line_style/line_width/circle_shape_*/circle_size_*)
+Headless-Beweis fuer die Refactoring-Anweisung (Popover StylePickerDialog &
+Cleanup) und die praezisierten Entscheidungen (Kapitel 5):
+  1) Die StylePickerWidgets im Indikator-Prop-Fenster bestehen AUSSCHLIESSLICH
+     aus einem QPushButton (keine Inline-QSpinBox/QComboBox/QCheckBox mehr).
+  2) Der StylePickerDialog ist vertikal zweigeteilt (Color-Grid oben,
+     QFrame.HLine-Trennlinie, Zeichnungsparameter unten) und besitzt
+     [Übernehmen]/[Abbrechen].
+  3) color_only=True blendet Trennlinie + unteren Bereich aus (kompakt).
+  4) API-Invariante: get_style()/set_style()/set_color() + Properties
+     style_type/color_only/show_visibility + Signal style_changed bleiben
+     erhalten; ctrl.get_style().color funktioniert.
+  5) Die Alt-Felder (line_style/line_width/circle_shape_*/circle_size_*)
      werden in KEINEM Indikator mehr als eigene Controls gerendert.
-  3) Das Fenster-X (WindowCloseButtonHint) ist fuer alle Indikator-
+  6) Das Fenster-X (WindowCloseButtonHint) ist fuer alle Indikator-
      Prop-Fenster gesetzt (generisch).
 
 KEINE GUI-Ausfuehrung (offscreen, kein exec).
@@ -25466,7 +26887,10 @@ import tempfile
 sys.path.insert(0, r"F:\Python\PyTrader")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QSpinBox, QComboBox  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QApplication, QCheckBox, QComboBox, QDialog, QFrame, QPushButton,
+    QSpinBox,
+)
 from PySide6.QtCore import Qt  # noqa: E402
 
 _app = QApplication.instance() or QApplication(sys.argv)
@@ -25475,7 +26899,10 @@ from state_manager import StateManager  # noqa: E402
 from chart.indicators.multi_ma import MultiMovingAverageIndicator  # noqa: E402
 from chart.indicators.fixed_grid_proximity import FixedGridProximityIndicator  # noqa: E402
 from chart.indicator_dialog import IndicatorSettingsDialog  # noqa: E402
-from chart.widgets.style_picker_widget import StylePickerWidget  # noqa: E402
+from chart.widgets.style_picker_widget import (  # noqa: E402
+    LINE_STYLES, MARKER_SHAPES, LineStyle, MarkerStyle, StylePickerDialog,
+    StylePickerWidget,
+)
 
 tmp = tempfile.mkdtemp(prefix="sp16_")
 sm = StateManager(db_path=os.path.join(tmp, "app_data.duckdb"))
@@ -25499,53 +26926,69 @@ def check(name, cond, detail=""):
         FAILURES.append(name)
 
 
-def picker_subwidgets(ctrl):
-    """Liefert (spin, combo) eines StylePickerWidget (falls vorhanden)."""
-    if not isinstance(ctrl, StylePickerWidget):
-        return None, None
-    spin = ctrl.findChild(QSpinBox)
-    combo = ctrl.findChild(QComboBox)
-    return spin, combo
+def widget_children(ctrl):
+    """Direkte QWidget-Kinder des Picker-Widgets (ohne Layout-Abstraktion)."""
+    return [ctrl.layout().itemAt(i).widget()
+            for i in range(ctrl.layout().count())
+            if ctrl.layout().itemAt(i).widget() is not None]
 
 
-def picker_visible(ctrl):
-    """True, wenn der Picker die Stil-Felder (Spin+Combo) sichtbar anzeigt."""
-    spin, combo = picker_subwidgets(ctrl)
-    return (spin is not None and combo is not None
-            and spin.isVisibleTo(ctrl) and combo.isVisibleTo(ctrl))
+def only_button(ctrl):
+    """True, wenn das Widget ausschliesslich aus einem QPushButton besteht
+    und KEINE Inline-SpinBox/ComboBox/CheckBox mehr direkt anzeigt."""
+    kids = widget_children(ctrl)
+    buttons = [w for w in kids if isinstance(w, QPushButton)]
+    extras = [w for w in kids
+              if isinstance(w, (QSpinBox, QComboBox, QCheckBox))]
+    return len(kids) == 1 and len(buttons) == 1 and not extras
+
+
+def dialog_line(ctrl):
+    """Erzeugt den (nicht ausgefuehrten) LineStyle-Dialog wie beim Klick."""
+    return StylePickerDialog(
+        ctrl.get_style(), style_type=ctrl.style_type,
+        color_only=ctrl.color_only, enable_alpha=True,
+        show_visibility=ctrl.show_visibility, parent=ctrl)
 
 
 # ---------------------------------------------------------------------------
-# Teil A: Multi-MA – maX_color/ma1_bull_color = volle Picker mit Stil-Feldern
+# Teil A: Multi-MA – Button-Only-Picker + API-Invariante + Defaults
 # ---------------------------------------------------------------------------
-print("\n=== A) Multi-MA: StylePicker mit Linien-/Staerke-Feldern ===")
+print("\n=== A) Multi-MA: Button-Only StylePicker ===")
 ma = MultiMovingAverageIndicator()
 dlg_ma = IndicatorSettingsDialog(ma, dict(ma.default_params), "Default", sm,
                                  lambda p, pr: None, symbol="SILVER", timeframe="H1")
 
 ma_color_keys = ["ma1_bull_color"] + [f"ma{x}_color" for x in range(2, 9)]
-picker_ok = all(
-    isinstance(dlg_ma.param_controls[k], StylePickerWidget)
-    and not dlg_ma.param_controls[k].color_only
-    and picker_visible(dlg_ma.param_controls[k])
-    for k in ma_color_keys
-)
-check("A1) maX_color/ma1_bull_color = volle Picker mit Spin+Combo (sichtbar)",
-      picker_ok, "")
+check("A1) maX_color/ma1_bull_color = Button-Only-Picker (kein Inline-Composite)",
+      all(isinstance(dlg_ma.param_controls[k], StylePickerWidget)
+          and not dlg_ma.param_controls[k].color_only
+          and only_button(dlg_ma.param_controls[k])
+          for k in ma_color_keys), "")
 
-# Werte aus den SpinBoxen/Combos (Default: MA1 w2/solid, MA2 w1/solid)
-w2 = dlg_ma.param_controls["ma1_bull_color"].get_style().width
-s2 = dlg_ma.param_controls["ma1_bull_color"].get_style().style
-w3 = dlg_ma.param_controls["ma2_color"].get_style().width
-s3 = dlg_ma.param_controls["ma2_color"].get_style().style
-check("A2) Picker-Werte: MA1 w2/solid, MA2 w1/solid",
-      w2 == 2 and s2 == "solid" and w3 == 1 and s3 == "solid",
-      f"MA1={w2}/{s2} MA2={w3}/{s3}")
+# API-Invariante: get_style().color liefert weiterhin einen Farb-String.
+_ma1 = dlg_ma.param_controls["ma1_bull_color"]
+check("A2) API: ctrl.get_style().color funktioniert (Invariante 16.06.01)",
+      isinstance(_ma1.get_style(), LineStyle)
+      and isinstance(_ma1.get_style().color, str)
+      and _ma1.get_style().color.startswith("#"), "")
+
+# Defaults: MA1 w2/solid, MA2 w1/solid (Sibling-Defaults aus dem Schema).
+check("A3) Picker-Werte: MA1 w2/solid, MA2 w1/solid",
+      _ma1.get_style().width == 2 and _ma1.get_style().style == "solid"
+      and dlg_ma.param_controls["ma2_color"].get_style().width == 1
+      and dlg_ma.param_controls["ma2_color"].get_style().style == "solid",
+      f"MA1={_ma1.get_style().width}/{_ma1.get_style().style}")
+
+# Button-Vorschau-Text: '● 2px Solid' (Anweisung 16.06.01).
+check("A4) Button-Vorschau '● 2px Solid'",
+      _ma1._btn.text() == "● 2px Solid",
+      repr(_ma1._btn.text()))
 
 # ---------------------------------------------------------------------------
-# Teil B: FixedGridProximity – Picker + KEINE Alt-Einzelfelder mehr
+# Teil B: FixedGridProximity – Button-Only + KEINE Alt-Einzelfelder
 # ---------------------------------------------------------------------------
-print("\n=== B) FixedGridProximity: Picker ja, Alt-Felder nein ===")
+print("\n=== B) FixedGridProximity: Button-Only-Picker, Alt-Felder weg ===")
 fgp = FixedGridProximityIndicator()
 dlg_fgp = IndicatorSettingsDialog(fgp, dict(fgp.default_params), "Default", sm,
                                   lambda p, pr: None, symbol="SILVER", timeframe="H1")
@@ -25553,15 +26996,15 @@ dlg_fgp = IndicatorSettingsDialog(fgp, dict(fgp.default_params), "Default", sm,
 line_p = dlg_fgp.param_controls.get("line_color")
 std_p = dlg_fgp.param_controls.get("circle_color_std")
 act_p = dlg_fgp.param_controls.get("circle_color_active")
-check("B1) line_color = LineStyle-Picker mit Stil-Feldern",
+check("B1) line_color = LineStyle-Picker (Button-Only, style_type line)",
       line_p is not None and isinstance(line_p, StylePickerWidget)
-      and line_p.style_type == "line" and picker_visible(line_p), "")
-check("B2) circle_color_std/_active = MarkerStyle-Picker mit Symbol/Groesse",
+      and line_p.style_type == "line" and only_button(line_p), "")
+check("B2) circle_color_std/_active = MarkerStyle-Picker (Button-Only)",
       std_p is not None and act_p is not None
       and isinstance(std_p, StylePickerWidget)
       and isinstance(act_p, StylePickerWidget)
       and std_p.style_type == "marker" and act_p.style_type == "marker"
-      and picker_visible(std_p) and picker_visible(act_p), "")
+      and only_button(std_p) and only_button(act_p), "")
 
 alt_keys = ("line_style", "line_width", "circle_shape_std", "circle_shape_active",
             "circle_size_std", "circle_size_active")
@@ -25574,13 +27017,88 @@ check("B4) Schema ohne Alt-Keys",
       str([k for k in alt_keys if k in fgp.parameter_schema]))
 
 # ---------------------------------------------------------------------------
-# Teil C: Fenster-X (WindowCloseButtonHint) generisch gesetzt
+# Teil C: StylePickerDialog – zweigeteilt, color_only kompakt, API
 # ---------------------------------------------------------------------------
-print("\n=== C) Fenster-X fuer alle Indikator-Prop-Fenster ===")
+print("\n=== C) StylePickerDialog (Popover) ===")
+
+# C1: LineStyle-Dialog (voll) – Spin 1-10, Combo LINE_STYLES, HLine sichtbar,
+#     unterer Bereich sichtbar, [Übernehmen]/[Abbrechen].
+_dlg_line = StylePickerDialog(LineStyle(), style_type="line")
+_spin_line = _dlg_line._param_spin
+_combo_line = _dlg_line._param_combo
+check("C1) Line-Dialog: Spin 1-10 px + Combo LINE_STYLES + HLine + Params sichtbar",
+      _dlg_line._separator.isVisibleTo(_dlg_line)
+      and _dlg_line._params_widget.isVisibleTo(_dlg_line)
+      and _spin_line.minimum() == 1 and _spin_line.maximum() == 10
+      and [_combo_line.itemText(i) for i in range(_combo_line.count())] == LINE_STYLES
+      and _dlg_line._separator.frameShape() == QFrame.HLine, "")
+
+# C2: MarkerStyle-Dialog – Spin 1-20, Combo MARKER_SHAPES.
+_dlg_marker = StylePickerDialog(MarkerStyle(), style_type="marker")
+_spin_marker = _dlg_marker._param_spin
+_combo_marker = _dlg_marker._param_combo
+check("C2) Marker-Dialog: Spin 1-20 px + Combo MARKER_SHAPES",
+      _spin_marker.minimum() == 1 and _spin_marker.maximum() == 20
+      and [_combo_marker.itemText(i) for i in range(_combo_marker.count())] == MARKER_SHAPES, "")
+
+# C3: color_only -> HLine + unterer Bereich ausgeblendet (kompakt).
+_dlg_co = StylePickerDialog(LineStyle(), style_type="line", color_only=True)
+check("C3) color_only: HLine + unterer Bereich setVisible(False)",
+      not _dlg_co._separator.isVisibleTo(_dlg_co)
+      and not _dlg_co._params_widget.isVisibleTo(_dlg_co), "")
+
+# C4: Dialog-API – get_style() nach Aenderung (Spin=4, Combo=dashed).
+_dlg_edit = StylePickerDialog(LineStyle(width=2, style="solid"), style_type="line")
+_dlg_edit._param_spin.setValue(4)
+_dlg_edit._param_combo.setCurrentText("dashed")
+_dlg_edit.accept()  # Uebernehmen
+_edited = _dlg_edit.get_style()
+check("C4) Dialog get_style() nach Uebernahme (width 4 / dashed)",
+      isinstance(_edited, LineStyle)
+      and _edited.width == 4 and _edited.style == "dashed", "")
+
+# C5: Dialog-Farbbereich – Palette + Hex-Feld + Alpha-Slider + Anpassen-Button.
+check("C5) Farbbereich: Palette-Buttons + Hex-Feld + Alpha-Slider + [Anpassen...]",
+      len(_dlg_line.findChildren(QPushButton)) >= 16
+      and _dlg_line._hex_edit is not None
+      and _dlg_line._alpha_slider is not None
+      and _dlg_line._custom_btn.text() == "Anpassen...", "")
+
+# C6: set_color()/set_style() des Widgets (keine Signal-Emission) + Preview.
+_spw = StylePickerWidget(style=LineStyle(), style_type="line")
+_spw.set_style(LineStyle(show=True, color="#FF0000", width=3, style="dashed"))
+check("C6) set_style: get_style() + Button-Preview aktualisiert (w3/dashed/#FF0000)",
+      _spw.get_style().width == 3 and _spw.get_style().style == "dashed"
+      and _spw.get_style().color == "#FF0000"
+      and _spw._btn.text() == "● 3px Dashed", "")
+
+# C7: style_changed wird bei Uebernahme emittiert (Widget-Klick simuliert,
+#     exec() durch Auto-Accept ersetzt, ohne GUI).
+_emitted = []
+_spw2 = StylePickerWidget(style=LineStyle(), style_type="line")
+_spw2.style_changed.connect(_emitted.append)
+_orig_exec = StylePickerDialog.exec
+def _auto_accept(dlg):
+    dlg._param_spin.setValue(5)
+    dlg.accept()
+    return QDialog.Accepted
+StylePickerDialog.exec = _auto_accept
+try:
+    _spw2._btn.click()
+finally:
+    StylePickerDialog.exec = _orig_exec
+check("C7) Klick -> Dialog akzeptiert -> style_changed(w5) + Widget-Update",
+      len(_emitted) == 1 and _emitted[0].width == 5
+      and _spw2.get_style().width == 5, "")
+
+# ---------------------------------------------------------------------------
+# Teil D: Fenster-X (WindowCloseButtonHint) generisch gesetzt
+# ---------------------------------------------------------------------------
+print("\n=== D) Fenster-X fuer alle Indikator-Prop-Fenster ===")
 for name, dlg in (("Multi-MA", dlg_ma), ("FixedGridProximity", dlg_fgp)):
     flags = dlg.windowFlags()
     has_x = bool(flags & Qt.WindowCloseButtonHint)
-    check(f"C1) {name}: WindowCloseButtonHint gesetzt", has_x,
+    check(f"D1) {name}: WindowCloseButtonHint gesetzt", has_x,
           f"flags={int(flags)}")
 
 print("-" * 60)
@@ -25923,7 +27441,8 @@ check("C5) show_circles=False -> keine Circles", len(circles_off) == 0,
 print("\n=== Teil 5: MasterTree Layout ===")
 from analytics.engine.service_selector_model import ServiceSelectorModel  # noqa: E402
 from serviceui.master_tree import (  # noqa: E402
-    MasterTree, MAX_BADGE_CELL_CHARS, BADGE_TRUNCATE_ICON, ROLE_PLUGIN_ID,
+    MasterTree, TreeItemIterator, MAX_BADGE_CELL_CHARS, BADGE_TRUNCATE_ICON,
+    ROLE_PLUGIN_ID, ROLE_NODE_TYPE, TYPE_PLUGIN,
     BADGE_COLUMN_WIDTH, BRANCH_ZONE_WIDTH, LEVEL_INDENT, INFO_BUTTON_WIDTH,
     INFO_BUTTON_TEXT, INFO_BUTTON_SIZE,
 )
@@ -25965,10 +27484,16 @@ no_indent5 = all(
 check("T2) Service-Zeilen ohne Einrueckung (kein fuehrender Whitespace)",
       no_indent5, str([it.text(0) if it else None for it in svc_items5]))
 
-# 2.0: Plugin-Zeilen (Gruppe 3) ebenfalls ohne fuehrende Leerzeichen
+# 2.0: Plugin-Zeilen (Gruppe 3) ebenfalls ohne fuehrende Leerzeichen.
+# 16.08 (P16.08): grid_lines/proximity tragen category='Grid' -> die
+# Plugin-Blaetter liegen seit 16.08 in einem '📁 Grid'-Ordner. Daher werden
+# sie rekursiv ueber TreeItemIterator gesammelt statt als direkte Kinder
+# der Gruppe.
 plugins_group5 = tree5.topLevelItem(2)
-plugin_items5 = ([plugins_group5.child(i) for i in range(plugins_group5.childCount())]
-                 if plugins_group5 else [])
+plugin_items5 = ([it for it in TreeItemIterator(tree5)
+                  if it is not None
+                  and it.data(0, ROLE_NODE_TYPE) == TYPE_PLUGIN]
+                 if plugins_group5 is not None else [])
 no_indent_pl5 = all(
     it is not None and it.text(0) and not it.text(0).startswith(" ")
     for it in plugin_items5
@@ -27401,6 +28926,428 @@ check("G5) Old-Preset-Fallback: width 1 / solid / circle / size 6",
       and _circ_g5 and all(c["shape"] == "circle" and c["size"] == 6
                            for c in _circ_g5),
       f"pl={_pl_g5[:1]} circ={_circ_g5[:1]}")
+
+# ---------------------------------------------------------------------------
+# Teil 12 (Phase 16.07, 07.08.2026): Two-Tier Caching & Dynamic Range
+# Management (D1–D10). Headless Backend-/Logik-Tests:
+#   T1) fetch_historical_candles(before_epoch=...) – Chunk-Nachladen (D4)
+#   T2) ChartDataBuffer.load_initial – M/Warmup, Tier-1-Fenster, cont-Maps
+#   T3) serve_older – RAM-Serve (0 ms I/O, D3/D4) + Erschöpfung
+#   T4) merge_older – Prepend, cont-Erhalt, Warmup, Kapazitäts-Trim (D2/D6/D8)
+#   T5) _compute_warmup – period*4 + smoothing*3, nur aktive MAs (D6)
+#   T6) _resolve_visible_logical_range – D10 (Offset-Format vs. Alt-Format)
+#   T7) _collect_render_payload Zeitfenster-Filter (D1/D5)
+# ---------------------------------------------------------------------------
+print("\n=== Teil 12: P16.07 Two-Tier Caching (ChartDataBuffer, D1–D10) ===")
+
+from chart.indicators.utils.chart_data_buffer import ChartDataBuffer  # noqa: E402
+
+_p1607_tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp_p1607")
+os.makedirs(_p1607_tmp, exist_ok=True)
+_p1607_db = os.path.join(_p1607_tmp, "tt_test.duckdb")
+if os.path.exists(_p1607_db):
+    os.remove(_p1607_db)
+
+# --- T1: before_epoch (D4) -------------------------------------------------
+try:
+    import duckdb as _ddb7
+    _c7 = _ddb7.connect(_p1607_db)
+    _c7.execute("""
+        CREATE TABLE ohlcv_bars (
+            symbol VARCHAR NOT NULL, timeframe VARCHAR NOT NULL,
+            time TIMESTAMPTZ NOT NULL, open DOUBLE NOT NULL, high DOUBLE NOT NULL,
+            low DOUBLE NOT NULL, close DOUBLE NOT NULL, tick_volume BIGINT,
+            PRIMARY KEY (symbol, timeframe, time)
+        );
+    """)
+    _base7 = 2_000_000_000
+    for _i7 in range(200):
+        _c7.execute("""
+            INSERT INTO ohlcv_bars (symbol, timeframe, time, open, high, low, close, tick_volume)
+            VALUES ('TT', 'M1', to_timestamp(?), 10.0, 11.0, 9.0, 10.5, 100)
+        """, [_base7 + _i7 * 60])
+    _c7.close()
+    _repo7 = MarketDataRepository(_p1607_db)
+    _all7, _prec7 = _repo7.fetch_historical_candles("TT", "M1", limit=500)
+    check("P16.07 T1) fetch gesamt (200 Kerzen, aufsteigend)",
+          len(_all7) == 200 and _all7[0]["time"] == _base7
+          and _all7[-1]["time"] == _base7 + 199 * 60, str(len(_all7)))
+    _old7, _ = _repo7.fetch_historical_candles("TT", "M1", limit=500,
+                                               before_epoch=_base7 + 100 * 60)
+    check("P16.07 T1) before_epoch liefert NUR aeltere Kerzen",
+          len(_old7) == 100 and _old7[0]["time"] == _base7
+          and _old7[-1]["time"] == _base7 + 99 * 60,
+          f"n={len(_old7)}, first={_old7[0]['time'] if _old7 else None}")
+    _old7b, _ = _repo7.fetch_historical_candles("TT", "M1", limit=500,
+                                                before_epoch=_base7)
+    check("P16.07 T1) before_epoch an der aeltesten Kante -> 0 Kerzen",
+          len(_old7b) == 0, str(len(_old7b)))
+finally:
+    if os.path.exists(_p1607_db):
+        os.remove(_p1607_db)
+
+# --- T2–T4: ChartDataBuffer (D2/D3/D6/D8) ---------------------------------
+try:
+    _c7b = _ddb7.connect(_p1607_db)
+    _c7b.execute("""
+        CREATE TABLE ohlcv_bars (
+            symbol VARCHAR NOT NULL, timeframe VARCHAR NOT NULL,
+            time TIMESTAMPTZ NOT NULL, open DOUBLE NOT NULL, high DOUBLE NOT NULL,
+            low DOUBLE NOT NULL, close DOUBLE NOT NULL, tick_volume BIGINT,
+            PRIMARY KEY (symbol, timeframe, time)
+        );
+    """)
+    _base7b = 3_000_000_000
+    for _i7b in range(1200):
+        _c7b.execute("""
+            INSERT INTO ohlcv_bars (symbol, timeframe, time, open, high, low, close, tick_volume)
+            VALUES ('TT', 'M1', to_timestamp(?), 10.0, 11.0, 9.0, 10.5, 100)
+        """, [_base7b + _i7b * 60])
+    _c7b.close()
+    _repo7b = MarketDataRepository(_p1607_db)
+    _buf = ChartDataBuffer(market_repo=_repo7b)
+    _buf.TIER2_CAPACITY = 1000
+    _buf.load_initial("TT", "M1", warmup=10, limit=1000)
+
+    # --- T2: load_initial + Tier-1-Fenster + cont-Maps ---------------------
+    check("P16.07 T2) load_initial: served=1000 + warmup=10",
+          len(_buf.candles) == 1000 and len(_buf._warmup_candles) == 10,
+          f"served={len(_buf.candles)} warmup={len(_buf._warmup_candles)}")
+    check("P16.07 T2) has_more_history True (DB laenger, D8)",
+          _buf.has_more_history is True, str(_buf.has_more_history))
+    _win7 = _buf.window_candles(ChartDataBuffer.TIER1_WINDOW)
+    check("P16.07 T2) window_candles = letzte N (Tier-1, D1)",
+          len(_win7) == ChartDataBuffer.TIER1_WINDOW, str(len(_win7)))
+    check("P16.07 T2) cont-Zeiten monoton & lueckenlos (tf_sec-Raster)",
+          all(_win7[i]["time"] == _win7[0]["time"] + i * 60
+              for i in range(len(_win7))), "")
+    check("P16.07 T2) timeMap bijektiv (cont<->real)",
+          all(_buf.time_real_to_cont[_buf.time_cont_to_real[k]] == k
+              for k in _buf.time_cont_to_real), "")
+    check("P16.07 T2) df = warmup + served (1010 Zeilen, D5)",
+          _buf.df is not None and len(_buf.df) == 1010,
+          str(len(_buf.df) if _buf.df is not None else None))
+
+    # --- T3: serve_older RAM-Serve + Erschoepfung (D3/D4) ------------------
+    _left_real7 = _buf.candles[-500]["time"]
+    _res7 = _buf.serve_older(_left_real7, 100)
+    check("P16.07 T3) serve_older RAM: 100 Kerzen aelter als from_epoch",
+          _res7 is not None and len(_res7[0]) == 100
+          and _res7[0][0]["time"] < _buf.time_real_to_cont[_left_real7],
+          f"n={len(_res7[0]) if _res7 else None}")
+    check("P16.07 T3) serve_older window_right = Puffer-Rechtskante",
+          _res7 is not None and _res7[1] == _buf.candles[-1]["time"],
+          str(_res7[1] if _res7 else None))
+    _res7b = _buf.serve_older(_buf.candles[0]["time"], 100)
+    check("P16.07 T3) serve_older erschoepft (None) an Puffer-Linkskante",
+          _res7b is None, str(_res7b))
+
+    # --- T4: merge_older Prepend + cont-Erhalt + Trim (D2/D6/D8) -----------
+    _prev_oldest7 = _buf.candles[0]["time"]
+    _prev_min_cont7 = min(_buf.time_cont_to_real.keys())
+    _prev_max_cont7 = max(_buf.time_cont_to_real.keys())
+    _fetched7 = [{"time": _prev_oldest7 - (110 - _i7c) * 60, "open": 10.0,
+                  "high": 11.0, "low": 9.0, "close": 10.5, "tick_volume": 100}
+                 for _i7c in range(110)]
+    _new7, _wr7, _hm7 = _buf.merge_older(_fetched7, serve_count=100, warmup=10)
+    check("P16.07 T4) merge_older: 100 served + 10 warmup",
+          len(_new7) == 100 and len(_buf._warmup_candles) == 10,
+          f"new={len(_new7)} warmup={len(_buf._warmup_candles)}")
+    check("P16.07 T4) alte cont-Zeiten bleiben unveraendert (Prepend)",
+          _buf.time_real_to_cont[_prev_oldest7] == _prev_min_cont7
+          and _buf.time_cont_to_real[_prev_min_cont7] == _prev_oldest7,
+          f"{_buf.time_real_to_cont.get(_prev_oldest7)} != {_prev_min_cont7}")
+    # Sliding-Window (D2): Der Kapazitaets-Trim wirft die RECHTESTEN
+    # (neuesten) Kerzen ab und entfernt ihre Map-Eintraege. _prev_max_cont7
+    # ist die rechte Kante -> muss nach dem Trim aus der Map entfernt sein.
+    check("P16.07 T4) Trim entfernt rechteste Kerze samt Map-Eintrag (D2)",
+          _prev_max_cont7 not in _buf.time_cont_to_real,
+          str(_prev_max_cont7))
+    # Eine VERBLIEBENE Alt-Kerze (Original-Index 500 -> jetzt Puffer-Index
+    # 600, da 100 neue Kerzen vorne stehen) behaelt ihre cont-Zeit.
+    _kept_real7 = _buf.candles[600]["time"]
+    check("P16.07 T4) verbliebene Alt-Kerzen behalten cont (Prepend)",
+          _buf.time_real_to_cont.get(_kept_real7) == _prev_min_cont7 + 500 * 60,
+          f"{_buf.time_real_to_cont.get(_kept_real7)} != {_prev_min_cont7 + 500 * 60}")
+    check("P16.07 T4) neue Kerzen cont unterhalb des alten Minimums",
+          _new7[0]["time"] < _prev_min_cont7, str(_new7[0]["time"]))
+    check("P16.07 T4) has_more True (fetch >= serve+warmup, D8)",
+          _hm7 is True, str(_hm7))
+    check("P16.07 T4) Kapazitaets-Trim (served <= M=1000, D2)",
+          len(_buf.candles) == 1000, str(len(_buf.candles)))
+    _fetched7b = []
+    _new7b, _wr7b, _hm7b = _buf.merge_older(_fetched7b, serve_count=100, warmup=10)
+    check("P16.07 T4) merge_older leerer Fetch -> has_more False (D8)",
+          len(_new7b) == 0 and _hm7b is False, f"hm={_hm7b}")
+finally:
+    if os.path.exists(_p1607_db):
+        os.remove(_p1607_db)
+
+# --- T5: _compute_warmup (D6) ----------------------------------------------
+class _P1607WarmupHost:
+    def __init__(self, ind_state, params):
+        self.indicators_state = ind_state
+        self._params = params
+
+    def _resolve_indicator_params(self, ind_id, st):
+        return self._params
+
+
+_h7 = _P1607WarmupHost({"ind_moving_averages": {"active": True}},
+                       {"show_ma1": True, "ma1_period": 4, "ma1_smoothing": 10,
+                        "show_ma2": False, "ma2_period": 10, "ma2_smoothing": 10,
+                        "show_ma3": True, "ma3_period": 20, "ma3_smoothing": 15})
+_w7 = PyTraderChartWindow._compute_warmup(_h7)
+check("P16.07 T5) Warmup = max(period*4 + smoothing*3) nur aktive MAs (D6)",
+      _w7 == max(4 * 4 + 10 * 3, 20 * 4 + 15 * 3), str(_w7))
+_h7b = _P1607WarmupHost({"ind_moving_averages": {"active": False}}, {})
+check("P16.07 T5) Warmup = 0 bei inaktivem MA (Grid/Proximity, D6)",
+      PyTraderChartWindow._compute_warmup(_h7b) == 0, "")
+
+# --- T6: _resolve_visible_logical_range (D10) ------------------------------
+class _P1607RangeHost:
+    def __init__(self, vf, vt):
+        self.visible_from = vf
+        self.visible_to = vt
+
+
+# Neues Offset-Format (from > to): total=1000, Viewport [200,800]
+# -> Abstand-von-rechts from=800, to=200 (D10, umbruchfest).
+_r7 = PyTraderChartWindow._resolve_visible_logical_range(_P1607RangeHost(800, 200), 1000)
+check("P16.07 T6) D10 Offset-Restore (new format) -> [200,800]",
+      _r7 == (200, 800), str(_r7))
+# Alt-Format (absolute Indizes, from < to) wird unveraendert uebernommen.
+_r7b = PyTraderChartWindow._resolve_visible_logical_range(_P1607RangeHost(100, 900), 1000)
+check("P16.07 T6) Alt-Format absolute -> [100,900]",
+      _r7b == (100, 900), str(_r7b))
+# Alt-Format mit Indizes > Fensterlaenge wird geklemmt.
+_r7c = PyTraderChartWindow._resolve_visible_logical_range(_P1607RangeHost(2000, 4000), 1000)
+check("P16.07 T6) Alt-Format ueber total geklemmt",
+      _r7c == (999, 1000), str(_r7c))
+_r7d = PyTraderChartWindow._resolve_visible_logical_range(_P1607RangeHost(None, None), 1000)
+check("P16.07 T6) None visible -> (None, None)",
+      _r7d == (None, None), str(_r7d))
+
+# --- T7: _collect_render_payload Zeitfenster-Filter (D1/D5) ----------------
+class _P1607FakeLine:
+    def set_context(self, s, tf):
+        pass
+
+    def calculate(self, df, params):
+        return {"lines": [{"id": "ma1", "data": [
+            {"time": 1000, "value": 1.0, "color": "#fff"},
+            {"time": 2000, "value": 2.0, "color": "#fff"},
+            {"time": 3000, "value": 3.0, "color": "#fff"}]}]}
+
+
+class _P1607FilterHarness(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.indicators = {"ind_ma": _P1607FakeLine()}
+        self.indicators_state = {"ind_ma": {"active": True}}
+        self.df_data = pd.DataFrame({"time": [1000, 2000, 3000]})
+        self.current_symbol = "TT"
+        self.current_tf = "M1"
+        self._time_real_to_cont = {1000: 5000, 2000: 6000, 3000: 7000}
+        self._resolve_indicator_params = lambda ind_id, st: {}
+
+
+_pf7 = _P1607FilterHarness()
+_pf7_payload = PyTraderChartWindow._collect_render_payload(
+    _pf7, time_from=2000, time_to=3000)
+check("P16.07 T7) Render-Payload Zeitfenster-Filter (lines, D1/D5)",
+      len(_pf7_payload["lines"]) == 1
+      and len(_pf7_payload["lines"][0]["data"]) == 2
+      and _pf7_payload["lines"][0]["data"][0]["time"] == 6000,
+      str(_pf7_payload["lines"]))
+
+if os.path.isdir(_p1607_tmp):
+    shutil.rmtree(_p1607_tmp, ignore_errors=True)
+
+# ---------------------------------------------------------------------------
+# Teil 13 (Phase 16.08, 07.08.2026): Meta-Ordner im MasterTree (Dynamic
+# Category Trees, Entscheidungen K1–K10). Headless-Logik-Tests mit
+# Duck-Typ-Registry-Stub (kein PluginRegistry, keine echte DB):
+#   T1) Plugin mit category='A/B/C' -> Ordner A -> B -> C, Blatt im tiefsten
+#       Ordner; Blatt-Dict unveraendert ({plugin_id, badge, last_execution})
+#   T2) ohne/leere/'General'-Kategorie -> oberste Ebene (K1)
+#   T3) Ordner-vor-Blatt-Sortierung, alphabetisch case-insensitiv (K8)
+#   T4) keine leeren Ordner (K9)
+#   T5) MasterTree (offscreen): Ordner nicht auswaehlbar (K3), kein
+#       Info-Button (K5), nicht anhakbar im Checkbox-Modus (K4),
+#       Plugin-Blatt in Ordner bleibt checked_services-faehig,
+#       Ordner-Selektion -> Default (K7)
+# ---------------------------------------------------------------------------
+print("\n=== Teil 13: P16.08 Meta-Ordner im MasterTree (K1–K10) ===")
+from analytics.engine.service_selector_model import ServiceSelectorModel  # noqa: E402
+from serviceui.master_tree import (  # noqa: E402
+    MasterTree, TreeItemIterator, TYPE_CATEGORY, ROLE_NODE_TYPE,
+    ROLE_PLUGIN_ID,
+)
+from PySide6.QtCore import Qt  # noqa: E402
+
+
+class _P1608Plugin:
+    """Duck-Typ-Plugin-Stub (PluginFeature-Interface, das das Modell nutzt)."""
+
+    def __init__(self, plugin_id, category=None):
+        self._plugin_id = plugin_id
+        self.capabilities = {"chart": False}
+        self.metadata = {"category": category} if category else {}
+
+    @property
+    def plugin_id(self):
+        return self._plugin_id
+
+
+class _P1608Registry:
+    """Duck-Typ-Registry-Stub (plugins-Dict + get(), case-insensitiv)."""
+
+    def __init__(self, plugins):
+        self.plugins = {pid.lower(): p for pid, p in plugins.items()}
+
+    def get(self, plugin_id):
+        return self.plugins[plugin_id.lower()]
+
+
+class _P1608SetRepo:
+    def list_sets(self):
+        return []
+
+
+class _P1608StateMgr:
+    def load_all_instances(self):
+        return []
+
+
+class _P1608FSReader:
+    def fetch_last_execution_dates(self):
+        return {}
+
+
+def _p1608_model(plugins):
+    return ServiceSelectorModel(
+        set_repo=_P1608SetRepo(), state_manager=_P1608StateMgr(),
+        registry=_P1608Registry(plugins), feature_store_reader=_P1608FSReader())
+
+
+def _p1608_group(tree, group):
+    for g in tree:
+        if g.get("group") == group:
+            return g
+    return None
+
+
+def _p1608_no_empty(nodes):
+    """Rekursiv: jeder Ordner hat mindestens ein Kind (K9)."""
+    for n in nodes:
+        if n.get("group") == ServiceSelectorModel.GROUP_CATEGORY:
+            if not n.get("children"):
+                return False
+            if not _p1608_no_empty(n["children"]):
+                return False
+    return True
+
+
+# --- T1: verschachtelte Kategorie (A/B/C) -----------------------------------
+_tree13 = _p1608_model(
+    {"plugin_a": _P1608Plugin("plugin_a", category="A/B/C")}).build_tree()
+_plugs13 = _p1608_group(_tree13, ServiceSelectorModel.GROUP_PLUGINS)
+_children13 = _plugs13["children"] if _plugs13 else []
+check("P16.08 T1) Ordner A (category_node, Label '📁 A')",
+      len(_children13) == 1
+      and _children13[0].get("group") == ServiceSelectorModel.GROUP_CATEGORY
+      and _children13[0].get("label") == "📁 A", str(_children13))
+_lvl_b13 = _children13[0]["children"] if _children13 else []
+check("P16.08 T1) Ordner B unter A",
+      len(_lvl_b13) == 1 and _lvl_b13[0].get("label") == "📁 B", "")
+_lvl_c13 = _lvl_b13[0]["children"] if _lvl_b13 else []
+check("P16.08 T1) Ordner C unter B",
+      len(_lvl_c13) == 1 and _lvl_c13[0].get("label") == "📁 C", "")
+_leaf13 = _lvl_c13[0]["children"] if _lvl_c13 else []
+check("P16.08 T1) Blatt im tiefsten Ordner (C)",
+      len(_leaf13) == 1 and _leaf13[0].get("plugin_id") == "plugin_a",
+      str(_leaf13))
+check("P16.08 T1) Blatt-Dict unveraendert (plugin_id/badge/last_execution)",
+      bool(_leaf13) and set(_leaf13[0]) == {"plugin_id", "badge",
+                                            "last_execution"},
+      str(_leaf13[0] if _leaf13 else None))
+
+# --- T2: ohne/leere/'General'-Kategorie -> oberste Ebene (K1) ----------------
+_plugs13b = _p1608_group(_p1608_model({
+    "no_cat": _P1608Plugin("no_cat"),
+    "empty_cat": _P1608Plugin("empty_cat", category="   "),
+    "general_cat": _P1608Plugin("general_cat", category="General"),
+}).build_tree(), ServiceSelectorModel.GROUP_PLUGINS)
+_ch13b = _plugs13b["children"] if _plugs13b else []
+check("P16.08 T2) ohne/leere/General-Kategorie -> oberste Ebene (K1)",
+      all(c.get("group") != ServiceSelectorModel.GROUP_CATEGORY
+          for c in _ch13b)
+      and {c.get("plugin_id") for c in _ch13b}
+      == {"no_cat", "empty_cat", "general_cat"}, str(_ch13b))
+
+# --- T3: Ordner vor Blaettern, alphabetisch case-insensitiv (K8) ------------
+_ch13c = _p1608_group(_p1608_model({
+    "zeta": _P1608Plugin("zeta", category="Grid"),
+    "alpha": _P1608Plugin("alpha", category="abc"),
+    "middle": _P1608Plugin("middle"),
+    "beta": _P1608Plugin("beta", category="Trend"),
+}).build_tree(), ServiceSelectorModel.GROUP_PLUGINS)
+_ch13c = _ch13c["children"] if _ch13c else []
+_folders13c = [c.get("label") for c in _ch13c
+               if c.get("group") == ServiceSelectorModel.GROUP_CATEGORY]
+_leaves13c = [c.get("plugin_id") for c in _ch13c if c.get("plugin_id")]
+check("P16.08 T3) Ordner vor Blaettern, alphabetisch (K8)",
+      _folders13c == ["📁 abc", "📁 Grid", "📁 Trend"]
+      and _leaves13c == ["middle"],
+      f"folders={_folders13c} leaves={_leaves13c}")
+
+# --- T4: keine leeren Ordner (K9) -------------------------------------------
+check("P16.08 T4) keine leeren Ordner (K9)",
+      _p1608_no_empty(_ch13c) and _p1608_no_empty(_children13), "")
+
+# --- T5: MasterTree-Verhalten (K3/K4/K5/K7) ---------------------------------
+_tree13d = MasterTree(_p1608_model({
+    "plugin_a": _P1608Plugin("plugin_a", category="A/B"),
+    "plain": _P1608Plugin("plain"),
+}))
+_tree13d.expandAll()
+pump()
+_cat_items13 = [i for i in TreeItemIterator(_tree13d)
+                if i is not None
+                and i.data(0, ROLE_NODE_TYPE) == TYPE_CATEGORY]
+# plugin_a mit Kategorie 'A/B' erscheint in BEIDEN Gruppen (⚡ Standalone +
+# 📦 Plugins) -> 2 Baeume x 2 Ordner (A, B) = 4 Ordner-Knoten.
+check("P16.08 T5) Ordner-Knoten im Baum vorhanden",
+      len(_cat_items13) == 4, str(len(_cat_items13)))
+if _cat_items13:
+    _cat13 = _cat_items13[0]
+    check("P16.08 T5) Ordner nicht auswaehlbar (K3)",
+          not (_cat13.flags() & Qt.ItemIsSelectable), "")
+    check("P16.08 T5) Ordner ohne Info-Button (K5)",
+          _tree13d.itemWidget(_cat13, 1) is None, "")
+# Checkbox-Modus: Ordner nicht anhakbar (K4); Plugin-Blatt in Ordner bleibt
+# checked_services-faehig.
+_tree13d.set_checkable(True)
+pump()
+_cat_items13b = [i for i in TreeItemIterator(_tree13d)
+                 if i is not None
+                 and i.data(0, ROLE_NODE_TYPE) == TYPE_CATEGORY]
+if _cat_items13b:
+    check("P16.08 T5) Ordner nicht anhakbar im Checkbox-Modus (K4)",
+          all(not (i.flags() & Qt.ItemIsUserCheckable)
+              for i in _cat_items13b), "")
+_tree13d.set_checked_feature_ids(["plugin_a"])
+_svcs13 = _tree13d.checked_services()
+check("P16.08 T5) Plugin-Blatt in Ordner bleibt checked_services-faehig",
+      any(s.get("plugin_id") == "plugin_a" for s in _svcs13), str(_svcs13))
+if _cat_items13b:
+    _tree13d.setCurrentItem(_cat_items13b[0])
+    check("P16.08 T5) Ordner-Selektion -> Default (K7)",
+          _tree13d.current_selection() == {"set_id": "", "service_id": ""},
+          str(_tree13d.current_selection()))
+_tree13d.hide()
+pump()
 
 print("-" * 60)
 if FAILURES:

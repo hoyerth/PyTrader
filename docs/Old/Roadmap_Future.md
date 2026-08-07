@@ -63,3 +63,5 @@ Others Topics -
 3. **Massentests & Parameter-Optimierung:** Automatische Parameter-Sweeps über verschiedene Zeiträume, Service-Parameter und ML-Variablen.
 4. **Aktive ML-Inferenz:** In Phase 15 wird ML noch nicht aktiv eingebunden; die bestehenden Profil-Strukturen (`"ml_models"` im JSON-Payload) bleiben rein vorbereitend vorhanden.
 6. **VectorBT: ** Einsatz prüfen für Massentests und Matrix-Analysen - Als Engine im analytics_worker.py für blitzschnelle N-Bar Outcomes, Heatmaps & Indikator-Sweeps.
+
+- grobe kurs sync zwischen symbolen überwachen:  SILVER, GOLD, NQ, S&P, DAYX etc. - Monitoring Board als Indikator mit eigenem Fenster?
