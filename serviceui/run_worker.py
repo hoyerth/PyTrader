@@ -31,7 +31,7 @@ Der Worker emittiert NUR Signale (log_message / run_finished / run_failed);
 den Bestaetigungsdialog zeigt der Orchestrator (ServiceWindow) VOR dem Start.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QThread, Signal
 
@@ -145,13 +145,15 @@ class ServiceRunWorker(QThread):
             return ["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
 
     def _execute_timeframe(self, fb, settings, definition: Dict[str, Any],
-                           scope_label: str, tf: str) -> int:
+                           scope_label: str, tf: str) -> Tuple[int, bool]:
         """Fuehrt die Pipeline fuer EINEN Timeframe aus und persistiert die
         Feature-Payloads im feature_store.
 
         Returns:
-            Anzahl geschriebener Feature-Rows (0, wenn keine Daten oder kein
-            Payload vorhanden sind).
+            (stored, had_data) – Anzahl geschriebener Feature-Rows (0, wenn
+            kein Payload vorhanden ist) und ob OHLCV-Daten geladen wurden
+            (False, wenn die Quelle leer war – NUR dann ist die Meldung
+            'Keine OHLCV-Daten' korrekt, 17.01.02 Bugfix).
         """
         from analytics.features.feature_builder import prepare_plugin_df
         from analytics.features.plugins.base_plugin import PluginContext
@@ -161,7 +163,7 @@ class ServiceRunWorker(QThread):
         if df is None or df.empty:
             self.log_message.emit(
                 f"  {self.symbol} {tf}: keine OHLCV-Daten – uebersprungen")
-            return 0
+            return 0, False
 
         df_plugin = prepare_plugin_df(df)
         context = PluginContext(
@@ -190,7 +192,7 @@ class ServiceRunWorker(QThread):
             self.log_message.emit(
                 f"  {iid}: {len(records)} Feature-Row(s) gespeichert "
                 f"({self.symbol} {tf})")
-        return stored
+        return stored, True
 
     # ------------------------------------------------------------------
     # Worker-Loop
@@ -234,10 +236,11 @@ class ServiceRunWorker(QThread):
                 return
 
             total_stored = 0
-            empty_tfs: List[str] = []
+            no_data_tfs: List[str] = []
+            no_payload_tfs: List[str] = []
             for tf in timeframes:
                 try:
-                    stored = self._execute_timeframe(
+                    stored, had_data = self._execute_timeframe(
                         fb, settings, definition, scope_label, tf)
                 except Exception as e:
                     # U15-E (Multi-TF): Ein fehlgeschlagener Timeframe bricht
@@ -249,15 +252,29 @@ class ServiceRunWorker(QThread):
                         continue
                     raise
                 total_stored += stored
-                if stored == 0:
-                    empty_tfs.append(tf)
+                if not had_data:
+                    no_data_tfs.append(tf)
+                elif stored == 0:
+                    no_payload_tfs.append(tf)
 
-            # Single-TF ohne Daten -> Fehler (bisheriges Verhalten erhalten).
-            if len(timeframes) == 1 and empty_tfs:
-                self.run_failed.emit(
-                    scope_id,
-                    f"Keine OHLCV-Daten fuer {self.symbol} {timeframes[0]}.")
-                return
+            # Single-TF-Fehler differenzieren (17.01.02 Bugfix): Die
+            # Meldung 'Keine OHLCV-Daten' ist NUR korrekt, wenn die Quelle
+            # leer war. Waren Daten vorhanden, aber der Service hat keinen
+            # Feature-Store-Payload erzeugt, wird das praezise gemeldet
+            # (z. B. Scaffold mit records=[], unbekannter Modus).
+            if len(timeframes) == 1:
+                if no_data_tfs:
+                    self.run_failed.emit(
+                        scope_id,
+                        f"Keine OHLCV-Daten fuer {self.symbol} {timeframes[0]}.")
+                    return
+                if no_payload_tfs:
+                    self.run_failed.emit(
+                        scope_id,
+                        f"Kein Feature-Store-Payload erzeugt fuer "
+                        f"{self.symbol} {timeframes[0]} (Service lieferte "
+                        f"0 Records – Daten waren vorhanden).")
+                    return
 
             self.log_message.emit(
                 f"Fertig: {total_stored} Feature-Row(s) im feature_store "

@@ -669,3 +669,79 @@ Daher: `srv_swing_structure: fertig (kein Feature-Store-Payload)` und
 * `test/` enthaelt wieder nur `test/test.py` (temporaere Helfer/Logs/Test-DB
   entfernt). Kapitel 17.01.02 ist damit abgeschlossen.
 * Naechste Kapitel (Roadmap): 17.02 Trend Services.
+
+## 9.4 Teil 3 (07.08.2026, 2. Bugfix-Runde) - srv_swing_momentum + srv_swing_volume_profile + Worker-Meldung
+
+### Problem (User-Meldungen)
+1. `srv_swing_momentum`: "FEHLER bei Ausfuehrung - Keine OHLCV-Daten fuer SILVER H1"
+2. `srv_swing_volume_profile`: identische Fehlermeldung
+3. `srv_swing_structure` funktionierte (56.751 Rows) -> Daten waren vorhanden.
+
+**Root Cause:** Beide Services waren noch **Scaffold** aus 17.01 (records=[]).
+Der `ServiceRunWorker` meldete bei `stored == 0` pauschal `Keine OHLCV-Daten`,
+obwohl die Quelle gefuellt war. Zwei Fixes: echte Erkennung in beiden Services
++ Meldungs-Differenzierung im Worker.
+
+### Aenderungen in `analytics/features/definitions/srv_swing_momentum.py`
+* **Scaffold ersetzt** durch echte Erkennung, 3 Modi (Datenvertrag 17.01 §4,
+  dichte Record-Reihe, kausale Zeitstempel, INSUFFICIENT_DATA am Start):
+  * `MA_Peak_Hysteresis`: MA-Serie ueber `MATemplateEngine.calculate_ma`
+    (alle 12 Typen, VWMA nutzt tick_volume); Pivot erst bei Gegenbewegung
+    >= `piv_maxMaMovePct` % (strength PERCENT).
+  * `MA_Slope_Change`: Vorzeichenwechsel der MA-Steigung (strength NORMALIZED).
+  * `Chande_Kroll_Ratchet`: Trailing-Stop = Highest-High/Lowest-Low ueber
+    `chande_lookback` +- `x_atr` x ATR (strength ATR_MULTIPLE).
+* Modul-Helfer: `_atr_series`, `_detect_ma_hysteresis`, `_detect_ma_slope`,
+  `_detect_chande_kroll`.
+* **Bugfix waehrend Tests:** Warmup-NaN (z. B. SMA/WMA/HMA/EHMA/ZLEMA/KAMA/
+  ALMA/VWMA) liess die Hysterese dauerhaft auf NaN haengen -> 0 Swings.
+  Fix: erstes finites MA-Extremum als Startpunkt.
+
+### Aenderungen in `analytics/features/definitions/srv_swing_volume_profile.py`
+* **Scaffold ersetzt** durch echte Erkennung, 3 Modi (Zusatzfelder §4.2):
+  * `Volume_Profile`: entwickelndes Profil je `profile_period` (Bars/Sessions/
+    Days/Weeks/Months) mit POC/VAH/VAL, LVN-Detektion (`lvn_sensitivity`),
+    `is_lvn_swing`; Felder volume_source/poc_price/vah_price/val_price/
+    lvn_price/is_lvn_swing.
+  * `Grid_Proximity`: naechstes Rasterlevel (`grid_step`) + Level-Crossings;
+    Feld grid_price.
+  * `Anchored_VWAP`: VWAP ab Session/Week/Month-Start +- vwap_band_mult x
+    StDev; Felder vwap_price/vwap_upper/vwap_lower; event=Anker-Bar.
+* Modul-Helfer: `_volume_series`, `_profile_for`, `_group_ids`, `_anchored_vwap`.
+* **Hinweis:** 'Sessions' wird ohne Session-Kalender als Kalendertag (24h)
+  behandelt (Batch-Datenlieferant, dokumentiert im Header).
+* **Bugfix waehrend Tests:** `DatetimeIndex` hat kein `.dt` (identisch zu
+  srv_swing_structure) -> Formatierung direkt via `.strftime`.
+
+### Aenderungen in `serviceui/run_worker.py`
+* `_execute_timeframe` liefert jetzt `(stored, had_data)`.
+* Single-TF-Fehler werden differenziert (17.01.02 Bugfix):
+  * Quelle leer -> weiterhin `Keine OHLCV-Daten fuer ...` (bestehender Test
+    U18 bleibt gruen).
+  * Daten vorhanden, aber 0 Records -> praezise
+    `Kein Feature-Store-Payload erzeugt fuer ... (Service lieferte 0 Records
+    - Daten waren vorhanden)`.
+
+### Verifikation (headless, keine UI-Tests)
+* **Syntax:** `py_compile` auf den 3 Dateien + `test/test.py` – PASS.
+* **`test/test.py` Teil 18 (NEU, 62 Checks):**
+  * T1) momentum: 3 Modi dicht (864/864), Highs/Lows > 0, kausal, schema;
+    alle 12 MA-Typen liefern Swings (> 0); Start-INSUFFICIENT_DATA.
+  * T2) volume_profile: 3 Modi dicht + kausal + schema; Felder §4.2 je Modus;
+    VA-Grenzen konsistent (vah >= poc >= val); VWAP upper >= vwap >= lower.
+  * T3) `store_plugin_payload` auf Test-DuckDB: beide feature_ids mit
+    konfliktfreiem 4-Spalten-PK (864 Rows je Feature auf derselben Bar).
+  * T4) Worker-Meldung: Daten + 0 Records -> `Kein Feature-Store-Payload`
+    (nicht `Keine OHLCV-Daten`).
+* **DB-Investigations-Query (SILVER H1, data/analytics.duckdb):**
+  srv_swing_momentum 56.751 Bars (1.070/1.070), srv_swing_structure 56.751
+  (7.527/7.793), srv_swing_volume_profile 56.751 (19.325/4.947). Die Asymmetrie
+  des Volume-Profile-Services ist bedingt durch `close >= vah` als
+  Swing-High-Definition bei vorwiegend oberhalb der VA liegenden Schluessen
+  (Default-Modus) – statistisch zu beobachten (17.02).
+* **Verbleibende 6 Harness-FAILURES** (unbeteiligt): P2, P5, H3, H4, H5, H7.
+
+## 9.5 Test-Cleanup (2. Runde)
+* `test/` enthaelt wieder nur `test/test.py` (temporaere Helfer/Logs/Test-DBs
+  entfernt). Kapitel 17.01.02 ist mit allen 3 Swing-Services abgeschlossen.
+* Naechste Kapitel (Roadmap): 17.02 Trend Services.
