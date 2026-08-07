@@ -590,6 +590,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # Persistenz + EventBus-Sync.
         tree.run_service_requested.connect(self._on_run_service)
         tree.run_set_requested.connect(self._on_run_set)
+        # 17.01.02 (Bugfix-Runde): Run-/Info-Aktionen der Services-Gruppe
+        # (Plugin-Zeilen einzeln, Kategorie-Ordner rekursiv, Ordner-Info).
+        tree.run_plugin_requested.connect(self._on_run_plugin)
+        tree.run_category_requested.connect(self._on_run_category)
+        tree.category_info_requested.connect(self._on_category_info_requested)
 
     @Slot(str)
     def _toolbar_add_service(self, plugin_id: str,
@@ -773,6 +778,113 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.log("Ausführung abgebrochen.")
             return
         self._start_run_worker(set_id, definition, instance_id=None)
+
+    @Slot(str)
+    def _on_run_plugin(self, plugin_id: str) -> None:
+        """'▶️ Diesen Service ausführen' (Plugin-Zeile unter 📦 Services).
+
+        17.01.02 (Bugfix-Runde): Einzel-Services ausserhalb von Sets (z.B.
+        unter Kategorie-Ordnern) erhalten dieselbe Run-Aktion wie die
+        Service-Zeilen der Sets. Sicherheitsabfrage mit Plugin-Name und dem
+        aktuell gewaehlten Symbol/Timeframe, danach gezielter Single-Run via
+        ServiceRunWorker mit einer Ad-hoc-Mini-Definition (nur dieser
+        Service; prepare_worker_definition loest ggf. dependencies auf).
+        """
+        if not plugin_id:
+            return
+        symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
+        # U15-E: Timeframe-Control der Filterleiste (combo_tf) – kann auch
+        # 'ALLE Timeframes' sein (Multi-TF-Ausfuehrung im Worker).
+        timeframe = self.combo_tf.currentText() if self.combo_tf else "H1"
+        reply = QMessageBox.question(
+            self, "Service ausführen",
+            f"Service '{plugin_id}' ausführen?\n\n"
+            f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+            f"Der erzeugte Feature-Store-Payload wird in analytics.duckdb "
+            f"geschrieben.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            self.log("Ausführung abgebrochen.")
+            return
+        definition = {
+            "set_id": f"plugin_{plugin_id}",
+            "display_name": plugin_id,
+            "execution_order": [plugin_id],
+            "services": {plugin_id: {"plugin_id": plugin_id}},
+        }
+        self._start_run_worker(plugin_id, definition, instance_id=plugin_id)
+
+    @Slot(str)
+    def _on_run_category(self, category_path: str) -> None:
+        """'▶️ Alle Services ausführen' (Kategorie-Ordner unter 📦 Services).
+
+        17.01.02 (Bugfix-Runde): Ordner-Knoten erhalten dieselbe Run-Aktion
+        wie die Sets. Es werden ALLE Services unter dem Ordner ausgefuehrt
+        (rekursiv, inkl. Unter-Ordner – via
+        ServiceSelectorModel.category_plugin_ids). Sicherheitsabfrage mit
+        Kategorie-Name und dem aktuell gewaehlten Symbol/Timeframe, danach
+        gezielter Set-Run mit einer Ad-hoc-Definition.
+        """
+        if not category_path:
+            return
+        model = getattr(self.service_selector, "model", None)
+        if model is None:
+            return
+        plugin_ids = model.category_plugin_ids(category_path)
+        if not plugin_ids:
+            self.log(f"Kategorie '{category_path}' hat keine Services – "
+                     f"Ausführung abgebrochen.")
+            return
+        symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
+        # U15-E: Timeframe-Control der Filterleiste (combo_tf) – kann auch
+        # 'ALLE Timeframes' sein (Multi-TF-Ausfuehrung im Worker).
+        timeframe = self.combo_tf.currentText() if self.combo_tf else "H1"
+        count = len(plugin_ids)
+        reply = QMessageBox.question(
+            self, "Alle Services ausführen",
+            f"Alle Services ({count}) der Kategorie '{category_path}' "
+            f"ausführen?\n\n"
+            f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+            f"Die erzeugten Feature-Store-Payloads werden in analytics.duckdb "
+            f"geschrieben.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            self.log("Ausführung abgebrochen.")
+            return
+        definition = {
+            "set_id": f"category_{category_path}",
+            "display_name": category_path,
+            "execution_order": list(plugin_ids),
+            "services": {pid: {"plugin_id": pid} for pid in plugin_ids},
+        }
+        self._start_run_worker(category_path, definition, instance_id=None)
+
+    @Slot(str)
+    def _on_category_info_requested(self, category_path: str) -> None:
+        """Info-Dialog fuer einen Kategorie-Ordner (17.01.02, wie Set-Info).
+
+        Read-Only-Liste aller Services unter dem Ordner (rekursiv) mit dem
+        Kategorie-Pfad als Titel – analog zur Set-Info (ServiceDescription
+        Dialog.from_set, keine persistierbare Beschreibung).
+        """
+        if not category_path:
+            return
+        model = getattr(self.service_selector, "model", None)
+        if model is None:
+            return
+        plugin_ids = model.category_plugin_ids(category_path)
+        definition = {
+            "set_id": f"category_{category_path}",
+            "display_name": category_path,
+            "description": f"Kategorie-Ordner: {category_path}",
+            "execution_order": list(plugin_ids),
+            "services": {pid: {"plugin_id": pid} for pid in plugin_ids},
+        }
+        try:
+            dlg = ServiceDescriptionDialog.from_set(definition, parent=self)
+            dlg.exec()
+        except (RuntimeError, AttributeError) as e:
+            self.log(f"Info-Dialog nicht möglich: {e}")
 
     @Slot(str, int)
     def _on_run_worker_finished(self, scope_id: str, stored: int) -> None:

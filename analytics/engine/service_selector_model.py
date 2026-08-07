@@ -464,6 +464,32 @@ class ServiceSelectorModel(QObject):
                 n["children"] = self._sort_category_nodes(n.get("children") or [])
         return result
 
+    def category_plugin_ids(self, category_path: str) -> List[str]:
+        """Alle Plugin-IDs unter einem Kategorie-Pfad (rekursiv, 17.01.02).
+
+        Liefert deterministisch (alphabetisch) alle Plugins, deren
+        `metadata['category']`-Pfad mit `category_path` beginnt – d.h. auch
+        Plugins in UNTER-Ordnern (z.B. Pfad 'Swing Points' liefert auch
+        Plugins aus 'Swing Points/Geometrie'). Pfad-Format: slash-separiert
+        OHNE '📁 '-Praefixe (z.B. 'Swing Points/Geometrie'), case-insensitiv.
+
+        Grundlage fuer:
+          * Kontextmenue '▶️ Alle Services ausführen' auf Ordner-Knoten
+            (run_category_requested).
+          * Info-Button auf Ordner-Knoten (category_info_requested).
+        """
+        target = [p.strip().lower() for p in str(category_path or "").split("/")
+                  if p.strip()]
+        if not target:
+            return []
+        plugins = self.get_plugins()
+        result: List[str] = []
+        for pid in sorted(plugins.keys()):
+            parts = [p.lower() for p in self._category_parts(plugins.get(pid))]
+            if len(parts) >= len(target) and parts[:len(target)] == target:
+                result.append(pid)
+        return result
+
     def _category_nodes(self, plugin_ids: List[str]) -> List[Dict[str, Any]]:
         """Baut die (ggf. verschachtelte) Kinderliste einer Plugin-Gruppe.
 

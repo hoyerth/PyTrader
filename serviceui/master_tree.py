@@ -203,6 +203,16 @@ class MasterTree(QTreeWidget):
     # Bestaetigungsdialog (Set/Service + Symbol/Timeframe).
     run_service_requested = Signal(str, str)
     run_set_requested = Signal(str)
+    # 17.01.02 (Bugfix-Runde): Run-/Info-Aktionen fuer die Services-Gruppe.
+    #   run_plugin_requested(plugin_id)  – '▶️ Diesen Service ausführen'
+    #                                      (Einzel-Plugin-Zeile, ohne Set)
+    #   run_category_requested(path)     – '▶️ Alle Services ausführen'
+    #                                      (Kategorie-Ordner, rekursiv; path
+    #                                      z.B. 'Swing Points/Geometrie')
+    #   category_info_requested(path)    – Info-Button auf Kategorie-Ordnern
+    run_plugin_requested = Signal(str)
+    run_category_requested = Signal(str)
+    category_info_requested = Signal(str)
 
     def __init__(self, model, parent=None) -> None:
         super().__init__(parent)
@@ -515,9 +525,31 @@ class MasterTree(QTreeWidget):
                    else f"im {label}")
         item.setToolTip(1, tooltip)
 
+    def _category_path_of(self, item) -> str:
+        """Voller Kategorie-Pfad eines Ordner-Items (17.01.02).
+
+        Sammelt die Ordner-Labels von der Wurzel bis zum Item und verkettet
+        sie slash-separiert OHNE '📁 '-Praefix (z.B. 'Swing Points/Geometrie').
+        Liefert '' fuer Nicht-Ordner-Items oder leere Ketten. Das Format
+        entspricht exakt `ServiceSelectorModel.category_plugin_ids()`.
+        """
+        parts: List[str] = []
+        node = item
+        hops = 0
+        while node is not None and isValid(node) and hops < 64:
+            if node.data(0, ROLE_NODE_TYPE) == TYPE_CATEGORY:
+                label = str(node.data(0, ROLE_SET_ID) or "").strip()
+                if label.startswith("📁"):
+                    label = label[len("📁"):].lstrip()
+                if label:
+                    parts.append(label)
+            node = node.parent()
+            hops += 1
+        return "/".join(reversed(parts))
+
     def _attach_item_buttons(self) -> None:
         """Haengt die Info-Buttons (Spalte 1) an alle Service-/Set-/Plugin-
-        Zeilen (Bugfix 05.08.2026).
+        Zeilen UND Kategorie-Ordner (Bugfix 05.08.2026 / 17.01.02).
 
         Der Button ist ein kompakter QPushButton ("ℹ", Icon-Breite) und ersetzt
         die frueheren Text-Badges. Gehoert die Zeile einem Indikator (Tooltip
@@ -527,14 +559,19 @@ class MasterTree(QTreeWidget):
           Service-Zeile -> (set_id, instance_id, plugin_id)
           Set-Zeile      -> (set_id, "", "")
           Plugin-Zeile   -> ("", "", plugin_id)
-        Gruppen-Knoten (📁/⚡/📦) erhalten bewusst KEINEN Button.
+          Kategorie-Ordner -> `category_info_requested(Kategorie-Pfad)`
+            (17.01.02: wie bei Sets – der Ordner-Button zeigt die Kategorie-
+            Info mit allen Services unter dem Ordner).
+        Gruppen-Knoten (📁 Sets / 📦 Services, TYPE_GROUP) erhalten bewusst
+        KEINEN Button.
         """
         try:
             for item in TreeItemIterator(self):
                 if item is None or not isValid(item):
                     continue
                 node_type = item.data(0, ROLE_NODE_TYPE)
-                if node_type not in (TYPE_SERVICE, TYPE_SET, TYPE_PLUGIN):
+                if node_type not in (TYPE_SERVICE, TYPE_SET, TYPE_PLUGIN,
+                                     TYPE_CATEGORY):
                     continue
                 tooltip = item.toolTip(1) or ""
                 set_id = str(item.data(0, ROLE_SET_ID) or "")
@@ -559,9 +596,19 @@ class MasterTree(QTreeWidget):
                     f" font-weight:bold; background:transparent; }}")
                 if tooltip:
                     btn.setToolTip(tooltip)
-                btn.clicked.connect(
-                    lambda _=False, s=set_id, svc=service_id, pid=plugin_id:
-                    self.info_requested.emit(s, svc, pid))
+                # 17.01.02: Kategorie-Ordner emittieren category_info_requested
+                # mit dem vollen Kategorie-Pfad (analog Set-Info).
+                if node_type == TYPE_CATEGORY:
+                    cat_path = self._category_path_of(item)
+                    btn.setToolTip(
+                        f"Kategorie: {cat_path or '?'}")
+                    btn.clicked.connect(
+                        lambda _=False, cp=cat_path:
+                        self.category_info_requested.emit(cp))
+                else:
+                    btn.clicked.connect(
+                        lambda _=False, s=set_id, svc=service_id, pid=plugin_id:
+                        self.info_requested.emit(s, svc, pid))
                 self.setItemWidget(item, 1, btn)
         except (RuntimeError, AttributeError):
             pass
@@ -937,10 +984,13 @@ class MasterTree(QTreeWidget):
                                      'Order ▲/▼', 'Service entfernen',
                                      'Service-Info anzeigen' (move/remove/
                                      info_requested)
-          * Ausserhalb eines Sets (Plugin-Zeilen, ⚡-/📦-Gruppen):
-                                     Order/Entfernen/Umbenennen ausgegraut;
-                                     'Service-Info anzeigen' bleibt fuer
-                                     Plugin-Zeilen aktiv.
+          * Plugin-Zeile (Services) -> '▶️ Diesen Service ausführen'
+                                     (run_plugin_requested, einzeln) +
+                                     'Service-Info anzeigen' (17.01.02)
+          * Kategorie-Ordner      -> '▶️ Alle Services ausführen'
+                                     (run_category_requested, rekursiv) +
+                                     'Ordner-Info anzeigen' (17.01.02)
+          * Sonstige Gruppen      -> Order/Entfernen ausgegraut (17.01.02).
 
         isValid-Guards: Bei wildem Klicken koennen Items zwischen itemAt() und
         Datenzugriff C++-seitig zerstoert sein (Access-Violation-Schutz).
@@ -958,9 +1008,25 @@ class MasterTree(QTreeWidget):
             except (RuntimeError, AttributeError):
                 pass
             node_type = item.data(0, ROLE_NODE_TYPE)
-            # 16.08 (K6): Ordnerknoten erhalten KEIN Kontextmenue (kein
-            # run_service/info/move/remove auf Ordnern).
+            # 17.01.02 (Bugfix-Runde): Kategorie-Ordner erhalten jetzt ein
+            # Kontextmenue mit '▶️ Alle Services ausführen' (rekursiv, alle
+            # Services unter dem Ordner) + 'Ordner-Info anzeigen' (analog zu
+            # den Set-Aktionen in der 📁-Gruppe).
             if node_type == TYPE_CATEGORY:
+                cat_path = self._category_path_of(item)
+                if not cat_path:
+                    return
+                menu = QMenu(self)
+                act_run = menu.addAction("▶️ Alle Services ausführen")
+                act_run.triggered.connect(
+                    lambda _=False, cp=cat_path:
+                    self.run_category_requested.emit(cp))
+                menu.addSeparator()
+                act_info = menu.addAction("Ordner-Info anzeigen")
+                act_info.triggered.connect(
+                    lambda _=False, cp=cat_path:
+                    self.category_info_requested.emit(cp))
+                menu.exec(self.viewport().mapToGlobal(pos))
                 return
             menu = QMenu(self)
             if node_type == TYPE_GROUP:
@@ -1042,7 +1108,25 @@ class MasterTree(QTreeWidget):
                     lambda _=False: self.purge_trash_requested.emit())
                 menu.exec(self.viewport().mapToGlobal(pos))
                 return
-            # Plugin-Zeile (standalone/plugins) – nur Info aktiv
+            # Plugin-Zeile (Services-Gruppe / Kategorie-Ordner):
+            # 17.01.02 (Bugfix-Runde) – '▶️ Diesen Service ausführen' wie bei
+            # den Set-Service-Zeilen (einzelner Run, Sicherheitsabfrage durch
+            # den Orchestrator); 'Service-Info anzeigen' bleibt aktiv.
+            if node_type == TYPE_PLUGIN:
+                plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
+                menu = QMenu(self)
+                act_run = menu.addAction("▶️ Diesen Service ausführen")
+                act_run.triggered.connect(
+                    lambda _=False, p=plugin_id:
+                    self.run_plugin_requested.emit(p))
+                menu.addSeparator()
+                act_info = menu.addAction("Service-Info anzeigen")
+                act_info.triggered.connect(
+                    lambda _=False, p=plugin_id:
+                    self.info_requested.emit("", "", p))
+                menu.exec(self.viewport().mapToGlobal(pos))
+                return
+            # Sonstige Nicht-Set-Knoten (Gruppen der Services-Seite)
             self._add_outside_set_actions(menu, item)
             menu.exec(self.viewport().mapToGlobal(pos))
         except (RuntimeError, AttributeError):
