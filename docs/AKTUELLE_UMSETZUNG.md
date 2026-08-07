@@ -445,4 +445,286 @@ python test/test.py
 
 Nach erfolgreichem Testlauf werden temporäre Test-Datenbanken (`*.duckdb`) und temporäre Helfer-Skripte im Ordner `test/` gelöscht. Nur die erweiterte `test/test.py` bleibt als dauerhafter Harness bestehen.
 
+---
 
+# 17.02 Review & Entscheidungen (07.08.2026) - Konsistenzpruefung gegen den Ist-Code
+
+> **Implementierungs-Log (Review, kein Coding):** Am 07.08.2026 wurde das
+> Kapitel "17.02 Trend Services" (frische Doku, Commit `494335e x` - das
+> Dokument enthaelt neben den Phase-17-Grundsaetzen NUR noch die 17.02-
+> Spezifikation) gegen den realen Quellcode geprueft:
+> `analytics/features/plugins/base_plugin.py`, `analytics/features/feature_builder.py`,
+> `analytics/features/definitions/srv_swing_*.py`, `test/test.py`.
+> Die Codebasis ist seit dem letzten Stand unveraendert (keine Source-Commits
+> ausser dem Doku-Commit `494335e x`).
+>
+> Ergebnis: Das Kapitel ist **inhaltlich stimmig** (3 Services, Kategorien,
+> Datenvertrag, Invarianten), aber die Skeleton-Codes und die
+> Umsetzungsanleitung weichen in mehreren Punkten von den Laufzeit-Konventionen
+> ab (siehe Befunde B-1..B-8). **Es wurde kein Code geaendert**; die
+> Entscheidungen E-1..E-8 sind **verbindlich** fuer die Umsetzung.
+
+---
+
+## 1. Verifizierte Ist-Konventionen (Basis des Reviews)
+
+* **`base_plugin.py`:** `PluginMetadata.condition_rules` ist `List[str]`
+  (Basis-Default `[]`, Zeile 167/216). `metadata` und `capabilities` sind in
+  der Basisklasse **Properties**. `api_version`-Basis-Default: `"1"`.
+  `full_parameter_schema()` existiert als Basisklassen-Methode (merged aus
+  `base_parameter_schema` + `parameter_schema`); `base_parameter_schema`
+  liefert `lookback` (expert). `default_params` der Basis nutzt
+  `full_parameter_schema()` (inkl. lookback) - die 17.01.04-Overrides der
+  Services liefern bewusst NUR Plugin-Defaults (ohne lookback).
+* **`srv_swing_structure.py` (Ist-Muster):** `metadata` als Property mit
+  `condition_rules` **als Liste von Strings**, `api_version: "1"`;
+  `capabilities` als Property mit `PluginCapabilities`-Typ; explizite
+  `parameter_order`- und `param_labels`-Properties; `parameter_schema` als
+  flache Kopie der Modul-Konstante; `default_params`-Property +
+  `full_parameter_schema()`-Methode; `calculate()` liefert
+  **`FeatureCalculateResult`** (`{"feature_store_payload": {...}}`-Wrapper);
+  `visible_when`-Deklarationen im Schema (17.01.05); Typ-Imports
+  (`FeatureCalculateResult`, `PluginCapabilities`, `ParameterSchema`,
+  `PluginContext`, `Optional`).
+* **`srv_swing_momentum.py` (Ist):** MA-Berechnung ueber **lokalen Import**
+  `from chart.indicators.utils.ma_template import MATemplateEngine`
+  (try/except-Fallback). Der Pfad `analytics/features/helpers/...` existiert
+  **nicht** (kein Ordner `analytics/features/helpers` im Projekt).
+* **`feature_builder.py` (`store_plugin_payload(symbol, timeframe, payload,
+  con)`, Zeile 606):** Records sind flach (`{bar_time, ...}`); **`symbol`,
+  `timeframe`, `feature_id` setzt der Builder selbst** aus den
+  Aufruf-Parametern bzw. dem Payload - sie duerfen NICHT in den Records
+  stehen. Alles ausser `bar_time` wird per JSON in `feature_data` abgelegt.
+* **`test/test.py`:** Die Teile **22 und 23 existieren bereits** (17.01.05,
+  UI-Dropdown + Info-Label). `calculate()`-Ergebnisse werden ueber
+  `res.get("feature_store_payload")` gelesen.
+* **Git:** Die Arbeit liegt auf **`main`** (Commits b2a7206, 51401b3,
+  494335e). Kein `phase17_02`-Branch vorhanden.
+
+---
+
+## 2. Befunde (Spezifikation vs. Ist-Code)
+
+### B-1 Erfuellte Konventionen (konsistent, unveraendert uebernehmen)
+
+* E-2/E-3: Schema als Modul-Konstante (`_TREND_*_SCHEMA`), Typen als Strings,
+  `parameter_schema`-Property mit flacher Kopie - korrekt in allen 3
+  Skeletons.
+* E-5: `capabilities` mit chart=False/batch/live/feature_store/render -
+  korrekt.
+* E-7: `schema_version: "1.0.0"` in Payload-`metadata` - korrekt.
+* 17.01.04: `default_params`-Property + `full_parameter_schema()`-Methode
+  (merge `base_parameter_schema` + `parameter_schema`) - korrekt.
+* Datenvertrag: Kausale Timestamps (`event/confirmation_bar_time`,
+  `confirmation_lag_bars`), `calculation_status` mit `INSUFFICIENT_DATA` am
+  Serienanfang, 4-Spalten-PK via `store_plugin_payload` - korrekt und additiv
+  zu 17.01 (`result_type` TREND|REVERSAL|BREAKOUT, `strength_type`
+  R2_SCORE|ADX_VALUE|SLOPE_ANGLE|Z_SCORE|ATR_DISTANCE, `confirmation_type`
+  CAUSAL|BAR_CLOSE sind neue, nicht-kollidierende Werte).
+* MasterTree-Kategorien `Trend & Reversal/...` passen zur 2-Gruppen-Struktur
+  (17.01.01: `📁 Sets` / `📦 Services`, Kategorie-Ordner via
+  `metadata["category"]`).
+
+### B-2 Skeleton-Details weichen ab (bei der Umsetzung korrigieren)
+
+* **`condition_rules` als Dict** `{"Mode": "Regel"}` in allen 3 Skeletons -
+  verletzt den `PluginMetadata`-Vertrag (`List[str]`, vgl. Ist-Services mit
+  Listenform).
+* **`metadata`/`capabilities` als Klassenattribut** statt Property - weicht
+  vom Ist-Muster ab; die Basis-Defaults (z. B. generierter `display_name`)
+  gehen verloren.
+* **`api_version: "1.0.0"`** - Ist-Stand ist `"1"` (Basis-Default;
+  `api_version` ist KEIN SemVer-Pflichtfeld wie `schema_version`).
+* **Fehlende `parameter_order`/`param_labels`-Properties** - Ist-Services
+  deklarieren sie als Single Source of Truth fuer das Prop-Fenster.
+* **Fehlende Typ-Imports** - Skeletons importieren nur `PluginFeature`; fuer
+  Typsicherheit (Projektregel 2.5) sind `FeatureCalculateResult`,
+  `PluginCapabilities`, `ParameterSchema`, `PluginContext`, `Optional` noetig.
+* **`calculate(self, df, params, context=None) -> Dict[str, Any]`** mit `pass`
+  - muss `FeatureCalculateResult` liefern (Wrapper) und die volle
+  `Optional[PluginContext]`-Signatur tragen.
+
+### B-3 Datenvertrag §3.1 (korrigieren)
+
+* **Records mit `symbol`/`timeframe`/`feature_id`:** `store_plugin_payload`
+  setzt diese Spalten selbst aus den Aufruf-Parametern/Payload. Ein Record mit
+  diesen Keys wuerde sie als JSON-Doppel in `feature_data` legen.
+  Korrekt: Records tragen **nur `bar_time` + die `feature_data`-Inhalte
+  flach** (exakt das 17.01-Muster).
+* **Top-Level ohne `feature_store_payload`-Wrapper:** `calculate()` liefert
+  `FeatureCalculateResult = {"feature_store_payload": {...}}` (Wrapper ist
+  Pflicht, wird von Worker/Evaluator/Tests konsumiert).
+* **Namensvorschlag `swing_price`:** im Trend-Kontext irrefuehrend -
+  Umbenennung zu `reference_price` (optional, additiv, kein Pflichtfeld).
+* `schema_version` im `feature_data` jedes Records ist zulaessig/gewuenscht
+  (additiv; die 17.01-Services stempeln es im Payload-metadata, der
+  Reader-Default `SCHEMA_VERSION_DEFAULT` ist deckungsgleich).
+
+### B-4 MA-Engine-Pfad in §4 Schritt 3 (korrigieren)
+
+* **`analytics.features.helpers.ma_template.MATemplateEngine` existiert
+  nicht** (kein Ordner `analytics/features/helpers`, verifiziert).
+* Ist-Pfad (srv_swing_momentum.py, Zeile 392):
+  `chart.indicators.utils.ma_template.MATemplateEngine.calculate_ma(
+  df, ma_type, period)` - **lokaler Import** in der Methode mit
+  try/except.
+
+### B-5 Test-Teil-Nummerierung (§4 Schritt 4)
+
+* **"Teil 22" ist bereits belegt** (17.01.05, UI-Dropdown; Teil 23
+  Read-only-Label). Der neue Trend-Teil wird **Teil 24** (naechste freie
+  Nummer im Harness, verifiziert: kein `Teil 24` vorhanden).
+
+### B-6 `visible_when` fehlt in den Skeletons (17.01.05-Konvention)
+
+* Modus-spezifische Parameter (`di_period`/`adx_smooth`/`adx_threshold` nur
+  bei `ADX_DMI`, `r2_threshold` nur bei `Linear_Regression_Slope`,
+  `channel_type`/`ma_type`/`period` nur bei `Donchian_Keltner_Breakout`,
+  `piv_len`/`hma_type`/`hma_smoothing`/`piv_maxHmaMovePct` bei
+  `HMA_Peak_Toleranz`, `ma_type` nur beim Z-Score-Modus) erhalten
+  `visible_when: {"mode": [...]}`-Deklarationen, damit die Conditional
+  Visibility (17.01.05) beim Mode-Wechsel greift.
+
+### B-7 Branch-Strategie (§4 Schritt 1)
+
+* Die Anleitung fordert `git checkout -b phase17_02`. Die gesamte 17.01-
+  Arbeit (inkl. 17.01.04/17.01.05) liegt auf **main**. Entscheidung:
+  **main** (Kontinuitaet, keine verschachtelten Branches; Tags
+  `phase17_02_step*` werden wie bisher auf main gesetzt). Ein separater
+  Branch ist nur auf ausdrueckliche Einzelanweisung des Benutzers sinnvoll.
+
+### B-8 Scaffold-Strategie (Skeletons mit `calculate() = pass`)
+
+* 17.01 nutzte den Zweistufen-Weg (Scaffold mit korrektem Payload +
+  records=[], danach echte Algorithmen in 17.01.02). Da das 17.01-Muster
+  (dichte Record-Reihe, kausale Timestamps, Modul-Helfer) jetzt etabliert und
+  im Harness erprobt ist, wird **direkt die vollstaendige Erkennung**
+  implementiert (kein Scaffold-Zwischenschritt) - inkl. 3 Modi je Service.
+
+---
+
+## 3. Entscheidungen (verbindlich fuer die Umsetzung)
+
+* **E-1 (Stil-Angleichung):** Alle 3 Trend-Services nach dem Ist-Muster von
+  `srv_swing_structure.py`:
+  * `metadata` als `@property def metadata(self) -> Dict[str, Any]` mit
+    `condition_rules` als **Liste** von Strings; `api_version: "1"`; `author`
+    konsistent ("PyTrader AI").
+  * `capabilities` als `@property def capabilities(self) -> PluginCapabilities`.
+  * `parameter_order`- und `param_labels`-Properties (PineScript-Zone).
+  * Typ-Imports (`FeatureCalculateResult`, `PluginCapabilities`,
+    `ParameterSchema`, `PluginContext`, `Optional`, `Any`, `Dict`, `List`).
+  * `calculate(...) -> FeatureCalculateResult` mit
+    `context: Optional[PluginContext] = None` und `feature_store_payload`-
+    Wrapper (feature_id, plugin_version, metadata inkl. schema_version,
+    records).
+* **E-2 (Datenvertrag korrigieren):** §3.1 der 17.02-Spezifikation anpassen -
+  Records ohne `symbol`/`timeframe`/`feature_id` (der Builder setzt sie),
+  Top-Level mit `feature_store_payload`-Wrapper; Feld `swing_price` ->
+  optional `reference_price`.
+* **E-3 (MA-Pfad):** Anleitung §4 Schritt 3 korrigieren auf
+  `chart.indicators.utils.ma_template.MATemplateEngine` (lokaler Import,
+  try/except) - identisch zu `srv_swing_momentum.py`.
+* **E-4 (visible_when):** Schema der 3 Services um `visible_when`-
+  Deklarationen ergaenzen (B-6), damit die Conditional Visibility aus
+  17.01.05 fuer die modus-spezifischen Parameter greift.
+* **E-5 (Test-Teil):** Neuer Harness-Teil **24 (Trend Services Validation)** -
+  nicht Teil 22. Pruefungen analog Teil 17/18: Registry-Discovery,
+  `build_tree()` enthaelt die 3 Kategorien, dichte Records
+  (`len(records) == len(df)`), `schema_version` in Metadata+Records,
+  Kausalitaet (`confirmation_bar_time >= event_bar_time`),
+  Warmup-INSUFFICIENT_DATA, 4-Spalten-PK-Store auf
+  `test/test_p17_trend.duckdb` (wird nach dem Test geloescht, Invariante 10).
+* **E-6 (Branch):** Umsetzung auf **main** (kein `phase17_02`-Branch);
+  Commits + Tags `phase17_02_step*` wie bei 17.01.
+* **E-7 (Direkte Erkennung statt Scaffold):** Vollstaendige `calculate()`-
+  Implementierung in einem Schritt (B-8); kein Zwischen-Commit mit
+  records=[].
+* **E-8 (Verifikation):** `py_compile` auf den 3 neuen Dateien +
+  `test/test.py`; Gesamtlauf `test/test.py` mit erwarteten 6 vorbestehenden
+  Harness-FAILURES (P2, P5, H3, H4, H5, H7 - PersistentWindow-Position/
+  -Groesse, offscreen-bedingt, dokumentierte Baseline). Test-Cleanup gem.
+  Invariante 10.
+
+---
+
+## 4. Ergebnis
+
+* Die 17.02-Spezifikation bleibt als verbindliche Anleitung erhalten; die
+  Punkte B-2..B-5 sowie E-1..E-8 werden **bei der Umsetzung** als
+  Korrekturen gegenueber dem Skeleton-Stand angewendet.
+* **Kein Code geaendert** (Review pur). Dieser Eintrag ist die verbindliche
+  Ergaenzung fuer die Umsetzung von 17.02.
+* Naechster Schritt: Umsetzung von 17.02 (Startschuss des Benutzers
+---
+
+# Bugfix-Log 07.08.2026 (Service-Parameter-Box: Hoehe & Scroll-Verhalten)
+
+> **Implementierungs-Log (Bugfixing-Modus, 07.08.2026):** Der Benutzer meldete
+> zwei aufeinanderfolgende Probleme beim Wechsel des Algorithmus-Dropdowns
+> (Conditional Visibility, 17.01.05) im ServiceWindow:
+
+## Bugfix 1 (Commit `c61e14e`): Box-Hoehe folgt wechselnder Parameterzahl
+
+**Symptom:** Nach der Auswahl eines Algorithmus im Dropdown wurde die Hoehe
+der Box "Service-Parameter" nicht an die wechselnde Anzahl der Parameter
+angepasst – falsch war dagegen die Anpassung der Hoehe der Einzelfelder
+(gestreckte Parameterfelder).
+
+**Ursache:** `_apply_conditional_visibility` blendete die modus-abhaengigen
+Parameter zwar ein/aus, stiess danach aber KEIN `updateGeometry()`/`_reflow()`
+an. Qt 6.11 cached den QWidgetItemV2-sizeHint – ohne Invalidierung blieb die
+alte Box-Hoehe stehen und der QFormLayout verteilte die ueberschuessige Hoehe
+auf die verbliebenen Zeilen (gestreckte Einzelfelder).
+
+**Fix:** Nach dem Ein-/Ausblenden werden die Geometrie-Caches der betroffenen
+Spalten + der Service-Parameter-Box invalidiert und ein deferred Reflow
+angestossen (analog `_setup_collapsible`/`_build_service_columns`).
+
+**Verifikation:** `test/test.py` Teil 25 (T1–T9): Box waechst/schrumpft mit
+der Parameterzahl, Einzelfeld-Hoehen stabil, `py_compile` OK.
+
+## Bugfix 2 (07.08.2026): KEIN Canvas-/Fenster-Versatz – Scrollbox statt Hoehen-Reflow
+
+**User-Anweisung (wörtlich):**
+1) Das Resizing ist ok fuer den Rahmen "Service-Parameter", ABER es soll nicht
+   der gesamte Canvas fuer eine oder mehrere Service-Parameter-Boxen in der
+   Hoehe versetzt werden, ebenso nicht die ganze Fensterhoehe.
+2) Ist der Rahmen "Service-Parameter" zu hoch, soll der Canvas einfach eine
+   Scrollbox aktivieren (so war das mal festgelegt).
+3) Das gilt auch fuer den Tree: Der soll seine Hoehe nicht aufgrund von
+   Service-Parametern anpassen, sondern selbst eine Scrollbar erhalten, falls
+   es so viele Knoten gibt, dass sie nicht in die Box passen.
+
+**Ursache (Bugfix-1-Nebenwirkung):** `_reflow()` -> `_schedule_reflow()` ->
+`_apply_reflow_size()` -> `resize_to_clamped_content()` mit
+`_exact_fit_to_content = True` (ServiceWindow) setzte die FENSTERHOEHE exakt
+auf min(Inhalt, Bildschirm) – dadurch wurde der gesamte Canvas/die
+Fensterhoehe bei jedem Mode-Wechsel versetzt.
+
+**Fix (`serviceui/param_columns.py`, 2 Stellen):**
+* `_apply_conditional_visibility` (Mode-Wechsel): `self._reflow()` ersetzt
+  durch `QTimer.singleShot(0, self._resize_param_box_deferred)` – NUR die Box
+  wird auf ihre Layout-Groesse gesetzt, kein Fenster-Reflow.
+* `_setup_collapsible` (Experten-Optionen ein-/ausklappen): gleiche Umstellung.
+
+**Ergebnis (deckt alle 3 Punkte ab):**
+* Punkt 1: Fensterhoehe bleibt stabil – kein Canvas-/Fenster-Versatz beim
+  Mode-Wechsel (Teil 25 T10/T11: Hoehe identisch vor/nach Wechsel).
+* Punkt 2: Die `_param_scroll`-ContentScrollArea (`widgetResizable=False`,
+  vertikale Scrollbar `AsNeeded`) aktiviert bei Ueberhoehe der Box einen
+  vertikalen Scrollbalken (Teil 25 T12/T13/T13b/T15: Range > 0 bei Ueberhoehe).
+* Punkt 3: Der MasterTree (links) behaelt seine Hoehe; er hat die native
+  QTreeWidget-Scrollbar (`ScrollBarAsNeeded`) und scrollt bei vielen Knoten
+  selbst (Teil 25 T14).
+
+`_build_service_columns` (Set-Load/Initial-Fit) behaelt `_reflow()` bewusst
+bei – nur die box-internen Hoehenaenderungen (Mode-Wechsel, Experten-
+Optionen) loesen keinen Fenster-Reflow mehr aus.
+
+**Verifikation:** `test/test.py` Teil 25 (T1–T15) alle PASS; Gesamtlauf mit
+exakt den 6 vorbestehenden Harness-FAILURES (P2, P5, H3, H4, H5, H7 –
+PersistentWindow-Position/-Groesse, offscreen-bedingt, dokumentierte
+Baseline). Test-Cleanup gem. Invariante 10 (temporaere Helfer entfernt).
+
+  erforderlich).

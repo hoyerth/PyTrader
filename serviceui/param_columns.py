@@ -241,17 +241,25 @@ class ServiceParamColumnsMixin:
         # zahl folgen (nicht die Hoehe der Einzelfelder). Qt 6.11 cached den
         # QWidgetItemV2-sizeHint – ohne updateGeometry()/Re-Indexierung bleibt
         # die alte Hoehe stehen und der QFormLayout streckt die verbliebenen
-        # Zeilen (gestreckte Einzelfelder). Analog zu _setup_collapsible/
-        # _build_service_columns werden daher die Caches der betroffenen
-        # Spalten + der Service-Parameter-Box invalidiert und der deferred
-        # Reflow (Fenster + Box-Resize) angestossen.
+        # Zeilen (gestreckte Einzelfelder). Daher werden die Caches der
+        # betroffenen Spalten + der Service-Parameter-Box invalidiert.
+        #
+        # 07.08.2026 (User-Anweisung): KEIN self._reflow() mehr – der volle
+        # Reflow (_schedule_reflow -> _apply_reflow_size ->
+        # resize_to_clamped_content, _exact_fit_to_content) wuerde die
+        # FENSTERHOEHE an die neue Box-Hoehe anpassen und damit den gesamten
+        # Canvas + die Fensterhoehe versetzen. Gewuenscht: NUR die Box wird
+        # auf ihre Layout-Groesse gesetzt; ist sie zu hoch, zeigt die
+        # ContentScrollArea (_param_scroll) Scrollbalken (Original-Spezifika-
+        # tion Punkt 5). Der Baum (links) behaelt seine Hoehe und scrollt
+        # selbst (User-Anweisung Punkt 3).
         try:
             for col in touched_cols:
                 col.updateGeometry()
             box = getattr(self, "widget_service_columns", None)
             if box is not None:
                 box.updateGeometry()
-            self._reflow()
+            QTimer.singleShot(0, self._resize_param_box_deferred)
         except (RuntimeError, AttributeError):
             pass
 
@@ -389,17 +397,23 @@ class ServiceParamColumnsMixin:
     def _setup_collapsible(self, group: QGroupBox) -> None:
         """Macht eine ausklappbare QGroupBox wirklich kollabierbar.
 
-        Beim Abwählen werden die Kinder ausgeblendet und die Fensterhöhe per
-        _reflow() nahtlos verkleinert (Roadmap 5.4.2.2: Ein-/Ausklappen
-        verändert die Höhe dynamisch). Zusätzlich wird group.updateGeometry()
+        Beim Abwählen werden die Kinder ausgeblendet und die Box-Hoehe per
+        deferred Box-Resize angepasst; die ScrollArea (_param_scroll) zeigt
+        bei Ueberhoehe Scrollbalken. Zusaetzlich wird group.updateGeometry()
         gerufen, damit der gecachte QWidgetItemV2-sizeHint der Box invalidiert
         wird (Qt 6.11: Layouts refreshen diesen Cache sonst NICHT).
+
+        07.08.2026 (User-Anweisung): Frueher lief hier self._reflow() (voller
+        Fenster-Reflow) – dadurch wurde die FENSTERHOEHE an die Box angepasst.
+        Gewuenscht: NUR die Box resizen, Fenster-/Canvas-Hoehe bleibt stabil
+        (Original-Spezifikation: ScrollArea aktiviert bei Ueberhoehe einen
+        Scrollbalken; der Baum scrollt selbst).
         """
         def _toggle(checked: bool) -> None:
             for child in group.findChildren(QWidget):
                 child.setVisible(checked)
             group.updateGeometry()  # QWidgetItemV2-Cache invalidieren (s. oben)
-            self._reflow()
+            QTimer.singleShot(0, self._resize_param_box_deferred)
         group.toggled.connect(_toggle)
         _toggle(group.isChecked())
 
