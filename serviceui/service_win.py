@@ -1825,6 +1825,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
     def _resolve_info_plugin(self, plugin_id: str):
         """Liefert das Plugin aus der Registry (oder None + Log-Eintrag)."""
         try:
+            from analytics.features.feature_builder import PluginRegistry
             return PluginRegistry().get(plugin_id)
         except KeyError:
             self.log(f"Plugin '{plugin_id}' nicht gefunden.")

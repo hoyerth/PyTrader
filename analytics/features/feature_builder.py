@@ -668,12 +668,20 @@ class FeatureBuilder:
             )
             con.register("df_temp", df_rows)
             try:
+                # Bugfix 07.08.2026 (Phase 17 Bugfix-Runde 2): created_at wird
+                # JETZT auch fuer NEUE Rows explizit mit now() geschrieben
+                # (nicht nur im ON CONFLICT-Zweig). Die PK-Migration
+                # (17.01 E-1, test/migrate_pk.py) hat den Spalten-DEFAULT
+                # (current_timestamp) der feature_store-Tabelle entfernt –
+                # ohne die explizite Spalte waeren neue Rows created_at=NULL
+                # und das Datum der letzten Ausfuehrung ('DD.MM.JJ' im
+                # MasterTree) bliebe fuer neu berechnete Services '--.--.--'.
                 con.execute("""
                     INSERT INTO feature_store
                         (symbol, timeframe, bar_time, feature_id,
-                         plugin_version, feature_data)
+                         plugin_version, feature_data, created_at)
                     SELECT symbol, timeframe, bar_time, feature_id,
-                           plugin_version, feature_data
+                           plugin_version, feature_data, now()
                     FROM df_temp
                     ON CONFLICT (symbol, timeframe, bar_time, feature_id) DO UPDATE SET
                         feature_id = EXCLUDED.feature_id,

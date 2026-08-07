@@ -261,6 +261,19 @@ def check_and_init_databases() -> None:
 	con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_id VARCHAR;")
 	con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS plugin_version VARCHAR;")
 	con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_data JSON;")
+	# Bugfix 07.08.2026 (Phase 17 Bugfix-Runde 2): Der Spalten-DEFAULT von
+	# created_at wurde durch die PK-Migration (17.01 E-1, test/migrate_pk.py –
+	# Table-Rewrite + RENAME) entfernt. Seitdem bleiben NEUE feature_store-Rows
+	# ohne explizites created_at NULL und das 'Datum der letzten Ausfuehrung'
+	# (MasterTree, MAX(created_at) je feature_id) zeigt '--.--.--'. Der DEFAULT
+	# wird hier idempotent wiederhergestellt (No-op bei korrekter DB).
+	try:
+		con_analytics.execute(
+			"ALTER TABLE feature_store ALTER created_at "
+			"SET DEFAULT current_timestamp")
+	except Exception as e:
+		print(f"⚠️ [MIGRATION WARNUNG] created_at-Default des feature_store "
+		      f"konnte nicht wiederhergestellt werden: {e}")
 
 	con_app = DbPool.get(DB_APP_DATA)
 	con_app.execute("""
