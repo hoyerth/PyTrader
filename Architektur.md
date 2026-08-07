@@ -1,7 +1,7 @@
 # Architektur-Dokumentation: PyTrader System-Architektur
 
 > **Single Point of Truth:** Dieses Dokument ist die verbindliche Architektur-Datei.
-> Archiv-/Alt-Fassungen (`docs/Old/`) werden nicht mehr gepflegt. Detaillierte
+> Archiv-/Alt-Fassungen (`docs/Current/`) werden nicht mehr gepflegt. Detaillierte
 > Modul- und Tabellen-Beschreibungen liegen direkt im Code (Modul-Docstrings,
 > `db_service.py` als Schema-Source-of-Truth).
 

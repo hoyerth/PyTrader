@@ -115,7 +115,7 @@ _FIXED_GRID_PROXIMITY_SCHEMA: Dict[str, Dict[str, Any]] = {
     # line_width wurden ENTFERNT - Linienart/-staerke werden ausschliesslich
     # ueber den LineStyle-Picker (Sibling-Keys, Konvention 'color' ->
     # 'style'/'width' in indicator_dialog) bedient und persistiert.
-    # Old-Presets ohne diese Keys fallen in _build_style_objects auf die
+    # Current-Presets ohne diese Keys fallen in _build_style_objects auf die
     # Defaults zurueck (solid / 1 px). show_visibility=False: die interne
     # 'sichtbar'-Checkbox des Pickers entfaellt - Sichtbarkeit steuert der
     # separate Param show_lines.
@@ -124,7 +124,7 @@ _FIXED_GRID_PROXIMITY_SCHEMA: Dict[str, Dict[str, Any]] = {
     # Phase 16.06 (07.08.2026): Die Einzelfeld-Deklarationen circle_shape_* /
     # circle_size_* wurden ENTFERNT - Marker-Form/-Groesse werden
     # ausschliesslich ueber den MarkerStyle-Picker (Sibling-Keys, Konvention
-    # 'color' -> 'shape'/'size') bedient und persistiert. Old-Presets ohne
+    # 'color' -> 'shape'/'size') bedient und persistiert. Current-Presets ohne
     # diese Keys fallen in _build_style_objects auf die Defaults zurueck
     # (circle / 6 px).
     "show_lines": {"type": "bool", "default": True, "description": "Grid-Linien anzeigen"},
@@ -501,7 +501,7 @@ class FixedGridProximityIndicator(BaseIndicator):
         line_style (choice, LINE_STYLES) und line_width (int 1..10).
         Ebenso shape/size der Marker aus circle_shape_* (choice,
         MARKER_SHAPES) und circle_size_* (int 1..20). Fehlen die Params
-        (Old-Presets), fallen sie auf die P16.03-Defaults zurueck
+        (Current-Presets), fallen sie auf die P16.03-Defaults zurueck
         (LineStyle: width 1, style 'solid'; MarkerStyle: shape 'circle',
         size 6).
 

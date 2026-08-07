@@ -16,10 +16,10 @@ Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukture
 - Abweichungen davon nur auf ausdrückliche Einzelanweisung des Benutzers.
 - Anpassungen, ob aus dieser Datei oder manuell eingegeben, werden hier in weiteren Kapiteln nach gegebener Taxonomie als Implementierungs-Log mit datum/uhrzeit im Format MD dokumentiert
 
-### 0b. WICHTIG: `docs/Old` NICHT BEACHTEN (Standard)
-- **Alle Dateien im Unterordner `docs/Old` (`docs/Old/x_Architektur.md`, `docs/Old/x_Roadmap.md`, ...) sind archivierte/abgelegte Alt-Dokumente und werden NICHT beachtet.**
+### 0b. WICHTIG: `docs/Current` NICHT BEACHTEN (Standard)
+- **Alle Dateien im Unterordner `docs/Current` und `docs/Archiv` (`docs/Current/x_Architektur.md`, `docs/Current/x_Roadmap.md`, ...) sind archivierte/abgelegte Alt-Dokumente und werden NICHT beachtet.**
 - **Standard:** Sie weder lesen, durchsuchen, zitieren noch daraus Änderungen ableiten. Sie spiegeln NICHT den aktuellen Stand des Projekts wider.
-- **Ausnahme:** Nur auf temporäre, ausdrückliche Einzelanweisung des Benutzers darf eine bestimmte Datei aus `docs/Old` ausnahmsweise herangezogen werden.
+- **Ausnahme:** Nur auf temporäre, ausdrückliche Einzelanweisung des Benutzers darf eine bestimmte Datei aus `docs/Current` ausnahmsweise herangezogen werden.
 
 ---
 
@@ -128,3 +128,17 @@ Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukture
 2. **Status nur als einfacher Prompt ausgeben:** Nach Abschluss eines Schrittes gibt die AI ausschließlich den **Status** (was umgesetzt, validiert und committet wurde) als einfachen Text-Prompt aus.
 3. **Warten auf expliziten Startschuss:** Die AI wartet danach, bis der Anwender **ausdrücklich** die Ausführung des nächsten Schrittes anweist (z. B. „continue" / „setze Schritt X um" / konkrete Anweisung). Ohne diesen expliziten Startschuss wird **kein** weiterer Schritt begonnen.
 4. **Keine unbeabsichtigten Folgeaktionen:** Kein automatisches Anstoßen von Folge-Steps, kein vorauseilendes Commit des nächsten Schrittes und keine Vorschlags-Buttons/Abfragen für den nächsten Schritt – nur der reine Statusbericht.
+
+---
+
+### 7. NAMING CONVENTIONS & FILE HEADERS FOR SERVICES & INDICATORS
+
+Bei der Erstellung oder Überarbeitung von Services (Plugins) und Indikatoren MÜSSEN folgende Regeln strikt eingehalten werden:
+
+1. **Naming & Ordner-Präfixe:**
+   * **Services (in `analytics/features/definitions/`):** Müssen das Präfix `srv_` tragen (z. B. `srv_grid_lines.py` mit `plugin_id = "srv_grid_lines"`). Begriffe wie `service`, `plugin` oder `feature` entfallen im Namen.
+   * **Indikatoren (in `chart/indicators/`):** Müssen das Präfix `ind_` tragen (z. B. `ind_multi_ma.py` mit `indicator_id = "ind_multi_ma"`).
+2. **PineScript-Input-Zone (Header-Dokumentation):**
+   * Das `parameter_schema` / `default_params` muss **direkt auf Klassenebene unter dem Header-Docstring am Dateianfang** platziert werden, damit Eingaben und Defaults wie in PineScript sofort manuell anpassbar sind.
+3. **MasterTree-Kategorisierung:**
+   * Jedes Service-Plugin MUSS in `metadata["category"]` einen Slash-separierten Ordnerpfad angeben (z. B. `"category": "Swing Points/Preis-Grid"`), damit der MasterTree dynamische Kategorie-Ordner rendert.

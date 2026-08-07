@@ -43,9 +43,9 @@ PyTrader/
                 atr_normalized.py
                 ema_diff.py
                 grid_levels.py
-                grid_lines_service.py
                 grid_math.py
-                proximity_service.py
+                srv_grid_lines.py
+                srv_proximity.py
             plugins/
                 __init__.py
                 base_plugin.py
@@ -66,8 +66,8 @@ PyTrader/
         indicators/
             __init__.py
             base_indicator.py
-            fixed_grid_proximity.py
-            multi_ma.py
+            ind_fixed_grid_proximity.py
+            ind_moving_averages.py
             utils/
                 __init__.py
                 chart_data_buffer.py
@@ -251,6 +251,20 @@ Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukture
 2. **Status nur als einfacher Prompt ausgeben:** Nach Abschluss eines Schrittes gibt die AI ausschließlich den **Status** (was umgesetzt, validiert und committet wurde) als einfachen Text-Prompt aus.
 3. **Warten auf expliziten Startschuss:** Die AI wartet danach, bis der Anwender **ausdrücklich** die Ausführung des nächsten Schrittes anweist (z. B. „continue" / „setze Schritt X um" / konkrete Anweisung). Ohne diesen expliziten Startschuss wird **kein** weiterer Schritt begonnen.
 4. **Keine unbeabsichtigten Folgeaktionen:** Kein automatisches Anstoßen von Folge-Steps, kein vorauseilendes Commit des nächsten Schrittes und keine Vorschlags-Buttons/Abfragen für den nächsten Schritt – nur der reine Statusbericht.
+
+---
+
+### 7. NAMING CONVENTIONS & FILE HEADERS FOR SERVICES & INDICATORS
+
+Bei der Erstellung oder Überarbeitung von Services (Plugins) und Indikatoren MÜSSEN folgende Regeln strikt eingehalten werden:
+
+1. **Naming & Ordner-Präfixe:**
+   * **Services (in `analytics/features/definitions/`):** Müssen das Präfix `srv_` tragen (z. B. `srv_grid_lines.py` mit `plugin_id = "srv_grid_lines"`). Begriffe wie `service`, `plugin` oder `feature` entfallen im Namen.
+   * **Indikatoren (in `chart/indicators/`):** Müssen das Präfix `ind_` tragen (z. B. `ind_multi_ma.py` mit `indicator_id = "ind_multi_ma"`).
+2. **PineScript-Input-Zone (Header-Dokumentation):**
+   * Das `parameter_schema` / `default_params` muss **direkt auf Klassenebene unter dem Header-Docstring am Dateianfang** platziert werden, damit Eingaben und Defaults wie in PineScript sofort manuell anpassbar sind.
+3. **MasterTree-Kategorisierung:**
+   * Jedes Service-Plugin MUSS in `metadata["category"]` einen Slash-separierten Ordnerpfad angeben (z. B. `"category": "Swing Points/Preis-Grid"`), damit der MasterTree dynamische Kategorie-Ordner rendert.
 ```
 
 --------------------------------------------------
@@ -985,7 +999,7 @@ def check_and_init_databases() -> None:
 
 	# Phase 12 (Hybrid-Schema): Additive Erweiterung des feature_store um die
 	# Plugin-Architektur. feature_id identifiziert das erzeugende Plugin
-	# (z.B. 'grid_lines'), plugin_version dessen Version und feature_data
+	# (z.B. 'srv_grid_lines'), plugin_version dessen Version und feature_data
 	# haelt den vollstaendigen FeatureStorePayload (JSON). Bestehende Spalten
 	# und Daten bleiben unangetastet.
 	con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_id VARCHAR;")
@@ -2769,7 +2783,7 @@ class StateManager:
 
         # Phase 12 (Hybrid-Schema): Additive Erweiterung der indicator_presets
         # um die Plugin-Verknuepfung. plugin_id verknuepft ein Preset mit einem
-        # Plugin (z.B. 'grid_lines'), version fuehrt die Plugin-Version und
+        # Plugin (z.B. 'srv_grid_lines'), version fuehrt die Plugin-Version und
         # is_active_batch markiert Presets, die von den Batch-Services
         # (HistoricalScanner/LiveAnalyzer) ueber den PluginExecutor aktiv
         # verarbeitet werden. Bestehende Presets und Daten bleiben unangetastet.
@@ -2824,6 +2838,79 @@ class StateManager:
         except Exception as e:
             print(f"WARN [StateManager] Phase-16-Migration (grid_liquidity -> "
                   f"ind_fixed_grid_proximity) fehlgeschlagen: {e}")
+
+        # Phase 16.08.01 (Naming Conventions): Service-Plugin-IDs wurden in
+        # 'srv_grid_lines'/'srv_proximity' umbenannt (Datei-/Klassen-Renames).
+        # Persistierte Alt-Referenzen werden idempotent nachgezogen:
+        #   * service_sets / service_sets_trash / service_set_history
+        #     (definition JSON -> services[].plugin_id)
+        #   * indicator_presets.plugin_id
+        #   * analytics.duckdb/feature_store.feature_id
+        # Additiv und defensiv: nur exakte Alt-Werte werden ersetzt, fehlende
+        # Tabellen/Spalten/DBs werden stillschweigend uebersprungen.
+        _plugin_id_map = {"grid_lines": "srv_grid_lines",
+                          "proximity": "srv_proximity"}
+
+        def _map_plugin_ids_in_definition(definition: Any) -> bool:
+            """Migriert services[].plugin_id in einer Set-Definition (JSON).
+            Liefert True, wenn mindestens ein Wert geaendert wurde."""
+            if not isinstance(definition, dict):
+                return False
+            services = definition.get("services")
+            if not isinstance(services, dict):
+                return False
+            changed = False
+            for cfg in services.values():
+                if not isinstance(cfg, dict):
+                    continue
+                pid = cfg.get("plugin_id")
+                if pid in _plugin_id_map:
+                    cfg["plugin_id"] = _plugin_id_map[pid]
+                    changed = True
+            return changed
+
+        try:
+            for _tbl in ("service_sets", "service_sets_trash", "service_set_history"):
+                try:
+                    _rows = con.execute(
+                        f"SELECT set_id, definition FROM {_tbl}").fetchall()
+                except Exception:
+                    continue  # Tabelle existiert nicht -> ueberspringen
+                for _rid, _raw in _rows:
+                    if _raw is None:
+                        continue
+                    _data = _parse_json_field(_raw) if isinstance(_raw, str) else _raw
+                    if not _map_plugin_ids_in_definition(_data):
+                        continue
+                    con.execute(
+                        f"UPDATE {_tbl} SET definition = ? WHERE set_id = ?",
+                        [json.dumps(_data), _rid])
+        except Exception as e:
+            print(f"WARN [StateManager] 16.08.01-Migration (service_sets-"
+                  f"plugin_ids) fehlgeschlagen: {e}")
+
+        try:
+            for _old_pid, _new_pid in _plugin_id_map.items():
+                con.execute(
+                    "UPDATE indicator_presets SET plugin_id = ? WHERE plugin_id = ?",
+                    [_new_pid, _old_pid])
+        except Exception as e:
+            print(f"WARN [StateManager] 16.08.01-Migration (indicator_presets-"
+                  f"plugin_id) fehlgeschlagen: {e}")
+
+        # analytics.duckdb/feature_store.feature_id (separate DB, defensiv)
+        try:
+            _ana_path = os.path.join(
+                os.path.dirname(self.db_path), "analytics.duckdb")
+            if os.path.exists(_ana_path):
+                _ana_con = DbPool.get(_ana_path)
+                for _old_fid, _new_fid in _plugin_id_map.items():
+                    _ana_con.execute(
+                        "UPDATE feature_store SET feature_id = ? WHERE feature_id = ?",
+                        [_new_fid, _old_fid])
+        except Exception as e:
+            print(f"WARN [StateManager] 16.08.01-Migration (feature_store-"
+                  f"feature_id) fehlgeschlagen: {e}")
 
         # Explicit Column Check via information_schema
         tables_to_migrate = ["instance_states", "symbol_tf_states"]
@@ -3964,14 +4051,14 @@ class WindowStateRepository:
 # analytics/statistics_repository.py
 """
 Statistics Repository – SQL-Aggregations-Queries auf feature_data
-(Proximity-Services, feature_id='proximity') + Forward-Performance.
+(Proximity-Services, feature_id='srv_proximity') + Forward-Performance.
 
 Die Statistik liest die Treffer-Records aus dem feature_store
 (feature_data der Proximity-Services); signal_results-Tabellen existieren
 seit Phase 15 nicht mehr.
 
 Da die feature_store-Tabelle KEINE set_id-Spalte hat, ist das 'Set' im
-neuen Datenmodell die feature_id (Plugin-Identität, z. B. 'proximity').
+neuen Datenmodell die feature_id (Plugin-Identität, z. B. 'srv_proximity').
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -4596,12 +4683,12 @@ class LiveAnalyzer(QThread):
 
         for preset in plugins:
             plugin_id = preset.get("plugin_id")
-            # instance_id = plugin_id → GridLinesService schreibt sein Raster
+            # instance_id = plugin_id → srv_grid_lines schreibt sein Raster
             # in den persistenten shared_state (Namespace-isoliert).
             svc_ctx = replace(self._live_context, instance_id=plugin_id)
-            if plugin_id == "proximity":
-                # Proximity liest das Grid-Raster aus shared_state[depends_on[0]].
-                svc_ctx = replace(svc_ctx, depends_on=["grid_lines"])
+            if plugin_id == "srv_proximity":
+                # srv_proximity liest das Grid-Raster aus shared_state[depends_on[0]].
+                svc_ctx = replace(svc_ctx, depends_on=["srv_grid_lines"])
             try:
                 result = self.plugin_executor.execute(
                     plugin_id, df_short, preset.get("params", {}), context=svc_ctx
@@ -5087,7 +5174,7 @@ class AnalyticsViewModel(QObject):
         """Setzt die Multi-Auswahl der Datenquellen (15.03-E).
 
         `feature_ids` sind die plugin_ids des Feature-Store (z. B.
-        ["grid_lines", "proximity"]); leer = kein Filter (alle Features).
+        ["srv_grid_lines", "srv_proximity"]); leer = kein Filter (alle Features).
         Typen-/Duplikat-normalisiert; ohne Aenderung wird kein Refresh
         ausgeloest (idempotent, wie set_symbol/set_timeframe).
         """
@@ -6083,7 +6170,7 @@ DB_ANALYTICS = str(BASE_DIR / "data" / "analytics.duckdb")
 # E-3 (Phase 15.04, harmonisiert): schema_version-Default fuer Alt-Rows ohne
 # Pflichtfeld. 15.04 vereinheitlicht den Default auf "1.0.0" (dreistellig,
 # Semantic Versioning major.minor.patch) – identisch zum Plugin-Vertrag
-# (grid_lines/proximity/metadata) und zur base_plugin-Spezifikation.
+# (srv_grid_lines/srv_proximity/metadata) und zur base_plugin-Spezifikation.
 # Zuvor stand hier "1.0" (zweistellig) – Reader-Default und Plugin-Vertrag
 # sind seit 15.04 deckungsgleich.
 SCHEMA_VERSION_DEFAULT = "1.0.0"
@@ -6437,7 +6524,7 @@ class FeatureStoreReader:
 
         Robustheit (Bugfix 05.08.2026, Punkt 1):
           * Case-insensitiv: feature_id wird per LOWER(TRIM(...)) normalisiert –
-            Registry-/Plugin-IDs (z.B. 'proximity') werden unabhaengig von der
+            Registry-/Plugin-IDs (z.B. 'srv_proximity') werden unabhaengig von der
             in der DB gespeicherten Gross-/Kleinschreibung gefunden.
           * Whitespace-tolerant: fuehrende/trailing Leerzeichen (z.B. durch
             Alt-Schreibpfade) werden ignoriert.
@@ -6446,7 +6533,7 @@ class FeatureStoreReader:
             gueltiges Datum liefern).
 
         Returns:
-            Dict feature_id (lower) -> 'DD.MM.JJ' (z.B. {'proximity': '05.08.26'});
+            Dict feature_id (lower) -> 'DD.MM.JJ' (z.B. {'srv_proximity': '05.08.26'});
             leer bei fehlender DB/Tabelle oder Fehler (defensiv).
         """
         con = self._get_connection()
@@ -6799,7 +6886,7 @@ ServiceSetRepository in app_data.duckdb persistiert. Bewusst KEINE
 Dataclasses – der ServiceSetEvaluator (Schritt 3) und die UI (Schritte 4/5)
 arbeiten auf denselben Dict-Strukturen wie die JSON-Speicherung.
 
-Multi-Use-Prinzip: Ein Plugin (z.B. grid_lines) kann MEHRFACH in einem Set
+Multi-Use-Prinzip: Ein Plugin (z.B. srv_grid_lines) kann MEHRFACH in einem Set
 vorkommen. Jede Nutzung erhält eine eindeutige instance_id (z.B. grid_1,
 grid_2). execution_order bestimmt die Ausführungs-Reihenfolge, depends_on
 deklariert explizit, welche instance_ids der Service aus dem shared_state
@@ -6813,7 +6900,7 @@ class ServiceInstanceConfig(TypedDict, total=False):
     """Konfiguration einer einzelnen Service-Instanz innerhalb eines Sets.
 
     Attribute:
-        plugin_id:  Dauerhaft stabile Plugin-ID (z.B. 'grid_lines', 'proximity').
+        plugin_id:  Dauerhaft stabile Plugin-ID (z.B. 'srv_grid_lines', 'srv_proximity').
         lookback:   Scan-Fenster über die Historie (Anzahl Bars, df.tail(lookback)).
         params:     Plugin-Parameter (werden gegen das parameter_schema validiert).
         depends_on: Optional. instance_ids, deren shared_state-Einträge dieser
@@ -6840,9 +6927,9 @@ class ServiceSetDefinition(TypedDict, total=False):
       "display_name": "Mein Scalper",
       "execution_order": ["grid_1", "prox_1", "ema_1"],
       "services": {
-        "grid_1": {"plugin_id": "grid_lines", "lookback": 1000,
+        "grid_1": {"plugin_id": "srv_grid_lines", "lookback": 1000,
                    "params": {"step_size": 0.5, "steps_around": 4, "custom_levels": []}},
-        "prox_1": {"plugin_id": "proximity", "lookback": 10000,
+        "prox_1": {"plugin_id": "srv_proximity", "lookback": 10000,
                    "depends_on": ["grid_1"],
                    "params": {"visit_pct": 0.05, "time_window_mins": 5}}
       }
@@ -6910,7 +6997,7 @@ def list_indicators() -> List[Dict[str, Any]]:
     """
     result: List[Dict[str, Any]] = []
     try:
-        from chart.indicators.fixed_grid_proximity import FixedGridProximityIndicator
+        from chart.indicators.ind_fixed_grid_proximity import FixedGridProximityIndicator
         ind = FixedGridProximityIndicator()
         svc_ids = list(getattr(ind, "service_plugin_ids", []) or [])
         # Konsistenter Anzeigename: bevorzugt metadata['indicator_name'] des
@@ -7036,7 +7123,7 @@ class ServiceSelectorModel(QObject):
                   f"lesbar: {e}")
             return {}
         # Case-insensitive Zuordnung (feature_id ist die Plugin-ID, z.B.
-        # 'proximity' – Registry-IDs sind case-insensitiv).
+        # 'srv_proximity' – Registry-IDs sind case-insensitiv).
         return {str(k).lower(): v for k, v in raw.items()}
 
     def last_execution_date(self, plugin_id: str) -> str:
@@ -7127,7 +7214,7 @@ class ServiceSelectorModel(QObject):
     def get_indicator_id(self, plugin_id: str) -> str:
         """Indikator-ID, in der das Plugin laeuft (metadata['indicator_id']).
 
-        Services (grid_lines/proximity) laufen IN einem Indikator
+        Services (srv_grid_lines/srv_proximity) laufen IN einem Indikator
         (Ind_FixedGridProximity -> 'ind_fixed_grid_proximity'); aktiv im Chart sind
         die indicators_state-Keys des Indikators, nicht die Plugin-ID.
         Ohne Angabe faellt die Methode auf die plugin_id selbst zurueck.
@@ -7145,7 +7232,7 @@ class ServiceSelectorModel(QObject):
         """True, wenn das Plugin explizit einem Indikator zugeordnet ist.
 
         Signal: metadata['indicator_id'] ODER metadata['indicator_name'] sind
-        gesetzt (z.B. Ind_FixedGridProximity fuer grid_lines/proximity).
+        gesetzt (z.B. Ind_FixedGridProximity fuer srv_grid_lines/srv_proximity).
         """
         plugin = self.get_plugin(plugin_id)
         if plugin is None:
@@ -7181,7 +7268,7 @@ class ServiceSelectorModel(QObject):
         Indikator – aktiv im Chart sind die indicators_state-Keys des
         Indikators ('ind_fixed_grid_proximity'), nicht die Plugin-ID selbst. Dadurch
         greift die Tooltip-Variante a) ('aktiv <Indikator>') auch fuer
-        Services wie grid_lines/proximity.
+        Services wie srv_grid_lines/srv_proximity.
         """
         key = str(plugin_id).lower()
         if any(pid.lower() == key for pid in self._active_indicator_ids):
@@ -9466,11 +9553,102 @@ class GridLevelsFeature(BaseFeature):
 
 --------------------------------------------------
 
-### DATEI: analytics/features/definitions/grid_lines_service.py
+### DATEI: analytics/features/definitions/grid_math.py
 ```py
-# analytics/features/definitions/grid_lines_service.py
+# analytics/features/definitions/grid_math.py
 """
-Service: GridLines (Phase 13 Schritt 6)
+Phase 15 (U15-B3): Eigenständige Paritäts-Mathematik für Grid-Services.
+
+Die Funktionen sind die eingefrorenen Referenz-Kopien der ehemaligen
+Alt-Implementierung `chart/indicators/grid.py` (am 04.08.2026 entfernt).
+Sie dienen als SINGLE SOURCE OF TRUTH für die Grid-Parität:
+
+* `f_round_to_custom_step` – Rundung auf das nächste Vielfache von step.
+* `build_grid_levels`      – Level-Array (Center ± steps_around × step + Custom).
+* `f_in_window_around`     – natives UTC-Zeitfenster (Minute 0/30 ± span, Wrap-Around).
+* `f_strip_trailing_zeros` – '%.6f' ohne nachgestellte Nullen (Level-Strings).
+
+Die Services (srv_grid_lines.py, srv_proximity.py) importieren diese
+Funktionen und garantieren damit identisches Verhalten zum historischen
+Alt-Indikator, ohne auf das gelöschte Modul zu verweisen.
+
+HINWEIS: Der Indikator-Adapter (chart/indicators/ind_fixed_grid_proximity.py) behält seine
+private Kopie (`_f_in_window_around`) unverändert – sie wird nicht umgestellt.
+Das Alt-Plugin analytics/features/definitions/grid_liquidity.py wurde am
+04.08.2026 archiviert/entfernt (Schema ist im Indikator selbst hinterlegt).
+"""
+
+from typing import List, Optional
+
+
+def f_round_to_custom_step(price: float, step: float) -> float:
+    """Rundet price auf das nächste Vielfache von step.
+
+    Exakte Parität zur ehemaligen chart/indicators/grid.py.
+    """
+    if step <= 0:
+        return price
+    inv_step = 1.0 / step
+    return round(price * inv_step) / inv_step
+
+
+def build_grid_levels(
+    last_close: float,
+    step_size: float,
+    steps_around: int,
+    custom_levels: Optional[List[float]] = None,
+) -> List[float]:
+    """Sortierte Level-Liste (absteigend) – exakte Parität zum Alt-Grid.
+
+    grid.py (historisch):
+      center_price = f_round_to_custom_step(last_close, step_size)
+      grid_levels  = {round(center_price + i*step_size, 6)
+                      | i in range(-steps_around, steps_around+1)}
+      + {round(c_lvl, 6) | c_lvl in custom_levels, c_lvl > 0.0}
+    """
+    center_price = f_round_to_custom_step(last_close, step_size)
+    grid_levels: set = set()
+    for i in range(-steps_around, steps_around + 1):
+        grid_levels.add(round(center_price + (i * step_size), 6))
+    for c_lvl in (custom_levels or []):
+        v = float(c_lvl)
+        if v > 0.0:
+            grid_levels.add(round(v, 6))
+    return sorted(list(grid_levels), reverse=True)
+
+
+def f_in_window_around(minute_val: int, center: int, span: int) -> bool:
+    """Native UTC-Zeitfenster-Logik – exakte Parität zum Alt-Grid.
+
+    True, wenn minute_val im Fenster center ± span liegt (mit Wrap-Around
+    über 0/59). Zentren: 0 (ganze Stunde) und 30 (halbe Stunde).
+    """
+    lower = center - span
+    upper = center + span
+    if lower < 0:
+        return minute_val >= (60 + lower) or minute_val <= upper
+    elif upper > 59:
+        return minute_val >= lower or minute_val <= (upper - 60)
+    else:
+        return lower <= minute_val <= upper
+
+
+def f_strip_trailing_zeros(val: float) -> str:
+    """'%.6f' ohne nachgestellte Nullen – exakte Parität zum Alt-Grid."""
+    s = f"{val:.6f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/features/definitions/srv_grid_lines.py
+```py
+# analytics/features/definitions/srv_grid_lines.py
+"""
+Service: GridLines (Phase 13 Schritt 6) – Naming Convention 16.08.01: srv_
 
 Paritäts-Service zur Alt-Implementierung (ehemals chart/indicators/grid.py,
 am 04.08.2026 entfernt) – baut das Level-Raster EXAKT wie der Alt-Indikator.
@@ -9485,7 +9663,7 @@ Der Service liefert KEINEN chart_render_payload mehr (Phase 16 P16.01, E2/E5:
 render=False) – er schreibt ausschliesslich eine REINE Level-Liste
 (`[{price}, ...]`, ohne Farben/Styling) nach context.shared_state[self.instance_id];
 der nachgelagerte ProximityService liest sie von dort (depends_on), der
-Indikator (chart/indicators/fixed_grid_proximity.py) baut daraus in
+Indikator (chart/indicators/ind_fixed_grid_proximity.py) baut daraus in
 `build_chart_render_payload()` das Styling (is_custom-Färbung, width 1/3,
 style Solid – Parität zum Alt-Grid).
 
@@ -9496,15 +9674,22 @@ nicht dieses Services.
 Capabilities: render=False (P16.01), feature_store=True (schreibt Grid-Level je Bar in den Store).
 
 05.08.2026 (U15-E, echte Feature-Store-Payloads): `calculate()` erzeugt jetzt
-ZWINGEND ein gefuelltes `feature_store_payload` mit `feature_id="grid_lines"`,
+ZWINGEND ein gefuelltes `feature_store_payload` mit `feature_id="srv_grid_lines"`,
 `plugin_version` und `records` je Bar:
     {"bar_time", "grid_nearest_level", "grid_step", "upper_level", "lower_level"}
   * grid_nearest_level = center = round(close / step_size) * step_size
   * upper_level        = center + step_size
   * lower_level        = center - step_size
-Dadurch schreibt grid_lines bei der Ausfuehrung echte mathematische Zeilen in
-analytics.duckdb (`feature_store`) – unabhaengig von `show_lines` (das nur die
-RENDER-Darstellung steuert, nicht die Daten-Mathematik).
+Dadurch schreibt grid_lines (srv_grid_lines) bei der Ausfuehrung echte
+mathematische Zeilen in analytics.duckdb (`feature_store`) – unabhaengig von
+`show_lines` (das nur die RENDER-Darstellung steuert, nicht die
+Daten-Mathematik).
+
+PARAMETER (PineScript-Input-Zone, 16.08.02 M3): Alle Inputs/Defaults stehen
+als Modul-Konstante `_GRID_LINES_SCHEMA` direkt unter diesem Header (siehe
+dort) und sind wie in PineScript am Dateianfang anpassbar. Darstellungs-
+Reihenfolge steuert `parameter_order`; `custom_levels` bleibt intern
+(Aggregat), die 6 Einzel-Level `prox_level1..6` werden im Editor gerendert.
 """
 
 from typing import Any, Dict, List, Optional
@@ -9522,6 +9707,40 @@ from analytics.features.plugins.base_plugin import (
     PluginContext,
     PluginFeature,
 )
+
+# ---------------------------------------------------------------------------
+# PARAMETER (PineScript-Input-Zone, 16.08.02 M3): Single Source of Truth
+# fürs Prop-Fenster. Inputs/Defaults stehen hier direkt am Dateianfang
+# (analog _FIXED_GRID_PROXIMITY_SCHEMA), damit sie wie in PineScript ohne
+# Suchen anpassbar sind. `parameter_schema` gibt eine flache Kopie zurück
+# (M1: kein geteiltes mutable Dict über Instanzen).
+# ---------------------------------------------------------------------------
+_GRID_LINES_SCHEMA: Dict[str, ParameterSchema] = {
+    "step_size": {
+        "type": "float", "default": 0.5, "min": 0.01, "max": 1000.0,
+        "step": 0.05, "description": "Rasterabstand (prox_stepSize ↔ step_size)",
+    },
+    "steps_around": {
+        "type": "int", "default": 4, "min": 0, "max": 100,
+        "step": 1, "description": "Level ober-/unterhalb des Zentrums (prox_stepsAround ↔ steps_around)",
+    },
+    # USER-REQ: P14-01 Nachtrag - die 6 Custom-Levels werden im Editor
+    # als EINZELPARAMETER prox_level1..6 gerendert (Level 1..6). Das
+    # Aggregat custom_levels bleibt im Schema erhalten - die interne
+    # Pipeline (FixedGridProximityIndicator._build_set_definition) und
+    # Alt-Sets speichern die Level als Liste/String. calculate() liest
+    # beide Formen (custom_levels_from_params).
+    "custom_levels": {
+        "type": "str", "default": "",
+        "description": "Custom-Levels, nur > 0 (prox_level1..6 ↔ custom_levels)",
+    },
+    "prox_level1": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 1"},
+    "prox_level2": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 2"},
+    "prox_level3": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 3"},
+    "prox_level4": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 4"},
+    "prox_level5": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 5"},
+    "prox_level6": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 6"},
+}
 
 
 def _parse_custom_levels(raw: Any) -> List[float]:
@@ -9546,7 +9765,7 @@ def _to_float(value: Any, default: float = 0.0) -> float:
 def _extract_prox_levels(params: Dict[str, Any]) -> List[float]:
     """Custom-Levels aus den EINZELPARAMETERN prox_level1..6 (nur > 0).
 
-    Parität zu fixed_grid_proximity._extract_custom_levels(): Einzelwerte werden
+    Parität zu ind_fixed_grid_proximity._extract_custom_levels(): Einzelwerte werden
     bevorzugt, wenn mindestens einer > 0 ist.
     """
     levels: List[float] = []
@@ -9595,7 +9814,7 @@ class GridLinesService(PluginFeature):
 
     @property
     def plugin_id(self) -> str:
-        return "grid_lines"
+        return "srv_grid_lines"
 
     @property
     def version(self) -> str:
@@ -9649,13 +9868,13 @@ class GridLinesService(PluginFeature):
     @property
     def parameter_order(self) -> List[str]:
         # USER-REQ: P14-01 Nachtrag - die 6 Custom-Levels werden im Editor als
-        # EINZELPARAMETER prox_level1..6 (Level 1..6, wie fixed_grid_proximity)
+        # EINZELPARAMETER prox_level1..6 (Level 1..6, wie ind_fixed_grid_proximity)
         # gerendert. custom_levels bleibt im parameter_schema (interne Pipeline
         # & Aggregat-Speicherung), ist aber NICHT in der Darstellungs-Reihenfolge
         # -> wird im Editor nicht als Komma-Feld gerendert.
         # Phase 16 (P16.01): show_lines/line_color sind KEINE Service-Parameter
         # mehr (E1/E5) - sie steuern ausschliesslich die Render-Darstellung im
-        # Indikator (chart/indicators/fixed_grid_proximity.py).
+        # Indikator (chart/indicators/ind_fixed_grid_proximity.py).
         return [
             "step_size", "steps_around",
             "prox_level1", "prox_level2", "prox_level3",
@@ -9677,32 +9896,13 @@ class GridLinesService(PluginFeature):
 
     @property
     def parameter_schema(self) -> Dict[str, ParameterSchema]:
-        return {
-            "step_size": {
-                "type": "float", "default": 0.5, "min": 0.01, "max": 1000.0,
-                "step": 0.05, "description": "Rasterabstand (prox_stepSize ↔ step_size)",
-            },
-            "steps_around": {
-                "type": "int", "default": 4, "min": 0, "max": 100,
-                "step": 1, "description": "Level ober-/unterhalb des Zentrums (prox_stepsAround ↔ steps_around)",
-            },
-            # USER-REQ: P14-01 Nachtrag - die 6 Custom-Levels werden im Editor
-            # als EINZELPARAMETER prox_level1..6 gerendert (Level 1..6). Das
-            # Aggregat custom_levels bleibt im Schema erhalten - die interne
-            # Pipeline (FixedGridProximityIndicator._build_set_definition) und
-            # Alt-Sets speichern die Level als Liste/String. calculate() liest
-            # beide Formen (custom_levels_from_params).
-            "custom_levels": {
-                "type": "str", "default": "",
-                "description": "Custom-Levels, nur > 0 (prox_level1..6 ↔ custom_levels)",
-            },
-            "prox_level1": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 1"},
-            "prox_level2": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 2"},
-            "prox_level3": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 3"},
-            "prox_level4": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 4"},
-            "prox_level5": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 5"},
-            "prox_level6": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 6"},
-        }
+        """Flache Kopie der Modul-Konstante `_GRID_LINES_SCHEMA` (16.08.02 M3).
+
+        Inhalt/Reihenfolge identisch zur vorherigen Inline-Property – nur die
+        Position des Dict-Literals hat sich an den Dateianfang verschoben
+        (PineScript-Input-Zone, kein geteiltes mutable Dict: flache Kopie).
+        """
+        return {k: dict(v) for k, v in _GRID_LINES_SCHEMA.items()}
 
     def calculate(
         self,
@@ -9715,7 +9915,7 @@ class GridLinesService(PluginFeature):
         (Namespace-isoliert).
 
         05.08.2026 (U15-E): Zusaetzlich wird ein gefuelltes feature_store_payload
-        erzeugt (feature_id='grid_lines', plugin_version, records je Bar mit
+        erzeugt (feature_id='srv_grid_lines', plugin_version, records je Bar mit
         bar_time / grid_nearest_level / grid_step / upper_level / lower_level) -
         grid_lines schreibt damit echte mathematische Grid-Level in den
         feature_store.
@@ -9724,7 +9924,7 @@ class GridLinesService(PluginFeature):
         mehr (render=False, E5). Die Level-Liste im shared_state enthaelt nur
         noch {price} - OHNE Farben/width/style. Das Render-Styling (Farben,
         Sichtbarkeit) baut ausschliesslich der Indikator
-        (build_chart_render_payload in fixed_grid_proximity.py)."""
+        (build_chart_render_payload in ind_fixed_grid_proximity.py)."""
         if df is None or df.empty:
             return {"feature_store_payload": {}}
 
@@ -9832,102 +10032,11 @@ class GridLinesService(PluginFeature):
 
 --------------------------------------------------
 
-### DATEI: analytics/features/definitions/grid_math.py
+### DATEI: analytics/features/definitions/srv_proximity.py
 ```py
-# analytics/features/definitions/grid_math.py
+# analytics/features/definitions/srv_proximity.py
 """
-Phase 15 (U15-B3): Eigenständige Paritäts-Mathematik für Grid-Services.
-
-Die Funktionen sind die eingefrorenen Referenz-Kopien der ehemaligen
-Alt-Implementierung `chart/indicators/grid.py` (am 04.08.2026 entfernt).
-Sie dienen als SINGLE SOURCE OF TRUTH für die Grid-Parität:
-
-* `f_round_to_custom_step` – Rundung auf das nächste Vielfache von step.
-* `build_grid_levels`      – Level-Array (Center ± steps_around × step + Custom).
-* `f_in_window_around`     – natives UTC-Zeitfenster (Minute 0/30 ± span, Wrap-Around).
-* `f_strip_trailing_zeros` – '%.6f' ohne nachgestellte Nullen (Level-Strings).
-
-Die Services (grid_lines_service.py, proximity_service.py) importieren diese
-Funktionen und garantieren damit identisches Verhalten zum historischen
-Alt-Indikator, ohne auf das gelöschte Modul zu verweisen.
-
-HINWEIS: Der Indikator-Adapter (chart/indicators/fixed_grid_proximity.py) behält seine
-private Kopie (`_f_in_window_around`) unverändert – sie wird nicht umgestellt.
-Das Alt-Plugin analytics/features/definitions/grid_liquidity.py wurde am
-04.08.2026 archiviert/entfernt (Schema ist im Indikator selbst hinterlegt).
-"""
-
-from typing import List, Optional
-
-
-def f_round_to_custom_step(price: float, step: float) -> float:
-    """Rundet price auf das nächste Vielfache von step.
-
-    Exakte Parität zur ehemaligen chart/indicators/grid.py.
-    """
-    if step <= 0:
-        return price
-    inv_step = 1.0 / step
-    return round(price * inv_step) / inv_step
-
-
-def build_grid_levels(
-    last_close: float,
-    step_size: float,
-    steps_around: int,
-    custom_levels: Optional[List[float]] = None,
-) -> List[float]:
-    """Sortierte Level-Liste (absteigend) – exakte Parität zum Alt-Grid.
-
-    grid.py (historisch):
-      center_price = f_round_to_custom_step(last_close, step_size)
-      grid_levels  = {round(center_price + i*step_size, 6)
-                      | i in range(-steps_around, steps_around+1)}
-      + {round(c_lvl, 6) | c_lvl in custom_levels, c_lvl > 0.0}
-    """
-    center_price = f_round_to_custom_step(last_close, step_size)
-    grid_levels: set = set()
-    for i in range(-steps_around, steps_around + 1):
-        grid_levels.add(round(center_price + (i * step_size), 6))
-    for c_lvl in (custom_levels or []):
-        v = float(c_lvl)
-        if v > 0.0:
-            grid_levels.add(round(v, 6))
-    return sorted(list(grid_levels), reverse=True)
-
-
-def f_in_window_around(minute_val: int, center: int, span: int) -> bool:
-    """Native UTC-Zeitfenster-Logik – exakte Parität zum Alt-Grid.
-
-    True, wenn minute_val im Fenster center ± span liegt (mit Wrap-Around
-    über 0/59). Zentren: 0 (ganze Stunde) und 30 (halbe Stunde).
-    """
-    lower = center - span
-    upper = center + span
-    if lower < 0:
-        return minute_val >= (60 + lower) or minute_val <= upper
-    elif upper > 59:
-        return minute_val >= lower or minute_val <= (upper - 60)
-    else:
-        return lower <= minute_val <= upper
-
-
-def f_strip_trailing_zeros(val: float) -> str:
-    """'%.6f' ohne nachgestellte Nullen – exakte Parität zum Alt-Grid."""
-    s = f"{val:.6f}"
-    if "." in s:
-        s = s.rstrip("0").rstrip(".")
-    return s
-
-```
-
---------------------------------------------------
-
-### DATEI: analytics/features/definitions/proximity_service.py
-```py
-# analytics/features/definitions/proximity_service.py
-"""
-Service: Proximity (Phase 13 Schritt 6)
+Service: Proximity (Phase 13 Schritt 6) – Naming Convention 16.08.01: srv_
 
 Liest die Linienliste aus context.shared_state[depends_on[0]] (z. B. grid_1)
 und wendet die PROZENTUALE visit%-Semantik des Alt-Grid-Indikators an
@@ -9945,7 +10054,7 @@ Das native UTC-Zeitfenster (Minute 0/30 ± time_window_mins) wird pro Bar als
 `in_time_window`-Flag in die Feature-Records geschrieben. Die FARBE der Kreise
 (gelb im Fenster / fuchsia außerhalb) und die Sichtbarkeit (show_lines /
 show_circles) sind KEINE Service-Parameter – sie werden vom INDIKATOR gesteuert
-(chart/indicators/fixed_grid_proximity.py), der die Circle-Farben auf Basis seines
+(chart/indicators/ind_fixed_grid_proximity.py), der die Circle-Farben auf Basis seines
 eigenen Schemas (circle_color_std / circle_color_active) und des
 `in_time_window`-Flags setzt (P16.01: `status_info` liegt als
 metadata["statistics"] im feature_store_payload).
@@ -9955,6 +10064,12 @@ len(df)) aus context.settings. Der Service schreibt die Hit-Records nach
 feature_data (feature_store=True) für Schritt 7 (Marker/Statistik).
 
 Capabilities: render=False (P16.01), feature_store=True.
+
+PARAMETER (PineScript-Input-Zone, 16.08.02 M3): Alle Inputs/Defaults stehen
+als Modul-Konstante `_PROXIMITY_SCHEMA` direkt unter diesem Header (siehe
+dort) und sind wie in PineScript am Dateianfang anpassbar. Die visuellen
+Parameter (Farben/Sichtbarkeit) gehören NICHT zum Service – sie steuert der
+Indikator (ind_fixed_grid_proximity).
 """
 
 from datetime import datetime, timezone as dt_timezone
@@ -9975,9 +10090,31 @@ from analytics.features.plugins.base_plugin import (
     PluginFeature,
 )
 
+# ---------------------------------------------------------------------------
+# PARAMETER (PineScript-Input-Zone, 16.08.02 M3): Single Source of Truth
+# fürs Prop-Fenster. Inputs/Defaults stehen hier direkt am Dateianfang
+# (analog _FIXED_GRID_PROXIMITY_SCHEMA), damit sie wie in PineScript ohne
+# Suchen anpassbar sind. `parameter_schema` gibt eine flache Kopie zurück
+# (M1: kein geteiltes mutable Dict über Instanzen).
+# ---------------------------------------------------------------------------
+_PROXIMITY_SCHEMA: Dict[str, ParameterSchema] = {
+    "visit_pct": {
+        "type": "float", "default": 0.05, "min": 0.0, "max": 100.0,
+        "step": 0.005, "description": "Prozentuale Toleranz um jede Linie (Parität zu grid_math.py visit_pct)",
+    },
+    "time_window_mins": {
+        "type": "int", "default": 5, "min": 0, "max": 30,
+        "step": 1, "description": "Time Filter Minuten um 0/30 UTC",
+    },
+    "use_time_filter": {
+        "type": "bool", "default": True,
+        "description": "Time Filter aktiv – steuert das in_window-Flag der Hits",
+    },
+}
+
 
 def _bar_utc_minutes(df: pd.DataFrame) -> List[int]:
-    """UTC-Minute (0-59) jeder Bar – konsistent zu fixed_grid_proximity.py.
+    """UTC-Minute (0-59) jeder Bar – konsistent zu ind_fixed_grid_proximity.py.
 
     Phase 16 (05.08.2026): Vektorisierter Fast-Path fuer 'time'-Spalten
     (epoch-Sekunden, int) – (t // 60) % 60 ist mathematisch identisch zu
@@ -10015,7 +10152,7 @@ class ProximityService(PluginFeature):
 
     @property
     def plugin_id(self) -> str:
-        return "proximity"
+        return "srv_proximity"
 
     @property
     def version(self) -> str:
@@ -10070,7 +10207,7 @@ class ProximityService(PluginFeature):
 
         05.08.2026 (Bugfix Service-Run): proximity liest seine Linienliste aus
         context.shared_state[depends_on[0]] – dafuer muss eine vorgelagerte
-        grid_lines-Instanz in execution_order stehen. Gespeicherte Sets aus
+        srv_grid_lines-Instanz in execution_order stehen. Gespeicherte Sets aus
         der UI-Pfade haben oft KEIN explizites depends_on; die Worker-
         Aufbereitung (serviceui/service_set_utils.prepare_worker_definition)
         loest daraus die implizite Abhaengigkeit auf (naechste VORHERIGE
@@ -10078,13 +10215,13 @@ class ProximityService(PluginFeature):
         depends_on-Werte (z.B. Indikator-intern grid_1 -> prox_1) bleiben
         unveraendert gueltig.
         """
-        return ["grid_lines"]
+        return ["srv_grid_lines"]
 
     # --- Single Source of Truth fürs Prop-Fenster (Phase 13 Schritt 5) -------
     # Hinweis (Schritt 6-Korrektur 3): Die visuellen Parameter (show_circles,
     # circle_color_std, circle_color_active, show_lines) sind KEINE
     # Service-Parameter – sie gehören zum Indikator-Schema und werden dort
-    # gesteuert (chart/indicators/fixed_grid_proximity.py). Der Service meldet nur
+    # gesteuert (chart/indicators/ind_fixed_grid_proximity.py). Der Service meldet nur
     # das in_window-Flag; der Indikator färbt die Kreise.
     @property
     def parameter_order(self) -> List[str]:
@@ -10103,20 +10240,13 @@ class ProximityService(PluginFeature):
 
     @property
     def parameter_schema(self) -> Dict[str, ParameterSchema]:
-        return {
-            "visit_pct": {
-                "type": "float", "default": 0.05, "min": 0.0, "max": 100.0,
-                "step": 0.005, "description": "Prozentuale Toleranz um jede Linie (Parität zu grid_math.py visit_pct)",
-            },
-            "time_window_mins": {
-                "type": "int", "default": 5, "min": 0, "max": 30,
-                "step": 1, "description": "Time Filter Minuten um 0/30 UTC",
-            },
-            "use_time_filter": {
-                "type": "bool", "default": True,
-                "description": "Time Filter aktiv – steuert das in_window-Flag der Hits",
-            },
-        }
+        """Flache Kopie der Modul-Konstante `_PROXIMITY_SCHEMA` (16.08.02 M3).
+
+        Inhalt/Reihenfolge identisch zur vorherigen Inline-Property – nur die
+        Position des Dict-Literals hat sich an den Dateianfang verschoben
+        (PineScript-Input-Zone, kein geteiltes mutable Dict: flache Kopie).
+        """
+        return {k: dict(v) for k, v in _PROXIMITY_SCHEMA.items()}
 
     def calculate(
         self,
@@ -10501,7 +10631,7 @@ class PluginFeature(ABC):
     @property
     @abstractmethod
     def plugin_id(self) -> str:
-        """Dauerhaft stabile ID (z.B. 'grid_lines')."""
+        """Dauerhaft stabile ID (z.B. 'srv_grid_lines')."""
         pass
 
     @property
@@ -12300,13 +12430,13 @@ from PySide6.QtWidgets import (
 
 try:
     from chart.chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, build_html_template
-    from chart.indicators.fixed_grid_proximity import FixedGridProximityIndicator
-    from chart.indicators.multi_ma import MultiMovingAverageIndicator
+    from chart.indicators.ind_fixed_grid_proximity import FixedGridProximityIndicator
+    from chart.indicators.ind_moving_averages import MultiMovingAverageIndicator
     from chart.indicator_dialog import IndicatorSettingsDialog
 except ImportError:
     from chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, build_html_template
-    from indicators.fixed_grid_proximity import FixedGridProximityIndicator
-    from indicators.multi_ma import MultiMovingAverageIndicator
+    from indicators.ind_fixed_grid_proximity import FixedGridProximityIndicator
+    from indicators.ind_moving_averages import MultiMovingAverageIndicator
     from indicator_dialog import IndicatorSettingsDialog
 
 # Phase 16.07 (D2): Tier-2-RAM-Puffer als eigene Engine-Klasse (SRP – Rule 2.3).
@@ -12515,7 +12645,7 @@ class PyTraderChartWindow(QMainWindow):
 
         # Generische Indikator-Registry: indicator_id -> BaseIndicator.
         # Phase 16: Alt-Indikator 'grid_liquidity' entfernt; der Plugin-
-        # Indikator 'Ind_FixedGridProximity' (fixed_grid_proximity) bleibt.
+        # Indikator 'Ind_FixedGridProximity' (ind_fixed_grid_proximity) bleibt.
         # Phase 16.05 (D1): Multi-MA-Indikator 'ind_moving_averages' additiv.
         self.indicators: Dict[str, BaseIndicator] = {
             "ind_fixed_grid_proximity": FixedGridProximityIndicator(),
@@ -15003,7 +15133,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 
 	# -------------------------------------------------------------------------
 	# Indikator-Services (Phase 13 Schritt 6-Korrektur): die Services, die der
-	# aktive Plugin-Indikator intern ausführt (z.B. grid_lines + proximity beim
+	# aktive Plugin-Indikator intern ausführt (z.B. srv_grid_lines + srv_proximity beim
 	# Ind_FixedGridProximity-Indikator). grid_liquidity (Altbestand) ist nur Schema-
 	# Quelle und KEIN Service des Indikators.
 	# -------------------------------------------------------------------------
@@ -15024,8 +15154,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 	def _service_items(self) -> List[Dict[str, Any]]:
 		"""Anzuzeigende Services im Prop-Fenster: [{instance_id, plugin_id}].
 
-		Bevorzugt die vom Indikator deklarierten Service-IDs (z.B. grid_lines +
-		proximity). Existiert ein Service mit dieser plugin_id im gewählten Set,
+		Bevorzugt die vom Indikator deklarierten Service-IDs (z.B. srv_grid_lines +
+		srv_proximity). Existiert ein Service mit dieser plugin_id im gewählten Set,
 		wird dessen instance_id (z.B. grid_1) übernommen; sonst plugin_id.
 		Ohne Indikator-Deklaration: die Services des gewählten Sets.
 		Phase 14 P14-01: Fallback auf das aktive Plugin als Service, wenn weder
@@ -15266,7 +15396,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 					# Felder aus dem Aggregat vorbefüllt.
 					if key.startswith("prox_level") and not cval:
 						try:
-							from analytics.features.definitions.grid_lines_service import map_custom_levels_to_prox_levels
+							from analytics.features.definitions.srv_grid_lines import map_custom_levels_to_prox_levels
 							cval = map_custom_levels_to_prox_levels(sp_params).get(key, cval)
 						except Exception:
 							pass
@@ -15335,7 +15465,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			order = (definition or {}).get("execution_order") or []
 			# Alle Services des Sets mergen, die zum Indikator gehören (das
 			# aktive Plugin selbst ODER deklarierte Indikator-Services wie
-			# grid_lines + proximity). Fremde Services werden nicht eingemischt.
+			# srv_grid_lines + srv_proximity). Fremde Services werden nicht eingemischt.
 			svc_ids = self._indicator_service_ids()
 			merged: Dict[str, Any] = {}
 			merged_lookback: Optional[int] = None
@@ -15444,7 +15574,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		if self.edit_set_description:
 			definition["description"] = self.edit_set_description.text().strip()
 
-		# Kein Set geladen → die Indikator-Services (z.B. grid_lines + proximity)
+		# Kein Set geladen → die Indikator-Services (z.B. srv_grid_lines + srv_proximity)
 		# als neue Services, sonst das aktive Plugin (instance_id = plugin_id).
 		if not definition.get("execution_order") and self.plugin is not None:
 			svc_ids = self._indicator_service_ids()
@@ -15971,7 +16101,9 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 # ==============================================================================
 # Phase 15: Alt-Indikator 'grid' (grid.py) entfernt. Verbleibende Indikatoren
 # werden direkt über ihre Module importiert (z. B. chart_win.py importiert
-# chart.indicators.fixed_grid_proximity.FixedGridProximityIndicator).
+# chart.indicators.ind_fixed_grid_proximity.FixedGridProximityIndicator bzw.
+# chart.indicators.ind_moving_averages.MultiMovingAverageIndicator).
+# Naming Convention 16.08.01: Dateiname = indicator_id (ind_-Präfix).
 # Keine Exporte im Paket-__init__ – keine harten Imports erforderlich.
 ```
 
@@ -16052,17 +16184,17 @@ class BaseIndicator(ABC):
 
 --------------------------------------------------
 
-### DATEI: chart/indicators/fixed_grid_proximity.py
+### DATEI: chart/indicators/ind_fixed_grid_proximity.py
 ```py
-# chart/indicators/fixed_grid_proximity.py
+# chart/indicators/ind_fixed_grid_proximity.py
 """
 NEUER Grid-Indikator mit Service-Pipeline (Phase 13 Schritt 6).
 
 Der Indikator ist jetzt der VISUELLE ADAPTER über die neuen Services
-grid_lines + proximity (analytics/features/definitions/):
+srv_grid_lines + srv_proximity (analytics/features/definitions/):
 
   * Historical-Run: Er instanziiert intern eine ServiceSetDefinition
-    (grid_1 → grid_lines, prox_1 → proximity, Reihenfolge + depends_on) und
+    (grid_1 → srv_grid_lines, prox_1 → srv_proximity, Reihenfolge + depends_on) und
     führt sie über den ServiceSetEvaluator aus. Die Linien (Parität zu
     chart/indicators/grid.py) werden THREAD-SICHER in self._cached_grid_lines
     zwischengespeichert (atomare Zuweisung unter Lock).
@@ -16078,7 +16210,7 @@ hinterlegt (_FIXED_GRID_PROXIMITY_SCHEMA) – der Indikator ist dadurch die eige
 Single Source of Truth für das Prop-Fenster (parameter_schema/plugin_id) und
 hängt NICHT mehr am entfernten Alt-Plugin 'grid_liquidity'
 (analytics/features/definitions/grid_liquidity.py, archiviert). Die Services
-grid_lines + proximity (grid_lines_service.py / proximity_service.py) bleiben
+srv_grid_lines + srv_proximity (srv_grid_lines.py / srv_proximity.py) bleiben
 die einzigen Service-Plugins dieses Indikators.
 """
 
@@ -16141,7 +16273,7 @@ def _line_width(value: Any, default: int = 1) -> int:
 
 
 def _f_in_window_around(minute_val: int, center: int, span: int) -> bool:
-    """Native UTC-Zeitfenster-Logik (identisch zu grid.py / proximity_service)."""
+    """Native UTC-Zeitfenster-Logik (identisch zu grid.py / srv_proximity)."""
     lower = center - span
     upper = center + span
     if lower < 0:
@@ -16171,7 +16303,7 @@ _FIXED_GRID_PROXIMITY_SCHEMA: Dict[str, Dict[str, Any]] = {
     # line_width wurden ENTFERNT - Linienart/-staerke werden ausschliesslich
     # ueber den LineStyle-Picker (Sibling-Keys, Konvention 'color' ->
     # 'style'/'width' in indicator_dialog) bedient und persistiert.
-    # Old-Presets ohne diese Keys fallen in _build_style_objects auf die
+    # Current-Presets ohne diese Keys fallen in _build_style_objects auf die
     # Defaults zurueck (solid / 1 px). show_visibility=False: die interne
     # 'sichtbar'-Checkbox des Pickers entfaellt - Sichtbarkeit steuert der
     # separate Param show_lines.
@@ -16180,7 +16312,7 @@ _FIXED_GRID_PROXIMITY_SCHEMA: Dict[str, Dict[str, Any]] = {
     # Phase 16.06 (07.08.2026): Die Einzelfeld-Deklarationen circle_shape_* /
     # circle_size_* wurden ENTFERNT - Marker-Form/-Groesse werden
     # ausschliesslich ueber den MarkerStyle-Picker (Sibling-Keys, Konvention
-    # 'color' -> 'shape'/'size') bedient und persistiert. Old-Presets ohne
+    # 'color' -> 'shape'/'size') bedient und persistiert. Current-Presets ohne
     # diese Keys fallen in _build_style_objects auf die Defaults zurueck
     # (circle / 6 px).
     "show_lines": {"type": "bool", "default": True, "description": "Grid-Linien anzeigen"},
@@ -16286,9 +16418,10 @@ class FixedGridProximityIndicator(BaseIndicator):
     @property
     def service_plugin_ids(self) -> List[str]:
         """Die Service-Plugin-IDs, die dieser Indikator intern ausführt (Schritt 6):
-        grid_lines + proximity. Der Alt-Service 'grid_liquidity' existiert nicht
-        mehr (Bugfix 04.08.2026) – KEIN Service dieses Indikators."""
-        return ["grid_lines", "proximity"]
+        srv_grid_lines + srv_proximity. Der Alt-Service 'grid_liquidity'
+        existiert nicht mehr (Bugfix 04.08.2026) – KEIN Service dieses
+        Indikators."""
+        return ["srv_grid_lines", "srv_proximity"]
 
     @property
     def param_options(self) -> Dict[str, List[Any]]:
@@ -16363,16 +16496,16 @@ class FixedGridProximityIndicator(BaseIndicator):
         timeframe: str,
         limit: Optional[int] = None,
         db_path: Optional[str] = None,
-        feature_id: str = "proximity",
+        feature_id: str = "srv_proximity",
     ) -> List[Dict[str, Any]]:
         """P14-03 (Live-Entkopplung A.1.3 / Schritt 3.2): PRIMÄRER
         DB-Lesepfad des Indikators – liest fertige Proximity-Hits aus dem
-        feature_store (JSON-Feld feature_data, feature_id='proximity', inkl.
+        feature_store (JSON-Feld feature_data, feature_id='srv_proximity', inkl.
         schema_version) beim Chart-Re-Render/Refresh OHNE synchrone
         Service-Pipeline (Invariante 10).
 
         P14-03-E (Schritt 4, generisch): `feature_id` ist parametrisiert
-        (Standard 'proximity'), damit spätere Indikator-Plugins denselben
+        (Standard 'srv_proximity'), damit spätere Indikator-Plugins denselben
         Lesepfad über die eigene feature_id nutzen können (Open/Closed).
 
         Der Indikator führt hier KEINE Berechnungen aus; er liest ausschließlich
@@ -16390,7 +16523,7 @@ class FixedGridProximityIndicator(BaseIndicator):
             timeframe: Timeframe
             limit: Maximale Anzahl Bars (Default 1000)
             db_path: Optionaler DB-Pfad (für Tests) – Default analytics.duckdb
-            feature_id: Feature-ID im feature_store (Default 'proximity')
+            feature_id: Feature-ID im feature_store (Default 'srv_proximity')
         """
         if not symbol or not timeframe:
             return []
@@ -16486,7 +16619,7 @@ class FixedGridProximityIndicator(BaseIndicator):
 
     def _build_set_definition(self, params: Dict[str, Any], df: pd.DataFrame) -> Dict[str, Any]:
         """Interne ServiceSetDefinition für den Historical-Run (Schritt 6):
-        grid_1 → grid_lines, prox_1 → proximity (depends_on grid_1)."""
+        grid_1 → srv_grid_lines, prox_1 → srv_proximity (depends_on grid_1)."""
         lookback = int(params.get("lookback") or len(df))
         if lookback < 1:
             lookback = 1
@@ -16503,7 +16636,7 @@ class FixedGridProximityIndicator(BaseIndicator):
             "execution_order": ["grid_1", "prox_1"],
             "services": {
                 "grid_1": {
-                    "plugin_id": "grid_lines",
+                    "plugin_id": "srv_grid_lines",
                     "lookback": lookback,
                     "params": {
                         "step_size": step_size,
@@ -16512,7 +16645,7 @@ class FixedGridProximityIndicator(BaseIndicator):
                     },
                 },
                 "prox_1": {
-                    "plugin_id": "proximity",
+                    "plugin_id": "srv_proximity",
                     "lookback": lookback,
                     "depends_on": ["grid_1"],
                     "params": {
@@ -16556,7 +16689,7 @@ class FixedGridProximityIndicator(BaseIndicator):
         line_style (choice, LINE_STYLES) und line_width (int 1..10).
         Ebenso shape/size der Marker aus circle_shape_* (choice,
         MARKER_SHAPES) und circle_size_* (int 1..20). Fehlen die Params
-        (Old-Presets), fallen sie auf die P16.03-Defaults zurueck
+        (Current-Presets), fallen sie auf die P16.03-Defaults zurueck
         (LineStyle: width 1, style 'solid'; MarkerStyle: shape 'circle',
         size 6).
 
@@ -16715,7 +16848,7 @@ class FixedGridProximityIndicator(BaseIndicator):
         }
 
     def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Führt die Service-Pipeline (grid_lines + proximity) für den
+        """Führt die Service-Pipeline (srv_grid_lines + srv_proximity) für den
         Historical-Run aus, cached die Linien thread-sicher und liefert den
         Render-Payload (Parität zu grid.py).
 
@@ -16943,12 +17076,13 @@ class FixedGridProximityIndicator(BaseIndicator):
 
 --------------------------------------------------
 
-### DATEI: chart/indicators/multi_ma.py
+### DATEI: chart/indicators/ind_moving_averages.py
 ```py
-# chart/indicators/multi_ma.py
+# chart/indicators/ind_moving_averages.py
 """
 Phase 16.05 – Multi-MA-Indikator (8x Moving Averages)
 ======================================================
+Naming Convention 16.08.01: Dateiname = indicator_id `ind_moving_averages`.
 
 Selbst-contained Indikator (BaseIndicator) für den Chart: zeichnet bis zu
 8 Moving Averages als LWC-v5-LineSeries über die GENERISCHE Render-Pipeline
@@ -17404,7 +17538,7 @@ class MultiMovingAverageIndicator(BaseIndicator):
                 # Phase 16.06 (07.08.2026): Breite/Linienart aus dem
                 # LineStyle-Picker (Sibling-Keys ma1_bull_style/ma1_bull_width,
                 # vom StylePickerWidget an ma1_bull_color gebunden) - Fallback
-                # auf die Konstanten (Old-Presets ohne Sibling-Keys).
+                # auf die Konstanten (Current-Presets ohne Sibling-Keys).
                 width = _as_int(params.get("ma1_bull_width"), _MA1_WIDTH)
                 line_style = _line_style(params.get("ma1_bull_style"), _LINE_STYLE)
                 title = f"MA1 {str(ma_type).upper()} {period}"
@@ -18143,7 +18277,7 @@ class MATemplateEngine:
         """Standard-Parameter-Schema für MA-basierte Indikatoren.
 
         Konvention exakt wie im Projekt üblich (vgl. _FIXED_GRID_PROXIMITY_SCHEMA
-        in chart/indicators/fixed_grid_proximity.py und dem Schema-Renderer in
+        in chart/indicators/ind_fixed_grid_proximity.py und dem Schema-Renderer in
         chart/indicator_dialog.py): {"type": "...", "default": ...,
         "min"/"max"/"step", "options", "description", "style_type"}.
 
@@ -21481,7 +21615,7 @@ Hierarchische Darstellung der Service-Landschaft:
               'prox_1 (05.08.26)' (DD.MM.JJ aus MAX(created_at) des
               feature_store je feature_id) – ohne Eintrag '(--.--.--)'.
               Gilt seit 05.08.2026 (Punkt 4) auch fuer Standalone-Services
-              und Plugin-Zeilen ('proximity (02.08.26)').
+              und Plugin-Zeilen ('srv_proximity (02.08.26)').
   * Spalte 1: Schmale Status-Spalte ganz RECHTS (Fixed-Spalte, fest am
               rechten Rand verankert) – pro Zeile ein echter Info-Button
               (QPushButton "ℹ", Icon-Breite ~20 px). Badge-TEXTE werden
@@ -21908,7 +22042,7 @@ class MasterTree(QTreeWidget):
         # Keine fuehrenden Leerzeichen: Einrueckung via setIndentation().
         # 05.08.2026 (Punkt 4): Das Datum der letzten Ausfuehrung (DD.MM.JJ,
         # aus dem feature_store) haengt auch an Standalone-/Plugin-Zeilen:
-        # 'proximity (02.08.26)' – ohne Eintrag '(--.--.--)'.
+        # 'srv_proximity (02.08.26)' – ohne Eintrag '(--.--.--)'.
         last_exec = str(child.get("last_execution") or "--.--.--")
         plugin_item = QTreeWidgetItem([f"{pid} ({last_exec})", ""])
         plugin_item.setData(0, ROLE_NODE_TYPE, TYPE_PLUGIN)
@@ -21938,8 +22072,8 @@ class MasterTree(QTreeWidget):
              -> 'im <Indikator>'
           Die Aktiv-Pruefung beruecksichtigt den ZUGEHOERIGEN Indikator
           (metadata['indicator_id']), nicht nur die Plugin-ID selbst –
-          dadurch greift Variante a) auch fuer Services (grid_lines/
-          proximity), die IN einem aktiven Indikator (Ind_FixedGridProximity)
+          dadurch greift Variante a) auch fuer Services (srv_grid_lines/
+          srv_proximity), die IN einem aktiven Indikator (Ind_FixedGridProximity)
           laufen. Der Tooltip wird auf Spalte 0 UND Spalte 1 gesetzt
           (Spalte 1 uebernimmt ihn der Info-Button).
         """
@@ -22284,7 +22418,7 @@ class MasterTree(QTreeWidget):
         """Deduplizierte plugin_ids aller Haken (SQL-Vertrag `IN (...)`).
 
         Mehrere Services mit derselben plugin_id (z. B. grid_1 + grid_2)
-        ergeben EINEN feature_id-Eintrag ('grid_lines').
+        ergeben EINEN feature_id-Eintrag ('srv_grid_lines').
         """
         ids: List[str] = []
         for entry in self.checked_services():
@@ -22298,7 +22432,7 @@ class MasterTree(QTreeWidget):
 
         Set-Services: '<Set-Anzeigename>/<instance_id>'
         (z. B. 'Mein Scalper/prox_1'); Standalone-/Plugin-Zeilen: plugin_id
-        (z. B. 'proximity').
+        (z. B. 'srv_proximity').
         """
         names: List[str] = []
         for entry in self.checked_services():
@@ -23252,7 +23386,7 @@ class ServiceParamColumnsMixin:
             # prox_level1..6 - leere Level-Felder werden daraus vorbefüllt.
             if key.startswith("prox_level") and not cval:
                 try:
-                    from analytics.features.definitions.grid_lines_service import map_custom_levels_to_prox_levels
+                    from analytics.features.definitions.srv_grid_lines import map_custom_levels_to_prox_levels
                     cval = map_custom_levels_to_prox_levels(params).get(key, cval)
                 except Exception:
                     pass
@@ -23327,7 +23461,7 @@ Einzel-Service-Run (single): Es wird eine Mini-Definition gebildet, die den
 selektierten Service UND alle Upstream-Services (fruehere Positionen in der
 execution_order des Sets) enthaelt – damit liefern Abhaengigkeiten
 (depends_on, z.B. grid_1 -> prox_1) ihre shared_state-Eintraege und ein
-nachgelagerter Service (proximity) kann tatsaechlich Hits erzeugen und in
+nachgelagerter Service (srv_proximity) kann tatsaechlich Hits erzeugen und in
 den feature_store schreiben.
 
 Der Worker emittiert NUR Signale (log_message / run_finished / run_failed);
@@ -23513,7 +23647,7 @@ class ServiceRunWorker(QThread):
             fb = FeatureBuilder()
             definition = self._build_scope_definition()
             # 05.08.2026 (Bugfix Service-Run):
-            #  * Fehlende depends_on-Einträge (z.B. proximity -> grid_lines)
+            #  * Fehlende depends_on-Einträge (z.B. srv_proximity -> srv_grid_lines)
             #    werden automatisch aufgelöst (sonst 'kein Feature-Store-
             #    Payload' beim Single-Run eines nachgelagerten Services).
             #  * Scanner-Candles (max) aus den App-Optionen als max Lookback
@@ -23610,9 +23744,9 @@ Aktions-Zeile unten:
 
 Datenvertrag (Entscheidung 06.08.2026):
   * `display_names`: lesbare Namen fuer die Button-Anzeige
-    (z. B. ["Mein Scalper/prox_1", "proximity"]).
+    (z. B. ["Mein Scalper/prox_1", "srv_proximity"]).
   * `feature_ids`:   technische IDs fuer die SQL-Abfrage – die plugin_ids
-    des Feature-Store (z. B. ["grid_lines", "proximity"]), dedupliziert
+    des Feature-Store (z. B. ["srv_grid_lines", "srv_proximity"]), dedupliziert
     (`feature_store.feature_id` IST die plugin_id).
 
 Live-Sync (Invariante 5): Das `ServiceSelectorModel` hoert auf
@@ -24399,7 +24533,7 @@ def _available_plugin_ids() -> str:
     """Alle registrierten Plugin-IDs (sortiert, kommasepariert).
 
     Phase 13 Schritt 6-Korrektur: Die Verfügbarkeit wird dynamisch aus der
-    PluginRegistry abgeleitet (grid_lines, proximity, ...),
+    PluginRegistry abgeleitet (srv_grid_lines, srv_proximity, ...),
     NICHT hartkodiert auf einen Indikator-Namen.
     """
     try:
@@ -24415,7 +24549,7 @@ def _sets_using_plugin(plugin_id: str, sets: List[Dict[str, Any]]) -> List[str]:
 
     Basis der Service-Sperre: Einzel-Services, die in einem gespeicherten
     Service-Set vorkommen, dürfen im Service-Fenster nicht entfernt werden
-    (Indikator-Basisservices wie grid_lines/proximity bleiben funktionsfähig).
+    (Indikator-Basisservices wie srv_grid_lines/srv_proximity bleiben funktionsfähig).
     Beim Löschversuch wird der Name des verwendeten Sets angezeigt.
     """
     names: List[str] = []
@@ -24440,7 +24574,7 @@ def prepare_worker_definition(
 
     1. Implizite Abhängigkeiten (depends_on): Services OHNE expliziten
        `depends_on`-Eintrag, deren Plugin `dependencies` deklariert
-       (z.B. proximity -> ['grid_lines']), erhalten die nächstliegende
+       (z.B. srv_proximity -> ['srv_grid_lines']), erhalten die nächstliegende
        VORHERIGE Instanz in execution_order mit passender plugin_id als
        depends_on. Dadurch liest der ProximityService seine Linienliste
        aus shared_state[depends_on[0]] (vorher: 'fertig (kein
@@ -24453,7 +24587,7 @@ def prepare_worker_definition(
        scanner_candle_limit) als Scan-Fenster – damit verwenden ALLE
        Services dieselbe Datenbasis wie der Historical Scanner (vorher:
        gespeicherter Service-lookback, z.B. 1000 Feature-Rows bei
-       grid_lines).
+       srv_grid_lines).
     """
     import copy as _copy
     from analytics.features.feature_builder import PluginRegistry
@@ -25219,7 +25353,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
 
         Sicherheitsabfrage mit Set-/Service-Name und dem aktuell gewaehlten
         Symbol/Timeframe, danach gezielter Single-Run (inkl. Upstream-
-        Abhaengigkeiten im Set, damit z.B. proximity seine Linien hat).
+        Abhaengigkeiten im Set, damit z.B. srv_proximity seine Linien hat).
         """
         if not set_id or not service_id:
             return
@@ -25469,7 +25603,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
 
         Bugfix 05.08.2026: Bei Indikator-Auswahl wird die `indicator_id`
         explizit gespeichert und die Basis-Services des Indikators
-        (service_plugin_ids, z.B. grid_lines + proximity) werden mit
+        (service_plugin_ids, z.B. srv_grid_lines + srv_proximity) werden mit
         Registry-Defaults automatisch angelegt (instance_id = plugin_id) –
         einfache Bedienung und das Set ist sofort gueltig fuer den Indikator.
         """
@@ -25888,7 +26022,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                           plugin_id: str) -> str:
         """Liefert die naechste freie instance_id fuer ein Plugin im Set.
 
-        Basis ist der plugin_id selbst (z.B. 'proximity'); bei bereits
+        Basis ist der plugin_id selbst (z.B. 'srv_proximity'); bei bereits
         vorhandener Instanz werden '_2', '_3', ... angehaengt."""
         base = plugin_id
         if base not in services:
@@ -27213,9 +27347,9 @@ repo.save_set({
     "display_name": "Drei Services",
     "execution_order": ["grid_1", "prox_1", "grid_2"],
     "services": {
-        "grid_1": {"plugin_id": "grid_lines", "lookback": 1000, "params": {"step_size": 0.5}},
-        "prox_1": {"plugin_id": "proximity", "lookback": 500, "params": {"prox_level1": 1.0}},
-        "grid_2": {"plugin_id": "grid_lines", "lookback": 2000, "params": {"step_size": 0.25}},
+        "grid_1": {"plugin_id": "srv_grid_lines", "lookback": 1000, "params": {"step_size": 0.5}},
+        "prox_1": {"plugin_id": "srv_proximity", "lookback": 500, "params": {"prox_level1": 1.0}},
+        "grid_2": {"plugin_id": "srv_grid_lines", "lookback": 2000, "params": {"step_size": 0.25}},
     },
 })
 
@@ -27363,7 +27497,7 @@ except OSError:
 # ---------------------------------------------------------------------------
 print("\n=== Teil 4: Chart-Circles (Pipeline-Fallback) ===")
 import pandas as pd  # noqa: E402
-from chart.indicators.fixed_grid_proximity import FixedGridProximityIndicator  # noqa: E402
+from chart.indicators.ind_fixed_grid_proximity import FixedGridProximityIndicator  # noqa: E402
 
 # Synthetischer OHLCV-DataFrame (H1), Preis stabil um 30.0 -> Grid-Level 30
 # wird bei jedem Bar (high/low in der 5%-visit-Bandbreite) getroffen.
@@ -27457,8 +27591,8 @@ repo5.save_set({
     "display_name": "Layout-Set",
     "execution_order": ["g1", "p1"],
     "services": {
-        "g1": {"plugin_id": "grid_lines", "lookback": 1000, "params": {}},
-        "p1": {"plugin_id": "proximity", "lookback": 500, "params": {}},
+        "g1": {"plugin_id": "srv_grid_lines", "lookback": 1000, "params": {}},
+        "p1": {"plugin_id": "srv_proximity", "lookback": 500, "params": {}},
     },
 })
 model5 = ServiceSelectorModel()
@@ -27749,7 +27883,7 @@ check("U10) Multi-TF: Reihenfolge = get_timeframes() (MN1..M1)",
       tfs_all == expected_tfs, str(tfs_all))
 
 # 6.3 grid_lines feature_store_payload (Mathematik U15-E)
-from analytics.features.definitions.grid_lines_service import GridLinesService  # noqa: E402
+from analytics.features.definitions.srv_grid_lines import GridLinesService  # noqa: E402
 gl = GridLinesService()
 df_gl = pd.DataFrame({
     "time": [1600000000, 1600000360],
@@ -27762,7 +27896,7 @@ res_gl = gl.calculate(df_gl, {"step_size": 0.5, "steps_around": 4})
 payload_gl = res_gl.get("feature_store_payload") or {}
 recs = payload_gl.get("records") or []
 check("U11) grid_lines feature_store_payload gefuellt",
-      bool(recs) and payload_gl.get("feature_id") == "grid_lines",
+      bool(recs) and payload_gl.get("feature_id") == "srv_grid_lines",
       f"records={len(recs)}")
 check("U12) grid_lines records je Bar (bar_time + Levels)",
       len(recs) == 2 and all(
@@ -27811,7 +27945,7 @@ class _FakeFB:
 class _FakeEval:
     def execute_set(self, definition, df_plugin, context=None):
         return {"g1": {"feature_store_payload": {
-            "feature_id": "grid_lines", "plugin_version": "1.0.0",
+            "feature_id": "srv_grid_lines", "plugin_version": "1.0.0",
             "records": [{"bar_time": 1600000000}]}}}
 
 
@@ -27866,7 +28000,7 @@ import numpy as np  # noqa: E402
 from datetime import datetime, timezone as dt_timezone  # noqa: E402
 from PySide6.QtWidgets import QDialog, QTextEdit  # noqa: E402
 from analytics.engine.description_dialog import ServiceDescriptionEditDialog  # noqa: E402
-from analytics.features.definitions.proximity_service import (  # noqa: E402
+from analytics.features.definitions.srv_proximity import (  # noqa: E402
     ProximityService, _bar_utc_minutes,
 )
 from analytics.features.plugins.base_plugin import PluginContext  # noqa: E402
@@ -27877,7 +28011,7 @@ from config.event_bus import event_bus  # noqa: E402
 
 # 7.1 ServiceDescriptionEditDialog – headless + save_requested-Signal
 _edit_dlg = ServiceDescriptionEditDialog(
-    instance_id="grid_1", plugin_id="grid_lines",
+    instance_id="grid_1", plugin_id="srv_grid_lines",
     header_line="im Ind_FixedGridProximity", description="Alt-Text",
 )
 _edit_editor = _edit_dlg.findChild(QTextEdit)
@@ -28118,7 +28252,7 @@ _rows_ok = all(
 check("V7) proximity: Feature-Rows vollstaendige Paritaet", _rows_ok, "")
 # P16.01: hit_circles aus den ROHDATEN via build_chart_render_payload
 # (Prioritaet 10, in_window-Flag, Paritaet zur Referenz).
-from chart.indicators.fixed_grid_proximity import FixedGridProximityIndicator  # noqa: E402
+from chart.indicators.ind_fixed_grid_proximity import FixedGridProximityIndicator  # noqa: E402
 _indi = FixedGridProximityIndicator()
 _circ_p = (_indi.build_chart_render_payload(
     {"grid_levels": _lines, "proximity_records": _rows_p,
@@ -28318,7 +28452,7 @@ check("P16.05 T3) price_lines Inhalt",
 #       smoothing>1 = EMA-Doppelpass in der Engine, Titel ' | S <Laenge>'
 # ---------------------------------------------------------------------------
 print("\n=== Teil 9: P16.05 Multi-MA-Indikator ===")
-from chart.indicators.multi_ma import (  # noqa: E402
+from chart.indicators.ind_moving_averages import (  # noqa: E402
     MultiMovingAverageIndicator, _MA_COLORS, _MA1_BEAR_COLOR,
     _MA_SMOOTHING_DEFAULT,
 )
@@ -28594,10 +28728,10 @@ check("M8) smoothing=10 = EMA(EMA(SMA4, span=10), alpha=0.4)",
 # D6) Kontrolle: Grid-Indikator (MIT Services) behaelt den Service-Pfad
 # ---------------------------------------------------------------------------
 print("\n=== Teil 10: P16.05 Dialog-Bugfix (Multi-MA ohne Services) ===")
-from chart.indicators.multi_ma import (  # noqa: E402
+from chart.indicators.ind_moving_averages import (  # noqa: E402
     MultiMovingAverageIndicator,
 )
-from chart.indicators.fixed_grid_proximity import FixedGridProximityIndicator  # noqa: E402
+from chart.indicators.ind_fixed_grid_proximity import FixedGridProximityIndicator  # noqa: E402
 from chart.indicator_dialog import IndicatorSettingsDialog  # noqa: E402
 from chart.widgets.style_picker_widget import StylePickerWidget  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
@@ -28832,11 +28966,11 @@ check("D7) Nichts unterhalb MA6/MA7/MA8 (Zeile 4 leer)",
 #     jeweils show_visibility=False (Sichtbarkeit ueber show_lines/show_circles).
 #   - Preset-Payload persistiert die Sibling-Keys (line_style/line_width/...).
 #   - Render (build_chart_render_payload) wendet die Sibling-Keys an
-#     (price_lines width/style, hit_circles shape/size) - Old-Presets ohne
+#     (price_lines width/style, hit_circles shape/size) - Current-Presets ohne
 #     Sibling-Keys fallen auf Defaults zurueck.
 # ---------------------------------------------------------------------------
 print("\n=== Teil 11: P16.06 StylePicker-Integration (FixedGridProximity) ===")
-from chart.indicators.fixed_grid_proximity import (  # noqa: E402
+from chart.indicators.ind_fixed_grid_proximity import (  # noqa: E402
     _FIXED_GRID_PROXIMITY_SCHEMA,
 )
 
@@ -28912,7 +29046,7 @@ check("G4) hit_circles: shape/size aus Picker (std square/8)",
                              for c in _circ_g4),
       str(_circ_g4[:2]))
 
-# G5: Old-Presets ohne Sibling-Keys -> Defaults (solid/1, circle/6)
+# G5: Current-Presets ohne Sibling-Keys -> Defaults (solid/1, circle/6)
 _g5_payload = _indi.build_chart_render_payload(
     {"grid_levels": [{"price": 24.5}], "proximity_records": _g4_recs,
      "status_info": {}},
@@ -28921,7 +29055,7 @@ _g5_payload = _indi.build_chart_render_payload(
      "use_time_filter": True})
 _pl_g5 = _g5_payload.get("price_lines") or []
 _circ_g5 = _g5_payload.get("hit_circles") or []
-check("G5) Old-Preset-Fallback: width 1 / solid / circle / size 6",
+check("G5) Current-Preset-Fallback: width 1 / solid / circle / size 6",
       _pl_g5 and _pl_g5[0]["width"] == 1 and _pl_g5[0]["style"] == "solid"
       and _circ_g5 and all(c["shape"] == "circle" and c["size"] == 6
                            for c in _circ_g5),

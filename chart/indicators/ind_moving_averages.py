@@ -458,7 +458,7 @@ class MultiMovingAverageIndicator(BaseIndicator):
                 # Phase 16.06 (07.08.2026): Breite/Linienart aus dem
                 # LineStyle-Picker (Sibling-Keys ma1_bull_style/ma1_bull_width,
                 # vom StylePickerWidget an ma1_bull_color gebunden) - Fallback
-                # auf die Konstanten (Old-Presets ohne Sibling-Keys).
+                # auf die Konstanten (Current-Presets ohne Sibling-Keys).
                 width = _as_int(params.get("ma1_bull_width"), _MA1_WIDTH)
                 line_style = _line_style(params.get("ma1_bull_style"), _LINE_STYLE)
                 title = f"MA1 {str(ma_type).upper()} {period}"
