@@ -15,14 +15,14 @@ Selbst-contained Indikator (BaseIndicator) für den Chart: zeichnet bis zu
                  "width", "style", "title"}, ...]}` (Entscheidung D6,
     P-C5: `lines` statt `maLines` – der `lines`-Key ist ausschließlich für
     Zeitreihen-LineSeries reserviert, F1-Beschluss).
-  * Das Parameter-Schema (58 Parameter: MA1 9 Keys, MA2..8 je 7 Keys) wird
+  * Das Parameter-Schema (50 Parameter: MA1 8 Keys, MA2..8 je 6 Keys) wird
     PROGRAMMATISCH in einer Schleife `for x in range(1, 9)` erzeugt
-    (Ergänzung C3), nicht manuell ausgeschrieben. `maX_smooth_type` +
-    `maX_smooth_length` (Bugfix 07.08.2026, Entscheidung D5-überholt): Der
-    Smoothing-Typ wird JETZT konsumiert – ein zweiter MA-Pass glättet die
-    MA-Serie (maX_smooth_type mit Glättungslänge maX_smooth_length). Die
-    Option " - no Smoothing" (Default) bedeutet: keine Glättung, die Linie
-    läuft unverändert über `maX_type`.
+    (Ergänzung C3), nicht manuell ausgeschrieben. `maX_smoothing` (Vertrag C,
+    16.05): int-Glättungslänge (min 0, max 500, Default 10 laut Konzept) –
+    der EMA-Doppelpass läuft über `MATemplateEngine.calculate_ma(..., 
+    smoothing=smoothing)`. `smoothing <= 1` = keine Glättung (die frühere
+    Option " - no Smoothing" sowie `maX_smooth_type` sind damit überholt
+    und ersatzlos entfernt).
   * Defaults (Entscheidung D7): MA1 `EHMA/4/alpha 2.0/dual_color=False`,
     MA2..8 `EMA/10*X/alpha 2.0`, alle `show=False` außer MA1.
   * Kontrastfarben (Entscheidung D4): MA1 teal #26A69A (Führungslinie),
@@ -66,20 +66,9 @@ _MA1_WIDTH: int = 2
 _MA_WIDTH: int = 1
 _LINE_STYLE: str = "solid"
 
-# Glättung (Bugfix 07.08.2026): " - no Smoothing" = keine Glättung (Default).
-_NO_SMOOTHING: str = " - no Smoothing"
-_MA_SMOOTH_LENGTH_DEFAULT: int = 3
-
-
-def _is_no_smoothing(value: Any) -> bool:
-    """True, wenn der Smoothing-Typ 'keine Glättung' bedeutet.
-
-    Normalisiert auf strip()/lower(), damit die Literal-Option
-    " - no Smoothing" sowie leere/None-Werte zuverlässig erkannt werden.
-    """
-    if value is None:
-        return True
-    return str(value).strip().lower() == "- no smoothing"
+# Glättung (Vertrag C, 16.05): Default 10 laut Konzept (16.04 Schritt 3).
+# smoothing <= 1 = keine Glättung (Bypass in MATemplateEngine.calculate_ma).
+_MA_SMOOTHING_DEFAULT: int = 10
 
 
 def _as_bool(value: Any, default: bool = True) -> bool:
@@ -138,14 +127,13 @@ class MultiMovingAverageIndicator(BaseIndicator):
     # ----------------------------------------------------- Parameter-Schema
     @staticmethod
     def _build_schema() -> Dict[str, Dict[str, Any]]:
-        """Programmatische Schema-Erzeugung (Ergänzung C3): 8 MAs × 8 Keys.
+        """Programmatische Schema-Erzeugung (Ergänzung C3): 8 MAs, 50 Keys.
 
         MA1 (Führung, mit DualColor): show_ma1, ma1_type, ma1_period,
-        ma1_smooth_type, ma1_smooth_length, ma1_alpha, ma1_dual_color,
-        ma1_bull_color, ma1_bear_color.
+        ma1_smoothing, ma1_alpha, ma1_dual_color, ma1_bull_color,
+        ma1_bear_color.
         MA2..8 (Standard): show_maX, maX_type, maX_period,
-        maX_smooth_type, maX_smooth_length, maX_alpha, maX_color
-        (kein dual_color/bear_color).
+        maX_smoothing, maX_alpha, maX_color (kein dual_color/bear_color).
         """
         schema: Dict[str, Dict[str, Any]] = {}
         for x in range(1, 9):
@@ -169,21 +157,16 @@ class MultiMovingAverageIndicator(BaseIndicator):
                 "step": 1,
                 "description": f"MA {x} Periode",
             }
-            schema[f"{prefix}_smooth_type"] = {
-                "type": "choice",
-                # Bugfix 07.08.2026: " - no Smoothing" als erste Option
-                # (keine Glättung) + die 12 MA-Typen als Glättungsverfahren.
-                "options": [_NO_SMOOTHING] + list(MA_TYPES),
-                "default": _NO_SMOOTHING,
-                "description": f"MA {x} Smoothing-Typ ('{_NO_SMOOTHING}' = keine Glättung)",
-            }
-            schema[f"{prefix}_smooth_length"] = {
+            schema[f"{prefix}_smoothing"] = {
                 "type": "int",
-                "default": _MA_SMOOTH_LENGTH_DEFAULT,
-                "min": 1,
+                # Vertrag C (16.05): int-Glättungslänge, EMA-Doppelpass in der
+                # Engine (MATemplateEngine.calculate_ma, smoothing=...).
+                # smoothing <= 1 = keine Glättung.
+                "default": _MA_SMOOTHING_DEFAULT,
+                "min": 0,
                 "max": 500,
                 "step": 1,
-                "description": f"MA {x} Glättungslänge (zweiter MA-Pass über die MA-Serie)",
+                "description": f"MA {x} Glättung (zweiter EMA-Pass über die MA-Serie; <= 1 = keine Glättung)",
             }
             schema[f"{prefix}_alpha"] = {
                 "type": "float",
@@ -241,8 +224,7 @@ class MultiMovingAverageIndicator(BaseIndicator):
             order.append(f"show_ma{x}")
             order.append(f"ma{x}_type")
             order.append(f"ma{x}_period")
-            order.append(f"ma{x}_smooth_type")
-            order.append(f"ma{x}_smooth_length")
+            order.append(f"ma{x}_smoothing")
             order.append(f"ma{x}_alpha")
             if x == 1:
                 order.extend(["ma1_dual_color", "ma1_bull_color", "ma1_bear_color"])
@@ -280,10 +262,9 @@ class MultiMovingAverageIndicator(BaseIndicator):
             labels[f"show_ma{x}"] = f"MA {x} anzeigen"
             labels[f"ma{x}_type"] = f"MA {x} Typ"
             labels[f"ma{x}_period"] = f"MA {x} Periode"
-            labels[f"ma{x}_smooth_type"] = f"MA {x} Smoothing"
-            # Bugfix 07.08.2026: Glättungslänge mit Label 'Smooth'
+            # Vertrag C (16.05): maX_smoothing mit Label 'Smooth'
             # (Anwenderanforderung).
-            labels[f"ma{x}_smooth_length"] = f"MA {x} Smooth"
+            labels[f"ma{x}_smoothing"] = f"MA {x} Smooth"
             labels[f"ma{x}_alpha"] = f"MA {x} Decay-Faktor"
             if x == 1:
                 labels["ma1_dual_color"] = "MA 1 Auf/Ab-Färbung"
@@ -300,7 +281,7 @@ class MultiMovingAverageIndicator(BaseIndicator):
         for x in range(1, 9):
             keys = [
                 f"show_ma{x}", f"ma{x}_type", f"ma{x}_period",
-                f"ma{x}_smooth_type", f"ma{x}_smooth_length", f"ma{x}_alpha",
+                f"ma{x}_smoothing", f"ma{x}_alpha",
             ]
             if x == 1:
                 keys.extend(["ma1_dual_color", "ma1_bull_color", "ma1_bear_color"])
@@ -352,10 +333,10 @@ class MultiMovingAverageIndicator(BaseIndicator):
                 Wanduhr-Epochs. Wird auf AppSettings.chart_candle_limit
                 zugeschnitten (crop_dataframe).
             params: Indikator-Parameter (show_maX / maX_type / maX_period /
-                maX_smooth_type + maX_smooth_length (Bugfix 07.08.2026:
-                zweiter MA-Pass über die MA-Serie, " - no Smoothing" =
-                keine Glättung) / maX_alpha / ma1_dual_color /
-                ma1_bull_color / ma1_bear_color / maX_color).
+                maX_smoothing (Vertrag C: EMA-Doppelpass in der Engine,
+                smoothing <= 1 = keine Glättung) / maX_alpha /
+                ma1_dual_color / ma1_bull_color / ma1_bear_color /
+                maX_color).
 
         Returns:
             {"lines": [{id, data, width, style, title}, ...]} – data ist
@@ -388,30 +369,18 @@ class MultiMovingAverageIndicator(BaseIndicator):
             ma_type = str(params.get(f"{prefix}_type") or ("EHMA" if x == 1 else "EMA"))
             period = _as_int(params.get(f"{prefix}_period"), 4 if x == 1 else 10 * x)
             alpha = _as_float(params.get(f"{prefix}_alpha"), 2.0)
+            smoothing = _as_int(
+                params.get(f"{prefix}_smoothing"), _MA_SMOOTHING_DEFAULT
+            )
 
+            # Berechnung + optionale Alpha-EMA-Glättung (Vertrag C, 16.05):
+            # der EMA-Doppelpass läuft in der Engine (smoothing=...), KEIN
+            # Inline-Zweitpass mehr. smoothing <= 1 = keine Glättung.
             ma_series = MATemplateEngine.calculate_ma(
-                close, ma_type, period, alpha_factor=alpha, volume=volume
+                close, ma_type, period, alpha_factor=alpha, volume=volume,
+                smoothing=smoothing,
             )
-
-            # --- Glättung (Bugfix 07.08.2026) -------------------------------
-            # maX_smooth_type wird JETZT konsumiert: Ein zweiter MA-Pass
-            # über die MA-Serie glättet die Linie (maX_smooth_length =
-            # Glättungslänge). " - no Smoothing" (oder Länge < 2, sonst
-            # liefert z.B. KAMA lauter NaNs) => keine Glättung, die Linie
-            # bleibt exakt die Roh-MA.
-            smooth_type = str(params.get(f"{prefix}_smooth_type") or "").strip()
-            smooth_length = _as_int(
-                params.get(f"{prefix}_smooth_length"), _MA_SMOOTH_LENGTH_DEFAULT
-            )
-            smoothing_active = (
-                bool(smooth_type)
-                and not _is_no_smoothing(smooth_type)
-                and smooth_length > 1
-            )
-            if smoothing_active:
-                ma_series = MATemplateEngine.calculate_ma(
-                    ma_series, smooth_type, smooth_length, alpha_factor=alpha
-                )
+            smoothing_active = smoothing > 1
 
             if x == 1:
                 # MA1: dual_color-Semantik (E6) – bull/bear aus den Params.
@@ -435,8 +404,9 @@ class MultiMovingAverageIndicator(BaseIndicator):
                 title = f"MA{x} {str(ma_type).upper()} {period}"
 
             # Aktive Glättung im Linien-Titel sichtbar machen (Chart-Legende).
+            # Vertrag C: nur die Länge, kein Typ mehr (' | S 10').
             if smoothing_active:
-                title += f" | S {str(smooth_type).upper()} {smooth_length}"
+                title += f" | S {smoothing}"
 
             data = MATemplateEngine.build_chart_payload(
                 df_crop["time"], ma_series, colors
