@@ -692,8 +692,9 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			content_layout.addWidget(self._build_preset_group())
 
 		# Bugfix (06.08.2026): _init_plugin_ui_params_only platziert den
-		# Schließen-Button bereits im Plugin-Grid (Zeile 1, Spalte 2, Vertrag C) -
-		# hier NUR anfügen, wenn er nicht schon im Plugin-Grid sitzt (sonst
+		# Schließen-Button bereits im Plugin-Grid (Zeile 0, Spalte 2, rechts
+		# mittig neben der Preset-Box) - hier NUR anfügen, wenn er nicht
+		# schon im Plugin-Grid sitzt (sonst
 		# Doppel-Button).
 		if not getattr(self, "_close_placed_in_plugin_ui", False):
 			btn_close = QPushButton("Schließen")
@@ -977,9 +978,10 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		(maX_type/maX_period/maX_smoothing/maX_alpha) im Prop-Fenster.
 
 		Layout (Vertrag C, 07.08.2026, Anwenderanforderungen):
-		  * Zeile 0: Preset-Box ganz oben, ueber ALLE 3 Spalten (span 3).
-		  * Zeile 1: die ersten zwei Parameter-Boxen nebeneinander, rechts
-		    daneben der Schließen-Button (Spalte 2).
+		  * Zeile 0: Preset-Box ganz oben links, so breit wie MA1+MA2
+		    (Spalten 0-1, span 2); rechts daneben (Spalte 2) vertikal
+		    zentriert der Schließen-Button.
+		  * Zeile 1: die ersten zwei Parameter-Boxen nebeneinander (MA1/MA2).
 		  * Danach: je 3 Parameter-Boxen pro Zeile (Multi-MA: Zeile 2 =
 		    MA3/MA4/MA5, Zeile 3 = MA6/MA7/MA8).
 		  * Nichts unterhalb der letzten Boxen-Zeile -> das Fenster endet
@@ -990,12 +992,12 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		content_grid = QGridLayout()
 		content_grid.setSpacing(6)
 
-		# --- Zeile 0: Preset-Box oben, ueber alle 3 Spalten (span 3) ---
-		# Der Schließen-Button sitzt NICHT mehr in Zeile 0, sondern in Zeile 1
-		# Spalte 2 (rechts neben der zweiten Parameter-Box, Vertrag C).
+		# --- Zeile 0: Preset-Box oben links (Spalten 0-1, span 2 = bis zum
+		# Ende von MA2); rechts daneben in Spalte 2 vertikal zentriert der
+		# Schließen-Button (rechts mittig neben der Preset-Box). ---
 		self._close_placed_in_plugin_ui = True
 		content_grid.addWidget(
-			self._build_preset_group(), 0, 0, 1, 3, Qt.AlignTop)
+			self._build_preset_group(), 0, 0, 1, 2, Qt.AlignTop)
 
 		layout_schema = getattr(self.plugin, "param_layout", None)
 		groups: List[Any] = []
@@ -1047,17 +1049,18 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 				form.addRow(self.plugin_labels.get(key, self._human(key)), ctrl)
 			rendered_groups.append(group)
 
-		# --- 3-Spalten-Grid (Vertrag C) ---
-		# Zeile 1: Gruppe 1 (Spalte 0) + Gruppe 2 (Spalte 1) nebeneinander,
-		# rechts daneben der Schliessen-Button (Spalte 2). Ab Gruppe 3 folgen
-		# je 3 Boxen pro Zeile (Zeile 2: G3/G4/G5, Zeile 3: G6/G7/G8).
+		# --- 3-Spalten-Grid (Vertrag C, Bugfix 07.08.2026) ---
+		# Zeile 1: Gruppe 1 (Spalte 0) + Gruppe 2 (Spalte 1) nebeneinander
+		# (MA1/MA2). Ab Gruppe 3 folgen je 3 Boxen pro Zeile (Zeile 2:
+		# G3/G4/G5, Zeile 3: G6/G7/G8). Der Schliessen-Button sitzt in
+		# Zeile 0 Spalte 2 (rechts mittig neben der Preset-Box).
 		btn_close = QPushButton("Schließen")
 		btn_close.clicked.connect(self.accept)
 		if rendered_groups:
 			content_grid.addWidget(rendered_groups[0], 1, 0, Qt.AlignTop)
 			if len(rendered_groups) > 1:
 				content_grid.addWidget(rendered_groups[1], 1, 1, Qt.AlignTop)
-			content_grid.addWidget(btn_close, 1, 2, Qt.AlignTop)
+			content_grid.addWidget(btn_close, 0, 2, Qt.AlignCenter)
 			for i in range(2, len(rendered_groups)):
 				g = i - 2
 				content_grid.addWidget(
