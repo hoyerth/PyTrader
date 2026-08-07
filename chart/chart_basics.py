@@ -25,6 +25,8 @@ CSS_STYLE = """
 	#measurement-box { display: none; position: absolute; background: #1e222d; border: 1px solid #2962FF; border-radius: 6px; padding: 8px 12px; color: #d1d4dc; font-size: 12px; pointer-events: none; z-index: 1000; line-height: 1.5; white-space: nowrap; }
 	#price-badge { display: none; position: absolute; right: 2px; background: #2962FF; color: white; font-size: 11px; font-weight: bold; padding: 2px 6px; border-radius: 3px; pointer-events: none; z-index: 1000; will-change: transform, top; }
 	#countdown-badge { display: none; position: absolute; right: 62px; background: #1e222d; border: 1px solid #2962FF; color: #2962FF; font-size: 11px; font-weight: bold; padding: 2px 6px; border-radius: 3px; pointer-events: none; z-index: 1000; will-change: transform, top; }
+	#live-button { display: none; position: absolute; top: 4px; right: 4px; background: #2962FF; color: white; border: none; border-radius: 4px; font-size: 11px; font-weight: bold; padding: 3px 10px; cursor: pointer; z-index: 1001; }
+	#live-button:hover { background: #1e4fcc; }
 """
 
 JS_DIR = Path(__file__).resolve().parent / "js"
@@ -35,6 +37,10 @@ JS_FILES = [
     "03_chart_rendering.js",
     "04_live_updates.js",
     "05_measurement.js",
+    # Phase 16.07 (Two-Tier Caching): Sliding-Window-, Nachlade- und
+    # Live-Button-Logik (D1/D3/D4/D7/D8/D9/D10). Muss NACH 04 geladen
+    # werden (hängt sich über optionale Hooks in 04 ein).
+    "06_two_tier.js",
 ]
 
 
@@ -68,6 +74,7 @@ def _build_html_template() -> str:
 		<div id="measurement-box"></div>
 		<div id="price-badge"></div>
 		<div id="countdown-badge"></div>
+		<button id="live-button" title="Zurück zum Live-Ende">● Live</button>
 	</div>
 	<script>
 {js_code}

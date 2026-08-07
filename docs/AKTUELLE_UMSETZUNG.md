@@ -14,267 +14,169 @@
 10. **Test-Cleanup (Ergänzung 4, Entscheidung 06.08.2026):** Tests werden NICHT aufbewahrt. Nach Abschluss jedes Phasenkapitels wird der Ordner `test/` aufgeräumt – es bleibt ausschließlich die Datei `test/test.py` (dauerhafter Test-Harness) bestehen. Alle temporären Check-Skripte (`check_*.py`/`*.js`), einmaligen Migrations-/Bereinigungsskripte, Test-Datenbanken (`*.duckdb`) und generierten Dateien (`tmp_*.json` u. Ä.) werden entfernt. Die Verifikation eines Kapitels erfolgt daher VOR der Bereinigung; danach existieren die Prüfskripte nicht mehr.
 
 ---
-# 16.06 Refactoring StylePickerWidget & Indikator-Integration
+# Kapitel 16.07: Two-Tier Caching & Dynamic Range Management
 
-## 1. Konzept StylePickerWidget (Unified Style Picker)
-* **Ziel:** Zusammenführung von Farbauswahl, Transparenz und Zeichnungsparametern (Linienstärke, Linienstil, Darstellungsmodus) in einer einzigen kompakten UI-Komponente mit typsicherem Schnittstellenvertrag.
-* **UI-Aufbau des Popover-Dialogs (`StylePickerDialog`):**
-  1. **Oberer Bereich:** Bisheriger ColorPicker (Farbfeld, Palette, RGBA/Hex-Eingabe, Transparenz-Slider).
-  2. **Trennlinie (`QFrame.HLine`):** Visuelle Abgrenzung.
-  3. **Unterer Bereich (Neue Zeichnungsparameter):**
-     * **Linienstärke / Stärke:** `width` (SpinBox: 1–5 px)
-     * **Linienstil:** `style` (ComboBox: `solid` [Durchgezogen], `dashed` [Gestrichelt], `dotted` [Gepunktet])
-     * **Darstellungsmodus:** `draw_mode` (ComboBox: `line` [Linie], `histogram` [Histogramm], `circles` [Kreise ●], `blocks` [Blöcke / HA])
-* **Button-Vorschau im Haupt-Dialog:** Nach der Transition ist im Hauptformular des Indikators nur noch ein kompaktes Farbkästchen mit Vorschau-Text (z. B. `● 2px Solid`) sichtbar. Klick auf das Kästchen öffnet den erweiterten Dialog.
+## 1. Executive Summary & Zielsetzung
+Zweistufige Datenarchitektur (**Two-Tier Caching**), die das Laden und Berechnen historischer Marktdaten (OHLCV) und Indikator-Overlays beim Scrollen in die Vergangenheit entkoppelt. Sie kombiniert minimale JS-Render-Last im Chart (Tier 1) mit einem erweiterten RAM-Datenpuffer im Python-Backend (Tier 2), um nahtloses, latenzfreies Scrollen ohne Performance-Einbußen zu gewährleisten.
 
 ---
 
-## 2. Datenvertrag & Persistenz (Presethandling & Window State)
-* **Data Contract (`LineStyleModel` in `chart/overlays/style_models.py`):**
+## 2. Die Zwei-Stufen-Architektur (Two-Tier Concept)
 
-  @dataclass
-  class LineStyleModel:
-      color: str = "#2196F3"
-      width: int = 2
-      style: str = "solid"       # "solid" | "dashed" | "dotted"
-      draw_mode: str = "line"    # "line" | "histogram" | "circles" | "blocks"
-      transparency: int = 0      # 0..100 %
+* **Tier 1: Frontend Render Window (JS / LWC v5)**
+  * **Umfang:** Hält strikt nur das aktive Darstellungsfenster (z. B. $N = \text{chart\_candle\_limit} \approx 1.000$ Kerzen) im DOM/Canvas.
+  * **Aufgabe:** Gewährleistet flüssiges Rendering mit 60 FPS ohne Memory-Leaks.
+  * **Verhalten:** Erhält synchrone, bereits berechnete Gesamt-Pakete (OHLCV-Candles + fertige Indikator-Payloads) direkt von Python per JS-Bridge.
 
-      def to_dict(self) -> dict: ...
-      @classmethod
-      def from_dict(cls, data: dict) -> "LineStyleModel": ...
-
-
-
-* **Persistenz-Invariante:** All-in-one Dict in den Indikator-Parametern (z. B. `"ma1_style": {...}`).
-* **Rückwärtskompatibilität & Auto-Migration:**
-* Wenn im gespeicherten Preset/Window-State ein Alt-Format vorliegt (z. B. `"ma1_color": "#FF0000"`, `"ma1_width": 2`), wandelt `from_dict()` dies automatisch fehlerfrei in ein valides `LineStyleModel` um.
-* Dadurch bleiben bestehende `indicator_presets` und `instance_states` in `app_data.duckdb` ohne Schema-Bruch voll funktionsfähig.
+* **Tier 2: Backend Memory Buffer (Python / `MATemplateEngine` & FeatureBuilder)**
+  * **Umfang:** Puffert ein erweitertes Historien-Fenster im RAM (z. B. $M = N \cdot 10 \approx 10.000$ Kerzen).
+  * **Aufgabe:** Führt Indikator-Berechnungen durch und bedient Nachlade-Anfragen des Frontends verzögerungsfrei (0 ms I/O-Latenz).
+  * **Storage Fallback:** Lädt asynchron Blöcke aus `market_data.duckdb` (`ohlcv_bars`) nach, sobald der Tier-2-RAM-Puffer nach links erschöpft ist.
 
 ---
 
-## 3. Transition der vorbestehenden Indikatoren
+## 3. Dynamisches Nachladen, Warmup & Range Management
 
-* **Betroffene Indikatoren:** `MultiMA` (`multi_ma.py`) und `FixedGridProximity` (`fixed_grid_proximity.py`).
-* **Vorher:** Separate Input-Felder für Farben, Linienstärken und Kreis-Optionen verstreut im Dialog.
-* **Nachher:**
-* Zusammenfassung aller Stil-Parameter pro Linie/Signal in ein `StylePickerWidget`.
-* Ein einziges Farbkästchen pro Element im Einstellungs-Dialog.
-* Linienstärken, gestrichelte Stile und Kreis-Darstellungen (`circles` für Proximity-Hits) werden vollständig über das Unter-Panel des Pickers gesteuert.
-
----
-
-## 4. Schritt-für-Schritt-Anleitung für die IDE-AI
-
-### Schritt 1: Data Model in `chart/overlays/style_models.py` erweitern
-
-* Erstelle/Erweitere `LineStyleModel` mit den Feldern `color`, `width`, `style`, `draw_mode`, `transparency`.
-* Implementiere `to_dict()` und `from_dict()` inkl. Fallback für flache Alt-Keys (`color`, `width`, `lineWidth`, etc.).
-
-### Schritt 2: Popover-Dialog & Widget in `chart/widgets/style_picker_widget.py` umbauen
-
-* **Dialog (`StylePickerDialog`):**
-* Integriere den bestehenden Farb-/Transparenz-Picker im oberen Bereich.
-* Füge ein `QFrame(FrameShape.HLine)` als Trennlinie ein.
-* Füge Formularzeilen für `width` (QSpinBox 1-5), `style` (QComboBox) und `draw_mode` (QComboBox) unter der Trennlinie hinzu.
+[ DuckDB Storage ] ──(Async Chunk)──> [ Tier 2: RAM Buffer (10.000) ] ──(Sliding View)──> [ Tier 1: JS Canvas (1.000) ]
+│                                       │
+[DB-Lookback]                           [Warmup Vorlauf]
 
 
-* **Widget (`StylePickerWidget`):**
-* Reduziere die Anzeige im Indikator-Dialog auf einen kompakten Button (Farbkästchen + Stärke/Stil-Text).
-* Klick-Event öffnet `StylePickerDialog(exec)`.
-* Emittiere `style_changed(LineStyleModel)` bei Übernahme.
 
-### Schritt 3: Migration `chart/indicator_dialog.py`
+1. **Sliding Window Shift (Tier 1 ↔ Tier 2):**
+   * Das Frontend überwacht den Scroll-Rand via `visibleLogicalRangeChanged`.
+   * Nähert sich die Viewport-Position dem linken Rand ($< 100$ verbleibende Kerzen im Canvas), fordert JS per Bridge den nächsten Daten-Ausschnitt aus dem Tier-2-RAM-Puffer an.
+   * Der sichtbare Bereich in JS wird unter Beibehaltung der `visibleLogicalRange` nahtlos aktualisiert, ohne dass der Chart springt.
 
-* Ersetze isolierte `ColorPicker`-Aufforderungen und verstreute Linienstärke-/Stil-SpinBoxes durch `StylePickerWidget`.
-* Pass die Getter/Setter an, sodass Stil-Daten als kompaktes Dict (`<item>_style`) geladen und im Preset/State gespeichert werden.
+2. **Backend Chunk Fetch (Tier 2 ↔ DuckDB):**
+   * Erreicht der Tier-1-Viewport die $20\%$-Grenze des Tier-2-RAM-Puffers, stößt Python im Hintergrund (QThread) das Nachladen des nächsten Chunks aus `market_data.duckdb` an.
+   * DB-Fetches werden bei schnellem Scrollen debounced (300 ms).
 
-### Schritt 4: Transition `chart/indicators/multi_ma.py` & `chart/indicators/fixed_grid_proximity.py`
+3. **Lookback / Warmup Buffer (Mathematische Nahtstellen-Garantie):**
+   * Zur Vermeidung von Indikator-Verzerrungen (z. B. bei rekursiven Alpha-EMAs / EHMA / Smoothed MA) liest Tier 2 aus DuckDB immer eine erweiterte Historie aus:
+     $$\text{Warmup-Vorlauf} = \text{period} \cdot 4 + \text{smoothing} \cdot 3$$
+   * Dieser reine Warmup-Vorlauf wird für die mathematische Einschwingphase genutzt und danach verworfen; nur valide Indikator-Punkte fließen in den Tier-2-Puffer und an Tier 1.
 
-* **`multi_ma.py`:** Verbinde `ma1_style` .. `ma3_style` direkt mit den LWC-Render-Payloads (`color`, `lineWidth`, `lineStyle`).
-* **`fixed_grid_proximity.py`:** Führe Linien- und Kreis-Formate (Farbe, Proximity-Circles `●`, Linienstärken) in die jeweiligen `LineStyleModel`-Strukturen zusammen.
-
-### Schritt 5: Verifikation (Backend & Tests)
-
-* Führe isolierte Logik- & Parametertests in `test/test.py` aus (Syntax-Check via `py_compile`, Serialization/Deserialization-Test von `LineStyleModel` und Preset-Read/Write).
-* **UI-Regel:** Keinen GUI-Test starten; Verifikation erfolgt per Code-Inspektion und statischer Analyse.
+4. **Live-Tick-Entkopplung bei Historien-Ansicht:**
+   * Befindet sich der Anwender in der Historie (nicht am rechten Rand), aktualisieren eingehende Live-Ticks den Tier-2-Puffer im Hintergrund, verändern jedoch nicht den aktiven Historien-Viewport in Tier 1.
 
 ---
 
-## 5. Implementierungs-Log & Entscheidungen 16.06 (Stand 07.08.2026)
+# Kapitel 16.07 – Review & Finale Entscheidungen (07.08.2026, kritische Prüfung gegen Ist-Code)
 
-**Hinweis:** Die Ist-Umsetzung weicht in der Struktur von der Planung (Kapitel 1–4) ab. Die Planung bleibt als Konzeptdokument erhalten; verbindlich für Code und Persistenz ist der hier dokumentierte Ist-Stand (Entscheidungen E1–E6).
+> **Status:** Kapitel 16.07 ist ein **Konzept/Plan**, keine Umsetzung. Stand heute existiert im Code **keine** Two-Tier-Architektur, kein RAM-Puffer, kein Chunk-Nachladen, kein Sliding Window. Die Entscheidungen **D1–D10 sind final** (Anwender-Review, 07.08.2026) und verbindlich für die Umsetzung. **Coding startet erst nach ausdrücklichem Startbefehl des Anwenders.**
 
-### E1: `LineStyleModel` → generische Style-Verträge `LineStyle`/`MarkerStyle` (P16.03)
-* Die geplante Klasse `LineStyleModel` (color/width/style/draw_mode/transparency) wurde NICHT eingeführt.
-* Stattdessen leben in `chart/overlays/style_models.py` die Dataclasses **`LineStyle`** (`show/color/width/style`, LINE_STYLES: solid/dashed/dotted/dashdotted) und **`MarkerStyle`** (`show/color/shape/size`, MARKER_SHAPES: circle/square/arrowUp/arrowDown) mit `to_js_dict()` (LWC-v5-Bridge, lowercase) und `to_dict()/from_dict()` (JSON-Persistenz, tolerant, Default-Fallback).
-* `draw_mode` (line/histogram/circles/blocks) wurde **verworfen** – der `circles`-Fall wird über `MarkerStyle` (shape/size) abgebildet, der `line`-Fall über `LineStyle`. histogram/blocks sind ungenutzt.
-* Transparenz wird nicht als eigenes Feld, sondern als `rgba(r,g,b,a)`-Farbstring geführt (Alpha=255 → `#RRGGBB`); die Steuerung erfolgt über den `QColorDialog` (`ShowAlphaChannel`).
+## 1. Konsistenz mit dem Ist-Code (Abweichungen)
 
-### E2: `StylePickerDialog`-Popover → Inline-Composite `StylePickerWidget`
-* Der geplante Popover-Dialog (Farbbereich oben, Trennlinie, Zeichnungsparameter unten, kompakte Button-Vorschau `● 2px Solid`) wurde NICHT umgesetzt.
-* `chart/widgets/style_picker_widget.py` rendert stattdessen ein **Inline-Composite** direkt in der Form-Zeile: `QCheckBox` (sichtbar) + Farb-Button (Swatch) + `QSpinBox` (width 1–10 / size 1–20) + `QComboBox` (style/shape). Parameter `style_type` ("line"/"marker") und `color_only` wählen den Modus.
-* Signal `style_changed(object)` emittiert das aktuelle Style-Objekt; `get_style()` liefert eine frische Instanz, `set_style()/set_color()` emittieren bewusst kein Signal.
+1. **`N ≈ 1.000` vs. `chart_candle_limit = 3000`:** Der Ist-Code lädt exakt `settings.chart_candle_limit` Kerzen (`chart/chart_win.py:790`), Default **3000** (`config/app_settings.py:17`, `properties_win.py:47`). Das Kapitel nennt "z. B. ≈1.000" – es ist zu entscheiden, ob `N` die **bestehende** Einstellung (`chart_candle_limit`) ist oder eine neue Konstante entsteht (und wie die Properties-UI das abbildet).
+2. **`M = N·10 ≈ 10.000`:** Es gibt **keinen** RAM-Puffer. Aktueller Ablauf: `fetch_historical_candles(..., limit=chart_candle_limit)` → kompletter Chart-**Rebuild** je Refresh (`applyFullChartUpdate`: `chart.remove()` + `createChart` + `setData`). Verortung/Zuständigkeit von `M` (ChartWindow? FeatureBuilder? `MATemplateEngine`?) ist offen.
+3. **Warmup-Formel `period·4 + smoothing·3`:** Der Ist-Code (`chart/indicators/utils/ma_template.py`) definiert Warmup als **`period−1` NaNs** (Zeilen 221–223, 424) – die Formel ist also **neu** und ändert potenziell die Indikator-Semantik (Einschwingverhalten). Zudem deckt sie nur MA-artige Indikatoren ab; `FixedGridProximity`/`custom_levels` haben kein `smoothing`. Zu klären: Ist der Warmup-Vorlauf **nur Lese-Vorlauf für die Berechnung** (verworfen) oder verändert er das bisherige NaN-Vertragsverhalten?
+4. **Bridge-Vertrag fehlt:** `ChartBridge` (`chart/chart_win.py:92–99`) kennt nur `onRangeChanged` / `onPriceRangeChanged` / `measurementChanged`. Das Kapitel verlangt "fordert JS per Bridge den nächsten Daten-Ausschnitt an" – **kein Slot/kein Payload-Vertrag definiert** (Namen, Parameter, Antwortformat, updateId-Guard analog `_updateId`).
+5. **Schwellwerte "100 Kerzen / 20% / 300 ms":** Keine Konstanten definiert, kein Ort (Python oder JS) benannt.
+6. **Sliding Window ≠ Ist-Architektur:** Ein nahtloses Sliding-Window erfordert JS-seitiges **inkrementelles Hinzufügen/Entfernen** von Candles/Serien ohne Chart-Rebuild sowie eine über Chunk-Grenzen **konsistente** `_continuousTimeMap`/`_continuousKeys` (aktuell bei jedem `applyFullChartUpdate` neu aufgebaut). Das ist eine erhebliche JS-Architekturänderung (`01_core.js`/`03_chart_rendering.js`/`04_live_updates.js`), die im Kapitel nicht adressiert ist.
 
-### E3: Persistenz über Sibling-Keys statt All-in-one-Dict
-* Statt `"ma1_style": {...}` wird das **flache Format** mit Sibling-Keys persistiert (Konvention: `color` im Key → `style`/`width` bei line, `shape`/`size` bei marker).
-* `indicator_dialog._style_sibling_keys()` leitet die Geschwister-Keys her; `_build_preset_payload()`, `collect_params_from_ui()` und `update_ui_from_params()` schreiben/lesen sie round-trip-fest (Old-Presets ohne Sibling-Keys fallen auf Defaults zurück → keine Auto-Migration nötig).
-* `_jsonify_style_objects()` ist die defensive Absicherung, falls ein Style-Vertrag direkt im Preset-Payload landet.
+## 2. Vollständigkeit – fehlende Aspekte
 
-### E4: Multi-MA → volle LineStyle-Picker (Phase 16.06, 07.08.2026)
-* **Anwenderanweisung (07.08.2026):** „Multi-MA soll auch auf den neuen StylePicker angewendet werden."
-* **Umsetzung:** `ma1_bull_color` und `maX_color` (MA2..8) werden als **volle LineStyle-Picker** gerendert (Farbe + Breite 1–10 px + Linienart solid/dashed/dotted/dashdotted) statt als `color_only`-Farbwähler. Sichtbarkeit steuert weiterhin `show_maX` (daher `show_visibility=False` — keine doppelte „sichtbar"-Checkbox im Dialog).
-* **Sibling-Defaults:** Die Picker-Breite/-Art wird über Sibling-Keys persistiert (Konvention `color`→`style`/`width`): `ma1_bull_style`/`ma1_bull_width` (gelten für die gesamte MA1-Linie, auch bear-Segmente) bzw. `maX_style`/`maX_width`. Diese 16 Keys sind im Schema als Default-Params enthalten (MA1 Breite 2/solid, MA2..8 Breite 1/solid), aber **nicht** in `parameter_order` → keine eigenen Controls (Schema-Gesamt: 66 Keys = 50 UI + 16 Sibling-Defaults).
-* `ma1_bear_color` bleibt **`color_only=True`** (nur die Fall-Farbe; Breite/Art übernimmt der bull-Picker).
-* **Render:** `build_chart_render_payload` liest `ma1_bull_width`/`ma1_bull_style` bzw. `maX_width`/`maX_style` mit Fallback auf die Konstanten (`_MA1_WIDTH=2`, `_MA_WIDTH=1`, `_LINE_STYLE="solid"`) → Old-Presets ohne Sibling-Keys bleiben kompatibel.
+1. **Indikator-Neuberechnung beim Nachladen:** Neue ältere Kerzen → `price_lines`, `hit_circles`, `DaySeparator`, Live-Overlays, LineSeries-Registry (`_activeLineSeries`) müssen für den erweiterten Bereich **neu berechnet und nahtlos ergänzt** werden. Trigger/Zyklus fehlt.
+2. **Race-Conditions:** Veraltete Chunk-Antworten (analog zum bestehenden `updateId`-Guard), Symbol/TF-Wechsel während eines laufenden Chunk-Loads, doppelte Requests bei schnellem Scrollen – kein Konzept.
+3. **Linker Rand / DB-Ende:** Verhalten, wenn keine älteren Daten existieren (Stop-Flag, kein Endlos-Loop).
+4. **Handelspause & Wochenend-Lücke:** Chunk-Grenzen können mitten in der Pause (Wanduhr 23:00–23:59) oder der Wochenend-Lücke liegen. Die Invarianten "keine leeren Candles / keine Lückenfüller" und `resolveRealTime`/`formatDT` müssen über Chunk-Grenzen hinweg gelten (kontinuierliche Zeitachse).
+5. **Live-Tick-Entkopplung (Punkt 4):** Nur als Satz beschrieben – es fehlt, wie der rechte Rand (Puffer-Wachstum, Sync), der Rücksprung ans Live-Ende und der Konflikt "Historie-Viewport vs. neuer Tick" konkret gelöst werden.
+6. **Restore:** `visible_from`/`visible_range_from` (`chart_win.py:241/265`, State-Persistenz) müssen bei einem Sliding-Window in **Chunk-/Offset-Koordinaten** übersetzt werden.
+7. **Verifikation & Zielgrößen:** Kein Testkonzept (headless), keine Performance-Zielwerte (FPS, Latenz, Speicher), kein Migrations-/Cleanup-Plan (Regel 10).
 
-### E5: FixedGridProximity → Einzelfelder entfernt, Bedienung nur über StylePicker (Phase 16.06, 07.08.2026)
-* **Anwenderanweisung (07.08.2026):** „Die Einzelfelder für lines und circles sollen im StylePicker bedient werden → entferne die vorhandenen Elemente."
-* **Umsetzung:** Die separaten Schema-/Label-Deklarationen **`line_style`, `line_width`, `circle_shape_std`, `circle_shape_active`, `circle_size_std`, `circle_size_active` wurden ENTFERNT**. Linienart/-stärke und Marker-Form/-Größe werden ausschließlich über den StylePicker bedient und als Sibling-Keys persistiert (Konvention `color`→`style`/`width` bzw. `shape`/`size`).
-* `line_color` = LineStyle-Picker, `circle_color_std`/`circle_color_active` = MarkerStyle-Picker, jeweils **`show_visibility=False`** (Sichtbarkeit steuern `show_lines`/`show_circles` → die doppelte „sichtbar"-Checkbox aus E6-Beobachtung entfällt).
-* `_build_style_objects()`/`build_chart_render_payload()` lesen die Sibling-Keys weiterhin tolerant mit Default-Fallback (solid/1, circle/6) → **alte Presets und instance_states bleiben voll funktionsfähig** (Roundtrip über den Picker bleibt erhalten).
-* **JS-Bridge:** `renderMarkers` (chart/js/03_chart_rendering.js) übernimmt shape/size aus dem Payload.
+## 3. Finale Entscheidungen D1–D10 (verbindlich für die Umsetzung)
 
-### E6: Verifikation 16.06 (07.08.2026)
-* Syntax-Check `python -m py_compile` auf `style_models.py`, `style_picker_widget.py`, `indicator_dialog.py`, `multi_ma.py`, `fixed_grid_proximity.py` → EXIT=0.
-* `test/test.py` (headless, venv): alle 16.06-Checks PASS — M1 (Schema 66, Sibling-Defaults), D3 (50 gerenderte UI-Params), D4 (volle Picker ohne Checkbox, bear color_only, Picker-Defaults), D5 (Sibling-Keys in display_params), Teil 11 G1–G5 (Einzelfeld-Schema entfernt, Picker-Typen/`show_visibility`, Sibling-Roundtrip, Render-Anwendung, Old-Preset-Fallback).
-* Zusätzliches Verifikations-Skript `test/check_stylepicker_16_06.py` (headless): A1/A2 (Multi-MA-Picker zeigen Spin+Combo sichtbar, Defaults w2/solid + w1/solid), B1–B4 (FixedGridProximity-Picker korrekt, KEINE Alt-Einzelfelder gerendert/persistiert, Schema ohne Alt-Keys), C1 (WindowCloseButtonHint für beide Dialoge gesetzt) — alle PASS.
-* **Fenster-X-Fix (Punkt 4, empirisch belegt):** `IndicatorSettingsDialog` hatte `windowFlags()=12291` = Dialog|TitleHint|SystemMenuHint **OHNE WindowCloseButtonHint** → kein X in der Titelleiste. Ein `OR` mit `Qt.WindowCloseButtonHint` wird von Qt/PySide6 wieder verworfen (bleibt 12291); einzig das **explizite Setzen** `Qt.Dialog | WindowTitleHint | WindowSystemMenuHint | WindowCloseButtonHint` setzt das X zuverlässig (flags=134230019, Close=True). Gilt generisch für ALLE Indikator-Prop-Fenster (eine zentrale Stelle in `indicator_dialog.__init__`).
-* **Befund zu „Alt-Felder noch sichtbar" (Punkte 1+2):** Die Alt-Felder (`line_style`/`line_width`/`circle_shape_*`/`circle_size_*`) existieren im Quellcode nachweislich NICHT mehr (Schema + Labels entfernt, Suche im gesamten Projekt ohne Treffer außerhalb `.venv`/Konstanten). Der beschriebene Anzeige-Zustand entspricht exakt dem ALTEN Code-Stand → die getestete App-Instanz lief noch mit dem zuvor geladenen Code. **Die App muss neu gestartet werden** (Python lädt Module nur beim Start; ggf. `__pycache__` leeren und sicherstellen, dass die Run-Config den `.venv`-Interpreter nutzt).
-* **Vorbestehende, NICHT von 16.06 verursachte Test-Fails** in Teil 1/3 des Harness (ServiceWindow): P2/P5/H3/H4/H5/H7 — Test-Erwartung `_keep_history_on_close == True` vs. Code `service_win.py:92 _keep_history_on_close = False` (Kommentar „NEU") plus offscreen-Größen-Checks (≥1300px). Betrifft `serviceui/service_win.py` (unverändert).
-* Keine UI-Tests ausgeführt (Regel 4); Working Tree nach Review: 5 geänderte Dateien (`chart/indicator_dialog.py`, `chart/indicators/fixed_grid_proximity.py`, `chart/indicators/multi_ma.py`, `chart/widgets/style_picker_widget.py`, `docs/AKTUELLE_UMSETZUNG.md`). `test/test.py` und `test/check_stylepicker_16_06.py` sind per `.gitignore` nicht versioniert.
+### D1: Größe `N` (Tier-1-Renderfenster) → **fix 1.000 Kerzen**
+* **Kritik (teilweise):** 3.000 Kerzen gleichzeitig im DOM/Canvas von LWC v5 sind performant, aber als Render-Fenster für flüssiges 60-FPS-Scrolling unnötig groß.
+* **Entscheidung:** $N = 1.000$ als **festes Tier-1-Renderfenster** (Canvas) für maximale JS-FPS und flüssiges Wischen.
+* `chart_candle_limit` (3.000, `AppSettings`/`PropertiesWindow`) dient ab jetzt nur noch als **Sichtbarkeits-Standard beim initialen Öffnen** eines Charts – es steuert **nicht mehr** die obere harte Render-Grenze des Tier-1-Puffers.
 
----
+### D2: Größe & Verortung `M` (Tier-2-RAM-Puffer) → **eigene Engine-Klasse `ChartDataBuffer`**
+* **Kritik (SRP-Verstoß):** `PyTraderChartWindow` ist ein PySide6-UI-Fenster. Laut **Rule 2.3 (SRP)** gehören mathematische Datenpuffer und schwere DataFrames **niemals** in eine UI-Klasse.
+* **Entscheidung:** Kapsele den Tier-2-Puffer in einer eigenen, zustandslosen Engine-Klasse **`ChartDataBuffer`** (unter `chart/chart_basics.py` oder `chart/indicators/utils/`). `PyTraderChartWindow` hält nur eine **Referenz** auf dieses Backend-Puffer-Objekt.
+* **Größe:** $M = 10.000$ Kerzen (Faktor 10) – perfekt (~5 MB RAM pro Chart), entlastet DuckDB hervorragend.
 
-# Refactoring-Anweisung: Popover StylePickerDialog & Cleanup (16.06.01)
+### D3: Trigger Nachladen → **JS-Request über die Bridge**
+* **Kritik (vollkommen richtig):** Nur Lightweight Charts kennt den exakten Pixel-/LogicalRange-Scrollstand des Anwenders.
+* **Entscheidung:** JS ruft über die `QWebChannel`-Bridge eine Python-Slot-Methode auf, sobald der Rand erreicht wird.
 
-## 1. Problemstellung & Soll-Zustand
-* **Problem:** Die aktuelle Umsetzung (E2/E4/E5) verwendet ein Inline-Composite-Layout (Farbe, SpinBox und ComboBoxen nebeneinander direkt in der Formularzeile des Einstellungs-Dialogs)[cite: 2]. Dadurch bleibt das Hauptformular der Indikatoren überladen.
-* **Soll-Zustand:** 
-  1. Im Einstellungs-Dialog des Indikators darf pro Element **ausschließlich ein einziger kompakter Button** (Farbkästchen + Vorschau-Text `● 2px Solid` / `● Circle`) zu sehen sein.
-  2. Erst bei Klick auf diesen Button öffnet sich ein modal/popover **`StylePickerDialog`**.
-  3. Der `StylePickerDialog` ist vertikal zweigeteilt:
-     * **Oberer Bereich:** Farbwähler + Transparenz-Slider (`QColorDialog` / Color-Grid).
-     * **Trennlinie:** Visuelle `QFrame` Horizontallinie (`QFrame.HLine`).
-     * **Unterer Bereich:** Zusätzliche Zeichnungsparameter (Linienstärke 1–10 px / Markergröße 1–20 px, Linienstil `solid`/`dashed`/`dotted`/`dashdotted` bzw. Markerform `circle`/`square`/`arrowUp`/`arrowDown`).
+### D4: Bridge-Vertrag → **Slot `request_older_data(from_time_epoch, count)`**
+* **Korrektur:** Der Slot heißt `request_older_data(from_time_epoch, count)` – **zeitbasierte Abfragen (Epoch-Wanduhr)** sind robuster gegen Chart-Indizes.
+* **Entscheidung:** Antwort-Payload mit `updateId`, `candles`, `timeMapDelta`, `chartRenderPayloadDelta`. `updateId` + Delta-Payloads sind essenziell gegen Race-Conditions bei schnellem Wischen (Debounce).
 
----
+### D5: Indikator-Berechnung pro Chunk → **vollständige Tier-2-Neuberechnung auf `M`**
+* **Kritik (Gold-Standard):** Vektorisierte NumPy/Pandas-Berechnungen über 10.000 Kerzen dauern in Python nur wenige Millisekunden (z. B. `< 5 ms` für EHMA/Multi-MA). Synchrone inkrementelle „Nahtstellen-Flickerei" wäre fehleranfällig und komplex.
+* **Entscheidung:** Die Mathe in Tier 2 rechnet das Gesamtfeld $M$ **vektorisiert neu**; nur der JS-Ausschnitt bleibt inkrementell.
 
-## 2. Anpassung in `chart/widgets/style_picker_widget.py`
+### D6: Warmup-Formel → **reiner Lese-Vorlauf, nur für Gleitdurchschnitts-Indikatoren**
+* **Kritik (sehr durchdacht):** Grid- & Proximity-Indikatoren benötigen **keinen Warmup-Vorlauf** ($\text{Warmup} = 0$), da Preis-Raster rein statisch auf dem aktuellen Preis berechnet werden.
+* **Entscheidung:** Die Formel $\text{Warmup} = \text{period} \cdot 4 + \text{smoothing} \cdot 3$ greift **ausschließlich** bei Indikatoren mit zeitlichen Gleitdurchschnitten (Multi-MA, EHMA, Volatilitäts-MAs). Der Vorlauf ist **reiner Lese-Vorlauf** (verworfen, NaN-Vertrag `period−1` bleibt unverändert).
 
-### A. Umbau `StylePickerDialog` (Dialog)
-* Erstelle eine eigenständige `QDialog`-Klasse `StylePickerDialog` (Modal).
-* **Layout:** `QVBoxLayout`
-  1. **Top:** Einbetten der bisherigen Farbauswahl & Transparenz-Steuerung.
-  2. **Separator:** `line = QFrame(); line.setFrameShape(QFrame.HLine); line.setFrameShadow(QFrame.Sunken)`
-  3. **Bottom (FormLayout):**
-     * Bei `style_type == "line"`: SpinBox für `width` (1–10), ComboBox für `style` (`solid`, `dashed`, `dotted`, `dashdotted`).
-     * Bei `style_type == "marker"`: SpinBox für `size` (1–20), ComboBox für `shape` (`circle`, `square`, `arrowUp`, `arrowDown`).
-  4. **Buttons:** `[Abbrechen]` und `[Übernehmen]` (Ok / Cancel Button-Box).
+### D7: Schwellwerte → **100 Kerzen / 20% / 300 ms, geteilte Verantwortung**
+* **Entscheidung:** JS überwacht den Rand (`< 100` verbleibende Kerzen) und **debounct** Mehrfach-Trigger mit **300 ms**. Python debounct **zusätzlich** den DuckDB-I/O-Fetch, falls sehr schnell gewischt wird.
 
-### B. Umbau `StylePickerWidget` (Inline-Button)
-* Entferne alle direkt sichtbaren SpinBoxen, ComboBoxen und CheckBoxes aus dem Layout des `StylePickerWidget`.
-* Das Widget besteht **ausschließlich aus einem `QPushButton`** (Farb-Swatch + Vorschau-Text).
-* **Klick-Event (`clicked`):** Instanziiert `StylePickerDialog`, übergibt das aktuelle `LineStyle`/`MarkerStyle`-Objekt, führt `.exec()` aus und übernimmt bei Erfolg das geänderte Style-Objekt. Emittiere `style_changed(object)`.
+### D8: DB-Ende & Datenlücken → **`has_more_history`-Stop-Flag**
+* **Entscheidung:** Liefert DuckDB **0 neue Zeilen**, setzt Python `has_more_history = False`; JS stellt weitere Nachlade-Requests am linken Rand ein (kein Endlos-Loop).
+* **Wanduhr-Pausen/Wochenende:** Dank `resolveRealTime()` (`01_core.js`) und Wanduhr-Epochs werden historische Pausen (23:00–23:59) und Wochenend-Lücken ohne Phantom-Index-Slots gerendert.
+
+### D9: Live-Ticks vs. Historie-Viewport → **Viewport fix, stummer Puffer-Update, „Live"-Button**
+* **Entscheidung (Exzellente Trading-UX):** Eingehende M1-Bar-Closes (`LiveAnalyzer`) schreiben die neue Kerze ans **rechte Ende** von Tier 2. Scrollt der User in der Historie (Tier-1-Ausschnitt nicht am rechten Rand), wird `updateLiveCandle()` in JS **unterdrückt oder nur stumm im Speicher aktualisiert**, damit der Scroll-Fokus nicht zuckt. Ein dezenter **„Live"-Button** im Chart springt bei Klick an den aktuellen Rand.
+
+### D10: Restore / Window Geometry & State → **offsetbasiert relativ zum rechten Rand**
+* **Entscheidung:** Da im Hintergrund ständig neue Ticks hinzukommen, verändern sich absolute Bar-Indizes. Der Restore (`visible_from`/`visible_range_from`) erfolgt als **zeit-/offsetbasierter Offset relativ zum rechten Rand** (Chunk-Koordinaten), umbruchfest – beim Wiederöffnen wird exakt derselbe Wochentag/Ausschnitt geladen.
+
+> **Zusammenfassung (Anwender-Urteil):** Die Vorschläge sind bis auf die **Verortung von Tier 2 (D2: heraus aus UI, hinein in eine Buffer-Klasse)** und die **Klarstellung der N-Größe (D1: N=1000 Canvas)** perfekt durchdacht. Die Verträge zur zeitzonenfreien Wanduhr-Formatierung, die Entkopplung von Background-Workern und der Erhalt aller OOP-Prinzipien sind lückenlos gewahrt.
+>
+> **Kein Coding:** Die Entscheidungen sind dokumentiert. Eine Umsetzung von 16.07 erfolgt erst nach ausdrücklichem Startbefehl des Anwenders. *(Inzwischen erfolgt – siehe unten: Implementierungs-Log 16.07, 07.08.2026.)*
 
 ---
+# Kapitel 16.07 – Implementierungs-Log (07.08.2026, 12:56 Uhr)
 
-## 3. Bereinigung Indikator-Dialoge & Parameterschemata
+> **Status:** Kapitel 16.07 ist **umgesetzt** (D1–D10, siehe Review oben). Implementierungs-Log gemäß Regel 0c – Datum/Uhrzeit 07.08.2026 12:56 Uhr. Verifikation headless (Regel 4: keine UI-Tests, keine Regressionstests) über `test/test.py` Teil 12 (P16.07) sowie `py_compile`/`node --check` auf allen geänderten Dateien.
 
-### A. `chart/indicator_dialog.py`
-* Stelle sicher, dass die Formularzeilen für Farbfelder nur noch die kompakte `StylePickerWidget`-Schaltfläche rendern.
-* Stelle sicher, dass `_style_sibling_keys()` beim Speichern/Laden die Sibling-Keys (`*_width`, `*_style`, `*_size`, `*_shape`) weiterhin fehlerfrei liest und schreibt[cite: 2].
+## 1. Umgesetzte Architektur (Ist-Stand)
 
-### B. `chart/indicators/fixed_grid_proximity.py` & `chart/indicators/multi_ma.py`
-* Keine separaten Einzelfelder (Linienstärke, Linienstile, Markergrößen) direkt im Formular rendern[cite: 2].
-* Alle visuellen Einstellungen laufen exklusiv über den Popover-`StylePickerDialog`[cite: 2].
+* **Tier 1 (JS-Renderfenster):** fest **N = 1.000** Kerzen (`TIER1_WINDOW`, D1). `chart_candle_limit` (3.000) steuert nur noch den initialen Sichtbarkeits-Standard beim Öffnen, nicht die harte Render-Grenze.
+* **Tier 2 (RAM-Puffer):** eigene Backend-Engine-Klasse **`ChartDataBuffer`** (D2, SRP – Rule 2.3), `TIER2_CAPACITY = 10.000`. `PyTraderChartWindow` (PySide6-UI) hält nur eine Referenz; schwere DataFrames/Zeit-Maps leben ausschließlich im Puffer.
+* **Nachlade-Trigger:** JS-Seite über die QWebChannel-Bridge (D3): `olderDataRequested(from_epoch, count, request_id, window_right)`.
+* **Bridge-Vertrag (D4):** Python-Slot liefert Delta-Payload `{updateId, symbol, timeframe, candles, timeMapDelta, windowRightEpoch, hasMoreHistory, chartRenderPayloadDelta}`; `updateId`-Guard gegen Race-Conditions (analog `_updateId`).
 
----
+## 2. Umsetzung D1–D10 im Detail
 
-## 4. Anweisung für die IDE-AI (Ausführung & Verifikation)
+* **D1 (N=1000):** `ChartDataBuffer.TIER1_WINDOW = 1000`; `window_candles()` liefert die letzten N served Kerzen kont-zeit-gemappt; `_do_refresh_chart_data()` sendet nur `window_candles(TIER1_WINDOW)` an JS.
+* **D2 (M=10000):** `chart/indicators/utils/chart_data_buffer.py` (NEU). In-place-Erhalt der cont-Zeit-Maps (`time_cont_to_real`/`time_real_to_cont` – ChartWindow hält gültige Referenzen), Sliding-Window-Trim rechts bei Kapazitätsüberschreitung (rechteste/neueste Kerzen werden samt Map-Einträgen verworfen).
+* **D3 (JS-Trigger):** `chart/js/06_two_tier.js` (NEU) überwacht `visibleLogicalRange`; `< 100` Kerzen links → debounced (300 ms) `onRequestOlderData(leftReal, 1000, serial, rightReal)`. Live-Erkennung über `_isHistoryView()` (D9).
+* **D4 (Bridge/Slot):** `ChartBridge.olderDataRequested` → `_on_older_data_requested` (Debounce-Timer 300 ms) → `_do_older_data_load`: Priorität 1 = RAM-Serve aus `ChartDataBuffer.serve_older()` (0 ms I/O, D3/D4), Priorität 2 = `OlderDataWorker` (QThread) mit `before_epoch`-DB-Fetch. Antwort via `_send_older_chunk` (Delta-Payload).
+* **D5 (vektorisierte Neuberechnung):** `merge_older()` baut `df = warmup + served` vollständig neu; `_apply_data_window_size()` setzt das Multi-MA-Fenster; nur der JS-Ausschnitt bleibt inkrementell (`applyOlderDataChunk` mit `candleSeries.setData` OHNE `chart.remove/createChart`; Render-Delta via `renderLineSeries`/`renderMarkers`/`DaySeparator.render`).
+* **D6 (Warmup):** `_compute_warmup()` = `max(period*4 + smoothing*3)` **nur über aktive MAs** (Grid/Proximity: 0). `ChartDataBuffer` hält den Vorlauf als `_warmup_candles` (reiner Lese-Vorlauf, verworfen – NaN-Vertrag `period−1` unverändert).
+* **D7 (Schwellwerte):** 100 Kerzen / 20% / 300 ms – JS-Debounce (`OLDER_REQUEST_DEBOUNCE_MS=300`) + Python-Debounce (`_older_debounce_timer`) für den DB-Fetch.
+* **D8 (DB-Ende):** `has_more_history=False` bei 0 neuen Zeilen (`merge_older` leerer Fetch); JS stellt Nachlade-Requests ein. Pausen/Wochenende bleiben dank `resolveRealTime()`-Wanduhr-Handling korrekt.
+* **D9 (Historie-Viewport):** `updateLiveCandle()` bricht ab, wenn `window._isHistoryView()` (stummer Puffer-Update); dezenter **„Live"-Button** (`#live-button` in `chart/chart_basics.py`) springt per `jumpToLiveRequested` an den rechten Rand.
+* **D10 (Offset-Restore):** `syncRanges` sendet `totalBars` als 3. Argument; `handle_range_changed` speichert Offsets relativ zum rechten Rand (`visible_from = total - from`, `visible_to = total - to`); `_resolve_visible_logical_range(total)` stellt sie umbruchfest wieder her (Offset-Format from>to; Alt-Format wird geklemmt).
 
-1. **Bugfixing-Modus beachten:** Nutze gezielte Snippets und mache nur minimale, strukturelle Korrekturen[cite: 1, 2].
-2. **Statischer Check (keine UI-Tests):** Führe nach den Anpassungen ausschließlich den Syntax-Check durch[cite: 1]:
+## 3. Geänderte / neue Dateien
 
-   python -m py_compile chart/widgets/style_picker_widget.py chart/indicator_dialog.py chart/indicators/multi_ma.py chart/indicators/fixed_grid_proximity.py
+| Datei | Änderung |
+|---|---|
+| `db_service.py` | `fetch_historical_candles(..., before_epoch=None)` additiv (WHERE `"time" < to_timestamp(?)`) – Chunk-Fetch für ältere Daten (D4) |
+| `chart/indicators/utils/chart_data_buffer.py` | **NEU:** `ChartDataBuffer` (D2) – load_initial/serve_older/merge_older/window_candles, cont-Maps, Warmup, Kapazitäts-Trim |
+| `chart/indicators/multi_ma.py` | `set_data_window_size(n)` + `_get_candle_limit()`-Fallback (Tier-2-Fenster für D5) |
+| `chart/chart_win.py` | ChartBridge-Erweiterung (rangeChanged/olderDataRequested/jumpToLiveRequested), `OlderDataWorker`, Two-Tier-Refresh, `_compute_warmup`, `_resolve_visible_logical_range`, `_collect_render_payload`-Zeitfenster-Filter, Delta-Payload-Sendung |
+| `chart/js/06_two_tier.js` | **NEU:** Rand-Trigger, Debounce, `applyOlderDataChunk`, Viewport-Stabilisierung, Live-Button-Logik (D3/D7/D8/D9) |
+| `chart/js/04_live_updates.js` | additiv: `syncRanges` mit totalBars, `_isHistoryView`-Guard, Hooks `_onFullChartUpdateApplied`/`_onVisibleRangeChanged` |
+| `chart/chart_basics.py` | `#live-button`-CSS + Button-HTML; `JS_FILES` += `06_two_tier.js` |
 
+## 4. Verifikation (headless, 07.08.2026)
 
-3. **Führe KEINE GUI-/UI-Tests aus** (Harte Projektregel 4).
+* `py_compile` auf allen geänderten Python-Dateien → EXIT=0.
+* `node --check` auf `02_time_utils.js`/`03_chart_rendering.js`/`04_live_updates.js`/`06_two_tier.js` → EXIT=0.
+* `test/test.py` (offscreen, venv, UTF-8): **Teil 12 (P16.07) alle 28 Checks PASS** – T1 `before_epoch` (additiver Chunk-Fetch, älteste Kante → 0 Kerzen), T2 `load_initial`/Tier-1-Fenster/cont-Maps (bijektiv, lückenlos), T3 RAM-Serve + Erschöpfung, T4 `merge_older` Prepend/cont-Erhalt/Trim (Sliding-Window entfernt rechteste Kerze samt Map-Eintrag; verbliebene Alt-Kerzen behalten cont)/Warmup/`has_more_history` (D8), T5 `_compute_warmup` (nur aktive MAs, D6), T6 `_resolve_visible_logical_range` (D10 Offset-/Alt-Format, Klemmen), T7 Render-Payload-Zeitfenster-Filter (D1/D5).
+* Teile 1–11 unverändert grün; weiterhin exakt **6 vorbestehende ServiceWindow-Fails** (P2/P5/H3/H4/H5/H7 – dokumentiert in E6, betrifft `serviceui/service_win.py` unverändert).
+* Temporäre Test-Artefakte (`test/_tmp_p1607`, `test_stderr.txt`) nach Abschluss entfernt (Regel 8/10).
+* Keine UI-Tests / keine Regressionstests ausgeführt (Regel 4).
 
----
+## 5. Offene Punkte (bewusst, nicht Teil dieser Umsetzung)
 
-## 5. Präzisierung der Dialog-Interna & API-Garantie (Kritisch)
-
-* **Farbbereich (`StylePickerDialog` Top):** Baue ein kompaktes Custom-Widget (Palette-Grid + Transparenz-Slider 0-100% + QColorDialog-Modal-Button als Fallback). Kein QColorDialog(Qt.Widget) verwenden.
-* **`color_only`-Handling:** Ist `color_only=True`, schalte die `QFrame.HLine`-Trennlinie und den unteren Formularbereich im Dialog auf `setVisible(False)` und verkleinere den Dialog.
-* **Schnittstellen-Invariante:** `StylePickerWidget` MUSS folgende API 1:1 bereitstellen:
-  - Methods: `get_style()`, `set_style(obj)`, `set_color(color_str)`
-  - Props: `style_type` ("line"|"marker"), `color_only` (bool), `show_visibility` (bool)
-  - Signal: `style_changed(object)`
-  - Innerer Zugriff `ctrl.get_style().color` muss garantiert funktionieren!
-
----
-
-## 6. Implementierungs-Log 16.06.01 (Stand 07.08.2026)
-
-### E7: Popover StylePickerDialog & Button-Only-Cleanup umgesetzt (16.06.01)
-* **Umsetzung (Refactoring-Anweisung 16.06.01, Kapitel 1–5):**
-  * **`chart/widgets/style_picker_widget.py` neu strukturiert:**
-    * **`StylePickerDialog`** (modal, `QDialog`): vertikal zweigeteilt –
-      oberer Bereich = kompaktes Custom-Color-Grid (TradingView-Palette mit
-      16 Farben + Hex/RGB-Eingabefeld + Transparenz-Slider 0–100% +
-      `[Anpassen...]`-Fallback auf `QColorDialog.getColor()`; bewusst KEIN
-      `QColorDialog(Qt.Widget)`-Trick, Entscheidung 1), darunter
-      `QFrame.HLine`-Trennlinie (Sunken), unterer Bereich = `QFormLayout`
-      mit width 1–10 / size 1–20 (QSpinBox) und style `LINE_STYLES` /
-      shape `MARKER_SHAPES` (QComboBox), abschließend `QDialogButtonBox`
-      `[Abbrechen]` / `[Übernehmen]`.
-    * **`color_only=True`:** Trennlinie + unterer Bereich werden per
-      `setVisible(False)` ausgeblendet und der Dialog via `adjustSize()` auf
-      die reine Farbwahl verkleinert (Entscheidung 2).
-    * **`StylePickerWidget` = Button-Only:** Layout besteht ausschließlich aus
-      einem `QPushButton` (Farb-Swatch-Icon 16×16 + Vorschau-Text `● 2px Solid`
-      bzw. `● Circle`). Klick → `StylePickerDialog.exec()`; bei
-      `[Übernehmen]` wird das geänderte Style-Objekt übernommen und
-      `style_changed` emittiert. Das Inline-Composite (QCheckBox + Swatch +
-      QSpinBox + QComboBox in der Formularzeile) ist entfernt.
-  * **API-Invariante (Entscheidung 3) 1:1 erfüllt:** `get_style()` /
-    `set_style(obj)` / `set_color(color_str)` / `color()`, Properties
-    `style_type` ("line"|"marker"), `color_only` (bool), `show_visibility`
-    (bool), Signal `style_changed(object)`. Innerer Zugriff
-    `ctrl.get_style().color` funktioniert garantiert.
-  * **`show_visibility=True`:** Der Dialog zeigt im unteren Bereich eine
-    `sichtbar`-Checkbox (ersetzt die frühere Inline-Checkbox); `get_style()`
-    liefert dann deren Zustand als `show`. Bei `show_visibility=False`
-    bleibt `show` unverändert (separater `show_*`-Param steuert die
-    Sichtbarkeit).
-  * `chart/widgets/__init__.py`: `StylePickerDialog` additiv re-exportiert
-    (Kapitel 3, Regel 9: keine Bestandscode-Änderungen).
-  * `chart/indicator_dialog.py`, `multi_ma.py`, `fixed_grid_proximity.py`:
-    **keine Änderungen nötig** – die Fassade ist unverändert, der
-    Sibling-Roundtrip (`_style_sibling_keys`/`_build_preset_payload`/
-    `collect_params_from_ui`/`update_ui_from_params`) und die Schemata
-    bleiben intakt.
-* **Verifikation (headless, kein GUI-Start; Regel 4/4.5):**
-  * `python -m py_compile` auf `style_picker_widget.py`, `widgets/__init__.py`,
-    `indicator_dialog.py`, `multi_ma.py`, `fixed_grid_proximity.py`,
-    `style_models.py` → EXIT=0.
-  * `test/check_stylepicker_16_06.py` (headless, venv, UTF-8): A1–A4
-    (Button-Only ohne Inline-Composite, API-Invariante, Defaults MA1 w2/solid
-    + MA2 w1/solid, Vorschau `● 2px Solid`), B1–B4 (Line-/Marker-Picker
-    Button-Only, KEINE Alt-Einzelfelder gerendert/persistiert, Schema ohne
-    Alt-Keys), C1–C7 (Dialog zweigeteilt, Spin-Ranges 1–10/1–20 + Combos,
-    color_only kompakt via `setVisible(False)`, `get_style()` nach
-    Übernahme, Farbbereich vollständig, `set_style`/`set_color`, `style_changed`-
-    Emission via Auto-Accept ohne GUI), D1 (WindowCloseButtonHint für beide
-    Dialoge) — alle PASS (EXIT=0).
-  * `test/test.py` (headless, venv): alle 16.06-Checks weiterhin PASS
-    (D4 volle Picker ohne Checkbox/`ma1_bear_color` color_only/Picker-Defaults,
-    D5 Sibling-Keys in display_params, Teil 11 G1–G5). Einzige Fails:
-    vorbestehende ServiceWindow-Checks P2/P5/H3/H4/H5/H7 (dokumentiert in E6;
-    betrifft `serviceui/service_win.py`, unverändert).
-* Keine UI-Tests ausgeführt (Regel 4); Working Tree nach Umsetzung:
-  `chart/widgets/style_picker_widget.py`, `chart/widgets/__init__.py`,
-  `docs/AKTUELLE_UMSETZUNG.md` (`test/check_stylepicker_16_06.py` ist per
-  `.gitignore` nicht versioniert).
-
+* Performance-Messung JS-seitig (FPS/Latenz unter realer Last) – manuelle Verifikation durch den Anwender in der GUI.
+* `_pending_older`-Auflösung bei Symbol-/TF-Wechsel mitten im Chunk-Load (durch `updateId`-Guard abgesichert, Verhalten beibehalten).

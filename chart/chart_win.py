@@ -44,6 +44,13 @@ except ImportError:
     from indicators.multi_ma import MultiMovingAverageIndicator
     from indicator_dialog import IndicatorSettingsDialog
 
+# Phase 16.07 (D2): Tier-2-RAM-Puffer als eigene Engine-Klasse (SRP – Rule 2.3).
+# Die UI-Klasse haelt nur eine Referenz auf das Backend-Puffer-Objekt.
+try:
+    from chart.indicators.utils.chart_data_buffer import ChartDataBuffer
+except ImportError:
+    from indicators.utils.chart_data_buffer import ChartDataBuffer
+
 try:
     from state_manager import StateManager
 except ImportError:
@@ -90,18 +97,35 @@ class WebEngineConsolePage(QWebEnginePage):
 
 
 class ChartBridge(QObject):
-    rangeChanged = Signal(float, float)
+    """QWebChannel-Bridge zwischen JS (LWC v5) und Python (GUI-Thread).
+
+    Phase 16.07 (D3/D4/D10): Additiv erweitert um
+      * rangeChanged(f, t, totalBars) – totalBars für D10-Offset-Restore
+      * olderDataRequested(from_time_epoch, count, request_id, window_right_epoch)
+        – JS fordert ältere Daten an (zeitbasiert, Wanduhr-Epoch, D4)
+      * jumpToLiveRequested – D9 „Live"-Button (Rücksprung ans Live-Ende)
+    """
+    rangeChanged = Signal(float, float, float)
     priceRangeChanged = Signal(float, float)
     measurementChanged = Signal(str)
+    olderDataRequested = Signal(int, int, int, int)
+    jumpToLiveRequested = Signal()
 
-    @Slot(float, float)
-    def onRangeChanged(self, f, t): self.rangeChanged.emit(f, t)
+    @Slot(float, float, float)
+    def onRangeChanged(self, f, t, total): self.rangeChanged.emit(f, t, total)
 
     @Slot(float, float)
     def onPriceRangeChanged(self, f, t): self.priceRangeChanged.emit(f, t)
 
     @Slot(str)
     def onMeasurementChanged(self, m): self.measurementChanged.emit(m)
+
+    @Slot(int, int, int, int)
+    def onRequestOlderData(self, from_time_epoch, count, request_id, window_right_epoch):
+        self.olderDataRequested.emit(from_time_epoch, count, request_id, window_right_epoch)
+
+    @Slot()
+    def onJumpToLive(self): self.jumpToLiveRequested.emit()
 
 
 class ChartDataSerializer(QThread):
@@ -146,6 +170,39 @@ class GridDataSerializer(QThread):
             self.done.emit("", self.grid_gen)
 
 
+class OlderDataWorker(QThread):
+    """Phase 16.07 (D7): Holt den nächsten DB-Chunk (ältere Kerzen) im
+    Hintergrund-Thread – der GUI-Thread bleibt reaktionsfähig.
+
+    Führt NUR den reinen Lese-Fetch aus (MarketDataRepository,
+    before_epoch-Pfad). Die Puffer-Merge und das Delta-Payload werden im
+    GUI-Thread erledigt (Buffer/Indikator-Zustand ist nicht thread-safe).
+
+    Generations-Guard über request_id: Veraltete Worker-Ergebnisse (schneller
+    Wechsel / neuerer Request) werden in _on_older_db_fetched verworfen.
+    """
+    done = Signal(int, list, bool)  # request_id, candles, success
+
+    def __init__(self, repo, symbol, timeframe, before_epoch, count, request_id, parent=None):
+        super().__init__(parent)
+        self.repo = repo
+        self.symbol = symbol
+        self.timeframe = timeframe
+        self.before_epoch = before_epoch
+        self.count = count
+        self.request_id = request_id
+
+    def run(self):
+        try:
+            candles, _precision = self.repo.fetch_historical_candles(
+                self.symbol, self.timeframe, limit=self.count,
+                before_epoch=self.before_epoch)
+            self.done.emit(self.request_id, candles, True)
+        except Exception as e:
+            print(f"⚠️ [OlderDataWorker] DB-Fetch-Fehler: {e}")
+            self.done.emit(self.request_id, [], False)
+
+
 class PyTraderChartWindow(QMainWindow):
     closed_signal = Signal(str)
 
@@ -184,6 +241,10 @@ class PyTraderChartWindow(QMainWindow):
         self.state_manager = state_manager or StateManager()
         self.settings = self.state_manager.get_app_settings()
         self.market_repo = MarketDataRepository()
+        # Phase 16.07 (D2): Tier-2-RAM-Puffer als eigene Engine-Klasse (SRP –
+        # Rule 2.3). Die UI-Klasse haelt NUR eine Referenz; schwere DataFrames
+        # und die Zeit-Maps leben ausschliesslich im Buffer.
+        self.chart_buffer: ChartDataBuffer = ChartDataBuffer(market_repo=self.market_repo)
         self._is_loading_data = False
         self.df_data = None
 
@@ -216,9 +277,12 @@ class PyTraderChartWindow(QMainWindow):
         self._loading_watchdog.setSingleShot(True)
         self._loading_watchdog.setInterval(15000)
         self._loading_watchdog.timeout.connect(self._on_loading_watchdog)
-        # Mapping: kontinuierliche Zeit -> originale epoch (für JS tickMarkFormatter)
-        self._time_cont_to_real: Dict[int, int] = {}
-        self._time_real_to_cont: Dict[int, int] = {}
+        # Mapping: kontinuierliche Zeit -> originale epoch (für JS tickMarkFormatter).
+        # Phase 16.07 (D2): Referenzen auf die Buffer-Maps – der Buffer pflegt
+        # sie IN-PLACE (clear/update), damit diese Referenzen dauerhaft gültig
+        # bleiben (auch update_live_candle ergänzt live Einträge direkt).
+        self._time_cont_to_real: Dict[int, int] = self.chart_buffer.time_cont_to_real
+        self._time_real_to_cont: Dict[int, int] = self.chart_buffer.time_real_to_cont
         # P14-03-E: Live-Kerzen-State für die Pflicht-Re-Injektion (Flacker-Fix).
         self._live_bar_time: Optional[int] = None   # reale, gerundete Bar-Zeit der offenen Kerze
         self._live_candle_cont: Optional[Dict[str, Any]] = None  # letzter Live-Candle (kont. Zeit + OHLC)
@@ -227,6 +291,23 @@ class PyTraderChartWindow(QMainWindow):
         # Symbol/TF-Stand) werden in _apply_chart_update/_apply_grid_render verworfen.
         self._update_generation: int = 0
         self._grid_generation: int = 0
+
+        # Phase 16.07 (D7): Debounce für JS-Nachlade-Requests (300 ms, JS und
+        # Python debouncen – geteilte Verantwortung). Der DuckDB-I/O-Fetch
+        # laeuft zusätzlich im OlderDataWorker (Hintergrund-Thread).
+        self._older_debounce_timer: QTimer = QTimer(self)
+        self._older_debounce_timer.setSingleShot(True)
+        self._older_debounce_timer.setInterval(300)
+        self._older_debounce_timer.timeout.connect(self._do_older_data_load)
+        self._older_worker: Optional[OlderDataWorker] = None
+        # JS-Request-Tracking (D4/D7): request_id = JS-Seitiges Serial; nur
+        # der neueste Request wird ausgeführt/angewendet (Race-Guard).
+        self._older_request_serial: int = 0
+        self._pending_older: Optional[Tuple[int, int, int, int]] = None
+        # JS-Fenster-Bounds (reale Wanduhr-Epochs) für den Render-Payload-
+        # Filter (Tier-1-Fenster, D1) bei render_indicators und Chunk-Deltas.
+        self._js_window_first_real: Optional[int] = None
+        self._js_window_last_real: Optional[int] = None
 
                 # 1. ZUERST versuchen, spezifischen Instanz-Status aus der DB zu laden
         saved_inst_st = self.state_manager.load_all_instances()
@@ -383,6 +464,10 @@ class PyTraderChartWindow(QMainWindow):
         self.bridge.rangeChanged.connect(self.handle_range_changed)
         self.bridge.priceRangeChanged.connect(self.handle_price_range_changed)
         self.bridge.measurementChanged.connect(self.handle_measurement_changed)
+        # Phase 16.07 (D3/D4/D9): JS fordert ältere Daten an bzw. springt ans
+        # Live-Ende („Live"-Button).
+        self.bridge.olderDataRequested.connect(self._on_older_data_requested)
+        self.bridge.jumpToLiveRequested.connect(self._on_jump_to_live)
         self.channel = QWebChannel()
         self.channel.registerObject("pyBridge", self.bridge)
         self.web_view.page().setWebChannel(self.channel)
@@ -610,7 +695,8 @@ class PyTraderChartWindow(QMainWindow):
         self.save_state()
         self.render_indicators()
 
-    def _collect_render_payload(self) -> Dict[str, list]:
+    def _collect_render_payload(self, time_from: Optional[int] = None,
+                                time_to: Optional[int] = None) -> Dict[str, list]:
         """P16.05 (Prework Schritt 1, F1/P-C2): Sammelt das generische
         Render-Payload über ALLE aktiven Indikatoren.
 
@@ -620,6 +706,14 @@ class PyTraderChartWindow(QMainWindow):
         Branches mehr (Open/Closed, Invariante 9). Circle- und Linien-Zeiten
         (reale Wanduhr-Epochs) werden generisch auf kontinuierliche Zeiten
         gemappt (P-D1 / Ergänzung 1: `_time_real_to_cont.get(ts, ts)`).
+
+        Phase 16.07 (D1/D5): `time_from`/`time_to` (reale Wanduhr-Epochs,
+        inklusiv) grenzen den Render-Payload auf ein Zeitfenster ein:
+        * render_indicators(): Tier-1-Fenster [self._js_window_first_real,
+          self._js_window_last_real] – verhindert, dass Linien/Circles über
+          die sichtbaren Kerzen hinausragen (Two-Tier, D1).
+        * Chunk-Delta: [neue linke Kante, Fenster-Rechtskante].
+        None = keine Filterung (Bestandsverhalten, P16.05-Tests).
         """
         payload: Dict[str, list] = {
             "lines": [], "price_lines": [], "hit_circles": [],
@@ -656,6 +750,7 @@ class PyTraderChartWindow(QMainWindow):
                         for item in items:
                             if not isinstance(item, dict):
                                 continue
+                            keep_pts = []
                             for pt in (item.get("data") or []):
                                 if not isinstance(pt, dict):
                                     continue
@@ -666,7 +761,16 @@ class PyTraderChartWindow(QMainWindow):
                                     pt_t = int(pt_t)
                                 except (TypeError, ValueError):
                                     continue
+                                # Phase 16.07: Zeitfenster-Filter (real,
+                                # inklusiv) – Warmup-Punkte (D6, verworfen)
+                                # und Punkte ausserhalb des Fensters fallen weg.
+                                if time_from is not None and pt_t < time_from:
+                                    continue
+                                if time_to is not None and pt_t > time_to:
+                                    continue
                                 pt["time"] = self._time_real_to_cont.get(pt_t, pt_t)
+                                keep_pts.append(pt)
+                            item["data"] = keep_pts
                     else:
                         # Marker-Format: {time, price, ...} – Zeit auf oberster
                         # Ebene des Items (Circle).
@@ -680,6 +784,10 @@ class PyTraderChartWindow(QMainWindow):
                                 gc_t = int(gc_t)
                             except (TypeError, ValueError):
                                 continue
+                            if time_from is not None and gc_t < time_from:
+                                continue
+                            if time_to is not None and gc_t > time_to:
+                                continue
                             item["time"] = self._time_real_to_cont.get(gc_t, gc_t)
                 payload[key].extend(items)
         return payload
@@ -690,11 +798,18 @@ class PyTraderChartWindow(QMainWindow):
         P16.05 (Prework Schritt 1): Generische Pipeline statt Indikator-
         Branches – das aggregierte Render-Payload wird 1:1 per
         applyChartRenderPayload an JS durchgereicht (P-D1, F1).
+
+        Phase 16.07 (D1): Das Payload wird auf das Tier-1-Fenster
+        [self._js_window_first_real, self._js_window_last_real] begrenzt,
+        damit Linien/Circles nicht über die sichtbaren Kerzen hinausragen
+        (Two-Tier; die Berechnung selbst läuft über den vollen Tier-2-Puffer).
         """
         if self.df_data is None or self.df_data.empty:
             return
 
-        payload = self._collect_render_payload()
+        payload = self._collect_render_payload(
+            time_from=self._js_window_first_real,
+            time_to=self._js_window_last_real)
 
         # P14-03-E (Flacker-Fix): calculate() resettet die _known_times der
         # Indikatoren – die offene Live-Bar generisch wieder einfügen, damit
@@ -779,99 +894,73 @@ class PyTraderChartWindow(QMainWindow):
         self._debounce_timer.start()
 
     def _do_refresh_chart_data(self) -> None:
-        """Führt den tatsächlichen Chart-Refresh aus (nur via Debounce-Timer)."""
+        """Führt den tatsächlichen Chart-Refresh aus (nur via Debounce-Timer).
+
+        Phase 16.07 (Two-Tier, D1/D2/D5/D6/D8/D10):
+          * Tier 2: `ChartDataBuffer.load_initial()` lädt M + Warmup aus
+            DuckDB (D2: M=10000; D6: reiner Lese-Vorlauf für MAs).
+          * Tier 1: JS erhält das letzte Tier-1-Fenster (D1: N=1000).
+          * Indikator-Berechnung läuft über den vollen Tier-2-Puffer (D5),
+            das Render-Payload wird auf das Tier-1-Fenster begrenzt.
+          * `hasMoreHistory` (D8) und `rangeFrom/rangeTo` (D10, offsetbasiert
+            relativ zum rechten Rand) gehen in den Payload.
+        """
         if self._is_loading_data:
             self._debounce_timer.start()
             return
 
         self._set_loading(True)
 
-        print(f"📊 Lade Chart-Daten: {self.current_symbol} {self.current_tf}")
-        candles, precision = self.market_repo.fetch_historical_candles(self.current_symbol, self.current_tf, limit=self.settings.chart_candle_limit)
-        print(f"   → {len(candles)} Candles geladen, precision={precision}")
+        print(f"📊 Lade Chart-Daten (Two-Tier): {self.current_symbol} {self.current_tf}")
 
-        # NaN-Werte aus den Candles entfernen
-        clean_candles = []
-        if candles:
-            import math
-            for c in candles:
-                if (c.get("time") is not None and
-                    c.get("open") is not None and
-                    c.get("high") is not None and
-                    c.get("low") is not None and
-                    c.get("close") is not None):
-                    if (not math.isnan(c["open"]) and
-                        not math.isnan(c["high"]) and
-                        not math.isnan(c["low"]) and
-                        not math.isnan(c["close"])):
-                        # P16.05 (F3-Beschluss): tick_volume NaN/None -> 0,
-                        # die Candle bleibt gültig. Doppel-Absicherung zur
-                        # Normalisierung in fetch_historical_candles, damit
-                        # json.dumps(allow_nan=False) nie an tick_volume
-                        # scheitert und df_data["tick_volume"] sauber ist.
-                        tv = c.get("tick_volume")
-                        if tv is None:
-                            tv = 0.0
-                        else:
-                            try:
-                                tv = float(tv)
-                            except (TypeError, ValueError):
-                                tv = 0.0
-                            if math.isnan(tv):
-                                tv = 0.0
-                        c["tick_volume"] = tv
-                        clean_candles.append(c)
+        # D6: Warmup-Vorlauf (period*4 + smoothing*3) nur für aktive
+        # Gleitdurchschnitts-Indikatoren; Grid/Proximity => 0.
+        warmup = self._compute_warmup()
 
-            # ======================================================================
-            # Kontinuierliche Candle-Zeiten (keinerlei Lücken/Whitespace im Chart)
-            # Jede Candle bekommt: base_time + i * tf_sec
-            # Mapping cont -> real für JS tickMarkFormatter.
-            # ======================================================================
-            t_sec = TF_SECONDS_MAP.get(str(self.current_tf).upper(), 60)
-            self._time_cont_to_real = {}
-            self._time_real_to_cont = {}
-            continuous_candles = []
-            if clean_candles:
-                base_time = clean_candles[0]["time"]
-                for i, c in enumerate(clean_candles):
-                    cont_time = base_time + i * t_sec
-                    real_time = int(c["time"])
-                    self._time_cont_to_real[cont_time] = real_time
-                    self._time_real_to_cont[real_time] = cont_time
-                    dc = dict(c)
-                    dc["time"] = cont_time
-                    continuous_candles.append(dc)
+        # Tier 2: RAM-Puffer (M + Warmup) aus DuckDB füllen (D2/D6).
+        self.chart_buffer.load_initial(
+            self.current_symbol, self.current_tf, warmup=warmup,
+            limit=self.chart_buffer.TIER2_CAPACITY)
+        # D6: Datenfenster-Grösse (M + Warmup) an den MA-Indikator melden,
+        # damit die Berechnung über den vollen Tier-2-Puffer läuft (D5).
+        self._apply_data_window_size()
+        self.df_data = self.chart_buffer.df
 
-            # P14-03-E (PFLICHT, Pruefprotokoll P5): Offene Live-Kerze nach dem
-            # Map-Rebuild re-injizieren – sonst feuert der New-Candle-Callback
-            # bei jedem Tick erneut und die Flacker-Schleife bleibt bestehen.
-            # (remember_live_time-Re-Injektion erfolgt GENERISCH NACH dem
-            # calculate()-Loop weiter unten – calculate setzt die _known_times
-            # der Indikatoren aus den DB-Bars zurück und wuerde eine Re-Injektion
-            # VOR dem Loop wieder zunichte machen.)
-            if (self._live_bar_time is not None
-                    and self._live_bar_time not in self._time_real_to_cont):
-                last_cont = max(self._time_cont_to_real.keys())
-                cont = last_cont + t_sec
-                self._time_cont_to_real[cont] = self._live_bar_time
-                self._time_real_to_cont[self._live_bar_time] = cont
-                if self._live_candle_cont is not None:
-                    lc = dict(self._live_candle_cont)
-                    lc["time"] = cont
-                    continuous_candles.append(lc)
+        # Tier-1-Fenster (D1: letzte N Kerzen) mit kontinuierlichen Zeiten.
+        continuous_candles = self.chart_buffer.window_candles(
+            self.chart_buffer.TIER1_WINDOW)
+        precision = self.chart_buffer.precision
+        print(f"   → Tier2={len(self.chart_buffer.candles)} (warmup={warmup}), "
+              f"Tier1={len(continuous_candles)} Candles, precision={precision}")
 
-            import pandas as pd
-            self.df_data = pd.DataFrame(clean_candles)
-        else:
-            self.df_data = None
-            continuous_candles = []
+        # JS-Fenster-Bounds (reale Wanduhr-Epochs) für Render-Payload-Filter.
+        n_win = min(self.chart_buffer.TIER1_WINDOW, len(self.chart_buffer.candles))
+        self._js_window_first_real = (
+            int(self.chart_buffer.candles[-n_win]["time"]) if n_win > 0 else None)
+        self._js_window_last_real = self.chart_buffer.last_real
+
+        # P14-03-E (PFLICHT, Pruefprotokoll P5): Offene Live-Kerze nach dem
+        # Map-Rebuild (load_initial hat die Maps IN-PLACE neu aufgebaut)
+        # re-injizieren – sonst feuert der New-Candle-Callback bei jedem Tick
+        # erneut und die Flacker-Schleife bleibt bestehen.
+        t_sec = self.chart_buffer.tf_seconds
+        if (self._live_bar_time is not None
+                and self._live_bar_time not in self._time_real_to_cont):
+            last_cont = max(self._time_cont_to_real.keys()) if self._time_cont_to_real else 0
+            cont = last_cont + t_sec
+            self._time_cont_to_real[cont] = self._live_bar_time
+            self._time_real_to_cont[self._live_bar_time] = cont
+            if self._live_candle_cont is not None:
+                lc = dict(self._live_candle_cont)
+                lc["time"] = cont
+                continuous_candles.append(lc)
 
         # P16.05 (Prework Schritt 1): Generische Payload-Aggregation über
-        # ALLE aktiven Indikatoren (P-D1/F1/P-C2) – keine Indikator-
-        # spezifischen Branches mehr (Open/Closed, Invariante 9). Circle-/
-        # Linien-Zeiten werden in _collect_render_payload auf kontinuierlich
-        # gemappt (real→cont via _time_real_to_cont).
-        render_payload = self._collect_render_payload()
+        # ALLE aktiven Indikatoren (P-D1/F1/P-C2). Phase 16.07 (D1): auf das
+        # Tier-1-Fenster begrenzt (die Berechnung lief über den vollen Puffer).
+        render_payload = self._collect_render_payload(
+            time_from=self._js_window_first_real,
+            time_to=self._js_window_last_real)
 
         # P14-03-E (Flacker-Fix, generisch): plugin.calculate() setzt die
         # _known_times der Indikatoren auf die DB-Bars zurück – die offene
@@ -898,6 +987,9 @@ class PyTraderChartWindow(QMainWindow):
             # diesen Payload, statt sich auf seine eingebettete Offline-Map zu
             # verlassen (kein Duplikat-Pflege-Problem mehr).
             "tfSecondsMap": TF_SECONDS_MAP,
+            # D8: Stop-Flag – JS stellt am linken Rand keine weiteren
+            # Nachlade-Requests, wenn die DB keine ältere Geschichte mehr hat.
+            "hasMoreHistory": self.chart_buffer.has_more_history,
         }
 
         # Generations-Guard: monotone Update-ID für Race-Schutz im JS.
@@ -907,10 +999,13 @@ class PyTraderChartWindow(QMainWindow):
         update_id = self._update_generation
         update_package["updateId"] = update_id
 
-        # Nur hinzufügen, wenn echte Werte da sind – nie null/0 übergeben (sonst "Value is null" in JS)
-        if self.visible_from is not None and self.visible_to is not None:
-            update_package["rangeFrom"] = int(self.visible_from)
-            update_package["rangeTo"] = int(self.visible_to)
+        # D10: Restore offsetbasiert relativ zum rechten Rand (Chunk-
+        # Koordinaten, umbruchfest) – in logische Indizes übersetzen.
+        range_from, range_to = self._resolve_visible_logical_range(
+            len(continuous_candles))
+        if range_from is not None and range_to is not None:
+            update_package["rangeFrom"] = range_from
+            update_package["rangeTo"] = range_to
 
         if self.visible_price_from is not None and self.visible_price_to is not None:
             update_package["priceFrom"] = float(self.visible_price_from)
@@ -976,6 +1071,254 @@ class PyTraderChartWindow(QMainWindow):
         try:
             self._set_loading(False)
             self.update_indicator_button_style()
+        except (RuntimeError, AttributeError):
+            pass
+
+    # ======================================================================
+    # Phase 16.07 – Two-Tier Caching (D1–D10)
+    # ======================================================================
+
+    def _compute_warmup(self) -> int:
+        """D6: Warmup-Vorlauf = period*4 + smoothing*3 – NUR für aktive
+        Gleitdurchschnitts-Indikatoren (Multi-MA). Grid-/Proximity-
+        Indikatoren brauchen keinen Vorlauf (Warmup = 0).
+
+        Der Vorlauf ist ein REINER LESE-Vorlauf (verworfen; der NaN-Vertrag
+        period−1 bleibt unverändert) – er stellt sicher, dass die MA-Werte an
+        der linken Tier-1-Kante voll eingeschwungen sind."""
+        warmup = 0
+        st = self.indicators_state.get("ind_moving_averages", {})
+        if not st.get("active"):
+            return 0
+        try:
+            params = self._resolve_indicator_params("ind_moving_averages", st)
+        except Exception:
+            return 0
+        for x in range(1, 9):
+            show = params.get(f"show_ma{x}")
+            if x == 1:
+                if show in (False, 0, "false", "False"):
+                    continue
+            else:
+                if not show or show in (False, 0, "false", "False"):
+                    continue
+            try:
+                period = int(params.get(f"ma{x}_period") or 0)
+            except (TypeError, ValueError):
+                period = 0
+            try:
+                smoothing = int(params.get(f"ma{x}_smoothing") or 0)
+            except (TypeError, ValueError):
+                smoothing = 0
+            warmup = max(warmup, period * 4 + smoothing * 3)
+        return warmup
+
+    def _apply_data_window_size(self) -> None:
+        """D6: Meldet die Tier-2-Datenfenster-Grösse (M + Warmup) an den
+        Multi-MA-Indikator, damit die Berechnung über den VOLLEN Puffer läuft
+        (D5) statt über den alten chart_candle_limit-Zuschnitt (3000)."""
+        ind = self.indicators.get("ind_moving_averages")
+        setter = getattr(ind, "set_data_window_size", None)
+        if not callable(setter):
+            return
+        size = len(self.chart_buffer.df) if self.chart_buffer.df is not None else None
+        try:
+            setter(size)
+        except Exception:
+            pass
+
+    def _resolve_visible_logical_range(self, total: int):
+        """D10: Übersetzt die persistierten visible_from/visible_to in
+        logische Indizes des aktuellen Tier-1-Fensters.
+
+        NEUES Format (16.07): Offsets relativ zum rechten Rand (Chunk-
+        Koordinaten, umbruchfest) – erkennbar an `visible_from > visible_to`
+        (logisches from < to, daher ist der Abstand-von-rechts von from
+        grösser als der von to).
+        ALTES Format (Bestand): absolute logische Indizes (from < to) – wird
+        auf das aktuelle Fenster geklemmt (Abwärtskompatibilität).
+
+        Returns:
+            (range_from, range_to) als ints oder (None, None).
+        """
+        if self.visible_from is None or self.visible_to is None:
+            return None, None
+        if not total or total <= 0:
+            return None, None
+        vf, vt = int(self.visible_from), int(self.visible_to)
+        if vf > vt:
+            # Neues Offset-Format: Abstand vom rechten Rand.
+            f = max(0, total - vf)
+            t = min(total - 1, total - vt)
+            if t < f:
+                f, t = total - 1, total - 1
+            return f, t
+        # Alt-Format: absolute Indizes -> klemmen.
+        f = max(0, min(vf, total - 1))
+        t = max(f + 1, min(vt, total))
+        return f, t
+
+    def _on_jump_to_live(self) -> None:
+        """D9: „Live"-Button in JS -> vollständiger Refresh. Der Tier-2-Puffer
+        wird aus DuckDB neu geladen, das Fenster springt ans Live-Ende."""
+        if self._is_loading_data:
+            return
+        self.refresh_chart_data()
+
+    def _on_older_data_requested(self, from_time_epoch: int, count: int,
+                                 request_id: int, window_right_epoch: int) -> None:
+        """D3/D4/D7: JS fordert ältere Daten an (zeitbasiert, Wanduhr-Epoch).
+
+        Debounce (300 ms, D7): Nur der letzte Request innerhalb des
+        Debounce-Fensters wird ausgeführt (schnelles Wischen erzeugt viele
+        Range-Events). `request_id` = JS-seitiges Serial (Race-Guard)."""
+        if self._is_loading_data:
+            return
+        self._older_request_serial = int(request_id)
+        self._pending_older = (
+            int(from_time_epoch), int(count), int(request_id),
+            int(window_right_epoch or 0))
+        self._older_debounce_timer.start()
+
+    def _do_older_data_load(self) -> None:
+        """Führt den debounced Nachlade-Request aus (GUI-Thread).
+
+        Priorität 1: RAM-Serve aus dem Tier-2-Puffer (0 ms I/O, D3/D4).
+        Priorität 2: Puffer nach links erschöpft -> DB-Chunk im
+        OlderDataWorker (D7, Hintergrund-Thread), danach merge + serve.
+        """
+        if not self._pending_older:
+            return
+        from_epoch, count, request_id, _wr = self._pending_older
+        self._pending_older = None
+        if self._is_loading_data:
+            return
+
+        # Priorität 1: RAM-Serve (Tier 2 -> Tier 1, keine DB-I/O).
+        result = self.chart_buffer.serve_older(from_epoch, count)
+        if result is not None:
+            new_candles, window_right, has_more = result
+            first_cont = int(new_candles[0]["time"])
+            self._js_window_first_real = self._time_cont_to_real.get(
+                first_cont, first_cont)
+            self._send_older_chunk(new_candles, window_right, has_more, request_id)
+            return
+
+        # Priorität 2: Puffer erschöpft -> DB-Chunk (D7).
+        self._last_older_count = int(count)
+        self._last_older_warmup = self._compute_warmup()
+        if self._older_worker is not None and self._older_worker.isRunning():
+            # Ein alter Fetch läuft noch – abbrechen (neuer Request gewinnt).
+            try:
+                self._older_worker.done.disconnect(self._on_older_db_fetched)
+            except (RuntimeError, TypeError):
+                pass
+            self._older_worker.quit()
+            self._older_worker.wait(300)
+        worker = OlderDataWorker(
+            self.market_repo, self.current_symbol, self.current_tf,
+            from_epoch, self._last_older_count + self._last_older_warmup,
+            request_id, self)
+        self._older_worker = worker
+        worker.done.connect(self._on_older_db_fetched)
+        worker.start()
+
+    def _on_older_db_fetched(self, request_id: int, fetched: list, success: bool) -> None:
+        """Merge + Serve nach DB-Fetch (GUI-Thread).
+
+        Generations-Guard über request_id (D7): Veraltete Worker-Ergebnisse
+        (inzwischen neuerer Request / Symbol/TF-Wechsel) werden verworfen."""
+        worker = self._older_worker
+        self._older_worker = None
+        if not success or request_id != self._older_request_serial:
+            return
+        if self._is_loading_data:
+            return
+        new_candles, window_right, has_more = self.chart_buffer.merge_older(
+            fetched, serve_count=self._last_older_count,
+            warmup=self._last_older_warmup)
+        self._apply_data_window_size()
+        self.df_data = self.chart_buffer.df
+        if new_candles:
+            first_cont = int(new_candles[0]["time"])
+            self._js_window_first_real = self._time_cont_to_real.get(
+                first_cont, first_cont)
+        # D10/Right-Edge-Sync: Nach evtl. Capacity-Trim ist die Puffer-Rechts-
+        # kante die neue JS-Fenster-Rechtskante (JS kürzt in applyOlderDataChunk).
+        if window_right:
+            self._js_window_last_real = int(window_right)
+        self._send_older_chunk(new_candles, window_right, has_more, request_id)
+
+    def _send_older_chunk(self, new_candles: List[Dict[str, Any]],
+                          window_right: int, has_more: bool, request_id: int) -> None:
+        """Baut das Delta-Payload (D4) und sendet es an JS.
+
+        Vertrag: {updateId, symbol, timeframe, candles, timeMapDelta,
+        windowRightEpoch, hasMoreHistory, chartRenderPayloadDelta}.
+
+        `chartRenderPayloadDelta.lines/hit_circles` = vollständig neu
+        berechnetes Render-Payload über den vollen Tier-2-Puffer (D5),
+        begrenzt auf das aktuelle Tier-1-Fenster [neue linke Kante, rechte
+        Kante] – JS ersetzt die Linien/Marker damit nahtlos (kein Seam)."""
+        if not new_candles:
+            # DB-Ende / keine neuen Daten -> nur Stop-Flag senden (D8).
+            payload = {
+                "updateId": int(request_id),
+                "symbol": self.current_symbol,
+                "timeframe": self.current_tf,
+                "candles": [],
+                "timeMapDelta": {},
+                "windowRightEpoch": int(window_right or 0),
+                "hasMoreHistory": False,
+                "chartRenderPayloadDelta": {"lines": [], "hit_circles": []},
+            }
+            self._send_older_json(payload)
+            return
+
+        first_cont = int(new_candles[0]["time"])
+        window_left_real = self._time_cont_to_real.get(first_cont, first_cont)
+        window_right_real = int(window_right or self._js_window_last_real or 0)
+
+        render_payload = self._collect_render_payload(
+            time_from=window_left_real, time_to=window_right_real)
+
+        # P14-03-E (Flacker-Fix): Live-Bar-Re-Injektion nach dem calculate()-Loop.
+        self._reinject_live_bar_to_indicators()
+
+        # timeMapDelta: NUR die neuen (geprependeten) cont->real Einträge –
+        # die bestehenden Kerzen behalten ihre cont-Zeiten (JS erweitert nur).
+        time_map_delta: Dict[int, int] = {}
+        for c in new_candles:
+            cont = int(c["time"])
+            real = self._time_cont_to_real.get(cont)
+            if real is not None:
+                time_map_delta[cont] = real
+
+        payload = {
+            "updateId": int(request_id),
+            "symbol": self.current_symbol,
+            "timeframe": self.current_tf,
+            "candles": new_candles,
+            "timeMapDelta": time_map_delta,
+            "windowRightEpoch": window_right_real,
+            "hasMoreHistory": bool(has_more),
+            "chartRenderPayloadDelta": {
+                "lines": render_payload.get("lines") or [],
+                "hit_circles": render_payload.get("hit_circles") or [],
+            },
+        }
+        self._send_older_json(_clean_nan(payload))
+
+    def _send_older_json(self, payload: dict) -> None:
+        """Serialisiert und sendet ein Chunk-Payload an JS (mit Fehler-Schutz)."""
+        try:
+            payload_json = json.dumps(payload, allow_nan=False)
+        except (ValueError, TypeError) as e:
+            print(f"⚠️ [OlderData] JSON-Fehler: {e}")
+            return
+        try:
+            self.web_view.page().runJavaScript(
+                f"if(window.applyOlderDataChunk) applyOlderDataChunk({payload_json});")
         except (RuntimeError, AttributeError):
             pass
 
@@ -1196,9 +1539,24 @@ class PyTraderChartWindow(QMainWindow):
         except (RuntimeError, AttributeError):
             pass
 
-    def handle_range_changed(self, f, t):
+    def handle_range_changed(self, f, t, total=0):
+        """Phase 16.07 (D10): Speichert den Viewport OFFSETBASIERT relativ
+        zum rechten Rand (Chunk-Koordinaten, umbruchfest).
+
+        Da im Hintergrund ständig neue Ticks / Chunks hinzukommen, verändern
+        sich absolute Bar-Indizes. `visible_from`/`visible_to` werden daher
+        als Abstand vom rechten Rand des JS-Datenfensters persistiert
+        (visible_from > visible_to) – beim Restore wird daraus die logische
+        Range des aktuellen Fensters zurückgerechnet
+        (_resolve_visible_logical_range).
+        """
         if not self._is_loading_data:
-            self.visible_from, self.visible_to = f, t
+            total = int(total or 0)
+            if total > 0:
+                self.visible_from = total - int(f)
+                self.visible_to = total - int(t)
+            else:
+                self.visible_from, self.visible_to = f, t
             self.save_state()
 
     def handle_price_range_changed(self, f, t):

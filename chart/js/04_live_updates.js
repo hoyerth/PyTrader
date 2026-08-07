@@ -6,7 +6,9 @@ function syncRanges() {
     try {
         var lr = chart.timeScale().getVisibleLogicalRange();
         if (lr && lr.from !== null && lr.to !== null && !isNaN(lr.from) && !isNaN(lr.to)) {
-            pyBridge.onRangeChanged(Math.floor(lr.from), Math.floor(lr.to));
+            // P16.07 (D10): Gesamt-Kerzenzahl mitliefern, damit Python den
+            // Viewport offsetbasiert (Abstand vom rechten Rand) persistieren kann.
+            pyBridge.onRangeChanged(Math.floor(lr.from), Math.floor(lr.to), rawCandleData.length);
         }
         var pr = chart.priceScale('right').getVisibleRange();
         if (pr && pr.from !== null && pr.to !== null && !isNaN(pr.from) && !isNaN(pr.to)) {
@@ -103,6 +105,10 @@ function updateLiveCandle(json) {
         if (c.timeframe !== undefined && c.timeframe !== null && c.timeframe !== currentTimeframe) return;
         if (c.open === null || c.high === null || c.low === null || c.close === null) return;
         if (rawCandleData.length > 0 && c.time < rawCandleData[rawCandleData.length-1].time) return;
+        // P16.07 (D9): Befindet sich der Viewport in der Historie (nicht am
+        // Live-Ende), wird der Tick unterdrückt (stummer Tier-2-Update) –
+        // der Scroll-Fokus zuckt nicht. Der „Live"-Button springt zurück.
+        if (window._isHistoryView && window._isHistoryView()) return;
         candleSeries.update(c);
         lastClosePrice = c.close;
         updateCountdownDisplay();
@@ -350,6 +356,9 @@ function applyFullChartUpdate(data) {
         }
         rawCandleData = validCandles;
         lastClosePrice = validCandles[validCandles.length - 1].close;
+        // P16.07 (Two-Tier): State-Reset für Nachlade-/Live-System
+        // (hasMoreHistory D8, _atLiveEdge D9, Request-Serial D4, Live-Button).
+        try { if (window._onFullChartUpdateApplied) window._onFullChartUpdateApplied(data); } catch(e) {}
         // P16.05 (P-C3): Circle-Cache für Merged-Render aus dem generischen
         // Render-Payload (chartRenderPayload.hit_circles) statt gridCircles.
         var renderPayload = (typeof data.chartRenderPayload === 'string')
@@ -368,6 +377,9 @@ function applyFullChartUpdate(data) {
                     try { updateCountdownDisplay(); } catch(e) {}
                     try { DaySeparator.updatePositions(); } catch(e) {}
                     try { Measurement.updatePositions(); } catch(e) {}
+                    // P16.07 (D7/D9): Live-Ende-Detektion + Nachlade-Trigger
+                    // (< 100 Kerzen links, debounced) via Two-Tier-Modul.
+                    try { if (window._onVisibleRangeChanged) window._onVisibleRangeChanged(); } catch(e) {}
                 }
             });
 

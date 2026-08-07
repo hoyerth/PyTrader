@@ -528,7 +528,18 @@ class MarketDataRepository:
 	def __init__(self, db_path: str = DB_MARKET_DATA) -> None:
 		self.db_path = db_path
 
-	def fetch_historical_candles(self, symbol: str, timeframe: str, limit: int = 3000) -> Tuple[List[Dict[str, Any]], int]:
+	def fetch_historical_candles(self, symbol: str, timeframe: str, limit: int = 3000,
+	                             before_epoch: Optional[int] = None) -> Tuple[List[Dict[str, Any]], int]:
+		"""Liest OHLCV-Kerzen aus der Marktdatenbank (aufsteigend sortiert).
+
+		Phase 16.07 (Two-Tier Caching, D4): Additiver Parameter `before_epoch`.
+		Ist er gesetzt, werden ausschliesslich KERZEN GELADEN, DIE ÄLTER ALS
+		diese Wanduhr-Epoch sind (WHERE "time" < to_timestamp(?)) – das
+		Chunk-Nachladen des `ChartDataBuffer` (Tier 2 -> DuckDB) nutzt genau
+		diesen Pfad, um den naechsten Block alter Geschichte vorzuladen.
+		Ohne `before_epoch` ist das Verhalten unveraendert (letzte `limit`
+		Kerzen, Abwaertskompatibilitaet).
+		"""
 		candles: List[Dict[str, Any]] = []
 		precision: int = 2
 
@@ -559,6 +570,17 @@ class MarketDataRepository:
 				if p_row and p_row[0] is not None:
 					precision = int(p_row[0])
 
+				# Phase 16.07: before_epoch filtert additiv auf ältere Kerzen
+				# (Wanduhr-Epoch; "time" ist TIMESTAMPTZ, daher to_timestamp-
+				# Vergleich). Die WHERE-Bedingung wird nur bei gesetztem
+				# before_epoch ergänzt (Abwaertskompatibilität).
+				older_filter = ""
+				params: List[Any] = [symbol, timeframe]
+				if before_epoch is not None:
+					older_filter = ' AND "time" < to_timestamp(?)'
+					params.append(int(before_epoch))
+				params.append(limit)
+
 				query = """
 					SELECT EXTRACT('epoch' FROM "time")::BIGINT AS time_epoch,
 					       open, high, low, close, tick_volume 
@@ -571,12 +593,13 @@ class MarketDataRepository:
 						  AND high IS NOT NULL 
 						  AND low IS NOT NULL 
 						  AND close IS NOT NULL
+						""" + older_filter + """
 						ORDER BY "time" DESC 
 						LIMIT ?
 					) 
 					ORDER BY "time" ASC;
 				"""
-				rows = con.execute(query, [symbol, timeframe, limit]).fetchall()
+				rows = con.execute(query, params).fetchall()
 				con.close()
 
 				for r in rows:

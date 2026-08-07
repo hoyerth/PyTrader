@@ -111,6 +111,10 @@ class MultiMovingAverageIndicator(BaseIndicator):
         self._timeframe: Optional[str] = None
         self._settings: Any = None
         self._plugin_id: str = _INDICATOR_ID
+        # Phase 16.07 (Two-Tier, D6): Datenfenster-Grösse für die Tier-2-
+        # Berechnung (Buffergrösse M + Warmup). None = Fallback auf
+        # chart_candle_limit (Bestandsverhalten / Tests, z. B. P16.05 M4).
+        self._data_window_size: Optional[int] = None
 
     # ------------------------------------------------------------- Identität
     @property
@@ -337,6 +341,18 @@ class MultiMovingAverageIndicator(BaseIndicator):
         """Injiziert AppSettings (Kopie) – sonst lazy aus dem StateManager."""
         self._settings = settings
 
+    def set_data_window_size(self, n: Optional[int]) -> None:
+        """Phase 16.07 (D6): Setzt die Datenfenster-Grösse für die Tier-2-
+        Berechnung (Buffergrösse M + Warmup-Vorlauf, verworfen).
+
+        Der ChartWindow ruft diese Methode nach jedem Buffer-Load/Merge auf,
+        damit die MA-Berechnung über den VOLLEN Tier-2-Puffer läuft (D5:
+        vollständige vektorisierte Neuberechnung auf M) statt über den alten
+        chart_candle_limit-Zuschnitt (3000). None = Fallback auf
+        chart_candle_limit (Bestandsverhalten, Tests).
+        """
+        self._data_window_size = int(n) if n else None
+
     def _get_app_settings(self) -> Any:
         if self._settings is not None:
             return self._settings
@@ -347,7 +363,16 @@ class MultiMovingAverageIndicator(BaseIndicator):
             return None
 
     def _get_candle_limit(self) -> int:
-        """chart_candle_limit aus den AppSettings (Default 3000)."""
+        """Datenfenster-Limit für die Berechnung.
+
+        Phase 16.07 (D6): Wenn `set_data_window_size()` gesetzt wurde
+        (Tier-2-Buffergrösse M + Warmup), wird DIESES Limit verwendet –
+        die MA-Berechnung läuft dann über den vollen Puffer (D5).
+        Sonst Fallback auf chart_candle_limit (Default 3000,
+        Bestandsverhalten / Tests, z. B. P16.05 M4).
+        """
+        if getattr(self, "_data_window_size", None):
+            return max(int(self._data_window_size), 1)
         try:
             settings = self._get_app_settings()
             limit = int(getattr(settings, "chart_candle_limit", 3000))
