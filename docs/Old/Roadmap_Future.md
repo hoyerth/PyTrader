@@ -56,6 +56,7 @@ Others Topics -
 
 - Multiservice Darstellung in Analytics mit Legenden auf den Graphics
 - Analytics Service Parameter editierbar (What-If, in-memory calculation) -  ggf. auch persistieren und in Chart_win
+- Trendindikator :  Trenderkennung und -warnung
 
 1. **Exporte:** Export von gefilterten Daten und Matrizen als CSV, Excel oder PNG/SVG-Grafik.
 2. **Multi-Symbol und Multi-Timeframe:** Gezielter Vergleich mehrerer Symbole/Timeframes nebeneinander in einer Matrix oder Kurve.

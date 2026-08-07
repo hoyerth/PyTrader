@@ -1007,3 +1007,9 @@ Alle diese Services schreiben im selben einheitlichen Schema in den `feature_sto
 * `is_swing_low`: Bool
 * `swing_price`: Float (Preis des Wendepunkts)
 * `swing_strength` / `distance`: Float (Stärke des Swings in ATR, % oder Punkten)
+---
+
+# 16.09 - Trend Services
+**rein auf MT5-OHLCV-/Tick-Volumendaten** basieren, voll **service-fähig** in PyTrader sind und ihre Ergebnisse als `feature_store_payload` für den Analyzer bereitstellen können.
+
+

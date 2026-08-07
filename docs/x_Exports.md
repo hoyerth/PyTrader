@@ -106,6 +106,7 @@ PyTrader/
         symbols_win.py
         trash_dialog.py
     test/
+        check_stylepicker_16_06.py
         test.py
     ui/
         chart_win.ui
@@ -13788,7 +13789,20 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		self.plugin_labels: Dict[str, str] = {}
 
 		self.setWindowTitle(f"Einstellungen - {self.indicator.display_name}")
-		self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+		# Phase 16.06 (07.08.2026): Fenster-Flags - der '?'-Button (ContextHelp)
+		# entfaellt; das Window-X (Schliessen) wird GARANTIERT gesetzt.
+		# Empirisch (PySide6/Windows): Ein QDialog mit Parent liefert
+		# windowFlags()=Dialog|TitleHint|SystemMenuHint (OHNE CloseButtonHint)
+		# und ein OR mit Qt.WindowCloseButtonHint wird von Qt wieder verworfen
+		# (bleibt 12291 -> kein X). Einzig das EXPLIZITE Setzen aller Hints
+		# setzt das X zuverlaessig (flags=134230019, Close=True). Diese eine
+		# zentrale Stelle gilt generisch fuer ALLE Indikator-Prop-Fenster.
+		self.setWindowFlags(
+			Qt.Dialog
+			| Qt.WindowTitleHint
+			| Qt.WindowSystemMenuHint
+			| Qt.WindowCloseButtonHint
+		)
 
 		self.param_controls: Dict[str, QWidget] = {}
 		# Phase 13 Schritt 5 Punkt 4: Fenster & Boxen sind vollständig dynamisch –
@@ -13973,8 +13987,17 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			# marker-Modus nicht verloren geht (Typ-Mismatch im Widget würde
 			# sonst auf die Default-Farbe zurueckfallen).
 			style_type = str(spec.get("style_type", "line"))
+			# Phase 16.06 (07.08.2026): Die interne 'sichtbar'-Checkbox des
+			# StylePickerWidget kann per Schema-Flag 'show_visibility' (Default
+			# True) ausgeblendet werden - fuer Parameter, deren Sichtbarkeit ein
+			# separater 'show_*'-Param steuert (Multi-MA: show_maX,
+			# FixedGridProximity: show_lines/show_circles). Damit entfaellt die
+			# doppelte Sichtbarkeits-Steuerung im Dialog (get_style() liefert
+			# dann show=True; die Persistenz bleibt unveraendert: color +
+			# Sibling-Keys style/width bzw. shape/size).
+			show_visibility = bool(spec.get("show_visibility", True))
 			# Bugfix (06.08.2026): Reiner Farbwaehler (color_only im Schema,
-			# z.B. Multi-MA maX_color) - KEIN StylePickerWidget-Composite.
+			# z.B. Multi-MA ma1_bear_color) - KEIN StylePickerWidget-Composite.
 			# Diese Farb-Parameter besitzen keine Geschwister-Keys
 			# (style/width bzw. shape/size) und keine eigene
 			# Sichtbarkeits-Checkbox (die steuert show_maX).
@@ -13985,7 +14008,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 					style_obj = LineStyle(color=str(val))
 				ctrl = StylePickerWidget(
 					style=style_obj, enable_alpha=allow_alpha,
-					style_type=style_type, color_only=True)
+					style_type=style_type, color_only=True,
+					show_visibility=show_visibility)
 				ctrl.style_changed.connect(self.on_param_control_changed)
 				return ctrl
 			if style_type == "marker":
@@ -14022,7 +14046,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 					except (TypeError, ValueError):
 						width_val = 1
 				style_obj = LineStyle(color=str(val), style=style_val, width=width_val)
-			ctrl = StylePickerWidget(style=style_obj, enable_alpha=allow_alpha, style_type=style_type)
+			ctrl = StylePickerWidget(style=style_obj, enable_alpha=allow_alpha, style_type=style_type, show_visibility=show_visibility)
 			ctrl.style_changed.connect(self.on_param_control_changed)
 			return ctrl
 
@@ -15661,24 +15685,23 @@ _FIXED_GRID_PROXIMITY_SCHEMA: Dict[str, Dict[str, Any]] = {
     "proximity_threshold": {"type": "float", "default": 0.05, "min": 0.001, "max": 10.0, "step": 0.005, "description": "Toleranzschwelle"},
     "use_time_filter": {"type": "bool", "default": True, "description": "Time Filter aktiv (Zeitfenster um ganze/halbe Stunde)"},
     "time_window_mins": {"type": "int", "default": 5, "min": 0, "max": 30, "step": 1, "description": "Time Filter Minuten (0 oder 30 um ganze/halbe Stunde)"},
-    "line_color": {"type": "color", "default": "#2196F3", "description": "Farbe Grid-Linien", "style_type": "line"},
-    # P16.03-Bugfix (06.08.2026): Linienart/-staerke werden NICHT als eigene
-    # Controls gerendert (nicht in parameter_order) - der StylePickerWidget
-    # (line-Modus) steuert sie direkt ueber die Geschwister-Keys (Konvention
-    # 'color' -> 'style'/'width'). Old-Presets ohne diese Keys fallen auf die
-    # Defaults zurueck (solid / 1 px).
-    "line_style": {"type": "choice", "options": list(LINE_STYLES), "default": "solid", "description": "Linienart"},
-    "line_width": {"type": "int", "default": 1, "min": 1, "max": 10, "step": 1, "description": "Linienstärke (px)"},
-    "circle_color_std": {"type": "color", "default": "#FFEB3B", "description": "Farbe Standard-Hit (im Zeitfenster)", "style_type": "marker"},
-    "circle_color_active": {"type": "color", "default": "#E91E63", "description": "Farbe Hit in Aktivitätsfenster", "style_type": "marker"},
-    # P16.03-Bugfix (06.08.2026): Marker-Form/-Groesse werden NICHT als eigene
-    # Controls gerendert (nicht in parameter_order) - der StylePickerWidget
-    # steuert sie direkt ueber die Geschwister-Keys (Konvention 'color' ->
-    # 'shape'/'size'). Old-Presets ohne diese Keys fallen auf die Defaults zurueck.
-    "circle_shape_std": {"type": "choice", "options": list(MARKER_SHAPES), "default": "circle", "description": "Symbol Standard-Hit (im Zeitfenster)"},
-    "circle_shape_active": {"type": "choice", "options": list(MARKER_SHAPES), "default": "circle", "description": "Symbol Aktiv-Hit (ausserhalb)"},
-    "circle_size_std": {"type": "int", "default": 6, "min": 1, "max": 20, "step": 1, "description": "Groesse Standard-Hit (px)"},
-    "circle_size_active": {"type": "int", "default": 6, "min": 1, "max": 20, "step": 1, "description": "Groesse Aktiv-Hit (px)"},
+    "line_color": {"type": "color", "default": "#2196F3", "description": "Farbe Grid-Linien", "style_type": "line", "show_visibility": False},
+    # Phase 16.06 (07.08.2026): Die Einzelfeld-Deklarationen line_style /
+    # line_width wurden ENTFERNT - Linienart/-staerke werden ausschliesslich
+    # ueber den LineStyle-Picker (Sibling-Keys, Konvention 'color' ->
+    # 'style'/'width' in indicator_dialog) bedient und persistiert.
+    # Old-Presets ohne diese Keys fallen in _build_style_objects auf die
+    # Defaults zurueck (solid / 1 px). show_visibility=False: die interne
+    # 'sichtbar'-Checkbox des Pickers entfaellt - Sichtbarkeit steuert der
+    # separate Param show_lines.
+    "circle_color_std": {"type": "color", "default": "#FFEB3B", "description": "Farbe Standard-Hit (im Zeitfenster)", "style_type": "marker", "show_visibility": False},
+    "circle_color_active": {"type": "color", "default": "#E91E63", "description": "Farbe Hit in Aktivitätsfenster", "style_type": "marker", "show_visibility": False},
+    # Phase 16.06 (07.08.2026): Die Einzelfeld-Deklarationen circle_shape_* /
+    # circle_size_* wurden ENTFERNT - Marker-Form/-Groesse werden
+    # ausschliesslich ueber den MarkerStyle-Picker (Sibling-Keys, Konvention
+    # 'color' -> 'shape'/'size') bedient und persistiert. Old-Presets ohne
+    # diese Keys fallen in _build_style_objects auf die Defaults zurueck
+    # (circle / 6 px).
     "show_lines": {"type": "bool", "default": True, "description": "Grid-Linien anzeigen"},
     "show_circles": {"type": "bool", "default": True, "description": "Hits anzeigen"},
     "prox_level1": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 1"},
@@ -15792,6 +15815,10 @@ class FixedGridProximityIndicator(BaseIndicator):
 
     @property
     def param_labels(self) -> Dict[str, str]:
+        # Phase 16.06 (07.08.2026): Die Labels line_style/line_width/
+        # circle_shape_*/circle_size_* wurden entfernt - diese Einzelfelder
+        # existieren nicht mehr als Schema/Controls, sie werden ausschliesslich
+        # ueber den StylePicker bedient (Sibling-Keys).
         return {
             "lookback": "Lookback (Scan-Fenster)",
             "grid_step": "Rasterabstand",
@@ -15799,14 +15826,8 @@ class FixedGridProximityIndicator(BaseIndicator):
             "use_time_filter": "Time Filter aktiv",
             "time_window_mins": "Time Filter Minuten (0/30)",
             "line_color": "Linien-Farbe",
-            "line_style": "Linienart",
-            "line_width": "Linienstärke (px)",
             "circle_color_std": "Std-Hit-Farbe (im Fenster)",
             "circle_color_active": "Aktiv-Hit-Farbe (ausserhalb)",
-            "circle_shape_std": "Symbol Std-Hit",
-            "circle_shape_active": "Symbol Aktiv-Hit",
-            "circle_size_std": "Groesse Std-Hit (px)",
-            "circle_size_active": "Groesse Aktiv-Hit (px)",
             "show_lines": "Linien anzeigen",
             "show_circles": "Circles anzeigen",
             "prox_level1": "Level 1",
@@ -16486,6 +16507,7 @@ import pandas as pd
 
 from .base_indicator import BaseIndicator
 from .utils.ma_template import MATemplateEngine, MA_TYPES, resolve_bull_color
+from chart.overlays.style_models import LINE_STYLES
 
 # ---------------------------------------------------------------------------
 # Konstanten & Defaults (Entscheidungen D4/D7)
@@ -16536,6 +16558,13 @@ def _as_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _line_style(value: Any, default: str = "solid") -> str:
+    """Phase 16.06 (07.08.2026): Validiert eine Linienart gegen LINE_STYLES
+    (tolerant: ungueltige Werte fallen auf den Default zurueck)."""
+    s = str(value or default)
+    return s if s in LINE_STYLES else default
 
 
 class MultiMovingAverageIndicator(BaseIndicator):
@@ -16633,27 +16662,55 @@ class MultiMovingAverageIndicator(BaseIndicator):
                     "default": _MA_COLORS[1],
                     "description": "MA 1 Farbe steigend",
                     "style_type": "line",
-                    # Bugfix (06.08.2026): REINER Farbwaehler - KEIN
-                    # StylePickerWidget-Composite (keine 'sichtbar'-Checkbox,
-                    # keine Linienart/-staerke). Die Sichtbarkeit steuert
-                    # ausschliesslich show_maX (Anzeige-Checkbox).
-                    "color_only": True,
+                    # Phase 16.06 (07.08.2026): VOLLER LineStyle-Picker
+                    # (Farbe + Breite + Linienart) statt color_only-Farbwaehler.
+                    # Breite/Art der bull-Farbe gelten fuer die gesamte MA1-
+                    # Linie (auch bear-Segmente). Die Sichtbarkeit steuert
+                    # weiterhin show_ma1 (daher show_visibility=False -> keine
+                    # doppelte 'sichtbar'-Checkbox im Dialog).
+                    "show_visibility": False,
+                }
+                # Phase 16.06 (07.08.2026): Sibling-Defaults des MA1-LineStyle-
+                # Pickers (Konvention 'color' -> 'style'/'width' in
+                # indicator_dialog). NICHT in parameter_order -> keine eigenen
+                # Controls. Sie liefern die Default-Params (Breite 2 / solid),
+                # damit der Picker und der Render konsistent initialisieren.
+                schema["ma1_bull_width"] = {
+                    "type": "int", "default": _MA1_WIDTH, "min": 1, "max": 10,
+                    "step": 1, "description": "MA 1 Linienstärke (px)",
+                }
+                schema["ma1_bull_style"] = {
+                    "type": "choice", "options": list(LINE_STYLES),
+                    "default": _LINE_STYLE, "description": "MA 1 Linienart",
                 }
                 schema["ma1_bear_color"] = {
                     "type": "color",
                     "default": _MA1_BEAR_COLOR,
                     "description": "MA 1 Farbe fallend (dual_color)",
                     "style_type": "line",
+                    # Nur Farbe (color_only): Breite/Art der MA1-Linie steuert
+                    # der bull-Picker (ma1_bull_style/ma1_bull_width).
                     "color_only": True,
                 }
             else:
-                # MA2..8: einfarbig (kein dual_color/bear_color).
+                # MA2..8: einfarbig (kein dual_color/bear_color). Voller
+                # LineStyle-Picker (Phase 16.06) - Farbe/Breite/Linienart ueber
+                # die Sibling-Keys maX_width/maX_style (NICHT in parameter_order
+                # -> keine eigenen Controls, der Picker bedient sie direkt).
                 schema[f"{prefix}_color"] = {
                     "type": "color",
                     "default": _MA_COLORS[x],
                     "description": f"MA {x} Farbe",
                     "style_type": "line",
-                    "color_only": True,
+                    "show_visibility": False,
+                }
+                schema[f"{prefix}_width"] = {
+                    "type": "int", "default": _MA_WIDTH, "min": 1, "max": 10,
+                    "step": 1, "description": f"MA {x} Linienstärke (px)",
+                }
+                schema[f"{prefix}_style"] = {
+                    "type": "choice", "options": list(LINE_STYLES),
+                    "default": _LINE_STYLE, "description": f"MA {x} Linienart",
                 }
         return schema
 
@@ -16838,14 +16895,23 @@ class MultiMovingAverageIndicator(BaseIndicator):
                 colors = MATemplateEngine.build_color_series(
                     ma_series, dual_color, bull_color, bear_color
                 )
-                width = _MA1_WIDTH
+                # Phase 16.06 (07.08.2026): Breite/Linienart aus dem
+                # LineStyle-Picker (Sibling-Keys ma1_bull_style/ma1_bull_width,
+                # vom StylePickerWidget an ma1_bull_color gebunden) - Fallback
+                # auf die Konstanten (Old-Presets ohne Sibling-Keys).
+                width = _as_int(params.get("ma1_bull_width"), _MA1_WIDTH)
+                line_style = _line_style(params.get("ma1_bull_style"), _LINE_STYLE)
                 title = f"MA1 {str(ma_type).upper()} {period}"
             else:
                 # MA2..8: einfarbige Farbliste (maX_color).
                 color = str(params.get(f"{prefix}_color") or _MA_COLORS[x])
                 n = len(ma_series)
                 colors = [color] * n
-                width = _MA_WIDTH
+                # Phase 16.06 (07.08.2026): Breite/Linienart aus dem
+                # LineStyle-Picker (Sibling-Keys maX_style/maX_width) -
+                # Fallback auf die Konstanten.
+                width = _as_int(params.get(f"{prefix}_width"), _MA_WIDTH)
+                line_style = _line_style(params.get(f"{prefix}_style"), _LINE_STYLE)
                 title = f"MA{x} {str(ma_type).upper()} {period}"
 
             # Aktive Glättung im Linien-Titel sichtbar machen (Chart-Legende).
@@ -16860,7 +16926,7 @@ class MultiMovingAverageIndicator(BaseIndicator):
                 "id": prefix,
                 "data": data,
                 "width": width,
-                "style": _LINE_STYLE,
+                "style": line_style,
                 "title": title,
             })
         return {"lines": lines}
@@ -19444,7 +19510,8 @@ class StylePickerWidget(QWidget):
     """Kombinierter Stil-Waehler: Sichtbarkeit + Farbe + Staerke/Groesse + Art.
 
     Kapselt intern:
-      1. QCheckBox  (Sichtbarkeit `show`)
+      1. QCheckBox  (Sichtbarkeit `show`) – per `show_visibility=False`
+         ausblendbar (Sichtbarkeit steuert dann ein separater `show_*`-Param)
       2. kleiner Farb-Button (Farbe `color` via QColorDialog, optional Alpha)
       3. QSpinBox   (Linienstaerke `width` bzw. Markergroesse `size`)
       4. QComboBox  (Linienart `style` bzw. Marker-Form `shape`)
@@ -19469,16 +19536,23 @@ class StylePickerWidget(QWidget):
         parent=None,
         style_type: str = "line",
         color_only: bool = False,
+        show_visibility: bool = True,
     ) -> None:
         super().__init__(parent)
         self._enable_alpha: bool = bool(enable_alpha)
         # color_only (Bugfix 06.08.2026): Reiner Farbwaehler - das Composite
         # (Sichtbarkeits-Checkbox, Linienstaerke/Groesse, Linienart/Markerform)
         # wird NICHT angezeigt. Verwendet fuer reine Farb-Parameter (z.B.
-        # Multi-MA maX_color), deren Sichtbarkeit ein separater 'show_*'-
+        # Multi-MA ma1_bear_color), deren Sichtbarkeit ein separater 'show_*'-
         # Parameter steuert. get_style() liefert weiterhin ein Style-Objekt
         # (Defaults fuer show/width/style) - der Dialog liest nur .color.
         self._color_only: bool = bool(color_only)
+        # show_visibility (Phase 16.06, 07.08.2026): Blendet die interne
+        # 'sichtbar'-Checkbox aus, wenn die Sichtbarkeit ueber einen separaten
+        # 'show_*'-Parameter laeuft (Multi-MA: show_maX, FixedGridProximity:
+        # show_lines/show_circles). get_style() liefert dann immer show=True.
+        # Damit entfaellt die doppelte Sichtbarkeits-Steuerung im Dialog.
+        self._show_visibility: bool = bool(show_visibility)
         # style_type: "line" (LineStyle) | "marker" (MarkerStyle)
         self._style_type: str = "marker" if style_type == "marker" else "line"
         if self._style_type == "marker":
@@ -19552,7 +19626,8 @@ class StylePickerWidget(QWidget):
         layout.setSpacing(4)
         # color_only: NUR den Farb-Button anzeigen (kein Composite).
         if not self._color_only:
-            layout.addWidget(self._show_check)
+            if self._show_visibility:
+                layout.addWidget(self._show_check)
             layout.addWidget(self._color_btn)
             layout.addWidget(self._width_spin)
             layout.addWidget(self._style_combo)
@@ -19581,6 +19656,17 @@ class StylePickerWidget(QWidget):
         """
         return self._color_only
 
+    @property
+    def show_visibility(self) -> bool:
+        """True = interne 'sichtbar'-Checkbox wird angezeigt (Default).
+
+        False = Checkbox ausgeblendet; get_style() liefert dann immer
+        show=True, weil die Sichtbarkeit ein separater 'show_*'-Parameter
+        steuert (Multi-MA: show_maX, FixedGridProximity: show_lines/
+        show_circles).
+        """
+        return self._show_visibility
+
     def get_style(self) -> Union[LineStyle, MarkerStyle]:
         """Liefert den aktuellen Stil als NEUES Style-Objekt (LineStyle bei
         style_type='line', MarkerStyle bei style_type='marker').
@@ -19590,13 +19676,13 @@ class StylePickerWidget(QWidget):
         """
         if self._style_type == "marker":
             return MarkerStyle(
-                show=self._show_check.isChecked(),
+                show=(self._show_check.isChecked() if self._show_visibility else True),
                 color=self._color_button_value(),
                 shape=str(self._style_combo.currentText()),
                 size=int(self._width_spin.value()),
             )
         return LineStyle(
-            show=self._show_check.isChecked(),
+            show=(self._show_check.isChecked() if self._show_visibility else True),
             color=self._color_button_value(),
             width=int(self._width_spin.value()),
             style=str(self._style_combo.currentText()),
@@ -25358,6 +25444,156 @@ class ServiceSetTrashDialog(QDialog):
 
 --------------------------------------------------
 
+### DATEI: test/check_stylepicker_16_06.py
+```py
+# test/check_stylepicker_16_06.py
+"""Phase 16.06 – Verifikation der StylePicker-Integration (07.08.2026).
+
+Headless-Beweis fuer die Anwender-Punkte:
+  1) Die StylePickerWidgets im Indikator-Prop-Fenster enthalten die
+     Linien-/Symbol-/Staerke-Felder (QSpinBox + QComboBox, sichtbar).
+  2) Die Alt-Felder (line_style/line_width/circle_shape_*/circle_size_*)
+     werden in KEINEM Indikator mehr als eigene Controls gerendert.
+  3) Das Fenster-X (WindowCloseButtonHint) ist fuer alle Indikator-
+     Prop-Fenster gesetzt (generisch).
+
+KEINE GUI-Ausfuehrung (offscreen, kein exec).
+"""
+import os
+import sys
+import tempfile
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtWidgets import QApplication, QSpinBox, QComboBox  # noqa: E402
+from PySide6.QtCore import Qt  # noqa: E402
+
+_app = QApplication.instance() or QApplication(sys.argv)
+
+from state_manager import StateManager  # noqa: E402
+from chart.indicators.multi_ma import MultiMovingAverageIndicator  # noqa: E402
+from chart.indicators.fixed_grid_proximity import FixedGridProximityIndicator  # noqa: E402
+from chart.indicator_dialog import IndicatorSettingsDialog  # noqa: E402
+from chart.widgets.style_picker_widget import StylePickerWidget  # noqa: E402
+
+tmp = tempfile.mkdtemp(prefix="sp16_")
+sm = StateManager(db_path=os.path.join(tmp, "app_data.duckdb"))
+
+# ServiceSetRepository auf Test-DB umleiten (analog test/test.py), damit der
+# FixedGridProximity-Dialog (Service-Pfad) nicht auf die echte sets.duckdb
+# zugreift (DuckDB Single-Writer / laufende App).
+import analytics.engine.service_set_repository as _ssr_mod  # noqa: E402
+_orig_ssr_init = _ssr_mod.ServiceSetRepository.__init__
+def _patched_ssr_init(self, db_path=None, *a, **kw):
+    _orig_ssr_init(self, db_path or os.path.join(tmp, "sets.duckdb"), *a, **kw)
+_ssr_mod.ServiceSetRepository.__init__ = _patched_ssr_init
+
+FAILURES = []
+
+
+def check(name, cond, detail=""):
+    s = "PASS" if cond else "FAIL"
+    print(f"[{s}] {name}" + (f" - {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(name)
+
+
+def picker_subwidgets(ctrl):
+    """Liefert (spin, combo) eines StylePickerWidget (falls vorhanden)."""
+    if not isinstance(ctrl, StylePickerWidget):
+        return None, None
+    spin = ctrl.findChild(QSpinBox)
+    combo = ctrl.findChild(QComboBox)
+    return spin, combo
+
+
+def picker_visible(ctrl):
+    """True, wenn der Picker die Stil-Felder (Spin+Combo) sichtbar anzeigt."""
+    spin, combo = picker_subwidgets(ctrl)
+    return (spin is not None and combo is not None
+            and spin.isVisibleTo(ctrl) and combo.isVisibleTo(ctrl))
+
+
+# ---------------------------------------------------------------------------
+# Teil A: Multi-MA – maX_color/ma1_bull_color = volle Picker mit Stil-Feldern
+# ---------------------------------------------------------------------------
+print("\n=== A) Multi-MA: StylePicker mit Linien-/Staerke-Feldern ===")
+ma = MultiMovingAverageIndicator()
+dlg_ma = IndicatorSettingsDialog(ma, dict(ma.default_params), "Default", sm,
+                                 lambda p, pr: None, symbol="SILVER", timeframe="H1")
+
+ma_color_keys = ["ma1_bull_color"] + [f"ma{x}_color" for x in range(2, 9)]
+picker_ok = all(
+    isinstance(dlg_ma.param_controls[k], StylePickerWidget)
+    and not dlg_ma.param_controls[k].color_only
+    and picker_visible(dlg_ma.param_controls[k])
+    for k in ma_color_keys
+)
+check("A1) maX_color/ma1_bull_color = volle Picker mit Spin+Combo (sichtbar)",
+      picker_ok, "")
+
+# Werte aus den SpinBoxen/Combos (Default: MA1 w2/solid, MA2 w1/solid)
+w2 = dlg_ma.param_controls["ma1_bull_color"].get_style().width
+s2 = dlg_ma.param_controls["ma1_bull_color"].get_style().style
+w3 = dlg_ma.param_controls["ma2_color"].get_style().width
+s3 = dlg_ma.param_controls["ma2_color"].get_style().style
+check("A2) Picker-Werte: MA1 w2/solid, MA2 w1/solid",
+      w2 == 2 and s2 == "solid" and w3 == 1 and s3 == "solid",
+      f"MA1={w2}/{s2} MA2={w3}/{s3}")
+
+# ---------------------------------------------------------------------------
+# Teil B: FixedGridProximity – Picker + KEINE Alt-Einzelfelder mehr
+# ---------------------------------------------------------------------------
+print("\n=== B) FixedGridProximity: Picker ja, Alt-Felder nein ===")
+fgp = FixedGridProximityIndicator()
+dlg_fgp = IndicatorSettingsDialog(fgp, dict(fgp.default_params), "Default", sm,
+                                  lambda p, pr: None, symbol="SILVER", timeframe="H1")
+
+line_p = dlg_fgp.param_controls.get("line_color")
+std_p = dlg_fgp.param_controls.get("circle_color_std")
+act_p = dlg_fgp.param_controls.get("circle_color_active")
+check("B1) line_color = LineStyle-Picker mit Stil-Feldern",
+      line_p is not None and isinstance(line_p, StylePickerWidget)
+      and line_p.style_type == "line" and picker_visible(line_p), "")
+check("B2) circle_color_std/_active = MarkerStyle-Picker mit Symbol/Groesse",
+      std_p is not None and act_p is not None
+      and isinstance(std_p, StylePickerWidget)
+      and isinstance(act_p, StylePickerWidget)
+      and std_p.style_type == "marker" and act_p.style_type == "marker"
+      and picker_visible(std_p) and picker_visible(act_p), "")
+
+alt_keys = ("line_style", "line_width", "circle_shape_std", "circle_shape_active",
+            "circle_size_std", "circle_size_active")
+rendered_alt = [k for k in alt_keys
+                if k in dlg_fgp.param_controls or k in dlg_fgp.params]
+check("B3) KEINE Alt-Einzelfelder gerendert/persistiert",
+      not rendered_alt, str(rendered_alt))
+check("B4) Schema ohne Alt-Keys",
+      not any(k in fgp.parameter_schema for k in alt_keys),
+      str([k for k in alt_keys if k in fgp.parameter_schema]))
+
+# ---------------------------------------------------------------------------
+# Teil C: Fenster-X (WindowCloseButtonHint) generisch gesetzt
+# ---------------------------------------------------------------------------
+print("\n=== C) Fenster-X fuer alle Indikator-Prop-Fenster ===")
+for name, dlg in (("Multi-MA", dlg_ma), ("FixedGridProximity", dlg_fgp)):
+    flags = dlg.windowFlags()
+    has_x = bool(flags & Qt.WindowCloseButtonHint)
+    check(f"C1) {name}: WindowCloseButtonHint gesetzt", has_x,
+          f"flags={int(flags)}")
+
+print("-" * 60)
+if FAILURES:
+    print(f"FEHLER: {len(FAILURES)}: {FAILURES}")
+    sys.exit(1)
+print("ALLE PRUEFUNGEN BESTANDEN (OK)")
+sys.exit(0)
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/test.py
 ```py
 # test/test.py
@@ -26567,9 +26803,25 @@ _ma_ind = MultiMovingAverageIndicator()
 _ma_schema = _ma_ind.parameter_schema
 _ma_defaults = _ma_ind.default_params
 
-# M1: Schema-Vollstaendigkeit (MA1: 8 Keys, MA2..8: je 6 Keys = 50, Vertrag C)
-check("M1) Schema 50 Parameter (MA1 8 + MA2..8 je 6)",
-      len(_ma_schema) == 50, str(len(_ma_schema)))
+# M1: Schema-Vollstaendigkeit (MA1: 8 UI-Keys, MA2..8: je 6 UI-Keys = 50,
+# Vertrag C) + Phase 16.06: +16 Sibling-Defaults (MA1: bull_width/bull_style,
+# MA2..8: width/style) -> 66 Schema-Keys. Die Sibling-Keys sind NICHT in
+# parameter_order -> werden nicht als eigene Controls gerendert.
+check("M1) Schema 66 Keys (50 UI + 16 Sibling-Defaults, 16.06)",
+      len(_ma_schema) == 66, str(len(_ma_schema)))
+check("M1) Sibling-Defaults im Schema (16.06)",
+      "ma1_bull_width" in _ma_schema and "ma1_bull_style" in _ma_schema
+      and all(f"ma{x}_width" in _ma_schema and f"ma{x}_style" in _ma_schema
+              for x in range(2, 9)),
+      "")
+check("M1) Sibling-Defaults Werte (MA1 Breite 2/solid, MA2..8 Breite 1/solid)",
+      _ma_defaults.get("ma1_bull_width") == 2
+      and _ma_defaults.get("ma1_bull_style") == "solid"
+      and all(_ma_defaults.get(f"ma{x}_width") == 1
+              and _ma_defaults.get(f"ma{x}_style") == "solid"
+              for x in range(2, 9)),
+      str({k: _ma_defaults.get(k)
+           for k in ("ma1_bull_width", "ma1_bull_style", "ma2_width", "ma2_style")}))
 check("M1) MA1-Defaults (EHMA/4/dual=False, D7)",
       _ma_defaults.get("ma1_type") == "EHMA"
       and _ma_defaults.get("ma1_period") == 4
@@ -26861,22 +27113,44 @@ check("D2) Kein Service-UI (edit_set_name is None)",
 check("D2) Kein Service-UI (group_expert is None)",
       _dlg_ma.group_expert is None, "")
 
-# D3: Alle 50 Parameter gerendert (Anforderung 3, Vertrag C)
+# D3: Alle 50 UI-Parameter gerendert (Anforderung 3, Vertrag C). Die 16
+# Sibling-Defaults (Phase 16.06) sind NICHT in parameter_order -> keine
+# Controls, daher 50 gerenderte bei 66 Schema-Keys.
 _schema10 = _ma_ind_dlg.parameter_schema
-_all_in_controls = all(k in _dlg_ma.param_controls for k in _schema10)
-check("D3) Alle 50 Parameter in param_controls",
-      len(_dlg_ma.param_controls) == len(_schema10) == 50 and _all_in_controls,
-      f"{len(_dlg_ma.param_controls)}/{len(_schema10)}")
+_ui_keys10 = [k for k in _schema10
+              if not (k.endswith("_style") or k.endswith("_width"))]
+_all_in_controls = all(k in _dlg_ma.param_controls for k in _ui_keys10)
+check("D3) Alle 50 UI-Parameter in param_controls (Sibling-Keys nicht gerendert)",
+      len(_dlg_ma.param_controls) == 50 == len(_ui_keys10) and _all_in_controls,
+      f"{len(_dlg_ma.param_controls)}/{len(_ui_keys10)}/{len(_schema10)}")
 
-# D4: Farb-Controls = reiner Farbwaehler (Anforderung 2)
-_color_keys10 = (["ma1_bull_color", "ma1_bear_color"]
-                 + [f"ma{x}_color" for x in range(2, 9)])
-_color_ok = all(
+# D4 (Phase 16.06, 07.08.2026): Farb-Controls = StylePickerWidget.
+# ma1_bull_color + maX_color (2..8) sind VOLLE LineStyle-Picker
+# (color_only=False, show_visibility=False -> KEINE 'sichtbar'-Checkbox,
+# weil die Sichtbarkeit ueber show_maX laeuft). ma1_bear_color bleibt
+# reiner Farbwaehler (color_only=True - Breite/Art steuert der bull-Picker).
+_line_picker_keys10 = (["ma1_bull_color"] + [f"ma{x}_color" for x in range(2, 9)])
+_line_picker_ok = all(
     isinstance(_dlg_ma.param_controls[k], StylePickerWidget)
-    and _dlg_ma.param_controls[k].color_only
-    for k in _color_keys10
+    and not _dlg_ma.param_controls[k].color_only
+    and not _dlg_ma.param_controls[k].show_visibility
+    for k in _line_picker_keys10
 )
-check("D4) Farb-Controls = color_only (ohne Composite-Checkbox)", _color_ok, "")
+check("D4) ma1_bull_color/maX_color = volle LineStyle-Picker ohne Checkbox (16.06)",
+      _line_picker_ok, "")
+_bear_ctrl10 = _dlg_ma.param_controls["ma1_bear_color"]
+check("D4) ma1_bear_color bleibt color_only (nur Farbe, 16.06)",
+      isinstance(_bear_ctrl10, StylePickerWidget) and _bear_ctrl10.color_only,
+      "")
+# Picker zeigen die Sibling-Defaults (MA1 Breite 2/solid, MA2..8 Breite 1/solid)
+_picker_defaults_ok = (
+    _dlg_ma.param_controls["ma1_bull_color"].get_style().width == 2
+    and _dlg_ma.param_controls["ma1_bull_color"].get_style().style == "solid"
+    and _dlg_ma.param_controls["ma2_color"].get_style().width == 1
+    and _dlg_ma.param_controls["ma2_color"].get_style().style == "solid"
+)
+check("D4) Picker zeigen Sibling-Defaults (MA1 w2/solid, MA2 w1/solid)",
+      _picker_defaults_ok, "")
 
 # D3: Die zuvor fehlenden Parametertypen (Anforderung 3)
 _type_ok = all(isinstance(_dlg_ma.param_controls[f"ma{x}_type"], QComboBox)
@@ -26924,10 +27198,25 @@ check("D5) display_params enthaelt show_maX + Farben",
       and "ma1_bull_color" in _display10 and "ma1_bear_color" in _display10
       and all(f"ma{x}_color" in _display10 for x in range(2, 9)),
       str(sorted(_display10.keys())))
-_sibling_noise10 = [k for k in _display10
-                    if k.endswith("_style") or k.endswith("_width")]
-check("D5) Keine Sibling-Keys (maX_style/maX_width) in display_params",
-      not _sibling_noise10, str(_sibling_noise10))
+# Phase 16.06 (07.08.2026): display_params enthaelt JETZT die Sibling-Keys der
+# LineStyle-Picker (ma1_bull_style/ma1_bull_width + maX_style/maX_width), damit
+# Breite/Linienart aus dem Picker im Preset round-trippen. ma1_bear_color
+# (color_only) hat KEINE Siblings.
+_sibling10 = {k: _display10.get(k) for k in
+              ["ma1_bull_style", "ma1_bull_width"]
+              + [f"ma{x}_style" for x in range(2, 9)]
+              + [f"ma{x}_width" for x in range(2, 9)]}
+check("D5) Sibling-Keys (maX_style/maX_width) in display_params (16.06)",
+      all(v is not None for v in _sibling10.values())
+      and _display10.get("ma1_bull_width") == 2
+      and _display10.get("ma1_bull_style") == "solid"
+      and all(_display10.get(f"ma{x}_width") == 1
+              and _display10.get(f"ma{x}_style") == "solid"
+              for x in range(2, 9)),
+      str(_sibling10))
+check("D5) ma1_bear_color ohne Sibling-Keys (color_only)",
+      "ma1_bear_style" not in _display10
+      and "ma1_bear_width" not in _display10, "")
 
 # D6: Grid-Indikator (MIT Services) behaelt den Service-Pfad unveraendert.
 _dlg_grid = IndicatorSettingsDialog(
@@ -27008,6 +27297,110 @@ check("D7) Nichts unterhalb MA6/MA7/MA8 (Zeile 4 leer)",
       _grid_lay10.itemAtPosition(4, 0) is None
       and _grid_lay10.itemAtPosition(4, 1) is None
       and _grid_lay10.itemAtPosition(4, 2) is None, "")
+
+# ---------------------------------------------------------------------------
+# Teil 11 (Phase 16.06, 07.08.2026): StylePicker-Integration FixedGridProximity
+#   - Die Einzelfeld-Deklarationen line_style/line_width/circle_shape_*/
+#     circle_size_* sind aus dem Schema ENTFERNT (Bedienung ausschliesslich
+#     ueber den StylePicker / Sibling-Keys).
+#   - line_color = LineStyle-Picker, circle_color_* = MarkerStyle-Picker,
+#     jeweils show_visibility=False (Sichtbarkeit ueber show_lines/show_circles).
+#   - Preset-Payload persistiert die Sibling-Keys (line_style/line_width/...).
+#   - Render (build_chart_render_payload) wendet die Sibling-Keys an
+#     (price_lines width/style, hit_circles shape/size) - Old-Presets ohne
+#     Sibling-Keys fallen auf Defaults zurueck.
+# ---------------------------------------------------------------------------
+print("\n=== Teil 11: P16.06 StylePicker-Integration (FixedGridProximity) ===")
+from chart.indicators.fixed_grid_proximity import (  # noqa: E402
+    _FIXED_GRID_PROXIMITY_SCHEMA,
+)
+
+# G1: Einzelfeld-Deklarationen entfernt (Phase 16.06)
+_gone_schema11 = [k for k in ("line_style", "line_width",
+                              "circle_shape_std", "circle_shape_active",
+                              "circle_size_std", "circle_size_active")
+                  if k in _FIXED_GRID_PROXIMITY_SCHEMA]
+check("G1) Einzelfeld-Schema entfernt (line_style/line_width/shape/size)",
+      not _gone_schema11, str(_gone_schema11))
+
+# G2: Picker-Typen + show_visibility=False (Sichtbarkeit via show_lines/
+#     show_circles)
+_line_picker11 = _dlg_grid.param_controls["line_color"]
+_marker_std11 = _dlg_grid.param_controls["circle_color_std"]
+_marker_act11 = _dlg_grid.param_controls["circle_color_active"]
+check("G2) line_color = LineStyle-Picker (show_visibility=False)",
+      isinstance(_line_picker11, StylePickerWidget)
+      and _line_picker11.style_type == "line"
+      and not _line_picker11.color_only
+      and not _line_picker11.show_visibility, "")
+check("G2) circle_color_std/_active = MarkerStyle-Picker (show_visibility=False)",
+      isinstance(_marker_std11, StylePickerWidget)
+      and isinstance(_marker_act11, StylePickerWidget)
+      and _marker_std11.style_type == "marker"
+      and _marker_act11.style_type == "marker"
+      and not _marker_std11.show_visibility
+      and not _marker_act11.show_visibility, "")
+check("G2) Keine eigenen Controls fuer line_style/line_width/shape/size",
+      not any(k in _dlg_grid.param_controls
+              for k in ("line_style", "line_width",
+                        "circle_shape_std", "circle_shape_active",
+                        "circle_size_std", "circle_size_active")), "")
+
+# G3: Preset-Payload persistiert Sibling-Keys (line_style/line_width + shape/size)
+_payload11 = _dlg_grid._build_preset_payload()
+_display11 = _payload11.get("display_params") or {}
+_siblings_grid11 = {k: _display11.get(k) for k in (
+    "line_style", "line_width",
+    "circle_shape_std", "circle_shape_active",
+    "circle_size_std", "circle_size_active")}
+check("G3) display_params enthaelt Sibling-Keys (16.06)",
+      all(v is not None for v in _siblings_grid11.values())
+      and _display11.get("line_style") == "solid"
+      and _display11.get("line_width") == 1
+      and _display11.get("circle_shape_std") == "circle"
+      and _display11.get("circle_size_std") == 6,
+      str(_siblings_grid11))
+
+# G4: Render wendet Sibling-Keys an (price_lines width/style, hit_circles
+#     shape/size) - wie sie der StylePicker liefert (line_width=3, dashed,
+#     circle_shape_std=square, circle_size_std=8).
+_g4_recs = [{"bar_time": 1600000000, "levels_hit": [24.5], "is_hit": True,
+             "in_time_window": True}]
+_g4_payload = _indi.build_chart_render_payload(
+    {"grid_levels": [{"price": 24.5}], "proximity_records": _g4_recs,
+     "status_info": {}},
+    {"show_lines": True, "line_color": "#2196F3", "line_width": 3,
+     "line_style": "dashed",
+     "show_circles": True, "circle_color_std": "#FFEB3B",
+     "circle_shape_std": "square", "circle_size_std": 8,
+     "circle_color_active": "#E91E63",
+     "circle_shape_active": "arrowUp", "circle_size_active": 10,
+     "use_time_filter": True})
+_pl_g4 = _g4_payload.get("price_lines") or []
+_circ_g4 = _g4_payload.get("hit_circles") or []
+check("G4) price_lines: width/style aus Picker (3/dashed)",
+      len(_pl_g4) == 1 and _pl_g4[0]["width"] == 3
+      and _pl_g4[0]["style"] == "dashed",
+      str(_pl_g4))
+check("G4) hit_circles: shape/size aus Picker (std square/8)",
+      bool(_circ_g4) and all(c["shape"] == "square" and c["size"] == 8
+                             for c in _circ_g4),
+      str(_circ_g4[:2]))
+
+# G5: Old-Presets ohne Sibling-Keys -> Defaults (solid/1, circle/6)
+_g5_payload = _indi.build_chart_render_payload(
+    {"grid_levels": [{"price": 24.5}], "proximity_records": _g4_recs,
+     "status_info": {}},
+    {"show_lines": True, "line_color": "#2196F3", "show_circles": True,
+     "circle_color_std": "#FFEB3B", "circle_color_active": "#E91E63",
+     "use_time_filter": True})
+_pl_g5 = _g5_payload.get("price_lines") or []
+_circ_g5 = _g5_payload.get("hit_circles") or []
+check("G5) Old-Preset-Fallback: width 1 / solid / circle / size 6",
+      _pl_g5 and _pl_g5[0]["width"] == 1 and _pl_g5[0]["style"] == "solid"
+      and _circ_g5 and all(c["shape"] == "circle" and c["size"] == 6
+                           for c in _circ_g5),
+      f"pl={_pl_g5[:1]} circ={_circ_g5[:1]}")
 
 print("-" * 60)
 if FAILURES:
