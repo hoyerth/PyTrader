@@ -745,3 +745,100 @@ obwohl die Quelle gefuellt war. Zwei Fixes: echte Erkennung in beiden Services
 * `test/` enthaelt wieder nur `test/test.py` (temporaere Helfer/Logs/Test-DBs
   entfernt). Kapitel 17.01.02 ist mit allen 3 Swing-Services abgeschlossen.
 * Naechste Kapitel (Roadmap): 17.02 Trend Services.
+
+
+---
+
+# 10. Implementierungs-Log 17.01.03 (07.08.2026) - Bugfix-Runde 2: i-Button Plugin-Zeilen + Datum letzter Run UMGESETZT (commit b7eb3c2, phase17_step8)
+
+**Ziel:** Zwei User-Meldungen aus der Testrunde zu 17.01.02 aufloesen:
+(a) Der i-Button auf Einzelservice-Zeilen unter `?? Services` oeffnete den
+Info-/Beschreibungsdialog nie; (b) das Datum des letzten Runs blieb im
+MasterTree dauerhaft `--.--.--`, obwohl Services erfolgreich gelaufen waren.
+
+---
+
+## 10.1 Bug a) - i-Button bei Einzelservices unter "Services" oeffnete keinen Dialog
+
+### Ursache
+`_resolve_info_plugin()` in `serviceui/service_win.py` (@1825) nutzte
+`PluginRegistry()` ohne Import - `NameError` zur Laufzeit. Der umgebende
+`except (RuntimeError, AttributeError)` im Signal-Handler
+`_on_tree_info_requested()` (@1739) fing den `NameError` nicht (gehoert zur
+Klasse `Exception`, nicht zu den aufgelisteten Ausnahmen), daher wurde der
+`ServiceDescriptionEditDialog` nie erzeugt. Headless-Probe reproduzierte den
+exakten `NameError`.
+
+### Fix
+* `serviceui/service_win.py`: **Lokaler Import**
+  `from analytics.features.feature_builder import PluginRegistry`
+  in `_resolve_info_plugin()` ergaenzt (konsistent zu den uebrigen
+  Verwendungsstellen in der Datei; keine weiteren Aenderungen).
+
+### Verifikation (headless, keine UI-Tests)
+* `test/test.py` **Teil 19 T1 (NEU):** `_on_tree_info_requested("", "",
+  "srv_grid_lines")` mit gefaketem `ServiceDescriptionEditDialog.exec`
+  (kein Modal-Loop) -> Dialog wird genau 1x mit Titel
+  `Service-Beschreibung bearbeiten` aufgerufen (kein NameError); zusaetzlich
+  liefert `_resolve_info_plugin()` das Plugin korrekt zurueck. PASS.
+
+---
+
+## 10.2 Bug b) - Datum letzter Run blieb nach Multi-Service-Run `--.--.--`
+
+### Root Cause (bewiesen mit realen DB-Daten)
+Die PK-Migration (17.01 E-1, `test/migrate_pk.py` - nicht im Repo) entfernte
+den `created_at`-Spalten-DEFAULT der `feature_store`-Tabelle (real in
+`data/analytics.duckdb`: `column_default = None`). `store_plugin_payload()`
+setzte `created_at = now()` **nur im ON CONFLICT-Zweig**; bei NEUEN Rows blieb
+`created_at = NULL`. Beleg real: `srv_swing_momentum` = 56.751 Rows,
+0x mit `created_at` (nicht NULL). `fetch_last_execution_dates()` ueberspringt
+NULL-Werte -> `MAX(created_at)` fehlt -> `ServiceSelectorModel.refresh()`
+liefert kein Datum -> MasterTree zeigt `--.--.--`. Betroffen waren exakt
+Services, die erstmals oder ueber einen Kategorie-Ordner ausgefuehrt wurden.
+
+### Fix 1 - `analytics/features/feature_builder.py` (`store_plugin_payload` @606)
+* `created_at = now()` wird jetzt **explizit als Spalte** im INSERT/SELECT
+  mitgefuehrt, damit auch NEUE Rows einen gueltigen `created_at`-Wert erhalten
+  (robust fuer alle DB-Staende, auch ohne Spalten-DEFAULT).
+* ON CONFLICT-Zweig (Update mit `created_at = now()`) unveraendert.
+
+### Fix 2 - `db_service.py` (`check_and_init_databases` @187)
+* **Idempotente Reparatur** des verlorenen Spalten-DEFAULTs direkt nach den
+  ADD COLUMN-Statements (@261):
+  `ALTER TABLE feature_store ALTER created_at SET DEFAULT current_timestamp`
+  in `try/except` mit WARN-Log. Laueft beim App-Start (`main.py:238`) und
+  stellt den Default auf allen Bestands-Datenbanken wieder her.
+
+### Verifikation (headless, keine UI-Tests)
+* `test/test.py` **Teil 19 T2 (NEU, 5 Checks):**
+  * Test-DB `test/test_p19_created_at.duckdb` mit `created_at TIMESTAMP`
+    OHNE Default (migrierter Zustand, wird vom Test selbst erzeugt/geloescht).
+  * Fix 2: `ALTER ... SET DEFAULT current_timestamp` repariert - Pruefung
+    `column_default` == `current_timestamp`. PASS.
+  * Fix 1: `store_plugin_payload()` schreibt 1 Row (neuer PK-Konflikt-freier
+    Datensatz). PASS.
+  * `FeatureStoreReader.fetch_last_execution_dates()` liefert fuer den
+    Service ein Datum (created_at gesetzt). PASS.
+  * `created_at` in der DB ist nicht NULL. PASS.
+* **DB-Layer / Cross-Thread / kompletter UI-Pfad** (ServiceWindow +
+  `event_bus.service_set_changed` -> `refresh()` -> `data_changed` ->
+  `_populate()` -> Labels aktualisiert): alle headless PASS.
+* **Gesamtlauf `test/test.py`:** 339 PASS; unveraenderte 6 vorbestehende
+  Harness-FAILURES (P2, P5, H3, H4, H5, H7 - PersistentWindow-Position/
+  -Groesse, offscreen-bedingt, unabhaengig von diesen Fixes; H3 erwartet
+  `_keep_history_on_close == True`, seit History-Bugfix 06.08.2026 absichtlich
+  `False`).
+
+---
+
+## 10.3 Status & Test-Cleanup (3. Runde)
+* **Commit `b7eb3c2`** (phase17_step8) enthaelt die 3 Fix-Dateien
+  (`feature_builder.py`, `db_service.py`, `service_win.py`) - gepusht.
+* `test/test.py` bleibt der einzige Test-Harness in `test/` (Teil 19
+  ergaenzt, lauffaehig); temporaere Helfer (z. B. `test/_ins19.py`) und
+  Test-DBs (`test_p19_created_at.duckdb`) wurden entfernt bzw. werden vom
+  Test selbst aufgeraeumt (Invariante 10).
+* **Doku-Freigabe:** Dieser Eintrag wurde erst nach erfolgreichem manuellem
+  Funktionstest des Anwenders erstellt (Regel C: Doku nach Freigabe).
+* Naechste Kapitel (Roadmap): 17.02 Trend Services.
