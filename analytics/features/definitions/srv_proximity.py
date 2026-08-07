@@ -1,6 +1,6 @@
-# analytics/features/definitions/proximity_service.py
+# analytics/features/definitions/srv_proximity.py
 """
-Service: Proximity (Phase 13 Schritt 6)
+Service: Proximity (Phase 13 Schritt 6) – Naming Convention 16.08.01: srv_
 
 Liest die Linienliste aus context.shared_state[depends_on[0]] (z. B. grid_1)
 und wendet die PROZENTUALE visit%-Semantik des Alt-Grid-Indikators an
@@ -18,7 +18,7 @@ Das native UTC-Zeitfenster (Minute 0/30 ± time_window_mins) wird pro Bar als
 `in_time_window`-Flag in die Feature-Records geschrieben. Die FARBE der Kreise
 (gelb im Fenster / fuchsia außerhalb) und die Sichtbarkeit (show_lines /
 show_circles) sind KEINE Service-Parameter – sie werden vom INDIKATOR gesteuert
-(chart/indicators/fixed_grid_proximity.py), der die Circle-Farben auf Basis seines
+(chart/indicators/ind_fixed_grid_proximity.py), der die Circle-Farben auf Basis seines
 eigenen Schemas (circle_color_std / circle_color_active) und des
 `in_time_window`-Flags setzt (P16.01: `status_info` liegt als
 metadata["statistics"] im feature_store_payload).
@@ -50,7 +50,7 @@ from analytics.features.plugins.base_plugin import (
 
 
 def _bar_utc_minutes(df: pd.DataFrame) -> List[int]:
-    """UTC-Minute (0-59) jeder Bar – konsistent zu fixed_grid_proximity.py.
+    """UTC-Minute (0-59) jeder Bar – konsistent zu ind_fixed_grid_proximity.py.
 
     Phase 16 (05.08.2026): Vektorisierter Fast-Path fuer 'time'-Spalten
     (epoch-Sekunden, int) – (t // 60) % 60 ist mathematisch identisch zu
@@ -88,7 +88,7 @@ class ProximityService(PluginFeature):
 
     @property
     def plugin_id(self) -> str:
-        return "proximity"
+        return "srv_proximity"
 
     @property
     def version(self) -> str:
@@ -143,7 +143,7 @@ class ProximityService(PluginFeature):
 
         05.08.2026 (Bugfix Service-Run): proximity liest seine Linienliste aus
         context.shared_state[depends_on[0]] – dafuer muss eine vorgelagerte
-        grid_lines-Instanz in execution_order stehen. Gespeicherte Sets aus
+        srv_grid_lines-Instanz in execution_order stehen. Gespeicherte Sets aus
         der UI-Pfade haben oft KEIN explizites depends_on; die Worker-
         Aufbereitung (serviceui/service_set_utils.prepare_worker_definition)
         loest daraus die implizite Abhaengigkeit auf (naechste VORHERIGE
@@ -151,13 +151,13 @@ class ProximityService(PluginFeature):
         depends_on-Werte (z.B. Indikator-intern grid_1 -> prox_1) bleiben
         unveraendert gueltig.
         """
-        return ["grid_lines"]
+        return ["srv_grid_lines"]
 
     # --- Single Source of Truth fürs Prop-Fenster (Phase 13 Schritt 5) -------
     # Hinweis (Schritt 6-Korrektur 3): Die visuellen Parameter (show_circles,
     # circle_color_std, circle_color_active, show_lines) sind KEINE
     # Service-Parameter – sie gehören zum Indikator-Schema und werden dort
-    # gesteuert (chart/indicators/fixed_grid_proximity.py). Der Service meldet nur
+    # gesteuert (chart/indicators/ind_fixed_grid_proximity.py). Der Service meldet nur
     # das in_window-Flag; der Indikator färbt die Kreise.
     @property
     def parameter_order(self) -> List[str]:

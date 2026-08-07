@@ -170,7 +170,7 @@ class AnalyticsViewModel(QObject):
         """Setzt die Multi-Auswahl der Datenquellen (15.03-E).
 
         `feature_ids` sind die plugin_ids des Feature-Store (z. B.
-        ["grid_lines", "proximity"]); leer = kein Filter (alle Features).
+        ["srv_grid_lines", "srv_proximity"]); leer = kein Filter (alle Features).
         Typen-/Duplikat-normalisiert; ohne Aenderung wird kein Refresh
         ausgeloest (idempotent, wie set_symbol/set_timeframe).
         """

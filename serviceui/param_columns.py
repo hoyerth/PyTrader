@@ -418,7 +418,7 @@ class ServiceParamColumnsMixin:
             # prox_level1..6 - leere Level-Felder werden daraus vorbefüllt.
             if key.startswith("prox_level") and not cval:
                 try:
-                    from analytics.features.definitions.grid_lines_service import map_custom_levels_to_prox_levels
+                    from analytics.features.definitions.srv_grid_lines import map_custom_levels_to_prox_levels
                     cval = map_custom_levels_to_prox_levels(params).get(key, cval)
                 except Exception:
                     pass

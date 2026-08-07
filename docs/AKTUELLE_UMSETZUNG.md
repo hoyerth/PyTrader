@@ -180,4 +180,66 @@ python -m py_compile analytics/features/definitions/srv_*.py chart/indicators/in
 
 > **Kein Coding:** Die Entscheidungen sind dokumentiert. Eine Umsetzung von 16.08.01 erfolgt erst nach ausdrücklichem Startbefehl des Anwenders.
 
+---
+
+# Kapitel 16.08.01 – Implementierungs-Log (Umsetzung, 07.08.2026 16:18)
+
+> **Status:** UMSGESETZT (Anwender-Startbefehl "umnsetzung" / "continue" 07.08.2026). Alle Entscheidungen N1–N9 sind wie geplant umgesetzt und headless verifiziert.
+
+## 1. Umgesetzte Änderungen
+
+### 1.1 Git-Renames (physikalische Dateien, R-Status erkannt)
+| Alter Pfad | Neuer Pfad |
+|---|---|
+| `analytics/features/definitions/grid_lines_service.py` | `analytics/features/definitions/srv_grid_lines.py` |
+| `analytics/features/definitions/proximity_service.py` | `analytics/features/definitions/srv_proximity.py` |
+| `chart/indicators/fixed_grid_proximity.py` | `chart/indicators/ind_fixed_grid_proximity.py` |
+| `chart/indicators/multi_ma.py` | `chart/indicators/ind_moving_averages.py` |
+
+### 1.2 Funktionale Identifier-/Referenzanpassungen
+* `srv_grid_lines.py`: Header + `plugin_id = "srv_grid_lines"`, Docstring-Verweise (`srv_grid_lines`/`srv_proximity`).
+* `srv_proximity.py`: Header + `plugin_id = "srv_proximity"`, `dependencies = ["srv_grid_lines"]` (N5).
+* `ind_fixed_grid_proximity.py`: Header, `service_plugin_ids = ["srv_grid_lines", "srv_proximity"]`, `read_proximity_from_feature_store`-Default `feature_id="proximity"` → `"srv_proximity"`, interne `plugin_id`-Literale in `_build_set_definition` → `srv_*` (N6).
+* `ind_moving_averages.py`: nur Header (Code unverändert, `_INDICATOR_ID = "ind_moving_averages"` bleibt – N3).
+* `chart/chart_win.py`: Imports → `chart.indicators.ind_fixed_grid_proximity` / `chart.indicators.ind_moving_averages` (beide try/except-Zweige).
+* `chart/indicators/__init__.py`: Kommentar-Update.
+* `chart/indicator_dialog.py`: Import `from analytics.features.definitions.srv_grid_lines import map_custom_levels_to_prox_levels`, Kommentare → `srv_*`.
+* `serviceui/param_columns.py` (Zusatzfund): Import `map_custom_levels_to_prox_levels` → `srv_grid_lines` (war in N6 nicht gelistet, wurde durch Konsistenz-Scan gefunden).
+* `analytics/background_workers/live_analyzer.py`: `if plugin_id == "srv_proximity": depends_on = ["srv_grid_lines"]`.
+* `analytics/engine/service_selector_model.py`: Import → `chart.indicators.ind_fixed_grid_proximity` (funktional kritisch, `list_indicators()`), Kommentare → `srv_*`.
+* `analytics/features/definitions/grid_math.py` + `chart/indicators/utils/ma_template.py`: Docstring-Verweise auf alten Dateinamen `fixed_grid_proximity.py` → `ind_fixed_grid_proximity.py`.
+
+### 1.3 Kommentar-/Docstring-Konvention (`srv_`/`ind_`)
+`analytics/engine/service_models.py`, `analytics/engine/analytics_view_model.py`, `analytics/engine/feature_store_reader.py`, `analytics/features/plugins/base_plugin.py`, `analytics/statistics_repository.py`, `db_service.py`, `serviceui/service_set_utils.py`, `serviceui/run_worker.py`, `serviceui/service_win.py`, `serviceui/service_selector_dialog.py`, `serviceui/master_tree.py`, `state_manager.py`.
+
+### 1.4 DB-Migration (N4, `state_manager.py` `_init_db()`, idempotent & additiv)
+Nach der bestehenden Phase-16-Migration (`grid_liquidity → ind_fixed_grid_proximity`) eingefügt:
+1. **`service_sets` / `service_sets_trash` / `service_set_history`:** `definition`-JSON → `services[].plugin_id` von `grid_lines`→`srv_grid_lines`, `proximity`→`srv_proximity` (defensiv, Tabelle fehlt → überspringen).
+2. **`indicator_presets.plugin_id`:** `grid_lines`→`srv_grid_lines`, `proximity`→`srv_proximity`.
+3. **`analytics.duckdb/feature_store.feature_id`:** gleiche Zuordnung (separate DB, nur falls vorhanden).
+
+Nicht migriert (bewusst, N1/N2/N3/N7): `grid_levels`/`ema_diff`/`atr_normalized` (BaseFeature, DB-Spalten-Invarianten), `indicator_id` `ind_fixed_grid_proximity`/`ind_moving_averages` (bereits konform), `indicator_id='grid'`-Cleanup (bestehend).
+
+### 1.5 `test/test.py` angepasst (nicht versioniert, aber Tests grün)
+* Imports: `ind_fixed_grid_proximity`, `ind_moving_averages`, `srv_grid_lines`, `srv_proximity`.
+* `plugin_id`-Literale in Set-Definitionen (3× `grid_lines`, 2× `proximity`).
+* `feature_id`-Asserts (`srv_grid_lines`), `instance_id="grid_1", plugin_id="srv_grid_lines"`.
+
+## 2. Verifikation (headless, Regel 4)
+
+1. **`py_compile`:** alle 25 geänderten Dateien OK (inkl. `state_manager.py`, `chart_win.py`, `indicator_dialog.py`, alle 4 umbenannten Dateien).
+2. **`test/test.py`** (offscreen, `PYTHONIOENCODING=utf-8`): alle 16.08.01-relevanten Tests **grün** – V1–V11 (Service-Parität `srv_*`), Teil 9/10 (Multi-MA `ind_moving_averages`), Teil 11 (StylePicker FixedGridProximity), Teil 12 (P16.07 Two-Tier), Teil 13 (P16.08 Meta-Ordner). Die 6 Fehler (P2/P5/H3/H4/H5/H7) sind reine Offscreen-Fenstergeometrie-Artefakte (Screen 800×800), nicht durch 16.08.01 verursacht.
+3. **Gesamt-Scan:** keine alten Modul-/Dateinamen mehr im Projektcode (nur `.idea/workspace.xml` – IDE-Verlaufsdatei, nicht versioniert).
+4. **Keine UI-/Regressionstests** ausgeführt (Regel 4).
+
+## 3. Abweichungen / Hinweise
+* **`param_columns.py`** war in N6 nicht explizit gelistet, wurde aber beim Konsistenz-Scan als funktionale Alt-Referenz gefunden und korrigiert (zusätzlich zur bekannten `indicator_dialog.py:1400`).
+* Die Migration ist **nur für die 2 echten Plugin-Services** ausgelegt (N1: `grid_levels`/`ema_diff`/`atr_normalized` bleiben unberührt).
+* Beim Batch-Editieren (9 Edits in einem Block) persistierte das Edit-Tool nur den letzten Edit – wurde erkannt und alle Ersetzungen zuverlässig per Python-Skript nachgezogen.
+* `docs/x_Exports.md` wurde **nicht** angefasst (keine Quelle für Änderungen).
+
+## 4. Commit
+- Commit mit Signatur `Generated with [Continue](https://continue.dev)` + `Co-Authored-By: Continue <noreply@continue.dev>`.
+
+
 

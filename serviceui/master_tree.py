@@ -21,7 +21,7 @@ Hierarchische Darstellung der Service-Landschaft:
               'prox_1 (05.08.26)' (DD.MM.JJ aus MAX(created_at) des
               feature_store je feature_id) – ohne Eintrag '(--.--.--)'.
               Gilt seit 05.08.2026 (Punkt 4) auch fuer Standalone-Services
-              und Plugin-Zeilen ('proximity (02.08.26)').
+              und Plugin-Zeilen ('srv_proximity (02.08.26)').
   * Spalte 1: Schmale Status-Spalte ganz RECHTS (Fixed-Spalte, fest am
               rechten Rand verankert) – pro Zeile ein echter Info-Button
               (QPushButton "ℹ", Icon-Breite ~20 px). Badge-TEXTE werden
@@ -448,7 +448,7 @@ class MasterTree(QTreeWidget):
         # Keine fuehrenden Leerzeichen: Einrueckung via setIndentation().
         # 05.08.2026 (Punkt 4): Das Datum der letzten Ausfuehrung (DD.MM.JJ,
         # aus dem feature_store) haengt auch an Standalone-/Plugin-Zeilen:
-        # 'proximity (02.08.26)' – ohne Eintrag '(--.--.--)'.
+        # 'srv_proximity (02.08.26)' – ohne Eintrag '(--.--.--)'.
         last_exec = str(child.get("last_execution") or "--.--.--")
         plugin_item = QTreeWidgetItem([f"{pid} ({last_exec})", ""])
         plugin_item.setData(0, ROLE_NODE_TYPE, TYPE_PLUGIN)
@@ -478,8 +478,8 @@ class MasterTree(QTreeWidget):
              -> 'im <Indikator>'
           Die Aktiv-Pruefung beruecksichtigt den ZUGEHOERIGEN Indikator
           (metadata['indicator_id']), nicht nur die Plugin-ID selbst –
-          dadurch greift Variante a) auch fuer Services (grid_lines/
-          proximity), die IN einem aktiven Indikator (Ind_FixedGridProximity)
+          dadurch greift Variante a) auch fuer Services (srv_grid_lines/
+          srv_proximity), die IN einem aktiven Indikator (Ind_FixedGridProximity)
           laufen. Der Tooltip wird auf Spalte 0 UND Spalte 1 gesetzt
           (Spalte 1 uebernimmt ihn der Info-Button).
         """
@@ -824,7 +824,7 @@ class MasterTree(QTreeWidget):
         """Deduplizierte plugin_ids aller Haken (SQL-Vertrag `IN (...)`).
 
         Mehrere Services mit derselben plugin_id (z. B. grid_1 + grid_2)
-        ergeben EINEN feature_id-Eintrag ('grid_lines').
+        ergeben EINEN feature_id-Eintrag ('srv_grid_lines').
         """
         ids: List[str] = []
         for entry in self.checked_services():
@@ -838,7 +838,7 @@ class MasterTree(QTreeWidget):
 
         Set-Services: '<Set-Anzeigename>/<instance_id>'
         (z. B. 'Mein Scalper/prox_1'); Standalone-/Plugin-Zeilen: plugin_id
-        (z. B. 'proximity').
+        (z. B. 'srv_proximity').
         """
         names: List[str] = []
         for entry in self.checked_services():

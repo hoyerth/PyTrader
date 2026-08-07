@@ -11,11 +11,11 @@ Sie dienen als SINGLE SOURCE OF TRUTH für die Grid-Parität:
 * `f_in_window_around`     – natives UTC-Zeitfenster (Minute 0/30 ± span, Wrap-Around).
 * `f_strip_trailing_zeros` – '%.6f' ohne nachgestellte Nullen (Level-Strings).
 
-Die Services (grid_lines_service.py, proximity_service.py) importieren diese
+Die Services (srv_grid_lines.py, srv_proximity.py) importieren diese
 Funktionen und garantieren damit identisches Verhalten zum historischen
 Alt-Indikator, ohne auf das gelöschte Modul zu verweisen.
 
-HINWEIS: Der Indikator-Adapter (chart/indicators/fixed_grid_proximity.py) behält seine
+HINWEIS: Der Indikator-Adapter (chart/indicators/ind_fixed_grid_proximity.py) behält seine
 private Kopie (`_f_in_window_around`) unverändert – sie wird nicht umgestellt.
 Das Alt-Plugin analytics/features/definitions/grid_liquidity.py wurde am
 04.08.2026 archiviert/entfernt (Schema ist im Indikator selbst hinterlegt).

@@ -24,7 +24,7 @@ Einzel-Service-Run (single): Es wird eine Mini-Definition gebildet, die den
 selektierten Service UND alle Upstream-Services (fruehere Positionen in der
 execution_order des Sets) enthaelt – damit liefern Abhaengigkeiten
 (depends_on, z.B. grid_1 -> prox_1) ihre shared_state-Eintraege und ein
-nachgelagerter Service (proximity) kann tatsaechlich Hits erzeugen und in
+nachgelagerter Service (srv_proximity) kann tatsaechlich Hits erzeugen und in
 den feature_store schreiben.
 
 Der Worker emittiert NUR Signale (log_message / run_finished / run_failed);
@@ -210,7 +210,7 @@ class ServiceRunWorker(QThread):
             fb = FeatureBuilder()
             definition = self._build_scope_definition()
             # 05.08.2026 (Bugfix Service-Run):
-            #  * Fehlende depends_on-Einträge (z.B. proximity -> grid_lines)
+            #  * Fehlende depends_on-Einträge (z.B. srv_proximity -> srv_grid_lines)
             #    werden automatisch aufgelöst (sonst 'kein Feature-Store-
             #    Payload' beim Single-Run eines nachgelagerten Services).
             #  * Scanner-Candles (max) aus den App-Optionen als max Lookback

@@ -704,7 +704,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
 
         Sicherheitsabfrage mit Set-/Service-Name und dem aktuell gewaehlten
         Symbol/Timeframe, danach gezielter Single-Run (inkl. Upstream-
-        Abhaengigkeiten im Set, damit z.B. proximity seine Linien hat).
+        Abhaengigkeiten im Set, damit z.B. srv_proximity seine Linien hat).
         """
         if not set_id or not service_id:
             return
@@ -954,7 +954,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
 
         Bugfix 05.08.2026: Bei Indikator-Auswahl wird die `indicator_id`
         explizit gespeichert und die Basis-Services des Indikators
-        (service_plugin_ids, z.B. grid_lines + proximity) werden mit
+        (service_plugin_ids, z.B. srv_grid_lines + srv_proximity) werden mit
         Registry-Defaults automatisch angelegt (instance_id = plugin_id) –
         einfache Bedienung und das Set ist sofort gueltig fuer den Indikator.
         """
@@ -1373,7 +1373,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                           plugin_id: str) -> str:
         """Liefert die naechste freie instance_id fuer ein Plugin im Set.
 
-        Basis ist der plugin_id selbst (z.B. 'proximity'); bei bereits
+        Basis ist der plugin_id selbst (z.B. 'srv_proximity'); bei bereits
         vorhandener Instanz werden '_2', '_3', ... angehaengt."""
         base = plugin_id
         if base not in services:

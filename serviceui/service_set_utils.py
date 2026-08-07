@@ -13,7 +13,7 @@ def _available_plugin_ids() -> str:
     """Alle registrierten Plugin-IDs (sortiert, kommasepariert).
 
     Phase 13 Schritt 6-Korrektur: Die Verfügbarkeit wird dynamisch aus der
-    PluginRegistry abgeleitet (grid_lines, proximity, ...),
+    PluginRegistry abgeleitet (srv_grid_lines, srv_proximity, ...),
     NICHT hartkodiert auf einen Indikator-Namen.
     """
     try:
@@ -29,7 +29,7 @@ def _sets_using_plugin(plugin_id: str, sets: List[Dict[str, Any]]) -> List[str]:
 
     Basis der Service-Sperre: Einzel-Services, die in einem gespeicherten
     Service-Set vorkommen, dürfen im Service-Fenster nicht entfernt werden
-    (Indikator-Basisservices wie grid_lines/proximity bleiben funktionsfähig).
+    (Indikator-Basisservices wie srv_grid_lines/srv_proximity bleiben funktionsfähig).
     Beim Löschversuch wird der Name des verwendeten Sets angezeigt.
     """
     names: List[str] = []
@@ -54,7 +54,7 @@ def prepare_worker_definition(
 
     1. Implizite Abhängigkeiten (depends_on): Services OHNE expliziten
        `depends_on`-Eintrag, deren Plugin `dependencies` deklariert
-       (z.B. proximity -> ['grid_lines']), erhalten die nächstliegende
+       (z.B. srv_proximity -> ['srv_grid_lines']), erhalten die nächstliegende
        VORHERIGE Instanz in execution_order mit passender plugin_id als
        depends_on. Dadurch liest der ProximityService seine Linienliste
        aus shared_state[depends_on[0]] (vorher: 'fertig (kein
@@ -67,7 +67,7 @@ def prepare_worker_definition(
        scanner_candle_limit) als Scan-Fenster – damit verwenden ALLE
        Services dieselbe Datenbasis wie der Historical Scanner (vorher:
        gespeicherter Service-lookback, z.B. 1000 Feature-Rows bei
-       grid_lines).
+       srv_grid_lines).
     """
     import copy as _copy
     from analytics.features.feature_builder import PluginRegistry

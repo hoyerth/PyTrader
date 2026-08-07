@@ -45,7 +45,7 @@ def list_indicators() -> List[Dict[str, Any]]:
     """
     result: List[Dict[str, Any]] = []
     try:
-        from chart.indicators.fixed_grid_proximity import FixedGridProximityIndicator
+        from chart.indicators.ind_fixed_grid_proximity import FixedGridProximityIndicator
         ind = FixedGridProximityIndicator()
         svc_ids = list(getattr(ind, "service_plugin_ids", []) or [])
         # Konsistenter Anzeigename: bevorzugt metadata['indicator_name'] des
@@ -171,7 +171,7 @@ class ServiceSelectorModel(QObject):
                   f"lesbar: {e}")
             return {}
         # Case-insensitive Zuordnung (feature_id ist die Plugin-ID, z.B.
-        # 'proximity' – Registry-IDs sind case-insensitiv).
+        # 'srv_proximity' – Registry-IDs sind case-insensitiv).
         return {str(k).lower(): v for k, v in raw.items()}
 
     def last_execution_date(self, plugin_id: str) -> str:
@@ -262,7 +262,7 @@ class ServiceSelectorModel(QObject):
     def get_indicator_id(self, plugin_id: str) -> str:
         """Indikator-ID, in der das Plugin laeuft (metadata['indicator_id']).
 
-        Services (grid_lines/proximity) laufen IN einem Indikator
+        Services (srv_grid_lines/srv_proximity) laufen IN einem Indikator
         (Ind_FixedGridProximity -> 'ind_fixed_grid_proximity'); aktiv im Chart sind
         die indicators_state-Keys des Indikators, nicht die Plugin-ID.
         Ohne Angabe faellt die Methode auf die plugin_id selbst zurueck.
@@ -280,7 +280,7 @@ class ServiceSelectorModel(QObject):
         """True, wenn das Plugin explizit einem Indikator zugeordnet ist.
 
         Signal: metadata['indicator_id'] ODER metadata['indicator_name'] sind
-        gesetzt (z.B. Ind_FixedGridProximity fuer grid_lines/proximity).
+        gesetzt (z.B. Ind_FixedGridProximity fuer srv_grid_lines/srv_proximity).
         """
         plugin = self.get_plugin(plugin_id)
         if plugin is None:
@@ -316,7 +316,7 @@ class ServiceSelectorModel(QObject):
         Indikator – aktiv im Chart sind die indicators_state-Keys des
         Indikators ('ind_fixed_grid_proximity'), nicht die Plugin-ID selbst. Dadurch
         greift die Tooltip-Variante a) ('aktiv <Indikator>') auch fuer
-        Services wie grid_lines/proximity.
+        Services wie srv_grid_lines/srv_proximity.
         """
         key = str(plugin_id).lower()
         if any(pid.lower() == key for pid in self._active_indicator_ids):

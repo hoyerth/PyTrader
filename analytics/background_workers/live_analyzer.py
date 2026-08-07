@@ -226,12 +226,12 @@ class LiveAnalyzer(QThread):
 
         for preset in plugins:
             plugin_id = preset.get("plugin_id")
-            # instance_id = plugin_id → GridLinesService schreibt sein Raster
+            # instance_id = plugin_id → srv_grid_lines schreibt sein Raster
             # in den persistenten shared_state (Namespace-isoliert).
             svc_ctx = replace(self._live_context, instance_id=plugin_id)
-            if plugin_id == "proximity":
-                # Proximity liest das Grid-Raster aus shared_state[depends_on[0]].
-                svc_ctx = replace(svc_ctx, depends_on=["grid_lines"])
+            if plugin_id == "srv_proximity":
+                # srv_proximity liest das Grid-Raster aus shared_state[depends_on[0]].
+                svc_ctx = replace(svc_ctx, depends_on=["srv_grid_lines"])
             try:
                 result = self.plugin_executor.execute(
                     plugin_id, df_short, preset.get("params", {}), context=svc_ctx

@@ -1134,7 +1134,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 
 	# -------------------------------------------------------------------------
 	# Indikator-Services (Phase 13 Schritt 6-Korrektur): die Services, die der
-	# aktive Plugin-Indikator intern ausführt (z.B. grid_lines + proximity beim
+	# aktive Plugin-Indikator intern ausführt (z.B. srv_grid_lines + srv_proximity beim
 	# Ind_FixedGridProximity-Indikator). grid_liquidity (Altbestand) ist nur Schema-
 	# Quelle und KEIN Service des Indikators.
 	# -------------------------------------------------------------------------
@@ -1155,8 +1155,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 	def _service_items(self) -> List[Dict[str, Any]]:
 		"""Anzuzeigende Services im Prop-Fenster: [{instance_id, plugin_id}].
 
-		Bevorzugt die vom Indikator deklarierten Service-IDs (z.B. grid_lines +
-		proximity). Existiert ein Service mit dieser plugin_id im gewählten Set,
+		Bevorzugt die vom Indikator deklarierten Service-IDs (z.B. srv_grid_lines +
+		srv_proximity). Existiert ein Service mit dieser plugin_id im gewählten Set,
 		wird dessen instance_id (z.B. grid_1) übernommen; sonst plugin_id.
 		Ohne Indikator-Deklaration: die Services des gewählten Sets.
 		Phase 14 P14-01: Fallback auf das aktive Plugin als Service, wenn weder
@@ -1397,7 +1397,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 					# Felder aus dem Aggregat vorbefüllt.
 					if key.startswith("prox_level") and not cval:
 						try:
-							from analytics.features.definitions.grid_lines_service import map_custom_levels_to_prox_levels
+							from analytics.features.definitions.srv_grid_lines import map_custom_levels_to_prox_levels
 							cval = map_custom_levels_to_prox_levels(sp_params).get(key, cval)
 						except Exception:
 							pass
@@ -1466,7 +1466,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			order = (definition or {}).get("execution_order") or []
 			# Alle Services des Sets mergen, die zum Indikator gehören (das
 			# aktive Plugin selbst ODER deklarierte Indikator-Services wie
-			# grid_lines + proximity). Fremde Services werden nicht eingemischt.
+			# srv_grid_lines + srv_proximity). Fremde Services werden nicht eingemischt.
 			svc_ids = self._indicator_service_ids()
 			merged: Dict[str, Any] = {}
 			merged_lookback: Optional[int] = None
@@ -1575,7 +1575,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		if self.edit_set_description:
 			definition["description"] = self.edit_set_description.text().strip()
 
-		# Kein Set geladen → die Indikator-Services (z.B. grid_lines + proximity)
+		# Kein Set geladen → die Indikator-Services (z.B. srv_grid_lines + srv_proximity)
 		# als neue Services, sonst das aktive Plugin (instance_id = plugin_id).
 		if not definition.get("execution_order") and self.plugin is not None:
 			svc_ids = self._indicator_service_ids()

@@ -324,7 +324,7 @@ class MATemplateEngine:
         """Standard-Parameter-Schema für MA-basierte Indikatoren.
 
         Konvention exakt wie im Projekt üblich (vgl. _FIXED_GRID_PROXIMITY_SCHEMA
-        in chart/indicators/fixed_grid_proximity.py und dem Schema-Renderer in
+        in chart/indicators/ind_fixed_grid_proximity.py und dem Schema-Renderer in
         chart/indicator_dialog.py): {"type": "...", "default": ...,
         "min"/"max"/"step", "options", "description", "style_type"}.
 

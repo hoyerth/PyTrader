@@ -1,12 +1,12 @@
-# chart/indicators/fixed_grid_proximity.py
+# chart/indicators/ind_fixed_grid_proximity.py
 """
 NEUER Grid-Indikator mit Service-Pipeline (Phase 13 Schritt 6).
 
 Der Indikator ist jetzt der VISUELLE ADAPTER über die neuen Services
-grid_lines + proximity (analytics/features/definitions/):
+srv_grid_lines + srv_proximity (analytics/features/definitions/):
 
   * Historical-Run: Er instanziiert intern eine ServiceSetDefinition
-    (grid_1 → grid_lines, prox_1 → proximity, Reihenfolge + depends_on) und
+    (grid_1 → srv_grid_lines, prox_1 → srv_proximity, Reihenfolge + depends_on) und
     führt sie über den ServiceSetEvaluator aus. Die Linien (Parität zu
     chart/indicators/grid.py) werden THREAD-SICHER in self._cached_grid_lines
     zwischengespeichert (atomare Zuweisung unter Lock).
@@ -22,7 +22,7 @@ hinterlegt (_FIXED_GRID_PROXIMITY_SCHEMA) – der Indikator ist dadurch die eige
 Single Source of Truth für das Prop-Fenster (parameter_schema/plugin_id) und
 hängt NICHT mehr am entfernten Alt-Plugin 'grid_liquidity'
 (analytics/features/definitions/grid_liquidity.py, archiviert). Die Services
-grid_lines + proximity (grid_lines_service.py / proximity_service.py) bleiben
+srv_grid_lines + srv_proximity (srv_grid_lines.py / srv_proximity.py) bleiben
 die einzigen Service-Plugins dieses Indikators.
 """
 
@@ -85,7 +85,7 @@ def _line_width(value: Any, default: int = 1) -> int:
 
 
 def _f_in_window_around(minute_val: int, center: int, span: int) -> bool:
-    """Native UTC-Zeitfenster-Logik (identisch zu grid.py / proximity_service)."""
+    """Native UTC-Zeitfenster-Logik (identisch zu grid.py / srv_proximity)."""
     lower = center - span
     upper = center + span
     if lower < 0:
@@ -230,9 +230,10 @@ class FixedGridProximityIndicator(BaseIndicator):
     @property
     def service_plugin_ids(self) -> List[str]:
         """Die Service-Plugin-IDs, die dieser Indikator intern ausführt (Schritt 6):
-        grid_lines + proximity. Der Alt-Service 'grid_liquidity' existiert nicht
-        mehr (Bugfix 04.08.2026) – KEIN Service dieses Indikators."""
-        return ["grid_lines", "proximity"]
+        srv_grid_lines + srv_proximity. Der Alt-Service 'grid_liquidity'
+        existiert nicht mehr (Bugfix 04.08.2026) – KEIN Service dieses
+        Indikators."""
+        return ["srv_grid_lines", "srv_proximity"]
 
     @property
     def param_options(self) -> Dict[str, List[Any]]:
@@ -307,16 +308,16 @@ class FixedGridProximityIndicator(BaseIndicator):
         timeframe: str,
         limit: Optional[int] = None,
         db_path: Optional[str] = None,
-        feature_id: str = "proximity",
+        feature_id: str = "srv_proximity",
     ) -> List[Dict[str, Any]]:
         """P14-03 (Live-Entkopplung A.1.3 / Schritt 3.2): PRIMÄRER
         DB-Lesepfad des Indikators – liest fertige Proximity-Hits aus dem
-        feature_store (JSON-Feld feature_data, feature_id='proximity', inkl.
+        feature_store (JSON-Feld feature_data, feature_id='srv_proximity', inkl.
         schema_version) beim Chart-Re-Render/Refresh OHNE synchrone
         Service-Pipeline (Invariante 10).
 
         P14-03-E (Schritt 4, generisch): `feature_id` ist parametrisiert
-        (Standard 'proximity'), damit spätere Indikator-Plugins denselben
+        (Standard 'srv_proximity'), damit spätere Indikator-Plugins denselben
         Lesepfad über die eigene feature_id nutzen können (Open/Closed).
 
         Der Indikator führt hier KEINE Berechnungen aus; er liest ausschließlich
@@ -334,7 +335,7 @@ class FixedGridProximityIndicator(BaseIndicator):
             timeframe: Timeframe
             limit: Maximale Anzahl Bars (Default 1000)
             db_path: Optionaler DB-Pfad (für Tests) – Default analytics.duckdb
-            feature_id: Feature-ID im feature_store (Default 'proximity')
+            feature_id: Feature-ID im feature_store (Default 'srv_proximity')
         """
         if not symbol or not timeframe:
             return []
@@ -430,7 +431,7 @@ class FixedGridProximityIndicator(BaseIndicator):
 
     def _build_set_definition(self, params: Dict[str, Any], df: pd.DataFrame) -> Dict[str, Any]:
         """Interne ServiceSetDefinition für den Historical-Run (Schritt 6):
-        grid_1 → grid_lines, prox_1 → proximity (depends_on grid_1)."""
+        grid_1 → srv_grid_lines, prox_1 → srv_proximity (depends_on grid_1)."""
         lookback = int(params.get("lookback") or len(df))
         if lookback < 1:
             lookback = 1
@@ -447,7 +448,7 @@ class FixedGridProximityIndicator(BaseIndicator):
             "execution_order": ["grid_1", "prox_1"],
             "services": {
                 "grid_1": {
-                    "plugin_id": "grid_lines",
+                    "plugin_id": "srv_grid_lines",
                     "lookback": lookback,
                     "params": {
                         "step_size": step_size,
@@ -456,7 +457,7 @@ class FixedGridProximityIndicator(BaseIndicator):
                     },
                 },
                 "prox_1": {
-                    "plugin_id": "proximity",
+                    "plugin_id": "srv_proximity",
                     "lookback": lookback,
                     "depends_on": ["grid_1"],
                     "params": {
@@ -659,7 +660,7 @@ class FixedGridProximityIndicator(BaseIndicator):
         }
 
     def calculate(self, df: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Führt die Service-Pipeline (grid_lines + proximity) für den
+        """Führt die Service-Pipeline (srv_grid_lines + srv_proximity) für den
         Historical-Run aus, cached die Linien thread-sicher und liefert den
         Render-Payload (Parität zu grid.py).
 

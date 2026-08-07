@@ -1,6 +1,6 @@
-# analytics/features/definitions/grid_lines_service.py
+# analytics/features/definitions/srv_grid_lines.py
 """
-Service: GridLines (Phase 13 Schritt 6)
+Service: GridLines (Phase 13 Schritt 6) – Naming Convention 16.08.01: srv_
 
 Paritäts-Service zur Alt-Implementierung (ehemals chart/indicators/grid.py,
 am 04.08.2026 entfernt) – baut das Level-Raster EXAKT wie der Alt-Indikator.
@@ -15,7 +15,7 @@ Der Service liefert KEINEN chart_render_payload mehr (Phase 16 P16.01, E2/E5:
 render=False) – er schreibt ausschliesslich eine REINE Level-Liste
 (`[{price}, ...]`, ohne Farben/Styling) nach context.shared_state[self.instance_id];
 der nachgelagerte ProximityService liest sie von dort (depends_on), der
-Indikator (chart/indicators/fixed_grid_proximity.py) baut daraus in
+Indikator (chart/indicators/ind_fixed_grid_proximity.py) baut daraus in
 `build_chart_render_payload()` das Styling (is_custom-Färbung, width 1/3,
 style Solid – Parität zum Alt-Grid).
 
@@ -26,15 +26,16 @@ nicht dieses Services.
 Capabilities: render=False (P16.01), feature_store=True (schreibt Grid-Level je Bar in den Store).
 
 05.08.2026 (U15-E, echte Feature-Store-Payloads): `calculate()` erzeugt jetzt
-ZWINGEND ein gefuelltes `feature_store_payload` mit `feature_id="grid_lines"`,
+ZWINGEND ein gefuelltes `feature_store_payload` mit `feature_id="srv_grid_lines"`,
 `plugin_version` und `records` je Bar:
     {"bar_time", "grid_nearest_level", "grid_step", "upper_level", "lower_level"}
   * grid_nearest_level = center = round(close / step_size) * step_size
   * upper_level        = center + step_size
   * lower_level        = center - step_size
-Dadurch schreibt grid_lines bei der Ausfuehrung echte mathematische Zeilen in
-analytics.duckdb (`feature_store`) – unabhaengig von `show_lines` (das nur die
-RENDER-Darstellung steuert, nicht die Daten-Mathematik).
+Dadurch schreibt grid_lines (srv_grid_lines) bei der Ausfuehrung echte
+mathematische Zeilen in analytics.duckdb (`feature_store`) – unabhaengig von
+`show_lines` (das nur die RENDER-Darstellung steuert, nicht die
+Daten-Mathematik).
 """
 
 from typing import Any, Dict, List, Optional
@@ -76,7 +77,7 @@ def _to_float(value: Any, default: float = 0.0) -> float:
 def _extract_prox_levels(params: Dict[str, Any]) -> List[float]:
     """Custom-Levels aus den EINZELPARAMETERN prox_level1..6 (nur > 0).
 
-    Parität zu fixed_grid_proximity._extract_custom_levels(): Einzelwerte werden
+    Parität zu ind_fixed_grid_proximity._extract_custom_levels(): Einzelwerte werden
     bevorzugt, wenn mindestens einer > 0 ist.
     """
     levels: List[float] = []
@@ -125,7 +126,7 @@ class GridLinesService(PluginFeature):
 
     @property
     def plugin_id(self) -> str:
-        return "grid_lines"
+        return "srv_grid_lines"
 
     @property
     def version(self) -> str:
@@ -179,13 +180,13 @@ class GridLinesService(PluginFeature):
     @property
     def parameter_order(self) -> List[str]:
         # USER-REQ: P14-01 Nachtrag - die 6 Custom-Levels werden im Editor als
-        # EINZELPARAMETER prox_level1..6 (Level 1..6, wie fixed_grid_proximity)
+        # EINZELPARAMETER prox_level1..6 (Level 1..6, wie ind_fixed_grid_proximity)
         # gerendert. custom_levels bleibt im parameter_schema (interne Pipeline
         # & Aggregat-Speicherung), ist aber NICHT in der Darstellungs-Reihenfolge
         # -> wird im Editor nicht als Komma-Feld gerendert.
         # Phase 16 (P16.01): show_lines/line_color sind KEINE Service-Parameter
         # mehr (E1/E5) - sie steuern ausschliesslich die Render-Darstellung im
-        # Indikator (chart/indicators/fixed_grid_proximity.py).
+        # Indikator (chart/indicators/ind_fixed_grid_proximity.py).
         return [
             "step_size", "steps_around",
             "prox_level1", "prox_level2", "prox_level3",
@@ -245,7 +246,7 @@ class GridLinesService(PluginFeature):
         (Namespace-isoliert).
 
         05.08.2026 (U15-E): Zusaetzlich wird ein gefuelltes feature_store_payload
-        erzeugt (feature_id='grid_lines', plugin_version, records je Bar mit
+        erzeugt (feature_id='srv_grid_lines', plugin_version, records je Bar mit
         bar_time / grid_nearest_level / grid_step / upper_level / lower_level) -
         grid_lines schreibt damit echte mathematische Grid-Level in den
         feature_store.
@@ -254,7 +255,7 @@ class GridLinesService(PluginFeature):
         mehr (render=False, E5). Die Level-Liste im shared_state enthaelt nur
         noch {price} - OHNE Farben/width/style. Das Render-Styling (Farben,
         Sichtbarkeit) baut ausschliesslich der Indikator
-        (build_chart_render_payload in fixed_grid_proximity.py)."""
+        (build_chart_render_payload in ind_fixed_grid_proximity.py)."""
         if df is None or df.empty:
             return {"feature_store_payload": {}}
 

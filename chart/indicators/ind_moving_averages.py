@@ -1,7 +1,8 @@
-# chart/indicators/multi_ma.py
+# chart/indicators/ind_moving_averages.py
 """
 Phase 16.05 – Multi-MA-Indikator (8x Moving Averages)
 ======================================================
+Naming Convention 16.08.01: Dateiname = indicator_id `ind_moving_averages`.
 
 Selbst-contained Indikator (BaseIndicator) für den Chart: zeichnet bis zu
 8 Moving Averages als LWC-v5-LineSeries über die GENERISCHE Render-Pipeline

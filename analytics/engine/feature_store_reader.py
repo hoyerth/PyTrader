@@ -41,7 +41,7 @@ DB_ANALYTICS = str(BASE_DIR / "data" / "analytics.duckdb")
 # E-3 (Phase 15.04, harmonisiert): schema_version-Default fuer Alt-Rows ohne
 # Pflichtfeld. 15.04 vereinheitlicht den Default auf "1.0.0" (dreistellig,
 # Semantic Versioning major.minor.patch) – identisch zum Plugin-Vertrag
-# (grid_lines/proximity/metadata) und zur base_plugin-Spezifikation.
+# (srv_grid_lines/srv_proximity/metadata) und zur base_plugin-Spezifikation.
 # Zuvor stand hier "1.0" (zweistellig) – Reader-Default und Plugin-Vertrag
 # sind seit 15.04 deckungsgleich.
 SCHEMA_VERSION_DEFAULT = "1.0.0"
@@ -395,7 +395,7 @@ class FeatureStoreReader:
 
         Robustheit (Bugfix 05.08.2026, Punkt 1):
           * Case-insensitiv: feature_id wird per LOWER(TRIM(...)) normalisiert –
-            Registry-/Plugin-IDs (z.B. 'proximity') werden unabhaengig von der
+            Registry-/Plugin-IDs (z.B. 'srv_proximity') werden unabhaengig von der
             in der DB gespeicherten Gross-/Kleinschreibung gefunden.
           * Whitespace-tolerant: fuehrende/trailing Leerzeichen (z.B. durch
             Alt-Schreibpfade) werden ignoriert.
@@ -404,7 +404,7 @@ class FeatureStoreReader:
             gueltiges Datum liefern).
 
         Returns:
-            Dict feature_id (lower) -> 'DD.MM.JJ' (z.B. {'proximity': '05.08.26'});
+            Dict feature_id (lower) -> 'DD.MM.JJ' (z.B. {'srv_proximity': '05.08.26'});
             leer bei fehlender DB/Tabelle oder Fehler (defensiv).
         """
         con = self._get_connection()

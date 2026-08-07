@@ -1,14 +1,14 @@
 # analytics/statistics_repository.py
 """
 Statistics Repository – SQL-Aggregations-Queries auf feature_data
-(Proximity-Services, feature_id='proximity') + Forward-Performance.
+(Proximity-Services, feature_id='srv_proximity') + Forward-Performance.
 
 Die Statistik liest die Treffer-Records aus dem feature_store
 (feature_data der Proximity-Services); signal_results-Tabellen existieren
 seit Phase 15 nicht mehr.
 
 Da die feature_store-Tabelle KEINE set_id-Spalte hat, ist das 'Set' im
-neuen Datenmodell die feature_id (Plugin-Identität, z. B. 'proximity').
+neuen Datenmodell die feature_id (Plugin-Identität, z. B. 'srv_proximity').
 """
 
 from typing import Any, Dict, List, Optional, Tuple

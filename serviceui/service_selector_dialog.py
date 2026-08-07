@@ -23,9 +23,9 @@ Aktions-Zeile unten:
 
 Datenvertrag (Entscheidung 06.08.2026):
   * `display_names`: lesbare Namen fuer die Button-Anzeige
-    (z. B. ["Mein Scalper/prox_1", "proximity"]).
+    (z. B. ["Mein Scalper/prox_1", "srv_proximity"]).
   * `feature_ids`:   technische IDs fuer die SQL-Abfrage – die plugin_ids
-    des Feature-Store (z. B. ["grid_lines", "proximity"]), dedupliziert
+    des Feature-Store (z. B. ["srv_grid_lines", "srv_proximity"]), dedupliziert
     (`feature_store.feature_id` IST die plugin_id).
 
 Live-Sync (Invariante 5): Das `ServiceSelectorModel` hoert auf

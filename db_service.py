@@ -245,7 +245,7 @@ def check_and_init_databases() -> None:
 
 	# Phase 12 (Hybrid-Schema): Additive Erweiterung des feature_store um die
 	# Plugin-Architektur. feature_id identifiziert das erzeugende Plugin
-	# (z.B. 'grid_lines'), plugin_version dessen Version und feature_data
+	# (z.B. 'srv_grid_lines'), plugin_version dessen Version und feature_data
 	# haelt den vollstaendigen FeatureStorePayload (JSON). Bestehende Spalten
 	# und Daten bleiben unangetastet.
 	con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_id VARCHAR;")

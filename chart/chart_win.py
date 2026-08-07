@@ -35,13 +35,13 @@ from PySide6.QtWidgets import (
 
 try:
     from chart.chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, build_html_template
-    from chart.indicators.fixed_grid_proximity import FixedGridProximityIndicator
-    from chart.indicators.multi_ma import MultiMovingAverageIndicator
+    from chart.indicators.ind_fixed_grid_proximity import FixedGridProximityIndicator
+    from chart.indicators.ind_moving_averages import MultiMovingAverageIndicator
     from chart.indicator_dialog import IndicatorSettingsDialog
 except ImportError:
     from chart_basics import BUTTON_PRIMARY_STYLE, COMBOBOX_STYLE, build_html_template
-    from indicators.fixed_grid_proximity import FixedGridProximityIndicator
-    from indicators.multi_ma import MultiMovingAverageIndicator
+    from indicators.ind_fixed_grid_proximity import FixedGridProximityIndicator
+    from indicators.ind_moving_averages import MultiMovingAverageIndicator
     from indicator_dialog import IndicatorSettingsDialog
 
 # Phase 16.07 (D2): Tier-2-RAM-Puffer als eigene Engine-Klasse (SRP – Rule 2.3).
@@ -250,7 +250,7 @@ class PyTraderChartWindow(QMainWindow):
 
         # Generische Indikator-Registry: indicator_id -> BaseIndicator.
         # Phase 16: Alt-Indikator 'grid_liquidity' entfernt; der Plugin-
-        # Indikator 'Ind_FixedGridProximity' (fixed_grid_proximity) bleibt.
+        # Indikator 'Ind_FixedGridProximity' (ind_fixed_grid_proximity) bleibt.
         # Phase 16.05 (D1): Multi-MA-Indikator 'ind_moving_averages' additiv.
         self.indicators: Dict[str, BaseIndicator] = {
             "ind_fixed_grid_proximity": FixedGridProximityIndicator(),

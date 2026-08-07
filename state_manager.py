@@ -95,7 +95,7 @@ class StateManager:
 
         # Phase 12 (Hybrid-Schema): Additive Erweiterung der indicator_presets
         # um die Plugin-Verknuepfung. plugin_id verknuepft ein Preset mit einem
-        # Plugin (z.B. 'grid_lines'), version fuehrt die Plugin-Version und
+        # Plugin (z.B. 'srv_grid_lines'), version fuehrt die Plugin-Version und
         # is_active_batch markiert Presets, die von den Batch-Services
         # (HistoricalScanner/LiveAnalyzer) ueber den PluginExecutor aktiv
         # verarbeitet werden. Bestehende Presets und Daten bleiben unangetastet.
@@ -150,6 +150,79 @@ class StateManager:
         except Exception as e:
             print(f"WARN [StateManager] Phase-16-Migration (grid_liquidity -> "
                   f"ind_fixed_grid_proximity) fehlgeschlagen: {e}")
+
+        # Phase 16.08.01 (Naming Conventions): Service-Plugin-IDs wurden in
+        # 'srv_grid_lines'/'srv_proximity' umbenannt (Datei-/Klassen-Renames).
+        # Persistierte Alt-Referenzen werden idempotent nachgezogen:
+        #   * service_sets / service_sets_trash / service_set_history
+        #     (definition JSON -> services[].plugin_id)
+        #   * indicator_presets.plugin_id
+        #   * analytics.duckdb/feature_store.feature_id
+        # Additiv und defensiv: nur exakte Alt-Werte werden ersetzt, fehlende
+        # Tabellen/Spalten/DBs werden stillschweigend uebersprungen.
+        _plugin_id_map = {"grid_lines": "srv_grid_lines",
+                          "proximity": "srv_proximity"}
+
+        def _map_plugin_ids_in_definition(definition: Any) -> bool:
+            """Migriert services[].plugin_id in einer Set-Definition (JSON).
+            Liefert True, wenn mindestens ein Wert geaendert wurde."""
+            if not isinstance(definition, dict):
+                return False
+            services = definition.get("services")
+            if not isinstance(services, dict):
+                return False
+            changed = False
+            for cfg in services.values():
+                if not isinstance(cfg, dict):
+                    continue
+                pid = cfg.get("plugin_id")
+                if pid in _plugin_id_map:
+                    cfg["plugin_id"] = _plugin_id_map[pid]
+                    changed = True
+            return changed
+
+        try:
+            for _tbl in ("service_sets", "service_sets_trash", "service_set_history"):
+                try:
+                    _rows = con.execute(
+                        f"SELECT set_id, definition FROM {_tbl}").fetchall()
+                except Exception:
+                    continue  # Tabelle existiert nicht -> ueberspringen
+                for _rid, _raw in _rows:
+                    if _raw is None:
+                        continue
+                    _data = _parse_json_field(_raw) if isinstance(_raw, str) else _raw
+                    if not _map_plugin_ids_in_definition(_data):
+                        continue
+                    con.execute(
+                        f"UPDATE {_tbl} SET definition = ? WHERE set_id = ?",
+                        [json.dumps(_data), _rid])
+        except Exception as e:
+            print(f"WARN [StateManager] 16.08.01-Migration (service_sets-"
+                  f"plugin_ids) fehlgeschlagen: {e}")
+
+        try:
+            for _old_pid, _new_pid in _plugin_id_map.items():
+                con.execute(
+                    "UPDATE indicator_presets SET plugin_id = ? WHERE plugin_id = ?",
+                    [_new_pid, _old_pid])
+        except Exception as e:
+            print(f"WARN [StateManager] 16.08.01-Migration (indicator_presets-"
+                  f"plugin_id) fehlgeschlagen: {e}")
+
+        # analytics.duckdb/feature_store.feature_id (separate DB, defensiv)
+        try:
+            _ana_path = os.path.join(
+                os.path.dirname(self.db_path), "analytics.duckdb")
+            if os.path.exists(_ana_path):
+                _ana_con = DbPool.get(_ana_path)
+                for _old_fid, _new_fid in _plugin_id_map.items():
+                    _ana_con.execute(
+                        "UPDATE feature_store SET feature_id = ? WHERE feature_id = ?",
+                        [_new_fid, _old_fid])
+        except Exception as e:
+            print(f"WARN [StateManager] 16.08.01-Migration (feature_store-"
+                  f"feature_id) fehlgeschlagen: {e}")
 
         # Explicit Column Check via information_schema
         tables_to_migrate = ["instance_states", "symbol_tf_states"]
