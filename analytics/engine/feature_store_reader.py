@@ -46,6 +46,12 @@ DB_ANALYTICS = str(BASE_DIR / "data" / "analytics.duckdb")
 # sind seit 15.04 deckungsgleich.
 SCHEMA_VERSION_DEFAULT = "1.0.0"
 
+# 17.01 (E-1, 07.08.2026): Sentinel feature_id fuer native Feature-Builder-Rows
+# (ohne Plugin). Seit der PK-Migration (symbol, timeframe, bar_time,
+# feature_id) tragen sie feature_id='native' und werden in allen UI-Listen
+# (feature_ids / letzte Ausfuehrung) ausgeblendet.
+SENTINEL_NATIVE = "native"
+
 # Native Feature-Spalten der feature_store-Tabelle (fuer Heatmap-Metriken,
 # Scatter-/Verteilungs-Achsen). Keine JSON-Feld-Pfade – nur echte Spalten.
 NATIVE_COLUMNS = ("ema_diff", "rsi_14", "atr_normalized")
@@ -413,8 +419,9 @@ class FeatureStoreReader:
                 SELECT LOWER(TRIM(feature_id)) AS fid, MAX(created_at)
                 FROM feature_store
                 WHERE feature_id IS NOT NULL AND TRIM(feature_id) != ''
+                  AND feature_id != ?
                 GROUP BY LOWER(TRIM(feature_id))
-            """).fetchall()
+            """, [SENTINEL_NATIVE]).fetchall()
         except Exception as e:
             print(f"WARN [FeatureStoreReader] fetch_last_execution_dates "
                   f"fehlgeschlagen: {e}")
@@ -470,8 +477,9 @@ class FeatureStoreReader:
             ids = [r[0] for r in con.execute("""
                 SELECT DISTINCT feature_id FROM feature_store
                 WHERE feature_id IS NOT NULL AND feature_id != ''
+                  AND feature_id != ?
                 ORDER BY feature_id
-            """).fetchall()]
+            """, [SENTINEL_NATIVE]).fetchall()]
             total = con.execute("""
                 SELECT COUNT(*) FROM feature_store
                 WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)

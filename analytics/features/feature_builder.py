@@ -565,6 +565,11 @@ class FeatureBuilder:
         df = features_df.copy()
         df["symbol"] = symbol
         df["timeframe"] = timeframe
+        # 17.01 (E-1, 07.08.2026): Der nativen Feature-Builder-Pfad schreibt
+        # mit feature_id='native' (Sentinel) – der PK ist seit der Migration
+        # (symbol, timeframe, bar_time, feature_id), damit mehrere Services auf
+        # derselben Bar koexistieren koennen.
+        df["feature_id"] = "native"
 
         own_connection = False
         if con is None:
@@ -575,19 +580,19 @@ class FeatureBuilder:
         try:
             con.register("df_temp", df)
 
-            feature_cols = [c for c in df.columns if c not in ("bar_time", "symbol", "timeframe")]
+            feature_cols = [c for c in df.columns if c not in ("bar_time", "symbol", "timeframe", "feature_id")]
             if not feature_cols:
                 return 0
 
-            insert_cols = ", ".join(['"symbol"', '"timeframe"', '"bar_time"'] + [f'"{c}"' for c in feature_cols])
-            select_cols = ", ".join(['"symbol"', '"timeframe"', '"bar_time"'] + [f'"{c}"' for c in feature_cols])
+            insert_cols = ", ".join(['"symbol"', '"timeframe"', '"bar_time"', '"feature_id"'] + [f'"{c}"' for c in feature_cols])
+            select_cols = ", ".join(['"symbol"', '"timeframe"', '"bar_time"', '"feature_id"'] + [f'"{c}"' for c in feature_cols])
             set_clause = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in feature_cols])
 
             sql = f"""
                 INSERT INTO feature_store ({insert_cols})
                 SELECT {select_cols}
                 FROM df_temp
-                ON CONFLICT (symbol, timeframe, bar_time) DO UPDATE SET
+                ON CONFLICT (symbol, timeframe, bar_time, feature_id) DO UPDATE SET
                     {set_clause}
             """
             con.execute(sql)
@@ -611,8 +616,10 @@ class FeatureBuilder:
 
         Setzt/aktualisiert NUR die Plugin-Spalten (feature_id, plugin_version,
         feature_data); native Feature-Spalten bleiben unberuehrt. Dadurch ist
-        der Plugin-Pfad parallel zum Alt-Pfad betreibbar (derselbe (symbol,
-        timeframe, bar_time)-Schluessel kann beide Informationsarten tragen).
+        der Plugin-Pfad parallel zum Alt-Pfad betreibbar – seit 17.01 (E-1,
+        PK-Migration auf (symbol, timeframe, bar_time, feature_id)) koennen
+        MEHRERE Services denselben (symbol, timeframe, bar_time)-Schluessel
+        tragen; feature_id des Payloads ist der Trenner.
 
         payload: {"feature_id", "plugin_version", "records": [{bar_time, ...}]}
         """
@@ -668,7 +675,7 @@ class FeatureBuilder:
                     SELECT symbol, timeframe, bar_time, feature_id,
                            plugin_version, feature_data
                     FROM df_temp
-                    ON CONFLICT (symbol, timeframe, bar_time) DO UPDATE SET
+                    ON CONFLICT (symbol, timeframe, bar_time, feature_id) DO UPDATE SET
                         feature_id = EXCLUDED.feature_id,
                         plugin_version = EXCLUDED.plugin_version,
                         feature_data = EXCLUDED.feature_data,

@@ -230,6 +230,13 @@ def check_and_init_databases() -> None:
 	""")
 
 	# Analytics-Tabelle für Feature-/Plugin-Daten
+	# 17.01 (E-1, 07.08.2026): 4-Spalten-PK (symbol, timeframe, bar_time,
+	# feature_id) – erlaubt die konfliktfreie Speicherung MEHRERER Services auf
+	# derselben Kerze (feature_id identifiziert das erzeugende Plugin, Default
+	# 'native' fuer den klassischen Feature-Builder-Pfad). Bei bestehenden DBs
+	# ist CREATE TABLE IF NOT EXISTS ein No-op; die Migration existierender
+	# Tabellen erfolgt ueber test/migrate_pk.py (Table-Rewrite + RENAME, da
+	# DuckDB 1.5.5 kein DROP PRIMARY KEY unterstuetzt).
 	con_analytics.execute("""
 		CREATE TABLE IF NOT EXISTS feature_store (
 			symbol      VARCHAR NOT NULL,
@@ -239,7 +246,10 @@ def check_and_init_databases() -> None:
 			rsi_14      DOUBLE,
 			atr_normalized DOUBLE,
 			created_at  TIMESTAMP DEFAULT current_timestamp,
-			PRIMARY KEY (symbol, timeframe, bar_time)
+			feature_id  VARCHAR NOT NULL DEFAULT 'native',
+			plugin_version VARCHAR,
+			feature_data JSON,
+			PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
 		);
 	""")
 

@@ -48,7 +48,7 @@ Konsolidierung aller Swing-, Wendepunkt- und Volumenstruktur-Verfahren in **3 ho
 
 5. **Primary Key & DB-Persistenz:** Zur konfliktfreien Speicherung mehrerer Services auf derselben Kerze ist der Primary Key im `feature_store` exakt `(symbol, timeframe, bar_time, feature_id)`.
 
-> **Hinweis (07.08.2026):** Dies ist ein **Migrations-Ziel**, kein Ist-Zustand. Der aktuelle PK lautet `(symbol, timeframe, bar_time)`, `feature_id` ist NULLABLE (verifiziert an `data/analytics.duckdb`). Die verbindliche Migrations-Strategie (Table-Rewrite, Sentinel `'native'`, Write-Pfad-Umstellung) steht in **Kapitel 6 – Entscheidung E-1**. Ohne diese Migration können die 3 Swing-Services NICHT parallel auf derselben Kerze persistieren.
+> **Hinweis (07.08.2026, UMGESETZT):** Die PK-Migration wurde durchgeführt – der `feature_store` hat jetzt den 4-Spalten-PK `(symbol, timeframe, bar_time, feature_id)` mit `feature_id VARCHAR NOT NULL` (Sentinel `'native'` für klassische Feature-Builder-Rows; verifiziert, 677.713 Zeilen verlustfrei migriert, Backup `data/backup_analytics_20260807.duckdb`). Details in Kapitel 7.1.
 
 
 ---
@@ -375,3 +375,59 @@ python -m py_compile analytics/features/definitions/srv_swing_structure.py analy
 * §1, §2 (1–4), §3-Kategorien, §4-Vertragsfelder und §5-Prüfpunkte sind **konsistent** mit `base_plugin.py`, `PluginLoader` (Dateinamen-unabhängige Discovery), `PluginRegistry`, `ServiceSelectorModel._category_parts` (Slash-Pfade) und den bestehenden Service-Mustern.
 * Lese-Pfade (`feature_store_reader`, `statistics_repository`, `analytics_repository`) filtern über `feature_id`/`bar_time` und bleiben nach E-1 funktionsfähig – einzige Anpassung sind die Sentinel-Exclusions (E-1.7).
 * Klassenname `SrvSwingStructure` funktioniert (Discovery über `issubclass(PluginFeature)`, `inspect.isabstract`); optional wäre `SwingStructureService` (Muster `GridLinesService`/`ProximityService`) – keine Pflichtänderung.
+
+---
+
+## 7. Implementierungs-Log 17.01 (07.08.2026, 18:45) – Umsetzung E-1..E-8
+
+> **Implementierungs-Log (Coding):** Alle Entscheidungen E-1..E-8 aus Kapitel 6 wurden am 07.08.2026 umgesetzt und headless verifiziert. Es wurden NUR additive Anpassungen vorgenommen; auskommentierter/alter Code blieb erhalten.
+
+### 7.1 E-1 (BLOCKER) – PK-Migration `feature_store` (UMGESETZT)
+
+* **Migration ausgeführt** via `test/migrate_pk.py` (dynamischer Spaltenaufbau aus der DB, Table-Rewrite + RENAME, da DuckDB 1.5.5 kein `DROP PRIMARY KEY` kann):
+  * Sentinel: 3.000 native Alt-Rows → `feature_id='native'`.
+  * Kopiert: **677.713 Zeilen** (Verlustfrei, Spalten 1:1).
+  * Neuer PK: `PRIMARY KEY(symbol, timeframe, bar_time, feature_id)`; `feature_id VARCHAR NOT NULL` (verifiziert via `duckdb_constraints()`).
+  * Positivtest im Skript: 4-Spalten-Upsert (2 Services auf derselben Bar) erfolgreich.
+* **Backup:** `data/backup_analytics_20260807.duckdb` (98,8 MB) + Git-Tag `phase17_step0` (Review-Commit).
+* **`db_service.py`** (`check_and_init_databases`): Basis-`CREATE TABLE IF NOT EXISTS feature_store` auf 4-Spalten-PK + `feature_id VARCHAR NOT NULL DEFAULT 'native'` aktualisiert (No-op für die migrierte DB, korrektes Schema für neue DBs). Die alten `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`-Statements bleiben als idempotente No-ops erhalten.
+* **`analytics/features/feature_builder.py`** (Write-Pfade):
+  * `store_features()` (nativer Pfad): setzt `feature_id='native'` je Zeile, Insert-/Select-Spalten + `ON CONFLICT (symbol, timeframe, bar_time, feature_id)`.
+  * `store_plugin_payload()`: `ON CONFLICT (symbol, timeframe, bar_time, feature_id)`.
+* **`analytics/engine/feature_store_reader.py`** (Sentinel-Exclusions):
+  * Neue Konstante `SENTINEL_NATIVE = "native"`.
+  * `fetch_last_execution_dates()` und `get_available_features()` schließen `feature_id != 'native'` aus (Sentinel erscheint nicht in MasterTree/UI-Listen).
+  * `statistics_repository.get_available_sets()` benötigte keine Änderung (filtert bereits über `feature_data IS NOT NULL`).
+
+### 7.2 E-2..E-6 – Die 3 Swing-Services (NEU, Scaffold)
+
+* **Neue Dateien** in `analytics/features/definitions/` (alle registriert, verifiziert):
+  * `srv_swing_structure.py` – `SrvSwingStructure`, `category: "Swing Points/Geometrie"`.
+  * `srv_swing_momentum.py` – `SrvSwingMomentum`, `category: "Swing Points/Dynamik & Filter"`.
+  * `srv_swing_volume_profile.py` – `SrvSwingVolumeProfile`, `category: "Swing Points/Volumen & Grid"`.
+* **E-2:** `type`-Werte als Strings (`"int"`, `"float"`, `"str"`) → `validate_params()` konvertiert korrekt.
+* **E-3:** PineScript-Input-Zone als Modul-Konstante (`_SWING_STRUCTURE_SCHEMA` etc.); `parameter_schema` liefert eine flache Kopie (`{k: dict(v) ...}`, M1-konform).
+* **E-4:** `plugin_version`-Attribut entfällt; `version`-Property (`"1.0.0"`). `plugin_id` als Property.
+* **E-5:** `capabilities = {"chart": False, "batch": True, "live": False, "feature_store": True, "render": False}` – keine irreführenden „📌 im …"-Badges.
+* **E-6:** `metadata` mit Vollschema (author, tags, `description_long`, `condition_rules` je Modus, `api_version`).
+* **`calculate()`:** Scaffold – validiert Parameter und liefert strukturell korrekten `feature_store_payload` mit `schema_version` (E-7), `records=[]` (0 persistierte Zeilen). Die konkreten Swing-Algorithmen (Williams-Fraktal, ZigZag, Volume Profile …) werden in einem Folge-Schritt nach statistischer Validierung der Feature-Store-Grundlage umgesetzt (entspricht dem Kapitel-Fokus auf Architektur/Invarianten).
+
+### 7.3 E-7 – `schema_version` im Datenvertrag
+
+* In §4.1 dokumentiert und in allen 3 Services als `metadata["schema_version"] = "1.0.0"` gesetzt (Pflichtfeld U15-A1/Invariante 5; Reader-Default `SCHEMA_VERSION_DEFAULT` deckungsgleich).
+
+### 7.4 E-8 – Verifikation (headless, keine UI-Tests)
+
+* `py_compile` PASS auf: `srv_swing_structure.py`, `srv_swing_momentum.py`, `srv_swing_volume_profile.py`, `feature_builder.py`, `feature_store_reader.py`, `db_service.py`, `test/test.py`.
+* `test/test.py` **Teil 14 (8/8 PASS)**:
+  * T1: `PluginRegistry().get(...)` für alle 3 IDs.
+  * T2: `build_tree()` enthält die Kategorien `Swing Points/Geometrie`, `Swing Points/Dynamik & Filter`, `Swing Points/Volumen & Grid` (Pfad-basiert, Ordner rekursiv).
+  * T3: Zwei Services koexistieren auf derselben Bar (4-Spalten-Upsert auf Test-DB).
+  * T4: 3-Spalten-`ON CONFLICT` wirft nach Migration `BinderException` (Negativtest).
+  * `check_and_init_databases()` läuft mit der migrierten DB fehlerfrei (Schema/Constraint-Verifikation).
+* Vorbestehende Harness-FAILURES (P2/P5/H3/H4/H5/H7/T5 – Fenster-Geometrie/Info-Button aus früheren Teilen) sind unabhängig von 17.01 (keine berührten Komponenten; kein Regressionstest gemäß Harte Regel 4).
+
+### 7.5 Test-Cleanup (Invariante 10, ausstehend bis Kapitelabschluss)
+
+* Dauerhaft: `test/test.py` (inkl. Teil 14).
+* Temporär (verbleiben bis zur Abnahme des Kapitels, werden danach entfernt): `test/check_pk_migration.py` (Referenz für E-1), `test/migrate_pk.py`, `test/check_init_compat.py`, `test/_insert_part14.py`, `test/_fix_part14.py`, `test/_fix_part14b.py`.
