@@ -1,230 +1,377 @@
-# Phase 16: Architektur Servive/Indikator - Feinarbeit Analytics
+# Phase 17: Services und Analytics-Finalisierung
 
-## 1. Allgemeine Grundsätze & Architektur-Invarianten (Phase 16)
+## 1. Allgemeine Grundsätze & Architektur-Invarianten (Phase 17)
 
-1. **Git-Backup vor jedem Schritt:** Vor Beginn jedes Teilkapitels automatischen Git-Commit/Tag setzen (`phase16_step1`, `phase16_step2` usw.).
+1. **Git-Backup vor jedem Schritt:** Vor Beginn jedes Teilkapitels automatischen Git-Commit/Tag setzen (`phase17_step1`, `phase17_step2` usw.).
 2. **Headless-Validierung (Keine UI-Tests):** Validierungen erfolgen rein headless (kein `QApplication.exec()`) über gezielte PyTest-/Python-Skripte im Unterordner `test/`.
 3. **Strikte Trennung & MVVM (Kein SQL in UI):** UI-Klassen enthalten **keine SQL-Queries**. Datenfluss: `DuckDB` $\rightarrow$ `FeatureStoreReader` / `Repositories` $\rightarrow$ `Worker/ViewModel` $\rightarrow$ `UI-Pages`.
-4. **Zentraler `EventBus`:** Fenster und Worker communicaten schwellenfrei über Events (`favorites_changed`, `profile_changed`, `service_set_changed`), um zirkuläre Abhängigkeiten zu vermeiden.
-5. **Thread-Safety & DbPool:** DB-Zugriff erfolgt lock-frei über den Thread-local `DbPool` (`../../db_service.py`) – eine Verbindung pro Thread und DB-Datei.
+4. **Zentraler `EventBus`:** Fenster und Worker kommunizieren schwellenfrei über Events (`favorites_changed`, `profile_changed`, `service_set_changed`), um zirkuläre Abhängigkeiten zu vermeiden.
+5. **Thread-Safety & DbPool:** DB-Zugriff erfolgt lock-frei über den Thread-local `DbPool` (`db_service.py`) – eine Verbindung pro Thread und DB-Datei.
 6. **Wanduhr-Garantie:** Achsen, Zeitfilter und Visualisierungen formatieren streng die Berliner Wanduhrzeit aus MT5-Epochs ohne doppelte UTC-Offsets.
-7. **Concurrency-Guard & Timer-Pausierung (Ergänzung 1):** Solange im ServiceWindow intensive Service-Berechnungen laufen (`SetRunWorker` / `HistoricalScanner`), wird der 45s-`sync_timer` entkoppelt via `EventBus` pausiert, um Locking-Konflikte und UI-Ruckler zu verhindern.
-8. **Isolierter Test-Workspace (Ergänzung 2):** Alle neuen Test-Python-Dateien und temporären Test-Datenbanken (`*.duckdb`) müssen strikt im Unterordner `test/` erzeugt, gelesen und abgelegt werden – niemals im Projekt-Root oder im `data/`-Ordner.
-9. **Open/Closed-Principle & Code-Preserving (Ergänzung 3):** Erweiterungen erfolgen strikt additiv durch neue Dateien. Auskommentierter Bestandscode darf nicht gelöscht werden und bestehende Kern-Klassen bleiben geschützt.
-10. **Test-Cleanup (Ergänzung 4, Entscheidung 06.08.2026):** Tests werden NICHT aufbewahrt. Nach Abschluss jedes Phasenkapitels wird der Ordner `test/` aufgeräumt – es bleibt ausschließlich die Datei `test/test.py` (dauerhafter Test-Harness) bestehen. Alle temporären Check-Skripte (`check_*.py`/`*.js`), einmaligen Migrations-/Bereinigungsskripte, Test-Datenbanken (`*.duckdb`) und generierten Dateien (`tmp_*.json` u. Ä.) werden entfernt. Die Verifikation eines Kapitels erfolgt daher VOR der Bereinigung; danach existieren die Prüfskripte nicht mehr.
+7. **Concurrency-Guard & Timer-Pausierung:** Solange im ServiceWindow intensive Service-Berechnungen laufen (`ServiceRunWorker` / `HistoricalScanner`), wird der 45s-`sync_timer` entkoppelt via `EventBus` pausiert, um Locking-Konflikte und UI-Ruckler zu verhindern.
+8. **Isolierter Test-Workspace:** Alle neuen Test-Python-Dateien und temporären Test-Datenbanken (`*.duckdb`) müssen strikt im Unterordner `test/` erzeugt, gelesen und abgelegt werden – niemals im Projekt-Root oder im `data/`-Ordner.
+9. **Open/Closed-Principle & Code-Preserving:** Erweiterungen erfolgen strikt additiv durch neue Dateien. Auskommentierter Bestandscode darf nicht gelöscht werden und bestehende Kern-Klassen bleiben geschützt.
+10. **Test-Cleanup (Entscheidung 06.08.2026):** Tests werden NICHT dauerhaft aufbewahrt. Nach Abschluss jedes Phasenkapitels wird der Ordner `test/` aufgeräumt – es bleibt ausschließlich die Datei `test/test.py` (dauerhafter Test-Harness) bestehen.
+11. **Naming Conventions & PineScript-Input-Zone:** 
+    * Services in `analytics/features/definitions/` nutzen strikt das Präfix `srv_` (`plugin_id = "srv_..."`).
+    * Indikatoren in `chart/indicators/` nutzen strikt das Präfix `ind_` (`indicator_id = "ind_..."`).
+    * Füllwörter (`service`, `plugin`, `indicator`) entfallen im Dateinamen.
+    * Das `parameter_schema` liegt direkt am Dateianfang unter dem Header-Docstring.
+    * Jedes Service-Plugin deklariert `metadata["category"]` für die dynamische Kategorie-Ordner-Struktur im MasterTree.
+---
+
+# 17.01 Grouped Swing Services (Feature Store Architecture)
+
+## 1. Executive Summary & Strategie
+
+Konsolidierung aller Swing-, Wendepunkt- und Volumenstruktur-Verfahren in **3 hochperformante Core-Services**:
+
+1. `srv_swing_structure` (Klassische & Geometrische Preis-Swings)
+2. `srv_swing_momentum` (Dynamik-, MA-Hysterese- & Trailing-Swings)
+3. `srv_swing_volume_profile` (Profil-, LVN-, Grid- & Anchored-VWAP-Swings)
+
+**Hauptzweck:** Reine Datenlieferanten für die **Analytics-UI** und spätere **Machine-Learning-Pipelines (XGBoost/LightGBM)**. Eine direkte Chart-Visualisierung ist **nicht** Bestandteil dieses Kapitels. Dedizierte Chart-Indikatoren (`ind_...`) werden erst nach statistischer Validierung der erzeugten Features entwickelt.
 
 ---
 
-# 16.08.02 Nachtrag Bereinigung: Umstellung Parameter Position in Definitionsdateien
-### Schritt 5: Schema-Platzierung (PineScript-Input-Zone)
-* In allen `srv_*.py` und `ind_*.py` Dateien muss das `parameter_schema` / `default_params` **direkt auf Klassenebene unter dem Header-Docstring** platziert werden.
-* Jeder Parameter im Schema MUSS einen aussagekräftigen Kommentar bzw. ein `"description"`-Feld enthalten, damit der Anwender Inputs und Defaults wie in PineScript direkt am Dateianfang manuell anpassen kann.
+## 2. Invarianten, Causal Timestamps & PineScript-Standard
+
+1. **Präfix & Pfad:** `analytics/features/definitions/srv_*.py` mit `plugin_id = "srv_<name>"` (ohne Wörter wie *service* oder *plugin*).
+2. **PineScript-Input-Zone:** `parameter_schema` steht **direkt als erstes Attribut auf Klassenebene** unter dem Header-Docstring (vor `plugin_id` / `metadata`).
+3. **MasterTree-Kategorie:** Deklaration von `metadata["category"]` für den rekursiven Baumaufbau.
+4. **Causal Timestamping (Kein Look-ahead Bias für ML):**
+* `event_bar_time`: Zeitpunkt (Epoch) des tatsächlichen Extremums.
+* `confirmation_bar_time`: Zeitpunkt (Epoch), an dem das Signal mathematisch/kausal feststand (`bar_time` der aktuellen Kerze).
+* `confirmation_lag_bars`: Dynamisch berechnete Differenz in Bars (`params["right_bars"]` bzw. Modus-Verzögerung).
+* Kerzen am Serienanfang ohne ausreichenden Lookback/Lookahead erhalten `calculation_status = "INSUFFICIENT_DATA"` und `is_swing_* = False`
+
+
+5. **Primary Key & DB-Persistenz:** Zur konfliktfreien Speicherung mehrerer Services auf derselben Kerze ist der Primary Key im `feature_store` exakt `(symbol, timeframe, bar_time, feature_id)`.
+
+> **Hinweis (07.08.2026):** Dies ist ein **Migrations-Ziel**, kein Ist-Zustand. Der aktuelle PK lautet `(symbol, timeframe, bar_time)`, `feature_id` ist NULLABLE (verifiziert an `data/analytics.duckdb`). Die verbindliche Migrations-Strategie (Table-Rewrite, Sentinel `'native'`, Write-Pfad-Umstellung) steht in **Kapitel 6 – Entscheidung E-1**. Ohne diese Migration können die 3 Swing-Services NICHT parallel auf derselben Kerze persistieren.
+
 
 ---
 
-# Kapitel 16.08.02 – Review & Entscheidungen (07.08.2026, kritische Prüfung gegen Ist-Code)
+## 3. Die 3 Konsolidierten Swing Services
 
-> **Status:** Kapitel 16.08.02 ist ein **Konzept/Plan**, keine Umsetzung. Der Ist-Code wurde kritisch geprüft (alle `srv_*.py`/`ind_*.py`-Definitionsdateien, Basisklassen `base_plugin.py`/`base_indicator.py`). Es wurden **5 Entscheidungen (M1–M5)** getroffen. Die Entscheidungen **M1–M5 sind final** und verbindlich für die Umsetzung. **Coding startet erst nach ausdrücklichem Startbefehl des Anwenders.**
+### A. `srv_swing_structure.py` (Geometrische & Preis-Swings)
 
-## 1. Ist-Zustand (Schema-Platzierung je Definitionsdatei)
+* **Verwendungszweck:** Erfasst lokale Extrema über Fraktale, Pivots, Gann Swings, Period Extrema (PDH/PWH) und ZigZag.
+* **MasterTree:** `category: "Swing Points/Geometrie"`
 
-| Datei | Schema-Quelle | Aktuelle Position | `description` je Key? |
-|---|---|---|---|
-| `analytics/features/definitions/srv_grid_lines.py` | `@property def parameter_schema` (Z. 210) | Klassenkörper (am Ende) | ✓ 9 Keys |
-| `analytics/features/definitions/srv_proximity.py` | `@property def parameter_schema` (Z. 178) | Klassenkörper | ✓ 3 Keys |
-| `chart/indicators/ind_fixed_grid_proximity.py` | Modul-Konstante `_FIXED_GRID_PROXIMITY_SCHEMA` (Z. 108) | Dateianfang (vor der Klasse, nach den Helfern) | ✓ 13 Keys |
-| `chart/indicators/ind_moving_averages.py` | `@staticmethod _build_schema()` (Z. 142) – programmatisch (66 Keys, Schleife `for x in range(1, 9)`) | Klassenkörper | ✓ 66 Keys (generiert) |
+# ==============================================================================
+# DEFINITION: srv_swing_structure
+# ==============================================================================
+# NAME:        Swing Structure Service
+# KATEGORIE:   Swing Points/Geometrie
+# BESCHREIBUNG: Extrahierte Swing Highs/Lows über Fraktale, Pivots, Gann & ZigZag
+# ==============================================================================
 
-Zusätzlich geprüft:
-* **`default_params`** ist in beiden Basisklassen eine **generische, abgeleitete Methode** (`base_plugin.py:309`, `base_indicator.py:29`), die die Defaults aus `full_parameter_schema()` extrahiert – **kein** Datenattribut in den Definitionsdateien.
-* **`grid_levels.py` / `ema_diff.py` / `atr_normalized.py`** (BaseFeature, N1 aus 16.08.01) besitzen **kein** `parameter_schema`/`default_params` → **nicht betroffen** (Scan über alle Projekt-Python-Dateien).
-* **`parameter_schema`** ist in `PluginFeature` ein `@abstractmethod`-Vertrag (`base_plugin.py:243–244`); alle 4 Dateien implementieren ihn als `@property` und liefern flache Kopien (`{k: dict(v) ...}`).
+import pandas as pd
+from typing import Dict, Any
+from analytics.features.plugins.base_plugin import PluginFeature
 
-## 2. Entscheidungen (M1–M5)
+class SrvSwingStructure(PluginFeature):
+    # INPUT-PARAMETER & DEFAULTS (PINESCRIPT-ZONE - KLASSENANFANG)
+    parameter_schema = {
+        "mode": {
+            "type": str,
+            "default": "Williams_Fractal",
+            "options": ["Williams_Fractal", "Standard_Pivot", "Gann_Mechanical", "ZigZag_ATR", "ZigZag_Pct", "Period_Extrema"],
+            "description": "Erkennungs-Modus für Strukturswings"
+        },
+        "left_bars": {
+            "type": int,
+            "default": 2,
+            "min": 1,
+            "description": "Anzahl erforderlicher Kerzen links mit niedrigeren Hochs / höheren Tiefs"
+        },
+        "right_bars": {
+            "type": int,
+            "default": 2,
+            "min": 1,
+            "description": "Anzahl Bestätigungskerzen rechts (bestimmt dynamisch confirmation_lag_bars)"
+        },
+        "atr_period": {"type": int, "default": 14, "min": 1, "description": "ATR-Periode für ZigZag_ATR"},
+        "atr_mult": {"type": float, "default": 2.0, "min": 0.1, "description": "ATR-Multiplikator für ZigZag_ATR"},
+        "change_pct": {"type": float, "default": 0.5, "min": 0.05, "description": "Mindestprozentbewegung für ZigZag_Pct"},
+        "period_extrema_type": {
+            "type": str,
+            "default": "PREVIOUS_CLOSED",
+            "options": ["PREVIOUS_CLOSED", "CURRENT_DEVELOPING"],
+            "description": "PREVIOUS_CLOSED (z. B. PDH/PWH final) oder CURRENT_DEVELOPING"
+        }
+    }
 
-### M1: `parameter_schema` bleibt `@property` (ABC-Vertrag) – KEIN Klassenattribut-Dict
-* **Begründung:** `base_plugin.py:243–244` verlangt `parameter_schema` als (property-artige) Methode; `full_parameter_schema` (`base_plugin.py:272`) und `validate_params` (`base_plugin.py:319`) rufen `self.parameter_schema` lesend auf. Ein Klassenattribut-Dict wäre ein **geteiltes, mutables Objekt** über alle Instanzen – die Property erzeugt pro Aufruf eine frische flache Kopie und schützt vor Cross-Plugin-Mutation. Das einheitliche Property-Muster aller Plugins/Indikatoren bleibt unangetastet (Ergänzung 3: keine bestehenden Kern-Strukturen überschreiben).
-* **Wirkung:** „Auf Klassenebene" ist bereits erfüllt (Property = Methode auf Klassenebene). Die PineScript-Intention wird über M3 erfüllt.
+    plugin_id = "srv_swing_structure"
+    plugin_version = "1.0.0"
+    
+    metadata = {
+        "display_name": "Swing Structure Service",
+        "category": "Swing Points/Geometrie",
+        "description": "Erfasst Fraktal-, Pivot-, Gann- und ZigZag-Extrema für die Struktur-Analyse"
+    }
 
-### M2: `default_params` wird NICHT ausgerollt
-* **Begründung:** `default_params` leitet sich generisch aus dem Schema ab (siehe Ist-Zustand). Wer das Schema am Dateianfang sieht, sieht damit implizit alle Defaults. Ein statisches Ausrollen wäre Duplikation ohne fachlichen Nutzen und würde die Basis-API verändern.
+    def calculate(self, df: pd.DataFrame, params: Dict[str, Any], context=None):
+        pass
 
-### M3: PineScript-Input-Zone via **Modul-Konstanten** (einheitliches Muster, analog `_FIXED_GRID_PROXIMITY_SCHEMA`)
-* Die **Schema-Dicts** werden als benannte Modul-Konstanten **direkt unter dem Header-Docstring** (bzw. im Konstanten-Block am Dateianfang) platziert; die `parameter_schema`-Property gibt `{k: dict(v) for k, v in _XXX_SCHEMA.items()}` zurück (flache Kopie – Verhalten identisch, getestete Invarianzen bleiben).
-* Betroffene Dateien (nur **Umsetzung nach Startbefehl**):
-  * `srv_grid_lines.py`: Schema-Inhalt der Property (Z. 210–224) → neue Modul-Konstante `_GRID_LINES_SCHEMA` (8+1 Keys, `custom_levels` bleibt im Schema, nicht in `parameter_order`).
-  * `srv_proximity.py`: Schema-Inhalt der Property (Z. 178–190) → neue Modul-Konstante `_PROXIMITY_SCHEMA` (3 Keys).
-  * `ind_fixed_grid_proximity.py`: **bereits konform** (`_FIXED_GRID_PROXIMITY_SCHEMA` am Dateianfang). Optional nur: Konstante **vor** die privaten Helfer-Funktionen (Z. 49–102) ziehen, damit die „Input-Zone" unmittelbar nach dem Header beginnt (rein kosmetisch).
-  * `ind_moving_averages.py`: `_build_schema()` **bleibt programmatisch** (66 Keys, MA1-Spezial + MA2..8, Sibling-Defaults 16.06, Kontrastfarben D4). Eine statische Ausrollung wäre ein Wartungsdesaster und würde die in `test/test.py` hart getesteten Invarianzen (M1: 66 Keys, Sibling-Defaults) gefährden. Optional: `_build_schema` als **Modul-Funktion** in den Konstanten-Block am Dateianfang ziehen (referenziert nur Modul-Konstanten `MA_TYPES`/`LINE_STYLES`/`_MA_*`).
-
-### M4: `description`-Vollständigkeit ist BEREITS erfüllt
-* Alle Parameter in allen 4 Definitionsdateien tragen bereits ein aussagekräftiges `"description"`-Feld (geprüft, s. Ist-Zustand). Kein Nachrüsten nötig.
-* Optional (Komfort, im Zuge von M3): Die Header-Docstrings der `srv_*.py`-Dateien erhalten einen **PARAMETER-Referenzblock** (PineScript-Stil), der die Konstanten-Namen referenziert.
-
-### M5: Keine DB-Migration / keine test.py-Änderung nötig
-* Die Schemas werden **inhaltlich nicht verändert** (nur Position des Dict-Literals) → keine DB-Migration, keine Verhaltensänderung, `test/test.py` bleibt unverändert grün.
-* `docs/x_Exports.md` wird nicht angefasst.
-
-## 3. Verifikation (headless, Regel 4 – NUR nach Startbefehl)
-
-1. **`py_compile`:** `srv_grid_lines.py`, `srv_proximity.py`, `ind_fixed_grid_proximity.py`, `ind_moving_averages.py`.
-2. **`test/test.py`:** unverändert grün (Teile 4–13; Schemas inhaltlich identisch).
-3. **Konsistenz-Scan:** `parameter_schema`-Properties liefern flache Kopien; keine doppelten Dict-Objekte.
-4. **Keine UI-/Regressionstests** (Regel 4).
-
-> **Kein Coding:** Die Entscheidungen sind dokumentiert. Eine Umsetzung von 16.08.02 erfolgt erst nach ausdrücklichem Startbefehl des Anwenders.
 
 ---
 
-# Kapitel 16.08.02 – Implementierungs-Log (Umsetzung, 07.08.2026 16:46)
+### B. `srv_swing_momentum.py` (Dynamik- & MA-Hysterese Swings)
 
-> **Status:** UMSGESETZT (Anwender-Startbefehl "umsetzen" / "commit und push" 07.08.2026). M3 + M4-Komfort sind umgesetzt und headless verifiziert. M1/M2/M5 als reine Entscheidungen ohne Coding.
+* **Verwendungszweck:** Erfasst Richtungswechsel über Glättungs-Hysteresen (alle 12 MA-Typen), Steigungswechsel und Trailing-Stops.
+* **MasterTree:** `category: "Swing Points/Dynamik & Filter"`
 
-## 1. Umgesetzte Änderungen
+# ==============================================================================
+# DEFINITION: srv_swing_momentum
+# ==============================================================================
+# NAME:        Swing Momentum Service
+# KATEGORIE:   Swing Points/Dynamik & Filter
+# BESCHREIBUNG: Wendepunkts-Erkennung über MA-Hysteresen, Steigungswechsel & Chande-Kroll
+# ==============================================================================
 
-### 1.1 `analytics/features/definitions/srv_grid_lines.py`
-* **Neue Modul-Konstante `_GRID_LINES_SCHEMA`** direkt nach den Imports (PineScript-Input-Zone unter dem Header-Docstring) – Inhalt = ehemaliges Inline-Schema der `parameter_schema`-Property (9 Keys: `step_size`, `steps_around`, `custom_levels`, `prox_level1..6`).
-* **`parameter_schema`-Property** gibt jetzt eine flache Kopie zurück: `{k: dict(v) for k, v in _GRID_LINES_SCHEMA.items()}` (M1: kein geteiltes mutable Dict, ABC-Vertrag `base_plugin.py:243–244` unverändert).
-* **Header-Docstring:** PARAMETER-Referenzblock ergänzt (verweist auf `_GRID_LINES_SCHEMA`, M4-Komfort).
+import pandas as pd
+from typing import Dict, Any
+from analytics.features.plugins.base_plugin import PluginFeature
 
-### 1.2 `analytics/features/definitions/srv_proximity.py`
-* **Neue Modul-Konstante `_PROXIMITY_SCHEMA`** direkt nach den Imports (3 Keys: `visit_pct`, `time_window_mins`, `use_time_filter`).
-* **`parameter_schema`-Property** → flache Kopie (`{k: dict(v) for k, v in _PROXIMITY_SCHEMA.items()}`).
-* **Header-Docstring:** PARAMETER-Referenzblock ergänzt (M4-Komfort; Hinweis: visuelle Parameter gehören zum Indikator).
+class SrvSwingMomentum(PluginFeature):
+    # INPUT-PARAMETER & DEFAULTS (PINESCRIPT-ZONE - KLASSENANFANG)
+    parameter_schema = {
+        "mode": {
+            "type": str,
+            "default": "MA_Peak_Hysteresis",
+            "options": ["MA_Peak_Hysteresis", "MA_Slope_Change", "Chande_Kroll_Ratchet"],
+            "description": "Algorithmus-Modus für Momentum-Swings"
+        },
+        "ma_type": {
+            "type": str,
+            "default": "EHMA",
+            "options": ["SMA", "EMA", "WMA", "DEMA", "TEMA", "HMA", "EHMA", "ZLEMA", "RMA", "KAMA", "ALMA", "VWMA"],
+            "description": "Gleitender Durchschnittstyp (MA-Template 16.04)"
+        },
+        "period": {"type": int, "default": 14, "min": 2, "description": "Berechnungsperiode für Glättungs-MA"},
+        "piv_maxMaMovePct": {
+            "type": float,
+            "default": 0.2,
+            "min": 0.01,
+            "description": "Erforderliche Gegenbewegung in % für MA Peak Pivot (gültig für alle ma_type-Optionen)"
+        },
+        "chande_lookback": {
+            "type": int,
+            "default": 10,
+            "min": 1,
+            "description": "Lookback-Periode für Highest-High/Lowest-Low im Chande_Kroll_Ratchet Modus"
+        },
+        "x_atr": {"type": float, "default": 3.0, "min": 0.5, "description": "ATR-Multiplikator für Chande Kroll Stops"}
+    }
 
-### 1.3 Bewusst NICHT verändert (gemäß M3/M5)
-* `chart/indicators/ind_fixed_grid_proximity.py`: bereits konform (`_FIXED_GRID_PROXIMITY_SCHEMA` am Dateianfang, Z. 108) – keine Änderung.
-* `chart/indicators/ind_moving_averages.py`: `_build_schema()` bleibt programmatisch (66 Keys, Schleife `for x in range(1, 9)`) – keine statische Ausrollung (Wartungsdesaster, test-geschützte Invarianzen M1).
-* `default_params`: bleibt generisch in den Basisklassen abgeleitet (M2), kein Ausrollen.
-* Keine DB-Migration, keine Änderung an `test/test.py` (M5).
+    plugin_id = "srv_swing_momentum"
+    plugin_version = "1.0.0"
+    
+    metadata = {
+        "display_name": "Swing Momentum Service",
+        "category": "Swing Points/Dynamik & Filter",
+        "description": "Dynamische Momentum-Swings via MA-Hysterese, Steigung & Chande Kroll"
+    }
 
-## 2. Verifikation (headless, Regel 4)
+    def calculate(self, df: pd.DataFrame, params: Dict[str, Any], context=None):
+        pass
 
-1. **`py_compile`:** `srv_grid_lines.py`, `srv_proximity.py` OK.
-2. **Gezielter Schema-Check** (`test/_tmp_160802_check.py`, danach entfernt): **14/14 PASS** – Konstanten == Property-Inhalt, flache Kopien (getrennte Dict-Objekte), Defaults korrekt (`step_size=0.5`, `visit_pct=0.05`, `prox_level1=0.0`), `description` je Key, `default_params` funktionsfähig (generische Basisableitung).
-3. **`test/test.py`** (offscreen): alle Tests grün; exakt dieselben 6 vorbestehenden Offscreen-Geometrie-Fehler (P2/P5/H3/H4/H5/H7) – keine Verhaltensänderung (M5 bestätigt).
-4. **Keine UI-/Regressionstests** (Regel 4).
-
-## 3. Abweichungen / Hinweise
-* Keine Abweichungen von den Review-Entscheidungen M1–M5.
-* `docs/Old/x_Roadmap_Phase16.md` wurde **nicht** angefasst (Anwender-Änderung, nicht Teil dieser Umsetzung).
-* `docs/x_Exports.md` bleibt unberührt (keine Quelle).
-
-## 4. Commit
-- Commit mit Signatur `Generated with [Continue](https://continue.dev)` + `Co-Authored-By: Continue <noreply@continue.dev>`.
-
-
-# 16.08.01 Nachtrag Bereinigung: Naming Conventions (`srv_` & `ind_`)
-
-## 1. Zielsetzung & Naming-Regeln
-Vereinheitlichung aller Dateinamen, Klassen-Identifier, Plugin-IDs und Datenbank-Einträge für Services und Indikatoren nach strikter Naming Convention.
-
-1. **Services (Plugins/Features):**
-   * **Präfix:** `srv_`
-   * **Regel:** Wörter wie `service`, `plugin` oder `feature` **entfallen** vollständig aus Dateinamen und Identifiern.
-   * **Beispiel:** `grid_lines_service.py` -> `srv_grid_lines.py` | `plugin_id = "grid_lines"` -> `plugin_id = "srv_grid_lines"`
-2. **Indikatoren:**
-   * **Präfix:** `ind_`
-   * **Regel:** Wörter wie `indicator` oder `ind` (doppelt) **entfallen** vollständig aus Dateinamen und Identifiern.
-   * **Beispiel:** `fixed_grid_proximity.py` -> `ind_fixed_grid_proximity.py` | `indicator_id = "fixed_grid_proximity"` -> `indicator_id = "ind_fixed_grid_proximity"`
 
 ---
 
-## 2. Zuordnung der Dateinamen & Identifier (Refactoring Matrix)
+### C. `srv_swing_volume_profile.py` (Volumen-, Grid- & VWAP-Swings)
 
-### A. Services (`analytics/features/definitions/`)
-| Alter Dateiname | Neuer Dateiname | Alte `plugin_id` | Neue `plugin_id` |
-| :--- | :--- | :--- | :--- |
-| `grid_lines_service.py` | `srv_grid_lines.py` | `grid_lines` | `srv_grid_lines` |
-| `proximity_service.py` | `srv_proximity.py` | `proximity` | `srv_proximity` |
-| `grid_levels.py` | `srv_grid_levels.py` | `grid_levels` | `srv_grid_levels` |
-| `ema_diff.py` | `srv_ema_diff.py` | `ema_diff` | `srv_ema_diff` |
-| `atr_normalized.py` | `srv_atr_normalized.py` | `atr_normalized` | `srv_atr_normalized` |
+* **Verwendungszweck:** Berechnet POC/VAH/VAL, Low Volume Nodes (LVNs), Raster-Annäherungen und Anchored VWAP Bänder.
+* **MasterTree:** `category: "Swing Points/Volumen & Grid"`
 
-### B. Indikatoren (`chart/indicators/`)
-| Alter Dateiname | Neuer Dateiname | Alte `indicator_id` | Neue `indicator_id` |
-| :--- | :--- | :--- | :--- |
-| `fixed_grid_proximity.py` | `ind_fixed_grid_proximity.py` | `fixed_grid_proximity` / `grid_liquidity` | `ind_fixed_grid_proximity` |
-| `multi_ma.py` | `ind_multi_ma.py` | `multi_ma` | `ind_multi_ma` |
+# ==============================================================================
+# DEFINITION: srv_swing_volume_profile
+# ==============================================================================
+# NAME:        Swing Volume Profile Service
+# KATEGORIE:   Swing Points/Volumen & Grid
+# BESCHREIBUNG: Berechnet POC/VAH/VAL, LVN-Rejections, Grid-Proximity und Anchored VWAP
+# ==============================================================================
+
+import pandas as pd
+from typing import Dict, Any
+from analytics.features.plugins.base_plugin import PluginFeature
+
+class SrvSwingVolumeProfile(PluginFeature):
+    # INPUT-PARAMETER & DEFAULTS (PINESCRIPT-ZONE - KLASSENANFANG)
+    parameter_schema = {
+        "mode": {
+            "type": str,
+            "default": "Volume_Profile",
+            "options": ["Volume_Profile", "Grid_Proximity", "Anchored_VWAP"],
+            "description": "Haupt-Berechnungsmodus"
+        },
+        "profile_period": {
+            "type": str,
+            "default": "Sessions",
+            "options": ["Bars", "Sessions", "Days", "Weeks", "Months"],
+            "description": "Profil-Zeitraum (nur aktiv bei mode == 'Volume_Profile')"
+        },
+        "period_val": {"type": int, "default": 1, "min": 1, "description": "Multiplier für profile_period"},
+        "volume_source": {
+            "type": str,
+            "default": "tick_volume",
+            "options": ["tick_volume", "real_volume"],
+            "description": "Volumenquelle aus MT5 (standardmäßig tick_volume)"
+        },
+        "volume_thresh_pct": {"type": float, "default": 5.0, "min": 0.5, "description": "Mindestvolumenanteil in % für Cluster"},
+        "value_area_pct": {"type": float, "default": 0.70, "min": 0.1, "max": 1.0, "description": "Value Area Abdeckung (0.70 = 70%)"},
+        "lvn_sensitivity": {"type": float, "default": 0.20, "min": 0.05, "description": "Schwellwert für Low Volume Nodes"},
+        "grid_step": {"type": float, "default": 0.5, "min": 0.01, "description": "Rasterabstand (nur bei mode == 'Grid_Proximity')"},
+        "vwap_anchor": {
+            "type": str,
+            "default": "Session_Start",
+            "options": ["Session_Start", "Week_Start", "Month_Start"],
+            "description": "Ankerpunkt (nur bei mode == 'Anchored_VWAP')"
+        },
+        "vwap_band_mult": {"type": float, "default": 2.0, "min": 0.1, "description": "StDev-Multiplikator für VWAP-Bänder"}
+    }
+
+    plugin_id = "srv_swing_volume_profile"
+    plugin_version = "1.0.0"
+    
+    metadata = {
+        "display_name": "Swing Volume Profile Service",
+        "category": "Swing Points/Volumen & Grid",
+        "description": "Volumengewichtetes Profil mit POC/VAH/VAL, LVNs, Grid & Anchored VWAP"
+    }
+
+    def calculate(self, df: pd.DataFrame, params: Dict[str, Any], context=None):
+        pass
+
 
 ---
 
-## 3. Schritt-für-Schritt-Anleitung für die IDE-AI
+## 4. Verbindlicher Feature-Store-Datenvertrag (`analytics.duckdb`)
 
-### Schritt 1: Physikalische Dateien umbenennen
-Benenne die Dateien in `analytics/features/definitions/` und `chart/indicators/` gemäß Tabelle in Abschnitt 2 um. Aktualisiere die jeweiligen `__init__.py`-Dateien in den beiden Ordnern mit den neuen Modulimporten.
+Jeder Service schreibt seine Ergebnisse strukturiert in das JSON-Feld `feature_data`.
 
-### Schritt 2: In-Code-Identifier & Metadaten anpassen
-1. In allen umbenannten `srv_*.py`-Dateien:
-   * Setze `plugin_id = "srv_<name>"` (z. B. `srv_grid_lines`).
-   * Falls `dependencies` angegeben sind, passe diese ebenfalls an (z. B. `dependencies = ["srv_grid_lines"]`).
-2. In allen umbenannten `ind_*.py`-Dateien:
-   * Setze `indicator_id = "ind_<name>"` (z. B. `ind_fixed_grid_proximity`).
-   * Passe `service_plugin_ids` an (z. B. `service_plugin_ids = ["srv_grid_lines", "srv_proximity"]`).
-3. Passe alle Code-Imports im Projekt an (`FeatureBuilder`, `LiveAnalyzer`, `HistoricalScanner`, `ServiceSelectorModel`, Tests).
-
-### Schritt 3: Datenbank-Migration (`app_data.duckdb` & `analytics.duckdb`)
-Füge in `state_manager.py` (`_init_db()`) eine idempotente Schema-Migration ein, um bestehende Presets, Window-States und Feature-Store-Einträge bruchfrei auf die neuen Präfixe umzustellen:
+### 4.1 Gemeinsamer Basisvertrag (Trägt jeder Record):
 
 
-# In StateManager._init_db():
-renames_plugins = {
-    "grid_lines": "srv_grid_lines",
-    "proximity": "srv_proximity",
-    "grid_levels": "srv_grid_levels",
-    "ema_diff": "srv_ema_diff",
-    "atr_normalized": "srv_atr_normalized",
+{
+  "result_type": "SWING | LEVEL | ZONE | REJECTION | VWAP",
+  "source_mode": "Williams_Fractal | MA_Peak_Hysteresis | Volume_Profile | ...",
+  "calculation_status": "OK | INSUFFICIENT_DATA | MISSING_MTF_CONTEXT",
+  
+  "is_swing_high": false,
+  "is_swing_low": false,
+  "is_rejection": false,
+  
+  "event_bar_time": 1770000000,
+  "confirmation_bar_time": 1770000120,
+  "confirmation_lag_bars": 2,
+  "confirmation_type": "FRACTAL | PIVOT | CAUSAL | SESSION_CLOSE | NONE",
+  
+  "price": 28.50,
+  "strength_value": 2.1,
+  "strength_type": "ATR_MULTIPLE | PERCENT | PRICE_DISTANCE | VOLUME_RATIO | NORMALIZED"
 }
-renames_indicators = {
-    "fixed_grid_proximity": "ind_fixed_grid_proximity",
-    "grid_liquidity": "ind_fixed_grid_proximity",
-    "multi_ma": "ind_multi_ma",
-}
-
-# 1. indicator_presets mappen
-for old_id, new_id in renames_indicators.items():
-    con.execute("UPDATE indicator_presets SET indicator_id = ? WHERE indicator_id = ?", [new_id, old_id])
-
-for old_id, new_id in renames_plugins.items():
-    con.execute("UPDATE indicator_presets SET plugin_id = ? WHERE plugin_id = ?", [new_id, old_id])
-
-# 2. analytics.duckdb -> feature_store.feature_id mappen
-con_analytics = DbPool.get(DB_ANALYTICS)
-for old_id, new_id in renames_plugins.items():
-    con_analytics.execute("UPDATE feature_store SET feature_id = ? WHERE feature_id = ?", [new_id, old_id])
 
 
+### 4.2 Modus-Spezifische Zusatzfelder:
 
-### Schritt 4: Header-Standardisierung
-
-Stelle sicher, dass in allen umbenannten Dateien ganz oben ein einheitlicher Kommentar-Header vorhanden ist:
-
-
-# ==============================================================================
-# DEFINITION: [srv_grid_lines / ind_fixed_grid_proximity]
-# ==============================================================================
-# NAME:        [z. B. Grid Lines Service]
-# KATEGORIE:   [z. B. Swing Points/Preis-Grid]
-# BESCHREIBUNG: [Kurze Beschreibung]
-#
-# PARAMETER:
-#   - step_size (float, Def: 0.5): Schrittweite der Grid-Rasterlinien
-# ==============================================================================
+* **Bei `srv_swing_volume_profile` (Volume_Profile):**
+* `volume_source`: `"tick_volume" | "real_volume"`
+* `poc_price`: `float` | `null`
+* `vah_price`: `float` | `null`
+* `val_price`: `float` | `null`
+* `lvn_price`: `float` | `null`
+* `is_lvn_swing`: `bool`
 
 
-## 4. Verifikation (Harte Projekt-Regeln)
-
-1. **Statischer Check (Keine UI-Tests):**
-
-python -m py_compile analytics/features/definitions/srv_*.py chart/indicators/ind_*.py state_manager.py
+* **Bei `srv_swing_volume_profile` (Grid_Proximity):**
+* `grid_price`: `float`
 
 
+* **Bei `srv_swing_volume_profile` (Anchored_VWAP):**
+* `vwap_price`: `float`
+* `vwap_upper`: `float`
+* `vwap_lower`: `float`
 
+---
 
-2. **Backend-/DB-Test in `test/test.py`:**
-* Teste das Laden von Plugins über `PluginRegistry().get("srv_grid_lines")`.
-* Teste das Laden von Indikator-Presets mit den neuen `ind_`-Präfixen.
-* **Rule 4:** Keine GUI starten; Verifikation erfolgt per Terminal/py_compile.
+## 5. Verifikation & Harte Regeln
 
+1. **Statischer Syntax-Check (keine UI-Tests):**
 
+python -m py_compile analytics/features/definitions/srv_swing_structure.py analytics/features/definitions/srv_swing_momentum.py analytics/features/definitions/srv_swing_volume_profile.py
 
+2. **Backend-Integrationstest in `test/test.py`:**
+* Prüfe Registrierung über `PluginRegistry().get("srv_swing_structure")` (definiert in `analytics/features/feature_builder.py`).
+* Prüfe Baumaufbau in `ServiceSelectorModel().build_tree()` (definiert in `analytics/engine/service_selector_model.py`).
+
+3. **Keine GUI-/UI-Tests ausführen (Harte Regel 4).**
+
+---
+
+## 6. Konsistenzprüfung & Entscheidungen (07.08.2026, 17:44) – 17.01 Review
+
+> **Implementierungs-Log (Review, kein Coding):** Am 07.08.2026 wurde Kapitel 17.01 gegen den realen Quellcode und `data/analytics.duckdb` geprüft (Schema-Abfragen, Write-/Lese-Pfade, `base_plugin.py`, bestehende Service-Muster `srv_grid_lines`/`srv_proximity`, DuckDB-Fähigkeiten). Ergebnis: **Kapitel ist inhaltlich stimmig, aber §2.5 (PK) ist ein Migrations-Ziel und die Service-Snippets in §3 weichen in 4 Punkten von den Laufzeit-Konventionen ab.** Die folgenden Entscheidungen sind **verbindlich** für die Umsetzung; es wurde kein Code geändert.
+
+### E-1 (BLOCKER): `feature_store`-PK-Migration auf `(symbol, timeframe, bar_time, feature_id)`
+
+* **Befund:** Ist-PK = `(symbol, timeframe, bar_time)`; `feature_id` ist NULLABLE. Damit kann heute **max. 1 Service je Bar** gespeichert werden (letzter Writer gewinnt). `data/analytics.duckdb`: 677.713 Zeilen – `srv_proximity` 593.627, `srv_grid_lines` 81.086, native Rows ohne feature_id 3.000.
+* **Befund (DuckDB 1.5.5):** `ALTER TABLE ... DROP PRIMARY KEY` wird **nicht** unterstützt (ParserError, verifiziert). Einzig praktikables Verfahren ist **Table-Rewrite + RENAME** (verifiziert in `test/check_pk_migration.py`).
+* **Migrations-Schritt 17.01.0 (verbindliche Reihenfolge):**
+  1. Backup: Git-Tag `phase17_step0` + Kopie von `data/analytics.duckdb` nach `data/backup_analytics_20260807.duckdb`.
+  2. Sentinel für native Alt-Rows: `UPDATE feature_store SET feature_id = 'native' WHERE feature_id IS NULL;`
+  3. `CREATE TABLE feature_store_new` mit **identischer Spaltenliste** (alle 30 Spalten) + `feature_id VARCHAR NOT NULL` + `PRIMARY KEY (symbol, timeframe, bar_time, feature_id)`.
+  4. `INSERT INTO feature_store_new (…) SELECT … FROM feature_store;` (Spalten 1:1, feature_id bereits durch Schritt 2 gesetzt).
+  5. `DROP TABLE feature_store;` + `ALTER TABLE feature_store_new RENAME TO feature_store;`
+  6. **Write-Pfade in `analytics/features/feature_builder.py` umstellen** (sonst BinderException nach Migration):
+     * `store_plugin_payload()`: `ON CONFLICT (symbol, timeframe, bar_time)` → `ON CONFLICT (symbol, timeframe, bar_time, feature_id)`.
+     * `store_features()` (nativer Pfad): Insert-Spalten um `feature_id` erweitern (Wert `'native'` je Zeile) und Konfliktziel auf 4 Spalten.
+  7. **Reader-Exclusions für den Sentinel `'native'`** (sonst erscheint er in UI-Listen): `feature_store_reader.get_available_features()` und `fetch_last_execution_dates()` um `AND feature_id != 'native'` ergänzen (`statistics_repository.get_available_sets()` filtert bereits über `feature_data IS NOT NULL` – native Rows bleiben dort automatisch außen vor).
+* **Verifikation:** Test in `test/test.py`: (a) 2 Services auf derselben Bar koexistieren nach Migration (4-Spalten-Upsert), (b) 3-Spalten-`ON CONFLICT` wirft nach Migration BinderException, (c) `feature_id != 'native'`-Filter liefert keine Sentinel-IDs.
+
+### E-2: `parameter_schema` – String-Typen statt Klassen
+
+* **Befund (verifiziert):** Die Snippets in §3 verwenden `"type": str/int/float` (Klassen). `base_plugin.validate_params()` prüft aber `p_type == "float"` **string-vergleichend** → Klassen-Typen werden **nicht** konvertiert (`validate_params({'atr_mult': '2.5'})` liefert den String `'2.5'`). Bestehende Services (`_GRID_LINES_SCHEMA`, `_PROXIMITY_SCHEMA`) verwenden korrekt `"type": "float"`.
+* **Entscheidung:** Alle `type`-Werte in den 3 Services als **Strings** `"float" | "int" | "bool" | "str"` deklarieren (Konvention `ParameterSchema`/`base_plugin.py`).
+
+### E-3: `parameter_schema` – Modul-Konstante + flache Kopie (M1)
+
+* **Befund:** Klassenattribut-Dict im Snippet = geteiltes mutable Dict (Verletzung der M1-Regel „kein geteiltes mutable Dict über Instanzen", dokumentiert in `srv_grid_lines.py`/`srv_proximity.py`).
+* **Entscheidung:** PineScript-Input-Zone bleibt am Dateianfang, aber als **Modul-Konstante** `_SWING_STRUCTURE_SCHEMA` / `_SWING_MOMENTUM_SCHEMA` / `_SWING_VOLUME_PROFILE_SCHEMA`; `parameter_schema` als Property, die `{k: dict(v) for k, v in _SCHEMA.items()}` zurückgibt (exakt das bestehende Muster).
+
+### E-4: `plugin_version` entfällt; `version`-Property bleibt (Basis-Default)
+
+* **Befund:** `plugin_version = "1.0.0"` im Snippet ist toter Ballast – die Basisklasse liefert `version` (= `"1.0.0"`), und die Payloads bauen mit `self.version` (`store_plugin_payload` liest `payload["plugin_version"]`).
+* **Entscheidung:** Snippets korrigieren: `version` als Property (nur überschreiben, falls abweichend), `plugin_version`-Attribut **streichen**. `plugin_id` als Property im bestehenden Stil (`@property def plugin_id`) ODER Klassenattribut ist zulässig (funktioniert, verifiziert), Konvention ist die Property.
+
+### E-5: `capabilities` explizit deklarieren (reine Datenlieferanten)
+
+* **Befund:** Snippets definieren kein `capabilities` → es würden die Basis-Defaults `chart=True, live=True, render=True` erben; der MasterTree zeigte dann irreführend „📌 im \<Service>" obwohl §1 explizit „keine Chart-Visualisierung in diesem Kapitel" fordert.
+* **Entscheidung:** Alle 3 Services deklarieren explizit:
+  `capabilities = {"chart": False, "batch": True, "live": False, "feature_store": True, "render": False}`
+  (analog `srv_grid_lines`/`srv_proximity`, zusätzlich `chart=False`, da noch kein Indikator existiert). `indicator_name`/`indicator_id` in `metadata` entfallen bis zur Indikator-Phase (Open/Closed: dann neue `ind_...`-Datei).
+
+### E-6: `metadata` vollständig (Vollschema analog bestehender Services)
+
+* **Befund:** Snippet-`metadata` enthält nur `display_name`/`category`/`description`; die Basis-Defaults (`author`, `tags`, `description_long`, `condition_rules`, `api_version`) greifen bei Klassenattribut-Override nicht.
+* **Entscheidung:** Alle 3 Services liefern das Vollschema (Keys analog `srv_grid_lines`/`srv_proximity`), inkl. `description_long` und `condition_rules` je Modus.
+
+### E-7: `schema_version`-Pflichtfeld im Datenvertrag (§4 ergänzen)
+
+* **Befund:** `base_plugin.py` (Phase 15 U15-A1, Invariante 5): `schema_version` ist **Pflichtfeld** für alle Plugins mit `feature_store=True`; der Reader (`feature_store_reader._normalize_feature_data`) setzt nur den Default für Alt-Rows. §4 spezifiziert es nicht.
+* **Entscheidung:** §4.1 ergänzen: Jeder `feature_store_payload.metadata` trägt `"schema_version": "1.0.0"` (SemVer major.minor.patch, exakt wie `srv_grid_lines`/`srv_proximity`). Optionales Feld `statistics` (P16.01 `status_info`-Semantik) wird als erlaubt deklariert, ist aber kein Pflichtfeld.
+
+### E-8: Verifikation §5 erweitern
+
+* `py_compile` zusätzlich auf `analytics/features/feature_builder.py` und `analytics/engine/feature_store_reader.py` (geänderte Pfade aus E-1).
+* Test in `test/test.py`: Koexistenz zweier Swing-Services auf derselben Bar (PK-Migration), `PluginRegistry().get(...)` für alle 3 IDs, `build_tree()` enthält die Kategorien `Swing Points/Geometrie`, `Swing Points/Dynamik & Filter`, `Swing Points/Volumen & Grid`.
+* Test-Cleanup nach Abschluss des Kapitels (Invariante 10): nur `test/test.py` bleibt bestehen; `test/check_pk_migration.py` wird als Referenz für E-1 während der Umsetzung vorgehalten und danach entfernt.
+
+### Ergebnis der Prüfung (sonstige Bereiche)
+
+* §1, §2 (1–4), §3-Kategorien, §4-Vertragsfelder und §5-Prüfpunkte sind **konsistent** mit `base_plugin.py`, `PluginLoader` (Dateinamen-unabhängige Discovery), `PluginRegistry`, `ServiceSelectorModel._category_parts` (Slash-Pfade) und den bestehenden Service-Mustern.
+* Lese-Pfade (`feature_store_reader`, `statistics_repository`, `analytics_repository`) filtern über `feature_id`/`bar_time` und bleiben nach E-1 funktionsfähig – einzige Anpassung sind die Sentinel-Exclusions (E-1.7).
+* Klassenname `SrvSwingStructure` funktioniert (Discovery über `issubclass(PluginFeature)`, `inspect.isabstract`); optional wäre `SwingStructureService` (Muster `GridLinesService`/`ProximityService`) – keine Pflichtänderung.
