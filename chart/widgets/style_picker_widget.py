@@ -60,7 +60,8 @@ class StylePickerWidget(QWidget):
     """Kombinierter Stil-Waehler: Sichtbarkeit + Farbe + Staerke/Groesse + Art.
 
     Kapselt intern:
-      1. QCheckBox  (Sichtbarkeit `show`)
+      1. QCheckBox  (Sichtbarkeit `show`) – per `show_visibility=False`
+         ausblendbar (Sichtbarkeit steuert dann ein separater `show_*`-Param)
       2. kleiner Farb-Button (Farbe `color` via QColorDialog, optional Alpha)
       3. QSpinBox   (Linienstaerke `width` bzw. Markergroesse `size`)
       4. QComboBox  (Linienart `style` bzw. Marker-Form `shape`)
@@ -85,16 +86,23 @@ class StylePickerWidget(QWidget):
         parent=None,
         style_type: str = "line",
         color_only: bool = False,
+        show_visibility: bool = True,
     ) -> None:
         super().__init__(parent)
         self._enable_alpha: bool = bool(enable_alpha)
         # color_only (Bugfix 06.08.2026): Reiner Farbwaehler - das Composite
         # (Sichtbarkeits-Checkbox, Linienstaerke/Groesse, Linienart/Markerform)
         # wird NICHT angezeigt. Verwendet fuer reine Farb-Parameter (z.B.
-        # Multi-MA maX_color), deren Sichtbarkeit ein separater 'show_*'-
+        # Multi-MA ma1_bear_color), deren Sichtbarkeit ein separater 'show_*'-
         # Parameter steuert. get_style() liefert weiterhin ein Style-Objekt
         # (Defaults fuer show/width/style) - der Dialog liest nur .color.
         self._color_only: bool = bool(color_only)
+        # show_visibility (Phase 16.06, 07.08.2026): Blendet die interne
+        # 'sichtbar'-Checkbox aus, wenn die Sichtbarkeit ueber einen separaten
+        # 'show_*'-Parameter laeuft (Multi-MA: show_maX, FixedGridProximity:
+        # show_lines/show_circles). get_style() liefert dann immer show=True.
+        # Damit entfaellt die doppelte Sichtbarkeits-Steuerung im Dialog.
+        self._show_visibility: bool = bool(show_visibility)
         # style_type: "line" (LineStyle) | "marker" (MarkerStyle)
         self._style_type: str = "marker" if style_type == "marker" else "line"
         if self._style_type == "marker":
@@ -168,7 +176,8 @@ class StylePickerWidget(QWidget):
         layout.setSpacing(4)
         # color_only: NUR den Farb-Button anzeigen (kein Composite).
         if not self._color_only:
-            layout.addWidget(self._show_check)
+            if self._show_visibility:
+                layout.addWidget(self._show_check)
             layout.addWidget(self._color_btn)
             layout.addWidget(self._width_spin)
             layout.addWidget(self._style_combo)
@@ -197,6 +206,17 @@ class StylePickerWidget(QWidget):
         """
         return self._color_only
 
+    @property
+    def show_visibility(self) -> bool:
+        """True = interne 'sichtbar'-Checkbox wird angezeigt (Default).
+
+        False = Checkbox ausgeblendet; get_style() liefert dann immer
+        show=True, weil die Sichtbarkeit ein separater 'show_*'-Parameter
+        steuert (Multi-MA: show_maX, FixedGridProximity: show_lines/
+        show_circles).
+        """
+        return self._show_visibility
+
     def get_style(self) -> Union[LineStyle, MarkerStyle]:
         """Liefert den aktuellen Stil als NEUES Style-Objekt (LineStyle bei
         style_type='line', MarkerStyle bei style_type='marker').
@@ -206,13 +226,13 @@ class StylePickerWidget(QWidget):
         """
         if self._style_type == "marker":
             return MarkerStyle(
-                show=self._show_check.isChecked(),
+                show=(self._show_check.isChecked() if self._show_visibility else True),
                 color=self._color_button_value(),
                 shape=str(self._style_combo.currentText()),
                 size=int(self._width_spin.value()),
             )
         return LineStyle(
-            show=self._show_check.isChecked(),
+            show=(self._show_check.isChecked() if self._show_visibility else True),
             color=self._color_button_value(),
             width=int(self._width_spin.value()),
             style=str(self._style_combo.currentText()),

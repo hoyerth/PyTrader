@@ -41,6 +41,7 @@ import pandas as pd
 
 from .base_indicator import BaseIndicator
 from .utils.ma_template import MATemplateEngine, MA_TYPES, resolve_bull_color
+from chart.overlays.style_models import LINE_STYLES
 
 # ---------------------------------------------------------------------------
 # Konstanten & Defaults (Entscheidungen D4/D7)
@@ -91,6 +92,13 @@ def _as_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _line_style(value: Any, default: str = "solid") -> str:
+    """Phase 16.06 (07.08.2026): Validiert eine Linienart gegen LINE_STYLES
+    (tolerant: ungueltige Werte fallen auf den Default zurueck)."""
+    s = str(value or default)
+    return s if s in LINE_STYLES else default
 
 
 class MultiMovingAverageIndicator(BaseIndicator):
@@ -188,27 +196,55 @@ class MultiMovingAverageIndicator(BaseIndicator):
                     "default": _MA_COLORS[1],
                     "description": "MA 1 Farbe steigend",
                     "style_type": "line",
-                    # Bugfix (06.08.2026): REINER Farbwaehler - KEIN
-                    # StylePickerWidget-Composite (keine 'sichtbar'-Checkbox,
-                    # keine Linienart/-staerke). Die Sichtbarkeit steuert
-                    # ausschliesslich show_maX (Anzeige-Checkbox).
-                    "color_only": True,
+                    # Phase 16.06 (07.08.2026): VOLLER LineStyle-Picker
+                    # (Farbe + Breite + Linienart) statt color_only-Farbwaehler.
+                    # Breite/Art der bull-Farbe gelten fuer die gesamte MA1-
+                    # Linie (auch bear-Segmente). Die Sichtbarkeit steuert
+                    # weiterhin show_ma1 (daher show_visibility=False -> keine
+                    # doppelte 'sichtbar'-Checkbox im Dialog).
+                    "show_visibility": False,
+                }
+                # Phase 16.06 (07.08.2026): Sibling-Defaults des MA1-LineStyle-
+                # Pickers (Konvention 'color' -> 'style'/'width' in
+                # indicator_dialog). NICHT in parameter_order -> keine eigenen
+                # Controls. Sie liefern die Default-Params (Breite 2 / solid),
+                # damit der Picker und der Render konsistent initialisieren.
+                schema["ma1_bull_width"] = {
+                    "type": "int", "default": _MA1_WIDTH, "min": 1, "max": 10,
+                    "step": 1, "description": "MA 1 Linienstärke (px)",
+                }
+                schema["ma1_bull_style"] = {
+                    "type": "choice", "options": list(LINE_STYLES),
+                    "default": _LINE_STYLE, "description": "MA 1 Linienart",
                 }
                 schema["ma1_bear_color"] = {
                     "type": "color",
                     "default": _MA1_BEAR_COLOR,
                     "description": "MA 1 Farbe fallend (dual_color)",
                     "style_type": "line",
+                    # Nur Farbe (color_only): Breite/Art der MA1-Linie steuert
+                    # der bull-Picker (ma1_bull_style/ma1_bull_width).
                     "color_only": True,
                 }
             else:
-                # MA2..8: einfarbig (kein dual_color/bear_color).
+                # MA2..8: einfarbig (kein dual_color/bear_color). Voller
+                # LineStyle-Picker (Phase 16.06) - Farbe/Breite/Linienart ueber
+                # die Sibling-Keys maX_width/maX_style (NICHT in parameter_order
+                # -> keine eigenen Controls, der Picker bedient sie direkt).
                 schema[f"{prefix}_color"] = {
                     "type": "color",
                     "default": _MA_COLORS[x],
                     "description": f"MA {x} Farbe",
                     "style_type": "line",
-                    "color_only": True,
+                    "show_visibility": False,
+                }
+                schema[f"{prefix}_width"] = {
+                    "type": "int", "default": _MA_WIDTH, "min": 1, "max": 10,
+                    "step": 1, "description": f"MA {x} Linienstärke (px)",
+                }
+                schema[f"{prefix}_style"] = {
+                    "type": "choice", "options": list(LINE_STYLES),
+                    "default": _LINE_STYLE, "description": f"MA {x} Linienart",
                 }
         return schema
 
@@ -393,14 +429,23 @@ class MultiMovingAverageIndicator(BaseIndicator):
                 colors = MATemplateEngine.build_color_series(
                     ma_series, dual_color, bull_color, bear_color
                 )
-                width = _MA1_WIDTH
+                # Phase 16.06 (07.08.2026): Breite/Linienart aus dem
+                # LineStyle-Picker (Sibling-Keys ma1_bull_style/ma1_bull_width,
+                # vom StylePickerWidget an ma1_bull_color gebunden) - Fallback
+                # auf die Konstanten (Old-Presets ohne Sibling-Keys).
+                width = _as_int(params.get("ma1_bull_width"), _MA1_WIDTH)
+                line_style = _line_style(params.get("ma1_bull_style"), _LINE_STYLE)
                 title = f"MA1 {str(ma_type).upper()} {period}"
             else:
                 # MA2..8: einfarbige Farbliste (maX_color).
                 color = str(params.get(f"{prefix}_color") or _MA_COLORS[x])
                 n = len(ma_series)
                 colors = [color] * n
-                width = _MA_WIDTH
+                # Phase 16.06 (07.08.2026): Breite/Linienart aus dem
+                # LineStyle-Picker (Sibling-Keys maX_style/maX_width) -
+                # Fallback auf die Konstanten.
+                width = _as_int(params.get(f"{prefix}_width"), _MA_WIDTH)
+                line_style = _line_style(params.get(f"{prefix}_style"), _LINE_STYLE)
                 title = f"MA{x} {str(ma_type).upper()} {period}"
 
             # Aktive Glättung im Linien-Titel sichtbar machen (Chart-Legende).
@@ -415,7 +460,7 @@ class MultiMovingAverageIndicator(BaseIndicator):
                 "id": prefix,
                 "data": data,
                 "width": width,
-                "style": _LINE_STYLE,
+                "style": line_style,
                 "title": title,
             })
         return {"lines": lines}

@@ -110,24 +110,23 @@ _FIXED_GRID_PROXIMITY_SCHEMA: Dict[str, Dict[str, Any]] = {
     "proximity_threshold": {"type": "float", "default": 0.05, "min": 0.001, "max": 10.0, "step": 0.005, "description": "Toleranzschwelle"},
     "use_time_filter": {"type": "bool", "default": True, "description": "Time Filter aktiv (Zeitfenster um ganze/halbe Stunde)"},
     "time_window_mins": {"type": "int", "default": 5, "min": 0, "max": 30, "step": 1, "description": "Time Filter Minuten (0 oder 30 um ganze/halbe Stunde)"},
-    "line_color": {"type": "color", "default": "#2196F3", "description": "Farbe Grid-Linien", "style_type": "line"},
-    # P16.03-Bugfix (06.08.2026): Linienart/-staerke werden NICHT als eigene
-    # Controls gerendert (nicht in parameter_order) - der StylePickerWidget
-    # (line-Modus) steuert sie direkt ueber die Geschwister-Keys (Konvention
-    # 'color' -> 'style'/'width'). Old-Presets ohne diese Keys fallen auf die
-    # Defaults zurueck (solid / 1 px).
-    "line_style": {"type": "choice", "options": list(LINE_STYLES), "default": "solid", "description": "Linienart"},
-    "line_width": {"type": "int", "default": 1, "min": 1, "max": 10, "step": 1, "description": "Linienstärke (px)"},
-    "circle_color_std": {"type": "color", "default": "#FFEB3B", "description": "Farbe Standard-Hit (im Zeitfenster)", "style_type": "marker"},
-    "circle_color_active": {"type": "color", "default": "#E91E63", "description": "Farbe Hit in Aktivitätsfenster", "style_type": "marker"},
-    # P16.03-Bugfix (06.08.2026): Marker-Form/-Groesse werden NICHT als eigene
-    # Controls gerendert (nicht in parameter_order) - der StylePickerWidget
-    # steuert sie direkt ueber die Geschwister-Keys (Konvention 'color' ->
-    # 'shape'/'size'). Old-Presets ohne diese Keys fallen auf die Defaults zurueck.
-    "circle_shape_std": {"type": "choice", "options": list(MARKER_SHAPES), "default": "circle", "description": "Symbol Standard-Hit (im Zeitfenster)"},
-    "circle_shape_active": {"type": "choice", "options": list(MARKER_SHAPES), "default": "circle", "description": "Symbol Aktiv-Hit (ausserhalb)"},
-    "circle_size_std": {"type": "int", "default": 6, "min": 1, "max": 20, "step": 1, "description": "Groesse Standard-Hit (px)"},
-    "circle_size_active": {"type": "int", "default": 6, "min": 1, "max": 20, "step": 1, "description": "Groesse Aktiv-Hit (px)"},
+    "line_color": {"type": "color", "default": "#2196F3", "description": "Farbe Grid-Linien", "style_type": "line", "show_visibility": False},
+    # Phase 16.06 (07.08.2026): Die Einzelfeld-Deklarationen line_style /
+    # line_width wurden ENTFERNT - Linienart/-staerke werden ausschliesslich
+    # ueber den LineStyle-Picker (Sibling-Keys, Konvention 'color' ->
+    # 'style'/'width' in indicator_dialog) bedient und persistiert.
+    # Old-Presets ohne diese Keys fallen in _build_style_objects auf die
+    # Defaults zurueck (solid / 1 px). show_visibility=False: die interne
+    # 'sichtbar'-Checkbox des Pickers entfaellt - Sichtbarkeit steuert der
+    # separate Param show_lines.
+    "circle_color_std": {"type": "color", "default": "#FFEB3B", "description": "Farbe Standard-Hit (im Zeitfenster)", "style_type": "marker", "show_visibility": False},
+    "circle_color_active": {"type": "color", "default": "#E91E63", "description": "Farbe Hit in Aktivitätsfenster", "style_type": "marker", "show_visibility": False},
+    # Phase 16.06 (07.08.2026): Die Einzelfeld-Deklarationen circle_shape_* /
+    # circle_size_* wurden ENTFERNT - Marker-Form/-Groesse werden
+    # ausschliesslich ueber den MarkerStyle-Picker (Sibling-Keys, Konvention
+    # 'color' -> 'shape'/'size') bedient und persistiert. Old-Presets ohne
+    # diese Keys fallen in _build_style_objects auf die Defaults zurueck
+    # (circle / 6 px).
     "show_lines": {"type": "bool", "default": True, "description": "Grid-Linien anzeigen"},
     "show_circles": {"type": "bool", "default": True, "description": "Hits anzeigen"},
     "prox_level1": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 1"},
@@ -241,6 +240,10 @@ class FixedGridProximityIndicator(BaseIndicator):
 
     @property
     def param_labels(self) -> Dict[str, str]:
+        # Phase 16.06 (07.08.2026): Die Labels line_style/line_width/
+        # circle_shape_*/circle_size_* wurden entfernt - diese Einzelfelder
+        # existieren nicht mehr als Schema/Controls, sie werden ausschliesslich
+        # ueber den StylePicker bedient (Sibling-Keys).
         return {
             "lookback": "Lookback (Scan-Fenster)",
             "grid_step": "Rasterabstand",
@@ -248,14 +251,8 @@ class FixedGridProximityIndicator(BaseIndicator):
             "use_time_filter": "Time Filter aktiv",
             "time_window_mins": "Time Filter Minuten (0/30)",
             "line_color": "Linien-Farbe",
-            "line_style": "Linienart",
-            "line_width": "Linienstärke (px)",
             "circle_color_std": "Std-Hit-Farbe (im Fenster)",
             "circle_color_active": "Aktiv-Hit-Farbe (ausserhalb)",
-            "circle_shape_std": "Symbol Std-Hit",
-            "circle_shape_active": "Symbol Aktiv-Hit",
-            "circle_size_std": "Groesse Std-Hit (px)",
-            "circle_size_active": "Groesse Aktiv-Hit (px)",
             "show_lines": "Linien anzeigen",
             "show_circles": "Circles anzeigen",
             "prox_level1": "Level 1",

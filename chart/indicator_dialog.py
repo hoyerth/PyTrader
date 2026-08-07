@@ -401,7 +401,20 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		self.plugin_labels: Dict[str, str] = {}
 
 		self.setWindowTitle(f"Einstellungen - {self.indicator.display_name}")
-		self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+		# Phase 16.06 (07.08.2026): Fenster-Flags - der '?'-Button (ContextHelp)
+		# entfaellt; das Window-X (Schliessen) wird GARANTIERT gesetzt.
+		# Empirisch (PySide6/Windows): Ein QDialog mit Parent liefert
+		# windowFlags()=Dialog|TitleHint|SystemMenuHint (OHNE CloseButtonHint)
+		# und ein OR mit Qt.WindowCloseButtonHint wird von Qt wieder verworfen
+		# (bleibt 12291 -> kein X). Einzig das EXPLIZITE Setzen aller Hints
+		# setzt das X zuverlaessig (flags=134230019, Close=True). Diese eine
+		# zentrale Stelle gilt generisch fuer ALLE Indikator-Prop-Fenster.
+		self.setWindowFlags(
+			Qt.Dialog
+			| Qt.WindowTitleHint
+			| Qt.WindowSystemMenuHint
+			| Qt.WindowCloseButtonHint
+		)
 
 		self.param_controls: Dict[str, QWidget] = {}
 		# Phase 13 Schritt 5 Punkt 4: Fenster & Boxen sind vollständig dynamisch –
@@ -586,8 +599,17 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			# marker-Modus nicht verloren geht (Typ-Mismatch im Widget würde
 			# sonst auf die Default-Farbe zurueckfallen).
 			style_type = str(spec.get("style_type", "line"))
+			# Phase 16.06 (07.08.2026): Die interne 'sichtbar'-Checkbox des
+			# StylePickerWidget kann per Schema-Flag 'show_visibility' (Default
+			# True) ausgeblendet werden - fuer Parameter, deren Sichtbarkeit ein
+			# separater 'show_*'-Param steuert (Multi-MA: show_maX,
+			# FixedGridProximity: show_lines/show_circles). Damit entfaellt die
+			# doppelte Sichtbarkeits-Steuerung im Dialog (get_style() liefert
+			# dann show=True; die Persistenz bleibt unveraendert: color +
+			# Sibling-Keys style/width bzw. shape/size).
+			show_visibility = bool(spec.get("show_visibility", True))
 			# Bugfix (06.08.2026): Reiner Farbwaehler (color_only im Schema,
-			# z.B. Multi-MA maX_color) - KEIN StylePickerWidget-Composite.
+			# z.B. Multi-MA ma1_bear_color) - KEIN StylePickerWidget-Composite.
 			# Diese Farb-Parameter besitzen keine Geschwister-Keys
 			# (style/width bzw. shape/size) und keine eigene
 			# Sichtbarkeits-Checkbox (die steuert show_maX).
@@ -598,7 +620,8 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 					style_obj = LineStyle(color=str(val))
 				ctrl = StylePickerWidget(
 					style=style_obj, enable_alpha=allow_alpha,
-					style_type=style_type, color_only=True)
+					style_type=style_type, color_only=True,
+					show_visibility=show_visibility)
 				ctrl.style_changed.connect(self.on_param_control_changed)
 				return ctrl
 			if style_type == "marker":
@@ -635,7 +658,7 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 					except (TypeError, ValueError):
 						width_val = 1
 				style_obj = LineStyle(color=str(val), style=style_val, width=width_val)
-			ctrl = StylePickerWidget(style=style_obj, enable_alpha=allow_alpha, style_type=style_type)
+			ctrl = StylePickerWidget(style=style_obj, enable_alpha=allow_alpha, style_type=style_type, show_visibility=show_visibility)
 			ctrl.style_changed.connect(self.on_param_control_changed)
 			return ctrl
 
