@@ -11,15 +11,16 @@ WICHTIG (Entscheidungen 06.08.2026, Doku-Analyse 16.04):
   * MAType = TradingView-konformer 12er-Satz in exakter Reihenfolge
     (E2): SMA, EMA, WMA, DEMA, TEMA, HMA, EHMA, ZLEMA, RMA, KAMA, ALMA, VWMA.
   * Defaults (E3): ma_type="EHMA", period=4, alpha_factor=2.0,
-    smooth_type=" - no Smoothing", smooth_length=3, dual_color=False,
-    bull_color="#2196F3", bear_color="#EF5350".
+    smoothing=10, dual_color=False, bull_color="#2196F3",
+    bear_color="#EF5350".
   * Alpha-MAs (E4): DEMA, TEMA, EHMA verwenden den dynamischen Decay-Faktor
     alpha = alpha_factor / (period + 1).
   * VWMA (E5): ohne gültiges Volumen (fehlend/Null) Fallback auf SMA.
-  * smooth_type/smooth_length (Bugfix 07.08.2026): Schema-Vertrag für die
-    optionale zweite Glättung (MA auf MA). " - no Smoothing" (Default) =
-    keine Glättung. Konsumenten (z.B. Multi-MA) führen den zweiten Pass
-    über calculate_ma(ma_series, smooth_type, smooth_length) aus.
+  * smoothing (Vertrag B, 16.04 Schritt 5): optionaler zweiter EMA-Pass
+    über die Basis-MA-Serie (auf alle 12 Typen anwendbar). smoothing > 1 =
+    aktiv (ema_first = EMA(base, span=smoothing); base = EMA(ema_first,
+    alpha=alpha_calc) mit alpha_calc = alpha_factor / (period + 1));
+    smoothing <= 1 = keine Glättung (Basis-Serie unverändert).
   * bull_color-Default bedingt (E7/Ergänzung 2): Schema liefert "#2196F3";
     der Konsument wendet "#26A69A" an, wenn dual_color=True UND bull_color
     nicht vom User gesetzt wurde (leer/None).
@@ -346,19 +347,13 @@ class MATemplateEngine:
                 "step": 1,
                 "description": "MA-Periode",
             },
-            "smooth_type": {
-                "type": "choice",
-                "options": [" - no Smoothing"] + list(MA_TYPES),
-                "default": " - no Smoothing",
-                "description": "Smoothing-Typ (' - no Smoothing' = keine Glättung)",
-            },
-            "smooth_length": {
+            "smoothing": {
                 "type": "int",
-                "default": 3,
-                "min": 1,
+                "default": 10,
+                "min": 0,
                 "max": 500,
                 "step": 1,
-                "description": "Glättungslänge (zweiter MA-Pass über die MA-Serie)",
+                "description": "Glättung (zweiter EMA-Pass über die MA-Serie; <= 1 = keine Glättung)",
             },
             "alpha_factor": {
                 "type": "float",
@@ -405,8 +400,9 @@ class MATemplateEngine:
         period: int,
         alpha_factor: float = 2.0,
         volume: Optional[pd.Series] = None,
+        smoothing: int = 1,
     ) -> pd.Series:
-        """Berechnet einen der 12 MA-Typen vektorisiert.
+        """Berechnet einen der 12 MA-Typen vektorisiert (Vertrag B).
 
         Args:
             source: Preis-Serie (z. B. df['close']).
@@ -415,6 +411,13 @@ class MATemplateEngine:
             alpha_factor: Decay-Faktor für Alpha-MAs (E4); entfällt bei KAMA.
             volume: Volumen-Serie für VWMA (z. B. df['tick_volume']). Fehlt
                     sie oder ist sie Null/NaN, fällt VWMA auf SMA zurück (E5).
+            smoothing: Optionale Alpha-EMA-Glättung (Vertrag B, 16.04 Schritt
+                    5) auf die Basis-MA-Serie (alle 12 Typen anwendbar):
+                      * smoothing > 1 (aktiv): ema_first = EMA(base,
+                        span=smoothing); base = EMA(ema_first, alpha=alpha_calc)
+                        mit alpha_calc = alpha_factor / (period + 1).
+                      * smoothing <= 1: keine Glättung (Basis-Serie
+                        unverändert, Default).
 
         Returns:
             pd.Series mit demselben Index wie `source`; die ersten
@@ -466,6 +469,14 @@ class MATemplateEngine:
             raise ValueError(
                 f"Unbekannter MA-Typ '{ma_type}'. Gültig: {MA_TYPES}"
             )
+
+        # Optionale Alpha-EMA-Glättung (Vertrag B, 16.04 Schritt 5):
+        # zweifach verschachtelte EMA-Filterung auf die Basis-MA-Serie.
+        # smoothing > 1 = aktiv; smoothing <= 1 = keine Glättung.
+        smoothing_int = max(int(smoothing or 0), 0)
+        if smoothing_int > 1:
+            ema_first = _ema_span_values(result, smoothing_int)
+            result = _ema_alpha_values(ema_first, alpha)
 
         return pd.Series(result, index=src.index, dtype=float)
 
