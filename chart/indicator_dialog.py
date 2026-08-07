@@ -692,8 +692,9 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 			content_layout.addWidget(self._build_preset_group())
 
 		# Bugfix (06.08.2026): _init_plugin_ui_params_only platziert den
-		# Schließen-Button bereits oben rechts (Zeile 0) - hier NUR anfügen,
-		# wenn er nicht schon im Plugin-Grid sitzt (sonst Doppel-Button).
+		# Schließen-Button bereits im Plugin-Grid (Zeile 1, Spalte 2, Vertrag C) -
+		# hier NUR anfügen, wenn er nicht schon im Plugin-Grid sitzt (sonst
+		# Doppel-Button).
 		if not getattr(self, "_close_placed_in_plugin_ui", False):
 			btn_close = QPushButton("Schließen")
 			btn_close.clicked.connect(self.accept)
@@ -973,36 +974,28 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 		entfallen komplett (Anwenderanforderung, siehe _init_plugin_ui). Die
 		Preset-Verwaltung bleibt erhalten (Speichern/Laden der Parameter).
 		Damit erscheinen auch die vorher fehlenden Nicht-Darstellungs-Parameter
-		(maX_type/maX_period/maX_smooth_type/maX_alpha) im Prop-Fenster.
+		(maX_type/maX_period/maX_smoothing/maX_alpha) im Prop-Fenster.
 
-		Layout (Bugfix 06.08.2026, Anwenderanforderungen):
-		  * Zeile 0: Preset-Box ganz oben LINKS; rechts daneben der
-		    Schließen-Button (oben rechts) - kein Button mehr unterhalb.
-		  * Darunter: IMMER zwei Parameter-Boxen nebeneinander
-		    (1-2, 3-4, 5-6, 7-8), je eine Grid-Zeile.
+		Layout (Vertrag C, 07.08.2026, Anwenderanforderungen):
+		  * Zeile 0: Preset-Box ganz oben, ueber ALLE 3 Spalten (span 3).
+		  * Zeile 1: die ersten zwei Parameter-Boxen nebeneinander, rechts
+		    daneben der Schließen-Button (Spalte 2).
+		  * Danach: je 3 Parameter-Boxen pro Zeile (Multi-MA: Zeile 2 =
+		    MA3/MA4/MA5, Zeile 3 = MA6/MA7/MA8).
 		  * Nichts unterhalb der letzten Boxen-Zeile -> das Fenster endet
-		    exakt am unteren Rand der letzten Boxen (Höhe = MA7/MA8-Rand).
-		  * Das kompakte 2-Spalten-Grid macht das Fenster nur etwas breiter
-		    als die zwei Boxen nebeneinander (ContentScrollMixin klemmt die
-		    Größe auf den Inhalt).
+		    exakt am unteren Rand der letzten Boxen.
+		  * Das kompakte 3-Spalten-Grid ergibt ~900px Breite (ContentScroll-
+		    Mixin klemmt die Groesse auf den Inhalt bzw. den Bildschirm).
 		"""
 		content_grid = QGridLayout()
 		content_grid.setSpacing(6)
 
-		# --- Zeile 0: Preset-Box oben LINKS, Schließen-Button oben rechts ---
-		# Die Zeile spannt ueber BEIDE Spalten (span 2) und verbreitert das
-		# Fenster dadurch NICHT: die Spaltenbreiten bestimmen die MA-Boxen
-		# (Zeilen 1-4), der addStretch(1) faengt den Restplatz auf. Ergebnis:
-		# das Fenster ist nur etwas breiter als die zwei MA-Boxen nebeneinander.
+		# --- Zeile 0: Preset-Box oben, ueber alle 3 Spalten (span 3) ---
+		# Der Schließen-Button sitzt NICHT mehr in Zeile 0, sondern in Zeile 1
+		# Spalte 2 (rechts neben der zweiten Parameter-Box, Vertrag C).
 		self._close_placed_in_plugin_ui = True
-		top_row = QHBoxLayout()
-		top_row.setSpacing(6)
-		top_row.addWidget(self._build_preset_group())
-		top_row.addStretch(1)
-		btn_close = QPushButton("Schließen")
-		btn_close.clicked.connect(self.accept)
-		top_row.addWidget(btn_close)
-		content_grid.addLayout(top_row, 0, 0, 1, 2, Qt.AlignTop)
+		content_grid.addWidget(
+			self._build_preset_group(), 0, 0, 1, 3, Qt.AlignTop)
 
 		layout_schema = getattr(self.plugin, "param_layout", None)
 		groups: List[Any] = []
@@ -1054,17 +1047,27 @@ class IndicatorSettingsDialog(ContentScrollMixin, NamedItemActionsMixin, QDialog
 				form.addRow(self.plugin_labels.get(key, self._human(key)), ctrl)
 			rendered_groups.append(group)
 
-		# --- IMMER zwei Boxen nebeneinander (1-2, 3-4, 5-6, 7-8) ---
-		for i in range(0, len(rendered_groups), 2):
-			row = i // 2 + 1  # Zeile 1 beginnt unter der Preset-Zeile
-			content_grid.addWidget(rendered_groups[i], row, 0, Qt.AlignTop)
-			if i + 1 < len(rendered_groups):
-				content_grid.addWidget(rendered_groups[i + 1], row, 1, Qt.AlignTop)
+		# --- 3-Spalten-Grid (Vertrag C) ---
+		# Zeile 1: Gruppe 1 (Spalte 0) + Gruppe 2 (Spalte 1) nebeneinander,
+		# rechts daneben der Schliessen-Button (Spalte 2). Ab Gruppe 3 folgen
+		# je 3 Boxen pro Zeile (Zeile 2: G3/G4/G5, Zeile 3: G6/G7/G8).
+		btn_close = QPushButton("Schließen")
+		btn_close.clicked.connect(self.accept)
+		if rendered_groups:
+			content_grid.addWidget(rendered_groups[0], 1, 0, Qt.AlignTop)
+			if len(rendered_groups) > 1:
+				content_grid.addWidget(rendered_groups[1], 1, 1, Qt.AlignTop)
+			content_grid.addWidget(btn_close, 1, 2, Qt.AlignTop)
+			for i in range(2, len(rendered_groups)):
+				g = i - 2
+				content_grid.addWidget(
+					rendered_groups[i], g // 3 + 2, g % 3, Qt.AlignTop)
 
-		# Beide Spalten wachsen beim Aufziehen gleichmäßig; die Breite ergibt
-		# sich aus den zwei Boxen nebeneinander ("nur etwas breiter").
+		# Alle 3 Spalten wachsen beim Aufziehen gleichmaessig; die Breite
+		# ergibt sich aus den drei Boxen nebeneinander ("~900px", Vertrag C).
 		content_grid.setColumnStretch(0, 1)
 		content_grid.setColumnStretch(1, 1)
+		content_grid.setColumnStretch(2, 1)
 		main_layout.addLayout(content_grid)
 
 	# -------------------------------------------------------------------------
