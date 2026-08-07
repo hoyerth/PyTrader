@@ -96,6 +96,10 @@ TYPE_GROUP = "group"
 TYPE_SET = "set"
 TYPE_SERVICE = "service"
 TYPE_PLUGIN = "plugin"
+# 16.08 (K3): Kategorie-Ordner-Knoten (Dynamic Category Trees). Nicht
+# auswaehlbar, expandierbar; traegt KEINEN Info-Button (K5), keine Badges
+# und ist im Checkbox-Modus nicht anhakbar (K4).
+TYPE_CATEGORY = "category"
 
 # Bugfix 2.1 (04.08.2026, aktualisiert): Lange Relationstexte in der Badge-
 # Spalte (z. B. "📌 im Ind_FixedGridProximity | ⚪ inaktiv in ...") werden auf
@@ -347,14 +351,47 @@ class MasterTree(QTreeWidget):
 
     def _build_child_item(self, group: str,
                           child: Dict[str, Any]) -> Optional[QTreeWidgetItem]:
-        """Erzeugt das Kind-Item fuer einen Knoten der Gruppe `group`."""
+        """Erzeugt das Kind-Item fuer einen Knoten der Gruppe `group`.
+
+        16.08 (K2/K3): Ordner-Knoten (group == GROUP_CATEGORY) werden
+        rekursiv aufgebaut; Plugin-Blaetter in Ordnern nutzen weiterhin
+        _build_plugin_item (Badge/Ausfuehrungsdatum unveraendert). Die
+        Original-Gruppe (standalone/plugins) wird durch die Rekursion
+        durchgereicht, damit ROLE_SET_ID der Blaetter stabil bleibt.
+        """
+        if isinstance(child, dict) and child.get("group") == self.model.GROUP_CATEGORY:
+            return self._build_category_item(child, group)
         if group == self.model.GROUP_SETS:
             return self._build_set_item(child)
-        if group == self.model.GROUP_STANDALONE:
-            return self._build_plugin_item(child, group)
-        if group == self.model.GROUP_PLUGINS:
+        if group in (self.model.GROUP_STANDALONE, self.model.GROUP_PLUGINS):
             return self._build_plugin_item(child, group)
         return None
+
+    def _build_category_item(self, child: Dict[str, Any],
+                             group: str) -> QTreeWidgetItem:
+        """Erzeugt einen Ordner-Knoten (K3, 16.08).
+
+        Nicht auswaehlbar, expandierbar, '📁 <Name>' im Label (aus dem
+        Modell, K2-Format); Kinder rekursiv ueber _build_child_item.
+        Ordner tragen KEINEN Info-Button (K5 – _attach_item_buttons
+        ueberspringt TYPE_CATEGORY automatisch), keine Badges/Datum (K2)
+        und sind im Checkbox-Modus nicht anhakbar (K4 – kein
+        ItemIsUserCheckable). Die Selektion liefert fuer Ordner den
+        Default-Pfad zurueck (K7).
+        """
+        label = _expandable_label(str(child.get("label") or "?"), True, False)
+        cat_item = QTreeWidgetItem([label, ""])
+        cat_item.setData(0, ROLE_NODE_TYPE, TYPE_CATEGORY)
+        cat_item.setData(0, ROLE_SET_ID, str(child.get("label") or ""))
+        # K3/K4: nicht auswaehlbar UND nicht anhakbar – Qt setzt
+        # ItemIsUserCheckable standardmaessig, daher beide Flags entfernen.
+        cat_item.setFlags(cat_item.flags()
+                          & ~(Qt.ItemIsSelectable | Qt.ItemIsUserCheckable))
+        for sub in child.get("children") or []:
+            item = self._build_child_item(group, sub)
+            if item is not None:
+                cat_item.addChild(item)
+        return cat_item
 
     def _build_set_item(self, child: Dict[str, Any]) -> QTreeWidgetItem:
         services = child.get("services", [])
@@ -919,6 +956,10 @@ class MasterTree(QTreeWidget):
             except (RuntimeError, AttributeError):
                 pass
             node_type = item.data(0, ROLE_NODE_TYPE)
+            # 16.08 (K6): Ordnerknoten erhalten KEIN Kontextmenue (kein
+            # run_service/info/move/remove auf Ordnern).
+            if node_type == TYPE_CATEGORY:
+                return
             menu = QMenu(self)
             if node_type == TYPE_GROUP:
                 group = str(item.data(0, ROLE_SET_ID) or "")

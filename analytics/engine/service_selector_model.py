@@ -97,6 +97,10 @@ class ServiceSelectorModel(QObject):
     GROUP_SETS = "sets"
     GROUP_STANDALONE = "standalone"
     GROUP_PLUGINS = "plugins"
+    # 16.08 (K2): Kategorie-Ordner-Knoten (Dynamic Category Trees).
+    # Ein Ordner-Dict besitzt das Format:
+    #   {"group": GROUP_CATEGORY, "label": "📁 <Name>", "children": [...]}
+    GROUP_CATEGORY = "category_node"
 
     def __init__(self, set_repo=None, state_manager=None, registry=None,
                  feature_store_reader=None,
@@ -396,6 +400,104 @@ class ServiceSelectorModel(QObject):
             if pid.lower() not in used
         )
 
+    # ------------------------------------------------------------------
+    # 16.08 (K1/K2/K8/K9): Kategorie-Ordner (Dynamic Category Trees)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cat_key(label: str) -> str:
+        """Case-insensitiver Sortier-/Vergleichsschluessel eines Ordners.
+
+        Entfernt das '📁 '-Praefix des Ordnerlabels (K2-Format), damit
+        Sortierung (K8) und Pfad-Lookup stabil auf dem reinen Namen laufen.
+        """
+        s = str(label or "").strip()
+        if s.startswith("📁"):
+            s = s[len("📁"):].lstrip()
+        return s.lower()
+
+    def _category_parts(self, plugin: Optional[Any]) -> List[str]:
+        """Kategorienpfad eines Plugins (K1, 16.08).
+
+        Lese `metadata.get('category')` -> Slash-Pfad in saubere Teile
+        zerlegt. Leer ODER der Ist-Default `"General"` (base_plugin.py)
+        gelten als "keine Kategorie" -> das Plugin bleibt auf der obersten
+        Ebene der Hauptgruppe.
+        """
+        try:
+            meta = getattr(plugin, "metadata", None) or {}
+            category = str(meta.get("category") or "").strip()
+        except Exception:
+            return []
+        if not category or category.lower() == "general":
+            return []
+        return [p.strip() for p in category.split("/") if p.strip()]
+
+    def _insert_into_category_tree(self, nodes: List[Dict[str, Any]],
+                                   parts: List[str],
+                                   leaf: Dict[str, Any]) -> None:
+        """Fuegt ein Plugin-Blatt rekursiv in die Ordnerstruktur ein (K2).
+
+        Erzeugt fehlende Ordner entlang des Pfads. Ordner entstehen NUR
+        durch eine tatsaechliche Blatt-Einfuegung -> keine leeren Ordner
+        (K9). Ordner-Label folgt dem K2-Format '📁 <Name>'.
+        """
+        if not parts:
+            nodes.append(leaf)
+            return
+        key = self._cat_key(parts[0])
+        folder = None
+        for n in nodes:
+            if (n.get("group") == self.GROUP_CATEGORY
+                    and self._cat_key(n.get("label")) == key):
+                folder = n
+                break
+        if folder is None:
+            folder = {"group": self.GROUP_CATEGORY,
+                      "label": f"📁 {parts[0]}", "children": []}
+            nodes.append(folder)
+        self._insert_into_category_tree(folder["children"], parts[1:], leaf)
+
+    def _sort_category_nodes(self,
+                             nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Sortiert eine Ordner-Ebene (K8, 16.08).
+
+        Deterministisch: Ordner zuerst, dann Blaetter; jeweils alphabetisch
+        (case-insensitiv). Innerhalb der Ordner rekursiv dieselbe Regel.
+        """
+        def sort_key(n: Dict[str, Any]) -> tuple:
+            is_folder = n.get("group") == self.GROUP_CATEGORY
+            name = (self._cat_key(n.get("label"))
+                    if is_folder else str(n.get("plugin_id") or "").lower())
+            return (0 if is_folder else 1, name)
+
+        result = sorted(nodes, key=sort_key)
+        for n in result:
+            if n.get("group") == self.GROUP_CATEGORY:
+                n["children"] = self._sort_category_nodes(n.get("children") or [])
+        return result
+
+    def _category_nodes(self, plugin_ids: List[str]) -> List[Dict[str, Any]]:
+        """Baut die (ggf. verschachtelte) Kinderliste einer Plugin-Gruppe.
+
+        Plugins mit Kategorienpfad werden in 📁-Ordner einsortiert; Plugins
+        ohne Kategorie (bzw. Default 'General') bleiben auf oberster Ebene
+        (K1). Blatt-Dicts unveraendert ({plugin_id, badge, last_execution}).
+        Sortierung pro Ebene: Ordner vor Blaettern, alphabetisch (K8).
+        """
+        plugins = self.get_plugins()
+        root: List[Dict[str, Any]] = []
+        for pid in plugin_ids:
+            plugin = plugins.get(pid)
+            parts = self._category_parts(plugin)
+            leaf = {
+                "plugin_id": pid,
+                "badge": self.badge_for(pid),
+                "last_execution": self.last_execution_date(pid),
+            }
+            self._insert_into_category_tree(root, parts, leaf)
+        return self._sort_category_nodes(root)
+
     def build_tree(self) -> List[Dict[str, Any]]:
         """Baut die vollstaendige Hierarchie fuer das 2-Spalten-MasterTree.
 
@@ -405,11 +507,17 @@ class ServiceSelectorModel(QObject):
                   "services": [{"instance_id": ..., "plugin_id": ...,
                                 "badge": ...}, ...]}, ...]},
              {"group": "standalone", "label": "⚡ Standalone Services",
-              "children": [{"plugin_id": ..., "badge": ...}, ...]},
+              "children": [Blatt- und/oder Ordner-Knoten ...]},
              {"group": "plugins", "label": "📦 Alle verfügbaren Plugins",
-              "children": [{"plugin_id": ..., "badge": ...}, ...]}]
+              "children": [Blatt- und/oder Ordner-Knoten ...]}]
 
-        Deterministisch sortiert (Sets nach display_name, Plugins alphabetisch).
+        Deterministisch sortiert (Sets nach display_name; Plugins/Ordner
+        alphabetisch, 16.08 K8). Seit 16.08 (K2) sind die Kinder der
+        Plugin-Gruppen eine Mischung aus flachen Blatt-Dicts
+        ({plugin_id, badge, last_execution}) und verschachtelten
+        Ordner-Dicts ({"group": GROUP_CATEGORY, "label": "📁 <Name>",
+        "children": [...]} – rekursiv), gesteuert ueber das Metadaten-Feld
+        `category` der Plugins (K1). GROUP_SETS bleibt unveraendert.
         """
         sets = sorted(self._sets,
                       key=lambda s: str(s.get("display_name") or s.get("set_id") or "").lower())
@@ -436,28 +544,11 @@ class ServiceSelectorModel(QObject):
                 "services": service_nodes,
             })
 
-        standalone_nodes = [
-            {
-                "plugin_id": pid,
-                "badge": self.badge_for(pid),
-                # 05.08.2026 (Punkt 4): Datum der letzten Ausfuehrung auch fuer
-                # Standalone-Services – der MasterTree zeigt es hinter dem
-                # Plugin-Namen an (gleiche Semantik wie bei Set-Services).
-                "last_execution": self.last_execution_date(pid),
-            }
-            for pid in self.get_standalone_plugin_ids()
-        ]
-
-        plugin_nodes = [
-            {
-                "plugin_id": pid,
-                "badge": self.badge_for(pid),
-                # 05.08.2026 (Punkt 4): Datum der letzten Ausfuehrung auch in
-                # der 'Alle verfügbaren Plugins'-Gruppe (gleiche Semantik).
-                "last_execution": self.last_execution_date(pid),
-            }
-            for pid in sorted(self.get_plugins().keys())
-        ]
+        # 16.08 (K2/K8): Kinder der Plugin-Gruppen via _category_nodes –
+        # Plugins mit `category`-Metadatum werden in 📁-Ordner verschachtelt
+        # (K1), ohne Kategorie bleiben sie flache Blaetter auf oberster Ebene.
+        standalone_nodes = self._category_nodes(self.get_standalone_plugin_ids())
+        plugin_nodes = self._category_nodes(sorted(self.get_plugins().keys()))
 
         return [
             {"group": self.GROUP_SETS, "label": "📁 Service-Sets",
