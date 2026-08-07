@@ -11,14 +11,15 @@ WICHTIG (Entscheidungen 06.08.2026, Doku-Analyse 16.04):
   * MAType = TradingView-konformer 12er-Satz in exakter Reihenfolge
     (E2): SMA, EMA, WMA, DEMA, TEMA, HMA, EHMA, ZLEMA, RMA, KAMA, ALMA, VWMA.
   * Defaults (E3): ma_type="EHMA", period=4, alpha_factor=2.0,
-    smooth_type="EHMA", dual_color=False, bull_color="#2196F3",
-    bear_color="#EF5350".
+    smooth_type=" - no Smoothing", smooth_length=3, dual_color=False,
+    bull_color="#2196F3", bear_color="#EF5350".
   * Alpha-MAs (E4): DEMA, TEMA, EHMA verwenden den dynamischen Decay-Faktor
     alpha = alpha_factor / (period + 1).
   * VWMA (E5): ohne gültiges Volumen (fehlend/Null) Fallback auf SMA.
-  * smooth_type (Ergänzung 1): reiner Schema-Vertrag für spätere
-    MA-Indikatoren – wird von der Engine hier NICHT konsumiert
-    (Forward-Compatibility). EHMA = EMA_alpha(HMA(src, len), len).
+  * smooth_type/smooth_length (Bugfix 07.08.2026): Schema-Vertrag für die
+    optionale zweite Glättung (MA auf MA). " - no Smoothing" (Default) =
+    keine Glättung. Konsumenten (z.B. Multi-MA) führen den zweiten Pass
+    über calculate_ma(ma_series, smooth_type, smooth_length) aus.
   * bull_color-Default bedingt (E7/Ergänzung 2): Schema liefert "#2196F3";
     der Konsument wendet "#26A69A" an, wenn dual_color=True UND bull_color
     nicht vom User gesetzt wurde (leer/None).
@@ -347,9 +348,17 @@ class MATemplateEngine:
             },
             "smooth_type": {
                 "type": "choice",
-                "options": list(MA_TYPES),
-                "default": "EHMA",
-                "description": "Smoothing-Typ (Forward-Compatibility, 16.04 noch nicht konsumiert)",
+                "options": [" - no Smoothing"] + list(MA_TYPES),
+                "default": " - no Smoothing",
+                "description": "Smoothing-Typ (' - no Smoothing' = keine Glättung)",
+            },
+            "smooth_length": {
+                "type": "int",
+                "default": 3,
+                "min": 1,
+                "max": 500,
+                "step": 1,
+                "description": "Glättungslänge (zweiter MA-Pass über die MA-Serie)",
             },
             "alpha_factor": {
                 "type": "float",
