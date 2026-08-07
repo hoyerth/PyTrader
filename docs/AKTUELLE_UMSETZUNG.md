@@ -143,3 +143,138 @@
 * **Befund zu „Alt-Felder noch sichtbar" (Punkte 1+2):** Die Alt-Felder (`line_style`/`line_width`/`circle_shape_*`/`circle_size_*`) existieren im Quellcode nachweislich NICHT mehr (Schema + Labels entfernt, Suche im gesamten Projekt ohne Treffer außerhalb `.venv`/Konstanten). Der beschriebene Anzeige-Zustand entspricht exakt dem ALTEN Code-Stand → die getestete App-Instanz lief noch mit dem zuvor geladenen Code. **Die App muss neu gestartet werden** (Python lädt Module nur beim Start; ggf. `__pycache__` leeren und sicherstellen, dass die Run-Config den `.venv`-Interpreter nutzt).
 * **Vorbestehende, NICHT von 16.06 verursachte Test-Fails** in Teil 1/3 des Harness (ServiceWindow): P2/P5/H3/H4/H5/H7 — Test-Erwartung `_keep_history_on_close == True` vs. Code `service_win.py:92 _keep_history_on_close = False` (Kommentar „NEU") plus offscreen-Größen-Checks (≥1300px). Betrifft `serviceui/service_win.py` (unverändert).
 * Keine UI-Tests ausgeführt (Regel 4); Working Tree nach Review: 5 geänderte Dateien (`chart/indicator_dialog.py`, `chart/indicators/fixed_grid_proximity.py`, `chart/indicators/multi_ma.py`, `chart/widgets/style_picker_widget.py`, `docs/AKTUELLE_UMSETZUNG.md`). `test/test.py` und `test/check_stylepicker_16_06.py` sind per `.gitignore` nicht versioniert.
+
+---
+
+# Refactoring-Anweisung: Popover StylePickerDialog & Cleanup (16.06.01)
+
+## 1. Problemstellung & Soll-Zustand
+* **Problem:** Die aktuelle Umsetzung (E2/E4/E5) verwendet ein Inline-Composite-Layout (Farbe, SpinBox und ComboBoxen nebeneinander direkt in der Formularzeile des Einstellungs-Dialogs)[cite: 2]. Dadurch bleibt das Hauptformular der Indikatoren überladen.
+* **Soll-Zustand:** 
+  1. Im Einstellungs-Dialog des Indikators darf pro Element **ausschließlich ein einziger kompakter Button** (Farbkästchen + Vorschau-Text `● 2px Solid` / `● Circle`) zu sehen sein.
+  2. Erst bei Klick auf diesen Button öffnet sich ein modal/popover **`StylePickerDialog`**.
+  3. Der `StylePickerDialog` ist vertikal zweigeteilt:
+     * **Oberer Bereich:** Farbwähler + Transparenz-Slider (`QColorDialog` / Color-Grid).
+     * **Trennlinie:** Visuelle `QFrame` Horizontallinie (`QFrame.HLine`).
+     * **Unterer Bereich:** Zusätzliche Zeichnungsparameter (Linienstärke 1–10 px / Markergröße 1–20 px, Linienstil `solid`/`dashed`/`dotted`/`dashdotted` bzw. Markerform `circle`/`square`/`arrowUp`/`arrowDown`).
+
+---
+
+## 2. Anpassung in `chart/widgets/style_picker_widget.py`
+
+### A. Umbau `StylePickerDialog` (Dialog)
+* Erstelle eine eigenständige `QDialog`-Klasse `StylePickerDialog` (Modal).
+* **Layout:** `QVBoxLayout`
+  1. **Top:** Einbetten der bisherigen Farbauswahl & Transparenz-Steuerung.
+  2. **Separator:** `line = QFrame(); line.setFrameShape(QFrame.HLine); line.setFrameShadow(QFrame.Sunken)`
+  3. **Bottom (FormLayout):**
+     * Bei `style_type == "line"`: SpinBox für `width` (1–10), ComboBox für `style` (`solid`, `dashed`, `dotted`, `dashdotted`).
+     * Bei `style_type == "marker"`: SpinBox für `size` (1–20), ComboBox für `shape` (`circle`, `square`, `arrowUp`, `arrowDown`).
+  4. **Buttons:** `[Abbrechen]` und `[Übernehmen]` (Ok / Cancel Button-Box).
+
+### B. Umbau `StylePickerWidget` (Inline-Button)
+* Entferne alle direkt sichtbaren SpinBoxen, ComboBoxen und CheckBoxes aus dem Layout des `StylePickerWidget`.
+* Das Widget besteht **ausschließlich aus einem `QPushButton`** (Farb-Swatch + Vorschau-Text).
+* **Klick-Event (`clicked`):** Instanziiert `StylePickerDialog`, übergibt das aktuelle `LineStyle`/`MarkerStyle`-Objekt, führt `.exec()` aus und übernimmt bei Erfolg das geänderte Style-Objekt. Emittiere `style_changed(object)`.
+
+---
+
+## 3. Bereinigung Indikator-Dialoge & Parameterschemata
+
+### A. `chart/indicator_dialog.py`
+* Stelle sicher, dass die Formularzeilen für Farbfelder nur noch die kompakte `StylePickerWidget`-Schaltfläche rendern.
+* Stelle sicher, dass `_style_sibling_keys()` beim Speichern/Laden die Sibling-Keys (`*_width`, `*_style`, `*_size`, `*_shape`) weiterhin fehlerfrei liest und schreibt[cite: 2].
+
+### B. `chart/indicators/fixed_grid_proximity.py` & `chart/indicators/multi_ma.py`
+* Keine separaten Einzelfelder (Linienstärke, Linienstile, Markergrößen) direkt im Formular rendern[cite: 2].
+* Alle visuellen Einstellungen laufen exklusiv über den Popover-`StylePickerDialog`[cite: 2].
+
+---
+
+## 4. Anweisung für die IDE-AI (Ausführung & Verifikation)
+
+1. **Bugfixing-Modus beachten:** Nutze gezielte Snippets und mache nur minimale, strukturelle Korrekturen[cite: 1, 2].
+2. **Statischer Check (keine UI-Tests):** Führe nach den Anpassungen ausschließlich den Syntax-Check durch[cite: 1]:
+
+   python -m py_compile chart/widgets/style_picker_widget.py chart/indicator_dialog.py chart/indicators/multi_ma.py chart/indicators/fixed_grid_proximity.py
+
+
+3. **Führe KEINE GUI-/UI-Tests aus** (Harte Projektregel 4).
+
+---
+
+## 5. Präzisierung der Dialog-Interna & API-Garantie (Kritisch)
+
+* **Farbbereich (`StylePickerDialog` Top):** Baue ein kompaktes Custom-Widget (Palette-Grid + Transparenz-Slider 0-100% + QColorDialog-Modal-Button als Fallback). Kein QColorDialog(Qt.Widget) verwenden.
+* **`color_only`-Handling:** Ist `color_only=True`, schalte die `QFrame.HLine`-Trennlinie und den unteren Formularbereich im Dialog auf `setVisible(False)` und verkleinere den Dialog.
+* **Schnittstellen-Invariante:** `StylePickerWidget` MUSS folgende API 1:1 bereitstellen:
+  - Methods: `get_style()`, `set_style(obj)`, `set_color(color_str)`
+  - Props: `style_type` ("line"|"marker"), `color_only` (bool), `show_visibility` (bool)
+  - Signal: `style_changed(object)`
+  - Innerer Zugriff `ctrl.get_style().color` muss garantiert funktionieren!
+
+---
+
+## 6. Implementierungs-Log 16.06.01 (Stand 07.08.2026)
+
+### E7: Popover StylePickerDialog & Button-Only-Cleanup umgesetzt (16.06.01)
+* **Umsetzung (Refactoring-Anweisung 16.06.01, Kapitel 1–5):**
+  * **`chart/widgets/style_picker_widget.py` neu strukturiert:**
+    * **`StylePickerDialog`** (modal, `QDialog`): vertikal zweigeteilt –
+      oberer Bereich = kompaktes Custom-Color-Grid (TradingView-Palette mit
+      16 Farben + Hex/RGB-Eingabefeld + Transparenz-Slider 0–100% +
+      `[Anpassen...]`-Fallback auf `QColorDialog.getColor()`; bewusst KEIN
+      `QColorDialog(Qt.Widget)`-Trick, Entscheidung 1), darunter
+      `QFrame.HLine`-Trennlinie (Sunken), unterer Bereich = `QFormLayout`
+      mit width 1–10 / size 1–20 (QSpinBox) und style `LINE_STYLES` /
+      shape `MARKER_SHAPES` (QComboBox), abschließend `QDialogButtonBox`
+      `[Abbrechen]` / `[Übernehmen]`.
+    * **`color_only=True`:** Trennlinie + unterer Bereich werden per
+      `setVisible(False)` ausgeblendet und der Dialog via `adjustSize()` auf
+      die reine Farbwahl verkleinert (Entscheidung 2).
+    * **`StylePickerWidget` = Button-Only:** Layout besteht ausschließlich aus
+      einem `QPushButton` (Farb-Swatch-Icon 16×16 + Vorschau-Text `● 2px Solid`
+      bzw. `● Circle`). Klick → `StylePickerDialog.exec()`; bei
+      `[Übernehmen]` wird das geänderte Style-Objekt übernommen und
+      `style_changed` emittiert. Das Inline-Composite (QCheckBox + Swatch +
+      QSpinBox + QComboBox in der Formularzeile) ist entfernt.
+  * **API-Invariante (Entscheidung 3) 1:1 erfüllt:** `get_style()` /
+    `set_style(obj)` / `set_color(color_str)` / `color()`, Properties
+    `style_type` ("line"|"marker"), `color_only` (bool), `show_visibility`
+    (bool), Signal `style_changed(object)`. Innerer Zugriff
+    `ctrl.get_style().color` funktioniert garantiert.
+  * **`show_visibility=True`:** Der Dialog zeigt im unteren Bereich eine
+    `sichtbar`-Checkbox (ersetzt die frühere Inline-Checkbox); `get_style()`
+    liefert dann deren Zustand als `show`. Bei `show_visibility=False`
+    bleibt `show` unverändert (separater `show_*`-Param steuert die
+    Sichtbarkeit).
+  * `chart/widgets/__init__.py`: `StylePickerDialog` additiv re-exportiert
+    (Kapitel 3, Regel 9: keine Bestandscode-Änderungen).
+  * `chart/indicator_dialog.py`, `multi_ma.py`, `fixed_grid_proximity.py`:
+    **keine Änderungen nötig** – die Fassade ist unverändert, der
+    Sibling-Roundtrip (`_style_sibling_keys`/`_build_preset_payload`/
+    `collect_params_from_ui`/`update_ui_from_params`) und die Schemata
+    bleiben intakt.
+* **Verifikation (headless, kein GUI-Start; Regel 4/4.5):**
+  * `python -m py_compile` auf `style_picker_widget.py`, `widgets/__init__.py`,
+    `indicator_dialog.py`, `multi_ma.py`, `fixed_grid_proximity.py`,
+    `style_models.py` → EXIT=0.
+  * `test/check_stylepicker_16_06.py` (headless, venv, UTF-8): A1–A4
+    (Button-Only ohne Inline-Composite, API-Invariante, Defaults MA1 w2/solid
+    + MA2 w1/solid, Vorschau `● 2px Solid`), B1–B4 (Line-/Marker-Picker
+    Button-Only, KEINE Alt-Einzelfelder gerendert/persistiert, Schema ohne
+    Alt-Keys), C1–C7 (Dialog zweigeteilt, Spin-Ranges 1–10/1–20 + Combos,
+    color_only kompakt via `setVisible(False)`, `get_style()` nach
+    Übernahme, Farbbereich vollständig, `set_style`/`set_color`, `style_changed`-
+    Emission via Auto-Accept ohne GUI), D1 (WindowCloseButtonHint für beide
+    Dialoge) — alle PASS (EXIT=0).
+  * `test/test.py` (headless, venv): alle 16.06-Checks weiterhin PASS
+    (D4 volle Picker ohne Checkbox/`ma1_bear_color` color_only/Picker-Defaults,
+    D5 Sibling-Keys in display_params, Teil 11 G1–G5). Einzige Fails:
+    vorbestehende ServiceWindow-Checks P2/P5/H3/H4/H5/H7 (dokumentiert in E6;
+    betrifft `serviceui/service_win.py`, unverändert).
+* Keine UI-Tests ausgeführt (Regel 4); Working Tree nach Umsetzung:
+  `chart/widgets/style_picker_widget.py`, `chart/widgets/__init__.py`,
+  `docs/AKTUELLE_UMSETZUNG.md` (`test/check_stylepicker_16_06.py` ist per
+  `.gitignore` nicht versioniert).
+

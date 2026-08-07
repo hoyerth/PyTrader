@@ -16,7 +16,7 @@
 # re-exportiert (rueckwaertskompatibler Importweg). StylePickerWidget selbst
 # importiert sie bereits direkt aus den overlays.
 from chart.overlays.style_models import LineStyle, MarkerStyle
-from .style_picker_widget import StylePickerWidget
+from .style_picker_widget import StylePickerDialog, StylePickerWidget
 from .named_item_actions import NamedItemActionsMixin, NamedItemAdapter
 
-__all__ = ["LineStyle", "MarkerStyle", "StylePickerWidget", "NamedItemActionsMixin", "NamedItemAdapter"]
+__all__ = ["LineStyle", "MarkerStyle", "StylePickerDialog", "StylePickerWidget", "NamedItemActionsMixin", "NamedItemAdapter"]
