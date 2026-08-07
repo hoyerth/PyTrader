@@ -565,3 +565,107 @@ entfaellt ersatzlos; der MasterTree besitzt danach genau **2 Root-Gruppen**:
 * Test-Cleanup durchgefuehrt (siehe 7.5): `test/` enthaelt nur noch
   `test/test.py`. Kapitel 17.01 + 17.01.01 sind damit abgeschlossen.
 * Naechste Kapitel (Roadmap): 17.02 Trend Services.
+
+
+---
+
+# 9. Implementierungs-Log 17.01.02 (07.08.2026) - Services-Gruppen-Funktionalitaet + Swing-Erkennung UMGESETZT
+
+**Ziel:** Die User-Meldungen aus der Testrunde zu 17.01 (E-1..E-8) aufloesen:
+(1) Kategorie-Ordner im MasterTree waren nur Deko – jetzt Info-Button +
+Run-Aktionen (Teil 1); (2) "Service ausfuehren" lieferte keine Ergebnisse
+("srv_swing_structure: fertig (kein Feature-Store-Payload), Fertig: 0
+Feature-Row(s) im feature_store") – Ursache war der Scaffold aus 17.01
+(records=[]); die echte Swing-Erkennung ist jetzt implementiert (Teil 2).
+
+---
+
+## 9.1 Teil 1 – Services-Gruppen-Funktionalitaet (commit a8b8563, phase17_step5)
+
+### Aenderungen in `analytics/engine/service_selector_model.py`
+* **NEU `category_plugin_ids(path)`:** Liefert rekursiv alle Plugin-IDs unter
+  einem Kategorie-Pfad (Praefix-Matching, case-insensitiv, deterministisch
+  sortiert). Grundlage fuer "Alle Services ausfuehren" eines Ordners.
+
+### Aenderungen in `serviceui/master_tree.py`
+* **3 neue Signale:** `run_plugin_requested(plugin_id)`,
+  `run_category_requested(path)`, `category_info_requested(path)`.
+* **NEU `_category_path_of(item)`:** Voller Kategorie-Pfad aus der Parent-Kette
+  (z. B. `Swing Points/Geometrie`).
+* **Info-Button auch auf Kategorie-Ordnern** (bisher nur Set-Zeilen) ->
+  emittiert `category_info_requested`.
+* **Kontextmenue erweitert:**
+  * Ordner-Knoten: `Alle Services ausfuehren` (run_category_requested) +
+    `Ordner-Info anzeigen`.
+  * Plugin-Zeilen: `Diesen Service ausfuehren` (run_plugin_requested) +
+    `Service-Info anzeigen`.
+
+### Aenderungen in `serviceui/service_win.py`
+* **Handler:** `_on_run_plugin` (Mini-Definition, Single-Run),
+  `_on_run_category` (Ad-hoc-Definition, Set-Run aller Services im Ordner),
+  `_on_category_info_requested` (Read-Only-Kategorie-Info).
+* Alle mit Sicherheitsabfrage (Symbol/Timeframe) + `ServiceRunWorker`
+  (FeatureStore-Persistenz + EventBus-Sync, wie der bestehende Set-Run).
+
+---
+
+## 9.2 Teil 2 – Echte Swing-Erkennung in `srv_swing_structure.py` (Bugfix "0 Feature-Row(s)")
+
+### Problem
+Der Scaffold aus 17.01 (E-1..E-8) lieferte `records=[]` in `calculate()`.
+Daher: `srv_swing_structure: fertig (kein Feature-Store-Payload)` und
+`Fertig: 0 Feature-Row(s) im feature_store` – fuer SILVER in keinem Timeframe.
+
+### Umsetzung (Modul-Helfer + `calculate()` ersetzt)
+* **Modul-Helfer (neu, vor der Klasse):**
+  * `_atr_series(df, period)` – Wilder-ATR (EWM alpha 1/period, adjust=False).
+  * `_detect_fractal(df, left, right)` – Williams-Fraktal / Standard-Pivot
+    (lokale Extrema mit kausaler Bestaetigung nach `right` Bars).
+  * `_detect_gann(df, left, right)` – Fenster-Extremum + Schlusskurs-Reversal.
+  * `_detect_zigzag(df, threshold_for)` – klassischer ZigZag (alternierend),
+    Umkehr-Schwelle als Callable (ATR- bzw. Prozent-Variante).
+  * `_detect_period_extrema(df, extrema_type)` – PDH/PWH: `CURRENT_DEVELOPING`
+    (laufende Tages-Extrema, CAUSAL) / `PREVIOUS_CLOSED`
+    (Vortages-Level-Touch, SESSION_CLOSE).
+* **`calculate()`:** Erkennung je `params['mode']` (6 Modi) + dichter
+  Record-Satz **1 Record pro Bar** (Datenvertrag 17.01 §4):
+  `bar_time, result_type="SWING", source_mode, calculation_status,
+  is_swing_high, is_swing_low, is_rejection=False, event_bar_time,
+  confirmation_bar_time, confirmation_lag_bars, confirmation_type, price,
+  strength_value, strength_type`.
+* **Kausale Zeitstempel:** `event_bar_time` = tatsaechliches Extremum,
+  `confirmation_bar_time` = kausale Feststellung (>= event); Serienanfang
+  (ohne Lookback/Lookahead) => `calculation_status='INSUFFICIENT_DATA'`.
+* **Payload-metadata:** `schema_version="1.0.0"` (E-7-Pflichtfeld),
+  `source_mode`, `total_swing_highs`, `total_swing_lows`, `bars`.
+
+### Waehrend des Testens gefundene & behobene Bugs
+1. **`pd.to_datetime(...)` liefert `DatetimeIndex`** – `.dt.date` existiert dort
+   nicht (AttributeError in `_detect_period_extrema`); Zugriff jetzt ueber
+   `.date` (ndarray aus `datetime.date`).
+2. **PREVIOUS_CLOSED-Kausalitaet invertiert:** `confirmation_bar_time` lag VOR
+   `event_bar_time`. Refactor: `swing_meta` traegt jetzt
+   `(event_idx, conf_idx, lag, price)`; fuer PREVIOUS_CLOSED ist
+   event = Vortages-Extremum-Bar, confirmation = die beruehrende Bar selbst
+   (lag = Abstand event->confirmation).
+
+### Verifikation (headless, keine UI-Tests)
+* **Syntax:** `py_compile` auf `srv_swing_structure.py` und `test/test.py` – PASS.
+* **`test/test.py` Teil 17 (NEU, 62 Checks):** 7 Modi-Konfigurationen
+  (Williams_Fractal, Standard_Pivot, Gann_Mechanical, ZigZag_ATR,
+  ZigZag_Pct, Period_Extrema/CURRENT_DEVELOPING, Period_Extrema/PREVIOUS_CLOSED)
+  auf 864 synthetischen M5-Bars (3 Tage, Sinus + Wobble):
+  * records dicht (`len(records) == 864`), Swing-Highs > 0, Swing-Lows > 0.
+  * Kausale Zeitstempel (confirmation >= event) fuer ALLE Modi.
+  * `schema_version == "1.0.0"`; Metadata totals == Summen der Flags.
+  * Start-INSUFFICIENT_DATA fuer Lookback-Modi + Period_Extrema.
+  * **T2: `store_plugin_payload` auf Test-DuckDB (`test/test_p17_swing.duckdb`,
+    wird nach dem Test geloescht):** Rows == 864, `feature_data` ist JSON mit
+    `result_type == "SWING"`.
+* **Verbleibende 6 Harness-FAILURES** (unbeteiligt, PersistentWindow-Position/
+  -Groesse, vor 17.01 bereits vorhanden): P2, P5, H3, H4, H5, H7.
+
+## 9.3 Test-Cleanup
+* `test/` enthaelt wieder nur `test/test.py` (temporaere Helfer/Logs/Test-DB
+  entfernt). Kapitel 17.01.02 ist damit abgeschlossen.
+* Naechste Kapitel (Roadmap): 17.02 Trend Services.
