@@ -28,6 +28,12 @@ len(df)) aus context.settings. Der Service schreibt die Hit-Records nach
 feature_data (feature_store=True) für Schritt 7 (Marker/Statistik).
 
 Capabilities: render=False (P16.01), feature_store=True.
+
+PARAMETER (PineScript-Input-Zone, 16.08.02 M3): Alle Inputs/Defaults stehen
+als Modul-Konstante `_PROXIMITY_SCHEMA` direkt unter diesem Header (siehe
+dort) und sind wie in PineScript am Dateianfang anpassbar. Die visuellen
+Parameter (Farben/Sichtbarkeit) gehören NICHT zum Service – sie steuert der
+Indikator (ind_fixed_grid_proximity).
 """
 
 from datetime import datetime, timezone as dt_timezone
@@ -47,6 +53,28 @@ from analytics.features.plugins.base_plugin import (
     PluginContext,
     PluginFeature,
 )
+
+# ---------------------------------------------------------------------------
+# PARAMETER (PineScript-Input-Zone, 16.08.02 M3): Single Source of Truth
+# fürs Prop-Fenster. Inputs/Defaults stehen hier direkt am Dateianfang
+# (analog _FIXED_GRID_PROXIMITY_SCHEMA), damit sie wie in PineScript ohne
+# Suchen anpassbar sind. `parameter_schema` gibt eine flache Kopie zurück
+# (M1: kein geteiltes mutable Dict über Instanzen).
+# ---------------------------------------------------------------------------
+_PROXIMITY_SCHEMA: Dict[str, ParameterSchema] = {
+    "visit_pct": {
+        "type": "float", "default": 0.05, "min": 0.0, "max": 100.0,
+        "step": 0.005, "description": "Prozentuale Toleranz um jede Linie (Parität zu grid_math.py visit_pct)",
+    },
+    "time_window_mins": {
+        "type": "int", "default": 5, "min": 0, "max": 30,
+        "step": 1, "description": "Time Filter Minuten um 0/30 UTC",
+    },
+    "use_time_filter": {
+        "type": "bool", "default": True,
+        "description": "Time Filter aktiv – steuert das in_window-Flag der Hits",
+    },
+}
 
 
 def _bar_utc_minutes(df: pd.DataFrame) -> List[int]:
@@ -176,20 +204,13 @@ class ProximityService(PluginFeature):
 
     @property
     def parameter_schema(self) -> Dict[str, ParameterSchema]:
-        return {
-            "visit_pct": {
-                "type": "float", "default": 0.05, "min": 0.0, "max": 100.0,
-                "step": 0.005, "description": "Prozentuale Toleranz um jede Linie (Parität zu grid_math.py visit_pct)",
-            },
-            "time_window_mins": {
-                "type": "int", "default": 5, "min": 0, "max": 30,
-                "step": 1, "description": "Time Filter Minuten um 0/30 UTC",
-            },
-            "use_time_filter": {
-                "type": "bool", "default": True,
-                "description": "Time Filter aktiv – steuert das in_window-Flag der Hits",
-            },
-        }
+        """Flache Kopie der Modul-Konstante `_PROXIMITY_SCHEMA` (16.08.02 M3).
+
+        Inhalt/Reihenfolge identisch zur vorherigen Inline-Property – nur die
+        Position des Dict-Literals hat sich an den Dateianfang verschoben
+        (PineScript-Input-Zone, kein geteiltes mutable Dict: flache Kopie).
+        """
+        return {k: dict(v) for k, v in _PROXIMITY_SCHEMA.items()}
 
     def calculate(
         self,

@@ -36,6 +36,12 @@ Dadurch schreibt grid_lines (srv_grid_lines) bei der Ausfuehrung echte
 mathematische Zeilen in analytics.duckdb (`feature_store`) – unabhaengig von
 `show_lines` (das nur die RENDER-Darstellung steuert, nicht die
 Daten-Mathematik).
+
+PARAMETER (PineScript-Input-Zone, 16.08.02 M3): Alle Inputs/Defaults stehen
+als Modul-Konstante `_GRID_LINES_SCHEMA` direkt unter diesem Header (siehe
+dort) und sind wie in PineScript am Dateianfang anpassbar. Darstellungs-
+Reihenfolge steuert `parameter_order`; `custom_levels` bleibt intern
+(Aggregat), die 6 Einzel-Level `prox_level1..6` werden im Editor gerendert.
 """
 
 from typing import Any, Dict, List, Optional
@@ -53,6 +59,40 @@ from analytics.features.plugins.base_plugin import (
     PluginContext,
     PluginFeature,
 )
+
+# ---------------------------------------------------------------------------
+# PARAMETER (PineScript-Input-Zone, 16.08.02 M3): Single Source of Truth
+# fürs Prop-Fenster. Inputs/Defaults stehen hier direkt am Dateianfang
+# (analog _FIXED_GRID_PROXIMITY_SCHEMA), damit sie wie in PineScript ohne
+# Suchen anpassbar sind. `parameter_schema` gibt eine flache Kopie zurück
+# (M1: kein geteiltes mutable Dict über Instanzen).
+# ---------------------------------------------------------------------------
+_GRID_LINES_SCHEMA: Dict[str, ParameterSchema] = {
+    "step_size": {
+        "type": "float", "default": 0.5, "min": 0.01, "max": 1000.0,
+        "step": 0.05, "description": "Rasterabstand (prox_stepSize ↔ step_size)",
+    },
+    "steps_around": {
+        "type": "int", "default": 4, "min": 0, "max": 100,
+        "step": 1, "description": "Level ober-/unterhalb des Zentrums (prox_stepsAround ↔ steps_around)",
+    },
+    # USER-REQ: P14-01 Nachtrag - die 6 Custom-Levels werden im Editor
+    # als EINZELPARAMETER prox_level1..6 gerendert (Level 1..6). Das
+    # Aggregat custom_levels bleibt im Schema erhalten - die interne
+    # Pipeline (FixedGridProximityIndicator._build_set_definition) und
+    # Alt-Sets speichern die Level als Liste/String. calculate() liest
+    # beide Formen (custom_levels_from_params).
+    "custom_levels": {
+        "type": "str", "default": "",
+        "description": "Custom-Levels, nur > 0 (prox_level1..6 ↔ custom_levels)",
+    },
+    "prox_level1": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 1"},
+    "prox_level2": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 2"},
+    "prox_level3": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 3"},
+    "prox_level4": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 4"},
+    "prox_level5": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 5"},
+    "prox_level6": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 6"},
+}
 
 
 def _parse_custom_levels(raw: Any) -> List[float]:
@@ -208,32 +248,13 @@ class GridLinesService(PluginFeature):
 
     @property
     def parameter_schema(self) -> Dict[str, ParameterSchema]:
-        return {
-            "step_size": {
-                "type": "float", "default": 0.5, "min": 0.01, "max": 1000.0,
-                "step": 0.05, "description": "Rasterabstand (prox_stepSize ↔ step_size)",
-            },
-            "steps_around": {
-                "type": "int", "default": 4, "min": 0, "max": 100,
-                "step": 1, "description": "Level ober-/unterhalb des Zentrums (prox_stepsAround ↔ steps_around)",
-            },
-            # USER-REQ: P14-01 Nachtrag - die 6 Custom-Levels werden im Editor
-            # als EINZELPARAMETER prox_level1..6 gerendert (Level 1..6). Das
-            # Aggregat custom_levels bleibt im Schema erhalten - die interne
-            # Pipeline (FixedGridProximityIndicator._build_set_definition) und
-            # Alt-Sets speichern die Level als Liste/String. calculate() liest
-            # beide Formen (custom_levels_from_params).
-            "custom_levels": {
-                "type": "str", "default": "",
-                "description": "Custom-Levels, nur > 0 (prox_level1..6 ↔ custom_levels)",
-            },
-            "prox_level1": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 1"},
-            "prox_level2": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 2"},
-            "prox_level3": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 3"},
-            "prox_level4": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 4"},
-            "prox_level5": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 5"},
-            "prox_level6": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 6"},
-        }
+        """Flache Kopie der Modul-Konstante `_GRID_LINES_SCHEMA` (16.08.02 M3).
+
+        Inhalt/Reihenfolge identisch zur vorherigen Inline-Property – nur die
+        Position des Dict-Literals hat sich an den Dateianfang verschoben
+        (PineScript-Input-Zone, kein geteiltes mutable Dict: flache Kopie).
+        """
+        return {k: dict(v) for k, v in _GRID_LINES_SCHEMA.items()}
 
     def calculate(
         self,
