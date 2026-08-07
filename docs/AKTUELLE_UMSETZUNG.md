@@ -431,3 +431,69 @@ python -m py_compile analytics/features/definitions/srv_swing_structure.py analy
 
 * Dauerhaft: `test/test.py` (inkl. Teil 14).
 * Temporär (verbleiben bis zur Abnahme des Kapitels, werden danach entfernt): `test/check_pk_migration.py` (Referenz für E-1), `test/migrate_pk.py`, `test/check_init_compat.py`, `test/_insert_part14.py`, `test/_fix_part14.py`, `test/_fix_part14b.py`.
+
+---
+
+# 17.01.01 MasterTree Refactoring: Cleanup Standalone & Root Node Rename
+
+## 1. Zielsetzung & Anpassungen
+1. **Entfernung der Redundanz:** Die Gruppe `⚡ Standalone Services` (`GROUP_STANDALONE`) entfällt ersatzlos, da alle Plugins über `metadata["category"]` bereits sauber in Ordner einsortiert werden[cite: 1, 2].
+2. **Kompakte Root-Label:**
+   * `"📁 Service-Sets"` ➔ **`"📁 Sets"`**[cite: 1, 2]
+   * `"📦 Alle verfügbaren Plugins"` / `"Alle verfügbaren Services"` ➔ **`"📦 Services"`**[cite: 1, 2]
+
+---
+
+## 2. Code-Anpassungen in `analytics/engine/service_selector_model.py`
+
+### Schritt 1: Konstanten & Hilfsmethoden bereinigen
+* Entferne die Konstante `GROUP_STANDALONE = "standalone"`[cite: 1, 2].
+* Entferne die Methode `get_standalone_plugin_ids()` vollständig (keine Aufrufe mehr vorhanden)[cite: 1, 2].
+
+### Schritt 2: `build_tree()` auf 2 Root-Knoten reduzieren
+Passe `build_tree()` so an, dass nur noch zwei schlanke Gruppen erzeugt werden[cite: 1, 2]:
+
+# In ServiceSelectorModel.build_tree():
+
+# 1. Sets-Gruppe mit neuem Root-Label
+set_nodes = [...]  # (bestehende Set-Erzeugung bleibt unverändert)
+
+# 2. Kategorisierte Services-Gruppe
+plugin_nodes = self._category_nodes(sorted(self.get_plugins().keys()))
+
+return [
+    {
+        "group": self.GROUP_SETS, 
+        "label": "📁 Sets", 
+        "children": set_nodes
+    },
+    {
+        "group": self.GROUP_PLUGINS, 
+        "label": "📦 Services", 
+        "children": plugin_nodes
+    },
+]
+
+
+---
+
+## 3. UI-Absicherung (`serviceui/master_tree.py`)
+
+Falls im `MasterTree` oder im `ServiceSelectorWidget` noch explizite String- oder Group-Checks auf `"standalone"` oder den alten Label-Text existieren, entferne diese bzw. passe sie auf `self.GROUP_PLUGINS` (`"plugins"`) und `"📁 Sets"` / `"📦 Services"` an.
+
+---
+
+## 4. Verifikation (Harte Regeln)
+
+1. **Statischer Syntax-Check:**
+
+python -m py_compile analytics/engine/service_selector_model.py serviceui/master_tree.py
+
+
+2. **Isolierter Baum-Test in `test/test.py`:**
+* Lade `ServiceSelectorModel().build_tree()`.
+* **Assert:** Der Baum enthält exakt **2 Root-Elemente** mit den Labels `"📁 Sets"` und `"📦 Services"`.
+* **Assert:** Kein Element besitzt mehr die Gruppe `"standalone"`.
+
+3. **Keine GUI-Tests ausführen (Rule 4).**
+
