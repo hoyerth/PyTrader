@@ -22,137 +22,129 @@
 
 ---
 
-# 18.01.01 Harmonisierung Analytics_win & Service_win (Rekursive Ordner)
+# 18.01.03 Dynamic Tree Management (Ordner-CRUD, Drag & Drop & Sets-Kategorien)
 
 ## 1. Regeln & Invarianten
 
-* **Einrückung:** Ausschließlich **4 Leerzeichen** (E-1: „Tabs" = redaktioneller Fehler).
+* **Einrückung:** Exakt **4 Leerzeichen** (Codebase-Standard).
 * **Spacing:** Exakt **1 Leerzeile** zwischen Funktionen/Methoden.
 * **UI-Tests:** **VERBOTEN.** Verifikation rein headless (`py_compile`, `test/test.py`).
-* **Architektur:** SRP, Inversion of Control, Entkopplung via `EventBus`.
+* **Architektur:** Modellgetrieben, Single Source of Truth (`ServiceSelectorModel`), Entkopplung via `EventBus`.
+
 ---
 
-## 2. Architektur & Datenfluss (Textblock-Schema)
+## 2. Architektur & Datenfluss
 
-[ServiceSelectorModel] ──(baut n-tiefe Ordner/Pfade)──► [MasterTree (serviceui)]
-         │                                                        │
-         ├──► [ServiceWindow]   ──(speichert)──► [StateManager (plugin_params_<id>)]
-         │                                                │
-         └──► [AnalyticsWindow] ──(sendet IDs)─► [AnalyticsViewModel] ◄── [EventBus]
+[MasterTree (Custom Drag&Drop + ContextMenu)] ──(Aktion)──► [ServiceSelectorModel / Repositories]
+        │                                                                │
+        ├── Neuer Ordner / Rename ──► Ordnerpfad-Aktualisierung          │
+        └── Drag & Drop DropEvent ──► Category-String Update             │
+                                                                         ▼
+[ServiceWindow & AnalyticsWindow] ◄────── (Refresh UI) ─────── [EventBus.service_set_changed]
+
+
 ---
 
-## 3. Betroffene Dateien
+## 3. Datenmodell-Erweiterungen
 
-* `analytics/engine/service_selector_model.py`: Rekursive Ordner (`_insert_into_category_tree`), tiefes Resolving (`category_plugin_ids`).
-* `serviceui/master_tree.py`: Rekursives Rendering (`GROUP_CATEGORY`) im QTreeWidget.
-* `serviceui/service_win.py`: Aktionen/Kontextmenüs für n-tiefe Ordner anpassen.
-* `analytics/ui/analytics_win.py`: Einbau `MasterTree` & `ParamColumnsWidget`, Standalone-Editierung, Multi-Select-Filter.
-* `analytics/engine/analytics_view_model.py`: Verarbeitet aufgelöste `feature_ids` aus Ordnern/Sets.
+* **Sets (`ServiceSetDefinition`):** Optionales Feld `"category": "Ordner/Unterordner"` in Set-JSON.
+* **Plugins / Standalone Services:** Kategorie-Pfad im Metadatum `category` bzw. Persistenz via `state_manager.save_global_value("plugin_params_<id>", ...)`.
 
 ---
 
 ## 4. Schritt-für-Schritt Anleitung (IDE-AI)
 
-### Step 1: Rekursion in `service_selector_model.py`
+### Step 1: Sets-Kategorisierung in `service_selector_model.py`
 
-* [ ] `_insert_into_category_tree()` für unbegrenzt verschachtelte Slash-Pfade (`A/B/C`) absichern.
-* [ ] `category_plugin_ids(path)` so anpassen, dass alle Plugins aus Unterordnern rekursiv gesammelt werden.
+* [ ] Ordner-Mechanik (`_insert_into_category_tree`) auch auf den Knoten `Sets` (`GROUP_SETS`) anwenden.
+* [ ] `category_set_ids(path)`-Methode hinzufügen, die alle `set_id`s aus Unterordnern rekursiv auflöst.
 
-### Step 2: `master_tree.py` & `service_win.py`
+### Step 2: Konfektionierung `MasterTree` (`serviceui/master_tree.py`)
 
-* [ ] Ordner-Rendering im `MasterTree` rekursiv für `GROUP_CATEGORY` umsetzen (`📁 <Name>`).
-* [ ] In `service_win.py` Ordner-Aktionen für tief verschachtelte Pfade anpassen.
+* [ ] **Drag & Drop aktivieren:** `setDragEnabled(True)`, `setAcceptDrops(True)`, `setDropIndicatorShown(True)`.
+* [ ] `dropEvent()` überschreiben:
+1. Ermittle gezogenen Knoten (Set-ID, Plugin-ID oder Ordner) und Ziel-Ordner-Pfad.
+2. Aktualisiere den Kategorie-Pfad beim Element.
+3. Emittiere Datenänderung an das Modell/Repositories.
 
-### Step 3: `analytics_win.py` Harmonisierung & Parameter-Editierung
+* [ ] **Kontextmenü erweitern (`customContextMenuRequested`):**
+1. **"Neuer Ordner":** Öffnet `QInputDialog`, erstellt neuen Unterordner-Pfad im gewählten Elternknoten.
+2. **"Umbenennen":** Benennt Ordner/Knoten um und führt Pfad-Update für alle enthaltenen Kinder durch (String-Replace).
 
-* [x] Legacy-Filter durch `MasterTree` & `ServiceParamColumnsMixin` ersetzen (umgesetzt im `ServiceSelectorDialog`, s. E-4).
-* [x] Bei Standalone-Service (`belongs_to_indicator == False`):
-1. Params laden: `state_manager.get_global_value("plugin_params_<id>", default)`.
-2. Im Param-Panel aus `full_parameter_schema()`/`_plugin_config()` rendern.
-3. Bei Änderung: `save_global_value("plugin_params_<id>", params)` + `event_bus.service_set_changed.emit()`.
 
-* [x] Bei Baum-Selektion (Set/Ordner/Plugin): IDs auflösen -> `view_model.set_feature_ids(ids)` (Live-Filter via `selection_ids_requested`).
+### Step 3: Persistenz & Synchronisation
+
+* [ ] Ordner-Aktionen für Sets via `ServiceSetRepository.save_set()` abspeichern.
+* [ ] Ordner-Aktionen für Standalone-Plugins via `state_manager.save_global_value("plugin_params_<id>", ...)` sichern.
+* [ ] Nach allen Strukturänderungen `event_bus.service_set_changed.emit()` abfeuern.
+
 
 ### Step 4: Quality Gate
 
-* [x] `python -m py_compile analytics/engine/service_selector_model.py serviceui/master_tree.py serviceui/service_win.py analytics/ui/analytics_win.py` (zusätzlich `serviceui/service_selector_dialog.py`) – **läuft fehlerfrei**.
-* [x] Headless-Test in `test/test.py` bzw. `test/` für rekursive Kategorien & Standalone-Params (42 Prüfungen bestanden, siehe §5.1 Step 4).
-* [x] Code-Check: 4 Leerzeichen (E-1), 1 Leerzeile Abstand (Ist-Code folgt dem).
+* [ ] `python -m py_compile serviceui/master_tree.py analytics/engine/service_selector_model.py analytics/ui/analytics_win.py serviceui/service_win.py`
+* [ ] Headless-Test in `test/test.py` für rekursive Sets-Kategorien & Pfad-Updates.
+* [ ] Code-Check: Exakt 4 Leerzeichen Einrückung, 1 Leerzeile Abstand.
+
 
 ---
 
-## 5. Review & Entscheidungen (08.08.2026, Bugfixing-Modus)
+## Prüfprotokoll 18.01.03 (08.08.2026) – Konsistenz, Vollständigkeit & Entscheidungen
 
-### 5.1 Vollständigkeits-Review (Ist-Code vs. Kapitel-Anweisung)
+### Prüfergebnis (Konsistenz)
+Der Plan ist architektonisch konsistent (Modell-getrieben, MasterTree entkoppelt via
+Signale, EventBus `service_set_changed`, keine SQL in UI). Die Ordner-Mechanik
+(`_insert_into_category_tree`, `category_plugin_ids`, `_category_parts`) existiert für
+GROUP_PLUGINS und ist die Vorlage für GROUP_SETS. **3 Lücken** gefunden:
 
-| Step | Status | Befund |
-|---|---|---|
-| Step 1 | **Bereits umgesetzt** | `_insert_into_category_tree()` ist bereits rekursiv (unbegrenzte Slash-Pfade, 16.08 K2); `category_plugin_ids(path)` sammelt bereits rekursiv aus Unterordnern (17.01.02). Tests in `test/test.py` (16.08, 17.01.02) vorhanden. |
-| Step 2 | **Bereits umgesetzt** | Rekursives Ordner-Rendering im MasterTree (`_build_category_item`/`_build_child_item`); Ordner-Aktionen in `service_win.py` (`_on_run_category`, `_on_category_info_requested`, `_category_path_of`). Tests vorhanden. |
-| Step 3 | **Umgesetzt (korrigierte Variante, s. E-4)** | Standalone-Editierung (plugin_params_<id> + EventBus-Sync), Live-Filter (`selection_ids_requested` → `set_feature_ids`) und Set-/Service-Verwaltung (CRUD via ServiceSetRepository) sind im `ServiceSelectorDialog` umgesetzt – NICHT eingebettet in `analytics_win.py` (siehe E-4). |
-| Step 4 | **Abgeschlossen (08.08.2026)** | `py_compile` aller betroffenen Dateien (inkl. `service_selector_model.py`, `master_tree.py`, `service_win.py`, `analytics_win.py`, `service_selector_dialog.py`) **läuft fehlerfrei**. Headless-Test `test/check_phase18_dialog.py` (42 Prüfungen: Auflösung, Panel-Editierbarkeit, Persistenz, Live-Filter, CRUD, Dialog-Singleton) **bestanden**, danach entfernt (Invariante 10). |
+* **L1 – `ServiceSetRepository.save_set()`-Whitelist:** Das Payload-Dict persistiert
+  nur feste Keys (`set_id, display_name, description, indicator_id, version,
+  schema_version, created_at, execution_order, services`). Ein neues Set-Feld
+  `category` würde beim Speichern VERWORFEN. → Step 3 bzw. „Datenmodell-
+  Erweiterungen" muss `category` additiv ins Payload aufnehmen (analog `indicator_id`),
+  sonst ist die Sets-Kategorisierung nicht persistent.
+* **L2 – `plugin_params_<id>`-Kollision:** Der Plan will Ordner-Aktionen für
+  Standalone-Plugins über `state_manager.save_global_value("plugin_params_<id>", ...)`
+  sichern. Dieser Key ist aber bereits exklusiv für das Parameter-Preset belegt
+  (service_win `_plugin_config`/`_save_plugin_params`, Dialog `_plugin_config` –
+  lookback/params/description). Vermischung von Kategorie-Override und Parameter-
+  Preset kollidiert semantisch und stört beide Editoren. → separater Key
+  `plugin_category_<id>` (siehe Entscheidung E1).
+* **L3 – Generische Ordner-Auflösung im Picker (SELECT_MULTI):**
+  `_resolve_selection_ids`/`_entries_for_scope` behandeln TYPE_CATEGORY aktuell nur
+  als Plugin-Ordner (`category_plugin_ids`). Bekommen auch SETS Ordner, muss die
+  Auflösung die ZUGEHÖRIGE GRUPPE des Ordners kennen (Sets-Ordner → Sets → Services
+  → plugin_ids; Plugins-Ordner → plugin_ids). `MasterTree._emit_selection_details`
+  liefert für TYPE_CATEGORY nur den Pfad im plugin_id-Slot – die Gruppe fehlt.
+  → MasterTree muss für Kategorie-Ordner die Elterngruppe (GROUP_SETS/GROUP_PLUGINS)
+  mitliefern.
 
-### 5.2 Konsistenz-Probleme (Doku vs. Ist-Code)
+### Entscheidungen (18.01.03)
+1. **E1 – Plugin-Kategorie-Override:** eigener global_settings-Key `plugin_category_<id>`
+   (JSON-String Pfad oder ""). Auswertungsreihenfolge im Modell `_category_parts()`:
+   Override (falls vorhanden) → sonst `metadata['category']` → sonst „keine Kategorie".
+   Das bestehende `plugin_params_<id>` bleibt unangetastet (Parameter-Preset).
+2. **E2 – Set-Kategorie-Persistenz:** `category` wird additiv in das `save_set()`-
+   Payload aufgenommen; `ServiceSetDefinition` erhält das optionale Feld `category`
+   (Doku in `analytics/engine/service_models.py`). Leer oder "General" = keine
+   Kategorie (Root-Ebene, Spiegel der Plugin-Logik).
+3. **E3 – Leere Ordner:** K9 bleibt gültig – ein per „Neuer Ordner" angelegter Ordner
+   existiert nur, solange er Kinder enthält; leere Ordner verschwinden beim nächsten
+   Refresh (akzeptiert, kein Empty-Folder-Persistenzmodus).
+4. **E4 – Drag & Drop Scope:** nur Kategorie-Moves (Set/Plugin/Ordner auf Ordner-
+   Ziel oder Root-Gruppe). Service-Reihenfolge bleibt beim Kontextmenü Order ▲/▼;
+   KEIN Service-Reorder per Drag & Drop.
+5. **E5 – Verdrahtung in allen Trees:** Die neuen MasterTree-Signale
+   (`create_folder_requested`, `rename_folder_requested`, `folder_item_moved`) werden
+   in service_win (FULL_EDIT) UND ServiceSelectorDialog (SELECT_MULTI, Picker =
+   Manager-Window 18.01.01 E-4) mit Orchestrator-Handlern verdrahtet.
 
-1. **Einrückung:** Kapitel verlangt „Ausschließlich Tabs" – der gesamte Codebase nutzt **4 Leerzeichen** (0 Tab-Zeilen in allen 7 Dateien). → Siehe E-1.
-2. **`ParamColumnsWidget`:** Diese Klasse existiert **nicht**. Real: `ServiceParamColumnsMixin` in `serviceui/param_columns.py`. → Siehe E-2.
-3. **`service_set_changed`-Emit:** `ServiceWindow._save_plugin_params()` emittiert aktuell **kein** `service_set_changed` (nur `_save_params_from_panel` im Set-Pfad). Kapitel verlangt das Emit für Standalone-Params. → Siehe E-3.
-4. **Test-Cleanup (Invariante 10):** `test/` enthält Alt-Proben (`_probe_meta.py`, `_probe_sets.py`, `_probe_*_out.txt`), die nach Abschluss entfernt werden müssen (nur `test.py` bleibt).
-
-### 5.3 Entscheidungen
-
-**E-1 (08.08.2026): Einrückung = 4 Leerzeichen, nicht Tabs.** Der Projekt-Standard (sämtliche bestehenden Dateien) ist 4 Leerzeichen pro Ebene. Die „Tabs"-Regel des Kapitels wird als redaktioneller Fehler gewertet und für alle Phase-18-Änderungen auf **4 Leerzeichen** korrigiert (kein Reindent bestehender Dateien, Code-Preserving). Spacing „1 Leerzeile zwischen Methoden" bleibt gültig (Ist-Code folgt dem bereits).
-
-**E-2 (08.08.2026): Referenzklasse = `ServiceParamColumnsMixin`.** Alle Vorkommen von „ParamColumnsWidget" in der Kapitel-Anweisung bezeichnen `serviceui/param_columns.py::ServiceParamColumnsMixin` (der einzige reale Param-Column-Builder, genutzt von `ServiceWindow` und `ServiceSelectorDialog`/`_DialogParamHost`). Eine neue Klasse wird nicht eingeführt.
-
-**E-3 (08.08.2026): `service_set_changed` nach Standalone-Speicherung.** Gemäß Kapitel wird bei `save_global_value("plugin_params_<id>", ...)` zusätzlich `event_bus.service_set_changed.emit()` abgesetzt, damit alle `ServiceSelectorModel`-Instanzen (MasterTree-Daten, Ausführungsdaten) live synchronisieren. Im ServiceWindow-Pfad wird das Verhalten beibehalten (der Run-Worker emittiert bereits am Ende); der neue Analytics-Pfad emittiert gemäß Kapitel.
-
-**E-4 (08.08.2026, KORRIGIERT am 08.08.2026): Umsetzungs-Variante für Step 3 = Dialog als frei beweglicher Service-Picker/Manager (KEINE Einbettung).** Die zuvor dokumentierte Option B („`ServiceSelectorDialog` entfällt ersatzlos, MasterTree + Param-Panel werden direkt in `analytics_win.py` eingebettet") wurde umgesetzt, vom Benutzer aber als Missverständnis korrigiert: Baum und Parameter **bleiben im `ServiceSelectorDialog`** – dieser ist das frei bewegliche „Manager-Window" während einer Analytics-Session. Die neue Logik wurde **im Dialog** implementiert:
-
-* **Live-Filter:** Klick auf eine Baum-Zeile (Set/Ordner/Plugin) löst die feature_ids auf (`_resolve_selection_ids`, Kategorie rekursiv via `category_plugin_ids`) und emittiert `selection_ids_requested` → `AnalyticsViewModel.set_feature_ids()` sofort (ohne „Anwenden").
-* **Standalone-Editierung:** Standalone-Services (`belongs_to_indicator == False`) sind im Param-Panel **editierbar** (`_DialogParamHost`: RAM-Definition + Dirty-Tracking, Speichern-Button; Persistenz `save_global_value("plugin_params_<id>", …)` + `event_bus.service_set_changed.emit()`).
-* **Verwaltung (CRUD):** Set anlegen/umbenennen/löschen, Service hinzufügen/entfernen/verschieben via `ServiceSetRepository` + EventBus-Live-Sync (MasterTree-Kontextmenü-Signale).
-* **Singleton-Dialog:** Kein `WA_DeleteOnClose` mehr – der Dialog bleibt während der Session erhalten, ist frei positionierbar (Geometrie via global_settings) und aktualisiert die Analytics-Ansicht live.
-
-### 5.4 Verbleibende offene Punkte (für die Umsetzung)
-
-1. **Dialog-Gestaltung:** Der `ServiceSelectorDialog` ist als frei bewegliches Manager-Window umgesetzt (kein `WA_DeleteOnClose`, Singleton). Checkbox-Multi-Select („Anwenden & Schließen") und Live-Filter (Zeilen-Klick) existieren parallel – das Zusammenspiel beider Pfade (z. B. Button-Anzeige nach Checkbox-Anwenden vs. Live-Filter) ist manuell zu prüfen.
-2. **Editierbarkeit:** Die Standalone-Editierung nutzt das `_DialogParamHost`-Muster (RAM-Definition + `plugin_params_<id>`); die `service_set_changed`-Konsistenz im ServiceWindow-Pfad wurde ergänzt (E-3). Die interaktive Bedienung (Dirty-Marker, Save-Button) ist manuell zu verifizieren.
-3. **Profil-Sync:** `_sync_service_filter_button`/`_active_display_names` bleiben gültig (Button-Text im AnalyticsWindow); nach einem Live-Filter werden die Anzeigenamen über das Modell re-resolved.
-
----
-
-# 6. Implementierungs-Log (Phase 18.01.01)
-
-**Log-Format:** Datum/Uhrzeit (MD), Schritt-ID, Datei(en), Kurzbeschreibung, Verifikation.
-
-### 08.08.2026 12:36 – Phase 18.01.01 abgeschlossen (4 Commits)
-
-1. **18.01.01 E-4-KORREKTUR (Commit `cd56958`):**
-   * `analytics/ui/analytics_win.py`, `serviceui/service_selector_dialog.py`, `serviceui/service_win.py`, `docs/AKTUELLE_UMSETZUNG.md`
-   * Revert der Analytics-Einbettung (Option B) – `ServiceSelectorDialog` ist wieder der frei bewegliche Picker/Manager während der Analytics-Session (Singleton, kein `WA_DeleteOnClose`, Geometrie-Persistenz).
-   * Live-Filter: Klick auf Set/Ordner/Plugin löst feature_ids auf (`_resolve_selection_ids`, Kategorie rekursiv via `category_plugin_ids`) → `selection_ids_requested` → `AnalyticsViewModel.set_feature_ids()`.
-   * Standalone-Editierung im Param-Panel (`_DialogParamHost`: `_plugin_config` + Dirty-Tracking, Speichern-Button; Persistenz `save_global_value("plugin_params_<id>", …)` inkl. Beschreibungs-Collection).
-   * Set-/Service-CRUD via `ServiceSetRepository` + `event_bus.service_set_changed` (E-3).
-   * E-3-Konsistenz: `ServiceWindow._save_plugin_params()` emittiert jetzt ebenfalls `service_set_changed`.
-   * Verifikation: `py_compile` aller 4 Dateien PASS; Headless-Test 42/42 (danach entfernt, Invariante 10).
-
-2. **18.01.01 Quality Gate Step 4 (Commit `876bc4f`):**
-   * `docs/AKTUELLE_UMSETZUNG.md`
-   * Doku-Status: Step-3-Zeile auf „Umgesetzt (korrigierte Variante, s. E-4)", Step-4 „Abgeschlossen", E-1-Einrückungs-Regel (4 Leerzeichen), Step-4-Checkboxen.
-   * Verifikation: `py_compile` aller 5 betroffenen Dateien PASS (inkl. `service_selector_model.py`, `master_tree.py`).
-
-3. **Bugfix: Parameteranzeige `_mode_schemas` (Commit `a9d917b`):**
-   * `serviceui/service_selector_dialog.py`
-   * `_DialogParamHost.__init__` initialisierte nur `_service_param_controls`/`_service_desc_controls`; `ServiceParamColumnsMixin._build_service_column` schreibt zusätzlich in `_mode_schemas`, `_service_param_labels`, `_service_info_labels`, `_service_info_pids` → `AttributeError: no attribute _mode_schemas`.
-   * Fix: 4 fehlende Registrys initialisiert; `_clear_panel` leert alle 6 Registrys (kein Stale beim Zeilenwechsel).
-   * Verifikation: `py_compile` PASS; Headless-Test 11/11 (echter `_build_service_column`-Pfad + Gegenprobe reproduziert den Original-Bug; danach entfernt).
-
-4. **Bugfix: Dialog-Fensterhöhe FIX + Scrollbars (Commit `033d3cc`):**
-   * `serviceui/service_selector_dialog.py`
-   * ServiceWindow-Muster (07.08.2026): `param_scroll.setWidgetResizable(False)` + Container wird nach jedem Panel-Aufbau explizit auf `layout().sizeHint()` gesetzt (`_resize_param_container_deferred`, deferred wegen QWidgetItemV2-Cache) → ScrollArea zeigt bei Überhöhe vertikale Scrollbalken statt Fensterhöhen-Anpassung.
-   * `setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)` (vorher nur horizontal), `setSizeConstraint(QLayout.SetNoConstraint)` (QDialog-Default hätte die Höhe beim show() an den Layout-sizeHint geklemmt).
-   * `_DialogParamHost._resize_param_box_deferred` delegiert an den Dialog (Mode-Wechsel/Experten-Optionen-Kollaps ziehen den Container nach, kein Fenster-Reflow).
-   * Verifikation: `py_compile` PASS; Headless-Test 17/17 (Container-Resize auf sizeHint, deferred-Planung, Host-Delegation, `_fit_dialog_width` ändert nur die Breite, kein `resize_to_clamped_content`/`_reflow` im Dialog; danach entfernt).
-
-**Abschluss:** Phase 18.01.01 (Harmonisierung Analytics_win & Service_win) vollständig umgesetzt und headless verifiziert. Offene Punkte aus §5.4 sind reine manuelle UI-Prüfungen (Zusammenspiel Checkbox/Anwenden vs. Live-Filter, Dirty-Marker/Speichern-Button, Profil-Sync) und blockieren den Stand nicht.
+### Generizitäts-Check (alle Trees: service_win / analytics_win / Service-Picker)
+Der MasterTree ist das gemeinsame Bauteil (FULL_EDIT bzw. SELECT_MULTI).
+Baum-Rekursion (`_build_child_item` → `_build_category_item`, Ordner ohne
+ItemIsUserCheckable), `_category_path_of` und der Checkbox-Zustand (`_checked_items`
+Keys sind pfadunabhängig: set_id/instance_id/plugin_id) sind bereits
+gruppen-agnostisch und funktionieren für Sets-Ordner identisch – sofern das Modell
+für Sets dasselbe Ordner-Blatt-Format liefert (`set_id/display_name/definition/services`).
+Einzige generische Lücke ist L3 (Gruppen-Kontext bei Kategorie-Klicks); in service_win
+muss analog zu `_on_run_category`/`_on_category_info_requested` die Sets-Ordner-
+Variante (Sets unter dem Pfad → Services) ergänzt werden.
