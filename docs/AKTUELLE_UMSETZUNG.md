@@ -127,9 +127,13 @@ GROUP_PLUGINS und ist die Vorlage für GROUP_SETS. **3 Lücken** gefunden:
    Payload aufgenommen; `ServiceSetDefinition` erhält das optionale Feld `category`
    (Doku in `analytics/engine/service_models.py`). Leer oder "General" = keine
    Kategorie (Root-Ebene, Spiegel der Plugin-Logik).
-3. **E3 – Leere Ordner:** K9 bleibt gültig – ein per „Neuer Ordner" angelegter Ordner
-   existiert nur, solange er Kinder enthält; leere Ordner verschwinden beim nächsten
-   Refresh (akzeptiert, kein Empty-Folder-Persistenzmodus).
+3. **E3 – Leere Ordner (REVIDIERT am 08.08.2026, Bugfixing-Modus):** Die
+   ursprüngliche Entscheidung („leere Ordner verschwinden beim nächsten Refresh,
+   kein Empty-Folder-Persistenzmodus") ist **widerrufen**. Benutzererzeugte
+   Ordner werden persistiert (global_settings, Key `tree_folders_sets` /
+   `tree_folders_plugins` – Liste Slash-Pfade ohne `📁`-Präfix) und verschwinden
+   **NICHT** beim Refresh, sondern nur bei **manueller Löschung** im Kontextmenü
+   („Ordner löschen", nur für leere Ordner aktiv). Umgesetzt in `phase18_step3`.
 4. **E4 – Drag & Drop Scope:** nur Kategorie-Moves (Set/Plugin/Ordner auf Ordner-
    Ziel oder Root-Gruppe). Service-Reihenfolge bleibt beim Kontextmenü Order ▲/▼;
    KEIN Service-Reorder per Drag & Drop.
@@ -193,7 +197,10 @@ Umgesetzt (alle Checklisten-Punkte des Kapitels abgearbeitet):
   Ordner-Zyklus (eigener Unterordner) werden abgelehnt.
 * Kontextmenü: „Neuer Ordner" (Gruppen + Ordner) und „Umbenennen" (Ordner);
   `create_folder_requested`/`rename_folder_requested`-Signale. „Neuer Ordner" ist
-  ein reiner UI-Zustand (`_pending_folder`/`_ensure_pending_folder`, K9/E3).
+  ein reiner UI-Zustand (`_pending_folder`/`_ensure_pending_folder`, K9/E3) –
+  **seit 08.08.2026 (E3-revidiert) ersatzlos entfernt: Der MasterTree emittiert
+  `create_folder_requested(group, full_path)`, der Orchestrator persistiert den
+  Ordner über `create_empty_folder` (global_settings, Key `tree_folders_<group>`).**
 * L3: `selection_details` liefert für TYPE_CATEGORY die Eltern-Gruppe im set_id-Slot;
   `category_info_requested`/`run_category_requested` tragen jetzt `(group, path)`.
 
@@ -224,3 +231,60 @@ Umgesetzt (alle Checklisten-Punkte des Kapitels abgearbeitet):
   `plugin_category_<id>` (Kollision mit Parameter-Preset vermieden).
 * `category_info_requested`/`run_category_requested` sind um die Gruppe erweitert
   (L3) – betroffene bestehende Tests wurden angepasst.
+
+
+---
+
+## Implementierungs-Log 18.01.03 (08.08.2026 15:40) – E3-revidiert: Leere Ordner persistieren
+
+**Bugfixing-Modus (User-Anweisung):** „Leere Ordner sollen nicht verschwinden, nur bei
+manueller Löschung im Kontextmenü." Damit ist **E3 widerrufen** (ursprünglich: leerer
+Ordner = reiner UI-Zustand `_pending_folder`, verschwindet beim nächsten Refresh).
+Umgesetzt in Commit `f300176` (phase18_step3).
+
+### Persistenz & Helfer (`serviceui/service_set_utils.py`)
+* `EMPTY_FOLDERS_KEY = "tree_folders_{}"` – global_settings-Key je Gruppe
+  (`tree_folders_sets` / `tree_folders_plugins`), Wert = Liste Slash-Pfade ohne
+  `📁`-Präfix.
+* `list_empty_folders(state_manager, group)` / `save_empty_folders(...)` –
+  lesen/schreiben (dedupliziert, defensiv gegen Fehler).
+* `create_empty_folder(state_manager, group, path)` – idempotent (kein Duplikat).
+* `delete_empty_folder(state_manager, group, path)` – manuelle Löschung.
+* `rename_category(...)` zieht zusätzlich die persistierten leeren Ordner der
+  Gruppe mit um (Praefix-Replace, `_replace_prefix`).
+
+### Modell (`analytics/engine/service_selector_model.py`)
+* `_empty_folder_paths` (pro Gruppe) wird in `refresh()` geladen
+  (`_load_empty_folders`); Accessor `empty_folder_paths(group)` (lesend).
+* `_ensure_category_path(nodes, parts)` – erzeugt die Ordnerkette OHNE
+  Blatt-Einfügung; bereits vorhandene reale Ordner (aus Blatt-Kategorien) werden
+  wiederverwendet → **kein Duplikat**.
+* `build_tree()` mischt die persistierten Pfade in die Gruppen-Kinder ein (Sets
+  UND Plugins), danach erneute Sortierung (K8). Leere Ordner überleben Refreshs.
+
+### MasterTree (`serviceui/master_tree.py`)
+* `_pending_folder`/`_ensure_pending_folder` **ersatzlos entfernt** (kein
+  UI-Zustand mehr); Drop-Handler räumt nichts mehr auf.
+* `create_folder_requested(group, full_path)` – `_on_new_folder` fragt nur noch
+  den Namen ab und emittiert (Orchestrator persistiert).
+* Neues Signal `delete_folder_requested(group, path)` + Kontextmenü **„Ordner
+  löschen"** – nur für Ordner OHNE Kinder aktiv (Guard `item.childCount() == 0`);
+  Tooltip erklärt den Guard.
+* `_build_category_item` rendert leere Ordner ohne `>`-Expand-Symbol
+  (`bool(child.get("children"))` statt hart `True`).
+
+### Verdrahtung (`serviceui/service_win.py` + `serviceui/service_selector_dialog.py`)
+* Beide Trees: `_on_create_folder`/`_on_delete_folder` (DRY über
+  service_set_utils, global_settings + `event_bus.service_set_changed`).
+
+### Validierung (headless, `test/test.py`, Teil 27, neu)
+* 17/17 Prüfungen PASS (A1–A4 Helfer, B1–B3 build_tree leerer Ordner,
+  C1 Refresh-Persistenz, D1 Plugins-Gruppe, E1 verschachtelte Elternkette,
+  F1/F2 kein Duplikat bei realem Ordner + Blatt erhalten, G1/G2 Rename zieht
+  leere Ordner mit, H1–H3 manuelle Löschung, I1 Gruppen-Isolation).
+* Teil 26 (18.01.03-Bestand) weiterhin 20/20 PASS; `py_compile` auf allen
+  betroffenen Dateien PASS.
+* **Hinweis (vorbestehend, unverändert):** Geometrie-Tests P2/P5/H3/H4/H5/H7
+  schlagen weiterhin in der Baseline fehl (offscreen `800x582`, Reflow-/Scrollbar-
+  Umbau 07./08.08.2026) – nicht durch E3-revidiert verursacht. Separater Bugfix
+  nur auf Wunsch.
