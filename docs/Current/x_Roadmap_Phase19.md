@@ -25,3 +25,54 @@
 
 ---
 
+# 19.01 Analytics UI: Status-Feedback, Empty-State & Multi-Service Table Handling
+
+### 1. Architektur & Datenfluss
+
+[AnalyticsWindow] ──(ViewModel `data_ready`)──► Status-Check (total == 0?)
+        │
+        ├── Ist Total == 0 ──► label_status_msg: "⚠️ Keine Daten vorhanden"
+        │                      Pages -> clear_data() / Empty State
+        │
+        └── Multi-Select   ──► TablePage: Spalte 1 = "Service" (feature_id/display_name)
+                               + Chronologische Sortierung + JSON-Union-Key-Spalten
+
+---
+
+### 2. Betroffene Dateien
+
+* `analytics/ui/analytics_win.py`: Status-Message (`label_status_msg`) hinter Limit-Feld einbauen, Auswertung von `data_ready(kind, data)`.
+* `analytics/ui/table_page.py`: Multi-Service-Darstellung anpassen (Spalte 1 = Service, dynamische JSON-Spalten-Union, chronologische Sortierung).
+* `analytics/engine/analytics_view_model.py`: Bereitstellung typisierter Datenströme bei Einzel- und Multi-`feature_ids`.
+
+---
+
+### 3. Schritt-für-Schritt Anleitung (IDE-AI)
+
+#### Step 1: Status-Message im Filterbereich (`analytics_win.py`)
+
+* [ ] Platziere ein `QLabel` (`label_status_msg`) direkt neben/hinter dem Limit-Input-Feld (`spin_limit`).
+* [ ] Verbinde den Event-Handler für `view_model.data_ready(kind, data)`:
+* Falls `data.get("total", 0) == 0`:
+* Setze `label_status_msg.setText("⚠️ Keine Daten vorhanden")` (Farbton: dezent gelb/orange).
+* Blende leere Zustände auf den Unterseiten (`table_page`, `heatmap_page`, `scatter_page`, `distribution_page`) sauber aus/zurück.
+
+* Falls `data.get("total", 0) > 0`:
+* Setze `label_status_msg.setText(f"✅ {total} Einträge")` oder leere den Text.
+
+#### Step 2: Multi-Service Spaltenaufbereitung (`table_page.py`)
+
+* [ ] Erweitere das Layout der `TablePage`:
+1. Füge als **Spalte 1** das Feld **`Service`** ein (Anzeige der `feature_id` bzw. des via `service_selector_model.resolve_display_names()` aufgelösten Namens).
+2. Standard-Spaltenreihenfolge festlegen: `[Zeitstempel, Service, ema_diff, rsi_14, atr_normalized, ...]`.
+3. Bei Zusatzfeldern aus `feature_data`: Bilde die Union aller JSON-Keys über die geladenen Rows; fülle fehlende Werte bei abweichenden Services mit `"-"`.
+4. Erzwinge eine chronologisch absteigende Sortierung nach `bar_time`, damit Signale verschiedener Services zeitlich korrekt gemischt dargestellt werden.
+
+#### Step 3: Quality Gate & Verifikation
+
+* [ ] Syntax-Check via Terminal ausführen:
+`python -m py_compile analytics/ui/analytics_win.py analytics/ui/table_page.py analytics/engine/analytics_view_model.py`
+
+* [ ] Headless-Test in `test/test.py` für `AnalyticsViewModel`-Abfragen ausführen:
+* Testfall A: Abfrage für ungescannte Symbole/Services liefert `total == 0`.
+* Testfall B: Multi-`feature_ids`-Abfrage liefert gemischte Ergebnissätze.
