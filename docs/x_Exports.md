@@ -49,6 +49,9 @@ PyTrader/
                 srv_swing_momentum.py
                 srv_swing_structure.py
                 srv_swing_volume_profile.py
+                srv_trend_breakout.py
+                srv_trend_hma_pivot.py
+                srv_trend_regime.py
             plugins/
                 __init__.py
                 base_plugin.py
@@ -12199,6 +12202,1328 @@ class SrvSwingVolumeProfile(PluginFeature):
                     "source_mode": mode,
                     "total_swing_highs": total_high,
                     "total_swing_lows": total_low,
+                    "bars": n,
+                },
+            },
+        }
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/features/definitions/srv_trend_breakout.py
+```py
+# analytics/features/definitions/srv_trend_breakout.py
+# ==============================================================================
+# DEFINITION: srv_trend_breakout
+# ==============================================================================
+# NAME:        Trend Breakout Service
+# KATEGORIE:   Trend & Reversal/Breakout & Kanal
+# BESCHREIBUNG: Trendfolgende Trailing-Stops & Kanal-Breakouts via Supertrend & Donchian/Keltner
+# ==============================================================================
+"""
+Service: TrendBreakout (Phase 17.02) - Naming Convention 16.08.01: srv_
+
+Erkennt Trendwechsel und Ausbrueche ueber dynamische ATR-Trailings und
+Bänder (Supertrend ATR, Donchian/Keltner-Kanaele). Reiner Datenlieferant
+fuer die Analytics-UI und spaetere ML-Pipelines - KEINE Chart-Visualisierung
+in diesem Kapitel (17.02, §1).
+
+Causal Timestamping (Kein Look-ahead Bias, 17.01 §2.4):
+  * event_bar_time:        Zeitpunkt der betrachteten Kerze (Bar-Close-Signal).
+  * confirmation_bar_time: identisch zu event_bar_time (confirmation_lag_bars
+                           = 0).
+  * Kerzen am Serienanfang ohne ausreichenden Lookback (Kanal-/ATR-Warmup)
+    erhalten calculation_status = 'INSUFFICIENT_DATA' und is_trend_* = False.
+
+Datenvertrag (17.02 §3): result_type TREND|BREAKOUT, 1 Record pro Bar,
+flache Records (nur bar_time + feature_data-Inhalte; symbol/timeframe/
+feature_id setzt store_plugin_payload selbst).
+
+Capabilities (E-5, 07.08.2026): chart=False, batch=True, live=False,
+feature_store=True, render=False.
+metadata['category'] = 'Trend & Reversal/Breakout & Kanal' fuer den MasterTree.
+
+PARAMETER (PineScript-Input-Zone, 17.01 §2.2): Modul-Konstante
+`_TREND_BREAKOUT_SCHEMA` direkt unter diesem Header. `parameter_schema`
+gibt eine flache Kopie zurueck (M1). `visible_when` (17.01.05): Conditional
+Visibility beim Mode-Wechsel.
+"""
+
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+
+from analytics.features.plugins.base_plugin import (
+    FeatureCalculateResult,
+    ParameterSchema,
+    PluginCapabilities,
+    PluginContext,
+    PluginFeature,
+)
+
+# ---------------------------------------------------------------------------
+# PARAMETER (PineScript-Input-Zone, 17.01): Single Source of Truth fuer das
+# Prop-Fenster. E-2: type-Werte als Strings. E-4: `visible_when`-Deklarationen.
+# ---------------------------------------------------------------------------
+_TREND_BREAKOUT_SCHEMA: Dict[str, ParameterSchema] = {
+    "mode": {
+        "type": "str",
+        "default": "Supertrend_ATR",
+        "options": ["Supertrend_ATR", "Donchian_Keltner_Breakout"],
+        "description": "Breakout-Algorithmus",
+    },
+    "channel_type": {
+        "type": "str",
+        "default": "Donchian",
+        "options": ["Donchian", "Keltner"],
+        "description": "Kanal-Typ bei mode == 'Donchian_Keltner_Breakout'",
+        "visible_when": {"mode": "Donchian_Keltner_Breakout"},
+    },
+    "atr_period": {
+        "type": "int", "default": 10, "min": 1,
+        "description": "ATR-Periode fuer Supertrend / Keltner",
+    },
+    "atr_mult": {
+        "type": "float", "default": 3.0, "min": 0.1,
+        "description": "ATR-Multiplikator fuer Bänder/Trailing",
+    },
+    "period": {
+        "type": "int", "default": 20, "min": 2,
+        "description": "Donchian/Keltner Kanal-Periode",
+        "visible_when": {"mode": "Donchian_Keltner_Breakout"},
+    },
+    "ma_type": {
+        "type": "str",
+        "default": "EMA",
+        "options": [
+            "SMA", "EMA", "WMA", "DEMA", "TEMA", "HMA", "EHMA",
+            "ZLEMA", "RMA", "KAMA", "ALMA", "VWMA",
+        ],
+        "description": "MA-Typ fuer Keltner Baseline",
+        "visible_when": {"mode": "Donchian_Keltner_Breakout"},
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Modul-Helfer (17.02: direkte, vollstaendige Erkennung statt Scaffold)
+# ---------------------------------------------------------------------------
+
+def _atr_series(df: pd.DataFrame, period: int) -> pd.Series:
+    """Wilder-ATR (EMA-alpha 1/period, adjust=False) ueber OHLCV."""
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1.0 / period, adjust=False).mean()
+
+
+def _supertrend(df: pd.DataFrame, atr_period: int, atr_mult: float
+                ) -> pd.DataFrame:
+    """Supertrend (ATR-Trailing) vektorisiert mit sequenzieller
+    final-Band-Regel (wie im Ist-Stand des Projekts).
+
+    basic_upper/lower = (high+low)/2 +- atr_mult * ATR.
+    final_upper/lower: klemmt das Band in Trendrichtung (kein Ueberspringen
+    beim Wechsel). supertrend = final_upper (downtrend) | final_lower (uptrend).
+    """
+    high = df["high"].astype(float).to_numpy()
+    low = df["low"].astype(float).to_numpy()
+    close = df["close"].astype(float).to_numpy()
+    atr = _atr_series(df, atr_period).to_numpy(dtype=float)
+
+    n = len(df)
+    hl2 = (high + low) / 2.0
+    basic_upper = hl2 + atr_mult * atr
+    basic_lower = hl2 - atr_mult * atr
+
+    final_upper = np.empty(n)
+    final_lower = np.empty(n)
+    supertrend = np.empty(n)
+    direction = np.zeros(n, dtype=bool)  # True = uptrend
+
+    for i in range(n):
+        if i == 0:
+            final_upper[i] = basic_upper[i]
+            final_lower[i] = basic_lower[i]
+            direction[i] = close[i] > final_upper[i]
+        else:
+            # final_upper: nur nach oben ziehen, wenn vorher nicht drunter.
+            prev_close = close[i - 1]
+            if prev_close <= final_upper[i - 1]:
+                final_upper[i] = min(basic_upper[i], final_upper[i - 1])
+            else:
+                final_upper[i] = basic_upper[i]
+            if prev_close >= final_lower[i - 1]:
+                final_lower[i] = max(basic_lower[i], final_lower[i - 1])
+            else:
+                final_lower[i] = basic_lower[i]
+            # Richtung beibehalten, bis der Schlusskurs die Linie durchbricht.
+            if direction[i - 1]:
+                if close[i] < final_lower[i]:
+                    direction[i] = False
+                else:
+                    direction[i] = True
+            else:
+                if close[i] > final_upper[i]:
+                    direction[i] = True
+                else:
+                    direction[i] = False
+
+        supertrend[i] = final_lower[i] if direction[i] else final_upper[i]
+
+    return pd.DataFrame({
+        "supertrend_line": supertrend,
+        "direction": direction,
+        "atr": atr,
+    }, index=df.index)
+
+
+def _donchian_keltner(df: pd.DataFrame, channel_type: str, period: int,
+                      ma_type: str, atr_period: int, atr_mult: float
+                      ) -> pd.DataFrame:
+    """Donchian- oder Keltner-Kanal vektorisiert (upper/lower/middle)."""
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+
+    if channel_type == "Keltner":
+        # MA-Serie (Template 16.04, alle 12 Typen; VWMA nutzt tick_volume).
+        try:
+            from chart.indicators.utils.ma_template import MATemplateEngine
+        except Exception:
+            MATemplateEngine = None  # type: ignore
+        if MATemplateEngine is not None and ma_type in (
+                "SMA", "EMA", "WMA", "DEMA", "TEMA", "HMA", "EHMA",
+                "ZLEMA", "RMA", "KAMA", "ALMA", "VWMA"):
+            volume = df["tick_volume"] if "tick_volume" in df.columns else None
+            middle = MATemplateEngine.calculate_ma(
+                close, ma_type, period, volume=volume)
+        else:
+            middle = close.rolling(period, min_periods=1).mean()
+        atr = _atr_series(df, atr_period)
+        upper = middle + atr_mult * atr
+        lower = middle - atr_mult * atr
+    else:  # Donchian
+        # Kausaler Kanal: NUR abgeschlossene Bars (shift(1)) - ein Close
+        # bricht die letzten N Bars DURCH. Ohne shift waere upper >= aktuelle
+        # high > close immer, ein Breakout-Signal nie moeglich (Bugfix
+        # waehrend der Tests, 17.02 Umsetzung).
+        upper = high.shift(1).rolling(period, min_periods=period).max()
+        lower = low.shift(1).rolling(period, min_periods=period).min()
+        middle = (upper + lower) / 2.0
+
+    return pd.DataFrame({
+        "upper_band": upper,
+        "lower_band": lower,
+        "middle_band": middle,
+    })
+
+
+class SrvTrendBreakout(PluginFeature):
+    """Trend-Ausbrueche & Trailing-Stops (Supertrend, Donchian/Keltner).
+
+    Stateless (Basisklassen-Vertrag): Berechnung ist eine reine Funktion
+    calculate(df, params, context) - keine eigenen Zustaende.
+    """
+
+    @property
+    def plugin_id(self) -> str:
+        return "srv_trend_breakout"
+
+    @property
+    def version(self) -> str:
+        return "1.0.0"
+
+    @property
+    def metadata(self) -> Dict[str, Any]:
+        return {
+            "category": "Trend & Reversal/Breakout & Kanal",
+            "display_name": "Trend Breakout Service",
+            "description": "Erfasst Trend-Ausbrueche und Trailing-Stops ueber Supertrend ATR und Donchian/Keltner-Kanaele.",
+            "author": "PyTrader AI",
+            "tags": ["trend", "breakout", "supertrend", "donchian", "keltner"],
+            # Phase 14 P14-01: Erweiterte Beschreibungsfelder
+            "description_long": "Reiner Datenlieferant (feature_store=True) fuer "
+                                "die Analytics-UI und ML-Pipelines. Liefert "
+                                "kausale Trendwechsel-Signale. Supertrend "
+                                "schaltet bei Schlusskurs-Durchbruch des "
+                                "Median+-ATR-Bandes um. Donchian/Keltner "
+                                "signalisiert Ausbrueche aus N-Bar Extrema "
+                                "oder Volatilitaetsbändern. Keine "
+                                "Chart-Visualisierung in Kapitel 17.02.",
+            "condition_rules": [
+                "Supertrend_ATR: TrendUp = Close > Supertrend_Line",
+                "Donchian_Keltner_Breakout: TrendUp = Close > Upper_Channel_Band",
+                "Causal Timestamps: event/confirmation_bar_time, confirmation_lag_bars, INSUFFICIENT_DATA",
+            ],
+            "api_version": "1",
+        }
+
+    @property
+    def capabilities(self) -> PluginCapabilities:
+        return {
+            "chart": False,   # E-5: kein Indikator in Kapitel 17.02
+            "batch": True,
+            "live": False,
+            "feature_store": True,
+            "render": False,  # E-5: reine Datenlieferanten
+        }
+
+    # --- Single Source of Truth fuer's Prop-Fenster (17.01 §2.2, PineScript-Zone)
+    @property
+    def parameter_order(self) -> List[str]:
+        return list(_TREND_BREAKOUT_SCHEMA.keys())
+
+    @property
+    def param_labels(self) -> Dict[str, str]:
+        return {
+            "mode": "Breakout-Algorithmus",
+            "channel_type": "Kanal-Typ (Donchian/Keltner)",
+            "atr_period": "ATR-Periode",
+            "atr_mult": "ATR-Multiplikator",
+            "period": "Kanal-Periode",
+            "ma_type": "MA-Typ (Keltner Baseline)",
+        }
+
+    @property
+    def parameter_schema(self) -> Dict[str, ParameterSchema]:
+        """Flache Kopie der Modul-Konstante `_TREND_BREAKOUT_SCHEMA`
+        (PineScript-Input-Zone am Dateianfang, M1: kein geteiltes Dict)."""
+        return {k: dict(v) for k, v in _TREND_BREAKOUT_SCHEMA.items()}
+
+    # 2. SCHEMA-EXPOSURE FUER DIE UI (17.01.04, Bugfix): Siehe
+    # srv_trend_regime.py - identischer Basisklassen-Vertrag.
+    @property
+    def default_params(self) -> Dict[str, Any]:
+        """Extrahiert die Default-Werte aus dem parameter_schema fuer die Engine."""
+        return {k: v.get("default") for k, v in self.parameter_schema.items()
+                if "default" in v}
+
+    def full_parameter_schema(self) -> Dict[str, ParameterSchema]:
+        """Liefert das vollstaendige Schema (Basis + plugin-spezifisch) inkl.
+        Min/Max/Typ fuer die UI-Spalten (Basisklassen-Vertrag)."""
+        merged = dict(self.base_parameter_schema)
+        merged.update(dict(self.parameter_schema or {}))
+        return merged
+
+    def calculate(
+        self,
+        df: pd.DataFrame,
+        params: Dict[str, Any],
+        context: Optional[PluginContext] = None,
+    ) -> FeatureCalculateResult:
+        """Berechnet Trend-Breakouts (Supertrend/Donchian/Keltner).
+
+        Datenvertrag (17.02 §3): 1 Record pro Bar (dichte Label-Reihe).
+        Trend-Bars tragen is_trend_up/is_trend_down=True sowie kausale
+        Zeitstempel (event/confirmation_bar_time, confirmation_lag_bars=0).
+        Bars am Serienanfang ohne Kanal-/ATR-Historie erhalten
+        calculation_status='INSUFFICIENT_DATA'.
+
+        Modi (params['mode']):
+          * Supertrend_ATR: ATR-Trailing; TrendUp = Close > Supertrend_Line.
+          * Donchian_Keltner_Breakout: Donchian (N-Bar Extrema) oder Keltner
+            (MA +- ATR-Multiplikator); TrendUp = Close > Upper_Channel_Band.
+        """
+        empty: FeatureCalculateResult = {"feature_store_payload": {}}
+        if df is None or df.empty:
+            return empty
+
+        # Defensive Normalisierung: 'time'-Spalte (epoch) sicherstellen.
+        work = df.copy()
+        if "time" not in work.columns:
+            if "bar_time" in work.columns:
+                work["time"] = work["bar_time"].apply(
+                    lambda v: int(v.timestamp())
+                    if hasattr(v, "timestamp") else int(v))
+            else:
+                return empty
+
+        p = self.validate_params(params)
+        mode = str(p.get("mode") or "Supertrend_ATR")
+        channel_type = str(p.get("channel_type") or "Donchian")
+        atr_period = int(p.get("atr_period") or 10)
+        atr_mult = float(p.get("atr_mult") or 3.0)
+        period = int(p.get("period") or 20)
+        ma_type = str(p.get("ma_type") or "EMA")
+
+        n = len(work)
+        times = work["time"].to_numpy(dtype=np.int64)
+        close = work["close"].to_numpy(dtype=float)
+
+        is_trend_up = np.zeros(n, dtype=bool)
+        is_trend_down = np.zeros(n, dtype=bool)
+        is_rev_up = np.zeros(n, dtype=bool)
+        is_rev_down = np.zeros(n, dtype=bool)
+        status = np.full(n, "OK", dtype=object)
+        strength = np.zeros(n, dtype=float)
+        strength_type = "ATR_DISTANCE"
+        conf_type = "BAR_CLOSE"
+        extra: Dict[str, np.ndarray] = {}
+
+        if mode == "Supertrend_ATR":
+            st = _supertrend(work, atr_period, atr_mult)
+            line = st["supertrend_line"].to_numpy(dtype=float)
+            atr = st["atr"].to_numpy(dtype=float)
+            nan = ~np.isfinite(line) | ~np.isfinite(atr)
+            status[nan] = "INSUFFICIENT_DATA"
+            is_trend_up = close > line
+            is_trend_down = close < line
+            # Staerke: Distanz in ATR-Einheiten.
+            strength = np.where(
+                (np.isfinite(atr)) & (atr > 0),
+                np.abs(close - line) / np.where(atr > 0, atr, np.nan),
+                0.0)
+            extra["supertrend_line"] = np.where(np.isfinite(line), line, np.nan)
+            extra["atr_value"] = np.where(np.isfinite(atr), atr, np.nan)
+
+        elif mode == "Donchian_Keltner_Breakout":
+            ch = _donchian_keltner(work, channel_type, period, ma_type,
+                                   atr_period, atr_mult)
+            upper = ch["upper_band"].to_numpy(dtype=float)
+            lower = ch["lower_band"].to_numpy(dtype=float)
+            middle = ch["middle_band"].to_numpy(dtype=float)
+            nan = ~np.isfinite(upper) | ~np.isfinite(lower)
+            status[nan] = "INSUFFICIENT_DATA"
+            is_trend_up = close > upper
+            is_trend_down = close < lower
+            spread = np.where(
+                (np.isfinite(upper)) & (np.isfinite(lower)),
+                (upper - lower) / 2.0, np.nan)
+            strength = np.where(
+                (np.isfinite(spread)) & (spread > 0),
+                np.abs(close - middle) / np.where(spread > 0, spread, np.nan),
+                0.0)
+            strength_type = "ATR_DISTANCE"
+            extra["upper_band"] = np.where(np.isfinite(upper), upper, np.nan)
+            extra["lower_band"] = np.where(np.isfinite(lower), lower, np.nan)
+            extra["middle_band"] = np.where(np.isfinite(middle), middle, np.nan)
+
+        else:
+            # Unbekannter Modus: defensiv leer (kein Crash, 0 Rows).
+            return empty
+
+        # --- Records bauen (dicht: 1 Record pro Bar, 17.02 §3) --------------
+        records: List[Dict[str, Any]] = []
+        total_up = int(is_trend_up.sum())
+        total_down = int(is_trend_down.sum())
+        for i in range(n):
+            rec: Dict[str, Any] = {
+                "bar_time": int(times[i]),
+                "result_type": "BREAKOUT" if (is_trend_up[i] or is_trend_down[i])
+                else "TREND",
+                "source_mode": mode,
+                "calculation_status": str(status[i]),
+                "is_trend_up": bool(is_trend_up[i]),
+                "is_trend_down": bool(is_trend_down[i]),
+                "is_reversal_up": bool(is_rev_up[i]),
+                "is_reversal_down": bool(is_rev_down[i]),
+                # Bar-Close-Signal: event == confirmation (Lag 0).
+                "event_bar_time": int(times[i]),
+                "confirmation_bar_time": int(times[i]),
+                "confirmation_lag_bars": 0,
+                "confirmation_type": conf_type,
+                "trend_strength": float(strength[i]),
+                "strength_type": strength_type,
+                "reference_price": float(close[i]),
+            }
+            for k, arr in extra.items():
+                rec[k] = float(arr[i]) if np.isfinite(arr[i]) else None
+            records.append(rec)
+
+        return {
+            "feature_store_payload": {
+                "feature_id": self.plugin_id,
+                "plugin_version": self.version,
+                "records": records,
+                "metadata": {
+                    # E-7 / base_plugin (U15-A1, Invariante 5): schema_version
+                    # ist Pflichtfeld fuer alle feature_store=True-Plugins.
+                    "schema_version": "1.0.0",
+                    "source_mode": mode,
+                    "total_trend_up": total_up,
+                    "total_trend_down": total_down,
+                    "bars": n,
+                },
+            },
+        }
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/features/definitions/srv_trend_hma_pivot.py
+```py
+# analytics/features/definitions/srv_trend_hma_pivot.py
+# ==============================================================================
+# DEFINITION: srv_trend_hma_pivot
+# ==============================================================================
+# NAME:        HMA Peak-Toleranz Pivot Service
+# KATEGORIE:   Trend & Reversal/Hysteresis & Pivots
+# BESCHREIBUNG: Trendwechsel-Erkennung auf geglaetteter EHMA/HMA mit Prozent-Hysterese
+# ==============================================================================
+"""
+Service: TrendHmaPivot (Phase 17.02) - Naming Convention 16.08.01: srv_
+
+Spezialisierter Trendwechsel-Detektor auf Basis von HMA/EHMA-Extrema und
+prozentualer Hysterese (PineScript-Logik `piv_pendingExtremeValue`).
+Reiner Datenlieferant fuer die Analytics-UI und spaetere ML-Pipelines -
+KEINE Chart-Visualisierung in diesem Kapitel (17.02, §1).
+
+Causal Timestamping (Kein Look-ahead Bias, 17.01 §2.4):
+  * event_bar_time:        Zeitpunkt der betrachteten Kerze (Bar-Close-Signal).
+  * confirmation_bar_time: identisch zu event_bar_time (confirmation_lag_bars
+                           = 0; Bar-Close-Signal der geglaetteten MA).
+  * Kerzen am Serienanfang ohne ausreichenden MA-Warmup erhalten
+    calculation_status = 'INSUFFICIENT_DATA' und is_trend_* = False.
+
+Datenvertrag (17.02 §3): result_type TREND|REVERSAL, 1 Record pro Bar,
+flache Records (nur bar_time + feature_data-Inhalte; symbol/timeframe/
+feature_id setzt store_plugin_payload selbst).
+
+Capabilities (E-5, 07.08.2026): chart=False, batch=True, live=False,
+feature_store=True, render=False.
+metadata['category'] = 'Trend & Reversal/Hysteresis & Pivots' fuer den MasterTree.
+
+PARAMETER (PineScript-Input-Zone, 17.01 §2.2): Modul-Konstante
+`_TREND_HMA_PIVOT_SCHEMA` direkt unter diesem Header. `parameter_schema`
+gibt eine flache Kopie zurueck (M1). `visible_when` (17.01.05): Conditional
+Visibility beim Mode-Wechsel.
+"""
+
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+
+from analytics.features.plugins.base_plugin import (
+    FeatureCalculateResult,
+    ParameterSchema,
+    PluginCapabilities,
+    PluginContext,
+    PluginFeature,
+)
+
+# ---------------------------------------------------------------------------
+# PARAMETER (PineScript-Input-Zone, 17.01): Single Source of Truth fuer das
+# Prop-Fenster. E-2: type-Werte als Strings. E-4: `visible_when`-Deklarationen.
+# ---------------------------------------------------------------------------
+_TREND_HMA_PIVOT_SCHEMA: Dict[str, ParameterSchema] = {
+    "mode": {
+        "type": "str",
+        "default": "HMA_Peak_Toleranz",
+        "options": ["HMA_Peak_Toleranz"],
+        "description": "HMA Pivot Hysteresis Modus",
+    },
+    "piv_len": {
+        "type": "int", "default": 4, "min": 1,
+        "description": "Pivot-Lookback/Glaettung",
+        "visible_when": {"mode": "HMA_Peak_Toleranz"},
+    },
+    "hma_type": {
+        "type": "str",
+        "default": "EHMA",
+        "options": [
+            "SMA", "EMA", "WMA", "DEMA", "TEMA", "HMA", "EHMA",
+            "ZLEMA", "RMA", "KAMA", "ALMA", "VWMA",
+        ],
+        "description": "Gleitender Durchschnittstyp (EHMA/HMA)",
+        "visible_when": {"mode": "HMA_Peak_Toleranz"},
+    },
+    "hma_smoothing": {
+        "type": "int", "default": 10, "min": 2,
+        "description": "Hauptperiode des MA",
+        "visible_when": {"mode": "HMA_Peak_Toleranz"},
+    },
+    "piv_maxHmaMovePct": {
+        "type": "float", "default": 0.2, "min": 0.01,
+        "description": "Erforderlicher prozentualer Mindestabstand vom Peak fuer Trendwechsel",
+        "visible_when": {"mode": "HMA_Peak_Toleranz"},
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Modul-Helfer (17.02: direkte, vollstaendige Erkennung statt Scaffold)
+# ---------------------------------------------------------------------------
+
+def _ma_series(df: pd.DataFrame, ma_type: str, period: int) -> pd.Series:
+    """MA-Serie (Template 16.04, alle 12 Typen; VWMA nutzt tick_volume).
+
+    Lokaler Import (E-3, 17.02 Review): `chart.indicators.utils.ma_template`
+    - der Pfad `analytics.features.helpers.ma_template` existiert nicht.
+    """
+    try:
+        from chart.indicators.utils.ma_template import MATemplateEngine
+    except Exception:
+        MATemplateEngine = None  # type: ignore
+    close = df["close"].astype(float)
+    if MATemplateEngine is not None and ma_type in (
+            "SMA", "EMA", "WMA", "DEMA", "TEMA", "HMA", "EHMA",
+            "ZLEMA", "RMA", "KAMA", "ALMA", "VWMA"):
+        volume = df["tick_volume"] if "tick_volume" in df.columns else None
+        return MATemplateEngine.calculate_ma(close, ma_type, period,
+                                             volume=volume)
+    # Fallback: einfacher SMA (defensiv, kein Crash).
+    return close.rolling(period, min_periods=1).mean()
+
+
+def _hma_peak_toleranz(ma: np.ndarray, piv_len: int, move_pct: float
+                       ) -> pd.DataFrame:
+    """PineScript-Hysterese-Logik auf der geglaetteten MA-Serie.
+
+    Haelt den letzten extremen MA-Wert (`piv_pendingExtremeValue`) als
+    gleitendes Extremum ueber ein `piv_len`-Fenster (Rolling min/max,
+    min_periods=1, NaN-robust: keine NaN-Verseuchung durch den MA-Warmup).
+    Ein Trendwechsel wird erst signalisiert, wenn der MA den Extremwert um
+    `move_pct` % durchbricht (verhindert Fehlsignale in Seitwaertsphasen):
+
+      * TrendUp:   MA > PendingLow  * (1 + move_pct/100)
+      * TrendDown: MA < PendingHigh * (1 - move_pct/100)
+
+    Liefert je Bar is_trend_up/is_trend_down und die Extremwerte
+    (pending_extreme_value) fuer den Datenvertrag (§3.2).
+    """
+    n = len(ma)
+    series = pd.Series(ma)
+    # Rolling-Extrema ueber piv_len Fenster (inkl. aktueller Bar);
+    # NaN im Warmup werden uebersprungen (skipna) - kein Infekt.
+    roll_low = series.rolling(piv_len, min_periods=1).min().to_numpy(dtype=float)
+    roll_high = series.rolling(piv_len, min_periods=1).max().to_numpy(dtype=float)
+
+    is_up = np.zeros(n, dtype=bool)
+    is_down = np.zeros(n, dtype=bool)
+    pending_low = np.full(n, np.nan)
+    pending_high = np.full(n, np.nan)
+    pending_val = np.full(n, np.nan)
+    trend_up = False
+
+    for i in range(n):
+        if not np.isfinite(ma[i]) or not np.isfinite(roll_low[i]):
+            trend_up = False
+            continue
+        pending_low[i] = roll_low[i]
+        pending_high[i] = roll_high[i]
+
+        # Trendwechsel mit Hysterese.
+        if trend_up:
+            if ma[i] < pending_high[i] * (1.0 - move_pct / 100.0):
+                trend_up = False
+                is_down[i] = True
+            else:
+                is_up[i] = True
+        else:
+            if ma[i] > pending_low[i] * (1.0 + move_pct / 100.0):
+                trend_up = True
+                is_up[i] = True
+            else:
+                is_down[i] = False
+
+        pending_val[i] = pending_high[i] if trend_up else pending_low[i]
+
+    return pd.DataFrame({
+        "is_trend_up": is_up,
+        "is_trend_down": is_down,
+        "pending_extreme": pending_val,
+        "ma_value": ma,
+    })
+
+
+class SrvTrendHmaPivot(PluginFeature):
+    """HMA/EHMA Peak-Toleranz & Pivot-Trendwechsel.
+
+    Stateless (Basisklassen-Vertrag): Berechnung ist eine reine Funktion
+    calculate(df, params, context) - keine eigenen Zustaende.
+    """
+
+    @property
+    def plugin_id(self) -> str:
+        return "srv_trend_hma_pivot"
+
+    @property
+    def version(self) -> str:
+        return "1.0.0"
+
+    @property
+    def metadata(self) -> Dict[str, Any]:
+        return {
+            "category": "Trend & Reversal/Hysteresis & Pivots",
+            "display_name": "HMA Peak Pivot Service",
+            "description": "Erkennt Trendwechsel auf geglaetteten EHMA/HMA-Linien unter Beruecksichtigung einer Prozent-Hysterese.",
+            "author": "PyTrader AI",
+            "tags": ["trend", "hma", "ehma", "pivot", "hysteresis"],
+            # Phase 14 P14-01: Erweiterte Beschreibungsfelder
+            "description_long": "Reiner Datenlieferant (feature_store=True) fuer "
+                                "die Analytics-UI und ML-Pipelines. Haelt den "
+                                "letzten extremen MA-Wert "
+                                "(piv_pendingExtremeValue). Ein Trendwechsel "
+                                "wird erst signalisiert, wenn der MA den "
+                                "Extremwert um piv_maxHmaMovePct % durchbricht. "
+                                "Verhindert Fehlsignale in Seitwaertsphasen. "
+                                "Keine Chart-Visualisierung in Kapitel 17.02.",
+            "condition_rules": [
+                "HMA_Peak_Toleranz: TrendUp = MA > PendingLow * (1 + MovePct/100)",
+                "Causal Timestamps: event/confirmation_bar_time, confirmation_lag_bars, INSUFFICIENT_DATA",
+            ],
+            "api_version": "1",
+        }
+
+    @property
+    def capabilities(self) -> PluginCapabilities:
+        return {
+            "chart": False,   # E-5: kein Indikator in Kapitel 17.02
+            "batch": True,
+            "live": False,
+            "feature_store": True,
+            "render": False,  # E-5: reine Datenlieferanten
+        }
+
+    # --- Single Source of Truth fuer's Prop-Fenster (17.01 §2.2, PineScript-Zone)
+    @property
+    def parameter_order(self) -> List[str]:
+        return list(_TREND_HMA_PIVOT_SCHEMA.keys())
+
+    @property
+    def param_labels(self) -> Dict[str, str]:
+        return {
+            "mode": "Pivot-Modus",
+            "piv_len": "Pivot-Lookback",
+            "hma_type": "MA-Typ (EHMA/HMA)",
+            "hma_smoothing": "Hauptperiode des MA",
+            "piv_maxHmaMovePct": "Mindestabstand % vom Peak",
+        }
+
+    @property
+    def parameter_schema(self) -> Dict[str, ParameterSchema]:
+        """Flache Kopie der Modul-Konstante `_TREND_HMA_PIVOT_SCHEMA`
+        (PineScript-Input-Zone am Dateianfang, M1: kein geteiltes Dict)."""
+        return {k: dict(v) for k, v in _TREND_HMA_PIVOT_SCHEMA.items()}
+
+    # 2. SCHEMA-EXPOSURE FUER DIE UI (17.01.04, Bugfix): Siehe
+    # srv_trend_regime.py - identischer Basisklassen-Vertrag.
+    @property
+    def default_params(self) -> Dict[str, Any]:
+        """Extrahiert die Default-Werte aus dem parameter_schema fuer die Engine."""
+        return {k: v.get("default") for k, v in self.parameter_schema.items()
+                if "default" in v}
+
+    def full_parameter_schema(self) -> Dict[str, ParameterSchema]:
+        """Liefert das vollstaendige Schema (Basis + plugin-spezifisch) inkl.
+        Min/Max/Typ fuer die UI-Spalten (Basisklassen-Vertrag)."""
+        merged = dict(self.base_parameter_schema)
+        merged.update(dict(self.parameter_schema or {}))
+        return merged
+
+    def calculate(
+        self,
+        df: pd.DataFrame,
+        params: Dict[str, Any],
+        context: Optional[PluginContext] = None,
+    ) -> FeatureCalculateResult:
+        """Berechnet HMA/EHMA-Peak-Toleranz-Trendwechsel.
+
+        Datenvertrag (17.02 §3): 1 Record pro Bar (dichte Label-Reihe).
+        Trend-Bars tragen is_trend_up/is_trend_down=True sowie kausale
+        Zeitstempel (event/confirmation_bar_time, confirmation_lag_bars=0).
+        Bars am Serienanfang ohne MA-Warmup erhalten
+        calculation_status='INSUFFICIENT_DATA'.
+
+        Modi (params['mode']):
+          * HMA_Peak_Toleranz: Hysterese gegen letztes MA-Extremum
+            (piv_maxHmaMovePct % Durchbruch => Trendwechsel).
+        """
+        empty: FeatureCalculateResult = {"feature_store_payload": {}}
+        if df is None or df.empty:
+            return empty
+
+        # Defensive Normalisierung: 'time'-Spalte (epoch) sicherstellen.
+        work = df.copy()
+        if "time" not in work.columns:
+            if "bar_time" in work.columns:
+                work["time"] = work["bar_time"].apply(
+                    lambda v: int(v.timestamp())
+                    if hasattr(v, "timestamp") else int(v))
+            else:
+                return empty
+
+        p = self.validate_params(params)
+        mode = str(p.get("mode") or "HMA_Peak_Toleranz")
+        piv_len = int(p.get("piv_len") or 4)
+        hma_type = str(p.get("hma_type") or "EHMA")
+        hma_smoothing = int(p.get("hma_smoothing") or 10)
+        move_pct = float(p.get("piv_maxHmaMovePct") or 0.2)
+
+        n = len(work)
+        times = work["time"].to_numpy(dtype=np.int64)
+        close = work["close"].to_numpy(dtype=float)
+
+        is_trend_up = np.zeros(n, dtype=bool)
+        is_trend_down = np.zeros(n, dtype=bool)
+        status = np.full(n, "OK", dtype=object)
+        strength = np.zeros(n, dtype=float)
+        strength_type = "PERCENT"
+        conf_type = "BAR_CLOSE"
+        extra: Dict[str, np.ndarray] = {}
+
+        if mode == "HMA_Peak_Toleranz":
+            ma = _ma_series(work, hma_type, hma_smoothing).to_numpy(dtype=float)
+            res = _hma_peak_toleranz(ma, piv_len, move_pct)
+            is_trend_up = res["is_trend_up"].to_numpy(dtype=bool)
+            is_trend_down = res["is_trend_down"].to_numpy(dtype=bool)
+            pending = res["pending_extreme"].to_numpy(dtype=float)
+            ma_nan = ~np.isfinite(ma)
+            status[ma_nan] = "INSUFFICIENT_DATA"
+            # Staerke: Prozent-Distanz vom Pending-Extremwert.
+            with np.errstate(divide="ignore", invalid="ignore"):
+                pct = np.where(
+                    (np.isfinite(pending)) & (pending != 0),
+                    np.abs(close - pending) / np.abs(pending) * 100.0,
+                    0.0)
+            strength = np.where(np.isfinite(pct), pct, 0.0)
+            extra["ma_value"] = np.where(np.isfinite(ma), ma, np.nan)
+            extra["pending_extreme_value"] = np.where(
+                np.isfinite(pending), pending, np.nan)
+
+        else:
+            # Unbekannter Modus: defensiv leer (kein Crash, 0 Rows).
+            return empty
+
+        # --- Records bauen (dicht: 1 Record pro Bar, 17.02 §3) --------------
+        records: List[Dict[str, Any]] = []
+        total_up = int(is_trend_up.sum())
+        total_down = int(is_trend_down.sum())
+        for i in range(n):
+            rec: Dict[str, Any] = {
+                "bar_time": int(times[i]),
+                "result_type": "REVERSAL" if (is_trend_up[i] or is_trend_down[i])
+                else "TREND",
+                "source_mode": mode,
+                "calculation_status": str(status[i]),
+                "is_trend_up": bool(is_trend_up[i]),
+                "is_trend_down": bool(is_trend_down[i]),
+                "is_reversal_up": bool(is_trend_up[i] and not is_trend_down[i]),
+                "is_reversal_down": bool(is_trend_down[i] and not is_trend_up[i]),
+                # Bar-Close-Signal: event == confirmation (Lag 0).
+                "event_bar_time": int(times[i]),
+                "confirmation_bar_time": int(times[i]),
+                "confirmation_lag_bars": 0,
+                "confirmation_type": conf_type,
+                "trend_strength": float(strength[i]),
+                "strength_type": strength_type,
+                "reference_price": float(close[i]),
+            }
+            for k, arr in extra.items():
+                rec[k] = float(arr[i]) if np.isfinite(arr[i]) else None
+            records.append(rec)
+
+        return {
+            "feature_store_payload": {
+                "feature_id": self.plugin_id,
+                "plugin_version": self.version,
+                "records": records,
+                "metadata": {
+                    # E-7 / base_plugin (U15-A1, Invariante 5): schema_version
+                    # ist Pflichtfeld fuer alle feature_store=True-Plugins.
+                    "schema_version": "1.0.0",
+                    "source_mode": mode,
+                    "total_trend_up": total_up,
+                    "total_trend_down": total_down,
+                    "bars": n,
+                },
+            },
+        }
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/features/definitions/srv_trend_regime.py
+```py
+# analytics/features/definitions/srv_trend_regime.py
+# ==============================================================================
+# DEFINITION: srv_trend_regime
+# ==============================================================================
+# NAME:        Trend Regime Service
+# KATEGORIE:   Trend & Reversal/Regime & Staerke
+# BESCHREIBUNG: Statistische Trendstaerke- und Regime-Analyse via LinReg (R2), ADX/DMI & Z-Score
+# ==============================================================================
+"""
+Service: TrendRegime (Phase 17.02) - Naming Convention 16.08.01: srv_
+
+Quantifiziert statistische Trend-Regimes, Trendstaerken und
+Mittelwertabweichungen. Reiner Datenlieferant fuer die Analytics-UI und
+spaetere ML-Pipelines - KEINE Chart-Visualisierung in diesem Kapitel (17.02,
+§1); dedizierte Chart-Indikatoren (ind_...) folgen erst nach statistischer
+Validierung der erzeugten Features.
+
+Causal Timestamping (Kein Look-ahead Bias, 17.01 §2.4):
+  * event_bar_time:        Zeitpunkt der betrachteten Kerze (Bar-Close-Signal).
+  * confirmation_bar_time: identisch zu event_bar_time (Bar-Close-Signal,
+                           confirmation_lag_bars = 0).
+  * Kerzen am Serienanfang ohne ausreichenden Lookback erhalten
+    calculation_status = 'INSUFFICIENT_DATA' und is_trend_* = False.
+
+Datenvertrag (17.02 §3): result_type TREND|REVERSAL, 1 Record pro Bar,
+flache Records (nur bar_time + feature_data-Inhalte; symbol/timeframe/
+feature_id setzt store_plugin_payload selbst).
+
+Capabilities (E-5, 07.08.2026): chart=False (kein Indikator), batch=True,
+live=False, feature_store=True, render=False.
+metadata['category'] = 'Trend & Reversal/Regime & Staerke' fuer den MasterTree.
+
+PARAMETER (PineScript-Input-Zone, 17.01 §2.2): Alle Inputs/Defaults stehen
+als Modul-Konstante `_TREND_REGIME_SCHEMA` direkt unter diesem Header
+(siehe dort) und sind wie in PineScript am Dateianfang anpassbar.
+`parameter_schema` gibt eine flache Kopie zurueck (M1: kein geteiltes
+mutable Dict ueber Instanzen). `visible_when` (17.01.05): Conditional
+Visibility beim Mode-Wechsel.
+"""
+
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+
+from analytics.features.plugins.base_plugin import (
+    FeatureCalculateResult,
+    ParameterSchema,
+    PluginCapabilities,
+    PluginContext,
+    PluginFeature,
+)
+
+# ---------------------------------------------------------------------------
+# PARAMETER (PineScript-Input-Zone, 17.01): Single Source of Truth fuer das
+# Prop-Fenster. Inputs/Defaults stehen hier direkt am Dateianfang.
+# E-2 (07.08.2026): type-Werte als Strings ("int"/"float"/"str").
+# E-4 (17.02 Review): `visible_when`-Deklarationen fuer die Conditional
+# Visibility (17.01.05).
+# ---------------------------------------------------------------------------
+_TREND_REGIME_SCHEMA: Dict[str, ParameterSchema] = {
+    "mode": {
+        "type": "str",
+        "default": "Linear_Regression_Slope",
+        "options": [
+            "Linear_Regression_Slope", "ADX_DMI", "ZScore_Mean_Distance",
+        ],
+        "description": "Algorithmus-Modus zur Trend-Regime-Bestimmung",
+    },
+    "period": {
+        "type": "int", "default": 20, "min": 2,
+        "description": "Berechnungsperiode fuer Regressions-/Statistik-Fenster",
+    },
+    "r2_threshold": {
+        "type": "float", "default": 0.6, "min": 0.0, "max": 1.0,
+        "description": "Mindest-R2 fuer etablierten Trend (LinReg)",
+        "visible_when": {"mode": "Linear_Regression_Slope"},
+    },
+    "di_period": {
+        "type": "int", "default": 14, "min": 1,
+        "description": "DMI-Periode (nur bei mode == 'ADX_DMI')",
+        "visible_when": {"mode": "ADX_DMI"},
+    },
+    "adx_smooth": {
+        "type": "int", "default": 14, "min": 1,
+        "description": "ADX-Glaettung (nur bei mode == 'ADX_DMI')",
+        "visible_when": {"mode": "ADX_DMI"},
+    },
+    "adx_threshold": {
+        "type": "float", "default": 25.0, "min": 1.0,
+        "description": "ADX-Schwellwert fuer Trend-Regime",
+        "visible_when": {"mode": "ADX_DMI"},
+    },
+    "z_thresh": {
+        "type": "float", "default": 2.0, "min": 0.1,
+        "description": "Z-Score Extremwert-Schwelle fuer Reversals",
+        "visible_when": {"mode": "ZScore_Mean_Distance"},
+    },
+    "ma_type": {
+        "type": "str",
+        "default": "SMA",
+        "options": [
+            "SMA", "EMA", "WMA", "DEMA", "TEMA", "HMA", "EHMA",
+            "ZLEMA", "RMA", "KAMA", "ALMA", "VWMA",
+        ],
+        "description": "Gleitender Durchschnitt fuer Z-Score Baseline",
+        "visible_when": {"mode": "ZScore_Mean_Distance"},
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Modul-Helfer (17.02: direkte, vollstaendige Erkennung statt Scaffold)
+# ---------------------------------------------------------------------------
+
+def _atr_series(df: pd.DataFrame, period: int) -> pd.Series:
+    """Wilder-ATR (EMA-alpha 1/period, adjust=False) ueber OHLCV."""
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1.0 / period, adjust=False).mean()
+
+
+def _rolling_slope_r2(series: pd.Series, period: int) -> pd.Series:
+    """Vektorisierte rolling LinReg: Steigung und R2 je Fenster.
+
+    slope = Sxy / Sxx,  r2 = Sxy^2 / (Sxx * Syy)
+    x = arange(period) (konstant), Sxx = sum((x-xbar)^2).
+    Liefert NaN fuer Fenster mit fehlenden Werten (Warmup).
+    """
+    x = np.arange(period, dtype=float)
+    xm = x - x.mean()
+    sxx = float((xm ** 2).sum())
+
+    def _slope(w: np.ndarray) -> float:
+        y = np.asarray(w, dtype=float)
+        if np.isnan(y).any() or sxx == 0:
+            return np.nan
+        ym = y - y.mean()
+        sxy = float((xm * ym).sum())
+        return sxy / sxx
+
+    def _r2(w: np.ndarray) -> float:
+        y = np.asarray(w, dtype=float)
+        if np.isnan(y).any() or sxx == 0:
+            return np.nan
+        ym = y - y.mean()
+        sxy = float((xm * ym).sum())
+        syy = float((ym ** 2).sum())
+        if syy <= 0:
+            return 0.0
+        return (sxy ** 2) / (sxx * syy)
+
+    roll = series.rolling(period, min_periods=period)
+    slope = roll.apply(_slope, raw=True)
+    r2 = roll.apply(_r2, raw=True)
+    return pd.DataFrame({"slope": slope, "r2": r2})
+
+
+def _adx_dmi(df: pd.DataFrame, di_period: int, adx_smooth: int
+             ) -> pd.DataFrame:
+    """ADX/DMI (Wilder) vektorisiert: +DI, -DI, ADX.
+
+    +DM = high - prev_high (falls > 0 und > -(low - prev_low))
+    -DM = prev_low - low   (falls > 0 und > high - prev_high)
+    Glaettung: Wilder RMA (EWM alpha=1/period, adjust=False).
+    """
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = pd.Series(np.where(
+        (up_move > down_move) & (up_move > 0), up_move, 0.0),
+        index=df.index)
+    minus_dm = pd.Series(np.where(
+        (down_move > up_move) & (down_move > 0), down_move, 0.0),
+        index=df.index)
+
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+
+    alpha = 1.0 / max(di_period, 1)
+    atr = tr.ewm(alpha=alpha, adjust=False).mean()
+    plus_di = 100.0 * plus_dm.ewm(alpha=alpha, adjust=False).mean() / atr
+    minus_di = 100.0 * minus_dm.ewm(alpha=alpha, adjust=False).mean() / atr
+
+    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    alpha_adx = 1.0 / max(adx_smooth, 1)
+    adx = dx.ewm(alpha=alpha_adx, adjust=False).mean()
+
+    return pd.DataFrame({
+        "plus_di": plus_di,
+        "minus_di": minus_di,
+        "adx": adx,
+    })
+
+
+def _zscore_series(df: pd.DataFrame, ma: np.ndarray, period: int
+                   ) -> np.ndarray:
+    """Z-Score = (close - MA) / rolling-std(close, period)."""
+    close = df["close"].astype(float)
+    std = close.rolling(period, min_periods=period).std(ddof=0).to_numpy()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z = (close.to_numpy() - ma) / std
+    return np.where(np.isfinite(std) & (std > 0), z, np.nan)
+
+
+class SrvTrendRegime(PluginFeature):
+    """Statistische Trendstaerke- und Regime-Analyse.
+
+    Stateless (Basisklassen-Vertrag): Berechnung ist eine reine Funktion
+    calculate(df, params, context) - keine eigenen Zustaende.
+    """
+
+    @property
+    def plugin_id(self) -> str:
+        return "srv_trend_regime"
+
+    @property
+    def version(self) -> str:
+        return "1.0.0"
+
+    @property
+    def metadata(self) -> Dict[str, Any]:
+        return {
+            "category": "Trend & Reversal/Regime & Staerke",
+            "display_name": "Trend Regime Service",
+            "description": "Quantifiziert Trendstaerke und Regimes ueber LinReg Slope/R2, ADX/DMI und Z-Score Mean Distance.",
+            "author": "PyTrader AI",
+            "tags": ["trend", "regime", "linreg", "adx", "zscore"],
+            # Phase 14 P14-01: Erweiterte Beschreibungsfelder
+            "description_long": "Reiner Datenlieferant (feature_store=True) fuer "
+                                "die Analytics-UI und ML-Pipelines. LinReg misst "
+                                "Steigung und Bestimmtheitsmass R2. ADX/DMI misst "
+                                "Richtungsdynamik. Z-Score misst die "
+                                "Standardabweichung vom Mittelwert fuer "
+                                "Uebertreibungen. Keine Chart-Visualisierung in "
+                                "Kapitel 17.02.",
+            "condition_rules": [
+                "Linear_Regression_Slope: TrendUp = Slope > 0 and R2 >= r2_threshold",
+                "ADX_DMI: TrendUp = +DI > -DI and ADX >= adx_threshold",
+                "ZScore_Mean_Distance: ReversalUp = Z-Score <= -z_thresh (Ueberverkauft), ReversalDown = Z >= +z_thresh (Ueberkauft)",
+                "Causal Timestamps: event/confirmation_bar_time, confirmation_lag_bars, INSUFFICIENT_DATA",
+            ],
+            "api_version": "1",
+        }
+
+    @property
+    def capabilities(self) -> PluginCapabilities:
+        return {
+            "chart": False,   # E-5: kein Indikator in Kapitel 17.02
+            "batch": True,
+            "live": False,
+            "feature_store": True,
+            "render": False,  # E-5: reine Datenlieferanten
+        }
+
+    # --- Single Source of Truth fuer's Prop-Fenster (17.01 §2.2, PineScript-Zone)
+    @property
+    def parameter_order(self) -> List[str]:
+        return list(_TREND_REGIME_SCHEMA.keys())
+
+    @property
+    def param_labels(self) -> Dict[str, str]:
+        return {
+            "mode": "Algorithmus-Modus",
+            "period": "Statistik-Fenster",
+            "r2_threshold": "Mindest-R2 (LinReg)",
+            "di_period": "DMI-Periode (ADX)",
+            "adx_smooth": "ADX-Glaettung",
+            "adx_threshold": "ADX-Schwellwert",
+            "z_thresh": "Z-Score Schwelle",
+            "ma_type": "MA-Typ (Z-Score Baseline)",
+        }
+
+    @property
+    def parameter_schema(self) -> Dict[str, ParameterSchema]:
+        """Flache Kopie der Modul-Konstante `_TREND_REGIME_SCHEMA`
+        (PineScript-Input-Zone am Dateianfang, M1: kein geteiltes Dict)."""
+        return {k: dict(v) for k, v in _TREND_REGIME_SCHEMA.items()}
+
+    # 2. SCHEMA-EXPOSURE FUER DIE UI (17.01.04, Bugfix): Die Spalten-UI
+    # (serviceui/param_columns.py & ServiceSelectorWidget) liest Parameter-
+    # Definitionen ueber `default_params` / `full_parameter_schema()`. Diese
+    # expliziten Overrides stellen das Schema unabhaengig von der jeweiligen
+    # parameter_schema-Definition (Property/Klassen-Attribut) bereit und
+    # erhalten den Basisklassen-Vertrag (Basis-Parameter wie lookback +
+    # plugin-spezifische Parameter, vgl. base_plugin.PluginFeature).
+    @property
+    def default_params(self) -> Dict[str, Any]:
+        """Extrahiert die Default-Werte aus dem parameter_schema fuer die Engine."""
+        return {k: v.get("default") for k, v in self.parameter_schema.items()
+                if "default" in v}
+
+    def full_parameter_schema(self) -> Dict[str, ParameterSchema]:
+        """Liefert das vollstaendige Schema (Basis + plugin-spezifisch) inkl.
+        Min/Max/Typ fuer die UI-Spalten (Basisklassen-Vertrag)."""
+        merged = dict(self.base_parameter_schema)
+        merged.update(dict(self.parameter_schema or {}))
+        return merged
+
+    def calculate(
+        self,
+        df: pd.DataFrame,
+        params: Dict[str, Any],
+        context: Optional[PluginContext] = None,
+    ) -> FeatureCalculateResult:
+        """Berechnet Trend-Regimes (LinReg/ADX/Z-Score).
+
+        Datenvertrag (17.02 §3): JEDER Bar entspricht genau EIN Record
+        (dichte Label-Reihe fuer ML/Analytics). Trend-Bars tragen
+        is_trend_up/is_trend_down bzw. is_reversal_up/is_reversal_down=True
+        sowie kausale Zeitstempel (event/confirmation_bar_time,
+        confirmation_lag_bars = 0 fuer Bar-Close-Signale). Bars am
+        Serienanfang ohne ausreichenden Lookback erhalten
+        calculation_status='INSUFFICIENT_DATA'.
+
+        Modi (params['mode']):
+          * Linear_Regression_Slope: rolling LinReg auf close
+            (Slope > 0 und R2 >= r2_threshold => TrendUp).
+          * ADX_DMI: +DI > -DI und ADX >= adx_threshold => TrendUp.
+          * ZScore_Mean_Distance: Z <= -z_thresh => ReversalUp,
+            Z >= +z_thresh => ReversalDown (Uebertreibungen).
+        """
+        empty: FeatureCalculateResult = {"feature_store_payload": {}}
+        if df is None or df.empty:
+            return empty
+
+        # Defensive Normalisierung: 'time'-Spalte (epoch) sicherstellen.
+        work = df.copy()
+        if "time" not in work.columns:
+            if "bar_time" in work.columns:
+                work["time"] = work["bar_time"].apply(
+                    lambda v: int(v.timestamp())
+                    if hasattr(v, "timestamp") else int(v))
+            else:
+                return empty
+
+        p = self.validate_params(params)
+        mode = str(p.get("mode") or "Linear_Regression_Slope")
+        period = int(p.get("period") or 20)
+        r2_threshold = float(p.get("r2_threshold") or 0.6)
+        di_period = int(p.get("di_period") or 14)
+        adx_smooth = int(p.get("adx_smooth") or 14)
+        adx_threshold = float(p.get("adx_threshold") or 25.0)
+        z_thresh = float(p.get("z_thresh") or 2.0)
+        ma_type = str(p.get("ma_type") or "SMA")
+
+        n = len(work)
+        times = work["time"].to_numpy(dtype=np.int64)
+        close = work["close"].to_numpy(dtype=float)
+
+        is_trend_up = np.zeros(n, dtype=bool)
+        is_trend_down = np.zeros(n, dtype=bool)
+        is_rev_up = np.zeros(n, dtype=bool)
+        is_rev_down = np.zeros(n, dtype=bool)
+        status = np.full(n, "OK", dtype=object)
+        strength = np.zeros(n, dtype=float)
+        strength_type = "R2_SCORE"
+        conf_type = "BAR_CLOSE"
+        extra: Dict[str, np.ndarray] = {}
+
+        if mode == "Linear_Regression_Slope":
+            lr = _rolling_slope_r2(work["close"], period)
+            slope = lr["slope"].to_numpy(dtype=float)
+            r2 = lr["r2"].to_numpy(dtype=float)
+            nan = ~np.isfinite(slope) | ~np.isfinite(r2)
+            status[nan] = "INSUFFICIENT_DATA"
+            is_trend_up = (slope > 0) & (r2 >= r2_threshold)
+            is_trend_down = (slope < 0) & (r2 >= r2_threshold)
+            strength = np.where(np.isfinite(r2), r2, 0.0)
+            strength_type = "R2_SCORE"
+            extra["slope_value"] = np.where(np.isfinite(slope), slope, np.nan)
+            extra["r2_score"] = np.where(np.isfinite(r2), r2, np.nan)
+
+        elif mode == "ADX_DMI":
+            dmi = _adx_dmi(work, di_period, adx_smooth)
+            plus_di = dmi["plus_di"].to_numpy(dtype=float)
+            minus_di = dmi["minus_di"].to_numpy(dtype=float)
+            adx = dmi["adx"].to_numpy(dtype=float)
+            nan = ~np.isfinite(adx)
+            status[nan] = "INSUFFICIENT_DATA"
+            is_trend_up = (plus_di > minus_di) & (adx >= adx_threshold)
+            is_trend_down = (minus_di > plus_di) & (adx >= adx_threshold)
+            strength = np.where(np.isfinite(adx), adx, 0.0)
+            strength_type = "ADX_VALUE"
+            extra["adx_value"] = np.where(np.isfinite(adx), adx, np.nan)
+            extra["plus_di"] = np.where(np.isfinite(plus_di), plus_di, np.nan)
+            extra["minus_di"] = np.where(np.isfinite(minus_di), minus_di, np.nan)
+
+        elif mode == "ZScore_Mean_Distance":
+            # MA-Serie (Template 16.04, alle 12 Typen; VWMA nutzt tick_volume).
+            try:
+                from chart.indicators.utils.ma_template import MATemplateEngine
+            except Exception:
+                MATemplateEngine = None  # type: ignore
+            if MATemplateEngine is not None and ma_type in (
+                    "SMA", "EMA", "WMA", "DEMA", "TEMA", "HMA", "EHMA",
+                    "ZLEMA", "RMA", "KAMA", "ALMA", "VWMA"):
+                volume = work["tick_volume"] if "tick_volume" in work.columns else None
+                ma = MATemplateEngine.calculate_ma(
+                    work["close"], ma_type, period, volume=volume,
+                ).to_numpy(dtype=float)
+            else:
+                # Fallback: einfacher SMA (defensiv, kein Crash).
+                ma = pd.Series(close).rolling(period, min_periods=1).mean().to_numpy()
+
+            z = _zscore_series(work, ma, period)
+            nan = ~np.isfinite(z)
+            status[nan] = "INSUFFICIENT_DATA"
+            is_rev_up = z <= -z_thresh
+            is_rev_down = z >= z_thresh
+            strength = np.where(np.isfinite(z), np.abs(z), 0.0)
+            strength_type = "Z_SCORE"
+            extra["z_score_value"] = np.where(np.isfinite(z), z, np.nan)
+            extra["mean_baseline"] = np.where(np.isfinite(ma), ma, np.nan)
+
+        else:
+            # Unbekannter Modus: defensiv leer (kein Crash, 0 Rows).
+            return empty
+
+        # --- Records bauen (dicht: 1 Record pro Bar, 17.02 §3) --------------
+        records: List[Dict[str, Any]] = []
+        total_up = int(is_trend_up.sum())
+        total_down = int(is_trend_down.sum())
+        total_rev_up = int(is_rev_up.sum())
+        total_rev_down = int(is_rev_down.sum())
+        for i in range(n):
+            rec: Dict[str, Any] = {
+                "bar_time": int(times[i]),
+                "result_type": "REVERSAL" if (is_rev_up[i] or is_rev_down[i])
+                else "TREND",
+                "source_mode": mode,
+                "calculation_status": str(status[i]),
+                "is_trend_up": bool(is_trend_up[i]),
+                "is_trend_down": bool(is_trend_down[i]),
+                "is_reversal_up": bool(is_rev_up[i]),
+                "is_reversal_down": bool(is_rev_down[i]),
+                # Bar-Close-Signal: event == confirmation (Lag 0).
+                "event_bar_time": int(times[i]),
+                "confirmation_bar_time": int(times[i]),
+                "confirmation_lag_bars": 0,
+                "confirmation_type": conf_type,
+                "trend_strength": float(strength[i]),
+                "strength_type": strength_type,
+                "reference_price": float(close[i]),
+            }
+            for k, arr in extra.items():
+                rec[k] = float(arr[i]) if np.isfinite(arr[i]) else None
+            records.append(rec)
+
+        return {
+            "feature_store_payload": {
+                "feature_id": self.plugin_id,
+                "plugin_version": self.version,
+                "records": records,
+                "metadata": {
+                    # E-7 / base_plugin (U15-A1, Invariante 5): schema_version
+                    # ist Pflichtfeld fuer alle feature_store=True-Plugins.
+                    "schema_version": "1.0.0",
+                    "source_mode": mode,
+                    "total_trend_up": total_up,
+                    "total_trend_down": total_down,
+                    "total_reversal_up": total_rev_up,
+                    "total_reversal_down": total_rev_down,
                     "bars": n,
                 },
             },
@@ -25043,6 +26368,10 @@ class ServiceParamColumnsMixin:
         mode_ctrl = self._service_param_controls.get((iid, "mode"))
         mode_val = (str(self._ctrl_value(mode_ctrl))
                     if mode_ctrl is not None else "")
+        # Bugfix (Mode-Wechsel): Spalten (QGroupBox), deren Controls durch
+        # die Ein-/Ausblendung beruehrt wurden – deren Geometrie-Caches werden
+        # NACH der Sichtbarkeits-Aenderung invalidiert (s. u.).
+        touched_cols: set = set()
         for key, spec in schema.items():
             vw = spec.get("visible_when")
             if not isinstance(vw, dict) or "mode" not in vw:
@@ -25058,6 +26387,9 @@ class ServiceParamColumnsMixin:
                 ctrl.setVisible(visible)
             except (RuntimeError, AttributeError):
                 pass
+            col = ctrl.parentWidget()
+            if col is not None:
+                touched_cols.add(col)
             lbl = getattr(self, "_service_param_labels", {}).get((iid, key))
             if lbl is not None:
                 try:
@@ -25067,6 +26399,32 @@ class ServiceParamColumnsMixin:
         # 17.01.05 (Bugfix): Auch das Info-Label (Service-/Algo-Beschreibung)
         # auf den aktuellen Modus aktualisieren.
         self._update_service_info_label(iid)
+        # Bugfix (Mode-Wechsel, Hoehe der Box): Nach dem Ein-/Ausblenden der
+        # modus-abhaengigen Parameter muss die BOX-HOEHE der neuen Parameter-
+        # zahl folgen (nicht die Hoehe der Einzelfelder). Qt 6.11 cached den
+        # QWidgetItemV2-sizeHint – ohne updateGeometry()/Re-Indexierung bleibt
+        # die alte Hoehe stehen und der QFormLayout streckt die verbliebenen
+        # Zeilen (gestreckte Einzelfelder). Daher werden die Caches der
+        # betroffenen Spalten + der Service-Parameter-Box invalidiert.
+        #
+        # 07.08.2026 (User-Anweisung): KEIN self._reflow() mehr – der volle
+        # Reflow (_schedule_reflow -> _apply_reflow_size ->
+        # resize_to_clamped_content, _exact_fit_to_content) wuerde die
+        # FENSTERHOEHE an die neue Box-Hoehe anpassen und damit den gesamten
+        # Canvas + die Fensterhoehe versetzen. Gewuenscht: NUR die Box wird
+        # auf ihre Layout-Groesse gesetzt; ist sie zu hoch, zeigt die
+        # ContentScrollArea (_param_scroll) Scrollbalken (Original-Spezifika-
+        # tion Punkt 5). Der Baum (links) behaelt seine Hoehe und scrollt
+        # selbst (User-Anweisung Punkt 3).
+        try:
+            for col in touched_cols:
+                col.updateGeometry()
+            box = getattr(self, "widget_service_columns", None)
+            if box is not None:
+                box.updateGeometry()
+            QTimer.singleShot(0, self._resize_param_box_deferred)
+        except (RuntimeError, AttributeError):
+            pass
 
     # ------------------------------------------------------------------
     # 17.01.05 (Bugfix): Read-only Info-Label unter dem individuellen
@@ -25202,17 +26560,23 @@ class ServiceParamColumnsMixin:
     def _setup_collapsible(self, group: QGroupBox) -> None:
         """Macht eine ausklappbare QGroupBox wirklich kollabierbar.
 
-        Beim Abwählen werden die Kinder ausgeblendet und die Fensterhöhe per
-        _reflow() nahtlos verkleinert (Roadmap 5.4.2.2: Ein-/Ausklappen
-        verändert die Höhe dynamisch). Zusätzlich wird group.updateGeometry()
+        Beim Abwählen werden die Kinder ausgeblendet und die Box-Hoehe per
+        deferred Box-Resize angepasst; die ScrollArea (_param_scroll) zeigt
+        bei Ueberhoehe Scrollbalken. Zusaetzlich wird group.updateGeometry()
         gerufen, damit der gecachte QWidgetItemV2-sizeHint der Box invalidiert
         wird (Qt 6.11: Layouts refreshen diesen Cache sonst NICHT).
+
+        07.08.2026 (User-Anweisung): Frueher lief hier self._reflow() (voller
+        Fenster-Reflow) – dadurch wurde die FENSTERHOEHE an die Box angepasst.
+        Gewuenscht: NUR die Box resizen, Fenster-/Canvas-Hoehe bleibt stabil
+        (Original-Spezifikation: ScrollArea aktiviert bei Ueberhoehe einen
+        Scrollbalken; der Baum scrollt selbst).
         """
         def _toggle(checked: bool) -> None:
             for child in group.findChildren(QWidget):
                 child.setVisible(checked)
             group.updateGeometry()  # QWidgetItemV2-Cache invalidieren (s. oben)
-            self._reflow()
+            QTimer.singleShot(0, self._resize_param_box_deferred)
         group.toggled.connect(_toggle)
         _toggle(group.isChecked())
 
@@ -32908,6 +34272,380 @@ check("23 T10) Info-Anzeige auch fuer srv_swing_momentum",
       isinstance(_info23b, _QTextEdit23)
       and "Swing Momentum Service" in (_info23b.toPlainText() or ""),
       (_info23b.toPlainText() or "")[:120])
+
+# ===========================================================================
+# Teil 24 (Phase 17.02, 07.08.2026): Trend Services Validation
+#   srv_trend_regime (LinReg/ADX/Z-Score), srv_trend_breakout
+#   (Supertrend/Donchian/Keltner), srv_trend_hma_pivot (HMA_Peak_Toleranz).
+#   - Registry-Discovery + Kategorien im MasterTree (build_tree).
+#   - Dichte Records (len(records) == len(df)), schema_version in
+#     Metadata+Records, kausale Zeitstempel, Warmup-INSUFFICIENT_DATA.
+#   - Records flach: KEIN symbol/timeframe/feature_id (setzt
+#     store_plugin_payload selbst, Datenvertrag 17.02 E-2).
+#   - 4-Spalten-PK-Store auf test/test_p17_trend.duckdb (wird geloescht,
+#     Invariante 10).
+# ===========================================================================
+print("\n=== Teil 24: Phase 17.02 Trend Services Validation ===")
+
+from analytics.features.feature_builder import (  # noqa: E402
+    PluginRegistry as _P24_REG_CLS,
+)
+from analytics.features.definitions.srv_trend_regime import SrvTrendRegime  # noqa: E402
+from analytics.features.definitions.srv_trend_breakout import SrvTrendBreakout  # noqa: E402
+from analytics.features.definitions.srv_trend_hma_pivot import SrvTrendHmaPivot  # noqa: E402
+
+_p24_reg = _P24_REG_CLS()
+_p24_ids = ("srv_trend_regime", "srv_trend_breakout", "srv_trend_hma_pivot")
+for _p24_pid in _p24_ids:
+    check(f"24 T1) Registry {_p24_pid}",
+          _p24_reg.get(_p24_pid) is not None, "")
+
+_p24_objs = (SrvTrendRegime(), SrvTrendBreakout(), SrvTrendHmaPivot())
+for _p24_o in _p24_objs:
+    check(f"24 T1) {_p24_o.plugin_id}: capability feature_store",
+          bool(_p24_o.capabilities.get("feature_store")), "")
+    check(f"24 T1) {_p24_o.plugin_id}: category Trend & Reversal",
+          str(_p24_o.metadata.get("category", "")).startswith("Trend & Reversal"),
+          str(_p24_o.metadata.get("category")))
+    _fps = _p24_o.full_parameter_schema()
+    check(f"24 T1) {_p24_o.plugin_id}: lookback im full_parameter_schema",
+          "lookback" in _fps, "")
+    check(f"24 T1) {_p24_o.plugin_id}: visible_when deklariert",
+          any(isinstance(s.get("visible_when"), dict) for s in _fps.values()),
+          "")
+
+# build_tree: 3 neue Kategorien unter 'Trend & Reversal'
+from analytics.engine.service_selector_model import ServiceSelectorModel  # noqa: E402
+_p24_tree = ServiceSelectorModel().build_tree()
+_p24_tree_txt = str(_p24_tree)
+for _cat in ("Regime & Staerke", "Breakout & Kanal", "Hysteresis & Pivots"):
+    check(f"24 T2) build_tree enthaelt Kategorie '{_cat}'",
+          _cat in _p24_tree_txt, "")
+
+# --- Synthetische OHLCV-Serie: 6 Phasen (Range/Breakout up/Range/Breakout
+#     down/Range/Breakout up) -> Trend- und Breakout-Signale garantiert.
+_p24_n = 864
+_p24_period = 300  # M5
+_p24_t0 = 1700000000
+_p24_ts = _p24_t0 + np.arange(_p24_n) * _p24_period
+_p24_rng = np.random.default_rng(42)
+_p24_seg = 144
+_p24_cl = []
+for _i, _trend in enumerate([0.0, 0.10, 0.0, -0.10, 0.0, 0.08]):
+    _idx = np.arange(_i * _p24_seg, (_i + 1) * _p24_seg)
+    _p24_cl.append(np.linspace(0, _trend, _p24_seg)
+                   + _p24_rng.normal(0, 0.0015, _p24_seg))
+_p24_close = np.concatenate(_p24_cl)
+_p24_open = np.concatenate([[_p24_close[0]], _p24_close[:-1]])
+_p24_high = np.maximum(_p24_open, _p24_close) + _p24_rng.uniform(0.0005, 0.002, _p24_n)
+_p24_low = np.minimum(_p24_open, _p24_close) - _p24_rng.uniform(0.0005, 0.002, _p24_n)
+_p24_vol = (100.0 + (_p24_ts % 50)).astype(np.float64)
+_p24_df = pd.DataFrame({
+    "time": _p24_ts.astype(np.int64),
+    "open": _p24_open,
+    "high": _p24_high,
+    "low": _p24_low,
+    "close": _p24_close,
+    "tick_volume": _p24_vol,
+})
+
+# --- T3: srv_trend_regime (alle 3 Modi) --------------------------------------
+_p24_regime = SrvTrendRegime()
+_p24_r_payloads = {}
+for _mode, _params in (
+        ("Linear_Regression_Slope", {"mode": "Linear_Regression_Slope"}),
+        ("ADX_DMI", {"mode": "ADX_DMI"}),
+        ("ZScore_Mean_Distance", {"mode": "ZScore_Mean_Distance"}),
+):
+    _res = _p24_regime.calculate(_p24_df, dict(_params))
+    _payload = _res.get("feature_store_payload") or {}
+    _recs = _payload.get("records") or []
+    _p24_r_payloads[_mode] = _payload
+    check(f"24 T3) regime.{_mode}: records dicht",
+          len(_recs) == _p24_n, f"{len(_recs)}/{_p24_n}")
+    check(f"24 T3) regime.{_mode}: schema_version",
+          (_payload.get("metadata") or {}).get("schema_version") == "1.0.0",
+          str((_payload.get("metadata") or {}).get("schema_version")))
+    check(f"24 T3) regime.{_mode}: kausale Zeitstempel",
+          all(int(r["confirmation_bar_time"]) >= int(r["event_bar_time"])
+              for r in _recs), "")
+    check(f"24 T3) regime.{_mode}: Records flach (kein symbol/timeframe/feature_id)",
+          all(("symbol" not in r and "timeframe" not in r and "feature_id" not in r)
+              for r in _recs), "")
+    _up = sum(1 for r in _recs if r["is_trend_up"])
+    _down = sum(1 for r in _recs if r["is_trend_down"])
+    _rev = sum(1 for r in _recs if r["is_reversal_up"] or r["is_reversal_down"])
+    check(f"24 T3) regime.{_mode}: Signale erzeugt (up/down/rev)",
+          _up + _down + _rev > 0, f"up={_up}, down={_down}, rev={_rev}")
+    check(f"24 T3) regime.{_mode}: Start INSUFFICIENT_DATA",
+          bool(_recs) and _recs[0]["calculation_status"] == "INSUFFICIENT_DATA",
+          str(_recs[0]["calculation_status"]) if _recs else "no records")
+
+# --- T4: srv_trend_breakout (Supertrend + Donchian + Keltner) ----------------
+_p24_breakout = SrvTrendBreakout()
+for _mode, _params in (
+        ("Supertrend_ATR", {"mode": "Supertrend_ATR"}),
+        ("Donchian", {"mode": "Donchian_Keltner_Breakout", "channel_type": "Donchian"}),
+        ("Keltner", {"mode": "Donchian_Keltner_Breakout", "channel_type": "Keltner"}),
+):
+    _res = _p24_breakout.calculate(_p24_df, dict(_params))
+    _payload = _res.get("feature_store_payload") or {}
+    _recs = _payload.get("records") or []
+    check(f"24 T4) breakout.{_mode}: records dicht",
+          len(_recs) == _p24_n, f"{len(_recs)}/{_p24_n}")
+    check(f"24 T4) breakout.{_mode}: schema_version",
+          (_payload.get("metadata") or {}).get("schema_version") == "1.0.0",
+          str((_payload.get("metadata") or {}).get("schema_version")))
+    check(f"24 T4) breakout.{_mode}: kausale Zeitstempel",
+          all(int(r["confirmation_bar_time"]) >= int(r["event_bar_time"])
+              for r in _recs), "")
+    _up = sum(1 for r in _recs if r["is_trend_up"])
+    _down = sum(1 for r in _recs if r["is_trend_down"])
+    check(f"24 T4) breakout.{_mode}: Signale erzeugt (up/down)",
+          _up + _down > 0, f"up={_up}, down={_down}")
+
+# --- T5: srv_trend_hma_pivot -------------------------------------------------
+_p24_hma = SrvTrendHmaPivot()
+_res = _p24_hma.calculate(_p24_df, {"mode": "HMA_Peak_Toleranz"})
+_payload = _res.get("feature_store_payload") or {}
+_recs = _payload.get("records") or []
+check("24 T5) hma_pivot: records dicht", len(_recs) == _p24_n,
+      f"{len(_recs)}/{_p24_n}")
+check("24 T5) hma_pivot: schema_version",
+      (_payload.get("metadata") or {}).get("schema_version") == "1.0.0",
+      str((_payload.get("metadata") or {}).get("schema_version")))
+check("24 T5) hma_pivot: kausale Zeitstempel",
+      all(int(r["confirmation_bar_time"]) >= int(r["event_bar_time"])
+          for r in _recs), "")
+_up = sum(1 for r in _recs if r["is_trend_up"])
+_down = sum(1 for r in _recs if r["is_trend_down"])
+check("24 T5) hma_pivot: Signale erzeugt (up/down)",
+      _up + _down > 0, f"up={_up}, down={_down}")
+check("24 T5) hma_pivot: Zusatzfeld ma_value/pending_extreme_value",
+      bool(_recs)
+      and ("ma_value" in _recs[-1] and "pending_extreme_value" in _recs[-1]),
+      str(sorted(_recs[-1].keys()))[:160] if _recs else "")
+
+# --- T6: store_plugin_payload auf Test-DuckDB (4-Spalten-PK) ----------------
+_p24_db = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "test_p17_trend.duckdb")
+if os.path.exists(_p24_db):
+    os.remove(_p24_db)
+_con24 = duckdb.connect(_p24_db)
+_con24.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR NOT NULL,
+        timeframe VARCHAR NOT NULL,
+        bar_time TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMP DEFAULT current_timestamp,
+        feature_id VARCHAR NOT NULL DEFAULT 'native',
+        plugin_version VARCHAR,
+        feature_data JSON,
+        PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
+    )
+""")
+_fb24 = FeatureBuilder()
+# 3 Services auf derselben Bar koexistieren (konfliktfreier Upsert).
+# Hinweis: store_plugin_payload schliesst uebergebene Conns selbst
+# (own_connection=True) -> pro Aufruf eine frische Connection oeffnen.
+_p24_store = [
+    ("SILVER_TEST", "M5", "srv_trend_regime", _p24_r_payloads["Linear_Regression_Slope"]),
+    ("SILVER_TEST", "M5", "srv_trend_breakout",
+     SrvTrendBreakout().calculate(_p24_df, {"mode": "Supertrend_ATR"})
+     .get("feature_store_payload") or {}),
+    ("SILVER_TEST", "M5", "srv_trend_hma_pivot",
+     SrvTrendHmaPivot().calculate(_p24_df, {"mode": "HMA_Peak_Toleranz"})
+     .get("feature_store_payload") or {}),
+]
+for _sym, _tf, _fid, _payload in _p24_store:
+    _con24_w = duckdb.connect(_p24_db)
+    _n_w = _fb24.store_plugin_payload(_sym, _tf, _payload, con=_con24_w)
+    check(f"24 T6) {_fid}: store rows == bars", _n_w == _p24_n, str(_n_w))
+_con24_check = duckdb.connect(_p24_db)
+_n_rows = _con24_check.execute(
+    "SELECT count(*) FROM feature_store WHERE symbol='SILVER_TEST' "
+    "AND timeframe='M5'").fetchone()[0]
+_con24_check.close()
+check("24 T6) 3 Services koexistieren auf derselben Bar (3x bars)",
+      _n_rows == 3 * _p24_n, str(_n_rows))
+
+# Cleanup der Test-DB (Invariante 10) - inkl. WAL-Rest (DuckDB schreibt
+# beim Upsert eine -wal-Datei, die nicht Teil der Test-DB ist).
+for _p24_cf in (_p24_db, _p24_db + ".wal"):
+    try:
+        os.remove(_p24_cf)
+    except OSError:
+        pass
+
+
+# ===========================================================================
+# Teil 25 (Bugfix 07.08.2026, Mode-Wechsel): Die HOEHE der Service-Parameter-
+#   BOX (widget_service_columns) muss der wechselnden Anzahl sichtbarer
+#   modus-abhaengiger Parameter folgen - NICHT die Hoehe der Einzelfelder.
+#   Regression: Vor dem Fix blendete _apply_conditional_visibility die
+#   Controls/Labels zwar ein/aus, stiess aber KEIN updateGeometry()/_reflow()
+#   an (Qt 6.11 QWidgetItemV2-Cache blieb stale) - die Box behielt ihre alte
+#   Hoehe und der QFormLayout streckte die verbliebenen Zeilen.
+#   Referenz-Muster: _setup_collapsible/_build_service_columns.
+# ===========================================================================
+print("\n=== Teil 25: Box-Hoehe folgt wechselnder Parameterzahl (Mode) ===")
+
+from PySide6.QtWidgets import QComboBox as _QComboBox25  # noqa: E402
+from PySide6.QtWidgets import QGroupBox as _QGroupBox25  # noqa: E402
+
+w25 = ServiceWindow(parent=_Parent(), service_set_repo=repo)
+w25.show()
+pump()
+w25._load_plugin_editor("srv_swing_structure")
+pump()
+
+_iid25 = "srv_swing_structure"
+_mode25 = w25._service_param_controls.get((_iid25, "mode"))
+_box25 = w25.widget_service_columns
+_col25 = _mode25.parentWidget() if _mode25 is not None else None
+check("25 T1) Plugin-Editor geladen + Spalte verfuegbar",
+      _mode25 is not None and isinstance(_col25, _QGroupBox25),
+      str(type(_col25).__name__) if _col25 else "None")
+
+
+def _box_wish25():
+    """Layout-Wunschhoehe der Box (unabhaengig von Cache/Deferred-Resize)."""
+    if _box25.layout() is None:
+        return 0
+    return _box25.layout().sizeHint().height()
+
+
+def _visible_ctrls25():
+    """Hoehen der aktuell SICHTBAREN Formular-Controls (sollen stabil sein)."""
+    out = {}
+    for _k, _spec in w25._mode_schemas.get(_iid25, {}).items():
+        if _spec.get("expert") or w25._is_visual_key(_k):
+            continue
+        _c = w25._service_param_controls.get((_iid25, _k))
+        if _c is not None and _c.isVisible():
+            out[_k] = _c.height()
+    return out
+
+
+# --- Messung 1: Period_Extrema (2 sichtbare Nicht-Mode-Parameter) ---
+if isinstance(_mode25, _QComboBox25):
+    _mode25.setCurrentText("Period_Extrema")
+pump()
+pump()  # deferred Reflow (QTimer singleShot 0) sicher verarbeitet
+_h_pe_wish = _box_wish25()
+_h_pe_act = _box25.height()
+_ctrls_pe = _visible_ctrls25()
+check("25 T2) Period_Extrema: Box-Hoehe == Layout-sizeHint (Reflow lief)",
+      abs(_h_pe_act - _h_pe_wish) <= 2,
+      f"act={_h_pe_act} wish={_h_pe_wish}")
+check("25 T3) Period_Extrema: genau 1 sichtbarer Nicht-Mode-Parameter",
+      sum(1 for _k in _ctrls_pe if _k != "mode") == 1,
+      str(sorted(_ctrls_pe)))
+
+# --- Messung 2: ZigZag_ATR (3 sichtbare Nicht-Mode-Parameter) ---
+if isinstance(_mode25, _QComboBox25):
+    _mode25.setCurrentText("ZigZag_ATR")
+pump()
+pump()
+_h_zz_wish = _box_wish25()
+_h_zz_act = _box25.height()
+_ctrls_zz = _visible_ctrls25()
+check("25 T4) ZigZag_ATR: Box-Hoehe == Layout-sizeHint (Reflow lief)",
+      abs(_h_zz_act - _h_zz_wish) <= 2,
+      f"act={_h_zz_act} wish={_h_zz_wish}")
+check("25 T5) ZigZag_ATR: genau 2 sichtbare Nicht-Mode-Parameter",
+      sum(1 for _k in _ctrls_zz if _k != "mode") == 2,
+      str(sorted(_ctrls_zz)))
+check("25 T6) BOX-WACHSTUM: ZigZag_ATR(3 Params) > Period_Extrema(2)",
+      _h_zz_act > _h_pe_act,
+      f"zz={_h_zz_act} pe={_h_pe_act}")
+
+# --- Messung 3: zurueck zu Period_Extrema (Box MUSS wieder schrumpfen) ---
+if isinstance(_mode25, _QComboBox25):
+    _mode25.setCurrentText("Period_Extrema")
+pump()
+pump()
+_h_pe2_act = _box25.height()
+check("25 T7) BOX-SCHRUMPF: Period_Extrema(2) < ZigZag_ATR(3)",
+      _h_pe2_act < _h_zz_act,
+      f"pe2={_h_pe2_act} zz={_h_zz_act}")
+check("25 T8) Rueckwechsel konsistent (Hoehe wie Messung 1)",
+      abs(_h_pe2_act - _h_pe_act) <= 2,
+      f"pe2={_h_pe2_act} pe1={_h_pe_act}")
+
+# --- Einzelfelder: Hoehe ueber Mode-Wechsel stabil (kein Strecken) ---
+_common25 = sorted(set(_ctrls_pe) & set(_ctrls_zz))
+_ok25 = len(_common25) > 0 and all(
+    abs(_ctrls_pe[_k] - _ctrls_zz[_k]) <= 4 for _k in _common25)
+check("25 T9) Einzelfeld-Hoehen stabil ueber Mode-Wechsel (Tol. 4px)",
+      _ok25,
+      str({_k: (_ctrls_pe.get(_k), _ctrls_zz.get(_k))
+           for _k in _common25}))
+
+
+# --- 07.08.2026 (User-Anweisung): Fensterhoehe stabil, Canvas-Scrollbox,
+#     Tree eigene Scrollbar (kein Fenster-/Canvas-Versatz mehr) ---
+from PySide6.QtCore import Qt as _Qt25  # noqa: E402
+
+# T10/T11: Die FENSTERHOEHE darf sich beim Mode-Wechsel NICHT aendern
+# (Regression: vorher rief _apply_conditional_visibility self._reflow() ->
+# resize_to_clamped_content, _exact_fit_to_content -> Fensterhoehe folgte
+# der Box-Hoehe; jetzt wird NUR die Box resized, die ScrollArea uebernimmt).
+_h_win25_pe = w25.height()
+if isinstance(_mode25, _QComboBox25):
+    _mode25.setCurrentText("ZigZag_ATR")
+pump()
+pump()
+_h_win25_zz = w25.height()
+check("25 T10) Fensterhoehe stabil beim Mode-Wechsel (PE->ZZ)",
+      _h_win25_zz == _h_win25_pe,
+      f"pe={_h_win25_pe} zz={_h_win25_zz}")
+if isinstance(_mode25, _QComboBox25):
+    _mode25.setCurrentText("Period_Extrema")
+pump()
+pump()
+_h_win25_pe2 = w25.height()
+check("25 T11) Fensterhoehe stabil beim Rueckwechsel (ZZ->PE)",
+      _h_win25_pe2 == _h_win25_pe,
+      f"pe1={_h_win25_pe} pe2={_h_win25_pe2}")
+
+# T12/T13: Canvas-Scrollbox (Param-ScrollArea) ist der Mechanismus fuer
+# Ueberhoehe der Service-Parameter-Box (User-Anweisung Punkt 2).
+_scroll25 = getattr(w25, "_param_scroll", None)
+check("25 T12) Param-ScrollArea vorhanden (Canvas-Scrollbox)",
+      _scroll25 is not None, str(type(_scroll25).__name__) if _scroll25 else "None")
+if _scroll25 is not None:
+    check("25 T13) Param-ScrollArea vertikale Scrollbar AsNeeded",
+          _scroll25.verticalScrollBarPolicy() == _Qt25.ScrollBarAsNeeded,
+          str(_scroll25.verticalScrollBarPolicy()))
+    check("25 T13b) Param-ScrollArea widgetResizable=False (Box behaelt Groesse)",
+          not _scroll25.widgetResizable(), str(_scroll25.widgetResizable()))
+
+# T14: Der Baum (MasterTree) bekommt eine EIGENE Scrollbar und passt seine
+# Hoehe NICHT an die Service-Parameter an (User-Anweisung Punkt 3).
+_tree25 = w25.service_selector.master_tree
+check("25 T14) Tree vertikale Scrollbar-Policy AsNeeded (eigene Scrollbar)",
+      _tree25 is not None and _tree25.verticalScrollBarPolicy()
+      == _Qt25.ScrollBarAsNeeded,
+      str(_tree25.verticalScrollBarPolicy()) if _tree25 else "None")
+
+# T15: Scrollbox aktivierbar - wird die Box hoeher als der Viewport, erhaelt
+# die vertikale Scrollbar einen Range (> 0).
+if _scroll25 is not None and _box25 is not None:
+    _old_h25 = _box25.height()
+    _box25.resize(_box25.width(), _old_h25 + 600)
+    pump()
+    _range25 = (_scroll25.verticalScrollBar().maximum()
+                - _scroll25.verticalScrollBar().minimum())
+    check("25 T15) Scrollbox aktiviert sich bei Ueberhoehe (Range > 0)",
+          _range25 > 0,
+          f"range={_range25} viewport_h={_scroll25.viewport().height()} "
+          f"box_h={_box25.height()}")
+    _box25.resize(_box25.width(), _old_h25)
+    pump()
+
+w25.close()
+pump()
 
 if FAILURES:
     print(f"FEHLER: {len(FAILURES)}: {FAILURES}")

@@ -119,3 +119,40 @@
 1. **Dialog-Gestaltung:** Der `ServiceSelectorDialog` ist als frei bewegliches Manager-Window umgesetzt (kein `WA_DeleteOnClose`, Singleton). Checkbox-Multi-Select („Anwenden & Schließen") und Live-Filter (Zeilen-Klick) existieren parallel – das Zusammenspiel beider Pfade (z. B. Button-Anzeige nach Checkbox-Anwenden vs. Live-Filter) ist manuell zu prüfen.
 2. **Editierbarkeit:** Die Standalone-Editierung nutzt das `_DialogParamHost`-Muster (RAM-Definition + `plugin_params_<id>`); die `service_set_changed`-Konsistenz im ServiceWindow-Pfad wurde ergänzt (E-3). Die interaktive Bedienung (Dirty-Marker, Save-Button) ist manuell zu verifizieren.
 3. **Profil-Sync:** `_sync_service_filter_button`/`_active_display_names` bleiben gültig (Button-Text im AnalyticsWindow); nach einem Live-Filter werden die Anzeigenamen über das Modell re-resolved.
+
+---
+
+# 6. Implementierungs-Log (Phase 18.01.01)
+
+**Log-Format:** Datum/Uhrzeit (MD), Schritt-ID, Datei(en), Kurzbeschreibung, Verifikation.
+
+### 08.08.2026 12:36 – Phase 18.01.01 abgeschlossen (4 Commits)
+
+1. **18.01.01 E-4-KORREKTUR (Commit `cd56958`):**
+   * `analytics/ui/analytics_win.py`, `serviceui/service_selector_dialog.py`, `serviceui/service_win.py`, `docs/AKTUELLE_UMSETZUNG.md`
+   * Revert der Analytics-Einbettung (Option B) – `ServiceSelectorDialog` ist wieder der frei bewegliche Picker/Manager während der Analytics-Session (Singleton, kein `WA_DeleteOnClose`, Geometrie-Persistenz).
+   * Live-Filter: Klick auf Set/Ordner/Plugin löst feature_ids auf (`_resolve_selection_ids`, Kategorie rekursiv via `category_plugin_ids`) → `selection_ids_requested` → `AnalyticsViewModel.set_feature_ids()`.
+   * Standalone-Editierung im Param-Panel (`_DialogParamHost`: `_plugin_config` + Dirty-Tracking, Speichern-Button; Persistenz `save_global_value("plugin_params_<id>", …)` inkl. Beschreibungs-Collection).
+   * Set-/Service-CRUD via `ServiceSetRepository` + `event_bus.service_set_changed` (E-3).
+   * E-3-Konsistenz: `ServiceWindow._save_plugin_params()` emittiert jetzt ebenfalls `service_set_changed`.
+   * Verifikation: `py_compile` aller 4 Dateien PASS; Headless-Test 42/42 (danach entfernt, Invariante 10).
+
+2. **18.01.01 Quality Gate Step 4 (Commit `876bc4f`):**
+   * `docs/AKTUELLE_UMSETZUNG.md`
+   * Doku-Status: Step-3-Zeile auf „Umgesetzt (korrigierte Variante, s. E-4)", Step-4 „Abgeschlossen", E-1-Einrückungs-Regel (4 Leerzeichen), Step-4-Checkboxen.
+   * Verifikation: `py_compile` aller 5 betroffenen Dateien PASS (inkl. `service_selector_model.py`, `master_tree.py`).
+
+3. **Bugfix: Parameteranzeige `_mode_schemas` (Commit `a9d917b`):**
+   * `serviceui/service_selector_dialog.py`
+   * `_DialogParamHost.__init__` initialisierte nur `_service_param_controls`/`_service_desc_controls`; `ServiceParamColumnsMixin._build_service_column` schreibt zusätzlich in `_mode_schemas`, `_service_param_labels`, `_service_info_labels`, `_service_info_pids` → `AttributeError: no attribute _mode_schemas`.
+   * Fix: 4 fehlende Registrys initialisiert; `_clear_panel` leert alle 6 Registrys (kein Stale beim Zeilenwechsel).
+   * Verifikation: `py_compile` PASS; Headless-Test 11/11 (echter `_build_service_column`-Pfad + Gegenprobe reproduziert den Original-Bug; danach entfernt).
+
+4. **Bugfix: Dialog-Fensterhöhe FIX + Scrollbars (Commit `033d3cc`):**
+   * `serviceui/service_selector_dialog.py`
+   * ServiceWindow-Muster (07.08.2026): `param_scroll.setWidgetResizable(False)` + Container wird nach jedem Panel-Aufbau explizit auf `layout().sizeHint()` gesetzt (`_resize_param_container_deferred`, deferred wegen QWidgetItemV2-Cache) → ScrollArea zeigt bei Überhöhe vertikale Scrollbalken statt Fensterhöhen-Anpassung.
+   * `setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)` (vorher nur horizontal), `setSizeConstraint(QLayout.SetNoConstraint)` (QDialog-Default hätte die Höhe beim show() an den Layout-sizeHint geklemmt).
+   * `_DialogParamHost._resize_param_box_deferred` delegiert an den Dialog (Mode-Wechsel/Experten-Optionen-Kollaps ziehen den Container nach, kein Fenster-Reflow).
+   * Verifikation: `py_compile` PASS; Headless-Test 17/17 (Container-Resize auf sizeHint, deferred-Planung, Host-Delegation, `_fit_dialog_width` ändert nur die Breite, kein `resize_to_clamped_content`/`_reflow` im Dialog; danach entfernt).
+
+**Abschluss:** Phase 18.01.01 (Harmonisierung Analytics_win & Service_win) vollständig umgesetzt und headless verifiziert. Offene Punkte aus §5.4 sind reine manuelle UI-Prüfungen (Zusammenspiel Checkbox/Anwenden vs. Live-Filter, Dirty-Marker/Speichern-Button, Profil-Sync) und blockieren den Stand nicht.
