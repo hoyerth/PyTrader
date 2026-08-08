@@ -636,12 +636,12 @@ class AnalyticsWindow(PersistentWindow):
     def _on_table_settings_changed(self, settings: Dict[str, Any]) -> None:
         """Uebernimmt TablePage-Settings in den ViewModel (19.03 Step 1/2).
 
-        Spaltenbreiten {Spaltenname: Breite} (E5), Default-Zeilenhoehe (E9),
-        **individuelle Zeilenhoehen** (19.05-Bugfix: {globaler Row-Index:
-        Hoehe} – damit das Ziehen einer Zeile nicht alle anderen mitzieht),
-        Sortier-Spalte/-Richtung (E8). Reine UI-Zustaende der TablePage:
-        set_table_settings markiert nur das Profil-Dirty-Flag (E6, Option B)
-        und loest KEINEN Query-Refresh aus (kein Debounce/Worker).
+        Spaltenbreiten {Spaltenname: Breite} (E5), **globale Zeilenhoehe**
+        (E9/19.06: ein Wert fuer die GESAMTE Tabelle – das Ziehen einer
+        Zeile setzt alle Zeilen live auf diese Hoehe), Sortier-Spalte/
+        -Richtung (E8). Reine UI-Zustaende der TablePage: set_table_settings
+        markiert nur das Profil-Dirty-Flag (E6, Option B) und loest KEINEN
+        Query-Refresh aus (kein Debounce/Worker).
         """
         so = settings.get("sort_order")
         self._vm.set_table_settings(
@@ -649,7 +649,6 @@ class AnalyticsWindow(PersistentWindow):
             row_height=int(settings.get("row_height") or 0),
             sort_column=int(settings.get("sort_column") or 0),
             sort_order=int(so) if so is not None else 1,
-            row_heights=settings.get("row_heights") or {},
         )
 
     @Slot(bool)

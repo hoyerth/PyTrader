@@ -56,13 +56,18 @@ Die Daten kommen ueber `data_ready(QUERY_TABLE, data)` vom ViewModel
   Anzeige-Seite wird neu gerendert, Roh-Liste unveraendert).
 
 19.05 (Bugfix 08.08.2026): Individuelle Zeilenhöhen
-- Bug: `_emit_table_settings` persistierte `sectionSize(0)` als globalen
-  `table_row_height` -> beim nächsten Render setzte `setDefaultSectionSize`
-  ALLE Zeilen auf die Höhe der (evtl. einzeln gezogenen) Zeile 0.
-- Fix: `row_height` bleibt die Default-Section-Size; individuell gezogene
-  Zeilenhöhen werden separat als `row_heights` {globaler Row-Index: Höhe}
-  persistiert (JSON-sicher) und in `_apply_table_settings` per `setRowHeight`
-  wiederhergestellt (nur die gezogene Zeile, robust gegenüber Paging).
+- Zwischenstand (Anforderung korrigiert in 19.06): `row_height` als
+  Default-Section-Size + separate `row_heights` {Row-Index: Höhe}.
+
+19.06 (Korrektur 08.08.2026): Zeilenhöhe -> GANZE Tabelle live
+- Gewuenschtes Verhalten (Anwender): Das Ziehen einer Zeilenhöhe uebertraegt
+  die neue Hoehe LIVE auf die gesamte Tabelle (alle Zeilen) und speichert sie
+  als globale `table_row_height` im Profil. KEIN individuelles row_heights.
+- Umsetzung: `_on_vertical_section_resized` setzt nach dem Drag die neue
+  Hoehe per setDefaultSectionSize + setRowHeight auf alle Zeilen (Signale
+  blockiert, kein Signal-Sturm) und emittiert die globale Hoehe;
+  `_apply_table_settings` stellt sie beim Refresh/Profil-Load wieder her
+  (alle Zeilen auf die gespeicherte Hoehe).
 """
 
 from typing import Any, Callable, Dict, List, Optional
@@ -470,7 +475,34 @@ class TablePage(QWidget):
         self._emit_table_settings()
 
     def _on_vertical_section_resized(self, *args) -> None:
-        """Zeilenhoehe geaendert (User) -> Settings emittieren (19.03)."""
+        """Zeilenhoehe geaendert (User) -> GANZE Tabelle live uebernehmen (19.06).
+
+        Gewuenschtes Verhalten (Anwender): Das Ziehen einer Zeilenhöhe
+        uebertraegt die neue Hoehe sofort auf ALLE Zeilen (live, ohne
+        Refresh). Qt aendert beim Drag zunaechst nur die gezogene Zeile –
+        dieser Handler uebernimmt danach die neue Hoehe (args[2] = newSize)
+        per `setDefaultSectionSize` (Default fuer neue Zeilen) + `setRowHeight`
+        (alle bestehenden Zeilen) auf die gesamte Tabelle. Die Header-Signale
+        sind waehrenddessen blockiert (kein sectionResized-Signal-Sturm);
+        danach wird die globale `row_height` emittiert (kein individuelles
+        row_heights mehr, 19.06).
+        """
+        if len(args) >= 3:
+            try:
+                new_size = int(args[2])
+            except (TypeError, ValueError):
+                new_size = 0
+        else:
+            new_size = 0
+        if new_size > 0:
+            vheader = self._table.verticalHeader()
+            vheader.blockSignals(True)
+            try:
+                vheader.setDefaultSectionSize(new_size)
+                for r in range(self._table.rowCount()):
+                    self._table.setRowHeight(r, new_size)
+            finally:
+                vheader.blockSignals(False)
         self._emit_table_settings()
 
     def _on_sort_indicator_changed(self, *args) -> None:
@@ -478,20 +510,16 @@ class TablePage(QWidget):
         self._emit_table_settings()
 
     def _emit_table_settings(self) -> None:
-        """Emittiert den kompletten Tabellen-Zustand (19.03 E5/E9 / 19.05).
+        """Emittiert den kompletten Tabellen-Zustand (19.03 E5/E8/E9 / 19.06).
 
         Spaltenbreiten als {Header-Text: Breite} (E5 – robust gegenueber der
-        dynamischen JSON-Union), Zeilenhoehe als Default-Section-Size (E9,
-        Basis fuer neue Zeilen), **individuelle Zeilenhoehen** als
-        `row_heights` {globaler Row-Index: Hoehe} (19.05-Bugfix: nur von der
-        Default abweichende Zeilen; die globalen Indizes sind
-        paging-robust), Sortier-Spalte und -Richtung als Qt-Werte (E8).
-
-        Hinweis 19.05 (Bugfix): Frueher wurde `sectionSize(0)` als globaler
-        `table_row_height` persistiert – beim naechsten Render setzte
-        `setDefaultSectionSize` dann ALLE Zeilen auf die Hoehe der Zeile 0.
-        Deshalb bleibt `row_height` jetzt die Default-Section-Size, und nur
-        die tatsaechlich gezogenen Zeilen wandern in `row_heights`.
+        dynamischen JSON-Union), **globale Zeilenhoehe** (E9/19.06: alle
+        Zeilen identisch, nach einem Zeilen-Drag hat
+        `_on_vertical_section_resized` die gesamte Tabelle bereits live auf
+        die neue Hoehe gesetzt), Sortier-Spalte und -Richtung als Qt-Werte
+        (E8). KEIN individuelles `row_heights` mehr (19.06-Korrektur: das
+        Ziehen einer Zeile soll die GANZE Tabelle setzen und als globale
+        `table_row_height` persistiert werden).
         """
         widths: Dict[str, int] = {}
         header = self._table.horizontalHeader()
@@ -500,16 +528,12 @@ class TablePage(QWidget):
             if item is not None:
                 widths[str(item.text())] = int(header.sectionSize(i))
         vheader = self._table.verticalHeader()
-        row_height = int(vheader.defaultSectionSize())
-        # 19.05: Individuelle Zeilenhöhen erfassen (globaler Row-Index =
-        # Seitenstart + Anzeige-Zeile; nur Abweichungen vom Default).
-        row_heights: Dict[int, int] = {}
+        # 19.06: Globale Zeilenhöhe (alle Zeilen identisch). Nach einem
+        # Zeilen-Drag sind alle Zeilen auf die neue Hoehe gesetzt.
         if self._table.rowCount() > 0:
-            page_start = self._current_page * self._page_size
-            for r in range(self._table.rowCount()):
-                h = int(vheader.sectionSize(r))
-                if h != row_height:
-                    row_heights[page_start + r] = h
+            row_height = int(vheader.sectionSize(0))
+        else:
+            row_height = int(vheader.defaultSectionSize())
         sort_col = int(header.sortIndicatorSection())
         if sort_col < 0:
             sort_col = 0
@@ -519,7 +543,6 @@ class TablePage(QWidget):
         self.table_settings_changed.emit({
             "column_widths": widths,
             "row_height": row_height,
-            "row_heights": row_heights,
             "sort_column": sort_col,
             "sort_order": 1 if order == Qt.DescendingOrder else 0,
         })
@@ -548,37 +571,28 @@ class TablePage(QWidget):
         """Wendet die gespeicherten Tabellen-Settings an (19.03 E3/E8/E9).
 
         Wird am Ende von _populate gerufen (Header-Signale sind blockiert):
-        Default-Zeilenhoehe (setDefaultSectionSize, E9), **individuelle
-        Zeilenhoehen** (setRowHeight, 19.05-Bugfix) und Sortier-Spalte/
-        -Richtung (validiert, E8). Spaltenbreiten uebernimmt bereits der
-        Spaltenaufbau aus _get_settings_widths(). Ohne ViewModel (z. B.
-        Headless-Tests) bleibt die Sortierung deaktiviert – Settings gibt es
-        nicht.
+        **globale Zeilenhoehe** (E9/19.06: `setDefaultSectionSize` als
+        Default fuer neue Zeilen + `setRowHeight` fuer ALLE bestehenden
+        Zeilen – die GANZE Tabelle bekommt die gespeicherte Hoehe, keine
+        individuellen Zeilenhoehen) und Sortier-Spalte/-Richtung (validiert,
+        E8). Spaltenbreiten uebernimmt bereits der Spaltenaufbau aus
+        _get_settings_widths(). Ohne ViewModel (z. B. Headless-Tests) bleibt
+        die Sortierung deaktiviert – Settings gibt es nicht.
         """
         if self._view_model is None:
             return
         params = self._view_model.params
-        # Default-Zeilenhoehe (E9): Basis fuer Zeilen ohne eigene Hoehe.
+        # 19.06: Globale Zeilenhöhe auf die GESAMTE Tabelle anwenden
+        # (Default fuer neue Zeilen + alle bestehenden Zeilen).
         try:
             row_height = int(params.get("table_row_height") or 0)
         except (TypeError, ValueError):
             row_height = 0
         if row_height > 0:
-            self._table.verticalHeader().setDefaultSectionSize(row_height)
-        # 19.05 (Bugfix): Individuelle Zeilenhöhen wiederherstellen –
-        # NUR die gezogenen Zeilen (globaler Row-Index, paging-robust),
-        # statt alle Zeilen auf einen Wert zu setzen.
-        raw_heights = params.get("table_row_heights") or {}
-        if raw_heights:
-            page_start = self._current_page * self._page_size
+            vheader = self._table.verticalHeader()
+            vheader.setDefaultSectionSize(row_height)
             for r in range(self._table.rowCount()):
-                global_r = page_start + r
-                try:
-                    h = int(raw_heights.get(str(global_r)) or 0)
-                except (TypeError, ValueError):
-                    h = 0
-                if h > 0:
-                    self._table.setRowHeight(r, h)
+                self._table.setRowHeight(r, row_height)
         # Sortierung (E8): Spalten-Index validieren, Order auf Qt-Werte klemmen.
         try:
             sort_col = int(params.get("table_sort_column") or 0)
