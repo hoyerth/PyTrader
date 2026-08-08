@@ -16,7 +16,7 @@ Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukture
 - Abweichungen davon nur auf ausdrückliche Einzelanweisung des Benutzers.
 - Anpassungen, ob aus dieser Datei oder manuell eingegeben, werden hier in weiteren Kapiteln nach gegebener Taxonomie als Implementierungs-Log mit datum/uhrzeit im Format MD dokumentiert
 
-### 0b. WICHTIG: `docs/Current` NICHT BEACHTEN (Standard)
+### 0b. WICHTIG: `docs/Current` und `docs/Archiv` NICHT BEACHTEN (Standard)
 - **Alle Dateien im Unterordner `docs/Current` und `docs/Archiv` (`docs/Current/x_Architektur.md`, `docs/Current/x_Roadmap.md`, ...) sind archivierte/abgelegte Alt-Dokumente und werden NICHT beachtet.**
 - **Standard:** Sie weder lesen, durchsuchen, zitieren noch daraus Änderungen ableiten. Sie spiegeln NICHT den aktuellen Stand des Projekts wider.
 - **Ausnahme:** Nur auf temporäre, ausdrückliche Einzelanweisung des Benutzers darf eine bestimmte Datei aus `docs/Current` ausnahmsweise herangezogen werden.

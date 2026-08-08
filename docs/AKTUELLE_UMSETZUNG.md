@@ -899,3 +899,107 @@ Umgesetzt (Steps 1–4 abgearbeitet; Entscheidungen E1–E10 des Prüfprotokolls
   (Bugfixing-Regel C). Keine UI-/Regressionstests ausgeführt (Regel 4);
   Baseline-Vorbefunde P2/P5/H3/H4/H5/H7 sind unverändert dokumentiert.
 
+
+
+---
+
+# 19.05/19.06 Bugfix: Profilname-'?' + Zeilenhöhe -> GANZE Tabelle live
+
+## Ausgangslage (Bugfixing-Modus, 08.08.2026)
+
+Vom Anwender gemeldet:
+1. **Zeilenhöhe:** Das Ziehen einer Zeilenhöhe in der Analytics-Tabelle
+   zog alle anderen Zeilen auf dieselbe Höhe.
+2. **Profilname:** Nach dem Speichern eines Profils wurde der Profilname
+   durch `?` ersetzt.
+
+## Bug 2 – Profilname '?' (19.05)
+
+**Ursache:** `AnalyticsWindow._initial_load()` ruft `load_profiles()` auf –
+der ViewModel emittiert dort **kein** `active_profile_changed` (nur
+`set_active_profile`/`create_profile` emittieren es). `edit_profile_name`
+blieb dadurch beim App-Start leer. Der erste `[💾 Save]` persistierte dann
+`name=''` (update_profile mit leerem Namen) – die Profil-Combo zeigt für
+leere Namen `'?'` (`p.get("name") or "?"` in `_on_profiles_available`).
+
+**Fix (`analytics_win.py`):**
+* Neue Methode `_sync_profile_editor()`: synchronisiert
+  `edit_profile_name`/`edit_profile_desc`/`edit_limit` mit dem aktiven
+  Profil (Name/Beschreibung) bzw. dem VM-Parameter (Limit). Ohne aktives
+  Profil werden die Felder geleert.
+* Aufruf in `_initial_load()` direkt nach `load_profiles()` (App-Start)
+  und nach `_sync_profile_filters()` – der Profilname steht damit vor dem
+  ersten Save korrekt im Feld und wird nicht mehr als `''` persistiert.
+
+## Bug 1 – Zeilenhöhe (19.05 Zwischenstand -> 19.06 Korrektur)
+
+**Fehlinterpretation in 19.05:** Der erste Fix interpretierte die Meldung
+als „einzelne Zeile isolieren" und führte `table_row_heights` (individuelle
+Zeilenhöhen {Row-Index: Höhe}) ein. Das war NICHT gewünscht.
+
+**19.06 – Gewünschtes Verhalten (Korrektur):** Das Ziehen einer Zeilenhöhe
+soll die neue Höhe **live auf die GANZE Tabelle** übertragen und als
+**globale** `table_row_height` im Profil speichern. `table_row_heights`
+wurde wieder entfernt.
+
+**Fix (`table_page.py`, `analytics_view_model.py`, `analytics_win.py`):**
+* `_on_vertical_section_resized(logicalIndex, oldSize, newSize)`: übernimmt
+  die neue Höhe (`newSize` = args[2]) sofort per
+  `setDefaultSectionSize(newSize)` + `setRowHeight(r, newSize)` auf **alle**
+  Zeilen (live, ohne Refresh). Der verticalHeader ist währenddessen
+  blockiert (kein sectionResized-Signal-Sturm).
+* `_emit_table_settings()`: liefert nur noch die **globale** `row_height`
+  (alle Zeilen identisch) – kein `row_heights`-Key mehr.
+* `_apply_table_settings()`: wendet beim Refresh/Profil-Load die gespeicherte
+  globale Höhe auf die gesamte Tabelle an (`setDefaultSectionSize` + alle
+  `setRowHeight`).
+* `analytics_view_model.py`: Param `table_row_heights` entfernt;
+  `set_table_settings()` wieder ohne `row_heights`-Argument.
+* `analytics_win.py`: `_on_table_settings_changed` reicht kein `row_heights`
+  mehr durch.
+
+## Verifikation (headless, kein UI)
+
+* `py_compile` auf `table_page.py`, `analytics_win.py`,
+  `analytics_view_model.py` + `test.py` → **PASS**.
+* Isolierte Runner `test/_run_part35.py` (Temp-DBs) → **alle PASS** (danach
+  entfernt, Invariante 10).
+* `test/test.py` **Teil 35** (10 Prüfungen, 19.06-Semantik) → **alle PASS**:
+  * Z1a: Ziehen einer Zeile → **alle** Zeilen live auf 45
+    (setDefaultSectionSize + setRowHeight).
+  * Z1b: Emit `row_height=45`, **kein** `row_heights`-Key.
+  * Z1c: VM speichert `table_row_height=45` (kein `table_row_heights`).
+  * Z1d: Nach `_populate` (Refresh) → alle Zeilen wieder 45 (global).
+  * Z1e: `table_row_height` im Profil-Payload.
+  * Z1f: `_apply_profile` übernimmt die globale Höhe.
+  * Z2a–Z2d: `_sync_profile_editor` füllt Name/Beschreibung/Limit aus dem
+    aktiven Profil; leerer Name wird beim Save nicht mehr persistiert;
+    ohne aktives Profil werden die Felder geleert.
+* Gesamtlauf `test/test.py`: Teile 31–35 **PASS**; die 6 Fehler sind die
+  dokumentierten **Baseline-Vorbefunde** P2/P5/H3/H4/H5/H7 (Geometrie-
+  Tests, offscreen `800x582`) – nicht durch 19.05/19.06 verursacht.
+* Test-Workspace aufgeräumt (Invariante 10): nur `test/test.py` verbleibt.
+
+## Abweichungen / Entscheidungen
+
+* **19.06-Korrektur statt 19.05:** Der Zwischenstand 19.05 (individuelle
+  Zeilenhöhen `table_row_heights`) wurde verworfen – die Anforderung des
+  Anwenders ist „eine Zeilenhöhe ziehen → ganze Tabelle live auf diese
+  Höhe", persistiert als globale `table_row_height`.
+* **Live ohne Refresh:** Die Übernahme erfolgt direkt im
+  `sectionResized`-Handler (kein `_populate`/Query nötig); der Refresh
+  (TF-/Datenwechsel, Profil-Load) stellt die globale Höhe über
+  `_apply_table_settings` wieder her.
+* **DB-Wartung (nicht Teil dieses Commits):** Die WAL-Dateien waren nach
+  hartem Beenden von `main.py` beschädigt (DuckDB `GetDefaultDatabase`-
+  Internal-Error). Sie wurden entfernt und alle drei echten DBs headless
+  verifiziert (feature_store 904.723 Rows, Alt-IDs migriert, ohlcv_bars
+  19,97 M Rows) – **kein Datenverlust**.
+
+### Status
+
+* **19.05 (`41d29bf`) + 19.06 (`38fc830`): beide Bugs umgesetzt, headless
+  verifiziert und committet (08.08.2026).** Doku-Eintrag erst nach Freigabe
+  des Anwenders (Bugfixing-Regel C). Keine UI-/Regressionstests ausgeführt
+  (Regel 4); Baseline-Vorbefunde P2/P5/H3/H4/H5/H7 sind unverändert
+  dokumentiert.
