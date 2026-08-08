@@ -125,6 +125,14 @@ class _DialogParamHost(ServiceParamColumnsMixin):
     def __init__(self, state_manager=None) -> None:
         self._service_param_controls: Dict[str, Any] = {}
         self._service_desc_controls: Dict[str, Any] = {}
+        # 08.08.2026 (Bugfix): `ServiceParamColumnsMixin._build_service_column`
+        # schreibt auch in diese Registrys (Conditional-Visibility-Schema je
+        # Instanz, Form-Label-Referenzen, Info-Labels) – ohne Init schlaegt die
+        # Parameteranzeige mit 'AttributeError: _mode_schemas' fehl.
+        self._mode_schemas: Dict[str, Any] = {}
+        self._service_param_labels: Dict[str, Any] = {}
+        self._service_info_labels: Dict[str, Any] = {}
+        self._service_info_pids: Dict[str, Any] = {}
         self._symbol_precision: Optional[int] = None
         self.combo_symbol = None
         self.combo_tf = None
@@ -950,8 +958,17 @@ class ServiceSelectorDialog(QDialog):
             if w is not None:
                 w.setParent(None)
                 w.deleteLater()
-        self._param_host._service_param_controls.clear()
-        self._param_host._service_desc_controls.clear()
+        host = self._param_host
+        host._service_param_controls.clear()
+        host._service_desc_controls.clear()
+        # 08.08.2026 (Bugfix): Schema-/Label-Registrys ebenfalls zuruecksetzen
+        # (Muster `_clear_service_columns` in param_columns.py) – sonst bleiben
+        # Conditional-Visibility-Schemas und Info-Labels fremder Instanzen
+        # haengen, wenn der naechste Spaltenaufbau weniger Spalten baut.
+        host._mode_schemas.clear()
+        host._service_param_labels.clear()
+        host._service_info_labels.clear()
+        host._service_info_pids.clear()
 
     # ------------------------------------------------------------------
     # Punkt 4: Geometrie-Persistenz (global_settings, IndicatorDialog-Muster)
