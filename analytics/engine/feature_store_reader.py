@@ -140,7 +140,7 @@ class FeatureStoreReader:
         feature_ids: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """Liefert Feature-Store-Zeilen als Dicts (zeilen-aufwaerts sortiert).
+        """Liefert Feature-Store-Zeilen als Dicts (vom NEUESTEN Stand abwaerts).
 
         19.02 (Cleanup): Die Legacy-Native-Spalten ema_diff/rsi_14/
         atr_normalized sind entfernt – jede Zeile enthaelt:
@@ -150,13 +150,20 @@ class FeatureStoreReader:
             plugin_version– Plugin-Version (oder None)
             feature_data  – geparstes JSON inkl. schema_version-Default (E-3)
 
+        Bugfix 08.08.2026 (Vorgabe): Die Zeilen werden mit `ORDER BY bar_time
+        DESC` vom NEUESTEN Stand rueckwaerts bis zum `limit` gelesen (neuestes
+        Datum zuerst). Vorher stand `ASC` – mit Limit wurden dadurch die
+        AELTESTEN Zeilen geliefert (genau das Gegenteil der Vorgabe). Die
+        TablePage sortiert die Anzeige zusaetzlich deterministisch absteigend.
+
         Args:
             symbol: Symbol-Name (case-insensitive)
             timeframe: Timeframe (case-insensitive)
             feature_id: Optionaler Einzel-Filter auf die Plugin-ID (Legacy)
             feature_ids: Optionaler Multi-Filter (15.03-E) – filtert per
                 `feature_id IN (...)`. Leere Liste/None = kein Filter.
-            limit: Maximale Anzahl Zeilen (Default 1000)
+            limit: Maximale Anzahl Zeilen (Default 1000) – die NEUESTEN
+                `limit` Zeilen (rueckwaerts vom neuesten Stand).
         """
         if not symbol or not timeframe:
             return []
@@ -178,7 +185,7 @@ class FeatureStoreReader:
                     feature_data
                 FROM feature_store
                 WHERE {' AND '.join(conditions)}
-                ORDER BY bar_time ASC
+                ORDER BY bar_time DESC
                 LIMIT ?
             """, params + [limit]).fetchall()
         except Exception as e:
@@ -300,13 +307,18 @@ class FeatureStoreReader:
         extrahiert (identische Semantik: Zeilen mit fehlendem/nicht-
         numerischem Wert in einer Spalte werden ausgelassen).
 
+        Bugfix 08.08.2026 (Vorgabe): Wie fetch_rows werden die Zeilen vom
+        NEUESTEN Stand rueckwaerts bis zum `limit` gelesen (`ORDER BY
+        bar_time DESC`) – vorher ASC (aelteste N Zeilen bei Limit).
+
         Args:
             symbol/timeframe: Filter (case-insensitive)
             columns: JSON-Keys aus feature_data (nur identifier-sichere)
             feature_id: Optionaler Einzel-Filter auf die Plugin-ID (Legacy)
             feature_ids: Optionaler Multi-Filter (15.03-E) per
                 `feature_id IN (...)`. Leere Liste/None = kein Filter.
-            limit: Maximale Zeilen (Default 1000)
+            limit: Maximale Zeilen (Default 1000) – die NEUESTEN `limit`
+                Zeilen (rueckwaerts vom neuesten Stand).
 
         Returns:
             Liste von Dicts {key: float, ...} – Zeilen mit NULL/nicht-
@@ -331,7 +343,7 @@ class FeatureStoreReader:
                 FROM feature_store
                 WHERE {' AND '.join(conditions)}
                   AND feature_data IS NOT NULL
-                ORDER BY bar_time ASC
+                ORDER BY bar_time DESC
                 LIMIT ?
             """, params + [limit]).fetchall()
         except Exception as e:
