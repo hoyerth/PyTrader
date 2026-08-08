@@ -68,11 +68,12 @@ Bugfix-Runde 06.08.2026 (User-Anweisung, Punkte 1-4):
 
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMessageBox,
     QPushButton,
@@ -82,8 +83,9 @@ from PySide6.QtWidgets import (
 )
 
 from analytics.engine.service_selector_model import ServiceSelectorModel
+from config.event_bus import event_bus
 from serviceui.master_tree import (
-    TYPE_PLUGIN, TYPE_SERVICE, TYPE_SET,
+    TYPE_CATEGORY, TYPE_PLUGIN, TYPE_SERVICE, TYPE_SET,
 )
 from serviceui.param_columns import ServiceParamColumnsMixin
 from serviceui.service_selector_widget import ServiceSelectorWidget
@@ -104,25 +106,37 @@ TREE_DEFAULT_WIDTH = 300
 
 
 class _DialogParamHost(ServiceParamColumnsMixin):
-    """Minimaler Mixin-Host fuer das Read-Only-Parameter-Panel des Dialogs.
+    """Mixin-Host fuer das Parameter-Panel des Dialogs.
 
     `ServiceParamColumnsMixin._build_service_column()` erwartet Host-
     Attribute des ServiceWindow (Parameter-Controls, Sperr-Lookup usw.).
-    Dieser Mini-Host stellt nur die benoetigten Attribute/Methoden bereit;
-    alle Bearbeitungs-/Persistenz-Pfade sind no-op – der Dialog zeigt die
-    Parameter-Spalten ausschliesslich Read-Only an (deaktivierte QGroupBox,
-    kein Dirty-Tracking, kein Speichern).
+    Dieser Host stellt die benoetigten Attribute/Methoden bereit:
+
+      * Read-Only-Anzeige (Sets/Indikator-Services): deaktivierte QGroupBox,
+        kein Dirty-Tracking (kein Speichern).
+      * 18.01.01 (E-3/E-4): Standalone-Services (`belongs_to_indicator ==
+        False`) werden EDITIERBAR gerendert – Parameter laufen in
+        global_settings (Key 'plugin_params_<pid>'), der Speichern-Button
+        des Dialogs wird bei Aenderungen eingeblendet (_set_param_actions_
+        visible) und `_save_plugin_params()` persistiert + emittiert
+        `event_bus.service_set_changed` (Live-Sync aller MasterTree).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, state_manager=None) -> None:
         self._service_param_controls: Dict[str, Any] = {}
         self._service_desc_controls: Dict[str, Any] = {}
         self._symbol_precision: Optional[int] = None
         self.combo_symbol = None
         self.combo_tf = None
+        # 18.01.01: Standalone-Editierung im Dialog-Kontext.
+        self._state_manager = state_manager
+        self._current_plugin_editing: Optional[str] = None
+        self._current_set_definition: Optional[Dict[str, Any]] = None
+        #: Speichern-Button des Dialogs (wird nach dem UI-Aufbau gesetzt).
+        self.btn_save_params: Optional[QPushButton] = None
 
     def _service_lock(self, plugin_id: str):
-        """Keine Set-Sperre im Dialog (Read-Only-Anzeige)."""
+        """Keine Set-Sperre im Dialog (kein Set-Editing hier)."""
         return "", ""
 
     def _open_service_desc_editor(self, instance_id: str) -> None:
@@ -130,16 +144,132 @@ class _DialogParamHost(ServiceParamColumnsMixin):
         pass
 
     def _schedule_reflow(self) -> None:
-        """Read-Only: kein Editor-Reflow noetig."""
+        """Kein Fenster-Reflow (Param-Panel skaliert nicht)."""
         pass
+
+    def _set_param_actions_visible(self, visible: bool) -> None:
+        """Blendet den Speichern-Button des Dialogs ein/aus (Dirty-State)."""
+        btn = self.btn_save_params
+        if btn is not None:
+            try:
+                btn.setVisible(bool(visible))
+            except (RuntimeError, AttributeError):
+                pass
+
+    def _plugin_config(self, plugin_id: str) -> Dict[str, Any]:
+        """ServiceInstanceConfig eines Standalone-Plugins (service_win-Muster).
+
+        Basis sind die Registry-Defaults; gespeicherte Werte aus
+        global_settings (Key 'plugin_params_<pid>') ueberschreiben
+        lookback/params und ergaenzen eine optionale Beschreibung.
+        """
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            plugin = PluginRegistry().get(plugin_id)
+        except KeyError:
+            plugin = None
+        params = dict(getattr(plugin, "default_params", None) or {}) if plugin else {}
+        lookback: int = 1000
+        if "lookback" in params:
+            try:
+                lookback = int(params.pop("lookback") or 1000)
+            except (TypeError, ValueError):
+                lookback = 1000
+        cfg: Dict[str, Any] = {
+            "plugin_id": plugin_id,
+            "lookback": lookback,
+            "params": params,
+            "version": getattr(plugin, "version", "0.0.0") or "0.0.0",
+        }
+        if self._state_manager is not None:
+            try:
+                saved = self._state_manager.get_global_value(
+                    f"plugin_params_{plugin_id}", None)
+            except Exception:
+                saved = None
+            if isinstance(saved, dict):
+                lb = saved.get("lookback")
+                if lb is not None:
+                    try:
+                        cfg["lookback"] = int(lb)
+                    except (TypeError, ValueError):
+                        pass
+                saved_params = saved.get("params")
+                if isinstance(saved_params, dict):
+                    merged = dict(params)
+                    merged.update(saved_params)
+                    cfg["params"] = merged
+                desc = saved.get("description")
+                if desc:
+                    cfg["description"] = str(desc)
+        return cfg
+
+    def _save_plugin_params(self) -> bool:
+        """Persistiert die Parameter des editierbaren Standalone-Plugins.
+
+        global_settings (Key 'plugin_params_<pid>') + EventBus-Sync
+        (`service_set_changed`, 18.01.01 E-3) – so synchronisieren alle
+        ServiceSelectorModel-Instanzen den MasterTree live.
+
+        Wie `collect_set_definition` in service_win wird die individuelle
+        Instanz-Beschreibung aus dem Beschreibungs-Control uebernommen
+        (`_service_desc_controls`), damit auch Beschreibungs-Aenderungen
+        persistiert werden (nicht nur lookback/params).
+        """
+        plugin_id = self._current_plugin_editing
+        if not plugin_id or self._state_manager is None:
+            return False
+        definition = self._current_set_definition or {}
+        services = definition.get("services") or {}
+        cfg = next(iter(services.values()), None)
+        if not isinstance(cfg, dict):
+            return False
+        description = str(cfg.get("description") or "")
+        desc_ctrl = self._service_desc_controls.get(plugin_id)
+        if desc_ctrl is not None:
+            try:
+                description = str(desc_ctrl.text()).strip()
+            except (RuntimeError, AttributeError):
+                pass
+        data: Dict[str, Any] = {
+            "plugin_id": plugin_id,
+            "lookback": int(cfg.get("lookback") or 1000),
+            "params": dict(cfg.get("params") or {}),
+            "description": description,
+        }
+        try:
+            self._state_manager.save_global_value(
+                f"plugin_params_{plugin_id}", data)
+        except Exception as e:
+            print(f"WARN [ServiceSelectorDialog] Plugin-Parameter nicht "
+                  f"gespeichert: {e}")
+            return False
+        self._set_param_actions_visible(False)
+        event_bus.service_set_changed.emit()
+        return True
 
 
 class ServiceSelectorDialog(QDialog):
-    """Multi-Select-Dialog fuer die Analytics-Datenquellen (15.03-E)."""
+    """Multi-Select-Dialog fuer die Analytics-Datenquellen (15.03-E).
+
+    18.01.01 (E-4): Der Picker ist das frei bewegliche "Manager-Window"
+    waehrend einer Analytics-Session. Zusaetzlich zum Multi-Select-Filter:
+      * Live-Filter: Klick auf eine Baum-Zeile (Set/Ordner/Plugin) loest die
+        feature_ids auf und emittiert `selection_ids_requested` – das
+        AnalyticsWindow filtert sofort (ohne 'Anwenden').
+      * Standalone-Editierung: Standalone-Services (belongs_to_indicator ==
+        False) sind im Param-Panel editierbar (plugin_params_<id>, E-3).
+      * Verwaltung: MasterTree-Kontextmenue (Set anlegen/umbenennen/loeschen,
+        Service hinzufuegen/entfernen/verschieben) via ServiceSetRepository –
+        Services lassen sich waehrend der Session live verwalten.
+    """
 
     #: (display_names, feature_ids) – beim 'Anwenden & Schliessen' bzw.
     #: leere Listen beim 'Aktive Filter entfernen'.
     services_selected = Signal(list, list)
+    #: 18.01.01 (E-4): Live-Filter bei Klick auf eine Baum-Zeile –
+    #: aufgeloeste feature_ids (plugin_ids), sofort an das AnalyticsWindow.
+    selection_ids_requested = Signal(list)
 
     def __init__(
         self,
@@ -148,17 +278,18 @@ class ServiceSelectorDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.model = model or ServiceSelectorModel(parent=self)
-        self._param_host = _DialogParamHost()
-        # 06.08.2026 (Bugfix-Runde 3, Punkte 1-7): Zuletzt GEKLICKTE
-        # Tree-Zeile (node_type, set_id, service_id, plugin_id) – Grundlage
-        # des Read-Only-Panels (analog service_win). Bleibt nach
-        # Modell-Refreshes erhalten, damit das Panel nicht ungewollt
-        # zurueckspringt.
-        self._last_scope: Optional[tuple] = None
+        # 18.01.01: Zugriff auf die ServiceSetRepository (CRUD-Verwaltung).
+        self.set_repo = getattr(self.model, "set_repo", None)
         # 06.08.2026 (Punkt 4): StateManager fuer die Dialog-Geometrie.
         # Der Parent (AnalyticsWindow) ist ein PersistentWindow mit
         # `state_manager`-Property; ohne Parent bleiben Save/Restore no-ops.
         self._state_manager = getattr(parent, "state_manager", None)
+        self._param_host = _DialogParamHost(state_manager=self._state_manager)
+        # 06.08.2026 (Bugfix-Runde 3, Punkte 1-7): Zuletzt GEKLICKTE
+        # Tree-Zeile (node_type, set_id, service_id, plugin_id) – Grundlage
+        # des Panels (analog service_win). Bleibt nach Modell-Refreshes
+        # erhalten, damit das Panel nicht ungewollt zurueckspringt.
+        self._last_scope: Optional[tuple] = None
         # 06.08.2026 (Punkte 3+4): Minimum-Breite der Parameter-Box
         # (Default: Platz fuer 2 Service-Spalten nebeneinander).
         self._panel_min_width: int = 0
@@ -203,6 +334,14 @@ class ServiceSelectorDialog(QDialog):
         self.param_box_layout.setSpacing(6)
         self.param_scroll.setWidget(self.param_container)
         panel_layout.addWidget(self.param_scroll, 1)
+        # 18.01.01 (E-3): Speichern-Button fuer editierbare Standalone-
+        # Services (wird nur bei Parameter-Aenderungen eingeblendet).
+        self.btn_save_params = QPushButton("💾 Parameter speichern")
+        self.btn_save_params.setVisible(False)
+        self.btn_save_params.setToolTip(
+            "Speichert die Parameter des editierbaren Standalone-Services "
+            "(plugin_params_<id>) inkl. EventBus-Sync (E-3).")
+        panel_layout.addWidget(self.btn_save_params)
         body.addWidget(panel, 2)
         root.addLayout(body, 1)
 
@@ -222,15 +361,28 @@ class ServiceSelectorDialog(QDialog):
         # --- Verdrahtung ---
         self.btn_clear.clicked.connect(self._on_clear_filters)
         self.btn_apply.clicked.connect(self._on_apply)
+        self.btn_save_params.clicked.connect(self._on_save_plugin_params)
         tree = self.selector.master_tree
         if tree is not None:
-            # Bugfix-Runde 3 (06.08.2026): Das Read-Only-Panel folgt dem
-            # MAUSKLICK auf eine Tree-Zeile (selection_details), NICHT den
-            # Checkboxen (checked_changed-Verbindung entfernt – Punkte 1-7).
+            # Bugfix-Runde 3 (06.08.2026): Das Panel folgt dem MAUSKLICK auf
+            # eine Tree-Zeile (selection_details), NICHT den Checkboxen
+            # (checked_changed-Verbindung entfernt – Punkte 1-7).
             tree.selection_details.connect(self._on_tree_selection_details)
+            # 18.01.01 (E-4): Live-Verwaltung waehrend der Analytics-Session –
+            # der MasterTree emittiert die CRUD-Signale; der Dialog fuehrt
+            # sie ueber die ServiceSetRepository aus (Set anlegen/umbenennen/
+            # loeschen, Service hinzufuegen/entfernen/verschieben).
+            tree.create_set_requested.connect(self._on_create_set)
+            tree.rename_set_requested.connect(self._on_rename_set)
+            tree.add_set_service_requested.connect(self._on_add_set_service)
+            tree.delete_set_requested.connect(self._on_delete_set)
+            tree.move_service_requested.connect(self._on_move_service)
+            tree.remove_service_requested.connect(self._on_remove_service)
         # Live-Sync: Modell-Refresh (EventBus -> data_changed) baut den Baum
         # neu; das Panel wird mit dem zuletzt geklickten Scope nachgezogen.
         self.model.data_changed.connect(self._on_model_data_changed)
+        # 18.01.01: Der Host blendet den Speichern-Button des Dialogs ein.
+        self._param_host.btn_save_params = self.btn_save_params
 
         # Punkt 4: Letzte Position/Groesse wiederherstellen.
         self._restore_geometry()
@@ -295,6 +447,223 @@ class ServiceSelectorDialog(QDialog):
         self.accept()
 
     # ------------------------------------------------------------------
+    # 18.01.01 (E-4): Live-Verwaltung (Set/Service-CRUD im Picker)
+    # ------------------------------------------------------------------
+    @Slot()
+    def _on_save_plugin_params(self) -> None:
+        """Speichern-Button: persistiert die editierbaren Standalone-Params."""
+        if not self._param_host._save_plugin_params():
+            QMessageBox.warning(
+                self, "Fehler",
+                "Parameter konnten nicht gespeichert werden "
+                "(kein editierbarer Standalone-Service ausgewählt).")
+
+    def _next_instance_id(self, services: Dict[str, Any],
+                          plugin_id: str) -> str:
+        """Naechste freie instance_id fuer ein Plugin im Set (service_win-
+        Muster): Basis ist die plugin_id, bei Belegung '_2', '_3', ..."""
+        base = plugin_id
+        if base not in services:
+            return base
+        i = 2
+        while f"{base}_{i}" in services:
+            i += 1
+        return f"{base}_{i}"
+
+    def _add_service_to_set(self, set_id: str, plugin_id: str) -> None:
+        """Fuegt einen Service (Plugin) mit Registry-Defaults zum Set hinzu
+        und persistiert sofort (set_repo + EventBus-Live-Sync)."""
+        if not set_id or not plugin_id or self.set_repo is None:
+            return
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            plugin = PluginRegistry().get(plugin_id)
+        except KeyError:
+            QMessageBox.warning(
+                self, "Fehler", f"Plugin '{plugin_id}' nicht gefunden.")
+            return
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            QMessageBox.warning(self, "Fehler", str(e))
+            return
+        if not definition:
+            return
+        services = dict(definition.get("services") or {})
+        order = list(definition.get("execution_order") or [])
+        iid = self._next_instance_id(services, plugin_id)
+        params = dict(getattr(plugin, "default_params", None) or {})
+        lookback = 1000
+        if "lookback" in params:
+            try:
+                lookback = int(params.pop("lookback") or 1000)
+            except (TypeError, ValueError):
+                lookback = 1000
+        services[iid] = {
+            "plugin_id": plugin_id,
+            "lookback": lookback,
+            "params": params,
+            "version": getattr(plugin, "version", "0.0.0") or "0.0.0",
+        }
+        order.append(iid)
+        definition["execution_order"] = order
+        definition["services"] = services
+        try:
+            self.set_repo.save_set(definition)
+        except Exception as e:
+            QMessageBox.warning(self, "Fehler", str(e))
+            return
+        event_bus.service_set_changed.emit()
+
+    def _on_create_set(self) -> None:
+        """Kontextmenue 'Neues Set anlegen' (Pickername-Dialog)."""
+        name, ok = QInputDialog.getText(self, "Neues Service-Set", "Set-Name:")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        definition: Dict[str, Any] = {
+            "set_id": "",
+            "display_name": name,
+            "description": "",
+            "execution_order": [],
+            "services": {},
+        }
+        try:
+            self.set_repo.save_set(definition)
+        except Exception as e:
+            QMessageBox.warning(self, "Fehler", str(e))
+            return
+        event_bus.service_set_changed.emit()
+
+    def _on_rename_set(self, set_id: str) -> None:
+        """Kontextmenue 'Set umbenennen' (Namensdialog, Kollisionspruefung)."""
+        if not set_id or self.set_repo is None:
+            return
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            QMessageBox.warning(self, "Fehler", str(e))
+            return
+        if not definition:
+            return
+        current_name = str(definition.get("display_name") or "")
+        name, ok = QInputDialog.getText(
+            self, "Set umbenennen",
+            f"Neuer Name für das Service-Set '{current_name}':",
+            text=current_name,
+        )
+        if not ok:
+            return
+        clean = (name or "").strip()
+        if not clean:
+            QMessageBox.warning(self, "Fehler", "Der Name darf nicht leer sein.")
+            return
+        collision = any(
+            (s.get("display_name") or "") == clean and s.get("set_id") != set_id
+            for s in self.set_repo.list_sets())
+        if collision:
+            QMessageBox.warning(
+                self, "Name vergeben",
+                f"Ein anderes Service-Set heißt bereits '{clean}'.")
+            return
+        definition["display_name"] = clean
+        try:
+            self.set_repo.save_set(definition)
+        except Exception as e:
+            QMessageBox.warning(self, "Fehler", str(e))
+            return
+        event_bus.service_set_changed.emit()
+
+    def _on_add_set_service(self, set_id: str) -> None:
+        """Kontextmenue 'Service hinzufügen' (Plugin-Auswahlbox)."""
+        if not set_id:
+            return
+        ids = sorted(self.model.get_plugins().keys())
+        if not ids:
+            QMessageBox.information(
+                self, "Service hinzufügen", "Keine Services verfügbar.")
+            return
+        pid, ok = QInputDialog.getItem(
+            self, "Service hinzufügen", "Service wählen:", ids, 0, False)
+        if not ok or not pid:
+            return
+        self._add_service_to_set(set_id, str(pid))
+
+    def _on_delete_set(self, set_id: str) -> None:
+        """Kontextmenue 'Set löschen' (Rueckfrage, Soft-Delete/Papierkorb)."""
+        if not set_id or self.set_repo is None:
+            return
+        reply = QMessageBox.question(
+            self, "Set löschen",
+            f"Service-Set '{set_id}' wirklich löschen (in den Papierkorb)?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            self.set_repo.delete_set(set_id)
+        except Exception as e:
+            QMessageBox.warning(self, "Fehler", str(e))
+            return
+        event_bus.service_set_changed.emit()
+
+    def _on_move_service(self, set_id: str, service_id: str, delta: int) -> None:
+        """Kontextmenue 'Order ▲/▼' (execution_order verschieben)."""
+        if not set_id or not service_id or self.set_repo is None:
+            return
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            QMessageBox.warning(self, "Fehler", str(e))
+            return
+        if not definition:
+            return
+        order = list(definition.get("execution_order") or [])
+        if service_id not in order:
+            return
+        i = order.index(service_id)
+        j = i + delta
+        if j < 0 or j >= len(order):
+            return
+        order[i], order[j] = order[j], order[i]
+        definition["execution_order"] = order
+        try:
+            self.set_repo.save_set(definition)
+        except Exception as e:
+            QMessageBox.warning(self, "Fehler", str(e))
+            return
+        event_bus.service_set_changed.emit()
+
+    def _on_remove_service(self, set_id: str, service_id: str) -> None:
+        """Kontextmenue 'Service entfernen' (Rueckfrage, direkter Entzug)."""
+        if not set_id or not service_id or self.set_repo is None:
+            return
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            QMessageBox.warning(self, "Fehler", str(e))
+            return
+        if not definition:
+            return
+        reply = QMessageBox.question(
+            self, "Service entfernen",
+            f"Service '{service_id}' aus dem Set entfernen?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        services = dict(definition.get("services") or {})
+        order = [i for i in (definition.get("execution_order") or [])
+                 if i != service_id]
+        services.pop(service_id, None)
+        definition["execution_order"] = order
+        definition["services"] = services
+        try:
+            self.set_repo.save_set(definition)
+        except Exception as e:
+            QMessageBox.warning(self, "Fehler", str(e))
+            return
+        event_bus.service_set_changed.emit()
+
+    # ------------------------------------------------------------------
     # Read-Only-Parameter-Panel (Punkte 1-3: horizontal, 2-Spalten-Default,
     # Fensterbreite == rechte Kante der Parameter-Box)
     # ------------------------------------------------------------------
@@ -302,19 +671,65 @@ class ServiceSelectorDialog(QDialog):
                                    service_id: str, plugin_id: str) -> None:
         """Slot fuer `MasterTree.selection_details` (Mausklick in einer Zeile).
 
-        Bugfix-Runde 3 (06.08.2026, Punkte 1-7): Das Read-Only-Panel folgt
-        der GEKLICKTEN Zeile, NICHT den Checkboxen (analog service_win
+        Bugfix-Runde 3 (06.08.2026, Punkte 1-7): Das Panel folgt der
+        GEKLICKTEN Zeile, NICHT den Checkboxen (analog service_win
         `_on_master_selection`):
 
           * Set-Zeile ODER Service-Zeile IN einem Set -> ALLE Services des
             Sets nebeneinander (`_entries_for_scope`, Punkt 4+5).
           * Plugin-Zeile (⚡ Standalone / 📦 Plugins) -> NUR dieser eine
             Service (Punkt 6).
+          * Kategorie-Ordner (18.01.01, E-4) -> ALLE Plugins des Pfads
+            (rekursiv, `category_plugin_ids`).
           * Gruppen-/sonstige Zeilen -> KEIN Service (Punkt 7).
+
+        18.01.01 (E-4): Zusaetzlich wird der LIVE-Filter gesetzt –
+        `selection_ids_requested(feature_ids)` informiert das AnalyticsWindow
+        sofort (ohne 'Anwenden'). Standalone-Services (belongs_to_indicator
+        == False) sind editierbar (plugin_params_<id>), alle anderen Zeilen
+        bleiben read-only.
         """
         self._last_scope = (node_type, set_id, service_id, plugin_id)
-        self._rebuild_param_panel(self._entries_for_scope(
-            node_type, set_id, service_id, plugin_id))
+        ids = self._resolve_selection_ids(node_type, set_id, service_id,
+                                          plugin_id)
+        if ids:
+            self.selection_ids_requested.emit(ids)
+        editable = None
+        if node_type == TYPE_PLUGIN and plugin_id:
+            if not self.model.belongs_to_indicator(str(plugin_id)):
+                editable = str(plugin_id)
+        self._rebuild_param_panel(
+            self._entries_for_scope(node_type, set_id, service_id, plugin_id),
+            editable_plugin=editable)
+
+    def _resolve_selection_ids(self, node_type: str, set_id: str,
+                               service_id: str, plugin_id: str) -> List[str]:
+        """Loest eine geklickte Baum-Zeile in feature_ids (plugin_ids) auf.
+
+        18.01.01 (E-4): Klick auf Set -> alle Services des Sets; Klick auf
+        Kategorie-Ordner -> `category_plugin_ids(Pfad, rekursiv)`; Klick auf
+        Plugin-Zeile -> [plugin_id]; Service-Zeile -> [plugin_id des Service].
+        """
+        if node_type == TYPE_CATEGORY:
+            return self.model.category_plugin_ids(plugin_id or "")
+        if node_type == TYPE_PLUGIN and plugin_id:
+            return [str(plugin_id)]
+        if node_type == TYPE_SERVICE and set_id and service_id:
+            cfg = self.model.find_service(set_id, service_id) or {}
+            pid = str(cfg.get("plugin_id") or service_id)
+            return [pid] if pid else []
+        if node_type == TYPE_SET and set_id:
+            definition = self.model.find_set(set_id) or {}
+            services = definition.get("services") or {}
+            order = definition.get("execution_order") or list(services.keys())
+            ids: List[str] = []
+            for iid in order:
+                cfg = services.get(iid) or {}
+                pid = str(cfg.get("plugin_id") or iid)
+                if pid and pid not in ids:
+                    ids.append(pid)
+            return ids
+        return []
 
     def _on_model_data_changed(self) -> None:
         """Modell-Refresh (EventBus -> data_changed): Panel neu aufbauen.
@@ -336,7 +751,19 @@ class ServiceSelectorDialog(QDialog):
         Returns:
             Liste von {"node_type", "set_id", "instance_id", "plugin_id"} –
             leer fuer Zeilen ohne Parameter-Anzeige (Gruppen, leere Auswahl).
+            Kategorie-Ordner (18.01.01, E-4) liefern die Plugins des Pfads
+            (rekursiv, `category_plugin_ids`).
         """
+        if node_type == TYPE_CATEGORY:
+            entries: List[Dict[str, str]] = []
+            for pid in self.model.category_plugin_ids(plugin_id or ""):
+                entries.append({
+                    "node_type": TYPE_PLUGIN,
+                    "set_id": "",
+                    "instance_id": "",
+                    "plugin_id": pid,
+                })
+            return entries
         if node_type == TYPE_PLUGIN and plugin_id:
             return [{
                 "node_type": TYPE_PLUGIN,
@@ -362,23 +789,32 @@ class ServiceSelectorDialog(QDialog):
             return entries
         return []
 
-    def _rebuild_param_panel(self,
-                             entries: Optional[List[Dict[str, str]]] = None
-                             ) -> None:
+    def _rebuild_param_panel(
+        self,
+        entries: Optional[List[Dict[str, str]]] = None,
+        editable_plugin: Optional[str] = None,
+    ) -> None:
         """Baut das rechte Parameter-Panel aus den uebergebenen Entries neu.
 
         Bugfix-Runde 3 (06.08.2026): Die Entries kommen aus `_entries_for_scope`
         (GEKLICKTE Zeile, service_win-Muster) – NICHT mehr aus
         `tree.checked_services()` (Checkboxen). Fuer jeden Eintrag wird eine
-        deaktivierte QGroupBox-Spalte ueber
-        `ServiceParamColumnsMixin._build_service_column()` erzeugt (seit
-        06.08.2026 HORIZONTAL nebeneinander, Punkt 1):
+        QGroupBox-Spalte ueber `ServiceParamColumnsMixin._build_service_column()`
+        erzeugt (seit 06.08.2026 HORIZONTAL nebeneinander, Punkt 1):
           * Set-Service:  cfg aus der Set-Definition (instance_id + params)
-          * Plugin-Zeile: cfg {"plugin_id": pid} (Schema-Defaults)
+          * Plugin-Zeile: cfg aus `_plugin_config(pid)` (Schema-Defaults +
+            gespeicherte plugin_params_<id>)
+        18.01.01 (E-4): Standalone-Services (editable_plugin gesetzt) sind
+        EDITIERBAR (Dirty-Tracking + Speichern); alle anderen bleiben
+        read-only (deaktivierte QGroupBox).
         Danach werden Panel-Breite (Default: 2 Spalten, Punkt 2) und
         Fensterbreite (Punkt 3) angepasst.
         """
         self._clear_panel()
+        host = self._param_host
+        host._current_plugin_editing = None
+        host._current_set_definition = None
+        host._set_param_actions_visible(False)
         entries = list(entries or [])
         if not entries:
             self.param_box_layout.addWidget(
@@ -388,7 +824,6 @@ class ServiceSelectorDialog(QDialog):
             self.param_box_layout.addStretch(1)
             self._apply_panel_size(0)
             return
-        host = self._param_host
         for entry in entries:
             pid = str(entry.get("plugin_id") or "")
             if entry["node_type"] == TYPE_SERVICE:
@@ -397,7 +832,8 @@ class ServiceSelectorDialog(QDialog):
                     str(entry.get("set_id") or ""), iid) or {}
             else:
                 iid = pid
-                cfg = {"plugin_id": pid}
+                cfg = host._plugin_config(pid)
+            editable = bool(editable_plugin) and pid == editable_plugin
             try:
                 box = host._build_service_column(iid, pid, cfg)
             except Exception as e:  # defensiv: Plugin/Schema-Fehler
@@ -405,8 +841,23 @@ class ServiceSelectorDialog(QDialog):
                 self.param_box_layout.addWidget(
                     QLabel(f"Parameteranzeige nicht verfügbar: {e}"))
             if box is not None:
-                box.setEnabled(False)
-                box.setToolTip("Read-Only – Parameter der gewählten Datenquelle")
+                if not editable:
+                    box.setEnabled(False)
+                    box.setToolTip("Read-Only – Parameter der gewählten "
+                                   "Datenquelle (editierbar im ServiceWindow)")
+                else:
+                    # 18.01.01 (E-4): Editierbarer Standalone-Service –
+                    # RAM-Definition fuer das Dirty-Tracking (_on_param_changed)
+                    # bereitstellen; Persistenz via _save_plugin_params.
+                    definition: Dict[str, Any] = {
+                        "set_id": "",
+                        "display_name": pid,
+                        "description": str(cfg.get("description") or ""),
+                        "execution_order": [pid],
+                        "services": {pid: cfg},
+                    }
+                    host._current_plugin_editing = pid
+                    host._current_set_definition = definition
                 self.param_box_layout.addWidget(box)
         # Bugfix 06.08.2026 (Runde 3): Die einzelnen Service-Rahmen
         # (QGroupBox) werden beim Vergroessern NICHT gestreckt – sie behalten

@@ -65,13 +65,13 @@
 
 ### Step 3: `analytics_win.py` Harmonisierung & Parameter-Editierung
 
-* [ ] Legacy-Filter durch `MasterTree` & `ParamColumnsWidget` ersetzen.
-* [ ] Bei Standalone-Service (`belongs_to_indicator == False`):
+* [x] Legacy-Filter durch `MasterTree` & `ServiceParamColumnsMixin` ersetzen (umgesetzt im `ServiceSelectorDialog`, s. E-4).
+* [x] Bei Standalone-Service (`belongs_to_indicator == False`):
 1. Params laden: `state_manager.get_global_value("plugin_params_<id>", default)`.
-2. Im `ParamColumnsWidget` aus `full_parameter_schema()` rendern.
+2. Im Param-Panel aus `full_parameter_schema()`/`_plugin_config()` rendern.
 3. Bei Änderung: `save_global_value("plugin_params_<id>", params)` + `event_bus.service_set_changed.emit()`.
 
-* [ ] Bei Baum-Selektion (Set/Ordner/Plugin): IDs auflösen -> `view_model.set_feature_ids(ids)`.
+* [x] Bei Baum-Selektion (Set/Ordner/Plugin): IDs auflösen -> `view_model.set_feature_ids(ids)` (Live-Filter via `selection_ids_requested`).
 
 ### Step 4: Quality Gate
 
@@ -107,10 +107,15 @@
 
 **E-3 (08.08.2026): `service_set_changed` nach Standalone-Speicherung.** Gemäß Kapitel wird bei `save_global_value("plugin_params_<id>", ...)` zusätzlich `event_bus.service_set_changed.emit()` abgesetzt, damit alle `ServiceSelectorModel`-Instanzen (MasterTree-Daten, Ausführungsdaten) live synchronisieren. Im ServiceWindow-Pfad wird das Verhalten beibehalten (der Run-Worker emittiert bereits am Ende); der neue Analytics-Pfad emittiert gemäß Kapitel.
 
-**E-4 (08.08.2026): Umsetzungs-Variante für Step 3 = Option B (vollständige Harmonisierung).** Der `ServiceSelectorDialog` entfällt ersatzlos; `MasterTree` (Multi-Select, Checkbox-Modus) und ein editierbares Param-Panel (`ServiceParamColumnsMixin`) werden **direkt in `analytics_win.py` eingebettet** (Filterbereich). Datenfluss: Baum-Selektion (Set/Ordner/Plugin) löst IDs auf → `view_model.set_feature_ids(ids)`; Standalone-Services (`belongs_to_indicator == False`) laden/speichern ihre Params über `state_manager.plugin_params_<id>`.
+**E-4 (08.08.2026, KORRIGIERT am 08.08.2026): Umsetzungs-Variante für Step 3 = Dialog als frei beweglicher Service-Picker/Manager (KEINE Einbettung).** Die zuvor dokumentierte Option B („`ServiceSelectorDialog` entfällt ersatzlos, MasterTree + Param-Panel werden direkt in `analytics_win.py` eingebettet") wurde umgesetzt, vom Benutzer aber als Missverständnis korrigiert: Baum und Parameter **bleiben im `ServiceSelectorDialog`** – dieser ist das frei bewegliche „Manager-Window" während einer Analytics-Session. Die neue Logik wurde **im Dialog** implementiert:
+
+* **Live-Filter:** Klick auf eine Baum-Zeile (Set/Ordner/Plugin) löst die feature_ids auf (`_resolve_selection_ids`, Kategorie rekursiv via `category_plugin_ids`) und emittiert `selection_ids_requested` → `AnalyticsViewModel.set_feature_ids()` sofort (ohne „Anwenden").
+* **Standalone-Editierung:** Standalone-Services (`belongs_to_indicator == False`) sind im Param-Panel **editierbar** (`_DialogParamHost`: RAM-Definition + Dirty-Tracking, Speichern-Button; Persistenz `save_global_value("plugin_params_<id>", …)` + `event_bus.service_set_changed.emit()`).
+* **Verwaltung (CRUD):** Set anlegen/umbenennen/löschen, Service hinzufügen/entfernen/verschieben via `ServiceSetRepository` + EventBus-Live-Sync (MasterTree-Kontextmenü-Signale).
+* **Singleton-Dialog:** Kein `WA_DeleteOnClose` mehr – der Dialog bleibt während der Session erhalten, ist frei positionierbar (Geometrie via global_settings) und aktualisiert die Analytics-Ansicht live.
 
 ### 5.4 Verbleibende offene Punkte (für die Umsetzung)
 
-1. **Layout:** Wie wird der MasterTree im AnalyticsWindow platziert (linke Spalte neben Sidebar, oberhalb des Filterbereichs, o. Ä.)? → Entscheidung während Coding, minimale Eingriffe in bestehendes Layout (Code-Preserving).
-2. **Read-Only → Editierbar:** Das bestehende `_DialogParamHost`-Muster (No-op-Speicherpfade) wird durch einen echten Analytics-Host ersetzt; die Editier-Pfade folgen `ServiceWindow._load_plugin_editor`/`_save_plugin_params`.
-3. **Profil-Sync:** `_sync_service_filter_button`/`_active_display_names`-Logik muss auf den eingebetteten Baum umgestellt werden (Button-Text entfällt).
+1. **Dialog-Gestaltung:** Der `ServiceSelectorDialog` ist als frei bewegliches Manager-Window umgesetzt (kein `WA_DeleteOnClose`, Singleton). Checkbox-Multi-Select („Anwenden & Schließen") und Live-Filter (Zeilen-Klick) existieren parallel – das Zusammenspiel beider Pfade (z. B. Button-Anzeige nach Checkbox-Anwenden vs. Live-Filter) ist manuell zu prüfen.
+2. **Editierbarkeit:** Die Standalone-Editierung nutzt das `_DialogParamHost`-Muster (RAM-Definition + `plugin_params_<id>`); die `service_set_changed`-Konsistenz im ServiceWindow-Pfad wurde ergänzt (E-3). Die interaktive Bedienung (Dirty-Marker, Save-Button) ist manuell zu verifizieren.
+3. **Profil-Sync:** `_sync_service_filter_button`/`_active_display_names` bleiben gültig (Button-Text im AnalyticsWindow); nach einem Live-Filter werden die Anzeigenamen über das Modell re-resolved.

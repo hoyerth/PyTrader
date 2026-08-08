@@ -787,6 +787,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.log(f"FEHLER beim Speichern der Plugin-Parameter: {e}")
             return False
         self._clear_dirty_markers()
+        # 18.01.01 (E-3): EventBus-Live-Sync - analog zum Set-Speichern
+        # (save_set-Pfad) und zum Dialog-Picker, damit alle MasterTree-
+        # Instanzen (auch der Analytics-Picker) die Standalone-Parameter
+        # bzw. den geaenderten Zustand live uebernehmen.
+        event_bus.service_set_changed.emit()
         self.log(f"Parameter gespeichert (Plugin): {plugin_id}")
         return True
 
