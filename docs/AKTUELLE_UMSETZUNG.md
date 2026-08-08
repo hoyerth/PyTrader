@@ -785,3 +785,117 @@ Umgesetzt (Steps 1–4 abgearbeitet; Entscheidungen E1–E10 des Prüfprotokolls
 * **Alle Steps 1–4 abgeschlossen und headless verifiziert.** Keine UI-/
   Regressionstests ausgeführt (Regel 4); Baseline-Vorbefunde P2/P5/H3/H4/H5/H7
   sind unverändert dokumentiert.
+
+---
+
+# 19.04 TablePage-Paging & Profil-symbol/tf-Sync (Bugfix 08.08.2026)
+
+## Ausgangslage (zwei Bugs, Bugfixing-Modus)
+
+* **Bug 1 – Paging verschwunden:** Das Legacy-Fenster `statistic_win.py` besaß
+  Vor/Zurück-Buttons + `label_page_info`; diese Paging-Leiste wurde bei der
+  Übernahme der Tabelle ins `AnalyticsWindow` (15.03) **nie** mit übernommen.
+  Die TablePage zeigte alle bis zum Limit geladenen Rows in einem Rutsch.
+* **Bug 2 – symbol/timeframe wird nicht im Profil gespeichert/restored:**
+  `_on_active_profile_changed` wird beim App-Start **nicht** emittiert (nur bei
+  `set_active_profile`/`create_profile`). `load_profiles()` → `_apply_profile()`
+  überschreibt die VM-Params `symbol`/`timeframe` aus dem Profil-Payload, aber die
+  Combos bleiben auf den Historie-Werten → Inkonsistenz zwischen Anzeige und
+  Abfragebasis, dadurch falsche Persistenz beim Schließen
+  (`get_persistent_symbol` liefert den Combo-Wert).
+
+## Umgesetzt
+
+### Bug 1 – Paging (`analytics/ui/table_page.py` + `analytics/ui/analytics_win.py`)
+
+* **Paging-Leiste unter der Tabelle** (Muster `statistic_win.py`):
+  `btn_prev`/`btn_next`/`label_page` in einer `QHBoxLayout`-Leiste; die
+  Buttons werden je nach Position ein-/ausgegraut, das Label zeigt
+  „Seite X / Y (n Zeilen)".
+* **`set_page_size(page_size)` (IoC):** Der Wert kommt aus den AppSettings
+  (`statistics_page_size`, Default 100) und wird vom AnalyticsWindow injiziert;
+  ungültige Werte (<= 0 / kein int) fallen auf 100 zurück. Bei bereits geladenen
+  Daten wird die Anzeige auf Seite 0 neu gerendert.
+* **`_populate`:** setzt `_current_page = 0` und ruft `_render_current_page()`
+  statt des alten Befüll-Blocks.
+* **`_render_current_page()`:** berechnet `_total_pages` aus
+  `len(_current_rows)`/`_page_size`, klemmt `_current_page`, rendert nur den
+  Seiten-Ausschnitt `[start : start+page_size]` via
+  `_populate_rows(page_rows, start_offset=start)` und wendet danach
+  `_apply_table_settings()` an (Signale währenddessen blockiert – kein
+  unbeabsichtigtes Dirty-Flag).
+* **`_populate_rows(rows, start_offset)`:** Der `UserRole+1`-Index (E7,
+  Jump-to-Chart-Row-Mapping aus 19.03) trägt jetzt den **globalen**
+  `_current_rows`-Index (`start_offset + r`) – ein Doppelklick trifft die
+  richtige Roh-Row unabhängig von Seite und Anzeige-Sortierung.
+* **`_update_page_controls()`:** Seitenlabel + Button-Zustände
+  (`btn_prev` deaktiviert auf Seite 0, `btn_next` deaktiviert auf der letzten).
+* **`analytics_win.py`:** `_table_page_size` wird in `__init__` aus den
+  AppSettings gelesen; `_wire_view_model()` verdrahtet
+  `self.table_page.set_page_size(self._table_page_size)`.
+* Beim Seitenwechsel bleibt die aktive User-Sortierung erhalten (nur die
+  Anzeige-Seite wird neu gerendert, Roh-Liste unverändert).
+
+### Bug 2 – symbol/tf-Profil-Sync (`analytics/ui/analytics_win.py`)
+
+* **Neu: `_sync_profile_filters()`** – synchronisiert `combo_symbol`/
+  `combo_tf` mit den VM-Params (`symbol`/`timeframe`):
+  * `blockSignals(True/False)` um beide Combos → keine
+    `set_symbol`/`set_timeframe`-Signalkette, kein zusätzlicher Query (der
+    Profilwechsel hat die Abfragen bereits via `refresh_all()` angestoßen).
+  * Ein Symbol außerhalb der Favoriten wird in die Combo aufgenommen (Muster
+    `_apply_persistent_filters`), damit der gespeicherte Filter sichtbar bleibt.
+  * Anschließend `_refresh_timeframe_combo(symbol)` (TF-Ausgrauung für das ggf.
+    neue Symbol).
+  * Leeres `symbol` im VM → früher Return (kein Eingriff).
+* **Aufrufstellen:** `_on_active_profile_changed()` (Profilwechsel
+  während der Session) **und** `_initial_load()` direkt nach
+  `self._vm.load_profiles()` (App-Start, da `active_profile_changed` dort nicht
+  emittiert wird).
+
+## Verifikation (headless, kein UI)
+
+* `py_compile` auf `analytics/ui/table_page.py` + `analytics/ui/analytics_win.py`
+  → **PASS** (exit 0).
+* Isolierter Check `test/_run_part34.py` (Temp-DBs) → **alle PASS** (temporär,
+  nach Abschluss entfernt, Invariante 10).
+* `test/test.py` **Teil 34** (neu, 18 Prüfungen) → **alle PASS**:
+  * P1a–P1m (Paging): Default-PageSize 100; `_populate` setzt Seite 0 /
+    total_pages=3 (250/100); Seite 0 = 100 Zeilen mit globalen Indizes 0..99;
+    Button-Zustände; `_next_page` → p=1 mit Start 100 (Indizes 100..199);
+    Jump-to-Chart auf Seite 1 trifft globale Row 100; letzte Seite 50 Zeilen
+    (Indizes 200..249) + `btn_next` disabled; Klemmen auf letzter Seite;
+    `_prev_page`; `set_page_size(50)` → p=0/total_pages=5; Seitenlabel
+    „Seite 1 / 5 (250 Zeilen)"; `set_page_size(-5)` → Fallback 100; neues
+    `_populate` (150 Rows) → p=0/total_pages=2.
+  * P2a–P2e (Bug 2): Profil-Payload-Roundtrip übernimmt `symbol`/`timeframe`
+    (EURUSD/H4); `_sync_profile_filters` setzt Dummy-Combos auf die VM-Params;
+    Sync lief geblockt (blockSignals-Log); unbekanntes Symbol (BTCUSD) wird in
+    die Combo aufgenommen; leeres Symbol → kein Eingriff.
+* Gesamtlauf `test/test.py`: Teile 31–34 **PASS**; die 6 Fehler sind die
+  dokumentierten **Baseline-Vorbefunde** P2/P5/H3/H4/H5/H7 (Geometrie-Tests,
+  offscreen `800x582`) – im aktuellen Lauf zusätzlich durch den DB-Lock der zwei
+  laufenden `main.py`-Instanzen (IOException) bedingt – nicht durch 19.04
+  verursacht.
+* Test-Workspace aufgeräumt (Invariante 10): nur `test/test.py` verbleibt.
+
+## Abweichungen / Entscheidungen
+
+* **Paging-Quelle:** Zeilen pro Seite kommen aus den **AppSettings**
+  (`statistics_page_size`) statt aus dem Profil-Payload (Konsistenz mit dem
+  Legacy-`statistic_win` und den App-Optionen; das Profil speichert die
+  übrigen TablePage-UI-Zustände aus 19.03).
+* **Globaler Row-Index:** Der `UserRole+1`-Index aus 19.03-E7 wurde fürs
+  Paging auf `start_offset + r` erweitert (eine einzige Quelle für
+  Jump-to-Chart, unabhängig von Seite und Anzeige-Sortierung).
+* **Kein Code in `analytics_view_model.py` nötig:** Der Sync liest nur die
+  VM-Params (lesender Zugriff, MVVM-Invariante 4); die Param-Grenzen
+  (symbol/timeframe) wurden bereits durch `_apply_profile` korrekt gesetzt.
+
+### Status
+
+* **Beide Bugs umgesetzt, headless verifiziert und committet (`92a8537`,
+  Bugfix-Commit 08.08.2026).** Doku-Eintrag erst nach Freigabe des Anwenders
+  (Bugfixing-Regel C). Keine UI-/Regressionstests ausgeführt (Regel 4);
+  Baseline-Vorbefunde P2/P5/H3/H4/H5/H7 sind unverändert dokumentiert.
+
