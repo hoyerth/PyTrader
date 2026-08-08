@@ -1,11 +1,11 @@
 # analytics/ui/scatter_page.py
 """
-scatter_page.py - Scatter-Seite der Analytics-UI (Phase 15.03).
+scatter_page.py - Scatter-Seite der Analytics-UI (Phase 15.03 / 19.02).
 
-Zeigt X/Y-Paare zweier nativer Feature-Spalten (ema_diff, rsi_14,
-atr_normalized) als pyqtgraph-ScatterPlot. Ein Klick auf einen Punkt
-oeffnet das Chart-Fenster an der neuesten Feature-Bar des Symbol/Timeframe
-(Jump-to-Chart Variante 2, Aufloesung ueber den ViewModel).
+Zeigt X/Y-Paare zweier feature_data-JSON-Keys (dynamisch, 19.02) als
+pyqtgraph-ScatterPlot. Ein Klick auf einen Punkt oeffnet das Chart-Fenster
+an der neuesten Feature-Bar des Symbol/Timeframe (Jump-to-Chart Variante 2,
+Aufloesung ueber den ViewModel).
 
 MVVM (Invariante 4): Reine UI – Daten kommen ueber
 `data_ready(QUERY_SCATTER, data)` vom ViewModel (Async-Worker); es gibt
@@ -64,19 +64,14 @@ class ScatterPage(QWidget):
     # ------------------------------------------------------------------
     def attach_view_model(self, view_model: Any) -> None:
         self._view_model = view_model
-        columns = view_model.native_columns
         params = view_model.params
-        self._combo_x.blockSignals(True)
-        self._combo_y.blockSignals(True)
-        for col in columns:
-            self._combo_x.addItem(col, col)
-            self._combo_y.addItem(col, col)
-        idx_x = self._combo_x.findData(params.get("scatter_x"))
-        idx_y = self._combo_y.findData(params.get("scatter_y"))
-        self._combo_x.setCurrentIndex(idx_x if idx_x >= 0 else 0)
-        self._combo_y.setCurrentIndex(idx_y if idx_y >= 0 else 0)
-        self._combo_x.blockSignals(False)
-        self._combo_y.blockSignals(False)
+        # 19.02 (Cleanup): Dynamische feature_data-JSON-Keys statt nativer
+        # Spalten. Prefill fuer das aktuelle Symbol/Timeframe; die Combos
+        # werden bei jedem Daten-Payload aktualisiert (on_data_ready).
+        columns = view_model.available_feature_columns(
+            params.get("symbol", ""), params.get("timeframe", "M1"))
+        self._set_columns(columns, params.get("scatter_x"),
+                          params.get("scatter_y"))
         view_model.data_ready.connect(self.on_data_ready)
 
     def set_navigation_handler(self, fn: Callable[[str, str, int], None]) -> None:
@@ -91,6 +86,35 @@ class ScatterPage(QWidget):
             self._view_model.request_scatter()
 
     # ------------------------------------------------------------------
+    # 19.02: Dynamische Achsen-Combos (feature_data-JSON-Keys)
+    # ------------------------------------------------------------------
+    def _set_columns(self, columns, x_col, y_col) -> None:
+        """Fuellt die Achsen-Combos (19.02, dynamische JSON-Keys).
+
+        Erhaelt die aktuelle Auswahl, wenn sie in `columns` verfuegbar ist;
+        sonst Defaults (erste beiden, x != y). Signale sind blockiert, damit
+        kein Query-Loop ueber _on_columns_changed entsteht.
+        """
+        cols = [str(c) for c in (columns or [])]
+        x = str(x_col or "") if str(x_col or "") in cols else (
+            cols[0] if cols else "")
+        y_candidates = [c for c in cols if c != x]
+        y = str(y_col or "") if (str(y_col or "") in cols
+                                 and str(y_col or "") != x) else (
+            y_candidates[0] if y_candidates else x)
+        self._combo_x.blockSignals(True)
+        self._combo_y.blockSignals(True)
+        self._combo_x.clear()
+        self._combo_y.clear()
+        for c in cols:
+            self._combo_x.addItem(c, c)
+            self._combo_y.addItem(c, c)
+        self._combo_x.setCurrentIndex(self._combo_x.findData(x) if x else -1)
+        self._combo_y.setCurrentIndex(self._combo_y.findData(y) if y else -1)
+        self._combo_x.blockSignals(False)
+        self._combo_y.blockSignals(False)
+
+    # ------------------------------------------------------------------
     # Datenfluss (UI rendert, KEIN SQL)
     # ------------------------------------------------------------------
     def on_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
@@ -98,6 +122,17 @@ class ScatterPage(QWidget):
             return
         self._current_symbol = str(data.get("symbol") or "")
         self._current_timeframe = str(data.get("timeframe") or "M1")
+        # 19.02: Combos mit den verfuegbaren JSON-Keys aktualisieren und auf
+        # die tatsaechlich verwendeten Achsen (x_label/y_label) synchronisieren.
+        vm_params_x = (self._view_model.params.get("scatter_x")
+                       if self._view_model else "")
+        vm_params_y = (self._view_model.params.get("scatter_y")
+                       if self._view_model else "")
+        self._set_columns(
+            data.get("columns"),
+            data.get("x_label") or vm_params_x,
+            data.get("y_label") or vm_params_y,
+        )
         points = data.get("points") or []
         xs = [p["x"] for p in points]
         ys = [p["y"] for p in points]

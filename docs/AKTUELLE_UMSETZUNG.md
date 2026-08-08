@@ -231,3 +231,251 @@ des Prüfprotokolls 19.01 als verbindliche Spezifikation):
 * **Alle Steps 1–3 abgeschlossen und headless verifiziert.** Keine UI-/Regressionstests
   ausgeführt (Regel 4); Baseline-Vorbefunde P2/P5/H3/H4/H5/H7 sind dokumentiert.
 
+---
+
+# 19.02 Analytics-Finalisierung: Cleanup Legacy-Native-Spalten & kleinere Tabellen-Schrift
+
+### 1. Ziel & Architektur
+
+Die Analytics-UI (15.03/19.01) stützte Achsen, Metriken und Tabellen-Spalten noch auf
+**native DB-Spalten** (`ema_diff`, `rsi_14`, `atr_normalized`) – ein Relikt des
+vor-Plugin-Zeitalters. Seit Phase 12 persistieren Services ihre Werte ausschließlich im
+`feature_data`-JSON (`store_plugin_payload`). 19.02 entfernt die Legacy-Spalten aus dem
+Datenfluss (lesend) und dem Neuschema (schreibend):
+
+```
+feature_store.feature_data (JSON) ──► FeatureStoreReader.available_feature_keys() ──►
+AnalyticsRepository (get_scatter/get_distribution/get_heatmap, dynamische Defaults) ──►
+ViewModel (heatmap_metrics/available_feature_columns) ──► UI-Combos (dynamisch)
+```
+
+Zusätzlich wird die TablePage-Schrift auf **9 pt** reduziert (mehr Zeilen/Spalten sichtbar
+bei gleicher Fenstergröße, Task 1).
+
+### 2. Betroffene Dateien
+
+* `analytics/features/feature_builder.py` + `analytics/features/definitions/__init__.py`:
+  nur noch `grid_levels` (EMA-Diff/ATR-Normalized archiviert, nicht mehr importiert).
+* `analytics/engine/feature_store_reader.py`: `NATIVE_COLUMNS` entfernt; neue
+  `available_feature_keys()` (DISTINCT-JSON-Struktur-Analyse), `fetch_columns()` und
+  `fetch_heatmap()` lesen JSON-Keys; `fetch_rows()` ohne Legacy-Spalten.
+* `analytics/engine/analytics_repository.py`: `HEATMAP_METRICS`/`NATIVE_COLUMNS` entfernt;
+  dynamische Key-Auflösung, `metrics`-Feld, Fallback `"count"`.
+* `analytics/engine/analytics_view_model.py` + `analytics/engine/analytics_worker.py`:
+  Legacy-Defaults entfernt (leere Strings → Repo-Default), dynamische Auflösung.
+* `analytics/ui/table_page.py`: Schrift ≤ 9 pt (Task 1), Basis-Spalten nur
+  `[Zeit (Wanduhr), Service]` + JSON-Union.
+* `analytics/ui/scatter_page.py`, `distribution_page.py`, `heatmap_page.py`: dynamische
+  Achsen-/Spalten-/Metrik-Combos (prefill + `on_data_ready`-Sync).
+* `db/schema_initializer.py`: Neuschema des `feature_store` ohne
+  `ema_diff/rsi_14/atr_normalized` (Alt-DBs bleiben via Additiv-Pfad unangetastet).
+
+### 3. Schritt-für-Schritt Anleitung (IDE-AI)
+
+#### Step 1: Feature-Builder & Definitionen (`feature_builder.py`, `definitions/__init__.py`)
+
+* [x] `EMADiffFeature`/`ATRNormalizedFeature`-Imports entfernt; `self.features` =
+      nur noch `{"grid_levels": GridLevelsFeature()}`.
+* [x] `definitions/__init__.py` exportiert nur noch `GridLevelsFeature`; die Dateien
+      `ema_diff.py`/`atr_normalized.py` bleiben als Code-Archiv auf Platte (kein
+      Import, keine Registrierung – `PluginLoader` scannt nur `PluginFeature`-Subklassen).
+
+#### Step 2: Reader & Repository (`feature_store_reader.py`, `analytics_repository.py`, `analytics_view_model.py`, `analytics_worker.py`)
+
+* [x] `NATIVE_COLUMNS`/`HEATMAP_METRICS`-Konstanten entfernt; `fetch_rows()` liest nur
+      `bar_time/symbol/timeframe/feature_id/plugin_version/feature_data`.
+* [x] Neu: `available_feature_keys(symbol, tf, numeric_only=False)` (Union über
+      DISTINCT-JSON-Strukturen, `schema_version` ausgeschlossen, bool/str/null-Typisierung,
+      Regex-Guard `_is_json_key_identifier()`).
+* [x] `fetch_columns()` extrahiert numerische JSON-Keys (bool → ausgelassen);
+      `fetch_heatmap()` nutzt `AVG(TRY_CAST(feature_data->>'key' AS DOUBLE))`.
+* [x] Repository-Defaults: `x_column`/`y_column`/`column` optional (None → erste zwei
+      numerische Keys bzw. erster numerischer Key); `get_heatmap` liefert `metrics` und
+      fällt bei unbekannter Metrik auf `"count"` zurück.
+* [x] ViewModel: Defaults `""` (statt `ema_diff`/`rsi_14`/`atr_normalized`);
+      `native_columns`-Property ersetzt durch `available_feature_columns(symbol, tf)`
+      und `heatmap_metrics(symbol, tf)` (defensiv); Worker reicht `None` durch.
+
+#### Step 3: UI-Pages (`table_page.py`, `scatter_page.py`, `distribution_page.py`, `heatmap_page.py`)
+
+* [x] **Task 1 (Schrift):** TablePage-Tabelle + Header auf **9 pt** (Header fett);
+      `_TABLE_FONT_PT = 9`.
+* [x] `_BASE_COLUMNS` = nur `[("Zeit (Wanduhr)", 130), ("Service", 150)]`; Legacy-
+      Spalten-Renderblock entfernt; `_EXTRA_COLUMN_WIDTH = 95`.
+* [x] Scatter/Distribution/Heatmap: dynamische Combos (`_set_columns`/`_set_metrics`),
+      Prefill bei `attach_view_model`, Sync in `on_data_ready` aus `data["columns"]`
+      bzw. `data["metrics"]` (kein Query-Loop durch blockierte Signale).
+
+#### Step 4: Schema (`db/schema_initializer.py`)
+
+* [x] `CREATE TABLE IF NOT EXISTS feature_store` im Neuschema **ohne**
+      `ema_diff/rsi_14/atr_normalized`; bestehende DB-Dateien bleiben über den
+      Additiv-Pfad (ALTER TABLE ADD COLUMN IF NOT EXISTS) unangetastet.
+
+#### Step 5: Quality Gate & Verifikation
+
+* [x] `py_compile` aller 11 geänderten Produktivdateien → **PASS**.
+* [x] Isolierter Check `test/_check_1902_isolated.py` (deterministische Temp-DB,
+      22 Prüfungen R1–R5/S1–S2/D1/H1–H3/V1–V3/T1–T7/B1) → **PASS** (temporär,
+      nach Abschluss entfernt).
+* [x] `test/test.py` **Teil 32** (neu, 14 Prüfungen A1–A5/B1–B4/C1–C2/D1–D3) → **PASS**;
+      Teil 31 (19.01) unverändert **PASS**.
+* [x] Gesamtlauf `test/test.py`: **573 PASS / 6 FAIL** – die 6 Fehler sind identisch
+      mit den dokumentierten Baseline-Vorbefunden P2/P5/H3/H4/H5/H7
+      (Geometrie-Tests, offscreen `800x582`) – nicht durch 19.02 verursacht.
+
+---
+
+## Prüfprotokoll 19.02 (08.08.2026) – Datenanalyse, Konsistenz & Entscheidungen
+
+### Datenanalyse (Ist-Zustand der realen DB)
+
+* **Reale Datenbasis:** `data/analytics.duckdb`, **904.723 Rows** im `feature_store`.
+* **Keine nativen Legacy-Werte im Gebrauch:** Die realen `feature_data`-JSONs enthalten
+  ausschließlich Service-Keys, z. B.:
+  * `srv_grid_lines`: `grid_nearest_level`, `grid_step`, `lower_level`, `upper_level`
+    (sowie per Service-Vertrag `levels_...`-Strukturen).
+  * `srv_proximity`: `visit_pct`, `is_hit`, `in_time_window`, `levels_hit` (u. a.);
+    `is_swing_high`, `strength_value`-artige Keys je nach Service-Instanz.
+  * `schema_version` ist Pflicht-Key (E-3, Default `"1.0.0"`).
+* **NULL-`feature_data`:** `srv_proximity`-Rows haben z. T. NULL-`feature_data`
+  (≈ 573k Rows). `_normalize_feature_data(NULL)` → `{"schema_version": "1.0.0"}`
+  (rein lesend, DB-Zeile bleibt unverändert).
+* **DuckDB-SQL:** `feature_data->>'key'` und `TRY_CAST` funktionieren zuverlässig;
+  ein `json_keys`-UNNEST ist nicht direkt verfügbar → Key-Union wird über die
+  **DISTINCT-JSON-Strukturen** abgefragt (performant und deterministisch).
+* **Alt-DB-Kompatibilität:** Die echte DB trägt noch zusätzliche native Spalten
+  (u. a. `pivot_*`, `session_*`, `regime_*` von früheren Service-Generationen). Diese
+  bleiben unangetastet (Additiv-Pfad); der Reader greift seit 19.02 **nur noch** auf
+  `feature_data` zu.
+
+### Konsistenz-Prüfung
+
+* **Verträge passen:** `store_plugin_payload()` (Schreibseite) persistiert ausschließlich
+  `feature_data`-JSON – die 19.02-Leseseite (JSON-Keys) ist vertragskonform; es existiert
+  **keine** Schreibseite mehr, die native Spalten befüllt.
+* **Kein verwaister Legacy-Code:** Projektweite Suche nach `ema_diff`/`rsi_14`/
+  `atr_normalized`/`NATIVE_COLUMNS`/`HEATMAP_METRICS`/`native_columns`/
+  `EMADiffFeature`/`ATRNormalizedFeature` (ohne `test/`/`docs/`/`.venv`) → **0 Treffer**
+  in Produktivdateien.
+* **Kein Re-Import der Archive:** `ema_diff.py`/`atr_normalized.py` erben von
+  `BaseFeature` (nicht `PluginFeature`) → der `PluginLoader` (scannt `definitions/` per
+  `pkgutil.walk_packages` nach `PluginFeature`-Subklassen) registriert sie **nicht**.
+  `FeatureBuilder.features` ist ein Dict-Literal (nur `grid_levels`).
+* **Teil-31-Regression:** Die 19.01-Checks (31 A/B/C) sind spalten-agnostisch und
+  bestehen unverändert (Temp-DB mit Legacy-Spalten ist für `fetch_rows` irrelevant).
+
+### Entscheidungen (19.02)
+
+1. **D1 – Dynamische Achsen aus JSON-Strukturen:** Scatter-/Verteilungs-/Heatmap-Achsen
+   werden pro Symbol/Timeframe aus der Union der DISTINCT-`feature_data`-JSON-Strukturen
+   abgeleitet (`available_feature_keys`). `schema_version` (Pflichtfeld) wird nie als
+   Achse/Metrik angeboten.
+2. **D2 – Typfilter:** `numeric_only=True` akzeptiert nur Keys, die in **allen**
+   Vorkommen numerisch sind (int/float, kein bool/str/null) → Grundlage für
+   Scatter-/Verteilungs-Achsen und Heatmap-Metriken. Bool/str-Keys bleiben in der
+   Tabellen-JSON-Union sichtbar, aber nicht als Achse wählbar.
+3. **D3 – NULL-`feature_data`:** wird beim Lesen auf `{"schema_version": "1.0.0"}`
+   normalisiert (E-3-Vertrag, DB-Zeile unverändert); Rows ohne Wert in einer
+   angefragten Achse werden ausgelassen (Scatter/Histogramm).
+4. **D4 – Neuschema vs. Alt-DBs:** Das `feature_store`-Neuschema enthält keine
+   Legacy-Spalten mehr. Bestehende DB-Dateien (mit `ema_diff`/`rsi_14`/`atr_normalized`
+   und `pivot_*`/`session_*`/`regime_*`) werden **nicht** migriert/entfernt
+   (Additiv-Pfad, Code-Preserving) – der Reader liest sie schlicht nicht mehr.
+5. **D5 – Defensive Fallbacks:** unbekannte Heatmap-Metrik → `"count"`; leere
+   Datenlage → leere Combos (UI füllt beim ersten Daten-Payload); Repo-Fehler →
+   `["count"]` bzw. `[]` (keine UI-Hänger).
+6. **D6 – Schrift 9 pt:** `_TABLE_FONT_PT = 9` für TablePage-Tabelle + Header (fett) –
+   mehr Zeilen (Zeilenhöhe folgt der Schrift) und schmalere Spalten bei gleicher
+   Fenstergröße; Basis-Spalten `[Zeit (Wanduhr), Service]` bleiben fix.
+
+### Status
+
+* **Alle Steps 1–5 abgeschlossen und headless verifiziert.** Keine UI-/Regressionstests
+  ausgeführt (Regel 4); Baseline-Vorbefunde P2/P5/H3/H4/H5/H7 sind unverändert
+  dokumentiert.
+
+---
+
+## Implementierungs-Log 19.02 (08.08.2026) – Cleanup Legacy-Native-Spalten & 9-pt-Schrift
+
+Umgesetzt (Checklisten-Step 1–5 abgearbeitet; Entscheidungen D1–D6 des Prüfprotokolls
+19.02 als verbindliche Spezifikation):
+
+### Step 1 – Feature-Builder & Definitionen
+
+* `feature_builder.py`: `EMADiffFeature`/`ATRNormalizedFeature`-Imports entfernt;
+  `self.features` = nur `{"grid_levels": GridLevelsFeature()}` (Doku angepasst).
+* `definitions/__init__.py`: exportiert nur noch `GridLevelsFeature`; die Dateien
+  `ema_diff.py`/`atr_normalized.py` bleiben als Code-Archiv auf Platte (kein Import,
+  keine Registrierung – D4, `PluginLoader`-Scan findet keine `PluginFeature`-Klasse).
+
+### Step 2 – Reader, Repository, ViewModel, Worker
+
+* `feature_store_reader.py`: `NATIVE_COLUMNS`-Konstante entfernt; `fetch_rows()` liest
+  nur `bar_time/symbol/timeframe/feature_id/plugin_version/feature_data`. Neu:
+  `available_feature_keys(symbol, tf, numeric_only=False)` (DISTINCT-JSON-Struktur-
+  Union, `schema_version` ausgeschlossen, Typ-Klassifikation bool/num/str/null,
+  Regex-Guard `_is_json_key_identifier()` für SQL-Einbettungen); `fetch_columns()`
+  (JSON-Keys, bool → ausgelassen); `fetch_heatmap()` mit
+  `AVG(TRY_CAST(feature_data->>'key' AS DOUBLE))`.
+* `analytics_repository.py`: `HEATMAP_METRICS`/`NATIVE_COLUMNS` entfernt; `get_scatter`/
+  `get_distribution` mit Optional-Defaults (None → erste zwei numerische Keys bzw.
+  erster numerischer Key); `get_heatmap` mit `metrics`-Feld und Fallback `"count"`;
+  neue `available_heatmap_metrics()`/`available_feature_columns()` (dynamisch, defensiv).
+* `analytics_view_model.py`: Defaults `scatter_x`/`scatter_y`/`distribution_column` = `""`
+  (Repo-Default); `set_scatter_columns`/`set_distribution_column` ohne Legacy-Fallbacks;
+  `native_columns`-Property ersetzt durch `available_feature_columns(symbol, tf)` und
+  `heatmap_metrics(symbol, tf)` (defensiv).
+* `analytics_worker.py`: `x_column`/`y_column`/`column` werden als `None` durchgereicht
+  (Repo wählt Defaults, D1/D5).
+
+### Step 3 – UI-Pages
+
+* `table_page.py` (**Task 1 – Schrift**): `_TABLE_FONT_PT = 9` auf Tabelle + Header
+  (Header fett, D6); `_BASE_COLUMNS` = nur `[Zeit (Wanduhr), Service]`; Legacy-Spalten-
+  Renderblock entfernt; `_EXTRA_COLUMN_WIDTH = 95`; JSON-Union dynamisch
+  (`_union_feature_keys` ohne native Kollisionen).
+* `scatter_page.py`/`distribution_page.py`/`heatmap_page.py`: dynamische Achsen-/
+  Spalten-/Metrik-Combos (`_set_columns`/`_set_metrics`), Prefill in `attach_view_model`
+  über `available_feature_columns`/`heatmap_metrics`, Sync in `on_data_ready` aus
+  `data["columns"]`/`data["metrics"]`/`x_label`/`y_label`/`column`/`metric`
+  (Signale blockiert → kein Query-Loop).
+
+### Step 4 – Schema
+
+* `db/schema_initializer.py`: `feature_store`-Neuschema **ohne**
+  `ema_diff/rsi_14/atr_normalized` (D4); bestehende DBs bleiben über den Additiv-Pfad
+  unangetastet.
+
+### Step 5 – Quality Gate & Verifikation (headless, kein UI)
+
+* `py_compile` aller 11 geänderten Produktivdateien → **PASS** (exit 0).
+* Temporärer Check `test/_check_1902_isolated.py` (deterministische Temp-DB, 22 Prüfungen):
+  Reader R1–R5 (Key-Union, numeric_only, fetch_rows ohne Legacy, fetch_columns,
+  get_available_features), Repository S1–S2/D1/H1–H3, ViewModel V1–V3, TablePage
+  T1–T7 (Schrift ≤ 9 pt, Basis `[Zeit, Service]`, JSON-Union, absteigend, Spalte 1),
+  Builder B1 → **alle PASS**. Nach Abschluss entfernt (Invariante 10).
+* `test/test.py` **Teil 32** (neu, 14 Prüfungen): 32 A1–A5 (Reader-JSON), 32 B1–B4
+  (Repository-Dynamik), 32 C1–C2 (ViewModel), 32 D1–D3 (TablePage) → **alle PASS**.
+  Teil 31 (19.01, 11 Prüfungen) unverändert **PASS**.
+* Gesamtlauf `test/test.py`: **573 PASS / 6 FAIL** – die 6 Fehler sind die
+  dokumentierten **Baseline-Vorbefunde** P2/P5/H3/H4/H5/H7 (Geometrie-Tests,
+  offscreen `800x582`) – ohne 19.02-Änderungen identisch, nicht durch 19.02 verursacht.
+* Test-Workspace aufgeräumt (Invariante 10): nur `test/test.py` verbleibt.
+
+### Abweichungen vom Plan-Kapitel (per Prüfprotokoll-Entscheidungen)
+
+* Plan-Punkt „Native Spalten → dynamische JSON-Keys": realisiert als
+  `available_feature_keys()` (DISTINCT-Strukturen statt `json_keys`-UNNEST, D1).
+* Plan-Punkt „Heatmap-Metriken" → D5: unbekannte Metrik fällt auf `"count"` zurück
+  (kein `ValueError`-Hänger in der UI).
+* Plan-Punkt „Archiv-Dateien" → D4: `ema_diff.py`/`atr_normalized.py` bleiben auf
+  Platte (Code-Preserving), werden aber weder importiert noch registriert.
+
+### Status
+
+* **Alle Steps 1–5 abgeschlossen und headless verifiziert.** Keine UI-/Regressionstests
+  ausgeführt (Regel 4); Baseline-Vorbefunde P2/P5/H3/H4/H5/H7 sind unverändert
+  dokumentiert.
+

@@ -159,8 +159,8 @@ class AnalyticsAsyncWorker(QThread):
         if self._query_kind == QUERY_SCATTER:
             return repo.get_scatter(
                 symbol, timeframe,
-                x_column=str(p.get("x_column", "ema_diff") or "ema_diff"),
-                y_column=str(p.get("y_column", "rsi_14") or "rsi_14"),
+                x_column=p.get("x_column") or None,
+                y_column=p.get("y_column") or None,
                 feature_id=p.get("feature_id"),
                 feature_ids=feature_ids,
                 limit=cap_lookback_limit(p.get("limit")),
@@ -168,7 +168,7 @@ class AnalyticsAsyncWorker(QThread):
         if self._query_kind == QUERY_DISTRIBUTION:
             return repo.get_distribution(
                 symbol, timeframe,
-                column=str(p.get("column", "atr_normalized") or "atr_normalized"),
+                column=p.get("column") or None,
                 bins=p.get("bins", 20),
                 feature_id=p.get("feature_id"),
                 feature_ids=feature_ids,

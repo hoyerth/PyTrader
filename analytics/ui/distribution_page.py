@@ -1,11 +1,11 @@
 # analytics/ui/distribution_page.py
 """
-distribution_page.py - Verteilungs-Seite der Analytics-UI (Phase 15.03).
+distribution_page.py - Verteilungs-Seite der Analytics-UI (Phase 15.03 / 19.02).
 
-Zeigt das Histogramm einer nativen Feature-Spalte (ema_diff, rsi_14,
-atr_normalized) als pyqtgraph-BarGraphItem. Spalte und Bin-Anzahl sind
-ueber die Steuerleiste einstellbar; die Bin-Aenderung laeuft ueber den
-ViewModel-Debounce (200-300 ms, 15.03-Spezifikation).
+Zeigt das Histogramm eines feature_data-JSON-Keys (dynamisch, 19.02) als
+pyqtgraph-BarGraphItem. Spalte und Bin-Anzahl sind ueber die Steuerleiste
+einstellbar; die Bin-Aenderung laeuft ueber den ViewModel-Debounce
+(200-300 ms, 15.03-Spezifikation).
 
 MVVM (Invariante 4): Reine UI – Daten kommen ueber
 `data_ready(QUERY_DISTRIBUTION, data)` vom ViewModel (Async-Worker); es
@@ -75,12 +75,12 @@ class DistributionPage(QWidget):
     def attach_view_model(self, view_model: Any) -> None:
         self._view_model = view_model
         params = view_model.params
-        self._combo_column.blockSignals(True)
-        for col in view_model.native_columns:
-            self._combo_column.addItem(col, col)
-        idx = self._combo_column.findData(params.get("distribution_column"))
-        self._combo_column.setCurrentIndex(idx if idx >= 0 else 0)
-        self._combo_column.blockSignals(False)
+        # 19.02 (Cleanup): Dynamische feature_data-JSON-Keys statt nativer
+        # Spalten. Prefill fuer das aktuelle Symbol/Timeframe; die Combo
+        # wird bei jedem Daten-Payload aktualisiert (on_data_ready).
+        columns = view_model.available_feature_columns(
+            params.get("symbol", ""), params.get("timeframe", "M1"))
+        self._set_columns(columns, params.get("distribution_column"))
         self._slider_bins.blockSignals(True)
         self._slider_bins.setValue(int(params.get("bins") or 20))
         self._slider_bins.blockSignals(False)
@@ -92,11 +92,39 @@ class DistributionPage(QWidget):
             self._view_model.request_distribution()
 
     # ------------------------------------------------------------------
+    # 19.02: Dynamische Spalten-Combo (feature_data-JSON-Keys)
+    # ------------------------------------------------------------------
+    def _set_columns(self, columns, column) -> None:
+        """Fuellt die Spalten-Combo (19.02, dynamische JSON-Keys).
+
+        Erhaelt die aktuelle Auswahl, wenn sie in `columns` verfuegbar ist;
+        sonst erster Key. Signale blockiert (kein Query-Loop).
+        """
+        cols = [str(c) for c in (columns or [])]
+        sel = str(column or "") if str(column or "") in cols else (
+            cols[0] if cols else "")
+        self._combo_column.blockSignals(True)
+        self._combo_column.clear()
+        for c in cols:
+            self._combo_column.addItem(c, c)
+        self._combo_column.setCurrentIndex(
+            self._combo_column.findData(sel) if sel else -1)
+        self._combo_column.blockSignals(False)
+
+    # ------------------------------------------------------------------
     # Datenfluss (UI rendert, KEIN SQL)
     # ------------------------------------------------------------------
     def on_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
         if kind != QUERY_DISTRIBUTION:
             return
+        # 19.02: Combo mit den verfuegbaren JSON-Keys aktualisieren und auf
+        # die tatsaechlich verwendete Spalte synchronisieren.
+        vm_params_col = (self._view_model.params.get("distribution_column")
+                         if self._view_model else "")
+        self._set_columns(
+            data.get("columns"),
+            data.get("column") or vm_params_col,
+        )
         bins = data.get("bins") or []
         counts = data.get("counts") or []
         if not bins or not counts:

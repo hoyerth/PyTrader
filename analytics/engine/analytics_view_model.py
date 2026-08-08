@@ -84,10 +84,15 @@ class AnalyticsViewModel(QObject):
             # 15.03-E (Multi-Select): feature_ids = Liste der plugin_ids
             # (Datenquellen-Filter, `WHERE feature_id IN (...)`); leer = alle.
             "feature_ids": [],
+            # 19.02 (Cleanup): Keine festen Legacy-Spalten-Defaults mehr –
+            # scatter_x/scatter_y/distribution_column werden beim ersten
+            # Daten-Payload auf die verfuegbaren feature_data-JSON-Keys
+            # aufgeloest (Repo-Defaults). Leer = Repo waehlt die ersten
+            # numerischen Keys.
             "heatmap_metric": "count",
-            "scatter_x": "ema_diff",
-            "scatter_y": "rsi_14",
-            "distribution_column": "atr_normalized",
+            "scatter_x": "",
+            "scatter_y": "",
+            "distribution_column": "",
             "bins": DEFAULT_BINS,
             "limit": DEFAULT_LIMIT,
         }
@@ -199,14 +204,16 @@ class AnalyticsViewModel(QObject):
                         (QUERY_HEATMAP,))
 
     def set_scatter_columns(self, x_column: str, y_column: str) -> None:
-        self._set_param("scatter_x", str(x_column or "ema_diff"),
+        # 19.02 (Cleanup): Leere Werte = Repo-Default (erste numerische
+        # feature_data-JSON-Keys). Keine Legacy-Spalten-Fallbacks mehr.
+        self._set_param("scatter_x", str(x_column or ""),
                         (QUERY_SCATTER,))
-        self._set_param("scatter_y", str(y_column or "rsi_14"),
+        self._set_param("scatter_y", str(y_column or ""),
                         (QUERY_SCATTER,))
 
     def set_distribution_column(self, column: str) -> None:
         self._set_param("distribution_column",
-                        str(column or "atr_normalized"),
+                        str(column or ""),
                         (QUERY_DISTRIBUTION,))
 
     def set_bins(self, bins: int) -> None:
@@ -539,15 +546,31 @@ class AnalyticsViewModel(QObject):
         """True, wenn ungespeicherte Parametertrends vorliegen ('*')."""
         return self._dirty
 
-    @property
-    def heatmap_metrics(self) -> List[str]:
-        """Verfuegbare Heatmap-Metriken (fuer UI-Dropdown)."""
-        return self._repo.available_heatmap_metrics()
+    def heatmap_metrics(self, symbol: str, timeframe: str) -> List[str]:
+        """Verfuegbare Heatmap-Metriken fuer ein Symbol/Timeframe (19.02).
 
-    @property
-    def native_columns(self) -> List[str]:
-        """Native Feature-Spalten (fuer Scatter-/Verteilungs-Dropdown)."""
-        return self._repo.native_columns
+        "count" + numerische feature_data-JSON-Keys (dynamisch). Defensiv:
+        ohne Daten/bei Fehler -> ["count"].
+        """
+        try:
+            return self._repo.available_heatmap_metrics(
+                str(symbol or ""), str(timeframe or ""))
+        except Exception:
+            return ["count"]
+
+    def available_feature_columns(
+        self, symbol: str, timeframe: str
+    ) -> List[str]:
+        """Numerische feature_data-JSON-Keys (Scatter-/Verteilungs-Dropdown).
+
+        19.02 (Cleanup): Ersetzt die entfernten nativen Spalten. Defensiv:
+        Fehler/leere Daten -> [].
+        """
+        try:
+            return self._repo.available_feature_columns(
+                str(symbol or ""), str(timeframe or ""))
+        except Exception:
+            return []
 
     @property
     def max_lookback_limit(self) -> int:

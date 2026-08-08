@@ -7,10 +7,14 @@ Reiner Lese-Zugriff auf die `feature_store`-Tabelle in `analytics.duckdb`
 -> ViewModel -> UI). Der Reader fuehrt KEINE Berechnungen aus und schreibt
 NIE in die DB – er kapselt ausschliesslich lesende DuckDB-Abfragen.
 
-Datenmodell feature_store (Hybrid-Schema, Phasen 12+):
-    symbol, timeframe, bar_time TIMESTAMPTZ, ema_diff, rsi_14,
-    atr_normalized, created_at, feature_id, plugin_version,
-    feature_data JSON (FeatureStorePayload des Plugins)
+Datenmodell feature_store (Hybrid-Schema, Phasen 12+; 19.02-Cleanup):
+    symbol, timeframe, bar_time TIMESTAMPTZ, created_at, feature_id,
+    plugin_version, feature_data JSON (FeatureStorePayload des Plugins)
+
+19.02 (Cleanup): Die Legacy-Native-Spalten ema_diff/rsi_14/atr_normalized
+sind entfernt. Scatter-/Verteilungs-/Heatmap-Achsen und Tabellen-Spalten
+werden rein dynamisch aus den JSON-Keys von `feature_data` abgeleitet
+(`available_feature_keys()`); es gibt KEINE nativen Spalten mehr.
 
 Wanduhr-Garantie (Invariante 7, 15.03-Spez: Heatmap X/Y):
     Die gespeicherten bar_time-Werte sind Berlin-Wanduhr-encoded (MT5
@@ -52,9 +56,10 @@ SCHEMA_VERSION_DEFAULT = "1.0.0"
 # (feature_ids / letzte Ausfuehrung) ausgeblendet.
 SENTINEL_NATIVE = "native"
 
-# Native Feature-Spalten der feature_store-Tabelle (fuer Heatmap-Metriken,
-# Scatter-/Verteilungs-Achsen). Keine JSON-Feld-Pfade – nur echte Spalten.
-NATIVE_COLUMNS = ("ema_diff", "rsi_14", "atr_normalized")
+# 19.02 (Cleanup): NATIVE_COLUMNS ENTFERNT – die Legacy-Spalten ema_diff/
+# rsi_14/atr_normalized existieren nicht mehr im Neuschema. Achsen und
+# Metriken (Scatter/Verteilung/Heatmap) werden rein dynamisch aus den
+# feature_data-JSON-Keys abgeleitet (available_feature_keys()).
 
 # Heatmap-Achsen (15.03-Spezifikation): X = Wochentage, Y = Tagesstunden
 # Berlin Wanduhr. Matrix: rows = Stunde (0-23), cols = DOW (0=Sonntag..6).
@@ -137,12 +142,12 @@ class FeatureStoreReader:
     ) -> List[Dict[str, Any]]:
         """Liefert Feature-Store-Zeilen als Dicts (zeilen-aufwaerts sortiert).
 
-        Jede Zeile enthaelt:
+        19.02 (Cleanup): Die Legacy-Native-Spalten ema_diff/rsi_14/
+        atr_normalized sind entfernt – jede Zeile enthaelt:
             time          – Wanduhr-Epoch (int, bar_time)
             symbol/timeframe – Filterwerte
             feature_id    – Plugin-ID (oder None)
             plugin_version– Plugin-Version (oder None)
-            ema_diff/rsi_14/atr_normalized – native Spalten (oder None)
             feature_data  – geparstes JSON inkl. schema_version-Default (E-3)
 
         Args:
@@ -170,9 +175,6 @@ class FeatureStoreReader:
                     timeframe,
                     feature_id,
                     plugin_version,
-                    ema_diff,
-                    rsi_14,
-                    atr_normalized,
                     feature_data
                 FROM feature_store
                 WHERE {' AND '.join(conditions)}
@@ -191,10 +193,7 @@ class FeatureStoreReader:
                 "timeframe": str(r[2]),
                 "feature_id": str(r[3]) if r[3] is not None else None,
                 "plugin_version": str(r[4]) if r[4] is not None else None,
-                "ema_diff": self._float_or_none(r[5]),
-                "rsi_14": self._float_or_none(r[6]),
-                "atr_normalized": self._float_or_none(r[7]),
-                "feature_data": self._normalize_feature_data(r[8]),
+                "feature_data": self._normalize_feature_data(r[5]),
             })
         return out
 
@@ -209,8 +208,82 @@ class FeatureStoreReader:
             return None
 
     # ------------------------------------------------------------------
-    # Lesen: Gezielte Spalten (Scatter / Verteilung)
+    # Lesen: Dynamische JSON-Keys (Scatter / Verteilung / Heatmap, 19.02)
     # ------------------------------------------------------------------
+    @staticmethod
+    def _is_json_key_identifier(key: Any) -> bool:
+        """True, wenn der JSON-Key ein sicheres DuckDB-Identifier-Format hat.
+
+        Wird fuer SQL-Einbettungen (feature_data->>'key') verwendet – nur
+        [A-Za-z_][A-Za-z0-9_]* wird akzeptiert (kein SQL-Injection-/Quoting-
+        Risiko). JSON-Keys aus den Service-Payloads sind alle identifier-sicher.
+        """
+        import re
+        return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(key or "")))
+
+    def available_feature_keys(
+        self,
+        symbol: str,
+        timeframe: str,
+        numeric_only: bool = False,
+    ) -> List[str]:
+        """Union aller feature_data-JSON-Keys (19.02, dynamische Achsen).
+
+        Wertet die DISTINCT-JSON-Strukturen der Rows (symbol/timeframe)
+        aus; pro Struktur werden die Keys gesammelt. `schema_version`
+        (Pflichtfeld, E-3) wird ignoriert.
+
+        Args:
+            symbol/timeframe: Filter (case-insensitive)
+            numeric_only: True => nur Keys, deren Wert in ALLEN Vorkommen
+                numerisch (int/float, kein bool/str/None) ist – Grundlage
+                fuer Scatter-/Verteilungs-Achsen und Heatmap-Metriken.
+
+        Returns:
+            Deterministisch sortierte Key-Liste (alphabetisch); leer bei
+            fehlender DB/Tabelle oder Fehler (defensiv).
+        """
+        if not symbol or not timeframe:
+            return []
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT DISTINCT feature_data
+                FROM feature_store
+                WHERE LOWER(symbol) = LOWER(?)
+                  AND LOWER(timeframe) = LOWER(?)
+                  AND feature_data IS NOT NULL
+            """, [symbol, timeframe]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] available_feature_keys "
+                  f"fehlgeschlagen: {e}")
+            return []
+
+        key_types: Dict[str, set] = {}
+        for (raw,) in rows:
+            data = self._normalize_feature_data(raw)
+            if not isinstance(data, dict):
+                continue
+            for k, v in data.items():
+                if k == "schema_version" or not str(k).strip():
+                    continue
+                key = str(k)
+                if isinstance(v, bool):
+                    t = "bool"
+                elif isinstance(v, (int, float)):
+                    t = "num"
+                elif v is None:
+                    t = "null"
+                else:
+                    t = "str"
+                key_types.setdefault(key, set()).add(t)
+
+        keys = sorted(key_types.keys())
+        if not numeric_only:
+            return keys
+        # numeric_only: jeder Key muss durchgaengig numerisch (nicht bool/null/str)
+        return [k for k in keys if key_types[k] == {"num"}]
+
     def fetch_columns(
         self,
         symbol: str,
@@ -220,28 +293,33 @@ class FeatureStoreReader:
         feature_ids: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> List[Dict[str, float]]:
-        """Liefert nur die angeforderten nativen Spalten (non-null).
+        """Liefert numerische Werte angeforderter feature_data-JSON-Keys.
+
+        19.02 (Cleanup): Die alten nativen DB-Spalten sind entfernt – die
+        Spalten werden stattdessen als JSON-Keys aus `feature_data`
+        extrahiert (identische Semantik: Zeilen mit fehlendem/nicht-
+        numerischem Wert in einer Spalte werden ausgelassen).
 
         Args:
             symbol/timeframe: Filter (case-insensitive)
-            columns: Nur native Spalten (ema_diff, rsi_14, atr_normalized)
+            columns: JSON-Keys aus feature_data (nur identifier-sichere)
             feature_id: Optionaler Einzel-Filter auf die Plugin-ID (Legacy)
             feature_ids: Optionaler Multi-Filter (15.03-E) per
                 `feature_id IN (...)`. Leere Liste/None = kein Filter.
             limit: Maximale Zeilen (Default 1000)
 
         Returns:
-            Liste von Dicts {spaltenname: float, ...} – Zeilen mit NULL in
-            einer angeforderten Spalte werden ausgelassen (Scatter/Histogramm).
+            Liste von Dicts {key: float, ...} – Zeilen mit NULL/nicht-
+            numerischem Wert in einer angeforderten Spalte werden
+            ausgelassen (Scatter/Histogramm).
         """
         if not symbol or not timeframe or not columns:
             return []
-        valid = [c for c in columns if c in NATIVE_COLUMNS]
+        valid = [str(c) for c in columns if self._is_json_key_identifier(c)]
         if not valid:
             return []
         if limit is None:
             limit = 1000
-        col_sql = ", ".join(f'"{c}"' for c in valid)
         conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
         params: List[Any] = [symbol, timeframe]
         self._apply_feature_filter(feature_ids, feature_id, conditions, params)
@@ -249,10 +327,10 @@ class FeatureStoreReader:
         con = self._get_connection()
         try:
             rows = con.execute(f"""
-                SELECT {col_sql}
+                SELECT feature_data
                 FROM feature_store
                 WHERE {' AND '.join(conditions)}
-                  AND {" AND ".join(f'"{c}" IS NOT NULL' for c in valid)}
+                  AND feature_data IS NOT NULL
                 ORDER BY bar_time ASC
                 LIMIT ?
             """, params + [limit]).fetchall()
@@ -261,15 +339,18 @@ class FeatureStoreReader:
             return []
 
         out: List[Dict[str, float]] = []
-        for r in rows:
+        for (raw,) in rows:
+            data = self._normalize_feature_data(raw)
+            if not isinstance(data, dict):
+                continue
             item: Dict[str, float] = {}
             ok = True
-            for i, c in enumerate(valid):
-                fv = self._float_or_none(r[i])
-                if fv is None:
+            for c in valid:
+                v = data.get(c)
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
                     ok = False
                     break
-                item[c] = fv
+                item[c] = float(v)
             if ok:
                 out.append(item)
         return out
@@ -296,8 +377,9 @@ class FeatureStoreReader:
 
         Args:
             symbol/timeframe: Filter (case-insensitive)
-            metric: "count" (Anzahl Zeilen je Zelle) ODER eine native Spalte
-                (ema_diff, rsi_14, atr_normalized) -> AVG je Zelle.
+            metric: "count" (Anzahl Zeilen je Zelle) ODER ein numerischer
+                feature_data-JSON-Key (19.02) -> AVG je Zelle (z. B.
+                'grid_nearest_level', 'visit_pct').
             feature_id: Optionaler Einzel-Filter auf die Plugin-ID (Legacy)
             feature_ids: Optionaler Multi-Filter (15.03-E) per
                 `feature_id IN (...)`. Leere Liste/None = kein Filter.
@@ -316,19 +398,27 @@ class FeatureStoreReader:
             }
 
         Raises:
-            ValueError: bei unbekannter Metrik (nur count / native Spalten).
+            ValueError: bei unbekannter Metrik (nur 'count' / identifier-
+                sichere JSON-Keys).
         """
         if not symbol or not timeframe:
             return self._empty_heatmap(symbol, timeframe, metric)
         metric_key = str(metric).lower()
         if metric_key == "count":
             agg_sql = "COUNT(*) AS val"
-        elif metric_key in NATIVE_COLUMNS:
-            agg_sql = f'AVG("{metric_key}") AS val'
+        elif self._is_json_key_identifier(metric_key):
+            # 19.02 (Cleanup): Metrik = JSON-Key aus feature_data – AVG ueber
+            # die numerischen Werte. TRY_CAST liefert NULL fuer fehlende/nicht-
+            # numerische Werte; AVG ignoriert NULLs (wie bisher bei nativen
+            # Spalten mit NULL-Zellen).
+            agg_sql = (
+                f"AVG(TRY_CAST(feature_data->>'{metric_key}' AS DOUBLE)) AS val"
+            )
         else:
             raise ValueError(
                 f"[FeatureStoreReader] Unbekannte Heatmap-Metrik '{metric}' – "
-                f"erlaubt: 'count' oder eine native Spalte {NATIVE_COLUMNS}."
+                f"erlaubt: 'count' oder ein numerischer JSON-Key des "
+                f"feature_data."
             )
 
         conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
@@ -467,7 +557,10 @@ class FeatureStoreReader:
     def get_available_features(
         self, symbol: str, timeframe: str
     ) -> Dict[str, Any]:
-        """Liefert verfuegbare Plugin-IDs, native Spalten und Zeilenzahl.
+        """Liefert verfuegbare Plugin-IDs, JSON-Keys und Zeilenzahl.
+
+        19.02 (Cleanup): `columns` = dynamische feature_data-JSON-Keys
+        (statt der entfernten nativen Spalten).
 
         Returns:
             {"feature_ids": [...], "columns": [...], "total_rows": int}
@@ -488,11 +581,10 @@ class FeatureStoreReader:
         except Exception as e:
             print(f"WARN [FeatureStoreReader] get_available_features "
                   f"fehlgeschlagen: {e}")
-            return {"feature_ids": [], "columns": list(NATIVE_COLUMNS),
-                    "total_rows": 0}
+            return {"feature_ids": [], "columns": [], "total_rows": 0}
         return {
             "feature_ids": [str(i) for i in ids],
-            "columns": list(NATIVE_COLUMNS),
+            "columns": self.available_feature_keys(symbol, timeframe),
             "total_rows": total,
         }
 

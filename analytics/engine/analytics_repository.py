@@ -10,8 +10,13 @@ den UI-Pages benoetigten Strukturen auf:
     get_table()         – rohe Feature-Zeilen fuer die Tabellen-Seite
     get_heatmap()       – 2D-Matrix (X: Wochentage, Y: Tagesstunden
                           Berlin Wanduhr, Invariante 7)
-    get_scatter()       – X/Y-Paare zweier nativer Spalten
-    get_distribution()  – Histogramm (bins/counts) einer nativen Spalte
+    get_scatter()       – X/Y-Paare zweier feature_data-JSON-Keys (19.02)
+    get_distribution()  – Histogramm (bins/counts) eines JSON-Keys (19.02)
+
+19.02 (Cleanup): Die Legacy-Native-Spalten ema_diff/rsi_14/atr_normalized
+sind entfernt. Scatter-/Verteilungs-/Heatmap-Achsen werden rein dynamisch
+aus den numerischen JSON-Keys des `feature_data` abgeleitet
+(`available_feature_keys(numeric_only=True)`).
 
 Das Repository ist rein lesend (kein SQL in UI, keine Schreiboperationen) –
 die Profil-Persistenz (Option B / Explicit Save) liegt separat im
@@ -28,14 +33,12 @@ import numpy as np
 
 from analytics.engine.feature_store_reader import (
     FeatureStoreReader,
-    NATIVE_COLUMNS,
-    DOW_LABELS,
-    HOURS_PER_DAY,
-    DAYS_PER_WEEK,
 )
 
-# Vertraglich unterstuetzte Metriken fuer die Heatmap (count + native Spalten).
-HEATMAP_METRICS = ("count",) + NATIVE_COLUMNS
+# 19.02 (Cleanup): HEATMAP_METRICS ENTFERNT – Heatmap-Metriken sind "count"
+# oder dynamische feature_data-JSON-Keys (available_feature_keys(numeric_only)).
+# Die Achsen-Verfuegbarkeit wird pro Symbol/Timeframe aus dem feature_data
+# abgeleitet (keine nativen Spalten mehr).
 
 
 class AnalyticsRepository:
@@ -78,6 +81,11 @@ class AnalyticsRepository:
     ) -> Dict[str, Any]:
         """2D-Matrix (Wochentag x Tagesstunde) fuer die Heatmap-Seite.
 
+        19.02 (Cleanup): Metrik ist "count" oder ein numerischer
+        feature_data-JSON-Key (Default "count"). Unbekannte/fehlende
+        JSON-Metriken fallen auf "count" zurueck (defensiv, keine ValueError-
+        Haenger im UI). `metrics` liefert die verfuegbaren Metriken.
+
         Wanduhr-Garantie (Invariante 7): Die Extraktion von Wochentag/Stunde
         erfolgt im Reader mit `bar_time AT TIME ZONE 'UTC'` (die gespeicherten
         Werte sind Berlin-Wanduhr-encoded – die UTC-Darstellung IST die
@@ -87,13 +95,20 @@ class AnalyticsRepository:
             {
               "matrix":   7x24 (rows=Stunde 0-23, cols=DOW 0=So..6=Sa),
               "x_labels": Wochentage, "y_labels": Stunden,
-              "metric", "symbol", "timeframe",
+              "metric", "metrics": ["count", ...JSON-Keys],
+              "symbol", "timeframe",
             }
         """
-        return self.reader.fetch_heatmap(
-            symbol, timeframe, metric=metric, feature_id=feature_id,
+        avail = self.reader.available_feature_keys(
+            symbol, timeframe, numeric_only=True)
+        metrics = ["count"] + avail
+        use_metric = metric if metric in metrics else "count"
+        result = self.reader.fetch_heatmap(
+            symbol, timeframe, metric=use_metric, feature_id=feature_id,
             feature_ids=feature_ids
         )
+        result["metrics"] = metrics
+        return result
 
     # ------------------------------------------------------------------
     # Scatter
@@ -102,36 +117,45 @@ class AnalyticsRepository:
         self,
         symbol: str,
         timeframe: str,
-        x_column: str = "ema_diff",
-        y_column: str = "rsi_14",
+        x_column: Optional[str] = None,
+        y_column: Optional[str] = None,
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
-        limit: Optional[int] = 1000,
+        limit: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """X/Y-Paare zweier nativer Spalten fuer die Scatter-Seite.
+        """X/Y-Paare zweier feature_data-JSON-Keys fuer die Scatter-Seite.
 
-        Zeilen mit NULL in einer der beiden Spalten werden ausgelassen.
-        Unbekannte Spalten werden durch die Reader-Validierung abgefangen
-        (nur native Spalten erlaubt).
+        19.02 (Cleanup): Achsen sind dynamische JSON-Keys aus `feature_data`
+        (nicht mehr native DB-Spalten). Defaults: die ersten beiden
+        numerischen Keys der aktuellen Datenlage (x != y). Rows mit NULL/
+        nicht-numerischem Wert in einer Achse werden ausgelassen.
 
         Returns:
             {"points": [{"x": float, "y": float}, ...],
              "x_label": x_column, "y_label": y_column,
+             "columns": [verfuegbare numerische JSON-Keys...],
              "symbol", "timeframe", "total": n}
         """
-        if x_column not in NATIVE_COLUMNS or y_column not in NATIVE_COLUMNS:
-            raise ValueError(
-                f"[AnalyticsRepository] Unbekannte Scatter-Spalten "
-                f"x='{x_column}', y='{y_column}' – erlaubt: {NATIVE_COLUMNS}."
-            )
+        avail = self.reader.available_feature_keys(
+            symbol, timeframe, numeric_only=True)
+        if not avail:
+            return {
+                "points": [], "x_label": "", "y_label": "", "columns": [],
+                "symbol": symbol, "timeframe": timeframe, "total": 0,
+            }
+        x_col = x_column if x_column in avail else avail[0]
+        y_candidates = [c for c in avail if c != x_col]
+        y_col = y_column if y_column in avail and y_column != x_col \
+            else (y_candidates[0] if y_candidates else x_col)
+
         rows = self.reader.fetch_columns(
-            symbol, timeframe, [x_column, y_column],
+            symbol, timeframe, [x_col, y_col],
             feature_id=feature_id, feature_ids=feature_ids, limit=limit,
         )
         points: List[Dict[str, float]] = []
         for r in rows:
-            xv = r.get(x_column)
-            yv = r.get(y_column)
+            xv = r.get(x_col)
+            yv = r.get(y_col)
             if xv is None or yv is None:
                 continue
             if not (np.isfinite(xv) and np.isfinite(yv)):
@@ -139,8 +163,9 @@ class AnalyticsRepository:
             points.append({"x": xv, "y": yv})
         return {
             "points": points,
-            "x_label": x_column,
-            "y_label": y_column,
+            "x_label": x_col,
+            "y_label": y_col,
+            "columns": avail,
             "symbol": symbol,
             "timeframe": timeframe,
             "total": len(points),
@@ -153,40 +178,47 @@ class AnalyticsRepository:
         self,
         symbol: str,
         timeframe: str,
-        column: str = "atr_normalized",
+        column: Optional[str] = None,
         bins: int = 20,
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
-        limit: Optional[int] = 1000,
+        limit: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Histogramm einer nativen Spalte fuer die Verteilungs-Seite.
+        """Histogramm eines feature_data-JSON-Keys fuer die Verteilungs-Seite.
 
+        19.02 (Cleanup): Die Spalte ist ein dynamischer JSON-Key aus
+        `feature_data` (Default: erster numerischer Key der Datenlage).
         Berechnet bin-Edges + counts mit numpy.histogram (NaN-/Inf-Werte
-        werden ausgelassen). Unbekannte Spalten werden abgefangen.
+        werden ausgelassen).
 
         Returns:
             {"bins": [edges...], "counts": [n...], "column": column,
+             "columns": [verfuegbare numerische JSON-Keys...],
              "symbol", "timeframe", "total": n}
         """
-        if column not in NATIVE_COLUMNS:
-            raise ValueError(
-                f"[AnalyticsRepository] Unbekannte Verteilungs-Spalte "
-                f"'{column}' – erlaubt: {NATIVE_COLUMNS}."
-            )
+        avail = self.reader.available_feature_keys(
+            symbol, timeframe, numeric_only=True)
+        col = column if column in avail else (avail[0] if avail else "")
         try:
             n_bins = max(2, int(bins))
         except (TypeError, ValueError):
             n_bins = 20
 
+        if not col:
+            return {
+                "bins": [], "counts": [], "column": "", "columns": avail,
+                "symbol": symbol, "timeframe": timeframe, "total": 0,
+            }
+
         rows = self.reader.fetch_columns(
-            symbol, timeframe, [column], feature_id=feature_id,
+            symbol, timeframe, [col], feature_id=feature_id,
             feature_ids=feature_ids, limit=limit,
         )
-        values = [r[column] for r in rows if r.get(column) is not None]
+        values = [r[col] for r in rows if r.get(col) is not None]
         values = [v for v in values if np.isfinite(v)]
         if not values:
             return {
-                "bins": [], "counts": [], "column": column,
+                "bins": [], "counts": [], "column": col, "columns": avail,
                 "symbol": symbol, "timeframe": timeframe, "total": 0,
             }
 
@@ -194,7 +226,8 @@ class AnalyticsRepository:
         return {
             "bins": [float(e) for e in bin_edges],
             "counts": [int(c) for c in counts],
-            "column": column,
+            "column": col,
+            "columns": avail,
             "symbol": symbol,
             "timeframe": timeframe,
             "total": len(values),
@@ -249,14 +282,35 @@ class AnalyticsRepository:
     def get_available_features(
         self, symbol: str, timeframe: str
     ) -> Dict[str, Any]:
-        """Verfuegbare Plugin-IDs, native Spalten und Zeilenzahl."""
+        """Verfuegbare Plugin-IDs, JSON-Keys und Zeilenzahl."""
         return self.reader.get_available_features(symbol, timeframe)
 
-    def available_heatmap_metrics(self) -> List[str]:
-        """Vertraglich unterstuetzte Heatmap-Metriken (fuer UI-Dropdowns)."""
-        return list(HEATMAP_METRICS)
+    def available_heatmap_metrics(
+        self, symbol: str, timeframe: str
+    ) -> List[str]:
+        """Verfuegbare Heatmap-Metriken fuer ein Symbol/Timeframe (19.02).
 
-    @property
-    def native_columns(self) -> List[str]:
-        """Native Feature-Spalten (fuer Scatter-/Verteilungs-Dropdowns)."""
-        return list(NATIVE_COLUMNS)
+        "count" + numerische feature_data-JSON-Keys (dynamisch). Ohne Daten
+        liefert die Methode ["count"] (defensiver Fallback fuer die UI).
+        """
+        try:
+            keys = self.reader.available_feature_keys(
+                symbol, timeframe, numeric_only=True)
+        except Exception:
+            keys = []
+        return ["count"] + list(keys)
+
+    def available_feature_columns(
+        self, symbol: str, timeframe: str
+    ) -> List[str]:
+        """Numerische feature_data-JSON-Keys (Scatter-/Verteilungs-Dropdowns).
+
+        19.02 (Cleanup): Ersetzt die entfernten nativen Spalten. Defensiv:
+        Fehler/leere Daten -> [] (UI kann dann leer starten und fuellt die
+        Combos aus dem ersten Daten-Payload).
+        """
+        try:
+            return self.reader.available_feature_keys(
+                symbol, timeframe, numeric_only=True)
+        except Exception:
+            return []

@@ -13,19 +13,27 @@ Die Daten kommen ueber `data_ready(QUERY_TABLE, data)` vom ViewModel
 19.01 (Step 2) – Multi-Service-Darstellung:
 - Spalte 1 = **Service** (feature_id bzw. via injiziertem `name_resolver`
   aufgeloester Anzeigename, E3/IoC – kein SQL, keine Modell-Kopplung).
-- Standard-Spaltenreihenfolge: [Zeit (Wanduhr), Service, ema_diff, rsi_14,
-  atr_normalized, ...JSON-Union-Keys alphabetisch] (E4).
+- Standard-Spaltenreihenfolge: [Zeit (Wanduhr), Service,
+  ...JSON-Union-Keys alphabetisch] (E4).
 - **Chronologisch ABSTEIGEND** nach bar_time (E2): Die Page sortiert die
   erhaltenen Rows deterministisch (stabil); die QTableWidget-Interaktions-
   sortierung bleibt deaktiviert, damit die Service-Mischung korrekt bleibt.
   Der `FeatureStoreReader` (ASC-Vertrag) bleibt unveraendert.
 - JSON-Union: Vereinigung aller `feature_data`-Keys ueber die geladenen
   Rows; fehlende Werte bei abweichenden Services -> "-".
+
+19.02 (Cleanup + Schrift):
+- Legacy-Native-Spalten ema_diff/rsi_14/atr_normalized sind ENTFERNT –
+  die Tabelle zeigt nur noch Zeit + Service + dynamische JSON-Union.
+- Kleinere Schrift (9 pt): bei gleicher Fenstergroesse sind mehr Zeilen
+  (Zeilenhoehe folgt der Schrift) und mehr Spalten (schmalere Spalten)
+  sichtbar.
 """
 
 from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
@@ -38,22 +46,19 @@ from PySide6.QtWidgets import (
 from analytics.engine.analytics_worker import QUERY_TABLE
 from analytics.ui.common import format_wanduhr_time, make_overlay_stack
 
-# Basis-Spalten (19.01): Reihenfolge laut Kapitel
-# [Zeitstempel, Service, ema_diff, rsi_14, atr_normalized, ...Union-Keys].
+# 19.02 (Cleanup): Basis-Spalten OHNE Legacy-Native-Spalten – nur Zeit +
+# Service. Alle Feature-Werte kommen dynamisch aus feature_data (JSON-Union).
 _BASE_COLUMNS = [
-    ("Zeit (Wanduhr)", 150),
-    ("Service", 160),
-    ("ema_diff", 90),
-    ("rsi_14", 80),
-    ("atr_normalized", 100),
+    ("Zeit (Wanduhr)", 130),
+    ("Service", 150),
 ]
 # Feste Breite der dynamischen JSON-Union-Spalten (feature_data-Keys).
-_EXTRA_COLUMN_WIDTH = 110
-# Native Feature-Spalten (indiziert in _BASE_COLUMNS ab Spalte 2).
-_NATIVE_KEYS = ("ema_diff", "rsi_14", "atr_normalized")
+_EXTRA_COLUMN_WIDTH = 95
 # Spalten-Indizes der Basis-Spalten (fuer Jump-to-Chart / Zeit-UserRole).
 _COL_TIME = 0
 _COL_SERVICE = 1
+# 19.02 (Task 1): Schriftgroesse der Tabelle (kleiner -> mehr Zeilen/Spalten).
+_TABLE_FONT_PT = 9
 
 
 def _epoch_int(value: Any) -> Optional[int]:
@@ -105,6 +110,14 @@ class TablePage(QWidget):
         # zeichnet deterministisch ABSTEIGEND nach bar_time (Service-Mischung
         # bleibt chronologisch korrekt; kein haengender O(n^2)-Sort).
         self._table.setSortingEnabled(False)
+        # 19.02 (Task 1): Kleinere Schrift – mehr Zeilen (Zeilenhoehe folgt
+        # der Schrift) und mehr Spalten sichtbar bei gleicher Fenstergroesse.
+        table_font = QFont()
+        table_font.setPointSize(_TABLE_FONT_PT)
+        self._table.setFont(table_font)
+        header_font = QFont(table_font)
+        header_font.setBold(True)
+        header.setFont(header_font)
 
         content = QWidget(self)
         lay = QVBoxLayout(content)
@@ -212,13 +225,6 @@ class TablePage(QWidget):
             # Spalte 1 = Service (feature_id bzw. Anzeigename, E3).
             self._table.setItem(r, _COL_SERVICE,
                                 QTableWidgetItem(service_names[r] or "-"))
-            # Native Feature-Spalten (ema_diff, rsi_14, atr_normalized).
-            for ci, key in enumerate(_NATIVE_KEYS, start=2):
-                v = row.get(key)
-                if isinstance(v, (int, float)):
-                    self._table.setItem(r, ci, QTableWidgetItem(f"{v:.4f}"))
-                else:
-                    self._table.setItem(r, ci, QTableWidgetItem("-"))
             # JSON-Union-Spalten: Wert aus feature_data, sonst "-".
             fd = row.get("feature_data")
             if not isinstance(fd, dict):
@@ -238,13 +244,13 @@ class TablePage(QWidget):
     # ------------------------------------------------------------------
     @staticmethod
     def _union_feature_keys(rows: List[Dict[str, Any]]) -> set:
-        """Union aller feature_data-JSON-Keys (19.01 E4).
+        """Union aller feature_data-JSON-Keys (19.01 E4 / 19.02).
 
-        Keys, die mit Basis-/Pflicht-Spalten (Zeit, Service) oder nativen
-        Spalten (ema_diff, rsi_14, atr_normalized) kollidieren, werden
-        ignoriert (keine Duplikat-Header); leere/Whitespace-Keys ebenfalls.
+        19.02: Es gibt keine nativen Spalten mehr – es werden nur noch die
+        Basis-/Pflicht-Spalten (Zeit, Service) von der Union ausgenommen
+        (keine Duplikat-Header); leere/Whitespace-Keys ebenfalls.
         """
-        base = {c[0] for c in _BASE_COLUMNS} | set(_NATIVE_KEYS)
+        base = {c[0] for c in _BASE_COLUMNS}
         keys: set = set()
         for row in rows:
             fd = row.get("feature_data")

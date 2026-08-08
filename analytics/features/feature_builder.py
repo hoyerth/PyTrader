@@ -1,8 +1,13 @@
 # analytics/features/feature_builder.py
 """
 Feature Builder – Lädt OHLCV aus market_data.duckdb, berechnet Features
-(ema_diff, atr_normalized, grid_levels) vektorisiert und schreibt sie per
-Bulk-Upsert in analytics.duckdb.
+(grid_levels, Phase 11) vektorisiert und schreibt sie per Bulk-Upsert in
+analytics.duckdb.
+
+19.02 (Cleanup): Die Legacy-Native-Spalten ema_diff/atr_normalized wurden
+entfernt. Services persistieren ihre Werte ausschliesslich ueber
+feature_data (JSON, store_plugin_payload); der native Feature-Builder-Pfad
+liefert nur noch die Grid-Level-Spalten.
 
 Stabiler Basis-Stand + Phase-11-Erweiterung: grid_levels (Y-Achsen-Grid-Levels
 und X-Achsen-Zeitfenster-Flags), gekapselt in analytics/features/definitions/.
@@ -24,8 +29,6 @@ from pathlib import Path
 import pandas as pd
 
 from analytics.features.base_feature import BaseFeature
-from analytics.features.definitions.ema_diff import EMADiffFeature
-from analytics.features.definitions.atr_normalized import ATRNormalizedFeature
 from analytics.features.definitions.grid_levels import GridLevelsFeature
 from analytics.features.plugins.base_plugin import (
     PluginFeature,
@@ -446,10 +449,11 @@ class FeatureBuilder:
     """Orchestriert die Feature-Berechnung und persistiert sie im feature_store."""
 
     def __init__(self) -> None:
-        # Basis-Stand (EMADiff + ATRNormalized) + Phase 11: Grid-Levels
+        # 19.02 (Cleanup): Legacy-Native-Spalten (ema_diff, atr_normalized)
+        # entfernt. Der native Feature-Builder-Pfad berechnet nur noch die
+        # Phase-11 Grid-Levels; Services persistieren ihre Werte ueber
+        # feature_data (JSON, store_plugin_payload).
         self.features: Dict[str, BaseFeature] = {
-            "ema_diff": EMADiffFeature(),
-            "atr_normalized": ATRNormalizedFeature(),
             "grid_levels": GridLevelsFeature(),
         }
         # Spaltenname -> Feature-Modul-Name. Erlaubt calculate_features() auch

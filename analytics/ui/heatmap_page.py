@@ -41,7 +41,7 @@ class HeatmapPage(QWidget):
         self._current_symbol = ""
         self._current_timeframe = "M1"
 
-        # Metrik-Dropdown (count | native Spalten)
+        # Metrik-Dropdown (19.02: count | numerische feature_data-JSON-Keys)
         self._combo_metric = QComboBox()
         self._label_info = QLabel("")
 
@@ -84,13 +84,13 @@ class HeatmapPage(QWidget):
     # ------------------------------------------------------------------
     def attach_view_model(self, view_model: Any) -> None:
         self._view_model = view_model
-        # Metrik-Dropdown befuellen (count + native Spalten)
-        self._combo_metric.blockSignals(True)
-        for metric in view_model.heatmap_metrics:
-            self._combo_metric.addItem(metric, metric)
-        idx = self._combo_metric.findData(view_model.params.get("heatmap_metric"))
-        self._combo_metric.setCurrentIndex(idx if idx >= 0 else 0)
-        self._combo_metric.blockSignals(False)
+        params = view_model.params
+        # 19.02 (Cleanup): Metriken = "count" + numerische feature_data-
+        # JSON-Keys (dynamisch). Prefill fuer das aktuelle Symbol/Timeframe;
+        # die Combo wird bei jedem Daten-Payload aktualisiert (on_data_ready).
+        metrics = view_model.heatmap_metrics(
+            params.get("symbol", ""), params.get("timeframe", "M1"))
+        self._set_metrics(metrics, params.get("heatmap_metric"))
         view_model.data_ready.connect(self.on_data_ready)
 
     def set_navigation_handler(self, fn: Callable[[str, str, int], None]) -> None:
@@ -107,6 +107,26 @@ class HeatmapPage(QWidget):
             self._view_model.request_heatmap()
 
     # ------------------------------------------------------------------
+    # 19.02: Dynamische Metrik-Combo ("count" + feature_data-JSON-Keys)
+    # ------------------------------------------------------------------
+    def _set_metrics(self, metrics, metric) -> None:
+        """Fuellt die Metrik-Combo (19.02, dynamische JSON-Keys).
+
+        Erhaelt die aktuelle Auswahl, wenn sie in `metrics` verfuegbar ist;
+        sonst "count". Signale blockiert (kein Query-Loop).
+        """
+        items = [str(m) for m in (metrics or [])]
+        sel = str(metric or "") if str(metric or "") in items else (
+            "count" if "count" in items else (items[0] if items else ""))
+        self._combo_metric.blockSignals(True)
+        self._combo_metric.clear()
+        for m in items:
+            self._combo_metric.addItem(m, m)
+        self._combo_metric.setCurrentIndex(
+            self._combo_metric.findData(sel) if sel else -1)
+        self._combo_metric.blockSignals(False)
+
+    # ------------------------------------------------------------------
     # Datenfluss (UI rendert, KEIN SQL)
     # ------------------------------------------------------------------
     def on_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
@@ -114,6 +134,14 @@ class HeatmapPage(QWidget):
             return
         self._current_symbol = str(data.get("symbol") or "")
         self._current_timeframe = str(data.get("timeframe") or "M1")
+        # 19.02: Metrik-Combo mit den verfuegbaren Metriken aktualisieren und
+        # auf die tatsaechlich verwendete Metrik synchronisieren.
+        vm_params_metric = (self._view_model.params.get("heatmap_metric")
+                            if self._view_model else "")
+        self._set_metrics(
+            data.get("metrics"),
+            data.get("metric") or vm_params_metric,
+        )
         matrix = np.asarray(data.get("matrix"), dtype=float)
         if matrix.size == 0:
             self._stack.setCurrentIndex(1)

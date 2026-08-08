@@ -66,14 +66,16 @@ def check_and_init_databases() -> None:
     # ist CREATE TABLE IF NOT EXISTS ein No-op; die Migration existierender
     # Tabellen erfolgt ueber test/migrate_pk.py (Table-Rewrite + RENAME, da
     # DuckDB 1.5.5 kein DROP PRIMARY KEY unterstuetzt).
+    # 19.02 (Cleanup): Die Legacy-Native-Spalten ema_diff/rsi_14/
+    # atr_normalized entfallen im NEUSCHEMA – alle Feature-Werte liegen im
+    # feature_data-JSON. Bestehende DB-Dateien (mit den Alt-Spalten) werden
+    # durch den Additiv-Pfad (ALTER TABLE ADD COLUMN IF NOT EXISTS) nicht
+    # angetastet; der Reader greift nur noch auf feature_data zu.
     con_analytics.execute("""
         CREATE TABLE IF NOT EXISTS feature_store (
             symbol      VARCHAR NOT NULL,
             timeframe   VARCHAR NOT NULL,
             bar_time    TIMESTAMPTZ NOT NULL,
-            ema_diff    DOUBLE,
-            rsi_14      DOUBLE,
-            atr_normalized DOUBLE,
             created_at  TIMESTAMP DEFAULT current_timestamp,
             feature_id  VARCHAR NOT NULL DEFAULT 'native',
             plugin_version VARCHAR,
