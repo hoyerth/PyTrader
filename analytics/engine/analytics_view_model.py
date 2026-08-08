@@ -103,6 +103,11 @@ class AnalyticsViewModel(QObject):
             # -Richtung als Qt-Werte (E8; 1 = DescendingOrder = Zeit absteigend).
             "table_column_widths": {},
             "table_row_height": 0,
+            # 19.05 (Bugfix): Individuelle Zeilenhöhen {globaler Row-Index:
+            # Höhe} – nur Abweichungen von der Default-Höhe. JSON-sicher
+            # (String-Keys). Beim Anwenden per setRowHeight wiederhergestellt,
+            # damit das Ziehen einer Zeile nicht alle anderen mitzieht.
+            "table_row_heights": {},
             "table_sort_column": 0,
             "table_sort_order": 1,
         }
@@ -246,16 +251,18 @@ class AnalyticsViewModel(QObject):
         row_height: int = 0,
         sort_column: int = 0,
         sort_order: int = 1,
+        row_heights: Optional[Dict[Any, Any]] = None,
     ) -> None:
         """Uebernimmt TablePage-Settings (19.03 E6, ohne Query-Refresh).
 
-        Spaltenbreiten {Spaltenname: Breite} (E5), Zeilenhoehe als
-        Default-Section-Size (E9), Sortier-Spalte und -Richtung (E8).
-        Reine UI-Zustaende der TablePage: KEIN `_refresh`/Debounce/Worker
-        und keine DB-Abfrage – nur die Dirty-Markierung fuer die
-        Profil-Persistenz (Option B – Explicit Save). Typ-/Werte-
-        normalisiert; ohne tatsaechliche Aenderung idempotent (kein
-        unnötiges Dirty-Flag bei Drag-Ereignissen).
+        Spaltenbreiten {Spaltenname: Breite} (E5), Default-Zeilenhoehe als
+        Default-Section-Size (E9), **individuelle Zeilenhoehen** (19.05:
+        {globaler Row-Index: Hoehe}, nur Abweichungen vom Default),
+        Sortier-Spalte und -Richtung (E8). Reine UI-Zustaende der TablePage:
+        KEIN `_refresh`/Debounce/Worker und keine DB-Abfrage – nur die
+        Dirty-Markierung fuer die Profil-Persistenz (Option B – Explicit
+        Save). Typ-/Werte-normalisiert; ohne tatsaechliche Aenderung
+        idempotent (kein unnötiges Dirty-Flag bei Drag-Ereignissen).
         """
         norm_widths: Dict[str, int] = {}
         for k, v in (widths or {}).items():
@@ -278,14 +285,26 @@ class AnalyticsViewModel(QObject):
         except (TypeError, ValueError):
             so_raw = 1
         so = so_raw if so_raw in (0, 1) else 1
+        # 19.05: Individuelle Zeilenhöhen normalisieren (String-Keys,
+        # JSON-sicher; nur positive Hoehen).
+        norm_heights: Dict[str, int] = {}
+        for k, v in (row_heights or {}).items():
+            try:
+                h = int(v)
+            except (TypeError, ValueError):
+                continue
+            if h > 0:
+                norm_heights[str(k)] = h
 
         if (norm_widths == self._params.get("table_column_widths")
                 and rh == self._params.get("table_row_height")
+                and norm_heights == self._params.get("table_row_heights")
                 and sc == self._params.get("table_sort_column")
                 and so == self._params.get("table_sort_order")):
             return
         self._params["table_column_widths"] = norm_widths
         self._params["table_row_height"] = rh
+        self._params["table_row_heights"] = norm_heights
         self._params["table_sort_column"] = sc
         self._params["table_sort_order"] = so
         self._mark_dirty()

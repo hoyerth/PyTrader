@@ -636,7 +636,9 @@ class AnalyticsWindow(PersistentWindow):
     def _on_table_settings_changed(self, settings: Dict[str, Any]) -> None:
         """Uebernimmt TablePage-Settings in den ViewModel (19.03 Step 1/2).
 
-        Spaltenbreiten {Spaltenname: Breite} (E5), Zeilenhoehe (E9),
+        Spaltenbreiten {Spaltenname: Breite} (E5), Default-Zeilenhoehe (E9),
+        **individuelle Zeilenhoehen** (19.05-Bugfix: {globaler Row-Index:
+        Hoehe} – damit das Ziehen einer Zeile nicht alle anderen mitzieht),
         Sortier-Spalte/-Richtung (E8). Reine UI-Zustaende der TablePage:
         set_table_settings markiert nur das Profil-Dirty-Flag (E6, Option B)
         und loest KEINEN Query-Refresh aus (kein Debounce/Worker).
@@ -647,6 +649,7 @@ class AnalyticsWindow(PersistentWindow):
             row_height=int(settings.get("row_height") or 0),
             sort_column=int(settings.get("sort_column") or 0),
             sort_order=int(so) if so is not None else 1,
+            row_heights=settings.get("row_heights") or {},
         )
 
     @Slot(bool)
@@ -754,6 +757,28 @@ class AnalyticsWindow(PersistentWindow):
         # TF-Ausgrauung fuer das (ggf. neue) Symbol aktualisieren.
         self._refresh_timeframe_combo(symbol)
 
+    def _sync_profile_editor(self) -> None:
+        """Synchronisiert Name-/Beschreibungs-/Limit-Felder mit dem VM (Bugfix).
+
+        Wird beim App-Start nach `load_profiles()` gerufen: Dort emittiert der
+        ViewModel KEIN `active_profile_changed` (nur set_active_profile/
+        create_profile) – die edit-Felder blieben sonst leer. Ein leerer
+        `edit_profile_name` wuerde beim ersten Save als `name=''` persistiert
+        werden (die Combo zeigt dann '?'). Ohne aktives Profil werden die
+        Felder geleert; das Limit-Feld wird mit dem VM-Wert synchronisiert.
+        """
+        active = self._vm.active_profile
+        if active:
+            self.edit_profile_name.setText(active.get("name") or "")
+            self.edit_profile_desc.setText(active.get("description") or "")
+        else:
+            self.edit_profile_name.clear()
+            self.edit_profile_desc.clear()
+        if hasattr(self, "edit_limit"):
+            self.edit_limit.setText(
+                str(int(self._vm.params.get("limit")
+                        or self._default_limit)))
+
     @Slot(bool)
     def _on_dirty_changed(self, dirty: bool) -> None:
         self.label_dirty.setText(
@@ -842,6 +867,12 @@ class AnalyticsWindow(PersistentWindow):
         # synchronisiert werden, sonst bleiben sie auf den Historie-Werten
         # (inkonsistente Anzeige + falsche Persistenz beim Schliessen).
         self._sync_profile_filters()
+        # Bugfix 08.08.2026 (Profilname '?' nach Save): Auch die Name-/
+        # Beschreibungs-Felder bleiben nach load_profiles() leer (kein
+        # active_profile_changed). Beim ersten Save wuerde update_profile
+        # name='' persistieren und die Combo zeigt '?'. Deshalb die Felder
+        # hier aus dem (ggf. geladenen) aktiven Profil synchronisieren.
+        self._sync_profile_editor()
         self._on_page_changed(self.sidebar.currentRow())
         # 15.03-E: QUERY_FEATURES speiste das entfernte combo_feature-Dropdown –
         # ohne Feature-Dropdown ist keine Features-Metadaten-Abfrage noetig.
