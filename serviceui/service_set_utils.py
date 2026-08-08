@@ -172,6 +172,40 @@ def delete_empty_folder(state_manager, group: str, path: str) -> bool:
     return save_empty_folders(state_manager, group, paths)
 
 
+def ensure_folder_path(state_manager, group: str, path: str) -> bool:
+    """Stellt sicher, dass die Ordnerkette von `path` persistiert ist.
+
+    18.01.03 (E3-revidiert, Bugfix 08.08.2026): Wird nach Struktur-
+    Aenderungen aufgerufen (letztes Kind aus einem Ordner verschoben,
+    Ordner per Drag verschoben), damit benutzererzeugte Ordner auch dann
+    sichtbar bleiben, wenn ihr letztes Kind entzogen wurde. Ergaenzt
+    idempotent ALLE Kettenglieder von `path` in der Leere-Ordner-Liste
+    der Gruppe (tree_folders_<group>) – ein Kettenglied, das aktuell noch
+    Kinder hat, ist als redundanter Eintrag unschaedlich (build_tree
+    dedupliziert ueber _ensure_category_path).
+
+    Returns:
+        True, wenn die Kette gesichert ist (neu ergaenzt oder bereits
+        vorhanden); False bei fehlendem state_manager/Speicherfehler.
+    """
+    path = str(path or "").strip().strip("/")
+    if not path or state_manager is None:
+        return False
+    parts = [p.strip() for p in path.split("/") if p.strip()]
+    if not parts:
+        return False
+    paths = list_empty_folders(state_manager, group)
+    changed = False
+    for i in range(len(parts)):
+        p = "/".join(parts[: i + 1])
+        if p not in paths:
+            paths.append(p)
+            changed = True
+    if changed:
+        return save_empty_folders(state_manager, group, paths)
+    return True
+
+
 def _replace_prefix(path: str, old_path: str, new_path: str) -> str:
     """Ersetzt das Pfad-Praefix old_path in path durch new_path.
 
@@ -249,6 +283,16 @@ def rename_category(model, set_repo, state_manager, group: str,
         except Exception as e:
             print(f"WARN [service_set_utils] Leere-Ordner-Rename "
                   f"'{old_path}' -> '{new_path}' fehlgeschlagen: {e}")
+        # 18.01.03 (E3-revidiert, Bugfix 08.08.2026): Der QUELL-Ordner
+        # bleibt nach dem Wegziehen seines letzten Kindes sichtbar (auch
+        # wenn er bisher nur aus echten Kindern bestand und NICHT in der
+        # Leere-Ordner-Liste stand). Idempotent – ein Ordner mit verbleibenden
+        # Kindern bekommt einen redundanten Eintrag (unschaedlich).
+        try:
+            ensure_folder_path(state_manager, group, old_path)
+        except Exception as e:
+            print(f"WARN [service_set_utils] Leere-Ordner-Sicherung des "
+                  f"Quell-Ordners '{old_path}' fehlgeschlagen: {e}")
     except Exception as e:
         print(f"WARN [service_set_utils] Ordner-Rename '{old_path}' -> "
               f"'{new_path}' fehlgeschlagen: {e}")

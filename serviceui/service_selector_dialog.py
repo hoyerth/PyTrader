@@ -738,20 +738,39 @@ class ServiceSelectorDialog(QDialog):
 
         TYPE_SET    -> category-Feld der Set-Definition (E2).
         TYPE_PLUGIN -> Kategorie-Override plugin_category_<id> (E1).
-        Danach EventBus-Sync (Live-Refresh aller MasterTree-Instanzen).
+        18.01.03 (E3-revidiert, Bugfix 08.08.2026): Der QUELL-Ordner
+        (und seine Elternkette) wird VOR dem Update ermittelt und nach dem
+        Verschieben als Leere-Ordner persistiert (ensure_folder_path) –
+        damit bleibt der Ordner sichtbar, wenn sein letztes Kind entzogen
+        wurde. Danach EventBus-Sync (Live-Refresh aller MasterTrees).
         """
         from serviceui.master_tree import TYPE_PLUGIN, TYPE_SET
         from serviceui.service_set_utils import (
-            set_plugin_category, set_set_category)
+            ensure_folder_path, set_plugin_category, set_set_category)
+        source_path = ""
+        group = ""
         ok = False
         if node_type == TYPE_SET:
+            group = "sets"
+            try:
+                definition = self.set_repo.get_set(item_id) or {}
+                source_path = str(definition.get("category") or "").strip().strip("/")
+            except Exception:
+                source_path = ""
             ok = set_set_category(self.set_repo, item_id, new_path)
         elif node_type == TYPE_PLUGIN:
+            group = "plugins"
+            try:
+                source_path = self.model.plugin_category_path(item_id)
+            except Exception:
+                source_path = ""
             ok = set_plugin_category(self._state_manager, item_id, new_path)
         if not ok:
             print(f"WARN [ServiceSelectorDialog] Kategorie-Verschiebung "
                   f"fehlgeschlagen ({node_type} '{item_id}').")
             return
+        if source_path:
+            ensure_folder_path(self._state_manager, group, source_path)
         event_bus.service_set_changed.emit()
 
     @Slot(str, str)

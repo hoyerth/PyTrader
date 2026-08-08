@@ -1077,21 +1077,43 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
           * TYPE_SET    -> Set-Definition (category-Feld) via save_set (E2).
           * TYPE_PLUGIN -> Kategorie-Override (plugin_category_<id>,
                            global_settings – E1).
+        18.01.03 (E3-revidiert, Bugfix 08.08.2026): Der QUELL-Ordner
+        (und seine Elternkette) wird VOR dem Update ermittelt und nach
+        dem Verschieben als Leere-Ordner persistiert
+        (ensure_folder_path) – damit bleibt der Ordner sichtbar und
+        verschiebbar, wenn sein letztes Kind entzogen wurde.
         Danach EventBus-Sync, damit ALLE MasterTree-Instanzen live
         refreshen (Invariante 5).
         """
         from serviceui.master_tree import TYPE_PLUGIN, TYPE_SET
         from serviceui.service_set_utils import (
-            set_plugin_category, set_set_category)
+            ensure_folder_path, set_plugin_category, set_set_category)
+        source_path = ""
+        group = ""
         ok = False
         if node_type == TYPE_SET:
+            group = "sets"
+            try:
+                definition = self.set_repo.get_set(item_id) or {}
+                source_path = str(definition.get("category") or "").strip().strip("/")
+            except Exception:
+                source_path = ""
             ok = set_set_category(self.set_repo, item_id, new_path)
         elif node_type == TYPE_PLUGIN:
+            group = "plugins"
+            model = getattr(self.service_selector, "model", None)
+            if model is not None:
+                try:
+                    source_path = model.plugin_category_path(item_id)
+                except Exception:
+                    source_path = ""
             ok = set_plugin_category(self.state_manager, item_id, new_path)
         if not ok:
             self.log(f"Kategorie-Verschiebung fehlgeschlagen "
                      f"({node_type} '{item_id}').")
             return
+        if source_path:
+            ensure_folder_path(self.state_manager, group, source_path)
         event_bus.service_set_changed.emit()
 
     @Slot(str, str)

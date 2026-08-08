@@ -317,6 +317,13 @@ class MasterTree(QTreeWidget):
         #: Beim Mausklick gemerktes Item – Quelle eines beginnenden Drags
         #: (mousePressEvent -> startDrag).
         self._drag_source: Optional[QTreeWidgetItem] = None
+        # 18.01.03 (Bugfix 08.08.2026): Aufklapp-Zustand ueber Baum-
+        # Neuaufbauten hinweg erhalten. Ein Ordner-/Item-Move oder eine
+        # Ordner-Erstellung triggert data_changed -> _populate(); der Baum
+        # soll dabei NICHT zusammenklappen. Schluessel im RAM:
+        #   ("cat", group, kategorie-pfad) fuer Ordner,
+        #   ("set", set_id)                 fuer Set-Knoten.
+        self._expand_after_rebuild: set = set()
 
         self._populate()
         self.itemSelectionChanged.connect(self._emit_selection)
@@ -331,6 +338,10 @@ class MasterTree(QTreeWidget):
     def _populate(self) -> None:
         """Baut den Baum aus model.build_tree() neu auf (deterministisch)."""
         current = self._safe_current_selection()
+        # 18.01.03 (Bugfix 08.08.2026): Expansion-Zustand VOR dem Neuaufbau
+        # sichern – der Baum soll nach Ordner-Erstellung/-Verschiebung NICHT
+        # zusammenklappen (_collect_expanded_state liest den IST-Baum).
+        expanded = self._collect_expanded_state()
         self.blockSignals(True)
         self.clear()
         try:
@@ -350,6 +361,10 @@ class MasterTree(QTreeWidget):
                 group_item.setExpanded(True)
         except Exception as e:
             print(f"WARN [MasterTree] Baum-Aufbau fehlgeschlagen: {e}")
+        # 18.01.03 (Bugfix 08.08.2026): Expansion unter blockSignals
+        # wiederherstellen (keine Signal-Seiteneffekte; die '>'/'⌄'-Labels
+        # refresht der anschliessende Label-Block explizit).
+        self._apply_expanded_state(expanded)
         self.blockSignals(False)
         # Bugfix 04.08.2026 (Punkt 2/3): unter blockSignals feuern die
         # itemExpanded/itemCollapsed-Signale nicht – die Labels der
@@ -760,10 +775,16 @@ class MasterTree(QTreeWidget):
                     or target_path.startswith(source_path + "/")):
                 event.ignore()
                 return
+            # 18.01.03 (Bugfix 08.08.2026): Ziel-Ordnerkette fuer den
+            # folgenden Refresh zum Aufklappen merken (VOR dem emit).
+            self._mark_expand(source_group, target_path)
             self.folder_moved.emit(source_group, source_path, target_path)
             event.accept()
             return
         if source_type in (TYPE_SET, TYPE_PLUGIN) and source_id:
+            # 18.01.03 (Bugfix 08.08.2026): Ziel-Ordnerkette fuer den
+            # folgenden Refresh zum Aufklappen merken (VOR dem emit).
+            self._mark_expand(target_group, target_path)
             self.folder_item_moved.emit(source_type, source_id, target_path)
         event.accept()
 
@@ -784,6 +805,11 @@ class MasterTree(QTreeWidget):
             return
         parent_path = str(parent_path or "").strip().strip("/")
         full_path = f"{parent_path}/{name}" if parent_path else name
+        # 18.01.03 (Bugfix 08.08.2026): Neuen Ordner (und Elternkette) fuer
+        # den folgenden Refresh zum Aufklappen merken – VOR dem emit, weil
+        # der Orchestrator den EventBus synchron feuert (data_changed ->
+        # _populate).
+        self._mark_expand(str(group), full_path)
         self.create_folder_requested.emit(str(group), full_path)
 
     def _on_rename_folder(self, group: str, old_path: str) -> None:
@@ -806,6 +832,87 @@ class MasterTree(QTreeWidget):
         parts = old_path.split("/")
         new_path = "/".join(parts[:-1] + [new_name])
         self.rename_folder_requested.emit(str(group), old_path, new_path)
+
+    # -------------------------------------------------------------------------
+    # 18.01.03 (Bugfix 08.08.2026): Expansion-Erhaltung ueber _populate()
+    # -------------------------------------------------------------------------
+
+    def _collect_expanded_state(self) -> set:
+        """Sammelt die aufgeklappten Knoten des IST-Baums (RAM-Schluessel).
+
+        Schluessel: ("cat", group, kategorie-pfad) fuer Ordner bzw.
+        ("set", set_id) fuer Set-Knoten. Top-Level-Gruppen (TYPE_GROUP)
+        werden in _populate() ohnehin immer expandiert; Blatt-/Service-
+        Knoten sind nicht aufklappbar. isValid-Guards gegen zerstoerte
+        Items (Access-Violation-Schutz).
+        """
+        result: set = set()
+        try:
+            for item in TreeItemIterator(self):
+                if item is None or not isValid(item):
+                    continue
+                if not item.isExpanded():
+                    continue
+                node_type = item.data(0, ROLE_NODE_TYPE)
+                if node_type == TYPE_CATEGORY:
+                    result.add(("cat", self._group_of(item),
+                                self._category_path_of(item)))
+                elif node_type == TYPE_SET:
+                    result.add(("set",
+                                str(item.data(0, ROLE_SET_ID) or "")))
+        except (RuntimeError, AttributeError):
+            pass
+        return result
+
+    def _apply_expanded_state(self, expanded: set) -> None:
+        """Expandiert die gesammelten Knoten nach dem Neuaufbau wieder.
+
+        Zusaetzlich werden Einmal-Expansionen aus `_expand_after_rebuild`
+        angewandt (Ziel-Ordner nach Drop, neu erzeugter Ordner) und danach
+        geleert. Die '>'/'⌄'-Labels werden explizit aktualisiert (setExpanded
+        unter blockSignals feuert kein itemExpanded).
+        """
+        try:
+            for item in TreeItemIterator(self):
+                if item is None or not isValid(item):
+                    continue
+                node_type = item.data(0, ROLE_NODE_TYPE)
+                expand = False
+                if node_type == TYPE_CATEGORY:
+                    key = ("cat", self._group_of(item),
+                           self._category_path_of(item))
+                    expand = (key in expanded
+                              or key in self._expand_after_rebuild)
+                elif node_type == TYPE_SET:
+                    key = ("set", str(item.data(0, ROLE_SET_ID) or ""))
+                    expand = key in expanded
+                if expand:
+                    item.setExpanded(True)
+        except (RuntimeError, AttributeError):
+            pass
+        self._expand_after_rebuild.clear()
+        # Labels aller aufklappbaren Knoten auf den IST-Zustand bringen.
+        try:
+            for item in TreeItemIterator(self):
+                if item is None or not isValid(item):
+                    continue
+                self._refresh_expand_label(item)
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _mark_expand(self, group: str, path: str) -> None:
+        """Merkt die Ordnerkette von `path` fuer die naechste Expansion.
+
+        Wird VOR dem emit() der Struktur-Signale gerufen (der EventBus-
+        Refresh laeuft synchron waehrend des emit): Beim unmittelbar
+        folgenden _populate() werden diese Pfade (und alle Eltern-Glieder)
+        aufgeklappt, damit z. B. ein neu erzeugter Ordner oder ein
+        Drop-Ziel-Ordner sofort sichtbar bleibt.
+        """
+        parts = [p.strip() for p in str(path or "").split("/") if p.strip()]
+        for i in range(len(parts)):
+            self._expand_after_rebuild.add(
+                ("cat", str(group or ""), "/".join(parts[: i + 1])))
 
     def _attach_item_buttons(self) -> None:
         """Haengt die Info-Buttons (Spalte 1) an alle Service-/Set-/Plugin-
