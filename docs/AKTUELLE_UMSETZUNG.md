@@ -52,8 +52,8 @@
 
 #### Step 1: Status-Message im Filterbereich (`analytics_win.py`)
 
-* [ ] Platziere ein `QLabel` (`label_status_msg`) direkt neben/hinter dem Limit-Input-Feld (`spin_limit`).
-* [ ] Verbinde den Event-Handler für `view_model.data_ready(kind, data)`:
+* [x] Platziere ein `QLabel` (`label_status_msg`) direkt neben/hinter dem Limit-Input-Feld (`spin_limit`).
+* [x] Verbinde den Event-Handler für `view_model.data_ready(kind, data)`:
 * Falls `data.get("total", 0) == 0`:
 * Setze `label_status_msg.setText("⚠️ Keine Daten vorhanden")` (Farbton: dezent gelb/orange).
 * Blende leere Zustände auf den Unterseiten (`table_page`, `heatmap_page`, `scatter_page`, `distribution_page`) sauber aus/zurück.
@@ -63,7 +63,7 @@
 
 #### Step 2: Multi-Service Spaltenaufbereitung (`table_page.py`)
 
-* [ ] Erweitere das Layout der `TablePage`:
+* [x] Erweitere das Layout der `TablePage`:
 1. Füge als **Spalte 1** das Feld **`Service`** ein (Anzeige der `feature_id` bzw. des via `service_selector_model.resolve_display_names()` aufgelösten Namens).
 2. Standard-Spaltenreihenfolge festlegen: `[Zeitstempel, Service, ema_diff, rsi_14, atr_normalized, ...]`.
 3. Bei Zusatzfeldern aus `feature_data`: Bilde die Union aller JSON-Keys über die geladenen Rows; fülle fehlende Werte bei abweichenden Services mit `"-"`.
@@ -71,10 +71,10 @@
 
 #### Step 3: Quality Gate & Verifikation
 
-* [ ] Syntax-Check via Terminal ausführen:
+* [x] Syntax-Check via Terminal ausführen:
 `python -m py_compile analytics/ui/analytics_win.py analytics/ui/table_page.py analytics/engine/analytics_view_model.py`
 
-* [ ] Headless-Test in `test/test.py` für `AnalyticsViewModel`-Abfragen ausführen:
+* [x] Headless-Test in `test/test.py` für `AnalyticsViewModel`-Abfragen ausführen:
 * Testfall A: Abfrage für ungescannte Symbole/Services liefert `total == 0`.
 * Testfall B: Multi-`feature_ids`-Abfrage liefert gemischte Ergebnissätze.
 
@@ -163,7 +163,71 @@
 
 ### Status
 
-* **Kein Coding umgesetzt** – ausschließlich Doku-Audit (Konsistenz/Vollständigkeit)
-  und Entscheidungsfindung. Die Umsetzung (Steps 1–3 des Kapitels 19.01) wartet auf
-  den expliziten Startbefehl des Anwenders.
+* **Umsetzung abgeschlossen (08.08.2026, Implementierungs-Log unten).**
+
+---
+
+## Implementierungs-Log 19.01 (08.08.2026 16:35) – Status-Feedback, Empty-State & Multi-Service Table
+
+Umgesetzt (alle Checklisten-Punkte des Kapitels abgearbeitet; Entscheidungen E1–E5
+des Prüfprotokolls 19.01 als verbindliche Spezifikation):
+
+### Step 1 – Status-Message im Filterbereich (`analytics/engine/analytics_win.py`)
+
+* `label_status_msg` (QLabel, dezent orange `#b7950b`, fett) direkt hinter dem
+  Limit-Feld (`edit_limit`) in der Filter-Zeile eingebaut.
+* `_on_data_ready(kind, data)`-Handler verbunden (`vm.data_ready` in
+  `_wire_view_model`): wertet ausschließlich `QUERY_TABLE` aus (E1, kein
+  zusätzlicher COUNT-Query). `total == 0` → `"⚠️ Keine Daten vorhanden"`,
+  `total > 0` → `"✅ {n} Einträge"` (LIMIT-gekappte Zeilenzahl, L5).
+* Empty-States der Unterseiten (Overlay-Stacks) waren bereits vorhanden (E5) –
+  unverändert gelassen.
+
+### Step 2 – Multi-Service Spaltenaufbereitung (`analytics/ui/table_page.py`)
+
+* **Spalte 1 = Service** (E3): Injizierbarer `name_resolver` (Default = feature_id
+  selbst); das AnalyticsWindow verknüpft `ServiceSelectorModel.resolve_display_names`
+  IoC-konform (kein SQL, keine Modell-Kopplung in der Page).
+* Standard-Spaltenreihenfolge `[Zeit (Wanduhr), Service, ema_diff, rsi_14,
+  atr_normalized, ...JSON-Union-Keys alphabetisch]`; dynamischer Spaltenaufbau
+  pro Abfrage.
+* **JSON-Union** (E4): Vereinigung aller `feature_data`-Keys über die geladenen
+  Rows; Kollisionen mit Basis-/nativen Spalten ignoriert; fehlende Werte → `"-"`.
+* **Chronologisch ABSTEIGEND** (E2): `_populate()` sortiert die Rows deterministisch
+  (stabil) nach `bar_time`; `setSortingEnabled(False)` bleibt dauerhaft deaktiviert
+  (Service-Mischung korrekt, kein O(n^2)-Interaktions-Sort). `FeatureStoreReader`
+  unverändert (ASC-Vertrag, L4).
+* `_on_double_clicked` (Jump-to-Chart) liest Symbol/TF/Zeit jetzt aus der Roh-Row
+  (`_current_rows`) statt aus festen Spaltenpositionen (dynamische Spalten).
+
+### Step 3 – Quality Gate & Verifikation (headless, kein UI)
+
+* `python -m py_compile analytics/ui/analytics_win.py analytics/ui/table_page.py
+  analytics/engine/analytics_view_model.py` → **PASS** (exit 0).
+* `test/test.py` (Teil 31, neu): 11 Prüfungen **PASS** –
+  * Testfall A (`31 A1`): ungescanntes Symbol → `total == 0`.
+  * Testfall B (`31 B1–B3`): Multi-`feature_ids` → 4 gemischte Rows
+    (`srv_a`+`srv_b`), Einzel-Filter `srv_a` → nur 2 srv_a-Rows.
+  * TablePage (`31 C1–C5`): absteigende Sortierung, Spalte-1-Anzeigename,
+    JSON-Union-Spalten (`grid_step`, `lookback`, `schema_version`),
+    Fehlwert `"-"` bei abweichendem Service.
+* Gesamtlauf `test/test.py`: **559 PASS / 6 FAIL** – die 6 Fehler sind die
+  dokumentierten **Baseline-Vorbefunde** P2/P5/H3/H4/H5/H7 (Geometrie-Tests,
+  offscreen `800x582`, Reflow-/Scrollbar-Umbau 07./08.08.2026) – nicht durch
+  19.01 verursacht, ohne 19.01-Änderungen identisch.
+* Test-Workspace aufgeräumt (Invariante 10): nur `test/test.py` verbleibt.
+
+### Abweichungen vom Plan-Kapitel (per Prüfprotokoll-Entscheidungen)
+
+* Plan-Punkt „Spalte 1 = `feature_id`/`display_name`" → E3: injizierter
+  `name_resolver` statt direkter Modell-Referenz.
+* Plan-Punkt „chronologisch absteigende Sortierung" → E2: Sortierung in der Page
+  (Reader-Sortierung bleibt ASC, L4).
+* Plan-Punkt „Farbton dezent gelb/orange" → E1: `#b7950b` (QSS auf
+  `label_status_msg`).
+
+### Status
+
+* **Alle Steps 1–3 abgeschlossen und headless verifiziert.** Keine UI-/Regressionstests
+  ausgeführt (Regel 4); Baseline-Vorbefunde P2/P5/H3/H4/H5/H7 sind dokumentiert.
 

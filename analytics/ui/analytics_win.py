@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
 )
 
 from analytics.engine.analytics_view_model import AnalyticsViewModel
+from analytics.engine.analytics_worker import QUERY_TABLE
 from analytics.engine.service_selector_model import ServiceSelectorModel
 from analytics.ui.table_page import TablePage
 from analytics.ui.heatmap_page import HeatmapPage
@@ -283,6 +284,14 @@ class AnalyticsWindow(PersistentWindow):
         filt.addWidget(self.btn_data_sources)
         filt.addWidget(QLabel("Limit:"))
         filt.addWidget(self.edit_limit)
+        # 19.01 (Step 1): Status-Message direkt hinter dem Limit-Feld –
+        # zeigt den Ergebnistext der Tabellen-Abfrage (total == 0 ->
+        # "⚠️ Keine Daten vorhanden", sonst "✅ n Einträge"; E1). Dezent
+        # orange, damit der Hinweis auffaellt, aber nicht stoert.
+        self.label_status_msg = QLabel("")
+        self.label_status_msg.setStyleSheet(
+            "color: #b7950b; font-weight: bold;")
+        filt.addWidget(self.label_status_msg)
         filt.addStretch(1)
         root.addLayout(filt)
 
@@ -404,6 +413,13 @@ class AnalyticsWindow(PersistentWindow):
         vm.dirty_changed.connect(self._on_dirty_changed)
         vm.busy_changed.connect(self._on_busy_changed)
         vm.query_failed.connect(self._on_query_failed)
+        # 19.01 (Step 1): Status-Text bei Tabellen-Abfragen (total == 0 ->
+        # "Keine Daten vorhanden", E1). Nur QUERY_TABLE wird ausgewertet.
+        vm.data_ready.connect(self._on_data_ready)
+        # 19.01 (E3): Service-Namensaufloesung fuer die TablePage (IoC) –
+        # kein SQL / keine direkte Modell-Kopplung in der Page.
+        self.table_page.set_name_resolver(
+            self._selector_model.resolve_display_names)
 
         # Jump-to-Chart (Variante 2): open_chart_at_bar + Aufloesung
         self.table_page.set_navigation_handler(self._open_chart_at_bar)
@@ -576,6 +592,27 @@ class AnalyticsWindow(PersistentWindow):
     @Slot(str, str)
     def _on_query_failed(self, kind: str, error: str) -> None:
         print(f"WARN [AnalyticsWindow] Abfrage '{kind}' fehlgeschlagen: {error}")
+
+    @Slot(str, dict)
+    def _on_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
+        """Status-Text der Tabellen-Abfrage (19.01 Step 1).
+
+        Zeigt den Ergebnisstatus NUR fuer QUERY_TABLE (total aus dem
+        Repository = LIMIT-gekappte Zeilenzahl, E1). total == 0 ->
+        "Keine Daten vorhanden" (dezent orange), sonst "n Eintraege".
+        Leere Zustaende der Unterseiten (Overlay-Stacks) schalten die
+        Pages bereits selbst um (E5) – dieser Text ist ergaenzend.
+        """
+        if kind != QUERY_TABLE:
+            return
+        try:
+            total = int(data.get("total") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        if total == 0:
+            self.label_status_msg.setText("⚠️ Keine Daten vorhanden")
+        else:
+            self.label_status_msg.setText(f"✅ {total} Einträge")
 
     @Slot(bool)
     def _on_busy_changed(self, busy: bool) -> None:
