@@ -479,3 +479,227 @@ Umgesetzt (Checklisten-Step 1–5 abgearbeitet; Entscheidungen D1–D6 des Prüf
   ausgeführt (Regel 4); Baseline-Vorbefunde P2/P5/H3/H4/H5/H7 sind unverändert
   dokumentiert.
 
+---
+
+# 19.03 Table Page Enhancements: Resizing, In-Memory Sorting & Profil-Persistenz
+
+## 1. Regeln & Invarianten
+* **Einrückung:** Exakt **4 Leerzeichen** (Codebase-Standard)[cite: 1, 3].
+* **Spacing:** Exakt **1 Leerzeile** zwischen Methoden/Funktionen[cite: 1, 3].
+* **UI-Tests:** **STRIKT VERBOTEN** (Prüfung rein headless via `py_compile` & `test/test.py`)[cite: 1, 3].
+* **Architektur:** MVVM, In-Memory-Sortierung (Variante A – kein Backend-Re-Query), Profil-Persistenz via `AnalyticsViewModel` (Option B – Explicit Save)[cite: 1, 3].
+
+---
+
+## 2. Architektur & Datenfluss (Textblock-Schema)
+```text
+[TablePage User-Interaktion] ──(Breite / Höhe / Sortierung)──► [AnalyticsWindow / ViewModel]
+        │                                                              │
+        ├── In-Memory-Sortierung (Qt native setSortingEnabled)        ├── mark_dirty() -> "*"
+        └── Anwenden aus Profil ◄── [AnalyticsProfile.payload] ───────┴── [💾 Save] (column_widths/sort)
+
+```
+
+---
+
+## 3. Schritt-für-Schritt Anleitung (IDE-AI)
+
+### Step 1: Interaktives Resizing & In-Memory-Sortierung (`table_page.py`)
+
+* [ ] In `TablePage.__init__()` / Tabellen-Setup:
+* Interaktive Spalten- und Zeilenanpassung aktivieren:
+`self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)`
+`self.table.verticalHeader().setSectionResizeMode(QHeaderView.Interactive)`
+* In-Memory-Sortierung aktivieren:
+`self.table.setSortingEnabled(True)`
+
+* [ ] Bei Signalen `sectionResized` (Horizontal/Vertical Header) sowie `sortIndicatorChanged` ein UI-Change-Signal an `AnalyticsWindow` emittieren.
+
+### Step 2: ViewModel & Profil-Payload Erweiterung (`analytics_win.py` & `analytics_view_model.py`)
+
+* [ ] `AnalyticsViewModel` um Methoden zur Aufnahme von Tabelleneinstellungen erweitern:
+* Param-Keys in `self._params`: `table_column_widths` (Dict), `table_row_height` (int), `table_sort_column` (int), `table_sort_order` (int).
+* Ändern dieser Parameter markiert das ViewModel als dirty (`_mark_dirty()`) -> setzt `*`-Flag in der Profil-UI.
+* [ ] In `AnalyticsProfileRepository`:
+* Der Payload speichert die neuen Tabellen-Keys additiv unter Beibehaltung von `schema_version: 1`.
+
+### Step 3: Wiederherstellung beim Profil-Laden (`analytics_win.py` -> `table_page.py`)
+
+* [ ] Bei `active_profile_changed` / Data-Ready:
+* Reiche die Tabelleneinstellungen an `TablePage` weiter.
+* Wende Spaltenbreiten an: `self.table.setColumnWidth(col, width)`.
+* Wende Zeilenhöhe an: `self.table.verticalHeader().setDefaultSectionSize(height)`.
+* Wende Sortierung an: `self.table.sortItems(sort_col, sort_order)` (Signale während der Wiederherstellung blockieren, um kein unbeabsichtigtes Dirty-Flag auszulösen).
+
+### Step 4: Quality Gate & Verifikation
+
+* [ ] Terminal-Syntax-Check ausführen:
+`python -m py_compile analytics/ui/table_page.py analytics/ui/analytics_win.py analytics/engine/analytics_view_model.py analytics_profile_repository.py`
+
+* [ ] Headless-Test in `test/test.py` für Profil-Payload-Persistenz der neuen Tabellenschlüssel durchführen.
+* [ ] Code-Check: Exakt 4 Leerzeichen Einrückung, 1 Leerzeile Abstand.
+
+---
+
+## Prüfprotokoll 19.03 (08.08.2026) – Konsistenz, Vollständigkeit & Entscheidungen
+
+### Konsistenz-Prüfung
+
+* **MVVM-Invariante 4 erfüllt:** TablePage emittiert nur Signale (`sectionResized`,
+  `sortIndicatorChanged`), kein SQL, kein direkter Modell-Zugriff. Das AnalyticsWindow
+  orchestriert (Signale → VM-Setter); Persistenz läuft über `AnalyticsViewModel`/
+  `AnalyticsProfileRepository` (Option B – Explicit Save). Konsistent.
+* **Profil-Payload additiv ohne Schema-Bruch:** `_current_payload()` (ViewModel) baut
+  den Payload aus `dict(self._params)` + `schema_version`; `AnalyticsProfileRepository.
+  _ensure_schema_version()` setzt `schema_version` additiv auf `1`. Neue Tabellen-Keys
+  sind einfache zusätzliche Dict-Einträge → **`analytics_profile_repository.py` benötigt
+  KEINE Änderung** (Payload ist offenes JSON). `py_compile` darauf ist unschädlich, die
+  Datei ist aber nicht betroffen.
+* **`_apply_profile()` übernimmt neue Keys automatisch:** Sie iteriert über
+  `self._params.keys()` und übernimmt jeden im Payload vorhandenen Key → die vier neuen
+  Param-Keys werden beim Profil-Laden in den ViewModel übernommen, ohne Änderung an
+  `_apply_profile`.
+* **`active_profile_changed`-Signal existiert:** Wird vom AnalyticsWindow bereits in
+  `_on_active_profile_changed` behandelt (Name/Beschreibung, feature_ids-Re-Resolution,
+  Limit-Sync) – Anschluss für die Tabellen-Settings-Anwendung ist vorhanden.
+* **Qt-APIs verfügbar:** `QHeaderView.Interactive`, `setSectionResizeMode`,
+  `setSortingEnabled`, `sortItems`, `sortIndicatorChanged` (auf `horizontalHeader()`),
+  `setDefaultSectionSize` – alle Standard-PySide6-APIs, kein Konflikt.
+* **19.01-E2-Kompatibilität:** 19.01 deaktivierte die Interaktions-Sortierung
+  (`setSortingEnabled(False)`) zugunsten einer deterministischen absteigenden
+  Anzeige. 19.03 aktiviert sie (True) als **User-Feature** – der 19.01-Vertrag
+  (Page sortiert `_current_rows` deterministisch absteigend nach bar_time) bleibt für
+  die **Roh-Liste** unverändert; die **Anzeige** darf der User zusätzlich umsortieren.
+  Initial-/Default-Sortierung bleibt Zeit absteigend. Kein harter Widerspruch, aber
+  eine bewusste Weiterentwicklung (siehe E3/E4).
+* **MVVM-Datenfluss für die Anwendung:** Statt eines zusätzlichen Window-Rundwegs
+  liest die TablePage die Settings in `_populate` direkt aus `self._view_model.params`
+  (MVVM-konform, Spalten existieren zu diesem Zeitpunkt). Das Window verbindet nur die
+  UI-Change-Signale (Step 1) mit den neuen VM-Settern – Abweichung vom Step-3-Wortlaut
+  (siehe E1).
+
+### Vollständigkeit (Ist-Zustand vs. Kapitel)
+
+| Step | Anforderung | Ist-Zustand |
+|---|---|---|
+| 1 | `horizontalHeader().setSectionResizeMode(Interactive)` | **OFFEN** – Header wird mit `QHeaderView.Fixed` + fixen Breiten aufgebaut (`_BASE_COLUMNS`/`_EXTRA_COLUMN_WIDTH`) |
+| 1 | `verticalHeader().setSectionResizeMode(Interactive)` | **OFFEN** – nicht gesetzt |
+| 1 | `setSortingEnabled(True)` | **OFFEN** – 19.01 setzt explizit `False` |
+| 1 | UI-Change-Signal bei `sectionResized`/`sortIndicatorChanged` an AnalyticsWindow | **OFFEN** – kein Signal auf der Page |
+| 2 | VM-Param-Keys `table_column_widths`/`table_row_height`/`table_sort_column`/`table_sort_order` | **OFFEN** – nicht in `_params` |
+| 2 | Dirty-Flag bei Änderung | **OFFEN** – kein Setter vorhanden |
+| 2 | Payload speichert additiv, `schema_version: 1` | **BEREITS ERFÜLLT** – Payload ist offenes JSON, `schema_version` bleibt `1`; Repository unverändert |
+| 3 | Settings an TablePage weiterreichen | **OFFEN** – kein `apply_*`-Mechanismus; `_populate` setzt Breiten fix zurück |
+| 3 | `setColumnWidth`/`setDefaultSectionSize`/`sortItems` anwenden | **OFFEN** |
+| 3 | Signale während Wiederherstellung blockieren | **OFFEN** – nicht implementiert |
+| 4 | `py_compile` der 4 Dateien | **OFFEN** – folgt mit der Umsetzung |
+| 4 | Headless-Test Profil-Payload-Persistenz | **OFFEN** – keine 19.03-Testfälle |
+| 4 | 4 Leerzeichen / 1 Leerzeile | **N.A.** – folgt mit der Umsetzung |
+
+### Befunde (Lücken)
+
+* **L1 – Numerische Sortierung der Zeitspalte fehlt im Plan:** QTableWidget sortiert
+  standardmäßig nach `QTableWidgetItem.__lt__` (= `text()`-Vergleich). Das Zeitformat
+  `"Fr 31.07.26 00:01"` ist lexikografisch **nicht** chronologisch → eine reine
+  `setSortingEnabled(True)`-Aktivierung würde die Zeitspalte falsch sortieren.
+* **L2 – `_populate` überschreibt Spaltenbreiten fix:** Aktuell setzt `_populate` bei
+  jedem Daten-Update alle Breiten auf `_BASE_COLUMNS`-Werte bzw. `_EXTRA_COLUMN_WIDTH`.
+  User-Anpassungen gingen bei jedem TF-/Daten-Wechsel verloren.
+* **L3 – Signale feuern auch programmatisch:** `sectionResized` feuert bei jedem
+  `setColumnWidth` (u. a. in `_populate`), `sortIndicatorChanged` bei `sortItems`/
+  `setSortingEnabled`. Ohne `blockSignals` würde bereits das Befüllen das Dirty-Flag
+  setzen. Das Kapitel nennt blockieren nur für die Wiederherstellung (Step 3), nicht
+  für das reguläre `_populate`.
+* **L4 – `setSortingEnabled` während des Befüllens:** Bei aktivem
+  `setSortingEnabled(True)` sortiert QTableWidget bei **jedem** `setItem` neu (O(n²)).
+  Für 5000 Zeilen ungeeignet → während des Befüllens deaktivieren, danach reaktivieren
+  + `sortItems` (Default: Zeit absteigend bzw. gespeicherte Settings).
+* **L5 – `table_column_widths`-Schlüssel unbestimmt:** Index-basierte Schlüssel
+  brechen bei der dynamischen JSON-Union (Spaltenanzahl variiert pro Datenlage).
+* **L6 – Kein Query-Refresh bei Tabellen-Settings:** `_set_param` ruft `_refresh(kinds)`
+  auf; Tabellen-Settings sind reine UI-Zustände ohne DB-Abfrage → eigener Setter, der
+  **nur** `_mark_dirty()` ausführt (kein Debounce/Worker).
+* **L7 – Jump-to-Chart-Row-Mapping bricht bei Sortierung:** `_on_double_clicked`
+  nutzt `item.row()` als Index in `_current_rows`. Bei aktiver QTableWidget-Sortierung
+  entspricht die Anzeige-Zeile nicht mehr der Einfüge-Reihenfolge → falsche Roh-Row bei
+  Doppelklick (Jump-to-Chart-Fehler).
+* **L8 – Sortier-Index bei dynamischen Spalten:** `table_sort_column` (int) kann nach
+  TF-Wechsel (andere Union-Spalten) eine andere Spalte treffen; Index muss beim Anwenden
+  validiert werden (Fallback: Spalte 0 absteigend). Zeit (0)/Service (1) sind fix.
+* **L9 – Zeilenhöhe ist Default-Section-Size:** `verticalHeader().setSectionResizeMode
+  (Interactive)` erlaubt Einzel-Zeilenhöhen; persistiert wird aber nur ein
+  `table_row_height`-Wert (Default für alle Zeilen) – konsistent mit dem Kapitel, aber
+  als Begrenzung zu dokumentieren.
+
+### Entscheidungen (19.03)
+
+1. **E1 – Anwendung der Settings in `_populate` (MVVM):** Die TablePage liest die
+   Settings in `_populate` aus `self._view_model.params` (nach dem Spaltenaufbau) und
+   wendet sie an. Damit deckt ein einziger Pfad ab: Profilwechsel (`active_profile_changed`
+   → `_apply_profile` → `refresh_all` → `data_ready` → `_populate`) UND TF-/Datenwechsel.
+   Das AnalyticsWindow verbindet nur die UI-Change-Signale mit den VM-Settern
+   (Abweichung vom Step-3-Wortlaut „Window reicht explizit weiter" – funktional
+   äquivalent, minimal-invasiv, kein zusätzlicher Window-Rundweg).
+2. **E2 – Numerische Sortierung der Zeitspalte (L1):** Neue `QTableWidgetItem`-Subklasse
+   (z. B. `_SortableTimeItem`) mit überschriebenem `__lt__`, das `data(Qt.UserRole)`
+   (Epoch, wird bereits gesetzt) numerisch vergleicht; Fallback auf `super().__lt__`.
+   Nur die Zeitspalte nutzt diese Klasse; Service-/JSON-Spalten bleiben Text-Sortierung.
+3. **E3 – Sortier-Kontrakt (L1/L4, Abweichung 19.01-E2):** `setSortingEnabled(True)`
+   wird **nach** dem Befüllen aktiviert (während `_populate` deaktiviert, O(n²)-Schutz).
+   `_current_rows` bleibt die deterministisch absteigend sortierte Roh-Liste (19.01-E2
+   unverändert für Rohdaten/Jump-to-Chart-Basis); die Anzeige sortiert der User über
+   Header-Klicks. Default nach Daten-Update: gespeicherte Settings bzw. Spalte 0
+   (Zeit) absteigend.
+4. **E4 – Signale nur bei User-Interaktion (L3):** Während `_populate` und während der
+   Settings-Anwendung werden `horizontalHeader()`/`verticalHeader()` (und die Tabelle)
+   mit `blockSignals(True/False)` geschützt; das UI-Change-Signal emittiert nur aus den
+   verbundenen Header-Signalen bei echter User-Aktion.
+5. **E5 – `table_column_widths`-Schlüssel = Spaltenname (L5):** Dict `{Header-Text:
+   Breite}`; beim Anwenden wird für jede aktuelle Spalte der Name aufgelöst (fehlende
+   neue Union-Spalten → `_EXTRA_COLUMN_WIDTH`). Robust gegenüber dynamischer
+   JSON-Union. `table_sort_column` bleibt Index (Qt-Konvention, E8).
+6. **E6 – Eigene VM-Setter ohne Query-Refresh (L6):** Neue Methode
+   `set_table_settings(widths: Dict[str, int], row_height: int, sort_column: int,
+   sort_order: int)` – setzt alle vier `_params`-Keys, markiert genau einmal `_mark_dirty()`
+   und ruft KEIN `_refresh(...)` auf (kein Debounce, kein Worker, keine DB-Abfrage).
+   Typ-/Werte-Normalisierung (Dict[str,int], non-negative ints, SortOrder 0/1).
+7. **E7 – Jump-to-Chart-Row-Mapping über UserRole (L7):** Das Zeit-Item jeder Zeile
+   trägt zusätzlich den `_current_rows`-Einfüge-Index als zweite UserRole
+   (z. B. `Qt.UserRole + 1`). `_on_double_clicked` löst über
+   `self._table.item(item.row(), _COL_TIME).data(Qt.UserRole + 1)` die Roh-Row auf –
+   unabhängig von der Anzeige-Sortierung.
+8. **E8 – Sortier-Index-Validierung (L8):** Beim Anwenden wird `table_sort_column` auf
+   `0 <= idx < columnCount()` geprüft (Fallback: 0) und `table_sort_order` auf
+   `Qt.AscendingOrder`/`Qt.DescendingOrder` geklemmt. Zeit (0)/Service (1) sind fixe
+   Indizes – die Haupt-Sortierfälle bleiben stabil.
+9. **E9 – Zeilenhöhe als Default-Section-Size (L9):** `table_row_height` wird via
+   `verticalHeader().setDefaultSectionSize()` angewandt (ein Wert für alle Zeilen);
+   individuell gezogene Zeilenhöhen werden nicht persistiert (Kapitel-Konsistenz).
+10. **E10 – `analytics_profile_repository.py` unverändert:** Payload ist offenes JSON,
+    `schema_version: 1` bleibt (bereits erfüllt). Die Datei steht nur im `py_compile`-
+    Schritt (Kapitel-Text), nicht im Diff. „Betroffene Dateien": `table_page.py`,
+    `analytics_win.py`, `analytics_view_model.py` (+ `test/test.py` für Teil 33).
+
+### Testplan (Step 4, headless – mit Umsetzung)
+
+* `py_compile` der 3 Produktivdateien (`table_page.py`, `analytics_win.py`,
+  `analytics_view_model.py`) + `analytics_profile_repository.py` (Kapitel-Text, E10).
+* `test/test.py` **Teil 33** (neu):
+  * Repo-Roundtrip: Profil mit den 4 Tabellen-Keys speichern/laden; `schema_version`
+    bleibt `1` (additiv, E10).
+  * VM: `set_table_settings` setzt `_params`-Keys, setzt `dirty_changed`, löst **keinen**
+    Query/Worker aus (E6); `_apply_profile` übernimmt die Keys (Payload-Roundtrip).
+  * TablePage: `_populate` mit Settings (Breiten aus `table_column_widths`,
+    `setDefaultSectionSize`, `sortItems`) und `blockSignals`-Verhalten (E4).
+  * Numerische Sortierung der Zeitspalte (E2): Anzeige nach Epoch absteigend korrekt.
+  * Jump-to-Chart-Row-Mapping nach User-Sortierung (E7): Doppelklick trifft die richtige
+    Roh-Row (Regression zu 19.01-C1/C2 und 32-D2).
+  * Baseline-Vorbefunde P2/P5/H3/H4/H5/H7 bleiben unverändert (offscreen-Geometrie).
+* Code-Check: 4 Leerzeichen / 1 Leerzeile.
+
+### Status
+
+* **Analyse abgeschlossen (Konsistenz, Vollständigkeit, E1–E10 dokumentiert).**
+  **Kein Code umgesetzt** – Umsetzung wartet auf den ausdrücklichen Startbefehl des
+  Anwenders (Steps 1–4 offen, Checklisten oben).
+
