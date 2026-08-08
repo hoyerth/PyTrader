@@ -288,3 +288,64 @@ Umgesetzt in Commit `f300176` (phase18_step3).
   schlagen weiterhin in der Baseline fehl (offscreen `800x582`, Reflow-/Scrollbar-
   Umbau 07./08.08.2026) – nicht durch E3-revidiert verursacht. Separater Bugfix
   nur auf Wunsch.
+
+
+---
+
+## Implementierungs-Log 18.01.03 (08.08.2026 14:03) – Bugfix-Runde: Leere-Ordner-Erhaltung, Baum-Expansion, Picker-Crash & fixe Fensterhöhe
+
+**Bugfixing-Modus (User-Anweisungen vom 08.08.2026, nachmittags):**
+1. Leere Ordner dürfen beim Herausziehen des letzten Services NICHT verschwinden
+   (Ordner bleibt sichtbar und selbst verschiebbar).
+2. Ordner dürfen nur gelöscht werden, wenn sie leer sind (bereits umgesetzt).
+3. Baum soll nach Ordner-Erstellung/-Verschieben nicht zusammenklappen.
+4. Canvas-/Fensterhöhe ist nicht fix bei Klicks auf Sets/Set-Services.
+5. Service-Picker startet nicht (`AttributeError: setSizeConstraint`).
+
+Umgesetzt in den Commits `ed8f4f0` (Punkte 1–3) und `17c6a86` (Punkte 4–5).
+
+### Punkte 1–3 – Leere-Ordner-Erhaltung & Baum-Expansion (`ed8f4f0`)
+* `serviceui/service_set_utils.py`:
+  * `ensure_folder_path(state_manager, group, path)` – persistiert die
+    Ordnerkette idempotent (global_settings `tree_folders_<group>`); wird nach
+    Struktur-Änderungen gerufen, damit der Quell-Ordner auch ohne persistierten
+    Leere-Ordner-Eintrag sichtbar bleibt.
+  * `rename_category(...)` sichert zusätzlich den Quell-Ordner (idempotent).
+* `serviceui/master_tree.py`:
+  * `_collect_expanded_state()` / `_apply_expanded_state()` – Aufklapp-Zustand
+    über `_populate()` hinweg erhalten (RAM-Keys `("cat", group, pfad)` /
+    `("set", set_id)`).
+  * `_mark_expand(group, path)` – wird VOR dem emit der Struktur-Signale gerufen
+    (EventBus-Refresh läuft synchron) und klappt Ziel-Ordnerkette nach Drop sowie
+    neu erzeugte Ordner auf; `_expand_after_rebuild` wird nach Anwendung geleert.
+  * `_build_category_item` rendert leere Ordner ohne `>`-Symbol
+    (`bool(child.get("children"))`).
+* `serviceui/service_win.py` + `service_selector_dialog.py`: `_on_folder_item_moved`
+  ermittelt den Quell-Pfad VOR dem Update (Set: `definition.category`, Plugin:
+  `plugin_category_path`) und persistiert ihn via `ensure_folder_path` – der
+  Ordner bleibt nach dem Entzug des letzten Kindes sichtbar und verschiebbar.
+* Validierung: Teil 28 (neu) 16/16 PASS; Teile 26+27 unverändert PASS.
+
+### Punkte 4–5 – Picker-Crash & fixe Fensterhöhe (`17c6a86`)
+* `serviceui/service_selector_dialog.py`: `self.setSizeConstraint(...)` war ein
+  QLayout-Aufruf auf dem QDialog (existiert nicht → AttributeError beim Öffnen
+  des Pickers). Fix: Constraint wird auf dem root-Layout gesetzt
+  (`root.setSizeConstraint(QLayout.SetNoConstraint)`) – der Picker startet
+  wieder und hält seine Fensterhöhe FIX (ScrollArea zeigt bei Überhöhe
+  Scrollbalken).
+* `serviceui/param_columns.py`: `_build_service_columns` rief `self._reflow()`
+  → der volle Reflow (`_schedule_reflow` → `_apply_reflow_size` →
+  `_exact_fit_to_content`) passte bei JEDEM Set-/Service-Klick die Fensterhöhe
+  an die Spaltenhöhe an (Canvas-/Fensterhöhe versetzte sich). Fix: nur noch
+  Box-only-Reflow (`QTimer` → `_resize_param_box_deferred`, Muster
+  `_apply_conditional_visibility`/`_setup_collapsible` vom 07.08.2026) – die
+  Service-Parameter-Box folgt ihrer Layout-Größe, Fenster-/Canvas-Höhe bleibt
+  stabil. Der initiale Fensteraufbau (show → `_apply_reflow_size`) bleibt
+  unverändert.
+* Validierung: Teil 29 (neu) 5/5 PASS (Picker-Konstruktion ohne Crash +
+  SetNoConstraint auf dem root-Layout; Duck-Typ-Host ohne `_schedule_reflow`
+  belegt: `_build_service_columns` löst keinen Fenster-Reflow mehr aus).
+  Teile 26–28 unverändert PASS. `py_compile` auf allen Dateien OK.
+* **Hinweis (vorbestehend, unverändert):** Geometrie-Tests P2/P5/H3/H4/H5/H7
+  schlagen weiterhin in der Baseline fehl (offscreen `800x582`). Separater
+  Bugfix nur auf Wunsch.
