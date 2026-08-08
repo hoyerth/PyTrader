@@ -34,6 +34,7 @@ PyTrader/
             service_selector_model.py
             service_set_repository.py
             set_evaluator.py
+            tree_builder.py
         features/
             __init__.py
             base_feature.py
@@ -100,6 +101,17 @@ PyTrader/
     data/
         analytics.duckdb.tmp/
         custom_plugins/
+    data_sync/
+        __init__.py
+        mt5_sync_service.py
+    db/
+        __init__.py
+        db_pool.py
+        db_utils.py
+        schema_initializer.py
+    repositories/
+        __init__.py
+        market_data_repository.py
     serviceui/
         __init__.py
         master_tree.py
@@ -116,10 +128,16 @@ PyTrader/
     test/
         test.py
     ui/
+        __init__.py
         chart_win.ui
         main_win.ui
         service_win.ui
         statistic_win.ui
+        window_manager.py
+    workers/
+        __init__.py
+        data_sync_worker.py
+        live_tick_worker.py
 ```
 
 ## 2. QUELLCODE
@@ -759,663 +777,61 @@ Jedes Refactoring und jede Code-Generierung muss strikt folgenden Prinzipien ent
 ```py
 # db_service.py
 """
-db_service.py - MT5 Sync Service for PyTrader mit globaler Thread-Sperre, TIMESTAMPTZ & Native Upsert (INSERT OR REPLACE)
+db_service.py - FASSADE (Re-Export-Wrapper), seit 18.01.02 (E2/E3).
+
+Diese Datei enthaelt KEINE Logik mehr – die Implementierung wurde im Rahmen
+von 18.01.02 (Refactoring & Modularisierung) auf folgende Module aufgeteilt:
+
+  * db/db_pool.py                    – DATA_DIR, DB_*-Pfad-Konstanten, DbPool,
+                                       _LockedConnection, db_connect, with_db_lock
+  * db/db_utils.py                   – _parse_json_field, _ensure_epoch
+  * db/schema_initializer.py         – check_and_init_databases
+  * data_sync/mt5_sync_service.py    – SYMBOLS, _TIMEFRAMES_CACHE, get_timeframes,
+                                       TF_SECONDS_MAP, MT5_LOCK, check_mt5_connection,
+                                       get_latest_timestamp, sync_market_data
+  * repositories/market_data_repository.py – MarketDataRepository, get_symbol_precision
+
+Die Bestands-Caller (20 Dateien, u. a. chart_win, state_manager, symbol_repository,
+analytics_profile_repository, service_selector_model) importieren weiterhin
+unveraendert aus `db_service` (E2). Der CLI-Einstieg `python db_service.py`
+(fuehrt den MT5-Sync aus) bleibt erhalten.
 """
 
-import json
-import os
-import threading
-import time
-from datetime import datetime, timezone
-from typing import Set, Tuple, Optional, List, Dict, Any
-import duckdb
-import pandas as pd
-
-# ==============================================================================
-# CONFIGURATION & THREAD SAFETY
-# ==============================================================================
-DATA_DIR = "data"
-DB_MARKET_DATA = os.path.join(DATA_DIR, "market_data.duckdb")
-DB_ANALYTICS = os.path.join(DATA_DIR, "analytics.duckdb")
-DB_APP_DATA = os.path.join(DATA_DIR, "app_data.duckdb")
-
-SYMBOLS = ["SILVER", "GOLD", "BTCUSD"]
-
-# TIMEFRAMES als Lazy-Initialisierung (vermeidet MT5-DLL-Load beim Import)
-_TIMEFRAMES_CACHE: Optional[Dict[str, int]] = None
-
-
-def get_timeframes() -> Dict[str, int]:
-    """Gibt das Timeframe-Mapping zurueck (lazy, importiert mt5 nur bei Bedarf)."""
-    global _TIMEFRAMES_CACHE
-    if _TIMEFRAMES_CACHE is None:
-        import MetaTrader5 as _mt5
-        _TIMEFRAMES_CACHE = {
-            "MN1": _mt5.TIMEFRAME_MN1,
-            "W1": _mt5.TIMEFRAME_W1,
-            "D1": _mt5.TIMEFRAME_D1,
-            "H4": _mt5.TIMEFRAME_H4,
-            "H1": _mt5.TIMEFRAME_H1,
-            "M30": _mt5.TIMEFRAME_M30,
-            "M15": _mt5.TIMEFRAME_M15,
-            "M10": _mt5.TIMEFRAME_M10,
-            "M5": _mt5.TIMEFRAME_M5,
-            "M2": _mt5.TIMEFRAME_M2,
-            "M1": _mt5.TIMEFRAME_M1,
-        }
-    return _TIMEFRAMES_CACHE
-
-TF_SECONDS_MAP: Dict[str, int] = {
-	"M1": 60,
-	"M2": 120,
-	"M5": 300,
-	"M10": 600,
-	"M15": 900,
-	"M30": 1800,
-	"H1": 3600,
-	"H4": 14400,
-	"D1": 86400,
-	"W1": 604800,
-	"MN1": 2592000,
-}
-
-MT5_LOCK = threading.Lock()
-
-# ==============================================================================
-# DB LOCK-FREIER CONNECTION-HELPER
-# ==============================================================================
-# DuckDB unterstützt Multiple Connections innerhalb eines Prozesses nativ.
-# Threading-Locks sind hier kontraproduktiv, da sie z. B. eine dauerhaft
-# offene Haupt-Connection (self.db in MainWindow) blockieren.
-# Cross-Prozess-Konflikte (IO Error: file is already open) werden durch
-# sauberes Beenden vorheriger Prozesse gelöst, nicht durch threading.Lock.
-
-
-def with_db_lock(db_path: str):
-    """No-op decorator (Lock-frei). Beibehalten für API-Kompatibilität."""
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            return func(*args, **kwargs)
-        return wrapper
-    return decorator
-
-
-# ==============================================================================
-# DB CONNECTION POOL (Thread-local Singleton) – eine Connection pro Thread & DB
-# ==============================================================================
-# Loest drei Kernprobleme unter Windows:
-#   1. "Can't open a connection with a different configuration" – immer gleiche Config
-#   2. "Cannot open file – file used by another process" – keine Open/Close-Zyklen
-#   3. DuckDB-Connections sind nicht thread-safe – eigenes Connection pro Thread
-#
-# Nutzung: DbPool.get(db_path) statt db_connect(db_path)
-# Connections werden automatisch via atexit geschlossen.
-
-_db_pool_lock = threading.Lock()
-_db_pool_global: Dict[str, int] = {}  # abs_path -> Referenzzähler (fuer atexit)
-
-
-class DbPool:
-    """Thread-sicherer Connection-Pool: eine persistente Connection pro Thread & DB-Datei."""
-
-    _local = threading.local()
-
-    @staticmethod
-    def get(db_path: str) -> duckdb.DuckDBPyConnection:
-        """Gibt eine persistente Connection zur DB-Datei zurueck (eine pro Thread).
-        Die Connection lebt bis Prozess-Ende und wird nie geschlossen."""
-        abs_path = os.path.abspath(db_path)
-        # Thread-local Storage: Jeder Thread hat seine eigenen Connections
-        if not hasattr(DbPool._local, 'conns'):
-            DbPool._local.conns = {}
-        if abs_path not in DbPool._local.conns:
-            DbPool._local.conns[abs_path] = duckdb.connect(abs_path)
-            # Globalen Referenzzähler erhöhen (für atexit)
-            with _db_pool_lock:
-                if _db_pool_global.get(abs_path, 0) == 0:
-                    import atexit
-                    atexit.register(lambda p=abs_path: DbPool._close_all_for(p))
-                _db_pool_global[abs_path] = _db_pool_global.get(abs_path, 0) + 1
-        return DbPool._local.conns[abs_path]
-
-    @staticmethod
-    def _close_all_for(abs_path: str) -> None:
-        """Schliesst ALLE Connections zu einer DB-Datei (fuer atexit)."""
-        # Kann nur die Connections des aktuellen Threads schliessen
-        if hasattr(DbPool._local, 'conns'):
-            con = DbPool._local.conns.pop(abs_path, None)
-            if con is not None:
-                try:
-                    con.close()
-                except Exception:
-                    pass
-
-    @staticmethod
-    def close_all() -> None:
-        """Schliesst ALLE Connections des aktuellen Threads.
-
-        Dekrementiert dabei den globalen Referenzzaehler, damit der
-        atexit-Bookkeeping-Dict (Fix 15.03, Worker-Connection-Leak) nicht
-        unbegrenzt waechst. Wird u. a. von AnalyticsAsyncWorker nach jeder
-        Abfrage aufgerufen (Worker-Thread gibt seine Connection frei; ein
-        neuer Worker-Thread erhaelt automatisch eine frische Connection).
-        """
-        if hasattr(DbPool._local, 'conns'):
-            for abs_path in list(DbPool._local.conns.keys()):
-                try:
-                    DbPool._local.conns[abs_path].close()
-                except Exception:
-                    pass
-                with _db_pool_lock:
-                    _db_pool_global[abs_path] = max(
-                        0, _db_pool_global.get(abs_path, 0) - 1)
-            DbPool._local.conns = {}
-
-
-class _LockedConnection:
-    """Wrapper um DuckDBPyConnection (LEGACY – nur noch fuer sync_market_data & MarketDataRepository).
-    Oeffnet/schliesst die Connection bei jedem Aufruf.
-    """
-
-    def __init__(self, con: duckdb.DuckDBPyConnection):
-        self._con = con
-
-    def __getattr__(self, name):
-        return getattr(self._con, name)
-
-    def close(self):
-        try:
-            self._con.close()
-        finally:
-            pass
-
-
-def db_connect(db_path: str, read_only: bool = False) -> _LockedConnection:
-    """LEGACY: Oeffnet eine neue Connection (wird geschlossen nach Gebrauch).
-    
-    Warnung: Nicht fuer haeufige Zugriffe verwenden!
-    Nutze stattdessen: DbPool.get(db_path)
-    """
-    con = duckdb.connect(db_path, read_only=read_only)
-    return _LockedConnection(con)
-
-
-# ==============================================================================
-# 1) DATENBANKEN PRÜFEN, ANLEGEN & MIGRIEREN
-# ==============================================================================
-def check_and_init_databases() -> None:
-	"""Prüft, initialisiert und migriert die Kern-Datenbanken bei Bedarf."""
-	print("🔍 [1/3] Prüfe und initialisiere Ordnerstruktur und Datenbanken...")
-	os.makedirs(DATA_DIR, exist_ok=True)
-
-	con_market = DbPool.get(DB_MARKET_DATA)
-	con_market.execute("""
-		CREATE TABLE IF NOT EXISTS ohlcv_bars (
-			symbol      VARCHAR NOT NULL,
-			timeframe   VARCHAR NOT NULL,
-			time        TIMESTAMPTZ NOT NULL,
-			open        DOUBLE NOT NULL,
-			high        DOUBLE NOT NULL,
-			low         DOUBLE NOT NULL,
-			close       DOUBLE NOT NULL,
-			tick_volume BIGINT,
-			spread      INTEGER,
-			real_volume BIGINT,
-			created_at  TIMESTAMP DEFAULT current_timestamp,
-			PRIMARY KEY (symbol, timeframe, time)
-		);
-	""")
-
-	try:
-		col_type_row = con_market.execute("""
-			SELECT data_type 
-			FROM information_schema.columns 
-			WHERE LOWER(table_name) = 'ohlcv_bars' AND LOWER(column_name) = 'time'
-		""").fetchone()
-
-		if col_type_row and col_type_row[0].upper() == "TIMESTAMP":
-			print("⚠️ [MIGRATION] Konvertiere 'time' Spalte in ohlcv_bars von TIMESTAMP zu TIMESTAMPTZ...")
-			con_market.execute("ALTER TABLE ohlcv_bars ALTER time TYPE TIMESTAMPTZ")
-			print("✅ [MIGRATION] Konvertierung erfolgreich abgeschlossen.")
-	except Exception as e:
-		print(f"⚠️ [MIGRATION WARNUNG] Migration konnte nicht durchgeführt werden: {e}")
-
-	con_analytics = DbPool.get(DB_ANALYTICS)
-	con_analytics.execute("""
-		CREATE TABLE IF NOT EXISTS analytics_metadata (
-			created_at TIMESTAMP DEFAULT current_timestamp,
-			info VARCHAR
-		);
-	""")
-
-	# Analytics-Tabelle für Feature-/Plugin-Daten
-	# 17.01 (E-1, 07.08.2026): 4-Spalten-PK (symbol, timeframe, bar_time,
-	# feature_id) – erlaubt die konfliktfreie Speicherung MEHRERER Services auf
-	# derselben Kerze (feature_id identifiziert das erzeugende Plugin, Default
-	# 'native' fuer den klassischen Feature-Builder-Pfad). Bei bestehenden DBs
-	# ist CREATE TABLE IF NOT EXISTS ein No-op; die Migration existierender
-	# Tabellen erfolgt ueber test/migrate_pk.py (Table-Rewrite + RENAME, da
-	# DuckDB 1.5.5 kein DROP PRIMARY KEY unterstuetzt).
-	con_analytics.execute("""
-		CREATE TABLE IF NOT EXISTS feature_store (
-			symbol      VARCHAR NOT NULL,
-			timeframe   VARCHAR NOT NULL,
-			bar_time    TIMESTAMPTZ NOT NULL,
-			ema_diff    DOUBLE,
-			rsi_14      DOUBLE,
-			atr_normalized DOUBLE,
-			created_at  TIMESTAMP DEFAULT current_timestamp,
-			feature_id  VARCHAR NOT NULL DEFAULT 'native',
-			plugin_version VARCHAR,
-			feature_data JSON,
-			PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
-		);
-	""")
-
-	# Phase 12 (Hybrid-Schema): Additive Erweiterung des feature_store um die
-	# Plugin-Architektur. feature_id identifiziert das erzeugende Plugin
-	# (z.B. 'srv_grid_lines'), plugin_version dessen Version und feature_data
-	# haelt den vollstaendigen FeatureStorePayload (JSON). Bestehende Spalten
-	# und Daten bleiben unangetastet.
-	con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_id VARCHAR;")
-	con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS plugin_version VARCHAR;")
-	con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_data JSON;")
-	# Bugfix 07.08.2026 (Phase 17 Bugfix-Runde 2): Der Spalten-DEFAULT von
-	# created_at wurde durch die PK-Migration (17.01 E-1, test/migrate_pk.py –
-	# Table-Rewrite + RENAME) entfernt. Seitdem bleiben NEUE feature_store-Rows
-	# ohne explizites created_at NULL und das 'Datum der letzten Ausfuehrung'
-	# (MasterTree, MAX(created_at) je feature_id) zeigt '--.--.--'. Der DEFAULT
-	# wird hier idempotent wiederhergestellt (No-op bei korrekter DB).
-	try:
-		con_analytics.execute(
-			"ALTER TABLE feature_store ALTER created_at "
-			"SET DEFAULT current_timestamp")
-	except Exception as e:
-		print(f"⚠️ [MIGRATION WARNUNG] created_at-Default des feature_store "
-		      f"konnte nicht wiederhergestellt werden: {e}")
-
-	con_app = DbPool.get(DB_APP_DATA)
-	con_app.execute("""
-		CREATE TABLE IF NOT EXISTS app_config (
-			key VARCHAR PRIMARY KEY,
-			value VARCHAR,
-			updated_at TIMESTAMP DEFAULT current_timestamp
-		);
-	""")
-
-	# Phase 15 (15.01): Symbol- & Favoriten-Verwaltung. broker_symbols haelt
-	# die Broker-Symbole (aus mt5.symbols_get()) inkl. Favoriten-Flag und
-	# dient als Fallback, wenn MT5 nicht verfuegbar ist. Standard-Defaults
-	# (SILVER, GOLD, BTCUSD) werden als Favoriten vorbelegt, damit die
-	# Favoriten-Dropdowns (ServiceWindow/AnalyticsWindow) nie leer starten.
-	con_app.execute("""
-		CREATE TABLE IF NOT EXISTS broker_symbols (
-			symbol      VARCHAR PRIMARY KEY,
-			path        VARCHAR,
-			is_favorite BOOLEAN DEFAULT FALSE,
-			updated_at  TIMESTAMP DEFAULT current_timestamp
-		);
-	""")
-	con_app.execute("""
-		INSERT INTO broker_symbols (symbol, path, is_favorite)
-		VALUES ('SILVER', '', TRUE), ('GOLD', '', TRUE), ('BTCUSD', '', TRUE)
-		ON CONFLICT (symbol) DO NOTHING;
-	""")
-
-	# Phase 15 (15.03): Analytics-Profile. analytics_profiles haelt benannte
-	# Parametrisierungen der Analytics-UI (Option B – Explicit Save: Slider-/
-	# Parametertrends setzen Dirty-Flag, Speichern erst auf [Save]). Das
-	# Profil-Payload-JSON (Spalte payload) enthaelt als Pflichtfeld
-	# `schema_version` (15.03-Spezifikation: 1). Additiv/idempotent –
-	# bestehende Profile bleiben unangetastet.
-	con_app.execute("""
-		CREATE TABLE IF NOT EXISTS analytics_profiles (
-			profile_id  VARCHAR PRIMARY KEY,
-			name        VARCHAR NOT NULL,
-			description VARCHAR,
-			payload     JSON,
-			is_active   BOOLEAN DEFAULT FALSE,
-			created_at  TIMESTAMP DEFAULT current_timestamp,
-			updated_at  TIMESTAMP DEFAULT current_timestamp
-		);
-	""")
-	print(f"   ✅ Ordner '{DATA_DIR}/' und alle 3 DBs sind einsatzbereit.")
-
-
-# ==============================================================================
-# 2) MT5 VERBINDUNG PRÜFEN
-# ==============================================================================
-def check_mt5_connection() -> None:
-	"""Prüft die MT5-Verbindung mit abgesicherter Fehlerbehandlung (lazy mt5 import)."""
-	import MetaTrader5 as _mt5
-
-	print("\n🔗 [2/3] Prüfe MT5-Verbindung...")
-
-	with MT5_LOCK:
-		if not _mt5.initialize():
-			error_code = _mt5.last_error()
-			try:
-				_mt5.shutdown()
-			except Exception:
-				pass
-			raise SystemExit(
-				f"❌ KRITISCHER FEHLER: MT5-Verbindung fehlgeschlagen!\n"
-				f"   Fehlercode: {error_code}\n"
-				f"   Bitte stelle sicher, dass das MT5 Terminal geöffnet und eingeloggt ist."
-			)
-
-		account = _mt5.account_info()
-		if account is None:
-			try:
-				_mt5.shutdown()
-			except Exception:
-				pass
-			raise SystemExit("❌ KRITISCHER FEHLER: Im MT5-Terminal ist kein Konto eingeloggt!")
-
-		for symbol in SYMBOLS:
-			if not _mt5.symbol_select(symbol, True):
-				try:
-					_mt5.shutdown()
-				except Exception:
-					pass
-				raise SystemExit(f"❌ KRITISCHER FEHLER: Symbol '{symbol}' konnte im MT5 nicht aktiviert werden.")
-
-	print(f"   ✅ Verbunden mit Broker: {account.company} (Server: {account.server}, Login: {account.login})")
-
-
-# ==============================================================================
-# 3 & 4) DATEN HILFSFUNKTIONEN & IMPORT-SCHLEIFE
-# ==============================================================================
-def get_latest_timestamp(con: duckdb.DuckDBPyConnection, symbol: str, timeframe_str: str) -> Optional[datetime]:
-	res = con.execute("""
-		SELECT MAX(time) 
-		FROM ohlcv_bars 
-		WHERE symbol = ? AND timeframe = ?
-	""", [symbol, timeframe_str]).fetchone()
-
-	return res[0] if res and res[0] is not None else None
-
-
-def sync_market_data() -> Set[Tuple[str, str]]:
-	import MetaTrader5 as _mt5
-	timeframes = get_timeframes()
-
-	check_and_init_databases()
-	check_mt5_connection()
-
-	print(f"\n📥 [3/3] Starte Synchronisation für {', '.join(SYMBOLS)} über {len(timeframes)} Timeframes...")
-
-	start_time_total = time.perf_counter()
-	total_bars_downloaded = 0
-	updated_pairs: Set[Tuple[str, str]] = set()
-
-	for symbol in SYMBOLS:
-		print(f"\n--- Synchronisiere {symbol} ---")
-		# Connection pro Symbol öffnen/schließen, damit andere Threads (LiveTickWorker)
-		# zwischendurch ebenfalls auf die DB zugreifen können
-		con = db_connect(DB_MARKET_DATA)
-		try:
-			for tf_str, tf_mt5 in timeframes.items():
-				tf_start = time.perf_counter()
-
-				last_time = get_latest_timestamp(con, symbol, tf_str)
-
-				with MT5_LOCK:
-					if last_time is not None:
-						rates = _mt5.copy_rates_from_pos(symbol, tf_mt5, 0, 5_000)
-						update_type = "UPDATE"
-					else:
-						rates = _mt5.copy_rates_from_pos(symbol, tf_mt5, 0, 10_000_000)
-						update_type = "VOLLIMPORT"
-
-					if rates is None:
-						err = _mt5.last_error()
-						print(f"   [--] {tf_str:<4} | MT5 Fehler beim Abrufen der Kerzen: {err}")
-						continue
-
-				if len(rates) == 0:
-					print(f"   [--] {tf_str:<4} | Keine Kerzen von MT5 empfangen.")
-					continue
-
-				df = pd.DataFrame(rates)
-				df["symbol"] = symbol
-				df["timeframe"] = tf_str
-				df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-				df = df.drop_duplicates(subset=["time"], keep="last")
-
-				df_to_insert = df[
-					[
-						"symbol",
-						"timeframe",
-						"time",
-						"open",
-						"high",
-						"low",
-						"close",
-						"tick_volume",
-						"spread",
-						"real_volume",
-					]
-				]
-
-				con.register("df_temp", df_to_insert)
-
-				# NATIVE UPSERT VIA PRIMÄRSCHLÜSSEL (symbol, timeframe, time)
-				con.execute("""
-					INSERT OR REPLACE INTO ohlcv_bars (
-						symbol, timeframe, time, open, high, low, close, tick_volume, spread, real_volume
-					)
-					SELECT 
-						symbol, timeframe, "time", open, high, low, close, tick_volume, spread, real_volume 
-					FROM df_temp
-				""")
-
-				con.unregister("df_temp")
-
-				tf_elapsed = time.perf_counter() - tf_start
-				bars_count = len(df_to_insert)
-				total_bars_downloaded += bars_count
-
-				if bars_count > 0:
-					updated_pairs.add((symbol, tf_str))
-
-				print(f"   [✅] {tf_str:<4} | {update_type:<10} | {bars_count:>8,} Kerzen verarbeitet in {tf_elapsed:.2f}s")
-		finally:
-			con.close()
-
-	total_elapsed = time.perf_counter() - start_time_total
-
-	print("\n" + "=" * 60)
-	print("⏱️  ERGEBNIS & ZEITMESSUNG")
-	print("=" * 60)
-	print(f"Gesamtdauer Process:    {total_elapsed:.2f} Sekunden")
-	print(f"Gesamtanzahl Kerzen:    {total_bars_downloaded:,}")
-	print(f"Durchschnittliche Rate: {total_bars_downloaded / max(total_elapsed, 0.001):,.0f} Kerzen/Sekunde")
-	print("=" * 60)
-	return updated_pairs
-
-
-# ==============================================================================
-# HELPER: Einheitlicher Unix-Epoch-Konverter
-# ==============================================================================
-def _ensure_epoch(val: Any) -> int:
-    """DEPRECATED: Nutze stattdessen EXTRACT('epoch' FROM time)::BIGINT in SQL.
-    Diese Funktion zerstört die Zeitzone bei TIMESTAMPTZ (timetuple() verliert offset).
-    Nur noch für backward-compat in Test-Dateien."""
-    if isinstance(val, datetime):
-        import calendar
-        return calendar.timegm(val.timetuple())
-    return int(val)
-
-
-# ==============================================================================
-# HELPER: Sicheres JSON-Parsing (DuckDB liefert str oder dict je nach Treiber)
-# ==============================================================================
-def _parse_json_field(val: Any) -> Any:
-    """Wandelt JSON aus DuckDB in Python-Objekt um (str->dict, dict bleibt)."""
-    if isinstance(val, str):
-        return json.loads(val) if val else None
-    return val
-
-
-# ==============================================================================
-# HELPER: Symbol-Preision (fixer Wert je Symbol, identisch zur Preisskala)
-# ==============================================================================
-def get_symbol_precision(symbol: str, timeframe: str,
-                         db_path: str = DB_MARKET_DATA) -> int:
-    """Liefert die Preisskala-Praezision (Nachkommastellen) eines Symbols.
-
-    Identische Query wie MarketDataRepository.fetch_historical_candles()
-    (die Preisskala im Chart nutzt exakt diesen Wert) – jedoch OHNE die
-    Candles zu laden. Wird fuer die Custom-Level-Eingabefelder (prox_level1..6)
-    verwendet, damit die Eingabe dieselbe Dezimalanzahl wie die Preisskala hat.
-
-    Fallback: 2 bei fehlender DB / leerer Tabelle / Fehler.
-    """
-    default = 2
-    if not os.path.exists(db_path):
-        return default
-    try:
-        con = DbPool.get(db_path)
-        p_row = con.execute("""
-            SELECT COALESCE(MAX(
-                CASE
-                    WHEN POSITION('.' IN CAST(ROUND(close, 5) AS VARCHAR)) > 0
-                    THEN LENGTH(RTRIM(CAST(ROUND(close, 5) AS VARCHAR), '0'))
-                         - POSITION('.' IN CAST(ROUND(close, 5) AS VARCHAR))
-                    ELSE 0
-                END
-            ), 2) AS precision
-            FROM (
-                SELECT close
-                FROM ohlcv_bars
-                WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
-                  AND close IS NOT NULL
-                LIMIT 1000
-            );
-        """, [symbol, timeframe]).fetchone()
-        if p_row and p_row[0] is not None:
-            return int(p_row[0])
-    except Exception:
-        pass
-    return default
-
-
-# ==============================================================================
-# 5) REPOSITORY MIT ROBUSTER STATISTISCHER PRECISION-ERMITTLUNG
-# ==============================================================================
-class MarketDataRepository:
-	"""Kapselt den exklusiven Lesezugriff auf die Marktdatenbank."""
-
-	def __init__(self, db_path: str = DB_MARKET_DATA) -> None:
-		self.db_path = db_path
-
-	def fetch_historical_candles(self, symbol: str, timeframe: str, limit: int = 3000,
-	                             before_epoch: Optional[int] = None) -> Tuple[List[Dict[str, Any]], int]:
-		"""Liest OHLCV-Kerzen aus der Marktdatenbank (aufsteigend sortiert).
-
-		Phase 16.07 (Two-Tier Caching, D4): Additiver Parameter `before_epoch`.
-		Ist er gesetzt, werden ausschliesslich KERZEN GELADEN, DIE ÄLTER ALS
-		diese Wanduhr-Epoch sind (WHERE "time" < to_timestamp(?)) – das
-		Chunk-Nachladen des `ChartDataBuffer` (Tier 2 -> DuckDB) nutzt genau
-		diesen Pfad, um den naechsten Block alter Geschichte vorzuladen.
-		Ohne `before_epoch` ist das Verhalten unveraendert (letzte `limit`
-		Kerzen, Abwaertskompatibilitaet).
-		"""
-		candles: List[Dict[str, Any]] = []
-		precision: int = 2
-
-		if not os.path.exists(self.db_path):
-			return candles, precision
-
-		for attempt in range(3):
-			try:
-				con = db_connect(self.db_path)
-
-				precision_query = """
-					SELECT COALESCE(MAX(
-						CASE 
-							WHEN POSITION('.' IN CAST(ROUND(close, 5) AS VARCHAR)) > 0 
-							THEN LENGTH(RTRIM(CAST(ROUND(close, 5) AS VARCHAR), '0')) - POSITION('.' IN CAST(ROUND(close, 5) AS VARCHAR))
-							ELSE 0 
-						END
-					), 2) AS precision
-					FROM (
-						SELECT close 
-						FROM ohlcv_bars 
-						WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
-						  AND close IS NOT NULL 
-						LIMIT 1000
-					);
-				"""
-				p_row = con.execute(precision_query, [symbol, timeframe]).fetchone()
-				if p_row and p_row[0] is not None:
-					precision = int(p_row[0])
-
-				# Phase 16.07: before_epoch filtert additiv auf ältere Kerzen
-				# (Wanduhr-Epoch; "time" ist TIMESTAMPTZ, daher to_timestamp-
-				# Vergleich). Die WHERE-Bedingung wird nur bei gesetztem
-				# before_epoch ergänzt (Abwaertskompatibilität).
-				older_filter = ""
-				params: List[Any] = [symbol, timeframe]
-				if before_epoch is not None:
-					older_filter = ' AND "time" < to_timestamp(?)'
-					params.append(int(before_epoch))
-				params.append(limit)
-
-				query = """
-					SELECT EXTRACT('epoch' FROM "time")::BIGINT AS time_epoch,
-					       open, high, low, close, tick_volume 
-					FROM (
-						SELECT "time", open, high, low, close, tick_volume 
-						FROM ohlcv_bars 
-						WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
-						  AND "time" IS NOT NULL 
-						  AND open IS NOT NULL 
-						  AND high IS NOT NULL 
-						  AND low IS NOT NULL 
-						  AND close IS NOT NULL
-						""" + older_filter + """
-						ORDER BY "time" DESC 
-						LIMIT ?
-					) 
-					ORDER BY "time" ASC;
-				"""
-				rows = con.execute(query, params).fetchall()
-				con.close()
-
-				for r in rows:
-					t_epoch = int(r[0])  # Bereits epoch-Integer aus DuckDB
-					# P16.05 VWMA-Fix (P-D4): tick_volume wird mitgeliefert.
-					# Entscheidung F3: NaN/None -> 0, Candle bleibt gueltig
-					# (kein WHERE-Filter auf tick_volume, damit Candles mit
-					# NULL-Volumen nicht wegfallen).
-					vol_raw = r[5]
-					candles.append({
-						"time": t_epoch,
-						"open": float(r[1]),
-						"high": float(r[2]),
-						"low": float(r[3]),
-						"close": float(r[4]),
-						"tick_volume": float(vol_raw) if vol_raw is not None else 0.0
-					})
-				break
-
-			except Exception as e:
-				if attempt == 2:
-					print(f"❌ [Repository Error] Fehler beim Laden von {symbol} {timeframe}: {e}")
-				else:
-					time.sleep(0.1)
-
-		return candles, precision
+from db.db_pool import (
+    DATA_DIR,
+    DB_ANALYTICS,
+    DB_APP_DATA,
+    DB_MARKET_DATA,
+    DbPool,
+    _LockedConnection,
+    db_connect,
+    with_db_lock,
+)
+from db.db_utils import _ensure_epoch, _parse_json_field
+from db.schema_initializer import check_and_init_databases
+from data_sync.mt5_sync_service import (
+    SYMBOLS,
+    TF_SECONDS_MAP,
+    MT5_LOCK,
+    check_mt5_connection,
+    get_latest_timestamp,
+    get_timeframes,
+    sync_market_data,
+)
+from repositories.market_data_repository import (
+    MarketDataRepository,
+    get_symbol_precision,
+)
 
 
 def main() -> None:
-	sync_market_data()
+    """CLI-Einstieg (Kompatibilitaet): fuehrt den MT5-Sync aus."""
+    sync_market_data()
 
 
 if __name__ == "__main__":
-	main()
+    main()
+
 ```
 
 --------------------------------------------------
@@ -1430,9 +846,8 @@ main.py - Haupt-Orchestrator für PyTrader mit Multi-Monitor-Sicherheitsprüfung
 import json
 import os
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 # CHROMIUM MULTI-MONITOR & OCCLUSION RENDER FIX (Vor QApplication Import setzen)
 os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
@@ -1444,15 +859,12 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
     "--num-raster-threads=4"
 )
 
-import MetaTrader5 as mt5
 import duckdb
-from PySide6.QtCore import QFile, QIODevice, QThread, QTimer, Signal, Slot, Qt
-from PySide6.QtGui import QScreen
+from PySide6.QtCore import QFile, QIODevice, QTimer, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
-    QMessageBox,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -1461,15 +873,18 @@ from PySide6.QtWidgets import (
 from chart.chart_win import PyTraderChartWindow
 from state_manager import StateManager
 from persistent_win import PersistentWindow
-from db_service import get_timeframes, TF_SECONDS_MAP, MT5_LOCK, DbPool
-import db_service
 from symbol_repository import get_symbol_repository
-from serviceui.service_win import ServiceWindow
-from analytics.ui.analytics_win import AnalyticsWindow
-from properties_win import PropertiesWindow
 from config.app_settings import AppSettings
 from config.event_bus import event_bus
 from analytics.background_workers.live_analyzer import LiveAnalyzer
+
+# 18.01.02 (E7): db-Basisschicht, Sync-Service, Worker & WindowManager
+from db.db_pool import DbPool
+from db.schema_initializer import check_and_init_databases
+from data_sync.mt5_sync_service import check_mt5_connection
+from workers.data_sync_worker import DataSyncWorker
+from workers.live_tick_worker import LiveTickWorker
+from ui.window_manager import WindowManager
 
 # ==============================================================================
 # KONSOLE: UTF-8 erzwingen – verhindert UnicodeEncodeError bei Emojis/Log-Ausgaben
@@ -1485,130 +900,6 @@ for _stream in (sys.stdout, sys.stderr):
 BASE_DIR = Path(__file__).resolve().parent
 
 
-class DataSyncWorker(QThread):
-    sync_completed = Signal(object)
-
-    def run(self) -> None:
-        """Führt den Hintergrund-Sync für alle historischen Daten aus."""
-        try:
-            updated_pairs: Set[Tuple[str, str]] = db_service.sync_market_data()
-            self.sync_completed.emit(updated_pairs)
-        except Exception as e:
-            print(f"❌ Fehler im DataSyncWorker: {e}")
-            self.sync_completed.emit(set())
-
-
-class LiveTickWorker(QThread):
-    ticks_ready = Signal(str)
-
-    def __init__(self, get_active_pairs_callback: Callable[[], Set[Tuple[str, str]]]) -> None:
-        super().__init__()
-        self.get_active_pairs: Callable[[], Set[Tuple[str, str]]] = get_active_pairs_callback
-        self._running: bool = True
-        self._last_bar_times: Dict[str, int] = {}  # Für Bar-Close-Erkennung
-        self._last_bar_data: Dict[str, Dict[str, Any]] = {}  # OHLCV der letzten abgeschlossenen Kerze
-
-    def stop(self) -> None:
-        self._running = False
-
-    def run(self) -> None:
-        """Kontinuierliche Polling-Schleife für MT5-Ticks mit try/finally Freigabe.
-        Erkennt Bar-Close-Events und schreibt abgeschlossene Kerzen in market_data.duckdb."""
-        try:
-            with MT5_LOCK:
-                if not mt5.initialize():
-                    # MT5 ist möglicherweise bereits von MainWindow initialisiert
-                    print("⚠️ [LiveTickWorker] mt5.initialize() war False, versuche trotzdem weiter...")
-
-            while self._running:
-                active_pairs: Set[Tuple[str, str]] = self.get_active_pairs()
-                if not active_pairs:
-                    self.msleep(200)
-                    continue
-
-                results: Dict[str, Dict[str, float | int]] = {}
-                try:
-                    for symbol, tf_str in active_pairs:
-                        mt5_tf: Optional[int] = get_timeframes().get(tf_str)
-                        if mt5_tf is None:
-                            continue
-
-                        with MT5_LOCK:
-                            tick = mt5.symbol_info_tick(symbol)
-                            rates = mt5.copy_rates_from_pos(symbol, mt5_tf, 0, 1)
-
-                        if tick and rates is not None and len(rates) > 0:
-                            rate = rates[0]
-                            key: str = f"{symbol}|{tf_str}"
-                            current_bar_time = int(rate['time'])
-
-                            # Bar-Close erkennen: neue Bar-Time != letzte Bar-Time
-                            last_bar = self._last_bar_times.get(key, 0)
-                            if last_bar > 0 and current_bar_time > last_bar:
-                                # Alte (abgeschlossene) Kerze aus dem Zwischenspeicher in DB schreiben
-                                last_data = self._last_bar_data.get(key)
-                                if last_data:
-                                    self._persist_bar(symbol, tf_str, last_bar, last_data)
-
-                            # Aktuelle Kerze zwischenspeichern (wird beim nächsten Bar-Close persistiert)
-                            self._last_bar_times[key] = current_bar_time
-                            self._last_bar_data[key] = {
-                                'open': float(rate[1]),  # open
-                                'high': float(rate[2]),  # high
-                                'low': float(rate[3]),   # low
-                                'close': float(rate[4]), # close
-                                'tick_volume': int(rate[5]) if len(rate) > 5 else 0,
-                                'spread': int(rate[6]) if len(rate) > 6 else 0,
-                                'real_volume': int(rate[7]) if len(rate) > 7 else 0,
-                            }
-
-                            # JEDEN Tick an die Charts senden (für Live-Candle-Updates)
-                            results[key] = {
-                                "time": current_bar_time,
-                                "open": float(rate['open']),
-                                "high": max(float(rate['high']), float(tick.bid)),
-                                "low": min(float(rate['low']), float(tick.bid)),
-                                "close": float(tick.bid)
-                            }
-                except Exception as e:
-                    print(f"⚠️ [LiveTickWorker] Fehler in Poll-Schleife: {e}")
-
-                if results:
-                    self.ticks_ready.emit(json.dumps(results))
-
-                self.msleep(500)
-
-        finally:
-            with MT5_LOCK:
-                try:
-                    mt5.shutdown()
-                except Exception:
-                    pass
-
-    def _persist_bar(self, symbol: str, tf_str: str, bar_time: int, bar_data: Dict[str, Any]) -> None:
-        """Schreibt eine abgeschlossene Kerze per INSERT OR REPLACE in market_data.duckdb."""
-        try:
-            from db_service import DB_MARKET_DATA, DbPool
-            con = DbPool.get(DB_MARKET_DATA)
-            con.execute("""
-                INSERT OR REPLACE INTO ohlcv_bars (symbol, timeframe, time, open, high, low, close, tick_volume, spread, real_volume)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, [
-                symbol,
-                tf_str,
-                datetime.fromtimestamp(bar_time, tz=timezone.utc),
-                bar_data['open'],
-                bar_data['high'],
-                bar_data['low'],
-                bar_data['close'],
-                bar_data['tick_volume'],
-                bar_data['spread'],
-                bar_data['real_volume'],
-            ])
-        except Exception as e:
-            print(f"⚠️ [LiveTickWorker] Fehler beim Persistieren von {symbol} {tf_str} @ {bar_time}: {e}")
-
-
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1617,6 +908,14 @@ class MainWindow(QMainWindow):
         self.settings: AppSettings = self.state_manager.get_app_settings()
         self.chart_windows: List[PyTraderChartWindow] = []
         self.persistent_sub_windows: List[PersistentWindow] = []
+        # 18.01.02 (E5): Fenster-Lifecycle in WindowManager ausgelagert
+        # (gemeinsame Listen-Referenzen, in-place-Mutationen).
+        self.window_manager: WindowManager = WindowManager(
+            parent=self,
+            state_manager=self.state_manager,
+            chart_windows=self.chart_windows,
+            persistent_sub_windows=self.persistent_sub_windows,
+        )
         self.sync_thread: Optional[DataSyncWorker] = None
         self.pending_ticks_buffer: Dict[str, Dict[str, float | int]] = {}
         self._pending_ticks_timer: QTimer = QTimer(self)
@@ -1639,7 +938,7 @@ class MainWindow(QMainWindow):
 
         self.btn_open_chart: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_open_chart")
         if self.btn_open_chart:
-            self.btn_open_chart.clicked.connect(self.open_chart_window)
+            self.btn_open_chart.clicked.connect(self.window_manager.open_chart_window)
 
         self.btn_refresh_db: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_refresh_db")
         if self.btn_refresh_db:
@@ -1647,21 +946,21 @@ class MainWindow(QMainWindow):
 
         self.btn_service: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_service")
         if self.btn_service:
-            self.btn_service.clicked.connect(self.open_service_window)
+            self.btn_service.clicked.connect(self.window_manager.open_service_window)
 
         self.btn_statistics: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_statistics")
         if self.btn_statistics:
-            self.btn_statistics.clicked.connect(self.open_analytics_window)
+            self.btn_statistics.clicked.connect(self.window_manager.open_analytics_window)
 
         self.btn_properties: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_properties")
         if self.btn_properties:
-            self.btn_properties.clicked.connect(self.open_properties_window)
+            self.btn_properties.clicked.connect(self.window_manager.open_properties_window)
 
         # Datenbanken initialisieren (Tabellen anlegen/updaten) bevor irgendetwas
         # auf analytics.duckdb oder andere DBs zugreift.
-        db_service.check_and_init_databases()
+        check_and_init_databases()
 
-        db_service.check_mt5_connection()
+        check_mt5_connection()
 
         # Phase 15 15.01-Nachtrag 3 (User-Anweisung 04.08.2026): Alle Broker-
         # Symbole werden NUR beim App-Start EINMALIG live von MT5 geladen und
@@ -1691,7 +990,7 @@ class MainWindow(QMainWindow):
 
         self.restore_main_window_geometry()
 
-        QTimer.singleShot(200, self.restore_all_windows)
+        QTimer.singleShot(200, self.window_manager.restore_all_windows)
 
         self.sync_timer: QTimer = QTimer(self)
         self.sync_timer.setInterval(45000)
@@ -1708,7 +1007,8 @@ class MainWindow(QMainWindow):
         event_bus.service_run_started.connect(self._on_service_run_started)
         event_bus.service_run_finished.connect(self._on_service_run_finished)
 
-        self.tick_worker: LiveTickWorker = LiveTickWorker(self.get_currently_active_pairs)
+        self.tick_worker: LiveTickWorker = LiveTickWorker(
+            self.window_manager.get_currently_active_pairs)
         self.tick_worker.ticks_ready.connect(self.on_ticks_ready)
         self.tick_worker.start()
 
@@ -1757,181 +1057,21 @@ class MainWindow(QMainWindow):
         else:
             self.resize(1000, 600)
 
-    def restore_all_windows(self) -> None:
-        """Stellt ALLE gespeicherten Fenster vollautomatisch und generisch wieder her.
-        
-        Nutzt die Klassen-Registry aus persistent_win.py, um ohne Hardcoding
-        zwischen PersistentWindow-Subklassen (Service, Statistik) und
-        dynamischen Chart-Fenstern zu unterscheiden.
-        """
-        all_instances: List[Dict[str, Any]] = self.state_manager.load_all_instances()
-        if not all_instances:
-            print("✨ Keine gespeicherten Instanzen vorhanden.")
-            return
-
-        print(f"🔄 Prüfe {len(all_instances)} gespeicherte Fenster-Einträge...")
-
-        for inst in all_instances:
-            inst_id = str(inst.get("instance_id", ""))
-            if not inst_id or inst_id == "win_main":
-                continue
-
-            # 1. Fall: Registrierte PersistentWindow-Subklasse (Service, Statistik, etc.)
-            window_cls = PersistentWindow.get_registered_class(inst_id)
-            if window_cls is not None:
-                if not PersistentWindow.should_auto_restore(inst_id):
-                    print(f"  → Überspringe {inst_id} ({window_cls.__name__}): auto_restore=False")
-                    continue
-                print(f"  → Öffne registriertes Fenster: {inst_id} ({window_cls.__name__})")
-                # WICHTIG: parent=self nur für state_manager-Zugriff, nicht als Qt-Parent!
-                # PersistentWindow.__init__() übergibt kein Parent an QMainWindow,
-                # damit das Fenster einen eigenen Taskleisten-Eintrag hat.
-                win = window_cls(parent=self)
-                self.persistent_sub_windows.append(win)
-                # Ohne Fokus anzeigen (damit MainWindow den Fokus behält)
-                win.setAttribute(Qt.WA_ShowWithoutActivating, True)
-                win.show()
-                win.setAttribute(Qt.WA_ShowWithoutActivating, False)
-                # Maximiert wiederherstellen (nach show(), ohne Fokus-Klau)
-                if getattr(win, '_restored_is_maximized', False):
-                    win.showMaximized()
-                continue
-
-            # 2. Fall: Dynamische Chart-Fenster (win_1, win_2, ...)
-            if inst_id.startswith("win_"):
-                print(f"  → Öffne Chart-Fenster: {inst_id}")
-                win = PyTraderChartWindow(
-                    instance_id=inst_id,
-                    symbol=inst.get("symbol") or "SILVER",
-                    timeframe=inst.get("timeframe") or "H1",
-                    visible_from=inst.get("visible_range_from"),
-                    visible_to=inst.get("visible_range_to"),
-                    state_manager=self.state_manager
-                )
-                win.closed_signal.connect(self.handle_chart_closed)
-
-                # Geometrie anwenden
-                screen_geo = QApplication.primaryScreen().availableGeometry()
-                pos_x, pos_y = inst.get("pos_x"), inst.get("pos_y")
-                width = inst.get("width") or 900
-                height = inst.get("height") or 600
-
-                if pos_x is not None and pos_y is not None:
-                    if pos_x < screen_geo.x() - 100 or pos_x > screen_geo.right() or \
-                       pos_y < screen_geo.y() - 100 or pos_y > screen_geo.bottom():
-                        pos_x, pos_y = 100, 100
-                    win.move(pos_x, pos_y)
-                    win.resize(width, height)
-
-                if inst.get("is_maximized"):
-                    win.showMaximized()
-                else:
-                    win.setAttribute(Qt.WA_ShowWithoutActivating, True)
-                    win.show()
-                    win.setAttribute(Qt.WA_ShowWithoutActivating, False)
-
-                self.chart_windows.append(win)
-
-        # MainWindow NICHT in den Vordergrund holen – die WA_ShowWithoutActivating-Logik
-        # bei den Sub-Fenstern verhindert bereits Fokus-Klau. Ein erzwungenes
-        # raise_() + activateWindow() würde nur stören, falls der User inzwischen
-        # eine andere Anwendung fokussiert hat.
-
     def open_chart_window(self) -> None:
-        new_id: str = self.state_manager.get_next_instance_id()
-        win = PyTraderChartWindow(
-            instance_id=new_id,
-            symbol="SILVER",
-            timeframe="H1",
-            visible_from=None,
-            visible_to=None,
-            state_manager=self.state_manager
-        )
-        win.closed_signal.connect(self.handle_chart_closed)
-        win.show()
-        self.chart_windows.append(win)
+        """Delegation an WindowManager (18.01.02 E5).
 
-    @Slot(str)
-    def handle_chart_closed(self, instance_id: str) -> None:
-        app = QApplication.instance()
-        if getattr(app, '_is_quitting', False): return
-        self.chart_windows = [w for w in self.chart_windows if w.instance_id != instance_id]
-
-    def open_service_window(self) -> None:
-        # Singleton: Bestehendes Fenster in den Vordergrund holen
-        existing = ServiceWindow.get_existing_instance()
-        if existing is not None:
-            existing.raise_()
-            existing.activateWindow()
-            return
-        win = ServiceWindow(self)  # parent=self nur für state_manager-Zugriff
-        self.persistent_sub_windows.append(win)
-        win.show()
-
-    def open_analytics_window(self) -> None:
-        # Phase 15 15.03: Statistik-Fenster durch AnalyticsWindow ersetzt
-        # (win_statistics-Persistenz wird per E-2 nach win_analytics migriert).
-        # Singleton: Bestehendes Fenster in den Vordergrund holen
-        existing = AnalyticsWindow.get_existing_instance()
-        if existing is not None:
-            existing.raise_()
-            existing.activateWindow()
-            return
-        win = AnalyticsWindow(self)  # parent=self nur für state_manager-Zugriff
-        self.persistent_sub_windows.append(win)
-        win.show()
-
-    def open_properties_window(self) -> None:
-        # Singleton: Bestehendes Fenster in den Vordergrund holen
-        existing = PropertiesWindow.get_existing_instance()
-        if existing is not None:
-            existing.raise_()
-            existing.activateWindow()
-            return
-        win = PropertiesWindow(self)
-        self.persistent_sub_windows.append(win)
-        win.show()
+        API-Kompatibilitaet fuer statistic_win/analytics_win
+        (Jump-to-Chart-Variante 2, hasattr-Check).
+        """
+        self.window_manager.open_chart_window()
 
     def open_chart_at_bar(self, symbol: str, timeframe: str, bar_time: int) -> None:
-        """Oeffnet oder fokussiert ein Chart-Fenster und scrollt zur angegebenen Bar-Position."""
-        # Bestehendes Chart-Fenster mit passendem Symbol/TF suchen
-        for win in self.chart_windows:
-            try:
-                if win.current_symbol == symbol and win.current_tf == timeframe and win.isVisible():
-                    win.raise_()
-                    win.activateWindow()
-                    # Chart zur Position scrollen
-                    win.visible_from = bar_time
-                    win.visible_to = None
-                    win.refresh_chart_data()
-                    return
-            except (RuntimeError, AttributeError):
-                pass
+        """Delegation an WindowManager (18.01.02 E5).
 
-        # Kein passendes Fenster gefunden -> neues oeffnen
-        from chart.chart_win import PyTraderChartWindow
-        new_id: str = self.state_manager.get_next_instance_id()
-        win = PyTraderChartWindow(
-            instance_id=new_id,
-            symbol=symbol,
-            timeframe=timeframe,
-            visible_from=bar_time,
-            visible_to=None,
-            state_manager=self.state_manager
-        )
-        win.closed_signal.connect(self.handle_chart_closed)
-        win.show()
-        self.chart_windows.append(win)
-
-    def get_currently_active_pairs(self) -> Set[Tuple[str, str]]:
-        active_pairs = set()
-        for win in list(self.chart_windows):
-            try:
-                if win.isVisible():
-                    active_pairs.add((win.current_symbol, win.current_tf))
-            except (RuntimeError, AttributeError):
-                pass
-        return active_pairs
+        API-Kompatibilitaet fuer statistic_win/analytics_win
+        (Jump-to-Chart-Variante 2, hasattr-Check).
+        """
+        self.window_manager.open_chart_at_bar(symbol, timeframe, bar_time)
 
     def trigger_background_sync(self) -> None:
         if self.sync_thread is not None and self.sync_thread.isRunning():
@@ -7003,6 +6143,11 @@ class ServiceSetDefinition(TypedDict, total=False):
     set_id: str                      # Eindeutige ID (uuid oder Name)
     display_name: str                # Anzeigename (leer → Auto-Name aus instance_ids)
     description: Optional[str]       # Phase 14 P14-01: Ausführliche Set-/Strategie-Beschreibung
+    category: Optional[str]          # Phase 18.01.03 (E2): Kategorie-Pfad für den
+                                     # MasterTree-Sets-Ordner (z.B. 'Swing Points/Geometrie',
+                                     # Slash-separiert OHNE '📁 '-Präfixe; leer/"General" =
+                                     # Root-Ebene der Sets-Gruppe). Persistiert additiv
+                                     # in save_set().
     version: Optional[str]           # Kap 5: Set-Level Semantic Version (major.minor.patch)
     schema_version: Optional[str]    # Kap 5: Schema-Format-Version der Definition (z.B. "1.0")
     created_at: Optional[str]        # Kap 5: Erstellungs-Zeitstempel (ISO-8601 UTC)
@@ -7153,6 +6298,19 @@ class ServiceSelectorModel(QObject):
         self._active_indicator_ids: Set[str] = set()
         # 05.08.2026: Datum der letzten Ausfuehrung je feature_id (DD.MM.JJ)
         self._last_execution_dates: Dict[str, str] = {}
+        # 18.01.03 (E1): Kategorie-Overrides je Plugin (global_settings,
+        # Key 'plugin_category_<pid>'). Ein gesetzter Override UEBERSCHREIBT
+        # metadata['category'] (auch "" = Root-Ebene); ohne Override gilt das
+        # metadata-Feld. Wird in refresh() einmalig geladen und von
+        # _category_parts() ausgewertet (kein DB-Zugriff im Baum-Aufbau).
+        self._plugin_category_overrides: Dict[str, str] = {}
+        # 18.01.03 (E3-revidiert, 08.08.2026): Persistierte benutzererzeugte
+        # (ggf. leere) Ordner je Gruppe (global_settings, Key
+        # 'tree_folders_<group>'). Wird in refresh() geladen und in
+        # build_tree() in die Gruppen-Kinder eingemischt – leere Ordner
+        # verschwinden damit NICHT beim Refresh, sondern nur bei manueller
+        # Loeschung (Kontextmenue 'Ordner löschen').
+        self._empty_folder_paths: Dict[str, List[str]] = {}
 
         # Initialbefuellung + Live-Sync (schwellenfrei via EventBus)
         self.refresh()
@@ -7175,7 +6333,71 @@ class ServiceSelectorModel(QObject):
         # wird nach jedem Service-Run (ServiceRunWorker -> EventBus) neu
         # gelesen, damit der MasterTree das Datum live aktualisiert.
         self._last_execution_dates = self._load_last_execution_dates()
+        # 18.01.03 (E1): Kategorie-Overrides (plugin_category_<pid>) laden –
+        # einmalig pro Refresh, damit _category_parts() ohne DB-Zugriff
+        # auswertet (Baum-Aufbau bleibt rein lesend aus dem RAM).
+        self._plugin_category_overrides = self._load_plugin_category_overrides()
+        # 18.01.03 (E3-revidiert): Persistierte benutzererzeugte Ordner je
+        # Gruppe laden (tree_folders_<group>); build_tree() mischt sie in
+        # die Gruppen-Kinder ein (leere Ordner bleiben ueber Refreshs).
+        self._empty_folder_paths = self._load_empty_folders()
         self.data_changed.emit()
+
+    def _load_empty_folders(self) -> Dict[str, List[str]]:
+        """Liest die persistierten benutzererzeugten Ordner je Gruppe.
+
+        Quelle: global_settings (Key 'tree_folders_<group>' aus
+        service_set_utils, 18.01.03 E3-revidiert). Liefert pro Gruppe eine
+        deduplizierte Liste Slash-Pfade OHNE '📁 '-Praefix (z.B.
+        ['Swing Points', 'Swing Points/Geometrie']). Defensiv: Fehler -> leer.
+        """
+        try:
+            from serviceui.service_set_utils import EMPTY_FOLDERS_KEY
+        except Exception:
+            EMPTY_FOLDERS_KEY = "tree_folders_{}"
+        result: Dict[str, List[str]] = {}
+        for group in (self.GROUP_SETS, self.GROUP_PLUGINS):
+            paths: List[str] = []
+            try:
+                raw = self.state_manager.get_global_value(
+                    EMPTY_FOLDERS_KEY.format(group), [])
+                if isinstance(raw, list):
+                    for p in raw:
+                        p = str(p or "").strip().strip("/")
+                        if p and p not in paths:
+                            paths.append(p)
+            except Exception as e:
+                print(f"WARN [ServiceSelectorModel] Leere-Ordner der Gruppe "
+                      f"'{group}' nicht lesbar: {e}")
+            result[group] = paths
+        return result
+
+    def empty_folder_paths(self, group: str) -> List[str]:
+        """Persistierte benutzererzeugte Ordner-Pfade einer Gruppe (lesend).
+
+        Gruppe 'sets' oder 'plugins' (GROUP_SETS/GROUP_PLUGINS); unbekannte
+        Gruppen -> [] (defensiv). Rein lesend aus dem Refresh-Zustand.
+        """
+        return list(self._empty_folder_paths.get(str(group or ""), []) or [])
+
+    def _load_plugin_category_overrides(self) -> Dict[str, str]:
+        """Liest die Kategorie-Overrides aller Plugins aus global_settings.
+
+        Key-Format: 'plugin_category_<plugin_id>' (18.01.03, E1) – Wert ist
+        der Slash-Pfad ("" = Root-Ebene) oder ein leerer Eintrag bei fehlendem
+        Override (dann gilt metadata['category']). Defensiv: Fehler -> leer.
+        """
+        overrides: Dict[str, str] = {}
+        try:
+            for pid in sorted(self.get_plugins().keys()):
+                raw = self.state_manager.get_global_value(
+                    f"plugin_category_{pid}", None)
+                if isinstance(raw, str):
+                    overrides[str(pid).lower()] = raw
+        except Exception as e:
+            print(f"WARN [ServiceSelectorModel] Kategorie-Overrides nicht "
+                  f"lesbar: {e}")
+        return overrides
 
     def _load_last_execution_dates(self) -> Dict[str, str]:
         """Liest das Datum der letzten Ausfuehrung je feature_id aus dem
@@ -7407,79 +6629,19 @@ class ServiceSelectorModel(QObject):
     # ------------------------------------------------------------------
     # 16.08 (K1/K2/K8/K9): Kategorie-Ordner (Dynamic Category Trees)
     # ------------------------------------------------------------------
+    # 18.01.02 (E6): Die Baum-Konstruktions-/Aufloesungslogik ist in
+    # `analytics/engine/tree_builder.py` ausgelagert (reine Modul-Funktionen,
+    # keine Zirkularitaet). Dieses Modell bleibt die oeffentliche API und
+    # delegiert hierher (dünne Wrapper).
 
     @staticmethod
     def _cat_key(label: str) -> str:
         """Case-insensitiver Sortier-/Vergleichsschluessel eines Ordners.
 
-        Entfernt das '📁 '-Praefix des Ordnerlabels (K2-Format), damit
-        Sortierung (K8) und Pfad-Lookup stabil auf dem reinen Namen laufen.
+        Delegation an tree_builder._cat_key (18.01.02 E6).
         """
-        s = str(label or "").strip()
-        if s.startswith("📁"):
-            s = s[len("📁"):].lstrip()
-        return s.lower()
-
-    def _category_parts(self, plugin: Optional[Any]) -> List[str]:
-        """Kategorienpfad eines Plugins (K1, 16.08).
-
-        Lese `metadata.get('category')` -> Slash-Pfad in saubere Teile
-        zerlegt. Leer ODER der Ist-Default `"General"` (base_plugin.py)
-        gelten als "keine Kategorie" -> das Plugin bleibt auf der obersten
-        Ebene der Hauptgruppe.
-        """
-        try:
-            meta = getattr(plugin, "metadata", None) or {}
-            category = str(meta.get("category") or "").strip()
-        except Exception:
-            return []
-        if not category or category.lower() == "general":
-            return []
-        return [p.strip() for p in category.split("/") if p.strip()]
-
-    def _insert_into_category_tree(self, nodes: List[Dict[str, Any]],
-                                   parts: List[str],
-                                   leaf: Dict[str, Any]) -> None:
-        """Fuegt ein Plugin-Blatt rekursiv in die Ordnerstruktur ein (K2).
-
-        Erzeugt fehlende Ordner entlang des Pfads. Ordner entstehen NUR
-        durch eine tatsaechliche Blatt-Einfuegung -> keine leeren Ordner
-        (K9). Ordner-Label folgt dem K2-Format '📁 <Name>'.
-        """
-        if not parts:
-            nodes.append(leaf)
-            return
-        key = self._cat_key(parts[0])
-        folder = None
-        for n in nodes:
-            if (n.get("group") == self.GROUP_CATEGORY
-                    and self._cat_key(n.get("label")) == key):
-                folder = n
-                break
-        if folder is None:
-            folder = {"group": self.GROUP_CATEGORY,
-                      "label": f"📁 {parts[0]}", "children": []}
-            nodes.append(folder)
-        self._insert_into_category_tree(folder["children"], parts[1:], leaf)
-
-    def _sort_category_nodes(self,
-                             nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Sortiert eine Ordner-Ebene (K8, 16.08).
-
-        Deterministisch: Ordner zuerst, dann Blaetter; jeweils alphabetisch
-        (case-insensitiv). Innerhalb der Ordner rekursiv dieselbe Regel.
-        """
-        def sort_key(n: Dict[str, Any]) -> tuple:
-            is_folder = n.get("group") == self.GROUP_CATEGORY
-            name = (self._cat_key(n.get("label"))
-                    if is_folder else str(n.get("plugin_id") or "").lower())
-            return (0 if is_folder else 1, name)
-
-        result = sorted(nodes, key=sort_key)
-        for n in result:
-            if n.get("group") == self.GROUP_CATEGORY:
-                n["children"] = self._sort_category_nodes(n.get("children") or [])
-        return result
+        from analytics.engine.tree_builder import _cat_key as _tb_cat_key
+        return _tb_cat_key(label)
 
     def category_plugin_ids(self, category_path: str) -> List[str]:
         """Alle Plugin-IDs unter einem Kategorie-Pfad (rekursiv, 17.01.02).
@@ -7495,38 +6657,55 @@ class ServiceSelectorModel(QObject):
             (run_category_requested).
           * Info-Button auf Ordner-Knoten (category_info_requested).
         """
-        target = [p.strip().lower() for p in str(category_path or "").split("/")
-                  if p.strip()]
-        if not target:
-            return []
-        plugins = self.get_plugins()
-        result: List[str] = []
-        for pid in sorted(plugins.keys()):
-            parts = [p.lower() for p in self._category_parts(plugins.get(pid))]
-            if len(parts) >= len(target) and parts[:len(target)] == target:
-                result.append(pid)
-        return result
+        from analytics.engine.tree_builder import category_plugin_ids
+        return category_plugin_ids(self.get_plugins(),
+                                   self._plugin_category_overrides,
+                                   category_path)
 
-    def _category_nodes(self, plugin_ids: List[str]) -> List[Dict[str, Any]]:
-        """Baut die (ggf. verschachtelte) Kinderliste einer Plugin-Gruppe.
+    def category_set_ids(self, category_path: str) -> List[str]:
+        """Alle set_ids unter einem Kategorie-Pfad (rekursiv, 18.01.03).
 
-        Plugins mit Kategorienpfad werden in 📁-Ordner einsortiert; Plugins
-        ohne Kategorie (bzw. Default 'General') bleiben auf oberster Ebene
-        (K1). Blatt-Dicts unveraendert ({plugin_id, badge, last_execution}).
-        Sortierung pro Ebene: Ordner vor Blaettern, alphabetisch (K8).
+        Liefert deterministisch (Set-Reihenfolge = display_name) alle Sets,
+        deren `category`-Pfad mit `category_path` beginnt – d.h. auch Sets in
+        UNTER-Ordnern (z.B. Pfad 'Swing Points' liefert auch Sets aus
+        'Swing Points/Geometrie'). Pfad-Format: slash-separiert OHNE
+        '📁 '-Praefixe, case-insensitiv. Analog `category_plugin_ids` fuer
+        die Sets-Gruppe.
         """
-        plugins = self.get_plugins()
-        root: List[Dict[str, Any]] = []
-        for pid in plugin_ids:
-            plugin = plugins.get(pid)
-            parts = self._category_parts(plugin)
-            leaf = {
-                "plugin_id": pid,
-                "badge": self.badge_for(pid),
-                "last_execution": self.last_execution_date(pid),
-            }
-            self._insert_into_category_tree(root, parts, leaf)
-        return self._sort_category_nodes(root)
+        from analytics.engine.tree_builder import category_set_ids
+        return category_set_ids(self._sets, category_path)
+
+    def plugin_category_path(self, plugin_id: str) -> str:
+        """Aktueller Kategorie-Pfad eines Plugins (lesend, 18.01.03).
+
+        Liefert den voll aufgeloesten Pfad (Override -> metadata['category'])
+        slash-separiert OHNE '📁 '-Praefix (z.B. 'Swing Points/Geometrie');
+        leer = Root-Ebene. Grundlage fuer die Ordner-Verschiebung und
+        Rename-String-Replace im Orchestrator.
+        """
+        from analytics.engine.tree_builder import plugin_category_path
+        plugin = self.get_plugin(plugin_id)
+        return plugin_category_path(plugin_id, plugin,
+                                    self._plugin_category_overrides)
+
+    def category_service_plugin_ids(self, group: str,
+                                    category_path: str) -> List[str]:
+        """Alle plugin_ids unter einem Kategorie-Ordner (rekursiv, 18.01.03).
+
+        Gruppenspezifische Aufloesung (L3):
+          * group == GROUP_SETS    -> Sets unter dem Pfad
+            (category_set_ids), dann alle plugin_ids ihrer Services
+            (execution_order, dedupliziert, deterministisch).
+          * group == GROUP_PLUGINS -> Plugins unter dem Pfad
+            (category_plugin_ids).
+        Leerer Pfad/leere Gruppe -> [] (defensiv). Wird von den Run-/Info-
+        Aktionen des ServiceWindow und der Picker-Aufloesung genutzt.
+        """
+        from analytics.engine.tree_builder import category_service_plugin_ids
+        return category_service_plugin_ids(group, self._sets,
+                                           self.get_plugins(),
+                                           self._plugin_category_overrides,
+                                           category_path)
 
     def build_tree(self) -> List[Dict[str, Any]]:
         """Baut die vollstaendige Hierarchie fuer das 2-Spalten-MasterTree.
@@ -7545,50 +6724,19 @@ class ServiceSelectorModel(QObject):
               "children": [Blatt- und/oder Ordner-Knoten ...]}]
 
         Deterministisch sortiert (Sets nach display_name; Plugins/Ordner
-        alphabetisch, 16.08 K8). Seit 16.08 (K2) sind die Kinder der
-        Plugin-Gruppen eine Mischung aus flachen Blatt-Dicts
-        ({plugin_id, badge, last_execution}) und verschachtelten
-        Ordner-Dicts ({"group": GROUP_CATEGORY, "label": "📁 <Name>",
-        "children": [...]} – rekursiv), gesteuert ueber das Metadaten-Feld
-        `category` der Plugins (K1).
+        alphabetisch, 16.08 K8). Die Baum-Logik selbst ist seit 18.01.02 (E6)
+        in `analytics/engine/tree_builder.build_tree` ausgelagert – dieses
+        Modell berechnet lediglich die Badges/Ausfuehrungsdaten und delegiert.
         """
-        sets = sorted(self._sets,
-                      key=lambda s: str(s.get("display_name") or s.get("set_id") or "").lower())
-        set_nodes: List[Dict[str, Any]] = []
-        for s in sets:
-            services = s.get("services") or {}
-            order = s.get("execution_order") or []
-            service_nodes: List[Dict[str, Any]] = []
-            for iid in order:
-                cfg = services.get(iid) or {}
-                pid = str(cfg.get("plugin_id") or iid)
-                service_nodes.append({
-                    "instance_id": iid,
-                    "plugin_id": pid,
-                    "badge": self.badge_for(pid),
-                    # 05.08.2026: Datum der letzten Ausfuehrung (DD.MM.JJ) –
-                    # MasterTree haengt es direkt an den Service-Namen an.
-                    "last_execution": self.last_execution_date(pid),
-                })
-            set_nodes.append({
-                "set_id": s.get("set_id"),
-                "display_name": s.get("display_name") or s.get("set_id") or "Unbenannt",
-                "definition": s,
-                "services": service_nodes,
-            })
-
-        # 16.08 (K2/K8) + 17.01.01: EINE kategorisierte Services-Gruppe –
-        # Plugins mit `category`-Metadatum werden in 📁-Ordner verschachtelt
-        # (K1), ohne Kategorie bleiben sie flache Blaetter auf oberster Ebene.
-        # Die fruehere Standalone-Gruppe (separate Knoten) ist entfallen.
-        plugin_nodes = self._category_nodes(sorted(self.get_plugins().keys()))
-
-        return [
-            {"group": self.GROUP_SETS, "label": "📁 Sets",
-             "children": set_nodes},
-            {"group": self.GROUP_PLUGINS, "label": "📦 Services",
-             "children": plugin_nodes},
-        ]
+        from analytics.engine.tree_builder import build_tree as _tb_build_tree
+        plugins = self.get_plugins()
+        badges: Dict[str, str] = {pid: self.badge_for(pid) for pid in plugins}
+        last_executions: Dict[str, str] = {
+            pid: self.last_execution_date(pid) for pid in plugins}
+        return _tb_build_tree(self._sets, plugins,
+                              self._plugin_category_overrides,
+                              self._empty_folder_paths,
+                              badges, last_executions)
 
     def find_set(self, set_id: str) -> Optional[Dict[str, Any]]:
         """Liefert die Set-Definition zur set_id (oder None)."""
@@ -7880,6 +7028,10 @@ class ServiceSetRepository:
             # Bugfix 05.08.2026: Explizite Indikator-Zuordnung (Anlage-Dialog)
             # wird in der Definition persistiert (kein Service noetig).
             "indicator_id": definition.get("indicator_id"),
+            # 18.01.03 (E2): Sets-Kategorie (Dynamic Category Trees) – der
+            # Slash-Pfad (z.B. 'Swing Points/Geometrie') wird additiv
+            # persistiert; leer/fehlend = Root-Ebene der Sets-Gruppe.
+            "category": definition.get("category"),
             "version": version,
             "schema_version": schema_version,
             "created_at": created_at,
@@ -8518,6 +7670,436 @@ class ServiceSetEvaluator:
                 results[iid] = result
 
         return results
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/engine/tree_builder.py
+```py
+# analytics/engine/tree_builder.py
+"""
+analytics/engine/tree_builder.py - Rekursiver Baumaufbau der Service-Hierarchie.
+
+Ausgelagert aus service_selector_model.py im Rahmen von 18.01.02 (E6): alle
+Baum-Konstruktions- und Kategorie-Aufloesungsfunktionen als REINE Modul-
+Funktionen (kein Klassenzustand, keine Qt-Signale, kein Import von
+ServiceSelectorModel – keine Zirkularitaet).
+
+Eingangsdaten (Sets, Plugins, Kategorie-Overrides, Empty-Folder-Pfade,
+Badges, Last-Execution-Daten) werden als Parameter uebergeben. Der
+ServiceSelectorModel bleibt die oeffentliche API und delegiert hierher
+(dünne Wrapper).
+
+Gruppen-Kennungen (Spiegel der ServiceSelectorModel-Konstanten):
+  * GROUP_SETS = "sets"      – Root-Gruppe '📁 Sets'
+  * GROUP_PLUGINS = "plugins" – Root-Gruppe '📦 Services'
+  * GROUP_CATEGORY = "category_node" – 📁-Ordner-Knoten
+"""
+
+from typing import Any, Dict, List, Optional
+
+#: Root-Gruppe der gespeicherten Service-Sets.
+GROUP_SETS = "sets"
+#: Root-Gruppe aller registrierten Plugins/Services.
+GROUP_PLUGINS = "plugins"
+#: Kategorie-Ordner-Knoten (Dynamic Category Trees).
+GROUP_CATEGORY = "category_node"
+
+
+# ------------------------------------------------------------------
+# Kategorie-Bausteine (K1/K2/K8/K9)
+# ------------------------------------------------------------------
+def _cat_key(label: str) -> str:
+    """Case-insensitiver Sortier-/Vergleichsschluessel eines Ordners.
+
+    Entfernt das '📁 '-Praefix des Ordnerlabels (K2-Format), damit
+    Sortierung (K8) und Pfad-Lookup stabil auf dem reinen Namen laufen.
+    """
+    s = str(label or "").strip()
+    if s.startswith("📁"):
+        s = s[len("📁"):].lstrip()
+    return s.lower()
+
+
+def _category_parts(plugin_id: str, plugin: Optional[Any],
+                    overrides: Dict[str, str]) -> List[str]:
+    """Kategorienpfad eines Plugins (K1, 16.08 / 18.01.03 E1).
+
+    Ein gesetzter Kategorie-Override (global_settings, Key
+    'plugin_category_<plugin_id>', Quelle des Drag & Drop) hat VORRANG vor
+    `metadata['category']` – auch ein leerer String "" hebt die metadata-
+    Kategorie auf (Root-Ebene). Ohne Override gilt das metadata-Feld wie
+    bisher. Leer ODER der Ist-Default `"General"` (base_plugin.py) gelten
+    als "keine Kategorie" -> das Plugin bleibt auf der obersten Ebene der
+    Hauptgruppe.
+    """
+    category = ""
+    if plugin_id:
+        override = overrides.get(str(plugin_id).lower())
+        if override is not None:
+            category = str(override or "").strip()
+    if not category:
+        try:
+            meta = getattr(plugin, "metadata", None) or {}
+            category = str(meta.get("category") or "").strip()
+        except Exception:
+            category = ""
+    if not category or category.lower() == "general":
+        return []
+    return [p.strip() for p in category.split("/") if p.strip()]
+
+
+def _insert_into_category_tree(nodes: List[Dict[str, Any]],
+                               parts: List[str],
+                               leaf: Dict[str, Any]) -> None:
+    """Fuegt ein Plugin-Blatt rekursiv in die Ordnerstruktur ein (K2).
+
+    Erzeugt fehlende Ordner entlang des Pfads. Ordner entstehen NUR
+    durch eine tatsaechliche Blatt-Einfuegung -> keine leeren Ordner
+    (K9). Ordner-Label folgt dem K2-Format '📁 <Name>'.
+    """
+    if not parts:
+        nodes.append(leaf)
+        return
+    key = _cat_key(parts[0])
+    folder = None
+    for n in nodes:
+        if (n.get("group") == GROUP_CATEGORY
+                and _cat_key(n.get("label")) == key):
+            folder = n
+            break
+    if folder is None:
+        folder = {"group": GROUP_CATEGORY,
+                  "label": f"📁 {parts[0]}", "children": []}
+        nodes.append(folder)
+    _insert_into_category_tree(folder["children"], parts[1:], leaf)
+
+
+def _sort_category_nodes(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Sortiert eine Ordner-Ebene (K8, 16.08 / 18.01.03).
+
+    Deterministisch: Ordner zuerst, dann Blaetter; jeweils alphabetisch
+    (case-insensitiv). Innerhalb der Ordner rekursiv dieselbe Regel.
+    Blaetter koennen sowohl Plugin-Dicts ({plugin_id, ...}) als auch
+    Sets-Dicts ({set_id, display_name, ...}) sein – als Sortiername gilt
+    plugin_id, sonst display_name/set_id.
+    """
+    def sort_key(n: Dict[str, Any]) -> tuple:
+        is_folder = n.get("group") == GROUP_CATEGORY
+        if is_folder:
+            name = _cat_key(n.get("label"))
+        else:
+            name = str(n.get("plugin_id")
+                       or n.get("display_name")
+                       or n.get("set_id") or "").lower()
+        return (0 if is_folder else 1, name)
+
+    result = sorted(nodes, key=sort_key)
+    for n in result:
+        if n.get("group") == GROUP_CATEGORY:
+            n["children"] = _sort_category_nodes(n.get("children") or [])
+    return result
+
+
+def _set_category_parts(definition: Dict[str, Any]) -> List[str]:
+    """Kategorienpfad eines Service-Sets (18.01.03, E2).
+
+    Lese das optionale Feld `category` der Set-Definition (Slash-Pfad,
+    z.B. 'Swing Points/Geometrie'). Leer ODER der Ist-Default "General"
+    gelten als "keine Kategorie" -> das Set bleibt auf der obersten
+    Ebene der Sets-Gruppe (Spiegel der Plugin-Logik K1).
+    """
+    category = str((definition or {}).get("category") or "").strip()
+    if not category or category.lower() == "general":
+        return []
+    return [p.strip() for p in category.split("/") if p.strip()]
+
+
+def _insert_set_into_category_tree(nodes: List[Dict[str, Any]],
+                                   parts: List[str],
+                                   leaf: Dict[str, Any]) -> None:
+    """Fuegt ein Set-Blatt rekursiv in die Ordnerstruktur ein (18.01.03).
+
+    Analoge Mechanik zu `_insert_into_category_tree` (K2), aber fuer
+    Sets-Blatt-Dicts ({set_id, display_name, definition, services}).
+    Ordner entstehen NUR durch eine tatsaechliche Blatt-Einfuegung ->
+    keine leeren Ordner (K9).
+    """
+    if not parts:
+        nodes.append(leaf)
+        return
+    key = _cat_key(parts[0])
+    folder = None
+    for n in nodes:
+        if (n.get("group") == GROUP_CATEGORY
+                and _cat_key(n.get("label")) == key):
+            folder = n
+            break
+    if folder is None:
+        folder = {"group": GROUP_CATEGORY,
+                  "label": f"📁 {parts[0]}", "children": []}
+        nodes.append(folder)
+    _insert_set_into_category_tree(folder["children"], parts[1:], leaf)
+
+
+def _ensure_category_path(nodes: List[Dict[str, Any]],
+                          parts: List[str]) -> None:
+    """Stellt sicher, dass die Ordnerkette fuer `parts` existiert
+    (18.01.03, E3-revidiert).
+
+    Erzeugt fehlende Ordner entlang des Pfads OHNE Blatt-Einfuegung
+    (K2-Format '📁 <Name>', children leer). Dient der Einmischung
+    persistierter benutzererzeugter (ggf. leerer) Ordner in build_tree():
+    Ein bereits vorhandener Ordner (aus echten Blatt-Kategorien) wird
+    wiederverwendet – kein Duplikat, keine Kinder-Aenderung.
+    """
+    if not parts:
+        return
+    key = _cat_key(parts[0])
+    folder = None
+    for n in nodes:
+        if (n.get("group") == GROUP_CATEGORY
+                and _cat_key(n.get("label")) == key):
+            folder = n
+            break
+    if folder is None:
+        folder = {"group": GROUP_CATEGORY,
+                  "label": f"📁 {parts[0]}", "children": []}
+        nodes.append(folder)
+    _ensure_category_path(folder["children"], parts[1:])
+
+
+def _category_nodes(plugin_ids: List[str],
+                    plugins: Dict[str, Any],
+                    overrides: Dict[str, str],
+                    badges: Dict[str, str],
+                    last_executions: Dict[str, str]) -> List[Dict[str, Any]]:
+    """Baut die (ggf. verschachtelte) Kinderliste einer Plugin-Gruppe.
+
+    Plugins mit Kategorienpfad werden in 📁-Ordner einsortiert; Plugins
+    ohne Kategorie (bzw. Default 'General') bleiben auf oberster Ebene
+    (K1). Blatt-Dicts unveraendert ({plugin_id, badge, last_execution}).
+    Sortierung pro Ebene: Ordner vor Blaettern, alphabetisch (K8).
+    """
+    root: List[Dict[str, Any]] = []
+    for pid in plugin_ids:
+        plugin = plugins.get(pid)
+        parts = _category_parts(pid, plugin, overrides)
+        leaf = {
+            "plugin_id": pid,
+            "badge": badges.get(pid, ""),
+            "last_execution": last_executions.get(pid, "--.--.--"),
+        }
+        _insert_into_category_tree(root, parts, leaf)
+    return _sort_category_nodes(root)
+
+
+# ------------------------------------------------------------------
+# Kategorie-Aufloesung
+# ------------------------------------------------------------------
+def category_plugin_ids(plugins: Dict[str, Any],
+                        overrides: Dict[str, str],
+                        category_path: str) -> List[str]:
+    """Alle Plugin-IDs unter einem Kategorie-Pfad (rekursiv, 17.01.02).
+
+    Liefert deterministisch (alphabetisch) alle Plugins, deren Kategorie-
+    Pfad mit `category_path` beginnt – d.h. auch Plugins in UNTER-Ordnern
+    (z.B. Pfad 'Swing Points' liefert auch Plugins aus 'Swing Points/
+    Geometrie'). Pfad-Format: slash-separiert OHNE '📁 '-Praefixe
+    (z.B. 'Swing Points/Geometrie'), case-insensitiv.
+
+    Grundlage fuer:
+      * Kontextmenue '▶️ Alle Services ausführen' auf Ordner-Knoten
+        (run_category_requested).
+      * Info-Button auf Ordner-Knoten (category_info_requested).
+    """
+    target = [p.strip().lower() for p in str(category_path or "").split("/")
+              if p.strip()]
+    if not target:
+        return []
+    result: List[str] = []
+    for pid in sorted(plugins.keys()):
+        parts = [p.lower() for p in _category_parts(pid, plugins.get(pid),
+                                                    overrides)]
+        if len(parts) >= len(target) and parts[:len(target)] == target:
+            result.append(pid)
+    return result
+
+
+def _find_set(sets_data: List[Dict[str, Any]], set_id: str) -> Optional[Dict[str, Any]]:
+    """Liefert die Set-Definition zur set_id (oder None)."""
+    for s in sets_data:
+        if s.get("set_id") == set_id:
+            return s
+    return None
+
+
+def category_set_ids(sets_data: List[Dict[str, Any]],
+                     category_path: str) -> List[str]:
+    """Alle set_ids unter einem Kategorie-Pfad (rekursiv, 18.01.03).
+
+    Liefert deterministisch (Set-Reihenfolge = display_name) alle Sets,
+    deren `category`-Pfad mit `category_path` beginnt – d.h. auch Sets in
+    UNTER-Ordnern (z.B. Pfad 'Swing Points' liefert auch Sets aus
+    'Swing Points/Geometrie'). Pfad-Format: slash-separiert OHNE
+    '📁 '-Praefixe, case-insensitiv. Analog `category_plugin_ids` fuer
+    die Sets-Gruppe.
+    """
+    target = [p.strip().lower() for p in str(category_path or "").split("/")
+              if p.strip()]
+    if not target:
+        return []
+    result: List[str] = []
+    for s in sorted(sets_data, key=lambda x: str(
+            x.get("display_name") or x.get("set_id") or "").lower()):
+        parts = [p.lower() for p in _set_category_parts(s)]
+        if len(parts) >= len(target) and parts[:len(target)] == target:
+            result.append(str(s.get("set_id") or ""))
+    return result
+
+
+def plugin_category_path(plugin_id: str, plugin: Optional[Any],
+                         overrides: Dict[str, str]) -> str:
+    """Aktueller Kategorie-Pfad eines Plugins (lesend, 18.01.03).
+
+    Liefert den voll aufgeloesten Pfad (Override -> metadata['category'])
+    slash-separiert OHNE '📁 '-Praefix (z.B. 'Swing Points/Geometrie');
+    leer = Root-Ebene. Ist das Plugin nicht registriert, gilt leer
+    (Spiegel der Original-Semantik: Override wird nur bei vorhandenem
+    Plugin ausgewertet).
+    """
+    if not plugin_id:
+        return ""
+    parts = _category_parts(plugin_id, plugin, overrides) if plugin else []
+    return "/".join(parts)
+
+
+def category_service_plugin_ids(group: str,
+                                sets_data: List[Dict[str, Any]],
+                                plugins: Dict[str, Any],
+                                overrides: Dict[str, str],
+                                category_path: str) -> List[str]:
+    """Alle plugin_ids unter einem Kategorie-Ordner (rekursiv, 18.01.03).
+
+    Gruppenspezifische Aufloesung (L3):
+      * group == GROUP_SETS    -> Sets unter dem Pfad
+        (category_set_ids), dann alle plugin_ids ihrer Services
+        (execution_order, dedupliziert, deterministisch).
+      * group == GROUP_PLUGINS -> Plugins unter dem Pfad
+        (category_plugin_ids).
+    Leerer Pfad/leere Gruppe -> [] (defensiv). Wird von den Run-/Info-
+    Aktionen des ServiceWindow und der Picker-Aufloesung genutzt.
+    """
+    if str(group or "") == str(GROUP_SETS):
+        ids: List[str] = []
+        for set_id in category_set_ids(sets_data, category_path):
+            definition = _find_set(sets_data, set_id) or {}
+            services = definition.get("services") or {}
+            order = definition.get("execution_order") \
+                or list(services.keys())
+            for iid in order:
+                cfg = services.get(iid) or {}
+                pid = str(cfg.get("plugin_id") or iid)
+                if pid and pid not in ids:
+                    ids.append(pid)
+        return ids
+    return category_plugin_ids(plugins, overrides, category_path)
+
+
+# ------------------------------------------------------------------
+# Baumaufbau
+# ------------------------------------------------------------------
+def build_tree(sets_data: List[Dict[str, Any]],
+               plugins: Dict[str, Any],
+               overrides: Dict[str, str],
+               empty_folders: Dict[str, List[str]],
+               badges: Dict[str, str],
+               last_executions: Dict[str, str]) -> List[Dict[str, Any]]:
+    """Baut die vollstaendige Hierarchie fuer das 2-Spalten-MasterTree.
+
+    17.01.01: NUR noch 2 Root-Gruppen – die ehemalige Gruppe
+    '⚡ Standalone Services' (GROUP_STANDALONE) entfaellt ersatzlos, da
+    alle Plugins ueber metadata['category'] in Ordner einsortiert werden.
+    Root-Label kompakt: '📁 Sets' und '📦 Services'.
+
+    Rueckgabe (pro Gruppe ein Dict):
+        [{"group": "sets", "label": "📁 Sets", "children": [
+             {"set_id": ..., "display_name": ..., "definition": {...},
+              "services": [{"instance_id": ..., "plugin_id": ...,
+                            "badge": ...}, ...]}, ...]},
+         {"group": "plugins", "label": "📦 Services",
+          "children": [Blatt- und/oder Ordner-Knoten ...]}]
+
+    Deterministisch sortiert (Sets nach display_name; Plugins/Ordner
+    alphabetisch, 16.08 K8). Die Kinder der Plugin-Gruppen sind eine
+    Mischung aus flachen Blatt-Dicts ({plugin_id, badge, last_execution})
+    und verschachtelten Ordner-Dicts ({"group": GROUP_CATEGORY,
+    "label": "📁 <Name>", "children": [...]} – rekursiv), gesteuert ueber
+    das Metadaten-Feld `category` der Plugins (K1). Dieselbe Ordner-
+    Mechanik gilt fuer die Sets-Gruppe (18.01.03): Set-Definitionen mit
+    `category`-Feld werden in identische Ordner-Dicts einsortiert, Sets
+    ohne Kategorie bleiben flache Blaetter. Seit 18.01.03 (E3-revidiert)
+    werden zusaetzlich benutzererzeugte (ggf. leere) Ordner aus
+    `empty_folders` (global_settings Key 'tree_folders_<group>') in die
+    Gruppen-Kinder eingemischt – leere Ordner bleiben ueber Refreshs
+    erhalten und verschwinden NUR bei manueller Loeschung im Kontextmenue.
+    """
+    sets = sorted(sets_data,
+                  key=lambda s: str(s.get("display_name") or s.get("set_id") or "").lower())
+    # Sets-Kategorien (Dynamic Category Trees fuer GROUP_SETS). Set-
+    # Definitionen mit `category`-Pfad werden in 📁-Ordner einsortiert
+    # (rekursiv, gleiche K2/K8/K9-Regeln wie die Plugins); ohne Kategorie
+    # bleiben sie flache Blaetter auf oberster Ebene.
+    set_nodes: List[Dict[str, Any]] = []
+    for s in sets:
+        services = s.get("services") or {}
+        order = s.get("execution_order") or []
+        service_nodes: List[Dict[str, Any]] = []
+        for iid in order:
+            cfg = services.get(iid) or {}
+            pid = str(cfg.get("plugin_id") or iid)
+            service_nodes.append({
+                "instance_id": iid,
+                "plugin_id": pid,
+                "badge": badges.get(pid, ""),
+                "last_execution": last_executions.get(pid, "--.--.--"),
+            })
+        _insert_set_into_category_tree(
+            set_nodes, _set_category_parts(s), {
+                "set_id": s.get("set_id"),
+                "display_name": s.get("display_name") or s.get("set_id") or "Unbenannt",
+                "definition": s,
+                "services": service_nodes,
+            })
+    set_nodes = _sort_category_nodes(set_nodes)
+
+    # EINE kategorisierte Services-Gruppe – Plugins mit `category`-Metadatum
+    # werden in 📁-Ordner verschachtelt (K1), ohne Kategorie bleiben sie
+    # flache Blaetter auf oberster Ebene. Die fruehere Standalone-Gruppe
+    # (separate Knoten) ist entfallen.
+    plugin_nodes = _category_nodes(sorted(plugins.keys()), plugins,
+                                   overrides, badges, last_executions)
+
+    # 18.01.03 (E3-revidiert): Persistierte benutzererzeugte (ggf. leere)
+    # Ordner in die Gruppen-Kinder einmischen – leere Ordner verschwinden
+    # damit NICHT beim Refresh, sondern nur bei manueller Loeschung
+    # (Kontextmenue 'Ordner löschen'). Bereits vorhandene Ordner (aus
+    # echten Blatt-Kategorien) werden wiederverwendet (kein Duplikat).
+    for group, nodes in ((GROUP_SETS, set_nodes), (GROUP_PLUGINS, plugin_nodes)):
+        for path in empty_folders.get(group, []) or []:
+            parts = [p.strip() for p in str(path or "").split("/")
+                     if p.strip()]
+            if parts:
+                _ensure_category_path(nodes, parts)
+    set_nodes = _sort_category_nodes(set_nodes)
+    plugin_nodes = _sort_category_nodes(plugin_nodes)
+
+    return [
+        {"group": GROUP_SETS, "label": "📁 Sets", "children": set_nodes},
+        {"group": GROUP_PLUGINS, "label": "📦 Services",
+         "children": plugin_nodes},
+    ]
 
 ```
 
@@ -24650,6 +24232,805 @@ event_bus = EventBus.instance()
 
 --------------------------------------------------
 
+### DATEI: data_sync/__init__.py
+```py
+# data_sync/__init__.py
+"""
+data_sync-Paket (18.01.02, E3): MT5-Synchronisation.
+
+  * mt5_sync_service.py – get_timeframes, TF_SECONDS_MAP, MT5_LOCK,
+                          check_mt5_connection, get_latest_timestamp, sync_market_data
+
+Importiert nur die db-Basisschicht (E4); kein Import von main.py/db_service.py.
+"""
+
+```
+
+--------------------------------------------------
+
+### DATEI: data_sync/mt5_sync_service.py
+```py
+# data_sync/mt5_sync_service.py
+"""
+data_sync/mt5_sync_service.py - MT5-Sync-Service (Zeitrahmen, Verbindung, Import).
+
+Ausgelagert aus db_service.py im Rahmen von 18.01.02 (E3): SYMBOLS,
+get_timeframes/TF_SECONDS_MAP/MT5_LOCK (MT5-Konfiguration),
+check_mt5_connection (Verbindungspruefung), get_latest_timestamp und
+sync_market_data (Voll-/Update-Import der MT5-Historie).
+
+Lazy-Import-Prinzip (E3): `MetaTrader5` wird weiterhin erst beim Aufruf
+importiert – kein MT5-DLL-Load beim Modul-Import.
+
+Abhaengigkeiten (E4): db/db_pool (DB_MARKET_DATA, db_connect),
+db/schema_initializer (check_and_init_databases).
+"""
+
+import threading
+import time
+from typing import Dict, Optional, Set, Tuple
+
+import duckdb
+import pandas as pd
+
+from db.db_pool import DB_MARKET_DATA, db_connect
+from db.schema_initializer import check_and_init_databases
+
+SYMBOLS = ["SILVER", "GOLD", "BTCUSD"]
+
+# TIMEFRAMES als Lazy-Initialisierung (vermeidet MT5-DLL-Load beim Import)
+_TIMEFRAMES_CACHE: Optional[Dict[str, int]] = None
+
+
+def get_timeframes() -> Dict[str, int]:
+    """Gibt das Timeframe-Mapping zurueck (lazy, importiert mt5 nur bei Bedarf)."""
+    global _TIMEFRAMES_CACHE
+    if _TIMEFRAMES_CACHE is None:
+        import MetaTrader5 as _mt5
+        _TIMEFRAMES_CACHE = {
+            "MN1": _mt5.TIMEFRAME_MN1,
+            "W1": _mt5.TIMEFRAME_W1,
+            "D1": _mt5.TIMEFRAME_D1,
+            "H4": _mt5.TIMEFRAME_H4,
+            "H1": _mt5.TIMEFRAME_H1,
+            "M30": _mt5.TIMEFRAME_M30,
+            "M15": _mt5.TIMEFRAME_M15,
+            "M10": _mt5.TIMEFRAME_M10,
+            "M5": _mt5.TIMEFRAME_M5,
+            "M2": _mt5.TIMEFRAME_M2,
+            "M1": _mt5.TIMEFRAME_M1,
+        }
+    return _TIMEFRAMES_CACHE
+
+TF_SECONDS_MAP: Dict[str, int] = {
+    "M1": 60,
+    "M2": 120,
+    "M5": 300,
+    "M10": 600,
+    "M15": 900,
+    "M30": 1800,
+    "H1": 3600,
+    "H4": 14400,
+    "D1": 86400,
+    "W1": 604800,
+    "MN1": 2592000,
+}
+
+MT5_LOCK = threading.Lock()
+
+
+# ==============================================================================
+# 2) MT5 VERBINDUNG PRÜFEN
+# ==============================================================================
+def check_mt5_connection() -> None:
+    """Prüft die MT5-Verbindung mit abgesicherter Fehlerbehandlung (lazy mt5 import)."""
+    import MetaTrader5 as _mt5
+
+    print("\n🔗 [2/3] Prüfe MT5-Verbindung...")
+
+    with MT5_LOCK:
+        if not _mt5.initialize():
+            error_code = _mt5.last_error()
+            try:
+                _mt5.shutdown()
+            except Exception:
+                pass
+            raise SystemExit(
+                f"❌ KRITISCHER FEHLER: MT5-Verbindung fehlgeschlagen!\n"
+                f"   Fehlercode: {error_code}\n"
+                f"   Bitte stelle sicher, dass das MT5 Terminal geöffnet und eingeloggt ist."
+            )
+
+        account = _mt5.account_info()
+        if account is None:
+            try:
+                _mt5.shutdown()
+            except Exception:
+                pass
+            raise SystemExit("❌ KRITISCHER FEHLER: Im MT5-Terminal ist kein Konto eingeloggt!")
+
+        for symbol in SYMBOLS:
+            if not _mt5.symbol_select(symbol, True):
+                try:
+                    _mt5.shutdown()
+                except Exception:
+                    pass
+                raise SystemExit(f"❌ KRITISCHER FEHLER: Symbol '{symbol}' konnte im MT5 nicht aktiviert werden.")
+
+    print(f"   ✅ Verbunden mit Broker: {account.company} (Server: {account.server}, Login: {account.login})")
+
+
+# ==============================================================================
+# 3 & 4) DATEN HILFSFUNKTIONEN & IMPORT-SCHLEIFE
+# ==============================================================================
+def get_latest_timestamp(con: duckdb.DuckDBPyConnection, symbol: str, timeframe_str: str) -> Optional[datetime]:
+    """Liefert den neuesten Zeitstempel eines Symbol/Timeframe in ohlcv_bars."""
+    res = con.execute("""
+        SELECT MAX(time)
+        FROM ohlcv_bars
+        WHERE symbol = ? AND timeframe = ?
+    """, [symbol, timeframe_str]).fetchone()
+
+    return res[0] if res and res[0] is not None else None
+
+
+def sync_market_data() -> Set[Tuple[str, str]]:
+    """Synchronisiert die MT5-Historie (VOLLIMPORT oder UPDATE) je Symbol/Timeframe."""
+    import MetaTrader5 as _mt5
+    timeframes = get_timeframes()
+
+    check_and_init_databases()
+    check_mt5_connection()
+
+    print(f"\n📥 [3/3] Starte Synchronisation für {', '.join(SYMBOLS)} über {len(timeframes)} Timeframes...")
+
+    start_time_total = time.perf_counter()
+    total_bars_downloaded = 0
+    updated_pairs: Set[Tuple[str, str]] = set()
+
+    for symbol in SYMBOLS:
+        print(f"\n--- Synchronisiere {symbol} ---")
+        # Connection pro Symbol öffnen/schließen, damit andere Threads (LiveTickWorker)
+        # zwischendurch ebenfalls auf die DB zugreifen können
+        con = db_connect(DB_MARKET_DATA)
+        try:
+            for tf_str, tf_mt5 in timeframes.items():
+                tf_start = time.perf_counter()
+
+                last_time = get_latest_timestamp(con, symbol, tf_str)
+
+                with MT5_LOCK:
+                    if last_time is not None:
+                        rates = _mt5.copy_rates_from_pos(symbol, tf_mt5, 0, 5_000)
+                        update_type = "UPDATE"
+                    else:
+                        rates = _mt5.copy_rates_from_pos(symbol, tf_mt5, 0, 10_000_000)
+                        update_type = "VOLLIMPORT"
+
+                    if rates is None:
+                        err = _mt5.last_error()
+                        print(f"   [--] {tf_str:<4} | MT5 Fehler beim Abrufen der Kerzen: {err}")
+                        continue
+
+                if len(rates) == 0:
+                    print(f"   [--] {tf_str:<4} | Keine Kerzen von MT5 empfangen.")
+                    continue
+
+                df = pd.DataFrame(rates)
+                df["symbol"] = symbol
+                df["timeframe"] = tf_str
+                df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+                df = df.drop_duplicates(subset=["time"], keep="last")
+
+                df_to_insert = df[
+                    [
+                        "symbol",
+                        "timeframe",
+                        "time",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "tick_volume",
+                        "spread",
+                        "real_volume",
+                    ]
+                ]
+
+                con.register("df_temp", df_to_insert)
+
+                # NATIVE UPSERT VIA PRIMÄRSCHLÜSSEL (symbol, timeframe, time)
+                con.execute("""
+                    INSERT OR REPLACE INTO ohlcv_bars (
+                        symbol, timeframe, time, open, high, low, close, tick_volume, spread, real_volume
+                    )
+                    SELECT
+                        symbol, timeframe, "time", open, high, low, close, tick_volume, spread, real_volume
+                    FROM df_temp
+                """)
+
+                con.unregister("df_temp")
+
+                tf_elapsed = time.perf_counter() - tf_start
+                bars_count = len(df_to_insert)
+                total_bars_downloaded += bars_count
+
+                if bars_count > 0:
+                    updated_pairs.add((symbol, tf_str))
+
+                print(f"   [✅] {tf_str:<4} | {update_type:<10} | {bars_count:>8,} Kerzen verarbeitet in {tf_elapsed:.2f}s")
+        finally:
+            con.close()
+
+    total_elapsed = time.perf_counter() - start_time_total
+
+    print("\n" + "=" * 60)
+    print("⏱️  ERGEBNIS & ZEITMESSUNG")
+    print("=" * 60)
+    print(f"Gesamtdauer Process:    {total_elapsed:.2f} Sekunden")
+    print(f"Gesamtanzahl Kerzen:    {total_bars_downloaded:,}")
+    print(f"Durchschnittliche Rate: {total_bars_downloaded / max(total_elapsed, 0.001):,.0f} Kerzen/Sekunde")
+    print("=" * 60)
+    return updated_pairs
+
+```
+
+--------------------------------------------------
+
+### DATEI: db/__init__.py
+```py
+# db/__init__.py
+"""
+db-Paket (18.01.02, E3): Datenbank-Basisschicht.
+
+  * db_pool.py            – DbPool, db_connect, _LockedConnection, with_db_lock, DB-Pfade
+  * db_utils.py           – _parse_json_field, _ensure_epoch
+  * schema_initializer.py – check_and_init_databases
+
+Kein Modul dieses Pakets importiert main.py oder db_service.py (E4).
+"""
+
+```
+
+--------------------------------------------------
+
+### DATEI: db/db_pool.py
+```py
+# db/db_pool.py
+"""
+db/db_pool.py - Thread-lokaler DuckDB-Verbindungspool & DB-Pfad-Konstanten.
+
+Ausgelagert aus db_service.py im Rahmen von 18.01.02 (Refactoring &
+Modularisierung, Pruefprotokoll-Entscheidung E3). Enthaelt:
+
+  * `DATA_DIR` / `DB_MARKET_DATA` / `DB_ANALYTICS` / `DB_APP_DATA` (Pfad-Konstanten)
+  * `DbPool` (Thread-local Singleton: eine Connection pro Thread & DB-Datei)
+  * `_LockedConnection` (LEGACY-Wrapper) und `db_connect` (LEGACY)
+  * `with_db_lock` (No-op Decorator, API-Kompatibilitaet)
+
+Basis-Schicht (E4): kein Import anderer Projekt-Module.
+"""
+
+import os
+import threading
+from typing import Dict
+
+import duckdb
+
+# ==============================================================================
+# CONFIGURATION & THREAD SAFETY
+# ==============================================================================
+DATA_DIR = "data"
+DB_MARKET_DATA = os.path.join(DATA_DIR, "market_data.duckdb")
+DB_ANALYTICS = os.path.join(DATA_DIR, "analytics.duckdb")
+DB_APP_DATA = os.path.join(DATA_DIR, "app_data.duckdb")
+
+# ==============================================================================
+# DB LOCK-FREIER CONNECTION-HELPER
+# ==============================================================================
+# DuckDB unterstützt Multiple Connections innerhalb eines Prozesses nativ.
+# Threading-Locks sind hier kontraproduktiv, da sie z. B. eine dauerhaft
+# offene Haupt-Connection (self.db in MainWindow) blockieren.
+# Cross-Prozess-Konflikte (IO Error: file is already open) werden durch
+# sauberes Beenden vorheriger Prozesse gelöst, nicht durch threading.Lock.
+
+
+def with_db_lock(db_path: str):
+    """No-op decorator (Lock-frei). Beibehalten für API-Kompatibilität."""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+# ==============================================================================
+# DB CONNECTION POOL (Thread-local Singleton) – eine Connection pro Thread & DB
+# ==============================================================================
+# Loest drei Kernprobleme unter Windows:
+#   1. "Can't open a connection with a different configuration" – immer gleiche Config
+#   2. "Cannot open file – file used by another process" – keine Open/Close-Zyklen
+#   3. DuckDB-Connections sind nicht thread-safe – eigenes Connection pro Thread
+#
+# Nutzung: DbPool.get(db_path) statt db_connect(db_path)
+# Connections werden automatisch via atexit geschlossen.
+
+_db_pool_lock = threading.Lock()
+_db_pool_global: Dict[str, int] = {}  # abs_path -> Referenzzähler (fuer atexit)
+
+
+class DbPool:
+    """Thread-sicherer Connection-Pool: eine persistente Connection pro Thread & DB-Datei."""
+
+    _local = threading.local()
+
+    @staticmethod
+    def get(db_path: str) -> duckdb.DuckDBPyConnection:
+        """Gibt eine persistente Connection zur DB-Datei zurueck (eine pro Thread).
+        Die Connection lebt bis Prozess-Ende und wird nie geschlossen."""
+        abs_path = os.path.abspath(db_path)
+        # Thread-local Storage: Jeder Thread hat seine eigenen Connections
+        if not hasattr(DbPool._local, 'conns'):
+            DbPool._local.conns = {}
+        if abs_path not in DbPool._local.conns:
+            DbPool._local.conns[abs_path] = duckdb.connect(abs_path)
+            # Globalen Referenzzähler erhöhen (für atexit)
+            with _db_pool_lock:
+                if _db_pool_global.get(abs_path, 0) == 0:
+                    import atexit
+                    atexit.register(lambda p=abs_path: DbPool._close_all_for(p))
+                _db_pool_global[abs_path] = _db_pool_global.get(abs_path, 0) + 1
+        return DbPool._local.conns[abs_path]
+
+    @staticmethod
+    def _close_all_for(abs_path: str) -> None:
+        """Schliesst ALLE Connections zu einer DB-Datei (fuer atexit)."""
+        # Kann nur die Connections des aktuellen Threads schliessen
+        if hasattr(DbPool._local, 'conns'):
+            con = DbPool._local.conns.pop(abs_path, None)
+            if con is not None:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def close_all() -> None:
+        """Schliesst ALLE Connections des aktuellen Threads.
+
+        Dekrementiert dabei den globalen Referenzzaehler, damit der
+        atexit-Bookkeeping-Dict (Fix 15.03, Worker-Connection-Leak) nicht
+        unbegrenzt waechst. Wird u. a. von AnalyticsAsyncWorker nach jeder
+        Abfrage aufgerufen (Worker-Thread gibt seine Connection frei; ein
+        neuer Worker-Thread erhaelt automatisch eine frische Connection).
+        """
+        if hasattr(DbPool._local, 'conns'):
+            for abs_path in list(DbPool._local.conns.keys()):
+                try:
+                    DbPool._local.conns[abs_path].close()
+                except Exception:
+                    pass
+                with _db_pool_lock:
+                    _db_pool_global[abs_path] = max(
+                        0, _db_pool_global.get(abs_path, 0) - 1)
+            DbPool._local.conns = {}
+
+
+class _LockedConnection:
+    """Wrapper um DuckDBPyConnection (LEGACY – nur noch fuer sync_market_data & MarketDataRepository).
+    Oeffnet/schliesst die Connection bei jedem Aufruf.
+    """
+
+    def __init__(self, con: duckdb.DuckDBPyConnection):
+        self._con = con
+
+    def __getattr__(self, name):
+        return getattr(self._con, name)
+
+    def close(self):
+        try:
+            self._con.close()
+        finally:
+            pass
+
+
+def db_connect(db_path: str, read_only: bool = False) -> _LockedConnection:
+    """LEGACY: Oeffnet eine neue Connection (wird geschlossen nach Gebrauch).
+
+    Warnung: Nicht fuer haeufige Zugriffe verwenden!
+    Nutze stattdessen: DbPool.get(db_path)
+    """
+    con = duckdb.connect(db_path, read_only=read_only)
+    return _LockedConnection(con)
+
+```
+
+--------------------------------------------------
+
+### DATEI: db/db_utils.py
+```py
+# db/db_utils.py
+"""
+db/db_utils.py - Gemeinsame DB-Hilfsfunktionen.
+
+Ausgelagert aus db_service.py im Rahmen von 18.01.02 (E3): `_parse_json_field`
+(DuckDB liefert JSON teils als str, teils als dict) und `_ensure_epoch`
+(DEPRECATED, backward-compat). Basis-Schicht (E4) – kein Projekt-Import.
+"""
+
+import calendar
+import json
+from datetime import datetime
+from typing import Any
+
+
+def _ensure_epoch(val: Any) -> int:
+    """DEPRECATED: Nutze stattdessen EXTRACT('epoch' FROM time)::BIGINT in SQL.
+    Diese Funktion zerstört die Zeitzone bei TIMESTAMPTZ (timetuple() verliert offset).
+    Nur noch für backward-compat in Test-Dateien."""
+    if isinstance(val, datetime):
+        return calendar.timegm(val.timetuple())
+    return int(val)
+
+
+def _parse_json_field(val: Any) -> Any:
+    """Wandelt JSON aus DuckDB in Python-Objekt um (str->dict, dict bleibt)."""
+    if isinstance(val, str):
+        return json.loads(val) if val else None
+    return val
+
+```
+
+--------------------------------------------------
+
+### DATEI: db/schema_initializer.py
+```py
+# db/schema_initializer.py
+"""
+db/schema_initializer.py - Pruefen, Anlegen & Migrieren der Kern-Datenbanken.
+
+Ausgelagert aus db_service.py im Rahmen von 18.01.02 (E3): `check_and_init_databases`
+legt die drei DuckDB-Dateien (market_data, analytics, app_data) mit ihrem
+Schema idempotent an und fuehrt additive Migrationen aus. Importiert die
+Basis-Schicht db/db_pool (E4); kein MT5-Import (Lazy-Import-Prinzip).
+"""
+
+import os
+
+from db.db_pool import DATA_DIR, DB_ANALYTICS, DB_APP_DATA, DB_MARKET_DATA, DbPool
+
+
+def check_and_init_databases() -> None:
+    """Prüft, initialisiert und migriert die Kern-Datenbanken bei Bedarf."""
+    print("🔍 [1/3] Prüfe und initialisiere Ordnerstruktur und Datenbanken...")
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    con_market = DbPool.get(DB_MARKET_DATA)
+    con_market.execute("""
+        CREATE TABLE IF NOT EXISTS ohlcv_bars (
+            symbol      VARCHAR NOT NULL,
+            timeframe   VARCHAR NOT NULL,
+            time        TIMESTAMPTZ NOT NULL,
+            open        DOUBLE NOT NULL,
+            high        DOUBLE NOT NULL,
+            low         DOUBLE NOT NULL,
+            close       DOUBLE NOT NULL,
+            tick_volume BIGINT,
+            spread      INTEGER,
+            real_volume BIGINT,
+            created_at  TIMESTAMP DEFAULT current_timestamp,
+            PRIMARY KEY (symbol, timeframe, time)
+        );
+    """)
+
+    try:
+        col_type_row = con_market.execute("""
+            SELECT data_type
+            FROM information_schema.columns
+            WHERE LOWER(table_name) = 'ohlcv_bars' AND LOWER(column_name) = 'time'
+        """).fetchone()
+
+        if col_type_row and col_type_row[0].upper() == "TIMESTAMP":
+            print("⚠️ [MIGRATION] Konvertiere 'time' Spalte in ohlcv_bars von TIMESTAMP zu TIMESTAMPTZ...")
+            con_market.execute("ALTER TABLE ohlcv_bars ALTER time TYPE TIMESTAMPTZ")
+            print("✅ [MIGRATION] Konvertierung erfolgreich abgeschlossen.")
+    except Exception as e:
+        print(f"⚠️ [MIGRATION WARNUNG] Migration konnte nicht durchgeführt werden: {e}")
+
+    con_analytics = DbPool.get(DB_ANALYTICS)
+    con_analytics.execute("""
+        CREATE TABLE IF NOT EXISTS analytics_metadata (
+            created_at TIMESTAMP DEFAULT current_timestamp,
+            info VARCHAR
+        );
+    """)
+
+    # Analytics-Tabelle für Feature-/Plugin-Daten
+    # 17.01 (E-1, 07.08.2026): 4-Spalten-PK (symbol, timeframe, bar_time,
+    # feature_id) – erlaubt die konfliktfreie Speicherung MEHRERER Services auf
+    # derselben Kerze (feature_id identifiziert das erzeugende Plugin, Default
+    # 'native' fuer den klassischen Feature-Builder-Pfad). Bei bestehenden DBs
+    # ist CREATE TABLE IF NOT EXISTS ein No-op; die Migration existierender
+    # Tabellen erfolgt ueber test/migrate_pk.py (Table-Rewrite + RENAME, da
+    # DuckDB 1.5.5 kein DROP PRIMARY KEY unterstuetzt).
+    con_analytics.execute("""
+        CREATE TABLE IF NOT EXISTS feature_store (
+            symbol      VARCHAR NOT NULL,
+            timeframe   VARCHAR NOT NULL,
+            bar_time    TIMESTAMPTZ NOT NULL,
+            ema_diff    DOUBLE,
+            rsi_14      DOUBLE,
+            atr_normalized DOUBLE,
+            created_at  TIMESTAMP DEFAULT current_timestamp,
+            feature_id  VARCHAR NOT NULL DEFAULT 'native',
+            plugin_version VARCHAR,
+            feature_data JSON,
+            PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
+        );
+    """)
+
+    # Phase 12 (Hybrid-Schema): Additive Erweiterung des feature_store um die
+    # Plugin-Architektur. feature_id identifiziert das erzeugende Plugin
+    # (z.B. 'srv_grid_lines'), plugin_version dessen Version und feature_data
+    # haelt den vollstaendigen FeatureStorePayload (JSON). Bestehende Spalten
+    # und Daten bleiben unangetastet.
+    con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_id VARCHAR;")
+    con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS plugin_version VARCHAR;")
+    con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_data JSON;")
+    # Bugfix 07.08.2026 (Phase 17 Bugfix-Runde 2): Der Spalten-DEFAULT von
+    # created_at wurde durch die PK-Migration (17.01 E-1, test/migrate_pk.py –
+    # Table-Rewrite + RENAME) entfernt. Seitdem bleiben NEUE feature_store-Rows
+    # ohne explizites created_at NULL und das 'Datum der letzten Ausfuehrung'
+    # (MasterTree, MAX(created_at) je feature_id) zeigt '--.--.--'. Der DEFAULT
+    # wird hier idempotent wiederhergestellt (No-op bei korrekter DB).
+    try:
+        con_analytics.execute(
+            "ALTER TABLE feature_store ALTER created_at "
+            "SET DEFAULT current_timestamp")
+    except Exception as e:
+        print(f"⚠️ [MIGRATION WARNUNG] created_at-Default des feature_store "
+              f"konnte nicht wiederhergestellt werden: {e}")
+
+    con_app = DbPool.get(DB_APP_DATA)
+    con_app.execute("""
+        CREATE TABLE IF NOT EXISTS app_config (
+            key VARCHAR PRIMARY KEY,
+            value VARCHAR,
+            updated_at TIMESTAMP DEFAULT current_timestamp
+        );
+    """)
+
+    # Phase 15 (15.01): Symbol- & Favoriten-Verwaltung. broker_symbols haelt
+    # die Broker-Symbole (aus mt5.symbols_get()) inkl. Favoriten-Flag und
+    # dient als Fallback, wenn MT5 nicht verfuegbar ist. Standard-Defaults
+    # (SILVER, GOLD, BTCUSD) werden als Favoriten vorbelegt, damit die
+    # Favoriten-Dropdowns (ServiceWindow/AnalyticsWindow) nie leer starten.
+    con_app.execute("""
+        CREATE TABLE IF NOT EXISTS broker_symbols (
+            symbol      VARCHAR PRIMARY KEY,
+            path        VARCHAR,
+            is_favorite BOOLEAN DEFAULT FALSE,
+            updated_at  TIMESTAMP DEFAULT current_timestamp
+        );
+    """)
+    con_app.execute("""
+        INSERT INTO broker_symbols (symbol, path, is_favorite)
+        VALUES ('SILVER', '', TRUE), ('GOLD', '', TRUE), ('BTCUSD', '', TRUE)
+        ON CONFLICT (symbol) DO NOTHING;
+    """)
+
+    # Phase 15 (15.03): Analytics-Profile. analytics_profiles haelt benannte
+    # Parametrisierungen der Analytics-UI (Option B – Explicit Save: Slider-/
+    # Parametertrends setzen Dirty-Flag, Speichern erst auf [Save]). Das
+    # Profil-Payload-JSON (Spalte payload) enthaelt als Pflichtfeld
+    # `schema_version` (15.03-Spezifikation: 1). Additiv/idempotent –
+    # bestehende Profile bleiben unangetastet.
+    con_app.execute("""
+        CREATE TABLE IF NOT EXISTS analytics_profiles (
+            profile_id  VARCHAR PRIMARY KEY,
+            name        VARCHAR NOT NULL,
+            description VARCHAR,
+            payload     JSON,
+            is_active   BOOLEAN DEFAULT FALSE,
+            created_at  TIMESTAMP DEFAULT current_timestamp,
+            updated_at  TIMESTAMP DEFAULT current_timestamp
+        );
+    """)
+    print(f"   ✅ Ordner '{DATA_DIR}/' und alle 3 DBs sind einsatzbereit.")
+
+```
+
+--------------------------------------------------
+
+### DATEI: repositories/__init__.py
+```py
+# repositories/__init__.py
+"""
+repositories-Paket (18.01.02, E3): Exklusive Lese-Repositories.
+
+  * market_data_repository.py – MarketDataRepository, get_symbol_precision
+
+Importiert nur die db-Basisschicht (E4); kein Import von main.py/db_service.py.
+"""
+
+```
+
+--------------------------------------------------
+
+### DATEI: repositories/market_data_repository.py
+```py
+# repositories/market_data_repository.py
+"""
+repositories/market_data_repository.py - Exklusiver Lesezugriff auf Marktdaten.
+
+Ausgelagert aus db_service.py im Rahmen von 18.01.02 (E3): `MarketDataRepository`
+(kapselt den exklusiven Lesezugriff auf die Marktdatenbank) und
+`get_symbol_precision` (identische Precision-Query, DRY – Grundlage der
+Custom-Level-Eingabefelder). Importiert nur db/db_pool (E4).
+"""
+
+import os
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+from db.db_pool import DB_MARKET_DATA, DbPool, db_connect
+
+
+# ==============================================================================
+# HELPER: Symbol-Preision (fixer Wert je Symbol, identisch zur Preisskala)
+# ==============================================================================
+def get_symbol_precision(symbol: str, timeframe: str,
+                         db_path: str = DB_MARKET_DATA) -> int:
+    """Liefert die Preisskala-Praezision (Nachkommastellen) eines Symbols.
+
+    Identische Query wie MarketDataRepository.fetch_historical_candles()
+    (die Preisskala im Chart nutzt exakt diesen Wert) – jedoch OHNE die
+    Candles zu laden. Wird fuer die Custom-Level-Eingabefelder (prox_level1..6)
+    verwendet, damit die Eingabe dieselbe Dezimalanzahl wie die Preisskala hat.
+
+    Fallback: 2 bei fehlender DB / leerer Tabelle / Fehler.
+    """
+    default = 2
+    if not os.path.exists(db_path):
+        return default
+    try:
+        con = DbPool.get(db_path)
+        p_row = con.execute("""
+            SELECT COALESCE(MAX(
+                CASE
+                    WHEN POSITION('.' IN CAST(ROUND(close, 5) AS VARCHAR)) > 0
+                    THEN LENGTH(RTRIM(CAST(ROUND(close, 5) AS VARCHAR), '0'))
+                         - POSITION('.' IN CAST(ROUND(close, 5) AS VARCHAR))
+                    ELSE 0
+                END
+            ), 2) AS precision
+            FROM (
+                SELECT close
+                FROM ohlcv_bars
+                WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+                  AND close IS NOT NULL
+                LIMIT 1000
+            );
+        """, [symbol, timeframe]).fetchone()
+        if p_row and p_row[0] is not None:
+            return int(p_row[0])
+    except Exception:
+        pass
+    return default
+
+
+# ==============================================================================
+# REPOSITORY MIT ROBUSTER STATISTISCHER PRECISION-ERMITTLUNG
+# ==============================================================================
+class MarketDataRepository:
+    """Kapselt den exklusiven Lesezugriff auf die Marktdatenbank."""
+
+    def __init__(self, db_path: str = DB_MARKET_DATA) -> None:
+        self.db_path = db_path
+
+    def fetch_historical_candles(self, symbol: str, timeframe: str, limit: int = 3000,
+                                 before_epoch: Optional[int] = None) -> Tuple[List[Dict[str, Any]], int]:
+        """Liest OHLCV-Kerzen aus der Marktdatenbank (aufsteigend sortiert).
+
+        Phase 16.07 (Two-Tier Caching, D4): Additiver Parameter `before_epoch`.
+        Ist er gesetzt, werden ausschliesslich KERZEN GELADEN, DIE ÄLTER ALS
+        diese Wanduhr-Epoch sind (WHERE "time" < to_timestamp(?)) – das
+        Chunk-Nachladen des `ChartDataBuffer` (Tier 2 -> DuckDB) nutzt genau
+        diesen Pfad, um den naechsten Block alter Geschichte vorzuladen.
+        Ohne `before_epoch` ist das Verhalten unveraendert (letzte `limit`
+        Kerzen, Abwaertskompatibilitaet).
+        """
+        candles: List[Dict[str, Any]] = []
+        precision: int = 2
+
+        if not os.path.exists(self.db_path):
+            return candles, precision
+
+        for attempt in range(3):
+            try:
+                con = db_connect(self.db_path)
+
+                precision_query = """
+                    SELECT COALESCE(MAX(
+                        CASE
+                            WHEN POSITION('.' IN CAST(ROUND(close, 5) AS VARCHAR)) > 0
+                            THEN LENGTH(RTRIM(CAST(ROUND(close, 5) AS VARCHAR), '0')) - POSITION('.' IN CAST(ROUND(close, 5) AS VARCHAR))
+                            ELSE 0
+                        END
+                    ), 2) AS precision
+                    FROM (
+                        SELECT close
+                        FROM ohlcv_bars
+                        WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+                          AND close IS NOT NULL
+                        LIMIT 1000
+                    );
+                """
+                p_row = con.execute(precision_query, [symbol, timeframe]).fetchone()
+                if p_row and p_row[0] is not None:
+                    precision = int(p_row[0])
+
+                # Phase 16.07: before_epoch filtert additiv auf ältere Kerzen
+                # (Wanduhr-Epoch; "time" ist TIMESTAMPTZ, daher to_timestamp-
+                # Vergleich). Die WHERE-Bedingung wird nur bei gesetztem
+                # before_epoch ergänzt (Abwaertskompatibilität).
+                older_filter = ""
+                params: List[Any] = [symbol, timeframe]
+                if before_epoch is not None:
+                    older_filter = ' AND "time" < to_timestamp(?)'
+                    params.append(int(before_epoch))
+                params.append(limit)
+
+                query = """
+                    SELECT EXTRACT('epoch' FROM "time")::BIGINT AS time_epoch,
+                           open, high, low, close, tick_volume
+                    FROM (
+                        SELECT "time", open, high, low, close, tick_volume
+                        FROM ohlcv_bars
+                        WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+                          AND "time" IS NOT NULL
+                          AND open IS NOT NULL
+                          AND high IS NOT NULL
+                          AND low IS NOT NULL
+                          AND close IS NOT NULL
+                        """ + older_filter + """
+                        ORDER BY "time" DESC
+                        LIMIT ?
+                    )
+                    ORDER BY "time" ASC;
+                """
+                rows = con.execute(query, params).fetchall()
+                con.close()
+
+                for r in rows:
+                    t_epoch = int(r[0])  # Bereits epoch-Integer aus DuckDB
+                    # P16.05 VWMA-Fix (P-D4): tick_volume wird mitgeliefert.
+                    # Entscheidung F3: NaN/None -> 0, Candle bleibt gueltig
+                    # (kein WHERE-Filter auf tick_volume, damit Candles mit
+                    # NULL-Volumen nicht wegfallen).
+                    vol_raw = r[5]
+                    candles.append({
+                        "time": t_epoch,
+                        "open": float(r[1]),
+                        "high": float(r[2]),
+                        "low": float(r[3]),
+                        "close": float(r[4]),
+                        "tick_volume": float(vol_raw) if vol_raw is not None else 0.0
+                    })
+                break
+
+            except Exception as e:
+                if attempt == 2:
+                    print(f"❌ [Repository Error] Fehler beim Laden von {symbol} {timeframe}: {e}")
+                else:
+                    time.sleep(0.1)
+
+        return candles, precision
+
+```
+
+--------------------------------------------------
+
 ### DATEI: serviceui/__init__.py
 ```py
 # serviceui/__init__.py
@@ -24781,12 +25162,22 @@ Signale:
     (Service-Info nutzt das bestehende `info_requested`-Signal.)
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import Qt, Signal
+import json
+
+from PySide6.QtCore import QMimeData, Qt, Signal
+from PySide6.QtGui import QDrag
 from PySide6.QtWidgets import (
-    QHeaderView, QMenu, QPushButton, QTreeWidget, QTreeWidgetItem,
+    QHeaderView, QInputDialog, QMenu, QPushButton, QTreeWidget,
+    QTreeWidgetItem,
 )
+
+# 18.01.03 (Dynamic Tree Management): MIME-Typ fuer den internen
+# Kategorie-Drag & Drop. Die MIME-Daten kodieren den gezogenen Knoten als
+# JSON: {"node_type": "set|plugin|category", "group": "sets|plugins",
+#         "id": <set_id|plugin_id|category-path>, "path": <Quell-Pfad>}.
+MIME_CATEGORY_MOVE = "application/x-pytrader-category-move"
 
 # P15-Bugfix: shiboken6.isValid() schuetzt vor dem Zugriff auf bereits
 # C++-seitig zerstoerte Items (QTreeWidget.clear() nach data_changed bei
@@ -24924,13 +25315,36 @@ class MasterTree(QTreeWidget):
     # 17.01.02 (Bugfix-Runde): Run-/Info-Aktionen fuer die Services-Gruppe.
     #   run_plugin_requested(plugin_id)  – '▶️ Diesen Service ausführen'
     #                                      (Einzel-Plugin-Zeile, ohne Set)
-    #   run_category_requested(path)     – '▶️ Alle Services ausführen'
+    #   run_category_requested(group, path) – '▶️ Alle Services ausführen'
     #                                      (Kategorie-Ordner, rekursiv; path
-    #                                      z.B. 'Swing Points/Geometrie')
-    #   category_info_requested(path)    – Info-Button auf Kategorie-Ordnern
+    #                                      z.B. 'Swing Points/Geometrie';
+    #                                      group = 'sets' | 'plugins',
+    #                                      18.01.03: Sets-Ordner moeglich)
+    #   category_info_requested(group, path) – Info-Button auf Kategorie-Ordnern
     run_plugin_requested = Signal(str)
-    run_category_requested = Signal(str)
-    category_info_requested = Signal(str)
+    run_category_requested = Signal(str, str)
+    category_info_requested = Signal(str, str)
+    # 18.01.03 (Dynamic Tree Management): Ordner-CRUD & Kategorie-Drag&Drop.
+    #   create_folder_requested(group, full_path) – 'Neuer Ordner' (der
+    #       MasterTree zeigt den Namensdialog; der Orchestrator PERSISTIERT
+    #       den Ordner ueber global_settings (tree_folders_<group>,
+    #       service_set_utils.create_empty_folder) – E3-revidiert
+    #       08.08.2026: Leere Ordner verschwinden NICHT beim Refresh).
+    #   delete_folder_requested(group, path) – 'Ordner löschen' (manuelle
+    #       Loeschung; der Orchestrator entfernt den Eintrag ueber
+    #       service_set_utils.delete_empty_folder).
+    #   rename_folder_requested(group, old_path, new_path) – 'Umbenennen'
+    #       (String-Replace aller Kinder + persistierter Leere-Ordner im
+    #       Orchestrator).
+    #   folder_item_moved(node_type, item_id, new_path) – Drop eines Sets
+    #       (TYPE_SET) bzw. Plugins (TYPE_PLUGIN) in einen Ziel-Ordner.
+    #   folder_moved(group, old_path, new_path) – Drop eines Ordners auf
+    #       einen anderen Ordner (verschiebt alle Kinder rekursiv).
+    create_folder_requested = Signal(str, str)
+    delete_folder_requested = Signal(str, str)
+    rename_folder_requested = Signal(str, str, str)
+    folder_item_moved = Signal(str, str, str)
+    folder_moved = Signal(str, str, str)
 
     def __init__(self, model, parent=None) -> None:
         super().__init__(parent)
@@ -24991,6 +25405,25 @@ class MasterTree(QTreeWidget):
         self._checked_items: set = set()
         self._updating_checks: bool = False
 
+        # 18.01.03 (Dynamic Tree Management): Interner Kategorie-Drag&Drop.
+        # Nur Sets/Plugins/Ordner sind ziehbar (E4 – kein Service-Reorder);
+        # der Drop aktualisiert den Kategorie-Pfad ueber die Signale
+        # folder_item_moved/folder_moved (Modell/Repositories persistieren).
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QTreeWidget.DragDrop)  # type: ignore[attr-defined]
+        #: Beim Mausklick gemerktes Item – Quelle eines beginnenden Drags
+        #: (mousePressEvent -> startDrag).
+        self._drag_source: Optional[QTreeWidgetItem] = None
+        # 18.01.03 (Bugfix 08.08.2026): Aufklapp-Zustand ueber Baum-
+        # Neuaufbauten hinweg erhalten. Ein Ordner-/Item-Move oder eine
+        # Ordner-Erstellung triggert data_changed -> _populate(); der Baum
+        # soll dabei NICHT zusammenklappen. Schluessel im RAM:
+        #   ("cat", group, kategorie-pfad) fuer Ordner,
+        #   ("set", set_id)                 fuer Set-Knoten.
+        self._expand_after_rebuild: set = set()
+
         self._populate()
         self.itemSelectionChanged.connect(self._emit_selection)
         # 15.03-E: Checkbox-Aenderungen (Klick) -> Tri-State + Signal.
@@ -25004,6 +25437,10 @@ class MasterTree(QTreeWidget):
     def _populate(self) -> None:
         """Baut den Baum aus model.build_tree() neu auf (deterministisch)."""
         current = self._safe_current_selection()
+        # 18.01.03 (Bugfix 08.08.2026): Expansion-Zustand VOR dem Neuaufbau
+        # sichern – der Baum soll nach Ordner-Erstellung/-Verschiebung NICHT
+        # zusammenklappen (_collect_expanded_state liest den IST-Baum).
+        expanded = self._collect_expanded_state()
         self.blockSignals(True)
         self.clear()
         try:
@@ -25023,6 +25460,10 @@ class MasterTree(QTreeWidget):
                 group_item.setExpanded(True)
         except Exception as e:
             print(f"WARN [MasterTree] Baum-Aufbau fehlgeschlagen: {e}")
+        # 18.01.03 (Bugfix 08.08.2026): Expansion unter blockSignals
+        # wiederherstellen (keine Signal-Seiteneffekte; die '>'/'⌄'-Labels
+        # refresht der anschliessende Label-Block explizit).
+        self._apply_expanded_state(expanded)
         self.blockSignals(False)
         # Bugfix 04.08.2026 (Punkt 2/3): unter blockSignals feuern die
         # itemExpanded/itemCollapsed-Signale nicht – die Labels der
@@ -25058,6 +25499,10 @@ class MasterTree(QTreeWidget):
                 self._apply_dirty_label(iid, True)
         finally:
             self._updating_checks = False
+        # 18.01.03 (E3-revidiert): Leere Ordner kommen jetzt aus dem Modell
+        # (build_tree mischt die persistierten tree_folders_<group>-Pfade
+        # ein) – ein separater UI-Zustand ist nicht mehr noetig.
+        pass
 
     def _safe_current_selection(self) -> Dict[str, str]:
         """Liess die aktuelle Auswahl defensiv (isValid-Guard gegen zerstoerte
@@ -25109,7 +25554,8 @@ class MasterTree(QTreeWidget):
         ItemIsUserCheckable). Die Selektion liefert fuer Ordner den
         Default-Pfad zurueck (K7).
         """
-        label = _expandable_label(str(child.get("label") or "?"), True, False)
+        label = _expandable_label(str(child.get("label") or "?"),
+                                  bool(child.get("children")), False)
         cat_item = QTreeWidgetItem([label, ""])
         cat_item.setData(0, ROLE_NODE_TYPE, TYPE_CATEGORY)
         cat_item.setData(0, ROLE_SET_ID, str(child.get("label") or ""))
@@ -25265,6 +25711,308 @@ class MasterTree(QTreeWidget):
             hops += 1
         return "/".join(reversed(parts))
 
+    # -------------------------------------------------------------------------
+    # 18.01.03 (Dynamic Tree Management): Kategorie-Drag&Drop + Ordner-CRUD
+    # -------------------------------------------------------------------------
+
+    def _group_of(self, item) -> str:
+        """Eltern-GRUPPE eines Items ('sets' / 'plugins', 18.01.03, L3).
+
+        Wandert vom Item zur Top-Level-Gruppe (TYPE_GROUP) und liefert deren
+        ROLE_SET_ID (GROUP_SETS/GROUP_PLUGINS). Leer, wenn keine Gruppe
+        gefunden wird (defensiv).
+        """
+        node = item
+        hops = 0
+        while node is not None and isValid(node) and hops < 64:
+            if node.data(0, ROLE_NODE_TYPE) == TYPE_GROUP:
+                return str(node.data(0, ROLE_SET_ID) or "")
+            node = node.parent()
+            hops += 1
+        return ""
+
+    def _drag_id(self, item) -> str:
+        """Eindeutige ID eines ziehbaren Knotens fuer die MIME-Daten.
+
+        Sets -> set_id (ROLE_SET_ID), Plugins -> plugin_id (ROLE_PLUGIN_ID),
+        Kategorie-Ordner -> voller Kategorie-Pfad (_category_path_of).
+        """
+        node_type = item.data(0, ROLE_NODE_TYPE)
+        if node_type == TYPE_CATEGORY:
+            return self._category_path_of(item)
+        if node_type == TYPE_SET:
+            return str(item.data(0, ROLE_SET_ID) or "")
+        if node_type == TYPE_PLUGIN:
+            return str(item.data(0, ROLE_PLUGIN_ID) or "")
+        return ""
+
+    def startDrag(self, supported_actions) -> None:
+        """Startet den internen Kategorie-Drag (18.01.03, E4).
+
+        Ueberschrieben, damit NUR Sets/Plugins/Ordner gezogen werden
+        (kein Service-Reorder – E4) und die Ziel-Informationen als JSON-MIME
+        transportiert werden (Ordner sind nicht selektierbar, daher liefert
+        der Qt-Default-Mime aus selectedItems() nicht die Quelle).
+        """
+        item = getattr(self, "_drag_source", None)
+        if item is None or not isValid(item):
+            super().startDrag(supported_actions)
+            return
+        node_type = item.data(0, ROLE_NODE_TYPE)
+        if node_type not in (TYPE_SET, TYPE_PLUGIN, TYPE_CATEGORY):
+            super().startDrag(supported_actions)
+            return
+        try:
+            payload = {
+                "node_type": node_type,
+                "group": self._group_of(item),
+                "id": self._drag_id(item),
+                "path": (self._category_path_of(item)
+                         if node_type == TYPE_CATEGORY else ""),
+            }
+            mime = QMimeData()
+            mime.setData(MIME_CATEGORY_MOVE,
+                         json.dumps(payload).encode("utf-8"))
+            drag = QDrag(self)
+            drag.setMimeData(mime)
+            drag.exec(Qt.MoveAction, Qt.MoveAction)
+        except (RuntimeError, AttributeError):
+            pass
+        finally:
+            self._drag_source = None
+
+    def dragEnterEvent(self, event) -> None:
+        """Akzeptiert nur den eigenen Kategorie-Move-MIME (18.01.03)."""
+        try:
+            if event.mimeData().hasFormat(MIME_CATEGORY_MOVE):
+                event.acceptProposedAction()
+                return
+        except (RuntimeError, AttributeError):
+            pass
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:
+        """Akzeptiert den eigenen Kategorie-Move-MIME waehrend des Drags."""
+        try:
+            if event.mimeData().hasFormat(MIME_CATEGORY_MOVE):
+                event.acceptProposedAction()
+                return
+        except (RuntimeError, AttributeError):
+            pass
+        super().dragMoveEvent(event)
+
+    def _drop_target(self, item) -> tuple:
+        """Bestimmt (Gruppe, Ziel-Kategorie-Pfad) fuer ein Drop-Ziel-Item.
+
+        * Gruppe (TYPE_GROUP)  -> ("sets"/"plugins", "" = Root-Ebene)
+        * Ordner (TYPE_CATEGORY) -> (Eltern-Gruppe, Ordner-Pfad)
+        * Blatt (Set/Service/Plugin) -> (Eltern-Gruppe, Pfad des naechsten
+          Kategorie-Vorfahren; "" wenn direkt unter der Gruppe)
+        Liefert ("", "") wenn kein gueltiges Ziel gefunden wird (18.01.03).
+        """
+        if item is None or not isValid(item):
+            return "", ""
+        node_type = item.data(0, ROLE_NODE_TYPE)
+        if node_type == TYPE_GROUP:
+            return str(item.data(0, ROLE_SET_ID) or ""), ""
+        if node_type == TYPE_CATEGORY:
+            return self._group_of(item), self._category_path_of(item)
+        # Blatt: zum naechsten Kategorie-Vorfahren (oder zur Gruppe) wandern.
+        node = item.parent()
+        hops = 0
+        while node is not None and isValid(node) and hops < 64:
+            nt = node.data(0, ROLE_NODE_TYPE)
+            if nt == TYPE_CATEGORY:
+                return self._group_of(node), self._category_path_of(node)
+            if nt == TYPE_GROUP:
+                return str(node.data(0, ROLE_SET_ID) or ""), ""
+            node = node.parent()
+            hops += 1
+        return "", ""
+
+    def dropEvent(self, event) -> None:
+        """Verarbeitet den Kategorie-Drop (18.01.03).
+
+        Der Baum fuehrt KEINEN echten Item-Move aus – es werden nur die
+        Signale folder_item_moved (Set/Plugin) bzw. folder_moved (Ordner)
+        emittiert; der Orchestrator persistiert den Kategorie-Pfad ueber
+        Modell/Repositories und der naechste Refresh baut den Baum neu.
+        Guards:
+          * Nur der eigene MIME wird verarbeitet (sonst Qt-Default).
+          * Gruppen-Mismatch (Set in Plugins-Ordner ziehen) -> abgelehnt.
+          * Ordner-Zyklus (Ordner in seinen eigenen Unterordner) -> abgelehnt.
+        """
+        if not event.mimeData().hasFormat(MIME_CATEGORY_MOVE):
+            super().dropEvent(event)
+            return
+        try:
+            payload = json.loads(
+                bytes(event.mimeData().data(MIME_CATEGORY_MOVE)).decode("utf-8"))
+        except (ValueError, TypeError):
+            event.ignore()
+            return
+        source_type = str(payload.get("node_type") or "")
+        source_group = str(payload.get("group") or "")
+        source_id = str(payload.get("id") or "")
+        source_path = str(payload.get("path") or "")
+        try:
+            pos = (event.position().toPoint() if hasattr(event, "position")
+                   else event.pos())
+        except AttributeError:
+            pos = event.pos()
+        target = self.itemAt(pos)
+        target_group, target_path = self._drop_target(target)
+        if not target_group:
+            event.ignore()
+            return
+        if source_group and source_group != target_group:
+            event.ignore()
+            return
+        if source_type == TYPE_CATEGORY:
+            # Ordner-Verschiebung: Zyklus-Schutz (eigener Unterordner).
+            if (not source_path or target_path == source_path
+                    or target_path.startswith(source_path + "/")):
+                event.ignore()
+                return
+            # 18.01.03 (Bugfix 08.08.2026): Ziel-Ordnerkette fuer den
+            # folgenden Refresh zum Aufklappen merken (VOR dem emit).
+            self._mark_expand(source_group, target_path)
+            self.folder_moved.emit(source_group, source_path, target_path)
+            event.accept()
+            return
+        if source_type in (TYPE_SET, TYPE_PLUGIN) and source_id:
+            # 18.01.03 (Bugfix 08.08.2026): Ziel-Ordnerkette fuer den
+            # folgenden Refresh zum Aufklappen merken (VOR dem emit).
+            self._mark_expand(target_group, target_path)
+            self.folder_item_moved.emit(source_type, source_id, target_path)
+        event.accept()
+
+    def _on_new_folder(self, group: str, parent_path: str) -> None:
+        """Kontextmenue 'Neuer Ordner' (18.01.03, E3-revidiert).
+
+        Fragt den Namen ab und emittiert `create_folder_requested(group,
+        full_path)` – der Orchestrator PERSISTIERT den (ggf. leeren) Ordner
+        ueber global_settings (service_set_utils.create_empty_folder,
+        Key 'tree_folders_<group>'). Damit bleibt der Ordner ueber Refreshs
+        erhalten und verschwindet nur bei manueller Loeschung im
+        Kontextmenue ('Ordner löschen').
+        """
+        name, ok = QInputDialog.getText(
+            self, "Neuer Ordner", "Ordner-Name:")
+        name = (name or "").strip().strip("/")
+        if not ok or not name:
+            return
+        parent_path = str(parent_path or "").strip().strip("/")
+        full_path = f"{parent_path}/{name}" if parent_path else name
+        # 18.01.03 (Bugfix 08.08.2026): Neuen Ordner (und Elternkette) fuer
+        # den folgenden Refresh zum Aufklappen merken – VOR dem emit, weil
+        # der Orchestrator den EventBus synchron feuert (data_changed ->
+        # _populate).
+        self._mark_expand(str(group), full_path)
+        self.create_folder_requested.emit(str(group), full_path)
+
+    def _on_rename_folder(self, group: str, old_path: str) -> None:
+        """Kontextmenue 'Umbenennen' (18.01.03).
+
+        Fragt den neuen Namen ab (vorbelegt mit dem letzten Pfad-Teil) und
+        emittiert `rename_folder_requested(group, old_path, new_path)` – der
+        Orchestrator fuehrt den String-Replace ueber alle Kinder aus
+        (service_set_utils.rename_category) und emittiert den EventBus.
+        """
+        old_path = str(old_path or "").strip().strip("/")
+        if not old_path:
+            return
+        old_name = old_path.split("/")[-1]
+        new_name, ok = QInputDialog.getText(
+            self, "Ordner umbenennen", "Neuer Name:", text=old_name)
+        new_name = (new_name or "").strip().strip("/")
+        if not ok or not new_name or new_name == old_name:
+            return
+        parts = old_path.split("/")
+        new_path = "/".join(parts[:-1] + [new_name])
+        self.rename_folder_requested.emit(str(group), old_path, new_path)
+
+    # -------------------------------------------------------------------------
+    # 18.01.03 (Bugfix 08.08.2026): Expansion-Erhaltung ueber _populate()
+    # -------------------------------------------------------------------------
+
+    def _collect_expanded_state(self) -> set:
+        """Sammelt die aufgeklappten Knoten des IST-Baums (RAM-Schluessel).
+
+        Schluessel: ("cat", group, kategorie-pfad) fuer Ordner bzw.
+        ("set", set_id) fuer Set-Knoten. Top-Level-Gruppen (TYPE_GROUP)
+        werden in _populate() ohnehin immer expandiert; Blatt-/Service-
+        Knoten sind nicht aufklappbar. isValid-Guards gegen zerstoerte
+        Items (Access-Violation-Schutz).
+        """
+        result: set = set()
+        try:
+            for item in TreeItemIterator(self):
+                if item is None or not isValid(item):
+                    continue
+                if not item.isExpanded():
+                    continue
+                node_type = item.data(0, ROLE_NODE_TYPE)
+                if node_type == TYPE_CATEGORY:
+                    result.add(("cat", self._group_of(item),
+                                self._category_path_of(item)))
+                elif node_type == TYPE_SET:
+                    result.add(("set",
+                                str(item.data(0, ROLE_SET_ID) or "")))
+        except (RuntimeError, AttributeError):
+            pass
+        return result
+
+    def _apply_expanded_state(self, expanded: set) -> None:
+        """Expandiert die gesammelten Knoten nach dem Neuaufbau wieder.
+
+        Zusaetzlich werden Einmal-Expansionen aus `_expand_after_rebuild`
+        angewandt (Ziel-Ordner nach Drop, neu erzeugter Ordner) und danach
+        geleert. Die '>'/'⌄'-Labels werden explizit aktualisiert (setExpanded
+        unter blockSignals feuert kein itemExpanded).
+        """
+        try:
+            for item in TreeItemIterator(self):
+                if item is None or not isValid(item):
+                    continue
+                node_type = item.data(0, ROLE_NODE_TYPE)
+                expand = False
+                if node_type == TYPE_CATEGORY:
+                    key = ("cat", self._group_of(item),
+                           self._category_path_of(item))
+                    expand = (key in expanded
+                              or key in self._expand_after_rebuild)
+                elif node_type == TYPE_SET:
+                    key = ("set", str(item.data(0, ROLE_SET_ID) or ""))
+                    expand = key in expanded
+                if expand:
+                    item.setExpanded(True)
+        except (RuntimeError, AttributeError):
+            pass
+        self._expand_after_rebuild.clear()
+        # Labels aller aufklappbaren Knoten auf den IST-Zustand bringen.
+        try:
+            for item in TreeItemIterator(self):
+                if item is None or not isValid(item):
+                    continue
+                self._refresh_expand_label(item)
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _mark_expand(self, group: str, path: str) -> None:
+        """Merkt die Ordnerkette von `path` fuer die naechste Expansion.
+
+        Wird VOR dem emit() der Struktur-Signale gerufen (der EventBus-
+        Refresh laeuft synchron waehrend des emit): Beim unmittelbar
+        folgenden _populate() werden diese Pfade (und alle Eltern-Glieder)
+        aufgeklappt, damit z. B. ein neu erzeugter Ordner oder ein
+        Drop-Ziel-Ordner sofort sichtbar bleibt.
+        """
+        parts = [p.strip() for p in str(path or "").split("/") if p.strip()]
+        for i in range(len(parts)):
+            self._expand_after_rebuild.add(
+                ("cat", str(group or ""), "/".join(parts[: i + 1])))
+
     def _attach_item_buttons(self) -> None:
         """Haengt die Info-Buttons (Spalte 1) an alle Service-/Set-/Plugin-
         Zeilen UND Kategorie-Ordner (Bugfix 05.08.2026 / 17.01.02).
@@ -25315,14 +26063,18 @@ class MasterTree(QTreeWidget):
                 if tooltip:
                     btn.setToolTip(tooltip)
                 # 17.01.02: Kategorie-Ordner emittieren category_info_requested
-                # mit dem vollen Kategorie-Pfad (analog Set-Info).
+                # mit dem vollen Kategorie-Pfad (analog Set-Info). 18.01.03
+                # (L3): Zusaetzlich wird die Eltern-GRUPPE uebergeben, damit
+                # der Orchestrator Sets-Ordner ('sets') von Plugins-Ordnern
+                # ('plugins') unterscheiden kann.
                 if node_type == TYPE_CATEGORY:
                     cat_path = self._category_path_of(item)
+                    cat_group = self._group_of(item)
                     btn.setToolTip(
                         f"Kategorie: {cat_path or '?'}")
                     btn.clicked.connect(
-                        lambda _=False, cp=cat_path:
-                        self.category_info_requested.emit(cp))
+                        lambda _=False, g=cat_group, cp=cat_path:
+                        self.category_info_requested.emit(g, cp))
                 else:
                     btn.clicked.connect(
                         lambda _=False, s=set_id, svc=service_id, pid=plugin_id:
@@ -25707,7 +26459,10 @@ class MasterTree(QTreeWidget):
                                      'Service-Info anzeigen' (17.01.02)
           * Kategorie-Ordner      -> '▶️ Alle Services ausführen'
                                      (run_category_requested, rekursiv) +
-                                     'Ordner-Info anzeigen' (17.01.02)
+                                     'Ordner-Info anzeigen' (17.01.02) +
+                                     'Neuer Ordner' / 'Umbenennen' /
+                                     'Ordner löschen' (18.01.03; Loeschen
+                                     nur fuer leere Ordner aktiv)
           * Sonstige Gruppen      -> Order/Entfernen ausgegraut (17.01.02).
 
         isValid-Guards: Bei wildem Klicken koennen Items zwischen itemAt() und
@@ -25729,21 +26484,48 @@ class MasterTree(QTreeWidget):
             # 17.01.02 (Bugfix-Runde): Kategorie-Ordner erhalten jetzt ein
             # Kontextmenue mit '▶️ Alle Services ausführen' (rekursiv, alle
             # Services unter dem Ordner) + 'Ordner-Info anzeigen' (analog zu
-            # den Set-Aktionen in der 📁-Gruppe).
+            # den Set-Aktionen in der 📁-Gruppe). 18.01.03: Run/Info tragen
+            # zusaetzlich die Eltern-GRUPPE ('sets'/'plugins', L3) und das
+            # Menue bietet 'Neuer Ordner' + 'Umbenennen' + 'Ordner löschen'
+            # (Ordner-CRUD, 18.01.03; Loeschen nur fuer leere Ordner aktiv).
             if node_type == TYPE_CATEGORY:
                 cat_path = self._category_path_of(item)
+                cat_group = self._group_of(item)
                 if not cat_path:
                     return
                 menu = QMenu(self)
                 act_run = menu.addAction("▶️ Alle Services ausführen")
                 act_run.triggered.connect(
-                    lambda _=False, cp=cat_path:
-                    self.run_category_requested.emit(cp))
+                    lambda _=False, g=cat_group, cp=cat_path:
+                    self.run_category_requested.emit(g, cp))
                 menu.addSeparator()
                 act_info = menu.addAction("Ordner-Info anzeigen")
                 act_info.triggered.connect(
-                    lambda _=False, cp=cat_path:
-                    self.category_info_requested.emit(cp))
+                    lambda _=False, g=cat_group, cp=cat_path:
+                    self.category_info_requested.emit(g, cp))
+                menu.addSeparator()
+                act_new = menu.addAction("Neuer Ordner")
+                act_new.triggered.connect(
+                    lambda _=False, g=cat_group, cp=cat_path:
+                    self._on_new_folder(g, cp))
+                act_ren = menu.addAction("Umbenennen")
+                act_ren.triggered.connect(
+                    lambda _=False, g=cat_group, cp=cat_path:
+                    self._on_rename_folder(g, cp))
+                menu.addSeparator()
+                # 18.01.03 (E3-revidiert, 08.08.2026): 'Ordner löschen' –
+                # die EINZIGE Moeglichkeit, einen leeren Ordner zu entfernen
+                # (leere Ordner verschwinden NICHT automatisch beim Refresh).
+                # Nur fuer Ordner OHNE Kinder aktiv – bei gefuellten Ordnern
+                # muss der Benutzer zuerst die Kinder herausziehen (Guard).
+                act_del = menu.addAction("Ordner löschen")
+                act_del.setToolTip(
+                    "Nur für leere Ordner verfügbar – entfernt den Ordner "
+                    "dauerhaft.")
+                act_del.setEnabled(item.childCount() == 0)
+                act_del.triggered.connect(
+                    lambda _=False, g=cat_group, cp=cat_path:
+                    self.delete_folder_requested.emit(g, cp))
                 menu.exec(self.viewport().mapToGlobal(pos))
                 return
             menu = QMenu(self)
@@ -25753,11 +26535,24 @@ class MasterTree(QTreeWidget):
                     act = menu.addAction("Neues Set anlegen")
                     act.triggered.connect(
                         lambda _=False: self.create_set_requested.emit())
+                    # 18.01.03: 'Neuer Ordner' in der Sets-Gruppe (Root).
+                    act_folder = menu.addAction("Neuer Ordner")
+                    act_folder.triggered.connect(
+                        lambda _=False, g=group:
+                        self._on_new_folder(g, ""))
                     menu.addSeparator()
                     act_trash = menu.addAction("🗑️ Papierkorb öffnen...")
                     act_trash.triggered.connect(
                         lambda _=False: self.open_trash_requested.emit())
                 else:
+                    # 18.01.03: 'Neuer Ordner' auch in der Services-Gruppe
+                    # (Root) – die uebrigen Struktur-Aktionen bleiben
+                    # ausgegraut (_add_outside_set_actions).
+                    act_folder = menu.addAction("Neuer Ordner")
+                    act_folder.triggered.connect(
+                        lambda _=False, g=group:
+                        self._on_new_folder(g, ""))
+                    menu.addSeparator()
                     self._add_outside_set_actions(menu, item)
                 menu.exec(self.viewport().mapToGlobal(pos))
                 return
@@ -25929,6 +26724,10 @@ class MasterTree(QTreeWidget):
             if item is None or not isValid(item):
                 super().mousePressEvent(event)
                 return
+            # 18.01.03 (Drag & Drop): Quelle fuer einen beginnenden Drag
+            # merken (nur linke Maustaste; startDrag wertet sie aus).
+            self._drag_source = (
+                item if event.button() == Qt.LeftButton else None)
             # Klick-Scope fuer das Read-Only-Panel (Bugfix 06.08.2026).
             self._emit_selection_details(item)
             # Checkbox-Klick hat Vorrang vor dem Expand-Toggle
@@ -25979,6 +26778,11 @@ class MasterTree(QTreeWidget):
                 # Kategorie-Pfad (z.B. 'Swing Points/Geometrie') im
                 # plugin_id-Slot – Grundlage fuer die ID-Aufloesung im
                 # AnalyticsWindow (Baum-Selektion -> set_feature_ids).
+                # 18.01.03 (L3): Zusaetzlich wird die Eltern-GRUPPE
+                # ('sets'/'plugins') im set_id-Slot geliefert, damit die
+                # Aufloesung Sets-Ordner von Plugins-Ordnern unterscheiden
+                # kann (Sets-Ordner -> category_set_ids -> Services).
+                set_id = self._group_of(item)
                 plugin_id = self._category_path_of(item)
             self.selection_details.emit(node_type, set_id, service_id,
                                         plugin_id)
@@ -26734,7 +27538,17 @@ class ServiceParamColumnsMixin:
         scroll = getattr(self, "_param_scroll", None)
         if scroll is not None:
             scroll.updateGeometry()
-        self._reflow()
+        # 08.08.2026 (Bugfix): KEIN self._reflow() – der volle Reflow
+        # (_schedule_reflow -> _apply_reflow_size -> resize_to_clamped_
+        # content, _exact_fit_to_content) wuerde die FENSTERHOEHE an die neue
+        # Spaltenhoehe anpassen und damit Canvas + Fenster bei jedem Set-/
+        # Service-Klick versetzen (User-Anweisung: Hoehe fix, vgl.
+        # _apply_conditional_visibility/_setup_collapsible, 07.08.2026).
+        # Gewuenscht: NUR die Service-Parameter-Box wird auf ihre Layout-
+        # Groesse gesetzt; ist sie zu hoch, zeigt die ContentScrollArea
+        # (_param_scroll) Scrollbalken. Der initiale Fensteraufbau (show)
+        # setzt die Groesse weiterhin ueber _apply_reflow_size.
+        QTimer.singleShot(0, self._resize_param_box_deferred)
 
     def _build_service_column(self, iid: str, pid: str, cfg: Dict[str, Any]) -> QGroupBox:
         """Erzeugt EINE Service-Spalte (QGroupBox) mit Parameter-Formular.
@@ -27542,14 +28356,15 @@ class ServiceSelectorDialog(QDialog):
         self.setWindowTitle("Datenquellen auswählen")
         self.resize(980, 600)
         self.setMinimumWidth(760)
-        # 08.08.2026 (Bugfix, ServiceWindow-Muster 07.08.2026): QDialog-Default
-        # (SetDefaultConstraint) setzt die Fenstergroesse beim show() auf den
-        # Layout-sizeHint – das wuerde die Hoehe an die Parameter-Spalten
-        # klemmen. SetNoConstraint haelt die Fenstergroesse FIX; bei
-        # Ueberhoehe zeigt die ScrollArea Scrollbalken.
-        self.setSizeConstraint(QLayout.SetNoConstraint)
-
         root = QVBoxLayout(self)
+        # 08.08.2026 (Bugfix): `setSizeConstraint` ist eine QLayout-Methode,
+        # KEIN QWidget-Attribut – der fruehere self.setSizeConstraint(...)-
+        # Aufruf crashte beim Oeffnen des Pickers (AttributeError). Der
+        # QDialog-Default (SetDefaultConstraint) wuerde die Fenstergroesse
+        # beim show() auf den Layout-sizeHint setzen (Hoehe an die Parameter-
+        # Spalten geklemmt); SetNoConstraint haelt die Fenstergroesse FIX,
+        # bei Ueberhoehe zeigt die ScrollArea Scrollbalken.
+        root.setSizeConstraint(QLayout.SetNoConstraint)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 
@@ -27638,6 +28453,17 @@ class ServiceSelectorDialog(QDialog):
             tree.delete_set_requested.connect(self._on_delete_set)
             tree.move_service_requested.connect(self._on_move_service)
             tree.remove_service_requested.connect(self._on_remove_service)
+            # 18.01.03 (Dynamic Tree Management): Kategorie-Drag&Drop &
+            # Ordner-CRUD im Picker (Manager-Window) – Sets/Plugins/Ordner
+            # ziehen (folder_item_moved/folder_moved), 'Neuer Ordner' (wird
+            # PERSISTIERT, E3-revidiert 08.08.2026), 'Umbenennen'
+            # (rename_folder_requested) und 'Ordner löschen' (manuelle
+            # Loeschung) werden hier persistiert.
+            tree.folder_item_moved.connect(self._on_folder_item_moved)
+            tree.folder_moved.connect(self._on_folder_moved)
+            tree.rename_folder_requested.connect(self._on_rename_folder)
+            tree.create_folder_requested.connect(self._on_create_folder)
+            tree.delete_folder_requested.connect(self._on_delete_folder)
         # Live-Sync: Modell-Refresh (EventBus -> data_changed) baut den Baum
         # neu; das Panel wird mit dem zuletzt geklickten Scope nachgezogen.
         self.model.data_changed.connect(self._on_model_data_changed)
@@ -27928,6 +28754,115 @@ class ServiceSelectorDialog(QDialog):
         event_bus.service_set_changed.emit()
 
     # ------------------------------------------------------------------
+    # 18.01.03 (Dynamic Tree Management): Kategorie-Drag&Drop & Ordner-CRUD
+    # im Picker (Manager-Window). Persistenz analog service_win ueber die
+    # gemeinsamen Helfer service_set_utils (DRY, E1/E2).
+    # ------------------------------------------------------------------
+    @Slot(str, str, str)
+    def _on_folder_item_moved(self, node_type: str, item_id: str,
+                              new_path: str) -> None:
+        """Drop eines Sets/Plugins in einen Ziel-Ordner (MasterTree).
+
+        TYPE_SET    -> category-Feld der Set-Definition (E2).
+        TYPE_PLUGIN -> Kategorie-Override plugin_category_<id> (E1).
+        18.01.03 (E3-revidiert, Bugfix 08.08.2026): Der QUELL-Ordner
+        (und seine Elternkette) wird VOR dem Update ermittelt und nach dem
+        Verschieben als Leere-Ordner persistiert (ensure_folder_path) –
+        damit bleibt der Ordner sichtbar, wenn sein letztes Kind entzogen
+        wurde. Danach EventBus-Sync (Live-Refresh aller MasterTrees).
+        """
+        from serviceui.master_tree import TYPE_PLUGIN, TYPE_SET
+        from serviceui.service_set_utils import (
+            ensure_folder_path, set_plugin_category, set_set_category)
+        source_path = ""
+        group = ""
+        ok = False
+        if node_type == TYPE_SET:
+            group = "sets"
+            try:
+                definition = self.set_repo.get_set(item_id) or {}
+                source_path = str(definition.get("category") or "").strip().strip("/")
+            except Exception:
+                source_path = ""
+            ok = set_set_category(self.set_repo, item_id, new_path)
+        elif node_type == TYPE_PLUGIN:
+            group = "plugins"
+            try:
+                source_path = self.model.plugin_category_path(item_id)
+            except Exception:
+                source_path = ""
+            ok = set_plugin_category(self._state_manager, item_id, new_path)
+        if not ok:
+            print(f"WARN [ServiceSelectorDialog] Kategorie-Verschiebung "
+                  f"fehlgeschlagen ({node_type} '{item_id}').")
+            return
+        if source_path:
+            ensure_folder_path(self._state_manager, group, source_path)
+        event_bus.service_set_changed.emit()
+
+    @Slot(str, str)
+    def _on_create_folder(self, group: str, full_path: str) -> None:
+        """Kontextmenue 'Neuer Ordner' (create_folder_requested).
+
+        18.01.03 (E3-revidiert, 08.08.2026): Persistiert den
+        benutzererzeugten (ggf. leeren) Ordner ueber global_settings
+        (service_set_utils.create_empty_folder, Key 'tree_folders_<group>')
+        und emittiert den EventBus. Leere Ordner verschwinden damit NICHT
+        beim Refresh, sondern nur bei manueller Loeschung.
+        """
+        from serviceui.service_set_utils import create_empty_folder
+        if not create_empty_folder(self._state_manager,
+                                   str(group or ""), full_path):
+            return
+        event_bus.service_set_changed.emit()
+
+    @Slot(str, str)
+    def _on_delete_folder(self, group: str, path: str) -> None:
+        """Kontextmenue 'Ordner löschen' (delete_folder_requested).
+
+        18.01.03 (E3-revidiert): Entfernt den persistierten Ordner-Eintrag
+        (service_set_utils.delete_empty_folder, Key 'tree_folders_<group>')
+        und emittiert den EventBus. Der MasterTree erlaubt die Aktion nur
+        fuer Ordner ohne Kinder; Kinder bleiben unangetastet.
+        """
+        from serviceui.service_set_utils import delete_empty_folder
+        if not delete_empty_folder(self._state_manager,
+                                   str(group or ""), path):
+            return
+        event_bus.service_set_changed.emit()
+
+    @Slot(str, str, str)
+    def _on_folder_moved(self, group: str, old_path: str,
+                         new_path: str) -> None:
+        """Drop eines Ordners auf einen anderen Ordner (MasterTree)."""
+        self._rename_folder(group, old_path, new_path)
+
+    @Slot(str, str, str)
+    def _on_rename_folder(self, group: str, old_path: str,
+                          new_path: str) -> None:
+        """Kontextmenue 'Umbenennen' (rename_folder_requested)."""
+        self._rename_folder(group, old_path, new_path)
+
+    def _rename_folder(self, group: str, old_path: str,
+                       new_path: str) -> None:
+        """Zentraler Ordner-Rename (String-Replace aller Kinder).
+
+        18.01.03 (E1/E2): Sets-Ordner aktualisieren das category-Feld der
+        Set-Definitionen; Plugins-Ordner setzen Kategorie-Overrides.
+        """
+        from serviceui.service_set_utils import rename_category
+        try:
+            count = rename_category(
+                self.model, self.set_repo, self._state_manager,
+                str(group or ""), old_path, new_path)
+        except Exception as e:
+            print(f"WARN [ServiceSelectorDialog] Ordner-Umbenennung "
+                  f"fehlgeschlagen: {e}")
+            return
+        if count > 0:
+            event_bus.service_set_changed.emit()
+
+    # ------------------------------------------------------------------
     # Read-Only-Parameter-Panel (Punkte 1-3: horizontal, 2-Spalten-Default,
     # Fensterbreite == rechte Kante der Parameter-Box)
     # ------------------------------------------------------------------
@@ -27943,8 +28878,10 @@ class ServiceSelectorDialog(QDialog):
             Sets nebeneinander (`_entries_for_scope`, Punkt 4+5).
           * Plugin-Zeile (⚡ Standalone / 📦 Plugins) -> NUR dieser eine
             Service (Punkt 6).
-          * Kategorie-Ordner (18.01.01, E-4) -> ALLE Plugins des Pfads
-            (rekursiv, `category_plugin_ids`).
+          * Kategorie-Ordner (18.01.01, E-4) -> ALLE Elemente des Pfads
+            (rekursiv). 18.01.03 (L3): Sets-Ordner (set_id == 'sets')
+            liefern die Service-Spalten aller Sets unter dem Pfad,
+            Plugins-Ordner die Plugin-Spalten (category_plugin_ids).
           * Gruppen-/sonstige Zeilen -> KEIN Service (Punkt 7).
 
         18.01.01 (E-4): Zusaetzlich wird der LIVE-Filter gesetzt –
@@ -27971,11 +28908,16 @@ class ServiceSelectorDialog(QDialog):
         """Loest eine geklickte Baum-Zeile in feature_ids (plugin_ids) auf.
 
         18.01.01 (E-4): Klick auf Set -> alle Services des Sets; Klick auf
-        Kategorie-Ordner -> `category_plugin_ids(Pfad, rekursiv)`; Klick auf
-        Plugin-Zeile -> [plugin_id]; Service-Zeile -> [plugin_id des Service].
+        Kategorie-Ordner -> rekursive Aufloesung; Klick auf Plugin-Zeile ->
+        [plugin_id]; Service-Zeile -> [plugin_id des Service]. 18.01.03
+        (L3): Fuer Kategorie-Ordner traegt set_id die Eltern-GRUPPE
+        ('sets'/'plugins', aus MasterTree._emit_selection_details) – die
+        Aufloesung unterscheidet damit Sets-Ordner (Sets unter dem Pfad ->
+        deren Service-plugin_ids) von Plugins-Ordnern (category_plugin_ids).
         """
         if node_type == TYPE_CATEGORY:
-            return self.model.category_plugin_ids(plugin_id or "")
+            return self.model.category_service_plugin_ids(
+                set_id or "", plugin_id or "")
         if node_type == TYPE_PLUGIN and plugin_id:
             return [str(plugin_id)]
         if node_type == TYPE_SERVICE and set_id and service_id:
@@ -28015,10 +28957,32 @@ class ServiceSelectorDialog(QDialog):
         Returns:
             Liste von {"node_type", "set_id", "instance_id", "plugin_id"} –
             leer fuer Zeilen ohne Parameter-Anzeige (Gruppen, leere Auswahl).
-            Kategorie-Ordner (18.01.01, E-4) liefern die Plugins des Pfads
-            (rekursiv, `category_plugin_ids`).
+            Kategorie-Ordner (18.01.01, E-4) liefern die Elemente des Pfads
+            rekursiv; 18.01.03 (L3) unterscheidet dabei ueber die im set_id-
+            Slot mitgelieferte Gruppe: Sets-Ordner -> Set-Service-Entries
+            aller Sets unter dem Pfad, Plugins-Ordner -> Plugin-Entries
+            (category_plugin_ids).
         """
         if node_type == TYPE_CATEGORY:
+            if str(set_id or "") == str(self.model.GROUP_SETS):
+                entries: List[Dict[str, str]] = []
+                for set_id_under in self.model.category_set_ids(
+                        plugin_id or ""):
+                    definition = self.model.find_set(set_id_under) or {}
+                    services = definition.get("services") or {}
+                    order = definition.get("execution_order") \
+                        or list(services.keys())
+                    for iid in order:
+                        cfg = services.get(iid) or {}
+                        if not isinstance(cfg, dict):
+                            continue
+                        entries.append({
+                            "node_type": TYPE_SERVICE,
+                            "set_id": str(set_id_under),
+                            "instance_id": str(iid),
+                            "plugin_id": str(cfg.get("plugin_id") or iid),
+                        })
+                return entries
             entries: List[Dict[str, str]] = []
             for pid in self.model.category_plugin_ids(plugin_id or ""):
                 entries.append({
@@ -28561,7 +29525,297 @@ Phase 15, Kapitel 15.1 (U15-D1): Aus service_win.py ausgelagert –
 Verhalten unverändert.
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+
+# 18.01.03 (E1): Separater global_settings-Key fuer den Kategorie-Override
+# eines Standalone-Plugins (NICHT plugin_params_<id> – das bleibt exklusiv
+# dem Parameter-Preset vorbehalten; siehe Entscheidung E1 im Prüfprotokoll).
+PLUGIN_CATEGORY_KEY = "plugin_category_{}"
+
+# 18.01.03 (E3-revidiert, Bugfixing-Modus 08.08.2026): Persistenz leerer
+# Ordner. Der Benutzer hat E3 widerrufen – leere Ordner duerfen NICHT beim
+# naechsten Refresh verschwinden, sondern NUR bei manueller Loeschung im
+# Kontextmenue. Dafuer werden die Pfade benutzererzeugter Ordner je Gruppe
+# in global_settings persistiert (Key 'tree_folders_<group>', Wert =
+# Liste Slash-Pfade OHNE '📁 '-Praefix). Das ServiceSelectorModel mischt
+# sie in build_tree() ein; create/delete laufen ueber diese Helfer.
+EMPTY_FOLDERS_KEY = "tree_folders_{}"
+
+
+def set_set_category(set_repo, set_id: str, category_path: str) -> bool:
+    """Setzt den Kategorie-Pfad eines Service-Sets (18.01.03, E2).
+
+    Laedt die Definition FRISCH aus der DB (kein Cache), setzt das
+    `category`-Feld ("" = Root-Ebene) und persistiert additiv via
+    save_set(). record_snapshot=False – ein Ordner-Verschieben ist eine
+    interne Struktur-Verwaltung (wie die P14-04 Bestands-Migration) und
+    erzeugt KEINE Snapshot-Historie (Invariante 9).
+
+    Returns:
+        True bei Erfolg (Set existierte und wurde gespeichert).
+    """
+    set_id = str(set_id or "").strip()
+    if not set_id or set_repo is None:
+        return False
+    try:
+        definition = set_repo.get_set(set_id)
+    except Exception as e:
+        print(f"WARN [service_set_utils] Set '{set_id}' nicht ladbar: {e}")
+        return False
+    if not definition:
+        return False
+    definition["category"] = str(category_path or "").strip()
+    try:
+        set_repo.save_set(definition, record_snapshot=False)
+    except Exception as e:
+        print(f"WARN [service_set_utils] Kategorie fuer Set '{set_id}' "
+              f"nicht gespeichert: {e}")
+        return False
+    return True
+
+
+def set_plugin_category(state_manager, plugin_id: str,
+                        category_path: str) -> bool:
+    """Setzt den Kategorie-Override eines Plugins (18.01.03, E1).
+
+    Persistiert den Slash-Pfad unter `plugin_category_<plugin_id>` in
+    global_settings ("" = Root-Ebene hebt metadata['category'] auf). Der
+    Override hat VORRANG vor metadata['category'] (Modell _category_parts).
+    Das bestehende `plugin_params_<id>` bleibt unangetastet.
+
+    Returns:
+        True bei Erfolg (plugin_id vorhanden und gespeichert).
+    """
+    plugin_id = str(plugin_id or "").strip()
+    if not plugin_id or state_manager is None:
+        return False
+    try:
+        state_manager.save_global_value(
+            PLUGIN_CATEGORY_KEY.format(plugin_id),
+            str(category_path or "").strip())
+    except Exception as e:
+        print(f"WARN [service_set_utils] Kategorie fuer Plugin '{plugin_id}' "
+              f"nicht gespeichert: {e}")
+        return False
+    return True
+
+
+def list_empty_folders(state_manager, group: str) -> List[str]:
+    """Alle persistierten Pfade benutzererzeugter leerer Ordner einer Gruppe.
+
+    Quelle: global_settings (Key 'tree_folders_<group>', 18.01.03 E3-
+    revidiert). Liefert eine deduplizierte Liste Slash-Pfade OHNE
+    '📁 '-Praefix (z.B. ['Swing Points', 'Swing Points/Geometrie']);
+    Fehler -> [] (defensiv).
+    """
+    if state_manager is None:
+        return []
+    try:
+        raw = state_manager.get_global_value(
+            EMPTY_FOLDERS_KEY.format(str(group or "").strip()), [])
+    except Exception as e:
+        print(f"WARN [service_set_utils] Leere-Ordner-Liste der Gruppe "
+              f"'{group}' nicht lesbar: {e}")
+        return []
+    result: List[str] = []
+    if isinstance(raw, list):
+        for p in raw:
+            p = str(p or "").strip().strip("/")
+            if p and p not in result:
+                result.append(p)
+    return result
+
+
+def save_empty_folders(state_manager, group: str, paths) -> bool:
+    """Persistiert die Leere-Ordner-Liste einer Gruppe (Upsert).
+
+    Returns:
+        True bei Erfolg.
+    """
+    if state_manager is None:
+        return False
+    cleaned: List[str] = []
+    for p in paths or []:
+        p = str(p or "").strip().strip("/")
+        if p and p not in cleaned:
+            cleaned.append(p)
+    try:
+        state_manager.save_global_value(
+            EMPTY_FOLDERS_KEY.format(str(group or "").strip()), cleaned)
+    except Exception as e:
+        print(f"WARN [service_set_utils] Leere-Ordner-Liste der Gruppe "
+              f"'{group}' nicht speicherbar: {e}")
+        return False
+    return True
+
+
+def create_empty_folder(state_manager, group: str, path: str) -> bool:
+    """Registriert einen benutzererzeugten (ggf. leeren) Ordner.
+
+    Haengt den Slash-Pfad an die Leere-Ordner-Liste der Gruppe an
+    (idempotent – bereits vorhandene Pfade werden nicht dupliziert). Das
+    Modell rendert den Ordner daraufhin dauerhaft (auch ohne Kinder), bis
+    er manuell ueber delete_empty_folder() entfernt wird.
+
+    Returns:
+        True, wenn der Pfad (neu) persistiert wurde.
+    """
+    path = str(path or "").strip().strip("/")
+    if not path:
+        return False
+    paths = list_empty_folders(state_manager, group)
+    if path in paths:
+        return False
+    paths.append(path)
+    return save_empty_folders(state_manager, group, paths)
+
+
+def delete_empty_folder(state_manager, group: str, path: str) -> bool:
+    """Entfernt einen benutzererzeugten Ordner (manuelle Loeschung).
+
+    Loescht NUR den persistierten Ordner-Eintrag der Gruppe; Kinder
+    (falls vorhanden) bleiben unangetastet. Die UI erlaubt die Loeschung
+    nur fuer Ordner ohne Kinder (MasterTree-Guard).
+
+    Returns:
+        True, wenn der Pfad vorhanden war und entfernt wurde.
+    """
+    path = str(path or "").strip().strip("/")
+    if not path:
+        return False
+    paths = list_empty_folders(state_manager, group)
+    if path not in paths:
+        return False
+    paths.remove(path)
+    return save_empty_folders(state_manager, group, paths)
+
+
+def ensure_folder_path(state_manager, group: str, path: str) -> bool:
+    """Stellt sicher, dass die Ordnerkette von `path` persistiert ist.
+
+    18.01.03 (E3-revidiert, Bugfix 08.08.2026): Wird nach Struktur-
+    Aenderungen aufgerufen (letztes Kind aus einem Ordner verschoben,
+    Ordner per Drag verschoben), damit benutzererzeugte Ordner auch dann
+    sichtbar bleiben, wenn ihr letztes Kind entzogen wurde. Ergaenzt
+    idempotent ALLE Kettenglieder von `path` in der Leere-Ordner-Liste
+    der Gruppe (tree_folders_<group>) – ein Kettenglied, das aktuell noch
+    Kinder hat, ist als redundanter Eintrag unschaedlich (build_tree
+    dedupliziert ueber _ensure_category_path).
+
+    Returns:
+        True, wenn die Kette gesichert ist (neu ergaenzt oder bereits
+        vorhanden); False bei fehlendem state_manager/Speicherfehler.
+    """
+    path = str(path or "").strip().strip("/")
+    if not path or state_manager is None:
+        return False
+    parts = [p.strip() for p in path.split("/") if p.strip()]
+    if not parts:
+        return False
+    paths = list_empty_folders(state_manager, group)
+    changed = False
+    for i in range(len(parts)):
+        p = "/".join(parts[: i + 1])
+        if p not in paths:
+            paths.append(p)
+            changed = True
+    if changed:
+        return save_empty_folders(state_manager, group, paths)
+    return True
+
+
+def _replace_prefix(path: str, old_path: str, new_path: str) -> str:
+    """Ersetzt das Pfad-Praefix old_path in path durch new_path.
+
+    Nur echte Ordner-Grenzen zaehlen: 'A/B' ersetzt 'A' UND 'A/C' (unter
+    'A'), aber NICHT 'AB'. Liefert path unveraendert, wenn old_path nicht
+    Praefix ist.
+    """
+    if path == old_path:
+        return new_path
+    if path.startswith(old_path + "/"):
+        return new_path + path[len(old_path):]
+    return path
+
+
+def rename_category(model, set_repo, state_manager, group: str,
+                    old_path: str, new_path: str) -> int:
+    """Benennt/verschiebt einen Kategorie-Ordner (String-Replace, 18.01.03).
+
+    Fuehrt fuer ALLE Kinder des Ordners ein Pfad-Update durch:
+      * group == 'sets'     -> jedes Set mit category-Praefix old_path wird
+                               via set_set_category() neu gespeichert.
+      * group == 'plugins'  -> jedes Plugin mit aufgeloestem Pfad-Praefix
+                               old_path erhaelt einen Kategorie-Override auf
+                               den neuen Pfad (plugin_category_<id>). Auch
+                               Plugins, deren Kategorie bisher aus
+                               metadata['category'] stammte, werden dadurch
+                               dauerhaft umgezogen (Override gewinnt).
+    Der Aufrufer emittiert danach `event_bus.service_set_changed`.
+
+    Returns:
+        Anzahl der betroffenen Elemente (Sets bzw. Plugins).
+    """
+    old_path = str(old_path or "").strip().strip("/")
+    new_path = str(new_path or "").strip().strip("/")
+    if not old_path or old_path == new_path:
+        return 0
+    group = str(group or "").strip()
+    count = 0
+    try:
+        if group == "sets":
+            for s in (model.get_sets() if model is not None else []) or []:
+                cat = str(s.get("category") or "").strip()
+                if not cat:
+                    continue
+                updated = _replace_prefix(cat, old_path, new_path)
+                if updated != cat and set_set_category(
+                        set_repo, str(s.get("set_id") or ""), updated):
+                    count += 1
+        else:
+            plugins = (model.get_plugins() if model is not None else {}) or {}
+            for pid in sorted(plugins.keys()):
+                current = (model.plugin_category_path(pid)
+                           if model is not None else "")
+                if not current:
+                    continue
+                updated = _replace_prefix(current, old_path, new_path)
+                if updated != current and set_plugin_category(
+                        state_manager, pid, updated):
+                    count += 1
+        # 18.01.03 (E3-revidiert): Auch persistierte leere Ordner der Gruppe
+        # umziehen (Praefix-Replace auf die 'tree_folders_<group>'-Liste),
+        # damit benutzererzeugte Ordner ihren Platz behalten.
+        try:
+            empty_paths = list_empty_folders(state_manager, group)
+            if empty_paths:
+                updated_paths = [
+                    _replace_prefix(p, old_path, new_path)
+                    for p in empty_paths]
+                if updated_paths != empty_paths:
+                    if save_empty_folders(state_manager, group,
+                                          updated_paths):
+                        count += sum(1 for a, b in zip(empty_paths,
+                                                       updated_paths)
+                                     if a != b)
+        except Exception as e:
+            print(f"WARN [service_set_utils] Leere-Ordner-Rename "
+                  f"'{old_path}' -> '{new_path}' fehlgeschlagen: {e}")
+        # 18.01.03 (E3-revidiert, Bugfix 08.08.2026): Der QUELL-Ordner
+        # bleibt nach dem Wegziehen seines letzten Kindes sichtbar (auch
+        # wenn er bisher nur aus echten Kindern bestand und NICHT in der
+        # Leere-Ordner-Liste stand). Idempotent – ein Ordner mit verbleibenden
+        # Kindern bekommt einen redundanten Eintrag (unschaedlich).
+        try:
+            ensure_folder_path(state_manager, group, old_path)
+        except Exception as e:
+            print(f"WARN [service_set_utils] Leere-Ordner-Sicherung des "
+                  f"Quell-Ordners '{old_path}' fehlgeschlagen: {e}")
+    except Exception as e:
+        print(f"WARN [service_set_utils] Ordner-Rename '{old_path}' -> "
+              f"'{new_path}' fehlgeschlagen: {e}")
+    return count
 
 
 def _available_plugin_ids() -> str:
@@ -29289,6 +30543,16 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         tree.run_plugin_requested.connect(self._on_run_plugin)
         tree.run_category_requested.connect(self._on_run_category)
         tree.category_info_requested.connect(self._on_category_info_requested)
+        # 18.01.03 (Dynamic Tree Management): Ordner-CRUD & Kategorie-
+        # Drag&Drop – Sets/Plugins/Ordner ziehen, 'Neuer Ordner' (wird
+        # PERSISTIERT, E3-revidiert 08.08.2026), 'Umbenennen' (String-Replace
+        # aller Kinder) und 'Ordner löschen' (manuelle Loeschung) werden hier
+        # persistiert.
+        tree.folder_item_moved.connect(self._on_folder_item_moved)
+        tree.folder_moved.connect(self._on_folder_moved)
+        tree.rename_folder_requested.connect(self._on_rename_folder)
+        tree.create_folder_requested.connect(self._on_create_folder)
+        tree.delete_folder_requested.connect(self._on_delete_folder)
 
     @Slot(str)
     def _toolbar_add_service(self, plugin_id: str,
@@ -29657,13 +30921,15 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         }
         self._start_run_worker(plugin_id, definition, instance_id=plugin_id)
 
-    @Slot(str)
-    def _on_run_category(self, category_path: str) -> None:
-        """'▶️ Alle Services ausführen' (Kategorie-Ordner unter 📦 Services).
+    @Slot(str, str)
+    def _on_run_category(self, group: str, category_path: str) -> None:
+        """▶️ Alle Services ausführen (Kategorie-Ordner).
 
         17.01.02 (Bugfix-Runde): Ordner-Knoten erhalten dieselbe Run-Aktion
         wie die Sets. Es werden ALLE Services unter dem Ordner ausgefuehrt
-        (rekursiv, inkl. Unter-Ordner – via
+        (rekursiv, inkl. Unter-Ordner). 18.01.03 (L3): `group` unterscheidet
+        Sets-Ordner ('sets' – alle Service-plugin_ids der Sets unter dem
+        Pfad, rekursiv) von Plugins-Ordnern ('plugins' – via
         ServiceSelectorModel.category_plugin_ids). Sicherheitsabfrage mit
         Kategorie-Name und dem aktuell gewaehlten Symbol/Timeframe, danach
         gezielter Set-Run mit einer Ad-hoc-Definition.
@@ -29673,7 +30939,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         model = getattr(self.service_selector, "model", None)
         if model is None:
             return
-        plugin_ids = model.category_plugin_ids(category_path)
+        plugin_ids = model.category_service_plugin_ids(group, category_path)
+
         if not plugin_ids:
             self.log(f"Kategorie '{category_path}' hat keine Services – "
                      f"Ausführung abgebrochen.")
@@ -29704,20 +30971,24 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         }
         self._start_run_worker(category_path, definition, instance_id=None)
 
-    @Slot(str)
-    def _on_category_info_requested(self, category_path: str) -> None:
+    @Slot(str, str)
+    def _on_category_info_requested(self, group: str,
+                                    category_path: str) -> None:
         """Info-Dialog fuer einen Kategorie-Ordner (17.01.02, wie Set-Info).
 
         Read-Only-Liste aller Services unter dem Ordner (rekursiv) mit dem
         Kategorie-Pfad als Titel – analog zur Set-Info (ServiceDescription
-        Dialog.from_set, keine persistierbare Beschreibung).
+        Dialog.from_set, keine persistierbare Beschreibung). 18.01.03 (L3):
+        `group` unterscheidet Sets- von Plugins-Ordnern (Aufloesung via
+        ServiceSelectorModel.category_service_plugin_ids).
         """
         if not category_path:
             return
         model = getattr(self.service_selector, "model", None)
         if model is None:
             return
-        plugin_ids = model.category_plugin_ids(category_path)
+        plugin_ids = model.category_service_plugin_ids(group, category_path)
+
         definition = {
             "set_id": f"category_{category_path}",
             "display_name": category_path,
@@ -29730,6 +31001,134 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             dlg.exec()
         except (RuntimeError, AttributeError) as e:
             self.log(f"Info-Dialog nicht möglich: {e}")
+
+    # -------------------------------------------------------------------------
+    # 18.01.03 (Dynamic Tree Management): Kategorie-Drag&Drop & Ordner-CRUD
+    # -------------------------------------------------------------------------
+
+    @Slot(str, str, str)
+    def _on_folder_item_moved(self, node_type: str, item_id: str,
+                              new_path: str) -> None:
+        """Drop eines Sets/Plugins in einen Ziel-Ordner (MasterTree).
+
+        Persistiert den neuen Kategorie-Pfad:
+          * TYPE_SET    -> Set-Definition (category-Feld) via save_set (E2).
+          * TYPE_PLUGIN -> Kategorie-Override (plugin_category_<id>,
+                           global_settings – E1).
+        18.01.03 (E3-revidiert, Bugfix 08.08.2026): Der QUELL-Ordner
+        (und seine Elternkette) wird VOR dem Update ermittelt und nach
+        dem Verschieben als Leere-Ordner persistiert
+        (ensure_folder_path) – damit bleibt der Ordner sichtbar und
+        verschiebbar, wenn sein letztes Kind entzogen wurde.
+        Danach EventBus-Sync, damit ALLE MasterTree-Instanzen live
+        refreshen (Invariante 5).
+        """
+        from serviceui.master_tree import TYPE_PLUGIN, TYPE_SET
+        from serviceui.service_set_utils import (
+            ensure_folder_path, set_plugin_category, set_set_category)
+        source_path = ""
+        group = ""
+        ok = False
+        if node_type == TYPE_SET:
+            group = "sets"
+            try:
+                definition = self.set_repo.get_set(item_id) or {}
+                source_path = str(definition.get("category") or "").strip().strip("/")
+            except Exception:
+                source_path = ""
+            ok = set_set_category(self.set_repo, item_id, new_path)
+        elif node_type == TYPE_PLUGIN:
+            group = "plugins"
+            model = getattr(self.service_selector, "model", None)
+            if model is not None:
+                try:
+                    source_path = model.plugin_category_path(item_id)
+                except Exception:
+                    source_path = ""
+            ok = set_plugin_category(self.state_manager, item_id, new_path)
+        if not ok:
+            self.log(f"Kategorie-Verschiebung fehlgeschlagen "
+                     f"({node_type} '{item_id}').")
+            return
+        if source_path:
+            ensure_folder_path(self.state_manager, group, source_path)
+        event_bus.service_set_changed.emit()
+
+    @Slot(str, str)
+    def _on_create_folder(self, group: str, full_path: str) -> None:
+        """Kontextmenue 'Neuer Ordner' (create_folder_requested).
+
+        18.01.03 (E3-revidiert, 08.08.2026): Persistiert den
+        benutzererzeugten (ggf. leeren) Ordner ueber global_settings
+        (service_set_utils.create_empty_folder, Key
+        'tree_folders_<group>') und emittiert den EventBus, damit alle
+        MasterTree-Instanzen live refreshen (Invariante 5). Leere
+        Ordner verschwinden damit NICHT beim Refresh, sondern nur bei
+        manueller Loeschung ('Ordner löschen').
+        """
+        from serviceui.service_set_utils import create_empty_folder
+        if not create_empty_folder(self.state_manager,
+                                   str(group or ""), full_path):
+            return
+        event_bus.service_set_changed.emit()
+
+    @Slot(str, str)
+    def _on_delete_folder(self, group: str, path: str) -> None:
+        """Kontextmenue 'Ordner löschen' (delete_folder_requested).
+
+        18.01.03 (E3-revidiert): Entfernt den persistierten Ordner-
+        Eintrag (service_set_utils.delete_empty_folder, Key
+        'tree_folders_<group>') und emittiert den EventBus. Der
+        MasterTree erlaubt die Aktion nur fuer Ordner ohne Kinder;
+        Kinder (falls vorhanden) bleiben unangetastet.
+        """
+        from serviceui.service_set_utils import delete_empty_folder
+        if not delete_empty_folder(self.state_manager,
+                                   str(group or ""), path):
+            return
+        event_bus.service_set_changed.emit()
+
+    @Slot(str, str, str)
+    def _on_folder_moved(self, group: str, old_path: str,
+                         new_path: str) -> None:
+        """Drop eines Ordners auf einen anderen Ordner (MasterTree).
+
+        Verschiebt alle Kinder rekursiv (String-Replace des Pfad-Praefixes
+        via service_set_utils.rename_category) und emittiert den EventBus.
+        """
+        self._rename_folder(group, old_path, new_path)
+
+    @Slot(str, str, str)
+    def _on_rename_folder(self, group: str, old_path: str,
+                          new_path: str) -> None:
+        """Kontextmenue 'Umbenennen' (rename_folder_requested).
+
+        Fuehrt dasselbe String-Replace aus wie der Ordner-Drop
+        (_on_folder_moved) – DRY ueber `_rename_folder`.
+        """
+        self._rename_folder(group, old_path, new_path)
+
+    def _rename_folder(self, group: str, old_path: str,
+                       new_path: str) -> None:
+        """Zentraler Ordner-Rename (String-Replace aller Kinder).
+
+        18.01.03 (E1/E2): Sets-Ordner aktualisieren das category-Feld der
+        Set-Definitionen; Plugins-Ordner setzen Kategorie-Overrides
+        (plugin_category_<id>). Nach Aenderung EventBus-Sync.
+        """
+        from serviceui.service_set_utils import rename_category
+        try:
+            count = rename_category(
+                getattr(self.service_selector, "model", None),
+                self.set_repo, self.state_manager,
+                str(group or ""), old_path, new_path)
+        except Exception as e:
+            self.log(f"Ordner-Umbenennung fehlgeschlagen: {e}")
+            return
+        if count > 0:
+            event_bus.service_set_changed.emit()
+        self.log(f"Ordner '{old_path}' -> '{new_path}': {count} "
+                 f"Element(e) verschoben.")
 
     @Slot(str, int)
     def _on_run_worker_finished(self, scope_id: str, stored: int) -> None:
@@ -33799,7 +35198,9 @@ _p170102_cat_items = [i for i in TreeItemIterator(_p170102_tree)
                       if i is not None
                       and i.data(0, ROLE_NODE_TYPE) == TYPE_CATEGORY]
 _p170102_cat_sigs = []
-_p170102_tree.category_info_requested.connect(_p170102_cat_sigs.append)
+# 18.01.03 (L3): category_info_requested traegt (group, path).
+_p170102_tree.category_info_requested.connect(
+    lambda _g, _p: _p170102_cat_sigs.append((_g, _p)))
 _cat_btn_ok = False
 _cat_path_ok = False
 for _ci in _p170102_cat_items:
@@ -33808,7 +35209,8 @@ for _ci in _p170102_cat_items:
         _cat_btn_ok = True
         _btn.click()
         if _p170102_cat_sigs:
-            _cat_path_ok = (_p170102_cat_sigs[-1]
+            _cat_path_ok = (len(_p170102_cat_sigs[-1]) == 2
+                            and _p170102_cat_sigs[-1][1]
                             == "Swing Points/Geometrie")
 check("17.01.02 T2) Ordner-Info-Button vorhanden",
       _cat_btn_ok, "")
@@ -33816,7 +35218,7 @@ check("17.01.02 T2) category_info_requested Pfad korrekt",
       _cat_path_ok, "sigs=" + str(_p170102_cat_sigs))
 check("17.01.02 T2) category_plugin_ids stimmt mit Pfad ueberein",
       _p170102_cat_sigs and _p170102_model.category_plugin_ids(
-          _p170102_cat_sigs[-1]) == ["srv_a", "srv_c"],
+          _p170102_cat_sigs[-1][1]) == ["srv_a", "srv_c"],
       "sigs=" + str(_p170102_cat_sigs))
 
 # --- T3: Run-Signale vorhanden ----------------------------------------------
@@ -35147,11 +36549,586 @@ if _scroll25 is not None and _box25 is not None:
 w25.close()
 pump()
 
+# ---------------------------------------------------------------------------
+# Teil 26: 18.01.03 Dynamic Tree Management – Sets-Kategorien, Kategorie-
+#          Persistenz (E2), Plugin-Override (E1), Rename & rekursive
+#          Aufloesung (L3). Rein headless (kein Drag&Drop-UI, nur Modell).
+# ---------------------------------------------------------------------------
+print("\n=== Teil 26: 18.01.03 Sets-Kategorien & Kategorie-Persistenz ===")
+from analytics.engine.service_selector_model import ServiceSelectorModel  # noqa: E402
+from serviceui.service_set_utils import (  # noqa: E402
+    _replace_prefix, rename_category, set_plugin_category, set_set_category,
+    create_empty_folder, delete_empty_folder, list_empty_folders)
+
+# E2: save_set persistiert das category-Feld additiv im Payload.
+repo.save_set({
+    "set_id": "set_cat_1",
+    "display_name": "Kategorien-Set A",
+    "category": "Swing Points/Geometrie",
+    "execution_order": ["grid_1"],
+    "services": {"grid_1": {"plugin_id": "srv_grid_lines", "lookback": 1000, "params": {}}},
+})
+repo.save_set({
+    "set_id": "set_cat_2",
+    "display_name": "Kategorien-Set B",
+    "category": "Swing Points",
+    "execution_order": ["prox_1"],
+    "services": {"prox_1": {"plugin_id": "srv_proximity", "lookback": 500, "params": {}}},
+})
+repo.save_set({
+    "set_id": "set_cat_3",
+    "display_name": "Kategorien-Set C",
+    "execution_order": [],
+    "services": {},
+})
+_loaded_cat = repo.get_set("set_cat_1")
+check("26 A1) save_set persistiert category-Feld",
+      bool(_loaded_cat) and _loaded_cat.get("category") == "Swing Points/Geometrie",
+      str(_loaded_cat and _loaded_cat.get("category")))
+
+_model_cat = ServiceSelectorModel(set_repo=repo, state_manager=sm)
+_model_cat.refresh()
+_ids_geo = _model_cat.category_set_ids("Swing Points/Geometrie")
+check("26 A2) category_set_ids exakter Unterordner",
+      "set_cat_1" in _ids_geo and "set_cat_2" not in _ids_geo, str(_ids_geo))
+_ids_sp = _model_cat.category_set_ids("Swing Points")
+check("26 A3) category_set_ids rekursiv (Unterordner inklusive)",
+      set(_ids_sp) >= {"set_cat_1", "set_cat_2"}, str(_ids_sp))
+check("26 A4) Sets ohne Kategorie sind in keinem Pfad",
+      "set_cat_3" not in _ids_sp, str(_ids_sp))
+
+# build_tree: Die Sets-Gruppe enthaelt Kategorie-Ordner (gruppen-agnostisch).
+_tree_cat = _model_cat.build_tree()
+_sets_group = next(g for g in _tree_cat if g["group"] == _model_cat.GROUP_SETS)
+
+
+def _find_folder(nodes, name):
+    for n in nodes or []:
+        if n.get("group") == _model_cat.GROUP_CATEGORY:
+            if (n.get("label") or "").replace("📁 ", "") == name:
+                return n
+            sub = _find_folder(n.get("children") or [], name)
+            if sub:
+                return sub
+    return None
+
+
+_fsp = _find_folder(_sets_group["children"], "Swing Points")
+_fgeo = _find_folder(_sets_group["children"], "Geometrie")
+check("26 A5) build_tree: Sets-Ordner 'Swing Points' vorhanden",
+      _fsp is not None)
+check("26 A6) build_tree: Unterordner 'Geometrie' rekursiv",
+      _fgeo is not None)
+if _fsp is not None:
+    _ids_in_folder = [c.get("set_id") for c in _fsp.get("children", [])]
+    check("26 A7) Set-Dicts in Ordnern (set_id-Schluessel)",
+          "set_cat_2" in _ids_in_folder, str(_ids_in_folder))
+_root_sets = [c for c in _sets_group["children"]
+              if c.get("group") != _model_cat.GROUP_CATEGORY]
+_root_ids = [c.get("set_id") for c in _root_sets]
+check("26 A8) Set ohne Kategorie bleibt Root-Blatt",
+      "set_cat_3" in _root_ids, str(_root_ids))
+
+# E1: Plugin-Kategorie-Override (plugin_category_<id>).
+_pid26 = "srv_grid_lines"
+_orig_path = _model_cat.plugin_category_path(_pid26)
+check("26 B1) set_plugin_category speichert Override",
+      set_plugin_category(sm, _pid26, "Meine Ordner/Unter"))
+_model_cat.refresh()
+check("26 B2) Override aendert plugin_category_path",
+      _model_cat.plugin_category_path(_pid26) == "Meine Ordner/Unter",
+      f"orig={_orig_path} -> {_model_cat.plugin_category_path(_pid26)}")
+_pl_ids = _model_cat.category_plugin_ids("Meine Ordner")
+check("26 B3) category_plugin_ids nutzt Override (rekursiv)",
+      _pid26 in _pl_ids, str(_pl_ids))
+# Override aufheben -> metadata['category'] gilt wieder.
+sm.save_global_value(f"plugin_category_{_pid26}", None)
+_model_cat.refresh()
+check("26 B4) Override aufgehoben -> metadata-Pfad wiederhergestellt",
+      _model_cat.plugin_category_path(_pid26) == _orig_path,
+      f"{_orig_path}")
+
+# Rename (String-Replace aller Kinder) fuer Sets-Ordner.
+_cnt_ren = rename_category(_model_cat, repo, sm, "sets",
+                           "Swing Points", "Bewegte Punkte")
+check("26 C1) rename_category sets liefert Anzahl betroffener Sets",
+      _cnt_ren == 2, str(_cnt_ren))
+_l1 = repo.get_set("set_cat_1")
+check("26 C2) Sets-Pfad-Update Unterordner",
+      bool(_l1) and _l1.get("category") == "Bewegte Punkte/Geometrie",
+      str(_l1 and _l1.get("category")))
+_l2 = repo.get_set("set_cat_2")
+check("26 C3) Sets-Pfad-Update exakter Treffer",
+      bool(_l2) and _l2.get("category") == "Bewegte Punkte",
+      str(_l2 and _l2.get("category")))
+_model_cat.refresh()
+check("26 C4) category_set_ids nach Rename",
+      _model_cat.category_set_ids("Bewegte Punkte/Geometrie") == ["set_cat_1"],
+      str(_model_cat.category_set_ids("Bewegte Punkte/Geometrie")))
+
+# Pfad-Grenzen (kein Prefix-Ersatz von 'AB' durch 'A').
+check("26 D1) _replace_prefix exakter Treffer",
+      _replace_prefix("A/B", "A", "X") == "X/B")
+check("26 D2) _replace_prefix respektiert Ordner-Grenzen",
+      _replace_prefix("AB/C", "A", "X") == "AB/C")
+
+# L3: category_service_plugin_ids (gruppenspezifische Aufloesung).
+_srv_ids = _model_cat.category_service_plugin_ids("sets", "Bewegte Punkte")
+check("26 E1) Sets-Ordner -> Service-plugin_ids (rekursiv)",
+      "srv_grid_lines" in _srv_ids and "srv_proximity" in _srv_ids, str(_srv_ids))
+check("26 E2) Plugins-Ordner Root-Pfad -> [] (defensiv)",
+      _model_cat.category_service_plugin_ids("plugins", "") == [], "")
+
+# ---------------------------------------------------------------------------
+# Teil 27: 18.01.03 (E3-revidiert, 08.08.2026) – Persistenz leerer Ordner.
+# Leere Ordner verschwinden NICHT beim Refresh; sie werden in global_settings
+# (Key 'tree_folders_<group>') persistiert und nur bei manueller Loeschung
+# ('Ordner löschen') entfernt. Rein headless (Modell + global_settings).
+# ---------------------------------------------------------------------------
+print("\n=== Teil 27: 18.01.03 E3-revidiert \u2013 Persistenz leerer Ordner ===")
+
+# create/list/delete Helfer (service_set_utils, DRY mit service_win/dialog).
+check("27 A1) create_empty_folder persistiert Pfad",
+      create_empty_folder(sm, "sets", "Leere Ordner"))
+check("27 A2) list_empty_folders liefert den Pfad",
+      "Leere Ordner" in list_empty_folders(sm, "sets"),
+      str(list_empty_folders(sm, "sets")))
+check("27 A3) create_empty_folder idempotent (kein Duplikat)",
+      create_empty_folder(sm, "sets", "Leere Ordner") is False,
+      str(list_empty_folders(sm, "sets")))
+
+_model_e3 = ServiceSelectorModel(set_repo=repo, state_manager=sm)
+_model_e3.refresh()
+check("27 A4) empty_folder_paths lesend (Modell)",
+      "Leere Ordner" in _model_e3.empty_folder_paths("sets"),
+      str(_model_e3.empty_folder_paths("sets")))
+
+# build_tree: leerer Ordner erscheint in der Sets-Gruppe (ohne Kinder).
+_tree_e3 = _model_e3.build_tree()
+_sets_e3 = next(g for g in _tree_e3 if g["group"] == _model_e3.GROUP_SETS)
+_fleer = _find_folder(_sets_e3["children"], "Leere Ordner")
+check("27 B1) build_tree enthaelt leeren Ordner (Sets)",
+      _fleer is not None)
+if _fleer is not None:
+    check("27 B2) leerer Ordner hat keine Kinder",
+          not _fleer.get("children"), str(_fleer.get("children")))
+    check("27 B3) leerer Ordner ist GROUP_CATEGORY",
+          _fleer.get("group") == _model_e3.GROUP_CATEGORY,
+          str(_fleer.get("group")))
+
+# Persistenz: ueberlebt einen weiteren build_tree-Aufruf (frischer Refresh).
+_sets_e3b = next(g for g in _model_e3.build_tree()
+                 if g["group"] == _model_e3.GROUP_SETS)
+check("27 C1) leerer Ordner ueberlebt Refresh",
+      _find_folder(_sets_e3b["children"], "Leere Ordner") is not None)
+
+# Auch in der Plugins-Gruppe (tree_folders_plugins).
+create_empty_folder(sm, "plugins", "Meine Plugins")
+_model_e3.refresh()
+_pl_e3 = next(g for g in _model_e3.build_tree()
+              if g["group"] == _model_e3.GROUP_PLUGINS)
+_fpl = _find_folder(_pl_e3["children"], "Meine Plugins")
+check("27 D1) leerer Ordner in Plugins-Gruppe",
+      _fpl is not None and not _fpl.get("children"))
+
+# Verschachtelter leerer Ordner erzeugt die Eltern-Kette.
+create_empty_folder(sm, "sets", "Eltern/Unter")
+_model_e3.refresh()
+_sets_e3c = next(g for g in _model_e3.build_tree()
+                 if g["group"] == _model_e3.GROUP_SETS)
+check("27 E1) verschachtelter leerer Ordner: Elternkette erzeugt",
+      _find_folder(_sets_e3c["children"], "Eltern") is not None
+      and _find_folder(_sets_e3c["children"], "Unter") is not None)
+
+# Kein Duplikat, wenn ein REALER Ordner (Blatt-Kategorie) existiert:
+# Set mit category 'Leere Ordner' -> Ordner wird wiederverwendet.
+repo.save_set({
+    "set_id": "set_e3_real",
+    "display_name": "E3-Realset",
+    "category": "Leere Ordner",
+    "execution_order": ["grid_1"],
+    "services": {"grid_1": {"plugin_id": "srv_grid_lines", "lookback": 1000,
+                            "params": {}}},
+})
+_model_e3.refresh()
+_sets_e3d = next(g for g in _model_e3.build_tree()
+                 if g["group"] == _model_e3.GROUP_SETS)
+_fmix = _find_folder(_sets_e3d["children"], "Leere Ordner")
+_cnt_leer = sum(1 for n in _sets_e3d["children"]
+                if n.get("group") == _model_e3.GROUP_CATEGORY
+                and _model_e3._cat_key(n.get("label")) == "leere ordner")
+check("27 F1) realer Ordner + leerer Eintrag -> kein Duplikat",
+      _cnt_leer == 1, f"count={_cnt_leer}")
+if _fmix is not None:
+    _real_ids = [n.get("set_id") for n in _fmix.get("children", [])]
+    check("27 F2) realer Ordner behaelt sein Blatt",
+          "set_e3_real" in _real_ids, str(_real_ids))
+
+# Rename (String-Replace) verschiebt auch persistierte leere Ordner.
+create_empty_folder(sm, "sets", "Leere Ordner/Unterleer")
+_model_e3.refresh()
+_cnt_ren_e3 = rename_category(_model_e3, repo, sm, "sets",
+                              "Leere Ordner", "Rename-Ordner")
+check("27 G1) rename_category erfasst leere Ordner mit",
+      _cnt_ren_e3 >= 2, str(_cnt_ren_e3))
+check("27 G2) leere-Ordner-Pfade nach Rename verschoben",
+      "Rename-Ordner" in list_empty_folders(sm, "sets")
+      and "Rename-Ordner/Unterleer" in list_empty_folders(sm, "sets"),
+      str(list_empty_folders(sm, "sets")))
+
+# Manuelle Loeschung (delete_empty_folder) entfernt den Ordner endgueltig.
+check("27 H1) delete_empty_folder entfernt Pfad",
+      delete_empty_folder(sm, "sets", "Rename-Ordner/Unterleer"))
+_model_e3.refresh()
+_sets_e3e = next(g for g in _model_e3.build_tree()
+                 if g["group"] == _model_e3.GROUP_SETS)
+check("27 H2) geloeschter leerer Ordner aus build_tree verschwunden",
+      _find_folder(_sets_e3e["children"], "Unterleer") is None)
+check("27 H3) delete_empty_folder bei fehlendem Pfad -> False",
+      delete_empty_folder(sm, "sets", "Gibt es nicht") is False)
+
+# ---------------------------------------------------------------------------
+# Teil 28: 18.01.03 (Bugfix 08.08.2026) – Quell-Ordner bleiben beim
+# Herausziehen sichtbar (Punkt 1) + Expansion-Erhaltung ueber _populate()
+# (Punkt 3). Rein headless (Modell + global_settings; MasterTree offscreen
+# fuer die Expansion-Logik, kein exec).
+# ---------------------------------------------------------------------------
+print("\n=== Teil 28: 18.01.03 Bugfix - Quell-Ordner erhalten & Expansion ===")
+from serviceui.service_set_utils import ensure_folder_path  # noqa: E402
+from serviceui.master_tree import TYPE_CATEGORY  # noqa: E402
+
+
+def _find_cat_item(tree, path):
+    """Kategorie-Item mit vollem Pfad `path` im MasterTree (oder None)."""
+    for _it in TreeItemIterator(tree):
+        if _it is None:
+            continue
+        if _it.data(0, ROLE_NODE_TYPE) != TYPE_CATEGORY:
+            continue
+        if tree._category_path_of(_it) == path:
+            return _it
+    return None
+
+
+# A) ensure_folder_path: Kette idempotent persistieren.
+check("28 A1) ensure_folder_path persistiert Kette",
+      ensure_folder_path(sm, "sets", "Eltern/Unter"))
+check("28 A2) Kettenglieder in Liste",
+      "Eltern" in list_empty_folders(sm, "sets")
+      and "Eltern/Unter" in list_empty_folders(sm, "sets"),
+      str(list_empty_folders(sm, "sets")))
+check("28 A3) idempotent (keine Duplikate)",
+      ensure_folder_path(sm, "sets", "Eltern/Unter") is True
+      and list_empty_folders(sm, "sets").count("Eltern/Unter") == 1,
+      str(list_empty_folders(sm, "sets")))
+check("28 A4) None-state_manager -> False",
+      ensure_folder_path(None, "sets", "Eltern") is False)
+
+# B) Move-out: letztes Set aus einem Ordner gezogen -> Ordner bleibt sichtbar.
+repo.save_set({
+    "set_id": "set_e3_move",
+    "display_name": "E3-Move-Set",
+    "category": "Bewegte Punkte/Geometrie",
+    "execution_order": ["grid_1"],
+    "services": {"grid_1": {"plugin_id": "srv_grid_lines", "lookback": 1000,
+                            "params": {}}},
+})
+_model_e3b = ServiceSelectorModel(set_repo=repo, state_manager=sm)
+_model_e3b.refresh()
+_tree_b = _model_e3b.build_tree()
+_sets_b = next(g for g in _tree_b if g["group"] == _model_e3b.GROUP_SETS)
+check("28 B1) Ordner vor Move vorhanden",
+      _find_folder(_sets_b["children"], "Geometrie") is not None)
+# Verschieben auf Root (category "") – der Orchestrator-Handler
+# (_on_folder_item_moved) ruft danach ensure_folder_path fuer den
+# Quell-Pfad (Punkt 1).
+set_set_category(repo, "set_e3_move", "")
+ensure_folder_path(sm, "sets", "Bewegte Punkte/Geometrie")
+_model_e3b.refresh()
+_sets_b2 = next(g for g in _model_e3b.build_tree()
+                if g["group"] == _model_e3b.GROUP_SETS)
+check("28 B2) Quell-Ordner 'Geometrie' bleibt sichtbar (leer)",
+      _find_folder(_sets_b2["children"], "Geometrie") is not None)
+check("28 B3) Elternkette 'Bewegte Punkte' bleibt sichtbar",
+      _find_folder(_sets_b2["children"], "Bewegte Punkte") is not None)
+_root_b = [n.get("set_id") for n in _sets_b2["children"]
+           if n.get("group") != _model_e3b.GROUP_CATEGORY]
+check("28 B4) Set ist Root-Blatt",
+      "set_e3_move" in _root_b, str(_root_b))
+_fgeo_b = _find_folder(_sets_b2["children"], "Geometrie")
+if _fgeo_b is not None:
+    _geo_ids = [c.get("set_id") for c in _fgeo_b.get("children", [])]
+    check("28 B5) verschobenes Set aus Quell-Ordner entfernt",
+          "set_e3_move" not in _geo_ids, str(_geo_ids))
+
+# C) Ordner-Move (rename_category) erhaelt den Quell-Ordner.
+ensure_folder_path(sm, "sets", "Quell-A")
+repo.save_set({
+    "set_id": "set_e3_src",
+    "display_name": "E3-Quell-Set",
+    "category": "Quell-A",
+    "execution_order": ["grid_1"],
+    "services": {"grid_1": {"plugin_id": "srv_grid_lines", "lookback": 1000,
+                            "params": {}}},
+})
+_model_e3c = ServiceSelectorModel(set_repo=repo, state_manager=sm)
+_cnt_ren_c = rename_category(_model_e3c, repo, sm, "sets",
+                             "Quell-A", "Ziel-B")
+check("28 C1) rename_category verschiebt Kind",
+      _cnt_ren_c >= 1, str(_cnt_ren_c))
+_after_c = list_empty_folders(sm, "sets")
+check("28 C2) Ziel-Pfad 'Ziel-B' in Liste",
+      "Ziel-B" in _after_c, str(_after_c))
+check("28 C3) Quell-Ordner 'Quell-A' bleibt erhalten (leer)",
+      "Quell-A" in _after_c, str(_after_c))
+
+# D) Expansion-Erhaltung ueber _populate (Punkt 3, offscreen MasterTree).
+ensure_folder_path(sm, "sets", "Expand/Unter")
+_model_e3d = ServiceSelectorModel(set_repo=repo, state_manager=sm)
+_tree_w = MasterTree(_model_e3d)
+_xd = _find_cat_item(_tree_w, "Expand")
+_yd = _find_cat_item(_tree_w, "Expand/Unter")
+check("28 D1) Ordner im Tree vorhanden",
+      _xd is not None and _yd is not None)
+if _xd is not None and _yd is not None:
+    _xd.setExpanded(True)
+    _yd.setExpanded(True)
+    _tree_w._populate()
+    _xd2 = _find_cat_item(_tree_w, "Expand")
+    _yd2 = _find_cat_item(_tree_w, "Expand/Unter")
+    check("28 D2) Expansion bleibt ueber _populate erhalten",
+          _xd2 is not None and _yd2 is not None
+          and _xd2.isExpanded() and _yd2.isExpanded())
+# Einmal-Expansion (_mark_expand, z.B. nach Ordner-Erstellung/Drop).
+ensure_folder_path(sm, "sets", "Frisch/Neu")
+_model_e3d.refresh()  # data_changed -> _populate (Ordner wird gebaut)
+_tree_w._mark_expand("sets", "Frisch/Neu")
+_tree_w._populate()
+_fd1 = _find_cat_item(_tree_w, "Frisch")
+_fd2 = _find_cat_item(_tree_w, "Frisch/Neu")
+check("28 D3) _mark_expand klappt Ziel-Kette nach _populate auf",
+      _fd1 is not None and _fd2 is not None
+      and _fd1.isExpanded() and _fd2.isExpanded())
+check("28 D4) _expand_after_rebuild geleert",
+      not _tree_w._expand_after_rebuild)
+
+# ---------------------------------------------------------------------------
+# Teil 29: 08.08.2026 Bugfix – 1) Picker-Start (setSizeConstraint-Crash) und
+# 2) Hoehe fix bei Set-/Service-Klicks (_build_service_columns ohne
+# Fenster-Reflow). Rein headless (offscreen, kein exec).
+# ---------------------------------------------------------------------------
+print("\n=== Teil 29: 08.08.2026 Bugfix - Picker-Start & Hoehe fix ===")
+from PySide6.QtWidgets import (  # noqa: E402
+    QGroupBox, QHBoxLayout, QLayout, QScrollArea,
+)
+from serviceui.param_columns import ServiceParamColumnsMixin  # noqa: E402
+from serviceui.service_selector_dialog import ServiceSelectorDialog  # noqa: E402
+
+# Bug 2: ServiceSelectorDialog darf beim Oeffnen nicht mehr crashen
+# (self.setSizeConstraint gehoerte zum Layout, nicht zum QDialog).
+_model_picker = ServiceSelectorModel(set_repo=repo, state_manager=sm)
+try:
+    _dlg = ServiceSelectorDialog(model=_model_picker)
+    check("29 A1) ServiceSelectorDialog startet ohne Crash", _dlg is not None)
+    check("29 A2) root-Layout SetNoConstraint (Hoehe fix)",
+          _dlg.layout().sizeConstraint() == QLayout.SetNoConstraint,
+          str(_dlg.layout().sizeConstraint()))
+    _dlg.close()
+except Exception as _e:
+    check(f"29 A1) ServiceSelectorDialog startet ohne Crash", False, str(_e))
+
+# Bug 1: _build_service_columns darf KEINEN Fenster-Reflow mehr ausloesen.
+# Duck-Typ-Host OHNE _schedule_reflow/_apply_reflow_size – vor dem Fix haette
+# der _reflow()-Aufruf (-> _schedule_reflow) einen AttributeError ausgeloest.
+class _DummyParamHost29(ServiceParamColumnsMixin):
+    def __init__(self):
+        self._service_param_controls = {}
+        self._service_desc_controls = {}
+        self._mode_schemas = {}
+        self._service_param_labels = {}
+        self._service_info_labels = {}
+        self._service_info_pids = {}
+        self._symbol_precision = None
+        self.combo_symbol = None
+        self.combo_tf = None
+        self.main_splitter = None
+        self.service_columns_layout = QHBoxLayout()
+        self.widget_service_columns = QGroupBox("Service-Parameter")
+        self.widget_service_columns.setLayout(self.service_columns_layout)
+        self._param_scroll = QScrollArea()
+        self._param_scroll.setWidget(self.widget_service_columns)
+
+    def _service_lock(self, plugin_id):
+        return "", ""
+
+    def _mark_service_dirty(self, iid):
+        pass
+
+    def _open_service_desc_editor(self, instance_id):
+        pass
+
+    def collect_set_definition(self):
+        return {}
+
+
+_host29 = _DummyParamHost29()
+try:
+    _host29._build_service_columns({
+        "execution_order": ["grid_1", "prox_1"],
+        "services": {
+            "grid_1": {"plugin_id": "srv_grid_lines", "lookback": 1000,
+                       "params": {}},
+            "prox_1": {"plugin_id": "srv_proximity", "lookback": 500,
+                       "params": {}},
+        },
+    })
+    check("29 B1) _build_service_columns ohne Fenster-Reflow (kein Crash)",
+          True)
+    check("29 B2) Service-Spalten gebaut",
+          _host29.service_columns_layout.count() >= 2,
+          str(_host29.service_columns_layout.count()))
+    check("29 B3) kein _apply_reflow_size-QTimer geplant",
+          not hasattr(_host29, "_apply_reflow_size"))
+except Exception as _e:
+    check(f"29 B1) _build_service_columns ohne Fenster-Reflow", False,
+          str(_e))
+
+
+print(chr(10) + '=== Teil 30: 18.01.02 Refactoring & Modularisierung (E1-E8) ===')
+import io as _io30
+import db_service as _db_facade
+from db.db_pool import DbPool as _DbPool30, db_connect as _dbc30, _LockedConnection as _lock30, with_db_lock as _wdl30
+from db.db_utils import _parse_json_field as _pjf30, _ensure_epoch as _ee30
+from db.schema_initializer import check_and_init_databases as _ci30
+from data_sync.mt5_sync_service import (sync_market_data as _smd30, get_timeframes as _gtf30,
+                                         check_mt5_connection as _cmc30, get_latest_timestamp as _glt30,
+                                         TF_SECONDS_MAP as _tfs30, MT5_LOCK as _ml30, SYMBOLS as _sym30)
+from repositories.market_data_repository import MarketDataRepository as _mdr30, get_symbol_precision as _gsp30
+
+# --- A: Fassade db_service re-exportiert alle E2-Namen (Identitaet) ---
+_facade30 = {
+    'DbPool': _db_facade.DbPool, '_LockedConnection': _db_facade._LockedConnection,
+    'db_connect': _db_facade.db_connect, 'with_db_lock': _db_facade.with_db_lock,
+    '_parse_json_field': _db_facade._parse_json_field, '_ensure_epoch': _db_facade._ensure_epoch,
+    'check_and_init_databases': _db_facade.check_and_init_databases,
+    'sync_market_data': _db_facade.sync_market_data, 'get_timeframes': _db_facade.get_timeframes,
+    'check_mt5_connection': _db_facade.check_mt5_connection,
+    'get_latest_timestamp': _db_facade.get_latest_timestamp,
+    'TF_SECONDS_MAP': _db_facade.TF_SECONDS_MAP, 'MT5_LOCK': _db_facade.MT5_LOCK,
+    'SYMBOLS': _db_facade.SYMBOLS, 'MarketDataRepository': _db_facade.MarketDataRepository,
+    'get_symbol_precision': _db_facade.get_symbol_precision,
+    'DATA_DIR': _db_facade.DATA_DIR, 'DB_MARKET_DATA': _db_facade.DB_MARKET_DATA,
+    'DB_ANALYTICS': _db_facade.DB_ANALYTICS, 'DB_APP_DATA': _db_facade.DB_APP_DATA,
+}
+check('30 A1) Fassade re-exportiert alle E2-Namen',
+      all(_facade30.values()) and len(_facade30) == 20, str(list(_facade30.keys())))
+check('30 A2) DbPool-Identitaet (db_service == db.db_pool)', _db_facade.DbPool is _DbPool30)
+check('30 A3) MarketDataRepository-Identitaet', _db_facade.MarketDataRepository is _mdr30)
+check('30 A4) _parse_json_field-Identitaet', _db_facade._parse_json_field is _pjf30)
+check('30 A5) sync_market_data-Identitaet', _db_facade.sync_market_data is _smd30)
+check('30 A6) get_timeframes-Identitaet', _db_facade.get_timeframes is _gtf30)
+
+# --- B: Kein Zirkularitaets-Verstoes (E4) ---
+_new_modules30 = ['db/db_pool.py', 'db/db_utils.py', 'db/schema_initializer.py',
+                  'data_sync/mt5_sync_service.py', 'repositories/market_data_repository.py',
+                  'workers/data_sync_worker.py', 'workers/live_tick_worker.py',
+                  'ui/window_manager.py', 'analytics/engine/tree_builder.py']
+_bad30 = []
+for _rel30 in _new_modules30:
+    _txt30 = _io30.open(os.path.join(r'F:\Python\PyTrader', _rel30), encoding='utf-8').read()
+    for _banned30 in ('import main', 'from main import', 'from db_service import',
+                      'import db_service'):
+        if _banned30 in _txt30:
+            _bad30.append(_rel30 + ': ' + _banned30)
+check('30 B1) neue Module importieren main/db_service NICHT (E4)', not _bad30, str(_bad30))
+_tb_src30 = _io30.open(os.path.join(r'F:\Python\PyTrader',
+                                    'analytics/engine/tree_builder.py'), encoding='utf-8').read()
+check('30 B2) tree_builder importiert ServiceSelectorModel NICHT (E6)',
+      'from analytics.engine.service_selector_model' not in _tb_src30
+      and 'import service_selector_model' not in _tb_src30)
+
+# --- C: Worker-Instanziierung (E7) ---
+from workers.data_sync_worker import DataSyncWorker
+from workers.live_tick_worker import LiveTickWorker
+_ws30 = DataSyncWorker()
+check('30 C1) DataSyncWorker instanziierbar', isinstance(_ws30, DataSyncWorker))
+_wt30 = LiveTickWorker(lambda: set())
+check('30 C2) LiveTickWorker instanziierbar', isinstance(_wt30, LiveTickWorker))
+check('30 C3) LiveTickWorker-Callback liefert leere Paare',
+      _wt30.get_active_pairs() == set())
+
+# --- D: WindowManager (E5, IoC ohne MainWindow) ---
+from ui.window_manager import WindowManager
+class _DummyParent30:
+    pass
+_wm30 = WindowManager(parent=_DummyParent30(), state_manager=_P1608StateMgr(),
+                      chart_windows=[], persistent_sub_windows=[])
+check('30 D1) WindowManager instanziierbar (IoC, kein main-Import)', isinstance(_wm30, WindowManager))
+check('30 D2) get_currently_active_pairs leer', _wm30.get_currently_active_pairs() == set())
+
+# --- E: tree_builder-Delegation (E6) ---
+from analytics.engine.tree_builder import (build_tree as _tbb30, category_plugin_ids as _tbcpid30,
+                                            category_set_ids as _tbcsid30, plugin_category_path as _tbp30,
+                                            category_service_plugin_ids as _tbcsp30, _cat_key as _tbck30)
+check('30 E1) Modell._cat_key delegiert an tree_builder',
+      ServiceSelectorModel._cat_key('📁 Trend') == 'trend' == _tbck30('📁 Trend'))
+_plugs30 = {'a': _P1608Plugin('a', category='Swing Points/Geometrie'),
+            'b': _P1608Plugin('b', category='Swing Points'),
+            'c': _P1608Plugin('c', category='')}
+_model30 = _p1608_model(_plugs30)
+_tree_model30 = _model30.build_tree()
+_plugins30 = _model30.get_plugins()
+_badges30 = {pid: _model30.badge_for(pid) for pid in _plugins30}
+_exec30 = {pid: _model30.last_execution_date(pid) for pid in _plugins30}
+_tree_direct30 = _tbb30(_model30.get_sets(), _plugins30,
+                        _model30._plugin_category_overrides,
+                        _model30._empty_folder_paths, _badges30, _exec30)
+check('30 E2) build_tree Modell == tree_builder direkt', _tree_model30 == _tree_direct30, '')
+check('30 E3) category_plugin_ids-Delegation',
+      _model30.category_plugin_ids('Swing Points')
+      == _tbcpid30(_plugins30, _model30._plugin_category_overrides, 'Swing Points')
+      == ['a', 'b'])
+check('30 E4) plugin_category_path-Delegation',
+      _model30.plugin_category_path('a')
+      == _tbp30('a', _plugins30.get('a'), _model30._plugin_category_overrides)
+      == 'Swing Points/Geometrie')
+check('30 E5) category_set_ids leer -> [] (Delegation)',
+      _model30.category_set_ids('Swing Points')
+      == _tbcsid30([], 'Swing Points') == [])
+check('30 E6) category_service_plugin_ids Plugins-Ordner (Delegation)',
+      _model30.category_service_plugin_ids('plugins', 'Swing Points')
+      == _tbcsp30('plugins', _model30.get_sets(), _plugins30,
+                  _model30._plugin_category_overrides, 'Swing Points')
+      == ['a', 'b'])
+check('30 E7) Baum-Logik aus dem Modell ausgelagert (keine Methoden mehr)',
+      not hasattr(ServiceSelectorModel, '_category_parts')
+      and not hasattr(ServiceSelectorModel, '_insert_into_category_tree')
+      and not hasattr(ServiceSelectorModel, '_sort_category_nodes')
+      and not hasattr(ServiceSelectorModel, '_category_nodes')
+      and not hasattr(ServiceSelectorModel, '_ensure_category_path')
+      and not hasattr(ServiceSelectorModel, '_set_category_parts')
+      and not hasattr(ServiceSelectorModel, '_insert_set_into_category_tree'))
+
 if FAILURES:
     print(f"FEHLER: {len(FAILURES)}: {FAILURES}")
     sys.exit(1)
 print("ALLE PRUEFUNGEN BESTANDEN (OK)")
 sys.exit(0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: ui/__init__.py
+```py
+# ui/__init__.py
+"""
+ui-Paket (18.01.02, E5): Fenster-Lifecycle-Management.
+
+  * window_manager.py – WindowManager (Sub-/Chart-Fenster, Jump-to-Bar)
+
+Kein Import von main.py (IoC – der WindowManager kennt MainWindow nicht).
+"""
 
 ```
 
@@ -36186,6 +38163,433 @@ QTableWidget::item:selected { background-color: #2b5c8f; }</string>
  <resources/>
  <connections/>
 </ui>
+
+```
+
+--------------------------------------------------
+
+### DATEI: ui/window_manager.py
+```py
+# ui/window_manager.py
+"""
+ui/window_manager.py - Zentraler Fenster-Lifecycle-Manager (18.01.02, E5).
+
+Kapselt die Sub-/Chart-Fenster-Verwaltung des MainWindow (Single Responsibility
+Principle, Inversion of Control):
+
+  * Wiederherstellung aller gespeicherten Fenster (restore_all_windows)
+  * Oeffnen/Fokussieren von Chart-, Service-, Analytics- und Properties-Fenstern
+  * Jump-to-Bar (open_chart_at_bar)
+  * Ermittlung der aktuell aktiven Symbol/Timeframe-Paare (LiveTickWorker-Callback)
+
+Der WindowManager kennt MainWindow NICHT (kein Import von main.py). Die
+Kopplung erfolgt ueber Konstruktor-Parameter (parent + state_manager +
+Listen-Referenzen). `restore_main_window_geometry` und die Tick-Verteilung
+bleiben im MainWindow (E5).
+"""
+
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from PySide6.QtCore import Qt, Slot
+from PySide6.QtWidgets import QApplication
+
+from analytics.ui.analytics_win import AnalyticsWindow
+from chart.chart_win import PyTraderChartWindow
+from persistent_win import PersistentWindow
+from properties_win import PropertiesWindow
+from serviceui.service_win import ServiceWindow
+from state_manager import StateManager
+
+
+class WindowManager:
+    """Verwaltet alle Sub-/Chart-Fenster des MainWindow (Fenster-Lifecycle)."""
+
+    def __init__(self, parent, state_manager: StateManager,
+                 chart_windows: List[PyTraderChartWindow],
+                 persistent_sub_windows: List[PersistentWindow]) -> None:
+        """Erstellt den Fenster-Manager.
+
+        Args:
+            parent: Qt-Parent fuer neu erzeugte Fenster (duck-typed, z. B. das
+                    MainWindow – wird NIE importiert, E5/IoC).
+            state_manager: StateManager – Persistenz (Instanzen, Geometrien).
+            chart_windows: Referenz auf die Chart-Fenster-Liste des Aufrufers
+                           (gemeinsames List-Objekt, in-place-Mutationen).
+            persistent_sub_windows: Referenz auf die PersistentWindow-Liste
+                           des Aufrufers (gemeinsames List-Objekt).
+        """
+        self._parent = parent
+        self.state_manager = state_manager
+        self.chart_windows = chart_windows
+        self.persistent_sub_windows = persistent_sub_windows
+
+    def restore_all_windows(self) -> None:
+        """Stellt ALLE gespeicherten Fenster vollautomatisch und generisch wieder her.
+
+        Nutzt die Klassen-Registry aus persistent_win.py, um ohne Hardcoding
+        zwischen PersistentWindow-Subklassen (Service, Statistik) und
+        dynamischen Chart-Fenstern zu unterscheiden.
+        """
+        all_instances: List[Dict[str, Any]] = self.state_manager.load_all_instances()
+        if not all_instances:
+            print("✨ Keine gespeicherten Instanzen vorhanden.")
+            return
+
+        print(f"🔄 Prüfe {len(all_instances)} gespeicherte Fenster-Einträge...")
+
+        for inst in all_instances:
+            inst_id = str(inst.get("instance_id", ""))
+            if not inst_id or inst_id == "win_main":
+                continue
+
+            # 1. Fall: Registrierte PersistentWindow-Subklasse (Service, Statistik, etc.)
+            window_cls = PersistentWindow.get_registered_class(inst_id)
+            if window_cls is not None:
+                if not PersistentWindow.should_auto_restore(inst_id):
+                    print(f"  → Überspringe {inst_id} ({window_cls.__name__}): auto_restore=False")
+                    continue
+                print(f"  → Öffne registriertes Fenster: {inst_id} ({window_cls.__name__})")
+                # WICHTIG: parent=self nur für state_manager-Zugriff, nicht als Qt-Parent!
+                # PersistentWindow.__init__() übergibt kein Parent an QMainWindow,
+                # damit das Fenster einen eigenen Taskleisten-Eintrag hat.
+                win = window_cls(parent=self._parent)
+                self.persistent_sub_windows.append(win)
+                # Ohne Fokus anzeigen (damit MainWindow den Fokus behält)
+                win.setAttribute(Qt.WA_ShowWithoutActivating, True)
+                win.show()
+                win.setAttribute(Qt.WA_ShowWithoutActivating, False)
+                # Maximiert wiederherstellen (nach show(), ohne Fokus-Klau)
+                if getattr(win, '_restored_is_maximized', False):
+                    win.showMaximized()
+                continue
+
+            # 2. Fall: Dynamische Chart-Fenster (win_1, win_2, ...)
+            if inst_id.startswith("win_"):
+                print(f"  → Öffne Chart-Fenster: {inst_id}")
+                win = PyTraderChartWindow(
+                    instance_id=inst_id,
+                    symbol=inst.get("symbol") or "SILVER",
+                    timeframe=inst.get("timeframe") or "H1",
+                    visible_from=inst.get("visible_range_from"),
+                    visible_to=inst.get("visible_range_to"),
+                    state_manager=self.state_manager
+                )
+                win.closed_signal.connect(self.handle_chart_closed)
+
+                # Geometrie anwenden
+                screen_geo = QApplication.primaryScreen().availableGeometry()
+                pos_x, pos_y = inst.get("pos_x"), inst.get("pos_y")
+                width = inst.get("width") or 900
+                height = inst.get("height") or 600
+
+                if pos_x is not None and pos_y is not None:
+                    if pos_x < screen_geo.x() - 100 or pos_x > screen_geo.right() or \
+                       pos_y < screen_geo.y() - 100 or pos_y > screen_geo.bottom():
+                        pos_x, pos_y = 100, 100
+                    win.move(pos_x, pos_y)
+                    win.resize(width, height)
+
+                if inst.get("is_maximized"):
+                    win.showMaximized()
+                else:
+                    win.setAttribute(Qt.WA_ShowWithoutActivating, True)
+                    win.show()
+                    win.setAttribute(Qt.WA_ShowWithoutActivating, False)
+
+                self.chart_windows.append(win)
+
+        # MainWindow NICHT in den Vordergrund holen – die WA_ShowWithoutActivating-Logik
+        # bei den Sub-Fenstern verhindert bereits Fokus-Klau. Ein erzwungenes
+        # raise_() + activateWindow() würde nur stören, falls der User inzwischen
+        # eine andere Anwendung fokussiert hat.
+
+    def open_chart_window(self) -> None:
+        new_id: str = self.state_manager.get_next_instance_id()
+        win = PyTraderChartWindow(
+            instance_id=new_id,
+            symbol="SILVER",
+            timeframe="H1",
+            visible_from=None,
+            visible_to=None,
+            state_manager=self.state_manager
+        )
+        win.closed_signal.connect(self.handle_chart_closed)
+        win.show()
+        self.chart_windows.append(win)
+
+    @Slot(str)
+    def handle_chart_closed(self, instance_id: str) -> None:
+        app = QApplication.instance()
+        if getattr(app, '_is_quitting', False):
+            return
+        # In-place-Filter (gemeinsames List-Objekt mit dem Aufrufer, E5)
+        self.chart_windows[:] = [w for w in self.chart_windows if w.instance_id != instance_id]
+
+    def open_service_window(self) -> None:
+        # Singleton: Bestehendes Fenster in den Vordergrund holen
+        existing = ServiceWindow.get_existing_instance()
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
+        win = ServiceWindow(self._parent)  # parent nur für state_manager-Zugriff
+        self.persistent_sub_windows.append(win)
+        win.show()
+
+    def open_analytics_window(self) -> None:
+        # Phase 15 15.03: Statistik-Fenster durch AnalyticsWindow ersetzt
+        # (win_statistics-Persistenz wird per E-2 nach win_analytics migriert).
+        # Singleton: Bestehendes Fenster in den Vordergrund holen
+        existing = AnalyticsWindow.get_existing_instance()
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
+        win = AnalyticsWindow(self._parent)  # parent nur für state_manager-Zugriff
+        self.persistent_sub_windows.append(win)
+        win.show()
+
+    def open_properties_window(self) -> None:
+        # Singleton: Bestehendes Fenster in den Vordergrund holen
+        existing = PropertiesWindow.get_existing_instance()
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
+        win = PropertiesWindow(self._parent)
+        self.persistent_sub_windows.append(win)
+        win.show()
+
+    def open_chart_at_bar(self, symbol: str, timeframe: str, bar_time: int) -> None:
+        """Oeffnet oder fokussiert ein Chart-Fenster und scrollt zur angegebenen Bar-Position."""
+        # Bestehendes Chart-Fenster mit passendem Symbol/TF suchen
+        for win in self.chart_windows:
+            try:
+                if win.current_symbol == symbol and win.current_tf == timeframe and win.isVisible():
+                    win.raise_()
+                    win.activateWindow()
+                    # Chart zur Position scrollen
+                    win.visible_from = bar_time
+                    win.visible_to = None
+                    win.refresh_chart_data()
+                    return
+            except (RuntimeError, AttributeError):
+                pass
+
+        # Kein passendes Fenster gefunden -> neues oeffnen
+        from chart.chart_win import PyTraderChartWindow
+        new_id: str = self.state_manager.get_next_instance_id()
+        win = PyTraderChartWindow(
+            instance_id=new_id,
+            symbol=symbol,
+            timeframe=timeframe,
+            visible_from=bar_time,
+            visible_to=None,
+            state_manager=self.state_manager
+        )
+        win.closed_signal.connect(self.handle_chart_closed)
+        win.show()
+        self.chart_windows.append(win)
+
+    def get_currently_active_pairs(self) -> Set[Tuple[str, str]]:
+        active_pairs: Set[Tuple[str, str]] = set()
+        for win in list(self.chart_windows):
+            try:
+                if win.isVisible():
+                    active_pairs.add((win.current_symbol, win.current_tf))
+            except (RuntimeError, AttributeError):
+                pass
+        return active_pairs
+
+```
+
+--------------------------------------------------
+
+### DATEI: workers/__init__.py
+```py
+# workers/__init__.py
+"""
+workers-Paket (18.01.02, E7): Qt-Hintergrund-Threads.
+
+  * data_sync_worker.py – DataSyncWorker (MT5-Historie-Sync)
+  * live_tick_worker.py – LiveTickWorker (Tick-Polling + Bar-Close-Persistenz)
+
+Kein Import von main.py (E4); UI-Logik ist verboten (SRP).
+"""
+
+```
+
+--------------------------------------------------
+
+### DATEI: workers/data_sync_worker.py
+```py
+# workers/data_sync_worker.py
+"""
+workers/data_sync_worker.py - Hintergrund-Sync der historischen Marktdaten.
+
+Ausgelagert aus main.py im Rahmen von 18.01.02 (E7). Der Worker fuehrt den
+Voll-/Update-Import der MT5-Historie in einem QThread aus und emittiert die
+aktualisierten Symbol/Timeframe-Paare. Keine UI-Logik (SRP).
+"""
+
+from typing import Set, Tuple
+
+from PySide6.QtCore import QThread, Signal
+
+from data_sync.mt5_sync_service import sync_market_data
+
+
+class DataSyncWorker(QThread):
+    """Führt den Hintergrund-Sync für alle historischen Daten aus."""
+
+    sync_completed = Signal(object)
+
+    def run(self) -> None:
+        """Führt den Hintergrund-Sync für alle historischen Daten aus."""
+        try:
+            updated_pairs: Set[Tuple[str, str]] = sync_market_data()
+            self.sync_completed.emit(updated_pairs)
+        except Exception as e:
+            print(f"❌ Fehler im DataSyncWorker: {e}")
+            self.sync_completed.emit(set())
+
+```
+
+--------------------------------------------------
+
+### DATEI: workers/live_tick_worker.py
+```py
+# workers/live_tick_worker.py
+"""
+workers/live_tick_worker.py - Kontinuierliches MT5-Tick-Polling & Bar-Close.
+
+Ausgelagert aus main.py im Rahmen von 18.01.02 (E7). Der Worker pollt
+MT5-Ticks fuer die aktuell aktiven Symbol/Timeframe-Paare, erkennt
+Bar-Close-Events, schreibt abgeschlossene Kerzen in market_data.duckdb und
+emittiert Live-Candle-Updates an die Charts. Keine UI-Logik (SRP).
+"""
+
+import json
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, Optional, Set, Tuple
+
+import MetaTrader5 as mt5
+from PySide6.QtCore import QThread, Signal
+
+from data_sync.mt5_sync_service import MT5_LOCK, get_timeframes
+from db.db_pool import DB_MARKET_DATA, DbPool
+
+
+class LiveTickWorker(QThread):
+    """Kontinuierliche MT5-Tick-Polling-Schleife mit Bar-Close-Erkennung."""
+
+    ticks_ready = Signal(str)
+
+    def __init__(self, get_active_pairs_callback: Callable[[], Set[Tuple[str, str]]]) -> None:
+        super().__init__()
+        self.get_active_pairs: Callable[[], Set[Tuple[str, str]]] = get_active_pairs_callback
+        self._running: bool = True
+        self._last_bar_times: Dict[str, int] = {}  # Für Bar-Close-Erkennung
+        self._last_bar_data: Dict[str, Dict[str, Any]] = {}  # OHLCV der letzten abgeschlossenen Kerze
+
+    def stop(self) -> None:
+        self._running = False
+
+    def run(self) -> None:
+        """Kontinuierliche Polling-Schleife für MT5-Ticks mit try/finally Freigabe.
+        Erkennt Bar-Close-Events und schreibt abgeschlossene Kerzen in market_data.duckdb."""
+        try:
+            with MT5_LOCK:
+                if not mt5.initialize():
+                    # MT5 ist möglicherweise bereits von MainWindow initialisiert
+                    print("⚠️ [LiveTickWorker] mt5.initialize() war False, versuche trotzdem weiter...")
+
+            while self._running:
+                active_pairs: Set[Tuple[str, str]] = self.get_active_pairs()
+                if not active_pairs:
+                    self.msleep(200)
+                    continue
+
+                results: Dict[str, Dict[str, float | int]] = {}
+                try:
+                    for symbol, tf_str in active_pairs:
+                        mt5_tf: Optional[int] = get_timeframes().get(tf_str)
+                        if mt5_tf is None:
+                            continue
+
+                        with MT5_LOCK:
+                            tick = mt5.symbol_info_tick(symbol)
+                            rates = mt5.copy_rates_from_pos(symbol, mt5_tf, 0, 1)
+
+                        if tick and rates is not None and len(rates) > 0:
+                            rate = rates[0]
+                            key: str = f"{symbol}|{tf_str}"
+                            current_bar_time = int(rate['time'])
+
+                            # Bar-Close erkennen: neue Bar-Time != letzte Bar-Time
+                            last_bar = self._last_bar_times.get(key, 0)
+                            if last_bar > 0 and current_bar_time > last_bar:
+                                # Alte (abgeschlossene) Kerze aus dem Zwischenspeicher in DB schreiben
+                                last_data = self._last_bar_data.get(key)
+                                if last_data:
+                                    self._persist_bar(symbol, tf_str, last_bar, last_data)
+
+                            # Aktuelle Kerze zwischenspeichern (wird beim nächsten Bar-Close persistiert)
+                            self._last_bar_times[key] = current_bar_time
+                            self._last_bar_data[key] = {
+                                'open': float(rate[1]),  # open
+                                'high': float(rate[2]),  # high
+                                'low': float(rate[3]),   # low
+                                'close': float(rate[4]), # close
+                                'tick_volume': int(rate[5]) if len(rate) > 5 else 0,
+                                'spread': int(rate[6]) if len(rate) > 6 else 0,
+                                'real_volume': int(rate[7]) if len(rate) > 7 else 0,
+                            }
+
+                            # JEDEN Tick an die Charts senden (für Live-Candle-Updates)
+                            results[key] = {
+                                "time": current_bar_time,
+                                "open": float(rate['open']),
+                                "high": max(float(rate['high']), float(tick.bid)),
+                                "low": min(float(rate['low']), float(tick.bid)),
+                                "close": float(tick.bid)
+                            }
+                except Exception as e:
+                    print(f"⚠️ [LiveTickWorker] Fehler in Poll-Schleife: {e}")
+
+                if results:
+                    self.ticks_ready.emit(json.dumps(results))
+
+                self.msleep(500)
+
+        finally:
+            with MT5_LOCK:
+                try:
+                    mt5.shutdown()
+                except Exception:
+                    pass
+
+    def _persist_bar(self, symbol: str, tf_str: str, bar_time: int, bar_data: Dict[str, Any]) -> None:
+        """Schreibt eine abgeschlossene Kerze per INSERT OR REPLACE in market_data.duckdb."""
+        try:
+            con = DbPool.get(DB_MARKET_DATA)
+            con.execute("""
+                INSERT OR REPLACE INTO ohlcv_bars (symbol, timeframe, time, open, high, low, close, tick_volume, spread, real_volume)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, [
+                symbol,
+                tf_str,
+                datetime.fromtimestamp(bar_time, tz=timezone.utc),
+                bar_data['open'],
+                bar_data['high'],
+                bar_data['low'],
+                bar_data['close'],
+                bar_data['tick_volume'],
+                bar_data['spread'],
+                bar_data['real_volume'],
+            ])
+        except Exception as e:
+            print(f"⚠️ [LiveTickWorker] Fehler beim Persistieren von {symbol} {tf_str} @ {bar_time}: {e}")
 
 ```
 

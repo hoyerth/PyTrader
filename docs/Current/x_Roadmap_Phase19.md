@@ -23,7 +23,5 @@
     - Das `parameter_schema` liegt direkt am Dateianfang unter dem Header-Docstring.
     - Jedes Service-Plugin deklariert `metadata["category"]` für die dynamische Kategorie-Ordner-Struktur im MasterTree.
 
-
 ---
-
 
