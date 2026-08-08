@@ -162,7 +162,7 @@ Mache nur ergänzende Anpassungen und überschreibe NIEMALS vorhandene Strukture
 - Abweichungen davon nur auf ausdrückliche Einzelanweisung des Benutzers.
 - Anpassungen, ob aus dieser Datei oder manuell eingegeben, werden hier in weiteren Kapiteln nach gegebener Taxonomie als Implementierungs-Log mit datum/uhrzeit im Format MD dokumentiert
 
-### 0b. WICHTIG: `docs/Current` NICHT BEACHTEN (Standard)
+### 0b. WICHTIG: `docs/Current` und `docs/Archiv` NICHT BEACHTEN (Standard)
 - **Alle Dateien im Unterordner `docs/Current` und `docs/Archiv` (`docs/Current/x_Architektur.md`, `docs/Current/x_Roadmap.md`, ...) sind archivierte/abgelegte Alt-Dokumente und werden NICHT beachtet.**
 - **Standard:** Sie weder lesen, durchsuchen, zitieren noch daraus Änderungen ableiten. Sie spiegeln NICHT den aktuellen Stand des Projekts wider.
 - **Ausnahme:** Nur auf temporäre, ausdrückliche Einzelanweisung des Benutzers darf eine bestimmte Datei aus `docs/Current` ausnahmsweise herangezogen werden.
@@ -3942,8 +3942,13 @@ den UI-Pages benoetigten Strukturen auf:
     get_table()         – rohe Feature-Zeilen fuer die Tabellen-Seite
     get_heatmap()       – 2D-Matrix (X: Wochentage, Y: Tagesstunden
                           Berlin Wanduhr, Invariante 7)
-    get_scatter()       – X/Y-Paare zweier nativer Spalten
-    get_distribution()  – Histogramm (bins/counts) einer nativen Spalte
+    get_scatter()       – X/Y-Paare zweier feature_data-JSON-Keys (19.02)
+    get_distribution()  – Histogramm (bins/counts) eines JSON-Keys (19.02)
+
+19.02 (Cleanup): Die Legacy-Native-Spalten ema_diff/rsi_14/atr_normalized
+sind entfernt. Scatter-/Verteilungs-/Heatmap-Achsen werden rein dynamisch
+aus den numerischen JSON-Keys des `feature_data` abgeleitet
+(`available_feature_keys(numeric_only=True)`).
 
 Das Repository ist rein lesend (kein SQL in UI, keine Schreiboperationen) –
 die Profil-Persistenz (Option B / Explicit Save) liegt separat im
@@ -3960,14 +3965,12 @@ import numpy as np
 
 from analytics.engine.feature_store_reader import (
     FeatureStoreReader,
-    NATIVE_COLUMNS,
-    DOW_LABELS,
-    HOURS_PER_DAY,
-    DAYS_PER_WEEK,
 )
 
-# Vertraglich unterstuetzte Metriken fuer die Heatmap (count + native Spalten).
-HEATMAP_METRICS = ("count",) + NATIVE_COLUMNS
+# 19.02 (Cleanup): HEATMAP_METRICS ENTFERNT – Heatmap-Metriken sind "count"
+# oder dynamische feature_data-JSON-Keys (available_feature_keys(numeric_only)).
+# Die Achsen-Verfuegbarkeit wird pro Symbol/Timeframe aus dem feature_data
+# abgeleitet (keine nativen Spalten mehr).
 
 
 class AnalyticsRepository:
@@ -4010,6 +4013,11 @@ class AnalyticsRepository:
     ) -> Dict[str, Any]:
         """2D-Matrix (Wochentag x Tagesstunde) fuer die Heatmap-Seite.
 
+        19.02 (Cleanup): Metrik ist "count" oder ein numerischer
+        feature_data-JSON-Key (Default "count"). Unbekannte/fehlende
+        JSON-Metriken fallen auf "count" zurueck (defensiv, keine ValueError-
+        Haenger im UI). `metrics` liefert die verfuegbaren Metriken.
+
         Wanduhr-Garantie (Invariante 7): Die Extraktion von Wochentag/Stunde
         erfolgt im Reader mit `bar_time AT TIME ZONE 'UTC'` (die gespeicherten
         Werte sind Berlin-Wanduhr-encoded – die UTC-Darstellung IST die
@@ -4019,13 +4027,20 @@ class AnalyticsRepository:
             {
               "matrix":   7x24 (rows=Stunde 0-23, cols=DOW 0=So..6=Sa),
               "x_labels": Wochentage, "y_labels": Stunden,
-              "metric", "symbol", "timeframe",
+              "metric", "metrics": ["count", ...JSON-Keys],
+              "symbol", "timeframe",
             }
         """
-        return self.reader.fetch_heatmap(
-            symbol, timeframe, metric=metric, feature_id=feature_id,
+        avail = self.reader.available_feature_keys(
+            symbol, timeframe, numeric_only=True)
+        metrics = ["count"] + avail
+        use_metric = metric if metric in metrics else "count"
+        result = self.reader.fetch_heatmap(
+            symbol, timeframe, metric=use_metric, feature_id=feature_id,
             feature_ids=feature_ids
         )
+        result["metrics"] = metrics
+        return result
 
     # ------------------------------------------------------------------
     # Scatter
@@ -4034,36 +4049,45 @@ class AnalyticsRepository:
         self,
         symbol: str,
         timeframe: str,
-        x_column: str = "ema_diff",
-        y_column: str = "rsi_14",
+        x_column: Optional[str] = None,
+        y_column: Optional[str] = None,
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
-        limit: Optional[int] = 1000,
+        limit: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """X/Y-Paare zweier nativer Spalten fuer die Scatter-Seite.
+        """X/Y-Paare zweier feature_data-JSON-Keys fuer die Scatter-Seite.
 
-        Zeilen mit NULL in einer der beiden Spalten werden ausgelassen.
-        Unbekannte Spalten werden durch die Reader-Validierung abgefangen
-        (nur native Spalten erlaubt).
+        19.02 (Cleanup): Achsen sind dynamische JSON-Keys aus `feature_data`
+        (nicht mehr native DB-Spalten). Defaults: die ersten beiden
+        numerischen Keys der aktuellen Datenlage (x != y). Rows mit NULL/
+        nicht-numerischem Wert in einer Achse werden ausgelassen.
 
         Returns:
             {"points": [{"x": float, "y": float}, ...],
              "x_label": x_column, "y_label": y_column,
+             "columns": [verfuegbare numerische JSON-Keys...],
              "symbol", "timeframe", "total": n}
         """
-        if x_column not in NATIVE_COLUMNS or y_column not in NATIVE_COLUMNS:
-            raise ValueError(
-                f"[AnalyticsRepository] Unbekannte Scatter-Spalten "
-                f"x='{x_column}', y='{y_column}' – erlaubt: {NATIVE_COLUMNS}."
-            )
+        avail = self.reader.available_feature_keys(
+            symbol, timeframe, numeric_only=True)
+        if not avail:
+            return {
+                "points": [], "x_label": "", "y_label": "", "columns": [],
+                "symbol": symbol, "timeframe": timeframe, "total": 0,
+            }
+        x_col = x_column if x_column in avail else avail[0]
+        y_candidates = [c for c in avail if c != x_col]
+        y_col = y_column if y_column in avail and y_column != x_col \
+            else (y_candidates[0] if y_candidates else x_col)
+
         rows = self.reader.fetch_columns(
-            symbol, timeframe, [x_column, y_column],
+            symbol, timeframe, [x_col, y_col],
             feature_id=feature_id, feature_ids=feature_ids, limit=limit,
         )
         points: List[Dict[str, float]] = []
         for r in rows:
-            xv = r.get(x_column)
-            yv = r.get(y_column)
+            xv = r.get(x_col)
+            yv = r.get(y_col)
             if xv is None or yv is None:
                 continue
             if not (np.isfinite(xv) and np.isfinite(yv)):
@@ -4071,8 +4095,9 @@ class AnalyticsRepository:
             points.append({"x": xv, "y": yv})
         return {
             "points": points,
-            "x_label": x_column,
-            "y_label": y_column,
+            "x_label": x_col,
+            "y_label": y_col,
+            "columns": avail,
             "symbol": symbol,
             "timeframe": timeframe,
             "total": len(points),
@@ -4085,40 +4110,47 @@ class AnalyticsRepository:
         self,
         symbol: str,
         timeframe: str,
-        column: str = "atr_normalized",
+        column: Optional[str] = None,
         bins: int = 20,
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
-        limit: Optional[int] = 1000,
+        limit: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Histogramm einer nativen Spalte fuer die Verteilungs-Seite.
+        """Histogramm eines feature_data-JSON-Keys fuer die Verteilungs-Seite.
 
+        19.02 (Cleanup): Die Spalte ist ein dynamischer JSON-Key aus
+        `feature_data` (Default: erster numerischer Key der Datenlage).
         Berechnet bin-Edges + counts mit numpy.histogram (NaN-/Inf-Werte
-        werden ausgelassen). Unbekannte Spalten werden abgefangen.
+        werden ausgelassen).
 
         Returns:
             {"bins": [edges...], "counts": [n...], "column": column,
+             "columns": [verfuegbare numerische JSON-Keys...],
              "symbol", "timeframe", "total": n}
         """
-        if column not in NATIVE_COLUMNS:
-            raise ValueError(
-                f"[AnalyticsRepository] Unbekannte Verteilungs-Spalte "
-                f"'{column}' – erlaubt: {NATIVE_COLUMNS}."
-            )
+        avail = self.reader.available_feature_keys(
+            symbol, timeframe, numeric_only=True)
+        col = column if column in avail else (avail[0] if avail else "")
         try:
             n_bins = max(2, int(bins))
         except (TypeError, ValueError):
             n_bins = 20
 
+        if not col:
+            return {
+                "bins": [], "counts": [], "column": "", "columns": avail,
+                "symbol": symbol, "timeframe": timeframe, "total": 0,
+            }
+
         rows = self.reader.fetch_columns(
-            symbol, timeframe, [column], feature_id=feature_id,
+            symbol, timeframe, [col], feature_id=feature_id,
             feature_ids=feature_ids, limit=limit,
         )
-        values = [r[column] for r in rows if r.get(column) is not None]
+        values = [r[col] for r in rows if r.get(col) is not None]
         values = [v for v in values if np.isfinite(v)]
         if not values:
             return {
-                "bins": [], "counts": [], "column": column,
+                "bins": [], "counts": [], "column": col, "columns": avail,
                 "symbol": symbol, "timeframe": timeframe, "total": 0,
             }
 
@@ -4126,7 +4158,8 @@ class AnalyticsRepository:
         return {
             "bins": [float(e) for e in bin_edges],
             "counts": [int(c) for c in counts],
-            "column": column,
+            "column": col,
+            "columns": avail,
             "symbol": symbol,
             "timeframe": timeframe,
             "total": len(values),
@@ -4181,17 +4214,38 @@ class AnalyticsRepository:
     def get_available_features(
         self, symbol: str, timeframe: str
     ) -> Dict[str, Any]:
-        """Verfuegbare Plugin-IDs, native Spalten und Zeilenzahl."""
+        """Verfuegbare Plugin-IDs, JSON-Keys und Zeilenzahl."""
         return self.reader.get_available_features(symbol, timeframe)
 
-    def available_heatmap_metrics(self) -> List[str]:
-        """Vertraglich unterstuetzte Heatmap-Metriken (fuer UI-Dropdowns)."""
-        return list(HEATMAP_METRICS)
+    def available_heatmap_metrics(
+        self, symbol: str, timeframe: str
+    ) -> List[str]:
+        """Verfuegbare Heatmap-Metriken fuer ein Symbol/Timeframe (19.02).
 
-    @property
-    def native_columns(self) -> List[str]:
-        """Native Feature-Spalten (fuer Scatter-/Verteilungs-Dropdowns)."""
-        return list(NATIVE_COLUMNS)
+        "count" + numerische feature_data-JSON-Keys (dynamisch). Ohne Daten
+        liefert die Methode ["count"] (defensiver Fallback fuer die UI).
+        """
+        try:
+            keys = self.reader.available_feature_keys(
+                symbol, timeframe, numeric_only=True)
+        except Exception:
+            keys = []
+        return ["count"] + list(keys)
+
+    def available_feature_columns(
+        self, symbol: str, timeframe: str
+    ) -> List[str]:
+        """Numerische feature_data-JSON-Keys (Scatter-/Verteilungs-Dropdowns).
+
+        19.02 (Cleanup): Ersetzt die entfernten nativen Spalten. Defensiv:
+        Fehler/leere Daten -> [] (UI kann dann leer starten und fuellt die
+        Combos aus dem ersten Daten-Payload).
+        """
+        try:
+            return self.reader.available_feature_keys(
+                symbol, timeframe, numeric_only=True)
+        except Exception:
+            return []
 
 ```
 
@@ -4285,12 +4339,27 @@ class AnalyticsViewModel(QObject):
             # 15.03-E (Multi-Select): feature_ids = Liste der plugin_ids
             # (Datenquellen-Filter, `WHERE feature_id IN (...)`); leer = alle.
             "feature_ids": [],
+            # 19.02 (Cleanup): Keine festen Legacy-Spalten-Defaults mehr –
+            # scatter_x/scatter_y/distribution_column werden beim ersten
+            # Daten-Payload auf die verfuegbaren feature_data-JSON-Keys
+            # aufgeloest (Repo-Defaults). Leer = Repo waehlt die ersten
+            # numerischen Keys.
             "heatmap_metric": "count",
-            "scatter_x": "ema_diff",
-            "scatter_y": "rsi_14",
-            "distribution_column": "atr_normalized",
+            "scatter_x": "",
+            "scatter_y": "",
+            "distribution_column": "",
             "bins": DEFAULT_BINS,
             "limit": DEFAULT_LIMIT,
+            # 19.03 (Step 2): TablePage-Settings – reine UI-Zustaende ohne
+            # DB-Abfrage. Persistiert im Profil-Payload (Option B – Explicit
+            # Save); set_table_settings() markiert nur dirty (E6, kein
+            # Query-Refresh). Spaltenbreiten {Spaltenname: Breite} (E5),
+            # Zeilenhoehe als Default-Section-Size (E9), Sortier-Spalte und
+            # -Richtung als Qt-Werte (E8; 1 = DescendingOrder = Zeit absteigend).
+            "table_column_widths": {},
+            "table_row_height": 0,
+            "table_sort_column": 0,
+            "table_sort_order": 1,
         }
         self._pending_kinds: List[str] = []
         self._worker: Optional[AnalyticsAsyncWorker] = None
@@ -4400,14 +4469,16 @@ class AnalyticsViewModel(QObject):
                         (QUERY_HEATMAP,))
 
     def set_scatter_columns(self, x_column: str, y_column: str) -> None:
-        self._set_param("scatter_x", str(x_column or "ema_diff"),
+        # 19.02 (Cleanup): Leere Werte = Repo-Default (erste numerische
+        # feature_data-JSON-Keys). Keine Legacy-Spalten-Fallbacks mehr.
+        self._set_param("scatter_x", str(x_column or ""),
                         (QUERY_SCATTER,))
-        self._set_param("scatter_y", str(y_column or "rsi_14"),
+        self._set_param("scatter_y", str(y_column or ""),
                         (QUERY_SCATTER,))
 
     def set_distribution_column(self, column: str) -> None:
         self._set_param("distribution_column",
-                        str(column or "atr_normalized"),
+                        str(column or ""),
                         (QUERY_DISTRIBUTION,))
 
     def set_bins(self, bins: int) -> None:
@@ -4423,6 +4494,57 @@ class AnalyticsViewModel(QObject):
             self._params["limit"] = new_limit
             self._mark_dirty()
             self._refresh((QUERY_TABLE, QUERY_SCATTER, QUERY_DISTRIBUTION))
+
+    def set_table_settings(
+        self,
+        widths: Optional[Dict[str, Any]] = None,
+        row_height: int = 0,
+        sort_column: int = 0,
+        sort_order: int = 1,
+    ) -> None:
+        """Uebernimmt TablePage-Settings (19.03 E6, ohne Query-Refresh).
+
+        Spaltenbreiten {Spaltenname: Breite} (E5), **globale Zeilenhoehe**
+        (E9/19.06: ein Wert fuer die GESAMTE Tabelle – das Ziehen einer
+        Zeile setzt alle Zeilen live auf diese Hoehe), Sortier-Spalte und
+        -Richtung (E8). Reine UI-Zustaende der TablePage: KEIN `_refresh`/
+        Debounce/Worker und keine DB-Abfrage – nur die Dirty-Markierung fuer
+        die Profil-Persistenz (Option B – Explicit Save). Typ-/Werte-
+        normalisiert; ohne tatsaechliche Aenderung idempotent (kein
+        unnötiges Dirty-Flag bei Drag-Ereignissen).
+        """
+        norm_widths: Dict[str, int] = {}
+        for k, v in (widths or {}).items():
+            try:
+                w = int(v)
+            except (TypeError, ValueError):
+                continue
+            if w > 0:
+                norm_widths[str(k)] = w
+        try:
+            rh = max(0, int(row_height))
+        except (TypeError, ValueError):
+            rh = 0
+        try:
+            sc = max(0, int(sort_column))
+        except (TypeError, ValueError):
+            sc = 0
+        try:
+            so_raw = int(sort_order)
+        except (TypeError, ValueError):
+            so_raw = 1
+        so = so_raw if so_raw in (0, 1) else 1
+
+        if (norm_widths == self._params.get("table_column_widths")
+                and rh == self._params.get("table_row_height")
+                and sc == self._params.get("table_sort_column")
+                and so == self._params.get("table_sort_order")):
+            return
+        self._params["table_column_widths"] = norm_widths
+        self._params["table_row_height"] = rh
+        self._params["table_sort_column"] = sc
+        self._params["table_sort_order"] = so
+        self._mark_dirty()
 
     def _set_param(self, key: str, value: Any, kinds: Iterable[str]) -> None:
         if self._params.get(key) == value:
@@ -4740,15 +4862,31 @@ class AnalyticsViewModel(QObject):
         """True, wenn ungespeicherte Parametertrends vorliegen ('*')."""
         return self._dirty
 
-    @property
-    def heatmap_metrics(self) -> List[str]:
-        """Verfuegbare Heatmap-Metriken (fuer UI-Dropdown)."""
-        return self._repo.available_heatmap_metrics()
+    def heatmap_metrics(self, symbol: str, timeframe: str) -> List[str]:
+        """Verfuegbare Heatmap-Metriken fuer ein Symbol/Timeframe (19.02).
 
-    @property
-    def native_columns(self) -> List[str]:
-        """Native Feature-Spalten (fuer Scatter-/Verteilungs-Dropdown)."""
-        return self._repo.native_columns
+        "count" + numerische feature_data-JSON-Keys (dynamisch). Defensiv:
+        ohne Daten/bei Fehler -> ["count"].
+        """
+        try:
+            return self._repo.available_heatmap_metrics(
+                str(symbol or ""), str(timeframe or ""))
+        except Exception:
+            return ["count"]
+
+    def available_feature_columns(
+        self, symbol: str, timeframe: str
+    ) -> List[str]:
+        """Numerische feature_data-JSON-Keys (Scatter-/Verteilungs-Dropdown).
+
+        19.02 (Cleanup): Ersetzt die entfernten nativen Spalten. Defensiv:
+        Fehler/leere Daten -> [].
+        """
+        try:
+            return self._repo.available_feature_columns(
+                str(symbol or ""), str(timeframe or ""))
+        except Exception:
+            return []
 
     @property
     def max_lookback_limit(self) -> int:
@@ -4934,8 +5072,8 @@ class AnalyticsAsyncWorker(QThread):
         if self._query_kind == QUERY_SCATTER:
             return repo.get_scatter(
                 symbol, timeframe,
-                x_column=str(p.get("x_column", "ema_diff") or "ema_diff"),
-                y_column=str(p.get("y_column", "rsi_14") or "rsi_14"),
+                x_column=p.get("x_column") or None,
+                y_column=p.get("y_column") or None,
                 feature_id=p.get("feature_id"),
                 feature_ids=feature_ids,
                 limit=cap_lookback_limit(p.get("limit")),
@@ -4943,7 +5081,7 @@ class AnalyticsAsyncWorker(QThread):
         if self._query_kind == QUERY_DISTRIBUTION:
             return repo.get_distribution(
                 symbol, timeframe,
-                column=str(p.get("column", "atr_normalized") or "atr_normalized"),
+                column=p.get("column") or None,
                 bins=p.get("bins", 20),
                 feature_id=p.get("feature_id"),
                 feature_ids=feature_ids,
@@ -5333,10 +5471,14 @@ Reiner Lese-Zugriff auf die `feature_store`-Tabelle in `analytics.duckdb`
 -> ViewModel -> UI). Der Reader fuehrt KEINE Berechnungen aus und schreibt
 NIE in die DB – er kapselt ausschliesslich lesende DuckDB-Abfragen.
 
-Datenmodell feature_store (Hybrid-Schema, Phasen 12+):
-    symbol, timeframe, bar_time TIMESTAMPTZ, ema_diff, rsi_14,
-    atr_normalized, created_at, feature_id, plugin_version,
-    feature_data JSON (FeatureStorePayload des Plugins)
+Datenmodell feature_store (Hybrid-Schema, Phasen 12+; 19.02-Cleanup):
+    symbol, timeframe, bar_time TIMESTAMPTZ, created_at, feature_id,
+    plugin_version, feature_data JSON (FeatureStorePayload des Plugins)
+
+19.02 (Cleanup): Die Legacy-Native-Spalten ema_diff/rsi_14/atr_normalized
+sind entfernt. Scatter-/Verteilungs-/Heatmap-Achsen und Tabellen-Spalten
+werden rein dynamisch aus den JSON-Keys von `feature_data` abgeleitet
+(`available_feature_keys()`); es gibt KEINE nativen Spalten mehr.
 
 Wanduhr-Garantie (Invariante 7, 15.03-Spez: Heatmap X/Y):
     Die gespeicherten bar_time-Werte sind Berlin-Wanduhr-encoded (MT5
@@ -5378,9 +5520,10 @@ SCHEMA_VERSION_DEFAULT = "1.0.0"
 # (feature_ids / letzte Ausfuehrung) ausgeblendet.
 SENTINEL_NATIVE = "native"
 
-# Native Feature-Spalten der feature_store-Tabelle (fuer Heatmap-Metriken,
-# Scatter-/Verteilungs-Achsen). Keine JSON-Feld-Pfade – nur echte Spalten.
-NATIVE_COLUMNS = ("ema_diff", "rsi_14", "atr_normalized")
+# 19.02 (Cleanup): NATIVE_COLUMNS ENTFERNT – die Legacy-Spalten ema_diff/
+# rsi_14/atr_normalized existieren nicht mehr im Neuschema. Achsen und
+# Metriken (Scatter/Verteilung/Heatmap) werden rein dynamisch aus den
+# feature_data-JSON-Keys abgeleitet (available_feature_keys()).
 
 # Heatmap-Achsen (15.03-Spezifikation): X = Wochentage, Y = Tagesstunden
 # Berlin Wanduhr. Matrix: rows = Stunde (0-23), cols = DOW (0=Sonntag..6).
@@ -5461,15 +5604,21 @@ class FeatureStoreReader:
         feature_ids: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """Liefert Feature-Store-Zeilen als Dicts (zeilen-aufwaerts sortiert).
+        """Liefert Feature-Store-Zeilen als Dicts (vom NEUESTEN Stand abwaerts).
 
-        Jede Zeile enthaelt:
+        19.02 (Cleanup): Die Legacy-Native-Spalten ema_diff/rsi_14/
+        atr_normalized sind entfernt – jede Zeile enthaelt:
             time          – Wanduhr-Epoch (int, bar_time)
             symbol/timeframe – Filterwerte
             feature_id    – Plugin-ID (oder None)
             plugin_version– Plugin-Version (oder None)
-            ema_diff/rsi_14/atr_normalized – native Spalten (oder None)
             feature_data  – geparstes JSON inkl. schema_version-Default (E-3)
+
+        Bugfix 08.08.2026 (Vorgabe): Die Zeilen werden mit `ORDER BY bar_time
+        DESC` vom NEUESTEN Stand rueckwaerts bis zum `limit` gelesen (neuestes
+        Datum zuerst). Vorher stand `ASC` – mit Limit wurden dadurch die
+        AELTESTEN Zeilen geliefert (genau das Gegenteil der Vorgabe). Die
+        TablePage sortiert die Anzeige zusaetzlich deterministisch absteigend.
 
         Args:
             symbol: Symbol-Name (case-insensitive)
@@ -5477,7 +5626,8 @@ class FeatureStoreReader:
             feature_id: Optionaler Einzel-Filter auf die Plugin-ID (Legacy)
             feature_ids: Optionaler Multi-Filter (15.03-E) – filtert per
                 `feature_id IN (...)`. Leere Liste/None = kein Filter.
-            limit: Maximale Anzahl Zeilen (Default 1000)
+            limit: Maximale Anzahl Zeilen (Default 1000) – die NEUESTEN
+                `limit` Zeilen (rueckwaerts vom neuesten Stand).
         """
         if not symbol or not timeframe:
             return []
@@ -5496,13 +5646,10 @@ class FeatureStoreReader:
                     timeframe,
                     feature_id,
                     plugin_version,
-                    ema_diff,
-                    rsi_14,
-                    atr_normalized,
                     feature_data
                 FROM feature_store
                 WHERE {' AND '.join(conditions)}
-                ORDER BY bar_time ASC
+                ORDER BY bar_time DESC
                 LIMIT ?
             """, params + [limit]).fetchall()
         except Exception as e:
@@ -5517,10 +5664,7 @@ class FeatureStoreReader:
                 "timeframe": str(r[2]),
                 "feature_id": str(r[3]) if r[3] is not None else None,
                 "plugin_version": str(r[4]) if r[4] is not None else None,
-                "ema_diff": self._float_or_none(r[5]),
-                "rsi_14": self._float_or_none(r[6]),
-                "atr_normalized": self._float_or_none(r[7]),
-                "feature_data": self._normalize_feature_data(r[8]),
+                "feature_data": self._normalize_feature_data(r[5]),
             })
         return out
 
@@ -5535,8 +5679,82 @@ class FeatureStoreReader:
             return None
 
     # ------------------------------------------------------------------
-    # Lesen: Gezielte Spalten (Scatter / Verteilung)
+    # Lesen: Dynamische JSON-Keys (Scatter / Verteilung / Heatmap, 19.02)
     # ------------------------------------------------------------------
+    @staticmethod
+    def _is_json_key_identifier(key: Any) -> bool:
+        """True, wenn der JSON-Key ein sicheres DuckDB-Identifier-Format hat.
+
+        Wird fuer SQL-Einbettungen (feature_data->>'key') verwendet – nur
+        [A-Za-z_][A-Za-z0-9_]* wird akzeptiert (kein SQL-Injection-/Quoting-
+        Risiko). JSON-Keys aus den Service-Payloads sind alle identifier-sicher.
+        """
+        import re
+        return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(key or "")))
+
+    def available_feature_keys(
+        self,
+        symbol: str,
+        timeframe: str,
+        numeric_only: bool = False,
+    ) -> List[str]:
+        """Union aller feature_data-JSON-Keys (19.02, dynamische Achsen).
+
+        Wertet die DISTINCT-JSON-Strukturen der Rows (symbol/timeframe)
+        aus; pro Struktur werden die Keys gesammelt. `schema_version`
+        (Pflichtfeld, E-3) wird ignoriert.
+
+        Args:
+            symbol/timeframe: Filter (case-insensitive)
+            numeric_only: True => nur Keys, deren Wert in ALLEN Vorkommen
+                numerisch (int/float, kein bool/str/None) ist – Grundlage
+                fuer Scatter-/Verteilungs-Achsen und Heatmap-Metriken.
+
+        Returns:
+            Deterministisch sortierte Key-Liste (alphabetisch); leer bei
+            fehlender DB/Tabelle oder Fehler (defensiv).
+        """
+        if not symbol or not timeframe:
+            return []
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT DISTINCT feature_data
+                FROM feature_store
+                WHERE LOWER(symbol) = LOWER(?)
+                  AND LOWER(timeframe) = LOWER(?)
+                  AND feature_data IS NOT NULL
+            """, [symbol, timeframe]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] available_feature_keys "
+                  f"fehlgeschlagen: {e}")
+            return []
+
+        key_types: Dict[str, set] = {}
+        for (raw,) in rows:
+            data = self._normalize_feature_data(raw)
+            if not isinstance(data, dict):
+                continue
+            for k, v in data.items():
+                if k == "schema_version" or not str(k).strip():
+                    continue
+                key = str(k)
+                if isinstance(v, bool):
+                    t = "bool"
+                elif isinstance(v, (int, float)):
+                    t = "num"
+                elif v is None:
+                    t = "null"
+                else:
+                    t = "str"
+                key_types.setdefault(key, set()).add(t)
+
+        keys = sorted(key_types.keys())
+        if not numeric_only:
+            return keys
+        # numeric_only: jeder Key muss durchgaengig numerisch (nicht bool/null/str)
+        return [k for k in keys if key_types[k] == {"num"}]
+
     def fetch_columns(
         self,
         symbol: str,
@@ -5546,28 +5764,38 @@ class FeatureStoreReader:
         feature_ids: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> List[Dict[str, float]]:
-        """Liefert nur die angeforderten nativen Spalten (non-null).
+        """Liefert numerische Werte angeforderter feature_data-JSON-Keys.
+
+        19.02 (Cleanup): Die alten nativen DB-Spalten sind entfernt – die
+        Spalten werden stattdessen als JSON-Keys aus `feature_data`
+        extrahiert (identische Semantik: Zeilen mit fehlendem/nicht-
+        numerischem Wert in einer Spalte werden ausgelassen).
+
+        Bugfix 08.08.2026 (Vorgabe): Wie fetch_rows werden die Zeilen vom
+        NEUESTEN Stand rueckwaerts bis zum `limit` gelesen (`ORDER BY
+        bar_time DESC`) – vorher ASC (aelteste N Zeilen bei Limit).
 
         Args:
             symbol/timeframe: Filter (case-insensitive)
-            columns: Nur native Spalten (ema_diff, rsi_14, atr_normalized)
+            columns: JSON-Keys aus feature_data (nur identifier-sichere)
             feature_id: Optionaler Einzel-Filter auf die Plugin-ID (Legacy)
             feature_ids: Optionaler Multi-Filter (15.03-E) per
                 `feature_id IN (...)`. Leere Liste/None = kein Filter.
-            limit: Maximale Zeilen (Default 1000)
+            limit: Maximale Zeilen (Default 1000) – die NEUESTEN `limit`
+                Zeilen (rueckwaerts vom neuesten Stand).
 
         Returns:
-            Liste von Dicts {spaltenname: float, ...} – Zeilen mit NULL in
-            einer angeforderten Spalte werden ausgelassen (Scatter/Histogramm).
+            Liste von Dicts {key: float, ...} – Zeilen mit NULL/nicht-
+            numerischem Wert in einer angeforderten Spalte werden
+            ausgelassen (Scatter/Histogramm).
         """
         if not symbol or not timeframe or not columns:
             return []
-        valid = [c for c in columns if c in NATIVE_COLUMNS]
+        valid = [str(c) for c in columns if self._is_json_key_identifier(c)]
         if not valid:
             return []
         if limit is None:
             limit = 1000
-        col_sql = ", ".join(f'"{c}"' for c in valid)
         conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
         params: List[Any] = [symbol, timeframe]
         self._apply_feature_filter(feature_ids, feature_id, conditions, params)
@@ -5575,11 +5803,11 @@ class FeatureStoreReader:
         con = self._get_connection()
         try:
             rows = con.execute(f"""
-                SELECT {col_sql}
+                SELECT feature_data
                 FROM feature_store
                 WHERE {' AND '.join(conditions)}
-                  AND {" AND ".join(f'"{c}" IS NOT NULL' for c in valid)}
-                ORDER BY bar_time ASC
+                  AND feature_data IS NOT NULL
+                ORDER BY bar_time DESC
                 LIMIT ?
             """, params + [limit]).fetchall()
         except Exception as e:
@@ -5587,15 +5815,18 @@ class FeatureStoreReader:
             return []
 
         out: List[Dict[str, float]] = []
-        for r in rows:
+        for (raw,) in rows:
+            data = self._normalize_feature_data(raw)
+            if not isinstance(data, dict):
+                continue
             item: Dict[str, float] = {}
             ok = True
-            for i, c in enumerate(valid):
-                fv = self._float_or_none(r[i])
-                if fv is None:
+            for c in valid:
+                v = data.get(c)
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
                     ok = False
                     break
-                item[c] = fv
+                item[c] = float(v)
             if ok:
                 out.append(item)
         return out
@@ -5622,8 +5853,9 @@ class FeatureStoreReader:
 
         Args:
             symbol/timeframe: Filter (case-insensitive)
-            metric: "count" (Anzahl Zeilen je Zelle) ODER eine native Spalte
-                (ema_diff, rsi_14, atr_normalized) -> AVG je Zelle.
+            metric: "count" (Anzahl Zeilen je Zelle) ODER ein numerischer
+                feature_data-JSON-Key (19.02) -> AVG je Zelle (z. B.
+                'grid_nearest_level', 'visit_pct').
             feature_id: Optionaler Einzel-Filter auf die Plugin-ID (Legacy)
             feature_ids: Optionaler Multi-Filter (15.03-E) per
                 `feature_id IN (...)`. Leere Liste/None = kein Filter.
@@ -5642,19 +5874,27 @@ class FeatureStoreReader:
             }
 
         Raises:
-            ValueError: bei unbekannter Metrik (nur count / native Spalten).
+            ValueError: bei unbekannter Metrik (nur 'count' / identifier-
+                sichere JSON-Keys).
         """
         if not symbol or not timeframe:
             return self._empty_heatmap(symbol, timeframe, metric)
         metric_key = str(metric).lower()
         if metric_key == "count":
             agg_sql = "COUNT(*) AS val"
-        elif metric_key in NATIVE_COLUMNS:
-            agg_sql = f'AVG("{metric_key}") AS val'
+        elif self._is_json_key_identifier(metric_key):
+            # 19.02 (Cleanup): Metrik = JSON-Key aus feature_data – AVG ueber
+            # die numerischen Werte. TRY_CAST liefert NULL fuer fehlende/nicht-
+            # numerische Werte; AVG ignoriert NULLs (wie bisher bei nativen
+            # Spalten mit NULL-Zellen).
+            agg_sql = (
+                f"AVG(TRY_CAST(feature_data->>'{metric_key}' AS DOUBLE)) AS val"
+            )
         else:
             raise ValueError(
                 f"[FeatureStoreReader] Unbekannte Heatmap-Metrik '{metric}' – "
-                f"erlaubt: 'count' oder eine native Spalte {NATIVE_COLUMNS}."
+                f"erlaubt: 'count' oder ein numerischer JSON-Key des "
+                f"feature_data."
             )
 
         conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
@@ -5793,7 +6033,10 @@ class FeatureStoreReader:
     def get_available_features(
         self, symbol: str, timeframe: str
     ) -> Dict[str, Any]:
-        """Liefert verfuegbare Plugin-IDs, native Spalten und Zeilenzahl.
+        """Liefert verfuegbare Plugin-IDs, JSON-Keys und Zeilenzahl.
+
+        19.02 (Cleanup): `columns` = dynamische feature_data-JSON-Keys
+        (statt der entfernten nativen Spalten).
 
         Returns:
             {"feature_ids": [...], "columns": [...], "total_rows": int}
@@ -5814,11 +6057,10 @@ class FeatureStoreReader:
         except Exception as e:
             print(f"WARN [FeatureStoreReader] get_available_features "
                   f"fehlgeschlagen: {e}")
-            return {"feature_ids": [], "columns": list(NATIVE_COLUMNS),
-                    "total_rows": 0}
+            return {"feature_ids": [], "columns": [], "total_rows": 0}
         return {
             "feature_ids": [str(i) for i in ids],
-            "columns": list(NATIVE_COLUMNS),
+            "columns": self.available_feature_keys(symbol, timeframe),
             "total_rows": total,
         }
 
@@ -8180,8 +8422,13 @@ class BaseFeature(ABC):
 # analytics/features/feature_builder.py
 """
 Feature Builder – Lädt OHLCV aus market_data.duckdb, berechnet Features
-(ema_diff, atr_normalized, grid_levels) vektorisiert und schreibt sie per
-Bulk-Upsert in analytics.duckdb.
+(grid_levels, Phase 11) vektorisiert und schreibt sie per Bulk-Upsert in
+analytics.duckdb.
+
+19.02 (Cleanup): Die Legacy-Native-Spalten ema_diff/atr_normalized wurden
+entfernt. Services persistieren ihre Werte ausschliesslich ueber
+feature_data (JSON, store_plugin_payload); der native Feature-Builder-Pfad
+liefert nur noch die Grid-Level-Spalten.
 
 Stabiler Basis-Stand + Phase-11-Erweiterung: grid_levels (Y-Achsen-Grid-Levels
 und X-Achsen-Zeitfenster-Flags), gekapselt in analytics/features/definitions/.
@@ -8203,8 +8450,6 @@ from pathlib import Path
 import pandas as pd
 
 from analytics.features.base_feature import BaseFeature
-from analytics.features.definitions.ema_diff import EMADiffFeature
-from analytics.features.definitions.atr_normalized import ATRNormalizedFeature
 from analytics.features.definitions.grid_levels import GridLevelsFeature
 from analytics.features.plugins.base_plugin import (
     PluginFeature,
@@ -8625,10 +8870,11 @@ class FeatureBuilder:
     """Orchestriert die Feature-Berechnung und persistiert sie im feature_store."""
 
     def __init__(self) -> None:
-        # Basis-Stand (EMADiff + ATRNormalized) + Phase 11: Grid-Levels
+        # 19.02 (Cleanup): Legacy-Native-Spalten (ema_diff, atr_normalized)
+        # entfernt. Der native Feature-Builder-Pfad berechnet nur noch die
+        # Phase-11 Grid-Levels; Services persistieren ihre Werte ueber
+        # feature_data (JSON, store_plugin_payload).
         self.features: Dict[str, BaseFeature] = {
-            "ema_diff": EMADiffFeature(),
-            "atr_normalized": ATRNormalizedFeature(),
             "grid_levels": GridLevelsFeature(),
         }
         # Spaltenname -> Feature-Modul-Name. Erlaubt calculate_features() auch
@@ -8918,13 +9164,13 @@ class FeatureBuilder:
 ### DATEI: analytics/features/definitions/__init__.py
 ```py
 # analytics/features/definitions/__init__.py
-from analytics.features.definitions.ema_diff import EMADiffFeature
-from analytics.features.definitions.atr_normalized import ATRNormalizedFeature
+# 19.02 (Cleanup): Legacy-Native-Features ema_diff/atr_normalized deaktiviert
+# (Dateien verbleiben als Code-Archiv auf Platte, werden aber nirgends mehr
+# importiert/registriert). Der native Feature-Builder-Pfad nutzt nur noch
+# grid_levels (Phase 11).
 from analytics.features.definitions.grid_levels import GridLevelsFeature
 
 __all__ = [
-    "EMADiffFeature",
-    "ATRNormalizedFeature",
     "GridLevelsFeature",
 ]
 
@@ -13542,6 +13788,7 @@ from PySide6.QtWidgets import (
 )
 
 from analytics.engine.analytics_view_model import AnalyticsViewModel
+from analytics.engine.analytics_worker import QUERY_TABLE
 from analytics.engine.service_selector_model import ServiceSelectorModel
 from analytics.ui.table_page import TablePage
 from analytics.ui.heatmap_page import HeatmapPage
@@ -13664,8 +13911,15 @@ class AnalyticsWindow(PersistentWindow):
             _app_settings = self.state_manager.get_app_settings()
             self._default_limit: int = int(
                 getattr(_app_settings, "statistics_signal_limit", 10_000))
+            # 19.04 (Paging): Zeilen pro Seite aus den App-Optionen
+            # (statistics_page_size, Default 100) – wird an die TablePage
+            # injiziert (set_page_size), die die geladenen Rows seitenweise
+            # rendert (Muster statistic_win.py).
+            self._table_page_size: int = int(
+                getattr(_app_settings, "statistics_page_size", 100))
         except Exception:
             self._default_limit = 10_000
+            self._table_page_size = 100
 
         # 15.03-E: Datenquellen-Dialog (ServiceSelectorDialog, Multi-Select)
         # ersetzt das fruehere Service-Filter-Popover. Das
@@ -13779,6 +14033,14 @@ class AnalyticsWindow(PersistentWindow):
         filt.addWidget(self.btn_data_sources)
         filt.addWidget(QLabel("Limit:"))
         filt.addWidget(self.edit_limit)
+        # 19.01 (Step 1): Status-Message direkt hinter dem Limit-Feld –
+        # zeigt den Ergebnistext der Tabellen-Abfrage (total == 0 ->
+        # "⚠️ Keine Daten vorhanden", sonst "✅ n Einträge"; E1). Dezent
+        # orange, damit der Hinweis auffaellt, aber nicht stoert.
+        self.label_status_msg = QLabel("")
+        self.label_status_msg.setStyleSheet(
+            "color: #b7950b; font-weight: bold;")
+        filt.addWidget(self.label_status_msg)
         filt.addStretch(1)
         root.addLayout(filt)
 
@@ -13900,6 +14162,24 @@ class AnalyticsWindow(PersistentWindow):
         vm.dirty_changed.connect(self._on_dirty_changed)
         vm.busy_changed.connect(self._on_busy_changed)
         vm.query_failed.connect(self._on_query_failed)
+        # 19.01 (Step 1): Status-Text bei Tabellen-Abfragen (total == 0 ->
+        # "Keine Daten vorhanden", E1). Nur QUERY_TABLE wird ausgewertet.
+        vm.data_ready.connect(self._on_data_ready)
+        # 19.01 (E3): Service-Namensaufloesung fuer die TablePage (IoC) –
+        # kein SQL / keine direkte Modell-Kopplung in der Page.
+        self.table_page.set_name_resolver(
+            self._selector_model.resolve_display_names)
+        # 19.03 (Step 1): Tabellen-Settings (Spaltenbreiten, Zeilenhoehe,
+        # Sortierung) der TablePage in den ViewModel leiten (Persistenz,
+        # Option B – Explicit Save; E6: kein Query-Refresh).
+        self.table_page.table_settings_changed.connect(
+            self._on_table_settings_changed)
+
+        # 19.04 (Paging): Zeilen pro Seite aus den AppSettings injizieren
+        # (statistics_page_size). Die TablePage rendert nur Seiten der
+        # Groesse page_size; die geladenen _current_rows (bis zum Limit)
+        # bleiben vollstaendig erhalten (Jump-to-Chart/Seitenwechsel).
+        self.table_page.set_page_size(self._table_page_size)
 
         # Jump-to-Chart (Variante 2): open_chart_at_bar + Aufloesung
         self.table_page.set_navigation_handler(self._open_chart_at_bar)
@@ -14073,6 +14353,46 @@ class AnalyticsWindow(PersistentWindow):
     def _on_query_failed(self, kind: str, error: str) -> None:
         print(f"WARN [AnalyticsWindow] Abfrage '{kind}' fehlgeschlagen: {error}")
 
+    @Slot(str, dict)
+    def _on_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
+        """Status-Text der Tabellen-Abfrage (19.01 Step 1).
+
+        Zeigt den Ergebnisstatus NUR fuer QUERY_TABLE (total aus dem
+        Repository = LIMIT-gekappte Zeilenzahl, E1). total == 0 ->
+        "Keine Daten vorhanden" (dezent orange), sonst "n Eintraege".
+        Leere Zustaende der Unterseiten (Overlay-Stacks) schalten die
+        Pages bereits selbst um (E5) – dieser Text ist ergaenzend.
+        """
+        if kind != QUERY_TABLE:
+            return
+        try:
+            total = int(data.get("total") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        if total == 0:
+            self.label_status_msg.setText("⚠️ Keine Daten vorhanden")
+        else:
+            self.label_status_msg.setText(f"✅ {total} Einträge")
+
+    @Slot(dict)
+    def _on_table_settings_changed(self, settings: Dict[str, Any]) -> None:
+        """Uebernimmt TablePage-Settings in den ViewModel (19.03 Step 1/2).
+
+        Spaltenbreiten {Spaltenname: Breite} (E5), **globale Zeilenhoehe**
+        (E9/19.06: ein Wert fuer die GESAMTE Tabelle – das Ziehen einer
+        Zeile setzt alle Zeilen live auf diese Hoehe), Sortier-Spalte/
+        -Richtung (E8). Reine UI-Zustaende der TablePage: set_table_settings
+        markiert nur das Profil-Dirty-Flag (E6, Option B) und loest KEINEN
+        Query-Refresh aus (kein Debounce/Worker).
+        """
+        so = settings.get("sort_order")
+        self._vm.set_table_settings(
+            widths=settings.get("column_widths") or {},
+            row_height=int(settings.get("row_height") or 0),
+            sort_column=int(settings.get("sort_column") or 0),
+            sort_order=int(so) if so is not None else 1,
+        )
+
     @Slot(bool)
     def _on_busy_changed(self, busy: bool) -> None:
         self.progress_busy.setVisible(busy)
@@ -14136,6 +14456,69 @@ class AnalyticsWindow(PersistentWindow):
         if hasattr(self, "edit_limit"):
             self.edit_limit.setText(
                 str(int(self._vm.params.get("limit") or self._default_limit)))
+        # Bugfix 08.08.2026 (symbol/tf-Profil-Restore): Der Profilwechsel
+        # hat die VM-Parameter symbol/timeframe via _apply_profile() gesetzt –
+        # die Combos muessen diesen Werten folgen (sonst zeigen sie weiter
+        # die Historie-Werte und beim Schliessen wird der falsche Zustand
+        # persistiert).
+        self._sync_profile_filters()
+
+    def _sync_profile_filters(self) -> None:
+        """Synchronisiert Symbol-/TF-Combos mit den VM-Parametern (Bugfix).
+
+        Beim Profilwechsel (active_profile_changed) bzw. nach load_profiles()
+        wurden die VM-Parameter `symbol`/`timeframe` aus dem Profil-Payload
+        uebernommen (ViewModel._apply_profile). Die Combos wuerden aber auf
+        den alten (Historie-)Werten bleiben – das ergibt inkonsistente
+        Abfragen und eine falsche Persistenz beim Schliessen
+        (get_persistent_symbol liefert den Combo-Wert). Der Sync laeuft mit
+        blockSignals(True), damit keine set_symbol/set_timeframe-Signalkette
+        (und kein zusaetzlicher Query) ausgeloest wird – der Profilwechsel
+        hat die Abfragen bereits via refresh_all() angestossen. Ein Symbol
+        ausserhalb der Favoriten wird in die Combo aufgenommen (Muster
+        _apply_persistent_filters), damit der gespeicherte Filter sichtbar
+        bleibt.
+        """
+        if not hasattr(self, "combo_symbol") or not hasattr(self, "combo_tf"):
+            return
+        symbol = (self._vm.params.get("symbol") or "").strip()
+        if not symbol:
+            return
+        self.combo_symbol.blockSignals(True)
+        if self.combo_symbol.findText(symbol) < 0:
+            self.combo_symbol.addItem(symbol, symbol)
+        self.combo_symbol.setCurrentIndex(self.combo_symbol.findText(symbol))
+        self.combo_symbol.blockSignals(False)
+        timeframe = (self._vm.params.get("timeframe") or "M1").strip()
+        self.combo_tf.blockSignals(True)
+        idx = self.combo_tf.findText(timeframe)
+        if idx >= 0:
+            self.combo_tf.setCurrentIndex(idx)
+        self.combo_tf.blockSignals(False)
+        # TF-Ausgrauung fuer das (ggf. neue) Symbol aktualisieren.
+        self._refresh_timeframe_combo(symbol)
+
+    def _sync_profile_editor(self) -> None:
+        """Synchronisiert Name-/Beschreibungs-/Limit-Felder mit dem VM (Bugfix).
+
+        Wird beim App-Start nach `load_profiles()` gerufen: Dort emittiert der
+        ViewModel KEIN `active_profile_changed` (nur set_active_profile/
+        create_profile) – die edit-Felder blieben sonst leer. Ein leerer
+        `edit_profile_name` wuerde beim ersten Save als `name=''` persistiert
+        werden (die Combo zeigt dann '?'). Ohne aktives Profil werden die
+        Felder geleert; das Limit-Feld wird mit dem VM-Wert synchronisiert.
+        """
+        active = self._vm.active_profile
+        if active:
+            self.edit_profile_name.setText(active.get("name") or "")
+            self.edit_profile_desc.setText(active.get("description") or "")
+        else:
+            self.edit_profile_name.clear()
+            self.edit_profile_desc.clear()
+        if hasattr(self, "edit_limit"):
+            self.edit_limit.setText(
+                str(int(self._vm.params.get("limit")
+                        or self._default_limit)))
 
     @Slot(bool)
     def _on_dirty_changed(self, dirty: bool) -> None:
@@ -14218,6 +14601,19 @@ class AnalyticsWindow(PersistentWindow):
         self._vm.set_symbol(self.combo_symbol.currentText())
         self._vm.set_timeframe(self.combo_tf.currentText())
         self._vm.load_profiles()
+        # Bugfix 08.08.2026 (symbol/tf-Profil-Restore): load_profiles()
+        # emittiert active_profile_changed NICHT (nur set_active_profile/
+        # create_profile) – die VM-Parameter wurden aber bereits aus dem
+        # Profil-Payload gesetzt. Die Combos muessen deshalb hier explizit
+        # synchronisiert werden, sonst bleiben sie auf den Historie-Werten
+        # (inkonsistente Anzeige + falsche Persistenz beim Schliessen).
+        self._sync_profile_filters()
+        # Bugfix 08.08.2026 (Profilname '?' nach Save): Auch die Name-/
+        # Beschreibungs-Felder bleiben nach load_profiles() leer (kein
+        # active_profile_changed). Beim ersten Save wuerde update_profile
+        # name='' persistieren und die Combo zeigt '?'. Deshalb die Felder
+        # hier aus dem (ggf. geladenen) aktiven Profil synchronisieren.
+        self._sync_profile_editor()
         self._on_page_changed(self.sidebar.currentRow())
         # 15.03-E: QUERY_FEATURES speiste das entfernte combo_feature-Dropdown –
         # ohne Feature-Dropdown ist keine Features-Metadaten-Abfrage noetig.
@@ -14301,12 +14697,12 @@ def make_overlay_stack(
 ```py
 # analytics/ui/distribution_page.py
 """
-distribution_page.py - Verteilungs-Seite der Analytics-UI (Phase 15.03).
+distribution_page.py - Verteilungs-Seite der Analytics-UI (Phase 15.03 / 19.02).
 
-Zeigt das Histogramm einer nativen Feature-Spalte (ema_diff, rsi_14,
-atr_normalized) als pyqtgraph-BarGraphItem. Spalte und Bin-Anzahl sind
-ueber die Steuerleiste einstellbar; die Bin-Aenderung laeuft ueber den
-ViewModel-Debounce (200-300 ms, 15.03-Spezifikation).
+Zeigt das Histogramm eines feature_data-JSON-Keys (dynamisch, 19.02) als
+pyqtgraph-BarGraphItem. Spalte und Bin-Anzahl sind ueber die Steuerleiste
+einstellbar; die Bin-Aenderung laeuft ueber den ViewModel-Debounce
+(200-300 ms, 15.03-Spezifikation).
 
 MVVM (Invariante 4): Reine UI – Daten kommen ueber
 `data_ready(QUERY_DISTRIBUTION, data)` vom ViewModel (Async-Worker); es
@@ -14376,12 +14772,12 @@ class DistributionPage(QWidget):
     def attach_view_model(self, view_model: Any) -> None:
         self._view_model = view_model
         params = view_model.params
-        self._combo_column.blockSignals(True)
-        for col in view_model.native_columns:
-            self._combo_column.addItem(col, col)
-        idx = self._combo_column.findData(params.get("distribution_column"))
-        self._combo_column.setCurrentIndex(idx if idx >= 0 else 0)
-        self._combo_column.blockSignals(False)
+        # 19.02 (Cleanup): Dynamische feature_data-JSON-Keys statt nativer
+        # Spalten. Prefill fuer das aktuelle Symbol/Timeframe; die Combo
+        # wird bei jedem Daten-Payload aktualisiert (on_data_ready).
+        columns = view_model.available_feature_columns(
+            params.get("symbol", ""), params.get("timeframe", "M1"))
+        self._set_columns(columns, params.get("distribution_column"))
         self._slider_bins.blockSignals(True)
         self._slider_bins.setValue(int(params.get("bins") or 20))
         self._slider_bins.blockSignals(False)
@@ -14393,11 +14789,39 @@ class DistributionPage(QWidget):
             self._view_model.request_distribution()
 
     # ------------------------------------------------------------------
+    # 19.02: Dynamische Spalten-Combo (feature_data-JSON-Keys)
+    # ------------------------------------------------------------------
+    def _set_columns(self, columns, column) -> None:
+        """Fuellt die Spalten-Combo (19.02, dynamische JSON-Keys).
+
+        Erhaelt die aktuelle Auswahl, wenn sie in `columns` verfuegbar ist;
+        sonst erster Key. Signale blockiert (kein Query-Loop).
+        """
+        cols = [str(c) for c in (columns or [])]
+        sel = str(column or "") if str(column or "") in cols else (
+            cols[0] if cols else "")
+        self._combo_column.blockSignals(True)
+        self._combo_column.clear()
+        for c in cols:
+            self._combo_column.addItem(c, c)
+        self._combo_column.setCurrentIndex(
+            self._combo_column.findData(sel) if sel else -1)
+        self._combo_column.blockSignals(False)
+
+    # ------------------------------------------------------------------
     # Datenfluss (UI rendert, KEIN SQL)
     # ------------------------------------------------------------------
     def on_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
         if kind != QUERY_DISTRIBUTION:
             return
+        # 19.02: Combo mit den verfuegbaren JSON-Keys aktualisieren und auf
+        # die tatsaechlich verwendete Spalte synchronisieren.
+        vm_params_col = (self._view_model.params.get("distribution_column")
+                         if self._view_model else "")
+        self._set_columns(
+            data.get("columns"),
+            data.get("column") or vm_params_col,
+        )
         bins = data.get("bins") or []
         counts = data.get("counts") or []
         if not bins or not counts:
@@ -14539,7 +14963,7 @@ class HeatmapPage(QWidget):
         self._current_symbol = ""
         self._current_timeframe = "M1"
 
-        # Metrik-Dropdown (count | native Spalten)
+        # Metrik-Dropdown (19.02: count | numerische feature_data-JSON-Keys)
         self._combo_metric = QComboBox()
         self._label_info = QLabel("")
 
@@ -14582,13 +15006,13 @@ class HeatmapPage(QWidget):
     # ------------------------------------------------------------------
     def attach_view_model(self, view_model: Any) -> None:
         self._view_model = view_model
-        # Metrik-Dropdown befuellen (count + native Spalten)
-        self._combo_metric.blockSignals(True)
-        for metric in view_model.heatmap_metrics:
-            self._combo_metric.addItem(metric, metric)
-        idx = self._combo_metric.findData(view_model.params.get("heatmap_metric"))
-        self._combo_metric.setCurrentIndex(idx if idx >= 0 else 0)
-        self._combo_metric.blockSignals(False)
+        params = view_model.params
+        # 19.02 (Cleanup): Metriken = "count" + numerische feature_data-
+        # JSON-Keys (dynamisch). Prefill fuer das aktuelle Symbol/Timeframe;
+        # die Combo wird bei jedem Daten-Payload aktualisiert (on_data_ready).
+        metrics = view_model.heatmap_metrics(
+            params.get("symbol", ""), params.get("timeframe", "M1"))
+        self._set_metrics(metrics, params.get("heatmap_metric"))
         view_model.data_ready.connect(self.on_data_ready)
 
     def set_navigation_handler(self, fn: Callable[[str, str, int], None]) -> None:
@@ -14605,6 +15029,26 @@ class HeatmapPage(QWidget):
             self._view_model.request_heatmap()
 
     # ------------------------------------------------------------------
+    # 19.02: Dynamische Metrik-Combo ("count" + feature_data-JSON-Keys)
+    # ------------------------------------------------------------------
+    def _set_metrics(self, metrics, metric) -> None:
+        """Fuellt die Metrik-Combo (19.02, dynamische JSON-Keys).
+
+        Erhaelt die aktuelle Auswahl, wenn sie in `metrics` verfuegbar ist;
+        sonst "count". Signale blockiert (kein Query-Loop).
+        """
+        items = [str(m) for m in (metrics or [])]
+        sel = str(metric or "") if str(metric or "") in items else (
+            "count" if "count" in items else (items[0] if items else ""))
+        self._combo_metric.blockSignals(True)
+        self._combo_metric.clear()
+        for m in items:
+            self._combo_metric.addItem(m, m)
+        self._combo_metric.setCurrentIndex(
+            self._combo_metric.findData(sel) if sel else -1)
+        self._combo_metric.blockSignals(False)
+
+    # ------------------------------------------------------------------
     # Datenfluss (UI rendert, KEIN SQL)
     # ------------------------------------------------------------------
     def on_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
@@ -14612,6 +15056,14 @@ class HeatmapPage(QWidget):
             return
         self._current_symbol = str(data.get("symbol") or "")
         self._current_timeframe = str(data.get("timeframe") or "M1")
+        # 19.02: Metrik-Combo mit den verfuegbaren Metriken aktualisieren und
+        # auf die tatsaechlich verwendete Metrik synchronisieren.
+        vm_params_metric = (self._view_model.params.get("heatmap_metric")
+                            if self._view_model else "")
+        self._set_metrics(
+            data.get("metrics"),
+            data.get("metric") or vm_params_metric,
+        )
         matrix = np.asarray(data.get("matrix"), dtype=float)
         if matrix.size == 0:
             self._stack.setCurrentIndex(1)
@@ -14670,12 +15122,12 @@ class HeatmapPage(QWidget):
 ```py
 # analytics/ui/scatter_page.py
 """
-scatter_page.py - Scatter-Seite der Analytics-UI (Phase 15.03).
+scatter_page.py - Scatter-Seite der Analytics-UI (Phase 15.03 / 19.02).
 
-Zeigt X/Y-Paare zweier nativer Feature-Spalten (ema_diff, rsi_14,
-atr_normalized) als pyqtgraph-ScatterPlot. Ein Klick auf einen Punkt
-oeffnet das Chart-Fenster an der neuesten Feature-Bar des Symbol/Timeframe
-(Jump-to-Chart Variante 2, Aufloesung ueber den ViewModel).
+Zeigt X/Y-Paare zweier feature_data-JSON-Keys (dynamisch, 19.02) als
+pyqtgraph-ScatterPlot. Ein Klick auf einen Punkt oeffnet das Chart-Fenster
+an der neuesten Feature-Bar des Symbol/Timeframe (Jump-to-Chart Variante 2,
+Aufloesung ueber den ViewModel).
 
 MVVM (Invariante 4): Reine UI – Daten kommen ueber
 `data_ready(QUERY_SCATTER, data)` vom ViewModel (Async-Worker); es gibt
@@ -14734,19 +15186,14 @@ class ScatterPage(QWidget):
     # ------------------------------------------------------------------
     def attach_view_model(self, view_model: Any) -> None:
         self._view_model = view_model
-        columns = view_model.native_columns
         params = view_model.params
-        self._combo_x.blockSignals(True)
-        self._combo_y.blockSignals(True)
-        for col in columns:
-            self._combo_x.addItem(col, col)
-            self._combo_y.addItem(col, col)
-        idx_x = self._combo_x.findData(params.get("scatter_x"))
-        idx_y = self._combo_y.findData(params.get("scatter_y"))
-        self._combo_x.setCurrentIndex(idx_x if idx_x >= 0 else 0)
-        self._combo_y.setCurrentIndex(idx_y if idx_y >= 0 else 0)
-        self._combo_x.blockSignals(False)
-        self._combo_y.blockSignals(False)
+        # 19.02 (Cleanup): Dynamische feature_data-JSON-Keys statt nativer
+        # Spalten. Prefill fuer das aktuelle Symbol/Timeframe; die Combos
+        # werden bei jedem Daten-Payload aktualisiert (on_data_ready).
+        columns = view_model.available_feature_columns(
+            params.get("symbol", ""), params.get("timeframe", "M1"))
+        self._set_columns(columns, params.get("scatter_x"),
+                          params.get("scatter_y"))
         view_model.data_ready.connect(self.on_data_ready)
 
     def set_navigation_handler(self, fn: Callable[[str, str, int], None]) -> None:
@@ -14761,6 +15208,35 @@ class ScatterPage(QWidget):
             self._view_model.request_scatter()
 
     # ------------------------------------------------------------------
+    # 19.02: Dynamische Achsen-Combos (feature_data-JSON-Keys)
+    # ------------------------------------------------------------------
+    def _set_columns(self, columns, x_col, y_col) -> None:
+        """Fuellt die Achsen-Combos (19.02, dynamische JSON-Keys).
+
+        Erhaelt die aktuelle Auswahl, wenn sie in `columns` verfuegbar ist;
+        sonst Defaults (erste beiden, x != y). Signale sind blockiert, damit
+        kein Query-Loop ueber _on_columns_changed entsteht.
+        """
+        cols = [str(c) for c in (columns or [])]
+        x = str(x_col or "") if str(x_col or "") in cols else (
+            cols[0] if cols else "")
+        y_candidates = [c for c in cols if c != x]
+        y = str(y_col or "") if (str(y_col or "") in cols
+                                 and str(y_col or "") != x) else (
+            y_candidates[0] if y_candidates else x)
+        self._combo_x.blockSignals(True)
+        self._combo_y.blockSignals(True)
+        self._combo_x.clear()
+        self._combo_y.clear()
+        for c in cols:
+            self._combo_x.addItem(c, c)
+            self._combo_y.addItem(c, c)
+        self._combo_x.setCurrentIndex(self._combo_x.findData(x) if x else -1)
+        self._combo_y.setCurrentIndex(self._combo_y.findData(y) if y else -1)
+        self._combo_x.blockSignals(False)
+        self._combo_y.blockSignals(False)
+
+    # ------------------------------------------------------------------
     # Datenfluss (UI rendert, KEIN SQL)
     # ------------------------------------------------------------------
     def on_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
@@ -14768,6 +15244,17 @@ class ScatterPage(QWidget):
             return
         self._current_symbol = str(data.get("symbol") or "")
         self._current_timeframe = str(data.get("timeframe") or "M1")
+        # 19.02: Combos mit den verfuegbaren JSON-Keys aktualisieren und auf
+        # die tatsaechlich verwendeten Achsen (x_label/y_label) synchronisieren.
+        vm_params_x = (self._view_model.params.get("scatter_x")
+                       if self._view_model else "")
+        vm_params_y = (self._view_model.params.get("scatter_y")
+                       if self._view_model else "")
+        self._set_columns(
+            data.get("columns"),
+            data.get("x_label") or vm_params_x,
+            data.get("y_label") or vm_params_y,
+        )
         points = data.get("points") or []
         xs = [p["x"] for p in points]
         ys = [p["y"] for p in points]
@@ -14814,7 +15301,7 @@ class ScatterPage(QWidget):
 ```py
 # analytics/ui/table_page.py
 """
-table_page.py - Tabellen-Seite der Analytics-UI (Phase 15.03).
+table_page.py - Tabellen-Seite der Analytics-UI (Phase 15.03 / 19.01).
 
 Zeigt die rohen Feature-Store-Zeilen (Tabelle) und koppelt einen
 Doppelklick an 'Jump-to-Chart' (Variante 2): open_chart_at_bar(symbol, tf,
@@ -14823,14 +15310,76 @@ bar_time) wird aufgerufen und das Chart-Fenster in den Vordergrund geholt.
 MVVM (Invariante 4): Die Page ist reine UI – Rendering + Event-Handling.
 Die Daten kommen ueber `data_ready(QUERY_TABLE, data)` vom ViewModel
 (Async-Worker); es gibt KEIN SQL in dieser Klasse.
+
+19.01 (Step 2) – Multi-Service-Darstellung:
+- Spalte 1 = **Service** (feature_id bzw. via injiziertem `name_resolver`
+  aufgeloester Anzeigename, E3/IoC – kein SQL, keine Modell-Kopplung).
+- Standard-Spaltenreihenfolge: [Zeit (Wanduhr), Service,
+  ...JSON-Union-Keys alphabetisch] (E4).
+- **Chronologisch ABSTEIGEND** nach bar_time (E2): Die Page sortiert die
+  erhaltenen Rows deterministisch (stabil); die QTableWidget-Interaktions-
+  sortierung bleibt deaktiviert, damit die Service-Mischung korrekt bleibt.
+  Der `FeatureStoreReader` (ASC-Vertrag) bleibt unveraendert.
+- JSON-Union: Vereinigung aller `feature_data`-Keys ueber die geladenen
+  Rows; fehlende Werte bei abweichenden Services -> "-".
+
+19.02 (Cleanup + Schrift):
+- Legacy-Native-Spalten ema_diff/rsi_14/atr_normalized sind ENTFERNT –
+  die Tabelle zeigt nur noch Zeit + Service + dynamische JSON-Union.
+- Kleinere Schrift (9 pt): bei gleicher Fenstergroesse sind mehr Zeilen
+  (Zeilenhoehe folgt der Schrift) und mehr Spalten (schmalere Spalten)
+  sichtbar.
+
+19.03 (Resizing, In-Memory-Sorting & Profil-Persistenz):
+- Interaktives Resizing: Spaltenbreiten und Zeilenhoehen sind per
+  QHeaderView.Interactive frei anpassbar (Step 1).
+- In-Memory-Sortierung: QTableWidget-Sortierung wird NACH dem Befuellen
+  aktiviert (O(n^2)-Schutz); die Zeitspalte sortiert numerisch ueber die
+  Roh-Epoch (_SortableTimeItem, E2/E3). 19.01-E2 (deterministisch
+  absteigende Roh-Liste `_current_rows`) bleibt fuer Jump-to-Chart unveraendert.
+- Profil-Persistenz (Option B – Explicit Save): User-Aenderungen emittieren
+  `table_settings_changed` (Breiten {Name: Breite}, Zeilenhoehe, Sortierung);
+  das AnalyticsWindow reicht sie an `AnalyticsViewModel.set_table_settings()`
+  (nur Dirty, kein Query-Refresh). Beim Befuellen werden die gespeicherten
+  Settings wiederhergestellt (E1/E8/E9); Signale sind waehrenddessen blockiert
+  (E4).
+- Jump-to-Chart-Row-Mapping (E7): Der `_current_rows`-Einfuege-Index liegt im
+  UserRole+1 des Zeit-Items – unabhaengig von der Anzeige-Sortierung.
+
+19.04 (Paging, Bugfix 08.08.2026):
+- Paging wieder eingebaut (Legacy-Muster aus statistic_win.py): Vor/Zurueck-
+  Buttons + Seitenlabel unter der Tabelle. Die geladenen `_current_rows`
+  (bis zum Limit aus analytics_win) werden in Seiten der Groesse
+  `statistics_page_size` (AppSettings, via `set_page_size()` injiziert)
+  aufgeteilt; `_current_rows` haelt weiterhin ALLE Zeilen (Jump-to-Chart/
+  Seitenwechsel). Nach Daten-Update springt die Anzeige auf Seite 0.
+- Beim Seitenwechsel bleibt die aktive User-Sortierung erhalten (nur die
+  Anzeige-Seite wird neu gerendert, Roh-Liste unveraendert).
+
+19.05 (Bugfix 08.08.2026): Individuelle Zeilenhöhen
+- Zwischenstand (Anforderung korrigiert in 19.06): `row_height` als
+  Default-Section-Size + separate `row_heights` {Row-Index: Höhe}.
+
+19.06 (Korrektur 08.08.2026): Zeilenhöhe -> GANZE Tabelle live
+- Gewuenschtes Verhalten (Anwender): Das Ziehen einer Zeilenhöhe uebertraegt
+  die neue Hoehe LIVE auf die gesamte Tabelle (alle Zeilen) und speichert sie
+  als globale `table_row_height` im Profil. KEIN individuelles row_heights.
+- Umsetzung: `_on_vertical_section_resized` setzt nach dem Drag die neue
+  Hoehe per setDefaultSectionSize + setRowHeight auf alle Zeilen (Signale
+  blockiert, kein Signal-Sturm) und emittiert die globale Hoehe;
+  `_apply_table_settings` stellt sie beim Refresh/Profil-Load wieder her
+  (alle Zeilen auf die gespeicherte Hoehe).
 """
 
 from typing import Any, Callable, Dict, List, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal, Slot
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
+    QHBoxLayout,
     QHeaderView,
     QLabel,
+    QPushButton,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -14840,53 +15389,157 @@ from PySide6.QtWidgets import (
 from analytics.engine.analytics_worker import QUERY_TABLE
 from analytics.ui.common import format_wanduhr_time, make_overlay_stack
 
-# Datenvertrag der Tabellen-Spalten (feature_store-Zeilen).
-_TABLE_COLUMNS = [
-    ("Zeit (Wanduhr)", 150),
-    ("Symbol", 90),
-    ("TF", 60),
-    ("Feature", 110),
-    ("Version", 80),
-    ("ema_diff", 90),
-    ("rsi_14", 80),
-    ("atr_normalized", 100),
+# 19.02 (Cleanup): Basis-Spalten OHNE Legacy-Native-Spalten – nur Zeit +
+# Service. Alle Feature-Werte kommen dynamisch aus feature_data (JSON-Union).
+_BASE_COLUMNS = [
+    ("Zeit (Wanduhr)", 130),
+    ("Service", 150),
 ]
+# Feste Breite der dynamischen JSON-Union-Spalten (feature_data-Keys).
+_EXTRA_COLUMN_WIDTH = 95
+# Spalten-Indizes der Basis-Spalten (fuer Jump-to-Chart / Zeit-UserRole).
+_COL_TIME = 0
+_COL_SERVICE = 1
+# 19.02 (Task 1): Schriftgroesse der Tabelle (kleiner -> mehr Zeilen/Spalten).
+_TABLE_FONT_PT = 9
+
+
+def _epoch_int(value: Any) -> Optional[int]:
+    """Wandelt einen bar_time-Wert in die Wanduhr-Epoch (int) um (oder None).
+
+    Defensiv: fetch_rows() liefert bereits int-Epochs; dieser Helfer schuetzt
+    vor Alt-Rows/ungueltigen Werten beim Sortieren und im UserRole.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+class _SortableTimeItem(QTableWidgetItem):
+    """Zeit-Spalten-Item mit numerischem Zeitvergleich (19.03 E2).
+
+    QTableWidget sortiert standardmaessig nach `__lt__` (= text()-Vergleich).
+    Das Wanduhr-Format ('Fr 31.07.26 00:01') ist lexikografisch NICHT
+    chronologisch – diese Subklasse vergleicht die Roh-Epoch aus dem
+    UserRole numerisch (Fallback auf die Text-Sortierung).
+    """
+
+    def __lt__(self, other) -> bool:
+        if isinstance(other, QTableWidgetItem):
+            try:
+                a = self.data(Qt.UserRole)
+                b = other.data(Qt.UserRole)
+                if a is not None and b is not None:
+                    return int(a) < int(b)
+            except (TypeError, ValueError):
+                pass
+        return super().__lt__(other)
 
 
 class TablePage(QWidget):
     """Feature-Store-Tabelle mit Jump-to-Chart (Doppelklick)."""
 
+    # 19.03 (Step 1): UI-Change-Signal fuer Tabellen-Settings (Spaltenbreiten
+    # {Name: Breite}, Zeilenhoehe, Sortier-Spalte/-Richtung). Wird vom
+    # AnalyticsWindow an `AnalyticsViewModel.set_table_settings()` verdrahtet
+    # (Profil-Persistenz, Option B – Explicit Save; E6: kein Query-Refresh).
+    table_settings_changed = Signal(dict)
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._view_model = None
         self._navigation_handler: Optional[Callable[[str, str, int], None]] = None
+        # 19.01 (E3): Injizierbarer Namensaufloeser (feature_ids -> Namen).
+        # Default: feature_id selbst anzeigen (kein UI->Modell-Zwang).
+        self._name_resolver: Callable[[List[str]], List[str]] = lambda ids: list(ids)
+        # Roh-Rows der aktuellen Anzeige (fuer Jump-to-Chart, unabhaengig
+        # von Tabellen-Spalten-Positionen). 19.04 (Paging): haelt ALLE
+        # geladenen Zeilen (bis Limit); angezeigt wird nur die aktuelle Seite.
+        self._current_rows: List[Dict[str, Any]] = []
+        # 19.04 (Paging): Zeilen pro Seite (via set_page_size aus den
+        # AppSettings statistics_page_size injiziert; Default 100), aktuelle
+        # Seite und Gesamtseitenzahl.
+        self._page_size: int = 100
+        self._current_page: int = 0
+        self._total_pages: int = 1
 
         self._header = QLabel("Feature-Store-Tabelle")
-        self._table = QTableWidget(0, len(_TABLE_COLUMNS))
+        self._table = QTableWidget(0, len(_BASE_COLUMNS))
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
         self._table.setSelectionMode(QTableWidget.SingleSelection)
         self._table.setAlternatingRowColors(True)
-        self._table.setHorizontalHeaderLabels([c[0] for c in _TABLE_COLUMNS])
+        self._table.setHorizontalHeaderLabels([c[0] for c in _BASE_COLUMNS])
         header = self._table.horizontalHeader()
         # Fix 15.03 (TF-Wechsel-Haenger): KEIN ResizeToContents! Der Modus
         # berechnet bei JEDEM setItem die optimale Breite ueber ALLE Zeilen
         # (O(n^2)) – bei 5000 Zeilen blockiert das den Main-Thread minuten-
-        # lang. Stattdessen FIXE Spaltenbreiten aus _TABLE_COLUMNS
-        # (deterministisch schnell, unabhaengig von der Zeilenanzahl).
+        # lang. Stattdessen deterministische Startbreiten aus _BASE_COLUMNS
+        # (setColumnWidth unten); der User kann sie seit 19.03 interaktiv
+        # anpassen (QHeaderView.Interactive, Step 1).
         header.setStretchLastSection(False)
-        for i, (_, width) in enumerate(_TABLE_COLUMNS):
-            header.setSectionResizeMode(i, QHeaderView.Fixed)
+        # 19.03 (Step 1): Interaktives Resizing – Spaltenbreiten und
+        # Zeilenhoehen sind frei anpassbar. Die FIXEN Defaults aus
+        # _BASE_COLUMNS/_EXTRA_COLUMN_WIDTH bleiben als Startbreiten beim
+        # ersten Befuellen erhalten (siehe _populate / _get_settings_widths).
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        self._table.verticalHeader().setSectionResizeMode(
+            QHeaderView.Interactive)
+        for i, (_, width) in enumerate(_BASE_COLUMNS):
             self._table.setColumnWidth(i, width)
+        # 19.01 (E2) + 19.03 (E3): Die Page zeichnet `_current_rows`
+        # deterministisch ABSTEIGEND nach bar_time (Service-Mischung bleibt
+        # chronologisch korrekt). Die QTableWidget-Interaktions-Sortierung
+        # (setSortingEnabled(True)) wird seit 19.03 NACH dem Befuellen
+        # aktiviert (sonst O(n^2)-Re-Sort bei jedem setItem) – sie sortiert
+        # nur die ANZEIGE, nicht die Roh-Liste (E7-Row-Mapping).
+        self._table.setSortingEnabled(False)
+        # 19.02 (Task 1): Kleinere Schrift – mehr Zeilen (Zeilenhoehe folgt
+        # der Schrift) und mehr Spalten sichtbar bei gleicher Fenstergroesse.
+        table_font = QFont()
+        table_font.setPointSize(_TABLE_FONT_PT)
+        self._table.setFont(table_font)
+        header_font = QFont(table_font)
+        header_font.setBold(True)
+        header.setFont(header_font)
+        # 19.03 (Step 1): UI-Change-Signale – Breiten-/Zeilen-Resize und
+        # Sortier-Indikator emittieren table_settings_changed (Persistenz).
+        # Waehrend _populate sind die Header blockiert (E4), sodass nur echte
+        # User-Aktionen emittieren.
+        header.sectionResized.connect(self._on_header_section_resized)
+        header.sortIndicatorChanged.connect(self._on_sort_indicator_changed)
+        self._table.verticalHeader().sectionResized.connect(
+            self._on_vertical_section_resized)
 
         content = QWidget(self)
         lay = QVBoxLayout(content)
         lay.addWidget(self._header)
         lay.addWidget(self._table)
+        # 19.04 (Paging): Leiste mit Zurueck/Weiter + Seitenlabel unter der
+        # Tabelle (Muster statistic_win.py: btn_prev_page/btn_next_page/
+        # label_page_info). Zeigt die Seite und die Gesamtzahl der geladenen
+        # Zeilen; Buttons werden je nach Position ein-/ausgegraut.
+        self.btn_prev = QPushButton("◀ Zurück")
+        self.btn_next = QPushButton("Weiter ▶")
+        self.label_page = QLabel("Seite 1 / 1")
+        page_bar = QWidget(self)
+        page_lay = QHBoxLayout(page_bar)
+        page_lay.setContentsMargins(0, 2, 0, 0)
+        page_lay.setSpacing(6)
+        page_lay.addWidget(self.btn_prev)
+        page_lay.addWidget(self.label_page)
+        page_lay.addWidget(self.btn_next)
+        page_lay.addStretch(1)
+        lay.addWidget(page_bar)
         self._stack = make_overlay_stack(content)
         self.setLayout(self._stack)
 
         self._table.itemDoubleClicked.connect(self._on_double_clicked)
+        self.btn_prev.clicked.connect(self._prev_page)
+        self.btn_next.clicked.connect(self._next_page)
 
     # ------------------------------------------------------------------
     # MVVM-Anbindung (vom AnalyticsWindow gesetzt)
@@ -14902,10 +15555,42 @@ class TablePage(QWidget):
         """Setzt den Jump-to-Chart-Handler (open_chart_at_bar)."""
         self._navigation_handler = fn
 
+    def set_name_resolver(
+        self, fn: Callable[[List[str]], List[str]]
+    ) -> None:
+        """Setzt den Service-Namensaufloeser (19.01 E3, IoC).
+
+        `fn` bildet feature_ids (plugin_ids) auf Anzeigenamen ab (z. B.
+        `ServiceSelectorModel.resolve_display_names`). Default: die
+        feature_id selbst anzeigen. Kein SQL / keine Modell-Kopplung.
+        """
+        if callable(fn):
+            self._name_resolver = fn
+
     def request_data(self) -> None:
         """Fordert die Tabellen-Daten ueber das ViewModel an."""
         if self._view_model is not None:
             self._view_model.request_table()
+
+    def set_page_size(self, page_size: int) -> None:
+        """Setzt die Zeilen pro Seite (Paging, 19.04; IoC vom AnalyticsWindow).
+
+        Der Wert kommt aus den AppSettings (`statistics_page_size`). Bei
+        bereits geladenen Daten wird die aktuelle Seite neu gerendert (Seite
+        wird auf 0 zurueckgesetzt).
+        """
+        try:
+            ps = int(page_size)
+        except (TypeError, ValueError):
+            ps = 100
+        if ps <= 0:
+            ps = 100
+        if ps == self._page_size:
+            return
+        self._page_size = ps
+        if self._current_rows:
+            self._current_page = 0
+            self._render_current_page()
 
     # ------------------------------------------------------------------
     # Datenfluss (UI rendert, KEIN SQL)
@@ -14926,51 +15611,391 @@ class TablePage(QWidget):
         self._stack.setCurrentIndex(0 if rows else 1)
 
     def _populate(self, rows: List[Dict[str, Any]]) -> None:
+        """Baut die Multi-Service-Tabelle (19.01 Step 2).
+
+        Sortiert ABSTEIGEND nach bar_time (E2), bildet die JSON-Union der
+        feature_data-Keys (E4) und zeigt die Service-Spalte mit aufgeloesten
+        Anzeigenamen (E3). Fehlende Werte bei abweichenden Services -> "-".
+        """
+        # E2: Chronologisch absteigend (deterministisch, stabil). Rows ohne
+        # time landen dank `or 0` am Ende der absteigenden Anzeige.
+        sorted_rows = sorted(
+            (r for r in rows if isinstance(r, dict)),
+            key=lambda r: _epoch_int(r.get("time")) or 0,
+            reverse=True,
+        )
+        self._current_rows = sorted_rows
+
+        # E4: Union aller feature_data-JSON-Keys (alphabetisch).
+        extra_keys = sorted(self._union_feature_keys(sorted_rows))
+
+        # Dynamischer Spaltenaufbau: Basis + Union-Keys.
+        headers = [c[0] for c in _BASE_COLUMNS] + list(extra_keys)
+        default_widths = ([c[1] for c in _BASE_COLUMNS]
+                          + [_EXTRA_COLUMN_WIDTH] * len(extra_keys))
+        header = self._table.horizontalHeader()
+        vheader = self._table.verticalHeader()
+
+        # 19.03 (E3/E4): Signale waehrend des Befuellens blockieren – sonst
+        # wuerden setColumnWidth/setSortingEnabled/sortItems als User-Aktion
+        # interpretiert und ein ungewolltes Dirty-Flag/Persistieren ausloesen.
+        # Die In-Memory-Sortierung wird erst NACH dem Befuellen aktiviert
+        # (O(n^2)-Schutz: QTableWidget sortiert sonst bei JEDEM setItem).
         self._table.setUpdatesEnabled(False)
+        blocked = (self._table, header, vheader)
+        for w in blocked:
+            w.blockSignals(True)
         self._table.setSortingEnabled(False)
+        self._table.setColumnCount(len(headers))
+        self._table.setHorizontalHeaderLabels(headers)
+        header.setStretchLastSection(False)
+        # 19.03 (Step 1/E5): Interactive + gespeicherte Profil-Breiten
+        # {Spaltenname: Breite} ueberschreiben die Defaults (fehlende neue
+        # Union-Spalten -> _BASE_COLUMNS/_EXTRA_COLUMN_WIDTH).
+        settings_widths = self._get_settings_widths()
+        for i, name in enumerate(headers):
+            header.setSectionResizeMode(i, QHeaderView.Interactive)
+            self._table.setColumnWidth(
+                i, int(settings_widths.get(name, default_widths[i])))
+
+        # 19.04 (Paging): Seite zuruecksetzen und nur die aktuelle Seite
+        # rendern (Seitenaufbau in _render_current_page/_populate_rows;
+        # Sortierung/Settings werden dort angewendet).
+        self._current_page = 0
+        self._render_current_page()
+        self._table.setUpdatesEnabled(True)
+        for w in blocked:
+            w.blockSignals(False)
+
+    # ------------------------------------------------------------------
+    # 19.04: Paging (Muster statistic_win.py, Bugfix 08.08.2026)
+    # ------------------------------------------------------------------
+    def _prev_page(self) -> None:
+        """Eine Seite zurueck (aktiviert sobald _current_page > 0)."""
+        if self._current_page > 0:
+            self._current_page -= 1
+            self._render_current_page()
+
+    def _next_page(self) -> None:
+        """Eine Seite vor (aktiviert solange nicht auf der letzten Seite)."""
+        if self._current_page < self._total_pages - 1:
+            self._current_page += 1
+            self._render_current_page()
+
+    def _render_current_page(self) -> None:
+        """Rendert die Zeilen der aktuellen Seite (19.04 Paging).
+
+        `_current_rows` haelt ALLE geladenen Zeilen (bis Limit) – angezeigt
+        wird nur der Ausschnitt `[current_page*page_size : +page_size]`.
+        Die Signale sind waehrend des Neu-Befuellens blockiert (E4), damit
+        setItem/sortItems nicht als User-Aktion (Dirty-Flag/Persistieren)
+        gewertet werden. Nach dem Befuellen werden die Tabellen-Settings
+        angewandt (Sortierung; bei aktiver User-Sortierung bleibt der
+        Indikator erhalten).
+        """
+        page_size = self._page_size if self._page_size > 0 else 1
+        total = len(self._current_rows)
+        self._total_pages = max(1, (total + page_size - 1) // page_size)
+        if self._current_page >= self._total_pages:
+            self._current_page = max(0, self._total_pages - 1)
+        start = self._current_page * page_size
+        end = min(start + page_size, total)
+        page_rows = self._current_rows[start:end]
+
+        header = self._table.horizontalHeader()
+        vheader = self._table.verticalHeader()
+        blocked = (self._table, header, vheader)
+        for w in blocked:
+            w.blockSignals(True)
+        try:
+            self._table.setSortingEnabled(False)
+            self._populate_rows(page_rows, start_offset=start)
+            self._apply_table_settings()
+        finally:
+            for w in blocked:
+                w.blockSignals(False)
+        self._update_page_controls()
+
+    def _populate_rows(
+        self, rows: List[Dict[str, Any]], start_offset: int = 0
+    ) -> None:
+        """Befuellt die Tabellen-Zeilen einer Seite (19.04 Paging).
+
+        Der UserRole+1 (E7, Jump-to-Chart-Row-Mapping) traegt den GLOBALEN
+        `_current_rows`-Index (`start_offset + r`), damit ein Doppelklick
+        unabhaengig von Seite und Anzeige-Sortierung die richtige Roh-Row
+        trifft.
+        """
+        service_names = self._resolve_names(rows)
+        extra_keys = sorted(self._union_feature_keys(self._current_rows))
+        extra_start = len(_BASE_COLUMNS)
+
         self._table.setRowCount(len(rows))
         for r, row in enumerate(rows):
+            global_r = start_offset + r
             # Zeit: Wanduhr-Formatierung (Invariante 7) + Roh-Epoch im
-            # UserRole fuer Jump-to-Chart.
-            epoch = row.get("time")
-            time_item = QTableWidgetItem(format_wanduhr_time(epoch))
+            # UserRole (numerische Sortierung, E2) + globaler Einfuege-Index
+            # im UserRole+1 (Jump-to-Chart, E7).
+            epoch = _epoch_int(row.get("time"))
+            time_item = _SortableTimeItem(format_wanduhr_time(epoch))
             if epoch is not None:
-                time_item.setData(Qt.UserRole, int(epoch))
-            self._table.setItem(r, 0, time_item)
-            self._table.setItem(r, 1, QTableWidgetItem(str(row.get("symbol") or "")))
-            self._table.setItem(r, 2, QTableWidgetItem(str(row.get("timeframe") or "")))
-            self._table.setItem(r, 3, QTableWidgetItem(str(row.get("feature_id") or "-")))
-            self._table.setItem(r, 4, QTableWidgetItem(str(row.get("plugin_version") or "-")))
-            for ci, key in enumerate(("ema_diff", "rsi_14", "atr_normalized"),
-                                     start=5):
-                v = row.get(key)
-                if isinstance(v, (int, float)):
-                    self._table.setItem(r, ci, QTableWidgetItem(f"{v:.4f}"))
-                else:
+                time_item.setData(Qt.UserRole, epoch)
+            time_item.setData(Qt.UserRole + 1, global_r)
+            self._table.setItem(r, _COL_TIME, time_item)
+            # Spalte 1 = Service (feature_id bzw. Anzeigename, E3).
+            self._table.setItem(r, _COL_SERVICE,
+                                QTableWidgetItem(service_names[r] or "-"))
+            # JSON-Union-Spalten: Wert aus feature_data, sonst "-".
+            fd = row.get("feature_data")
+            if not isinstance(fd, dict):
+                fd = {}
+            for ci, key in enumerate(extra_keys, start=extra_start):
+                v = fd.get(key)
+                if v is None:
                     self._table.setItem(r, ci, QTableWidgetItem("-"))
+                elif isinstance(v, (int, float)):
+                    self._table.setItem(r, ci, QTableWidgetItem(f"{v:.4g}"))
+                else:
+                    self._table.setItem(r, ci, QTableWidgetItem(str(v)))
+
+    def _update_page_controls(self) -> None:
+        """Synchronisiert Seitenlabel + Button-Zustaende (19.04 Paging)."""
+        total = len(self._current_rows)
+        self.label_page.setText(
+            f"Seite {self._current_page + 1} / {max(self._total_pages, 1)}"
+            f"  ({total} Zeilen)")
+        self.btn_prev.setEnabled(self._current_page > 0)
+        self.btn_next.setEnabled(
+            self._current_page < self._total_pages - 1)
+
+    # ------------------------------------------------------------------
+    # 19.03: Tabellen-Settings (Resizing / Sortierung / Profil-Persistenz)
+    # ------------------------------------------------------------------
+    def _on_header_section_resized(self, *args) -> None:
+        """Spaltenbreite geaendert (User) -> Settings emittieren (19.03)."""
+        self._emit_table_settings()
+
+    def _on_vertical_section_resized(self, *args) -> None:
+        """Zeilenhoehe geaendert (User) -> GANZE Tabelle live uebernehmen (19.06).
+
+        Gewuenschtes Verhalten (Anwender): Das Ziehen einer Zeilenhöhe
+        uebertraegt die neue Hoehe sofort auf ALLE Zeilen (live, ohne
+        Refresh). Qt aendert beim Drag zunaechst nur die gezogene Zeile –
+        dieser Handler uebernimmt danach die neue Hoehe (args[2] = newSize)
+        per `setDefaultSectionSize` (Default fuer neue Zeilen) + `setRowHeight`
+        (alle bestehenden Zeilen) auf die gesamte Tabelle. Die Header-Signale
+        sind waehrenddessen blockiert (kein sectionResized-Signal-Sturm);
+        danach wird die globale `row_height` emittiert (kein individuelles
+        row_heights mehr, 19.06).
+        """
+        if len(args) >= 3:
+            try:
+                new_size = int(args[2])
+            except (TypeError, ValueError):
+                new_size = 0
+        else:
+            new_size = 0
+        if new_size > 0:
+            vheader = self._table.verticalHeader()
+            vheader.blockSignals(True)
+            try:
+                vheader.setDefaultSectionSize(new_size)
+                for r in range(self._table.rowCount()):
+                    self._table.setRowHeight(r, new_size)
+            finally:
+                vheader.blockSignals(False)
+        self._emit_table_settings()
+
+    def _on_sort_indicator_changed(self, *args) -> None:
+        """Sortier-Indikator geaendert (User) -> Settings emittieren (19.03)."""
+        self._emit_table_settings()
+
+    def _emit_table_settings(self) -> None:
+        """Emittiert den kompletten Tabellen-Zustand (19.03 E5/E8/E9 / 19.06).
+
+        Spaltenbreiten als {Header-Text: Breite} (E5 – robust gegenueber der
+        dynamischen JSON-Union), **globale Zeilenhoehe** (E9/19.06: alle
+        Zeilen identisch, nach einem Zeilen-Drag hat
+        `_on_vertical_section_resized` die gesamte Tabelle bereits live auf
+        die neue Hoehe gesetzt), Sortier-Spalte und -Richtung als Qt-Werte
+        (E8). KEIN individuelles `row_heights` mehr (19.06-Korrektur: das
+        Ziehen einer Zeile soll die GANZE Tabelle setzen und als globale
+        `table_row_height` persistiert werden).
+        """
+        widths: Dict[str, int] = {}
+        header = self._table.horizontalHeader()
+        for i in range(self._table.columnCount()):
+            item = self._table.horizontalHeaderItem(i)
+            if item is not None:
+                widths[str(item.text())] = int(header.sectionSize(i))
+        vheader = self._table.verticalHeader()
+        # 19.06: Globale Zeilenhöhe (alle Zeilen identisch). Nach einem
+        # Zeilen-Drag sind alle Zeilen auf die neue Hoehe gesetzt.
+        if self._table.rowCount() > 0:
+            row_height = int(vheader.sectionSize(0))
+        else:
+            row_height = int(vheader.defaultSectionSize())
+        sort_col = int(header.sortIndicatorSection())
+        if sort_col < 0:
+            sort_col = 0
+        # PySide6: sortIndicatorOrder() liefert den Qt.SortOrder-Enum (nicht
+        # direkt int-konvertierbar) – robust ueber den Enum-Vergleich mappen.
+        order = header.sortIndicatorOrder()
+        self.table_settings_changed.emit({
+            "column_widths": widths,
+            "row_height": row_height,
+            "sort_column": sort_col,
+            "sort_order": 1 if order == Qt.DescendingOrder else 0,
+        })
+
+    def _get_settings_widths(self) -> Dict[str, int]:
+        """Gespeicherte Spaltenbreiten aus dem ViewModel (19.03 E5).
+
+        {Spaltenname: Breite} – robust gegenueber der dynamischen JSON-Union
+        (fehlende neue Spalten fallen auf _BASE_COLUMNS/_EXTRA_COLUMN_WIDTH
+        zurueck). Defensiv: ohne ViewModel/leer -> {}.
+        """
+        if self._view_model is None:
+            return {}
+        raw = self._view_model.params.get("table_column_widths") or {}
+        out: Dict[str, int] = {}
+        for k, v in raw.items():
+            try:
+                w = int(v)
+            except (TypeError, ValueError):
+                continue
+            if w > 0:
+                out[str(k)] = w
+        return out
+
+    def _apply_table_settings(self) -> None:
+        """Wendet die gespeicherten Tabellen-Settings an (19.03 E3/E8/E9).
+
+        Wird am Ende von _populate gerufen (Header-Signale sind blockiert):
+        **globale Zeilenhoehe** (E9/19.06: `setDefaultSectionSize` als
+        Default fuer neue Zeilen + `setRowHeight` fuer ALLE bestehenden
+        Zeilen – die GANZE Tabelle bekommt die gespeicherte Hoehe, keine
+        individuellen Zeilenhoehen) und Sortier-Spalte/-Richtung (validiert,
+        E8). Spaltenbreiten uebernimmt bereits der Spaltenaufbau aus
+        _get_settings_widths(). Ohne ViewModel (z. B. Headless-Tests) bleibt
+        die Sortierung deaktiviert – Settings gibt es nicht.
+        """
+        if self._view_model is None:
+            return
+        params = self._view_model.params
+        # 19.06: Globale Zeilenhöhe auf die GESAMTE Tabelle anwenden
+        # (Default fuer neue Zeilen + alle bestehenden Zeilen).
+        try:
+            row_height = int(params.get("table_row_height") or 0)
+        except (TypeError, ValueError):
+            row_height = 0
+        if row_height > 0:
+            vheader = self._table.verticalHeader()
+            vheader.setDefaultSectionSize(row_height)
+            for r in range(self._table.rowCount()):
+                self._table.setRowHeight(r, row_height)
+        # Sortierung (E8): Spalten-Index validieren, Order auf Qt-Werte klemmen.
+        try:
+            sort_col = int(params.get("table_sort_column") or 0)
+        except (TypeError, ValueError):
+            sort_col = 0
+        try:
+            sort_order = int(params.get("table_sort_order") or 1)
+        except (TypeError, ValueError):
+            sort_order = 1
+        sort_order = (Qt.DescendingOrder if sort_order
+                      else Qt.AscendingOrder)
+        if not (0 <= sort_col < self._table.columnCount()):
+            sort_col = 0
         self._table.setSortingEnabled(True)
-        self._table.setUpdatesEnabled(True)
+        self._table.sortItems(sort_col, sort_order)
+
+    # ------------------------------------------------------------------
+    # 19.01 Step 2: Helfer (JSON-Union, Namensaufloesung)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _union_feature_keys(rows: List[Dict[str, Any]]) -> set:
+        """Union aller feature_data-JSON-Keys (19.01 E4 / 19.02).
+
+        19.02: Es gibt keine nativen Spalten mehr – es werden nur noch die
+        Basis-/Pflicht-Spalten (Zeit, Service) von der Union ausgenommen
+        (keine Duplikat-Header); leere/Whitespace-Keys ebenfalls.
+        """
+        base = {c[0] for c in _BASE_COLUMNS}
+        keys: set = set()
+        for row in rows:
+            fd = row.get("feature_data")
+            if not isinstance(fd, dict):
+                continue
+            for k in fd.keys():
+                s = str(k).strip()
+                if s and s not in base:
+                    keys.add(s)
+        return keys
+
+    def _resolve_names(self, rows: List[Dict[str, Any]]) -> List[str]:
+        """Loest die Service-Anzeigenamen der Rows einmalig auf (19.01 E3).
+
+        Baut die deduplizierte feature_id-Liste (Reihenfolge des ersten
+        Auftretens), ruft den injizierten `name_resolver` EINMAL auf und
+        bildet die Namen auf die Rows ab. Rows ohne feature_id -> "-".
+        Defensiv: Fehler im Resolver / abweichende Laenge -> feature_id.
+        """
+        unique: List[str] = []
+        index: Dict[str, int] = {}
+        for row in rows:
+            fid = row.get("feature_id")
+            key = str(fid) if fid else ""
+            if key not in index:
+                index[key] = len(unique)
+                unique.append(key)
+        try:
+            resolved = self._name_resolver(unique)
+        except Exception:
+            resolved = unique
+        by_id = dict(zip(unique, resolved))
+        out: List[str] = []
+        for row in rows:
+            fid = row.get("feature_id")
+            key = str(fid) if fid else ""
+            out.append(by_id.get(key, key) if key else "-")
+        return out
 
     # ------------------------------------------------------------------
     # Jump-to-Chart (Variante 2)
     # ------------------------------------------------------------------
     def _on_double_clicked(self, item: QTableWidgetItem) -> None:
-        row = item.row()
-        if row < 0 or self._navigation_handler is None:
+        if item is None or self._navigation_handler is None:
             return
-        symbol = self._table.item(row, 1)
-        tf = self._table.item(row, 2)
-        time_item = self._table.item(row, 0)
-        if not symbol or not tf or not time_item:
+        # 19.03 (E7): Bei aktiver QTableWidget-Sortierung entspricht die
+        # Anzeige-Zeile nicht mehr der _current_rows-Reihenfolge – der
+        # Roh-Row-Index wird stattdessen aus dem UserRole+1 des Zeit-Items
+        # aufgeloest (unabhaengig von der Anzeige-Sortierung).
+        time_item = self._table.item(item.row(), _COL_TIME)
+        if time_item is None:
             return
-        bar_time = time_item.data(Qt.UserRole)
-        if bar_time is None:
+        row_index = time_item.data(Qt.UserRole + 1)
+        if row_index is None:
+            return
+        try:
+            row_index = int(row_index)
+        except (TypeError, ValueError):
+            return
+        if not (0 <= row_index < len(self._current_rows)):
+            return
+        # 19.01: Symbol/TF/Zeit kommen aus der Roh-Row (nicht aus festen
+        # Spaltenpositionen – die Spalten sind jetzt dynamisch).
+        row_data = self._current_rows[row_index]
+        symbol = row_data.get("symbol")
+        tf = row_data.get("timeframe")
+        bar_time = row_data.get("time")
+        if not symbol or not tf or bar_time is None:
             return
         try:
             bar_time = int(bar_time)
         except (TypeError, ValueError):
             return
-        self._navigation_handler(symbol.text(), tf.text(), bar_time)
+        self._navigation_handler(str(symbol), str(tf), bar_time)
 
 ```
 
@@ -24753,14 +25778,16 @@ def check_and_init_databases() -> None:
     # ist CREATE TABLE IF NOT EXISTS ein No-op; die Migration existierender
     # Tabellen erfolgt ueber test/migrate_pk.py (Table-Rewrite + RENAME, da
     # DuckDB 1.5.5 kein DROP PRIMARY KEY unterstuetzt).
+    # 19.02 (Cleanup): Die Legacy-Native-Spalten ema_diff/rsi_14/
+    # atr_normalized entfallen im NEUSCHEMA – alle Feature-Werte liegen im
+    # feature_data-JSON. Bestehende DB-Dateien (mit den Alt-Spalten) werden
+    # durch den Additiv-Pfad (ALTER TABLE ADD COLUMN IF NOT EXISTS) nicht
+    # angetastet; der Reader greift nur noch auf feature_data zu.
     con_analytics.execute("""
         CREATE TABLE IF NOT EXISTS feature_store (
             symbol      VARCHAR NOT NULL,
             timeframe   VARCHAR NOT NULL,
             bar_time    TIMESTAMPTZ NOT NULL,
-            ema_diff    DOUBLE,
-            rsi_14      DOUBLE,
-            atr_normalized DOUBLE,
             created_at  TIMESTAMP DEFAULT current_timestamp,
             feature_id  VARCHAR NOT NULL DEFAULT 'native',
             plugin_version VARCHAR,
@@ -37108,6 +38135,661 @@ check('30 E7) Baum-Logik aus dem Modell ausgelagert (keine Methoden mehr)',
       and not hasattr(ServiceSelectorModel, '_ensure_category_path')
       and not hasattr(ServiceSelectorModel, '_set_category_parts')
       and not hasattr(ServiceSelectorModel, '_insert_set_into_category_tree'))
+
+
+print("\n=== Teil 31: 19.01 Analytics UI - Status-Feedback & Multi-Service Table ===")
+import duckdb  # noqa: E402
+from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
+from analytics.engine.analytics_repository import AnalyticsRepository  # noqa: E402
+from analytics.ui.table_page import TablePage  # noqa: E402
+
+# Eigene Temp-DB (analytics) – unabhaengig vom echten Datenbestand.
+_tmp31 = tempfile.mkdtemp(prefix="p1901_")
+_db31 = os.path.join(_tmp31, "analytics.duckdb")
+_con31 = duckdb.connect(_db31)
+_con31.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR, timeframe VARCHAR, bar_time TIMESTAMPTZ,
+        ema_diff DOUBLE, rsi_14 DOUBLE, atr_normalized DOUBLE,
+        created_at TIMESTAMPTZ, feature_id VARCHAR, plugin_version VARCHAR,
+        feature_data JSON
+    )
+""")
+_con31.execute("""
+    INSERT INTO feature_store VALUES
+    ('XAGUSD','M1', '2026-08-01 10:00:00+00', 0.5, 60.0, 1.0,
+     '2026-08-01 10:01:00+00', 'srv_a', '1.0.0',
+     '{"schema_version":"1.0.0","grid_step":1.0}'),
+    ('XAGUSD','M1', '2026-08-01 10:01:00+00', 0.6, 55.0, 1.1,
+     '2026-08-01 10:02:00+00', 'srv_b', '1.0.0',
+     '{"schema_version":"1.0.0","lookback":200}'),
+    ('XAGUSD','M1', '2026-08-01 10:02:00+00', 0.7, 58.0, 1.2,
+     '2026-08-01 10:03:00+00', 'srv_a', '1.0.0',
+     '{"schema_version":"1.0.0","grid_step":2.0}'),
+    ('XAGUSD','M1', '2026-08-01 10:03:00+00', 0.8, 61.0, 1.3,
+     '2026-08-01 10:04:00+00', 'srv_b', '1.0.0',
+     '{"schema_version":"1.0.0","lookback":100}')
+""")
+_con31.close()
+
+_reader31 = FeatureStoreReader(_db31)
+_repo31 = AnalyticsRepository(_reader31)
+
+# Testfall A: Abfrage fuer ungescannte Symbole/Services liefert total == 0.
+_a31 = _repo31.get_table("EURUSD", "M1")
+check("31 A1) Ungescanntes Symbol liefert total == 0",
+      _a31["total"] == 0 and _a31["rows"] == [],
+      f"total={_a31['total']}")
+
+# Testfall B: Multi-feature_ids-Abfrage liefert gemischte Ergebnissaetze.
+_b31 = _repo31.get_table("XAGUSD", "M1", feature_ids=["srv_a", "srv_b"])
+check("31 B1) Multi-feature_ids liefert alle Rows",
+      _b31["total"] == 4, f"total={_b31['total']}")
+_fids31 = sorted({r["feature_id"] for r in _b31["rows"]})
+check("31 B2) Gemischte Services (srv_a + srv_b)",
+      _fids31 == ["srv_a", "srv_b"], str(_fids31))
+_only_a31 = _repo31.get_table("XAGUSD", "M1", feature_ids=["srv_a"])
+check("31 B3) Einzel-Filter srv_a liefert nur srv_a",
+      _only_a31["total"] == 2
+      and all(r["feature_id"] == "srv_a" for r in _only_a31["rows"]),
+      f"total={_only_a31['total']}")
+
+# TablePage: Multi-Service-Darstellung (Spalte 1 = Service, absteigende
+# Chronologie, JSON-Union-Spalten, Fehlwerte "-").
+_page31 = TablePage()
+_page31.set_name_resolver(lambda ids: [f"Name({i})" for i in ids])
+_page31._populate(_b31["rows"])
+_times31 = [int(r["time"]) for r in _page31._current_rows]
+check("31 C1) Tabelle absteigend nach bar_time sortiert",
+      _times31 == sorted(_times31, reverse=True), str(_times31))
+_svc31 = _page31._table.item(0, 1).text()
+check("31 C2) Spalte 1 = Service-Anzeigename (neueste Row = srv_b)",
+      _svc31 == "Name(srv_b)", f"svc={_svc31}")
+_headers31 = [_page31._table.horizontalHeaderItem(i).text()
+              for i in range(_page31._table.columnCount())]
+check("31 C3) JSON-Union-Spalten (grid_step, lookback, schema_version)",
+      "grid_step" in _headers31 and "lookback" in _headers31
+      and "schema_version" in _headers31, str(_headers31))
+_lb_idx31 = _headers31.index("lookback")
+_found_a31 = False
+for _r31 in range(_page31._table.rowCount()):
+    if _page31._current_rows[_r31]["feature_id"] == "srv_a":
+        _val31 = _page31._table.item(_r31, _lb_idx31).text()
+        check("31 C4) Fehlwert bei abweichendem Service -> '-'",
+              _val31 == "-", f"val={_val31}")
+        _found_a31 = True
+        break
+check("31 C5) srv_a-Row im TablePage gefunden (Union-Kontrollzeile)",
+      _found_a31, "")
+shutil.rmtree(_tmp31, ignore_errors=True)
+
+print("\n=== Teil 32: 19.02 Cleanup - Native-Spalten entfernt, dynamische JSON-Achsen ===")
+# Deterministische Temp-DB (Neuschema OHNE ema_diff/rsi_14/atr_normalized).
+_tmp32 = tempfile.mkdtemp(prefix="p1902_")
+_db32 = os.path.join(_tmp32, "analytics.duckdb")
+_con32 = duckdb.connect(_db32)
+_con32.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR, timeframe VARCHAR, bar_time TIMESTAMPTZ,
+        created_at TIMESTAMPTZ, feature_id VARCHAR, plugin_version VARCHAR,
+        feature_data JSON
+    )
+""")
+_con32.execute("""
+    INSERT INTO feature_store VALUES
+    ('XAGUSD','M1', '2026-08-01 10:00:00+00', '2026-08-01 10:01:00+00',
+     'srv_a', '1.0.0', '{"schema_version":"1.0.0","grid_step":1.0,"grid_nearest_level":1.5,"visit_pct":2.0}'),
+    ('XAGUSD','M1', '2026-08-01 10:01:00+00', '2026-08-01 10:02:00+00',
+     'srv_b', '1.0.0', '{"schema_version":"1.0.0","lookback":200,"visit_pct":2.5}'),
+    ('XAGUSD','M1', '2026-08-01 10:02:00+00', '2026-08-01 10:03:00+00',
+     'srv_a', '1.0.0', '{"schema_version":"1.0.0","grid_step":2.0,"grid_nearest_level":3.0,"visit_pct":4.0}'),
+    ('XAGUSD','M1', '2026-08-01 10:03:00+00', '2026-08-01 10:04:00+00',
+     'srv_b', '1.0.0', '{"schema_version":"1.0.0","lookback":100,"visit_pct":1.5,"is_hit":true,"grid_nearest_level":2.5}'),
+    ('XAGUSD','M1', '2026-08-01 10:04:00+00', '2026-08-01 10:05:00+00',
+     'srv_b', '1.0.0', NULL)
+""")
+_con32.close()
+_reader32 = FeatureStoreReader(_db32)
+_repo32 = AnalyticsRepository(_reader32)
+
+# Reader: dynamische JSON-Keys statt nativer Spalten.
+_keys32 = _reader32.available_feature_keys("XAGUSD", "M1")
+check("32 A1) Alle JSON-Keys inkl. bool is_hit",
+      set(_keys32) == {"grid_step", "grid_nearest_level", "lookback",
+                       "visit_pct", "is_hit"}, str(_keys32))
+_keys_num32 = _reader32.available_feature_keys("XAGUSD", "M1",
+                                               numeric_only=True)
+check("32 A2) numeric_only (kein bool/str/schema_version)",
+      set(_keys_num32) == {"grid_step", "grid_nearest_level", "lookback",
+                           "visit_pct"}, str(_keys_num32))
+_rows32 = _reader32.fetch_rows("XAGUSD", "M1")
+check("32 A3) fetch_rows ohne Legacy-Spalten",
+      len(_rows32) == 5
+      and all("ema_diff" not in r and "rsi_14" not in r
+              and "atr_normalized" not in r for r in _rows32),
+      f"n={len(_rows32)}")
+check("32 A4) NULL-feature_data -> schema_version-Default",
+      len(_rows32) == 5
+      and any(r["feature_data"] == {"schema_version": "1.0.0"}
+              for r in _rows32),
+      str([r["feature_data"] for r in _rows32]))
+_cols32 = _reader32.fetch_columns("XAGUSD", "M1",
+                                  ["grid_nearest_level", "visit_pct"])
+check("32 A5) fetch_columns extrahiert JSON-Keys",
+      len(_cols32) == 3
+      and all("grid_nearest_level" in c and "visit_pct" in c
+              for c in _cols32), str(_cols32))
+check("32 A6) fetch_rows DESC (neuestes zuerst, bis Limit)",
+      [r["time"] for r in _rows32]
+      == sorted([r["time"] for r in _rows32], reverse=True)
+      and [r["time"] for r in _reader32.fetch_rows(
+          "XAGUSD", "M1", limit=2)]
+      == sorted([r["time"] for r in _rows32], reverse=True)[:2],
+      str([r["time"] for r in _rows32]))
+
+# Repository: Defaults dynamisch (keine Legacy-Achsen).
+_sc32 = _repo32.get_scatter("XAGUSD", "M1")
+check("32 B1) Scatter-Defaults dynamisch (x != y, aus JSON)",
+      _sc32["total"] > 0 and _sc32["x_label"] in _sc32["columns"]
+      and _sc32["y_label"] in _sc32["columns"]
+      and _sc32["x_label"] != _sc32["y_label"],
+      f"x={_sc32['x_label']} y={_sc32['y_label']} n={_sc32['total']}")
+_sc32b = _repo32.get_scatter("XAGUSD", "M1", x_column="grid_nearest_level",
+                             y_column="visit_pct")
+check("32 B2) Scatter explizite Keys", _sc32b["total"] == 3,
+      f"n={_sc32b['total']}")
+_dist32 = _repo32.get_distribution("XAGUSD", "M1")
+check("32 B3) Distribution-Default dynamisch", _dist32["total"] > 0
+      and _dist32["column"] in _dist32["columns"],
+      f"col={_dist32['column']} n={_dist32['total']}")
+_hm32 = _repo32.get_heatmap("XAGUSD", "M1", metric="grid_nearest_level")
+check("32 B4) Heatmap JSON-Metrik + Fallback count",
+      _hm32["metric"] == "grid_nearest_level"
+      and _repo32.get_heatmap("XAGUSD", "M1",
+                              metric="quatsch")["metric"] == "count"
+      and _repo32.get_heatmap("XAGUSD", "M1")["metric"] == "count",
+      f"metrics={_hm32.get('metrics')}")
+
+# ViewModel: keine Legacy-Defaults mehr.
+from analytics.engine.analytics_view_model import AnalyticsViewModel  # noqa: E402
+_vm32 = AnalyticsViewModel(analytics_repo=_repo32)
+check("32 C1) Keine Legacy-Achsen-Defaults",
+      _vm32.params["scatter_x"] == "" and _vm32.params["scatter_y"] == ""
+      and _vm32.params["distribution_column"] == ""
+      and _vm32.params["heatmap_metric"] == "count", str(_vm32.params))
+check("32 C2) Dynamische Achsen-/Metrik-Aufloesung",
+      "grid_nearest_level" in _vm32.available_feature_columns("XAGUSD", "M1")
+      and _vm32.heatmap_metrics("XAGUSD", "M1")[0] == "count"
+      and "visit_pct" in _vm32.heatmap_metrics("XAGUSD", "M1"), "")
+
+# TablePage: Schrift <=9pt, Basis [Zeit, Service], JSON-Union, keine Legacy.
+_page32 = TablePage()
+_font32 = _page32._table.font()
+_hdr32 = _page32._table.horizontalHeader().font()
+check("32 D1) Kleinere Schrift (Tabelle + Header, <= 9pt, Header fett)",
+      _font32.pointSize() <= 9 and _hdr32.pointSize() <= 9 and _hdr32.bold(),
+      f"t={_font32.pointSize()} h={_hdr32.pointSize()} b={_hdr32.bold()}")
+_page32._populate(_rows32)
+_headers32 = [_page32._table.horizontalHeaderItem(i).text()
+              for i in range(_page32._table.columnCount())]
+check("32 D2) Basis-Spalten [Zeit (Wanduhr), Service] + keine Legacy",
+      _headers32[:2] == ["Zeit (Wanduhr)", "Service"]
+      and "ema_diff" not in _headers32 and "rsi_14" not in _headers32
+      and "atr_normalized" not in _headers32, str(_headers32[:4]))
+check("32 D3) JSON-Union inkl. schema_version",
+      {"grid_step", "lookback", "visit_pct", "is_hit", "schema_version"}
+      <= set(_headers32), str(_headers32))
+shutil.rmtree(_tmp32, ignore_errors=True)
+
+print("\n=== Teil 33: 19.03 TablePage - Resizing, In-Memory-Sorting & Profil-Persistenz ===")
+from datetime import datetime  # noqa: E402
+from PySide6.QtCore import Qt  # noqa: E402
+from analytics_profile_repository import AnalyticsProfileRepository  # noqa: E402
+from analytics.ui.table_page import _SortableTimeItem  # noqa: E402
+
+# Deterministische Temp-DBs (app_data fuer Profile, analytics leer).
+_tmp33 = tempfile.mkdtemp(prefix="p1903_")
+_db33_profile = os.path.join(_tmp33, "app_data.duckdb")
+_db33_ana = os.path.join(_tmp33, "analytics.duckdb")
+for _p33 in (_db33_profile, _db33_ana):
+    _c33 = duckdb.connect(_p33)
+    _c33.execute("CREATE TABLE t (x INTEGER)")
+    _c33.close()
+_reader33 = FeatureStoreReader(_db33_ana)
+_repo33 = AnalyticsRepository(_reader33)
+_profile_repo33 = AnalyticsProfileRepository(_db33_profile)
+
+# R1: VM set_table_settings (Dirty + kein Query-Refresh).
+_vm33 = AnalyticsViewModel(analytics_repo=_repo33, profile_repo=_profile_repo33)
+_vm33.create_profile("P33", "desc")
+_dirty33 = []
+_vm33.dirty_changed.connect(lambda d: _dirty33.append(d))
+_vm33.set_table_settings(widths={"Zeit (Wanduhr)": 200, "grid_step": 111},
+                         row_height=30, sort_column=2, sort_order=0)
+_p33 = _vm33.params
+check("33 R1a) table_column_widths gesetzt",
+      _p33["table_column_widths"] == {"Zeit (Wanduhr)": 200, "grid_step": 111},
+      str(_p33["table_column_widths"]))
+check("33 R1b) row_height/sort gesetzt",
+      _p33["table_row_height"] == 30 and _p33["table_sort_column"] == 2
+      and _p33["table_sort_order"] == 0, str(_p33))
+check("33 R1c) dirty-Flag gesetzt + kein Query-Refresh",
+      _vm33.is_dirty and _vm33._pending_kinds == []
+      and not _vm33._debounce.isActive(), "")
+_vm33.set_table_settings(widths={"Zeit (Wanduhr)": 200, "grid_step": 111},
+                         row_height=30, sort_column=2, sort_order=0)
+check("33 R1d) idempotent (kein weiteres Dirty-Signal)",
+      _dirty33 == [True], str(_dirty33))
+
+# R2: Profil-Payload additiv (Repo-Roundtrip, schema_version: 1).
+_pid33 = _profile_repo33.create_profile(
+    "P33b", payload={"symbol": "XAGUSD",
+                     "table_column_widths": {"Zeit": 199},
+                     "table_row_height": 25, "table_sort_column": 1,
+                     "table_sort_order": 0})
+_p2_33 = _profile_repo33.get_profile(_pid33)
+check("33 R2a) Tabellen-Keys im Payload",
+      _p2_33["payload"]["table_column_widths"] == {"Zeit": 199}
+      and _p2_33["payload"]["table_row_height"] == 25
+      and _p2_33["payload"]["table_sort_column"] == 1
+      and _p2_33["payload"]["table_sort_order"] == 0,
+      str(_p2_33["payload"]))
+check("33 R2b) schema_version bleibt 1",
+      _p2_33["payload"].get("schema_version") == 1,
+      str(_p2_33["payload"].get("schema_version")))
+
+# R3: Profil-Laden uebernimmt Tabellen-Keys (_apply_profile).
+_vm33b = AnalyticsViewModel(analytics_repo=_repo33, profile_repo=_profile_repo33)
+_vm33b.set_active_profile(_pid33)
+_p3_33 = _vm33b.params
+check("33 R3a) _apply_profile uebernimmt Keys",
+      _p3_33["table_column_widths"] == {"Zeit": 199}
+      and _p3_33["table_row_height"] == 25
+      and _p3_33["table_sort_column"] == 1
+      and _p3_33["table_sort_order"] == 0,
+      str({k: _p3_33[k] for k in ("table_column_widths", "table_row_height",
+                                  "table_sort_column", "table_sort_order")}))
+
+# R4: Numerische Sortierung der Zeitspalte (_SortableTimeItem).
+_e_jan33 = int(datetime(2026, 1, 31, 10, 0).timestamp())
+_e_dec33 = int(datetime(2026, 12, 1, 10, 0).timestamp())
+_i_jan33 = _SortableTimeItem("So 31.01.26 10:00")
+_i_jan33.setData(Qt.UserRole, _e_jan33)
+_i_dec33 = _SortableTimeItem("Di 01.12.26 10:00")
+_i_dec33.setData(Qt.UserRole, _e_dec33)
+check("33 R4a) numerischer Zeitvergleich (Jan < Dez)",
+      _i_jan33.__lt__(_i_dec33) and not _i_dec33.__lt__(_i_jan33),
+      "")
+check("33 R4b) Text-Sortierung waere falsch (Gegenprobe)",
+      not _i_dec33.__lt__(_i_jan33), "")
+
+# T1: TablePage wendet Settings an (Breiten/Hoehe/Sortierung).
+_t1_33 = int(datetime(2026, 1, 31, 10, 0).timestamp())
+_t2_33 = int(datetime(2026, 3, 15, 10, 0).timestamp())
+_t3_33 = int(datetime(2026, 5, 20, 10, 0).timestamp())
+_rows33 = [
+    {"time": _t1_33, "symbol": "XAGUSD", "timeframe": "M1", "feature_id": "srv_a",
+     "plugin_version": "1.0.0",
+     "feature_data": {"schema_version": "1.0.0", "grid_step": 1.0}},
+    {"time": _t2_33, "symbol": "XAGUSD", "timeframe": "M1", "feature_id": "srv_b",
+     "plugin_version": "1.0.0",
+     "feature_data": {"schema_version": "1.0.0", "lookback": 200}},
+    {"time": _t3_33, "symbol": "XAGUSD", "timeframe": "M1", "feature_id": "srv_a",
+     "plugin_version": "1.0.0",
+     "feature_data": {"schema_version": "1.0.0", "grid_step": 2.0}},
+]
+_vm33c = AnalyticsViewModel(analytics_repo=_repo33, profile_repo=_profile_repo33)
+_vm33c.set_table_settings(widths={"Zeit (Wanduhr)": 200, "Service": 250,
+                                  "grid_step": 111},
+                          row_height=30, sort_column=0, sort_order=1)
+_page33 = TablePage()
+_page33.attach_view_model(_vm33c)
+_emitted33 = []
+_page33.table_settings_changed.connect(lambda s: _emitted33.append(s))
+_page33._populate(_rows33)
+_hdr33 = [_page33._table.horizontalHeaderItem(i).text()
+          for i in range(_page33._table.columnCount())]
+_gi33 = _hdr33.index("grid_step")
+check("33 T1a) Spaltenbreiten aus Settings",
+      _page33._table.columnWidth(0) == 200
+      and _page33._table.columnWidth(1) == 250
+      and _page33._table.columnWidth(_gi33) == 111,
+      f"w0={_page33._table.columnWidth(0)} w1={_page33._table.columnWidth(1)} "
+      f"w_grid={_page33._table.columnWidth(_gi33)}")
+check("33 T1b) Zeilenhoehe als Default-Section-Size",
+      _page33._table.verticalHeader().defaultSectionSize() == 30,
+      f"h={_page33._table.verticalHeader().defaultSectionSize()}")
+check("33 T1c) Sortierung aktiv + Zeit absteigend",
+      _page33._table.isSortingEnabled()
+      and _page33._table.item(0, 0).data(Qt.UserRole) == _t3_33,
+      f"enabled={_page33._table.isSortingEnabled()} "
+      f"z0={_page33._table.item(0, 0).data(Qt.UserRole)}")
+check("33 T1d) kein Settings-Emit waehrend _populate (E4)",
+      len(_emitted33) == 0, str(_emitted33))
+
+# T2: Jump-to-Chart-Row-Mapping nach User-Sortierung (E7).
+_captured33 = []
+_page33.set_navigation_handler(
+    lambda s, tf, bt: _captured33.append((s, tf, bt)))
+_page33._table.sortItems(0, Qt.AscendingOrder)
+_idx_t1_33 = [r["time"] for r in _page33._current_rows].index(_t1_33)
+check("33 T2a) Roh-Row-Index im UserRole+1 (Zeile 0 = aelteste)",
+      _page33._table.item(0, 0).data(Qt.UserRole + 1) == _idx_t1_33,
+      f"idx={_page33._table.item(0, 0).data(Qt.UserRole + 1)}")
+_page33._on_double_clicked(_page33._table.item(0, 0))
+check("33 T2b) Jump-to-Chart trifft Roh-Row (t1, nicht Anzeige-Zeile)",
+      len(_captured33) == 1 and _captured33[0] == ("XAGUSD", "M1", _t1_33),
+      str(_captured33))
+_captured33.clear()
+_page33._table.sortItems(0, Qt.DescendingOrder)
+_page33._on_double_clicked(_page33._table.item(0, 0))
+check("33 T2c) Absteigend trifft neueste Roh-Row (t3)",
+      len(_captured33) == 1 and _captured33[0] == ("XAGUSD", "M1", _t3_33),
+      str(_captured33))
+
+# T3: E8 – ungueltiger Sortier-Index wird beim Anwenden auf 0 geklemmt.
+_vm33d = AnalyticsViewModel(analytics_repo=_repo33, profile_repo=_profile_repo33)
+_vm33d.set_table_settings(widths={}, row_height=0, sort_column=99,
+                          sort_order=1)
+_page33b = TablePage()
+_page33b.attach_view_model(_vm33d)
+_page33b._populate(_rows33)
+check("33 T3a) sort_col=99 -> Fallback Spalte 0 (Zeit absteigend)",
+      _page33b._table.isSortingEnabled()
+      and _page33b._table.item(0, 0).data(Qt.UserRole) == _t3_33,
+      "")
+shutil.rmtree(_tmp33, ignore_errors=True)
+
+print("\n=== Teil 34: 19.04 TablePage-Paging + Profil-symbol/tf-Sync (Bugfix) ===")
+from analytics.ui.analytics_win import AnalyticsWindow  # noqa: E402
+
+# Deterministische Temp-DBs (app_data fuer Profile, analytics leer).
+_tmp34 = tempfile.mkdtemp(prefix="p1904_")
+_db34_profile = os.path.join(_tmp34, "app_data.duckdb")
+_db34_ana = os.path.join(_tmp34, "analytics.duckdb")
+for _p34 in (_db34_profile, _db34_ana):
+    _c34 = duckdb.connect(_p34)
+    _c34.execute("CREATE TABLE t (x INTEGER)")
+    _c34.close()
+_reader34 = FeatureStoreReader(_db34_ana)
+_repo34 = AnalyticsRepository(_reader34)
+_profile_repo34 = AnalyticsProfileRepository(_db34_profile)
+
+# P1: Paging-Zustand (headless, kein DB-Zugriff).
+_t34 = int(datetime(2026, 8, 8, 10, 0).timestamp())
+_rows34 = [
+    {"time": _t34 - i * 60, "symbol": "XAGUSD", "timeframe": "M1",
+     "feature_id": f"srv_{i % 3}", "plugin_version": "1.0.0",
+     "feature_data": {"schema_version": "1.0.0", "grid_step": float(i)}}
+    for i in range(250)
+]
+_vm34 = AnalyticsViewModel(analytics_repo=_repo34, profile_repo=_profile_repo34)
+_page34 = TablePage()
+_page34.attach_view_model(_vm34)
+# set_page_size vor dem ersten Befuellen (wie _wire_view_model).
+_page34.set_page_size(100)
+check("34 P1a) Default-PageSize 100",
+      _page34._page_size == 100, str(_page34._page_size))
+_page34._populate(_rows34)
+check("34 P1b) _populate setzt Seite 0, total_pages=3 (250/100)",
+      _page34._current_page == 0 and _page34._total_pages == 3,
+      f"p={_page34._current_page} tp={_page34._total_pages}")
+check("34 P1c) Seite 0 zeigt 100 Zeilen mit globalen Indizes 0..99",
+      _page34._table.rowCount() == 100
+      and _page34._table.item(0, 0).data(Qt.UserRole + 1) == 0
+      and _page34._table.item(99, 0).data(Qt.UserRole + 1) == 99,
+      f"rows={_page34._table.rowCount()} "
+      f"i0={_page34._table.item(0, 0).data(Qt.UserRole + 1)} "
+      f"i99={_page34._table.item(99, 0).data(Qt.UserRole + 1)}")
+check("34 P1d) btn_prev disabled, btn_next enabled",
+      not _page34.btn_prev.isEnabled() and _page34.btn_next.isEnabled(),
+      f"prev={_page34.btn_prev.isEnabled()} "
+      f"next={_page34.btn_next.isEnabled()}")
+_page34._next_page()
+check("34 P1e) naechste Seite: p=1, Start 100, Indizes 100..199",
+      _page34._current_page == 1 and _page34._table.rowCount() == 100
+      and _page34._table.item(0, 0).data(Qt.UserRole + 1) == 100
+      and _page34._table.item(99, 0).data(Qt.UserRole + 1) == 199,
+      f"p={_page34._current_page} rows={_page34._table.rowCount()} "
+      f"i0={_page34._table.item(0, 0).data(Qt.UserRole + 1)} "
+      f"i99={_page34._table.item(99, 0).data(Qt.UserRole + 1)}")
+_cap34 = []
+_page34.set_navigation_handler(lambda s, tf, bt: _cap34.append((s, tf, bt)))
+_page34._on_double_clicked(_page34._table.item(0, 0))
+check("34 P1f) Jump-to-Chart trifft globale Row 100 (nicht Anzeige-Seite)",
+      len(_cap34) == 1 and _cap34[0] == ("XAGUSD", "M1",
+                                          int(_rows34[100]["time"])),
+      str(_cap34))
+_page34._next_page()
+_page34._next_page()
+check("34 P1g) letzte Seite: p=2, 50 Zeilen, Indizes 200..249, btn_next disabled",
+      _page34._current_page == 2 and _page34._table.rowCount() == 50
+      and _page34._table.item(0, 0).data(Qt.UserRole + 1) == 200
+      and _page34._table.item(49, 0).data(Qt.UserRole + 1) == 249
+      and not _page34.btn_next.isEnabled(),
+      f"p={_page34._current_page} rows={_page34._table.rowCount()} "
+      f"i0={_page34._table.item(0, 0).data(Qt.UserRole + 1)} "
+      f"i49={_page34._table.item(49, 0).data(Qt.UserRole + 1)} "
+      f"next={_page34.btn_next.isEnabled()}")
+_page34._next_page()  # bleibt auf letzter Seite
+check("34 P1h) _next_page klemmt auf letzter Seite",
+      _page34._current_page == 2, f"p={_page34._current_page}")
+_page34._prev_page()
+check("34 P1i) _prev_page -> p=1",
+      _page34._current_page == 1, f"p={_page34._current_page}")
+# set_page_size mit geladenen Daten -> Seite 0, total_pages=5 (250/50).
+_page34.set_page_size(50)
+check("34 P1j) set_page_size(50) -> p=0, total_pages=5, 50 Zeilen",
+      _page34._page_size == 50 and _page34._current_page == 0
+      and _page34._total_pages == 5 and _page34._table.rowCount() == 50,
+      f"ps={_page34._page_size} p={_page34._current_page} "
+      f"tp={_page34._total_pages} rows={_page34._table.rowCount()}")
+check("34 P1k) Seitenlabel zeigt Seite/Gesamt + Zeilen",
+      "Seite 1 / 5" in _page34.label_page.text()
+      and "250 Zeilen" in _page34.label_page.text(),
+      _page34.label_page.text())
+_page34.set_page_size(-5)
+check("34 P1l) set_page_size(-5) faellt auf 100 zurueck",
+      _page34._page_size == 100, str(_page34._page_size))
+_page34._current_page = 2
+_page34._populate(_rows34[:150])
+check("34 P1m) neues _populate setzt Seite 0, total_pages=2",
+      _page34._current_page == 0 and _page34._total_pages == 2,
+      f"p={_page34._current_page} tp={_page34._total_pages}")
+
+# P2: Profil-Payload symbol/timeframe + _sync_profile_filters (Bugfix).
+_pid34 = _profile_repo34.create_profile(
+    "P34", payload={"symbol": "EURUSD", "timeframe": "H4", "limit": 1234})
+_vm34b = AnalyticsViewModel(analytics_repo=_repo34,
+                            profile_repo=_profile_repo34)
+_vm34b.set_active_profile(_pid34)
+_p34b = _vm34b.params
+check("34 P2a) _apply_profile uebernimmt symbol/timeframe aus Payload",
+      _p34b["symbol"] == "EURUSD" and _p34b["timeframe"] == "H4",
+      str({k: _p34b[k] for k in ("symbol", "timeframe")}))
+
+
+class _DummyCombo34:
+    """Minimaler Combo-Ersatz fuer den _sync_profile_filters-Test."""
+
+    def __init__(self, items):
+        self._items = list(items)
+        self._cur = 0
+        self._block_log = []
+
+    def blockSignals(self, b):
+        self._block_log.append(bool(b))
+
+    def findText(self, t):
+        for i, (txt, _d) in enumerate(self._items):
+            if txt == t:
+                return i
+        return -1
+
+    def addItem(self, txt, data):
+        self._items.append((txt, data))
+
+    def setCurrentIndex(self, idx):
+        if 0 <= idx < len(self._items):
+            self._cur = idx
+
+    def currentText(self):
+        return self._items[self._cur][0]
+
+
+_dummy34 = type("DummyWin34", (), {})()
+_dummy34.combo_symbol = _DummyCombo34([("XAGUSD", "XAGUSD")])
+_dummy34.combo_tf = _DummyCombo34([("M1", "M1"), ("M15", "M15"), ("H4", "H4")])
+_dummy34._vm = AnalyticsViewModel(analytics_repo=_repo34,
+                                  profile_repo=_profile_repo34)
+_dummy34._vm._params["symbol"] = "EURUSD"
+_dummy34._vm._params["timeframe"] = "H4"
+_dummy34._refresh_timeframe_combo = lambda symbol: None
+AnalyticsWindow._sync_profile_filters(_dummy34)
+check("34 P2b) _sync_profile_filters setzt Combos auf VM-Parameter",
+      _dummy34.combo_symbol.currentText() == "EURUSD"
+      and _dummy34.combo_tf.currentText() == "H4",
+      f"s={_dummy34.combo_symbol.currentText()} "
+      f"tf={_dummy34.combo_tf.currentText()}")
+check("34 P2c) Sync lief blockiert (blockSignals-Log endet mit False)",
+      len(_dummy34.combo_symbol._block_log) >= 2
+      and _dummy34.combo_symbol._block_log[-1] is False
+      and True in _dummy34.combo_symbol._block_log,
+      str(_dummy34.combo_symbol._block_log))
+# Unbekanntes Symbol wird in die Combo aufgenommen (Muster
+# _apply_persistent_filters) – kein Favorit noetig.
+_dummy34.combo_symbol = _DummyCombo34([("XAGUSD", "XAGUSD")])
+_dummy34._vm._params["symbol"] = "BTCUSD"
+_dummy34._vm._params["timeframe"] = "M15"
+AnalyticsWindow._sync_profile_filters(_dummy34)
+check("34 P2d) unbekanntes Symbol wird in die Combo aufgenommen",
+      _dummy34.combo_symbol.currentText() == "BTCUSD"
+      and _dummy34.combo_symbol.findText("BTCUSD") >= 0,
+      _dummy34.combo_symbol.currentText())
+# Leeres Symbol -> frueher Return, Combo bleibt unveraendert.
+_dummy34._vm._params["symbol"] = ""
+AnalyticsWindow._sync_profile_filters(_dummy34)
+check("34 P2e) leeres Symbol -> kein Eingriff",
+      _dummy34.combo_symbol.currentText() == "BTCUSD"
+      and _dummy34.combo_tf.currentText() == "M15",
+      f"s={_dummy34.combo_symbol.currentText()} "
+      f"tf={_dummy34.combo_tf.currentText()}")
+shutil.rmtree(_tmp34, ignore_errors=True)
+
+print("\n=== Teil 35: 19.06 Bugfix - Zeilenhoehe->GANZE Tabelle live + Profilname-Sync ===")
+from PySide6.QtWidgets import QHeaderView, QLineEdit  # noqa: E402
+from analytics.ui.analytics_win import AnalyticsWindow  # noqa: E402
+
+# Deterministische Temp-DBs (app_data fuer Profile, analytics leer).
+_tmp35 = tempfile.mkdtemp(prefix="p1906_")
+_db35_profile = os.path.join(_tmp35, "app_data.duckdb")
+_db35_ana = os.path.join(_tmp35, "analytics.duckdb")
+for _p35 in (_db35_profile, _db35_ana):
+    _c35 = duckdb.connect(_p35)
+    _c35.execute("CREATE TABLE t (x INTEGER)")
+    _c35.close()
+_reader35 = FeatureStoreReader(_db35_ana)
+_repo35 = AnalyticsRepository(_reader35)
+_profile_repo35 = AnalyticsProfileRepository(_db35_profile)
+
+# Z1: Zeilenhöhe -> GANZE Tabelle live (Bugfix 19.06).
+_t35 = int(datetime(2026, 8, 8, 10, 0).timestamp())
+_rows35 = [
+    {"time": _t35 - i * 60, "symbol": "XAGUSD", "timeframe": "M1",
+     "feature_id": "srv_a", "plugin_version": "1.0.0",
+     "feature_data": {"schema_version": "1.0.0", "grid_step": float(i)}}
+    for i in range(5)
+]
+_vm35 = AnalyticsViewModel(analytics_repo=_repo35, profile_repo=_profile_repo35)
+_vm35.create_profile("P35")
+_page35 = TablePage()
+_page35.attach_view_model(_vm35)
+_page35.set_page_size(100)
+_page35._populate(_rows35)
+_vh35 = _page35._table.verticalHeader()
+_default35 = _vh35.defaultSectionSize()
+# User zieht Zeile 2 auf 45 -> _on_vertical_section_resized uebernimmt die
+# neue Hoehe LIVE auf ALLE Zeilen (Signal ist nach _populate aktiv).
+_vh35.resizeSection(2, 45)
+check("35 Z1a) Live: Ziehen einer Zeile setzt ALLE Zeilen auf 45",
+      _vh35.sectionSize(0) == 45 and _vh35.sectionSize(1) == 45
+      and _vh35.sectionSize(2) == 45 and _vh35.sectionSize(3) == 45
+      and _vh35.defaultSectionSize() == 45,
+      f"sizes={[_vh35.sectionSize(i) for i in range(5)]}")
+_emit35 = []
+_page35.table_settings_changed.connect(lambda s: _emit35.append(s))
+_page35._on_vertical_section_resized(2, _default35, 45)
+_s35 = _emit35[-1]
+check("35 Z1b) Emit: row_height=45, KEIN row_heights",
+      _s35["row_height"] == 45 and "row_heights" not in _s35,
+      f"rh={_s35['row_height']}")
+_vm35.set_table_settings(widths={}, row_height=45,
+                         sort_column=0, sort_order=1)
+check("35 Z1c) VM speichert table_row_height=45 (kein table_row_heights)",
+      _vm35.params["table_row_height"] == 45
+      and "table_row_heights" not in _vm35.params,
+      str(_vm35.params.get("table_row_height")))
+_page35._populate(_rows35)
+check("35 Z1d) nach Refresh: ALLE Zeilen = 45 (globale Hoehe angewendet)",
+      _vh35.sectionSize(0) == 45 and _vh35.sectionSize(1) == 45
+      and _vh35.sectionSize(2) == 45 and _vh35.sectionSize(3) == 45,
+      f"sizes={[_vh35.sectionSize(i) for i in range(5)]}")
+_vm35.save_profile()
+_pay35 = _profile_repo35.get_profile(_vm35.active_profile["profile_id"])["payload"]
+check("35 Z1e) table_row_height im Profil-Payload",
+      _pay35.get("table_row_height") == 45,
+      str(_pay35.get("table_row_height")))
+_vm35b = AnalyticsViewModel(analytics_repo=_repo35, profile_repo=_profile_repo35)
+_vm35b.set_active_profile(_vm35.active_profile["profile_id"])
+check("35 Z1f) _apply_profile uebernimmt table_row_height",
+      _vm35b.params.get("table_row_height") == 45,
+      str(_vm35b.params.get("table_row_height")))
+
+# Z2: Profilname nach load_profiles (Bugfix 19.05/19.06) - '?' verhindern.
+_pid35 = _profile_repo35.create_profile("MeinProfil",
+                                        payload={"symbol": "XAGUSD",
+                                                 "limit": 777})
+_profile_repo35.set_active(_pid35)
+_vm35c = AnalyticsViewModel(analytics_repo=_repo35,
+                            profile_repo=_profile_repo35)
+_vm35c.load_profiles()
+check("35 Z2a) load_profiles setzt aktives Profil (Name 'MeinProfil')",
+      _vm35c.active_profile is not None
+      and _vm35c.active_profile["name"] == "MeinProfil",
+      str(_vm35c.active_profile.get("name")
+          if _vm35c.active_profile else None))
+
+
+class _DummyWin35:
+    """Minimales Window-Stub fuer _sync_profile_editor (Bugfix 19.05)."""
+
+    def __init__(self, vm, default_limit=10_000):
+        self._vm = vm
+        self._default_limit = default_limit
+        self.edit_profile_name = QLineEdit("")
+        self.edit_profile_desc = QLineEdit("")
+        self.edit_limit = QLineEdit("")
+
+
+_dummy35 = _DummyWin35(_vm35c)
+AnalyticsWindow._sync_profile_editor(_dummy35)
+check("35 Z2b) _sync_profile_editor fuellt Name/Limit aus aktivem Profil",
+      _dummy35.edit_profile_name.text() == "MeinProfil"
+      and _dummy35.edit_limit.text() == "777",
+      f"name={_dummy35.edit_profile_name.text()!r} "
+      f"limit={_dummy35.edit_limit.text()!r}")
+check("35 Z2c) Name nicht leer -> Save loescht den Profilnamen NICHT",
+      _dummy35.edit_profile_name.text() != "", "")
+# Ohne aktives Profil -> Felder geleert (kein Haenger).
+_dummy35b = _DummyWin35(AnalyticsViewModel(analytics_repo=_repo35,
+                                           profile_repo=_profile_repo35))
+AnalyticsWindow._sync_profile_editor(_dummy35b)
+check("35 Z2d) ohne aktives Profil: Felder leer",
+      _dummy35b.edit_profile_name.text() == ""
+      and _dummy35b.edit_profile_desc.text() == "",
+      f"name={_dummy35b.edit_profile_name.text()!r}")
+
+shutil.rmtree(_tmp35, ignore_errors=True)
 
 if FAILURES:
     print(f"FEHLER: {len(FAILURES)}: {FAILURES}")
