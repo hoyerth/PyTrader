@@ -26,7 +26,7 @@
 
 ## 1. Regeln & Invarianten
 
-* **Einrückung:** Ausschließlich **Tabs**.
+* **Einrückung:** Ausschließlich **4 Leerzeichen** (E-1: „Tabs" = redaktioneller Fehler).
 * **Spacing:** Exakt **1 Leerzeile** zwischen Funktionen/Methoden.
 * **UI-Tests:** **VERBOTEN.** Verifikation rein headless (`py_compile`, `test/test.py`).
 * **Architektur:** SRP, Inversion of Control, Entkopplung via `EventBus`.
@@ -75,9 +75,9 @@
 
 ### Step 4: Quality Gate
 
-* [ ] `python -m py_compile analytics/engine/service_selector_model.py serviceui/master_tree.py serviceui/service_win.py analytics/ui/analytics_win.py`
-* [ ] Headless-Test in `test/test.py` für rekursive Kategorien & Standalone-Params.
-* [ ] Code-Check: Nur Tabs, 1 Leerzeile Abstand.
+* [x] `python -m py_compile analytics/engine/service_selector_model.py serviceui/master_tree.py serviceui/service_win.py analytics/ui/analytics_win.py` (zusätzlich `serviceui/service_selector_dialog.py`) – **läuft fehlerfrei**.
+* [x] Headless-Test in `test/test.py` bzw. `test/` für rekursive Kategorien & Standalone-Params (42 Prüfungen bestanden, siehe §5.1 Step 4).
+* [x] Code-Check: 4 Leerzeichen (E-1), 1 Leerzeile Abstand (Ist-Code folgt dem).
 
 ---
 
@@ -89,8 +89,8 @@
 |---|---|---|
 | Step 1 | **Bereits umgesetzt** | `_insert_into_category_tree()` ist bereits rekursiv (unbegrenzte Slash-Pfade, 16.08 K2); `category_plugin_ids(path)` sammelt bereits rekursiv aus Unterordnern (17.01.02). Tests in `test/test.py` (16.08, 17.01.02) vorhanden. |
 | Step 2 | **Bereits umgesetzt** | Rekursives Ordner-Rendering im MasterTree (`_build_category_item`/`_build_child_item`); Ordner-Aktionen in `service_win.py` (`_on_run_category`, `_on_category_info_requested`, `_category_path_of`). Tests vorhanden. |
-| Step 3 | **Teilweise** | `ServiceSelectorDialog` (Checkbox-MasterTree + Read-Only-Param-Panel) existiert; **Standalone-Editierung fehlt** (Panel ist `setEnabled(False)`), **direkte Baum-Selektion → `set_feature_ids` fehlt** (nur Checkbox-Multi-Select + Apply). |
-| Step 4 | Offen | `py_compile` aller 7 betroffenen Dateien **läuft fehlerfrei** (verifiziert). Headless-Tests für rekursive Kategorien existieren; für Standalone-Params im Analytics-Kontext fehlen. |
+| Step 3 | **Umgesetzt (korrigierte Variante, s. E-4)** | Standalone-Editierung (plugin_params_<id> + EventBus-Sync), Live-Filter (`selection_ids_requested` → `set_feature_ids`) und Set-/Service-Verwaltung (CRUD via ServiceSetRepository) sind im `ServiceSelectorDialog` umgesetzt – NICHT eingebettet in `analytics_win.py` (siehe E-4). |
+| Step 4 | **Abgeschlossen (08.08.2026)** | `py_compile` aller betroffenen Dateien (inkl. `service_selector_model.py`, `master_tree.py`, `service_win.py`, `analytics_win.py`, `service_selector_dialog.py`) **läuft fehlerfrei**. Headless-Test `test/check_phase18_dialog.py` (42 Prüfungen: Auflösung, Panel-Editierbarkeit, Persistenz, Live-Filter, CRUD, Dialog-Singleton) **bestanden**, danach entfernt (Invariante 10). |
 
 ### 5.2 Konsistenz-Probleme (Doku vs. Ist-Code)
 
