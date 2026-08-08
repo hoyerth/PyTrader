@@ -169,8 +169,15 @@ class AnalyticsWindow(PersistentWindow):
             _app_settings = self.state_manager.get_app_settings()
             self._default_limit: int = int(
                 getattr(_app_settings, "statistics_signal_limit", 10_000))
+            # 19.04 (Paging): Zeilen pro Seite aus den App-Optionen
+            # (statistics_page_size, Default 100) – wird an die TablePage
+            # injiziert (set_page_size), die die geladenen Rows seitenweise
+            # rendert (Muster statistic_win.py).
+            self._table_page_size: int = int(
+                getattr(_app_settings, "statistics_page_size", 100))
         except Exception:
             self._default_limit = 10_000
+            self._table_page_size = 100
 
         # 15.03-E: Datenquellen-Dialog (ServiceSelectorDialog, Multi-Select)
         # ersetzt das fruehere Service-Filter-Popover. Das
@@ -425,6 +432,12 @@ class AnalyticsWindow(PersistentWindow):
         # Option B – Explicit Save; E6: kein Query-Refresh).
         self.table_page.table_settings_changed.connect(
             self._on_table_settings_changed)
+
+        # 19.04 (Paging): Zeilen pro Seite aus den AppSettings injizieren
+        # (statistics_page_size). Die TablePage rendert nur Seiten der
+        # Groesse page_size; die geladenen _current_rows (bis zum Limit)
+        # bleiben vollstaendig erhalten (Jump-to-Chart/Seitenwechsel).
+        self.table_page.set_page_size(self._table_page_size)
 
         # Jump-to-Chart (Variante 2): open_chart_at_bar + Aufloesung
         self.table_page.set_navigation_handler(self._open_chart_at_bar)
@@ -699,6 +712,47 @@ class AnalyticsWindow(PersistentWindow):
         if hasattr(self, "edit_limit"):
             self.edit_limit.setText(
                 str(int(self._vm.params.get("limit") or self._default_limit)))
+        # Bugfix 08.08.2026 (symbol/tf-Profil-Restore): Der Profilwechsel
+        # hat die VM-Parameter symbol/timeframe via _apply_profile() gesetzt –
+        # die Combos muessen diesen Werten folgen (sonst zeigen sie weiter
+        # die Historie-Werte und beim Schliessen wird der falsche Zustand
+        # persistiert).
+        self._sync_profile_filters()
+
+    def _sync_profile_filters(self) -> None:
+        """Synchronisiert Symbol-/TF-Combos mit den VM-Parametern (Bugfix).
+
+        Beim Profilwechsel (active_profile_changed) bzw. nach load_profiles()
+        wurden die VM-Parameter `symbol`/`timeframe` aus dem Profil-Payload
+        uebernommen (ViewModel._apply_profile). Die Combos wuerden aber auf
+        den alten (Historie-)Werten bleiben – das ergibt inkonsistente
+        Abfragen und eine falsche Persistenz beim Schliessen
+        (get_persistent_symbol liefert den Combo-Wert). Der Sync laeuft mit
+        blockSignals(True), damit keine set_symbol/set_timeframe-Signalkette
+        (und kein zusaetzlicher Query) ausgeloest wird – der Profilwechsel
+        hat die Abfragen bereits via refresh_all() angestossen. Ein Symbol
+        ausserhalb der Favoriten wird in die Combo aufgenommen (Muster
+        _apply_persistent_filters), damit der gespeicherte Filter sichtbar
+        bleibt.
+        """
+        if not hasattr(self, "combo_symbol") or not hasattr(self, "combo_tf"):
+            return
+        symbol = (self._vm.params.get("symbol") or "").strip()
+        if not symbol:
+            return
+        self.combo_symbol.blockSignals(True)
+        if self.combo_symbol.findText(symbol) < 0:
+            self.combo_symbol.addItem(symbol, symbol)
+        self.combo_symbol.setCurrentIndex(self.combo_symbol.findText(symbol))
+        self.combo_symbol.blockSignals(False)
+        timeframe = (self._vm.params.get("timeframe") or "M1").strip()
+        self.combo_tf.blockSignals(True)
+        idx = self.combo_tf.findText(timeframe)
+        if idx >= 0:
+            self.combo_tf.setCurrentIndex(idx)
+        self.combo_tf.blockSignals(False)
+        # TF-Ausgrauung fuer das (ggf. neue) Symbol aktualisieren.
+        self._refresh_timeframe_combo(symbol)
 
     @Slot(bool)
     def _on_dirty_changed(self, dirty: bool) -> None:
@@ -781,6 +835,13 @@ class AnalyticsWindow(PersistentWindow):
         self._vm.set_symbol(self.combo_symbol.currentText())
         self._vm.set_timeframe(self.combo_tf.currentText())
         self._vm.load_profiles()
+        # Bugfix 08.08.2026 (symbol/tf-Profil-Restore): load_profiles()
+        # emittiert active_profile_changed NICHT (nur set_active_profile/
+        # create_profile) – die VM-Parameter wurden aber bereits aus dem
+        # Profil-Payload gesetzt. Die Combos muessen deshalb hier explizit
+        # synchronisiert werden, sonst bleiben sie auf den Historie-Werten
+        # (inkonsistente Anzeige + falsche Persistenz beim Schliessen).
+        self._sync_profile_filters()
         self._on_page_changed(self.sidebar.currentRow())
         # 15.03-E: QUERY_FEATURES speiste das entfernte combo_feature-Dropdown –
         # ohne Feature-Dropdown ist keine Features-Metadaten-Abfrage noetig.

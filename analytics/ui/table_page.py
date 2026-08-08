@@ -44,15 +44,27 @@ Die Daten kommen ueber `data_ready(QUERY_TABLE, data)` vom ViewModel
   (E4).
 - Jump-to-Chart-Row-Mapping (E7): Der `_current_rows`-Einfuege-Index liegt im
   UserRole+1 des Zeit-Items – unabhaengig von der Anzeige-Sortierung.
+
+19.04 (Paging, Bugfix 08.08.2026):
+- Paging wieder eingebaut (Legacy-Muster aus statistic_win.py): Vor/Zurueck-
+  Buttons + Seitenlabel unter der Tabelle. Die geladenen `_current_rows`
+  (bis zum Limit aus analytics_win) werden in Seiten der Groesse
+  `statistics_page_size` (AppSettings, via `set_page_size()` injiziert)
+  aufgeteilt; `_current_rows` haelt weiterhin ALLE Zeilen (Jump-to-Chart/
+  Seitenwechsel). Nach Daten-Update springt die Anzeige auf Seite 0.
+- Beim Seitenwechsel bleibt die aktive User-Sortierung erhalten (nur die
+  Anzeige-Seite wird neu gerendert, Roh-Liste unveraendert).
 """
 
 from typing import Any, Callable, Dict, List, Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
+    QHBoxLayout,
     QHeaderView,
     QLabel,
+    QPushButton,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -129,8 +141,15 @@ class TablePage(QWidget):
         # Default: feature_id selbst anzeigen (kein UI->Modell-Zwang).
         self._name_resolver: Callable[[List[str]], List[str]] = lambda ids: list(ids)
         # Roh-Rows der aktuellen Anzeige (fuer Jump-to-Chart, unabhaengig
-        # von Tabellen-Spalten-Positionen).
+        # von Tabellen-Spalten-Positionen). 19.04 (Paging): haelt ALLE
+        # geladenen Zeilen (bis Limit); angezeigt wird nur die aktuelle Seite.
         self._current_rows: List[Dict[str, Any]] = []
+        # 19.04 (Paging): Zeilen pro Seite (via set_page_size aus den
+        # AppSettings statistics_page_size injiziert; Default 100), aktuelle
+        # Seite und Gesamtseitenzahl.
+        self._page_size: int = 100
+        self._current_page: int = 0
+        self._total_pages: int = 1
 
         self._header = QLabel("Feature-Store-Tabelle")
         self._table = QTableWidget(0, len(_BASE_COLUMNS))
@@ -184,10 +203,28 @@ class TablePage(QWidget):
         lay = QVBoxLayout(content)
         lay.addWidget(self._header)
         lay.addWidget(self._table)
+        # 19.04 (Paging): Leiste mit Zurueck/Weiter + Seitenlabel unter der
+        # Tabelle (Muster statistic_win.py: btn_prev_page/btn_next_page/
+        # label_page_info). Zeigt die Seite und die Gesamtzahl der geladenen
+        # Zeilen; Buttons werden je nach Position ein-/ausgegraut.
+        self.btn_prev = QPushButton("◀ Zurück")
+        self.btn_next = QPushButton("Weiter ▶")
+        self.label_page = QLabel("Seite 1 / 1")
+        page_bar = QWidget(self)
+        page_lay = QHBoxLayout(page_bar)
+        page_lay.setContentsMargins(0, 2, 0, 0)
+        page_lay.setSpacing(6)
+        page_lay.addWidget(self.btn_prev)
+        page_lay.addWidget(self.label_page)
+        page_lay.addWidget(self.btn_next)
+        page_lay.addStretch(1)
+        lay.addWidget(page_bar)
         self._stack = make_overlay_stack(content)
         self.setLayout(self._stack)
 
         self._table.itemDoubleClicked.connect(self._on_double_clicked)
+        self.btn_prev.clicked.connect(self._prev_page)
+        self.btn_next.clicked.connect(self._next_page)
 
     # ------------------------------------------------------------------
     # MVVM-Anbindung (vom AnalyticsWindow gesetzt)
@@ -219,6 +256,26 @@ class TablePage(QWidget):
         """Fordert die Tabellen-Daten ueber das ViewModel an."""
         if self._view_model is not None:
             self._view_model.request_table()
+
+    def set_page_size(self, page_size: int) -> None:
+        """Setzt die Zeilen pro Seite (Paging, 19.04; IoC vom AnalyticsWindow).
+
+        Der Wert kommt aus den AppSettings (`statistics_page_size`). Bei
+        bereits geladenen Daten wird die aktuelle Seite neu gerendert (Seite
+        wird auf 0 zurueckgesetzt).
+        """
+        try:
+            ps = int(page_size)
+        except (TypeError, ValueError):
+            ps = 100
+        if ps <= 0:
+            ps = 100
+        if ps == self._page_size:
+            return
+        self._page_size = ps
+        if self._current_rows:
+            self._current_page = 0
+            self._render_current_page()
 
     # ------------------------------------------------------------------
     # Datenfluss (UI rendert, KEIN SQL)
@@ -286,21 +343,89 @@ class TablePage(QWidget):
             self._table.setColumnWidth(
                 i, int(settings_widths.get(name, default_widths[i])))
 
-        # E3: Anzeigenamen einmalig fuer die vorliegenden Rows aufloesen.
-        service_names = self._resolve_names(sorted_rows)
+        # 19.04 (Paging): Seite zuruecksetzen und nur die aktuelle Seite
+        # rendern (Seitenaufbau in _render_current_page/_populate_rows;
+        # Sortierung/Settings werden dort angewendet).
+        self._current_page = 0
+        self._render_current_page()
+        self._table.setUpdatesEnabled(True)
+        for w in blocked:
+            w.blockSignals(False)
+
+    # ------------------------------------------------------------------
+    # 19.04: Paging (Muster statistic_win.py, Bugfix 08.08.2026)
+    # ------------------------------------------------------------------
+    def _prev_page(self) -> None:
+        """Eine Seite zurueck (aktiviert sobald _current_page > 0)."""
+        if self._current_page > 0:
+            self._current_page -= 1
+            self._render_current_page()
+
+    def _next_page(self) -> None:
+        """Eine Seite vor (aktiviert solange nicht auf der letzten Seite)."""
+        if self._current_page < self._total_pages - 1:
+            self._current_page += 1
+            self._render_current_page()
+
+    def _render_current_page(self) -> None:
+        """Rendert die Zeilen der aktuellen Seite (19.04 Paging).
+
+        `_current_rows` haelt ALLE geladenen Zeilen (bis Limit) – angezeigt
+        wird nur der Ausschnitt `[current_page*page_size : +page_size]`.
+        Die Signale sind waehrend des Neu-Befuellens blockiert (E4), damit
+        setItem/sortItems nicht als User-Aktion (Dirty-Flag/Persistieren)
+        gewertet werden. Nach dem Befuellen werden die Tabellen-Settings
+        angewandt (Sortierung; bei aktiver User-Sortierung bleibt der
+        Indikator erhalten).
+        """
+        page_size = self._page_size if self._page_size > 0 else 1
+        total = len(self._current_rows)
+        self._total_pages = max(1, (total + page_size - 1) // page_size)
+        if self._current_page >= self._total_pages:
+            self._current_page = max(0, self._total_pages - 1)
+        start = self._current_page * page_size
+        end = min(start + page_size, total)
+        page_rows = self._current_rows[start:end]
+
+        header = self._table.horizontalHeader()
+        vheader = self._table.verticalHeader()
+        blocked = (self._table, header, vheader)
+        for w in blocked:
+            w.blockSignals(True)
+        try:
+            self._table.setSortingEnabled(False)
+            self._populate_rows(page_rows, start_offset=start)
+            self._apply_table_settings()
+        finally:
+            for w in blocked:
+                w.blockSignals(False)
+        self._update_page_controls()
+
+    def _populate_rows(
+        self, rows: List[Dict[str, Any]], start_offset: int = 0
+    ) -> None:
+        """Befuellt die Tabellen-Zeilen einer Seite (19.04 Paging).
+
+        Der UserRole+1 (E7, Jump-to-Chart-Row-Mapping) traegt den GLOBALEN
+        `_current_rows`-Index (`start_offset + r`), damit ein Doppelklick
+        unabhaengig von Seite und Anzeige-Sortierung die richtige Roh-Row
+        trifft.
+        """
+        service_names = self._resolve_names(rows)
+        extra_keys = sorted(self._union_feature_keys(self._current_rows))
         extra_start = len(_BASE_COLUMNS)
 
-        self._table.setRowCount(len(sorted_rows))
-        for r, row in enumerate(sorted_rows):
+        self._table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            global_r = start_offset + r
             # Zeit: Wanduhr-Formatierung (Invariante 7) + Roh-Epoch im
-            # UserRole fuer die numerische Sortierung (E2) + Einfuege-Index
-            # der _current_rows im UserRole+1 fuer Jump-to-Chart (E7,
-            # unabhaengig von der Anzeige-Sortierung).
+            # UserRole (numerische Sortierung, E2) + globaler Einfuege-Index
+            # im UserRole+1 (Jump-to-Chart, E7).
             epoch = _epoch_int(row.get("time"))
             time_item = _SortableTimeItem(format_wanduhr_time(epoch))
             if epoch is not None:
                 time_item.setData(Qt.UserRole, epoch)
-            time_item.setData(Qt.UserRole + 1, r)
+            time_item.setData(Qt.UserRole + 1, global_r)
             self._table.setItem(r, _COL_TIME, time_item)
             # Spalte 1 = Service (feature_id bzw. Anzeigename, E3).
             self._table.setItem(r, _COL_SERVICE,
@@ -317,12 +442,16 @@ class TablePage(QWidget):
                     self._table.setItem(r, ci, QTableWidgetItem(f"{v:.4g}"))
                 else:
                     self._table.setItem(r, ci, QTableWidgetItem(str(v)))
-        # 19.03 (E3/E8/E9): In-Memory-Sortierung nach dem Befuellen aktivieren
-        # und die gespeicherten Settings (Zeilenhoehe, Sortierung) anwenden.
-        self._apply_table_settings()
-        self._table.setUpdatesEnabled(True)
-        for w in blocked:
-            w.blockSignals(False)
+
+    def _update_page_controls(self) -> None:
+        """Synchronisiert Seitenlabel + Button-Zustaende (19.04 Paging)."""
+        total = len(self._current_rows)
+        self.label_page.setText(
+            f"Seite {self._current_page + 1} / {max(self._total_pages, 1)}"
+            f"  ({total} Zeilen)")
+        self.btn_prev.setEnabled(self._current_page > 0)
+        self.btn_next.setEnabled(
+            self._current_page < self._total_pages - 1)
 
     # ------------------------------------------------------------------
     # 19.03: Tabellen-Settings (Resizing / Sortierung / Profil-Persistenz)
