@@ -506,26 +506,26 @@ Umgesetzt (Checklisten-Step 1–5 abgearbeitet; Entscheidungen D1–D6 des Prüf
 
 ### Step 1: Interaktives Resizing & In-Memory-Sortierung (`table_page.py`)
 
-* [ ] In `TablePage.__init__()` / Tabellen-Setup:
+* [x] In `TablePage.__init__()` / Tabellen-Setup:
 * Interaktive Spalten- und Zeilenanpassung aktivieren:
 `self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)`
 `self.table.verticalHeader().setSectionResizeMode(QHeaderView.Interactive)`
 * In-Memory-Sortierung aktivieren:
 `self.table.setSortingEnabled(True)`
 
-* [ ] Bei Signalen `sectionResized` (Horizontal/Vertical Header) sowie `sortIndicatorChanged` ein UI-Change-Signal an `AnalyticsWindow` emittieren.
+* [x] Bei Signalen `sectionResized` (Horizontal/Vertical Header) sowie `sortIndicatorChanged` ein UI-Change-Signal an `AnalyticsWindow` emittieren.
 
 ### Step 2: ViewModel & Profil-Payload Erweiterung (`analytics_win.py` & `analytics_view_model.py`)
 
-* [ ] `AnalyticsViewModel` um Methoden zur Aufnahme von Tabelleneinstellungen erweitern:
+* [x] `AnalyticsViewModel` um Methoden zur Aufnahme von Tabelleneinstellungen erweitern:
 * Param-Keys in `self._params`: `table_column_widths` (Dict), `table_row_height` (int), `table_sort_column` (int), `table_sort_order` (int).
 * Ändern dieser Parameter markiert das ViewModel als dirty (`_mark_dirty()`) -> setzt `*`-Flag in der Profil-UI.
-* [ ] In `AnalyticsProfileRepository`:
+* [x] In `AnalyticsProfileRepository`:
 * Der Payload speichert die neuen Tabellen-Keys additiv unter Beibehaltung von `schema_version: 1`.
 
 ### Step 3: Wiederherstellung beim Profil-Laden (`analytics_win.py` -> `table_page.py`)
 
-* [ ] Bei `active_profile_changed` / Data-Ready:
+* [x] Bei `active_profile_changed` / Data-Ready:
 * Reiche die Tabelleneinstellungen an `TablePage` weiter.
 * Wende Spaltenbreiten an: `self.table.setColumnWidth(col, width)`.
 * Wende Zeilenhöhe an: `self.table.verticalHeader().setDefaultSectionSize(height)`.
@@ -533,11 +533,11 @@ Umgesetzt (Checklisten-Step 1–5 abgearbeitet; Entscheidungen D1–D6 des Prüf
 
 ### Step 4: Quality Gate & Verifikation
 
-* [ ] Terminal-Syntax-Check ausführen:
+* [x] Terminal-Syntax-Check ausführen:
 `python -m py_compile analytics/ui/table_page.py analytics/ui/analytics_win.py analytics/engine/analytics_view_model.py analytics_profile_repository.py`
 
-* [ ] Headless-Test in `test/test.py` für Profil-Payload-Persistenz der neuen Tabellenschlüssel durchführen.
-* [ ] Code-Check: Exakt 4 Leerzeichen Einrückung, 1 Leerzeile Abstand.
+* [x] Headless-Test in `test/test.py` für Profil-Payload-Persistenz der neuen Tabellenschlüssel durchführen.
+* [x] Code-Check: Exakt 4 Leerzeichen Einrückung, 1 Leerzeile Abstand.
 
 ---
 
@@ -703,3 +703,85 @@ Umgesetzt (Checklisten-Step 1–5 abgearbeitet; Entscheidungen D1–D6 des Prüf
   **Kein Code umgesetzt** – Umsetzung wartet auf den ausdrücklichen Startbefehl des
   Anwenders (Steps 1–4 offen, Checklisten oben).
 
+---
+
+## Implementierungs-Log 19.03 (08.08.2026) – Resizing, In-Memory-Sorting & Profil-Persistenz
+
+Umgesetzt (Steps 1–4 abgearbeitet; Entscheidungen E1–E10 des Prüfprotokolls
+19.03 als verbindliche Spezifikation):
+
+### Step 1 – TablePage (`analytics/ui/table_page.py`)
+
+* **Interaktives Resizing:** `horizontalHeader()`/`verticalHeader()` auf
+  `QHeaderView.Interactive` (Spaltenbreiten + Zeilenhöhen frei anpassbar);
+  deterministische Startbreiten aus `_BASE_COLUMNS`/`_EXTRA_COLUMN_WIDTH`
+  bleiben beim ersten Befüllen erhalten.
+* **In-Memory-Sortierung (E3):** `setSortingEnabled(True)` wird erst NACH dem
+  Befüllen in `_apply_table_settings()` aktiviert (O(n²)-Schutz: sonst Re-Sort
+  bei jedem `setItem`); während `_populate` deaktiviert.
+* **UI-Change-Signal `table_settings_changed(dict)`:** emittiert aus
+  `sectionResized` (Horizontal/Vertical) und `sortIndicatorChanged`; Tabelle
+  + Header sind während `_populate` blockiert (E4) – nur echte User-Aktionen
+  emittieren (kein ungewolltes Dirty-Flag beim Befüllen).
+* **`_SortableTimeItem` (E2):** numerischer Zeitvergleich über die Roh-Epoch
+  (UserRole) – das lexikografische Wanduhr-Format wäre nicht chronologisch.
+* **Settings-Anwendung in `_populate` (E1):** `_get_settings_widths()`
+  (Breiten {Spaltenname: Breite}, E5, robust gegen dynamische JSON-Union) und
+  `_apply_table_settings()` (Zeilenhöhe via `setDefaultSectionSize`, E9;
+  `sortItems` mit validiertem Index, E8).
+* **Jump-to-Chart-Row-Mapping (E7):** Einfüge-Index der `_current_rows` liegt
+  im `UserRole+1` des Zeit-Items; `_on_double_clicked` löst die Roh-Row
+  darüber auf – unabhängig von der Anzeige-Sortierung.
+
+### Step 2 – ViewModel (`analytics/engine/analytics_view_model.py`)
+
+* Neue Param-Keys: `table_column_widths` (Dict), `table_row_height` (int),
+  `table_sort_column` (int), `table_sort_order` (int, Default 1 =
+  DescendingOrder → Zeit absteigend).
+* **`set_table_settings(widths, row_height, sort_column, sort_order)` (E6):**
+  typ-/werte-normalisiert (ungültige Breiten ignoriert, negative → 0,
+  SortOrder auf 0/1 geklemmt), idempotent, markiert nur `_mark_dirty()` –
+  **kein** Query-Refresh/Debounce/Worker (reine UI-Zustände).
+* `_apply_profile()` übernimmt die vier Keys automatisch (Payload-Roundtrip,
+  R3-PASS) – keine Änderung nötig.
+* `analytics_profile_repository.py` unverändert (E10): Payload additiv,
+  `schema_version` bleibt 1.
+
+### Step 3 – AnalyticsWindow (`analytics/ui/analytics_win.py`)
+
+* `_wire_view_model`: `table_page.table_settings_changed` → neuer Slot
+  `_on_table_settings_changed(settings)`.
+* Slot reicht Breiten/Zeilenhöhe/Sortierung an `set_table_settings` weiter
+  (`sort_order` per None-Guard – 0 = AscendingOrder bleibt korrekt erhalten).
+
+### Step 4 – Quality Gate & Verifikation (headless, kein UI)
+
+* `py_compile` der 3 Produktivdateien + `analytics_profile_repository.py`
+  (Kapitel-Text, E10) → **PASS** (exit 0).
+* Isolierter Check `test/_check_1903_isolated.py` (Temp-DBs, 20 Prüfungen
+  R1–R4/T1–T3: VM-Setter/Dirty/kein Query, Payload-Roundtrip, numerische
+  Zeitsortierung, Settings-Anwendung, Jump-to-Chart-Row-Mapping, E8-Fallback)
+  → **alle PASS** (temporär, nach Abschluss entfernt).
+* `test/test.py` **Teil 33** (18 Prüfungen) → **alle PASS**; Teil 31/32
+  unverändert **PASS**.
+* Gesamtlauf `test/test.py`: **590 PASS / 6 FAIL** – die 6 Fehler sind die
+  dokumentierten **Baseline-Vorbefunde** P2/P5/H3/H4/H5/H7 (Geometrie-Tests,
+  offscreen `800x582`) – nicht durch 19.03 verursacht.
+* Test-Workspace aufgeräumt (Invariante 10): nur `test/test.py` verbleibt.
+
+### Abweichungen vom Plan-Kapitel (per Prüfprotokoll-Entscheidungen)
+
+* Plan-Step 3 „Window reicht Settings explizit weiter" → E1: Anwendung in
+  `_populate` (MVVM, ein Pfad für Profil- UND TF-/Datenwechsel).
+* Plan-Step 1 `setSortingEnabled(True)` direkt im Setup → E3: erst nach dem
+  Befüllen aktivieren.
+* `table_sort_order`-Default: 1 (DescendingOrder = Zeit absteigend) statt
+  unbestimmt (E3/E8).
+* Numerische Zeitspalten-Sortierung (L1/E2) als Ergänzung zum Plan (sonst
+  wäre die Zeitspalte textuell falsch sortiert).
+
+### Status
+
+* **Alle Steps 1–4 abgeschlossen und headless verifiziert.** Keine UI-/
+  Regressionstests ausgeführt (Regel 4); Baseline-Vorbefunde P2/P5/H3/H4/H5/H7
+  sind unverändert dokumentiert.

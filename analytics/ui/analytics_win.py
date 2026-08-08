@@ -420,6 +420,11 @@ class AnalyticsWindow(PersistentWindow):
         # kein SQL / keine direkte Modell-Kopplung in der Page.
         self.table_page.set_name_resolver(
             self._selector_model.resolve_display_names)
+        # 19.03 (Step 1): Tabellen-Settings (Spaltenbreiten, Zeilenhoehe,
+        # Sortierung) der TablePage in den ViewModel leiten (Persistenz,
+        # Option B – Explicit Save; E6: kein Query-Refresh).
+        self.table_page.table_settings_changed.connect(
+            self._on_table_settings_changed)
 
         # Jump-to-Chart (Variante 2): open_chart_at_bar + Aufloesung
         self.table_page.set_navigation_handler(self._open_chart_at_bar)
@@ -613,6 +618,23 @@ class AnalyticsWindow(PersistentWindow):
             self.label_status_msg.setText("⚠️ Keine Daten vorhanden")
         else:
             self.label_status_msg.setText(f"✅ {total} Einträge")
+
+    @Slot(dict)
+    def _on_table_settings_changed(self, settings: Dict[str, Any]) -> None:
+        """Uebernimmt TablePage-Settings in den ViewModel (19.03 Step 1/2).
+
+        Spaltenbreiten {Spaltenname: Breite} (E5), Zeilenhoehe (E9),
+        Sortier-Spalte/-Richtung (E8). Reine UI-Zustaende der TablePage:
+        set_table_settings markiert nur das Profil-Dirty-Flag (E6, Option B)
+        und loest KEINEN Query-Refresh aus (kein Debounce/Worker).
+        """
+        so = settings.get("sort_order")
+        self._vm.set_table_settings(
+            widths=settings.get("column_widths") or {},
+            row_height=int(settings.get("row_height") or 0),
+            sort_column=int(settings.get("sort_column") or 0),
+            sort_order=int(so) if so is not None else 1,
+        )
 
     @Slot(bool)
     def _on_busy_changed(self, busy: bool) -> None:

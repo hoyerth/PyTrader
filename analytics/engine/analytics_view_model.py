@@ -95,6 +95,16 @@ class AnalyticsViewModel(QObject):
             "distribution_column": "",
             "bins": DEFAULT_BINS,
             "limit": DEFAULT_LIMIT,
+            # 19.03 (Step 2): TablePage-Settings – reine UI-Zustaende ohne
+            # DB-Abfrage. Persistiert im Profil-Payload (Option B – Explicit
+            # Save); set_table_settings() markiert nur dirty (E6, kein
+            # Query-Refresh). Spaltenbreiten {Spaltenname: Breite} (E5),
+            # Zeilenhoehe als Default-Section-Size (E9), Sortier-Spalte und
+            # -Richtung als Qt-Werte (E8; 1 = DescendingOrder = Zeit absteigend).
+            "table_column_widths": {},
+            "table_row_height": 0,
+            "table_sort_column": 0,
+            "table_sort_order": 1,
         }
         self._pending_kinds: List[str] = []
         self._worker: Optional[AnalyticsAsyncWorker] = None
@@ -229,6 +239,56 @@ class AnalyticsViewModel(QObject):
             self._params["limit"] = new_limit
             self._mark_dirty()
             self._refresh((QUERY_TABLE, QUERY_SCATTER, QUERY_DISTRIBUTION))
+
+    def set_table_settings(
+        self,
+        widths: Optional[Dict[str, Any]] = None,
+        row_height: int = 0,
+        sort_column: int = 0,
+        sort_order: int = 1,
+    ) -> None:
+        """Uebernimmt TablePage-Settings (19.03 E6, ohne Query-Refresh).
+
+        Spaltenbreiten {Spaltenname: Breite} (E5), Zeilenhoehe als
+        Default-Section-Size (E9), Sortier-Spalte und -Richtung (E8).
+        Reine UI-Zustaende der TablePage: KEIN `_refresh`/Debounce/Worker
+        und keine DB-Abfrage – nur die Dirty-Markierung fuer die
+        Profil-Persistenz (Option B – Explicit Save). Typ-/Werte-
+        normalisiert; ohne tatsaechliche Aenderung idempotent (kein
+        unnötiges Dirty-Flag bei Drag-Ereignissen).
+        """
+        norm_widths: Dict[str, int] = {}
+        for k, v in (widths or {}).items():
+            try:
+                w = int(v)
+            except (TypeError, ValueError):
+                continue
+            if w > 0:
+                norm_widths[str(k)] = w
+        try:
+            rh = max(0, int(row_height))
+        except (TypeError, ValueError):
+            rh = 0
+        try:
+            sc = max(0, int(sort_column))
+        except (TypeError, ValueError):
+            sc = 0
+        try:
+            so_raw = int(sort_order)
+        except (TypeError, ValueError):
+            so_raw = 1
+        so = so_raw if so_raw in (0, 1) else 1
+
+        if (norm_widths == self._params.get("table_column_widths")
+                and rh == self._params.get("table_row_height")
+                and sc == self._params.get("table_sort_column")
+                and so == self._params.get("table_sort_order")):
+            return
+        self._params["table_column_widths"] = norm_widths
+        self._params["table_row_height"] = rh
+        self._params["table_sort_column"] = sc
+        self._params["table_sort_order"] = so
+        self._mark_dirty()
 
     def _set_param(self, key: str, value: Any, kinds: Iterable[str]) -> None:
         if self._params.get(key) == value:

@@ -28,11 +28,27 @@ Die Daten kommen ueber `data_ready(QUERY_TABLE, data)` vom ViewModel
 - Kleinere Schrift (9 pt): bei gleicher Fenstergroesse sind mehr Zeilen
   (Zeilenhoehe folgt der Schrift) und mehr Spalten (schmalere Spalten)
   sichtbar.
+
+19.03 (Resizing, In-Memory-Sorting & Profil-Persistenz):
+- Interaktives Resizing: Spaltenbreiten und Zeilenhoehen sind per
+  QHeaderView.Interactive frei anpassbar (Step 1).
+- In-Memory-Sortierung: QTableWidget-Sortierung wird NACH dem Befuellen
+  aktiviert (O(n^2)-Schutz); die Zeitspalte sortiert numerisch ueber die
+  Roh-Epoch (_SortableTimeItem, E2/E3). 19.01-E2 (deterministisch
+  absteigende Roh-Liste `_current_rows`) bleibt fuer Jump-to-Chart unveraendert.
+- Profil-Persistenz (Option B – Explicit Save): User-Aenderungen emittieren
+  `table_settings_changed` (Breiten {Name: Breite}, Zeilenhoehe, Sortierung);
+  das AnalyticsWindow reicht sie an `AnalyticsViewModel.set_table_settings()`
+  (nur Dirty, kein Query-Refresh). Beim Befuellen werden die gespeicherten
+  Settings wiederhergestellt (E1/E8/E9); Signale sind waehrenddessen blockiert
+  (E4).
+- Jump-to-Chart-Row-Mapping (E7): Der `_current_rows`-Einfuege-Index liegt im
+  UserRole+1 des Zeit-Items – unabhaengig von der Anzeige-Sortierung.
 """
 
 from typing import Any, Callable, Dict, List, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QHeaderView,
@@ -75,8 +91,35 @@ def _epoch_int(value: Any) -> Optional[int]:
         return None
 
 
+class _SortableTimeItem(QTableWidgetItem):
+    """Zeit-Spalten-Item mit numerischem Zeitvergleich (19.03 E2).
+
+    QTableWidget sortiert standardmaessig nach `__lt__` (= text()-Vergleich).
+    Das Wanduhr-Format ('Fr 31.07.26 00:01') ist lexikografisch NICHT
+    chronologisch – diese Subklasse vergleicht die Roh-Epoch aus dem
+    UserRole numerisch (Fallback auf die Text-Sortierung).
+    """
+
+    def __lt__(self, other) -> bool:
+        if isinstance(other, QTableWidgetItem):
+            try:
+                a = self.data(Qt.UserRole)
+                b = other.data(Qt.UserRole)
+                if a is not None and b is not None:
+                    return int(a) < int(b)
+            except (TypeError, ValueError):
+                pass
+        return super().__lt__(other)
+
+
 class TablePage(QWidget):
     """Feature-Store-Tabelle mit Jump-to-Chart (Doppelklick)."""
+
+    # 19.03 (Step 1): UI-Change-Signal fuer Tabellen-Settings (Spaltenbreiten
+    # {Name: Breite}, Zeilenhoehe, Sortier-Spalte/-Richtung). Wird vom
+    # AnalyticsWindow an `AnalyticsViewModel.set_table_settings()` verdrahtet
+    # (Profil-Persistenz, Option B – Explicit Save; E6: kein Query-Refresh).
+    table_settings_changed = Signal(dict)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -100,15 +143,25 @@ class TablePage(QWidget):
         # Fix 15.03 (TF-Wechsel-Haenger): KEIN ResizeToContents! Der Modus
         # berechnet bei JEDEM setItem die optimale Breite ueber ALLE Zeilen
         # (O(n^2)) – bei 5000 Zeilen blockiert das den Main-Thread minuten-
-        # lang. Stattdessen FIXE Spaltenbreiten aus _BASE_COLUMNS
-        # (deterministisch schnell, unabhaengig von der Zeilenanzahl).
+        # lang. Stattdessen deterministische Startbreiten aus _BASE_COLUMNS
+        # (setColumnWidth unten); der User kann sie seit 19.03 interaktiv
+        # anpassen (QHeaderView.Interactive, Step 1).
         header.setStretchLastSection(False)
+        # 19.03 (Step 1): Interaktives Resizing – Spaltenbreiten und
+        # Zeilenhoehen sind frei anpassbar. Die FIXEN Defaults aus
+        # _BASE_COLUMNS/_EXTRA_COLUMN_WIDTH bleiben als Startbreiten beim
+        # ersten Befuellen erhalten (siehe _populate / _get_settings_widths).
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        self._table.verticalHeader().setSectionResizeMode(
+            QHeaderView.Interactive)
         for i, (_, width) in enumerate(_BASE_COLUMNS):
-            header.setSectionResizeMode(i, QHeaderView.Fixed)
             self._table.setColumnWidth(i, width)
-        # 19.01 (E2): Interaktions-Sortierung bleibt DEAKTIVIERT – die Page
-        # zeichnet deterministisch ABSTEIGEND nach bar_time (Service-Mischung
-        # bleibt chronologisch korrekt; kein haengender O(n^2)-Sort).
+        # 19.01 (E2) + 19.03 (E3): Die Page zeichnet `_current_rows`
+        # deterministisch ABSTEIGEND nach bar_time (Service-Mischung bleibt
+        # chronologisch korrekt). Die QTableWidget-Interaktions-Sortierung
+        # (setSortingEnabled(True)) wird seit 19.03 NACH dem Befuellen
+        # aktiviert (sonst O(n^2)-Re-Sort bei jedem setItem) – sie sortiert
+        # nur die ANZEIGE, nicht die Roh-Liste (E7-Row-Mapping).
         self._table.setSortingEnabled(False)
         # 19.02 (Task 1): Kleinere Schrift – mehr Zeilen (Zeilenhoehe folgt
         # der Schrift) und mehr Spalten sichtbar bei gleicher Fenstergroesse.
@@ -118,6 +171,14 @@ class TablePage(QWidget):
         header_font = QFont(table_font)
         header_font.setBold(True)
         header.setFont(header_font)
+        # 19.03 (Step 1): UI-Change-Signale – Breiten-/Zeilen-Resize und
+        # Sortier-Indikator emittieren table_settings_changed (Persistenz).
+        # Waehrend _populate sind die Header blockiert (E4), sodass nur echte
+        # User-Aktionen emittieren.
+        header.sectionResized.connect(self._on_header_section_resized)
+        header.sortIndicatorChanged.connect(self._on_sort_indicator_changed)
+        self._table.verticalHeader().sectionResized.connect(
+            self._on_vertical_section_resized)
 
         content = QWidget(self)
         lay = QVBoxLayout(content)
@@ -198,29 +259,48 @@ class TablePage(QWidget):
 
         # Dynamischer Spaltenaufbau: Basis + Union-Keys.
         headers = [c[0] for c in _BASE_COLUMNS] + list(extra_keys)
-        widths = ([c[1] for c in _BASE_COLUMNS]
-                  + [_EXTRA_COLUMN_WIDTH] * len(extra_keys))
+        default_widths = ([c[1] for c in _BASE_COLUMNS]
+                          + [_EXTRA_COLUMN_WIDTH] * len(extra_keys))
+        header = self._table.horizontalHeader()
+        vheader = self._table.verticalHeader()
+
+        # 19.03 (E3/E4): Signale waehrend des Befuellens blockieren – sonst
+        # wuerden setColumnWidth/setSortingEnabled/sortItems als User-Aktion
+        # interpretiert und ein ungewolltes Dirty-Flag/Persistieren ausloesen.
+        # Die In-Memory-Sortierung wird erst NACH dem Befuellen aktiviert
+        # (O(n^2)-Schutz: QTableWidget sortiert sonst bei JEDEM setItem).
+        self._table.setUpdatesEnabled(False)
+        blocked = (self._table, header, vheader)
+        for w in blocked:
+            w.blockSignals(True)
+        self._table.setSortingEnabled(False)
         self._table.setColumnCount(len(headers))
         self._table.setHorizontalHeaderLabels(headers)
-        header = self._table.horizontalHeader()
         header.setStretchLastSection(False)
-        for i, w in enumerate(widths):
-            header.setSectionResizeMode(i, QHeaderView.Fixed)
-            self._table.setColumnWidth(i, w)
+        # 19.03 (Step 1/E5): Interactive + gespeicherte Profil-Breiten
+        # {Spaltenname: Breite} ueberschreiben die Defaults (fehlende neue
+        # Union-Spalten -> _BASE_COLUMNS/_EXTRA_COLUMN_WIDTH).
+        settings_widths = self._get_settings_widths()
+        for i, name in enumerate(headers):
+            header.setSectionResizeMode(i, QHeaderView.Interactive)
+            self._table.setColumnWidth(
+                i, int(settings_widths.get(name, default_widths[i])))
 
         # E3: Anzeigenamen einmalig fuer die vorliegenden Rows aufloesen.
         service_names = self._resolve_names(sorted_rows)
         extra_start = len(_BASE_COLUMNS)
 
-        self._table.setUpdatesEnabled(False)
         self._table.setRowCount(len(sorted_rows))
         for r, row in enumerate(sorted_rows):
             # Zeit: Wanduhr-Formatierung (Invariante 7) + Roh-Epoch im
-            # UserRole fuer Jump-to-Chart.
+            # UserRole fuer die numerische Sortierung (E2) + Einfuege-Index
+            # der _current_rows im UserRole+1 fuer Jump-to-Chart (E7,
+            # unabhaengig von der Anzeige-Sortierung).
             epoch = _epoch_int(row.get("time"))
-            time_item = QTableWidgetItem(format_wanduhr_time(epoch))
+            time_item = _SortableTimeItem(format_wanduhr_time(epoch))
             if epoch is not None:
                 time_item.setData(Qt.UserRole, epoch)
+            time_item.setData(Qt.UserRole + 1, r)
             self._table.setItem(r, _COL_TIME, time_item)
             # Spalte 1 = Service (feature_id bzw. Anzeigename, E3).
             self._table.setItem(r, _COL_SERVICE,
@@ -237,7 +317,113 @@ class TablePage(QWidget):
                     self._table.setItem(r, ci, QTableWidgetItem(f"{v:.4g}"))
                 else:
                     self._table.setItem(r, ci, QTableWidgetItem(str(v)))
+        # 19.03 (E3/E8/E9): In-Memory-Sortierung nach dem Befuellen aktivieren
+        # und die gespeicherten Settings (Zeilenhoehe, Sortierung) anwenden.
+        self._apply_table_settings()
         self._table.setUpdatesEnabled(True)
+        for w in blocked:
+            w.blockSignals(False)
+
+    # ------------------------------------------------------------------
+    # 19.03: Tabellen-Settings (Resizing / Sortierung / Profil-Persistenz)
+    # ------------------------------------------------------------------
+    def _on_header_section_resized(self, *args) -> None:
+        """Spaltenbreite geaendert (User) -> Settings emittieren (19.03)."""
+        self._emit_table_settings()
+
+    def _on_vertical_section_resized(self, *args) -> None:
+        """Zeilenhoehe geaendert (User) -> Settings emittieren (19.03)."""
+        self._emit_table_settings()
+
+    def _on_sort_indicator_changed(self, *args) -> None:
+        """Sortier-Indikator geaendert (User) -> Settings emittieren (19.03)."""
+        self._emit_table_settings()
+
+    def _emit_table_settings(self) -> None:
+        """Emittiert den kompletten Tabellen-Zustand (19.03 E5/E9).
+
+        Spaltenbreiten als {Header-Text: Breite} (E5 – robust gegenueber der
+        dynamischen JSON-Union), Zeilenhoehe als Hoehe der ersten Zeile bzw.
+        Default-Section-Size (E9, ein Wert fuer alle Zeilen), Sortier-Spalte
+        und -Richtung als Qt-Werte (E8 – Validierung beim Anwenden).
+        """
+        widths: Dict[str, int] = {}
+        header = self._table.horizontalHeader()
+        for i in range(self._table.columnCount()):
+            item = self._table.horizontalHeaderItem(i)
+            if item is not None:
+                widths[str(item.text())] = int(header.sectionSize(i))
+        vheader = self._table.verticalHeader()
+        row_height = int(vheader.defaultSectionSize())
+        if self._table.rowCount() > 0:
+            row_height = int(vheader.sectionSize(0))
+        sort_col = int(header.sortIndicatorSection())
+        if sort_col < 0:
+            sort_col = 0
+        # PySide6: sortIndicatorOrder() liefert den Qt.SortOrder-Enum (nicht
+        # direkt int-konvertierbar) – robust ueber den Enum-Vergleich mappen.
+        order = header.sortIndicatorOrder()
+        self.table_settings_changed.emit({
+            "column_widths": widths,
+            "row_height": row_height,
+            "sort_column": sort_col,
+            "sort_order": 1 if order == Qt.DescendingOrder else 0,
+        })
+
+    def _get_settings_widths(self) -> Dict[str, int]:
+        """Gespeicherte Spaltenbreiten aus dem ViewModel (19.03 E5).
+
+        {Spaltenname: Breite} – robust gegenueber der dynamischen JSON-Union
+        (fehlende neue Spalten fallen auf _BASE_COLUMNS/_EXTRA_COLUMN_WIDTH
+        zurueck). Defensiv: ohne ViewModel/leer -> {}.
+        """
+        if self._view_model is None:
+            return {}
+        raw = self._view_model.params.get("table_column_widths") or {}
+        out: Dict[str, int] = {}
+        for k, v in raw.items():
+            try:
+                w = int(v)
+            except (TypeError, ValueError):
+                continue
+            if w > 0:
+                out[str(k)] = w
+        return out
+
+    def _apply_table_settings(self) -> None:
+        """Wendet die gespeicherten Tabellen-Settings an (19.03 E3/E8/E9).
+
+        Wird am Ende von _populate gerufen (Header-Signale sind blockiert):
+        Zeilenhoehe (Default-Section-Size, E9) und Sortier-Spalte/-Richtung
+        (validiert, E8). Spaltenbreiten uebernimmt bereits der Spaltenaufbau
+        aus _get_settings_widths(). Ohne ViewModel (z. B. Headless-Tests)
+        bleibt die Sortierung deaktiviert – Settings gibt es nicht.
+        """
+        if self._view_model is None:
+            return
+        params = self._view_model.params
+        # Zeilenhoehe (E9): eine Default-Hoehe fuer alle Zeilen.
+        try:
+            row_height = int(params.get("table_row_height") or 0)
+        except (TypeError, ValueError):
+            row_height = 0
+        if row_height > 0:
+            self._table.verticalHeader().setDefaultSectionSize(row_height)
+        # Sortierung (E8): Spalten-Index validieren, Order auf Qt-Werte klemmen.
+        try:
+            sort_col = int(params.get("table_sort_column") or 0)
+        except (TypeError, ValueError):
+            sort_col = 0
+        try:
+            sort_order = int(params.get("table_sort_order") or 1)
+        except (TypeError, ValueError):
+            sort_order = 1
+        sort_order = (Qt.DescendingOrder if sort_order
+                      else Qt.AscendingOrder)
+        if not (0 <= sort_col < self._table.columnCount()):
+            sort_col = 0
+        self._table.setSortingEnabled(True)
+        self._table.sortItems(sort_col, sort_order)
 
     # ------------------------------------------------------------------
     # 19.01 Step 2: Helfer (JSON-Union, Namensaufloesung)
@@ -294,14 +480,27 @@ class TablePage(QWidget):
     # Jump-to-Chart (Variante 2)
     # ------------------------------------------------------------------
     def _on_double_clicked(self, item: QTableWidgetItem) -> None:
-        row = item.row()
-        if row < 0 or self._navigation_handler is None:
+        if item is None or self._navigation_handler is None:
             return
-        if row >= len(self._current_rows):
+        # 19.03 (E7): Bei aktiver QTableWidget-Sortierung entspricht die
+        # Anzeige-Zeile nicht mehr der _current_rows-Reihenfolge – der
+        # Roh-Row-Index wird stattdessen aus dem UserRole+1 des Zeit-Items
+        # aufgeloest (unabhaengig von der Anzeige-Sortierung).
+        time_item = self._table.item(item.row(), _COL_TIME)
+        if time_item is None:
+            return
+        row_index = time_item.data(Qt.UserRole + 1)
+        if row_index is None:
+            return
+        try:
+            row_index = int(row_index)
+        except (TypeError, ValueError):
+            return
+        if not (0 <= row_index < len(self._current_rows)):
             return
         # 19.01: Symbol/TF/Zeit kommen aus der Roh-Row (nicht aus festen
         # Spaltenpositionen – die Spalten sind jetzt dynamisch).
-        row_data = self._current_rows[row]
+        row_data = self._current_rows[row_index]
         symbol = row_data.get("symbol")
         tf = row_data.get("timeframe")
         bar_time = row_data.get("time")
