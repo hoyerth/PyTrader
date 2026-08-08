@@ -550,7 +550,17 @@ class ServiceParamColumnsMixin:
         scroll = getattr(self, "_param_scroll", None)
         if scroll is not None:
             scroll.updateGeometry()
-        self._reflow()
+        # 08.08.2026 (Bugfix): KEIN self._reflow() – der volle Reflow
+        # (_schedule_reflow -> _apply_reflow_size -> resize_to_clamped_
+        # content, _exact_fit_to_content) wuerde die FENSTERHOEHE an die neue
+        # Spaltenhoehe anpassen und damit Canvas + Fenster bei jedem Set-/
+        # Service-Klick versetzen (User-Anweisung: Hoehe fix, vgl.
+        # _apply_conditional_visibility/_setup_collapsible, 07.08.2026).
+        # Gewuenscht: NUR die Service-Parameter-Box wird auf ihre Layout-
+        # Groesse gesetzt; ist sie zu hoch, zeigt die ContentScrollArea
+        # (_param_scroll) Scrollbalken. Der initiale Fensteraufbau (show)
+        # setzt die Groesse weiterhin ueber _apply_reflow_size.
+        QTimer.singleShot(0, self._resize_param_box_deferred)
 
     def _build_service_column(self, iid: str, pid: str, cfg: Dict[str, Any]) -> QGroupBox:
         """Erzeugt EINE Service-Spalte (QGroupBox) mit Parameter-Formular.

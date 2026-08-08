@@ -330,14 +330,15 @@ class ServiceSelectorDialog(QDialog):
         self.setWindowTitle("Datenquellen auswählen")
         self.resize(980, 600)
         self.setMinimumWidth(760)
-        # 08.08.2026 (Bugfix, ServiceWindow-Muster 07.08.2026): QDialog-Default
-        # (SetDefaultConstraint) setzt die Fenstergroesse beim show() auf den
-        # Layout-sizeHint – das wuerde die Hoehe an die Parameter-Spalten
-        # klemmen. SetNoConstraint haelt die Fenstergroesse FIX; bei
-        # Ueberhoehe zeigt die ScrollArea Scrollbalken.
-        self.setSizeConstraint(QLayout.SetNoConstraint)
-
         root = QVBoxLayout(self)
+        # 08.08.2026 (Bugfix): `setSizeConstraint` ist eine QLayout-Methode,
+        # KEIN QWidget-Attribut – der fruehere self.setSizeConstraint(...)-
+        # Aufruf crashte beim Oeffnen des Pickers (AttributeError). Der
+        # QDialog-Default (SetDefaultConstraint) wuerde die Fenstergroesse
+        # beim show() auf den Layout-sizeHint setzen (Hoehe an die Parameter-
+        # Spalten geklemmt); SetNoConstraint haelt die Fenstergroesse FIX,
+        # bei Ueberhoehe zeigt die ScrollArea Scrollbalken.
+        root.setSizeConstraint(QLayout.SetNoConstraint)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 
