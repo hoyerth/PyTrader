@@ -68,13 +68,21 @@ Bugfix-Runde 06.08.2026 (User-Anweisung, Punkte 1-4):
 
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import Qt, Signal, Slot
+from PySide6.QtCore import (
+    QCoreApplication,
+    QEvent,
+    Qt,
+    QTimer,
+    Signal,
+    Slot,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLayout,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -154,6 +162,23 @@ class _DialogParamHost(ServiceParamColumnsMixin):
     def _schedule_reflow(self) -> None:
         """Kein Fenster-Reflow (Param-Panel skaliert nicht)."""
         pass
+
+    def _resize_param_box_deferred(self) -> None:
+        """08.08.2026 (Bugfix): Dialog-Variante statt ServiceWindow-No-op.
+
+        `_setup_collapsible` (Experten-Optionen) und
+        `_apply_conditional_visibility` (Mode-Wechsel) rufen diese Methode
+        nach Aenderungen der Spaltenhoehe. Hier wird der Param-Container des
+        Dialogs auf seine Layout-Groesse nachgezogen – die ScrollArea zeigt
+        bei Ueberhoehe Scrollbalken, die Dialog-Fensterhoehe bleibt FIX
+        (ServiceWindow-Muster 07.08.2026).
+        """
+        dlg = getattr(self, "_dialog", None)
+        if dlg is not None:
+            try:
+                dlg._resize_param_container_deferred()
+            except (RuntimeError, AttributeError):
+                pass
 
     def _set_param_actions_visible(self, visible: bool) -> None:
         """Blendet den Speichern-Button des Dialogs ein/aus (Dirty-State)."""
@@ -305,6 +330,12 @@ class ServiceSelectorDialog(QDialog):
         self.setWindowTitle("Datenquellen auswählen")
         self.resize(980, 600)
         self.setMinimumWidth(760)
+        # 08.08.2026 (Bugfix, ServiceWindow-Muster 07.08.2026): QDialog-Default
+        # (SetDefaultConstraint) setzt die Fenstergroesse beim show() auf den
+        # Layout-sizeHint – das wuerde die Hoehe an die Parameter-Spalten
+        # klemmen. SetNoConstraint haelt die Fenstergroesse FIX; bei
+        # Ueberhoehe zeigt die ScrollArea Scrollbalken.
+        self.setSizeConstraint(QLayout.SetNoConstraint)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -332,9 +363,18 @@ class ServiceSelectorDialog(QDialog):
             QLabel("Service-Parameter (Read-Only):"))
         self.param_panel = panel  # 06.08.2026: feste Breite auf dem PANEL-WIDGET
         self.param_scroll = QScrollArea(panel)
-        self.param_scroll.setWidgetResizable(True)
+        # 08.08.2026 (Bugfix, ServiceWindow-Muster 07.08.2026): widgetResizable
+        # False – der Param-Container behaelt seine NATUERLICHE Groesse
+        # (wird nach jedem Panel-Aufbau explizit auf layout().sizeHint()
+        # gesetzt, _resize_param_container_deferred). Wird er groesser als
+        # der Viewport (viele/hohe Parameter), zeigt die ScrollArea vertikale
+        # Scrollbalken – die Dialog-Fensterhoehe bleibt FIX (keine
+        # Hoehen-Anpassung an den Parameter-Inhalt).
+        self.param_scroll.setWidgetResizable(False)
         # Punkt 2: bei mehr als 2 Spalten horizontale Scrollbar (AsNeeded).
         self.param_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # 08.08.2026 (Bugfix): auch vertikal Scrollbalken bei Ueberhoehe.
+        self.param_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.param_container = QWidget()
         # Punkt 1: Service-Spalten horizontal nebeneinander (QHBoxLayout).
         self.param_box_layout = QHBoxLayout(self.param_container)
@@ -391,6 +431,10 @@ class ServiceSelectorDialog(QDialog):
         self.model.data_changed.connect(self._on_model_data_changed)
         # 18.01.01: Der Host blendet den Speichern-Button des Dialogs ein.
         self._param_host.btn_save_params = self.btn_save_params
+        # 08.08.2026 (Bugfix): Host kann den Param-Container nachziehen
+        # (Mode-Wechsel/Experten-Kollaps rufen _resize_param_box_deferred)
+        # – kein Fenster-Reflow, nur Container-Resize (Scrollbalken).
+        self._param_host._dialog = self
 
         # Punkt 4: Letzte Position/Groesse wiederherstellen.
         self._restore_geometry()
@@ -831,6 +875,9 @@ class ServiceSelectorDialog(QDialog):
             # den freien Platz auf – der Hinweis behaelt seine Default-Breite.
             self.param_box_layout.addStretch(1)
             self._apply_panel_size(0)
+            # 08.08.2026 (Bugfix): Container auf Layout-Groesse nachziehen
+            # (Scrollbalken statt Fensterhoehen-Anpassung).
+            QTimer.singleShot(0, self._resize_param_container_deferred)
             return
         for entry in entries:
             pid = str(entry.get("plugin_id") or "")
@@ -875,6 +922,9 @@ class ServiceSelectorDialog(QDialog):
         # Stretch (Faktor 1) absorbiert den gesamten freien Platz.
         self.param_box_layout.addStretch(1)
         self._apply_panel_size(len(entries))
+        # 08.08.2026 (Bugfix): Container auf Layout-Groesse nachziehen –
+        # ScrollArea zeigt Scrollbalken statt Fensterhoehen-Anpassung.
+        QTimer.singleShot(0, self._resize_param_container_deferred)
 
     def _apply_panel_size(self, col_count: int) -> None:
         """Punkt 2+3: Panel-MINIMUM-Breite (Default: ZWEI Spalten).
@@ -916,6 +966,32 @@ class ServiceSelectorDialog(QDialog):
         self.param_container.setMinimumWidth(max(total_w, panel_w))
         # Punkt 3: Fensterbreite exakt bis zur rechten Kante der Parameter-Box.
         self._fit_dialog_width()
+
+    def _resize_param_container_deferred(self) -> None:
+        """Setzt den Param-Container auf seine Layout-Groesse (Scrollbar).
+
+        08.08.2026 (Bugfix, ServiceWindow-Muster 07.08.2026): Bei
+        widgetResizable=False behaelt der Container seine natuerliche
+        Groesse (hier: layout().sizeHint()). Wird er groesser als der
+        Viewport (viele/hohe Parameter), zeigt die ScrollArea vertikale
+        Scrollbalken – die Dialog-Fensterhoehe bleibt FIX. Deferred (nach
+        deleteLater der Alt-Spalten), damit der sizeHint nicht veraltet
+        gelesen wird (QWidgetItemV2-Cache, Muster
+        `_resize_param_box_deferred` in param_columns.py).
+        """
+        try:
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        except (RuntimeError, AttributeError):
+            pass
+        try:
+            lay = self.param_container.layout()
+            if lay is None:
+                return
+            self.param_container.updateGeometry()
+            self.param_container.resize(lay.sizeHint())
+            self.param_scroll.updateGeometry()
+        except (RuntimeError, AttributeError):
+            pass
 
     def _fit_dialog_width(self) -> None:
         """Punkt 3: Fensterbreite == rechte Kante der Parameter-Box.
