@@ -428,12 +428,15 @@ class ServiceSelectorDialog(QDialog):
             tree.remove_service_requested.connect(self._on_remove_service)
             # 18.01.03 (Dynamic Tree Management): Kategorie-Drag&Drop &
             # Ordner-CRUD im Picker (Manager-Window) – Sets/Plugins/Ordner
-            # ziehen (folder_item_moved/folder_moved) und 'Umbenennen'
-            # (rename_folder_requested) werden hier persistiert; 'Neuer
-            # Ordner' ist ein reiner UI-Zustand im Baum (K9/E3).
+            # ziehen (folder_item_moved/folder_moved), 'Neuer Ordner' (wird
+            # PERSISTIERT, E3-revidiert 08.08.2026), 'Umbenennen'
+            # (rename_folder_requested) und 'Ordner löschen' (manuelle
+            # Loeschung) werden hier persistiert.
             tree.folder_item_moved.connect(self._on_folder_item_moved)
             tree.folder_moved.connect(self._on_folder_moved)
             tree.rename_folder_requested.connect(self._on_rename_folder)
+            tree.create_folder_requested.connect(self._on_create_folder)
+            tree.delete_folder_requested.connect(self._on_delete_folder)
         # Live-Sync: Modell-Refresh (EventBus -> data_changed) baut den Baum
         # neu; das Panel wird mit dem zuletzt geklickten Scope nachgezogen.
         self.model.data_changed.connect(self._on_model_data_changed)
@@ -748,6 +751,37 @@ class ServiceSelectorDialog(QDialog):
         if not ok:
             print(f"WARN [ServiceSelectorDialog] Kategorie-Verschiebung "
                   f"fehlgeschlagen ({node_type} '{item_id}').")
+            return
+        event_bus.service_set_changed.emit()
+
+    @Slot(str, str)
+    def _on_create_folder(self, group: str, full_path: str) -> None:
+        """Kontextmenue 'Neuer Ordner' (create_folder_requested).
+
+        18.01.03 (E3-revidiert, 08.08.2026): Persistiert den
+        benutzererzeugten (ggf. leeren) Ordner ueber global_settings
+        (service_set_utils.create_empty_folder, Key 'tree_folders_<group>')
+        und emittiert den EventBus. Leere Ordner verschwinden damit NICHT
+        beim Refresh, sondern nur bei manueller Loeschung.
+        """
+        from serviceui.service_set_utils import create_empty_folder
+        if not create_empty_folder(self._state_manager,
+                                   str(group or ""), full_path):
+            return
+        event_bus.service_set_changed.emit()
+
+    @Slot(str, str)
+    def _on_delete_folder(self, group: str, path: str) -> None:
+        """Kontextmenue 'Ordner löschen' (delete_folder_requested).
+
+        18.01.03 (E3-revidiert): Entfernt den persistierten Ordner-Eintrag
+        (service_set_utils.delete_empty_folder, Key 'tree_folders_<group>')
+        und emittiert den EventBus. Der MasterTree erlaubt die Aktion nur
+        fuer Ordner ohne Kinder; Kinder bleiben unangetastet.
+        """
+        from serviceui.service_set_utils import delete_empty_folder
+        if not delete_empty_folder(self._state_manager,
+                                   str(group or ""), path):
             return
         event_bus.service_set_changed.emit()
 

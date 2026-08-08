@@ -142,6 +142,13 @@ class ServiceSelectorModel(QObject):
         # metadata-Feld. Wird in refresh() einmalig geladen und von
         # _category_parts() ausgewertet (kein DB-Zugriff im Baum-Aufbau).
         self._plugin_category_overrides: Dict[str, str] = {}
+        # 18.01.03 (E3-revidiert, 08.08.2026): Persistierte benutzererzeugte
+        # (ggf. leere) Ordner je Gruppe (global_settings, Key
+        # 'tree_folders_<group>'). Wird in refresh() geladen und in
+        # build_tree() in die Gruppen-Kinder eingemischt – leere Ordner
+        # verschwinden damit NICHT beim Refresh, sondern nur bei manueller
+        # Loeschung (Kontextmenue 'Ordner löschen').
+        self._empty_folder_paths: Dict[str, List[str]] = {}
 
         # Initialbefuellung + Live-Sync (schwellenfrei via EventBus)
         self.refresh()
@@ -168,7 +175,48 @@ class ServiceSelectorModel(QObject):
         # einmalig pro Refresh, damit _category_parts() ohne DB-Zugriff
         # auswertet (Baum-Aufbau bleibt rein lesend aus dem RAM).
         self._plugin_category_overrides = self._load_plugin_category_overrides()
+        # 18.01.03 (E3-revidiert): Persistierte benutzererzeugte Ordner je
+        # Gruppe laden (tree_folders_<group>); build_tree() mischt sie in
+        # die Gruppen-Kinder ein (leere Ordner bleiben ueber Refreshs).
+        self._empty_folder_paths = self._load_empty_folders()
         self.data_changed.emit()
+
+    def _load_empty_folders(self) -> Dict[str, List[str]]:
+        """Liest die persistierten benutzererzeugten Ordner je Gruppe.
+
+        Quelle: global_settings (Key 'tree_folders_<group>' aus
+        service_set_utils, 18.01.03 E3-revidiert). Liefert pro Gruppe eine
+        deduplizierte Liste Slash-Pfade OHNE '📁 '-Praefix (z.B.
+        ['Swing Points', 'Swing Points/Geometrie']). Defensiv: Fehler -> leer.
+        """
+        try:
+            from serviceui.service_set_utils import EMPTY_FOLDERS_KEY
+        except Exception:
+            EMPTY_FOLDERS_KEY = "tree_folders_{}"
+        result: Dict[str, List[str]] = {}
+        for group in (self.GROUP_SETS, self.GROUP_PLUGINS):
+            paths: List[str] = []
+            try:
+                raw = self.state_manager.get_global_value(
+                    EMPTY_FOLDERS_KEY.format(group), [])
+                if isinstance(raw, list):
+                    for p in raw:
+                        p = str(p or "").strip().strip("/")
+                        if p and p not in paths:
+                            paths.append(p)
+            except Exception as e:
+                print(f"WARN [ServiceSelectorModel] Leere-Ordner der Gruppe "
+                      f"'{group}' nicht lesbar: {e}")
+            result[group] = paths
+        return result
+
+    def empty_folder_paths(self, group: str) -> List[str]:
+        """Persistierte benutzererzeugte Ordner-Pfade einer Gruppe (lesend).
+
+        Gruppe 'sets' oder 'plugins' (GROUP_SETS/GROUP_PLUGINS); unbekannte
+        Gruppen -> [] (defensiv). Rein lesend aus dem Refresh-Zustand.
+        """
+        return list(self._empty_folder_paths.get(str(group or ""), []) or [])
 
     def _load_plugin_category_overrides(self) -> Dict[str, str]:
         """Liest die Kategorie-Overrides aller Plugins aus global_settings.
@@ -578,6 +626,32 @@ class ServiceSelectorModel(QObject):
         self._insert_set_into_category_tree(folder["children"], parts[1:],
                                             leaf)
 
+    def _ensure_category_path(self, nodes: List[Dict[str, Any]],
+                              parts: List[str]) -> None:
+        """Stellt sicher, dass die Ordnerkette fuer `parts` existiert
+        (18.01.03, E3-revidiert).
+
+        Erzeugt fehlende Ordner entlang des Pfads OHNE Blatt-Einfuegung
+        (K2-Format '📁 <Name>', children leer). Dient der Einmischung
+        persistierter benutzererzeugter (ggf. leerer) Ordner in build_tree():
+        Ein bereits vorhandener Ordner (aus echten Blatt-Kategorien) wird
+        wiederverwendet – kein Duplikat, keine Kinder-Aenderung.
+        """
+        if not parts:
+            return
+        key = self._cat_key(parts[0])
+        folder = None
+        for n in nodes:
+            if (n.get("group") == self.GROUP_CATEGORY
+                    and self._cat_key(n.get("label")) == key):
+                folder = n
+                break
+        if folder is None:
+            folder = {"group": self.GROUP_CATEGORY,
+                      "label": f"📁 {parts[0]}", "children": []}
+            nodes.append(folder)
+        self._ensure_category_path(folder["children"], parts[1:])
+
     def category_set_ids(self, category_path: str) -> List[str]:
         """Alle set_ids unter einem Kategorie-Pfad (rekursiv, 18.01.03).
 
@@ -689,7 +763,11 @@ class ServiceSelectorModel(QObject):
         Mechanik auch fuer die Sets-Gruppe: Set-Definitionen mit dem
         optionalen Feld `category` werden in identische Ordner-Dicts
         einsortiert (K2/K8/K9 analog), Sets ohne Kategorie bleiben flache
-        Blaetter auf oberster Ebene.
+        Blaetter auf oberster Ebene. Seit 18.01.03 (E3-revidiert) werden
+        zusaetzlich benutzererzeugte (ggf. leere) Ordner aus global_settings
+        (Key 'tree_folders_<group>') in die Gruppen-Kinder eingemischt –
+        leere Ordner bleiben dadurch ueber Refreshs erhalten und
+        verschwinden NUR bei manueller Loeschung im Kontextmenue.
         """
         sets = sorted(self._sets,
                       key=lambda s: str(s.get("display_name") or s.get("set_id") or "").lower())
@@ -729,6 +807,21 @@ class ServiceSelectorModel(QObject):
         # (K1), ohne Kategorie bleiben sie flache Blaetter auf oberster Ebene.
         # Die fruehere Standalone-Gruppe (separate Knoten) ist entfallen.
         plugin_nodes = self._category_nodes(sorted(self.get_plugins().keys()))
+
+        # 18.01.03 (E3-revidiert): Persistierte benutzererzeugte (ggf. leere)
+        # Ordner in die Gruppen-Kinder einmischen – leere Ordner verschwinden
+        # damit NICHT beim Refresh, sondern nur bei manueller Loeschung
+        # (Kontextmenue 'Ordner löschen'). Bereits vorhandene Ordner (aus
+        # echten Blatt-Kategorien) werden wiederverwendet (kein Duplikat).
+        for group, nodes in ((self.GROUP_SETS, set_nodes),
+                             (self.GROUP_PLUGINS, plugin_nodes)):
+            for path in self._empty_folder_paths.get(group, []) or []:
+                parts = [p.strip() for p in str(path or "").split("/")
+                         if p.strip()]
+                if parts:
+                    self._ensure_category_path(nodes, parts)
+        set_nodes = self._sort_category_nodes(set_nodes)
+        plugin_nodes = self._sort_category_nodes(plugin_nodes)
 
         return [
             {"group": self.GROUP_SETS, "label": "📁 Sets",

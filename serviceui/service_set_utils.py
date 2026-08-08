@@ -14,6 +14,15 @@ from typing import Any, Dict, List, Optional
 # dem Parameter-Preset vorbehalten; siehe Entscheidung E1 im Prüfprotokoll).
 PLUGIN_CATEGORY_KEY = "plugin_category_{}"
 
+# 18.01.03 (E3-revidiert, Bugfixing-Modus 08.08.2026): Persistenz leerer
+# Ordner. Der Benutzer hat E3 widerrufen – leere Ordner duerfen NICHT beim
+# naechsten Refresh verschwinden, sondern NUR bei manueller Loeschung im
+# Kontextmenue. Dafuer werden die Pfade benutzererzeugter Ordner je Gruppe
+# in global_settings persistiert (Key 'tree_folders_<group>', Wert =
+# Liste Slash-Pfade OHNE '📁 '-Praefix). Das ServiceSelectorModel mischt
+# sie in build_tree() ein; create/delete laufen ueber diese Helfer.
+EMPTY_FOLDERS_KEY = "tree_folders_{}"
+
 
 def set_set_category(set_repo, set_id: str, category_path: str) -> bool:
     """Setzt den Kategorie-Pfad eines Service-Sets (18.01.03, E2).
@@ -71,6 +80,96 @@ def set_plugin_category(state_manager, plugin_id: str,
               f"nicht gespeichert: {e}")
         return False
     return True
+
+
+def list_empty_folders(state_manager, group: str) -> List[str]:
+    """Alle persistierten Pfade benutzererzeugter leerer Ordner einer Gruppe.
+
+    Quelle: global_settings (Key 'tree_folders_<group>', 18.01.03 E3-
+    revidiert). Liefert eine deduplizierte Liste Slash-Pfade OHNE
+    '📁 '-Praefix (z.B. ['Swing Points', 'Swing Points/Geometrie']);
+    Fehler -> [] (defensiv).
+    """
+    if state_manager is None:
+        return []
+    try:
+        raw = state_manager.get_global_value(
+            EMPTY_FOLDERS_KEY.format(str(group or "").strip()), [])
+    except Exception as e:
+        print(f"WARN [service_set_utils] Leere-Ordner-Liste der Gruppe "
+              f"'{group}' nicht lesbar: {e}")
+        return []
+    result: List[str] = []
+    if isinstance(raw, list):
+        for p in raw:
+            p = str(p or "").strip().strip("/")
+            if p and p not in result:
+                result.append(p)
+    return result
+
+
+def save_empty_folders(state_manager, group: str, paths) -> bool:
+    """Persistiert die Leere-Ordner-Liste einer Gruppe (Upsert).
+
+    Returns:
+        True bei Erfolg.
+    """
+    if state_manager is None:
+        return False
+    cleaned: List[str] = []
+    for p in paths or []:
+        p = str(p or "").strip().strip("/")
+        if p and p not in cleaned:
+            cleaned.append(p)
+    try:
+        state_manager.save_global_value(
+            EMPTY_FOLDERS_KEY.format(str(group or "").strip()), cleaned)
+    except Exception as e:
+        print(f"WARN [service_set_utils] Leere-Ordner-Liste der Gruppe "
+              f"'{group}' nicht speicherbar: {e}")
+        return False
+    return True
+
+
+def create_empty_folder(state_manager, group: str, path: str) -> bool:
+    """Registriert einen benutzererzeugten (ggf. leeren) Ordner.
+
+    Haengt den Slash-Pfad an die Leere-Ordner-Liste der Gruppe an
+    (idempotent – bereits vorhandene Pfade werden nicht dupliziert). Das
+    Modell rendert den Ordner daraufhin dauerhaft (auch ohne Kinder), bis
+    er manuell ueber delete_empty_folder() entfernt wird.
+
+    Returns:
+        True, wenn der Pfad (neu) persistiert wurde.
+    """
+    path = str(path or "").strip().strip("/")
+    if not path:
+        return False
+    paths = list_empty_folders(state_manager, group)
+    if path in paths:
+        return False
+    paths.append(path)
+    return save_empty_folders(state_manager, group, paths)
+
+
+def delete_empty_folder(state_manager, group: str, path: str) -> bool:
+    """Entfernt einen benutzererzeugten Ordner (manuelle Loeschung).
+
+    Loescht NUR den persistierten Ordner-Eintrag der Gruppe; Kinder
+    (falls vorhanden) bleiben unangetastet. Die UI erlaubt die Loeschung
+    nur fuer Ordner ohne Kinder (MasterTree-Guard).
+
+    Returns:
+        True, wenn der Pfad vorhanden war und entfernt wurde.
+    """
+    path = str(path or "").strip().strip("/")
+    if not path:
+        return False
+    paths = list_empty_folders(state_manager, group)
+    if path not in paths:
+        return False
+    paths.remove(path)
+    return save_empty_folders(state_manager, group, paths)
 
 
 def _replace_prefix(path: str, old_path: str, new_path: str) -> str:
@@ -132,6 +231,24 @@ def rename_category(model, set_repo, state_manager, group: str,
                 if updated != current and set_plugin_category(
                         state_manager, pid, updated):
                     count += 1
+        # 18.01.03 (E3-revidiert): Auch persistierte leere Ordner der Gruppe
+        # umziehen (Praefix-Replace auf die 'tree_folders_<group>'-Liste),
+        # damit benutzererzeugte Ordner ihren Platz behalten.
+        try:
+            empty_paths = list_empty_folders(state_manager, group)
+            if empty_paths:
+                updated_paths = [
+                    _replace_prefix(p, old_path, new_path)
+                    for p in empty_paths]
+                if updated_paths != empty_paths:
+                    if save_empty_folders(state_manager, group,
+                                          updated_paths):
+                        count += sum(1 for a, b in zip(empty_paths,
+                                                       updated_paths)
+                                     if a != b)
+        except Exception as e:
+            print(f"WARN [service_set_utils] Leere-Ordner-Rename "
+                  f"'{old_path}' -> '{new_path}' fehlgeschlagen: {e}")
     except Exception as e:
         print(f"WARN [service_set_utils] Ordner-Rename '{old_path}' -> "
               f"'{new_path}' fehlgeschlagen: {e}")

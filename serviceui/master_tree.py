@@ -226,17 +226,23 @@ class MasterTree(QTreeWidget):
     run_category_requested = Signal(str, str)
     category_info_requested = Signal(str, str)
     # 18.01.03 (Dynamic Tree Management): Ordner-CRUD & Kategorie-Drag&Drop.
-    #   create_folder_requested(group, parent_path) – 'Neuer Ordner' (der
-    #       MasterTree zeigt den Namensdialog und haelt den Ordner als
-    #       UI-Zustand; der Orchestrator benoetigt KEINE Persistenz, da
-    #       leere Ordner nicht gespeichert werden – K9/E3).
+    #   create_folder_requested(group, full_path) – 'Neuer Ordner' (der
+    #       MasterTree zeigt den Namensdialog; der Orchestrator PERSISTIERT
+    #       den Ordner ueber global_settings (tree_folders_<group>,
+    #       service_set_utils.create_empty_folder) – E3-revidiert
+    #       08.08.2026: Leere Ordner verschwinden NICHT beim Refresh).
+    #   delete_folder_requested(group, path) – 'Ordner löschen' (manuelle
+    #       Loeschung; der Orchestrator entfernt den Eintrag ueber
+    #       service_set_utils.delete_empty_folder).
     #   rename_folder_requested(group, old_path, new_path) – 'Umbenennen'
-    #       (String-Replace aller Kinder im Orchestrator).
+    #       (String-Replace aller Kinder + persistierter Leere-Ordner im
+    #       Orchestrator).
     #   folder_item_moved(node_type, item_id, new_path) – Drop eines Sets
     #       (TYPE_SET) bzw. Plugins (TYPE_PLUGIN) in einen Ziel-Ordner.
     #   folder_moved(group, old_path, new_path) – Drop eines Ordners auf
     #       einen anderen Ordner (verschiebt alle Kinder rekursiv).
     create_folder_requested = Signal(str, str)
+    delete_folder_requested = Signal(str, str)
     rename_folder_requested = Signal(str, str, str)
     folder_item_moved = Signal(str, str, str)
     folder_moved = Signal(str, str, str)
@@ -311,11 +317,6 @@ class MasterTree(QTreeWidget):
         #: Beim Mausklick gemerktes Item – Quelle eines beginnenden Drags
         #: (mousePressEvent -> startDrag).
         self._drag_source: Optional[QTreeWidgetItem] = None
-        #: UI-Zustand 'Neuer Ordner' (K9/E3): (group, voller Pfad) eines
-        #: noch LEEREN Ordners. Er wird im Baum gerendert (_ensure_pending_
-        #: folder), aber NICHT persistiert – sobald ein Item hineingezogen
-        #: wird (oder der Baum refresht), verschwindet er wieder.
-        self._pending_folder: Optional[tuple] = None
 
         self._populate()
         self.itemSelectionChanged.connect(self._emit_selection)
@@ -384,9 +385,10 @@ class MasterTree(QTreeWidget):
                 self._apply_dirty_label(iid, True)
         finally:
             self._updating_checks = False
-        # 18.01.03: UI-Zustand 'Neuer Ordner' nach dem Neuaufbau wieder
-        # anhaengen (leere Ordner sind nicht persistiert – K9/E3).
-        self._ensure_pending_folder()
+        # 18.01.03 (E3-revidiert): Leere Ordner kommen jetzt aus dem Modell
+        # (build_tree mischt die persistierten tree_folders_<group>-Pfade
+        # ein) – ein separater UI-Zustand ist nicht mehr noetig.
+        pass
 
     def _safe_current_selection(self) -> Dict[str, str]:
         """Liess die aktuelle Auswahl defensiv (isValid-Guard gegen zerstoerte
@@ -438,7 +440,8 @@ class MasterTree(QTreeWidget):
         ItemIsUserCheckable). Die Selektion liefert fuer Ordner den
         Default-Pfad zurueck (K7).
         """
-        label = _expandable_label(str(child.get("label") or "?"), True, False)
+        label = _expandable_label(str(child.get("label") or "?"),
+                                  bool(child.get("children")), False)
         cat_item = QTreeWidgetItem([label, ""])
         cat_item.setData(0, ROLE_NODE_TYPE, TYPE_CATEGORY)
         cat_item.setData(0, ROLE_SET_ID, str(child.get("label") or ""))
@@ -763,19 +766,16 @@ class MasterTree(QTreeWidget):
         if source_type in (TYPE_SET, TYPE_PLUGIN) and source_id:
             self.folder_item_moved.emit(source_type, source_id, target_path)
         event.accept()
-        # 18.01.03 (E3): Ein Item ist in den pending-Ordner gezogen worden –
-        # der UI-Zustand kann aufgeloest werden (der Ordner ist jetzt durch
-        # das Item real persistiert).
-        self._pending_folder = None
 
     def _on_new_folder(self, group: str, parent_path: str) -> None:
-        """Kontextmenue 'Neuer Ordner' (18.01.03, E3).
+        """Kontextmenue 'Neuer Ordner' (18.01.03, E3-revidiert).
 
-        Fragt den Namen ab und haelt den neuen LEEREN Ordner als UI-Zustand
-        (self._pending_folder) im Baum – eine Persistenz gibt es fuer leere
-        Ordner bewusst NICHT (K9/E3): Sobald ein Item hineingezogen wird,
-        wird der Pfad ueber die Repositories real; ein leerer Ordner
-        verschwindet beim naechsten Modell-Refresh.
+        Fragt den Namen ab und emittiert `create_folder_requested(group,
+        full_path)` – der Orchestrator PERSISTIERT den (ggf. leeren) Ordner
+        ueber global_settings (service_set_utils.create_empty_folder,
+        Key 'tree_folders_<group>'). Damit bleibt der Ordner ueber Refreshs
+        erhalten und verschwindet nur bei manueller Loeschung im
+        Kontextmenue ('Ordner löschen').
         """
         name, ok = QInputDialog.getText(
             self, "Neuer Ordner", "Ordner-Name:")
@@ -784,8 +784,7 @@ class MasterTree(QTreeWidget):
             return
         parent_path = str(parent_path or "").strip().strip("/")
         full_path = f"{parent_path}/{name}" if parent_path else name
-        self._pending_folder = (str(group), full_path)
-        self._populate()
+        self.create_folder_requested.emit(str(group), full_path)
 
     def _on_rename_folder(self, group: str, old_path: str) -> None:
         """Kontextmenue 'Umbenennen' (18.01.03).
@@ -807,60 +806,6 @@ class MasterTree(QTreeWidget):
         parts = old_path.split("/")
         new_path = "/".join(parts[:-1] + [new_name])
         self.rename_folder_requested.emit(str(group), old_path, new_path)
-
-    def _ensure_pending_folder(self) -> None:
-        """Haengt den UI-Ordner 'Neuer Ordner' an den Baum (18.01.03, E3).
-
-        Wird am Ende von _populate() gerufen: Existiert self._pending_folder
-        (group, voller Pfad) und ist der Pfad im neu aufgebauten Baum noch
-        nicht vorhanden, werden die fehlenden Ordner-Knoten erzeugt
-        (gleiches Format wie _build_category_item: nicht auswaehlbar, nicht
-        anhakbar, '📁 ' -Label). Der Ordner wird aufgeklappt, damit Drop-Ziele
-        sichtbar sind.
-        """
-        pending = getattr(self, "_pending_folder", None)
-        if not pending:
-            return
-        group, full_path = pending
-        parts = [p.strip() for p in str(full_path or "").split("/") if p.strip()]
-        if not parts:
-            return
-        try:
-            for i in range(self.topLevelItemCount()):
-                top = self.topLevelItem(i)
-                if (top is None or not isValid(top)
-                        or top.data(0, ROLE_NODE_TYPE) != TYPE_GROUP
-                        or str(top.data(0, ROLE_SET_ID) or "") != group):
-                    continue
-                node = top
-                for part in parts:
-                    folder = None
-                    for c in range(node.childCount()):
-                        ch = node.child(c)
-                        if (ch is None or not isValid(ch)
-                                or ch.data(0, ROLE_NODE_TYPE) != TYPE_CATEGORY):
-                            continue
-                        label = str(ch.data(0, ROLE_SET_ID) or "").strip()
-                        if label.startswith("📁"):
-                            label = label[len("📁"):].lstrip()
-                        if label.lower() == part.lower():
-                            folder = ch
-                            break
-                    if folder is None:
-                        label = _expandable_label(f"📁 {part}",
-                                                  False, False)
-                        folder = QTreeWidgetItem([label, ""])
-                        folder.setData(0, ROLE_NODE_TYPE, TYPE_CATEGORY)
-                        folder.setData(0, ROLE_SET_ID, f"📁 {part}")
-                        folder.setFlags(
-                            folder.flags()
-                            & ~(Qt.ItemIsSelectable | Qt.ItemIsUserCheckable))
-                        node.addChild(folder)
-                    node = folder
-                node.setExpanded(True)
-                break
-        except (RuntimeError, AttributeError):
-            pass
 
     def _attach_item_buttons(self) -> None:
         """Haengt die Info-Buttons (Spalte 1) an alle Service-/Set-/Plugin-
@@ -1308,7 +1253,10 @@ class MasterTree(QTreeWidget):
                                      'Service-Info anzeigen' (17.01.02)
           * Kategorie-Ordner      -> '▶️ Alle Services ausführen'
                                      (run_category_requested, rekursiv) +
-                                     'Ordner-Info anzeigen' (17.01.02)
+                                     'Ordner-Info anzeigen' (17.01.02) +
+                                     'Neuer Ordner' / 'Umbenennen' /
+                                     'Ordner löschen' (18.01.03; Loeschen
+                                     nur fuer leere Ordner aktiv)
           * Sonstige Gruppen      -> Order/Entfernen ausgegraut (17.01.02).
 
         isValid-Guards: Bei wildem Klicken koennen Items zwischen itemAt() und
@@ -1332,7 +1280,8 @@ class MasterTree(QTreeWidget):
             # Services unter dem Ordner) + 'Ordner-Info anzeigen' (analog zu
             # den Set-Aktionen in der 📁-Gruppe). 18.01.03: Run/Info tragen
             # zusaetzlich die Eltern-GRUPPE ('sets'/'plugins', L3) und das
-            # Menue bietet 'Neuer Ordner' + 'Umbenennen' (Ordner-CRUD).
+            # Menue bietet 'Neuer Ordner' + 'Umbenennen' + 'Ordner löschen'
+            # (Ordner-CRUD, 18.01.03; Loeschen nur fuer leere Ordner aktiv).
             if node_type == TYPE_CATEGORY:
                 cat_path = self._category_path_of(item)
                 cat_group = self._group_of(item)
@@ -1357,6 +1306,20 @@ class MasterTree(QTreeWidget):
                 act_ren.triggered.connect(
                     lambda _=False, g=cat_group, cp=cat_path:
                     self._on_rename_folder(g, cp))
+                menu.addSeparator()
+                # 18.01.03 (E3-revidiert, 08.08.2026): 'Ordner löschen' –
+                # die EINZIGE Moeglichkeit, einen leeren Ordner zu entfernen
+                # (leere Ordner verschwinden NICHT automatisch beim Refresh).
+                # Nur fuer Ordner OHNE Kinder aktiv – bei gefuellten Ordnern
+                # muss der Benutzer zuerst die Kinder herausziehen (Guard).
+                act_del = menu.addAction("Ordner löschen")
+                act_del.setToolTip(
+                    "Nur für leere Ordner verfügbar – entfernt den Ordner "
+                    "dauerhaft.")
+                act_del.setEnabled(item.childCount() == 0)
+                act_del.triggered.connect(
+                    lambda _=False, g=cat_group, cp=cat_path:
+                    self.delete_folder_requested.emit(g, cp))
                 menu.exec(self.viewport().mapToGlobal(pos))
                 return
             menu = QMenu(self)
