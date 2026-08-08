@@ -22,6 +22,224 @@
 
 ---
 
+# 18.01.02 Refactoring & Modularisierung (Großdateien)
+
+## 1. Regeln & Invarianten
+
+* **Einrückung:** Ausschließlich **Tabs**.
+* **Spacing:** Exakt **1 Leerzeile** zwischen Funktionen/Methoden.
+* **UI-Tests:** **VERBOTEN.** Verifikation rein headless (`py_compile`, `test/test.py`).
+* **Architektur:** Single Responsibility Principle (SRP), Inversion of Control, Entkopplung.
+
+
+
+---
+
+## 2. Refactoring-Ziele (Zu große Dateien)
+
+```text
+[db_service.py] ──────────► [db/db_pool.py] + [db/schema_initializer.py]
+                        └─► [data_sync/mt5_sync_service.py] + [repositories/market_data_repository.py]
+
+[main.py] ────────────────► [workers/live_tick_worker.py] + [workers/data_sync_worker.py]
+                        └─► [ui/window_manager.py]
+
+[service_selector_model] ─► [analytics/engine/tree_builder.py] (Kategorie-Verschachtelung/Baumaufbau)
+
+```
+
+---
+
+## 3. Modularisierungs-Anleitung (IDE-AI)
+
+### Step 1: `db_service.py` entflechten
+
+* [x] `DbPool` & Threading-Locks in `db/db_pool.py` auslagern.
+
+
+* [x] Schema-Anlage (`check_and_init_databases`) nach `db/schema_initializer.py` verschieben.
+
+
+* [x] Sync-Logik (`sync_market_data`) in `data_sync/mt5_sync_service.py` trennen.
+
+
+* [x] `MarketDataRepository` eigenständig in `repositories/market_data_repository.py` platzieren.
+
+
+
+### Step 2: `main.py` schlankziehen
+
+* [x] `LiveTickWorker` & `DataSyncWorker` in eigene Worker-Dateien im Ordner `workers/` auslagern.
+
+
+* [x] Wiederherstellung & Jump-to-Bar (`restore_all_windows`, `open_chart_at_bar`) in `ui/window_manager.py` kapseln.
+
+
+
+### Step 3: `service_selector_model.py` bereinigen
+
+* [x] Rekursiven Baumaufbau (`build_tree`, `_insert_into_category_tree`) in `analytics/engine/tree_builder.py` auslagern.
+
+
+* [x] Model rein auf Daten-Providing & EventBus-Sync fokussieren.
+
+
+
+### Step 4: Quality Gate
+
+* [x] `python -m py_compile db/db_pool.py db/schema_initializer.py data_sync/mt5_sync_service.py repositories/market_data_repository.py workers/live_tick_worker.py workers/data_sync_worker.py ui/window_manager.py analytics/engine/tree_builder.py`
+* [x] Headless-Test in `test/test.py` für DB-Zugriffe & Worker-Instanziierung ausführen.
+* [x] Code-Check: Nur Tabs, 1 Leerzeile Abstand.
+
+---
+
+## Prüfprotokoll 18.01.02 (08.08.2026) – Konsistenz, Vollständigkeit & Entscheidungen
+
+### Prüfergebnis (Konsistenz)
+Die IST-Analyse bestätigt die drei Refactoring-Ziele des Kapitels (Code-Inspektion, `ast`-Strukturanalyse und Import-Graph-Analyse über alle 84 Projekt-`.py`-Dateien):
+
+* **`db_service.py` (23,9 KB)** vereint real 6 logische Einheiten: `DbPool`/`_LockedConnection`/`db_connect`/`with_db_lock` (Pool & Threading), `check_and_init_databases` (Schema/Migration), `check_mt5_connection`/`sync_market_data`/`get_latest_timestamp` (MT5-Sync), `get_timeframes`/`TF_SECONDS_MAP`/`MT5_LOCK` (MT5-Konfig), `_parse_json_field`/`_ensure_epoch` (Utilities), `MarketDataRepository`/`get_symbol_precision` (Read-Repository).
+* **`main.py` (29,9 KB)** enthält `DataSyncWorker`/`LiveTickWorker` (QThread) sowie `MainWindow` mit 9 Fenster-Lifecycle-Methoden und Tick-Dispatch-Methoden.
+* **`analytics/engine/service_selector_model.py`** trägt den kompletten Baum-Aufbau (`build_tree`, `_category_nodes`, `_insert_into_category_tree`, `_insert_set_into_category_tree`, `_ensure_category_path`, Kategorie-Auflösung) – seit 18.01.03 zusätzlich Sets-Kategorien, Empty-Folder-Einmischung und Override-Auswertung.
+
+Der Plan ist architektonisch schlüssig (SRP-Ziele korrekt, Reihenfolge Step 1→2→3 sinnvoll, da die Worker die neuen `db/`-Module benötigen). **Vollständigkeits-Lücken** gefunden:
+
+* **L1 – Import-Kompatibilität nicht geregelt:** **20 Projektdateien** importieren aus `db_service` (`DbPool` 12×, `_parse_json_field` 7×, `TF_SECONDS_MAP` 6×, `get_timeframes` 4×, `MarketDataRepository` 2×, `get_symbol_precision` 2×, `DB_APP_DATA`/`DB_MARKET_DATA`/`MT5_LOCK` je 1–2×, zusätzlich `import db_service` in `main.py`). Ohne Kompatibilitätsstrategie bricht die Aufteilung alle 20 Caller.
+* **L2 – `_parse_json_field` ohne Zielort:** wird von 7 Modulen als „privates" Helferlein importiert (`feature_store_reader`, `service_selector_model`, `service_set_repository`, `analytics_profile_repository`, `chart_win`, `state_manager`, `window_state_repository`) – gehört weder zum Pool noch zur Sync-Logik; der Plan listet keinen Zielordner.
+* **L3 – Nicht zugeordnete Bestandteile:** Der Plan nennt nur 4 Zieleinheiten. Nicht zugeordnet: `get_timeframes`, `TF_SECONDS_MAP`, `MT5_LOCK`, `SYMBOLS`, `check_mt5_connection`, `get_latest_timestamp`, `get_symbol_precision`, `db_connect`/`_LockedConnection` (LEGACY), `with_db_lock` (No-op, API-Kompatibilität), `_ensure_epoch` (DEPRECATED), die DB-Pfad-Konstanten (`DATA_DIR`, `DB_MARKET_DATA`, `DB_ANALYTICS`, `DB_APP_DATA`) und der CLI-Einstieg `main()` (`python db_service.py`).
+* **L4 – Abhängigkeitsrichtung/Zirkularität nicht spezifiziert:** `sync_market_data` ruft `check_and_init_databases` + `check_mt5_connection` auf; alle drei brauchen `DbPool`/DB-Konstanten; `LiveTickWorker` braucht `MT5_LOCK` + `get_timeframes`; `MarketDataRepository` und `get_symbol_precision` teilen dieselbe Precision-Query. Ohne festgelegte einseitige Import-Richtung drohen Zyklen.
+* **L5 – Einrückungs-Konflikt:** Kapitel-Regel 1 fordert „Ausschließlich Tabs" – der Codebase-Standard ist jedoch **4 Leerzeichen** (18.01.01 E-1, 18.01.03-Kapitel; real in `db_service.py`, `main.py`, `state_manager.py`, `service_set_repository.py`). Zusätzlich sind `service_selector_model.py`/`master_tree.py` real mit 2 Leerzeichen eingerückt (Altbestand).
+* **L6 – Umfang `ui/window_manager.py` unklar:** Der Plan nennt nur `restore_all_windows` + `open_chart_at_bar`. Es existieren aber 8 Fenster-Lifecycle-Methoden (zusätzlich `open_chart_window`, `handle_chart_closed`, `open_service_window`, `open_analytics_window`, `open_properties_window`, `get_currently_active_pairs`), die eng an `self.chart_windows`/`self.persistent_sub_windows`/`self.state_manager` hängen; `restore_main_window_geometry` operiert auf dem Hauptfenster selbst.
+* **L7 – Baum-Extraktionsumfang veraltet (18.01.03 nachgezogen):** Der Plan nennt nur `build_tree` + `_insert_into_category_tree`. Seit 18.01.03 gehören dazu zusätzlich `_category_nodes`, `_category_parts`, `_cat_key`, `_sort_category_nodes`, `_insert_set_into_category_tree`, `_set_category_parts`, `_ensure_category_path`, `category_plugin_ids`, `category_set_ids`, `category_service_plugin_ids`, `plugin_category_path` – verzahnt mit Model-Zustand (`_plugin_category_overrides`, `_empty_folder_paths`).
+* **L8 – Worker-Anpassungspunkte nicht abgedeckt:** `DataSyncWorker.run()` ruft `db_service.sync_market_data()` (Modul-Referenz); `LiveTickWorker._persist_bar` nutzt deferred `from db_service import DB_MARKET_DATA, DbPool`. Beide Importziele müssen nach der Aufteilung angepasst werden.
+
+### Entscheidungen (18.01.02)
+
+1. **E1 – Einrückung = 4 Leerzeichen (Codebase-Standard):** Die Kapitel-Regel „Ausschließlich Tabs" wird überstimmt. Alle **neuen** Dateien (`db/db_pool.py`, `db/db_utils.py`, `db/schema_initializer.py`, `data_sync/mt5_sync_service.py`, `repositories/market_data_repository.py`, `workers/*.py`, `ui/window_manager.py`, `analytics/engine/tree_builder.py`) nutzen exakt **4 Leerzeichen** pro Ebene (konsistent mit 18.01.01 E-1 und 18.01.03). Bestehende Dateien werden **nicht** umformatiert (auch nicht die 2-Space-Dateien `service_selector_model.py`/`master_tree.py` – Kern-Dateien geschützt, Invariante 9).
+2. **E2 – `db_service.py` bleibt als Fassade (Re-Export-Wrapper):** Alle 20 Bestands-Caller bleiben unverändert. `db_service.py` re-exportiert nach der Aufteilung alle öffentlichen Namen (`DbPool`, `MarketDataRepository`, `get_timeframes`, `TF_SECONDS_MAP`, `MT5_LOCK`, `DB_APP_DATA`, `DB_MARKET_DATA`, `DB_ANALYTICS`, `SYMBOLS`, `get_symbol_precision`, `get_latest_timestamp`, `sync_market_data`, `check_and_init_databases`, `check_mt5_connection`, `db_connect`, `with_db_lock`, `_parse_json_field`, `_ensure_epoch`) und behält den CLI-Einstieg (`main()`/`if __name__ == "__main__"` → `sync_market_data()`). Damit bleibt auch `import db_service` in `main.py` gültig. Die Fassade re-exportiert nur, enthält aber keine Logik mehr.
+3. **E3 – Vollständige Zuordnungstabelle für `db_service.py`:**
+
+   | Neues Modul | Übernommene Bestandteile |
+   |---|---|
+   | `db/db_pool.py` | `DATA_DIR`, `DB_MARKET_DATA`, `DB_ANALYTICS`, `DB_APP_DATA`, `_db_pool_lock`, `_db_pool_global`, `DbPool`, `_LockedConnection`, `db_connect`, `with_db_lock` |
+   | `db/db_utils.py` | `_parse_json_field`, `_ensure_epoch` |
+   | `db/schema_initializer.py` | `check_and_init_databases` |
+   | `data_sync/mt5_sync_service.py` | `SYMBOLS`, `_TIMEFRAMES_CACHE`, `get_timeframes`, `TF_SECONDS_MAP`, `MT5_LOCK`, `check_mt5_connection`, `get_latest_timestamp`, `sync_market_data` |
+   | `repositories/market_data_repository.py` | `MarketDataRepository`, `get_symbol_precision` (gemeinsame Precision-Logik, DRY) |
+   | `db_service.py` (Fassade) | Re-Exports (E2) + CLI `main()` |
+
+   **Lazy-Import-Prinzip beibehalten:** `MetaTrader5` wird weiterhin erst beim Aufruf importiert (`get_timeframes`/`check_mt5_connection`/`sync_market_data`) – kein MT5-DLL-Load beim Modul-Import (verhindert Import-Zyklen über `data_sync`).
+4. **E4 – Einseitige Abhängigkeitsrichtung (keine Zirkularität):**
+   ```
+   db/db_pool.py (Basis)  ←  db/db_utils.py, db/schema_initializer.py,
+                              repositories/market_data_repository.py,
+                              data_sync/mt5_sync_service.py
+   data_sync/mt5_sync_service.py  →  db/db_pool.py, db/db_utils.py, db/schema_initializer.py
+   workers/data_sync_worker.py    →  data_sync/mt5_sync_service.py
+   workers/live_tick_worker.py    →  data_sync/mt5_sync_service.py (MT5_LOCK, get_timeframes),
+                                     db/db_pool.py, db/db_utils.py
+   ui/window_manager.py           →  chart/chart_win.py, persistent_win.py, state_manager.py
+   analytics/engine/tree_builder.py → (keine Abhängigkeit von ServiceSelectorModel)
+   ```
+   **Kern-Regel:** Kein neues Modul importiert `main.py` oder `db_service.py` (Fassade). Die Fassade wird nur von den Bestands-Callern genutzt.
+5. **E5 – `ui/window_manager.py`: Scope & Kopplungsmodell:** Der `WindowManager` übernimmt **alle** Sub-/Chart-Fenster-Lifecycle-Methoden von `MainWindow`: `restore_all_windows`, `open_chart_window`, `handle_chart_closed`, `open_service_window`, `open_analytics_window`, `open_properties_window`, `open_chart_at_bar`, `get_currently_active_pairs`. **Ausnahme:** `restore_main_window_geometry` bleibt in `MainWindow` (operiert auf dem Hauptfenster selbst: `self.move`/`resize`/`showMaximized`). Die Tick-Verteilung (`_dispatch_tick_map`, `on_ticks_ready`, `_flush_pending_ticks`, `_refresh_updated_charts`) bleibt ebenfalls in `MainWindow` (Live-Daten-Dispatch, kein Fenster-Lebenszyklus). Kopplung über Konstruktor-Parameter (`state_manager` + Listen-Referenzen `chart_windows`/`persistent_sub_windows`); `MainWindow` delegiert 1:1. **Kein Import von `main.py`** (IoC – `WindowManager` kennt `MainWindow` nicht).
+6. **E6 – `analytics/engine/tree_builder.py`: Scope & Schnittstelle:** Es wandern NUR die Baum-Konstruktions-/Auflösungsfunktionen als **Modul-Funktionen** (reine Funktionen, kein Klassenzustand, keine Qt-Signale): `build_tree`, `_category_nodes`, `_category_parts`, `_cat_key`, `_sort_category_nodes`, `_insert_into_category_tree`, `_insert_set_into_category_tree`, `_set_category_parts`, `_ensure_category_path`, `category_plugin_ids`, `category_set_ids`, `category_service_plugin_ids`, `plugin_category_path`. Eingangsdaten (Sets, Plugins, Kategorie-Overrides, Empty-Folder-Pfade, Badges, Last-Execution) werden **als Parameter übergeben**. `ServiceSelectorModel` bleibt die öffentliche API für die 11 Nutzer-Dateien (`master_tree`, `service_set_utils`, `service_selector_dialog`, `analytics_win`, …) und delegiert intern an `tree_builder` (dünne Wrapper). **Kein Import von `ServiceSelectorModel` in `tree_builder.py`** – keine Zirkularität. Die `refresh()`-Ladefunktionen (`_load_empty_folders`, `_load_plugin_category_overrides`, `_load_last_execution_dates`) bleiben im Model.
+7. **E7 – Worker-Auslagerung (`workers/`):** `DataSyncWorker` → `workers/data_sync_worker.py` (ruft `sync_market_data()` aus `data_sync/mt5_sync_service`); `LiveTickWorker` → `workers/live_tick_worker.py` (nutzt `MT5_LOCK`/`get_timeframes` aus `data_sync/mt5_sync_service`, `DbPool`/`DB_MARKET_DATA` aus `db/db_pool`; `_persist_bar`-Importziel wird angepasst, L8). `main.py` behält: Chromium-Occlusion-Fix (MUSS vor `QApplication` stehen), UTF-8-Fix, `BASE_DIR`, `--check-plugins`-CLI, `MainWindow` (inkl. `load_initial_table_data`, `trigger_background_sync`, Concurrency-Guard, LiveAnalyzer-Verdrahtung, Tick-Dispatch).
+8. **E8 – Quality-Gate-Erweiterung (zusätzlich zu Step 4):**
+   * `py_compile` zusätzlich auf der Fassade `db_service.py` (muss nach der Aufteilung fehlerfrei importierbar sein).
+   * Headless-Fassaden-Smoke-Test in `test/test.py`: alle Re-Export-Namen aus E2 sind importierbar; repräsentative Stichprobe der 20 Bestands-Caller (`chart_win`, `state_manager`, `symbol_repository`, `feature_store_reader`) importierbar.
+   * Zirkularitäts-Check: kein `import main`/`from main import ...` und keine Logik-Nutzung von `db_service` in den 8 neuen Modulen (nur die Fassade re-exportiert).
+   * Einrückungs-Check: 4 Leerzeichen (E1), 1 Leerzeile zwischen Funktionen/Methoden.
+
+### Abweichungen vom Plan-Kapitel (per Prüfprotokoll-Entscheidungen)
+* Kapitel-Regel 1 „Einrückung: Ausschließlich Tabs" → **E1**: 4 Leerzeichen (Codebase-Standard).
+* Step 4 „Code-Check: Nur Tabs, 1 Leerzeile" → **E1/E8**: Code-Check auf 4 Leerzeichen + 1 Leerzeile.
+* Step 1 (4 Checklisten-Punkte) → **E3**: vollständige Zuordnung inkl. Utilities, MT5-Konfig, LEGACY/DEPRECATED-Helfer und CLI.
+* Step 2 (nur `restore_all_windows`, `open_chart_at_bar`) → **E5**: `WindowManager` übernimmt alle 8 Fenster-Lifecycle-Methoden; `restore_main_window_geometry` und Tick-Dispatch bleiben in `MainWindow`.
+* Step 3 (nur `build_tree`, `_insert_into_category_tree`) → **E6**: erweiterter Umfang (18.01.03-Erweiterungen inklusive); `ServiceSelectorModel` bleibt öffentliche API (Delegation).
+* Step 4 (py_compile-Liste) → unverändert gültig; um Fassade + Smoke-Test ergänzt (**E8**).
+
+---
+
+
+
+---
+
+## Implementierungs-Log 18.01.02 (08.08.2026 14:37) – Refactoring & Modularisierung (Großdateien)
+
+Umgesetzt (alle Checklisten-Punkte des Kapitels abgearbeitet; Entscheidungen E1–E8 des
+Prüfprotokolls):
+
+### Step 1 – `db_service.py` entflechten (E2/E3/E4)
+* **Neu `db/db_pool.py`:** Pfad-Konstanten (`DATA_DIR`, `DB_MARKET_DATA`, `DB_ANALYTICS`,
+  `DB_APP_DATA`), `_db_pool_lock`/`_db_pool_global`, `DbPool` (Thread-local Singleton),
+  `_LockedConnection`, `db_connect` (LEGACY), `with_db_lock` (No-op, API-Kompatibilität).
+* **Neu `db/db_utils.py`:** `_parse_json_field`, `_ensure_epoch` (DEPRECATED, backward-compat).
+* **Neu `db/schema_initializer.py`:** `check_and_init_databases` (Schema-Anlage/-Migration der
+  3 DuckDBs, unveränderte Logik).
+* **Neu `data_sync/mt5_sync_service.py`:** `SYMBOLS`, `_TIMEFRAMES_CACHE`, `get_timeframes`,
+  `TF_SECONDS_MAP`, `MT5_LOCK`, `check_mt5_connection`, `get_latest_timestamp`,
+  `sync_market_data`. **Lazy-Import-Prinzip beibehalten** (MT5 erst beim Aufruf).
+* **Neu `repositories/market_data_repository.py`:** `MarketDataRepository`,
+  `get_symbol_precision` (gemeinsame Precision-Query, DRY).
+* **`db_service.py` = Fassade (E2):** Re-Export aller 20 öffentlichen Namen + CLI-Einstieg
+  `main()` (`python db_service.py`). Alle 20 Bestands-Caller bleiben unverändert.
+
+### Step 2 – `main.py` schlankziehen (E5/E7)
+* **Neu `workers/data_sync_worker.py`:** `DataSyncWorker` ruft `sync_market_data()` aus
+  `data_sync/mt5_sync_service` (L8).
+* **Neu `workers/live_tick_worker.py`:** `LiveTickWorker` nutzt `MT5_LOCK`/`get_timeframes`
+  aus `data_sync`, `DbPool`/`DB_MARKET_DATA` aus `db/db_pool`; `_persist_bar`-Importziel
+  angepasst (L8).
+* **Neu `ui/window_manager.py`:** `WindowManager` (IoC – **kein** `main.py`-Import) übernimmt
+  alle 8 Fenster-Lifecycle-Methoden (`restore_all_windows`, `open_chart_window`,
+  `handle_chart_closed`, `open_service_window`, `open_analytics_window`,
+  `open_properties_window`, `open_chart_at_bar`, `get_currently_active_pairs`). Kopplung über
+  Konstruktor-Parameter (`state_manager` + Listen-Referenzen, in-place-Mutationen).
+* **`main.py`:** Chromium-Occlusion-Fix, UTF-8-Fix, `BASE_DIR`, `--check-plugins`-CLI und
+  `MainWindow` (inkl. `restore_main_window_geometry`, Tick-Dispatch, Concurrency-Guard,
+  LiveAnalyzer-Verdrahtung) bleiben. Buttons/Timer/Worker-Callback auf
+  `self.window_manager.*` verdrahtet; dünne Delegationen `open_chart_window`/`open_chart_at_bar`
+  für `statistic_win`/`analytics_win` (API-Kompatibilität, Jump-to-Chart-Variante 2).
+  Ungenutzte Importe entfernt (`QThread`, `Signal`, `QScreen`, `QMessageBox`, `mt5`,
+  `db_service`, `ServiceWindow`, `AnalyticsWindow`, `PropertiesWindow`, `Qt`).
+
+### Step 3 – `service_selector_model.py` bereinigen (E6)
+* **Neu `analytics/engine/tree_builder.py`:** alle Baum-Konstruktions-/Auflösungsfunktionen als
+  reine Modul-Funktionen (kein Klassenzustand, keine Qt-Signale, **kein**
+  `ServiceSelectorModel`-Import): `build_tree`, `_category_nodes`, `_category_parts`,
+  `_cat_key`, `_sort_category_nodes`, `_insert_into_category_tree`,
+  `_insert_set_into_category_tree`, `_set_category_parts`, `_ensure_category_path`,
+  `category_plugin_ids`, `category_set_ids`, `category_service_plugin_ids`,
+  `plugin_category_path`. Eingangsdaten (Sets, Plugins, Overrides, Empty-Folder-Pfade,
+  Badges, Last-Execution) werden als Parameter übergeben.
+* **Modell:** `ServiceSelectorModel` bleibt die öffentliche API (11 Nutzer-Dateien:
+  master_tree, service_set_utils, service_selector_dialog, analytics_win, ...) und delegiert
+  intern (dünne Wrapper). Die `refresh()`-Ladefunktionen bleiben im Modell.
+
+### Step 4 – Quality Gate (E8)
+* `py_compile` auf allen 12 neuen/geänderten Dateien: **PASS** (inkl. Fassade `db_service.py`).
+* **Test-Teil 30 (neu, headless, `test/test.py`): 20/20 PASS** – Fassaden-Re-Exports/-Identität
+  (A1–A6), Zirkularitäts-Check E4/E6 (B1–B2), Worker-Instanziierung E7 (C1–C3),
+  WindowManager-IoC E5 (D1–D2), tree_builder-Delegation E6 (E1–E7; `build_tree` Modell ==
+  tree_builder direkt).
+* Bestehende Teile 26–29 (18.01.03) unverändert PASS; Gesamtlauf wie bisher mit ausschließlich
+  den dokumentierten Baseline-Geometrie-Fehlern P2/P5/H3/H4/H5/H7 (offscreen `800x582`,
+  Reflow-/Scrollbar-Umbau 07./08.08.2026 – vorbestehend, nicht durch 18.01.02 verursacht).
+* `python main.py --check-plugins`: PASS.
+* Code-Check (E1): alle neuen Module reine 4-Leerzeichen-INDENT-Token, keine Tabs;
+  1 Leerzeile zwischen Funktionen/Methoden.
+
+### Abweichungen vom Plan-Kapitel (per Prüfprotokoll-Entscheidungen)
+* Kapitel-Regel 1 „Einrückung: Ausschließlich Tabs" → **E1**: 4 Leerzeichen (Codebase-Standard).
+* Step 4 „Code-Check: Nur Tabs, 1 Leerzeile" → **E1/E8**: Code-Check auf 4 Leerzeichen +
+  1 Leerzeile.
+* Step 2 (nur `restore_all_windows` + `open_chart_at_bar`) → **E5**: `WindowManager` übernimmt
+  alle 8 Fenster-Lifecycle-Methoden; `restore_main_window_geometry` und Tick-Dispatch bleiben
+  in `MainWindow`.
+* Step 3 (nur `build_tree` + `_insert_into_category_tree`) → **E6**: erweiterter Umfang
+  (alle 13 Baum-/Auflösungsfunktionen inkl. 18.01.03-Erweiterungen).
+
 # 18.01.03 Dynamic Tree Management (Ordner-CRUD, Drag & Drop & Sets-Kategorien)
 
 ## 1. Regeln & Invarianten
@@ -56,35 +274,34 @@
 
 ### Step 1: Sets-Kategorisierung in `service_selector_model.py`
 
-* [ ] Ordner-Mechanik (`_insert_into_category_tree`) auch auf den Knoten `Sets` (`GROUP_SETS`) anwenden.
-* [ ] `category_set_ids(path)`-Methode hinzufügen, die alle `set_id`s aus Unterordnern rekursiv auflöst.
+* [x] Ordner-Mechanik (`_insert_into_category_tree`) auch auf den Knoten `Sets` (`GROUP_SETS`) anwenden.
+* [x] `category_set_ids(path)`-Methode hinzufügen, die alle `set_id`s aus Unterordnern rekursiv auflöst.
 
 ### Step 2: Konfektionierung `MasterTree` (`serviceui/master_tree.py`)
 
-* [ ] **Drag & Drop aktivieren:** `setDragEnabled(True)`, `setAcceptDrops(True)`, `setDropIndicatorShown(True)`.
-* [ ] `dropEvent()` überschreiben:
+* [x] **Drag & Drop aktivieren:** `setDragEnabled(True)`, `setAcceptDrops(True)`, `setDropIndicatorShown(True)`.
+* [x] `dropEvent()` überschreiben:
 1. Ermittle gezogenen Knoten (Set-ID, Plugin-ID oder Ordner) und Ziel-Ordner-Pfad.
 2. Aktualisiere den Kategorie-Pfad beim Element.
 3. Emittiere Datenänderung an das Modell/Repositories.
 
-* [ ] **Kontextmenü erweitern (`customContextMenuRequested`):**
+* [x] **Kontextmenü erweitern (`customContextMenuRequested`):**
 1. **"Neuer Ordner":** Öffnet `QInputDialog`, erstellt neuen Unterordner-Pfad im gewählten Elternknoten.
 2. **"Umbenennen":** Benennt Ordner/Knoten um und führt Pfad-Update für alle enthaltenen Kinder durch (String-Replace).
 
 
 ### Step 3: Persistenz & Synchronisation
 
-* [ ] Ordner-Aktionen für Sets via `ServiceSetRepository.save_set()` abspeichern.
-* [ ] Ordner-Aktionen für Standalone-Plugins via `state_manager.save_global_value("plugin_params_<id>", ...)` sichern.
-* [ ] Nach allen Strukturänderungen `event_bus.service_set_changed.emit()` abfeuern.
+* [x] Ordner-Aktionen für Sets via `ServiceSetRepository.save_set()` abspeichern.
+* [x] Ordner-Aktionen für Standalone-Plugins via `state_manager.save_global_value("plugin_params_<id>", ...)` sichern.
+* [x] Nach allen Strukturänderungen `event_bus.service_set_changed.emit()` abfeuern.
 
 
 ### Step 4: Quality Gate
 
-* [ ] `python -m py_compile serviceui/master_tree.py analytics/engine/service_selector_model.py analytics/ui/analytics_win.py serviceui/service_win.py`
-* [ ] Headless-Test in `test/test.py` für rekursive Sets-Kategorien & Pfad-Updates.
-* [ ] Code-Check: Exakt 4 Leerzeichen Einrückung, 1 Leerzeile Abstand.
-
+* [x] `python -m py_compile serviceui/master_tree.py analytics/engine/service_selector_model.py analytics/ui/analytics_win.py serviceui/service_win.py`
+* [x] Headless-Test in `test/test.py` für rekursive Sets-Kategorien & Pfad-Updates.
+* [x] Code-Check: Exakt 4 Leerzeichen Einrückung, 1 Leerzeile Abstand.
 
 ---
 
@@ -349,3 +566,25 @@ Umgesetzt in den Commits `ed8f4f0` (Punkte 1–3) und `17c6a86` (Punkte 4–5).
 * **Hinweis (vorbestehend, unverändert):** Geometrie-Tests P2/P5/H3/H4/H5/H7
   schlagen weiterhin in der Baseline fehl (offscreen `800x582`). Separater
   Bugfix nur auf Wunsch.
+
+---
+
+# Phase 18 Abschluss (08.08.2026)
+
+Phase 18 „Analytics-Finalisierung" ist mit den Kapiteln **18.01.02 (Refactoring &
+Modularisierung)** und **18.01.03 (Dynamic Tree Management)** abgeschlossen.
+
+* **18.01.02** – Refactoring & Modularisierung (Großdateien): `db_service.py` (Fassade +
+  `db/`-Paket, `data_sync/`, `repositories/`), `main.py` (Worker in `workers/`, Fenster-
+  Lifecycle in `ui/window_manager.py`), `service_selector_model.py` (Baumaufbau in
+  `analytics/engine/tree_builder.py`). Umgesetzt gemäß Prüfprotokoll E1–E8; Validierung
+  headless (py_compile, Test-Teil 30: 20/20 PASS).
+* **18.01.03** – Dynamic Tree Management (Ordner-CRUD, Drag & Drop, Sets-Kategorien):
+  umgesetzt in den Commits `phase18_step1`–`phase18_step3` (siehe Prüfprotokoll und
+  Implementierungs-Logs oben); Bugfix-Runden inkl. E3-revidiert (leere Ordner persistieren).
+
+Alle Quality Gates (headless) bestanden; **keine UI-Tests ausgeführt** (Regel 4/4.5).
+
+**Bekannte, nicht durch Phase 18 verursachte Baseline-Geometrie-Testfehler** (offscreen
+`800x582`, Reflow-/Scrollbar-Umbau 07./08.08.2026): P2, P5, H3, H4, H5, H7. Separater
+Bugfix nur auf Wunsch.

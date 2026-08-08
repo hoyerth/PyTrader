@@ -467,97 +467,19 @@ class ServiceSelectorModel(QObject):
     # ------------------------------------------------------------------
     # 16.08 (K1/K2/K8/K9): Kategorie-Ordner (Dynamic Category Trees)
     # ------------------------------------------------------------------
+    # 18.01.02 (E6): Die Baum-Konstruktions-/Aufloesungslogik ist in
+    # `analytics/engine/tree_builder.py` ausgelagert (reine Modul-Funktionen,
+    # keine Zirkularitaet). Dieses Modell bleibt die oeffentliche API und
+    # delegiert hierher (dünne Wrapper).
 
     @staticmethod
     def _cat_key(label: str) -> str:
         """Case-insensitiver Sortier-/Vergleichsschluessel eines Ordners.
 
-        Entfernt das '📁 '-Praefix des Ordnerlabels (K2-Format), damit
-        Sortierung (K8) und Pfad-Lookup stabil auf dem reinen Namen laufen.
+        Delegation an tree_builder._cat_key (18.01.02 E6).
         """
-        s = str(label or "").strip()
-        if s.startswith("📁"):
-            s = s[len("📁"):].lstrip()
-        return s.lower()
-
-    def _category_parts(self, plugin_id: str,
-                        plugin: Optional[Any]) -> List[str]:
-        """Kategorienpfad eines Plugins (K1, 16.08 / 18.01.03 E1).
-
-        18.01.03 (E1): Ein gesetzter Kategorie-Override (global_settings,
-        Key 'plugin_category_<plugin_id>', Quelle des Drag & Drop) hat
-        VORRANG vor `metadata['category']` – auch ein leerer String "" hebt
-        die metadata-Kategorie auf (Root-Ebene). Ohne Override gilt das
-        metadata-Feld wie bisher. Leer ODER der Ist-Default `"General"`
-        (base_plugin.py) gelten als "keine Kategorie" -> das Plugin bleibt
-        auf der obersten Ebene der Hauptgruppe.
-        """
-        category = ""
-        if plugin_id:
-            override = self._plugin_category_overrides.get(
-                str(plugin_id).lower())
-            if override is not None:
-                category = str(override or "").strip()
-        if not category:
-            try:
-                meta = getattr(plugin, "metadata", None) or {}
-                category = str(meta.get("category") or "").strip()
-            except Exception:
-                category = ""
-        if not category or category.lower() == "general":
-            return []
-        return [p.strip() for p in category.split("/") if p.strip()]
-
-    def _insert_into_category_tree(self, nodes: List[Dict[str, Any]],
-                                   parts: List[str],
-                                   leaf: Dict[str, Any]) -> None:
-        """Fuegt ein Plugin-Blatt rekursiv in die Ordnerstruktur ein (K2).
-
-        Erzeugt fehlende Ordner entlang des Pfads. Ordner entstehen NUR
-        durch eine tatsaechliche Blatt-Einfuegung -> keine leeren Ordner
-        (K9). Ordner-Label folgt dem K2-Format '📁 <Name>'.
-        """
-        if not parts:
-            nodes.append(leaf)
-            return
-        key = self._cat_key(parts[0])
-        folder = None
-        for n in nodes:
-            if (n.get("group") == self.GROUP_CATEGORY
-                    and self._cat_key(n.get("label")) == key):
-                folder = n
-                break
-        if folder is None:
-            folder = {"group": self.GROUP_CATEGORY,
-                      "label": f"📁 {parts[0]}", "children": []}
-            nodes.append(folder)
-        self._insert_into_category_tree(folder["children"], parts[1:], leaf)
-
-    def _sort_category_nodes(self,
-                             nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Sortiert eine Ordner-Ebene (K8, 16.08 / 18.01.03).
-
-        Deterministisch: Ordner zuerst, dann Blaetter; jeweils alphabetisch
-        (case-insensitiv). Innerhalb der Ordner rekursiv dieselbe Regel.
-        Blaetter koennen seit 18.01.03 sowohl Plugin-Dicts ({plugin_id, ...})
-        als auch Sets-Dicts ({set_id, display_name, ...}) sein – als
-        Sortiername gilt plugin_id, sonst display_name/set_id.
-        """
-        def sort_key(n: Dict[str, Any]) -> tuple:
-            is_folder = n.get("group") == self.GROUP_CATEGORY
-            if is_folder:
-                name = self._cat_key(n.get("label"))
-            else:
-                name = str(n.get("plugin_id")
-                           or n.get("display_name")
-                           or n.get("set_id") or "").lower()
-            return (0 if is_folder else 1, name)
-
-        result = sorted(nodes, key=sort_key)
-        for n in result:
-            if n.get("group") == self.GROUP_CATEGORY:
-                n["children"] = self._sort_category_nodes(n.get("children") or [])
-        return result
+        from analytics.engine.tree_builder import _cat_key as _tb_cat_key
+        return _tb_cat_key(label)
 
     def category_plugin_ids(self, category_path: str) -> List[str]:
         """Alle Plugin-IDs unter einem Kategorie-Pfad (rekursiv, 17.01.02).
@@ -573,84 +495,10 @@ class ServiceSelectorModel(QObject):
             (run_category_requested).
           * Info-Button auf Ordner-Knoten (category_info_requested).
         """
-        target = [p.strip().lower() for p in str(category_path or "").split("/")
-                  if p.strip()]
-        if not target:
-            return []
-        plugins = self.get_plugins()
-        result: List[str] = []
-        for pid in sorted(plugins.keys()):
-            parts = [p.lower() for p in self._category_parts(pid,
-                                                             plugins.get(pid))]
-            if len(parts) >= len(target) and parts[:len(target)] == target:
-                result.append(pid)
-        return result
-
-    def _set_category_parts(self, definition: Dict[str, Any]) -> List[str]:
-        """Kategorienpfad eines Service-Sets (18.01.03, E2).
-
-        Lese das optionale Feld `category` der Set-Definition (Slash-Pfad,
-        z.B. 'Swing Points/Geometrie'). Leer ODER der Ist-Default "General"
-        gelten als "keine Kategorie" -> das Set bleibt auf der obersten
-        Ebene der Sets-Gruppe (Spiegel der Plugin-Logik K1).
-        """
-        category = str((definition or {}).get("category") or "").strip()
-        if not category or category.lower() == "general":
-            return []
-        return [p.strip() for p in category.split("/") if p.strip()]
-
-    def _insert_set_into_category_tree(self, nodes: List[Dict[str, Any]],
-                                       parts: List[str],
-                                       leaf: Dict[str, Any]) -> None:
-        """Fuegt ein Set-Blatt rekursiv in die Ordnerstruktur ein (18.01.03).
-
-        Analoge Mechanik zu `_insert_into_category_tree` (K2), aber fuer
-        Sets-Blatt-Dicts ({set_id, display_name, definition, services}).
-        Ordner entstehen NUR durch eine tatsaechliche Blatt-Einfuegung ->
-        keine leeren Ordner (K9).
-        """
-        if not parts:
-            nodes.append(leaf)
-            return
-        key = self._cat_key(parts[0])
-        folder = None
-        for n in nodes:
-            if (n.get("group") == self.GROUP_CATEGORY
-                    and self._cat_key(n.get("label")) == key):
-                folder = n
-                break
-        if folder is None:
-            folder = {"group": self.GROUP_CATEGORY,
-                      "label": f"📁 {parts[0]}", "children": []}
-            nodes.append(folder)
-        self._insert_set_into_category_tree(folder["children"], parts[1:],
-                                            leaf)
-
-    def _ensure_category_path(self, nodes: List[Dict[str, Any]],
-                              parts: List[str]) -> None:
-        """Stellt sicher, dass die Ordnerkette fuer `parts` existiert
-        (18.01.03, E3-revidiert).
-
-        Erzeugt fehlende Ordner entlang des Pfads OHNE Blatt-Einfuegung
-        (K2-Format '📁 <Name>', children leer). Dient der Einmischung
-        persistierter benutzererzeugter (ggf. leerer) Ordner in build_tree():
-        Ein bereits vorhandener Ordner (aus echten Blatt-Kategorien) wird
-        wiederverwendet – kein Duplikat, keine Kinder-Aenderung.
-        """
-        if not parts:
-            return
-        key = self._cat_key(parts[0])
-        folder = None
-        for n in nodes:
-            if (n.get("group") == self.GROUP_CATEGORY
-                    and self._cat_key(n.get("label")) == key):
-                folder = n
-                break
-        if folder is None:
-            folder = {"group": self.GROUP_CATEGORY,
-                      "label": f"📁 {parts[0]}", "children": []}
-            nodes.append(folder)
-        self._ensure_category_path(folder["children"], parts[1:])
+        from analytics.engine.tree_builder import category_plugin_ids
+        return category_plugin_ids(self.get_plugins(),
+                                   self._plugin_category_overrides,
+                                   category_path)
 
     def category_set_ids(self, category_path: str) -> List[str]:
         """Alle set_ids unter einem Kategorie-Pfad (rekursiv, 18.01.03).
@@ -662,17 +510,8 @@ class ServiceSelectorModel(QObject):
         '📁 '-Praefixe, case-insensitiv. Analog `category_plugin_ids` fuer
         die Sets-Gruppe.
         """
-        target = [p.strip().lower() for p in str(category_path or "").split("/")
-                  if p.strip()]
-        if not target:
-            return []
-        result: List[str] = []
-        for s in sorted(self._sets, key=lambda x: str(
-                x.get("display_name") or x.get("set_id") or "").lower()):
-            parts = [p.lower() for p in self._set_category_parts(s)]
-            if len(parts) >= len(target) and parts[:len(target)] == target:
-                result.append(str(s.get("set_id") or ""))
-        return result
+        from analytics.engine.tree_builder import category_set_ids
+        return category_set_ids(self._sets, category_path)
 
     def plugin_category_path(self, plugin_id: str) -> str:
         """Aktueller Kategorie-Pfad eines Plugins (lesend, 18.01.03).
@@ -682,11 +521,10 @@ class ServiceSelectorModel(QObject):
         leer = Root-Ebene. Grundlage fuer die Ordner-Verschiebung und
         Rename-String-Replace im Orchestrator.
         """
-        if not plugin_id:
-            return ""
+        from analytics.engine.tree_builder import plugin_category_path
         plugin = self.get_plugin(plugin_id)
-        parts = self._category_parts(plugin_id, plugin) if plugin else []
-        return "/".join(parts)
+        return plugin_category_path(plugin_id, plugin,
+                                    self._plugin_category_overrides)
 
     def category_service_plugin_ids(self, group: str,
                                     category_path: str) -> List[str]:
@@ -701,41 +539,11 @@ class ServiceSelectorModel(QObject):
         Leerer Pfad/leere Gruppe -> [] (defensiv). Wird von den Run-/Info-
         Aktionen des ServiceWindow und der Picker-Aufloesung genutzt.
         """
-        if str(group or "") == str(self.GROUP_SETS):
-            ids: List[str] = []
-            for set_id in self.category_set_ids(category_path):
-                definition = self.find_set(set_id) or {}
-                services = definition.get("services") or {}
-                order = definition.get("execution_order") \
-                    or list(services.keys())
-                for iid in order:
-                    cfg = services.get(iid) or {}
-                    pid = str(cfg.get("plugin_id") or iid)
-                    if pid and pid not in ids:
-                        ids.append(pid)
-            return ids
-        return self.category_plugin_ids(category_path)
-
-    def _category_nodes(self, plugin_ids: List[str]) -> List[Dict[str, Any]]:
-        """Baut die (ggf. verschachtelte) Kinderliste einer Plugin-Gruppe.
-
-        Plugins mit Kategorienpfad werden in 📁-Ordner einsortiert; Plugins
-        ohne Kategorie (bzw. Default 'General') bleiben auf oberster Ebene
-        (K1). Blatt-Dicts unveraendert ({plugin_id, badge, last_execution}).
-        Sortierung pro Ebene: Ordner vor Blaettern, alphabetisch (K8).
-        """
-        plugins = self.get_plugins()
-        root: List[Dict[str, Any]] = []
-        for pid in plugin_ids:
-            plugin = plugins.get(pid)
-            parts = self._category_parts(pid, plugin)
-            leaf = {
-                "plugin_id": pid,
-                "badge": self.badge_for(pid),
-                "last_execution": self.last_execution_date(pid),
-            }
-            self._insert_into_category_tree(root, parts, leaf)
-        return self._sort_category_nodes(root)
+        from analytics.engine.tree_builder import category_service_plugin_ids
+        return category_service_plugin_ids(group, self._sets,
+                                           self.get_plugins(),
+                                           self._plugin_category_overrides,
+                                           category_path)
 
     def build_tree(self) -> List[Dict[str, Any]]:
         """Baut die vollstaendige Hierarchie fuer das 2-Spalten-MasterTree.
@@ -754,81 +562,19 @@ class ServiceSelectorModel(QObject):
               "children": [Blatt- und/oder Ordner-Knoten ...]}]
 
         Deterministisch sortiert (Sets nach display_name; Plugins/Ordner
-        alphabetisch, 16.08 K8). Seit 16.08 (K2) sind die Kinder der
-        Plugin-Gruppen eine Mischung aus flachen Blatt-Dicts
-        ({plugin_id, badge, last_execution}) und verschachtelten
-        Ordner-Dicts ({"group": GROUP_CATEGORY, "label": "📁 <Name>",
-        "children": [...]} – rekursiv), gesteuert ueber das Metadaten-Feld
-        `category` der Plugins (K1). Seit 18.01.03 gilt dieselbe Ordner-
-        Mechanik auch fuer die Sets-Gruppe: Set-Definitionen mit dem
-        optionalen Feld `category` werden in identische Ordner-Dicts
-        einsortiert (K2/K8/K9 analog), Sets ohne Kategorie bleiben flache
-        Blaetter auf oberster Ebene. Seit 18.01.03 (E3-revidiert) werden
-        zusaetzlich benutzererzeugte (ggf. leere) Ordner aus global_settings
-        (Key 'tree_folders_<group>') in die Gruppen-Kinder eingemischt –
-        leere Ordner bleiben dadurch ueber Refreshs erhalten und
-        verschwinden NUR bei manueller Loeschung im Kontextmenue.
+        alphabetisch, 16.08 K8). Die Baum-Logik selbst ist seit 18.01.02 (E6)
+        in `analytics/engine/tree_builder.build_tree` ausgelagert – dieses
+        Modell berechnet lediglich die Badges/Ausfuehrungsdaten und delegiert.
         """
-        sets = sorted(self._sets,
-                      key=lambda s: str(s.get("display_name") or s.get("set_id") or "").lower())
-        # 18.01.03: Sets-Kategorien (Dynamic Category Trees fuer GROUP_SETS).
-        # Set-Definitionen mit `category`-Pfad werden in 📁-Ordner einsortiert
-        # (rekursiv, gleiche K2/K8/K9-Regeln wie die Plugins); ohne Kategorie
-        # bleiben sie flache Blaetter auf oberster Ebene. Der MasterTree
-        # baut daraus identische Ordner-Knoten wie bei den Plugins
-        # (gruppen-agnostische Rekursion).
-        set_nodes: List[Dict[str, Any]] = []
-        for s in sets:
-            services = s.get("services") or {}
-            order = s.get("execution_order") or []
-            service_nodes: List[Dict[str, Any]] = []
-            for iid in order:
-                cfg = services.get(iid) or {}
-                pid = str(cfg.get("plugin_id") or iid)
-                service_nodes.append({
-                    "instance_id": iid,
-                    "plugin_id": pid,
-                    "badge": self.badge_for(pid),
-                    # 05.08.2026: Datum der letzten Ausfuehrung (DD.MM.JJ) –
-                    # MasterTree haengt es direkt an den Service-Namen an.
-                    "last_execution": self.last_execution_date(pid),
-                })
-            self._insert_set_into_category_tree(
-                set_nodes, self._set_category_parts(s), {
-                    "set_id": s.get("set_id"),
-                    "display_name": s.get("display_name") or s.get("set_id") or "Unbenannt",
-                    "definition": s,
-                    "services": service_nodes,
-                })
-        set_nodes = self._sort_category_nodes(set_nodes)
-
-        # 16.08 (K2/K8) + 17.01.01: EINE kategorisierte Services-Gruppe –
-        # Plugins mit `category`-Metadatum werden in 📁-Ordner verschachtelt
-        # (K1), ohne Kategorie bleiben sie flache Blaetter auf oberster Ebene.
-        # Die fruehere Standalone-Gruppe (separate Knoten) ist entfallen.
-        plugin_nodes = self._category_nodes(sorted(self.get_plugins().keys()))
-
-        # 18.01.03 (E3-revidiert): Persistierte benutzererzeugte (ggf. leere)
-        # Ordner in die Gruppen-Kinder einmischen – leere Ordner verschwinden
-        # damit NICHT beim Refresh, sondern nur bei manueller Loeschung
-        # (Kontextmenue 'Ordner löschen'). Bereits vorhandene Ordner (aus
-        # echten Blatt-Kategorien) werden wiederverwendet (kein Duplikat).
-        for group, nodes in ((self.GROUP_SETS, set_nodes),
-                             (self.GROUP_PLUGINS, plugin_nodes)):
-            for path in self._empty_folder_paths.get(group, []) or []:
-                parts = [p.strip() for p in str(path or "").split("/")
-                         if p.strip()]
-                if parts:
-                    self._ensure_category_path(nodes, parts)
-        set_nodes = self._sort_category_nodes(set_nodes)
-        plugin_nodes = self._sort_category_nodes(plugin_nodes)
-
-        return [
-            {"group": self.GROUP_SETS, "label": "📁 Sets",
-             "children": set_nodes},
-            {"group": self.GROUP_PLUGINS, "label": "📦 Services",
-             "children": plugin_nodes},
-        ]
+        from analytics.engine.tree_builder import build_tree as _tb_build_tree
+        plugins = self.get_plugins()
+        badges: Dict[str, str] = {pid: self.badge_for(pid) for pid in plugins}
+        last_executions: Dict[str, str] = {
+            pid: self.last_execution_date(pid) for pid in plugins}
+        return _tb_build_tree(self._sets, plugins,
+                              self._plugin_category_overrides,
+                              self._empty_folder_paths,
+                              badges, last_executions)
 
     def find_set(self, set_id: str) -> Optional[Dict[str, Any]]:
         """Liefert die Set-Definition zur set_id (oder None)."""

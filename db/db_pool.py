@@ -1,0 +1,146 @@
+# db/db_pool.py
+"""
+db/db_pool.py - Thread-lokaler DuckDB-Verbindungspool & DB-Pfad-Konstanten.
+
+Ausgelagert aus db_service.py im Rahmen von 18.01.02 (Refactoring &
+Modularisierung, Pruefprotokoll-Entscheidung E3). Enthaelt:
+
+  * `DATA_DIR` / `DB_MARKET_DATA` / `DB_ANALYTICS` / `DB_APP_DATA` (Pfad-Konstanten)
+  * `DbPool` (Thread-local Singleton: eine Connection pro Thread & DB-Datei)
+  * `_LockedConnection` (LEGACY-Wrapper) und `db_connect` (LEGACY)
+  * `with_db_lock` (No-op Decorator, API-Kompatibilitaet)
+
+Basis-Schicht (E4): kein Import anderer Projekt-Module.
+"""
+
+import os
+import threading
+from typing import Dict
+
+import duckdb
+
+# ==============================================================================
+# CONFIGURATION & THREAD SAFETY
+# ==============================================================================
+DATA_DIR = "data"
+DB_MARKET_DATA = os.path.join(DATA_DIR, "market_data.duckdb")
+DB_ANALYTICS = os.path.join(DATA_DIR, "analytics.duckdb")
+DB_APP_DATA = os.path.join(DATA_DIR, "app_data.duckdb")
+
+# ==============================================================================
+# DB LOCK-FREIER CONNECTION-HELPER
+# ==============================================================================
+# DuckDB unterstützt Multiple Connections innerhalb eines Prozesses nativ.
+# Threading-Locks sind hier kontraproduktiv, da sie z. B. eine dauerhaft
+# offene Haupt-Connection (self.db in MainWindow) blockieren.
+# Cross-Prozess-Konflikte (IO Error: file is already open) werden durch
+# sauberes Beenden vorheriger Prozesse gelöst, nicht durch threading.Lock.
+
+
+def with_db_lock(db_path: str):
+    """No-op decorator (Lock-frei). Beibehalten für API-Kompatibilität."""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+# ==============================================================================
+# DB CONNECTION POOL (Thread-local Singleton) – eine Connection pro Thread & DB
+# ==============================================================================
+# Loest drei Kernprobleme unter Windows:
+#   1. "Can't open a connection with a different configuration" – immer gleiche Config
+#   2. "Cannot open file – file used by another process" – keine Open/Close-Zyklen
+#   3. DuckDB-Connections sind nicht thread-safe – eigenes Connection pro Thread
+#
+# Nutzung: DbPool.get(db_path) statt db_connect(db_path)
+# Connections werden automatisch via atexit geschlossen.
+
+_db_pool_lock = threading.Lock()
+_db_pool_global: Dict[str, int] = {}  # abs_path -> Referenzzähler (fuer atexit)
+
+
+class DbPool:
+    """Thread-sicherer Connection-Pool: eine persistente Connection pro Thread & DB-Datei."""
+
+    _local = threading.local()
+
+    @staticmethod
+    def get(db_path: str) -> duckdb.DuckDBPyConnection:
+        """Gibt eine persistente Connection zur DB-Datei zurueck (eine pro Thread).
+        Die Connection lebt bis Prozess-Ende und wird nie geschlossen."""
+        abs_path = os.path.abspath(db_path)
+        # Thread-local Storage: Jeder Thread hat seine eigenen Connections
+        if not hasattr(DbPool._local, 'conns'):
+            DbPool._local.conns = {}
+        if abs_path not in DbPool._local.conns:
+            DbPool._local.conns[abs_path] = duckdb.connect(abs_path)
+            # Globalen Referenzzähler erhöhen (für atexit)
+            with _db_pool_lock:
+                if _db_pool_global.get(abs_path, 0) == 0:
+                    import atexit
+                    atexit.register(lambda p=abs_path: DbPool._close_all_for(p))
+                _db_pool_global[abs_path] = _db_pool_global.get(abs_path, 0) + 1
+        return DbPool._local.conns[abs_path]
+
+    @staticmethod
+    def _close_all_for(abs_path: str) -> None:
+        """Schliesst ALLE Connections zu einer DB-Datei (fuer atexit)."""
+        # Kann nur die Connections des aktuellen Threads schliessen
+        if hasattr(DbPool._local, 'conns'):
+            con = DbPool._local.conns.pop(abs_path, None)
+            if con is not None:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def close_all() -> None:
+        """Schliesst ALLE Connections des aktuellen Threads.
+
+        Dekrementiert dabei den globalen Referenzzaehler, damit der
+        atexit-Bookkeeping-Dict (Fix 15.03, Worker-Connection-Leak) nicht
+        unbegrenzt waechst. Wird u. a. von AnalyticsAsyncWorker nach jeder
+        Abfrage aufgerufen (Worker-Thread gibt seine Connection frei; ein
+        neuer Worker-Thread erhaelt automatisch eine frische Connection).
+        """
+        if hasattr(DbPool._local, 'conns'):
+            for abs_path in list(DbPool._local.conns.keys()):
+                try:
+                    DbPool._local.conns[abs_path].close()
+                except Exception:
+                    pass
+                with _db_pool_lock:
+                    _db_pool_global[abs_path] = max(
+                        0, _db_pool_global.get(abs_path, 0) - 1)
+            DbPool._local.conns = {}
+
+
+class _LockedConnection:
+    """Wrapper um DuckDBPyConnection (LEGACY – nur noch fuer sync_market_data & MarketDataRepository).
+    Oeffnet/schliesst die Connection bei jedem Aufruf.
+    """
+
+    def __init__(self, con: duckdb.DuckDBPyConnection):
+        self._con = con
+
+    def __getattr__(self, name):
+        return getattr(self._con, name)
+
+    def close(self):
+        try:
+            self._con.close()
+        finally:
+            pass
+
+
+def db_connect(db_path: str, read_only: bool = False) -> _LockedConnection:
+    """LEGACY: Oeffnet eine neue Connection (wird geschlossen nach Gebrauch).
+
+    Warnung: Nicht fuer haeufige Zugriffe verwenden!
+    Nutze stattdessen: DbPool.get(db_path)
+    """
+    con = duckdb.connect(db_path, read_only=read_only)
+    return _LockedConnection(con)

@@ -6,9 +6,8 @@ main.py - Haupt-Orchestrator für PyTrader mit Multi-Monitor-Sicherheitsprüfung
 import json
 import os
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 # CHROMIUM MULTI-MONITOR & OCCLUSION RENDER FIX (Vor QApplication Import setzen)
 os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
@@ -20,15 +19,12 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
     "--num-raster-threads=4"
 )
 
-import MetaTrader5 as mt5
 import duckdb
-from PySide6.QtCore import QFile, QIODevice, QThread, QTimer, Signal, Slot, Qt
-from PySide6.QtGui import QScreen
+from PySide6.QtCore import QFile, QIODevice, QTimer, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
-    QMessageBox,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -37,15 +33,18 @@ from PySide6.QtWidgets import (
 from chart.chart_win import PyTraderChartWindow
 from state_manager import StateManager
 from persistent_win import PersistentWindow
-from db_service import get_timeframes, TF_SECONDS_MAP, MT5_LOCK, DbPool
-import db_service
 from symbol_repository import get_symbol_repository
-from serviceui.service_win import ServiceWindow
-from analytics.ui.analytics_win import AnalyticsWindow
-from properties_win import PropertiesWindow
 from config.app_settings import AppSettings
 from config.event_bus import event_bus
 from analytics.background_workers.live_analyzer import LiveAnalyzer
+
+# 18.01.02 (E7): db-Basisschicht, Sync-Service, Worker & WindowManager
+from db.db_pool import DbPool
+from db.schema_initializer import check_and_init_databases
+from data_sync.mt5_sync_service import check_mt5_connection
+from workers.data_sync_worker import DataSyncWorker
+from workers.live_tick_worker import LiveTickWorker
+from ui.window_manager import WindowManager
 
 # ==============================================================================
 # KONSOLE: UTF-8 erzwingen – verhindert UnicodeEncodeError bei Emojis/Log-Ausgaben
@@ -61,130 +60,6 @@ for _stream in (sys.stdout, sys.stderr):
 BASE_DIR = Path(__file__).resolve().parent
 
 
-class DataSyncWorker(QThread):
-    sync_completed = Signal(object)
-
-    def run(self) -> None:
-        """Führt den Hintergrund-Sync für alle historischen Daten aus."""
-        try:
-            updated_pairs: Set[Tuple[str, str]] = db_service.sync_market_data()
-            self.sync_completed.emit(updated_pairs)
-        except Exception as e:
-            print(f"❌ Fehler im DataSyncWorker: {e}")
-            self.sync_completed.emit(set())
-
-
-class LiveTickWorker(QThread):
-    ticks_ready = Signal(str)
-
-    def __init__(self, get_active_pairs_callback: Callable[[], Set[Tuple[str, str]]]) -> None:
-        super().__init__()
-        self.get_active_pairs: Callable[[], Set[Tuple[str, str]]] = get_active_pairs_callback
-        self._running: bool = True
-        self._last_bar_times: Dict[str, int] = {}  # Für Bar-Close-Erkennung
-        self._last_bar_data: Dict[str, Dict[str, Any]] = {}  # OHLCV der letzten abgeschlossenen Kerze
-
-    def stop(self) -> None:
-        self._running = False
-
-    def run(self) -> None:
-        """Kontinuierliche Polling-Schleife für MT5-Ticks mit try/finally Freigabe.
-        Erkennt Bar-Close-Events und schreibt abgeschlossene Kerzen in market_data.duckdb."""
-        try:
-            with MT5_LOCK:
-                if not mt5.initialize():
-                    # MT5 ist möglicherweise bereits von MainWindow initialisiert
-                    print("⚠️ [LiveTickWorker] mt5.initialize() war False, versuche trotzdem weiter...")
-
-            while self._running:
-                active_pairs: Set[Tuple[str, str]] = self.get_active_pairs()
-                if not active_pairs:
-                    self.msleep(200)
-                    continue
-
-                results: Dict[str, Dict[str, float | int]] = {}
-                try:
-                    for symbol, tf_str in active_pairs:
-                        mt5_tf: Optional[int] = get_timeframes().get(tf_str)
-                        if mt5_tf is None:
-                            continue
-
-                        with MT5_LOCK:
-                            tick = mt5.symbol_info_tick(symbol)
-                            rates = mt5.copy_rates_from_pos(symbol, mt5_tf, 0, 1)
-
-                        if tick and rates is not None and len(rates) > 0:
-                            rate = rates[0]
-                            key: str = f"{symbol}|{tf_str}"
-                            current_bar_time = int(rate['time'])
-
-                            # Bar-Close erkennen: neue Bar-Time != letzte Bar-Time
-                            last_bar = self._last_bar_times.get(key, 0)
-                            if last_bar > 0 and current_bar_time > last_bar:
-                                # Alte (abgeschlossene) Kerze aus dem Zwischenspeicher in DB schreiben
-                                last_data = self._last_bar_data.get(key)
-                                if last_data:
-                                    self._persist_bar(symbol, tf_str, last_bar, last_data)
-
-                            # Aktuelle Kerze zwischenspeichern (wird beim nächsten Bar-Close persistiert)
-                            self._last_bar_times[key] = current_bar_time
-                            self._last_bar_data[key] = {
-                                'open': float(rate[1]),  # open
-                                'high': float(rate[2]),  # high
-                                'low': float(rate[3]),   # low
-                                'close': float(rate[4]), # close
-                                'tick_volume': int(rate[5]) if len(rate) > 5 else 0,
-                                'spread': int(rate[6]) if len(rate) > 6 else 0,
-                                'real_volume': int(rate[7]) if len(rate) > 7 else 0,
-                            }
-
-                            # JEDEN Tick an die Charts senden (für Live-Candle-Updates)
-                            results[key] = {
-                                "time": current_bar_time,
-                                "open": float(rate['open']),
-                                "high": max(float(rate['high']), float(tick.bid)),
-                                "low": min(float(rate['low']), float(tick.bid)),
-                                "close": float(tick.bid)
-                            }
-                except Exception as e:
-                    print(f"⚠️ [LiveTickWorker] Fehler in Poll-Schleife: {e}")
-
-                if results:
-                    self.ticks_ready.emit(json.dumps(results))
-
-                self.msleep(500)
-
-        finally:
-            with MT5_LOCK:
-                try:
-                    mt5.shutdown()
-                except Exception:
-                    pass
-
-    def _persist_bar(self, symbol: str, tf_str: str, bar_time: int, bar_data: Dict[str, Any]) -> None:
-        """Schreibt eine abgeschlossene Kerze per INSERT OR REPLACE in market_data.duckdb."""
-        try:
-            from db_service import DB_MARKET_DATA, DbPool
-            con = DbPool.get(DB_MARKET_DATA)
-            con.execute("""
-                INSERT OR REPLACE INTO ohlcv_bars (symbol, timeframe, time, open, high, low, close, tick_volume, spread, real_volume)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, [
-                symbol,
-                tf_str,
-                datetime.fromtimestamp(bar_time, tz=timezone.utc),
-                bar_data['open'],
-                bar_data['high'],
-                bar_data['low'],
-                bar_data['close'],
-                bar_data['tick_volume'],
-                bar_data['spread'],
-                bar_data['real_volume'],
-            ])
-        except Exception as e:
-            print(f"⚠️ [LiveTickWorker] Fehler beim Persistieren von {symbol} {tf_str} @ {bar_time}: {e}")
-
-
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -193,6 +68,14 @@ class MainWindow(QMainWindow):
         self.settings: AppSettings = self.state_manager.get_app_settings()
         self.chart_windows: List[PyTraderChartWindow] = []
         self.persistent_sub_windows: List[PersistentWindow] = []
+        # 18.01.02 (E5): Fenster-Lifecycle in WindowManager ausgelagert
+        # (gemeinsame Listen-Referenzen, in-place-Mutationen).
+        self.window_manager: WindowManager = WindowManager(
+            parent=self,
+            state_manager=self.state_manager,
+            chart_windows=self.chart_windows,
+            persistent_sub_windows=self.persistent_sub_windows,
+        )
         self.sync_thread: Optional[DataSyncWorker] = None
         self.pending_ticks_buffer: Dict[str, Dict[str, float | int]] = {}
         self._pending_ticks_timer: QTimer = QTimer(self)
@@ -215,7 +98,7 @@ class MainWindow(QMainWindow):
 
         self.btn_open_chart: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_open_chart")
         if self.btn_open_chart:
-            self.btn_open_chart.clicked.connect(self.open_chart_window)
+            self.btn_open_chart.clicked.connect(self.window_manager.open_chart_window)
 
         self.btn_refresh_db: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_refresh_db")
         if self.btn_refresh_db:
@@ -223,21 +106,21 @@ class MainWindow(QMainWindow):
 
         self.btn_service: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_service")
         if self.btn_service:
-            self.btn_service.clicked.connect(self.open_service_window)
+            self.btn_service.clicked.connect(self.window_manager.open_service_window)
 
         self.btn_statistics: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_statistics")
         if self.btn_statistics:
-            self.btn_statistics.clicked.connect(self.open_analytics_window)
+            self.btn_statistics.clicked.connect(self.window_manager.open_analytics_window)
 
         self.btn_properties: Optional[QPushButton] = self.ui.findChild(QPushButton, "btn_properties")
         if self.btn_properties:
-            self.btn_properties.clicked.connect(self.open_properties_window)
+            self.btn_properties.clicked.connect(self.window_manager.open_properties_window)
 
         # Datenbanken initialisieren (Tabellen anlegen/updaten) bevor irgendetwas
         # auf analytics.duckdb oder andere DBs zugreift.
-        db_service.check_and_init_databases()
+        check_and_init_databases()
 
-        db_service.check_mt5_connection()
+        check_mt5_connection()
 
         # Phase 15 15.01-Nachtrag 3 (User-Anweisung 04.08.2026): Alle Broker-
         # Symbole werden NUR beim App-Start EINMALIG live von MT5 geladen und
@@ -267,7 +150,7 @@ class MainWindow(QMainWindow):
 
         self.restore_main_window_geometry()
 
-        QTimer.singleShot(200, self.restore_all_windows)
+        QTimer.singleShot(200, self.window_manager.restore_all_windows)
 
         self.sync_timer: QTimer = QTimer(self)
         self.sync_timer.setInterval(45000)
@@ -284,7 +167,8 @@ class MainWindow(QMainWindow):
         event_bus.service_run_started.connect(self._on_service_run_started)
         event_bus.service_run_finished.connect(self._on_service_run_finished)
 
-        self.tick_worker: LiveTickWorker = LiveTickWorker(self.get_currently_active_pairs)
+        self.tick_worker: LiveTickWorker = LiveTickWorker(
+            self.window_manager.get_currently_active_pairs)
         self.tick_worker.ticks_ready.connect(self.on_ticks_ready)
         self.tick_worker.start()
 
@@ -333,181 +217,21 @@ class MainWindow(QMainWindow):
         else:
             self.resize(1000, 600)
 
-    def restore_all_windows(self) -> None:
-        """Stellt ALLE gespeicherten Fenster vollautomatisch und generisch wieder her.
-        
-        Nutzt die Klassen-Registry aus persistent_win.py, um ohne Hardcoding
-        zwischen PersistentWindow-Subklassen (Service, Statistik) und
-        dynamischen Chart-Fenstern zu unterscheiden.
-        """
-        all_instances: List[Dict[str, Any]] = self.state_manager.load_all_instances()
-        if not all_instances:
-            print("✨ Keine gespeicherten Instanzen vorhanden.")
-            return
-
-        print(f"🔄 Prüfe {len(all_instances)} gespeicherte Fenster-Einträge...")
-
-        for inst in all_instances:
-            inst_id = str(inst.get("instance_id", ""))
-            if not inst_id or inst_id == "win_main":
-                continue
-
-            # 1. Fall: Registrierte PersistentWindow-Subklasse (Service, Statistik, etc.)
-            window_cls = PersistentWindow.get_registered_class(inst_id)
-            if window_cls is not None:
-                if not PersistentWindow.should_auto_restore(inst_id):
-                    print(f"  → Überspringe {inst_id} ({window_cls.__name__}): auto_restore=False")
-                    continue
-                print(f"  → Öffne registriertes Fenster: {inst_id} ({window_cls.__name__})")
-                # WICHTIG: parent=self nur für state_manager-Zugriff, nicht als Qt-Parent!
-                # PersistentWindow.__init__() übergibt kein Parent an QMainWindow,
-                # damit das Fenster einen eigenen Taskleisten-Eintrag hat.
-                win = window_cls(parent=self)
-                self.persistent_sub_windows.append(win)
-                # Ohne Fokus anzeigen (damit MainWindow den Fokus behält)
-                win.setAttribute(Qt.WA_ShowWithoutActivating, True)
-                win.show()
-                win.setAttribute(Qt.WA_ShowWithoutActivating, False)
-                # Maximiert wiederherstellen (nach show(), ohne Fokus-Klau)
-                if getattr(win, '_restored_is_maximized', False):
-                    win.showMaximized()
-                continue
-
-            # 2. Fall: Dynamische Chart-Fenster (win_1, win_2, ...)
-            if inst_id.startswith("win_"):
-                print(f"  → Öffne Chart-Fenster: {inst_id}")
-                win = PyTraderChartWindow(
-                    instance_id=inst_id,
-                    symbol=inst.get("symbol") or "SILVER",
-                    timeframe=inst.get("timeframe") or "H1",
-                    visible_from=inst.get("visible_range_from"),
-                    visible_to=inst.get("visible_range_to"),
-                    state_manager=self.state_manager
-                )
-                win.closed_signal.connect(self.handle_chart_closed)
-
-                # Geometrie anwenden
-                screen_geo = QApplication.primaryScreen().availableGeometry()
-                pos_x, pos_y = inst.get("pos_x"), inst.get("pos_y")
-                width = inst.get("width") or 900
-                height = inst.get("height") or 600
-
-                if pos_x is not None and pos_y is not None:
-                    if pos_x < screen_geo.x() - 100 or pos_x > screen_geo.right() or \
-                       pos_y < screen_geo.y() - 100 or pos_y > screen_geo.bottom():
-                        pos_x, pos_y = 100, 100
-                    win.move(pos_x, pos_y)
-                    win.resize(width, height)
-
-                if inst.get("is_maximized"):
-                    win.showMaximized()
-                else:
-                    win.setAttribute(Qt.WA_ShowWithoutActivating, True)
-                    win.show()
-                    win.setAttribute(Qt.WA_ShowWithoutActivating, False)
-
-                self.chart_windows.append(win)
-
-        # MainWindow NICHT in den Vordergrund holen – die WA_ShowWithoutActivating-Logik
-        # bei den Sub-Fenstern verhindert bereits Fokus-Klau. Ein erzwungenes
-        # raise_() + activateWindow() würde nur stören, falls der User inzwischen
-        # eine andere Anwendung fokussiert hat.
-
     def open_chart_window(self) -> None:
-        new_id: str = self.state_manager.get_next_instance_id()
-        win = PyTraderChartWindow(
-            instance_id=new_id,
-            symbol="SILVER",
-            timeframe="H1",
-            visible_from=None,
-            visible_to=None,
-            state_manager=self.state_manager
-        )
-        win.closed_signal.connect(self.handle_chart_closed)
-        win.show()
-        self.chart_windows.append(win)
+        """Delegation an WindowManager (18.01.02 E5).
 
-    @Slot(str)
-    def handle_chart_closed(self, instance_id: str) -> None:
-        app = QApplication.instance()
-        if getattr(app, '_is_quitting', False): return
-        self.chart_windows = [w for w in self.chart_windows if w.instance_id != instance_id]
-
-    def open_service_window(self) -> None:
-        # Singleton: Bestehendes Fenster in den Vordergrund holen
-        existing = ServiceWindow.get_existing_instance()
-        if existing is not None:
-            existing.raise_()
-            existing.activateWindow()
-            return
-        win = ServiceWindow(self)  # parent=self nur für state_manager-Zugriff
-        self.persistent_sub_windows.append(win)
-        win.show()
-
-    def open_analytics_window(self) -> None:
-        # Phase 15 15.03: Statistik-Fenster durch AnalyticsWindow ersetzt
-        # (win_statistics-Persistenz wird per E-2 nach win_analytics migriert).
-        # Singleton: Bestehendes Fenster in den Vordergrund holen
-        existing = AnalyticsWindow.get_existing_instance()
-        if existing is not None:
-            existing.raise_()
-            existing.activateWindow()
-            return
-        win = AnalyticsWindow(self)  # parent=self nur für state_manager-Zugriff
-        self.persistent_sub_windows.append(win)
-        win.show()
-
-    def open_properties_window(self) -> None:
-        # Singleton: Bestehendes Fenster in den Vordergrund holen
-        existing = PropertiesWindow.get_existing_instance()
-        if existing is not None:
-            existing.raise_()
-            existing.activateWindow()
-            return
-        win = PropertiesWindow(self)
-        self.persistent_sub_windows.append(win)
-        win.show()
+        API-Kompatibilitaet fuer statistic_win/analytics_win
+        (Jump-to-Chart-Variante 2, hasattr-Check).
+        """
+        self.window_manager.open_chart_window()
 
     def open_chart_at_bar(self, symbol: str, timeframe: str, bar_time: int) -> None:
-        """Oeffnet oder fokussiert ein Chart-Fenster und scrollt zur angegebenen Bar-Position."""
-        # Bestehendes Chart-Fenster mit passendem Symbol/TF suchen
-        for win in self.chart_windows:
-            try:
-                if win.current_symbol == symbol and win.current_tf == timeframe and win.isVisible():
-                    win.raise_()
-                    win.activateWindow()
-                    # Chart zur Position scrollen
-                    win.visible_from = bar_time
-                    win.visible_to = None
-                    win.refresh_chart_data()
-                    return
-            except (RuntimeError, AttributeError):
-                pass
+        """Delegation an WindowManager (18.01.02 E5).
 
-        # Kein passendes Fenster gefunden -> neues oeffnen
-        from chart.chart_win import PyTraderChartWindow
-        new_id: str = self.state_manager.get_next_instance_id()
-        win = PyTraderChartWindow(
-            instance_id=new_id,
-            symbol=symbol,
-            timeframe=timeframe,
-            visible_from=bar_time,
-            visible_to=None,
-            state_manager=self.state_manager
-        )
-        win.closed_signal.connect(self.handle_chart_closed)
-        win.show()
-        self.chart_windows.append(win)
-
-    def get_currently_active_pairs(self) -> Set[Tuple[str, str]]:
-        active_pairs = set()
-        for win in list(self.chart_windows):
-            try:
-                if win.isVisible():
-                    active_pairs.add((win.current_symbol, win.current_tf))
-            except (RuntimeError, AttributeError):
-                pass
-        return active_pairs
+        API-Kompatibilitaet fuer statistic_win/analytics_win
+        (Jump-to-Chart-Variante 2, hasattr-Check).
+        """
+        self.window_manager.open_chart_at_bar(symbol, timeframe, bar_time)
 
     def trigger_background_sync(self) -> None:
         if self.sync_thread is not None and self.sync_thread.isRunning():
