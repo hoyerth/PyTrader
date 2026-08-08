@@ -1256,6 +1256,12 @@ class MasterTree(QTreeWidget):
                 set_id = str(item.data(0, ROLE_SET_ID) or "")
             elif node_type == TYPE_PLUGIN:
                 plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
+            elif node_type == TYPE_CATEGORY:
+                # 18.01.01 (E-4): Kategorie-Ordner liefern den VOLLEN
+                # Kategorie-Pfad (z.B. 'Swing Points/Geometrie') im
+                # plugin_id-Slot – Grundlage fuer die ID-Aufloesung im
+                # AnalyticsWindow (Baum-Selektion -> set_feature_ids).
+                plugin_id = self._category_path_of(item)
             self.selection_details.emit(node_type, set_id, service_id,
                                         plugin_id)
         except (RuntimeError, AttributeError):

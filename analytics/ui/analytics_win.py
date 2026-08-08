@@ -14,10 +14,11 @@ MVVM-Orchestrator (Invariante 4, kein SQL in der UI):
 Aufgaben (15.03-Spezifikation):
 - Top-Bar: Profil-CRUD (Option B – Explicit Save, Dirty-Flag '*').
 - Sidebar-Navigation: Tabelle, Heatmap, Scatter, Verteilung, Equity.
-- 15.03-E: Datenquellen-Dialog (`ServiceSelectorDialog`, Multi-Select) ersetzt
-  das alte combo_feature-Dropdown UND das Service-Filter-Popover – Checkbox-
-  MasterTree (Sets/Services/Standalone/Plugins), Button `[ 🛠️ Datenquellen:
-  ... ▾ ]`, ViewModel `set_feature_ids(...)`, SQL `WHERE feature_id IN (...)`.
+- 15.03-E + 18.01.01 (E-4): Datenquellen-Filter DIREKT im Fenster (ersetzt
+  den `ServiceSelectorDialog`): Checkbox-MasterTree (Sets/Ordner/Services/
+  Plugins) mit Baum-Selektion -> `set_feature_ids(...)` und editierbarem
+  Standalone-Param-Panel (`plugin_params_<id>` + EventBus-Sync E-3),
+  SQL `WHERE feature_id IN (...)`.
 - Jump-to-Chart (Variante 2): open_chart_at_bar(symbol, tf, bar_time)
   und Chart-Fenster in den Vordergrund holen.
 - E-2: Migration der win_statistics-Persistenz nach win_analytics
@@ -40,6 +41,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -56,7 +58,8 @@ from persistent_win import PersistentWindow, register_persistent_window
 from state_manager import StateManager
 from symbol_repository import SymbolRepository, get_symbol_repository
 from config.event_bus import event_bus
-from serviceui.service_selector_dialog import ServiceSelectorDialog
+from serviceui.master_tree import MasterTree
+from serviceui.param_columns import ServiceParamColumnsMixin
 from serviceui.symbols_win import SymbolsWindow
 
 # Im AnalyticsWindow angebotene Timeframes (Feature-Store-Auswahl).
@@ -134,8 +137,13 @@ def migrate_statistics_persistence(
 
 
 @register_persistent_window()
-class AnalyticsWindow(PersistentWindow):
-    """Analytics-Hauptfenster (win_analytics, 1280 x 800, nicht-modal)."""
+class AnalyticsWindow(ServiceParamColumnsMixin, PersistentWindow):
+    """Analytics-Hauptfenster (win_analytics, 1280 x 800, nicht-modal).
+
+    18.01.01 (E-4): Erbt zusaetzlich `ServiceParamColumnsMixin` – der
+    eingebettete Datenquellen-Filter rendert damit die editierbaren
+    Standalone-Parameter-Spalten direkt im Fenster (E-2: die reale
+    Param-Column-Klasse, kein 'ParamColumnsWidget')."""
 
     INSTANCE_ID = "win_analytics"
     # Bugfix 04.08.2026 (Fenster-Historie): auto_restore=True – das Fenster
@@ -171,17 +179,19 @@ class AnalyticsWindow(PersistentWindow):
         except Exception:
             self._default_limit = 10_000
 
-        # 15.03-E: Datenquellen-Dialog (ServiceSelectorDialog, Multi-Select)
-        # ersetzt das fruehere Service-Filter-Popover. Das
-        # ServiceSelectorModel ist injizierbar (Headless-Tests); der Dialog
-        # wird lazy erzeugt (nicht-modal) und beim Schliessen zerstört.
+        # 15.03-E + 18.01.01 (E-4): Das ServiceSelectorModel ist injizierbar
+        # (Headless-Tests). Seit 18.01.01 ist der Datenquellen-Filter KEIN
+        # Dialog mehr, sondern der eingebettete MasterTree (Checkbox-Multi-
+        # Select, Baum-Selektion -> set_feature_ids) mit editierbarem
+        # Standalone-Param-Panel (Option B).
         self._selector_model: ServiceSelectorModel = (
             selector_model or ServiceSelectorModel(parent=self))
-        self._service_dialog: Optional[ServiceSelectorDialog] = None
-        #: Anzeigenamen des aktiven Datenquellen-Filters (fuer den Button).
-        #: Beim Profilwechsel zurueckgesetzt – Namen werden dann aus den
-        #: persistierten feature_ids ueber das Model re-resolved.
-        self._active_display_names: List[str] = []
+        # 18.01.01: Standalone-Plugin-Editierung im Analytics-Kontext –
+        # Persistenz in global_settings (Key 'plugin_params_<pid>').
+        self._current_plugin_editing: Optional[str] = None
+        self._current_set_definition: Optional[Dict[str, Any]] = None
+        #: Preisskala-Praezision je Symbol (lazy, _get_symbol_precision).
+        self._symbol_precision: Optional[int] = None
 
         self.setWindowTitle(WINDOW_TITLE_BASE)
         self.resize(1280, 800)
@@ -244,11 +254,10 @@ class AnalyticsWindow(PersistentWindow):
         top.addWidget(self.progress_busy)
         root.addLayout(top)
 
-        # --- Filter-Zeile: Symbol / TF / Datenquellen (Multi-Select) / Limit ---
-        # 15.03-E: Der Datenquellen-Button oeffnet den ServiceSelectorDialog
-        # (Multi-Select, Checkbox-MasterTree) – ersetzt das alte
-        # combo_feature-Dropdown UND das Service-Filter-Popover
-        # (Entscheidung 06.08.2026).
+        # --- Filter-Zeile: Symbol / TF / Limit ---
+        # 18.01.01 (E-4): Der Datenquellen-Button ist ersatzlos entfernt –
+        # der Multi-Select-Filter liegt seitdem als eingebetteter MasterTree
+        # im Body-Bereich (Baum-Selektion -> set_feature_ids, Option B).
         filt = QHBoxLayout()
         self.combo_symbol = QComboBox()
         self.btn_symbol_fav = QPushButton("★")
@@ -258,11 +267,6 @@ class AnalyticsWindow(PersistentWindow):
         self.combo_tf = QComboBox()
         for tf in TIMEFRAMES:
             self.combo_tf.addItem(tf, tf)
-        self.btn_data_sources = QPushButton(
-            "[ 🛠️ Datenquellen: Keiner ausgewählt ▾ ]")
-        self.btn_data_sources.setToolTip(
-            "Datenquellen wählen – öffnet den Multi-Select-Dialog "
-            "(Sets/Services/Plugins).")
         # 06.08.2026 (Punkt 5): Limit als reines TEXTFELD (keine Up/Down-
         # Pfeile). Default = 'Statistik-Signale' aus den App-Optionen
         # (statistics_signal_limit, siehe __init__).
@@ -279,14 +283,16 @@ class AnalyticsWindow(PersistentWindow):
         filt.addWidget(self.btn_symbol_fav)
         filt.addWidget(QLabel("Timeframe:"))
         filt.addWidget(self.combo_tf)
-        filt.addWidget(QLabel("Datenquellen:"))
-        filt.addWidget(self.btn_data_sources)
         filt.addWidget(QLabel("Limit:"))
         filt.addWidget(self.edit_limit)
         filt.addStretch(1)
         root.addLayout(filt)
 
-        # --- Body: Sidebar + Seiten (QStackedWidget) ---
+        # --- Body: Sidebar + Datenquellen (MasterTree + Param-Panel) + Seiten ---
+        # 18.01.01 (E-4): Der ServiceSelectorDialog ist ersatzlos in das
+        # Fenster eingebettet: Checkbox-MasterTree (Multi-Select-Filter,
+        # Klick-Selektion -> set_feature_ids) mit editierbarem Param-Panel
+        # (Standalone-Services, plugin_params_<id> + E-3 EventBus-Sync).
         body = QHBoxLayout()
         self.sidebar = QListWidget()
         self.sidebar.setFixedWidth(150)
@@ -303,76 +309,344 @@ class AnalyticsWindow(PersistentWindow):
             self.sidebar.addItem(QListWidgetItem(label))
         self.sidebar.setCurrentRow(0)
 
+        service_zone = QWidget()
+        sz = QHBoxLayout(service_zone)
+        sz.setContentsMargins(0, 0, 0, 0)
+        sz.setSpacing(6)
+
+        tree_panel = QWidget()
+        tp = QVBoxLayout(tree_panel)
+        tp.setContentsMargins(0, 0, 0, 0)
+        tp.setSpacing(4)
+        tp.addWidget(QLabel(
+            "Datenquellen (Klick = Filtern, Haken = Multi-Select):"))
+        self.service_tree = MasterTree(self._selector_model, parent=self)
+        self.service_tree.set_checkable(True)
+        # 18.01.01: Kein Struktur-/Run-Kontextmenue im Analytics-Filter –
+        # die Run-/CRUD-Aktionen gehören in das ServiceWindow.
+        self.service_tree.setContextMenuPolicy(Qt.NoContextMenu)
+        self.service_tree.setMinimumWidth(300)
+        self.service_tree.setMaximumWidth(430)
+        tp.addWidget(self.service_tree, 1)
+        sz.addWidget(tree_panel, 0)
+
+        param_panel = QWidget()
+        pp = QVBoxLayout(param_panel)
+        pp.setContentsMargins(0, 0, 0, 0)
+        pp.setSpacing(4)
+        pp.addWidget(QLabel("Service-Parameter:"))
+        self.param_scroll = QScrollArea(param_panel)
+        self.param_scroll.setWidgetResizable(True)
+        self.param_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.param_container = QWidget()
+        # 18.01.01: service_columns_layout erwartet der Param-Column-Mixin
+        # (_clear_service_columns/_build_service_column).
+        self.service_columns_layout = QHBoxLayout(self.param_container)
+        self.service_columns_layout.setContentsMargins(0, 0, 0, 0)
+        self.service_columns_layout.setSpacing(6)
+        self.param_scroll.setWidget(self.param_container)
+        pp.addWidget(self.param_scroll, 1)
+        self.btn_save_params = QPushButton("💾 Parameter speichern")
+        self.btn_save_params.setVisible(False)
+        self.btn_save_params.setToolTip(
+            "Speichert die Parameter des editierbaren Standalone-Services "
+            "(plugin_params_<id>) inkl. EventBus-Sync (E-3).")
+        pp.addWidget(self.btn_save_params)
+        sz.addWidget(param_panel, 1)
+
         body.addWidget(self.sidebar)
-        body.addWidget(self.pages_stack, 1)
+        body.addWidget(service_zone, 2)
+        body.addWidget(self.pages_stack, 3)
         root.addLayout(body, 1)
 
         self.setCentralWidget(central)
 
     # ------------------------------------------------------------------
-    # Datenquellen-Dialog (15.03-E, ServiceSelectorDialog / Multi-Select)
+    # 18.01.01 (E-4): Eingebetteter Datenquellen-Filter
+    # (MasterTree + editierbares Param-Panel, ersetzt ServiceSelectorDialog)
     # ------------------------------------------------------------------
-    @Slot()
-    def _open_service_dialog(self) -> None:
-        """Oeffnet den Datenquellen-Dialog (nicht-modal, Singleton-Lazy).
 
-        Vor dem Oeffnen wird die aktuelle ViewModel-Auswahl (feature_ids)
-        im Checkbox-Baum des Dialogs widergespiegelt (Profil/Filtersync).
-        Der Dialog wird beim Schliessen zerstört (WA_DeleteOnClose) und bei
-        Bedarf neu erzeugt – so bleibt der Baum immer konsistent mit dem
-        Modell und es entstehen keine veralteten Haken.
+    def _sync_tree_from_vm(self) -> None:
+        """Synchronisiert die Checkboxen des MasterTree mit dem VM-Filter.
+
+        Ersetzt die fruehere Button-Sync-Logik (18.01.01, E-4): Nach einem
+        Profilwechsel bzw. `event_bus.profile_changed` werden die
+        persistierten feature_ids (plugin_ids) als Haken im Baum abgebildet.
+        Der dadurch emittierte `checked_changed` ruft `set_feature_ids`
+        idempotent auf (gleiche IDs -> kein Refresh, keine Schleife).
         """
-        if self._service_dialog is None:
-            self._service_dialog = ServiceSelectorDialog(
-                model=self._selector_model, parent=self)
-            self._service_dialog.services_selected.connect(
-                self._on_services_selected)
-            self._service_dialog.setAttribute(Qt.WA_DeleteOnClose, True)
-            self._service_dialog.destroyed.connect(
-                self._on_service_dialog_destroyed)
-        self._service_dialog.apply_feature_ids(
-            self._vm.params.get("feature_ids") or [])
-        self._service_dialog.show()
-        self._service_dialog.raise_()
-        self._service_dialog.activateWindow()
-
-    @Slot()
-    def _on_service_dialog_destroyed(self) -> None:
-        """Setzt die Dialog-Referenz zurueck (WA_DeleteOnClose)."""
-        self._service_dialog = None
-
-    @Slot(list, list)
-    def _on_services_selected(
-        self, display_names: List[str], feature_ids: List[str]
-    ) -> None:
-        """Uebernimmt die Multi-Auswahl aus dem Dialog (Signal-Vertrag).
-
-        `display_names` werden fuer den Button-Text gemerkt; `feature_ids`
-        (plugin_ids) gehen an `AnalyticsViewModel.set_feature_ids()` – das
-        ViewModel filtert die Charts per `WHERE feature_id IN (...)`.
-        """
-        self._active_display_names = list(display_names or [])
-        self._vm.set_feature_ids(list(feature_ids or []))
-        self._sync_service_filter_button()
-
-    def _sync_service_filter_button(self) -> None:
-        """Synchronisiert den Datenquellen-Button mit dem VM-Parameter.
-
-        Wird beim Setzen/Entfernen des Filters, bei Profilwechseln
-        (active_profile_changed) und ueber `event_bus.profile_changed`
-        aufgerufen. Nach einem Profilwechsel liegen nur die persistierten
-        feature_ids (plugin_ids) vor – die Anzeigenamen werden dann ueber
-        `ServiceSelectorModel.resolve_display_names()` re-resolved.
-        """
-        ids = self._vm.params.get("feature_ids") or []
-        if not ids:
-            self.btn_data_sources.setText(
-                "[ 🛠️ Datenquellen: Keiner ausgewählt ▾ ]")
+        if not hasattr(self, "service_tree"):
             return
-        names = (self._active_display_names
-                 or self._selector_model.resolve_display_names(ids))
-        self.btn_data_sources.setText(
-            f"[ 🛠️ Datenquellen: {', '.join(names)} ▾ ]")
+        ids = self._vm.params.get("feature_ids") or []
+        self.service_tree.set_checked_feature_ids(ids)
+
+    def _on_service_tree_checked(self) -> None:
+        """Multi-Select-Filter (Checkboxen): Haken -> ViewModel.
+
+        feature_ids (plugin_ids) der angehakten Service-/Plugin-Knoten gehen
+        an `AnalyticsViewModel.set_feature_ids()` (SQL WHERE feature_id IN).
+        """
+        ids = self.service_tree.checked_feature_ids()
+        self._vm.set_feature_ids(ids)
+
+    def _resolve_selection_ids(self, node_type: str, set_id: str,
+                               service_id: str, plugin_id: str) -> List[str]:
+        """Loest eine geklickte Baum-Zeile in feature_ids (plugin_ids) auf.
+
+        18.01.01 (E-4): Klick auf Set -> alle Services des Sets; Klick auf
+        Kategorie-Ordner -> `category_plugin_ids(Pfad, rekursiv)`; Klick auf
+        Plugin-Zeile -> [plugin_id]; Service-Zeile -> [plugin_id des Service].
+        """
+        if node_type == "category":
+            return self._selector_model.category_plugin_ids(plugin_id or "")
+        if node_type == "plugin" and plugin_id:
+            return [str(plugin_id)]
+        if node_type == "service" and set_id and service_id:
+            cfg = self._selector_model.find_service(set_id, service_id) or {}
+            pid = str(cfg.get("plugin_id") or service_id)
+            return [pid] if pid else []
+        if node_type == "set" and set_id:
+            definition = self._selector_model.find_set(set_id) or {}
+            services = definition.get("services") or {}
+            order = definition.get("execution_order") or list(services.keys())
+            ids: List[str] = []
+            for iid in order:
+                cfg = services.get(iid) or {}
+                pid = str(cfg.get("plugin_id") or iid)
+                if pid and pid not in ids:
+                    ids.append(pid)
+            return ids
+        return []
+
+    def _entries_for_scope(self, node_type: str, set_id: str,
+                           service_id: str, plugin_id: str) -> List[Dict[str, str]]:
+        """Param-Panel-Entries der geklickten Tree-Zeile (service_win-Muster).
+
+        Returns:
+            Liste von {"node_type", "set_id", "instance_id", "plugin_id"} –
+            leer fuer Gruppen/leere Auswahl. Kategorie-Ordner liefern die
+            Plugins des Pfads (rekursiv), Set-/Service-Zeilen alle Services
+            des Sets, Plugin-Zeilen nur diesen einen Service.
+        """
+        if node_type == "category":
+            entries: List[Dict[str, str]] = []
+            for pid in self._selector_model.category_plugin_ids(plugin_id or ""):
+                entries.append({
+                    "node_type": "plugin",
+                    "set_id": "",
+                    "instance_id": "",
+                    "plugin_id": pid,
+                })
+            return entries
+        if node_type == "plugin" and plugin_id:
+            return [{
+                "node_type": "plugin",
+                "set_id": "",
+                "instance_id": "",
+                "plugin_id": str(plugin_id),
+            }]
+        if node_type in ("set", "service") and set_id:
+            definition = self._selector_model.find_set(set_id) or {}
+            services = definition.get("services") or {}
+            order = definition.get("execution_order") or list(services.keys())
+            entries = []
+            for iid in order:
+                cfg = services.get(iid) or {}
+                if not isinstance(cfg, dict):
+                    continue
+                entries.append({
+                    "node_type": "service",
+                    "set_id": str(set_id),
+                    "instance_id": str(iid),
+                    "plugin_id": str(cfg.get("plugin_id") or iid),
+                })
+            return entries
+        return []
+
+    def _plugin_config(self, plugin_id: str) -> Dict[str, Any]:
+        """ServiceInstanceConfig eines Standalone-Plugins (Analytics-Kontext).
+
+        Basis sind die Registry-Defaults; gespeicherte Werte aus
+        global_settings (Key 'plugin_params_<pid>') ueberschreiben lookback/
+        params und ergaenzen eine optionale Beschreibung (service_win-Muster).
+        """
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            plugin = PluginRegistry().get(plugin_id)
+        except KeyError:
+            plugin = None
+        params = dict(getattr(plugin, "default_params", None) or {}) if plugin else {}
+        lookback: int = 1000
+        if "lookback" in params:
+            try:
+                lookback = int(params.pop("lookback") or 1000)
+            except (TypeError, ValueError):
+                lookback = 1000
+        cfg: Dict[str, Any] = {
+            "plugin_id": plugin_id,
+            "lookback": lookback,
+            "params": params,
+            "version": getattr(plugin, "version", "0.0.0") or "0.0.0",
+        }
+        try:
+            saved = self.state_manager.get_global_value(
+                f"plugin_params_{plugin_id}", None)
+        except Exception:
+            saved = None
+        if isinstance(saved, dict):
+            lb = saved.get("lookback")
+            if lb is not None:
+                try:
+                    cfg["lookback"] = int(lb)
+                except (TypeError, ValueError):
+                    pass
+            saved_params = saved.get("params")
+            if isinstance(saved_params, dict):
+                merged = dict(params)
+                merged.update(saved_params)
+                cfg["params"] = merged
+            desc = saved.get("description")
+            if desc:
+                cfg["description"] = str(desc)
+        return cfg
+
+    def _rebuild_param_panel(self, entries: Optional[List[Dict[str, str]]],
+                             editable_plugin: Optional[str] = None) -> None:
+        """Baut das Param-Panel aus den uebergebenen Entries neu.
+
+        Standalone-Plugin-Zeilen (editable_plugin gesetzt) rendern die
+        Spalte AKTIV (editierbar, Dirty-Tracking + Speichern); alle anderen
+        Zeilen (Sets, Indikator-Services, Ordner) werden read-only angezeigt
+        (deaktivierte QGroupBox, wie im ServiceSelectorDialog).
+        """
+        self._clear_service_columns()
+        self._set_param_actions_visible(False)
+        self._current_plugin_editing = None
+        self._current_set_definition = None
+        entries = list(entries or [])
+        if not entries:
+            self.service_columns_layout.addWidget(
+                QLabel("Keine Auswahl – klicke eine Zeile im Baum."))
+            self.service_columns_layout.addStretch(1)
+            return
+        for entry in entries:
+            pid = str(entry.get("plugin_id") or "")
+            if entry["node_type"] == "service":
+                iid = str(entry.get("instance_id") or "")
+                cfg = self._selector_model.find_service(
+                    str(entry.get("set_id") or ""), iid) or {}
+            else:
+                iid = pid
+                cfg = self._plugin_config(pid)
+            editable = bool(editable_plugin) and pid == editable_plugin
+            try:
+                box = self._build_service_column(iid, pid, cfg)
+            except Exception as e:
+                box = None
+                self.service_columns_layout.addWidget(
+                    QLabel(f"Parameteranzeige nicht verfügbar: {e}"))
+            if box is not None:
+                if not editable:
+                    box.setEnabled(False)
+                    box.setToolTip("Read-Only – Parameter der gewählten "
+                                   "Datenquelle (editierbar im ServiceWindow)")
+                else:
+                    # 18.01.01 (E-4): Editierbarer Standalone-Service –
+                    # RAM-Definition fuer das Dirty-Tracking (_on_param_changed)
+                    # bereitstellen; Persistenz via _save_plugin_params.
+                    definition: Dict[str, Any] = {
+                        "set_id": "",
+                        "display_name": pid,
+                        "description": str(cfg.get("description") or ""),
+                        "execution_order": [pid],
+                        "services": {pid: cfg},
+                    }
+                    self._current_plugin_editing = pid
+                    self._current_set_definition = definition
+                self.service_columns_layout.addWidget(box)
+        self.service_columns_layout.addStretch(1)
+
+    @Slot(str, str, str, str)
+    def _on_service_selection_details(self, node_type: str, set_id: str,
+                                      service_id: str, plugin_id: str) -> None:
+        """Slot fuer MasterTree.selection_details (Mausklick in einer Zeile).
+
+        18.01.01 (E-4): Jeder Klick auf eine Datenquellen-Zeile
+        (a) loest die IDs der Zeile auf und setzt den VM-Filter
+            (`set_feature_ids`, Baum-Selektion -> Filter) und
+        (b) baut das Param-Panel neu (Set/Ordner/Plugin -> Entries).
+        Standalone-Services (belongs_to_indicator == False) sind editierbar;
+        Indikator-/Set-Services bleiben read-only.
+        """
+        # Filter setzen (Set/Ordner/Plugin -> IDs aufloesen).
+        ids = self._resolve_selection_ids(node_type, set_id, service_id,
+                                          plugin_id)
+        if ids:
+            self._vm.set_feature_ids(ids)
+            self.service_tree.set_checked_feature_ids(ids)
+        # Param-Panel: editierbar nur fuer einzelne Standalone-Plugin-Zeilen.
+        editable = None
+        if node_type == "plugin" and plugin_id:
+            if not self._selector_model.belongs_to_indicator(str(plugin_id)):
+                editable = str(plugin_id)
+        self._rebuild_param_panel(
+            self._entries_for_scope(node_type, set_id, service_id, plugin_id),
+            editable_plugin=editable)
+
+    @Slot()
+    def _save_plugin_params(self) -> bool:
+        """Persistiert die Parameter des editierbaren Standalone-Plugins.
+
+        global_settings (Key 'plugin_params_<pid>') + EventBus-Sync
+        (`service_set_changed`, E-3) – so synchronisieren alle
+        ServiceSelectorModel-Instanzen den MasterTree live.
+        """
+        plugin_id = self._current_plugin_editing
+        if not plugin_id:
+            return False
+        definition = self._current_set_definition or {}
+        services = definition.get("services") or {}
+        cfg = next(iter(services.values()), None)
+        if not isinstance(cfg, dict):
+            return False
+        data: Dict[str, Any] = {
+            "plugin_id": plugin_id,
+            "lookback": int(cfg.get("lookback") or 1000),
+            "params": dict(cfg.get("params") or {}),
+            "description": str(cfg.get("description") or ""),
+        }
+        try:
+            self.state_manager.save_global_value(
+                f"plugin_params_{plugin_id}", data)
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] Plugin-Parameter nicht "
+                  f"gespeichert: {e}")
+            return False
+        self._set_param_actions_visible(False)
+        event_bus.service_set_changed.emit()
+        return True
+
+    def _set_param_actions_visible(self, visible: bool) -> None:
+        """Blendet den Speichern-Button des Param-Panels ein/aus (Dirty)."""
+        btn = getattr(self, "btn_save_params", None)
+        if btn is not None:
+            try:
+                btn.setVisible(bool(visible))
+            except (RuntimeError, AttributeError):
+                pass
+
+    # --- ServiceParamColumnsMixin-Host (18.01.01, E-2) -------------------
+    def _service_lock(self, plugin_id: str) -> tuple:
+        """Keine Set-Sperre im Analytics-Kontext (kein Set-Editing hier)."""
+        return "", ""
+
+    def _open_service_desc_editor(self, instance_id: str) -> None:
+        """Analytics: kein Beschreibungs-Editor (Parameter-Ansicht pur)."""
+        pass
+
+    def _schedule_reflow(self) -> None:
+        """Analytics: kein Fenster-Reflow (Param-Panel skaliert nicht)."""
+        pass
 
     # ------------------------------------------------------------------
     # MVVM + Steuerung verdrahten
@@ -403,9 +677,14 @@ class AnalyticsWindow(PersistentWindow):
         # ausgrauen (nicht auswaehlbar).
         self.combo_symbol.currentTextChanged.connect(self._refresh_timeframe_combo)
         self.combo_tf.currentTextChanged.connect(self._vm.set_timeframe)
-        # 15.03-E: Datenquellen-Dialog (Multi-Select, ersetzt Popover)
-        self.btn_data_sources.clicked.connect(self._open_service_dialog)
-        event_bus.profile_changed.connect(self._sync_service_filter_button)
+        # 18.01.01 (E-4): Eingebetteter Datenquellen-Filter (MasterTree).
+        # checked_changed (Checkboxen) = Multi-Select-Filter; selection_details
+        # (Klick auf Set/Ordner/Plugin) = ID-Aufloesung + Param-Panel.
+        self.service_tree.checked_changed.connect(self._on_service_tree_checked)
+        self.service_tree.selection_details.connect(
+            self._on_service_selection_details)
+        self.btn_save_params.clicked.connect(self._save_plugin_params)
+        event_bus.profile_changed.connect(self._sync_tree_from_vm)
         # 06.08.2026 (Punkt 5): Limit-Textfeld -> ViewModel. Der Default
         # (App-Optionen 'Statistik-Signale') wird beim Start gesetzt, damit
         # Feld und VM-Parameter konsistent sind.
@@ -602,8 +881,7 @@ class AnalyticsWindow(PersistentWindow):
         if profile is None:
             self.edit_profile_name.clear()
             self.edit_profile_desc.clear()
-            self._active_display_names = []
-            self._sync_service_filter_button()
+            self._sync_tree_from_vm()
             return
         self.edit_profile_name.setText(profile.get("name") or "")
         self.edit_profile_desc.setText(profile.get("description") or "")
@@ -613,11 +891,10 @@ class AnalyticsWindow(PersistentWindow):
             self.combo_profile.blockSignals(True)
             self.combo_profile.setCurrentIndex(idx)
             self.combo_profile.blockSignals(False)
-        # 15.03-E: Profilwechsel uebernimmt feature_ids in den VM – die
-        # Anzeigenamen werden neu aus den persistierten IDs aufgeloest
-        # (resolve_display_names) und der Button-Text synchronisiert.
-        self._active_display_names = []
-        self._sync_service_filter_button()
+        # 18.01.01 (E-4): Profilwechsel uebernimmt feature_ids in den VM –
+        # die Checkboxen des eingebetteten MasterTree werden aus den
+        # persistierten IDs synchronisiert (_sync_tree_from_vm).
+        self._sync_tree_from_vm()
         # 06.08.2026 (Punkt 5): Limit-Feld mit dem (ggf. aus dem Profil
         # geladenen) VM-Wert synchronisieren.
         if hasattr(self, "edit_limit"):
