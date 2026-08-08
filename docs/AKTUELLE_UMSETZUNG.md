@@ -148,3 +148,79 @@ für Sets dasselbe Ordner-Blatt-Format liefert (`set_id/display_name/definition/
 Einzige generische Lücke ist L3 (Gruppen-Kontext bei Kategorie-Klicks); in service_win
 muss analog zu `_on_run_category`/`_on_category_info_requested` die Sets-Ordner-
 Variante (Sets unter dem Pfad → Services) ergänzt werden.
+
+
+---
+
+## Implementierungs-Log 18.01.03 (08.08.2026 13:12) – Dynamic Tree Management
+
+Umgesetzt (alle Checklisten-Punkte des Kapitels abgearbeitet):
+
+### Step 1 – Sets-Kategorisierung (`analytics/engine/service_selector_model.py`)
+* `_insert_set_into_category_tree()` + `_set_category_parts()`: die Ordner-Mechanik
+  (K2/K8/K9) gilt jetzt auch für GROUP_SETS – Set-Definitionen mit `category`-Feld
+  werden rekursiv in 📁-Ordner einsortiert, ohne Kategorie bleiben sie Root-Blaetter.
+* `category_set_ids(path)`: rekursive Auflösung aller set_ids unter einem Pfad
+  (analog `category_plugin_ids`).
+* `category_service_plugin_ids(group, path)`: gruppenspezifische Auflösung (L3) –
+  Sets-Ordner → Service-plugin_ids aller Sets, Plugins-Ordner → `category_plugin_ids`.
+* `_sort_category_nodes` verallgemeinert (Blatt-Sortierung auch für Sets-Dicts).
+* E1-Override-Logik: `_category_parts()` wertet `plugin_category_<id>` (VORRANG vor
+  `metadata['category']`, auch "" = Root); Overrides werden in `refresh()` einmalig
+  geladen (`_load_plugin_category_overrides`), kein DB-Zugriff im Baum-Aufbau.
+
+### Step 1/3 – Persistenz (L1/E2)
+* `ServiceSetRepository.save_set()`: `category` additiv im Payload (analog `indicator_id`),
+  mit `record_snapshot=False` bei Struktur-Verwaltung (kein Snapshot, Invariante 9).
+* `ServiceSetDefinition`: optionales Feld `category` dokumentiert
+  (`analytics/engine/service_models.py`).
+
+### Step 3 – Gemeinsame Schreib-Helfer (`serviceui/service_set_utils.py`, E1/E2, DRY)
+* `set_set_category(set_repo, set_id, path)` – frisch aus der DB laden, `category`
+  setzen, `save_set(record_snapshot=False)`.
+* `set_plugin_category(state_manager, plugin_id, path)` – global_settings-Key
+  `plugin_category_<id>` (separater Key, L2-Fix: `plugin_params_<id>` bleibt dem
+  Parameter-Preset vorbehalten).
+* `rename_category(model, set_repo, state_manager, group, old_path, new_path)` –
+  String-Replace (echte Ordner-Grenzen, `_replace_prefix`) über alle Kinder.
+
+### Step 2 – MasterTree (`serviceui/master_tree.py`)
+* Drag & Drop: `setDragEnabled/setAcceptDrops/setDropIndicatorShown` + eigene
+  `startDrag()` (JSON-MIME `application/x-pytrader-category-move`; nur
+  Sets/Plugins/Ordner ziehbar, E4) + `dragEnterEvent/dragMoveEvent/dropEvent`.
+  `dropEvent` emittiert nur `folder_item_moved` (Set/Plugin) bzw. `folder_moved`
+  (Ordner) – der Baum führt keinen echten Item-Move; Guards: Gruppen-Mismatch und
+  Ordner-Zyklus (eigener Unterordner) werden abgelehnt.
+* Kontextmenü: „Neuer Ordner" (Gruppen + Ordner) und „Umbenennen" (Ordner);
+  `create_folder_requested`/`rename_folder_requested`-Signale. „Neuer Ordner" ist
+  ein reiner UI-Zustand (`_pending_folder`/`_ensure_pending_folder`, K9/E3).
+* L3: `selection_details` liefert für TYPE_CATEGORY die Eltern-Gruppe im set_id-Slot;
+  `category_info_requested`/`run_category_requested` tragen jetzt `(group, path)`.
+
+### E5 – Verdrahtung in beiden Trees
+* `service_win.py` (FULL_EDIT): `_on_folder_item_moved`/`_on_folder_moved`/
+  `_on_rename_folder`/`_rename_folder`; `_on_run_category`/`_on_category_info_requested`
+  gruppenbewusst (Sets-Ordner → Services der Sets). Alle Aktionen emittieren
+  `event_bus.service_set_changed`.
+* `service_selector_dialog.py` (SELECT_MULTI, Picker): gleiche Handler (DRY über
+  service_set_utils); `_resolve_selection_ids`/`_entries_for_scope` gruppenbewusst
+  (Sets-Ordner → Set-Service-Entries bzw. plugin_ids).
+
+### Validierung (headless, `test/test.py`, Teil 26)
+* 23/23 Prüfungen PASS (A1–A8 Persistenz/Baum, B1–B4 Override, C1–C4 Rename,
+  D1–D2 Pfad-Grenzen, E1–E2 gruppenspezifische Auflösung).
+* `python -m py_compile` auf allen betroffenen Dateien: PASS.
+* 17.01.02-T2-Test an die neue `(group, path)`-Signatur angepasst: PASS.
+* **Hinweis (vorbestehend, NICHT durch 18.01.03):** Die Geometrie-Tests
+  P2/P5/H3/H5/H7 schlagen bereits im Baseline-Stand fehl (offscreen `800x582`,
+  verifiziert per Baseline-Probe gegen HEAD) – Ursache ist der 07./08.08.2026-
+  Reflow-/Scrollbar-Umbau, nicht diese Umsetzung. Separater Bugfix erforderlich,
+  sofern gewünscht.
+* Test-Cleanup: temporäre Patch-/Probe-Skripte gelöscht, `test/` enthält nur
+  `test/test.py`.
+
+### Abweichungen vom Plan-Kapitel (per Prüfprotokoll-Entscheidungen)
+* Plan-Punkt 3 „Persistenz via `plugin_params_<id>`" → E1: separater Key
+  `plugin_category_<id>` (Kollision mit Parameter-Preset vermieden).
+* `category_info_requested`/`run_category_requested` sind um die Gruppe erweitert
+  (L3) – betroffene bestehende Tests wurden angepasst.

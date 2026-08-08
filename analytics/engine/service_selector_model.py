@@ -136,6 +136,12 @@ class ServiceSelectorModel(QObject):
         self._active_indicator_ids: Set[str] = set()
         # 05.08.2026: Datum der letzten Ausfuehrung je feature_id (DD.MM.JJ)
         self._last_execution_dates: Dict[str, str] = {}
+        # 18.01.03 (E1): Kategorie-Overrides je Plugin (global_settings,
+        # Key 'plugin_category_<pid>'). Ein gesetzter Override UEBERSCHREIBT
+        # metadata['category'] (auch "" = Root-Ebene); ohne Override gilt das
+        # metadata-Feld. Wird in refresh() einmalig geladen und von
+        # _category_parts() ausgewertet (kein DB-Zugriff im Baum-Aufbau).
+        self._plugin_category_overrides: Dict[str, str] = {}
 
         # Initialbefuellung + Live-Sync (schwellenfrei via EventBus)
         self.refresh()
@@ -158,7 +164,30 @@ class ServiceSelectorModel(QObject):
         # wird nach jedem Service-Run (ServiceRunWorker -> EventBus) neu
         # gelesen, damit der MasterTree das Datum live aktualisiert.
         self._last_execution_dates = self._load_last_execution_dates()
+        # 18.01.03 (E1): Kategorie-Overrides (plugin_category_<pid>) laden –
+        # einmalig pro Refresh, damit _category_parts() ohne DB-Zugriff
+        # auswertet (Baum-Aufbau bleibt rein lesend aus dem RAM).
+        self._plugin_category_overrides = self._load_plugin_category_overrides()
         self.data_changed.emit()
+
+    def _load_plugin_category_overrides(self) -> Dict[str, str]:
+        """Liest die Kategorie-Overrides aller Plugins aus global_settings.
+
+        Key-Format: 'plugin_category_<plugin_id>' (18.01.03, E1) – Wert ist
+        der Slash-Pfad ("" = Root-Ebene) oder ein leerer Eintrag bei fehlendem
+        Override (dann gilt metadata['category']). Defensiv: Fehler -> leer.
+        """
+        overrides: Dict[str, str] = {}
+        try:
+            for pid in sorted(self.get_plugins().keys()):
+                raw = self.state_manager.get_global_value(
+                    f"plugin_category_{pid}", None)
+                if isinstance(raw, str):
+                    overrides[str(pid).lower()] = raw
+        except Exception as e:
+            print(f"WARN [ServiceSelectorModel] Kategorie-Overrides nicht "
+                  f"lesbar: {e}")
+        return overrides
 
     def _load_last_execution_dates(self) -> Dict[str, str]:
         """Liest das Datum der letzten Ausfuehrung je feature_id aus dem
@@ -403,19 +432,30 @@ class ServiceSelectorModel(QObject):
             s = s[len("📁"):].lstrip()
         return s.lower()
 
-    def _category_parts(self, plugin: Optional[Any]) -> List[str]:
-        """Kategorienpfad eines Plugins (K1, 16.08).
+    def _category_parts(self, plugin_id: str,
+                        plugin: Optional[Any]) -> List[str]:
+        """Kategorienpfad eines Plugins (K1, 16.08 / 18.01.03 E1).
 
-        Lese `metadata.get('category')` -> Slash-Pfad in saubere Teile
-        zerlegt. Leer ODER der Ist-Default `"General"` (base_plugin.py)
-        gelten als "keine Kategorie" -> das Plugin bleibt auf der obersten
-        Ebene der Hauptgruppe.
+        18.01.03 (E1): Ein gesetzter Kategorie-Override (global_settings,
+        Key 'plugin_category_<plugin_id>', Quelle des Drag & Drop) hat
+        VORRANG vor `metadata['category']` – auch ein leerer String "" hebt
+        die metadata-Kategorie auf (Root-Ebene). Ohne Override gilt das
+        metadata-Feld wie bisher. Leer ODER der Ist-Default `"General"`
+        (base_plugin.py) gelten als "keine Kategorie" -> das Plugin bleibt
+        auf der obersten Ebene der Hauptgruppe.
         """
-        try:
-            meta = getattr(plugin, "metadata", None) or {}
-            category = str(meta.get("category") or "").strip()
-        except Exception:
-            return []
+        category = ""
+        if plugin_id:
+            override = self._plugin_category_overrides.get(
+                str(plugin_id).lower())
+            if override is not None:
+                category = str(override or "").strip()
+        if not category:
+            try:
+                meta = getattr(plugin, "metadata", None) or {}
+                category = str(meta.get("category") or "").strip()
+            except Exception:
+                category = ""
         if not category or category.lower() == "general":
             return []
         return [p.strip() for p in category.split("/") if p.strip()]
@@ -447,15 +487,22 @@ class ServiceSelectorModel(QObject):
 
     def _sort_category_nodes(self,
                              nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Sortiert eine Ordner-Ebene (K8, 16.08).
+        """Sortiert eine Ordner-Ebene (K8, 16.08 / 18.01.03).
 
         Deterministisch: Ordner zuerst, dann Blaetter; jeweils alphabetisch
         (case-insensitiv). Innerhalb der Ordner rekursiv dieselbe Regel.
+        Blaetter koennen seit 18.01.03 sowohl Plugin-Dicts ({plugin_id, ...})
+        als auch Sets-Dicts ({set_id, display_name, ...}) sein – als
+        Sortiername gilt plugin_id, sonst display_name/set_id.
         """
         def sort_key(n: Dict[str, Any]) -> tuple:
             is_folder = n.get("group") == self.GROUP_CATEGORY
-            name = (self._cat_key(n.get("label"))
-                    if is_folder else str(n.get("plugin_id") or "").lower())
+            if is_folder:
+                name = self._cat_key(n.get("label"))
+            else:
+                name = str(n.get("plugin_id")
+                           or n.get("display_name")
+                           or n.get("set_id") or "").lower()
             return (0 if is_folder else 1, name)
 
         result = sorted(nodes, key=sort_key)
@@ -485,10 +532,115 @@ class ServiceSelectorModel(QObject):
         plugins = self.get_plugins()
         result: List[str] = []
         for pid in sorted(plugins.keys()):
-            parts = [p.lower() for p in self._category_parts(plugins.get(pid))]
+            parts = [p.lower() for p in self._category_parts(pid,
+                                                             plugins.get(pid))]
             if len(parts) >= len(target) and parts[:len(target)] == target:
                 result.append(pid)
         return result
+
+    def _set_category_parts(self, definition: Dict[str, Any]) -> List[str]:
+        """Kategorienpfad eines Service-Sets (18.01.03, E2).
+
+        Lese das optionale Feld `category` der Set-Definition (Slash-Pfad,
+        z.B. 'Swing Points/Geometrie'). Leer ODER der Ist-Default "General"
+        gelten als "keine Kategorie" -> das Set bleibt auf der obersten
+        Ebene der Sets-Gruppe (Spiegel der Plugin-Logik K1).
+        """
+        category = str((definition or {}).get("category") or "").strip()
+        if not category or category.lower() == "general":
+            return []
+        return [p.strip() for p in category.split("/") if p.strip()]
+
+    def _insert_set_into_category_tree(self, nodes: List[Dict[str, Any]],
+                                       parts: List[str],
+                                       leaf: Dict[str, Any]) -> None:
+        """Fuegt ein Set-Blatt rekursiv in die Ordnerstruktur ein (18.01.03).
+
+        Analoge Mechanik zu `_insert_into_category_tree` (K2), aber fuer
+        Sets-Blatt-Dicts ({set_id, display_name, definition, services}).
+        Ordner entstehen NUR durch eine tatsaechliche Blatt-Einfuegung ->
+        keine leeren Ordner (K9).
+        """
+        if not parts:
+            nodes.append(leaf)
+            return
+        key = self._cat_key(parts[0])
+        folder = None
+        for n in nodes:
+            if (n.get("group") == self.GROUP_CATEGORY
+                    and self._cat_key(n.get("label")) == key):
+                folder = n
+                break
+        if folder is None:
+            folder = {"group": self.GROUP_CATEGORY,
+                      "label": f"📁 {parts[0]}", "children": []}
+            nodes.append(folder)
+        self._insert_set_into_category_tree(folder["children"], parts[1:],
+                                            leaf)
+
+    def category_set_ids(self, category_path: str) -> List[str]:
+        """Alle set_ids unter einem Kategorie-Pfad (rekursiv, 18.01.03).
+
+        Liefert deterministisch (Set-Reihenfolge = display_name) alle Sets,
+        deren `category`-Pfad mit `category_path` beginnt – d.h. auch Sets in
+        UNTER-Ordnern (z.B. Pfad 'Swing Points' liefert auch Sets aus
+        'Swing Points/Geometrie'). Pfad-Format: slash-separiert OHNE
+        '📁 '-Praefixe, case-insensitiv. Analog `category_plugin_ids` fuer
+        die Sets-Gruppe.
+        """
+        target = [p.strip().lower() for p in str(category_path or "").split("/")
+                  if p.strip()]
+        if not target:
+            return []
+        result: List[str] = []
+        for s in sorted(self._sets, key=lambda x: str(
+                x.get("display_name") or x.get("set_id") or "").lower()):
+            parts = [p.lower() for p in self._set_category_parts(s)]
+            if len(parts) >= len(target) and parts[:len(target)] == target:
+                result.append(str(s.get("set_id") or ""))
+        return result
+
+    def plugin_category_path(self, plugin_id: str) -> str:
+        """Aktueller Kategorie-Pfad eines Plugins (lesend, 18.01.03).
+
+        Liefert den voll aufgeloesten Pfad (Override -> metadata['category'])
+        slash-separiert OHNE '📁 '-Praefix (z.B. 'Swing Points/Geometrie');
+        leer = Root-Ebene. Grundlage fuer die Ordner-Verschiebung und
+        Rename-String-Replace im Orchestrator.
+        """
+        if not plugin_id:
+            return ""
+        plugin = self.get_plugin(plugin_id)
+        parts = self._category_parts(plugin_id, plugin) if plugin else []
+        return "/".join(parts)
+
+    def category_service_plugin_ids(self, group: str,
+                                    category_path: str) -> List[str]:
+        """Alle plugin_ids unter einem Kategorie-Ordner (rekursiv, 18.01.03).
+
+        Gruppenspezifische Aufloesung (L3):
+          * group == GROUP_SETS    -> Sets unter dem Pfad
+            (category_set_ids), dann alle plugin_ids ihrer Services
+            (execution_order, dedupliziert, deterministisch).
+          * group == GROUP_PLUGINS -> Plugins unter dem Pfad
+            (category_plugin_ids).
+        Leerer Pfad/leere Gruppe -> [] (defensiv). Wird von den Run-/Info-
+        Aktionen des ServiceWindow und der Picker-Aufloesung genutzt.
+        """
+        if str(group or "") == str(self.GROUP_SETS):
+            ids: List[str] = []
+            for set_id in self.category_set_ids(category_path):
+                definition = self.find_set(set_id) or {}
+                services = definition.get("services") or {}
+                order = definition.get("execution_order") \
+                    or list(services.keys())
+                for iid in order:
+                    cfg = services.get(iid) or {}
+                    pid = str(cfg.get("plugin_id") or iid)
+                    if pid and pid not in ids:
+                        ids.append(pid)
+            return ids
+        return self.category_plugin_ids(category_path)
 
     def _category_nodes(self, plugin_ids: List[str]) -> List[Dict[str, Any]]:
         """Baut die (ggf. verschachtelte) Kinderliste einer Plugin-Gruppe.
@@ -502,7 +654,7 @@ class ServiceSelectorModel(QObject):
         root: List[Dict[str, Any]] = []
         for pid in plugin_ids:
             plugin = plugins.get(pid)
-            parts = self._category_parts(plugin)
+            parts = self._category_parts(pid, plugin)
             leaf = {
                 "plugin_id": pid,
                 "badge": self.badge_for(pid),
@@ -533,10 +685,20 @@ class ServiceSelectorModel(QObject):
         ({plugin_id, badge, last_execution}) und verschachtelten
         Ordner-Dicts ({"group": GROUP_CATEGORY, "label": "📁 <Name>",
         "children": [...]} – rekursiv), gesteuert ueber das Metadaten-Feld
-        `category` der Plugins (K1).
+        `category` der Plugins (K1). Seit 18.01.03 gilt dieselbe Ordner-
+        Mechanik auch fuer die Sets-Gruppe: Set-Definitionen mit dem
+        optionalen Feld `category` werden in identische Ordner-Dicts
+        einsortiert (K2/K8/K9 analog), Sets ohne Kategorie bleiben flache
+        Blaetter auf oberster Ebene.
         """
         sets = sorted(self._sets,
                       key=lambda s: str(s.get("display_name") or s.get("set_id") or "").lower())
+        # 18.01.03: Sets-Kategorien (Dynamic Category Trees fuer GROUP_SETS).
+        # Set-Definitionen mit `category`-Pfad werden in 📁-Ordner einsortiert
+        # (rekursiv, gleiche K2/K8/K9-Regeln wie die Plugins); ohne Kategorie
+        # bleiben sie flache Blaetter auf oberster Ebene. Der MasterTree
+        # baut daraus identische Ordner-Knoten wie bei den Plugins
+        # (gruppen-agnostische Rekursion).
         set_nodes: List[Dict[str, Any]] = []
         for s in sets:
             services = s.get("services") or {}
@@ -553,12 +715,14 @@ class ServiceSelectorModel(QObject):
                     # MasterTree haengt es direkt an den Service-Namen an.
                     "last_execution": self.last_execution_date(pid),
                 })
-            set_nodes.append({
-                "set_id": s.get("set_id"),
-                "display_name": s.get("display_name") or s.get("set_id") or "Unbenannt",
-                "definition": s,
-                "services": service_nodes,
-            })
+            self._insert_set_into_category_tree(
+                set_nodes, self._set_category_parts(s), {
+                    "set_id": s.get("set_id"),
+                    "display_name": s.get("display_name") or s.get("set_id") or "Unbenannt",
+                    "definition": s,
+                    "services": service_nodes,
+                })
+        set_nodes = self._sort_category_nodes(set_nodes)
 
         # 16.08 (K2/K8) + 17.01.01: EINE kategorisierte Services-Gruppe –
         # Plugins mit `category`-Metadatum werden in 📁-Ordner verschachtelt

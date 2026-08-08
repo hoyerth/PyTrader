@@ -235,6 +235,10 @@ class ServiceSetRepository:
             # Bugfix 05.08.2026: Explizite Indikator-Zuordnung (Anlage-Dialog)
             # wird in der Definition persistiert (kein Service noetig).
             "indicator_id": definition.get("indicator_id"),
+            # 18.01.03 (E2): Sets-Kategorie (Dynamic Category Trees) – der
+            # Slash-Pfad (z.B. 'Swing Points/Geometrie') wird additiv
+            # persistiert; leer/fehlend = Root-Ebene der Sets-Gruppe.
+            "category": definition.get("category"),
             "version": version,
             "schema_version": schema_version,
             "created_at": created_at,

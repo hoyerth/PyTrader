@@ -605,6 +605,13 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         tree.run_plugin_requested.connect(self._on_run_plugin)
         tree.run_category_requested.connect(self._on_run_category)
         tree.category_info_requested.connect(self._on_category_info_requested)
+        # 18.01.03 (Dynamic Tree Management): Ordner-CRUD & Kategorie-
+        # Drag&Drop – Sets/Plugins/Ordner ziehen, 'Neuer Ordner' (UI-Zustand
+        # im Baum, keine Persistenz K9/E3) und 'Umbenennen' (String-Replace
+        # aller Kinder) werden hier persistiert.
+        tree.folder_item_moved.connect(self._on_folder_item_moved)
+        tree.folder_moved.connect(self._on_folder_moved)
+        tree.rename_folder_requested.connect(self._on_rename_folder)
 
     @Slot(str)
     def _toolbar_add_service(self, plugin_id: str,
@@ -973,13 +980,15 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         }
         self._start_run_worker(plugin_id, definition, instance_id=plugin_id)
 
-    @Slot(str)
-    def _on_run_category(self, category_path: str) -> None:
-        """'▶️ Alle Services ausführen' (Kategorie-Ordner unter 📦 Services).
+    @Slot(str, str)
+    def _on_run_category(self, group: str, category_path: str) -> None:
+        """▶️ Alle Services ausführen (Kategorie-Ordner).
 
         17.01.02 (Bugfix-Runde): Ordner-Knoten erhalten dieselbe Run-Aktion
         wie die Sets. Es werden ALLE Services unter dem Ordner ausgefuehrt
-        (rekursiv, inkl. Unter-Ordner – via
+        (rekursiv, inkl. Unter-Ordner). 18.01.03 (L3): `group` unterscheidet
+        Sets-Ordner ('sets' – alle Service-plugin_ids der Sets unter dem
+        Pfad, rekursiv) von Plugins-Ordnern ('plugins' – via
         ServiceSelectorModel.category_plugin_ids). Sicherheitsabfrage mit
         Kategorie-Name und dem aktuell gewaehlten Symbol/Timeframe, danach
         gezielter Set-Run mit einer Ad-hoc-Definition.
@@ -989,7 +998,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         model = getattr(self.service_selector, "model", None)
         if model is None:
             return
-        plugin_ids = model.category_plugin_ids(category_path)
+        plugin_ids = model.category_service_plugin_ids(group, category_path)
+
         if not plugin_ids:
             self.log(f"Kategorie '{category_path}' hat keine Services – "
                      f"Ausführung abgebrochen.")
@@ -1020,20 +1030,24 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         }
         self._start_run_worker(category_path, definition, instance_id=None)
 
-    @Slot(str)
-    def _on_category_info_requested(self, category_path: str) -> None:
+    @Slot(str, str)
+    def _on_category_info_requested(self, group: str,
+                                    category_path: str) -> None:
         """Info-Dialog fuer einen Kategorie-Ordner (17.01.02, wie Set-Info).
 
         Read-Only-Liste aller Services unter dem Ordner (rekursiv) mit dem
         Kategorie-Pfad als Titel – analog zur Set-Info (ServiceDescription
-        Dialog.from_set, keine persistierbare Beschreibung).
+        Dialog.from_set, keine persistierbare Beschreibung). 18.01.03 (L3):
+        `group` unterscheidet Sets- von Plugins-Ordnern (Aufloesung via
+        ServiceSelectorModel.category_service_plugin_ids).
         """
         if not category_path:
             return
         model = getattr(self.service_selector, "model", None)
         if model is None:
             return
-        plugin_ids = model.category_plugin_ids(category_path)
+        plugin_ids = model.category_service_plugin_ids(group, category_path)
+
         definition = {
             "set_id": f"category_{category_path}",
             "display_name": category_path,
@@ -1046,6 +1060,78 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             dlg.exec()
         except (RuntimeError, AttributeError) as e:
             self.log(f"Info-Dialog nicht möglich: {e}")
+
+    # -------------------------------------------------------------------------
+    # 18.01.03 (Dynamic Tree Management): Kategorie-Drag&Drop & Ordner-CRUD
+    # -------------------------------------------------------------------------
+
+    @Slot(str, str, str)
+    def _on_folder_item_moved(self, node_type: str, item_id: str,
+                              new_path: str) -> None:
+        """Drop eines Sets/Plugins in einen Ziel-Ordner (MasterTree).
+
+        Persistiert den neuen Kategorie-Pfad:
+          * TYPE_SET    -> Set-Definition (category-Feld) via save_set (E2).
+          * TYPE_PLUGIN -> Kategorie-Override (plugin_category_<id>,
+                           global_settings – E1).
+        Danach EventBus-Sync, damit ALLE MasterTree-Instanzen live
+        refreshen (Invariante 5).
+        """
+        from serviceui.master_tree import TYPE_PLUGIN, TYPE_SET
+        from serviceui.service_set_utils import (
+            set_plugin_category, set_set_category)
+        ok = False
+        if node_type == TYPE_SET:
+            ok = set_set_category(self.set_repo, item_id, new_path)
+        elif node_type == TYPE_PLUGIN:
+            ok = set_plugin_category(self.state_manager, item_id, new_path)
+        if not ok:
+            self.log(f"Kategorie-Verschiebung fehlgeschlagen "
+                     f"({node_type} '{item_id}').")
+            return
+        event_bus.service_set_changed.emit()
+
+    @Slot(str, str, str)
+    def _on_folder_moved(self, group: str, old_path: str,
+                         new_path: str) -> None:
+        """Drop eines Ordners auf einen anderen Ordner (MasterTree).
+
+        Verschiebt alle Kinder rekursiv (String-Replace des Pfad-Praefixes
+        via service_set_utils.rename_category) und emittiert den EventBus.
+        """
+        self._rename_folder(group, old_path, new_path)
+
+    @Slot(str, str, str)
+    def _on_rename_folder(self, group: str, old_path: str,
+                          new_path: str) -> None:
+        """Kontextmenue 'Umbenennen' (rename_folder_requested).
+
+        Fuehrt dasselbe String-Replace aus wie der Ordner-Drop
+        (_on_folder_moved) – DRY ueber `_rename_folder`.
+        """
+        self._rename_folder(group, old_path, new_path)
+
+    def _rename_folder(self, group: str, old_path: str,
+                       new_path: str) -> None:
+        """Zentraler Ordner-Rename (String-Replace aller Kinder).
+
+        18.01.03 (E1/E2): Sets-Ordner aktualisieren das category-Feld der
+        Set-Definitionen; Plugins-Ordner setzen Kategorie-Overrides
+        (plugin_category_<id>). Nach Aenderung EventBus-Sync.
+        """
+        from serviceui.service_set_utils import rename_category
+        try:
+            count = rename_category(
+                getattr(self.service_selector, "model", None),
+                self.set_repo, self.state_manager,
+                str(group or ""), old_path, new_path)
+        except Exception as e:
+            self.log(f"Ordner-Umbenennung fehlgeschlagen: {e}")
+            return
+        if count > 0:
+            event_bus.service_set_changed.emit()
+        self.log(f"Ordner '{old_path}' -> '{new_path}': {count} "
+                 f"Element(e) verschoben.")
 
     @Slot(str, int)
     def _on_run_worker_finished(self, scope_id: str, stored: int) -> None:

@@ -59,6 +59,11 @@ class ServiceSetDefinition(TypedDict, total=False):
     set_id: str                      # Eindeutige ID (uuid oder Name)
     display_name: str                # Anzeigename (leer → Auto-Name aus instance_ids)
     description: Optional[str]       # Phase 14 P14-01: Ausführliche Set-/Strategie-Beschreibung
+    category: Optional[str]          # Phase 18.01.03 (E2): Kategorie-Pfad für den
+                                     # MasterTree-Sets-Ordner (z.B. 'Swing Points/Geometrie',
+                                     # Slash-separiert OHNE '📁 '-Präfixe; leer/"General" =
+                                     # Root-Ebene der Sets-Gruppe). Persistiert additiv
+                                     # in save_set().
     version: Optional[str]           # Kap 5: Set-Level Semantic Version (major.minor.patch)
     schema_version: Optional[str]    # Kap 5: Schema-Format-Version der Definition (z.B. "1.0")
     created_at: Optional[str]        # Kap 5: Erstellungs-Zeitstempel (ISO-8601 UTC)

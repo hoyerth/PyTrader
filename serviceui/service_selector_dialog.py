@@ -426,6 +426,14 @@ class ServiceSelectorDialog(QDialog):
             tree.delete_set_requested.connect(self._on_delete_set)
             tree.move_service_requested.connect(self._on_move_service)
             tree.remove_service_requested.connect(self._on_remove_service)
+            # 18.01.03 (Dynamic Tree Management): Kategorie-Drag&Drop &
+            # Ordner-CRUD im Picker (Manager-Window) – Sets/Plugins/Ordner
+            # ziehen (folder_item_moved/folder_moved) und 'Umbenennen'
+            # (rename_folder_requested) werden hier persistiert; 'Neuer
+            # Ordner' ist ein reiner UI-Zustand im Baum (K9/E3).
+            tree.folder_item_moved.connect(self._on_folder_item_moved)
+            tree.folder_moved.connect(self._on_folder_moved)
+            tree.rename_folder_requested.connect(self._on_rename_folder)
         # Live-Sync: Modell-Refresh (EventBus -> data_changed) baut den Baum
         # neu; das Panel wird mit dem zuletzt geklickten Scope nachgezogen.
         self.model.data_changed.connect(self._on_model_data_changed)
@@ -716,6 +724,65 @@ class ServiceSelectorDialog(QDialog):
         event_bus.service_set_changed.emit()
 
     # ------------------------------------------------------------------
+    # 18.01.03 (Dynamic Tree Management): Kategorie-Drag&Drop & Ordner-CRUD
+    # im Picker (Manager-Window). Persistenz analog service_win ueber die
+    # gemeinsamen Helfer service_set_utils (DRY, E1/E2).
+    # ------------------------------------------------------------------
+    @Slot(str, str, str)
+    def _on_folder_item_moved(self, node_type: str, item_id: str,
+                              new_path: str) -> None:
+        """Drop eines Sets/Plugins in einen Ziel-Ordner (MasterTree).
+
+        TYPE_SET    -> category-Feld der Set-Definition (E2).
+        TYPE_PLUGIN -> Kategorie-Override plugin_category_<id> (E1).
+        Danach EventBus-Sync (Live-Refresh aller MasterTree-Instanzen).
+        """
+        from serviceui.master_tree import TYPE_PLUGIN, TYPE_SET
+        from serviceui.service_set_utils import (
+            set_plugin_category, set_set_category)
+        ok = False
+        if node_type == TYPE_SET:
+            ok = set_set_category(self.set_repo, item_id, new_path)
+        elif node_type == TYPE_PLUGIN:
+            ok = set_plugin_category(self._state_manager, item_id, new_path)
+        if not ok:
+            print(f"WARN [ServiceSelectorDialog] Kategorie-Verschiebung "
+                  f"fehlgeschlagen ({node_type} '{item_id}').")
+            return
+        event_bus.service_set_changed.emit()
+
+    @Slot(str, str, str)
+    def _on_folder_moved(self, group: str, old_path: str,
+                         new_path: str) -> None:
+        """Drop eines Ordners auf einen anderen Ordner (MasterTree)."""
+        self._rename_folder(group, old_path, new_path)
+
+    @Slot(str, str, str)
+    def _on_rename_folder(self, group: str, old_path: str,
+                          new_path: str) -> None:
+        """Kontextmenue 'Umbenennen' (rename_folder_requested)."""
+        self._rename_folder(group, old_path, new_path)
+
+    def _rename_folder(self, group: str, old_path: str,
+                       new_path: str) -> None:
+        """Zentraler Ordner-Rename (String-Replace aller Kinder).
+
+        18.01.03 (E1/E2): Sets-Ordner aktualisieren das category-Feld der
+        Set-Definitionen; Plugins-Ordner setzen Kategorie-Overrides.
+        """
+        from serviceui.service_set_utils import rename_category
+        try:
+            count = rename_category(
+                self.model, self.set_repo, self._state_manager,
+                str(group or ""), old_path, new_path)
+        except Exception as e:
+            print(f"WARN [ServiceSelectorDialog] Ordner-Umbenennung "
+                  f"fehlgeschlagen: {e}")
+            return
+        if count > 0:
+            event_bus.service_set_changed.emit()
+
+    # ------------------------------------------------------------------
     # Read-Only-Parameter-Panel (Punkte 1-3: horizontal, 2-Spalten-Default,
     # Fensterbreite == rechte Kante der Parameter-Box)
     # ------------------------------------------------------------------
@@ -731,8 +798,10 @@ class ServiceSelectorDialog(QDialog):
             Sets nebeneinander (`_entries_for_scope`, Punkt 4+5).
           * Plugin-Zeile (⚡ Standalone / 📦 Plugins) -> NUR dieser eine
             Service (Punkt 6).
-          * Kategorie-Ordner (18.01.01, E-4) -> ALLE Plugins des Pfads
-            (rekursiv, `category_plugin_ids`).
+          * Kategorie-Ordner (18.01.01, E-4) -> ALLE Elemente des Pfads
+            (rekursiv). 18.01.03 (L3): Sets-Ordner (set_id == 'sets')
+            liefern die Service-Spalten aller Sets unter dem Pfad,
+            Plugins-Ordner die Plugin-Spalten (category_plugin_ids).
           * Gruppen-/sonstige Zeilen -> KEIN Service (Punkt 7).
 
         18.01.01 (E-4): Zusaetzlich wird der LIVE-Filter gesetzt –
@@ -759,11 +828,16 @@ class ServiceSelectorDialog(QDialog):
         """Loest eine geklickte Baum-Zeile in feature_ids (plugin_ids) auf.
 
         18.01.01 (E-4): Klick auf Set -> alle Services des Sets; Klick auf
-        Kategorie-Ordner -> `category_plugin_ids(Pfad, rekursiv)`; Klick auf
-        Plugin-Zeile -> [plugin_id]; Service-Zeile -> [plugin_id des Service].
+        Kategorie-Ordner -> rekursive Aufloesung; Klick auf Plugin-Zeile ->
+        [plugin_id]; Service-Zeile -> [plugin_id des Service]. 18.01.03
+        (L3): Fuer Kategorie-Ordner traegt set_id die Eltern-GRUPPE
+        ('sets'/'plugins', aus MasterTree._emit_selection_details) – die
+        Aufloesung unterscheidet damit Sets-Ordner (Sets unter dem Pfad ->
+        deren Service-plugin_ids) von Plugins-Ordnern (category_plugin_ids).
         """
         if node_type == TYPE_CATEGORY:
-            return self.model.category_plugin_ids(plugin_id or "")
+            return self.model.category_service_plugin_ids(
+                set_id or "", plugin_id or "")
         if node_type == TYPE_PLUGIN and plugin_id:
             return [str(plugin_id)]
         if node_type == TYPE_SERVICE and set_id and service_id:
@@ -803,10 +877,32 @@ class ServiceSelectorDialog(QDialog):
         Returns:
             Liste von {"node_type", "set_id", "instance_id", "plugin_id"} –
             leer fuer Zeilen ohne Parameter-Anzeige (Gruppen, leere Auswahl).
-            Kategorie-Ordner (18.01.01, E-4) liefern die Plugins des Pfads
-            (rekursiv, `category_plugin_ids`).
+            Kategorie-Ordner (18.01.01, E-4) liefern die Elemente des Pfads
+            rekursiv; 18.01.03 (L3) unterscheidet dabei ueber die im set_id-
+            Slot mitgelieferte Gruppe: Sets-Ordner -> Set-Service-Entries
+            aller Sets unter dem Pfad, Plugins-Ordner -> Plugin-Entries
+            (category_plugin_ids).
         """
         if node_type == TYPE_CATEGORY:
+            if str(set_id or "") == str(self.model.GROUP_SETS):
+                entries: List[Dict[str, str]] = []
+                for set_id_under in self.model.category_set_ids(
+                        plugin_id or ""):
+                    definition = self.model.find_set(set_id_under) or {}
+                    services = definition.get("services") or {}
+                    order = definition.get("execution_order") \
+                        or list(services.keys())
+                    for iid in order:
+                        cfg = services.get(iid) or {}
+                        if not isinstance(cfg, dict):
+                            continue
+                        entries.append({
+                            "node_type": TYPE_SERVICE,
+                            "set_id": str(set_id_under),
+                            "instance_id": str(iid),
+                            "plugin_id": str(cfg.get("plugin_id") or iid),
+                        })
+                return entries
             entries: List[Dict[str, str]] = []
             for pid in self.model.category_plugin_ids(plugin_id or ""):
                 entries.append({

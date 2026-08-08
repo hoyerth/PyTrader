@@ -6,7 +6,136 @@ Phase 15, Kapitel 15.1 (U15-D1): Aus service_win.py ausgelagert –
 Verhalten unverändert.
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+
+# 18.01.03 (E1): Separater global_settings-Key fuer den Kategorie-Override
+# eines Standalone-Plugins (NICHT plugin_params_<id> – das bleibt exklusiv
+# dem Parameter-Preset vorbehalten; siehe Entscheidung E1 im Prüfprotokoll).
+PLUGIN_CATEGORY_KEY = "plugin_category_{}"
+
+
+def set_set_category(set_repo, set_id: str, category_path: str) -> bool:
+    """Setzt den Kategorie-Pfad eines Service-Sets (18.01.03, E2).
+
+    Laedt die Definition FRISCH aus der DB (kein Cache), setzt das
+    `category`-Feld ("" = Root-Ebene) und persistiert additiv via
+    save_set(). record_snapshot=False – ein Ordner-Verschieben ist eine
+    interne Struktur-Verwaltung (wie die P14-04 Bestands-Migration) und
+    erzeugt KEINE Snapshot-Historie (Invariante 9).
+
+    Returns:
+        True bei Erfolg (Set existierte und wurde gespeichert).
+    """
+    set_id = str(set_id or "").strip()
+    if not set_id or set_repo is None:
+        return False
+    try:
+        definition = set_repo.get_set(set_id)
+    except Exception as e:
+        print(f"WARN [service_set_utils] Set '{set_id}' nicht ladbar: {e}")
+        return False
+    if not definition:
+        return False
+    definition["category"] = str(category_path or "").strip()
+    try:
+        set_repo.save_set(definition, record_snapshot=False)
+    except Exception as e:
+        print(f"WARN [service_set_utils] Kategorie fuer Set '{set_id}' "
+              f"nicht gespeichert: {e}")
+        return False
+    return True
+
+
+def set_plugin_category(state_manager, plugin_id: str,
+                        category_path: str) -> bool:
+    """Setzt den Kategorie-Override eines Plugins (18.01.03, E1).
+
+    Persistiert den Slash-Pfad unter `plugin_category_<plugin_id>` in
+    global_settings ("" = Root-Ebene hebt metadata['category'] auf). Der
+    Override hat VORRANG vor metadata['category'] (Modell _category_parts).
+    Das bestehende `plugin_params_<id>` bleibt unangetastet.
+
+    Returns:
+        True bei Erfolg (plugin_id vorhanden und gespeichert).
+    """
+    plugin_id = str(plugin_id or "").strip()
+    if not plugin_id or state_manager is None:
+        return False
+    try:
+        state_manager.save_global_value(
+            PLUGIN_CATEGORY_KEY.format(plugin_id),
+            str(category_path or "").strip())
+    except Exception as e:
+        print(f"WARN [service_set_utils] Kategorie fuer Plugin '{plugin_id}' "
+              f"nicht gespeichert: {e}")
+        return False
+    return True
+
+
+def _replace_prefix(path: str, old_path: str, new_path: str) -> str:
+    """Ersetzt das Pfad-Praefix old_path in path durch new_path.
+
+    Nur echte Ordner-Grenzen zaehlen: 'A/B' ersetzt 'A' UND 'A/C' (unter
+    'A'), aber NICHT 'AB'. Liefert path unveraendert, wenn old_path nicht
+    Praefix ist.
+    """
+    if path == old_path:
+        return new_path
+    if path.startswith(old_path + "/"):
+        return new_path + path[len(old_path):]
+    return path
+
+
+def rename_category(model, set_repo, state_manager, group: str,
+                    old_path: str, new_path: str) -> int:
+    """Benennt/verschiebt einen Kategorie-Ordner (String-Replace, 18.01.03).
+
+    Fuehrt fuer ALLE Kinder des Ordners ein Pfad-Update durch:
+      * group == 'sets'     -> jedes Set mit category-Praefix old_path wird
+                               via set_set_category() neu gespeichert.
+      * group == 'plugins'  -> jedes Plugin mit aufgeloestem Pfad-Praefix
+                               old_path erhaelt einen Kategorie-Override auf
+                               den neuen Pfad (plugin_category_<id>). Auch
+                               Plugins, deren Kategorie bisher aus
+                               metadata['category'] stammte, werden dadurch
+                               dauerhaft umgezogen (Override gewinnt).
+    Der Aufrufer emittiert danach `event_bus.service_set_changed`.
+
+    Returns:
+        Anzahl der betroffenen Elemente (Sets bzw. Plugins).
+    """
+    old_path = str(old_path or "").strip().strip("/")
+    new_path = str(new_path or "").strip().strip("/")
+    if not old_path or old_path == new_path:
+        return 0
+    group = str(group or "").strip()
+    count = 0
+    try:
+        if group == "sets":
+            for s in (model.get_sets() if model is not None else []) or []:
+                cat = str(s.get("category") or "").strip()
+                if not cat:
+                    continue
+                updated = _replace_prefix(cat, old_path, new_path)
+                if updated != cat and set_set_category(
+                        set_repo, str(s.get("set_id") or ""), updated):
+                    count += 1
+        else:
+            plugins = (model.get_plugins() if model is not None else {}) or {}
+            for pid in sorted(plugins.keys()):
+                current = (model.plugin_category_path(pid)
+                           if model is not None else "")
+                if not current:
+                    continue
+                updated = _replace_prefix(current, old_path, new_path)
+                if updated != current and set_plugin_category(
+                        state_manager, pid, updated):
+                    count += 1
+    except Exception as e:
+        print(f"WARN [service_set_utils] Ordner-Rename '{old_path}' -> "
+              f"'{new_path}' fehlgeschlagen: {e}")
+    return count
 
 
 def _available_plugin_ids() -> str:

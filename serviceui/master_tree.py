@@ -63,12 +63,22 @@ Signale:
     (Service-Info nutzt das bestehende `info_requested`-Signal.)
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import Qt, Signal
+import json
+
+from PySide6.QtCore import QMimeData, Qt, Signal
+from PySide6.QtGui import QDrag
 from PySide6.QtWidgets import (
-    QHeaderView, QMenu, QPushButton, QTreeWidget, QTreeWidgetItem,
+    QHeaderView, QInputDialog, QMenu, QPushButton, QTreeWidget,
+    QTreeWidgetItem,
 )
+
+# 18.01.03 (Dynamic Tree Management): MIME-Typ fuer den internen
+# Kategorie-Drag & Drop. Die MIME-Daten kodieren den gezogenen Knoten als
+# JSON: {"node_type": "set|plugin|category", "group": "sets|plugins",
+#         "id": <set_id|plugin_id|category-path>, "path": <Quell-Pfad>}.
+MIME_CATEGORY_MOVE = "application/x-pytrader-category-move"
 
 # P15-Bugfix: shiboken6.isValid() schuetzt vor dem Zugriff auf bereits
 # C++-seitig zerstoerte Items (QTreeWidget.clear() nach data_changed bei
@@ -206,13 +216,30 @@ class MasterTree(QTreeWidget):
     # 17.01.02 (Bugfix-Runde): Run-/Info-Aktionen fuer die Services-Gruppe.
     #   run_plugin_requested(plugin_id)  – '▶️ Diesen Service ausführen'
     #                                      (Einzel-Plugin-Zeile, ohne Set)
-    #   run_category_requested(path)     – '▶️ Alle Services ausführen'
+    #   run_category_requested(group, path) – '▶️ Alle Services ausführen'
     #                                      (Kategorie-Ordner, rekursiv; path
-    #                                      z.B. 'Swing Points/Geometrie')
-    #   category_info_requested(path)    – Info-Button auf Kategorie-Ordnern
+    #                                      z.B. 'Swing Points/Geometrie';
+    #                                      group = 'sets' | 'plugins',
+    #                                      18.01.03: Sets-Ordner moeglich)
+    #   category_info_requested(group, path) – Info-Button auf Kategorie-Ordnern
     run_plugin_requested = Signal(str)
-    run_category_requested = Signal(str)
-    category_info_requested = Signal(str)
+    run_category_requested = Signal(str, str)
+    category_info_requested = Signal(str, str)
+    # 18.01.03 (Dynamic Tree Management): Ordner-CRUD & Kategorie-Drag&Drop.
+    #   create_folder_requested(group, parent_path) – 'Neuer Ordner' (der
+    #       MasterTree zeigt den Namensdialog und haelt den Ordner als
+    #       UI-Zustand; der Orchestrator benoetigt KEINE Persistenz, da
+    #       leere Ordner nicht gespeichert werden – K9/E3).
+    #   rename_folder_requested(group, old_path, new_path) – 'Umbenennen'
+    #       (String-Replace aller Kinder im Orchestrator).
+    #   folder_item_moved(node_type, item_id, new_path) – Drop eines Sets
+    #       (TYPE_SET) bzw. Plugins (TYPE_PLUGIN) in einen Ziel-Ordner.
+    #   folder_moved(group, old_path, new_path) – Drop eines Ordners auf
+    #       einen anderen Ordner (verschiebt alle Kinder rekursiv).
+    create_folder_requested = Signal(str, str)
+    rename_folder_requested = Signal(str, str, str)
+    folder_item_moved = Signal(str, str, str)
+    folder_moved = Signal(str, str, str)
 
     def __init__(self, model, parent=None) -> None:
         super().__init__(parent)
@@ -272,6 +299,23 @@ class MasterTree(QTreeWidget):
         self._checkable: bool = False
         self._checked_items: set = set()
         self._updating_checks: bool = False
+
+        # 18.01.03 (Dynamic Tree Management): Interner Kategorie-Drag&Drop.
+        # Nur Sets/Plugins/Ordner sind ziehbar (E4 – kein Service-Reorder);
+        # der Drop aktualisiert den Kategorie-Pfad ueber die Signale
+        # folder_item_moved/folder_moved (Modell/Repositories persistieren).
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QTreeWidget.DragDrop)  # type: ignore[attr-defined]
+        #: Beim Mausklick gemerktes Item – Quelle eines beginnenden Drags
+        #: (mousePressEvent -> startDrag).
+        self._drag_source: Optional[QTreeWidgetItem] = None
+        #: UI-Zustand 'Neuer Ordner' (K9/E3): (group, voller Pfad) eines
+        #: noch LEEREN Ordners. Er wird im Baum gerendert (_ensure_pending_
+        #: folder), aber NICHT persistiert – sobald ein Item hineingezogen
+        #: wird (oder der Baum refresht), verschwindet er wieder.
+        self._pending_folder: Optional[tuple] = None
 
         self._populate()
         self.itemSelectionChanged.connect(self._emit_selection)
@@ -340,6 +384,9 @@ class MasterTree(QTreeWidget):
                 self._apply_dirty_label(iid, True)
         finally:
             self._updating_checks = False
+        # 18.01.03: UI-Zustand 'Neuer Ordner' nach dem Neuaufbau wieder
+        # anhaengen (leere Ordner sind nicht persistiert – K9/E3).
+        self._ensure_pending_folder()
 
     def _safe_current_selection(self) -> Dict[str, str]:
         """Liess die aktuelle Auswahl defensiv (isValid-Guard gegen zerstoerte
@@ -547,6 +594,274 @@ class MasterTree(QTreeWidget):
             hops += 1
         return "/".join(reversed(parts))
 
+    # -------------------------------------------------------------------------
+    # 18.01.03 (Dynamic Tree Management): Kategorie-Drag&Drop + Ordner-CRUD
+    # -------------------------------------------------------------------------
+
+    def _group_of(self, item) -> str:
+        """Eltern-GRUPPE eines Items ('sets' / 'plugins', 18.01.03, L3).
+
+        Wandert vom Item zur Top-Level-Gruppe (TYPE_GROUP) und liefert deren
+        ROLE_SET_ID (GROUP_SETS/GROUP_PLUGINS). Leer, wenn keine Gruppe
+        gefunden wird (defensiv).
+        """
+        node = item
+        hops = 0
+        while node is not None and isValid(node) and hops < 64:
+            if node.data(0, ROLE_NODE_TYPE) == TYPE_GROUP:
+                return str(node.data(0, ROLE_SET_ID) or "")
+            node = node.parent()
+            hops += 1
+        return ""
+
+    def _drag_id(self, item) -> str:
+        """Eindeutige ID eines ziehbaren Knotens fuer die MIME-Daten.
+
+        Sets -> set_id (ROLE_SET_ID), Plugins -> plugin_id (ROLE_PLUGIN_ID),
+        Kategorie-Ordner -> voller Kategorie-Pfad (_category_path_of).
+        """
+        node_type = item.data(0, ROLE_NODE_TYPE)
+        if node_type == TYPE_CATEGORY:
+            return self._category_path_of(item)
+        if node_type == TYPE_SET:
+            return str(item.data(0, ROLE_SET_ID) or "")
+        if node_type == TYPE_PLUGIN:
+            return str(item.data(0, ROLE_PLUGIN_ID) or "")
+        return ""
+
+    def startDrag(self, supported_actions) -> None:
+        """Startet den internen Kategorie-Drag (18.01.03, E4).
+
+        Ueberschrieben, damit NUR Sets/Plugins/Ordner gezogen werden
+        (kein Service-Reorder – E4) und die Ziel-Informationen als JSON-MIME
+        transportiert werden (Ordner sind nicht selektierbar, daher liefert
+        der Qt-Default-Mime aus selectedItems() nicht die Quelle).
+        """
+        item = getattr(self, "_drag_source", None)
+        if item is None or not isValid(item):
+            super().startDrag(supported_actions)
+            return
+        node_type = item.data(0, ROLE_NODE_TYPE)
+        if node_type not in (TYPE_SET, TYPE_PLUGIN, TYPE_CATEGORY):
+            super().startDrag(supported_actions)
+            return
+        try:
+            payload = {
+                "node_type": node_type,
+                "group": self._group_of(item),
+                "id": self._drag_id(item),
+                "path": (self._category_path_of(item)
+                         if node_type == TYPE_CATEGORY else ""),
+            }
+            mime = QMimeData()
+            mime.setData(MIME_CATEGORY_MOVE,
+                         json.dumps(payload).encode("utf-8"))
+            drag = QDrag(self)
+            drag.setMimeData(mime)
+            drag.exec(Qt.MoveAction, Qt.MoveAction)
+        except (RuntimeError, AttributeError):
+            pass
+        finally:
+            self._drag_source = None
+
+    def dragEnterEvent(self, event) -> None:
+        """Akzeptiert nur den eigenen Kategorie-Move-MIME (18.01.03)."""
+        try:
+            if event.mimeData().hasFormat(MIME_CATEGORY_MOVE):
+                event.acceptProposedAction()
+                return
+        except (RuntimeError, AttributeError):
+            pass
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:
+        """Akzeptiert den eigenen Kategorie-Move-MIME waehrend des Drags."""
+        try:
+            if event.mimeData().hasFormat(MIME_CATEGORY_MOVE):
+                event.acceptProposedAction()
+                return
+        except (RuntimeError, AttributeError):
+            pass
+        super().dragMoveEvent(event)
+
+    def _drop_target(self, item) -> tuple:
+        """Bestimmt (Gruppe, Ziel-Kategorie-Pfad) fuer ein Drop-Ziel-Item.
+
+        * Gruppe (TYPE_GROUP)  -> ("sets"/"plugins", "" = Root-Ebene)
+        * Ordner (TYPE_CATEGORY) -> (Eltern-Gruppe, Ordner-Pfad)
+        * Blatt (Set/Service/Plugin) -> (Eltern-Gruppe, Pfad des naechsten
+          Kategorie-Vorfahren; "" wenn direkt unter der Gruppe)
+        Liefert ("", "") wenn kein gueltiges Ziel gefunden wird (18.01.03).
+        """
+        if item is None or not isValid(item):
+            return "", ""
+        node_type = item.data(0, ROLE_NODE_TYPE)
+        if node_type == TYPE_GROUP:
+            return str(item.data(0, ROLE_SET_ID) or ""), ""
+        if node_type == TYPE_CATEGORY:
+            return self._group_of(item), self._category_path_of(item)
+        # Blatt: zum naechsten Kategorie-Vorfahren (oder zur Gruppe) wandern.
+        node = item.parent()
+        hops = 0
+        while node is not None and isValid(node) and hops < 64:
+            nt = node.data(0, ROLE_NODE_TYPE)
+            if nt == TYPE_CATEGORY:
+                return self._group_of(node), self._category_path_of(node)
+            if nt == TYPE_GROUP:
+                return str(node.data(0, ROLE_SET_ID) or ""), ""
+            node = node.parent()
+            hops += 1
+        return "", ""
+
+    def dropEvent(self, event) -> None:
+        """Verarbeitet den Kategorie-Drop (18.01.03).
+
+        Der Baum fuehrt KEINEN echten Item-Move aus – es werden nur die
+        Signale folder_item_moved (Set/Plugin) bzw. folder_moved (Ordner)
+        emittiert; der Orchestrator persistiert den Kategorie-Pfad ueber
+        Modell/Repositories und der naechste Refresh baut den Baum neu.
+        Guards:
+          * Nur der eigene MIME wird verarbeitet (sonst Qt-Default).
+          * Gruppen-Mismatch (Set in Plugins-Ordner ziehen) -> abgelehnt.
+          * Ordner-Zyklus (Ordner in seinen eigenen Unterordner) -> abgelehnt.
+        """
+        if not event.mimeData().hasFormat(MIME_CATEGORY_MOVE):
+            super().dropEvent(event)
+            return
+        try:
+            payload = json.loads(
+                bytes(event.mimeData().data(MIME_CATEGORY_MOVE)).decode("utf-8"))
+        except (ValueError, TypeError):
+            event.ignore()
+            return
+        source_type = str(payload.get("node_type") or "")
+        source_group = str(payload.get("group") or "")
+        source_id = str(payload.get("id") or "")
+        source_path = str(payload.get("path") or "")
+        try:
+            pos = (event.position().toPoint() if hasattr(event, "position")
+                   else event.pos())
+        except AttributeError:
+            pos = event.pos()
+        target = self.itemAt(pos)
+        target_group, target_path = self._drop_target(target)
+        if not target_group:
+            event.ignore()
+            return
+        if source_group and source_group != target_group:
+            event.ignore()
+            return
+        if source_type == TYPE_CATEGORY:
+            # Ordner-Verschiebung: Zyklus-Schutz (eigener Unterordner).
+            if (not source_path or target_path == source_path
+                    or target_path.startswith(source_path + "/")):
+                event.ignore()
+                return
+            self.folder_moved.emit(source_group, source_path, target_path)
+            event.accept()
+            return
+        if source_type in (TYPE_SET, TYPE_PLUGIN) and source_id:
+            self.folder_item_moved.emit(source_type, source_id, target_path)
+        event.accept()
+        # 18.01.03 (E3): Ein Item ist in den pending-Ordner gezogen worden –
+        # der UI-Zustand kann aufgeloest werden (der Ordner ist jetzt durch
+        # das Item real persistiert).
+        self._pending_folder = None
+
+    def _on_new_folder(self, group: str, parent_path: str) -> None:
+        """Kontextmenue 'Neuer Ordner' (18.01.03, E3).
+
+        Fragt den Namen ab und haelt den neuen LEEREN Ordner als UI-Zustand
+        (self._pending_folder) im Baum – eine Persistenz gibt es fuer leere
+        Ordner bewusst NICHT (K9/E3): Sobald ein Item hineingezogen wird,
+        wird der Pfad ueber die Repositories real; ein leerer Ordner
+        verschwindet beim naechsten Modell-Refresh.
+        """
+        name, ok = QInputDialog.getText(
+            self, "Neuer Ordner", "Ordner-Name:")
+        name = (name or "").strip().strip("/")
+        if not ok or not name:
+            return
+        parent_path = str(parent_path or "").strip().strip("/")
+        full_path = f"{parent_path}/{name}" if parent_path else name
+        self._pending_folder = (str(group), full_path)
+        self._populate()
+
+    def _on_rename_folder(self, group: str, old_path: str) -> None:
+        """Kontextmenue 'Umbenennen' (18.01.03).
+
+        Fragt den neuen Namen ab (vorbelegt mit dem letzten Pfad-Teil) und
+        emittiert `rename_folder_requested(group, old_path, new_path)` – der
+        Orchestrator fuehrt den String-Replace ueber alle Kinder aus
+        (service_set_utils.rename_category) und emittiert den EventBus.
+        """
+        old_path = str(old_path or "").strip().strip("/")
+        if not old_path:
+            return
+        old_name = old_path.split("/")[-1]
+        new_name, ok = QInputDialog.getText(
+            self, "Ordner umbenennen", "Neuer Name:", text=old_name)
+        new_name = (new_name or "").strip().strip("/")
+        if not ok or not new_name or new_name == old_name:
+            return
+        parts = old_path.split("/")
+        new_path = "/".join(parts[:-1] + [new_name])
+        self.rename_folder_requested.emit(str(group), old_path, new_path)
+
+    def _ensure_pending_folder(self) -> None:
+        """Haengt den UI-Ordner 'Neuer Ordner' an den Baum (18.01.03, E3).
+
+        Wird am Ende von _populate() gerufen: Existiert self._pending_folder
+        (group, voller Pfad) und ist der Pfad im neu aufgebauten Baum noch
+        nicht vorhanden, werden die fehlenden Ordner-Knoten erzeugt
+        (gleiches Format wie _build_category_item: nicht auswaehlbar, nicht
+        anhakbar, '📁 ' -Label). Der Ordner wird aufgeklappt, damit Drop-Ziele
+        sichtbar sind.
+        """
+        pending = getattr(self, "_pending_folder", None)
+        if not pending:
+            return
+        group, full_path = pending
+        parts = [p.strip() for p in str(full_path or "").split("/") if p.strip()]
+        if not parts:
+            return
+        try:
+            for i in range(self.topLevelItemCount()):
+                top = self.topLevelItem(i)
+                if (top is None or not isValid(top)
+                        or top.data(0, ROLE_NODE_TYPE) != TYPE_GROUP
+                        or str(top.data(0, ROLE_SET_ID) or "") != group):
+                    continue
+                node = top
+                for part in parts:
+                    folder = None
+                    for c in range(node.childCount()):
+                        ch = node.child(c)
+                        if (ch is None or not isValid(ch)
+                                or ch.data(0, ROLE_NODE_TYPE) != TYPE_CATEGORY):
+                            continue
+                        label = str(ch.data(0, ROLE_SET_ID) or "").strip()
+                        if label.startswith("📁"):
+                            label = label[len("📁"):].lstrip()
+                        if label.lower() == part.lower():
+                            folder = ch
+                            break
+                    if folder is None:
+                        label = _expandable_label(f"📁 {part}",
+                                                  False, False)
+                        folder = QTreeWidgetItem([label, ""])
+                        folder.setData(0, ROLE_NODE_TYPE, TYPE_CATEGORY)
+                        folder.setData(0, ROLE_SET_ID, f"📁 {part}")
+                        folder.setFlags(
+                            folder.flags()
+                            & ~(Qt.ItemIsSelectable | Qt.ItemIsUserCheckable))
+                        node.addChild(folder)
+                    node = folder
+                node.setExpanded(True)
+                break
+        except (RuntimeError, AttributeError):
+            pass
+
     def _attach_item_buttons(self) -> None:
         """Haengt die Info-Buttons (Spalte 1) an alle Service-/Set-/Plugin-
         Zeilen UND Kategorie-Ordner (Bugfix 05.08.2026 / 17.01.02).
@@ -597,14 +912,18 @@ class MasterTree(QTreeWidget):
                 if tooltip:
                     btn.setToolTip(tooltip)
                 # 17.01.02: Kategorie-Ordner emittieren category_info_requested
-                # mit dem vollen Kategorie-Pfad (analog Set-Info).
+                # mit dem vollen Kategorie-Pfad (analog Set-Info). 18.01.03
+                # (L3): Zusaetzlich wird die Eltern-GRUPPE uebergeben, damit
+                # der Orchestrator Sets-Ordner ('sets') von Plugins-Ordnern
+                # ('plugins') unterscheiden kann.
                 if node_type == TYPE_CATEGORY:
                     cat_path = self._category_path_of(item)
+                    cat_group = self._group_of(item)
                     btn.setToolTip(
                         f"Kategorie: {cat_path or '?'}")
                     btn.clicked.connect(
-                        lambda _=False, cp=cat_path:
-                        self.category_info_requested.emit(cp))
+                        lambda _=False, g=cat_group, cp=cat_path:
+                        self.category_info_requested.emit(g, cp))
                 else:
                     btn.clicked.connect(
                         lambda _=False, s=set_id, svc=service_id, pid=plugin_id:
@@ -1011,21 +1330,33 @@ class MasterTree(QTreeWidget):
             # 17.01.02 (Bugfix-Runde): Kategorie-Ordner erhalten jetzt ein
             # Kontextmenue mit '▶️ Alle Services ausführen' (rekursiv, alle
             # Services unter dem Ordner) + 'Ordner-Info anzeigen' (analog zu
-            # den Set-Aktionen in der 📁-Gruppe).
+            # den Set-Aktionen in der 📁-Gruppe). 18.01.03: Run/Info tragen
+            # zusaetzlich die Eltern-GRUPPE ('sets'/'plugins', L3) und das
+            # Menue bietet 'Neuer Ordner' + 'Umbenennen' (Ordner-CRUD).
             if node_type == TYPE_CATEGORY:
                 cat_path = self._category_path_of(item)
+                cat_group = self._group_of(item)
                 if not cat_path:
                     return
                 menu = QMenu(self)
                 act_run = menu.addAction("▶️ Alle Services ausführen")
                 act_run.triggered.connect(
-                    lambda _=False, cp=cat_path:
-                    self.run_category_requested.emit(cp))
+                    lambda _=False, g=cat_group, cp=cat_path:
+                    self.run_category_requested.emit(g, cp))
                 menu.addSeparator()
                 act_info = menu.addAction("Ordner-Info anzeigen")
                 act_info.triggered.connect(
-                    lambda _=False, cp=cat_path:
-                    self.category_info_requested.emit(cp))
+                    lambda _=False, g=cat_group, cp=cat_path:
+                    self.category_info_requested.emit(g, cp))
+                menu.addSeparator()
+                act_new = menu.addAction("Neuer Ordner")
+                act_new.triggered.connect(
+                    lambda _=False, g=cat_group, cp=cat_path:
+                    self._on_new_folder(g, cp))
+                act_ren = menu.addAction("Umbenennen")
+                act_ren.triggered.connect(
+                    lambda _=False, g=cat_group, cp=cat_path:
+                    self._on_rename_folder(g, cp))
                 menu.exec(self.viewport().mapToGlobal(pos))
                 return
             menu = QMenu(self)
@@ -1035,11 +1366,24 @@ class MasterTree(QTreeWidget):
                     act = menu.addAction("Neues Set anlegen")
                     act.triggered.connect(
                         lambda _=False: self.create_set_requested.emit())
+                    # 18.01.03: 'Neuer Ordner' in der Sets-Gruppe (Root).
+                    act_folder = menu.addAction("Neuer Ordner")
+                    act_folder.triggered.connect(
+                        lambda _=False, g=group:
+                        self._on_new_folder(g, ""))
                     menu.addSeparator()
                     act_trash = menu.addAction("🗑️ Papierkorb öffnen...")
                     act_trash.triggered.connect(
                         lambda _=False: self.open_trash_requested.emit())
                 else:
+                    # 18.01.03: 'Neuer Ordner' auch in der Services-Gruppe
+                    # (Root) – die uebrigen Struktur-Aktionen bleiben
+                    # ausgegraut (_add_outside_set_actions).
+                    act_folder = menu.addAction("Neuer Ordner")
+                    act_folder.triggered.connect(
+                        lambda _=False, g=group:
+                        self._on_new_folder(g, ""))
+                    menu.addSeparator()
                     self._add_outside_set_actions(menu, item)
                 menu.exec(self.viewport().mapToGlobal(pos))
                 return
@@ -1211,6 +1555,10 @@ class MasterTree(QTreeWidget):
             if item is None or not isValid(item):
                 super().mousePressEvent(event)
                 return
+            # 18.01.03 (Drag & Drop): Quelle fuer einen beginnenden Drag
+            # merken (nur linke Maustaste; startDrag wertet sie aus).
+            self._drag_source = (
+                item if event.button() == Qt.LeftButton else None)
             # Klick-Scope fuer das Read-Only-Panel (Bugfix 06.08.2026).
             self._emit_selection_details(item)
             # Checkbox-Klick hat Vorrang vor dem Expand-Toggle
@@ -1261,6 +1609,11 @@ class MasterTree(QTreeWidget):
                 # Kategorie-Pfad (z.B. 'Swing Points/Geometrie') im
                 # plugin_id-Slot – Grundlage fuer die ID-Aufloesung im
                 # AnalyticsWindow (Baum-Selektion -> set_feature_ids).
+                # 18.01.03 (L3): Zusaetzlich wird die Eltern-GRUPPE
+                # ('sets'/'plugins') im set_id-Slot geliefert, damit die
+                # Aufloesung Sets-Ordner von Plugins-Ordnern unterscheiden
+                # kann (Sets-Ordner -> category_set_ids -> Services).
+                set_id = self._group_of(item)
                 plugin_id = self._category_path_of(item)
             self.selection_details.emit(node_type, set_id, service_id,
                                         plugin_id)
