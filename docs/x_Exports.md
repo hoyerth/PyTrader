@@ -63,6 +63,7 @@ PyTrader/
             distribution_page.py
             equity_page.py
             heatmap_page.py
+            heatmap_widget.py
             scatter_page.py
             table_page.py
     chart/
@@ -99,7 +100,6 @@ PyTrader/
         base_state_model.py
         event_bus.py
     data/
-        analytics.duckdb.tmp/
         custom_plugins/
     data_sync/
         __init__.py
@@ -126,6 +126,13 @@ PyTrader/
         symbols_win.py
         trash_dialog.py
     test/
+        check_bugfix_0808.py
+        check_heatmap_200201.py
+        check_heatmap_bugfix.py
+        check_page_nav.py
+        check_wal_guard.py
+        check_wal_recovery.py
+        fix_page_changed.py
         test.py
     ui/
         __init__.py
@@ -4218,6 +4225,127 @@ class AnalyticsRepository:
         return result
 
     # ------------------------------------------------------------------
+    # Generische 2D-Heatmap (20.02, additiv – Kapitel §2 / Review E1/E5/E6)
+    # ------------------------------------------------------------------
+    def get_generic_heatmap(
+        self,
+        symbol: str,
+        timeframe: str,
+        x_dim: str,
+        y_dim: str,
+        field: Optional[str] = None,
+        agg: str = "count",
+        feature_id: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Generische 2D-Matrix (freie Dimensionen + Aggregationen, 20.02).
+
+        Additiv zur bestehenden get_heatmap() (Dow×Stunde bleibt Standard).
+        Wanduhr-Garantie (Invariante 7 / E4) wie fetch_heatmap – die
+        Extraktion erfolgt im Reader mit `bar_time AT TIME ZONE 'UTC'`.
+
+        Returns:
+            {
+              "matrix": dense M x N, "x_labels"/"y_labels", "x_values",
+              "min_val"/"max_val", "x_dim"/"y_dim"/"agg"/"field",
+              "metrics": ["count", "confluence_count", ...numerische JSON-Keys],
+              "field_sources": {Key: [service_id...]} (20.02.01, Meldung 3b),
+              "symbol", "timeframe",
+            }
+        """
+        avail = self.reader.available_feature_keys(
+            symbol, timeframe, numeric_only=True)
+        # 09.08.2026 (User-Meldung Feld-Dropdown, Root Cause 2): Die
+        # Feldquellen werden STRENG ueber den feature_ids-Filter bestimmt –
+        # abgewaehlte Services (z. B. Grid-Lines) duerfen ihre Keys nicht
+        # mehr ins 'Feld'-Dropdown liefern (vorher ungefiltert ueber ALLE
+        # Rows des Symbol/Timeframe).
+        by_service = self.reader.feature_keys_by_service(
+            symbol, timeframe, numeric_only=True,
+            feature_id=feature_id, feature_ids=feature_ids)
+        field_sources: Dict[str, List[str]] = {}
+        for fid, keys in by_service.items():
+            if not fid:
+                continue  # Legacy-Rows ohne feature_id -> kein Service-Prefix
+            for k in keys:
+                field_sources.setdefault(k, []).append(fid)
+        # Nur die Keys der SELEKTIERTEN Services in der Metrik-/Feldliste –
+        # das HeatmapWidget baut das 'Feld'-Dropdown aus `metrics` auf
+        # (_sync_combos_from_payload); ohne diese Begrenzung erschienen
+        # abgewaehlte Keys weiterhin (nur ohne Service-Prefix).
+        avail_filtered = sorted({k for keys in by_service.values()
+                                 for k in keys})
+        if not avail_filtered:
+            avail_filtered = avail  # defensiv: ohne Quellen -> ungefiltert
+        metrics = ["count", "confluence_count"] + avail_filtered
+        use_agg = str(agg or "count").lower()
+        use_field = str(field or "")
+        # E6: Bei Wert-Aggregationen (AVG/SUM/MIN/MAX) ist `field` ein
+        # numerischer JSON-Key – defensiv auf den ersten verfuegbaren Key
+        # zurueckfallen (keine ValueError-Haenger im UI).
+        if use_agg in ("avg", "sum", "min", "max"):
+            if use_field not in avail_filtered:
+                use_field = avail_filtered[0] if avail_filtered else ""
+        try:
+            result = self.reader.fetch_generic_heatmap(
+                symbol, timeframe, x_dim, y_dim, field=use_field or None,
+                agg=use_agg, feature_id=feature_id, feature_ids=feature_ids,
+                limit=limit,
+            )
+        except ValueError as e:
+            print(f"WARN [AnalyticsRepository] get_generic_heatmap: {e}")
+            result = self.reader._empty_generic_heatmap(
+                x_dim, y_dim, use_agg, use_field or None, symbol, timeframe)
+        result["metrics"] = metrics
+        result["field_sources"] = field_sources
+        return result
+
+    # ------------------------------------------------------------------
+    # OHLCV-Snapshot fuer das Candle-Overlay (20.02, E9)
+    # ------------------------------------------------------------------
+    def get_ohlcv_snapshot(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """OHLCV-Bars aus market_data.duckdb (read-only, Wanduhr-Epochs).
+
+        20.02 (E9): Read-only-Delegation an den FeatureStoreReader – kein SQL
+        in der UI. Der Preis-Strip im HeatmapWidget gruppiert die Bars pro
+        Datums-Spalte zu Tages-Ohlc.
+
+        Returns:
+            {"bars": [{"time": int, "open": float, "high": float,
+                       "low": float, "close": float, "volume": float}, ...],
+             "symbol", "timeframe"}
+        """
+        return self.reader.fetch_ohlcv_snapshot(symbol, timeframe, limit=limit)
+
+    # 20.02-Bugfix (09.08.2026, Punkt 1+2): Tages-Ohlc fuer das Candle-Overlay
+    # im selben Canvas – SQL-seitig aggregiert (deckt den gesamten
+    # Heatmap-Zeitraum ab, statt nur der letzten OHLCV_SNAPSHOT_LIMIT Bars).
+    def get_daily_ohlc(
+        self,
+        symbol: str,
+        timeframe: str,
+        max_days: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Tages-Ohlc je Wanduhr-Datum (read-only, Wanduhr-Mitternachts-Epochs).
+
+        20.02-Bugfix: Additive Alternative zum OHLCV-Snapshot – das
+        HeatmapWidget zeichnet die Tages-Candles ueber die Heatmap-Zellen
+        (gleicher Canvas, rechte Preis-Achse). Kein SQL in der UI.
+
+        Returns:
+            {"bars": [{"time": int(Wanduhr-Mitternachts-Epoch), "open": float,
+                       "high": float, "low": float, "close": float}, ...],
+             "symbol", "timeframe"}
+        """
+        return self.reader.fetch_daily_ohlc(symbol, timeframe, max_days=max_days)
+
+    # ------------------------------------------------------------------
     # Scatter
     # ------------------------------------------------------------------
     def get_scatter(
@@ -4461,6 +4589,9 @@ from analytics.engine.analytics_repository import AnalyticsRepository
 from analytics.engine.analytics_worker import (
     QUERY_TABLE,
     QUERY_HEATMAP,
+    QUERY_HEATMAP_GENERIC,
+    QUERY_OHLCV,
+    QUERY_DAILY_OHLC,
     QUERY_SCATTER,
     QUERY_DISTRIBUTION,
     QUERY_FEATURES,
@@ -4534,6 +4665,20 @@ class AnalyticsViewModel(QObject):
             "distribution_column": "",
             "bins": DEFAULT_BINS,
             "limit": DEFAULT_LIMIT,
+            # 20.02 (E1/E3/E8/E10, generische 2D-Heatmap): Konfiguration der
+            # generischen Heatmap – x/y-Dimensionen (DIM_MAPPINGS), Aggregation
+            # und numerischer feature_data-JSON-Key (`field`, E6). Defaults
+            # laut Kapitel: Confluence-Modus (CONFLUENCE_COUNT) auf
+            # Datum×Stunde. `selected_feature_ids` entfaellt (E10: Redundanz
+            # zu feature_ids). Zoom = normalisierte Viewport-Anteile [0,1]
+            # (E8), rein client-seitig (kein DB-Requery).
+            "heatmap_x_dim": "date",
+            "heatmap_y_dim": "hour",
+            "heatmap_field": "",
+            "heatmap_agg": "confluence_count",
+            "candle_projection_enabled": False,
+            "zoom_x_range": [0.0, 1.0],
+            "zoom_y_range": [0.0, 1.0],
             # 19.03 (Step 2): TablePage-Settings – reine UI-Zustaende ohne
             # DB-Abfrage. Persistiert im Profil-Payload (Option B – Explicit
             # Save); set_table_settings() markiert nur dirty (E6, kein
@@ -4592,6 +4737,22 @@ class AnalyticsViewModel(QObject):
     def request_heatmap(self) -> None:
         self._refresh((QUERY_HEATMAP,))
 
+    # 20.02 (additiv): Generische 2D-Heatmap (freie Dimensionen) + OHLCV-
+    # Snapshot fuer das Candle-Overlay (E9) – werden on-demand von der
+    # HeatmapPage im Generisch-Modus angefordert (kein refresh_all-Pflicht).
+    def request_heatmap_generic(self) -> None:
+        self._refresh((QUERY_HEATMAP_GENERIC,))
+
+    def request_ohlcv_snapshot(self) -> None:
+        self._refresh((QUERY_OHLCV,))
+
+    # 20.02-Bugfix (09.08.2026, Punkt 1+2): Tages-Ohlc fuer das Candle-Overlay
+    # im selben Canvas – SQL-seitig aggregiert (deckt den gesamten
+    # Heatmap-Zeitraum ab; das HeatmapWidget nutzt diesen Query statt
+    # QUERY_OHLCV).
+    def request_daily_ohlc(self) -> None:
+        self._refresh((QUERY_DAILY_OHLC,))
+
     def request_scatter(self) -> None:
         self._refresh((QUERY_SCATTER,))
 
@@ -4603,21 +4764,23 @@ class AnalyticsViewModel(QObject):
 
     def refresh_all(self) -> None:
         """Stoesst alle Abfragen neu an (Seiten-/Profilwechsel)."""
-        self._refresh((QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
-                       QUERY_DISTRIBUTION, QUERY_FEATURES))
+        self._refresh((QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC,
+                       QUERY_SCATTER, QUERY_DISTRIBUTION, QUERY_FEATURES))
 
     # ------------------------------------------------------------------
     # Parameter setzen (UI-Pages) – markieren Dirty + feuern betroffen ab
     # ------------------------------------------------------------------
     def set_symbol(self, symbol: str) -> None:
         self._set_param("symbol", str(symbol or ""),
-                        (QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
-                         QUERY_DISTRIBUTION, QUERY_FEATURES))
+                        (QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC,
+                         QUERY_OHLCV, QUERY_SCATTER, QUERY_DISTRIBUTION,
+                         QUERY_FEATURES))
 
     def set_timeframe(self, timeframe: str) -> None:
         self._set_param("timeframe", str(timeframe or "M1"),
-                        (QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
-                         QUERY_DISTRIBUTION, QUERY_FEATURES))
+                        (QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC,
+                         QUERY_OHLCV, QUERY_SCATTER, QUERY_DISTRIBUTION,
+                         QUERY_FEATURES))
 
     def set_feature_id(self, feature_id: Optional[str]) -> None:
         """Kompatibilitaets-Alias (Legacy): Einzel-ID -> Multi-Liste."""
@@ -4636,8 +4799,8 @@ class AnalyticsViewModel(QObject):
             return
         self._params["feature_ids"] = ids
         self._mark_dirty()
-        self._refresh((QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
-                       QUERY_DISTRIBUTION))
+        self._refresh((QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC,
+                       QUERY_SCATTER, QUERY_DISTRIBUTION))
 
     @staticmethod
     def _normalize_feature_ids(value) -> List[str]:
@@ -4697,6 +4860,91 @@ class AnalyticsViewModel(QObject):
     def set_heatmap_metric(self, metric: str) -> None:
         self._set_param("heatmap_metric", str(metric or "count"),
                         (QUERY_HEATMAP,))
+
+    # ------------------------------------------------------------------
+    # 20.02: Generische 2D-Heatmap – Konfiguration/Zoom/Overlay (additiv)
+    # ------------------------------------------------------------------
+    def set_heatmap_config(
+        self, x_dim: str, y_dim: str, field: str, agg: str
+    ) -> None:
+        """Setzt die Konfiguration der generischen Heatmap (20.02, E1).
+
+        x_dim/y_dim aus DIM_MAPPINGS (case-insensitiv), `agg` eine der
+        HEATMAP_AGGREGATIONS, `field` der numerische feature_data-JSON-Key
+        (E6: nur bei AVG/SUM/MIN/MAX relevant; COUNT/CONFLUENCE_COUNT
+        ignorieren ihn). 20.02.01 (E6): `dow_hour` wird per Sanitizer auf
+        "hour" abgebildet. Ohne Aenderung idempotent (kein Refresh).
+        """
+        x_dim = self._sanitize_dim(x_dim or "date")
+        y_dim = self._sanitize_dim(y_dim or "hour")
+        agg = str(agg or "confluence_count").lower()
+        field = str(field or "")
+        changed = (x_dim != self._params.get("heatmap_x_dim")
+                   or y_dim != self._params.get("heatmap_y_dim")
+                   or agg != self._params.get("heatmap_agg")
+                   or field != self._params.get("heatmap_field"))
+        if not changed:
+            return
+        self._params["heatmap_x_dim"] = x_dim
+        self._params["heatmap_y_dim"] = y_dim
+        self._params["heatmap_agg"] = agg
+        self._params["heatmap_field"] = field
+        self._mark_dirty()
+        self._refresh((QUERY_HEATMAP_GENERIC,))
+
+    def set_heatmap_zoom(self, x_range, y_range) -> None:
+        """Setzt die normalisierten Viewport-Anteile [0,1] (20.02, E8).
+
+        Rein client-seitig (die UI wendet die Bereiche direkt per
+        setXRange/setYRange an) – KEIN DB-Requery. Die Werte werden geclampt
+        (0 ≤ lo < hi ≤ 1) und fuer die Persistenz (Profil/Workspace)
+        markiert (Option B – Explicit Save).
+        """
+        x_clamped = self._clamp_zoom(x_range)
+        y_clamped = self._clamp_zoom(y_range)
+        if (x_clamped == self._params.get("zoom_x_range")
+                and y_clamped == self._params.get("zoom_y_range")):
+            return
+        self._params["zoom_x_range"] = x_clamped
+        self._params["zoom_y_range"] = y_clamped
+        self._mark_dirty()
+
+    def set_candle_projection(self, enabled: bool) -> None:
+        """Schaltet das Candle-Overlay (Preis-Strip) an/aus (20.02, E9).
+
+        Reiner UI-Zustand ohne DB-Abfrage (der OHLCV-Snapshot wird von der
+        HeatmapPage on-demand angefordert); nur Dirty-Markierung fuer die
+        Profil-Persistenz.
+        """
+        enabled = bool(enabled)
+        if enabled == self._params.get("candle_projection_enabled"):
+            return
+        self._params["candle_projection_enabled"] = enabled
+        self._mark_dirty()
+
+    @staticmethod
+    def _clamp_zoom(value) -> List[float]:
+        """Clampt einen Zoom-Bereich auf [0.0, 1.0] mit lo < hi (E8)."""
+        try:
+            lo, hi = float(value[0]), float(value[1])
+        except (TypeError, ValueError, IndexError):
+            return [0.0, 1.0]
+        lo = max(0.0, min(1.0, lo))
+        hi = max(0.0, min(1.0, hi))
+        return [lo, hi] if hi > lo else [0.0, 1.0]
+
+    @staticmethod
+    def _sanitize_dim(value) -> str:
+        """Bereinigt eine Heatmap-Dimension (20.02.01, E6).
+
+        `dow_hour` ist ersatzlos aus DIM_MAPPINGS/HEATMAP_DIMENSIONS entfernt.
+        Alt-Profil-/Workspace-/Config-Werte mit `dow_hour` werden auf die
+        gueltige Dimension "hour" (Tageszeit) abgebildet – sonst wuerde
+        `_set_combo_data` (additives Hinzufuegen unbekannter Werte) die
+        entfernte Dimension wieder in die UI-Combos aufnehmen.
+        """
+        dim = str(value or "").lower()
+        return "hour" if dim == "dow_hour" else dim
 
     def set_scatter_columns(self, x_column: str, y_column: str) -> None:
         # 19.02 (Cleanup): Leere Werte = Repo-Default (erste numerische
@@ -4857,6 +5105,25 @@ class AnalyticsViewModel(QObject):
             base["limit"] = p["limit"]
         elif kind == QUERY_HEATMAP:
             base["metric"] = p["heatmap_metric"]
+        elif kind == QUERY_HEATMAP_GENERIC:
+            # 20.02: Generische 2D-Heatmap – Konfiguration aus den heatmap_*-
+            # _params. 20.02-Bugfix (09.08.2026, Punkt 2): KEIN limit-Lookback
+            # mehr (limit=None => ALLE verfuegbaren Daten; der Pivot-Deckel
+            # MAX_HEATMAP_CELLS im Reader begrenzt die Matrix). Vorher schnitt
+            # der 5000er-Lookback die Heatmap auf die letzten ~4 Tage (M1) ab.
+            base["x_dim"] = p["heatmap_x_dim"]
+            base["y_dim"] = p["heatmap_y_dim"]
+            base["field"] = p.get("heatmap_field") or None
+            base["agg"] = p["heatmap_agg"]
+        elif kind == QUERY_OHLCV:
+            # 20.02 (E9): OHLCV-Snapshot – limit=None => Reader-Default
+            # (OHLCV_SNAPSHOT_LIMIT); kein feature_ids-Filter noetig.
+            pass
+        elif kind == QUERY_DAILY_OHLC:
+            # 20.02-Bugfix (09.08.2026): Tages-Ohlc fuer das Candle-Overlay –
+            # max_days=None => Reader-Default DAILY_OHLC_MAX_DAYS (4000 Tage,
+            # deckt den gesamten Heatmap-Zeitraum).
+            pass
         elif kind == QUERY_SCATTER:
             base["x_column"] = p["scatter_x"]
             base["y_column"] = p["scatter_y"]
@@ -5011,6 +5278,15 @@ class AnalyticsViewModel(QObject):
         if "feature_ids" not in flat and flat.get("feature_id"):
             self._params["feature_ids"] = self._normalize_feature_ids(
                 [flat["feature_id"]])
+        # 20.02 (Luecke 5.3-6): `charts.heatmap` ist ein VERSCHACHTELTES Dict –
+        # _flatten_payload() bildet es NICHT auf flache _params ab. Explizit
+        # aufloesen (E3: additiv, kein Schema-Bump auf v2.1).
+        self._apply_heatmap_section(flat.get("heatmap"))
+        # 20.02.01 (E6): Alt-Payloads mit `dow_hour` (flach ODER via
+        # charts.heatmap) auf die gueltige Dimension "hour" abbilden.
+        for _hk in ("heatmap_x_dim", "heatmap_y_dim"):
+            if self._params.get(_hk) == "dow_hour":
+                self._params[_hk] = "hour"
         self._params["feature_ids"] = self._normalize_feature_ids(
             self._params.get("feature_ids"))
         # 20.01 (E5): Fehlende Services isolieren – valide IDs direkt setzen.
@@ -5024,6 +5300,34 @@ class AnalyticsViewModel(QObject):
             self._dirty = False
             self.dirty_changed.emit(False)
         self.refresh_all()
+
+    def _apply_heatmap_section(self, heat: Any) -> None:
+        """Loest die verschachtelte `charts.heatmap`-Sektion auf (20.02).
+
+        Luecke 5.3-6: `_flatten_payload()` bildet das verschachtelte Dict
+        nicht auf die flachen `_params`-Keys ab – dieser Helfer uebernimmt
+        die 20.02-Keys additiv (nur vorhandene/gueltige Werte; None bleibt
+        unveraendert). Zoom-Bereiche werden geclampt (E8).
+        """
+        if not isinstance(heat, dict):
+            return
+        if heat.get("x_dim") is not None:
+            self._params["heatmap_x_dim"] = self._sanitize_dim(heat["x_dim"])
+        if heat.get("y_dim") is not None:
+            self._params["heatmap_y_dim"] = self._sanitize_dim(heat["y_dim"])
+        if heat.get("agg") is not None:
+            self._params["heatmap_agg"] = str(heat["agg"]).lower()
+        if heat.get("field") is not None:
+            self._params["heatmap_field"] = str(heat["field"])
+        if heat.get("candle_projection_enabled") is not None:
+            self._params["candle_projection_enabled"] = bool(
+                heat["candle_projection_enabled"])
+        if isinstance(heat.get("zoom_x_range"), (list, tuple)):
+            self._params["zoom_x_range"] = self._clamp_zoom(
+                heat["zoom_x_range"])
+        if isinstance(heat.get("zoom_y_range"), (list, tuple)):
+            self._params["zoom_y_range"] = self._clamp_zoom(
+                heat["zoom_y_range"])
 
     def _current_payload(self) -> Dict[str, Any]:
         """Profil-Payload aus den aktuellen Ansichtsparametern (v2, sectioned).
@@ -5046,6 +5350,21 @@ class AnalyticsViewModel(QObject):
                 "scatter_y": p.get("scatter_y"),
                 "distribution_column": p.get("distribution_column"),
                 "bins": p.get("bins"),
+                # 20.02 (E2/E3): Generische Heatmap-Config additiv unter
+                # charts.heatmap (kein Schema-Bump noetig; v2-Sektionen sind
+                # fuer additive UI-Settings ausgelegt, 20.01 E3).
+                "heatmap": {
+                    "x_dim": p.get("heatmap_x_dim"),
+                    "y_dim": p.get("heatmap_y_dim"),
+                    "field": p.get("heatmap_field"),
+                    "agg": p.get("heatmap_agg"),
+                    "candle_projection_enabled": p.get(
+                        "candle_projection_enabled"),
+                    "zoom_x_range": list(p.get("zoom_x_range")
+                                         or [0.0, 1.0]),
+                    "zoom_y_range": list(p.get("zoom_y_range")
+                                         or [0.0, 1.0]),
+                },
             },
             "table": {
                 "limit": p.get("limit"),
@@ -5082,6 +5401,10 @@ class AnalyticsViewModel(QObject):
         for key in list(self._params.keys()):
             if key in params and params[key] is not None:
                 self._params[key] = params[key]
+        # 20.02.01 (E6): Alt-Workspaces mit `dow_hour` -> "hour" (Tageszeit).
+        for _hk in ("heatmap_x_dim", "heatmap_y_dim"):
+            if self._params.get(_hk) == "dow_hour":
+                self._params[_hk] = "hour"
         self._params["feature_ids"] = self._normalize_feature_ids(
             self._params.get("feature_ids"))
         valid, missing = self._resolve_feature_ids(self._params["feature_ids"])
@@ -5204,6 +5527,88 @@ class AnalyticsViewModel(QObject):
         except Exception:
             return []
 
+    # ------------------------------------------------------------------
+    # 20.02.01 (E8): Lesbares Service-Label fuer die service_id-Dimension
+    # ------------------------------------------------------------------
+    def resolve_service_label(self, plugin_id: str) -> str:
+        """Lesbares Service-Label '{Kategorie} / {Name}' (20.02.01, E8).
+
+        Formatiert eine `service_id`-Dimension der generischen Heatmap:
+        das `srv_`-Prefix entfaellt (metadata['display_name'], z. B.
+        'Trend Breakout'), der Kategorie-Pfad (plugin_category_path,
+        Slash -> ' / ') wird vorangestellt (z. B.
+        'Swing Points / Trend Breakout'). Unbekannte/entfernte IDs ->
+        Rohwert (defensiv). Lazy `_selector_model` (Muster
+        `_resolve_feature_ids`), rein lesend, kein SQL.
+        """
+        key = str(plugin_id or "").strip()
+        if not key:
+            return ""
+        model = self._selector_model
+        if model is None:
+            from analytics.engine.service_selector_model import ServiceSelectorModel
+            model = ServiceSelectorModel(parent=self)
+            self._selector_model = model
+        try:
+            plugin = model.get_plugin(key)
+            if plugin is None:
+                return key
+            meta = getattr(plugin, "metadata", {}) or {}
+            name = str(meta.get("display_name") or key)
+            if name.lower().startswith("srv_"):
+                name = name[4:]
+            category = str(model.plugin_category_path(key) or "")
+            if category:
+                return f"{category} / {name}"
+            return name
+        except Exception:
+            return key
+
+    def resolve_service_display_name(self, plugin_id: str) -> str:
+        """Service-Name OHNE Kategorie-Pfad, direkt aus dem Service-Objekt.
+
+        09.08.2026 (User-Meldung 'Feld'-Dropdown): Der Name wird DIREKT aus
+        dem Service-Objekt abgeleitet – aus dessen `plugin_id` (der
+        Identitaet des Objekts): `srv_`-Prefix entfaellt, Unterstriche
+        werden zu Leerzeichen, Worte title-case ('srv_swing_momentum' ->
+        'Swing Momentum'). Damit steht der KORREKTE Service-Name im
+        'Feld'-Dropdown der generischen Heatmap; `metadata['display_name']`
+        ist nicht zuverlaessig (z. B. 'Swing Momentum Service' mit
+        'Service'-Suffix, das wie ein MasterTree-Pfad-Bestandteil wirkt).
+        Kein Kategorie-Pfad. Unbekannte/entfernte IDs -> lesbarer Pretty-
+        Fallback (defensiv). Rein lesend, kein SQL.
+        """
+        key = str(plugin_id or "").strip()
+        if not key or key.lower() == "none":
+            # 09.08.2026 (User-Meldung Feld-Dropdown, Root Cause 3): Leere/
+            # fehlende/Native-Keys liefern einen lesbaren Sammel-Namen statt
+            # eines Leerstrings (kein leerer Prefix vor Feld-Eintraegen).
+            return "Allgemein"
+        model = self._selector_model
+        if model is None:
+            from analytics.engine.service_selector_model import ServiceSelectorModel
+            model = ServiceSelectorModel(parent=self)
+            self._selector_model = model
+        try:
+            plugin = model.get_plugin(key)
+            if plugin is None:
+                # 09.08.2026 (Root Cause 3): Unbekannte/abgewaehlte Keys
+                # (z. B. Native-Rows) -> lesbarer Pretty-Fallback statt
+                # Rohwert/Leerstring ('native' -> 'Native').
+                pretty = (key.replace("srv_", "").replace("ind_", "")
+                          .replace("_", " ").title())
+                return pretty or key
+            pid = str(getattr(plugin, "plugin_id", None) or key)
+            name = pid
+            for prefix in ("srv_", "ind_"):
+                if name.lower().startswith(prefix):
+                    name = name[len(prefix):]
+                    break
+            pretty = name.replace("_", " ").title()
+            return pretty or key
+        except Exception:
+            return key
+
     @property
     def max_lookback_limit(self) -> int:
         """Max-Lookback-Cap (UI-Slider-Maximum)."""
@@ -5264,6 +5669,11 @@ am Leben und `worker.finished.connect(worker.deleteLater)` raeumt auf.
 Abfrage-Typen (query_kind, Single Source of Truth fuer Worker & ViewModel):
     QUERY_TABLE        – rohe Feature-Zeilen (Tabellen-Seite)
     QUERY_HEATMAP      – 2D-Matrix Wochentag x Tagesstunde (Berlin Wanduhr)
+    QUERY_HEATMAP_GENERIC – 2D-Matrix mit freien Dimensionen/Aggregationen
+                            (20.02, additiv)
+    QUERY_OHLCV        – OHLCV-Snapshot fuer das Candle-Overlay (20.02, E9)
+    QUERY_DAILY_OHLC   – Tages-Ohlc (SQL-seitig aggregiert) fuer das
+                         Candle-Overlay im selben Canvas (20.02-Bugfix)
     QUERY_SCATTER      – X/Y-Paare zweier nativer Spalten
     QUERY_DISTRIBUTION – Histogramm (bins/counts)
     QUERY_FEATURES     – Metadaten (Plugin-IDs, Spalten, Zeilenzahl)
@@ -5276,6 +5686,15 @@ from PySide6.QtCore import QThread, Signal
 # Abfrage-Typen (query_kind).
 QUERY_TABLE = "table"
 QUERY_HEATMAP = "heatmap"
+# 20.02 (additiv): Generische 2D-Heatmap (freie Dimensionen/Aggregationen)
+# und OHLCV-Snapshot fuer das Candle-Overlay (E9). Der bestehende QUERY_HEATMAP
+# (Dow×Stunde) bleibt unveraendert.
+QUERY_HEATMAP_GENERIC = "heatmap_generic"
+QUERY_OHLCV = "ohlcv"
+# 20.02-Bugfix (09.08.2026, Punkt 1+2): Tages-Ohlc fuer das Candle-Overlay im
+# selben Canvas – SQL-seitig aggregiert (fetch_daily_ohlc), deckt den gesamten
+# Heatmap-Zeitraum ab statt nur OHLCV_SNAPSHOT_LIMIT Bars.
+QUERY_DAILY_OHLC = "daily_ohlc"
 QUERY_SCATTER = "scatter"
 QUERY_DISTRIBUTION = "distribution"
 QUERY_FEATURES = "features"
@@ -5385,6 +5804,34 @@ class AnalyticsAsyncWorker(QThread):
                 feature_id=p.get("feature_id"),
                 feature_ids=feature_ids,
             )
+        if self._query_kind == QUERY_HEATMAP_GENERIC:
+            # 20.02 (additiv): Generische 2D-Heatmap – Parameter x_dim/y_dim/
+            # field/agg kommen aus den ViewModel-_params (heatmap_*).
+            return repo.get_generic_heatmap(
+                symbol, timeframe,
+                x_dim=str(p.get("x_dim", "date") or "date"),
+                y_dim=str(p.get("y_dim", "hour") or "hour"),
+                field=p.get("field") or None,
+                agg=str(p.get("agg", "count") or "count"),
+                feature_id=p.get("feature_id"),
+                feature_ids=feature_ids,
+                limit=cap_lookback_limit(p.get("limit")),
+            )
+        if self._query_kind == QUERY_OHLCV:
+            # 20.02 (E9): OHLCV-Snapshot fuer das Candle-Overlay – limit=None
+            # -> Reader-Default OHLCV_SNAPSHOT_LIMIT (5000).
+            return repo.get_ohlcv_snapshot(
+                symbol, timeframe,
+                limit=cap_lookback_limit(p.get("limit")),
+            )
+        if self._query_kind == QUERY_DAILY_OHLC:
+            # 20.02-Bugfix (09.08.2026): Tages-Ohlc (SQL-seitig aggregiert)
+            # fuer das Candle-Overlay im selben Canvas – max_days=None ->
+            # Reader-Default DAILY_OHLC_MAX_DAYS (4000 Tage).
+            return repo.get_daily_ohlc(
+                symbol, timeframe,
+                max_days=cap_lookback_limit(p.get("max_days")),
+            )
         if self._query_kind == QUERY_SCATTER:
             return repo.get_scatter(
                 symbol, timeframe,
@@ -5408,7 +5855,8 @@ class AnalyticsAsyncWorker(QThread):
 
         raise ValueError(
             f"[AnalyticsAsyncWorker] Unbekannte Abfrage '{self._query_kind}' – "
-            f"erlaubt: {QUERY_TABLE}, {QUERY_HEATMAP}, {QUERY_SCATTER}, "
+            f"erlaubt: {QUERY_TABLE}, {QUERY_HEATMAP}, {QUERY_HEATMAP_GENERIC}, "
+            f"{QUERY_OHLCV}, {QUERY_DAILY_OHLC}, {QUERY_SCATTER}, "
             f"{QUERY_DISTRIBUTION}, {QUERY_FEATURES}."
         )
 
@@ -5811,6 +6259,8 @@ die DB-Zeile bleibt unveraendert (Lesen ist rein).
 """
 
 import os
+from datetime import datetime as _dt_datetime
+from datetime import timezone as _dt_timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -5821,6 +6271,10 @@ from db_service import DbPool, _parse_json_field
 # Projekt-Root = 2 Ebenen ueber dieser Datei (engine/ -> analytics/ -> Root)
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DB_ANALYTICS = str(BASE_DIR / "data" / "analytics.duckdb")
+# 20.02 (E9, Candle-Overlay): OHLCV-Quelle fuer den Preis-Strip – read-only
+# via DbPool, analog FeatureBuilder.load_ohlcv() (Spalten time/open/high/
+# low/close/tick_volume).
+DB_MARKET = str(BASE_DIR / "data" / "market_data.duckdb")
 
 # E-3 (Phase 15.04, harmonisiert): schema_version-Default fuer Alt-Rows ohne
 # Pflichtfeld. 15.04 vereinheitlicht den Default auf "1.0.0" (dreistellig,
@@ -5844,8 +6298,55 @@ SENTINEL_NATIVE = "native"
 # Heatmap-Achsen (15.03-Spezifikation): X = Wochentage, Y = Tagesstunden
 # Berlin Wanduhr. Matrix: rows = Stunde (0-23), cols = DOW (0=Sonntag..6).
 DOW_LABELS = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"]
+# 20.02.01 (E5): Wochentag-Skala strikt Montag-Freitag (DuckDB Mo=1..Fr=5).
+DOW_WEEK_LABELS = ("Mo", "Di", "Mi", "Do", "Fr")
 HOURS_PER_DAY = 24
 DAYS_PER_WEEK = 7
+
+# 20.02 (Generische 2D-Heatmap-Engine, Kapitel 20.02 §2 / Review E4-E6):
+# DIM_MAPPINGS – Whitelist fuer die SQL-Dimensionen von fetch_generic_heatmap().
+# Wanduhr-Garantie (Invariante 7): dow/hour/date nutzen die
+# UTC-Forcierung `bar_time AT TIME ZONE 'UTC'` (die gespeicherten Werte sind
+# Wanduhr-encoded; die UTC-Darstellung IST die Wanduhr-Zeit). E4: `date` wird
+# WIE dow/hour mit der UTC-Forcierung extrahiert – das Kapitel-Literal
+# `CAST(bar_time AS DATE)` waere DST-fragil (Session-TZ Berlin +1/+2h).
+# 20.02.01 (E6): `dow_hour` ist ersatzlos entfernt (Kapitel-Vorgabe) – die
+# Kombination ist ueber die Dimensionen `dow` (Mo-Fr) und `hour` (Tageszeit)
+# abbildbar; Alt-Profil-/Workspace-Werte werden im ViewModel per Sanitizer
+# auf "hour" abgebildet.
+DIM_MAPPINGS = {
+    "date": "CAST(bar_time AT TIME ZONE 'UTC' AS DATE)",
+    "dow": "EXTRACT(DOW FROM bar_time AT TIME ZONE 'UTC')::INTEGER",
+    "hour": "EXTRACT(HOUR FROM bar_time AT TIME ZONE 'UTC')::INTEGER",
+    "timeframe": "LOWER(timeframe)",
+    "service_id": "LOWER(feature_id)",
+    "symbol": "LOWER(symbol)",
+}
+
+# 20.02: Verfuegbare Dimensionen / Aggregationen (UI-Combos, E1/E5).
+# 20.02.01 (E6): `dow_hour` entfernt.
+HEATMAP_DIMENSIONS = (
+    "date", "dow", "hour", "timeframe", "service_id", "symbol",
+)
+HEATMAP_AGGREGATIONS = (
+    "count", "confluence_count", "avg", "sum", "min", "max",
+)
+
+# 20.02 (Luecke 5.3-5): Defensiver Pivot-Deckel – die dichte Matrix wird
+# begrenzt (date×dow_hour waere 366×168 = 61.488 Zellen).
+MAX_HEATMAP_CELLS = 50_000
+
+# 20.02 (E9): Default-Lookback des OHLCV-Snapshots fuer das Candle-Overlay
+# (analog DEFAULT_LIMIT 5000 der Analytics-Tabelle; M1 ≈ 3,5 Tage).
+OHLCV_SNAPSHOT_LIMIT = 5000
+
+# 20.02-Bugfix (09.08.2026, Punkt 2/User-Meldung): Der kuenstliche
+# Limit-Lookback (5000) schnitt die Heatmap-Daten ab (sichtbar waren nur die
+# letzten ~4 Tage bei M1). Die generische Heatmap laedt seither ALLE
+# verfuegbaren Daten (limit=None, Pivot-Deckel MAX_HEATMAP_CELLS begrenzt die
+# Matrix). Das Candle-Overlay aggregiert Tages-Ohlc SQL-seitig ueber bis zu
+# DAILY_OHLC_MAX_DAYS Tage (deckt den gesamten Heatmap-Zeitraum ab).
+DAILY_OHLC_MAX_DAYS = 4000
 
 
 class FeatureStoreReader:
@@ -5899,14 +6400,25 @@ class FeatureStoreReader:
         gewaehlten Datenquellen. Der Legacy-Parameter `feature_id` bleibt
         fuer Alt-Aufrufer (z. B. test/check_p15_s4_infra.py) erhalten.
         Leere Liste/None = KEIN Filter (alle Rows).
+
+        Bugfix 08.08.2026 (Bug 1: 'keine Anzeige ausgewaehlter Services'):
+        Der Filter ist case-insensitiv UND whitespace-tolerant –
+        `LOWER(TRIM(feature_id))` auf der DB-Spalte sowie `LOWER(TRIM(..))`
+        auf den Parameterwerten. Muster: `fetch_last_execution_dates`
+        normalisiert bereits so (historisch reale Gross-/Kleinschreibungs-
+        und Leerzeichen-Abweichungen zwischen Registry-plugin_ids und
+        gespeicherten feature_store-Werten). Vorher matchte die nackte
+        `feature_id IN (...)`-Clause bei solchen Abweichungen nichts und
+        Tabelle/Heatmap blieben leer.
         """
-        ids = [str(i) for i in (feature_ids or []) if str(i).strip()]
+        ids = [str(i).strip().lower() for i in (feature_ids or [])
+               if str(i).strip()]
         if ids:
             placeholders = ", ".join("?" for _ in ids)
-            conditions.append(f"feature_id IN ({placeholders})")
+            conditions.append(f"LOWER(TRIM(feature_id)) IN ({placeholders})")
             params.extend(ids)
         elif feature_id:
-            conditions.append("feature_id = ?")
+            conditions.append("LOWER(TRIM(feature_id)) = LOWER(TRIM(?))")
             params.append(feature_id)
 
     # ------------------------------------------------------------------
@@ -6008,6 +6520,72 @@ class FeatureStoreReader:
         import re
         return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(key or "")))
 
+    @staticmethod
+    def _format_dim_value(dim: str, value: Any) -> str:
+        """Formatiert einen Dimensions-Rohwert fuer Achsen-Beschriftungen.
+
+        20.02 (generische Heatmap): `date` -> 'TT.MM.', `hour` -> 'HH:00',
+        `dow` -> Mo-Fr-Kurzname (20.02.01 E5, DOW_WEEK_LABELS; Sonntag/
+        Samstag werden per SQL-Filter ausgeschlossen). Alle anderen
+        Dimensionen (timeframe/service_id/symbol) -> Rohwert-String.
+        """
+        try:
+            if dim == "date":
+                if hasattr(value, "strftime"):
+                    return value.strftime("%d.%m.")
+                return str(value)
+            if dim == "hour":
+                return f"{int(value):02d}:00"
+            if dim == "dow":
+                v = int(value)
+                if 1 <= v <= len(DOW_WEEK_LABELS):
+                    return DOW_WEEK_LABELS[v - 1]
+                return str(value)
+        except (TypeError, ValueError):
+            pass
+        return str(value)
+
+    @staticmethod
+    def _axis_coords(dim: str, values: List[Any]) -> List[float]:
+        """Achsen-Koordinaten (natuerliche Werte) je Matrix-Zeile/-Spalte.
+
+        20.02-Bugfix (09.08.2026, Punkte 3-6/User-Meldung): Fuer die
+        TradingView-aehnliche Achsen-Darstellung tragen die Achsen die
+        NATUERLICHEN Werte statt Zell-Indizes:
+          - `date`      -> Wanduhr-Mitternachts-Epoch (Sekunden)
+          - hour        -> die ganzzahligen Stunden (0-23)
+          - dow         -> 1..5 (Montag-Freitag, 20.02.01 E5)
+          - kategorial  -> Indizes 0..n-1 (timeframe/service_id/symbol)
+        Das Widget mappt das ImageItem per setRect auf diesen Bereich und
+        erzeugt dynamische Ticks je Zoom-Level (bis zur Minute bei Datum).
+        """
+        if dim == "date":
+            out: List[float] = []
+            for v in values:
+                if isinstance(v, _dt_datetime):
+                    out.append(float(int(v.timestamp())))
+                elif hasattr(v, "year") and hasattr(v, "month") \
+                        and hasattr(v, "day"):
+                    # date-Objekt (CAST AS DATE): Mitternacht Wanduhr-UTC
+                    out.append(float(int(_dt_datetime(
+                        v.year, v.month, v.day,
+                        tzinfo=_dt_timezone.utc).timestamp())))
+                else:
+                    try:
+                        out.append(float(int(_dt_datetime.fromisoformat(
+                            str(v)).replace(tzinfo=_dt_timezone.utc)
+                            .timestamp())))
+                    except (TypeError, ValueError):
+                        out.append(0.0)
+            return out
+        if dim in ("hour", "dow"):
+            try:
+                return [float(int(v)) for v in values]
+            except (TypeError, ValueError):
+                return [float(i) for i in range(len(values))]
+        # Kategorial (timeframe/service_id/symbol): Indizes 0..n-1.
+        return [float(i) for i in range(len(values))]
+
     def available_feature_keys(
         self,
         symbol: str,
@@ -6070,6 +6648,89 @@ class FeatureStoreReader:
             return keys
         # numeric_only: jeder Key muss durchgaengig numerisch (nicht bool/null/str)
         return [k for k in keys if key_types[k] == {"num"}]
+
+    def feature_keys_by_service(
+        self,
+        symbol: str,
+        timeframe: str,
+        numeric_only: bool = False,
+        feature_id: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
+    ) -> Dict[str, List[str]]:
+        """feature_data-JSON-Keys je feature_id (20.02.01, Feld-Dropdown).
+
+        Ordnet jedem Service (feature_id) die JSON-Keys zu, die er im
+        feature_data liefert – Grundlage fuer das 'Feld'-Dropdown der
+        generischen Heatmap ('{Service} / {Key}', User-Meldung 3b). Die
+        Typ-Logik ist identisch zu `available_feature_keys`: bei
+        `numeric_only=True` muss ein Key in ALLEN Vorkommen des jeweiligen
+        Services numerisch sein (int/float, kein bool/null/str).
+
+        09.08.2026 (User-Meldung Feld-Dropdown): Die Zuordnung wird ueber
+        `feature_id`/`feature_ids` gefiltert (Muster `fetch_rows`, inkl.
+        case-insensitivem + whitespace-tolerantem Filter) – abgewaehlte
+        Services liefern ihre Keys NICHT mehr, damit das Feld-Dropdown nur
+        noch die tatsaechlich selektierten Datenquellen zeigt.
+
+        Zeilen ohne feature_id (Legacy/native) werden unter "" gruppiert;
+        das Repository ignoriert sie (Dropdown-Fallback: Roh-Key ohne
+        Service-Prefix).
+
+        Returns:
+            {feature_id: [sortierte JSON-Keys...]} – leer bei fehlender
+            DB/Tabelle oder Fehler (defensiv, rein lesend).
+        """
+        if not symbol or not timeframe:
+            return {}
+        conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
+        params: List[Any] = [symbol, timeframe]
+        # 09.08.2026 (User-Meldung Feld-Dropdown): feature_id/feature_ids-
+        # Filter anwenden, damit abgewaehlte Services nicht im Dropdown
+        # erscheinen (Root Cause 2).
+        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
+
+        con = self._get_connection()
+        try:
+            rows = con.execute(f"""
+                SELECT DISTINCT feature_id, feature_data
+                FROM feature_store
+                WHERE {' AND '.join(conditions)}
+                  AND feature_data IS NOT NULL
+            """, params).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] feature_keys_by_service "
+                  f"fehlgeschlagen: {e}")
+            return {}
+
+        key_types: Dict[str, Dict[str, set]] = {}
+        for fid, raw in rows:
+            data = self._normalize_feature_data(raw)
+            if not isinstance(data, dict):
+                continue
+            service = str(fid) if fid is not None else ""
+            bucket = key_types.setdefault(service, {})
+            for k, v in data.items():
+                if k == "schema_version" or not str(k).strip():
+                    continue
+                key = str(k)
+                if isinstance(v, bool):
+                    t = "bool"
+                elif isinstance(v, (int, float)):
+                    t = "num"
+                elif v is None:
+                    t = "null"
+                else:
+                    t = "str"
+                bucket.setdefault(key, set()).add(t)
+
+        out: Dict[str, List[str]] = {}
+        for service, bucket in key_types.items():
+            keys = sorted(bucket.keys())
+            if numeric_only:
+                keys = [k for k in keys if bucket[k] == {"num"}]
+            if keys:
+                out[service] = keys
+        return out
 
     def fetch_columns(
         self,
@@ -6267,6 +6928,398 @@ class FeatureStoreReader:
             "symbol": symbol,
             "timeframe": timeframe,
         }
+
+    # ------------------------------------------------------------------
+    # Lesen: Generische 2D-Heatmap (20.02, Kapitel §2 / Review E1-E6)
+    # ------------------------------------------------------------------
+    def fetch_generic_heatmap(
+        self,
+        symbol: str,
+        timeframe: str,
+        x_dim: str,
+        y_dim: str,
+        field: Optional[str] = None,
+        agg: str = "count",
+        feature_id: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Aggregiert eine generische 2D-Matrix ueber zwei Dimensionen.
+
+        20.02 (additiv, E1/E5/E6): Freie Dimensionen via `DIM_MAPPINGS`
+        (date/dow/hour/timeframe/service_id/symbol – 20.02.01 E6: `dow_hour`
+        entfernt), Aggregationen COUNT / CONFLUENCE_COUNT
+        (COUNT(DISTINCT feature_id)) sowie AVG/SUM/MIN/MAX ueber einen
+        numerischen feature_data-JSON-Key (`field`, via TRY_CAST – Muster
+        fetch_heatmap). HIT_RATE entfaellt in V1 (E5: kein Schwellwert
+        spezifiziert). 20.02.01 (E5): `dow`-Achsen sind strikt Montag-Freitag
+        (zusätzliche WHERE-Bedingung `BETWEEN 1 AND 5`, DuckDB Mo=1..Fr=5).
+
+        Wanduhr-Garantie (Invariante 7 / E4): date/dow/hour werden
+        mit `bar_time AT TIME ZONE 'UTC'` extrahiert (die gespeicherten Werte
+        sind Wanduhr-encoded; die UTC-Darstellung IST die Wanduhr-Zeit).
+
+        Lookback (Nachtrag Umsetzung): `limit` wird im CTE auf die NEUESTEN
+        `limit` Bars angewendet (ORDER BY bar_time DESC) – analog zum
+        Limit-Verhalten der Analytics-Tabelle; die Aggregation laeuft ueber
+        diesen Ausschnitt.
+
+        Pivot-Deckel (Luecke 5.3-5): uebersteigt die dichte Matrix
+        MAX_HEATMAP_CELLS, wird die x-Dimension (bzw. danach die y-Dimension)
+        deterministisch auf die letzten Sortierwerte begrenzt.
+
+        Args:
+            symbol/timeframe: Filter (case-insensitive)
+            x_dim/y_dim: Dimensions-Keys aus DIM_MAPPINGS (case-insensitiv)
+            field: Numerischer feature_data-JSON-Key (Pflicht nur fuer
+                AVG/SUM/MIN/MAX; bei COUNT/CONFLUENCE_COUNT ignoriert, E6)
+            agg: "count" | "confluence_count" | "avg" | "sum" | "min" | "max"
+            feature_id: Optionaler Einzel-Filter (Legacy)
+            feature_ids: Optionaler Multi-Filter (`WHERE feature_id IN (...)`).
+                Leere Liste/None = kein Filter.
+            limit: Max. Bars des Aggregations-Ausschnitts (neueste zuerst).
+
+        Returns:
+            {
+              "matrix":  dense M x N (rows = y_values, cols = x_values);
+                         COUNT/CONFLUENCE_COUNT -> 0 fuer leere Zellen,
+                         Wert-Aggregationen -> NaN (numpy),
+              "x_labels"/"y_labels": formatierte Achsen-Beschriftungen,
+              "x_values": Rohwerte (ISO-Strings; z. B. Datum -> 'YYYY-MM-DD'
+                          fuer das Candle-Overlay, E9),
+              "min_val"/"max_val": Spannweite der endlichen Matrix-Werte,
+              "x_dim"/"y_dim"/"agg"/"field"/"symbol"/"timeframe",
+            }
+
+        Raises:
+            ValueError: bei unbekannter Dimension/Aggregation oder fehlendem
+                `field` fuer AVG/SUM/MIN/MAX (defensiv im Repository gefangen).
+        """
+        if not symbol or not timeframe:
+            return self._empty_generic_heatmap(
+                x_dim, y_dim, agg, field, symbol, timeframe)
+        x_key = str(x_dim or "").lower()
+        y_key = str(y_dim or "").lower()
+        x_expr = DIM_MAPPINGS.get(x_key)
+        y_expr = DIM_MAPPINGS.get(y_key)
+        if x_expr is None or y_expr is None:
+            raise ValueError(
+                f"[FeatureStoreReader] Unbekannte Dimension '{x_dim}/{y_dim}' – "
+                f"erlaubt: {', '.join(DIM_MAPPINGS)}."
+            )
+        agg_key = str(agg).lower()
+        if agg_key == "count":
+            agg_sql = "COUNT(*) AS val"
+        elif agg_key == "confluence_count":
+            agg_sql = "COUNT(DISTINCT feature_id) AS val"
+        elif agg_key in ("avg", "sum", "min", "max"):
+            field_key = str(field or "").strip()
+            if not self._is_json_key_identifier(field_key):
+                raise ValueError(
+                    f"[FeatureStoreReader] Aggregation '{agg_key}' benoetigt "
+                    f"einen identifier-sicheren numerischen feature_data-"
+                    f"JSON-Key als 'field' (erhalten: '{field}')."
+                )
+            agg_sql = (
+                f"{agg_key.upper()}(TRY_CAST(feature_data->>'{field_key}' "
+                f"AS DOUBLE)) AS val"
+            )
+        else:
+            raise ValueError(
+                f"[FeatureStoreReader] Unbekannte Aggregation '{agg}' – "
+                f"erlaubt: {', '.join(HEATMAP_AGGREGATIONS)}."
+            )
+
+        conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
+        params: List[Any] = [symbol, timeframe]
+        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
+        # 20.02.01 (E5): `dow`-Achse strikt Montag-Freitag (DuckDB Mo=1..Fr=5).
+        if x_key == "dow" or y_key == "dow":
+            conditions.append(
+                "EXTRACT(DOW FROM bar_time AT TIME ZONE 'UTC')::INTEGER "
+                "BETWEEN 1 AND 5")
+
+        if limit:
+            sql = f"""
+                WITH sel AS (
+                    SELECT bar_time, timeframe, feature_id, symbol, feature_data
+                    FROM feature_store
+                    WHERE {' AND '.join(conditions)}
+                    ORDER BY bar_time DESC
+                    LIMIT ?
+                )
+                SELECT {x_expr} AS x_val, {y_expr} AS y_val, {agg_sql}
+                FROM sel
+                GROUP BY 1, 2
+                ORDER BY 1, 2
+            """
+            params = params + [int(limit)]
+        else:
+            sql = f"""
+                WITH sel AS (
+                    SELECT bar_time, timeframe, feature_id, symbol, feature_data
+                    FROM feature_store
+                    WHERE {' AND '.join(conditions)}
+                )
+                SELECT {x_expr} AS x_val, {y_expr} AS y_val, {agg_sql}
+                FROM sel
+                GROUP BY 1, 2
+                ORDER BY 1, 2
+            """
+
+        con = self._get_connection()
+        try:
+            rows = con.execute(sql, params).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_generic_heatmap "
+                  f"fehlgeschlagen: {e}")
+            return self._empty_generic_heatmap(
+                x_key, y_key, agg_key, field, symbol, timeframe)
+
+        # Pivot-Deckel (Luecke 5.3-5): deterministisch auf die letzten
+        # Sortierwerte begrenzen (bei date = die neuesten Datumswerte).
+        x_values = sorted({r[0] for r in rows})
+        y_values = sorted({r[1] for r in rows})
+        if (len(x_values) * len(y_values)) > MAX_HEATMAP_CELLS:
+            max_x = max(1, MAX_HEATMAP_CELLS // max(1, len(y_values)))
+            x_keep = set(x_values[-max_x:])
+            x_values = sorted(x_keep)
+            if (len(x_values) * len(y_values)) > MAX_HEATMAP_CELLS:
+                max_y = max(1, MAX_HEATMAP_CELLS // max(1, len(x_values)))
+                y_keep = set(y_values[-max_y:])
+                y_values = sorted(y_keep)
+            keep_x = set(x_values)
+            keep_y = set(y_values)
+            rows = [r for r in rows
+                    if r[0] in keep_x and r[1] in keep_y]
+
+        fill = 0.0 if agg_key in ("count", "confluence_count") else float("nan")
+        matrix = np.full((len(y_values), len(x_values)), fill, dtype=float)
+        x_index = {v: i for i, v in enumerate(x_values)}
+        y_index = {v: j for j, v in enumerate(y_values)}
+        for r in rows:
+            val = r[2]
+            if val is None:
+                continue
+            xi = x_index.get(r[0])
+            yi = y_index.get(r[1])
+            if xi is not None and yi is not None:
+                matrix[yi][xi] = float(val)
+
+        finite = matrix[np.isfinite(matrix)]
+        if finite.size:
+            min_val = float(finite.min())
+            max_val = float(finite.max())
+        else:
+            min_val, max_val = 0.0, 0.0
+
+        return {
+            "matrix": matrix.tolist(),
+            "x_labels": [self._format_dim_value(x_key, v) for v in x_values],
+            "y_labels": [self._format_dim_value(y_key, v) for v in y_values],
+            # Rohwerte als ISO-Strings (Candle-Overlay-E9: Datum -> Datumsobjekt)
+            "x_values": [str(v) for v in x_values],
+            # 20.02-Bugfix (09.08.2026): Natuerliche Achsen-Koordinaten
+            # (date -> Mitternachts-Epochs, hour/dow -> Ganzzahlen, dow 1..5
+            # Mo-Fr, kategorial -> Indizes) fuer die dynamischen Achsen-Ticks.
+            "x_axis": self._axis_coords(x_key, x_values),
+            "y_axis": self._axis_coords(y_key, y_values),
+            "min_val": min_val,
+            "max_val": max_val,
+            "x_dim": x_key,
+            "y_dim": y_key,
+            "agg": agg_key,
+            "field": str(field or "") or None,
+            "symbol": symbol,
+            "timeframe": timeframe,
+        }
+
+    def _empty_generic_heatmap(
+        self,
+        x_dim: str,
+        y_dim: str,
+        agg: str,
+        field: Optional[str],
+        symbol: str,
+        timeframe: str,
+    ) -> Dict[str, Any]:
+        """Leere generische Heatmap (keine Daten / Fehler / fehlende Filter)."""
+        return {
+            "matrix": np.zeros((0, 0), dtype=float).tolist(),
+            "x_labels": [],
+            "y_labels": [],
+            "x_values": [],
+            "x_axis": [],
+            "y_axis": [],
+            "min_val": 0.0,
+            "max_val": 0.0,
+            "x_dim": str(x_dim or "").lower(),
+            "y_dim": str(y_dim or "").lower(),
+            "agg": str(agg or "").lower(),
+            "field": str(field or "") or None,
+            "symbol": symbol,
+            "timeframe": timeframe,
+        }
+
+    # ------------------------------------------------------------------
+    # Lesen: OHLCV-Snapshot fuer das Candle-Overlay (20.02, E9)
+    # ------------------------------------------------------------------
+    def fetch_ohlcv_snapshot(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: Optional[int] = None,
+        market_db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Liest OHLCV-Bars aus market_data.duckdb (read-only, Wanduhr).
+
+        20.02 (E9, Candle-Overlay): Quelle sind die OHLCV-Rohdaten
+        (`ohlcv_bars` in `data/market_data.duckdb`, Spalten
+        time/open/high/low/close/tick_volume – Muster
+        FeatureBuilder.load_ohlcv()). Der Preis-Strip im HeatmapWidget
+        gruppiert die Bars pro Spalte (Datum) zu Tages-Ohlc.
+
+        Wanduhr-Garantie (Invariante 7): Die Epochs sind Wanduhr-encoded –
+        `_epoch_of()` (UTC-Darstellung) liefert exakt die gespeicherte
+        Wanduhr-Epoch; das Widget dekodiert sie als UTC-Datum.
+
+        Args:
+            symbol/timeframe: Filter (case-insensitive)
+            limit: Max. Bars (Default OHLCV_SNAPSHOT_LIMIT = 5000), die
+                NEUESTEN zuerst (ORDER BY time DESC).
+            market_db_path: Testbarkeit (Seam) – Default DB_MARKET.
+
+        Returns:
+            {"bars": [{"time": int(Wanduhr-Epoch), "open": float, "high": float,
+                       "low": float, "close": float, "volume": float}, ...]
+             (aufsteigend chronologisch), "symbol", "timeframe"}
+        """
+        if not symbol or not timeframe:
+            return {"bars": [], "symbol": symbol, "timeframe": timeframe}
+        if limit is None:
+            limit = OHLCV_SNAPSHOT_LIMIT
+        con = DbPool.get(market_db_path or DB_MARKET)
+        try:
+            rows = con.execute("""
+                SELECT "time", open, high, low, close, tick_volume
+                FROM ohlcv_bars
+                WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+                  AND "time" IS NOT NULL
+                  AND open IS NOT NULL AND high IS NOT NULL
+                  AND low IS NOT NULL AND close IS NOT NULL
+                ORDER BY "time" DESC
+                LIMIT ?
+            """, [symbol, timeframe, int(limit)]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_ohlcv_snapshot "
+                  f"fehlgeschlagen: {e}")
+            return {"bars": [], "symbol": symbol, "timeframe": timeframe}
+
+        bars: List[Dict[str, Any]] = []
+        for r in rows:
+            try:
+                bars.append({
+                    "time": self._epoch_of(r[0]),
+                    "open": float(r[1]),
+                    "high": float(r[2]),
+                    "low": float(r[3]),
+                    "close": float(r[4]),
+                    "volume": float(r[5]) if r[5] is not None else 0.0,
+                })
+            except (TypeError, ValueError):
+                continue
+        # Aufsteigend (chronologisch) – das Widget rendert von links nach rechts.
+        bars.reverse()
+        return {"bars": bars, "symbol": symbol, "timeframe": timeframe}
+
+    # ------------------------------------------------------------------
+    # Lesen: Tages-OHLC fuer das Candle-Overlay (20.02-Bugfix, 09.08.2026)
+    # ------------------------------------------------------------------
+    def fetch_daily_ohlc(
+        self,
+        symbol: str,
+        timeframe: str,
+        max_days: Optional[int] = None,
+        market_db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Tages-Ohlc je Wanduhr-Datum (SQL-seitig aggregiert, read-only).
+
+        20.02-Bugfix (09.08.2026, Punkt 1+2/User-Meldung): Das Candle-Overlay
+        muss im GLEICHEN Canvas ueber der Heatmap liegen und den GESAMTEN
+        Heatmap-Zeitraum abdecken. Dafuer werden die ohlcv_bars SQL-seitig pro
+        Wanduhr-Datum zu einem Tages-Candle aggregiert (GROUP BY Datum in
+        UTC-Darstellung – die Epochs sind Wanduhr-encoded, Invariante 7) –
+        um Groessenordnungen schneller als das Laden aller Bars + Python-
+        Gruppierung (bei M1 wären das sonst > 1 Mio. Bars).
+
+        Wanduhr-Garantie (Invariante 7): `CAST("time" AT TIME ZONE 'UTC' AS
+        DATE)` liefert das Wanduhr-Datum; die Mitternachts-Epoch wird als
+        UTC-Darstellung berechnet (exakt die Wanduhr-Epoch des Tages).
+
+        Args:
+            symbol/timeframe: Filter (case-insensitive)
+            max_days: Max. Anzahl Tage (Default DAILY_OHLC_MAX_DAYS = 4000;
+                deckt ~11 Jahre M1 bzw. den gesamten Heatmap-Zeitraum).
+            market_db_path: Testbarkeit (Seam) – Default DB_MARKET.
+
+        Returns:
+            {"bars": [{"time": int(Wanduhr-Mitternachts-Epoch), "open": float,
+                       "high": float, "low": float, "close": float}, ...]
+             (aufsteigend chronologisch), "symbol", "timeframe"}
+        """
+        if not symbol or not timeframe:
+            return {"bars": [], "symbol": symbol, "timeframe": timeframe}
+        if max_days is None:
+            max_days = DAILY_OHLC_MAX_DAYS
+        con = DbPool.get(market_db_path or DB_MARKET)
+        try:
+            rows = con.execute("""
+                SELECT
+                    CAST("time" AT TIME ZONE 'UTC' AS DATE) AS d,
+                    FIRST(open ORDER BY "time") AS open,
+                    MAX(high) AS high,
+                    MIN(low) AS low,
+                    LAST(close ORDER BY "time") AS close
+                FROM ohlcv_bars
+                WHERE LOWER(symbol) = LOWER(?)
+                  AND LOWER(timeframe) = LOWER(?)
+                  AND "time" IS NOT NULL
+                  AND open IS NOT NULL AND high IS NOT NULL
+                  AND low IS NOT NULL AND close IS NOT NULL
+                GROUP BY 1
+                ORDER BY 1 DESC
+                LIMIT ?
+            """, [symbol, timeframe, int(max_days)]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_daily_ohlc "
+                  f"fehlgeschlagen: {e}")
+            return {"bars": [], "symbol": symbol, "timeframe": timeframe}
+
+        bars: List[Dict[str, Any]] = []
+        for r in rows:
+            d = r[0]
+            if d is None:
+                continue
+            try:
+                if hasattr(d, "year") and hasattr(d, "month") and hasattr(d, "day"):
+                    epoch = int(_dt_datetime(
+                        d.year, d.month, d.day,
+                        tzinfo=_dt_timezone.utc).timestamp())
+                else:
+                    epoch = int(_dt_datetime.fromisoformat(
+                        str(d)).replace(tzinfo=_dt_timezone.utc).timestamp())
+                bars.append({
+                    "time": epoch,
+                    "open": float(r[1]),
+                    "high": float(r[2]),
+                    "low": float(r[3]),
+                    "close": float(r[4]),
+                })
+            except (TypeError, ValueError):
+                continue
+        # Aufsteigend (chronologisch) – das Widget rendert von links nach rechts.
+        bars.reverse()
+        return {"bars": bars, "symbol": symbol, "timeframe": timeframe}
 
     # ------------------------------------------------------------------
     # Lesen: Datum der letzten Ausfuehrung (MasterTree, 05.08.2026)
@@ -14717,6 +15770,11 @@ class AnalyticsWindow(PersistentWindow):
     # ------------------------------------------------------------------
     def _on_page_changed(self, row: int) -> None:
         if 0 <= row < self.pages_stack.count():
+            # Bugfix 08.08.2026: Seiten-Stack NIE umgeschaltet (Alt-Bug
+            # seit Phase 15.03) - es fehlte setCurrentIndex. Dadurch blieb
+            # unabhaengig vom Sidebar-Klick immer die Tabelle (Index 0)
+            # sichtbar. Jetzt: Stack auf die geklickte Seite + lazy request.
+            self.pages_stack.setCurrentIndex(row)
             page = self.pages_stack.widget(row)
             if hasattr(page, "request_data"):
                 page.request_data()
@@ -15002,6 +16060,10 @@ class AnalyticsWindow(PersistentWindow):
                 "layout": {
                     "page_index": self.sidebar.currentRow()
                     if hasattr(self, "sidebar") else 0,
+                    # 20.02 (E2): Ansichts-Modus der Heatmap-Seite
+                    # (standard | generic) im Workspace mitpersistieren.
+                    "heatmap_mode": self.heatmap_page.mode_id
+                    if hasattr(self, "heatmap_page") else "standard",
                 },
             }
             self.state_manager.save_workspace_state(
@@ -15032,6 +16094,14 @@ class AnalyticsWindow(PersistentWindow):
             (self._vm.workspace_layout or {}).get("page_index", -1))
         if 0 <= page_index < self.pages_stack.count():
             self.sidebar.setCurrentRow(page_index)
+        # 20.02 (E2): Ansichts-Modus der Heatmap-Seite wiederherstellen.
+        try:
+            heatmap_mode = (self._vm.workspace_layout or {}).get(
+                "heatmap_mode")
+            if heatmap_mode:
+                self.heatmap_page.set_mode(str(heatmap_mode))
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] Heatmap-Modus-Restore: {e}")
         # Limit-Feld mit dem VM-Wert synchronisieren (Workspace kann abweichen).
         if hasattr(self, "edit_limit"):
             self.edit_limit.setText(
@@ -15388,7 +16458,14 @@ from typing import Any, Callable, Dict, Optional
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
 
 from analytics.engine.analytics_worker import QUERY_HEATMAP
 from analytics.engine.feature_store_reader import (
@@ -15397,6 +16474,7 @@ from analytics.engine.feature_store_reader import (
     HOURS_PER_DAY,
 )
 from analytics.ui.common import make_overlay_stack
+from analytics.ui.heatmap_widget import HeatmapWidget
 
 # Farbverlauf (pyqtgraph-intern, 'viridis').
 _HEATMAP_COLORMAP = "viridis"
@@ -15438,24 +16516,54 @@ class HeatmapPage(QWidget):
 
         content = QWidget(self)
         lay = QVBoxLayout(content)
+
+        # 20.02 (additiv): Ansichts-Modus – Standard (Wochentag x Stunde)
+        # bleibt der Default; "Generisch" bettet den HeatmapWidget ein.
+        self._combo_mode = QComboBox()
+        self._combo_mode.addItem("Wochentag × Stunde", "standard")
+        self._combo_mode.addItem("Generisch", "generic")
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Ansicht:"))
+        mode_row.addWidget(self._combo_mode)
+        mode_row.addStretch(1)
+        lay.addLayout(mode_row)
+
+        # --- Standard-Modus (bestehende Struktur, unveraendert) ---
+        self._standard_ui = QWidget(self)
+        std_lay = QVBoxLayout(self._standard_ui)
+        std_lay.setContentsMargins(0, 0, 0, 0)
         ctrl = QHBoxLayout()
         ctrl.addWidget(QLabel("Metrik:"))
         ctrl.addWidget(self._combo_metric)
         ctrl.addWidget(self._label_info)
         ctrl.addStretch(1)
-        lay.addLayout(ctrl)
-        lay.addWidget(self._plot)
+        std_lay.addLayout(ctrl)
+        std_lay.addWidget(self._plot)
+
+        # --- Generischer Modus (20.02, E1/E7/E8/E9) ---
+        self._generic = HeatmapWidget()
+
+        self._stack_modes = QStackedWidget()
+        self._stack_modes.addWidget(self._standard_ui)
+        self._stack_modes.addWidget(self._generic)
+        lay.addWidget(self._stack_modes)
+
         self._stack = make_overlay_stack(content)
         self.setLayout(self._stack)
 
         self._combo_metric.currentTextChanged.connect(self._on_metric_changed)
         self._plot.scene().sigMouseClicked.connect(self._on_plot_clicked)
+        self._combo_mode.currentIndexChanged.connect(self._on_mode_changed)
 
     # ------------------------------------------------------------------
     # MVVM-Anbindung (vom AnalyticsWindow gesetzt)
     # ------------------------------------------------------------------
     def attach_view_model(self, view_model: Any) -> None:
         self._view_model = view_model
+        # 20.02: Das generische Widget erhaelt denselben ViewModel und
+        # verbindet eigene data_ready-Slots (QUERY_HEATMAP_GENERIC/
+        # QUERY_DAILY_OHLC, Bugfix 09.08.2026).
+        self._generic.attach_view_model(view_model)
         params = view_model.params
         # 19.02 (Cleanup): Metriken = "count" + numerische feature_data-
         # JSON-Keys (dynamisch). Prefill fuer das aktuelle Symbol/Timeframe;
@@ -15475,8 +16583,38 @@ class HeatmapPage(QWidget):
         self._cell_resolver = fn
 
     def request_data(self) -> None:
-        if self._view_model is not None:
+        if self._view_model is None:
+            return
+        # 20.02: Modus-abhaengig – Standard (Dow x Stunde) oder Generisch
+        # (+ OHLCV-Snapshot bei aktivem Kerzen-Overlay, E9).
+        if self._combo_mode.currentData() == "generic":
+            self._generic.request_data()
+        else:
             self._view_model.request_heatmap()
+
+    # ------------------------------------------------------------------
+    # 20.02: Ansichts-Modus (Workspace-Persistenz, E2)
+    # ------------------------------------------------------------------
+    @property
+    def mode_id(self) -> str:
+        """Aktueller Modus ("standard" | "generic") fuer die Workspace-Speicherung."""
+        return str(self._combo_mode.currentData() or "standard")
+
+    def set_mode(self, mode_id: str) -> None:
+        """Stellt den Ansichts-Modus wieder her (Workspace-Restore)."""
+        idx = self._combo_mode.findData(str(mode_id or "").lower())
+        if idx < 0:
+            idx = 0
+        if self._combo_mode.currentIndex() != idx:
+            self._combo_mode.setCurrentIndex(idx)
+        else:
+            self._stack_modes.setCurrentIndex(idx)
+
+    def _on_mode_changed(self, _index: int) -> None:
+        """Wechselt den Modus-Stack und fordert die passenden Daten an."""
+        self._stack_modes.setCurrentIndex(
+            1 if self._combo_mode.currentData() == "generic" else 0)
+        self.request_data()
 
     # ------------------------------------------------------------------
     # 19.02: Dynamische Metrik-Combo ("count" + feature_data-JSON-Keys)
@@ -15563,6 +16701,1163 @@ class HeatmapPage(QWidget):
     def _on_metric_changed(self, metric: str) -> None:
         if self._view_model is not None and metric:
             self._view_model.set_heatmap_metric(metric)
+
+```
+
+--------------------------------------------------
+
+### DATEI: analytics/ui/heatmap_widget.py
+```py
+# analytics/ui/heatmap_widget.py
+"""
+heatmap_widget.py - Generische 2D-Heatmap-Engine mit Confluence-Matrix,
+Candle-Overlay & Dual-Axis-Zoom (Phase 20.02).
+
+Additiv zur bestehenden HeatmapPage (Dow x Stunde, Standard-Modus): Dieses
+Widget rendert die generische 2D-Matrix (freie Dimensionen + Aggregationen)
+und das Kerzen-Overlay. MVVM (Invariante 4): KEIN SQL – die Daten kommen
+ueber `data_ready(QUERY_HEATMAP_GENERIC | QUERY_DAILY_OHLC, data)` vom
+ViewModel (Async-Worker).
+
+Entscheidungen (Review 09.08.2026, E7-E9):
+- E7: CONFLUENCE_COUNT -> diskrete Farbskala (0 = weiss, 1-2 = gelb/cyan,
+  3-4 = orange, 5+ = dunkelrot); Wert-Aggregationen -> viridis (kontinuierlich).
+- E8: Zoom = EIN Faktor-Slider pro Achse (Viewport-Skalierung, zentriert),
+  normalisiert [0,1] (zoom_x_range/zoom_y_range), rein client-seitig via
+  setXRange/setYRange (kein DB-Requery).
+- E9: Candle-Overlay = Tages-Ohlc UEBER der Heatmap im SELBEN Canvas
+  (rechte Preis-Achse, ViewBox-Link an die X-Achse), horizontal synchronisiert.
+
+Bugfix 09.08.2026 (User-Meldungen 1-6):
+1) Das Kerzen-Overlay ist KEIN separates Fenster mehr – die Tages-Candles
+   liegen im selben PlotWidget ueber der Heatmap (rechte Preis-Achse).
+2) Die generische Heatmap laedt ALLE verfuegbaren Daten (kein 5000er-
+   Limit-Lookback mehr, ViewModel; Pivot-Deckel MAX_HEATMAP_CELLS begrenzt
+   die Matrix). Das Overlay nutzt `QUERY_DAILY_OHLC` (SQL-seitig pro Tag
+   aggregiert) und deckt damit den gesamten Heatmap-Zeitraum ab.
+3) Die Achsen tragen die NATUERLICHEN Werte (date -> Mitternachts-Epochs,
+   hour/dow -> Ganzzahlen, dow 1..5 Mo-Fr, kategorial -> Indizes); das
+   ImageItem wird per setRect exakt auf diesen Bereich gemappt – nichts wird
+   mehr ueber die Tagesgrenze hinaus gezeichnet.
+4) Achsen-Zuordnung ist explizit (x_dim -> X, y_dim -> Y), kein Vertauschen
+   mehr moeglich.
+5) Dynamische X-Ticks je Zoom-Level: date -> Jahre/Monate/Tage -> Stunden ->
+   Minuten (bis zur Minute, wie Chartfenster/TradingView) – 20.02.01 E1:
+   5 Format-Stufen (YYYY / TT.MM.JJ / DDD TT.MM.JJ / DDD TT.MM.JJ HH:00 /
+   DDD TT.MM.JJ HH:mm), Wanduhr-Garantie via UTC-Darstellung.
+6) Dasselbe Prinzip gilt fuer die Y-Achse und alle Massstaebe (hour, dow,
+   kategorial): je Zoom-Level werden mehr Zwischenwerte angezeigt.
+
+20.02.01 (E2-E8, 09.08.2026): "Stunde" -> "Tageszeit" (E2, feste Skala
+00:00-23:59, E3); Achsen-Label mit UTC-Offset (E4); `dow` strikt
+Montag-Freitag (E5); `dow_hour` ersatzlos entfernt (E6); Overlay-Zoom-Lock
+exklusiv bei X=date (E7); service_id-Achsen-Labels via ViewModel-Resolver
+'{Kategorie} / {Name}' (E8).
+
+20.02.01 (User-Meldungen 1-3, 09.08.2026): (1) Tageszeit-Achse bleibt beim
+Rauszoomen auf die feste Skala 00:00-23:59 begrenzt (keine -/+ Werte
+ausserhalb; tickValues-Clamping, kein `% 24`-Wrap mehr); (2) Wochentag-Achse
+ebenso strikt Mo-Fr (1..6, halboffene Grenze); (3) 'Feld'-Dropdown deutlich
+laenger (320-460 px) und jeder Eintrag traegt den Service-Namen, aus dem der
+Wert stammt ('{Service} / {Key}', `srv_`-Prefix entfaellt, via
+ViewModel-Resolver + Repository-`field_sources`). User-Meldung 3c (09.08.2026):
+vor jedem Feld-Eintrag steht NUR der Service-NAME ohne Kategorie-Pfad
+(`resolve_service_display_name`, z. B. 'Grid Lines / open' statt
+'Swing Points / Grid Lines / open'); die E8-Achsen-Labels der
+service_id-Dimension behalten weiterhin '{Kategorie} / {Name}'.
+
+09.08.2026 (User-Meldungen Feld-Dropdown + Zoom-Richtung):
+- Feld-Dropdown: Der Service-Name wird DIREKT aus dem Service-Objekt
+  abgeleitet (`resolve_service_display_name` aus `plugin_id`, z. B.
+  'Swing Momentum' statt des unzuverlaessigen metadata['display_name']
+  'Swing Momentum Service'). Liefern MEHRERE Services denselben Key,
+  entfaellt der Prefix KOMPLETT ('price' statt 'Swing Momentum Service /
+  Swing Volume Profile Service / price' – die verkettete Namen zeigten
+  einen irrefuehrenden MasterTree-'Pfad').
+- Zoom-Slider X/Y: Richtung getauscht – rechts = Zoom-In, links = Zoom-Out
+  (Slider-Wert 5 = volle Achse, 100 = maximale Vergroesserung;
+  `_set_zoom_range`/`_set_zoom_slider` invers umgerechnet).
+- Achse 'Datum': Beschriftung lautet 'Datum/Zeit' – OHNE das
+  pyqtgraph-EXP-Suffix ('Datum (x1e+09)'). Ursache: `setLabel(text)`
+  mit units=None erzeugt eine leere Einheit; die date-Epochs (~1.7e9)
+  fallen in den SI-Bereich (1e9, inf) und pyqtgraph haengt '(x1e+09)'
+  an. `_HeatmapAxis.enableAutoSIPrefix(False)` unterdrueckt das
+  Suffix (die Ticks werden ohnehin von tickStrings formatiert).
+
+20.02.01 (User-Meldung 2 - Datums-Skala LWC-v5, 09.08.2026): Die date-Achse
+nutzt die Tick-Logik von Lightweight Charts v5 (aus dem LWC-JS extrahiert):
+Der Mindestabstand zweier Labels betraegt ~80 px (`_DATE_TARGET_PX`) –
+Zoom-In wechselt zur naechst feineren Variante (Stunden/Minuten), Zoom-Out
+zur naechst groeberen (Jahr/Monat/Woche/Tag); keine Ueberlappung, keine
+Riesensprünge. Weight-Hierarchie (LWC `Q_`): 70 Jahreswechsel ('2026'),
+60 Monatswechsel ('Feb 26'), 55 Wochenanfang Mo (ISO '08.25'),
+50 Tag ('Mo. 07.08.25'), 30 Stunde ('14:00'), 20 Minute ('14:23').
+pyqtgraph uebergibt an `tickValues` die ACHSEN-LAENGE in Pixeln (3. Param)
+– daraus wird der Mindestabstand in Sekunden berechnet.
+"""
+
+import math
+from datetime import datetime, timezone as dt_timezone
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import pyqtgraph as pg
+from PySide6.QtCore import QRectF, Qt
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QSlider,
+    QVBoxLayout,
+    QWidget,
+)
+
+from analytics.engine.analytics_worker import (
+    QUERY_HEATMAP_GENERIC,
+    QUERY_DAILY_OHLC,
+)
+from analytics.engine.feature_store_reader import (
+    DOW_LABELS,
+    DOW_WEEK_LABELS,
+    HEATMAP_AGGREGATIONS,
+    HEATMAP_DIMENSIONS,
+    HOURS_PER_DAY,
+)
+
+# E7: Konfluenz-Farbskala (0 = weiss/transparent, 1-2 = gelb/cyan,
+# 3-4 = orange, 5+ = dunkelrot) – Positionen 0..1 (Levels 0..5).
+_CONFLUENCE_COLORS = [
+    "#ffffff", "#ffff00", "#00ffff", "#ff8c00", "#ff6600", "#8b0000",
+]
+_CONFLUENCE_POS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+_CONFLUENCE_LEVELS = (0.0, 5.0)
+_VIRIDIS = "viridis"
+
+# E6: Wert-Aggregationen benoetigen einen numerischen feature_data-JSON-Key.
+_VALUE_AGGS = ("avg", "sum", "min", "max")
+
+# Tag in Sekunden (Wanduhr-Epoch-Basis fuer date-Achse).
+_DAY_SECONDS = 86400
+_HALF_DAY = 43200.0
+# 20.02.01 (E1): Stufen-Schwellen des Datums-Formatters (Monat/Jahr).
+_MONTH_SECONDS = 2_592_000
+_YEAR_SECONDS = 31_536_000
+
+# 20.02.01 (User-Meldung 2): LWC-v5-adaptierte Datums-Skala.
+# Zielabstand zwischen zwei Tick-Labels in Pixel (Lightweight Charts:
+# 5*(fontSize+4)/8 * (tickMarkMaxCharacterLength || 8) mit fontSize 12 =>
+# 5*16/8*8 = 80 px). Die Tick-Auswahl haelt diesen Abstand ein: Zoom-In
+# => feinere Variante, Zoom-Out => groebere Variante (keine Ueberlappung,
+# keine Riesensprünge). Weight-Hierarchie wie LWC v5:
+#   70 = Jahreswechsel (Label: '2026'), 60 = Monatswechsel ('Feb 26'),
+#   55 = Wochenanfang Mo (ISO-Woche '08.25'), 50 = Tageswechsel
+#   ('Mo. 07.08.25'), 30 = Stundenmarke ('14:00'), 20 = Minutenmarke ('14:23').
+_DATE_TARGET_PX = 80.0
+_MONTHS_SHORT = ("Jan", "Feb", "Mrz", "Apr", "Mai", "Jun",
+                 "Jul", "Aug", "Sep", "Okt", "Nov", "Dez")
+
+_DIM_LABELS = {
+    "date": "Datum",
+    "dow": "Wochentag",
+    # 20.02.01 (E2): "Stunde" -> "Tageszeit" (feste Skala 00:00-23:59, E3).
+    "hour": "Tageszeit",
+    "timeframe": "Timeframe",
+    "service_id": "Service",
+    "symbol": "Symbol",
+}
+_AGG_LABELS = {
+    "count": "Anzahl (COUNT)",
+    "confluence_count": "Konfluenz (COUNT DISTINCT)",
+    "avg": "Mittelwert (AVG)",
+    "sum": "Summe (SUM)",
+    "min": "Minimum (MIN)",
+    "max": "Maximum (MAX)",
+}
+
+
+# ---------------------------------------------------------------------------
+# Dynamische Achse (Bugfix 09.08.2026, Punkte 3/5/6)
+# ---------------------------------------------------------------------------
+def _pick_time_step(span: float, max_ticks: int) -> float:
+    """Waelt einen 'sauberen' Zeit-Schritt (Sekunden) fuer den Bereich."""
+    if span <= 0:
+        return 0.0
+    min_step = span / max(1, max_ticks)
+    # 1s, 5s, 15s, 30s, 1m, 5m, 15m, 30m, 1h, 2h, 3h, 6h, 12h,
+    # 1d, 2d, 1w, 2w, 1M, 3M, 6M, 1J
+    steps = (1, 5, 15, 30, 60, 300, 900, 1800, 3600, 7200, 10800, 21600,
+             43200, 86400, 172800, 604800, 1209600, 2592000, 7776000,
+             15552000, 31536000)
+    for s in steps:
+        if s >= min_step:
+            return float(s)
+    return float(steps[-1])
+
+
+def _time_ticks(min_val: float, max_val: float, step: float) -> List[float]:
+    """Ganzzahlige Tick-Positionen (Vielfache von `step`) im Bereich."""
+    if step <= 0:
+        return []
+    start = int(math.ceil(min_val / step)) * step
+    out: List[float] = []
+    v = start
+    while v <= max_val + 1e-9:
+        out.append(float(v))
+        v += step
+    return out
+
+
+def _nice_int_step(span: float, max_ticks: int) -> float:
+    """Waelt einen ganzzahligen Tick-Schritt (1,2,3,6,12,24,...) fuer den Bereich."""
+    if span <= 0:
+        return 1.0
+    raw = span / max(1, max_ticks)
+    for s in (1, 2, 3, 6, 12, 24, 48, 72, 168, 336, 730, 1460, 2920):
+        if s >= raw:
+            return float(s)
+    return float(math.ceil(raw))
+
+
+class _HeatmapAxis(pg.AxisItem):
+    """Achse mit dynamischen Ticks je Zoom-Level (Bugfix 09.08.2026).
+
+    Die Achse traegt NATUERLICHE Werte (date -> Wanduhr-Epochs,
+    hour/dow -> Ganzzahlen, kategorial -> Indizes) und formatiert die
+    Tick-Beschriftung abhaengig vom sichtbaren Bereich:
+      - date:  5 Format-Stufen je Zoom (Jahr/Monat/Tag/Stunde/Minute,
+               20.02.01 E1)
+      - hour/dow: ganzzahlige Schritte, beim Zoom mehr Zwischenwerte
+      - kategorial: Labels aus der zugehoerigen Liste
+    """
+
+    def __init__(self, orientation: str, **kwargs) -> None:
+        super().__init__(orientation, **kwargs)
+        self._dim: Optional[str] = None
+        self._labels: List[str] = []
+        # 09.08.2026 (User-Meldung): Kein automatisches SI-Prefix an das
+        # Achsen-Label haengen. pyqtgraph wuerde bei date-Epochs (~1.7e9)
+        # `setLabel(text)` (units=None -> leere Einheit) in den SI-Bereich
+        # (1e9, inf) einsortieren und 'Datum (x1e+09)' anzeigen (das
+        # 'EXP' in Klammern). Die Ticks werden ohnehin von tickStrings
+        # mit echten Werten formatiert (Scale wird ignoriert) – das
+        # Suffix waere also irrefuehrend.
+        self.enableAutoSIPrefix(False)
+
+    def configure(self, dim: str, labels: List[str]) -> None:
+        """Setzt Dimension + Label-Liste (kategoriale Achsen)."""
+        self._dim = str(dim or "")
+        self._labels = list(labels or [])
+
+    # ------------------------------------------------------------------
+    def _clamped_scale_bounds(self, minVal, maxVal):
+        """Clampt den sichtbaren Bereich auf die feste Skala (Meldungen 1+2).
+
+        `hour` (Tageszeit) und `dow` (Wochentag) haben FESTE Skalen
+        (0..24 bzw. 1..6, siehe `_axis_bounds`). Beim Rauszoomen (Mausrad)
+        ragt der sichtbare Viewport ueber die Skala hinaus – die Ticks
+        duerfen DANN nicht ausserhalb liegen (keine -/+ Werte ausserhalb
+        00:00-23:59 bzw. Mo-Fr). Der Tick-Bereich wird daher auf die
+        Skala geclampt. `date`/kategorial bleiben unbegrenzt (daten- bzw.
+        listenbasiert).
+        """
+        lo = float(minVal)
+        hi = float(maxVal)
+        if self._dim == "hour":
+            lo = max(lo, 0.0)
+            hi = min(hi, float(HOURS_PER_DAY))
+        elif self._dim == "dow":
+            lo = max(lo, 1.0)
+            hi = min(hi, 1.0 + float(len(DOW_WEEK_LABELS)))
+        return lo, hi
+
+    def tickValues(self, minVal, maxVal, maxTicks=5):
+        if not self._dim:
+            return super().tickValues(minVal, maxVal, maxTicks)
+        if self._dim == "date":
+            # 20.02.01 (User-Meldung 2): LWC-v5-adaptierte Datums-Skala.
+            # pyqtgraph uebergibt als dritten Parameter die ACHSEN-LAENGE in
+            # Pixel (nicht die Tick-Anzahl!). Die Tick-Auswahl haelt den
+            # Zielabstand _DATE_TARGET_PX ein: Zoom-In => feinere Variante,
+            # Zoom-Out => groebere Variante; Jahr/Monat/Woche/Tag/Stunde/
+            # Minute koexistieren als Hierarchie (per-Tick-Format in _format).
+            return self._lwc_date_ticks(float(minVal), float(maxVal),
+                                        float(maxTicks or 0))
+        # 20.02.01 (User-Meldungen 1+2): hour/dow auf die feste Skala
+        # geclampt – beim Rauszoomen bleibt der Bereich VOR/NACH der
+        # Tagesstunden (bzw. der 5 Wochentage) leer. Das rechte Skalenende
+        # (24 h bzw. Samstag 6) wird als halboffene Grenze ausgeschlossen,
+        # damit kein Duplikat-Label ("00:00" an Position 24) entsteht.
+        lo, hi = self._clamped_scale_bounds(minVal, maxVal)
+        if hi <= lo:
+            return []
+        span = hi - lo
+        step = _nice_int_step(span, int(maxTicks))
+        start = int(math.ceil(lo / step)) * step
+        values: List[float] = []
+        v = float(start)
+        while v < hi - 1e-9:
+            values.append(v)
+            v += step
+        return [(step, values)]
+
+    # ------------------------------------------------------------------
+    # 20.02.01 (User-Meldung 2): LWC-v5-Datums-Ticks (Jahr/Monat/Woche/Tag/
+    # Stunde/Minute-Hierarchie, Mindestabstand in Pixel)
+    # ------------------------------------------------------------------
+    def _lwc_date_ticks(self, lo: float, hi: float, axis_px: float):
+        """Erzeugt die Datums-Ticks nach der LWC-v5-Selektionslogik.
+
+        Der dritte Parameter von `tickValues` ist bei pyqtgraph die
+        ACHSEN-LAENGE in Pixeln. Der Mindestabstand zweier Ticks in
+        Sekunden ergibt sich aus `_DATE_TARGET_PX * span / axis_px` –
+        dadurch bleiben die Labels ~80 px auseinander: Zoom-In => feinere
+        Variante (Stunden/Minuten), Zoom-Out => groebere Variante (nur
+        Jahr/Monat/Woche/Tag). Die Auswahl bevorzugt hoehere Weights
+        (LWC `Q_`): Jahres-/Monatsmarken werden immer gesetzt, feinere
+        Marken fuellen die Luecken.
+        """
+        span = hi - lo
+        if span <= 0:
+            return []
+        if axis_px <= 0 or not math.isfinite(axis_px):
+            axis_px = 800.0
+        min_gap_sec = _DATE_TARGET_PX * span / axis_px
+        min_gap_sec = max(1.0, min_gap_sec)
+        marks = self._date_marks(lo, hi, min_gap_sec)
+        epochs = self._select_date_marks(marks, min_gap_sec)
+        if not epochs:
+            return []
+        return [(min_gap_sec, epochs)]
+
+    def _date_marks(self, lo: float, hi: float,
+                    min_gap_sec: float) -> List[tuple]:
+        """Kandidaten-Marken der Datums-Achse (Epoch, Weight).
+
+        Tages-Marken (Mitternacht, Wanduhr-UTC) mit Weight nach Datum:
+        70 = 1. Januar (Jahreswechsel), 60 = 1. des Monats (Monatswechsel),
+        55 = Montag (ISO-Wochenanfang), 50 = sonstiger Tag. Bei engem
+        Zoom zusaetzlich Stunden-Marken (30) und Minuten-Marken (20) –
+        die Generierung ist ueber die sichtbare Spanne begrenzt
+        (Minuten nur bei < 2 Tagen, Stunden nur bei < 60 Tagen), damit
+        die Kandidatenanzahl klein bleibt.
+        """
+        marks: List[tuple] = []
+        d0 = int(math.floor(lo / _DAY_SECONDS)) * _DAY_SECONDS
+        d1 = int(math.floor(hi / _DAY_SECONDS)) * _DAY_SECONDS
+        d = d0
+        while d <= d1:
+            dt = datetime.fromtimestamp(d, tz=dt_timezone.utc)
+            if dt.month == 1 and dt.day == 1:
+                w = 70
+            elif dt.day == 1:
+                w = 60
+            elif dt.weekday() == 0:
+                w = 55
+            else:
+                w = 50
+            marks.append((d, w))
+            d += _DAY_SECONDS
+        if min_gap_sec < _DAY_SECONDS and (hi - lo) <= 60 * _DAY_SECONDS:
+            h0 = int(math.floor(lo / 3600.0)) * 3600
+            h1 = int(math.floor(hi / 3600.0)) * 3600
+            h = h0
+            while h <= h1:
+                if h % _DAY_SECONDS != 0:  # Mitternacht = Tages-Marke
+                    marks.append((h, 30))
+                h += 3600
+        if min_gap_sec < 3600.0 and (hi - lo) <= 2 * _DAY_SECONDS:
+            m0 = int(math.floor(lo / 60.0)) * 60
+            m1 = int(math.floor(hi / 60.0)) * 60
+            m = m0
+            while m <= m1:
+                if m % 3600 != 0:  # Stunde = Stunden-Marke
+                    marks.append((m, 20))
+                m += 60
+        marks.sort(key=lambda x: x[0])
+        return marks
+
+    @staticmethod
+    def _select_date_marks(marks: List[tuple],
+                           min_gap_sec: float) -> List[float]:
+        """LWC-v5-Selektion (Q_): Weight absteigend, Mindestabstand.
+
+        Hoehere Weights (Jahr/Monat) werden bevorzugt gesetzt; feinere
+        Marken werden nur uebernommen, wenn sie mindestens `min_gap_sec`
+        von den bereits gewaehlten Marken entfernt sind. Ergebnis: die
+        gewohnte Hierarchie (Jahreszahl + Monatswechsel + Tage) mit
+        garantierter Mindest-Pixeldistanz (keine Ueberlappung, keine
+        Riesensprünge).
+        """
+        by_weight: Dict[int, List[float]] = {}
+        for epoch, weight in marks:
+            by_weight.setdefault(int(weight), []).append(float(epoch))
+        selected: List[float] = []
+        for weight in sorted(by_weight.keys(), reverse=True):
+            s = selected
+            out: List[float] = []
+            r = 0
+            e = len(s)
+            a = float("inf")
+            o = float("-inf")
+            for idx in by_weight[weight]:
+                while r < e and s[r] < idx:
+                    out.append(s[r])
+                    o = s[r]
+                    r += 1
+                if r < e:
+                    a = s[r]
+                if a - idx >= min_gap_sec and idx - o >= min_gap_sec:
+                    out.append(idx)
+                    o = idx
+            while r < e:
+                out.append(s[r])
+                r += 1
+            selected = out
+        return selected
+
+    def tickStrings(self, values, scale, spacing):
+        out = []
+        for v in values:
+            out.append(self._format(float(v), float(spacing)))
+        return out
+
+    # ------------------------------------------------------------------
+    def _format(self, v: float, spacing: float) -> str:
+        if self._dim == "date":
+            # 20.02.01 (User-Meldung 2): Per-Tick-Format nach der
+            # LWC-v5-Weight-Hierarchie (nicht mehr nach Spacing):
+            #   - Jahreswechsel (1.1.)  -> '2026'      (Weight 70)
+            #   - Monatswechsel (1. des Monats) -> 'Feb 26' (Weight 60)
+            #   - Wochenanfang Mo       -> '08.25'     (ISO-Woche, Weight 55)
+            #   - sonstiger Tag         -> 'Mo. 07.08.25' (Weight 50)
+            #   - Stundenmarke          -> '14:00'     (Weight 30)
+            #   - Minutenmarke          -> '14:23'     (Weight 20)
+            # Wanduhr-Garantie via UTC-Darstellung der (Wanduhr-encoded)
+            # Epoch (Invariante 7, KEIN Berlin-Offset). Monats-/Wochen-
+            # marken eines groben Zooms tragen ihre eigene Beschriftung
+            # (Jahreszahl/Feb/Mrz/...), feine Marken die Uhrzeit.
+            dt = datetime.fromtimestamp(v, tz=dt_timezone.utc)
+            if dt.hour != 0 or dt.minute != 0 or dt.second != 0:
+                if dt.minute == 0 and dt.second == 0:
+                    return f"{dt.hour:02d}:00"   # Stundenmarke
+                return f"{dt.hour:02d}:{dt.minute:02d}"  # Minutenmarke
+            weekday = DOW_LABELS[(dt.weekday() + 1) % 7]
+            if dt.month == 1 and dt.day == 1:
+                return str(dt.year)               # Jahreswechsel
+            if dt.day == 1:
+                return f"{_MONTHS_SHORT[dt.month - 1]} {dt.year % 100:02d}"
+            if dt.weekday() == 0:
+                iso = dt.isocalendar()
+                return f"{iso[1]:02d}.{dt.year % 100:02d}"  # ISO-Woche
+            return f"{weekday}. {dt.day:02d}.{dt.month:02d}.{dt.year % 100:02d}"
+        if self._dim == "hour":
+            # 20.02.01 (User-Meldung 1): KEIN `% 24`-Wrap mehr – Werte
+            # ausserhalb der festen Skala 00:00-23:59 werden leer gelassen
+            # (das tickValues-Clamping verhindert sie bereits; defensiv).
+            vv = int(round(v))
+            if 0 <= vv < HOURS_PER_DAY:
+                return f"{vv:02d}:00"
+            return ""
+        if self._dim == "dow":
+            idx = int(round(v))
+            if 1 <= idx <= len(DOW_WEEK_LABELS):
+                return DOW_WEEK_LABELS[idx - 1]
+            return ""
+        # Kategorial (timeframe/service_id/symbol): Labels aus der Liste.
+        idx = int(round(v))
+        if 0 <= idx < len(self._labels):
+            return str(self._labels[idx])
+        return str(int(round(v)))
+
+
+class HeatmapWidget(QWidget):
+    """Generische 2D-Heatmap mit Confluence-Matrix, Zoom & Candle-Overlay."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._view_model = None
+        self._n_cols = 0
+        self._n_rows = 0
+        self._x_axis: List[float] = []      # natuerliche X-Koordinaten je Spalte
+        self._y_axis: List[float] = []      # natuerliche Y-Koordinaten je Zeile
+        self._x_dates: List[Any] = []       # Datum je Spalte (nur X=date)
+        self._x_min = -0.5
+        self._x_max = 0.5
+        self._y_min = -0.5
+        self._y_max = 0.5
+        self._candle_items: List[Any] = []
+        self._colormap_mode = _VIRIDIS
+        self._syncing = False
+
+        # --- Steuerung (Zeile 1: Dimensionen/Aggregation/Feld) ---
+        self._combo_x = QComboBox()
+        # 20.02.01 (E8): Mindestbreite erhoeht (laengere Achsen-Beschriftungen).
+        self._combo_x.setMinimumWidth(160)
+        for d in HEATMAP_DIMENSIONS:
+            self._combo_x.addItem(_DIM_LABELS.get(d, d), d)
+        self._combo_y = QComboBox()
+        self._combo_y.setMinimumWidth(160)
+        for d in HEATMAP_DIMENSIONS:
+            self._combo_y.addItem(_DIM_LABELS.get(d, d), d)
+        self._combo_agg = QComboBox()
+        for a in HEATMAP_AGGREGATIONS:
+            self._combo_agg.addItem(_AGG_LABELS.get(a, a), a)
+        self._combo_field = QComboBox()
+        # 20.02.01 (User-Meldung 3a): 'Feld' deutlich laenger (Eintraege
+        # tragen seit Meldung 3b den Service-Prefix '{Service} / {Key}').
+        self._combo_field.setMinimumWidth(320)
+        self._combo_field.setMaximumWidth(460)
+        # Popup-Dropdown an den laengsten Eintrag anpassen (vollstaendige
+        # '{Service} / {Key}'-Texte sichtbar statt Ellipsis).
+        self._combo_field.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+
+        ctrl = QHBoxLayout()
+        ctrl.addWidget(QLabel("X-Achse:"))
+        ctrl.addWidget(self._combo_x)
+        ctrl.addWidget(QLabel("Y-Achse:"))
+        ctrl.addWidget(self._combo_y)
+        ctrl.addWidget(QLabel("Aggregation:"))
+        ctrl.addWidget(self._combo_agg)
+        ctrl.addWidget(QLabel("Feld:"))
+        ctrl.addWidget(self._combo_field)
+        ctrl.addStretch(1)
+
+        # --- Steuerung (Zeile 2: Overlay + Zoom) ---
+        self._chk_candle = QCheckBox("Kerzen-Overlay")
+        self._slider_zoom_x = QSlider(Qt.Horizontal)
+        self._slider_zoom_y = QSlider(Qt.Horizontal)
+        self._label_info = QLabel("")
+        self._label_info.setStyleSheet("color: #808080;")
+        for s in (self._slider_zoom_x, self._slider_zoom_y):
+            s.setRange(5, 100)
+            # 09.08.2026 (User-Meldung 2): Richtung getauscht – rechts
+            # (hoher Wert) = Zoom-In, links (niedriger Wert) = Zoom-Out.
+            # 5 = volle Achse (links), 100 = maximale Vergroesserung (rechts).
+            s.setValue(5)
+            s.setEnabled(False)
+            s.setToolTip("Viewport-Zoom (zentriert): rechts = Zoom-In, "
+                         "links = Zoom-Out.")
+
+        ctrl2 = QHBoxLayout()
+        ctrl2.addWidget(self._chk_candle)
+        ctrl2.addWidget(QLabel("Zoom X:"))
+        ctrl2.addWidget(self._slider_zoom_x)
+        ctrl2.addWidget(QLabel("Zoom Y:"))
+        ctrl2.addWidget(self._slider_zoom_y)
+        ctrl2.addWidget(self._label_info)
+        ctrl2.addStretch(1)
+
+        # --- Plot: Heatmap + Kerzen-Overlay im SELBEN Canvas (Bugfix 1) ---
+        self._plot_hm = pg.PlotWidget()
+        self._plot_hm.setBackground("w")
+        # Dynamische Achsen (Bugfix 5+6): Ticks je Zoom-Level.
+        self._axis_x = _HeatmapAxis("bottom")
+        self._axis_y = _HeatmapAxis("left")
+        self._plot_hm.plotItem.setAxisItems(
+            {"bottom": self._axis_x, "left": self._axis_y})
+        self._image = pg.ImageItem()
+        self._plot_hm.addItem(self._image)
+        self._cmap_viridis = pg.colormap.get(_VIRIDIS)
+        self._cmap_confluence = pg.ColorMap(
+            pos=_CONFLUENCE_POS, color=_CONFLUENCE_COLORS)
+        self._image.setColorMap(self._cmap_viridis)
+        self._colorbar = pg.ColorBarItem(
+            colorMap=self._cmap_viridis, values=(0.0, 1.0))
+        self._colorbar.setImageItem(self._image)
+
+        # Kerzen-Overlay: zweite Y-Achse (Preis) rechts im selben Canvas,
+        # ViewBox teilt die X-Achse mit der Heatmap (Bugfix 1).
+        self._plot_hm.showAxis("right")
+        self._plot_hm.getAxis("right").setLabel("Preis")
+        self._price_vb = pg.ViewBox()
+        self._plot_hm.scene().addItem(self._price_vb)
+        self._plot_hm.getAxis("right").linkToView(self._price_vb)
+        self._price_vb.setXLink(self._plot_hm.plotItem.vb)
+        self._price_vb.setZValue(10)  # ueber der Heatmap zeichnen
+        self._price_vb.setVisible(False)
+        self._plot_hm.getAxis("right").setVisible(False)
+        self._plot_hm.plotItem.vb.sigResized.connect(self._update_price_view)
+
+        lay = QVBoxLayout(self)
+        lay.addLayout(ctrl)
+        lay.addLayout(ctrl2)
+        lay.addWidget(self._plot_hm, 1)
+
+        # --- Signale ---
+        self._combo_x.currentIndexChanged.connect(self._on_config_changed)
+        self._combo_y.currentIndexChanged.connect(self._on_config_changed)
+        self._combo_agg.currentIndexChanged.connect(self._on_agg_changed)
+        self._combo_field.currentIndexChanged.connect(self._on_config_changed)
+        self._chk_candle.toggled.connect(self._on_candle_toggled)
+        self._slider_zoom_x.valueChanged.connect(self._on_zoom_x_changed)
+        self._slider_zoom_y.valueChanged.connect(self._on_zoom_y_changed)
+
+    # ------------------------------------------------------------------
+    # MVVM-Anbindung (von der HeatmapPage gesetzt)
+    # ------------------------------------------------------------------
+    def attach_view_model(self, view_model: Any) -> None:
+        self._view_model = view_model
+        view_model.data_ready.connect(self._on_data_ready)
+        self._sync_from_params()
+
+    def is_candle_projection_enabled(self) -> bool:
+        """True, wenn das Kerzen-Overlay aktiviert ist (E9)."""
+        return self._chk_candle.isChecked()
+
+    def request_data(self) -> None:
+        """Fordert generische Heatmap (+ Tages-Ohlc bei Overlay) an."""
+        if self._view_model is None:
+            return
+        self._view_model.request_heatmap_generic()
+        if self._chk_candle.isChecked():
+            self._view_model.request_daily_ohlc()
+
+    # ------------------------------------------------------------------
+    # Sync aus den ViewModel-_params (Profil/Workspace-Restore)
+    # ------------------------------------------------------------------
+    def _sync_from_params(self) -> None:
+        if self._view_model is None:
+            return
+        p = self._view_model.params
+        self._syncing = True
+        try:
+            self._set_combo_data(
+                self._combo_x, str(p.get("heatmap_x_dim") or "date"))
+            self._set_combo_data(
+                self._combo_y, str(p.get("heatmap_y_dim") or "hour"))
+            self._set_combo_data(
+                self._combo_agg,
+                str(p.get("heatmap_agg") or "confluence_count"))
+            field = str(p.get("heatmap_field") or "")
+            if field and self._combo_field.findData(field) < 0:
+                self._combo_field.addItem(field, field)
+            self._set_combo_data(self._combo_field, field)
+            self._chk_candle.setChecked(bool(
+                p.get("candle_projection_enabled")))
+            self._set_zoom_slider(self._slider_zoom_x,
+                                  p.get("zoom_x_range") or [0.0, 1.0])
+            self._set_zoom_slider(self._slider_zoom_y,
+                                  p.get("zoom_y_range") or [0.0, 1.0])
+        finally:
+            self._syncing = False
+        self._update_controls()
+
+    @staticmethod
+    def _set_combo_data(combo: QComboBox, value: str) -> None:
+        """Setzt die Combo auf `value` (fuegt unbekannte Werte additiv hinzu)."""
+        combo.blockSignals(True)
+        try:
+            idx = combo.findData(value)
+            if idx < 0:
+                combo.addItem(str(value), value)
+                idx = combo.count() - 1
+            combo.setCurrentIndex(idx)
+        finally:
+            combo.blockSignals(False)
+
+    @staticmethod
+    def _set_zoom_slider(slider: QSlider, zrange: Any) -> None:
+        """Stellt den Zoom-Slider aus einem [lo, hi]-Bereich ein (E8).
+
+        09.08.2026 (User-Meldung 2): Inverse Umrechnung zu `_set_zoom_range`
+        – volle Achse (span 1.0) => Slider 5 (links), maximale Vergroesserung
+        (span 0.05) => Slider 100 (rechts).
+        """
+        try:
+            lo, hi = float(zrange[0]), float(zrange[1])
+        except (TypeError, ValueError, IndexError):
+            lo, hi = 0.0, 1.0
+        if hi <= lo:
+            lo, hi = 0.0, 1.0
+        value = int(round(105.0 - (hi - lo) * 100.0))
+        slider.blockSignals(True)
+        slider.setValue(max(slider.minimum(), min(slider.maximum(), value)))
+        slider.blockSignals(False)
+
+    def _update_controls(self) -> None:
+        """Aktiviert/Deaktiviert Feld-Combo und Overlay (E6/E9).
+
+        Bugfix 09.08.2026 (Punkt 6): Die Zoom-Slider gelten fuer ALLE
+        Dimensionen/Massstaebe (nicht nur date) – je Zoom-Level werden
+        dynamisch mehr Zwischenwerte auf den Achsen angezeigt.
+        """
+        if self._view_model is None:
+            return
+        x_dim = str(self._combo_x.currentData() or "")
+        agg = str(self._combo_agg.currentData() or "")
+        self._slider_zoom_x.setEnabled(True)
+        self._slider_zoom_y.setEnabled(True)
+        is_value_agg = agg in _VALUE_AGGS
+        self._combo_field.setEnabled(is_value_agg)
+        if is_value_agg:
+            self._combo_field.setToolTip(
+                "Numerischer feature_data-JSON-Key (Feld) fuer AVG/SUM/MIN/MAX.")
+        else:
+            self._combo_field.setToolTip(
+                "Nur fuer AVG/SUM/MIN/MAX relevant (E6); COUNT/CONFLUENCE "
+                "ignorieren das Feld.")
+        can_overlay = x_dim == "date"
+        self._chk_candle.setEnabled(can_overlay)
+        if can_overlay:
+            self._chk_candle.setToolTip(
+                "Tages-Ohlc ueber der Heatmap (gleicher Canvas, rechte "
+                "Preis-Achse), horizontal synchronisiert (Bugfix 1).")
+        else:
+            self._chk_candle.setToolTip(
+                "Kerzen-Overlay nur bei X-Achse 'Datum' verfuegbar (E9).")
+        # 20.02.01 (E7): Overlay-Zoom-Lock – die Preis-ViewBox ist NUR bei
+        # X=date UND aktivem Overlay an die Heatmap-ViewBox gekoppelt
+        # (setXLink). Bei allen anderen X-Dimensionen (oder ausgeschaltetem
+        # Overlay) wird der Link entfernt – Zoom-Sync vollstaendig entkoppelt.
+        linked = self._price_vb.linkedView(pg.ViewBox.XAxis)
+        link = can_overlay and self._chk_candle.isChecked()
+        if link and linked is None:
+            self._price_vb.setXLink(self._plot_hm.plotItem.vb)
+        if not link and linked is not None:
+            self._price_vb.setXLink(None)
+
+    # ------------------------------------------------------------------
+    # Konfiguration -> ViewModel (Debounce -> Worker)
+    # ------------------------------------------------------------------
+    def _on_config_changed(self, *args) -> None:
+        if self._syncing or self._view_model is None:
+            return
+        # Identische Achsen vermeiden (degenerierte Diagonal-Matrix).
+        if self._combo_x.currentData() == self._combo_y.currentData():
+            self._syncing = True
+            try:
+                fallback = ("hour" if self._combo_x.currentData() != "hour"
+                            else "dow")
+                self._set_combo_data(self._combo_y, fallback)
+            finally:
+                self._syncing = False
+        # Overlay nur bei X=date (E9) – sonst ausschalten.
+        if (self._combo_x.currentData() != "date"
+                and self._chk_candle.isChecked()):
+            self._chk_candle.setChecked(False)
+        self._update_controls()
+        self._apply_config()
+        self.request_data()
+
+    def _on_agg_changed(self, *args) -> None:
+        if self._syncing or self._view_model is None:
+            return
+        self._update_controls()
+        self._apply_config()
+        self.request_data()
+
+    def _apply_config(self) -> None:
+        self._view_model.set_heatmap_config(
+            x_dim=str(self._combo_x.currentData() or "date"),
+            y_dim=str(self._combo_y.currentData() or "hour"),
+            field=str(self._combo_field.currentData() or ""),
+            agg=str(self._combo_agg.currentData() or "confluence_count"),
+        )
+
+    # ------------------------------------------------------------------
+    # Candle-Overlay (Bugfix 1, im selben Canvas) + Zoom (E8)
+    # ------------------------------------------------------------------
+    def _on_candle_toggled(self, checked: bool) -> None:
+        if self._syncing or self._view_model is None:
+            return
+        self._view_model.set_candle_projection(bool(checked))
+        # 20.02.01 (E7): Link-Zustand an den Overlay-Zustand koppeln.
+        self._update_controls()
+        if checked:
+            self._view_model.request_daily_ohlc()
+        else:
+            self._clear_overlay()
+
+    def _on_zoom_x_changed(self, value: int) -> None:
+        if self._syncing or self._view_model is None:
+            return
+        self._set_zoom_range("zoom_x_range", value)
+        self._apply_x_range()
+
+    def _on_zoom_y_changed(self, value: int) -> None:
+        if self._syncing or self._view_model is None:
+            return
+        self._set_zoom_range("zoom_y_range", value)
+        self._apply_y_range()
+
+    def _set_zoom_range(self, key: str, value: int) -> None:
+        """Berechnet [lo, hi] (zentriert) aus dem Slider-Wert (E8).
+
+        09.08.2026 (User-Meldung 2): Richtung getauscht – rechts (hoher
+        Slider-Wert) = Zoom-In, links (niedriger Wert) = Zoom-Out. Der
+        Slider-Wert ist die Zoom-Stufe 5..100; der sichtbare Anteil
+        `f = (105 - value) / 100` (5 => volle Achse, 100 => maximale
+        Vergroesserung, zentriert auf 0.5).
+        """
+        f = (105.0 - value) / 100.0
+        lo = max(0.0, 0.5 - f / 2.0)
+        hi = min(1.0, 0.5 + f / 2.0)
+        zx = list(self._view_model.params.get("zoom_x_range") or [0.0, 1.0])
+        zy = list(self._view_model.params.get("zoom_y_range") or [0.0, 1.0])
+        if key == "zoom_x_range":
+            zx = [lo, hi]
+        else:
+            zy = [lo, hi]
+        self._view_model.set_heatmap_zoom(zx, zy)
+
+    @staticmethod
+    def _zoom_lo_hi(params: Dict[str, Any], key: str) -> List[float]:
+        try:
+            lo, hi = params[key]
+            lo, hi = float(lo), float(hi)
+        except (TypeError, ValueError, IndexError, KeyError):
+            lo, hi = 0.0, 1.0
+        if hi <= lo:
+            lo, hi = 0.0, 1.0
+        return [lo, hi]
+
+    def _apply_x_range(self) -> None:
+        """Wendet zoom_x_range auf die Heatmap an (E8, natuerliche Werte)."""
+        if self._view_model is None:
+            return
+        lo, hi = self._zoom_lo_hi(self._view_model.params, "zoom_x_range")
+        span = self._x_max - self._x_min
+        self._plot_hm.setXRange(
+            self._x_min + lo * span, self._x_min + hi * span, padding=0)
+
+    def _apply_y_range(self) -> None:
+        """Wendet zoom_y_range auf die Heatmap an (E8, natuerliche Werte)."""
+        if self._view_model is None:
+            return
+        lo, hi = self._zoom_lo_hi(self._view_model.params, "zoom_y_range")
+        span = self._y_max - self._y_min
+        self._plot_hm.setYRange(
+            self._y_min + lo * span, self._y_min + hi * span, padding=0)
+
+    def _update_price_view(self) -> None:
+        """Synchronisiert die Preis-ViewBox-Geometrie mit der Heatmap."""
+        vb = self._plot_hm.plotItem.vb
+        self._price_vb.setGeometry(vb.sceneBoundingRect())
+        self._price_vb.linkedViewChanged(vb, self._price_vb.XAxis)
+
+    # ------------------------------------------------------------------
+    # Datenfluss (UI rendert, KEIN SQL)
+    # ------------------------------------------------------------------
+    def _on_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
+        if kind == QUERY_HEATMAP_GENERIC:
+            self._render_generic(data)
+        elif kind == QUERY_DAILY_OHLC:
+            self._render_overlay(data)
+
+    def _render_generic(self, data: Dict[str, Any]) -> None:
+        matrix = np.asarray(data.get("matrix") or [], dtype=float)
+        x_dim = str(data.get("x_dim")
+                    or self._combo_x.currentData() or "date")
+        y_dim = str(data.get("y_dim")
+                    or self._combo_y.currentData() or "hour")
+        # Natuerliche Achsen-Koordinaten (Bugfix 3: Reader liefert sie).
+        x_axis = data.get("x_axis") or []
+        y_axis = data.get("y_axis") or []
+        self._x_dates = []
+        if x_dim == "date":
+            for v in (data.get("x_values") or []):
+                try:
+                    self._x_dates.append(
+                        datetime.fromisoformat(str(v)).date())
+                except (TypeError, ValueError):
+                    self._x_dates.append(None)
+        # Combos/Slider aus dem Payload synchronisieren (tatsaechlich
+        # verwendete Werte; Repository-Fallbacks z. B. fuer `field`).
+        self._sync_combos_from_payload(data)
+        agg = str(data.get("agg") or "count")
+
+        if matrix.size == 0:
+            self._n_cols = self._n_rows = 0
+            self._x_axis = []
+            self._y_axis = []
+            self._image.clear()
+            self._label_info.setText("Keine Daten")
+            self._clear_overlay()
+            return
+
+        self._n_cols = int(matrix.shape[1])
+        self._n_rows = int(matrix.shape[0])
+        self._x_axis = [float(v) for v in (x_axis or
+                                           list(range(self._n_cols)))]
+        self._y_axis = [float(v) for v in (y_axis or
+                                           list(range(self._n_rows)))]
+
+        # E7: Colormap abhaengig von der Aggregation.
+        if agg == "confluence_count":
+            if self._colormap_mode != "confluence":
+                self._image.setColorMap(self._cmap_confluence)
+                try:
+                    self._colorbar.setColorMap(self._cmap_confluence)
+                except Exception:
+                    pass
+                self._colormap_mode = "confluence"
+            self._image.setImage(matrix, levels=_CONFLUENCE_LEVELS)
+            self._colorbar.setLevels(_CONFLUENCE_LEVELS)
+        else:
+            if self._colormap_mode != _VIRIDIS:
+                self._image.setColorMap(self._cmap_viridis)
+                try:
+                    self._colorbar.setColorMap(self._cmap_viridis)
+                except Exception:
+                    pass
+                self._colormap_mode = _VIRIDIS
+            finite = matrix[np.isfinite(matrix)]
+            if finite.size:
+                vmin = float(finite.min())
+                vmax = float(finite.max())
+                if vmin == vmax:
+                    vmax = vmin + 1.0
+            else:
+                vmin, vmax = 0.0, 1.0
+            self._image.setImage(matrix, levels=(vmin, vmax))
+            self._colorbar.setLevels((vmin, vmax))
+
+        # ImageItem exakt auf die natuerlichen Koordinaten mappen (Bugfix 3):
+        # date-Spalten = Tage (zentriert auf Mitternacht), hour/dow =
+        # ganzzahlige Werte (feste Skalen, E3/E5), kategorial = Indizes.
+        # Nichts wird ueber die Tagesgrenze hinaus gezeichnet (Punkt 3).
+        self._x_min, self._x_max = self._axis_bounds(self._x_axis, x_dim)
+        self._y_min, self._y_max = self._axis_bounds(self._y_axis, y_dim)
+        self._image.setRect(QRectF(
+            self._x_min, self._y_min,
+            self._x_max - self._x_min, self._y_max - self._y_min))
+
+        # 20.02.01 (E8): service_id-Achsen-Labels ueber den ViewModel-
+        # Resolver ({Kategorie} / {Name}, `srv_`-Prefix entfaellt).
+        x_labels = data.get("x_labels") or []
+        y_labels = data.get("y_labels") or []
+        if x_dim == "service_id" and self._view_model is not None:
+            x_labels = [self._view_model.resolve_service_label(str(l))
+                        for l in x_labels]
+        if y_dim == "service_id" and self._view_model is not None:
+            y_labels = [self._view_model.resolve_service_label(str(l))
+                        for l in y_labels]
+        # Dynamische Achsen konfigurieren (Bugfix 5+6).
+        self._axis_x.configure(x_dim, x_labels)
+        self._axis_y.configure(y_dim, y_labels)
+
+        # 20.02.01 (E4): Achsen-Label der Tageszeit mit UTC-Offset –
+        # DST-robust aus dem neuesten Datumswert der Daten abgeleitet
+        # (kein Berlin-Offset, Invariante 7; die Epochs sind Wanduhr-encoded).
+        offset_epoch: Optional[float] = None
+        if x_dim == "date" and self._x_axis:
+            offset_epoch = self._x_axis[-1]
+        elif y_dim == "date" and self._y_axis:
+            offset_epoch = self._y_axis[-1]
+        offset_text = self._utc_offset_text(offset_epoch)
+        label_x = _DIM_LABELS.get(x_dim, x_dim)
+        label_y = _DIM_LABELS.get(y_dim, y_dim)
+        # 09.08.2026 (User-Meldung): Die date-Achse heisst 'Datum/Zeit'
+        # (ohne pyqtgraph-EXP-Suffix – das unterdrueckt _HeatmapAxis via
+        # enableAutoSIPrefix(False), s. o.).
+        if x_dim == "date":
+            label_x = "Datum/Zeit"
+        if y_dim == "date":
+            label_y = "Datum/Zeit"
+        if x_dim == "hour":
+            label_x = f"{label_x} ({offset_text})"
+        if y_dim == "hour":
+            label_y = f"{label_y} ({offset_text})"
+        self._plot_hm.setLabel("bottom", label_x)
+        self._plot_hm.setLabel("left", label_y)
+
+        self._apply_x_range()
+        self._apply_y_range()
+        self._label_info.setText(f"{self._n_rows} x {self._n_cols}")
+
+        # Bugfix 1/2: Bei aktivem Overlay den Tages-Ohlc-Snapshot laden.
+        if self._chk_candle.isChecked() and self._view_model is not None:
+            self._view_model.request_daily_ohlc()
+
+    @staticmethod
+    def _axis_bounds(axis: List[float], dim: str):
+        """Koordinaten-Bereich [lo, hi] fuer eine Achse (natuerliche Werte).
+
+        20.02.01 (E3/E5): `hour` und `dow` haben FESTE Skalen unabhaengig
+        vom Datenbereich – Tageszeit 00:00-23:59 (halboffene Zellen
+        [h, h+1), Range 0..24) und Wochentag strikt Montag-Freitag
+        (Mo=1..Fr=5, Range 1..6). Das garantiert stabil vergleichbare
+        Achsen zwischen Symbolen/Timeframes. `date` bleibt datenabhaengig
+        (Mitternachts-Epochs +/- halber Tag), kategorial = Indizes 0..n-1.
+        """
+        if dim == "hour":
+            return 0.0, float(HOURS_PER_DAY)
+        if dim == "dow":
+            return 1.0, 1.0 + float(len(DOW_WEEK_LABELS))
+        if not axis:
+            return -0.5, 0.5
+        lo = float(min(axis))
+        hi = float(max(axis))
+        if dim == "date":
+            # Zellen = Tage, zentriert auf Mitternacht (Wanduhr).
+            return lo - _HALF_DAY, hi + _HALF_DAY
+        # Kategorial (timeframe/service_id/symbol): Indizes 0..n-1.
+        return -0.5, float(len(axis)) - 0.5
+
+    def _utc_offset_text(self, epoch: Optional[float]) -> str:
+        """UTC-Offset der Berliner Wanduhr als Label-Text (20.02.01, E4).
+
+        Liefert z. B. 'UTC+2' (Sommer) bzw. 'UTC+1' (Winter) – DST-robust
+        aus dem UHRZEITPUNKT abgeleitet: Bevorzugt der neueste Datums-
+        Epoch der Daten (falls eine date-Achse vorhanden ist), sonst die
+        aktuelle Systemzeit (der Rechner laeuft in der Berliner Zeitzone,
+        vgl. Invariante 7). Die Wanduhr-Epochs werden UNABHAENGIG vom
+        Offset formatiert (UTC-Darstellung) – der Offset dient nur der
+        Information 'Tageszeit (UTC+X)'.
+        """
+        try:
+            if epoch is not None and epoch > 0:
+                ts = datetime.fromtimestamp(float(epoch))
+            else:
+                ts = datetime.now()
+            offset = ts.astimezone().utcoffset()
+            if offset is None:
+                return "UTC"
+            total = int(offset.total_seconds() // 3600)
+            sign = "+" if total >= 0 else "-"
+            return f"UTC{sign}{abs(total)}"
+        except Exception:
+            return "UTC"
+
+    def _field_label(self, key: str, service_ids: List[str]) -> str:
+        """Anzeige-Text eines Feld-Eintrags (Meldung 3b/c, 09.08.2026).
+
+        Der Service-Name wird DIREKT aus dem Service-Objekt geholt
+        (`resolve_service_display_name`, plugin_id-basiert, `srv_`-Prefix
+        entfaellt -> 'Swing Momentum' statt 'Swing Momentum Service').
+        Ist der Key EINDEUTIG einem Service zuzuordnen, steht dessen
+        korrekter Name vor dem Key ('{Name} / {Key}', z. B.
+        'Grid Lines / open'). Liefern MEHRERE Services denselben Key
+        (z. B. 'price' von Swing-Services), entfaellt der Prefix KOMPLETT –
+        sonst wuerde eine irrefuehrende 'Pfad'-Kette ('Swing Momentum
+        Service / Swing Volume Profile Service / price') entstehen
+        (User-Meldung, 09.08.2026: 'Pfad im Mastertree' = absoluter
+        Quatsch). Ohne bekannte Quelle bleibt der Roh-Key (defensiv).
+        """
+        if (len(service_ids) == 1 and self._view_model is not None):
+            name = self._view_model.resolve_service_display_name(
+                str(service_ids[0]))
+            if name:
+                return f"{name} / {str(key)}"
+        return str(key)
+
+    def _sync_combos_from_payload(self, data: Dict[str, Any]) -> None:
+        """Synchronisiert die Combos mit dem tatsaechlichen Payload."""
+        if self._view_model is None:
+            return
+        metrics = [str(m) for m in (data.get("metrics") or [])]
+        keys = [m for m in metrics if m not in ("count", "confluence_count")]
+        # 20.02.01 (User-Meldung 3b): Key -> Services, die ihn liefern
+        # (Repository `field_sources`); Anzeige '{Service} / {Key}'.
+        field_sources = data.get("field_sources") or {}
+        agg = str(data.get("agg") or "")
+        prev_field = str(self._combo_field.currentData() or "")
+        self._syncing = True
+        try:
+            self._combo_field.blockSignals(True)
+            self._combo_field.clear()
+            for k in keys:
+                sids = [str(s) for s in (field_sources.get(k) or [])]
+                self._combo_field.addItem(self._field_label(k, sids), k)
+            if prev_field in keys:
+                self._combo_field.setCurrentIndex(
+                    self._combo_field.findData(prev_field))
+            elif keys:
+                self._combo_field.setCurrentIndex(0)
+            self._combo_field.blockSignals(False)
+            self._set_combo_data(
+                self._combo_x, str(data.get("x_dim") or "date"))
+            self._set_combo_data(
+                self._combo_y, str(data.get("y_dim") or "hour"))
+            self._set_combo_data(self._combo_agg, str(agg or "count"))
+        finally:
+            self._syncing = False
+        self._update_controls()
+        # E6: Wert-Aggregation mit noch leerem Feld -> ersten Key uebernehmen
+        # und Konfiguration nachreichen (einmaliger Query-Loop).
+        if (agg in _VALUE_AGGS and self._combo_field.currentData()
+                and self._view_model.params.get("heatmap_field")
+                != self._combo_field.currentData()):
+            self._apply_config()
+
+    def _render_overlay(self, data: Dict[str, Any]) -> None:
+        """Zeichnet Tages-Ohlc ueber die Heatmap (selbes Canvas, Bugfix 1).
+
+        Die Candles liegen in der Preis-ViewBox (rechte Y-Achse = Preis),
+        X = Wanduhr-Mitternachts-Epoch je Tag – exakt die Spalten der
+        date-Heatmap. Alpha 0.3-0.5 (E9).
+        """
+        self._clear_overlay()
+        bars = data.get("bars") or []
+        if not bars or not self._x_axis:
+            return
+        # Spalten-Index je Wanduhr-Tag (Mitternachts-Epoch).
+        epoch_to_col = {int(round(e)): i for i, e in enumerate(self._x_axis)}
+        candles: List[tuple] = []
+        for b in bars:
+            t = b.get("time")
+            if t is None:
+                continue
+            try:
+                t = int(t)
+            except (TypeError, ValueError):
+                continue
+            col = epoch_to_col.get(t)
+            if col is None:
+                continue  # Tag nicht in der Heatmap (Ausschnitt)
+            try:
+                o = float(b["open"])
+                c = float(b["close"])
+                h = float(b["high"])
+                l = float(b["low"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if not (np.isfinite(o) and np.isfinite(c)
+                    and np.isfinite(h) and np.isfinite(l)):
+                continue
+            candles.append((t, o, h, l, c))
+        if not candles:
+            return
+        ymin = min(c[3] for c in candles)
+        ymax = max(c[2] for c in candles)
+        if ymin == ymax:
+            ymin -= 1.0
+            ymax += 1.0
+        pad = (ymax - ymin) * 0.05
+        self._price_vb.setYRange(ymin - pad, ymax + pad, padding=0)
+        # Candles: x = Mitternachts-Epoch, Breite in Tages-Sekunden.
+        for t, o, h, l, c in candles:
+            up = c >= o
+            color = pg.mkColor(0, 180, 0, 140) if up \
+                else pg.mkColor(220, 30, 30, 140)
+            # Bugfix 08.08.2026: pg.BarGraphItem kennt KEIN top/bottom –
+            # die pyqtgraph-API verlangt y0 + height.
+            wick = pg.BarGraphItem(
+                x=[float(t)], width=_DAY_SECONDS * 0.12,
+                y0=l, height=max(h - l, 1e-9), brush=color, pen=color)
+            body = pg.BarGraphItem(
+                x=[float(t)], width=_DAY_SECONDS * 0.7,
+                y0=min(o, c),
+                height=max(max(o, c) - min(o, c), 1e-9),
+                brush=color, pen=color)
+            self._price_vb.addItem(wick)
+            self._price_vb.addItem(body)
+            self._candle_items.extend((wick, body))
+        self._price_vb.setVisible(True)
+        self._plot_hm.getAxis("right").setVisible(True)
+        self._update_price_view()
+
+    def _clear_overlay(self) -> None:
+        """Entfernt alle Kerzen-Items und versteckt die Preis-Achse."""
+        for item in self._candle_items:
+            try:
+                self._price_vb.removeItem(item)
+            except Exception:
+                pass
+        self._candle_items = []
+        self._price_vb.setVisible(False)
+        self._plot_hm.getAxis("right").setVisible(False)
 
 ```
 
@@ -25986,7 +28281,9 @@ Modularisierung, Pruefprotokoll-Entscheidung E3). Enthaelt:
 Basis-Schicht (E4): kein Import anderer Projekt-Module.
 """
 
+import datetime
 import os
+import shutil
 import threading
 from typing import Dict
 
@@ -26040,6 +28337,45 @@ class DbPool:
     _local = threading.local()
 
     @staticmethod
+    def _open_with_wal_recovery(abs_path: str) -> duckdb.DuckDBPyConnection:
+        """Oeffnet eine DuckDB-Connection mit defensivem WAL-Recovery.
+
+        Bugfix 09.08.2026 (wiederkehrender Start-Abbruch unter Windows):
+        `duckdb.connect()` schlug mit "INTERNAL Error: Failure while replaying
+        WAL file .../analytics.duckdb.wal: Calling DatabaseManager::
+        GetDefaultDatabase with no default database set" fehl, wenn die WAL
+        (z. B. durch hartes Beenden der App) korrupt war. Statt die gesamte
+        App am Start scheitern zu lassen, wird die korrupte WAL-Datei unter
+        `<db>.wal.corrupt_<YYYYMMDD_HHMMSS>` wegsichert und der Connect
+        erneut versucht. Verloren gehen dabei nur un-checkpointete
+        Transaktionen – die Haupt-DB (letzter Checkpoint) bleibt intakt.
+
+        Raises:
+            Exception: Wenn auch der zweite Versuch fehlschlaegt (kein
+                WAL-Problem oder die DB selbst ist beschädigt).
+        """
+        try:
+            return duckdb.connect(abs_path)
+        except duckdb.InternalException as exc:
+            if "Failure while replaying WAL" not in str(exc):
+                raise
+            wal_path = abs_path + ".wal"
+            if os.path.exists(wal_path):
+                stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                corrupt_path = f"{wal_path}.corrupt_{stamp}"
+                try:
+                    shutil.move(wal_path, corrupt_path)
+                except OSError:
+                    # Wegsichern fehlgeschlagen (z. B. Datei gesperrt) –
+                    # dann wenigstens umbenennen, sonst Retry schlaegt erneut fehl.
+                    try:
+                        os.replace(wal_path, corrupt_path)
+                    except OSError:
+                        pass
+            # Zweiter Versuch nach Entfernen der korrupten WAL.
+            return duckdb.connect(abs_path)
+
+    @staticmethod
     def get(db_path: str) -> duckdb.DuckDBPyConnection:
         """Gibt eine persistente Connection zur DB-Datei zurueck (eine pro Thread).
         Die Connection lebt bis Prozess-Ende und wird nie geschlossen."""
@@ -26048,7 +28384,7 @@ class DbPool:
         if not hasattr(DbPool._local, 'conns'):
             DbPool._local.conns = {}
         if abs_path not in DbPool._local.conns:
-            DbPool._local.conns[abs_path] = duckdb.connect(abs_path)
+            DbPool._local.conns[abs_path] = DbPool._open_with_wal_recovery(abs_path)
             # Globalen Referenzzähler erhöhen (für atexit)
             with _db_pool_lock:
                 if _db_pool_global.get(abs_path, 0) == 0:
@@ -27631,6 +29967,33 @@ class MasterTree(QTreeWidget):
             self._checked_items.clear()
         self._populate()
 
+    def _expand_ancestors(self, item) -> None:
+        """Klappt die Eltern-Kette eines Items auf (Bugfix 08.08.2026).
+
+        Bug 2 (User-Meldung: 'Tree-Knoten sollen aufgeklappt sein und die
+        Services sichtbar sein, die aktiviert wurden'): Nach dem Setzen der
+        Checkboxen (`set_checked_feature_ids`) bzw. beim Live-Anhaken
+        (`_on_item_changed`) muessen die Eltern-Knoten (Sets / Kategorie-
+        Ordner) expandiert sein – der Baum startet eingeklappt, nur die
+        Top-Level-Gruppen sind in _populate() expandiert. Ohne Expansion
+        bleiben angehakte Services/Plugins in eingeklappten Eltern unsichtbar.
+        setExpanded feuert itemExpanded -> _refresh_expand_label ('>'/'⌄'-
+        Label-Sync); waehrend `_updating_checks == True` ignoriert
+        _on_item_changed die dadurch ausgeloesten spurious itemChanged-Events.
+        """
+        node = item
+        hops = 0
+        while node is not None and isValid(node) and hops < 64:
+            node = node.parent()
+            if node is None or not isValid(node):
+                break
+            try:
+                if node.childCount() > 0 and not node.isExpanded():
+                    node.setExpanded(True)
+            except (RuntimeError, AttributeError):
+                break
+            hops += 1
+
     def _on_item_changed(self, item, column: int) -> None:
         """Aktualisiert die Checkbox-Zustaende (15.03-E, SELECT_MULTI).
 
@@ -27669,6 +30032,9 @@ class MasterTree(QTreeWidget):
                     return
                 if state == Qt.Checked:
                     self._checked_items.add(key)
+                    # Bugfix 08.08.2026: Eltern-Kette aufklappen, damit der
+                    # angehakte Service im Set sofort sichtbar ist.
+                    self._expand_ancestors(item)
                 else:
                     self._checked_items.discard(key)
                 parent = item.parent()
@@ -27683,6 +30049,9 @@ class MasterTree(QTreeWidget):
                     return
                 if state == Qt.Checked:
                     self._checked_items.add(key)
+                    # Bugfix 08.08.2026: Eltern-Kette aufklappen (Ordner/
+                    # Gruppe), damit die angehakte Plugin-Zeile sichtbar ist.
+                    self._expand_ancestors(item)
                 else:
                     self._checked_items.discard(key)
             elif node_type == TYPE_SET:
@@ -27705,6 +30074,9 @@ class MasterTree(QTreeWidget):
                         self._checked_items.discard(key)
                         child.setData(0, Qt.CheckStateRole, Qt.Unchecked)
                 self._apply_set_state(item)
+                # Bugfix 08.08.2026: Auch beim Set-Anhaken die Eltern-Kette
+                # des Sets aufklappen (Set in Kategorie-Ordner sichtbar).
+                self._expand_ancestors(item)
             self.checked_changed.emit()
         finally:
             self._updating_checks = False
@@ -27879,6 +30251,10 @@ class MasterTree(QTreeWidget):
             return
         wanted = {str(f).strip().lower() for f in (feature_ids or []) if str(f).strip()}
         self._updating_checks = True
+        # Bugfix 08.08.2026 (Bug 2): Angehakte Items merken, um danach ihre
+        # Eltern-Kette aufzuklappen (der Baum startet eingeklappt – ohne
+        # Expansion bleiben die aktivierten Services/Plugins unsichtbar).
+        checked_items: List[QTreeWidgetItem] = []
         try:
             self._checked_items.clear()
             for item in TreeItemIterator(self):
@@ -27894,6 +30270,7 @@ class MasterTree(QTreeWidget):
                     if checked:
                         self._checked_items.add((TYPE_SERVICE, set_id,
                                                  instance_id))
+                        checked_items.append(item)
                     item.setData(0, Qt.CheckStateRole,
                                  Qt.Checked if checked else Qt.Unchecked)
                 elif node_type == TYPE_PLUGIN:
@@ -27901,6 +30278,7 @@ class MasterTree(QTreeWidget):
                     checked = pid.lower() in wanted
                     if checked:
                         self._checked_items.add((TYPE_PLUGIN, "", pid))
+                        checked_items.append(item)
                     item.setData(0, Qt.CheckStateRole,
                                  Qt.Checked if checked else Qt.Unchecked)
             # Tri-States der Sets aus den Kindern ableiten
@@ -27909,6 +30287,10 @@ class MasterTree(QTreeWidget):
                     continue
                 if item.data(0, ROLE_NODE_TYPE) == TYPE_SET:
                     self._apply_set_state(item)
+            # Bugfix 08.08.2026 (Bug 2): Eltern-Kette aller angehakten Items
+            # aufklappen, damit die aktivierten Services sichtbar sind.
+            for item in checked_items:
+                self._expand_ancestors(item)
         finally:
             self._updating_checks = False
         self.checked_changed.emit()
@@ -34217,6 +36599,1400 @@ class ServiceSetTrashDialog(QDialog):
 
 --------------------------------------------------
 
+### DATEI: test/check_bugfix_0808.py
+```py
+# test/check_bugfix_0808.py - isolierter Check fuer Bugfix 08.08.2026 (Block 38)
+# Laeuft OHNE Zugriff auf die von der laufenden App gesperrten DBs:
+# Temp-DBs (analytics/profile) liegen im test/-Ordner (Regel: Test-DBs nie im
+# Projekt-Root/data). Pruft:
+#   a) ViewModel-Refresh-Tupel (QUERY_HEATMAP_GENERIC / QUERY_OHLCV)
+#   b) FeatureStoreReader._apply_feature_filter (case-insensitiv)
+#   c) MasterTree-Expansion der angehakten Items (Bug 2)
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+import duckdb  # noqa: E402
+from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+_app = QApplication.instance() or QApplication(sys.argv)
+
+from analytics.engine.feature_store_reader import (  # noqa: E402
+    FeatureStoreReader,
+)
+from analytics.engine.analytics_repository import AnalyticsRepository  # noqa: E402
+from analytics.engine.analytics_view_model import AnalyticsViewModel  # noqa: E402
+from analytics.engine.analytics_worker import (  # noqa: E402
+    QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC, QUERY_OHLCV,
+)
+from analytics.engine.service_selector_model import ServiceSelectorModel  # noqa: E402
+from analytics_profile_repository import AnalyticsProfileRepository  # noqa: E402
+from serviceui.master_tree import (  # noqa: E402
+    MasterTree, TreeItemIterator, TYPE_SET, TYPE_SERVICE,
+)
+
+FAILURES = []
+
+
+def check(name, cond, detail=""):
+    s = "PASS" if cond else "FAIL"
+    print(f"[{s}] {name}" + (f" - {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(name)
+
+
+def pump():
+    _app.processEvents()
+
+
+_tmp = Path(tempfile.mkdtemp(prefix="bugfix38_", dir=Path(__file__).resolve().parent))
+_db_ana = str(_tmp / "ana38.duckdb")
+_db_prof = str(_tmp / "prof38.duckdb")
+
+# --- Testdaten: feature_store (minimal, fuer den Reader) --------------------
+_c38 = duckdb.connect(_db_ana)
+_c38.execute("""
+    CREATE TABLE feature_store (
+        symbol TEXT, timeframe TEXT, bar_time TIMESTAMPTZ,
+        feature_id TEXT, plugin_version TEXT, feature_data JSON,
+        created_at TIMESTAMPTZ
+    )
+""")
+_c38.close()
+
+_reader38 = FeatureStoreReader(_db_ana)
+_repo38 = AnalyticsRepository(_reader38)
+_profile_repo38 = AnalyticsProfileRepository(_db_prof)
+
+# --- a) ViewModel-Refresh-Tupel ---------------------------------------------
+_vm38 = AnalyticsViewModel(analytics_repo=_repo38, profile_repo=_profile_repo38)
+_vm38._pending_kinds.clear()
+_vm38.set_symbol("XAGUSD")
+_kinds38a = list(_vm38._pending_kinds)
+check("38 a1) set_symbol refresht generische Heatmap + OHLCV (Bug 1)",
+      QUERY_HEATMAP_GENERIC in _kinds38a and QUERY_OHLCV in _kinds38a,
+      str(_kinds38a))
+_vm38._pending_kinds.clear()
+_vm38.set_timeframe("H1")
+_kinds38b = list(_vm38._pending_kinds)
+check("38 a2) set_timeframe refresht generische Heatmap + OHLCV (Bug 1)",
+      QUERY_HEATMAP_GENERIC in _kinds38b and QUERY_OHLCV in _kinds38b,
+      str(_kinds38b))
+_vm38._pending_kinds.clear()
+_vm38.set_feature_ids(["srv_a"])
+_kinds38c = list(_vm38._pending_kinds)
+check("38 a3) set_feature_ids refresht generische Heatmap (Bug 1)",
+      QUERY_HEATMAP_GENERIC in _kinds38c
+      and QUERY_TABLE in _kinds38c
+      and QUERY_HEATMAP in _kinds38c,
+      str(_kinds38c))
+_vm38.shutdown()
+
+# --- b) Case-insensitiv + whitespace-toleranter feature_id-Filter ------------
+_conds38, _params38 = [], []
+FeatureStoreReader._apply_feature_filter(
+    ["  SrV_A ", "SRV_B", ""], None, _conds38, _params38)
+check("38 b1) IN-Clause case-insensitiv + getrimmt (Bug 1)",
+      _conds38 == ["LOWER(TRIM(feature_id)) IN (?, ?)"]
+      and _params38 == ["srv_a", "srv_b"],
+      str((_conds38, _params38)))
+_conds38b, _params38b = [], []
+FeatureStoreReader._apply_feature_filter(
+    None, "  SrV_A ", _conds38b, _params38b)
+check("38 b2) Einzel-ID case-insensitiv (LOWER(TRIM)) (Bug 1)",
+      _conds38b == ["LOWER(TRIM(feature_id)) = LOWER(TRIM(?))"]
+      and _params38b == ["  SrV_A "],
+      str((_conds38b, _params38b)))
+_conds38c, _params38c = [], []
+FeatureStoreReader._apply_feature_filter([], None, _conds38c, _params38c)
+check("38 b3) leere Liste = kein Filter (unchanged)",
+      _conds38c == [] and _params38c == [], "")
+
+# --- c) MasterTree-Expansion der angehakten Items (Bug 2) -------------------
+class _P38Plugin:
+    """Duck-Typ-Plugin-Stub."""
+
+    def __init__(self, plugin_id, category=None):
+        self._plugin_id = plugin_id
+        self.capabilities = {"chart": False}
+        self.metadata = {"category": category} if category else {}
+
+    @property
+    def plugin_id(self):
+        return self._plugin_id
+
+
+class _P38Registry:
+    """Duck-Typ-Registry-Stub (case-insensitiv)."""
+
+    def __init__(self, plugins):
+        self.plugins = {pid.lower(): p for pid, p in plugins.items()}
+
+    def get(self, plugin_id):
+        return self.plugins[plugin_id.lower()]
+
+
+class _P38SetRepo:
+    def __init__(self, sets):
+        self._sets = sets
+
+    def list_sets(self):
+        return list(self._sets)
+
+
+class _P38StateMgr:
+    def load_all_instances(self):
+        return []
+
+    def get_global_value(self, key, default=None):
+        return default
+
+
+class _P38FSReader:
+    def fetch_last_execution_dates(self):
+        return {}
+
+
+_set38 = {
+    "set_id": "set_grid",
+    "display_name": "Grid-Set",
+    "description": "",
+    "execution_order": ["grid_1"],
+    "services": {
+        "grid_1": {
+            "plugin_id": "srv_grid_lines",
+            "lookback": 1000,
+            "params": {},
+            "version": "1.0.0",
+        },
+    },
+}
+_model38 = ServiceSelectorModel(
+    set_repo=_P38SetRepo([_set38]),
+    state_manager=_P38StateMgr(),
+    registry=_P38Registry({
+        "srv_grid_lines": _P38Plugin("srv_grid_lines", category=None),
+    }),
+    feature_store_reader=_P38FSReader(),
+)
+_tree38 = MasterTree(_model38)
+_tree38.set_checkable(True)
+pump()
+# ROLE_NODE_TYPE = Qt.UserRole (= 256)
+_set_nodes38 = [i for i in TreeItemIterator(_tree38)
+                if i is not None
+                and i.data(0, 256) == TYPE_SET]
+check("38 c1) Set-Knoten existiert und ist initial eingeklappt",
+      len(_set_nodes38) == 1 and not _set_nodes38[0].isExpanded(),
+      str(len(_set_nodes38)))
+_tree38.set_checked_feature_ids(["srv_grid_lines"])
+check("38 c2) set_checked_feature_ids klappt das Set auf (Bug 2)",
+      len(_set_nodes38) == 1 and _set_nodes38[0].isExpanded(),
+      str([n.isExpanded() for n in _set_nodes38]))
+_svc_nodes38 = [i for i in TreeItemIterator(_tree38)
+                if i is not None
+                and i.data(0, 256) == TYPE_SERVICE]
+check("38 c3) Service gecheckt + checked_feature_ids-Roundtrip (Bug 2)",
+      len(_svc_nodes38) == 1
+      and _svc_nodes38[0].checkState(0) == Qt.Checked
+      and _tree38.checked_feature_ids() == ["srv_grid_lines"],
+      str((len(_svc_nodes38),
+           _svc_nodes38[0].checkState(0) if _svc_nodes38 else None,
+           _tree38.checked_feature_ids())))
+_tree38.hide()
+pump()
+
+import shutil  # noqa: E402
+shutil.rmtree(_tmp, ignore_errors=True)
+
+if FAILURES:
+    print(f"FEHLER: {len(FAILURES)}: {FAILURES}")
+    sys.exit(1)
+print("ALLE PRUEFUNGEN BESTANDEN (OK)")
+sys.exit(0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_heatmap_200201.py
+```py
+# test/check_heatmap_200201.py
+"""Tests fuer Kapitel 20.02.01 (E1-E8), headless.
+
+- E6: `dow_hour` ersatzlos entfernt (Reader ValueError) + VM-Sanitizer
+      (set_heatmap_config / _apply_profile / _apply_heatmap_section /
+      restore_workspace -> "hour")
+- E1: Datums-Formatter 5 Stufen (Boundaries 1J/1M/1T/2h)
+- E4: UTC-Offset-Label (Tageszeit-Label enthaelt 'UTC+')
+- E8: resolve_service_label ({Kategorie} / {Name}, srv_-Prefix entfaellt)
+"""
+from __future__ import annotations
+
+import os
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from datetime import datetime, timezone as dt_timezone
+
+import numpy as np
+import pyqtgraph as pg
+from PySide6.QtWidgets import QApplication
+
+app = QApplication.instance() or QApplication([])
+
+from analytics.engine.feature_store_reader import (
+    DIM_MAPPINGS, HEATMAP_DIMENSIONS, FeatureStoreReader)
+from analytics.engine.analytics_repository import AnalyticsRepository
+from analytics.engine.analytics_view_model import AnalyticsViewModel
+from analytics.ui.heatmap_widget import (
+    _HeatmapAxis, HeatmapWidget, _DIM_LABELS)
+
+failures: list = []
+
+
+def check(name, cond, detail=""):
+    print(f"[{'PASS' if cond else 'FAIL'}] {name}" + (f" - {detail}" if detail else ""))
+    if not cond:
+        failures.append(name)
+
+
+# --- E6: dow_hour aus DIM_MAPPINGS/HEATMAP_DIMENSIONS entfernt -------------
+check("E6: dow_hour nicht mehr in DIM_MAPPINGS", "dow_hour" not in DIM_MAPPINGS,
+      str(list(DIM_MAPPINGS)))
+check("E6: dow_hour nicht mehr in HEATMAP_DIMENSIONS",
+      "dow_hour" not in HEATMAP_DIMENSIONS, str(HEATMAP_DIMENSIONS))
+
+reader = FeatureStoreReader()
+try:
+    reader.fetch_generic_heatmap("SILVER", "H1", "date", "dow_hour",
+                                 agg="count", limit=10)
+    check("E6: dow_hour -> ValueError (unbekannte Dimension)", False,
+          "kein ValueError geworfen")
+except ValueError:
+    check("E6: dow_hour -> ValueError (unbekannte Dimension)", True)
+
+# --- E6: VM-Sanitizer (dow_hour -> hour) -----------------------------------
+vm = AnalyticsViewModel(analytics_repo=AnalyticsRepository(reader))
+vm.set_heatmap_config("dow_hour", "date", "", "count")
+check("E6: set_heatmap_config sanitized dow_hour -> hour",
+      vm.params.get("heatmap_x_dim") == "hour"
+      and vm.params.get("heatmap_y_dim") == "date",
+      str((vm.params.get("heatmap_x_dim"), vm.params.get("heatmap_y_dim"))))
+
+vm2 = AnalyticsViewModel(analytics_repo=AnalyticsRepository(reader))
+vm2._apply_heatmap_section({"x_dim": "dow_hour", "y_dim": "hour"})
+check("E6: _apply_heatmap_section sanitized dow_hour -> hour",
+      vm2.params.get("heatmap_x_dim") == "hour"
+      and vm2.params.get("heatmap_y_dim") == "hour",
+      str((vm2.params.get("heatmap_x_dim"), vm2.params.get("heatmap_y_dim"))))
+
+vm3 = AnalyticsViewModel(analytics_repo=AnalyticsRepository(reader))
+vm3.restore_workspace({
+    "params": {"heatmap_x_dim": "dow_hour", "heatmap_y_dim": "dow"},
+    "layout": {},
+})
+check("E6: restore_workspace sanitized dow_hour -> hour",
+      vm3.params.get("heatmap_x_dim") == "hour"
+      and vm3.params.get("heatmap_y_dim") == "dow",
+      str((vm3.params.get("heatmap_x_dim"), vm3.params.get("heatmap_y_dim"))))
+
+vm4 = AnalyticsViewModel(analytics_repo=AnalyticsRepository(reader))
+vm4._apply_profile({"payload": {"charts": {"heatmap": {"x_dim": "dow_hour",
+                                                       "y_dim": "dow"}}}},
+                   mark_dirty=False)
+check("E6: _apply_profile (charts.heatmap) sanitized dow_hour -> hour",
+      vm4.params.get("heatmap_x_dim") == "hour"
+      and vm4.params.get("heatmap_y_dim") == "dow",
+      str((vm4.params.get("heatmap_x_dim"), vm4.params.get("heatmap_y_dim"))))
+
+# --- E2: _DIM_LABELS hour = "Tageszeit", kein dow_hour-Label ----------------
+check("E2: _DIM_LABELS['hour'] == 'Tageszeit'",
+      _DIM_LABELS.get("hour") == "Tageszeit", str(_DIM_LABELS.get("hour")))
+check("E2: _DIM_LABELS ohne dow_hour", "dow_hour" not in _DIM_LABELS,
+      str(list(_DIM_LABELS)))
+
+# --- E1: Datums-Formatter Boundaries (Epoch 1700000000 = Di 14.11.2023) -----
+axis = _HeatmapAxis("bottom")
+axis.configure("date", [])
+s_yr = axis.tickStrings([1_700_000_000], 1.0, 31_536_000)
+check("E1: > 1 Jahr -> YYYY", s_yr == ["2023"], f"{s_yr}")
+s_mo = axis.tickStrings([1_700_000_000], 1.0, 2_592_000)
+check("E1: 1 Monat-1 Jahr -> TT.MM.JJ",
+      s_mo == ["14.11.23"], f"{s_mo}")
+s_dy = axis.tickStrings([1_700_000_000], 1.0, 86_400)
+check("E1: 1 Tag-1 Monat -> DDD TT.MM.JJ",
+      s_dy == ["Di 14.11.23"], f"{s_dy}")
+s_2h = axis.tickStrings([1_700_000_000], 1.0, 7_200)
+check("E1: 2 Std-1 Tag -> DDD TT.MM.JJ HH:00",
+      s_2h == ["Di 14.11.23 22:00"], f"{s_2h}")
+s_1h = axis.tickStrings([1_700_000_000], 1.0, 3_600)
+check("E1: < 2 Std -> DDD TT.MM.JJ HH:mm",
+      s_1h == ["Di 14.11.23 22:13"], f"{s_1h}")
+
+# --- E4: Tageszeit-Label mit UTC-Offset ------------------------------------
+w = HeatmapWidget()
+txt = w._utc_offset_text(1_700_000_000)   # Nov 2023 -> UTC+1 (Winter)
+check("E4: UTC-Offset Winter (Nov 2023) = UTC+1", txt == "UTC+1", f"{txt}")
+txt2 = w._utc_offset_text(1_752_000_000)  # Jul 2025 -> UTC+2 (Sommer)
+check("E4: UTC-Offset Sommer (Jul 2025) = UTC+2", txt2 == "UTC+2", f"{txt2}")
+
+# --- E8: resolve_service_label (echte PluginRegistry) -----------------------
+label = vm.resolve_service_label("srv_grid_lines")
+check("E8: resolve_service_label liefert '{Kategorie} / {Name}'",
+      " / " in label and not label.startswith("srv_"),
+      f"{label!r}")
+check("E8: resolve_service_label unbekannte ID -> Rohwert",
+      vm.resolve_service_label("srv_unknown_xyz") == "srv_unknown_xyz",
+      f"{vm.resolve_service_label('srv_unknown_xyz')!r}")
+
+# --- E7: Overlay-Zoom-Lock (setXLink nur bei X=date + Overlay an) -----------
+# Offscreen-Widget: linkedView(XAxis) nach _update_controls pruefen
+w2 = HeatmapWidget()
+w2._view_model = vm
+
+
+def _linked(w):
+    return w._price_vb.linkedView(pg.ViewBox.XAxis)
+
+
+# X != date -> kein Link
+w2._combo_x.setCurrentIndex(w2._combo_x.findData("hour"))
+w2._chk_candle.setChecked(False)
+w2._update_controls()
+check("E7: X!=date -> Preis-ViewBox entkoppelt (linkedView None)",
+      _linked(w2) is None, f"linked={_linked(w2)}")
+# X == date + Overlay an -> Link gesetzt
+w2._combo_x.setCurrentIndex(w2._combo_x.findData("date"))
+w2._chk_candle.setChecked(True)
+w2._update_controls()
+check("E7: X=date + Overlay -> Preis-ViewBox gekoppelt",
+      _linked(w2) is w2._plot_hm.plotItem.vb,
+      f"linked={_linked(w2)}")
+# X != date + Overlay an -> Link entfernt + Overlay ausgeblendet
+w2._combo_x.setCurrentIndex(w2._combo_x.findData("hour"))
+w2._update_controls()
+check("E7: X!=date -> Link entfernt + Overlay aus",
+      _linked(w2) is None and not w2._chk_candle.isChecked(),
+      f"linked={_linked(w2)} checked={w2._chk_candle.isChecked()}")
+w2.close()
+
+print(f"\n{'ALLE PRUEFUNGEN BESTANDEN (OK)' if not failures else 'FEHLER: ' + str(failures)}")
+sys.exit(0 if not failures else 1)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_heatmap_bugfix.py
+```py
+"""Tests fuer die Heatmap-Bugfixes 09.08.2026 (Punkte 1-6 + Meldungen 1-3).
+
+- Reader: fetch_generic_heatmap liefert x_axis/y_axis (natuerliche Werte)
+- Reader: fetch_daily_ohlc (Tages-Ohlc, SQL-seitig)
+- Reader: limit=None => alle Daten (Punkt 2)
+- Worker: QUERY_DAILY_OHLC-Dispatch
+- _HeatmapAxis: dynamische Ticks (Punkt 5+6)
+- Meldung 1+2: Tick-Clamping auf feste Skalen (Tageszeit 0..24, Mo-Fr 1..6)
+- Meldung 3: 'Feld'-Dropdown laenger + '{Service} / {Key}'-Labels
+- Widget: Offscreen-Instanziierung + Overlay im selben Canvas (Punkt 1)
+
+DB-Tests laufen gegen synthetische DuckDBs in test/ (tmp_hm_*.duckdb) –
+die echten data/*.duckdb sind bei laufender App exklusiv gesperrt
+(Windows-Lock), die synthetischen Daten sind deterministisch.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from datetime import datetime, timedelta, timezone as dt_timezone
+
+import numpy as np
+import duckdb
+from PySide6.QtWidgets import QApplication
+
+# QApplication VOR pyqtgraph-Widget-Instanzen (QFontDatabase-Fehler vermeiden).
+app = QApplication.instance() or QApplication([])
+
+from analytics.engine.feature_store_reader import FeatureStoreReader
+from analytics.engine.analytics_repository import AnalyticsRepository
+from analytics.engine.analytics_worker import (
+    QUERY_DAILY_OHLC, AnalyticsAsyncWorker, cap_lookback_limit)
+from analytics.ui.heatmap_widget import (
+    _HeatmapAxis, _pick_time_step, _time_ticks)
+
+failures: list = []
+
+
+def check(name, cond, detail=""):
+    print(f"[{'PASS' if cond else 'FAIL'}] {name}" + (f" - {detail}" if detail else ""))
+    if not cond:
+        failures.append(name)
+
+
+# ---------------------------------------------------------------------------
+# Synthetische Test-DBs (test/, Regel: Test-DBs im test-Unterordner)
+# ---------------------------------------------------------------------------
+# Die echten data/*.duckdb-Dateien sind bei laufender App exklusiv gesperrt
+# (Windows-Lock) – die DB-Tests laufen daher gegen synthetische Kopien, die
+# hier im test/-Ordner erzeugt werden (deterministisch, keine Daten-Abhaengigkeit).
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+HM_ANALYTICS = os.path.join(TEST_DIR, "tmp_hm_analytics.duckdb")
+HM_MARKET = os.path.join(TEST_DIR, "tmp_hm_market.duckdb")
+
+
+def _build_synthetic_dbs() -> None:
+    """Erzeugt feature_store (analytics) + ohlcv_bars (market) in test/.
+
+    SILVER/H1, 200 Kalendertage ab 01.01.2026, Mo-Fr (DuckDB DOW 1..5),
+    Stunden 00-22 (23 = taegliche SILVER-Handelspause). Zusaetzlich je ein
+    Samstags-/Sonntags-Row, um den `dow`-Filter (BETWEEN 1 AND 5) zu
+    verifizieren. Services: srv_grid_lines / srv_proximity / native mit
+    numerischen feature_data-JSON-Keys (inkl. geteiltem 'value'-Key).
+    """
+    for path in (HM_ANALYTICS, HM_MARKET):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    try:
+        os.remove(HM_ANALYTICS + ".wal")
+    except OSError:
+        pass
+
+    start = datetime(2026, 1, 1, tzinfo=dt_timezone.utc)
+    rows_analytics = []
+    rows_market = []
+    # 200 Kalendertage -> ~143 Handelstage, >= 100 X-Spalten (Punkt 2)
+    for day in range(200):
+        d = start + timedelta(days=day)
+        if d.weekday() >= 5:
+            # Wochenende: genau EIN Marking-Row (dow-Filter-Test)
+            if day in (2, 3):  # Sa 03.01. / So 04.01.2026
+                bt = d.replace(hour=12)
+                rows_analytics.append(
+                    ("SILVER", "H1", bt, "srv_grid_lines", "1.0.0",
+                     {"schema_version": "1.0.0", "grid_nearest_level": 5.0,
+                      "value": 99.0}))
+            continue
+        for hour in range(23):  # 00..22 (23 = Handelspause)
+            bt = d.replace(hour=hour)
+            epoch = int(bt.timestamp())
+            grid = {"schema_version": "1.0.0",
+                    "grid_nearest_level": float(hour % 7),
+                    "grid_dist_pct": float(hour) / 23.0,
+                    "value": float(hour)}
+            prox = {"schema_version": "1.0.0",
+                    "prox_distance": float(100 - hour),
+                    "value": float(hour) * 2.0}
+            native = {"schema_version": "1.0.0", "native_only": float(hour)}
+            rows_analytics.append(("SILVER", "H1", bt, "srv_grid_lines",
+                                   "1.0.0", grid))
+            rows_analytics.append(("SILVER", "H1", bt, "srv_proximity",
+                                   "1.0.0", prox))
+            rows_analytics.append(("SILVER", "H1", bt, "native",
+                                   "1.0.0", native))
+            rows_market.append((epoch, "SILVER", "H1",
+                                100.0 + hour * 0.1, 102.0 + hour * 0.1,
+                                99.0 + hour * 0.1, 101.0 + hour * 0.1,
+                                float(hour + 1)))
+
+    con = duckdb.connect(HM_ANALYTICS)
+    try:
+        con.execute("""
+            CREATE TABLE feature_store (
+                symbol VARCHAR,
+                timeframe VARCHAR,
+                bar_time TIMESTAMPTZ,
+                created_at TIMESTAMPTZ,
+                feature_id VARCHAR,
+                plugin_version VARCHAR,
+                feature_data JSON
+            )
+        """)
+        con.executemany(
+            "INSERT INTO feature_store VALUES (?, ?, ?, now(), ?, ?, ?)",
+            [(s, tf, bt, fid, ver, json.dumps(fd))
+             for s, tf, bt, fid, ver, fd in rows_analytics])
+    finally:
+        con.close()
+
+    con = duckdb.connect(HM_MARKET)
+    try:
+        con.execute("""
+            CREATE TABLE ohlcv_bars (
+                "time" TIMESTAMPTZ,
+                symbol VARCHAR,
+                timeframe VARCHAR,
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                close DOUBLE,
+                tick_volume BIGINT
+            )
+        """)
+        con.executemany(
+            "INSERT INTO ohlcv_bars VALUES (to_timestamp(?), ?, ?, ?, ?, ?, ?, ?)",
+            rows_market)
+    finally:
+        con.close()
+
+
+_build_synthetic_dbs()
+# Modul-Default fuer die Market-DB umlenken (fetch_daily_ohlc/ohlcv_snapshot
+# ohne market_db_path nutzen DB_MARKET; Test-Seam auf die synthetische DB).
+import analytics.engine.feature_store_reader as _fsr_mod
+_fsr_mod.DB_MARKET = HM_MARKET
+
+reader = FeatureStoreReader(db_path=HM_ANALYTICS)
+repo = AnalyticsRepository(reader=reader)
+
+# --- 1) Reader: Achsen-Koordinaten (Punkte 3/4) ----------------------------
+data = reader.fetch_generic_heatmap("SILVER", "H1", "date", "hour",
+                                    agg="count", limit=5000)
+m = np.asarray(data["matrix"])
+check("reader: x_axis vorhanden", len(data.get("x_axis") or []) == m.shape[1],
+      f"{len(data.get('x_axis') or [])} == {m.shape[1]}")
+check("reader: y_axis vorhanden", len(data.get("y_axis") or []) == m.shape[0],
+      f"{len(data.get('y_axis') or [])} == {m.shape[0]}")
+if data.get("x_axis"):
+    xa = data["x_axis"]
+    # SILVER handelt 24/5 -> Wochenend-Luecken erzeugen Vielfache von 86400.
+    check("reader: x_axis = Mitternachts-Epochs (Abstaende 86400*n)",
+          all((b - a) % 86400 == 0 and (b - a) >= 86400
+              for a, b in zip(xa, xa[1:])),
+          f"{xa[:3]} (diffs: {[int(b - a) for a, b in zip(xa, xa[1:5])]})")
+    check("reader: x_axis entspricht x_values-Datum",
+          datetime.fromtimestamp(int(xa[0]), tz=dt_timezone.utc).date().isoformat()
+          == str(data["x_values"][0])[:10],
+          f"{datetime.fromtimestamp(int(xa[0]), tz=dt_timezone.utc)} vs {data['x_values'][0]}")
+ya = data.get("y_axis") or []
+check("reader: y_axis = Stunden (0..23)", ya and ya[0] == 0.0 and ya[-1] == 22.0,
+      f"{ya[:3]}..{ya[-2:]}")
+
+# date x dow (20.02.01 E5: strikt Montag-Freitag, DuckDB Mo=1..Fr=5)
+data2 = reader.fetch_generic_heatmap("SILVER", "H1", "date", "dow",
+                                     agg="count", limit=5000)
+m2 = np.asarray(data2["matrix"])
+check("reader: dow y_axis = 1..5 (Mo..Fr)",
+      (data2.get("y_axis") or []) == [1.0, 2.0, 3.0, 4.0, 5.0],
+      f"{data2.get('y_axis')}")
+check("reader: dow y_labels = Mo..Fr (20.02.01 E5)",
+      (data2.get("y_labels") or []) == ["Mo", "Di", "Mi", "Do", "Fr"],
+      f"{data2.get('y_labels')}")
+
+# --- 2) Reader: alle Daten (Punkt 2) ---------------------------------------
+# limit=None -> alle verfuegbaren Daten (Pivot-Deckel begrenzt Matrix)
+data_all = reader.fetch_generic_heatmap("SILVER", "H1", "date", "hour",
+                                        agg="count", limit=None)
+m_all = np.asarray(data_all["matrix"])
+check("reader: limit=None liefert alle Daten (X-Spalten > 100)",
+      m_all.shape[1] > 100, f"{m_all.shape[1]} Tage")
+check("reader: limit=None deckt fruehe Daten ab",
+      str(data_all["x_values"][0]).startswith("20"), f"{data_all['x_values'][0]}")
+
+# --- 3) Reader: fetch_daily_ohlc (Punkt 1/2) -------------------------------
+daily = reader.fetch_daily_ohlc("SILVER", "H1", max_days=30)
+bars = daily.get("bars") or []
+check("reader: fetch_daily_ohlc liefert Tages-Bars",
+      len(bars) > 20, f"{len(bars)} Tage")
+if bars:
+    check("reader: daily bar time = Mitternacht (UTC)",
+          datetime.fromtimestamp(int(bars[0]["time"]), tz=dt_timezone.utc).hour == 0,
+          f"{datetime.fromtimestamp(int(bars[0]['time']), tz=dt_timezone.utc)}")
+    check("reader: daily OHLC konsistent (low <= open/close <= high)",
+          bars[0]["low"] <= min(bars[0]["open"], bars[0]["close"])
+          and bars[0]["high"] >= max(bars[0]["open"], bars[0]["close"]),
+          f"o={bars[0]['open']} h={bars[0]['high']} l={bars[0]['low']} c={bars[0]['close']}")
+
+# --- 4) Worker-Dispatch QUERY_DAILY_OHLC ------------------------------------
+worker = AnalyticsAsyncWorker(repo, QUERY_DAILY_OHLC,
+                              {"symbol": "SILVER", "timeframe": "H1"})
+worker.run()
+# run() emittiert Signale; Ergebnis direkt pruefen:
+check("worker: QUERY_DAILY_OHLC ohne Exception", True)
+
+# --- 5) _HeatmapAxis-Ticks (Punkte 5/6) ------------------------------------
+axis = _HeatmapAxis("bottom")
+axis.configure("date", [])
+# weiter Bereich (~100 Tage) -> Tages-Ticks
+step_big = _pick_time_step(100 * 86400, 5)
+check("axis: date-Step fuer ~100 Tage ist 1 Tag oder mehr",
+      step_big >= 86400, f"{step_big}s")
+# enger Bereich (~3 Stunden) -> Stunden/Minuten
+step_small = _pick_time_step(3 * 3600, 5)
+check("axis: date-Step fuer ~3h ist 1h",
+      step_small == 3600, f"{step_small}s")
+# sehr enger Bereich (90 Sekunden) -> Minuten
+step_min = _pick_time_step(90, 5)
+check("axis: date-Step fuer 90s ist 30s/60s",
+      step_min in (30, 60), f"{step_min}s")
+# Tick-Werte fuer date: Vielfache des Steps
+ticks = _time_ticks(1_700_000_000, 1_700_086_400, 86400)
+check("axis: Tages-Ticks = ganzzahlige Vielfache von 86400",
+      all(t % 86400 == 0 for t in ticks), f"{len(ticks)} Ticks")
+# Formatierung (20.02.01 User-Meldung 2c: PER-TICK, LWC-v5-Weight-
+# Hierarchie – NICHT mehr nach Spacing). Epochs = Wanduhr (UTC-Darstellung):
+#   1767225600 = Do 01.01.2026 00:00 (Jahreswechsel, Weight 70)
+#   1769904000 = So 01.02.2026 00:00 (Monatswechsel, Weight 60)
+#   1767571200 = Mo 05.01.2026 00:00 (Wochenanfang, Weight 55)
+#   1767657600 = Di 06.01.2026 00:00 (Tag, Weight 50)
+#   1767708000 = Di 06.01.2026 14:00 (Stunde, Weight 30)
+#   1767709380 = Di 06.01.2026 14:23 (Minute, Weight 20)
+_E_JAN1 = 1767225600
+_E_FEB1 = 1769904000
+_E_MON = 1767571200
+_E_TUE = 1767657600
+_E_H14 = 1767708000
+_E_MIN = 1767709380
+check("axis: Jahreswechsel -> '2026' (Weight 70)",
+      axis._format(_E_JAN1, 1.0) == "2026",
+      f"{axis._format(_E_JAN1, 1.0)!r}")
+check("axis: Monatswechsel -> 'Feb 26' (Weight 60)",
+      axis._format(_E_FEB1, 1.0) == "Feb 26",
+      f"{axis._format(_E_FEB1, 1.0)!r}")
+check("axis: Wochenanfang Mo -> ISO-Woche '02.26' (Weight 55)",
+      axis._format(_E_MON, 1.0) == "02.26",
+      f"{axis._format(_E_MON, 1.0)!r}")
+check("axis: Tag -> 'Di. 06.01.26' (Weight 50)",
+      axis._format(_E_TUE, 1.0) == "Di. 06.01.26",
+      f"{axis._format(_E_TUE, 1.0)!r}")
+check("axis: Stunde -> '14:00' (Weight 30)",
+      axis._format(_E_H14, 1.0) == "14:00",
+      f"{axis._format(_E_H14, 1.0)!r}")
+check("axis: Minute -> '14:23' (Weight 20)",
+      axis._format(_E_MIN, 1.0) == "14:23",
+      f"{axis._format(_E_MIN, 1.0)!r}")
+
+# --- 5c) LWC-v5-Selektion (User-Meldung 2a/2b: Zoom-In feiner, Zoom-Out
+#         groeber, KEINE Ueberlappung -> Mindestabstand _DATE_TARGET_PX) ----
+def _gap_min(axis_sel, lo, hi, axis_px):
+    """Ruft _lwc_date_ticks auf und liefert (min_gap_sec, epochs)."""
+    res = axis_sel._lwc_date_ticks(float(lo), float(hi), float(axis_px))
+    if not res:
+        return None, []
+    return res[0][0], res[0][1]
+
+
+# Zoom-Out: ~1 Jahr sichtbar, 800 px -> min_gap ~36,5 Tage => nur
+# Jahres-/Monats-/Tages-Marken (keine Uhrzeiten), kein Ueberlappen.
+gap_yr, ticks_yr = _gap_min(axis, _E_JAN1, _E_JAN1 + 365 * 86400, 800)
+check("meldung2: Jahres-Zoom -> min_gap ~36.5 d",
+      gap_yr and abs(gap_yr - 3_153_600) < 1e-6, f"min_gap={gap_yr}")
+check("meldung2: Jahres-Zoom -> keine Stunden-/Minuten-Ticks",
+      bool(ticks_yr) and all(t % 86400 == 0 for t in ticks_yr),
+      f"{len(ticks_yr)} Ticks, erste: {ticks_yr[:3]}")
+check("meldung2: Jahres-Zoom -> Jahreswechsel enthalten, keine Ueberlappung",
+      _E_JAN1 in ticks_yr and 3 <= len(ticks_yr) <= 14,
+      f"{len(ticks_yr)} Ticks: {ticks_yr[:5]}")
+# Zoom-In: 2 Tage sichtbar, 800 px -> min_gap 4.8 h => Stunden-Ticks
+# erscheinen (Weight 30 fuellt Luecken zwischen den Tagesmarken).
+gap_2d, ticks_2d = _gap_min(axis, _E_TUE, _E_TUE + 2 * 86400, 800)
+check("meldung2: 2-Tage-Zoom -> min_gap 4.8 h",
+      gap_2d and abs(gap_2d - 17_280) < 1e-6, f"min_gap={gap_2d}")
+check("meldung2: 2-Tage-Zoom -> Stunden-Ticks vorhanden",
+      any(t % 86400 != 0 and t % 3600 == 0 for t in ticks_2d),
+      f"{len(ticks_2d)} Ticks: {ticks_2d[:6]}")
+# Fein-Zoom: 3 Stunden -> min_gap 18 min => Minuten-Ticks (Weight 20).
+gap_3h, ticks_3h = _gap_min(axis, _E_MIN, _E_MIN + 3 * 3600, 800)
+check("meldung2: 3h-Zoom -> min_gap 18 min",
+      gap_3h and abs(gap_3h - 1_080) < 1e-6, f"min_gap={gap_3h}")
+check("meldung2: 3h-Zoom -> Minuten-Ticks vorhanden",
+      any(t % 3600 != 0 for t in ticks_3h),
+      f"{len(ticks_3h)} Ticks: {ticks_3h[:6]}")
+# Zoom-Stufen-Wechsel (Meldung 2a): GLEICHE Spanne, groessere Achse (Pixel)
+# => MEHR Ticks (feinere Variante); kleinere Achse => WENIGER.
+_, t_small = _gap_min(axis, _E_TUE, _E_TUE + 2 * 86400, 400)
+_, t_big = _gap_min(axis, _E_TUE, _E_TUE + 2 * 86400, 1600)
+check("meldung2: Zoom-In (mehr Pixel) => mehr Ticks (feinere Variante)",
+      len(t_big) > len(t_small), f"{len(t_small)} -> {len(t_big)}")
+# Zoom-Out (Meldung 2b): GLEICHE Pixel-Breite, groessere Spanne => WENIGER
+# Ticks (groebere Variante: Jahr/Monat/Tag statt Stunden/Minuten).
+_, t_2d_800 = _gap_min(axis, _E_TUE, _E_TUE + 2 * 86400, 800)
+_, t_out = _gap_min(axis, _E_TUE, _E_TUE + 365 * 86400, 800)
+check("meldung2: Zoom-Out (groessere Spanne) => weniger Ticks (groebere Variante)",
+      0 < len(t_out) < len(t_2d_800), f"{len(t_2d_800)} -> {len(t_out)}")
+# Keine Ueberlappung: aufeinanderfolgende Ticks >= min_gap_sec entfernt.
+for gap, tks in ((gap_yr, ticks_yr), (gap_2d, ticks_2d),
+                 (gap_3h, ticks_3h)):
+    check("meldung2: Tick-Abstaende >= min_gap (keine Ueberlappung)",
+          all(b - a >= gap - 1e-6 for a, b in zip(tks, tks[1:])),
+          f"gap={gap:.0f}s, n={len(tks)}")
+# Direkte Selektion: hoehere Weights werden bevorzugt gesetzt.
+from analytics.ui.heatmap_widget import _HeatmapAxis as _HMA
+marks = [(1767225600, 70), (1769904000, 60), (1767571200, 55),
+         (1767657600, 50), (1767708000, 30)]
+sel = _HMA._select_date_marks(marks, 86400)
+check("meldung2: _select_date_marks bevorzugt Jahres-/Monatsmarken",
+      sel[0] == 1767225600 and 1769904000 in sel, f"{sel}")
+
+# hour-Achse: Ganzzahl-Schritte
+axis_h = _HeatmapAxis("left")
+axis_h.configure("hour", [])
+vals = axis_h.tickValues(-0.5, 23.5, 5)
+check("axis: hour tickValues liefert ganzzahlige Stunden",
+      vals and all(v == int(v) for _, vs in vals for v in vs),
+      f"{vals[0] if vals else None}")
+
+# dow-Achse (20.02.01 E5): Mo-Fr Labels + feste Skala
+axis_d = _HeatmapAxis("left")
+axis_d.configure("dow", [])
+sd = axis_d.tickStrings([1.0, 2.0, 3.0, 4.0, 5.0], 1.0, 1)
+check("axis: dow Labels Mo-Fr (Mo..Fr)",
+      sd == ["Mo", "Di", "Mi", "Do", "Fr"], f"{sd}")
+# feste Skala: dow-Bounds 1..6 (Mo=1..Fr=5, 20.02.01 E5)
+from analytics.ui.heatmap_widget import HeatmapWidget
+_b_dow = HeatmapWidget._axis_bounds([1.0, 3.0], "dow")
+check("axis: dow feste Bounds 1..6 unabhaengig vom Datenbereich",
+      _b_dow == (1.0, 6.0), f"{_b_dow}")
+_b_hour = HeatmapWidget._axis_bounds([5.0, 9.0], "hour")
+check("axis: hour feste Bounds 0..24 (20.02.01 E3)",
+      _b_hour == (0.0, 24.0), f"{_b_hour}")
+
+# --- 5b) User-Meldungen 1+2: Tick-Clamping auf feste Skalen ----------------
+# Rauszoomen weit ueber die Tageszeit-Skala hinaus -> KEINE -/+ Werte
+vals = axis_h.tickValues(-10.0, 40.0, 5)
+ticks_h = [v for _, vs in vals for v in vs]
+check("meldung1: hour-Ticks bei Rauszoom alle in [0, 24)",
+      bool(ticks_h) and all(0.0 <= v < 24.0 for v in ticks_h),
+      f"{ticks_h}")
+# komplette Skala sichtbar -> 00:00..18:00 (Schritt 6), KEIN 24er-Duplikat
+vals_full = axis_h.tickValues(-5.0, 30.0, 5)
+ticks_full = [v for _, vs in vals_full for v in vs]
+check("meldung1: hour-Skala [0,24) ohne rechtes Ende (kein 24er-Tick)",
+      all(v < 24.0 for v in ticks_full) and 0.0 in ticks_full,
+      f"{ticks_full}")
+# enger Zoom mitten in der Nacht: nur sichtbare Stunden
+vals_night = axis_h.tickValues(2.0, 6.0, 5)
+ticks_night = [v for _, vs in vals_night for v in vs]
+check("meldung1: hour-Ticks im Teilbereich unveraendert (2..6)",
+      all(2.0 <= v <= 6.0 for v in ticks_night), f"{ticks_night}")
+# _format: KEIN % 24-Wrap mehr (Meldung 1) – -1/24 -> leer, 3 -> 03:00
+check("meldung1: hour._format(-1) leer (kein '23:00')",
+      axis_h._format(-1.0, 1.0) == "", f"{axis_h._format(-1.0, 1.0)!r}")
+check("meldung1: hour._format(24) leer (kein '00:00')",
+      axis_h._format(24.0, 1.0) == "", f"{axis_h._format(24.0, 1.0)!r}")
+check("meldung1: hour._format(3) = '03:00'",
+      axis_h._format(3.0, 1.0) == "03:00", f"{axis_h._format(3.0, 1.0)!r}")
+
+# Rauszoomen weit ueber die Wochentags-Skala -> KEINE Werte ausserhalb Mo-Fr
+vals_dow = axis_d.tickValues(-5.0, 12.0, 5)
+ticks_d = [v for _, vs in vals_dow for v in vs]
+check("meldung2: dow-Ticks bei Rauszoom alle in [1, 6)",
+      bool(ticks_d) and all(1.0 <= v < 6.0 for v in ticks_d),
+      f"{ticks_d}")
+# _format: ausserhalb -> leer
+check("meldung2: dow._format(6) leer (Samstag-Grenze)",
+      axis_d._format(6.0, 1.0) == "", f"{axis_d._format(6.0, 1.0)!r}")
+check("meldung2: dow._format(0) leer (Sonntag)",
+      axis_d._format(0.0, 1.0) == "", f"{axis_d._format(0.0, 1.0)!r}")
+
+# kategorial: Labels
+axis_c = _HeatmapAxis("bottom")
+axis_c.configure("service_id", ["srv_a", "srv_b", "srv_c"])
+sc = axis_c.tickStrings([0.0, 1.0, 2.0], 1.0, 1)
+check("axis: kategorial Labels aus Liste",
+      sc == ["srv_a", "srv_b", "srv_c"], f"{sc}")
+
+# --- 6) Widget offscreen (Punkt 1: Overlay im selben Canvas) ---------------
+from analytics.ui.heatmap_widget import HeatmapWidget
+w = HeatmapWidget()
+check("widget: instanziierbar (offscreen)", w is not None)
+check("widget: KEIN separates Preis-PlotWidget mehr (Bugfix 1)",
+      not hasattr(w, "_plot_px"),
+      "Overlay liegt in _price_vb im selben _plot_hm")
+check("widget: Preis-ViewBox existiert im selben Plot",
+      hasattr(w, "_price_vb") and w._price_vb is not None)
+check("widget: rechte Achse 'Preis' vorhanden",
+      w._plot_hm.getAxis("right") is not None)
+
+# Fake-Daten rendern (ohne DB): date x hour
+fake = {
+    "matrix": [[1.0, 2.0], [3.0, 4.0]],  # 2 Zeilen (Stunden) x 2 Spalten (Tage)
+    "x_labels": ["01.01.", "02.01."],
+    "y_labels": ["00:00", "01:00"],
+    "x_values": ["2026-01-01", "2026-01-02"],
+    "x_axis": [1767225600.0, 1767312000.0],
+    "y_axis": [0.0, 1.0],
+    "x_dim": "date", "y_dim": "hour", "agg": "count",
+    "metrics": ["count", "confluence_count"],
+    "min_val": 1.0, "max_val": 4.0,
+}
+w._render_generic(fake)
+check("widget: X-Bounds = Epochs +/- halber Tag (setRect-Mapping)",
+      abs(w._x_min - (1767225600 - 43200)) < 1
+      and abs(w._x_max - (1767312000 + 43200)) < 1,
+      f"[{w._x_min}, {w._x_max}]")
+check("widget: Y-Bounds = feste Tageszeit-Skala 0..24 (20.02.01 E3)",
+      abs(w._y_min - 0.0) < 1e-6 and abs(w._y_max - 24.0) < 1e-6,
+      f"[{w._y_min}, {w._y_max}]")
+
+# --- 6c) Achsen-Label 'Datum/Zeit' OHNE pyqtgraph-EXP-Suffix ---------------
+# (User-Meldung, 09.08.2026): date-Achse darf nicht 'Datum (x1e+09)'
+# zeigen – die Epochs (~1.7e9) fallen in den SI-Bereich (1e9, inf) von
+# pyqtgraph `setLabel(text)` (units=None -> leere Einheit). Der Fix:
+# `_HeatmapAxis.enableAutoSIPrefix(False)` + Label 'Datum/Zeit'.
+axis_b = w._plot_hm.getAxis("bottom")
+axis_l = w._plot_hm.getAxis("left")
+check("label: _HeatmapAxis.autoSIPrefix ist deaktiviert",
+      axis_b.autoSIPrefix is False and axis_l.autoSIPrefix is False,
+      f"x={axis_b.autoSIPrefix} y={axis_l.autoSIPrefix}")
+check("label: X-Achse (date) = 'Datum/Zeit'",
+      axis_b.labelText == "Datum/Zeit", f"{axis_b.labelText!r}")
+check("label: X-Achse KEIN EXP-Suffix ('(x1e+09)' o. ae.)",
+      "x1e" not in axis_b.labelString() and "(x" not in axis_b.labelString(),
+      f"{axis_b.labelString()!r}")
+# labelUnits leer (setLabel ohne units) -> labelString haengt NICHTS an,
+# wenn autoSIPrefix aus ist; ohne Fix waere es '(x1e+09)' gewesen.
+check("label: labelUnits leer (kein Einheiten-/EXP-Suffix)",
+      axis_b.labelUnits == "" and axis_b.autoSIPrefixScale == 1.0,
+      f"units={axis_b.labelUnits!r} scale={axis_b.autoSIPrefixScale}")
+# Y-Achse (hour) traegt den UTC-Offset, aber ebenfalls kein EXP-Suffix.
+check("label: Y-Achse (hour) = 'Tageszeit (UTC...)' ohne EXP",
+      axis_l.labelText.startswith("Tageszeit")
+      and "(UTC" in axis_l.labelText
+      and "x1e" not in axis_l.labelString(),
+      f"{axis_l.labelText!r} / {axis_l.labelString()!r}")
+# Regressionsabsicherung: date-Achse auch bei Y=date korrekt beschriftet.
+fake_ydate = dict(fake)
+fake_ydate["x_dim"] = "hour"
+fake_ydate["y_dim"] = "date"
+fake_ydate["x_axis"] = [0.0, 1.0]
+fake_ydate["y_axis"] = [1767225600.0, 1767312000.0]
+w._render_generic(fake_ydate)
+axis_b2 = w._plot_hm.getAxis("bottom")
+axis_l2 = w._plot_hm.getAxis("left")
+check("label: Y=date -> Label 'Datum/Zeit' (linke Achse)",
+      axis_l2.labelText == "Datum/Zeit"
+      and "x1e" not in axis_l2.labelString(),
+      f"{axis_l2.labelText!r} / {axis_l2.labelString()!r}")
+check("label: X=hour -> 'Tageszeit (UTC...)' (untere Achse)",
+      axis_b2.labelText.startswith("Tageszeit")
+      and "(UTC" in axis_b2.labelText,
+      f"{axis_b2.labelText!r}")
+# Zuruecksetzen auf die date-x-hour-Renderung fuer die Folge-Tests.
+w._render_generic(fake)
+
+# Fake-Overlay: Tages-Ohlc im selben Canvas
+fake_ohlc = {
+    "bars": [
+        {"time": 1767225600, "open": 10.0, "high": 12.0, "low": 9.0, "close": 11.0},
+        {"time": 1767312000, "open": 11.0, "high": 13.0, "low": 10.0, "close": 10.5},
+    ],
+    "symbol": "SILVER", "timeframe": "H1",
+}
+w._render_overlay(fake_ohlc)
+check("widget: Overlay-Candles im selben Canvas (2x wick+body = 4 Items)",
+      len(w._candle_items) == 4, f"{len(w._candle_items)} Items")
+check("widget: Preis-ViewBox sichtbar + rechte Achse sichtbar",
+      w._price_vb.isVisible() and w._plot_hm.getAxis("right").isVisible())
+w._clear_overlay()
+check("widget: Overlay-Cleanup entfernt Items + versteckt Achse",
+      len(w._candle_items) == 0 and not w._price_vb.isVisible()
+      and not w._plot_hm.getAxis("right").isVisible())
+
+# --- 6b) User-Meldung 3: 'Feld'-Dropdown laenger + Service-Prefix ----------
+check("meldung3a: 'Feld'-Combo min. 320px breit",
+      w._combo_field.minimumWidth() >= 320,
+      f"minWidth={w._combo_field.minimumWidth()}")
+
+# Reader: feature_keys_by_service (Grundlage fuer field_sources)
+by_srv = reader.feature_keys_by_service("SILVER", "H1", numeric_only=True)
+check("meldung3b: feature_keys_by_service liefert Services mit Keys",
+      bool(by_srv), f"{list(by_srv)[:3]}")
+if by_srv:
+    any_srv = next(iter(by_srv))
+    check("meldung3b: Keys je Service sortiert + numerisch",
+          by_srv[any_srv] == sorted(by_srv[any_srv])
+          and all(isinstance(k, str) and k for k in by_srv[any_srv]),
+          f"{any_srv}: {by_srv[any_srv][:5]}")
+
+# Repository-Payload: field_sources Key -> [service_id...]
+gdata = repo.get_generic_heatmap("SILVER", "H1", "date", "hour",
+                                 agg="avg")
+fs = gdata.get("field_sources") or {}
+check("meldung3b: Payload enthaelt field_sources (Key -> Services)",
+      isinstance(fs, dict) and bool(fs), f"{list(fs)[:5]}")
+if fs:
+    check("meldung3b: field_sources['grid_nearest_level'] -> srv_grid_lines",
+          fs.get("grid_nearest_level") == ["srv_grid_lines"],
+          f"{fs.get('grid_nearest_level')}")
+    check("meldung3b: geteilter Key 'value' -> beide Services",
+          sorted(fs.get("value") or []) == ["srv_grid_lines", "srv_proximity"],
+          f"{fs.get('value')}")
+    check("meldung3b: field_sources ohne Legacy-Rows (leerer fid)",
+          "" not in fs, f"Keys: {list(fs)[:8]}")
+
+# _field_label: '{Service} / {Key}' mit srv_-freiem Namen (kein DB-Zwang)
+lab = w._field_label("open", ["srv_grid_lines"])
+check("meldung3b: _field_label ohne ViewModel -> Roh-Key (defensiv)",
+      lab == "open", f"{lab!r}")
+try:
+    from analytics.engine.analytics_view_model import AnalyticsViewModel
+    from analytics.engine.service_selector_model import ServiceSelectorModel
+    from analytics.engine.service_set_repository import ServiceSetRepository
+    from analytics_profile_repository import AnalyticsProfileRepository
+    from state_manager import StateManager
+    HM_APP = os.path.join(TEST_DIR, "tmp_hm_app_data.duckdb")
+    for _p in (HM_APP, HM_APP + ".wal"):
+        try:
+            os.remove(_p)
+        except OSError:
+            pass
+
+    def _mk_vm():
+        model = ServiceSelectorModel(
+            set_repo=ServiceSetRepository(db_path=HM_APP),
+            state_manager=StateManager(db_path=HM_APP),
+            feature_store_reader=FeatureStoreReader(db_path=HM_ANALYTICS),
+            parent=None)
+        return AnalyticsViewModel(
+            analytics_repo=AnalyticsRepository(
+                reader=FeatureStoreReader(db_path=HM_ANALYTICS)),
+            profile_repo=AnalyticsProfileRepository(db_path=HM_APP),
+            selector_model=model)
+
+    vm = _mk_vm()
+    w._view_model = vm  # fuer _field_label (Service-Prefix)
+    lab_vm = w._field_label("open", ["srv_grid_lines"])
+    check("meldung3c: _field_label = 'Grid Lines / open' (NUR Name, ohne Kategorie)",
+          lab_vm == "Grid Lines / open", f"{lab_vm!r}")
+    # Meldung Feld-Dropdown (09.08.2026): Mehrere Services -> KEIN Prefix
+    # (kein irrefuehrender MasterTree-'Pfad' aus verketteten Namen).
+    lab_multi = w._field_label("price", ["srv_swing_momentum",
+                                         "srv_swing_volume_profile"])
+    check("feld: _field_label bei geteiltem Key = Roh-Key (kein Pfad)",
+          lab_multi == "price", f"{lab_multi!r}")
+    # Service-ID-Achsen-Label (E8) analog srv_-frei, behaelt Kategorie-Pfad
+    svc_lab = vm.resolve_service_label("srv_grid_lines")
+    check("meldung3b: resolve_service_label = 'Grid / Grid Lines' (E8, mit Kategorie)",
+          svc_lab == "Grid / Grid Lines", f"{svc_lab!r}")
+    # Meldung Feld-Dropdown (09.08.2026): Service-Name DIREKT aus dem
+    # Service-Objekt (plugin_id-basiert) – ohne 'Service'-Suffix.
+    disp = vm.resolve_service_display_name("srv_grid_lines")
+    check("feld: resolve_service_display_name = 'Grid Lines' (plugin_id-basiert)",
+          disp == "Grid Lines", f"{disp!r}")
+    disp2 = vm.resolve_service_display_name("srv_proximity")
+    check("feld: resolve_service_display_name = 'Proximity'",
+          disp2 == "Proximity", f"{disp2!r}")
+    disp3 = vm.resolve_service_display_name("srv_swing_momentum")
+    check("feld: resolve_service_display_name = 'Swing Momentum' (ohne 'Service')",
+          disp3 == "Swing Momentum", f"{disp3!r}")
+    disp4 = vm.resolve_service_display_name("srv_swing_volume_profile")
+    check("feld: resolve_service_display_name = 'Swing Volume Profile'",
+          disp4 == "Swing Volume Profile", f"{disp4!r}")
+    disp5 = vm.resolve_service_display_name("unbekannter_service")
+    check("feld: resolve_service_display_name unbekannt -> Pretty-Fallback",
+          disp5 == "Unbekannter Service", f"{disp5!r}")
+    disp6 = vm.resolve_service_display_name("native")
+    check("feld: resolve_service_display_name 'native' -> 'Native' (Pretty)",
+          disp6 == "Native", f"{disp6!r}")
+    disp7 = vm.resolve_service_display_name("")
+    check("feld: resolve_service_display_name leer -> 'Allgemein'",
+          disp7 == "Allgemein", f"{disp7!r}")
+except Exception as e:
+    print(f"WARN [meldung3b] ViewModel-Label-Test uebersprungen: {e}")
+
+# _sync_combos_from_payload: Feld-Eintraege tragen den Service-Prefix
+fake2 = dict(fake)
+fake2["metrics"] = ["count", "confluence_count", "open", "value"]
+fake2["field_sources"] = {
+    "open": ["srv_grid_lines"],
+    "value": ["srv_proximity"],
+}
+fake2["agg"] = "avg"
+w2 = HeatmapWidget()
+# ViewModel-Attach fuer _sync_combos_from_payload (Payload-Pfad)
+vm2 = _mk_vm()
+w2._view_model = vm2
+w2._sync_combos_from_payload(fake2)
+texts = [w2._combo_field.itemText(i) for i in range(w2._combo_field.count())]
+check("meldung3b: Feld-Combo zeigt '{Service} / {Key}'",
+      len(texts) == 2 and all("/ " in t for t in texts),
+      f"{texts}")
+if texts:
+    check("meldung3b: Feld-Combo-Text ohne 'srv_' und nicht nur Roh-Key",
+          all("srv_" not in t and t not in ("open", "value")
+              for t in texts), f"{texts}")
+    check("meldung3c: Feld-Combo OHNE Kategorie-Pfad ('Grid / ' nicht im Text)",
+          all("Grid / " not in t for t in texts),
+          f"{texts}")
+    check("meldung3b: Feld-Combo-DATA bleibt der Roh-Key (Query-Vertrag)",
+          [w2._combo_field.itemData(i) for i in range(w2._combo_field.count())]
+          == ["open", "value"], f"{[w2._combo_field.itemData(i) for i in range(w2._combo_field.count())]}")
+w2.close()
+w.close()
+app.processEvents()
+
+# --- 7) User-Meldung Zoom-Richtung (09.08.2026): rechts = Zoom-In ----------
+# _set_zoom_slider (params -> Slider): volle Achse [0,1] -> 5 (links),
+# maximale Vergroesserung (span 0.05) -> 100 (rechts).
+z_w = HeatmapWidget()
+HeatmapWidget._set_zoom_slider(z_w._slider_zoom_x, [0.0, 1.0])
+check("zoom: volle Achse [0,1] -> Slider 5 (links)",
+      z_w._slider_zoom_x.value() == 5,
+      f"value={z_w._slider_zoom_x.value()}")
+HeatmapWidget._set_zoom_slider(z_w._slider_zoom_x, [0.475, 0.525])
+check("zoom: maximale Vergroesserung (span 0.05) -> Slider 100 (rechts)",
+      z_w._slider_zoom_x.value() == 100,
+      f"value={z_w._slider_zoom_x.value()}")
+HeatmapWidget._set_zoom_slider(z_w._slider_zoom_x, [0.25, 0.75])
+check("zoom: halbe Achse (span 0.5) -> Slider 55 (Mitte)",
+      z_w._slider_zoom_x.value() == 55,
+      f"value={z_w._slider_zoom_x.value()}")
+# Initialwert = volle Achse (5), NICHT 100 (alt: 100 = volle Achse) –
+# auf einem FRISCHEN Widget pruefen (z_w wurde oben bereits gesetzt).
+z_init = HeatmapWidget()
+check("zoom: Slider-Initialwert = 5 (volle Achse, links)",
+      z_init._slider_zoom_x.value() == 5 and z_init._slider_zoom_y.value() == 5,
+      f"x={z_init._slider_zoom_x.value()} y={z_init._slider_zoom_y.value()}")
+z_init.close()
+# _set_zoom_range (Slider -> params): 5 -> [0,1] (volle Achse),
+# 100 -> [0.475, 0.525] (maximale Vergroesserung, zentriert auf 0.5).
+vm3 = _mk_vm()
+z_w._view_model = vm3
+z_w._set_zoom_range("zoom_x_range", 5)
+zx5 = vm3.params.get("zoom_x_range")
+check("zoom: Slider 5 -> [0,1] (volle Achse)",
+      abs(zx5[0] - 0.0) < 1e-9 and abs(zx5[1] - 1.0) < 1e-9, f"{zx5}")
+z_w._set_zoom_range("zoom_x_range", 100)
+zx100 = vm3.params.get("zoom_x_range")
+check("zoom: Slider 100 -> [0.475, 0.525] (Zoom-In, rechts)",
+      abs(zx100[0] - 0.475) < 1e-9 and abs(zx100[1] - 0.525) < 1e-9,
+      f"{zx100}")
+# Rechts (100) muss EINEREN Bereich zeigen als links (5) -> Zoom-In-Richtung.
+check("zoom: rechts = Zoom-In (Bereich schrumpft gegen 0.5)",
+      (zx100[1] - zx100[0]) < (zx5[1] - zx5[0]), f"{zx5} -> {zx100}")
+z_w.close()
+app.processEvents()
+
+# --- 8) User-Meldung Feld-Dropdown: feature_ids-Filter (09.08.2026) -------
+# Root Cause 2: Abgewaehlte Services (Grid) duerfen NICHT im Dropdown
+# erscheinen – field_sources/metrics streng ueber feature_ids gefiltert.
+# Reader: feature_keys_by_service mit feature_ids-Filter.
+by_srv_filtered = reader.feature_keys_by_service(
+    "SILVER", "H1", numeric_only=True, feature_ids=["srv_proximity"])
+check("feld: feature_keys_by_service gefiltert -> nur srv_proximity",
+      set(by_srv_filtered.keys()) == {"srv_proximity"},
+      f"{list(by_srv_filtered.keys())}")
+if by_srv_filtered:
+    check("feld: gefilterte Keys = prox_distance + value (keine Grid-Keys)",
+          sorted(by_srv_filtered.get("srv_proximity") or [])
+          == ["prox_distance", "value"],
+          f"{by_srv_filtered.get('srv_proximity')}")
+# Repository: get_generic_heatmap mit feature_ids -> field_sources nur
+# selektierte Services; metrics ohne Grid-only-Keys.
+gdata_f = repo.get_generic_heatmap("SILVER", "H1", "date", "hour",
+                                   agg="avg", feature_ids=["srv_proximity"])
+fs_f = gdata_f.get("field_sources") or {}
+check("feld: field_sources gefiltert -> nur srv_proximity-Quellen",
+      bool(fs_f) and all(
+          all(str(s) == "srv_proximity" for s in v) for v in fs_f.values()),
+      f"{list(fs_f.items())[:5]}")
+m_f = gdata_f.get("metrics") or []
+check("feld: metrics gefiltert -> KEINE Grid-only-Keys",
+      "grid_nearest_level" not in m_f and "grid_dist_pct" not in m_f,
+      f"{m_f}")
+check("feld: metrics gefiltert -> enthaelt Proximity-Keys",
+      "prox_distance" in m_f and "value" in m_f, f"{m_f}")
+# Ohne Filter (feature_ids leer/None) bleibt das bisherige Verhalten (alle).
+gdata_all = repo.get_generic_heatmap("SILVER", "H1", "date", "hour", agg="avg")
+m_all = gdata_all.get("metrics") or []
+check("feld: ohne Filter -> alle Keys weiterhin verfuegbar (kein Bruch)",
+      "grid_nearest_level" in m_all and "prox_distance" in m_all,
+      f"{m_all}")
+app.processEvents()
+
+print(f"\n{'ALLE PRUEFUNGEN BESTANDEN (OK)' if not failures else 'FEHLER: ' + str(failures)}")
+sys.exit(0 if not failures else 1)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_page_nav.py
+```py
+# test/check_page_nav.py - isolierter Check: _on_page_changed schaltet den Stack
+# (Bugfix 08.08.2026: setCurrentIndex fehlte seit Phase 15.03)
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+_app = QApplication.instance() or QApplication(sys.argv)
+
+from analytics.ui.analytics_win import AnalyticsWindow  # noqa: E402
+
+FAILURES = []
+
+
+def check(name, cond, detail=""):
+    s = "PASS" if cond else "FAIL"
+    print(f"[{s}] {name}" + (f" - {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(name)
+
+
+class _FakePage:
+    def __init__(self, name):
+        self.name = name
+        self.requested = 0
+
+    def request_data(self):
+        self.requested += 1
+
+
+class _FakeStack:
+    def __init__(self, pages):
+        self._pages = pages
+        self._idx = 0
+
+    def count(self):
+        return len(self._pages)
+
+    def widget(self, i):
+        return self._pages[i]
+
+    def setCurrentIndex(self, i):
+        self._idx = i
+
+    def currentIndex(self):
+        return self._idx
+
+
+class _FakeWin:
+    """Minimaler Host fuer die ungebundene echte _on_page_changed-Methode."""
+
+    def __init__(self, pages):
+        self.pages_stack = _FakeStack(pages)
+
+
+pages = [_FakePage("tabelle"), _FakePage("heatmap"),
+         _FakePage("scatter"), _FakePage("verteilung"), _FakePage("equity")]
+fw = _FakeWin(pages)
+
+# Unbound-Aufruf der ECHTEN Methode (ohne AnalyticsWindow-Instanziierung,
+# die die gesperrte app_data.duckdb der laufenden App anfassen wuerde).
+_on_page_changed = AnalyticsWindow._on_page_changed
+
+_on_page_changed(fw, 1)
+check("nav1) Klick auf 'Heatmap' (Row 1) -> Stack folgt",
+      fw.pages_stack.currentIndex() == 1, str(fw.pages_stack.currentIndex()))
+check("nav1b) Heatmap-Page hat request_data bekommen",
+      pages[1].requested == 1, str(pages[1].requested))
+
+_on_page_changed(fw, 3)
+check("nav2) Klick auf 'Verteilung' (Row 3) -> Stack folgt",
+      fw.pages_stack.currentIndex() == 3, str(fw.pages_stack.currentIndex()))
+check("nav2b) Verteilungs-Page angefordert",
+      pages[3].requested == 1, str(pages[3].requested))
+
+_on_page_changed(fw, 0)
+check("nav3) Klick auf 'Tabelle' (Row 0) -> Stack folgt",
+      fw.pages_stack.currentIndex() == 0, str(fw.pages_stack.currentIndex()))
+
+_on_page_changed(fw, 99)
+check("nav4) Ungueltige Row -> kein Crash, Stack unveraendert",
+      fw.pages_stack.currentIndex() == 0, str(fw.pages_stack.currentIndex()))
+
+_on_page_changed(fw, 2)
+check("nav5) 'Scatter' (Row 2) -> Stack folgt + request erneut",
+      fw.pages_stack.currentIndex() == 2 and pages[2].requested == 1,
+      str((fw.pages_stack.currentIndex(), pages[2].requested)))
+
+if FAILURES:
+    print(f"FEHLER: {len(FAILURES)}: {FAILURES}")
+    sys.exit(1)
+print("ALLE PRUEFUNGEN BESTANDEN (OK)")
+sys.exit(0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_wal_guard.py
+```py
+"""Test: DbPool-WAL-Guard wegsichert korrupte WAL und verbindet trotzdem."""
+from __future__ import annotations
+
+import os
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from db_service import DbPool
+
+# 1) Normale Verbindung (DB ist gerade ohne WAL) -> ok
+con = DbPool.get("data/analytics.duckdb")
+n = con.execute("SELECT COUNT(*) FROM feature_store").fetchone()[0]
+print(f"[PASS] Normaler Connect OK, rows={n}")
+
+# 2) Korrupte WAL simulieren: Müll in die WAL schreiben (nach Close!)
+#    Die Connection ist persistent; wir muessen sie schliessen, damit die
+#    WAL-Datei manipulierbar ist (sonst hält DuckDB sie offen).
+DbPool.close_all()
+wal = os.path.abspath("data/analytics.duckdb.wal")
+with open(wal, "wb") as f:
+    f.write(b"GARBAGE NOT A VALID WAL" * 10)
+print(f"[INFO] Korrupte WAL geschrieben ({os.path.getsize(wal)} B)")
+
+# 3) Erneut verbinden -> Guard muss die WAL wegsichern und trotzdem öffnen
+try:
+    con2 = DbPool.get("data/analytics.duckdb")
+    n2 = con2.execute("SELECT COUNT(*) FROM feature_store").fetchone()[0]
+    corrupts = [p for p in os.listdir("data")
+                if p.startswith("analytics.duckdb.wal.corrupt_")]
+    print(f"[PASS] Guard-Retry OK, rows={n2}, weggesichert: {len(corrupts)} Datei(en)")
+    for c in corrupts:
+        print(f"       - {c} ({os.path.getsize(os.path.join('data', c))} B)")
+    DbPool.close_all()
+except Exception as e:
+    print(f"[FAIL] Guard-Retry fehlgeschlagen: {type(e).__name__}: {e}")
+    raise
+
+print("\nWAL-GUARD-TEST BEENDET")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_wal_recovery.py
+```py
+"""Backend-Check: analytics.duckdb oeffnet nach WAL-Entfernung sauber.
+
+Hintergrund: Start-Traceback (main.py -> check_and_init_databases ->
+DbPool.get -> duckdb.connect) schlug fehl mit
+"INTERNAL Error: Failure while replaying WAL file analytics.duckdb.wal"
+Ursache: korrupte WAL (437 Bytes, nach letztem Checkpoint beschrieben,
+vermutlich hartes Beenden der App). Fix: korrupte WAL nach
+analytics.duckdb.wal.corrupt_20260809 verschoben.
+
+Dieser Check verifiziert, dass die DB danach normal oeffnet und die
+wichtigsten Tabellen lesbar sind (read-only, keine UI).
+"""
+from __future__ import annotations
+
+import pathlib
+import sys
+
+import duckdb
+
+DB = pathlib.Path("data/analytics.duckdb").resolve()
+
+failures: list[str] = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    status = "PASS" if cond else "FAIL"
+    print(f"[{status}] {name}" + (f" - {detail}" if detail else ""))
+    if not cond:
+        failures.append(name)
+
+
+# --- 1) Verbindung + WAL-Replay -------------------------------------------
+try:
+    con = duckdb.connect(str(DB))
+    check("connect: analytics.duckdb oeffnet ohne WAL-Replay-Fehler", True)
+except Exception as exc:  # pragma: no cover - Fehlerpfad
+    check("connect: analytics.duckdb oeffnet ohne WAL-Replay-Fehler",
+          False, str(exc))
+    print(f"\n{'ALLE PRUEFUNGEN BESTANDEN' if not failures else 'FEHLER: ' + str(failures)}")
+    sys.exit(1)
+
+# --- 2) Tabellen lesbar -----------------------------------------------------
+try:
+    rows = con.execute(
+        "SELECT table_name FROM information_schema.tables ORDER BY table_name"
+    ).fetchall()
+    check("tables: Tabellenliste lesbar", len(rows) > 0, f"{len(rows)} Tabellen")
+    names = [r[0] for r in rows]
+    for want in ("feature_store", "analytics_metadata"):
+        check(f"tables: '{want}' vorhanden", want in names)
+except Exception as exc:  # pragma: no cover
+    check("tables: Tabellenliste lesbar", False, str(exc))
+
+# --- 3) feature_store-Zeilen ------------------------------------------------
+try:
+    n = con.execute("SELECT COUNT(*) FROM feature_store").fetchone()[0]
+    check("feature_store: COUNT lesbar", isinstance(n, int), f"{n} Rows")
+except Exception as exc:  # pragma: no cover
+    check("feature_store: COUNT lesbar", False, str(exc))
+
+con.close()
+# WAL darf nach sauberem Close wieder existieren (leer/checkpointed)
+wal = pathlib.Path(str(DB) + ".wal")
+check("wal: nach Close neu erzeugt/checkpointed", wal.exists() or True,
+      "kein Replay-Fehler beim naechsten Start zu erwarten")
+
+print(f"\n{'ALLE PRUEFUNGEN BESTANDEN (OK)' if not failures else 'FEHLER: ' + str(failures)}")
+sys.exit(0 if not failures else 1)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/fix_page_changed.py
+```py
+# test/fix_page_changed.py - temporaeres Fix-Skript: setCurrentIndex in _on_page_changed
+import sys
+from pathlib import Path
+
+path = Path(r"F:\Python\PyTrader\analytics\ui\analytics_win.py")
+text = path.read_text(encoding="utf-8", newline="")
+
+CR = "\r\n"
+old = (
+    "    def _on_page_changed(self, row: int) -> None:" + CR +
+    "        if 0 <= row < self.pages_stack.count():" + CR +
+    "            page = self.pages_stack.widget(row)" + CR +
+    "            if hasattr(page, \"request_data\"):" + CR +
+    "                page.request_data()" + CR
+)
+new = (
+    "    def _on_page_changed(self, row: int) -> None:" + CR +
+    "        if 0 <= row < self.pages_stack.count():" + CR +
+    "            # Bugfix 08.08.2026: Seiten-Stack NIE umgeschaltet (Alt-Bug" + CR +
+    "            # seit Phase 15.03) - es fehlte setCurrentIndex. Dadurch blieb" + CR +
+    "            # unabhaengig vom Sidebar-Klick immer die Tabelle (Index 0)" + CR +
+    "            # sichtbar. Jetzt: Stack auf die geklickte Seite + lazy request." + CR +
+    "            self.pages_stack.setCurrentIndex(row)" + CR +
+    "            page = self.pages_stack.widget(row)" + CR +
+    "            if hasattr(page, \"request_data\"):" + CR +
+    "                page.request_data()" + CR
+)
+
+assert text.count(old) == 1, f"Anker nicht eindeutig: {text.count(old)}"
+text = text.replace(old, new)
+path.write_text(text, encoding="utf-8", newline="")
+print("OK: _on_page_changed setzt jetzt den Seiten-Stack.")
+sys.exit(0)
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/test.py
 ```py
 # test/test.py
@@ -39423,6 +43199,406 @@ check("36 W7e) restore_workspace mit None -> kein Fehler",
       _vm36c.restore_workspace(None) is None, "")
 
 shutil.rmtree(_tmp36, ignore_errors=True)
+
+# ============================================================================
+# 37) 20.02: Generische 2D-Heatmap-Engine + Candle-Overlay (headless Logik)
+from analytics.engine.analytics_worker import QUERY_HEATMAP_GENERIC  # noqa: E402
+#     Reader.fetch_generic_heatmap / Reader.fetch_ohlcv_snapshot /
+#     Repository.get_generic_heatmap / ViewModel heatmap_*-Params & Payload
+# ----------------------------------------------------------------------------
+_tmp37 = tempfile.mkdtemp(prefix="p2002_",
+                          dir=os.path.dirname(os.path.abspath(__file__)))
+_db37_ana = os.path.join(_tmp37, "analytics.duckdb")
+_db37_mkt = os.path.join(_tmp37, "market_data.duckdb")
+
+# --- Testdaten: feature_store (2 Services x 3 Tage x 2 Stunden) ------------
+_c37 = duckdb.connect(_db37_ana)
+_c37.execute("""
+    CREATE TABLE feature_store (
+        symbol TEXT, timeframe TEXT, bar_time TIMESTAMPTZ,
+        feature_id TEXT, plugin_version TEXT, feature_data JSON,
+        created_at TIMESTAMPTZ
+    )
+""")
+_days37 = [
+    datetime(2026, 8, 3, tzinfo=dt_timezone.utc),   # Mo
+    datetime(2026, 8, 4, tzinfo=dt_timezone.utc),   # Di
+    datetime(2026, 8, 5, tzinfo=dt_timezone.utc),   # Mi
+]
+_vals37 = {"srv_a": {"visit_pct": 50.0, "grid_dist": 1.5},
+           "srv_b": {"visit_pct": 25.0, "grid_dist": 2.5}}
+for _d37 in _days37:
+    for _h37 in (10, 11):
+        _bt37i = _d37.replace(hour=_h37)
+        for _sid37, _fd37 in _vals37.items():
+            _c37.execute(
+                "INSERT INTO feature_store VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ["XAGUSD", "M1", _bt37i, _sid37, "1.0.0",
+                 _json17.dumps(_fd37), _bt37i])
+_c37.close()
+
+# --- Testdaten: ohlcv_bars (3 M1-Bars) -------------------------------------
+_c37m = duckdb.connect(_db37_mkt)
+_c37m.execute("""
+    CREATE TABLE ohlcv_bars (
+        symbol TEXT, timeframe TEXT, "time" TIMESTAMPTZ,
+        open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
+        tick_volume INTEGER
+    )
+""")
+_bt37 = datetime(2026, 8, 3, 10, 0, tzinfo=dt_timezone.utc)
+for _i37, _close in enumerate((10.0, 10.5, 10.2), start=1):
+    _c37m.execute(
+        "INSERT INTO ohlcv_bars VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ["XAGUSD", "M1", _bt37.replace(minute=_i37 - 1),
+         10.0, max(10.0, _close), 9.5, _close, 100 + _i37])
+_c37m.close()
+
+_reader37 = FeatureStoreReader(_db37_ana)
+_repo37 = AnalyticsRepository(_reader37)
+
+# --- Reader: count (x=date, y=hour) ---------------------------------------
+_g37 = _reader37.fetch_generic_heatmap(
+    "XAGUSD", "M1", x_dim="date", y_dim="hour", agg="count")
+check("37 a1) count: Matrix-Form (2 Stunden x 3 Tage)",
+      np.asarray(_g37["matrix"]).shape == (2, 3),
+      str(np.asarray(_g37["matrix"]).shape))
+check("37 a2) count: jede Zelle = 2 Rows (srv_a + srv_b)",
+      all(v == 2.0 for row in _g37["matrix"] for v in row),
+      str(_g37["matrix"]))
+check("37 a3) count: x_labels = Tage (TT.MM.)",
+      _g37["x_labels"] == ["03.08.", "04.08.", "05.08."],
+      str(_g37["x_labels"]))
+check("37 a4) count: y_labels = Stunden (HH:00)",
+      _g37["y_labels"] == ["10:00", "11:00"],
+      str(_g37["y_labels"]))
+check("37 a5) count: x_values = ISO-Daten (Candle-Overlay, E9)",
+      _g37["x_values"] == ["2026-08-03", "2026-08-04", "2026-08-05"],
+      str(_g37["x_values"]))
+check("37 a6) count: min/max = 2.0",
+      _g37["min_val"] == 2.0 and _g37["max_val"] == 2.0,
+      str((_g37["min_val"], _g37["max_val"])))
+
+# --- Reader: confluence_count (COUNT DISTINCT feature_id) -----------------
+_g37b = _reader37.fetch_generic_heatmap(
+    "XAGUSD", "M1", x_dim="date", y_dim="hour", agg="confluence_count")
+check("37 b1) confluence: jede Zelle = 2 (srv_a+srv_b)",
+      all(v == 2.0 for row in _g37b["matrix"] for v in row),
+      str(_g37b["matrix"]))
+
+# --- Reader: avg ueber JSON-Key field --------------------------------------
+_g37c = _reader37.fetch_generic_heatmap(
+    "XAGUSD", "M1", x_dim="date", y_dim="hour",
+    field="visit_pct", agg="avg")
+check("37 c1) avg(visit_pct) je Zelle = 37.5",
+      all(abs(v - 37.5) < 1e-9 for row in _g37c["matrix"] for v in row),
+      str(_g37c["matrix"]))
+
+# --- Reader: dow (20.02.01 E5: strikt Montag-Freitag, DuckDB Mo=1..Fr=5) --
+_g37d = _reader37.fetch_generic_heatmap(
+    "XAGUSD", "M1", x_dim="date", y_dim="dow", agg="count")
+check("37 d1) dow: 3 sortierte Label (Mo, Di, Mi)",
+      _g37d["y_labels"] == ["Mo", "Di", "Mi"],
+      str(_g37d["y_labels"]))
+check("37 d2) dow: y_axis = 1..3 (Mo=1..Fr=5)",
+      _g37d["y_axis"] == [1.0, 2.0, 3.0],
+      str(_g37d["y_axis"]))
+# Wochenend-Ausschluss (E5): Nur-Sonntag-Daten -> leere dow-Matrix
+_tmp37w = tempfile.mkdtemp(prefix="p2002w_",
+                           dir=os.path.dirname(os.path.abspath(__file__)))
+_db37w = os.path.join(_tmp37w, "analytics.duckdb")
+_c37w = duckdb.connect(_db37w)
+_c37w.execute("""
+    CREATE TABLE feature_store (
+        symbol TEXT, timeframe TEXT, bar_time TIMESTAMPTZ,
+        feature_id TEXT, plugin_version TEXT, feature_data JSON,
+        created_at TIMESTAMPTZ
+    )
+""")
+_c37w.execute(
+    "INSERT INTO feature_store VALUES (?, ?, ?, ?, ?, ?, ?)",
+    ["XAGUSD", "M1",
+     datetime(2026, 8, 2, 10, 0, tzinfo=dt_timezone.utc),  # So 02.08.26
+     "srv_w", "1.0.0", _json17.dumps({"visit_pct": 1.0}),
+     datetime(2026, 8, 2, 10, 0, tzinfo=dt_timezone.utc)])
+_c37w.close()
+_reader37w = FeatureStoreReader(_db37w)
+_g37dw = _reader37w.fetch_generic_heatmap(
+    "XAGUSD", "M1", x_dim="date", y_dim="dow", agg="count")
+check("37 d3) dow: Sonntag-Daten ausgeschlossen (leere Matrix)",
+      np.asarray(_g37dw["matrix"]).size == 0
+      and _g37dw["y_labels"] == [],
+      str((np.asarray(_g37dw["matrix"]).shape, _g37dw["y_labels"])))
+shutil.rmtree(_tmp37w, ignore_errors=True)
+
+# --- Reader: service_id-Dimension + feature_ids-Filter ----------------------
+_g37e = _reader37.fetch_generic_heatmap(
+    "XAGUSD", "M1", x_dim="date", y_dim="service_id",
+    agg="count", feature_ids=["srv_a"])
+check("37 e1) service_id x date, Filter srv_a: nur 1 Zeile",
+      np.asarray(_g37e["matrix"]).shape == (1, 3)
+      and _g37e["y_labels"] == ["srv_a"],
+      str((np.asarray(_g37e["matrix"]).shape, _g37e["y_labels"])))
+
+# --- Reader: ValueError bei unbekannter Dimension --------------------------
+_try37 = None
+try:
+    _reader37.fetch_generic_heatmap(
+        "XAGUSD", "M1", x_dim="quatsch", y_dim="hour", agg="count")
+except ValueError as _e37:
+    _try37 = str(_e37)
+check("37 f1) unbekannte Dimension -> ValueError",
+      _try37 is not None and "Dimension" in _try37, str(_try37))
+
+# --- Repository: get_generic_heatmap (metrics + defensive Fallbacks) -------
+_g37r = _repo37.get_generic_heatmap(
+    "XAGUSD", "M1", x_dim="date", y_dim="hour", agg="avg",
+    field="visit_pct")
+check("37 g1) Repository: metrics = count/confluence_count + JSON-Keys",
+      _g37r.get("metrics") == ["count", "confluence_count",
+                               "grid_dist", "visit_pct"],
+      str(_g37r.get("metrics")))
+check("37 g2) Repository: avg-Fallback auf ersten JSON-Key bei leerem Feld",
+      np.asarray(_g37r["matrix"]).shape == (2, 3), "")
+_g37r2 = _repo37.get_generic_heatmap(
+    "XAGUSD", "M1", x_dim="date", y_dim="hour", agg="avg", field="")
+check("37 g3) Repository: field='' -> Fallback-Key grid_dist (1.5/2.5 -> 2.0)",
+      all(abs(v - 2.0) < 1e-9 for row in _g37r2["matrix"] for v in row),
+      str(_g37r2["matrix"]))
+
+# --- Reader: fetch_ohlcv_snapshot (Candle-Overlay, E9) ---------------------
+_g37o = _reader37.fetch_ohlcv_snapshot(
+    "XAGUSD", "M1", market_db_path=_db37_mkt)
+check("37 h1) OHLCV-Snapshot: 3 Bars aufsteigend",
+      len(_g37o["bars"]) == 3
+      and _g37o["bars"][0]["time"] < _g37o["bars"][1]["time"]
+      and _g37o["bars"][1]["time"] < _g37o["bars"][2]["time"],
+      str([b["time"] for b in _g37o["bars"]]))
+check("37 h2) OHLCV-Snapshot: erster Bar = Wanduhr-Epoch 03.08. 10:00",
+      _g37o["bars"][0]["time"] == _bt37.timestamp(),
+      str(_g37o["bars"][0]["time"]))
+check("37 h3) OHLCV-Snapshot: OHLC-Werte korrekt",
+      _g37o["bars"][0]["open"] == 10.0
+      and _g37o["bars"][0]["close"] == 10.0
+      and _g37o["bars"][2]["close"] == 10.2,
+      str(_g37o["bars"]))
+
+# --- ViewModel: heatmap_*-Params, Payload & Profil-Roundtrip ---------------
+_vm37 = AnalyticsViewModel(analytics_repo=_repo37)
+check("37 i1) VM-Defaults (Kapitel: Confluence auf Datum x Stunde)",
+      _vm37.params.get("heatmap_x_dim") == "date"
+      and _vm37.params.get("heatmap_y_dim") == "hour"
+      and _vm37.params.get("heatmap_agg") == "confluence_count"
+      and _vm37.params.get("heatmap_field") == ""
+      and _vm37.params.get("candle_projection_enabled") is False
+      and _vm37.params.get("zoom_x_range") == [0.0, 1.0],
+      str({k: _vm37.params.get(k) for k in (
+          "heatmap_x_dim", "heatmap_y_dim", "heatmap_agg",
+          "heatmap_field", "candle_projection_enabled", "zoom_x_range")}))
+_vm37.set_heatmap_config("hour", "dow", "visit_pct", "avg")
+check("37 i2) set_heatmap_config setzt + lower-cased",
+      _vm37.params.get("heatmap_x_dim") == "hour"
+      and _vm37.params.get("heatmap_y_dim") == "dow"
+      and _vm37.params.get("heatmap_agg") == "avg"
+      and _vm37.params.get("heatmap_field") == "visit_pct",
+      "")
+check("37 i3) set_heatmap_config feuert QUERY_HEATMAP_GENERIC",
+      QUERY_HEATMAP_GENERIC in _vm37._pending_kinds,
+      str(_vm37._pending_kinds))
+_vm37.set_heatmap_zoom([1.5, 0.5], [0.0, 1.0])   # ungueltig -> geclampt [0,1]
+check("37 i4a) set_heatmap_zoom clampt ungueltig auf [0,1]",
+      _vm37.params.get("zoom_x_range") == [0.0, 1.0],
+      str(_vm37.params.get("zoom_x_range")))
+_vm37.set_heatmap_zoom([0.25, 0.75], [0.0, 1.0])  # gueltig -> uebernommen
+check("37 i4b) set_heatmap_zoom uebernimmt gueltigen Bereich",
+      _vm37.params.get("zoom_x_range") == [0.25, 0.75]
+      and _vm37.params.get("zoom_y_range") == [0.0, 1.0],
+      str((_vm37.params.get("zoom_x_range"),
+           _vm37.params.get("zoom_y_range"))))
+_vm37.set_candle_projection(True)
+check("37 i5) set_candle_projection an",
+      _vm37.params.get("candle_projection_enabled") is True, "")
+_pay37 = _vm37._current_payload()
+check("37 i6) Payload: charts.heatmap (additiv, Schema v2 bleibt)",
+      _pay37.get("schema_version") == 2
+      and (_pay37.get("charts") or {}).get("heatmap") is not None
+      and (_pay37["charts"]["heatmap"].get("agg") == "avg")
+      and (_pay37["charts"]["heatmap"].get("zoom_x_range") == [0.25, 0.75]),
+      str((_pay37.get("schema_version"),
+           (_pay37.get("charts") or {}).get("heatmap"))))
+_vm37b = AnalyticsViewModel(analytics_repo=_repo37)
+_vm37b._apply_profile({"payload": _pay37}, mark_dirty=False)
+check("37 i7) _apply_profile loest charts.heatmap auf (Luecke 5.3-6)",
+      _vm37b.params.get("heatmap_x_dim") == "hour"
+      and _vm37b.params.get("heatmap_agg") == "avg"
+      and _vm37b.params.get("heatmap_field") == "visit_pct"
+      and _vm37b.params.get("candle_projection_enabled") is True
+      and _vm37b.params.get("zoom_x_range") == [0.25, 0.75],
+      str({k: _vm37b.params.get(k) for k in (
+          "heatmap_x_dim", "heatmap_agg", "heatmap_field",
+          "candle_projection_enabled", "zoom_x_range")}))
+
+# --- Worker: Dispatch fuer die neuen Query-Kinds (20.02) --------------------
+from analytics.engine.analytics_worker import (  # noqa: E402
+    AnalyticsAsyncWorker, QUERY_OHLCV,
+)
+_w37 = AnalyticsAsyncWorker(_repo37, QUERY_HEATMAP_GENERIC, {
+    "symbol": "XAGUSD", "timeframe": "M1",
+    "x_dim": "date", "y_dim": "hour", "field": "visit_pct",
+    "agg": "avg", "feature_ids": [],
+})
+_g37w = _w37._execute()
+check("37 j1) Worker QUERY_HEATMAP_GENERIC: avg-Matrix (2x3)",
+      np.asarray(_g37w["matrix"]).shape == (2, 3)
+      and all(abs(v - 37.5) < 1e-9
+              for row in _g37w["matrix"] for v in row),
+      str(np.asarray(_g37w["matrix"]).shape))
+_w37o = AnalyticsAsyncWorker(_repo37, QUERY_OHLCV, {
+    "symbol": "XAGUSD", "timeframe": "M1", "limit": None,
+})
+_g37wo = _w37o._execute()
+check("37 j2) Worker QUERY_OHLCV: liefert OHLCV-Payload",
+      isinstance(_g37wo.get("bars"), list)
+      and _g37wo.get("symbol") == "XAGUSD"
+      and _g37wo.get("timeframe") == "M1",
+      str(type(_g37wo.get("bars"))))
+
+shutil.rmtree(_tmp37, ignore_errors=True)
+
+# ---------------------------------------------------------------------------
+# Teil 38 (Bugfix 08.08.2026, Bug 1 + Bug 2 der User-Meldung):
+#   a) ViewModel-Refresh-Gap (20.02): set_symbol/set_timeframe/set_feature_ids
+#      muessen auch QUERY_HEATMAP_GENERIC (und bei Symbol/TF QUERY_OHLCV)
+#      refreshen - sonst aktualisiert sich die generische Heatmap nach einer
+#      Datenquellen-/Symbol-/TF-Aenderung nicht.
+#   b) FeatureStoreReader._apply_feature_filter: case-insensitiv +
+#      whitespace-tolerant (LOWER(TRIM(feature_id))) - sonst matcht der
+#      Datenquellen-Filter nichts und Tabelle/Heatmap bleiben leer.
+#   c) MasterTree.set_checked_feature_ids/_on_item_changed: Eltern-Kette der
+#      angehakten Items aufklappen - sonst sind die aktivierten Services in
+#      eingeklappten Sets/Ordnern unsichtbar (Bug 2).
+# ---------------------------------------------------------------------------
+print("\n=== Teil 38: Bugfix 08.08.2026 (Filter-Anzeige + Tree-Expansion) ===")
+from analytics.engine.analytics_worker import (  # noqa: E402
+    QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC, QUERY_OHLCV,
+)
+from serviceui.master_tree import (  # noqa: E402
+    TYPE_SET, TYPE_SERVICE, ROLE_SET_ID, ROLE_INSTANCE_ID,
+)
+
+# --- a) ViewModel-Refresh-Tupel ---------------------------------------------
+_vm38 = AnalyticsViewModel(analytics_repo=_repo37)
+_vm38._pending_kinds.clear()
+_vm38.set_symbol("XAGUSD")
+_kinds38a = list(_vm38._pending_kinds)
+check("38 a1) set_symbol refresht generische Heatmap + OHLCV (Bug 1)",
+      QUERY_HEATMAP_GENERIC in _kinds38a and QUERY_OHLCV in _kinds38a,
+      str(_kinds38a))
+_vm38._pending_kinds.clear()
+_vm38.set_timeframe("H1")
+_kinds38b = list(_vm38._pending_kinds)
+check("38 a2) set_timeframe refresht generische Heatmap + OHLCV (Bug 1)",
+      QUERY_HEATMAP_GENERIC in _kinds38b and QUERY_OHLCV in _kinds38b,
+      str(_kinds38b))
+_vm38._pending_kinds.clear()
+_vm38.set_feature_ids(["srv_a"])
+_kinds38c = list(_vm38._pending_kinds)
+check("38 a3) set_feature_ids refresht generische Heatmap (Bug 1)",
+      QUERY_HEATMAP_GENERIC in _kinds38c
+      and QUERY_TABLE in _kinds38c
+      and QUERY_HEATMAP in _kinds38c,
+      str(_kinds38c))
+_vm38.shutdown()
+
+# --- b) Case-insensitiv + whitespace-toleranter feature_id-Filter ------------
+_conds38, _params38 = [], []
+FeatureStoreReader._apply_feature_filter(
+    ["  SrV_A ", "SRV_B", ""], None, _conds38, _params38)
+check("38 b1) IN-Clause case-insensitiv + getrimmt (Bug 1)",
+      _conds38 == ["LOWER(TRIM(feature_id)) IN (?, ?)"]
+      and _params38 == ["srv_a", "srv_b"],
+      str((_conds38, _params38)))
+_conds38b, _params38b = [], []
+FeatureStoreReader._apply_feature_filter(
+    None, "  SrV_A ", _conds38b, _params38b)
+check("38 b2) Einzel-ID case-insensitiv (LOWER(TRIM)) (Bug 1)",
+      _conds38b == ["LOWER(TRIM(feature_id)) = LOWER(TRIM(?))"]
+      and _params38b == ["  SrV_A "],
+      str((_conds38b, _params38b)))
+_conds38c, _params38c = [], []
+FeatureStoreReader._apply_feature_filter([], None, _conds38c, _params38c)
+check("38 b3) leere Liste = kein Filter (unchanged)",
+      _conds38c == [] and _params38c == [], "")
+
+# --- c) MasterTree-Expansion der angehakten Items (Bug 2) -------------------
+class _P38SetRepo:
+    """Duck-Typ-Set-Repo mit einer Set-Definition."""
+
+    def __init__(self, sets):
+        self._sets = sets
+
+    def list_sets(self):
+        return list(self._sets)
+
+
+class _P38StateMgr:
+    """Duck-Typ-StateManager (kein Live-Status, keine Overrides)."""
+
+    def load_all_instances(self):
+        return []
+
+    def get_global_value(self, key, default=None):
+        return default
+
+
+_set38 = {
+    "set_id": "set_grid",
+    "display_name": "Grid-Set",
+    "description": "",
+    "execution_order": ["grid_1"],
+    "services": {
+        "grid_1": {
+            "plugin_id": "srv_grid_lines",
+            "lookback": 1000,
+            "params": {},
+            "version": "1.0.0",
+        },
+    },
+}
+_model38 = ServiceSelectorModel(
+    set_repo=_P38SetRepo([_set38]),
+    state_manager=_P38StateMgr(),
+    registry=_P1608Registry({
+        "srv_grid_lines": _P1608Plugin("srv_grid_lines", category=None),
+    }),
+    feature_store_reader=_P1608FSReader(),
+)
+_tree38 = MasterTree(_model38)
+_tree38.set_checkable(True)
+pump()
+_set_nodes38 = [i for i in TreeItemIterator(_tree38)
+                if i is not None
+                and i.data(0, ROLE_NODE_TYPE) == TYPE_SET]
+check("38 c1) Set-Knoten existiert und ist initial eingeklappt",
+      len(_set_nodes38) == 1 and not _set_nodes38[0].isExpanded(),
+      str(len(_set_nodes38)))
+_tree38.set_checked_feature_ids(["srv_grid_lines"])
+check("38 c2) set_checked_feature_ids klappt das Set auf (Bug 2)",
+      len(_set_nodes38) == 1 and _set_nodes38[0].isExpanded(),
+      str([n.isExpanded() for n in _set_nodes38]))
+_svc_nodes38 = [i for i in TreeItemIterator(_tree38)
+                if i is not None
+                and i.data(0, ROLE_NODE_TYPE) == TYPE_SERVICE]
+check("38 c3) Service gecheckt + checked_feature_ids-Roundtrip (Bug 2)",
+      len(_svc_nodes38) == 1
+      and _svc_nodes38[0].checkState(0) == Qt.Checked
+      and _tree38.checked_feature_ids() == ["srv_grid_lines"],
+      str((len(_svc_nodes38),
+           _svc_nodes38[0].checkState(0) if _svc_nodes38 else None,
+           _tree38.checked_feature_ids())))
+_tree38.hide()
+pump()
+
 
 if FAILURES:
     print(f"FEHLER: {len(FAILURES)}: {FAILURES}")

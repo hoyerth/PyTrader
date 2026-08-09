@@ -343,7 +343,84 @@
 
 ---
 
-# Phase 20.03: Generatives Filter- & Sortiersystem (Cross-View Filtering Engine)
+# 20.03 Service-Output-Schema & Resultatfelder-Dokumentation im Service-Picker
+
+## 1. Concept & Requirements
+- **Output-Schema Integration**: Ergänzung des statischen Output-Schemas in den Plugins zur Dokumentation der im `feature_data`-JSON erzeugten Ergebnisspalten.
+- **UI-Anzeige**: Einbettung einer eingerückten Read-Only-Sektion *"Resultatfelder"* im Parameter-Panel des Service-Pickers/MasterTrees direkt unterhalb des allgemeinen Beschreibungsfeldes.
+
+## 2. Base Plugin Extension (`analytics/features/plugins/base_plugin.py`)
+- **`output_schema`**: Attribut in `PluginFeature` definieren:
+
+  output_schema: Dict[str, Dict[str, str]] = {}
+  # Format: {"field_name": {"type": "bool|float|int|str", "description": "Kurztext"}}
+
+
+* **Feature Definitions (`analytics/features/definitions/srv_*.py`)**: Strikte Befüllung des `output_schema` für alle Core-Services (z. B. `is_hit`, `visit_pct`, `in_time_window`).
+
+## 3. UI Implementation (`serviceui/param_columns.py` / `service_win.py`)
+
+* **Layout**: Unterhalb des allgemeinen Beschreibungs-Textfeldes (`description`) eine neue Sektion *"Resultatfelder (Output-Schema)"* einfügen.
+* **Formatierung**: Eingerückte Darstellung pro Feld:
+* `{field_name}` (`{type}`):
+* `└── {description}` (in hellerer Schrift / eingerückt)
+
+* **Read-Only**: Strikte schreibgeschützte Darstellung (keine Eingabe-Elemente).
+
+---
+
+# 20.04 Parameter-Varianten, Instanziierung & Archivierung
+## Concept: Parent-Child & Hash-ID (Model C)
+- **Service/Set = Template**: Pure logic/code definition (non-executable).
+- **Instance/Clone = Executable**: Combination of `Service_ID` + `Parameters` + `Timeframe/Symbol`. Assigned unique cryptographic `instance_hash`.
+- **Mastertree UI**: Expandable Parent-Child hierarchy (`Service` -> `Parameter-Clones`).
+## Archive System
+- **Instance Archive**: Move specific failing parameter presets to Archive. Parent service remains active.
+- **Complete Archive**: Move entire Service/Set with all child clones to Archive.
+- **Doc Log**: Required large text field per archived node for negative knowledge logging.
+- **Safety**: All selection checkboxes disabled inside Archive directory.
+## Archive Maintenance Context Menu
+- **Delete "Data Only"**: Clears historical signals/metrics from DB; keeps node structure, settings, and documentation text.
+- **Delete "Complete"**: Double confirmation prompt. Irreversibly purges node, clones, settings, logs, and all DB records.
+## Text Architecture: 20.04
+[Mastertree (Active)]
+ ├── 📁 [Swing Algos]
+ │     └── ⚙️ [srv_swing_pivot]
+ │           ├── 🟢 [Preset: M15_Fast] (hash: #a91f3b) [X]
+ │           └── 🟢 [Preset: H1_Slow]  (hash: #b82e4c) [X]
+[Archive (Checkboxes Disabled)]
+ ├── 📁 [Invalid Sweeps]
+ │     └── 🔴 [srv_breakout_v1] (Entire Service Archived)
+ │           ├── 📝 Log: "85% false signals in chop markets"
+ │           └── 🔹 [Preset: Default] (hash: #c73d5d)
+
+
+---
+
+# 20.05 Multi-DB Architecture & Data Management
+## Strategy: Domain-Driven Split via DuckDB
+Split storage into 4 isolated `.db` files to prevent file-locking, maximize IOPS, and isolate test data. Native cross-DB joins via `ATTACH DATABASE`.
+## DB Schema Split
+1. `master_config.db` (Lightweight): Mastertree hierarchy, service configs, parameter presets, instance hashes, archive text logs.
+2. `market_data.db` (Static Read-Only): Raw OHLCV (M1-Daily), tick histories, L2 DOM snapshots.
+3. `analytics_runs.db` (High-Volume Dynamic): Generated signals, sweep results, metrics, heatmap densities. Targeted by "Delete Data Only".
+4. `ml_feature_store.db` (ML Optimized): Fractional diffs, Z-scores, Garman-Klass vols, trained probability matrices.
+## Text Architecture: 20.05
+                   [PyTrader Core / Execution Engine]
+                                   │
+      ┌────────────────┬───────────┴───────────┬────────────────┐
+      ▼                ▼                       ▼                ▼
+┌──────────────┐┌──────────────┐       ┌──────────────┐ ┌──────────────┐
+│ market_data  ││master_config │       │analytics_runs│ │ml_feature_st │
+│     .db      ││     .db      │       │     .db      │ │     .db      │
+└──────────────┘└──────────────┘       └──────────────┘ └──────────────┘
+ (OHLCV/Ticks)  (Tree/Configs/          (Signals/Sweeps/ (ML Features/
+                 Archive Logs)           Data Clear)      Prob-Matrices)
+
+
+---
+
+# Phase 20.06: Generatives Filter- & Sortiersystem (Cross-View Filtering Engine)
 
 ## 1. Architektur & Invarianten
 * **Code-Style:** Exakt 4 Leerzeichen Einrückung, 1 Leerzeile zwischen Methoden.
@@ -418,53 +495,3 @@ Ein zentraler, dynamischer Filter-Builder erzeugt strukturierte Regelketten (Rul
 * [ ] Empty-Rule Fallback: Leere Filter-Regeln liefern vollständigen Datensatz.
 * [ ] Profil v2.1: Speicherung & Wiederherstellung der `filters`-Sektion im Payload.
 
-
----
-
-# 20.04 Parameter-Varianten, Instanziierung & Archivierung
-## Concept: Parent-Child & Hash-ID (Model C)
-- **Service/Set = Template**: Pure logic/code definition (non-executable).
-- **Instance/Clone = Executable**: Combination of `Service_ID` + `Parameters` + `Timeframe/Symbol`. Assigned unique cryptographic `instance_hash`.
-- **Mastertree UI**: Expandable Parent-Child hierarchy (`Service` -> `Parameter-Clones`).
-## Archive System
-- **Instance Archive**: Move specific failing parameter presets to Archive. Parent service remains active.
-- **Complete Archive**: Move entire Service/Set with all child clones to Archive.
-- **Doc Log**: Required large text field per archived node for negative knowledge logging.
-- **Safety**: All selection checkboxes disabled inside Archive directory.
-## Archive Maintenance Context Menu
-- **Delete "Data Only"**: Clears historical signals/metrics from DB; keeps node structure, settings, and documentation text.
-- **Delete "Complete"**: Double confirmation prompt. Irreversibly purges node, clones, settings, logs, and all DB records.
-## Text Architecture: 20.04
-[Mastertree (Active)]
- ├── 📁 [Swing Algos]
- │     └── ⚙️ [srv_swing_pivot]
- │           ├── 🟢 [Preset: M15_Fast] (hash: #a91f3b) [X]
- │           └── 🟢 [Preset: H1_Slow]  (hash: #b82e4c) [X]
-[Archive (Checkboxes Disabled)]
- ├── 📁 [Invalid Sweeps]
- │     └── 🔴 [srv_breakout_v1] (Entire Service Archived)
- │           ├── 📝 Log: "85% false signals in chop markets"
- │           └── 🔹 [Preset: Default] (hash: #c73d5d)
-
-
----
-
-# 20.05 Multi-DB Architecture & Data Management
-## Strategy: Domain-Driven Split via DuckDB
-Split storage into 4 isolated `.db` files to prevent file-locking, maximize IOPS, and isolate test data. Native cross-DB joins via `ATTACH DATABASE`.
-## DB Schema Split
-1. `master_config.db` (Lightweight): Mastertree hierarchy, service configs, parameter presets, instance hashes, archive text logs.
-2. `market_data.db` (Static Read-Only): Raw OHLCV (M1-Daily), tick histories, L2 DOM snapshots.
-3. `analytics_runs.db` (High-Volume Dynamic): Generated signals, sweep results, metrics, heatmap densities. Targeted by "Delete Data Only".
-4. `ml_feature_store.db` (ML Optimized): Fractional diffs, Z-scores, Garman-Klass vols, trained probability matrices.
-## Text Architecture: 20.05
-                   [PyTrader Core / Execution Engine]
-                                   │
-      ┌────────────────┬───────────┴───────────┬────────────────┐
-      ▼                ▼                       ▼                ▼
-┌──────────────┐┌──────────────┐       ┌──────────────┐ ┌──────────────┐
-│ market_data  ││master_config │       │analytics_runs│ │ml_feature_st │
-│     .db      ││     .db      │       │     .db      │ │     .db      │
-└──────────────┘└──────────────┘       └──────────────┘ └──────────────┘
- (OHLCV/Ticks)  (Tree/Configs/          (Signals/Sweeps/ (ML Features/
-                 Archive Logs)           Data Clear)      Prob-Matrices)
