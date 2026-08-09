@@ -546,11 +546,18 @@ class HeatmapWidget(QWidget):
             up = c >= o
             color = pg.mkColor(0, 180, 0, 140) if up \
                 else pg.mkColor(220, 30, 30, 140)
+            # Bugfix 08.08.2026: pg.BarGraphItem kennt KEIN top/bottom –
+            # die pyqtgraph-API verlangt y0 + height (Exception
+            # 'must specify either y1 or height'). Docht = low..high,
+            # Koerper = min(o,c)..max(o,c); height>0 defensiv erzwingen.
             wick = pg.BarGraphItem(x=[col + 0.5], width=0.12,
-                                   top=h, bottom=l, brush=color, pen=color)
-            body = pg.BarGraphItem(x=[col + 0.5], width=0.7,
-                                   top=max(o, c), bottom=min(o, c),
+                                   y0=l, height=max(h - l, 1e-9),
                                    brush=color, pen=color)
+            body = pg.BarGraphItem(
+                x=[col + 0.5], width=0.7,
+                y0=min(o, c),
+                height=max(max(o, c) - min(o, c), 1e-9),
+                brush=color, pen=color)
             self._plot_px.addItem(wick)
             self._plot_px.addItem(body)
             self._candle_items.extend((wick, body))

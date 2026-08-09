@@ -625,6 +625,11 @@ class AnalyticsWindow(PersistentWindow):
     # ------------------------------------------------------------------
     def _on_page_changed(self, row: int) -> None:
         if 0 <= row < self.pages_stack.count():
+            # Bugfix 08.08.2026: Seiten-Stack NIE umgeschaltet (Alt-Bug
+            # seit Phase 15.03) - es fehlte setCurrentIndex. Dadurch blieb
+            # unabhaengig vom Sidebar-Klick immer die Tabelle (Index 0)
+            # sichtbar. Jetzt: Stack auf die geklickte Seite + lazy request.
+            self.pages_stack.setCurrentIndex(row)
             page = self.pages_stack.widget(row)
             if hasattr(page, "request_data"):
                 page.request_data()
