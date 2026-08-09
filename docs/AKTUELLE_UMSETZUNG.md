@@ -94,5 +94,31 @@ Befüllung der Modul-Konstante `_*_OUTPUT_SCHEMA` in allen 8 aktiven Services un
   sind VORBESTEHEND und betreffen nicht die geänderten Codepfade
   (nur `master_tree.py`/`param_columns.py` wurden modifiziert).
 
+## 4. Folge-Bugfixes (09.08.2026, 2. Runde, Commit `f071b10` + `b772c93`)
+Zwei User-Meldungen nach dem ersten Commit – beide betrafen den Service-Selector-
+Dialog (`service_selector_dialog.py`), dessen `_DialogParamHost` den Mixin nur als
+Plain-Object (kein QWidget) hostet:
+
+1. **`f071b10` – 'Parameteranzeige nicht verfügbar: _DialogParamHost object has
+   no attribute _service_output_schemas'**:
+   - Ursache: Der Dialog ruft `_build_service_column` DIREKT auf (ohne
+     `_clear_service_columns`, das das Dict normalerweise anlegt); der Host-
+     `__init__` initialisierte alle Mixin-Registrys, aber nicht das seit dem
+     Output-Schema-Umbau neue `_service_output_schemas`.
+   - Fix: `self._service_output_schemas: Dict[str, Any] = {}` im `__init__` von
+     `_DialogParamHost` ergänzt (analog `_mode_schemas`, 08.08.2026).
+   - Neuer headless Regressions-Test `test/check_dialog_host.py` (Host-Spaltenbau
+     inkl. Resultatfelder-Header/System-Metrik/i-Buttons): PASS.
+
+2. **`b772c93` – 'QDialog.__init__ called with wrong argument types' beim
+   i-Button der Ergebnisparameter**:
+   - Ursache: `_show_output_field_info` erzeugte `QDialog(self)` – `self` ist im
+     Dialog-Kontext der `_DialogParamHost` (kein QWidget) → TypeError.
+   - Fix: Eltern-Widget robust aufgelöst: `self` falls QWidget, sonst
+     `self._dialog` (echtes Dialog-Fenster des Hosts), sonst `None`.
+   - `test/check_dialog_host.py` erweitert (mockt `QDialog.exec`, prüft
+     Eltern-Auflösung + None-Fallback): ALL PASS.
+
+
 
 
