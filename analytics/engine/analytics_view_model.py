@@ -847,6 +847,13 @@ class AnalyticsViewModel(QObject):
         for _hk in ("heatmap_x_dim", "heatmap_y_dim"):
             if self._params.get(_hk) == "dow_hour":
                 self._params[_hk] = "hour"
+        # 20.04-Q8-Fix (User-Bugreport Punkt 1a): Auch die verschachtelte
+        # `charts.heatmap`-Sektion des Workspace-Params restaurieren
+        # (heatmap_agg/heatmap_field) – der flache Key-Loop uebernimmt die
+        # flachen Keys, aber das verschachtelte Dict (wie im Profil-Payload)
+        # muss explizit via _apply_heatmap_section aufgeloest werden.
+        if isinstance(params.get("heatmap"), dict):
+            self._apply_heatmap_section(params.get("heatmap"))
         self._params["feature_ids"] = self._normalize_feature_ids(
             self._params.get("feature_ids"))
         valid, missing = self._resolve_feature_ids(self._params["feature_ids"])

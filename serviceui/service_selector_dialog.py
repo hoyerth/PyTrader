@@ -444,6 +444,18 @@ class ServiceSelectorDialog(QDialog):
             tree.rename_folder_requested.connect(self._on_rename_folder)
             tree.create_folder_requested.connect(self._on_create_folder)
             tree.delete_folder_requested.connect(self._on_delete_folder)
+            # 20.04 (Q5/Q6/Q8): Instanz-Verwaltung im MasterTree-Kontextmenue
+            # (Service-/Clone-Zeilen) -> Handler (Muster service_win). Ohne
+            # diese Verbindungen emittiert der MasterTree die Signale zwar,
+            # aber niemand fuehrt sie aus – 'Als Variante duplizieren' im
+            # Analytics-Datenquellen-Picker blieb wirkungslos (Q8-Bugfix).
+            tree.data_only_purge_requested.connect(
+                self._on_data_only_purge)
+            tree.delete_complete_requested.connect(
+                self._on_delete_complete)
+            tree.doc_log_requested.connect(self._on_doc_log_requested)
+            tree.duplicate_variant_requested.connect(
+                self._on_duplicate_variant)
         # Live-Sync: Modell-Refresh (EventBus -> data_changed) baut den Baum
         # neu; das Panel wird mit dem zuletzt geklickten Scope nachgezogen.
         self.model.data_changed.connect(self._on_model_data_changed)
@@ -646,6 +658,259 @@ class ServiceSelectorDialog(QDialog):
                 self, "Fehler",
                 "Parameter konnten nicht gespeichert werden "
                 "(kein editierbarer Standalone-Service ausgewählt).")
+
+    # ------------------------------------------------------------------
+    # 20.04 (Q5/Q6/Q8): Instanz-Verwaltung im Kontextmenue – Handler
+    # (Muster service_win, ohne Editor-Load/Logging; der Dialog ist ein
+    # Read-Only-Picker, aber die Duplizierung/Loeschung muss funktionieren).
+    # ------------------------------------------------------------------
+
+    def _find_preset_for_hash(self, plugin_id: str,
+                              instance_hash: str):
+        """Preset-Dict zu plugin_id + instance_hash (indicator_presets)."""
+        try:
+            sm = self.model.state_manager
+            for preset in sm.list_plugin_presets(plugin_id) or []:
+                if not isinstance(preset, dict):
+                    continue
+                from analytics.engine.service_models import (
+                    generate_instance_hash)
+                if generate_instance_hash(
+                        plugin_id, preset.get("params") or {}) == instance_hash:
+                    return preset
+        except Exception:
+            pass
+        return None
+
+    @Slot(str, str, str, str)
+    def _on_duplicate_variant(self, set_id: str, service_id: str,
+                              plugin_id: str, instance_hash: str) -> None:
+        """'Als Variante duplizieren' (20.04, Q8) – Muster service_win."""
+        try:
+            if set_id and service_id:
+                self._duplicate_set_instance(set_id, service_id)
+                return
+            if plugin_id:
+                self._duplicate_preset(plugin_id, instance_hash)
+                return
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _next_preset_copy_name(self, plugin_id: str, base: str) -> str:
+        """Naechster freier Preset-Name '<base> (Kopie)', '(Kopie 2)', ..."""
+        try:
+            sm = self.model.state_manager
+            existing = {str(p.get("preset_name") or "")
+                        for p in (sm.list_plugin_presets(plugin_id) or [])
+                        if isinstance(p, dict)}
+        except Exception:
+            existing = set()
+        if base not in existing:
+            return base
+        candidate = f"{base} (Kopie)"
+        i = 2
+        while candidate in existing:
+            i += 1
+            candidate = f"{base} (Kopie {i})"
+        return candidate
+
+    def _duplicate_set_instance(self, set_id: str, service_id: str) -> None:
+        """Dupliziert eine Service-Instanz in ihrem Set (Q8)."""
+        if self.set_repo is None:
+            return
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception:
+            return
+        if not definition:
+            return
+        services = dict(definition.get("services") or {})
+        cfg = services.get(service_id)
+        if not isinstance(cfg, dict):
+            return
+        pid = str(cfg.get("plugin_id") or service_id)
+        iid = self._next_instance_id(services, pid)
+        copy = dict(cfg)
+        copy["params"] = dict(cfg.get("params") or {})
+        from analytics.engine.service_models import generate_instance_hash
+        copy["instance_hash"] = generate_instance_hash(pid, copy["params"])
+        copy.pop("description", None)
+        copy.pop("doc_log", None)
+        services[iid] = copy
+        order = list(definition.get("execution_order") or [])
+        order.append(iid)
+        definition["execution_order"] = order
+        definition["services"] = services
+        try:
+            self.set_repo.save_set(definition)
+        except Exception:
+            return
+        event_bus.service_set_changed.emit()
+
+    def _duplicate_preset(self, plugin_id: str, instance_hash: str) -> None:
+        """Dupliziert einen Plugin-Clone als neues Preset (Q8)."""
+        try:
+            sm = self.model.state_manager
+        except Exception:
+            return
+        base = "Default"
+        params = {}
+        indicator_id = plugin_id
+        version = "1.0.0"
+        if instance_hash:
+            preset = self._find_preset_for_hash(plugin_id, instance_hash)
+            if preset is None:
+                return
+            base = str(preset.get("preset_name") or "Default")
+            params = dict(preset.get("params") or {})
+            indicator_id = str(preset.get("indicator_id") or plugin_id)
+            version = preset.get("version") or "1.0.0"
+        else:
+            # Flaches Plugin-Blatt: aktuelle Standalone-Parameter.
+            try:
+                raw = sm.get_global_value(f"plugin_params_{plugin_id}", {})
+            except Exception:
+                raw = {}
+            if not isinstance(raw, dict):
+                raw = {}
+            params = dict(raw.get("params") or {})
+            version = raw.get("version") or "1.0.0"
+        new_name = self._next_preset_copy_name(plugin_id, base)
+        try:
+            sm.save_indicator_preset(
+                indicator_id, new_name, params,
+                plugin_id=plugin_id,
+                version=version,
+                # Q8-Bugfix: Kopie IMMER batch-aktiv (nicht Erbe vom
+                # Quell-Preset), damit Scans/LiveAnalyzer sie berechnen.
+                is_active_batch=True,
+                doc_log="",
+            )
+        except Exception:
+            return
+        event_bus.service_set_changed.emit()
+
+    @Slot(str, str, str, str)
+    def _on_data_only_purge(self, set_id: str, service_id: str,
+                            plugin_id: str, instance_hash: str) -> None:
+        """'Data Only Löschen' (Q5): Feature-Daten purgen, Struktur bleibt."""
+        if not instance_hash:
+            return
+        reply = QMessageBox.question(
+            self, "Data Only Löschen",
+            f"Feature-Daten der Variante #{instance_hash} löschen?\n"
+            "Struktur, Parameter und Doc-Log bleiben erhalten.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            from analytics.features.feature_builder import FeatureBuilder
+            FeatureBuilder().purge_instance_data(instance_hash)
+        except Exception:
+            pass
+        event_bus.service_set_changed.emit()
+
+    @Slot(str, str, str, str)
+    def _on_delete_complete(self, set_id: str, service_id: str,
+                            plugin_id: str, instance_hash: str) -> None:
+        """'Vollständig Löschen': Preset/Instanz + Daten entfernen."""
+        try:
+            sm = self.model.state_manager
+        except Exception:
+            return
+        if set_id and service_id and self.set_repo is not None:
+            try:
+                definition = self.set_repo.get_set(set_id)
+            except Exception:
+                return
+            if not definition:
+                return
+            services = dict(definition.get("services") or {})
+            cfg = services.get(service_id)
+            if not isinstance(cfg, dict):
+                return
+            label = str(cfg.get("plugin_id") or service_id)
+            reply = QMessageBox.question(
+                self, "Vollständig Löschen",
+                f"Instanz '{service_id}' aus Set '{set_id}' vollständig "
+                "löschen?\n\nDas Preset wird entfernt UND die "
+                "berechneten Feature-Daten gelöscht.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+            services.pop(service_id, None)
+            order = [i for i in (definition.get("execution_order") or [])
+                     if i != service_id]
+            definition["execution_order"] = order
+            definition["services"] = services
+            try:
+                self.set_repo.save_set(definition)
+            except Exception:
+                return
+            if instance_hash:
+                try:
+                    from analytics.features.feature_builder import (
+                        FeatureBuilder)
+                    FeatureBuilder().purge_instance_data(instance_hash)
+                except Exception:
+                    pass
+            event_bus.service_set_changed.emit()
+            return
+        if plugin_id and instance_hash:
+            preset = self._find_preset_for_hash(plugin_id, instance_hash)
+            if preset is None:
+                return
+            preset_name = str(preset.get("preset_name") or "Default")
+            indicator_id = str(preset.get("indicator_id") or "")
+            reply = QMessageBox.question(
+                self, "Vollständig Löschen",
+                f"Preset '{preset_name}' von '{plugin_id}' vollständig "
+                "löschen?\n\nDas Preset wird entfernt UND die "
+                "berechneten Feature-Daten gelöscht.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+            if sm is not None and indicator_id:
+                try:
+                    sm.delete_indicator_preset(indicator_id, preset_name)
+                except Exception:
+                    return
+            if instance_hash:
+                try:
+                    from analytics.features.feature_builder import (
+                        FeatureBuilder)
+                    FeatureBuilder().purge_instance_data(instance_hash)
+                except Exception:
+                    pass
+            event_bus.service_set_changed.emit()
+
+    @Slot(str, str, str, str)
+    def _on_doc_log_requested(self, set_id: str, service_id: str,
+                              plugin_id: str, instance_hash: str) -> None:
+        """'Doc Log bearbeiten' (Q7) – Read-Only-Hinweis im Picker.
+
+        Der Dialog ist ein Read-Only-Datenquellen-Picker ohne Editor – die
+        vollstaendige Doc-Log-Bearbeitung uebernimmt das ServiceWindow. Hier
+        wird eine kurze Info angezeigt, damit der Menuepunkt nicht wirkungslos
+        bleibt.
+        """
+        try:
+            if set_id and service_id:
+                QMessageBox.information(
+                    self, "Doc Log",
+                    "Die Doc-Log-Bearbeitung erfolgt im ServiceWindow "
+                    "(Kontextmenü der Instanz).")
+                return
+            if plugin_id and instance_hash:
+                preset = self._find_preset_for_hash(plugin_id, instance_hash)
+                doc = str((preset or {}).get("doc_log") or "")
+                QMessageBox.information(
+                    self, "Doc Log",
+                    f"Doc Log von '{plugin_id}':\n\n{doc or '(leer)'}\n\n"
+                    "Bearbeitung im ServiceWindow (Kontextmenü des Clones).")
+                return
+        except (RuntimeError, AttributeError):
+            pass
 
     def _next_instance_id(self, services: Dict[str, Any],
                           plugin_id: str) -> str:
