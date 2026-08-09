@@ -126,9 +126,12 @@ PyTrader/
         symbols_win.py
         trash_dialog.py
     test/
+        _append_20_03_bugfix.py
         check_bugfix_0808.py
+        check_dialog_host.py
         check_heatmap_200201.py
         check_heatmap_bugfix.py
+        check_output_schema.py
         check_page_nav.py
         check_wal_guard.py
         check_wal_recovery.py
@@ -11067,6 +11070,30 @@ _GRID_LINES_SCHEMA: Dict[str, ParameterSchema] = {
     "prox_level6": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 6"},
 }
 
+# ---------------------------------------------------------------------------
+# OUTPUT-SCHEMA (20.03): Resultatfelder je feature_data-Record.
+# `bar_time` ist eine native DB-Spalte und wird NICHT deklariert (E4).
+# `type` sind freie Strings (E5). `technical: True` -> kompakte Anzeige im
+# Unterblock `🔧 System-Metrik` (E2).
+# ---------------------------------------------------------------------------
+_GRID_OUTPUT_SCHEMA: Dict[str, Dict[str, Any]] = {
+    "grid_nearest_level": {
+        "type": "float",
+        "description": "Nächstes Grid-Level zum Close (Center = round(close/step_size) × step_size)",
+    },
+    "grid_step": {
+        "type": "float",
+        "description": "Rasterabstand (step_size) der Grid-Konstruktion",
+    },
+    "upper_level": {
+        "type": "float",
+        "description": "Obere Klammer = Center + step_size",
+    },
+    "lower_level": {
+        "type": "float",
+        "description": "Untere Klammer = Center - step_size",
+    },
+}
 
 def _parse_custom_levels(raw: Any) -> List[float]:
     """Akzeptiert Liste/Tupel ODER Komma-/Semikolon-String; nur Werte > 0."""
@@ -11228,6 +11255,13 @@ class GridLinesService(PluginFeature):
         (PineScript-Input-Zone, kein geteiltes mutable Dict: flache Kopie).
         """
         return {k: dict(v) for k, v in _GRID_LINES_SCHEMA.items()}
+
+    @property
+    def output_schema(self) -> Dict[str, Dict[str, Any]]:
+        """Output-Schema (20.03): flache Kopie der Modul-Konstante
+        `_GRID_OUTPUT_SCHEMA` (PineScript-Input-Zone, M1: kein geteiltes
+        mutable Dict)."""
+        return {k: dict(v) for k, v in _GRID_OUTPUT_SCHEMA.items()}
 
     def calculate(
         self,
@@ -11437,6 +11471,41 @@ _PROXIMITY_SCHEMA: Dict[str, ParameterSchema] = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# OUTPUT-SCHEMA (20.03): Resultatfelder je feature_data-Record.
+# `bar_time` ist eine native DB-Spalte und wird NICHT deklariert (E4).
+# `type` sind freie Strings (E5). `technical: True` -> kompakte Anzeige im
+# Unterblock `🔧 System-Metrik` (E2).
+# ---------------------------------------------------------------------------
+_PROXIMITY_OUTPUT_SCHEMA: Dict[str, Dict[str, Any]] = {
+    "levels_hit": {
+        "type": "list[float]",
+        "description": "Getroffene Grid-Level der Bar (near/Piercing-Semantik, Parität grid_math.py)",
+    },
+    "is_hit": {
+        "type": "bool",
+        "description": "True, wenn die Bar mindestens ein Grid-Level trifft",
+    },
+    "in_time_window": {
+        "type": "bool",
+        "description": "True, wenn die Bar im nativen UTC-Zeitfenster (Minute 0/30 ± time_window_mins) liegt",
+    },
+    "time_window_mins": {
+        "type": "int",
+        "description": "Fenster-Minuten (Parameter-Abbild im Record)",
+        "technical": True,
+    },
+    "use_time_filter": {
+        "type": "bool",
+        "description": "Time-Filter aktiv (Parameter-Abbild im Record)",
+        "technical": True,
+    },
+    "visit_pct": {
+        "type": "float",
+        "description": "Prozentuale Toleranz um jede Linie (Parameter-Abbild im Record)",
+        "technical": True,
+    },
+}
 
 def _bar_utc_minutes(df: pd.DataFrame) -> List[int]:
     """UTC-Minute (0-59) jeder Bar – konsistent zu ind_fixed_grid_proximity.py.
@@ -11572,6 +11641,13 @@ class ProximityService(PluginFeature):
         (PineScript-Input-Zone, kein geteiltes mutable Dict: flache Kopie).
         """
         return {k: dict(v) for k, v in _PROXIMITY_SCHEMA.items()}
+
+    @property
+    def output_schema(self) -> Dict[str, Dict[str, Any]]:
+        """Output-Schema (20.03): flache Kopie der Modul-Konstante
+        `_PROXIMITY_OUTPUT_SCHEMA` (PineScript-Input-Zone, M1: kein
+        geteiltes mutable Dict)."""
+        return {k: dict(v) for k, v in _PROXIMITY_OUTPUT_SCHEMA.items()}
 
     def calculate(
         self,
@@ -11850,6 +11926,74 @@ _SWING_MOMENTUM_SCHEMA: Dict[str, ParameterSchema] = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# OUTPUT-SCHEMA (20.03): Resultatfelder je feature_data-Record (Datenvertrag
+# 17.01 §4). `bar_time` ist eine native DB-Spalte und wird NICHT deklariert
+# (E4). `type` sind freie Strings (E5). `technical: True` -> kompakte
+# Anzeige im Unterblock `🔧 System-Metrik` (E2).
+# ---------------------------------------------------------------------------
+_SWING_MOMENTUM_OUTPUT_SCHEMA: Dict[str, Dict[str, Any]] = {
+    "result_type": {
+        "type": "str",
+        "description": "Klassifikation des Records (immer 'SWING')",
+        "technical": True,
+    },
+    "source_mode": {
+        "type": "str",
+        "description": "Aktiver Algorithmus-Modus (MA_Peak_Hysteresis/MA_Slope_Change/Chande_Kroll_Ratchet)",
+        "technical": True,
+    },
+    "calculation_status": {
+        "type": "str",
+        "description": "Berechnungsstatus ('OK' | 'INSUFFICIENT_DATA')",
+        "technical": True,
+    },
+    "is_swing_high": {
+        "type": "bool",
+        "description": "True, wenn die Bar ein bestätigtes Swing-High ist",
+    },
+    "is_swing_low": {
+        "type": "bool",
+        "description": "True, wenn die Bar ein bestätigtes Swing-Low ist",
+    },
+    "is_rejection": {
+        "type": "bool",
+        "description": "Rejection-Flag (Momentum: immer False)",
+    },
+    "event_bar_time": {
+        "type": "int",
+        "description": "Wanduhr-Epoch des tatsächlichen Extremums (kausal, kein Look-ahead)",
+        "technical": True,
+    },
+    "confirmation_bar_time": {
+        "type": "int",
+        "description": "Wanduhr-Epoch, an der das Signal kausal feststand",
+        "technical": True,
+    },
+    "confirmation_lag_bars": {
+        "type": "int",
+        "description": "Dynamische Bestätigungs-Verzögerung in Bars",
+        "technical": True,
+    },
+    "confirmation_type": {
+        "type": "str",
+        "description": "Bestätigungsart (immer 'CAUSAL')",
+        "technical": True,
+    },
+    "price": {
+        "type": "float",
+        "description": "Preis des Extremums (MA-/High-/Low-Wert) bzw. Close bei Nicht-Swing-Bars",
+    },
+    "strength_value": {
+        "type": "float",
+        "description": "Signalstärke (PERCENT: Gegenbewegung %; NORMALIZED: |Steigung|; ATR_MULTIPLE: ATR-Einheiten)",
+    },
+    "strength_type": {
+        "type": "str",
+        "description": "Stärke-Maßstab ('PERCENT' | 'NORMALIZED' | 'ATR_MULTIPLE')",
+        "technical": True,
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Modul-Helfer (17.01.02: echte Swing-Erkennung statt Scaffold)
@@ -12066,6 +12210,13 @@ class SrvSwingMomentum(PluginFeature):
         """Flache Kopie der Modul-Konstante `_SWING_MOMENTUM_SCHEMA`
         (PineScript-Input-Zone am Dateianfang, M1: kein geteiltes Dict)."""
         return {k: dict(v) for k, v in _SWING_MOMENTUM_SCHEMA.items()}
+
+    @property
+    def output_schema(self) -> Dict[str, Dict[str, Any]]:
+        """Output-Schema (20.03): flache Kopie der Modul-Konstante
+        `_SWING_MOMENTUM_OUTPUT_SCHEMA` (PineScript-Input-Zone, M1: kein
+        geteiltes mutable Dict)."""
+        return {k: dict(v) for k, v in _SWING_MOMENTUM_OUTPUT_SCHEMA.items()}
 
     # 2. SCHEMA-EXPOSURE FÜR DIE UI (07.08.2026, Bugfix): Die Spalten-UI
     # (serviceui/param_columns.py & ServiceSelectorWidget) liest Parameter-
@@ -12359,6 +12510,74 @@ _SWING_STRUCTURE_SCHEMA: Dict[str, ParameterSchema] = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# OUTPUT-SCHEMA (20.03): Resultatfelder je feature_data-Record (Datenvertrag
+# 17.01 §4). `bar_time` ist eine native DB-Spalte und wird NICHT deklariert
+# (E4). `type` sind freie Strings (E5). `technical: True` -> kompakte
+# Anzeige im Unterblock `🔧 System-Metrik` (E2).
+# ---------------------------------------------------------------------------
+_SWING_STRUCTURE_OUTPUT_SCHEMA: Dict[str, Dict[str, Any]] = {
+    "result_type": {
+        "type": "str",
+        "description": "Klassifikation des Records (immer 'SWING')",
+        "technical": True,
+    },
+    "source_mode": {
+        "type": "str",
+        "description": "Aktiver Erkennungs-Modus (Williams_Fractal/Standard_Pivot/Gann_Mechanical/ZigZag_*/Period_Extrema)",
+        "technical": True,
+    },
+    "calculation_status": {
+        "type": "str",
+        "description": "Berechnungsstatus ('OK' | 'INSUFFICIENT_DATA')",
+        "technical": True,
+    },
+    "is_swing_high": {
+        "type": "bool",
+        "description": "True, wenn die Bar ein bestätigtes Swing-High ist",
+    },
+    "is_swing_low": {
+        "type": "bool",
+        "description": "True, wenn die Bar ein bestätigtes Swing-Low ist",
+    },
+    "is_rejection": {
+        "type": "bool",
+        "description": "Rejection-Flag (Struktur: immer False)",
+    },
+    "event_bar_time": {
+        "type": "int",
+        "description": "Wanduhr-Epoch des tatsächlichen Extremums (kausal, kein Look-ahead)",
+        "technical": True,
+    },
+    "confirmation_bar_time": {
+        "type": "int",
+        "description": "Wanduhr-Epoch, an der das Signal kausal feststand",
+        "technical": True,
+    },
+    "confirmation_lag_bars": {
+        "type": "int",
+        "description": "Dynamische Bestätigungs-Verzögerung in Bars (right_bars bzw. Modus-Verzögerung)",
+        "technical": True,
+    },
+    "confirmation_type": {
+        "type": "str",
+        "description": "Bestätigungsart ('FRACTAL' | 'PIVOT' | 'CAUSAL' | 'SESSION_CLOSE')",
+        "technical": True,
+    },
+    "price": {
+        "type": "float",
+        "description": "Preis des Extremums (High/Low) bzw. Close bei Nicht-Swing-Bars",
+    },
+    "strength_value": {
+        "type": "float",
+        "description": "Signalstärke (ATR_MULTIPLE: ATR-Einheiten; PERCENT: %; PRICE_DISTANCE: Preisdistanz)",
+    },
+    "strength_type": {
+        "type": "str",
+        "description": "Stärke-Maßstab ('NORMALIZED' | 'ATR_MULTIPLE' | 'PERCENT' | 'PRICE_DISTANCE')",
+        "technical": True,
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Modul-Helfer (17.01.02: echte Swing-Erkennung statt Scaffold)
@@ -12619,6 +12838,13 @@ class SrvSwingStructure(PluginFeature):
         """Flache Kopie der Modul-Konstante `_SWING_STRUCTURE_SCHEMA`
         (PineScript-Input-Zone am Dateianfang, M1: kein geteiltes Dict)."""
         return {k: dict(v) for k, v in _SWING_STRUCTURE_SCHEMA.items()}
+
+    @property
+    def output_schema(self) -> Dict[str, Dict[str, Any]]:
+        """Output-Schema (20.03): flache Kopie der Modul-Konstante
+        `_SWING_STRUCTURE_OUTPUT_SCHEMA` (PineScript-Input-Zone, M1: kein
+        geteiltes mutable Dict)."""
+        return {k: dict(v) for k, v in _SWING_STRUCTURE_OUTPUT_SCHEMA.items()}
 
     # 2. SCHEMA-EXPOSURE FÜR DIE UI (07.08.2026, Bugfix): Die Spalten-UI
     # (serviceui/param_columns.py & ServiceSelectorWidget) liest Parameter-
@@ -12967,6 +13193,115 @@ _SWING_VOLUME_PROFILE_SCHEMA: Dict[str, ParameterSchema] = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# OUTPUT-SCHEMA (20.03): Resultatfelder je feature_data-Record (Datenvertrag
+# 17.01 §4, modus-spezifische Zusatzfelder §4.2). `bar_time` ist eine native
+# DB-Spalte und wird NICHT deklariert (E4). `type` sind freie Strings (E5).
+# `technical: True` -> kompakte Anzeige im Unterblock `🔧 System-Metrik` (E2).
+# ---------------------------------------------------------------------------
+_SWING_VOLUME_PROFILE_OUTPUT_SCHEMA: Dict[str, Dict[str, Any]] = {
+    "result_type": {
+        "type": "str",
+        "description": "Klassifikation des Records ('LEVEL' | 'VWAP')",
+        "technical": True,
+    },
+    "source_mode": {
+        "type": "str",
+        "description": "Aktiver Modus (Volume_Profile/Grid_Proximity/Anchored_VWAP)",
+        "technical": True,
+    },
+    "calculation_status": {
+        "type": "str",
+        "description": "Berechnungsstatus ('OK' | 'INSUFFICIENT_DATA')",
+        "technical": True,
+    },
+    "is_swing_high": {
+        "type": "bool",
+        "description": "True, wenn der Close über VAH bzw. über Upper-Band liegt",
+    },
+    "is_swing_low": {
+        "type": "bool",
+        "description": "True, wenn der Close unter VAL bzw. unter Lower-Band liegt",
+    },
+    "is_rejection": {
+        "type": "bool",
+        "description": "True bei LVN-Rejection (Close nahe LVN) – nur Volume_Profile",
+    },
+    "event_bar_time": {
+        "type": "int",
+        "description": "Wanduhr-Epoch des Events (Session_Start beim VWAP, sonst Bar selbst)",
+        "technical": True,
+    },
+    "confirmation_bar_time": {
+        "type": "int",
+        "description": "Wanduhr-Epoch, an der das Signal kausal feststand",
+        "technical": True,
+    },
+    "confirmation_lag_bars": {
+        "type": "int",
+        "description": "Bestätigungs-Verzögerung in Bars (VWAP: Bars seit Anker)",
+        "technical": True,
+    },
+    "confirmation_type": {
+        "type": "str",
+        "description": "Bestätigungsart (immer 'CAUSAL')",
+        "technical": True,
+    },
+    "price": {
+        "type": "float",
+        "description": "Close-Preis der Bar",
+    },
+    "strength_value": {
+        "type": "float",
+        "description": "Signalstärke (VOLUME_RATIO: Volumen/POC-Volumen; NORMALIZED: |Distanz|/grid_step; PRICE_DISTANCE: |Close-VWAP|/StDev)",
+    },
+    "strength_type": {
+        "type": "str",
+        "description": "Stärke-Maßstab ('VOLUME_RATIO' | 'NORMALIZED' | 'PRICE_DISTANCE')",
+        "technical": True,
+    },
+    "volume_source": {
+        "type": "str",
+        "description": "Volumenquelle (tick_volume/real_volume) – nur Volume_Profile",
+        "technical": True,
+    },
+    "poc_price": {
+        "type": "float",
+        "description": "Point of Control (volumenstärkste Preisstufe) – nur Volume_Profile, nullbar",
+    },
+    "vah_price": {
+        "type": "float",
+        "description": "Value Area High (obere Wertbereichsgrenze) – nur Volume_Profile, nullbar",
+    },
+    "val_price": {
+        "type": "float",
+        "description": "Value Area Low (untere Wertbereichsgrenze) – nur Volume_Profile, nullbar",
+    },
+    "lvn_price": {
+        "type": "float",
+        "description": "Nächstgelegener Low Volume Node zum Close – nur Volume_Profile, nullbar",
+    },
+    "is_lvn_swing": {
+        "type": "bool",
+        "description": "True bei LVN-Rejection – nur Volume_Profile",
+    },
+    "grid_price": {
+        "type": "float",
+        "description": "Nächstes Raster-Level (round(close/grid_step) × grid_step) – nur Grid_Proximity",
+    },
+    "vwap_price": {
+        "type": "float",
+        "description": "Anchored VWAP (kumulativ ab Perioden-Start) – nur Anchored_VWAP",
+    },
+    "vwap_upper": {
+        "type": "float",
+        "description": "Oberes VWAP-Band (VWAP + band_mult × StDev) – nur Anchored_VWAP",
+    },
+    "vwap_lower": {
+        "type": "float",
+        "description": "Unteres VWAP-Band (VWAP - band_mult × StDev) – nur Anchored_VWAP",
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Modul-Helfer (17.01.02: echte Erkennung statt Scaffold)
@@ -13204,6 +13539,13 @@ class SrvSwingVolumeProfile(PluginFeature):
         """Flache Kopie der Modul-Konstante `_SWING_VOLUME_PROFILE_SCHEMA`
         (PineScript-Input-Zone am Dateianfang, M1: kein geteiltes Dict)."""
         return {k: dict(v) for k, v in _SWING_VOLUME_PROFILE_SCHEMA.items()}
+
+    @property
+    def output_schema(self) -> Dict[str, Dict[str, Any]]:
+        """Output-Schema (20.03): flache Kopie der Modul-Konstante
+        `_SWING_VOLUME_PROFILE_OUTPUT_SCHEMA` (PineScript-Input-Zone, M1:
+        kein geteiltes mutable Dict)."""
+        return {k: dict(v) for k, v in _SWING_VOLUME_PROFILE_OUTPUT_SCHEMA.items()}
 
     # 2. SCHEMA-EXPOSURE FÜR DIE UI (07.08.2026, Bugfix): Die Spalten-UI
     # (serviceui/param_columns.py & ServiceSelectorWidget) liest Parameter-
@@ -13535,6 +13877,98 @@ _TREND_BREAKOUT_SCHEMA: Dict[str, ParameterSchema] = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# OUTPUT-SCHEMA (20.03): Resultatfelder je feature_data-Record (Datenvertrag
+# 17.02 §3). `bar_time` ist eine native DB-Spalte und wird NICHT deklariert
+# (E4). `type` sind freie Strings (E5). `technical: True` -> kompakte
+# Anzeige im Unterblock `🔧 System-Metrik` (E2).
+# ---------------------------------------------------------------------------
+_TREND_BREAKOUT_OUTPUT_SCHEMA: Dict[str, Dict[str, Any]] = {
+    "result_type": {
+        "type": "str",
+        "description": "Klassifikation des Records ('BREAKOUT' bei Signal, sonst 'TREND')",
+        "technical": True,
+    },
+    "source_mode": {
+        "type": "str",
+        "description": "Aktiver Algorithmus (Supertrend_ATR/Donchian_Keltner_Breakout)",
+        "technical": True,
+    },
+    "calculation_status": {
+        "type": "str",
+        "description": "Berechnungsstatus ('OK' | 'INSUFFICIENT_DATA')",
+        "technical": True,
+    },
+    "is_trend_up": {
+        "type": "bool",
+        "description": "True, wenn der Close über der Supertrend-Linie bzw. dem Upper-Band liegt",
+    },
+    "is_trend_down": {
+        "type": "bool",
+        "description": "True, wenn der Close unter der Supertrend-Linie bzw. dem Lower-Band liegt",
+    },
+    "is_reversal_up": {
+        "type": "bool",
+        "description": "Reversal-Up-Flag (Breakout: immer False)",
+    },
+    "is_reversal_down": {
+        "type": "bool",
+        "description": "Reversal-Down-Flag (Breakout: immer False)",
+    },
+    "event_bar_time": {
+        "type": "int",
+        "description": "Wanduhr-Epoch der Bar (Bar-Close-Signal, event == confirmation)",
+        "technical": True,
+    },
+    "confirmation_bar_time": {
+        "type": "int",
+        "description": "Wanduhr-Epoch der Bestätigung (identisch zu event_bar_time)",
+        "technical": True,
+    },
+    "confirmation_lag_bars": {
+        "type": "int",
+        "description": "Bestätigungs-Verzögerung (immer 0, Bar-Close-Signal)",
+        "technical": True,
+    },
+    "confirmation_type": {
+        "type": "str",
+        "description": "Bestätigungsart (immer 'BAR_CLOSE')",
+        "technical": True,
+    },
+    "trend_strength": {
+        "type": "float",
+        "description": "Signalstärke (ATR_DISTANCE: Distanz zur Linie in ATR-Einheiten bzw. zum Kanal-Mittel)",
+    },
+    "strength_type": {
+        "type": "str",
+        "description": "Stärke-Maßstab (immer 'ATR_DISTANCE')",
+        "technical": True,
+    },
+    "reference_price": {
+        "type": "float",
+        "description": "Close-Preis der Bar (Referenzpreis)",
+    },
+    "supertrend_line": {
+        "type": "float",
+        "description": "Supertrend-Linienwert – nur Supertrend_ATR, nullbar",
+    },
+    "atr_value": {
+        "type": "float",
+        "description": "ATR-Wert – nur Supertrend_ATR, nullbar",
+    },
+    "upper_band": {
+        "type": "float",
+        "description": "Oberes Kanalband – nur Donchian_Keltner_Breakout, nullbar",
+    },
+    "lower_band": {
+        "type": "float",
+        "description": "Unteres Kanalband – nur Donchian_Keltner_Breakout, nullbar",
+    },
+    "middle_band": {
+        "type": "float",
+        "description": "Kanal-Mittelband – nur Donchian_Keltner_Breakout, nullbar",
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Modul-Helfer (17.02: direkte, vollstaendige Erkennung statt Scaffold)
@@ -13727,6 +14161,13 @@ class SrvTrendBreakout(PluginFeature):
         """Flache Kopie der Modul-Konstante `_TREND_BREAKOUT_SCHEMA`
         (PineScript-Input-Zone am Dateianfang, M1: kein geteiltes Dict)."""
         return {k: dict(v) for k, v in _TREND_BREAKOUT_SCHEMA.items()}
+
+    @property
+    def output_schema(self) -> Dict[str, Dict[str, Any]]:
+        """Output-Schema (20.03): flache Kopie der Modul-Konstante
+        `_TREND_BREAKOUT_OUTPUT_SCHEMA` (PineScript-Input-Zone, M1: kein
+        geteiltes mutable Dict)."""
+        return {k: dict(v) for k, v in _TREND_BREAKOUT_OUTPUT_SCHEMA.items()}
 
     # 2. SCHEMA-EXPOSURE FUER DIE UI (17.01.04, Bugfix): Siehe
     # srv_trend_regime.py - identischer Basisklassen-Vertrag.
@@ -13979,6 +14420,86 @@ _TREND_HMA_PIVOT_SCHEMA: Dict[str, ParameterSchema] = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# OUTPUT-SCHEMA (20.03): Resultatfelder je feature_data-Record (Datenvertrag
+# 17.02 §3, §3.2). `bar_time` ist eine native DB-Spalte und wird NICHT
+# deklariert (E4). `type` sind freie Strings (E5). `technical: True` ->
+# kompakte Anzeige im Unterblock `🔧 System-Metrik` (E2).
+# ---------------------------------------------------------------------------
+_TREND_HMA_PIVOT_OUTPUT_SCHEMA: Dict[str, Dict[str, Any]] = {
+    "result_type": {
+        "type": "str",
+        "description": "Klassifikation des Records ('REVERSAL' bei Trendwechsel, sonst 'TREND')",
+        "technical": True,
+    },
+    "source_mode": {
+        "type": "str",
+        "description": "Aktiver Algorithmus (immer 'HMA_Peak_Toleranz')",
+        "technical": True,
+    },
+    "calculation_status": {
+        "type": "str",
+        "description": "Berechnungsstatus ('OK' | 'INSUFFICIENT_DATA')",
+        "technical": True,
+    },
+    "is_trend_up": {
+        "type": "bool",
+        "description": "True, wenn MA das Pending-Low um piv_maxHmaMovePct % nach oben durchbrochen hat",
+    },
+    "is_trend_down": {
+        "type": "bool",
+        "description": "True, wenn MA das Pending-High um piv_maxHmaMovePct % nach unten durchbrochen hat",
+    },
+    "is_reversal_up": {
+        "type": "bool",
+        "description": "Reversal-Up-Flag (is_trend_up und nicht is_trend_down)",
+    },
+    "is_reversal_down": {
+        "type": "bool",
+        "description": "Reversal-Down-Flag (is_trend_down und nicht is_trend_up)",
+    },
+    "event_bar_time": {
+        "type": "int",
+        "description": "Wanduhr-Epoch der Bar (Bar-Close-Signal, event == confirmation)",
+        "technical": True,
+    },
+    "confirmation_bar_time": {
+        "type": "int",
+        "description": "Wanduhr-Epoch der Bestätigung (identisch zu event_bar_time)",
+        "technical": True,
+    },
+    "confirmation_lag_bars": {
+        "type": "int",
+        "description": "Bestätigungs-Verzögerung (immer 0, Bar-Close-Signal)",
+        "technical": True,
+    },
+    "confirmation_type": {
+        "type": "str",
+        "description": "Bestätigungsart (immer 'BAR_CLOSE')",
+        "technical": True,
+    },
+    "trend_strength": {
+        "type": "float",
+        "description": "Signalstärke (PERCENT: prozentuale Distanz des Close vom Pending-Extremwert)",
+    },
+    "strength_type": {
+        "type": "str",
+        "description": "Stärke-Maßstab (immer 'PERCENT')",
+        "technical": True,
+    },
+    "reference_price": {
+        "type": "float",
+        "description": "Close-Preis der Bar (Referenzpreis)",
+    },
+    "ma_value": {
+        "type": "float",
+        "description": "Geglätteter MA-Wert der Bar (EHMA/HMA) – nullbar",
+    },
+    "pending_extreme_value": {
+        "type": "float",
+        "description": "Letzter extremer MA-Wert (piv_pendingExtremeValue) – nullbar",
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Modul-Helfer (17.02: direkte, vollstaendige Erkennung statt Scaffold)
@@ -14135,6 +14656,13 @@ class SrvTrendHmaPivot(PluginFeature):
         """Flache Kopie der Modul-Konstante `_TREND_HMA_PIVOT_SCHEMA`
         (PineScript-Input-Zone am Dateianfang, M1: kein geteiltes Dict)."""
         return {k: dict(v) for k, v in _TREND_HMA_PIVOT_SCHEMA.items()}
+
+    @property
+    def output_schema(self) -> Dict[str, Dict[str, Any]]:
+        """Output-Schema (20.03): flache Kopie der Modul-Konstante
+        `_TREND_HMA_PIVOT_OUTPUT_SCHEMA` (PineScript-Input-Zone, M1: kein
+        geteiltes mutable Dict)."""
+        return {k: dict(v) for k, v in _TREND_HMA_PIVOT_OUTPUT_SCHEMA.items()}
 
     # 2. SCHEMA-EXPOSURE FUER DIE UI (17.01.04, Bugfix): Siehe
     # srv_trend_regime.py - identischer Basisklassen-Vertrag.
@@ -14386,6 +14914,106 @@ _TREND_REGIME_SCHEMA: Dict[str, ParameterSchema] = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# OUTPUT-SCHEMA (20.03): Resultatfelder je feature_data-Record (Datenvertrag
+# 17.02 §3). `bar_time` ist eine native DB-Spalte und wird NICHT deklariert
+# (E4). `type` sind freie Strings (E5). `technical: True` -> kompakte
+# Anzeige im Unterblock `🔧 System-Metrik` (E2).
+# ---------------------------------------------------------------------------
+_TREND_REGIME_OUTPUT_SCHEMA: Dict[str, Dict[str, Any]] = {
+    "result_type": {
+        "type": "str",
+        "description": "Klassifikation des Records ('REVERSAL' bei Z-Score-Signal, sonst 'TREND')",
+        "technical": True,
+    },
+    "source_mode": {
+        "type": "str",
+        "description": "Aktiver Algorithmus (Linear_Regression_Slope/ADX_DMI/ZScore_Mean_Distance)",
+        "technical": True,
+    },
+    "calculation_status": {
+        "type": "str",
+        "description": "Berechnungsstatus ('OK' | 'INSUFFICIENT_DATA')",
+        "technical": True,
+    },
+    "is_trend_up": {
+        "type": "bool",
+        "description": "LinReg: Slope > 0 und R2 >= Threshold; ADX: +DI > -DI und ADX >= Threshold",
+    },
+    "is_trend_down": {
+        "type": "bool",
+        "description": "LinReg: Slope < 0 und R2 >= Threshold; ADX: -DI > +DI und ADX >= Threshold",
+    },
+    "is_reversal_up": {
+        "type": "bool",
+        "description": "Z-Score: True bei Z <= -z_thresh (überverkauft)",
+    },
+    "is_reversal_down": {
+        "type": "bool",
+        "description": "Z-Score: True bei Z >= +z_thresh (überkauft)",
+    },
+    "event_bar_time": {
+        "type": "int",
+        "description": "Wanduhr-Epoch der Bar (Bar-Close-Signal, event == confirmation)",
+        "technical": True,
+    },
+    "confirmation_bar_time": {
+        "type": "int",
+        "description": "Wanduhr-Epoch der Bestätigung (identisch zu event_bar_time)",
+        "technical": True,
+    },
+    "confirmation_lag_bars": {
+        "type": "int",
+        "description": "Bestätigungs-Verzögerung (immer 0, Bar-Close-Signal)",
+        "technical": True,
+    },
+    "confirmation_type": {
+        "type": "str",
+        "description": "Bestätigungsart (immer 'BAR_CLOSE')",
+        "technical": True,
+    },
+    "trend_strength": {
+        "type": "float",
+        "description": "Signalstärke (R2_SCORE: R2; ADX_VALUE: ADX; Z_SCORE: |Z|)",
+    },
+    "strength_type": {
+        "type": "str",
+        "description": "Stärke-Maßstab ('R2_SCORE' | 'ADX_VALUE' | 'Z_SCORE')",
+        "technical": True,
+    },
+    "reference_price": {
+        "type": "float",
+        "description": "Close-Preis der Bar (Referenzpreis)",
+    },
+    "slope_value": {
+        "type": "float",
+        "description": "LinReg-Steigung des rolling Fensters – nur Linear_Regression_Slope, nullbar",
+    },
+    "r2_score": {
+        "type": "float",
+        "description": "Bestimmtheitsmaß R2 des rolling Fensters – nur Linear_Regression_Slope, nullbar",
+    },
+    "adx_value": {
+        "type": "float",
+        "description": "ADX-Wert – nur ADX_DMI, nullbar",
+    },
+    "plus_di": {
+        "type": "float",
+        "description": "+DI-Wert – nur ADX_DMI, nullbar",
+    },
+    "minus_di": {
+        "type": "float",
+        "description": "-DI-Wert – nur ADX_DMI, nullbar",
+    },
+    "z_score_value": {
+        "type": "float",
+        "description": "Z-Score (Close - MA) / rolling-std – nur ZScore_Mean_Distance, nullbar",
+    },
+    "mean_baseline": {
+        "type": "float",
+        "description": "MA-Baseline (Z-Score Nenner) – nur ZScore_Mean_Distance, nullbar",
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Modul-Helfer (17.02: direkte, vollstaendige Erkennung statt Scaffold)
@@ -14568,6 +15196,13 @@ class SrvTrendRegime(PluginFeature):
         """Flache Kopie der Modul-Konstante `_TREND_REGIME_SCHEMA`
         (PineScript-Input-Zone am Dateianfang, M1: kein geteiltes Dict)."""
         return {k: dict(v) for k, v in _TREND_REGIME_SCHEMA.items()}
+
+    @property
+    def output_schema(self) -> Dict[str, Dict[str, Any]]:
+        """Output-Schema (20.03): flache Kopie der Modul-Konstante
+        `_TREND_REGIME_OUTPUT_SCHEMA` (PineScript-Input-Zone, M1: kein
+        geteiltes mutable Dict)."""
+        return {k: dict(v) for k, v in _TREND_REGIME_OUTPUT_SCHEMA.items()}
 
     # 2. SCHEMA-EXPOSURE FUER DIE UI (17.01.04, Bugfix): Die Spalten-UI
     # (serviceui/param_columns.py & ServiceSelectorWidget) liest Parameter-
@@ -15050,6 +15685,26 @@ class PluginFeature(ABC):
         merged = dict(self.base_parameter_schema)
         merged.update(dict(self.parameter_schema or {}))
         return merged
+
+    @property
+    def output_schema(self) -> Dict[str, Dict[str, Any]]:
+        """Output-Schema (20.03): dokumentiert alle im `feature_data`-JSON
+        erzeugten Ergebnisspalten samt Typ und Beschreibung.
+
+        Format: {"field_name": {"type": str, "description": str,
+        "technical": bool (optional)}} – `technical: True` kennzeichnet
+        System-/Metadaten-Felder (z. B. calculation_status), die die UI
+        kompakt in einem Unterblock `🔧 System-Metrik` anzeigt (E2).
+
+        Konventionen (Kapitel 20.03, E1/E4/E5):
+          * Abwärtskompatibler Default: leeres Dict – Plugins ohne Schema
+            zeigen keinen Resultatfelder-Block.
+          * `bar_time` wird NICHT deklariert – es ist eine native
+            DB-Spalte, kein `feature_data`-JSON-Key (E4).
+          * `type` ist ein freier String (E5), z. B. "bool", "float",
+            "int", "str" oder "list[float]".
+        """
+        return {}
 
     @property
     def parameter_order(self) -> List[str]:
@@ -29034,13 +29689,18 @@ MAX_BADGE_CELL_CHARS = 24
 # die Konstante bleibt nur als Test-Referenz erhalten (Historik).
 BADGE_TRUNCATE_ICON = "i"
 
-# Bugfix 05.08.2026: Echter Info-Button (QPushButton "ℹ", Icon-Breite) in
-# Spalte 1 statt Badge-Text/'i'-Zeichen. Die Status-Spalte wird auf die
-# Button-Breite verkleinert (Spalte 0 ist Stretch und bekommt den freien
-# Platz). Der Button erscheint auf ALLEN Service-/Plugin-/Set-Zeilen; gehoert
-# die Zeile einem Indikator, ist er gelb (#FFD700) und traegt den Tooltip
-# 'aktiv/im <Indikator>' (Namenslogik unveraendert aus _apply_badge).
-INFO_BUTTON_TEXT = "ℹ"
+# Bugfix 20.03.01 (09.08.2026): Das Unicode-Zeichen "ℹ" (U+2139) rendert
+# unter Windows in Qt bei fehlendem Font als Tofu-Box – der Info-Button
+# war nicht mehr erkennbar (User-Meldung 'i-Button im Tree geht nicht
+# mehr'; vgl. Bugfix 04.08.2026, Punkt 5: Unicode-Badge '🛈' ebenfalls
+# durch ASCII 'i' ersetzt). Daher wieder ASCII 'i' als Button-Beschriftung.
+# Der QPushButton (Spalte 1) ersetzt seit 05.08.2026 das Badge-Text-'i';
+# die Status-Spalte wird auf die Button-Breite verkleinert (Spalte 0 ist
+# Stretch und bekommt den freien Platz). Der Button erscheint auf ALLEN
+# Service-/Plugin-/Set-Zeilen; gehoert die Zeile einem Indikator, ist er
+# gelb (#FFD700) und traegt den Tooltip 'aktiv/im <Indikator>'
+# (Namenslogik unveraendert aus _apply_badge).
+INFO_BUTTON_TEXT = "i"
 INFO_BUTTON_SIZE = 20          # ~Icon-Breite
 INFO_BUTTON_WIDTH = 24         # Spaltenbreite (Status-Spalte)
 INFO_BUTTON_COLOR_INDICATOR = "#FFD700"   # gelb bei Indikator-Zugehoerigkeit
@@ -30860,14 +31520,14 @@ collect_set_definition(), _schedule_reflow (ContentScrollMixin),
 _service_lock/_build_tooltip (ServiceWindow).
 """
 
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
 from PySide6.QtCore import QCoreApplication, QEvent, Qt, QTimer
 from PySide6.QtGui import QTextCursor, QTextOption
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QSizePolicy, QSpinBox, QTextEdit,
-    QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFormLayout, QGroupBox,
+    QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy, QSpinBox,
+    QTextEdit, QVBoxLayout, QWidget,
 )
 
 
@@ -31157,6 +31817,7 @@ class ServiceParamColumnsMixin:
                          f"{_html.escape(mode_val)}")
         if mode_desc and mode_desc != mode_label:
             parts.append(f"<i>{_html.escape(mode_desc)}</i>")
+
         try:
             # QTextEdit (read-only): HTML setzen – bei langem Text scrollt
             # die Anzeige vertikal (max. Hoehe gedeckelt).
@@ -31172,6 +31833,54 @@ class ServiceParamColumnsMixin:
             self._scroll_textedit_top(label)
             QTimer.singleShot(
                 0, lambda l=label: self._scroll_textedit_top(l))
+        except (RuntimeError, AttributeError):
+            pass
+
+    # ------------------------------------------------------------------
+    # 20.03 (Bugfix): Feld-Beschreibung eines Resultatfelds (Output-Schema)
+    # in einem kleinen modalen Dialog anzeigen (i-Button in der Sektion
+    # 'Resultatfelder (Output-Schema)' der Service-Spalte).
+    # ------------------------------------------------------------------
+    def _show_output_field_info(self, field_name: str, field_type: str,
+                                description: str, plugin_id: str) -> None:
+        """Zeigt Name, Typ und Beschreibung eines Output-Schema-Felds an.
+
+        Kleiner QDialog (modal, keine Bearbeitung – rein informativ),
+        konsistent zur Read-only-Natur des Output-Schemas (Kapitel 20.03).
+
+        20.03.01 (Bugfix): Der Mixin-Host ist nicht IMMER ein QWidget
+        (ServiceWindow ja; _DialogParamHost ist ein Plain-Object mit
+        `_dialog`-Referenz auf das echte Dialog-Fenster). `QDialog(self)`
+        wirft daher im Dialog-Kontext einen TypeError. Eltern-Widget wird
+        robust aufgeloest: `self`, sonst `self._dialog`, sonst None.
+        """
+        try:
+            parent = (self if isinstance(self, QWidget)
+                      else getattr(self, "_dialog", None))
+            if not isinstance(parent, QWidget):
+                parent = None
+            dlg = QDialog(parent)
+            dlg.setWindowTitle(f"Resultatfeld: {field_name}")
+            dlg.setModal(True)
+            dvl = QVBoxLayout(dlg)
+            head = QLabel(f"<b>{field_name}</b>  <i>({field_type})</i>")
+            dvl.addWidget(head)
+            if description:
+                desc = QLabel(description)
+                desc.setWordWrap(True)
+                dvl.addWidget(desc)
+            if plugin_id:
+                note = QLabel(f"Service: {plugin_id}")
+                note.setStyleSheet("color: #999; font-size: 10px;")
+                dvl.addWidget(note)
+            btn_row = QHBoxLayout()
+            btn_row.addStretch(1)
+            ok_btn = QPushButton("OK")
+            ok_btn.setDefault(True)
+            ok_btn.clicked.connect(dlg.accept)
+            btn_row.addWidget(ok_btn)
+            dvl.addLayout(btn_row)
+            dlg.exec()
         except (RuntimeError, AttributeError):
             pass
 
@@ -31365,6 +32074,9 @@ class ServiceParamColumnsMixin:
         # Beschreibung) je Instanz zuruecksetzen.
         self._service_info_labels = {}
         self._service_info_pids = {}
+        # 20.03 (Bugfix): Output-Schema-Zustand je Instanz zuruecksetzen
+        # (Resultatfelder-Sektion mit i-Buttons in den Service-Spalten).
+        self._service_output_schemas = {}
 
     def _build_service_columns(self, set_definition: Dict[str, Any]) -> None:
         """Baut die dynamischen Service-Spalten (Roadmap 5.4.2.2).
@@ -31507,6 +32219,66 @@ class ServiceParamColumnsMixin:
         self._service_info_labels[iid] = info_label
         self._service_info_pids[iid] = pid
         vl.addWidget(info_label)
+
+        # 20.03 (Bugfix): Resultatfelder (Output-Schema) als eigene Sektion
+        # UNTER dem Beschreibungs-/Info-Feld (nicht mehr im Info-Label, User-
+        # Meldung: Ergebnisparameter gehoeren nicht ins Beschreibungsfeld).
+        # Je Haupt-Resultatfeld eine Zeile: Feldname (+ Typ) und ein kleiner
+        # 'i'-Button, der die Feld-Beschreibung in einem Dialog anzeigt.
+        # Technische Felder (technical: True) kompakt in einer dezenten Zeile
+        # `🔧 System-Metrik` (Semikolon-getrennt, ohne Beschreibung – E2).
+        output_schema = dict(getattr(plugin, "output_schema", None) or {})
+        if output_schema:
+            out_header = QLabel("📊 Resultatfelder (Output-Schema):")
+            out_header.setObjectName("lbl_output_schema_header")
+            out_header.setStyleSheet(
+                "color: #666; font-size: 11px; font-weight: bold;")
+            vl.addWidget(out_header)
+
+            main_fields: List[Tuple[str, Dict[str, Any]]] = []
+            tech_fields: List[Tuple[str, Dict[str, Any]]] = []
+            for fname, fspec in output_schema.items():
+                fspec = fspec or {}
+                if fspec.get("technical"):
+                    tech_fields.append((fname, fspec))
+                else:
+                    main_fields.append((fname, fspec))
+
+            for fname, fspec in main_fields:
+                ftype = str(fspec.get("type") or "")
+                fdesc = str(fspec.get("description") or "")
+                row = QHBoxLayout()
+                row.setContentsMargins(12, 0, 0, 0)
+                name_lbl = QLabel(f"🔹 {fname}  <i>({ftype})</i>")
+                name_lbl.setStyleSheet("color: #666; font-size: 11px;")
+                row.addWidget(name_lbl)
+                row.addStretch(1)
+                if fdesc:
+                    info_btn = QPushButton("i")
+                    info_btn.setFixedSize(16, 16)
+                    info_btn.setCursor(Qt.PointingHandCursor)
+                    info_btn.setToolTip("Feld-Beschreibung anzeigen")
+                    info_btn.setStyleSheet(
+                        "QPushButton { color:#666; border:1px solid #aaa;"
+                        " border-radius:8px; font-size:9px; font-weight:bold;"
+                        " background:transparent; }"
+                        "QPushButton:hover { color:#000; border-color:#000; }")
+                    info_btn.clicked.connect(
+                        lambda _=False, n=fname, t=ftype, d=fdesc, p=pid:
+                        self._show_output_field_info(n, t, d, p))
+                    row.addWidget(info_btn)
+                vl.addLayout(row)
+
+            if tech_fields:
+                tech_txt = "🔧 System-Metrik: " + "; ".join(
+                    f"{n} ({f.get('type') or ''})" for n, f in tech_fields)
+                tech_lbl = QLabel(tech_txt)
+                tech_lbl.setWordWrap(True)
+                tech_lbl.setStyleSheet("color: #999; font-size: 10px;")
+                vl.addWidget(tech_lbl)
+
+            # Zustand je Instanz merken (Reset in _clear_service_columns).
+            self._service_output_schemas[iid] = output_schema
 
         # Normale (Nicht-Expert-, Nicht-Darstellungs-)Parameter
         form = QFormLayout()
@@ -32026,6 +32798,11 @@ class _DialogParamHost(ServiceParamColumnsMixin):
         self._service_param_labels: Dict[str, Any] = {}
         self._service_info_labels: Dict[str, Any] = {}
         self._service_info_pids: Dict[str, Any] = {}
+        # 20.03.01 (Bugfix): `ServiceParamColumnsMixin._build_service_column`
+        # schreibt seit dem Output-Schema-Umbau auch in diese Registry –
+        # ohne Init schlaegt die Parameteranzeige mit 'AttributeError:
+        # _service_output_schemas' fehl (analog _mode_schemas, 08.08.2026).
+        self._service_output_schemas: Dict[str, Any] = {}
         self._symbol_precision: Optional[int] = None
         self.combo_symbol = None
         self.combo_tf = None
@@ -36599,6 +37376,67 @@ class ServiceSetTrashDialog(QDialog):
 
 --------------------------------------------------
 
+### DATEI: test/_append_20_03_bugfix.py
+```py
+# test/_append_20_03_bugfix.py - temporaerer Helfer (wird nach Ausfuehrung
+# wieder geloescht): haengt den 20.03-Bugfix-Testblock an test/test.py an.
+import io
+
+P = r"F:\Python\PyTrader\test\test.py"
+SRC = io.open(P, encoding="utf-8").read()
+
+ANCHOR = (
+    'except Exception as _e20_3:\n'
+    '    check("20.03 output_schema-Check", False, str(_e20_3))\n'
+    '\n'
+    '\n'
+    'if FAILURES:'
+)
+
+BLOCK = (
+    'except Exception as _e20_3:\n'
+    '    check("20.03 output_schema-Check", False, str(_e20_3))\n'
+    '\n'
+    '\n'
+    '# ============================================================================\n'
+    '# 20.03-Bugfix (09.08.2026): Info-Button-Text ASCII + Main/Tech-Split\n'
+    '# Headless (keine UI): Konstante pruefen + Split-Logik der Resultatfelder-\n'
+    '# Sektion (main vs. technical) gegen die Registry-Daten verifizieren.\n'
+    '# ============================================================================\n'
+    'try:\n'
+    '    from serviceui.master_tree import INFO_BUTTON_TEXT\n'
+    '    check("20.03-Bugfix a) INFO_BUTTON_TEXT ist ASCII \'i\' (kein U+2139)",\n'
+    '          INFO_BUTTON_TEXT == "i" and "\\u2139" not in INFO_BUTTON_TEXT,\n'
+    '          repr(INFO_BUTTON_TEXT))\n'
+    '    _reg20_3b = PluginRegistry()\n'
+    '    for _pid20_3b in _output_expected:\n'
+    '        _schema20_3b = _reg20_3b.get(_pid20_3b).output_schema or {}\n'
+    '        _main20_3b = [f for f, s in _schema20_3b.items()\n'
+    '                      if not (s or {}).get("technical")]\n'
+    '        _tech20_3b = [f for f, s in _schema20_3b.items()\n'
+    '                      if (s or {}).get("technical")]\n'
+    '        check(f"20.03-Bugfix b) Main/Tech-Split vollstaendig: {_pid20_3b}",\n'
+    '              len(_main20_3b) + len(_tech20_3b) == len(_schema20_3b)\n'
+    '              and bool(_main20_3b),\n'
+    '              f"{len(_main20_3b)} main / {len(_tech20_3b)} tech")\n'
+    '        check(f"20.03-Bugfix c) Tech-Felder tragen Beschreibung: {_pid20_3b}",\n'
+    '              all(bool((_schema20_3b[f] or {}).get("description"))\n'
+    '                  for f in _tech20_3b), str(_tech20_3b))\n'
+    'except Exception as _e20_3b:\n'
+    '    check("20.03-Bugfix-Check", False, str(_e20_3b))\n'
+    '\n'
+    '\n'
+    'if FAILURES:'
+)
+
+assert SRC.count(ANCHOR) == 1, "Anker nicht eindeutig/gefunden"
+io.open(P, "w", encoding="utf-8", newline="").write(SRC.replace(ANCHOR, BLOCK))
+print("OK: 20.03-Bugfix-Testblock angehaengt")
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/check_bugfix_0808.py
 ```py
 # test/check_bugfix_0808.py - isolierter Check fuer Bugfix 08.08.2026 (Block 38)
@@ -36814,6 +37652,133 @@ pump()
 
 import shutil  # noqa: E402
 shutil.rmtree(_tmp, ignore_errors=True)
+
+if FAILURES:
+    print(f"FEHLER: {len(FAILURES)}: {FAILURES}")
+    sys.exit(1)
+print("ALLE PRUEFUNGEN BESTANDEN (OK)")
+sys.exit(0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_dialog_host.py
+```py
+# test/check_dialog_host.py
+"""
+20.03.01 (Bugfix, 09.08.2026): Regressions-Check fuer die User-Meldung
+'parameteranzeige nicht verfuegbar: _dialogparamhost object has no attribute
+_service_output_schemas'.
+
+Der Dialog (service_selector_dialog.py) ruft `_build_service_column` DIREKT
+auf (ohne `_clear_service_columns`); daher muss `_DialogParamHost.__init__`
+alle vom Mixin geschriebenen Registrys initialisieren – inkl. dem seit dem
+Output-Schema-Umbau neuen `_service_output_schemas`.
+
+Headless (offscreen, kein exec_): Host instanziieren, eine Spalte fuer ein
+Plugin mit Main- UND Tech-Feldern bauen, pruefen dass kein AttributeError
+kommt und die Resultatfelder-Sektion (Header + i-Buttons) vorhanden ist.
+"""
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+from PySide6.QtWidgets import QApplication, QDialog, QLabel, QPushButton, QWidget  # noqa: E402
+
+_app = QApplication.instance() or QApplication(sys.argv)
+
+FAILURES = []
+
+
+def check(name, cond, detail=""):
+    s = "PASS" if cond else "FAIL"
+    print(f"[{s}] {name}" + (f" - {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(name)
+
+
+# --- 20.03.01 (Bugfix, 2. Runde): `_show_output_field_info` muss auch im
+# --- _DialogParamHost-Kontext funktionieren (self ist KEIN QWidget).
+# --- QDialog.exec wird gemockt, damit headless nichts blockiert.
+_created = []
+
+
+def _mock_exec(self):
+    _created.append(self)
+    return 0
+
+
+QDialog.exec = _mock_exec
+_orig_init = QDialog.__init__
+
+
+def _spy_init(self, parent=None, *args, **kwargs):
+    _orig_init(self, parent, *args, **kwargs)
+
+
+try:
+    from serviceui.service_selector_dialog import _DialogParamHost
+    host = _DialogParamHost()
+    check("Host initialisiert _service_output_schemas",
+          hasattr(host, "_service_output_schemas"))
+    # Plugin mit Main- UND Tech-Feldern (13 Felder, 8 technical, 5 main):
+    col = host._build_service_column("check_dialog_host_1",
+                                     "srv_swing_momentum", {})
+    check("_build_service_column wirft keinen Fehler", col is not None)
+    if col is not None:
+        labels = [w.text() for w in col.findChildren(QLabel)]
+        btns = [b.text() for b in col.findChildren(QPushButton)]
+        check("Resultatfelder-Header vorhanden",
+              any("Resultatfelder" in t for t in labels),
+              str([t for t in labels if "Resultatfelder" in t]))
+        check("System-Metrik-Zeile vorhanden",
+              any("System-Metrik" in t for t in labels),
+              str([t for t in labels if "System-Metrik" in t]))
+        check("i-Buttons je Hauptfeld (5 main -> 5 i)",
+              btns.count("i") == 5, f"{btns.count('i')} i-Buttons")
+        check("Tooltip am i-Button vorhanden",
+              any(b.toolTip() for b in col.findChildren(QPushButton)
+                  if b.text() == "i"))
+except Exception as e:
+    check("Host-Spaltenbau", False, str(e))
+
+# --- 2. Runde: i-Button im _DialogParamHost-Kontext (kein QWidget-Host) ---
+try:
+    from serviceui.param_columns import ServiceParamColumnsMixin
+    from serviceui.service_selector_dialog import _DialogParamHost
+
+    host2 = _DialogParamHost()
+    # Simuliere Dialog-Host mit echter QWidget-Referenz (self._dialog):
+    fake_dialog = QWidget()
+    host2._dialog = fake_dialog
+    _created.clear()
+    host2._show_output_field_info("price", "float",
+                                  "Testbeschreibung", "srv_swing_momentum")
+    check("i-Button-Dialog: kein TypeError im Host-Kontext",
+          len(_created) == 1, f"{len(_created)} Dialoge erzeugt")
+    if _created:
+        check("i-Button-Dialog: Eltern-Widget korrekt aufgeloest",
+              _created[0].parentWidget() is fake_dialog,
+              str(_created[0].parentWidget()))
+        check("i-Button-Dialog: Titel + Beschreibung",
+              _created[0].windowTitle() == "Resultatfeld: price"
+              and _created[0].findChild(QLabel, "").text() is not None)
+    # Ohne _dialog-Referenz (None-Fallback) darf es auch nicht crashen:
+    host3 = _DialogParamHost()
+    _created.clear()
+    host3._show_output_field_info("grid_step", "float", "", "srv_grid_lines")
+    check("i-Button-Dialog: None-Fallback ohne Crash",
+          len(_created) == 1, f"{len(_created)} Dialoge erzeugt")
+except Exception as e:
+    check("i-Button-Dialog-Check", False, str(e))
 
 if FAILURES:
     print(f"FEHLER: {len(FAILURES)}: {FAILURES}")
@@ -37720,6 +38685,81 @@ app.processEvents()
 
 print(f"\n{'ALLE PRUEFUNGEN BESTANDEN (OK)' if not failures else 'FEHLER: ' + str(failures)}")
 sys.exit(0 if not failures else 1)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_output_schema.py
+```py
+# test/check_output_schema.py
+"""Headless-Check (20.03, Step 4): output_schema aller registrierten Plugins.
+
+Prüft: (a) alle 8 Core-Services liefern ein nicht-leeres output_schema,
+(b) jedes Feld hat type + description, (c) `bar_time` wird NICHT deklariert
+(E4), (d) technische Felder sind korrekt markiert (E2). Kein UI.
+"""
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+EXPECTED = {
+    "srv_grid_lines": {"grid_nearest_level", "grid_step", "upper_level", "lower_level"},
+    "srv_proximity": {"levels_hit", "is_hit", "in_time_window"},
+    "srv_swing_momentum": {"is_swing_high", "is_swing_low", "price", "strength_value"},
+    "srv_swing_structure": {"is_swing_high", "is_swing_low", "price", "strength_value"},
+    "srv_swing_volume_profile": {"poc_price", "vah_price", "val_price", "vwap_price", "grid_price"},
+    "srv_trend_breakout": {"is_trend_up", "is_trend_down", "trend_strength", "reference_price"},
+    "srv_trend_hma_pivot": {"is_trend_up", "is_trend_down", "pending_extreme_value", "ma_value"},
+    "srv_trend_regime": {"is_trend_up", "is_trend_down", "r2_score", "adx_value", "z_score_value"},
+}
+
+
+def main() -> int:
+    from analytics.features.feature_builder import PluginRegistry
+
+    reg = PluginRegistry()
+    failures: list[str] = []
+    for pid, keys in EXPECTED.items():
+        schema = reg.get(pid).output_schema
+        if not schema:
+            failures.append(f"{pid}: output_schema ist LEER")
+            continue
+        for k in keys:
+            if k not in schema:
+                failures.append(f"{pid}: Feld '{k}' fehlt im output_schema")
+        for fname, fspec in schema.items():
+            if not isinstance(fspec, dict):
+                failures.append(f"{pid}: Feld '{fname}' ist kein Dict")
+                continue
+            if not fspec.get("type"):
+                failures.append(f"{pid}: Feld '{fname}' ohne type")
+            if not fspec.get("description"):
+                failures.append(f"{pid}: Feld '{fname}' ohne description")
+            if fname == "bar_time":
+                failures.append(f"{pid}: 'bar_time' darf NICHT deklariert sein (E4)")
+        tech = sum(1 for s in schema.values() if s.get("technical"))
+        print(f"  OK {pid}: {len(schema)} Felder, {tech} technical")
+
+    # Basisklassen-Default bleibt leer (abwaertskompatibel) – der fget
+    # braucht kein self (liefert konstant {}).
+    from analytics.features.plugins.base_plugin import PluginFeature
+    assert PluginFeature.output_schema.fget(None) == {}
+
+    if failures:
+        print("\nFAILURES:")
+        for f in failures:
+            print("  -", f)
+        return 1
+    print("\nALL CHECKS PASSED")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 
 ```
 
@@ -43600,11 +44640,74 @@ _tree38.hide()
 pump()
 
 
+_tree38.hide()
+pump()
+
+
+# ============================================================================
+# 20.03 (Kapitel 20.03 Step 4): output_schema aller registrierten Plugins
+# Headless (keine UI): Registry + Property-Retrieval pruefen.
+# ============================================================================
+try:
+    from analytics.features.feature_builder import PluginRegistry
+    from analytics.features.plugins.base_plugin import PluginFeature
+
+    _reg20_3 = PluginRegistry()
+    _output_expected = [
+        "srv_grid_lines", "srv_proximity", "srv_swing_momentum",
+        "srv_swing_structure", "srv_swing_volume_profile",
+        "srv_trend_breakout", "srv_trend_hma_pivot", "srv_trend_regime",
+    ]
+    for _pid20_3 in _output_expected:
+        _schema20_3 = _reg20_3.get(_pid20_3).output_schema
+        check(f"20.03 a) output_schema nicht leer: {_pid20_3}",
+              bool(_schema20_3), str(len(_schema20_3)))
+        for _fn, _fs in _schema20_3.items():
+            check(f"20.03 b) Feld-Vertrag: {_pid20_3}.{_fn}",
+                  isinstance(_fs, dict) and bool(_fs.get("type"))
+                  and bool(_fs.get("description")), str(_fs))
+            check(f"20.03 c) kein bar_time: {_pid20_3}.{_fn}",
+                  _fn != "bar_time", _fn)
+    check("20.03 d) Basis-Default bleibt leer",
+          PluginFeature.output_schema.fget(None) == {})
+except Exception as _e20_3:
+    check("20.03 output_schema-Check", False, str(_e20_3))
+
+
+# ============================================================================
+# 20.03-Bugfix (09.08.2026): Info-Button-Text ASCII + Main/Tech-Split
+# Headless (keine UI): Konstante pruefen + Split-Logik der Resultatfelder-
+# Sektion (main vs. technical) gegen die Registry-Daten verifizieren.
+# ============================================================================
+try:
+    from serviceui.master_tree import INFO_BUTTON_TEXT
+    check("20.03-Bugfix a) INFO_BUTTON_TEXT ist ASCII 'i' (kein U+2139)",
+          INFO_BUTTON_TEXT == "i" and "\u2139" not in INFO_BUTTON_TEXT,
+          repr(INFO_BUTTON_TEXT))
+    _reg20_3b = PluginRegistry()
+    for _pid20_3b in _output_expected:
+        _schema20_3b = _reg20_3b.get(_pid20_3b).output_schema or {}
+        _main20_3b = [f for f, s in _schema20_3b.items()
+                      if not (s or {}).get("technical")]
+        _tech20_3b = [f for f, s in _schema20_3b.items()
+                      if (s or {}).get("technical")]
+        check(f"20.03-Bugfix b) Main/Tech-Split vollstaendig: {_pid20_3b}",
+              len(_main20_3b) + len(_tech20_3b) == len(_schema20_3b)
+              and bool(_main20_3b),
+              f"{len(_main20_3b)} main / {len(_tech20_3b)} tech")
+        check(f"20.03-Bugfix c) Tech-Felder tragen Beschreibung: {_pid20_3b}",
+              all(bool((_schema20_3b[f] or {}).get("description"))
+                  for f in _tech20_3b), str(_tech20_3b))
+except Exception as _e20_3b:
+    check("20.03-Bugfix-Check", False, str(_e20_3b))
+
+
 if FAILURES:
     print(f"FEHLER: {len(FAILURES)}: {FAILURES}")
     sys.exit(1)
 print("ALLE PRUEFUNGEN BESTANDEN (OK)")
 sys.exit(0)
+
 
 ```
 
