@@ -94,6 +94,30 @@ _GRID_LINES_SCHEMA: Dict[str, ParameterSchema] = {
     "prox_level6": {"type": "float", "default": 0.0, "min": 0.0, "max": 100000.0, "step": 0.01, "description": "Custom Level 6"},
 }
 
+# ---------------------------------------------------------------------------
+# OUTPUT-SCHEMA (20.03): Resultatfelder je feature_data-Record.
+# `bar_time` ist eine native DB-Spalte und wird NICHT deklariert (E4).
+# `type` sind freie Strings (E5). `technical: True` -> kompakte Anzeige im
+# Unterblock `🔧 System-Metrik` (E2).
+# ---------------------------------------------------------------------------
+_GRID_OUTPUT_SCHEMA: Dict[str, Dict[str, Any]] = {
+    "grid_nearest_level": {
+        "type": "float",
+        "description": "Nächstes Grid-Level zum Close (Center = round(close/step_size) × step_size)",
+    },
+    "grid_step": {
+        "type": "float",
+        "description": "Rasterabstand (step_size) der Grid-Konstruktion",
+    },
+    "upper_level": {
+        "type": "float",
+        "description": "Obere Klammer = Center + step_size",
+    },
+    "lower_level": {
+        "type": "float",
+        "description": "Untere Klammer = Center - step_size",
+    },
+}
 
 def _parse_custom_levels(raw: Any) -> List[float]:
     """Akzeptiert Liste/Tupel ODER Komma-/Semikolon-String; nur Werte > 0."""
@@ -255,6 +279,13 @@ class GridLinesService(PluginFeature):
         (PineScript-Input-Zone, kein geteiltes mutable Dict: flache Kopie).
         """
         return {k: dict(v) for k, v in _GRID_LINES_SCHEMA.items()}
+
+    @property
+    def output_schema(self) -> Dict[str, Dict[str, Any]]:
+        """Output-Schema (20.03): flache Kopie der Modul-Konstante
+        `_GRID_OUTPUT_SCHEMA` (PineScript-Input-Zone, M1: kein geteiltes
+        mutable Dict)."""
+        return {k: dict(v) for k, v in _GRID_OUTPUT_SCHEMA.items()}
 
     def calculate(
         self,

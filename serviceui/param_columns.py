@@ -13,7 +13,7 @@ collect_set_definition(), _schedule_reflow (ContentScrollMixin),
 _service_lock/_build_tooltip (ServiceWindow).
 """
 
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
 from PySide6.QtCore import QCoreApplication, QEvent, Qt, QTimer
 from PySide6.QtGui import QTextCursor, QTextOption
@@ -310,6 +310,42 @@ class ServiceParamColumnsMixin:
                          f"{_html.escape(mode_val)}")
         if mode_desc and mode_desc != mode_label:
             parts.append(f"<i>{_html.escape(mode_desc)}</i>")
+
+        # 20.03 (Kapitel 20.03 §3, E2/E7): Resultatfelder (Output-Schema)
+        # unterhalb der allgemeinen Beschreibung rendern – strikt read-only,
+        # eingerückt. Haupt-Resultatfelder als Einzelzeilen
+        # (└── 🔹 name (type): description); technische Felder (technical:
+        # True) kompakt in kleinerer, dezenter Schrift im Unterblock
+        # `🔧 System-Metrik` (Semikolon-getrennt, ohne Beschreibung).
+        output_schema = dict(getattr(plugin, "output_schema", None) or {})
+        if output_schema:
+            parts.append("<b>📊 Resultatfelder (Output-Schema):</b>")
+            main_fields: List[Tuple[str, str, str]] = []
+            tech_fields: List[Tuple[str, str, str]] = []
+            for fname, fspec in output_schema.items():
+                fspec = fspec or {}
+                ftype = str(fspec.get("type") or "")
+                fdesc = str(fspec.get("description") or "")
+                if fspec.get("technical"):
+                    tech_fields.append((fname, ftype, fdesc))
+                else:
+                    main_fields.append((fname, ftype, fdesc))
+            for fname, ftype, fdesc in main_fields:
+                line = (f"└── 🔹 <b>{_html.escape(fname)}</b> "
+                        f"({_html.escape(ftype)})")
+                if fdesc:
+                    line += f": <i>{_html.escape(fdesc)}</i>"
+                parts.append(f'<div style="margin-left:12px;">{line}</div>')
+            if tech_fields:
+                tech_parts = [
+                    f"{_html.escape(n)} ({_html.escape(t)})"
+                    for n, t, _d in tech_fields
+                ]
+                parts.append(
+                    '<div style="margin-left:12px; color:#999; font-size:10px;">'
+                    '🔧 <b>System-Metrik:</b> ' + "; ".join(tech_parts)
+                    + "</div>")
+
         try:
             # QTextEdit (read-only): HTML setzen – bei langem Text scrollt
             # die Anzeige vertikal (max. Hoehe gedeckelt).

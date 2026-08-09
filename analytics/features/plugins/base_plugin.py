@@ -279,6 +279,26 @@ class PluginFeature(ABC):
         return merged
 
     @property
+    def output_schema(self) -> Dict[str, Dict[str, Any]]:
+        """Output-Schema (20.03): dokumentiert alle im `feature_data`-JSON
+        erzeugten Ergebnisspalten samt Typ und Beschreibung.
+
+        Format: {"field_name": {"type": str, "description": str,
+        "technical": bool (optional)}} – `technical: True` kennzeichnet
+        System-/Metadaten-Felder (z. B. calculation_status), die die UI
+        kompakt in einem Unterblock `🔧 System-Metrik` anzeigt (E2).
+
+        Konventionen (Kapitel 20.03, E1/E4/E5):
+          * Abwärtskompatibler Default: leeres Dict – Plugins ohne Schema
+            zeigen keinen Resultatfelder-Block.
+          * `bar_time` wird NICHT deklariert – es ist eine native
+            DB-Spalte, kein `feature_data`-JSON-Key (E4).
+          * `type` ist ein freier String (E5), z. B. "bool", "float",
+            "int", "str" oder "list[float]".
+        """
+        return {}
+
+    @property
     def parameter_order(self) -> List[str]:
         """Darstellungs-Reihenfolge der Props im Prop-Fenster.
 

@@ -104,6 +104,74 @@ _SWING_STRUCTURE_SCHEMA: Dict[str, ParameterSchema] = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# OUTPUT-SCHEMA (20.03): Resultatfelder je feature_data-Record (Datenvertrag
+# 17.01 §4). `bar_time` ist eine native DB-Spalte und wird NICHT deklariert
+# (E4). `type` sind freie Strings (E5). `technical: True` -> kompakte
+# Anzeige im Unterblock `🔧 System-Metrik` (E2).
+# ---------------------------------------------------------------------------
+_SWING_STRUCTURE_OUTPUT_SCHEMA: Dict[str, Dict[str, Any]] = {
+    "result_type": {
+        "type": "str",
+        "description": "Klassifikation des Records (immer 'SWING')",
+        "technical": True,
+    },
+    "source_mode": {
+        "type": "str",
+        "description": "Aktiver Erkennungs-Modus (Williams_Fractal/Standard_Pivot/Gann_Mechanical/ZigZag_*/Period_Extrema)",
+        "technical": True,
+    },
+    "calculation_status": {
+        "type": "str",
+        "description": "Berechnungsstatus ('OK' | 'INSUFFICIENT_DATA')",
+        "technical": True,
+    },
+    "is_swing_high": {
+        "type": "bool",
+        "description": "True, wenn die Bar ein bestätigtes Swing-High ist",
+    },
+    "is_swing_low": {
+        "type": "bool",
+        "description": "True, wenn die Bar ein bestätigtes Swing-Low ist",
+    },
+    "is_rejection": {
+        "type": "bool",
+        "description": "Rejection-Flag (Struktur: immer False)",
+    },
+    "event_bar_time": {
+        "type": "int",
+        "description": "Wanduhr-Epoch des tatsächlichen Extremums (kausal, kein Look-ahead)",
+        "technical": True,
+    },
+    "confirmation_bar_time": {
+        "type": "int",
+        "description": "Wanduhr-Epoch, an der das Signal kausal feststand",
+        "technical": True,
+    },
+    "confirmation_lag_bars": {
+        "type": "int",
+        "description": "Dynamische Bestätigungs-Verzögerung in Bars (right_bars bzw. Modus-Verzögerung)",
+        "technical": True,
+    },
+    "confirmation_type": {
+        "type": "str",
+        "description": "Bestätigungsart ('FRACTAL' | 'PIVOT' | 'CAUSAL' | 'SESSION_CLOSE')",
+        "technical": True,
+    },
+    "price": {
+        "type": "float",
+        "description": "Preis des Extremums (High/Low) bzw. Close bei Nicht-Swing-Bars",
+    },
+    "strength_value": {
+        "type": "float",
+        "description": "Signalstärke (ATR_MULTIPLE: ATR-Einheiten; PERCENT: %; PRICE_DISTANCE: Preisdistanz)",
+    },
+    "strength_type": {
+        "type": "str",
+        "description": "Stärke-Maßstab ('NORMALIZED' | 'ATR_MULTIPLE' | 'PERCENT' | 'PRICE_DISTANCE')",
+        "technical": True,
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Modul-Helfer (17.01.02: echte Swing-Erkennung statt Scaffold)
@@ -364,6 +432,13 @@ class SrvSwingStructure(PluginFeature):
         """Flache Kopie der Modul-Konstante `_SWING_STRUCTURE_SCHEMA`
         (PineScript-Input-Zone am Dateianfang, M1: kein geteiltes Dict)."""
         return {k: dict(v) for k, v in _SWING_STRUCTURE_SCHEMA.items()}
+
+    @property
+    def output_schema(self) -> Dict[str, Dict[str, Any]]:
+        """Output-Schema (20.03): flache Kopie der Modul-Konstante
+        `_SWING_STRUCTURE_OUTPUT_SCHEMA` (PineScript-Input-Zone, M1: kein
+        geteiltes mutable Dict)."""
+        return {k: dict(v) for k, v in _SWING_STRUCTURE_OUTPUT_SCHEMA.items()}
 
     # 2. SCHEMA-EXPOSURE FÜR DIE UI (07.08.2026, Bugfix): Die Spalten-UI
     # (serviceui/param_columns.py & ServiceSelectorWidget) liest Parameter-

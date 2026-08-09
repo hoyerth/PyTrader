@@ -108,6 +108,106 @@ _TREND_REGIME_SCHEMA: Dict[str, ParameterSchema] = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# OUTPUT-SCHEMA (20.03): Resultatfelder je feature_data-Record (Datenvertrag
+# 17.02 §3). `bar_time` ist eine native DB-Spalte und wird NICHT deklariert
+# (E4). `type` sind freie Strings (E5). `technical: True` -> kompakte
+# Anzeige im Unterblock `🔧 System-Metrik` (E2).
+# ---------------------------------------------------------------------------
+_TREND_REGIME_OUTPUT_SCHEMA: Dict[str, Dict[str, Any]] = {
+    "result_type": {
+        "type": "str",
+        "description": "Klassifikation des Records ('REVERSAL' bei Z-Score-Signal, sonst 'TREND')",
+        "technical": True,
+    },
+    "source_mode": {
+        "type": "str",
+        "description": "Aktiver Algorithmus (Linear_Regression_Slope/ADX_DMI/ZScore_Mean_Distance)",
+        "technical": True,
+    },
+    "calculation_status": {
+        "type": "str",
+        "description": "Berechnungsstatus ('OK' | 'INSUFFICIENT_DATA')",
+        "technical": True,
+    },
+    "is_trend_up": {
+        "type": "bool",
+        "description": "LinReg: Slope > 0 und R2 >= Threshold; ADX: +DI > -DI und ADX >= Threshold",
+    },
+    "is_trend_down": {
+        "type": "bool",
+        "description": "LinReg: Slope < 0 und R2 >= Threshold; ADX: -DI > +DI und ADX >= Threshold",
+    },
+    "is_reversal_up": {
+        "type": "bool",
+        "description": "Z-Score: True bei Z <= -z_thresh (überverkauft)",
+    },
+    "is_reversal_down": {
+        "type": "bool",
+        "description": "Z-Score: True bei Z >= +z_thresh (überkauft)",
+    },
+    "event_bar_time": {
+        "type": "int",
+        "description": "Wanduhr-Epoch der Bar (Bar-Close-Signal, event == confirmation)",
+        "technical": True,
+    },
+    "confirmation_bar_time": {
+        "type": "int",
+        "description": "Wanduhr-Epoch der Bestätigung (identisch zu event_bar_time)",
+        "technical": True,
+    },
+    "confirmation_lag_bars": {
+        "type": "int",
+        "description": "Bestätigungs-Verzögerung (immer 0, Bar-Close-Signal)",
+        "technical": True,
+    },
+    "confirmation_type": {
+        "type": "str",
+        "description": "Bestätigungsart (immer 'BAR_CLOSE')",
+        "technical": True,
+    },
+    "trend_strength": {
+        "type": "float",
+        "description": "Signalstärke (R2_SCORE: R2; ADX_VALUE: ADX; Z_SCORE: |Z|)",
+    },
+    "strength_type": {
+        "type": "str",
+        "description": "Stärke-Maßstab ('R2_SCORE' | 'ADX_VALUE' | 'Z_SCORE')",
+        "technical": True,
+    },
+    "reference_price": {
+        "type": "float",
+        "description": "Close-Preis der Bar (Referenzpreis)",
+    },
+    "slope_value": {
+        "type": "float",
+        "description": "LinReg-Steigung des rolling Fensters – nur Linear_Regression_Slope, nullbar",
+    },
+    "r2_score": {
+        "type": "float",
+        "description": "Bestimmtheitsmaß R2 des rolling Fensters – nur Linear_Regression_Slope, nullbar",
+    },
+    "adx_value": {
+        "type": "float",
+        "description": "ADX-Wert – nur ADX_DMI, nullbar",
+    },
+    "plus_di": {
+        "type": "float",
+        "description": "+DI-Wert – nur ADX_DMI, nullbar",
+    },
+    "minus_di": {
+        "type": "float",
+        "description": "-DI-Wert – nur ADX_DMI, nullbar",
+    },
+    "z_score_value": {
+        "type": "float",
+        "description": "Z-Score (Close - MA) / rolling-std – nur ZScore_Mean_Distance, nullbar",
+    },
+    "mean_baseline": {
+        "type": "float",
+        "description": "MA-Baseline (Z-Score Nenner) – nur ZScore_Mean_Distance, nullbar",
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Modul-Helfer (17.02: direkte, vollstaendige Erkennung statt Scaffold)
@@ -290,6 +390,13 @@ class SrvTrendRegime(PluginFeature):
         """Flache Kopie der Modul-Konstante `_TREND_REGIME_SCHEMA`
         (PineScript-Input-Zone am Dateianfang, M1: kein geteiltes Dict)."""
         return {k: dict(v) for k, v in _TREND_REGIME_SCHEMA.items()}
+
+    @property
+    def output_schema(self) -> Dict[str, Dict[str, Any]]:
+        """Output-Schema (20.03): flache Kopie der Modul-Konstante
+        `_TREND_REGIME_OUTPUT_SCHEMA` (PineScript-Input-Zone, M1: kein
+        geteiltes mutable Dict)."""
+        return {k: dict(v) for k, v in _TREND_REGIME_OUTPUT_SCHEMA.items()}
 
     # 2. SCHEMA-EXPOSURE FUER DIE UI (17.01.04, Bugfix): Die Spalten-UI
     # (serviceui/param_columns.py & ServiceSelectorWidget) liest Parameter-

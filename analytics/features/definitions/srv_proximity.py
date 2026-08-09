@@ -76,6 +76,41 @@ _PROXIMITY_SCHEMA: Dict[str, ParameterSchema] = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# OUTPUT-SCHEMA (20.03): Resultatfelder je feature_data-Record.
+# `bar_time` ist eine native DB-Spalte und wird NICHT deklariert (E4).
+# `type` sind freie Strings (E5). `technical: True` -> kompakte Anzeige im
+# Unterblock `🔧 System-Metrik` (E2).
+# ---------------------------------------------------------------------------
+_PROXIMITY_OUTPUT_SCHEMA: Dict[str, Dict[str, Any]] = {
+    "levels_hit": {
+        "type": "list[float]",
+        "description": "Getroffene Grid-Level der Bar (near/Piercing-Semantik, Parität grid_math.py)",
+    },
+    "is_hit": {
+        "type": "bool",
+        "description": "True, wenn die Bar mindestens ein Grid-Level trifft",
+    },
+    "in_time_window": {
+        "type": "bool",
+        "description": "True, wenn die Bar im nativen UTC-Zeitfenster (Minute 0/30 ± time_window_mins) liegt",
+    },
+    "time_window_mins": {
+        "type": "int",
+        "description": "Fenster-Minuten (Parameter-Abbild im Record)",
+        "technical": True,
+    },
+    "use_time_filter": {
+        "type": "bool",
+        "description": "Time-Filter aktiv (Parameter-Abbild im Record)",
+        "technical": True,
+    },
+    "visit_pct": {
+        "type": "float",
+        "description": "Prozentuale Toleranz um jede Linie (Parameter-Abbild im Record)",
+        "technical": True,
+    },
+}
 
 def _bar_utc_minutes(df: pd.DataFrame) -> List[int]:
     """UTC-Minute (0-59) jeder Bar – konsistent zu ind_fixed_grid_proximity.py.
@@ -211,6 +246,13 @@ class ProximityService(PluginFeature):
         (PineScript-Input-Zone, kein geteiltes mutable Dict: flache Kopie).
         """
         return {k: dict(v) for k, v in _PROXIMITY_SCHEMA.items()}
+
+    @property
+    def output_schema(self) -> Dict[str, Dict[str, Any]]:
+        """Output-Schema (20.03): flache Kopie der Modul-Konstante
+        `_PROXIMITY_OUTPUT_SCHEMA` (PineScript-Input-Zone, M1: kein
+        geteiltes mutable Dict)."""
+        return {k: dict(v) for k, v in _PROXIMITY_OUTPUT_SCHEMA.items()}
 
     def calculate(
         self,

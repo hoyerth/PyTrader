@@ -86,6 +86,86 @@ _TREND_HMA_PIVOT_SCHEMA: Dict[str, ParameterSchema] = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# OUTPUT-SCHEMA (20.03): Resultatfelder je feature_data-Record (Datenvertrag
+# 17.02 §3, §3.2). `bar_time` ist eine native DB-Spalte und wird NICHT
+# deklariert (E4). `type` sind freie Strings (E5). `technical: True` ->
+# kompakte Anzeige im Unterblock `🔧 System-Metrik` (E2).
+# ---------------------------------------------------------------------------
+_TREND_HMA_PIVOT_OUTPUT_SCHEMA: Dict[str, Dict[str, Any]] = {
+    "result_type": {
+        "type": "str",
+        "description": "Klassifikation des Records ('REVERSAL' bei Trendwechsel, sonst 'TREND')",
+        "technical": True,
+    },
+    "source_mode": {
+        "type": "str",
+        "description": "Aktiver Algorithmus (immer 'HMA_Peak_Toleranz')",
+        "technical": True,
+    },
+    "calculation_status": {
+        "type": "str",
+        "description": "Berechnungsstatus ('OK' | 'INSUFFICIENT_DATA')",
+        "technical": True,
+    },
+    "is_trend_up": {
+        "type": "bool",
+        "description": "True, wenn MA das Pending-Low um piv_maxHmaMovePct % nach oben durchbrochen hat",
+    },
+    "is_trend_down": {
+        "type": "bool",
+        "description": "True, wenn MA das Pending-High um piv_maxHmaMovePct % nach unten durchbrochen hat",
+    },
+    "is_reversal_up": {
+        "type": "bool",
+        "description": "Reversal-Up-Flag (is_trend_up und nicht is_trend_down)",
+    },
+    "is_reversal_down": {
+        "type": "bool",
+        "description": "Reversal-Down-Flag (is_trend_down und nicht is_trend_up)",
+    },
+    "event_bar_time": {
+        "type": "int",
+        "description": "Wanduhr-Epoch der Bar (Bar-Close-Signal, event == confirmation)",
+        "technical": True,
+    },
+    "confirmation_bar_time": {
+        "type": "int",
+        "description": "Wanduhr-Epoch der Bestätigung (identisch zu event_bar_time)",
+        "technical": True,
+    },
+    "confirmation_lag_bars": {
+        "type": "int",
+        "description": "Bestätigungs-Verzögerung (immer 0, Bar-Close-Signal)",
+        "technical": True,
+    },
+    "confirmation_type": {
+        "type": "str",
+        "description": "Bestätigungsart (immer 'BAR_CLOSE')",
+        "technical": True,
+    },
+    "trend_strength": {
+        "type": "float",
+        "description": "Signalstärke (PERCENT: prozentuale Distanz des Close vom Pending-Extremwert)",
+    },
+    "strength_type": {
+        "type": "str",
+        "description": "Stärke-Maßstab (immer 'PERCENT')",
+        "technical": True,
+    },
+    "reference_price": {
+        "type": "float",
+        "description": "Close-Preis der Bar (Referenzpreis)",
+    },
+    "ma_value": {
+        "type": "float",
+        "description": "Geglätteter MA-Wert der Bar (EHMA/HMA) – nullbar",
+    },
+    "pending_extreme_value": {
+        "type": "float",
+        "description": "Letzter extremer MA-Wert (piv_pendingExtremeValue) – nullbar",
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Modul-Helfer (17.02: direkte, vollstaendige Erkennung statt Scaffold)
@@ -242,6 +322,13 @@ class SrvTrendHmaPivot(PluginFeature):
         """Flache Kopie der Modul-Konstante `_TREND_HMA_PIVOT_SCHEMA`
         (PineScript-Input-Zone am Dateianfang, M1: kein geteiltes Dict)."""
         return {k: dict(v) for k, v in _TREND_HMA_PIVOT_SCHEMA.items()}
+
+    @property
+    def output_schema(self) -> Dict[str, Dict[str, Any]]:
+        """Output-Schema (20.03): flache Kopie der Modul-Konstante
+        `_TREND_HMA_PIVOT_OUTPUT_SCHEMA` (PineScript-Input-Zone, M1: kein
+        geteiltes mutable Dict)."""
+        return {k: dict(v) for k, v in _TREND_HMA_PIVOT_OUTPUT_SCHEMA.items()}
 
     # 2. SCHEMA-EXPOSURE FUER DIE UI (17.01.04, Bugfix): Siehe
     # srv_trend_regime.py - identischer Basisklassen-Vertrag.

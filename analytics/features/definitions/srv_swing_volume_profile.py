@@ -120,6 +120,115 @@ _SWING_VOLUME_PROFILE_SCHEMA: Dict[str, ParameterSchema] = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# OUTPUT-SCHEMA (20.03): Resultatfelder je feature_data-Record (Datenvertrag
+# 17.01 §4, modus-spezifische Zusatzfelder §4.2). `bar_time` ist eine native
+# DB-Spalte und wird NICHT deklariert (E4). `type` sind freie Strings (E5).
+# `technical: True` -> kompakte Anzeige im Unterblock `🔧 System-Metrik` (E2).
+# ---------------------------------------------------------------------------
+_SWING_VOLUME_PROFILE_OUTPUT_SCHEMA: Dict[str, Dict[str, Any]] = {
+    "result_type": {
+        "type": "str",
+        "description": "Klassifikation des Records ('LEVEL' | 'VWAP')",
+        "technical": True,
+    },
+    "source_mode": {
+        "type": "str",
+        "description": "Aktiver Modus (Volume_Profile/Grid_Proximity/Anchored_VWAP)",
+        "technical": True,
+    },
+    "calculation_status": {
+        "type": "str",
+        "description": "Berechnungsstatus ('OK' | 'INSUFFICIENT_DATA')",
+        "technical": True,
+    },
+    "is_swing_high": {
+        "type": "bool",
+        "description": "True, wenn der Close über VAH bzw. über Upper-Band liegt",
+    },
+    "is_swing_low": {
+        "type": "bool",
+        "description": "True, wenn der Close unter VAL bzw. unter Lower-Band liegt",
+    },
+    "is_rejection": {
+        "type": "bool",
+        "description": "True bei LVN-Rejection (Close nahe LVN) – nur Volume_Profile",
+    },
+    "event_bar_time": {
+        "type": "int",
+        "description": "Wanduhr-Epoch des Events (Session_Start beim VWAP, sonst Bar selbst)",
+        "technical": True,
+    },
+    "confirmation_bar_time": {
+        "type": "int",
+        "description": "Wanduhr-Epoch, an der das Signal kausal feststand",
+        "technical": True,
+    },
+    "confirmation_lag_bars": {
+        "type": "int",
+        "description": "Bestätigungs-Verzögerung in Bars (VWAP: Bars seit Anker)",
+        "technical": True,
+    },
+    "confirmation_type": {
+        "type": "str",
+        "description": "Bestätigungsart (immer 'CAUSAL')",
+        "technical": True,
+    },
+    "price": {
+        "type": "float",
+        "description": "Close-Preis der Bar",
+    },
+    "strength_value": {
+        "type": "float",
+        "description": "Signalstärke (VOLUME_RATIO: Volumen/POC-Volumen; NORMALIZED: |Distanz|/grid_step; PRICE_DISTANCE: |Close-VWAP|/StDev)",
+    },
+    "strength_type": {
+        "type": "str",
+        "description": "Stärke-Maßstab ('VOLUME_RATIO' | 'NORMALIZED' | 'PRICE_DISTANCE')",
+        "technical": True,
+    },
+    "volume_source": {
+        "type": "str",
+        "description": "Volumenquelle (tick_volume/real_volume) – nur Volume_Profile",
+        "technical": True,
+    },
+    "poc_price": {
+        "type": "float",
+        "description": "Point of Control (volumenstärkste Preisstufe) – nur Volume_Profile, nullbar",
+    },
+    "vah_price": {
+        "type": "float",
+        "description": "Value Area High (obere Wertbereichsgrenze) – nur Volume_Profile, nullbar",
+    },
+    "val_price": {
+        "type": "float",
+        "description": "Value Area Low (untere Wertbereichsgrenze) – nur Volume_Profile, nullbar",
+    },
+    "lvn_price": {
+        "type": "float",
+        "description": "Nächstgelegener Low Volume Node zum Close – nur Volume_Profile, nullbar",
+    },
+    "is_lvn_swing": {
+        "type": "bool",
+        "description": "True bei LVN-Rejection – nur Volume_Profile",
+    },
+    "grid_price": {
+        "type": "float",
+        "description": "Nächstes Raster-Level (round(close/grid_step) × grid_step) – nur Grid_Proximity",
+    },
+    "vwap_price": {
+        "type": "float",
+        "description": "Anchored VWAP (kumulativ ab Perioden-Start) – nur Anchored_VWAP",
+    },
+    "vwap_upper": {
+        "type": "float",
+        "description": "Oberes VWAP-Band (VWAP + band_mult × StDev) – nur Anchored_VWAP",
+    },
+    "vwap_lower": {
+        "type": "float",
+        "description": "Unteres VWAP-Band (VWAP - band_mult × StDev) – nur Anchored_VWAP",
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Modul-Helfer (17.01.02: echte Erkennung statt Scaffold)
@@ -357,6 +466,13 @@ class SrvSwingVolumeProfile(PluginFeature):
         """Flache Kopie der Modul-Konstante `_SWING_VOLUME_PROFILE_SCHEMA`
         (PineScript-Input-Zone am Dateianfang, M1: kein geteiltes Dict)."""
         return {k: dict(v) for k, v in _SWING_VOLUME_PROFILE_SCHEMA.items()}
+
+    @property
+    def output_schema(self) -> Dict[str, Dict[str, Any]]:
+        """Output-Schema (20.03): flache Kopie der Modul-Konstante
+        `_SWING_VOLUME_PROFILE_OUTPUT_SCHEMA` (PineScript-Input-Zone, M1:
+        kein geteiltes mutable Dict)."""
+        return {k: dict(v) for k, v in _SWING_VOLUME_PROFILE_OUTPUT_SCHEMA.items()}
 
     # 2. SCHEMA-EXPOSURE FÜR DIE UI (07.08.2026, Bugfix): Die Spalten-UI
     # (serviceui/param_columns.py & ServiceSelectorWidget) liest Parameter-
