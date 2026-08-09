@@ -333,3 +333,46 @@ Geometrie-FAILs unverändert), temporäre Checks `test/check_2004_*.py`
 * `test/check_2004_schema.py` (7/7), `test/check_2004_tree.py` (13/13),
   `test/check_2004_viewmodel.py` (7/7), `test/check_2004_purge.py` (8/8),
   `test/check_2004_ctxmenu.py` (34/34), `test/check_2004_writers.py` (8/8).
+
+---
+
+## 8a. Implementierungs-Log – Bugfix Q8 „Als Variante duplizieren zeigt kein Ergebnis" (09.08.2026, Commit `0a1baea`)
+
+**Problem:** `Als Variante duplizieren` schrieb korrekt in die DB (Set-Instanz- und
+Clone-Pfad verifiziert), lieferte aber KEIN sichtbares Ergebnis:
+
+1. Der Parameter-Editor wurde nur bei bereits geladenem Set aktualisiert
+   (Q8 verlangt „öffnet Parameter-Editor").
+2. Clones wurden als unsichtbares (kollabiertes) Child angelegt.
+3. Namens-Bug: flaches Plugin → Preset wurde `Default (Kopie)` statt `Default`
+   benannt, weil `_next_preset_copy_name` auf `list_indicator_presets` zugriff,
+   das den UI-Default „Default" immer fabriziert.
+
+### Änderungen
+
+* **`serviceui/master_tree.py`**:
+  * Neu (public, nach `_restore_selection`): `select_instance(set_id, service_id)`
+    und `select_clone(plugin_id, instance_hash)` plus gemeinsames
+    `_select_by(predicate)` – expandiert die Eltern-Kette (`_expand_ancestors`),
+    selektiert unter `blockSignals` und scrollt in den sichtbaren Bereich.
+
+* **`serviceui/service_win.py`**:
+  * `_duplicate_set_instance`: lädt das Ziel-Set IMMER in den Parameter-Editor
+    (statt nur wenn `_current_set_id == set_id`) und selektiert die neue Instanz
+    via `tree.select_instance(...)`.
+  * `_duplicate_preset`: selektiert den neuen Clone via `tree.select_clone(...)`.
+  * `_next_preset_copy_name(sm, plugin_id, base)`: Quelle jetzt
+    `list_plugin_presets(plugin_id)` (nur echte Preset-Rows) statt
+    `list_indicator_presets`; ist der Basis-Name noch GAR NICHT vergeben
+    (flaches Plugin-Blatt), wird er direkt verwendet – sonst
+    `<base> (Kopie)`, `(Kopie 2)`, ...
+
+### Verifikation (headless, keine UI-Tests)
+
+* `test/check_2004_dupl3.py`: **8/8 PASS** (Set-Instanz-Pfad, Editor-Spalte,
+  Baum-Selektion + Expansion, Clone-Pfad, Namens-Fix) – danach Cleanup.
+* `test/test.py`: 964 PASS / 6 FAIL (nur vorbestehende Geometrie-Baseline
+  P2/P5/H3-H7, unverändert).
+* `test/check_2004_ctxmenu.py` (34/34), `test/check_2004_writers.py` (8/8),
+  `test/check_2004_purge.py` (8/8).
+* `py_compile` + CRLF-Konsistenz (0 lone LF) aller geänderten Dateien.
