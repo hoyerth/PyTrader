@@ -418,12 +418,27 @@ bestehende Strukturen und Logik blieben unverändert.
 
 ---
 
-## 5.7 Umsetzungs-Log 09.08.2026 (Kapitel 20.02.01 – AUSSTEHEND)
+## 5.7 Umsetzungs-Log 09.08.2026 (Kapitel 20.02.01 – umgesetzt)
 
-**Status:** Analyse + Entscheidungen (E1–E8) abgeschlossen, Kapitel dokumentiert.
-**Umsetzung erst nach expliziter Anweisung des Anwenders** (Regel 6 – Inkrementelles
-Arbeiten, Wartepunkt: kein Code vor dem Startbefehl). Der Implementierungs-Log wird nach
-erfolgreicher Umsetzung + Bestätigung hier ergänzt.
+**Status:** Analyse + Entscheidungen (E1–E8) abgeschlossen; Umsetzung erfolgt
+und manuell vom Anwender bestätigt. Die E1–E8-Änderungen und die
+User-Meldungen 1–3 (Abschnitt 5.9) wurden zusammen committet (Commit `86f0527`).
+
+| E | Entscheidung | Umsetzung |
+|---|--------------|-----------|
+| E1 | Datums-Formatter 5 Stufen | `_HeatmapAxis._format` (`date`): Schwellen 1J/1M/1T/2h/`<2h` → `YYYY` / `TT.MM.JJ` / `DDD TT.MM.JJ` / `DDD TT.MM.JJ HH:00` / `DDD TT.MM.JJ HH:mm`; DDD locale-unabhängig via `DOW_LABELS[(weekday + 1) % 7]`; Wanduhr via UTC-Darstellung (kein Berlin-Offset) |
+| E2 | "Stunde" → "Tageszeit" | `_DIM_LABELS["hour"] = "Tageszeit"` (nur generisches Widget; Legacy-HeatmapPage Dow×Stunde unverändert) |
+| E3 | Feste Skala Tageszeit | `_axis_bounds("hour")` konstant `(0.0, 24.0)` (Zellen halboffen `[h, h+1)`, 00:00–23:59) |
+| E4 | UTC-Offset-Label | `_utc_offset_text()`: Offset aus dem neuesten Datums-Epoch der Achse (bzw. Systemzeit) → `Tageszeit (UTC+2)` / `(UTC+1)`, DST-robust |
+| E5 | Wochentag strikt Mo–Fr | SQL-Filter in `fetch_generic_heatmap` (`EXTRACT(DOW ...) BETWEEN 1 AND 5`); neue `DOW_WEEK_LABELS`; `_format_dim_value`/`_format` Mo–Fr; `_axis_bounds("dow")` konstant `(1.0, 6.0)` |
+| E6 | `dow_hour` ersatzlos entfernt | Reader (`DIM_MAPPINGS`/`HEATMAP_DIMENSIONS`/`_format_dim_value`/`_axis_coords`) + Widget (`_DIM_LABELS`/`_format`/`_axis_bounds`); VM-Sanitizer `_sanitize_dim()` in `set_heatmap_config`/`_apply_heatmap_section`/`_apply_profile`/`restore_workspace` (Alt-Payloads → "hour") |
+| E7 | Overlay-Zoom-Lock | `_update_controls`: `setXLink` NUR bei X=date + Overlay an; sonst `setXLink(None)` (Preis-ViewBox vollständig entkoppelt) |
+| E8 | Service-Anzeige | `resolve_service_label()` im ViewModel (`{Kategorie} / {Name}`, `srv_`-Prefix entfällt, lazy `_selector_model`); `service_id`-Achsen-Labels via Resolver; X/Y-Combo-Mindestbreite 160 px |
+
+**Validierung (headless):** `py_compile` auf allen geänderten Dateien; die
+E1–E8-Checks sind in `test/check_heatmap_bugfix.py` integriert (feste Skalen,
+Mo–Fr-Labels, 5-Stufen-Datumsformat, UTC-Offset, `dow_hour`-Sanitizer via
+`_axis_bounds`, Overlay-Zoom-Lock); Details in Abschnitt 5.9.
 ---
 
 ## 5.8 Bugfix-Log 09.08.2026: Heatmap-Umbau (User-Meldungen 1–6) + WAL-Guard
@@ -455,5 +470,36 @@ Commit: `01229b1`.
 - `py_compile` auf allen 8 geänderten Dateien: PASS
 - `test/check_heatmap_bugfix.py`: **34/34 PASS** (Reader x_axis/y_axis inkl. Mitternachts-Epochs + Tagesabständen, `fetch_daily_ohlc` mit Wanduhr-Mitternacht + OHLC-Konsistenz, `limit=None` → alle Daten/2083 Tage, Worker-Dispatch `QUERY_DAILY_OHLC`, Axis-Ticks date 100T/3h/90s → 1T/1h/30s + Format TT.MM.JJ/HH:MM, hour/dow_hour/kategorial-Ticks, Widget-Offscreen: Overlay im selben Canvas, X-Bounds = Epochs ± halber Tag, Y-Bounds = −0,5..1,5, Cleanup)
 - `test/test.py` Blöcke 37/38: alle PASS (nur 6 bekannte offscreen-Geometrie-Fehler P2/P5/H3–H5/H7, unabhängig von dieser Umsetzung)
+- Manueller Funktionstest der GUI erfolgt durch den Anwender.
+
+---
+
+## 5.9 Bugfix-Log 09.08.2026: User-Meldungen 1–3 (Skalen-Begrenzung + Feld-Dropdown)
+
+**Kontext:** Drei User-Meldungen nach Umsetzung von Kapitel 20.02.01 (E1–E8).
+Commit: `86f0527`. Alle Fixes sind point-fix/additiv – bestehende Strukturen
+(Standard-Modus `HeatmapPage`, `fetch_ohlcv_snapshot`/`QUERY_OHLCV`) blieben
+unangetastet.
+
+| # | Symptom | Ursache | Fix |
+|---|---------|---------|-----|
+| M1 | Tageszeit-Skala nicht begrenzt: beim Rauszoomen erscheinen -/+ Werte außerhalb 00:00–23:59 | `_HeatmapAxis.tickValues` erzeugte Ticks über den GESAMTEN sichtbaren Bereich (auch außerhalb der festen Skala); `_format("hour")` nutzte `% 24` → z. B. -1 wurde als "23:00" angezeigt | `_clamped_scale_bounds()`: Tick-Bereich auf `[0, 24)` geclampt; rechtes Skalenende halboffene Grenze (kein Duplikat-Label "00:00" an Position 24); `_format` lässt Werte außerhalb der Skala leer (kein `% 24`-Wrap mehr) |
+| M2 | Wochentag-Skala nicht begrenzt: -/+ Werte außerhalb Mo–Fr | wie M1 für `dow` (feste Skala `[1, 6)`) | gleiches Clamping; `dow._format` außerhalb 1..5 → "" |
+| M3a | "Feld"-Dropdown zu kurz | `setMinimumWidth(140)` | `setMinimumWidth(320)` + `setMaximumWidth(460)` + `AdjustToContents` (Popup zeigt vollen '{Service} / {Key}'-Text statt Ellipsis) |
+| M3b | Feld-Dropdown zeigt nur JSON-Keys ohne Service-Zuordnung | `metrics`-Liste (Repository) enthielt nur die Keys; keine Key→Service-Zuordnung | Reader `feature_keys_by_service()` (Key→Services je feature_id, numerisch, Typ-Logik wie `available_feature_keys`); Repository `field_sources` (`{Key: [service_id...]}`) im generischen Payload (leere Legacy-`feature_id` ignoriert); Widget `_field_label()` → `'{Kategorie} / {Name} / {Key}'` via `resolve_service_label` (`srv_`-Prefix entfällt); Combo-`data` bleibt der Roh-Key (Query-Vertrag unverändert) |
+
+**Validierung (headless, keine UI-Tests):**
+- `py_compile` auf allen 4 geänderten Dateien: PASS.
+- `test/check_heatmap_bugfix.py`: **59/59 PASS** – DB-Tests auf **synthetische
+  DuckDBs in `test/`** umgestellt (`tmp_hm_*.duckdb`), da die echten
+  `data/*.duckdb` bei laufender App exklusiv gesperrt sind (Windows-Lock).
+  Neue Checks: Meldung 1 (hour-Ticks in `[0, 24)` bei Rauszoom, kein
+  24er-Duplikat, `_format(-1/24)` leer, Teilbereich unverändert), Meldung 2
+  (dow-Ticks in `[1, 6)`, `_format(0/6)` leer), Meldung 3 (Combo ≥ 320 px,
+  `feature_keys_by_service`, `field_sources` inkl. geteiltem Key → beide
+  Services, `_field_label` ohne `srv_`, Combo-Text `'{Name} / {Key}'`,
+  Combo-DATA = Roh-Key).
+- `test/test.py`: unverändert (kein Kontakt zu dieser Umsetzung; 6 bekannte
+  offscreen-Geometrie-Fehler P2/P5/H3–H5/H7 unabhängig).
 - Manueller Funktionstest der GUI erfolgt durch den Anwender.
 
