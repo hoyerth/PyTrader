@@ -52,3 +52,47 @@ Befüllung der Modul-Konstante `_*_OUTPUT_SCHEMA` in allen 8 aktiven Services un
 4. **Validation (`test/test.py`)**: Headless Test verifying `output_schema` retrieval for all registered plugins + `py_compile`.
 
 
+---
+
+# 20.03.01 Bugfix: Output-Schema-Sektion + Info-Button im Tree (09.08.2026, 18:20)
+
+## 1. Ausgangslage (User-Meldungen)
+1. **Ergebnisparameter gehören NICHT ins Beschreibungsfeld** – die 20.03-Resultatfelder
+   wurden zunächst im Read-only-Info-Label unter dem individuellen Beschreibungsfeld
+   gerendert; gewünscht ist eine eigene Sektion.
+2. **Erste Zeile im allgemeinen Beschreibungsfeld nicht mehr sichtbar** – das lange
+   Output-HTML im Info-Label verstärkte den Qt-Quirk (`setHtml` setzt den Cursor ans
+   Dokument-Ende, Qt wrappt später um → Scroll nach unten). Alt-Fix 17.01.06
+   (`_scroll_textedit_top`, synchron + deferred + nach Box-Resize) ist intakt.
+3. **i-Button im Tree geht nicht mehr** – `INFO_BUTTON_TEXT = "ℹ"` (U+2139) rendert
+   unter Windows-Qt bei fehlendem Font als Tofu-Box → Button unsichtbar
+   (vgl. Alt-Bugfix 04.08.2026 Punkt 5: Unicode-Badge `🛈` → ASCII `'i'`).
+4. **Vorgabe (User)**: Je Ergebnisparameter Name + i-Button daneben, der die
+   Beschreibung in einem Fenster zeigt.
+
+## 2. Umsetzung (Commit `1f40783`, Tag `20.03_bugfix`)
+- **`serviceui/param_columns.py`**:
+  - Output-Schema-Block aus `_update_service_info_label` entfernt (Punkt 1).
+  - Neue Sektion **UNTER** dem Info-Label in `_build_service_column`: Header
+    `📊 Resultatfelder (Output-Schema):`, je Haupt-Resultatfeld eine Zeile
+    (`🔹 name (type)`) mit 16-px-`i`-Button → `_show_output_field_info`
+    (modaler `QDialog` mit Name/Typ/Beschreibung/Service-Referenz).
+    Technische Felder (`technical: True`) kompakt in dezentem Block
+    `🔧 System-Metrik: …` (Semikolon-getrennt, ohne Beschreibung).
+  - Neues State-Dict `self._service_output_schemas[iid]` (Reset in
+    `_clear_service_columns`); `QDialog`-Import ergänzt.
+- **`serviceui/master_tree.py`**: `INFO_BUTTON_TEXT` von `"ℹ"` (U+2139) zurück auf
+  ASCII `"i"` (Punkt 3) – inkl. Begründungskommentar.
+
+## 3. Validierung (headless, keine UI)
+- `py_compile` auf beiden geänderten Dateien: OK.
+- `test/check_output_schema.py`: ALL CHECKS PASSED (8 Services, Main/Tech-Split).
+- Neuer Testblock `20.03-Bugfix` in `test/test.py`: `INFO_BUTTON_TEXT` = ASCII `'i'`
+  (kein U+2139) + Main/Tech-Split vollständig + alle Tech-Felder tragen eine
+  Beschreibung – alle PASS.
+- Hinweis: Die 6 bestehenden Fehlschläge (P2/P5/H3–H7, Fenster-Persistenz-Geometrie)
+  sind VORBESTEHEND und betreffen nicht die geänderten Codepfade
+  (nur `master_tree.py`/`param_columns.py` wurden modifiziert).
+
+
+
