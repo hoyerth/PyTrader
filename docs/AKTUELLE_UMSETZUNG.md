@@ -324,7 +324,7 @@ Regressions-Absicherung in `test/test.py` (Filter-Check).
 * Entscheidungen F1–F7 sind vom Anwender am 09.08.2026, 20:21 bestätigt und
   in §6 verbindlich dokumentiert.
 
-## 9. Implementierungs-Log (09.08.2026, ~20:55; Commit `…`, Tag `20.03.02`)
+## 9. Implementierungs-Log (09.08.2026, ~20:55; Commit `1324d95`, Tag `20.03.02`)
 * **`analytics/ui/common.py`** – `CheckableComboBox` (NEU, F1): `QComboBox` mit
   `QStandardItemModel`, Checkbox-Spalte, EventFilter hält Pop-up bei
   Checkbox-Klick offen; API `add_checkable_item(display_text, user_data,
