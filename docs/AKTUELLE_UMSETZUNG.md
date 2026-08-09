@@ -242,7 +242,7 @@ Verifiziert gegen den tatsächlichen Quellcode (keine UI-Ausführung):
 
 ---
 
-## 8. Implementierungs-Log (09.08.2026, ~22:08; Commit “TBD”, Tag “20.04”)
+## 8. Implementierungs-Log (09.08.2026, ~22:08; Commit `b57244b`, Tag `20.04`)
 
 **Phase 20.04 – Parameter-Varianten, Instanz-Hashes & Archivierung** – alle 9
 Entscheidungen Q1–Q9 umgesetzt. Headless-Verifikation (keine UI-Tests):
