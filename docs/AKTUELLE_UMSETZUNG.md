@@ -509,7 +509,7 @@ loeste jedes Sync einen `_apply_config()`-Aufruf aus).
   Nachricht). Implementierungs-Log siehe §8.
 * Keine UI-Tests, kein Regressionstest (Invariante 2).
 
-## 8. Implementierungs-Log (09.08.2026, ~21:40; Commit `…`, Tag `20.03.03`)
+## 8. Implementierungs-Log (09.08.2026, ~21:40; Commit `84f02df`, Tag `20.03.03`)
 * **`analytics/ui/common.py`**:
   * `add_header_item()` (Q4): deaktivierte, graue, fette Trenn-/Kopfzeile
     (`Qt.NoItemFlags`, `userData=None`) – erscheint weder auswaehlbar noch in
