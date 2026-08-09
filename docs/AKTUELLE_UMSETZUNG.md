@@ -268,3 +268,37 @@
 - UI (HeatmapPage/HeatmapWidget) wurde nur als offscreen-Instanziierung
   geprüft (kein GUI-Start, keine UI-Tests gemäß harter Regel).
 - Manueller Funktionstest der GUI erfolgt durch den Anwender.
+
+---
+
+## 5.6 Bugfix-Log 08./09.08.2026 (Analytics – manuell vom Anwender bestätigt)
+
+**Kontext:** Drei User-Meldungen nach Umsetzung von Kapitel 20.02
+(Generische 2D-Heatmap-Engine). Alle Fixes sind additiv/point-fix –
+bestehende Strukturen und Logik blieben unverändert.
+
+### Bugfix A (08.08.2026, Commit `90f78dd`): Keine Anzeige ausgewählter Services + Tree aufgeklappt
+
+| # | Symptom | Ursache | Fix |
+|---|---------|---------|-----|
+| A1 | Analytics-Tabelle zeigt keine Einträge, obwohl Services im MasterTree angehakt sind | `_apply_feature_filter` (analytics/engine/analytics_view_model.py) filterte case-sensitiv und nicht whitespace-tolerant – `feature_id`-Vergleich schlug bei Groß-/Kleinschreibung fehl | Filter case-insensitiv + whitespace-tolerant: `LOWER(TRIM(feature_id))`; VM-Setter refreshen auch `QUERY_HEATMAP_GENERIC`/`QUERY_OHLCV` |
+| A2 | MasterTree-Knoten (Set/Service/Plugin) bleiben nach Anhaken aufgeklappt / kollabieren ungewollt | fehlende Expansion der Vorfahren beim Setzen der Checkboxen | `master_tree.py`: neue `_expand_ancestors()` in `set_checked_feature_ids` + `_on_item_changed` |
+
+**Validierung:** `test/check_bugfix_0808.py` 9/9 PASS; `test/test.py` Block 38 (9 Checks) ergänzt.
+
+### Bugfix B (09.08.2026, Commit `3e7c220`): Seiten-Navigation zeigt immer nur die Tabelle
+
+| # | Symptom | Ursache | Fix |
+|---|---------|---------|-----|
+| B1 | Egal welcher Menüeintrag im Analytics-Fenster (Tabelle/Heatmap/Verteilung/Scatter) – sichtbar blieb immer die Tabelle | Alt-Bug seit Phase 15.03: `AnalyticsWindow._on_page_changed` rief nur `page.request_data()` auf, **ohne** `self.pages_stack.setCurrentIndex(row)` – der Stack blieb dauerhaft auf Index 0 | `_on_page_changed` (analytics/ui/analytics_win.py): `self.pages_stack.setCurrentIndex(row)` VOR `request_data()`; ungültige Rows bleiben ohne Crash |
+
+**Validierung:** `test/check_page_nav.py` 7/7 PASS (Stack folgt Row 1/3/0/2, ungültige Row kein Crash, `request_data` je Page genau 1x).
+
+### Bugfix C (09.08.2026, Commit `3e7c220`): Traceback in der Heatmap-Candle-Projektion
+
+| # | Symptom | Ursache | Fix |
+|---|---------|---------|-----|
+| C1 | Beim Aktivieren der Candle-Projektion im Heatmap-Modus: `Exception: must specify either y1 or height` | `pg.BarGraphItem` kennt KEIN `top=`/`bottom=` – die pyqtgraph-API verlangt `y0` + `height` | `_render_overlay` (analytics/ui/heatmap_widget.py): Docht = `y0=l, height=max(h-l, 1e-9)`, Körper = `y0=min(o,c), height=max(max(o,c)-min(o,c), 1e-9)` |
+
+**Validierung:** `py_compile` OK; offscreen-Smoke-Test `BarGraphItem(x=[0.5], width=0.12, y0=9.5, height=1.0)` PASS (kein GUI-Start, keine UI-Tests gemäß harter Regel).
+
