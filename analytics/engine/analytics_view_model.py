@@ -23,7 +23,7 @@ Aufgaben (15.03-Spezifikation):
    emittiert (Invariante 5 / zentraler EventBus, Payload = Profil-Name).
 """
 
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
@@ -67,15 +67,24 @@ class AnalyticsViewModel(QObject):
     profile_deleted = Signal(str)            # profile_id
     profiles_available = Signal(list)        # Liste der Profile
 
+    # 20.01 (Graceful Degradation, E5): fehlende (entfernte/umbenannte)
+    # Services – Payload: Liste der nicht mehr registrierten plugin_ids.
+    missing_services_detected = Signal(list)
+
     def __init__(
         self,
         analytics_repo: Optional[AnalyticsRepository] = None,
         profile_repo: Optional[AnalyticsProfileRepository] = None,
+        selector_model=None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self._repo = analytics_repo or AnalyticsRepository()
         self._profile_repo = profile_repo or get_analytics_profile_repository()
+        # 20.01 (E5): ServiceSelectorModel fuer den Fault-Tolerant-Resolver
+        # (resolve_valid_feature_ids). Lazy Default – wird nur bei Bedarf
+        # instanziiert (Tests/Alt-Aufrufer ohne Injektion bleiben schlank).
+        self._selector_model = selector_model
 
         # Aktuelle Ansichtsparameter (werden im Profil-Payload persistiert).
         self._params: Dict[str, Any] = {
@@ -111,6 +120,9 @@ class AnalyticsViewModel(QObject):
         self._dirty = False
         self._active_profile: Optional[Dict[str, Any]] = None
         self._profiles: List[Dict[str, Any]] = []
+        # 20.01 (E7): UI-Layout-Anteil des zuletzt restaurierten Workspace
+        # (z. B. {"page_index": 2}) – von der UI abfragbar, kein _params-Key.
+        self._workspace_layout: Dict[str, Any] = {}
 
         # Debounce-QTimer (200-300 ms, 15.03-Spezifikation)
         self._debounce = QTimer(self)
@@ -208,6 +220,49 @@ class AnalyticsViewModel(QObject):
             if s and s not in out:
                 out.append(s)
         return out
+
+    def _resolve_feature_ids(
+        self, feature_ids: List[str]
+    ) -> Tuple[List[str], List[str]]:
+        """Isoliert fehlende Services ueber den Resolver (20.01, E5).
+
+        Ohne ein injiziertes Modell (Tests/Alt-Aufrufer) wird ein lazies
+        Default-Modell erzeugt (nur wenn ueberhaupt IDs zu pruefen sind).
+        Fehler -> (normalisierte ids, []) defensiv (kein Absturz).
+        """
+        ids = self._normalize_feature_ids(feature_ids)
+        if not ids:
+            return [], []
+        model = self._selector_model
+        if model is None:
+            from analytics.engine.service_selector_model import ServiceSelectorModel
+            model = ServiceSelectorModel(parent=self)
+            self._selector_model = model
+        try:
+            return model.resolve_valid_feature_ids(ids)
+        except Exception:
+            return ids, []
+
+    @staticmethod
+    def _flatten_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Flacht v2-Sections (sources/charts/table/styling) auf Top-Level ab.
+
+        20.01 (E2/E3): Der ViewModel arbeitet weiterhin mit flachen `_params` –
+        die v2-Sektions-Keys haben Vorrang vor gleichnamigen Top-Level-Resten
+        (die bei der v1→v2-Migration verlustfrei erhalten bleiben).
+        """
+        flat: Dict[str, Any] = {}
+        for section in ("sources", "charts", "table", "styling"):
+            values = payload.get(section)
+            if isinstance(values, dict):
+                flat.update(values)
+        for key, value in payload.items():
+            if key in ("schema_version", "sources", "charts", "table",
+                       "styling"):
+                continue
+            if key not in flat:
+                flat[key] = value
+        return flat
 
     def set_heatmap_metric(self, metric: str) -> None:
         self._set_param("heatmap_metric", str(metric or "count"),
@@ -504,19 +559,35 @@ class AnalyticsViewModel(QObject):
     def _apply_profile(
         self, profile: Dict[str, Any], mark_dirty: bool = True
     ) -> None:
-        """Uebernimmt die Profil-Parameter in die Ansicht (Explicit Save)."""
+        """Uebernimmt die Profil-Parameter in die Ansicht (Explicit Save).
+
+        20.01 (E2/E3/E5): Das Repository liefert beim Lesen bereits migrierte
+        v2-Sectioned-Payloads – die flachen Sektionen werden hier auf die
+        flachen `_params` abgebildet (keine VM-eigene Migration, Single
+        Source of Truth im Repository). Fehlende Services (entfernte/
+        umbenannte Plugins) werden per ServiceSelectorModel isoliert und via
+        `missing_services_detected` gemeldet; die validen IDs werden DIREKT
+        in `_params` geschrieben (kein `set_feature_ids`: kein Dirty-Flag,
+        kein Doppel-Refresh, B4).
+        """
         self._active_profile = dict(profile)
         payload = profile.get("payload") or {}
+        flat = self._flatten_payload(payload)
         for key in list(self._params.keys()):
-            if key in payload and payload[key] is not None:
-                self._params[key] = payload[key]
+            if key in flat and flat[key] is not None:
+                self._params[key] = flat[key]
         # 15.03-E (Profil-Migration): Alt-Payloads speicherten den Filter als
         # Einzelwert `feature_id` (String) – in `feature_ids` (Liste) wandeln.
-        if "feature_ids" not in payload and payload.get("feature_id"):
+        if "feature_ids" not in flat and flat.get("feature_id"):
             self._params["feature_ids"] = self._normalize_feature_ids(
-                [payload["feature_id"]])
+                [flat["feature_id"]])
         self._params["feature_ids"] = self._normalize_feature_ids(
             self._params.get("feature_ids"))
+        # 20.01 (E5): Fehlende Services isolieren – valide IDs direkt setzen.
+        valid, missing = self._resolve_feature_ids(self._params["feature_ids"])
+        self._params["feature_ids"] = valid
+        if missing:
+            self.missing_services_detected.emit(list(missing))
         self._params["bins"] = self._clamp_bins(self._params.get("bins"))
         self._params["limit"] = self._clamp_limit(self._params.get("limit"))
         if not mark_dirty:
@@ -525,10 +596,71 @@ class AnalyticsViewModel(QObject):
         self.refresh_all()
 
     def _current_payload(self) -> Dict[str, Any]:
-        """Profil-Payload aus den aktuellen Ansichtsparametern."""
-        payload = dict(self._params)
-        payload["schema_version"] = SCHEMA_VERSION_DEFAULT
-        return payload
+        """Profil-Payload aus den aktuellen Ansichtsparametern (v2, sectioned).
+
+        20.01 (E3): Die v2-Sektionen sources/charts/table/styling gruppieren
+        die bekannten Parameter; neue UI-Settings lassen sich spaeter additiv
+        unter neuen Sektionen ergaenzen (kein Schema-Bump noetig).
+        """
+        p = self._params
+        return {
+            "schema_version": SCHEMA_VERSION_DEFAULT,
+            "sources": {
+                "symbol": p.get("symbol"),
+                "timeframe": p.get("timeframe"),
+                "feature_ids": list(p.get("feature_ids") or []),
+            },
+            "charts": {
+                "heatmap_metric": p.get("heatmap_metric"),
+                "scatter_x": p.get("scatter_x"),
+                "scatter_y": p.get("scatter_y"),
+                "distribution_column": p.get("distribution_column"),
+                "bins": p.get("bins"),
+            },
+            "table": {
+                "limit": p.get("limit"),
+                "table_column_widths": dict(
+                    p.get("table_column_widths") or {}),
+                "table_row_height": p.get("table_row_height"),
+                "table_sort_column": p.get("table_sort_column"),
+                "table_sort_order": p.get("table_sort_order"),
+            },
+            "styling": {},
+        }
+
+    def restore_workspace(self, workspace: Dict[str, Any]) -> None:
+        """Wendet den gespeicherten Fenster-Workspace an (20.01, E7).
+
+        Uebernimmt die Workspace-Parameter (letzter Sitzungszustand gewinnt
+        ueber das aktive Profil) verlustfrei in `_params` – OHNE Dirty-Flag
+        und mit demselben Resolver-Pfad wie `_apply_profile` (fehlende
+        Services werden isoliert und via `missing_services_detected`
+        gemeldet). Der UI-Layout-Anteil (z. B. page_index) wird separat unter
+        `workspace_layout` bereitgestellt (kein `_params`-Key). Danach
+        `refresh_all()` (Daten fuer alle Seiten).
+
+        Args:
+            workspace: Payload aus `state_manager.get_workspace_state(...)`
+                im Format {"params": {...}, "layout": {...}}.
+        """
+        if not isinstance(workspace, dict):
+            return
+        self._workspace_layout = dict(workspace.get("layout") or {})
+        params = workspace.get("params")
+        if not isinstance(params, dict):
+            return
+        for key in list(self._params.keys()):
+            if key in params and params[key] is not None:
+                self._params[key] = params[key]
+        self._params["feature_ids"] = self._normalize_feature_ids(
+            self._params.get("feature_ids"))
+        valid, missing = self._resolve_feature_ids(self._params["feature_ids"])
+        self._params["feature_ids"] = valid
+        if missing:
+            self.missing_services_detected.emit(list(missing))
+        self._params["bins"] = self._clamp_bins(self._params.get("bins"))
+        self._params["limit"] = self._clamp_limit(self._params.get("limit"))
+        self.refresh_all()
 
     @staticmethod
     def _emit_profile_changed(name: str) -> None:
@@ -606,6 +738,15 @@ class AnalyticsViewModel(QObject):
     def is_dirty(self) -> bool:
         """True, wenn ungespeicherte Parametertrends vorliegen ('*')."""
         return self._dirty
+
+    @property
+    def workspace_layout(self) -> Dict[str, Any]:
+        """UI-Layout-Anteil des zuletzt restaurierten Workspace (20.01, E7).
+
+        Z. B. {"page_index": n} – wird von der UI nach `restore_workspace()`
+        abgefragt (kein `_params`-Key).
+        """
+        return dict(self._workspace_layout)
 
     def heatmap_metrics(self, symbol: str, timeframe: str) -> List[str]:
         """Verfuegbare Heatmap-Metriken fuer ein Symbol/Timeframe (19.02).

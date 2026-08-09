@@ -63,6 +63,7 @@ class StateManager:
                 visible_price_to DOUBLE,
                 indicators_state JSON,
                 measurement_state JSON,
+                workspace_state JSON,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -102,6 +103,12 @@ class StateManager:
         con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS plugin_id VARCHAR;")
         con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS version VARCHAR DEFAULT '1.0.0';")
         con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS is_active_batch BOOLEAN DEFAULT FALSE;")
+
+        # Phase 20.01 (09.08.2026): Analytics-Workspace-Persistenz – additive
+        # JSON-Spalte `workspace_state` in instance_states (win_analytics:
+        # vm.params + UI-Layout). Idempotent – bestehende Zeilen/Spalten
+        # bleiben unangetastet.
+        con.execute("ALTER TABLE instance_states ADD COLUMN IF NOT EXISTS workspace_state JSON;")
 
         # Phase 15 (U15-B4): Alt-Indikator 'grid' (chart/indicators/grid.py)
         # wurde am 04.08.2026 entfernt. Persistierte Presets mit
@@ -321,6 +328,25 @@ class StateManager:
         exakt reproduziert).
         """
         return self._window_repo.get_window_geometry(instance_id)
+
+    # Phase 20.01: Workspace-Persistenz (win_analytics) – Fassaden-Delegation
+    # an das WindowStateRepository (Muster 15.04, identische Signaturen).
+    def save_workspace_state(
+        self, instance_id: str, state: Dict[str, Any]
+    ) -> None:
+        """Persistiert einen Fenster-Workspace (E6, NOT-NULL-konform).
+
+        `workspace_state` (JSON) wird auf die instance_states-Zeile der
+        Instanz ge-upsertet; symbol/timeframe der Zeile bleiben erhalten
+        (Fallback ''/'M1' bei noch nicht existierender Row).
+        """
+        self._window_repo.save_workspace_state(instance_id, state)
+
+    def get_workspace_state(
+        self, instance_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Liest den gespeicherten Fenster-Workspace (oder None)."""
+        return self._window_repo.get_workspace_state(instance_id)
 
     def load_all_instances(self) -> List[Dict[str, Any]]:
         # Phase 15.04: Delegation an das WindowStateRepository (pandas-.df()-

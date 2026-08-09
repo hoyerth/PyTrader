@@ -27,7 +27,7 @@ Verwendete Badge-Konvention (Spalte 1 des MasterTree):
   * `⚪ inaktiv in <Indikator>` – Indikator ist nirgends aktiv / kein Chart-Pflicht
 """
 
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from PySide6.QtCore import QObject, Signal
 
@@ -622,3 +622,37 @@ class ServiceSelectorModel(QObject):
                     break
             names.append(found if found else str(fid))
         return names
+
+    # ------------------------------------------------------------------
+    # 20.01 (E5): Fault-Tolerant Resolver fuer persistierte feature_ids
+    # ------------------------------------------------------------------
+    def resolve_valid_feature_ids(
+        self, feature_ids: List[str]
+    ) -> Tuple[List[str], List[str]]:
+        """Prueft feature_ids gegen die PluginRegistry (Phase 20.01, E5).
+
+        Wird vom AnalyticsViewModel beim Profil-/Workspace-Restore genutzt,
+        um entfernte/umbenannte Plugins (fehlende feature_ids) zu isolieren:
+        die validen IDs bleiben aktiv, die fehlenden werden gemeldet
+        (missing_services_detected -> Warn-Label, Graceful Degradation).
+
+        Returns:
+            (valid_ids, missing_ids): gueltige Plugin-IDs (case-insensitiv,
+            dedupliziert, Reihenfolge erhalten) und nicht (mehr) registrierte
+            IDs. `'native'` ist der Feature-Store-Sentinel des nativen
+            Feature-Builder-Pfads (kein Plugin) und gilt als fehlend (B7) –
+            der ServiceSelectorDialog emittiert ausschliesslich plugin_ids.
+        """
+        valid: List[str] = []
+        missing: List[str] = []
+        seen: Set[str] = set()
+        for fid in feature_ids or []:
+            key = str(fid or "").strip()
+            if not key or key.lower() in seen:
+                continue
+            seen.add(key.lower())
+            if self.get_plugin(key) is not None:
+                valid.append(key)
+            else:
+                missing.append(key)
+        return valid, missing

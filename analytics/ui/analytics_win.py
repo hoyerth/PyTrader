@@ -141,10 +141,15 @@ class AnalyticsWindow(PersistentWindow):
     INSTANCE_ID = "win_analytics"
     # Bugfix 04.08.2026 (Fenster-Historie): auto_restore=True – das Fenster
     # wird beim App-Start wiederhergestellt, wenn es beim Beenden der App
-    # OFFEN war. _keep_history_on_close bleibt Default (False): ein MANUELL
-    # geschlossenes Fenster wird aus der aktiven History entfernt
-    # (delete_instance) und poppt beim naechsten Start NICHT wieder auf
-    # (Semantik identisch zu chart_win).
+    # OFFEN war.
+    # 20.01 (E1): _keep_history_on_close = True – der Analytics-Workspace
+    # (vm.params + Layout) wird in instance_states.workspace_state
+    # persistiert und muss das manuelle Schliessen ueberleben
+    # (PersistentWindow.closeEvent loescht bei False den DB-Eintrag).
+    # Trade-off: ein manuell geschlossenes Analytics-Fenster wird beim
+    # naechsten Start wiederhergestellt (Dashboard-Fenster, kein Wegwerf-
+    # Fenster; Semantik bewusst abweichend von chart_win).
+    _keep_history_on_close = True
 
     def __init__(
         self,
@@ -155,9 +160,15 @@ class AnalyticsWindow(PersistentWindow):
         selector_model: Optional[ServiceSelectorModel] = None,
     ) -> None:
         super().__init__(parent)
+        # 20.01 (E5): Das ServiceSelectorModel wird VOR dem ViewModel erzeugt
+        # und injiziert – der VM nutzt es fuer den Fault-Tolerant-Resolver
+        # (resolve_valid_feature_ids) beim Profil-/Workspace-Restore.
+        self._selector_model: ServiceSelectorModel = (
+            selector_model or ServiceSelectorModel(parent=self))
         self._vm = view_model or AnalyticsViewModel(
             analytics_repo=analytics_repo,
             profile_repo=profile_repo,
+            selector_model=self._selector_model,
             parent=self,
         )
         self._symbol_repo: SymbolRepository = get_symbol_repository()
@@ -183,8 +194,6 @@ class AnalyticsWindow(PersistentWindow):
         # ersetzt das fruehere Service-Filter-Popover. Das
         # ServiceSelectorModel ist injizierbar (Headless-Tests); der Dialog
         # wird lazy erzeugt (nicht-modal) und beim Schliessen zerstört.
-        self._selector_model: ServiceSelectorModel = (
-            selector_model or ServiceSelectorModel(parent=self))
         self._service_dialog: Optional[ServiceSelectorDialog] = None
         #: Anzeigenamen des aktiven Datenquellen-Filters (fuer den Button).
         #: Beim Profilwechsel zurueckgesetzt – Namen werden dann aus den
@@ -299,6 +308,13 @@ class AnalyticsWindow(PersistentWindow):
         self.label_status_msg.setStyleSheet(
             "color: #b7950b; font-weight: bold;")
         filt.addWidget(self.label_status_msg)
+        # 20.01 (Graceful Degradation): Warn-Hinweis bei nicht mehr
+        # verfügbaren Services (fehlende plugin_ids im Profil/Workspace).
+        self.label_missing_warning = QLabel("")
+        self.label_missing_warning.setStyleSheet(
+            "color: #c62828; font-weight: bold;")
+        self.label_missing_warning.setVisible(False)
+        filt.addWidget(self.label_missing_warning)
         filt.addStretch(1)
         root.addLayout(filt)
 
@@ -373,6 +389,8 @@ class AnalyticsWindow(PersistentWindow):
         self._active_display_names = []
         self._vm.set_feature_ids(list(feature_ids or []))
         self._sync_service_filter_button()
+        # 20.01: Manuelle Datenquellen-Aenderung -> Warn-Label zuruecksetzen.
+        self.label_missing_warning.setVisible(False)
 
     @Slot(list, list)
     def _on_services_selected(
@@ -387,6 +405,8 @@ class AnalyticsWindow(PersistentWindow):
         self._active_display_names = list(display_names or [])
         self._vm.set_feature_ids(list(feature_ids or []))
         self._sync_service_filter_button()
+        # 20.01: Manuelle Datenquellen-Aenderung -> Warn-Label zuruecksetzen.
+        self.label_missing_warning.setVisible(False)
 
     def _sync_service_filter_button(self) -> None:
         """Synchronisiert den Datenquellen-Button mit dem VM-Parameter.
@@ -420,6 +440,8 @@ class AnalyticsWindow(PersistentWindow):
         vm.dirty_changed.connect(self._on_dirty_changed)
         vm.busy_changed.connect(self._on_busy_changed)
         vm.query_failed.connect(self._on_query_failed)
+        # 20.01 (Graceful Degradation): fehlende Services -> Warn-Label.
+        vm.missing_services_detected.connect(self._on_missing_services)
         # 19.01 (Step 1): Status-Text bei Tabellen-Abfragen (total == 0 ->
         # "Keine Daten vorhanden", E1). Nur QUERY_TABLE wird ausgewertet.
         vm.data_ready.connect(self._on_data_ready)
@@ -610,6 +632,23 @@ class AnalyticsWindow(PersistentWindow):
     @Slot(str, str)
     def _on_query_failed(self, kind: str, error: str) -> None:
         print(f"WARN [AnalyticsWindow] Abfrage '{kind}' fehlgeschlagen: {error}")
+
+    @Slot(list)
+    def _on_missing_services(self, missing: List[str]) -> None:
+        """Zeigt an, welche gespeicherten Services nicht mehr verfügbar sind.
+
+        20.01 (Graceful Degradation): Fehlende feature_ids (entfernte/
+        umbenannte Plugins) wurden beim Profil-/Workspace-Restore isoliert
+        gefiltert – die verbliebenen Quellen bleiben aktiv. Das Label wird
+        bei manueller Datenquellen-Aenderung oder save_profile() versteckt.
+        """
+        missing = [str(m) for m in missing or [] if str(m or "").strip()]
+        if not missing:
+            self.label_missing_warning.setVisible(False)
+            return
+        self.label_missing_warning.setText(
+            f"⚠️ {len(missing)} Services nicht mehr verfügbar")
+        self.label_missing_warning.setVisible(True)
 
     @Slot(str, dict)
     def _on_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
@@ -805,6 +844,9 @@ class AnalyticsWindow(PersistentWindow):
         """Explicit Save: Name/Beschreibung + aktuelle Parameter persistieren."""
         if self._vm.active_profile is None:
             return
+        # 20.01: save_profile() bestaetigt die aktuelle Datenquellen-Wahl ->
+        # Warn-Label (fehlende Services) zuruecksetzen.
+        self.label_missing_warning.setVisible(False)
         pid = self._vm.active_profile["profile_id"]
         self._vm.update_profile(
             pid,
@@ -851,6 +893,59 @@ class AnalyticsWindow(PersistentWindow):
     # ------------------------------------------------------------------
     # Initiale Ladung + Lebenszyklus
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Workspace-Persistenz (20.01, E1/E7): vm.params + UI-Layout
+    # ------------------------------------------------------------------
+    def _save_workspace(self) -> None:
+        """Persistiert den Analytics-Workspace (VM-Parameter + Layout).
+
+        20.01: Payload = {"params": vm.params, "layout": {"page_index": ...}}.
+        Wird im closeEvent VOR super().closeEvent() ausgefuehrt, damit die
+        instance_states-Zeile (inkl. workspace_state) das Fenster ueberlebt
+        (E1: _keep_history_on_close = True).
+        """
+        try:
+            payload = {
+                "params": self._vm.params,
+                "layout": {
+                    "page_index": self.sidebar.currentRow()
+                    if hasattr(self, "sidebar") else 0,
+                },
+            }
+            self.state_manager.save_workspace_state(
+                self.INSTANCE_ID, payload)
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] Workspace-Save fehlgeschlagen: {e}")
+
+    def _restore_workspace(self) -> None:
+        """Stellt den letzten Workspace wieder her (20.01, E7).
+
+        Laeuft NACH load_profiles() (aktives Profil wird zuerst angewendet);
+        der Workspace (letzter Sitzungszustand) gewinnt. Fehlende Services
+        meldet der ViewModel via missing_services_detected -> Warn-Label.
+        """
+        try:
+            payload = self.state_manager.get_workspace_state(
+                self.INSTANCE_ID)
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] Workspace-Restore fehlgeschlagen: {e}")
+            return
+        if not payload:
+            return
+        self._vm.restore_workspace(payload)
+        # Combos/Button mit den restaurierten VM-Parametern synchronisieren.
+        self._sync_profile_filters()
+        self._sync_service_filter_button()
+        page_index = int(
+            (self._vm.workspace_layout or {}).get("page_index", -1))
+        if 0 <= page_index < self.pages_stack.count():
+            self.sidebar.setCurrentRow(page_index)
+        # Limit-Feld mit dem VM-Wert synchronisieren (Workspace kann abweichen).
+        if hasattr(self, "edit_limit"):
+            self.edit_limit.setText(
+                str(int(self._vm.params.get("limit")
+                        or self._default_limit)))
+
     def _initial_load(self) -> None:
         # VM mit dem aktuellen Combo-Zustand starten (Fix 15.03, idempotent):
         # restore_state (t=0) bzw. _apply_profile koennen bereits Werte gesetzt
@@ -872,19 +967,24 @@ class AnalyticsWindow(PersistentWindow):
         # name='' persistieren und die Combo zeigt '?'. Deshalb die Felder
         # hier aus dem (ggf. geladenen) aktiven Profil synchronisieren.
         self._sync_profile_editor()
+        # 20.01 (E7): Workspace NACH dem aktiven Profil anwenden – der letzte
+        # Sitzungszustand gewinnt. Fehlende Services -> Warn-Label.
+        self._restore_workspace()
         self._on_page_changed(self.sidebar.currentRow())
         # 15.03-E: QUERY_FEATURES speiste das entfernte combo_feature-Dropdown –
         # ohne Feature-Dropdown ist keine Features-Metadaten-Abfrage noetig.
 
     def closeEvent(self, event) -> None:
-        """Stoppt Debounce + laufenden Worker (PersistentWindow speichert).
+        """Stoppt Debounce + Worker und persistiert den Workspace.
 
-        Der Fenster-Historie-Eintrag bleibt dank _keep_history_on_close
-        erhalten, damit Symbol/Timeframe beim naechsten Oeffnen
-        wiederhergestellt werden (Fix 15.03).
+        Der Fenster-Historie-Eintrag bleibt dank _keep_history_on_close =
+        True erhalten, damit Symbol/Timeframe UND Workspace
+        (instance_states.workspace_state) beim naechsten Oeffnen
+        wiederhergestellt werden (20.01 E1).
         """
         try:
             self._vm.shutdown()
         except Exception:
             pass
+        self._save_workspace()
         super().closeEvent(event)

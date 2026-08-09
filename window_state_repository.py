@@ -244,3 +244,56 @@ class WindowStateRepository:
             "DELETE FROM symbol_tf_states WHERE symbol = CAST(? AS VARCHAR) AND timeframe = CAST(? AS VARCHAR)",
             [symbol, timeframe]
         )
+
+    # ------------------------------------------------------------------
+    # workspace_state: Fenster-Workspace (Phase 20.01, win_analytics)
+    # ------------------------------------------------------------------
+    def save_workspace_state(
+        self, instance_id: str, state: Dict[str, Any]
+    ) -> None:
+        """Upsertet `workspace_state` (JSON) auf die instance_states-Zeile.
+
+        Phase 20.01 (E6, NOT-NULL-konform): `instance_states.symbol`/
+        `timeframe` sind NOT NULL. Fuer eine noch nicht existierende Row
+        werden die bestehenden Werte uebernommen (Fallback ''/'M1'), damit
+        der reine Workspace-Upsert keinen NOT-NULL-Constraint verletzt.
+        Vorhandene symbol/timeframe/indicator-Zustaende bleiben unberuehrt
+        (ON CONFLICT aktualisiert nur workspace_state + updated_at).
+        """
+        con = self._get_connection()
+        existing = con.execute(
+            "SELECT symbol, timeframe FROM instance_states "
+            "WHERE instance_id = ?",
+            [instance_id],
+        ).fetchone()
+        symbol = str(existing[0]) if existing and existing[0] is not None else ""
+        timeframe = (
+            str(existing[1]) if existing and existing[1] is not None else "M1"
+        )
+        con.execute("""
+            INSERT INTO instance_states (
+                instance_id, symbol, timeframe, workspace_state, updated_at
+            ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT (instance_id) DO UPDATE SET
+                workspace_state = EXCLUDED.workspace_state,
+                updated_at = EXCLUDED.updated_at;
+        """, [instance_id, symbol, timeframe, json.dumps(state)])
+
+    def get_workspace_state(
+        self, instance_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Liest den gespeicherten Fenster-Workspace einer Instanz (oder None).
+
+        Workspace-Payload (Phase 20.01, E7):
+            {"params": {...}, "layout": {"page_index": n}}
+        """
+        con = self._get_connection()
+        row = con.execute(
+            "SELECT workspace_state FROM instance_states "
+            "WHERE instance_id = ?",
+            [instance_id],
+        ).fetchone()
+        if row and row[0] is not None:
+            parsed = _parse_json_field(row[0])
+            return parsed if isinstance(parsed, dict) else None
+        return None

@@ -16,10 +16,23 @@ Schema (analytics_profiles):
     name        VARCHAR NOT NULL      – eindeutiger Profil-Name (case-insensitiv)
     description VARCHAR               – optionale Beschreibung
     payload     JSON                  – Profil-Payload INKL. Pflichtfeld
-                                        `schema_version` (15.03-Spez: 1)
+                                        `schema_version` (20.01-Spez: 2)
     is_active   BOOLEAN DEFAULT FALSE – genau EIN aktives Profil
     created_at  TIMESTAMP DEFAULT current_timestamp
     updated_at  TIMESTAMP DEFAULT current_timestamp
+
+Payload-Schema (20.01, E3 – sectioned, verlustfrei):
+    schema_version: 2
+    sources:  symbol, timeframe, feature_ids
+    charts:   heatmap_metric, scatter_x, scatter_y, distribution_column, bins
+    table:    limit, table_column_widths, table_row_height,
+              table_sort_column, table_sort_order
+    styling:  {}  (Reserve fuer zukuenftige visuelle Settings)
+
+Alt-Payloads (schema_version: 1, flach) werden beim Lesen (_row_to_profile)
+UND beim Schreiben (_ensure_schema_version) verlustfrei nach v2 migriert
+(E2/E4, Single Source of Truth im Repository – das ViewModel erhaelt IMMER
+v2-Sections). Unbekannte v1-Top-Level-Keys bleiben erhalten.
 
 Verhalten:
 - `create_profile()`   : legt ein neues Profil an; ergaenzt den Payload
@@ -42,8 +55,18 @@ from typing import Any, Dict, List, Optional
 
 from db_service import DB_APP_DATA, DbPool, _parse_json_field
 
-# Pflichtfeld im Profil-Payload (15.03-Spezifikation: `schema_version: 1`).
-SCHEMA_VERSION_DEFAULT: int = 1
+# Pflichtfeld im Profil-Payload (20.01-Spezifikation: `schema_version: 2`).
+SCHEMA_VERSION_DEFAULT: int = 2
+
+#: Sektions-Zuordnung der bekannten Analytics-Parameter (v2-Payload, E3).
+_V1_SECTION_KEYS = {
+    "sources": {"symbol", "timeframe", "feature_ids", "feature_id"},
+    "charts": {"heatmap_metric", "scatter_x", "scatter_y",
+               "distribution_column", "bins"},
+    "table": {"limit", "table_column_widths", "table_row_height",
+              "table_sort_column", "table_sort_order"},
+    "styling": set(),
+}
 
 
 class AnalyticsProfileRepository:
@@ -85,27 +108,100 @@ class AnalyticsProfileRepository:
     def _ensure_schema_version(payload: Dict[str, Any]) -> Dict[str, Any]:
         """Stellt das Pflichtfeld `schema_version` im Profil-Payload sicher.
 
-        Wird beim Erzeugen/Aktualisieren additiv gesetzt (15.03-Spez: 1).
-        Ein vom Aufrufer bereits mitgegebenes schema_version gewinnt
+        Phase 20.01 (E4): Beim Erzeugen/Aktualisieren werden flache
+        v1-Payloads VOR dem Speichern verlustfrei nach v2 migriert
+        (_migrate_v1_to_v2) – es entstehen keine neuen v1-Rows. Ein vom
+        Aufrufer bereits mitgegebenes schema_version >= 2 gewinnt
         (Aufwaertskompatibilitaet).
         """
         payload = dict(payload or {})
-        payload.setdefault("schema_version", SCHEMA_VERSION_DEFAULT)
+        try:
+            version = int(payload.get("schema_version", 1) or 1)
+        except (TypeError, ValueError):
+            version = 1
+        if version < 2:
+            return AnalyticsProfileRepository._migrate_v1_to_v2(payload)
         return payload
+
+    @staticmethod
+    def _migrate_v1_to_v2(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Wandelt ein flaches v1-Profil-Payload verlustfrei in v2-Sections.
+
+        Phase 20.01 (E2/E3): V1-Payloads (schema_version: 1) speichern alle
+        Analytics-Parameter flach auf Top-Level-Ebene. Die Migration gruppiert
+        die bekannten Keys in die Sektionen sources/charts/table/styling und
+        wandelt den Alt-Einzelwert `feature_id` nach `feature_ids` (Liste,
+        kanonisches v2). UNBEKANNTE Top-Level-Keys bleiben erhalten
+        (verlustfrei), damit Fremd-Felder nicht zerstoert werden. Ein bereits
+        v2-Payload wird unveraendert zurueckgegeben.
+
+        Returns:
+            Das migrierte v2-Payload (immer mit `schema_version: 2`).
+        """
+        if not isinstance(payload, dict):
+            return {}
+        payload = dict(payload)
+        try:
+            version = int(payload.get("schema_version", 1) or 1)
+        except (TypeError, ValueError):
+            version = 1
+        if version >= 2:
+            return payload
+
+        sections: Dict[str, Dict[str, Any]] = {
+            name: {} for name in _V1_SECTION_KEYS
+        }
+        rest: Dict[str, Any] = {}
+        for key, value in payload.items():
+            if key == "schema_version":
+                continue
+            placed = False
+            for name, keys in _V1_SECTION_KEYS.items():
+                if key in keys:
+                    sections[name][key] = value
+                    placed = True
+                    break
+            if not placed:
+                rest[key] = value
+
+        # Alt-Einzelwert feature_id -> feature_ids (Liste), kanonisches v2.
+        fid = sections["sources"].pop("feature_id", None)
+        if fid and not sections["sources"].get("feature_ids"):
+            if isinstance(fid, (list, tuple)):
+                sections["sources"]["feature_ids"] = [
+                    str(f) for f in fid if str(f or "").strip()]
+            else:
+                sections["sources"]["feature_ids"] = [str(fid)]
+
+        out: Dict[str, Any] = {"schema_version": 2}
+        for name in ("sources", "charts", "table", "styling"):
+            if sections[name]:
+                out[name] = sections[name]
+            elif name == "styling":
+                # Reserve (E3) immer anlegen – zukuenftige visuelle Settings.
+                out[name] = {}
+        out.update(rest)
+        return out
 
     @staticmethod
     def _row_to_profile(row) -> Dict[str, Any]:
         """Wandelt eine DB-Zeile in ein Profil-Dict (JSON geparst).
 
-        Fehlt im Payload das Pflichtfeld `schema_version` (z. B. Alt-Rows
-        aus einer frueheren Schema-Version), wird es beim Lesen mit dem
-        Default ergaenzt (analog E-3: Default fuer Alt-Rows) – der Payload
-        selbst bleibt unveraendert.
+        Phase 20.01 (E2): Alt-Rows ohne `schema_version` oder mit
+        schema_version 1 (flach) werden beim Lesen verlustfrei nach v2
+        migriert – der ViewModel erhaelt IMMER v2-Sections (Single Source
+        of Truth im Repository). Der Payload in der DB bleibt unveraendert
+        (Migration nur beim Lesen; beim naechsten Save wird v2 geschrieben).
         """
         profile_id, name, description, payload_json, is_active, created_at, updated_at = row
         payload = _parse_json_field(payload_json) or {}
         payload = dict(payload)
-        payload.setdefault("schema_version", SCHEMA_VERSION_DEFAULT)
+        try:
+            version = int(payload.get("schema_version", 1) or 1)
+        except (TypeError, ValueError):
+            version = 1
+        if version < 2:
+            payload = AnalyticsProfileRepository._migrate_v1_to_v2(payload)
         return {
             "profile_id": str(profile_id),
             "name": str(name),
