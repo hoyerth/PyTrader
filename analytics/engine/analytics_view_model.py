@@ -1006,6 +1006,37 @@ class AnalyticsViewModel(QObject):
         except Exception:
             return key
 
+    def resolve_service_display_name(self, plugin_id: str) -> str:
+        """Service-Name OHNE Kategorie-Pfad (20.02.01, User-Meldung 3c).
+
+        Wie `resolve_service_label`, aber OHNE den Kategorie-Pfad: Das
+        `srv_`-Prefix entfaellt (metadata['display_name'], z. B. 'Grid
+        Lines'), der Kategorie-Pfad des MasterTree ('Swing Points /')
+        wird NICHT vorangestellt. Verwendet vom 'Feld'-Dropdown der
+        generischen Heatmap – dort soll vor jedem feature_data-JSON-Key
+        NUR der Service-Name stehen (kein Kategorie-Pfad). Unbekannte/
+        entfernte IDs -> Rohwert (defensiv). Rein lesend, kein SQL.
+        """
+        key = str(plugin_id or "").strip()
+        if not key:
+            return ""
+        model = self._selector_model
+        if model is None:
+            from analytics.engine.service_selector_model import ServiceSelectorModel
+            model = ServiceSelectorModel(parent=self)
+            self._selector_model = model
+        try:
+            plugin = model.get_plugin(key)
+            if plugin is None:
+                return key
+            meta = getattr(plugin, "metadata", {}) or {}
+            name = str(meta.get("display_name") or key)
+            if name.lower().startswith("srv_"):
+                name = name[4:]
+            return name or key
+        except Exception:
+            return key
+
     @property
     def max_lookback_limit(self) -> int:
         """Max-Lookback-Cap (UI-Slider-Maximum)."""

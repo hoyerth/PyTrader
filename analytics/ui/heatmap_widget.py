@@ -50,7 +50,22 @@ ausserhalb; tickValues-Clamping, kein `% 24`-Wrap mehr); (2) Wochentag-Achse
 ebenso strikt Mo-Fr (1..6, halboffene Grenze); (3) 'Feld'-Dropdown deutlich
 laenger (320-460 px) und jeder Eintrag traegt den Service-Namen, aus dem der
 Wert stammt ('{Service} / {Key}', `srv_`-Prefix entfaellt, via
-ViewModel-Resolver + Repository-`field_sources`).
+ViewModel-Resolver + Repository-`field_sources`). User-Meldung 3c (09.08.2026):
+vor jedem Feld-Eintrag steht NUR der Service-NAME ohne Kategorie-Pfad
+(`resolve_service_display_name`, z. B. 'Grid Lines / open' statt
+'Swing Points / Grid Lines / open'); die E8-Achsen-Labels der
+service_id-Dimension behalten weiterhin '{Kategorie} / {Name}'.
+
+20.02.01 (User-Meldung 2 - Datums-Skala LWC-v5, 09.08.2026): Die date-Achse
+nutzt die Tick-Logik von Lightweight Charts v5 (aus dem LWC-JS extrahiert):
+Der Mindestabstand zweier Labels betraegt ~80 px (`_DATE_TARGET_PX`) –
+Zoom-In wechselt zur naechst feineren Variante (Stunden/Minuten), Zoom-Out
+zur naechst groeberen (Jahr/Monat/Woche/Tag); keine Ueberlappung, keine
+Riesensprünge. Weight-Hierarchie (LWC `Q_`): 70 Jahreswechsel ('2026'),
+60 Monatswechsel ('Feb 26'), 55 Wochenanfang Mo (ISO '08.25'),
+50 Tag ('Mo. 07.08.25'), 30 Stunde ('14:00'), 20 Minute ('14:23').
+pyqtgraph uebergibt an `tickValues` die ACHSEN-LAENGE in Pixeln (3. Param)
+– daraus wird der Mindestabstand in Sekunden berechnet.
 """
 
 import math
@@ -100,6 +115,19 @@ _HALF_DAY = 43200.0
 # 20.02.01 (E1): Stufen-Schwellen des Datums-Formatters (Monat/Jahr).
 _MONTH_SECONDS = 2_592_000
 _YEAR_SECONDS = 31_536_000
+
+# 20.02.01 (User-Meldung 2): LWC-v5-adaptierte Datums-Skala.
+# Zielabstand zwischen zwei Tick-Labels in Pixel (Lightweight Charts:
+# 5*(fontSize+4)/8 * (tickMarkMaxCharacterLength || 8) mit fontSize 12 =>
+# 5*16/8*8 = 80 px). Die Tick-Auswahl haelt diesen Abstand ein: Zoom-In
+# => feinere Variante, Zoom-Out => groebere Variante (keine Ueberlappung,
+# keine Riesensprünge). Weight-Hierarchie wie LWC v5:
+#   70 = Jahreswechsel (Label: '2026'), 60 = Monatswechsel ('Feb 26'),
+#   55 = Wochenanfang Mo (ISO-Woche '08.25'), 50 = Tageswechsel
+#   ('Mo. 07.08.25'), 30 = Stundenmarke ('14:00'), 20 = Minutenmarke ('14:23').
+_DATE_TARGET_PX = 80.0
+_MONTHS_SHORT = ("Jan", "Feb", "Mrz", "Apr", "Mai", "Jun",
+                 "Jul", "Aug", "Sep", "Okt", "Nov", "Dez")
 
 _DIM_LABELS = {
     "date": "Datum",
@@ -211,11 +239,14 @@ class _HeatmapAxis(pg.AxisItem):
         if not self._dim:
             return super().tickValues(minVal, maxVal, maxTicks)
         if self._dim == "date":
-            step = _pick_time_step(float(maxVal) - float(minVal),
-                                   int(maxTicks))
-            if step <= 0:
-                return super().tickValues(minVal, maxVal, maxTicks)
-            return [(step, _time_ticks(float(minVal), float(maxVal), step))]
+            # 20.02.01 (User-Meldung 2): LWC-v5-adaptierte Datums-Skala.
+            # pyqtgraph uebergibt als dritten Parameter die ACHSEN-LAENGE in
+            # Pixel (nicht die Tick-Anzahl!). Die Tick-Auswahl haelt den
+            # Zielabstand _DATE_TARGET_PX ein: Zoom-In => feinere Variante,
+            # Zoom-Out => groebere Variante; Jahr/Monat/Woche/Tag/Stunde/
+            # Minute koexistieren als Hierarchie (per-Tick-Format in _format).
+            return self._lwc_date_ticks(float(minVal), float(maxVal),
+                                        float(maxTicks or 0))
         # 20.02.01 (User-Meldungen 1+2): hour/dow auf die feste Skala
         # geclampt – beim Rauszoomen bleibt der Bereich VOR/NACH der
         # Tagesstunden (bzw. der 5 Wochentage) leer. Das rechte Skalenende
@@ -234,6 +265,121 @@ class _HeatmapAxis(pg.AxisItem):
             v += step
         return [(step, values)]
 
+    # ------------------------------------------------------------------
+    # 20.02.01 (User-Meldung 2): LWC-v5-Datums-Ticks (Jahr/Monat/Woche/Tag/
+    # Stunde/Minute-Hierarchie, Mindestabstand in Pixel)
+    # ------------------------------------------------------------------
+    def _lwc_date_ticks(self, lo: float, hi: float, axis_px: float):
+        """Erzeugt die Datums-Ticks nach der LWC-v5-Selektionslogik.
+
+        Der dritte Parameter von `tickValues` ist bei pyqtgraph die
+        ACHSEN-LAENGE in Pixeln. Der Mindestabstand zweier Ticks in
+        Sekunden ergibt sich aus `_DATE_TARGET_PX * span / axis_px` –
+        dadurch bleiben die Labels ~80 px auseinander: Zoom-In => feinere
+        Variante (Stunden/Minuten), Zoom-Out => groebere Variante (nur
+        Jahr/Monat/Woche/Tag). Die Auswahl bevorzugt hoehere Weights
+        (LWC `Q_`): Jahres-/Monatsmarken werden immer gesetzt, feinere
+        Marken fuellen die Luecken.
+        """
+        span = hi - lo
+        if span <= 0:
+            return []
+        if axis_px <= 0 or not math.isfinite(axis_px):
+            axis_px = 800.0
+        min_gap_sec = _DATE_TARGET_PX * span / axis_px
+        min_gap_sec = max(1.0, min_gap_sec)
+        marks = self._date_marks(lo, hi, min_gap_sec)
+        epochs = self._select_date_marks(marks, min_gap_sec)
+        if not epochs:
+            return []
+        return [(min_gap_sec, epochs)]
+
+    def _date_marks(self, lo: float, hi: float,
+                    min_gap_sec: float) -> List[tuple]:
+        """Kandidaten-Marken der Datums-Achse (Epoch, Weight).
+
+        Tages-Marken (Mitternacht, Wanduhr-UTC) mit Weight nach Datum:
+        70 = 1. Januar (Jahreswechsel), 60 = 1. des Monats (Monatswechsel),
+        55 = Montag (ISO-Wochenanfang), 50 = sonstiger Tag. Bei engem
+        Zoom zusaetzlich Stunden-Marken (30) und Minuten-Marken (20) –
+        die Generierung ist ueber die sichtbare Spanne begrenzt
+        (Minuten nur bei < 2 Tagen, Stunden nur bei < 60 Tagen), damit
+        die Kandidatenanzahl klein bleibt.
+        """
+        marks: List[tuple] = []
+        d0 = int(math.floor(lo / _DAY_SECONDS)) * _DAY_SECONDS
+        d1 = int(math.floor(hi / _DAY_SECONDS)) * _DAY_SECONDS
+        d = d0
+        while d <= d1:
+            dt = datetime.fromtimestamp(d, tz=dt_timezone.utc)
+            if dt.month == 1 and dt.day == 1:
+                w = 70
+            elif dt.day == 1:
+                w = 60
+            elif dt.weekday() == 0:
+                w = 55
+            else:
+                w = 50
+            marks.append((d, w))
+            d += _DAY_SECONDS
+        if min_gap_sec < _DAY_SECONDS and (hi - lo) <= 60 * _DAY_SECONDS:
+            h0 = int(math.floor(lo / 3600.0)) * 3600
+            h1 = int(math.floor(hi / 3600.0)) * 3600
+            h = h0
+            while h <= h1:
+                if h % _DAY_SECONDS != 0:  # Mitternacht = Tages-Marke
+                    marks.append((h, 30))
+                h += 3600
+        if min_gap_sec < 3600.0 and (hi - lo) <= 2 * _DAY_SECONDS:
+            m0 = int(math.floor(lo / 60.0)) * 60
+            m1 = int(math.floor(hi / 60.0)) * 60
+            m = m0
+            while m <= m1:
+                if m % 3600 != 0:  # Stunde = Stunden-Marke
+                    marks.append((m, 20))
+                m += 60
+        marks.sort(key=lambda x: x[0])
+        return marks
+
+    @staticmethod
+    def _select_date_marks(marks: List[tuple],
+                           min_gap_sec: float) -> List[float]:
+        """LWC-v5-Selektion (Q_): Weight absteigend, Mindestabstand.
+
+        Hoehere Weights (Jahr/Monat) werden bevorzugt gesetzt; feinere
+        Marken werden nur uebernommen, wenn sie mindestens `min_gap_sec`
+        von den bereits gewaehlten Marken entfernt sind. Ergebnis: die
+        gewohnte Hierarchie (Jahreszahl + Monatswechsel + Tage) mit
+        garantierter Mindest-Pixeldistanz (keine Ueberlappung, keine
+        Riesensprünge).
+        """
+        by_weight: Dict[int, List[float]] = {}
+        for epoch, weight in marks:
+            by_weight.setdefault(int(weight), []).append(float(epoch))
+        selected: List[float] = []
+        for weight in sorted(by_weight.keys(), reverse=True):
+            s = selected
+            out: List[float] = []
+            r = 0
+            e = len(s)
+            a = float("inf")
+            o = float("-inf")
+            for idx in by_weight[weight]:
+                while r < e and s[r] < idx:
+                    out.append(s[r])
+                    o = s[r]
+                    r += 1
+                if r < e:
+                    a = s[r]
+                if a - idx >= min_gap_sec and idx - o >= min_gap_sec:
+                    out.append(idx)
+                    o = idx
+            while r < e:
+                out.append(s[r])
+                r += 1
+            selected = out
+        return selected
+
     def tickStrings(self, values, scale, spacing):
         out = []
         for v in values:
@@ -243,21 +389,32 @@ class _HeatmapAxis(pg.AxisItem):
     # ------------------------------------------------------------------
     def _format(self, v: float, spacing: float) -> str:
         if self._dim == "date":
-            # 20.02.01 (E1): 5 Format-Stufen – Wanduhr-Garantie via
-            # UTC-Darstellung der (Wanduhr-encoded) Epoch (Invariante 7,
-            # KEIN Berlin-Offset). DDD = deutscher Wochentag locale-
-            # unabhaengig ueber DOW_LABELS (So=0..Sa=6).
+            # 20.02.01 (User-Meldung 2): Per-Tick-Format nach der
+            # LWC-v5-Weight-Hierarchie (nicht mehr nach Spacing):
+            #   - Jahreswechsel (1.1.)  -> '2026'      (Weight 70)
+            #   - Monatswechsel (1. des Monats) -> 'Feb 26' (Weight 60)
+            #   - Wochenanfang Mo       -> '08.25'     (ISO-Woche, Weight 55)
+            #   - sonstiger Tag         -> 'Mo. 07.08.25' (Weight 50)
+            #   - Stundenmarke          -> '14:00'     (Weight 30)
+            #   - Minutenmarke          -> '14:23'     (Weight 20)
+            # Wanduhr-Garantie via UTC-Darstellung der (Wanduhr-encoded)
+            # Epoch (Invariante 7, KEIN Berlin-Offset). Monats-/Wochen-
+            # marken eines groben Zooms tragen ihre eigene Beschriftung
+            # (Jahreszahl/Feb/Mrz/...), feine Marken die Uhrzeit.
             dt = datetime.fromtimestamp(v, tz=dt_timezone.utc)
+            if dt.hour != 0 or dt.minute != 0 or dt.second != 0:
+                if dt.minute == 0 and dt.second == 0:
+                    return f"{dt.hour:02d}:00"   # Stundenmarke
+                return f"{dt.hour:02d}:{dt.minute:02d}"  # Minutenmarke
             weekday = DOW_LABELS[(dt.weekday() + 1) % 7]
-            if spacing >= _YEAR_SECONDS:
-                return dt.strftime("%Y")
-            if spacing >= _MONTH_SECONDS:
-                return dt.strftime("%d.%m.%y")
-            if spacing >= _DAY_SECONDS:
-                return f"{weekday} {dt.strftime('%d.%m.%y')}"
-            if spacing >= 2 * 3600:
-                return f"{weekday} {dt.strftime('%d.%m.%y %H:00')}"
-            return f"{weekday} {dt.strftime('%d.%m.%y %H:%M')}"
+            if dt.month == 1 and dt.day == 1:
+                return str(dt.year)               # Jahreswechsel
+            if dt.day == 1:
+                return f"{_MONTHS_SHORT[dt.month - 1]} {dt.year % 100:02d}"
+            if dt.weekday() == 0:
+                iso = dt.isocalendar()
+                return f"{iso[1]:02d}.{dt.year % 100:02d}"  # ISO-Woche
+            return f"{weekday}. {dt.day:02d}.{dt.month:02d}.{dt.year % 100:02d}"
         if self._dim == "hour":
             # 20.02.01 (User-Meldung 1): KEIN `% 24`-Wrap mehr – Werte
             # ausserhalb der festen Skala 00:00-23:59 werden leer gelassen
@@ -805,11 +962,13 @@ class HeatmapWidget(QWidget):
             return "UTC"
 
     def _field_label(self, key: str, service_ids: List[str]) -> str:
-        """Anzeige-Text eines Feld-Eintrags '{Service} / {Key}' (Meldung 3b).
+        """Anzeige-Text eines Feld-Eintrags '{Service} / {Key}' (Meldung 3b/c).
 
         Vor jedem feature_data-JSON-Key steht der Service-Name, aus dem der
-        Wert stammt – das `srv_`-Prefix entfaellt (resolve_service_label,
-        '{Kategorie} / {Name}', z. B. 'Swing Points / Trend Breakout').
+        Wert stammt – NUR der Name OHNE Kategorie-Pfad und ohne `srv_`-
+        Prefix (User-Meldung 3c: `resolve_service_display_name`, z. B.
+        'Grid Lines' statt 'Swing Points / Grid Lines'; die E8-Achsen-
+        Labels der service_id-Dimension behalten den Kategorie-Pfad).
         Liefert ein Key aus mehreren Services, werden die Namen mit ' / '
         verkettet (dedupliziert, deterministisch nach Payload-Reihenfolge).
         Ohne bekannte Quelle (Legacy-Rows ohne feature_id) bleibt der
@@ -818,7 +977,7 @@ class HeatmapWidget(QWidget):
         names: List[str] = []
         if self._view_model is not None:
             for sid in service_ids:
-                label = self._view_model.resolve_service_label(str(sid))
+                label = self._view_model.resolve_service_display_name(str(sid))
                 if label and label not in names:
                     names.append(label)
         if names:

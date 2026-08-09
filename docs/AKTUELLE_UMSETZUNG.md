@@ -503,3 +503,41 @@ unangetastet.
   offscreen-Geometrie-Fehler P2/P5/H3–H5/H7 unabhängig).
 - Manueller Funktionstest der GUI erfolgt durch den Anwender.
 
+---
+
+## 5.10 Bugfix-Log 09.08.2026: Datums-Skala LWC-v5 (Meldung 2) + Feld-Dropdown ohne Kategorie-Pfad (Meldung 3c)
+
+**Kontext:** Drei neue User-Meldungen nach Commit `86f0527` (20.02.01 E1–E8).
+Commit: nach manueller Freigabe. Alle Fixes sind point-fix/additiv –
+bestehende Strukturen blieben unangetastet.
+
+| # | Symptom | Ursache | Fix |
+|---|---------|---------|-----|
+| M2a | Zoom-In: Datums-Beschriftungen überlagern sich | Die date-Achse nutzte `_pick_time_step`/`_time_ticks` (feste Schrittliste) – bei engen Zooms wurden zu viele Labels gezeichnet (kein Mindestabstand) | **LWC-v5-adaptierte Tick-Selektion** (`_lwc_date_ticks`/`_date_marks`/`_select_date_marks`): Mindestabstand `_DATE_TARGET_PX = 80 px` (LWC-Formel `5*(fontSize+4)/8 * (tickMarkMaxCharacterLength||8)` bei fontSize 12). pyqtgraph übergibt an `tickValues` die **Achsen-Länge in Pixeln** (3. Param) → `min_gap_sec = 80 * span / axis_px`. Gewichtete Auswahl (LWC `Q_`): 70 Jahreswechsel → 60 Monatswechsel → 55 Wochenanfang Mo → 50 Tag → 30 Stunde → 20 Minute; feinere Marken nur, wenn ≥ min_gap von den gewählten entfernt |
+| M2b | Zoom-Out: Datums-Beschriftungen stehen zu weit auseinander | wie M2a (Schrittliste griff nicht bei groben Zooms) | gleiche LWC-Selektion: Zoom-Out → automatisch gröbere Variante (Jahr/Monat/Woche/Tag statt Stunden/Minuten), keine Riesensprünge |
+| M2c | Datums-Formate nicht wie gewünscht (Jahre '2026', Monate 'Jan 26', Wochen '08.25', Tage 'Mo. 07.08.25', Stunden '14:00', Minuten '14:23') | `_format` entschied **nach Spacing** (5 Stufen E1) | `_format` entscheidet jetzt **per Tick** anhand der LWC-Weight-Hierarchie: 1.1. → `'2026'` (Weight 70), 1. des Monats → `'Feb 26'` (60), Montag → ISO-Woche `'08.25'` (55), sonstiger Tag → `'Mo. 07.08.25'` (50, DOW_LABELS locale-unabhängig), volle Stunde → `'14:00'` (30), Minute → `'14:23'` (20). Wanduhr-Garantie via UTC-Darstellung (kein Berlin-Offset). Monatsnamen `_MONTHS_SHORT` (Jan…Dez) |
+| M3c | Feld-Dropdown zeigt Kategorie-Pfad '{Kategorie} / {Name} / {Key}' (z. B. 'Grid / Grid Lines / open') | `_field_label` nutzte `resolve_service_label` (E8-Resolver mit Kategorie-Pfad) | Neuer ViewModel-Resolver `resolve_service_display_name(plugin_id)` (nur `display_name`, `srv_`-Prefix entfällt, **ohne** Kategorie-Pfad) → `_field_label` liefert `'{Name} / {Key}'` (z. B. 'Grid Lines / open'). Die **E8-Achsen-Labels** der service_id-Dimension behalten weiterhin `{Kategorie} / {Name}` (`resolve_service_label` unverändert) |
+
+**Betroffene Dateien:**
+- `analytics/ui/heatmap_widget.py` – LWC-Datums-Skala (`_DATE_TARGET_PX`,
+  `_MONTHS_SHORT`, `_lwc_date_ticks`, `_date_marks`, `_select_date_marks`,
+  Per-Tick-`_format`), `_field_label` → `resolve_service_display_name`
+- `analytics/engine/analytics_view_model.py` – neuer Resolver
+  `resolve_service_display_name()` (lazy `_selector_model`, Muster
+  `resolve_service_label`)
+
+**Validierung (headless, keine UI-Tests):**
+- `py_compile` auf beiden geänderten Python-Dateien: PASS.
+- `test/check_heatmap_bugfix.py`: **alle PASS** – alte Spacing-Format-Checks
+  durch Per-Tick-Formate ersetzt (Jahr/Monat/ISO-Woche/Tag/Stunde/Minute),
+  neue LWC-Selektions-Checks: Jahres-Zoom → min_gap 36,5 d + nur Tagesmarken
+  (7 Ticks), 2-Tage-Zoom → min_gap 4,8 h + Stunden-Ticks, 3h-Zoom →
+  Minuten-Ticks, Zoom-In (mehr Pixel) → mehr Ticks (5→17), Zoom-Out
+  (größere Spanne) → weniger Ticks (9→7), alle Tick-Abstände ≥ min_gap
+  (keine Überlappung), `_select_date_marks` bevorzugt Jahres-/Monatsmarken;
+  Meldung 3c: `_field_label` = 'Grid Lines / open' (ohne Kategorie),
+  `resolve_service_display_name` = 'Grid Lines'/'Proximity',
+  E8-`resolve_service_label` = 'Grid / Grid Lines' (Kategorie bleibt),
+  Feld-Combo-Text ohne 'Grid / '-Pfad, Combo-DATA = Roh-Key.
+- Manueller Funktionstest der GUI erfolgt durch den Anwender.
+
