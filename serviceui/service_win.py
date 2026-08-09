@@ -2602,7 +2602,12 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             params = dict(preset.get("params") or {})
             indicator_id = str(preset.get("indicator_id") or "")
             version = preset.get("version")
-            is_active = bool(preset.get("is_active_batch"))
+            # Diff 2 (User-Bugreport 09.08.2026): Eine duplizierte Variante
+            # ist IMMER batch-aktiv (is_active_batch=True) – NICHT der Status
+            # des Quell-Presets. Sonst bliebe eine archivierte/inaktive Kopie
+            # unsichtbar: Scans/LiveAnalyzer ignorieren is_active_batch=False
+            # und das Analytics-Dropdown zeigt sie erst nach einem Run.
+            is_active = True
         else:
             # Flaches Plugin-Blatt: aktuelle Standalone-Parameter
             # (global_settings, Key 'plugin_params_<plugin_id>').

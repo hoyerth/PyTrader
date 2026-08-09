@@ -1267,6 +1267,25 @@ class HeatmapWidget(QWidget):
                 # 20.03.03 (Q4): Index 0 kann ein Header sein -> ersten
                 # auswaehlbaren Eintrag waehlen.
                 self._combo_field.setCurrentIndex(self._first_field_index())
+            # 20.04-Q8-Fix (User-Bugreport 09.08.2026, Option 'No Data'):
+            # Neue Plugin-Varianten (Clones/Presets) ohne feature_store-Daten
+            # sofort als deaktivierte Hinweis-Eintraege zeigen ('(No Data)'),
+            # damit der Anwender nach dem Duplizieren ein sichtbares Ergebnis
+            # hat, bevor der erste Scan/LiveRun Daten liefert.
+            no_data = []
+            try:
+                no_data = self._view_model.resolve_no_data_variants(
+                    str(data.get("symbol") or ""),
+                    str(data.get("timeframe") or ""))
+            except Exception:
+                no_data = []
+            if no_data:
+                self._combo_field.add_header_item(
+                    "🕓 Noch ohne Daten (erster Scan ausstehend):")
+                for nd in no_data:
+                    self._combo_field.add_disabled_item(
+                        f"{nd.get('display_name') or nd.get('plugin_id')} "
+                        f"({nd.get('preset_name')}) – (No Data)")
             self._combo_field.blockSignals(False)
             self._set_combo_data(
                 self._combo_x, str(data.get("x_dim") or "date"))

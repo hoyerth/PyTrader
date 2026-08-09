@@ -1171,6 +1171,38 @@ class FeatureStoreReader:
                   f"fehlgeschlagen: {e}")
             return []
 
+    def available_instance_hashes(
+        self, symbol: str, timeframe: str,
+    ) -> set:
+        """Liefert die instance_hash-Werte mit feature_data (20.04-Q8-Fix).
+
+        (No Data)-Unterstuetzung: Das Analytics-Feld-Dropdown zeigt neue
+        Plugin-Varianten (Clones/Presets) sofort an – markiert als
+        '(No Data)' – bis der erste Scan/LiveRun Daten in den feature_store
+        geschrieben hat. Diese Methode liefert die Menge der Hashes, die
+        bereits Zeilen BESITZEN (rein lesend, kein SQL in der UI).
+
+        Returns:
+            set[str] – leer bei fehlender DB/Tabelle oder Fehlern
+            (defensiv, Invariante FeatureStoreReader: rein lesend).
+        """
+        if not symbol or not timeframe:
+            return set()
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT DISTINCT instance_hash FROM feature_store
+                WHERE LOWER(symbol) = LOWER(?)
+                  AND LOWER(timeframe) = LOWER(?)
+                  AND instance_hash IS NOT NULL
+                  AND instance_hash != ''
+            """, [symbol, timeframe]).fetchall()
+            return {str(r[0]) for r in rows if r[0] is not None}
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] available_instance_hashes "
+                  f"fehlgeschlagen: {e}")
+            return set()
+
     def get_available_features(
         self, symbol: str, timeframe: str
     ) -> Dict[str, Any]:

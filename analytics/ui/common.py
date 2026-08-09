@@ -141,6 +141,23 @@ class CheckableComboBox(QComboBox):
         item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
         self._model.appendRow(item)
 
+    def add_disabled_item(self, display_text: str) -> None:
+        """Fuegt einen deaktivierten, grauen Hinweis-Eintrag hinzu (Q8-Fix).
+
+        (No Data)-Unterstuetzung: Neue Varianten ohne feature_store-Daten
+        werden als nicht-waehlbare, graue Eintraege im 'Feld'-Dropdown
+        angezeigt ('{Service} ({Preset}) – (No Data)'), bis der erste
+        Scan/LiveRun sie berechnet hat. Anders als `add_header_item` ist
+        der Eintrag NICHT fett und traegt userData=None (kein
+        selection_changed-Beitrag, nicht in checked_data()).
+        """
+        item = QStandardItem(str(display_text))
+        item.setData(None, Qt.UserRole)
+        item.setFlags(Qt.NoItemFlags)
+        item.setEnabled(False)
+        item.setForeground(QBrush(QColor(160, 160, 160)))  # hellgrau
+        self._model.appendRow(item)
+
     def add_header_item(self, display_text: str) -> None:
         """Fuegt eine deaktivierte, nicht-auswaehlbare Trenn-/Kopfzeile hinzu
         (20.03.03, Q4).

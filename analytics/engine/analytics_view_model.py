@@ -1112,6 +1112,66 @@ class AnalyticsViewModel(QObject):
             pass
         return result
 
+    def resolve_no_data_variants(self, symbol: str,
+                                timeframe: str) -> List[Dict[str, Any]]:
+        """Plugin-Varianten (Clones/Presets) OHNE feature_store-Daten (Q8-Fix).
+
+        (No Data)-Unterstuetzung (User-Bugreport 09.08.2026): Neue Varianten
+        eines Services erscheinen im Analytics-Feld-Dropdown erst, nachdem
+        sie mindestens EINMAL berechnet wurden (`feature_keys_by_service`
+        filtert `WHERE feature_data IS NOT NULL`). Diese Methode liefert die
+        Varianten, die es im ServiceSelectorModel (plugin_presets) bereits
+        gibt, deren `instance_hash` aber noch KEINE Zeilen besitzt – die UI
+        zeigt sie als '(No Data)'-Hinweis an, bis der erste Scan lief.
+
+        Nur aktive Presets (is_archived=False / is_active_batch=True) werden
+        geliefert – archivierte Varianten sind bewusst unsichtbar (Q6/Q7).
+
+        Returns:
+            Liste von {"plugin_id", "preset_name", "instance_hash",
+            "display_name"} – leer bei fehlendem Model/Reader oder wenn alle
+            Varianten Daten besitzen (defensiv, rein lesend).
+        """
+        if not symbol or not timeframe:
+            return []
+        model = self._selector_model
+        if model is None:
+            from analytics.engine.service_selector_model import ServiceSelectorModel
+            model = ServiceSelectorModel(parent=self)
+            self._selector_model = model
+        try:
+            presets = model.plugin_presets() or {}
+        except Exception:
+            return []
+        if not presets:
+            return []
+        try:
+            available = self._repo.reader.available_instance_hashes(
+                symbol, timeframe)
+        except Exception:
+            available = set()
+        out: List[Dict[str, Any]] = []
+        for pid, clones in presets.items():
+            if not clones or not isinstance(clones, list):
+                continue
+            for clone in clones:
+                if not isinstance(clone, dict):
+                    continue
+                if clone.get("is_archived"):
+                    continue
+                h = str(clone.get("instance_hash") or "").strip()
+                if not h or h in available:
+                    continue
+                pname = str(clone.get("preset_name") or "Default")
+                out.append({
+                    "plugin_id": str(pid),
+                    "preset_name": pname,
+                    "instance_hash": h,
+                    "display_name": self.resolve_service_display_name(
+                        str(pid), pname),
+                })
+        return out
+
     @property
     def max_lookback_limit(self) -> int:
         """Max-Lookback-Cap (UI-Slider-Maximum)."""
