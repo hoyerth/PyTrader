@@ -122,13 +122,18 @@ MAX_BADGE_CELL_CHARS = 24
 # die Konstante bleibt nur als Test-Referenz erhalten (Historik).
 BADGE_TRUNCATE_ICON = "i"
 
-# Bugfix 05.08.2026: Echter Info-Button (QPushButton "ℹ", Icon-Breite) in
-# Spalte 1 statt Badge-Text/'i'-Zeichen. Die Status-Spalte wird auf die
-# Button-Breite verkleinert (Spalte 0 ist Stretch und bekommt den freien
-# Platz). Der Button erscheint auf ALLEN Service-/Plugin-/Set-Zeilen; gehoert
-# die Zeile einem Indikator, ist er gelb (#FFD700) und traegt den Tooltip
-# 'aktiv/im <Indikator>' (Namenslogik unveraendert aus _apply_badge).
-INFO_BUTTON_TEXT = "ℹ"
+# Bugfix 20.03.01 (09.08.2026): Das Unicode-Zeichen "ℹ" (U+2139) rendert
+# unter Windows in Qt bei fehlendem Font als Tofu-Box – der Info-Button
+# war nicht mehr erkennbar (User-Meldung 'i-Button im Tree geht nicht
+# mehr'; vgl. Bugfix 04.08.2026, Punkt 5: Unicode-Badge '🛈' ebenfalls
+# durch ASCII 'i' ersetzt). Daher wieder ASCII 'i' als Button-Beschriftung.
+# Der QPushButton (Spalte 1) ersetzt seit 05.08.2026 das Badge-Text-'i';
+# die Status-Spalte wird auf die Button-Breite verkleinert (Spalte 0 ist
+# Stretch und bekommt den freien Platz). Der Button erscheint auf ALLEN
+# Service-/Plugin-/Set-Zeilen; gehoert die Zeile einem Indikator, ist er
+# gelb (#FFD700) und traegt den Tooltip 'aktiv/im <Indikator>'
+# (Namenslogik unveraendert aus _apply_badge).
+INFO_BUTTON_TEXT = "i"
 INFO_BUTTON_SIZE = 20          # ~Icon-Breite
 INFO_BUTTON_WIDTH = 24         # Spaltenbreite (Status-Spalte)
 INFO_BUTTON_COLOR_INDICATOR = "#FFD700"   # gelb bei Indikator-Zugehoerigkeit
