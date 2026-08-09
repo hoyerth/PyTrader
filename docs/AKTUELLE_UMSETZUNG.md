@@ -358,6 +358,185 @@ Regressions-Absicherung in `test/test.py` (Filter-Check).
   (danach gelöscht, test/-Cleanup) – ALLE PASS. Kein Regressionstest, keine
   UI-Ausführung (Phase-19-Invariante 2).
 
+---
 
+# 20.03.03 Dropdown-Eindeutigkeit & Sammel-Auswahl (finale Spezifikation 20.03.02, 09.08.2026, ~21:15)
 
+## 1. Regeln & Invarianten
+* **Code-Style:** Exakt 4 Leerzeichen, 1 Leerzeile zwischen Methoden (PEP8,
+  Phase-19-Invariante 3). Additive Aenderungen (Invariante 11).
+* **Testing:** STRIKT HEADLESS via `py_compile` & `test/test.py`
+  (`QApplication.exec()` VERBOTEN – Invariante 2); neue Test-Skripte/DBs nach
+  `test/` (Invariante 10).
 
+## 2. Problemstellung (User-Meldung 09.08.2026)
+Im Feld-Dropdown der generischen Heatmap sind Namens-Kollisionen nicht sauber
+aufgeloest: Liefern zwei aktive Services denselben Ergebnis-Key (z. B. `is_hit`),
+gibt es bisher NUR EINEN Eintrag mit dem rohen Key (`_field_label` unterdrueckt
+den Service-Prefix bei `len(sids) > 1` bewusst – „Pfad-Kette"-Meldung vom
+09.08.). Der Anwender kann nicht zuordnen, welcher Service den Wert liefert.
+Spezial-Parameter (`steps_around` vs. `volume_ratio`) sind unkritisch, aber ohne
+durchgehendes Schema.
+
+**Ziel (2-stufige Strukturierung):** Jeder Eintrag strikt `{Service-Name} /
+{Parameter}` (100 % Eindeutigkeit) + deaktivierte Sektions-Header + Sammel-
+Eintrag fuer gemeinsame Keys.
+
+## 3. Entscheidungen (Q1-Q5, Anwender 09.08.2026)
+
+| ID | Entscheidung (verbindlich) |
+|---|---|
+| Q1 | **Einzel-Eintraege bei Kollisionen:** pro Service EIN Eintrag `{Name} / {key}` (z. B. `Proximity / is_hit`, `Grid Lines / is_hit`). Der rohe Key entfaellt vollstaendig aus dem Dropdown. |
+| Q2 | **Sammel-Eintrag `Alle Services / <key>`:** reiner UI-Komfort, userData `ALL|<key>`. Beim Anhaken sind alle Services aktiv, die den Key liefern (-> `feature_ids`). **KEIN `ALL|`-Format bis in die DB/Repository** – keine Aggregationslogik-Aenderung. |
+| Q3 | **F1c/F2 strikt beibehalten:** GENAU EIN Hauptfeld (`field=_field_key(currentData())`); angehakte Checkboxen steuern NUR `feature_ids`. Kein Multi-Feld-Umbau im Repository. |
+| Q4 | **Sektions-Header** (`🌐 Gleiche Parameter (alle aktiven Services):`, `🔌 Einzelservices:`) als deaktivierte, nicht-auswaehlbare Trennzeilen (`Qt.NoItemFlags`, grau + fett, userData `None`). |
+| Q5 | **Initial-Zustand:** Sammel-Eintraege (shared Keys) + Einzel-Eintraege (unique Keys) angehakt; Einzel-Eintraege von shared Keys NICHT (keine Doppel-Haken). **XOR-Regel:** Sammel und Einzel desselben Keys schliessen sich gegenseitig aus. |
+
+## 4. Datenfluss & Mapping (kein DB-Umbau)
+```text
+userData je Item:
+  Sammel-Eintrag : 'ALL|<key>'                 (Label: 'Alle Services / <key>')
+  Einzel-Eintrag : '{service_id}|<key>'        (Label: '{Name} / <key>')
+  Sektions-Header: None                         (Qt.NoItemFlags, nicht checkbar)
+
+checked_data() -> _checked_field_service_ids():
+  - 'ALL|<key>'          -> expandieren ueber self._field_sources[key]
+                            (alle Quellen-Services des Keys)
+  - '{service_id}|<key>' -> service_id direkt
+  (dedupliziert, sortiert) -> view_model.set_feature_ids(ids)
+
+Hauptfeld (F2): field = _field_key(currentData())  ('ALL|is_hit' -> 'is_hit')
+Aggregation:   unveraendert (GENAU EIN Key; feature_ids-Filter in DuckDB)
+```
+Die `CheckableComboBox.checked_data()` ueberspringt Header automatisch
+(nicht-checkbare Items liefern Qt.Unchecked).
+
+## 5. Schritt-fuer-Schritt Umsetzung
+
+### Schritt 1: `analytics/ui/common.py` – `add_header_item()` (additiv)
+```python
+def add_header_item(self, display_text: str) -> None:
+    """Fuegt eine deaktivierte, nicht-auswaehlbare Trenn-/Kopfzeile hinzu
+    (20.03.03, Q4). userData = None (Header tauchen nie in checked_data() auf)."""
+    item = QStandardItem(str(display_text))
+    item.setData(None, Qt.UserRole)
+    item.setFlags(Qt.NoItemFlags)          # nicht aktiv, nicht checkbar
+    item.setEnabled(False)
+    brush = QBrush(QColor(128, 128, 128))  # grau
+    item.setForeground(brush)
+    f = item.font(); f.setBold(True); item.setFont(f)
+    self._model.appendRow(item)
+```
+(Import `QBrush`/`QColor` aus `PySide6.QtGui` ergaenzen.)
+
+### Schritt 2: `analytics/ui/heatmap_widget.py` – Befuellung (`_sync_combos_from_payload`)
+* `self._field_sources = data.get("field_sources") or {}` merken (Attribut fuer
+  die ALL-Expansion; im `__init__` mit `{}` vorinitialisieren).
+* `keys` in `shared` (2+ Quellen) und `unique` (genau 1 Quelle) gruppieren.
+* Wenn `shared`: Header `🌐 Gleiche Parameter (alle aktiven Services):`, dann je
+  shared Key: `add_checkable_item(f"Alle Services / {k}", f"ALL|{k}", checked=True)`.
+* Header `🔌 Einzelservices:`, dann je Key (sortiert):
+  * unique: je Service `add_checkable_item(f"{Name} / {k}", f"{sid}|{k}", checked=True)`
+  * shared: je Service `add_checkable_item(f"{Name} / {k}", f"{sid}|{k}", checked=False)`
+    (Sammel-Eintrag ist initial aktiv, Q5)
+  * Legacy ohne `field_sources` (leere sids): roher Key `add_checkable_item(k, k, checked=True)`
+* Current-Index: `_find_field_index(prev_field)` (findet bei shared Keys den
+  Sammel-Eintrag zuerst); Fallback `_first_field_index()` (UEBERspringt Header,
+  statt blind Index 0).
+
+### Schritt 3: `heatmap_widget.py` – Filter-Mapping (`_checked_field_service_ids`)
+```python
+def _checked_field_service_ids(self) -> List[str]:
+    ids: List[str] = []
+    for ud in self._combo_field.checked_data():
+        s = str(ud or "")
+        if s.startswith("ALL|"):
+            key = s.split("|", 1)[1]
+            for sid in (self._field_sources.get(key) or []):
+                if sid and sid not in ids:
+                    ids.append(sid)
+        elif "|" in s:
+            sid = s.split("|", 1)[0]
+            if sid and sid not in ids:
+                ids.append(sid)
+    return ids
+```
+
+### Schritt 4: `heatmap_widget.py` – XOR-Reconciliation (Q5)
+* `_on_field_selection_changed`: vor `set_feature_ids` die neue Methode
+  `_reconcile_sammel_checks()` aufrufen.
+* `_reconcile_sammel_checks()`: sammelt angehakte `ALL|`-Keys und Einzel-Keys;
+  Einzel-Eintraege eines angehakten Sammel-Keys abwaehlen, Sammel-Eintrag eines
+  Keys mit angehakten Einzel-Eintraegen abwaehlen (`set_checked_data`, blockiert,
+  kein Re-Emit).
+* Danach Current-Index nachziehen: steht der Index auf einem abgewaehlten/Header-
+  Item, auf das erste angehakte Item desselben Keys wechseln (blockSignals),
+  sonst erstes angehaktes/erstes auswaehlbares Item.
+
+### Schritt 5: `heatmap_widget.py` – E6-Loop-Fix (bestehender 20.03.02-Delta)
+Zeile ~1152: `params.get("heatmap_field") != currentData()` ist seit dem
+userData-Format `{service_id}|{key}` fehlerhaft (params haelt den reinen Key).
+Vergleich auf `_field_key(self._combo_field.currentData())` umstellen (nur
+Kosmetik: `set_heatmap_config` ist idempotent, aber der falsche Vergleich
+loeste jedes Sync einen `_apply_config()`-Aufruf aus).
+
+## 6. Verification Checklist (`test/test.py`, headless)
+
+- [x] **Syntax-Check:** `py_compile` auf `common.py`, `heatmap_widget.py` (und
+      `test/test.py`) – OK.
+- [x] **Header-Check (Q4):** `add_header_item` fuegt ein Item mit `Qt.NoItemFlags`
+      und `userData=None` hinzu; `checked_data()` ignoriert Header
+      (20.03.03-Checks `a`/`b`).
+- [x] **Label-Check (Q1):** shared Key erscheint als `Proximity / is_hit` UND
+      `Grid Lines / is_hit` (pro Service); roher Key ist NICHT im Dropdown
+      (20.03.03-Checks `c`/`d`; 28 isolierte Checks vor dem Einbau).
+- [x] **Sammel-Expansion (Q2):** `_checked_field_service_ids()` mit angehakten
+      `ALL|is_hit` -> alle Quellen-Services des Keys; Einzel-Eintrag ->
+      genau seine service_id (20.03.03-Check `f`).
+- [x] **XOR (Q5):** Klick auf Einzel-Eintrag enthaakt den Sammel-Eintrag und
+      umgekehrt (Klick-Tracking `last_click_index`); kein Doppel-Haken-Zustand
+      (20.03.03-Checks `g`/`h`).
+- [x] **Initial (Q5):** Sammel (shared) + Einzel (unique) angehakt; Einzel von
+      shared Keys NICHT (20.03.03-Check `e`).
+- [x] **E6-Loop:** Vergleich laeuft ueber `_field_key(currentData())` – kein
+      ueberfluessiger `config`-Call bei identischem Key (20.03.03-Check `i`).
+- [x] **Regression:** `test/check_dialog_host.py` bleibt PASS (16 Checks,
+      unveraenderte Pfade); 20.03.02-Checks `a`-`o` + `checked_data`/
+      `set_checked_data`-API isoliert gruen (28 Checks).
+
+## 7. Hinweise
+* Entscheidungen Q1-Q5 vom Anwender am 09.08.2026 bestaetigt (siehe Antwort-
+  Nachricht). Implementierungs-Log siehe §8.
+* Keine UI-Tests, kein Regressionstest (Invariante 2).
+
+## 8. Implementierungs-Log (09.08.2026, ~21:40; Commit `…`, Tag `20.03.03`)
+* **`analytics/ui/common.py`**:
+  * `add_header_item()` (Q4): deaktivierte, graue, fette Trenn-/Kopfzeile
+    (`Qt.NoItemFlags`, `userData=None`) – erscheint weder auswaehlbar noch in
+    `checked_data()`.
+  * Klick-Tracking (Q5): `_last_click_index` im EventFilter (Popup-Viewport)
+    + Getter `last_click_index()` – Grundlage der XOR-Aufloesung (Sammel vs.
+    Einzel); `-1` = programmatischer Wechsel (keine Aufloesung).
+* **`analytics/ui/heatmap_widget.py`**:
+  * `self._field_sources` (Key -> Quellen-Services) aus dem Payload gemerkt.
+  * `_sync_combos_from_payload` (Q1/Q4/Q5): 2-stufige Struktur – Sektions-
+    Header `🌐 Gleiche Parameter (alle aktiven Services):` + Sammel-Eintraege
+    `Alle Services / {key}` (`ALL|key`, initial angehakt), dann
+    `🔌 Einzelservices:` mit EINDEUTIGEN Eintraegen `{Name} / {key}` je Quelle
+    (unique angehakt, shared-Einzel nicht). Roher Key entfaellt bei bekannten
+    Quellen; Legacy ohne `field_sources` bleibt defensiv als roher Key.
+  * `_checked_field_service_ids` (Q2): `ALL|key`-Expansion ueber
+    `field_sources` (dedupliziert); Einzel-Eintrag -> genau seine `service_id`.
+  * `_reconcile_sammel_checks` (Q5): XOR auf Klick-Tracking-Basis – Klick auf
+    Einzel enthaakt den Sammel-Eintrag desselben Keys, Klick auf Sammel
+    enthaakt die Einzel-Eintraege.
+  * `_sync_field_current_after_checks`: Current-Index auf angehaktes/
+    auswaehlbares Item nachziehen (Header werden uebersprungen).
+  * `_first_field_index` (Q4): erster auswaehlbarer Index statt blind 0.
+  * E6-Loop-Fix: Vergleich `params["heatmap_field"]` gegen
+    `_field_key(currentData())` statt `currentData()` (behebt ueberfluessige
+    `_apply_config()`-Aufrufe seit dem `{service_id}|{key}`-userData).
+* **Validierung:** 28 isolierte Checks in `test/` (Q1-Q5, E6, Randfaelle,
+  20.03.02-API-Regression) + `test/check_dialog_host.py` (16 Checks) – ALLE
+  PASS; neuer 20.03.03-Testblock (9 Checks `a`-`i`) in `test/test.py`;
+  Temp-Skripte geloescht (test/-Cleanup). Kein UI-Test, kein Regressionstest.

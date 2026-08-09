@@ -480,6 +480,9 @@ class HeatmapWidget(QWidget):
         self._candle_items: List[Any] = []
         self._colormap_mode = _VIRIDIS
         self._syncing = False
+        # 20.03.03 (Q2): Key -> aktive Quellen-Services aus dem Payload
+        # (`field_sources`) fuer die ALL-Expansion der Sammel-Eintraege.
+        self._field_sources: Dict[str, List[str]] = {}
 
         # --- Steuerung (Zeile 1: Dimensionen/Aggregation/Feld) ---
         self._combo_x = QComboBox()
@@ -779,12 +782,27 @@ class HeatmapWidget(QWidget):
 
         20.03.02: Das userData traegt '{service_id}|{key}' – findData(key)
         wuerde den reinen Key nicht finden. Gibt -1 zurueck, wenn keiner
-        passt (Restore-Fallback erzeugt dann ein neues Item).
+        passt (Restore-Fallback erzeugt dann ein neues Item). 20.03.03: Bei
+        gemeinsamen Keys (2+ Quellen) findet die Methode zuerst den
+        Sammel-Eintrag ('ALL|key' -> Key-Teil == key).
         """
         for i in range(self._combo_field.count()):
             if self._field_key(self._combo_field.itemData(i)) == key:
                 return i
         return -1
+
+    def _first_field_index(self) -> int:
+        """Erster auswaehlbarer (nicht-Header) Item-Index im Feld-Dropdown
+        (20.03.03, Q4).
+
+        Sektions-Header haben `Qt.NoItemFlags` und duerfen nicht als
+        Current-Item gewaehlt werden – Index 0 kann ein Header sein.
+        """
+        for i in range(self._combo_field.count()):
+            item = self._combo_field.model().item(i)
+            if item is not None and (item.flags() & Qt.ItemIsEnabled):
+                return i
+        return 0
 
     # ------------------------------------------------------------------
     # 20.03.02 (F1c/F2): Multi-Select im 'Feld'-Dropdown -> Datenquellen-
@@ -798,25 +816,106 @@ class HeatmapWidget(QWidget):
         `set_feature_ids` stoesst den Debounce-Refresh der generischen
         Heatmap (und der uebrigen Analytics-Seiten) an. Leere Auswahl =
         leerer Filter (alle Features, ViewModel-Semantik 15.03-E).
+
+        20.03.03 (Q5): Vor der Filterableitung wird die XOR-Regel angewendet –
+        Sammel- ('ALL|key') und Einzel-Eintraege ('srv_x|key') desselben Keys
+        schliessen sich gegenseitig aus (keine Doppel-Haken).
         """
         if self._syncing or self._view_model is None:
             return
+        self._reconcile_sammel_checks()
         ids = self._checked_field_service_ids()
         self._view_model.set_feature_ids(ids)
 
-    def _checked_field_service_ids(self) -> List[str]:
-        """Service-IDs der angehakten Feld-Items (userData '{id}|{key}').
+    def _reconcile_sammel_checks(self) -> None:
+        """XOR-Reconciliation (20.03.03, Q5): Sammel- und Einzel-Eintraege
+        desselben Keys schliessen sich gegenseitig aus.
 
-        Items ohne '|' (Mehrfach-Service-Keys, roher Key) tragen keinen
-        eindeutigen Service und bleiben aussen vor (die Quellen der
-        Einzel-Keys decken den Filter ab).
+        Grundlage ist der ZULETZT geklickte Eintrag (`last_click_index`):
+        - Klick auf `ALL|key` (Sammel)  -> Einzel-Eintraege von `key` abwaehlen.
+        - Klick auf `srv_x|key` (Einzel) -> Sammel-Eintrag `ALL|key` abwaehlen.
+        Programmatische Wechsel (kein Klick, Index -1) loesen nichts auf.
+        Danach wird der Current-Index auf ein angehaktes/auswaehlbares Item
+        nachgezogen.
+        """
+        last_idx = self._combo_field.last_click_index()
+        if last_idx < 0:
+            self._sync_field_current_after_checks()
+            return
+        item = self._combo_field.model().item(last_idx)
+        if item is None or not (item.flags() & Qt.ItemIsEnabled):
+            return
+        ud = str(item.data(Qt.UserRole) or "")
+        checked = [str(u or "") for u in self._combo_field.checked_data()]
+        if ud.startswith("ALL|"):
+            # Sammel gewinnt: alle Einzel-Eintraege desselben Keys abwaehlen.
+            key = ud.split("|", 1)[1]
+            wanted = [u for u in checked
+                      if not (u.endswith(f"|{key}") and not u.startswith("ALL|"))]
+            if wanted != checked:
+                self._combo_field.set_checked_data(wanted)
+        elif "|" in ud:
+            # Einzel gewinnt: Sammel-Eintrag desselben Keys abwaehlen.
+            all_ud = f"ALL|{self._field_key(ud)}"
+            if all_ud in checked:
+                self._combo_field.set_checked_data(
+                    [u for u in checked if u != all_ud])
+        self._sync_field_current_after_checks()
+
+    def _sync_field_current_after_checks(self) -> None:
+        """Stellt sicher, dass der aktuelle Feld-Index auf einem anhakbaren
+        Item mit aktivem CheckState steht (20.03.03, Q5).
+
+        Nach der XOR-Reconciliation kann der Index auf einem abgewaehlten
+        oder deaktivierten (Header-)Item stehen – dann wird er (blockiert)
+        auf das erste angehakte, sonst erste auswaehlbare Item nachgezogen.
+        """
+        idx = self._combo_field.currentIndex()
+        item = self._combo_field.model().item(idx)
+        if (item is not None and (item.flags() & Qt.ItemIsEnabled)
+                and item.checkState() == Qt.Checked):
+            return
+        new_idx = -1
+        for i in range(self._combo_field.count()):
+            it = self._combo_field.model().item(i)
+            if it is None or not (it.flags() & Qt.ItemIsEnabled):
+                continue
+            if it.checkState() == Qt.Checked:
+                new_idx = i
+                break
+        if new_idx < 0:
+            for i in range(self._combo_field.count()):
+                it = self._combo_field.model().item(i)
+                if it is not None and (it.flags() & Qt.ItemIsEnabled):
+                    new_idx = i
+                    break
+        if 0 <= new_idx != idx:
+            self._combo_field.blockSignals(True)
+            self._combo_field.setCurrentIndex(new_idx)
+            self._combo_field.blockSignals(False)
+
+    def _checked_field_service_ids(self) -> List[str]:
+        """Service-IDs der angehakten Feld-Items (20.03.03, Q2).
+
+        - `ALL|<key>` (Sammel-Eintrag) wird ueber `self._field_sources[key]`
+          auf ALLE Quellen-Services des Keys expandiert (Confluence).
+        - `{service_id}|<key>` liefert genau seine service_id.
+        Items ohne `|` (roher Legacy-Key) tragen keinen eindeutigen Service
+        und bleiben aussen vor (die Quellen der Einzel-Keys decken den
+        Filter ab). Dedupliziert, in Item-Reihenfolge.
         """
         ids: List[str] = []
         for ud in self._combo_field.checked_data():
             s = str(ud or "")
-            sid = s.split("|", 1)[0] if "|" in s else ""
-            if sid and sid not in ids:
-                ids.append(sid)
+            if s.startswith("ALL|"):
+                key = s.split("|", 1)[1]
+                for sid in (self._field_sources.get(key) or []):
+                    if sid and sid not in ids:
+                        ids.append(sid)
+            elif "|" in s:
+                sid = s.split("|", 1)[0]
+                if sid and sid not in ids:
+                    ids.append(sid)
         return ids
 
     # ------------------------------------------------------------------
@@ -1115,6 +1214,11 @@ class HeatmapWidget(QWidget):
         # 20.02.01 (User-Meldung 3b): Key -> Services, die ihn liefern
         # (Repository `field_sources`); Anzeige '{Service} / {Key}'.
         field_sources = data.get("field_sources") or {}
+        # 20.03.03 (Q2): Quellen je Key fuer die ALL-Expansion merken.
+        self._field_sources = {
+            str(k): [str(s) for s in (v or [])]
+            for k, v in field_sources.items()
+        }
         agg = str(data.get("agg") or "")
         # 20.03.02: userData = '{service_id}|{key}' – fuer den Vergleich mit
         # den Payload-Keys nur den Key-Teil verwenden.
@@ -1123,21 +1227,46 @@ class HeatmapWidget(QWidget):
         try:
             self._combo_field.blockSignals(True)
             self._combo_field.clear()
-            for k in keys:
-                sids = [str(s) for s in (field_sources.get(k) or [])]
-                label = self._field_label(k, sids)
-                # 20.03.02 (F1c): userData = '{service_id}|{param_key}' bei
-                # eindeutigem Service (angehakte Items -> feature_ids-Filter);
-                # bei Mehrfach-Service-Keys bleibt der rohe Key (kein
-                # eindeutiger Filter-Bezug). Alle Items initial angehakt
-                # (aktiver Filter = alle verfuegbaren Quellen).
-                ud = f"{sids[0]}|{k}" if len(sids) == 1 else k
-                self._combo_field.add_checkable_item(label, ud, checked=True)
+            # 20.03.03 (Q1/Q4/Q5): 2-stufige Struktur – gemeinsame Keys
+            # (2+ Quellen) als Sammel-Eintrag 'Alle Services / {Key}' an der
+            # Spitze (initial angehakt), dann je Quelle ein EINDEUTIGER
+            # Eintrag '{Service-Name} / {Key}'. Sektions-Header sind
+            # deaktivierte Trennzeilen. Der rohe Key entfaellt bei bekannten
+            # Quellen (100 % Eindeutigkeit).
+            shared = sorted(k for k in keys
+                            if len(self._field_sources.get(k) or []) >= 2)
+            if shared:
+                self._combo_field.add_header_item(
+                    "🌐 Gleiche Parameter (alle aktiven Services):")
+                for k in shared:
+                    self._combo_field.add_checkable_item(
+                        f"Alle Services / {k}", f"ALL|{k}", checked=True)
+            if keys:
+                self._combo_field.add_header_item("🔌 Einzelservices:")
+            for k in sorted(keys):
+                sids = self._field_sources.get(k) or []
+                if len(sids) == 1:
+                    # Eindeutiger Service: Einzel-Eintrag initial angehakt.
+                    self._combo_field.add_checkable_item(
+                        self._field_label(k, sids), f"{sids[0]}|{k}",
+                        checked=True)
+                elif not sids:
+                    # Legacy ohne field_sources (roher Key, defensiv).
+                    self._combo_field.add_checkable_item(k, k, checked=True)
+                else:
+                    # Shared Key: je Quelle ein Einzel-Eintrag, initial NICHT
+                    # angehakt (der Sammel-Eintrag deckt die Quellen ab, Q5).
+                    for sid in sids:
+                        self._combo_field.add_checkable_item(
+                            self._field_label(k, [sid]), f"{sid}|{k}",
+                            checked=False)
             if prev_field in keys:
                 self._combo_field.setCurrentIndex(
                     self._find_field_index(prev_field))
             elif keys:
-                self._combo_field.setCurrentIndex(0)
+                # 20.03.03 (Q4): Index 0 kann ein Header sein -> ersten
+                # auswaehlbaren Eintrag waehlen.
+                self._combo_field.setCurrentIndex(self._first_field_index())
             self._combo_field.blockSignals(False)
             self._set_combo_data(
                 self._combo_x, str(data.get("x_dim") or "date"))
@@ -1148,10 +1277,12 @@ class HeatmapWidget(QWidget):
             self._syncing = False
         self._update_controls()
         # E6: Wert-Aggregation mit noch leerem Feld -> ersten Key uebernehmen
-        # und Konfiguration nachreichen (einmaliger Query-Loop).
+        # und Konfiguration nachreichen (einmaliger Query-Loop). 20.03.03:
+        # Vergleich ueber den KEY-Teil (params haelt den reinen Key, das
+        # userData traegt '{service_id}|{key}' bzw. 'ALL|{key}').
         if (agg in _VALUE_AGGS and self._combo_field.currentData()
                 and self._view_model.params.get("heatmap_field")
-                != self._combo_field.currentData()):
+                != self._field_key(self._combo_field.currentData())):
             self._apply_config()
 
     def _render_overlay(self, data: Dict[str, Any]) -> None:

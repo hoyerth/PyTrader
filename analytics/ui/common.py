@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, List
 
 from PySide6.QtCore import QEvent, Qt, Signal
-from PySide6.QtGui import QStandardItem, QStandardItemModel
+from PySide6.QtGui import QBrush, QColor, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QComboBox,
     QLabel,
@@ -83,6 +83,10 @@ class CheckableComboBox(QComboBox):
     def __init__(self, parent: QWidget = None) -> None:
         super().__init__(parent)
         self._popup_click = False
+        # 20.03.03 (Q5): Zuletzt vom Nutzer geklicktes Item (Row-Index) –
+        # Grundlage der XOR-Reconciliation im HeatmapWidget (Sammel- vs.
+        # Einzel-Eintrag desselben Keys). -1 = kein Klick (programmatisch).
+        self._last_click_index = -1
         self.setEditable(True)
         self.lineEdit().setReadOnly(True)
         self.setPlaceholderText("Felder wählen…")
@@ -108,11 +112,21 @@ class CheckableComboBox(QComboBox):
         super().hidePopup()
 
     def eventFilter(self, obj, event) -> bool:
-        """Setzt das Popup-Flag bei Mausklicks auf den Popup-Viewport."""
+        """Setzt das Popup-Flag bei Mausklicks auf den Popup-Viewport und
+        merkt sich den zuletzt geklickten Item-Index (20.03.03, Q5)."""
         if (obj is self.view().viewport()
                 and event.type() == QEvent.MouseButtonRelease):
             self._popup_click = True
+            self._last_click_index = self.view().indexAt(event.pos()).row()
         return super().eventFilter(obj, event)
+
+    def last_click_index(self) -> int:
+        """Row-Index des zuletzt geklickten Items (Q5, XOR-Aufloesung).
+
+        -1, wenn der letzte CheckState-Wechsel programmatisch erfolgte
+        (kein Klick) – dann findet keine XOR-Aufloesung statt.
+        """
+        return self._last_click_index
 
     # ------------------------------------------------------------------
     # Befuellung / Auslesen
@@ -125,6 +139,23 @@ class CheckableComboBox(QComboBox):
         item.setData(user_data, Qt.UserRole)
         item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
         item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        self._model.appendRow(item)
+
+    def add_header_item(self, display_text: str) -> None:
+        """Fuegt eine deaktivierte, nicht-auswaehlbare Trenn-/Kopfzeile hinzu
+        (20.03.03, Q4).
+
+        Header tragen `Qt.NoItemFlags` + `userData=None` und erscheinen daher
+        weder als auswaehlbares Item noch in `checked_data()`.
+        """
+        item = QStandardItem(str(display_text))
+        item.setData(None, Qt.UserRole)
+        item.setFlags(Qt.NoItemFlags)          # nicht aktiv, nicht checkbar
+        item.setEnabled(False)
+        item.setForeground(QBrush(QColor(128, 128, 128)))  # grau
+        f = item.font()
+        f.setBold(True)
+        item.setFont(f)
         self._model.appendRow(item)
 
     def checked_data(self) -> List[str]:
