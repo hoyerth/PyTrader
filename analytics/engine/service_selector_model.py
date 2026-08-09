@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from PySide6.QtCore import QObject, Signal
 
 from config.event_bus import event_bus
+from analytics.engine.service_models import generate_instance_hash
 
 
 def list_indicators() -> List[Dict[str, Any]]:
@@ -149,6 +150,14 @@ class ServiceSelectorModel(QObject):
         # verschwinden damit NICHT beim Refresh, sondern nur bei manueller
         # Loeschung (Kontextmenue 'Ordner löschen').
         self._empty_folder_paths: Dict[str, List[str]] = {}
+        # 20.04 (Q7): Presets/Clones je Plugin (plugin_id.lower() -> Liste
+        # von {"preset_name", "params", "instance_hash", "is_archived",
+        # "doc_log"}). Quelle: indicator_presets
+        # (StateManager.list_plugin_presets). Nur
+        # Plugins MIT Presets erscheinen als Parent-Knoten mit Clone-Kindern
+        # im MasterTree (Services-Gruppe); Plugins ohne Presets bleiben
+        # flache Blaetter (Zero-Regression). Wird in refresh() geladen.
+        self._plugin_presets: Dict[str, List[Dict[str, Any]]] = {}
 
         # Initialbefuellung + Live-Sync (schwellenfrei via EventBus)
         self.refresh()
@@ -179,6 +188,9 @@ class ServiceSelectorModel(QObject):
         # Gruppe laden (tree_folders_<group>); build_tree() mischt sie in
         # die Gruppen-Kinder ein (leere Ordner bleiben ueber Refreshs).
         self._empty_folder_paths = self._load_empty_folders()
+        # 20.04 (Q7): Presets/Clones je Plugin laden (indicator_presets via
+        # StateManager) – Grundlage der Parent-Child-Clone-Ansicht.
+        self._plugin_presets = self._load_plugin_presets()
         self.data_changed.emit()
 
     def _load_empty_folders(self) -> Dict[str, List[str]]:
@@ -236,6 +248,45 @@ class ServiceSelectorModel(QObject):
             print(f"WARN [ServiceSelectorModel] Kategorie-Overrides nicht "
                   f"lesbar: {e}")
         return overrides
+
+    def _load_plugin_presets(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Laedt die Presets/Clones aller Plugins (20.04, Q7).
+
+        Quelle: indicator_presets (StateManager.list_plugin_presets,
+        plugin_id-Verknuepfung). Der instance_hash wird fuer jedes Preset
+        deterministisch aus `generate_instance_hash(plugin_id, params)`
+        berechnet (Q2/Q4: ohne lookback, Typ-Sanitizer + sort_keys). Ein
+        Preset gilt als archiviert, wenn `is_active_batch = False` (Q7:
+        Archivierung eines Presets => is_active_batch = False; die Scans
+        isolieren diese Presets). Rueckgabe: plugin_id.lower() -> Liste
+        von {"preset_name", "params", "instance_hash", "is_archived",
+        "doc_log"}.
+        Defensiv: Fake-/Alt-StateManager ohne list_plugin_presets liefern
+        leere Dicts (kein Baum-Rendering, keine Regression in Tests).
+        """
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        try:
+            for pid in sorted(self.get_plugins().keys()):
+                raw = self.state_manager.list_plugin_presets(pid)
+                if not raw:
+                    continue
+                clones: List[Dict[str, Any]] = []
+                for p in raw or []:
+                    if not isinstance(p, dict):
+                        continue
+                    params = p.get("params") or {}
+                    clones.append({
+                        "preset_name": str(p.get("preset_name") or "Default"),
+                        "params": params,
+                        "instance_hash": generate_instance_hash(pid, params),
+                        "is_archived": not bool(p.get("is_active_batch")),
+                        "doc_log": str(p.get("doc_log") or ""),
+                    })
+                if clones:
+                    result[str(pid).lower()] = clones
+        except Exception as e:
+            print(f"WARN [ServiceSelectorModel] Plugin-Presets nicht lesbar: {e}")
+        return result
 
     def _load_last_execution_dates(self) -> Dict[str, str]:
         """Liest das Datum der letzten Ausfuehrung je feature_id aus dem
@@ -571,10 +622,24 @@ class ServiceSelectorModel(QObject):
         badges: Dict[str, str] = {pid: self.badge_for(pid) for pid in plugins}
         last_executions: Dict[str, str] = {
             pid: self.last_execution_date(pid) for pid in plugins}
+        # 20.04 (Q7): Presets/Clones je Plugin durchreichen – Plugins MIT
+        # Presets werden als Parent-Knoten mit Clone-Kindern gerendert,
+        # archivierte Clones (is_archived) in den '📁 Archiv'-Ordner.
         return _tb_build_tree(self._sets, plugins,
                               self._plugin_category_overrides,
                               self._empty_folder_paths,
-                              badges, last_executions)
+                              badges, last_executions,
+                              presets=self._plugin_presets)
+
+    def plugin_presets(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Presets/Clones je Plugin (20.04, Q7) – lesend fuer Widgets/Tests.
+
+        Liefert plugin_id.lower() -> Liste von {"preset_name", "params",
+        "instance_hash", "is_archived", "doc_log"} (Quelle:
+        indicator_presets). Wird in refresh() aktualisiert; leere Dicts
+        bei Fake-/Alt-StateManagern.
+        """
+        return dict(self._plugin_presets)
 
     def find_set(self, set_id: str) -> Optional[Dict[str, Any]]:
         """Liefert die Set-Definition zur set_id (oder None)."""

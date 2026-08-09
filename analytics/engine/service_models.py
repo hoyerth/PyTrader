@@ -16,6 +16,69 @@ liest (Service→Service-Abhängigkeit).
 
 from typing import Any, Dict, List, Optional, TypedDict
 
+import hashlib
+import json
+
+
+# ------------------------------------------------------------------
+# 20.04 (Q4): Kanonische Hash-Serialisierung
+# ------------------------------------------------------------------
+def _sanitize_for_hash(value: Any) -> Any:
+    """Rekursive Umwandlung in JSON-feste native Python-Typen (20.04, Q4).
+
+    numpy-Skalare (np.int64/np.float64), None, verschachtelte Dicts/Listen
+    und datetime-Werte werden deterministisch in native Typen überführt –
+    Grundlage der stabilen `instance_hash`-Berechnung (sonst
+    `TypeError: Object of type int64 is not JSON serializable` bzw.
+    instabile Hashes bei wechselnder Speicherreihenfolge).
+    """
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    # numpy-Skalare (np.int64, np.float64, np.bool_) -> native Python-Typen.
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return _sanitize_for_hash(item())
+        except Exception:
+            pass
+    if isinstance(value, dict):
+        return {str(k): _sanitize_for_hash(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_for_hash(v) for v in value]
+    # datetime/date -> ISO-String (deterministisch).
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    return str(value)
+
+
+def generate_instance_hash(
+    plugin_id: str, params: Optional[Dict[str, Any]] = None
+) -> str:
+    """8-stelliger deterministischer SHA256-Short-Hash einer Instanz (20.04).
+
+    `SHA256("<plugin_id>|" + json.dumps(sanitized_params, sort_keys=True))[:8]`
+
+    * **Q3:** `lookback` fließt BEWUSST NICHT ein – das Kerzen-Ergebnis hängt
+      nur von Algorithmus-Logik + `params` ab; `lookback` ist ein Laufzeit-
+      Fenster (Performance) und kein Inhalts-Identitätsmerkmal.
+    * **Q4:** `_sanitize_for_hash` überführt numpy-Werte/None/verschachtelte
+      Dicts vorher in native Python-Typen; `sort_keys=True` macht die
+      Serialisierung kanonisch (unabhängig von der Speicherreihenfolge).
+    """
+    canonical = json.dumps(
+        _sanitize_for_hash(params or {}),
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(
+        f"{plugin_id}|{canonical}".encode("utf-8")
+    ).hexdigest()
+    return digest[:8]
+
 
 class ServiceInstanceConfig(TypedDict, total=False):
     """Konfiguration einer einzelnen Service-Instanz innerhalb eines Sets.
@@ -30,6 +93,14 @@ class ServiceInstanceConfig(TypedDict, total=False):
                     diese Instanz (wird im Tooltip/Info-Dialog angezeigt).
         version:    Optional (Phase 14 P14-01). Plugin-Version dieser Instanz,
                     Default "1.0.0" (Semantic Versioning major.minor.patch).
+        instance_hash: Optional (20.04). 8-stelliger Hash der Parameter-
+                    Variante (generate_instance_hash); stabile Identifikation
+                    im feature_store (Spalte instance_hash) für
+                    Multi-Varianten-Statistiken.
+        doc_log:    Optional (20.04). Freitextfeld (Negativ-Wissen) – z. B.
+                    "85% false signals in chop markets".
+        is_archived: Optional (20.04, Q6). True = Instanz ist archiviert
+                    (MasterTree: non-checkable, unter 📁 Archiv).
     """
     plugin_id: str
     lookback: int
@@ -37,6 +108,9 @@ class ServiceInstanceConfig(TypedDict, total=False):
     depends_on: Optional[List[str]]
     description: Optional[str]
     version: Optional[str]
+    instance_hash: Optional[str]
+    doc_log: Optional[str]
+    is_archived: bool
 
 
 class ServiceSetDefinition(TypedDict, total=False):
@@ -67,5 +141,7 @@ class ServiceSetDefinition(TypedDict, total=False):
     version: Optional[str]           # Kap 5: Set-Level Semantic Version (major.minor.patch)
     schema_version: Optional[str]    # Kap 5: Schema-Format-Version der Definition (z.B. "1.0")
     created_at: Optional[str]        # Kap 5: Erstellungs-Zeitstempel (ISO-8601 UTC)
+    is_archived: bool                # 20.04 (Q6): True = gesamtes Set archiviert
+                                     # (MasterTree: non-checkable, unter 📁 Archiv)
     execution_order: List[str]       # Ausführungs-Reihenfolge der instance_ids
     services: Dict[str, ServiceInstanceConfig]  # instance_id → Konfiguration

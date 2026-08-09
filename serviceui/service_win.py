@@ -46,6 +46,7 @@ from analytics.engine.description_dialog import (
     ServiceDescriptionDialog,
     ServiceDescriptionEditDialog,
 )
+from analytics.engine.service_models import generate_instance_hash
 from analytics.engine.service_set_repository import ServiceSetRepository
 from analytics.engine.set_evaluator import ServiceSetEvaluator
 from persistent_win import PersistentWindow, register_persistent_window
@@ -615,6 +616,15 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         tree.rename_folder_requested.connect(self._on_rename_folder)
         tree.create_folder_requested.connect(self._on_create_folder)
         tree.delete_folder_requested.connect(self._on_delete_folder)
+        # 20.04 (Q5/Q6/Q8): Instanz-Verwaltung im MasterTree-Kontextmenue
+        # (Service-/Clone-Zeilen) -> Handler (unten). 'Data Only Löschen'
+        # purgt die Feature-Daten (Q5), 'Vollständig Löschen' entfernt
+        # Instanz/Preset + Daten, 'Doc Log bearbeiten' editiert das
+        # Negativ-Wissen und 'Als Variante duplizieren' erzeugt Kopien (Q8).
+        tree.data_only_purge_requested.connect(self._on_data_only_purge)
+        tree.delete_complete_requested.connect(self._on_delete_complete)
+        tree.doc_log_requested.connect(self._on_doc_log_requested)
+        tree.duplicate_variant_requested.connect(self._on_duplicate_variant)
 
     @Slot(str)
     def _toolbar_add_service(self, plugin_id: str,
@@ -683,7 +693,10 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         Set-Load laeuft ueber selection_changed); hier wird nur der
         Plugin-Modus zurueckgesetzt.
         """
-        if node_type == "plugin" and plugin_id:
+        if node_type in ("plugin", "clone") and plugin_id:
+            # 20.04 (Q7): Clone-Zeilen (Preset/Variante eines Plugin-Parents)
+            # laden wie Plugin-Zeilen den Standalone-Editor (feature_id =
+            # plugin_id des Parents).
             self._load_plugin_editor(str(plugin_id))
             return
         # Jede andere Zeile beendet den Plugin-Editor-Modus; der Set-Editor
@@ -2168,6 +2181,442 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                 return
         except (RuntimeError, AttributeError) as e:
             self.log(f"Info-Dialog nicht moeglich: {e}")
+
+    # =========================================================================
+    # 20.04 (Q5/Q6/Q8): Instanz-Verwaltung im MasterTree-Kontextmenue
+    # -------------------------------------------------------------------------
+    # 'Data Only Löschen', 'Vollständig Löschen', 'Doc Log bearbeiten' und
+    # 'Als Variante duplizieren' fuer Service-Instanzen (in Sets) und
+    # Plugin-Clones (indicator_presets). Alle Aktionen laufen entkoppelt
+    # ueber die MasterTree-Signale (keine UI-Kopplung, Invariante 2).
+    # =========================================================================
+
+    def _find_preset_for_hash(self, plugin_id: str,
+                              instance_hash: str) -> Optional[Dict[str, Any]]:
+        """Findet das Preset (indicator_presets) eines Clones ueber seinen
+        deterministischen instance_hash (20.04, Q2/Q4)."""
+        if not plugin_id or not instance_hash:
+            return None
+        sm = getattr(self, "_state_manager", None)
+        if sm is None:
+            return None
+        try:
+            for p in sm.list_plugin_presets(plugin_id) or []:
+                if not isinstance(p, dict):
+                    continue
+                params = p.get("params") or {}
+                if generate_instance_hash(plugin_id, params) == instance_hash:
+                    return p
+        except Exception as e:
+            self.log(f"Preset-Suche fehlgeschlagen: {e}")
+        return None
+
+    def _next_preset_copy_name(self, sm, indicator_id: str,
+                               base: str) -> str:
+        """Naechster freier Preset-Name '<base> (Kopie)', '(Kopie 2)', ..."""
+        try:
+            existing = set(sm.list_indicator_presets(indicator_id))
+        except Exception:
+            existing = set()
+        candidate = f"{base} (Kopie)"
+        i = 2
+        while candidate in existing:
+            candidate = f"{base} (Kopie {i})"
+            i += 1
+        return candidate
+
+    @Slot(str, str, str, str)
+    def _on_data_only_purge(self, set_id: str, service_id: str,
+                            plugin_id: str, instance_hash: str) -> None:
+        """'Data Only Löschen' (20.04, Q5): purge_instance_data.
+
+        Entfernt NUR die berechneten Feature-Daten der Instanz aus dem
+        feature_store – die Instanz-Konfiguration (Set/Preset) bleibt
+        unangetastet; die Daten werden beim naechsten Scan neu berechnet.
+
+        * Service-in-Set: Hash aus der Set-Definition (cfg.instance_hash)
+          oder bei Alt-Daten aus den aktuellen Params neu berechnet.
+        * Clone/Preset: Hash direkt aus ROLE_INSTANCE_HASH.
+        """
+        if not instance_hash:
+            if set_id and service_id:
+                model = getattr(self.service_selector, "model", None)
+                cfg = model.find_service(set_id, service_id) if model else None
+                if cfg:
+                    instance_hash = generate_instance_hash(
+                        cfg.get("plugin_id") or service_id,
+                        cfg.get("params") or {})
+            if not instance_hash:
+                self.log("Kein instance_hash fuer 'Data Only Löschen' "
+                         "verfuegbar.")
+                return
+        label = service_id or f"{plugin_id} (#{instance_hash})"
+        reply = QMessageBox.question(
+            self, "Data Only Löschen",
+            f"Berechnete Feature-Daten der Instanz '{label}' "
+            f"(#{instance_hash}) dauerhaft löschen?\n\n"
+            "Die Instanz-Konfiguration bleibt erhalten – die Daten werden "
+            "beim nächsten Scan neu berechnet.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            from analytics.features.feature_builder import FeatureBuilder
+            n = FeatureBuilder().purge_instance_data(instance_hash)
+        except Exception as e:
+            self.log(f"FEHLER beim Purgen der Feature-Daten: {e}")
+            return
+        self.log(f"Feature-Daten gelöscht: {n} Zeilen "
+                 f"(Instanz #{instance_hash}).")
+        event_bus.service_set_changed.emit()
+
+    @Slot(str, str, str, str)
+    def _on_delete_complete(self, set_id: str, service_id: str,
+                            plugin_id: str, instance_hash: str) -> None:
+        """'Vollständig Löschen' (20.04): Instanz/Preset + Daten entfernen.
+
+        Zwei Sicherheitsabfragen (P14-05-Muster). Betrifft:
+        * Service-in-Set: Instanz aus service_sets entfernen + Feature-Daten
+          der Variante purgen (Hash aus cfg bzw. Params).
+        * Clone/Preset: indicator_presets-Eintrag löschen + Feature-Daten
+          purgen (Archiv-Einheit: einzelner Clone – auch archivierte Clones
+          sind hierueber endgueltig entfernt).
+        """
+        if set_id and service_id:
+            self._delete_complete_set_instance(set_id, service_id, plugin_id)
+        elif plugin_id:
+            self._delete_complete_preset(plugin_id, instance_hash)
+        else:
+            self.log("Vollständig Löschen: keine Ziel-Instanz.")
+
+    def _delete_complete_set_instance(self, set_id: str, service_id: str,
+                                      plugin_id: str) -> None:
+        """Voll-Loeschung einer Service-Instanz in einem Set."""
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            self.log(f"FEHLER beim Laden des Sets ({set_id}): {e}")
+            return
+        if not definition:
+            self.log(f"Set '{set_id}' nicht gefunden.")
+            return
+        services = dict(definition.get("services") or {})
+        cfg = services.get(service_id) or {}
+        pid = str(cfg.get("plugin_id") or plugin_id or service_id)
+        # P14-04-E: nur der LETZTE Vorkommen eines Indikator-Services gesperrt.
+        if self._plugin_belongs_to_indicator(pid):
+            others = self._remaining_sets_with_plugin(
+                pid, exclude_set_id=set_id)
+            if not others:
+                QMessageBox.warning(
+                    self, "Service gesperrt",
+                    f"Der Service '{pid}' ist der letzte in einem "
+                    f"gespeicherten Service-Set.\n"
+                    f"Für den Indikator muss mindestens ein gültiges Set "
+                    f"mit diesem Service erhalten bleiben (P14-04).")
+                return
+        label = f"{service_id} [{pid}]"
+        reply = QMessageBox.question(
+            self, "Vollständig Löschen",
+            f"Instanz '{label}' vollständig löschen?\n\n"
+            "Die Instanz wird aus dem Set entfernt UND die berechneten "
+            "Feature-Daten dieser Parameter-Variante werden gelöscht.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        reply2 = QMessageBox.question(
+            self, "Wirklich?",
+            f"'{label}' wird dauerhaft entfernt – inkl. aller gespeicherten "
+            "Feature-Daten der Variante. Fortfahren?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply2 != QMessageBox.Yes:
+            return
+        # 1) Instanz aus dem Set entfernen
+        order = [i for i in (definition.get("execution_order") or [])
+                 if i != service_id]
+        services.pop(service_id, None)
+        definition["execution_order"] = order
+        definition["services"] = services
+        try:
+            self.set_repo.save_set(definition)
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern des Sets: {e}")
+            return
+        # 2) Feature-Daten der Variante purgen
+        hash_ = str(cfg.get("instance_hash") or "")
+        if not hash_:
+            hash_ = generate_instance_hash(pid, cfg.get("params") or {})
+        if hash_:
+            try:
+                from analytics.features.feature_builder import FeatureBuilder
+                n = FeatureBuilder().purge_instance_data(hash_)
+            except Exception as e:
+                n = 0
+                self.log(f"WARN: Feature-Daten-Purge fehlgeschlagen: {e}")
+            self.log(f"Variante #{hash_} purged ({n} Zeilen).")
+        self.log(f"Instanz vollständig gelöscht: {label}")
+        event_bus.service_set_changed.emit()
+        if self._current_set_id == set_id:
+            self.load_set_into_editor(definition)
+
+    def _delete_complete_preset(self, plugin_id: str,
+                                instance_hash: str) -> None:
+        """Voll-Loeschung eines Plugin-Presets/Clones."""
+        preset = self._find_preset_for_hash(plugin_id, instance_hash)
+        if preset is None:
+            self.log(f"Preset zu #{instance_hash} nicht gefunden.")
+            return
+        preset_name = str(preset.get("preset_name") or "Default")
+        indicator_id = str(preset.get("indicator_id") or "")
+        reply = QMessageBox.question(
+            self, "Vollständig Löschen",
+            f"Preset '{preset_name}' von '{plugin_id}' vollständig löschen?"
+            f"\n\nDas Preset wird aus indicator_presets entfernt UND die "
+            "berechneten Feature-Daten dieser Parameter-Variante werden "
+            "gelöscht.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        reply2 = QMessageBox.question(
+            self, "Wirklich?",
+            f"'{preset_name}' wird dauerhaft gelöscht – inkl. aller "
+            "gespeicherten Feature-Daten der Variante. Fortfahren?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply2 != QMessageBox.Yes:
+            return
+        sm = getattr(self, "_state_manager", None)
+        if sm is not None and indicator_id:
+            try:
+                sm.delete_indicator_preset(indicator_id, preset_name)
+            except Exception as e:
+                self.log(f"FEHLER beim Löschen des Presets: {e}")
+                return
+        if instance_hash:
+            try:
+                from analytics.features.feature_builder import FeatureBuilder
+                n = FeatureBuilder().purge_instance_data(instance_hash)
+            except Exception as e:
+                n = 0
+                self.log(f"WARN: Feature-Daten-Purge fehlgeschlagen: {e}")
+            self.log(f"Variante #{instance_hash} purged ({n} Zeilen).")
+        self.log(f"Preset vollständig gelöscht: '{preset_name}'.")
+        event_bus.service_set_changed.emit()
+
+    @Slot(str, str, str, str)
+    def _on_doc_log_requested(self, set_id: str, service_id: str,
+                              plugin_id: str, instance_hash: str) -> None:
+        """'Doc Log bearbeiten' (20.04, Q1/Q7).
+
+        Oeffnet den ServiceDescriptionEditDialog fuer das Freitextfeld
+        (Negativ-Wissen). Persistenz:
+        * Service-in-Set: ServiceInstanceConfig.doc_log (Set-JSON).
+        * Clone/Preset: indicator_presets.doc_log.
+        """
+        try:
+            if set_id and service_id:
+                model = getattr(self.service_selector, "model", None)
+                cfg = model.find_service(set_id, service_id) if model else None
+                cfg = cfg or {}
+                pid = str(cfg.get("plugin_id") or service_id)
+                dlg = ServiceDescriptionEditDialog(
+                    parent=self,
+                    instance_id=service_id,
+                    plugin_id=pid,
+                    header_line=self._info_header_tooltip(pid),
+                    description=str(cfg.get("doc_log") or ""),
+                    title="Doc Log bearbeiten",
+                )
+                dlg.save_requested.connect(
+                    lambda text, s=set_id, i=service_id:
+                    self._save_instance_doc_log(s, i, text))
+                dlg.exec()
+                return
+            if plugin_id and instance_hash:
+                preset = self._find_preset_for_hash(plugin_id, instance_hash)
+                preset_name = str((preset or {}).get("preset_name")
+                                  or instance_hash)
+                dlg = ServiceDescriptionEditDialog(
+                    parent=self,
+                    instance_id=preset_name,
+                    plugin_id=plugin_id,
+                    header_line=self._info_header_tooltip(plugin_id),
+                    description=str((preset or {}).get("doc_log") or ""),
+                    title="Doc Log bearbeiten",
+                )
+                dlg.save_requested.connect(
+                    lambda text, p=plugin_id, h=instance_hash:
+                    self._save_plugin_doc_log(p, h, text))
+                dlg.exec()
+                return
+        except (RuntimeError, AttributeError) as e:
+            self.log(f"Doc-Log-Dialog nicht möglich: {e}")
+
+    def _save_instance_doc_log(self, set_id: str, instance_id: str,
+                               new_log: str) -> None:
+        """Persistiert das Doc-Log einer Service-Instanz (20.04, Q7).
+
+        Ziel: ServiceInstanceConfig.doc_log im Set-JSON (single source of
+        truth wie description). Analog _save_instance_description.
+        """
+        clean = (new_log or "").strip()
+        # In der geladenen Definition nachziehen (sofortige Folge-Speicherung)
+        if self._current_set_definition is not None:
+            cfg = (self._current_set_definition.get("services") or {}).get(
+                instance_id)
+            if isinstance(cfg, dict):
+                cfg["doc_log"] = clean
+        if not set_id:
+            self.log(f"Doc Log '{instance_id}' aktualisiert "
+                     f"(Set noch nicht gespeichert).")
+            return
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            self.log(f"FEHLER beim Laden des Sets ({set_id}): {e}")
+            return
+        if not definition:
+            self.log(f"Set '{set_id}' nicht gefunden – Doc Log nicht "
+                     f"gespeichert.")
+            return
+        services = definition.get("services") or {}
+        if instance_id in services:
+            services[instance_id]["doc_log"] = clean
+        definition["services"] = services
+        try:
+            self.set_repo.save_set(definition)
+            event_bus.service_set_changed.emit()
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern des Doc Logs: {e}")
+            return
+        self._clear_dirty_markers()
+        self.log(f"Doc Log '{instance_id}' gespeichert.")
+
+    def _save_plugin_doc_log(self, plugin_id: str, instance_hash: str,
+                             new_log: str) -> None:
+        """Persistiert das Doc-Log eines Plugin-Presets (20.04, Q7)."""
+        sm = getattr(self, "_state_manager", None)
+        if sm is None:
+            self.log("Doc Log nicht gespeichert (kein StateManager).")
+            return
+        preset = self._find_preset_for_hash(plugin_id, instance_hash)
+        if not preset or not preset.get("indicator_id"):
+            self.log(f"Preset zu #{instance_hash} nicht gefunden.")
+            return
+        try:
+            sm.set_plugin_preset_doc_log(
+                preset.get("indicator_id"), preset.get("preset_name"),
+                new_log)
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern des Preset-Doc-Logs: {e}")
+            return
+        self.log(f"Doc Log '{preset.get('preset_name')}' gespeichert.")
+        event_bus.service_set_changed.emit()
+
+    @Slot(str, str, str, str)
+    def _on_duplicate_variant(self, set_id: str, service_id: str,
+                              plugin_id: str, instance_hash: str) -> None:
+        """'Als Variante duplizieren' (20.04, Q8).
+
+        * Service-in-Set: neue Instanz mit kopierten Parametern + neu
+          berechnetem instance_hash (neue instance_id via _next_instance_id).
+        * Clone/Preset: neues Preset mit kopierten Parametern (Name
+          '<Preset> (Kopie)'); aus einem flachen Plugin-Blatt entsteht so
+          die erste Variante.
+        """
+        if set_id and service_id:
+            self._duplicate_set_instance(set_id, service_id)
+            return
+        if plugin_id:
+            self._duplicate_preset(plugin_id, instance_hash)
+            return
+        self.log("Als Variante duplizieren: keine Ziel-Instanz.")
+
+    def _duplicate_set_instance(self, set_id: str, service_id: str) -> None:
+        """Dupliziert eine Service-Instanz in ihrem Set (Q8)."""
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            self.log(f"FEHLER beim Laden des Sets ({set_id}): {e}")
+            return
+        if not definition:
+            self.log(f"Set '{set_id}' nicht gefunden.")
+            return
+        services = dict(definition.get("services") or {})
+        cfg = services.get(service_id)
+        if not isinstance(cfg, dict):
+            self.log(f"Instanz '{service_id}' nicht gefunden.")
+            return
+        pid = str(cfg.get("plugin_id") or service_id)
+        iid = self._next_instance_id(services, pid)
+        copy = dict(cfg)
+        copy["params"] = dict(cfg.get("params") or {})
+        copy["instance_hash"] = generate_instance_hash(pid, copy["params"])
+        copy.pop("description", None)
+        copy.pop("doc_log", None)
+        services[iid] = copy
+        order = list(definition.get("execution_order") or [])
+        order.append(iid)
+        definition["execution_order"] = order
+        definition["services"] = services
+        try:
+            self.set_repo.save_set(definition)
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern des Sets: {e}")
+            return
+        self.log(f"Variante '{iid}' dupliziert aus '{service_id}' "
+                 f"(#{copy['instance_hash']}).")
+        event_bus.service_set_changed.emit()
+        if self._current_set_id == set_id:
+            self.load_set_into_editor(definition)
+
+    def _duplicate_preset(self, plugin_id: str, instance_hash: str) -> None:
+        """Dupliziert einen Plugin-Clone als neues Preset (Q8)."""
+        sm = getattr(self, "_state_manager", None)
+        if sm is None:
+            self.log("Variante nicht dupliziert (kein StateManager).")
+            return
+        if instance_hash:
+            preset = self._find_preset_for_hash(plugin_id, instance_hash)
+            if preset is None:
+                self.log(f"Preset zu #{instance_hash} nicht gefunden.")
+                return
+            base = str(preset.get("preset_name") or "Default")
+            params = dict(preset.get("params") or {})
+            indicator_id = str(preset.get("indicator_id") or "")
+            version = preset.get("version")
+            is_active = bool(preset.get("is_active_batch"))
+        else:
+            # Flaches Plugin-Blatt: aktuelle Standalone-Parameter
+            # (global_settings, Key 'plugin_params_<plugin_id>').
+            try:
+                raw = sm.get_global_value(f"plugin_params_{plugin_id}", {})
+            except Exception:
+                raw = {}
+            if not isinstance(raw, dict):
+                raw = {}
+            base = "Default"
+            params = dict(raw.get("params") or {})
+            indicator_id = plugin_id
+            version = raw.get("version") or "1.0.0"
+            is_active = True
+        if not indicator_id:
+            indicator_id = plugin_id
+        new_name = self._next_preset_copy_name(sm, indicator_id, base)
+        try:
+            sm.save_indicator_preset(
+                indicator_id, new_name, params,
+                plugin_id=plugin_id,
+                version=version,
+                is_active_batch=is_active,
+                doc_log="",
+            )
+        except Exception as e:
+            self.log(f"FEHLER beim Duplizieren der Variante: {e}")
+            return
+        new_hash = generate_instance_hash(plugin_id, params)
+        self.log(f"Variante '{new_name}' dupliziert aus '{base}' "
+                 f"(#{new_hash}).")
+        event_bus.service_set_changed.emit()
 
     def _resolve_info_plugin(self, plugin_id: str):
         """Liefert das Plugin aus der Registry (oder None + Log-Eintrag)."""

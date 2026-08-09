@@ -180,6 +180,12 @@ class ServiceRunWorker(QThread):
                                              context=context)
 
         stored = 0
+        # 20.04 (Q9): Instanz-Hashes je iid – Grundlage der feature_store-
+        # Spalte instance_hash (Varianten-Statistik + gezieltes Purge, Q5).
+        # Bevorzugt cfg.instance_hash (Set-Definition), sonst deterministisch
+        # aus generate_instance_hash(plugin_id, params) neu berechnet.
+        from analytics.engine.service_models import generate_instance_hash
+        svc_cfgs = dict(definition.get("services") or {})
         for iid, result in results.items():
             payload = (result or {}).get("feature_store_payload") or {}
             records = payload.get("records") or []
@@ -187,7 +193,13 @@ class ServiceRunWorker(QThread):
                 self.log_message.emit(
                     f"  {iid}: fertig (kein Feature-Store-Payload)")
                 continue
-            fb.store_plugin_payload(self.symbol, tf, payload)
+            cfg = svc_cfgs.get(iid) or {}
+            pid = str(cfg.get("plugin_id") or iid)
+            params = cfg.get("params") or {}
+            instance_hash = str(cfg.get("instance_hash") or "") or \
+                generate_instance_hash(pid, params)
+            fb.store_plugin_payload(self.symbol, tf, payload,
+                                    instance_hash=instance_hash)
             stored += len(records)
             self.log_message.emit(
                 f"  {iid}: {len(records)} Feature-Row(s) gespeichert "
@@ -211,6 +223,25 @@ class ServiceRunWorker(QThread):
             settings = StateManager().get_app_settings()
             fb = FeatureBuilder()
             definition = self._build_scope_definition()
+            # 20.04 (Q6): Archiv-Ignoranz (Archive Safety) – archivierte Sets
+            # bzw. einzeln archivierte Instanzen werden NICHT ausgefuehrt.
+            # Der MasterTree deaktiviert die Run-Aktionen zusaetzlich
+            # (Doppel-Absicherung; Scans/Executors bleiben rein lesend).
+            if not self.instance_id and self.set_definition.get("is_archived"):
+                self.log_message.emit(
+                    f"Archiviertes Set '{scope_id}' wird nicht ausgefuehrt "
+                    f"(Q6).")
+                self.run_finished.emit(scope_id, 0)
+                return
+            if self.instance_id:
+                _svc = (self.set_definition.get("services") or {}).get(
+                    self.instance_id) or {}
+                if _svc.get("is_archived"):
+                    self.log_message.emit(
+                        f"Archivierte Instanz '{self.instance_id}' wird nicht "
+                        f"ausgefuehrt (Q6).")
+                    self.run_finished.emit(scope_id, 0)
+                    return
             # 05.08.2026 (Bugfix Service-Run):
             #  * Fehlende depends_on-Einträge (z.B. srv_proximity -> srv_grid_lines)
             #    werden automatisch aufgelöst (sonst 'kein Feature-Store-

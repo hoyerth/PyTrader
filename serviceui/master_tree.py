@@ -94,6 +94,12 @@ ROLE_NODE_TYPE = Qt.UserRole
 ROLE_SET_ID = Qt.UserRole + 1
 ROLE_INSTANCE_ID = Qt.UserRole + 2
 ROLE_PLUGIN_ID = Qt.UserRole + 3
+# 20.04 (Q6/Q7): Zusaetzliche Rollen fuer Clone-Knoten (TYPE_CLONE) und
+# die Archiv-Kennzeichnung. ROLE_INSTANCE_HASH traegt den 8-stelligen
+# Parameter-Hash eines Clones (generate_instance_hash); ROLE_ARCHIVED=True
+# markiert archivierte Knoten (non-checkable, Archiv-Safety).
+ROLE_INSTANCE_HASH = Qt.UserRole + 4
+ROLE_ARCHIVED = Qt.UserRole + 5
 
 # 15.03-E (Multi-Select): Klickzone der Checkbox-Indikatoren in Spalte 0.
 # Klicks links dieser Zone (innerhalb der Item-Zeile) werden dem Qt-Default
@@ -106,6 +112,10 @@ TYPE_GROUP = "group"
 TYPE_SET = "set"
 TYPE_SERVICE = "service"
 TYPE_PLUGIN = "plugin"
+# 20.04 (Q7): Clone-/Preset-Knoten (Kind eines Plugin-Parents in der
+# Services-Gruppe). Traegt ROLE_PLUGIN_ID (plugin_id des Parents) und
+# ROLE_INSTANCE_HASH; aktive Clones sind anhakbar, archivierte nicht.
+TYPE_CLONE = "clone"
 # 16.08 (K3): Kategorie-Ordner-Knoten (Dynamic Category Trees). Nicht
 # auswaehlbar, expandierbar; traegt KEINEN Info-Button (K5), keine Badges
 # und ist im Checkbox-Modus nicht anhakbar (K4).
@@ -251,6 +261,30 @@ class MasterTree(QTreeWidget):
     rename_folder_requested = Signal(str, str, str)
     folder_item_moved = Signal(str, str, str)
     folder_moved = Signal(str, str, str)
+    # 20.04 (Q5/Q6/Q8): Instanz-Verwaltung im Kontextmenue (Service-/Clone-
+    # Zeilen). Der Orchestrator (ServiceWindow) verknuepft die Aktionen mit
+    # seinen Handlern:
+    #   data_only_purge_requested(set_id, service_id, plugin_id,
+    #                             instance_hash)
+    #       – 'Data Only Löschen': NUR die berechneten Feature-Daten der
+    #         Instanz purgen (FeatureBuilder.purge_instance_data, Q5). Bei
+    #         Clone-Zeilen sind set_id/service_id leer (plugin_id + Hash).
+    #   delete_complete_requested(set_id, service_id, plugin_id,
+    #                             instance_hash)
+    #       – 'Vollständig Löschen': Instanz/Preset + Feature-Daten entfernen
+    #         (2-stufige Sicherheitsabfrage im Orchestrator).
+    #   doc_log_requested(set_id, service_id, plugin_id, instance_hash)
+    #       – 'Doc Log bearbeiten': Negativ-Wissen editieren
+    #         (ServiceInstanceConfig.doc_log bzw. indicator_presets.doc_log
+    #         bei Clones).
+    #   duplicate_variant_requested(set_id, service_id, plugin_id,
+    #                               instance_hash)
+    #       – 'Als Variante duplizieren' (Q8): neue Instanz/Preset-Variante
+    #         mit kopierten Parametern (neue instance_id / Preset-Name).
+    data_only_purge_requested = Signal(str, str, str, str)
+    delete_complete_requested = Signal(str, str, str, str)
+    doc_log_requested = Signal(str, str, str, str)
+    duplicate_variant_requested = Signal(str, str, str, str)
 
     def __init__(self, model, parent=None) -> None:
         super().__init__(parent)
@@ -483,10 +517,15 @@ class MasterTree(QTreeWidget):
         set_item.setData(0, ROLE_NODE_TYPE, TYPE_SET)
         set_item.setData(0, ROLE_SET_ID, child.get("set_id") or "")
         set_item.setToolTip(0, f"Service-Set: {child.get('set_id') or '?'}")
+        # 20.04 (Q6): Archivierte Sets (is_archived=True) sind non-checkable
+        # (Archive Safety) – sie liegen im '📁 Archiv'-Ordner der Sets-Gruppe.
+        archived_set = bool(child.get("archived"))
+        if archived_set:
+            set_item.setData(0, ROLE_ARCHIVED, True)
         # 15.03-E (Multi-Select): Set-Knoten anhakbar – der Tri-State wird
         # NACH dem Anhaengen der Service-Kinder aus deren Zustaenden
         # abgeleitet (_apply_set_state).
-        if self._checkable:
+        if self._checkable and not archived_set:
             set_item.setFlags(set_item.flags() | Qt.ItemIsUserCheckable)
         # Bugfix 05.08.2026: Gehoert das Set einem Indikator, traegt der
         # Info-Button (Spalte 1) den Tooltip 'aktiv/im <Indikator>' (siehe
@@ -500,17 +539,24 @@ class MasterTree(QTreeWidget):
             # Service-Namen: 'prox_1 (05.08.26)' – ohne Eintrag '(--.--.--)'.
             plugin_id = svc.get("plugin_id") or ""
             last_exec = str(svc.get("last_execution") or "--.--.--")
-            svc_item = QTreeWidgetItem([
-                f"{svc.get('instance_id')} ({last_exec})",
-                "",
-            ])
+            svc_label = f"{svc.get('instance_id')} ({last_exec})"
+            # 20.04 (Q6): Einzeln archivierte Instanzen tragen im Archiv
+            # eine Kennzeichnung (is_archived=True -> non-checkable).
+            svc_archived = bool(svc.get("is_archived"))
+            if svc_archived:
+                svc_label = f"🔹 {svc_label}"
+            svc_item = QTreeWidgetItem([svc_label, ""])
             svc_item.setData(0, ROLE_NODE_TYPE, TYPE_SERVICE)
             svc_item.setData(0, ROLE_SET_ID, child.get("set_id") or "")
             svc_item.setData(0, ROLE_INSTANCE_ID, svc.get("instance_id") or "")
             svc_item.setData(0, ROLE_PLUGIN_ID, plugin_id)
+            svc_item.setData(0, ROLE_INSTANCE_HASH,
+                             str(svc.get("instance_hash") or ""))
+            if svc_archived or archived_set:
+                svc_item.setData(0, ROLE_ARCHIVED, True)
             # 15.03-E (Multi-Select): Service-Knoten anhakbar – Zustand aus
             # _checked_items re-applizieren (bleibt ueber Neuaufbauten erhalten).
-            if self._checkable:
+            if self._checkable and not svc_archived and not archived_set:
                 svc_item.setFlags(svc_item.flags() | Qt.ItemIsUserCheckable)
                 key = (TYPE_SERVICE,
                        str(child.get("set_id") or ""),
@@ -532,20 +578,80 @@ class MasterTree(QTreeWidget):
         # aus dem feature_store) haengt auch an Standalone-/Plugin-Zeilen:
         # 'srv_proximity (02.08.26)' – ohne Eintrag '(--.--.--)'.
         last_exec = str(child.get("last_execution") or "--.--.--")
+        clones = child.get("clones") or []
+        archived_parent = bool(child.get("archived"))
         plugin_item = QTreeWidgetItem([f"{pid} ({last_exec})", ""])
         plugin_item.setData(0, ROLE_NODE_TYPE, TYPE_PLUGIN)
         plugin_item.setData(0, ROLE_SET_ID, group)
         plugin_item.setData(0, ROLE_PLUGIN_ID, pid)
-        # 15.03-E (Multi-Select): Standalone-/Plugin-Zeilen anhakbar
-        # (feature_id des Feature-Store IST die plugin_id).
-        if self._checkable:
-            plugin_item.setFlags(plugin_item.flags() | Qt.ItemIsUserCheckable)
+        if archived_parent:
+            plugin_item.setData(0, ROLE_ARCHIVED, True)
+        # 20.04 (Q7): Plugins MIT Clones sind Template-Parents (nicht direkt
+        # ausfuehrbar) – KEINE Checkbox am Plugin-Knoten; die Clones tragen
+        # die Haken. Plugins OHNE Clones bleiben anhakbare flache Blaetter
+        # (Bestandsverhalten, feature_id des Feature-Store = plugin_id).
+        if clones:
+            plugin_item.setFlags(
+                plugin_item.flags() & ~Qt.ItemIsUserCheckable)
+        elif self._checkable:
+            plugin_item.setFlags(
+                plugin_item.flags() | Qt.ItemIsUserCheckable)
             key = (TYPE_PLUGIN, "", pid)
             state = (Qt.Checked if key in self._checked_items
                      else Qt.Unchecked)
             plugin_item.setData(0, Qt.CheckStateRole, state)
         self._apply_badge(plugin_item, pid, child.get("badge") or "")
+        for clone in clones:
+            plugin_item.addChild(self._build_clone_item(clone, pid))
         return plugin_item
+
+    def _build_clone_item(self, clone: Dict[str, Any],
+                          plugin_id: str) -> QTreeWidgetItem:
+        """Erzeugt ein Clone-/Preset-Kind unter einem Plugin-Parent (20.04).
+
+        Label-Format (Doku §3): aktive Clones `🟢 <Preset> (#<hash>)`,
+        archivierte Clones `🔹 <Preset> (#<hash>)`. Aktive Clones sind im
+        Checkbox-Modus anhakbar; ARCHIVIERTE Clones sind non-checkable
+        (Archive Safety, Q6) und emittieren keine IDs an Scans/Analytics.
+        """
+        preset_name = str(clone.get("preset_name") or "Default")
+        instance_hash = str(clone.get("instance_hash") or "")
+        archived = bool(clone.get("is_archived"))
+        hash_suffix = f" (#{instance_hash})" if instance_hash else ""
+        prefix = "🔹" if archived else "🟢"
+        clone_item = QTreeWidgetItem([f"{prefix} {preset_name}{hash_suffix}", ""])
+        clone_item.setData(0, ROLE_NODE_TYPE, TYPE_CLONE)
+        clone_item.setData(0, ROLE_PLUGIN_ID, plugin_id)
+        clone_item.setData(0, ROLE_INSTANCE_HASH, instance_hash)
+        if archived:
+            clone_item.setData(0, ROLE_ARCHIVED, True)
+        # Tooltip: Plugin/Preset + Parameter + Doc-Log (Negativ-Wissen).
+        tooltip = f"Plugin: {plugin_id}\nPreset: {preset_name}"
+        params = clone.get("params") or {}
+        if isinstance(params, dict) and params:
+            try:
+                tooltip += "\n" + ", ".join(
+                    f"{k}={v}" for k, v in list(params.items())[:8])
+            except Exception:
+                pass
+        doc_log = str(clone.get("doc_log") or "").strip()
+        if doc_log:
+            tooltip += f"\n📝 {doc_log}"
+        clone_item.setToolTip(0, tooltip)
+        # Checkbox nur fuer AKTIVE Clones im Checkbox-Modus (Q6).
+        if self._checkable and not archived:
+            clone_item.setFlags(
+                clone_item.flags() | Qt.ItemIsUserCheckable)
+            key = (TYPE_CLONE, plugin_id, instance_hash)
+            state = (Qt.Checked if key in self._checked_items
+                     else Qt.Unchecked)
+            clone_item.setData(0, Qt.CheckStateRole, state)
+        elif archived:
+            # QTreeWidgetItem traegt ItemIsUserCheckable per Default – bei
+            # ARCHIVIERTEN Clones explizit entfernen (Archive Safety, Q6).
+            clone_item.setFlags(
+                clone_item.flags() & ~Qt.ItemIsUserCheckable)
+        return clone_item
 
     def _apply_badge(self, item: QTreeWidgetItem, plugin_id: str,
                      badge: str) -> None:
@@ -668,6 +774,11 @@ class MasterTree(QTreeWidget):
         if node_type not in (TYPE_SET, TYPE_PLUGIN, TYPE_CATEGORY):
             super().startDrag(supported_actions)
             return
+        # 20.04 (Q6): Archivierte Knoten sind nicht ziehbar (Archive
+        # Safety) – sie duerfen nicht in normale Kategorie-Ordner wandern.
+        if item.data(0, ROLE_ARCHIVED):
+            super().startDrag(supported_actions)
+            return
         try:
             payload = {
                 "node_type": node_type,
@@ -769,6 +880,11 @@ class MasterTree(QTreeWidget):
         target = self.itemAt(pos)
         target_group, target_path = self._drop_target(target)
         if not target_group:
+            event.ignore()
+            return
+        # 20.04 (Q6): Der Archiv-Ordner ist kein Drag-Ziel (Archive Safety).
+        # Kategorie-Pfad 'Archiv' (ohne '📁 '-Praefix) wird abgelehnt.
+        if str(target_path or "").strip().lower().startswith("archiv"):
             event.ignore()
             return
         if source_group and source_group != target_group:
@@ -943,7 +1059,7 @@ class MasterTree(QTreeWidget):
                     continue
                 node_type = item.data(0, ROLE_NODE_TYPE)
                 if node_type not in (TYPE_SERVICE, TYPE_SET, TYPE_PLUGIN,
-                                     TYPE_CATEGORY):
+                                     TYPE_CATEGORY, TYPE_CLONE):
                     continue
                 tooltip = item.toolTip(1) or ""
                 set_id = str(item.data(0, ROLE_SET_ID) or "")
@@ -952,9 +1068,10 @@ class MasterTree(QTreeWidget):
                 if node_type == TYPE_SERVICE:
                     service_id = str(item.data(0, ROLE_INSTANCE_ID) or "")
                     plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
-                elif node_type == TYPE_PLUGIN:
-                    # Plugin-Zeilen: set_id bewusst leer (die ROLE_SET_ID
-                    # traegt nur die Gruppenkennung 'standalone'/'plugins').
+                elif node_type in (TYPE_PLUGIN, TYPE_CLONE):
+                    # Plugin-/Clone-Zeilen: set_id bewusst leer (die
+                    # ROLE_SET_ID traegt nur die Gruppenkennung); bei
+                    # Clones liefert ROLE_PLUGIN_ID die feature_id.
                     set_id = ""
                     plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
 
@@ -1109,7 +1226,7 @@ class MasterTree(QTreeWidget):
         if item is None or not isValid(item):
             return
         node_type = item.data(0, ROLE_NODE_TYPE)
-        if node_type not in (TYPE_SET, TYPE_SERVICE, TYPE_PLUGIN):
+        if node_type not in (TYPE_SET, TYPE_SERVICE, TYPE_PLUGIN, TYPE_CLONE):
             return
         self._updating_checks = True
         try:
@@ -1144,6 +1261,21 @@ class MasterTree(QTreeWidget):
                     self._checked_items.add(key)
                     # Bugfix 08.08.2026: Eltern-Kette aufklappen (Ordner/
                     # Gruppe), damit die angehakte Plugin-Zeile sichtbar ist.
+                    self._expand_ancestors(item)
+                else:
+                    self._checked_items.discard(key)
+            elif node_type == TYPE_CLONE:
+                # 20.04 (Q7): Clone-Haken -> feature_id ist die plugin_id
+                # des Plugin-Parents (WHERE feature_id IN (plugin_ids)).
+                key = (TYPE_CLONE,
+                       str(item.data(0, ROLE_PLUGIN_ID) or ""),
+                       str(item.data(0, ROLE_INSTANCE_HASH) or ""))
+                expected = (Qt.Checked if key in self._checked_items
+                            else Qt.Unchecked)
+                if state == expected:
+                    return
+                if state == Qt.Checked:
+                    self._checked_items.add(key)
                     self._expand_ancestors(item)
                 else:
                     self._checked_items.discard(key)
@@ -1251,6 +1383,11 @@ class MasterTree(QTreeWidget):
             elif node_type == TYPE_PLUGIN:
                 synced.add((TYPE_PLUGIN, "",
                             str(item.data(0, ROLE_PLUGIN_ID) or "")))
+            elif node_type == TYPE_CLONE:
+                # 20.04 (Q7): Clone-Keys (plugin_id, instance_hash).
+                synced.add((TYPE_CLONE,
+                            str(item.data(0, ROLE_PLUGIN_ID) or ""),
+                            str(item.data(0, ROLE_INSTANCE_HASH) or "")))
         self._checked_items = synced
 
     def checked_services(self) -> List[Dict[str, str]]:
@@ -1278,6 +1415,16 @@ class MasterTree(QTreeWidget):
                     "set_id": "",
                     "instance_id": "",
                     "plugin_id": key_id,
+                })
+            elif node_type == TYPE_CLONE:
+                # 20.04 (Q7): Clone-Haken -> feature_id ist die plugin_id
+                # (im set_id-Slot gespeichert); instance_hash im
+                # instance_id-Slot fuer die Varianten-Aufloesung.
+                result.append({
+                    "node_type": TYPE_CLONE,
+                    "set_id": "",
+                    "instance_id": key_id,
+                    "plugin_id": set_id,
                 })
         return result
 
@@ -1307,6 +1454,11 @@ class MasterTree(QTreeWidget):
                 s = self.model.find_set(entry["set_id"]) or {}
                 set_name = s.get("display_name") or entry["set_id"] or "?"
                 names.append(f"{set_name}/{entry['instance_id']}")
+            elif entry["node_type"] == TYPE_CLONE:
+                # 20.04 (Q7): Clone-Anzeige '<plugin_id> (#<hash>)'.
+                pid = entry["plugin_id"]
+                h = entry.get("instance_id") or ""
+                names.append(f"{pid} (#{h})" if h else pid)
             else:
                 names.append(entry["plugin_id"])
         return names
@@ -1326,7 +1478,7 @@ class MasterTree(QTreeWidget):
                 if item is None or not isValid(item):
                     continue
                 if item.data(0, ROLE_NODE_TYPE) in (TYPE_SET, TYPE_SERVICE,
-                                                    TYPE_PLUGIN):
+                                                    TYPE_PLUGIN, TYPE_CLONE):
                     item.setData(0, Qt.CheckStateRole, Qt.Unchecked)
         finally:
             self._updating_checks = False
@@ -1371,6 +1523,18 @@ class MasterTree(QTreeWidget):
                     checked = pid.lower() in wanted
                     if checked:
                         self._checked_items.add((TYPE_PLUGIN, "", pid))
+                        checked_items.append(item)
+                    item.setData(0, Qt.CheckStateRole,
+                                 Qt.Checked if checked else Qt.Unchecked)
+                elif node_type == TYPE_CLONE:
+                    # 20.04 (Q7): Clone-Haken folgen der plugin_id (feature-
+                    # id des Filters); instance_hash unterscheidet Varianten.
+                    pid = str(item.data(0, ROLE_PLUGIN_ID) or "")
+                    instance_hash = str(item.data(0, ROLE_INSTANCE_HASH) or "")
+                    checked = pid.lower() in wanted
+                    if checked:
+                        self._checked_items.add(
+                            (TYPE_CLONE, pid, instance_hash))
                         checked_items.append(item)
                     item.setData(0, Qt.CheckStateRole,
                                  Qt.Checked if checked else Qt.Unchecked)
@@ -1510,19 +1674,25 @@ class MasterTree(QTreeWidget):
                 return
             if node_type == TYPE_SET:
                 set_id = str(item.data(0, ROLE_SET_ID) or "")
+                archived_set = bool(item.data(0, ROLE_ARCHIVED))
                 # 05.08.2026: 'Alle Services ausführen' – gezielter Run des
                 # Sets (kein globaler Massen-Scan); der Orchestrator zeigt
                 # den Bestaetigungsdialog (Set + Symbol/Timeframe).
+                # 20.04 (Q6): Archivierte Sets sind von Run/Struktur-Aktionen
+                # ausgenommen (Archive Safety) – nur Loeschen bleibt aktiv.
                 act_run = menu.addAction("▶️ Alle Services ausführen")
+                act_run.setEnabled(not archived_set)
                 act_run.triggered.connect(
                     lambda _=False, s=set_id:
                     self.run_set_requested.emit(s))
                 menu.addSeparator()
                 act_rename = menu.addAction("Set umbenennen")
+                act_rename.setEnabled(not archived_set)
                 act_rename.triggered.connect(
                     lambda _=False, s=set_id:
                     self.rename_set_requested.emit(s))
                 act_add = menu.addAction("Service hinzufügen")
+                act_add.setEnabled(not archived_set)
                 act_add.triggered.connect(
                     lambda _=False, s=set_id:
                     self.add_set_service_requested.emit(s))
@@ -1541,6 +1711,10 @@ class MasterTree(QTreeWidget):
                 set_id = str(item.data(0, ROLE_SET_ID) or "")
                 service_id = str(item.data(0, ROLE_INSTANCE_ID) or "")
                 plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
+                # 20.04 (Q1/Q9): instance_hash der Instanz (aus der Set-
+                # Definition, ROLE_INSTANCE_HASH) – Grundlage von Data-Only-
+                # Purge, Voll-Loeschung und Doc-Log.
+                instance_hash = str(item.data(0, ROLE_INSTANCE_HASH) or "")
                 # 05.08.2026: 'Diesen Service ausführen' – gezielter Run des
                 # Einzel-Services (inkl. Upstream-Abhaengigkeiten im Set);
                 # der Orchestrator zeigt den Bestaetigungsdialog (Service +
@@ -1567,10 +1741,84 @@ class MasterTree(QTreeWidget):
                 act_info.triggered.connect(
                     lambda _=False, s=set_id, i=service_id, p=plugin_id:
                     self.info_requested.emit(s, i, p))
+                # 20.04 (Q5/Q6/Q8): Instanz-Verwaltung (Service-in-Set).
+                # 'Als Variante duplizieren' erzeugt eine neue Instanz mit
+                # kopierten Parametern (Q8); 'Doc Log bearbeiten' editiert
+                # das Negativ-Wissen; 'Data Only Löschen' purgt NUR die
+                # Feature-Daten (Q5); 'Vollständig Löschen' entfernt die
+                # Instanz + Daten (2-stufige Sicherheitsabfrage).
+                menu.addSeparator()
+                act_variant = menu.addAction("Als Variante duplizieren")
+                act_variant.triggered.connect(
+                    lambda _=False, s=set_id, i=service_id, p=plugin_id,
+                           h=instance_hash:
+                    self.duplicate_variant_requested.emit(s, i, p, h))
+                act_doclog = menu.addAction("Doc Log bearbeiten")
+                act_doclog.triggered.connect(
+                    lambda _=False, s=set_id, i=service_id, p=plugin_id,
+                           h=instance_hash:
+                    self.doc_log_requested.emit(s, i, p, h))
+                menu.addSeparator()
+                act_purge = menu.addAction("Data Only Löschen")
+                act_purge.triggered.connect(
+                    lambda _=False, s=set_id, i=service_id, p=plugin_id,
+                           h=instance_hash:
+                    self.data_only_purge_requested.emit(s, i, p, h))
+                act_del = menu.addAction("Vollständig Löschen")
+                act_del.triggered.connect(
+                    lambda _=False, s=set_id, i=service_id, p=plugin_id,
+                           h=instance_hash:
+                    self.delete_complete_requested.emit(s, i, p, h))
                 menu.addSeparator()
                 act_purge = menu.addAction("Papierkorb löschen…")
                 act_purge.triggered.connect(
                     lambda _=False: self.purge_trash_requested.emit())
+                menu.exec(self.viewport().mapToGlobal(pos))
+                return
+            # 20.04 (Q7): Clone-Zeile (Preset/Variante eines Plugin-Parents).
+            # Der Run adressiert den Service ueber die plugin_id; archivierte
+            # Clones sind von allen Aktionen ausgenommen (Archive Safety, Q6).
+            if node_type == TYPE_CLONE:
+                plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
+                instance_hash = str(item.data(0, ROLE_INSTANCE_HASH) or "")
+                archived = bool(item.data(0, ROLE_ARCHIVED))
+                menu = QMenu(self)
+                act_run = menu.addAction("▶️ Diesen Service ausführen")
+                act_run.setEnabled(not archived)
+                act_run.triggered.connect(
+                    lambda _=False, p=plugin_id:
+                    self.run_plugin_requested.emit(p))
+                menu.addSeparator()
+                act_info = menu.addAction("Service-Info anzeigen")
+                act_info.setEnabled(not archived)
+                act_info.triggered.connect(
+                    lambda _=False, p=plugin_id:
+                    self.info_requested.emit("", "", p))
+                # 20.04 (Q5/Q6/Q8): Preset-/Varianten-Verwaltung. Archivierte
+                # Clones sind von den Bearbeitungs-/Lauf-Aktionen ausgenommen
+                # (Archive Safety, Q6) – nur 'Vollständig Löschen' bleibt als
+                # einzige Loesch-Option aktiv (Archiv-Einheit: einzelner Clone).
+                menu.addSeparator()
+                act_variant = menu.addAction("Als Variante duplizieren")
+                act_variant.setEnabled(not archived)
+                act_variant.triggered.connect(
+                    lambda _=False, p=plugin_id, h=instance_hash:
+                    self.duplicate_variant_requested.emit("", "", p, h))
+                act_doclog = menu.addAction("Doc Log bearbeiten")
+                act_doclog.setEnabled(not archived)
+                act_doclog.triggered.connect(
+                    lambda _=False, p=plugin_id, h=instance_hash:
+                    self.doc_log_requested.emit("", "", p, h))
+                menu.addSeparator()
+                act_purge = menu.addAction("Data Only Löschen")
+                act_purge.setEnabled(not archived)
+                act_purge.triggered.connect(
+                    lambda _=False, p=plugin_id, h=instance_hash:
+                    self.data_only_purge_requested.emit("", "", p, h))
+                act_del = menu.addAction("Vollständig Löschen")
+                act_del.triggered.connect(
+                    lambda _=False, p=plugin_id, h=instance_hash:
+                    self.delete_complete_requested.emit("", "", p, h))
                 menu.exec(self.viewport().mapToGlobal(pos))
                 return
             # Plugin-Zeile (Services-Gruppe / Kategorie-Ordner):
@@ -1589,6 +1837,15 @@ class MasterTree(QTreeWidget):
                 act_info.triggered.connect(
                     lambda _=False, p=plugin_id:
                     self.info_requested.emit("", "", p))
+                # 20.04 (Q8): 'Als Variante duplizieren' – erzeugt eine
+                # Preset-Variante (indicator_presets) aus den aktuellen
+                # Plugin-Parametern; der Plugin-Knoten wird zum Parent mit
+                # Clone-Kindern (erste Variante eines flachen Blatts).
+                menu.addSeparator()
+                act_variant = menu.addAction("Als Variante duplizieren")
+                act_variant.triggered.connect(
+                    lambda _=False, p=plugin_id:
+                    self.duplicate_variant_requested.emit("", "", p, ""))
                 menu.exec(self.viewport().mapToGlobal(pos))
                 return
             # Sonstige Nicht-Set-Knoten (Gruppen der Services-Seite)
@@ -1725,6 +1982,12 @@ class MasterTree(QTreeWidget):
                 set_id = str(item.data(0, ROLE_SET_ID) or "")
             elif node_type == TYPE_PLUGIN:
                 plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
+            elif node_type == TYPE_CLONE:
+                # 20.04 (Q7): Clone-Zeilen liefern plugin_id (feature_id)
+                # im plugin_id-Slot; der instance_hash (Varianten-Key) wird
+                # im service_id-Slot mitgeliefert (Info/Param-Panel).
+                plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
+                service_id = str(item.data(0, ROLE_INSTANCE_HASH) or "")
             elif node_type == TYPE_CATEGORY:
                 # 18.01.01 (E-4): Kategorie-Ordner liefern den VOLLEN
                 # Kategorie-Pfad (z.B. 'Swing Points/Geometrie') im

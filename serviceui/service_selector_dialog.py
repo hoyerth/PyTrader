@@ -94,7 +94,7 @@ from analytics.engine.description_dialog import ServiceDescriptionDialog
 from analytics.engine.service_selector_model import ServiceSelectorModel
 from config.event_bus import event_bus
 from serviceui.master_tree import (
-    TYPE_CATEGORY, TYPE_PLUGIN, TYPE_SERVICE, TYPE_SET,
+    TYPE_CATEGORY, TYPE_CLONE, TYPE_PLUGIN, TYPE_SERVICE, TYPE_SET,
 )
 from serviceui.param_columns import ServiceParamColumnsMixin
 from serviceui.service_selector_widget import ServiceSelectorWidget
@@ -995,7 +995,7 @@ class ServiceSelectorDialog(QDialog):
         if ids:
             self.selection_ids_requested.emit(ids)
         editable = None
-        if node_type == TYPE_PLUGIN and plugin_id:
+        if node_type in (TYPE_PLUGIN, TYPE_CLONE) and plugin_id:
             if not self.model.belongs_to_indicator(str(plugin_id)):
                 editable = str(plugin_id)
         self._rebuild_param_panel(
@@ -1017,7 +1017,9 @@ class ServiceSelectorDialog(QDialog):
         if node_type == TYPE_CATEGORY:
             return self.model.category_service_plugin_ids(
                 set_id or "", plugin_id or "")
-        if node_type == TYPE_PLUGIN and plugin_id:
+        if node_type in (TYPE_PLUGIN, TYPE_CLONE) and plugin_id:
+            # 20.04 (Q7): Clone-Zeilen loesen auf die plugin_id des
+            # Plugin-Parents auf (Filter bleibt feature_id IN (plugin_ids)).
             return [str(plugin_id)]
         if node_type == TYPE_SERVICE and set_id and service_id:
             cfg = self.model.find_service(set_id, service_id) or {}
@@ -1091,7 +1093,9 @@ class ServiceSelectorDialog(QDialog):
                     "plugin_id": pid,
                 })
             return entries
-        if node_type == TYPE_PLUGIN and plugin_id:
+        if node_type in (TYPE_PLUGIN, TYPE_CLONE) and plugin_id:
+            # 20.04 (Q7): Clone-Zeilen zeigen wie Plugin-Zeilen den
+            # Standalone-Service (feature_id = plugin_id des Parents).
             return [{
                 "node_type": TYPE_PLUGIN,
                 "set_id": "",

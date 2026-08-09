@@ -26,6 +26,10 @@ GROUP_SETS = "sets"
 GROUP_PLUGINS = "plugins"
 #: Kategorie-Ordner-Knoten (Dynamic Category Trees).
 GROUP_CATEGORY = "category_node"
+# 20.04 (Q6): Label des dynamischen Archiv-Ordners. Enthaelt archivierte
+# Knoten (is_archived=True / Presets mit is_active_batch=False) – alle
+# darin liegenden Knoten sind non-checkable (Archive Safety).
+ARCHIVE_LABEL = "📁 Archiv"
 
 
 # ------------------------------------------------------------------
@@ -110,6 +114,11 @@ def _sort_category_nodes(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         is_folder = n.get("group") == GROUP_CATEGORY
         if is_folder:
             name = _cat_key(n.get("label"))
+            # 20.04 (Q6): '📁 Archiv' immer ans ENDE der Gruppe (nach allen
+            # normalen Ordnern UND Blaettern) – markiert ueber 'archived'.
+            if n.get("archived"):
+                return (2, name)
+            return (0, name)
         else:
             name = str(n.get("plugin_id")
                        or n.get("display_name")
@@ -191,28 +200,78 @@ def _ensure_category_path(nodes: List[Dict[str, Any]],
     _ensure_category_path(folder["children"], parts[1:])
 
 
+def _clones_for(presets: Optional[Dict[str, List[Dict[str, Any]]]],
+                plugin_id: str) -> List[Dict[str, Any]]:
+    """Preset-/Clone-Liste eines Plugins (20.04, Q7) oder [].
+
+    `presets` mappt plugin_id.lower() -> Liste von
+    {"preset_name", "params", "instance_hash", "is_archived"}. Plugins
+    ohne Eintrag liefern [] (keine Clones -> flaches Blatt).
+    """
+    if not presets:
+        return []
+    key = str(plugin_id or "").lower()
+    clones = presets.get(key)
+    if not clones:
+        clones = presets.get(str(plugin_id or ""))
+    return list(clones or [])
+
+
 def _category_nodes(plugin_ids: List[str],
                     plugins: Dict[str, Any],
                     overrides: Dict[str, str],
                     badges: Dict[str, str],
-                    last_executions: Dict[str, str]) -> List[Dict[str, Any]]:
+                    last_executions: Dict[str, str],
+                    presets: Optional[Dict[str, List[Dict[str, Any]]]] = None
+                    ) -> List[Dict[str, Any]]:
     """Baut die (ggf. verschachtelte) Kinderliste einer Plugin-Gruppe.
 
     Plugins mit Kategorienpfad werden in 📁-Ordner einsortiert; Plugins
     ohne Kategorie (bzw. Default 'General') bleiben auf oberster Ebene
     (K1). Blatt-Dicts unveraendert ({plugin_id, badge, last_execution}).
     Sortierung pro Ebene: Ordner vor Blaettern, alphabetisch (K8).
+
+    20.04 (Q7): Plugins MIT Presets/Clones werden als Parent-Knoten
+    gerendert – das Blatt-Dict erhaelt zusaetzlich `clones` (Liste der
+    AKTIVEN Clones, is_archived=False). Plugins OHNE Presets bleiben
+    flache Blaetter (Blatt-Struktur identisch, Zero-Regression). Die
+    ARCHIVIERTEN Clones (is_archived=True) wandern in den dynamischen
+    '📁 Archiv'-Ordner (Q6, Archiv-Einheit: einzelne Clone) – das
+    Archiv-Blatt traegt das 'archived'-Flag (non-checkable im MasterTree).
     """
     root: List[Dict[str, Any]] = []
+    archive_entries: List[Dict[str, Any]] = []
     for pid in plugin_ids:
         plugin = plugins.get(pid)
         parts = _category_parts(pid, plugin, overrides)
+        clones = _clones_for(presets, pid)
         leaf = {
             "plugin_id": pid,
             "badge": badges.get(pid, ""),
             "last_execution": last_executions.get(pid, "--.--.--"),
         }
-        _insert_into_category_tree(root, parts, leaf)
+        if not clones:
+            # Plugin ohne Presets: flaches Blatt (Bestandsverhalten).
+            _insert_into_category_tree(root, parts, leaf)
+            continue
+        active = [c for c in clones if not c.get("is_archived")]
+        archived = [c for c in clones if c.get("is_archived")]
+        if active:
+            leaf_with_clones = dict(leaf, clones=active)
+            _insert_into_category_tree(root, parts, leaf_with_clones)
+        if archived:
+            archive_entries.append(dict(
+                leaf, clones=archived, archived=True))
+    if archive_entries:
+        archive_folder: Dict[str, Any] = {
+            "group": GROUP_CATEGORY,
+            "label": ARCHIVE_LABEL,
+            "children": sorted(
+                archive_entries,
+                key=lambda e: str(e.get("plugin_id") or "").lower()),
+            "archived": True,
+        }
+        root.append(archive_folder)
     return _sort_category_nodes(root)
 
 
@@ -336,13 +395,21 @@ def build_tree(sets_data: List[Dict[str, Any]],
                overrides: Dict[str, str],
                empty_folders: Dict[str, List[str]],
                badges: Dict[str, str],
-               last_executions: Dict[str, str]) -> List[Dict[str, Any]]:
+               last_executions: Dict[str, str],
+               presets: Optional[Dict[str, List[Dict[str, Any]]]] = None
+               ) -> List[Dict[str, Any]]:
     """Baut die vollstaendige Hierarchie fuer das 2-Spalten-MasterTree.
 
     17.01.01: NUR noch 2 Root-Gruppen – die ehemalige Gruppe
     '⚡ Standalone Services' (GROUP_STANDALONE) entfaellt ersatzlos, da
     alle Plugins ueber metadata['category'] in Ordner einsortiert werden.
     Root-Label kompakt: '📁 Sets' und '📦 Services'.
+
+    20.04 (Q6/Q7): Plugins MIT Presets werden als Parent-Knoten mit
+    Clone-Kindern gerendert (`clones` im Blatt-Dict); archivierte Clones
+    bzw. archivierte Sets/Instanzen (is_archived=True) wandern in den
+    dynamischen '📁 Archiv'-Ordner (per 'archived'-Flag markiert,
+    non-checkable im MasterTree).
 
     Rueckgabe (pro Gruppe ein Dict):
         [{"group": "sets", "label": "📁 Sets", "children": [
@@ -353,16 +420,16 @@ def build_tree(sets_data: List[Dict[str, Any]],
           "children": [Blatt- und/oder Ordner-Knoten ...]}]
 
     Deterministisch sortiert (Sets nach display_name; Plugins/Ordner
-    alphabetisch, 16.08 K8). Die Kinder der Plugin-Gruppen sind eine
-    Mischung aus flachen Blatt-Dicts ({plugin_id, badge, last_execution})
-    und verschachtelten Ordner-Dicts ({"group": GROUP_CATEGORY,
-    "label": "📁 <Name>", "children": [...]} – rekursiv), gesteuert ueber
-    das Metadaten-Feld `category` der Plugins (K1). Dieselbe Ordner-
-    Mechanik gilt fuer die Sets-Gruppe (18.01.03): Set-Definitionen mit
-    `category`-Feld werden in identische Ordner-Dicts einsortiert, Sets
-    ohne Kategorie bleiben flache Blaetter. Seit 18.01.03 (E3-revidiert)
-    werden zusaetzlich benutzererzeugte (ggf. leere) Ordner aus
-    `empty_folders` (global_settings Key 'tree_folders_<group>') in die
+    alphabetisch, 16.08 K8; '📁 Archiv' immer am Ende). Die Kinder der
+    Plugin-Gruppen sind eine Mischung aus flachen Blatt-Dicts
+    ({plugin_id, badge, last_execution}) und verschachtelten Ordner-Dicts
+    ({"group": GROUP_CATEGORY, "label": "📁 <Name>", "children": [...]} –
+    rekursiv), gesteuert ueber das Metadaten-Feld `category` der Plugins
+    (K1). Dieselbe Ordner-Mechanik gilt fuer die Sets-Gruppe (18.01.03):
+    Set-Definitionen mit `category`-Feld werden in identische Ordner-Dicts
+    einsortiert, Sets ohne Kategorie bleiben flache Blaetter. Seit 18.01.03
+    (E3-revidiert) werden zusaetzlich benutzererzeugte (ggf. leere) Ordner
+    aus `empty_folders` (global_settings Key 'tree_folders_<group>') in die
     Gruppen-Kinder eingemischt – leere Ordner bleiben ueber Refreshs
     erhalten und verschwinden NUR bei manueller Loeschung im Kontextmenue.
     """
@@ -373,34 +440,65 @@ def build_tree(sets_data: List[Dict[str, Any]],
     # (rekursiv, gleiche K2/K8/K9-Regeln wie die Plugins); ohne Kategorie
     # bleiben sie flache Blaetter auf oberster Ebene.
     set_nodes: List[Dict[str, Any]] = []
+    # 20.04 (Q6): Archivierte Sets/Instanzen (is_archived=True) – sie
+    # wandern in den '📁 Archiv'-Ordner der Sets-Gruppe (non-checkable).
+    archive_set_nodes: List[Dict[str, Any]] = []
     for s in sets:
         services = s.get("services") or {}
         order = s.get("execution_order") or []
+        set_archived = bool(s.get("is_archived"))
         service_nodes: List[Dict[str, Any]] = []
+        archived_service_nodes: List[Dict[str, Any]] = []
         for iid in order:
             cfg = services.get(iid) or {}
             pid = str(cfg.get("plugin_id") or iid)
-            service_nodes.append({
+            svc_node = {
                 "instance_id": iid,
                 "plugin_id": pid,
                 "badge": badges.get(pid, ""),
                 "last_execution": last_executions.get(pid, "--.--.--"),
-            })
-        _insert_set_into_category_tree(
-            set_nodes, _set_category_parts(s), {
-                "set_id": s.get("set_id"),
-                "display_name": s.get("display_name") or s.get("set_id") or "Unbenannt",
-                "definition": s,
-                "services": service_nodes,
-            })
+                "instance_hash": str(cfg.get("instance_hash") or ""),
+                "is_archived": bool(cfg.get("is_archived")),
+                "doc_log": str(cfg.get("doc_log") or ""),
+                "params": cfg.get("params") or {},
+            }
+            if set_archived or svc_node["is_archived"]:
+                archived_service_nodes.append(svc_node)
+            else:
+                service_nodes.append(svc_node)
+        set_leaf = {
+            "set_id": s.get("set_id"),
+            "display_name": s.get("display_name") or s.get("set_id") or "Unbenannt",
+            "definition": s,
+            "services": service_nodes,
+        }
+        if set_archived:
+            # Ganzes Set archiviert -> komplett in den Archiv-Ordner.
+            archive_set_nodes.append(dict(set_leaf, archived=True))
+        else:
+            _insert_set_into_category_tree(
+                set_nodes, _set_category_parts(s), set_leaf)
+            # 20.04 (Q6): Einzeln archivierte Instanzen eines AKTIVEN Sets
+            # erscheinen als eigene Eintraege im Archiv-Ordner (Anzeige
+            # '<Set> / <instance_id>').
+            for svc_node in archived_service_nodes:
+                archive_set_nodes.append({
+                    "set_id": s.get("set_id"),
+                    "display_name": f"{s.get('display_name') or s.get('set_id') or 'Unbenannt'} / {svc_node['instance_id']}",
+                    "definition": s,
+                    "services": [svc_node],
+                    "archived": True,
+                })
     set_nodes = _sort_category_nodes(set_nodes)
 
     # EINE kategorisierte Services-Gruppe – Plugins mit `category`-Metadatum
     # werden in 📁-Ordner verschachtelt (K1), ohne Kategorie bleiben sie
     # flache Blaetter auf oberster Ebene. Die fruehere Standalone-Gruppe
-    # (separate Knoten) ist entfallen.
+    # (separate Knoten) ist entfallen. 20.04 (Q7): presets steuern die
+    # Parent-Child-Clone-Ansicht + den Archiv-Ordner.
     plugin_nodes = _category_nodes(sorted(plugins.keys()), plugins,
-                                   overrides, badges, last_executions)
+                                   overrides, badges, last_executions,
+                                   presets)
 
     # 18.01.03 (E3-revidiert): Persistierte benutzererzeugte (ggf. leere)
     # Ordner in die Gruppen-Kinder einmischen – leere Ordner verschwinden
@@ -413,6 +511,17 @@ def build_tree(sets_data: List[Dict[str, Any]],
                      if p.strip()]
             if parts:
                 _ensure_category_path(nodes, parts)
+
+    # 20.04 (Q6): Archiv-Ordner der Sets-Gruppe (falls vorhanden) ans Ende.
+    if archive_set_nodes:
+        archive_set_nodes.sort(
+            key=lambda n: str(n.get("display_name") or "").lower())
+        set_nodes.append({
+            "group": GROUP_CATEGORY,
+            "label": ARCHIVE_LABEL,
+            "children": archive_set_nodes,
+            "archived": True,
+        })
     set_nodes = _sort_category_nodes(set_nodes)
     plugin_nodes = _sort_category_nodes(plugin_nodes)
 

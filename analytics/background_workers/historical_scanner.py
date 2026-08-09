@@ -14,6 +14,7 @@ import time
 from typing import Any, Dict, List, Optional
 from PySide6.QtCore import QThread, Signal
 
+from analytics.engine.service_models import generate_instance_hash
 from analytics.features.feature_builder import FeatureBuilder, PluginExecutor, prepare_plugin_df
 from db_service import get_timeframes
 from state_manager import StateManager
@@ -100,7 +101,13 @@ class HistoricalScanner(QThread):
             payload = result.get("feature_store_payload", {}) if isinstance(result, dict) else {}
             if payload:
                 try:
-                    n = self.feature_builder.store_plugin_payload(self.symbol, tf, payload)
+                    # 20.04 (Q9): instance_hash der Preset-Variante (Parameter-
+                    # Hash) – Spalte im feature_store fuer Varianten-Statistik
+                    # und gezieltes Purge (Q5).
+                    instance_hash = generate_instance_hash(
+                        plugin_id, preset.get("params") or {})
+                    n = self.feature_builder.store_plugin_payload(
+                        self.symbol, tf, payload, instance_hash=instance_hash)
                     total_rows += n
                     self.log_message.emit(
                         f"  {tf}: Plugin {plugin_id}: {n} Feature-Rows im feature_store"

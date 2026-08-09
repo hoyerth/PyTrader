@@ -92,6 +92,13 @@ def check_and_init_databases() -> None:
     con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_id VARCHAR;")
     con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS plugin_version VARCHAR;")
     con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_data JSON;")
+    # 20.04 (Q1/Q9, 09.08.2026): Additive Spalte instance_hash – stabile
+    # Identifikation von Parameter-Varianten eines Plugins (8-stelliger
+    # SHA256-Short-Hash aus generate_instance_hash, ohne lookback – Q3).
+    # Ermoeglicht Multi-Varianten-Statistiken und gezieltes Daten-Purge
+    # (purge_instance_data, Q5), ohne die feature_id (plugin_id) anzutasten.
+    # Bestehende Rows bleiben NULL; feature_id bleibt plugin_id (Zero-Regression).
+    con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS instance_hash VARCHAR;")
     # Bugfix 07.08.2026 (Phase 17 Bugfix-Runde 2): Der Spalten-DEFAULT von
     # created_at wurde durch die PK-Migration (17.01 E-1, test/migrate_pk.py –
     # Table-Rewrite + RENAME) entfernt. Seitdem bleiben NEUE feature_store-Rows

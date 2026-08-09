@@ -103,7 +103,11 @@ class StateManager:
         con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS plugin_id VARCHAR;")
         con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS version VARCHAR DEFAULT '1.0.0';")
         con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS is_active_batch BOOLEAN DEFAULT FALSE;")
-
+        # 20.04 (Q7, 09.08.2026): Doc-Log-Spalte fuer Presets/Clones –
+        # Freitextfeld (Negativ-Wissen) analog ServiceInstanceConfig.doc_log.
+        # Additiv/idempotent – bestehende Presets bleiben unangetastet.
+        con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS doc_log VARCHAR;")
+        
         # Phase 20.01 (09.08.2026): Analytics-Workspace-Persistenz – additive
         # JSON-Spalte `workspace_state` in instance_states (win_analytics:
         # vm.params + UI-Layout). Idempotent – bestehende Zeilen/Spalten
@@ -394,21 +398,24 @@ class StateManager:
         plugin_id: Optional[str] = None,
         version: Optional[str] = None,
         is_active_batch: bool = False,
+        doc_log: Optional[str] = None,
     ) -> None:
         """Speichert ein Indikator-Preset. Unterstützt zusätzlich plugin_id,
-        version und is_active_batch (Phase 12 Hybrid-Schema)."""
+        version und is_active_batch (Phase 12 Hybrid-Schema) sowie das
+        Doc-Log (20.04, Q7)."""
         con = self._get_connection()
         con.execute("""
-            INSERT INTO indicator_presets (indicator_id, preset_name, params, plugin_id, version, is_active_batch)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO indicator_presets (indicator_id, preset_name, params, plugin_id, version, is_active_batch, doc_log)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (indicator_id, preset_name) DO UPDATE SET
                 params = EXCLUDED.params,
                 plugin_id = EXCLUDED.plugin_id,
                 version = EXCLUDED.version,
-                is_active_batch = EXCLUDED.is_active_batch;
+                is_active_batch = EXCLUDED.is_active_batch,
+                doc_log = EXCLUDED.doc_log;
         """, [
             indicator_id, preset_name, json.dumps(params),
-            plugin_id, version, bool(is_active_batch),
+            plugin_id, version, bool(is_active_batch), doc_log,
         ])
 
     def delete_indicator_preset(self, indicator_id: str, preset_name: str) -> None:
@@ -417,6 +424,53 @@ class StateManager:
             "DELETE FROM indicator_presets WHERE indicator_id = ? AND preset_name = ?",
             [indicator_id, preset_name]
         )
+
+    def list_plugin_presets(self, plugin_id: str) -> List[Dict[str, Any]]:
+        """Liefert alle Presets eines Plugins (20.04, Q7).
+
+        Quelle: indicator_presets (Spalte plugin_id, Phase-12-Hybrid-Schema).
+        Rueckgabe pro Eintrag: {"indicator_id", "preset_name", "params",
+        "plugin_id", "version", "is_active_batch", "doc_log"} –
+        deterministisch (preset_name ASC). Grundlage der Parent-Child-Clone-
+        Ansicht im MasterTree (Services-Gruppe: Plugin -> Presets/Clones)
+        und der Archiv-Logik (Q7: Archivierung eines Presets =>
+        is_active_batch = False; die Scans isolieren is_active_batch=False-
+        Presets).
+        """
+        con = self._get_connection()
+        res = con.execute("""
+            SELECT indicator_id, preset_name, params, plugin_id, version,
+                   is_active_batch, doc_log
+            FROM indicator_presets
+            WHERE plugin_id = ?
+            ORDER BY preset_name ASC
+        """, [plugin_id]).fetchall()
+        presets: List[Dict[str, Any]] = []
+        for indicator_id, preset_name, params_json, pid, version, is_active, doc_log in res:
+            presets.append({
+                "indicator_id": indicator_id,
+                "preset_name": preset_name,
+                "params": _parse_json_field(params_json) if params_json else {},
+                "plugin_id": pid,
+                "version": version,
+                "is_active_batch": bool(is_active),
+                "doc_log": str(doc_log) if doc_log else "",
+            })
+        return presets
+
+    def set_plugin_preset_doc_log(self, indicator_id: str, preset_name: str,
+                                  doc_log: str) -> None:
+        """Persistiert das Doc-Log (Negativ-Wissen) eines Plugin-Presets.
+
+        20.04 (Q7): analog ServiceInstanceConfig.doc_log – Freitextfeld,
+        das im MasterTree-Clone-Tooltip angezeigt wird. Additiv: bestehende
+        Presets ohne Eintrag bleiben unangetastet (doc_log = NULL).
+        """
+        con = self._get_connection()
+        con.execute(
+            "UPDATE indicator_presets SET doc_log = ? "
+            "WHERE indicator_id = ? AND preset_name = ?",
+            [(doc_log or "").strip() or None, indicator_id, preset_name])
 
     def list_indicator_presets(self, indicator_id: str) -> List[str]:
         con = self._get_connection()

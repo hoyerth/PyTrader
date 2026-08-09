@@ -613,6 +613,7 @@ class FeatureBuilder:
         timeframe: str,
         payload: Dict[str, Any],
         con: Optional = None,
+        instance_hash: Optional[str] = None,
     ) -> int:
         """
         Schreibt den feature_store_payload eines Plugins (Phase 12 Hybrid-Schema)
@@ -624,6 +625,15 @@ class FeatureBuilder:
         PK-Migration auf (symbol, timeframe, bar_time, feature_id)) koennen
         MEHRERE Services denselben (symbol, timeframe, bar_time)-Schluessel
         tragen; feature_id des Payloads ist der Trenner.
+
+        20.04 (Q9): Optionaler `instance_hash` (8-stelliger SHA256-Short-Hash
+        der Parameter-Variante) wird in die neue Spalte `instance_hash`
+        geschrieben – nur wenn gesetzt, sonst NULL (bestehende Hashes werden
+        beim Upsert NICHT durch NULL ueberschrieben, COALESCE). Der Aufrufer
+        (SetEvaluator / HistoricalScanner / LiveAnalyzer) uebergibt den Hash
+        der ausgeführten Instanz, damit Signal-/Metrik-Ergebnisse verschiedener
+        Clones in DuckDB getrennt und einzeln auswertbar sind (Multi-Clone-
+        Vergleich, §4). feature_id bleibt plugin_id (Q1).
 
         payload: {"feature_id", "plugin_version", "records": [{bar_time, ...}]}
         """
@@ -647,7 +657,8 @@ class FeatureBuilder:
                     continue
                 dt_val = _to_utc_datetime(rec["bar_time"])
                 data = {k: v for k, v in rec.items() if k != "bar_time"}
-                rows.append((symbol, timeframe, dt_val, feature_id, plugin_version, json.dumps(data)))
+                rows.append((symbol, timeframe, dt_val, feature_id,
+                             plugin_version, json.dumps(data), instance_hash))
             if not rows:
                 return 0
 
@@ -668,7 +679,7 @@ class FeatureBuilder:
             df_rows = pd.DataFrame(
                 rows,
                 columns=["symbol", "timeframe", "bar_time", "feature_id",
-                         "plugin_version", "feature_data"],
+                         "plugin_version", "feature_data", "instance_hash"],
             )
             con.register("df_temp", df_rows)
             try:
@@ -680,17 +691,23 @@ class FeatureBuilder:
                 # ohne die explizite Spalte waeren neue Rows created_at=NULL
                 # und das Datum der letzten Ausfuehrung ('DD.MM.JJ' im
                 # MasterTree) bliebe fuer neu berechnete Services '--.--.--'.
+                #
+                # 20.04 (Q9): instance_hash wird beim Upsert mitgeschrieben;
+                # COALESCE verhindert, dass ein NULL (Aufrufer ohne Hash) einen
+                # bestehenden Varianten-Hash ueberschreibt.
                 con.execute("""
                     INSERT INTO feature_store
                         (symbol, timeframe, bar_time, feature_id,
-                         plugin_version, feature_data, created_at)
+                         plugin_version, feature_data, instance_hash, created_at)
                     SELECT symbol, timeframe, bar_time, feature_id,
-                           plugin_version, feature_data, now()
+                           plugin_version, feature_data, instance_hash, now()
                     FROM df_temp
                     ON CONFLICT (symbol, timeframe, bar_time, feature_id) DO UPDATE SET
                         feature_id = EXCLUDED.feature_id,
                         plugin_version = EXCLUDED.plugin_version,
                         feature_data = EXCLUDED.feature_data,
+                        instance_hash = COALESCE(
+                            EXCLUDED.instance_hash, feature_store.instance_hash),
                         created_at = now()
                 """)
             finally:
@@ -702,6 +719,40 @@ class FeatureBuilder:
         finally:
             if own_connection:
                 con.close()
+
+    def purge_instance_data(self, instance_hash: str) -> int:
+        """Loescht alle feature_store-Rows einer Parameter-Variante (20.04, Q5).
+
+        `DELETE FROM feature_store WHERE instance_hash = ?` – ausschliesslich
+        im Schreib-/Store-Kontext (FeatureBuilder). Der `FeatureStoreReader`
+        bleibt 100 % read-only (MVVM-Invariante). Behaelt MasterTree-Struktur,
+        Parameter-Settings und `doc_log` vollstaendig bei – nur die
+        DB-Daten der Variante werden entfernt (`feature_id` bleibt plugin_id
+        und wird NICHT geloescht, Q1; andere Varianten/Instanzen bleiben
+        unangetastet).
+
+        Args:
+            instance_hash: 8-stelliger Parameter-Hash (generate_instance_hash).
+
+        Returns:
+            Anzahl der geloeschten Rows (0 bei leerem Hash/keinem Treffer).
+        """
+        if not instance_hash:
+            return 0
+        # DbPool verwaltet die Connection thread-lokal (Invariante 6) –
+        # NICHT schliessen (Muster store_plugin_payload: own_connection=False
+        # bei DbPool.get; ein close() wuerde die Pool-Connection korrumpieren).
+        con = DbPool.get(DB_ANALYTICS)
+        try:
+            result = con.execute(
+                "DELETE FROM feature_store WHERE instance_hash = ? "
+                "RETURNING feature_id",
+                [instance_hash])
+            rows = result.fetchall() if result is not None else []
+            return len(rows or [])
+        except Exception:
+            # Defensiv: keine Exception in den UI-Pfad durchreichen.
+            return 0
 
     def build(
         self,

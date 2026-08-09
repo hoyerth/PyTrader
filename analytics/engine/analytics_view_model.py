@@ -23,7 +23,7 @@ Aufgaben (15.03-Spezifikation):
    emittiert (Invariante 5 / zentraler EventBus, Payload = Profil-Name).
 """
 
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
@@ -1006,7 +1006,8 @@ class AnalyticsViewModel(QObject):
         except Exception:
             return key
 
-    def resolve_service_display_name(self, plugin_id: str) -> str:
+    def resolve_service_display_name(self, plugin_id: str,
+                                     preset_name: Optional[str] = None) -> str:
         """Service-Name OHNE Kategorie-Pfad, direkt aus dem Service-Objekt.
 
         09.08.2026 (User-Meldung 'Feld'-Dropdown): Der Name wird DIREKT aus
@@ -1019,6 +1020,11 @@ class AnalyticsViewModel(QObject):
         'Service'-Suffix, das wie ein MasterTree-Pfad-Bestandteil wirkt).
         Kein Kategorie-Pfad. Unbekannte/entfernte IDs -> lesbarer Pretty-
         Fallback (defensiv). Rein lesend, kein SQL.
+
+        20.04 (Q2, §4): Optionaler `preset_name` ergaenzt das Label um
+        ' ({Preset_Name})' – Anzeige-Format '{Service} ({Preset}) /
+        {Parameter}' fuer Parameter-Varianten (Clones). Ohne preset_name
+        bleibt das Label unveraendert (Zero-Regression).
         """
         key = str(plugin_id or "").strip()
         if not key or key.lower() in ("none", "native") \
@@ -1050,9 +1056,61 @@ class AnalyticsViewModel(QObject):
                     name = name[len(prefix):]
                     break
             pretty = name.replace("_", " ").title()
-            return pretty or key
+            if not pretty:
+                pretty = key
+            # 20.04 (Q2): Preset-Name (Variante) in Klammern ergaenzen.
+            preset = str(preset_name or "").strip()
+            if preset:
+                pretty = f"{pretty} ({preset})"
+            return pretty
         except Exception:
             return key
+
+    def resolve_instance_hashes(self,
+                                hashes: Iterable[str]) -> List[str]:
+        """Loest instance_hash-Werte transparent auf plugin_ids auf (20.04, Q2).
+
+        Quelle: Plugin-Presets/Clones des `ServiceSelectorModel`
+        (`plugin_presets()`, in refresh() aus indicator_presets geladen) –
+        die Zuordnung Hash -> plugin_id ist dort deterministisch ueber
+        `generate_instance_hash` abgelegt. Rueckgabe: deduplizierte
+        plugin_ids (Reihenfolge erhalten, case-insensitiv). Hashes ohne
+        Treffer werden verworfen (defensiv). Der Filter bleibt dadurch auf
+        `WHERE feature_id IN (plugin_ids)` – die Varianten-Aufloesung
+        passiert transparent im ViewModel (kein SQL, rein lesend).
+
+        Beispiel: `resolve_instance_hashes(["a91f3b"])` -> ["srv_swing_pivot"].
+        """
+        wanted = {str(h or "").strip()
+                  for h in (hashes or []) if str(h or "").strip()}
+        if not wanted:
+            return []
+        model = self._selector_model
+        if model is None:
+            from analytics.engine.service_selector_model import ServiceSelectorModel
+            model = ServiceSelectorModel(parent=self)
+            self._selector_model = model
+        result: List[str] = []
+        seen: Set[str] = set()
+        try:
+            presets = model.plugin_presets() or {}
+            for pid, clones in presets.items():
+                if not clones or not isinstance(clones, list):
+                    continue
+                for clone in clones:
+                    if not isinstance(clone, dict):
+                        continue
+                    h = str(clone.get("instance_hash") or "").strip()
+                    if not h or h not in wanted:
+                        continue
+                    if str(pid).lower() not in seen:
+                        seen.add(str(pid).lower())
+                        result.append(str(pid))
+                    # Ein plugin_id pro Hash genuegt (dedupliziert).
+                    wanted.discard(h)
+        except Exception:
+            pass
+        return result
 
     @property
     def max_lookback_limit(self) -> int:
