@@ -70,35 +70,35 @@ SENTINEL_NATIVE = "native"
 # Heatmap-Achsen (15.03-Spezifikation): X = Wochentage, Y = Tagesstunden
 # Berlin Wanduhr. Matrix: rows = Stunde (0-23), cols = DOW (0=Sonntag..6).
 DOW_LABELS = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"]
+# 20.02.01 (E5): Wochentag-Skala strikt Montag-Freitag (DuckDB Mo=1..Fr=5).
+DOW_WEEK_LABELS = ("Mo", "Di", "Mi", "Do", "Fr")
 HOURS_PER_DAY = 24
 DAYS_PER_WEEK = 7
 
 # 20.02 (Generische 2D-Heatmap-Engine, Kapitel 20.02 §2 / Review E4-E6):
 # DIM_MAPPINGS – Whitelist fuer die SQL-Dimensionen von fetch_generic_heatmap().
-# Wanduhr-Garantie (Invariante 7): dow/hour/dow_hour/date nutzen die
+# Wanduhr-Garantie (Invariante 7): dow/hour/date nutzen die
 # UTC-Forcierung `bar_time AT TIME ZONE 'UTC'` (die gespeicherten Werte sind
 # Wanduhr-encoded; die UTC-Darstellung IST die Wanduhr-Zeit). E4: `date` wird
 # WIE dow/hour mit der UTC-Forcierung extrahiert – das Kapitel-Literal
 # `CAST(bar_time AS DATE)` waere DST-fragil (Session-TZ Berlin +1/+2h).
-# Nachtrag (Umsetzung): `dow_hour` wird als GANZZAHL (DOW*24+HOUR) encodiert
-# statt des Kapitel-Literals `|| '_' ||` – String-Konkatenation sortiert
-# lexikografisch falsch ("10_" < "9_"); der Integer encodiert die natuerliche
-# Sortierreihenfolge (Mo_00..So_23) und _format_dim_value() dekodiert wieder.
+# 20.02.01 (E6): `dow_hour` ist ersatzlos entfernt (Kapitel-Vorgabe) – die
+# Kombination ist ueber die Dimensionen `dow` (Mo-Fr) und `hour` (Tageszeit)
+# abbildbar; Alt-Profil-/Workspace-Werte werden im ViewModel per Sanitizer
+# auf "hour" abgebildet.
 DIM_MAPPINGS = {
     "date": "CAST(bar_time AT TIME ZONE 'UTC' AS DATE)",
     "dow": "EXTRACT(DOW FROM bar_time AT TIME ZONE 'UTC')::INTEGER",
     "hour": "EXTRACT(HOUR FROM bar_time AT TIME ZONE 'UTC')::INTEGER",
-    "dow_hour": "((EXTRACT(DOW FROM bar_time AT TIME ZONE 'UTC')::INTEGER * "
-                "24 + EXTRACT(HOUR FROM bar_time AT TIME ZONE 'UTC')::INTEGER)"
-                ")::INTEGER",
     "timeframe": "LOWER(timeframe)",
     "service_id": "LOWER(feature_id)",
     "symbol": "LOWER(symbol)",
 }
 
 # 20.02: Verfuegbare Dimensionen / Aggregationen (UI-Combos, E1/E5).
+# 20.02.01 (E6): `dow_hour` entfernt.
 HEATMAP_DIMENSIONS = (
-    "date", "dow", "hour", "dow_hour", "timeframe", "service_id", "symbol",
+    "date", "dow", "hour", "timeframe", "service_id", "symbol",
 )
 HEATMAP_AGGREGATIONS = (
     "count", "confluence_count", "avg", "sum", "min", "max",
@@ -297,9 +297,9 @@ class FeatureStoreReader:
         """Formatiert einen Dimensions-Rohwert fuer Achsen-Beschriftungen.
 
         20.02 (generische Heatmap): `date` -> 'TT.MM.', `hour` -> 'HH:00',
-        `dow` -> DOW_LABELS-Kurzname, `dow_hour` -> 'So_00'..'Sa_23'
-        (Dekodierung der Ganzzahl DOW*24+HOUR, siehe DIM_MAPPINGS). Alle
-        anderen Dimensionen (timeframe/service_id/symbol) -> Rohwert-String.
+        `dow` -> Mo-Fr-Kurzname (20.02.01 E5, DOW_WEEK_LABELS; Sonntag/
+        Samstag werden per SQL-Filter ausgeschlossen). Alle anderen
+        Dimensionen (timeframe/service_id/symbol) -> Rohwert-String.
         """
         try:
             if dim == "date":
@@ -309,12 +309,9 @@ class FeatureStoreReader:
             if dim == "hour":
                 return f"{int(value):02d}:00"
             if dim == "dow":
-                return DOW_LABELS[int(value)]
-            if dim == "dow_hour":
                 v = int(value)
-                dow, hour = divmod(v, 24)
-                if 0 <= dow < DAYS_PER_WEEK and 0 <= hour < HOURS_PER_DAY:
-                    return f"{DOW_LABELS[dow]}_{hour:02d}"
+                if 1 <= v <= len(DOW_WEEK_LABELS):
+                    return DOW_WEEK_LABELS[v - 1]
                 return str(value)
         except (TypeError, ValueError):
             pass
@@ -328,8 +325,8 @@ class FeatureStoreReader:
         TradingView-aehnliche Achsen-Darstellung tragen die Achsen die
         NATUERLICHEN Werte statt Zell-Indizes:
           - `date`      -> Wanduhr-Mitternachts-Epoch (Sekunden)
-          - hour/dow    -> die ganzzahligen Werte (0-23 bzw. 0-6)
-          - dow_hour    -> 0..167 (Mo_00..So_23)
+          - hour        -> die ganzzahligen Stunden (0-23)
+          - dow         -> 1..5 (Montag-Freitag, 20.02.01 E5)
           - kategorial  -> Indizes 0..n-1 (timeframe/service_id/symbol)
         Das Widget mappt das ImageItem per setRect auf diesen Bereich und
         erzeugt dynamische Ticks je Zoom-Level (bis zur Minute bei Datum).
@@ -353,7 +350,7 @@ class FeatureStoreReader:
                     except (TypeError, ValueError):
                         out.append(0.0)
             return out
-        if dim in ("hour", "dow", "dow_hour"):
+        if dim in ("hour", "dow"):
             try:
                 return [float(int(v)) for v in values]
             except (TypeError, ValueError):
@@ -423,6 +420,75 @@ class FeatureStoreReader:
             return keys
         # numeric_only: jeder Key muss durchgaengig numerisch (nicht bool/null/str)
         return [k for k in keys if key_types[k] == {"num"}]
+
+    def feature_keys_by_service(
+        self,
+        symbol: str,
+        timeframe: str,
+        numeric_only: bool = False,
+    ) -> Dict[str, List[str]]:
+        """feature_data-JSON-Keys je feature_id (20.02.01, Feld-Dropdown).
+
+        Ordnet jedem Service (feature_id) die JSON-Keys zu, die er im
+        feature_data liefert – Grundlage fuer das 'Feld'-Dropdown der
+        generischen Heatmap ('{Service} / {Key}', User-Meldung 3b). Die
+        Typ-Logik ist identisch zu `available_feature_keys`: bei
+        `numeric_only=True` muss ein Key in ALLEN Vorkommen des jeweiligen
+        Services numerisch sein (int/float, kein bool/null/str).
+
+        Zeilen ohne feature_id (Legacy/native) werden unter "" gruppiert;
+        das Repository ignoriert sie (Dropdown-Fallback: Roh-Key ohne
+        Service-Prefix).
+
+        Returns:
+            {feature_id: [sortierte JSON-Keys...]} – leer bei fehlender
+            DB/Tabelle oder Fehler (defensiv, rein lesend).
+        """
+        if not symbol or not timeframe:
+            return {}
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT DISTINCT feature_id, feature_data
+                FROM feature_store
+                WHERE LOWER(symbol) = LOWER(?)
+                  AND LOWER(timeframe) = LOWER(?)
+                  AND feature_data IS NOT NULL
+            """, [symbol, timeframe]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] feature_keys_by_service "
+                  f"fehlgeschlagen: {e}")
+            return {}
+
+        key_types: Dict[str, Dict[str, set]] = {}
+        for fid, raw in rows:
+            data = self._normalize_feature_data(raw)
+            if not isinstance(data, dict):
+                continue
+            service = str(fid) if fid is not None else ""
+            bucket = key_types.setdefault(service, {})
+            for k, v in data.items():
+                if k == "schema_version" or not str(k).strip():
+                    continue
+                key = str(k)
+                if isinstance(v, bool):
+                    t = "bool"
+                elif isinstance(v, (int, float)):
+                    t = "num"
+                elif v is None:
+                    t = "null"
+                else:
+                    t = "str"
+                bucket.setdefault(key, set()).add(t)
+
+        out: Dict[str, List[str]] = {}
+        for service, bucket in key_types.items():
+            keys = sorted(bucket.keys())
+            if numeric_only:
+                keys = [k for k in keys if bucket[k] == {"num"}]
+            if keys:
+                out[service] = keys
+        return out
 
     def fetch_columns(
         self,
@@ -639,13 +705,15 @@ class FeatureStoreReader:
         """Aggregiert eine generische 2D-Matrix ueber zwei Dimensionen.
 
         20.02 (additiv, E1/E5/E6): Freie Dimensionen via `DIM_MAPPINGS`
-        (date/dow/hour/dow_hour/timeframe/service_id/symbol), Aggregationen
-        COUNT / CONFLUENCE_COUNT (COUNT(DISTINCT feature_id)) sowie
-        AVG/SUM/MIN/MAX ueber einen numerischen feature_data-JSON-Key
-        (`field`, via TRY_CAST – Muster fetch_heatmap). HIT_RATE entfaellt
-        in V1 (E5: kein Schwellwert spezifiziert).
+        (date/dow/hour/timeframe/service_id/symbol – 20.02.01 E6: `dow_hour`
+        entfernt), Aggregationen COUNT / CONFLUENCE_COUNT
+        (COUNT(DISTINCT feature_id)) sowie AVG/SUM/MIN/MAX ueber einen
+        numerischen feature_data-JSON-Key (`field`, via TRY_CAST – Muster
+        fetch_heatmap). HIT_RATE entfaellt in V1 (E5: kein Schwellwert
+        spezifiziert). 20.02.01 (E5): `dow`-Achsen sind strikt Montag-Freitag
+        (zusätzliche WHERE-Bedingung `BETWEEN 1 AND 5`, DuckDB Mo=1..Fr=5).
 
-        Wanduhr-Garantie (Invariante 7 / E4): date/dow/hour/dow_hour werden
+        Wanduhr-Garantie (Invariante 7 / E4): date/dow/hour werden
         mit `bar_time AT TIME ZONE 'UTC'` extrahiert (die gespeicherten Werte
         sind Wanduhr-encoded; die UTC-Darstellung IST die Wanduhr-Zeit).
 
@@ -723,6 +791,11 @@ class FeatureStoreReader:
         conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
         params: List[Any] = [symbol, timeframe]
         self._apply_feature_filter(feature_ids, feature_id, conditions, params)
+        # 20.02.01 (E5): `dow`-Achse strikt Montag-Freitag (DuckDB Mo=1..Fr=5).
+        if x_key == "dow" or y_key == "dow":
+            conditions.append(
+                "EXTRACT(DOW FROM bar_time AT TIME ZONE 'UTC')::INTEGER "
+                "BETWEEN 1 AND 5")
 
         if limit:
             sql = f"""
@@ -805,8 +878,8 @@ class FeatureStoreReader:
             # Rohwerte als ISO-Strings (Candle-Overlay-E9: Datum -> Datumsobjekt)
             "x_values": [str(v) for v in x_values],
             # 20.02-Bugfix (09.08.2026): Natuerliche Achsen-Koordinaten
-            # (date -> Mitternachts-Epochs, hour/dow_hour -> Ganzzahlen,
-            # kategorial -> Indizes) fuer die dynamischen Achsen-Ticks.
+            # (date -> Mitternachts-Epochs, hour/dow -> Ganzzahlen, dow 1..5
+            # Mo-Fr, kategorial -> Indizes) fuer die dynamischen Achsen-Ticks.
             "x_axis": self._axis_coords(x_key, x_values),
             "y_axis": self._axis_coords(y_key, y_values),
             "min_val": min_val,

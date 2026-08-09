@@ -136,12 +136,24 @@ class AnalyticsRepository:
               "matrix": dense M x N, "x_labels"/"y_labels", "x_values",
               "min_val"/"max_val", "x_dim"/"y_dim"/"agg"/"field",
               "metrics": ["count", "confluence_count", ...numerische JSON-Keys],
+              "field_sources": {Key: [service_id...]} (20.02.01, Meldung 3b),
               "symbol", "timeframe",
             }
         """
         avail = self.reader.available_feature_keys(
             symbol, timeframe, numeric_only=True)
         metrics = ["count", "confluence_count"] + avail
+        # 20.02.01 (User-Meldung 3b): Welcher Service liefert welchen
+        # numerischen JSON-Key? Fuer das 'Feld'-Dropdown
+        # ('{Service} / {Key}', `srv_`-Prefix entfaellt im Widget).
+        by_service = self.reader.feature_keys_by_service(
+            symbol, timeframe, numeric_only=True)
+        field_sources: Dict[str, List[str]] = {}
+        for fid, keys in by_service.items():
+            if not fid:
+                continue  # Legacy-Rows ohne feature_id -> kein Service-Prefix
+            for k in keys:
+                field_sources.setdefault(k, []).append(fid)
         use_agg = str(agg or "count").lower()
         use_field = str(field or "")
         # E6: Bei Wert-Aggregationen (AVG/SUM/MIN/MAX) ist `field` ein
@@ -161,6 +173,7 @@ class AnalyticsRepository:
             result = self.reader._empty_generic_heatmap(
                 x_dim, y_dim, use_agg, use_field or None, symbol, timeframe)
         result["metrics"] = metrics
+        result["field_sources"] = field_sources
         return result
 
     # ------------------------------------------------------------------

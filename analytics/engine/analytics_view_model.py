@@ -314,10 +314,11 @@ class AnalyticsViewModel(QObject):
         x_dim/y_dim aus DIM_MAPPINGS (case-insensitiv), `agg` eine der
         HEATMAP_AGGREGATIONS, `field` der numerische feature_data-JSON-Key
         (E6: nur bei AVG/SUM/MIN/MAX relevant; COUNT/CONFLUENCE_COUNT
-        ignorieren ihn). Ohne Aenderung idempotent (kein Refresh).
+        ignorieren ihn). 20.02.01 (E6): `dow_hour` wird per Sanitizer auf
+        "hour" abgebildet. Ohne Aenderung idempotent (kein Refresh).
         """
-        x_dim = str(x_dim or "date").lower()
-        y_dim = str(y_dim or "hour").lower()
+        x_dim = self._sanitize_dim(x_dim or "date")
+        y_dim = self._sanitize_dim(y_dim or "hour")
         agg = str(agg or "confluence_count").lower()
         field = str(field or "")
         changed = (x_dim != self._params.get("heatmap_x_dim")
@@ -373,6 +374,19 @@ class AnalyticsViewModel(QObject):
         lo = max(0.0, min(1.0, lo))
         hi = max(0.0, min(1.0, hi))
         return [lo, hi] if hi > lo else [0.0, 1.0]
+
+    @staticmethod
+    def _sanitize_dim(value) -> str:
+        """Bereinigt eine Heatmap-Dimension (20.02.01, E6).
+
+        `dow_hour` ist ersatzlos aus DIM_MAPPINGS/HEATMAP_DIMENSIONS entfernt.
+        Alt-Profil-/Workspace-/Config-Werte mit `dow_hour` werden auf die
+        gueltige Dimension "hour" (Tageszeit) abgebildet – sonst wuerde
+        `_set_combo_data` (additives Hinzufuegen unbekannter Werte) die
+        entfernte Dimension wieder in die UI-Combos aufnehmen.
+        """
+        dim = str(value or "").lower()
+        return "hour" if dim == "dow_hour" else dim
 
     def set_scatter_columns(self, x_column: str, y_column: str) -> None:
         # 19.02 (Cleanup): Leere Werte = Repo-Default (erste numerische
@@ -710,6 +724,11 @@ class AnalyticsViewModel(QObject):
         # _flatten_payload() bildet es NICHT auf flache _params ab. Explizit
         # aufloesen (E3: additiv, kein Schema-Bump auf v2.1).
         self._apply_heatmap_section(flat.get("heatmap"))
+        # 20.02.01 (E6): Alt-Payloads mit `dow_hour` (flach ODER via
+        # charts.heatmap) auf die gueltige Dimension "hour" abbilden.
+        for _hk in ("heatmap_x_dim", "heatmap_y_dim"):
+            if self._params.get(_hk) == "dow_hour":
+                self._params[_hk] = "hour"
         self._params["feature_ids"] = self._normalize_feature_ids(
             self._params.get("feature_ids"))
         # 20.01 (E5): Fehlende Services isolieren – valide IDs direkt setzen.
@@ -735,9 +754,9 @@ class AnalyticsViewModel(QObject):
         if not isinstance(heat, dict):
             return
         if heat.get("x_dim") is not None:
-            self._params["heatmap_x_dim"] = str(heat["x_dim"]).lower()
+            self._params["heatmap_x_dim"] = self._sanitize_dim(heat["x_dim"])
         if heat.get("y_dim") is not None:
-            self._params["heatmap_y_dim"] = str(heat["y_dim"]).lower()
+            self._params["heatmap_y_dim"] = self._sanitize_dim(heat["y_dim"])
         if heat.get("agg") is not None:
             self._params["heatmap_agg"] = str(heat["agg"]).lower()
         if heat.get("field") is not None:
@@ -824,6 +843,10 @@ class AnalyticsViewModel(QObject):
         for key in list(self._params.keys()):
             if key in params and params[key] is not None:
                 self._params[key] = params[key]
+        # 20.02.01 (E6): Alt-Workspaces mit `dow_hour` -> "hour" (Tageszeit).
+        for _hk in ("heatmap_x_dim", "heatmap_y_dim"):
+            if self._params.get(_hk) == "dow_hour":
+                self._params[_hk] = "hour"
         self._params["feature_ids"] = self._normalize_feature_ids(
             self._params.get("feature_ids"))
         valid, missing = self._resolve_feature_ids(self._params["feature_ids"])
@@ -945,6 +968,43 @@ class AnalyticsViewModel(QObject):
                 str(symbol or ""), str(timeframe or ""))
         except Exception:
             return []
+
+    # ------------------------------------------------------------------
+    # 20.02.01 (E8): Lesbares Service-Label fuer die service_id-Dimension
+    # ------------------------------------------------------------------
+    def resolve_service_label(self, plugin_id: str) -> str:
+        """Lesbares Service-Label '{Kategorie} / {Name}' (20.02.01, E8).
+
+        Formatiert eine `service_id`-Dimension der generischen Heatmap:
+        das `srv_`-Prefix entfaellt (metadata['display_name'], z. B.
+        'Trend Breakout'), der Kategorie-Pfad (plugin_category_path,
+        Slash -> ' / ') wird vorangestellt (z. B.
+        'Swing Points / Trend Breakout'). Unbekannte/entfernte IDs ->
+        Rohwert (defensiv). Lazy `_selector_model` (Muster
+        `_resolve_feature_ids`), rein lesend, kein SQL.
+        """
+        key = str(plugin_id or "").strip()
+        if not key:
+            return ""
+        model = self._selector_model
+        if model is None:
+            from analytics.engine.service_selector_model import ServiceSelectorModel
+            model = ServiceSelectorModel(parent=self)
+            self._selector_model = model
+        try:
+            plugin = model.get_plugin(key)
+            if plugin is None:
+                return key
+            meta = getattr(plugin, "metadata", {}) or {}
+            name = str(meta.get("display_name") or key)
+            if name.lower().startswith("srv_"):
+                name = name[4:]
+            category = str(model.plugin_category_path(key) or "")
+            if category:
+                return f"{category} / {name}"
+            return name
+        except Exception:
+            return key
 
     @property
     def max_lookback_limit(self) -> int:

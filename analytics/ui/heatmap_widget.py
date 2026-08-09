@@ -26,15 +26,31 @@ Bugfix 09.08.2026 (User-Meldungen 1-6):
    die Matrix). Das Overlay nutzt `QUERY_DAILY_OHLC` (SQL-seitig pro Tag
    aggregiert) und deckt damit den gesamten Heatmap-Zeitraum ab.
 3) Die Achsen tragen die NATUERLICHEN Werte (date -> Mitternachts-Epochs,
-   hour/dow_hour -> Ganzzahlen, kategorial -> Indizes); das ImageItem wird
-   per setRect exakt auf diesen Bereich gemappt – nichts wird mehr ueber
-   die Tagesgrenze hinaus gezeichnet.
+   hour/dow -> Ganzzahlen, dow 1..5 Mo-Fr, kategorial -> Indizes); das
+   ImageItem wird per setRect exakt auf diesen Bereich gemappt – nichts wird
+   mehr ueber die Tagesgrenze hinaus gezeichnet.
 4) Achsen-Zuordnung ist explizit (x_dim -> X, y_dim -> Y), kein Vertauschen
    mehr moeglich.
 5) Dynamische X-Ticks je Zoom-Level: date -> Jahre/Monate/Tage -> Stunden ->
-   Minuten (bis zur Minute, wie Chartfenster/TradingView).
-6) Dasselbe Prinzip gilt fuer die Y-Achse und alle Massstaebe (hour,
-   dow_hour, kategorial): je Zoom-Level werden mehr Zwischenwerte angezeigt.
+   Minuten (bis zur Minute, wie Chartfenster/TradingView) – 20.02.01 E1:
+   5 Format-Stufen (YYYY / TT.MM.JJ / DDD TT.MM.JJ / DDD TT.MM.JJ HH:00 /
+   DDD TT.MM.JJ HH:mm), Wanduhr-Garantie via UTC-Darstellung.
+6) Dasselbe Prinzip gilt fuer die Y-Achse und alle Massstaebe (hour, dow,
+   kategorial): je Zoom-Level werden mehr Zwischenwerte angezeigt.
+
+20.02.01 (E2-E8, 09.08.2026): "Stunde" -> "Tageszeit" (E2, feste Skala
+00:00-23:59, E3); Achsen-Label mit UTC-Offset (E4); `dow` strikt
+Montag-Freitag (E5); `dow_hour` ersatzlos entfernt (E6); Overlay-Zoom-Lock
+exklusiv bei X=date (E7); service_id-Achsen-Labels via ViewModel-Resolver
+'{Kategorie} / {Name}' (E8).
+
+20.02.01 (User-Meldungen 1-3, 09.08.2026): (1) Tageszeit-Achse bleibt beim
+Rauszoomen auf die feste Skala 00:00-23:59 begrenzt (keine -/+ Werte
+ausserhalb; tickValues-Clamping, kein `% 24`-Wrap mehr); (2) Wochentag-Achse
+ebenso strikt Mo-Fr (1..6, halboffene Grenze); (3) 'Feld'-Dropdown deutlich
+laenger (320-460 px) und jeder Eintrag traegt den Service-Namen, aus dem der
+Wert stammt ('{Service} / {Key}', `srv_`-Prefix entfaellt, via
+ViewModel-Resolver + Repository-`field_sources`).
 """
 
 import math
@@ -60,8 +76,10 @@ from analytics.engine.analytics_worker import (
 )
 from analytics.engine.feature_store_reader import (
     DOW_LABELS,
+    DOW_WEEK_LABELS,
     HEATMAP_AGGREGATIONS,
     HEATMAP_DIMENSIONS,
+    HOURS_PER_DAY,
 )
 
 # E7: Konfluenz-Farbskala (0 = weiss/transparent, 1-2 = gelb/cyan,
@@ -79,12 +97,15 @@ _VALUE_AGGS = ("avg", "sum", "min", "max")
 # Tag in Sekunden (Wanduhr-Epoch-Basis fuer date-Achse).
 _DAY_SECONDS = 86400
 _HALF_DAY = 43200.0
+# 20.02.01 (E1): Stufen-Schwellen des Datums-Formatters (Monat/Jahr).
+_MONTH_SECONDS = 2_592_000
+_YEAR_SECONDS = 31_536_000
 
 _DIM_LABELS = {
     "date": "Datum",
     "dow": "Wochentag",
-    "hour": "Stunde",
-    "dow_hour": "Wochentag × Stunde",
+    # 20.02.01 (E2): "Stunde" -> "Tageszeit" (feste Skala 00:00-23:59, E3).
+    "hour": "Tageszeit",
     "timeframe": "Timeframe",
     "service_id": "Service",
     "symbol": "Symbol",
@@ -146,10 +167,11 @@ class _HeatmapAxis(pg.AxisItem):
     """Achse mit dynamischen Ticks je Zoom-Level (Bugfix 09.08.2026).
 
     Die Achse traegt NATUERLICHE Werte (date -> Wanduhr-Epochs,
-    hour/dow_hour -> Ganzzahlen, kategorial -> Indizes) und formatiert die
+    hour/dow -> Ganzzahlen, kategorial -> Indizes) und formatiert die
     Tick-Beschriftung abhaengig vom sichtbaren Bereich:
-      - date:  Tage (grober Zoom) -> Stunden -> Minuten (enger Zoom)
-      - hour/dow_hour: ganzzahlige Schritte, beim Zoom mehr Zwischenwerte
+      - date:  5 Format-Stufen je Zoom (Jahr/Monat/Tag/Stunde/Minute,
+               20.02.01 E1)
+      - hour/dow: ganzzahlige Schritte, beim Zoom mehr Zwischenwerte
       - kategorial: Labels aus der zugehoerigen Liste
     """
 
@@ -164,6 +186,27 @@ class _HeatmapAxis(pg.AxisItem):
         self._labels = list(labels or [])
 
     # ------------------------------------------------------------------
+    def _clamped_scale_bounds(self, minVal, maxVal):
+        """Clampt den sichtbaren Bereich auf die feste Skala (Meldungen 1+2).
+
+        `hour` (Tageszeit) und `dow` (Wochentag) haben FESTE Skalen
+        (0..24 bzw. 1..6, siehe `_axis_bounds`). Beim Rauszoomen (Mausrad)
+        ragt der sichtbare Viewport ueber die Skala hinaus – die Ticks
+        duerfen DANN nicht ausserhalb liegen (keine -/+ Werte ausserhalb
+        00:00-23:59 bzw. Mo-Fr). Der Tick-Bereich wird daher auf die
+        Skala geclampt. `date`/kategorial bleiben unbegrenzt (daten- bzw.
+        listenbasiert).
+        """
+        lo = float(minVal)
+        hi = float(maxVal)
+        if self._dim == "hour":
+            lo = max(lo, 0.0)
+            hi = min(hi, float(HOURS_PER_DAY))
+        elif self._dim == "dow":
+            lo = max(lo, 1.0)
+            hi = min(hi, 1.0 + float(len(DOW_WEEK_LABELS)))
+        return lo, hi
+
     def tickValues(self, minVal, maxVal, maxTicks=5):
         if not self._dim:
             return super().tickValues(minVal, maxVal, maxTicks)
@@ -173,11 +216,22 @@ class _HeatmapAxis(pg.AxisItem):
             if step <= 0:
                 return super().tickValues(minVal, maxVal, maxTicks)
             return [(step, _time_ticks(float(minVal), float(maxVal), step))]
-        span = float(maxVal) - float(minVal)
+        # 20.02.01 (User-Meldungen 1+2): hour/dow auf die feste Skala
+        # geclampt – beim Rauszoomen bleibt der Bereich VOR/NACH der
+        # Tagesstunden (bzw. der 5 Wochentage) leer. Das rechte Skalenende
+        # (24 h bzw. Samstag 6) wird als halboffene Grenze ausgeschlossen,
+        # damit kein Duplikat-Label ("00:00" an Position 24) entsteht.
+        lo, hi = self._clamped_scale_bounds(minVal, maxVal)
+        if hi <= lo:
+            return []
+        span = hi - lo
         step = _nice_int_step(span, int(maxTicks))
-        start = int(math.ceil(minVal / step)) * step
-        values = [float(start + i * step)
-                  for i in range(0, int((maxVal - start) / step) + 1)]
+        start = int(math.ceil(lo / step)) * step
+        values: List[float] = []
+        v = float(start)
+        while v < hi - 1e-9:
+            values.append(v)
+            v += step
         return [(step, values)]
 
     def tickStrings(self, values, scale, spacing):
@@ -189,25 +243,34 @@ class _HeatmapAxis(pg.AxisItem):
     # ------------------------------------------------------------------
     def _format(self, v: float, spacing: float) -> str:
         if self._dim == "date":
+            # 20.02.01 (E1): 5 Format-Stufen – Wanduhr-Garantie via
+            # UTC-Darstellung der (Wanduhr-encoded) Epoch (Invariante 7,
+            # KEIN Berlin-Offset). DDD = deutscher Wochentag locale-
+            # unabhaengig ueber DOW_LABELS (So=0..Sa=6).
             dt = datetime.fromtimestamp(v, tz=dt_timezone.utc)
-            if spacing >= _DAY_SECONDS:
+            weekday = DOW_LABELS[(dt.weekday() + 1) % 7]
+            if spacing >= _YEAR_SECONDS:
+                return dt.strftime("%Y")
+            if spacing >= _MONTH_SECONDS:
                 return dt.strftime("%d.%m.%y")
-            if spacing >= 3600:
-                return dt.strftime("%d.%m. %H:%M")
-            return dt.strftime("%H:%M")
+            if spacing >= _DAY_SECONDS:
+                return f"{weekday} {dt.strftime('%d.%m.%y')}"
+            if spacing >= 2 * 3600:
+                return f"{weekday} {dt.strftime('%d.%m.%y %H:00')}"
+            return f"{weekday} {dt.strftime('%d.%m.%y %H:%M')}"
         if self._dim == "hour":
-            return f"{int(round(v)) % 24:02d}:00"
+            # 20.02.01 (User-Meldung 1): KEIN `% 24`-Wrap mehr – Werte
+            # ausserhalb der festen Skala 00:00-23:59 werden leer gelassen
+            # (das tickValues-Clamping verhindert sie bereits; defensiv).
+            vv = int(round(v))
+            if 0 <= vv < HOURS_PER_DAY:
+                return f"{vv:02d}:00"
+            return ""
         if self._dim == "dow":
             idx = int(round(v))
-            if 0 <= idx < len(DOW_LABELS):
-                return DOW_LABELS[idx]
-            return str(idx)
-        if self._dim == "dow_hour":
-            vv = int(round(v))
-            dow, hour = divmod(vv, 24)
-            if 0 <= dow < 7 and 0 <= hour < 24:
-                return f"{DOW_LABELS[dow]}_{hour:02d}"
-            return str(vv)
+            if 1 <= idx <= len(DOW_WEEK_LABELS):
+                return DOW_WEEK_LABELS[idx - 1]
+            return ""
         # Kategorial (timeframe/service_id/symbol): Labels aus der Liste.
         idx = int(round(v))
         if 0 <= idx < len(self._labels):
@@ -236,16 +299,25 @@ class HeatmapWidget(QWidget):
 
         # --- Steuerung (Zeile 1: Dimensionen/Aggregation/Feld) ---
         self._combo_x = QComboBox()
+        # 20.02.01 (E8): Mindestbreite erhoeht (laengere Achsen-Beschriftungen).
+        self._combo_x.setMinimumWidth(160)
         for d in HEATMAP_DIMENSIONS:
             self._combo_x.addItem(_DIM_LABELS.get(d, d), d)
         self._combo_y = QComboBox()
+        self._combo_y.setMinimumWidth(160)
         for d in HEATMAP_DIMENSIONS:
             self._combo_y.addItem(_DIM_LABELS.get(d, d), d)
         self._combo_agg = QComboBox()
         for a in HEATMAP_AGGREGATIONS:
             self._combo_agg.addItem(_AGG_LABELS.get(a, a), a)
         self._combo_field = QComboBox()
-        self._combo_field.setMinimumWidth(140)
+        # 20.02.01 (User-Meldung 3a): 'Feld' deutlich laenger (Eintraege
+        # tragen seit Meldung 3b den Service-Prefix '{Service} / {Key}').
+        self._combo_field.setMinimumWidth(320)
+        self._combo_field.setMaximumWidth(460)
+        # Popup-Dropdown an den laengsten Eintrag anpassen (vollstaendige
+        # '{Service} / {Key}'-Texte sichtbar statt Ellipsis).
+        self._combo_field.setSizeAdjustPolicy(QComboBox.AdjustToContents)
 
         ctrl = QHBoxLayout()
         ctrl.addWidget(QLabel("X-Achse:"))
@@ -432,6 +504,16 @@ class HeatmapWidget(QWidget):
         else:
             self._chk_candle.setToolTip(
                 "Kerzen-Overlay nur bei X-Achse 'Datum' verfuegbar (E9).")
+        # 20.02.01 (E7): Overlay-Zoom-Lock – die Preis-ViewBox ist NUR bei
+        # X=date UND aktivem Overlay an die Heatmap-ViewBox gekoppelt
+        # (setXLink). Bei allen anderen X-Dimensionen (oder ausgeschaltetem
+        # Overlay) wird der Link entfernt – Zoom-Sync vollstaendig entkoppelt.
+        linked = self._price_vb.linkedView(pg.ViewBox.XAxis)
+        link = can_overlay and self._chk_candle.isChecked()
+        if link and linked is None:
+            self._price_vb.setXLink(self._plot_hm.plotItem.vb)
+        if not link and linked is not None:
+            self._price_vb.setXLink(None)
 
     # ------------------------------------------------------------------
     # Konfiguration -> ViewModel (Debounce -> Worker)
@@ -478,6 +560,8 @@ class HeatmapWidget(QWidget):
         if self._syncing or self._view_model is None:
             return
         self._view_model.set_candle_projection(bool(checked))
+        # 20.02.01 (E7): Link-Zustand an den Overlay-Zustand koppeln.
+        self._update_controls()
         if checked:
             self._view_model.request_daily_ohlc()
         else:
@@ -621,20 +705,46 @@ class HeatmapWidget(QWidget):
             self._colorbar.setLevels((vmin, vmax))
 
         # ImageItem exakt auf die natuerlichen Koordinaten mappen (Bugfix 3):
-        # date-Spalten = Tage (zentriert auf Mitternacht), hour/dow_hour =
-        # ganzzahlige Werte, kategorial = Indizes. Nichts wird ueber die
-        # Tagesgrenze hinaus gezeichnet (Punkt 3).
+        # date-Spalten = Tage (zentriert auf Mitternacht), hour/dow =
+        # ganzzahlige Werte (feste Skalen, E3/E5), kategorial = Indizes.
+        # Nichts wird ueber die Tagesgrenze hinaus gezeichnet (Punkt 3).
         self._x_min, self._x_max = self._axis_bounds(self._x_axis, x_dim)
         self._y_min, self._y_max = self._axis_bounds(self._y_axis, y_dim)
         self._image.setRect(QRectF(
             self._x_min, self._y_min,
             self._x_max - self._x_min, self._y_max - self._y_min))
 
+        # 20.02.01 (E8): service_id-Achsen-Labels ueber den ViewModel-
+        # Resolver ({Kategorie} / {Name}, `srv_`-Prefix entfaellt).
+        x_labels = data.get("x_labels") or []
+        y_labels = data.get("y_labels") or []
+        if x_dim == "service_id" and self._view_model is not None:
+            x_labels = [self._view_model.resolve_service_label(str(l))
+                        for l in x_labels]
+        if y_dim == "service_id" and self._view_model is not None:
+            y_labels = [self._view_model.resolve_service_label(str(l))
+                        for l in y_labels]
         # Dynamische Achsen konfigurieren (Bugfix 5+6).
-        self._axis_x.configure(x_dim, data.get("x_labels") or [])
-        self._axis_y.configure(y_dim, data.get("y_labels") or [])
-        self._plot_hm.setLabel("bottom", _DIM_LABELS.get(x_dim, x_dim))
-        self._plot_hm.setLabel("left", _DIM_LABELS.get(y_dim, y_dim))
+        self._axis_x.configure(x_dim, x_labels)
+        self._axis_y.configure(y_dim, y_labels)
+
+        # 20.02.01 (E4): Achsen-Label der Tageszeit mit UTC-Offset –
+        # DST-robust aus dem neuesten Datumswert der Daten abgeleitet
+        # (kein Berlin-Offset, Invariante 7; die Epochs sind Wanduhr-encoded).
+        offset_epoch: Optional[float] = None
+        if x_dim == "date" and self._x_axis:
+            offset_epoch = self._x_axis[-1]
+        elif y_dim == "date" and self._y_axis:
+            offset_epoch = self._y_axis[-1]
+        offset_text = self._utc_offset_text(offset_epoch)
+        label_x = _DIM_LABELS.get(x_dim, x_dim)
+        label_y = _DIM_LABELS.get(y_dim, y_dim)
+        if x_dim == "hour":
+            label_x = f"{label_x} ({offset_text})"
+        if y_dim == "hour":
+            label_y = f"{label_y} ({offset_text})"
+        self._plot_hm.setLabel("bottom", label_x)
+        self._plot_hm.setLabel("left", label_y)
 
         self._apply_x_range()
         self._apply_y_range()
@@ -646,7 +756,19 @@ class HeatmapWidget(QWidget):
 
     @staticmethod
     def _axis_bounds(axis: List[float], dim: str):
-        """Koordinaten-Bereich [lo, hi] fuer eine Achse (natuerliche Werte)."""
+        """Koordinaten-Bereich [lo, hi] fuer eine Achse (natuerliche Werte).
+
+        20.02.01 (E3/E5): `hour` und `dow` haben FESTE Skalen unabhaengig
+        vom Datenbereich – Tageszeit 00:00-23:59 (halboffene Zellen
+        [h, h+1), Range 0..24) und Wochentag strikt Montag-Freitag
+        (Mo=1..Fr=5, Range 1..6). Das garantiert stabil vergleichbare
+        Achsen zwischen Symbolen/Timeframes. `date` bleibt datenabhaengig
+        (Mitternachts-Epochs +/- halber Tag), kategorial = Indizes 0..n-1.
+        """
+        if dim == "hour":
+            return 0.0, float(HOURS_PER_DAY)
+        if dim == "dow":
+            return 1.0, 1.0 + float(len(DOW_WEEK_LABELS))
         if not axis:
             return -0.5, 0.5
         lo = float(min(axis))
@@ -654,11 +776,54 @@ class HeatmapWidget(QWidget):
         if dim == "date":
             # Zellen = Tage, zentriert auf Mitternacht (Wanduhr).
             return lo - _HALF_DAY, hi + _HALF_DAY
-        if dim in ("hour", "dow", "dow_hour"):
-            # Ganzzahlige Werte (0-23 bzw. 0-167): Zellenbreite 1.
-            return lo - 0.5, hi + 0.5
         # Kategorial (timeframe/service_id/symbol): Indizes 0..n-1.
         return -0.5, float(len(axis)) - 0.5
+
+    def _utc_offset_text(self, epoch: Optional[float]) -> str:
+        """UTC-Offset der Berliner Wanduhr als Label-Text (20.02.01, E4).
+
+        Liefert z. B. 'UTC+2' (Sommer) bzw. 'UTC+1' (Winter) – DST-robust
+        aus dem UHRZEITPUNKT abgeleitet: Bevorzugt der neueste Datums-
+        Epoch der Daten (falls eine date-Achse vorhanden ist), sonst die
+        aktuelle Systemzeit (der Rechner laeuft in der Berliner Zeitzone,
+        vgl. Invariante 7). Die Wanduhr-Epochs werden UNABHAENGIG vom
+        Offset formatiert (UTC-Darstellung) – der Offset dient nur der
+        Information 'Tageszeit (UTC+X)'.
+        """
+        try:
+            if epoch is not None and epoch > 0:
+                ts = datetime.fromtimestamp(float(epoch))
+            else:
+                ts = datetime.now()
+            offset = ts.astimezone().utcoffset()
+            if offset is None:
+                return "UTC"
+            total = int(offset.total_seconds() // 3600)
+            sign = "+" if total >= 0 else "-"
+            return f"UTC{sign}{abs(total)}"
+        except Exception:
+            return "UTC"
+
+    def _field_label(self, key: str, service_ids: List[str]) -> str:
+        """Anzeige-Text eines Feld-Eintrags '{Service} / {Key}' (Meldung 3b).
+
+        Vor jedem feature_data-JSON-Key steht der Service-Name, aus dem der
+        Wert stammt – das `srv_`-Prefix entfaellt (resolve_service_label,
+        '{Kategorie} / {Name}', z. B. 'Swing Points / Trend Breakout').
+        Liefert ein Key aus mehreren Services, werden die Namen mit ' / '
+        verkettet (dedupliziert, deterministisch nach Payload-Reihenfolge).
+        Ohne bekannte Quelle (Legacy-Rows ohne feature_id) bleibt der
+        Roh-Key (defensiv).
+        """
+        names: List[str] = []
+        if self._view_model is not None:
+            for sid in service_ids:
+                label = self._view_model.resolve_service_label(str(sid))
+                if label and label not in names:
+                    names.append(label)
+        if names:
+            return " / ".join(names) + " / " + str(key)
+        return str(key)
 
     def _sync_combos_from_payload(self, data: Dict[str, Any]) -> None:
         """Synchronisiert die Combos mit dem tatsaechlichen Payload."""
@@ -666,6 +831,9 @@ class HeatmapWidget(QWidget):
             return
         metrics = [str(m) for m in (data.get("metrics") or [])]
         keys = [m for m in metrics if m not in ("count", "confluence_count")]
+        # 20.02.01 (User-Meldung 3b): Key -> Services, die ihn liefern
+        # (Repository `field_sources`); Anzeige '{Service} / {Key}'.
+        field_sources = data.get("field_sources") or {}
         agg = str(data.get("agg") or "")
         prev_field = str(self._combo_field.currentData() or "")
         self._syncing = True
@@ -673,7 +841,8 @@ class HeatmapWidget(QWidget):
             self._combo_field.blockSignals(True)
             self._combo_field.clear()
             for k in keys:
-                self._combo_field.addItem(k, k)
+                sids = [str(s) for s in (field_sources.get(k) or [])]
+                self._combo_field.addItem(self._field_label(k, sids), k)
             if prev_field in keys:
                 self._combo_field.setCurrentIndex(
                     self._combo_field.findData(prev_field))
