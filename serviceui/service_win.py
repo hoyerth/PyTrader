@@ -2211,13 +2211,25 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.log(f"Preset-Suche fehlgeschlagen: {e}")
         return None
 
-    def _next_preset_copy_name(self, sm, indicator_id: str,
+    def _next_preset_copy_name(self, sm, plugin_id: str,
                                base: str) -> str:
-        """Naechster freier Preset-Name '<base> (Kopie)', '(Kopie 2)', ..."""
+        """Naechster freier Preset-Name fuer eine Varianten-Kopie (Q8).
+
+        Quelle ist `list_plugin_presets(plugin_id)` (nur ECHTE Preset-Rows) –
+        NICHT `list_indicator_presets`, das den UI-Default 'Default' immer
+        fabriziert. Ist der Basis-Name (z. B. 'Default') noch GAR NICHT
+        vergeben – der Fall eines flachen Plugin-Blattes, das seine erste
+        Variante erhaelt – wird der Basis-Name direkt verwendet. Sonst
+        '<base> (Kopie)', '(Kopie 2)', ...
+        """
         try:
-            existing = set(sm.list_indicator_presets(indicator_id))
+            existing = {str(p.get("preset_name") or "")
+                        for p in (sm.list_plugin_presets(plugin_id) or [])
+                        if isinstance(p, dict)}
         except Exception:
             existing = set()
+        if base not in existing:
+            return base
         candidate = f"{base} (Kopie)"
         i = 2
         while candidate in existing:
@@ -2566,8 +2578,14 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self.log(f"Variante '{iid}' dupliziert aus '{service_id}' "
                  f"(#{copy['instance_hash']}).")
         event_bus.service_set_changed.emit()
-        if self._current_set_id == set_id:
-            self.load_set_into_editor(definition)
+        # Q8-Bugfix: Ergebnis SICHTBAR machen – das Ziel-Set wird in den
+        # Parameter-Editor geladen (neue Service-Spalte der Variante) und
+        # die neue Instanz im Baum expandiert/selektiert.
+        self.load_set_into_editor(definition)
+        tree = getattr(getattr(self, "service_selector", None),
+                       "master_tree", None)
+        if tree is not None:
+            tree.select_instance(set_id, iid)
 
     def _duplicate_preset(self, plugin_id: str, instance_hash: str) -> None:
         """Dupliziert einen Plugin-Clone als neues Preset (Q8)."""
@@ -2601,7 +2619,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             is_active = True
         if not indicator_id:
             indicator_id = plugin_id
-        new_name = self._next_preset_copy_name(sm, indicator_id, base)
+        new_name = self._next_preset_copy_name(sm, plugin_id, base)
         try:
             sm.save_indicator_preset(
                 indicator_id, new_name, params,
@@ -2617,6 +2635,13 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self.log(f"Variante '{new_name}' dupliziert aus '{base}' "
                  f"(#{new_hash}).")
         event_bus.service_set_changed.emit()
+        # Q8-Bugfix: Ergebnis SICHTBAR machen – den neuen Clone-Knoten im
+        # Baum expandieren/selektieren (ohne Editor-Overwrite; der Clone-
+        # Tooltip zeigt die kopierten Parameter).
+        tree = getattr(getattr(self, "service_selector", None),
+                       "master_tree", None)
+        if tree is not None:
+            tree.select_clone(plugin_id, new_hash)
 
     def _resolve_info_plugin(self, plugin_id: str):
         """Liefert das Plugin aus der Registry (oder None + Log-Eintrag)."""

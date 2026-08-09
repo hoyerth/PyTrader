@@ -2072,6 +2072,51 @@ class MasterTree(QTreeWidget):
         finally:
             self.blockSignals(False)
 
+    # -------------------------------------------------------------------------
+    # 20.04 (Q8-Bugfix): Programmgesteuerte Selektion nach dem Duplizieren –
+    # 'Als Variante duplizieren' muss ein SICHTBARES Ergebnis liefern. Die
+    # neuen Instanzen/Clones werden expandiert (Eltern-Kette), selektiert und
+    # in den sichtbaren Bereich gescrollt (unter blockSignals, kein Signal-
+    # Sturm auf _on_master_selection).
+    # -------------------------------------------------------------------------
+
+    def select_instance(self, set_id: str, service_id: str) -> bool:
+        """Selektiert eine Service-Instanz (TYPE_SERVICE) im Baum."""
+        return self._select_by(lambda it: (
+            it.data(0, ROLE_NODE_TYPE) == TYPE_SERVICE
+            and str(it.data(0, ROLE_SET_ID) or "") == str(set_id)
+            and str(it.data(0, ROLE_INSTANCE_ID) or "") == str(service_id)))
+
+    def select_clone(self, plugin_id: str, instance_hash: str) -> bool:
+        """Selektiert einen Clone-Knoten (TYPE_CLONE, Preset/Variante)."""
+        return self._select_by(lambda it: (
+            it.data(0, ROLE_NODE_TYPE) == TYPE_CLONE
+            and str(it.data(0, ROLE_PLUGIN_ID) or "") == str(plugin_id)
+            and str(it.data(0, ROLE_INSTANCE_HASH) or "") == str(instance_hash)))
+
+    def _select_by(self, predicate) -> bool:
+        """Iterator + Prädikat: expandieren, selektieren, scrollen."""
+        try:
+            for item in TreeItemIterator(self):
+                if item is None or not isValid(item):
+                    continue
+                try:
+                    if not predicate(item):
+                        continue
+                    self._expand_ancestors(item)
+                    self.blockSignals(True)
+                    try:
+                        self.setCurrentItem(item)
+                        self.scrollToItem(item)
+                    finally:
+                        self.blockSignals(False)
+                    return True
+                except (RuntimeError, AttributeError):
+                    continue
+        except (RuntimeError, AttributeError):
+            pass
+        return False
+
 
 class TreeItemIterator:
     """Leichter Iterator ueber alle QTreeWidgetItems (rekursiv, depth-first).
