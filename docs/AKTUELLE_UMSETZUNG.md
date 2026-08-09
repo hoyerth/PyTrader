@@ -302,3 +302,158 @@ bestehende Strukturen und Logik blieben unverändert.
 
 **Validierung:** `py_compile` OK; offscreen-Smoke-Test `BarGraphItem(x=[0.5], width=0.12, y0=9.5, height=1.0)` PASS (kein GUI-Start, keine UI-Tests gemäß harter Regel).
 
+---
+
+# 20.02.01 Heatmap-UI-Präzision: Datumsskala, feste Zeitachsen, Overlay-Zoom-Lock & Service-Anzeige
+
+## 1. Kapitel-Vorgabe (User-Anweisung, 09.08.2026)
+
+1. **Präzision Skala "Datum"** – dynamischer Zoom-Formatter für die X-Achse bei `date`:
+   - > 1 Jahr: `YYYY` / `MMM YYYY`
+   - 1 Monat–1 Jahr: `DD.MM.YY`
+   - 1 Tag–1 Monat: `DDD DD.MM.YY`
+   - 2 Std–1 Tag: `DDD DD.MM.YY HH:00`
+   - < 2 Std: `DDD DD.MM.YY HH:mm`
+   - Wanduhr-Garantie: `datetime.fromtimestamp(ts, tz=timezone.utc)` (kein Berlin-Offset).
+2. **Feste Skalen & Umbenennung:**
+   - `"Stunde"` → `"Tageszeit"` (UI + Code).
+   - Harter Range 00:00–23:59 für Tageszeit; Achsen-Label mit UTC-Offset (z. B. `Tageszeit (UTC+2)`).
+   - `"Wochentag"`-Range strikt Montag–Freitag.
+   - **`dow_hour` ersatzlos aus UI-Dropdowns & `DIM_MAPPINGS` entfernen.**
+3. **Candle-Overlay Zoom-Lock:** Exklusiv bei X=`date`; bei anderen X-Dimensionen automatisch
+   ausblenden & Zoom-Sync entkoppeln.
+4. **UI Service-Anzeige:** `srv_`-Prefix strippen (`srv_trend_breakout` → `Trend Breakout`),
+   Format `{Kategorie} / {Service_Name}`, Mindestbreite erhöhen.
+
+## 2. Analyse 09.08.2026: Ist-Code-Abgleich
+
+**Grundlage:** Abgleich der Kapitel-Vorgabe 20.02.01 gegen den verbindlichen Ist-Code
+(kein `docs/x_Exports.md`, keine `docs/Current`). Geprüfte Dateien:
+`analytics/engine/feature_store_reader.py`, `analytics/engine/analytics_view_model.py`,
+`analytics/ui/heatmap_widget.py`, `analytics/ui/heatmap_page.py`,
+`analytics/engine/service_selector_model.py`, `serviceui/service_selector_dialog.py`,
+`analytics/ui/analytics_win.py`.
+
+### 2.1 Befunde
+
+| # | Kapitel-Vorgabe 20.02.01 | Ist-Code (verbindlich) | Befund |
+|---|--------------------------|------------------------|--------|
+| B1 | Dynamischer Zoom-Formatter `date` mit 5 Stufen | `_HeatmapAxis._format` (heatmap_widget.py): nur 3 Stufen – ≥1d `%d.%m.%y`, ≥1h `%d.%m. %H:%M`, <1h `%H:%M`. Wanduhr via `datetime.fromtimestamp(v, tz=dt_timezone.utc)` ✓ | **Abweichung** → E1 |
+| B2 | `"Stunde"` → `"Tageszeit"` (UI + Code) | `_DIM_LABELS["hour"] = "Stunde"` (heatmap_widget.py, generisches Widget). Legacy-Standard-HeatmapPage nutzt "Stunde (Berlin Wanduhr)" (Dow×Stunde, 15.03) | Abweichung im generischen Widget → E2 |
+| B3 | Harter Range Tageszeit 00:00–23:59 | `_axis_bounds("hour")`: `lo-0.5 .. hi+0.5` (datenabhängig, z. B. -0.5..23.5) | **Abweichung** → E3 |
+| B4 | Achsen-Label mit UTC-Offset (`Tageszeit (UTC+2)`) | `setLabel` nutzt `_DIM_LABELS` ohne Offset-Angabe | fehlt → E4 |
+| B5 | `Wochentag` strikt Montag–Freitag | `dow` = `EXTRACT(DOW ...)` 0..6 (So..Sa), Labels via `DOW_LABELS`; `_axis_bounds` datenabhängig (-0.5..6.5) | **Abweichung** → E5 |
+| B6 | `dow_hour` ersatzlos entfernen | Reader: `DIM_MAPPINGS`, `HEATMAP_DIMENSIONS`, `_format_dim_value`, `_axis_coords`; Widget: `_DIM_LABELS`, `_HeatmapAxis._format`, `_axis_bounds`; VM: Persistenz-Pfade `_apply_heatmap_section`/`restore_workspace` | → E6 |
+| B7 | Overlay-Zoom-Lock (X=`date` exklusiv, Sync entkoppeln) | Checkbox bereits exklusiv bei X=`date` (`_update_controls`/`_on_config_changed` auto-uncheck). Aber: `_price_vb.setXLink(plotItem.vb)` bleibt dauerhaft gelinkt (auch bei X≠date) | teils umgesetzt → E7 |
+| B8 | Service-Anzeige: `srv_`-Prefix strippen, `{Kategorie} / {Service_Name}`, Mindestbreite | Es existiert **KEIN** Service-Dropdown in heatmap_page.py (Service-Auswahl = `ServiceSelectorDialog`/MasterTree, 15.03-E; Kategorien dort bereits über 📁-Ordner-Hierarchie). In der generischen Heatmap ist `service_id` eine X/Y-Dimension – Achsen-Labels = rohe plugin_ids (`_format_dim_value` → `str(value)`) | Interpretationsklärung → E8 |
+
+### 2.2 Entscheidungen (E1–E8)
+
+- **E1 – Datums-Formatter auf 5 Stufen:** `_HeatmapAxis._format` für `date` auf die
+  Kapitel-Stufen umstellen – Schwellen: `spacing >= 31536000` → `%Y` (Jahresskala),
+  `>= 2592000` → `%d.%m.%y`, `>= 86400` → `DDD %d.%m.%y`, `>= 7200` → `DDD %d.%m.%y %H:00`,
+  sonst → `DDD %d.%m.%y %H:%M`. `DDD` = deutscher Wochentag **locale-unabhängig** über
+  `DOW_LABELS[(dt.weekday() + 1) % 7]` (konsistent zur App; `strftime("%a")` wäre
+  locale-abhängig). `_pick_time_step`-Schrittliste bleibt unverändert (1M = 2592000,
+  1J = 31536000 bereits enthalten).
+- **E2 – Umbenennung nur im generischen Widget:** `_DIM_LABELS["hour"] = "Tageszeit"`
+  (Combos + Achsen-Label des HeatmapWidget). Die Legacy-Standard-HeatmapPage
+  (Dow×Stunde, "Stunde (Berlin Wanduhr)") bleibt unverändert (Open/Closed, additive
+  20.02-Philosophie; kein Refactoring des 15.03-Bestands).
+- **E3 – Feste Skala Tageszeit:** `_axis_bounds` liefert bei `dim == "hour"` **konstant**
+  `(0.0, 24.0)` – unabhängig vom Datenbereich (stabile Vergleichbarkeit zwischen Symbol/
+  Timeframe). Zellen halboffen `[h, h+1)`, Ticks bei ganzzahligen Stunden (`HH:00`-Labels).
+  Zoom-Slider funktionieren weiterhin (normalisierte Viewport-Anteile auf der festen Skala).
+- **E4 – UTC-Offset-Label:** Offset aus dem NEUESTEN Datumswert der Achse (`x_axis[-1]`)
+  via `datetime.fromtimestamp(ts, tz=ZoneInfo("Europe/Berlin")).utcoffset()` → volle
+  Stunden; Label `Tageszeit (UTC+2)` bzw. `Tageszeit (UTC+1)` – DST-robust (Offset folgt
+  dem Datum der Daten). `zoneinfo` aus der stdlib (Python 3.9+), kein neues Paket.
+- **E5 – Wochentag strikt Mo–Fr:** SQL-Filter in `fetch_generic_heatmap`: wenn
+  `x_dim == "dow"` bzw. `y_dim == "dow"` → zusätzliche WHERE-Bedingung
+  `EXTRACT(DOW FROM bar_time AT TIME ZONE 'UTC')::INTEGER BETWEEN 1 AND 5`
+  (DuckDB: Mo = 1 … Fr = 5). Neue Mapping-Konstante `DOW_WEEK_LABELS = ("Mo", "Di", "Mi",
+  "Do", "Fr")`; `_format_dim_value("dow", v)` für v ∈ 1..5 → `DOW_WEEK_LABELS[v-1]`
+  (Alt-Werte 0/6 defensiv → `str(v)`). `_axis_bounds("dow")` konstant `(1.0, 6.0)`.
+  `DOW_LABELS` (7 Tage, So..Sa) bleibt für die Legacy-Standard-Heatmap unverändert.
+- **E6 – `dow_hour` ersatzlos entfernen:** Entfernen aus `DIM_MAPPINGS`,
+  `HEATMAP_DIMENSIONS`, `_format_dim_value`, `_axis_coords` (Reader) sowie `_DIM_LABELS`,
+  `_HeatmapAxis._format`, `_axis_bounds` (Widget) + betroffene Docstrings.
+  **Persistenz-Sanitizer:** `_apply_heatmap_section` + `restore_workspace` +
+  `set_heatmap_config` (ViewModel) mappen `"dow_hour"` defensiv auf `"hour"` – sonst würde
+  `_set_combo_data` (additives Hinzufügen unbekannter Werte) die entfernte Dimension in
+  Alt-Profilen/Workspaces wieder in die Combo aufnehmen. Tests anpassen:
+  `test/test.py` Block 37 d1/d2 (dow_hour) und `test/check_heatmap_bugfix.py`
+  (dow_hour-Achsen) auf die neue feste Skala (`dow`/`hour`) umstellen.
+- **E7 – Overlay-Zoom-Lock vervollständigen:** Bei X ≠ `date` →
+  `_clear_overlay()` + `_price_vb.setXLink(None)` (Entkopplung der Zoom-Sync) + Checkbox
+  deaktiviert (bereits vorhanden); bei X = `date` → `setXLink(plotItem.vb)` wieder linken.
+  Damit ist die Preis-ViewBox bei nicht anwendbaren X-Dimensionen vollständig entkoppelt
+  (keine Viewport-Mitnahme, kein Rest-Rendering).
+- **E8 – Service-Anzeige (Interpretation von Punkt 4):** Punkt 4 bezieht sich auf die
+  `service_id`-Dimension der generischen Heatmap (ein separates Service-Dropdown existiert
+  in heatmap_page.py nicht; der ServiceSelectorDialog bildet Kategorien bereits über die
+  📁-Ordner-Hierarchie ab). Umsetzung MVVM-konform: ViewModel erhält
+  `resolve_service_label(plugin_id) -> str` (lazy `_selector_model`, Muster
+  `_resolve_feature_ids`): plugin.metadata → `display_name` (Service-Name, z. B.
+  "Trend Breakout") + `category`-Pfad (`plugin_category_path`, Slash → " / ", z. B.
+  "Swing Points / Trend Breakout"). Das HeatmapWidget formatiert die kategorialen
+  Achsen-Labels für `service_id` über den Resolver; `_combo_x`/`_combo_y` erhalten eine
+  erhöhte `setMinimumWidth(...)`. Fallback: unbekannte/entfernte IDs → Rohwert.
+
+### 2.3 Betroffene Dateien (geplant)
+
+| Datei | Änderung |
+|-------|----------|
+| `analytics/engine/feature_store_reader.py` | `dow_hour` entfernen (DIM_MAPPINGS/HEATMAP_DIMENSIONS/_format_dim_value/_axis_coords/Docstrings); Mo–Fr-Filter für `dow` in `fetch_generic_heatmap`; `DOW_WEEK_LABELS` |
+| `analytics/ui/heatmap_widget.py` | Datums-Formatter 5 Stufen (E1); `_DIM_LABELS["hour"]="Tageszeit"` (E2); feste Skalen hour `[0,24)` / dow `[1,6)` (E3/E5); UTC-Offset-Label (E4); `dow_hour` entfernen (E6); Overlay-Zoom-Lock via `setXLink` (E7); Service-Label-Resolver + Combo-Mindestbreite (E8) |
+| `analytics/engine/analytics_view_model.py` | `_sanitize_dim()` (dow_hour → hour) in `_apply_heatmap_section`/`restore_workspace`/`set_heatmap_config` (E6); `resolve_service_label()` (lazy `_selector_model`, E8) |
+| `test/test.py` | Block 37 d1/d2 (dow_hour) → neue feste Skalen-Checks |
+| `test/check_heatmap_bugfix.py` | dow_hour-Checks ersetzen/anpassen |
+
+### 2.4 Validierung (headless, nach Freigabe)
+
+- `py_compile` auf den geänderten Python-Dateien.
+- `test/test.py` Block 37 (angepasst) + isolierter Check in `test/`.
+- Keine UI-Tests (harte Regel 4); manueller Funktionstest der GUI durch den Anwender.
+
+---
+
+## 5.7 Umsetzungs-Log 09.08.2026 (Kapitel 20.02.01 – AUSSTEHEND)
+
+**Status:** Analyse + Entscheidungen (E1–E8) abgeschlossen, Kapitel dokumentiert.
+**Umsetzung erst nach expliziter Anweisung des Anwenders** (Regel 6 – Inkrementelles
+Arbeiten, Wartepunkt: kein Code vor dem Startbefehl). Der Implementierungs-Log wird nach
+erfolgreicher Umsetzung + Bestätigung hier ergänzt.
+---
+
+## 5.8 Bugfix-Log 09.08.2026: Heatmap-Umbau (User-Meldungen 1–6) + WAL-Guard
+
+**Kontext:** Sechs User-Meldungen nach Umsetzung von Kapitel 20.02
+(generische 2D-Heatmap). Alle Fixes sind point-fix/additiv –
+bestehende Strukturen (Standard-Modus `HeatmapPage` Dow×Stunde,
+`fetch_ohlcv_snapshot`/`QUERY_OHLCV`) blieben unangetastet.
+Commit: `01229b1`.
+
+### Entscheidungen (H1–H7)
+
+| # | Entscheidung | Detail |
+|---|--------------|--------|
+| H1 | **Overlay im selben Canvas** (Punkt 1) | Kerzen-Overlay ist KEIN separates PlotWidget mehr (`_plot_px` entfernt). Zweite Y-Achse "Preis" rechts im selben `PlotWidget`; eigene `ViewBox` `_price_vb` teilt per `setXLink` die X-Achse mit der Heatmap und zeichnet per `setZValue(10)` über dem ImageItem. Neuer Query-Kind `QUERY_DAILY_OHLC` |
+| H2 | **Alle Daten statt 5000er-Lookback** (Punkt 2) | `QUERY_HEATMAP_GENERIC` setzt im ViewModel KEIN `limit` mehr (`limit=None`). Der bisherige 5000er-Lookback schnitt die Heatmap auf ~4 Tage (M1) ab. Matrix-Begrenzung übernimmt der bestehende Pivot-Deckel `MAX_HEATMAP_CELLS` (50.000) |
+| H3 | **Tages-Ohlc SQL-seitig** (Punkte 1+2) | Neues `fetch_daily_ohlc()` im Reader: aggregiert `ohlcv_bars` pro Wanduhr-Tag in SQL (`GROUP BY CAST("time" AT TIME ZONE 'UTC' AS DATE)`, `FIRST(open)/MAX(high)/MIN(low)/LAST(close)`) – kein Laden aller Bars + Python-Gruppierung (> 1 Mio. Bars bei M1). Default `DAILY_OHLC_MAX_DAYS = 4000`. `fetch_ohlcv_snapshot()` bleibt unverändert (Alt-Aufrufer/Tests) |
+| H4 | **Natürliche Achsen-Werte** (Punkte 3+4) | Reader liefert neue `x_axis`/`y_axis` im generischen Payload: `date` → Wanduhr-Mitternachts-Epochs (Sekunden), `hour`/`dow`/`dow_hour` → Ganzzahlen (0–23 bzw. 0–167), kategorial → Indizes. `ImageItem` wird per `setRect` exakt auf den Bereich gemappt (date: ± halber Tag um Mitternacht; ganzzahlig: ±0,5; kategorial: −0,5..n−0,5) → nichts wird über die Tagesgrenze gezeichnet; Achsen-Zuordnung explizit (x_dim→X, y_dim→Y), kein Vertauschen |
+| H5 | **Dynamische Achsen-Ticks** (Punkte 5+6) | Neue `_HeatmapAxis(pg.AxisItem)` mit `configure(dim, labels)` + überschriebenen `tickValues`/`tickStrings`. `date`: Schrittwahl via `_pick_time_step()` (1s…1J) → je Zoom-Level Tage → Stunden → Minuten (TradingView-Stil); Formatierung nach Spacing (`TT.MM.JJ` / `TT.MM. HH:MM` / `HH:MM`). `hour`/`dow`/`dow_hour`: ganzzahlige Schritte (`_nice_int_step`) → mehr Zwischenwerte beim Zoom. Kategorial: Labels aus Payload |
+| H6 | **Zoom für alle Maßstäbe** (Punkt 6) | `_ZOOMABLE_DIMS` (nur `date`) entfernt – Zoom-Slider X/Y sind immer aktiv und wirken auf alle Dimensionen. `_apply_x_range`/`_apply_y_range` rechnen mit natürlichen `_x_min/_x_max`-Bounds statt Zell-Indizes |
+| H7 | **WAL-Guard** (Start-Abbruch, Zusatz) | `DbPool._open_with_wal_recovery()`: bei `duckdb.InternalException` mit "Failure while replaying WAL" wird die korrupte WAL unter `*.duckdb.wal.corrupt_<Zeitstempel>` weggesichert und der Connect erneut versucht (wiederkehrendes Start-Problem unter Windows nach hartem Beenden). `.gitignore` um `*.duckdb.wal.corrupt_*` erweitert |
+
+### Bewusst NICHT geändert
+- `fetch_ohlcv_snapshot()` / `QUERY_OHLCV` (Alt-Aufrufer/Tests)
+- `HeatmapPage`-Standard-Modus (Dow×Stunde) unangetastet
+- `docs/x_Exports.md` (nicht committet)
+
+### Validierung (headless, keine UI-Tests)
+- `py_compile` auf allen 8 geänderten Dateien: PASS
+- `test/check_heatmap_bugfix.py`: **34/34 PASS** (Reader x_axis/y_axis inkl. Mitternachts-Epochs + Tagesabständen, `fetch_daily_ohlc` mit Wanduhr-Mitternacht + OHLC-Konsistenz, `limit=None` → alle Daten/2083 Tage, Worker-Dispatch `QUERY_DAILY_OHLC`, Axis-Ticks date 100T/3h/90s → 1T/1h/30s + Format TT.MM.JJ/HH:MM, hour/dow_hour/kategorial-Ticks, Widget-Offscreen: Overlay im selben Canvas, X-Bounds = Epochs ± halber Tag, Y-Bounds = −0,5..1,5, Cleanup)
+- `test/test.py` Blöcke 37/38: alle PASS (nur 6 bekannte offscreen-Geometrie-Fehler P2/P5/H3–H5/H7, unabhängig von dieser Umsetzung)
+- Manueller Funktionstest der GUI erfolgt durch den Anwender.
+
