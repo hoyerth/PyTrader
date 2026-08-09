@@ -312,10 +312,23 @@ Schema (analytics_profiles):
     name        VARCHAR NOT NULL      – eindeutiger Profil-Name (case-insensitiv)
     description VARCHAR               – optionale Beschreibung
     payload     JSON                  – Profil-Payload INKL. Pflichtfeld
-                                        `schema_version` (15.03-Spez: 1)
+                                        `schema_version` (20.01-Spez: 2)
     is_active   BOOLEAN DEFAULT FALSE – genau EIN aktives Profil
     created_at  TIMESTAMP DEFAULT current_timestamp
     updated_at  TIMESTAMP DEFAULT current_timestamp
+
+Payload-Schema (20.01, E3 – sectioned, verlustfrei):
+    schema_version: 2
+    sources:  symbol, timeframe, feature_ids
+    charts:   heatmap_metric, scatter_x, scatter_y, distribution_column, bins
+    table:    limit, table_column_widths, table_row_height,
+              table_sort_column, table_sort_order
+    styling:  {}  (Reserve fuer zukuenftige visuelle Settings)
+
+Alt-Payloads (schema_version: 1, flach) werden beim Lesen (_row_to_profile)
+UND beim Schreiben (_ensure_schema_version) verlustfrei nach v2 migriert
+(E2/E4, Single Source of Truth im Repository – das ViewModel erhaelt IMMER
+v2-Sections). Unbekannte v1-Top-Level-Keys bleiben erhalten.
 
 Verhalten:
 - `create_profile()`   : legt ein neues Profil an; ergaenzt den Payload
@@ -338,8 +351,18 @@ from typing import Any, Dict, List, Optional
 
 from db_service import DB_APP_DATA, DbPool, _parse_json_field
 
-# Pflichtfeld im Profil-Payload (15.03-Spezifikation: `schema_version: 1`).
-SCHEMA_VERSION_DEFAULT: int = 1
+# Pflichtfeld im Profil-Payload (20.01-Spezifikation: `schema_version: 2`).
+SCHEMA_VERSION_DEFAULT: int = 2
+
+#: Sektions-Zuordnung der bekannten Analytics-Parameter (v2-Payload, E3).
+_V1_SECTION_KEYS = {
+    "sources": {"symbol", "timeframe", "feature_ids", "feature_id"},
+    "charts": {"heatmap_metric", "scatter_x", "scatter_y",
+               "distribution_column", "bins"},
+    "table": {"limit", "table_column_widths", "table_row_height",
+              "table_sort_column", "table_sort_order"},
+    "styling": set(),
+}
 
 
 class AnalyticsProfileRepository:
@@ -381,27 +404,100 @@ class AnalyticsProfileRepository:
     def _ensure_schema_version(payload: Dict[str, Any]) -> Dict[str, Any]:
         """Stellt das Pflichtfeld `schema_version` im Profil-Payload sicher.
 
-        Wird beim Erzeugen/Aktualisieren additiv gesetzt (15.03-Spez: 1).
-        Ein vom Aufrufer bereits mitgegebenes schema_version gewinnt
+        Phase 20.01 (E4): Beim Erzeugen/Aktualisieren werden flache
+        v1-Payloads VOR dem Speichern verlustfrei nach v2 migriert
+        (_migrate_v1_to_v2) – es entstehen keine neuen v1-Rows. Ein vom
+        Aufrufer bereits mitgegebenes schema_version >= 2 gewinnt
         (Aufwaertskompatibilitaet).
         """
         payload = dict(payload or {})
-        payload.setdefault("schema_version", SCHEMA_VERSION_DEFAULT)
+        try:
+            version = int(payload.get("schema_version", 1) or 1)
+        except (TypeError, ValueError):
+            version = 1
+        if version < 2:
+            return AnalyticsProfileRepository._migrate_v1_to_v2(payload)
         return payload
+
+    @staticmethod
+    def _migrate_v1_to_v2(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Wandelt ein flaches v1-Profil-Payload verlustfrei in v2-Sections.
+
+        Phase 20.01 (E2/E3): V1-Payloads (schema_version: 1) speichern alle
+        Analytics-Parameter flach auf Top-Level-Ebene. Die Migration gruppiert
+        die bekannten Keys in die Sektionen sources/charts/table/styling und
+        wandelt den Alt-Einzelwert `feature_id` nach `feature_ids` (Liste,
+        kanonisches v2). UNBEKANNTE Top-Level-Keys bleiben erhalten
+        (verlustfrei), damit Fremd-Felder nicht zerstoert werden. Ein bereits
+        v2-Payload wird unveraendert zurueckgegeben.
+
+        Returns:
+            Das migrierte v2-Payload (immer mit `schema_version: 2`).
+        """
+        if not isinstance(payload, dict):
+            return {}
+        payload = dict(payload)
+        try:
+            version = int(payload.get("schema_version", 1) or 1)
+        except (TypeError, ValueError):
+            version = 1
+        if version >= 2:
+            return payload
+
+        sections: Dict[str, Dict[str, Any]] = {
+            name: {} for name in _V1_SECTION_KEYS
+        }
+        rest: Dict[str, Any] = {}
+        for key, value in payload.items():
+            if key == "schema_version":
+                continue
+            placed = False
+            for name, keys in _V1_SECTION_KEYS.items():
+                if key in keys:
+                    sections[name][key] = value
+                    placed = True
+                    break
+            if not placed:
+                rest[key] = value
+
+        # Alt-Einzelwert feature_id -> feature_ids (Liste), kanonisches v2.
+        fid = sections["sources"].pop("feature_id", None)
+        if fid and not sections["sources"].get("feature_ids"):
+            if isinstance(fid, (list, tuple)):
+                sections["sources"]["feature_ids"] = [
+                    str(f) for f in fid if str(f or "").strip()]
+            else:
+                sections["sources"]["feature_ids"] = [str(fid)]
+
+        out: Dict[str, Any] = {"schema_version": 2}
+        for name in ("sources", "charts", "table", "styling"):
+            if sections[name]:
+                out[name] = sections[name]
+            elif name == "styling":
+                # Reserve (E3) immer anlegen – zukuenftige visuelle Settings.
+                out[name] = {}
+        out.update(rest)
+        return out
 
     @staticmethod
     def _row_to_profile(row) -> Dict[str, Any]:
         """Wandelt eine DB-Zeile in ein Profil-Dict (JSON geparst).
 
-        Fehlt im Payload das Pflichtfeld `schema_version` (z. B. Alt-Rows
-        aus einer frueheren Schema-Version), wird es beim Lesen mit dem
-        Default ergaenzt (analog E-3: Default fuer Alt-Rows) – der Payload
-        selbst bleibt unveraendert.
+        Phase 20.01 (E2): Alt-Rows ohne `schema_version` oder mit
+        schema_version 1 (flach) werden beim Lesen verlustfrei nach v2
+        migriert – der ViewModel erhaelt IMMER v2-Sections (Single Source
+        of Truth im Repository). Der Payload in der DB bleibt unveraendert
+        (Migration nur beim Lesen; beim naechsten Save wird v2 geschrieben).
         """
         profile_id, name, description, payload_json, is_active, created_at, updated_at = row
         payload = _parse_json_field(payload_json) or {}
         payload = dict(payload)
-        payload.setdefault("schema_version", SCHEMA_VERSION_DEFAULT)
+        try:
+            version = int(payload.get("schema_version", 1) or 1)
+        except (TypeError, ValueError):
+            version = 1
+        if version < 2:
+            payload = AnalyticsProfileRepository._migrate_v1_to_v2(payload)
         return {
             "profile_id": str(profile_id),
             "name": str(name),
@@ -1919,6 +2015,7 @@ class StateManager:
                 visible_price_to DOUBLE,
                 indicators_state JSON,
                 measurement_state JSON,
+                workspace_state JSON,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -1958,6 +2055,12 @@ class StateManager:
         con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS plugin_id VARCHAR;")
         con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS version VARCHAR DEFAULT '1.0.0';")
         con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS is_active_batch BOOLEAN DEFAULT FALSE;")
+
+        # Phase 20.01 (09.08.2026): Analytics-Workspace-Persistenz – additive
+        # JSON-Spalte `workspace_state` in instance_states (win_analytics:
+        # vm.params + UI-Layout). Idempotent – bestehende Zeilen/Spalten
+        # bleiben unangetastet.
+        con.execute("ALTER TABLE instance_states ADD COLUMN IF NOT EXISTS workspace_state JSON;")
 
         # Phase 15 (U15-B4): Alt-Indikator 'grid' (chart/indicators/grid.py)
         # wurde am 04.08.2026 entfernt. Persistierte Presets mit
@@ -2177,6 +2280,25 @@ class StateManager:
         exakt reproduziert).
         """
         return self._window_repo.get_window_geometry(instance_id)
+
+    # Phase 20.01: Workspace-Persistenz (win_analytics) – Fassaden-Delegation
+    # an das WindowStateRepository (Muster 15.04, identische Signaturen).
+    def save_workspace_state(
+        self, instance_id: str, state: Dict[str, Any]
+    ) -> None:
+        """Persistiert einen Fenster-Workspace (E6, NOT-NULL-konform).
+
+        `workspace_state` (JSON) wird auf die instance_states-Zeile der
+        Instanz ge-upsertet; symbol/timeframe der Zeile bleiben erhalten
+        (Fallback ''/'M1' bei noch nicht existierender Row).
+        """
+        self._window_repo.save_workspace_state(instance_id, state)
+
+    def get_workspace_state(
+        self, instance_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Liest den gespeicherten Fenster-Workspace (oder None)."""
+        return self._window_repo.get_workspace_state(instance_id)
 
     def load_all_instances(self) -> List[Dict[str, Any]]:
         # Phase 15.04: Delegation an das WindowStateRepository (pandas-.df()-
@@ -3232,6 +3354,59 @@ class WindowStateRepository:
             [symbol, timeframe]
         )
 
+    # ------------------------------------------------------------------
+    # workspace_state: Fenster-Workspace (Phase 20.01, win_analytics)
+    # ------------------------------------------------------------------
+    def save_workspace_state(
+        self, instance_id: str, state: Dict[str, Any]
+    ) -> None:
+        """Upsertet `workspace_state` (JSON) auf die instance_states-Zeile.
+
+        Phase 20.01 (E6, NOT-NULL-konform): `instance_states.symbol`/
+        `timeframe` sind NOT NULL. Fuer eine noch nicht existierende Row
+        werden die bestehenden Werte uebernommen (Fallback ''/'M1'), damit
+        der reine Workspace-Upsert keinen NOT-NULL-Constraint verletzt.
+        Vorhandene symbol/timeframe/indicator-Zustaende bleiben unberuehrt
+        (ON CONFLICT aktualisiert nur workspace_state + updated_at).
+        """
+        con = self._get_connection()
+        existing = con.execute(
+            "SELECT symbol, timeframe FROM instance_states "
+            "WHERE instance_id = ?",
+            [instance_id],
+        ).fetchone()
+        symbol = str(existing[0]) if existing and existing[0] is not None else ""
+        timeframe = (
+            str(existing[1]) if existing and existing[1] is not None else "M1"
+        )
+        con.execute("""
+            INSERT INTO instance_states (
+                instance_id, symbol, timeframe, workspace_state, updated_at
+            ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT (instance_id) DO UPDATE SET
+                workspace_state = EXCLUDED.workspace_state,
+                updated_at = EXCLUDED.updated_at;
+        """, [instance_id, symbol, timeframe, json.dumps(state)])
+
+    def get_workspace_state(
+        self, instance_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Liest den gespeicherten Fenster-Workspace einer Instanz (oder None).
+
+        Workspace-Payload (Phase 20.01, E7):
+            {"params": {...}, "layout": {"page_index": n}}
+        """
+        con = self._get_connection()
+        row = con.execute(
+            "SELECT workspace_state FROM instance_states "
+            "WHERE instance_id = ?",
+            [instance_id],
+        ).fetchone()
+        if row and row[0] is not None:
+            parsed = _parse_json_field(row[0])
+            return parsed if isinstance(parsed, dict) else None
+        return None
+
 ```
 
 --------------------------------------------------
@@ -4278,7 +4453,7 @@ Aufgaben (15.03-Spezifikation):
    emittiert (Invariante 5 / zentraler EventBus, Payload = Profil-Name).
 """
 
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
@@ -4322,15 +4497,24 @@ class AnalyticsViewModel(QObject):
     profile_deleted = Signal(str)            # profile_id
     profiles_available = Signal(list)        # Liste der Profile
 
+    # 20.01 (Graceful Degradation, E5): fehlende (entfernte/umbenannte)
+    # Services – Payload: Liste der nicht mehr registrierten plugin_ids.
+    missing_services_detected = Signal(list)
+
     def __init__(
         self,
         analytics_repo: Optional[AnalyticsRepository] = None,
         profile_repo: Optional[AnalyticsProfileRepository] = None,
+        selector_model=None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self._repo = analytics_repo or AnalyticsRepository()
         self._profile_repo = profile_repo or get_analytics_profile_repository()
+        # 20.01 (E5): ServiceSelectorModel fuer den Fault-Tolerant-Resolver
+        # (resolve_valid_feature_ids). Lazy Default – wird nur bei Bedarf
+        # instanziiert (Tests/Alt-Aufrufer ohne Injektion bleiben schlank).
+        self._selector_model = selector_model
 
         # Aktuelle Ansichtsparameter (werden im Profil-Payload persistiert).
         self._params: Dict[str, Any] = {
@@ -4366,6 +4550,9 @@ class AnalyticsViewModel(QObject):
         self._dirty = False
         self._active_profile: Optional[Dict[str, Any]] = None
         self._profiles: List[Dict[str, Any]] = []
+        # 20.01 (E7): UI-Layout-Anteil des zuletzt restaurierten Workspace
+        # (z. B. {"page_index": 2}) – von der UI abfragbar, kein _params-Key.
+        self._workspace_layout: Dict[str, Any] = {}
 
         # Debounce-QTimer (200-300 ms, 15.03-Spezifikation)
         self._debounce = QTimer(self)
@@ -4463,6 +4650,49 @@ class AnalyticsViewModel(QObject):
             if s and s not in out:
                 out.append(s)
         return out
+
+    def _resolve_feature_ids(
+        self, feature_ids: List[str]
+    ) -> Tuple[List[str], List[str]]:
+        """Isoliert fehlende Services ueber den Resolver (20.01, E5).
+
+        Ohne ein injiziertes Modell (Tests/Alt-Aufrufer) wird ein lazies
+        Default-Modell erzeugt (nur wenn ueberhaupt IDs zu pruefen sind).
+        Fehler -> (normalisierte ids, []) defensiv (kein Absturz).
+        """
+        ids = self._normalize_feature_ids(feature_ids)
+        if not ids:
+            return [], []
+        model = self._selector_model
+        if model is None:
+            from analytics.engine.service_selector_model import ServiceSelectorModel
+            model = ServiceSelectorModel(parent=self)
+            self._selector_model = model
+        try:
+            return model.resolve_valid_feature_ids(ids)
+        except Exception:
+            return ids, []
+
+    @staticmethod
+    def _flatten_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Flacht v2-Sections (sources/charts/table/styling) auf Top-Level ab.
+
+        20.01 (E2/E3): Der ViewModel arbeitet weiterhin mit flachen `_params` –
+        die v2-Sektions-Keys haben Vorrang vor gleichnamigen Top-Level-Resten
+        (die bei der v1→v2-Migration verlustfrei erhalten bleiben).
+        """
+        flat: Dict[str, Any] = {}
+        for section in ("sources", "charts", "table", "styling"):
+            values = payload.get(section)
+            if isinstance(values, dict):
+                flat.update(values)
+        for key, value in payload.items():
+            if key in ("schema_version", "sources", "charts", "table",
+                       "styling"):
+                continue
+            if key not in flat:
+                flat[key] = value
+        return flat
 
     def set_heatmap_metric(self, metric: str) -> None:
         self._set_param("heatmap_metric", str(metric or "count"),
@@ -4759,19 +4989,35 @@ class AnalyticsViewModel(QObject):
     def _apply_profile(
         self, profile: Dict[str, Any], mark_dirty: bool = True
     ) -> None:
-        """Uebernimmt die Profil-Parameter in die Ansicht (Explicit Save)."""
+        """Uebernimmt die Profil-Parameter in die Ansicht (Explicit Save).
+
+        20.01 (E2/E3/E5): Das Repository liefert beim Lesen bereits migrierte
+        v2-Sectioned-Payloads – die flachen Sektionen werden hier auf die
+        flachen `_params` abgebildet (keine VM-eigene Migration, Single
+        Source of Truth im Repository). Fehlende Services (entfernte/
+        umbenannte Plugins) werden per ServiceSelectorModel isoliert und via
+        `missing_services_detected` gemeldet; die validen IDs werden DIREKT
+        in `_params` geschrieben (kein `set_feature_ids`: kein Dirty-Flag,
+        kein Doppel-Refresh, B4).
+        """
         self._active_profile = dict(profile)
         payload = profile.get("payload") or {}
+        flat = self._flatten_payload(payload)
         for key in list(self._params.keys()):
-            if key in payload and payload[key] is not None:
-                self._params[key] = payload[key]
+            if key in flat and flat[key] is not None:
+                self._params[key] = flat[key]
         # 15.03-E (Profil-Migration): Alt-Payloads speicherten den Filter als
         # Einzelwert `feature_id` (String) – in `feature_ids` (Liste) wandeln.
-        if "feature_ids" not in payload and payload.get("feature_id"):
+        if "feature_ids" not in flat and flat.get("feature_id"):
             self._params["feature_ids"] = self._normalize_feature_ids(
-                [payload["feature_id"]])
+                [flat["feature_id"]])
         self._params["feature_ids"] = self._normalize_feature_ids(
             self._params.get("feature_ids"))
+        # 20.01 (E5): Fehlende Services isolieren – valide IDs direkt setzen.
+        valid, missing = self._resolve_feature_ids(self._params["feature_ids"])
+        self._params["feature_ids"] = valid
+        if missing:
+            self.missing_services_detected.emit(list(missing))
         self._params["bins"] = self._clamp_bins(self._params.get("bins"))
         self._params["limit"] = self._clamp_limit(self._params.get("limit"))
         if not mark_dirty:
@@ -4780,10 +5026,71 @@ class AnalyticsViewModel(QObject):
         self.refresh_all()
 
     def _current_payload(self) -> Dict[str, Any]:
-        """Profil-Payload aus den aktuellen Ansichtsparametern."""
-        payload = dict(self._params)
-        payload["schema_version"] = SCHEMA_VERSION_DEFAULT
-        return payload
+        """Profil-Payload aus den aktuellen Ansichtsparametern (v2, sectioned).
+
+        20.01 (E3): Die v2-Sektionen sources/charts/table/styling gruppieren
+        die bekannten Parameter; neue UI-Settings lassen sich spaeter additiv
+        unter neuen Sektionen ergaenzen (kein Schema-Bump noetig).
+        """
+        p = self._params
+        return {
+            "schema_version": SCHEMA_VERSION_DEFAULT,
+            "sources": {
+                "symbol": p.get("symbol"),
+                "timeframe": p.get("timeframe"),
+                "feature_ids": list(p.get("feature_ids") or []),
+            },
+            "charts": {
+                "heatmap_metric": p.get("heatmap_metric"),
+                "scatter_x": p.get("scatter_x"),
+                "scatter_y": p.get("scatter_y"),
+                "distribution_column": p.get("distribution_column"),
+                "bins": p.get("bins"),
+            },
+            "table": {
+                "limit": p.get("limit"),
+                "table_column_widths": dict(
+                    p.get("table_column_widths") or {}),
+                "table_row_height": p.get("table_row_height"),
+                "table_sort_column": p.get("table_sort_column"),
+                "table_sort_order": p.get("table_sort_order"),
+            },
+            "styling": {},
+        }
+
+    def restore_workspace(self, workspace: Dict[str, Any]) -> None:
+        """Wendet den gespeicherten Fenster-Workspace an (20.01, E7).
+
+        Uebernimmt die Workspace-Parameter (letzter Sitzungszustand gewinnt
+        ueber das aktive Profil) verlustfrei in `_params` – OHNE Dirty-Flag
+        und mit demselben Resolver-Pfad wie `_apply_profile` (fehlende
+        Services werden isoliert und via `missing_services_detected`
+        gemeldet). Der UI-Layout-Anteil (z. B. page_index) wird separat unter
+        `workspace_layout` bereitgestellt (kein `_params`-Key). Danach
+        `refresh_all()` (Daten fuer alle Seiten).
+
+        Args:
+            workspace: Payload aus `state_manager.get_workspace_state(...)`
+                im Format {"params": {...}, "layout": {...}}.
+        """
+        if not isinstance(workspace, dict):
+            return
+        self._workspace_layout = dict(workspace.get("layout") or {})
+        params = workspace.get("params")
+        if not isinstance(params, dict):
+            return
+        for key in list(self._params.keys()):
+            if key in params and params[key] is not None:
+                self._params[key] = params[key]
+        self._params["feature_ids"] = self._normalize_feature_ids(
+            self._params.get("feature_ids"))
+        valid, missing = self._resolve_feature_ids(self._params["feature_ids"])
+        self._params["feature_ids"] = valid
+        if missing:
+            self.missing_services_detected.emit(list(missing))
+        self._params["bins"] = self._clamp_bins(self._params.get("bins"))
+        self._params["limit"] = self._clamp_limit(self._params.get("limit"))
+        self.refresh_all()
 
     @staticmethod
     def _emit_profile_changed(name: str) -> None:
@@ -4861,6 +5168,15 @@ class AnalyticsViewModel(QObject):
     def is_dirty(self) -> bool:
         """True, wenn ungespeicherte Parametertrends vorliegen ('*')."""
         return self._dirty
+
+    @property
+    def workspace_layout(self) -> Dict[str, Any]:
+        """UI-Layout-Anteil des zuletzt restaurierten Workspace (20.01, E7).
+
+        Z. B. {"page_index": n} – wird von der UI nach `restore_workspace()`
+        abgefragt (kein `_params`-Key).
+        """
+        return dict(self._workspace_layout)
 
     def heatmap_metrics(self, symbol: str, timeframe: str) -> List[str]:
         """Verfuegbare Heatmap-Metriken fuer ein Symbol/Timeframe (19.02).
@@ -6431,7 +6747,7 @@ Verwendete Badge-Konvention (Spalte 1 des MasterTree):
   * `⚪ inaktiv in <Indikator>` – Indikator ist nirgends aktiv / kein Chart-Pflicht
 """
 
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from PySide6.QtCore import QObject, Signal
 
@@ -7026,6 +7342,40 @@ class ServiceSelectorModel(QObject):
                     break
             names.append(found if found else str(fid))
         return names
+
+    # ------------------------------------------------------------------
+    # 20.01 (E5): Fault-Tolerant Resolver fuer persistierte feature_ids
+    # ------------------------------------------------------------------
+    def resolve_valid_feature_ids(
+        self, feature_ids: List[str]
+    ) -> Tuple[List[str], List[str]]:
+        """Prueft feature_ids gegen die PluginRegistry (Phase 20.01, E5).
+
+        Wird vom AnalyticsViewModel beim Profil-/Workspace-Restore genutzt,
+        um entfernte/umbenannte Plugins (fehlende feature_ids) zu isolieren:
+        die validen IDs bleiben aktiv, die fehlenden werden gemeldet
+        (missing_services_detected -> Warn-Label, Graceful Degradation).
+
+        Returns:
+            (valid_ids, missing_ids): gueltige Plugin-IDs (case-insensitiv,
+            dedupliziert, Reihenfolge erhalten) und nicht (mehr) registrierte
+            IDs. `'native'` ist der Feature-Store-Sentinel des nativen
+            Feature-Builder-Pfads (kein Plugin) und gilt als fehlend (B7) –
+            der ServiceSelectorDialog emittiert ausschliesslich plugin_ids.
+        """
+        valid: List[str] = []
+        missing: List[str] = []
+        seen: Set[str] = set()
+        for fid in feature_ids or []:
+            key = str(fid or "").strip()
+            if not key or key.lower() in seen:
+                continue
+            seen.add(key.lower())
+            if self.get_plugin(key) is not None:
+                valid.append(key)
+            else:
+                missing.append(key)
+        return valid, missing
 
 ```
 
@@ -13883,10 +14233,15 @@ class AnalyticsWindow(PersistentWindow):
     INSTANCE_ID = "win_analytics"
     # Bugfix 04.08.2026 (Fenster-Historie): auto_restore=True – das Fenster
     # wird beim App-Start wiederhergestellt, wenn es beim Beenden der App
-    # OFFEN war. _keep_history_on_close bleibt Default (False): ein MANUELL
-    # geschlossenes Fenster wird aus der aktiven History entfernt
-    # (delete_instance) und poppt beim naechsten Start NICHT wieder auf
-    # (Semantik identisch zu chart_win).
+    # OFFEN war.
+    # 20.01 (E1): _keep_history_on_close = True – der Analytics-Workspace
+    # (vm.params + Layout) wird in instance_states.workspace_state
+    # persistiert und muss das manuelle Schliessen ueberleben
+    # (PersistentWindow.closeEvent loescht bei False den DB-Eintrag).
+    # Trade-off: ein manuell geschlossenes Analytics-Fenster wird beim
+    # naechsten Start wiederhergestellt (Dashboard-Fenster, kein Wegwerf-
+    # Fenster; Semantik bewusst abweichend von chart_win).
+    _keep_history_on_close = True
 
     def __init__(
         self,
@@ -13897,9 +14252,15 @@ class AnalyticsWindow(PersistentWindow):
         selector_model: Optional[ServiceSelectorModel] = None,
     ) -> None:
         super().__init__(parent)
+        # 20.01 (E5): Das ServiceSelectorModel wird VOR dem ViewModel erzeugt
+        # und injiziert – der VM nutzt es fuer den Fault-Tolerant-Resolver
+        # (resolve_valid_feature_ids) beim Profil-/Workspace-Restore.
+        self._selector_model: ServiceSelectorModel = (
+            selector_model or ServiceSelectorModel(parent=self))
         self._vm = view_model or AnalyticsViewModel(
             analytics_repo=analytics_repo,
             profile_repo=profile_repo,
+            selector_model=self._selector_model,
             parent=self,
         )
         self._symbol_repo: SymbolRepository = get_symbol_repository()
@@ -13925,8 +14286,6 @@ class AnalyticsWindow(PersistentWindow):
         # ersetzt das fruehere Service-Filter-Popover. Das
         # ServiceSelectorModel ist injizierbar (Headless-Tests); der Dialog
         # wird lazy erzeugt (nicht-modal) und beim Schliessen zerstört.
-        self._selector_model: ServiceSelectorModel = (
-            selector_model or ServiceSelectorModel(parent=self))
         self._service_dialog: Optional[ServiceSelectorDialog] = None
         #: Anzeigenamen des aktiven Datenquellen-Filters (fuer den Button).
         #: Beim Profilwechsel zurueckgesetzt – Namen werden dann aus den
@@ -14041,6 +14400,13 @@ class AnalyticsWindow(PersistentWindow):
         self.label_status_msg.setStyleSheet(
             "color: #b7950b; font-weight: bold;")
         filt.addWidget(self.label_status_msg)
+        # 20.01 (Graceful Degradation): Warn-Hinweis bei nicht mehr
+        # verfügbaren Services (fehlende plugin_ids im Profil/Workspace).
+        self.label_missing_warning = QLabel("")
+        self.label_missing_warning.setStyleSheet(
+            "color: #c62828; font-weight: bold;")
+        self.label_missing_warning.setVisible(False)
+        filt.addWidget(self.label_missing_warning)
         filt.addStretch(1)
         root.addLayout(filt)
 
@@ -14115,6 +14481,8 @@ class AnalyticsWindow(PersistentWindow):
         self._active_display_names = []
         self._vm.set_feature_ids(list(feature_ids or []))
         self._sync_service_filter_button()
+        # 20.01: Manuelle Datenquellen-Aenderung -> Warn-Label zuruecksetzen.
+        self.label_missing_warning.setVisible(False)
 
     @Slot(list, list)
     def _on_services_selected(
@@ -14129,6 +14497,8 @@ class AnalyticsWindow(PersistentWindow):
         self._active_display_names = list(display_names or [])
         self._vm.set_feature_ids(list(feature_ids or []))
         self._sync_service_filter_button()
+        # 20.01: Manuelle Datenquellen-Aenderung -> Warn-Label zuruecksetzen.
+        self.label_missing_warning.setVisible(False)
 
     def _sync_service_filter_button(self) -> None:
         """Synchronisiert den Datenquellen-Button mit dem VM-Parameter.
@@ -14162,6 +14532,8 @@ class AnalyticsWindow(PersistentWindow):
         vm.dirty_changed.connect(self._on_dirty_changed)
         vm.busy_changed.connect(self._on_busy_changed)
         vm.query_failed.connect(self._on_query_failed)
+        # 20.01 (Graceful Degradation): fehlende Services -> Warn-Label.
+        vm.missing_services_detected.connect(self._on_missing_services)
         # 19.01 (Step 1): Status-Text bei Tabellen-Abfragen (total == 0 ->
         # "Keine Daten vorhanden", E1). Nur QUERY_TABLE wird ausgewertet.
         vm.data_ready.connect(self._on_data_ready)
@@ -14352,6 +14724,23 @@ class AnalyticsWindow(PersistentWindow):
     @Slot(str, str)
     def _on_query_failed(self, kind: str, error: str) -> None:
         print(f"WARN [AnalyticsWindow] Abfrage '{kind}' fehlgeschlagen: {error}")
+
+    @Slot(list)
+    def _on_missing_services(self, missing: List[str]) -> None:
+        """Zeigt an, welche gespeicherten Services nicht mehr verfügbar sind.
+
+        20.01 (Graceful Degradation): Fehlende feature_ids (entfernte/
+        umbenannte Plugins) wurden beim Profil-/Workspace-Restore isoliert
+        gefiltert – die verbliebenen Quellen bleiben aktiv. Das Label wird
+        bei manueller Datenquellen-Aenderung oder save_profile() versteckt.
+        """
+        missing = [str(m) for m in missing or [] if str(m or "").strip()]
+        if not missing:
+            self.label_missing_warning.setVisible(False)
+            return
+        self.label_missing_warning.setText(
+            f"⚠️ {len(missing)} Services nicht mehr verfügbar")
+        self.label_missing_warning.setVisible(True)
 
     @Slot(str, dict)
     def _on_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
@@ -14547,6 +14936,9 @@ class AnalyticsWindow(PersistentWindow):
         """Explicit Save: Name/Beschreibung + aktuelle Parameter persistieren."""
         if self._vm.active_profile is None:
             return
+        # 20.01: save_profile() bestaetigt die aktuelle Datenquellen-Wahl ->
+        # Warn-Label (fehlende Services) zuruecksetzen.
+        self.label_missing_warning.setVisible(False)
         pid = self._vm.active_profile["profile_id"]
         self._vm.update_profile(
             pid,
@@ -14593,6 +14985,59 @@ class AnalyticsWindow(PersistentWindow):
     # ------------------------------------------------------------------
     # Initiale Ladung + Lebenszyklus
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Workspace-Persistenz (20.01, E1/E7): vm.params + UI-Layout
+    # ------------------------------------------------------------------
+    def _save_workspace(self) -> None:
+        """Persistiert den Analytics-Workspace (VM-Parameter + Layout).
+
+        20.01: Payload = {"params": vm.params, "layout": {"page_index": ...}}.
+        Wird im closeEvent VOR super().closeEvent() ausgefuehrt, damit die
+        instance_states-Zeile (inkl. workspace_state) das Fenster ueberlebt
+        (E1: _keep_history_on_close = True).
+        """
+        try:
+            payload = {
+                "params": self._vm.params,
+                "layout": {
+                    "page_index": self.sidebar.currentRow()
+                    if hasattr(self, "sidebar") else 0,
+                },
+            }
+            self.state_manager.save_workspace_state(
+                self.INSTANCE_ID, payload)
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] Workspace-Save fehlgeschlagen: {e}")
+
+    def _restore_workspace(self) -> None:
+        """Stellt den letzten Workspace wieder her (20.01, E7).
+
+        Laeuft NACH load_profiles() (aktives Profil wird zuerst angewendet);
+        der Workspace (letzter Sitzungszustand) gewinnt. Fehlende Services
+        meldet der ViewModel via missing_services_detected -> Warn-Label.
+        """
+        try:
+            payload = self.state_manager.get_workspace_state(
+                self.INSTANCE_ID)
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] Workspace-Restore fehlgeschlagen: {e}")
+            return
+        if not payload:
+            return
+        self._vm.restore_workspace(payload)
+        # Combos/Button mit den restaurierten VM-Parametern synchronisieren.
+        self._sync_profile_filters()
+        self._sync_service_filter_button()
+        page_index = int(
+            (self._vm.workspace_layout or {}).get("page_index", -1))
+        if 0 <= page_index < self.pages_stack.count():
+            self.sidebar.setCurrentRow(page_index)
+        # Limit-Feld mit dem VM-Wert synchronisieren (Workspace kann abweichen).
+        if hasattr(self, "edit_limit"):
+            self.edit_limit.setText(
+                str(int(self._vm.params.get("limit")
+                        or self._default_limit)))
+
     def _initial_load(self) -> None:
         # VM mit dem aktuellen Combo-Zustand starten (Fix 15.03, idempotent):
         # restore_state (t=0) bzw. _apply_profile koennen bereits Werte gesetzt
@@ -14614,21 +15059,26 @@ class AnalyticsWindow(PersistentWindow):
         # name='' persistieren und die Combo zeigt '?'. Deshalb die Felder
         # hier aus dem (ggf. geladenen) aktiven Profil synchronisieren.
         self._sync_profile_editor()
+        # 20.01 (E7): Workspace NACH dem aktiven Profil anwenden – der letzte
+        # Sitzungszustand gewinnt. Fehlende Services -> Warn-Label.
+        self._restore_workspace()
         self._on_page_changed(self.sidebar.currentRow())
         # 15.03-E: QUERY_FEATURES speiste das entfernte combo_feature-Dropdown –
         # ohne Feature-Dropdown ist keine Features-Metadaten-Abfrage noetig.
 
     def closeEvent(self, event) -> None:
-        """Stoppt Debounce + laufenden Worker (PersistentWindow speichert).
+        """Stoppt Debounce + Worker und persistiert den Workspace.
 
-        Der Fenster-Historie-Eintrag bleibt dank _keep_history_on_close
-        erhalten, damit Symbol/Timeframe beim naechsten Oeffnen
-        wiederhergestellt werden (Fix 15.03).
+        Der Fenster-Historie-Eintrag bleibt dank _keep_history_on_close =
+        True erhalten, damit Symbol/Timeframe UND Workspace
+        (instance_states.workspace_state) beim naechsten Oeffnen
+        wiederhergestellt werden (20.01 E1).
         """
         try:
             self._vm.shutdown()
         except Exception:
             pass
+        self._save_workspace()
         super().closeEvent(event)
 
 ```
@@ -33997,11 +34447,11 @@ check("H7) Groesse folgt dem Inhalt (nicht DB-Groesse 900x600)",
 w2.close()
 pump()
 
-# AnalyticsWindow behaelt die chart_win-Semantik (manuelles Schliessen
-# entfernt History; auto_restore=True wie bisher).
+# 20.01 (E1): AnalyticsWindow ist ein Dashboard-Fenster - der Workspace
+# (instance_states.workspace_state) muss das manuelle Schliessen ueberleben.
 from analytics.ui.analytics_win import AnalyticsWindow  # noqa: E402
-check("H8) AnalyticsWindow aus History entfernt (keep_history=False)",
-      getattr(AnalyticsWindow, "_keep_history_on_close", False) is False)
+check("H8) AnalyticsWindow behaelt History (keep_history=True, 20.01 E1)",
+      getattr(AnalyticsWindow, "_keep_history_on_close", False) is True)
 check("H9) AnalyticsWindow auto_restore aktiv (offen beim App-Ende)",
       PersistentWindow.should_auto_restore("win_analytics"))
 
@@ -38388,14 +38838,14 @@ _pid33 = _profile_repo33.create_profile(
                      "table_row_height": 25, "table_sort_column": 1,
                      "table_sort_order": 0})
 _p2_33 = _profile_repo33.get_profile(_pid33)
-check("33 R2a) Tabellen-Keys im Payload",
-      _p2_33["payload"]["table_column_widths"] == {"Zeit": 199}
-      and _p2_33["payload"]["table_row_height"] == 25
-      and _p2_33["payload"]["table_sort_column"] == 1
-      and _p2_33["payload"]["table_sort_order"] == 0,
+check("33 R2a) Tabellen-Keys im Payload (v2-Section 'table')",
+      (_p2_33["payload"].get("table") or {}).get("table_column_widths") == {"Zeit": 199}
+      and (_p2_33["payload"].get("table") or {}).get("table_row_height") == 25
+      and (_p2_33["payload"].get("table") or {}).get("table_sort_column") == 1
+      and (_p2_33["payload"].get("table") or {}).get("table_sort_order") == 0,
       str(_p2_33["payload"]))
-check("33 R2b) schema_version bleibt 1",
-      _p2_33["payload"].get("schema_version") == 1,
+check("33 R2b) schema_version auf 2 migriert",
+      _p2_33["payload"].get("schema_version") == 2,
       str(_p2_33["payload"].get("schema_version")))
 
 # R3: Profil-Laden uebernimmt Tabellen-Keys (_apply_profile).
@@ -38736,9 +39186,9 @@ check("35 Z1d) nach Refresh: ALLE Zeilen = 45 (globale Hoehe angewendet)",
       f"sizes={[_vh35.sectionSize(i) for i in range(5)]}")
 _vm35.save_profile()
 _pay35 = _profile_repo35.get_profile(_vm35.active_profile["profile_id"])["payload"]
-check("35 Z1e) table_row_height im Profil-Payload",
-      _pay35.get("table_row_height") == 45,
-      str(_pay35.get("table_row_height")))
+check("35 Z1e) table_row_height im Profil-Payload (v2-Section 'table')",
+      (_pay35.get("table") or {}).get("table_row_height") == 45,
+      str(_pay35.get("table")))
 _vm35b = AnalyticsViewModel(analytics_repo=_repo35, profile_repo=_profile_repo35)
 _vm35b.set_active_profile(_vm35.active_profile["profile_id"])
 check("35 Z1f) _apply_profile uebernimmt table_row_height",
@@ -38790,6 +39240,189 @@ check("35 Z2d) ohne aktives Profil: Felder leer",
       f"name={_dummy35b.edit_profile_name.text()!r}")
 
 shutil.rmtree(_tmp35, ignore_errors=True)
+
+print("\n=== Teil 36: Phase 20.01 - Workspace-Restore & Fault-Tolerant Resolver ===")
+from analytics.engine.analytics_view_model import AnalyticsViewModel as _VM36  # noqa: E402
+from analytics_profile_repository import AnalyticsProfileRepository as _APR36  # noqa: E402
+from analytics.engine.service_selector_model import ServiceSelectorModel as _SSM36  # noqa: E402
+
+# --- W8: Klassen-Check _keep_history_on_close (E1) -------------------------
+check("36 W8) AnalyticsWindow._keep_history_on_close is True (E1)",
+      AnalyticsWindow._keep_history_on_close is True,
+      str(AnalyticsWindow._keep_history_on_close))
+
+# --- W1/W2: workspace_state-Spalte + Roundtrip (E6, NOT-NULL-konform) ------
+_tmp36 = tempfile.mkdtemp(prefix="p2001_")
+_db36_app = os.path.join(_tmp36, "app_data.duckdb")
+_db36_ana = os.path.join(_tmp36, "analytics.duckdb")
+for _p36f in (_db36_app, _db36_ana):
+    _c36 = duckdb.connect(_p36f)
+    _c36.execute("CREATE TABLE t (x INTEGER)")
+    _c36.close()
+_sm36 = StateManager(_db36_app)
+_cols36 = [r[0] for r in _sm36._get_connection().execute(
+    "SELECT column_name FROM information_schema.columns "
+    "WHERE table_name = 'instance_states'").fetchall()]
+check("36 W1a) workspace_state-Spalte idempotent angelegt",
+      "workspace_state" in _cols36, str(_cols36))
+_sm36b = StateManager(_db36_app)  # zweiter Aufruf -> ALTER ist No-op
+check("36 W1b) workspace_state-Spalte idempotent (2. Aufruf)",
+      "workspace_state" in [r[0] for r in _sm36b._get_connection().execute(
+          "SELECT column_name FROM information_schema.columns "
+          "WHERE table_name = 'instance_states'").fetchall()], "")
+
+# Roundtrip OHNE vorherige instance_states-Row (E6: Fallback ''/'M1').
+_ws36 = {"params": {"symbol": "XAGUSD", "limit": 1234},
+         "layout": {"page_index": 2}}
+_sm36.save_workspace_state("win_analytics", _ws36)
+check("36 W2a) save/get_workspace_state Roundtrip (ohne existierende Row)",
+      _sm36.get_workspace_state("win_analytics") == _ws36,
+      str(_sm36.get_workspace_state("win_analytics")))
+_row36 = _sm36._get_connection().execute(
+    "SELECT symbol, timeframe FROM instance_states "
+    "WHERE instance_id = 'win_analytics'").fetchone()
+check("36 W2b) NOT-NULL-Fallback: symbol/timeframe der Row gesetzt",
+      _row36 is not None and str(_row36[0]) == ""
+      and str(_row36[1]) == "M1", str(_row36))
+_ws36b = {"params": {"symbol": "EURUSD"}, "layout": {"page_index": 3}}
+_sm36.save_workspace_state("win_analytics", _ws36b)
+check("36 W2c) Upsert aktualisiert workspace_state",
+      _sm36.get_workspace_state("win_analytics") == _ws36b,
+      str(_sm36.get_workspace_state("win_analytics")))
+_row36b = _sm36._get_connection().execute(
+    "SELECT symbol, timeframe FROM instance_states "
+    "WHERE instance_id = 'win_analytics'").fetchone()
+check("36 W2d) Upsert laesst symbol/timeframe der Row unberuehrt",
+      _row36b is not None and str(_row36b[1]) == "M1", str(_row36b))
+check("36 W2e) get_workspace_state fuer unbekannte Instanz -> None",
+      _sm36.get_workspace_state("win_unbekannt") is None, "")
+
+# --- W3: v1 -> v2 Migration verlustfrei (E3) -------------------------------
+_v1_36 = {
+    "schema_version": 1,
+    "symbol": "XAGUSD",
+    "timeframe": "H1",
+    "feature_id": "srv_grid_lines",
+    "limit": 777,
+    "table_row_height": 30,
+    "custom_extra": {"a": 1},
+}
+_v2_36 = _APR36._migrate_v1_to_v2(dict(_v1_36))
+check("36 W3a) v1->v2: schema_version == 2",
+      _v2_36.get("schema_version") == 2, str(_v2_36))
+check("36 W3b) v1->v2: Sektionen sources/charts/table/styling",
+      (_v2_36.get("sources") or {}).get("symbol") == "XAGUSD"
+      and (_v2_36.get("sources") or {}).get("timeframe") == "H1"
+      and (_v2_36.get("table") or {}).get("limit") == 777
+      and (_v2_36.get("table") or {}).get("table_row_height") == 30
+      and _v2_36.get("styling") == {},
+      str(_v2_36))
+check("36 W3c) v1->v2: feature_id -> feature_ids (Liste)",
+      (_v2_36.get("sources") or {}).get("feature_ids") == ["srv_grid_lines"]
+      and "feature_id" not in (_v2_36.get("sources") or {}),
+      str(_v2_36.get("sources")))
+check("36 W3d) v1->v2: unbekannte Top-Level-Keys verlustfrei erhalten",
+      _v2_36.get("custom_extra") == {"a": 1},
+      str(_v2_36.get("custom_extra")))
+check("36 W3e) v2-Payload wird nicht doppelt migriert (Idempotenz)",
+      _APR36._migrate_v1_to_v2(dict(_v2_36)) == _v2_36, "")
+
+# --- W4: _ensure_schema_version migriert v1-Flat beim Schreiben (E4) -------
+_profile_repo36 = _APR36(_db36_app)
+_pid36 = _profile_repo36.create_profile(
+    "P36", payload={"symbol": "XAGUSD", "limit": 99})
+_p36 = _profile_repo36.get_profile(_pid36)
+check("36 W4a) create_profile migriert v1-Flat -> v2-Sections",
+      _p36["payload"].get("schema_version") == 2
+      and (_p36["payload"].get("sources") or {}).get("symbol") == "XAGUSD"
+      and (_p36["payload"].get("table") or {}).get("limit") == 99,
+      str(_p36["payload"]))
+
+# --- W5: Resolver valid/missing + 'native' -> missing (B7) -----------------
+_model36 = _p1608_model({
+    "srv_a": _P1608Plugin("srv_a"),
+    "srv_b": _P1608Plugin("srv_b"),
+})
+_res36 = _model36.resolve_valid_feature_ids(
+    ["srv_a", "srv_b", "srv_gone", "native", "SRV_A"])
+check("36 W5a) Resolver: valid = registrierte (case-insensitiv, dedupliziert)",
+      _res36[0] == ["srv_a", "srv_b"], str(_res36[0]))
+check("36 W5b) Resolver: missing = nicht registrierte + 'native' (B7)",
+      _res36[1] == ["srv_gone", "native"], str(_res36[1]))
+check("36 W5c) Resolver: leere Liste -> ([], [])",
+      _model36.resolve_valid_feature_ids([]) == ([], []), "")
+
+# --- W6: _apply_profile v2 -> flache _params, kein Dirty (E5) --------------
+_repo36 = AnalyticsRepository(FeatureStoreReader(_db36_ana))
+_vm36 = AnalyticsViewModel(analytics_repo=_repo36, profile_repo=_profile_repo36,
+                           selector_model=_model36)
+_missing36 = []
+_vm36.missing_services_detected.connect(lambda m: _missing36.append(list(m)))
+_pid36b = _profile_repo36.create_profile(
+    "P36b", payload={
+        "schema_version": 1,
+        "symbol": "XAGUSD",
+        "timeframe": "M15",
+        "feature_id": "srv_a",
+        "limit": 4321,
+    })
+_vm36.set_active_profile(_pid36b)
+check("36 W6a) _apply_profile: feature_ids nur valide",
+      _vm36.params.get("feature_ids") == ["srv_a"],
+      str(_vm36.params.get("feature_ids")))
+check("36 W6b) _apply_profile: kein Dirty-Flag beim Profilwechsel",
+      _vm36.is_dirty is False, str(_vm36.is_dirty))
+check("36 W6c) _apply_profile: v2-Sections flach uebernommen",
+      _vm36.params.get("symbol") == "XAGUSD"
+      and _vm36.params.get("timeframe") == "M15"
+      and _vm36.params.get("limit") == 4321,
+      str({k: _vm36.params.get(k)
+           for k in ("symbol", "timeframe", "limit")}))
+
+# v1-Flat-Payload MIT fehlendem Service -> Emit + Filter
+_pid36c = _profile_repo36.create_profile(
+    "P36c", payload={"symbol": "XAGUSD", "feature_id": "srv_gone"})
+_vm36b = AnalyticsViewModel(analytics_repo=_repo36, profile_repo=_profile_repo36,
+                            selector_model=_model36)
+_missing36b = []
+_vm36b.missing_services_detected.connect(lambda m: _missing36b.append(list(m)))
+_vm36b.set_active_profile(_pid36c)
+check("36 W6d) missing_services_detected emittiert fehlende ID",
+      _missing36b and _missing36b[-1] == ["srv_gone"], str(_missing36b))
+check("36 W6e) fehlende ID wird aus _params entfernt",
+      _vm36b.params.get("feature_ids") == [],
+      str(_vm36b.params.get("feature_ids")))
+
+# --- W7: restore_workspace: params + layout.page_index, kein Dirty (E7) ----
+_vm36c = AnalyticsViewModel(analytics_repo=_repo36, profile_repo=_profile_repo36,
+                            selector_model=_model36)
+_missing36c = []
+_vm36c.missing_services_detected.connect(lambda m: _missing36c.append(list(m)))
+_ws36c = {
+    "params": {"symbol": "EURUSD", "timeframe": "H4", "limit": 888,
+               "feature_ids": ["srv_b", "srv_gone"]},
+    "layout": {"page_index": 2},
+}
+_vm36c.restore_workspace(_ws36c)
+check("36 W7a) restore_workspace: params uebernommen (Workspace gewinnt)",
+      _vm36c.params.get("symbol") == "EURUSD"
+      and _vm36c.params.get("timeframe") == "H4"
+      and _vm36c.params.get("limit") == 888,
+      str({k: _vm36c.params.get(k)
+           for k in ("symbol", "timeframe", "limit")}))
+check("36 W7b) restore_workspace: feature_ids gefiltert + Emit",
+      _vm36c.params.get("feature_ids") == ["srv_b"]
+      and _missing36c and _missing36c[-1] == ["srv_gone"],
+      str(_vm36c.params.get("feature_ids")))
+check("36 W7c) restore_workspace: kein Dirty-Flag",
+      _vm36c.is_dirty is False, str(_vm36c.is_dirty))
+check("36 W7d) workspace_layout (page_index) verfuegbar",
+      (_vm36c.workspace_layout or {}).get("page_index") == 2,
+      str(_vm36c.workspace_layout))
+check("36 W7e) restore_workspace mit None -> kein Fehler",
+      _vm36c.restore_workspace(None) is None, "")
+
+shutil.rmtree(_tmp36, ignore_errors=True)
 
 if FAILURES:
     print(f"FEHLER: {len(FAILURES)}: {FAILURES}")

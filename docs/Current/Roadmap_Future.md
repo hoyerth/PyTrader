@@ -61,6 +61,10 @@ Others Topics -
 1. **Exporte:** Export von gefilterten Daten und Matrizen als CSV, Excel oder PNG/SVG-Grafik.
 2. **Multi-Symbol und Multi-Timeframe:** Gezielter Vergleich mehrerer Symbole/Timeframes nebeneinander in einer Matrix oder Kurve.
 3. **Massentests & Parameter-Optimierung:** Automatische Parameter-Sweeps über verschiedene Zeiträume, Service-Parameter und ML-Variablen.
+Damit es auch in Zukunft so zukunftssicher bleibt, solltest du bei der Umsetzung von ML & Massentests auf 3 Dinge achten:
+    Heavy Models Cachen (Lazy Loading): ML-Modelle (wie PyTorch-Weights oder XGBoost-Pickles) dürfen nicht bei jedem calculate()-Aufruf neu von der Festplatte geladen werden. Nutze dafür den shared_state des PluginContext oder Klassen-Attribute im Plugin.
+    Feature Store Payload-Größe im Auge behalten: ML-Modelle erzeugen oft hunderte Features. Dein feature_data JSON-Feld in DuckDB verkraftet das problemlos, aber begrenze die Menge der geschriebenen Keys in der DB auf das, was du in der UI (Heatmap/Scatter) auch wirklich analysieren willst.
+    Async Batch Processing: Massentests für Parameter-Grid-Searches sollten immer eigene isolierte *.duckdb-Dateien in test/ nutzen (Invariante 10), um die Haupt-Analytics-DB nicht mit temporärem Optimierungs-Müll zu verstopfen.
 4. **Aktive ML-Inferenz:** In Phase 15 wird ML noch nicht aktiv eingebunden; die bestehenden Profil-Strukturen (`"ml_models"` im JSON-Payload) bleiben rein vorbereitend vorhanden.
 6. **VectorBT: ** Einsatz prüfen für Massentests und Matrix-Analysen - Als Engine im analytics_worker.py für blitzschnelle N-Bar Outcomes, Heatmaps & Indikator-Sweeps.
 
