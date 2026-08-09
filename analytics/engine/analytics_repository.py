@@ -185,6 +185,28 @@ class AnalyticsRepository:
         """
         return self.reader.fetch_ohlcv_snapshot(symbol, timeframe, limit=limit)
 
+    # 20.02-Bugfix (09.08.2026, Punkt 1+2): Tages-Ohlc fuer das Candle-Overlay
+    # im selben Canvas – SQL-seitig aggregiert (deckt den gesamten
+    # Heatmap-Zeitraum ab, statt nur der letzten OHLCV_SNAPSHOT_LIMIT Bars).
+    def get_daily_ohlc(
+        self,
+        symbol: str,
+        timeframe: str,
+        max_days: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Tages-Ohlc je Wanduhr-Datum (read-only, Wanduhr-Mitternachts-Epochs).
+
+        20.02-Bugfix: Additive Alternative zum OHLCV-Snapshot – das
+        HeatmapWidget zeichnet die Tages-Candles ueber die Heatmap-Zellen
+        (gleicher Canvas, rechte Preis-Achse). Kein SQL in der UI.
+
+        Returns:
+            {"bars": [{"time": int(Wanduhr-Mitternachts-Epoch), "open": float,
+                       "high": float, "low": float, "close": float}, ...],
+             "symbol", "timeframe"}
+        """
+        return self.reader.fetch_daily_ohlc(symbol, timeframe, max_days=max_days)
+
     # ------------------------------------------------------------------
     # Scatter
     # ------------------------------------------------------------------

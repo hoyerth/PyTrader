@@ -33,6 +33,7 @@ from analytics.engine.analytics_worker import (
     QUERY_HEATMAP,
     QUERY_HEATMAP_GENERIC,
     QUERY_OHLCV,
+    QUERY_DAILY_OHLC,
     QUERY_SCATTER,
     QUERY_DISTRIBUTION,
     QUERY_FEATURES,
@@ -186,6 +187,13 @@ class AnalyticsViewModel(QObject):
 
     def request_ohlcv_snapshot(self) -> None:
         self._refresh((QUERY_OHLCV,))
+
+    # 20.02-Bugfix (09.08.2026, Punkt 1+2): Tages-Ohlc fuer das Candle-Overlay
+    # im selben Canvas – SQL-seitig aggregiert (deckt den gesamten
+    # Heatmap-Zeitraum ab; das HeatmapWidget nutzt diesen Query statt
+    # QUERY_OHLCV).
+    def request_daily_ohlc(self) -> None:
+        self._refresh((QUERY_DAILY_OHLC,))
 
     def request_scatter(self) -> None:
         self._refresh((QUERY_SCATTER,))
@@ -527,15 +535,22 @@ class AnalyticsViewModel(QObject):
             base["metric"] = p["heatmap_metric"]
         elif kind == QUERY_HEATMAP_GENERIC:
             # 20.02: Generische 2D-Heatmap – Konfiguration aus den heatmap_*-
-            # _params; limit = Lookback-Ausschnitt (Reader-CTE).
+            # _params. 20.02-Bugfix (09.08.2026, Punkt 2): KEIN limit-Lookback
+            # mehr (limit=None => ALLE verfuegbaren Daten; der Pivot-Deckel
+            # MAX_HEATMAP_CELLS im Reader begrenzt die Matrix). Vorher schnitt
+            # der 5000er-Lookback die Heatmap auf die letzten ~4 Tage (M1) ab.
             base["x_dim"] = p["heatmap_x_dim"]
             base["y_dim"] = p["heatmap_y_dim"]
             base["field"] = p.get("heatmap_field") or None
             base["agg"] = p["heatmap_agg"]
-            base["limit"] = p["limit"]
         elif kind == QUERY_OHLCV:
             # 20.02 (E9): OHLCV-Snapshot – limit=None => Reader-Default
             # (OHLCV_SNAPSHOT_LIMIT); kein feature_ids-Filter noetig.
+            pass
+        elif kind == QUERY_DAILY_OHLC:
+            # 20.02-Bugfix (09.08.2026): Tages-Ohlc fuer das Candle-Overlay –
+            # max_days=None => Reader-Default DAILY_OHLC_MAX_DAYS (4000 Tage,
+            # deckt den gesamten Heatmap-Zeitraum).
             pass
         elif kind == QUERY_SCATTER:
             base["x_column"] = p["scatter_x"]

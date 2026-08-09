@@ -31,6 +31,8 @@ die DB-Zeile bleibt unveraendert (Lesen ist rein).
 """
 
 import os
+from datetime import datetime as _dt_datetime
+from datetime import timezone as _dt_timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -109,6 +111,14 @@ MAX_HEATMAP_CELLS = 50_000
 # 20.02 (E9): Default-Lookback des OHLCV-Snapshots fuer das Candle-Overlay
 # (analog DEFAULT_LIMIT 5000 der Analytics-Tabelle; M1 ≈ 3,5 Tage).
 OHLCV_SNAPSHOT_LIMIT = 5000
+
+# 20.02-Bugfix (09.08.2026, Punkt 2/User-Meldung): Der kuenstliche
+# Limit-Lookback (5000) schnitt die Heatmap-Daten ab (sichtbar waren nur die
+# letzten ~4 Tage bei M1). Die generische Heatmap laedt seither ALLE
+# verfuegbaren Daten (limit=None, Pivot-Deckel MAX_HEATMAP_CELLS begrenzt die
+# Matrix). Das Candle-Overlay aggregiert Tages-Ohlc SQL-seitig ueber bis zu
+# DAILY_OHLC_MAX_DAYS Tage (deckt den gesamten Heatmap-Zeitraum ab).
+DAILY_OHLC_MAX_DAYS = 4000
 
 
 class FeatureStoreReader:
@@ -309,6 +319,47 @@ class FeatureStoreReader:
         except (TypeError, ValueError):
             pass
         return str(value)
+
+    @staticmethod
+    def _axis_coords(dim: str, values: List[Any]) -> List[float]:
+        """Achsen-Koordinaten (natuerliche Werte) je Matrix-Zeile/-Spalte.
+
+        20.02-Bugfix (09.08.2026, Punkte 3-6/User-Meldung): Fuer die
+        TradingView-aehnliche Achsen-Darstellung tragen die Achsen die
+        NATUERLICHEN Werte statt Zell-Indizes:
+          - `date`      -> Wanduhr-Mitternachts-Epoch (Sekunden)
+          - hour/dow    -> die ganzzahligen Werte (0-23 bzw. 0-6)
+          - dow_hour    -> 0..167 (Mo_00..So_23)
+          - kategorial  -> Indizes 0..n-1 (timeframe/service_id/symbol)
+        Das Widget mappt das ImageItem per setRect auf diesen Bereich und
+        erzeugt dynamische Ticks je Zoom-Level (bis zur Minute bei Datum).
+        """
+        if dim == "date":
+            out: List[float] = []
+            for v in values:
+                if isinstance(v, _dt_datetime):
+                    out.append(float(int(v.timestamp())))
+                elif hasattr(v, "year") and hasattr(v, "month") \
+                        and hasattr(v, "day"):
+                    # date-Objekt (CAST AS DATE): Mitternacht Wanduhr-UTC
+                    out.append(float(int(_dt_datetime(
+                        v.year, v.month, v.day,
+                        tzinfo=_dt_timezone.utc).timestamp())))
+                else:
+                    try:
+                        out.append(float(int(_dt_datetime.fromisoformat(
+                            str(v)).replace(tzinfo=_dt_timezone.utc)
+                            .timestamp())))
+                    except (TypeError, ValueError):
+                        out.append(0.0)
+            return out
+        if dim in ("hour", "dow", "dow_hour"):
+            try:
+                return [float(int(v)) for v in values]
+            except (TypeError, ValueError):
+                return [float(i) for i in range(len(values))]
+        # Kategorial (timeframe/service_id/symbol): Indizes 0..n-1.
+        return [float(i) for i in range(len(values))]
 
     def available_feature_keys(
         self,
@@ -753,6 +804,11 @@ class FeatureStoreReader:
             "y_labels": [self._format_dim_value(y_key, v) for v in y_values],
             # Rohwerte als ISO-Strings (Candle-Overlay-E9: Datum -> Datumsobjekt)
             "x_values": [str(v) for v in x_values],
+            # 20.02-Bugfix (09.08.2026): Natuerliche Achsen-Koordinaten
+            # (date -> Mitternachts-Epochs, hour/dow_hour -> Ganzzahlen,
+            # kategorial -> Indizes) fuer die dynamischen Achsen-Ticks.
+            "x_axis": self._axis_coords(x_key, x_values),
+            "y_axis": self._axis_coords(y_key, y_values),
             "min_val": min_val,
             "max_val": max_val,
             "x_dim": x_key,
@@ -778,6 +834,8 @@ class FeatureStoreReader:
             "x_labels": [],
             "y_labels": [],
             "x_values": [],
+            "x_axis": [],
+            "y_axis": [],
             "min_val": 0.0,
             "max_val": 0.0,
             "x_dim": str(x_dim or "").lower(),
@@ -852,6 +910,95 @@ class FeatureStoreReader:
                     "low": float(r[3]),
                     "close": float(r[4]),
                     "volume": float(r[5]) if r[5] is not None else 0.0,
+                })
+            except (TypeError, ValueError):
+                continue
+        # Aufsteigend (chronologisch) – das Widget rendert von links nach rechts.
+        bars.reverse()
+        return {"bars": bars, "symbol": symbol, "timeframe": timeframe}
+
+    # ------------------------------------------------------------------
+    # Lesen: Tages-OHLC fuer das Candle-Overlay (20.02-Bugfix, 09.08.2026)
+    # ------------------------------------------------------------------
+    def fetch_daily_ohlc(
+        self,
+        symbol: str,
+        timeframe: str,
+        max_days: Optional[int] = None,
+        market_db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Tages-Ohlc je Wanduhr-Datum (SQL-seitig aggregiert, read-only).
+
+        20.02-Bugfix (09.08.2026, Punkt 1+2/User-Meldung): Das Candle-Overlay
+        muss im GLEICHEN Canvas ueber der Heatmap liegen und den GESAMTEN
+        Heatmap-Zeitraum abdecken. Dafuer werden die ohlcv_bars SQL-seitig pro
+        Wanduhr-Datum zu einem Tages-Candle aggregiert (GROUP BY Datum in
+        UTC-Darstellung – die Epochs sind Wanduhr-encoded, Invariante 7) –
+        um Groessenordnungen schneller als das Laden aller Bars + Python-
+        Gruppierung (bei M1 wären das sonst > 1 Mio. Bars).
+
+        Wanduhr-Garantie (Invariante 7): `CAST("time" AT TIME ZONE 'UTC' AS
+        DATE)` liefert das Wanduhr-Datum; die Mitternachts-Epoch wird als
+        UTC-Darstellung berechnet (exakt die Wanduhr-Epoch des Tages).
+
+        Args:
+            symbol/timeframe: Filter (case-insensitive)
+            max_days: Max. Anzahl Tage (Default DAILY_OHLC_MAX_DAYS = 4000;
+                deckt ~11 Jahre M1 bzw. den gesamten Heatmap-Zeitraum).
+            market_db_path: Testbarkeit (Seam) – Default DB_MARKET.
+
+        Returns:
+            {"bars": [{"time": int(Wanduhr-Mitternachts-Epoch), "open": float,
+                       "high": float, "low": float, "close": float}, ...]
+             (aufsteigend chronologisch), "symbol", "timeframe"}
+        """
+        if not symbol or not timeframe:
+            return {"bars": [], "symbol": symbol, "timeframe": timeframe}
+        if max_days is None:
+            max_days = DAILY_OHLC_MAX_DAYS
+        con = DbPool.get(market_db_path or DB_MARKET)
+        try:
+            rows = con.execute("""
+                SELECT
+                    CAST("time" AT TIME ZONE 'UTC' AS DATE) AS d,
+                    FIRST(open ORDER BY "time") AS open,
+                    MAX(high) AS high,
+                    MIN(low) AS low,
+                    LAST(close ORDER BY "time") AS close
+                FROM ohlcv_bars
+                WHERE LOWER(symbol) = LOWER(?)
+                  AND LOWER(timeframe) = LOWER(?)
+                  AND "time" IS NOT NULL
+                  AND open IS NOT NULL AND high IS NOT NULL
+                  AND low IS NOT NULL AND close IS NOT NULL
+                GROUP BY 1
+                ORDER BY 1 DESC
+                LIMIT ?
+            """, [symbol, timeframe, int(max_days)]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_daily_ohlc "
+                  f"fehlgeschlagen: {e}")
+            return {"bars": [], "symbol": symbol, "timeframe": timeframe}
+
+        bars: List[Dict[str, Any]] = []
+        for r in rows:
+            d = r[0]
+            if d is None:
+                continue
+            try:
+                if hasattr(d, "year") and hasattr(d, "month") and hasattr(d, "day"):
+                    epoch = int(_dt_datetime(
+                        d.year, d.month, d.day,
+                        tzinfo=_dt_timezone.utc).timestamp())
+                else:
+                    epoch = int(_dt_datetime.fromisoformat(
+                        str(d)).replace(tzinfo=_dt_timezone.utc).timestamp())
+                bars.append({
+                    "time": epoch,
+                    "open": float(r[1]),
+                    "high": float(r[2]),
+                    "low": float(r[3]),
+                    "close": float(r[4]),
                 })
             except (TypeError, ValueError):
                 continue

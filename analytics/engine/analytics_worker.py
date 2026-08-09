@@ -38,6 +38,8 @@ Abfrage-Typen (query_kind, Single Source of Truth fuer Worker & ViewModel):
     QUERY_HEATMAP_GENERIC – 2D-Matrix mit freien Dimensionen/Aggregationen
                             (20.02, additiv)
     QUERY_OHLCV        – OHLCV-Snapshot fuer das Candle-Overlay (20.02, E9)
+    QUERY_DAILY_OHLC   – Tages-Ohlc (SQL-seitig aggregiert) fuer das
+                         Candle-Overlay im selben Canvas (20.02-Bugfix)
     QUERY_SCATTER      – X/Y-Paare zweier nativer Spalten
     QUERY_DISTRIBUTION – Histogramm (bins/counts)
     QUERY_FEATURES     – Metadaten (Plugin-IDs, Spalten, Zeilenzahl)
@@ -55,6 +57,10 @@ QUERY_HEATMAP = "heatmap"
 # (Dow×Stunde) bleibt unveraendert.
 QUERY_HEATMAP_GENERIC = "heatmap_generic"
 QUERY_OHLCV = "ohlcv"
+# 20.02-Bugfix (09.08.2026, Punkt 1+2): Tages-Ohlc fuer das Candle-Overlay im
+# selben Canvas – SQL-seitig aggregiert (fetch_daily_ohlc), deckt den gesamten
+# Heatmap-Zeitraum ab statt nur OHLCV_SNAPSHOT_LIMIT Bars.
+QUERY_DAILY_OHLC = "daily_ohlc"
 QUERY_SCATTER = "scatter"
 QUERY_DISTRIBUTION = "distribution"
 QUERY_FEATURES = "features"
@@ -184,6 +190,14 @@ class AnalyticsAsyncWorker(QThread):
                 symbol, timeframe,
                 limit=cap_lookback_limit(p.get("limit")),
             )
+        if self._query_kind == QUERY_DAILY_OHLC:
+            # 20.02-Bugfix (09.08.2026): Tages-Ohlc (SQL-seitig aggregiert)
+            # fuer das Candle-Overlay im selben Canvas – max_days=None ->
+            # Reader-Default DAILY_OHLC_MAX_DAYS (4000 Tage).
+            return repo.get_daily_ohlc(
+                symbol, timeframe,
+                max_days=cap_lookback_limit(p.get("max_days")),
+            )
         if self._query_kind == QUERY_SCATTER:
             return repo.get_scatter(
                 symbol, timeframe,
@@ -208,6 +222,6 @@ class AnalyticsAsyncWorker(QThread):
         raise ValueError(
             f"[AnalyticsAsyncWorker] Unbekannte Abfrage '{self._query_kind}' – "
             f"erlaubt: {QUERY_TABLE}, {QUERY_HEATMAP}, {QUERY_HEATMAP_GENERIC}, "
-            f"{QUERY_OHLCV}, {QUERY_SCATTER}, {QUERY_DISTRIBUTION}, "
-            f"{QUERY_FEATURES}."
+            f"{QUERY_OHLCV}, {QUERY_DAILY_OHLC}, {QUERY_SCATTER}, "
+            f"{QUERY_DISTRIBUTION}, {QUERY_FEATURES}."
         )

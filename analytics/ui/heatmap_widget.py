@@ -5,27 +5,45 @@ Candle-Overlay & Dual-Axis-Zoom (Phase 20.02).
 
 Additiv zur bestehenden HeatmapPage (Dow x Stunde, Standard-Modus): Dieses
 Widget rendert die generische 2D-Matrix (freie Dimensionen + Aggregationen)
-und den Preis-Strip (Candle-Overlay). MVVM (Invariante 4): KEIN SQL – die
-Daten kommen ueber `data_ready(QUERY_HEATMAP_GENERIC | QUERY_OHLCV, data)`
-vom ViewModel (Async-Worker).
+und das Kerzen-Overlay. MVVM (Invariante 4): KEIN SQL – die Daten kommen
+ueber `data_ready(QUERY_HEATMAP_GENERIC | QUERY_DAILY_OHLC, data)` vom
+ViewModel (Async-Worker).
 
 Entscheidungen (Review 09.08.2026, E7-E9):
 - E7: CONFLUENCE_COUNT -> diskrete Farbskala (0 = weiss, 1-2 = gelb/cyan,
   3-4 = orange, 5+ = dunkelrot); Wert-Aggregationen -> viridis (kontinuierlich).
 - E8: Zoom = EIN Faktor-Slider pro Achse (Viewport-Skalierung, zentriert),
   normalisiert [0,1] (zoom_x_range/zoom_y_range), rein client-seitig via
-  setXRange/setYRange (kein DB-Requery). Aktiv nur bei `date`-Achsen.
-- E9: Candle-Overlay = Preis-Strip UNTER der Heatmap (Tages-Ohlc je
-  Datums-Spalte, Alpha 0.3-0.5), horizontal mit der Heatmap synchronisiert
-  (Zoom X wirkt auf beide). Aktiv nur bei X-Dimension `date`.
+  setXRange/setYRange (kein DB-Requery).
+- E9: Candle-Overlay = Tages-Ohlc UEBER der Heatmap im SELBEN Canvas
+  (rechte Preis-Achse, ViewBox-Link an die X-Achse), horizontal synchronisiert.
+
+Bugfix 09.08.2026 (User-Meldungen 1-6):
+1) Das Kerzen-Overlay ist KEIN separates Fenster mehr – die Tages-Candles
+   liegen im selben PlotWidget ueber der Heatmap (rechte Preis-Achse).
+2) Die generische Heatmap laedt ALLE verfuegbaren Daten (kein 5000er-
+   Limit-Lookback mehr, ViewModel; Pivot-Deckel MAX_HEATMAP_CELLS begrenzt
+   die Matrix). Das Overlay nutzt `QUERY_DAILY_OHLC` (SQL-seitig pro Tag
+   aggregiert) und deckt damit den gesamten Heatmap-Zeitraum ab.
+3) Die Achsen tragen die NATUERLICHEN Werte (date -> Mitternachts-Epochs,
+   hour/dow_hour -> Ganzzahlen, kategorial -> Indizes); das ImageItem wird
+   per setRect exakt auf diesen Bereich gemappt – nichts wird mehr ueber
+   die Tagesgrenze hinaus gezeichnet.
+4) Achsen-Zuordnung ist explizit (x_dim -> X, y_dim -> Y), kein Vertauschen
+   mehr moeglich.
+5) Dynamische X-Ticks je Zoom-Level: date -> Jahre/Monate/Tage -> Stunden ->
+   Minuten (bis zur Minute, wie Chartfenster/TradingView).
+6) Dasselbe Prinzip gilt fuer die Y-Achse und alle Massstaebe (hour,
+   dow_hour, kategorial): je Zoom-Level werden mehr Zwischenwerte angezeigt.
 """
 
+import math
 from datetime import datetime, timezone as dt_timezone
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QRectF, Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -38,9 +56,10 @@ from PySide6.QtWidgets import (
 
 from analytics.engine.analytics_worker import (
     QUERY_HEATMAP_GENERIC,
-    QUERY_OHLCV,
+    QUERY_DAILY_OHLC,
 )
 from analytics.engine.feature_store_reader import (
+    DOW_LABELS,
     HEATMAP_AGGREGATIONS,
     HEATMAP_DIMENSIONS,
 )
@@ -56,11 +75,10 @@ _VIRIDIS = "viridis"
 
 # E6: Wert-Aggregationen benoetigen einen numerischen feature_data-JSON-Key.
 _VALUE_AGGS = ("avg", "sum", "min", "max")
-# E8: Zoom nur bei Achsen mit vielen diskreten Werten (date).
-_ZOOMABLE_DIMS = ("date",)
 
-# Max. Achsen-Beschriftungen vor Sparse-Ticks.
-_MAX_TICK_LABELS = 24
+# Tag in Sekunden (Wanduhr-Epoch-Basis fuer date-Achse).
+_DAY_SECONDS = 86400
+_HALF_DAY = 43200.0
 
 _DIM_LABELS = {
     "date": "Datum",
@@ -81,6 +99,122 @@ _AGG_LABELS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Dynamische Achse (Bugfix 09.08.2026, Punkte 3/5/6)
+# ---------------------------------------------------------------------------
+def _pick_time_step(span: float, max_ticks: int) -> float:
+    """Waelt einen 'sauberen' Zeit-Schritt (Sekunden) fuer den Bereich."""
+    if span <= 0:
+        return 0.0
+    min_step = span / max(1, max_ticks)
+    # 1s, 5s, 15s, 30s, 1m, 5m, 15m, 30m, 1h, 2h, 3h, 6h, 12h,
+    # 1d, 2d, 1w, 2w, 1M, 3M, 6M, 1J
+    steps = (1, 5, 15, 30, 60, 300, 900, 1800, 3600, 7200, 10800, 21600,
+             43200, 86400, 172800, 604800, 1209600, 2592000, 7776000,
+             15552000, 31536000)
+    for s in steps:
+        if s >= min_step:
+            return float(s)
+    return float(steps[-1])
+
+
+def _time_ticks(min_val: float, max_val: float, step: float) -> List[float]:
+    """Ganzzahlige Tick-Positionen (Vielfache von `step`) im Bereich."""
+    if step <= 0:
+        return []
+    start = int(math.ceil(min_val / step)) * step
+    out: List[float] = []
+    v = start
+    while v <= max_val + 1e-9:
+        out.append(float(v))
+        v += step
+    return out
+
+
+def _nice_int_step(span: float, max_ticks: int) -> float:
+    """Waelt einen ganzzahligen Tick-Schritt (1,2,3,6,12,24,...) fuer den Bereich."""
+    if span <= 0:
+        return 1.0
+    raw = span / max(1, max_ticks)
+    for s in (1, 2, 3, 6, 12, 24, 48, 72, 168, 336, 730, 1460, 2920):
+        if s >= raw:
+            return float(s)
+    return float(math.ceil(raw))
+
+
+class _HeatmapAxis(pg.AxisItem):
+    """Achse mit dynamischen Ticks je Zoom-Level (Bugfix 09.08.2026).
+
+    Die Achse traegt NATUERLICHE Werte (date -> Wanduhr-Epochs,
+    hour/dow_hour -> Ganzzahlen, kategorial -> Indizes) und formatiert die
+    Tick-Beschriftung abhaengig vom sichtbaren Bereich:
+      - date:  Tage (grober Zoom) -> Stunden -> Minuten (enger Zoom)
+      - hour/dow_hour: ganzzahlige Schritte, beim Zoom mehr Zwischenwerte
+      - kategorial: Labels aus der zugehoerigen Liste
+    """
+
+    def __init__(self, orientation: str, **kwargs) -> None:
+        super().__init__(orientation, **kwargs)
+        self._dim: Optional[str] = None
+        self._labels: List[str] = []
+
+    def configure(self, dim: str, labels: List[str]) -> None:
+        """Setzt Dimension + Label-Liste (kategoriale Achsen)."""
+        self._dim = str(dim or "")
+        self._labels = list(labels or [])
+
+    # ------------------------------------------------------------------
+    def tickValues(self, minVal, maxVal, maxTicks=5):
+        if not self._dim:
+            return super().tickValues(minVal, maxVal, maxTicks)
+        if self._dim == "date":
+            step = _pick_time_step(float(maxVal) - float(minVal),
+                                   int(maxTicks))
+            if step <= 0:
+                return super().tickValues(minVal, maxVal, maxTicks)
+            return [(step, _time_ticks(float(minVal), float(maxVal), step))]
+        span = float(maxVal) - float(minVal)
+        step = _nice_int_step(span, int(maxTicks))
+        start = int(math.ceil(minVal / step)) * step
+        values = [float(start + i * step)
+                  for i in range(0, int((maxVal - start) / step) + 1)]
+        return [(step, values)]
+
+    def tickStrings(self, values, scale, spacing):
+        out = []
+        for v in values:
+            out.append(self._format(float(v), float(spacing)))
+        return out
+
+    # ------------------------------------------------------------------
+    def _format(self, v: float, spacing: float) -> str:
+        if self._dim == "date":
+            dt = datetime.fromtimestamp(v, tz=dt_timezone.utc)
+            if spacing >= _DAY_SECONDS:
+                return dt.strftime("%d.%m.%y")
+            if spacing >= 3600:
+                return dt.strftime("%d.%m. %H:%M")
+            return dt.strftime("%H:%M")
+        if self._dim == "hour":
+            return f"{int(round(v)) % 24:02d}:00"
+        if self._dim == "dow":
+            idx = int(round(v))
+            if 0 <= idx < len(DOW_LABELS):
+                return DOW_LABELS[idx]
+            return str(idx)
+        if self._dim == "dow_hour":
+            vv = int(round(v))
+            dow, hour = divmod(vv, 24)
+            if 0 <= dow < 7 and 0 <= hour < 24:
+                return f"{DOW_LABELS[dow]}_{hour:02d}"
+            return str(vv)
+        # Kategorial (timeframe/service_id/symbol): Labels aus der Liste.
+        idx = int(round(v))
+        if 0 <= idx < len(self._labels):
+            return str(self._labels[idx])
+        return str(int(round(v)))
+
+
 class HeatmapWidget(QWidget):
     """Generische 2D-Heatmap mit Confluence-Matrix, Zoom & Candle-Overlay."""
 
@@ -89,7 +223,13 @@ class HeatmapWidget(QWidget):
         self._view_model = None
         self._n_cols = 0
         self._n_rows = 0
-        self._x_dates: List[Any] = []      # Datum je Spalte (nur X=date)
+        self._x_axis: List[float] = []      # natuerliche X-Koordinaten je Spalte
+        self._y_axis: List[float] = []      # natuerliche Y-Koordinaten je Zeile
+        self._x_dates: List[Any] = []       # Datum je Spalte (nur X=date)
+        self._x_min = -0.5
+        self._x_max = 0.5
+        self._y_min = -0.5
+        self._y_max = 0.5
         self._candle_items: List[Any] = []
         self._colormap_mode = _VIRIDIS
         self._syncing = False
@@ -139,9 +279,14 @@ class HeatmapWidget(QWidget):
         ctrl2.addWidget(self._label_info)
         ctrl2.addStretch(1)
 
-        # --- Plot: Heatmap (oben) + Preis-Strip (unten, E9) ---
+        # --- Plot: Heatmap + Kerzen-Overlay im SELBEN Canvas (Bugfix 1) ---
         self._plot_hm = pg.PlotWidget()
         self._plot_hm.setBackground("w")
+        # Dynamische Achsen (Bugfix 5+6): Ticks je Zoom-Level.
+        self._axis_x = _HeatmapAxis("bottom")
+        self._axis_y = _HeatmapAxis("left")
+        self._plot_hm.plotItem.setAxisItems(
+            {"bottom": self._axis_x, "left": self._axis_y})
         self._image = pg.ImageItem()
         self._plot_hm.addItem(self._image)
         self._cmap_viridis = pg.colormap.get(_VIRIDIS)
@@ -152,17 +297,23 @@ class HeatmapWidget(QWidget):
             colorMap=self._cmap_viridis, values=(0.0, 1.0))
         self._colorbar.setImageItem(self._image)
 
-        self._plot_px = pg.PlotWidget()
-        self._plot_px.setBackground("w")
-        self._plot_px.setLabel("left", "Preis")
-        self._plot_px.setLabel("bottom", "Datum")
-        self._plot_px.setVisible(False)
+        # Kerzen-Overlay: zweite Y-Achse (Preis) rechts im selben Canvas,
+        # ViewBox teilt die X-Achse mit der Heatmap (Bugfix 1).
+        self._plot_hm.showAxis("right")
+        self._plot_hm.getAxis("right").setLabel("Preis")
+        self._price_vb = pg.ViewBox()
+        self._plot_hm.scene().addItem(self._price_vb)
+        self._plot_hm.getAxis("right").linkToView(self._price_vb)
+        self._price_vb.setXLink(self._plot_hm.plotItem.vb)
+        self._price_vb.setZValue(10)  # ueber der Heatmap zeichnen
+        self._price_vb.setVisible(False)
+        self._plot_hm.getAxis("right").setVisible(False)
+        self._plot_hm.plotItem.vb.sigResized.connect(self._update_price_view)
 
         lay = QVBoxLayout(self)
         lay.addLayout(ctrl)
         lay.addLayout(ctrl2)
         lay.addWidget(self._plot_hm, 1)
-        lay.addWidget(self._plot_px, 1)
 
         # --- Signale ---
         self._combo_x.currentIndexChanged.connect(self._on_config_changed)
@@ -186,12 +337,12 @@ class HeatmapWidget(QWidget):
         return self._chk_candle.isChecked()
 
     def request_data(self) -> None:
-        """Fordert generische Heatmap (+ OHLCV-Snapshot bei Overlay) an."""
+        """Fordert generische Heatmap (+ Tages-Ohlc bei Overlay) an."""
         if self._view_model is None:
             return
         self._view_model.request_heatmap_generic()
         if self._chk_candle.isChecked():
-            self._view_model.request_ohlcv_snapshot()
+            self._view_model.request_daily_ohlc()
 
     # ------------------------------------------------------------------
     # Sync aus den ViewModel-_params (Profil/Workspace-Restore)
@@ -251,14 +402,18 @@ class HeatmapWidget(QWidget):
         slider.blockSignals(False)
 
     def _update_controls(self) -> None:
-        """Aktiviert/Deaktiviert Zoom-Slider, Feld-Combo und Overlay (E6/E8/E9)."""
+        """Aktiviert/Deaktiviert Feld-Combo und Overlay (E6/E9).
+
+        Bugfix 09.08.2026 (Punkt 6): Die Zoom-Slider gelten fuer ALLE
+        Dimensionen/Massstaebe (nicht nur date) – je Zoom-Level werden
+        dynamisch mehr Zwischenwerte auf den Achsen angezeigt.
+        """
         if self._view_model is None:
             return
         x_dim = str(self._combo_x.currentData() or "")
-        y_dim = str(self._combo_y.currentData() or "")
         agg = str(self._combo_agg.currentData() or "")
-        self._slider_zoom_x.setEnabled(x_dim in _ZOOMABLE_DIMS)
-        self._slider_zoom_y.setEnabled(y_dim in _ZOOMABLE_DIMS)
+        self._slider_zoom_x.setEnabled(True)
+        self._slider_zoom_y.setEnabled(True)
         is_value_agg = agg in _VALUE_AGGS
         self._combo_field.setEnabled(is_value_agg)
         if is_value_agg:
@@ -272,8 +427,8 @@ class HeatmapWidget(QWidget):
         self._chk_candle.setEnabled(can_overlay)
         if can_overlay:
             self._chk_candle.setToolTip(
-                "Preis-Strip (Tages-Ohlc) unter der Heatmap, horizontal "
-                "synchronisiert (E9).")
+                "Tages-Ohlc ueber der Heatmap (gleicher Canvas, rechte "
+                "Preis-Achse), horizontal synchronisiert (Bugfix 1).")
         else:
             self._chk_candle.setToolTip(
                 "Kerzen-Overlay nur bei X-Achse 'Datum' verfuegbar (E9).")
@@ -317,14 +472,14 @@ class HeatmapWidget(QWidget):
         )
 
     # ------------------------------------------------------------------
-    # Candle-Overlay (E9) + Zoom (E8)
+    # Candle-Overlay (Bugfix 1, im selben Canvas) + Zoom (E8)
     # ------------------------------------------------------------------
     def _on_candle_toggled(self, checked: bool) -> None:
         if self._syncing or self._view_model is None:
             return
         self._view_model.set_candle_projection(bool(checked))
         if checked:
-            self._view_model.request_ohlcv_snapshot()
+            self._view_model.request_daily_ohlc()
         else:
             self._clear_overlay()
 
@@ -353,31 +508,40 @@ class HeatmapWidget(QWidget):
             zy = [lo, hi]
         self._view_model.set_heatmap_zoom(zx, zy)
 
-    def _apply_x_range(self) -> None:
-        """Wendet zoom_x_range auf Heatmap + Preis-Strip an (E8/E9)."""
-        if self._view_model is None or self._n_cols <= 0:
-            return
+    @staticmethod
+    def _zoom_lo_hi(params: Dict[str, Any], key: str) -> List[float]:
         try:
-            lo, hi = self._view_model.params["zoom_x_range"]
+            lo, hi = params[key]
             lo, hi = float(lo), float(hi)
         except (TypeError, ValueError, IndexError, KeyError):
             lo, hi = 0.0, 1.0
-        n = float(self._n_cols)
-        self._plot_hm.setXRange(-0.5 + lo * n, -0.5 + hi * n, padding=0)
-        if self._plot_px.isVisible():
-            self._plot_px.setXRange(-0.5 + lo * n, -0.5 + hi * n, padding=0)
+        if hi <= lo:
+            lo, hi = 0.0, 1.0
+        return [lo, hi]
+
+    def _apply_x_range(self) -> None:
+        """Wendet zoom_x_range auf die Heatmap an (E8, natuerliche Werte)."""
+        if self._view_model is None:
+            return
+        lo, hi = self._zoom_lo_hi(self._view_model.params, "zoom_x_range")
+        span = self._x_max - self._x_min
+        self._plot_hm.setXRange(
+            self._x_min + lo * span, self._x_min + hi * span, padding=0)
 
     def _apply_y_range(self) -> None:
-        """Wendet zoom_y_range auf die Heatmap an (E8)."""
-        if self._view_model is None or self._n_rows <= 0:
+        """Wendet zoom_y_range auf die Heatmap an (E8, natuerliche Werte)."""
+        if self._view_model is None:
             return
-        try:
-            lo, hi = self._view_model.params["zoom_y_range"]
-            lo, hi = float(lo), float(hi)
-        except (TypeError, ValueError, IndexError, KeyError):
-            lo, hi = 0.0, 1.0
-        m = float(self._n_rows)
-        self._plot_hm.setYRange(-0.5 + lo * m, -0.5 + hi * m, padding=0)
+        lo, hi = self._zoom_lo_hi(self._view_model.params, "zoom_y_range")
+        span = self._y_max - self._y_min
+        self._plot_hm.setYRange(
+            self._y_min + lo * span, self._y_min + hi * span, padding=0)
+
+    def _update_price_view(self) -> None:
+        """Synchronisiert die Preis-ViewBox-Geometrie mit der Heatmap."""
+        vb = self._plot_hm.plotItem.vb
+        self._price_vb.setGeometry(vb.sceneBoundingRect())
+        self._price_vb.linkedViewChanged(vb, self._price_vb.XAxis)
 
     # ------------------------------------------------------------------
     # Datenfluss (UI rendert, KEIN SQL)
@@ -385,12 +549,18 @@ class HeatmapWidget(QWidget):
     def _on_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
         if kind == QUERY_HEATMAP_GENERIC:
             self._render_generic(data)
-        elif kind == QUERY_OHLCV:
+        elif kind == QUERY_DAILY_OHLC:
             self._render_overlay(data)
 
     def _render_generic(self, data: Dict[str, Any]) -> None:
         matrix = np.asarray(data.get("matrix") or [], dtype=float)
-        x_dim = str(data.get("x_dim") or self._combo_x.currentData() or "date")
+        x_dim = str(data.get("x_dim")
+                    or self._combo_x.currentData() or "date")
+        y_dim = str(data.get("y_dim")
+                    or self._combo_y.currentData() or "hour")
+        # Natuerliche Achsen-Koordinaten (Bugfix 3: Reader liefert sie).
+        x_axis = data.get("x_axis") or []
+        y_axis = data.get("y_axis") or []
         self._x_dates = []
         if x_dim == "date":
             for v in (data.get("x_values") or []):
@@ -406,6 +576,8 @@ class HeatmapWidget(QWidget):
 
         if matrix.size == 0:
             self._n_cols = self._n_rows = 0
+            self._x_axis = []
+            self._y_axis = []
             self._image.clear()
             self._label_info.setText("Keine Daten")
             self._clear_overlay()
@@ -413,6 +585,10 @@ class HeatmapWidget(QWidget):
 
         self._n_cols = int(matrix.shape[1])
         self._n_rows = int(matrix.shape[0])
+        self._x_axis = [float(v) for v in (x_axis or
+                                           list(range(self._n_cols)))]
+        self._y_axis = [float(v) for v in (y_axis or
+                                           list(range(self._n_rows)))]
 
         # E7: Colormap abhaengig von der Aggregation.
         if agg == "confluence_count":
@@ -444,19 +620,45 @@ class HeatmapWidget(QWidget):
             self._image.setImage(matrix, levels=(vmin, vmax))
             self._colorbar.setLevels((vmin, vmax))
 
-        self._plot_hm.getAxis("bottom").setTicks(
-            [self._sparse_ticks(data.get("x_labels") or [])])
-        self._plot_hm.getAxis("left").setTicks(
-            [self._sparse_ticks(data.get("y_labels") or [])])
-        self._plot_hm.setXRange(-0.5, self._n_cols - 0.5, padding=0)
-        self._plot_hm.setYRange(-0.5, self._n_rows - 0.5, padding=0)
+        # ImageItem exakt auf die natuerlichen Koordinaten mappen (Bugfix 3):
+        # date-Spalten = Tage (zentriert auf Mitternacht), hour/dow_hour =
+        # ganzzahlige Werte, kategorial = Indizes. Nichts wird ueber die
+        # Tagesgrenze hinaus gezeichnet (Punkt 3).
+        self._x_min, self._x_max = self._axis_bounds(self._x_axis, x_dim)
+        self._y_min, self._y_max = self._axis_bounds(self._y_axis, y_dim)
+        self._image.setRect(QRectF(
+            self._x_min, self._y_min,
+            self._x_max - self._x_min, self._y_max - self._y_min))
+
+        # Dynamische Achsen konfigurieren (Bugfix 5+6).
+        self._axis_x.configure(x_dim, data.get("x_labels") or [])
+        self._axis_y.configure(y_dim, data.get("y_labels") or [])
+        self._plot_hm.setLabel("bottom", _DIM_LABELS.get(x_dim, x_dim))
+        self._plot_hm.setLabel("left", _DIM_LABELS.get(y_dim, y_dim))
+
         self._apply_x_range()
         self._apply_y_range()
         self._label_info.setText(f"{self._n_rows} x {self._n_cols}")
 
-        # E9: Bei aktivem Overlay den OHLCV-Snapshot (nach-)laden.
+        # Bugfix 1/2: Bei aktivem Overlay den Tages-Ohlc-Snapshot laden.
         if self._chk_candle.isChecked() and self._view_model is not None:
-            self._view_model.request_ohlcv_snapshot()
+            self._view_model.request_daily_ohlc()
+
+    @staticmethod
+    def _axis_bounds(axis: List[float], dim: str):
+        """Koordinaten-Bereich [lo, hi] fuer eine Achse (natuerliche Werte)."""
+        if not axis:
+            return -0.5, 0.5
+        lo = float(min(axis))
+        hi = float(max(axis))
+        if dim == "date":
+            # Zellen = Tage, zentriert auf Mitternacht (Wanduhr).
+            return lo - _HALF_DAY, hi + _HALF_DAY
+        if dim in ("hour", "dow", "dow_hour"):
+            # Ganzzahlige Werte (0-23 bzw. 0-167): Zellenbreite 1.
+            return lo - 0.5, hi + 0.5
+        # Kategorial (timeframe/service_id/symbol): Indizes 0..n-1.
+        return -0.5, float(len(axis)) - 0.5
 
     def _sync_combos_from_payload(self, data: Dict[str, Any]) -> None:
         """Synchronisiert die Combos mit dem tatsaechlichen Payload."""
@@ -494,44 +696,41 @@ class HeatmapWidget(QWidget):
             self._apply_config()
 
     def _render_overlay(self, data: Dict[str, Any]) -> None:
-        """Zeichnet den Preis-Strip (Tages-Ohlc je Datums-Spalte, E9)."""
+        """Zeichnet Tages-Ohlc ueber die Heatmap (selbes Canvas, Bugfix 1).
+
+        Die Candles liegen in der Preis-ViewBox (rechte Y-Achse = Preis),
+        X = Wanduhr-Mitternachts-Epoch je Tag – exakt die Spalten der
+        date-Heatmap. Alpha 0.3-0.5 (E9).
+        """
         self._clear_overlay()
         bars = data.get("bars") or []
-        if not bars or not self._x_dates:
+        if not bars or not self._x_axis:
             return
-        date_to_col = {d: i for i, d in enumerate(self._x_dates)
-                       if d is not None}
-        if not date_to_col:
-            return
-        # Bars nach Wanduhr-Datum gruppieren (Epochs als UTC dekodieren).
-        by_date: Dict[Any, List[Dict[str, Any]]] = {}
+        # Spalten-Index je Wanduhr-Tag (Mitternachts-Epoch).
+        epoch_to_col = {int(round(e)): i for i, e in enumerate(self._x_axis)}
+        candles: List[tuple] = []
         for b in bars:
             t = b.get("time")
             if t is None:
                 continue
             try:
-                d = datetime.fromtimestamp(int(t),
-                                           tz=dt_timezone.utc).date()
-            except (TypeError, ValueError, OSError, OverflowError):
+                t = int(t)
+            except (TypeError, ValueError):
                 continue
-            by_date.setdefault(d, []).append(b)
-        # Tages-Ohlc je Spalte.
-        candles: List[tuple] = []
-        for d, col in date_to_col.items():
-            day_bars = by_date.get(d)
-            if not day_bars:
-                continue
+            col = epoch_to_col.get(t)
+            if col is None:
+                continue  # Tag nicht in der Heatmap (Ausschnitt)
             try:
-                o = float(day_bars[0]["open"])
-                c = float(day_bars[-1]["close"])
-                h = max(float(x["high"]) for x in day_bars)
-                l = min(float(x["low"]) for x in day_bars)
+                o = float(b["open"])
+                c = float(b["close"])
+                h = float(b["high"])
+                l = float(b["low"])
             except (TypeError, ValueError, KeyError):
                 continue
             if not (np.isfinite(o) and np.isfinite(c)
                     and np.isfinite(h) and np.isfinite(l)):
                 continue
-            candles.append((col, o, h, l, c))
+            candles.append((t, o, h, l, c))
         if not candles:
             return
         ymin = min(c[3] for c in candles)
@@ -540,55 +739,36 @@ class HeatmapWidget(QWidget):
             ymin -= 1.0
             ymax += 1.0
         pad = (ymax - ymin) * 0.05
-        ymin -= pad
-        ymax += pad
-        for col, o, h, l, c in candles:
+        self._price_vb.setYRange(ymin - pad, ymax + pad, padding=0)
+        # Candles: x = Mitternachts-Epoch, Breite in Tages-Sekunden.
+        for t, o, h, l, c in candles:
             up = c >= o
             color = pg.mkColor(0, 180, 0, 140) if up \
                 else pg.mkColor(220, 30, 30, 140)
             # Bugfix 08.08.2026: pg.BarGraphItem kennt KEIN top/bottom –
-            # die pyqtgraph-API verlangt y0 + height (Exception
-            # 'must specify either y1 or height'). Docht = low..high,
-            # Koerper = min(o,c)..max(o,c); height>0 defensiv erzwingen.
-            wick = pg.BarGraphItem(x=[col + 0.5], width=0.12,
-                                   y0=l, height=max(h - l, 1e-9),
-                                   brush=color, pen=color)
+            # die pyqtgraph-API verlangt y0 + height.
+            wick = pg.BarGraphItem(
+                x=[float(t)], width=_DAY_SECONDS * 0.12,
+                y0=l, height=max(h - l, 1e-9), brush=color, pen=color)
             body = pg.BarGraphItem(
-                x=[col + 0.5], width=0.7,
+                x=[float(t)], width=_DAY_SECONDS * 0.7,
                 y0=min(o, c),
                 height=max(max(o, c) - min(o, c), 1e-9),
                 brush=color, pen=color)
-            self._plot_px.addItem(wick)
-            self._plot_px.addItem(body)
+            self._price_vb.addItem(wick)
+            self._price_vb.addItem(body)
             self._candle_items.extend((wick, body))
-        self._plot_px.setYRange(ymin, ymax, padding=0)
-        self._plot_px.setXRange(-0.5, max(1, self._n_cols) - 0.5, padding=0)
-        self._plot_px.show()
-        self._apply_x_range()
+        self._price_vb.setVisible(True)
+        self._plot_hm.getAxis("right").setVisible(True)
+        self._update_price_view()
 
     def _clear_overlay(self) -> None:
-        """Entfernt alle Kerzen-Items und versteckt den Preis-Strip."""
+        """Entfernt alle Kerzen-Items und versteckt die Preis-Achse."""
         for item in self._candle_items:
             try:
-                self._plot_px.removeItem(item)
+                self._price_vb.removeItem(item)
             except Exception:
                 pass
         self._candle_items = []
-        self._plot_px.setVisible(False)
-
-    # ------------------------------------------------------------------
-    # Helfer
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _sparse_ticks(labels: List[str]) -> List[tuple]:
-        """Achsen-Ticks mit Sparse-Verfahren bei vielen Labels (z. B. date)."""
-        n = len(labels)
-        if n == 0:
-            return []
-        if n <= _MAX_TICK_LABELS:
-            return [(i, str(labels[i])) for i in range(n)]
-        step = max(1, n // _MAX_TICK_LABELS)
-        ticks = [(i, str(labels[i])) for i in range(0, n, step)]
-        if ticks[-1][0] != n - 1:
-            ticks.append((n - 1, str(labels[-1])))
-        return ticks
+        self._price_vb.setVisible(False)
+        self._plot_hm.getAxis("right").setVisible(False)

@@ -229,3 +229,5 @@ __marimo__/
 
 # Legacy-Backups (archivierte Alt-Stände, Originale bleiben in Git-Historie)
 .backup_*/
+# WAL-Corrupt-Backups (DbPool-WAL-Recovery, Bugfix 09.08.2026)
+*.duckdb.wal.corrupt_*

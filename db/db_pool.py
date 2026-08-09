@@ -13,7 +13,9 @@ Modularisierung, Pruefprotokoll-Entscheidung E3). Enthaelt:
 Basis-Schicht (E4): kein Import anderer Projekt-Module.
 """
 
+import datetime
 import os
+import shutil
 import threading
 from typing import Dict
 
@@ -67,6 +69,45 @@ class DbPool:
     _local = threading.local()
 
     @staticmethod
+    def _open_with_wal_recovery(abs_path: str) -> duckdb.DuckDBPyConnection:
+        """Oeffnet eine DuckDB-Connection mit defensivem WAL-Recovery.
+
+        Bugfix 09.08.2026 (wiederkehrender Start-Abbruch unter Windows):
+        `duckdb.connect()` schlug mit "INTERNAL Error: Failure while replaying
+        WAL file .../analytics.duckdb.wal: Calling DatabaseManager::
+        GetDefaultDatabase with no default database set" fehl, wenn die WAL
+        (z. B. durch hartes Beenden der App) korrupt war. Statt die gesamte
+        App am Start scheitern zu lassen, wird die korrupte WAL-Datei unter
+        `<db>.wal.corrupt_<YYYYMMDD_HHMMSS>` wegsichert und der Connect
+        erneut versucht. Verloren gehen dabei nur un-checkpointete
+        Transaktionen – die Haupt-DB (letzter Checkpoint) bleibt intakt.
+
+        Raises:
+            Exception: Wenn auch der zweite Versuch fehlschlaegt (kein
+                WAL-Problem oder die DB selbst ist beschädigt).
+        """
+        try:
+            return duckdb.connect(abs_path)
+        except duckdb.InternalException as exc:
+            if "Failure while replaying WAL" not in str(exc):
+                raise
+            wal_path = abs_path + ".wal"
+            if os.path.exists(wal_path):
+                stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                corrupt_path = f"{wal_path}.corrupt_{stamp}"
+                try:
+                    shutil.move(wal_path, corrupt_path)
+                except OSError:
+                    # Wegsichern fehlgeschlagen (z. B. Datei gesperrt) –
+                    # dann wenigstens umbenennen, sonst Retry schlaegt erneut fehl.
+                    try:
+                        os.replace(wal_path, corrupt_path)
+                    except OSError:
+                        pass
+            # Zweiter Versuch nach Entfernen der korrupten WAL.
+            return duckdb.connect(abs_path)
+
+    @staticmethod
     def get(db_path: str) -> duckdb.DuckDBPyConnection:
         """Gibt eine persistente Connection zur DB-Datei zurueck (eine pro Thread).
         Die Connection lebt bis Prozess-Ende und wird nie geschlossen."""
@@ -75,7 +116,7 @@ class DbPool:
         if not hasattr(DbPool._local, 'conns'):
             DbPool._local.conns = {}
         if abs_path not in DbPool._local.conns:
-            DbPool._local.conns[abs_path] = duckdb.connect(abs_path)
+            DbPool._local.conns[abs_path] = DbPool._open_with_wal_recovery(abs_path)
             # Globalen Referenzzähler erhöhen (für atexit)
             with _db_pool_lock:
                 if _db_pool_global.get(abs_path, 0) == 0:

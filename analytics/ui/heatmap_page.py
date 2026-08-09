@@ -119,7 +119,8 @@ class HeatmapPage(QWidget):
     def attach_view_model(self, view_model: Any) -> None:
         self._view_model = view_model
         # 20.02: Das generische Widget erhaelt denselben ViewModel und
-        # verbindet eigene data_ready-Slots (QUERY_HEATMAP_GENERIC/QUERY_OHLCV).
+        # verbindet eigene data_ready-Slots (QUERY_HEATMAP_GENERIC/
+        # QUERY_DAILY_OHLC, Bugfix 09.08.2026).
         self._generic.attach_view_model(view_model)
         params = view_model.params
         # 19.02 (Cleanup): Metriken = "count" + numerische feature_data-
