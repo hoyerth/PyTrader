@@ -601,6 +601,15 @@ class HeatmapWidget(QWidget):
     def attach_view_model(self, view_model: Any) -> None:
         self._view_model = view_model
         view_model.data_ready.connect(self._on_data_ready)
+        # 20.04-Timing-Fix (D): Nach restore_workspace()/_apply_profile()
+        # emittiert der ViewModel `params_restored` – die Combos werden dann
+        # explizit aus den restaurierten Params synchronisiert (sonst kann
+        # der erste Daten-Payload bzw. _apply_config die restaurierten
+        # Aggregations-/Feld-Werte ueberschreiben). Defensiv per hasattr
+        # (Test-Mocks ohne Signal). _sync_from_params() blockt Signale und
+        # stoesst keinen Query an (kein Loop).
+        if hasattr(view_model, "params_restored"):
+            view_model.params_restored.connect(self._sync_from_params)
         self._sync_from_params()
 
     def is_candle_projection_enabled(self) -> bool:
@@ -1219,10 +1228,21 @@ class HeatmapWidget(QWidget):
             str(k): [str(s) for s in (v or [])]
             for k, v in field_sources.items()
         }
-        agg = str(data.get("agg") or "")
+        # 20.04-Timing-Fix (A+B): `agg` und `prev_field` BEVORZUGEN den
+        # Daten-Payload (tatsaechlich verwendete Werte), dann die
+        # restaurierten VM-Params und erst am Ende den Combo-Zustand.
+        # Beim App-Start laeuft attach_view_model() VOR restore_workspace() –
+        # der Combo kann beim ersten Daten-Payload noch leer/Default sein,
+        # wodurch Aggregation und Feld zurueckgesetzt wurden statt auf die
+        # im Workspace/Profil gespeicherten Werte (User-Bugreport 09.08.2026).
+        agg = (str(data.get("agg") or "")
+               or str(self._view_model.params.get("heatmap_agg") or "")
+               or str(self._combo_agg.currentData() or ""))
         # 20.03.02: userData = '{service_id}|{key}' – fuer den Vergleich mit
         # den Payload-Keys nur den Key-Teil verwenden.
-        prev_field = self._field_key(self._combo_field.currentData())
+        prev_field = (str(data.get("field") or "")
+                      or str(self._view_model.params.get("heatmap_field") or "")
+                      or self._field_key(self._combo_field.currentData()))
         self._syncing = True
         try:
             self._combo_field.blockSignals(True)

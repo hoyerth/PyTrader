@@ -376,3 +376,70 @@ Clone-Pfad verifiziert), lieferte aber KEIN sichtbares Ergebnis:
 * `test/check_2004_ctxmenu.py` (34/34), `test/check_2004_writers.py` (8/8),
   `test/check_2004_purge.py` (8/8).
 * `py_compile` + CRLF-Konsistenz (0 lone LF) aller geänderten Dateien.
+---
+
+## 8b. Implementierungs-Log – Bugfix „Aggregation & Ergebnisparameter nicht in Fensterhistorie/Profil" (09.08.2026)
+
+**Problem (User-Bugreport 09.08.2026, beobachtet unter „Generisch"):** Nach
+Fenster-Schliessen/Wiederherstellen UND bei Profilwechseln wurden die
+Aggregation und die Konfiguration des Ergebnisparameter-Dropdowns (Feld) in
+der generischen Heatmap NICHT wiederhergestellt. X-Achse, Y-Achse und der
+Metrik-/Modus-Selektor blieben korrekt. Die Werte WURDEN gespeichert
+(Workspace `instance_states.workspace_state` und Profil-Payload
+`charts.heatmap` enthalten `heatmap_agg`/`heatmap_field` vollständig) – der
+Restore-Verlust entstand in der UI-Sync-Schicht.
+
+**Root Cause (Timing-Problem beim App-Start):**
+
+1. `attach_view_model()` laeuft VOR `restore_workspace()`/`_apply_profile()` –
+   die Combos werden beim Start mit Defaults/leerem Zustand befuellt.
+2. Der Restore setzt NUR die VM-Params – die UI-Combos werden nicht neu
+   synchronisiert (kein `_sync_from_params()`-Aufruf nach dem Restore).
+3. Der erste Daten-Payload ruft `_sync_combos_from_payload()`:
+   * X-/Y-Achse und Aggregation werden aus dem Payload gesetzt – der Payload
+     reflektiert die restaurierten Params → bleiben korrekt.
+   * `prev_field` wurde aus `self._combo_field.currentData()` (leer beim
+     Start) abgeleitet statt aus dem Payload-`field` → fiel auf den ersten
+     verfuegbaren Key (`is_hit` statt `visit_pct`).
+   * Der E6-Loop (`_apply_config` bei AVG/SUM/MIN/MAX) ueberschrieb
+     `heatmap_field` AKTIV mit dem falschen Key.
+4. Dasselbe Divergenz-Muster bei der Aggregation: Ein veralteter/erster
+   Payload (Initial-Query mit Default-Params) konnte die Aggregations-Combo
+   auf `confluence_count` zurueckstellen; sobald der User danach ein Control
+   anfasste, las `_apply_config` die Combo (falscher Wert) und ueberschrieb
+   `params["heatmap_agg"]`.
+
+**Loesung (Variante A + B + D, wie empfohlen):**
+
+* **`analytics/ui/heatmap_widget.py`** – `_sync_combos_from_payload()` (A+B):
+  `agg` und `prev_field` bevorzugen jetzt primaer den Daten-Payload
+  (`data.get("agg")` / `data.get("field")`), sekundaer die restaurierten
+  VM-Params (`heatmap_agg`/`heatmap_field`) und erst am Ende den
+  Combo-Zustand. Der E6-Loop laesst einen restaurierten Wert unangetastet.
+
+* **`analytics/engine/analytics_view_model.py`** (D):
+  Neues Signal `params_restored = Signal()` (MVVM-konform, kein UI-Import).
+  Emission am Ende von `_apply_profile()` (deckt Profilwechsel +
+  `load_profiles()`) und `restore_workspace()` (deckt Fenster-Schliessen/
+  Wiederherstellen).
+
+* **`analytics/ui/heatmap_widget.py`** – `attach_view_model()` (D):
+  Verbindet `params_restored` mit dem bereits vorhandenen
+  `_sync_from_params()` (defensiv per `hasattr` fuer Test-Mocks). Dadurch
+  stehen die UI-Combos sofort nach dem Restore synchron zu den
+  VM-Parameters; Signale bleiben blockiert → kein Query-Loop.
+
+**Verifikation (headless, keine UI-Tests):**
+
+* `test/check_2004_timing.py`: **3/3 PASS** (vorher 1/3 – FAIL
+  `heatmap_field='is_hit'` nach Payload + E6-`_apply_config`-Ueberschreiben).
+* `test/check_2004_uiflow.py`: 6/6 PASS (User-Interaktion + Payload-Sync).
+* D-Wiring-Check (headless): X/Y/Aggregations/Feld-Combos korrekt aus den
+  restaurierten Params nach `params_restored`-Emission.
+* `py_compile` + CRLF-Konsistenz (0 lone LF) beider geaenderten Dateien.
+
+**Hinweis:** Die DB-abhaengigen Regressionstests (`test.py`-Baseline 964/6,
+`check_2004_restore`/`snapshot`/`bugfix3`) waren zum Verifikationszeitpunkt
+nicht ausfuehrbar, weil die laufende App `data/app_data.duckdb` haelt
+(DB-Lock, rein umgebungsbedingt). Sie liefen in derselben Sitzung vor der
+Umsetzung gruen und sind von dieser additiven Aenderung unberuehrt.

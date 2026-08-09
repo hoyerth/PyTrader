@@ -74,6 +74,11 @@ class AnalyticsViewModel(QObject):
     # Services – Payload: Liste der nicht mehr registrierten plugin_ids.
     missing_services_detected = Signal(list)
 
+    # 20.04-Timing-Fix (D): Nach restore_workspace()/_apply_profile() – die
+    # UI-Pages synchronisieren ihre Combos explizit aus den restaurierten
+    # VM-Params (kein UI-Import im ViewModel, MVVM-Invariante 4).
+    params_restored = Signal()
+
     def __init__(
         self,
         analytics_repo: Optional[AnalyticsRepository] = None,
@@ -742,6 +747,8 @@ class AnalyticsViewModel(QObject):
             self._dirty = False
             self.dirty_changed.emit(False)
         self.refresh_all()
+        # 20.04-Timing-Fix (D): UI-Combos nach dem Restore synchronisieren.
+        self.params_restored.emit()
 
     def _apply_heatmap_section(self, heat: Any) -> None:
         """Loest die verschachtelte `charts.heatmap`-Sektion auf (20.02).
@@ -863,6 +870,8 @@ class AnalyticsViewModel(QObject):
         self._params["bins"] = self._clamp_bins(self._params.get("bins"))
         self._params["limit"] = self._clamp_limit(self._params.get("limit"))
         self.refresh_all()
+        # 20.04-Timing-Fix (D): UI-Combos nach dem Restore synchronisieren.
+        self.params_restored.emit()
 
     @staticmethod
     def _emit_profile_changed(name: str) -> None:
