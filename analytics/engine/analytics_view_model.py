@@ -1007,19 +1007,25 @@ class AnalyticsViewModel(QObject):
             return key
 
     def resolve_service_display_name(self, plugin_id: str) -> str:
-        """Service-Name OHNE Kategorie-Pfad (20.02.01, User-Meldung 3c).
+        """Service-Name OHNE Kategorie-Pfad, direkt aus dem Service-Objekt.
 
-        Wie `resolve_service_label`, aber OHNE den Kategorie-Pfad: Das
-        `srv_`-Prefix entfaellt (metadata['display_name'], z. B. 'Grid
-        Lines'), der Kategorie-Pfad des MasterTree ('Swing Points /')
-        wird NICHT vorangestellt. Verwendet vom 'Feld'-Dropdown der
-        generischen Heatmap – dort soll vor jedem feature_data-JSON-Key
-        NUR der Service-Name stehen (kein Kategorie-Pfad). Unbekannte/
-        entfernte IDs -> Rohwert (defensiv). Rein lesend, kein SQL.
+        09.08.2026 (User-Meldung 'Feld'-Dropdown): Der Name wird DIREKT aus
+        dem Service-Objekt abgeleitet – aus dessen `plugin_id` (der
+        Identitaet des Objekts): `srv_`-Prefix entfaellt, Unterstriche
+        werden zu Leerzeichen, Worte title-case ('srv_swing_momentum' ->
+        'Swing Momentum'). Damit steht der KORREKTE Service-Name im
+        'Feld'-Dropdown der generischen Heatmap; `metadata['display_name']`
+        ist nicht zuverlaessig (z. B. 'Swing Momentum Service' mit
+        'Service'-Suffix, das wie ein MasterTree-Pfad-Bestandteil wirkt).
+        Kein Kategorie-Pfad. Unbekannte/entfernte IDs -> lesbarer Pretty-
+        Fallback (defensiv). Rein lesend, kein SQL.
         """
         key = str(plugin_id or "").strip()
-        if not key:
-            return ""
+        if not key or key.lower() == "none":
+            # 09.08.2026 (User-Meldung Feld-Dropdown, Root Cause 3): Leere/
+            # fehlende/Native-Keys liefern einen lesbaren Sammel-Namen statt
+            # eines Leerstrings (kein leerer Prefix vor Feld-Eintraegen).
+            return "Allgemein"
         model = self._selector_model
         if model is None:
             from analytics.engine.service_selector_model import ServiceSelectorModel
@@ -1028,12 +1034,20 @@ class AnalyticsViewModel(QObject):
         try:
             plugin = model.get_plugin(key)
             if plugin is None:
-                return key
-            meta = getattr(plugin, "metadata", {}) or {}
-            name = str(meta.get("display_name") or key)
-            if name.lower().startswith("srv_"):
-                name = name[4:]
-            return name or key
+                # 09.08.2026 (Root Cause 3): Unbekannte/abgewaehlte Keys
+                # (z. B. Native-Rows) -> lesbarer Pretty-Fallback statt
+                # Rohwert/Leerstring ('native' -> 'Native').
+                pretty = (key.replace("srv_", "").replace("ind_", "")
+                          .replace("_", " ").title())
+                return pretty or key
+            pid = str(getattr(plugin, "plugin_id", None) or key)
+            name = pid
+            for prefix in ("srv_", "ind_"):
+                if name.lower().startswith(prefix):
+                    name = name[len(prefix):]
+                    break
+            pretty = name.replace("_", " ").title()
+            return pretty or key
         except Exception:
             return key
 

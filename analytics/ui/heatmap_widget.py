@@ -56,6 +56,24 @@ vor jedem Feld-Eintrag steht NUR der Service-NAME ohne Kategorie-Pfad
 'Swing Points / Grid Lines / open'); die E8-Achsen-Labels der
 service_id-Dimension behalten weiterhin '{Kategorie} / {Name}'.
 
+09.08.2026 (User-Meldungen Feld-Dropdown + Zoom-Richtung):
+- Feld-Dropdown: Der Service-Name wird DIREKT aus dem Service-Objekt
+  abgeleitet (`resolve_service_display_name` aus `plugin_id`, z. B.
+  'Swing Momentum' statt des unzuverlaessigen metadata['display_name']
+  'Swing Momentum Service'). Liefern MEHRERE Services denselben Key,
+  entfaellt der Prefix KOMPLETT ('price' statt 'Swing Momentum Service /
+  Swing Volume Profile Service / price' – die verkettete Namen zeigten
+  einen irrefuehrenden MasterTree-'Pfad').
+- Zoom-Slider X/Y: Richtung getauscht – rechts = Zoom-In, links = Zoom-Out
+  (Slider-Wert 5 = volle Achse, 100 = maximale Vergroesserung;
+  `_set_zoom_range`/`_set_zoom_slider` invers umgerechnet).
+- Achse 'Datum': Beschriftung lautet 'Datum/Zeit' – OHNE das
+  pyqtgraph-EXP-Suffix ('Datum (x1e+09)'). Ursache: `setLabel(text)`
+  mit units=None erzeugt eine leere Einheit; die date-Epochs (~1.7e9)
+  fallen in den SI-Bereich (1e9, inf) und pyqtgraph haengt '(x1e+09)'
+  an. `_HeatmapAxis.enableAutoSIPrefix(False)` unterdrueckt das
+  Suffix (die Ticks werden ohnehin von tickStrings formatiert).
+
 20.02.01 (User-Meldung 2 - Datums-Skala LWC-v5, 09.08.2026): Die date-Achse
 nutzt die Tick-Logik von Lightweight Charts v5 (aus dem LWC-JS extrahiert):
 Der Mindestabstand zweier Labels betraegt ~80 px (`_DATE_TARGET_PX`) –
@@ -207,6 +225,14 @@ class _HeatmapAxis(pg.AxisItem):
         super().__init__(orientation, **kwargs)
         self._dim: Optional[str] = None
         self._labels: List[str] = []
+        # 09.08.2026 (User-Meldung): Kein automatisches SI-Prefix an das
+        # Achsen-Label haengen. pyqtgraph wuerde bei date-Epochs (~1.7e9)
+        # `setLabel(text)` (units=None -> leere Einheit) in den SI-Bereich
+        # (1e9, inf) einsortieren und 'Datum (x1e+09)' anzeigen (das
+        # 'EXP' in Klammern). Die Ticks werden ohnehin von tickStrings
+        # mit echten Werten formatiert (Scale wird ignoriert) – das
+        # Suffix waere also irrefuehrend.
+        self.enableAutoSIPrefix(False)
 
     def configure(self, dim: str, labels: List[str]) -> None:
         """Setzt Dimension + Label-Liste (kategoriale Achsen)."""
@@ -495,9 +521,13 @@ class HeatmapWidget(QWidget):
         self._label_info.setStyleSheet("color: #808080;")
         for s in (self._slider_zoom_x, self._slider_zoom_y):
             s.setRange(5, 100)
-            s.setValue(100)
+            # 09.08.2026 (User-Meldung 2): Richtung getauscht – rechts
+            # (hoher Wert) = Zoom-In, links (niedriger Wert) = Zoom-Out.
+            # 5 = volle Achse (links), 100 = maximale Vergroesserung (rechts).
+            s.setValue(5)
             s.setEnabled(False)
-            s.setToolTip("Viewport-Zoom (zentriert): 100 % = volle Achse.")
+            s.setToolTip("Viewport-Zoom (zentriert): rechts = Zoom-In, "
+                         "links = Zoom-Out.")
 
         ctrl2 = QHBoxLayout()
         ctrl2.addWidget(self._chk_candle)
@@ -618,14 +648,19 @@ class HeatmapWidget(QWidget):
 
     @staticmethod
     def _set_zoom_slider(slider: QSlider, zrange: Any) -> None:
-        """Stellt den Zoom-Slider aus einem [lo, hi]-Bereich ein (E8)."""
+        """Stellt den Zoom-Slider aus einem [lo, hi]-Bereich ein (E8).
+
+        09.08.2026 (User-Meldung 2): Inverse Umrechnung zu `_set_zoom_range`
+        – volle Achse (span 1.0) => Slider 5 (links), maximale Vergroesserung
+        (span 0.05) => Slider 100 (rechts).
+        """
         try:
             lo, hi = float(zrange[0]), float(zrange[1])
         except (TypeError, ValueError, IndexError):
             lo, hi = 0.0, 1.0
         if hi <= lo:
             lo, hi = 0.0, 1.0
-        value = int(round((hi - lo) * 100.0))
+        value = int(round(105.0 - (hi - lo) * 100.0))
         slider.blockSignals(True)
         slider.setValue(max(slider.minimum(), min(slider.maximum(), value)))
         slider.blockSignals(False)
@@ -737,8 +772,15 @@ class HeatmapWidget(QWidget):
         self._apply_y_range()
 
     def _set_zoom_range(self, key: str, value: int) -> None:
-        """Berechnet [lo, hi] (zentriert) aus dem Slider-Wert (E8)."""
-        f = value / 100.0
+        """Berechnet [lo, hi] (zentriert) aus dem Slider-Wert (E8).
+
+        09.08.2026 (User-Meldung 2): Richtung getauscht – rechts (hoher
+        Slider-Wert) = Zoom-In, links (niedriger Wert) = Zoom-Out. Der
+        Slider-Wert ist die Zoom-Stufe 5..100; der sichtbare Anteil
+        `f = (105 - value) / 100` (5 => volle Achse, 100 => maximale
+        Vergroesserung, zentriert auf 0.5).
+        """
+        f = (105.0 - value) / 100.0
         lo = max(0.0, 0.5 - f / 2.0)
         hi = min(1.0, 0.5 + f / 2.0)
         zx = list(self._view_model.params.get("zoom_x_range") or [0.0, 1.0])
@@ -896,6 +938,13 @@ class HeatmapWidget(QWidget):
         offset_text = self._utc_offset_text(offset_epoch)
         label_x = _DIM_LABELS.get(x_dim, x_dim)
         label_y = _DIM_LABELS.get(y_dim, y_dim)
+        # 09.08.2026 (User-Meldung): Die date-Achse heisst 'Datum/Zeit'
+        # (ohne pyqtgraph-EXP-Suffix – das unterdrueckt _HeatmapAxis via
+        # enableAutoSIPrefix(False), s. o.).
+        if x_dim == "date":
+            label_x = "Datum/Zeit"
+        if y_dim == "date":
+            label_y = "Datum/Zeit"
         if x_dim == "hour":
             label_x = f"{label_x} ({offset_text})"
         if y_dim == "hour":
@@ -962,26 +1011,25 @@ class HeatmapWidget(QWidget):
             return "UTC"
 
     def _field_label(self, key: str, service_ids: List[str]) -> str:
-        """Anzeige-Text eines Feld-Eintrags '{Service} / {Key}' (Meldung 3b/c).
+        """Anzeige-Text eines Feld-Eintrags (Meldung 3b/c, 09.08.2026).
 
-        Vor jedem feature_data-JSON-Key steht der Service-Name, aus dem der
-        Wert stammt – NUR der Name OHNE Kategorie-Pfad und ohne `srv_`-
-        Prefix (User-Meldung 3c: `resolve_service_display_name`, z. B.
-        'Grid Lines' statt 'Swing Points / Grid Lines'; die E8-Achsen-
-        Labels der service_id-Dimension behalten den Kategorie-Pfad).
-        Liefert ein Key aus mehreren Services, werden die Namen mit ' / '
-        verkettet (dedupliziert, deterministisch nach Payload-Reihenfolge).
-        Ohne bekannte Quelle (Legacy-Rows ohne feature_id) bleibt der
-        Roh-Key (defensiv).
+        Der Service-Name wird DIREKT aus dem Service-Objekt geholt
+        (`resolve_service_display_name`, plugin_id-basiert, `srv_`-Prefix
+        entfaellt -> 'Swing Momentum' statt 'Swing Momentum Service').
+        Ist der Key EINDEUTIG einem Service zuzuordnen, steht dessen
+        korrekter Name vor dem Key ('{Name} / {Key}', z. B.
+        'Grid Lines / open'). Liefern MEHRERE Services denselben Key
+        (z. B. 'price' von Swing-Services), entfaellt der Prefix KOMPLETT –
+        sonst wuerde eine irrefuehrende 'Pfad'-Kette ('Swing Momentum
+        Service / Swing Volume Profile Service / price') entstehen
+        (User-Meldung, 09.08.2026: 'Pfad im Mastertree' = absoluter
+        Quatsch). Ohne bekannte Quelle bleibt der Roh-Key (defensiv).
         """
-        names: List[str] = []
-        if self._view_model is not None:
-            for sid in service_ids:
-                label = self._view_model.resolve_service_display_name(str(sid))
-                if label and label not in names:
-                    names.append(label)
-        if names:
-            return " / ".join(names) + " / " + str(key)
+        if (len(service_ids) == 1 and self._view_model is not None):
+            name = self._view_model.resolve_service_display_name(
+                str(service_ids[0]))
+            if name:
+                return f"{name} / {str(key)}"
         return str(key)
 
     def _sync_combos_from_payload(self, data: Dict[str, Any]) -> None:

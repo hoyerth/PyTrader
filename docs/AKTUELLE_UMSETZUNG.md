@@ -541,3 +541,51 @@ bestehende Strukturen blieben unangetastet.
   Feld-Combo-Text ohne 'Grid / '-Pfad, Combo-DATA = Roh-Key.
 - Manueller Funktionstest der GUI erfolgt durch den Anwender.
 
+---
+
+## 5.11 Bugfix-Log 09.08.2026: Feld-Dropdown (Service-Name direkt) + Zoom-Richtung + feature_ids-Filter + Achsen-Label 'Datum/Zeit'
+
+**Kontext:** Vier User-Meldungen nach Commit `cedaa27` (20.02.01 E1–E8 /
+5.10). Alle Fixes sind point-fix/additiv – bestehende Strukturen
+(Standard-Modus `HeatmapPage`, LWC-Datums-Skala, E8-Achsen-Labels)
+blieben unangetastet.
+
+| # | Symptom | Ursache | Fix |
+|---|---------|---------|-----|
+| F1 | Feld-Dropdown zeigt Service-Namen mit unzuverlässigem `metadata['display_name']` (z. B. 'Swing Momentum Service' mit 'Service'-Suffix) | `_field_label` nutzte `resolve_service_label` (Kategorie-Pfad) bzw. `metadata['display_name']` | Neuer ViewModel-Resolver **`resolve_service_display_name(plugin_id)`** (Name DIREKT aus dem Service-Objekt/`plugin_id`: `srv_`-Prefix weg, `_`→Leerzeichen, Title-Case → 'Swing Momentum'; unbekannt → Pretty-Fallback 'Unbekannter Service', 'native' → 'Native', leer → 'Allgemein') → `_field_label` liefert `'{Name} / {Key}'` (z. B. 'Grid Lines / open') |
+| F2 | Geteilter Key mehrerer Services (z. B. 'price' von Swing-Services) zeigte irreführende 'Pfad'-Kette ('Swing Momentum Service / Swing Volume Profile Service / price') | `_field_label` verketterte alle Service-Namen bei mehreren `service_ids` | Liefern MEHRERE Services denselben Key → Prefix entfällt KOMPLETT (nur Roh-Key 'price'). EIN Service → `'{Name} / {Key}'`. Unbekannt → Roh-Key (defensiv) |
+| Z1 | Zoom-Slider-Richtung war vertauscht (rechts = Zoom-Out) | `_set_zoom_range`: `f = value / 100` (100 = volle Achse) | Richtung getauscht – **rechts = Zoom-In, links = Zoom-Out**: `_set_zoom_range` `f = (105 - value) / 100` (5 → volle Achse, 100 → max. Vergrößerung zentriert 0.5); `_set_zoom_slider` inverse Umrechnung `105 - span*100`; Initialwert 5 statt 100; Tooltip aktualisiert |
+| F3 | Abgewählte Services (z. B. Grid deaktiviert) erschienen weiterhin im Feld-Dropdown (Root Cause 2) | `feature_keys_by_service`/`field_sources`/`metrics` ignorierten die selektierten `feature_ids` | Reader `feature_keys_by_service()` neue Parameter `feature_id`/`feature_ids` + `_apply_feature_filter`; Repository `get_generic_heatmap()` übergibt Filter und begrenzt `metrics`/`field_sources` auf selektierte Services (`avail_filtered`, Fallback ungefiltert bei leer) – Dropdown reagiert über die bestehende Kette (set_feature_ids → Refresh → `_sync_combos_from_payload`) |
+| D1 | Datums-Achse zeigte 'Datum (EXP)' bzw. 'Datum (x1e+09)' als Beschriftung | pyqtgraph `setLabel(text)` mit `units=None` → leere Einheit → Default-SI-Ranges `((0.,1.), (1e9, inf))`; die date-Epochs (~1.7e9) fallen in (1e9, inf) → `autoSIPrefixScale = 1e-9` → Suffix `(x1e+09)` angehängt. Die Ticks werden ohnehin von `tickStrings` formatiert (Scale ignoriert) – das Suffix war irreführend | `_HeatmapAxis.__init__`: **`enableAutoSIPrefix(False)`** (unterdrückt das EXP-Suffix für X- und Y-Achse); Label der date-Achse jetzt **'Datum/Zeit'** (`_render_generic`, X und Y; `_DIM_LABELS`-Dropdown bleibt 'Datum') |
+
+**Betroffene Dateien:**
+- `analytics/engine/feature_store_reader.py` – `feature_keys_by_service()`:
+  neue `feature_id`/`feature_ids`-Parameter + `_apply_feature_filter`
+- `analytics/engine/analytics_repository.py` – `get_generic_heatmap()`:
+  feature_ids-Filter für `metrics`/`field_sources` (`avail_filtered`,
+  Fallback ungefiltert bei leer)
+- `analytics/engine/analytics_view_model.py` – `resolve_service_display_name()`
+  (Service-Name direkt aus `plugin_id`, Pretty-Fallbacks)
+- `analytics/ui/heatmap_widget.py` – `_field_label` (1 Service → Name;
+  mehrere Services → Roh-Key), Zoom-Richtung (`_set_zoom_range`/
+  `_set_zoom_slider`/Initialwert/Tooltip), date-Label 'Datum/Zeit' +
+  `enableAutoSIPrefix(False)` in `_HeatmapAxis`
+
+**Validierung (headless, keine UI-Tests):**
+- `py_compile` auf allen 4 geänderten Python-Dateien: PASS.
+- `test/check_heatmap_bugfix.py`: **alle PASS** – `resolve_service_display_name`
+  ('Grid Lines'/'Proximity'/'Swing Momentum'/'Swing Volume Profile'/
+  Unbekannt→'Unbekannter Service'/'native'→'Native'/leer→'Allgemein'),
+  `_field_label` bei geteiltem Key = Roh-Key (kein 'Pfad'), Feld-Combo ohne
+  Kategorie-Pfad, Combo-DATA = Roh-Key, feature_keys_by_service gefiltert
+  (nur srv_proximity + dessen Keys), `field_sources`/`metrics` gefiltert
+  (keine Grid-only-Keys), ohne Filter unverändert (kein Bruch),
+  Zoom-Slider 5→[0,1] / 100→[0.475,0.525] / 55→Mitte, Initialwert 5,
+  rechts = Zoom-In (span schrumpft), `_HeatmapAxis.autoSIPrefix` deaktiviert,
+  X=date → labelText 'Datum/Zeit' + labelString ohne '(x1e…)/(x…',
+  Y=date-Regression ebenfalls 'Datum/Zeit', hour-Achse 'Tageszeit (UTC+X)'
+  ohne EXP.
+- `test/test.py`: unverändert (kein Kontakt zu dieser Umsetzung).
+- Manueller Funktionstest der GUI erfolgt durch den Anwender.
+
+

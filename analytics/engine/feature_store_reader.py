@@ -426,6 +426,8 @@ class FeatureStoreReader:
         symbol: str,
         timeframe: str,
         numeric_only: bool = False,
+        feature_id: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
     ) -> Dict[str, List[str]]:
         """feature_data-JSON-Keys je feature_id (20.02.01, Feld-Dropdown).
 
@@ -435,6 +437,12 @@ class FeatureStoreReader:
         Typ-Logik ist identisch zu `available_feature_keys`: bei
         `numeric_only=True` muss ein Key in ALLEN Vorkommen des jeweiligen
         Services numerisch sein (int/float, kein bool/null/str).
+
+        09.08.2026 (User-Meldung Feld-Dropdown): Die Zuordnung wird ueber
+        `feature_id`/`feature_ids` gefiltert (Muster `fetch_rows`, inkl.
+        case-insensitivem + whitespace-tolerantem Filter) – abgewaehlte
+        Services liefern ihre Keys NICHT mehr, damit das Feld-Dropdown nur
+        noch die tatsaechlich selektierten Datenquellen zeigt.
 
         Zeilen ohne feature_id (Legacy/native) werden unter "" gruppiert;
         das Repository ignoriert sie (Dropdown-Fallback: Roh-Key ohne
@@ -446,15 +454,21 @@ class FeatureStoreReader:
         """
         if not symbol or not timeframe:
             return {}
+        conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
+        params: List[Any] = [symbol, timeframe]
+        # 09.08.2026 (User-Meldung Feld-Dropdown): feature_id/feature_ids-
+        # Filter anwenden, damit abgewaehlte Services nicht im Dropdown
+        # erscheinen (Root Cause 2).
+        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
+
         con = self._get_connection()
         try:
-            rows = con.execute("""
+            rows = con.execute(f"""
                 SELECT DISTINCT feature_id, feature_data
                 FROM feature_store
-                WHERE LOWER(symbol) = LOWER(?)
-                  AND LOWER(timeframe) = LOWER(?)
+                WHERE {' AND '.join(conditions)}
                   AND feature_data IS NOT NULL
-            """, [symbol, timeframe]).fetchall()
+            """, params).fetchall()
         except Exception as e:
             print(f"WARN [FeatureStoreReader] feature_keys_by_service "
                   f"fehlgeschlagen: {e}")

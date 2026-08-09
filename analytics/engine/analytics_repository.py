@@ -142,26 +142,37 @@ class AnalyticsRepository:
         """
         avail = self.reader.available_feature_keys(
             symbol, timeframe, numeric_only=True)
-        metrics = ["count", "confluence_count"] + avail
-        # 20.02.01 (User-Meldung 3b): Welcher Service liefert welchen
-        # numerischen JSON-Key? Fuer das 'Feld'-Dropdown
-        # ('{Service} / {Key}', `srv_`-Prefix entfaellt im Widget).
+        # 09.08.2026 (User-Meldung Feld-Dropdown, Root Cause 2): Die
+        # Feldquellen werden STRENG ueber den feature_ids-Filter bestimmt –
+        # abgewaehlte Services (z. B. Grid-Lines) duerfen ihre Keys nicht
+        # mehr ins 'Feld'-Dropdown liefern (vorher ungefiltert ueber ALLE
+        # Rows des Symbol/Timeframe).
         by_service = self.reader.feature_keys_by_service(
-            symbol, timeframe, numeric_only=True)
+            symbol, timeframe, numeric_only=True,
+            feature_id=feature_id, feature_ids=feature_ids)
         field_sources: Dict[str, List[str]] = {}
         for fid, keys in by_service.items():
             if not fid:
                 continue  # Legacy-Rows ohne feature_id -> kein Service-Prefix
             for k in keys:
                 field_sources.setdefault(k, []).append(fid)
+        # Nur die Keys der SELEKTIERTEN Services in der Metrik-/Feldliste –
+        # das HeatmapWidget baut das 'Feld'-Dropdown aus `metrics` auf
+        # (_sync_combos_from_payload); ohne diese Begrenzung erschienen
+        # abgewaehlte Keys weiterhin (nur ohne Service-Prefix).
+        avail_filtered = sorted({k for keys in by_service.values()
+                                 for k in keys})
+        if not avail_filtered:
+            avail_filtered = avail  # defensiv: ohne Quellen -> ungefiltert
+        metrics = ["count", "confluence_count"] + avail_filtered
         use_agg = str(agg or "count").lower()
         use_field = str(field or "")
         # E6: Bei Wert-Aggregationen (AVG/SUM/MIN/MAX) ist `field` ein
         # numerischer JSON-Key – defensiv auf den ersten verfuegbaren Key
         # zurueckfallen (keine ValueError-Haenger im UI).
         if use_agg in ("avg", "sum", "min", "max"):
-            if use_field not in avail:
-                use_field = avail[0] if avail else ""
+            if use_field not in avail_filtered:
+                use_field = avail_filtered[0] if avail_filtered else ""
         try:
             result = self.reader.fetch_generic_heatmap(
                 symbol, timeframe, x_dim, y_dim, field=use_field or None,
