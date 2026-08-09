@@ -340,9 +340,19 @@ class ServiceParamColumnsMixin:
 
         Kleiner QDialog (modal, keine Bearbeitung – rein informativ),
         konsistent zur Read-only-Natur des Output-Schemas (Kapitel 20.03).
+
+        20.03.01 (Bugfix): Der Mixin-Host ist nicht IMMER ein QWidget
+        (ServiceWindow ja; _DialogParamHost ist ein Plain-Object mit
+        `_dialog`-Referenz auf das echte Dialog-Fenster). `QDialog(self)`
+        wirft daher im Dialog-Kontext einen TypeError. Eltern-Widget wird
+        robust aufgeloest: `self`, sonst `self._dialog`, sonst None.
         """
         try:
-            dlg = QDialog(self)
+            parent = (self if isinstance(self, QWidget)
+                      else getattr(self, "_dialog", None))
+            if not isinstance(parent, QWidget):
+                parent = None
+            dlg = QDialog(parent)
             dlg.setWindowTitle(f"Resultatfeld: {field_name}")
             dlg.setModal(True)
             dvl = QVBoxLayout(dlg)
