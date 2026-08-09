@@ -141,6 +141,11 @@ class _DialogParamHost(ServiceParamColumnsMixin):
         self._service_param_labels: Dict[str, Any] = {}
         self._service_info_labels: Dict[str, Any] = {}
         self._service_info_pids: Dict[str, Any] = {}
+        # 20.03.01 (Bugfix): `ServiceParamColumnsMixin._build_service_column`
+        # schreibt seit dem Output-Schema-Umbau auch in diese Registry –
+        # ohne Init schlaegt die Parameteranzeige mit 'AttributeError:
+        # _service_output_schemas' fehl (analog _mode_schemas, 08.08.2026).
+        self._service_output_schemas: Dict[str, Any] = {}
         self._symbol_precision: Optional[int] = None
         self.combo_symbol = None
         self.combo_tf = None
