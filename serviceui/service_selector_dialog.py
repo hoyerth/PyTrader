@@ -90,6 +90,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from analytics.engine.description_dialog import ServiceDescriptionDialog
 from analytics.engine.service_selector_model import ServiceSelectorModel
 from config.event_bus import event_bus
 from serviceui.master_tree import (
@@ -453,6 +454,15 @@ class ServiceSelectorDialog(QDialog):
         # – kein Fenster-Reflow, nur Container-Resize (Scrollbalken).
         self._param_host._dialog = self
 
+        # 20.03.02 (F4): i-Button im MasterTree (ServicePicker) oeffnet den
+        # Read-Only ServiceDescriptionDialog.from_plugin()/from_set() –
+        # im Gegensatz zum editierbaren ServiceDescriptionEditDialog im
+        # ServiceWindow. Kategorie-Ordner zeigen die Ordner-Info analog zur
+        # Set-Info (ServiceWindow-Muster _on_category_info_requested).
+        self.selector.info_requested.connect(self._on_info_requested)
+        self.selector.category_info_requested.connect(
+            self._on_category_info_requested)
+
         # Punkt 4: Letzte Position/Groesse wiederherstellen.
         self._restore_geometry()
         # Panel initial bauen (leer -> Hinweis), damit die Breiten-Logik
@@ -514,6 +524,116 @@ class ServiceSelectorDialog(QDialog):
             self.current_feature_ids(),
         )
         self.accept()
+
+    # ------------------------------------------------------------------
+    # 20.03.02 (F4): i-Button im MasterTree -> Read-Only-Beschreibung
+    # ------------------------------------------------------------------
+    @Slot(str, str, str)
+    def _on_info_requested(self, set_id: str, service_id: str,
+                           plugin_id: str) -> None:
+        """Info-Button im MasterTree (ServicePicker, 20.03.02 F4).
+
+        Read-Only `ServiceDescriptionDialog.from_plugin()` bzw.
+        `from_set()` (kein Editieren – der editierbare
+        `ServiceDescriptionEditDialog` bleibt dem ServiceWindow
+        vorbehalten). `header_line` im vereinheitlichten F5-Format
+        ('📌 im <Indikator> | 🟢 aktiv in <Indikator>' / '⚪ inaktiv').
+        """
+        try:
+            if service_id and set_id:
+                cfg = self.model.find_service(set_id, service_id) or {}
+                pid = str(cfg.get("plugin_id") or service_id)
+                plugin = self._resolve_info_plugin(pid)
+                if plugin is None:
+                    return
+                dlg = ServiceDescriptionDialog.from_plugin(
+                    plugin, instance_id=service_id, config=cfg, parent=self,
+                    header_line=self._info_header_line(pid))
+                dlg.exec()
+            elif plugin_id and not service_id:
+                plugin = self._resolve_info_plugin(plugin_id)
+                if plugin is None:
+                    return
+                dlg = ServiceDescriptionDialog.from_plugin(
+                    plugin, parent=self,
+                    header_line=self._info_header_line(plugin_id))
+                dlg.exec()
+            elif set_id and not service_id:
+                definition = self.model.find_set(set_id)
+                if not definition:
+                    return
+                dlg = ServiceDescriptionDialog.from_set(
+                    definition, parent=self,
+                    header_line=self._info_set_header_line(definition))
+                dlg.exec()
+        except (RuntimeError, AttributeError):
+            pass
+
+    @Slot(str, str)
+    def _on_category_info_requested(self, group: str,
+                                    category_path: str) -> None:
+        """Info-Dialog fuer einen Kategorie-Ordner (20.03.02, F4).
+
+        Analog zur Set-Info (ServiceDescriptionDialog.from_set, keine
+        persistierbare Beschreibung): Read-Only-Liste aller Services unter
+        dem Ordner (rekursiv) mit dem Kategorie-Pfad als Titel
+        (ServiceWindow-Muster _on_category_info_requested).
+        """
+        if not category_path:
+            return
+        try:
+            plugin_ids = self.model.category_service_plugin_ids(
+                group, category_path)
+            definition = {
+                "set_id": f"category_{category_path}",
+                "display_name": category_path,
+                "description": f"Kategorie-Ordner: {category_path}",
+                "execution_order": list(plugin_ids),
+                "services": {pid: {"plugin_id": pid} for pid in plugin_ids},
+            }
+            dlg = ServiceDescriptionDialog.from_set(definition, parent=self)
+            dlg.exec()
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _resolve_info_plugin(self, plugin_id: str):
+        """Registry-Lookup fuer den Info-Dialog (defensiv, ohne KeyError)."""
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            return PluginRegistry().get(plugin_id)
+        except KeyError:
+            return None
+
+    def _info_header_line(self, plugin_id: str) -> str:
+        """Erste Dialog-Zeile fuer Plugin-/Service-Zeilen (20.03.02, F5).
+
+        Vereinheitlichtes Badge-Format ('📌 im <Indikator> | 🟢 aktiv in
+        <Indikator>' / '⚪ inaktiv'); leer ohne Indikator-Zugehoerigkeit.
+        """
+        model = self.model
+        if model is None or not model.belongs_to_indicator(plugin_id):
+            return ""
+        name = model.get_indicator_display_name(plugin_id)
+        if model.is_active_in_chart(plugin_id):
+            return f"📌 im {name} | 🟢 aktiv in {name}"
+        return f"📌 im {name} | ⚪ inaktiv"
+
+    def _info_set_header_line(self, set_def: Dict[str, Any]) -> str:
+        """Erste Dialog-Zeile fuer Set-Zeilen (20.03.02, F5).
+
+        Vereinheitlichtes Badge-Format; mehrere Indikatoren mit ' + '
+        verknuepft.
+        """
+        model = self.model
+        if model is None:
+            return ""
+        names = model.get_set_indicator_names(set_def or {})
+        if not names:
+            return ""
+        label = " + ".join(names)
+        if model.is_set_active(set_def or {}):
+            return f"📌 im {label} | 🟢 aktiv in {label}"
+        return f"📌 im {label} | ⚪ inaktiv"
 
     # ------------------------------------------------------------------
     # 18.01.01 (E-4): Live-Verwaltung (Set/Service-CRUD im Picker)

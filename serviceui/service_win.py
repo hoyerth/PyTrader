@@ -2179,19 +2179,27 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             return None
 
     def _info_header_tooltip(self, plugin_id: str) -> str:
-        """Erste Dialog-Zeile = bisheriger Tooltip-Text des Info-Buttons
-        ('aktiv <Indikator>' / 'im <Indikator>'); leer ohne Indikator-
-        Zugehoerigkeit."""
+        """Erste Dialog-Zeile = Badge-Header des Info-Buttons (20.03.02, F5).
+
+        Vereinheitlichtes Format: '📌 im <Indikator> | 🟢 aktiv in
+        <Indikator>' bzw. '📌 im <Indikator> | ⚪ inaktiv'. Leer ohne
+        Indikator-Zugehoerigkeit.
+        """
         model = getattr(self.service_selector, "model", None)
         if model is None or not model.belongs_to_indicator(plugin_id):
             return ""
         name = model.get_indicator_display_name(plugin_id)
-        return (f"aktiv {name}" if model.is_active_in_chart(plugin_id)
-                else f"im {name}")
+        if model.is_active_in_chart(plugin_id):
+            return f"📌 im {name} | 🟢 aktiv in {name}"
+        return f"📌 im {name} | ⚪ inaktiv"
 
     def _info_set_tooltip(self, set_def: Dict[str, Any]) -> str:
-        """Erste Dialog-Zeile fuer Set-Zeilen (Tooltip-Namenslogik analog
-        _apply_set_badge: 'aktiv/im <Indikator>', mehrere mit ' + ')."""
+        """Erste Dialog-Zeile fuer Set-Zeilen (20.03.02, F5).
+
+        Vereinheitlichtes Badge-Format analog _info_header_tooltip; mehrere
+        Indikatoren mit ' + ' verknuepft ('📌 im <I1> + <I2> | 🟢 aktiv in
+        <I1> + <I2>' bzw. '⚪ inaktiv').
+        """
         model = getattr(self.service_selector, "model", None)
         if model is None:
             return ""
@@ -2199,8 +2207,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         if not names:
             return ""
         label = " + ".join(names)
-        return (f"aktiv {label}" if model.is_set_active(set_def or {})
-                else f"im {label}")
+        if model.is_set_active(set_def or {}):
+            return f"📌 im {label} | 🟢 aktiv in {label}"
+        return f"📌 im {label} | ⚪ inaktiv"
 
     @Slot()
     def delete_set(self) -> None:

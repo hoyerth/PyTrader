@@ -114,6 +114,7 @@ from analytics.engine.feature_store_reader import (
     HEATMAP_DIMENSIONS,
     HOURS_PER_DAY,
 )
+from analytics.ui.common import CheckableComboBox
 
 # E7: Konfluenz-Farbskala (0 = weiss/transparent, 1-2 = gelb/cyan,
 # 3-4 = orange, 5+ = dunkelrot) – Positionen 0..1 (Levels 0..5).
@@ -493,7 +494,12 @@ class HeatmapWidget(QWidget):
         self._combo_agg = QComboBox()
         for a in HEATMAP_AGGREGATIONS:
             self._combo_agg.addItem(_AGG_LABELS.get(a, a), a)
-        self._combo_field = QComboBox()
+        # 20.03.02 (F1c/F7): 'Feld' ist ein CheckableComboBox – die
+        # Multi-Auswahl steuert den Datenquellen-Filter `feature_ids`, die
+        # Aggregation nutzt genau EIN aktives Hauptfeld (currentData). Bei
+        # COUNT/CONFLUENCE_COUNT bleibt die Auswahl deaktiviert (F7,
+        # _update_controls).
+        self._combo_field = CheckableComboBox()
         # 20.02.01 (User-Meldung 3a): 'Feld' deutlich laenger (Eintraege
         # tragen seit Meldung 3b den Service-Prefix '{Service} / {Key}').
         self._combo_field.setMinimumWidth(320)
@@ -579,6 +585,9 @@ class HeatmapWidget(QWidget):
         self._combo_y.currentIndexChanged.connect(self._on_config_changed)
         self._combo_agg.currentIndexChanged.connect(self._on_agg_changed)
         self._combo_field.currentIndexChanged.connect(self._on_config_changed)
+        # 20.03.02 (F1c): CheckState-Wechsel im 'Feld'-Dropdown -> Filter.
+        self._combo_field.selection_changed.connect(
+            self._on_field_selection_changed)
         self._chk_candle.toggled.connect(self._on_candle_toggled)
         self._slider_zoom_x.valueChanged.connect(self._on_zoom_x_changed)
         self._slider_zoom_y.valueChanged.connect(self._on_zoom_y_changed)
@@ -620,9 +629,18 @@ class HeatmapWidget(QWidget):
                 self._combo_agg,
                 str(p.get("heatmap_agg") or "confluence_count"))
             field = str(p.get("heatmap_field") or "")
-            if field and self._combo_field.findData(field) < 0:
-                self._combo_field.addItem(field, field)
-            self._set_combo_data(self._combo_field, field)
+            if field:
+                # 20.03.02: Index ueber den Key-Teil des userData suchen
+                # ('{service_id}|{key}'); unbekanntes Feld als checkbares
+                # Item anlegen (Restore-Fallback).
+                fidx = self._find_field_index(field)
+                if fidx < 0:
+                    self._combo_field.add_checkable_item(field, field,
+                                                         checked=True)
+                    fidx = self._combo_field.count() - 1
+                self._combo_field.blockSignals(True)
+                self._combo_field.setCurrentIndex(fidx)
+                self._combo_field.blockSignals(False)
             self._chk_candle.setChecked(bool(
                 p.get("candle_projection_enabled")))
             self._set_zoom_slider(self._slider_zoom_x,
@@ -741,9 +759,65 @@ class HeatmapWidget(QWidget):
         self._view_model.set_heatmap_config(
             x_dim=str(self._combo_x.currentData() or "date"),
             y_dim=str(self._combo_y.currentData() or "hour"),
-            field=str(self._combo_field.currentData() or ""),
+            # 20.03.02 (F2): Aus dem '{service_id}|{key}'-userData nur den
+            # JSON-Key extrahieren (heatmap_field bleibt ein reiner Key).
+            field=self._field_key(self._combo_field.currentData()),
             agg=str(self._combo_agg.currentData() or "confluence_count"),
         )
+
+    @staticmethod
+    def _field_key(ud: Any) -> str:
+        """Extrahiert den JSON-Key aus einem userData-Wert (20.03.02).
+
+        'srv_proximity|visit_pct' -> 'visit_pct'; reine Keys bleiben.
+        """
+        s = str(ud or "")
+        return s.split("|", 1)[1] if "|" in s else s
+
+    def _find_field_index(self, key: str) -> int:
+        """Item-Index im 'Feld'-Dropdown, dessen Key-Teil == `key` ist.
+
+        20.03.02: Das userData traegt '{service_id}|{key}' – findData(key)
+        wuerde den reinen Key nicht finden. Gibt -1 zurueck, wenn keiner
+        passt (Restore-Fallback erzeugt dann ein neues Item).
+        """
+        for i in range(self._combo_field.count()):
+            if self._field_key(self._combo_field.itemData(i)) == key:
+                return i
+        return -1
+
+    # ------------------------------------------------------------------
+    # 20.03.02 (F1c/F2): Multi-Select im 'Feld'-Dropdown -> Datenquellen-
+    # Filter `feature_ids` (KEINE Signatur-Aenderung von set_heatmap_config;
+    # die Aggregation nutzt GENAU EIN aktives Hauptfeld).
+    # ------------------------------------------------------------------
+    def _on_field_selection_changed(self, _checked: List[str]) -> None:
+        """CheckState-Wechsel im 'Feld'-Dropdown -> feature_ids-Filter.
+
+        Die angehakten Items bestimmen die Datenquellen (`set_feature_ids`);
+        `set_feature_ids` stoesst den Debounce-Refresh der generischen
+        Heatmap (und der uebrigen Analytics-Seiten) an. Leere Auswahl =
+        leerer Filter (alle Features, ViewModel-Semantik 15.03-E).
+        """
+        if self._syncing or self._view_model is None:
+            return
+        ids = self._checked_field_service_ids()
+        self._view_model.set_feature_ids(ids)
+
+    def _checked_field_service_ids(self) -> List[str]:
+        """Service-IDs der angehakten Feld-Items (userData '{id}|{key}').
+
+        Items ohne '|' (Mehrfach-Service-Keys, roher Key) tragen keinen
+        eindeutigen Service und bleiben aussen vor (die Quellen der
+        Einzel-Keys decken den Filter ab).
+        """
+        ids: List[str] = []
+        for ud in self._combo_field.checked_data():
+            s = str(ud or "")
+            sid = s.split("|", 1)[0] if "|" in s else ""
+            if sid and sid not in ids:
+                ids.append(sid)
+        return ids
 
     # ------------------------------------------------------------------
     # Candle-Overlay (Bugfix 1, im selben Canvas) + Zoom (E8)
@@ -1042,17 +1116,26 @@ class HeatmapWidget(QWidget):
         # (Repository `field_sources`); Anzeige '{Service} / {Key}'.
         field_sources = data.get("field_sources") or {}
         agg = str(data.get("agg") or "")
-        prev_field = str(self._combo_field.currentData() or "")
+        # 20.03.02: userData = '{service_id}|{key}' – fuer den Vergleich mit
+        # den Payload-Keys nur den Key-Teil verwenden.
+        prev_field = self._field_key(self._combo_field.currentData())
         self._syncing = True
         try:
             self._combo_field.blockSignals(True)
             self._combo_field.clear()
             for k in keys:
                 sids = [str(s) for s in (field_sources.get(k) or [])]
-                self._combo_field.addItem(self._field_label(k, sids), k)
+                label = self._field_label(k, sids)
+                # 20.03.02 (F1c): userData = '{service_id}|{param_key}' bei
+                # eindeutigem Service (angehakte Items -> feature_ids-Filter);
+                # bei Mehrfach-Service-Keys bleibt der rohe Key (kein
+                # eindeutiger Filter-Bezug). Alle Items initial angehakt
+                # (aktiver Filter = alle verfuegbaren Quellen).
+                ud = f"{sids[0]}|{k}" if len(sids) == 1 else k
+                self._combo_field.add_checkable_item(label, ud, checked=True)
             if prev_field in keys:
                 self._combo_field.setCurrentIndex(
-                    self._combo_field.findData(prev_field))
+                    self._find_field_index(prev_field))
             elif keys:
                 self._combo_field.setCurrentIndex(0)
             self._combo_field.blockSignals(False)

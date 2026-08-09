@@ -1021,10 +1021,13 @@ class AnalyticsViewModel(QObject):
         Fallback (defensiv). Rein lesend, kein SQL.
         """
         key = str(plugin_id or "").strip()
-        if not key or key.lower() == "none":
-            # 09.08.2026 (User-Meldung Feld-Dropdown, Root Cause 3): Leere/
-            # fehlende/Native-Keys liefern einen lesbaren Sammel-Namen statt
-            # eines Leerstrings (kein leerer Prefix vor Feld-Eintraegen).
+        if not key or key.lower() in ("none", "native") \
+                or key.lower().startswith("native_"):
+            # 09.08.2026 (User-Meldung Feld-Dropdown, Root Cause 3) +
+            # 20.03.02 (F3): Leere/fehlende/Native-Keys liefern einen
+            # lesbaren Sammel-Namen statt eines Leerstrings (kein leerer
+            # Prefix vor Feld-Eintraegen). `native`/`native_*` werden wie
+            # `none` auf 'Allgemein' gemappt (benutzerfreundlich).
             return "Allgemein"
         model = self._selector_model
         if model is None:

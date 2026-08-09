@@ -378,6 +378,91 @@ class ServiceParamColumnsMixin:
             pass
 
     # ------------------------------------------------------------------
+    # 20.03.02 (UI-Umbau, F6): Sammel-Info aller Resultatparameter einer
+    # Service-Instanz in einem kompakten Info-Window. Der einzelne
+    # (i)-Button hinter '📊 Resultatfelder:' ersetzt die bisherigen
+    # Per-Zeilen-i-Buttons (User-Req). Technische Felder (`technical:
+    # True`) werden UNTERHALB der Haupt-Resultatfelder in einer separaten,
+    # kleineren Sektion '🔧 System-Metriken' gerendert.
+    # ------------------------------------------------------------------
+    def _show_output_params_info(self, plugin_id: str) -> None:
+        """Zeigt ALLE Output-Parameter einer Service-Instanz an (20.03.02).
+
+        Haupt-Resultatfelder mit Typ + Beschreibung; Felder mit
+        `"technical": True` im `output_schema` in separater, kleinerer
+        Sektion `🔧 System-Metriken` (F6). Modaler QDialog (read-only),
+        Eltern-Widget robust aufgeloest (Bugfix b772c93: `self` falls
+        QWidget, sonst `self._dialog`, sonst None).
+        """
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            plugin = PluginRegistry().get(plugin_id)
+        except (KeyError, AttributeError):
+            plugin = None
+        schema = dict(getattr(plugin, "output_schema", None) or {})
+        if not schema:
+            return
+        try:
+            parent = (self if isinstance(self, QWidget)
+                      else getattr(self, "_dialog", None))
+            if not isinstance(parent, QWidget):
+                parent = None
+            dlg = QDialog(parent)
+            dlg.setWindowTitle(f"Resultatfelder – {plugin_id}")
+            dlg.setModal(True)
+            dlg.setMinimumWidth(420)
+            dvl = QVBoxLayout(dlg)
+
+            main_fields: List[Tuple[str, Dict[str, Any]]] = []
+            tech_fields: List[Tuple[str, Dict[str, Any]]] = []
+            for fname, fspec in schema.items():
+                fspec = fspec or {}
+                if fspec.get("technical"):
+                    tech_fields.append((fname, fspec))
+                else:
+                    main_fields.append((fname, fspec))
+
+            for fname, fspec in main_fields:
+                ftype = str(fspec.get("type") or "")
+                fdesc = str(fspec.get("description") or "")
+                head = QLabel(f"<b>{fname}</b>  <i>({ftype})</i>")
+                dvl.addWidget(head)
+                if fdesc:
+                    desc = QLabel(fdesc)
+                    desc.setWordWrap(True)
+                    desc.setStyleSheet("color: #555;")
+                    dvl.addWidget(desc)
+
+            if tech_fields:
+                sep = QLabel("<hr>")
+                dvl.addWidget(sep)
+                tech_head = QLabel("🔧 System-Metriken")
+                tech_head.setStyleSheet(
+                    "color: #888; font-size: 11px; font-weight: bold;")
+                dvl.addWidget(tech_head)
+                for fname, fspec in tech_fields:
+                    ftype = str(fspec.get("type") or "")
+                    fdesc = str(fspec.get("description") or "")
+                    line = f"<b>{fname}</b> <i>({ftype})</i>"
+                    if fdesc:
+                        line += f" – {fdesc}"
+                    tech_lbl = QLabel(line)
+                    tech_lbl.setWordWrap(True)
+                    tech_lbl.setStyleSheet("color: #999; font-size: 10px;")
+                    dvl.addWidget(tech_lbl)
+
+            btn_row = QHBoxLayout()
+            btn_row.addStretch(1)
+            ok_btn = QPushButton("OK")
+            ok_btn.setDefault(True)
+            ok_btn.clicked.connect(dlg.accept)
+            btn_row.addWidget(ok_btn)
+            dvl.addLayout(btn_row)
+            dlg.exec()
+        except (RuntimeError, AttributeError):
+            pass
+
+    # ------------------------------------------------------------------
     # Phase 15 (Dirty-State): Aenderungs-Tracking der Parameter-Controls
     # ------------------------------------------------------------------
     def _connect_param_change(self, ctrl: QWidget, iid: str, key: str) -> None:
@@ -716,60 +801,38 @@ class ServiceParamColumnsMixin:
         # 20.03 (Bugfix): Resultatfelder (Output-Schema) als eigene Sektion
         # UNTER dem Beschreibungs-/Info-Feld (nicht mehr im Info-Label, User-
         # Meldung: Ergebnisparameter gehoeren nicht ins Beschreibungsfeld).
-        # Je Haupt-Resultatfeld eine Zeile: Feldname (+ Typ) und ein kleiner
-        # 'i'-Button, der die Feld-Beschreibung in einem Dialog anzeigt.
-        # Technische Felder (technical: True) kompakt in einer dezenten Zeile
-        # `🔧 System-Metrik` (Semikolon-getrennt, ohne Beschreibung – E2).
+        # 20.03.02 (UI-Umbau, User-Req + F6): KEINE Einzelzeilen mehr – nur
+        # die Gruppenueberschrift '📊 Resultatfelder:' mit einem EINZELNEN
+        # (i)-Button dahinter, der ALLE Ergebnisparameter der gewaehlten
+        # Service-Instanz kompakt in einem Info-Window zeigt (Name/Typ/
+        # Beschreibung). Technische Felder (`technical: True`) erscheinen dort
+        # UNTERHALB der Haupt-Resultatfelder in einer separaten, kleineren
+        # Sektion '🔧 System-Metriken' (F6).
         output_schema = dict(getattr(plugin, "output_schema", None) or {})
         if output_schema:
-            out_header = QLabel("📊 Resultatfelder (Output-Schema):")
+            out_header_row = QHBoxLayout()
+            out_header_row.setContentsMargins(0, 0, 0, 0)
+            out_header = QLabel("📊 Resultatfelder:")
             out_header.setObjectName("lbl_output_schema_header")
             out_header.setStyleSheet(
                 "color: #666; font-size: 11px; font-weight: bold;")
-            vl.addWidget(out_header)
-
-            main_fields: List[Tuple[str, Dict[str, Any]]] = []
-            tech_fields: List[Tuple[str, Dict[str, Any]]] = []
-            for fname, fspec in output_schema.items():
-                fspec = fspec or {}
-                if fspec.get("technical"):
-                    tech_fields.append((fname, fspec))
-                else:
-                    main_fields.append((fname, fspec))
-
-            for fname, fspec in main_fields:
-                ftype = str(fspec.get("type") or "")
-                fdesc = str(fspec.get("description") or "")
-                row = QHBoxLayout()
-                row.setContentsMargins(12, 0, 0, 0)
-                name_lbl = QLabel(f"🔹 {fname}  <i>({ftype})</i>")
-                name_lbl.setStyleSheet("color: #666; font-size: 11px;")
-                row.addWidget(name_lbl)
-                row.addStretch(1)
-                if fdesc:
-                    info_btn = QPushButton("i")
-                    info_btn.setFixedSize(16, 16)
-                    info_btn.setCursor(Qt.PointingHandCursor)
-                    info_btn.setToolTip("Feld-Beschreibung anzeigen")
-                    info_btn.setStyleSheet(
-                        "QPushButton { color:#666; border:1px solid #aaa;"
-                        " border-radius:8px; font-size:9px; font-weight:bold;"
-                        " background:transparent; }"
-                        "QPushButton:hover { color:#000; border-color:#000; }")
-                    info_btn.clicked.connect(
-                        lambda _=False, n=fname, t=ftype, d=fdesc, p=pid:
-                        self._show_output_field_info(n, t, d, p))
-                    row.addWidget(info_btn)
-                vl.addLayout(row)
-
-            if tech_fields:
-                tech_txt = "🔧 System-Metrik: " + "; ".join(
-                    f"{n} ({f.get('type') or ''})" for n, f in tech_fields)
-                tech_lbl = QLabel(tech_txt)
-                tech_lbl.setWordWrap(True)
-                tech_lbl.setStyleSheet("color: #999; font-size: 10px;")
-                vl.addWidget(tech_lbl)
-
+            out_header_row.addWidget(out_header)
+            out_info_btn = QPushButton("(i)")
+            out_info_btn.setObjectName("btn_output_params_info")
+            out_info_btn.setFixedSize(24, 16)
+            out_info_btn.setCursor(Qt.PointingHandCursor)
+            out_info_btn.setToolTip(
+                "Alle Ergebnisparameter dieser Service-Instanz anzeigen")
+            out_info_btn.setStyleSheet(
+                "QPushButton { color:#666; border:1px solid #aaa;"
+                " border-radius:8px; font-size:9px; font-weight:bold;"
+                " background:transparent; }"
+                "QPushButton:hover { color:#000; border-color:#000; }")
+            out_info_btn.clicked.connect(
+                lambda _=False, p=pid: self._show_output_params_info(p))
+            out_header_row.addWidget(out_info_btn)
+            out_header_row.addStretch(1)
+            vl.addLayout(out_header_row)
             # Zustand je Instanz merken (Reset in _clear_service_columns).
             self._service_output_schemas[iid] = output_schema
 

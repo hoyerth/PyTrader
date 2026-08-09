@@ -49,6 +49,10 @@ class ServiceSelectorWidget(QWidget):
     #: Bugfix 05.08.2026: Klick auf den Info-Button im MasterTree (FULL_EDIT)
     #: wird an den Aufrufer weitergereicht (set_id, service_id, plugin_id).
     info_requested = Signal(str, str, str)
+    #: 20.03.02 (F4): Info-Button auf Kategorie-Ordnern wird an den Aufrufer
+    #: weitergereicht (group, category_path) – ServicePicker zeigt die
+    #: Read-Only-Ordner-Info (ServiceWindow-Muster).
+    category_info_requested = Signal(str, str)
 
     def __init__(self, mode: str = MODE_SELECT_ONLY, model: Optional[ServiceSelectorModel] = None,
                  parent: Optional[QWidget] = None) -> None:
@@ -108,6 +112,9 @@ class ServiceSelectorWidget(QWidget):
         self.master_tree.selection_changed.connect(self.selection_changed)
         # Bugfix 05.08.2026: Info-Button-Klicks im MasterTree re-emittieren.
         self.master_tree.info_requested.connect(self.info_requested)
+        # 20.03.02 (F4): Kategorie-Ordner-Info ebenfalls re-emittieren.
+        self.master_tree.category_info_requested.connect(
+            self.category_info_requested)
 
     def _build_select_only(self) -> None:
         """Modus A: kompakte Set-/Service-Combos."""
@@ -146,6 +153,9 @@ class ServiceSelectorWidget(QWidget):
         self.master_tree.selection_changed.connect(self.selection_changed)
         # Bugfix 05.08.2026: Info-Button-Klicks im MasterTree re-emittieren.
         self.master_tree.info_requested.connect(self.info_requested)
+        # 20.03.02 (F4): Kategorie-Ordner-Info ebenfalls re-emittieren.
+        self.master_tree.category_info_requested.connect(
+            self.category_info_requested)
 
     # -------------------------------------------------------------------------
     # Modell-Sync

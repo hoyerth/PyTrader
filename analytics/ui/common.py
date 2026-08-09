@@ -8,10 +8,16 @@ Gemeinsame UI-Helfer der Analytics-Pages (analytics/ui/*, Phase 15.03).
 """
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, List
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QLabel, QStackedLayout, QWidget
+from PySide6.QtCore import QEvent, Qt, Signal
+from PySide6.QtGui import QStandardItem, QStandardItemModel
+from PySide6.QtWidgets import (
+    QComboBox,
+    QLabel,
+    QStackedLayout,
+    QWidget,
+)
 
 # Ausgabeformat der Wanduhr-Zeit (z. B. '03.08.2026 12:00').
 WANDUHR_FORMAT = "%d.%m.%Y %H:%M"
@@ -49,3 +55,124 @@ def make_overlay_stack(
     stack.addWidget(overlay)
     stack.setCurrentWidget(content)
     return stack
+
+
+class CheckableComboBox(QComboBox):
+    """QComboBox mit Checkbox-Items und offen bleibendem Pop-up (20.03.02).
+
+    Mehrfach-Auswahl ueber `QStandardItem` (`Qt.ItemIsUserCheckable`),
+    Formatierung `{Service-Name} / {Parameter}` durch den Aufrufer
+    (Display-Text). Das Pop-up bleibt beim Anklicken einer Checkbox geoeffnet
+    (Klick im Viewport unterdrueckt `hidePopup()`), schliesst aber normal bei
+    Aussenklick / Escape / Fokusverlust.
+
+    API:
+      * `add_checkable_item(display_text, user_data, checked=False)`
+      * `checked_data() -> List[str]`  – user_data der angehakten Items
+      * Signal `selection_changed(list)` – bei jedem CheckState-Wechsel
+        (blockierbar ueber `blockSignals(True)`, Muster heatmap_widget).
+
+    Headless instanziierbar: Der Konstruktor startet KEINEN Event-Loop
+    (kein exec_()).
+    """
+
+    #: Wird bei jedem CheckState-Wechsel mit der Liste der angehakten
+    #: `user_data`-Werte emittiert (in Item-Reihenfolge).
+    selection_changed = Signal(list)
+
+    def __init__(self, parent: QWidget = None) -> None:
+        super().__init__(parent)
+        self._popup_click = False
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+        self.setPlaceholderText("Felder wählen…")
+        self._model = QStandardItemModel(self)
+        self.setModel(self._model)
+        # Pop-up offen halten: Mausklick auf den Viewport setzt das Flag,
+        # `hidePopup()` unterdrueckt das Schliessen dann einmalig.
+        self.view().viewport().installEventFilter(self)
+        self._model.itemChanged.connect(self._on_item_changed)
+
+    # ------------------------------------------------------------------
+    # Pop-up-Steuerung (offen bei Checkbox-Klick)
+    # ------------------------------------------------------------------
+    def hidePopup(self) -> None:
+        """Unterdrueckt das Schliessen bei Klicks in den Viewport (20.03.02).
+
+        Alle anderen Schliess-Gruende (Aussenklick, Escape, Fokusverlust)
+        verhalten sich wie beim Standard-QComboBox.
+        """
+        if self._popup_click:
+            self._popup_click = False
+            return
+        super().hidePopup()
+
+    def eventFilter(self, obj, event) -> bool:
+        """Setzt das Popup-Flag bei Mausklicks auf den Popup-Viewport."""
+        if (obj is self.view().viewport()
+                and event.type() == QEvent.MouseButtonRelease):
+            self._popup_click = True
+        return super().eventFilter(obj, event)
+
+    # ------------------------------------------------------------------
+    # Befuellung / Auslesen
+    # ------------------------------------------------------------------
+    def add_checkable_item(
+        self, display_text: str, user_data: Any, checked: bool = False
+    ) -> None:
+        """Fuegt ein Checkbox-Item hinzu (display_text, user_data)."""
+        item = QStandardItem(str(display_text))
+        item.setData(user_data, Qt.UserRole)
+        item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+        item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        self._model.appendRow(item)
+
+    def checked_data(self) -> List[str]:
+        """Liefert die `user_data`-Werte aller angehakten Items."""
+        out: List[str] = []
+        for i in range(self._model.rowCount()):
+            item = self._model.item(i)
+            if item is not None and item.checkState() == Qt.Checked:
+                out.append(item.data(Qt.UserRole))
+        return out
+
+    def set_checked_data(self, checked_values: List[str]) -> None:
+        """Setzt die CheckStates anhand einer Liste von user_data-Werten.
+
+        Items mit einem Wert aus `checked_values` werden angehakt, alle
+        anderen abgewaehlt (blockiert, kein selection_changed-Emit).
+        """
+        wanted = {str(v) for v in (checked_values or [])}
+        self.blockSignals(True)
+        try:
+            for i in range(self._model.rowCount()):
+                item = self._model.item(i)
+                if item is None:
+                    continue
+                on = str(item.data(Qt.UserRole) or "") in wanted
+                item.setCheckState(Qt.Checked if on else Qt.Unchecked)
+            self._update_line_text()
+        finally:
+            self.blockSignals(False)
+
+    def _on_item_changed(self, item) -> None:
+        """CheckState-Wechsel -> LineEdit-Text aktualisieren + Signal."""
+        if item is None or not (item.flags() & Qt.ItemIsUserCheckable):
+            return
+        self._update_line_text()
+        self.selection_changed.emit(self.checked_data())
+
+    def _update_line_text(self) -> None:
+        """Kompakte Zusammenfassung im (read-only) LineEdit."""
+        labels = [
+            self._model.item(i).text()
+            for i in range(self._model.rowCount())
+            if self._model.item(i) is not None
+            and self._model.item(i).checkState() == Qt.Checked
+        ]
+        if not labels:
+            self.lineEdit().setText("")
+        elif len(labels) == 1:
+            self.lineEdit().setText(labels[0])
+        else:
+            self.lineEdit().setText(f"{len(labels)} Felder gewählt")

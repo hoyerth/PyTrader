@@ -120,5 +120,244 @@ Plain-Object (kein QWidget) hostet:
      Eltern-Auflösung + None-Fallback): ALL PASS.
 
 
+---
+
+# 20.03.02 Multi-Select Resultatparameter, Dynamic Checkable ComboBox & Info-Fixes (09.08.2026, 20:15; Entscheidungen F1–F7 bestätigt 20:21)
+
+## 1. Regeln & Invarianten
+* **Code-Style:** Exakt **4 Leerzeichen** Einrückung, **1 Leerzeile** zwischen
+  Methoden/Funktionen (PEP8, Phase-19-Invariante 3).
+* **Testing:** **STRIKT HEADLESS** via `py_compile` & `test/test.py`
+  (`QApplication.exec()` STRIKT VERBOTEN – Phase-19-Invariante 2). Alle neuen
+  Test-Skripte/Test-DBs gehören nach `test/` (Invariante 10).
+* **Entkopplung:** MVVM & IoC (Invariante 4/5). Kein SQL in UI; strikter
+  Lese-Pfad über `AnalyticsRepository` / `FeatureStoreReader`.
+* **Open/Closed (Invariante 11):** Nur additive Ergänzungen; keine
+  Umformatierung unbeteiligter Dateien.
+
+## 2. Problemstellung & Ziel
+1. **Dropdown-Fixes (größtenteils VORHANDEN, s. §3):** Strikte Filterung der
+   Ergebnisfelder nach im Picker tatsächlich aktivierten `feature_ids`.
+2. **Multi-Select & Pop-up (NEU):** `CheckableComboBox` mit offen bleibendem
+   Pop-up bei Checkbox-Klick und Anzeige `{Service-Name} / {Parameter}`.
+3. **Info-Button UI-Umbau (Neuer Req):** Einzelanzeigen der Resultatparameter
+   im ServicePicker entfernen. Stattdessen hinter der Gruppenüberschrift
+   *"Resultatfelder"* ein einzelner **(i)-Info-Button**, der bei Klick alle
+   Ergebnisparameter der gewählten Service-Instanz kompakt in einem Info-Window
+   zeigt.
+4. **Wiederherstellung Bugfix 1 (Erste Zeile Beschreibungsfeld):**
+   `header_line` in `ServiceDescriptionDialog` / `ServiceDescriptionEditDialog`
+   – **ist bereits intakt** (Bestandsaufnahme §3, Punkt 5).
+5. **Wiederherstellung Bugfix 2 ((i)-Button im MasterTree):**
+   Signalverbindung `info_requested` / `category_info_requested` – im
+   ServiceWindow intakt; **Lücke im ServiceSelectorDialog (ServicePicker)**.
+
+## 3. Bestandsaufnahme (Vollständigkeitsprüfung gegen HEAD `5c40272`)
+
+| Schritt | Datei | Status | Befund |
+|---|---|---|---|
+| 2 | `analytics/engine/feature_store_reader.py` | ✅ VORHANDEN | `feature_keys_by_service()` nimmt `feature_ids` (Z. 430) und wendet `_apply_feature_filter` an (Z. 462). Commit `4648399`. |
+| 3 | `analytics/engine/analytics_repository.py` | ✅ VORHANDEN | `get_generic_heatmap()` baut `field_sources` + `avail_filtered` strikt über `feature_ids` (Z. 150–176). Commit `4648399`. |
+| 4 | `analytics/engine/analytics_view_model.py` | 🟡 DELTA | Leer/`"none"` → `"Allgemein"`, Title-Case-Fallback ✅. **`"native"` → `"Native"` (Plan: `"Allgemein"`)** – Erweiterung offen (F3). |
+| 5 | `analytics/engine/description_dialog.py` | ✅ VORHANDEN | `_render_html()` rendert `header_line` fett + `<p>&nbsp;</p>` (Z. 285–290); `ServiceDescriptionEditDialog` ebenso. |
+| 6 | `serviceui/master_tree.py` + `service_selector_widget.py` | 🟡 DELTA | Emit + Re-Emit vorhanden (ASCII `"i"`). **`service_selector_dialog.py` verbindet `info_requested` NICHT** → i-Button im ServicePicker wirkungslos. |
+| 6b | `serviceui/param_columns.py` | 🔴 NEU | UI-Umbau Resultatfelder (einzelner `btn_output_params_info` statt Per-Zeile-i-Buttons) – betrifft auch `_DialogParamHost`. |
+| 1 | `analytics/ui/common.py` | 🔴 NEU | `CheckableComboBox` fehlt vollständig. |
+| 7 | `analytics/ui/heatmap_widget.py` | 🟡 KORRIGIERT | **`combo_field` liegt in `heatmap_widget.py` (Z. 496), NICHT in `heatmap_page.py`** – Plan-Verortung angepasst. |
+| 7b | `analytics/engine/analytics_view_model.py` | ✅ ENTSCHIEDEN | `set_heatmap_config()` bleibt Einzel-Feld (`field: str`); Multi-Select steuert `feature_ids` (F1c/F2, §6). |
+
+## 4. Architektur & Datenfluss
+
+```text
+[ServicePicker / ServiceSelectorDialog] ──(EventBus: service_set_changed)──► [AnalyticsViewModel]
+  │                                                                             │
+  ├── (i) "Resultatfelder" ──► [ServiceDescriptionDialog (read-only)]          │
+  │                                                                             │
+[CheckableComboBox (Multi-Select)] ──(checked → feature_ids: List[str])────────┘
+       │                               (Filter: WHERE feature_id IN (...))
+       │
+       ▼
+[AnalyticsViewModel.set_heatmap_config(field: str)] ──► [FeatureStoreReader]
+       │                    (GENAU EIN aktives Hauptfeld, F1c/F2)
+       └──(heatmap_field: str) + feature_ids-Filter
+                ▼
+        [DuckDB Multi-Field-Aggregation / Render]
+```
+
+## 5. Schritt-für-Schritt Umsetzung (inkl. Entscheidungen)
+
+### Schritt 1: `analytics/ui/common.py` – `CheckableComboBox` (NEU)
+* `class CheckableComboBox(QComboBox)`: `setEditable(True)`,
+  `lineEdit().setReadOnly(True)`, LineEdit-Placeholder (z. B. `"Felder wählen…"`).
+* **Pop-up offen halten:** `eventFilter` auf `lineEdit()`/`view()` – Mausklick in
+  die Checkbox-Spalte ruft **nicht** `hidePopup()` auf (Qt überschreibt sonst
+  den Standard; Pattern: `QComboBox` mit `QStandardItemModel` +
+  `Qt.ItemIsUserCheckable`, analog `master_tree.py` Checkbox-Muster).
+* API: `add_checkable_item(display_text, user_data, checked=False)`,
+  `checked_data() -> List[str]` (nur angehakte `user_data`-Keys in
+  Item-Reihenfolge), Signal `selection_changed(list)` (emittiert bei jedem
+  CheckState-Wechsel; blockierbar über `_syncing`-Flag, Muster `heatmap_widget`).
+* Headless instanziierbar (kein `exec()` im Konstruktor).
+
+### Schritt 2 + 3: Reader/Repository-Filterung
+**Bereits umgesetzt (Commit `4648399`) – kein Handlungsbedarf**, nur
+Regressions-Absicherung in `test/test.py` (Filter-Check).
+
+### Schritt 4: `resolve_service_display_name()` – natives Handling (DELTA, F3 ✅)
+* **Entscheidung F3:** `"native"` und `native_*`-Keys werden wie leere/`"none"`-
+  Keys auf `"Allgemein"` gemappt (benutzerfreundlich, konsistent zu Root
+  Cause 3). Fallback-Zweig: Leer / `"none"` / `"native"` / `"native_*"`
+  → `"Allgemein"`.
+* Unregistrierte `srv_`/`ind_`-Keys → Title-Case (bereits vorhanden, bleibt).
+
+### Schritt 5: `header_line` (Bugfix 1)
+**Bereits intakt** – keine Änderung; nur Test-Absicherung.
+
+### Schritt 6: `master_tree.py` / `service_selector_widget.py` / `service_selector_dialog.py`
+* **Bugfix 2 DELTA (ServicePicker):** Im `service_selector_dialog.py` das
+  Signal `info_requested` (und `category_info_requested`) des eingebetteten
+  `ServiceSelectorWidget` mit dem Dialog verbinden.
+* **Dialog-Entkopplung (F4 ✅):**
+  * **ServiceWindow** (`service_win.py`): `i`-Button öffnet WEITERHIN den
+    editierbaren `ServiceDescriptionEditDialog` (Instanz-Notizen; Bestand,
+    keine Änderung).
+  * **ServicePicker** (`service_selector_dialog.py`): zeigt Read-Only
+    `ServiceDescriptionDialog.from_plugin()` bzw. `from_set()`.
+* **Header-Format (F5 ✅):** Badge-Header strikt vereinheitlicht
+  (gilt für `_info_header_tooltip`, `_info_set_tooltip` und den
+  Info-Dialog-`header_line`):
+  * Service aktiv im Indikator: `📌 im <Indikator> | 🟢 aktiv in <Indikator>`
+  * Service inaktiv: `📌 im <Indikator> | ⚪ inaktiv`
+  * Mehrere Indikatoren (Sets): `📌 im <I1> + <I2> | 🟢 aktiv in <I1> + <I2>`
+    bzw. `⚪ inaktiv` – Namenslogik analog `_apply_set_badge`.
+* **UI-Umbau Resultatfelder (`param_columns.py` `_build_service_column`):**
+  * Per-Zeile-`i`-Buttons der Haupt-Resultatfelder entfernen (20.03.01-Muster).
+  * Direkt hinter dem Label `📊 Resultatfelder:` einen kompakten
+    `QPushButton` `btn_output_params_info` (Text/Icon `(i)`) platzieren.
+  * Klick → kompaktes Info-Window mit **allen** Output-Parametern der
+    gewählten Service-Instanz inkl. Typ + Beschreibung + Service-Referenz.
+  * **System-Metriken (F6 ✅):** Felder mit `"technical": True` werden
+    UNTERHALB der Haupt-Resultatfelder in einer separaten, kleineren Sektion
+    `🔧 System-Metriken` gerendert (Semikolon-getrennt, dezenter Block).
+  * `_DialogParamHost`-Kompatibilität (Eltern-Auflösung `self`/`self._dialog`,
+    Bugfix `b772c93`) beibehalten; `_service_output_schemas` bleibt.
+
+### Schritt 7: `analytics/ui/heatmap_widget.py` (KORRIGIERTE Verortung + F1c/F2/F7 ✅)
+* `_combo_field` (Z. 496) durch `CheckableComboBox` ersetzen.
+* **Multi-Select-Semantik (F1c/F2):** Die Multi-Auswahl steuert
+  AUSSCHLIESSLICH den Datenquellen-Filter `feature_ids: List[str]`
+  (→ `view_model.set_feature_ids(...)`, Filter-Pfad `feature_keys_by_service`
+  / `fetch_generic_heatmap`). Die Aggregation verarbeitet GENAU EIN aktives
+  Hauptfeld.
+* **Keine Signatur-Änderung (F2):** `set_heatmap_config(x_dim, y_dim, field,
+  agg)` bleibt unverändert – `field: str` (heatmap_field) ist das eine aktive
+  Hauptfeld. KEINE Erweiterung auf `fields: List[str]`.
+* Bei `data_ready`/`_sync_combos_from_payload` (Z. 1040): Befüllen via
+  `field_sources` mit `{Service-Name} / {Parameter}`,
+  `userData="{service_id}|{param_key}"` (Mehrfach-Key: `{key}`-Fallback, Muster
+  `_field_label`).
+* `_syncing`-Guard und `_apply_config`/`request_data`-Loop beibehalten.
+* **UI-Behavior (F7):** Die Feld-Auswahl (`CheckableComboBox`) bleibt bei
+  Aggregationen `COUNT` und `CONFLUENCE_COUNT` strikt deaktiviert
+  (`setEnabled(False)`, bestehendes `_update_controls`-Muster).
+
+## 6. Entscheidungen (F1–F7, bestätigt durch Anwender am 09.08.2026)
+
+| ID | Entscheidung (verbindlich) |
+|---|---|
+| F1 | **Multi-Select = Quellen-Filter (c):** Multi-Auswahl im Dropdown steuert ausschließlich den Datenquellen-Filter `feature_ids: List[str]`. |
+| F2 | **Keine Signatur-Erweiterung:** `set_heatmap_config(x_dim, y_dim, field, agg)` bleibt unverändert; die Aggregation (`heatmap_field: str`) verarbeitet genau ein aktives Hauptfeld. |
+| F3 | **`native`-Fallback:** `resolve_service_display_name("native")` und `native_*`-Keys → `"Allgemein"`. |
+| F4 | **Dialog-Entkopplung:** ServiceWindow → editierbarer `ServiceDescriptionEditDialog` (Bestand); ServicePicker → Read-Only `from_plugin()`/`from_set()`. |
+| F5 | **Header-Format vereinheitlicht:** `📌 im <Indikator> | 🟢 aktiv in <Indikator>` bzw. `📌 im <Indikator> | ⚪ inaktiv` (Sets: Namen mit ` + ` verknüpft). |
+| F6 | **System-Metriken:** `technical: True`-Felder unterhalb der Haupt-Resultatfelder in separater, kleinerer Sektion `🔧 System-Metriken`. |
+| F7 | **UI-Behavior:** Feld-Auswahl bei `COUNT`/`CONFLUENCE_COUNT` strikt deaktiviert (`setEnabled(False)`). |
+
+## 7. Verification Checklist (`test/test.py`, headless)
+
+- [x] **Syntax-Check:** `py_compile` auf allen geänderten Dateien
+      (`common.py`, `analytics_view_model.py`, `param_columns.py`,
+      `service_selector_widget.py`, `service_selector_dialog.py`,
+      `service_win.py`, `heatmap_widget.py`, `test/check_dialog_host.py`,
+      `test/test.py`) – OK. Unveränderte Dateien (`feature_store_reader.py`,
+      `analytics_repository.py`, `description_dialog.py`, `master_tree.py`)
+      wurden nicht angefasst.
+- [x] **Filter-Check (F1):** `feature_keys_by_service(feature_ids=['srv_a'])`
+      liefert KEINE `srv_b`-Keys (und umgekehrt) – headless verifiziert
+      (test.py-Checks `m`/`n`, isoliertes Skript analog zum 37er-Block).
+      Multi-Select-Mapping (angehakte Items → `feature_ids`) per
+      Code-Inspektion abgesichert.
+- [x] **Naming- & Header-Check (F3/F5):** `resolve_service_display_name('native')`
+      und `resolve_service_display_name('native_foo')` liefern `"Allgemein"`
+      (Checks `d`–`f`); `_info_header_line`/`_info_set_header_line` liefern
+      das vereinheitlichte Format `📌 im … | 🟢 aktiv in …` / `⚪ inaktiv`
+      (Checks `i`–`k`). `ServiceDescriptionDialog`-`header_line`-Rendering
+      (Zeile 1, fett + Leerzeile) ist Bestand (Commit `4648399`) und durch
+      die Phase-16-Tests `D1`/`D2` + Code-Inspektion abgesichert.
+- [x] **Widget-Check:** `CheckableComboBox` instanziiert headless ohne
+      Qt-Exec-Freeze; `checked_data()` liefert nur angehakte `userData`-Keys,
+      `set_checked_data()` wechselt CheckStates (Checks `a`–`c`).
+      Pop-up-Offenhalten (EventFilter unterdrückt `hidePopup()` bei
+      Checkbox-Klick) ist per Code-Inspektion abgesichert (nicht headless
+      simulierbar).
+- [x] **Info-Umbau-Check (F6):** `_build_service_column` rendert genau EINEN
+      `btn_output_params_info` (hinter „Resultatfelder"), keine Per-Zeile-i-
+      Buttons mehr; `technical: True`-Felder als separate Sektion
+      `🔧 System-Metriken` im Sammel-Info-Window; `_DialogParamHost`-
+      Spaltenbau fehlerfrei (Regressions-`test/check_dialog_host.py`,
+      16 Checks – ALLE PASS).
+- [x] **Picker-i-Button (F4):** Signal-Re-Emission `category_info_requested`
+      im `ServiceSelectorWidget` (beide Modi) + Verdrahtung
+      `info_requested`/`category_info_requested` im `ServiceSelectorDialog`
+      → Read-Only `ServiceDescriptionDialog.from_plugin()`/`from_set()`
+      (Check `l` + Code-Inspektion der Slot-Verdrahtung); ServiceWindow-Pfad
+      (Editier-Dialog) unverändert.
+- [x] **F2/F7:** `set_heatmap_config`-Signatur unverändert (`field: str`,
+      Check `g`); `_field_key` extrahiert den JSON-Key aus
+      `"{service_id}|{key}"` (Check `h`); `COUNT`/`CONFLUENCE_COUNT` sind
+      NICHT in `_VALUE_AGGS` → Feld-Combo wird deaktiviert (Check `o` +
+      `_update_controls`-Inspektion).
+
+## 8. Hinweise
+* Die 6 vorbestehenden Fehlschläge in `test/test.py` (P2/P5/H3–H7,
+  Fenster-Persistenz-Geometrie) sind NICHT Bestandteil dieser Phase.
+* Entscheidungen F1–F7 sind vom Anwender am 09.08.2026, 20:21 bestätigt und
+  in §6 verbindlich dokumentiert.
+
+## 9. Implementierungs-Log (09.08.2026, ~20:55; Commit `…`, Tag `20.03.02`)
+* **`analytics/ui/common.py`** – `CheckableComboBox` (NEU, F1): `QComboBox` mit
+  `QStandardItemModel`, Checkbox-Spalte, EventFilter hält Pop-up bei
+  Checkbox-Klick offen; API `add_checkable_item(display_text, user_data,
+  checked)`, `checked_data() -> List[str]`, `set_checked_data()`, Signal
+  `selection_changed(list)`.
+* **`analytics/engine/analytics_view_model.py`** – F3: `resolve_service_display_name`
+  mappt `"native"`/`native_*`/`"none"`/leer → `"Allgemein"` (statt Title-Case-
+  Fallback für `native`).
+* **`serviceui/service_win.py`** – F5: Info-Badge-Header vereinheitlicht
+  (`📌 im … | 🟢 aktiv in …` bzw. `⚪ inaktiv`, Sets mit ` + `).
+* **`serviceui/service_selector_dialog.py`** – F4: Import + Verdrahtung
+  `info_requested`/`category_info_requested` des eingebetteten Widgets;
+  Slots `_on_info_requested`/`_on_category_info_requested` öffnen Read-Only
+  `ServiceDescriptionDialog.from_plugin()`/`from_set()` mit
+  `_info_header_line`/`_info_set_header_line`.
+* **`serviceui/service_selector_widget.py`** – F4: neues Signal
+  `category_info_requested` + Re-Emission in beiden Modi (Achtung: gemischte
+  Line-Endings, nur per Python-Skript editierbar).
+* **`serviceui/param_columns.py`** – F6: Per-Zeile-i-Buttons entfernt, EIN
+  `btn_output_params_info` hinter `📊 Resultatfelder:`; neuer Slot
+  `_show_output_params_info()` zeigt Hauptfelder + Sektion
+  `🔧 System-Metriken` (`technical: True`); `_DialogParamHost`-Kompatibilität
+  beibehalten.
+* **`analytics/ui/heatmap_widget.py`** – F1c/F2/F7: `_combo_field` ist jetzt
+  `CheckableComboBox`, userData `"{service_id}|{key}"`; Multi-Select →
+  `set_feature_ids(...)` (Quellen-Filter); `set_heatmap_config`-Signatur
+  unverändert; Feld-Combo bei `COUNT`/`CONFLUENCE_COUNT` deaktiviert.
+* **Validierung:** `py_compile` auf allen geänderten Dateien OK; neuer
+  20.03.02-Testblock in `test/test.py` (Checks `a`–`o`, 15 Stück);
+  `test/check_dialog_host.py` (16 Checks); isolierte Verifikationsskripte
+  (danach gelöscht, test/-Cleanup) – ALLE PASS. Kein Regressionstest, keine
+  UI-Ausführung (Phase-19-Invariante 2).
+
+
 
 
