@@ -111,6 +111,81 @@ class AnalyticsRepository:
         return result
 
     # ------------------------------------------------------------------
+    # Generische 2D-Heatmap (20.02, additiv – Kapitel §2 / Review E1/E5/E6)
+    # ------------------------------------------------------------------
+    def get_generic_heatmap(
+        self,
+        symbol: str,
+        timeframe: str,
+        x_dim: str,
+        y_dim: str,
+        field: Optional[str] = None,
+        agg: str = "count",
+        feature_id: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Generische 2D-Matrix (freie Dimensionen + Aggregationen, 20.02).
+
+        Additiv zur bestehenden get_heatmap() (Dow×Stunde bleibt Standard).
+        Wanduhr-Garantie (Invariante 7 / E4) wie fetch_heatmap – die
+        Extraktion erfolgt im Reader mit `bar_time AT TIME ZONE 'UTC'`.
+
+        Returns:
+            {
+              "matrix": dense M x N, "x_labels"/"y_labels", "x_values",
+              "min_val"/"max_val", "x_dim"/"y_dim"/"agg"/"field",
+              "metrics": ["count", "confluence_count", ...numerische JSON-Keys],
+              "symbol", "timeframe",
+            }
+        """
+        avail = self.reader.available_feature_keys(
+            symbol, timeframe, numeric_only=True)
+        metrics = ["count", "confluence_count"] + avail
+        use_agg = str(agg or "count").lower()
+        use_field = str(field or "")
+        # E6: Bei Wert-Aggregationen (AVG/SUM/MIN/MAX) ist `field` ein
+        # numerischer JSON-Key – defensiv auf den ersten verfuegbaren Key
+        # zurueckfallen (keine ValueError-Haenger im UI).
+        if use_agg in ("avg", "sum", "min", "max"):
+            if use_field not in avail:
+                use_field = avail[0] if avail else ""
+        try:
+            result = self.reader.fetch_generic_heatmap(
+                symbol, timeframe, x_dim, y_dim, field=use_field or None,
+                agg=use_agg, feature_id=feature_id, feature_ids=feature_ids,
+                limit=limit,
+            )
+        except ValueError as e:
+            print(f"WARN [AnalyticsRepository] get_generic_heatmap: {e}")
+            result = self.reader._empty_generic_heatmap(
+                x_dim, y_dim, use_agg, use_field or None, symbol, timeframe)
+        result["metrics"] = metrics
+        return result
+
+    # ------------------------------------------------------------------
+    # OHLCV-Snapshot fuer das Candle-Overlay (20.02, E9)
+    # ------------------------------------------------------------------
+    def get_ohlcv_snapshot(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """OHLCV-Bars aus market_data.duckdb (read-only, Wanduhr-Epochs).
+
+        20.02 (E9): Read-only-Delegation an den FeatureStoreReader – kein SQL
+        in der UI. Der Preis-Strip im HeatmapWidget gruppiert die Bars pro
+        Datums-Spalte zu Tages-Ohlc.
+
+        Returns:
+            {"bars": [{"time": int, "open": float, "high": float,
+                       "low": float, "close": float, "volume": float}, ...],
+             "symbol", "timeframe"}
+        """
+        return self.reader.fetch_ohlcv_snapshot(symbol, timeframe, limit=limit)
+
+    # ------------------------------------------------------------------
     # Scatter
     # ------------------------------------------------------------------
     def get_scatter(

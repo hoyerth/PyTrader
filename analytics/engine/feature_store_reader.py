@@ -41,6 +41,10 @@ from db_service import DbPool, _parse_json_field
 # Projekt-Root = 2 Ebenen ueber dieser Datei (engine/ -> analytics/ -> Root)
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DB_ANALYTICS = str(BASE_DIR / "data" / "analytics.duckdb")
+# 20.02 (E9, Candle-Overlay): OHLCV-Quelle fuer den Preis-Strip – read-only
+# via DbPool, analog FeatureBuilder.load_ohlcv() (Spalten time/open/high/
+# low/close/tick_volume).
+DB_MARKET = str(BASE_DIR / "data" / "market_data.duckdb")
 
 # E-3 (Phase 15.04, harmonisiert): schema_version-Default fuer Alt-Rows ohne
 # Pflichtfeld. 15.04 vereinheitlicht den Default auf "1.0.0" (dreistellig,
@@ -66,6 +70,45 @@ SENTINEL_NATIVE = "native"
 DOW_LABELS = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"]
 HOURS_PER_DAY = 24
 DAYS_PER_WEEK = 7
+
+# 20.02 (Generische 2D-Heatmap-Engine, Kapitel 20.02 §2 / Review E4-E6):
+# DIM_MAPPINGS – Whitelist fuer die SQL-Dimensionen von fetch_generic_heatmap().
+# Wanduhr-Garantie (Invariante 7): dow/hour/dow_hour/date nutzen die
+# UTC-Forcierung `bar_time AT TIME ZONE 'UTC'` (die gespeicherten Werte sind
+# Wanduhr-encoded; die UTC-Darstellung IST die Wanduhr-Zeit). E4: `date` wird
+# WIE dow/hour mit der UTC-Forcierung extrahiert – das Kapitel-Literal
+# `CAST(bar_time AS DATE)` waere DST-fragil (Session-TZ Berlin +1/+2h).
+# Nachtrag (Umsetzung): `dow_hour` wird als GANZZAHL (DOW*24+HOUR) encodiert
+# statt des Kapitel-Literals `|| '_' ||` – String-Konkatenation sortiert
+# lexikografisch falsch ("10_" < "9_"); der Integer encodiert die natuerliche
+# Sortierreihenfolge (Mo_00..So_23) und _format_dim_value() dekodiert wieder.
+DIM_MAPPINGS = {
+    "date": "CAST(bar_time AT TIME ZONE 'UTC' AS DATE)",
+    "dow": "EXTRACT(DOW FROM bar_time AT TIME ZONE 'UTC')::INTEGER",
+    "hour": "EXTRACT(HOUR FROM bar_time AT TIME ZONE 'UTC')::INTEGER",
+    "dow_hour": "((EXTRACT(DOW FROM bar_time AT TIME ZONE 'UTC')::INTEGER * "
+                "24 + EXTRACT(HOUR FROM bar_time AT TIME ZONE 'UTC')::INTEGER)"
+                ")::INTEGER",
+    "timeframe": "LOWER(timeframe)",
+    "service_id": "LOWER(feature_id)",
+    "symbol": "LOWER(symbol)",
+}
+
+# 20.02: Verfuegbare Dimensionen / Aggregationen (UI-Combos, E1/E5).
+HEATMAP_DIMENSIONS = (
+    "date", "dow", "hour", "dow_hour", "timeframe", "service_id", "symbol",
+)
+HEATMAP_AGGREGATIONS = (
+    "count", "confluence_count", "avg", "sum", "min", "max",
+)
+
+# 20.02 (Luecke 5.3-5): Defensiver Pivot-Deckel – die dichte Matrix wird
+# begrenzt (date×dow_hour waere 366×168 = 61.488 Zellen).
+MAX_HEATMAP_CELLS = 50_000
+
+# 20.02 (E9): Default-Lookback des OHLCV-Snapshots fuer das Candle-Overlay
+# (analog DEFAULT_LIMIT 5000 der Analytics-Tabelle; M1 ≈ 3,5 Tage).
+OHLCV_SNAPSHOT_LIMIT = 5000
 
 
 class FeatureStoreReader:
@@ -119,14 +162,25 @@ class FeatureStoreReader:
         gewaehlten Datenquellen. Der Legacy-Parameter `feature_id` bleibt
         fuer Alt-Aufrufer (z. B. test/check_p15_s4_infra.py) erhalten.
         Leere Liste/None = KEIN Filter (alle Rows).
+
+        Bugfix 08.08.2026 (Bug 1: 'keine Anzeige ausgewaehlter Services'):
+        Der Filter ist case-insensitiv UND whitespace-tolerant –
+        `LOWER(TRIM(feature_id))` auf der DB-Spalte sowie `LOWER(TRIM(..))`
+        auf den Parameterwerten. Muster: `fetch_last_execution_dates`
+        normalisiert bereits so (historisch reale Gross-/Kleinschreibungs-
+        und Leerzeichen-Abweichungen zwischen Registry-plugin_ids und
+        gespeicherten feature_store-Werten). Vorher matchte die nackte
+        `feature_id IN (...)`-Clause bei solchen Abweichungen nichts und
+        Tabelle/Heatmap blieben leer.
         """
-        ids = [str(i) for i in (feature_ids or []) if str(i).strip()]
+        ids = [str(i).strip().lower() for i in (feature_ids or [])
+               if str(i).strip()]
         if ids:
             placeholders = ", ".join("?" for _ in ids)
-            conditions.append(f"feature_id IN ({placeholders})")
+            conditions.append(f"LOWER(TRIM(feature_id)) IN ({placeholders})")
             params.extend(ids)
         elif feature_id:
-            conditions.append("feature_id = ?")
+            conditions.append("LOWER(TRIM(feature_id)) = LOWER(TRIM(?))")
             params.append(feature_id)
 
     # ------------------------------------------------------------------
@@ -227,6 +281,34 @@ class FeatureStoreReader:
         """
         import re
         return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(key or "")))
+
+    @staticmethod
+    def _format_dim_value(dim: str, value: Any) -> str:
+        """Formatiert einen Dimensions-Rohwert fuer Achsen-Beschriftungen.
+
+        20.02 (generische Heatmap): `date` -> 'TT.MM.', `hour` -> 'HH:00',
+        `dow` -> DOW_LABELS-Kurzname, `dow_hour` -> 'So_00'..'Sa_23'
+        (Dekodierung der Ganzzahl DOW*24+HOUR, siehe DIM_MAPPINGS). Alle
+        anderen Dimensionen (timeframe/service_id/symbol) -> Rohwert-String.
+        """
+        try:
+            if dim == "date":
+                if hasattr(value, "strftime"):
+                    return value.strftime("%d.%m.")
+                return str(value)
+            if dim == "hour":
+                return f"{int(value):02d}:00"
+            if dim == "dow":
+                return DOW_LABELS[int(value)]
+            if dim == "dow_hour":
+                v = int(value)
+                dow, hour = divmod(v, 24)
+                if 0 <= dow < DAYS_PER_WEEK and 0 <= hour < HOURS_PER_DAY:
+                    return f"{DOW_LABELS[dow]}_{hour:02d}"
+                return str(value)
+        except (TypeError, ValueError):
+            pass
+        return str(value)
 
     def available_feature_keys(
         self,
@@ -487,6 +569,295 @@ class FeatureStoreReader:
             "symbol": symbol,
             "timeframe": timeframe,
         }
+
+    # ------------------------------------------------------------------
+    # Lesen: Generische 2D-Heatmap (20.02, Kapitel §2 / Review E1-E6)
+    # ------------------------------------------------------------------
+    def fetch_generic_heatmap(
+        self,
+        symbol: str,
+        timeframe: str,
+        x_dim: str,
+        y_dim: str,
+        field: Optional[str] = None,
+        agg: str = "count",
+        feature_id: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Aggregiert eine generische 2D-Matrix ueber zwei Dimensionen.
+
+        20.02 (additiv, E1/E5/E6): Freie Dimensionen via `DIM_MAPPINGS`
+        (date/dow/hour/dow_hour/timeframe/service_id/symbol), Aggregationen
+        COUNT / CONFLUENCE_COUNT (COUNT(DISTINCT feature_id)) sowie
+        AVG/SUM/MIN/MAX ueber einen numerischen feature_data-JSON-Key
+        (`field`, via TRY_CAST – Muster fetch_heatmap). HIT_RATE entfaellt
+        in V1 (E5: kein Schwellwert spezifiziert).
+
+        Wanduhr-Garantie (Invariante 7 / E4): date/dow/hour/dow_hour werden
+        mit `bar_time AT TIME ZONE 'UTC'` extrahiert (die gespeicherten Werte
+        sind Wanduhr-encoded; die UTC-Darstellung IST die Wanduhr-Zeit).
+
+        Lookback (Nachtrag Umsetzung): `limit` wird im CTE auf die NEUESTEN
+        `limit` Bars angewendet (ORDER BY bar_time DESC) – analog zum
+        Limit-Verhalten der Analytics-Tabelle; die Aggregation laeuft ueber
+        diesen Ausschnitt.
+
+        Pivot-Deckel (Luecke 5.3-5): uebersteigt die dichte Matrix
+        MAX_HEATMAP_CELLS, wird die x-Dimension (bzw. danach die y-Dimension)
+        deterministisch auf die letzten Sortierwerte begrenzt.
+
+        Args:
+            symbol/timeframe: Filter (case-insensitive)
+            x_dim/y_dim: Dimensions-Keys aus DIM_MAPPINGS (case-insensitiv)
+            field: Numerischer feature_data-JSON-Key (Pflicht nur fuer
+                AVG/SUM/MIN/MAX; bei COUNT/CONFLUENCE_COUNT ignoriert, E6)
+            agg: "count" | "confluence_count" | "avg" | "sum" | "min" | "max"
+            feature_id: Optionaler Einzel-Filter (Legacy)
+            feature_ids: Optionaler Multi-Filter (`WHERE feature_id IN (...)`).
+                Leere Liste/None = kein Filter.
+            limit: Max. Bars des Aggregations-Ausschnitts (neueste zuerst).
+
+        Returns:
+            {
+              "matrix":  dense M x N (rows = y_values, cols = x_values);
+                         COUNT/CONFLUENCE_COUNT -> 0 fuer leere Zellen,
+                         Wert-Aggregationen -> NaN (numpy),
+              "x_labels"/"y_labels": formatierte Achsen-Beschriftungen,
+              "x_values": Rohwerte (ISO-Strings; z. B. Datum -> 'YYYY-MM-DD'
+                          fuer das Candle-Overlay, E9),
+              "min_val"/"max_val": Spannweite der endlichen Matrix-Werte,
+              "x_dim"/"y_dim"/"agg"/"field"/"symbol"/"timeframe",
+            }
+
+        Raises:
+            ValueError: bei unbekannter Dimension/Aggregation oder fehlendem
+                `field` fuer AVG/SUM/MIN/MAX (defensiv im Repository gefangen).
+        """
+        if not symbol or not timeframe:
+            return self._empty_generic_heatmap(
+                x_dim, y_dim, agg, field, symbol, timeframe)
+        x_key = str(x_dim or "").lower()
+        y_key = str(y_dim or "").lower()
+        x_expr = DIM_MAPPINGS.get(x_key)
+        y_expr = DIM_MAPPINGS.get(y_key)
+        if x_expr is None or y_expr is None:
+            raise ValueError(
+                f"[FeatureStoreReader] Unbekannte Dimension '{x_dim}/{y_dim}' – "
+                f"erlaubt: {', '.join(DIM_MAPPINGS)}."
+            )
+        agg_key = str(agg).lower()
+        if agg_key == "count":
+            agg_sql = "COUNT(*) AS val"
+        elif agg_key == "confluence_count":
+            agg_sql = "COUNT(DISTINCT feature_id) AS val"
+        elif agg_key in ("avg", "sum", "min", "max"):
+            field_key = str(field or "").strip()
+            if not self._is_json_key_identifier(field_key):
+                raise ValueError(
+                    f"[FeatureStoreReader] Aggregation '{agg_key}' benoetigt "
+                    f"einen identifier-sicheren numerischen feature_data-"
+                    f"JSON-Key als 'field' (erhalten: '{field}')."
+                )
+            agg_sql = (
+                f"{agg_key.upper()}(TRY_CAST(feature_data->>'{field_key}' "
+                f"AS DOUBLE)) AS val"
+            )
+        else:
+            raise ValueError(
+                f"[FeatureStoreReader] Unbekannte Aggregation '{agg}' – "
+                f"erlaubt: {', '.join(HEATMAP_AGGREGATIONS)}."
+            )
+
+        conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
+        params: List[Any] = [symbol, timeframe]
+        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
+
+        if limit:
+            sql = f"""
+                WITH sel AS (
+                    SELECT bar_time, timeframe, feature_id, symbol, feature_data
+                    FROM feature_store
+                    WHERE {' AND '.join(conditions)}
+                    ORDER BY bar_time DESC
+                    LIMIT ?
+                )
+                SELECT {x_expr} AS x_val, {y_expr} AS y_val, {agg_sql}
+                FROM sel
+                GROUP BY 1, 2
+                ORDER BY 1, 2
+            """
+            params = params + [int(limit)]
+        else:
+            sql = f"""
+                WITH sel AS (
+                    SELECT bar_time, timeframe, feature_id, symbol, feature_data
+                    FROM feature_store
+                    WHERE {' AND '.join(conditions)}
+                )
+                SELECT {x_expr} AS x_val, {y_expr} AS y_val, {agg_sql}
+                FROM sel
+                GROUP BY 1, 2
+                ORDER BY 1, 2
+            """
+
+        con = self._get_connection()
+        try:
+            rows = con.execute(sql, params).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_generic_heatmap "
+                  f"fehlgeschlagen: {e}")
+            return self._empty_generic_heatmap(
+                x_key, y_key, agg_key, field, symbol, timeframe)
+
+        # Pivot-Deckel (Luecke 5.3-5): deterministisch auf die letzten
+        # Sortierwerte begrenzen (bei date = die neuesten Datumswerte).
+        x_values = sorted({r[0] for r in rows})
+        y_values = sorted({r[1] for r in rows})
+        if (len(x_values) * len(y_values)) > MAX_HEATMAP_CELLS:
+            max_x = max(1, MAX_HEATMAP_CELLS // max(1, len(y_values)))
+            x_keep = set(x_values[-max_x:])
+            x_values = sorted(x_keep)
+            if (len(x_values) * len(y_values)) > MAX_HEATMAP_CELLS:
+                max_y = max(1, MAX_HEATMAP_CELLS // max(1, len(x_values)))
+                y_keep = set(y_values[-max_y:])
+                y_values = sorted(y_keep)
+            keep_x = set(x_values)
+            keep_y = set(y_values)
+            rows = [r for r in rows
+                    if r[0] in keep_x and r[1] in keep_y]
+
+        fill = 0.0 if agg_key in ("count", "confluence_count") else float("nan")
+        matrix = np.full((len(y_values), len(x_values)), fill, dtype=float)
+        x_index = {v: i for i, v in enumerate(x_values)}
+        y_index = {v: j for j, v in enumerate(y_values)}
+        for r in rows:
+            val = r[2]
+            if val is None:
+                continue
+            xi = x_index.get(r[0])
+            yi = y_index.get(r[1])
+            if xi is not None and yi is not None:
+                matrix[yi][xi] = float(val)
+
+        finite = matrix[np.isfinite(matrix)]
+        if finite.size:
+            min_val = float(finite.min())
+            max_val = float(finite.max())
+        else:
+            min_val, max_val = 0.0, 0.0
+
+        return {
+            "matrix": matrix.tolist(),
+            "x_labels": [self._format_dim_value(x_key, v) for v in x_values],
+            "y_labels": [self._format_dim_value(y_key, v) for v in y_values],
+            # Rohwerte als ISO-Strings (Candle-Overlay-E9: Datum -> Datumsobjekt)
+            "x_values": [str(v) for v in x_values],
+            "min_val": min_val,
+            "max_val": max_val,
+            "x_dim": x_key,
+            "y_dim": y_key,
+            "agg": agg_key,
+            "field": str(field or "") or None,
+            "symbol": symbol,
+            "timeframe": timeframe,
+        }
+
+    def _empty_generic_heatmap(
+        self,
+        x_dim: str,
+        y_dim: str,
+        agg: str,
+        field: Optional[str],
+        symbol: str,
+        timeframe: str,
+    ) -> Dict[str, Any]:
+        """Leere generische Heatmap (keine Daten / Fehler / fehlende Filter)."""
+        return {
+            "matrix": np.zeros((0, 0), dtype=float).tolist(),
+            "x_labels": [],
+            "y_labels": [],
+            "x_values": [],
+            "min_val": 0.0,
+            "max_val": 0.0,
+            "x_dim": str(x_dim or "").lower(),
+            "y_dim": str(y_dim or "").lower(),
+            "agg": str(agg or "").lower(),
+            "field": str(field or "") or None,
+            "symbol": symbol,
+            "timeframe": timeframe,
+        }
+
+    # ------------------------------------------------------------------
+    # Lesen: OHLCV-Snapshot fuer das Candle-Overlay (20.02, E9)
+    # ------------------------------------------------------------------
+    def fetch_ohlcv_snapshot(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: Optional[int] = None,
+        market_db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Liest OHLCV-Bars aus market_data.duckdb (read-only, Wanduhr).
+
+        20.02 (E9, Candle-Overlay): Quelle sind die OHLCV-Rohdaten
+        (`ohlcv_bars` in `data/market_data.duckdb`, Spalten
+        time/open/high/low/close/tick_volume – Muster
+        FeatureBuilder.load_ohlcv()). Der Preis-Strip im HeatmapWidget
+        gruppiert die Bars pro Spalte (Datum) zu Tages-Ohlc.
+
+        Wanduhr-Garantie (Invariante 7): Die Epochs sind Wanduhr-encoded –
+        `_epoch_of()` (UTC-Darstellung) liefert exakt die gespeicherte
+        Wanduhr-Epoch; das Widget dekodiert sie als UTC-Datum.
+
+        Args:
+            symbol/timeframe: Filter (case-insensitive)
+            limit: Max. Bars (Default OHLCV_SNAPSHOT_LIMIT = 5000), die
+                NEUESTEN zuerst (ORDER BY time DESC).
+            market_db_path: Testbarkeit (Seam) – Default DB_MARKET.
+
+        Returns:
+            {"bars": [{"time": int(Wanduhr-Epoch), "open": float, "high": float,
+                       "low": float, "close": float, "volume": float}, ...]
+             (aufsteigend chronologisch), "symbol", "timeframe"}
+        """
+        if not symbol or not timeframe:
+            return {"bars": [], "symbol": symbol, "timeframe": timeframe}
+        if limit is None:
+            limit = OHLCV_SNAPSHOT_LIMIT
+        con = DbPool.get(market_db_path or DB_MARKET)
+        try:
+            rows = con.execute("""
+                SELECT "time", open, high, low, close, tick_volume
+                FROM ohlcv_bars
+                WHERE LOWER(symbol) = LOWER(?) AND LOWER(timeframe) = LOWER(?)
+                  AND "time" IS NOT NULL
+                  AND open IS NOT NULL AND high IS NOT NULL
+                  AND low IS NOT NULL AND close IS NOT NULL
+                ORDER BY "time" DESC
+                LIMIT ?
+            """, [symbol, timeframe, int(limit)]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_ohlcv_snapshot "
+                  f"fehlgeschlagen: {e}")
+            return {"bars": [], "symbol": symbol, "timeframe": timeframe}
+
+        bars: List[Dict[str, Any]] = []
+        for r in rows:
+            try:
+                bars.append({
+                    "time": self._epoch_of(r[0]),
+                    "open": float(r[1]),
+                    "high": float(r[2]),
+                    "low": float(r[3]),
+                    "close": float(r[4]),
+                    "volume": float(r[5]) if r[5] is not None else 0.0,
+                })
+            except (TypeError, ValueError):
+                continue
+        # Aufsteigend (chronologisch) – das Widget rendert von links nach rechts.
+        bars.reverse()
+        return {"bars": bars, "symbol": symbol, "timeframe": timeframe}
 
     # ------------------------------------------------------------------
     # Lesen: Datum der letzten Ausfuehrung (MasterTree, 05.08.2026)

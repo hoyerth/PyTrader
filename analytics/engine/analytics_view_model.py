@@ -31,6 +31,8 @@ from analytics.engine.analytics_repository import AnalyticsRepository
 from analytics.engine.analytics_worker import (
     QUERY_TABLE,
     QUERY_HEATMAP,
+    QUERY_HEATMAP_GENERIC,
+    QUERY_OHLCV,
     QUERY_SCATTER,
     QUERY_DISTRIBUTION,
     QUERY_FEATURES,
@@ -104,6 +106,20 @@ class AnalyticsViewModel(QObject):
             "distribution_column": "",
             "bins": DEFAULT_BINS,
             "limit": DEFAULT_LIMIT,
+            # 20.02 (E1/E3/E8/E10, generische 2D-Heatmap): Konfiguration der
+            # generischen Heatmap – x/y-Dimensionen (DIM_MAPPINGS), Aggregation
+            # und numerischer feature_data-JSON-Key (`field`, E6). Defaults
+            # laut Kapitel: Confluence-Modus (CONFLUENCE_COUNT) auf
+            # Datum×Stunde. `selected_feature_ids` entfaellt (E10: Redundanz
+            # zu feature_ids). Zoom = normalisierte Viewport-Anteile [0,1]
+            # (E8), rein client-seitig (kein DB-Requery).
+            "heatmap_x_dim": "date",
+            "heatmap_y_dim": "hour",
+            "heatmap_field": "",
+            "heatmap_agg": "confluence_count",
+            "candle_projection_enabled": False,
+            "zoom_x_range": [0.0, 1.0],
+            "zoom_y_range": [0.0, 1.0],
             # 19.03 (Step 2): TablePage-Settings – reine UI-Zustaende ohne
             # DB-Abfrage. Persistiert im Profil-Payload (Option B – Explicit
             # Save); set_table_settings() markiert nur dirty (E6, kein
@@ -162,6 +178,15 @@ class AnalyticsViewModel(QObject):
     def request_heatmap(self) -> None:
         self._refresh((QUERY_HEATMAP,))
 
+    # 20.02 (additiv): Generische 2D-Heatmap (freie Dimensionen) + OHLCV-
+    # Snapshot fuer das Candle-Overlay (E9) – werden on-demand von der
+    # HeatmapPage im Generisch-Modus angefordert (kein refresh_all-Pflicht).
+    def request_heatmap_generic(self) -> None:
+        self._refresh((QUERY_HEATMAP_GENERIC,))
+
+    def request_ohlcv_snapshot(self) -> None:
+        self._refresh((QUERY_OHLCV,))
+
     def request_scatter(self) -> None:
         self._refresh((QUERY_SCATTER,))
 
@@ -173,21 +198,23 @@ class AnalyticsViewModel(QObject):
 
     def refresh_all(self) -> None:
         """Stoesst alle Abfragen neu an (Seiten-/Profilwechsel)."""
-        self._refresh((QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
-                       QUERY_DISTRIBUTION, QUERY_FEATURES))
+        self._refresh((QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC,
+                       QUERY_SCATTER, QUERY_DISTRIBUTION, QUERY_FEATURES))
 
     # ------------------------------------------------------------------
     # Parameter setzen (UI-Pages) – markieren Dirty + feuern betroffen ab
     # ------------------------------------------------------------------
     def set_symbol(self, symbol: str) -> None:
         self._set_param("symbol", str(symbol or ""),
-                        (QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
-                         QUERY_DISTRIBUTION, QUERY_FEATURES))
+                        (QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC,
+                         QUERY_OHLCV, QUERY_SCATTER, QUERY_DISTRIBUTION,
+                         QUERY_FEATURES))
 
     def set_timeframe(self, timeframe: str) -> None:
         self._set_param("timeframe", str(timeframe or "M1"),
-                        (QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
-                         QUERY_DISTRIBUTION, QUERY_FEATURES))
+                        (QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC,
+                         QUERY_OHLCV, QUERY_SCATTER, QUERY_DISTRIBUTION,
+                         QUERY_FEATURES))
 
     def set_feature_id(self, feature_id: Optional[str]) -> None:
         """Kompatibilitaets-Alias (Legacy): Einzel-ID -> Multi-Liste."""
@@ -206,8 +233,8 @@ class AnalyticsViewModel(QObject):
             return
         self._params["feature_ids"] = ids
         self._mark_dirty()
-        self._refresh((QUERY_TABLE, QUERY_HEATMAP, QUERY_SCATTER,
-                       QUERY_DISTRIBUTION))
+        self._refresh((QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC,
+                       QUERY_SCATTER, QUERY_DISTRIBUTION))
 
     @staticmethod
     def _normalize_feature_ids(value) -> List[str]:
@@ -267,6 +294,77 @@ class AnalyticsViewModel(QObject):
     def set_heatmap_metric(self, metric: str) -> None:
         self._set_param("heatmap_metric", str(metric or "count"),
                         (QUERY_HEATMAP,))
+
+    # ------------------------------------------------------------------
+    # 20.02: Generische 2D-Heatmap – Konfiguration/Zoom/Overlay (additiv)
+    # ------------------------------------------------------------------
+    def set_heatmap_config(
+        self, x_dim: str, y_dim: str, field: str, agg: str
+    ) -> None:
+        """Setzt die Konfiguration der generischen Heatmap (20.02, E1).
+
+        x_dim/y_dim aus DIM_MAPPINGS (case-insensitiv), `agg` eine der
+        HEATMAP_AGGREGATIONS, `field` der numerische feature_data-JSON-Key
+        (E6: nur bei AVG/SUM/MIN/MAX relevant; COUNT/CONFLUENCE_COUNT
+        ignorieren ihn). Ohne Aenderung idempotent (kein Refresh).
+        """
+        x_dim = str(x_dim or "date").lower()
+        y_dim = str(y_dim or "hour").lower()
+        agg = str(agg or "confluence_count").lower()
+        field = str(field or "")
+        changed = (x_dim != self._params.get("heatmap_x_dim")
+                   or y_dim != self._params.get("heatmap_y_dim")
+                   or agg != self._params.get("heatmap_agg")
+                   or field != self._params.get("heatmap_field"))
+        if not changed:
+            return
+        self._params["heatmap_x_dim"] = x_dim
+        self._params["heatmap_y_dim"] = y_dim
+        self._params["heatmap_agg"] = agg
+        self._params["heatmap_field"] = field
+        self._mark_dirty()
+        self._refresh((QUERY_HEATMAP_GENERIC,))
+
+    def set_heatmap_zoom(self, x_range, y_range) -> None:
+        """Setzt die normalisierten Viewport-Anteile [0,1] (20.02, E8).
+
+        Rein client-seitig (die UI wendet die Bereiche direkt per
+        setXRange/setYRange an) – KEIN DB-Requery. Die Werte werden geclampt
+        (0 ≤ lo < hi ≤ 1) und fuer die Persistenz (Profil/Workspace)
+        markiert (Option B – Explicit Save).
+        """
+        x_clamped = self._clamp_zoom(x_range)
+        y_clamped = self._clamp_zoom(y_range)
+        if (x_clamped == self._params.get("zoom_x_range")
+                and y_clamped == self._params.get("zoom_y_range")):
+            return
+        self._params["zoom_x_range"] = x_clamped
+        self._params["zoom_y_range"] = y_clamped
+        self._mark_dirty()
+
+    def set_candle_projection(self, enabled: bool) -> None:
+        """Schaltet das Candle-Overlay (Preis-Strip) an/aus (20.02, E9).
+
+        Reiner UI-Zustand ohne DB-Abfrage (der OHLCV-Snapshot wird von der
+        HeatmapPage on-demand angefordert); nur Dirty-Markierung fuer die
+        Profil-Persistenz.
+        """
+        enabled = bool(enabled)
+        if enabled == self._params.get("candle_projection_enabled"):
+            return
+        self._params["candle_projection_enabled"] = enabled
+        self._mark_dirty()
+
+    @staticmethod
+    def _clamp_zoom(value) -> List[float]:
+        """Clampt einen Zoom-Bereich auf [0.0, 1.0] mit lo < hi (E8)."""
+        try:
+            lo, hi = float(value[0]), float(value[1])
+        except (TypeError, ValueError, IndexError):
+            return [0.0, 1.0]
+        lo = max(0.0, min(1.0, lo))
+        hi = max(0.0, min(1.0, hi))
+        return [lo, hi] if hi > lo else [0.0, 1.0]
 
     def set_scatter_columns(self, x_column: str, y_column: str) -> None:
         # 19.02 (Cleanup): Leere Werte = Repo-Default (erste numerische
@@ -427,6 +525,18 @@ class AnalyticsViewModel(QObject):
             base["limit"] = p["limit"]
         elif kind == QUERY_HEATMAP:
             base["metric"] = p["heatmap_metric"]
+        elif kind == QUERY_HEATMAP_GENERIC:
+            # 20.02: Generische 2D-Heatmap – Konfiguration aus den heatmap_*-
+            # _params; limit = Lookback-Ausschnitt (Reader-CTE).
+            base["x_dim"] = p["heatmap_x_dim"]
+            base["y_dim"] = p["heatmap_y_dim"]
+            base["field"] = p.get("heatmap_field") or None
+            base["agg"] = p["heatmap_agg"]
+            base["limit"] = p["limit"]
+        elif kind == QUERY_OHLCV:
+            # 20.02 (E9): OHLCV-Snapshot – limit=None => Reader-Default
+            # (OHLCV_SNAPSHOT_LIMIT); kein feature_ids-Filter noetig.
+            pass
         elif kind == QUERY_SCATTER:
             base["x_column"] = p["scatter_x"]
             base["y_column"] = p["scatter_y"]
@@ -581,6 +691,10 @@ class AnalyticsViewModel(QObject):
         if "feature_ids" not in flat and flat.get("feature_id"):
             self._params["feature_ids"] = self._normalize_feature_ids(
                 [flat["feature_id"]])
+        # 20.02 (Luecke 5.3-6): `charts.heatmap` ist ein VERSCHACHTELTES Dict –
+        # _flatten_payload() bildet es NICHT auf flache _params ab. Explizit
+        # aufloesen (E3: additiv, kein Schema-Bump auf v2.1).
+        self._apply_heatmap_section(flat.get("heatmap"))
         self._params["feature_ids"] = self._normalize_feature_ids(
             self._params.get("feature_ids"))
         # 20.01 (E5): Fehlende Services isolieren – valide IDs direkt setzen.
@@ -594,6 +708,34 @@ class AnalyticsViewModel(QObject):
             self._dirty = False
             self.dirty_changed.emit(False)
         self.refresh_all()
+
+    def _apply_heatmap_section(self, heat: Any) -> None:
+        """Loest die verschachtelte `charts.heatmap`-Sektion auf (20.02).
+
+        Luecke 5.3-6: `_flatten_payload()` bildet das verschachtelte Dict
+        nicht auf die flachen `_params`-Keys ab – dieser Helfer uebernimmt
+        die 20.02-Keys additiv (nur vorhandene/gueltige Werte; None bleibt
+        unveraendert). Zoom-Bereiche werden geclampt (E8).
+        """
+        if not isinstance(heat, dict):
+            return
+        if heat.get("x_dim") is not None:
+            self._params["heatmap_x_dim"] = str(heat["x_dim"]).lower()
+        if heat.get("y_dim") is not None:
+            self._params["heatmap_y_dim"] = str(heat["y_dim"]).lower()
+        if heat.get("agg") is not None:
+            self._params["heatmap_agg"] = str(heat["agg"]).lower()
+        if heat.get("field") is not None:
+            self._params["heatmap_field"] = str(heat["field"])
+        if heat.get("candle_projection_enabled") is not None:
+            self._params["candle_projection_enabled"] = bool(
+                heat["candle_projection_enabled"])
+        if isinstance(heat.get("zoom_x_range"), (list, tuple)):
+            self._params["zoom_x_range"] = self._clamp_zoom(
+                heat["zoom_x_range"])
+        if isinstance(heat.get("zoom_y_range"), (list, tuple)):
+            self._params["zoom_y_range"] = self._clamp_zoom(
+                heat["zoom_y_range"])
 
     def _current_payload(self) -> Dict[str, Any]:
         """Profil-Payload aus den aktuellen Ansichtsparametern (v2, sectioned).
@@ -616,6 +758,21 @@ class AnalyticsViewModel(QObject):
                 "scatter_y": p.get("scatter_y"),
                 "distribution_column": p.get("distribution_column"),
                 "bins": p.get("bins"),
+                # 20.02 (E2/E3): Generische Heatmap-Config additiv unter
+                # charts.heatmap (kein Schema-Bump noetig; v2-Sektionen sind
+                # fuer additive UI-Settings ausgelegt, 20.01 E3).
+                "heatmap": {
+                    "x_dim": p.get("heatmap_x_dim"),
+                    "y_dim": p.get("heatmap_y_dim"),
+                    "field": p.get("heatmap_field"),
+                    "agg": p.get("heatmap_agg"),
+                    "candle_projection_enabled": p.get(
+                        "candle_projection_enabled"),
+                    "zoom_x_range": list(p.get("zoom_x_range")
+                                         or [0.0, 1.0]),
+                    "zoom_y_range": list(p.get("zoom_y_range")
+                                         or [0.0, 1.0]),
+                },
             },
             "table": {
                 "limit": p.get("limit"),

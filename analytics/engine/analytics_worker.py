@@ -35,6 +35,9 @@ am Leben und `worker.finished.connect(worker.deleteLater)` raeumt auf.
 Abfrage-Typen (query_kind, Single Source of Truth fuer Worker & ViewModel):
     QUERY_TABLE        – rohe Feature-Zeilen (Tabellen-Seite)
     QUERY_HEATMAP      – 2D-Matrix Wochentag x Tagesstunde (Berlin Wanduhr)
+    QUERY_HEATMAP_GENERIC – 2D-Matrix mit freien Dimensionen/Aggregationen
+                            (20.02, additiv)
+    QUERY_OHLCV        – OHLCV-Snapshot fuer das Candle-Overlay (20.02, E9)
     QUERY_SCATTER      – X/Y-Paare zweier nativer Spalten
     QUERY_DISTRIBUTION – Histogramm (bins/counts)
     QUERY_FEATURES     – Metadaten (Plugin-IDs, Spalten, Zeilenzahl)
@@ -47,6 +50,11 @@ from PySide6.QtCore import QThread, Signal
 # Abfrage-Typen (query_kind).
 QUERY_TABLE = "table"
 QUERY_HEATMAP = "heatmap"
+# 20.02 (additiv): Generische 2D-Heatmap (freie Dimensionen/Aggregationen)
+# und OHLCV-Snapshot fuer das Candle-Overlay (E9). Der bestehende QUERY_HEATMAP
+# (Dow×Stunde) bleibt unveraendert.
+QUERY_HEATMAP_GENERIC = "heatmap_generic"
+QUERY_OHLCV = "ohlcv"
 QUERY_SCATTER = "scatter"
 QUERY_DISTRIBUTION = "distribution"
 QUERY_FEATURES = "features"
@@ -156,6 +164,26 @@ class AnalyticsAsyncWorker(QThread):
                 feature_id=p.get("feature_id"),
                 feature_ids=feature_ids,
             )
+        if self._query_kind == QUERY_HEATMAP_GENERIC:
+            # 20.02 (additiv): Generische 2D-Heatmap – Parameter x_dim/y_dim/
+            # field/agg kommen aus den ViewModel-_params (heatmap_*).
+            return repo.get_generic_heatmap(
+                symbol, timeframe,
+                x_dim=str(p.get("x_dim", "date") or "date"),
+                y_dim=str(p.get("y_dim", "hour") or "hour"),
+                field=p.get("field") or None,
+                agg=str(p.get("agg", "count") or "count"),
+                feature_id=p.get("feature_id"),
+                feature_ids=feature_ids,
+                limit=cap_lookback_limit(p.get("limit")),
+            )
+        if self._query_kind == QUERY_OHLCV:
+            # 20.02 (E9): OHLCV-Snapshot fuer das Candle-Overlay – limit=None
+            # -> Reader-Default OHLCV_SNAPSHOT_LIMIT (5000).
+            return repo.get_ohlcv_snapshot(
+                symbol, timeframe,
+                limit=cap_lookback_limit(p.get("limit")),
+            )
         if self._query_kind == QUERY_SCATTER:
             return repo.get_scatter(
                 symbol, timeframe,
@@ -179,6 +207,7 @@ class AnalyticsAsyncWorker(QThread):
 
         raise ValueError(
             f"[AnalyticsAsyncWorker] Unbekannte Abfrage '{self._query_kind}' – "
-            f"erlaubt: {QUERY_TABLE}, {QUERY_HEATMAP}, {QUERY_SCATTER}, "
-            f"{QUERY_DISTRIBUTION}, {QUERY_FEATURES}."
+            f"erlaubt: {QUERY_TABLE}, {QUERY_HEATMAP}, {QUERY_HEATMAP_GENERIC}, "
+            f"{QUERY_OHLCV}, {QUERY_SCATTER}, {QUERY_DISTRIBUTION}, "
+            f"{QUERY_FEATURES}."
         )

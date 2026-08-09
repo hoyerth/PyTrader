@@ -82,3 +82,189 @@
 1. Connect `closeEvent` and `QApplication.aboutToQuit` to trigger automatic `save_last_snapshot()`.
 2. Ensure Profile load/save cycle correctly restores and applies `charts.heatmap` settings.
 3. Validate via headless tests (`py_compile` and `test/test.py`).
+
+---
+
+## 5. Review 09.08.2026: Konsistenz-, Vollständigkeits- & Korrektheits-Analyse
+
+**Grundlage:** Abgleich des Kapitels 20.02 gegen den verbindlichen Ist-Code
+(kein `docs/x_Exports.md`). Geprüfte Dateien: `analytics/engine/feature_store_reader.py`,
+`analytics/engine/analytics_repository.py`, `analytics/engine/analytics_view_model.py`,
+`analytics/engine/analytics_worker.py`, `analytics/ui/heatmap_page.py`,
+`analytics/ui/analytics_win.py`, `analytics_profile_repository.py`,
+`analytics/features/feature_builder.py` (OHLCV-Quelle).
+
+### 5.1 Ist-Code-Abgleich (Befunde)
+
+| # | Kapitel-Angabe 20.02 | Ist-Code (verbindlich) | Befund |
+|---|----------------------|------------------------|--------|
+| A1 | `analytics/gui/heatmap_widget.py` (§3/§4) | `analytics/ui/heatmap_page.py` (`HeatmapPage`, pyqtgraph `ImageItem`, viridis, Jump-to-Chart). Verzeichnis `analytics/gui/` existiert **nicht**. | **Pfadfehler** → E1 |
+| A2 | `analytics/analytics_window.py` (§5) | `analytics/ui/analytics_win.py` (`AnalyticsWindow`, `PersistentWindow`, `INSTANCE_ID="win_analytics"`). | **Pfadfehler** → E1 |
+| A3 | `DIM_MAPPINGS` + `fetch_generic_heatmap(...)` (§2) | existiert nicht. Ist: `fetch_heatmap(symbol, timeframe, metric, feature_id, feature_ids, limit)` mit **festen** Achsen DOW×Stunde (7×24), Metrik `"count"` \| numerischer JSON-Key (AVG via `TRY_CAST`). | **Neuimplementierung** (additiv) → E1 |
+| A4 | VM-`_params` `heatmap_x_dim/y_dim/field/agg`, `candle_projection_enabled`, `zoom_x_range/y_range`, `selected_feature_ids` (§3) | existieren nicht. Ist-`_params` nur `heatmap_metric` + `feature_ids` (Liste). | **Neuimplementierung** (additiv); `selected_feature_ids` ist Redundanz zu `feature_ids` → E10 |
+| A5 | `set_heatmap_config/set_heatmap_zoom/set_candle_projection/serialize_state()` (§3) | existieren nicht. Ist: `set_heatmap_metric()`; Persistenz via `_current_payload()` / `_apply_profile()` (+ `_flatten_payload`). | Methoden neu; `serialize_state()` = `_current_payload()`-Erweiterung |
+| A6 | `export_profile_payload()` / `import_profile_payload()` (§5 Schritt 2) | existieren nicht. Ist: `_current_payload()` (v2, sectioned) / `_apply_profile()`. | Namenskorrektur → E1 |
+| A7 | `chk_candle_projection`, `slider_zoom_x/y` (§4) | existieren nicht (HeatmapPage: nur Metrik-Combo + Doppelklick-Jump-to-Chart). | **Neuimplementierung** → E1/E8/E9 |
+| A8 | "Auto-persists into active profile ... on profile change, window close, app exit" (§1) | Profil = **Option B – Explicit Save** (Persistenz NUR auf explizites `save_profile()`); automatisch persistiert wird nur der Workspace im `closeEvent` (`_save_workspace()`, 20.01 E1). | **Widerspruch** → E2 |
+| A9 | "Schema v2.1" (§1) | `SCHEMA_VERSION_DEFAULT = 2` (`analytics_profile_repository.py`); es existiert KEINE v2.1. | Kein Bump nötig → E3 |
+| A10 | `DIM_MAPPINGS["date"] = CAST(bar_time AS DATE)` (§2) | Wanduhr-Garantie (Invariante 7): `bar_time` ist Berlin-Wanduhr-encoded; DuckDB rechnet TIMESTAMPTZ in die Session-TZ (Berlin +1/+2h) um. | **DST-fragil**: Wanduhr 23:00–23:59 (Sommer) → Folgetag 01:00 → falsches Datum → E4 |
+| A11 | `dow`/`hour`/`dow_hour` mit `bar_time AT TIME ZONE 'UTC'` (§2) | exakt das Muster von `fetch_heatmap()` / `fetch_recent_bar_time_for_cell()`. | **konsistent** ✓ |
+| A12 | `feature_ids`-Filter (`WHERE feature_id IN (...)`) | `_apply_feature_filter()` (15.03-E) vorhanden. | **konsistent** ✓ |
+| A13 | Aggregationen COUNT/AVG/SUM/MIN/MAX/CONFLUENCE_COUNT (§2) | COUNT + AVG-JSON-Muster (`TRY_CAST`) vorhanden; SUM/MIN/MAX/CONFLUENCE_COUNT neu. `HIT_RATE` undefiniert (kein Schwellwert spezifiziert). | Lücke → E5 |
+| A14 | "Candle-Overlay ... local chart field context, isolated from global header dropdowns" (§1/§4) | OHLCV-Quelle: `market_data.duckdb`/`ohlcv_bars` (Muster `FeatureBuilder.load_ohlcv()`: Spalten `time, open, high, low, close, tick_volume`). Das Analytics-Fenster hat KEINEN lokalen Chart-Feld-Kontext (nur globale Header-Dropdowns Symbol/TF). | Interpretations-/Präzisierungsbedarf → E9 |
+
+### 5.2 Entscheidungen (E1–E10)
+
+- **E1 – Additive Implementierung & korrigierte Pfade:** Alle Ergänzungen erfolgen additiv
+  (Open/Closed, Code-Preserving). Bestehende `fetch_heatmap()`/`get_heatmap()`/`HeatmapPage`
+  bleiben unangetastet. Dateien: `analytics/engine/feature_store_reader.py` (additiv),
+  `analytics/engine/analytics_repository.py` (additiv), `analytics/engine/analytics_view_model.py`
+  (additiv), `analytics/engine/analytics_worker.py` (**neuer Query-Kind `QUERY_HEATMAP_GENERIC`**,
+  bestehender `QUERY_HEATMAP` bleibt unverändert → kein Regressionsrisiko), neue UI-Datei
+  **`analytics/ui/heatmap_widget.py`** (Korrektur: nicht `analytics/gui/`), Lifecycle in
+  `analytics/ui/analytics_win.py`. Methodenbenennung wie Kapitel (`set_heatmap_config()` usw.)
+  statt der nicht existenten `export/import_profile_payload()`.
+- **E2 – Persistenz-Semantik (Kapitel-Korrektur):** Es gibt KEIN Auto-Save ins aktive Profil
+  (Option B – Explicit Save bleibt verbindlich). Die Heatmap-Config wird
+  (a) bei `save_profile()` additiv unter `charts.heatmap` persistiert und
+  (b) automatisch über den bestehenden Workspace-Mechanismus gesichert (`closeEvent` →
+  `_save_workspace()` → `instance_states.workspace_state`, 20.01 E1). Ein separater
+  `QApplication.aboutToQuit`-Hook ist **nicht** nötig – der App-Exit wird bereits durch das
+  `closeEvent` der Top-Level-Fenster abgedeckt (Ist-Verhalten 20.01).
+- **E3 – Kein Schema-Bump auf v2.1:** `schema_version: 2` bleibt. Die Sektion
+  `charts.heatmap` ist additiv (bestehende v2-Sektionen sind dafür ausgelegt, 20.01 E3:
+  "neue UI-Settings lassen sich additiv ergänzen, kein Schema-Bump nötig").
+  Die `_flatten_payload`-Lücke (verschachteltes `charts.heatmap`-Dict wird NICHT automatisch
+  auf flache `_params` abgebildet) wird durch explizite Auflösung in `_apply_profile()` /
+  `restore_workspace()` geschlossen.
+- **E4 – `date`-Mapping Wanduhr-sicher:** `DIM_MAPPINGS["date"] =
+  CAST(bar_time AT TIME ZONE 'UTC' AS DATE)` (konsistent zu dow/hour, Invariante 7).
+- **E5 – Aggregationen & HIT_RATE:** COUNT, AVG, SUM, MIN, MAX (JSON-Werte via `TRY_CAST`,
+  Muster `fetch_heatmap`), CONFLUENCE_COUNT = `COUNT(DISTINCT feature_id)`. **HIT_RATE
+  entfällt in V1** (ohne definierten Schwellwert nicht spezifizierbar); bei Bedarf später
+  mit explizitem Schwellwert-Parameter nachrüsten.
+- **E6 – Feld-Terminologie:** `field` = numerischer `feature_data`-JSON-Key. `heatmap_field
+  = "confluence"` ist KEIN JSON-Key, sondern wählt die CONFLUENCE_COUNT-Aggregation.
+  Bei AVG/SUM/MIN/MAX ist `field` Pflicht (JSON-Key); bei COUNT/CONFLUENCE_COUNT wird
+  `field` ignoriert.
+- **E7 – Farbskala:** Konfluenz (CONFLUENCE_COUNT) → diskrete Stufen laut Kapitel
+  (0 = weiß/transparent, 1–2 = gelb/cyan, 3–4 = orange, 5+ = dunkelrot);
+  Wert-Metriken (count/avg/...) → kontinuierliche viridis-Skala (Ist-Verhalten beibehalten).
+  Colormap-Umschaltung abhängig von `agg`.
+- **E8 – Dual-Axis-Zoom:** Slider nur aktiv bei Dimensionen mit vielen diskreten Werten
+  (v. a. X=`date`); bei dow (7) / hour (24) / timeframe / service_id deaktiviert.
+  `zoom_x_range`/`zoom_y_range` als [0.0, 1.0]-normalisierte Viewport-Anteile, geclampt
+  (0 ≤ lo < hi ≤ 1), rein client-seitig via `setXRange`/`setYRange` (kein DB-Requery);
+  Persistenz im Profil (`charts.heatmap.zoom_*`) und Workspace.
+- **E9 – Candle-Overlay (Kapitel-Korrektur):** Quelle = `market_data.duckdb`/`ohlcv_bars`
+  über eine neue read-only Repository-Methode `get_ohlcv_snapshot(symbol, timeframe, limit)`
+  (delegierend auf eine neue Reader-Methode; kein SQL in der UI). **Overlay nur bei
+  X-Dimension `date`** (kontinuierliche Zeitachse – pro X-Spalte = OHLCV-Gruppe des Tages,
+  Alpha 0.3–0.5); bei dow/hour/dow_hour semantisch nicht definierbar → `chk_candle_projection`
+  dort deaktiviert (Präzisierung der Kapitel-Angabe "temporal X-dimensions"). Der Snapshot
+  wird bei Aktivierung aus dem aktuellen (symbol, timeframe)-Filter erzeugt (keine Reaktion
+  auf globale Dropdown-Events = "isolated from global header dropdowns").
+- **E10 – Keine Parameter-Duplikation:** `selected_feature_ids` entfällt – der bestehende
+  `feature_ids`-Parameter wird unverändert als Datenquellen-Filter übernommen.
+
+### 5.3 Vollständigkeits-Lücken (im Kapitel fehlend, ergänzt)
+
+1. **Worker-/Repository-Dispatch:** Kapitel nennt nur Reader + ViewModel + UI. Ergänzt:
+   neuer Query-Kind `QUERY_HEATMAP_GENERIC` in `analytics_worker.py` + `get_generic_heatmap()`
+   in `analytics_repository.py` (inkl. `metrics`-Liste im Payload, Muster `get_heatmap()`).
+2. **Payload-Vertrag:** generisches Payload liefert `matrix` (dense), `x_labels`, `y_labels`,
+   `min_val`, `max_val`, `x_dim/y_dim/agg/field`, `metrics`, `symbol`, `timeframe` –
+   UI-Combo-/Slider-Sync aus dem Payload (Muster `get_heatmap()`).
+3. **Leerzellen:** count/COUNT → 0.0, AVG/SUM/MIN/MAX → NaN (bestehendes Muster
+   `fetch_heatmap`); Rendering ignoriert NaN (Ist-Verhalten).
+4. **Limit-Cap:** generische Abfrage nutzt `cap_lookback_limit()` (MAX_LOOKBACK_LIMIT 50.000).
+5. **Pivot-Begrenzung:** max. Zellenzahl defensiv deckeln (z. B. 50.000 Zellen;
+   date×hour ≈ 366×24 = 8.784 – unkritisch; date×dow_hour ≈ 366×168 = 61.488 – kritisch,
+   daher für `dow_hour` auf vorhandene Kombinationen beschränken oder cap).
+6. **`_flatten_payload`-Lücke:** `charts.heatmap` (verschachteltes Dict) wird vom bestehenden
+   `_flatten_payload()` NICHT auf `_params`-Keys abgebildet → explizite Auflösung
+   (`charts.heatmap.*` → `heatmap_x_dim`, `heatmap_y_dim`, `heatmap_field`, `heatmap_agg`,
+   `candle_projection_enabled`, `zoom_x_range`, `zoom_y_range`) in `_apply_profile()` /
+   `restore_workspace()`.
+7. **Bezeichnungen:** Label-Formatierung für `date`-Achse (z. B. `DD.MM.`) und `dow_hour`
+   (z. B. `Mo_14`) spezifizieren; Wiederverwendung von `DOW_LABELS`/`HOURS_PER_DAY`.
+
+### 5.4 Korrigierte Implementierungs-Schrittliste (verbindlich ab 09.08.2026)
+
+1. **Schritt 1 (SQL-Matrix-Engine):** additiv in `analytics/engine/feature_store_reader.py`
+   – `DIM_MAPPINGS` (date/dow/hour/dow_hour/timeframe/service_id/symbol; E4 beachten) +
+   `fetch_generic_heatmap(symbol, timeframe, x_dim, y_dim, field, agg, feature_ids, limit)`
+   mit Pivot-Ausgabe und `min_val`/`max_val`.
+2. **Schritt 2 (Repository/Worker/ViewModel):**
+   `analytics_repository.py` → `get_generic_heatmap()` (Payload inkl. `metrics`);
+   `analytics_worker.py` → `QUERY_HEATMAP_GENERIC`-Dispatch;
+   `analytics_view_model.py` → `_params`-Keys (E10: ohne `selected_feature_ids`),
+   `set_heatmap_config()/set_heatmap_zoom()/set_candle_projection()`,
+   `_current_payload()`-Erweiterung (`charts.heatmap`, E2/E3), Auflösung in
+   `_apply_profile()`/`restore_workspace()` (Lücke 5.3-6).
+3. **Schritt 3 (Heatmap/Confluence-Rendering):** NEUE Datei `analytics/ui/heatmap_widget.py`
+   – diskrete Konfluenz-Skala (E7), viridis für Wert-Metriken, Einbettung als Modus in die
+   bestehende `analytics/ui/heatmap_page.py` (additiv, Dow×Hour bleibt Standard-Modus),
+   Slider-Bindung an `setXRange`/`setYRange` (E8).
+4. **Schritt 4 (Candle-Overlay):** `get_ohlcv_snapshot()` (E9), `chk_candle_projection`
+   nur bei X=`date` aktiv, semi-transparente Candles an die Heatmap-Spalten gebunden.
+5. **Schritt 5 (Lifecycle):** `analytics/ui/analytics_win.py` – Erweiterung von
+   `_save_workspace()`/`_restore_workspace()` um die Heatmap-Config; KEIN
+   `aboutToQuit`/`save_last_snapshot`-Neu-Hook (E2); Validierung headless via
+   `py_compile` + `test/test.py` (Logik-/DB-Tests, keine UI-Tests).
+
+---
+
+## 5.5 Umsetzungs-Log 09.08.2026 (Kapitel 20.02 umgesetzt)
+
+**Umgesetzte Dateien (additiv, Open/Closed – Bestandscode unveraendert):**
+
+| Datei | Änderung |
+|-------|----------|
+| `analytics/engine/feature_store_reader.py` | + `DB_MARKET`, `DIM_MAPPINGS`, `HEATMAP_DIMENSIONS`, `HEATMAP_AGGREGATIONS`, `MAX_HEATMAP_CELLS`, `OHLCV_SNAPSHOT_LIMIT`, `_format_dim_value()`, `fetch_generic_heatmap()`, `_empty_generic_heatmap()`, `fetch_ohlcv_snapshot()` |
+| `analytics/engine/analytics_repository.py` | + `get_generic_heatmap()` (inkl. `metrics` + defensives `field`-Fallback), `get_ohlcv_snapshot()` |
+| `analytics/engine/analytics_worker.py` | + `QUERY_HEATMAP_GENERIC`, `QUERY_OHLCV` + Dispatch |
+| `analytics/engine/analytics_view_model.py` | + `_params`: `heatmap_x_dim/y_dim/field/agg`, `candle_projection_enabled`, `zoom_x_range/y_range`; + `request_heatmap_generic()`, `request_ohlcv_snapshot()`, `set_heatmap_config()`, `set_heatmap_zoom()`, `set_candle_projection()`, `_clamp_zoom()`, `_apply_heatmap_section()`; `refresh_all()` + `QUERY_HEATMAP_GENERIC`; `_current_payload()` + `charts.heatmap`; `_current_params()`-Zweige |
+| `analytics/ui/heatmap_widget.py` | **NEU:** `HeatmapWidget` – generische Heatmap (dims/agg/field), diskrete Konfluenz-Skala (E7), viridis für Wert-Metriken, Zoom-Slider (E8), Preis-Strip (E9) |
+| `analytics/ui/heatmap_page.py` | + Modus-Combo (`standard` \| `generic`), `QStackedWidget`, `mode_id`/`set_mode()`, `request_data()` modus-abhängig |
+| `analytics/ui/analytics_win.py` | `_save_workspace()` + `layout.heatmap_mode`; `_restore_workspace()` wendet `heatmap_mode` an |
+| `test/test.py` | + Tests 37 a1–j2 (Reader/Repository/Worker/ViewModel, headless, temporäre DuckDBs in `test/`) |
+
+**Umsetzungs-Nachtraege (Präzisierungen der Review-Entscheidungen E1–E10):**
+
+1. **`dow_hour`-Encoding (E4-Nachtrag):** Statt des Kapitel-Literals
+   `|| '_' ||` (String-Konkatenation, lexikografisch falsch sortiert) wird
+   `DOW*24+HOUR` als INTEGER encodiert – natuerliche Sortierreihenfolge
+   (Mo_00..So_23), Dekodierung in `_format_dim_value()`.
+2. **Candle-Overlay (E9-Präzisierung):** Der Preis-Strip wird als separates
+   Plot-Fenster UNTER der Heatmap gerendert (Tages-Ohlc je Datums-Spalte,
+   Alpha 0.3–0.5), horizontal mit der Heatmap synchronisiert (Zoom X wirkt
+   auf beide). Aktiv nur bei X-Dimension `date` (beliebige Y-Dimension).
+   Quell-Daten: `market_data.duckdb`/`ohlcv_bars` (read-only via
+   `fetch_ohlcv_snapshot()`, Wanduhr-Epochs).
+3. **Dual-Axis-Zoom (E8-Präzisierung):** EIN Faktor-Slider pro Achse
+   (Viewport-Skalierung, zentriert; Slider-Wert = sichtbarer Anteil in %),
+   normalisiert `[lo, hi]` gespeichert. Aktiv nur bei `date`-Achsen
+   (`_ZOOMABLE_DIMS`); rein client-seitig (kein DB-Requery).
+4. **Lookback im Reader-CTE:** `fetch_generic_heatmap()` wendet `limit` im
+   CTE auf die NEUESTEN `limit` Bars an (ORDER BY bar_time DESC) – konsistent
+   zum Limit der Analytics-Tabelle (Default 5000).
+5. **Kein `selected_feature_ids` (E10):** `feature_ids` bleibt der einzige
+   Datenquellen-Filter.
+6. **Kein Auto-Save ins Profil (E2):** Persistenz der Heatmap-Config nur via
+   `save_profile()` (`charts.heatmap`) und automatisch über den Workspace
+   (`closeEvent` → `_save_workspace()`, inkl. `heatmap_mode`).
+
+**Validierung (headless, 09.08.2026):**
+- `py_compile` auf allen 7 geänderten Python-Dateien + `test/test.py`: PASS.
+- `test/test.py`: **30 neue Checks 37 a1–j2 alle PASS** (Matrix-Form/-Werte,
+  Confluence, AVG-JSON-Key, dow_hour-Labels, feature_ids-Filter, ValueError,
+  Repository-Fallbacks, OHLCV-Snapshot inkl. Wanduhr-Epoch, VM-Params,
+  Payload-`charts.heatmap`, Profil-Roundtrip via `_apply_heatmap_section`,
+  Worker-Dispatch).
+- **6 vorbestehende Fehlschläge** (P2/P5/H3–H7, Fenstergeometrie-Tests des
+  Harness-Kopfes, Zeilen 133–223) sind Umgebungs-/offscreen-bedingt und
+  unabhängig von dieser Umsetzung (kein Kontakt zu geänderten Dateien).
+- UI (HeatmapPage/HeatmapWidget) wurde nur als offscreen-Instanziierung
+  geprüft (kein GUI-Start, keine UI-Tests gemäß harter Regel).
+- Manueller Funktionstest der GUI erfolgt durch den Anwender.

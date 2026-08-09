@@ -910,6 +910,10 @@ class AnalyticsWindow(PersistentWindow):
                 "layout": {
                     "page_index": self.sidebar.currentRow()
                     if hasattr(self, "sidebar") else 0,
+                    # 20.02 (E2): Ansichts-Modus der Heatmap-Seite
+                    # (standard | generic) im Workspace mitpersistieren.
+                    "heatmap_mode": self.heatmap_page.mode_id
+                    if hasattr(self, "heatmap_page") else "standard",
                 },
             }
             self.state_manager.save_workspace_state(
@@ -940,6 +944,14 @@ class AnalyticsWindow(PersistentWindow):
             (self._vm.workspace_layout or {}).get("page_index", -1))
         if 0 <= page_index < self.pages_stack.count():
             self.sidebar.setCurrentRow(page_index)
+        # 20.02 (E2): Ansichts-Modus der Heatmap-Seite wiederherstellen.
+        try:
+            heatmap_mode = (self._vm.workspace_layout or {}).get(
+                "heatmap_mode")
+            if heatmap_mode:
+                self.heatmap_page.set_mode(str(heatmap_mode))
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] Heatmap-Modus-Restore: {e}")
         # Limit-Feld mit dem VM-Wert synchronisieren (Workspace kann abweichen).
         if hasattr(self, "edit_limit"):
             self.edit_limit.setText(

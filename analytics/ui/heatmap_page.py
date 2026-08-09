@@ -16,7 +16,14 @@ from typing import Any, Callable, Dict, Optional
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
 
 from analytics.engine.analytics_worker import QUERY_HEATMAP
 from analytics.engine.feature_store_reader import (
@@ -25,6 +32,7 @@ from analytics.engine.feature_store_reader import (
     HOURS_PER_DAY,
 )
 from analytics.ui.common import make_overlay_stack
+from analytics.ui.heatmap_widget import HeatmapWidget
 
 # Farbverlauf (pyqtgraph-intern, 'viridis').
 _HEATMAP_COLORMAP = "viridis"
@@ -66,24 +74,53 @@ class HeatmapPage(QWidget):
 
         content = QWidget(self)
         lay = QVBoxLayout(content)
+
+        # 20.02 (additiv): Ansichts-Modus – Standard (Wochentag x Stunde)
+        # bleibt der Default; "Generisch" bettet den HeatmapWidget ein.
+        self._combo_mode = QComboBox()
+        self._combo_mode.addItem("Wochentag × Stunde", "standard")
+        self._combo_mode.addItem("Generisch", "generic")
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Ansicht:"))
+        mode_row.addWidget(self._combo_mode)
+        mode_row.addStretch(1)
+        lay.addLayout(mode_row)
+
+        # --- Standard-Modus (bestehende Struktur, unveraendert) ---
+        self._standard_ui = QWidget(self)
+        std_lay = QVBoxLayout(self._standard_ui)
+        std_lay.setContentsMargins(0, 0, 0, 0)
         ctrl = QHBoxLayout()
         ctrl.addWidget(QLabel("Metrik:"))
         ctrl.addWidget(self._combo_metric)
         ctrl.addWidget(self._label_info)
         ctrl.addStretch(1)
-        lay.addLayout(ctrl)
-        lay.addWidget(self._plot)
+        std_lay.addLayout(ctrl)
+        std_lay.addWidget(self._plot)
+
+        # --- Generischer Modus (20.02, E1/E7/E8/E9) ---
+        self._generic = HeatmapWidget()
+
+        self._stack_modes = QStackedWidget()
+        self._stack_modes.addWidget(self._standard_ui)
+        self._stack_modes.addWidget(self._generic)
+        lay.addWidget(self._stack_modes)
+
         self._stack = make_overlay_stack(content)
         self.setLayout(self._stack)
 
         self._combo_metric.currentTextChanged.connect(self._on_metric_changed)
         self._plot.scene().sigMouseClicked.connect(self._on_plot_clicked)
+        self._combo_mode.currentIndexChanged.connect(self._on_mode_changed)
 
     # ------------------------------------------------------------------
     # MVVM-Anbindung (vom AnalyticsWindow gesetzt)
     # ------------------------------------------------------------------
     def attach_view_model(self, view_model: Any) -> None:
         self._view_model = view_model
+        # 20.02: Das generische Widget erhaelt denselben ViewModel und
+        # verbindet eigene data_ready-Slots (QUERY_HEATMAP_GENERIC/QUERY_OHLCV).
+        self._generic.attach_view_model(view_model)
         params = view_model.params
         # 19.02 (Cleanup): Metriken = "count" + numerische feature_data-
         # JSON-Keys (dynamisch). Prefill fuer das aktuelle Symbol/Timeframe;
@@ -103,8 +140,38 @@ class HeatmapPage(QWidget):
         self._cell_resolver = fn
 
     def request_data(self) -> None:
-        if self._view_model is not None:
+        if self._view_model is None:
+            return
+        # 20.02: Modus-abhaengig – Standard (Dow x Stunde) oder Generisch
+        # (+ OHLCV-Snapshot bei aktivem Kerzen-Overlay, E9).
+        if self._combo_mode.currentData() == "generic":
+            self._generic.request_data()
+        else:
             self._view_model.request_heatmap()
+
+    # ------------------------------------------------------------------
+    # 20.02: Ansichts-Modus (Workspace-Persistenz, E2)
+    # ------------------------------------------------------------------
+    @property
+    def mode_id(self) -> str:
+        """Aktueller Modus ("standard" | "generic") fuer die Workspace-Speicherung."""
+        return str(self._combo_mode.currentData() or "standard")
+
+    def set_mode(self, mode_id: str) -> None:
+        """Stellt den Ansichts-Modus wieder her (Workspace-Restore)."""
+        idx = self._combo_mode.findData(str(mode_id or "").lower())
+        if idx < 0:
+            idx = 0
+        if self._combo_mode.currentIndex() != idx:
+            self._combo_mode.setCurrentIndex(idx)
+        else:
+            self._stack_modes.setCurrentIndex(idx)
+
+    def _on_mode_changed(self, _index: int) -> None:
+        """Wechselt den Modus-Stack und fordert die passenden Daten an."""
+        self._stack_modes.setCurrentIndex(
+            1 if self._combo_mode.currentData() == "generic" else 0)
+        self.request_data()
 
     # ------------------------------------------------------------------
     # 19.02: Dynamische Metrik-Combo ("count" + feature_data-JSON-Keys)

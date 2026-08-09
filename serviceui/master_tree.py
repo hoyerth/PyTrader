@@ -1055,6 +1055,33 @@ class MasterTree(QTreeWidget):
             self._checked_items.clear()
         self._populate()
 
+    def _expand_ancestors(self, item) -> None:
+        """Klappt die Eltern-Kette eines Items auf (Bugfix 08.08.2026).
+
+        Bug 2 (User-Meldung: 'Tree-Knoten sollen aufgeklappt sein und die
+        Services sichtbar sein, die aktiviert wurden'): Nach dem Setzen der
+        Checkboxen (`set_checked_feature_ids`) bzw. beim Live-Anhaken
+        (`_on_item_changed`) muessen die Eltern-Knoten (Sets / Kategorie-
+        Ordner) expandiert sein – der Baum startet eingeklappt, nur die
+        Top-Level-Gruppen sind in _populate() expandiert. Ohne Expansion
+        bleiben angehakte Services/Plugins in eingeklappten Eltern unsichtbar.
+        setExpanded feuert itemExpanded -> _refresh_expand_label ('>'/'⌄'-
+        Label-Sync); waehrend `_updating_checks == True` ignoriert
+        _on_item_changed die dadurch ausgeloesten spurious itemChanged-Events.
+        """
+        node = item
+        hops = 0
+        while node is not None and isValid(node) and hops < 64:
+            node = node.parent()
+            if node is None or not isValid(node):
+                break
+            try:
+                if node.childCount() > 0 and not node.isExpanded():
+                    node.setExpanded(True)
+            except (RuntimeError, AttributeError):
+                break
+            hops += 1
+
     def _on_item_changed(self, item, column: int) -> None:
         """Aktualisiert die Checkbox-Zustaende (15.03-E, SELECT_MULTI).
 
@@ -1093,6 +1120,9 @@ class MasterTree(QTreeWidget):
                     return
                 if state == Qt.Checked:
                     self._checked_items.add(key)
+                    # Bugfix 08.08.2026: Eltern-Kette aufklappen, damit der
+                    # angehakte Service im Set sofort sichtbar ist.
+                    self._expand_ancestors(item)
                 else:
                     self._checked_items.discard(key)
                 parent = item.parent()
@@ -1107,6 +1137,9 @@ class MasterTree(QTreeWidget):
                     return
                 if state == Qt.Checked:
                     self._checked_items.add(key)
+                    # Bugfix 08.08.2026: Eltern-Kette aufklappen (Ordner/
+                    # Gruppe), damit die angehakte Plugin-Zeile sichtbar ist.
+                    self._expand_ancestors(item)
                 else:
                     self._checked_items.discard(key)
             elif node_type == TYPE_SET:
@@ -1129,6 +1162,9 @@ class MasterTree(QTreeWidget):
                         self._checked_items.discard(key)
                         child.setData(0, Qt.CheckStateRole, Qt.Unchecked)
                 self._apply_set_state(item)
+                # Bugfix 08.08.2026: Auch beim Set-Anhaken die Eltern-Kette
+                # des Sets aufklappen (Set in Kategorie-Ordner sichtbar).
+                self._expand_ancestors(item)
             self.checked_changed.emit()
         finally:
             self._updating_checks = False
@@ -1303,6 +1339,10 @@ class MasterTree(QTreeWidget):
             return
         wanted = {str(f).strip().lower() for f in (feature_ids or []) if str(f).strip()}
         self._updating_checks = True
+        # Bugfix 08.08.2026 (Bug 2): Angehakte Items merken, um danach ihre
+        # Eltern-Kette aufzuklappen (der Baum startet eingeklappt – ohne
+        # Expansion bleiben die aktivierten Services/Plugins unsichtbar).
+        checked_items: List[QTreeWidgetItem] = []
         try:
             self._checked_items.clear()
             for item in TreeItemIterator(self):
@@ -1318,6 +1358,7 @@ class MasterTree(QTreeWidget):
                     if checked:
                         self._checked_items.add((TYPE_SERVICE, set_id,
                                                  instance_id))
+                        checked_items.append(item)
                     item.setData(0, Qt.CheckStateRole,
                                  Qt.Checked if checked else Qt.Unchecked)
                 elif node_type == TYPE_PLUGIN:
@@ -1325,6 +1366,7 @@ class MasterTree(QTreeWidget):
                     checked = pid.lower() in wanted
                     if checked:
                         self._checked_items.add((TYPE_PLUGIN, "", pid))
+                        checked_items.append(item)
                     item.setData(0, Qt.CheckStateRole,
                                  Qt.Checked if checked else Qt.Unchecked)
             # Tri-States der Sets aus den Kindern ableiten
@@ -1333,6 +1375,10 @@ class MasterTree(QTreeWidget):
                     continue
                 if item.data(0, ROLE_NODE_TYPE) == TYPE_SET:
                     self._apply_set_state(item)
+            # Bugfix 08.08.2026 (Bug 2): Eltern-Kette aller angehakten Items
+            # aufklappen, damit die aktivierten Services sichtbar sind.
+            for item in checked_items:
+                self._expand_ancestors(item)
         finally:
             self._updating_checks = False
         self.checked_changed.emit()
