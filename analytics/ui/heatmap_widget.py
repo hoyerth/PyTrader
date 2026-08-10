@@ -656,13 +656,21 @@ class HeatmapWidget(QWidget):
         return self._chk_candle.isChecked()
 
     def request_data(self) -> None:
-        """Fordert generische Heatmap (+ Tages-Ohlc bei Overlay) an."""
+        """Fordert generische Heatmap (+ Tages-Ohlc bei Overlay) an.
+
+        Runde 15 (Ultra-Low-Latency, Fix 1): QUERY_FEATURES wird VOR der
+        Grafik in die Puffer-Queue gelegt – der leichte Metadaten-Pfad
+        (Reader-Cache, KEIN Heatmap-Pivot) fuellt das 'Feld'-Dropdown und
+        die '(No Data)'-Hinweise, waehrend die teure Pivot-Aggregation
+        danach in einem separaten Worker laeuft. Das Dropdown blockiert
+        damit nicht mehr mehrere Sekunden auf der Grafik.
+        """
         if self._view_model is None:
             return
+        self._view_model.request_features()
         self._view_model.request_heatmap_generic()
-        # Runde 12 (Option A): Die No-Data-Varianten kommen IM SELBEN
-        # QUERY_HEATMAP_GENERIC-Payload (kein separater QUERY_FEATURES-
-        # Roundtrip mehr) - das Dropdown aktualisiert sich mit der Grafik.
+        # Runde 12 (Option A): Zusaetzlich kommen die No-Data-Varianten im
+        # QUERY_HEATMAP_GENERIC-Payload (Konsistenz nach dem Render).
         if self._chk_candle.isChecked():
             self._view_model.request_daily_ohlc()
 
@@ -1127,10 +1135,26 @@ class HeatmapWidget(QWidget):
         fehlgeschlagenen Check. Stale-Payloads werden verworfen
         (Generation-Guard). Danach wird das 'Feld'-Dropdown aus dem Cache
         neu abgeleitet (die '(No Data)'-Items erscheinen/verschwinden).
+
+        Runde 15 (Fix 1, Ultra-Low-Latency): Der QUERY_FEATURES-Payload
+        traegt jetzt zusaetzlich `metrics`/`field_sources` (Feld-Metadaten,
+        Repository `_field_metadata`) – das 'Feld'-Dropdown wird damit
+        BEREITS aus dem leichten Metadaten-Query gefuellt (KEIN Warten auf
+        die teure Heatmap-Pivot-Aggregation).
         """
         if not self._cache_no_data_from_payload(data):
             return
-        self._rebuild_field_dropdown(self._field_keys, self._field_sources)
+        # Runde 15 (Fix 1): Feld-Metadaten aus dem Leicht-Payload uebernehmen
+        # (falls vorhanden) – sonst bleibt der bestehende Widget-Cache.
+        keys = [str(m) for m in (data.get("metrics") or [])
+                if m not in ("count", "confluence_count")]
+        field_sources = data.get("field_sources")
+        if keys or field_sources:
+            self._rebuild_field_dropdown(
+                keys,
+                field_sources if isinstance(field_sources, dict) else {})
+        else:
+            self._rebuild_field_dropdown(self._field_keys, self._field_sources)
 
     def _on_query_failed(self, kind: str, _error: str) -> None:
         """Runde 11 (Bug 4, B4-2): Fehlerzustand des No-Data-Checks.

@@ -31,6 +31,8 @@ die DB-Zeile bleibt unveraendert (Lesen ist rein).
 """
 
 import os
+import threading
+import time
 from datetime import datetime as _dt_datetime
 from datetime import timezone as _dt_timezone
 from pathlib import Path
@@ -126,6 +128,160 @@ class FeatureStoreReader:
 
     def __init__(self, db_path: str = DB_ANALYTICS) -> None:
         self.db_path = db_path
+        # Runde 15 (Ultra-Low-Latency, Performance-Fix 3): In-Memory-Cache
+        # der STABILEN Metadaten (feature_data-JSON-Keys je Service,
+        # instance_hash-Fakten). Schlüssel = (symbol.lower(), timeframe.lower()).
+        # Die Metadaten aendern sich nur bei store_plugin_payload()-Writes –
+        # die bestehende `feature_cache_last_invalidated`-Mechanik
+        # (feature_builder.py, Invariante 13) markiert solche Writes. Ohne
+        # den Cache scannen `available_feature_keys`/`feature_keys_by_service`/
+        # `available_instance_hashes`/`plugin_ids_with_hashes` den Store
+        # mehrmals pro Update (bis zu 6 Voll-Scans -> Dropdown-Verzoegerung).
+        # Thread-Lock, weil der Reader von Worker-Threads gemeinsam genutzt
+        # wird (MVVM: ein Repository/Reader pro ViewModel).
+        self._meta_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._meta_lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Interna: Metadaten-Cache (Runde 15, Performance-Fix 3)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _meta_key(symbol: str, timeframe: str) -> Tuple[str, str]:
+        """Cache-Schluessel (symbol/timeframe normalisiert, case-insensitiv)."""
+        return (str(symbol or "").strip().lower(),
+                str(timeframe or "").strip().lower())
+
+    def _meta_cache_valid(self, key: Tuple[str, str]) -> bool:
+        """True, wenn der Cache-Eintrag fuer (symbol, timeframe) gueltig ist.
+
+        Invalidation (Invariante 13 / P14-03): `feature_cache_last_invalidated`
+        wird bei JEDEM `store_plugin_payload()` fuer (symbol, timeframe)
+        aktualisiert. Ein Eintrag ist genau dann gueltig, wenn nach seiner
+        Erstellung (ts) KEINE Invalidation registriert wurde. Lazy Import
+        (kein pandas-Load beim Reader-Modul-Import; feature_builder laedt
+        schwergewichtigere Abhaengigkeiten). Fehlt der Mechanismus (Tests/
+        Standalone), bleibt der Eintrag bis zur expliziten Invalidation
+        gueltig (der Writer-Pfad liegt im selben Prozess und aktualisiert
+        die Invalidation IMMER mit).
+        """
+        entry = self._meta_cache.get(key)
+        if entry is None:
+            return False
+        try:
+            from analytics.features.feature_builder import (
+                feature_cache_last_invalidated,
+            )
+            last_inv = feature_cache_last_invalidated(*key)
+        except Exception:
+            last_inv = None
+        return last_inv is None or last_inv < float(entry.get("ts") or 0.0)
+
+    def _meta_get(self, key: Tuple[str, str]) -> Optional[Dict[str, Any]]:
+        """Liefert den gueltigen Cache-Eintrag (oder None bei Miss/Stale)."""
+        with self._meta_lock:
+            if not self._meta_cache_valid(key):
+                return None
+            return self._meta_cache.get(key)
+
+    def _meta_put(self, key: Tuple[str, str], entry: Dict[str, Any]) -> None:
+        """Legt den Cache-Eintrag mit aktuellem Zeitstempel ab."""
+        entry["ts"] = time.time()
+        with self._meta_lock:
+            self._meta_cache[key] = dict(entry)
+
+    def invalidate_meta_cache(
+        self, symbol: Optional[str] = None, timeframe: Optional[str] = None
+    ) -> None:
+        """Loescht den Metadaten-Cache (ganz oder je symbol/timeframe).
+
+        Defensiver Notausgang (z. B. Tests, die ohne
+        feature_cache_last_invalidated schreiben). Im Produktivpfad
+        invalidiert `store_plugin_payload()` automatisch via Invariante 13.
+        """
+        with self._meta_lock:
+            if symbol is None or timeframe is None:
+                self._meta_cache.clear()
+                return
+            self._meta_cache.pop(self._meta_key(symbol, timeframe), None)
+
+    def _feature_meta_base(
+        self, symbol: str, timeframe: str
+    ) -> Optional[Dict[str, Any]]:
+        """Einmaliger Basis-Scan der feature_store-Metadaten (gedacht).
+
+        Liefert – aus dem Cache ODER frisch per GENAU EINER DuckDB-Abfrage
+        (alle 4 Metadaten-Methoden teilen sich diesen Scan; vorher liefen
+        bis zu 6 Voll-Scans pro Update):
+            {
+              "types_by_service": {fid: {key: set(Typ-Str)}},   # ungefiltert
+              "hashes_by_service": {fid_lower: set(nicht-leere Hashes)},
+              "null_hash_pids":    {fid_lower},  # fids mit NULL-Hash-Zeilen
+            }
+        None bei fehlender DB/Tabelle oder Fehler (defensiv, wird NICHT
+        gecacht – ein spaeter erfolgreicher Versuch bleibt moeglich).
+
+        Semantik identisch zu den bisherigen Einzelabfragen:
+          * `schema_version`-Key und leere Keys werden ignoriert (E-3).
+          * Rows ohne feature_id landen unter "" (Legacy/native).
+          * NULL-Hash-Zeilen = undifferenzierter Alt-Bestand
+            (gehoert der plugin_id als Ganzes, Runde 13c).
+        """
+        if not symbol or not timeframe:
+            return None
+        key = self._meta_key(symbol, timeframe)
+        entry = self._meta_get(key)
+        if entry is not None and "types_by_service" in entry:
+            return entry
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT DISTINCT feature_id, instance_hash, feature_data
+                FROM feature_store
+                WHERE LOWER(symbol) = LOWER(?)
+                  AND LOWER(timeframe) = LOWER(?)
+                  AND feature_data IS NOT NULL
+            """, [symbol, timeframe]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] _feature_meta_base "
+                  f"fehlgeschlagen: {e}")
+            return None
+
+        types_by_service: Dict[str, Dict[str, set]] = {}
+        hashes_by_service: Dict[str, set] = {}
+        null_hash_pids: Set[str] = set()
+        for fid, hash_raw, raw in rows:
+            data = self._normalize_feature_data(raw)
+            if not isinstance(data, dict):
+                continue
+            service = str(fid) if fid is not None else ""
+            bucket = types_by_service.setdefault(service, {})
+            for k, v in data.items():
+                if k == "schema_version" or not str(k).strip():
+                    continue
+                key_str = str(k)
+                if isinstance(v, bool):
+                    t = "bool"
+                elif isinstance(v, (int, float)):
+                    t = "num"
+                elif v is None:
+                    t = "null"
+                else:
+                    t = "str"
+                bucket.setdefault(key_str, set()).add(t)
+            # Hash-Zuordnung (nicht-leere Hashes getrennt vom NULL-Bestand).
+            svc_l = str(service).strip().lower()
+            h_s = str(hash_raw or "").strip()
+            if h_s:
+                hashes_by_service.setdefault(svc_l, set()).add(h_s)
+            else:
+                null_hash_pids.add(svc_l)
+        entry = {
+            "types_by_service": types_by_service,
+            "hashes_by_service": hashes_by_service,
+            "null_hash_pids": null_hash_pids,
+        }
+        self._meta_put(key, entry)
+        return entry
 
     # ------------------------------------------------------------------
     # Interna
@@ -389,6 +545,13 @@ class FeatureStoreReader:
         aus; pro Struktur werden die Keys gesammelt. `schema_version`
         (Pflichtfeld, E-3) wird ignoriert.
 
+        Runde 15 (Performance-Fix 3): Die Auswertung laeuft ueber den
+        gemeinsamen Metadaten-Basis-Scan `_feature_meta_base` (EIN Scan fuer
+        available_feature_keys/feature_keys_by_service/available_instance_
+        hashes/plugin_ids_with_hashes; Invalidation via
+        `feature_cache_last_invalidated`, Invariante 13). Ergebnis
+        identisch zur bisherigen Einzelabfrage.
+
         Args:
             symbol/timeframe: Filter (case-insensitive)
             numeric_only: True => nur Keys, deren Wert in ALLEN Vorkommen
@@ -401,39 +564,13 @@ class FeatureStoreReader:
         """
         if not symbol or not timeframe:
             return []
-        con = self._get_connection()
-        try:
-            rows = con.execute("""
-                SELECT DISTINCT feature_data
-                FROM feature_store
-                WHERE LOWER(symbol) = LOWER(?)
-                  AND LOWER(timeframe) = LOWER(?)
-                  AND feature_data IS NOT NULL
-            """, [symbol, timeframe]).fetchall()
-        except Exception as e:
-            print(f"WARN [FeatureStoreReader] available_feature_keys "
-                  f"fehlgeschlagen: {e}")
+        base = self._feature_meta_base(symbol, timeframe)
+        if base is None:
             return []
-
         key_types: Dict[str, set] = {}
-        for (raw,) in rows:
-            data = self._normalize_feature_data(raw)
-            if not isinstance(data, dict):
-                continue
-            for k, v in data.items():
-                if k == "schema_version" or not str(k).strip():
-                    continue
-                key = str(k)
-                if isinstance(v, bool):
-                    t = "bool"
-                elif isinstance(v, (int, float)):
-                    t = "num"
-                elif v is None:
-                    t = "null"
-                else:
-                    t = "str"
-                key_types.setdefault(key, set()).add(t)
-
+        for bucket in base["types_by_service"].values():
+            for k, types in bucket.items():
+                key_types.setdefault(k, set()).update(types)
         keys = sorted(key_types.keys())
         if not numeric_only:
             return keys
@@ -475,51 +612,38 @@ class FeatureStoreReader:
         """
         if not symbol or not timeframe:
             return {}
-        conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
-        params: List[Any] = [symbol, timeframe]
+        base = self._feature_meta_base(symbol, timeframe)
+        if base is None:
+            return {}
+        types_by_service = base["types_by_service"]
+        hashes_by_service = base["hashes_by_service"]
+        null_hash_pids = base["null_hash_pids"]
         # 09.08.2026 (User-Meldung Feld-Dropdown): feature_id/feature_ids-
         # Filter anwenden, damit abgewaehlte Services nicht im Dropdown
-        # erscheinen (Root Cause 2).
-        self._apply_feature_filter(
-            feature_ids, feature_id, conditions, params,
-            instance_hashes=instance_hashes)
-
-        con = self._get_connection()
-        try:
-            rows = con.execute(f"""
-                SELECT DISTINCT feature_id, feature_data
-                FROM feature_store
-                WHERE {' AND '.join(conditions)}
-                  AND feature_data IS NOT NULL
-            """, params).fetchall()
-        except Exception as e:
-            print(f"WARN [FeatureStoreReader] feature_keys_by_service "
-                  f"fehlgeschlagen: {e}")
-            return {}
-
-        key_types: Dict[str, Dict[str, set]] = {}
-        for fid, raw in rows:
-            data = self._normalize_feature_data(raw)
-            if not isinstance(data, dict):
-                continue
-            service = str(fid) if fid is not None else ""
-            bucket = key_types.setdefault(service, {})
-            for k, v in data.items():
-                if k == "schema_version" or not str(k).strip():
-                    continue
-                key = str(k)
-                if isinstance(v, bool):
-                    t = "bool"
-                elif isinstance(v, (int, float)):
-                    t = "num"
-                elif v is None:
-                    t = "null"
-                else:
-                    t = "str"
-                bucket.setdefault(key, set()).add(t)
+        # erscheinen (Root Cause 2). Runde 15: Die Filterung erfolgt in
+        # Python auf dem gecachten Basis-Scan (identische Semantik zur
+        # bisherigen SQL-IN-Clause: case-insensitiv + whitespace-tolerant).
+        wanted = {str(i).strip().lower() for i in (feature_ids or [])
+                  if str(i).strip()}
+        if not wanted and feature_id:
+            wanted = {str(feature_id).strip().lower()}
+        # Runde 10 (Bug 1): Varianten-Einschraenkung – NULL-Hash-Zeilen
+        # (Alt-Bestand) passieren IMMER, sonst muss ein nicht-leerer Hash
+        # der gewaehlten Variante treffen (exakter Hash-Match, case-insensitiv).
+        hashes = set()
+        if instance_hashes:
+            hashes = {str(h).strip().lower() for h in instance_hashes
+                      if str(h).strip()}
 
         out: Dict[str, List[str]] = {}
-        for service, bucket in key_types.items():
+        for service, bucket in types_by_service.items():
+            svc_l = str(service).strip().lower()
+            if wanted and svc_l not in wanted:
+                continue
+            if hashes:
+                svc_hashes = hashes_by_service.get(svc_l, set())
+                if not (svc_l in null_hash_pids or (svc_hashes & hashes)):
+                    continue
             keys = sorted(bucket.keys())
             if numeric_only:
                 keys = [k for k in keys if bucket[k] == {"num"}]
@@ -1270,20 +1394,13 @@ class FeatureStoreReader:
         """
         if not symbol or not timeframe:
             return set()
-        con = self._get_connection()
-        try:
-            rows = con.execute("""
-                SELECT DISTINCT instance_hash FROM feature_store
-                WHERE LOWER(symbol) = LOWER(?)
-                  AND LOWER(timeframe) = LOWER(?)
-                  AND instance_hash IS NOT NULL
-                  AND instance_hash != ''
-            """, [symbol, timeframe]).fetchall()
-            return {str(r[0]) for r in rows if r[0] is not None}
-        except Exception as e:
-            print(f"WARN [FeatureStoreReader] available_instance_hashes "
-                  f"fehlgeschlagen: {e}")
+        base = self._feature_meta_base(symbol, timeframe)
+        if base is None:
             return set()
+        out: Set[str] = set()
+        for hashes in base["hashes_by_service"].values():
+            out.update(hashes)
+        return out
 
     def plugin_ids_with_hashes(
         self, symbol: str, timeframe: str,
@@ -1298,26 +1415,22 @@ class FeatureStoreReader:
         mindestens EINE Zeile mit gesetztem instance_hash besitzen
         (rein lesend, kein SQL in der UI).
 
+        Runde 15 (Performance-Fix 3): Abgeleitet aus dem gemeinsamen
+        Metadaten-Basis-Scan `_feature_meta_base` (keine separate Abfrage;
+        Identitaet = unter "" gruppierte Legacy/native-Rows ohne feature_id
+        werden ausgeschlossen, wie bisher).
+
         Returns:
             set[str] – leer bei fehlender DB/Tabelle oder Fehlern
             (defensiv, Invariante FeatureStoreReader: rein lesend).
         """
         if not symbol or not timeframe:
             return set()
-        con = self._get_connection()
-        try:
-            rows = con.execute("""
-                SELECT DISTINCT LOWER(TRIM(feature_id)) FROM feature_store
-                WHERE LOWER(symbol) = LOWER(?)
-                  AND LOWER(timeframe) = LOWER(?)
-                  AND feature_id IS NOT NULL AND TRIM(feature_id) != ''
-                  AND instance_hash IS NOT NULL AND instance_hash != ''
-            """, [symbol, timeframe]).fetchall()
-            return {str(r[0]) for r in rows if r[0] is not None}
-        except Exception as e:
-            print(f"WARN [FeatureStoreReader] plugin_ids_with_hashes "
-                  f"fehlgeschlagen: {e}")
+        base = self._feature_meta_base(symbol, timeframe)
+        if base is None:
             return set()
+        return {k for k in base["hashes_by_service"]
+                if k and str(k).strip() != ""}
 
     def resolve_no_data_variants(
         self,

@@ -115,6 +115,62 @@ class AnalyticsRepository:
         return result
 
     # ------------------------------------------------------------------
+    # Feld-Metadaten (Runde 15, Fix 1/3): metrics + field_sources fuer das
+    # 'Feld'-Dropdown – gemeinsamer Pfad fuer QUERY_HEATMAP_GENERIC und den
+    # leichten QUERY_FEATURES-Payload. `feature_keys_by_service` wird im
+    # Reader gecacht (EIN DB-Scan, Invalidation via Invariante 13), damit
+    # beide Aufrufer identische Metadaten OHNE Doppel-Abfrage erhalten.
+    # ------------------------------------------------------------------
+    def _field_metadata(
+        self,
+        symbol: str,
+        timeframe: str,
+        feature_id: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
+        instance_hashes: Optional[List[str]] = None,
+    ) -> tuple:
+        """Verfuegbare Feld-Metriken + Quellen-Zuordnung (Feld-Dropdown).
+
+        09.08.2026 (User-Meldung Feld-Dropdown, Root Cause 2): Die
+        Feldquellen werden STRENG ueber den feature_ids-Filter bestimmt –
+        abgewaehlte Services (z. B. Grid-Lines) duerfen ihre Keys nicht
+        mehr ins 'Feld'-Dropdown liefern.
+
+        Returns:
+            (metrics, field_sources)
+              metrics:      ["count", "confluence_count"] + numerische Keys
+                            der SELEKTIERTEN Services
+              field_sources:{Key: [service_id...]} (nur selektierte Services)
+        """
+        try:
+            avail = self.reader.available_feature_keys(
+                symbol, timeframe, numeric_only=True)
+        except Exception:
+            avail = []
+        try:
+            by_service = self.reader.feature_keys_by_service(
+                symbol, timeframe, numeric_only=True,
+                feature_id=feature_id, feature_ids=feature_ids,
+                instance_hashes=instance_hashes)
+        except Exception:
+            by_service = {}
+        field_sources: Dict[str, List[str]] = {}
+        for fid, keys in by_service.items():
+            if not fid:
+                continue  # Legacy-Rows ohne feature_id -> kein Service-Prefix
+            for k in keys:
+                field_sources.setdefault(k, []).append(fid)
+        # Nur die Keys der SELEKTIERTEN Services in der Metrik-/Feldliste –
+        # das HeatmapWidget baut das 'Feld'-Dropdown aus `metrics` auf
+        # (_sync_combos_from_payload); ohne diese Begrenzung erschienen
+        # abgewaehlte Keys weiterhin (nur ohne Service-Prefix).
+        avail_filtered = sorted({k for keys in by_service.values()
+                                 for k in keys})
+        if not avail_filtered:
+            avail_filtered = avail  # defensiv: ohne Quellen -> ungefiltert
+        return (["count", "confluence_count"] + avail_filtered, field_sources)
+
+    # ------------------------------------------------------------------
     # Generische 2D-Heatmap (20.02, additiv – Kapitel §2 / Review E1/E5/E6)
     # ------------------------------------------------------------------
     def get_generic_heatmap(
@@ -150,32 +206,14 @@ class AnalyticsRepository:
               "symbol", "timeframe",
             }
         """
-        avail = self.reader.available_feature_keys(
-            symbol, timeframe, numeric_only=True)
-        # 09.08.2026 (User-Meldung Feld-Dropdown, Root Cause 2): Die
-        # Feldquellen werden STRENG ueber den feature_ids-Filter bestimmt –
-        # abgewaehlte Services (z. B. Grid-Lines) duerfen ihre Keys nicht
-        # mehr ins 'Feld'-Dropdown liefern (vorher ungefiltert ueber ALLE
-        # Rows des Symbol/Timeframe).
-        by_service = self.reader.feature_keys_by_service(
-            symbol, timeframe, numeric_only=True,
-            feature_id=feature_id, feature_ids=feature_ids,
+        # Runde 15 (Fix 1/3): Gemeinsamer Feld-Metadaten-Pfad
+        # (_field_metadata) – metrics + field_sources kommen aus dem
+        # gecachten Reader-Basis-Scan (EIN DB-Scan; der QUERY_FEATURES-
+        # Leichtpfad liefert identische Metadaten OHNE die teure
+        # Heatmap-Pivot-Aggregation).
+        metrics, field_sources = self._field_metadata(
+            symbol, timeframe, feature_id=feature_id, feature_ids=feature_ids,
             instance_hashes=instance_hashes)
-        field_sources: Dict[str, List[str]] = {}
-        for fid, keys in by_service.items():
-            if not fid:
-                continue  # Legacy-Rows ohne feature_id -> kein Service-Prefix
-            for k in keys:
-                field_sources.setdefault(k, []).append(fid)
-        # Nur die Keys der SELEKTIERTEN Services in der Metrik-/Feldliste –
-        # das HeatmapWidget baut das 'Feld'-Dropdown aus `metrics` auf
-        # (_sync_combos_from_payload); ohne diese Begrenzung erschienen
-        # abgewaehlte Keys weiterhin (nur ohne Service-Prefix).
-        avail_filtered = sorted({k for keys in by_service.values()
-                                 for k in keys})
-        if not avail_filtered:
-            avail_filtered = avail  # defensiv: ohne Quellen -> ungefiltert
-        metrics = ["count", "confluence_count"] + avail_filtered
         use_agg = str(agg or "count").lower()
         use_field = str(field or "")
         # E6: Bei Wert-Aggregationen (AVG/SUM/MIN/MAX) ist `field` ein
@@ -446,6 +484,10 @@ class AnalyticsRepository:
         symbol: str,
         timeframe: str,
         presets_data: Optional[Dict[str, Any]] = None,
+        # Runde 15 (Fix 1): feature_ids/instance_hashes fuer die Feld-
+        # Metadaten (metrics/field_sources) im QUERY_FEATURES-Leichtpfad.
+        feature_ids: Optional[List[str]] = None,
+        instance_hashes: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Verfuegbare Plugin-IDs, JSON-Keys, Zeilenzahl + No-Data-Varianten.
 
@@ -454,10 +496,23 @@ class AnalyticsRepository:
         existieren oder die Auswertung fehlschlaegt; `no_data_variants_error`
         markiert einen Fehlschlag). Die Auswertung laeuft hier (Worker-
         Thread), nicht im UI-Hauptthread.
+
+        Runde 15 (Fix 1, Ultra-Low-Latency): Zusaetzlich traegt der Payload
+        `metrics` + `field_sources` (Feld-Metadaten, identisch zu
+        get_generic_heatmap) – das 'Feld'-Dropdown + die '(No Data)'-Hinweise
+        kommen damit ueber den LEICHTEN Metadaten-Query (Reader-Cache, kein
+        Heatmap-Pivot), getrennt von der Grafik.
         """
         result = self.reader.get_available_features(symbol, timeframe)
         if not isinstance(result, dict):
             result = {}
+        # Runde 15 (Fix 1): Feld-Metadaten (metrics/field_sources) ueber
+        # denselben Reader-Basis-Scan wie die Heatmap (cache-served).
+        metrics, field_sources = self._field_metadata(
+            symbol, timeframe, feature_ids=feature_ids,
+            instance_hashes=instance_hashes)
+        result["metrics"] = metrics
+        result["field_sources"] = field_sources
         no_data_error = False
         try:
             variants = self.reader.resolve_no_data_variants(

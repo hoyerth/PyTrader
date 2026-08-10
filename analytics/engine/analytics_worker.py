@@ -241,9 +241,14 @@ class AnalyticsAsyncWorker(QThread):
             # Runde 11 (Bug 4, B4-1): Preset-Snapshot aus den Query-Params
             # fuer die No-Data-Auswertung (Repo berechnet no_data_variants
             # im Worker-Thread; kein DB-Zugriff im UI-Hauptthread).
+            # Runde 15 (Fix 1): feature_ids/instance_hashes fuer die Feld-
+            # Metadaten (metrics/field_sources) im leichten QUERY_FEATURES-
+            # Pfad (Feld-Dropdown OHNE Heatmap-Pivot).
             return repo.get_available_features(
                 symbol, timeframe,
                 presets_data=p.get("presets_data") or None,
+                feature_ids=feature_ids,
+                instance_hashes=instance_hashes,
             )
 
         raise ValueError(
