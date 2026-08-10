@@ -1444,10 +1444,20 @@ class FeatureStoreReader:
         UI-Hauptthread in den QUERY_FEATURES-Worker verlagert. Der
         ViewModel liefert die Preset-Modell-Daten als Snapshot
         (`presets_data`: {"presets": {pid: [...]}, "sets": [...],
-        "display_names": {"{pid}|{pname}": str},
+        "standalone": [pid...], "display_names": {"{pid}|{pname}": str},
         "active_hashes": [gecheckte Varianten-Hashes]}); diese Methode
         kombiniert sie mit den DB-Fakten (`available_instance_hashes` /
         `feature_keys_by_service`) im Worker-Thread.
+
+        Runde 15c (Bugfix Standalone, User-Meldung 10.08.2026): Die neue
+        Snapshot-Sektion `standalone` listet registrierte Plugins ohne
+        Presets und ohne Set-Instanz (z. B. srv_trend_breakout) als
+        hash-lose Variante (preset_name 'Default'). Eine Standalone-Variante
+        gilt als 'ohne Daten', wenn ihre plugin_id keine feature_store-Zeilen
+        besitzt (`_has_data` prueft `pids_with_data` direkt - kein
+        Hash-/Alt-Bestand-Fallback noetig). Dadurch erscheint ein
+        registrierter, aber noch nie ausgeführter Service korrekt als
+        '(No Data)' im Feld-Dropdown.
 
         Runde 13 (Bugfix Dropdown-NoData): `active_hashes` (nicht leer =
         Varianten-Einschraenkung) macht die Auswertung VARIANTEN-GENAU -
@@ -1480,6 +1490,13 @@ class FeatureStoreReader:
         presets = (presets_data or {}).get("presets") or {}
         sets = (presets_data or {}).get("sets") or []
         display_names = (presets_data or {}).get("display_names") or {}
+        # Runde 15c (Bugfix Standalone, User-Meldung 10.08.2026):
+        # Registrierte Plugins ohne Presets und ohne Set-Instanz
+        # (z. B. srv_trend_breakout) - der ViewModel markiert sie ueber
+        # die Snapshot-Sektion "standalone" als hash-lose Variante. Sie
+        # gelten als '(No Data)', solange der feature_store keine Rows
+        # ihrer plugin_id besitzt (Reader prueft `pids_with_data`).
+        standalone = (presets_data or {}).get("standalone") or []
         # Runde 13 (Bugfix Dropdown-NoData): Varianten-Einschraenkung aus dem
         # Snapshot - leer = KEINE Einschraenkung (alle Varianten der aktiven
         # Services), nicht leer = nur die gecheckten Varianten.
@@ -1521,6 +1538,14 @@ class FeatureStoreReader:
                 if isinstance(_svc, dict) and str(
                         _svc.get("plugin_id") or "").strip():
                     active_pids.append(str(_svc["plugin_id"]))
+        # Runde 15c: Standalone-Services ebenfalls in die Abfrage-Scope
+        # aufnehmen - `pids_with_data` muss deren Datenlage kennen, sonst
+        # wuerde ein Standalone-Service MIT Rows faelschlich als '(No Data)'
+        # geliefert (feature_keys_by_service scannt nur die aktiven pids).
+        for _pid in standalone or []:
+            _s = str(_pid or "").strip()
+            if _s:
+                active_pids.append(_s)
         active_pids = list(dict.fromkeys(active_pids))
         try:
             if active_pids:
@@ -1686,6 +1711,14 @@ class FeatureStoreReader:
                 else:
                     h = ""
                 _add(pid, f"{pid} [{instance_id}]", h)
+        # Runde 15c (Bugfix Standalone, User-Meldung 10.08.2026): Reine
+        # Standalone-Services als hash-lose Variante (preset_name 'Default')
+        # erfassen - `_has_data(pid, "")` prueft direkt `pids_with_data`
+        # (kein Hash-/Alt-Bestand-Fallback noetig). Ein Standalone-Service
+        # ohne feature_store-Rows erscheint damit als '(No Data)' im
+        # Feld-Dropdown; sobald Daten existieren, bleibt der Hinweis aus.
+        for pid in standalone or []:
+            _add(str(pid), "Default", "")
         return out
 
     @staticmethod

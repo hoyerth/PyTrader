@@ -1328,6 +1328,9 @@ class AnalyticsViewModel(QObject):
                                 "is_archived"}]},
              "sets": [{"services": {instance_id: {"plugin_id", "params",
                                                    "is_archived"}}}],
+             "standalone": [plugin_id der registrierten Plugins ohne
+                            Presets und ohne Set-Instanz (hash-lose
+                            Variante, 15c)],
              "display_names": {"{pid}|{pname}": "Anzeigename"},
              "active_hashes": [instance_hash der im Picker gecheckten
                                Varianten (leer = keine Einschraenkung)]}
@@ -1340,6 +1343,15 @@ class AnalyticsViewModel(QObject):
         damit nur noch die im ServicePicker gecheckten Varianten als
         '(No Data)' (nicht-gecheckte Instanzen derselben plugin_id erscheinen
         nicht mehr; das Dropdown zeigt nicht mehr die erste Variante).
+
+        Runde 15c (Bugfix Standalone, User-Meldung 10.08.2026): Reine
+        Standalone-Services (registrierte Plugins OHNE Presets/Clones UND
+        OHNE Set-Instanz, z. B. srv_trend_breakout) wurden nie in den
+        Snapshot aufgenommen - der Reader konnte sie daher nie als
+        '(No Data)' markieren, obwohl der feature_store noch keine Rows
+        ihrer plugin_id besitzt. Die neue Snapshot-Sektion `standalone`
+        listet genau diese Plugins als hash-lose Variante (preset_name
+        'Default'); der Reader prueft sie gegen `pids_with_data`.
         """
         model = self._selector_model
         if model is None:
@@ -1349,6 +1361,9 @@ class AnalyticsViewModel(QObject):
         presets: Dict[str, Any] = {}
         sets: List[Any] = []
         display_names: Dict[str, str] = {}
+        # Runde 15c (Bugfix Standalone): Registrierte Plugins ohne Presets
+        # und ohne Set-Instanz als hash-lose '(No Data)'-Kandidaten.
+        standalone: List[str] = []
         # Runde 12 (Punkt 4): Nur GE CHECKTE Services in den Snapshot
         # aufnehmen (feature_ids-Filter; leer = kein Filter = alle). Nicht
         # angehakte Services duerfen keine '(No Data)'-Hinweise liefern.
@@ -1411,11 +1426,56 @@ class AnalyticsViewModel(QObject):
                         in active_ids}
                 if services:
                     sets.append({"services": services})
+            # Runde 15c (Bugfix Standalone, User-Meldung 10.08.2026):
+            # Registrierte Plugins, die weder Presets/Clones noch eine
+            # Set-Instanz besitzen (z. B. srv_trend_breakout), sind reine
+            # Standalone-Services. Sie wurden bisher nie in den Snapshot
+            # aufgenommen - der Reader konnte sie deshalb nie als
+            # '(No Data)' markieren. Als hash-lose Variante (preset_name
+            # 'Default') geprueft, erscheinen sie im Feld-Dropdown, sobald
+            # der feature_store noch keine Rows ihrer plugin_id besitzt.
+            # Beim Vorhandensein von Daten (pids_with_data) bleibt der
+            # NoData-Hinweis aus (Reader-Semantik). Ausgeschlossen sind
+            # Plugins mit Presets oder Set-Instanzen (dort laeuft die
+            # bestehende Preset-/Set-Auswertung); ebenso ausgeblendet bei
+            # aktiver Varianten-Einschraenkung (eine hash-lose Variante
+            # kann nie Teil einer Hash-Auswahl sein, konsistent zur
+            # Hash-Los-Logik der Presets in Runde 13b).
+            if not active_hashes:
+                try:
+                    all_presets = model.plugin_presets() or {}
+                    preset_keys = {str(k).strip().lower()
+                                   for k in all_presets}
+                    set_pids: Set[str] = set()
+                    for _s in model.get_sets() or []:
+                        _services = (_s.get("services")
+                                     if isinstance(_s, dict) else None)
+                        if not isinstance(_services, dict):
+                            continue
+                        for _svc in _services.values():
+                            if isinstance(_svc, dict) and str(
+                                    _svc.get("plugin_id") or "").strip():
+                                set_pids.add(
+                                    str(_svc["plugin_id"]).strip().lower())
+                    for _pid in (model.get_plugins() or {}).keys():
+                        _pid_l = str(_pid).strip().lower()
+                        if not _pid_l:
+                            continue
+                        if active_ids and _pid_l not in active_ids:
+                            continue
+                        if _pid_l in preset_keys or _pid_l in set_pids:
+                            continue
+                        standalone.append(_pid)
+                        display_names[f"{_pid}|Default"] = \
+                            self.resolve_service_display_name(_pid)
+                except Exception:
+                    pass
         except Exception:
             pass
         return {
             "presets": presets,
             "sets": sets,
+            "standalone": standalone,
             "display_names": display_names,
             "active_hashes": sorted(active_hashes),
         }
