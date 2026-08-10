@@ -304,8 +304,18 @@ class AnalyticsViewModel(QObject):
             # Aenderung; reine Hash-Aenderung laesst das Feld-Dropdown
             # unveraendert.)
             self.feature_ids_changed.emit()
-        self._refresh((QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC,
-                       QUERY_SCATTER, QUERY_DISTRIBUTION))
+        # Runde 15b (Bugfix Dropdown, User-Meldung 10.08.2026): QUERY_FEATURES
+        # gehoert in den Refresh - der leichte Metadaten-Pfad liefert die
+        # field_sources/no_data_variants fuer die AKTUELLEN feature_ids +
+        # instance_hashes (Feld-Dropdown + NoData-Hinweise). Ohne den
+        # Refresh bliebe das Dropdown auf dem Cache-Stand des letzten
+        # Payloads (z. B. ein zuvor gefilterter Satz ohne die neu gecheckten
+        # Services) - Check/Uncheck waere erst nach einem Seitenwechsel
+        # sichtbar. Die Queue-Reihenfolge (QUERY_FEATURES zuerst) spiegelt
+        # die Runde-15-Prioritaet: leichtes Dropdown-Update VOR der Grafik.
+        self._refresh((QUERY_FEATURES, QUERY_TABLE, QUERY_HEATMAP,
+                       QUERY_HEATMAP_GENERIC, QUERY_SCATTER,
+                       QUERY_DISTRIBUTION))
 
     @staticmethod
     def _normalize_feature_ids(value) -> List[str]:

@@ -136,6 +136,20 @@ class AnalyticsRepository:
         abgewaehlte Services (z. B. Grid-Lines) duerfen ihre Keys nicht
         mehr ins 'Feld'-Dropdown liefern.
 
+        Runde 15b (Bugfix Dropdown, User-Meldung 10.08.2026): Die
+        Feld-Struktur gehoert zu den SERVICES (feature_ids), NICHT zu den
+        Varianten (instance_hashes) – eine gecheckte NoData-Variante
+        (Hash ohne DB-Rows) darf den aktiven Service NICHT aus der
+        Feld-Metadaten ausblenden (sonst greift der ungefilterte Fallback
+        und das Dropdown zeigt alle Keys aller Services ohne Prefix).
+        `instance_hashes` bleibt fuer die DATEN-Queries (Table/Heatmap)
+        bestehen; die NoData-Variante wird separat im Payload markiert.
+        Zusaetzlich greift der defensive Fallback `avail` (alle Keys)
+        NUR ohne aktiven feature_ids/feature_id-Filter – bei aktivem
+        Filter ist eine leere by_service-Menge ein LEGITIMES Ergebnis
+        (z. B. nur String-Services selektiert) und darf nicht zu einem
+        ungefilterten Dropdown fuehren.
+
         Returns:
             (metrics, field_sources)
               metrics:      ["count", "confluence_count"] + numerische Keys
@@ -148,10 +162,12 @@ class AnalyticsRepository:
         except Exception:
             avail = []
         try:
+            # Runde 15b: KEIN instance_hashes-Filter hier (siehe oben) –
+            # die Feld-Struktur folgt den aktiven Services, nicht den
+            # Varianten-Hashes.
             by_service = self.reader.feature_keys_by_service(
                 symbol, timeframe, numeric_only=True,
-                feature_id=feature_id, feature_ids=feature_ids,
-                instance_hashes=instance_hashes)
+                feature_id=feature_id, feature_ids=feature_ids)
         except Exception:
             by_service = {}
         field_sources: Dict[str, List[str]] = {}
@@ -166,8 +182,11 @@ class AnalyticsRepository:
         # abgewaehlte Keys weiterhin (nur ohne Service-Prefix).
         avail_filtered = sorted({k for keys in by_service.values()
                                  for k in keys})
-        if not avail_filtered:
-            avail_filtered = avail  # defensiv: ohne Quellen -> ungefiltert
+        # Runde 15b: Fallback nur ohne aktiven Filter (echte Leer-Datenlage
+        # bei 'alle Features'). Bei aktivem Filter gilt: kein Service matcht
+        # -> konsistent leere Feld-Liste (kein ungefiltertes Dropdown).
+        if not avail_filtered and not feature_ids and not feature_id:
+            avail_filtered = avail  # defensiv: ohne Filter -> ungefiltert
         return (["count", "confluence_count"] + avail_filtered, field_sources)
 
     # ------------------------------------------------------------------
@@ -214,6 +233,10 @@ class AnalyticsRepository:
         metrics, field_sources = self._field_metadata(
             symbol, timeframe, feature_id=feature_id, feature_ids=feature_ids,
             instance_hashes=instance_hashes)
+        # Numerische Keys aus den Metadaten (ohne count/confluence_count) –
+        # Grundlage des E6-Fallbacks fuer Wert-Aggregationen.
+        avail_filtered = [m for m in metrics
+                          if m not in ("count", "confluence_count")]
         use_agg = str(agg or "count").lower()
         use_field = str(field or "")
         # E6: Bei Wert-Aggregationen (AVG/SUM/MIN/MAX) ist `field` ein
