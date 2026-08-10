@@ -1018,3 +1018,70 @@ an mehreren Stellen, redundante Re-Queries).
 
 ---
 
+## 8j. Implementierungs-Log - Bugfix Runde 13: Dropdown-NoData - variantengenauer Reader-Filter & instance_hashes fuer Set-Instanz-Varianten (10.08.2026)
+
+**Problem (User-Meldung 10.08.2026, zwei seit langem bestehende Dropdown-Fehler im Analytics-NoData-Bereich):**
+(1) Das '(No Data)'-Dropdown zeigte immer die ERSTE Variante eines Services,
+auch wenn im ServicePicker eine andere Variante gecheckt war (falsche
+Variante).
+(2) Das '(No Data)'-Dropdown zeigte Services/Varianten an, die im
+ServicePicker gar nicht gecheckt waren.
+
+**Root Cause:** Die kanonische Datenstruktur 'gecheckte Variante' ist
+`instance_hashes` im ViewModel. Diese wurde im MasterTree nur fuer
+TYPE_CLONE-Knoten (Standalone-Presets) befuellt - Set-Instanz-Varianten
+(TYPE_SERVICE) verloren ihren `instance_hash` in der Check-Sync-Kette:
+- `_sync_checked_from_tree()` speicherte 3-Element-Keys
+  `(TYPE_SERVICE, set_id, instance_id)` ohne Hash.
+- `checked_services()` lieferte keinen Hash fuer TYPE_SERVICE.
+- `checked_instance_hashes()` sammelte nur aus TYPE_CLONE.
+-> `instance_hashes` blieb fuer Set-Instanzen leer: `_selected_no_data_
+variant()` griff auf den 'erste Variante des Services'-Fallback zurueck
+(Fehler 1), und `_render_no_data_items()` konnte ungecheckte Instanzen
+nicht per Hash filtern (Fehler 2). Zusaetzlich filterte der
+`presets_data`-Snapshot nur auf Plugin-Ebene.
+
+### Loesung
+
+* `serviceui/master_tree.py` (E1-E7): Check-Keys der Set-Instanz-Varianten
+  (TYPE_SERVICE) sind jetzt 4-elementig - inkl. `instance_hash`
+  (`_build_set_item`, Check-Handler, TYPE_SET-Branch,
+  `_sync_checked_from_tree`). `checked_services()` liefert `instance_hash`
+  fuer SERVICE/PLUGIN/CLONE (generisches Unpacking, abwaertskompatibel).
+  `checked_instance_hashes()` sammelt Hashes ALLER gecheckten Varianten
+  (vorher nur TYPE_CLONE). `set_checked_feature_ids()` wendet die
+  Hash-Restriktion jetzt auch auf TYPE_SERVICE an (analog TYPE_CLONE) und
+  fuegt den 4er-Key hinzu.
+* `analytics/engine/analytics_view_model.py`: `_no_data_presets_snapshot()`
+  berechnet `active_hashes` aus `_params["instance_hashes"]` und liefert
+  sie als neuen Snapshot-Schluessel.
+* `analytics/engine/feature_store_reader.py`: `resolve_no_data_variants()`
+  liest `active_hashes` aus dem Snapshot und filtert in `_add()`
+  variantengenau (`if active_hashes and h_s.lower() not in active_hashes:
+  return`) - der Payload enthaelt nur noch die im ServicePicker gecheckten
+  Varianten.
+* `analytics/ui/heatmap_widget.py`: `_selected_no_data_variant()` - der
+  'erste Variante des Services'-Fallback ist ersatzlos entfernt; es wird
+  nur noch die (einzige) Variante des aktuellen Feld-Services aus dem
+  variantengefilterten Payload zurueckgegeben. `_render_no_data_items()`
+  haelt die Widget-Filter (feature_ids/instance_hashes) DEFENSIV aktiv
+  (schuetzt gegen Alt-Payloads vom QUERY_FEATURES-Kompatibilitaetspfad
+  ohne Hash-Filter).
+
+### Verifikation (headless, keine UI-Tests)
+
+* `test/_verify_mastertree.py` (neu): **9/9 PASS** - statische Checks der
+  E1-E7-Ersetzungen in master_tree.py.
+* `test/check_round12.py` (aktualisiert, Runde-13-Semantik): **23/23 PASS**
+  - B3/B3b an den variantengenauen Payload angepasst (gecheckte Variante
+  gewinnt statt erster Variante; Payload ohne srv_x-Variante -> kein
+  V1-Fallback), neue C4/C5-Checks (Reader-`active_hashes`-Filter: nur
+  gecheckte Variante h2 geliefert, ohne Einschraenkung alle; VM-Snapshot
+  liefert `active_hashes`-Schluessel).
+* Regressionen: `test/check_round11.py` **35/35 PASS** (B3-1..B3-3,
+  B4-1..B4-5, A1-A6 unveraendert gruen).
+* `py_compile` aller 4 geaenderten Dateien (System- + venv-Python): EXIT=0.
+* Commit `8a72c8a` (Runde 13), Commit `993ad46` (Runde 12+12b).
+
+---
+
