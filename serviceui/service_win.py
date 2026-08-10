@@ -115,6 +115,12 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # Editor geladen, haelt dieses Feld die plugin_id. Die gespeicherten
         # Parameter liegen in global_settings (Key 'plugin_params_<pid>').
         self._current_plugin_editing: Optional[str] = None
+        # 10.08.2026 (Bugfix, Varianten-Params): Wird ein Clone-Knoten
+        # (Preset/Variante) editiert, haelt dieses Feld das Preset-Dict aus
+        # indicator_presets (indicator_id, preset_name, is_active_batch,
+        # doc_log) - der Save-Pfad schreibt dann in das Preset statt in
+        # global_settings (plugin_params_<pid>).
+        self._current_preset_editing: Optional[Dict[str, Any]] = None
         # USER-REQ (P14-03): Preisskala-Praezision je Symbol fuer die 6
         # Custom-Level-Eingabefelder (prox_level1..6). Lazy + gecacht.
         self._symbol_precision: Optional[int] = None
@@ -157,8 +163,10 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # unter dem Log (siehe right_panel-Aufbau weiter unten).
         if self.text_log:
             fm = self.text_log.fontMetrics()
-            self.text_log.setMaximumHeight(fm.lineSpacing() * 4 + 12)
-            self.text_log.setMinimumHeight(fm.lineSpacing() * 4 + 12)
+            # 10.08.2026 (Bugfix): Log-Hoehe von 4 auf 2 Zeilen reduziert
+            # (zwei Zeilen hoeher als der Default war ein Fehler).
+            self.text_log.setMaximumHeight(fm.lineSpacing() * 2 + 12)
+            self.text_log.setMinimumHeight(fm.lineSpacing() * 2 + 12)
 
         # Phase 13 5.4 Schritt 1: Dynamische Service-Spalten (Breite/Höhe aus
         # dem Inhalt – KEINE fixen Pixelwerte). Das Inhalt-Layout erhält
@@ -228,11 +236,12 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
 
             # Spalte 2: Service-Parameter-Box + Aktions-Leiste
             self._param_panel = QWidget()
-            # Bugfix 05.08.2026 (Punkt 1+2): Mindestbreite etwas breiter als
-            # ZWEI Service-Spalten (942 px) - kein horizontaler Scrollbalken
-            # bei 2 Services. Die UI-Geometrie (1400) deckt Tree (min. 400) +
-            # Box (min. 960) + Splitter-Handle ab.
-            self._param_panel.setMinimumWidth(960)
+            # 10.08.2026 (Bugfix, Slider): Das 960px-Minimum addierte sich mit
+            # dem Tree-Minimum (400px) auf ~1360px - der QSplitter hatte
+            # praktisch keinen Spielraum, der Slider war unbeweglich. Das
+            # Panel-Minimum ist jetzt schlank (520px); bei schmalerem Panel
+            # zeigt die ContentScrollArea horizontale Scrollbalken.
+            self._param_panel.setMinimumWidth(520)
             param_layout = QVBoxLayout(self._param_panel)
             param_layout.setContentsMargins(0, 0, 0, 0)
             param_layout.setSpacing(6)
@@ -280,6 +289,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             # Keine Spalte unter ihre Mindestgroesse kollabieren lassen.
             self.main_splitter.setCollapsible(0, False)
             self.main_splitter.setCollapsible(1, False)
+            # 10.08.2026 (Bugfix, Slider): Startgroessen einmalig setzen -
+            # danach behaelt der QSplitter die Position des Anwenders
+            # (_resize_param_box_deferred waechst nur noch, siehe
+            # param_columns.py).
+            self.main_splitter.setSizes([460, 820])
 
             self.top_row.addWidget(self.main_splitter)
             self.central_layout.insertLayout(idx, self.top_row)
@@ -698,15 +712,23 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         Plugin-Modus zurueckgesetzt.
         """
         if node_type in ("plugin", "clone") and plugin_id:
-            # 20.04 (Q7): Clone-Zeilen (Preset/Variante eines Plugin-Parents)
-            # laden wie Plugin-Zeilen den Standalone-Editor (feature_id =
-            # plugin_id des Parents).
-            self._load_plugin_editor(str(plugin_id))
+            if node_type == "clone":
+                # 10.08.2026 (Bugfix, Varianten-Params): Eine Variante/Clone
+                # hat EIGENE Parameter in indicator_presets (20.04, Q7) -
+                # der Editor laedt die presetspezifischen Werte statt der
+                # globalen Standalone-Parameter (plugin_params_<pid>). Der
+                # instance_hash liegt im service_id-Slot (MasterTree.
+                # _emit_selection_details).
+                self._load_clone_editor(str(plugin_id), str(service_id))
+            else:
+                self._load_plugin_editor(str(plugin_id))
             return
         # Jede andere Zeile beendet den Plugin-Editor-Modus; der Set-Editor
         # wird weiterhin ueber selection_changed gesteuert (Bestandslogik).
         if self._current_plugin_editing:
             self._current_plugin_editing = None
+        if self._current_preset_editing:
+            self._current_preset_editing = None
 
     def _plugin_config(self, plugin_id: str) -> Dict[str, Any]:
         """ServiceInstanceConfig eines Standalone-Plugins.
@@ -772,6 +794,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         except KeyError:
             self.log(f"Plugin '{plugin_id}' nicht gefunden.")
             self._current_plugin_editing = None
+            self._current_preset_editing = None
             self._clear_set_editor()
             return
         cfg = self._plugin_config(plugin_id)
@@ -783,6 +806,53 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             "services": {plugin_id: cfg},
         }
         self._current_plugin_editing = plugin_id
+        self._current_preset_editing = None
+        self.load_set_into_editor(definition)
+
+    def _load_clone_editor(self, plugin_id: str, instance_hash: str) -> None:
+        """Laedt die Parameter einer Variante (Clone) in den Editor.
+
+        10.08.2026 (Bugfix, Varianten-Params): Jede Variante hat EIGENE
+        Parameter-Einstellungen in indicator_presets (Kapitel 20.04, Model C).
+        Ein Klick auf einen Clone-Knoten darf NICHT die globalen Standalone-
+        Parameter (plugin_params_<pid>) laden - der Editor zeigt die
+        presetspezifischen Werte. Der Save-Pfad (_save_plugin_params)
+        schreibt Aenderungen via save_indicator_preset in das Preset
+        (indicator_id, preset_name) zurueck.
+        """
+        if not plugin_id or not instance_hash:
+            return
+        preset = self._find_preset_for_hash(plugin_id, instance_hash)
+        if preset is None:
+            self.log(f"Preset zu #{instance_hash} nicht gefunden.")
+            self._current_plugin_editing = None
+            self._current_preset_editing = None
+            self._clear_set_editor()
+            return
+        indicator_id = str(preset.get("indicator_id") or "")
+        preset_name = str(preset.get("preset_name") or "Default")
+        if not indicator_id:
+            self.log(f"Preset '{preset_name}' hat keine indicator_id.")
+            return
+        # Basis = Registry-Defaults + gespeicherte Standalone-Werte; die
+        # presetspezifischen Parameter ueberschreiben (Varianten-Params).
+        cfg = self._plugin_config(plugin_id)
+        preset_params = preset.get("params") or {}
+        if isinstance(preset_params, dict) and preset_params:
+            merged = dict(cfg.get("params") or {})
+            merged.update(preset_params)
+            cfg["params"] = merged
+        definition: Dict[str, Any] = {
+            "set_id": "",
+            "display_name": f"{plugin_id} ({preset_name})",
+            "description": str(preset.get("doc_log") or ""),
+            "execution_order": [plugin_id],
+            "services": {plugin_id: cfg},
+        }
+        self._current_plugin_editing = plugin_id
+        # Merke das Preset fuer den Save-Pfad (is_active_batch/doc_log
+        # bleiben beim Speichern erhalten).
+        self._current_preset_editing = preset
         self.load_set_into_editor(definition)
 
     def _save_plugin_params(self) -> bool:
@@ -801,6 +871,34 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.log(f"FEHLER beim Speichern der Plugin-Parameter: "
                      f"keine Service-Config.")
             return False
+        # 10.08.2026 (Bugfix, Varianten-Params): Im Clone-/Preset-Modus wird
+        # in indicator_presets gespeichert (eigene Parameter je Variante)
+        # statt in global_settings (plugin_params_<pid>).
+        preset = self._current_preset_editing
+        if isinstance(preset, dict):
+            indicator_id = str(preset.get("indicator_id") or "")
+            preset_name = str(preset.get("preset_name") or "Default")
+            if not indicator_id:
+                self.log("Preset hat keine indicator_id - nicht gespeichert.")
+                return False
+            try:
+                self._state_manager.save_indicator_preset(
+                    indicator_id, preset_name,
+                    dict(cfg.get("params") or {}),
+                    plugin_id=plugin_id,
+                    version=str(cfg.get("version")
+                                or preset.get("version") or "0.0.0"),
+                    is_active_batch=bool(preset.get("is_active_batch")),
+                    doc_log=str(preset.get("doc_log") or ""),
+                )
+            except Exception as e:
+                self.log(f"FEHLER beim Speichern der Varianten-Parameter: {e}")
+                return False
+            self._clear_dirty_markers()
+            event_bus.service_set_changed.emit()
+            self.log(f"Parameter gespeichert (Variante '{preset_name}'): "
+                     f"{plugin_id}")
+            return True
         data: Dict[str, Any] = {
             "plugin_id": plugin_id,
             "lookback": int(cfg.get("lookback") or 1000),
@@ -1823,6 +1921,10 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self._current_set_definition = None
         # 17.01.04: Auch den Standalone-Plugin-Editor-Modus beenden.
         self._current_plugin_editing = None
+        # 10.08.2026 (Bugfix, Varianten-Params): Preset-Modus ebenfalls
+        # beenden (sonst wuerde der naechste Save in ein fremdes Preset
+        # schreiben).
+        self._current_preset_editing = None
         # Phase 15 (Dirty-State): Marker des vorherigen Sets entfernen.
         self._clear_dirty_markers()
         self._clear_service_columns()

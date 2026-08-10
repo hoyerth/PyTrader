@@ -86,6 +86,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -154,6 +155,11 @@ class _DialogParamHost(ServiceParamColumnsMixin):
         self._state_manager = state_manager
         self._current_plugin_editing: Optional[str] = None
         self._current_set_definition: Optional[Dict[str, Any]] = None
+        # 10.08.2026 (Bugfix, Varianten-Params): Wird ein Clone-Knoten
+        # (Preset/Variante) editiert, haelt dieses Feld das Preset-Dict aus
+        # indicator_presets - _save_plugin_params schreibt dann in das
+        # Preset statt in global_settings (plugin_params_<pid>).
+        self._current_preset_editing: Optional[Dict[str, Any]] = None
         #: Speichern-Button des Dialogs (wird nach dem UI-Aufbau gesetzt).
         self.btn_save_params: Optional[QPushButton] = None
 
@@ -263,6 +269,32 @@ class _DialogParamHost(ServiceParamColumnsMixin):
         cfg = next(iter(services.values()), None)
         if not isinstance(cfg, dict):
             return False
+        # 10.08.2026 (Bugfix, Varianten-Params): Im Clone-/Preset-Modus wird
+        # in indicator_presets gespeichert (eigene Parameter je Variante)
+        # statt in global_settings (plugin_params_<pid>).
+        preset = self._current_preset_editing
+        if isinstance(preset, dict):
+            indicator_id = str(preset.get("indicator_id") or "")
+            preset_name = str(preset.get("preset_name") or "Default")
+            if not indicator_id:
+                return False
+            try:
+                self._state_manager.save_indicator_preset(
+                    indicator_id, preset_name,
+                    dict(cfg.get("params") or {}),
+                    plugin_id=plugin_id,
+                    version=str(cfg.get("version")
+                                or preset.get("version") or "0.0.0"),
+                    is_active_batch=bool(preset.get("is_active_batch")),
+                    doc_log=str(preset.get("doc_log") or ""),
+                )
+            except Exception as e:
+                print(f"WARN [ServiceSelectorDialog] Varianten-Parameter "
+                      f"nicht gespeichert: {e}")
+                return False
+            self._set_param_actions_visible(False)
+            event_bus.service_set_changed.emit()
+            return True
         description = str(cfg.get("description") or "")
         desc_ctrl = self._service_desc_controls.get(plugin_id)
         if desc_ctrl is not None:
@@ -356,11 +388,17 @@ class ServiceSelectorDialog(QDialog):
             model=self.model,
             parent=self,
         )
-        # Punkt 4: Die BREITE DES TREES IST FIX (TREE_DEFAULT_WIDTH) – beim
-        # manuellen Vergroessern des Fensters bleibt der Tree stehen und nur
-        # die Parameter-Box waechst mit (Punkt 3).
-        self.selector.setFixedWidth(TREE_DEFAULT_WIDTH)
-        body.addWidget(self.selector, 0)
+        # 10.08.2026 (Bugfix, UI-Splitter): Der Tree ist NICHT mehr starr
+        # fixiert - er liegt zusammen mit dem Parameter-Panel in einem
+        # QSplitter, dessen Handle der Anwender mit der Maus frei verschieben
+        # kann (Klick-Ergonomie, Punkt 3). Nur die Mindestbreite verhindert
+        # das Kollabieren; TREE_DEFAULT_WIDTH ist die Startgroesse.
+        self.selector.setMinimumWidth(180)
+
+        self._splitter = QSplitter(Qt.Horizontal)
+        self._splitter.addWidget(self.selector)
+        self._splitter.setStretchFactor(0, 0)
+        self._splitter.setCollapsible(0, False)
 
         panel = QWidget(self)
         panel_layout = QVBoxLayout(panel)
@@ -397,7 +435,11 @@ class ServiceSelectorDialog(QDialog):
             "Speichert die Parameter des editierbaren Standalone-Services "
             "(plugin_params_<id>) inkl. EventBus-Sync (E-3).")
         panel_layout.addWidget(self.btn_save_params)
-        body.addWidget(panel, 2)
+        self._splitter.addWidget(panel)
+        self._splitter.setStretchFactor(1, 1)
+        self._splitter.setCollapsible(1, False)
+        self._splitter.setSizes([TREE_DEFAULT_WIDTH, 620])
+        body.addWidget(self._splitter, 1)
         root.addLayout(body, 1)
 
         # --- Aktions-Zeile unten ---
@@ -423,6 +465,12 @@ class ServiceSelectorDialog(QDialog):
             # eine Tree-Zeile (selection_details), NICHT den Checkboxen
             # (checked_changed-Verbindung entfernt – Punkte 1-7).
             tree.selection_details.connect(self._on_tree_selection_details)
+            # 10.08.2026 (Bugfix, Punkt 2): Check/Uncheck im ServicePicker
+            # muss die Resultatparameter-Dropdowns live aktualisieren - der
+            # Analytics-Filter (feature_ids) folgt den HAKEN (checked_changed),
+            # zusaetzlich zum Klick-Scope (selection_details). Das Panel
+            # selbst bleibt klickgesteuert (Punkte 1-7 unveraendert).
+            tree.checked_changed.connect(self._on_checked_changed)
             # 18.01.01 (E-4): Live-Verwaltung waehrend der Analytics-Session –
             # der MasterTree emittiert die CRUD-Signale; der Dialog fuehrt
             # sie ueber die ServiceSetRepository aus (Set anlegen/umbenennen/
@@ -1305,6 +1353,25 @@ class ServiceSelectorDialog(QDialog):
     # Read-Only-Parameter-Panel (Punkte 1-3: horizontal, 2-Spalten-Default,
     # Fensterbreite == rechte Kante der Parameter-Box)
     # ------------------------------------------------------------------
+    @Slot()
+    def _on_checked_changed(self) -> None:
+        """Live-Filter bei Checkbox-Aenderungen im Picker (10.08.2026).
+
+        Ein An-/Abhaken aktualisiert sofort die Datenquellen des
+        AnalyticsWindow (selection_ids_requested -> set_feature_ids) -
+        dadurch erneuern sich auch die Resultatparameter-Dropdowns
+        (heatmap field/agg etc.). Das Read-Only-Panel folgt weiterhin der
+        GEKLICKTEN Zeile (Punkte 1-7), nicht den Haken.
+        """
+        tree = self.selector.master_tree
+        if tree is None:
+            return
+        try:
+            ids = list(tree.checked_feature_ids() or [])
+        except (RuntimeError, AttributeError):
+            return
+        self.selection_ids_requested.emit(ids)
+
     def _on_tree_selection_details(self, node_type: str, set_id: str,
                                    service_id: str, plugin_id: str) -> None:
         """Slot fuer `MasterTree.selection_details` (Mausklick in einer Zeile).
@@ -1436,6 +1503,23 @@ class ServiceSelectorDialog(QDialog):
         if node_type in (TYPE_PLUGIN, TYPE_CLONE) and plugin_id:
             # 20.04 (Q7): Clone-Zeilen zeigen wie Plugin-Zeilen den
             # Standalone-Service (feature_id = plugin_id des Parents).
+            # 10.08.2026 (Bugfix, Varianten-Params): Zusaetzlich werden die
+            # presetspezifischen Parameter (indicator_presets) mitgegeben -
+            # das Panel zeigt die EIGENEN Parameter der Variante (service_id
+            # traegt hier den instance_hash, MasterTree._emit_selection_-
+            # details), nicht die globalen Standalone-Params.
+            if node_type == TYPE_CLONE:
+                preset = self._find_preset_for_hash(
+                    plugin_id, service_id)
+                if preset is not None:
+                    return [{
+                        "node_type": TYPE_PLUGIN,
+                        "set_id": "",
+                        "instance_id": "",
+                        "plugin_id": str(plugin_id),
+                        "preset_params": dict(preset.get("params") or {}),
+                        "preset": preset,
+                    }]
             return [{
                 "node_type": TYPE_PLUGIN,
                 "set_id": "",
@@ -1485,6 +1569,7 @@ class ServiceSelectorDialog(QDialog):
         host = self._param_host
         host._current_plugin_editing = None
         host._current_set_definition = None
+        host._current_preset_editing = None
         host._set_param_actions_visible(False)
         entries = list(entries or [])
         if not entries:
@@ -1507,6 +1592,16 @@ class ServiceSelectorDialog(QDialog):
             else:
                 iid = pid
                 cfg = host._plugin_config(pid)
+                # 10.08.2026 (Bugfix, Varianten-Params): presetspezifische
+                # Parameter ueberschreiben die Registry-/Standalone-Defaults.
+                preset_params = entry.get("preset_params")
+                if isinstance(preset_params, dict) and preset_params:
+                    merged = dict(cfg.get("params") or {})
+                    merged.update(preset_params)
+                    cfg["params"] = merged
+                # Preset fuer den Save-Pfad merken (indicator_presets statt
+                # global_settings).
+                host._current_preset_editing = entry.get("preset")
             editable = bool(editable_plugin) and pid == editable_plugin
             try:
                 box = host._build_service_column(iid, pid, cfg)
@@ -1624,9 +1719,24 @@ class ServiceSelectorDialog(QDialog):
         `showEvent` + QTimer erneut angestossen (stabile Layout-Geometrie).
         """
         self.layout().activate()
-        panel_right = self.param_panel.geometry().right()  # dialog-relativ
-        margins_right = self.layout().contentsMargins().right()
-        target = panel_right + margins_right + 1
+        # 10.08.2026 (Bugfix, UI-Splitter): Das Panel liegt jetzt in einem
+        # QSplitter - die rechte Kante muss dialog-relativ bestimmt werden
+        # (mapTo statt geometry(), dessen Eltern-System der Splitter ist).
+        # Das Panel ist das rechte Splitter-Widget; target = Tree-Breite +
+        # Handle + Panel-Minimum + Margins waechst mit dem Inhalt mit.
+        splitter = getattr(self, "_splitter", None)
+        if splitter is not None:
+            margins = self.layout().contentsMargins()
+            tree_w = self.selector.size().width()
+            handle = splitter.handleWidth()
+            panel_min = max(self.param_panel.minimumWidth(),
+                            self.param_panel.sizeHint().width())
+            target = (margins.left() + tree_w + handle + panel_min
+                      + margins.right() + 1)
+        else:
+            panel_right = self.param_panel.geometry().right()  # dialog-relativ
+            margins_right = self.layout().contentsMargins().right()
+            target = panel_right + margins_right + 1
         target = max(target, self.minimumWidth())
         if self.width() < target:
             self.resize(target, self.height())

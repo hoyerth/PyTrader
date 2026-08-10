@@ -534,3 +534,107 @@ Schwaechen im MasterTree-Varianten-Konzept (20.04):
   `srv_swing_volume_profile` -> 'Default'/'Default (Kopie)' mit
   `exec=10.08.26`).
 * `py_compile` + CRLF-Konsistenz (0 lone LF) aller geaenderten Dateien.
+
+---
+
+## 8d. Implementierungs-Log - Bugfix UI-Splitter/Dropdown/Save-Restore-Pipeline (10.08.2026)
+
+**Problem (User-Bugreport 10.08.2026, Runden 2-4):** Sechs Punkte aus den
+Analytics-UI-Bugfix-Runden nach 20.04 (Varianten-Params, Dropdown-Hitbox,
+Splitter, Save-Collapse, Slider, Log-Hoehe) sowie vier Punkte der
+Save/Restore-Pipeline (nested heatmap, Picker-Live-Filter, UI-Sync nach
+Restore, Profil-Restore).
+
+### Runde 2: Varianten-Params, Dropdown-Hitbox, UI-Splitter
+
+* **Bug 1 (Varianten-Params):** Klick auf einen Clone-Knoten (Preset/
+  Variante) lud die GLOBALEN Standalone-Parameter statt der
+  presetspezifischen Params; Save schrieb in global_settings statt in das
+  Preset (indicator_presets).
+  * `serviceui/service_win.py`: `_current_preset_editing`,
+    `_load_clone_editor()` (Clone-Klick -> presetparams laden), Save via
+    `save_indicator_preset`.
+  * `serviceui/service_selector_dialog.py`: `_entries_for_scope` liefert
+    `preset_params` + `preset`; `_DialogParamHost._save_plugin_params`
+    Preset-Branch (schreibt in indicator_presets statt
+    plugin_params_<id>, is_active_batch/doc_log bleiben erhalten);
+    `_current_preset_editing` im Host + Ruecksetz im Panel-Rebuild.
+
+* **Bug 2 (CheckableComboBox-Hitbox):** Klick auf die LineEdit-Flaeche der
+  CheckableComboBox oeffnete das Popup nicht (nur Pfeil/Rahmen).
+  `analytics/ui/common.py`: `lineEdit().installEventFilter(self)`,
+  Event-Filter (LineEdit-Klick togglet das Popup) +
+  `mousePressEvent`-Override (Box/Rahmen togglet ebenfalls).
+
+* **Bug 3 (UI-Splitter):** Tree/Sidebar waren starr fixiert
+  (`setFixedWidth(300)` im Picker, `setFixedWidth(150)` im AnalyticsWindow).
+  `service_selector_dialog.py`: `_splitter` (QSplitter, Tree links mit
+  minWidth 180, Panel rechts, Stretch-Faktoren 0/1, nicht kollabierbar)
+  statt `setFixedWidth`; `_fit_dialog_width` misst die rechte Kante
+  splitter-relativ (Tree-Breite + Handle + Panel-Minimum).
+  `analytics/ui/analytics_win.py`: `_body_splitter` (Sidebar minWidth 120 +
+  Seiten-Stack, `setSizes([150, 1200])`).
+
+### Runde 3: Save-Collapse, Slider, Log-Hoehe
+
+* **Punkt 1 (Save klappt Knoten zu):** Nach einem Speichern (EventBus-
+  Refresh) kollabierte jeder zugeklappte Plugin-Knoten mit Clones.
+  `serviceui/master_tree.py`: `_collect_expanded_state`/`_apply_expanded_
+  state` tracken jetzt auch `TYPE_PLUGIN`-Knoten MIT Kindern
+  (`("plugin", plugin_id)`) - Expansion bleibt ueber Neuaufbauten erhalten.
+
+* **Punkt 3 (Slider service_win):** Das ServiceWindow war mit
+  `setMinimumWidth(960)` zu breit. `serviceui/service_win.py`:
+  `setMinimumWidth(520)` statt 960, initiale Splitter-Sizes
+  `main_splitter.setSizes([460, 820])`.
+  `serviceui/param_columns.py`: Grow-only-`setSizes` (beim Panel-Rebuild
+  waechst das Panel nur, der Tree bleibt an der User-Position).
+
+* **Punkt 4 (Log-Hoehe):** Das Scroll-Log war zwei Zeilen zu hoch.
+  `serviceui/service_win.py`: `lineSpacing() * 2 + 12` statt `* 4 + 12`.
+
+### Runde 4: Save/Restore-Pipeline (4 Punkte)
+
+**Analyse-Ergebnis:** Die Punkte 1 und 4 (nested heatmap-Dict aufloesen +
+`params_restored` emittieren) waren bereits im ViewModel implementiert
+(Commit `7ffc1f7` - `_apply_heatmap_section` in `restore_workspace()` UND
+`_apply_profile()`, Emission `params_restored` in beiden Pfaden). Keine
+Aenderung noetig - nur verifiziert.
+
+* **Punkt 2 (ECHTER BUG - Check/Uncheck im ServicePicker):** Die
+  `checked_changed`-Verbindung wurde in Bugfix-Runde 3 (06.08.2026)
+  entfernt ("Punkte 1-7"), damit das Read-Only-Panel dem Klick folgt.
+  Dadurch folgte aber AUCH der Live-Filter nicht mehr den Haken - die
+  Resultatparameter-Dropdowns (heatmap field/agg) aktualisierten sich bei
+  Checkbox-Aenderungen nicht. `serviceui/service_selector_dialog.py`:
+  Verbindung `tree.checked_changed` -> neuer Handler `_on_checked_changed`,
+  der `selection_ids_requested(checked_feature_ids())` emittiert ->
+  AnalyticsWindow `_on_picker_ids_selected` -> `set_feature_ids()`.
+  Das Read-Only-Panel bleibt klickgesteuert (Punkte 1-7 unveraendert).
+
+* **Punkt 3 (UI-Sync nach Restore):** `heatmap_widget.py` verband
+  `params_restored` -> `_sync_from_params` bereits, aber die
+  Fenster-Ebene (AnalyticsWindow) hatte keine Verbindung.
+  `analytics/ui/analytics_win.py`: `_wire_view_model()` verbindet
+  `vm.params_restored` -> neuer Handler `_sync_ui_from_restored_params`
+  (Sidebar-Seite via `workspace_layout.page_index` unter blockSignals,
+  aktuelle Page falls `_sync_from_params` existiert, danach
+  `_sync_profile_filters()` + `_sync_service_filter_button()`).
+
+### Verifikation (headless, keine UI-Tests)
+
+* `test/check_ui3_bugfix.py`: **19/19 PASS** (Save-Collapse-Fix
+  TYPE_PLUGIN-Expansion, service_win-Slider 520/Grow-only, Log-Hoehe
+  2 Zeilen).
+* `test/check_variant_bugfix.py`: **17/17 PASS** (per-Hash-Daten,
+  Clone-Labels, Rename-Persistenz - Runde 1).
+* `test/check_variant_params_bugfix.py`: **29/29 PASS** (Varianten-Params,
+  CheckableComboBox-Hitbox, QSplitter in Picker/AnalyticsWindow).
+* `test/check_restore_pipeline_bugfix.py` (neu): **27/27 PASS** - P1/P4
+  (nested heatmap + params_restored in restore_workspace/_apply_profile),
+  P2 (Anhaken/Abhaken -> selection_ids_requested mit checked_feature_ids),
+  P3 (params_restored -> Sidebar folgt page_index, Datenquellen-Button
+  synchron).
+* `test/check_2004_ctxmenu.py`: **34/34 PASS**, `test/check_2004_restore.py`:
+  **4/4 PASS** (Regression Restore-Pipeline).
+* `py_compile` aller geaenderten Dateien + CRLF-Konsistenz.

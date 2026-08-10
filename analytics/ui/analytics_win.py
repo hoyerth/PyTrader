@@ -27,7 +27,7 @@ Aufgaben (15.03-Spezifikation):
 
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import QTimer, Slot
+from PySide6.QtCore import QTimer, Qt, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSplitter,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -320,8 +321,11 @@ class AnalyticsWindow(PersistentWindow):
 
         # --- Body: Sidebar + Seiten (QStackedWidget) ---
         body = QHBoxLayout()
+        # 10.08.2026 (Bugfix, UI-Splitter): Sidebar (links) und Seiten-Stack
+        # (rechts) liegen in einem QSplitter - der Slider ist mit der Maus
+        # frei verschiebbar (statt starrer 150px-Fixbreite + Stretch).
         self.sidebar = QListWidget()
-        self.sidebar.setFixedWidth(150)
+        self.sidebar.setMinimumWidth(120)
         self.pages_stack = QStackedWidget()
         self.table_page = TablePage()
         self.heatmap_page = HeatmapPage()
@@ -335,8 +339,15 @@ class AnalyticsWindow(PersistentWindow):
             self.sidebar.addItem(QListWidgetItem(label))
         self.sidebar.setCurrentRow(0)
 
-        body.addWidget(self.sidebar)
-        body.addWidget(self.pages_stack, 1)
+        self._body_splitter = QSplitter(Qt.Horizontal)
+        self._body_splitter.addWidget(self.sidebar)
+        self._body_splitter.addWidget(self.pages_stack)
+        self._body_splitter.setStretchFactor(0, 0)
+        self._body_splitter.setStretchFactor(1, 1)
+        self._body_splitter.setCollapsible(0, False)
+        self._body_splitter.setCollapsible(1, False)
+        self._body_splitter.setSizes([150, 1200])
+        body.addWidget(self._body_splitter, 1)
         root.addLayout(body, 1)
 
         self.setCentralWidget(central)
@@ -427,6 +438,37 @@ class AnalyticsWindow(PersistentWindow):
         self.btn_data_sources.setText(
             f"[ 🛠️ Datenquellen: {', '.join(names)} ▾ ]")
 
+    @Slot()
+    def _sync_ui_from_restored_params(self) -> None:
+        """Synchronisiert die Fenster-UI nach `params_restored`.
+
+        10.08.2026 (Bugfix, Punkt 3): `params_restored` feuert nach einem
+        Workspace-Restore UND nach einem Profilwechsel (_apply_profile).
+        Hier wird die Fenster-Ebene nachgezogen: Sidebar-Seite (sofern der
+        Workspace eine page_index hat), die aktuelle Page (falls sie eine
+        _sync_from_params-Methode anbietet) und die Filterleiste
+        (Symbol/Timeframe/Datenquellen-Button). Die Unterseiten syncen ihre
+        Combos ueber eigene params_restored-Verbindungen.
+        """
+        try:
+            page_index = int((self._vm.workspace_layout or {}).get(
+                "page_index", -1))
+            if 0 <= page_index < self.pages_stack.count():
+                if self.sidebar.currentRow() != page_index:
+                    self.sidebar.blockSignals(True)
+                    self.sidebar.setCurrentRow(page_index)
+                    self.sidebar.blockSignals(False)
+            page = self.pages_stack.currentWidget()
+            if page is not None and hasattr(page, "_sync_from_params"):
+                try:
+                    page._sync_from_params()
+                except (RuntimeError, AttributeError):
+                    pass
+        except (RuntimeError, AttributeError):
+            pass
+        self._sync_profile_filters()
+        self._sync_service_filter_button()
+
     # ------------------------------------------------------------------
     # MVVM + Steuerung verdrahten
     # ------------------------------------------------------------------
@@ -438,6 +480,13 @@ class AnalyticsWindow(PersistentWindow):
         vm.profiles_available.connect(self._on_profiles_available)
         vm.active_profile_changed.connect(self._on_active_profile_changed)
         vm.dirty_changed.connect(self._on_dirty_changed)
+        # 10.08.2026 (Bugfix, Punkt 3): Der ViewModel emittiert
+        # params_restored nach restore_workspace() UND _apply_profile()
+        # (20.04-Timing-Fix) - die Fenster-Ebene wird synchronisiert
+        # (Sidebar-Seite + aktuelle Page + Filterleiste). Die Unterseiten
+        # (Heatmap-Widget) syncen ihre Combos ueber eigene Verbindungen.
+        if hasattr(vm, "params_restored"):
+            vm.params_restored.connect(self._sync_ui_from_restored_params)
         vm.busy_changed.connect(self._on_busy_changed)
         vm.query_failed.connect(self._on_query_failed)
         # 20.01 (Graceful Degradation): fehlende Services -> Warn-Label.

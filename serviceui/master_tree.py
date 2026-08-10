@@ -1027,6 +1027,15 @@ class MasterTree(QTreeWidget):
                 elif node_type == TYPE_SET:
                     result.add(("set",
                                 str(item.data(0, ROLE_SET_ID) or "")))
+                elif node_type == TYPE_PLUGIN and item.childCount() > 0:
+                    # 10.08.2026 (Bugfix): Plugin-Parents mit Varianten/
+                    # Clones sind aufklappbare Knoten - ihre Expansion muss
+                    # ueber Rebuilds (data_changed -> _populate nach
+                    # Speichern/Umbenennen/Duplizieren) erhalten bleiben,
+                    # sonst klappt der Knoten zusammen. Nur ein Mausklick
+                    # auf den Knoten soll togglen.
+                    result.add(("plugin",
+                                str(item.data(0, ROLE_PLUGIN_ID) or "")))
         except (RuntimeError, AttributeError):
             pass
         return result
@@ -1052,6 +1061,10 @@ class MasterTree(QTreeWidget):
                               or key in self._expand_after_rebuild)
                 elif node_type == TYPE_SET:
                     key = ("set", str(item.data(0, ROLE_SET_ID) or ""))
+                    expand = key in expanded
+                elif node_type == TYPE_PLUGIN and item.childCount() > 0:
+                    key = ("plugin",
+                           str(item.data(0, ROLE_PLUGIN_ID) or ""))
                     expand = key in expanded
                 if expand:
                     item.setExpanded(True)

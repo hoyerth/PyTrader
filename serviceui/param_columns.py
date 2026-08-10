@@ -619,7 +619,16 @@ class ServiceParamColumnsMixin:
                     if w is not None:
                         hints.append(w.sizeHint().width())
                 if hints:
-                    splitter.setSizes(hints)
+                    # 10.08.2026 (Bugfix, Slider): setSizes nur WACHSEN -
+                    # eine vom Anwender verschobene Splitter-Position darf
+                    # ein Param-Box-Rebuild nicht zuruecksetzen. Wird der
+                    # Inhalt breiter als das aktuelle Panel, waechst das
+                    # Panel auf den Bedarf (Tree-Breite bleibt).
+                    current = splitter.sizes()
+                    if not current or sum(current) <= 0:
+                        splitter.setSizes(hints)
+                    elif hints[1] > current[1]:
+                        splitter.setSizes([current[0], hints[1]])
         except (RuntimeError, AttributeError):
             pass
         # 17.01.06 (Bugfix): Nach dem FINALEN Box-Resize (DeferredDelete +

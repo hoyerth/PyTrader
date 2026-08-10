@@ -95,6 +95,11 @@ class CheckableComboBox(QComboBox):
         # Pop-up offen halten: Mausklick auf den Viewport setzt das Flag,
         # `hidePopup()` unterdrueckt das Schliessen dann einmalig.
         self.view().viewport().installEventFilter(self)
+        # 10.08.2026 (Bugfix, Klick-Ergonomie): Bei setEditable(True) deckt
+        # die LineEdit-Flaeche den Grossteil der Box ab und schluckt Klicks
+        # (Textmarkierung/ignorieren) - der EventFilter oeffnet/schliesst das
+        # Popup bei Klick auf die GESAMTE Flaeche (Textfeld + Pfeil/Rahmen).
+        self.lineEdit().installEventFilter(self)
         self._model.itemChanged.connect(self._on_item_changed)
 
     # ------------------------------------------------------------------
@@ -113,12 +118,41 @@ class CheckableComboBox(QComboBox):
 
     def eventFilter(self, obj, event) -> bool:
         """Setzt das Popup-Flag bei Mausklicks auf den Popup-Viewport und
-        merkt sich den zuletzt geklickten Item-Index (20.03.03, Q5)."""
+        merkt sich den zuletzt geklickten Item-Index (20.03.03, Q5).
+
+        10.08.2026 (Bugfix, Klick-Ergonomie): Zusaetzlich wird die LineEdit-
+        Flaeche (editable ComboBox) abgedeckt - ein Linksklick dort oeffnet/
+        schliesst das Popup wie der Pfeil-Button statt Textmarkierung."""
+        if (obj is self.lineEdit()
+                and event.type() == QEvent.MouseButtonPress
+                and event.button() == Qt.LeftButton):
+            self._popup_click = False
+            if self.view().isVisible():
+                self.hidePopup()
+            else:
+                self.showPopup()
+            event.accept()
+            return True
         if (obj is self.view().viewport()
                 and event.type() == QEvent.MouseButtonRelease):
             self._popup_click = True
             self._last_click_index = self.view().indexAt(event.pos()).row()
         return super().eventFilter(obj, event)
+
+    def mousePressEvent(self, event) -> None:
+        """Oeffnet/Schliesst das Popup bei Klick auf die Box (10.08.2026).
+
+        Die LineEdit-Flaeche uebernimmt der eventFilter (editable ComboBox);
+        diese Methode deckt die restliche Box (Pfeil/Rahmen) ab."""
+        if event.button() == Qt.LeftButton:
+            self._popup_click = False
+            if self.view().isVisible():
+                self.hidePopup()
+            else:
+                self.showPopup()
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
     def last_click_index(self) -> int:
         """Row-Index des zuletzt geklickten Items (Q5, XOR-Aufloesung).
