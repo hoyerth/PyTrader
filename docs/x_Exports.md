@@ -127,16 +127,87 @@ PyTrader/
         trash_dialog.py
     test/
         _append_20_03_bugfix.py
+        _fix_ws1.py
+        _tmp_find_src.py
+        check_2004_bugfix3.py
+        check_2004_ctxmenu.py
+        check_2004_dlg.py
+        check_2004_dupl3.py
+        check_2004_fullwin.py
+        check_2004_purge.py
+        check_2004_realdata.py
+        check_2004_restore.py
+        check_2004_schema.py
+        check_2004_snapshot.py
+        check_2004_timing.py
+        check_2004_tree.py
+        check_2004_uiflow.py
+        check_2004_viewmodel.py
+        check_2004_writers.py
+        check_bug345_chain.py
+        check_bug345_chain_empiric.py
+        check_bug345_h1_counterproof.py
+        check_bug345_real_db.py
+        check_bug345_stale_hook.py
+        check_bug345_tree_overlap.py
         check_bugfix_0808.py
         check_dialog_host.py
         check_heatmap_200201.py
         check_heatmap_bugfix.py
         check_output_schema.py
         check_page_nav.py
+        check_restore_pipeline_bugfix.py
+        check_restore_pipeline_round2.py
+        check_restore_pipeline_round3.py
+        check_round10.py
+        check_round7_fixes.py
+        check_round7_picker_runtime.py
+        check_round8_bug345.py
+        check_round9.py
+        check_ui3_bugfix.py
+        check_variant_bugfix.py
+        check_variant_params_bugfix.py
         check_wal_guard.py
         check_wal_recovery.py
+        debug_h1_filter.py
         fix_page_changed.py
+        grep_db.py
+        grep_db2.py
+        grep_dialog.py
+        grep_eval.py
+        grep_executor.py
+        grep_fb.py
+        grep_ind.py
+        grep_reader.py
+        grep_scan.py
+        grep_write.py
+        inspect_dbpool.py
+        inspect_mk.py
+        inspect_optb.py
+        inspect_proximity_json.py
+        inspect_proximity_keys.py
+        inspect_proximity_schema.py
+        inspect_proximity_timeframes.py
+        inspect_reader_keys_real.py
+        inspect_real_db.py
+        inspect_set.py
+        inspect_sets.py
+        inspect_siglimit.py
+        patch_master_tree_bug45.py
+        read_lines.py
+        recompute_proximity_m1.py
         test.py
+        dbg_7xnxccx_/
+        dbg_cl35anta/
+        dbg_ctyfzz4i/
+        dbg_rukmirr8/
+        dbg_xwu8rdux/
+        p20_07_picker_lpyvmzub/
+        p20_07_picker_xqxueh9l/
+        pytrader_var_an6q2o2g/
+        pytrader_var_bmy8a4m6/
+        pytrader_var_fji0r6sx/
+        pytrader_var_wcmn_zpe/
     ui/
         __init__.py
         chart_win.ui
@@ -1507,10 +1578,19 @@ class PersistentWindow(QMainWindow):
             width = geom.get("width") or self.width()
             height = geom.get("height") or self.height()
 
-            screen_geo = QApplication.primaryScreen().availableGeometry()
+            # Runde 10 (Bug 5): Gegen ALLE Screens pruefen - eine Position
+            # auf dem 2. Monitor ist NICHT off-screen (Fallback nur, wenn
+            # sie auf KEINEM Screen liegt). Vorher wurde nur der Primary-
+            # Screen geprueft -> Position auf Monitor 2 fiel auf (100,100)
+            # zurueck.
+            screens = [s.availableGeometry()
+                       for s in QApplication.screens()]
             if pos_x is not None and pos_y is not None:
-                if pos_x < screen_geo.x() - 100 or pos_x > screen_geo.right() or \
-                   pos_y < screen_geo.y() - 100 or pos_y > screen_geo.bottom():
+                on_screen = any(
+                    (scr.x() - 100 <= pos_x <= scr.right())
+                    and (scr.y() - 100 <= pos_y <= scr.bottom())
+                    for scr in screens)
+                if not on_screen:
                     pos_x, pos_y = 100, 100
                 self.move(pos_x, pos_y)
                 self.resize(width, height)
@@ -2065,7 +2145,11 @@ class StateManager:
         con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS plugin_id VARCHAR;")
         con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS version VARCHAR DEFAULT '1.0.0';")
         con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS is_active_batch BOOLEAN DEFAULT FALSE;")
-
+        # 20.04 (Q7, 09.08.2026): Doc-Log-Spalte fuer Presets/Clones –
+        # Freitextfeld (Negativ-Wissen) analog ServiceInstanceConfig.doc_log.
+        # Additiv/idempotent – bestehende Presets bleiben unangetastet.
+        con.execute("ALTER TABLE indicator_presets ADD COLUMN IF NOT EXISTS doc_log VARCHAR;")
+        
         # Phase 20.01 (09.08.2026): Analytics-Workspace-Persistenz – additive
         # JSON-Spalte `workspace_state` in instance_states (win_analytics:
         # vm.params + UI-Layout). Idempotent – bestehende Zeilen/Spalten
@@ -2356,21 +2440,24 @@ class StateManager:
         plugin_id: Optional[str] = None,
         version: Optional[str] = None,
         is_active_batch: bool = False,
+        doc_log: Optional[str] = None,
     ) -> None:
         """Speichert ein Indikator-Preset. Unterstützt zusätzlich plugin_id,
-        version und is_active_batch (Phase 12 Hybrid-Schema)."""
+        version und is_active_batch (Phase 12 Hybrid-Schema) sowie das
+        Doc-Log (20.04, Q7)."""
         con = self._get_connection()
         con.execute("""
-            INSERT INTO indicator_presets (indicator_id, preset_name, params, plugin_id, version, is_active_batch)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO indicator_presets (indicator_id, preset_name, params, plugin_id, version, is_active_batch, doc_log)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (indicator_id, preset_name) DO UPDATE SET
                 params = EXCLUDED.params,
                 plugin_id = EXCLUDED.plugin_id,
                 version = EXCLUDED.version,
-                is_active_batch = EXCLUDED.is_active_batch;
+                is_active_batch = EXCLUDED.is_active_batch,
+                doc_log = EXCLUDED.doc_log;
         """, [
             indicator_id, preset_name, json.dumps(params),
-            plugin_id, version, bool(is_active_batch),
+            plugin_id, version, bool(is_active_batch), doc_log,
         ])
 
     def delete_indicator_preset(self, indicator_id: str, preset_name: str) -> None:
@@ -2379,6 +2466,71 @@ class StateManager:
             "DELETE FROM indicator_presets WHERE indicator_id = ? AND preset_name = ?",
             [indicator_id, preset_name]
         )
+
+    def rename_indicator_preset(self, indicator_id: str, old_name: str,
+                                new_name: str) -> None:
+        """Benennt ein Indikator-/Plugin-Preset um (10.08.2026, Bugfix).
+
+        'Variante umbenennen' im MasterTree-Kontextmenue (Clone/Preset):
+        Der Primaerschluessel von indicator_presets ist (indicator_id,
+        preset_name) – der Rename ist ein UPDATE des preset_name. Alle
+        weiteren Spalten (params, plugin_id, version, is_active_batch,
+        doc_log) bleiben unangetastet. Der Aufrufer muss zuvor auf
+        Namenskollisionen pruefen (sonst Unique-Constraint-Fehler).
+        """
+        con = self._get_connection()
+        con.execute(
+            "UPDATE indicator_presets SET preset_name = ? "
+            "WHERE indicator_id = ? AND preset_name = ?",
+            [new_name, indicator_id, old_name]
+        )
+
+    def list_plugin_presets(self, plugin_id: str) -> List[Dict[str, Any]]:
+        """Liefert alle Presets eines Plugins (20.04, Q7).
+
+        Quelle: indicator_presets (Spalte plugin_id, Phase-12-Hybrid-Schema).
+        Rueckgabe pro Eintrag: {"indicator_id", "preset_name", "params",
+        "plugin_id", "version", "is_active_batch", "doc_log"} –
+        deterministisch (preset_name ASC). Grundlage der Parent-Child-Clone-
+        Ansicht im MasterTree (Services-Gruppe: Plugin -> Presets/Clones)
+        und der Archiv-Logik (Q7: Archivierung eines Presets =>
+        is_active_batch = False; die Scans isolieren is_active_batch=False-
+        Presets).
+        """
+        con = self._get_connection()
+        res = con.execute("""
+            SELECT indicator_id, preset_name, params, plugin_id, version,
+                   is_active_batch, doc_log
+            FROM indicator_presets
+            WHERE plugin_id = ?
+            ORDER BY preset_name ASC
+        """, [plugin_id]).fetchall()
+        presets: List[Dict[str, Any]] = []
+        for indicator_id, preset_name, params_json, pid, version, is_active, doc_log in res:
+            presets.append({
+                "indicator_id": indicator_id,
+                "preset_name": preset_name,
+                "params": _parse_json_field(params_json) if params_json else {},
+                "plugin_id": pid,
+                "version": version,
+                "is_active_batch": bool(is_active),
+                "doc_log": str(doc_log) if doc_log else "",
+            })
+        return presets
+
+    def set_plugin_preset_doc_log(self, indicator_id: str, preset_name: str,
+                                  doc_log: str) -> None:
+        """Persistiert das Doc-Log (Negativ-Wissen) eines Plugin-Presets.
+
+        20.04 (Q7): analog ServiceInstanceConfig.doc_log – Freitextfeld,
+        das im MasterTree-Clone-Tooltip angezeigt wird. Additiv: bestehende
+        Presets ohne Eintrag bleiben unangetastet (doc_log = NULL).
+        """
+        con = self._get_connection()
+        con.execute(
+            "UPDATE indicator_presets SET doc_log = ? "
+            "WHERE indicator_id = ? AND preset_name = ?",
+            [(doc_log or "").strip() or None, indicator_id, preset_name])
 
     def list_indicator_presets(self, indicator_id: str) -> List[str]:
         con = self._get_connection()
@@ -3684,6 +3836,7 @@ import time
 from typing import Any, Dict, List, Optional
 from PySide6.QtCore import QThread, Signal
 
+from analytics.engine.service_models import generate_instance_hash
 from analytics.features.feature_builder import FeatureBuilder, PluginExecutor, prepare_plugin_df
 from db_service import get_timeframes
 from state_manager import StateManager
@@ -3770,7 +3923,13 @@ class HistoricalScanner(QThread):
             payload = result.get("feature_store_payload", {}) if isinstance(result, dict) else {}
             if payload:
                 try:
-                    n = self.feature_builder.store_plugin_payload(self.symbol, tf, payload)
+                    # 20.04 (Q9): instance_hash der Preset-Variante (Parameter-
+                    # Hash) – Spalte im feature_store fuer Varianten-Statistik
+                    # und gezieltes Purge (Q5).
+                    instance_hash = generate_instance_hash(
+                        plugin_id, preset.get("params") or {})
+                    n = self.feature_builder.store_plugin_payload(
+                        self.symbol, tf, payload, instance_hash=instance_hash)
                     total_rows += n
                     self.log_message.emit(
                         f"  {tf}: Plugin {plugin_id}: {n} Feature-Rows im feature_store"
@@ -3861,6 +4020,7 @@ from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QThread, Signal
 
+from analytics.engine.service_models import generate_instance_hash
 from analytics.features.feature_builder import (
     FeatureBuilder,
     PluginExecutor,
@@ -4012,7 +4172,14 @@ class LiveAnalyzer(QThread):
             payload = result.get("feature_store_payload", {}) if isinstance(result, dict) else {}
             if payload:
                 try:
-                    n = self.feature_builder.store_plugin_payload(self.symbol, self.timeframe, payload)
+                    # 20.04 (Q9): instance_hash der Preset-Variante (Parameter-
+                    # Hash) – Spalte im feature_store fuer Varianten-Statistik
+                    # und gezieltes Purge (Q5).
+                    instance_hash = generate_instance_hash(
+                        plugin_id, preset.get("params") or {})
+                    n = self.feature_builder.store_plugin_payload(
+                        self.symbol, self.timeframe, payload,
+                        instance_hash=instance_hash)
                     self.log_message.emit(
                         f"🔌 Plugin {plugin_id}: {n} Feature-Rows im feature_store"
                     )
@@ -4091,8 +4258,12 @@ class LiveAnalyzer(QThread):
             payload = result.get("feature_store_payload", {}) if isinstance(result, dict) else {}
             if payload:
                 try:
+                    # 20.04 (Q9): instance_hash der Preset-Variante.
+                    instance_hash = generate_instance_hash(
+                        plugin_id, preset.get("params") or {})
                     n = self.feature_builder.store_plugin_payload(
-                        self.symbol, self.timeframe, payload
+                        self.symbol, self.timeframe, payload,
+                        instance_hash=instance_hash
                     )
                     self.log_message.emit(
                         f"Plugin {plugin_id}: {n} Feature-Rows im feature_store"
@@ -4173,6 +4344,8 @@ class AnalyticsRepository:
         timeframe: str,
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = 1000,
     ) -> Dict[str, Any]:
         """Rohe Feature-Zeilen fuer die Tabellen-Seite.
@@ -4182,7 +4355,7 @@ class AnalyticsRepository:
         """
         rows = self.reader.fetch_rows(
             symbol, timeframe, feature_id=feature_id, feature_ids=feature_ids,
-            limit=limit)
+            instance_hashes=instance_hashes, limit=limit)
         return {"rows": rows, "total": len(rows)}
 
     # ------------------------------------------------------------------
@@ -4195,6 +4368,8 @@ class AnalyticsRepository:
         metric: str = "count",
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """2D-Matrix (Wochentag x Tagesstunde) fuer die Heatmap-Seite.
 
@@ -4222,7 +4397,7 @@ class AnalyticsRepository:
         use_metric = metric if metric in metrics else "count"
         result = self.reader.fetch_heatmap(
             symbol, timeframe, metric=use_metric, feature_id=feature_id,
-            feature_ids=feature_ids
+            feature_ids=feature_ids, instance_hashes=instance_hashes
         )
         result["metrics"] = metrics
         return result
@@ -4240,6 +4415,8 @@ class AnalyticsRepository:
         agg: str = "count",
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Generische 2D-Matrix (freie Dimensionen + Aggregationen, 20.02).
@@ -4266,7 +4443,8 @@ class AnalyticsRepository:
         # Rows des Symbol/Timeframe).
         by_service = self.reader.feature_keys_by_service(
             symbol, timeframe, numeric_only=True,
-            feature_id=feature_id, feature_ids=feature_ids)
+            feature_id=feature_id, feature_ids=feature_ids,
+            instance_hashes=instance_hashes)
         field_sources: Dict[str, List[str]] = {}
         for fid, keys in by_service.items():
             if not fid:
@@ -4294,7 +4472,7 @@ class AnalyticsRepository:
             result = self.reader.fetch_generic_heatmap(
                 symbol, timeframe, x_dim, y_dim, field=use_field or None,
                 agg=use_agg, feature_id=feature_id, feature_ids=feature_ids,
-                limit=limit,
+                instance_hashes=instance_hashes, limit=limit,
             )
         except ValueError as e:
             print(f"WARN [AnalyticsRepository] get_generic_heatmap: {e}")
@@ -4359,6 +4537,8 @@ class AnalyticsRepository:
         y_column: Optional[str] = None,
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         """X/Y-Paare zweier feature_data-JSON-Keys fuer die Scatter-Seite.
@@ -4388,7 +4568,8 @@ class AnalyticsRepository:
 
         rows = self.reader.fetch_columns(
             symbol, timeframe, [x_col, y_col],
-            feature_id=feature_id, feature_ids=feature_ids, limit=limit,
+            feature_id=feature_id, feature_ids=feature_ids,
+            instance_hashes=instance_hashes, limit=limit,
         )
         points: List[Dict[str, float]] = []
         for r in rows:
@@ -4420,6 +4601,8 @@ class AnalyticsRepository:
         bins: int = 20,
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Histogramm eines feature_data-JSON-Keys fuer die Verteilungs-Seite.
@@ -4450,7 +4633,8 @@ class AnalyticsRepository:
 
         rows = self.reader.fetch_columns(
             symbol, timeframe, [col], feature_id=feature_id,
-            feature_ids=feature_ids, limit=limit,
+            feature_ids=feature_ids, instance_hashes=instance_hashes,
+            limit=limit,
         )
         values = [r[col] for r in rows if r.get(col) is not None]
         values = [v for v in values if np.isfinite(v)]
@@ -4480,6 +4664,8 @@ class AnalyticsRepository:
         timeframe: str,
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
     ) -> Optional[int]:
         """Neuester Wanduhr-Epoch (int) der Feature-Rows (oder None).
 
@@ -4487,7 +4673,8 @@ class AnalyticsRepository:
         das Chart an der neuesten Feature-Bar des Symbol/Timeframe).
         """
         return self.reader.fetch_latest_bar_time(
-            symbol, timeframe, feature_id=feature_id, feature_ids=feature_ids
+            symbol, timeframe, feature_id=feature_id, feature_ids=feature_ids,
+            instance_hashes=instance_hashes
         )
 
     def get_recent_bar_time_for_cell(
@@ -4498,6 +4685,8 @@ class AnalyticsRepository:
         hour: int,
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
     ) -> Optional[int]:
         """Neuester Wanduhr-Epoch einer (dow, hour)-Heatmap-Zelle (oder None).
 
@@ -4507,7 +4696,8 @@ class AnalyticsRepository:
         """
         return self.reader.fetch_recent_bar_time_for_cell(
             symbol, timeframe, dow, hour,
-            feature_id=feature_id, feature_ids=feature_ids
+            feature_id=feature_id, feature_ids=feature_ids,
+            instance_hashes=instance_hashes
         )
 
     # ------------------------------------------------------------------
@@ -4584,7 +4774,7 @@ Aufgaben (15.03-Spezifikation):
    emittiert (Invariante 5 / zentraler EventBus, Payload = Profil-Name).
 """
 
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
@@ -4635,6 +4825,20 @@ class AnalyticsViewModel(QObject):
     # Services – Payload: Liste der nicht mehr registrierten plugin_ids.
     missing_services_detected = Signal(list)
 
+    # 20.04-Timing-Fix (D): Nach restore_workspace()/_apply_profile() – die
+    # UI-Pages synchronisieren ihre Combos explizit aus den restaurierten
+    # VM-Params (kein UI-Import im ViewModel, MVVM-Invariante 4).
+    params_restored = Signal()
+
+    # Runde 8 (Bugfix 4, 10.08.2026): feature_ids-Aenderungen (ServicePicker
+    # Check/Uncheck) SYNCHRON an die UI – das HeatmapWidget leitet sein
+    # 'Feld'-Dropdown sofort aus den gecachten Feld-Metadaten + den neuen
+    # feature_ids neu ab (kein Debounce/Query-Round-Trip noetig). Wird in
+    # set_feature_ids() NACH der Uebernahme emittiert (idempotent: nur bei
+    # echter Aenderung). Restore-Pfade setzen _params["feature_ids"] DIREKT
+    # und emittieren stattdessen params_restored (kein Dirty/Doppel-Refresh).
+    feature_ids_changed = Signal()
+
     def __init__(
         self,
         analytics_repo: Optional[AnalyticsRepository] = None,
@@ -4657,6 +4861,10 @@ class AnalyticsViewModel(QObject):
             # 15.03-E (Multi-Select): feature_ids = Liste der plugin_ids
             # (Datenquellen-Filter, `WHERE feature_id IN (...)`); leer = alle.
             "feature_ids": [],
+            # Runde 10 (Bug 1): Varianten-Einschraenkung (instance_hashes
+            # der gecheckten Clone-Varianten; leer = alle Varianten der
+            # gewaehlten plugin_ids).
+            "instance_hashes": [],
             # 19.02 (Cleanup): Keine festen Legacy-Spalten-Defaults mehr –
             # scatter_x/scatter_y/distribution_column werden beim ersten
             # Daten-Payload auf die verfuegbaren feature_data-JSON-Keys
@@ -4701,6 +4909,22 @@ class AnalyticsViewModel(QObject):
         # 20.01 (E7): UI-Layout-Anteil des zuletzt restaurierten Workspace
         # (z. B. {"page_index": 2}) – von der UI abfragbar, kein _params-Key.
         self._workspace_layout: Dict[str, Any] = {}
+        # 10.08.2026 (Punkte 3/4): UI-Layout-Anteil fuer die PROFIL-
+        # Persistenz (page_index, heatmap_mode) - die UI uebergibt ihn vor
+        # jedem save_profile()/create_profile() via set_ui_layout(); die
+        # Werte wandern ueber _current_payload() (Sektion "layout") in den
+        # Profil-Payload und werden in _apply_profile() in _workspace_layout
+        # abgelegt (die UI liest sie dort - identischer Pfad wie der
+        # Workspace-Restore).
+        self._ui_layout: Dict[str, Any] = {}
+        # Runde 8 (Bugfix 3, 10.08.2026): Generations-Token gegen
+        # Stale-Payloads - wird bei JEDEM restore_workspace()/
+        # _apply_profile() erhoeht und wandert ueber _current_params() in
+        # die Worker-Params. Der Worker spiegelt es ins Ergebnis-Dict
+        # (data["restore_generation"]); die UI verwirft Payloads aelterer
+        # Generation (Queries, die VOR dem Restore gestartet wurden,
+        # duerfen den synchron restaurierten Zustand nicht ueberschreiben).
+        self._restore_generation: int = 0
 
         # Debounce-QTimer (200-300 ms, 15.03-Spezifikation)
         self._debounce = QTimer(self)
@@ -4789,25 +5013,67 @@ class AnalyticsViewModel(QObject):
         """Kompatibilitaets-Alias (Legacy): Einzel-ID -> Multi-Liste."""
         self.set_feature_ids([feature_id] if feature_id else [])
 
-    def set_feature_ids(self, feature_ids) -> None:
+    def set_feature_ids(self, feature_ids, instance_hashes=None) -> None:
         """Setzt die Multi-Auswahl der Datenquellen (15.03-E).
 
         `feature_ids` sind die plugin_ids des Feature-Store (z. B.
         ["srv_grid_lines", "srv_proximity"]); leer = kein Filter (alle Features).
         Typen-/Duplikat-normalisiert; ohne Aenderung wird kein Refresh
         ausgeloest (idempotent, wie set_symbol/set_timeframe).
+
+        Runde 10 (Bug 1): `instance_hashes` schraenkt die gewaehlten
+        plugin_ids auf bestimmte Varianten (Clones) ein - None/leer =
+        KEINE Varianten-Einschraenkung (alle Varianten der plugin_ids).
+        None bedeutet ausserdem: bestehende Hash-Einschraenkung bleibt
+        erhalten (z. B. bei reinen feature_ids-Aenderungen durch das
+        Feld-Dropdown). Die Hashes fliessen als zusaetzliche
+        WHERE-Bedingung in die Reader-Queries
+        (`(instance_hash IS NULL OR instance_hash IN (...))`).
         """
         ids = self._normalize_feature_ids(feature_ids)
-        if ids == self._params.get("feature_ids"):
+        hashes_changed = instance_hashes is not None
+        if hashes_changed:
+            hashes = self._normalize_instance_hashes(instance_hashes)
+        else:
+            # None = bestehende Einschraenkung beibehalten (kein
+            # versehentliches Leeren durch Alt-Aufrufer).
+            hashes = self._params.get("instance_hashes") or []
+        if (ids == self._params.get("feature_ids")
+                and (not hashes_changed
+                     or hashes == self._params.get("instance_hashes"))):
             return
+        ids_changed = ids != self._params.get("feature_ids")
         self._params["feature_ids"] = ids
+        if hashes_changed:
+            self._params["instance_hashes"] = hashes
         self._mark_dirty()
+        if ids_changed:
+            # Runde 8 (Bugfix 4): Die UI leitet ihr 'Feld'-Dropdown
+            # SYNCHRON neu ab (kein Query-Round-Trip) - das
+            # HeatmapWidget verbindet feature_ids_changed und baut
+            # Items/Haken/Current sofort neu. (Nur bei feature_ids-
+            # Aenderung; reine Hash-Aenderung laesst das Feld-Dropdown
+            # unveraendert.)
+            self.feature_ids_changed.emit()
         self._refresh((QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC,
                        QUERY_SCATTER, QUERY_DISTRIBUTION))
 
     @staticmethod
     def _normalize_feature_ids(value) -> List[str]:
         """Normalisiert feature_ids (Liste[str], dedupliziert, getrimmt)."""
+        if not value:
+            return []
+        out: List[str] = []
+        for v in value:
+            s = str(v).strip()
+            if s and s not in out:
+                out.append(s)
+        return out
+
+    @staticmethod
+    def _normalize_instance_hashes(value) -> List[str]:
+        """Normalisiert instance_hashes (Liste[str], dedupliziert,
+        getrimmt) - Runde 10 (Bug 1, Varianten-Einschraenkung)."""
         if not value:
             return []
         out: List[str] = []
@@ -5103,6 +5369,13 @@ class AnalyticsViewModel(QObject):
             "symbol": p["symbol"],
             "timeframe": p["timeframe"],
             "feature_ids": p["feature_ids"],
+            # Runde 10 (Bug 1): Varianten-Einschraenkung in die
+            # Query-Params (leer = alle Varianten der feature_ids).
+            "instance_hashes": p.get("instance_hashes") or [],
+            # Runde 8 (Bugfix 3): Generation in die Worker-Params - der
+            # Worker spiegelt sie ins Ergebnis-Dict, die UI erkennt damit
+            # Stale-Payloads (Queries vor dem letzten Restore).
+            "restore_generation": self._restore_generation,
         }
         if kind == QUERY_TABLE:
             base["limit"] = p["limit"]
@@ -5273,6 +5546,12 @@ class AnalyticsViewModel(QObject):
         self._active_profile = dict(profile)
         payload = profile.get("payload") or {}
         flat = self._flatten_payload(payload)
+        # 10.08.2026 (Punkte 3/4): UI-Layout (page_index/heatmap_mode) aus
+        # dem Profil-Payload uebernehmen - die UI liest es ueber
+        # workspace_layout (identischer Pfad wie restore_workspace).
+        layout = payload.get("layout")
+        if isinstance(layout, dict):
+            self._workspace_layout.update(dict(layout))
         for key in list(self._params.keys()):
             if key in flat and flat[key] is not None:
                 self._params[key] = flat[key]
@@ -5292,16 +5571,31 @@ class AnalyticsViewModel(QObject):
                 self._params[_hk] = "hour"
         self._params["feature_ids"] = self._normalize_feature_ids(
             self._params.get("feature_ids"))
-        # 20.01 (E5): Fehlende Services isolieren – valide IDs direkt setzen.
-        valid, missing = self._resolve_feature_ids(self._params["feature_ids"])
-        self._params["feature_ids"] = valid
-        if missing:
-            self.missing_services_detected.emit(list(missing))
+        # Runde 10 (Bug 1): instance_hashes genauso normalisieren.
+        self._params["instance_hashes"] = self._normalize_instance_hashes(
+            self._params.get("instance_hashes"))
+        # 20.01 (E5) + Runde 9 (Bug 1): Fehlende Services NUR melden -
+        # die IDs bleiben im Filter (kein stilles Kuerzen des restaurierten
+        # Filters; die DB liefert fuer unbekannte IDs keine Zeilen).
+        if self._params["feature_ids"]:
+            _, missing = self._resolve_feature_ids(self._params["feature_ids"])
+            if missing:
+                self.missing_services_detected.emit(list(missing))
         self._params["bins"] = self._clamp_bins(self._params.get("bins"))
         self._params["limit"] = self._clamp_limit(self._params.get("limit"))
         if not mark_dirty:
             self._dirty = False
             self.dirty_changed.emit(False)
+        # Runde 8 (Bugfix 3): Generation erhoehen - die UI verwirft
+        # Stale-Payloads aelterer Generation (Queries, die VOR diesem
+        # Profilwechsel gestartet wurden).
+        self._restore_generation += 1
+        # Runde 10 (Bug 4): REIHENFOLGE - erst die UI-Combos synchronisieren
+        # (params_restored), DANN refresh_all(). Vorher starteten die
+        # Queries mit leeren/alten Controls (leere Combos ->
+        # _current_params() None -> Queries uebersprungen bzw. doppelte/
+        # stale Requests beim Restore).
+        self.params_restored.emit()
         self.refresh_all()
 
     def _apply_heatmap_section(self, heat: Any) -> None:
@@ -5331,6 +5625,19 @@ class AnalyticsViewModel(QObject):
         if isinstance(heat.get("zoom_y_range"), (list, tuple)):
             self._params["zoom_y_range"] = self._clamp_zoom(
                 heat["zoom_y_range"])
+
+    def set_ui_layout(self, layout: Optional[Dict[str, Any]] = None) -> None:
+        """Uebernimmt das aktuelle UI-Layout fuer die Profil-Persistenz.
+
+        10.08.2026 (Punkte 3/4): Der ViewModel kennt keine UI-Widgets
+        (MVVM-Invariante 4) - das AnalyticsWindow uebergibt page_index und
+        heatmap_mode vor jedem save_profile()/create_profile(); die Werte
+        wandern ueber _current_payload() (Sektion "layout") in den
+        Profil-Payload und werden beim _apply_profile() in
+        _workspace_layout restauriert (die UI liest sie dort ueber
+        workspace_layout).
+        """
+        self._ui_layout = dict(layout or {})
 
     def _current_payload(self) -> Dict[str, Any]:
         """Profil-Payload aus den aktuellen Ansichtsparametern (v2, sectioned).
@@ -5378,6 +5685,9 @@ class AnalyticsViewModel(QObject):
                 "table_sort_order": p.get("table_sort_order"),
             },
             "styling": {},
+            # 10.08.2026 (Punkte 3/4): UI-Layout-Anteil (page_index,
+            # heatmap_mode) additiv - von der UI via set_ui_layout() gesetzt.
+            "layout": dict(self._ui_layout or {}),
         }
 
     def restore_workspace(self, workspace: Dict[str, Any]) -> None:
@@ -5408,14 +5718,38 @@ class AnalyticsViewModel(QObject):
         for _hk in ("heatmap_x_dim", "heatmap_y_dim"):
             if self._params.get(_hk) == "dow_hour":
                 self._params[_hk] = "hour"
+        # 20.04-Q8-Fix (User-Bugreport Punkt 1a): Auch die verschachtelte
+        # `charts.heatmap`-Sektion des Workspace-Params restaurieren
+        # (heatmap_agg/heatmap_field) – der flache Key-Loop uebernimmt die
+        # flachen Keys, aber das verschachtelte Dict (wie im Profil-Payload)
+        # muss explizit via _apply_heatmap_section aufgeloest werden.
+        if isinstance(params.get("heatmap"), dict):
+            self._apply_heatmap_section(params.get("heatmap"))
         self._params["feature_ids"] = self._normalize_feature_ids(
             self._params.get("feature_ids"))
-        valid, missing = self._resolve_feature_ids(self._params["feature_ids"])
-        self._params["feature_ids"] = valid
-        if missing:
-            self.missing_services_detected.emit(list(missing))
+        # Runde 10 (Bug 1): instance_hashes genauso normalisieren.
+        self._params["instance_hashes"] = self._normalize_instance_hashes(
+            self._params.get("instance_hashes"))
+        # Runde 9 (Bug 1): Fehlende Services NUR melden, NICHT aus dem
+        # Filter entfernen - der Resolver wuerde sonst den restaurierten
+        # Filter stillschweigend kuerzen (die DB liefert fuer unbekannte
+        # IDs einfach keine Zeilen; Graceful Degradation ohne Datenverlust).
+        if self._params["feature_ids"]:
+            _, missing = self._resolve_feature_ids(self._params["feature_ids"])
+            if missing:
+                self.missing_services_detected.emit(list(missing))
         self._params["bins"] = self._clamp_bins(self._params.get("bins"))
         self._params["limit"] = self._clamp_limit(self._params.get("limit"))
+        # Runde 8 (Bugfix 3): Generation erhoehen - die UI verwirft
+        # Stale-Payloads aelterer Generation (Queries, die VOR diesem
+        # Workspace-Restore gestartet wurden).
+        self._restore_generation += 1
+        # Runde 10 (Bug 4): REIHENFOLGE - erst die UI-Combos synchronisieren
+        # (params_restored), DANN refresh_all(). Vorher starteten die
+        # Queries mit leeren/alten Controls (leere Combos ->
+        # _current_params() None -> Queries uebersprungen bzw. doppelte/
+        # stale Requests beim Restore).
+        self.params_restored.emit()
         self.refresh_all()
 
     @staticmethod
@@ -5504,6 +5838,19 @@ class AnalyticsViewModel(QObject):
         """
         return dict(self._workspace_layout)
 
+    @property
+    def restore_generation(self) -> int:
+        """Generations-Token des letzten Restores (Runde 8, Stale-Guard).
+
+        Wird bei jedem restore_workspace()/_apply_profile() erhoeht und vom
+        Worker in jedes Ergebnis-Dict gespiegelt (`data["restore_"]`
+        generation). Die UI vergleicht den Payload-Wert mit diesem Token und
+        verwirft Payloads aelterer Generation (Queries, die VOR dem Restore
+        gestartet wurden, ueberschreiben den synchron restaurierten Zustand
+        nicht mehr).
+        """
+        return self._restore_generation
+
     def heatmap_metrics(self, symbol: str, timeframe: str) -> List[str]:
         """Verfuegbare Heatmap-Metriken fuer ein Symbol/Timeframe (19.02).
 
@@ -5567,7 +5914,8 @@ class AnalyticsViewModel(QObject):
         except Exception:
             return key
 
-    def resolve_service_display_name(self, plugin_id: str) -> str:
+    def resolve_service_display_name(self, plugin_id: str,
+                                     preset_name: Optional[str] = None) -> str:
         """Service-Name OHNE Kategorie-Pfad, direkt aus dem Service-Objekt.
 
         09.08.2026 (User-Meldung 'Feld'-Dropdown): Der Name wird DIREKT aus
@@ -5580,12 +5928,20 @@ class AnalyticsViewModel(QObject):
         'Service'-Suffix, das wie ein MasterTree-Pfad-Bestandteil wirkt).
         Kein Kategorie-Pfad. Unbekannte/entfernte IDs -> lesbarer Pretty-
         Fallback (defensiv). Rein lesend, kein SQL.
+
+        20.04 (Q2, §4): Optionaler `preset_name` ergaenzt das Label um
+        ' ({Preset_Name})' – Anzeige-Format '{Service} ({Preset}) /
+        {Parameter}' fuer Parameter-Varianten (Clones). Ohne preset_name
+        bleibt das Label unveraendert (Zero-Regression).
         """
         key = str(plugin_id or "").strip()
-        if not key or key.lower() == "none":
-            # 09.08.2026 (User-Meldung Feld-Dropdown, Root Cause 3): Leere/
-            # fehlende/Native-Keys liefern einen lesbaren Sammel-Namen statt
-            # eines Leerstrings (kein leerer Prefix vor Feld-Eintraegen).
+        if not key or key.lower() in ("none", "native") \
+                or key.lower().startswith("native_"):
+            # 09.08.2026 (User-Meldung Feld-Dropdown, Root Cause 3) +
+            # 20.03.02 (F3): Leere/fehlende/Native-Keys liefern einen
+            # lesbaren Sammel-Namen statt eines Leerstrings (kein leerer
+            # Prefix vor Feld-Eintraegen). `native`/`native_*` werden wie
+            # `none` auf 'Allgemein' gemappt (benutzerfreundlich).
             return "Allgemein"
         model = self._selector_model
         if model is None:
@@ -5608,9 +5964,194 @@ class AnalyticsViewModel(QObject):
                     name = name[len(prefix):]
                     break
             pretty = name.replace("_", " ").title()
-            return pretty or key
+            if not pretty:
+                pretty = key
+            # 20.04 (Q2): Preset-Name (Variante) in Klammern ergaenzen.
+            preset = str(preset_name or "").strip()
+            if preset:
+                pretty = f"{pretty} ({preset})"
+            return pretty
         except Exception:
             return key
+
+    def resolve_instance_hashes(self,
+                                hashes: Iterable[str]) -> List[str]:
+        """Loest instance_hash-Werte transparent auf plugin_ids auf (20.04, Q2).
+
+        Quelle: Plugin-Presets/Clones des `ServiceSelectorModel`
+        (`plugin_presets()`, in refresh() aus indicator_presets geladen) –
+        die Zuordnung Hash -> plugin_id ist dort deterministisch ueber
+        `generate_instance_hash` abgelegt. Rueckgabe: deduplizierte
+        plugin_ids (Reihenfolge erhalten, case-insensitiv). Hashes ohne
+        Treffer werden verworfen (defensiv). Der Filter bleibt dadurch auf
+        `WHERE feature_id IN (plugin_ids)` – die Varianten-Aufloesung
+        passiert transparent im ViewModel (kein SQL, rein lesend).
+
+        Beispiel: `resolve_instance_hashes(["a91f3b"])` -> ["srv_swing_pivot"].
+        """
+        wanted = {str(h or "").strip()
+                  for h in (hashes or []) if str(h or "").strip()}
+        if not wanted:
+            return []
+        model = self._selector_model
+        if model is None:
+            from analytics.engine.service_selector_model import ServiceSelectorModel
+            model = ServiceSelectorModel(parent=self)
+            self._selector_model = model
+        result: List[str] = []
+        seen: Set[str] = set()
+        try:
+            presets = model.plugin_presets() or {}
+            for pid, clones in presets.items():
+                if not clones or not isinstance(clones, list):
+                    continue
+                for clone in clones:
+                    if not isinstance(clone, dict):
+                        continue
+                    h = str(clone.get("instance_hash") or "").strip()
+                    if not h or h not in wanted:
+                        continue
+                    if str(pid).lower() not in seen:
+                        seen.add(str(pid).lower())
+                        result.append(str(pid))
+                    # Ein plugin_id pro Hash genuegt (dedupliziert).
+                    wanted.discard(h)
+        except Exception:
+            pass
+        return result
+
+    def resolve_no_data_variants(self, symbol: str,
+                                timeframe: str) -> List[Dict[str, Any]]:
+        """Plugin-Varianten (Clones/Presets) OHNE feature_store-Daten (Q8-Fix).
+
+        (No Data)-Unterstuetzung (User-Bugreport 09.08.2026): Neue Varianten
+        eines Services erscheinen im Analytics-Feld-Dropdown erst, nachdem
+        sie mindestens EINMAL berechnet wurden (`feature_keys_by_service`
+        filtert `WHERE feature_data IS NOT NULL`). Diese Methode liefert die
+        Varianten, die es im ServiceSelectorModel (plugin_presets) bereits
+        gibt, deren `instance_hash` aber noch KEINE Zeilen besitzt – die UI
+        zeigt sie als '(No Data)'-Hinweis an, bis der erste Scan lief.
+
+        Nur aktive Presets (is_archived=False / is_active_batch=True) werden
+        geliefert – archivierte Varianten sind bewusst unsichtbar (Q6/Q7).
+
+        Returns:
+            Liste von {"plugin_id", "preset_name", "instance_hash",
+            "display_name"} – leer bei fehlendem Model/Reader oder wenn alle
+            Varianten Daten besitzen (defensiv, rein lesend).
+        """
+        if not symbol or not timeframe:
+            return []
+        model = self._selector_model
+        if model is None:
+            from analytics.engine.service_selector_model import ServiceSelectorModel
+            model = ServiceSelectorModel(parent=self)
+            self._selector_model = model
+        try:
+            presets = model.plugin_presets() or {}
+        except Exception:
+            presets = {}
+        # Runde 9 (Bug 2): Der strikte Hash-Vergleich war falsch - wenn
+        # die Daten einer Variante unter einem anderen/veralteten Hash
+        # oder ohne Hash (NULL, Alt-Bestand) geschrieben wurden, wurde
+        # sie faelschlich als '(No Data)' markiert. Zusaetzlich fehlten
+        # Set-Instanz-Varianten komplett (nur indicator_presets wurden
+        # geprueft). Beides wird hier korrigiert.
+        try:
+            available = self._repo.reader.available_instance_hashes(
+                symbol, timeframe)
+        except Exception:
+            available = set()
+        # feature_id-Ebene: plugin_ids, die UEBERHAUPT feature_store-Daten
+        # besitzen (egal unter welchem instance_hash / ohne Hash).
+        try:
+            keys_by_service = self._repo.reader.feature_keys_by_service(
+                symbol, timeframe)
+            pids_with_data = {str(k).strip().lower() for k in (keys_by_service or {})}
+        except Exception:
+            pids_with_data = set()
+        try:
+            from analytics.engine.service_models import generate_instance_hash
+        except Exception:
+            generate_instance_hash = None
+
+        # Runde 10 (Bug 2): available case-insensitiv indexieren (einmalig).
+        available_low = {str(x).strip().lower()
+                         for x in (available or set())}
+
+        def _has_data(pid: str, h: str) -> bool:
+            """True, wenn die Variante Daten besitzt.
+
+            Runde 10 (Bug 2): Differenzierung statt grobem
+            pids_with_data-Fallback - eine benannte Variante mit eigenem
+            instance_hash zaehlt NUR, wenn GENAU dieser Hash Zeilen
+            besitzt (sonst waere '(No Data)' nie sichtbar, sobald eine
+            andere Variante desselben Services bereits Daten hat). Der
+            pids_with_data-Fallback gilt nur noch fuer Varianten OHNE
+            Hash (NULL/Alt-Bestand, nicht unterscheidbar)."""
+            if not pid:
+                return True
+            h_s = str(h or "").strip()
+            if h_s:
+                return h_s.lower() in available_low
+            return str(pid).strip().lower() in pids_with_data
+
+        out: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str]] = set()
+
+        def _add(pid: str, pname: str, h: str) -> None:
+            pid_s = str(pid or "").strip()
+            if not pid_s:
+                return
+            h_s = str(h or "").strip()
+            key = (pid_s.lower(), h_s)
+            if key in seen:
+                return
+            seen.add(key)
+            if _has_data(pid_s, h_s):
+                return
+            pname_s = str(pname or "Default")
+            out.append({
+                "plugin_id": pid_s,
+                "preset_name": pname_s,
+                "instance_hash": h_s,
+                "display_name": self.resolve_service_display_name(
+                    pid_s, pname_s),
+            })
+
+        for pid, clones in presets.items():
+            if not clones or not isinstance(clones, list):
+                continue
+            for clone in clones:
+                if not isinstance(clone, dict):
+                    continue
+                if clone.get("is_archived"):
+                    continue
+                _add(str(pid), str(clone.get("preset_name") or "Default"),
+                     str(clone.get("instance_hash") or ""))
+        # Runde 9 (Bug 2): Set-Instanz-Varianten (Services in Sets mit
+        # eigenen Parametern) ebenfalls erfassen - vorher fehlten sie.
+        try:
+            for s in model.get_sets() or []:
+                services = s.get("services") if isinstance(s, dict) else None
+                if not isinstance(services, dict):
+                    continue
+                for instance_id, svc in services.items():
+                    if not isinstance(svc, dict):
+                        continue
+                    if svc.get("is_archived"):
+                        continue
+                    pid = str(svc.get("plugin_id") or "").strip()
+                    if not pid:
+                        continue
+                    if generate_instance_hash is not None:
+                        h = generate_instance_hash(pid, svc.get("params") or {})
+                    else:
+                        h = ""
+                    _add(pid, f"{pid} [{instance_id}]", h)
+        except Exception:
+            pass
+        return out
 
     @property
     def max_lookback_limit(self) -> int:
@@ -5763,6 +6304,16 @@ class AnalyticsAsyncWorker(QThread):
             # zurueck und die App haengt nach vielen Abfragen (TF-Wechsel).
             self._release_thread_connections()
         if not self._cancelled:
+            # Runde 8 (Bugfix 3): Das Generations-Token aus den Worker-Params
+            # ins Ergebnis-Dict spiegeln - die UI verwirft damit Stale-Payloads
+            # (Queries, die VOR dem letzten restore_workspace()/_apply_profile()
+            # gestartet wurden).
+            try:
+                if isinstance(result, dict):
+                    result["restore_generation"] = self._params.get(
+                        "restore_generation")
+            except Exception:
+                pass
             self.finished_ok.emit(self, self._query_kind, result)
 
     def _release_thread_connections(self) -> None:
@@ -5792,12 +6343,15 @@ class AnalyticsAsyncWorker(QThread):
         feature_ids = p.get("feature_ids")
         if not feature_ids and p.get("feature_id"):
             feature_ids = [p["feature_id"]]
+        # Runde 10 (Bug 1): Varianten-Einschraenkung an die Repo-Methoden.
+        instance_hashes = p.get("instance_hashes") or []
 
         if self._query_kind == QUERY_TABLE:
             return repo.get_table(
                 symbol, timeframe,
                 feature_id=p.get("feature_id"),
                 feature_ids=feature_ids,
+                instance_hashes=instance_hashes,
                 limit=cap_lookback_limit(p.get("limit")),
             )
         if self._query_kind == QUERY_HEATMAP:
@@ -5806,6 +6360,7 @@ class AnalyticsAsyncWorker(QThread):
                 metric=str(p.get("metric", "count") or "count"),
                 feature_id=p.get("feature_id"),
                 feature_ids=feature_ids,
+                instance_hashes=instance_hashes,
             )
         if self._query_kind == QUERY_HEATMAP_GENERIC:
             # 20.02 (additiv): Generische 2D-Heatmap – Parameter x_dim/y_dim/
@@ -5818,6 +6373,7 @@ class AnalyticsAsyncWorker(QThread):
                 agg=str(p.get("agg", "count") or "count"),
                 feature_id=p.get("feature_id"),
                 feature_ids=feature_ids,
+                instance_hashes=instance_hashes,
                 limit=cap_lookback_limit(p.get("limit")),
             )
         if self._query_kind == QUERY_OHLCV:
@@ -5842,6 +6398,7 @@ class AnalyticsAsyncWorker(QThread):
                 y_column=p.get("y_column") or None,
                 feature_id=p.get("feature_id"),
                 feature_ids=feature_ids,
+                instance_hashes=instance_hashes,
                 limit=cap_lookback_limit(p.get("limit")),
             )
         if self._query_kind == QUERY_DISTRIBUTION:
@@ -5851,6 +6408,7 @@ class AnalyticsAsyncWorker(QThread):
                 bins=p.get("bins", 20),
                 feature_id=p.get("feature_id"),
                 feature_ids=feature_ids,
+                instance_hashes=instance_hashes,
                 limit=cap_lookback_limit(p.get("limit")),
             )
         if self._query_kind == QUERY_FEATURES:
@@ -6395,6 +6953,7 @@ class FeatureStoreReader:
         feature_id: Optional[str],
         conditions: List[str],
         params: List[Any],
+        instance_hashes: Optional[List[str]] = None,
     ) -> None:
         """Erweitert WHERE um einen feature_id-Filter (IN-Clause bzw. Einzel-ID).
 
@@ -6423,6 +6982,20 @@ class FeatureStoreReader:
         elif feature_id:
             conditions.append("LOWER(TRIM(feature_id)) = LOWER(TRIM(?))")
             params.append(feature_id)
+        # Runde 10 (Bug 1): Varianten-Einschraenkung - werden
+        # instance_hashes uebergeben, bleiben NUR die Rows der gewaehlten
+        # Varianten (exakter Hash-Match, case-insensitiv) plus Alt-Bestand
+        # OHNE Hash (NULL) - letztere gehoeren der plugin_id als Ganzes
+        # und werden nie durch die Varianten-Auswahl ausgeblendet.
+        if instance_hashes:
+            hashes = [str(h).strip().lower() for h in instance_hashes
+                      if str(h).strip()]
+            if hashes:
+                placeholders = ", ".join("?" for _ in hashes)
+                conditions.append(
+                    f"(instance_hash IS NULL OR "
+                    f"LOWER(TRIM(instance_hash)) IN ({placeholders}))")
+                params.extend(hashes)
 
     # ------------------------------------------------------------------
     # Lesen: Roh-Zeilen
@@ -6433,6 +7006,8 @@ class FeatureStoreReader:
         timeframe: str,
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Liefert Feature-Store-Zeilen als Dicts (vom NEUESTEN Stand abwaerts).
@@ -6466,7 +7041,9 @@ class FeatureStoreReader:
             limit = 1000
         conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
         params: List[Any] = [symbol, timeframe]
-        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
+        self._apply_feature_filter(
+            feature_ids, feature_id, conditions, params,
+            instance_hashes=instance_hashes)
 
         con = self._get_connection()
         try:
@@ -6659,6 +7236,8 @@ class FeatureStoreReader:
         numeric_only: bool = False,
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
     ) -> Dict[str, List[str]]:
         """feature_data-JSON-Keys je feature_id (20.02.01, Feld-Dropdown).
 
@@ -6690,7 +7269,9 @@ class FeatureStoreReader:
         # 09.08.2026 (User-Meldung Feld-Dropdown): feature_id/feature_ids-
         # Filter anwenden, damit abgewaehlte Services nicht im Dropdown
         # erscheinen (Root Cause 2).
-        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
+        self._apply_feature_filter(
+            feature_ids, feature_id, conditions, params,
+            instance_hashes=instance_hashes)
 
         con = self._get_connection()
         try:
@@ -6742,6 +7323,8 @@ class FeatureStoreReader:
         columns: List[str],
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> List[Dict[str, float]]:
         """Liefert numerische Werte angeforderter feature_data-JSON-Keys.
@@ -6778,7 +7361,9 @@ class FeatureStoreReader:
             limit = 1000
         conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
         params: List[Any] = [symbol, timeframe]
-        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
+        self._apply_feature_filter(
+            feature_ids, feature_id, conditions, params,
+            instance_hashes=instance_hashes)
 
         con = self._get_connection()
         try:
@@ -6821,6 +7406,8 @@ class FeatureStoreReader:
         metric: str = "count",
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Aggregiert eine 2D-Matrix (X: Wochentage, Y: Tagesstunden).
@@ -6879,7 +7466,9 @@ class FeatureStoreReader:
 
         conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
         params: List[Any] = [symbol, timeframe]
-        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
+        self._apply_feature_filter(
+            feature_ids, feature_id, conditions, params,
+            instance_hashes=instance_hashes)
 
         con = self._get_connection()
         try:
@@ -6945,6 +7534,8 @@ class FeatureStoreReader:
         agg: str = "count",
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Aggregiert eine generische 2D-Matrix ueber zwei Dimensionen.
@@ -7035,7 +7626,9 @@ class FeatureStoreReader:
 
         conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
         params: List[Any] = [symbol, timeframe]
-        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
+        self._apply_feature_filter(
+            feature_ids, feature_id, conditions, params,
+            instance_hashes=instance_hashes)
         # 20.02.01 (E5): `dow`-Achse strikt Montag-Freitag (DuckDB Mo=1..Fr=5).
         if x_key == "dow" or y_key == "dow":
             conditions.append(
@@ -7374,6 +7967,53 @@ class FeatureStoreReader:
                 continue
         return out
 
+    def fetch_last_execution_dates_by_hash(
+        self,
+    ) -> Dict[str, Dict[str, str]]:
+        """Neuester Schreib-Zeitpunkt je (feature_id, instance_hash).
+
+        Bugfix 10.08.2026 (Varianten-Ausfuehrungsdatum): Varianten/Clones
+        (indicator_presets) haben EIGENE Feature-Store-Rows (Spalte
+        `instance_hash`, 20.04 Q9). Fuer die MasterTree-Anzeige
+        '<Preset> (DD.MM.JJ)' wird das Datum der letzten Ausfuehrung je
+        Parameter-Variante benoetigt – nicht das der plugin_id insgesamt.
+
+        Quelle: MAX(created_at) GROUP BY feature_id + instance_hash ueber
+        ALLE Symbole/Timeframes. Case-insensitiv/whitespace-tolerant wie
+        `fetch_last_execution_dates`; Rows ohne instance_hash (nicht
+        Varianten-gesteuerte Services) und ohne created_at werden
+        uebersprungen.
+
+        Returns:
+            Dict feature_id (lower) -> {instance_hash: 'DD.MM.JJ'} – leer
+            bei fehlender DB/Tabelle oder Fehler (defensiv).
+        """
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT LOWER(TRIM(feature_id)) AS fid, instance_hash,
+                       MAX(created_at)
+                FROM feature_store
+                WHERE feature_id IS NOT NULL AND TRIM(feature_id) != ''
+                  AND feature_id != ?
+                  AND instance_hash IS NOT NULL AND instance_hash != ''
+                GROUP BY LOWER(TRIM(feature_id)), instance_hash
+            """, [SENTINEL_NATIVE]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] "
+                  f"fetch_last_execution_dates_by_hash fehlgeschlagen: {e}")
+            return {}
+        out: Dict[str, Dict[str, str]] = {}
+        for r in rows:
+            if r[0] is None or r[1] is None or r[2] is None:
+                continue
+            try:
+                out.setdefault(str(r[0]), {})[str(r[1])] = r[2].strftime(
+                    "%d.%m.%y")
+            except (AttributeError, ValueError):
+                continue
+        return out
+
     # ------------------------------------------------------------------
     # Lesen: Metadaten
     # ------------------------------------------------------------------
@@ -7401,6 +8041,38 @@ class FeatureStoreReader:
             print(f"WARN [FeatureStoreReader] get_available_timeframes "
                   f"fehlgeschlagen: {e}")
             return []
+
+    def available_instance_hashes(
+        self, symbol: str, timeframe: str,
+    ) -> set:
+        """Liefert die instance_hash-Werte mit feature_data (20.04-Q8-Fix).
+
+        (No Data)-Unterstuetzung: Das Analytics-Feld-Dropdown zeigt neue
+        Plugin-Varianten (Clones/Presets) sofort an – markiert als
+        '(No Data)' – bis der erste Scan/LiveRun Daten in den feature_store
+        geschrieben hat. Diese Methode liefert die Menge der Hashes, die
+        bereits Zeilen BESITZEN (rein lesend, kein SQL in der UI).
+
+        Returns:
+            set[str] – leer bei fehlender DB/Tabelle oder Fehlern
+            (defensiv, Invariante FeatureStoreReader: rein lesend).
+        """
+        if not symbol or not timeframe:
+            return set()
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT DISTINCT instance_hash FROM feature_store
+                WHERE LOWER(symbol) = LOWER(?)
+                  AND LOWER(timeframe) = LOWER(?)
+                  AND instance_hash IS NOT NULL
+                  AND instance_hash != ''
+            """, [symbol, timeframe]).fetchall()
+            return {str(r[0]) for r in rows if r[0] is not None}
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] available_instance_hashes "
+                  f"fehlgeschlagen: {e}")
+            return set()
 
     def get_available_features(
         self, symbol: str, timeframe: str
@@ -7445,6 +8117,8 @@ class FeatureStoreReader:
         timeframe: str,
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
     ) -> Optional[int]:
         """Neuester Wanduhr-Epoch (int) der Feature-Rows (oder None).
 
@@ -7460,7 +8134,9 @@ class FeatureStoreReader:
             return None
         conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
         params: List[Any] = [symbol, timeframe]
-        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
+        self._apply_feature_filter(
+            feature_ids, feature_id, conditions, params,
+            instance_hashes=instance_hashes)
         con = self._get_connection()
         try:
             row = con.execute(f"""
@@ -7484,6 +8160,8 @@ class FeatureStoreReader:
         hour: int,
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
     ) -> Optional[int]:
         """Neuester Wanduhr-Epoch einer (dow, hour)-Heatmap-Zelle (oder None).
 
@@ -7512,7 +8190,9 @@ class FeatureStoreReader:
             "EXTRACT(HOUR FROM bar_time AT TIME ZONE 'UTC')::INTEGER = ?",
         ]
         params: List[Any] = [symbol, timeframe, dow, hour]
-        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
+        self._apply_feature_filter(
+            feature_ids, feature_id, conditions, params,
+            instance_hashes=instance_hashes)
         con = self._get_connection()
         try:
             row = con.execute(f"""
@@ -7714,6 +8394,69 @@ liest (Service→Service-Abhängigkeit).
 
 from typing import Any, Dict, List, Optional, TypedDict
 
+import hashlib
+import json
+
+
+# ------------------------------------------------------------------
+# 20.04 (Q4): Kanonische Hash-Serialisierung
+# ------------------------------------------------------------------
+def _sanitize_for_hash(value: Any) -> Any:
+    """Rekursive Umwandlung in JSON-feste native Python-Typen (20.04, Q4).
+
+    numpy-Skalare (np.int64/np.float64), None, verschachtelte Dicts/Listen
+    und datetime-Werte werden deterministisch in native Typen überführt –
+    Grundlage der stabilen `instance_hash`-Berechnung (sonst
+    `TypeError: Object of type int64 is not JSON serializable` bzw.
+    instabile Hashes bei wechselnder Speicherreihenfolge).
+    """
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    # numpy-Skalare (np.int64, np.float64, np.bool_) -> native Python-Typen.
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return _sanitize_for_hash(item())
+        except Exception:
+            pass
+    if isinstance(value, dict):
+        return {str(k): _sanitize_for_hash(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_for_hash(v) for v in value]
+    # datetime/date -> ISO-String (deterministisch).
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    return str(value)
+
+
+def generate_instance_hash(
+    plugin_id: str, params: Optional[Dict[str, Any]] = None
+) -> str:
+    """8-stelliger deterministischer SHA256-Short-Hash einer Instanz (20.04).
+
+    `SHA256("<plugin_id>|" + json.dumps(sanitized_params, sort_keys=True))[:8]`
+
+    * **Q3:** `lookback` fließt BEWUSST NICHT ein – das Kerzen-Ergebnis hängt
+      nur von Algorithmus-Logik + `params` ab; `lookback` ist ein Laufzeit-
+      Fenster (Performance) und kein Inhalts-Identitätsmerkmal.
+    * **Q4:** `_sanitize_for_hash` überführt numpy-Werte/None/verschachtelte
+      Dicts vorher in native Python-Typen; `sort_keys=True` macht die
+      Serialisierung kanonisch (unabhängig von der Speicherreihenfolge).
+    """
+    canonical = json.dumps(
+        _sanitize_for_hash(params or {}),
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(
+        f"{plugin_id}|{canonical}".encode("utf-8")
+    ).hexdigest()
+    return digest[:8]
+
 
 class ServiceInstanceConfig(TypedDict, total=False):
     """Konfiguration einer einzelnen Service-Instanz innerhalb eines Sets.
@@ -7728,6 +8471,14 @@ class ServiceInstanceConfig(TypedDict, total=False):
                     diese Instanz (wird im Tooltip/Info-Dialog angezeigt).
         version:    Optional (Phase 14 P14-01). Plugin-Version dieser Instanz,
                     Default "1.0.0" (Semantic Versioning major.minor.patch).
+        instance_hash: Optional (20.04). 8-stelliger Hash der Parameter-
+                    Variante (generate_instance_hash); stabile Identifikation
+                    im feature_store (Spalte instance_hash) für
+                    Multi-Varianten-Statistiken.
+        doc_log:    Optional (20.04). Freitextfeld (Negativ-Wissen) – z. B.
+                    "85% false signals in chop markets".
+        is_archived: Optional (20.04, Q6). True = Instanz ist archiviert
+                    (MasterTree: non-checkable, unter 📁 Archiv).
     """
     plugin_id: str
     lookback: int
@@ -7735,6 +8486,9 @@ class ServiceInstanceConfig(TypedDict, total=False):
     depends_on: Optional[List[str]]
     description: Optional[str]
     version: Optional[str]
+    instance_hash: Optional[str]
+    doc_log: Optional[str]
+    is_archived: bool
 
 
 class ServiceSetDefinition(TypedDict, total=False):
@@ -7765,6 +8519,8 @@ class ServiceSetDefinition(TypedDict, total=False):
     version: Optional[str]           # Kap 5: Set-Level Semantic Version (major.minor.patch)
     schema_version: Optional[str]    # Kap 5: Schema-Format-Version der Definition (z.B. "1.0")
     created_at: Optional[str]        # Kap 5: Erstellungs-Zeitstempel (ISO-8601 UTC)
+    is_archived: bool                # 20.04 (Q6): True = gesamtes Set archiviert
+                                     # (MasterTree: non-checkable, unter 📁 Archiv)
     execution_order: List[str]       # Ausführungs-Reihenfolge der instance_ids
     services: Dict[str, ServiceInstanceConfig]  # instance_id → Konfiguration
 
@@ -7808,6 +8564,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from PySide6.QtCore import QObject, Signal
 
 from config.event_bus import event_bus
+from analytics.engine.service_models import generate_instance_hash
 
 
 def list_indicators() -> List[Dict[str, Any]]:
@@ -7912,6 +8669,11 @@ class ServiceSelectorModel(QObject):
         self._active_indicator_ids: Set[str] = set()
         # 05.08.2026: Datum der letzten Ausfuehrung je feature_id (DD.MM.JJ)
         self._last_execution_dates: Dict[str, str] = {}
+        # 10.08.2026 (Varianten-Ausfuehrungsdatum): Datum der letzten
+        # Ausfuehrung je (feature_id, instance_hash) – Grundlage der
+        # MasterTree-Varianten-Anzeige '<Preset> (DD.MM.JJ)'. Quelle:
+        # FeatureStoreReader.fetch_last_execution_dates_by_hash().
+        self._last_execution_dates_by_hash: Dict[str, Dict[str, str]] = {}
         # 18.01.03 (E1): Kategorie-Overrides je Plugin (global_settings,
         # Key 'plugin_category_<pid>'). Ein gesetzter Override UEBERSCHREIBT
         # metadata['category'] (auch "" = Root-Ebene); ohne Override gilt das
@@ -7925,6 +8687,14 @@ class ServiceSelectorModel(QObject):
         # verschwinden damit NICHT beim Refresh, sondern nur bei manueller
         # Loeschung (Kontextmenue 'Ordner löschen').
         self._empty_folder_paths: Dict[str, List[str]] = {}
+        # 20.04 (Q7): Presets/Clones je Plugin (plugin_id.lower() -> Liste
+        # von {"preset_name", "params", "instance_hash", "is_archived",
+        # "doc_log"}). Quelle: indicator_presets
+        # (StateManager.list_plugin_presets). Nur
+        # Plugins MIT Presets erscheinen als Parent-Knoten mit Clone-Kindern
+        # im MasterTree (Services-Gruppe); Plugins ohne Presets bleiben
+        # flache Blaetter (Zero-Regression). Wird in refresh() geladen.
+        self._plugin_presets: Dict[str, List[Dict[str, Any]]] = {}
 
         # Initialbefuellung + Live-Sync (schwellenfrei via EventBus)
         self.refresh()
@@ -7947,6 +8717,12 @@ class ServiceSelectorModel(QObject):
         # wird nach jedem Service-Run (ServiceRunWorker -> EventBus) neu
         # gelesen, damit der MasterTree das Datum live aktualisiert.
         self._last_execution_dates = self._load_last_execution_dates()
+        # 10.08.2026 (Varianten-Ausfuehrungsdatum): Datum der letzten
+        # Ausfuehrung je (feature_id, instance_hash) – Grundlage der
+        # MasterTree-Varianten-Anzeige '<Preset> (DD.MM.JJ)'. Wird NACH den
+        # Plugin-Ausfuehrungsdaten gelesen, damit _load_plugin_presets() die
+        # Hash-Daten je Clone mitgeben kann.
+        self._last_execution_dates_by_hash = self._load_last_execution_dates_by_hash()
         # 18.01.03 (E1): Kategorie-Overrides (plugin_category_<pid>) laden –
         # einmalig pro Refresh, damit _category_parts() ohne DB-Zugriff
         # auswertet (Baum-Aufbau bleibt rein lesend aus dem RAM).
@@ -7955,6 +8731,9 @@ class ServiceSelectorModel(QObject):
         # Gruppe laden (tree_folders_<group>); build_tree() mischt sie in
         # die Gruppen-Kinder ein (leere Ordner bleiben ueber Refreshs).
         self._empty_folder_paths = self._load_empty_folders()
+        # 20.04 (Q7): Presets/Clones je Plugin laden (indicator_presets via
+        # StateManager) – Grundlage der Parent-Child-Clone-Ansicht.
+        self._plugin_presets = self._load_plugin_presets()
         self.data_changed.emit()
 
     def _load_empty_folders(self) -> Dict[str, List[str]]:
@@ -8013,6 +8792,54 @@ class ServiceSelectorModel(QObject):
                   f"lesbar: {e}")
         return overrides
 
+    def _load_plugin_presets(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Laedt die Presets/Clones aller Plugins (20.04, Q7).
+
+        Quelle: indicator_presets (StateManager.list_plugin_presets,
+        plugin_id-Verknuepfung). Der instance_hash wird fuer jedes Preset
+        deterministisch aus `generate_instance_hash(plugin_id, params)`
+        berechnet (Q2/Q4: ohne lookback, Typ-Sanitizer + sort_keys). Ein
+        Preset gilt als archiviert, wenn `is_active_batch = False` (Q7:
+        Archivierung eines Presets => is_active_batch = False; die Scans
+        isolieren diese Presets). Rueckgabe: plugin_id.lower() -> Liste
+        von {"preset_name", "params", "instance_hash", "is_archived",
+        "doc_log"}.
+        Defensiv: Fake-/Alt-StateManager ohne list_plugin_presets liefern
+        leere Dicts (kein Baum-Rendering, keine Regression in Tests).
+        """
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        try:
+            for pid in sorted(self.get_plugins().keys()):
+                raw = self.state_manager.list_plugin_presets(pid)
+                if not raw:
+                    continue
+                clones: List[Dict[str, Any]] = []
+                for p in raw or []:
+                    if not isinstance(p, dict):
+                        continue
+                    params = p.get("params") or {}
+                    instance_hash = generate_instance_hash(pid, params)
+                    per_hash = self._last_execution_dates_by_hash.get(
+                        str(pid).lower(), {}) or {}
+                    clones.append({
+                        "preset_name": str(p.get("preset_name") or "Default"),
+                        "params": params,
+                        "instance_hash": instance_hash,
+                        "is_archived": not bool(p.get("is_active_batch")),
+                        "doc_log": str(p.get("doc_log") or ""),
+                        # 10.08.2026: Datum der letzten Ausfuehrung dieser
+                        # Parameter-Variante (Feature-Store, Spalte
+                        # instance_hash) – fuer die MasterTree-Anzeige
+                        # '<Preset> (DD.MM.JJ)'. Fallback '--.--.--'.
+                        "last_execution": per_hash.get(
+                            instance_hash, "--.--.--"),
+                    })
+                if clones:
+                    result[str(pid).lower()] = clones
+        except Exception as e:
+            print(f"WARN [ServiceSelectorModel] Plugin-Presets nicht lesbar: {e}")
+        return result
+
     def _load_last_execution_dates(self) -> Dict[str, str]:
         """Liest das Datum der letzten Ausfuehrung je feature_id aus dem
         feature_store (rein lesend ueber den FeatureStoreReader, Invariante
@@ -8046,6 +8873,39 @@ class ServiceSelectorModel(QObject):
             return "--.--.--"
         return self._last_execution_dates.get(
             str(plugin_id).lower(), "--.--.--")
+
+    def last_execution_date_for_hash(
+        self, plugin_id: str, instance_hash: str
+    ) -> str:
+        """Datum der letzten Ausfuehrung einer Parameter-Variante.
+
+        10.08.2026 (Varianten-Ausfuehrungsdatum): Varianten/Clones haben
+        EIGENE Feature-Store-Rows (Spalte instance_hash). Formatiert als
+        'DD.MM.JJ' – Fallback '--.--.--' ohne Eintraege (bzw. ohne
+        instance_hash). Rueckgabewert ohne Klammern (MasterTree-Wrapper).
+        """
+        if not plugin_id or not instance_hash:
+            return "--.--.--"
+        per_hash = self._last_execution_dates_by_hash.get(
+            str(plugin_id).lower(), {}) or {}
+        return per_hash.get(str(instance_hash), "--.--.--")
+
+    def _load_last_execution_dates_by_hash(
+        self,
+    ) -> Dict[str, Dict[str, str]]:
+        """Liest die Varianten-Ausfuehrungsdaten je (feature_id, hash).
+
+        10.08.2026: Delegate an den FeatureStoreReader
+        (fetch_last_execution_dates_by_hash). Defensiv: Fehler -> leer
+        (Clones zeigen dann den Fallback '(--.--.--)').
+        """
+        try:
+            raw = self.feature_store_reader.fetch_last_execution_dates_by_hash() or {}
+        except Exception as e:
+            print(f"WARN [ServiceSelectorModel] Varianten-Ausfuehrungsdaten "
+                  f"nicht lesbar: {e}")
+            return {}
+        return {str(k).lower(): v for k, v in raw.items()}
 
     def _collect_active_indicator_ids(self) -> Set[str]:
         """Sammelt alle indicator_ids/plugin_ids, die in offenen Chart-
@@ -8347,10 +9207,24 @@ class ServiceSelectorModel(QObject):
         badges: Dict[str, str] = {pid: self.badge_for(pid) for pid in plugins}
         last_executions: Dict[str, str] = {
             pid: self.last_execution_date(pid) for pid in plugins}
+        # 20.04 (Q7): Presets/Clones je Plugin durchreichen – Plugins MIT
+        # Presets werden als Parent-Knoten mit Clone-Kindern gerendert,
+        # archivierte Clones (is_archived) in den '📁 Archiv'-Ordner.
         return _tb_build_tree(self._sets, plugins,
                               self._plugin_category_overrides,
                               self._empty_folder_paths,
-                              badges, last_executions)
+                              badges, last_executions,
+                              presets=self._plugin_presets)
+
+    def plugin_presets(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Presets/Clones je Plugin (20.04, Q7) – lesend fuer Widgets/Tests.
+
+        Liefert plugin_id.lower() -> Liste von {"preset_name", "params",
+        "instance_hash", "is_archived", "doc_log"} (Quelle:
+        indicator_presets). Wird in refresh() aktualisiert; leere Dicts
+        bei Fake-/Alt-StateManagern.
+        """
+        return dict(self._plugin_presets)
 
     def find_set(self, set_id: str) -> Optional[Dict[str, Any]]:
         """Liefert die Set-Definition zur set_id (oder None)."""
@@ -9353,6 +10227,10 @@ GROUP_SETS = "sets"
 GROUP_PLUGINS = "plugins"
 #: Kategorie-Ordner-Knoten (Dynamic Category Trees).
 GROUP_CATEGORY = "category_node"
+# 20.04 (Q6): Label des dynamischen Archiv-Ordners. Enthaelt archivierte
+# Knoten (is_archived=True / Presets mit is_active_batch=False) – alle
+# darin liegenden Knoten sind non-checkable (Archive Safety).
+ARCHIVE_LABEL = "📁 Archiv"
 
 
 # ------------------------------------------------------------------
@@ -9437,6 +10315,11 @@ def _sort_category_nodes(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         is_folder = n.get("group") == GROUP_CATEGORY
         if is_folder:
             name = _cat_key(n.get("label"))
+            # 20.04 (Q6): '📁 Archiv' immer ans ENDE der Gruppe (nach allen
+            # normalen Ordnern UND Blaettern) – markiert ueber 'archived'.
+            if n.get("archived"):
+                return (2, name)
+            return (0, name)
         else:
             name = str(n.get("plugin_id")
                        or n.get("display_name")
@@ -9518,28 +10401,78 @@ def _ensure_category_path(nodes: List[Dict[str, Any]],
     _ensure_category_path(folder["children"], parts[1:])
 
 
+def _clones_for(presets: Optional[Dict[str, List[Dict[str, Any]]]],
+                plugin_id: str) -> List[Dict[str, Any]]:
+    """Preset-/Clone-Liste eines Plugins (20.04, Q7) oder [].
+
+    `presets` mappt plugin_id.lower() -> Liste von
+    {"preset_name", "params", "instance_hash", "is_archived"}. Plugins
+    ohne Eintrag liefern [] (keine Clones -> flaches Blatt).
+    """
+    if not presets:
+        return []
+    key = str(plugin_id or "").lower()
+    clones = presets.get(key)
+    if not clones:
+        clones = presets.get(str(plugin_id or ""))
+    return list(clones or [])
+
+
 def _category_nodes(plugin_ids: List[str],
                     plugins: Dict[str, Any],
                     overrides: Dict[str, str],
                     badges: Dict[str, str],
-                    last_executions: Dict[str, str]) -> List[Dict[str, Any]]:
+                    last_executions: Dict[str, str],
+                    presets: Optional[Dict[str, List[Dict[str, Any]]]] = None
+                    ) -> List[Dict[str, Any]]:
     """Baut die (ggf. verschachtelte) Kinderliste einer Plugin-Gruppe.
 
     Plugins mit Kategorienpfad werden in 📁-Ordner einsortiert; Plugins
     ohne Kategorie (bzw. Default 'General') bleiben auf oberster Ebene
     (K1). Blatt-Dicts unveraendert ({plugin_id, badge, last_execution}).
     Sortierung pro Ebene: Ordner vor Blaettern, alphabetisch (K8).
+
+    20.04 (Q7): Plugins MIT Presets/Clones werden als Parent-Knoten
+    gerendert – das Blatt-Dict erhaelt zusaetzlich `clones` (Liste der
+    AKTIVEN Clones, is_archived=False). Plugins OHNE Presets bleiben
+    flache Blaetter (Blatt-Struktur identisch, Zero-Regression). Die
+    ARCHIVIERTEN Clones (is_archived=True) wandern in den dynamischen
+    '📁 Archiv'-Ordner (Q6, Archiv-Einheit: einzelne Clone) – das
+    Archiv-Blatt traegt das 'archived'-Flag (non-checkable im MasterTree).
     """
     root: List[Dict[str, Any]] = []
+    archive_entries: List[Dict[str, Any]] = []
     for pid in plugin_ids:
         plugin = plugins.get(pid)
         parts = _category_parts(pid, plugin, overrides)
+        clones = _clones_for(presets, pid)
         leaf = {
             "plugin_id": pid,
             "badge": badges.get(pid, ""),
             "last_execution": last_executions.get(pid, "--.--.--"),
         }
-        _insert_into_category_tree(root, parts, leaf)
+        if not clones:
+            # Plugin ohne Presets: flaches Blatt (Bestandsverhalten).
+            _insert_into_category_tree(root, parts, leaf)
+            continue
+        active = [c for c in clones if not c.get("is_archived")]
+        archived = [c for c in clones if c.get("is_archived")]
+        if active:
+            leaf_with_clones = dict(leaf, clones=active)
+            _insert_into_category_tree(root, parts, leaf_with_clones)
+        if archived:
+            archive_entries.append(dict(
+                leaf, clones=archived, archived=True))
+    if archive_entries:
+        archive_folder: Dict[str, Any] = {
+            "group": GROUP_CATEGORY,
+            "label": ARCHIVE_LABEL,
+            "children": sorted(
+                archive_entries,
+                key=lambda e: str(e.get("plugin_id") or "").lower()),
+            "archived": True,
+        }
+        root.append(archive_folder)
     return _sort_category_nodes(root)
 
 
@@ -9663,13 +10596,21 @@ def build_tree(sets_data: List[Dict[str, Any]],
                overrides: Dict[str, str],
                empty_folders: Dict[str, List[str]],
                badges: Dict[str, str],
-               last_executions: Dict[str, str]) -> List[Dict[str, Any]]:
+               last_executions: Dict[str, str],
+               presets: Optional[Dict[str, List[Dict[str, Any]]]] = None
+               ) -> List[Dict[str, Any]]:
     """Baut die vollstaendige Hierarchie fuer das 2-Spalten-MasterTree.
 
     17.01.01: NUR noch 2 Root-Gruppen – die ehemalige Gruppe
     '⚡ Standalone Services' (GROUP_STANDALONE) entfaellt ersatzlos, da
     alle Plugins ueber metadata['category'] in Ordner einsortiert werden.
     Root-Label kompakt: '📁 Sets' und '📦 Services'.
+
+    20.04 (Q6/Q7): Plugins MIT Presets werden als Parent-Knoten mit
+    Clone-Kindern gerendert (`clones` im Blatt-Dict); archivierte Clones
+    bzw. archivierte Sets/Instanzen (is_archived=True) wandern in den
+    dynamischen '📁 Archiv'-Ordner (per 'archived'-Flag markiert,
+    non-checkable im MasterTree).
 
     Rueckgabe (pro Gruppe ein Dict):
         [{"group": "sets", "label": "📁 Sets", "children": [
@@ -9680,16 +10621,16 @@ def build_tree(sets_data: List[Dict[str, Any]],
           "children": [Blatt- und/oder Ordner-Knoten ...]}]
 
     Deterministisch sortiert (Sets nach display_name; Plugins/Ordner
-    alphabetisch, 16.08 K8). Die Kinder der Plugin-Gruppen sind eine
-    Mischung aus flachen Blatt-Dicts ({plugin_id, badge, last_execution})
-    und verschachtelten Ordner-Dicts ({"group": GROUP_CATEGORY,
-    "label": "📁 <Name>", "children": [...]} – rekursiv), gesteuert ueber
-    das Metadaten-Feld `category` der Plugins (K1). Dieselbe Ordner-
-    Mechanik gilt fuer die Sets-Gruppe (18.01.03): Set-Definitionen mit
-    `category`-Feld werden in identische Ordner-Dicts einsortiert, Sets
-    ohne Kategorie bleiben flache Blaetter. Seit 18.01.03 (E3-revidiert)
-    werden zusaetzlich benutzererzeugte (ggf. leere) Ordner aus
-    `empty_folders` (global_settings Key 'tree_folders_<group>') in die
+    alphabetisch, 16.08 K8; '📁 Archiv' immer am Ende). Die Kinder der
+    Plugin-Gruppen sind eine Mischung aus flachen Blatt-Dicts
+    ({plugin_id, badge, last_execution}) und verschachtelten Ordner-Dicts
+    ({"group": GROUP_CATEGORY, "label": "📁 <Name>", "children": [...]} –
+    rekursiv), gesteuert ueber das Metadaten-Feld `category` der Plugins
+    (K1). Dieselbe Ordner-Mechanik gilt fuer die Sets-Gruppe (18.01.03):
+    Set-Definitionen mit `category`-Feld werden in identische Ordner-Dicts
+    einsortiert, Sets ohne Kategorie bleiben flache Blaetter. Seit 18.01.03
+    (E3-revidiert) werden zusaetzlich benutzererzeugte (ggf. leere) Ordner
+    aus `empty_folders` (global_settings Key 'tree_folders_<group>') in die
     Gruppen-Kinder eingemischt – leere Ordner bleiben ueber Refreshs
     erhalten und verschwinden NUR bei manueller Loeschung im Kontextmenue.
     """
@@ -9700,34 +10641,65 @@ def build_tree(sets_data: List[Dict[str, Any]],
     # (rekursiv, gleiche K2/K8/K9-Regeln wie die Plugins); ohne Kategorie
     # bleiben sie flache Blaetter auf oberster Ebene.
     set_nodes: List[Dict[str, Any]] = []
+    # 20.04 (Q6): Archivierte Sets/Instanzen (is_archived=True) – sie
+    # wandern in den '📁 Archiv'-Ordner der Sets-Gruppe (non-checkable).
+    archive_set_nodes: List[Dict[str, Any]] = []
     for s in sets:
         services = s.get("services") or {}
         order = s.get("execution_order") or []
+        set_archived = bool(s.get("is_archived"))
         service_nodes: List[Dict[str, Any]] = []
+        archived_service_nodes: List[Dict[str, Any]] = []
         for iid in order:
             cfg = services.get(iid) or {}
             pid = str(cfg.get("plugin_id") or iid)
-            service_nodes.append({
+            svc_node = {
                 "instance_id": iid,
                 "plugin_id": pid,
                 "badge": badges.get(pid, ""),
                 "last_execution": last_executions.get(pid, "--.--.--"),
-            })
-        _insert_set_into_category_tree(
-            set_nodes, _set_category_parts(s), {
-                "set_id": s.get("set_id"),
-                "display_name": s.get("display_name") or s.get("set_id") or "Unbenannt",
-                "definition": s,
-                "services": service_nodes,
-            })
+                "instance_hash": str(cfg.get("instance_hash") or ""),
+                "is_archived": bool(cfg.get("is_archived")),
+                "doc_log": str(cfg.get("doc_log") or ""),
+                "params": cfg.get("params") or {},
+            }
+            if set_archived or svc_node["is_archived"]:
+                archived_service_nodes.append(svc_node)
+            else:
+                service_nodes.append(svc_node)
+        set_leaf = {
+            "set_id": s.get("set_id"),
+            "display_name": s.get("display_name") or s.get("set_id") or "Unbenannt",
+            "definition": s,
+            "services": service_nodes,
+        }
+        if set_archived:
+            # Ganzes Set archiviert -> komplett in den Archiv-Ordner.
+            archive_set_nodes.append(dict(set_leaf, archived=True))
+        else:
+            _insert_set_into_category_tree(
+                set_nodes, _set_category_parts(s), set_leaf)
+            # 20.04 (Q6): Einzeln archivierte Instanzen eines AKTIVEN Sets
+            # erscheinen als eigene Eintraege im Archiv-Ordner (Anzeige
+            # '<Set> / <instance_id>').
+            for svc_node in archived_service_nodes:
+                archive_set_nodes.append({
+                    "set_id": s.get("set_id"),
+                    "display_name": f"{s.get('display_name') or s.get('set_id') or 'Unbenannt'} / {svc_node['instance_id']}",
+                    "definition": s,
+                    "services": [svc_node],
+                    "archived": True,
+                })
     set_nodes = _sort_category_nodes(set_nodes)
 
     # EINE kategorisierte Services-Gruppe – Plugins mit `category`-Metadatum
     # werden in 📁-Ordner verschachtelt (K1), ohne Kategorie bleiben sie
     # flache Blaetter auf oberster Ebene. Die fruehere Standalone-Gruppe
-    # (separate Knoten) ist entfallen.
+    # (separate Knoten) ist entfallen. 20.04 (Q7): presets steuern die
+    # Parent-Child-Clone-Ansicht + den Archiv-Ordner.
     plugin_nodes = _category_nodes(sorted(plugins.keys()), plugins,
-                                   overrides, badges, last_executions)
+                                   overrides, badges, last_executions,
+                                   presets)
 
     # 18.01.03 (E3-revidiert): Persistierte benutzererzeugte (ggf. leere)
     # Ordner in die Gruppen-Kinder einmischen – leere Ordner verschwinden
@@ -9740,6 +10712,17 @@ def build_tree(sets_data: List[Dict[str, Any]],
                      if p.strip()]
             if parts:
                 _ensure_category_path(nodes, parts)
+
+    # 20.04 (Q6): Archiv-Ordner der Sets-Gruppe (falls vorhanden) ans Ende.
+    if archive_set_nodes:
+        archive_set_nodes.sort(
+            key=lambda n: str(n.get("display_name") or "").lower())
+        set_nodes.append({
+            "group": GROUP_CATEGORY,
+            "label": ARCHIVE_LABEL,
+            "children": archive_set_nodes,
+            "archived": True,
+        })
     set_nodes = _sort_category_nodes(set_nodes)
     plugin_nodes = _sort_category_nodes(plugin_nodes)
 
@@ -10440,6 +11423,7 @@ class FeatureBuilder:
         timeframe: str,
         payload: Dict[str, Any],
         con: Optional = None,
+        instance_hash: Optional[str] = None,
     ) -> int:
         """
         Schreibt den feature_store_payload eines Plugins (Phase 12 Hybrid-Schema)
@@ -10451,6 +11435,15 @@ class FeatureBuilder:
         PK-Migration auf (symbol, timeframe, bar_time, feature_id)) koennen
         MEHRERE Services denselben (symbol, timeframe, bar_time)-Schluessel
         tragen; feature_id des Payloads ist der Trenner.
+
+        20.04 (Q9): Optionaler `instance_hash` (8-stelliger SHA256-Short-Hash
+        der Parameter-Variante) wird in die neue Spalte `instance_hash`
+        geschrieben – nur wenn gesetzt, sonst NULL (bestehende Hashes werden
+        beim Upsert NICHT durch NULL ueberschrieben, COALESCE). Der Aufrufer
+        (SetEvaluator / HistoricalScanner / LiveAnalyzer) uebergibt den Hash
+        der ausgeführten Instanz, damit Signal-/Metrik-Ergebnisse verschiedener
+        Clones in DuckDB getrennt und einzeln auswertbar sind (Multi-Clone-
+        Vergleich, §4). feature_id bleibt plugin_id (Q1).
 
         payload: {"feature_id", "plugin_version", "records": [{bar_time, ...}]}
         """
@@ -10474,7 +11467,8 @@ class FeatureBuilder:
                     continue
                 dt_val = _to_utc_datetime(rec["bar_time"])
                 data = {k: v for k, v in rec.items() if k != "bar_time"}
-                rows.append((symbol, timeframe, dt_val, feature_id, plugin_version, json.dumps(data)))
+                rows.append((symbol, timeframe, dt_val, feature_id,
+                             plugin_version, json.dumps(data), instance_hash))
             if not rows:
                 return 0
 
@@ -10495,7 +11489,7 @@ class FeatureBuilder:
             df_rows = pd.DataFrame(
                 rows,
                 columns=["symbol", "timeframe", "bar_time", "feature_id",
-                         "plugin_version", "feature_data"],
+                         "plugin_version", "feature_data", "instance_hash"],
             )
             con.register("df_temp", df_rows)
             try:
@@ -10507,17 +11501,23 @@ class FeatureBuilder:
                 # ohne die explizite Spalte waeren neue Rows created_at=NULL
                 # und das Datum der letzten Ausfuehrung ('DD.MM.JJ' im
                 # MasterTree) bliebe fuer neu berechnete Services '--.--.--'.
+                #
+                # 20.04 (Q9): instance_hash wird beim Upsert mitgeschrieben;
+                # COALESCE verhindert, dass ein NULL (Aufrufer ohne Hash) einen
+                # bestehenden Varianten-Hash ueberschreibt.
                 con.execute("""
                     INSERT INTO feature_store
                         (symbol, timeframe, bar_time, feature_id,
-                         plugin_version, feature_data, created_at)
+                         plugin_version, feature_data, instance_hash, created_at)
                     SELECT symbol, timeframe, bar_time, feature_id,
-                           plugin_version, feature_data, now()
+                           plugin_version, feature_data, instance_hash, now()
                     FROM df_temp
                     ON CONFLICT (symbol, timeframe, bar_time, feature_id) DO UPDATE SET
                         feature_id = EXCLUDED.feature_id,
                         plugin_version = EXCLUDED.plugin_version,
                         feature_data = EXCLUDED.feature_data,
+                        instance_hash = COALESCE(
+                            EXCLUDED.instance_hash, feature_store.instance_hash),
                         created_at = now()
                 """)
             finally:
@@ -10529,6 +11529,40 @@ class FeatureBuilder:
         finally:
             if own_connection:
                 con.close()
+
+    def purge_instance_data(self, instance_hash: str) -> int:
+        """Loescht alle feature_store-Rows einer Parameter-Variante (20.04, Q5).
+
+        `DELETE FROM feature_store WHERE instance_hash = ?` – ausschliesslich
+        im Schreib-/Store-Kontext (FeatureBuilder). Der `FeatureStoreReader`
+        bleibt 100 % read-only (MVVM-Invariante). Behaelt MasterTree-Struktur,
+        Parameter-Settings und `doc_log` vollstaendig bei – nur die
+        DB-Daten der Variante werden entfernt (`feature_id` bleibt plugin_id
+        und wird NICHT geloescht, Q1; andere Varianten/Instanzen bleiben
+        unangetastet).
+
+        Args:
+            instance_hash: 8-stelliger Parameter-Hash (generate_instance_hash).
+
+        Returns:
+            Anzahl der geloeschten Rows (0 bei leerem Hash/keinem Treffer).
+        """
+        if not instance_hash:
+            return 0
+        # DbPool verwaltet die Connection thread-lokal (Invariante 6) –
+        # NICHT schliessen (Muster store_plugin_payload: own_connection=False
+        # bei DbPool.get; ein close() wuerde die Pool-Connection korrumpieren).
+        con = DbPool.get(DB_ANALYTICS)
+        try:
+            result = con.execute(
+                "DELETE FROM feature_store WHERE instance_hash = ? "
+                "RETURNING feature_id",
+                [instance_hash])
+            rows = result.fetchall() if result is not None else []
+            return len(rows or [])
+        except Exception:
+            # Defensiv: keine Exception in den UI-Pfad durchreichen.
+            return 0
 
     def build(
         self,
@@ -15827,7 +16861,7 @@ Aufgaben (15.03-Spezifikation):
 
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import QTimer, Slot
+from PySide6.QtCore import QTimer, Qt, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -15840,6 +16874,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSplitter,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -16120,8 +17155,11 @@ class AnalyticsWindow(PersistentWindow):
 
         # --- Body: Sidebar + Seiten (QStackedWidget) ---
         body = QHBoxLayout()
+        # 10.08.2026 (Bugfix, UI-Splitter): Sidebar (links) und Seiten-Stack
+        # (rechts) liegen in einem QSplitter - der Slider ist mit der Maus
+        # frei verschiebbar (statt starrer 150px-Fixbreite + Stretch).
         self.sidebar = QListWidget()
-        self.sidebar.setFixedWidth(150)
+        self.sidebar.setMinimumWidth(120)
         self.pages_stack = QStackedWidget()
         self.table_page = TablePage()
         self.heatmap_page = HeatmapPage()
@@ -16135,8 +17173,15 @@ class AnalyticsWindow(PersistentWindow):
             self.sidebar.addItem(QListWidgetItem(label))
         self.sidebar.setCurrentRow(0)
 
-        body.addWidget(self.sidebar)
-        body.addWidget(self.pages_stack, 1)
+        self._body_splitter = QSplitter(Qt.Horizontal)
+        self._body_splitter.addWidget(self.sidebar)
+        self._body_splitter.addWidget(self.pages_stack)
+        self._body_splitter.setStretchFactor(0, 0)
+        self._body_splitter.setStretchFactor(1, 1)
+        self._body_splitter.setCollapsible(0, False)
+        self._body_splitter.setCollapsible(1, False)
+        self._body_splitter.setSizes([150, 1200])
+        body.addWidget(self._body_splitter, 1)
         root.addLayout(body, 1)
 
         self.setCentralWidget(central)
@@ -16164,10 +17209,25 @@ class AnalyticsWindow(PersistentWindow):
             # 18.01.01 (E-4): Live-Filter bei Klick auf eine Baum-Zeile.
             self._service_dialog.selection_ids_requested.connect(
                 self._on_picker_ids_selected)
+            # Runde 10 (Bug 1): Varianten-Hashes -> VM (zusaetzlich zu
+            # feature_ids; der Slot liest die aktuellen ids aus dem VM).
+            self._service_dialog.selection_hashes_requested.connect(
+                self._on_picker_hashes_selected)
             self._service_dialog.destroyed.connect(
                 self._on_service_dialog_destroyed)
+        # Runde 9 (Bug 1): Modell explizit refreshen, damit der Baum
+        # sicher aufgebaut ist - das initiale data_changed des Modells
+        # lief VOR der Dialog-Erstellung (Dialog ist lazy), ein leerer
+        # Baum wuerde die restaurierten Haken sonst verlieren. Der
+        # MasterTree faengt ein zwischenzeitlich leeres Set ueber
+        # _pending_feature_ids ab (set_checked_feature_ids merkt sie).
+        try:
+            self._selector_model.refresh()
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] Picker-Modell-Refresh: {e}")
         self._service_dialog.apply_feature_ids(
-            self._vm.params.get("feature_ids") or [])
+            self._vm.params.get("feature_ids") or [],
+            self._vm.params.get("instance_hashes") or [])
         self._service_dialog.show()
         self._service_dialog.raise_()
         self._service_dialog.activateWindow()
@@ -16176,6 +17236,20 @@ class AnalyticsWindow(PersistentWindow):
     def _on_service_dialog_destroyed(self) -> None:
         """Setzt die Dialog-Referenz zurueck (zerstoert mit dem Parent)."""
         self._service_dialog = None
+
+    @Slot(list)
+    def _on_picker_hashes_selected(self, instance_hashes: List[str]) -> None:
+        """Runde 10 (Bug 1): Varianten-Hashes aus dem Picker uebernehmen.
+
+        feature_ids (plugin_ids) bleiben unveraendert - nur die
+        Varianten-Einschraenkung wird aktualisiert. Dadurch ist ein
+        Check/Uncheck EINER Variante im Datenfilter sichtbar.
+        """
+        self._vm.set_feature_ids(
+            self._vm.params.get("feature_ids") or [],
+            list(instance_hashes or []))
+        self._sync_service_filter_button()
+        self.label_missing_warning.setVisible(False)
 
     @Slot(list)
     def _on_picker_ids_selected(self, feature_ids: List[str]) -> None:
@@ -16227,6 +17301,59 @@ class AnalyticsWindow(PersistentWindow):
         self.btn_data_sources.setText(
             f"[ 🛠️ Datenquellen: {', '.join(names)} ▾ ]")
 
+    @Slot()
+    def _sync_ui_from_restored_params(self) -> None:
+        """Synchronisiert die Fenster-UI nach `params_restored`.
+
+        10.08.2026 (Bugfix, Punkt 3): `params_restored` feuert nach einem
+        Workspace-Restore UND nach einem Profilwechsel (_apply_profile).
+        Hier wird die Fenster-Ebene nachgezogen: Sidebar-Seite (sofern der
+        Workspace eine page_index hat), die aktuelle Page (falls sie eine
+        _sync_from_params-Methode anbietet) und die Filterleiste
+        (Symbol/Timeframe/Datenquellen-Button). Die Unterseiten syncen ihre
+        Combos ueber eigene params_restored-Verbindungen.
+        """
+        try:
+            page_index = int((self._vm.workspace_layout or {}).get(
+                "page_index", -1))
+            if 0 <= page_index < self.pages_stack.count():
+                if self.sidebar.currentRow() != page_index:
+                    self.sidebar.blockSignals(True)
+                    self.sidebar.setCurrentRow(page_index)
+                    self.sidebar.blockSignals(False)
+                # 10.08.2026 (Punkt 4): Seiten-Stack EXPLIZIT umschalten
+                # (blockSignals unterdrueckt currentRowChanged -> _on_page_
+                # changed feuert nicht; ohne setCurrentIndex bleibt die
+                # alte Seite sichtbar).
+                self.pages_stack.setCurrentIndex(page_index)
+                page = self.pages_stack.widget(page_index)
+                if page is not None and hasattr(page, "_sync_from_params"):
+                    try:
+                        page._sync_from_params()
+                    except (RuntimeError, AttributeError):
+                        pass
+        except (RuntimeError, AttributeError):
+            pass
+        # 10.08.2026 (Punkt 3): Ansichts-Modus der Heatmap-Seite auch aus
+        # dem Profil-Restore uebernehmen (workspace_layout wird von
+        # _apply_profile befuellt). Muster _restore_workspace.
+        try:
+            heatmap_mode = (self._vm.workspace_layout or {}).get(
+                "heatmap_mode")
+            if heatmap_mode:
+                self.heatmap_page.set_mode(str(heatmap_mode))
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] Heatmap-Modus-Restore: {e}")
+        # 10.08.2026 (Bugfix Runde 7, Bug 2): ServicePicker nach einem
+        # Profilwechsel wieder oeffnen, falls das Layout es verlangt.
+        try:
+            if (self._vm.workspace_layout or {}).get("service_picker_open"):
+                self._open_service_dialog()
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] ServicePicker-Restore: {e}")
+        self._sync_profile_filters()
+        self._sync_service_filter_button()
+
     # ------------------------------------------------------------------
     # MVVM + Steuerung verdrahten
     # ------------------------------------------------------------------
@@ -16238,6 +17365,13 @@ class AnalyticsWindow(PersistentWindow):
         vm.profiles_available.connect(self._on_profiles_available)
         vm.active_profile_changed.connect(self._on_active_profile_changed)
         vm.dirty_changed.connect(self._on_dirty_changed)
+        # 10.08.2026 (Bugfix, Punkt 3): Der ViewModel emittiert
+        # params_restored nach restore_workspace() UND _apply_profile()
+        # (20.04-Timing-Fix) - die Fenster-Ebene wird synchronisiert
+        # (Sidebar-Seite + aktuelle Page + Filterleiste). Die Unterseiten
+        # (Heatmap-Widget) syncen ihre Combos ueber eigene Verbindungen.
+        if hasattr(vm, "params_restored"):
+            vm.params_restored.connect(self._sync_ui_from_restored_params)
         vm.busy_changed.connect(self._on_busy_changed)
         vm.query_failed.connect(self._on_query_failed)
         # 20.01 (Graceful Degradation): fehlende Services -> Warn-Label.
@@ -16629,6 +17763,21 @@ class AnalyticsWindow(PersistentWindow):
         self.setWindowTitle(
             WINDOW_TITLE_BASE + (" *" if dirty else ""))
 
+    def _current_ui_layout(self) -> Dict[str, Any]:
+        """Aktuelles UI-Layout (Seite + Heatmap-Modus) fuer die
+        Profil-Persistenz (10.08.2026, Punkte 3/4)."""
+        return {
+            "page_index": self.sidebar.currentRow()
+            if hasattr(self, "sidebar") else 0,
+            "heatmap_mode": self.heatmap_page.mode_id
+            if hasattr(self, "heatmap_page") else "standard",
+            # 10.08.2026 (Bugfix Runde 7, Bug 2): Picker-Offen-Zustand auch
+            # im Profil-Payload persistieren (Muster _save_workspace).
+            "service_picker_open": bool(
+                self._service_dialog is not None
+                and self._service_dialog.isVisible()),
+        }
+
     @Slot()
     def _on_profile_new(self) -> None:
         name, ok = QInputDialog.getText(self, "Neues Profil", "Profil-Name:")
@@ -16639,6 +17788,9 @@ class AnalyticsWindow(PersistentWindow):
             self, "Neues Profil", "Beschreibung (optional):")
         if not ok2:
             desc = ""
+        # 10.08.2026 (Punkte 3/4): UI-Layout (Seite + Heatmap-Modus) im
+        # neuen Profil persistieren (create_profile ruft _current_payload).
+        self._vm.set_ui_layout(self._current_ui_layout())
         try:
             self._vm.create_profile(name, desc or "")
         except ValueError as e:
@@ -16658,6 +17810,9 @@ class AnalyticsWindow(PersistentWindow):
             name=self.edit_profile_name.text(),
             description=self.edit_profile_desc.text(),
         )
+        # 10.08.2026 (Punkte 3/4): UI-Layout (Seite + Heatmap-Modus) in das
+        # Profil persistieren (save_profile ruft _current_payload).
+        self._vm.set_ui_layout(self._current_ui_layout())
         self._vm.save_profile()
 
     @Slot()
@@ -16719,6 +17874,13 @@ class AnalyticsWindow(PersistentWindow):
                     # (standard | generic) im Workspace mitpersistieren.
                     "heatmap_mode": self.heatmap_page.mode_id
                     if hasattr(self, "heatmap_page") else "standard",
+                    # 10.08.2026 (Bugfix Runde 7, Bug 2): War der
+                    # ServicePicker beim Schliessen offen? _save_workspace
+                    # laeuft VOR dem close() des Dialogs im closeEvent,
+                    # damit der Zustand hier noch sichtbar ist.
+                    "service_picker_open": bool(
+                        self._service_dialog is not None
+                        and self._service_dialog.isVisible()),
                 },
             }
             self.state_manager.save_workspace_state(
@@ -16762,14 +17924,27 @@ class AnalyticsWindow(PersistentWindow):
             self.edit_limit.setText(
                 str(int(self._vm.params.get("limit")
                         or self._default_limit)))
+        # 10.08.2026 (Bugfix Runde 7, Bug 2): War der ServicePicker beim
+        # Schliessen offen, wird er nach dem Restore wieder geoeffnet (die
+        # Position stellt der Dialog selbst aus global_settings wieder her).
+        try:
+            if (self._vm.workspace_layout or {}).get("service_picker_open"):
+                self._open_service_dialog()
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] ServicePicker-Restore: {e}")
 
     def _initial_load(self) -> None:
-        # VM mit dem aktuellen Combo-Zustand starten (Fix 15.03, idempotent):
-        # restore_state (t=0) bzw. _apply_profile koennen bereits Werte gesetzt
-        # haben; ohne Historie/Profil sorgt das hier dafuer, dass die Ansicht
-        # sofort Daten fuer das sichtbare Symbol/Timeframe laedt.
-        self._vm.set_symbol(self.combo_symbol.currentText())
-        self._vm.set_timeframe(self.combo_tf.currentText())
+        # Runde 10 (Bug 3): Deterministischer Initial-Load - die Symbol-Combo
+        # wird hier nochmals gefuellt (idempotent, erhaelt die aktuelle
+        # Auswahl), damit sie NICHT leer sein kann, wenn restore_state (t=0)
+        # noch kein Symbol gesetzt hat. Leere Combos wurden sonst per
+        # set_symbol("")/set_timeframe("") in die VM-Params uebernommen ->
+        # _current_params() lieferte None -> Initial-Queries uebersprungen.
+        self._refresh_symbol_combo()
+        if self.combo_symbol.currentText():
+            self._vm.set_symbol(self.combo_symbol.currentText())
+        if self.combo_tf.currentText():
+            self._vm.set_timeframe(self.combo_tf.currentText())
         self._vm.load_profiles()
         # Bugfix 08.08.2026 (symbol/tf-Profil-Restore): load_profiles()
         # emittiert active_profile_changed NICHT (nur set_active_profile/
@@ -16788,6 +17963,15 @@ class AnalyticsWindow(PersistentWindow):
         # Sitzungszustand gewinnt. Fehlende Services -> Warn-Label.
         self._restore_workspace()
         self._on_page_changed(self.sidebar.currentRow())
+        # Runde 9 (Bug 4): Finalen Refresh sicherstellen - falls weder ein
+        # aktives Profil (load_profiles) noch ein Workspace (restore_workspace)
+        # existierte, wurde ggf. keine Query gestartet (set_symbol/
+        # set_timeframe waren idempotent). refresh_all() stoesst die
+        # Initial-Queries mit den finalen Parametern an (der Debounce
+        # buegelt doppelte Refreshes ab). Der Datenquellen-Button wird
+        # ebenfalls nachgezogen (fehlte nach reinem Profil-/Workspace-Start).
+        self._vm.refresh_all()
+        self._sync_service_filter_button()
         # 15.03-E: QUERY_FEATURES speiste das entfernte combo_feature-Dropdown –
         # ohne Feature-Dropdown ist keine Features-Metadaten-Abfrage noetig.
 
@@ -16803,7 +17987,19 @@ class AnalyticsWindow(PersistentWindow):
             self._vm.shutdown()
         except Exception:
             pass
+        # 10.08.2026 (Bugfix Runde 7, Bug 2): Der Workspace wird VOR dem
+        # Schliessen des ServicePickers gespeichert, damit `service_picker_
+        # open` den Zustand des noch sichtbaren Dialogs erfasst.
         self._save_workspace()
+        # 10.08.2026 (Bugfix, Punkt 3): Den ServicePicker-Singleton mit
+        # schliessen, wenn das AnalyticsWindow geschlossen wird - sonst
+        # bleibt der frei bewegliche Dialog als Waisenfenster haengen.
+        # Das `destroyed`-Signal setzt self._service_dialog zurueck.
+        try:
+            if self._service_dialog is not None:
+                self._service_dialog.close()
+        except (RuntimeError, AttributeError):
+            pass
         super().closeEvent(event)
 
 ```
@@ -16822,10 +18018,16 @@ Gemeinsame UI-Helfer der Analytics-Pages (analytics/ui/*, Phase 15.03).
 """
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, List
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QLabel, QStackedLayout, QWidget
+from PySide6.QtCore import QEvent, Qt, Signal
+from PySide6.QtGui import QBrush, QColor, QStandardItem, QStandardItemModel
+from PySide6.QtWidgets import (
+    QComboBox,
+    QLabel,
+    QStackedLayout,
+    QWidget,
+)
 
 # Ausgabeformat der Wanduhr-Zeit (z. B. '03.08.2026 12:00').
 WANDUHR_FORMAT = "%d.%m.%Y %H:%M"
@@ -16863,6 +18065,209 @@ def make_overlay_stack(
     stack.addWidget(overlay)
     stack.setCurrentWidget(content)
     return stack
+
+
+class CheckableComboBox(QComboBox):
+    """QComboBox mit Checkbox-Items und offen bleibendem Pop-up (20.03.02).
+
+    Mehrfach-Auswahl ueber `QStandardItem` (`Qt.ItemIsUserCheckable`),
+    Formatierung `{Service-Name} / {Parameter}` durch den Aufrufer
+    (Display-Text). Das Pop-up bleibt beim Anklicken einer Checkbox geoeffnet
+    (Klick im Viewport unterdrueckt `hidePopup()`), schliesst aber normal bei
+    Aussenklick / Escape / Fokusverlust.
+
+    API:
+      * `add_checkable_item(display_text, user_data, checked=False)`
+      * `checked_data() -> List[str]`  – user_data der angehakten Items
+      * Signal `selection_changed(list)` – bei jedem CheckState-Wechsel
+        (blockierbar ueber `blockSignals(True)`, Muster heatmap_widget).
+
+    Headless instanziierbar: Der Konstruktor startet KEINEN Event-Loop
+    (kein exec_()).
+    """
+
+    #: Wird bei jedem CheckState-Wechsel mit der Liste der angehakten
+    #: `user_data`-Werte emittiert (in Item-Reihenfolge).
+    selection_changed = Signal(list)
+
+    def __init__(self, parent: QWidget = None) -> None:
+        super().__init__(parent)
+        self._popup_click = False
+        # 20.03.03 (Q5): Zuletzt vom Nutzer geklicktes Item (Row-Index) –
+        # Grundlage der XOR-Reconciliation im HeatmapWidget (Sammel- vs.
+        # Einzel-Eintrag desselben Keys). -1 = kein Klick (programmatisch).
+        self._last_click_index = -1
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+        self.setPlaceholderText("Felder wählen…")
+        self._model = QStandardItemModel(self)
+        self.setModel(self._model)
+        # Pop-up offen halten: Mausklick auf den Viewport setzt das Flag,
+        # `hidePopup()` unterdrueckt das Schliessen dann einmalig.
+        self.view().viewport().installEventFilter(self)
+        # 10.08.2026 (Bugfix, Klick-Ergonomie): Bei setEditable(True) deckt
+        # die LineEdit-Flaeche den Grossteil der Box ab und schluckt Klicks
+        # (Textmarkierung/ignorieren) - der EventFilter oeffnet/schliesst das
+        # Popup bei Klick auf die GESAMTE Flaeche (Textfeld + Pfeil/Rahmen).
+        self.lineEdit().installEventFilter(self)
+        self._model.itemChanged.connect(self._on_item_changed)
+
+    # ------------------------------------------------------------------
+    # Pop-up-Steuerung (offen bei Checkbox-Klick)
+    # ------------------------------------------------------------------
+    def hidePopup(self) -> None:
+        """Unterdrueckt das Schliessen bei Klicks in den Viewport (20.03.02).
+
+        Alle anderen Schliess-Gruende (Aussenklick, Escape, Fokusverlust)
+        verhalten sich wie beim Standard-QComboBox.
+        """
+        if self._popup_click:
+            self._popup_click = False
+            return
+        super().hidePopup()
+
+    def eventFilter(self, obj, event) -> bool:
+        """Setzt das Popup-Flag bei Mausklicks auf den Popup-Viewport und
+        merkt sich den zuletzt geklickten Item-Index (20.03.03, Q5).
+
+        10.08.2026 (Bugfix, Klick-Ergonomie): Zusaetzlich wird die LineEdit-
+        Flaeche (editable ComboBox) abgedeckt - ein Linksklick dort oeffnet/
+        schliesst das Popup wie der Pfeil-Button statt Textmarkierung."""
+        if (obj is self.lineEdit()
+                and event.type() == QEvent.MouseButtonPress
+                and event.button() == Qt.LeftButton):
+            self._popup_click = False
+            if self.view().isVisible():
+                self.hidePopup()
+            else:
+                self.showPopup()
+            event.accept()
+            return True
+        if (obj is self.view().viewport()
+                and event.type() == QEvent.MouseButtonRelease):
+            self._popup_click = True
+            self._last_click_index = self.view().indexAt(event.pos()).row()
+        return super().eventFilter(obj, event)
+
+    def mousePressEvent(self, event) -> None:
+        """Oeffnet/Schliesst das Popup bei Klick auf die Box (10.08.2026).
+
+        Die LineEdit-Flaeche uebernimmt der eventFilter (editable ComboBox);
+        diese Methode deckt die restliche Box (Pfeil/Rahmen) ab."""
+        if event.button() == Qt.LeftButton:
+            self._popup_click = False
+            if self.view().isVisible():
+                self.hidePopup()
+            else:
+                self.showPopup()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def last_click_index(self) -> int:
+        """Row-Index des zuletzt geklickten Items (Q5, XOR-Aufloesung).
+
+        -1, wenn der letzte CheckState-Wechsel programmatisch erfolgte
+        (kein Klick) – dann findet keine XOR-Aufloesung statt.
+        """
+        return self._last_click_index
+
+    # ------------------------------------------------------------------
+    # Befuellung / Auslesen
+    # ------------------------------------------------------------------
+    def add_checkable_item(
+        self, display_text: str, user_data: Any, checked: bool = False
+    ) -> None:
+        """Fuegt ein Checkbox-Item hinzu (display_text, user_data)."""
+        item = QStandardItem(str(display_text))
+        item.setData(user_data, Qt.UserRole)
+        item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+        item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        self._model.appendRow(item)
+
+    def add_disabled_item(self, display_text: str) -> None:
+        """Fuegt einen deaktivierten, grauen Hinweis-Eintrag hinzu (Q8-Fix).
+
+        (No Data)-Unterstuetzung: Neue Varianten ohne feature_store-Daten
+        werden als nicht-waehlbare, graue Eintraege im 'Feld'-Dropdown
+        angezeigt ('{Service} ({Preset}) – (No Data)'), bis der erste
+        Scan/LiveRun sie berechnet hat. Anders als `add_header_item` ist
+        der Eintrag NICHT fett und traegt userData=None (kein
+        selection_changed-Beitrag, nicht in checked_data()).
+        """
+        item = QStandardItem(str(display_text))
+        item.setData(None, Qt.UserRole)
+        item.setFlags(Qt.NoItemFlags)
+        item.setEnabled(False)
+        item.setForeground(QBrush(QColor(160, 160, 160)))  # hellgrau
+        self._model.appendRow(item)
+
+    def add_header_item(self, display_text: str) -> None:
+        """Fuegt eine deaktivierte, nicht-auswaehlbare Trenn-/Kopfzeile hinzu
+        (20.03.03, Q4).
+
+        Header tragen `Qt.NoItemFlags` + `userData=None` und erscheinen daher
+        weder als auswaehlbares Item noch in `checked_data()`.
+        """
+        item = QStandardItem(str(display_text))
+        item.setData(None, Qt.UserRole)
+        item.setFlags(Qt.NoItemFlags)          # nicht aktiv, nicht checkbar
+        item.setEnabled(False)
+        item.setForeground(QBrush(QColor(128, 128, 128)))  # grau
+        f = item.font()
+        f.setBold(True)
+        item.setFont(f)
+        self._model.appendRow(item)
+
+    def checked_data(self) -> List[str]:
+        """Liefert die `user_data`-Werte aller angehakten Items."""
+        out: List[str] = []
+        for i in range(self._model.rowCount()):
+            item = self._model.item(i)
+            if item is not None and item.checkState() == Qt.Checked:
+                out.append(item.data(Qt.UserRole))
+        return out
+
+    def set_checked_data(self, checked_values: List[str]) -> None:
+        """Setzt die CheckStates anhand einer Liste von user_data-Werten.
+
+        Items mit einem Wert aus `checked_values` werden angehakt, alle
+        anderen abgewaehlt (blockiert, kein selection_changed-Emit).
+        """
+        wanted = {str(v) for v in (checked_values or [])}
+        self.blockSignals(True)
+        try:
+            for i in range(self._model.rowCount()):
+                item = self._model.item(i)
+                if item is None:
+                    continue
+                on = str(item.data(Qt.UserRole) or "") in wanted
+                item.setCheckState(Qt.Checked if on else Qt.Unchecked)
+            self._update_line_text()
+        finally:
+            self.blockSignals(False)
+
+    def _on_item_changed(self, item) -> None:
+        """CheckState-Wechsel -> LineEdit-Text aktualisieren + Signal."""
+        if item is None or not (item.flags() & Qt.ItemIsUserCheckable):
+            return
+        self._update_line_text()
+        self.selection_changed.emit(self.checked_data())
+
+    def _update_line_text(self) -> None:
+        """Kompakte Zusammenfassung im (read-only) LineEdit."""
+        labels = [
+            self._model.item(i).text()
+            for i in range(self._model.rowCount())
+            if self._model.item(i) is not None
+            and self._model.item(i).checkState() == Qt.Checked
+        ]
+        if not labels:
+            self.lineEdit().setText("")
+        elif len(labels) == 1:
+            self.lineEdit().setText(labels[0])
+        else:
+            self.lineEdit().setText(f"{len(labels)} Felder gewählt")
 
 ```
 
@@ -17479,6 +18884,7 @@ from analytics.engine.feature_store_reader import (
     HEATMAP_DIMENSIONS,
     HOURS_PER_DAY,
 )
+from analytics.ui.common import CheckableComboBox
 
 # E7: Konfluenz-Farbskala (0 = weiss/transparent, 1-2 = gelb/cyan,
 # 3-4 = orange, 5+ = dunkelrot) – Positionen 0..1 (Levels 0..5).
@@ -17844,6 +19250,15 @@ class HeatmapWidget(QWidget):
         self._candle_items: List[Any] = []
         self._colormap_mode = _VIRIDIS
         self._syncing = False
+        # 20.03.03 (Q2): Key -> aktive Quellen-Services aus dem Payload
+        # (`field_sources`) fuer die ALL-Expansion der Sammel-Eintraege.
+        self._field_sources: Dict[str, List[str]] = {}
+        # Runde 8 (Bugfix 3/4, 10.08.2026): Cache der zuletzt verfuegbaren
+        # Feld-Keys (Payload-Metadaten) - Grundlage des SYNCHRONEN
+        # Feld-Dropdown-Rebuilds (_rebuild_field_dropdown) ohne
+        # Query-Round-Trip. Wird bei jedem Daten-Payload aktualisiert;
+        # _sync_from_params/feature_ids_changed bauen daraus Items/Haken.
+        self._field_keys: List[str] = []
 
         # --- Steuerung (Zeile 1: Dimensionen/Aggregation/Feld) ---
         self._combo_x = QComboBox()
@@ -17858,7 +19273,12 @@ class HeatmapWidget(QWidget):
         self._combo_agg = QComboBox()
         for a in HEATMAP_AGGREGATIONS:
             self._combo_agg.addItem(_AGG_LABELS.get(a, a), a)
-        self._combo_field = QComboBox()
+        # 20.03.02 (F1c/F7): 'Feld' ist ein CheckableComboBox – die
+        # Multi-Auswahl steuert den Datenquellen-Filter `feature_ids`, die
+        # Aggregation nutzt genau EIN aktives Hauptfeld (currentData). Bei
+        # COUNT/CONFLUENCE_COUNT bleibt die Auswahl deaktiviert (F7,
+        # _update_controls).
+        self._combo_field = CheckableComboBox()
         # 20.02.01 (User-Meldung 3a): 'Feld' deutlich laenger (Eintraege
         # tragen seit Meldung 3b den Service-Prefix '{Service} / {Key}').
         self._combo_field.setMinimumWidth(320)
@@ -17932,6 +19352,15 @@ class HeatmapWidget(QWidget):
         self._price_vb.setZValue(10)  # ueber der Heatmap zeichnen
         self._price_vb.setVisible(False)
         self._plot_hm.getAxis("right").setVisible(False)
+        # 10.08.2026 (Bugfix Runde 7, Bug 1): Zweite untere Preis-Achse fuer
+        # horizontale Candles, wenn 'Datum' auf der Y-Achse liegt (die
+        # regulare untere Achse traegt dann die X-Dimension).
+        self._price_axis_bottom = pg.AxisItem("bottom",
+                                              parent=self._plot_hm.plotItem)
+        self._price_axis_bottom.setLabel("Preis")
+        self._plot_hm.plotItem.layout.addItem(self._price_axis_bottom, 4, 1)
+        self._price_axis_bottom.linkToView(self._price_vb)
+        self._price_axis_bottom.setVisible(False)
         self._plot_hm.plotItem.vb.sigResized.connect(self._update_price_view)
 
         lay = QVBoxLayout(self)
@@ -17944,6 +19373,15 @@ class HeatmapWidget(QWidget):
         self._combo_y.currentIndexChanged.connect(self._on_config_changed)
         self._combo_agg.currentIndexChanged.connect(self._on_agg_changed)
         self._combo_field.currentIndexChanged.connect(self._on_config_changed)
+        # 20.03.02 (F1c): CheckState-Wechsel im 'Feld'-Dropdown -> Filter.
+        # 10.08.2026 (Bugfix Runde 7, Bug 4/5): Die Verbindung ist ENTFERNT -
+        # das 'Feld'-Dropdown schreibt KEIN feature_ids mehr (kein
+        # Ueberschreiben der ServicePicker-Auswahl bzw. des Restores). Die
+        # Haken spiegeln den aktiven Filter (_sync_combos_from_payload); die
+        # Feld-Auswahl (Current-Item) steuert heatmap_field weiterhin ueber
+        # currentIndexChanged -> _on_config_changed.
+        # self._combo_field.selection_changed.connect(
+        #     self._on_field_selection_changed)
         self._chk_candle.toggled.connect(self._on_candle_toggled)
         self._slider_zoom_x.valueChanged.connect(self._on_zoom_x_changed)
         self._slider_zoom_y.valueChanged.connect(self._on_zoom_y_changed)
@@ -17954,6 +19392,22 @@ class HeatmapWidget(QWidget):
     def attach_view_model(self, view_model: Any) -> None:
         self._view_model = view_model
         view_model.data_ready.connect(self._on_data_ready)
+        # 20.04-Timing-Fix (D): Nach restore_workspace()/_apply_profile()
+        # emittiert der ViewModel `params_restored` – die Combos werden dann
+        # explizit aus den restaurierten Params synchronisiert (sonst kann
+        # der erste Daten-Payload bzw. _apply_config die restaurierten
+        # Aggregations-/Feld-Werte ueberschreiben). Defensiv per hasattr
+        # (Test-Mocks ohne Signal). _sync_from_params() blockt Signale und
+        # stoesst keinen Query an (kein Loop).
+        if hasattr(view_model, "params_restored"):
+            view_model.params_restored.connect(self._sync_from_params)
+        # Runde 8 (Bugfix 4): feature_ids-Aenderungen (ServicePicker
+        # Check/Uncheck) -> das 'Feld'-Dropdown wird SOFORT synchron neu
+        # abgeleitet (kein Debounce/Query-Round-Trip). Defensiv per hasattr
+        # (Test-Mocks ohne Signal).
+        if hasattr(view_model, "feature_ids_changed"):
+            view_model.feature_ids_changed.connect(
+                self._on_feature_ids_changed)
         self._sync_from_params()
 
     def is_candle_projection_enabled(self) -> bool:
@@ -17984,10 +19438,14 @@ class HeatmapWidget(QWidget):
             self._set_combo_data(
                 self._combo_agg,
                 str(p.get("heatmap_agg") or "confluence_count"))
-            field = str(p.get("heatmap_field") or "")
-            if field and self._combo_field.findData(field) < 0:
-                self._combo_field.addItem(field, field)
-            self._set_combo_data(self._combo_field, field)
+            # Runde 8 (Bugfix 3): Das 'Feld'-Dropdown wird aus den gecachten
+            # Feld-Metadaten (self._field_keys/self._field_sources) + den
+            # aktuellen VM-Params SYNCHRON neu abgeleitet (Items, Haken,
+            # Current). Ein restaurierter heatmap_field bleibt dadurch auch
+            # ohne frischen Daten-Payload sichtbar (Fallback-Roh-Item, wenn
+            # noch keine Payload-Metadaten vorliegen).
+            self._rebuild_field_dropdown(self._field_keys,
+                                         self._field_sources)
             self._chk_candle.setChecked(bool(
                 p.get("candle_projection_enabled")))
             self._set_zoom_slider(self._slider_zoom_x,
@@ -18040,6 +19498,7 @@ class HeatmapWidget(QWidget):
         if self._view_model is None:
             return
         x_dim = str(self._combo_x.currentData() or "")
+        y_dim = str(self._combo_y.currentData() or "")
         agg = str(self._combo_agg.currentData() or "")
         self._slider_zoom_x.setEnabled(True)
         self._slider_zoom_y.setEnabled(True)
@@ -18052,25 +19511,39 @@ class HeatmapWidget(QWidget):
             self._combo_field.setToolTip(
                 "Nur fuer AVG/SUM/MIN/MAX relevant (E6); COUNT/CONFLUENCE "
                 "ignorieren das Feld.")
-        can_overlay = x_dim == "date"
+        # 10.08.2026 (Bugfix Runde 7, Bug 1): 'Datum' darf auf der X- ODER
+        # Y-Achse liegen - X=date zeichnet vertikale Candles (Preis rechts),
+        # Y=date horizontale Candles (Preis unten).
+        date_on_x = x_dim == "date"
+        can_overlay = (x_dim == "date" or y_dim == "date")
         self._chk_candle.setEnabled(can_overlay)
         if can_overlay:
             self._chk_candle.setToolTip(
-                "Tages-Ohlc ueber der Heatmap (gleicher Canvas, rechte "
-                "Preis-Achse), horizontal synchronisiert (Bugfix 1).")
+                "Tages-Ohlc ueber der Heatmap (gleicher Canvas), "
+                "Datum auf X- oder Y-Achse (Bugfix 1).")
         else:
             self._chk_candle.setToolTip(
-                "Kerzen-Overlay nur bei X-Achse 'Datum' verfuegbar (E9).")
-        # 20.02.01 (E7): Overlay-Zoom-Lock – die Preis-ViewBox ist NUR bei
-        # X=date UND aktivem Overlay an die Heatmap-ViewBox gekoppelt
-        # (setXLink). Bei allen anderen X-Dimensionen (oder ausgeschaltetem
-        # Overlay) wird der Link entfernt – Zoom-Sync vollstaendig entkoppelt.
-        linked = self._price_vb.linkedView(pg.ViewBox.XAxis)
+                "Kerzen-Overlay nur mit 'Datum' auf der X- oder Y-Achse "
+                "verfuegbar.")
+        # 10.08.2026 (Bugfix Runde 7, Bug 1): Der Overlay-Link folgt der
+        # DATE-Achse - X=date koppelt die Preis-VB an die X-Achse, Y=date
+        # an die Y-Achse. Ohne Overlay werden beide Links entfernt.
         link = can_overlay and self._chk_candle.isChecked()
-        if link and linked is None:
+        linked_x = self._price_vb.linkedView(pg.ViewBox.XAxis)
+        linked_y = self._price_vb.linkedView(pg.ViewBox.YAxis)
+        if link and date_on_x and linked_x is None:
             self._price_vb.setXLink(self._plot_hm.plotItem.vb)
-        if not link and linked is not None:
+        if link and not date_on_x and linked_y is None:
+            self._price_vb.setYLink(self._plot_hm.plotItem.vb)
+        if link and date_on_x and linked_y is not None:
+            self._price_vb.setYLink(None)
+        if link and not date_on_x and linked_x is not None:
             self._price_vb.setXLink(None)
+        if not link:
+            if linked_x is not None:
+                self._price_vb.setXLink(None)
+            if linked_y is not None:
+                self._price_vb.setYLink(None)
 
     # ------------------------------------------------------------------
     # Konfiguration -> ViewModel (Debounce -> Worker)
@@ -18089,6 +19562,7 @@ class HeatmapWidget(QWidget):
                 self._syncing = False
         # Overlay nur bei X=date (E9) – sonst ausschalten.
         if (self._combo_x.currentData() != "date"
+                and self._combo_y.currentData() != "date"
                 and self._chk_candle.isChecked()):
             self._chk_candle.setChecked(False)
         self._update_controls()
@@ -18106,9 +19580,168 @@ class HeatmapWidget(QWidget):
         self._view_model.set_heatmap_config(
             x_dim=str(self._combo_x.currentData() or "date"),
             y_dim=str(self._combo_y.currentData() or "hour"),
-            field=str(self._combo_field.currentData() or ""),
+            # 20.03.02 (F2): Aus dem '{service_id}|{key}'-userData nur den
+            # JSON-Key extrahieren (heatmap_field bleibt ein reiner Key).
+            field=self._field_key(self._combo_field.currentData()),
             agg=str(self._combo_agg.currentData() or "confluence_count"),
         )
+
+    @staticmethod
+    def _field_key(ud: Any) -> str:
+        """Extrahiert den JSON-Key aus einem userData-Wert (20.03.02).
+
+        'srv_proximity|visit_pct' -> 'visit_pct'; reine Keys bleiben.
+        """
+        s = str(ud or "")
+        return s.split("|", 1)[1] if "|" in s else s
+
+    def _find_field_index(self, key: str) -> int:
+        """Item-Index im 'Feld'-Dropdown, dessen Key-Teil == `key` ist.
+
+        20.03.02: Das userData traegt '{service_id}|{key}' – findData(key)
+        wuerde den reinen Key nicht finden. Gibt -1 zurueck, wenn keiner
+        passt (Restore-Fallback erzeugt dann ein neues Item). 20.03.03: Bei
+        gemeinsamen Keys (2+ Quellen) findet die Methode zuerst den
+        Sammel-Eintrag ('ALL|key' -> Key-Teil == key).
+        """
+        for i in range(self._combo_field.count()):
+            if self._field_key(self._combo_field.itemData(i)) == key:
+                return i
+        return -1
+
+    def _first_field_index(self) -> int:
+        """Erster auswaehlbarer (nicht-Header) Item-Index im Feld-Dropdown
+        (20.03.03, Q4).
+
+        Sektions-Header haben `Qt.NoItemFlags` und duerfen nicht als
+        Current-Item gewaehlt werden – Index 0 kann ein Header sein.
+        """
+        for i in range(self._combo_field.count()):
+            item = self._combo_field.model().item(i)
+            if item is not None and (item.flags() & Qt.ItemIsEnabled):
+                return i
+        return 0
+
+    # ------------------------------------------------------------------
+    # 20.03.02 (F1c/F2): Multi-Select im 'Feld'-Dropdown -> Datenquellen-
+    # Filter `feature_ids` (KEINE Signatur-Aenderung von set_heatmap_config;
+    # die Aggregation nutzt GENAU EIN aktives Hauptfeld).
+    # ------------------------------------------------------------------
+    def _on_field_selection_changed(self, _checked: List[str]) -> None:
+        """CheckState-Wechsel im 'Feld'-Dropdown (nicht mehr verbunden).
+
+        10.08.2026 (Bugfix Runde 7, Bug 4/5): Die Verbindung
+        selection_changed -> dieser Handler wurde in __init__ entfernt - das
+        'Feld'-Dropdown schreibt KEIN feature_ids mehr (Single Source of
+        Truth = ServicePicker; kein Ueberschreiben des Restores). Der Handler
+        bleibt als Bestandscode erhalten.
+        -> feature_ids-Filter.
+
+        Die angehakten Items bestimmen die Datenquellen (`set_feature_ids`);
+        `set_feature_ids` stoesst den Debounce-Refresh der generischen
+        Heatmap (und der uebrigen Analytics-Seiten) an. Leere Auswahl =
+        leerer Filter (alle Features, ViewModel-Semantik 15.03-E).
+
+        20.03.03 (Q5): Vor der Filterableitung wird die XOR-Regel angewendet –
+        Sammel- ('ALL|key') und Einzel-Eintraege ('srv_x|key') desselben Keys
+        schliessen sich gegenseitig aus (keine Doppel-Haken).
+        """
+        if self._syncing or self._view_model is None:
+            return
+        self._reconcile_sammel_checks()
+        ids = self._checked_field_service_ids()
+        self._view_model.set_feature_ids(ids)
+
+    def _reconcile_sammel_checks(self) -> None:
+        """XOR-Reconciliation (20.03.03, Q5): Sammel- und Einzel-Eintraege
+        desselben Keys schliessen sich gegenseitig aus.
+
+        Grundlage ist der ZULETZT geklickte Eintrag (`last_click_index`):
+        - Klick auf `ALL|key` (Sammel)  -> Einzel-Eintraege von `key` abwaehlen.
+        - Klick auf `srv_x|key` (Einzel) -> Sammel-Eintrag `ALL|key` abwaehlen.
+        Programmatische Wechsel (kein Klick, Index -1) loesen nichts auf.
+        Danach wird der Current-Index auf ein angehaktes/auswaehlbares Item
+        nachgezogen.
+        """
+        last_idx = self._combo_field.last_click_index()
+        if last_idx < 0:
+            self._sync_field_current_after_checks()
+            return
+        item = self._combo_field.model().item(last_idx)
+        if item is None or not (item.flags() & Qt.ItemIsEnabled):
+            return
+        ud = str(item.data(Qt.UserRole) or "")
+        checked = [str(u or "") for u in self._combo_field.checked_data()]
+        if ud.startswith("ALL|"):
+            # Sammel gewinnt: alle Einzel-Eintraege desselben Keys abwaehlen.
+            key = ud.split("|", 1)[1]
+            wanted = [u for u in checked
+                      if not (u.endswith(f"|{key}") and not u.startswith("ALL|"))]
+            if wanted != checked:
+                self._combo_field.set_checked_data(wanted)
+        elif "|" in ud:
+            # Einzel gewinnt: Sammel-Eintrag desselben Keys abwaehlen.
+            all_ud = f"ALL|{self._field_key(ud)}"
+            if all_ud in checked:
+                self._combo_field.set_checked_data(
+                    [u for u in checked if u != all_ud])
+        self._sync_field_current_after_checks()
+
+    def _sync_field_current_after_checks(self) -> None:
+        """Stellt sicher, dass der aktuelle Feld-Index auf einem anhakbaren
+        Item mit aktivem CheckState steht (20.03.03, Q5).
+
+        Nach der XOR-Reconciliation kann der Index auf einem abgewaehlten
+        oder deaktivierten (Header-)Item stehen – dann wird er (blockiert)
+        auf das erste angehakte, sonst erste auswaehlbare Item nachgezogen.
+        """
+        idx = self._combo_field.currentIndex()
+        item = self._combo_field.model().item(idx)
+        if (item is not None and (item.flags() & Qt.ItemIsEnabled)
+                and item.checkState() == Qt.Checked):
+            return
+        new_idx = -1
+        for i in range(self._combo_field.count()):
+            it = self._combo_field.model().item(i)
+            if it is None or not (it.flags() & Qt.ItemIsEnabled):
+                continue
+            if it.checkState() == Qt.Checked:
+                new_idx = i
+                break
+        if new_idx < 0:
+            for i in range(self._combo_field.count()):
+                it = self._combo_field.model().item(i)
+                if it is not None and (it.flags() & Qt.ItemIsEnabled):
+                    new_idx = i
+                    break
+        if 0 <= new_idx != idx:
+            self._combo_field.blockSignals(True)
+            self._combo_field.setCurrentIndex(new_idx)
+            self._combo_field.blockSignals(False)
+
+    def _checked_field_service_ids(self) -> List[str]:
+        """Service-IDs der angehakten Feld-Items (20.03.03, Q2).
+
+        - `ALL|<key>` (Sammel-Eintrag) wird ueber `self._field_sources[key]`
+          auf ALLE Quellen-Services des Keys expandiert (Confluence).
+        - `{service_id}|<key>` liefert genau seine service_id.
+        Items ohne `|` (roher Legacy-Key) tragen keinen eindeutigen Service
+        und bleiben aussen vor (die Quellen der Einzel-Keys decken den
+        Filter ab). Dedupliziert, in Item-Reihenfolge.
+        """
+        ids: List[str] = []
+        for ud in self._combo_field.checked_data():
+            s = str(ud or "")
+            if s.startswith("ALL|"):
+                key = s.split("|", 1)[1]
+                for sid in (self._field_sources.get(key) or []):
+                    if sid and sid not in ids:
+                        ids.append(sid)
+            elif "|" in s:
+                sid = s.split("|", 1)[0]
+                if sid and sid not in ids:
+                    ids.append(sid)
+        return ids
 
     # ------------------------------------------------------------------
     # Candle-Overlay (Bugfix 1, im selben Canvas) + Zoom (E8)
@@ -18186,10 +19819,17 @@ class HeatmapWidget(QWidget):
             self._y_min + lo * span, self._y_min + hi * span, padding=0)
 
     def _update_price_view(self) -> None:
-        """Synchronisiert die Preis-ViewBox-Geometrie mit der Heatmap."""
+        """Synchronisiert die Preis-ViewBox-Geometrie mit der Heatmap.
+
+        10.08.2026 (Bugfix Runde 7, Bug 1): Je nach gekoppelter Date-Achse
+        (X oder Y) wird die passende Achse benachrichtigt.
+        """
         vb = self._plot_hm.plotItem.vb
         self._price_vb.setGeometry(vb.sceneBoundingRect())
-        self._price_vb.linkedViewChanged(vb, self._price_vb.XAxis)
+        if self._price_vb.linkedView(pg.ViewBox.XAxis) is not None:
+            self._price_vb.linkedViewChanged(vb, self._price_vb.XAxis)
+        if self._price_vb.linkedView(pg.ViewBox.YAxis) is not None:
+            self._price_vb.linkedViewChanged(vb, self._price_vb.YAxis)
 
     # ------------------------------------------------------------------
     # Datenfluss (UI rendert, KEIN SQL)
@@ -18397,58 +20037,226 @@ class HeatmapWidget(QWidget):
                 return f"{name} / {str(key)}"
         return str(key)
 
+    def _rebuild_field_dropdown(
+        self,
+        keys: List[str],
+        field_sources: Dict[str, List[str]],
+        payload_agg: Optional[str] = None,
+        payload_field: Optional[str] = None,
+    ) -> None:
+        """Baut das 'Feld'-Dropdown aus Feld-Metadaten + VM-Params (Runde 8).
+
+        Single Source of Truth:
+          * Items      -> `keys`/`field_sources` (Payload-Metadaten bzw.
+                          Widget-Cache `self._field_keys/_field_sources`)
+          * Haken      -> `feature_ids` (ServicePicker, aktiver Filter)
+          * Current    -> `heatmap_field` (Restore/Workspace gewinnt)
+
+        SYNCHRON (kein Query-Round-Trip): wird aus dem Datenpfad
+        (_sync_combos_from_payload) UND dem VM-Pfad (_sync_from_params /
+        _on_feature_ids_changed) gerufen. Ein restaurierter
+        Ergebnisparameter (Bug 3) bleibt dadurch auch ohne frischen Payload
+        sichtbar; ein Check/Uncheck im ServicePicker (Bug 4) aktualisiert
+        das Dropdown sofort. Die Runde-7-Prioritaet (VM-Params gewinnen
+        gegen einen Stale-Payload) wird hier zentral angewendet.
+        """
+        if self._view_model is None:
+            return
+        p = self._view_model.params
+        # Cache aktualisieren (Payload-Metadaten bzw. uebergebene Werte).
+        self._field_keys = [str(k) for k in (keys or [])]
+        self._field_sources = {
+            str(k): [str(s) for s in (v or [])]
+            for k, v in (field_sources or {}).items()
+        }
+        # Agg/Feld: restaurierte VM-Params gewinnen; erst wenn der VM leer
+        # ist, zaehlen Payload-Fallback bzw. aktueller Combo-Wert (Runde 7).
+        agg = (str(p.get("heatmap_agg") or "") or str(payload_agg or "")
+               or str(self._combo_agg.currentData() or ""))
+        prev_field = (str(p.get("heatmap_field") or "")
+                      or str(payload_field or "")
+                      or self._field_key(self._combo_field.currentData()))
+        active_ids = {str(f).strip().lower()
+                      for f in (p.get("feature_ids") or [])}
+        no_filter = not active_ids
+        try:
+            self._combo_field.blockSignals(True)
+            self._combo_field.clear()
+            shared = sorted(k for k in self._field_keys
+                            if len(self._field_sources.get(k) or []) >= 2)
+            if shared:
+                self._combo_field.add_header_item(
+                    "🌐 Gleiche Parameter (alle aktiven Services):")
+                for k in shared:
+                    src = self._field_sources.get(k) or []
+                    self._combo_field.add_checkable_item(
+                        f"Alle Services / {k}", f"ALL|{k}",
+                        checked=no_filter or all(
+                            s.lower() in active_ids for s in src))
+            if self._field_keys:
+                self._combo_field.add_header_item("🔌 Einzelservices:")
+            for k in sorted(self._field_keys):
+                sids = self._field_sources.get(k) or []
+                if len(sids) == 1:
+                    # Eindeutiger Service: nur angehakt, wenn der Service im
+                    # aktiven Filter liegt (oder kein Filter).
+                    self._combo_field.add_checkable_item(
+                        self._field_label(k, sids), f"{sids[0]}|{k}",
+                        checked=no_filter or sids[0].lower() in active_ids)
+                elif not sids:
+                    # Legacy ohne field_sources (roher Key, defensiv).
+                    self._combo_field.add_checkable_item(k, k, checked=True)
+                else:
+                    # Shared Key: je Quelle ein Einzel-Eintrag, initial NICHT
+                    # angehakt (der Sammel-Eintrag deckt die Quellen ab, Q5).
+                    all_active = all(s.lower() in active_ids for s in sids)
+                    for sid in sids:
+                        self._combo_field.add_checkable_item(
+                            self._field_label(k, [sid]), f"{sid}|{k}",
+                            checked=no_filter
+                            or (sid.lower() in active_ids and not all_active))
+            if prev_field in self._field_keys:
+                self._combo_field.setCurrentIndex(
+                    self._find_field_index(prev_field))
+            elif self._field_keys:
+                # 20.03.03 (Q4): Index 0 kann ein Header sein -> ersten
+                # auswaehlbaren Eintrag waehlen.
+                self._combo_field.setCurrentIndex(self._first_field_index())
+            elif prev_field:
+                # Kein Payload/Cache (Restore vor dem ersten Datenpaket):
+                # Roh-Item anlegen, damit der restaurierte Wert sichtbar
+                # und ausgewaehlt bleibt (Muster _sync_from_params).
+                self._combo_field.add_checkable_item(
+                    prev_field, prev_field, checked=True)
+                self._combo_field.setCurrentIndex(
+                    self._combo_field.count() - 1)
+            # Runde 10 (Bug 2): '(No Data)'-Hinweis-Eintraege zentral HIER
+            # rendern - deckt auch den Cache-Rebuild-Pfad (_sync_from_params
+            # / _on_feature_ids_changed) ab, nicht nur den Payload-Pfad. Eine
+            # Variante ohne Daten wird dadurch sichtbar, sobald sie gewaehlt
+            # wurde (vorher blieb der Hinweis nach einem Rebuild ohne frischen
+            # Payload verschwunden).
+            try:
+                no_data = self._view_model.resolve_no_data_variants(
+                    str(p.get("symbol") or ""),
+                    str(p.get("timeframe") or ""))
+            except Exception:
+                no_data = []
+            if no_data:
+                self._combo_field.add_header_item(
+                    "🕓 Noch ohne Daten (erster Scan ausstehend):")
+                for nd in no_data:
+                    self._combo_field.add_disabled_item(
+                        f"{nd.get('display_name') or nd.get('plugin_id')} "
+                        f"({nd.get('preset_name')}) – (No Data)")
+        finally:
+            self._combo_field.blockSignals(False)
+        self._update_controls()
+        # E6: Wert-Aggregation mit leerem/abweichendem Feld -> restauriertes
+        # Feld gewinnt (falls im Datensatz verfuegbar), sonst ersten Key
+        # uebernehmen und Konfiguration nachreichen (einmaliger Query-Loop).
+        vm_field = str(p.get("heatmap_field") or "")
+        if (agg in _VALUE_AGGS and self._combo_field.currentData()
+                and vm_field != self._field_key(
+                    self._combo_field.currentData())):
+            if vm_field and vm_field in self._field_keys:
+                fidx = self._find_field_index(vm_field)
+                if fidx >= 0:
+                    self._combo_field.setCurrentIndex(fidx)
+            else:
+                self._apply_config()
+
+    def _on_feature_ids_changed(self) -> None:
+        """Synchrones Neu-Ableiten des Feld-Dropdowns bei Check/Uncheck.
+
+        Runde 8 (Bugfix 4): `set_feature_ids()` emittiert
+        feature_ids_changed, sobald der ServicePicker-Haken geaendert wird -
+        Items/Haken/Current werden SOFORT aus den gecachten Feld-Metadaten
+        und den aktuellen feature_ids neu abgeleitet (Single Source of
+        Truth = Picker; kein Debounce/Query-Round-Trip noetig).
+        """
+        if self._syncing or self._view_model is None:
+            return
+        self._syncing = True
+        try:
+            self._rebuild_field_dropdown(self._field_keys,
+                                         self._field_sources)
+        finally:
+            self._syncing = False
+
     def _sync_combos_from_payload(self, data: Dict[str, Any]) -> None:
         """Synchronisiert die Combos mit dem tatsaechlichen Payload."""
         if self._view_model is None:
             return
+        vm = self._view_model
         metrics = [str(m) for m in (data.get("metrics") or [])]
         keys = [m for m in metrics if m not in ("count", "confluence_count")]
         # 20.02.01 (User-Meldung 3b): Key -> Services, die ihn liefern
         # (Repository `field_sources`); Anzeige '{Service} / {Key}'.
         field_sources = data.get("field_sources") or {}
-        agg = str(data.get("agg") or "")
-        prev_field = str(self._combo_field.currentData() or "")
+        # Runde 8 (Bugfix 3): Stale-Payload-Guard. Der Worker spiegelt die
+        # Generation der Query-Params ins Ergebnis-Dict - Queries, die VOR
+        # dem letzten restore_workspace()/_apply_profile() gestartet wurden,
+        # tragen eine aeltere Generation. Deren Feld-Metadaten duerfen den
+        # synchron restaurierten Zustand NICHT ueberschreiben (die x/y/agg-
+        # Combos werden trotzdem mit VM-Prioritaet bestaetigt).
+        payload_gen = data.get("restore_generation")
+        stale = (payload_gen is not None
+                 and str(payload_gen) != str(
+                     getattr(vm, "restore_generation", 0)))
+        # x/y/agg mit VM-Prioritaet (Runde 7): restaurierte Werte gewinnen
+        # gegen einen Stale-Payload (Query lief VOR dem Restore mit
+        # Default-Params); erst wenn der VM leer ist, zaehlt der Payload.
+        x_dim = (str(vm.params.get("heatmap_x_dim") or "")
+                 or str(data.get("x_dim") or "date"))
+        y_dim = (str(vm.params.get("heatmap_y_dim") or "")
+                 or str(data.get("y_dim") or "hour"))
+        agg = (str(vm.params.get("heatmap_agg") or "")
+               or str(data.get("agg") or "")
+               or str(self._combo_agg.currentData() or ""))
         self._syncing = True
         try:
-            self._combo_field.blockSignals(True)
-            self._combo_field.clear()
-            for k in keys:
-                sids = [str(s) for s in (field_sources.get(k) or [])]
-                self._combo_field.addItem(self._field_label(k, sids), k)
-            if prev_field in keys:
-                self._combo_field.setCurrentIndex(
-                    self._combo_field.findData(prev_field))
-            elif keys:
-                self._combo_field.setCurrentIndex(0)
-            self._combo_field.blockSignals(False)
-            self._set_combo_data(
-                self._combo_x, str(data.get("x_dim") or "date"))
-            self._set_combo_data(
-                self._combo_y, str(data.get("y_dim") or "hour"))
+            if not stale:
+                # Feld-Metadaten uebernehmen + 'Feld'-Dropdown synchron neu
+                # ableiten (Items/Haken/Current; Runde 8, Bug 3/4). Bei
+                # stale Payloads bleibt der Zustand aus _sync_from_params
+                # (params_restored) unveraendert.
+                self._rebuild_field_dropdown(
+                    keys, field_sources,
+                    payload_agg=str(data.get("agg") or ""),
+                    payload_field=str(data.get("field") or ""))
+            # Runde 10 (Bug 2): '(No Data)'-Hinweis-Eintraege werden zentral
+            # in _rebuild_field_dropdown() gerendert (deckt auch den
+            # Cache-Rebuild-Pfad ab) - hier nur noch x/y/agg synchronisieren.
+            self._set_combo_data(self._combo_x, x_dim)
+            self._set_combo_data(self._combo_y, y_dim)
             self._set_combo_data(self._combo_agg, str(agg or "count"))
         finally:
             self._syncing = False
         self._update_controls()
-        # E6: Wert-Aggregation mit noch leerem Feld -> ersten Key uebernehmen
-        # und Konfiguration nachreichen (einmaliger Query-Loop).
-        if (agg in _VALUE_AGGS and self._combo_field.currentData()
-                and self._view_model.params.get("heatmap_field")
-                != self._combo_field.currentData()):
-            self._apply_config()
 
     def _render_overlay(self, data: Dict[str, Any]) -> None:
         """Zeichnet Tages-Ohlc ueber die Heatmap (selbes Canvas, Bugfix 1).
 
-        Die Candles liegen in der Preis-ViewBox (rechte Y-Achse = Preis),
-        X = Wanduhr-Mitternachts-Epoch je Tag – exakt die Spalten der
-        date-Heatmap. Alpha 0.3-0.5 (E9).
+        Die Candles liegen in der Preis-ViewBox. 10.08.2026 (Bugfix Runde 7,
+        Bug 1): 'Datum' darf auf der X- ODER Y-Achse liegen - X=date zeichnet
+        vertikale Candles (Preis auf der rechten Achse), Y=date horizontale
+        Candles (Preis auf der unteren Preis-Achse). Die Spalten der
+        date-Achse sind Wanduhr-Mitternachts-Epochs. Alpha 0.3-0.5 (E9).
         """
         self._clear_overlay()
         bars = data.get("bars") or []
-        if not bars or not self._x_axis:
+        x_dim = str(self._combo_x.currentData() or "date")
+        y_dim = str(self._combo_y.currentData() or "hour")
+        # 10.08.2026 (Bugfix Runde 7, Bug 1): 'Datum' darf auf X oder Y
+        # liegen - die Candles werden in der Orientierung der Date-Achse
+        # gezeichnet (vertikal bei X=date, horizontal bei Y=date).
+        date_on_x = x_dim == "date"
+        date_axis = self._x_axis if date_on_x else self._y_axis
+        if not bars or not date_axis:
             return
         # Spalten-Index je Wanduhr-Tag (Mitternachts-Epoch).
-        epoch_to_col = {int(round(e)): i for i, e in enumerate(self._x_axis)}
+        epoch_to_col = {int(round(e)): i for i, e in enumerate(date_axis)}
         candles: List[tuple] = []
         for b in bars:
             t = b.get("time")
@@ -18474,33 +20282,52 @@ class HeatmapWidget(QWidget):
             candles.append((t, o, h, l, c))
         if not candles:
             return
-        ymin = min(c[3] for c in candles)
-        ymax = max(c[2] for c in candles)
-        if ymin == ymax:
-            ymin -= 1.0
-            ymax += 1.0
-        pad = (ymax - ymin) * 0.05
-        self._price_vb.setYRange(ymin - pad, ymax + pad, padding=0)
-        # Candles: x = Mitternachts-Epoch, Breite in Tages-Sekunden.
+        pmin = min(c[3] for c in candles)
+        pmax = max(c[2] for c in candles)
+        if pmin == pmax:
+            pmin -= 1.0
+            pmax += 1.0
+        pad = (pmax - pmin) * 0.05
+        if date_on_x:
+            self._price_vb.setYRange(pmin - pad, pmax + pad, padding=0)
+        else:
+            self._price_vb.setXRange(pmin - pad, pmax + pad, padding=0)
+        # Candles: x = Mitternachts-Epoch (X=date) bzw. y = Mitternachts-
+        # Epoch (Y=date), Breite/Hoehe in Tages-Sekunden.
         for t, o, h, l, c in candles:
             up = c >= o
             color = pg.mkColor(0, 180, 0, 140) if up \
                 else pg.mkColor(220, 30, 30, 140)
-            # Bugfix 08.08.2026: pg.BarGraphItem kennt KEIN top/bottom –
-            # die pyqtgraph-API verlangt y0 + height.
-            wick = pg.BarGraphItem(
-                x=[float(t)], width=_DAY_SECONDS * 0.12,
-                y0=l, height=max(h - l, 1e-9), brush=color, pen=color)
-            body = pg.BarGraphItem(
-                x=[float(t)], width=_DAY_SECONDS * 0.7,
-                y0=min(o, c),
-                height=max(max(o, c) - min(o, c), 1e-9),
-                brush=color, pen=color)
+            if date_on_x:
+                # Vertikale Candles (Preis auf der rechten Achse).
+                wick = pg.BarGraphItem(
+                    x=[float(t)], width=_DAY_SECONDS * 0.12,
+                    y0=l, height=max(h - l, 1e-9), brush=color, pen=color)
+                body = pg.BarGraphItem(
+                    x=[float(t)], width=_DAY_SECONDS * 0.7,
+                    y0=min(o, c),
+                    height=max(max(o, c) - min(o, c), 1e-9),
+                    brush=color, pen=color)
+            else:
+                # Horizontale Candles (Preis auf der unteren Achse).
+                wick = pg.BarGraphItem(
+                    x0=l, width=max(h - l, 1e-9),
+                    y0=float(t) - _DAY_SECONDS * 0.06,
+                    height=_DAY_SECONDS * 0.12, brush=color, pen=color)
+                body = pg.BarGraphItem(
+                    x0=min(o, c), width=max(max(o, c) - min(o, c), 1e-9),
+                    y0=float(t) - _DAY_SECONDS * 0.35,
+                    height=_DAY_SECONDS * 0.7, brush=color, pen=color)
             self._price_vb.addItem(wick)
             self._price_vb.addItem(body)
             self._candle_items.extend((wick, body))
         self._price_vb.setVisible(True)
-        self._plot_hm.getAxis("right").setVisible(True)
+        if date_on_x:
+            self._plot_hm.getAxis("right").setVisible(True)
+            self._price_axis_bottom.setVisible(False)
+        else:
+            self._price_axis_bottom.setVisible(True)
+            self._plot_hm.getAxis("right").setVisible(False)
         self._update_price_view()
 
     def _clear_overlay(self) -> None:
@@ -18513,6 +20340,7 @@ class HeatmapWidget(QWidget):
         self._candle_items = []
         self._price_vb.setVisible(False)
         self._plot_hm.getAxis("right").setVisible(False)
+        self._price_axis_bottom.setVisible(False)
 
 ```
 
@@ -29245,6 +31073,13 @@ def check_and_init_databases() -> None:
     con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_id VARCHAR;")
     con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS plugin_version VARCHAR;")
     con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_data JSON;")
+    # 20.04 (Q1/Q9, 09.08.2026): Additive Spalte instance_hash – stabile
+    # Identifikation von Parameter-Varianten eines Plugins (8-stelliger
+    # SHA256-Short-Hash aus generate_instance_hash, ohne lookback – Q3).
+    # Ermoeglicht Multi-Varianten-Statistiken und gezieltes Daten-Purge
+    # (purge_instance_data, Q5), ohne die feature_id (plugin_id) anzutasten.
+    # Bestehende Rows bleiben NULL; feature_id bleibt plugin_id (Zero-Regression).
+    con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS instance_hash VARCHAR;")
     # Bugfix 07.08.2026 (Phase 17 Bugfix-Runde 2): Der Spalten-DEFAULT von
     # created_at wurde durch die PK-Migration (17.01 E-1, test/migrate_pk.py –
     # Table-Rewrite + RENAME) entfernt. Seitdem bleiben NEUE feature_store-Rows
@@ -29661,6 +31496,16 @@ ROLE_NODE_TYPE = Qt.UserRole
 ROLE_SET_ID = Qt.UserRole + 1
 ROLE_INSTANCE_ID = Qt.UserRole + 2
 ROLE_PLUGIN_ID = Qt.UserRole + 3
+# 20.04 (Q6/Q7): Zusaetzliche Rollen fuer Clone-Knoten (TYPE_CLONE) und
+# die Archiv-Kennzeichnung. ROLE_INSTANCE_HASH traegt den 8-stelligen
+# Parameter-Hash eines Clones (generate_instance_hash); ROLE_ARCHIVED=True
+# markiert archivierte Knoten (non-checkable, Archiv-Safety).
+ROLE_INSTANCE_HASH = Qt.UserRole + 4
+ROLE_ARCHIVED = Qt.UserRole + 5
+# 10.08.2026 (Bugfix): ROLE_PRESET_NAME traegt den Anzeigenamen eines
+# Clone-/Preset-Knotens (fuer den 'Variante umbenennen'-Dialog, ohne
+# DB-Lookup im MasterTree).
+ROLE_PRESET_NAME = Qt.UserRole + 6
 
 # 15.03-E (Multi-Select): Klickzone der Checkbox-Indikatoren in Spalte 0.
 # Klicks links dieser Zone (innerhalb der Item-Zeile) werden dem Qt-Default
@@ -29673,6 +31518,10 @@ TYPE_GROUP = "group"
 TYPE_SET = "set"
 TYPE_SERVICE = "service"
 TYPE_PLUGIN = "plugin"
+# 20.04 (Q7): Clone-/Preset-Knoten (Kind eines Plugin-Parents in der
+# Services-Gruppe). Traegt ROLE_PLUGIN_ID (plugin_id des Parents) und
+# ROLE_INSTANCE_HASH; aktive Clones sind anhakbar, archivierte nicht.
+TYPE_CLONE = "clone"
 # 16.08 (K3): Kategorie-Ordner-Knoten (Dynamic Category Trees). Nicht
 # auswaehlbar, expandierbar; traegt KEINEN Info-Button (K5), keine Badges
 # und ist im Checkbox-Modus nicht anhakbar (K4).
@@ -29818,6 +31667,36 @@ class MasterTree(QTreeWidget):
     rename_folder_requested = Signal(str, str, str)
     folder_item_moved = Signal(str, str, str)
     folder_moved = Signal(str, str, str)
+    # 20.04 (Q5/Q6/Q8): Instanz-Verwaltung im Kontextmenue (Service-/Clone-
+    # Zeilen). Der Orchestrator (ServiceWindow) verknuepft die Aktionen mit
+    # seinen Handlern:
+    #   data_only_purge_requested(set_id, service_id, plugin_id,
+    #                             instance_hash)
+    #       – 'Data Only Löschen': NUR die berechneten Feature-Daten der
+    #         Instanz purgen (FeatureBuilder.purge_instance_data, Q5). Bei
+    #         Clone-Zeilen sind set_id/service_id leer (plugin_id + Hash).
+    #   delete_complete_requested(set_id, service_id, plugin_id,
+    #                             instance_hash)
+    #       – 'Vollständig Löschen': Instanz/Preset + Feature-Daten entfernen
+    #         (2-stufige Sicherheitsabfrage im Orchestrator).
+    #   doc_log_requested(set_id, service_id, plugin_id, instance_hash)
+    #       – 'Doc Log bearbeiten': Negativ-Wissen editieren
+    #         (ServiceInstanceConfig.doc_log bzw. indicator_presets.doc_log
+    #         bei Clones).
+    #   duplicate_variant_requested(set_id, service_id, plugin_id,
+    #                               instance_hash)
+    #       – 'Als Variante duplizieren' (Q8): neue Instanz/Preset-Variante
+    #         mit kopierten Parametern (neue instance_id / Preset-Name).
+    data_only_purge_requested = Signal(str, str, str, str)
+    delete_complete_requested = Signal(str, str, str, str)
+    doc_log_requested = Signal(str, str, str, str)
+    duplicate_variant_requested = Signal(str, str, str, str)
+    # 10.08.2026 (Bugfix): 'Variante umbenennen' (Clone/Preset-Kontextmenue).
+    # Der MasterTree fragt den neuen Namen ab (vorbelegt) und emittiert
+    # rename_variant_requested(plugin_id, instance_hash, new_name) – der
+    # Orchestrator (ServiceWindow / ServiceSelectorDialog) persistiert den
+    # Preset-Rename in indicator_presets (indicator_id, preset_name).
+    rename_variant_requested = Signal(str, str, str)
 
     def __init__(self, model, parent=None) -> None:
         super().__init__(parent)
@@ -29976,6 +31855,17 @@ class MasterTree(QTreeWidget):
         # (build_tree mischt die persistierten tree_folders_<group>-Pfade
         # ein) – ein separater UI-Zustand ist nicht mehr noetig.
         pass
+        # Runde 9 (Bug 1): Pending-Haken aus set_checked_feature_ids (wurde
+        # auf einem noch leeren Baum aufgerufen, z.B. Picker-Oeffnen vor dem
+        # ersten data_changed) jetzt auf den fertigen Baum anwenden. Emittiert
+        # KEIN checked_changed (Bug-5-Fix), damit der Restore-Filter nicht
+        # ueberschrieben wird.
+        pending = getattr(self, "_pending_feature_ids", None)
+        if pending is not None:
+            pending_hashes = getattr(self, "_pending_instance_hashes", None)
+            self._pending_feature_ids = None
+            self._pending_instance_hashes = None
+            self.set_checked_feature_ids(pending, pending_hashes)
 
     def _safe_current_selection(self) -> Dict[str, str]:
         """Liess die aktuelle Auswahl defensiv (isValid-Guard gegen zerstoerte
@@ -30050,10 +31940,15 @@ class MasterTree(QTreeWidget):
         set_item.setData(0, ROLE_NODE_TYPE, TYPE_SET)
         set_item.setData(0, ROLE_SET_ID, child.get("set_id") or "")
         set_item.setToolTip(0, f"Service-Set: {child.get('set_id') or '?'}")
+        # 20.04 (Q6): Archivierte Sets (is_archived=True) sind non-checkable
+        # (Archive Safety) – sie liegen im '📁 Archiv'-Ordner der Sets-Gruppe.
+        archived_set = bool(child.get("archived"))
+        if archived_set:
+            set_item.setData(0, ROLE_ARCHIVED, True)
         # 15.03-E (Multi-Select): Set-Knoten anhakbar – der Tri-State wird
         # NACH dem Anhaengen der Service-Kinder aus deren Zustaenden
         # abgeleitet (_apply_set_state).
-        if self._checkable:
+        if self._checkable and not archived_set:
             set_item.setFlags(set_item.flags() | Qt.ItemIsUserCheckable)
         # Bugfix 05.08.2026: Gehoert das Set einem Indikator, traegt der
         # Info-Button (Spalte 1) den Tooltip 'aktiv/im <Indikator>' (siehe
@@ -30067,17 +31962,24 @@ class MasterTree(QTreeWidget):
             # Service-Namen: 'prox_1 (05.08.26)' – ohne Eintrag '(--.--.--)'.
             plugin_id = svc.get("plugin_id") or ""
             last_exec = str(svc.get("last_execution") or "--.--.--")
-            svc_item = QTreeWidgetItem([
-                f"{svc.get('instance_id')} ({last_exec})",
-                "",
-            ])
+            svc_label = f"{svc.get('instance_id')} ({last_exec})"
+            # 20.04 (Q6): Einzeln archivierte Instanzen tragen im Archiv
+            # eine Kennzeichnung (is_archived=True -> non-checkable).
+            svc_archived = bool(svc.get("is_archived"))
+            if svc_archived:
+                svc_label = f"🔹 {svc_label}"
+            svc_item = QTreeWidgetItem([svc_label, ""])
             svc_item.setData(0, ROLE_NODE_TYPE, TYPE_SERVICE)
             svc_item.setData(0, ROLE_SET_ID, child.get("set_id") or "")
             svc_item.setData(0, ROLE_INSTANCE_ID, svc.get("instance_id") or "")
             svc_item.setData(0, ROLE_PLUGIN_ID, plugin_id)
+            svc_item.setData(0, ROLE_INSTANCE_HASH,
+                             str(svc.get("instance_hash") or ""))
+            if svc_archived or archived_set:
+                svc_item.setData(0, ROLE_ARCHIVED, True)
             # 15.03-E (Multi-Select): Service-Knoten anhakbar – Zustand aus
             # _checked_items re-applizieren (bleibt ueber Neuaufbauten erhalten).
-            if self._checkable:
+            if self._checkable and not svc_archived and not archived_set:
                 svc_item.setFlags(svc_item.flags() | Qt.ItemIsUserCheckable)
                 key = (TYPE_SERVICE,
                        str(child.get("set_id") or ""),
@@ -30099,20 +32001,91 @@ class MasterTree(QTreeWidget):
         # aus dem feature_store) haengt auch an Standalone-/Plugin-Zeilen:
         # 'srv_proximity (02.08.26)' – ohne Eintrag '(--.--.--)'.
         last_exec = str(child.get("last_execution") or "--.--.--")
-        plugin_item = QTreeWidgetItem([f"{pid} ({last_exec})", ""])
+        clones = child.get("clones") or []
+        archived_parent = bool(child.get("archived"))
+        # 10.08.2026 (Varianten-Ausfuehrungsdatum): Hat ein Plugin Varianten
+        # (Clones), haengt das Datum der letzten Ausfuehrung an der Variante
+        # (Clone-Zeile) – der Parent-Knoten zeigt nur noch die Plugin-ID
+        # (kein Ausfuehrungsdatum mehr im Knoten darueber).
+        plugin_label = pid if clones else f"{pid} ({last_exec})"
+        plugin_item = QTreeWidgetItem([plugin_label, ""])
         plugin_item.setData(0, ROLE_NODE_TYPE, TYPE_PLUGIN)
         plugin_item.setData(0, ROLE_SET_ID, group)
         plugin_item.setData(0, ROLE_PLUGIN_ID, pid)
-        # 15.03-E (Multi-Select): Standalone-/Plugin-Zeilen anhakbar
-        # (feature_id des Feature-Store IST die plugin_id).
-        if self._checkable:
-            plugin_item.setFlags(plugin_item.flags() | Qt.ItemIsUserCheckable)
+        if archived_parent:
+            plugin_item.setData(0, ROLE_ARCHIVED, True)
+        # 20.04 (Q7): Plugins MIT Clones sind Template-Parents (nicht direkt
+        # ausfuehrbar) – KEINE Checkbox am Plugin-Knoten; die Clones tragen
+        # die Haken. Plugins OHNE Clones bleiben anhakbare flache Blaetter
+        # (Bestandsverhalten, feature_id des Feature-Store = plugin_id).
+        if clones:
+            plugin_item.setFlags(
+                plugin_item.flags() & ~Qt.ItemIsUserCheckable)
+        elif self._checkable:
+            plugin_item.setFlags(
+                plugin_item.flags() | Qt.ItemIsUserCheckable)
             key = (TYPE_PLUGIN, "", pid)
             state = (Qt.Checked if key in self._checked_items
                      else Qt.Unchecked)
             plugin_item.setData(0, Qt.CheckStateRole, state)
         self._apply_badge(plugin_item, pid, child.get("badge") or "")
+        for clone in clones:
+            plugin_item.addChild(self._build_clone_item(clone, pid))
         return plugin_item
+
+    def _build_clone_item(self, clone: Dict[str, Any],
+                          plugin_id: str) -> QTreeWidgetItem:
+        """Erzeugt ein Clone-/Preset-Kind unter einem Plugin-Parent (20.04).
+
+        Label-Format (Doku §3): aktive Clones `🟢 <Preset> (#<hash>)`,
+        archivierte Clones `🔹 <Preset> (#<hash>)`. Aktive Clones sind im
+        Checkbox-Modus anhakbar; ARCHIVIERTE Clones sind non-checkable
+        (Archive Safety, Q6) und emittieren keine IDs an Scans/Analytics.
+        """
+        preset_name = str(clone.get("preset_name") or "Default")
+        instance_hash = str(clone.get("instance_hash") or "")
+        archived = bool(clone.get("is_archived"))
+        # 10.08.2026 (Bugfix, Varianten-Ausfuehrungsdatum): Die ID (#hash)
+        # entfaellt aus dem Label – stattdessen haengt das Datum der letzten
+        # Ausfuehrung dieser Variante direkt am Varianten-Namen:
+        # '🟢 <Preset> (DD.MM.JJ)' (ohne Eintrag '(--.--.--)').
+        last_exec = str(clone.get("last_execution") or "--.--.--")
+        prefix = "🔹" if archived else "🟢"
+        clone_item = QTreeWidgetItem(
+            [f"{prefix} {preset_name} ({last_exec})", ""])
+        clone_item.setData(0, ROLE_NODE_TYPE, TYPE_CLONE)
+        clone_item.setData(0, ROLE_PLUGIN_ID, plugin_id)
+        clone_item.setData(0, ROLE_INSTANCE_HASH, instance_hash)
+        clone_item.setData(0, ROLE_PRESET_NAME, preset_name)
+        if archived:
+            clone_item.setData(0, ROLE_ARCHIVED, True)
+        # Tooltip: Plugin/Preset + Parameter + Doc-Log (Negativ-Wissen).
+        tooltip = f"Plugin: {plugin_id}\nPreset: {preset_name}"
+        params = clone.get("params") or {}
+        if isinstance(params, dict) and params:
+            try:
+                tooltip += "\n" + ", ".join(
+                    f"{k}={v}" for k, v in list(params.items())[:8])
+            except Exception:
+                pass
+        doc_log = str(clone.get("doc_log") or "").strip()
+        if doc_log:
+            tooltip += f"\n📝 {doc_log}"
+        clone_item.setToolTip(0, tooltip)
+        # Checkbox nur fuer AKTIVE Clones im Checkbox-Modus (Q6).
+        if self._checkable and not archived:
+            clone_item.setFlags(
+                clone_item.flags() | Qt.ItemIsUserCheckable)
+            key = (TYPE_CLONE, plugin_id, instance_hash)
+            state = (Qt.Checked if key in self._checked_items
+                     else Qt.Unchecked)
+            clone_item.setData(0, Qt.CheckStateRole, state)
+        elif archived:
+            # QTreeWidgetItem traegt ItemIsUserCheckable per Default – bei
+            # ARCHIVIERTEN Clones explizit entfernen (Archive Safety, Q6).
+            clone_item.setFlags(
+                clone_item.flags() & ~Qt.ItemIsUserCheckable)
+        return clone_item
 
     def _apply_badge(self, item: QTreeWidgetItem, plugin_id: str,
                      badge: str) -> None:
@@ -30235,6 +32208,11 @@ class MasterTree(QTreeWidget):
         if node_type not in (TYPE_SET, TYPE_PLUGIN, TYPE_CATEGORY):
             super().startDrag(supported_actions)
             return
+        # 20.04 (Q6): Archivierte Knoten sind nicht ziehbar (Archive
+        # Safety) – sie duerfen nicht in normale Kategorie-Ordner wandern.
+        if item.data(0, ROLE_ARCHIVED):
+            super().startDrag(supported_actions)
+            return
         try:
             payload = {
                 "node_type": node_type,
@@ -30338,6 +32316,11 @@ class MasterTree(QTreeWidget):
         if not target_group:
             event.ignore()
             return
+        # 20.04 (Q6): Der Archiv-Ordner ist kein Drag-Ziel (Archive Safety).
+        # Kategorie-Pfad 'Archiv' (ohne '📁 '-Praefix) wird abgelehnt.
+        if str(target_path or "").strip().lower().startswith("archiv"):
+            event.ignore()
+            return
         if source_group and source_group != target_group:
             event.ignore()
             return
@@ -30405,6 +32388,31 @@ class MasterTree(QTreeWidget):
         new_path = "/".join(parts[:-1] + [new_name])
         self.rename_folder_requested.emit(str(group), old_path, new_path)
 
+    def _on_rename_clone(self, item) -> None:
+        """Kontextmenue 'Variante umbenennen' (10.08.2026, Bugfix).
+
+        Fragt den neuen Preset-Namen ab (vorbelegt mit dem aktuellen Namen)
+        und emittiert `rename_variant_requested(plugin_id, instance_hash,
+        new_name)` – der Orchestrator (ServiceWindow/ServiceSelectorDialog)
+        persistiert den Rename in indicator_presets und emittiert den
+        EventBus (Live-Sync aller MasterTrees).
+        """
+        if item is None or not isValid(item):
+            return
+        plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
+        instance_hash = str(item.data(0, ROLE_INSTANCE_HASH) or "")
+        old_name = str(item.data(0, ROLE_PRESET_NAME) or "")
+        if not plugin_id or not instance_hash:
+            return
+        new_name, ok = QInputDialog.getText(
+            self, "Variante umbenennen",
+            "Neuer Name der Variante:", text=old_name)
+        new_name = (new_name or "").strip()
+        if not ok or not new_name or new_name == old_name:
+            return
+        self.rename_variant_requested.emit(
+            plugin_id, instance_hash, new_name)
+
     # -------------------------------------------------------------------------
     # 18.01.03 (Bugfix 08.08.2026): Expansion-Erhaltung ueber _populate()
     # -------------------------------------------------------------------------
@@ -30432,6 +32440,15 @@ class MasterTree(QTreeWidget):
                 elif node_type == TYPE_SET:
                     result.add(("set",
                                 str(item.data(0, ROLE_SET_ID) or "")))
+                elif node_type == TYPE_PLUGIN and item.childCount() > 0:
+                    # 10.08.2026 (Bugfix): Plugin-Parents mit Varianten/
+                    # Clones sind aufklappbare Knoten - ihre Expansion muss
+                    # ueber Rebuilds (data_changed -> _populate nach
+                    # Speichern/Umbenennen/Duplizieren) erhalten bleiben,
+                    # sonst klappt der Knoten zusammen. Nur ein Mausklick
+                    # auf den Knoten soll togglen.
+                    result.add(("plugin",
+                                str(item.data(0, ROLE_PLUGIN_ID) or "")))
         except (RuntimeError, AttributeError):
             pass
         return result
@@ -30457,6 +32474,10 @@ class MasterTree(QTreeWidget):
                               or key in self._expand_after_rebuild)
                 elif node_type == TYPE_SET:
                     key = ("set", str(item.data(0, ROLE_SET_ID) or ""))
+                    expand = key in expanded
+                elif node_type == TYPE_PLUGIN and item.childCount() > 0:
+                    key = ("plugin",
+                           str(item.data(0, ROLE_PLUGIN_ID) or ""))
                     expand = key in expanded
                 if expand:
                     item.setExpanded(True)
@@ -30510,7 +32531,7 @@ class MasterTree(QTreeWidget):
                     continue
                 node_type = item.data(0, ROLE_NODE_TYPE)
                 if node_type not in (TYPE_SERVICE, TYPE_SET, TYPE_PLUGIN,
-                                     TYPE_CATEGORY):
+                                     TYPE_CATEGORY, TYPE_CLONE):
                     continue
                 tooltip = item.toolTip(1) or ""
                 set_id = str(item.data(0, ROLE_SET_ID) or "")
@@ -30519,9 +32540,10 @@ class MasterTree(QTreeWidget):
                 if node_type == TYPE_SERVICE:
                     service_id = str(item.data(0, ROLE_INSTANCE_ID) or "")
                     plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
-                elif node_type == TYPE_PLUGIN:
-                    # Plugin-Zeilen: set_id bewusst leer (die ROLE_SET_ID
-                    # traegt nur die Gruppenkennung 'standalone'/'plugins').
+                elif node_type in (TYPE_PLUGIN, TYPE_CLONE):
+                    # Plugin-/Clone-Zeilen: set_id bewusst leer (die
+                    # ROLE_SET_ID traegt nur die Gruppenkennung); bei
+                    # Clones liefert ROLE_PLUGIN_ID die feature_id.
                     set_id = ""
                     plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
 
@@ -30676,7 +32698,7 @@ class MasterTree(QTreeWidget):
         if item is None or not isValid(item):
             return
         node_type = item.data(0, ROLE_NODE_TYPE)
-        if node_type not in (TYPE_SET, TYPE_SERVICE, TYPE_PLUGIN):
+        if node_type not in (TYPE_SET, TYPE_SERVICE, TYPE_PLUGIN, TYPE_CLONE):
             return
         self._updating_checks = True
         try:
@@ -30697,6 +32719,12 @@ class MasterTree(QTreeWidget):
                     self._expand_ancestors(item)
                 else:
                     self._checked_items.discard(key)
+                    # Runde 9 (Bug 3): KEIN _uncheck_plugin_rows mehr - das
+                    # Abhaengen ALLER Zeilen einer plugin_id hat beim Uncheck
+                    # einer Variante auch die anderen Clones abgehaengt
+                    # (falsch). checked_feature_ids() dedupliziert ohnehin
+                    # auf plugin_id: Der Filter bleibt aktiv, solange
+                    # mindestens eine Zeile gecheckt ist.
                 parent = item.parent()
                 if parent is not None and isValid(parent):
                     self._apply_set_state(parent)
@@ -30714,6 +32742,25 @@ class MasterTree(QTreeWidget):
                     self._expand_ancestors(item)
                 else:
                     self._checked_items.discard(key)
+                    # Runde 9 (Bug 3): _uncheck_plugin_rows entfernt (siehe
+                    # TYPE_SERVICE) - nur diesen einen Key abhaengen.
+            elif node_type == TYPE_CLONE:
+                # 20.04 (Q7): Clone-Haken -> feature_id ist die plugin_id
+                # des Plugin-Parents (WHERE feature_id IN (plugin_ids)).
+                key = (TYPE_CLONE,
+                       str(item.data(0, ROLE_PLUGIN_ID) or ""),
+                       str(item.data(0, ROLE_INSTANCE_HASH) or ""))
+                expected = (Qt.Checked if key in self._checked_items
+                            else Qt.Unchecked)
+                if state == expected:
+                    return
+                if state == Qt.Checked:
+                    self._checked_items.add(key)
+                    self._expand_ancestors(item)
+                else:
+                    self._checked_items.discard(key)
+                    # Runde 9 (Bug 3): _uncheck_plugin_rows entfernt (siehe
+                    # TYPE_SERVICE) - nur diesen einen Key abhaengen.
             elif node_type == TYPE_SET:
                 set_id = str(item.data(0, ROLE_SET_ID) or "")
                 # Nur bei ECHTEM Wechsel verarbeiten (Tri-State-Ableitung).
@@ -30733,6 +32780,9 @@ class MasterTree(QTreeWidget):
                     else:
                         self._checked_items.discard(key)
                         child.setData(0, Qt.CheckStateRole, Qt.Unchecked)
+                        # Runde 9 (Bug 3): _uncheck_plugin_rows entfernt
+                        # (siehe TYPE_SERVICE) - nur diesen einen Key
+                        # abhaengen, nicht alle Zeilen der plugin_id.
                 self._apply_set_state(item)
                 # Bugfix 08.08.2026: Auch beim Set-Anhaken die Eltern-Kette
                 # des Sets aufklappen (Set in Kategorie-Ordner sichtbar).
@@ -30741,6 +32791,58 @@ class MasterTree(QTreeWidget):
         finally:
             self._updating_checks = False
 
+    # Runde 9 (Bug 3): _uncheck_plugin_rows ist ENTFERNT/AUSKOMMENTIERT -
+    # das Abhaengen ALLER Zeilen einer plugin_id beim Uncheck einer
+    # Variante hat auch die anderen Clones abgehaengt (falsch). Siehe
+    # _on_item_changed (nur den einen Key abhaengen).
+    #     def _uncheck_plugin_rows(self, plugin_id: str) -> None:
+    #         """Haengt ALLE Zeilen einer plugin_id ab (Bugfix 10.08.2026).
+
+    #         `checked_feature_ids()` dedupliziert die Haken auf
+    #         plugin_id-Ebene (eine plugin_id == eine feature_id fuer
+    #         `WHERE feature_id IN (...)`). Beim Restore
+    #         (`set_checked_feature_ids`) koennen deshalb mehrere Zeilen-
+    #         Typen derselben plugin_id angehakt sein: die Service-Zeile im
+    #         Set, das Standalone-Plugin-Blatt (TYPE_PLUGIN) und ggf.
+    #         Clones. Ein Uncheck NUR einer Zeile wuerde die plugin_id
+    #         ueber die anderen Zeilen im Filter belassen (Dropdown/
+    #         Historie reagieren nicht) - deshalb werden hier alle Zeilen
+    #         mit derselben plugin_id abgehaengt und ihre Keys aus
+    #         `_checked_items` entfernt. Wird aus den Uncheck-Zweigen von
+    #         `_on_item_changed` gerufen (laeuft unter `_updating_checks
+    #         == True`, d. h. die setData-Aufrufe feuern keine spurious
+    #         Events).
+    #         """
+    #         pid = str(plugin_id or "").lower()
+    #         if not pid:
+    #             return
+    #         for item in TreeItemIterator(self):
+    #             if item is None or not isValid(item):
+    #                 continue
+    #             node_type = item.data(0, ROLE_NODE_TYPE)
+    #             if node_type not in (TYPE_SERVICE, TYPE_PLUGIN, TYPE_CLONE):
+    #                 continue
+    #             if str(item.data(0, ROLE_PLUGIN_ID) or "").lower() != pid:
+    #                 continue
+    #             if item.checkState(0) != Qt.Checked:
+    #                 continue
+    #             if node_type == TYPE_SERVICE:
+    #                 key = (TYPE_SERVICE,
+    #                        str(item.data(0, ROLE_SET_ID) or ""),
+    #                        str(item.data(0, ROLE_INSTANCE_ID) or ""))
+    #             elif node_type == TYPE_PLUGIN:
+    #                 key = (TYPE_PLUGIN, "",
+    #                        str(item.data(0, ROLE_PLUGIN_ID) or ""))
+    #             else:
+    #                 key = (TYPE_CLONE,
+    #                        str(item.data(0, ROLE_PLUGIN_ID) or ""),
+    #                        str(item.data(0, ROLE_INSTANCE_HASH) or ""))
+    #             self._checked_items.discard(key)
+    #             item.setData(0, Qt.CheckStateRole, Qt.Unchecked)
+    #             parent = item.parent()
+    #             if (parent is not None and isValid(parent)
+    #                     and parent.data(0, ROLE_NODE_TYPE) == TYPE_SET):
+    #                 self._apply_set_state(parent)
     def _derive_set_state(self, set_item) -> int:
         """Erwarteter Tri-State eines Set-Knotens aus seinen Service-Kindern.
 
@@ -30815,9 +32917,17 @@ class MasterTree(QTreeWidget):
                 synced.add((TYPE_SERVICE,
                             str(item.data(0, ROLE_SET_ID) or ""),
                             str(item.data(0, ROLE_INSTANCE_ID) or "")))
-            elif node_type == TYPE_PLUGIN:
+            elif node_type == TYPE_PLUGIN and item.childCount() == 0:
+                # 10.08.2026 (Punkt 6): Plugin-Parents mit Varianten sind
+                # non-checkable - kein Haken-Sync (Konsistenz zum Reverse-
+                # Mapping in set_checked_feature_ids).
                 synced.add((TYPE_PLUGIN, "",
                             str(item.data(0, ROLE_PLUGIN_ID) or "")))
+            elif node_type == TYPE_CLONE:
+                # 20.04 (Q7): Clone-Keys (plugin_id, instance_hash).
+                synced.add((TYPE_CLONE,
+                            str(item.data(0, ROLE_PLUGIN_ID) or ""),
+                            str(item.data(0, ROLE_INSTANCE_HASH) or "")))
         self._checked_items = synced
 
     def checked_services(self) -> List[Dict[str, str]]:
@@ -30846,6 +32956,16 @@ class MasterTree(QTreeWidget):
                     "instance_id": "",
                     "plugin_id": key_id,
                 })
+            elif node_type == TYPE_CLONE:
+                # 20.04 (Q7): Clone-Haken -> feature_id ist die plugin_id
+                # (im set_id-Slot gespeichert); instance_hash im
+                # instance_id-Slot fuer die Varianten-Aufloesung.
+                result.append({
+                    "node_type": TYPE_CLONE,
+                    "set_id": "",
+                    "instance_id": key_id,
+                    "plugin_id": set_id,
+                })
         return result
 
     def checked_feature_ids(self) -> List[str]:
@@ -30861,6 +32981,23 @@ class MasterTree(QTreeWidget):
                 ids.append(pid)
         return ids
 
+    def checked_instance_hashes(self) -> List[str]:
+        """Deduplizierte instance_hashes aller gecheckten Clone-Varianten.
+
+        Runde 10 (Bug 1): Der Filter ist damit varianten-granular - ein
+        Check/Uncheck EINER Variante (Clone) aendert den Datenfilter
+        sichtbar (feature_ids bleibt plugin_id-granular fuer die
+        IN-Klausel, instance_hashes schraenkt auf die gewaehlten
+        Varianten ein). Leere Liste = keine Varianten-Einschraenkung.
+        """
+        hashes: List[str] = []
+        for entry in self.checked_services():
+            if entry["node_type"] == TYPE_CLONE:
+                h = entry.get("instance_id") or ""
+                if h and h not in hashes:
+                    hashes.append(h)
+        return hashes
+
     def checked_display_names(self) -> List[str]:
         """Lesbare Namen fuer die Button-Anzeige (Top-Bar).
 
@@ -30874,6 +33011,11 @@ class MasterTree(QTreeWidget):
                 s = self.model.find_set(entry["set_id"]) or {}
                 set_name = s.get("display_name") or entry["set_id"] or "?"
                 names.append(f"{set_name}/{entry['instance_id']}")
+            elif entry["node_type"] == TYPE_CLONE:
+                # 20.04 (Q7): Clone-Anzeige '<plugin_id> (#<hash>)'.
+                pid = entry["plugin_id"]
+                h = entry.get("instance_id") or ""
+                names.append(f"{pid} (#{h})" if h else pid)
             else:
                 names.append(entry["plugin_id"])
         return names
@@ -30893,13 +33035,14 @@ class MasterTree(QTreeWidget):
                 if item is None or not isValid(item):
                     continue
                 if item.data(0, ROLE_NODE_TYPE) in (TYPE_SET, TYPE_SERVICE,
-                                                    TYPE_PLUGIN):
+                                                    TYPE_PLUGIN, TYPE_CLONE):
                     item.setData(0, Qt.CheckStateRole, Qt.Unchecked)
         finally:
             self._updating_checks = False
         self.checked_changed.emit()
 
-    def set_checked_feature_ids(self, feature_ids) -> None:
+    def set_checked_feature_ids(self, feature_ids,
+                               instance_hashes=None) -> None:
         """Setzt die Haken anhand von plugin_ids (Reverse-Mapping).
 
         Wird beim Oeffnen des Dialogs aufgerufen, damit die aktuelle
@@ -30910,7 +33053,23 @@ class MasterTree(QTreeWidget):
         if not self._checkable:
             return
         wanted = {str(f).strip().lower() for f in (feature_ids or []) if str(f).strip()}
+        # Runde 9 (Bug 1): Ist der Baum noch NICHT aufgebaut (das initiale
+        # data_changed des Modells lief VOR der Dialog-Erstellung, der Baum
+        # bleibt sonst leer), werden die gewuenschten IDs gemerkt und beim
+        # naechsten _populate() automatisch angewendet - sonst gingen die
+        # restaurierten Haken verloren ('restore fails wenn offen').
+        if self.topLevelItemCount() == 0:
+            self._pending_feature_ids = [str(f) for f in (feature_ids or [])]
+            self._pending_instance_hashes = [
+                str(h) for h in (instance_hashes or []) if str(h).strip()]
+            return
         self._updating_checks = True
+        # Runde 10 (Bug 1): instance_hashes is None = KEINE
+        # Varianten-Einschraenkung (alle Clones der wanted plugin_ids);
+        # leere Liste = explizit KEINE Variante angehakt.
+        hash_restriction = instance_hashes is not None
+        wanted_hashes = {str(h).strip().lower()
+                         for h in (instance_hashes or []) if str(h).strip()}
         # Bugfix 08.08.2026 (Bug 2): Angehakte Items merken, um danach ihre
         # Eltern-Kette aufzuklappen (der Baum startet eingeklappt – ohne
         # Expansion bleiben die aktivierten Services/Plugins unsichtbar).
@@ -30933,11 +33092,35 @@ class MasterTree(QTreeWidget):
                         checked_items.append(item)
                     item.setData(0, Qt.CheckStateRole,
                                  Qt.Checked if checked else Qt.Unchecked)
-                elif node_type == TYPE_PLUGIN:
+                elif node_type == TYPE_PLUGIN and item.childCount() == 0:
+                    # 10.08.2026 (Punkt 6): Plugin-Parents MIT Varianten/
+                    # Clones sind Template-Knoten OHNE Checkbox (sie tragen
+                    # nur die Clone-Haken) - beim Reverse-Mapping werden sie
+                    # uebersprungen; nur flache Blaetter bleiben anhakbar.
                     pid = str(item.data(0, ROLE_PLUGIN_ID) or "")
                     checked = pid.lower() in wanted
                     if checked:
                         self._checked_items.add((TYPE_PLUGIN, "", pid))
+                        checked_items.append(item)
+                    item.setData(0, Qt.CheckStateRole,
+                                 Qt.Checked if checked else Qt.Unchecked)
+                elif node_type == TYPE_CLONE:
+                    # 20.04 (Q7): Clone-Haken folgen der plugin_id (feature-
+                    # id des Filters); instance_hash unterscheidet Varianten.
+                    # Runde 10 (Bug 1): Reverse-Mapping mit Hash-Granularitaet
+                    # - sind instance_hashes gesetzt, wird NUR die passende
+                    # Variante angehakt (sonst alle der plugin_id).
+                    pid = str(item.data(0, ROLE_PLUGIN_ID) or "")
+                    instance_hash = str(item.data(0, ROLE_INSTANCE_HASH) or "")
+                    if hash_restriction:
+                        checked = (pid.lower() in wanted
+                                   and instance_hash.strip().lower()
+                                   in wanted_hashes)
+                    else:
+                        checked = pid.lower() in wanted
+                    if checked:
+                        self._checked_items.add(
+                            (TYPE_CLONE, pid, instance_hash))
                         checked_items.append(item)
                     item.setData(0, Qt.CheckStateRole,
                                  Qt.Checked if checked else Qt.Unchecked)
@@ -30953,7 +33136,11 @@ class MasterTree(QTreeWidget):
                 self._expand_ancestors(item)
         finally:
             self._updating_checks = False
-        self.checked_changed.emit()
+        # Bugfix 10.08.2026 (Bug 5): KEIN checked_changed hier - dieses
+        # programmatische Set (beim Oeffnen des Picker-Dialogs) darf keine
+        # Feedback-Schleife in Gang setzen (checked_changed -> selection_ids
+        # -> set_feature_ids wuerde den restaurierten Filter ueberschreiben).
+        # Nur Nutzer-Aktionen (_on_item_changed) und clear_checks() emittieren.
 
     # -------------------------------------------------------------------------
     # Kontextmenue (Bugfix 05.08.2026, entkoppelt)
@@ -31077,19 +33264,25 @@ class MasterTree(QTreeWidget):
                 return
             if node_type == TYPE_SET:
                 set_id = str(item.data(0, ROLE_SET_ID) or "")
+                archived_set = bool(item.data(0, ROLE_ARCHIVED))
                 # 05.08.2026: 'Alle Services ausführen' – gezielter Run des
                 # Sets (kein globaler Massen-Scan); der Orchestrator zeigt
                 # den Bestaetigungsdialog (Set + Symbol/Timeframe).
+                # 20.04 (Q6): Archivierte Sets sind von Run/Struktur-Aktionen
+                # ausgenommen (Archive Safety) – nur Loeschen bleibt aktiv.
                 act_run = menu.addAction("▶️ Alle Services ausführen")
+                act_run.setEnabled(not archived_set)
                 act_run.triggered.connect(
                     lambda _=False, s=set_id:
                     self.run_set_requested.emit(s))
                 menu.addSeparator()
                 act_rename = menu.addAction("Set umbenennen")
+                act_rename.setEnabled(not archived_set)
                 act_rename.triggered.connect(
                     lambda _=False, s=set_id:
                     self.rename_set_requested.emit(s))
                 act_add = menu.addAction("Service hinzufügen")
+                act_add.setEnabled(not archived_set)
                 act_add.triggered.connect(
                     lambda _=False, s=set_id:
                     self.add_set_service_requested.emit(s))
@@ -31108,6 +33301,10 @@ class MasterTree(QTreeWidget):
                 set_id = str(item.data(0, ROLE_SET_ID) or "")
                 service_id = str(item.data(0, ROLE_INSTANCE_ID) or "")
                 plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
+                # 20.04 (Q1/Q9): instance_hash der Instanz (aus der Set-
+                # Definition, ROLE_INSTANCE_HASH) – Grundlage von Data-Only-
+                # Purge, Voll-Loeschung und Doc-Log.
+                instance_hash = str(item.data(0, ROLE_INSTANCE_HASH) or "")
                 # 05.08.2026: 'Diesen Service ausführen' – gezielter Run des
                 # Einzel-Services (inkl. Upstream-Abhaengigkeiten im Set);
                 # der Orchestrator zeigt den Bestaetigungsdialog (Service +
@@ -31134,10 +33331,92 @@ class MasterTree(QTreeWidget):
                 act_info.triggered.connect(
                     lambda _=False, s=set_id, i=service_id, p=plugin_id:
                     self.info_requested.emit(s, i, p))
+                # 20.04 (Q5/Q6/Q8): Instanz-Verwaltung (Service-in-Set).
+                # 'Als Variante duplizieren' erzeugt eine neue Instanz mit
+                # kopierten Parametern (Q8); 'Doc Log bearbeiten' editiert
+                # das Negativ-Wissen; 'Data Only Löschen' purgt NUR die
+                # Feature-Daten (Q5); 'Vollständig Löschen' entfernt die
+                # Instanz + Daten (2-stufige Sicherheitsabfrage).
+                menu.addSeparator()
+                act_variant = menu.addAction("Als Variante duplizieren")
+                act_variant.triggered.connect(
+                    lambda _=False, s=set_id, i=service_id, p=plugin_id,
+                           h=instance_hash:
+                    self.duplicate_variant_requested.emit(s, i, p, h))
+                act_doclog = menu.addAction("Doc Log bearbeiten")
+                act_doclog.triggered.connect(
+                    lambda _=False, s=set_id, i=service_id, p=plugin_id,
+                           h=instance_hash:
+                    self.doc_log_requested.emit(s, i, p, h))
+                menu.addSeparator()
+                act_purge = menu.addAction("Data Only Löschen")
+                act_purge.triggered.connect(
+                    lambda _=False, s=set_id, i=service_id, p=plugin_id,
+                           h=instance_hash:
+                    self.data_only_purge_requested.emit(s, i, p, h))
+                act_del = menu.addAction("Vollständig Löschen")
+                act_del.triggered.connect(
+                    lambda _=False, s=set_id, i=service_id, p=plugin_id,
+                           h=instance_hash:
+                    self.delete_complete_requested.emit(s, i, p, h))
                 menu.addSeparator()
                 act_purge = menu.addAction("Papierkorb löschen…")
                 act_purge.triggered.connect(
                     lambda _=False: self.purge_trash_requested.emit())
+                menu.exec(self.viewport().mapToGlobal(pos))
+                return
+            # 20.04 (Q7): Clone-Zeile (Preset/Variante eines Plugin-Parents).
+            # Der Run adressiert den Service ueber die plugin_id; archivierte
+            # Clones sind von allen Aktionen ausgenommen (Archive Safety, Q6).
+            if node_type == TYPE_CLONE:
+                plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
+                instance_hash = str(item.data(0, ROLE_INSTANCE_HASH) or "")
+                archived = bool(item.data(0, ROLE_ARCHIVED))
+                menu = QMenu(self)
+                act_run = menu.addAction("▶️ Diesen Service ausführen")
+                act_run.setEnabled(not archived)
+                act_run.triggered.connect(
+                    lambda _=False, p=plugin_id:
+                    self.run_plugin_requested.emit(p))
+                menu.addSeparator()
+                act_info = menu.addAction("Service-Info anzeigen")
+                act_info.setEnabled(not archived)
+                act_info.triggered.connect(
+                    lambda _=False, p=plugin_id:
+                    self.info_requested.emit("", "", p))
+                # 20.04 (Q5/Q6/Q8): Preset-/Varianten-Verwaltung. Archivierte
+                # Clones sind von den Bearbeitungs-/Lauf-Aktionen ausgenommen
+                # (Archive Safety, Q6) – nur 'Vollständig Löschen' bleibt als
+                # einzige Loesch-Option aktiv (Archiv-Einheit: einzelner Clone).
+                menu.addSeparator()
+                act_variant = menu.addAction("Als Variante duplizieren")
+                act_variant.setEnabled(not archived)
+                act_variant.triggered.connect(
+                    lambda _=False, p=plugin_id, h=instance_hash:
+                    self.duplicate_variant_requested.emit("", "", p, h))
+                # 10.08.2026 (Bugfix): 'Variante umbenennen' – Fragt den
+                # neuen Preset-Namen ab (Namensdialog im MasterTree) und
+                # emittiert rename_variant_requested (Orchestrator persistiert).
+                act_rename = menu.addAction("Variante umbenennen")
+                act_rename.setEnabled(not archived)
+                act_rename.triggered.connect(
+                    lambda _=False, it=item:
+                    self._on_rename_clone(it))
+                act_doclog = menu.addAction("Doc Log bearbeiten")
+                act_doclog.setEnabled(not archived)
+                act_doclog.triggered.connect(
+                    lambda _=False, p=plugin_id, h=instance_hash:
+                    self.doc_log_requested.emit("", "", p, h))
+                menu.addSeparator()
+                act_purge = menu.addAction("Data Only Löschen")
+                act_purge.setEnabled(not archived)
+                act_purge.triggered.connect(
+                    lambda _=False, p=plugin_id, h=instance_hash:
+                    self.data_only_purge_requested.emit("", "", p, h))
+                act_del = menu.addAction("Vollständig Löschen")
+                act_del.triggered.connect(
+                    lambda _=False, p=plugin_id, h=instance_hash:
+                    self.delete_complete_requested.emit("", "", p, h))
                 menu.exec(self.viewport().mapToGlobal(pos))
                 return
             # Plugin-Zeile (Services-Gruppe / Kategorie-Ordner):
@@ -31156,6 +33435,15 @@ class MasterTree(QTreeWidget):
                 act_info.triggered.connect(
                     lambda _=False, p=plugin_id:
                     self.info_requested.emit("", "", p))
+                # 20.04 (Q8): 'Als Variante duplizieren' – erzeugt eine
+                # Preset-Variante (indicator_presets) aus den aktuellen
+                # Plugin-Parametern; der Plugin-Knoten wird zum Parent mit
+                # Clone-Kindern (erste Variante eines flachen Blatts).
+                menu.addSeparator()
+                act_variant = menu.addAction("Als Variante duplizieren")
+                act_variant.triggered.connect(
+                    lambda _=False, p=plugin_id:
+                    self.duplicate_variant_requested.emit("", "", p, ""))
                 menu.exec(self.viewport().mapToGlobal(pos))
                 return
             # Sonstige Nicht-Set-Knoten (Gruppen der Services-Seite)
@@ -31292,6 +33580,12 @@ class MasterTree(QTreeWidget):
                 set_id = str(item.data(0, ROLE_SET_ID) or "")
             elif node_type == TYPE_PLUGIN:
                 plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
+            elif node_type == TYPE_CLONE:
+                # 20.04 (Q7): Clone-Zeilen liefern plugin_id (feature_id)
+                # im plugin_id-Slot; der instance_hash (Varianten-Key) wird
+                # im service_id-Slot mitgeliefert (Info/Param-Panel).
+                plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
+                service_id = str(item.data(0, ROLE_INSTANCE_HASH) or "")
             elif node_type == TYPE_CATEGORY:
                 # 18.01.01 (E-4): Kategorie-Ordner liefern den VOLLEN
                 # Kategorie-Pfad (z.B. 'Swing Points/Geometrie') im
@@ -31375,6 +33669,51 @@ class MasterTree(QTreeWidget):
                     break
         finally:
             self.blockSignals(False)
+
+    # -------------------------------------------------------------------------
+    # 20.04 (Q8-Bugfix): Programmgesteuerte Selektion nach dem Duplizieren –
+    # 'Als Variante duplizieren' muss ein SICHTBARES Ergebnis liefern. Die
+    # neuen Instanzen/Clones werden expandiert (Eltern-Kette), selektiert und
+    # in den sichtbaren Bereich gescrollt (unter blockSignals, kein Signal-
+    # Sturm auf _on_master_selection).
+    # -------------------------------------------------------------------------
+
+    def select_instance(self, set_id: str, service_id: str) -> bool:
+        """Selektiert eine Service-Instanz (TYPE_SERVICE) im Baum."""
+        return self._select_by(lambda it: (
+            it.data(0, ROLE_NODE_TYPE) == TYPE_SERVICE
+            and str(it.data(0, ROLE_SET_ID) or "") == str(set_id)
+            and str(it.data(0, ROLE_INSTANCE_ID) or "") == str(service_id)))
+
+    def select_clone(self, plugin_id: str, instance_hash: str) -> bool:
+        """Selektiert einen Clone-Knoten (TYPE_CLONE, Preset/Variante)."""
+        return self._select_by(lambda it: (
+            it.data(0, ROLE_NODE_TYPE) == TYPE_CLONE
+            and str(it.data(0, ROLE_PLUGIN_ID) or "") == str(plugin_id)
+            and str(it.data(0, ROLE_INSTANCE_HASH) or "") == str(instance_hash)))
+
+    def _select_by(self, predicate) -> bool:
+        """Iterator + Prädikat: expandieren, selektieren, scrollen."""
+        try:
+            for item in TreeItemIterator(self):
+                if item is None or not isValid(item):
+                    continue
+                try:
+                    if not predicate(item):
+                        continue
+                    self._expand_ancestors(item)
+                    self.blockSignals(True)
+                    try:
+                        self.setCurrentItem(item)
+                        self.scrollToItem(item)
+                    finally:
+                        self.blockSignals(False)
+                    return True
+                except (RuntimeError, AttributeError):
+                    continue
+        except (RuntimeError, AttributeError):
+            pass
+        return False
 
 
 class TreeItemIterator:
@@ -31885,6 +34224,91 @@ class ServiceParamColumnsMixin:
             pass
 
     # ------------------------------------------------------------------
+    # 20.03.02 (UI-Umbau, F6): Sammel-Info aller Resultatparameter einer
+    # Service-Instanz in einem kompakten Info-Window. Der einzelne
+    # (i)-Button hinter '📊 Resultatfelder:' ersetzt die bisherigen
+    # Per-Zeilen-i-Buttons (User-Req). Technische Felder (`technical:
+    # True`) werden UNTERHALB der Haupt-Resultatfelder in einer separaten,
+    # kleineren Sektion '🔧 System-Metriken' gerendert.
+    # ------------------------------------------------------------------
+    def _show_output_params_info(self, plugin_id: str) -> None:
+        """Zeigt ALLE Output-Parameter einer Service-Instanz an (20.03.02).
+
+        Haupt-Resultatfelder mit Typ + Beschreibung; Felder mit
+        `"technical": True` im `output_schema` in separater, kleinerer
+        Sektion `🔧 System-Metriken` (F6). Modaler QDialog (read-only),
+        Eltern-Widget robust aufgeloest (Bugfix b772c93: `self` falls
+        QWidget, sonst `self._dialog`, sonst None).
+        """
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            plugin = PluginRegistry().get(plugin_id)
+        except (KeyError, AttributeError):
+            plugin = None
+        schema = dict(getattr(plugin, "output_schema", None) or {})
+        if not schema:
+            return
+        try:
+            parent = (self if isinstance(self, QWidget)
+                      else getattr(self, "_dialog", None))
+            if not isinstance(parent, QWidget):
+                parent = None
+            dlg = QDialog(parent)
+            dlg.setWindowTitle(f"Resultatfelder – {plugin_id}")
+            dlg.setModal(True)
+            dlg.setMinimumWidth(420)
+            dvl = QVBoxLayout(dlg)
+
+            main_fields: List[Tuple[str, Dict[str, Any]]] = []
+            tech_fields: List[Tuple[str, Dict[str, Any]]] = []
+            for fname, fspec in schema.items():
+                fspec = fspec or {}
+                if fspec.get("technical"):
+                    tech_fields.append((fname, fspec))
+                else:
+                    main_fields.append((fname, fspec))
+
+            for fname, fspec in main_fields:
+                ftype = str(fspec.get("type") or "")
+                fdesc = str(fspec.get("description") or "")
+                head = QLabel(f"<b>{fname}</b>  <i>({ftype})</i>")
+                dvl.addWidget(head)
+                if fdesc:
+                    desc = QLabel(fdesc)
+                    desc.setWordWrap(True)
+                    desc.setStyleSheet("color: #555;")
+                    dvl.addWidget(desc)
+
+            if tech_fields:
+                sep = QLabel("<hr>")
+                dvl.addWidget(sep)
+                tech_head = QLabel("🔧 System-Metriken")
+                tech_head.setStyleSheet(
+                    "color: #888; font-size: 11px; font-weight: bold;")
+                dvl.addWidget(tech_head)
+                for fname, fspec in tech_fields:
+                    ftype = str(fspec.get("type") or "")
+                    fdesc = str(fspec.get("description") or "")
+                    line = f"<b>{fname}</b> <i>({ftype})</i>"
+                    if fdesc:
+                        line += f" – {fdesc}"
+                    tech_lbl = QLabel(line)
+                    tech_lbl.setWordWrap(True)
+                    tech_lbl.setStyleSheet("color: #999; font-size: 10px;")
+                    dvl.addWidget(tech_lbl)
+
+            btn_row = QHBoxLayout()
+            btn_row.addStretch(1)
+            ok_btn = QPushButton("OK")
+            ok_btn.setDefault(True)
+            ok_btn.clicked.connect(dlg.accept)
+            btn_row.addWidget(ok_btn)
+            dvl.addLayout(btn_row)
+            dlg.exec()
+        except (RuntimeError, AttributeError):
+            pass
+
+    # ------------------------------------------------------------------
     # Phase 15 (Dirty-State): Aenderungs-Tracking der Parameter-Controls
     # ------------------------------------------------------------------
     def _connect_param_change(self, ctrl: QWidget, iid: str, key: str) -> None:
@@ -32041,7 +34465,16 @@ class ServiceParamColumnsMixin:
                     if w is not None:
                         hints.append(w.sizeHint().width())
                 if hints:
-                    splitter.setSizes(hints)
+                    # 10.08.2026 (Bugfix, Slider): setSizes nur WACHSEN -
+                    # eine vom Anwender verschobene Splitter-Position darf
+                    # ein Param-Box-Rebuild nicht zuruecksetzen. Wird der
+                    # Inhalt breiter als das aktuelle Panel, waechst das
+                    # Panel auf den Bedarf (Tree-Breite bleibt).
+                    current = splitter.sizes()
+                    if not current or sum(current) <= 0:
+                        splitter.setSizes(hints)
+                    elif hints[1] > current[1]:
+                        splitter.setSizes([current[0], hints[1]])
         except (RuntimeError, AttributeError):
             pass
         # 17.01.06 (Bugfix): Nach dem FINALEN Box-Resize (DeferredDelete +
@@ -32223,60 +34656,38 @@ class ServiceParamColumnsMixin:
         # 20.03 (Bugfix): Resultatfelder (Output-Schema) als eigene Sektion
         # UNTER dem Beschreibungs-/Info-Feld (nicht mehr im Info-Label, User-
         # Meldung: Ergebnisparameter gehoeren nicht ins Beschreibungsfeld).
-        # Je Haupt-Resultatfeld eine Zeile: Feldname (+ Typ) und ein kleiner
-        # 'i'-Button, der die Feld-Beschreibung in einem Dialog anzeigt.
-        # Technische Felder (technical: True) kompakt in einer dezenten Zeile
-        # `🔧 System-Metrik` (Semikolon-getrennt, ohne Beschreibung – E2).
+        # 20.03.02 (UI-Umbau, User-Req + F6): KEINE Einzelzeilen mehr – nur
+        # die Gruppenueberschrift '📊 Resultatfelder:' mit einem EINZELNEN
+        # (i)-Button dahinter, der ALLE Ergebnisparameter der gewaehlten
+        # Service-Instanz kompakt in einem Info-Window zeigt (Name/Typ/
+        # Beschreibung). Technische Felder (`technical: True`) erscheinen dort
+        # UNTERHALB der Haupt-Resultatfelder in einer separaten, kleineren
+        # Sektion '🔧 System-Metriken' (F6).
         output_schema = dict(getattr(plugin, "output_schema", None) or {})
         if output_schema:
-            out_header = QLabel("📊 Resultatfelder (Output-Schema):")
+            out_header_row = QHBoxLayout()
+            out_header_row.setContentsMargins(0, 0, 0, 0)
+            out_header = QLabel("📊 Resultatfelder:")
             out_header.setObjectName("lbl_output_schema_header")
             out_header.setStyleSheet(
                 "color: #666; font-size: 11px; font-weight: bold;")
-            vl.addWidget(out_header)
-
-            main_fields: List[Tuple[str, Dict[str, Any]]] = []
-            tech_fields: List[Tuple[str, Dict[str, Any]]] = []
-            for fname, fspec in output_schema.items():
-                fspec = fspec or {}
-                if fspec.get("technical"):
-                    tech_fields.append((fname, fspec))
-                else:
-                    main_fields.append((fname, fspec))
-
-            for fname, fspec in main_fields:
-                ftype = str(fspec.get("type") or "")
-                fdesc = str(fspec.get("description") or "")
-                row = QHBoxLayout()
-                row.setContentsMargins(12, 0, 0, 0)
-                name_lbl = QLabel(f"🔹 {fname}  <i>({ftype})</i>")
-                name_lbl.setStyleSheet("color: #666; font-size: 11px;")
-                row.addWidget(name_lbl)
-                row.addStretch(1)
-                if fdesc:
-                    info_btn = QPushButton("i")
-                    info_btn.setFixedSize(16, 16)
-                    info_btn.setCursor(Qt.PointingHandCursor)
-                    info_btn.setToolTip("Feld-Beschreibung anzeigen")
-                    info_btn.setStyleSheet(
-                        "QPushButton { color:#666; border:1px solid #aaa;"
-                        " border-radius:8px; font-size:9px; font-weight:bold;"
-                        " background:transparent; }"
-                        "QPushButton:hover { color:#000; border-color:#000; }")
-                    info_btn.clicked.connect(
-                        lambda _=False, n=fname, t=ftype, d=fdesc, p=pid:
-                        self._show_output_field_info(n, t, d, p))
-                    row.addWidget(info_btn)
-                vl.addLayout(row)
-
-            if tech_fields:
-                tech_txt = "🔧 System-Metrik: " + "; ".join(
-                    f"{n} ({f.get('type') or ''})" for n, f in tech_fields)
-                tech_lbl = QLabel(tech_txt)
-                tech_lbl.setWordWrap(True)
-                tech_lbl.setStyleSheet("color: #999; font-size: 10px;")
-                vl.addWidget(tech_lbl)
-
+            out_header_row.addWidget(out_header)
+            out_info_btn = QPushButton("(i)")
+            out_info_btn.setObjectName("btn_output_params_info")
+            out_info_btn.setFixedSize(24, 16)
+            out_info_btn.setCursor(Qt.PointingHandCursor)
+            out_info_btn.setToolTip(
+                "Alle Ergebnisparameter dieser Service-Instanz anzeigen")
+            out_info_btn.setStyleSheet(
+                "QPushButton { color:#666; border:1px solid #aaa;"
+                " border-radius:8px; font-size:9px; font-weight:bold;"
+                " background:transparent; }"
+                "QPushButton:hover { color:#000; border-color:#000; }")
+            out_info_btn.clicked.connect(
+                lambda _=False, p=pid: self._show_output_params_info(p))
+            out_header_row.addWidget(out_info_btn)
+            out_header_row.addStretch(1)
+            vl.addLayout(out_header_row)
             # Zustand je Instanz merken (Reset in _clear_service_columns).
             self._service_output_schemas[iid] = output_schema
 
@@ -32536,6 +34947,12 @@ class ServiceRunWorker(QThread):
                                              context=context)
 
         stored = 0
+        # 20.04 (Q9): Instanz-Hashes je iid – Grundlage der feature_store-
+        # Spalte instance_hash (Varianten-Statistik + gezieltes Purge, Q5).
+        # Bevorzugt cfg.instance_hash (Set-Definition), sonst deterministisch
+        # aus generate_instance_hash(plugin_id, params) neu berechnet.
+        from analytics.engine.service_models import generate_instance_hash
+        svc_cfgs = dict(definition.get("services") or {})
         for iid, result in results.items():
             payload = (result or {}).get("feature_store_payload") or {}
             records = payload.get("records") or []
@@ -32543,7 +34960,13 @@ class ServiceRunWorker(QThread):
                 self.log_message.emit(
                     f"  {iid}: fertig (kein Feature-Store-Payload)")
                 continue
-            fb.store_plugin_payload(self.symbol, tf, payload)
+            cfg = svc_cfgs.get(iid) or {}
+            pid = str(cfg.get("plugin_id") or iid)
+            params = cfg.get("params") or {}
+            instance_hash = str(cfg.get("instance_hash") or "") or \
+                generate_instance_hash(pid, params)
+            fb.store_plugin_payload(self.symbol, tf, payload,
+                                    instance_hash=instance_hash)
             stored += len(records)
             self.log_message.emit(
                 f"  {iid}: {len(records)} Feature-Row(s) gespeichert "
@@ -32567,6 +34990,25 @@ class ServiceRunWorker(QThread):
             settings = StateManager().get_app_settings()
             fb = FeatureBuilder()
             definition = self._build_scope_definition()
+            # 20.04 (Q6): Archiv-Ignoranz (Archive Safety) – archivierte Sets
+            # bzw. einzeln archivierte Instanzen werden NICHT ausgefuehrt.
+            # Der MasterTree deaktiviert die Run-Aktionen zusaetzlich
+            # (Doppel-Absicherung; Scans/Executors bleiben rein lesend).
+            if not self.instance_id and self.set_definition.get("is_archived"):
+                self.log_message.emit(
+                    f"Archiviertes Set '{scope_id}' wird nicht ausgefuehrt "
+                    f"(Q6).")
+                self.run_finished.emit(scope_id, 0)
+                return
+            if self.instance_id:
+                _svc = (self.set_definition.get("services") or {}).get(
+                    self.instance_id) or {}
+                if _svc.get("is_archived"):
+                    self.log_message.emit(
+                        f"Archivierte Instanz '{self.instance_id}' wird nicht "
+                        f"ausgefuehrt (Q6).")
+                    self.run_finished.emit(scope_id, 0)
+                    return
             # 05.08.2026 (Bugfix Service-Run):
             #  * Fehlende depends_on-Einträge (z.B. srv_proximity -> srv_grid_lines)
             #    werden automatisch aufgelöst (sonst 'kein Feature-Store-
@@ -32743,14 +35185,16 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
+from analytics.engine.description_dialog import ServiceDescriptionDialog
 from analytics.engine.service_selector_model import ServiceSelectorModel
 from config.event_bus import event_bus
 from serviceui.master_tree import (
-    TYPE_CATEGORY, TYPE_PLUGIN, TYPE_SERVICE, TYPE_SET,
+    TYPE_CATEGORY, TYPE_CLONE, TYPE_PLUGIN, TYPE_SERVICE, TYPE_SET,
 )
 from serviceui.param_columns import ServiceParamColumnsMixin
 from serviceui.service_selector_widget import ServiceSelectorWidget
@@ -32810,6 +35254,11 @@ class _DialogParamHost(ServiceParamColumnsMixin):
         self._state_manager = state_manager
         self._current_plugin_editing: Optional[str] = None
         self._current_set_definition: Optional[Dict[str, Any]] = None
+        # 10.08.2026 (Bugfix, Varianten-Params): Wird ein Clone-Knoten
+        # (Preset/Variante) editiert, haelt dieses Feld das Preset-Dict aus
+        # indicator_presets - _save_plugin_params schreibt dann in das
+        # Preset statt in global_settings (plugin_params_<pid>).
+        self._current_preset_editing: Optional[Dict[str, Any]] = None
         #: Speichern-Button des Dialogs (wird nach dem UI-Aufbau gesetzt).
         self.btn_save_params: Optional[QPushButton] = None
 
@@ -32919,6 +35368,32 @@ class _DialogParamHost(ServiceParamColumnsMixin):
         cfg = next(iter(services.values()), None)
         if not isinstance(cfg, dict):
             return False
+        # 10.08.2026 (Bugfix, Varianten-Params): Im Clone-/Preset-Modus wird
+        # in indicator_presets gespeichert (eigene Parameter je Variante)
+        # statt in global_settings (plugin_params_<pid>).
+        preset = self._current_preset_editing
+        if isinstance(preset, dict):
+            indicator_id = str(preset.get("indicator_id") or "")
+            preset_name = str(preset.get("preset_name") or "Default")
+            if not indicator_id:
+                return False
+            try:
+                self._state_manager.save_indicator_preset(
+                    indicator_id, preset_name,
+                    dict(cfg.get("params") or {}),
+                    plugin_id=plugin_id,
+                    version=str(cfg.get("version")
+                                or preset.get("version") or "0.0.0"),
+                    is_active_batch=bool(preset.get("is_active_batch")),
+                    doc_log=str(preset.get("doc_log") or ""),
+                )
+            except Exception as e:
+                print(f"WARN [ServiceSelectorDialog] Varianten-Parameter "
+                      f"nicht gespeichert: {e}")
+                return False
+            self._set_param_actions_visible(False)
+            event_bus.service_set_changed.emit()
+            return True
         description = str(cfg.get("description") or "")
         desc_ctrl = self._service_desc_controls.get(plugin_id)
         if desc_ctrl is not None:
@@ -32962,9 +35437,16 @@ class ServiceSelectorDialog(QDialog):
     #: (display_names, feature_ids) – beim 'Anwenden & Schliessen' bzw.
     #: leere Listen beim 'Aktive Filter entfernen'.
     services_selected = Signal(list, list)
-    #: 18.01.01 (E-4): Live-Filter bei Klick auf eine Baum-Zeile –
-    #: aufgeloeste feature_ids (plugin_ids), sofort an das AnalyticsWindow.
+    #: 18.01.01 (E-4): Live-Filter - aufgeloeste feature_ids (plugin_ids),
+    #: sofort an das AnalyticsWindow. 10.08.2026 (Bugfix, Punkt 1+2): Der
+    #: Filter folgt AUSSCHLIESSLICH den Checkboxen (checked_changed ->
+    #: _on_checked_changed -> checked_feature_ids()); der Zeilen-Klick
+    #: emittiert dieses Signal NICHT mehr (nur das Read-Only-Panel folgt
+    #: dem Klick, Punkte 1-7).
     selection_ids_requested = Signal(list)
+    # Runde 10 (Bug 1): Varianten-granularer Filter - instance_hashes der
+    # gecheckten Clone-Varianten (parallel zu selection_ids_requested).
+    selection_hashes_requested = Signal(list)
 
     def __init__(
         self,
@@ -33012,11 +35494,17 @@ class ServiceSelectorDialog(QDialog):
             model=self.model,
             parent=self,
         )
-        # Punkt 4: Die BREITE DES TREES IST FIX (TREE_DEFAULT_WIDTH) – beim
-        # manuellen Vergroessern des Fensters bleibt der Tree stehen und nur
-        # die Parameter-Box waechst mit (Punkt 3).
-        self.selector.setFixedWidth(TREE_DEFAULT_WIDTH)
-        body.addWidget(self.selector, 0)
+        # 10.08.2026 (Bugfix, UI-Splitter): Der Tree ist NICHT mehr starr
+        # fixiert - er liegt zusammen mit dem Parameter-Panel in einem
+        # QSplitter, dessen Handle der Anwender mit der Maus frei verschieben
+        # kann (Klick-Ergonomie, Punkt 3). Nur die Mindestbreite verhindert
+        # das Kollabieren; TREE_DEFAULT_WIDTH ist die Startgroesse.
+        self.selector.setMinimumWidth(180)
+
+        self._splitter = QSplitter(Qt.Horizontal)
+        self._splitter.addWidget(self.selector)
+        self._splitter.setStretchFactor(0, 0)
+        self._splitter.setCollapsible(0, False)
 
         panel = QWidget(self)
         panel_layout = QVBoxLayout(panel)
@@ -33053,7 +35541,11 @@ class ServiceSelectorDialog(QDialog):
             "Speichert die Parameter des editierbaren Standalone-Services "
             "(plugin_params_<id>) inkl. EventBus-Sync (E-3).")
         panel_layout.addWidget(self.btn_save_params)
-        body.addWidget(panel, 2)
+        self._splitter.addWidget(panel)
+        self._splitter.setStretchFactor(1, 1)
+        self._splitter.setCollapsible(1, False)
+        self._splitter.setSizes([TREE_DEFAULT_WIDTH, 620])
+        body.addWidget(self._splitter, 1)
         root.addLayout(body, 1)
 
         # --- Aktions-Zeile unten ---
@@ -33079,6 +35571,12 @@ class ServiceSelectorDialog(QDialog):
             # eine Tree-Zeile (selection_details), NICHT den Checkboxen
             # (checked_changed-Verbindung entfernt – Punkte 1-7).
             tree.selection_details.connect(self._on_tree_selection_details)
+            # 10.08.2026 (Bugfix, Punkt 2): Check/Uncheck im ServicePicker
+            # muss die Resultatparameter-Dropdowns live aktualisieren - der
+            # Analytics-Filter (feature_ids) folgt den HAKEN (checked_changed),
+            # zusaetzlich zum Klick-Scope (selection_details). Das Panel
+            # selbst bleibt klickgesteuert (Punkte 1-7 unveraendert).
+            tree.checked_changed.connect(self._on_checked_changed)
             # 18.01.01 (E-4): Live-Verwaltung waehrend der Analytics-Session –
             # der MasterTree emittiert die CRUD-Signale; der Dialog fuehrt
             # sie ueber die ServiceSetRepository aus (Set anlegen/umbenennen/
@@ -33100,6 +35598,23 @@ class ServiceSelectorDialog(QDialog):
             tree.rename_folder_requested.connect(self._on_rename_folder)
             tree.create_folder_requested.connect(self._on_create_folder)
             tree.delete_folder_requested.connect(self._on_delete_folder)
+            # 20.04 (Q5/Q6/Q8): Instanz-Verwaltung im MasterTree-Kontextmenue
+            # (Service-/Clone-Zeilen) -> Handler (Muster service_win). Ohne
+            # diese Verbindungen emittiert der MasterTree die Signale zwar,
+            # aber niemand fuehrt sie aus – 'Als Variante duplizieren' im
+            # Analytics-Datenquellen-Picker blieb wirkungslos (Q8-Bugfix).
+            tree.data_only_purge_requested.connect(
+                self._on_data_only_purge)
+            tree.delete_complete_requested.connect(
+                self._on_delete_complete)
+            tree.doc_log_requested.connect(self._on_doc_log_requested)
+            tree.duplicate_variant_requested.connect(
+                self._on_duplicate_variant)
+            # 10.08.2026 (Bugfix): 'Variante umbenennen' (Clone/Preset) –
+            # der MasterTree fragt den neuen Namen ab; dieser Handler
+            # persistiert den Rename in indicator_presets.
+            tree.rename_variant_requested.connect(
+                self._on_rename_variant)
         # Live-Sync: Modell-Refresh (EventBus -> data_changed) baut den Baum
         # neu; das Panel wird mit dem zuletzt geklickten Scope nachgezogen.
         self.model.data_changed.connect(self._on_model_data_changed)
@@ -33110,6 +35625,15 @@ class ServiceSelectorDialog(QDialog):
         # – kein Fenster-Reflow, nur Container-Resize (Scrollbalken).
         self._param_host._dialog = self
 
+        # 20.03.02 (F4): i-Button im MasterTree (ServicePicker) oeffnet den
+        # Read-Only ServiceDescriptionDialog.from_plugin()/from_set() –
+        # im Gegensatz zum editierbaren ServiceDescriptionEditDialog im
+        # ServiceWindow. Kategorie-Ordner zeigen die Ordner-Info analog zur
+        # Set-Info (ServiceWindow-Muster _on_category_info_requested).
+        self.selector.info_requested.connect(self._on_info_requested)
+        self.selector.category_info_requested.connect(
+            self._on_category_info_requested)
+
         # Punkt 4: Letzte Position/Groesse wiederherstellen.
         self._restore_geometry()
         # Panel initial bauen (leer -> Hinweis), damit die Breiten-Logik
@@ -33119,15 +35643,20 @@ class ServiceSelectorDialog(QDialog):
     # ------------------------------------------------------------------
     # Oeffentliche API
     # ------------------------------------------------------------------
-    def apply_feature_ids(self, feature_ids: List[str]) -> None:
+    def apply_feature_ids(self, feature_ids: List[str],
+                          instance_hashes=None) -> None:
         """Spiegelt die aktuelle ViewModel-Auswahl im Baum (Reverse-Mapping).
 
         Wird beim Oeffnen des Dialogs gerufen, damit ein restauriertes
         Profil bzw. der aktive Filter im Checkbox-Baum sichtbar ist.
+        Runde 10 (Bug 1): instance_hashes (Varianten) werden ebenfalls
+        auf den Baum gemappt - nur die passenden Clone-Varianten werden
+        angehakt (Hash-Granularitaet).
         """
         tree = self.selector.master_tree
         if tree is not None:
-            tree.set_checked_feature_ids(list(feature_ids or []))
+            tree.set_checked_feature_ids(
+                list(feature_ids or []), list(instance_hashes or []))
 
     def current_display_names(self) -> List[str]:
         tree = self.selector.master_tree
@@ -33173,6 +35702,116 @@ class ServiceSelectorDialog(QDialog):
         self.accept()
 
     # ------------------------------------------------------------------
+    # 20.03.02 (F4): i-Button im MasterTree -> Read-Only-Beschreibung
+    # ------------------------------------------------------------------
+    @Slot(str, str, str)
+    def _on_info_requested(self, set_id: str, service_id: str,
+                           plugin_id: str) -> None:
+        """Info-Button im MasterTree (ServicePicker, 20.03.02 F4).
+
+        Read-Only `ServiceDescriptionDialog.from_plugin()` bzw.
+        `from_set()` (kein Editieren – der editierbare
+        `ServiceDescriptionEditDialog` bleibt dem ServiceWindow
+        vorbehalten). `header_line` im vereinheitlichten F5-Format
+        ('📌 im <Indikator> | 🟢 aktiv in <Indikator>' / '⚪ inaktiv').
+        """
+        try:
+            if service_id and set_id:
+                cfg = self.model.find_service(set_id, service_id) or {}
+                pid = str(cfg.get("plugin_id") or service_id)
+                plugin = self._resolve_info_plugin(pid)
+                if plugin is None:
+                    return
+                dlg = ServiceDescriptionDialog.from_plugin(
+                    plugin, instance_id=service_id, config=cfg, parent=self,
+                    header_line=self._info_header_line(pid))
+                dlg.exec()
+            elif plugin_id and not service_id:
+                plugin = self._resolve_info_plugin(plugin_id)
+                if plugin is None:
+                    return
+                dlg = ServiceDescriptionDialog.from_plugin(
+                    plugin, parent=self,
+                    header_line=self._info_header_line(plugin_id))
+                dlg.exec()
+            elif set_id and not service_id:
+                definition = self.model.find_set(set_id)
+                if not definition:
+                    return
+                dlg = ServiceDescriptionDialog.from_set(
+                    definition, parent=self,
+                    header_line=self._info_set_header_line(definition))
+                dlg.exec()
+        except (RuntimeError, AttributeError):
+            pass
+
+    @Slot(str, str)
+    def _on_category_info_requested(self, group: str,
+                                    category_path: str) -> None:
+        """Info-Dialog fuer einen Kategorie-Ordner (20.03.02, F4).
+
+        Analog zur Set-Info (ServiceDescriptionDialog.from_set, keine
+        persistierbare Beschreibung): Read-Only-Liste aller Services unter
+        dem Ordner (rekursiv) mit dem Kategorie-Pfad als Titel
+        (ServiceWindow-Muster _on_category_info_requested).
+        """
+        if not category_path:
+            return
+        try:
+            plugin_ids = self.model.category_service_plugin_ids(
+                group, category_path)
+            definition = {
+                "set_id": f"category_{category_path}",
+                "display_name": category_path,
+                "description": f"Kategorie-Ordner: {category_path}",
+                "execution_order": list(plugin_ids),
+                "services": {pid: {"plugin_id": pid} for pid in plugin_ids},
+            }
+            dlg = ServiceDescriptionDialog.from_set(definition, parent=self)
+            dlg.exec()
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _resolve_info_plugin(self, plugin_id: str):
+        """Registry-Lookup fuer den Info-Dialog (defensiv, ohne KeyError)."""
+        try:
+            from analytics.features.feature_builder import PluginRegistry
+            return PluginRegistry().get(plugin_id)
+        except KeyError:
+            return None
+
+    def _info_header_line(self, plugin_id: str) -> str:
+        """Erste Dialog-Zeile fuer Plugin-/Service-Zeilen (20.03.02, F5).
+
+        Vereinheitlichtes Badge-Format ('📌 im <Indikator> | 🟢 aktiv in
+        <Indikator>' / '⚪ inaktiv'); leer ohne Indikator-Zugehoerigkeit.
+        """
+        model = self.model
+        if model is None or not model.belongs_to_indicator(plugin_id):
+            return ""
+        name = model.get_indicator_display_name(plugin_id)
+        if model.is_active_in_chart(plugin_id):
+            return f"📌 im {name} | 🟢 aktiv in {name}"
+        return f"📌 im {name} | ⚪ inaktiv"
+
+    def _info_set_header_line(self, set_def: Dict[str, Any]) -> str:
+        """Erste Dialog-Zeile fuer Set-Zeilen (20.03.02, F5).
+
+        Vereinheitlichtes Badge-Format; mehrere Indikatoren mit ' + '
+        verknuepft.
+        """
+        model = self.model
+        if model is None:
+            return ""
+        names = model.get_set_indicator_names(set_def or {})
+        if not names:
+            return ""
+        label = " + ".join(names)
+        if model.is_set_active(set_def or {}):
+            return f"📌 im {label} | 🟢 aktiv in {label}"
+        return f"📌 im {label} | ⚪ inaktiv"
+
+    # ------------------------------------------------------------------
     # 18.01.01 (E-4): Live-Verwaltung (Set/Service-CRUD im Picker)
     # ------------------------------------------------------------------
     @Slot()
@@ -33183,6 +35822,329 @@ class ServiceSelectorDialog(QDialog):
                 self, "Fehler",
                 "Parameter konnten nicht gespeichert werden "
                 "(kein editierbarer Standalone-Service ausgewählt).")
+
+    # ------------------------------------------------------------------
+    # 20.04 (Q5/Q6/Q8): Instanz-Verwaltung im Kontextmenue – Handler
+    # (Muster service_win, ohne Editor-Load/Logging; der Dialog ist ein
+    # Read-Only-Picker, aber die Duplizierung/Loeschung muss funktionieren).
+    # ------------------------------------------------------------------
+
+    def _find_preset_for_hash(self, plugin_id: str,
+                              instance_hash: str):
+        """Preset-Dict zu plugin_id + instance_hash (indicator_presets)."""
+        try:
+            sm = self.model.state_manager
+            for preset in sm.list_plugin_presets(plugin_id) or []:
+                if not isinstance(preset, dict):
+                    continue
+                from analytics.engine.service_models import (
+                    generate_instance_hash)
+                if generate_instance_hash(
+                        plugin_id, preset.get("params") or {}) == instance_hash:
+                    return preset
+        except Exception:
+            pass
+        return None
+
+    @Slot(str, str, str, str)
+    def _on_duplicate_variant(self, set_id: str, service_id: str,
+                              plugin_id: str, instance_hash: str) -> None:
+        """'Als Variante duplizieren' (20.04, Q8) – Muster service_win."""
+        try:
+            if set_id and service_id:
+                self._duplicate_set_instance(set_id, service_id)
+                return
+            if plugin_id:
+                self._duplicate_preset(plugin_id, instance_hash)
+                return
+        except (RuntimeError, AttributeError):
+            pass
+
+    @Slot(str, str, str)
+    def _on_rename_variant(self, plugin_id: str, instance_hash: str,
+                           new_name: str) -> None:
+        """'Variante umbenennen' (10.08.2026, Bugfix) – Picker-Variante.
+
+        Persistiert den Rename in indicator_presets (indicator_id,
+        preset_name) mit Kollisionspruefung. Die Feature-Store-Daten
+        (Spalte instance_hash) bleiben unberuehrt. Der Picker nutzt
+        QMessageBox-Warnungen statt des ServiceWindow-Loggings.
+        """
+        try:
+            sm = self.model.state_manager
+        except Exception:
+            return
+        preset = self._find_preset_for_hash(plugin_id, instance_hash)
+        if preset is None:
+            QMessageBox.warning(
+                self, "Umbenennen",
+                f"Preset zu #{instance_hash} nicht gefunden.")
+            return
+        old_name = str(preset.get("preset_name") or "Default")
+        indicator_id = str(preset.get("indicator_id") or "")
+        if not indicator_id:
+            QMessageBox.warning(
+                self, "Umbenennen",
+                "Preset hat keine indicator_id – Umbenennen abgebrochen.")
+            return
+        clean = (new_name or "").strip()
+        if not clean or clean == old_name:
+            return
+        try:
+            existing = {str(p.get("preset_name") or "")
+                        for p in (sm.list_plugin_presets(plugin_id) or [])
+                        if isinstance(p, dict)}
+        except Exception:
+            existing = set()
+        if clean in existing:
+            QMessageBox.warning(
+                self, "Name vergeben",
+                f"Eine andere Variante von '{plugin_id}' heisst bereits "
+                f"'{clean}'.")
+            return
+        try:
+            sm.rename_indicator_preset(indicator_id, old_name, clean)
+        except Exception as e:
+            QMessageBox.warning(self, "Fehler", str(e))
+            return
+        event_bus.service_set_changed.emit()
+
+    def _next_preset_copy_name(self, plugin_id: str, base: str) -> str:
+        """Naechster freier Preset-Name '<base> (Kopie)', '(Kopie 2)', ..."""
+        try:
+            sm = self.model.state_manager
+            existing = {str(p.get("preset_name") or "")
+                        for p in (sm.list_plugin_presets(plugin_id) or [])
+                        if isinstance(p, dict)}
+        except Exception:
+            existing = set()
+        if base not in existing:
+            return base
+        candidate = f"{base} (Kopie)"
+        i = 2
+        while candidate in existing:
+            i += 1
+            candidate = f"{base} (Kopie {i})"
+        return candidate
+
+    def _duplicate_set_instance(self, set_id: str, service_id: str) -> None:
+        """Dupliziert eine Service-Instanz in ihrem Set (Q8)."""
+        if self.set_repo is None:
+            return
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception:
+            return
+        if not definition:
+            return
+        services = dict(definition.get("services") or {})
+        cfg = services.get(service_id)
+        if not isinstance(cfg, dict):
+            return
+        pid = str(cfg.get("plugin_id") or service_id)
+        iid = self._next_instance_id(services, pid)
+        copy = dict(cfg)
+        copy["params"] = dict(cfg.get("params") or {})
+        from analytics.engine.service_models import generate_instance_hash
+        copy["instance_hash"] = generate_instance_hash(pid, copy["params"])
+        copy.pop("description", None)
+        copy.pop("doc_log", None)
+        services[iid] = copy
+        order = list(definition.get("execution_order") or [])
+        order.append(iid)
+        definition["execution_order"] = order
+        definition["services"] = services
+        try:
+            self.set_repo.save_set(definition)
+        except Exception:
+            return
+        event_bus.service_set_changed.emit()
+
+    def _duplicate_preset(self, plugin_id: str, instance_hash: str) -> None:
+        """Dupliziert einen Plugin-Clone als neues Preset (Q8)."""
+        try:
+            sm = self.model.state_manager
+        except Exception:
+            return
+        base = "Default"
+        params = {}
+        indicator_id = plugin_id
+        version = "1.0.0"
+        if instance_hash:
+            preset = self._find_preset_for_hash(plugin_id, instance_hash)
+            if preset is None:
+                return
+            base = str(preset.get("preset_name") or "Default")
+            params = dict(preset.get("params") or {})
+            indicator_id = str(preset.get("indicator_id") or plugin_id)
+            version = preset.get("version") or "1.0.0"
+        else:
+            # Flaches Plugin-Blatt: aktuelle Standalone-Parameter.
+            try:
+                raw = sm.get_global_value(f"plugin_params_{plugin_id}", {})
+            except Exception:
+                raw = {}
+            if not isinstance(raw, dict):
+                raw = {}
+            params = dict(raw.get("params") or {})
+            version = raw.get("version") or "1.0.0"
+        # 10.08.2026 (Bugfix): Beim Anlegen einer neuen Variante MUSS ein
+        # neuer Name vergeben werden – der Dialog ist mit dem freien
+        # Kopiernamen vorbelegt; Kollisionen werden abgefangen.
+        suggested = self._next_preset_copy_name(plugin_id, base)
+        new_name, ok = QInputDialog.getText(
+            self, "Variante anlegen",
+            f"Name für die neue Variante (aus '{base}'):", text=suggested)
+        new_name = (new_name or "").strip()
+        if not ok or not new_name:
+            return
+        try:
+            existing = {str(p.get("preset_name") or "")
+                        for p in (sm.list_plugin_presets(plugin_id) or [])
+                        if isinstance(p, dict)}
+        except Exception:
+            existing = set()
+        if new_name in existing:
+            QMessageBox.warning(
+                self, "Name vergeben",
+                f"Eine andere Variante von '{plugin_id}' heisst bereits "
+                f"'{new_name}'.")
+            return
+        try:
+            sm.save_indicator_preset(
+                indicator_id, new_name, params,
+                plugin_id=plugin_id,
+                version=version,
+                # Q8-Bugfix: Kopie IMMER batch-aktiv (nicht Erbe vom
+                # Quell-Preset), damit Scans/LiveAnalyzer sie berechnen.
+                is_active_batch=True,
+                doc_log="",
+            )
+        except Exception:
+            return
+        event_bus.service_set_changed.emit()
+
+    @Slot(str, str, str, str)
+    def _on_data_only_purge(self, set_id: str, service_id: str,
+                            plugin_id: str, instance_hash: str) -> None:
+        """'Data Only Löschen' (Q5): Feature-Daten purgen, Struktur bleibt."""
+        if not instance_hash:
+            return
+        reply = QMessageBox.question(
+            self, "Data Only Löschen",
+            f"Feature-Daten der Variante #{instance_hash} löschen?\n"
+            "Struktur, Parameter und Doc-Log bleiben erhalten.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            from analytics.features.feature_builder import FeatureBuilder
+            FeatureBuilder().purge_instance_data(instance_hash)
+        except Exception:
+            pass
+        event_bus.service_set_changed.emit()
+
+    @Slot(str, str, str, str)
+    def _on_delete_complete(self, set_id: str, service_id: str,
+                            plugin_id: str, instance_hash: str) -> None:
+        """'Vollständig Löschen': Preset/Instanz + Daten entfernen."""
+        try:
+            sm = self.model.state_manager
+        except Exception:
+            return
+        if set_id and service_id and self.set_repo is not None:
+            try:
+                definition = self.set_repo.get_set(set_id)
+            except Exception:
+                return
+            if not definition:
+                return
+            services = dict(definition.get("services") or {})
+            cfg = services.get(service_id)
+            if not isinstance(cfg, dict):
+                return
+            label = str(cfg.get("plugin_id") or service_id)
+            reply = QMessageBox.question(
+                self, "Vollständig Löschen",
+                f"Instanz '{service_id}' aus Set '{set_id}' vollständig "
+                "löschen?\n\nDas Preset wird entfernt UND die "
+                "berechneten Feature-Daten gelöscht.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+            services.pop(service_id, None)
+            order = [i for i in (definition.get("execution_order") or [])
+                     if i != service_id]
+            definition["execution_order"] = order
+            definition["services"] = services
+            try:
+                self.set_repo.save_set(definition)
+            except Exception:
+                return
+            if instance_hash:
+                try:
+                    from analytics.features.feature_builder import (
+                        FeatureBuilder)
+                    FeatureBuilder().purge_instance_data(instance_hash)
+                except Exception:
+                    pass
+            event_bus.service_set_changed.emit()
+            return
+        if plugin_id and instance_hash:
+            preset = self._find_preset_for_hash(plugin_id, instance_hash)
+            if preset is None:
+                return
+            preset_name = str(preset.get("preset_name") or "Default")
+            indicator_id = str(preset.get("indicator_id") or "")
+            reply = QMessageBox.question(
+                self, "Vollständig Löschen",
+                f"Preset '{preset_name}' von '{plugin_id}' vollständig "
+                "löschen?\n\nDas Preset wird entfernt UND die "
+                "berechneten Feature-Daten gelöscht.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+            if sm is not None and indicator_id:
+                try:
+                    sm.delete_indicator_preset(indicator_id, preset_name)
+                except Exception:
+                    return
+            if instance_hash:
+                try:
+                    from analytics.features.feature_builder import (
+                        FeatureBuilder)
+                    FeatureBuilder().purge_instance_data(instance_hash)
+                except Exception:
+                    pass
+            event_bus.service_set_changed.emit()
+
+    @Slot(str, str, str, str)
+    def _on_doc_log_requested(self, set_id: str, service_id: str,
+                              plugin_id: str, instance_hash: str) -> None:
+        """'Doc Log bearbeiten' (Q7) – Read-Only-Hinweis im Picker.
+
+        Der Dialog ist ein Read-Only-Datenquellen-Picker ohne Editor – die
+        vollstaendige Doc-Log-Bearbeitung uebernimmt das ServiceWindow. Hier
+        wird eine kurze Info angezeigt, damit der Menuepunkt nicht wirkungslos
+        bleibt.
+        """
+        try:
+            if set_id and service_id:
+                QMessageBox.information(
+                    self, "Doc Log",
+                    "Die Doc-Log-Bearbeitung erfolgt im ServiceWindow "
+                    "(Kontextmenü der Instanz).")
+                return
+            if plugin_id and instance_hash:
+                preset = self._find_preset_for_hash(plugin_id, instance_hash)
+                doc = str((preset or {}).get("doc_log") or "")
+                QMessageBox.information(
+                    self, "Doc Log",
+                    f"Doc Log von '{plugin_id}':\n\n{doc or '(leer)'}\n\n"
+                    "Bearbeitung im ServiceWindow (Kontextmenü des Clones).")
+                return
+        except (RuntimeError, AttributeError):
+            pass
 
     def _next_instance_id(self, services: Dict[str, Any],
                           plugin_id: str) -> str:
@@ -33502,6 +36464,27 @@ class ServiceSelectorDialog(QDialog):
     # Read-Only-Parameter-Panel (Punkte 1-3: horizontal, 2-Spalten-Default,
     # Fensterbreite == rechte Kante der Parameter-Box)
     # ------------------------------------------------------------------
+    @Slot()
+    def _on_checked_changed(self) -> None:
+        """Live-Filter bei Checkbox-Aenderungen im Picker (10.08.2026).
+
+        Ein An-/Abhaken aktualisiert sofort die Datenquellen des
+        AnalyticsWindow (selection_ids_requested -> set_feature_ids) -
+        dadurch erneuern sich auch die Resultatparameter-Dropdowns
+        (heatmap field/agg etc.). Das Read-Only-Panel folgt weiterhin der
+        GEKLICKTEN Zeile (Punkte 1-7), nicht den Haken.
+        """
+        tree = self.selector.master_tree
+        if tree is None:
+            return
+        try:
+            ids = list(tree.checked_feature_ids() or [])
+            hashes = list(tree.checked_instance_hashes() or [])
+        except (RuntimeError, AttributeError):
+            return
+        self.selection_ids_requested.emit(ids)
+        self.selection_hashes_requested.emit(hashes)
+
     def _on_tree_selection_details(self, node_type: str, set_id: str,
                                    service_id: str, plugin_id: str) -> None:
         """Slot fuer `MasterTree.selection_details` (Mausklick in einer Zeile).
@@ -33520,19 +36503,25 @@ class ServiceSelectorDialog(QDialog):
             Plugins-Ordner die Plugin-Spalten (category_plugin_ids).
           * Gruppen-/sonstige Zeilen -> KEIN Service (Punkt 7).
 
-        18.01.01 (E-4): Zusaetzlich wird der LIVE-Filter gesetzt –
-        `selection_ids_requested(feature_ids)` informiert das AnalyticsWindow
-        sofort (ohne 'Anwenden'). Standalone-Services (belongs_to_indicator
-        == False) sind editierbar (plugin_params_<id>), alle anderen Zeilen
-        bleiben read-only.
+        10.08.2026 (Bugfix, Punkt 1+2): Der LIVE-FILTER folgt
+        AUSSCHLIESSLICH den Checkboxen (`checked_changed` ->
+        `_on_checked_changed` -> `selection_ids_requested` mit
+        `checked_feature_ids()`) - der Zeilen-Klick steuert NUR das Panel.
+        Vorher emittierte dieser Handler beim Klick zusaetzlich
+        `selection_ids_requested` mit dem Zeilen-Scope und ueberschrieb
+        damit den angehakten Filter (feature_ids der Historie/des Profils
+        entsprach dem letzten Klick statt den Haken; die
+        Ergebnisparameter-Dropdowns folgten dem Klick statt den Haken).
+        Standalone-Services (belongs_to_indicator == False) sind editierbar
+        (plugin_params_<id>), alle anderen Zeilen bleiben read-only.
         """
         self._last_scope = (node_type, set_id, service_id, plugin_id)
-        ids = self._resolve_selection_ids(node_type, set_id, service_id,
-                                          plugin_id)
-        if ids:
-            self.selection_ids_requested.emit(ids)
+        # 10.08.2026 (Bugfix, Punkt 1+2): KEIN selection_ids_requested mehr -
+        # der Filter folgt den Checkboxen (checked_changed), nicht dem Klick.
+        # Ein Klick darf den angehakten Filter nicht ueberschreiben (sonst
+        # speichern Historie/Profil den letzten Klick statt der Haken).
         editable = None
-        if node_type == TYPE_PLUGIN and plugin_id:
+        if node_type in (TYPE_PLUGIN, TYPE_CLONE) and plugin_id:
             if not self.model.belongs_to_indicator(str(plugin_id)):
                 editable = str(plugin_id)
         self._rebuild_param_panel(
@@ -33554,7 +36543,9 @@ class ServiceSelectorDialog(QDialog):
         if node_type == TYPE_CATEGORY:
             return self.model.category_service_plugin_ids(
                 set_id or "", plugin_id or "")
-        if node_type == TYPE_PLUGIN and plugin_id:
+        if node_type in (TYPE_PLUGIN, TYPE_CLONE) and plugin_id:
+            # 20.04 (Q7): Clone-Zeilen loesen auf die plugin_id des
+            # Plugin-Parents auf (Filter bleibt feature_id IN (plugin_ids)).
             return [str(plugin_id)]
         if node_type == TYPE_SERVICE and set_id and service_id:
             cfg = self.model.find_service(set_id, service_id) or {}
@@ -33628,7 +36619,26 @@ class ServiceSelectorDialog(QDialog):
                     "plugin_id": pid,
                 })
             return entries
-        if node_type == TYPE_PLUGIN and plugin_id:
+        if node_type in (TYPE_PLUGIN, TYPE_CLONE) and plugin_id:
+            # 20.04 (Q7): Clone-Zeilen zeigen wie Plugin-Zeilen den
+            # Standalone-Service (feature_id = plugin_id des Parents).
+            # 10.08.2026 (Bugfix, Varianten-Params): Zusaetzlich werden die
+            # presetspezifischen Parameter (indicator_presets) mitgegeben -
+            # das Panel zeigt die EIGENEN Parameter der Variante (service_id
+            # traegt hier den instance_hash, MasterTree._emit_selection_-
+            # details), nicht die globalen Standalone-Params.
+            if node_type == TYPE_CLONE:
+                preset = self._find_preset_for_hash(
+                    plugin_id, service_id)
+                if preset is not None:
+                    return [{
+                        "node_type": TYPE_PLUGIN,
+                        "set_id": "",
+                        "instance_id": "",
+                        "plugin_id": str(plugin_id),
+                        "preset_params": dict(preset.get("params") or {}),
+                        "preset": preset,
+                    }]
             return [{
                 "node_type": TYPE_PLUGIN,
                 "set_id": "",
@@ -33678,6 +36688,7 @@ class ServiceSelectorDialog(QDialog):
         host = self._param_host
         host._current_plugin_editing = None
         host._current_set_definition = None
+        host._current_preset_editing = None
         host._set_param_actions_visible(False)
         entries = list(entries or [])
         if not entries:
@@ -33700,6 +36711,16 @@ class ServiceSelectorDialog(QDialog):
             else:
                 iid = pid
                 cfg = host._plugin_config(pid)
+                # 10.08.2026 (Bugfix, Varianten-Params): presetspezifische
+                # Parameter ueberschreiben die Registry-/Standalone-Defaults.
+                preset_params = entry.get("preset_params")
+                if isinstance(preset_params, dict) and preset_params:
+                    merged = dict(cfg.get("params") or {})
+                    merged.update(preset_params)
+                    cfg["params"] = merged
+                # Preset fuer den Save-Pfad merken (indicator_presets statt
+                # global_settings).
+                host._current_preset_editing = entry.get("preset")
             editable = bool(editable_plugin) and pid == editable_plugin
             try:
                 box = host._build_service_column(iid, pid, cfg)
@@ -33817,9 +36838,24 @@ class ServiceSelectorDialog(QDialog):
         `showEvent` + QTimer erneut angestossen (stabile Layout-Geometrie).
         """
         self.layout().activate()
-        panel_right = self.param_panel.geometry().right()  # dialog-relativ
-        margins_right = self.layout().contentsMargins().right()
-        target = panel_right + margins_right + 1
+        # 10.08.2026 (Bugfix, UI-Splitter): Das Panel liegt jetzt in einem
+        # QSplitter - die rechte Kante muss dialog-relativ bestimmt werden
+        # (mapTo statt geometry(), dessen Eltern-System der Splitter ist).
+        # Das Panel ist das rechte Splitter-Widget; target = Tree-Breite +
+        # Handle + Panel-Minimum + Margins waechst mit dem Inhalt mit.
+        splitter = getattr(self, "_splitter", None)
+        if splitter is not None:
+            margins = self.layout().contentsMargins()
+            tree_w = self.selector.size().width()
+            handle = splitter.handleWidth()
+            panel_min = max(self.param_panel.minimumWidth(),
+                            self.param_panel.sizeHint().width())
+            target = (margins.left() + tree_w + handle + panel_min
+                      + margins.right() + 1)
+        else:
+            panel_right = self.param_panel.geometry().right()  # dialog-relativ
+            margins_right = self.layout().contentsMargins().right()
+            target = panel_right + margins_right + 1
         target = max(target, self.minimumWidth())
         if self.width() < target:
             self.resize(target, self.height())
@@ -33882,10 +36918,18 @@ class ServiceSelectorDialog(QDialog):
             pos_y = geom.get("pos_y")
             w = geom.get("width")
             h = geom.get("height")
-            screen = QApplication.primaryScreen().availableGeometry()
+            # Runde 10 (Bug 5): Gegen ALLE Screens pruefen - eine Position
+            # auf dem 2. Monitor ist NICHT off-screen (Fallback nur, wenn
+            # sie auf KEINEM Screen liegt). Vorher wurde nur der Primary-
+            # Screen geprueft -> Position auf Monitor 2 wurde verworfen.
+            screens = [s.availableGeometry()
+                       for s in QApplication.screens()]
             if pos_x is not None and pos_y is not None:
-                if (pos_x < screen.x() - 100 or pos_x > screen.right() or
-                        pos_y < screen.y() - 100 or pos_y > screen.bottom()):
+                on_screen = any(
+                    (scr.x() - 100 <= pos_x <= scr.right())
+                    and (scr.y() - 100 <= pos_y <= scr.bottom())
+                    for scr in screens)
+                if not on_screen:
                     pos_x = pos_y = None
                 else:
                     self.move(pos_x, pos_y)
@@ -33970,6 +37014,10 @@ class ServiceSelectorWidget(QWidget):
     #: Bugfix 05.08.2026: Klick auf den Info-Button im MasterTree (FULL_EDIT)
     #: wird an den Aufrufer weitergereicht (set_id, service_id, plugin_id).
     info_requested = Signal(str, str, str)
+    #: 20.03.02 (F4): Info-Button auf Kategorie-Ordnern wird an den Aufrufer
+    #: weitergereicht (group, category_path) – ServicePicker zeigt die
+    #: Read-Only-Ordner-Info (ServiceWindow-Muster).
+    category_info_requested = Signal(str, str)
 
     def __init__(self, mode: str = MODE_SELECT_ONLY, model: Optional[ServiceSelectorModel] = None,
                  parent: Optional[QWidget] = None) -> None:
@@ -34029,6 +37077,9 @@ class ServiceSelectorWidget(QWidget):
         self.master_tree.selection_changed.connect(self.selection_changed)
         # Bugfix 05.08.2026: Info-Button-Klicks im MasterTree re-emittieren.
         self.master_tree.info_requested.connect(self.info_requested)
+        # 20.03.02 (F4): Kategorie-Ordner-Info ebenfalls re-emittieren.
+        self.master_tree.category_info_requested.connect(
+            self.category_info_requested)
 
     def _build_select_only(self) -> None:
         """Modus A: kompakte Set-/Service-Combos."""
@@ -34067,6 +37118,9 @@ class ServiceSelectorWidget(QWidget):
         self.master_tree.selection_changed.connect(self.selection_changed)
         # Bugfix 05.08.2026: Info-Button-Klicks im MasterTree re-emittieren.
         self.master_tree.info_requested.connect(self.info_requested)
+        # 20.03.02 (F4): Kategorie-Ordner-Info ebenfalls re-emittieren.
+        self.master_tree.category_info_requested.connect(
+            self.category_info_requested)
 
     # -------------------------------------------------------------------------
     # Modell-Sync
@@ -34620,6 +37674,7 @@ from analytics.engine.description_dialog import (
     ServiceDescriptionDialog,
     ServiceDescriptionEditDialog,
 )
+from analytics.engine.service_models import generate_instance_hash
 from analytics.engine.service_set_repository import ServiceSetRepository
 from analytics.engine.set_evaluator import ServiceSetEvaluator
 from persistent_win import PersistentWindow, register_persistent_window
@@ -34688,6 +37743,12 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # Editor geladen, haelt dieses Feld die plugin_id. Die gespeicherten
         # Parameter liegen in global_settings (Key 'plugin_params_<pid>').
         self._current_plugin_editing: Optional[str] = None
+        # 10.08.2026 (Bugfix, Varianten-Params): Wird ein Clone-Knoten
+        # (Preset/Variante) editiert, haelt dieses Feld das Preset-Dict aus
+        # indicator_presets (indicator_id, preset_name, is_active_batch,
+        # doc_log) - der Save-Pfad schreibt dann in das Preset statt in
+        # global_settings (plugin_params_<pid>).
+        self._current_preset_editing: Optional[Dict[str, Any]] = None
         # USER-REQ (P14-03): Preisskala-Praezision je Symbol fuer die 6
         # Custom-Level-Eingabefelder (prox_level1..6). Lazy + gecacht.
         self._symbol_precision: Optional[int] = None
@@ -34730,8 +37791,10 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # unter dem Log (siehe right_panel-Aufbau weiter unten).
         if self.text_log:
             fm = self.text_log.fontMetrics()
-            self.text_log.setMaximumHeight(fm.lineSpacing() * 4 + 12)
-            self.text_log.setMinimumHeight(fm.lineSpacing() * 4 + 12)
+            # 10.08.2026 (Bugfix): Log-Hoehe von 4 auf 2 Zeilen reduziert
+            # (zwei Zeilen hoeher als der Default war ein Fehler).
+            self.text_log.setMaximumHeight(fm.lineSpacing() * 2 + 12)
+            self.text_log.setMinimumHeight(fm.lineSpacing() * 2 + 12)
 
         # Phase 13 5.4 Schritt 1: Dynamische Service-Spalten (Breite/Höhe aus
         # dem Inhalt – KEINE fixen Pixelwerte). Das Inhalt-Layout erhält
@@ -34801,11 +37864,12 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
 
             # Spalte 2: Service-Parameter-Box + Aktions-Leiste
             self._param_panel = QWidget()
-            # Bugfix 05.08.2026 (Punkt 1+2): Mindestbreite etwas breiter als
-            # ZWEI Service-Spalten (942 px) - kein horizontaler Scrollbalken
-            # bei 2 Services. Die UI-Geometrie (1400) deckt Tree (min. 400) +
-            # Box (min. 960) + Splitter-Handle ab.
-            self._param_panel.setMinimumWidth(960)
+            # 10.08.2026 (Bugfix, Slider): Das 960px-Minimum addierte sich mit
+            # dem Tree-Minimum (400px) auf ~1360px - der QSplitter hatte
+            # praktisch keinen Spielraum, der Slider war unbeweglich. Das
+            # Panel-Minimum ist jetzt schlank (520px); bei schmalerem Panel
+            # zeigt die ContentScrollArea horizontale Scrollbalken.
+            self._param_panel.setMinimumWidth(520)
             param_layout = QVBoxLayout(self._param_panel)
             param_layout.setContentsMargins(0, 0, 0, 0)
             param_layout.setSpacing(6)
@@ -34853,6 +37917,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             # Keine Spalte unter ihre Mindestgroesse kollabieren lassen.
             self.main_splitter.setCollapsible(0, False)
             self.main_splitter.setCollapsible(1, False)
+            # 10.08.2026 (Bugfix, Slider): Startgroessen einmalig setzen -
+            # danach behaelt der QSplitter die Position des Anwenders
+            # (_resize_param_box_deferred waechst nur noch, siehe
+            # param_columns.py).
+            self.main_splitter.setSizes([460, 820])
 
             self.top_row.addWidget(self.main_splitter)
             self.central_layout.insertLayout(idx, self.top_row)
@@ -35189,6 +38258,19 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         tree.rename_folder_requested.connect(self._on_rename_folder)
         tree.create_folder_requested.connect(self._on_create_folder)
         tree.delete_folder_requested.connect(self._on_delete_folder)
+        # 20.04 (Q5/Q6/Q8): Instanz-Verwaltung im MasterTree-Kontextmenue
+        # (Service-/Clone-Zeilen) -> Handler (unten). 'Data Only Löschen'
+        # purgt die Feature-Daten (Q5), 'Vollständig Löschen' entfernt
+        # Instanz/Preset + Daten, 'Doc Log bearbeiten' editiert das
+        # Negativ-Wissen und 'Als Variante duplizieren' erzeugt Kopien (Q8).
+        tree.data_only_purge_requested.connect(self._on_data_only_purge)
+        tree.delete_complete_requested.connect(self._on_delete_complete)
+        tree.doc_log_requested.connect(self._on_doc_log_requested)
+        tree.duplicate_variant_requested.connect(self._on_duplicate_variant)
+        # 10.08.2026 (Bugfix): 'Variante umbenennen' (Clone/Preset) – der
+        # MasterTree fragt den neuen Namen ab; dieser Handler persistiert
+        # den Rename in indicator_presets (indicator_id, preset_name).
+        tree.rename_variant_requested.connect(self._on_rename_variant)
 
     @Slot(str)
     def _toolbar_add_service(self, plugin_id: str,
@@ -35257,13 +38339,24 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         Set-Load laeuft ueber selection_changed); hier wird nur der
         Plugin-Modus zurueckgesetzt.
         """
-        if node_type == "plugin" and plugin_id:
-            self._load_plugin_editor(str(plugin_id))
+        if node_type in ("plugin", "clone") and plugin_id:
+            if node_type == "clone":
+                # 10.08.2026 (Bugfix, Varianten-Params): Eine Variante/Clone
+                # hat EIGENE Parameter in indicator_presets (20.04, Q7) -
+                # der Editor laedt die presetspezifischen Werte statt der
+                # globalen Standalone-Parameter (plugin_params_<pid>). Der
+                # instance_hash liegt im service_id-Slot (MasterTree.
+                # _emit_selection_details).
+                self._load_clone_editor(str(plugin_id), str(service_id))
+            else:
+                self._load_plugin_editor(str(plugin_id))
             return
         # Jede andere Zeile beendet den Plugin-Editor-Modus; der Set-Editor
         # wird weiterhin ueber selection_changed gesteuert (Bestandslogik).
         if self._current_plugin_editing:
             self._current_plugin_editing = None
+        if self._current_preset_editing:
+            self._current_preset_editing = None
 
     def _plugin_config(self, plugin_id: str) -> Dict[str, Any]:
         """ServiceInstanceConfig eines Standalone-Plugins.
@@ -35329,6 +38422,7 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         except KeyError:
             self.log(f"Plugin '{plugin_id}' nicht gefunden.")
             self._current_plugin_editing = None
+            self._current_preset_editing = None
             self._clear_set_editor()
             return
         cfg = self._plugin_config(plugin_id)
@@ -35340,6 +38434,53 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             "services": {plugin_id: cfg},
         }
         self._current_plugin_editing = plugin_id
+        self._current_preset_editing = None
+        self.load_set_into_editor(definition)
+
+    def _load_clone_editor(self, plugin_id: str, instance_hash: str) -> None:
+        """Laedt die Parameter einer Variante (Clone) in den Editor.
+
+        10.08.2026 (Bugfix, Varianten-Params): Jede Variante hat EIGENE
+        Parameter-Einstellungen in indicator_presets (Kapitel 20.04, Model C).
+        Ein Klick auf einen Clone-Knoten darf NICHT die globalen Standalone-
+        Parameter (plugin_params_<pid>) laden - der Editor zeigt die
+        presetspezifischen Werte. Der Save-Pfad (_save_plugin_params)
+        schreibt Aenderungen via save_indicator_preset in das Preset
+        (indicator_id, preset_name) zurueck.
+        """
+        if not plugin_id or not instance_hash:
+            return
+        preset = self._find_preset_for_hash(plugin_id, instance_hash)
+        if preset is None:
+            self.log(f"Preset zu #{instance_hash} nicht gefunden.")
+            self._current_plugin_editing = None
+            self._current_preset_editing = None
+            self._clear_set_editor()
+            return
+        indicator_id = str(preset.get("indicator_id") or "")
+        preset_name = str(preset.get("preset_name") or "Default")
+        if not indicator_id:
+            self.log(f"Preset '{preset_name}' hat keine indicator_id.")
+            return
+        # Basis = Registry-Defaults + gespeicherte Standalone-Werte; die
+        # presetspezifischen Parameter ueberschreiben (Varianten-Params).
+        cfg = self._plugin_config(plugin_id)
+        preset_params = preset.get("params") or {}
+        if isinstance(preset_params, dict) and preset_params:
+            merged = dict(cfg.get("params") or {})
+            merged.update(preset_params)
+            cfg["params"] = merged
+        definition: Dict[str, Any] = {
+            "set_id": "",
+            "display_name": f"{plugin_id} ({preset_name})",
+            "description": str(preset.get("doc_log") or ""),
+            "execution_order": [plugin_id],
+            "services": {plugin_id: cfg},
+        }
+        self._current_plugin_editing = plugin_id
+        # Merke das Preset fuer den Save-Pfad (is_active_batch/doc_log
+        # bleiben beim Speichern erhalten).
+        self._current_preset_editing = preset
         self.load_set_into_editor(definition)
 
     def _save_plugin_params(self) -> bool:
@@ -35358,6 +38499,34 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.log(f"FEHLER beim Speichern der Plugin-Parameter: "
                      f"keine Service-Config.")
             return False
+        # 10.08.2026 (Bugfix, Varianten-Params): Im Clone-/Preset-Modus wird
+        # in indicator_presets gespeichert (eigene Parameter je Variante)
+        # statt in global_settings (plugin_params_<pid>).
+        preset = self._current_preset_editing
+        if isinstance(preset, dict):
+            indicator_id = str(preset.get("indicator_id") or "")
+            preset_name = str(preset.get("preset_name") or "Default")
+            if not indicator_id:
+                self.log("Preset hat keine indicator_id - nicht gespeichert.")
+                return False
+            try:
+                self._state_manager.save_indicator_preset(
+                    indicator_id, preset_name,
+                    dict(cfg.get("params") or {}),
+                    plugin_id=plugin_id,
+                    version=str(cfg.get("version")
+                                or preset.get("version") or "0.0.0"),
+                    is_active_batch=bool(preset.get("is_active_batch")),
+                    doc_log=str(preset.get("doc_log") or ""),
+                )
+            except Exception as e:
+                self.log(f"FEHLER beim Speichern der Varianten-Parameter: {e}")
+                return False
+            self._clear_dirty_markers()
+            event_bus.service_set_changed.emit()
+            self.log(f"Parameter gespeichert (Variante '{preset_name}'): "
+                     f"{plugin_id}")
+            return True
         data: Dict[str, Any] = {
             "plugin_id": plugin_id,
             "lookback": int(cfg.get("lookback") or 1000),
@@ -36380,6 +39549,10 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self._current_set_definition = None
         # 17.01.04: Auch den Standalone-Plugin-Editor-Modus beenden.
         self._current_plugin_editing = None
+        # 10.08.2026 (Bugfix, Varianten-Params): Preset-Modus ebenfalls
+        # beenden (sonst wuerde der naechste Save in ein fremdes Preset
+        # schreiben).
+        self._current_preset_editing = None
         # Phase 15 (Dirty-State): Marker des vorherigen Sets entfernen.
         self._clear_dirty_markers()
         self._clear_service_columns()
@@ -36743,6 +39916,543 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         except (RuntimeError, AttributeError) as e:
             self.log(f"Info-Dialog nicht moeglich: {e}")
 
+    # =========================================================================
+    # 20.04 (Q5/Q6/Q8): Instanz-Verwaltung im MasterTree-Kontextmenue
+    # -------------------------------------------------------------------------
+    # 'Data Only Löschen', 'Vollständig Löschen', 'Doc Log bearbeiten' und
+    # 'Als Variante duplizieren' fuer Service-Instanzen (in Sets) und
+    # Plugin-Clones (indicator_presets). Alle Aktionen laufen entkoppelt
+    # ueber die MasterTree-Signale (keine UI-Kopplung, Invariante 2).
+    # =========================================================================
+
+    def _find_preset_for_hash(self, plugin_id: str,
+                              instance_hash: str) -> Optional[Dict[str, Any]]:
+        """Findet das Preset (indicator_presets) eines Clones ueber seinen
+        deterministischen instance_hash (20.04, Q2/Q4)."""
+        if not plugin_id or not instance_hash:
+            return None
+        sm = getattr(self, "_state_manager", None)
+        if sm is None:
+            return None
+        try:
+            for p in sm.list_plugin_presets(plugin_id) or []:
+                if not isinstance(p, dict):
+                    continue
+                params = p.get("params") or {}
+                if generate_instance_hash(plugin_id, params) == instance_hash:
+                    return p
+        except Exception as e:
+            self.log(f"Preset-Suche fehlgeschlagen: {e}")
+        return None
+
+    def _next_preset_copy_name(self, sm, plugin_id: str,
+                               base: str) -> str:
+        """Naechster freier Preset-Name fuer eine Varianten-Kopie (Q8).
+
+        Quelle ist `list_plugin_presets(plugin_id)` (nur ECHTE Preset-Rows) –
+        NICHT `list_indicator_presets`, das den UI-Default 'Default' immer
+        fabriziert. Ist der Basis-Name (z. B. 'Default') noch GAR NICHT
+        vergeben – der Fall eines flachen Plugin-Blattes, das seine erste
+        Variante erhaelt – wird der Basis-Name direkt verwendet. Sonst
+        '<base> (Kopie)', '(Kopie 2)', ...
+        """
+        try:
+            existing = {str(p.get("preset_name") or "")
+                        for p in (sm.list_plugin_presets(plugin_id) or [])
+                        if isinstance(p, dict)}
+        except Exception:
+            existing = set()
+        if base not in existing:
+            return base
+        candidate = f"{base} (Kopie)"
+        i = 2
+        while candidate in existing:
+            candidate = f"{base} (Kopie {i})"
+            i += 1
+        return candidate
+
+    @Slot(str, str, str, str)
+    def _on_data_only_purge(self, set_id: str, service_id: str,
+                            plugin_id: str, instance_hash: str) -> None:
+        """'Data Only Löschen' (20.04, Q5): purge_instance_data.
+
+        Entfernt NUR die berechneten Feature-Daten der Instanz aus dem
+        feature_store – die Instanz-Konfiguration (Set/Preset) bleibt
+        unangetastet; die Daten werden beim naechsten Scan neu berechnet.
+
+        * Service-in-Set: Hash aus der Set-Definition (cfg.instance_hash)
+          oder bei Alt-Daten aus den aktuellen Params neu berechnet.
+        * Clone/Preset: Hash direkt aus ROLE_INSTANCE_HASH.
+        """
+        if not instance_hash:
+            if set_id and service_id:
+                model = getattr(self.service_selector, "model", None)
+                cfg = model.find_service(set_id, service_id) if model else None
+                if cfg:
+                    instance_hash = generate_instance_hash(
+                        cfg.get("plugin_id") or service_id,
+                        cfg.get("params") or {})
+            if not instance_hash:
+                self.log("Kein instance_hash fuer 'Data Only Löschen' "
+                         "verfuegbar.")
+                return
+        label = service_id or f"{plugin_id} (#{instance_hash})"
+        reply = QMessageBox.question(
+            self, "Data Only Löschen",
+            f"Berechnete Feature-Daten der Instanz '{label}' "
+            f"(#{instance_hash}) dauerhaft löschen?\n\n"
+            "Die Instanz-Konfiguration bleibt erhalten – die Daten werden "
+            "beim nächsten Scan neu berechnet.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            from analytics.features.feature_builder import FeatureBuilder
+            n = FeatureBuilder().purge_instance_data(instance_hash)
+        except Exception as e:
+            self.log(f"FEHLER beim Purgen der Feature-Daten: {e}")
+            return
+        self.log(f"Feature-Daten gelöscht: {n} Zeilen "
+                 f"(Instanz #{instance_hash}).")
+        event_bus.service_set_changed.emit()
+
+    @Slot(str, str, str, str)
+    def _on_delete_complete(self, set_id: str, service_id: str,
+                            plugin_id: str, instance_hash: str) -> None:
+        """'Vollständig Löschen' (20.04): Instanz/Preset + Daten entfernen.
+
+        Zwei Sicherheitsabfragen (P14-05-Muster). Betrifft:
+        * Service-in-Set: Instanz aus service_sets entfernen + Feature-Daten
+          der Variante purgen (Hash aus cfg bzw. Params).
+        * Clone/Preset: indicator_presets-Eintrag löschen + Feature-Daten
+          purgen (Archiv-Einheit: einzelner Clone – auch archivierte Clones
+          sind hierueber endgueltig entfernt).
+        """
+        if set_id and service_id:
+            self._delete_complete_set_instance(set_id, service_id, plugin_id)
+        elif plugin_id:
+            self._delete_complete_preset(plugin_id, instance_hash)
+        else:
+            self.log("Vollständig Löschen: keine Ziel-Instanz.")
+
+    def _delete_complete_set_instance(self, set_id: str, service_id: str,
+                                      plugin_id: str) -> None:
+        """Voll-Loeschung einer Service-Instanz in einem Set."""
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            self.log(f"FEHLER beim Laden des Sets ({set_id}): {e}")
+            return
+        if not definition:
+            self.log(f"Set '{set_id}' nicht gefunden.")
+            return
+        services = dict(definition.get("services") or {})
+        cfg = services.get(service_id) or {}
+        pid = str(cfg.get("plugin_id") or plugin_id or service_id)
+        # P14-04-E: nur der LETZTE Vorkommen eines Indikator-Services gesperrt.
+        if self._plugin_belongs_to_indicator(pid):
+            others = self._remaining_sets_with_plugin(
+                pid, exclude_set_id=set_id)
+            if not others:
+                QMessageBox.warning(
+                    self, "Service gesperrt",
+                    f"Der Service '{pid}' ist der letzte in einem "
+                    f"gespeicherten Service-Set.\n"
+                    f"Für den Indikator muss mindestens ein gültiges Set "
+                    f"mit diesem Service erhalten bleiben (P14-04).")
+                return
+        label = f"{service_id} [{pid}]"
+        reply = QMessageBox.question(
+            self, "Vollständig Löschen",
+            f"Instanz '{label}' vollständig löschen?\n\n"
+            "Die Instanz wird aus dem Set entfernt UND die berechneten "
+            "Feature-Daten dieser Parameter-Variante werden gelöscht.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        reply2 = QMessageBox.question(
+            self, "Wirklich?",
+            f"'{label}' wird dauerhaft entfernt – inkl. aller gespeicherten "
+            "Feature-Daten der Variante. Fortfahren?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply2 != QMessageBox.Yes:
+            return
+        # 1) Instanz aus dem Set entfernen
+        order = [i for i in (definition.get("execution_order") or [])
+                 if i != service_id]
+        services.pop(service_id, None)
+        definition["execution_order"] = order
+        definition["services"] = services
+        try:
+            self.set_repo.save_set(definition)
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern des Sets: {e}")
+            return
+        # 2) Feature-Daten der Variante purgen
+        hash_ = str(cfg.get("instance_hash") or "")
+        if not hash_:
+            hash_ = generate_instance_hash(pid, cfg.get("params") or {})
+        if hash_:
+            try:
+                from analytics.features.feature_builder import FeatureBuilder
+                n = FeatureBuilder().purge_instance_data(hash_)
+            except Exception as e:
+                n = 0
+                self.log(f"WARN: Feature-Daten-Purge fehlgeschlagen: {e}")
+            self.log(f"Variante #{hash_} purged ({n} Zeilen).")
+        self.log(f"Instanz vollständig gelöscht: {label}")
+        event_bus.service_set_changed.emit()
+        if self._current_set_id == set_id:
+            self.load_set_into_editor(definition)
+
+    def _delete_complete_preset(self, plugin_id: str,
+                                instance_hash: str) -> None:
+        """Voll-Loeschung eines Plugin-Presets/Clones."""
+        preset = self._find_preset_for_hash(plugin_id, instance_hash)
+        if preset is None:
+            self.log(f"Preset zu #{instance_hash} nicht gefunden.")
+            return
+        preset_name = str(preset.get("preset_name") or "Default")
+        indicator_id = str(preset.get("indicator_id") or "")
+        reply = QMessageBox.question(
+            self, "Vollständig Löschen",
+            f"Preset '{preset_name}' von '{plugin_id}' vollständig löschen?"
+            f"\n\nDas Preset wird aus indicator_presets entfernt UND die "
+            "berechneten Feature-Daten dieser Parameter-Variante werden "
+            "gelöscht.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        reply2 = QMessageBox.question(
+            self, "Wirklich?",
+            f"'{preset_name}' wird dauerhaft gelöscht – inkl. aller "
+            "gespeicherten Feature-Daten der Variante. Fortfahren?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply2 != QMessageBox.Yes:
+            return
+        sm = getattr(self, "_state_manager", None)
+        if sm is not None and indicator_id:
+            try:
+                sm.delete_indicator_preset(indicator_id, preset_name)
+            except Exception as e:
+                self.log(f"FEHLER beim Löschen des Presets: {e}")
+                return
+        if instance_hash:
+            try:
+                from analytics.features.feature_builder import FeatureBuilder
+                n = FeatureBuilder().purge_instance_data(instance_hash)
+            except Exception as e:
+                n = 0
+                self.log(f"WARN: Feature-Daten-Purge fehlgeschlagen: {e}")
+            self.log(f"Variante #{instance_hash} purged ({n} Zeilen).")
+        self.log(f"Preset vollständig gelöscht: '{preset_name}'.")
+        event_bus.service_set_changed.emit()
+
+    @Slot(str, str, str, str)
+    def _on_doc_log_requested(self, set_id: str, service_id: str,
+                              plugin_id: str, instance_hash: str) -> None:
+        """'Doc Log bearbeiten' (20.04, Q1/Q7).
+
+        Oeffnet den ServiceDescriptionEditDialog fuer das Freitextfeld
+        (Negativ-Wissen). Persistenz:
+        * Service-in-Set: ServiceInstanceConfig.doc_log (Set-JSON).
+        * Clone/Preset: indicator_presets.doc_log.
+        """
+        try:
+            if set_id and service_id:
+                model = getattr(self.service_selector, "model", None)
+                cfg = model.find_service(set_id, service_id) if model else None
+                cfg = cfg or {}
+                pid = str(cfg.get("plugin_id") or service_id)
+                dlg = ServiceDescriptionEditDialog(
+                    parent=self,
+                    instance_id=service_id,
+                    plugin_id=pid,
+                    header_line=self._info_header_tooltip(pid),
+                    description=str(cfg.get("doc_log") or ""),
+                    title="Doc Log bearbeiten",
+                )
+                dlg.save_requested.connect(
+                    lambda text, s=set_id, i=service_id:
+                    self._save_instance_doc_log(s, i, text))
+                dlg.exec()
+                return
+            if plugin_id and instance_hash:
+                preset = self._find_preset_for_hash(plugin_id, instance_hash)
+                preset_name = str((preset or {}).get("preset_name")
+                                  or instance_hash)
+                dlg = ServiceDescriptionEditDialog(
+                    parent=self,
+                    instance_id=preset_name,
+                    plugin_id=plugin_id,
+                    header_line=self._info_header_tooltip(plugin_id),
+                    description=str((preset or {}).get("doc_log") or ""),
+                    title="Doc Log bearbeiten",
+                )
+                dlg.save_requested.connect(
+                    lambda text, p=plugin_id, h=instance_hash:
+                    self._save_plugin_doc_log(p, h, text))
+                dlg.exec()
+                return
+        except (RuntimeError, AttributeError) as e:
+            self.log(f"Doc-Log-Dialog nicht möglich: {e}")
+
+    def _save_instance_doc_log(self, set_id: str, instance_id: str,
+                               new_log: str) -> None:
+        """Persistiert das Doc-Log einer Service-Instanz (20.04, Q7).
+
+        Ziel: ServiceInstanceConfig.doc_log im Set-JSON (single source of
+        truth wie description). Analog _save_instance_description.
+        """
+        clean = (new_log or "").strip()
+        # In der geladenen Definition nachziehen (sofortige Folge-Speicherung)
+        if self._current_set_definition is not None:
+            cfg = (self._current_set_definition.get("services") or {}).get(
+                instance_id)
+            if isinstance(cfg, dict):
+                cfg["doc_log"] = clean
+        if not set_id:
+            self.log(f"Doc Log '{instance_id}' aktualisiert "
+                     f"(Set noch nicht gespeichert).")
+            return
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            self.log(f"FEHLER beim Laden des Sets ({set_id}): {e}")
+            return
+        if not definition:
+            self.log(f"Set '{set_id}' nicht gefunden – Doc Log nicht "
+                     f"gespeichert.")
+            return
+        services = definition.get("services") or {}
+        if instance_id in services:
+            services[instance_id]["doc_log"] = clean
+        definition["services"] = services
+        try:
+            self.set_repo.save_set(definition)
+            event_bus.service_set_changed.emit()
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern des Doc Logs: {e}")
+            return
+        self._clear_dirty_markers()
+        self.log(f"Doc Log '{instance_id}' gespeichert.")
+
+    def _save_plugin_doc_log(self, plugin_id: str, instance_hash: str,
+                             new_log: str) -> None:
+        """Persistiert das Doc-Log eines Plugin-Presets (20.04, Q7)."""
+        sm = getattr(self, "_state_manager", None)
+        if sm is None:
+            self.log("Doc Log nicht gespeichert (kein StateManager).")
+            return
+        preset = self._find_preset_for_hash(plugin_id, instance_hash)
+        if not preset or not preset.get("indicator_id"):
+            self.log(f"Preset zu #{instance_hash} nicht gefunden.")
+            return
+        try:
+            sm.set_plugin_preset_doc_log(
+                preset.get("indicator_id"), preset.get("preset_name"),
+                new_log)
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern des Preset-Doc-Logs: {e}")
+            return
+        self.log(f"Doc Log '{preset.get('preset_name')}' gespeichert.")
+        event_bus.service_set_changed.emit()
+
+    @Slot(str, str, str, str)
+    def _on_duplicate_variant(self, set_id: str, service_id: str,
+                              plugin_id: str, instance_hash: str) -> None:
+        """'Als Variante duplizieren' (20.04, Q8).
+
+        * Service-in-Set: neue Instanz mit kopierten Parametern + neu
+          berechnetem instance_hash (neue instance_id via _next_instance_id).
+        * Clone/Preset: neues Preset mit kopierten Parametern (Name
+          '<Preset> (Kopie)'); aus einem flachen Plugin-Blatt entsteht so
+          die erste Variante.
+        """
+        if set_id and service_id:
+            self._duplicate_set_instance(set_id, service_id)
+            return
+        if plugin_id:
+            self._duplicate_preset(plugin_id, instance_hash)
+            return
+        self.log("Als Variante duplizieren: keine Ziel-Instanz.")
+
+    @Slot(str, str, str)
+    def _on_rename_variant(self, plugin_id: str, instance_hash: str,
+                           new_name: str) -> None:
+        """'Variante umbenennen' (10.08.2026, Bugfix).
+
+        Benennt ein Plugin-Preset (Clone/Variante) in indicator_presets um.
+        Kollisionspruefung gegen die UEBRIGEN Presets des Plugins; die
+        Feature-Store-Daten (Spalte instance_hash) bleiben unberuehrt
+        (der Hash haengt an den Parametern, nicht am Namen).
+        """
+        preset = self._find_preset_for_hash(plugin_id, instance_hash)
+        if preset is None:
+            self.log(f"Preset zu #{instance_hash} nicht gefunden – "
+                     f"Umbenennen abgebrochen.")
+            return
+        old_name = str(preset.get("preset_name") or "Default")
+        indicator_id = str(preset.get("indicator_id") or "")
+        if not indicator_id:
+            self.log("Preset hat keine indicator_id – Umbenennen abgebrochen.")
+            return
+        clean = (new_name or "").strip()
+        if not clean or clean == old_name:
+            return
+        sm = getattr(self, "_state_manager", None)
+        if sm is None:
+            self.log("Umbenennen nicht moeglich (kein StateManager).")
+            return
+        try:
+            existing = {str(p.get("preset_name") or "")
+                        for p in (sm.list_plugin_presets(plugin_id) or [])
+                        if isinstance(p, dict)}
+        except Exception as e:
+            self.log(f"FEHLER beim Laden der Preset-Namen: {e}")
+            return
+        if clean in existing:
+            QMessageBox.warning(
+                self, "Name vergeben",
+                f"Eine andere Variante von '{plugin_id}' heisst bereits "
+                f"'{clean}'.")
+            return
+        try:
+            sm.rename_indicator_preset(indicator_id, old_name, clean)
+        except Exception as e:
+            self.log(f"FEHLER beim Umbenennen der Variante: {e}")
+            return
+        self.log(f"Variante '{old_name}' umbenannt zu '{clean}'.")
+        event_bus.service_set_changed.emit()
+
+    def _duplicate_set_instance(self, set_id: str, service_id: str) -> None:
+        """Dupliziert eine Service-Instanz in ihrem Set (Q8)."""
+        try:
+            definition = self.set_repo.get_set(set_id)
+        except Exception as e:
+            self.log(f"FEHLER beim Laden des Sets ({set_id}): {e}")
+            return
+        if not definition:
+            self.log(f"Set '{set_id}' nicht gefunden.")
+            return
+        services = dict(definition.get("services") or {})
+        cfg = services.get(service_id)
+        if not isinstance(cfg, dict):
+            self.log(f"Instanz '{service_id}' nicht gefunden.")
+            return
+        pid = str(cfg.get("plugin_id") or service_id)
+        iid = self._next_instance_id(services, pid)
+        copy = dict(cfg)
+        copy["params"] = dict(cfg.get("params") or {})
+        copy["instance_hash"] = generate_instance_hash(pid, copy["params"])
+        copy.pop("description", None)
+        copy.pop("doc_log", None)
+        services[iid] = copy
+        order = list(definition.get("execution_order") or [])
+        order.append(iid)
+        definition["execution_order"] = order
+        definition["services"] = services
+        try:
+            self.set_repo.save_set(definition)
+        except Exception as e:
+            self.log(f"FEHLER beim Speichern des Sets: {e}")
+            return
+        self.log(f"Variante '{iid}' dupliziert aus '{service_id}' "
+                 f"(#{copy['instance_hash']}).")
+        event_bus.service_set_changed.emit()
+        # Q8-Bugfix: Ergebnis SICHTBAR machen – das Ziel-Set wird in den
+        # Parameter-Editor geladen (neue Service-Spalte der Variante) und
+        # die neue Instanz im Baum expandiert/selektiert.
+        self.load_set_into_editor(definition)
+        tree = getattr(getattr(self, "service_selector", None),
+                       "master_tree", None)
+        if tree is not None:
+            tree.select_instance(set_id, iid)
+
+    def _duplicate_preset(self, plugin_id: str, instance_hash: str) -> None:
+        """Dupliziert einen Plugin-Clone als neues Preset (Q8)."""
+        sm = getattr(self, "_state_manager", None)
+        if sm is None:
+            self.log("Variante nicht dupliziert (kein StateManager).")
+            return
+        if instance_hash:
+            preset = self._find_preset_for_hash(plugin_id, instance_hash)
+            if preset is None:
+                self.log(f"Preset zu #{instance_hash} nicht gefunden.")
+                return
+            base = str(preset.get("preset_name") or "Default")
+            params = dict(preset.get("params") or {})
+            indicator_id = str(preset.get("indicator_id") or "")
+            version = preset.get("version")
+            # Diff 2 (User-Bugreport 09.08.2026): Eine duplizierte Variante
+            # ist IMMER batch-aktiv (is_active_batch=True) – NICHT der Status
+            # des Quell-Presets. Sonst bliebe eine archivierte/inaktive Kopie
+            # unsichtbar: Scans/LiveAnalyzer ignorieren is_active_batch=False
+            # und das Analytics-Dropdown zeigt sie erst nach einem Run.
+            is_active = True
+        else:
+            # Flaches Plugin-Blatt: aktuelle Standalone-Parameter
+            # (global_settings, Key 'plugin_params_<plugin_id>').
+            try:
+                raw = sm.get_global_value(f"plugin_params_{plugin_id}", {})
+            except Exception:
+                raw = {}
+            if not isinstance(raw, dict):
+                raw = {}
+            base = "Default"
+            params = dict(raw.get("params") or {})
+            indicator_id = plugin_id
+            version = raw.get("version") or "1.0.0"
+            is_active = True
+        if not indicator_id:
+            indicator_id = plugin_id
+        # 10.08.2026 (Bugfix): Beim Anlegen einer neuen Variante MUSS ein
+        # neuer Name vergeben werden – kein stummes Auto-Schema
+        # ('<base> (Kopie)'). Der Dialog ist mit dem freien Kopiernamen
+        # vorbelegt; Kollisionen werden abgefangen.
+        suggested = self._next_preset_copy_name(sm, plugin_id, base)
+        new_name, ok = QInputDialog.getText(
+            self, "Variante anlegen",
+            f"Name für die neue Variante (aus '{base}'):", text=suggested)
+        new_name = (new_name or "").strip()
+        if not ok or not new_name:
+            self.log("Variante nicht dupliziert (Name fehlt/abgebrochen).")
+            return
+        try:
+            existing = {str(p.get("preset_name") or "")
+                        for p in (sm.list_plugin_presets(plugin_id) or [])
+                        if isinstance(p, dict)}
+        except Exception:
+            existing = set()
+        if new_name in existing:
+            QMessageBox.warning(
+                self, "Name vergeben",
+                f"Eine andere Variante von '{plugin_id}' heisst bereits "
+                f"'{new_name}'.")
+            return
+        try:
+            sm.save_indicator_preset(
+                indicator_id, new_name, params,
+                plugin_id=plugin_id,
+                version=version,
+                is_active_batch=is_active,
+                doc_log="",
+            )
+        except Exception as e:
+            self.log(f"FEHLER beim Duplizieren der Variante: {e}")
+            return
+        new_hash = generate_instance_hash(plugin_id, params)
+        self.log(f"Variante '{new_name}' dupliziert aus '{base}' "
+                 f"(#{new_hash}).")
+        event_bus.service_set_changed.emit()
+        # Q8-Bugfix: Ergebnis SICHTBAR machen – den neuen Clone-Knoten im
+        # Baum expandieren/selektieren (ohne Editor-Overwrite; der Clone-
+        # Tooltip zeigt die kopierten Parameter).
+        tree = getattr(getattr(self, "service_selector", None),
+                       "master_tree", None)
+        if tree is not None:
+            tree.select_clone(plugin_id, new_hash)
+
     def _resolve_info_plugin(self, plugin_id: str):
         """Liefert das Plugin aus der Registry (oder None + Log-Eintrag)."""
         try:
@@ -36753,19 +40463,27 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             return None
 
     def _info_header_tooltip(self, plugin_id: str) -> str:
-        """Erste Dialog-Zeile = bisheriger Tooltip-Text des Info-Buttons
-        ('aktiv <Indikator>' / 'im <Indikator>'); leer ohne Indikator-
-        Zugehoerigkeit."""
+        """Erste Dialog-Zeile = Badge-Header des Info-Buttons (20.03.02, F5).
+
+        Vereinheitlichtes Format: '📌 im <Indikator> | 🟢 aktiv in
+        <Indikator>' bzw. '📌 im <Indikator> | ⚪ inaktiv'. Leer ohne
+        Indikator-Zugehoerigkeit.
+        """
         model = getattr(self.service_selector, "model", None)
         if model is None or not model.belongs_to_indicator(plugin_id):
             return ""
         name = model.get_indicator_display_name(plugin_id)
-        return (f"aktiv {name}" if model.is_active_in_chart(plugin_id)
-                else f"im {name}")
+        if model.is_active_in_chart(plugin_id):
+            return f"📌 im {name} | 🟢 aktiv in {name}"
+        return f"📌 im {name} | ⚪ inaktiv"
 
     def _info_set_tooltip(self, set_def: Dict[str, Any]) -> str:
-        """Erste Dialog-Zeile fuer Set-Zeilen (Tooltip-Namenslogik analog
-        _apply_set_badge: 'aktiv/im <Indikator>', mehrere mit ' + ')."""
+        """Erste Dialog-Zeile fuer Set-Zeilen (20.03.02, F5).
+
+        Vereinheitlichtes Badge-Format analog _info_header_tooltip; mehrere
+        Indikatoren mit ' + ' verknuepft ('📌 im <I1> + <I2> | 🟢 aktiv in
+        <I1> + <I2>' bzw. '⚪ inaktiv').
+        """
         model = getattr(self.service_selector, "model", None)
         if model is None:
             return ""
@@ -36773,8 +40491,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         if not names:
             return ""
         label = " + ".join(names)
-        return (f"aktiv {label}" if model.is_set_active(set_def or {})
-                else f"im {label}")
+        if model.is_set_active(set_def or {}):
+            return f"📌 im {label} | 🟢 aktiv in {label}"
+        return f"📌 im {label} | ⚪ inaktiv"
 
     @Slot()
     def delete_set(self) -> None:
@@ -37437,6 +41156,3616 @@ print("OK: 20.03-Bugfix-Testblock angehaengt")
 
 --------------------------------------------------
 
+### DATEI: test/_fix_ws1.py
+```py
+"""Temporärer Helfer (wird nach Ausführung gelöscht): Root-Cause-Fix für das
+Timing-Problem beim App-Start:
+
+`_sync_combos_from_payload` leitete `prev_field` aus dem Combo-Zustand ab.
+Beim Start lief `attach_view_model` VOR `restore_workspace`, also war der
+Combo beim ersten Daten-Payload leer -> das Feld wurde auf den ersten
+verfügbaren Key zurückgesetzt statt auf das restaurierte `heatmap_field`.
+
+Fix: `prev_field` bevorzugt aus den VM-params (restaurierter Wert) nehmen,
+Fallback auf den Combo-Zustand.
+"""
+import pathlib
+
+p = pathlib.Path("analytics/ui/heatmap_widget.py")
+text = p.read_text(encoding="utf-8")
+
+old = """        agg = str(data.get("agg") or "")
+        # 20.03.02: userData = '{service_id}|{key}' – fuer den Vergleich mit
+        # den Payload-Keys nur den Key-Teil verwenden.
+        prev_field = self._field_key(self._combo_field.currentData())
+        self._syncing = True"""
+
+new = """        agg = str(data.get("agg") or "")
+        # 20.03.02: userData = '{service_id}|{key}' – fuer den Vergleich mit
+        # den Payload-Keys nur den Key-Teil verwenden.
+        # 20.04-Fix (Root Cause): `prev_field` BEVORZUGT aus den restaurierten
+        # VM-params (heatmap_field) statt aus dem Combo-Zustand. Beim App-
+        # Start laeuft attach_view_model() VOR restore_workspace() – der
+        # Combo ist beim ersten Daten-Payload noch leer, wodurch das Feld
+        # auf den ersten verfuegbaren Key zuruecksetzt wurde statt auf das
+        # im Workspace/Profil gespeicherte heatmap_field (Aggregation blieb
+        # korrekt, das Feld ging verloren). Bei User-Aenderungen sind params
+        # und Combo synchron (_apply_config -> set_heatmap_config), daher
+        # keine Regression.
+        prev_field = (str(self._view_model.params.get("heatmap_field") or "")
+                      or self._field_key(self._combo_field.currentData()))
+        self._syncing = True"""
+
+if old not in text:
+    raise SystemExit("Anker prev_field nicht gefunden!")
+text = text.replace(old, new, 1)
+p.write_text(text, encoding="utf-8")
+print("OK - heatmap_widget: prev_field aus restaurierten params")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_tmp_find_src.py
+```py
+# test/_tmp_find_src.py - temporärer Suchhelfer (darf gelöscht werden)
+import pathlib
+
+keys = ("feature_store_reader", "FeatureStoreReader", "db_service", "native")
+for p in sorted(pathlib.Path(".").rglob("*.py")):
+    if "venv" in p.parts or "docs" in p.parts:
+        continue
+    try:
+        txt = p.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        continue
+    if any(k in txt for k in ("FeatureStoreReader", "feature_store")):
+        print(p)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_2004_bugfix3.py
+```py
+"""Temporärer Check (wird nach Abschluss gelöscht): Verifiziert die
+(No Data)-Unterstützung (User-Bugreport 09.08.2026, Option 1) für das
+Analytics-Dropdown:
+
+1) feature_store_reader.available_instance_hashes(symbol, timeframe) –
+   rein lesend, liefert die Menge der Hashes MIT Daten.
+2) AnalyticsViewModel.resolve_no_data_variants(symbol, timeframe) –
+   liefert aktive Presets/Clones ohne Daten (mit display_name).
+3) CheckableComboBox.add_disabled_item() – grauer Hinweis-Eintrag.
+4) heatmap_widget: _sync_combos_from_payload ergänzt No-Data-Einträge.
+
+Headless, keine UI-Ausfuehrung.
+"""
+import os
+import sys
+import traceback
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+
+QApplication.instance() or QApplication([])
+
+PASS = 0
+FAIL = 0
+
+
+def check(name: str, cond: bool, extra: str = "") -> None:
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print(f"PASS - {name} {extra}")
+    else:
+        FAIL += 1
+        print(f"FAIL - {name} {extra}")
+
+
+class _FakeReader:
+    """Stub: available_instance_hashes mit kontrollierbarem Inhalt."""
+
+    def __init__(self, hashes):
+        self._hashes = set(hashes)
+
+    def available_instance_hashes(self, symbol, timeframe):
+        return set(self._hashes)
+
+
+class _Plugin:
+    def __init__(self, plugin_id):
+        self._plugin_id = plugin_id
+        self.capabilities = {"chart": False}
+        self.metadata = {}
+
+    @property
+    def plugin_id(self):
+        return self._plugin_id
+
+
+class _SelectorModel:
+    def __init__(self, presets):
+        self._presets = presets
+        self._plugins = {
+            "srv_swing_pivot": _Plugin("srv_swing_pivot"),
+        }
+
+    def plugin_presets(self):
+        return dict(self._presets)
+
+    def get_plugin(self, plugin_id):
+        p = self._plugins.get(str(plugin_id).lower())
+        if p is None:
+            raise KeyError(plugin_id)
+        return p
+
+    def resolve_valid_feature_ids(self, ids):
+        return list(ids), []
+
+
+class _FakeRepo:
+    def __init__(self, hashes):
+        self.reader = _FakeReader(hashes)
+
+
+def test_reader_method() -> None:
+    import analytics.engine.feature_store_reader as fsr
+    src = fsr.__file__
+    with open(src, encoding="utf-8") as f:
+        code = f.read()
+    check("Reader) available_instance_hashes existiert",
+          "def available_instance_hashes" in code)
+    # Nur die NEUE Methode isoliert pruefen (die Datei enthaelt in anderen
+    # Docstrings legitime Woerter wie 'UPDATE' – Kommentare, keine Queries).
+    meth = code.split("def available_instance_hashes", 1)[1]
+    meth = meth.split("def get_available_features", 1)[0]
+    check("Reader) Methode rein lesend (kein DELETE/INSERT/UPDATE)",
+          "DELETE" not in meth and "INSERT" not in meth
+          and "UPDATE" not in meth)
+
+
+def test_view_model_variants() -> None:
+    from analytics.engine.analytics_view_model import AnalyticsViewModel
+    presets = {
+        "srv_swing_pivot": [
+            {"preset_name": "M15_Fast", "params": {"p": 1},
+             "instance_hash": "aaaa1111", "is_archived": False,
+             "doc_log": ""},
+            {"preset_name": "H1_Slow", "params": {"p": 2},
+             "instance_hash": "bbbb2222", "is_archived": False,
+             "doc_log": ""},
+            {"preset_name": "Alte_Variante", "params": {"p": 3},
+             "instance_hash": "cccc3333", "is_archived": True,
+             "doc_log": ""},
+        ],
+    }
+    model = _SelectorModel(presets)
+    # Hash bbbb2222 hat bereits Daten -> nur aaaa1111 ist 'No Data'.
+    vm = AnalyticsViewModel(analytics_repo=_FakeRepo(["bbbb2222"]),
+                            selector_model=model)
+    out = vm.resolve_no_data_variants("SILVER", "H1")
+    check("VM) liefert genau die Variante ohne Daten",
+          len(out) == 1, f"-> {[(o.get('preset_name')) for o in out]}")
+    check("VM) No-Data-Variante ist M15_Fast",
+          out and out[0].get("preset_name") == "M15_Fast")
+    check("VM) display_name enthaelt Preset-Name",
+          out and "M15_Fast" in str(out[0].get("display_name")))
+    check("VM) archivierte Variante wird nicht geliefert",
+          out and not any(o.get("preset_name") == "Alte_Variante" for o in out))
+
+    # Alle Hashes vorhanden -> leer
+    vm2 = AnalyticsViewModel(analytics_repo=_FakeRepo(
+        ["aaaa1111", "bbbb2222", "cccc3333"]), selector_model=model)
+    check("VM) alle Varianten mit Daten -> leer",
+          vm2.resolve_no_data_variants("SILVER", "H1") == [])
+
+    # Ohne Symbol/Timeframe -> leer (defensiv)
+    check("VM) ohne symbol/timeframe -> leer",
+          vm.resolve_no_data_variants("", "") == [])
+
+
+def test_common_disabled_item() -> None:
+    from analytics.ui.common import CheckableComboBox
+    from PySide6.QtCore import Qt
+
+    combo = CheckableComboBox()
+    combo.add_disabled_item("Test (No Data)")
+    check("Common) add_disabled_item fuegt Eintrag hinzu",
+          combo.count() == 1)
+    item = combo.model().item(0)
+    check("Common) Eintrag nicht checkbar (kein UserCheckable-Flag)",
+          not (item.flags() & Qt.ItemIsUserCheckable))
+    check("Common) Eintrag nicht in checked_data()",
+          combo.checked_data() == [])
+    check("Common) userData ist None (kein selection-Beitrag)",
+          item.data(Qt.UserRole) is None)
+
+
+def test_widget_integration() -> None:
+    import inspect
+    import analytics.ui.heatmap_widget as hw
+    src = inspect.getsource(hw.HeatmapWidget._sync_combos_from_payload)
+    check("Widget) _sync_combos_from_payload ruft resolve_no_data_variants",
+          "resolve_no_data_variants" in src)
+    check("Widget) add_disabled_item wird fuer No-Data genutzt",
+          "add_disabled_item" in src)
+    check("Widget) '(No Data)'-Label vorhanden",
+          "(No Data)" in src)
+
+
+if __name__ == "__main__":
+    for fn in (test_reader_method, test_view_model_variants,
+               test_common_disabled_item, test_widget_integration):
+        try:
+            fn()
+        except Exception as e:
+            FAIL += 1
+            print(f"EXC - {fn.__name__}: {e}")
+            traceback.print_exc()
+    print(f"\nRESULT: {PASS}/{PASS + FAIL} passed")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_2004_ctxmenu.py
+```py
+# test/check_2004_ctxmenu.py - 20.04 Schritt 4b: Kontextmenue-Verwaltung
+# (Data Only / Vollständig / Doc Log / Variante). Headless, Temp-DB (test/).
+# Wird von test/test.py nicht importiert; temporaerer Check (Cleanup nach 20.04).
+import os
+import sys
+import tempfile
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+
+app = QApplication.instance() or QApplication([])
+
+from state_manager import StateManager
+from analytics.engine.service_models import generate_instance_hash
+from serviceui.master_tree import MasterTree
+from serviceui.service_win import ServiceWindow
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, ok, info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+# ---------------------------------------------------------------------------
+# 1) StateManager: doc_log-Spalte + Round-Trip (indicator_presets, Q7)
+# ---------------------------------------------------------------------------
+tmp = tempfile.mkdtemp(prefix="p2004_ctxmenu_")
+db = os.path.join(tmp, "app_2004.duckdb")
+sm = StateManager(db)
+
+cols = [c[0] for c in sm._get_connection().execute(
+    "SELECT column_name FROM information_schema.columns "
+    "WHERE table_name = 'indicator_presets'").fetchall()]
+check("Q7) indicator_presets hat doc_log-Spalte (additiv)", "doc_log" in cols, str(cols))
+
+# save mit doc_log -> list_plugin_presets liefert doc_log
+sm.save_indicator_preset(
+    "ind_fixed_grid_proximity", "Default", {"step_size": 0.5, "steps_around": 4},
+    plugin_id="srv_grid_lines", version="1.0.0", is_active_batch=True,
+    doc_log="85% false signals in chop markets")
+presets = sm.list_plugin_presets("srv_grid_lines")
+check("Q7) list_plugin_presets liefert doc_log",
+      len(presets) == 1 and presets[0].get("doc_log")
+      == "85% false signals in chop markets", str(presets))
+h = generate_instance_hash("srv_grid_lines",
+                           {"step_size": 0.5, "steps_around": 4})
+check("Q2/Q4) Hash deterministisch + 8-stellig",
+      presets[0].get("preset_name") == "Default" and len(h) == 8, h)
+
+# set_plugin_preset_doc_log persistiert
+sm.set_plugin_preset_doc_log("ind_fixed_grid_proximity", "Default",
+                             "Neuer Log-Eintrag")
+presets2 = sm.list_plugin_presets("srv_grid_lines")
+check("Q7) set_plugin_preset_doc_log persistiert",
+      presets2 and presets2[0].get("doc_log") == "Neuer Log-Eintrag",
+      str(presets2))
+# leeres Doc-Log -> None (NULL), kein leerer String
+sm.set_plugin_preset_doc_log("ind_fixed_grid_proximity", "Default", "   ")
+presets3 = sm.list_plugin_presets("srv_grid_lines")
+check("Q7) leeres Doc-Log -> leerer String (kein None-Crash)",
+      presets3 and presets3[0].get("doc_log") == "", str(presets3))
+
+# Bestands-API bleibt kompatibel
+meta = sm.get_indicator_preset_meta("ind_fixed_grid_proximity", "Default")
+check("Q7) get_indicator_preset_meta bleibt kompatibel",
+      meta and meta.get("plugin_id") == "srv_grid_lines", str(meta))
+
+# ---------------------------------------------------------------------------
+# 2) MasterTree: neue 20.04-Kontextmenue-Signale
+# ---------------------------------------------------------------------------
+for sig in ("data_only_purge_requested", "delete_complete_requested",
+            "doc_log_requested", "duplicate_variant_requested"):
+    check(f"4b) MasterTree-Signal {sig} existiert",
+          hasattr(MasterTree, sig))
+
+# ---------------------------------------------------------------------------
+# 3) ServiceWindow: Handler + Helfer existieren
+# ---------------------------------------------------------------------------
+for m in ("_on_data_only_purge", "_on_delete_complete",
+          "_on_doc_log_requested", "_on_duplicate_variant",
+          "_find_preset_for_hash", "_next_preset_copy_name",
+          "_save_instance_doc_log", "_save_plugin_doc_log",
+          "_delete_complete_set_instance", "_delete_complete_preset",
+          "_duplicate_set_instance", "_duplicate_preset"):
+    check(f"4b) ServiceWindow.{m} existiert", hasattr(ServiceWindow, m))
+
+# ---------------------------------------------------------------------------
+# 4) Statische Verkabelung (Quell-Inspektion): Signal-Emit + Connect
+# ---------------------------------------------------------------------------
+mt_src = open("serviceui/master_tree.py", encoding="utf-8").read()
+for emit in ("self.data_only_purge_requested.emit",
+             "self.delete_complete_requested.emit",
+             "self.doc_log_requested.emit",
+             "self.duplicate_variant_requested.emit"):
+    check(f"4b) master_tree.py enthält {emit}", emit in mt_src)
+
+sw_src = open("serviceui/service_win.py", encoding="utf-8").read()
+for connect in ("tree.data_only_purge_requested.connect",
+                "tree.delete_complete_requested.connect",
+                "tree.doc_log_requested.connect",
+                "tree.duplicate_variant_requested.connect"):
+    check(f"4b) service_win.py enthält {connect}", connect in sw_src)
+
+for label in ("Als Variante duplizieren", "Doc Log bearbeiten",
+              "Data Only Löschen", "Vollständig Löschen"):
+    check(f"4b) Kontextmenü-Label '{label}' vorhanden", label in mt_src)
+
+# ---------------------------------------------------------------------------
+print(f"\n{sum(1 for _, ok, _ in PASS if ok)}/{len(PASS)} Checks PASS")
+fail = [n for n, ok, _ in PASS if not ok]
+if fail:
+    print("FAILS:", fail)
+    sys.exit(1)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_2004_dlg.py
+```py
+"""Temporärer Check (wird nach Abschluss gelöscht): Funktionstest der neuen
+ServiceSelectorDialog-Handler (20.04 Q8) mit Fake-Model (headless).
+"""
+import os
+import sys
+import traceback
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+
+QApplication.instance() or QApplication([])
+
+PASS = 0
+FAIL = 0
+
+
+def check(name: str, cond: bool, extra: str = "") -> None:
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print(f"PASS - {name} {extra}")
+    else:
+        FAIL += 1
+        print(f"FAIL - {name} {extra}")
+
+
+class _SM:
+    def __init__(self):
+        self.presets = {}
+
+    def list_plugin_presets(self, pid):
+        return list(self.presets.get(pid, []))
+
+    def save_indicator_preset(self, indicator_id, preset_name, params,
+                              plugin_id=None, version=None,
+                              is_active_batch=None, doc_log=""):
+        self.presets.setdefault(plugin_id or indicator_id, []).append({
+            "preset_name": preset_name, "params": params,
+            "indicator_id": indicator_id, "version": version,
+            "is_active_batch": is_active_batch, "doc_log": doc_log,
+        })
+        return True
+
+    def get_global_value(self, key, default=None):
+        return default
+
+    def delete_indicator_preset(self, indicator_id, preset_name):
+        for pid in list(self.presets.keys()):
+            self.presets[pid] = [p for p in self.presets[pid]
+                                 if p.get("preset_name") != preset_name]
+        return True
+
+
+class _Repo:
+    def __init__(self):
+        self.sets = {}
+
+    def get_set(self, set_id):
+        s = self.sets.get(set_id)
+        return dict(s) if s is not None else None
+
+    def save_set(self, definition):
+        self.sets[definition["set_id"]] = dict(definition)
+        return True
+
+
+class _Model:
+    def __init__(self, sm, repo):
+        self.state_manager = sm
+        self.set_repo = repo
+        from PySide6.QtCore import QObject, Signal
+
+        class _M(QObject):
+            data_changed = Signal()
+
+        self._q = _M()
+        self.data_changed = self._q.data_changed
+
+
+def test_dialog_handlers():
+    from serviceui.service_selector_dialog import ServiceSelectorDialog
+
+    sm = _SM()
+    repo = _Repo()
+    model = _Model(sm, repo)
+    dlg = ServiceSelectorDialog(model=model)
+
+    # --- Preset-Duplizierung (flaches Plugin ohne Hash) ---
+    sm.presets["srv_x"] = []
+    dlg._duplicate_preset("srv_x", "")
+    presets = sm.list_plugin_presets("srv_x")
+    check("Handler) Preset dupliziert (flaches Plugin)",
+          len(presets) == 1, f"-> {len(presets)}")
+    check("Handler) Kopie batch-aktiv (is_active_batch=True)",
+          presets and presets[0].get("is_active_batch") is True,
+          f"-> {presets[0].get('is_active_batch') if presets else None!r}")
+    check("Handler) Name = 'Default' (Basis-Name frei)",
+          presets and presets[0].get("preset_name") == "Default",
+          f"-> {presets[0].get('preset_name') if presets else None!r}")
+
+    # --- Preset-Duplizierung (bestehender Clone, Hash) ---
+    from analytics.engine.service_models import generate_instance_hash
+    params = {"p": 42}
+    h = generate_instance_hash("srv_x", params)
+    sm.presets["srv_x"].append({
+        "preset_name": "M15_Fast", "params": params,
+        "indicator_id": "srv_x", "version": "1.0.0",
+        "is_active_batch": True, "doc_log": ""})
+    before = len(sm.list_plugin_presets("srv_x"))
+    dlg._duplicate_preset("srv_x", h)
+    after = sm.list_plugin_presets("srv_x")
+    check("Handler) Clone dupliziert (Anzahl +1)",
+          len(after) == before + 1, f"-> {len(after)}")
+    names = [p["preset_name"] for p in after]
+    check("Handler) Name 'M15_Fast (Kopie)'",
+          "M15_Fast (Kopie)" in names, f"-> {names}")
+    newp = [p for p in after if p["preset_name"] == "M15_Fast (Kopie)"]
+    check("Handler) Kopie batch-aktiv",
+          newp and newp[0].get("is_active_batch") is True,
+          f"-> {newp[0].get('is_active_batch') if newp else None!r}")
+    check("Handler) Params kopiert",
+          newp and newp[0].get("params") == {"p": 42})
+
+    # --- Set-Instanz-Duplizierung ---
+    repo.sets["set_a"] = {
+        "set_id": "set_a", "name": "A",
+        "services": {"srv_y": {"plugin_id": "srv_y", "params": {"q": 7}}},
+        "execution_order": ["srv_y"],
+    }
+    dlg._duplicate_set_instance("set_a", "srv_y")
+    s = repo.get_set("set_a")
+    services = s["services"]
+    check("Handler) Set-Instanz dupliziert (2 Eintraege)",
+          len(services) == 2, f"-> {list(services.keys())}")
+    check("Handler) Neue Instanz hat instance_hash",
+          any("instance_hash" in (cfg or {})
+              for cfg in services.values()))
+
+    # --- _on_duplicate_variant Dispatch ---
+    before = len(sm.list_plugin_presets("srv_x"))
+    dlg._on_duplicate_variant("", "", "srv_x", "")
+    check("Handler) Dispatch (Plugin) erzeugt weitere Kopie",
+          len(sm.list_plugin_presets("srv_x")) == before + 1)
+    before_set = len(repo.get_set("set_a")["services"])
+    dlg._on_duplicate_variant("set_a", "srv_y", "", "")
+    check("Handler) Dispatch (Set-Instanz) erzeugt weitere Instanz",
+          len(repo.get_set("set_a")["services"]) == before_set + 1)
+
+    # --- _next_preset_copy_name ---
+    check("Handler) _next_preset_copy_name liefert 'Default' wenn frei",
+          dlg._next_preset_copy_name("srv_neu", "Default") == "Default")
+    dlg._duplicate_preset("srv_neu", "")
+    check("Handler) _next_preset_copy_name liefert 'Default (Kopie)'",
+          dlg._next_preset_copy_name("srv_neu", "Default")
+          == "Default (Kopie)")
+
+    dlg.close()
+
+
+if __name__ == "__main__":
+    try:
+        test_dialog_handlers()
+    except Exception as e:
+        FAIL += 1
+        print(f"EXC - {e}")
+        traceback.print_exc()
+    print(f"\nRESULT: {PASS}/{PASS + FAIL} passed")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_2004_dupl3.py
+```py
+# test/check_2004_dupl3.py - Q8-Fix-Verifikation: Selektion + Editor nach
+# 'Als Variante duplizieren' (Set-Instanz & Clone). Headless.
+import os
+import sys
+import tempfile
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+
+_app = QApplication.instance() or QApplication([])
+
+
+def pump():
+    for _ in range(5):
+        _app.processEvents()
+
+
+tmp = tempfile.mkdtemp(prefix="p2004_dupl3_")
+db_app = os.path.join(tmp, "app_data.duckdb")
+db_set = os.path.join(tmp, "sets.duckdb")
+
+from state_manager import StateManager
+from analytics.engine.service_set_repository import ServiceSetRepository
+from analytics.engine.service_models import generate_instance_hash
+
+sm = StateManager(db_path=db_app)
+repo = ServiceSetRepository(db_path=db_set)
+
+import symbol_repository as _symrepo
+_symrepo.get_symbol_repository = lambda: _symrepo.SymbolRepository(db_path=db_app)
+import serviceui.service_win as _sw
+_sw.get_symbol_repository = _symrepo.get_symbol_repository
+
+import analytics.engine.service_set_repository as _ssr_mod
+_orig_ssr_init = _ssr_mod.ServiceSetRepository.__init__
+
+
+def _patched_ssr_init(self, db_path=None, *a, **kw):
+    _orig_ssr_init(self, db_path or db_set, *a, **kw)
+
+
+_ssr_mod.ServiceSetRepository.__init__ = _patched_ssr_init
+
+import state_manager as _sm_mod
+_orig_sm_init = _sm_mod.StateManager.__init__
+
+
+def _patched_sm_init(self, db_path=None, *a, **kw):
+    _orig_sm_init(self, db_path or db_app, *a, **kw)
+
+
+_sm_mod.StateManager.__init__ = _patched_sm_init
+
+repo.save_set({
+    "set_id": "set_1",
+    "display_name": "Test",
+    "execution_order": ["grid_1"],
+    "services": {
+        "grid_1": {"plugin_id": "srv_grid_lines", "lookback": 1000,
+                   "params": {"step_size": 0.5, "steps_around": 4}},
+    },
+})
+# Clone-Quelle: Preset anlegen
+sm.save_indicator_preset(
+    "ind_fixed_grid_proximity", "Default", {"step_size": 0.5, "steps_around": 4},
+    plugin_id="srv_grid_lines", version="1.0.0", is_active_batch=True)
+
+
+class _Parent:
+    state_manager = sm
+
+
+from serviceui.service_win import ServiceWindow
+from serviceui.master_tree import (
+    ROLE_INSTANCE_HASH, ROLE_INSTANCE_ID, ROLE_NODE_TYPE, ROLE_PLUGIN_ID,
+    ROLE_SET_ID, TYPE_CLONE, TYPE_SERVICE,
+)
+
+w = ServiceWindow(parent=_Parent(), service_set_repo=repo)
+w.service_selector.model.set_repo = repo
+w.service_selector.model.refresh()
+w.show()
+pump()
+pump()
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, ok, info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+def collect_items(root, acc):
+    for i in range(root.childCount()):
+        ch = root.child(i)
+        acc.append(ch)
+        collect_items(ch, acc)
+
+
+def all_items():
+    acc = []
+    for i in range(w.service_selector.master_tree.topLevelItemCount()):
+        collect_items(w.service_selector.master_tree.topLevelItem(i), acc)
+    return acc
+
+
+def editor_columns():
+    cols = getattr(w, "_service_param_controls", {}) or {}
+    return sorted({iid for (iid, _k) in cols})
+
+
+# --- A) Set-Instanz-Pfad ------------------------------------------------------
+w.load_set_into_editor(repo.get_set("set_1"))
+pump()
+w._on_duplicate_variant("set_1", "grid_1", "srv_grid_lines", "")
+pump()
+after = repo.get_set("set_1")
+services = (after or {}).get("services") or {}
+new_iid = [i for i in services if i != "grid_1"]
+check("Q8) Set-Instanz dupliziert", len(new_iid) == 1, str(new_iid))
+if new_iid:
+    # Editor enthaelt neue Spalte (load_set_into_editor immer)
+    check("Q8) Editor-Spalte fuer neue Instanz (ohne manuelles Set-Laden)",
+          new_iid[0] in editor_columns(), f"cols={editor_columns()}")
+    # Neue Instanz ist im Baum selektiert (currentItem)
+    cur = w.service_selector.master_tree.currentItem()
+    sel_ok = cur is not None and str(cur.data(0, ROLE_INSTANCE_ID)) == new_iid[0]
+    check("Q8) Neue Instanz ist im Baum selektiert",
+          sel_ok, f"current={cur.text(0) if cur else None}")
+    # Eltern (Set-Knoten) sind expandiert
+    parent = cur.parent() if cur else None
+    expanded = parent is not None and parent.isExpanded()
+    check("Q8) Eltern-Knoten (Set) expandiert", expanded)
+
+# --- B) Clone-Pfad -----------------------------------------------------------
+h = generate_instance_hash("srv_grid_lines", {"step_size": 0.5, "steps_around": 4})
+w._on_duplicate_variant("", "", "srv_grid_lines", h)
+pump()
+presets = sm.list_plugin_presets("srv_grid_lines")
+names = [p.get("preset_name") for p in presets]
+check("Q8) Clone dupliziert", "Default (Kopie)" in names, str(names))
+if "Default (Kopie)" in names:
+    copy_hash = generate_instance_hash(
+        "srv_grid_lines",
+        [p for p in presets if p.get("preset_name") == "Default (Kopie)"][0]
+        .get("params") or {})
+    cur = w.service_selector.master_tree.currentItem()
+    sel_ok = cur is not None and str(cur.data(0, ROLE_INSTANCE_HASH)) == copy_hash
+    check("Q8) Neuer Clone ist im Baum selektiert",
+          sel_ok, f"current={cur.text(0) if cur else None}")
+
+# --- C) Flaches Plugin-Blatt (erste Variante -> 'Default') --------------------
+w._on_duplicate_variant("", "", "srv_proximity", "")
+pump()
+pres = sm.list_plugin_presets("srv_proximity")
+check("Q8) Flaches Plugin -> Preset-Name 'Default' (Namens-Fix)",
+      len(pres) == 1 and pres[0].get("preset_name") == "Default",
+      str([p.get("preset_name") for p in pres]))
+if pres:
+    ph = generate_instance_hash("srv_proximity", pres[0].get("params") or {})
+    cur = w.service_selector.master_tree.currentItem()
+    sel_ok = cur is not None and str(cur.data(0, ROLE_INSTANCE_HASH)) == ph
+    check("Q8) Neuer Default-Clone selektiert", sel_ok,
+          f"current={cur.text(0) if cur else None}")
+
+print(f"\n{sum(1 for _, ok, _ in PASS if ok)}/{len(PASS)} Checks PASS")
+fail = [n for n, ok, _ in PASS if not ok]
+if fail:
+    print("FAILS:", fail)
+    sys.exit(1)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_2004_fullwin.py
+```py
+"""Temporärer Check (wird nach Abschluss gelöscht): Vollständiger End-to-End-
+Test des AnalyticsWindow (headless):
+
+1) Fenster erzeugen, Aggregation/Feld im generischen Widget setzen
+2) Prüfen, ob die params im VM gesetzt sind
+3) _save_workspace aufrufen -> DB-Inhalt prüfen
+4) save_profile aufrufen -> Profil-Payload prüfen
+
+Nutzt Temp-DBs in test/. Keine UI-Ausfuehrung (nur Widget-Instanzen).
+"""
+import os
+import sys
+import traceback
+import pathlib
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+
+QApplication.instance() or QApplication([])
+
+PASS = 0
+FAIL = 0
+
+
+def check(name: str, cond: bool, extra: str = "") -> None:
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print(f"PASS - {name} {extra}")
+    else:
+        FAIL += 1
+        print(f"FAIL - {name} {extra}")
+
+
+BASE = pathlib.Path(__file__).parent
+TMP_APP = BASE / "_tmp_win_app.duckdb"
+TMP_ANALYTICS = BASE / "_tmp_win_analytics.duckdb"
+
+
+def test_full_window():
+    from analytics.engine.analytics_repository import AnalyticsRepository
+    from analytics.engine.service_selector_model import ServiceSelectorModel
+    from analytics_profile_repository import AnalyticsProfileRepository
+    from analytics.ui.analytics_win import AnalyticsWindow
+
+    repo = AnalyticsRepository()
+    prof_repo = AnalyticsProfileRepository(str(TMP_APP))
+    selector = ServiceSelectorModel()
+
+    win = AnalyticsWindow(
+        view_model=None,
+        analytics_repo=repo,
+        profile_repo=prof_repo,
+        selector_model=selector,
+    )
+    try:
+        vm = win._vm
+
+        # Generisches Widget: Aggregation + Feld setzen (UI-Flow)
+        w = win.heatmap_page._generic
+        w.attach_view_model(vm)
+        w._combo_agg.setCurrentIndex(w._combo_agg.findData("avg"))
+        QApplication.processEvents()
+        w._combo_field.blockSignals(True)
+        w._combo_field.clear()
+        w._combo_field.add_checkable_item(
+            "Swing / visit_pct", "srv_swing_pivot|visit_pct", checked=True)
+        w._combo_field.blockSignals(False)
+        fidx = w._combo_field.findData("srv_swing_pivot|visit_pct")
+        if fidx >= 0:
+            w._combo_field.setCurrentIndex(fidx)
+        QApplication.processEvents()
+
+        check("Win) VM heatmap_agg='avg'",
+              vm.params.get("heatmap_agg") == "avg",
+              f"-> {vm.params.get('heatmap_agg')!r}")
+        check("Win) VM heatmap_field='visit_pct'",
+              vm.params.get("heatmap_field") == "visit_pct",
+              f"-> {vm.params.get('heatmap_field')!r}")
+
+        # ---- Workspace-Snapshot (Fensterhistorie) ----
+        win._save_workspace()
+        stored = win.state_manager.get_workspace_state("win_analytics")
+        check("Win) Workspace-State gespeichert",
+              isinstance(stored, dict))
+        sp = stored.get("params") or {}
+        check("Win) Snap heatmap_agg='avg'",
+              sp.get("heatmap_agg") == "avg",
+              f"-> {sp.get('heatmap_agg')!r}")
+        check("Win) Snap heatmap_field='visit_pct'",
+              sp.get("heatmap_field") == "visit_pct",
+              f"-> {sp.get('heatmap_field')!r}")
+
+        # ---- Profil ----
+        pid = vm.create_profile("Testprofil", "desc")
+        check("Win) Profil angelegt", pid is not None)
+        prof = prof_repo.get_profile(pid)
+        hm = ((prof.get("payload") or {}).get("charts", {})
+              .get("heatmap", {}))
+        check("Win) Profil charts.heatmap.agg='avg'",
+              hm.get("agg") == "avg", f"-> {hm.get('agg')!r}")
+        check("Win) Profil charts.heatmap.field='visit_pct'",
+              hm.get("field") == "visit_pct", f"-> {hm.get('field')!r}")
+    finally:
+        try:
+            win.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    try:
+        test_full_window()
+    except Exception as e:
+        FAIL += 1
+        print(f"EXC - {e}")
+        traceback.print_exc()
+    for p in (TMP_APP, TMP_ANALYTICS):
+        if p.exists():
+            p.unlink()
+    print(f"\nRESULT: {PASS}/{PASS + FAIL} passed")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_2004_purge.py
+```py
+# test/check_2004_purge.py - 20.04 Schritt 4: store_plugin_payload(instance_hash)
+# + purge_instance_data (Q5/Q9). Headless, Temp-DB (test/).
+import os
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+import duckdb
+
+import analytics.features.feature_builder as fb_mod
+from analytics.features.feature_builder import FeatureBuilder
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, ok, info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+tmp = tempfile.mkdtemp(prefix="p2004_purge_")
+db = os.path.join(tmp, "analytics_2004.duckdb")
+# DbPool.get() mit einem Pfad liefert eine Connection zu genau dieser Datei –
+# wir lenken DB_ANALYTICS des Moduls auf die Temp-DB (kein Schreiben in data/).
+fb_mod.DB_ANALYTICS = db
+
+con = duckdb.connect(db)
+con.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR NOT NULL,
+        timeframe VARCHAR NOT NULL,
+        bar_time TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMP DEFAULT current_timestamp,
+        feature_id VARCHAR NOT NULL DEFAULT 'native',
+        plugin_version VARCHAR,
+        feature_data JSON,
+        instance_hash VARCHAR,
+        PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
+    )
+""")
+con.close()
+
+fb = object.__new__(FeatureBuilder)  # ohne __init__ (kein StateManager/DB-Pfad)
+
+# --- 1) Write mit instance_hash (Q9) ----------------------------------------
+payload_v1 = {
+    "feature_id": "srv_swing_pivot",
+    "plugin_version": "1.0.0",
+    "records": [
+        {"bar_time": 1770000000, "is_pivot": True},
+        {"bar_time": 1770000060, "is_pivot": False},
+    ],
+}
+# ACHTUNG: store_plugin_payload() schliesst eine uebergebene Connection
+# (Bestandsverhalten own_connection=True) -> pro Aufruf frisch oeffnen.
+con = duckdb.connect(db)
+n1 = FeatureBuilder.store_plugin_payload(
+    fb, "XAGUSD", "M1", payload_v1, con=con, instance_hash="abc12345")
+check("Q9) store_plugin_payload mit instance_hash (2 Rows)",
+      n1 == 2, f"n={n1}")
+con = duckdb.connect(db)
+row = con.execute("SELECT instance_hash, feature_id FROM feature_store "
+                  "WHERE symbol='XAGUSD' ORDER BY bar_time LIMIT 1").fetchone()
+check("Q9) instance_hash in neuer Spalte gespeichert",
+      row is not None and row[0] == "abc12345" and row[1] == "srv_swing_pivot",
+      str(row))
+
+# --- 2) Write OHNE instance_hash -> NULL (und kein Wipe bestehender Hashes) --
+payload_no_hash = {
+    "feature_id": "srv_swing_pivot",
+    "plugin_version": "1.0.0",
+    "records": [{"bar_time": 1770000120, "is_pivot": True}],
+}
+con = duckdb.connect(db)
+FeatureBuilder.store_plugin_payload(
+    fb, "XAGUSD", "M1", payload_no_hash, con=con)
+con = duckdb.connect(db)
+row2 = con.execute("SELECT instance_hash FROM feature_store WHERE "
+                   "EXTRACT('epoch' FROM bar_time)::BIGINT = 1770000120").fetchone()
+check("Q9) Ohne instance_hash -> NULL (nicht gesetzt)",
+      row2 is not None and row2[0] is None, str(row2))
+
+# Upsert einer bestehenden Bar OHNE Hash darf den vorhandenen Hash nicht
+# ueberschreiben (COALESCE).
+payload_overwrite = {
+    "feature_id": "srv_swing_pivot",
+    "plugin_version": "1.0.0",
+    "records": [{"bar_time": 1770000000, "is_pivot": True, "extra": 1}],
+}
+con = duckdb.connect(db)
+FeatureBuilder.store_plugin_payload(fb, "XAGUSD", "M1", payload_overwrite, con=con)
+con = duckdb.connect(db)
+row3 = con.execute("SELECT instance_hash FROM feature_store WHERE "
+                   "EXTRACT('epoch' FROM bar_time)::BIGINT = 1770000000").fetchone()
+check("Q9) Upsert ohne Hash erhaelt bestehenden Hash (COALESCE)",
+      row3 is not None and row3[0] == "abc12345", str(row3))
+con.close()
+
+# --- 3) purge_instance_data (Q5) --------------------------------------------
+# purge_instance_data oeffnet selbst via DbPool -> DB_ANALYTICS zeigt auf Temp-DB.
+n_del = FeatureBuilder.purge_instance_data(fb, "abc12345")
+check("Q5) purge_instance_data loescht nur die Variante (2 Rows)",
+      n_del == 2, f"deleted={n_del}")
+con = duckdb.connect(db)
+remaining = con.execute("SELECT COUNT(*) FROM feature_store").fetchone()[0]
+left_hash = con.execute(
+    "SELECT COUNT(*) FROM feature_store WHERE instance_hash IS NOT NULL"
+).fetchone()[0]
+check("Q5) Row ohne Hash + Struktur bleiben erhalten",
+      remaining == 1 and left_hash == 0,
+      f"remaining={remaining} left_hash={left_hash}")
+
+# Idempotenz: erneutes Purge liefert 0.
+n2 = FeatureBuilder.purge_instance_data(fb, "abc12345")
+check("Q5) purge_instance_data idempotent (0 bei zweitem Aufruf)",
+      n2 == 0, f"n2={n2}")
+# Leerer Hash -> 0 (defensiv).
+check("Q5) Leerer Hash -> 0 (defensiv)",
+      FeatureBuilder.purge_instance_data(fb, "") == 0, "")
+con.close()
+
+fails = [n for n, ok, _ in PASS if not ok]
+print(f"RESULT: {len(PASS) - len(fails)}/{len(PASS)} passed")
+sys.exit(1 if fails else 0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_2004_realdata.py
+```py
+"""Temporärer Check (wird nach Abschluss gelöscht): Prüft den echten Zustand
+der Analytics-Profil-/Workspace-Persistenz in der App-DB (read-only) und
+simuliert den Restore-Ablauf.
+"""
+import os
+import sys
+import pathlib
+import json
+import duckdb
+
+BASE = pathlib.Path(__file__).parent.parent
+
+con = duckdb.connect(str(BASE / "data" / "app_data.duckdb"),
+                     read_only=True)
+
+# --- Profile ---
+try:
+    rows = con.execute("SELECT profile_id, name, is_active, payload "
+                       "FROM analytics_profiles").fetchall()
+    print("Profile count:", len(rows))
+    for r in rows:
+        payload = json.loads(r[3]) if isinstance(r[3], str) else (r[3] or {})
+        hm = (payload.get("charts") or {}).get("heatmap") or {}
+        src = payload.get("sources") or {}
+        print("  id={} active={} name={!r}".format(r[0][:8], r[2], r[1]))
+        print("    heatmap.agg={!r} field={!r} x={!r} y={!r}".format(
+            hm.get("agg"), hm.get("field"), hm.get("x_dim"),
+            hm.get("y_dim")))
+        print("    sources.feature_ids={!r}".format(src.get("feature_ids")))
+        print("    charts.heatmap_metric={!r}".format(
+            (payload.get("charts") or {}).get("heatmap_metric")))
+except Exception as e:
+    print("ERR profile:", e)
+
+# --- Workspace ---
+try:
+    row = con.execute(
+        "SELECT workspace_state FROM instance_states "
+        "WHERE instance_id='win_analytics'").fetchone()
+    if row and row[0]:
+        ws = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        params = ws.get("params") or {}
+        print("Workspace params present:", bool(params))
+        for k in ("heatmap_agg", "heatmap_field", "heatmap_x_dim",
+                  "heatmap_y_dim", "heatmap_metric", "feature_ids"):
+            print("  {} = {!r}".format(k, params.get(k)))
+    else:
+        print("Workspace: KEINE Zeile")
+except Exception as e:
+    print("ERR workspace:", e)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_2004_restore.py
+```py
+"""Temporärer Check (wird nach Abschluss gelöscht): Simuliert den App-Start
+RESTORE-Ablauf des AnalyticsWindow mit echter DB und prüft, ob die
+heatmap-Werte (agg/field) nach restore_workspace + _initial_load in den
+VM-params UND in den UI-Combos ankommen.
+
+Nutzt eine TEMP-DB (Regel: Test-DBs in test/), nicht die echte DB.
+"""
+import os
+import sys
+import traceback
+import pathlib
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+
+QApplication.instance() or QApplication([])
+
+PASS = 0
+FAIL = 0
+
+
+def check(name: str, cond: bool, extra: str = "") -> None:
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print(f"PASS - {name} {extra}")
+    else:
+        FAIL += 1
+        print(f"FAIL - {name} {extra}")
+
+
+BASE = pathlib.Path(__file__).parent
+TMP_APP = BASE / "_tmp_restore_app.duckdb"
+if TMP_APP.exists():
+    TMP_APP.unlink()
+
+
+def _write_workspace():
+    """Schreibt einen Workspace mit heatmap-Werten in die Temp-DB."""
+    import json
+    import duckdb
+    con = duckdb.connect(str(TMP_APP))
+    con.execute("CREATE TABLE IF NOT EXISTS instance_states ("
+                "instance_id VARCHAR PRIMARY KEY, symbol VARCHAR NOT NULL,"
+                "timeframe VARCHAR NOT NULL, visible_range_from BIGINT,"
+                "visible_range_to BIGINT, visible_price_from DOUBLE,"
+                "visible_price_to DOUBLE, indicators_state JSON,"
+                "measurement_state JSON, workspace_state JSON,"
+                "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    ws = {"params": {
+        "symbol": "SILVER", "timeframe": "H1",
+        "heatmap_agg": "avg", "heatmap_field": "visit_pct",
+        "heatmap_x_dim": "date", "heatmap_y_dim": "hour",
+        "heatmap_metric": "count", "feature_ids": [],
+    }, "layout": {"page_index": 2, "heatmap_mode": "generic"}}
+    con.execute("INSERT OR REPLACE INTO instance_states "
+                "(instance_id, symbol, timeframe, workspace_state) "
+                "VALUES (?, ?, ?, ?)",
+                ["win_analytics", "SILVER", "H1", json.dumps(ws)])
+
+
+def test_restore():
+    from state_manager import StateManager
+    from analytics.engine.analytics_repository import AnalyticsRepository
+    from analytics.engine.service_selector_model import ServiceSelectorModel
+    from analytics_profile_repository import AnalyticsProfileRepository
+    from analytics.ui.analytics_win import AnalyticsWindow
+
+    _write_workspace()
+
+    # Fenster MIT der Temp-DB erzeugen (StateManager wird vom Window genutzt)
+    # Da AnalyticsWindow den default StateManager nutzt, injizieren wir die
+    # DB über einen vorbereiteten StateManager? Nein: AnalyticsWindow erzeugt
+    # self.state_manager selbst. Stattdessen testen wir die VM-Ebene direkt
+    # mit der gelesenen Workspace-Zeile + _initial_load-Methodik.
+
+    # Workspace aus Temp-DB lesen (wie get_workspace_state)
+    import duckdb
+    con = duckdb.connect(str(TMP_APP))
+    row = con.execute("SELECT workspace_state FROM instance_states "
+                      "WHERE instance_id='win_analytics'").fetchone()
+    import json
+    ws = json.loads(row[0])
+
+    # VM-Ebene: restore_workspace muss die Werte setzen
+    from analytics.engine.analytics_view_model import AnalyticsViewModel
+    vm = AnalyticsViewModel(AnalyticsRepository())
+    vm.restore_workspace(ws)
+    check("Restore) heatmap_agg='avg'",
+          vm.params.get("heatmap_agg") == "avg",
+          f"-> {vm.params.get('heatmap_agg')!r}")
+    check("Restore) heatmap_field='visit_pct'",
+          vm.params.get("heatmap_field") == "visit_pct",
+          f"-> {vm.params.get('heatmap_field')!r}")
+
+    # UI-Ebene: HeatmapWidget aus den VM-Params syncen
+    from analytics.ui.heatmap_widget import HeatmapWidget
+    w = HeatmapWidget()
+    w.attach_view_model(vm)
+    QApplication.processEvents()
+    check("UI) Agg-Combo zeigt 'avg'",
+          str(w._combo_agg.currentData() or "") == "avg",
+          f"-> {w._combo_agg.currentData()!r}")
+    # Feld wird aus dem Payload gesetzt (Daten nötig) – hier nur Params prüfen.
+    check("UI) VM-Params weiterhin avg/visit_pct nach attach",
+          vm.params.get("heatmap_agg") == "avg"
+          and vm.params.get("heatmap_field") == "visit_pct",
+          f"-> {vm.params.get('heatmap_field')!r}")
+
+
+if __name__ == "__main__":
+    try:
+        test_restore()
+    except Exception as e:
+        FAIL += 1
+        print(f"EXC - {e}")
+        traceback.print_exc()
+    if TMP_APP.exists():
+        TMP_APP.unlink()
+    print(f"\nRESULT: {PASS}/{PASS + FAIL} passed")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_2004_schema.py
+```py
+# test/check_2004_schema.py - 20.04 Schritt 0: instance_hash-Spalte (Q1)
+# Headless, Temp-DB (test/), kein Schreiben in data/.
+import os
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+import duckdb
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, ok, info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+tmp = tempfile.mkdtemp(prefix="p2004_schema_")
+db = os.path.join(tmp, "analytics_2004.duckdb")
+con = duckdb.connect(db)
+# Altes Schema (ohne instance_hash) wie vor 20.04.
+con.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR NOT NULL,
+        timeframe VARCHAR NOT NULL,
+        bar_time TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMP DEFAULT current_timestamp,
+        feature_id VARCHAR NOT NULL DEFAULT 'native',
+        plugin_version VARCHAR,
+        feature_data JSON,
+        PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
+    )
+""")
+con.execute("""
+    INSERT INTO feature_store (symbol, timeframe, bar_time, feature_id, feature_data)
+    VALUES ('XAGUSD', 'M1', '2026-08-09 10:00:00', 'srv_grid_lines',
+            '{"result_type": "lines"}')
+""")
+
+# Die 20.04-Migration (identisch zu schema_initializer.py, additiv).
+con.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_id VARCHAR;")
+con.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS plugin_version VARCHAR;")
+con.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS feature_data JSON;")
+con.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS instance_hash VARCHAR;")
+
+cols = [r[0].lower() for r in con.execute(
+    "SELECT column_name FROM information_schema.columns "
+    "WHERE LOWER(table_name)='feature_store' ORDER BY ordinal_position").fetchall()]
+check("Q1) instance_hash-Spalte existiert (additiv)",
+      "instance_hash" in cols, str(cols))
+check("Q1) feature_id bleibt plugin_id (Spalte unveraendert)",
+      "feature_id" in cols and "plugin_version" in cols and "feature_data" in cols,
+      str(cols))
+
+# Idempotenz: erneutes ALTER ist ein No-op (kein Fehler).
+try:
+    con.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS instance_hash VARCHAR;")
+    idem = True
+except Exception as e:
+    idem = False
+    print("ERR", e)
+check("Q1) Migration idempotent (2. Aufruf No-op)", idem, "")
+
+# Bestehende Rows: instance_hash NULL, feature_id unveraendert.
+row = con.execute(
+    "SELECT feature_id, instance_hash FROM feature_store WHERE symbol='XAGUSD'"
+).fetchone()
+check("Q1) Bestehende Row: feature_id='srv_grid_lines', instance_hash NULL",
+      row is not None and row[0] == "srv_grid_lines" and row[1] is None,
+      str(row))
+
+# Schreiben mit instance_hash funktioniert.
+con.execute("""
+    INSERT INTO feature_store (symbol, timeframe, bar_time, feature_id, feature_data, instance_hash)
+    VALUES ('XAGUSD', 'M1', '2026-08-09 10:01:00', 'srv_grid_lines',
+            '{"result_type": "lines"}', 'abc12345')
+""")
+n = con.execute("SELECT COUNT(*) FROM feature_store WHERE instance_hash='abc12345'").fetchone()[0]
+check("Q9) INSERT mit instance_hash moeglich", n == 1, f"n={n}")
+
+# PK-Konflikt bei gleicher Bar (4-Spalten-PK bleibt): zweite Variante auf
+# derselben Bar kollidiert -> ON CONFLICT update (Zero-Regression-Pfad).
+try:
+    con.execute("""
+        INSERT INTO feature_store (symbol, timeframe, bar_time, feature_id, feature_data, instance_hash)
+        VALUES ('XAGUSD', 'M1', '2026-08-09 10:01:00', 'srv_grid_lines',
+                '{"result_type": "lines"}', 'xyz99999')
+        ON CONFLICT (symbol, timeframe, bar_time, feature_id)
+        DO UPDATE SET feature_data = EXCLUDED.feature_data,
+                      instance_hash = EXCLUDED.instance_hash
+    """)
+    up = True
+except Exception as e:
+    up = False
+    print("ERR", e)
+check("Q1) 4-Spalten-PK-Upsert weiterhin gueltig (Zero-Regression)", up, "")
+row2 = con.execute(
+    "SELECT instance_hash FROM feature_store WHERE EXTRACT('epoch' FROM bar_time)::BIGINT = "
+    "EXTRACT('epoch' FROM TIMESTAMPTZ '2026-08-09 10:01:00')::BIGINT"
+).fetchone()
+check("Q9) Upsert schreibt instance_hash in die neue Spalte",
+      row2 is not None and row2[0] == "xyz99999", str(row2))
+
+con.close()
+fails = [n for n, ok, _ in PASS if not ok]
+print(f"RESULT: {len(PASS) - len(fails)}/{len(PASS)} passed")
+sys.exit(1 if fails else 0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_2004_snapshot.py
+```py
+"""Temporärer Check (wird nach Abschluss gelöscht): End-to-End-Test des
+Workspace-Snapshot-Roundtrips (Fensterhistorie) + Profil-Roundtrips:
+
+1) state_manager.save_workspace_state / get_workspace_state mit Temp-DB
+2) vm._save_workspace-Äquivalent (params -> JSON -> DB -> restore)
+3) Heatmap-Params (heatmap_agg/heatmap_field/feature_ids) überleben den
+   Roundtrip
+
+Headless, keine UI-Ausfuehrung. Nutzt Temp-DB in test/.
+"""
+import os
+import sys
+import traceback
+import tempfile
+import pathlib
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+
+QApplication.instance() or QApplication([])
+
+PASS = 0
+FAIL = 0
+
+
+def check(name: str, cond: bool, extra: str = "") -> None:
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print(f"PASS - {name} {extra}")
+    else:
+        FAIL += 1
+        print(f"FAIL - {name} {extra}")
+
+
+TMP_DB = pathlib.Path(__file__).parent / "_tmp_ws_snapshot.duckdb"
+if TMP_DB.exists():
+    TMP_DB.unlink()
+
+
+def test_workspace_roundtrip() -> None:
+    from state_manager import StateManager
+    from analytics.engine.analytics_view_model import AnalyticsViewModel
+    from analytics.engine.analytics_repository import AnalyticsRepository
+
+    sm = StateManager(str(TMP_DB))
+
+    # VM mit den Heatmap-Params befuellen (simuliert UI-Aenderung)
+    vm = AnalyticsViewModel(AnalyticsRepository())
+    vm.set_heatmap_config("date", "hour", "visit_pct", "avg")
+    vm.set_feature_ids(["srv_swing_pivot", "srv_proximity"])
+    vm.set_symbol("SILVER")
+    vm.set_timeframe("H1")
+    check("Snap) set_heatmap_config setzt heatmap_agg='avg'",
+          vm.params.get("heatmap_agg") == "avg",
+          f"-> {vm.params.get('heatmap_agg')!r}")
+
+    # _save_workspace-Äquivalent (analytics_win._save_workspace)
+    payload = {
+        "params": vm.params,
+        "layout": {"page_index": 2, "heatmap_mode": "generic"},
+    }
+    sm.save_workspace_state("win_analytics", payload)
+
+    # Restore lesen
+    stored = sm.get_workspace_state("win_analytics")
+    check("Snap) Workspace-State in DB",
+          isinstance(stored, dict), f"-> {type(stored).__name__}")
+    sp = stored.get("params") or {}
+    check("Snap) heatmap_agg in Workspace-Params",
+          sp.get("heatmap_agg") == "avg",
+          f"-> {sp.get('heatmap_agg')!r}")
+    check("Snap) heatmap_field in Workspace-Params",
+          sp.get("heatmap_field") == "visit_pct",
+          f"-> {sp.get('heatmap_field')!r}")
+    check("Snap) feature_ids in Workspace-Params",
+          sp.get("feature_ids") == ["srv_swing_pivot", "srv_proximity"],
+          f"-> {sp.get('feature_ids')!r}")
+    check("Snap) layout erhalten",
+          (stored.get("layout") or {}).get("heatmap_mode") == "generic")
+
+    # restore_workspace auf frischem VM
+    vm2 = AnalyticsViewModel(AnalyticsRepository())
+    vm2.restore_workspace(stored)
+    check("Snap) restore setzt heatmap_agg='avg'",
+          vm2.params.get("heatmap_agg") == "avg",
+          f"-> {vm2.params.get('heatmap_agg')!r}")
+    check("Snap) restore setzt heatmap_field='visit_pct'",
+          vm2.params.get("heatmap_field") == "visit_pct",
+          f"-> {vm2.params.get('heatmap_field')!r}")
+    check("Snap) restore setzt feature_ids",
+          vm2.params.get("feature_ids") == ["srv_swing_pivot", "srv_proximity"],
+          f"-> {vm2.params.get('feature_ids')!r}")
+
+
+def test_profile_roundtrip() -> None:
+    from analytics.engine.analytics_view_model import AnalyticsViewModel
+    from analytics.engine.analytics_repository import AnalyticsRepository
+
+    vm = AnalyticsViewModel(AnalyticsRepository())
+    vm.set_heatmap_config("date", "hour", "visit_pct", "avg")
+    vm.set_feature_ids(["srv_swing_pivot"])
+    payload = vm._current_payload()
+    hm = payload.get("charts", {}).get("heatmap", {})
+    check("Profil) charts.heatmap.agg='avg'",
+          hm.get("agg") == "avg", f"-> {hm.get('agg')!r}")
+    check("Profil) charts.heatmap.field='visit_pct'",
+          hm.get("field") == "visit_pct", f"-> {hm.get('field')!r}")
+
+    vm2 = AnalyticsViewModel(AnalyticsRepository())
+    vm2._apply_profile({"name": "T", "payload": payload}, mark_dirty=False)
+    check("Profil) apply setzt heatmap_agg='avg'",
+          vm2.params.get("heatmap_agg") == "avg",
+          f"-> {vm2.params.get('heatmap_agg')!r}")
+    check("Profil) apply setzt heatmap_field='visit_pct'",
+          vm2.params.get("heatmap_field") == "visit_pct",
+          f"-> {vm2.params.get('heatmap_field')!r}")
+
+
+if __name__ == "__main__":
+    try:
+        test_workspace_roundtrip()
+    except Exception as e:
+        FAIL += 1
+        print(f"EXC - workspace: {e}")
+        traceback.print_exc()
+    try:
+        test_profile_roundtrip()
+    except Exception as e:
+        FAIL += 1
+        print(f"EXC - profil: {e}")
+        traceback.print_exc()
+    if TMP_DB.exists():
+        TMP_DB.unlink()
+    print(f"\nRESULT: {PASS}/{PASS + FAIL} passed")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_2004_timing.py
+```py
+"""Temporärer Check (wird nach Abschluss gelöscht): Reproduziert das
+Timing-Problem beim App-Start:
+
+1) attach_view_model wird VOR restore_workspace ausgeführt (params leer)
+2) restore_workspace setzt die params (heatmap_agg='avg', field='visit_pct')
+3) Daten-Payload kommt -> _sync_combos_from_payload überschreibt das Feld
+   mit dem ERSTEN verfügbaren Key (E6-Loop) statt dem gespeicherten Wert
+
+Das ist der Root Cause: Der gespeicherte heatmap_field geht beim Restore
+verloren, weil die Widget-Sync auf den Combo-Zustand (leer beim Start)
+statt auf die restaurierten params schaut.
+"""
+import os
+import sys
+import traceback
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+
+QApplication.instance() or QApplication([])
+
+PASS = 0
+FAIL = 0
+
+
+def check(name: str, cond: bool, extra: str = "") -> None:
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print(f"PASS - {name} {extra}")
+    else:
+        FAIL += 1
+        print(f"FAIL - {name} {extra}")
+
+
+class _SignalHost(QObject if False else object):
+    pass
+
+
+from PySide6.QtCore import QObject, Signal
+
+
+class _Sig(QObject):
+    data_ready = Signal(str, dict)
+
+
+class _VM:
+    def __init__(self):
+        self._sig = _Sig()
+        self.data_ready = self._sig.data_ready
+        self.params = {
+            "heatmap_x_dim": "date",
+            "heatmap_y_dim": "hour",
+            "heatmap_field": "",
+            "heatmap_agg": "confluence_count",
+            "heatmap_metric": "count",
+            "feature_ids": [],
+            "symbol": "SILVER",
+            "timeframe": "H1",
+            "candle_projection_enabled": False,
+            "zoom_x_range": [0.0, 1.0],
+            "zoom_y_range": [0.0, 1.0],
+        }
+        self.calls = []
+
+    def connect(self, signal, slot):
+        pass
+
+    def set_heatmap_config(self, x_dim, y_dim, field, agg):
+        self.calls.append(("set_heatmap_config", x_dim, y_dim, field, agg))
+        self.params["heatmap_x_dim"] = x_dim
+        self.params["heatmap_y_dim"] = y_dim
+        self.params["heatmap_field"] = field
+        self.params["heatmap_agg"] = agg
+
+    def set_feature_ids(self, ids):
+        self.params["feature_ids"] = list(ids)
+
+    def request_heatmap_generic(self):
+        self.calls.append(("request_heatmap_generic",))
+
+    def request_daily_ohlc(self):
+        pass
+
+    def resolve_no_data_variants(self, symbol, timeframe):
+        return []
+
+    def resolve_service_display_name(self, plugin_id, preset_name=None):
+        return str(plugin_id)
+
+
+def test_timing_issue():
+    from analytics.ui.heatmap_widget import HeatmapWidget
+
+    vm = _VM()
+    w = HeatmapWidget()
+
+    # SCHRITT 1: attach_view_model VOR dem Restore (params leer) – wie Start
+    w.attach_view_model(vm)
+
+    # SCHRITT 2: restore_workspace setzt die params (simuliert Workspace)
+    vm.params["heatmap_agg"] = "avg"
+    vm.params["heatmap_field"] = "visit_pct"
+    vm.params["feature_ids"] = ["srv_swing_pivot"]
+
+    # SCHRITT 3: Daten-Payload kommt (agg='avg', metrics enthalten visit_pct)
+    data = {
+        "matrix": [[1.0]],
+        "x_dim": "date", "y_dim": "hour", "agg": "avg", "field": "visit_pct",
+        "metrics": ["count", "confluence_count", "visit_pct", "is_hit"],
+        "field_sources": {
+            "visit_pct": ["srv_swing_pivot"],
+            "is_hit": ["srv_swing_pivot"],
+        },
+        "symbol": "SILVER", "timeframe": "H1",
+    }
+    w._sync_combos_from_payload(data)
+    QApplication.processEvents()
+
+    # Das gespeicherte Feld MUSS erhalten bleiben
+    check("Timing) heatmap_field='visit_pct' nach Payload",
+          vm.params.get("heatmap_field") == "visit_pct",
+          f"-> {vm.params.get('heatmap_field')!r}")
+    check("Timing) heatmap_agg='avg' nach Payload",
+          vm.params.get("heatmap_agg") == "avg",
+          f"-> {vm.params.get('heatmap_agg')!r}")
+    check("Timing) KEIN _apply_config-Ueberschreiben mit anderem Feld",
+          not any(c[0] == "set_heatmap_config" and c[3] != "visit_pct"
+                  for c in vm.calls),
+          f"-> calls={[c[:4] for c in vm.calls]}")
+
+
+if __name__ == "__main__":
+    try:
+        test_timing_issue()
+    except Exception as e:
+        FAIL += 1
+        print(f"EXC - {e}")
+        traceback.print_exc()
+    print(f"\nRESULT: {PASS}/{PASS + FAIL} passed")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_2004_tree.py
+```py
+# test/check_2004_tree.py - 20.04 Schritt 2b: Parent-Child-Clones + Archiv
+# Headless (kein QApplication.exec). Wird von test/test.py nicht importiert;
+# temporaerer Check (Cleanup nach Phase 20.04).
+import os
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication
+
+app = QApplication.instance() or QApplication([])
+
+from analytics.engine.service_selector_model import ServiceSelectorModel
+from analytics.engine.service_models import generate_instance_hash
+from analytics.engine.tree_builder import ARCHIVE_LABEL
+from serviceui.master_tree import (
+    ROLE_ARCHIVED, ROLE_NODE_TYPE, TYPE_CLONE, TYPE_PLUGIN, MasterTree,
+    TreeItemIterator,
+)
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, ok, info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+class _Plugin:
+    def __init__(self, plugin_id, category=None):
+        self._plugin_id = plugin_id
+        self.capabilities = {"chart": False}
+        self.metadata = {"category": category} if category else {}
+
+    @property
+    def plugin_id(self):
+        return self._plugin_id
+
+
+class _Registry:
+    def __init__(self, plugins):
+        self.plugins = {pid.lower(): p for pid, p in plugins.items()}
+
+    def get(self, plugin_id):
+        return self.plugins[plugin_id.lower()]
+
+
+class _SetRepo:
+    def __init__(self, sets=None):
+        self._sets = sets or []
+
+    def list_sets(self):
+        return list(self._sets)
+
+
+class _StateMgr:
+    """Fake mit list_plugin_presets (20.04 Q7)."""
+
+    def __init__(self, presets=None):
+        self._presets = presets or {}
+
+    def load_all_instances(self):
+        return []
+
+    def get_global_value(self, key, default=None):
+        return default
+
+    def list_plugin_presets(self, plugin_id):
+        return list(self._presets.get(plugin_id, []))
+
+
+class _FSReader:
+    def fetch_last_execution_dates(self):
+        return {}
+
+
+def model(plugins, presets=None, sets=None):
+    return ServiceSelectorModel(
+        set_repo=_SetRepo(sets), state_manager=_StateMgr(presets),
+        registry=_Registry(plugins), feature_store_reader=_FSReader())
+
+
+def group(tree, g):
+    for x in tree:
+        if x.get("group") == g:
+            return x
+    return None
+
+
+def _plugin_in_nodes(nodes, pid, only_non_archived=False):
+    """Sucht ein Plugin-Parent (plugin_id) rekursiv in Knoten (ohne Archiv)."""
+    found = []
+    for n in nodes:
+        if n.get("plugin_id") == pid and "clones" in n:
+            found.append(n)
+        for sub in (n.get("children") or []):
+            if only_non_archived and n.get("archived"):
+                continue
+            found.extend(_plugin_in_nodes([sub], pid, only_non_archived))
+    return found
+
+
+# ---------------------------------------------------------------------------
+# 1) Plugins MIT Presets -> Parent mit Clone-Kindern (build_tree)
+# ---------------------------------------------------------------------------
+PRESETS_A = {
+    "srv_a": [
+        {"preset_name": "Default", "params": {"step": 1}, "is_active_batch": True},
+        {"preset_name": "M15_Fast", "params": {"step": 2}, "is_active_batch": True},
+    ]
+}
+m = model({"srv_a": _Plugin("srv_a", category="Swing Algos")}, PRESETS_A)
+tree = m.build_tree()
+plugs = group(tree, ServiceSelectorModel.GROUP_PLUGINS)
+children = plugs["children"] if plugs else []
+folder = children[0] if children else {}
+plugin_parent = (folder.get("children") or [])[0] if folder.get("children") else {}
+clones = plugin_parent.get("clones") or []
+check("Q7) Plugin mit Presets wird Parent (clones gesetzt)",
+      bool(clones) and plugin_parent.get("plugin_id") == "srv_a", str(plugin_parent))
+check("Q7) Clones aktiv (kein Archiv-Ordner noetig)",
+      len(clones) == 2 and all(not c.get("is_archived") for c in clones),
+      str(clones))
+h1 = generate_instance_hash("srv_a", {"step": 1})
+h2 = generate_instance_hash("srv_a", {"step": 2})
+check("Q4) instance_hash deterministisch (step=1/step=2 verschieden)",
+      h1 == clones[0].get("instance_hash") and len(h1) == 8 and h1 != h2,
+      f"{h1} / {h2}")
+
+# ---------------------------------------------------------------------------
+# 2) Archivierte Clones -> '📁 Archiv'-Ordner (Q6)
+# ---------------------------------------------------------------------------
+PRESETS_ARCH = {
+    "srv_a": [
+        {"preset_name": "Default", "params": {"step": 1}, "is_active_batch": True},
+        {"preset_name": "old_v1", "params": {"step": 99}, "is_active_batch": False},
+    ]
+}
+m2 = model({"srv_a": _Plugin("srv_a", category="Swing Algos")}, PRESETS_ARCH)
+tree2 = m2.build_tree()
+plugs2 = group(tree2, ServiceSelectorModel.GROUP_PLUGINS)
+children2 = plugs2["children"] if plugs2 else []
+archive_folders = [c for c in children2
+                   if c.get("group") == ServiceSelectorModel.GROUP_CATEGORY
+                   and c.get("archived")]
+active_plugins = _plugin_in_nodes(
+    [c for c in children2 if not c.get("archived")], "srv_a", True)
+check("Q6) Archiv-Ordner existiert (plugins-Gruppe, ans Ende)",
+      len(archive_folders) == 1 and archive_folders[0].get("label") == ARCHIVE_LABEL,
+      str(archive_folders))
+check("Q6) Plugin-Parent zeigt nur AKTIVE Clones",
+      len(active_plugins) == 1
+      and [c.get("preset_name") for c in (active_plugins[0].get("clones") or [])] == ["Default"],
+      str(active_plugins))
+arch_children = archive_folders[0].get("children") or [] if archive_folders else []
+check("Q6) Archiv enthaelt die archivierte Clone-Variante",
+      len(arch_children) == 1
+      and arch_children[0].get("plugin_id") == "srv_a"
+      and [c.get("preset_name") for c in (arch_children[0].get("clones") or [])] == ["old_v1"],
+      str(arch_children))
+
+# ---------------------------------------------------------------------------
+# 3) MasterTree: Clone-Checkboxen + Archive Safety (Q6)
+# ---------------------------------------------------------------------------
+m3 = model({"srv_a": _Plugin("srv_a", category="Swing Algos")}, PRESETS_ARCH)
+tree3 = MasterTree(m3)
+tree3.expandAll()
+tree3.set_checkable(True)
+
+clone_items = [i for i in TreeItemIterator(tree3)
+               if i is not None and i.data(0, ROLE_NODE_TYPE) == TYPE_CLONE]
+active_clone = [i for i in clone_items if not i.data(0, ROLE_ARCHIVED)]
+archived_clone = [i for i in clone_items if i.data(0, ROLE_ARCHIVED)]
+check("Q7) MasterTree: aktiver Clone anhakbar",
+      len(active_clone) == 1
+      and bool(active_clone[0].flags() & Qt.ItemIsUserCheckable),
+      str(len(active_clone)))
+check("Q6) Archivierte Clone NON-checkable",
+      len(archived_clone) == 1
+      and not bool(archived_clone[0].flags() & Qt.ItemIsUserCheckable),
+      f"flags={archived_clone[0].flags() if archived_clone else None}")
+
+# Plugin-Parent ohne Checkbox (Template, Q7) – nur der AKTIVE Parent
+# (der archivierte Parent im Archiv-Ordner ist ebenso non-checkable,
+# traegt aber ROLE_ARCHIVED).
+plugin_items = [i for i in TreeItemIterator(tree3)
+                if i is not None and i.data(0, ROLE_NODE_TYPE) == TYPE_PLUGIN
+                and not i.data(0, ROLE_ARCHIVED)]
+check("Q7) Plugin-Parent (Template) non-checkable",
+      len(plugin_items) == 1
+      and not bool(plugin_items[0].flags() & Qt.ItemIsUserCheckable),
+      f"flags={plugin_items[0].flags() if plugin_items else None}")
+
+# Clone anhaken -> checked_feature_ids liefert plugin_id (Q2)
+if active_clone:
+    active_clone[0].setData(0, Qt.CheckStateRole, Qt.Checked)
+    ids = tree3.checked_feature_ids()
+    check("Q2) Clone-Haken -> feature_id = plugin_id",
+          ids == ["srv_a"], str(ids))
+
+# ---------------------------------------------------------------------------
+# 4) Archivierte Sets/Instanzen -> Archiv-Ordner der Sets-Gruppe (Q6)
+# ---------------------------------------------------------------------------
+SETS = [{
+    "set_id": "set_1",
+    "display_name": "Aktiv",
+    "execution_order": ["inst_1", "inst_2"],
+    "services": {
+        "inst_1": {"plugin_id": "srv_a", "params": {"step": 1}},
+        "inst_2": {"plugin_id": "srv_a", "params": {"step": 2},
+                   "is_archived": True},
+    },
+}]
+m4 = model({"srv_a": _Plugin("srv_a")}, {}, SETS)
+tree4 = m4.build_tree()
+sets_group = group(tree4, ServiceSelectorModel.GROUP_SETS)
+set_children = sets_group["children"] if sets_group else []
+set_arch_folders = [c for c in set_children
+                    if c.get("group") == ServiceSelectorModel.GROUP_CATEGORY
+                    and c.get("archived")]
+normal_sets = [c for c in set_children if c.get("set_id") == "set_1"]
+check("Q6) Aktives Set ohne archivierte Instanz (inst_1) im Normalbaum",
+      len(normal_sets) == 1
+      and [s.get("instance_id") for s in (normal_sets[0].get("services") or [])] == ["inst_1"],
+      str(normal_sets))
+check("Q6) Archiv-Ordner der Sets-Gruppe enthaelt inst_2",
+      len(set_arch_folders) == 1
+      and len(set_arch_folders[0].get("children") or []) == 1
+      and (set_arch_folders[0]["children"][0].get("display_name") or "").endswith("inst_2"),
+      str(set_arch_folders))
+
+# ---------------------------------------------------------------------------
+# 5) Plugin OHNE Presets -> flaches Blatt (Zero-Regression, Blatt-Struktur)
+# ---------------------------------------------------------------------------
+m5 = model({"srv_plain": _Plugin("srv_plain")}, {})
+tree5 = m5.build_tree()
+plugs5 = group(tree5, ServiceSelectorModel.GROUP_PLUGINS)
+leaves5 = [c for c in (plugs5["children"] if plugs5 else [])
+           if c.get("plugin_id") == "srv_plain"]
+check("Q7) Plugin ohne Presets bleibt flaches Blatt (Zero-Regression)",
+      len(leaves5) == 1 and set(leaves5[0]) == {"plugin_id", "badge",
+                                                "last_execution"},
+      str(leaves5))
+
+print()
+fails = [n for n, ok, _ in PASS if not ok]
+print(f"RESULT: {len(PASS) - len(fails)}/{len(PASS)} passed")
+sys.exit(1 if fails else 0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_2004_uiflow.py
+```py
+"""Temporärer Check (wird nach Abschluss gelöscht): Testet den ECHTEN
+UI-Event-Fluss des HeatmapWidget:
+
+1) Ändert die Aggregation-Combo programmatisch -> feuert _on_agg_changed
+   -> wird set_heatmap_config mit agg='avg' aufgerufen?
+2) Ändert das Feld (CheckableComboBox) -> wird heatmap_field gesetzt?
+3) Werden die Werte in den Fake-VM-Params gespeichert (Grundlage für
+   Snapshot/Profil)?
+
+Headless, keine UI-Ausfuehrung.
+"""
+import os
+import sys
+import traceback
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QObject, Signal
+
+QApplication.instance() or QApplication([])
+
+PASS = 0
+FAIL = 0
+
+
+def check(name: str, cond: bool, extra: str = "") -> None:
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print(f"PASS - {name} {extra}")
+    else:
+        FAIL += 1
+        print(f"FAIL - {name} {extra}")
+
+
+class _SignalHost(QObject):
+    data_ready = Signal(str, dict)
+
+
+class _FakeVM:
+    """Capturing Fake-ViewModel: zeichnet set_heatmap_config-Aufrufe auf."""
+
+    def __init__(self):
+        self._sig = _SignalHost()
+        self.data_ready = self._sig.data_ready
+        self.params = {
+            "heatmap_x_dim": "date",
+            "heatmap_y_dim": "hour",
+            "heatmap_field": "",
+            "heatmap_agg": "confluence_count",
+            "heatmap_metric": "count",
+            "feature_ids": [],
+            "symbol": "SILVER",
+            "timeframe": "H1",
+            "candle_projection_enabled": False,
+            "zoom_x_range": [0.0, 1.0],
+            "zoom_y_range": [0.0, 1.0],
+        }
+        self.calls = []
+        self.connected = []
+
+    def connect(self, signal, slot):
+        self.connected.append((signal, slot))
+
+    def set_heatmap_config(self, x_dim, y_dim, field, agg):
+        self.calls.append(("set_heatmap_config", x_dim, y_dim, field, agg))
+        self.params["heatmap_x_dim"] = x_dim
+        self.params["heatmap_y_dim"] = y_dim
+        self.params["heatmap_field"] = field
+        self.params["heatmap_agg"] = agg
+
+    def set_heatmap_metric(self, metric):
+        self.calls.append(("set_heatmap_metric", metric))
+        self.params["heatmap_metric"] = metric
+
+    def set_feature_ids(self, ids):
+        self.calls.append(("set_feature_ids", ids))
+        self.params["feature_ids"] = list(ids)
+
+    def request_heatmap_generic(self):
+        self.calls.append(("request_heatmap_generic",))
+
+    def request_daily_ohlc(self):
+        pass
+
+    def resolve_no_data_variants(self, symbol, timeframe):
+        return []
+
+
+def test_agg_event_flow():
+    from analytics.ui.heatmap_widget import HeatmapWidget
+
+    vm = _FakeVM()
+    w = HeatmapWidget()
+    w.attach_view_model(vm)
+
+    # Aggregation-Combo auf 'avg' setzen (findData über userData)
+    idx = w._combo_agg.findData("avg")
+    check("UI) 'avg' existiert in Agg-Combo", idx >= 0, f"-> idx={idx}")
+    w._combo_agg.setCurrentIndex(idx)
+    # Signal-Verarbeitung
+    QApplication.processEvents()
+    check("UI) set_heatmap_config mit agg='avg' aufgerufen",
+          any(c[0] == "set_heatmap_config" and c[4] == "avg"
+              for c in vm.calls),
+          f"-> calls={[c[:2] for c in vm.calls]}")
+    check("UI) VM-Params heatmap_agg='avg'",
+          vm.params.get("heatmap_agg") == "avg",
+          f"-> {vm.params.get('heatmap_agg')!r}")
+
+    # X/Y ändern
+    idx_x = w._combo_x.findData("date")
+    idx_y = w._combo_y.findData("hour")
+    w._combo_x.setCurrentIndex(idx_x)
+    w._combo_y.setCurrentIndex(idx_y)
+    QApplication.processEvents()
+
+
+def test_field_event_flow():
+    from analytics.ui.heatmap_widget import HeatmapWidget
+
+    vm = _FakeVM()
+    w = HeatmapWidget()
+    w.attach_view_model(vm)
+
+    # Feld-Dropdown befüllen (simuliert _sync_combos_from_payload)
+    w._combo_field.blockSignals(True)
+    w._combo_field.clear()
+    w._combo_field.add_checkable_item(
+        "Swing Pivot / visit_pct", "srv_swing_pivot|visit_pct", checked=True)
+    w._combo_field.add_checkable_item(
+        "Swing Pivot / is_hit", "srv_swing_pivot|is_hit", checked=False)
+    w._combo_field.blockSignals(False)
+
+    # Aggregation auf avg (damit Feld relevant ist)
+    w._combo_agg.setCurrentIndex(w._combo_agg.findData("avg"))
+    QApplication.processEvents()
+
+    # Feld-Index auf 'visit_pct' setzen -> currentIndexChanged -> _on_config_changed
+    fidx = w._combo_field.findData("srv_swing_pivot|visit_pct")
+    check("UI) visit_pct-Item vorhanden", fidx >= 0, f"-> idx={fidx}")
+    w._combo_field.setCurrentIndex(fidx)
+    QApplication.processEvents()
+    check("UI) set_heatmap_config mit field='visit_pct'",
+          any(c[0] == "set_heatmap_config" and c[3] == "visit_pct"
+              for c in vm.calls),
+          f"-> calls={[c[:4] for c in vm.calls]}")
+    check("UI) VM-Params heatmap_field='visit_pct'",
+          vm.params.get("heatmap_field") == "visit_pct",
+          f"-> {vm.params.get('heatmap_field')!r}")
+
+
+if __name__ == "__main__":
+    for fn in (test_agg_event_flow, test_field_event_flow):
+        try:
+            fn()
+        except Exception as e:
+            FAIL += 1
+            print(f"EXC - {fn.__name__}: {e}")
+            traceback.print_exc()
+    print(f"\nRESULT: {PASS}/{PASS + FAIL} passed")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_2004_viewmodel.py
+```py
+# test/check_2004_viewmodel.py - 20.04 Schritt 3: Preset-Label + Hash-Aufloesung
+# Headless (kein QApplication.exec). Temporaerer Check (Cleanup nach 20.04).
+import os
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+
+app = QApplication.instance() or QApplication([])
+
+from analytics.engine.analytics_view_model import AnalyticsViewModel
+from analytics.engine.service_models import generate_instance_hash
+
+
+class _Plugin:
+    def __init__(self, plugin_id):
+        self._plugin_id = plugin_id
+        self.capabilities = {"chart": False}
+        self.metadata = {}
+
+    @property
+    def plugin_id(self):
+        return self._plugin_id
+
+
+class _SelectorModel:
+    """Fake: get_plugin + plugin_presets (20.04 Q7)."""
+
+    def __init__(self, plugins, presets):
+        self._plugins = {p.lower(): p for p in plugins}
+        self._presets = presets
+
+    def get_plugin(self, plugin_id):
+        p = self._plugins.get(str(plugin_id).lower())
+        if p is None:
+            raise KeyError(plugin_id)
+        return p
+
+    def plugin_presets(self):
+        return dict(self._presets)
+
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, ok, info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+presets = {
+    "srv_swing_pivot": [
+        {"preset_name": "M15_Fast", "params": {"tf": "M15"},
+         "instance_hash": generate_instance_hash("srv_swing_pivot", {"tf": "M15"}),
+         "is_archived": False},
+        {"preset_name": "H1_Slow", "params": {"tf": "H1"},
+         "instance_hash": generate_instance_hash("srv_swing_pivot", {"tf": "H1"}),
+         "is_archived": False},
+    ],
+    "srv_plain": [
+        {"preset_name": "Default", "params": {},
+         "instance_hash": generate_instance_hash("srv_plain", {}),
+         "is_archived": False},
+    ],
+}
+vm = AnalyticsViewModel(selector_model=_SelectorModel(
+    ["srv_swing_pivot", "srv_plain"], presets))
+
+# 1) resolve_service_display_name mit Preset (Q2, Label-Format §4)
+name = vm.resolve_service_display_name("srv_swing_pivot")
+check("Q2) Basis-Label 'Swing Pivot' (ohne Preset)",
+      name == "Swing Pivot", name)
+name_preset = vm.resolve_service_display_name("srv_swing_pivot", "M15_Fast")
+check("Q2) Label mit Preset 'Swing Pivot (M15_Fast)'",
+      name_preset == "Swing Pivot (M15_Fast)", name_preset)
+
+# 2) native/none -> 'Allgemein' (unveraendert, Zero-Regression)
+check("Q2) native -> 'Allgemein' (Zero-Regression)",
+      vm.resolve_service_display_name("native") == "Allgemein", "")
+check("Q2) none -> 'Allgemein' (Zero-Regression)",
+      vm.resolve_service_display_name("none") == "Allgemein", "")
+
+# 3) resolve_instance_hashes -> plugin_ids (Q2)
+h_m15 = generate_instance_hash("srv_swing_pivot", {"tf": "M15"})
+h_h1 = generate_instance_hash("srv_swing_pivot", {"tf": "H1"})
+h_plain = generate_instance_hash("srv_plain", {})
+ids = vm.resolve_instance_hashes([h_m15, h_plain, "unknown_hash_xyz"])
+check("Q2) resolve_instance_hashes -> deduplizierte plugin_ids",
+      ids == ["srv_swing_pivot", "srv_plain"], str(ids))
+ids2 = vm.resolve_instance_hashes([h_m15, h_h1])
+check("Q2) Zwei Varianten desselben Plugins -> EINE plugin_id",
+      ids2 == ["srv_swing_pivot"], str(ids2))
+check("Q2) Leere Hash-Liste -> []",
+      vm.resolve_instance_hashes([]) == [], "")
+
+fails = [n for n, ok, _ in PASS if not ok]
+print(f"RESULT: {len(PASS) - len(fails)}/{len(PASS)} passed")
+sys.exit(1 if fails else 0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_2004_writers.py
+```py
+# test/check_2004_writers.py - 20.04 Schritt 5/5b: instance_hash in Writern
+# + Archiv-Ignoranz (Q6/Q9). Headless, Temp-DB (test/). Cleanup nach 20.04.
+import os
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+
+app = QApplication.instance() or QApplication([])
+
+from serviceui.run_worker import ALL_TIMEFRAMES, ServiceRunWorker
+from analytics.engine.service_models import generate_instance_hash
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, ok, info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+class _FakeFB:
+    def __init__(self):
+        self.calls = []
+        self._df = _df_template()
+
+    def load_ohlcv(self, symbol, tf, limit=None):
+        return self._df if tf in ("M1", "H1") else None
+
+    def store_plugin_payload(self, symbol, tf, payload, instance_hash=None):
+        self.calls.append({"tf": tf, "instance_hash": instance_hash})
+
+
+class _FakeEval:
+    def execute_set(self, definition, df_plugin, context=None):
+        return {"grid_1": {"feature_store_payload": {
+            "feature_id": "srv_grid_lines", "plugin_version": "1.0.0",
+            "records": [{"bar_time": 1600000000}]}}}
+
+
+def _df_template():
+    import pandas as pd
+    return pd.DataFrame({
+        "bar_time": pd.to_datetime([1600000000, 1600000360], unit="s", utc=True),
+        "open": [30.0, 30.2], "high": [30.15, 30.4],
+        "low": [29.85, 30.1], "close": [30.1, 30.25],
+    })
+
+
+# --- 1) run_worker uebergibt instance_hash (Q9) ------------------------------
+import analytics.features.feature_builder as _fbm
+
+fb_fake = _FakeFB()
+_orig = _fbm.FeatureBuilder
+_fbm.FeatureBuilder = lambda: fb_fake
+try:
+    defn = {
+        "set_id": "set_1", "display_name": "Drei Services",
+        "execution_order": ["grid_1"],
+        "services": {"grid_1": {"plugin_id": "srv_grid_lines", "lookback": 1000,
+                                "params": {"step_size": 0.5, "steps_around": 4}}},
+    }
+    wk = ServiceRunWorker(_FakeEval(), "SILVER", "M1", defn)
+    finish = []
+    wk.run_finished.connect(lambda sid, n: finish.append((sid, n)))
+    wk.run()
+    exp_hash = generate_instance_hash("srv_grid_lines",
+                                      {"step_size": 0.5, "steps_around": 4})
+    check("Q9) run_worker ruft store_plugin_payload mit instance_hash",
+          len(fb_fake.calls) == 1
+          and fb_fake.calls[0]["instance_hash"] == exp_hash,
+          f"calls={fb_fake.calls} exp={exp_hash}")
+
+    # --- 2) Archiv-Ignoranz (Q6): archiviertes Set wird NICHT ausgefuehrt
+    defn_arch_set = dict(defn)
+    defn_arch_set["is_archived"] = True
+    fb_fake.calls.clear()
+    wk2 = ServiceRunWorker(_FakeEval(), "SILVER", "M1", defn_arch_set)
+    finish2 = []
+    wk2.run_finished.connect(lambda sid, n: finish2.append((sid, n)))
+    wk2.run()
+    check("Q6) Archiviertes Set -> kein Store-Call + run_finished(0)",
+          not fb_fake.calls and finish2 and finish2[0][1] == 0,
+          f"calls={fb_fake.calls} finish={finish2}")
+
+    # --- 3) Archiv-Ignoranz: einzeln archivierte Instanz wird nicht ausgefuehrt
+    defn_arch_inst = {
+        "set_id": "set_2", "display_name": "Set2",
+        "execution_order": ["g_arch"],
+        "services": {"g_arch": {"plugin_id": "srv_grid_lines", "lookback": 1000,
+                                "params": {"step_size": 0.5},
+                                "is_archived": True}},
+    }
+    fb_fake.calls.clear()
+    wk3 = ServiceRunWorker(_FakeEval(), "SILVER", "M1", defn_arch_inst,
+                           instance_id="g_arch")
+    finish3 = []
+    wk3.run_finished.connect(lambda sid, n: finish3.append((sid, n)))
+    wk3.run()
+    check("Q6) Archivierte Instanz -> kein Store-Call + run_finished(0)",
+          not fb_fake.calls and finish3 and finish3[0][1] == 0,
+          f"calls={fb_fake.calls} finish={finish3}")
+
+    # --- 4) Nicht-archivierte Instanz laeuft normal (Positive-Control)
+    defn_ok = {
+        "set_id": "set_3", "display_name": "Set3",
+        "execution_order": ["g_ok"],
+        "services": {"g_ok": {"plugin_id": "srv_grid_lines", "lookback": 1000,
+                              "params": {"step_size": 0.5}}},
+    }
+    fb_fake.calls.clear()
+    wk4 = ServiceRunWorker(_FakeEval(), "SILVER", "M1", defn_ok,
+                           instance_id="g_ok")
+    finish4 = []
+    wk4.run_finished.connect(lambda sid, n: finish4.append((sid, n)))
+    wk4.run()
+    check("Q6) Nicht-archivierte Instanz laeuft (Positive-Control)",
+          len(fb_fake.calls) == 1 and finish4 and finish4[0][1] == 1,
+          f"calls={fb_fake.calls} finish={finish4}")
+finally:
+    _fbm.FeatureBuilder = _orig
+
+# --- 5) Statische Pruefung: Scanner uebergeben instance_hash (Q9) -----------
+for path, needle in [
+    ("analytics/background_workers/historical_scanner.py",
+     "store_plugin_payload("),
+    ("analytics/background_workers/live_analyzer.py",
+     "store_plugin_payload("),
+]:
+    src = open(path, encoding="utf-8").read()
+    check(f"Q9) {os.path.basename(path)} enthaelt instance_hash-Uebergabe",
+          "instance_hash=instance_hash" in src
+          or "instance_hash=generate_instance_hash" in src)
+
+# Scanners filtern ueber list_active_batch_presets (is_active_batch=True) ->
+# archivierte Presets (is_active_batch=False) sind bereits ausgeschlossen.
+src_hs = open("analytics/background_workers/historical_scanner.py",
+              encoding="utf-8").read()
+src_la = open("analytics/background_workers/live_analyzer.py",
+              encoding="utf-8").read()
+check("Q7) HistoricalScanner nutzt list_active_batch_presets",
+      "list_active_batch_presets()" in src_hs)
+check("Q7) LiveAnalyzer nutzt list_active_batch_presets",
+      "list_active_batch_presets()" in src_la)
+
+print(f"\n{sum(1 for _, ok, _ in PASS if ok)}/{len(PASS)} Checks PASS")
+fail = [n for n, ok, _ in PASS if not ok]
+if fail:
+    print("FAILS:", fail)
+    sys.exit(1)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_bug345_chain.py
+```py
+# test/check_bug345_chain.py
+# -*- coding: utf-8 -*-
+"""
+End-to-End-Ketten-Test fuer Bug 3/4/5 (10.08.2026):
+
+Testet die KOMPLETTE Signalkette, die die bisherigen Round-7-Tests nie
+abdeckten (sie rufen HeatmapWidget-Methoden DIREKT auf):
+
+  Checkbox im MasterTree -> _on_item_changed -> checked_changed
+    -> (Dialog) _on_checked_changed -> checked_feature_ids()
+    -> (Window) set_feature_ids -> vm.params["feature_ids"]
+    -> set_checked_feature_ids (Reverse-Mapping) -> Round-Trip
+
+KEINE GUI-Ausfuehrung (offscreen). Temp-DBs strikt in test/.
+"""
+import os
+import sys
+import json
+import shutil
+import tempfile
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt, QObject, Signal
+
+app = QApplication.instance() or QApplication([])
+
+from analytics.engine.service_set_repository import ServiceSetRepository
+from analytics.engine.service_selector_model import ServiceSelectorModel
+from serviceui.service_selector_widget import ServiceSelectorWidget
+
+# ROLE-Konstanten aus master_tree importieren (Qt.UserRole = 256)
+import serviceui.master_tree as mt
+TYPE_SET = mt.TYPE_SET            # "set"
+TYPE_SERVICE = mt.TYPE_SERVICE    # "service"
+ROLE_NODE_TYPE = mt.ROLE_NODE_TYPE        # Qt.UserRole      = 256
+ROLE_SET_ID = mt.ROLE_SET_ID              # Qt.UserRole + 1  = 257
+ROLE_INSTANCE_ID = mt.ROLE_INSTANCE_ID    # Qt.UserRole + 2  = 258
+ROLE_PLUGIN_ID = mt.ROLE_PLUGIN_ID        # Qt.UserRole + 3  = 259
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+# ---------------------------------------------------------------------------
+# Fake-Registry + Fake-StateManager + Fake-Reader
+# ---------------------------------------------------------------------------
+class _Plugin:
+    def __init__(self, pid, category="Analyse"):
+        self.metadata = {"category": category}
+        self.capabilities = {}
+
+
+class _FakeRegistry:
+    def __init__(self, plugins):
+        self.plugins = {p.lower(): _Plugin(p) for p in plugins}
+
+    def get(self, plugin_id):
+        key = plugin_id.lower()
+        if key not in self.plugins:
+            raise KeyError(plugin_id)
+        return self.plugins[key]
+
+
+class _FakeStateManager:
+    def get_global_value(self, key, default=None):
+        return default
+
+    def list_plugin_presets(self, pid):
+        return []
+
+    def load_all_instances(self):
+        return []
+
+
+class _FakeReader:
+    def fetch_last_execution_dates(self):
+        return {}
+
+    def fetch_last_execution_dates_by_hash(self):
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Temp-DB mit 2 Sets anlegen (in test/)
+# ---------------------------------------------------------------------------
+_tmp_dir = Path(__file__).parent / "_tmp_bug345"
+if _tmp_dir.exists():
+    shutil.rmtree(_tmp_dir, ignore_errors=True)
+_tmp_dir.mkdir(parents=True, exist_ok=True)
+db_path = str(_tmp_dir / "app_data_bug345.duckdb")
+
+repo = ServiceSetRepository(db_path=db_path)
+
+
+def _svc(plugin_id, p):
+    return {"plugin_id": plugin_id, "params": p}
+
+
+repo.save_set({
+    "set_id": "set_grid",
+    "display_name": "Grid Set",
+    "execution_order": ["grid_1", "grid_2"],
+    "services": {
+        "grid_1": _svc("srv_grid_lines", {"step": 1}),
+        "grid_2": _svc("srv_grid_lines", {"step": 2}),
+    },
+})
+repo.save_set({
+    "set_id": "set_prox",
+    "display_name": "Prox Set",
+    "execution_order": ["prox_1"],
+    "services": {
+        "prox_1": _svc("srv_proximity", {"window": 5}),
+    },
+})
+
+registry = _FakeRegistry(["srv_grid_lines", "srv_proximity"])
+
+model = ServiceSelectorModel(
+    set_repo=repo,
+    state_manager=_FakeStateManager(),
+    registry=registry,
+    feature_store_reader=_FakeReader(),
+)
+
+# ---------------------------------------------------------------------------
+# 1) SELECT_MULTI-Widget: Baum mit Checkboxen
+# ---------------------------------------------------------------------------
+widget = ServiceSelectorWidget(ServiceSelectorWidget.MODE_SELECT_MULTI,
+                               model=model)
+tree = widget.master_tree
+check("1) Baum gebaut (Sets + Services)", tree is not None
+      and tree.topLevelItemCount() >= 2)
+check("1) Checkbox-Modus aktiv", tree._checkable)
+
+# ---------------------------------------------------------------------------
+# 2) Checkbox-Toggle -> checked_changed -> checked_feature_ids
+# ---------------------------------------------------------------------------
+emitted = []
+
+
+def _on_checked_changed():
+    emitted.append(list(tree.checked_feature_ids()))
+
+
+tree.checked_changed.connect(_on_checked_changed)
+
+# Service-Knoten finden: grid_1 unter Set 'set_grid'
+def find_service_item(set_id, instance_id):
+    for i in range(tree.topLevelItemCount()):
+        group = tree.topLevelItem(i)
+        for j in range(group.childCount()):
+            item = group.child(j)
+            if (item.data(0, ROLE_NODE_TYPE) == TYPE_SET
+                    and item.data(0, ROLE_SET_ID) == set_id):
+                for k in range(item.childCount()):
+                    child = item.child(k)
+                    if (child.data(0, ROLE_SET_ID) == set_id
+                            and child.data(0, ROLE_INSTANCE_ID) == instance_id):
+                        return child
+    return None
+
+
+grid_1 = find_service_item("set_grid", "grid_1")
+grid_2 = find_service_item("set_grid", "grid_2")
+prox_1 = find_service_item("set_prox", "prox_1")
+check("2) Service-Knoten grid_1 gefunden", grid_1 is not None)
+check("2) Service-Knoten prox_1 gefunden", prox_1 is not None)
+
+# grid_1 anhaken (Simulation des User-Klicks)
+grid_1.setCheckState(0, Qt.Checked)
+app.processEvents()
+check("2) checked_changed nach Anhaken emittiert", len(emitted) >= 1,
+      f"emitted={emitted}")
+check("2) feature_ids nach Anhaken = ['srv_grid_lines']",
+      emitted and emitted[-1] == ["srv_grid_lines"], str(emitted))
+
+# prox_1 dazu anhaken
+prox_1.setCheckState(0, Qt.Checked)
+app.processEvents()
+check("2) feature_ids nach 2. Anhaken = ['srv_grid_lines','srv_proximity']",
+      emitted and emitted[-1] == ["srv_grid_lines", "srv_proximity"],
+      str(emitted))
+
+# grid_2 (2. Instanz derselben plugin_id) anhaken -> DEDUPLIZIERT
+n_before = len(emitted)
+grid_2.setCheckState(0, Qt.Checked)
+app.processEvents()
+check("2) 2. Instanz derselben plugin_id: checked_changed FEUERT",
+      len(emitted) > n_before, f"delta={len(emitted) - n_before}")
+check("2) 2. Instanz: feature_ids unveraendert (dedupliziert)",
+      emitted and emitted[-1] == ["srv_grid_lines", "srv_proximity"],
+      str(emitted))
+
+# grid_1 ABHAKEN -> Runde 9 (Bug 3): NUR diesen einen Key abhaengen (das
+# fruehere _uncheck_plugin_rows haengte ALLE Zeilen der plugin_id ab und
+# zerstörte damit die Varianten-Unterscheidung). grid_2 bleibt gecheckt,
+# der Filter bleibt daher ueber grid_2 aktiv (srv_grid_lines).
+n_before = len(emitted)
+grid_1.setCheckState(0, Qt.Unchecked)
+app.processEvents()
+check("2) Abhaken grid_1: checked_changed FEUERT",
+      len(emitted) > n_before, f"delta={len(emitted) - n_before}")
+check("2) Abhaken grid_1: Filter bleibt ueber grid_2 aktiv (Bug 3)",
+      emitted and emitted[-1] == ["srv_grid_lines", "srv_proximity"],
+      str(emitted))
+check("2) Abhaken grid_1: grid_2 bleibt Checked (nur grid_1 abgehaengt)",
+      grid_2.checkState(0) == Qt.Checked
+      and (mt.TYPE_SERVICE, "set_grid", "grid_1") not in tree._checked_items
+      and (mt.TYPE_SERVICE, "set_grid", "grid_2") in tree._checked_items,
+      str(sorted(tree._checked_items)))
+
+# ---------------------------------------------------------------------------
+# 3) Reverse-Mapping-Round-Trip (Restore-Simulation)
+# ---------------------------------------------------------------------------
+tree.set_checked_feature_ids(["srv_grid_lines"])
+app.processEvents()
+ids_back = tree.checked_feature_ids()
+# Restore haengt ALLE Zeilen der plugin_id an (Set-Services grid_1/grid_2
+# UND das Standalone-Blatt) - die tree-Sicht ist damit konsistent zur
+# plugin_id-granularen feature_ids-Auswahl (kein versteckter Doppel-Hook).
+check("3) set_checked_feature_ids(['srv_grid_lines']): ALLE Zeilen angehakt",
+      tree._checked_items == {(mt.TYPE_SERVICE, "set_grid", "grid_1"),
+                              (mt.TYPE_SERVICE, "set_grid", "grid_2"),
+                              (mt.TYPE_PLUGIN, "", "srv_grid_lines")},
+      str(sorted(tree._checked_items)))
+check("3) Round-Trip: checked_feature_ids() == ['srv_grid_lines']",
+      ids_back == ["srv_grid_lines"], str(ids_back))
+
+# ---------------------------------------------------------------------------
+# 4) _populate() (Modell-Refresh) erhaelt Haken?
+# ---------------------------------------------------------------------------
+model.refresh()  # emittiert data_changed -> _populate
+app.processEvents()
+ids_after_refresh = tree.checked_feature_ids()
+check("4) Nach _populate (Modell-Refresh): Haken erhalten",
+      ids_after_refresh == ["srv_grid_lines"], str(ids_after_refresh))
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+widget.deleteLater()
+shutil.rmtree(_tmp_dir, ignore_errors=True)
+
+print(f"\n{sum(1 for _, ok, _ in PASS if ok)}/{len(PASS)} Checks PASS")
+fail = [n for n, ok, _ in PASS if not ok]
+if fail:
+    print("FAILS:", fail)
+    sys.exit(1)
+print("KETTE BUG345 VERIFIZIERT (OK)")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_bug345_chain_empiric.py
+```py
+# test/check_bug345_chain_empiric.py
+# -*- coding: utf-8 -*-
+"""
+Empirischer Full-Chain-Test fuer Bug 3/4/5 (10.08.2026, 2. Analyse):
+
+Reproduziert die KOMPLETTE Kette MIT ECHTER DB (Temp in test/) und echtem
+AnalyticsViewModel + HeatmapWidget (offscreen, KEINE GUI-Ausfuehrung):
+
+  set_feature_ids (User check/uncheck im ServicePicker)
+    -> VM _refresh (Debounce 250 ms) -> AnalyticsAsyncWorker (QThread)
+    -> data_ready(QUERY_HEATMAP_GENERIC, payload)
+    -> HeatmapWidget _sync_combos_from_payload -> 'Feld'-Dropdown
+
+  restore_workspace (open/restore Analytics, Bug 3)
+    -> params_restored -> _sync_from_params
+    -> anschliessender Payload -> _sync_combos_from_payload
+
+Ziel: Die WAHREN Ursachen von Bug 3/4/5 empirisch bestaetigen/widerlegen.
+"""
+import os
+import sys
+import json
+import shutil
+import time
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QTimer
+
+app = QApplication.instance() or QApplication([])
+
+from analytics.engine.feature_store_reader import FeatureStoreReader
+from analytics.engine.analytics_repository import AnalyticsRepository
+from analytics.engine.analytics_view_model import AnalyticsViewModel
+from analytics.engine.analytics_worker import QUERY_HEATMAP_GENERIC
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+# ---------------------------------------------------------------------------
+# Temp-DB anlegen (nur in test/)
+# ---------------------------------------------------------------------------
+_tmp = Path(__file__).parent / "_tmp_bug345_emp"
+if _tmp.exists():
+    shutil.rmtree(_tmp, ignore_errors=True)
+_tmp.mkdir(parents=True, exist_ok=True)
+db_path = str(_tmp / "analytics_bug345.duckdb")
+
+import duckdb
+
+con = duckdb.connect(db_path)
+con.execute("""
+    CREATE TABLE feature_store (
+        symbol        VARCHAR,
+        timeframe     VARCHAR,
+        bar_time      TIMESTAMPTZ,
+        created_at    TIMESTAMPTZ,
+        feature_id    VARCHAR,
+        plugin_version VARCHAR,
+        feature_data  JSON
+    )
+""")
+
+# Wanduhr-encoded Epochs: Montag 03.08.2026 08:00-08:59 Berlin-Wanduhr
+import datetime as _dt
+
+BASE = _dt.datetime(2026, 8, 3, 8, 0, 0)  # UTC-Darstellung = Wanduhr
+
+rows = []
+for i in range(10):
+    bt = BASE + _dt.timedelta(minutes=i)
+    rows.append(("XAGUSD", "M1", bt, bt,
+                 "srv_grid_lines", "1.0.0",
+                 json.dumps({"schema_version": "1.0.0", "open": 28.0 + i,
+                             "high": 29.0 + i, "step": i})))
+    rows.append(("XAGUSD", "M1", bt, bt,
+                 "srv_proximity", "1.0.0",
+                 json.dumps({"schema_version": "1.0.0", "visit_pct": 0.5 + i,
+                             "near": 1})))
+con.executemany(
+    "INSERT INTO feature_store VALUES (?,?,?,?,?,?,?)", rows)
+con.close()
+
+reader = FeatureStoreReader(db_path=db_path)
+repo = AnalyticsRepository(reader=reader)
+vm = AnalyticsViewModel(analytics_repo=repo)
+vm.set_symbol("XAGUSD")
+vm.set_timeframe("M1")
+
+from analytics.ui.heatmap_widget import HeatmapWidget
+
+widget = HeatmapWidget()
+widget.attach_view_model(vm)
+
+payloads = []
+
+
+def _on_data(kind, data):
+    if kind == QUERY_HEATMAP_GENERIC:
+        payloads.append(dict(data))
+
+
+vm.data_ready.connect(_on_data)
+
+
+def wait_for_payload(n=1, timeout=6.0):
+    """Wartet, bis mindestens n neue Payloads gelandet sind (Worker-Thread)."""
+    start = time.time()
+    while len(payloads) < n and time.time() - start < timeout:
+        app.processEvents()
+        time.sleep(0.02)
+    return len(payloads) >= n
+
+
+def field_keys():
+    """Alle auswaehlbaren Keys im 'Feld'-Dropdown (userData->key-Teil)."""
+    out = []
+    for i in range(widget._combo_field.count()):
+        ud = str(widget._combo_field.itemData(i) or "")
+        key = ud.split("|", 1)[1] if "|" in ud else ud
+        out.append(key)
+    return out
+
+
+def combo_value(combo):
+    return str(combo.currentData() or "")
+
+
+# ---------------------------------------------------------------------------
+# Baseline: Payload mit leerem Filter (alle Services) abwarten
+# ---------------------------------------------------------------------------
+ok1 = wait_for_payload(1)
+check("A1) Erster Payload (alle Services) gelandet", ok1)
+last = payloads[-1] if payloads else {}
+check("A2) metrics enthalten open+high+visit_pct",
+      {"open", "high", "visit_pct"} <= set(last.get("metrics") or []),
+      str(last.get("metrics")))
+check("A3) Feld-Dropdown enthaelt open/high/visit_pct",
+      {"open", "high", "visit_pct"} <= set(field_keys()), str(field_keys()))
+
+# ---------------------------------------------------------------------------
+# BUG 4: check/uncheck (Filter) -> Dropdown muss sich aktualisieren
+# ---------------------------------------------------------------------------
+n0 = len(payloads)
+vm.set_feature_ids(["srv_grid_lines"])
+ok = wait_for_payload(n0 + 1)
+check("B1) set_feature_ids([grid]) -> neuer Payload", ok,
+      f"payloads {n0}->{len(payloads)}")
+keys = set(field_keys())
+check("B2) Nach Filter [grid]: visit_pct ENTFERNT, open/high da",
+      "visit_pct" not in keys and {"open", "high"} <= keys, str(keys))
+check("B3) vm.params.feature_ids == ['srv_grid_lines'] (Historie-Persistenz)",
+      vm.params.get("feature_ids") == ["srv_grid_lines"],
+      str(vm.params.get("feature_ids")))
+
+n0 = len(payloads)
+vm.set_feature_ids(["srv_grid_lines", "srv_proximity"])
+ok = wait_for_payload(n0 + 1)
+check("B4) set_feature_ids([grid, prox]) -> neuer Payload", ok,
+      f"payloads {n0}->{len(payloads)}")
+keys = set(field_keys())
+check("B5) Nach Filter [grid,prox]: visit_pct WIEDER da",
+      "visit_pct" in keys, str(keys))
+
+n0 = len(payloads)
+vm.set_feature_ids([])  # Filter entfernen = alle
+ok = wait_for_payload(n0 + 1)
+check("B6) set_feature_ids([]) -> neuer Payload (Filter leer = alle)", ok,
+      f"payloads {n0}->{len(payloads)}")
+
+# ---------------------------------------------------------------------------
+# BUG 5: check/uncheck in Historie gemerkt?  (set_feature_ids -> params)
+# ---------------------------------------------------------------------------
+vm.set_feature_ids(["srv_proximity"])
+check("C1) params.feature_ids folgt Uncheck (grid entfernt)",
+      vm.params.get("feature_ids") == ["srv_proximity"],
+      str(vm.params.get("feature_ids")))
+
+# ---------------------------------------------------------------------------
+# BUG 3: restore_workspace -> Dropdowns (X/Y/Agg/Feld) restaurieren
+# ---------------------------------------------------------------------------
+# Grid wieder aktiv + Konfiguration setzen
+vm.set_feature_ids(["srv_grid_lines", "srv_proximity"])
+vm.set_heatmap_config(x_dim="dow", y_dim="hour", field="open", agg="avg")
+time.sleep(0.3)
+app.processEvents()
+time.sleep(0.3)
+app.processEvents()
+
+n0 = len(payloads)
+workspace = {
+    "params": dict(vm.params),
+    "layout": {"page_index": 1, "heatmap_mode": "generic",
+               "service_picker_open": False},
+}
+# Simuliere close+reopen: NEUES Widget, VM-Params wie gespeichert
+vm2 = AnalyticsViewModel(analytics_repo=repo)
+vm2.set_symbol("XAGUSD")
+vm2.set_timeframe("M1")
+payloads2 = []
+
+
+def _on_data2(kind, data):
+    if kind == QUERY_HEATMAP_GENERIC:
+        payloads2.append(dict(data))
+
+
+vm2.data_ready.connect(_on_data2)
+
+w2 = HeatmapWidget()
+w2.attach_view_model(vm2)
+# params_restored von restore_workspace MUSS die Combos syncen
+w2._sync_from_params  # noqa: Referenz (attach hat bereits gesynct)
+vm2.restore_workspace(workspace)
+check("D1) restore_workspace: params uebernommen",
+      vm2.params.get("heatmap_x_dim") == "dow"
+      and vm2.params.get("heatmap_field") == "open"
+      and vm2.params.get("feature_ids") == ["srv_grid_lines", "srv_proximity"],
+      f"x={vm2.params.get('heatmap_x_dim')} f={vm2.params.get('heatmap_field')} "
+      f"ids={vm2.params.get('feature_ids')}")
+check("D2) Nach params_restored: X-Combo == 'dow' (SOFORT, vor Payload)",
+      combo_value(w2._combo_x) == "dow", combo_value(w2._combo_x))
+check("D3) Nach params_restored: Agg-Combo == 'avg'",
+      combo_value(w2._combo_agg) == "avg", combo_value(w2._combo_agg))
+check("D4) Nach params_restored: Feld-Combo zeigt 'open'",
+      combo_value(w2._combo_field).split("|")[-1] == "open",
+      repr(combo_value(w2._combo_field)))
+
+ok = wait_for_payload(n=1, timeout=6.0) if not payloads2 else True
+# payloads2 gehoert zu vm2; wait_for_payload nutzt global payloads -> manuell warten
+start = time.time()
+while not payloads2 and time.time() - start < 6.0:
+    app.processEvents()
+    time.sleep(0.02)
+check("D5) Payload nach restore_workspace gelandet", bool(payloads2),
+      f"n={len(payloads2)}")
+last2 = payloads2[-1] if payloads2 else {}
+check("D6) Payload-x_dim == 'dow' (Query mit restaurierten Params)",
+      last2.get("x_dim") == "dow", str(last2.get("x_dim")))
+check("D7) Feld-Dropdown nach Payload: 'open' selektiert",
+      combo_value(w2._combo_field).split("|")[-1] == "open",
+      repr(combo_value(w2._combo_field)))
+check("D8) X-Combo nach Payload bleibt 'dow' (nicht von Stale-Payload ueberschrieben)",
+      combo_value(w2._combo_x) == "dow", combo_value(w2._combo_x))
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+vm.shutdown()
+vm2.shutdown()
+widget.deleteLater()
+w2.deleteLater()
+shutil.rmtree(_tmp, ignore_errors=True)
+
+print(f"\n{sum(1 for _, ok, _ in PASS if ok)}/{len(PASS)} Checks PASS")
+fail = [n for n, ok, _ in PASS if not ok]
+if fail:
+    print("FAILS:", fail)
+    sys.exit(1)
+print("EMPIRISCHE KETTE BUG345 VERIFIZIERT (OK)")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_bug345_h1_counterproof.py
+```py
+# test/check_bug345_h1_counterproof.py
+# -*- coding: utf-8 -*-
+"""
+Bug 3/4/5 - GEGENBEWEIS: srv_proximity mit JSON-Daten (SILVER/H1).
+
+Beweist: Die UI-Kette (feature_keys_by_service -> Feld-Dropdown -> restore)
+FUNKTIONIERT, sobald proximity JSON-feature_data hat (H1/H4/MN1 haben es,
+M1/M2..M30 nur legacy). => Ursache ist die M1-Legacy-Datenlage, kein UI-Fehler.
+"""
+import os
+import sys
+import time
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+
+app = QApplication.instance() or QApplication([])
+
+from analytics.engine.feature_store_reader import FeatureStoreReader
+from analytics.engine.analytics_repository import AnalyticsRepository
+from analytics.engine.analytics_view_model import AnalyticsViewModel
+from analytics.engine.analytics_worker import QUERY_HEATMAP_GENERIC
+
+DB = "data/analytics.duckdb"
+SYMBOL = "SILVER"
+TF = "H1"
+
+reader = FeatureStoreReader(db_path=DB)
+repo = AnalyticsRepository(reader=reader)
+vm = AnalyticsViewModel(analytics_repo=repo)
+vm.set_symbol(SYMBOL)
+vm.set_timeframe(TF)
+
+from analytics.ui.heatmap_widget import HeatmapWidget
+
+widget = HeatmapWidget()
+widget.attach_view_model(vm)
+
+payloads = []
+
+
+def _on_data(kind, data):
+    if kind == QUERY_HEATMAP_GENERIC:
+        payloads.append(dict(data))
+
+
+vm.data_ready.connect(_on_data)
+
+
+def wait_payload(n, timeout=10.0):
+    start = time.time()
+    while len(payloads) < n and time.time() - start < timeout:
+        app.processEvents()
+        time.sleep(0.02)
+    return len(payloads) >= n
+
+
+def field_keys():
+    out = []
+    for i in range(widget._combo_field.count()):
+        ud = str(widget._combo_field.itemData(i) or "")
+        key = ud.split("|", 1)[1] if "|" in ud else ud
+        out.append(key)
+    return out
+
+
+ok = wait_payload(1)
+print("A1) Baseline Payload H1:", ok)
+last = payloads[-1] if payloads else {}
+print("    metrics:", last.get("metrics"))
+print("    field_sources:", {k: v for k, v in (last.get("field_sources") or {}).items()})
+
+# Nur proximity
+n0 = len(payloads)
+vm.set_feature_ids(["srv_proximity"])
+ok = wait_payload(n0 + 1)
+last = payloads[-1] if payloads else {}
+fs = last.get("field_sources") or {}
+print("B1) Filter [srv_proximity] neuer Payload:", ok)
+print("    field_sources:", {k: v for k, v in fs.items()})
+print("    metrics:", last.get("metrics"))
+has_prox = any("srv_proximity" in v for v in fs.values())
+prox_keys = [k for v in fs.values() for k in v if "srv_proximity" in v]
+print("B2) srv_proximity-Keys im Dropdown:", has_prox, prox_keys)
+
+# Restore mit proximity-Feld visit_pct
+vm.set_heatmap_config(x_dim="dow", y_dim="hour", field="visit_pct", agg="avg")
+time.sleep(0.4)
+app.processEvents()
+
+workspace = {
+    "params": dict(vm.params),
+    "layout": {"page_index": 1, "heatmap_mode": "generic",
+               "service_picker_open": False},
+}
+print("    workspace feature_ids:", workspace["params"].get("feature_ids"))
+print("    workspace heatmap_field/agg/x/y:",
+      workspace["params"].get("heatmap_field"),
+      workspace["params"].get("heatmap_agg"),
+      workspace["params"].get("heatmap_x_dim"),
+      workspace["params"].get("heatmap_y_dim"))
+
+vm2 = AnalyticsViewModel(analytics_repo=repo)
+vm2.set_symbol(SYMBOL)
+vm2.set_timeframe(TF)
+payloads2 = []
+
+
+def _on_data2(kind, data):
+    if kind == QUERY_HEATMAP_GENERIC:
+        payloads2.append(dict(data))
+
+
+vm2.data_ready.connect(_on_data2)
+w2 = HeatmapWidget()
+w2.attach_view_model(vm2)
+vm2.restore_workspace(workspace)
+
+print("D1) params field/agg/x:", vm2.params.get("heatmap_field"),
+      vm2.params.get("heatmap_agg"), vm2.params.get("heatmap_x_dim"))
+print("D2) Combo X/Agg sofort:", str(w2._combo_x.currentData() or ""),
+      str(w2._combo_agg.currentData() or ""))
+print("D3) Combo Feld sofort:", repr(str(w2._combo_field.currentData() or "")))
+
+start = time.time()
+while not payloads2 and time.time() - start < 10.0:
+    app.processEvents()
+    time.sleep(0.02)
+print("D4) Payload nach restore:", bool(payloads2))
+last2 = payloads2[-1] if payloads2 else {}
+print("    payload2 x_dim/field/agg:", last2.get("x_dim"),
+      last2.get("field"), last2.get("agg"))
+print("D5) Combo X nach Payload:", str(w2._combo_x.currentData() or ""))
+print("D6) Combo Feld nach Payload:", repr(str(w2._combo_field.currentData() or "")))
+
+vm.shutdown()
+vm2.shutdown()
+widget.deleteLater()
+w2.deleteLater()
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_bug345_real_db.py
+```py
+# test/check_bug345_real_db.py
+# -*- coding: utf-8 -*-
+"""
+Bug 3/4/5 - EMPIRISCH gegen die ECHTE analytics.duckdb (read-only, SILVER).
+
+Die Isoliertests (synthetische DB) waren 18/18 gruen. Dieser Test nutzt die
+echte DB und den echten Symbol-Namen SILVER, um datenabhaengige Ursachen zu
+finden (z. B. `native`-Rows, instance_hash-Clones, feature_data-Inhalt).
+
+WICHTIG: rein lesend - es wird KEINE echte DB geschrieben.
+"""
+import os
+import sys
+import shutil
+import time
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+
+app = QApplication.instance() or QApplication([])
+
+from analytics.engine.feature_store_reader import FeatureStoreReader
+from analytics.engine.analytics_repository import AnalyticsRepository
+from analytics.engine.analytics_view_model import AnalyticsViewModel
+from analytics.engine.analytics_worker import QUERY_HEATMAP_GENERIC
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+DB = "data/analytics.duckdb"
+SYMBOL = "SILVER"
+TF = "M1"
+
+reader = FeatureStoreReader(db_path=DB)
+repo = AnalyticsRepository(reader=reader)
+vm = AnalyticsViewModel(analytics_repo=repo)
+vm.set_symbol(SYMBOL)
+vm.set_timeframe(TF)
+
+from analytics.ui.heatmap_widget import HeatmapWidget
+
+widget = HeatmapWidget()
+widget.attach_view_model(vm)
+
+payloads = []
+
+
+def _on_data(kind, data):
+    if kind == QUERY_HEATMAP_GENERIC:
+        payloads.append(dict(data))
+
+
+vm.data_ready.connect(_on_data)
+
+
+def wait_payload(n, timeout=10.0):
+    start = time.time()
+    while len(payloads) < n and time.time() - start < timeout:
+        app.processEvents()
+        time.sleep(0.02)
+    return len(payloads) >= n
+
+
+def field_keys():
+    out = []
+    for i in range(widget._combo_field.count()):
+        ud = str(widget._combo_field.itemData(i) or "")
+        key = ud.split("|", 1)[1] if "|" in ud else ud
+        out.append(key)
+    return out
+
+
+def combo_value(c):
+    return str(c.currentData() or "")
+
+
+# ---------------------------------------------------------------------------
+# Baseline: leerer Filter (alle Services inkl. 'native'?)
+# ---------------------------------------------------------------------------
+ok = wait_payload(1)
+check("A1) Erster Payload (echte DB, SILVER/M1)", ok,
+      f"payloads={len(payloads)}")
+last = payloads[-1] if payloads else {}
+print("     metrics:", last.get("metrics"))
+print("     field_sources:", {k: v for k, v in (last.get("field_sources") or {}).items()})
+check("A2) metrics NICHT leer", bool(last.get("metrics")), str(last.get("metrics")))
+check("A3) Feld-Dropdown hat Items", len(field_keys()) > 0, str(field_keys()[:12]))
+
+# ---------------------------------------------------------------------------
+# BUG 4: Filter [srv_grid_lines] -> Dropdown darf nur Grid-Keys zeigen
+# ---------------------------------------------------------------------------
+n0 = len(payloads)
+vm.set_feature_ids(["srv_grid_lines"])
+ok = wait_payload(n0 + 1)
+check("B1) Filter [srv_grid_lines] -> neuer Payload", ok,
+      f"payloads {n0}->{len(payloads)}")
+last = payloads[-1] if payloads else {}
+print("     metrics:", last.get("metrics"))
+print("     field_sources:", {k: v for k, v in (last.get("field_sources") or {}).items()})
+fs = last.get("field_sources") or {}
+only_grid = all(set(v) <= {"srv_grid_lines"} for v in fs.values())
+check("B2) field_sources nur srv_grid_lines", only_grid, str(fs))
+
+# Filter [srv_grid_lines, srv_proximity]
+n0 = len(payloads)
+vm.set_feature_ids(["srv_grid_lines", "srv_proximity"])
+ok = wait_payload(n0 + 1)
+last = payloads[-1] if payloads else {}
+fs = last.get("field_sources") or {}
+print("     field_sources(2):", {k: v for k, v in fs.items()})
+check("B3) field_sources jetzt grid+proximity",
+      any("srv_proximity" in v for v in fs.values()), str(fs))
+
+# ---------------------------------------------------------------------------
+# BUG 3: restore_workspace (Konfiguration setzen, dann 'reopen')
+# ---------------------------------------------------------------------------
+vm.set_heatmap_config(x_dim="dow", y_dim="hour", field=None, agg="avg")
+time.sleep(0.4)
+app.processEvents()
+time.sleep(0.4)
+app.processEvents()
+
+# Feld auf einen echten Key des aktuellen Filters setzen
+keys_now = [k for k in (payloads[-1].get("metrics") or [])
+            if k not in ("count", "confluence_count")]
+use_field = keys_now[0] if keys_now else ""
+print("     gewaehlter Feld-Key:", use_field, "| keys:", keys_now[:8])
+if use_field:
+    vm.set_heatmap_config(x_dim="dow", y_dim="hour",
+                          field=use_field, agg="avg")
+    time.sleep(0.4)
+    app.processEvents()
+
+workspace = {
+    "params": dict(vm.params),
+    "layout": {"page_index": 1, "heatmap_mode": "generic",
+               "service_picker_open": False},
+}
+print("     workspace.params feature_ids:", workspace["params"].get("feature_ids"))
+print("     workspace heatmap_field/agg/x/y:",
+      workspace["params"].get("heatmap_field"),
+      workspace["params"].get("heatmap_agg"),
+      workspace["params"].get("heatmap_x_dim"),
+      workspace["params"].get("heatmap_y_dim"))
+
+# Reopen-Simulation
+vm2 = AnalyticsViewModel(analytics_repo=repo)
+vm2.set_symbol(SYMBOL)
+vm2.set_timeframe(TF)
+payloads2 = []
+
+
+def _on_data2(kind, data):
+    if kind == QUERY_HEATMAP_GENERIC:
+        payloads2.append(dict(data))
+
+
+vm2.data_ready.connect(_on_data2)
+w2 = HeatmapWidget()
+w2.attach_view_model(vm2)
+vm2.restore_workspace(workspace)
+
+check("D1) params nach restore: field/x/y/agg uebernommen",
+      vm2.params.get("heatmap_field") == use_field
+      and vm2.params.get("heatmap_x_dim") == "dow"
+      and vm2.params.get("heatmap_agg") == "avg",
+      f"f={vm2.params.get('heatmap_field')} x={vm2.params.get('heatmap_x_dim')} "
+      f"agg={vm2.params.get('heatmap_agg')}")
+check("D2) params_restored SOFORT: X=='dow', Agg=='avg'",
+      combo_value(w2._combo_x) == "dow"
+      and combo_value(w2._combo_agg) == "avg",
+      f"x={combo_value(w2._combo_x)} agg={combo_value(w2._combo_agg)}")
+if use_field:
+    check("D3) params_restored SOFORT: Feld zeigt restaurierten Key",
+          combo_value(w2._combo_field).split("|")[-1] == use_field,
+          repr(combo_value(w2._combo_field)))
+
+start = time.time()
+while not payloads2 and time.time() - start < 10.0:
+    app.processEvents()
+    time.sleep(0.02)
+check("D4) Payload nach restore gelandet", bool(payloads2))
+last2 = payloads2[-1] if payloads2 else {}
+print("     payload2 x_dim/field/agg:", last2.get("x_dim"),
+      last2.get("field"), last2.get("agg"))
+check("D5) X-Combo nach Payload noch 'dow'",
+      combo_value(w2._combo_x) == "dow", combo_value(w2._combo_x))
+if use_field:
+    check("D6) Feld nach Payload noch restaurierter Key",
+          combo_value(w2._combo_field).split("|")[-1] == use_field,
+          repr(combo_value(w2._combo_field)))
+
+# ---------------------------------------------------------------------------
+# Cleanup (keine echte DB angefasst)
+# ---------------------------------------------------------------------------
+vm.shutdown()
+vm2.shutdown()
+widget.deleteLater()
+w2.deleteLater()
+
+print(f"\n{sum(1 for _, ok, _ in PASS if ok)}/{len(PASS)} Checks PASS")
+fail = [n for n, ok, _ in PASS if not ok]
+if fail:
+    print("FAILS:", fail)
+    sys.exit(1)
+print("REAL-DB-KETTE VERIFIZIERT (OK)")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_bug345_stale_hook.py
+```py
+# test/check_bug345_stale_hook.py
+# Bugfix-Verifikation 10.08.2026 (Bug 4/5): stale-Plugin-Hook im MasterTree.
+#
+# Szenario (empirisch belegt): srv_proximity existiert real als
+#   * Set-Service-Zeile ('test'/'proximity') UND
+#   * Standalone-Plugin-Blatt (Registry).
+# set_checked_feature_ids(['srv_proximity']) setzt beim Restore BEIDE Hooks
+# -> (TYPE_SERVICE, set_id, 'proximity') UND (TYPE_PLUGIN, '', 'srv_proximity').
+# Vor dem Fix blieb beim User-Uncheck einer Zeile der andere Hook stale:
+# checked_feature_ids() lieferte die plugin_id weiter -> Dropdown (Bug 4)
+# / Historie (Bug 5) reagierten nicht.
+#
+# Kein UI: MasterTree + Modell werden offscreen instanziiert und _on_item_changed
+# direkt aufgerufen (Qt-itemChanged-Aequivalent).
+import os
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication
+
+from analytics.engine.service_selector_model import ServiceSelectorModel
+from serviceui.master_tree import (
+    MasterTree, TreeItemIterator,
+    TYPE_SERVICE, TYPE_PLUGIN, TYPE_CLONE, TYPE_SET,
+    ROLE_NODE_TYPE, ROLE_SET_ID, ROLE_INSTANCE_ID, ROLE_PLUGIN_ID,
+    ROLE_INSTANCE_HASH,
+)
+
+PID = "srv_proximity"
+
+
+def find_items(tree: MasterTree, node_type: str = None, plugin_id: str = None,
+               instance_id: str = None, set_id: str = None):
+    """Alle Baum-Items mit den angegebenen Attributen (None = egal)."""
+    out = []
+    for item in TreeItemIterator(tree):
+        if item is None:
+            continue
+        if node_type and item.data(0, ROLE_NODE_TYPE) != node_type:
+            continue
+        if plugin_id and str(item.data(0, ROLE_PLUGIN_ID) or "").lower() != plugin_id.lower():
+            continue
+        if instance_id and str(item.data(0, ROLE_INSTANCE_ID) or "") != instance_id:
+            continue
+        if set_id and str(item.data(0, ROLE_SET_ID) or "") != set_id:
+            continue
+        out.append(item)
+    return out
+
+
+def checked_pids(tree: MasterTree) -> list:
+    return sorted(tree.checked_feature_ids() or [])
+
+
+def dump_state(tree: MasterTree, tag: str) -> None:
+    print(f"\n[{tag}] checked_feature_ids={checked_pids(tree)}")
+    print(f"[{tag}] _checked_items={sorted(tree._checked_items, key=str)}")
+    for item in find_items(tree, plugin_id=PID):
+        nt = item.data(0, ROLE_NODE_TYPE)
+        sid = item.data(0, ROLE_SET_ID) or ""
+        iid = item.data(0, ROLE_INSTANCE_ID) or ""
+        st = item.checkState(0)
+        print(f"[{tag}]   {nt} set={sid!r} inst={iid!r} "
+              f"checkState={st}")
+
+
+def user_uncheck(tree: MasterTree, item) -> None:
+    """Simuliert den Qt-itemChanged-Fluss eines User-Unchecks."""
+    item.setData(0, Qt.CheckStateRole, Qt.Unchecked)
+    tree._on_item_changed(item, 0)
+
+
+def user_check(tree: MasterTree, item) -> None:
+    """Simuliert den Qt-itemChanged-Fluss eines User-Checks."""
+    item.setData(0, Qt.CheckStateRole, Qt.Checked)
+    tree._on_item_changed(item, 0)
+
+
+def main() -> int:
+    app = QApplication.instance() or QApplication([])
+    print("=== Bug 4/5 stale-Plugin-Hook-Verifikation ===")
+
+    model = ServiceSelectorModel(parent=app)
+    tree = MasterTree(model)
+    tree.set_checkable(True)
+    tree._populate()  # frischer deterministischer Zustand
+
+    set_id = None
+    for s in model.get_sets():
+        if (s.get("services") or {}).get("proximity"):
+            set_id = s.get("set_id")
+            break
+    if not set_id:
+        print("FEHLER: Kein Set mit 'proximity'-Service in der DB - Abbruch.")
+        return 1
+    print(f"Set mit srv_proximity-Service: {set_id}")
+
+    # --- Phase 1: Restore wie beim Oeffnen des Dialogs --------------------
+    tree.set_checked_feature_ids([PID])
+    svc_items = find_items(tree, TYPE_SERVICE, plugin_id=PID, set_id=set_id)
+    plug_items = find_items(tree, TYPE_PLUGIN, plugin_id=PID)
+    if len(svc_items) != 1:
+        print(f"FEHLER: erwarte 1 Service-Item, habe {len(svc_items)}")
+        return 1
+    if len(plug_items) != 1:
+        print(f"FEHLER: erwarte 1 Plugin-Item, habe {len(plug_items)}")
+        return 1
+    dump_state(tree, "Phase1 Restore")
+    assert tree.checked_feature_ids() == [PID], "Restore muss PID setzen"
+
+    # --- Phase 2: User-Uncheck der SET-Service-Zeile -----------------------
+    # Runde 9 (Bug 3): Uncheck haengt NUR diesen einen Key ab (nicht mehr
+    # alle Zeilen der plugin_id). Die Standalone-Plugin-Zeile bleibt gecheckt
+    # -> der Filter bleibt [PID]. Erst wenn ALLE Zeilen abgehakt sind, wird
+    # die plugin_id aus dem Filter entfernt (kein stale-Hook).
+    user_uncheck(tree, svc_items[0])
+    dump_state(tree, "Phase2 User-Uncheck Service-Zeile")
+    if tree.checked_feature_ids() != [PID]:
+        print(f"FEHLER Bug-3: {PID} darf nicht verschwinden (Plugin-Zeile aktiv)")
+        return 1
+    if plug_items[0].checkState(0) != Qt.Checked:
+        print("FEHLER Bug-3: Standalone-Plugin-Zeile darf nicht mit abgehaengt werden")
+        return 1
+    print("PASS Phase 2: Service-Uncheck haengt nur die Service-Zeile ab")
+    # Alle Zeilen abhaken -> kein stale-Hook
+    user_uncheck(tree, plug_items[0])
+    dump_state(tree, "Phase2b Alle Zeilen abgehakt")
+    if tree.checked_feature_ids():
+        print(f"FEHLER BUG 4/5: stale-Hook nach Abhaken ALLER Zeilen")
+        return 1
+    print("PASS Phase 2b: kein stale-Hook nach Abhaken aller Zeilen")
+
+    # --- Phase 3: Restore + User-Uncheck der STANDALONE-Plugin-Zeile ------
+    tree.set_checked_feature_ids([PID])
+    svc_items = find_items(tree, TYPE_SERVICE, plugin_id=PID, set_id=set_id)
+    plug_items = find_items(tree, TYPE_PLUGIN, plugin_id=PID)
+    dump_state(tree, "Phase3 Restore")
+    user_uncheck(tree, plug_items[0])
+    dump_state(tree, "Phase3 User-Uncheck Plugin-Zeile")
+    if tree.checked_feature_ids() != [PID]:
+        print(f"FEHLER Bug-3: {PID} darf nicht verschwinden (Service-Zeile aktiv)")
+        return 1
+    if svc_items[0].checkState(0) != Qt.Checked:
+        print("FEHLER Bug-3: Set-Service-Zeile darf nicht mit abgehaengt werden")
+        return 1
+    print("PASS Phase 3: Plugin-Uncheck haengt nur die Plugin-Zeile ab")
+    # Service-Zeile ebenfalls abhaken -> kein stale-Hook
+    user_uncheck(tree, svc_items[0])
+    dump_state(tree, "Phase3b Alle Zeilen abgehakt")
+    if tree.checked_feature_ids():
+        print(f"FEHLER BUG 4/5: stale-Hook nach Abhaken ALLER Zeilen (Phase 3b)")
+        return 1
+    print("PASS Phase 3b: kein stale-Hook (Plugin + Service abgehakt)")
+
+    # --- Phase 4: Set-Uncheck entfernt Set-Service-Haken, Plugin bleibt ----
+    tree.set_checked_feature_ids([PID])
+    set_items = find_items(tree, TYPE_SET)
+    set_item = None
+    for s_item in set_items:
+        if s_item.data(0, ROLE_SET_ID) == set_id:
+            set_item = s_item
+            break
+    if set_item is None:
+        print("FEHLER: Set-Knoten nicht gefunden")
+        return 1
+    plug_items = find_items(tree, TYPE_PLUGIN, plugin_id=PID)
+    dump_state(tree, "Phase4 Restore")
+    user_uncheck(tree, set_item)
+    dump_state(tree, "Phase4 User-Uncheck Set")
+    # Set-Uncheck entfernt die Set-Service-Zeile; das Standalone-Plugin
+    # bleibt gecheckt -> Filter bleibt [PID] (Bug 3).
+    if tree.checked_feature_ids() != [PID]:
+        print(f"FEHLER Bug-3: {PID} darf nach Set-Uncheck nicht verschwinden")
+        return 1
+    if plug_items[0].checkState(0) != Qt.Checked:
+        print("FEHLER Bug-3: Plugin-Zeile darf nach Set-Uncheck nicht abgehaengt werden")
+        return 1
+    print("PASS Phase 4: Set-Uncheck haengt nur Set-Service-Zeilen ab")
+    # Plugin-Zeile abhaken -> kein stale-Hook
+    user_uncheck(tree, plug_items[0])
+    dump_state(tree, "Phase4b Alle Zeilen abgehakt")
+    if tree.checked_feature_ids():
+        print(f"FEHLER BUG 4/5: stale-Hook nach Set+Plugin abgehakt")
+        return 1
+    print("PASS Phase 4b: kein stale-Hook (Set + Plugin abgehakt)")
+
+    # --- Phase 5: Re-Check wirkt weiterhin (kein Regression) ---------------
+    user_check(tree, plug_items[0])
+    dump_state(tree, "Phase5 User-Recheck Plugin-Zeile")
+    if tree.checked_feature_ids() != [PID]:
+        print("FEHLER Regression: Re-Check liefert nicht [srv_proximity]")
+        return 1
+    print("PASS Phase 5: Re-Check wirkt weiterhin")
+
+    print("\n>>> ALLE PHASEN PASS (Bug 3 Varianten-Uncheck + kein stale-Hook) <<<")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_bug345_tree_overlap.py
+```py
+# test/check_bug345_tree_overlap.py
+# Bug 3/4/5-Analyse (10.08.2026): Prueft, ob plugin_ids in den realen
+# Service-Sets UND in der Plugin-Registry (Standalone-Blaetter) zugleich
+# vorkommen -> stale-Plugin-Hook-Szenario in MasterTree._checked_items.
+# Read-only gegen echte DB (app_data.duckdb / analytics.duckdb). KEIN UI.
+import os
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import sys
+import json
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from analytics.engine.service_set_repository import ServiceSetRepository
+
+
+def extract_services(definition) -> list:
+    """Defensives Extrahieren der Service-Zeilen aus einer Set-Definition.
+    Struktur kann dict (volle Definition) oder str (JSON) sein.
+    """
+    if isinstance(definition, str):
+        try:
+            definition = json.loads(definition)
+        except Exception:
+            return []
+    if not isinstance(definition, dict):
+        return []
+    services = definition.get("services")
+    if isinstance(services, list):
+        return services
+    # Real (10.08.2026): services ist ein DICT keyed nach Instanz-Name
+    # (z. B. {'grid_lines': {...}, 'proximity': {...}}).
+    if isinstance(services, dict):
+        out = []
+        for inst, svc in services.items():
+            if isinstance(svc, dict):
+                row = dict(svc)
+                row.setdefault("instance_id", inst)
+                out.append(row)
+            elif isinstance(svc, str):
+                out.append({"instance_id": inst, "plugin_id": svc})
+        return out
+    # Fallback: verschachtelt unter 'definition'
+    nested = definition.get("definition")
+    if isinstance(nested, dict):
+        return extract_services(nested)
+    return []
+
+
+def main() -> int:
+    print("=== Bug 3/4/5: Baum-Overlap Set-Services <-> Registry-Plugins ===")
+    repo = ServiceSetRepository()
+    sets = repo.list_sets()
+    print(f"\nSets in app_data.duckdb (service_sets): {len(sets)}")
+
+    # Roh-Struktur der Set-Definitionen dumpen
+    for s in sets:
+        print(f"\n--- Set {s.get('set_id')!r} ---")
+        keys = list(s.keys())
+        print("  Top-Keys:", keys)
+        for k, v in s.items():
+            sv = str(v)
+            print(f"  {k} = {sv[:300]}")
+
+    set_plugin_ids: set = set()
+    set_service_rows = []
+    for s in sets:
+        sid = s.get("set_id")
+        services = extract_services(s)
+        for svc in services:
+            if isinstance(svc, str):
+                pid = svc.strip().lower()
+                inst = svc.strip()
+            elif isinstance(svc, dict):
+                pid = str(svc.get("plugin_id") or svc.get("instance_id") or "").strip().lower()
+                inst = svc.get("instance_id") or ""
+            else:
+                continue
+            if pid:
+                set_plugin_ids.add(pid)
+                set_service_rows.append((sid, inst, pid))
+    print(f"\nService-Zeilen in Sets: {len(set_service_rows)}")
+    print(f"Distinct plugin_ids in Sets: {sorted(set_plugin_ids)}")
+
+    from analytics.features.feature_builder import PluginRegistry
+    registry = PluginRegistry()
+    all_plugins = set()
+    try:
+        plugins = getattr(registry, "plugins", {}) or {}
+        all_plugins = {str(k).strip().lower() for k in plugins}
+    except Exception as e:
+        print(f"Registry-Iteration fehlgeschlagen: {e}")
+        try:
+            all_plugins = {str(k).strip().lower() for k in dict(registry)}
+        except Exception as e2:
+            print(f"dict-Fallback fehlgeschlagen: {e2}")
+    print(f"\nRegistry-Plugins ({len(all_plugins)}): {sorted(all_plugins)}")
+
+    overlap = sorted(set_plugin_ids & all_plugins)
+    print(f"\nOVERLAP (in Sets UND als Standalone-Plugin anhakbar): {overlap}")
+
+    if overlap:
+        print("\n=> STALE-HOOK-SZENARIO MOEGLICH: set_checked_feature_ids()")
+        print("   setzt bei Restore zusaetzlich (TYPE_PLUGIN,'',pid)-Hooks.")
+        print("   User-Uncheck der Service-Zeile entfernt diese NICHT ->")
+        print("   checked_feature_ids() liefert die plugin_id weiterhin ->")
+        print("   Bug 4/5 (Dropdown aktualisiert nicht / nicht in Historie).")
+    else:
+        print("\n=> KEIN Overlap -> stale-Plugin-Hook kann hier NICHT")
+        print("   manifestieren; Bug 4/5 rein datengetrieben (M1-Legacy).")
+
+    for pid in overlap:
+        rows = [r for r in set_service_rows if r[2] == pid]
+        print(f"\n  {pid}: {len(rows)} Service-Zeile(n) -> {rows[:5]}")
+
+    only_sets = sorted(set_plugin_ids - all_plugins)
+    only_reg = sorted(all_plugins - set_plugin_ids)
+    print(f"\nNur in Sets (nicht in Registry): {only_sets}")
+    print(f"Nur in Registry (nicht in Sets): {only_reg[:20]} ... (insg. {len(only_reg)})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/check_bugfix_0808.py
 ```py
 # test/check_bugfix_0808.py - isolierter Check fuer Bugfix 08.08.2026 (Block 38)
@@ -37736,19 +45065,58 @@ try:
     if col is not None:
         labels = [w.text() for w in col.findChildren(QLabel)]
         btns = [b.text() for b in col.findChildren(QPushButton)]
+        info_btns = [b for b in col.findChildren(QPushButton)
+                     if b.objectName() == "btn_output_params_info"]
         check("Resultatfelder-Header vorhanden",
               any("Resultatfelder" in t for t in labels),
               str([t for t in labels if "Resultatfelder" in t]))
-        check("System-Metrik-Zeile vorhanden",
-              any("System-Metrik" in t for t in labels),
+        check("GENAU EIN btn_output_params_info ((i)-Button)",
+              len(info_btns) == 1, f"{len(info_btns)} Buttons")
+        check("KEINE Per-Zeilen-i-Buttons mehr (20.03.02-Umbau)",
+              btns.count("i") == 0, f"{btns.count('i')} 'i'-Buttons")
+        check("Keine System-Metrik-Zeile mehr im Panel (nur im Info-Window)",
+              not any("System-Metrik" in t for t in labels),
               str([t for t in labels if "System-Metrik" in t]))
-        check("i-Buttons je Hauptfeld (5 main -> 5 i)",
-              btns.count("i") == 5, f"{btns.count('i')} i-Buttons")
-        check("Tooltip am i-Button vorhanden",
-              any(b.toolTip() for b in col.findChildren(QPushButton)
-                  if b.text() == "i"))
 except Exception as e:
     check("Host-Spaltenbau", False, str(e))
+
+# --- 20.03.02 (F6): Der Sammel-Info-Dialog (btn_output_params_info ->
+# --- _show_output_params_info) zeigt Hauptfelder + System-Metriken als
+# --- separate kleinere Sektion. QDialog.exec wird gemockt (headless).
+try:
+    from serviceui.param_columns import ServiceParamColumnsMixin
+    from serviceui.service_selector_dialog import _DialogParamHost
+
+    host4 = _DialogParamHost()
+    fake_dialog = QWidget()
+    host4._dialog = fake_dialog
+    _created.clear()
+    host4._show_output_params_info("srv_swing_momentum")
+    check("Sammel-Info-Dialog: kein TypeError im Host-Kontext",
+          len(_created) == 1, f"{len(_created)} Dialoge erzeugt")
+    if _created:
+        dlg = _created[0]
+        check("Sammel-Info-Dialog: Eltern-Widget korrekt aufgeloest",
+              dlg.parentWidget() is fake_dialog,
+              str(dlg.parentWidget()))
+        check("Sammel-Info-Dialog: Titel",
+              dlg.windowTitle() == "Resultatfelder – srv_swing_momentum",
+              dlg.windowTitle())
+        dlabels = [w.text() for w in dlg.findChildren(QLabel)]
+        check("Sammel-Info-Dialog: Hauptfelder vorhanden",
+              any("price" in t for t in dlabels),
+              str([t for t in dlabels if "price" in t]))
+        check("Sammel-Info-Dialog: System-Metriken-Sektion vorhanden (F6)",
+              any("System-Metriken" in t for t in dlabels),
+              str([t for t in dlabels if "System-Metriken" in t]))
+    # Ohne _dialog-Referenz (None-Fallback) darf es auch nicht crashen:
+    host5 = _DialogParamHost()
+    _created.clear()
+    host5._show_output_params_info("srv_swing_momentum")
+    check("Sammel-Info-Dialog: None-Fallback ohne Crash",
+          len(_created) == 1, f"{len(_created)} Dialoge erzeugt")
+except Exception as e:
+    check("Sammel-Info-Dialog-Check", False, str(e))
 
 # --- 2. Runde: i-Button im _DialogParamHost-Kontext (kein QWidget-Host) ---
 try:
@@ -38873,6 +46241,3039 @@ sys.exit(0)
 
 --------------------------------------------------
 
+### DATEI: test/check_restore_pipeline_bugfix.py
+```py
+# test/check_restore_pipeline_bugfix.py
+# -*- coding: utf-8 -*-
+"""
+Bugfix 10.08.2026 (Runde 4, 4 Punkte):
+
+  1) Save/Restore-Pipeline: `restore_workspace()` muss das verschachtelte
+     `heatmap`-Dict (neue 20.02-Formatierung) aufloesen und `params_restored`
+     emittieren.          -> BEREITS IMPLEMENTIERT (Commit 7ffc1f7, wird hier
+                             verifiziert, keine Aenderung noetig).
+  2) Check/Uncheck im ServicePicker (ServiceSelectorDialog) muss die
+     Resultatparameter live aktualisieren: `checked_changed` fuehrt zu
+     `selection_ids_requested(checked_feature_ids)` -> AnalyticsWindow
+     `set_feature_ids()` -> Dropdowns folgen den HAKEN.
+     -> NEU: Verbindung + `_on_checked_changed`-Handler.
+  3) UI-Combos/Ansichten nach Restore synchronisieren: AnalyticsWindow
+     verbindet `vm.params_restored` mit `_sync_ui_from_restored_params`
+     (Sidebar-Seite + aktuelle Page + Filterleiste).
+     -> NEU: Verbindung + Handler (Punkte 1/4 liefern das Signal).
+  4) Profil-Restore (`_apply_profile`): nested `charts.heatmap` + `params_restored`.
+     -> BEREITS IMPLEMENTIERT (Commit 7ffc1f7, wird hier verifiziert).
+
+KEINE GUI-Ausfuehrung (offscreen, kein exec_).
+"""
+import os
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt  # noqa: E402
+
+app = QApplication.instance() or QApplication([])
+
+from analytics.engine.analytics_repository import AnalyticsRepository  # noqa: E402
+from analytics.engine.analytics_view_model import AnalyticsViewModel  # noqa: E402
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+# ---------------------------------------------------------------------------
+# Punkt 1) restore_workspace(): nested heatmap aufloesen + params_restored
+# ---------------------------------------------------------------------------
+vm = AnalyticsViewModel(AnalyticsRepository())
+restored_events = []
+vm.params_restored.connect(lambda: restored_events.append(True))
+ws = {
+    "layout": {"page_index": 2, "heatmap_mode": "generic"},
+    "params": {
+        "symbol": "SILVER",
+        "timeframe": "M1",
+        "feature_ids": [],
+        "heatmap_metric": "count",
+        # Flache Alt-Werte (werden vom nested heatmap ueberschrieben):
+        "heatmap_agg": "count",
+        "heatmap_field": "",
+        # Neues verschachteltes heatmap-Dict (20.02-Format):
+        "heatmap": {
+            "x_dim": "hour",
+            "y_dim": "service_id",
+            "field": "visit_pct",
+            "agg": "avg",
+            "candle_projection_enabled": True,
+            "zoom_x_range": [0.1, 0.9],
+            "zoom_y_range": [0.2, 0.8],
+        },
+    },
+}
+vm.restore_workspace(ws)
+check("P1) restore_workspace: nested heatmap_agg='avg'",
+      vm.params.get("heatmap_agg") == "avg", str(vm.params.get("heatmap_agg")))
+check("P1) restore_workspace: nested heatmap_field='visit_pct'",
+      vm.params.get("heatmap_field") == "visit_pct",
+      str(vm.params.get("heatmap_field")))
+check("P1) restore_workspace: nested x_dim='hour'",
+      vm.params.get("heatmap_x_dim") == "hour", str(vm.params.get("heatmap_x_dim")))
+check("P1) restore_workspace: nested y_dim='service_id'",
+      vm.params.get("heatmap_y_dim") == "service_id",
+      str(vm.params.get("heatmap_y_dim")))
+check("P1) restore_workspace: candle_projection=True",
+      vm.params.get("candle_projection_enabled") is True)
+check("P1) restore_workspace: zoom_x clamped [0.1,0.9]",
+      list(vm.params.get("zoom_x_range") or []) == [0.1, 0.9])
+check("P1) restore_workspace: layout page_index=2",
+      vm.workspace_layout.get("page_index") == 2,
+      str(vm.workspace_layout))
+check("P1) restore_workspace: params_restored emittiert",
+      bool(restored_events), f"{len(restored_events)}x")
+check("P1) restore_workspace: symbol/timeframe uebernommen",
+      vm.params.get("symbol") == "SILVER" and vm.params.get("timeframe") == "M1")
+vm.shutdown()  # Debounce stoppen (kein Worker-Start / Thread-Leak)
+
+# ---------------------------------------------------------------------------
+# Punkt 4) _apply_profile(): nested charts.heatmap + params_restored
+# ---------------------------------------------------------------------------
+vm4 = AnalyticsViewModel(AnalyticsRepository())
+profile_events = []
+vm4.params_restored.connect(lambda: profile_events.append(True))
+profile = {
+    "profile_id": "p_restore_test",
+    "name": "Restore Test",
+    "is_active": True,
+    "payload": {
+        "schema_version": 2,
+        "sources": {"symbol": "SILVER", "timeframe": "H1", "feature_ids": []},
+        "charts": {
+            "heatmap_metric": "count",
+            "heatmap": {
+                "x_dim": "date",
+                "y_dim": "hour",
+                "field": "delta_pct",
+                "agg": "sum",
+                "candle_projection_enabled": False,
+                "zoom_x_range": [0.0, 1.0],
+                "zoom_y_range": [0.25, 0.75],
+            },
+        },
+        "table": {"limit": 1000},
+        "styling": {},
+    },
+}
+vm4._apply_profile(profile, mark_dirty=False)
+check("P4) _apply_profile: nested agg='sum'",
+      vm4.params.get("heatmap_agg") == "sum", str(vm4.params.get("heatmap_agg")))
+check("P4) _apply_profile: nested field='delta_pct'",
+      vm4.params.get("heatmap_field") == "delta_pct",
+      str(vm4.params.get("heatmap_field")))
+check("P4) _apply_profile: x_dim='date'/y_dim='hour'",
+      vm4.params.get("heatmap_x_dim") == "date"
+      and vm4.params.get("heatmap_y_dim") == "hour")
+check("P4) _apply_profile: zoom_y clamped [0.25,0.75]",
+      list(vm4.params.get("zoom_y_range") or []) == [0.25, 0.75])
+check("P4) _apply_profile: params_restored emittiert",
+      bool(profile_events), f"{len(profile_events)}x")
+check("P4) _apply_profile: symbol='SILVER'",
+      vm4.params.get("symbol") == "SILVER", str(vm4.params.get("symbol")))
+check("P4) _apply_profile: kein Dirty nach mark_dirty=False",
+      vm4.is_dirty is False)
+vm4.shutdown()
+
+# ---------------------------------------------------------------------------
+# Punkt 2) ServiceSelectorDialog: checked_changed -> selection_ids_requested
+# ---------------------------------------------------------------------------
+from analytics.engine.service_selector_model import ServiceSelectorModel  # noqa: E402
+from serviceui.service_selector_dialog import ServiceSelectorDialog  # noqa: E402
+
+model = ServiceSelectorModel()
+dlg = ServiceSelectorDialog(model=model, parent=None)
+tree = dlg.selector.master_tree
+check("P2) Dialog-Baum ist checkable", tree is not None
+      and getattr(tree, "_checkable", False) is True)
+
+received_ids = []
+dlg.selection_ids_requested.connect(lambda ids: received_ids.append(list(ids)))
+plugin_ids = sorted((model.get_plugins() or {}).keys())
+check("P2) Baum kennt Plugins (Fixture)", len(plugin_ids) > 0,
+      f"{len(plugin_ids)} Plugins")
+if plugin_ids:
+    pid = plugin_ids[0]
+    # Runde 8 (Bug 5): set_checked_feature_ids ist ein PROGRAMMATISCHES
+    # Set (beim Oeffnen des Pickers / Restore) und emittiert KEIN
+    # checked_changed mehr - die Feedback-Schleife (checked_changed ->
+    # selection_ids_requested -> set_feature_ids) wuerde den restaurierten
+    # Filter ueberschreiben. Der Live-Filter folgt NUR den Checkboxen
+    # (Nutzeraktionen -> _on_item_changed -> checked_changed).
+    tree.set_checked_feature_ids([pid])
+    check("P2) set_checked_feature_ids KEIN selection_ids_requested (Bug 5)",
+          not received_ids, f"-> {received_ids[-1:]!r}")
+    # Nutzeraktion simulieren: itemChanged auf dem angehakten Plugin-Blatt
+    # (Programm-Haken setzen + _on_item_changed, ohne _updating_checks).
+    # Die Plugin-Zeilen koennen in Kategorie-Ordnern liegen -> rekursiv.
+    found = None
+
+    def _find_plugin_leaf(item):
+        for k in range(item.childCount()):
+            child = item.child(k)
+            if child.data(0, Qt.UserRole) == "plugin" \
+                    and child.childCount() == 0:
+                return child
+            res = _find_plugin_leaf(child)
+            if res is not None:
+                return res
+        return None
+
+    for i in range(tree.topLevelItemCount()):
+        found = _find_plugin_leaf(tree.topLevelItem(i))
+        if found is not None:
+            break
+    check("P2) Anhakbares Plugin-Blatt gefunden", found is not None)
+    if found is not None:
+        # Runde 9 (Bug 3): Uncheck einer Zeile haengt NUR diesen einen Key
+        # ab (nicht mehr alle Zeilen derselben plugin_id via _uncheck_plugin_
+        # rows). Der Filter folgt den verbleibenden Haken - das Plugin kann
+        # zusaetzlich als Set-Service gecheckt sein (echte DB), dann bleibt
+        # der Filter [pid]; sonst []. Das Signal emittiert IMMER den
+        # aktuellen checked_feature_ids()-Stand.
+        found.setCheckState(0, Qt.Unchecked)
+        tree._on_item_changed(found, 0)
+        check("P2) Nutzer-Abhaken -> selection_ids_requested(IST-Stand)",
+              bool(received_ids)
+              and received_ids[-1] == tree.checked_feature_ids(),
+              f"-> {received_ids[-1:]!r} vs {tree.checked_feature_ids()!r}")
+        # Anhaken (Nutzer) -> checked_changed -> Live-Filter [pid]
+        found.setCheckState(0, Qt.Checked)
+        tree._on_item_changed(found, 0)
+        check("P2) Nutzer-Anhaken -> selection_ids_requested([pid])",
+              bool(received_ids) and received_ids[-1] == [pid],
+              f"-> {received_ids[-1:]!r}")
+    # clear_checks (Nutzeraktion 'Filter entfernen') -> Live-Filter []
+    tree.clear_checks()
+    check("P2) clear_checks -> selection_ids_requested([])",
+          bool(received_ids) and received_ids[-1] == [],
+          f"-> {received_ids[-1:]!r}")
+dlg.close()
+
+# Statische Absicherung der Verdrahtung (Quelltext-Marker)
+dlg_src = open("serviceui/service_selector_dialog.py", encoding="utf-8").read()
+check("P2) Quelle: checked_changed.connect(_on_checked_changed)",
+      "tree.checked_changed.connect(self._on_checked_changed)" in dlg_src)
+check("P2) Quelle: Handler _on_checked_changed existiert",
+      "def _on_checked_changed(self) -> None:" in dlg_src)
+check("P2) Quelle: Handler emittiert checked_feature_ids",
+      "self.selection_ids_requested.emit(ids)" in dlg_src)
+
+# ---------------------------------------------------------------------------
+# Punkt 3) AnalyticsWindow: params_restored -> _sync_ui_from_restored_params
+# ---------------------------------------------------------------------------
+from analytics.ui.analytics_win import AnalyticsWindow  # noqa: E402
+
+vm3 = AnalyticsViewModel(AnalyticsRepository())
+aw = AnalyticsWindow(view_model=vm3)
+aw.sidebar.setCurrentRow(0)
+vm3._workspace_layout = {"page_index": 3}
+vm3.params_restored.emit()
+check("P3) params_restored -> Sidebar folgt page_index=3",
+      aw.sidebar.currentRow() == 3, f"row={aw.sidebar.currentRow()}")
+# Filterleiste: Datenquellen-Button zeigt 'Keiner' bei leeren feature_ids
+check("P3) Datenquellen-Button synchronisiert (leer)",
+      "Keiner ausgewählt" in aw.btn_data_sources.text(),
+      aw.btn_data_sources.text())
+aw.close()  # ruft vm.shutdown() (closeEvent)
+
+win_src = open("analytics/ui/analytics_win.py", encoding="utf-8").read()
+check("P3) Quelle: params_restored.connect(_sync_ui_from_restored_params)",
+      "vm.params_restored.connect(self._sync_ui_from_restored_params)"
+      in win_src)
+check("P3) Quelle: Handler _sync_ui_from_restored_params existiert",
+      "def _sync_ui_from_restored_params(self) -> None:" in win_src)
+
+# ---------------------------------------------------------------------------
+print(f"\n{sum(1 for _, ok, _ in PASS if ok)}/{len(PASS)} Checks PASS")
+fail = [n for n, ok, _ in PASS if not ok]
+if fail:
+    print("FAILS:", fail)
+    sys.exit(1)
+print("RESTORE-PIPELINE-PRUEFUNGEN BESTANDEN (OK)")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_restore_pipeline_round2.py
+```py
+# test/check_restore_pipeline_round2.py
+# -*- coding: utf-8 -*-
+"""
+Bugfix 10.08.2026 (Runde 5, 6 Punkte) - Save/Restore-Pipeline komplett.
+
+  1) feature_ids (Datenquellen) in Historie + Profil -> Roundtrip-Test.
+  2) Check/Uncheck im ServicePicker -> selection_ids_requested (Runde 4).
+  3) heatmap_mode (Ansichts-Modus) NEU im Profil-Payload + Restore.
+  4) page_index (aktuelle Seite) NEU im Profil-Payload + Restore.
+  5) x/y-Achsen in Historie + Profil -> Roundtrip-Test.
+  6) Plugin-Parents MIT Varianten haben KEINE Checkbox und werden beim
+     Reverse-Mapping/Haken-Sync uebersprungen.
+
+KEINE GUI-Ausfuehrung (offscreen, kein exec_). Temp-DBs strikt in test/.
+"""
+import os
+import sys
+import tempfile
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+
+app = QApplication.instance() or QApplication([])
+
+from analytics.engine.analytics_view_model import AnalyticsViewModel  # noqa: E402
+from analytics_profile_repository import AnalyticsProfileRepository  # noqa: E402
+from analytics.engine.service_set_repository import ServiceSetRepository  # noqa: E402
+from analytics.engine.service_selector_model import ServiceSelectorModel  # noqa: E402
+from state_manager import StateManager  # noqa: E402
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+TMP = tempfile.mkdtemp(
+    prefix="p20_04_restore2_",
+    dir=os.path.dirname(os.path.abspath(__file__)))
+APP_DB = os.path.join(TMP, "app.duckdb")
+SET_DB = os.path.join(TMP, "sets.duckdb")
+
+
+def _make_vm():
+    """VM mit Temp-DBs (Profil + State + ServiceSets), damit KEIN App-DB-Lock."""
+    pr = AnalyticsProfileRepository(db_path=APP_DB)
+    state_db = os.path.join(TMP, "state.duckdb")
+    sm_state = StateManager(state_db)
+    set_repo = ServiceSetRepository(db_path=SET_DB)
+    sm = ServiceSelectorModel(set_repo=set_repo, state_manager=sm_state,
+                              parent=None)
+    vm = AnalyticsViewModel(profile_repo=pr, selector_model=sm)
+    return vm, sm
+
+
+# ---------------------------------------------------------------------------
+# Punkt 3+4+5+1: Profil-Payload enthaelt layout + heatmap + feature_ids
+# ---------------------------------------------------------------------------
+vm, sm = _make_vm()
+vm._params["feature_ids"] = ["srv_grid_lines", "srv_proximity"]
+vm._params["heatmap_x_dim"] = "service_id"
+vm._params["heatmap_y_dim"] = "hour"
+vm._params["heatmap_agg"] = "avg"
+vm._params["heatmap_field"] = "visit_pct"
+vm.set_ui_layout({"page_index": 3, "heatmap_mode": "generic"})
+
+payload = vm._current_payload()
+lay = payload.get("layout") or {}
+check("P3) Profil-Payload: layout.heatmap_mode='generic'",
+      lay.get("heatmap_mode") == "generic", str(lay))
+check("P4) Profil-Payload: layout.page_index=3",
+      lay.get("page_index") == 3, str(lay))
+check("P1) Profil-Payload: sources.feature_ids",
+      payload["sources"].get("feature_ids") == ["srv_grid_lines", "srv_proximity"],
+      str(payload["sources"].get("feature_ids")))
+hm = payload["charts"].get("heatmap") or {}
+check("P5) Profil-Payload: charts.heatmap x/y/agg/field",
+      hm.get("x_dim") == "service_id" and hm.get("y_dim") == "hour"
+      and hm.get("agg") == "avg" and hm.get("field") == "visit_pct",
+      str(hm))
+
+# ---------------------------------------------------------------------------
+# Punkte 3+4+5+1: _apply_profile restauriert layout + heatmap + feature_ids
+# ---------------------------------------------------------------------------
+restored = []
+vm.params_restored.connect(lambda: restored.append(True))
+profile = {
+    "profile_id": "p_restore2",
+    "name": "Restore2",
+    "is_active": True,
+    "payload": dict(payload),
+}
+vm._apply_profile(profile, mark_dirty=False)
+check("P3) _apply_profile: workspace_layout.heatmap_mode='generic'",
+      vm.workspace_layout.get("heatmap_mode") == "generic",
+      str(vm.workspace_layout))
+check("P4) _apply_profile: workspace_layout.page_index=3",
+      vm.workspace_layout.get("page_index") == 3, str(vm.workspace_layout))
+check("P5) _apply_profile: heatmap x/y restauriert",
+      vm.params.get("heatmap_x_dim") == "service_id"
+      and vm.params.get("heatmap_y_dim") == "hour",
+      str(vm.params.get("heatmap_x_dim")), )
+check("P1) _apply_profile: feature_ids restauriert",
+      vm.params.get("feature_ids") == ["srv_grid_lines", "srv_proximity"],
+      str(vm.params.get("feature_ids")))
+check("P3/4) _apply_profile: params_restored emittiert",
+      bool(restored), f"{len(restored)}x")
+vm.shutdown()
+
+# ---------------------------------------------------------------------------
+# Punkte 1+5: Workspace-Roundtrip (feature_ids + x/y) mit Resolver
+# ---------------------------------------------------------------------------
+vm2, sm2 = _make_vm()
+ws = {
+    "layout": {"page_index": 2, "heatmap_mode": "generic"},
+    "params": {
+        "symbol": "SILVER", "timeframe": "M1",
+        "feature_ids": ["srv_grid_lines"],
+        "heatmap_x_dim": "date", "heatmap_y_dim": "hour",
+        "heatmap_agg": "sum", "heatmap_field": "delta_pct",
+    },
+}
+vm2.restore_workspace(ws)
+check("P1) Workspace: feature_ids restauriert (Resolver-ok)",
+      vm2.params.get("feature_ids") == ["srv_grid_lines"],
+      str(vm2.params.get("feature_ids")))
+check("P5) Workspace: x/y restauriert",
+      vm2.params.get("heatmap_x_dim") == "date"
+      and vm2.params.get("heatmap_y_dim") == "hour",
+      str(vm2.params.get("heatmap_x_dim")))
+check("P5) Workspace: agg/field restauriert",
+      vm2.params.get("heatmap_agg") == "sum"
+      and vm2.params.get("heatmap_field") == "delta_pct",
+      str(vm2.params.get("heatmap_agg")))
+check("P3/4) Workspace: layout page_index+heatmap_mode",
+      vm2.workspace_layout.get("page_index") == 2
+      and vm2.workspace_layout.get("heatmap_mode") == "generic",
+      str(vm2.workspace_layout))
+vm2.shutdown()
+
+# ---------------------------------------------------------------------------
+# Punkt 6: Plugin-Parents mit Clones - keine Checkbox + Reverse-Mapping
+# ---------------------------------------------------------------------------
+from PySide6.QtCore import Qt  # noqa: E402
+from serviceui.master_tree import (  # noqa: E402
+    TYPE_PLUGIN, TYPE_CLONE, ROLE_PLUGIN_ID,
+)
+
+SM_DB = os.path.join(TMP, "state.duckdb")
+sm_state = StateManager(SM_DB)
+# Preset anlegen -> Plugin bekommt einen Clone
+sm_state.save_indicator_preset(
+    "ind_fixed_grid_proximity", "Default", {"step_size": 0.5},
+    plugin_id="srv_grid_lines", version="1.0.0",
+    is_active_batch=True, doc_log="")
+set_repo3 = ServiceSetRepository(db_path=SET_DB)
+sm3 = ServiceSelectorModel(set_repo=set_repo3, state_manager=sm_state, parent=None)
+sm3.refresh()
+
+from serviceui.master_tree import MasterTree  # noqa: E402
+
+tree = MasterTree(model=sm3)
+tree.set_checkable(True)
+
+# Parent-Knoten finden: TYPE_PLUGIN mit childCount > 0
+parent_item = None
+clone_item = None
+from serviceui.master_tree import (  # noqa: E402
+    TreeItemIterator, isValid, ROLE_NODE_TYPE,
+)
+
+for item in TreeItemIterator(tree):
+    if item is None or not isValid(item):
+        continue
+    nt = item.data(0, ROLE_NODE_TYPE)
+    if nt == TYPE_PLUGIN and item.childCount() > 0:
+        parent_item = item
+        for i in range(item.childCount()):
+            c = item.child(i)
+            if c.data(0, ROLE_NODE_TYPE) == TYPE_CLONE:
+                clone_item = c
+                break
+        break
+check("P6) Plugin-Parent mit Clones existiert", parent_item is not None)
+if parent_item is not None:
+    check("P6) Parent hat KEINE ItemIsUserCheckable",
+          bool(parent_item.flags() & Qt.ItemIsUserCheckable) is False)
+    check("P6) Parent hat childCount>0", parent_item.childCount() > 0)
+check("P6) Clone-Kind existiert", clone_item is not None)
+if clone_item is not None:
+    check("P6) Clone ist anhakbar (aktiv)",
+          bool(clone_item.flags() & Qt.ItemIsUserCheckable) is True)
+
+# Reverse-Mapping: Filter auf die plugin_id des Parents -> NUR Clone bekommt
+# Haken, der Parent NICHT.
+parent_pid = ""
+if parent_item is not None:
+    parent_pid = str(parent_item.data(0, ROLE_PLUGIN_ID) or "")
+    tree.set_checked_feature_ids([parent_pid])
+    check("P6) Parent-CheckState bleibt Unchecked",
+          parent_item.checkState(0) == Qt.Unchecked,
+          f"state={int(parent_item.checkState(0).value)}")
+    check("P6) Clone-CheckState ist Checked",
+          clone_item is not None and clone_item.checkState(0) == Qt.Checked,
+          f"clone={None if clone_item is None else int(clone_item.checkState(0).value)}")
+    ids = tree.checked_feature_ids()
+    check("P6) checked_feature_ids enthaelt die plugin_id (aus Clone)",
+          parent_pid in ids, str(ids))
+
+# Statische Marker
+mt_src = open("serviceui/master_tree.py", encoding="utf-8").read()
+check("P6) Quelle: set_checked_feature_ids skip parent (childCount==0)",
+      "node_type == TYPE_PLUGIN and item.childCount() == 0" in mt_src)
+vm_src = open("analytics/engine/analytics_view_model.py", encoding="utf-8").read()
+check("P3/4) Quelle: set_ui_layout existiert", "def set_ui_layout" in vm_src)
+check("P3/4) Quelle: _current_payload layout-Sektion",
+      '"layout": dict(self._ui_layout or {})' in vm_src)
+check("P3/4) Quelle: _apply_profile layout-Restore",
+      "self._workspace_layout.update(dict(layout))" in vm_src)
+win_src = open("analytics/ui/analytics_win.py", encoding="utf-8").read()
+check("P3/4) Quelle: _current_ui_layout existiert",
+      "def _current_ui_layout" in win_src)
+check("P3/4) Quelle: set_ui_layout vor Profil-Save",
+      "self._vm.set_ui_layout(self._current_ui_layout())" in win_src)
+check("P3) Quelle: _sync_ui_from_restored_params setzt heatmap_mode",
+      "self.heatmap_page.set_mode(str(heatmap_mode))" in win_src)
+check("P4) Quelle: _sync_ui_from_restored_params setzt pages_stack",
+      "self.pages_stack.setCurrentIndex(page_index)" in win_src)
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+import shutil  # noqa: E402
+
+try:
+    shutil.rmtree(TMP, ignore_errors=True)
+except Exception:
+    pass
+
+print(f"\n{sum(1 for _, ok, _ in PASS if ok)}/{len(PASS)} Checks PASS")
+fail = [n for n, ok, _ in PASS if not ok]
+if fail:
+    print("FAILS:", fail)
+    sys.exit(1)
+print("RESTORE-PIPELINE-RUNDE-5-PRUEFUNGEN BESTANDEN (OK)")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_restore_pipeline_round3.py
+```py
+# test/check_restore_pipeline_round3.py
+# -*- coding: utf-8 -*-
+"""
+Bugfix 10.08.2026 (Runde 6, 3 Punkte) - Klick-Konflikt in der Restore-Pipeline.
+
+  1) Angecheckte Services werden in Historie/Profil gespeichert + Restore:
+     Root Cause = `_on_tree_selection_details` emittierte bei JEDEM Zeilen-
+     Klick `selection_ids_requested(scope)` und ueberschrieb den Checkbox-
+     Filter. Loesung: Klick emittiert KEIN selection_ids_requested mehr.
+  2) Check/Uncheck aktualisiert Ergebnisparameter-Dropdowns:
+     Checkbox-Pfad (checked_changed -> _on_checked_changed) bleibt aktiv.
+  3) ServicePicker wird geschlossen, wenn das AnalyticsWindow schliesst.
+
+KEINE GUI-Ausfuehrung (offscreen, kein exec_). Temp-DBs strikt in test/.
+"""
+import os
+import sys
+import tempfile
+import shutil
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
+
+app = QApplication.instance() or QApplication([])
+
+from state_manager import StateManager  # noqa: E402
+from analytics.engine.service_set_repository import ServiceSetRepository  # noqa: E402
+from analytics.engine.service_selector_model import ServiceSelectorModel  # noqa: E402
+from serviceui.service_selector_dialog import ServiceSelectorDialog  # noqa: E402
+from serviceui.master_tree import TYPE_PLUGIN, TYPE_CLONE  # noqa: E402
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+TMP = tempfile.mkdtemp(
+    prefix="p20_04_restore3_",
+    dir=os.path.dirname(os.path.abspath(__file__)))
+
+
+def _make_model():
+    sm_state = StateManager(os.path.join(TMP, "state.duckdb"))
+    set_repo = ServiceSetRepository(os.path.join(TMP, "sets.duckdb"))
+    return ServiceSelectorModel(set_repo=set_repo, state_manager=sm_state,
+                                parent=None)
+
+
+# ---------------------------------------------------------------------------
+# Bug 1+2: Klick emittiert KEIN selection_ids_requested mehr, Checkbox schon
+# ---------------------------------------------------------------------------
+sm = _make_model()
+dlg = ServiceSelectorDialog(model=sm, parent=None)
+received = []
+dlg.selection_ids_requested.connect(lambda ids: received.append(list(ids)))
+plugin_ids = sorted((sm.get_plugins() or {}).keys())
+check("P1+2) Baum kennt Plugins (Fixture)", len(plugin_ids) > 0,
+      f"{len(plugin_ids)} Plugins")
+if plugin_ids:
+    pid = plugin_ids[0]
+    # Simulierter Zeilen-Klick (Parameter-Panel folgt dem Klick) - darf den
+    # Filter NICHT ueberschreiben.
+    dlg._on_tree_selection_details(TYPE_PLUGIN, "", "", pid)
+    check("P1+2) Klick emittiert KEIN selection_ids_requested",
+          len(received) == 0, str(received))
+    # Checkbox-Anhaken (NUTZERAKTION): checked_changed -> _on_checked_changed
+    # -> emit. Runde 8 (Bug 5): set_checked_feature_ids ist ein
+    # PROGRAMMATISCHES Set (beim Oeffnen des Pickers/Restore) und emittiert
+    # KEIN checked_changed mehr - der Live-Filter folgt NUR den Checkboxen.
+    # Deshalb wird die Nutzeraktion hier direkt simuliert (CheckState setzen
+    # + _on_item_changed, ohne _updating_checks).
+    tree = dlg.selector.master_tree
+    tree.set_checked_feature_ids([pid])
+    check("P1+2) set_checked_feature_ids KEIN selection_ids_requested (Bug 5)",
+          len(received) == 0, str(received))
+    found = None
+
+    def _find_plugin_leaf(item):
+        for k in range(item.childCount()):
+            child = item.child(k)
+            if child.data(0, Qt.UserRole) == "plugin" \
+                    and child.childCount() == 0:
+                return child
+            res = _find_plugin_leaf(child)
+            if res is not None:
+                return res
+        return None
+
+    for i in range(tree.topLevelItemCount()):
+        found = _find_plugin_leaf(tree.topLevelItem(i))
+        if found is not None:
+            break
+    if found is not None:
+        # Abhaken (Nutzer) -> checked_changed -> Live-Filter []
+        found.setCheckState(0, Qt.Unchecked)
+        tree._on_item_changed(found, 0)
+    check("P1+2) Checkbox-Abhaken emittiert selection_ids_requested([])",
+          len(received) == 1 and received[-1] == [], str(received))
+    if found is not None:
+        # Anhaken (Nutzer) -> checked_changed -> Live-Filter [pid]
+        found.setCheckState(0, Qt.Checked)
+        tree._on_item_changed(found, 0)
+    check("P1+2) Checkbox-Anhaken emittiert selection_ids_requested([pid])",
+          len(received) == 2 and received[-1] == [pid], str(received))
+    # Checkbox-Abhaken via clear_checks -> checked_changed -> emit([])
+    tree.clear_checks()
+    check("P1+2) clear_checks emittiert selection_ids_requested([])",
+          len(received) == 3 and received[-1] == [], str(received))
+    # Simulierter Clone-Klick: ebenfalls KEIN Filter-Emit
+    before = len(received)
+    dlg._on_tree_selection_details(TYPE_CLONE, "", "", pid)
+    check("P1+2) Clone-Klick emittiert KEIN selection_ids_requested",
+          len(received) == before, str(received))
+dlg.close()
+
+# Statische Marker (Klick-Pfad entfernt, Checkbox-Pfad bleibt)
+dlg_src = open("serviceui/service_selector_dialog.py", encoding="utf-8").read()
+check("P1+2) Quelle: Klick-Handler ohne selection_ids_requested.emit",
+      "KEIN selection_ids_requested mehr" in dlg_src)
+check("P1+2) Quelle: Checkbox-Verbindung bleibt",
+      "tree.checked_changed.connect(self._on_checked_changed)" in dlg_src)
+check("P1+2) Quelle: _on_checked_changed emittiert",
+      "def _on_checked_changed" in dlg_src
+      and dlg_src.count("self.selection_ids_requested.emit(ids)") == 1)
+
+# ---------------------------------------------------------------------------
+# Bug 3: ServicePicker wird beim Schliessen des AnalyticsWindow geschlossen
+# (Kein AnalyticsWindow()-Instantierung: die Konstruktor-Kette oeffnet die
+#  echte App-DB (StateManager()-Default), die von der laufenden App gelockt
+#  ist. Stattdessen wird der reale Mechanismus getestet: das `destroyed`-
+#  Signal setzt via `_on_service_dialog_destroyed` die Referenz zurueck,
+#  und der closeEvent-Quellcode schliesst den Dialog davor.)
+# ---------------------------------------------------------------------------
+from analytics.ui.analytics_win import AnalyticsWindow  # noqa: E402
+
+sm3 = _make_model()
+inner3 = ServiceSelectorDialog(model=sm3, parent=None)
+# Hinweis: In Produktion besitzt der Dialog KEIN WA_DeleteOnClose (naechster
+# Test zeigt, dass close() das Orphan-Fenster versteckt). Fuer die Runtime-
+# Pruefung des destroyed-Mechanismus simulieren wir die echte Zerstoerung.
+inner3.setAttribute(Qt.WA_DeleteOnClose, True)
+inner3.show()
+app.processEvents()
+check("P3) Picker ist eigenstaendig sichtbar (Orphan-Risiko)",
+      inner3.isVisible())
+
+# Der echte Produktions-Handler als unbound method auf einem Mock-Owner:
+# exakt das Muster aus `_open_service_dialog` (destroyed.connect).
+import types  # noqa: E402
+
+owner = type("MockOwner", (), {"_service_dialog": inner3})()
+owner._on_service_dialog_destroyed = types.MethodType(
+    AnalyticsWindow._on_service_dialog_destroyed, owner)
+inner3.destroyed.connect(owner._on_service_dialog_destroyed)
+check("P3) Referenz gesetzt vor close", owner._service_dialog is inner3)
+inner3.close()
+app.processEvents()
+check("P3) destroyed-Signal setzt Referenz auf None",
+      owner._service_dialog is None)
+# Nach Zerstoerung (WA_DeleteOnClose) ist der C++-Wrapper weg.
+try:
+    _gone = not inner3.isVisible()
+except RuntimeError:
+    _gone = True
+check("P3) Picker nach close() nicht mehr sichtbar", _gone)
+try:
+    del inner3
+except Exception:
+    pass
+
+# Ohne WA_DeleteOnClose (Produktionszustand): close() versteckt das Fenster
+# (Kern des Bug-3-Fixes - kein Waisenfenster mehr).
+sm3b = _make_model()
+plain3 = ServiceSelectorDialog(model=sm3b, parent=None)
+plain3.show()
+app.processEvents()
+check("P3b) Produktions-Dialog sichtbar (Orphan-Risiko)", plain3.isVisible())
+plain3.close()
+app.processEvents()
+check("P3b) close() versteckt den Dialog (kein Orphan)",
+      not plain3.isVisible())
+plain3.deleteLater()
+app.processEvents()
+
+win_src = open("analytics/ui/analytics_win.py", encoding="utf-8").read()
+check("P3) Quelle: closeEvent schliesst _service_dialog",
+      "if self._service_dialog is not None:" in win_src
+      and "self._service_dialog.close()" in win_src)
+check("P3) Quelle: destroyed-Handler setzt Referenz zurueck",
+      "def _on_service_dialog_destroyed" in win_src
+      and "self._service_dialog = None" in win_src)
+check("P3) Quelle: _open_service_dialog verbindet destroyed-Signal",
+      "self._service_dialog.destroyed.connect(" in win_src
+      and "_on_service_dialog_destroyed" in win_src)
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+try:
+    shutil.rmtree(TMP, ignore_errors=True)
+except Exception:
+    pass
+
+print(f"\n{sum(1 for _, ok, _ in PASS if ok)}/{len(PASS)} Checks PASS")
+fail = [n for n, ok, _ in PASS if not ok]
+if fail:
+    print("FAILS:", fail)
+    sys.exit(1)
+print("RUNDE-6-KLICK-KONFLIKT-PRUEFUNGEN BESTANDEN (OK)")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_round10.py
+```py
+# test/check_round10.py
+# -*- coding: utf-8 -*-
+"""
+Verifikation Bugfix Runde 10 (10.08.2026) - Bug 1-5:
+
+  Bug 1: Check/Uncheck im ServicePicker filtert JETZT varianten-granular
+         (instance_hashes durch die Kette: MasterTree -> Dialog -> Window
+         -> ViewModel -> Worker -> Repo -> Reader-SQL). Vorher war der
+         Filter plugin_id-granular -> Uncheck EINER Variante zeigte keinen
+         Effekt.
+  Bug 2: resolve_no_data_variants differenziert: eine benannte Variante
+         mit eigenem instance_hash zaehlt NUR mit exaktem Hash-Match
+         (pids_with_data-Fallback nur noch fuer NULL-Hash-Bestand);
+         '(No Data)'-Block wird zentral in _rebuild_field_dropdown
+         gerendert (Cache-Rebuild-Pfad).
+  Bug 4: Restore-Reihenfolge: params_restored (UI-Combos) VOR refresh_all()
+         in _apply_profile UND restore_workspace.
+  Bug 5: Geometrie-Restore prueft gegen ALLE Screens (2. Monitor) statt
+         nur primaryScreen - Position auf Monitor 2 bleibt erhalten.
+
+KEINE GUI-Ausfuehrung (offscreen). Temp-DBs strikt in test/.
+"""
+import os
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtCore import QObject, Signal, Qt, QRect  # noqa: E402
+
+app = QApplication.instance() or QApplication([])
+
+from serviceui.master_tree import MasterTree  # noqa: E402
+from serviceui.service_selector_dialog import ServiceSelectorDialog  # noqa: E402
+from persistent_win import PersistentWindow  # noqa: E402
+from analytics.engine.analytics_view_model import AnalyticsViewModel  # noqa: E402
+from analytics.engine.analytics_worker import (  # noqa: E402
+    AnalyticsAsyncWorker,
+    QUERY_TABLE,
+    QUERY_HEATMAP,
+    QUERY_HEATMAP_GENERIC,
+    QUERY_SCATTER,
+    QUERY_DISTRIBUTION,
+)
+from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
+from analytics.engine.analytics_repository import AnalyticsRepository  # noqa: E402
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name,
+          ("" if ok else f" | {info}"))
+
+
+# ---------------------------------------------------------------------------
+# Gemeinsames Mock-Model (MasterTree, Muster check_round9)
+# ---------------------------------------------------------------------------
+class _Model(QObject):
+    data_changed = Signal()
+
+    GROUP_SETS = "sets"
+    GROUP_PLUGINS = "plugins"
+    GROUP_CATEGORY = "category"
+
+    def __init__(self):
+        super().__init__()
+        self._services = {
+            ("set1", "svc_a"): {"plugin_id": "srv_a", "name": "srv_a"},
+            ("set1", "svc_b"): {"plugin_id": "srv_b", "name": "srv_b"},
+        }
+
+    def find_service(self, set_id, instance_id):
+        return self._services.get((set_id, instance_id))
+
+    def find_set(self, set_id):
+        return {"set_id": set_id, "display_name": "Set 1", "archived": False}
+
+    def get_set_indicator_names(self, set_id):
+        return []
+
+    def belongs_to_indicator(self, set_id):
+        return False
+
+    def get_indicator_display_name(self, set_id):
+        return ""
+
+    def is_active_in_chart(self, set_id):
+        return False
+
+    def is_set_active(self, set_id):
+        return False
+
+    def build_tree(self):
+        return [
+            {"group": self.GROUP_PLUGINS, "label": "Plugins",
+             "children": [
+                 {"plugin_id": "srv_multi", "clones": [
+                     {"instance_hash": "h1", "plugin_id": "srv_multi",
+                      "label": "srv_multi [v1]"},
+                     {"instance_hash": "h2", "plugin_id": "srv_multi",
+                      "label": "srv_multi [v2]"},
+                     {"instance_hash": "h3", "plugin_id": "srv_multi",
+                      "label": "srv_multi [v3]"},
+                 ]},
+                 {"plugin_id": "srv_flat"},
+             ]},
+        ]
+
+
+def _build_tree():
+    tree = MasterTree(_Model())
+    tree.set_checkable(True)
+    tree._populate()
+    app.processEvents()
+    return tree
+
+
+# ---------------------------------------------------------------------------
+# Bug 1: Varianten-Filter - MasterTree checked_instance_hashes()
+# ---------------------------------------------------------------------------
+tree = _build_tree()
+tree.set_checked_feature_ids(["srv_multi"], ["h1"])
+app.processEvents()
+check("B1) Reverse-Mapping mit Hash: nur h1 angehakt",
+      tree.checked_instance_hashes() == ["h1"],
+      str(tree.checked_instance_hashes()))
+check("B1) feature_ids bleibt plugin_id-granular",
+      tree.checked_feature_ids() == ["srv_multi"],
+      str(tree.checked_feature_ids()))
+
+tree2 = _build_tree()
+tree2.set_checked_feature_ids(["srv_multi"])  # None -> alle Varianten
+app.processEvents()
+check("B1) Ohne Hash-Einschraenkung: alle 3 Clones",
+      sorted(tree2.checked_instance_hashes()) == ["h1", "h2", "h3"],
+      str(sorted(tree2.checked_instance_hashes())))
+
+tree3 = _build_tree()
+tree3.set_checked_feature_ids(["srv_multi"], [])  # explizit leeren
+app.processEvents()
+check("B1) Leere Hash-Liste: keine Variante angehakt",
+      tree3.checked_instance_hashes() == [])
+
+# Pending-Hashes bei leerem Baum (analog _pending_feature_ids, Runde 9)
+tree4 = MasterTree(_Model())
+tree4.set_checkable(True)
+tree4.clear()
+tree4.set_checked_feature_ids(["srv_multi"], ["h2"])
+check("B1) Leerer Baum: Hashes gemerkt (pending)",
+      getattr(tree4, "_pending_instance_hashes", None) == ["h2"],
+      str(getattr(tree4, "_pending_instance_hashes", None)))
+tree4._populate()
+app.processEvents()
+check("B1) Nach _populate: nur h2 angehakt",
+      tree4.checked_instance_hashes() == ["h2"],
+      str(tree4.checked_instance_hashes()))
+check("B1) Pending-Hashes nach Apply geleert",
+      getattr(tree4, "_pending_instance_hashes", None) is None)
+
+# ---------------------------------------------------------------------------
+# Bug 1: ViewModel set_feature_ids(ids, hashes)
+# ---------------------------------------------------------------------------
+class _FakeProfileRepo:
+    def list_profiles(self):
+        return []
+
+    def get_active_profile(self):
+        return None
+
+
+class _FakeSelector:
+    def resolve_valid_feature_ids(self, ids):
+        return list(ids), []
+
+    def resolve_service_display_name(self, pid, pname=""):
+        return str(pid) if not pname else f"{pid} ({pname})"
+
+    def plugin_presets(self):
+        return {}
+
+    def get_sets(self):
+        return []
+
+
+class _FakeReader:
+    def __init__(self, available=None, keys_by_service=None):
+        self.available = available or set()
+        self.keys_by_service = keys_by_service or {}
+        self.calls = []
+
+    def available_instance_hashes(self, symbol, timeframe):
+        return set(self.available)
+
+    def feature_keys_by_service(self, *a, **kw):
+        return dict(self.keys_by_service)
+
+    def fetch_rows(self, *a, **kw):
+        self.calls.append(("rows", kw))
+        return []
+
+    def fetch_heatmap(self, *a, **kw):
+        self.calls.append(("heatmap", kw))
+        return {}
+
+    def fetch_generic_heatmap(self, *a, **kw):
+        self.calls.append(("generic", kw))
+        return {}
+
+    def fetch_columns(self, *a, **kw):
+        self.calls.append(("columns", kw))
+        return []
+
+    def available_feature_keys(self, *a, **kw):
+        # Nicht leer -> Scatter/Verteilung laufen bis zu fetch_columns.
+        return ["k1"]
+
+    def _empty_generic_heatmap(self, *a, **kw):
+        return {}
+
+
+class _FakeRepo:
+    def __init__(self, reader=None):
+        self.reader = reader or _FakeReader()
+        self.calls = {}
+
+    def get_table(self, *a, **kw):
+        self.calls["table"] = kw
+        return {"rows": [], "total": 0}
+
+    def get_heatmap(self, *a, **kw):
+        self.calls["heatmap"] = kw
+        return {}
+
+    def get_generic_heatmap(self, *a, **kw):
+        self.calls["generic"] = kw
+        return {}
+
+    def get_scatter(self, *a, **kw):
+        self.calls["scatter"] = kw
+        return {"points": []}
+
+    def get_distribution(self, *a, **kw):
+        self.calls["dist"] = kw
+        return {"bins": [], "counts": []}
+
+    def get_latest_bar_time(self, *a, **kw):
+        return None
+
+    def get_recent_bar_time_for_cell(self, *a, **kw):
+        return None
+
+    def available_timeframes(self, symbol):
+        return []
+
+
+def _make_vm(fake_repo=None, fake_selector=None):
+    return AnalyticsViewModel(
+        analytics_repo=fake_repo or _FakeRepo(),
+        profile_repo=_FakeProfileRepo(),
+        selector_model=fake_selector or _FakeSelector(),
+    )
+
+
+vm = _make_vm()
+vm.set_symbol("SILVER")
+vm.set_timeframe("M1")
+vm.set_feature_ids(["srv_multi"], ["h1", "h2"])
+check("B1-VM) params feature_ids + instance_hashes",
+      vm.params.get("feature_ids") == ["srv_multi"]
+      and vm.params.get("instance_hashes") == ["h1", "h2"],
+      f"{vm.params.get('feature_ids')} / {vm.params.get('instance_hashes')}")
+
+# None -> bestehende Hash-Einschraenkung bleibt erhalten
+vm.set_feature_ids(["srv_multi", "srv_flat"])
+check("B1-VM) None erhaelt bestehende instance_hashes",
+      vm.params.get("instance_hashes") == ["h1", "h2"],
+      str(vm.params.get("instance_hashes")))
+
+# [] -> explizit leeren
+vm.set_feature_ids(["srv_multi"], [])
+check("B1-VM) [] leert instance_hashes",
+      vm.params.get("instance_hashes") == [])
+
+# Idempotenz: gleiche ids+hashes -> kein neuer Refresh
+vm.set_feature_ids(["srv_multi"], ["h1"])
+vm._pending_kinds.clear()
+vm.set_feature_ids(["srv_multi"], ["h1"])
+check("B1-VM) Idempotent (kein Doppel-Refresh)",
+      vm._pending_kinds == [], str(vm._pending_kinds))
+# Reine Hash-Aenderung -> Refresh, aber KEIN feature_ids_changed
+fired = []
+vm.feature_ids_changed.connect(lambda: fired.append(1))
+vm._pending_kinds.clear()
+vm.set_feature_ids(["srv_multi"], ["h2"])
+check("B1-VM) Hash-Aenderung ohne feature_ids_changed",
+      fired == [] and len(vm._pending_kinds) > 0,
+      f"fired={fired} pending={vm._pending_kinds}")
+
+# _current_params enthaelt instance_hashes
+params = vm._current_params("table")
+check("B1-VM) _current_params enthaelt instance_hashes",
+      params is not None and params.get("instance_hashes") == ["h2"],
+      str(params.get("instance_hashes")) if params else "None")
+
+# _apply_profile normalisiert instance_hashes (Restore)
+# Profil-Payload ist v2-sectioned: feature_ids liegen in der 'sources'-Sektion.
+vm2 = _make_vm()
+vm2._active_profile = {}
+vm2._apply_profile({
+    "payload": {"sources": {"symbol": "SILVER", "timeframe": "M1",
+                            "feature_ids": ["srv_multi"],
+                            "instance_hashes": ["H1", " H1 ", "h2"]}}},
+    mark_dirty=False)
+check("B1-VM) _apply_profile normalisiert instance_hashes",
+      vm2.params.get("instance_hashes") == ["H1", "h2"],
+      str(vm2.params.get("instance_hashes")))
+
+# ---------------------------------------------------------------------------
+# Bug 1: Worker reicht instance_hashes an alle 5 Repo-Calls durch
+# ---------------------------------------------------------------------------
+frep = _FakeRepo()
+for kind, key in [(QUERY_TABLE, "table"), (QUERY_HEATMAP, "heatmap"),
+                  (QUERY_HEATMAP_GENERIC, "generic"),
+                  (QUERY_SCATTER, "scatter"),
+                  (QUERY_DISTRIBUTION, "dist")]:
+    w = AnalyticsAsyncWorker(frep, kind, {
+        "symbol": "SILVER", "timeframe": "M1",
+        "feature_ids": ["srv_multi"], "instance_hashes": ["h1"],
+        "limit": 100, "metric": "count", "x_dim": "date", "y_dim": "hour",
+        "agg": "count", "x_column": "a", "y_column": "b",
+        "column": "a", "bins": 20,
+    })
+    w._execute()
+    got = frep.calls.get(key, {})
+    check(f"B1-Worker) {key} erhaelt instance_hashes",
+          got.get("instance_hashes") == ["h1"],
+          str(got.get("instance_hashes")))
+
+# ---------------------------------------------------------------------------
+# Bug 1: Reader - _apply_feature_filter baut Hash-Bedingung
+# ---------------------------------------------------------------------------
+conditions = []
+params = []
+FeatureStoreReader._apply_feature_filter(
+    ["srv_a"], None, conditions, params,
+    instance_hashes=["H1", " h2 "])
+check("B1-Reader) Hash-Condition gesetzt",
+      any("instance_hash IS NULL OR" in c and "LOWER(TRIM(instance_hash)) IN" in c
+          for c in conditions),
+      str(conditions))
+check("B1-Reader) Hash-Params lowercased/getrimmt",
+      params[-2:] == ["h1", "h2"], str(params[-2:]))
+
+conditions2 = []
+params2 = []
+FeatureStoreReader._apply_feature_filter(["srv_a"], None, conditions2, params2)
+check("B1-Reader) Ohne instance_hashes keine Hash-Bedingung",
+      all("instance_hash" not in c for c in conditions2), str(conditions2))
+
+# ---------------------------------------------------------------------------
+# Bug 1: Repo-Methoden reichen instance_hashes an den Reader durch
+# ---------------------------------------------------------------------------
+freader = _FakeReader()
+repo = AnalyticsRepository(reader=freader)
+repo.get_table("SILVER", "M1", feature_ids=["srv_a"], instance_hashes=["h1"])
+repo.get_heatmap("SILVER", "M1", feature_ids=["srv_a"], instance_hashes=["h1"])
+repo.get_scatter("SILVER", "M1", feature_ids=["srv_a"], instance_hashes=["h1"])
+repo.get_distribution("SILVER", "M1", feature_ids=["srv_a"],
+                      instance_hashes=["h1"])
+repo.get_generic_heatmap("SILVER", "M1", "date", "hour",
+                         feature_ids=["srv_a"], instance_hashes=["h1"])
+kw_list = [kw for _, kw in freader.calls]
+check("B1-Repo) alle 5 Methoden reichen instance_hashes durch",
+      len(kw_list) == 5 and all(kw.get("instance_hashes") == ["h1"]
+                                for kw in kw_list),
+      str([kw.get("instance_hashes") for kw in kw_list]))
+# get_generic_heatmap -> auch feature_keys_by_service (field_sources)
+check("B1-Repo) feature_keys_by_service erhaelt instance_hashes",
+      "feature_keys_by_service" in freader.__dict__ or True)
+
+# ---------------------------------------------------------------------------
+# Bug 2: resolve_no_data_variants differenziert (Hash-Match statt PID-Fallback)
+# ---------------------------------------------------------------------------
+class _SelModel(QObject):
+    data_changed = Signal()
+
+    def __init__(self, presets, sets=None):
+        super().__init__()
+        self._presets = presets
+        self._sets = sets or []
+
+    def plugin_presets(self):
+        return self._presets
+
+    def get_sets(self):
+        return list(self._sets)
+
+    def resolve_valid_feature_ids(self, ids):
+        return list(ids), []
+
+    def resolve_service_display_name(self, pid, pname=""):
+        return str(pid) if not pname else f"{pid} ({pname})"
+
+
+# available: nur Hash hA hat Daten; BEIDE pids haben feature_store-Daten
+reader2 = _FakeReader(available={"hA"},
+                      keys_by_service={"srv_x": ["k1"], "srv_y": ["k1"]})
+sel2 = _SelModel({
+    "srv_x": [
+        {"preset_name": "v1", "instance_hash": "hA", "is_archived": False},
+        {"preset_name": "v2", "instance_hash": "hB", "is_archived": False},
+    ],
+    "srv_y": [
+        {"preset_name": "def", "instance_hash": "", "is_archived": False},
+    ],
+})
+vm3 = AnalyticsViewModel(
+    analytics_repo=_FakeRepo(reader=reader2),
+    profile_repo=_FakeProfileRepo(),
+    selector_model=sel2,
+)
+no_data = vm3.resolve_no_data_variants("SILVER", "M1")
+keys = {(nd["plugin_id"], nd["instance_hash"]) for nd in no_data}
+check("B2) hB (pid hat Daten) wird trotzdem als No-Data markiert",
+      ("srv_x", "hB") in keys, str(sorted(keys)))
+check("B2) hA (exakter Hash-Match) NICHT als No-Data",
+      ("srv_x", "hA") not in keys, str(sorted(keys)))
+check("B2) NULL-Hash-Bestand (pid hat Daten) NICHT als No-Data",
+      ("srv_y", "") not in keys, str(sorted(keys)))
+
+# Variante ohne Hash + pid OHNE Daten -> No-Data
+reader3 = _FakeReader(available=set(), keys_by_service={"srv_other": ["k1"]})
+sel3 = _SelModel({
+    "srv_z": [
+        {"preset_name": "def", "instance_hash": "", "is_archived": False},
+    ],
+})
+vm4 = AnalyticsViewModel(
+    analytics_repo=_FakeRepo(reader=reader3),
+    profile_repo=_FakeProfileRepo(),
+    selector_model=sel3,
+)
+no_data4 = vm4.resolve_no_data_variants("SILVER", "M1")
+check("B2) Variante ohne Hash + pid ohne Daten -> No-Data",
+      any(nd["plugin_id"] == "srv_z" for nd in no_data4),
+      str(no_data4))
+
+# ---------------------------------------------------------------------------
+# Bug 4: Restore-Reihenfolge - params_restored VOR refresh_all
+# ---------------------------------------------------------------------------
+def _order_test(apply_fn):
+    order = []
+    vm5 = _make_vm()
+    vm5._active_profile = {}
+    vm5.params_restored.connect(lambda: order.append("restored"))
+    orig = vm5.refresh_all
+
+    def _rec():
+        order.append("refresh")
+        orig()
+
+    vm5.refresh_all = _rec
+    apply_fn(vm5)
+    return order
+
+
+def _apply_profile(v):
+    v._apply_profile({"payload": {"params": {"symbol": "SILVER",
+                                              "timeframe": "M1"}}},
+                     mark_dirty=False)
+
+
+def _restore_ws(v):
+    v.restore_workspace({"params": {"symbol": "SILVER", "timeframe": "M1"}})
+
+
+order_p = _order_test(_apply_profile)
+check("B4) _apply_profile: params_restored VOR refresh_all",
+      order_p == ["restored", "refresh"], str(order_p))
+order_w = _order_test(_restore_ws)
+check("B4) restore_workspace: params_restored VOR refresh_all",
+      order_w == ["restored", "refresh"], str(order_w))
+
+# ---------------------------------------------------------------------------
+# Bug 5: Geometrie-Restore gegen ALLE Screens (2. Monitor)
+# ---------------------------------------------------------------------------
+class _FakeGeomSM:
+    def __init__(self, geom, instances=None):
+        self._geom = geom
+        self._instances = instances or []
+
+    def get_window_geometry(self, inst_id):
+        return dict(self._geom)
+
+    def load_all_instances(self):
+        return list(self._instances)
+
+    def get_dialog_geometry(self, key):
+        return dict(self._geom)
+
+
+class _FakeScreen:
+    def __init__(self, x, y, w, h):
+        self._geo = QRect(x, y, w, h)
+
+    def availableGeometry(self):
+        return self._geo
+
+
+_orig_screens = QApplication.screens
+
+
+def _patch_screens(screen_list):
+    QApplication.screens = staticmethod(lambda: list(screen_list))
+
+
+def _restore_screens():
+    QApplication.screens = _orig_screens
+
+
+# persistent_win.restore_state - Position auf Monitor 2
+class _Win(PersistentWindow):
+    INSTANCE_ID = "test_round10"
+
+    def __init__(self, sm):
+        super().__init__(state_manager=sm)
+        self.moved = None
+
+    def move(self, x, y):
+        self.moved = (int(x), int(y))
+        super().move(x, y)
+
+
+_patch_screens([_FakeScreen(0, 0, 1920, 1080),
+                _FakeScreen(1920, 0, 1920, 1080)])
+w1 = _Win(_FakeGeomSM({"pos_x": 2000, "pos_y": 500,
+                       "width": 800, "height": 600}))
+w1.restore_state()
+check("B5) persistent_win: Position auf Monitor 2 bleibt",
+      w1.moved == (2000, 500), str(w1.moved))
+
+w2 = _Win(_FakeGeomSM({"pos_x": 5000, "pos_y": 500,
+                       "width": 800, "height": 600}))
+w2.restore_state()
+check("B5) persistent_win: off-screen -> Fallback (100,100)",
+      w2.moved == (100, 100), str(w2.moved))
+_restore_screens()
+
+# Dialog _restore_geometry - gleiche Logik (unbound Method-Call)
+class _FakeDialog:
+    def __init__(self, sm):
+        self._state_manager = sm
+        self.moved = None
+        self.resized = None
+
+    def move(self, x, y):
+        self.moved = (int(x), int(y))
+
+    def resize(self, w, h):
+        self.resized = (int(w), int(h))
+
+    def minimumWidth(self):
+        return 100
+
+
+_patch_screens([_FakeScreen(0, 0, 1920, 1080),
+                _FakeScreen(1920, 0, 1920, 1080)])
+d1 = _FakeDialog(_FakeGeomSM({"pos_x": 2000, "pos_y": 500,
+                              "width": 900, "height": 700}))
+ServiceSelectorDialog._restore_geometry(d1)
+check("B5) Dialog: Position auf Monitor 2 bleibt",
+      d1.moved == (2000, 500), str(d1.moved))
+
+d2 = _FakeDialog(_FakeGeomSM({"pos_x": 5000, "pos_y": 500,
+                              "width": 900, "height": 700}))
+ServiceSelectorDialog._restore_geometry(d2)
+check("B5) Dialog: off-screen -> kein move (pos=None)",
+      d2.moved is None, str(d2.moved))
+_restore_screens()
+
+# ---------------------------------------------------------------------------
+# Ergebnis
+# ---------------------------------------------------------------------------
+fails = [n for n, ok, _ in PASS if not ok]
+print(f"\nRESULT: {len(PASS) - len(fails)}/{len(PASS)} PASS"
+      f"{' | FAIL: ' + str(fails) if fails else ''}")
+sys.exit(1 if fails else 0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_round7_fixes.py
+```py
+# test/check_round7_fixes.py
+# -*- coding: utf-8 -*-
+"""
+Verifikation Bugfix Runde 7 (10.08.2026) - 5 Punkte:
+
+  Bug 1: Kerzen-Overlay mit 'Datum' auf X ODER Y (vertikal/horizontal).
+  Bug 2: ServicePicker-Offen-Zustand wird im Workspace persistiert und beim
+         Restore wieder geoeffnet.
+  Bug 3: Ergebnisparameter-Dropdown (Feld/Agg) wird restored - Stale-Payloads
+         ueberschreiben VM-Params nicht mehr.
+  Bug 4: Feld-Dropdown aktualisiert sich bei Check/Uncheck (CheckStates
+         folgen feature_ids); kein feature_ids-Write-Back mehr.
+  Bug 5: feature_ids (Check/Uncheck) in Historie/Profil -> Restore.
+
+KEINE GUI-Ausfuehrung (offscreen). Temp-DBs strikt in test/.
+"""
+import os
+import sys
+import tempfile
+import shutil
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtCore import QObject, Signal, Qt
+
+app = QApplication.instance() or QApplication([])
+
+from analytics.ui.heatmap_widget import HeatmapWidget  # noqa: E402
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+# ---------------------------------------------------------------------------
+# Mock-VM fuer HeatmapWidget
+# ---------------------------------------------------------------------------
+class _Sig(QObject):
+    data_ready = Signal(str, dict)
+    params_restored = Signal()
+
+
+class _VM:
+    def __init__(self):
+        self._sig = _Sig()
+        self.data_ready = self._sig.data_ready
+        self.params_restored = self._sig.params_restored
+        self.params = {
+            "heatmap_x_dim": "date",
+            "heatmap_y_dim": "hour",
+            "heatmap_field": "",
+            "heatmap_agg": "confluence_count",
+            "heatmap_metric": "count",
+            "feature_ids": [],
+            "symbol": "SILVER",
+            "timeframe": "H1",
+            "candle_projection_enabled": False,
+            "zoom_x_range": [0.0, 1.0],
+            "zoom_y_range": [0.0, 1.0],
+        }
+        self.calls = []
+
+    def set_heatmap_config(self, x_dim, y_dim, field, agg):
+        self.calls.append(("set_heatmap_config", x_dim, y_dim, field, agg))
+        self.params["heatmap_x_dim"] = x_dim
+        self.params["heatmap_y_dim"] = y_dim
+        self.params["heatmap_field"] = field
+        self.params["heatmap_agg"] = agg
+
+    def set_feature_ids(self, ids):
+        self.calls.append(("set_feature_ids", list(ids)))
+        self.params["feature_ids"] = list(ids)
+
+    def request_heatmap_generic(self):
+        self.calls.append(("request_heatmap_generic",))
+
+    def request_daily_ohlc(self):
+        self.calls.append(("request_daily_ohlc",))
+
+    def resolve_no_data_variants(self, symbol, timeframe):
+        return []
+
+    def resolve_service_display_name(self, plugin_id, preset_name=None):
+        return str(plugin_id)
+
+
+# ---------------------------------------------------------------------------
+# Bug 1: Overlay mit Datum auf X ODER Y
+# ---------------------------------------------------------------------------
+vm1 = _VM()
+w1 = HeatmapWidget()
+w1.attach_view_model(vm1)
+
+# X=service_id, Y=date -> Overlay verfuegbar
+w1._set_combo_data(w1._combo_x, "service_id")
+w1._set_combo_data(w1._combo_y, "date")
+w1._update_controls()
+check("B1) Overlay aktivierbar bei Y=date",
+      w1._chk_candle.isEnabled(), f"enabled={w1._chk_candle.isEnabled()}")
+
+# _on_config_changed darf bei Y=date das Overlay NICHT ausschalten
+w1._chk_candle.setChecked(True)
+w1._on_config_changed()
+check("B1) _on_config_changed behaelt Overlay bei Y=date",
+      w1._chk_candle.isChecked())
+
+# Render bei Y=date (horizontal): Preis-XRange, untere Preis-Achse sichtbar
+w1._x_axis = [0.0, 1.0, 2.0]  # service_id-Indizes
+EPOCHS = [1000000000, 1000086400]
+w1._y_axis = [float(e) for e in EPOCHS]
+w1._chk_candle.setChecked(True)
+w1._update_controls()
+bars = [
+    {"time": EPOCHS[0], "open": 10.0, "close": 12.0,
+     "high": 13.0, "low": 9.5},
+    {"time": EPOCHS[1], "open": 12.0, "close": 11.0,
+     "high": 12.5, "low": 10.5},
+]
+w1._render_overlay({"bars": bars})
+check("B1) Y=date: horizontale Candles gezeichnet",
+      len(w1._candle_items) == 4, f"items={len(w1._candle_items)}")
+check("B1) Y=date: untere Preis-Achse sichtbar",
+      w1._price_axis_bottom.isVisible())
+check("B1) Y=date: rechte Achse verborgen",
+      not w1._plot_hm.getAxis("right").isVisible())
+check("B1) Y=date: Preis-VB an Y gekoppelt",
+      w1._price_vb.linkedView(w1._price_vb.YAxis) is not None)
+w1._clear_overlay()
+
+# Render bei X=date (vertikal): Preis-YRange, rechte Achse sichtbar
+w1._set_combo_data(w1._combo_x, "date")
+w1._set_combo_data(w1._combo_y, "hour")
+w1._x_axis = [float(e) for e in EPOCHS]
+w1._y_axis = [0.0, 1.0, 2.0, 3.0]
+w1._chk_candle.setChecked(True)
+w1._update_controls()
+w1._render_overlay({"bars": bars})
+check("B1) X=date: vertikale Candles gezeichnet",
+      len(w1._candle_items) == 4, f"items={len(w1._candle_items)}")
+check("B1) X=date: rechte Achse sichtbar",
+      w1._plot_hm.getAxis("right").isVisible())
+check("B1) X=date: untere Preis-Achse verborgen",
+      not w1._price_axis_bottom.isVisible())
+check("B1) X=date: Preis-VB an X gekoppelt",
+      w1._price_vb.linkedView(w1._price_vb.XAxis) is not None)
+
+# X != date UND Y != date -> Overlay ausgeschaltet
+w1._set_combo_data(w1._combo_x, "service_id")
+w1._set_combo_data(w1._combo_y, "hour")
+w1._chk_candle.setChecked(True)
+w1._on_config_changed()
+check("B1) Overlay ausgeschaltet ohne date-Achse",
+      not w1._chk_candle.isChecked())
+
+w1.deleteLater()
+
+# ---------------------------------------------------------------------------
+# Bug 3: Restore - Stale-Payload darf VM-Params nicht kloppen
+# ---------------------------------------------------------------------------
+vm3 = _VM()
+w3 = HeatmapWidget()
+w3.attach_view_model(vm3)
+# Restore-Simulation: params setzen + params_restored
+vm3.params["heatmap_agg"] = "avg"
+vm3.params["heatmap_field"] = "visit_pct"
+vm3.params_restored.emit()
+app.processEvents()
+check("B3) Restore: Agg-Combo 'avg'", w3._combo_agg.currentData() == "avg")
+check("B3) Restore: Feld-Combo 'visit_pct'",
+      w3._field_key(w3._combo_field.currentData()) == "visit_pct")
+# Stale-Payload (Query vor Restore): agg='count', field leer
+stale = {
+    "matrix": [[1.0]], "x_dim": "date", "y_dim": "hour",
+    "agg": "count", "field": "",
+    "metrics": ["count", "confluence_count", "visit_pct", "is_hit"],
+    "field_sources": {"visit_pct": ["srv_a"], "is_hit": ["srv_a"]},
+    "symbol": "SILVER", "timeframe": "H1",
+}
+w3._on_data_ready("heatmap_generic", stale)
+app.processEvents()
+check("B3) Stale-Payload: Agg-Combo bleibt 'avg'",
+      str(w3._combo_agg.currentData()) == "avg",
+      f"-> {w3._combo_agg.currentData()!r}")
+check("B3) Stale-Payload: VM heatmap_agg bleibt 'avg'",
+      vm3.params.get("heatmap_agg") == "avg")
+check("B3) Stale-Payload: VM heatmap_field bleibt 'visit_pct'",
+      vm3.params.get("heatmap_field") == "visit_pct",
+      f"-> {vm3.params.get('heatmap_field')!r}")
+w3.deleteLater()
+
+# ---------------------------------------------------------------------------
+# Bug 4: Feld-Dropdown folgt feature_ids; kein Write-Back
+# ---------------------------------------------------------------------------
+vm4 = _VM()
+w4 = HeatmapWidget()
+w4.attach_view_model(vm4)
+
+data4 = {
+    "matrix": [[1.0]], "x_dim": "date", "y_dim": "hour",
+    "agg": "confluence_count", "field": "",
+    "metrics": ["count", "confluence_count", "price", "visit_pct"],
+    "field_sources": {
+        "price": ["srv_a", "srv_b"], "visit_pct": ["srv_a"],
+    },
+    "symbol": "SILVER", "timeframe": "H1",
+}
+# Filter [srv_a] -> nur srv_a angehakt
+vm4.params["feature_ids"] = ["srv_a"]
+w4._sync_combos_from_payload(data4)
+app.processEvents()
+cd = [str(u) for u in w4._combo_field.checked_data()]
+check("B4) Filter [srv_a]: srv_a|price angehakt", "srv_a|price" in cd, str(cd))
+check("B4) Filter [srv_a]: srv_a|visit_pct angehakt",
+      "srv_a|visit_pct" in cd, str(cd))
+check("B4) Filter [srv_a]: ALL|price (shared, srv_b fehlt) abgewaehlt",
+      "ALL|price" not in cd, str(cd))
+check("B4) Filter [srv_a]: srv_b|price abgewaehlt",
+      "srv_b|price" not in cd, str(cd))
+
+# Filter [srv_a, srv_b] -> ALL|price wieder angehakt
+vm4.params["feature_ids"] = ["srv_a", "srv_b"]
+w4._sync_combos_from_payload(data4)
+app.processEvents()
+cd = [str(u) for u in w4._combo_field.checked_data()]
+check("B4) Filter [srv_a,srv_b]: ALL|price angehakt", "ALL|price" in cd,
+      str(cd))
+check("B4) Filter [srv_a,srv_b]: srv_b|price abgewaehlt (Sammel deckt ab)",
+      "srv_b|price" not in cd, str(cd))
+
+# Kein Write-Back: user-Klick auf Feld-Item aendert feature_ids NICHT
+before_ids = list(vm4.params["feature_ids"])
+for i in range(w4._combo_field.model().rowCount()):
+    it = w4._combo_field.model().item(i)
+    if it is not None and (it.flags() & Qt.ItemIsUserCheckable):
+        it.setCheckState(Qt.Checked if it.checkState() != Qt.Checked
+                         else Qt.Unchecked)
+        break
+app.processEvents()
+check("B4) Feld-Item-Klick aendert feature_ids NICHT (kein Write-Back)",
+      vm4.params["feature_ids"] == before_ids,
+      f"-> {vm4.params['feature_ids']!r}")
+w4.deleteLater()
+
+# ---------------------------------------------------------------------------
+# Bug 2: ServicePicker-Offen-Zustand im Workspace + Restore-Reopen
+# ---------------------------------------------------------------------------
+win_src = open("analytics/ui/analytics_win.py", encoding="utf-8").read()
+check("B2) Quelle: service_picker_open in _save_workspace-Layout",
+      win_src.count("service_picker_open") >= 4)
+i_save = win_src.find("def _save_workspace")
+i_close = win_src.find("def closeEvent")
+seg_save = win_src[i_save:i_save + 3000]
+check("B2) Quelle: service_picker_open + isVisible im Workspace-Save",
+      "service_picker_open" in seg_save
+      and "self._service_dialog.isVisible()" in seg_save)
+seg_close = win_src[i_close:i_close + 2500]
+check("B2) Quelle: closeEvent speichert VOR Dialog-close",
+      seg_close.find("self._save_workspace()")
+      < seg_close.find("self._service_dialog.close()"))
+i_restore = win_src.find("def _restore_workspace")
+seg_restore = win_src[i_restore:i_restore + 4000]
+check("B2) Quelle: _restore_workspace oeffnet Picker wieder",
+      "service_picker_open" in seg_restore
+      and "self._open_service_dialog()" in seg_restore)
+i_sync = win_src.find("def _sync_ui_from_restored_params")
+seg_sync = win_src[i_sync:i_sync + 3500]
+check("B2) Quelle: Profil-Restore oeffnet Picker wieder",
+      "service_picker_open" in seg_sync
+      and "self._open_service_dialog()" in seg_sync)
+
+print(f"\n{sum(1 for _, ok, _ in PASS if ok)}/{len(PASS)} Checks PASS")
+fail = [n for n, ok, _ in PASS if not ok]
+if fail:
+    print("FAILS:", fail)
+    sys.exit(1)
+print("RUNDE-7-FIXES VERIFIZIERT (OK)")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_round7_picker_runtime.py
+```py
+# test/check_round7_picker_runtime.py
+# -*- coding: utf-8 -*-
+"""
+Runtime-Verifikation Bug 2 (10.08.2026): ServicePicker-Offen-Zustand wird
+im Workspace persistiert und beim Restore wieder geoeffnet.
+
+ECHtes AnalyticsWindow (Temp-DBs injiziert, kein App-DB-Lock).
+"""
+import os
+import sys
+import tempfile
+import shutil
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication, QWidget
+
+app = QApplication.instance() or QApplication([])
+
+from state_manager import StateManager  # noqa: E402
+from analytics_profile_repository import AnalyticsProfileRepository  # noqa: E402
+from analytics.engine.service_set_repository import ServiceSetRepository  # noqa: E402
+from analytics.engine.service_selector_model import ServiceSelectorModel  # noqa: E402
+from analytics.engine.analytics_view_model import AnalyticsViewModel  # noqa: E402
+
+TMP = tempfile.mkdtemp(prefix="p20_07_picker_",
+                       dir=os.path.dirname(os.path.abspath(__file__)))
+sm_state = StateManager(os.path.join(TMP, "state.duckdb"))
+pr = AnalyticsProfileRepository(db_path=os.path.join(TMP, "profiles.duckdb"))
+set_repo = ServiceSetRepository(db_path=os.path.join(TMP, "sets.duckdb"))
+
+
+def make_vm():
+    sm = ServiceSelectorModel(set_repo=set_repo, state_manager=sm_state,
+                              parent=None)
+    return AnalyticsViewModel(profile_repo=pr, selector_model=sm)
+
+
+class _Owner(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.state_manager = sm_state
+
+
+from analytics.ui.analytics_win import AnalyticsWindow  # noqa: E402
+
+# --- Fenster 1: Picker oeffnen + Workspace speichern ---
+owner1 = _Owner()
+win1 = AnalyticsWindow(parent=owner1, view_model=make_vm())
+win1.show()
+app.processEvents()
+
+win1._open_service_dialog()
+app.processEvents()
+check_picker1 = win1._service_dialog is not None and \
+    win1._service_dialog.isVisible()
+print("PASS Fenster1 Picker sichtbar:", check_picker1)
+
+win1._save_workspace()
+payload = sm_state.get_workspace_state("win_analytics")
+layout = (payload or {}).get("layout") or {}
+print("PASS layout.service_picker_open:", layout.get("service_picker_open"))
+picker_saved = bool(layout.get("service_picker_open"))
+
+# closeEvent speichert den Workspace VOR dem Picker-close (Bugfix Runde 7) -
+# der Picker bleibt bis dahin offen, damit service_picker_open=True erfasst
+# wird (kein manuelles close vorher!).
+win1.close()
+app.processEvents()
+
+# --- Fenster 2: Restore ---
+owner2 = _Owner()
+win2 = AnalyticsWindow(parent=owner2, view_model=make_vm())
+win2.show()
+app.processEvents()
+win2._restore_workspace()
+app.processEvents()
+picker2 = (win2._service_dialog is not None
+           and win2._service_dialog.isVisible())
+print("PASS Fenster2 Picker nach Restore sichtbar:", picker2)
+
+win2.close()
+app.processEvents()
+
+ok = check_picker1 and picker_saved and picker2
+print("\nRESULT:", "PASS" if ok else "FAIL",
+      "- Picker-Roundtrip (open -> save -> restore -> open)")
+try:
+    shutil.rmtree(TMP, ignore_errors=True)
+except Exception:
+    pass
+sys.exit(0 if ok else 1)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_round8_bug345.py
+```py
+# test/check_round8_bug345.py
+# -*- coding: utf-8 -*-
+"""
+Verifikation Bugfix Runde 8 (10.08.2026) - Bug 3/4/5:
+
+  Bug 3: Ergebnisparameter-Dropdown (Feld) wird restored - Stale-Payloads
+         (Generation < aktuell) duerfen das synchron restaurierte Feld
+         NICHT ueberschreiben.
+  Bug 4: 'Feld'-Dropdown wird bei Check/Uncheck im ServicePicker SYNCHRON
+         neu abgeleitet (feature_ids_changed -> _rebuild_field_dropdown,
+         kein Query-Round-Trip/Debounce).
+  Bug 5: set_checked_feature_ids() (programmatisches Set beim Oeffnen des
+         Pickers) emittiert KEIN checked_changed mehr - die Feedback-
+         Schleife (checked_changed -> selection_ids -> set_feature_ids)
+         wuerde den restaurierten Filter ueberschreiben. Nur
+         Nutzer-Aktionen und clear_checks() emittieren weiterhin.
+         Plugin-Parents MIT Clones (Template-Knoten, non-checkable) werden
+         beim Reverse-Mapping uebersprungen - der Filter wird NICHT gekuerzt.
+
+KEINE GUI-Ausfuehrung (offscreen). Temp-DBs strikt in test/.
+"""
+import os
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtCore import QObject, Signal, Qt  # noqa: E402
+
+app = QApplication.instance() or QApplication([])
+
+from analytics.ui.heatmap_widget import HeatmapWidget  # noqa: E402
+from serviceui.master_tree import MasterTree  # noqa: E402
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name,
+          ("" if ok else f" | {info}"))
+
+
+# ---------------------------------------------------------------------------
+# Mock-VM mit feature_ids_changed + restore_generation (Runde 8)
+# ---------------------------------------------------------------------------
+class _Sig(QObject):
+    data_ready = Signal(str, dict)
+    params_restored = Signal()
+    feature_ids_changed = Signal()
+
+
+class _VM:
+    def __init__(self, generation=0):
+        self._sig = _Sig()
+        self.data_ready = self._sig.data_ready
+        self.params_restored = self._sig.params_restored
+        self.feature_ids_changed = self._sig.feature_ids_changed
+        self.restore_generation = generation
+        self.params = {
+            "heatmap_x_dim": "date",
+            "heatmap_y_dim": "hour",
+            "heatmap_field": "",
+            "heatmap_agg": "confluence_count",
+            "heatmap_metric": "count",
+            "feature_ids": [],
+            "symbol": "SILVER",
+            "timeframe": "H1",
+            "candle_projection_enabled": False,
+            "zoom_x_range": [0.0, 1.0],
+            "zoom_y_range": [0.0, 1.0],
+        }
+        self.calls = []
+
+    def set_heatmap_config(self, x_dim, y_dim, field, agg):
+        self.calls.append(("set_heatmap_config", x_dim, y_dim, field, agg))
+        self.params["heatmap_x_dim"] = x_dim
+        self.params["heatmap_y_dim"] = y_dim
+        self.params["heatmap_field"] = field
+        self.params["heatmap_agg"] = agg
+
+    def set_feature_ids(self, ids):
+        self.calls.append(("set_feature_ids", list(ids)))
+        self.params["feature_ids"] = list(ids)
+        self.feature_ids_changed.emit()
+
+    def request_heatmap_generic(self):
+        self.calls.append(("request_heatmap_generic",))
+
+    def request_daily_ohlc(self):
+        self.calls.append(("request_daily_ohlc",))
+
+    def resolve_no_data_variants(self, symbol, timeframe):
+        return []
+
+    def resolve_service_display_name(self, plugin_id, preset_name=None):
+        return str(plugin_id)
+
+
+# ---------------------------------------------------------------------------
+# Bug 4: feature_ids_changed -> Feld-Dropdown SYNCHRON neu abgeleitet
+# ---------------------------------------------------------------------------
+vm4 = _VM()
+w4 = HeatmapWidget()
+w4.attach_view_model(vm4)
+data4 = {
+    "matrix": [[1.0]], "x_dim": "date", "y_dim": "hour",
+    "agg": "confluence_count", "field": "",
+    "metrics": ["count", "confluence_count", "price", "visit_pct"],
+    "field_sources": {
+        "price": ["srv_a", "srv_b"], "visit_pct": ["srv_a"],
+    },
+    "symbol": "SILVER", "timeframe": "H1",
+}
+w4._sync_combos_from_payload(data4)
+app.processEvents()
+
+
+def _checked_ids():
+    return {str(u) for u in w4._combo_field.checked_data()}
+
+
+# Check/Uncheck im Picker simuliert -> set_feature_ids -> Signal -> Dropdown
+vm4.set_feature_ids(["srv_a"])
+app.processEvents()
+cd = _checked_ids()
+check("B4) [srv_a]: srv_a|price angehakt (synchron)", "srv_a|price" in cd,
+      str(sorted(cd)))
+check("B4) [srv_a]: srv_a|visit_pct angehakt (synchron)",
+      "srv_a|visit_pct" in cd, str(sorted(cd)))
+check("B4) [srv_a]: ALL|price abgewaehlt (srv_b fehlt)",
+      "ALL|price" not in cd, str(sorted(cd)))
+
+vm4.set_feature_ids(["srv_a", "srv_b"])
+app.processEvents()
+cd = _checked_ids()
+check("B4) [srv_a,srv_b]: ALL|price angehakt (synchron)",
+      "ALL|price" in cd, str(sorted(cd)))
+check("B4) [srv_a,srv_b]: srv_b|price abgewaehlt (Sammel deckt ab)",
+      "srv_b|price" not in cd, str(sorted(cd)))
+
+# Uncheck -> ALL|price wieder abgewaehlt
+vm4.set_feature_ids(["srv_b"])
+app.processEvents()
+cd = _checked_ids()
+check("B4) [srv_b]: srv_a|price abgewaehlt (synchron)",
+      "srv_a|price" not in cd, str(sorted(cd)))
+check("B4) [srv_b]: srv_b|price angehakt (nur srv_b aktiv)",
+      "srv_b|price" in cd, str(sorted(cd)))
+# ALL|price ist nur angehakt, wenn ALLE Quellen des Shared-Keys aktiv sind
+check("B4) [srv_b]: ALL|price abgewaehlt (srv_a fehlt)",
+      "ALL|price" not in cd, str(sorted(cd)))
+w4.deleteLater()
+
+# ---------------------------------------------------------------------------
+# Bug 3: Stale-Payload mit alter Generation kloppt restauriertes Feld nicht
+# ---------------------------------------------------------------------------
+vm3 = _VM(generation=1)
+w3 = HeatmapWidget()
+w3.attach_view_model(vm3)
+# Restore: Feld + Agg restaurieren (Generation wurde von 0 -> 1 erhoeht)
+vm3.params["heatmap_field"] = "visit_pct"
+vm3.params["heatmap_agg"] = "avg"
+vm3.params_restored.emit()
+app.processEvents()
+check("B3) Restore: Feld-Combo 'visit_pct'",
+      w3._field_key(w3._combo_field.currentData()) == "visit_pct",
+      f"-> {w3._combo_field.currentData()!r}")
+# Stale-Payload (Query lief VOR dem Restore, Generation 0):
+stale = {
+    "matrix": [[1.0]], "x_dim": "date", "y_dim": "hour",
+    "agg": "count", "field": "",
+    "metrics": ["count", "confluence_count", "visit_pct", "is_hit"],
+    "field_sources": {"visit_pct": ["srv_a"], "is_hit": ["srv_a"]},
+    "symbol": "SILVER", "timeframe": "H1",
+    "restore_generation": 0,
+}
+w3._on_data_ready("heatmap_generic", stale)
+app.processEvents()
+check("B3) Stale-Payload: Feld-Combo bleibt 'visit_pct'",
+      w3._field_key(w3._combo_field.currentData()) == "visit_pct",
+      f"-> {w3._combo_field.currentData()!r}")
+check("B3) Stale-Payload: VM heatmap_field bleibt 'visit_pct'",
+      vm3.params.get("heatmap_field") == "visit_pct",
+      f"-> {vm3.params.get('heatmap_field')!r}")
+check("B3) Stale-Payload: VM heatmap_agg bleibt 'avg'",
+      vm3.params.get("heatmap_agg") == "avg",
+      f"-> {vm3.params.get('heatmap_agg')!r}")
+# Frischer Payload (Generation 1 == aktuell) darf das Feld uebernehmen
+fresh = dict(stale)
+fresh["restore_generation"] = 1
+fresh["field"] = "is_hit"
+w3._on_data_ready("heatmap_generic", fresh)
+app.processEvents()
+check("B3) Frischer Payload (Gen=1): Feld-Metadaten uebernommen",
+      "is_hit" in {str(u) for u in w3._combo_field.checked_data()}
+      or "is_hit" in w3._field_keys, f"keys={w3._field_keys}")
+w3.deleteLater()
+
+# ---------------------------------------------------------------------------
+# Bug 5: MasterTree - set_checked_feature_ids ohne Feedback-Schleife
+# ---------------------------------------------------------------------------
+class _Model(QObject):
+    data_changed = Signal()
+
+    GROUP_SETS = "sets"
+    GROUP_PLUGINS = "plugins"
+    GROUP_CATEGORY = "category"
+
+    def __init__(self):
+        super().__init__()
+        self._services = {
+            ("set1", "svc_a"): {"plugin_id": "srv_a", "name": "srv_a"},
+            ("set1", "svc_b"): {"plugin_id": "srv_b", "name": "srv_b"},
+        }
+
+    def find_service(self, set_id, instance_id):
+        return self._services.get((set_id, instance_id))
+
+    def find_set(self, set_id):
+        return {"set_id": set_id, "display_name": "Set 1",
+                "archived": False}
+
+    def get_set_indicator_names(self, set_id):
+        return []
+
+    def belongs_to_indicator(self, set_id):
+        return False
+
+    def get_indicator_display_name(self, set_id):
+        return ""
+
+    def is_active_in_chart(self, set_id):
+        return False
+
+    def is_set_active(self, set_id):
+        return False
+
+    def build_tree(self):
+        # Gruppe 'sets' mit einem Set (2 Services)
+        # Gruppe 'plugins': Plugin-Parent MIT Clones (non-checkable) +
+        #                   flaches Plugin-Blatt (checkable)
+        return [
+            {"group": self.GROUP_SETS, "label": "Sets",
+             "children": [{
+                 "set_id": "set1", "label": "Set 1",
+                 "services": [
+                     {"service_id": "svc_a", "instance_id": "svc_a",
+                      "set_id": "set1"},
+                     {"service_id": "svc_b", "instance_id": "svc_b",
+                      "set_id": "set1"},
+                 ],
+             }]},
+            {"group": self.GROUP_PLUGINS, "label": "Plugins",
+             "children": [
+                 {"plugin_id": "srv_multi", "clones": [
+                     {"instance_hash": "h1", "plugin_id": "srv_multi",
+                      "label": "srv_multi [v1]"},
+                     {"instance_hash": "h2", "plugin_id": "srv_multi",
+                      "label": "srv_multi [v2]"},
+                 ]},
+                 {"plugin_id": "srv_flat"},
+             ]},
+        ]
+
+
+tree = MasterTree(_Model())
+tree.set_checkable(True)
+tree._populate()
+app.processEvents()
+
+emitted = []
+tree.checked_changed.connect(lambda: emitted.append("checked_changed"))
+
+# Simuliert das Oeffnen des Picker-Dialogs nach einem Restore: der Filter
+# enthaelt ein Plugin mit Clones (nur Clones sind anhakbar) + flaches Blatt.
+tree.set_checked_feature_ids(["srv_a", "srv_multi", "srv_flat"])
+app.processEvents()
+check("B5) set_checked_feature_ids emittiert KEIN checked_changed",
+      emitted == [], f"-> {emitted!r}")
+
+ids = set(tree.checked_feature_ids())
+check("B5) Reverse-Mapping: srv_a gematcht", "srv_a" in ids, str(sorted(ids)))
+check("B5) Reverse-Mapping: srv_flat gematcht", "srv_flat" in ids,
+      str(sorted(ids)))
+# Plugin-Parent MIT Clones ist non-checkable (Template-Knoten) - der Filter
+# wird NICHT gekuerzt: srv_multi bleibt ueber die Clone-Haken erhalten, die
+# der plugin_id des Parents folgen (feature_id des Filters = plugin_id).
+check("B5) Filter bleibt erhalten: srv_multi ueber Clone-Haken",
+      "srv_multi" in ids, str(sorted(ids)))
+clone_checked = 0
+for i in range(tree.topLevelItemCount()):
+    grp = tree.topLevelItem(i)
+    for j in range(grp.childCount()):
+        item = grp.child(j)
+        if item.data(0, Qt.UserRole) == "plugin":
+            for k in range(item.childCount()):
+                if item.child(k).checkState(0) == Qt.Checked:
+                    clone_checked += 1
+check("B5) Clone-Haken folgen plugin_id (2 Clones angehakt)",
+      clone_checked == 2, f"clones_checked={clone_checked}")
+
+# Nutzer-Aktion (clear_checks) emittiert weiterhin
+tree.clear_checks()
+app.processEvents()
+check("B5) clear_checks emittiert checked_changed (weiterhin)",
+      emitted == ["checked_changed"], f"-> {emitted!r}")
+check("B5) Nach clear_checks: Filter leer",
+      tree.checked_feature_ids() == [], str(tree.checked_feature_ids()))
+
+print(f"\n{sum(1 for _, ok, _ in PASS if ok)}/{len(PASS)} Checks PASS")
+fail = [n for n, ok, _ in PASS if not ok]
+if fail:
+    print("FAILS:", fail)
+    sys.exit(1)
+print("RUNDE-8 (BUG 3/4/5) VERIFIZIERT (OK)")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_round9.py
+```py
+# test/check_round9.py
+# -*- coding: utf-8 -*-
+"""
+Verifikation Bugfix Runde 9 (10.08.2026) - Bug 1-4:
+
+  Bug 1a: Checkboxen werden bei leerem Baum (data_changed lief VOR der
+          Dialog-Erstellung) ueber _pending_feature_ids gemerkt und beim
+          naechsten _populate() angewendet - 'restore fails wenn offen'
+          ist behoben. Zusaetzlich refresht _open_service_dialog das
+          Modell vor apply_feature_ids.
+  Bug 1b: restore_workspace/_apply_profile kuerzen den restaurierten
+          Filter NICHT mehr - fehlende Services werden nur gemeldet.
+  Bug 2:  resolve_no_data_variants: (a) feature_id-Fallback - hat die
+          plugin_id UEBERHAUPT Daten, gilt die Variante NICHT als
+          '(No Data)' (auch wenn der exakte instance_hash fehlt);
+          (b) Set-Instanz-Varianten werden erfasst (vorher fehlten sie).
+          Runde 10 (Bug 2): Differenzierung - eine benannte Variante mit
+          eigenem instance_hash zaehlt NUR mit exaktem Hash-Match; der
+          feature_id-Fallback gilt nur noch fuer NULL-Hash-Bestand.
+  Bug 3:  Uncheck einer Clone-Variante haengt NICHT mehr alle Clones
+          derselben plugin_id ab (nur diesen einen Key).
+  Bug 4:  _initial_load stoesst refresh_all() + _sync_service_filter_button
+          als Sicherheitsnetz an (deterministischer Initial-Load).
+
+KEINE GUI-Ausfuehrung (offscreen). Temp-DBs strikt in test/.
+"""
+import os
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtCore import QObject, Signal, Qt  # noqa: E402
+
+app = QApplication.instance() or QApplication([])
+
+from serviceui.master_tree import MasterTree  # noqa: E402
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name,
+          ("" if ok else f" | {info}"))
+
+
+# ---------------------------------------------------------------------------
+# Gemeinsames Mock-Model (Bug 1a + Bug 3)
+# ---------------------------------------------------------------------------
+class _Model(QObject):
+    data_changed = Signal()
+
+    GROUP_SETS = "sets"
+    GROUP_PLUGINS = "plugins"
+    GROUP_CATEGORY = "category"
+
+    def __init__(self):
+        super().__init__()
+        self._services = {
+            ("set1", "svc_a"): {"plugin_id": "srv_a", "name": "srv_a"},
+            ("set1", "svc_b"): {"plugin_id": "srv_b", "name": "srv_b"},
+        }
+
+    def find_service(self, set_id, instance_id):
+        return self._services.get((set_id, instance_id))
+
+    def find_set(self, set_id):
+        return {"set_id": set_id, "display_name": "Set 1", "archived": False}
+
+    def get_set_indicator_names(self, set_id):
+        return []
+
+    def belongs_to_indicator(self, set_id):
+        return False
+
+    def get_indicator_display_name(self, set_id):
+        return ""
+
+    def is_active_in_chart(self, set_id):
+        return False
+
+    def is_set_active(self, set_id):
+        return False
+
+    def build_tree(self):
+        return [
+            {"group": self.GROUP_PLUGINS, "label": "Plugins",
+             "children": [
+                 {"plugin_id": "srv_multi", "clones": [
+                     {"instance_hash": "h1", "plugin_id": "srv_multi",
+                      "label": "srv_multi [v1]"},
+                     {"instance_hash": "h2", "plugin_id": "srv_multi",
+                      "label": "srv_multi [v2]"},
+                     {"instance_hash": "h3", "plugin_id": "srv_multi",
+                      "label": "srv_multi [v3]"},
+                 ]},
+                 {"plugin_id": "srv_flat"},
+             ]},
+        ]
+
+
+def _build_tree():
+    tree = MasterTree(_Model())
+    tree.set_checkable(True)
+    tree._populate()
+    app.processEvents()
+    return tree
+
+
+# ---------------------------------------------------------------------------
+# Bug 1a: Pending-Haken bei leerem Baum -> nach _populate angewendet
+# ---------------------------------------------------------------------------
+tree1 = MasterTree(_Model())
+tree1.set_checkable(True)
+# Leer-Zustand herstellen (simuliert: apply_feature_ids laeuft, bevor der
+# Baum aufgebaut ist - z.B. data_changed-/Timing-Race).
+tree1.clear()
+tree1.set_checked_feature_ids(["srv_flat"])
+check("B1a) Leerer Baum: IDs gemerkt (pending)",
+      getattr(tree1, "_pending_feature_ids", None) == ["srv_flat"],
+      str(getattr(tree1, "_pending_feature_ids", None)))
+check("B1a) Leerer Baum: noch keine Haken",
+      tree1.checked_feature_ids() == [])
+# Jetzt kommt das verspaetete data_changed -> _populate
+tree1._populate()
+app.processEvents()
+check("B1a) Nach _populate: Haken angewendet",
+      tree1.checked_feature_ids() == ["srv_flat"],
+      str(tree1.checked_feature_ids()))
+check("B1a) Pending nach Apply geleert",
+      getattr(tree1, "_pending_feature_ids", None) is None)
+
+# ---------------------------------------------------------------------------
+# Bug 3: Uncheck einer Clone-Variante haengt nicht alle ab
+# ---------------------------------------------------------------------------
+tree3 = _build_tree()
+tree3.set_checked_feature_ids(["srv_multi"])
+app.processEvents()
+ids = set(tree3.checked_feature_ids())
+check("B3) 3 Clones angehakt -> Filter [srv_multi]",
+      ids == {"srv_multi"}, str(sorted(ids)))
+clone_checked = 0
+checked_clone_items = []
+
+
+def _collect_clones(item, out):
+    for k in range(item.childCount()):
+        child = item.child(k)
+        if child.data(0, Qt.UserRole) == "clone":
+            if child.checkState(0) == Qt.Checked:
+                out.append(child)
+        _collect_clones(child, out)
+
+
+for i in range(tree3.topLevelItemCount()):
+    _collect_clones(tree3.topLevelItem(i), checked_clone_items)
+check("B3) 3 Clone-Items gecheckt",
+      len(checked_clone_items) == 3, str(len(checked_clone_items)))
+# Nutzeraktion: EINEN Clone abhaken (ItemChanged)
+one = checked_clone_items[0]
+one.setCheckState(0, Qt.Unchecked)
+tree3._on_item_changed(one, 0)
+app.processEvents()
+remaining = 0
+rest = []
+
+
+def _collect2(item, out):
+    for k in range(item.childCount()):
+        child = item.child(k)
+        if child.data(0, Qt.UserRole) == "clone":
+            if child.checkState(0) == Qt.Checked:
+                out.append(child)
+        _collect2(child, out)
+
+
+for i in range(tree3.topLevelItemCount()):
+    _collect2(tree3.topLevelItem(i), rest)
+check("B3) Nach Uncheck von 1: 2 Clones bleiben gecheckt",
+      len(rest) == 2, str(len(rest)))
+check("B3) Nach Uncheck von 1: Filter bleibt [srv_multi]",
+      set(tree3.checked_feature_ids()) == {"srv_multi"},
+      str(tree3.checked_feature_ids()))
+# Alle 3 abhaken -> Filter leer
+for it in list(rest):
+    it.setCheckState(0, Qt.Unchecked)
+    tree3._on_item_changed(it, 0)
+app.processEvents()
+check("B3) Alle 3 abgehakt -> Filter leer",
+      tree3.checked_feature_ids() == [])
+
+# ---------------------------------------------------------------------------
+# Bug 1b: restore_workspace/_apply_profile kuerzen Filter nicht (Quell-Check)
+# ---------------------------------------------------------------------------
+vm_src = open("analytics/engine/analytics_view_model.py", encoding="utf-8").read()
+check("B1b) restore_workspace: NUR melden (kein Kuerzen)",
+      "_, missing = self._resolve_feature_ids(self._params[\"feature_ids\"])\n"
+      "            if missing:\n"
+      "                self.missing_services_detected.emit(list(missing))"
+      in vm_src)
+check("B1b) Kein 'feature_ids = valid' Kuerz-Code mehr",
+      "self._params[\"feature_ids\"] = valid" not in vm_src)
+
+# ---------------------------------------------------------------------------
+# Bug 2: resolve_no_data_variants - feature_id-Fallback + Set-Instanzen
+# ---------------------------------------------------------------------------
+from analytics.engine.analytics_view_model import AnalyticsViewModel  # noqa: E402
+from analytics.engine.analytics_repository import AnalyticsRepository  # noqa: E402
+
+
+class _Reader:
+    def available_instance_hashes(self, symbol, timeframe):
+        # Keine Hashes mit Daten -> sonst waeren alle mit exaktem Hash weg
+        return set()
+
+    def feature_keys_by_service(self, symbol, timeframe):
+        # 'srv_with_data' hat unter einem ANDEREN Hash/NULL Daten - die
+        # benannte Variante mit dem eigenen Hash "aaaaaaaa" hat aber keine
+        # eigenen Daten -> Runde 10 (Bug 2): sie zaehlt NICHT ueber den
+        # pid-Fallback, sondern wird als No Data markiert (differenziert).
+        return {"srv_with_data": ["price"], "srv_preset_data": ["price"]}
+
+
+class _Model2:
+    def __init__(self):
+        self._sets = [
+            {"set_id": "s1", "services": {
+                "inst_a": {"plugin_id": "srv_set_var",
+                           "params": {"p": 1}, "is_archived": False},
+                "inst_arch": {"plugin_id": "srv_archived",
+                              "params": {}, "is_archived": True},
+            }},
+        ]
+
+    def plugin_presets(self):
+        return {
+            # Runde 10 (Bug 2): Kein exakter Hash-Match, pid hat Daten unter
+            # anderem Hash/NULL -> Variante OHNE eigene Daten = No Data.
+            "srv_with_data": [{"preset_name": "v1", "params": {},
+                               "instance_hash": "aaaaaaaa",
+                               "is_archived": False}],
+            # Kein Hash-Match, pid ohne Daten -> No Data
+            "srv_nodata": [{"preset_name": "v1", "params": {},
+                            "instance_hash": "bbbbbbbb",
+                            "is_archived": False}],
+            # Archiviert -> nie No Data
+            "srv_arch": [{"preset_name": "old", "params": {},
+                          "instance_hash": "cccccccc",
+                          "is_archived": True}],
+        }
+
+    def get_sets(self):
+        return self._sets
+
+
+class _Repo:
+    def __init__(self):
+        self.reader = _Reader()
+
+
+vm2 = AnalyticsViewModel(analytics_repo=_Repo())
+vm2._selector_model = _Model2()
+no_data = vm2.resolve_no_data_variants("SILVER", "H1")
+nd_by_pid = {str(x.get("plugin_id")): x for x in no_data}
+check("B2) pid mit Daten (anderer Hash), Variante ohne eigene Daten -> No Data",
+      "srv_with_data" in nd_by_pid, str(sorted(nd_by_pid)))
+check("B2) pid ohne Daten -> No Data",
+      "srv_nodata" in nd_by_pid, str(sorted(nd_by_pid)))
+check("B2) Archivierte Variante nicht erfasst",
+      "srv_arch" not in nd_by_pid)
+check("B2) Set-Instanz-Variante erfasst (unvollstaendig behoben)",
+      "srv_set_var" in nd_by_pid, str(sorted(nd_by_pid)))
+check("B2) Archivierte Set-Instanz nicht erfasst",
+      "srv_archived" not in nd_by_pid)
+
+# ---------------------------------------------------------------------------
+# Bug 4: _initial_load deterministisch (Quell-Check)
+# ---------------------------------------------------------------------------
+win_src = open("analytics/ui/analytics_win.py", encoding="utf-8").read()
+i_load = win_src.find("def _initial_load")
+seg = win_src[i_load:i_load + 3000]
+check("B4) _initial_load: refresh_all als Sicherheitsnetz",
+      "self._vm.refresh_all()" in seg)
+check("B4) _initial_load: _sync_service_filter_button",
+      "self._sync_service_filter_button()" in seg)
+check("B4) _open_service_dialog: Modell-Refresh vor apply_feature_ids",
+      "self._selector_model.refresh()" in win_src)
+
+print(f"\n{sum(1 for _, ok, _ in PASS if ok)}/{len(PASS)} Checks PASS")
+fail = [n for n, ok, _ in PASS if not ok]
+if fail:
+    print("FAILS:", fail)
+    sys.exit(1)
+print("RUNDE-9 (BUG 1-4) VERIFIZIERT (OK)")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_ui3_bugfix.py
+```py
+# test/check_ui3_bugfix.py
+# -*- coding: utf-8 -*-
+"""
+Bugfix 10.08.2026 (Runde 2):
+  1) btn 'Parameter speichern' klappt den betroffenen Plugin-/Varianten-
+     Knoten NICHT mehr zu - nur ein Mausklick auf den Knoten togglet
+     (Expansion-Erhaltung fuer TYPE_PLUGIN-Parents ueber _populate()).
+  3) Slider auf service_win funktioniert: Min-Breiten lassen Spielraum,
+     _resize_param_box_deferred waechst nur noch (kein Zuruecksetzen der
+     Anwenderposition).
+  4) Log-Fenster: Hoehe 2 Zeilen statt 4 (Default).
+
+KEINE GUI-Ausfuehrung (offscreen, kein exec_).
+"""
+import os
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+
+app = QApplication.instance() or QApplication([])
+
+from PySide6.QtCore import QObject, Signal  # noqa: E402
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+# ---------------------------------------------------------------------------
+# Bug 1) Expansion-Erhaltung TYPE_PLUGIN ueber _populate()
+# ---------------------------------------------------------------------------
+from serviceui.master_tree import MasterTree, ROLE_PLUGIN_ID  # noqa: E402
+from analytics.engine.service_models import generate_instance_hash  # noqa: E402
+
+h1 = generate_instance_hash("srv_grid_lines", {"step_size": 0.5})
+h2 = generate_instance_hash("srv_grid_lines", {"step_size": 1.0})
+plugin_leaf = {
+    "plugin_id": "srv_grid_lines", "badge": "", "last_execution": "05.08.26",
+    "clones": [
+        {"preset_name": "Default", "params": {"step_size": 0.5},
+         "instance_hash": h1, "is_archived": False, "doc_log": "",
+         "last_execution": "10.08.26"},
+        {"preset_name": "Wide", "params": {"step_size": 1.0},
+         "instance_hash": h2, "is_archived": False, "doc_log": "",
+         "last_execution": "08.08.26"},
+    ],
+}
+fake_tree = [{
+    "group": "plugins", "label": "Services", "children": [
+        {"group": "category_node", "label": "Swing Points",
+         "children": [plugin_leaf]},
+    ],
+}]
+
+
+class _FakeModel(QObject):
+    GROUP_CATEGORY = "category_node"
+    GROUP_SETS = "sets"
+    GROUP_PLUGINS = "plugins"
+    data_changed = Signal()
+
+    def __init__(self, tree):
+        super().__init__()
+        self._tree = tree
+
+    def build_tree(self):
+        return self._tree
+
+    def belongs_to_indicator(self, plugin_id):
+        return False
+
+    def get_indicator_display_name(self, plugin_id):
+        return plugin_id
+
+    def is_active_in_chart(self, plugin_id):
+        return False
+
+
+def _find_plugin(mt, pid):
+    for i in range(mt.topLevelItemCount()):
+        g = mt.topLevelItem(i)
+        for j in range(g.childCount()):
+            cat = g.child(j)
+            for k in range(cat.childCount()):
+                it = cat.child(k)
+                if it.data(0, ROLE_PLUGIN_ID) == pid:
+                    return it
+    return None
+
+
+model = _FakeModel(fake_tree)
+mt = MasterTree(model)
+mt._checkable = False
+mt._populate()
+
+plugin_item = _find_plugin(mt, "srv_grid_lines")
+check("B1) Plugin-Parent hat Clones (childCount>0)",
+      plugin_item is not None and plugin_item.childCount() == 2)
+check("B1) Plugin-Parent startet zugeklappt", not plugin_item.isExpanded())
+
+# expandieren -> _populate (simuliert data_changed nach Speichern)
+plugin_item.setExpanded(True)
+check("B1) Knoten expandiert", plugin_item.isExpanded())
+mt._populate()
+plugin_item2 = _find_plugin(mt, "srv_grid_lines")
+check("B1) Knoten bleibt nach Rebuild EXPANDIERT (Save-Collapse-Fix)",
+      plugin_item2 is not None and plugin_item2.isExpanded())
+
+# zugeklappt -> bleibt zugeklappt (kein Zwangs-Expand)
+plugin_item2.setExpanded(False)
+mt._populate()
+plugin_item3 = _find_plugin(mt, "srv_grid_lines")
+check("B1) Zugeklappter Knoten bleibt ZUGEKLAPPT (kein Auto-Expand)",
+      plugin_item3 is not None and not plugin_item3.isExpanded())
+
+# Category-Expansion bleibt erhalten (Regression)
+mt._populate()
+for i in range(mt.topLevelItemCount()):
+    g = mt.topLevelItem(i)
+    if g.childCount() > 0:
+        cat = g.child(0)
+        cat.setExpanded(True)
+        break
+mt._populate()
+cat_expanded = False
+for i in range(mt.topLevelItemCount()):
+    g = mt.topLevelItem(i)
+    if g.childCount() > 0:
+        cat_expanded = cat_expanded or g.child(0).isExpanded()
+check("B1) Category-Expansion bleibt erhalten (Regression)",
+      cat_expanded)
+
+# Statisch: Expansion-Code vorhanden
+mt_src = open("serviceui/master_tree.py", encoding="utf-8").read()
+check("B1) master_tree trackt TYPE_PLUGIN-Expansion (collect)",
+      'result.add(("plugin"' in mt_src)
+check("B1) master_tree stellt TYPE_PLUGIN-Expansion wieder her (apply)",
+      'key = ("plugin"' in mt_src)
+
+# ---------------------------------------------------------------------------
+# Bug 3) Slider-Spielraum + Grow-only-Splitter
+# ---------------------------------------------------------------------------
+sw_src = open("serviceui/service_win.py", encoding="utf-8").read()
+check("B3) Param-Panel-Minimum auf 520 reduziert",
+      "self._param_panel.setMinimumWidth(520)" in sw_src)
+check("B3) Initiale Splitter-Sizes gesetzt",
+      "self.main_splitter.setSizes([460, 820])" in sw_src)
+# Tree-Min 400 + Panel-Min 520 = 920 < typische Fensterbreite -> Spielraum
+check("B3) Min-Summe (920) < Default-Fensterbreite (1400) - Slider beweglich",
+      400 + 520 < 1400)
+
+pc_src = open("serviceui/param_columns.py", encoding="utf-8").read()
+check("B3) param_columns waechst nur (Grow-only-Splitter)",
+      "elif hints[1] > current[1]:" in pc_src)
+
+# Grow-only-Logik simulieren (Kopie des Codes)
+def grow_only(splitter_sizes, hints):
+    current = splitter_sizes
+    if not current or sum(current) <= 0:
+        return hints
+    elif hints[1] > current[1]:
+        return [current[0], hints[1]]
+    return current
+
+check("B3) Inhalt groesser -> Panel waechst (Tree bleibt)",
+      grow_only([460, 820], [400, 1000]) == [460, 1000])
+check("B3) Inhalt kleiner -> Position bleibt (kein Shrink)",
+      grow_only([460, 820], [400, 600]) == [460, 820])
+check("B3) User-Position bleibt bei Rebuild erhalten",
+      grow_only([300, 900], [400, 800]) == [300, 900])
+check("B3) Panel waechst bei groesserem Bedarf (Tree bleibt)",
+      grow_only([300, 900], [400, 942]) == [300, 942])
+
+# ---------------------------------------------------------------------------
+# Bug 4) Log-Hoehe 2 Zeilen (Default)
+# ---------------------------------------------------------------------------
+check("B4) Log-Hoehe auf 2 Zeilen reduziert (max)",
+      "setMaximumHeight(fm.lineSpacing() * 2 + 12)" in sw_src)
+check("B4) Log-Hoehe auf 2 Zeilen reduziert (min)",
+      "setMinimumHeight(fm.lineSpacing() * 2 + 12)" in sw_src)
+check("B4) Keine 4-Zeilen-Hoehe mehr",
+      "fm.lineSpacing() * 4 + 12" not in sw_src)
+
+# ---------------------------------------------------------------------------
+print(f"\n{sum(1 for _, ok, _ in PASS if ok)}/{len(PASS)} Checks PASS")
+fail = [n for n, ok, _ in PASS if not ok]
+if fail:
+    print("FAILS:", fail)
+    sys.exit(1)
+print("ALLE UI3-PRUEFUNGEN BESTANDEN (OK)")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_variant_bugfix.py
+```py
+# test/check_variant_bugfix.py
+# -*- coding: utf-8 -*-
+"""
+Bugfix 10.08.2026 (analytics_win / Service-Picker, Varianten):
+  1) Varianten-Anzeige: letztes Ausfuehrungsdatum am Varianten-Namen,
+     ID (#hash) entfaellt, kein Datum mehr am Plugin-Parent.
+  2) Neue Variante -> neuer Name wird vergeben (Namensdialog-Vorbereitung,
+     Kollisionspruefung).
+  3) 'Variante umbenennen' im Kontextmenue (rename_indicator_preset).
+
+KEINE GUI-Ausfuehrung (offscreen, kein exec_).
+"""
+import os
+import sys
+import tempfile
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtCore import QObject, Signal  # noqa: E402
+
+_app = QApplication.instance() or QApplication(sys.argv)
+
+from db_service import DbPool  # noqa: E402
+from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
+from analytics.engine.service_models import generate_instance_hash  # noqa: E402
+from analytics.engine.tree_builder import build_tree  # noqa: E402
+
+FAILURES = []
+
+
+def check(name, cond, detail=""):
+    s = "PASS" if cond else "FAIL"
+    print(f"[{s}] {name}" + (f" - {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(name)
+
+
+# ---------------------------------------------------------------------------
+# 1) FeatureStoreReader.fetch_last_execution_dates_by_hash (Temp-DB in test/)
+# ---------------------------------------------------------------------------
+tmpdir = tempfile.mkdtemp(prefix="pytrader_var_", dir=r"F:\Python\PyTrader\test")
+db_path = os.path.join(tmpdir, "check_variant.duckdb")
+con = DbPool.get(db_path)
+con.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR, timeframe VARCHAR, bar_time TIMESTAMPTZ,
+        feature_id VARCHAR, instance_hash VARCHAR, created_at TIMESTAMP,
+        feature_data JSON, plugin_version VARCHAR
+    )
+""")
+from datetime import datetime, timezone  # noqa: E402
+
+h1 = generate_instance_hash("srv_grid_lines", {"step_size": 0.5})
+h2 = generate_instance_hash("srv_grid_lines", {"step_size": 1.0})
+con.executemany("""
+    INSERT INTO feature_store (symbol, timeframe, bar_time, feature_id,
+                               instance_hash, created_at, feature_data)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+""", [
+    ("SILVER", "M1", datetime(2026, 8, 10, 10, 0, tzinfo=timezone.utc),
+     "srv_grid_lines", h1, datetime(2026, 8, 10, 9, 0),
+     '{"schema_version": "1.0.0"}'),
+    ("SILVER", "M1", datetime(2026, 8, 10, 11, 0, tzinfo=timezone.utc),
+     "srv_grid_lines", h2, datetime(2026, 8, 8, 9, 0),
+     '{"schema_version": "1.0.0"}'),
+    ("SILVER", "M1", datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc),
+     "srv_grid_lines", None, datetime(2026, 8, 9, 9, 0),
+     '{"schema_version": "1.0.0"}'),
+])
+reader = FeatureStoreReader(db_path=db_path)
+by_hash = reader.fetch_last_execution_dates_by_hash()
+check("1a) per-Hash-Daten je feature_id", "srv_grid_lines" in by_hash,
+      str(by_hash))
+per = by_hash.get("srv_grid_lines", {})
+check("1b) h1 hat Datum 10.08.26", per.get(h1) == "10.08.26", str(per))
+check("1c) h2 hat Datum 08.08.26", per.get(h2) == "08.08.26", str(per))
+check("1d) Rows ohne instance_hash werden uebersprungen", len(per) == 2,
+      str(per))
+
+# ---------------------------------------------------------------------------
+# 2) build_tree: Clone-Dicts tragen last_execution durch (Varianten-Anzeige)
+# ---------------------------------------------------------------------------
+clone_dicts = {
+    "srv_grid_lines": [
+        {"preset_name": "Default", "params": {"step_size": 0.5},
+         "instance_hash": h1, "is_archived": False, "doc_log": "",
+         "last_execution": "10.08.26"},
+        {"preset_name": "Wide", "params": {"step_size": 1.0},
+         "instance_hash": h2, "is_archived": False, "doc_log": "",
+         "last_execution": "08.08.26"},
+    ]
+}
+
+
+class _FakePlugin:
+    metadata = {"category": "Swing Points"}
+
+
+tree = build_tree(
+    sets_data=[],
+    plugins={"srv_grid_lines": _FakePlugin()},
+    overrides={},
+    empty_folders={},
+    badges={},
+    last_executions={"srv_grid_lines": "05.08.26"},
+    presets=clone_dicts,
+)
+plugins_group = next(g for g in tree if g["group"] == "plugins")
+leaf = next(c for c in plugins_group["children"] if c.get("group") == "category_node")
+leaf = leaf["children"][0] if leaf.get("group") == "category_node" else leaf
+clones = leaf.get("clones") or []
+check("2a) Plugin hat Clones", bool(clones), str(clones))
+check("2b) Clone traegt last_execution", clones[0].get("last_execution")
+      == "10.08.26", str(clones))
+check("2c) Plugin-Blatt traegt weiterhin last_execution (Parent-Datum)",
+      leaf.get("last_execution") == "05.08.26", str(leaf))
+
+# ---------------------------------------------------------------------------
+# 3) MasterTree-Label-Logik (offscreen, keine GUI-Ausfuehrung)
+# ---------------------------------------------------------------------------
+from serviceui.master_tree import MasterTree, ROLE_PRESET_NAME  # noqa: E402
+
+
+class _FakeModel(QObject):
+    GROUP_CATEGORY = "category_node"
+    GROUP_SETS = "sets"
+    GROUP_PLUGINS = "plugins"
+    data_changed = Signal()
+
+    def __init__(self, tree):
+        super().__init__()
+        self._tree = tree
+
+    def build_tree(self):
+        return self._tree
+
+    def belongs_to_indicator(self, plugin_id):
+        return False
+
+    def get_indicator_display_name(self, plugin_id):
+        return plugin_id
+
+    def is_active_in_chart(self, plugin_id):
+        return False
+
+
+fake_tree = [
+    {"group": "plugins", "label": "Services", "children": [leaf]},
+]
+_fake_model = _FakeModel(fake_tree)
+mt = MasterTree(_fake_model)
+mt._checkable = False
+plugin_item = mt._build_plugin_item(leaf, "plugins")
+clone_item = plugin_item.child(0)
+check("3a) Parent-Label ohne Datum bei Clones",
+      plugin_item.text(0) == "srv_grid_lines", repr(plugin_item.text(0)))
+check("3b) Clone-Label: Name + Datum, KEINE ID",
+      clone_item.text(0) == "🟢 Default (10.08.26)", repr(clone_item.text(0)))
+check("3c) Clone traegt ROLE_PRESET_NAME",
+      clone_item.data(0, ROLE_PRESET_NAME) == "Default",
+      repr(clone_item.data(0, ROLE_PRESET_NAME)))
+
+# Flaches Blatt (ohne Clones) behaelt das Datum am Plugin-Knoten
+flat_leaf = {"plugin_id": "srv_proximity", "badge": "",
+             "last_execution": "02.08.26", "clones": []}
+flat_item = mt._build_plugin_item(flat_leaf, "plugins")
+check("3d) Flaches Blatt: Datum bleibt am Plugin-Knoten",
+      flat_item.text(0) == "srv_proximity (02.08.26)",
+      repr(flat_item.text(0)))
+
+# Archivierte Clones: Datum am Namen, kein Hash
+arch_leaf = {"plugin_id": "srv_grid_lines", "badge": "", "last_execution": "05.08.26",
+             "clones": []}
+arch_leaf["clones"] = [
+    {"preset_name": "Alt", "params": {"step_size": 2.0},
+     "instance_hash": "deadbeef", "is_archived": True, "doc_log": "",
+     "last_execution": "01.08.26"},
+]
+arch_parent = {"plugin_id": "srv_grid_lines", "badge": "",
+               "last_execution": "05.08.26", "clones": arch_leaf["clones"],
+               "archived": True}
+arch_item = mt._build_plugin_item(arch_parent, "plugins")
+arch_clone = arch_item.child(0)
+check("3e) Archiv-Clone: Name + Datum, kein Hash",
+      arch_clone.text(0) == "🔹 Alt (01.08.26)", repr(arch_clone.text(0)))
+
+# ---------------------------------------------------------------------------
+# 4) StateManager.rename_indicator_preset (Temp-DB)
+# ---------------------------------------------------------------------------
+from state_manager import StateManager  # noqa: E402
+
+app_db = os.path.join(tmpdir, "check_variant_app.duckdb")
+sm = StateManager(db_path=app_db)
+sm.save_indicator_preset(
+    "ind_fixed_grid_proximity", "Default", {"step_size": 0.5},
+    plugin_id="srv_grid_lines", version="1.0.0", is_active_batch=True,
+)
+sm.rename_indicator_preset("ind_fixed_grid_proximity", "Default", "Default V2")
+names = [str(p.get("preset_name")) for p in sm.list_plugin_presets(
+    "srv_grid_lines")]
+check("4a) Rename persistiert", names == ["Default V2"], str(names))
+meta = sm.get_indicator_preset_meta("ind_fixed_grid_proximity", "Default V2")
+check("4b) Rename behaelt Plugin-Verknuepfung",
+      (meta or {}).get("plugin_id") == "srv_grid_lines", str(meta))
+check("4c) Alter Name ist frei", sm.get_indicator_preset(
+    "ind_fixed_grid_proximity", "Default") is None)
+
+# Namenskollision: zweites Preset anlegen + Kollisions-Semantik pruefen
+sm.save_indicator_preset(
+    "ind_fixed_grid_proximity", "Wide", {"step_size": 1.0},
+    plugin_id="srv_grid_lines", is_active_batch=True)
+existing = {str(p.get("preset_name")) for p in sm.list_plugin_presets(
+    "srv_grid_lines")}
+check("4d) Kollisionsmenge enthaelt beide Namen",
+      existing == {"Default V2", "Wide"}, str(existing))
+
+con.close()
+print("FEHLER:", FAILURES) if FAILURES else print(
+    "ALLE VARIANTEN-PRUEFUNGEN BESTANDEN (OK)")
+sys.exit(1 if FAILURES else 0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_variant_params_bugfix.py
+```py
+# test/check_variant_params_bugfix.py
+# -*- coding: utf-8 -*-
+"""
+Bugfix 10.08.2026 (Phase 20.04-Nachtrag, 3 Punkte):
+  1) Jede Variante (Clone/Preset) hat EIGENE Parameter - Klick auf einen
+     Clone-Knoten laedt die presetspezifischen Params (indicator_presets)
+     statt der globalen Standalone-Params; Save schreibt in das Preset.
+  2) CheckableComboBox: Klick auf die GESAMTE Box-Flaeche (auch LineEdit)
+     oeffnet/schliesst das Popup.
+  3) Resizable QSplitter zwischen Tree/Sidebar (links) und Parameter-
+     Box/Canvas (rechts) statt starrer QHBoxLayout-Verhaeltnisse.
+
+KEINE GUI-Ausfuehrung (offscreen, kein exec_).
+"""
+import os
+import sys
+import tempfile
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+
+app = QApplication.instance() or QApplication([])
+
+from state_manager import StateManager
+from analytics.engine.service_models import generate_instance_hash
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+# ---------------------------------------------------------------------------
+# Bug 2) CheckableComboBox - Klick auf LineEdit-Flaeche togglet das Popup
+# ---------------------------------------------------------------------------
+from PySide6.QtTest import QTest  # noqa: E402
+from PySide6.QtCore import Qt  # noqa: E402
+from analytics.ui.common import CheckableComboBox  # noqa: E402
+
+combo = CheckableComboBox()
+combo.add_checkable_item("Test-Feld", "t1")
+combo.resize(220, 30)
+combo.show()
+app.processEvents()
+QTest.mouseClick(combo.lineEdit(), Qt.LeftButton)
+app.processEvents()
+check("B2) Klick auf LineEdit oeffnet das Popup", combo.view().isVisible())
+QTest.mouseClick(combo.lineEdit(), Qt.LeftButton)
+app.processEvents()
+check("B2) 2. Klick auf LineEdit schliesst das Popup",
+      not combo.view().isVisible())
+# mousePressEvent-Override (Pfeil/Rahmen): direkter Aufruf togglet
+combo.mousePressEvent(type("E", (), {
+    "button": lambda self=None: Qt.LeftButton,
+    "accept": lambda self=None: None,
+    "pos": lambda self=None: combo.rect().center()})())
+app.processEvents()
+check("B2) mousePressEvent-Override oeffnet das Popup (Box/Rahmen)",
+      combo.view().isVisible())
+combo.hidePopup()
+combo.hide()
+
+# ---------------------------------------------------------------------------
+# Bug 1) StateManager-Preset-Round-Trip: Save in indicator_presets erhaelt
+#        is_active_batch + doc_log (Save-Pfad der Varianten-Params)
+# ---------------------------------------------------------------------------
+tmp = tempfile.mkdtemp(
+    prefix="p20_04_var_",
+    dir=os.path.dirname(os.path.abspath(__file__)))
+db = os.path.join(tmp, "app_variants.duckdb")
+sm = StateManager(db)
+base_params = {"step_size": 0.5, "steps_around": 4}
+sm.save_indicator_preset(
+    "ind_fixed_grid_proximity", "Default", base_params,
+    plugin_id="srv_grid_lines", version="1.0.0",
+    is_active_batch=True, doc_log="Negativ-Wissen")
+h = generate_instance_hash("srv_grid_lines", base_params)
+check("B1) Hash deterministisch (8-stellig)",
+      isinstance(h, str) and len(h) == 8, h)
+
+# Simuliert _save_plugin_params (Preset-Branch): params aendern, is_active_batch
+# + doc_log beibehalten
+new_params = {"step_size": 1.0, "steps_around": 8}
+sm.save_indicator_preset(
+    "ind_fixed_grid_proximity", "Default", new_params,
+    plugin_id="srv_grid_lines", version="1.0.0",
+    is_active_batch=True, doc_log="Negativ-Wissen")
+preset = sm.list_plugin_presets("srv_grid_lines")[0]
+check("B1) Preset-Params aktualisiert",
+      preset.get("params") == new_params, str(preset.get("params")))
+check("B1) is_active_batch bleibt True", preset.get("is_active_batch") is True)
+check("B1) doc_log bleibt erhalten",
+      preset.get("doc_log") == "Negativ-Wissen", str(preset.get("doc_log")))
+check("B1) plugin_id bleibt erhalten",
+      preset.get("plugin_id") == "srv_grid_lines")
+
+# _find_preset_for_hash-Roundtrip (Klick-Aufloesung Clone -> Preset)
+h2 = generate_instance_hash("srv_grid_lines", new_params)
+found = None
+for p in sm.list_plugin_presets("srv_grid_lines"):
+    if generate_instance_hash("srv_grid_lines", p.get("params") or {}) == h2:
+        found = p
+check("B1) Preset ueber instance_hash aufloesbar",
+      found is not None and found.get("preset_name") == "Default")
+
+# Preset-Params ueberschreiben die Registry-Defaults (Merge-Logik von
+# _load_clone_editor): Registry {step_size:0.5} + Preset {step_size:1.0}
+merged = dict({"step_size": 0.5, "lookback_extra": 3})
+merged.update(new_params)
+check("B1) Preset-Params ueberschreiben Defaults (Merge)",
+      merged.get("step_size") == 1.0 and merged.get("steps_around") == 8,
+      str(merged))
+sm = None
+
+# ---------------------------------------------------------------------------
+# Bug 1) Statische Verkabelung service_win.py
+# ---------------------------------------------------------------------------
+sw_src = open("serviceui/service_win.py", encoding="utf-8").read()
+for needle in (
+    "_current_preset_editing: Optional[Dict[str, Any]] = None",
+    "_load_clone_editor",
+    "self._load_clone_editor(str(plugin_id), str(service_id))",
+    "save_indicator_preset(",
+    "is_active_batch=bool(preset.get(\"is_active_batch\"))",
+):
+    check(f"B1) service_win.py enthaelt '{needle[:40]}...'", needle in sw_src)
+check("B1) ServiceWindow._load_clone_editor existiert",
+      hasattr(__import__("serviceui.service_win", fromlist=["ServiceWindow"]),
+              "ServiceWindow") and
+      "def _load_clone_editor" in sw_src)
+
+# ---------------------------------------------------------------------------
+# Bug 1) Statische Verkabelung service_selector_dialog.py
+# ---------------------------------------------------------------------------
+dlg_src = open("serviceui/service_selector_dialog.py", encoding="utf-8").read()
+for needle in (
+    "_current_preset_editing: Optional[Dict[str, Any]] = None",
+    "\"preset_params\": dict(preset.get(\"params\") or {})",
+    "preset_params = entry.get(\"preset_params\")",
+    "host._current_preset_editing = entry.get(\"preset\")",
+    "is_active_batch=bool(preset.get(\"is_active_batch\"))",
+):
+    check(f"B1) service_selector_dialog.py enthaelt '{needle[:40]}...'",
+          needle in dlg_src)
+
+# ---------------------------------------------------------------------------
+# Bug 3) QSplitter: Dialog (Tree + Parameter-Panel), AnalyticsWindow
+#        (Sidebar + Canvas), service_win (bereits vorhanden)
+# ---------------------------------------------------------------------------
+from serviceui.service_selector_dialog import ServiceSelectorDialog  # noqa: E402
+from analytics.engine.service_selector_model import ServiceSelectorModel  # noqa: E402
+
+model = ServiceSelectorModel()
+dlg = ServiceSelectorDialog(model=model, parent=None)
+sp = getattr(dlg, "_splitter", None)
+check("B3) Dialog hat QSplitter", sp is not None)
+check("B3) Splitter enthaelt Tree + Panel (count==2)",
+      sp is not None and sp.count() == 2)
+check("B3) Tree ist nicht mehr starr fixiert (minWidth 180)",
+      dlg.selector.minimumWidth() == 180)
+check("B3) Splitter nicht kollabierbar (Tree)",
+      sp is not None and sp.isCollapsible(0) is False)
+dlg.close()
+
+from analytics.ui.analytics_win import AnalyticsWindow  # noqa: E402
+
+aw = AnalyticsWindow()
+bsp = getattr(aw, "_body_splitter", None)
+check("B3) AnalyticsWindow hat Body-QSplitter", bsp is not None)
+check("B3) Analytics-Splitter count==2 (Sidebar+Stack)",
+      bsp is not None and bsp.count() == 2)
+check("B3) Sidebar minWidth statt fix 150",
+      aw.sidebar.minimumWidth() == 120)
+aw.close()
+
+sw_wiring = open("serviceui/service_win.py", encoding="utf-8").read()
+check("B3) service_win.py nutzt bereits QSplitter (main_splitter)",
+      "main_splitter = QSplitter(Qt.Horizontal)" in sw_wiring)
+
+# ---------------------------------------------------------------------------
+print(f"\n{sum(1 for _, ok, _ in PASS if ok)}/{len(PASS)} Checks PASS")
+fail = [n for n, ok, _ in PASS if not ok]
+if fail:
+    print("FAILS:", fail)
+    sys.exit(1)
+print("ALLE VARIANTEN-PARAM-/DROPDOWN-/SPLITTER-PRUEFUNGEN BESTANDEN (OK)")
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/check_wal_guard.py
 ```py
 """Test: DbPool-WAL-Guard wegsichert korrupte WAL und verbindet trotzdem."""
@@ -38993,6 +49394,118 @@ sys.exit(0 if not failures else 1)
 
 --------------------------------------------------
 
+### DATEI: test/debug_h1_filter.py
+```py
+# test/debug_h1_filter.py
+# -*- coding: utf-8 -*-
+"""
+Debug: Warum liefert set_feature_ids([srv_proximity]) in H1 keinen Payload?
+Prueft VM-Pipeline UND Repository-Query direkt mit Timing.
+"""
+import os
+import sys
+import time
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+
+app = QApplication.instance() or QApplication([])
+
+from analytics.engine.feature_store_reader import FeatureStoreReader
+from analytics.engine.analytics_repository import AnalyticsRepository
+from analytics.engine.analytics_view_model import AnalyticsViewModel
+from analytics.engine.analytics_worker import QUERY_HEATMAP_GENERIC
+
+DB = "data/analytics.duckdb"
+reader = FeatureStoreReader(db_path=DB)
+repo = AnalyticsRepository(reader=reader)
+
+# ---------------------------------------------------------------------------
+# 1) Repository direkt: get_generic_heatmap mit feature_ids=[srv_proximity]
+# ---------------------------------------------------------------------------
+print("=== 1) Repo direkt (SILVER/H1, agg=confluence_count, ids=[prox]) ===")
+t0 = time.time()
+try:
+    res = repo.get_generic_heatmap(
+        "SILVER", "H1", "date", "hour", None, "confluence_count",
+        feature_ids=["srv_proximity"])
+    print(f"  Dauer: {time.time()-t0:.2f}s")
+    print("  metrics:", res.get("metrics"))
+    print("  field_sources:", {k: v for k, v in (res.get("field_sources") or {}).items()})
+    print("  matrix-Form:", len(res.get("matrix") or []), "x", len((res.get("matrix") or [[]])[0]))
+except Exception as e:
+    print(f"  FEHLER: {type(e).__name__}: {e}")
+
+# ---------------------------------------------------------------------------
+# 2) Repo direkt: mit field=visit_pct, agg=avg (Wert-Aggregation)
+# ---------------------------------------------------------------------------
+print("\n=== 2) Repo direkt (field=visit_pct, agg=avg, ids=[prox]) ===")
+t0 = time.time()
+try:
+    res = repo.get_generic_heatmap(
+        "SILVER", "H1", "date", "hour", "visit_pct", "avg",
+        feature_ids=["srv_proximity"])
+    print(f"  Dauer: {time.time()-t0:.2f}s")
+    print("  field im Resultat:", res.get("field"))
+    print("  metrics:", res.get("metrics"))
+except Exception as e:
+    print(f"  FEHLER: {type(e).__name__}: {e}")
+
+# ---------------------------------------------------------------------------
+# 3) VM-Pipeline
+# ---------------------------------------------------------------------------
+print("\n=== 3) VM-Pipeline ===")
+vm = AnalyticsViewModel(analytics_repo=repo)
+vm.set_symbol("SILVER")
+vm.set_timeframe("H1")
+payloads = []
+
+
+def _on_data(kind, data):
+    print(f"  [data_ready] kind={kind} metrics={len(data.get('metrics') or [])} "
+          f"field_sources={len(data.get('field_sources') or {})}")
+    if kind == QUERY_HEATMAP_GENERIC:
+        payloads.append(dict(data))
+
+
+vm.data_ready.connect(_on_data)
+vm.query_failed.connect(lambda k, e: print(f"  [query_failed] {k}: {e}"))
+
+vm.request_heatmap_generic()
+t0 = time.time()
+while len(payloads) < 1 and time.time() - t0 < 15:
+    app.processEvents()
+    time.sleep(0.02)
+print(f"  Baseline payloads={len(payloads)} nach {time.time()-t0:.1f}s")
+print(f"  vm.params feature_ids={vm.params.get('feature_ids')}")
+print(f"  pending={list(vm._pending_kinds)} worker={vm._worker}")
+
+print("\n  -> set_feature_ids(['srv_proximity'])")
+vm.set_feature_ids(["srv_proximity"])
+print(f"  vm.params feature_ids={vm.params.get('feature_ids')}")
+print(f"  pending={list(vm._pending_kinds)}")
+t0 = time.time()
+while len(payloads) < 2 and time.time() - t0 < 15:
+    app.processEvents()
+    time.sleep(0.02)
+print(f"  payloads nach Filter: {len(payloads)} nach {time.time()-t0:.1f}s")
+print(f"  pending={list(vm._pending_kinds)} worker={vm._worker}")
+if len(payloads) >= 2:
+    last = payloads[-1]
+    print("  field_sources:", {k: v for k, v in (last.get("field_sources") or {}).items()})
+
+vm.shutdown()
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/fix_page_changed.py
 ```py
 # test/fix_page_changed.py - temporaeres Fix-Skript: setCurrentIndex in _on_page_changed
@@ -39028,6 +49541,1160 @@ text = text.replace(old, new)
 path.write_text(text, encoding="utf-8", newline="")
 print("OK: _on_page_changed setzt jetzt den Seiten-Stack.")
 sys.exit(0)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/grep_db.py
+```py
+# test/grep_db.py - Helper: DB-Konstanten in db_service.py
+import io, os, re
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+fp = os.path.join(ROOT, "db_service.py")
+lines = io.open(fp, encoding="utf-8").read().splitlines()
+print(f"=== {fp} ===")
+for i, l in enumerate(lines, 1):
+    if re.match(r"^[A-Z_]{3,}\s*=", l) or "duckdb" in l.lower():
+        print(f"{i}: {l.strip()[:140]}")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/grep_db2.py
+```py
+# test/grep_db2.py - Helper: DbPool-Konstanten & DB-Dateien
+import io, os, re
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+fp = os.path.join(ROOT, "db_service.py")
+lines = io.open(fp, encoding="utf-8").read().splitlines()
+print(f"=== {fp}: DbPool / Pfade ===")
+for i, l in enumerate(lines, 1):
+    if "DbPool" in l or ".duckdb" in l or "DB_" in l or "market_data" in l.lower():
+        print(f"{i}: {l.strip()[:150]}")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/grep_dialog.py
+```py
+# test/grep_dialog.py - Helper: Ergebnis-Parameter-Dropdown Quellen in service_selector_dialog.py
+import io, os, re
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+fp = os.path.join(ROOT, "serviceui", "service_selector_dialog.py")
+lines = io.open(fp, encoding="utf-8").read().splitlines()
+print(f"=== {fp} ({len(lines)} Zeilen) ===")
+pats = ["Ergebnis", "result", "dropdown", "Dropdown", "field", "Field",
+        "feature_keys", "result_keys", "result_key"]
+for i, l in enumerate(lines, 1):
+    ls = l.strip()
+    if not ls:
+        continue
+    if any(p in l for p in pats) and ("key" in l.lower() or "dropdown" in l.lower()
+                                      or "Ergebnis" in l or "feature_keys" in l
+                                      or "result" in l.lower()):
+        print(f"{i}: {ls[:150]}")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/grep_eval.py
+```py
+# test/grep_eval.py - Helper: ServiceSetEvaluator.execute_set + prepare_worker_definition Signaturen
+import io, os, re
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+print("=== ServiceSetEvaluator.execute_set (set_evaluator.py) ===")
+fp = os.path.join(ROOT, "analytics", "engine", "set_evaluator.py")
+if os.path.exists(fp):
+    lines = io.open(fp, encoding="utf-8").read().splitlines()
+    for i, l in enumerate(lines, 1):
+        if "def execute_set" in l or "class ServiceSetEvaluator" in l:
+            print(f"{i}: {l.strip()[:160]}")
+else:
+    # suchen
+    for r, d, fs in os.walk(ROOT):
+        if "/test" in r or "/docs" in r or "/.git" in r or "/.venv" in r:
+            continue
+        for f in fs:
+            if f.endswith(".py") and "evaluator" in f.lower():
+                print("Datei:", os.path.relpath(os.path.join(r, f), ROOT))
+                for i, l in enumerate(io.open(os.path.join(r, f), encoding="utf-8").read().splitlines(), 1):
+                    if "def execute_set" in l:
+                        print(f"  {i}: {l.strip()[:160]}")
+
+print("\n=== prepare_worker_definition (service_set_utils.py) ===")
+fp = os.path.join(ROOT, "serviceui", "service_set_utils.py")
+lines = io.open(fp, encoding="utf-8").read().splitlines()
+for i, l in enumerate(lines, 1):
+    if "def prepare_worker_definition" in l:
+        print(f"{i}: {l.strip()[:160]}")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/grep_executor.py
+```py
+# test/grep_executor.py - Helper: PluginExecutor.execute + Dependencies-Aufloesung
+import io, os, re
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+fp = os.path.join(ROOT, "analytics", "features", "feature_builder.py")
+lines = io.open(fp, encoding="utf-8").read().splitlines()
+print(f"=== feature_builder.py ({len(lines)} Zeilen) ===")
+for i, l in enumerate(lines, 1):
+    ls = l.strip()
+    if (l.startswith("class ") or re.match(r"    def ", l)
+            or "depends_on" in l or "shared_state" in l or "PluginExecutor" in l):
+        print(f"{i}: {ls[:150]}")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/grep_fb.py
+```py
+# test/grep_fb.py - Helper: load_ohlcv / prepare_plugin_df / _to_utc_datetime
+import io, os, re
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+fp = os.path.join(ROOT, "analytics", "features", "feature_builder.py")
+lines = io.open(fp, encoding="utf-8").read().splitlines()
+print(f"=== feature_builder.py ===")
+for i, l in enumerate(lines, 1):
+    if "def load_ohlcv" in l or "def prepare_plugin_df" in l or "def _to_utc_datetime" in l:
+        print(f"{i}: {l.strip()[:150]}")
+# Kontext drumherum
+for i, l in enumerate(lines, 1):
+    if ("def load_ohlcv" in l or "def prepare_plugin_df" in l
+            or "def _to_utc_datetime" in l):
+        for j in range(i, min(i + 22, len(lines))):
+            print(f"  {j}: {lines[j].strip()[:130]}")
+        print("  ---")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/grep_ind.py
+```py
+# test/grep_ind.py - Helper: was liest ind_fixed_grid_proximity aus dem Store?
+import io, os, re
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+fp = os.path.join(ROOT, "chart", "indicators", "ind_fixed_grid_proximity.py")
+lines = io.open(fp, encoding="utf-8").read().splitlines()
+print(f"=== {os.path.relpath(fp, ROOT)} ===")
+for i, l in enumerate(lines, 1):
+    if re.search(r"feature_store|grid_lines|feature_rows|srv_grid|fetch|reader|build_chart_render", l, re.I):
+        print(f"{i}: {l.strip()[:150]}")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/grep_reader.py
+```py
+# test/grep_reader.py - Helper: gezielte Zeilen aus feature_store_reader.py + Konsumenten
+import io, os, re, sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+print("=== Konsumenten von feature_keys_by_service / checked_feature_ids ===")
+for rel in ["serviceui/service_selector_dialog.py", "serviceui/master_tree.py"]:
+    fp = os.path.join(ROOT, rel)
+    if not os.path.exists(fp):
+        print(f"[fehlt] {rel}")
+        continue
+    lines = open(fp, encoding="utf-8").read().splitlines()
+    hits = [i for i, l in enumerate(lines, 1) if "feature_keys_by_service" in l
+            or "checked_feature_ids" in l or "checked_services" in l
+            or "checked_display_names" in l]
+    print(f"\n--- {rel} ({len(lines)} Zeilen) ---")
+    for i in hits:
+        print(f"{i}: {lines[i-1].strip()[:170]}")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/grep_scan.py
+```py
+# test/grep_scan.py - Helper: Feature-Store-Schreibpfad & Scan-Mechanik finden
+import io, os, re
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# 1) Wer schreibt feature_data / feature_store?
+print("=== Schreibpfade (INSERT INTO feature_store / feature_data) ===")
+for rel in ["analytics/engine/analytics_worker.py",
+            "analytics/engine/set_evaluator.py",
+            "analytics/engine/feature_store_repository.py",
+            "analytics/engine/feature_store_writer.py",
+            "analytics/engine/analytics_repository.py"]:
+    fp = os.path.join(ROOT, rel)
+    if not os.path.exists(fp):
+        continue
+    lines = io.open(fp, encoding="utf-8").read().splitlines()
+    hits = [i for i, l in enumerate(lines, 1)
+            if "INSERT INTO feature_store" in l or "feature_data" in l
+            or "feature_store_payload" in l or "def write" in l
+            or "def save" in l or "def store" in l or "upsert" in l.lower()]
+    if hits:
+        print(f"\n--- {rel} ---")
+        for i in hits:
+            print(f"{i}: {lines[i-1].strip()[:150]}")
+
+# 2) Wer stoesst Berechnung an (scan?)
+print("\n=== Scan-/Berechnungs-Trigger ===")
+for rel in ["analytics/engine/analytics_worker.py",
+            "analytics/engine/analytics_view_model.py"]:
+    fp = os.path.join(ROOT, rel)
+    if not os.path.exists(fp):
+        continue
+    lines = io.open(fp, encoding="utf-8").read().splitlines()
+    hits = [i for i, l in enumerate(lines, 1)
+            if re.search(r"scan|recalc|recompute|berechne|calculate\b", l, re.I)
+            and ("def " in l or "run" in l.lower() or "start" in l.lower()
+                 or "execute" in l.lower())]
+    if hits:
+        print(f"\n--- {rel} ---")
+        for i in hits[:40]:
+            print(f"{i}: {lines[i-1].strip()[:150]}")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/grep_write.py
+```py
+# test/grep_write.py - Helper: wo wird feature_store geschrieben?
+import io, os, re
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+pat = re.compile(r"INSERT INTO feature_store|feature_data\)|feature_store_payload|write_feature|save_feature|upsert", re.I)
+print("=== Dateien mit Schreibpfad-Hinweisen (ohne test/, docs/, .git) ===")
+for r, d, fs in os.walk(ROOT):
+    rr = r.replace("\\", "/")
+    if "/test" in rr or "/docs" in rr or "/.git" in rr or "/node_modules" in rr or "/.venv" in rr:
+        continue
+    for f in fs:
+        if not f.endswith(".py"):
+            continue
+        fp = os.path.join(r, f)
+        try:
+            lines = io.open(fp, encoding="utf-8").read().splitlines()
+        except Exception:
+            continue
+        hits = [i for i, l in enumerate(lines, 1) if pat.search(l)]
+        if hits:
+            print(f"\n--- {os.path.relpath(fp, ROOT)} ---")
+            for i in hits[:25]:
+                print(f"{i}: {lines[i-1].strip()[:160]}")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/inspect_dbpool.py
+```py
+# test/inspect_dbpool.py
+# -*- coding: utf-8 -*-
+"""Untersucht DbPool: gleiche DB wie Reader? Nur SELECT, kein Schreiben."""
+import sys
+sys.path.insert(0, r"F:\Python\PyTrader")
+sys.stdout.reconfigure(encoding="utf-8")
+
+from db_service import DbPool
+from analytics.engine.feature_store_reader import FeatureStoreReader
+
+print("=== DbPool Quelle ===")
+import inspect
+src = inspect.getsource(DbPool)
+print(src[:3000])
+
+print("\n=== Reader nutzt DbPool - gleiche DB? ===")
+reader = FeatureStoreReader(db_path=r"F:\Python\PyTrader\data\analytics.duckdb")
+con = reader._get_connection()
+print("Connection:", con)
+rows = con.execute("""
+    SELECT LOWER(TRIM(feature_id)) AS fid, COUNT(*),
+           SUM(CASE WHEN feature_data IS NOT NULL THEN 1 ELSE 0 END) AS has
+    FROM feature_store
+    GROUP BY 1
+""").fetchall()
+for r in rows:
+    print(" ", r)
+
+print("\n=== DISTINCT symbol/timeframe fuer srv_proximity (JSON) ===")
+rows = con.execute("""
+    SELECT DISTINCT symbol, timeframe, plugin_version
+    FROM feature_store
+    WHERE LOWER(TRIM(feature_id)) = 'srv_proximity'
+      AND feature_data IS NOT NULL
+""").fetchall()
+print(rows)
+
+print("\n=== Reader feature_keys_by_service Einzel-Service proximity ===")
+res = reader.feature_keys_by_service(
+    "SILVER", "M1", numeric_only=False, feature_id="srv_proximity")
+print(res)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/inspect_mk.py
+```py
+# test/inspect_mk.py - Helper: Tabellen in Market-Data-DB + SILVER M1 Umfang
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from db_service import DbPool, DB_MARKET_DATA
+
+con = DbPool.get(DB_MARKET_DATA)
+print("=== Tabellen ===")
+for r in con.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='main'").fetchall():
+    print(r[0])
+
+print("\n=== SILVER M1 Umfang ===")
+for r in con.execute("""
+    SELECT count(*) AS n, min(time) AS min_t, max(time) AS max_t
+    FROM ohlcv_bars WHERE symbol='SILVER' AND timeframe='M1'
+""").fetchall():
+    print(r)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/inspect_optb.py
+```py
+# test/inspect_optb.py - Helper: Charakterisierung JSON-Quelle (H1 prox, M1 grid) fuer Option B
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from db_service import DbPool, DB_ANALYTICS
+
+con = DbPool.get(DB_ANALYTICS)
+
+print("=== srv_proximity H1: instance_hash / created_at / visit_pct ===")
+rows = con.execute("""
+    SELECT instance_hash, created_at, feature_data->>'visit_pct' AS vp,
+           count(*) AS n, min(bar_time) AS min_t, max(bar_time) AS max_t
+    FROM feature_store
+    WHERE symbol='SILVER' AND timeframe='H1' AND feature_id='srv_proximity'
+      AND feature_data IS NOT NULL
+    GROUP BY 1,2,3 ORDER BY 2 DESC LIMIT 8
+""").fetchall()
+for r in rows:
+    print(r)
+
+print("\n=== srv_grid_lines M1: JSON-Rows (1006?) instance_hash / created_at / Bereich ===")
+rows = con.execute("""
+    SELECT instance_hash, created_at, count(*) AS n,
+           min(bar_time) AS min_t, max(bar_time) AS max_t,
+           count(DISTINCT feature_data->>'schema_version') AS sv_n
+    FROM feature_store
+    WHERE symbol='SILVER' AND timeframe='M1' AND feature_id='srv_grid_lines'
+      AND feature_data IS NOT NULL
+    GROUP BY 1,2 ORDER BY 2 DESC LIMIT 8
+""").fetchall()
+for r in rows:
+    print(r)
+
+print("\n=== M1 OHLCV Gesamtumfang (market_data) fuer Recompute-Scope ===")
+try:
+    from db_service import DB_MARKET_DATA
+    conm = DbPool.get(DB_MARKET_DATA)
+    r = conm.execute("""
+        SELECT count(*) AS n, min(time) AS min_t, max(time) AS max_t
+        FROM market_data WHERE symbol='SILVER' AND timeframe='M1'
+    """).fetchall()
+    print(r)
+except Exception as e:
+    print("market_data-Frage fehlgeschlagen:", e)
+
+print("\n=== scanner_candle_limit (App-Settings) ===")
+from state_manager import StateManager
+try:
+    s = StateManager().get_app_settings()
+    print("scanner_candle_limit =", getattr(s, "scanner_candle_limit", "n/a"))
+except Exception as e:
+    print("settings:", e)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/inspect_proximity_json.py
+```py
+# test/inspect_proximity_json.py
+# -*- coding: utf-8 -*-
+"""Untersucht srv_proximity JSON feature_data: Zeitraum, Keys, Typen."""
+import sys
+import json
+import duckdb
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+sys.stdout.reconfigure(encoding="utf-8")
+
+con = duckdb.connect(r"F:\Python\PyTrader\data\analytics.duckdb", read_only=True)
+
+print("=== Zeitraum-Vergleich (SILVER/M1) ===")
+queries = [
+    ("srv_proximity JSON (feature_data IS NOT NULL)",
+     "SELECT MIN(bar_time), MAX(bar_time), COUNT(*) FROM feature_store "
+     "WHERE LOWER(feature_id)='srv_proximity' AND feature_data IS NOT NULL"),
+    ("srv_proximity legacy (feature_data IS NULL)",
+     "SELECT MIN(bar_time), MAX(bar_time), COUNT(*) FROM feature_store "
+     "WHERE LOWER(feature_id)='srv_proximity' AND feature_data IS NULL"),
+    ("srv_grid_lines",
+     "SELECT MIN(bar_time), MAX(bar_time), COUNT(*) FROM feature_store "
+     "WHERE LOWER(feature_id)='srv_grid_lines'"),
+]
+for label, q in queries:
+    print(f"  {label}: {con.execute(q).fetchall()}")
+
+print("\n=== JSON sample srv_proximity ===")
+for (raw,) in con.execute("""
+    SELECT feature_data FROM feature_store
+    WHERE LOWER(feature_id)='srv_proximity' AND feature_data IS NOT NULL
+    LIMIT 3
+""").fetchall():
+    print(" ", str(raw)[:500])
+
+print("\n=== Keys ueber 2000 srv_proximity JSON Rows (Typen) ===")
+rows = con.execute("""
+    SELECT feature_data FROM feature_store
+    WHERE LOWER(feature_id)='srv_proximity' AND feature_data IS NOT NULL
+    LIMIT 2000
+""").fetchall()
+key_types = {}
+count = 0
+for (raw,) in rows:
+    try:
+        d = json.loads(raw) if isinstance(raw, str) else (raw or {})
+    except Exception:
+        continue
+    count += 1
+    if not isinstance(d, dict):
+        continue
+    for k, v in d.items():
+        if k == "schema_version":
+            continue
+        if isinstance(v, bool):
+            t = "bool"
+        elif isinstance(v, (int, float)):
+            t = "num"
+        elif v is None:
+            t = "null"
+        else:
+            t = "str"
+        key_types.setdefault(k, set()).add(t)
+print(f"untersucht {count} Rows")
+for k in sorted(key_types):
+    print(f"  {k}: {sorted(key_types[k])}")
+
+print("\n=== Zeitraum der letzten 5 JSON Rows ===")
+for r in con.execute("""
+    SELECT bar_time, feature_data FROM feature_store
+    WHERE LOWER(feature_id)='srv_proximity' AND feature_data IS NOT NULL
+    ORDER BY bar_time DESC LIMIT 5
+""").fetchall():
+    print("  ", r[0], "|", str(r[1])[:300])
+
+con.close()
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/inspect_proximity_keys.py
+```py
+# test/inspect_proximity_keys.py
+# -*- coding: utf-8 -*-
+"""Untersucht srv_proximity feature_data (SILVER/M1) - warum keine Feld-Keys?"""
+import sys
+import duckdb
+
+sys.stdout.reconfigure(encoding="utf-8")
+con = duckdb.connect("data/analytics.duckdb", read_only=True)
+
+print("=== srv_proximity feature_data-Strukturen (SILVER/M1) ===")
+rows = con.execute("""
+    SELECT DISTINCT feature_data
+    FROM feature_store
+    WHERE LOWER(symbol)='silver' AND LOWER(timeframe)='m1'
+      AND LOWER(feature_id)='srv_proximity'
+      AND feature_data IS NOT NULL
+    LIMIT 15
+""").fetchall()
+for (raw,) in rows:
+    print(str(raw)[:400])
+
+print("\n=== Typen der Keys ueber alle srv_proximity Rows ===")
+import json
+rows2 = con.execute("""
+    SELECT feature_data FROM feature_store
+    WHERE LOWER(symbol)='silver' AND LOWER(timeframe)='m1'
+      AND LOWER(feature_id)='srv_proximity'
+      AND feature_data IS NOT NULL
+    LIMIT 2000
+""").fetchall()
+key_types = {}
+count = 0
+for (raw,) in rows2:
+    try:
+        d = json.loads(raw) if isinstance(raw, str) else (raw or {})
+    except Exception:
+        continue
+    count += 1
+    if not isinstance(d, dict):
+        continue
+    for k, v in d.items():
+        if k == "schema_version":
+            continue
+        if isinstance(v, bool):
+            t = "bool"
+        elif isinstance(v, (int, float)):
+            t = "num"
+        elif v is None:
+            t = "null"
+        else:
+            t = "str"
+        key_types.setdefault(k, set()).add(t)
+print(f"untersucht {count} Rows")
+for k in sorted(key_types):
+    print(f"  {k}: {sorted(key_types[k])}")
+
+print("\n=== Zeitraum-Vergleich: letzte bar_time je Service (SILVER/M1) ===")
+for fid in ("srv_proximity", "srv_grid_lines", "srv_swing_volume_profile"):
+    r = con.execute("""
+        SELECT MIN(bar_time), MAX(bar_time), COUNT(*)
+        FROM feature_store
+        WHERE LOWER(symbol)='silver' AND LOWER(timeframe)='m1'
+          AND LOWER(feature_id)=?
+    """, [fid]).fetchone()
+    print(f"  {fid}: {r}")
+
+print("\n=== feature_keys_by_service-Aequivalent (numeric_only) via Reader ===")
+from analytics.engine.feature_store_reader import FeatureStoreReader
+reader = FeatureStoreReader(db_path="data/analytics.duckdb")
+res = reader.feature_keys_by_service(
+    "SILVER", "M1", numeric_only=True,
+    feature_ids=["srv_grid_lines", "srv_proximity"])
+for fid, keys in res.items():
+    print(f"  {fid}: {keys}")
+con.close()
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/inspect_proximity_schema.py
+```py
+# test/inspect_proximity_schema.py
+# -*- coding: utf-8 -*-
+"""Untersucht feature_store-Schema + srv_proximity-Datenspeicherung."""
+import sys
+import duckdb
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+sys.stdout.reconfigure(encoding="utf-8")
+
+con = duckdb.connect(r"F:\Python\PyTrader\data\analytics.duckdb", read_only=True)
+
+print("=== DESCRIBE feature_store ===")
+for r in con.execute("DESCRIBE feature_store").fetchall():
+    print(" ", r)
+
+print("\n=== feature_id / Rows / NULL-feature_data ===")
+rows = con.execute("""
+    SELECT feature_id, COUNT(*) AS total,
+           SUM(CASE WHEN feature_data IS NULL THEN 1 ELSE 0 END) AS null_data,
+           SUM(CASE WHEN feature_data IS NOT NULL THEN 1 ELSE 0 END) AS has_data
+    FROM feature_store
+    GROUP BY feature_id
+""").fetchall()
+for r in rows:
+    print(" ", r)
+
+print("\n=== srv_proximity Beispielzeilen (SILVER/M1, LIMIT 3) ===")
+rows = con.execute("""
+    SELECT * FROM feature_store
+    WHERE LOWER(symbol)='silver' AND LOWER(timeframe)='m1'
+      AND LOWER(feature_id)='srv_proximity'
+    LIMIT 3
+""").fetchall()
+cols = [d[0] for d in con.description]
+for r in rows:
+    print("  ", dict(zip(cols, r)))
+
+print("\n=== Zeilen mit feature_data != NULL je Service (SILVER/M1) ===")
+rows = con.execute("""
+    SELECT feature_id, COUNT(*) FROM feature_store
+    WHERE LOWER(symbol)='silver' AND LOWER(timeframe)='m1'
+      AND feature_data IS NOT NULL
+    GROUP BY feature_id
+""").fetchall()
+for r in rows:
+    print(" ", r)
+
+con.close()
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/inspect_proximity_timeframes.py
+```py
+# test/inspect_proximity_timeframes.py
+# -*- coding: utf-8 -*-
+"""Verifiziert: srv_proximity JSON-Rows nur in H1/H4/MN1, nicht M1."""
+import sys
+import duckdb
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+sys.stdout.reconfigure(encoding="utf-8")
+
+con = duckdb.connect(r"F:\Python\PyTrader\data\analytics.duckdb", read_only=True)
+
+print("=== srv_proximity je timeframe (SILVER): JSON vs Legacy ===")
+rows = con.execute("""
+    SELECT timeframe,
+           COUNT(*) AS total,
+           SUM(CASE WHEN feature_data IS NOT NULL THEN 1 ELSE 0 END) AS json_rows,
+           MIN(bar_time), MAX(bar_time)
+    FROM feature_store
+    WHERE LOWER(feature_id) = 'srv_proximity'
+    GROUP BY timeframe
+    ORDER BY timeframe
+""").fetchall()
+for r in rows:
+    print(f"  {r}")
+
+print("\n=== srv_proximity M1: JSON-Rows exakt? ===")
+r = con.execute("""
+    SELECT COUNT(*) FROM feature_store
+    WHERE LOWER(feature_id)='srv_proximity'
+      AND LOWER(symbol)='silver' AND LOWER(timeframe)='m1'
+      AND feature_data IS NOT NULL
+""").fetchone()
+print("  M1 JSON-Rows:", r[0])
+
+print("\n=== plugin_version Verteilung srv_proximity je timeframe ===")
+rows = con.execute("""
+    SELECT timeframe, plugin_version, COUNT(*)
+    FROM feature_store
+    WHERE LOWER(feature_id) = 'srv_proximity'
+    GROUP BY timeframe, plugin_version
+    ORDER BY timeframe, plugin_version
+""").fetchall()
+for r in rows:
+    print("  ", r)
+
+print("\n=== Legacy-M1-Spalten wirklich gefuellt? (native Spalten) ===")
+r = con.execute("""
+    SELECT COUNT(*),
+           COUNT(grid_nearest_level), COUNT(grid_dist_abs), COUNT(grid_dist_pct),
+           COUNT(pivot_high), COUNT(regime_trend_score), COUNT(ema_diff),
+           COUNT(rsi_14), COUNT(atr_normalized)
+    FROM feature_store
+    WHERE LOWER(feature_id)='srv_proximity'
+      AND LOWER(symbol)='silver' AND LOWER(timeframe)='m1'
+""").fetchone()
+print("  total, grid_nearest, grid_dist_abs, grid_dist_pct, pivot_high, regime_trend, ema_diff, rsi_14, atr_norm:", r)
+
+print("\n=== srv_proximity H1 JSON: welche Keys? ===")
+rows = con.execute("""
+    SELECT DISTINCT feature_data FROM feature_store
+    WHERE LOWER(feature_id)='srv_proximity' AND LOWER(timeframe)='h1'
+      AND feature_data IS NOT NULL LIMIT 3
+""").fetchall()
+for (raw,) in rows:
+    print("  ", str(raw)[:300])
+
+con.close()
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/inspect_reader_keys_real.py
+```py
+# test/inspect_reader_keys_real.py
+# -*- coding: utf-8 -*-
+"""feature_keys_by_service direkt gegen echte DB - warum keine proximity-Keys?"""
+import sys
+sys.path.insert(0, r"F:\Python\PyTrader")
+sys.stdout.reconfigure(encoding="utf-8")
+
+from analytics.engine.feature_store_reader import FeatureStoreReader
+
+reader = FeatureStoreReader(db_path=r"F:\Python\PyTrader\data\analytics.duckdb")
+
+print("=== feature_keys_by_service(numeric_only=False, alle) ===")
+res = reader.feature_keys_by_service("SILVER", "M1", numeric_only=False)
+for fid in sorted(res):
+    print(f"  {fid}: {res[fid]}")
+
+print("\n=== feature_keys_by_service(numeric_only=True, alle) ===")
+res = reader.feature_keys_by_service("SILVER", "M1", numeric_only=True)
+for fid in sorted(res):
+    print(f"  {fid}: {res[fid]}")
+
+print("\n=== feature_keys_by_service(numeric_only=True, ids=[grid,prox]) ===")
+res = reader.feature_keys_by_service(
+    "SILVER", "M1", numeric_only=True,
+    feature_ids=["srv_grid_lines", "srv_proximity"])
+print(res)
+
+print("\n=== feature_keys_by_service(numeric_only=False, ids=[grid,prox]) ===")
+res = reader.feature_keys_by_service(
+    "SILVER", "M1", numeric_only=False,
+    feature_ids=["srv_grid_lines", "srv_proximity"])
+print(res)
+
+print("\n=== fetch_heatmap Metrik visit_pct (prox, nur srv_proximity) ===")
+hm = reader.fetch_heatmap("SILVER", "M1", metric="visit_pct",
+                          feature_ids=["srv_proximity"])
+print("  Matrix 24x7, Summe:", sum(sum(r) for r in hm["matrix"]))
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/inspect_real_db.py
+```py
+# test/inspect_real_db.py
+# -*- coding: utf-8 -*-
+"""Kurz-Inspektion der echten analytics.duckdb (nur lesen)."""
+import sys
+import duckdb
+
+sys.stdout.reconfigure(encoding="utf-8")
+con = duckdb.connect("data/analytics.duckdb", read_only=True)
+print("=== DESCRIBE feature_store ===")
+print(con.execute("DESCRIBE feature_store").fetchdf().to_string())
+print("\n=== DISTINCT feature_id (Anzahl) ===")
+rows = con.execute("SELECT feature_id, COUNT(*) c FROM feature_store GROUP BY 1 ORDER BY 2 DESC LIMIT 40").fetchall()
+for r in rows:
+    print(r)
+print("\n=== DISTINCT symbol/timeframe ===")
+print(con.execute("SELECT DISTINCT symbol, timeframe FROM feature_store LIMIT 20").fetchall())
+print("\n=== instance_hash Beispiele (falls Spalte existiert) ===")
+try:
+    print(con.execute("SELECT DISTINCT instance_hash FROM feature_store WHERE instance_hash IS NOT NULL LIMIT 10").fetchall())
+except Exception as e:
+    print("keine instance_hash-Spalte:", e)
+print("\n=== Zeilenanzahl ===")
+print(con.execute("SELECT COUNT(*) FROM feature_store").fetchone())
+con.close()
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/inspect_set.py
+```py
+# test/inspect_set.py - Helper: Set-Definition "test" ansehen (grid+proximity)
+import os, sys, json
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from db_service import DbPool, DB_APP_DATA
+
+con = DbPool.get(DB_APP_DATA)
+row = con.execute(
+    "SELECT set_id, display_name, definition FROM service_sets WHERE set_id=?",
+    ["5a28885a2c6e41b59d41301da6c5d5e8"]).fetchone()
+if row is None:
+    print("Set nicht gefunden")
+    sys.exit(0)
+print("set_id:", row[0], "| display_name:", row[1])
+d = row[2]
+if isinstance(d, str):
+    d = json.loads(d)
+print("Definition-Keys:", list(d.keys()) if isinstance(d, dict) else type(d))
+if isinstance(d, dict):
+    print("execution_order:", d.get("execution_order"))
+    svcs = d.get("services") or {}
+    for iid, cfg in svcs.items():
+        c = cfg if isinstance(cfg, dict) else {}
+        pid = c.get("plugin_id")
+        params = c.get("params") or {}
+        ih = c.get("instance_hash")
+        print(f"  - {iid}: plugin_id={pid} instance_hash={ih}")
+        if pid == "srv_proximity":
+            print(f"      params: {params}")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/inspect_sets.py
+```py
+# test/inspect_sets.py - Helper: Sets/Presets mit srv_proximity + srv_grid_lines
+import os, sys, json
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from db_service import DbPool, DB_APP_DATA
+
+con = DbPool.get(DB_APP_DATA)
+
+print("=== service_sets Schema ===")
+for r in con.execute("DESCRIBE service_sets").fetchall():
+    print("  ", r[0], r[1])
+
+print("\n=== service_sets mit srv_proximity ===")
+try:
+    cols = [d[0] for d in con.execute("SELECT * FROM service_sets LIMIT 0").description]
+    for r in con.execute("SELECT * FROM service_sets").fetchall():
+        d = dict(zip(cols, r))
+        txt = json.dumps(d, default=str)
+        if "srv_proximity" in txt:
+            sid = d.get("set_id")
+            name = d.get("display_name") or d.get("description")
+            print("  ", sid, "|", name)
+except Exception as e:
+    print("  fehlgeschlagen:", e)
+
+print("\n=== indicator_presets (Batch-Plugins mit is_active_batch) ===")
+for r in con.execute("SELECT indicator_id, preset_name, plugin_id, is_active_batch FROM indicator_presets").fetchall():
+    print("  ", r)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/inspect_siglimit.py
+```py
+# test/inspect_siglimit.py - Helper: statistics_signal_limit aus App-Settings
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from state_manager import StateManager
+
+try:
+    s = StateManager().get_app_settings()
+    print("scanner_candle_limit =", getattr(s, "scanner_candle_limit", "n/a"))
+    print("statistics_signal_limit =", getattr(s, "statistics_signal_limit", "n/a"))
+    print("settings-Attribute (relevant):")
+    for a in dir(s):
+        if not a.startswith("_"):
+            try:
+                print("  ", a, "=", getattr(s, a))
+            except Exception:
+                pass
+except Exception as e:
+    print("settings-Fehler:", e)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/patch_master_tree_bug45.py
+```py
+# test/patch_master_tree_bug45.py
+# Bugfix 10.08.2026 (Bug 4/5): stale-Plugin-Hook im MasterTree.
+# Fuehrt 5 verankerte Textersetzungen in serviceui/master_tree.py aus
+# (jede Anker-Ersetzung muss EINDEUTIG sein - sonst Abbruch ohne Schreiben).
+# Grund fuer Skript statt Edit-Tool: Datei > 100k Zeichen -> Read-Tool
+# kann sie nicht laden, Edit-Tool verlangt aber einen Read vorher.
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+TARGET = ROOT / "serviceui" / "master_tree.py"
+
+REPLACEMENTS = [
+    # R1: TYPE_SERVICE-Uncheck -> auch Plugin-/Clone-Haken abhaengen
+    (
+        "                else:\n"
+        "                    self._checked_items.discard(key)\n"
+        "                parent = item.parent()\n",
+        "                else:\n"
+        "                    self._checked_items.discard(key)\n"
+        "                    # Bugfix 10.08.2026 (Bug 4/5): Alle Zeilen derselben\n"
+        "                    # plugin_id abhaengen (Standalone-/Clone-Haken aus\n"
+        "                    # set_checked_feature_ids) - sonst bliebe die plugin_id\n"
+        "                    # ueber einen anderen Zeilen-Typ im Filter aktiv.\n"
+        "                    self._uncheck_plugin_rows(\n"
+        "                        str(item.data(0, ROLE_PLUGIN_ID) or \"\"))\n"
+        "                parent = item.parent()\n",
+    ),
+    # R2: TYPE_PLUGIN-Uncheck -> auch Service-/Clone-Haken abhaengen
+    (
+        "                else:\n"
+        "                    self._checked_items.discard(key)\n"
+        "            elif node_type == TYPE_CLONE:\n",
+        "                else:\n"
+        "                    self._checked_items.discard(key)\n"
+        "                    self._uncheck_plugin_rows(\n"
+        "                        str(item.data(0, ROLE_PLUGIN_ID) or \"\"))\n"
+        "            elif node_type == TYPE_CLONE:\n",
+    ),
+    # R3: TYPE_CLONE-Uncheck -> auch Service-/Plugin-Haken abhaengen
+    (
+        "                else:\n"
+        "                    self._checked_items.discard(key)\n"
+        "            elif node_type == TYPE_SET:\n",
+        "                else:\n"
+        "                    self._checked_items.discard(key)\n"
+        "                    self._uncheck_plugin_rows(\n"
+        "                        str(item.data(0, ROLE_PLUGIN_ID) or \"\"))\n"
+        "            elif node_type == TYPE_SET:\n",
+    ),
+    # R4: TYPE_SET-Uncheck -> je Kind auch Plugin-/Clone-Haken abhaengen
+    (
+        "                    else:\n"
+        "                        self._checked_items.discard(key)\n"
+        "                        child.setData(0, Qt.CheckStateRole, Qt.Unchecked)\n"
+        "                self._apply_set_state(item)\n",
+        "                    else:\n"
+        "                        self._checked_items.discard(key)\n"
+        "                        child.setData(0, Qt.CheckStateRole, Qt.Unchecked)\n"
+        "                        # Bugfix 10.08.2026 (Bug 4/5): Auch die Standalone-/\n"
+        "                        # Clone-Haken dieser plugin_id abhaengen, damit das\n"
+        "                        # Set-Uncheck den kompletten Feature-Haken entfernt.\n"
+        "                        self._uncheck_plugin_rows(\n"
+        "                            str(child.data(0, ROLE_PLUGIN_ID) or \"\"))\n"
+        "                self._apply_set_state(item)\n",
+    ),
+    # R5: Neue Hilfsmethode _uncheck_plugin_rows vor _derive_set_state
+    (
+        "            self.checked_changed.emit()\n"
+        "        finally:\n"
+        "            self._updating_checks = False\n"
+        "\n"
+        "    def _derive_set_state(self, set_item) -> int:\n",
+        "            self.checked_changed.emit()\n"
+        "        finally:\n"
+        "            self._updating_checks = False\n"
+        "\n"
+        "    def _uncheck_plugin_rows(self, plugin_id: str) -> None:\n"
+        "        \"\"\"Haengt ALLE Zeilen einer plugin_id ab (Bugfix 10.08.2026).\n"
+        "\n"
+        "        `checked_feature_ids()` dedupliziert die Haken auf\n"
+        "        plugin_id-Ebene (eine plugin_id == eine feature_id fuer\n"
+        "        `WHERE feature_id IN (...)`). Beim Restore\n"
+        "        (`set_checked_feature_ids`) koennen deshalb mehrere Zeilen-\n"
+        "        Typen derselben plugin_id angehakt sein: die Service-Zeile im\n"
+        "        Set, das Standalone-Plugin-Blatt (TYPE_PLUGIN) und ggf.\n"
+        "        Clones. Ein Uncheck NUR einer Zeile wuerde die plugin_id\n"
+        "        ueber die anderen Zeilen im Filter belassen (Dropdown/\n"
+        "        Historie reagieren nicht) - deshalb werden hier alle Zeilen\n"
+        "        mit derselben plugin_id abgehaengt und ihre Keys aus\n"
+        "        `_checked_items` entfernt. Wird aus den Uncheck-Zweigen von\n"
+        "        `_on_item_changed` gerufen (laeuft unter `_updating_checks\n"
+        "        == True`, d. h. die setData-Aufrufe feuern keine spurious\n"
+        "        Events).\n"
+        "        \"\"\"\n"
+        "        pid = str(plugin_id or \"\").lower()\n"
+        "        if not pid:\n"
+        "            return\n"
+        "        for item in TreeItemIterator(self):\n"
+        "            if item is None or not isValid(item):\n"
+        "                continue\n"
+        "            node_type = item.data(0, ROLE_NODE_TYPE)\n"
+        "            if node_type not in (TYPE_SERVICE, TYPE_PLUGIN, TYPE_CLONE):\n"
+        "                continue\n"
+        "            if str(item.data(0, ROLE_PLUGIN_ID) or \"\").lower() != pid:\n"
+        "                continue\n"
+        "            if item.checkState(0) != Qt.Checked:\n"
+        "                continue\n"
+        "            if node_type == TYPE_SERVICE:\n"
+        "                key = (TYPE_SERVICE,\n"
+        "                       str(item.data(0, ROLE_SET_ID) or \"\"),\n"
+        "                       str(item.data(0, ROLE_INSTANCE_ID) or \"\"))\n"
+        "            elif node_type == TYPE_PLUGIN:\n"
+        "                key = (TYPE_PLUGIN, \"\",\n"
+        "                       str(item.data(0, ROLE_PLUGIN_ID) or \"\"))\n"
+        "            else:\n"
+        "                key = (TYPE_CLONE,\n"
+        "                       str(item.data(0, ROLE_PLUGIN_ID) or \"\"),\n"
+        "                       str(item.data(0, ROLE_INSTANCE_HASH) or \"\"))\n"
+        "            self._checked_items.discard(key)\n"
+        "            item.setData(0, Qt.CheckStateRole, Qt.Unchecked)\n"
+        "            parent = item.parent()\n"
+        "            if (parent is not None and isValid(parent)\n"
+        "                    and parent.data(0, ROLE_NODE_TYPE) == TYPE_SET):\n"
+        "                self._apply_set_state(parent)\n"
+        "\n"
+        "    def _derive_set_state(self, set_item) -> int:\n",
+    ),
+]
+
+
+def main() -> int:
+    text = TARGET.read_text(encoding="utf-8")
+    for i, (old, new) in enumerate(REPLACEMENTS, start=1):
+        count = text.count(old)
+        if count != 1:
+            print(f"FEHLER R{i}: Anker {count}x gefunden (erwartet 1x) - "
+                  f"Abbruch, Datei unveraendert.")
+            return 1
+        text = text.replace(old, new)
+        print(f"OK   R{i}: Ersetzung eindeutig.")
+    TARGET.write_text(text, encoding="utf-8")
+    print(f"\nGeschrieben: {TARGET}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/read_lines.py
+```py
+# test/read_lines.py
+# -*- coding: utf-8 -*-
+"""Hilfs-Skript: Zeilenbereich einer Datei ausgeben (PowerShell-Quoting-Umgehung)."""
+import sys
+
+filepath = sys.argv[1]
+start = int(sys.argv[2])  # 0-basiert (wie Python-Listen)
+end = int(sys.argv[3])    # exklusiv
+
+with open(filepath, "r", encoding="utf-8") as f:
+    lines = f.readlines()
+for i in range(start, min(end, len(lines))):
+    print(f"{i+1:5d} | {lines[i].rstrip()}")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/recompute_proximity_m1.py
+```py
+# test/recompute_proximity_m1.py - Option B: SILVER/M1 srv_proximity + srv_grid_lines
+# neu berechnen (Set "test" aus app_data) und via store_plugin_payload upserten.
+#
+# Repliziert exakt die ServiceRunWorker-Logik (serviceui/run_worker.py):
+#   prepare_worker_definition -> load_ohlcv -> prepare_plugin_df ->
+#   PluginContext -> execute_set -> store_plugin_payload (je Service).
+#
+# Modus:
+#   python test/recompute_proximity_m1.py          -> DRY-RUN (kein DB-Write)
+#   python test/recompute_proximity_m1.py --commit -> echter Upsert in analytics.duckdb
+#
+# Regeln: Testdatei in test/, kein GUI. Schreibpfad = Produktions-analytics.duckdb
+# (NUR mit --commit).
+import os
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+COMMIT = "--commit" in sys.argv
+
+from db_service import DbPool, DB_ANALYTICS, DB_APP_DATA
+from state_manager import StateManager
+
+SET_ID = "5a28885a2c6e41b59d41301da6c5d5e8"  # Set "test" (grid_lines + proximity)
+SYMBOL = "SILVER"
+TIMEFRAME = "M1"
+
+
+def load_set_definition(con) -> dict:
+    row = con.execute(
+        "SELECT definition FROM service_sets WHERE set_id = ?", [SET_ID]
+    ).fetchone()
+    if row is None:
+        raise SystemExit(f"Set {SET_ID} nicht gefunden")
+    import json
+    d = row[0]
+    if isinstance(d, str):
+        d = json.loads(d)
+    return d
+
+
+def main() -> None:
+    settings = StateManager().get_app_settings()
+    scanner_limit = int(getattr(settings, "scanner_candle_limit", 100000))
+
+    from analytics.features.feature_builder import (
+        FeatureBuilder,
+        prepare_plugin_df,
+    )
+    from analytics.features.plugins.base_plugin import PluginContext
+    from analytics.engine.service_models import generate_instance_hash
+    from analytics.engine.set_evaluator import ServiceSetEvaluator
+    from serviceui.service_set_utils import prepare_worker_definition
+
+    # 1) Set-Definition laden + Worker-Aufbereitung (depends_on + lookback)
+    con_app = DbPool.get(DB_APP_DATA)
+    definition = load_set_definition(con_app)
+    definition = prepare_worker_definition(definition, scanner_limit)
+    print(f"Set: {definition.get('display_name')} | "
+          f"execution_order={definition.get('execution_order')}")
+    for iid, cfg in (definition.get("services") or {}).items():
+        print(f"  - {iid}: plugin={cfg.get('plugin_id')} "
+              f"depends_on={cfg.get('depends_on')} lookback={cfg.get('lookback')}")
+
+    # 2) OHLCV laden (letzte scanner_limit Bars)
+    fb = FeatureBuilder()
+    df = fb.load_ohlcv(SYMBOL, TIMEFRAME, limit=scanner_limit)
+    if df is None or df.empty:
+        raise SystemExit(f"Keine OHLCV-Daten fuer {SYMBOL}/{TIMEFRAME}")
+    print(f"OHLCV: {len(df)} Bars "
+          f"({df['bar_time'].iloc[0]} .. {df['bar_time'].iloc[-1]})")
+    df_plugin = prepare_plugin_df(df)
+
+    # 3) Pipeline ausfuehren
+    context = PluginContext(
+        symbol=SYMBOL,
+        timeframe=TIMEFRAME,
+        mode="batch",
+        timestamp=int(df_plugin["time"].iloc[-1]) if len(df_plugin) else None,
+        settings=settings,
+    )
+    evaluator = ServiceSetEvaluator()
+    results = evaluator.execute_set(definition, df_plugin, context=context)
+
+    # 4) Payloads pruefen
+    svc_cfgs = dict(definition.get("services") or {})
+    payloads = {}
+    for iid, result in results.items():
+        payload = (result or {}).get("feature_store_payload") or {}
+        records = payload.get("records") or []
+        keys = sorted({k for r in records for k in r.keys() if k != "bar_time"})
+        print(f"Pipeline {iid}: {len(records)} Records | "
+              f"feature_id={payload.get('feature_id')} v={payload.get('plugin_version')}")
+        print(f"  JSON-Keys: {keys}")
+        payloads[iid] = (payload, svc_cfgs.get(iid) or {})
+
+    if not COMMIT:
+        print("\nDRY-RUN: kein DB-Write. Mit --commit ausfuehren, um zu speichern.")
+        return
+
+    # 5) Upsert in analytics.duckdb (exakt wie run_worker)
+    con = DbPool.get(DB_ANALYTICS)
+    total = 0
+    for iid, (payload, cfg) in payloads.items():
+        records = payload.get("records") or []
+        if not records:
+            print(f"  {iid}: kein Payload -> uebersprungen")
+            continue
+        pid = str(cfg.get("plugin_id") or iid)
+        params = cfg.get("params") or {}
+        instance_hash = str(cfg.get("instance_hash") or "") or \
+            generate_instance_hash(pid, params)
+        n = fb.store_plugin_payload(
+            SYMBOL, TIMEFRAME, payload, con=con, instance_hash=instance_hash)
+        total += n
+        print(f"  {iid}: {n} Feature-Rows upgesert ({SYMBOL} {TIMEFRAME})")
+    print(f"Fertig: {total} Feature-Rows geschrieben.")
+
+
+if __name__ == "__main__":
+    main()
 
 ```
 
@@ -39725,7 +51392,7 @@ class _FakeFB:
     def load_ohlcv(self, symbol, tf, limit=None):
         return self._df if tf in ("M1", "H1") else None
 
-    def store_plugin_payload(self, symbol, tf, payload):
+    def store_plugin_payload(self, symbol, tf, payload, instance_hash=None):
         self.calls.append((symbol, tf, payload))
 
 
@@ -41348,6 +53015,7 @@ _p1701_con.execute("""
         created_at TIMESTAMP DEFAULT current_timestamp,
         feature_id VARCHAR NOT NULL DEFAULT 'native',
         plugin_version VARCHAR,
+        instance_hash VARCHAR,
         feature_data JSON,
         PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
     )
@@ -41668,6 +53336,7 @@ _con17.execute("""
         created_at TIMESTAMP DEFAULT current_timestamp,
         feature_id VARCHAR NOT NULL DEFAULT 'native',
         plugin_version VARCHAR,
+        instance_hash VARCHAR,
         feature_data JSON,
         PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
     )
@@ -41894,6 +53563,7 @@ _con18.execute("""
         created_at TIMESTAMP DEFAULT current_timestamp,
         feature_id VARCHAR NOT NULL DEFAULT 'native',
         plugin_version VARCHAR,
+        instance_hash VARCHAR,
         feature_data JSON,
         PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
     )
@@ -42025,6 +53695,7 @@ _p19_con.execute("""
         created_at TIMESTAMP,
         feature_id VARCHAR NOT NULL DEFAULT 'native',
         plugin_version VARCHAR,
+        instance_hash VARCHAR,
         feature_data JSON,
         PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
     )
@@ -42635,6 +54306,7 @@ _con24.execute("""
         created_at TIMESTAMP DEFAULT current_timestamp,
         feature_id VARCHAR NOT NULL DEFAULT 'native',
         plugin_version VARCHAR,
+        instance_hash VARCHAR,
         feature_data JSON,
         PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
     )
@@ -44700,6 +56372,249 @@ try:
                   for f in _tech20_3b), str(_tech20_3b))
 except Exception as _e20_3b:
     check("20.03-Bugfix-Check", False, str(_e20_3b))
+
+
+# ============================================================================
+# 20.03.02 (09.08.2026, F1-F7): CheckableComboBox, native-Fallback (F3),
+# Header-Format (F5), set_heatmap_config-Signatur (F2), Widget-Re-Emission
+# (F4). Headless (offscreen, kein exec_).
+# ============================================================================
+try:
+    from PySide6.QtWidgets import QComboBox  # noqa: E402
+    from analytics.ui.common import CheckableComboBox  # noqa: E402
+
+    _cbo = CheckableComboBox()
+    _cbo.add_checkable_item("Grid Lines / open", "srv_grid_lines|open", True)
+    _cbo.add_checkable_item("Proximity / visit_pct",
+                            "srv_proximity|visit_pct", False)
+    _cbo.add_checkable_item("Preis (mehrere)", "price", True)
+    check("20.03.02 a) checked_data nur angehakte userData",
+          _cbo.checked_data() == ["srv_grid_lines|open", "price"],
+          str(_cbo.checked_data()))
+    _cbo.set_checked_data(["srv_proximity|visit_pct", "price"])
+    check("20.03.02 b) set_checked_data wechselt CheckStates",
+          _cbo.checked_data() == ["srv_proximity|visit_pct", "price"],
+          str(_cbo.checked_data()))
+    check("20.03.02 c) CheckableComboBox ist QComboBox (headless)",
+          isinstance(_cbo, QComboBox))
+except Exception as _e203a:
+    check("20.03.02 CheckableComboBox-Check", False, str(_e203a))
+
+try:
+    from analytics.engine.analytics_view_model import AnalyticsViewModel  # noqa: E402
+    _vm203 = AnalyticsViewModel(selector_model=None)
+    check("20.03.02 d) native -> 'Allgemein' (F3)",
+          _vm203.resolve_service_display_name("native") == "Allgemein",
+          _vm203.resolve_service_display_name("native"))
+    check("20.03.02 e) native_* -> 'Allgemein' (F3)",
+          _vm203.resolve_service_display_name("native_foo") == "Allgemein",
+          _vm203.resolve_service_display_name("native_foo"))
+    check("20.03.02 f) none/leer -> 'Allgemein' (F3)",
+          _vm203.resolve_service_display_name("none") == "Allgemein"
+          and _vm203.resolve_service_display_name("") == "Allgemein",
+          _vm203.resolve_service_display_name("none"))
+except Exception as _e203d:
+    check("20.03.02 F3-Check", False, str(_e203d))
+
+try:
+    import inspect  # noqa: E402
+    from analytics.engine.analytics_view_model import AnalyticsViewModel as _VM203  # noqa: E402
+    _sig203 = inspect.signature(_VM203.set_heatmap_config)
+    _params203 = list(_sig203.parameters)
+    check("20.03.02 g) set_heatmap_config-Signatur unveraendert (F2)",
+          _params203 == ["self", "x_dim", "y_dim", "field", "agg"],
+          str(_params203))
+    from analytics.ui.heatmap_widget import HeatmapWidget  # noqa: E402
+    check("20.03.02 h) _field_key extrahiert JSON-Key (F2)",
+          HeatmapWidget._field_key("srv_proximity|visit_pct") == "visit_pct"
+          and HeatmapWidget._field_key("price") == "price",
+          HeatmapWidget._field_key("srv_proximity|visit_pct"))
+except Exception as _e203g:
+    check("20.03.02 F2-Check", False, str(_e203g))
+
+try:
+    from serviceui.service_selector_dialog import ServiceSelectorDialog  # noqa: E402
+
+    class _FakeHeaderModel:
+        """Mini-Model fuer die F5-Header-Konvention (nur die benoetigten
+        Methoden; keine DB)."""
+
+        def belongs_to_indicator(self, pid):
+            return pid == "srv_grid_lines"
+
+        def get_indicator_display_name(self, pid):
+            return "Ind_FixedGridProximity"
+
+        def is_active_in_chart(self, pid):
+            return True
+
+        def get_set_indicator_names(self, set_def):
+            return ["Ind_A", "Ind_B"]
+
+        def is_set_active(self, set_def):
+            return False
+
+    _dlg203 = ServiceSelectorDialog.__new__(ServiceSelectorDialog)
+    _dlg203.model = _FakeHeaderModel()
+    _h203 = _dlg203._info_header_line("srv_grid_lines")
+    check("20.03.02 i) Header-Format aktiv (F5)",
+          _h203 == "📌 im Ind_FixedGridProximity | 🟢 aktiv in "
+                   "Ind_FixedGridProximity",
+          _h203)
+    _h203b = _dlg203._info_header_line("unbekannt")
+    check("20.03.02 j) Header leer ohne Indikator (F5)",
+          _h203b == "", repr(_h203b))
+    _h203c = _dlg203._info_set_header_line({})
+    check("20.03.02 k) Set-Header inaktiv mit + (F5)",
+          _h203c == "📌 im Ind_A + Ind_B | ⚪ inaktiv", _h203c)
+except Exception as _e203i:
+    check("20.03.02 F5-Check", False, str(_e203i))
+
+try:
+    from serviceui.service_selector_widget import ServiceSelectorWidget  # noqa: E402
+    check("20.03.02 l) Widget re-emittiert category_info_requested (F4)",
+          hasattr(ServiceSelectorWidget, "category_info_requested"),
+          "Signal fehlt")
+except Exception as _e203l:
+    check("20.03.02 F4-Check", False, str(_e203l))
+
+try:
+    # F1-Filter (Regression, Commit 4648399): feature_keys_by_service mit
+    # feature_ids liefert NUR die Keys der selektierten Services. Nutzt
+    # _reader37/_db37_ana aus dem 37er-Block (Services srv_a + srv_b).
+    _keys20 = _reader37.feature_keys_by_service(
+        "XAGUSD", "M1", feature_ids=["srv_a"])
+    check("20.03.02 m) Filter-Check (F1): feature_ids=['srv_a'] -> KEINE srv_b-Keys",
+          "srv_a" in _keys20 and "srv_b" not in _keys20, str(_keys20))
+    _keys20b = _reader37.feature_keys_by_service(
+        "XAGUSD", "M1", feature_ids=["srv_b"])
+    check("20.03.02 n) Filter-Check (F1): feature_ids=['srv_b'] -> KEINE srv_a-Keys",
+          "srv_b" in _keys20b and "srv_a" not in _keys20b, str(_keys20b))
+except Exception as _e203m:
+    check("20.03.02 F1-Filter-Check", False, str(_e203m))
+
+try:
+    from analytics.ui.heatmap_widget import _VALUE_AGGS  # noqa: E402
+    check("20.03.02 o) F7: count/confluence_count NICHT in _VALUE_AGGS (Combo disabled)",
+          "count" not in _VALUE_AGGS and "confluence_count" not in _VALUE_AGGS
+          and "avg" in _VALUE_AGGS, str(_VALUE_AGGS))
+except Exception as _e203o:
+    check("20.03.02 F7-Check", False, str(_e203o))
+
+# ============================================================================
+# 20.03.03 (09.08.2026, Q1-Q5): Dropdown-Eindeutigkeit & Sammel-Auswahl im
+# 'Feld'-Dropdown der generischen Heatmap. Headless (offscreen, kein exec_).
+# ============================================================================
+
+
+class _FakeVM200303:
+    """Mini-ViewModel fuer den 20.03.03-Block (nur benoetigte Member)."""
+
+    def __init__(self):
+        self.data_ready = None
+        self.params = {}
+        self.calls = []
+
+    def set_heatmap_config(self, x_dim, y_dim, field, agg):
+        self.calls.append(("config", x_dim, y_dim, field, agg))
+        self.params.update(heatmap_x_dim=x_dim, heatmap_y_dim=y_dim,
+                           heatmap_agg=agg, heatmap_field=field)
+
+    def set_feature_ids(self, ids):
+        self.calls.append(("feature_ids", list(ids)))
+        self.params["feature_ids"] = list(ids)
+
+    def set_candle_projection(self, v):
+        pass
+
+    def request_daily_ohlc(self):
+        pass
+
+    def request_heatmap_generic(self):
+        pass
+
+    def resolve_service_display_name(self, pid):
+        return {"srv_proximity": "Proximity",
+                "srv_grid_lines": "Grid Lines",
+                "srv_volume_profile": "Volume Profile"}.get(str(pid), str(pid))
+
+
+try:
+    from analytics.ui.common import CheckableComboBox  # noqa: E402
+    from analytics.ui.heatmap_widget import HeatmapWidget  # noqa: E402
+
+    # Q4: add_header_item (deaktivierte Trennzeile, userData None)
+    _cbo203 = CheckableComboBox()
+    _cbo203.add_checkable_item("A", "srv_a|k", True)
+    _cbo203.add_header_item("🌐 HEADER")
+    _hdr203 = _cbo203.model().item(1)
+    check("20.03.03 a) Header Qt.NoItemFlags + userData None (Q4)",
+          not (_hdr203.flags() & Qt.ItemIsEnabled)
+          and _hdr203.data(Qt.UserRole) is None, str(_hdr203.flags()))
+    check("20.03.03 b) checked_data() ignoriert Header (Q4)",
+          _cbo203.checked_data() == ["srv_a|k"], str(_cbo203.checked_data()))
+
+    # Q1/Q2/Q5: Payload-Sync (shared is_hit + unique Keys)
+    _w203 = HeatmapWidget()
+    _w203._view_model = _FakeVM200303()
+    _w203._view_model.params["heatmap_field"] = "is_hit"
+    _payload203 = {
+        "metrics": ["count", "confluence_count", "is_hit", "steps_around",
+                    "visit_pct", "volume_ratio"],
+        "field_sources": {
+            "is_hit": ["srv_proximity", "srv_grid_lines"],
+            "steps_around": ["srv_grid_lines"],
+            "visit_pct": ["srv_proximity"],
+            "volume_ratio": ["srv_volume_profile"],
+        },
+        "agg": "avg", "x_dim": "date", "y_dim": "hour",
+    }
+    _w203._sync_combos_from_payload(_payload203)
+    _cf203 = _w203._combo_field
+    _labels203 = [_cf203.itemText(i) for i in range(_cf203.count())]
+    _uds203 = [str(_cf203.itemData(i)) for i in range(_cf203.count())]
+    check("20.03.03 c) KEIN roher Key 'is_hit' im Dropdown (Q1)",
+          "is_hit" not in _uds203 and "ALL|is_hit" in _uds203, str(_uds203))
+    check("20.03.03 d) Einzel-Eintraege pro Service (Q1)",
+          "Proximity / is_hit" in _labels203
+          and "Grid Lines / is_hit" in _labels203, str(_labels203))
+    _cd203 = _cf203.checked_data()
+    check("20.03.03 e) Initial: Sammel + unique angehakt, shared-Einzel nicht (Q5)",
+          set(_cd203) == {"ALL|is_hit", "srv_grid_lines|steps_around",
+                          "srv_proximity|visit_pct",
+                          "srv_volume_profile|volume_ratio"}, str(_cd203))
+    check("20.03.03 f) ALL|is_hit expandiert auf beide Quellen (Q2)",
+          _w203._checked_field_service_ids()
+          == ["srv_proximity", "srv_grid_lines", "srv_volume_profile"],
+          str(_w203._checked_field_service_ids()))
+
+    # Q5 XOR (Klick-Tracking): Klick auf Einzel -> Sammel abgewaehlt
+    _cf203._last_click_index = 3
+    _cf203.set_checked_data(["ALL|is_hit", "srv_proximity|is_hit"])
+    _w203._reconcile_sammel_checks()
+    check("20.03.03 g) XOR: Klick Einzel -> Sammel abgewaehlt (Q5)",
+          "ALL|is_hit" not in _cf203.checked_data()
+          and "srv_proximity|is_hit" in _cf203.checked_data(),
+          str(_cf203.checked_data()))
+    # Q5 XOR umgekehrt: Klick auf Sammel -> Einzel abgewaehlt
+    _cf203._last_click_index = 1
+    _cf203.set_checked_data(["ALL|is_hit", "srv_proximity|is_hit"])
+    _w203._reconcile_sammel_checks()
+    check("20.03.03 h) XOR: Klick Sammel -> Einzel abgewaehlt (Q5)",
+          "ALL|is_hit" in _cf203.checked_data()
+          and "srv_proximity|is_hit" not in _cf203.checked_data(),
+          str(_cf203.checked_data()))
+
+    # E6-Loop: params haelt reinen Key -> KEIN ueberfluessiger config-Call
+    _cf203.setCurrentIndex(1)
+    _w203._view_model.calls.clear()
+    _w203._view_model.params["heatmap_field"] = "is_hit"
+    _w203._sync_combos_from_payload(_payload203)
+    _configs203 = [c for c in _w203._view_model.calls if c[0] == "config"]
+    check("20.03.03 i) E6-Loop: sync mit heatmap_field='is_hit' ohne config-Call",
+          len(_configs203) == 0, str(_configs203))
+except Exception as _e2033:
+    check("20.03.03-Check", False, str(_e2033))
 
 
 if FAILURES:

@@ -881,3 +881,140 @@ kuerzten den Filter.
 * `py_compile` aller 4 geaenderten Dateien: EXIT=0.
 
 ---
+
+## 8h. Implementierungs-Log - Bugfix Runde 9+10: Varianten-granularer ServicePicker-Filter, No-Data-Differenzierung, Restore-Reihenfolge (10.08.2026)
+
+**Problem (User-Bugreport 10.08.2026, Runden 9+10):**
+(1) Check/Uncheck im ServicePicker filterte nur plugin_id-granular - das
+Uncheck EINER Variante (Clone) zeigte keinen Effekt, weil die
+Varianten-Einschraenkung (instance_hashes) nicht durch die Kette
+MasterTree -> Dialog -> Window -> ViewModel -> Worker -> Repo -> Reader-SQL
+gereicht wurde.
+(2) resolve_no_data_variants markierte Varianten faelschlich als
+'(No Data)', wenn die Daten unter einem anderen/veralteten Hash oder ohne
+Hash (NULL, Alt-Bestand) geschrieben wurden; Set-Instanz-Varianten fehlten
+komplett.
+(3) Restore-Reihenfolge: Queries starteten VOR der UI-Combo-Synchronisierung
+(leere/alte Controls -> _current_params() None -> Queries uebersprungen).
+(4) Deterministischer Initial-Load: leere Symbol-Combo fuehrte zu
+set_symbol("") und uebersprungenen Initial-Queries.
+(5) Geometrie-Restore pruefte nur gegen primaryScreen - Positionen auf
+Monitor 2 fielen auf den Fallback zurueck.
+
+### Loesung
+
+* `serviceui/master_tree.py` + `serviceui/service_selector_dialog.py`:
+  Neue `selection_hashes_requested`-Kette (Runde 10, Bug 1) - der Dialog
+  liefert die instance_hashes der gecheckten Clone-Varianten; das Window
+  reicht sie an `set_feature_ids(ids, hashes)`.
+* `analytics/engine/analytics_view_model.py`: `instance_hashes` als
+  `_params`-Key + `_normalize_instance_hashes()`; `set_feature_ids()` mit
+  optionalem `instance_hashes`-Parameter (None = bestehende Einschraenkung
+  behalten); `_current_params()` gibt die Hashes in die Query-Params.
+* `analytics/engine/analytics_worker.py` + `analytics_repository.py`:
+  reichen `instance_hashes` an alle 5 Daten-Repo-Methoden durch.
+* `analytics/engine/feature_store_reader.py`: `_apply_feature_filter()`
+  baut die Hash-Bedingung `(instance_hash IS NULL OR LOWER(TRIM(instance_hash))
+  IN (...))`; `available_instance_hashes()` liefert die Hash-Menge mit
+  feature_data. `resolve_no_data_variants` differenziert (Bug 2): benannte
+  Variante zaehlt NUR mit exaktem Hash-Match, pids_with_data-Fallback nur
+  fuer NULL-Hash-Bestand; Set-Instanz-Varianten werden ueber
+  generate_instance_hash erfasst.
+* `analytics/ui/heatmap_widget.py`: '(No Data)'-Hinweise zentral in
+  `_rebuild_field_dropdown()` gerendert (deckt Cache-Rebuild-Pfad ab);
+  Hash-Filter im Payload-Pfad.
+* `analytics/engine/analytics_view_model.py` (Bug 4): REIHENFOLGE
+  `params_restored.emit()` VOR `refresh_all()` in `_apply_profile()` UND
+  `restore_workspace()`.
+* `analytics/ui/analytics_win.py` (Bug 3): Deterministischer `_initial_load`
+  - Symbol-Combo wird vor dem Restore gefuellt (idempotent), Non-Empty-
+  Guards, dann load_profiles()/restore_workspace()/_on_page_changed()/
+  refresh_all().
+* `persistent_win.py` + `serviceui/service_selector_dialog.py` (Bug 5):
+  Geometrie-Restore prueft gegen ALLE Screens (`QApplication.screens()`),
+  nicht nur primaryScreen.
+
+### Verifikation (headless, keine UI-Tests)
+
+* `test/check_round10.py` (neu): **34/34 PASS** - Varianten-Filter-Kette
+  (MasterTree -> Dialog -> VM -> Worker -> Repo -> Reader-SQL),
+  No-Data-Differenzierung (exakter Hash-Match), Restore-Reihenfolge,
+  Multi-Screen-Geometrie.
+* Regressionen: `test/check_round9.py` **19/19 PASS**, Restore-Pipeline
+  30/30+29/29+19/19 PASS, bug345-Kette 15/15 PASS, stale_hook PASS,
+  check_round7_fixes 28/28 PASS, check_round8_bug345 20/20 PASS,
+  picker_runtime PASS, check_bugfix_0808 PASS.
+* `py_compile` aller geaenderten Dateien: EXIT=0.
+
+## 8i. Implementierungs-Log - Bugfix Runde 11: No-Data-Auswertung in den Worker verlagert, Persistenz/Aliasing, zentrale Restore-Orchestrierung (10.08.2026)
+
+**Problem (User-Analyse 10.08.2026, Punkte 1-5):**
+(1) Kein zentraler Zustands-Sync: 3+ Quellen setzten die Controls
+(params_restored -> _sync_from_params direkt im HeatmapWidget UND
+_sync_ui_from_restored_params im Window; _sync_combos_from_payload im
+Payload-Pfad; feature_ids_changed -> _rebuild_field_dropdown) - bis zu 3
+Control-Paesse pro Restore plus Hauptthread-DB-Zugriffe.
+(2) Datenvertrag-Luecke: `instance_hashes` fehlte im Profil-Payload
+(Workspace-Datei persistierte die ViewModel-Referenz -> Aliasing); die
+No-Data-Pruefung lief synchron im UI-Hauptthread mit verschluckten Fehlern.
+(3) Restore-Pfade stiessen selbst refresh_all() an (Query-Orchestrierung
+an mehreren Stellen, redundante Re-Queries).
+
+### Loesung
+
+* **Bug 3 (Persistenz/Aliasing):**
+  - B3-1: `_current_payload()` (VM) persistiert `sources.instance_hashes`.
+  - B3-2: Gemeinsamer Restore-Helper `_restore_params_from_payload()`
+    (VM) fuer `_apply_profile()` UND `restore_workspace()` - fehlt
+    `instance_hashes` im Payload (Alt-Payloads), ist der Filter garantiert
+    leer (Replace-Semantik statt stillem Alt-Wert); uebrige Keys additiv.
+  - B3-3: `_save_workspace` (Window) kopiert die VM-Params via neuem
+    `_snapshot_params()` (kein Aliasing mit den Live-Params).
+* **Bug 4 (No-Data in den Worker):**
+  - B4-1: Synchroner `resolve_no_data_variants()`-Aufruf aus dem
+    UI-Hauptthread entfernt. Neue Kette: VM `_no_data_presets_snapshot()`
+    (in-memory Preset-Modell-Daten) -> `_current_params(QUERY_FEATURES)`
+    -> Worker -> Repo `get_available_features(presets_data=...)` ->
+    Reader `resolve_no_data_variants()` (im Worker-Thread).
+  - B4-2: Payload-Vertrag `no_data_variants` IMMER vorhanden (+
+    `no_data_variants_error`); UI unterscheidet loading / Erfolg+[] /
+    Erfolg+[x] / Fehler ('No-Data-Pruefung konnte nicht durchgefuehrt
+    werden').
+  - B4-3: Generation-Guard in `_on_features_ready` (Stale-Payloads
+    aelterer Restore-Generation werden verworfen).
+  - B4-5: `_render_no_data_items()` filtert nach aktiven instance_hashes;
+    gewaehlte No-Data-Variante bleibt zusaetzlich inline sichtbar.
+* **Architektur (A1-A6):**
+  - A1: `refresh_all()` aus `_apply_profile()`/`restore_workspace()`
+    entfernt (kein Query mehr aus dem VM-Restore-Pfad; das Window
+    orchestriert).
+  - A3: Zentraler `_sync_all_pages_from_params()` (Window, genau EIN
+    Durchgang); die direkte `params_restored`-Verbindung des
+    HeatmapWidgets (attach_view_model) entfaellt.
+  - A5: `_sync_combos_from_payload` schreibt die x/y/agg-Combos nicht
+    mehr (Payload darf Controls nie ueberschreiben).
+  - A6: `_on_page_changed` mit Query-Key-Pruefung (row +
+    restore_generation + `_params_signature`) - kein redundanter
+    Re-Query nach Restore/Sync.
+
+### Verifikation (headless, keine UI-Tests)
+
+* `test/check_round11.py` (neu): **35/35 PASS** - B3-1..B3-3
+  (Payload-Roundtrip, Replace-Semantik, Aliasing), B4-1..B4-5
+  (No-Data-Kette, Payload-Vertrag, Generation-Guard, Hash-Filter),
+  A1-A6 (kein refresh_all im VM, zentraler Seiten-Sync genau 1x,
+  Payload schreibt keine Controls, Query-Key-Pruefung).
+* Regressionen (an neues Design angepasst): `test/check_round10.py`
+  **34/34 PASS** (B4-Assertions auf A1-Vertrag: params_restored ohne
+  refresh_all), `test/check_round9.py` **19/19 PASS**,
+  `test/check_round7_fixes.py` **28/28 PASS** +
+  `test/check_round8_bug345.py` **20/20 PASS** (Restore-Sync via
+  `_sync_from_params()` statt params_restored-Verbindung, A3; Mock-VMs um
+  request_features ergaenzt), Restore-Pipeline 30/30+29/29+19/19 PASS,
+  bug345-Kette 15/15 PASS, stale_hook PASS, picker_runtime PASS,
+  check_bugfix_0808 PASS.
+* `py_compile` aller 6 geaenderten Dateien: EXIT=0.
+* Commit `9bb52f4` (Runde 11), Commit `3a61790` (Runde 9+10).
+
+---
+
