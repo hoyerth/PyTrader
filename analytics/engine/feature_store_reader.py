@@ -1297,9 +1297,17 @@ class FeatureStoreReader:
         UI-Hauptthread in den QUERY_FEATURES-Worker verlagert. Der
         ViewModel liefert die Preset-Modell-Daten als Snapshot
         (`presets_data`: {"presets": {pid: [...]}, "sets": [...],
-        "display_names": {"{pid}|{pname}": str}}); diese Methode kombiniert
-        sie mit den DB-Fakten (`available_instance_hashes` /
+        "display_names": {"{pid}|{pname}": str},
+        "active_hashes": [gecheckte Varianten-Hashes]}); diese Methode
+        kombiniert sie mit den DB-Fakten (`available_instance_hashes` /
         `feature_keys_by_service`) im Worker-Thread.
+
+        Runde 13 (Bugfix Dropdown-NoData): `active_hashes` (nicht leer =
+        Varianten-Einschraenkung) macht die Auswertung VARIANTEN-GENAU -
+        es werden NUR die im ServicePicker gecheckten Varianten geliefert
+        (nicht-gecheckte Instanzen derselben plugin_id erscheinen nicht
+        mehr im '(No Data)'-Abschnitt; das Dropdown zeigt damit nicht mehr
+        die erste Variante eines Services, wenn eine andere gecheckt ist).
 
         Eine Variante gilt als 'ohne Daten', wenn ihr instance_hash KEINE
         Zeilen besitzt (oder - bei Varianten ohne Hash - ihr plugin_id keine
@@ -1316,6 +1324,12 @@ class FeatureStoreReader:
         presets = (presets_data or {}).get("presets") or {}
         sets = (presets_data or {}).get("sets") or []
         display_names = (presets_data or {}).get("display_names") or {}
+        # Runde 13 (Bugfix Dropdown-NoData): Varianten-Einschraenkung aus dem
+        # Snapshot - leer = KEINE Einschraenkung (alle Varianten der aktiven
+        # Services), nicht leer = nur die gecheckten Varianten.
+        active_hashes = {str(h).strip().lower()
+                         for h in ((presets_data or {}).get("active_hashes")
+                                   or [])}
         try:
             available = self.available_instance_hashes(symbol, timeframe)
         except Exception:
@@ -1380,6 +1394,14 @@ class FeatureStoreReader:
             if not pid_s:
                 return
             h_s = str(h or "").strip()
+            # Runde 13 (Bugfix Dropdown-NoData): Varianten-Einschraenkung -
+            # ist eine Hash-Auswahl aktiv (active_hashes nicht leer), werden
+            # NUR die gecheckten Varianten geliefert. Nicht-gecheckte
+            # Instanzen derselben plugin_id erscheinen nicht mehr als
+            # '(No Data)' (vorher wurde hier die ERSTE Variante des Services
+            # angezeigt bzw. ungecheckte Instanzen mit aufgefuehrt).
+            if active_hashes and h_s.lower() not in active_hashes:
+                return
             key = (pid_s.lower(), h_s)
             if key in seen:
                 return

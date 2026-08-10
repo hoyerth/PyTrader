@@ -1467,9 +1467,16 @@ class HeatmapWidget(QWidget):
           * Payload ausstehend (self._no_data_variants is None) -> nichts
           * Payload-Fehler   -> '⚠️ No-Data-Prüfung ...' (deaktiviert)
           * Erfolg + Liste   -> '(No Data)'-Abschnitt (deaktivierte Items)
-        Bei aktiver Varianten-Einschraenkung (instance_hashes) werden nur
-        die betroffenen Varianten gezeigt (B4-5); die gewaehlte Variante
-        bleibt zusaetzlich als ausgegrautes '(No Data)'-Item sichtbar.
+
+        Runde 13 (Bugfix Dropdown-NoData): Der Payload ist seit dem
+        Reader-Hash-Filter bereits VARIANTEN-GENAU - `no_data_variants`
+        enthaelt nur noch die im ServicePicker gecheckten Varianten
+        (und nur Services aus `feature_ids`). Die Widget-seitigen Filter
+        (active_ids/active_hashes) sind damit redundant, bleiben aber
+        DEFENSIV aktiv (schuetzt z. B. gegen Alt-Payloads vom
+        QUERY_FEATURES-Kompatibilitaetspfad ohne Hash-Filter). Die
+        gewaehlte Variante ist in Runde 13 immer Teil des Abschnitts -
+        die B4-5-Inline-Ergaenzung greift nur noch bei Defensiv-Luecken.
         """
         if self._view_model is None:
             return
@@ -1482,9 +1489,13 @@ class HeatmapWidget(QWidget):
         p = self._view_model.params
         # Runde 12 (Punkt 4): Nur Services im aktiven feature_ids-Filter
         # (leer = kein Filter = alle) - nicht angehakte Services werden
-        # nicht als '(No Data)' angezeigt.
+        # nicht als '(No Data)' angezeigt. Runde 13: defensiv (der Reader
+        # filtert bereits nach feature_ids).
         active_ids = {str(f).strip().lower()
                       for f in (p.get("feature_ids") or [])}
+        # Runde 13: `instance_hashes` ist seit dem MasterTree-Fix auch fuer
+        # Set-Instanz-Varianten (TYPE_SERVICE) gefuellt. Der Reader filtert
+        # den Payload bereits danach - hier defensiv gegen Alt-Payloads.
         active_hashes = {str(h).strip().lower()
                          for h in (p.get("instance_hashes") or [])}
         variants = [dict(v) for v in self._no_data_variants]
@@ -1510,9 +1521,11 @@ class HeatmapWidget(QWidget):
             # doppelte '(preset)'-Ergaenzung im Item-Text.
             self._combo_field.add_disabled_item(
                 f"{nd.get('display_name') or nd.get('plugin_id')} – (No Data)")
-        # B4-5: Die gewaehlte No-Data-Variante bleibt zusaetzlich inline
-        # sichtbar (ausgegraut), auch wenn die Varianten-Einschraenkung sie
-        # aus dem Abschnitt gefiltert haette.
+        # B4-5 (Runde 13): Die gewaehlte Variante bleibt zusaetzlich inline
+        # sichtbar (ausgegraut) - defensiv: nur wenn die Widget-Filter sie
+        # wider Erwarten nicht im Abschnitt haetten (Reader-Hash-Filter
+        # und Widget-Filter koennen nicht divergieren, solange beide auf
+        # `instance_hashes` basieren).
         sel = self._selected_no_data_variant(variants)
         if sel is not None:
             key = (str(sel.get("plugin_id") or "").strip().lower(),
@@ -1534,6 +1547,18 @@ class HeatmapWidget(QWidget):
         Match) statt immer der ersten. Runde 12 (Punkt 4): Services, die
         NICHT im aktiven feature_ids-Filter liegen, werden ignoriert
         (None - keine Inline-Markierung fuer nicht gecheckte Services).
+
+        Runde 13 (Bugfix Dropdown-NoData): Der Payload (`no_data_variants`)
+        ist seit dem Reader-Hash-Filter bereits VARIANTEN-GENAU - er enthaelt
+        nur noch die im ServicePicker gecheckten Varianten. Die ausgewaehlte
+        No-Data-Variante des aktuellen Feld-Services ist damit EINDEUTIG
+        bestimmt (hoechstens eine Variante pro Service uebrig). Der alte
+        'erste Variante des Services'-Fallback ist ersatzlos entfernt: Er
+        zeigte bei aktiver Varianten-Einschraenkung faelschlich die ERSTE
+        Variante (V1), obwohl eine andere (V2) gecheckt und V1 gar nicht
+        aktiv war - die Runde-12b-Einschraenkung (kein Fallback bei nicht
+        leerem instance_hashes) war unvollstaendig, weil `instance_hashes`
+        fuer Set-Instanz-Varianten bis Runde 13 leer blieb.
         """
         if not variants:
             return None
@@ -1551,25 +1576,11 @@ class HeatmapWidget(QWidget):
                       for f in (p.get("feature_ids") or [])}
         if active_ids and sid not in active_ids:
             return None
-        # Punkt 3: Gecheckte Variante (instance_hashes) gewinnt.
-        active_hashes = {str(h).strip().lower()
-                         for h in (p.get("instance_hashes") or [])}
-        for v in variants:
-            if (str(v.get("plugin_id") or "").strip().lower() == sid
-                    and str(v.get("instance_hash") or "").strip().lower()
-                    in active_hashes):
-                return v
-        # Bugfix 10.08.2026 (Runde 12b, Dropdown-NoData): Bei AKTIVER
-        # Varianten-Einschraenkung (instance_hashes nicht leer) KEIN
-        # plugin_id-only-Fallback - sonst wuerde bei einem nicht gecheckten
-        # Hash die ERSTE Variante des Services angezeigt (falsche Variante,
-        # z. B. 'V1' obwohl V2 gewaehlt wurde und V1 nicht gecheckt ist).
-        # Konsistent mit _render_no_data_items, das `filtered` ebenfalls
-        # nach instance_hashes filtert. Ohne Hash-Einschraenkung bleibt der
-        # Fallback (erste Variante des Services) sinnvoll.
-        if active_hashes:
-            return None
-        # Fallback: erste Variante des gewaehlten (aktiven) Services.
+        # Runde 13: Der Payload ist bereits variantengefiltert (Reader-
+        # Hash-Filter auf active_hashes). Die No-Data-Variante des aktuellen
+        # Feld-Services im Payload IST die ausgewaehlte - kein Fallback auf
+        # die 'erste Variante' mehr (die gecheckte Variante gewinnt, weil
+        # nur sie im Payload steht).
         for v in variants:
             if str(v.get("plugin_id") or "").strip().lower() == sid:
                 return v

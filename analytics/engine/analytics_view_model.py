@@ -1318,10 +1318,18 @@ class AnalyticsViewModel(QObject):
                                 "is_archived"}]},
              "sets": [{"services": {instance_id: {"plugin_id", "params",
                                                    "is_archived"}}}],
-             "display_names": {"{pid}|{pname}": "Anzeigename"}}
+             "display_names": {"{pid}|{pname}": "Anzeigename"},
+             "active_hashes": [instance_hash der im Picker gecheckten
+                               Varianten (leer = keine Einschraenkung)]}
         Der Reader kombiniert den Snapshot mit den DB-Fakten
         (available_instance_hashes / feature_keys_by_service) im Worker-
         Thread und liefert `no_data_variants` als Payload-Attribut (B4-2).
+
+        Runde 13 (Bugfix Dropdown-NoData): `active_hashes` macht den Payload
+        VARIANTEN-GENAU - der Reader `resolve_no_data_variants()` liefert
+        damit nur noch die im ServicePicker gecheckten Varianten als
+        '(No Data)' (nicht-gecheckte Instanzen derselben plugin_id erscheinen
+        nicht mehr; das Dropdown zeigt nicht mehr die erste Variante).
         """
         model = self._selector_model
         if model is None:
@@ -1336,6 +1344,11 @@ class AnalyticsViewModel(QObject):
         # angehakte Services duerfen keine '(No Data)'-Hinweise liefern.
         active_ids = {str(f).strip().lower()
                       for f in (self._params.get("feature_ids") or [])}
+        # Runde 13 (Bugfix Dropdown-NoData): Varianten-Einschraenkung mit
+        # an den Reader geben - die '(No Data)'-Auswertung wird damit
+        # variantengenau (nur im Picker gecheckte Varianten im Payload).
+        active_hashes = {str(h).strip().lower()
+                         for h in (self._params.get("instance_hashes") or [])}
         try:
             for pid, clones in (model.plugin_presets() or {}).items():
                 pid_s = str(pid)
@@ -1375,6 +1388,7 @@ class AnalyticsViewModel(QObject):
             "presets": presets,
             "sets": sets,
             "display_names": display_names,
+            "active_hashes": sorted(active_hashes),
         }
 
     def resolve_no_data_variants(self, symbol: str,

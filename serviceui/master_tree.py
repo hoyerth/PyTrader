@@ -581,7 +581,8 @@ class MasterTree(QTreeWidget):
                 svc_item.setFlags(svc_item.flags() | Qt.ItemIsUserCheckable)
                 key = (TYPE_SERVICE,
                        str(child.get("set_id") or ""),
-                       str(svc.get("instance_id") or ""))
+                       str(svc.get("instance_id") or ""),
+                       str(svc.get("instance_hash") or ""))
                 state = (Qt.Checked if key in self._checked_items
                          else Qt.Unchecked)
                 svc_item.setData(0, Qt.CheckStateRole, state)
@@ -1304,7 +1305,8 @@ class MasterTree(QTreeWidget):
             if node_type == TYPE_SERVICE:
                 key = (TYPE_SERVICE,
                        str(item.data(0, ROLE_SET_ID) or ""),
-                       str(item.data(0, ROLE_INSTANCE_ID) or ""))
+                       str(item.data(0, ROLE_INSTANCE_ID) or ""),
+                       str(item.data(0, ROLE_INSTANCE_HASH) or ""))
                 # Kein echter Checkbox-Wechsel (z. B. Text-Refresh)? -> return.
                 expected = (Qt.Checked if key in self._checked_items
                             else Qt.Unchecked)
@@ -1371,7 +1373,8 @@ class MasterTree(QTreeWidget):
                     if child.data(0, ROLE_NODE_TYPE) != TYPE_SERVICE:
                         continue
                     key = (TYPE_SERVICE, set_id,
-                           str(child.data(0, ROLE_INSTANCE_ID) or ""))
+                           str(child.data(0, ROLE_INSTANCE_ID) or ""),
+                           str(child.data(0, ROLE_INSTANCE_HASH) or ""))
                     if state == Qt.Checked:
                         self._checked_items.add(key)
                         child.setData(0, Qt.CheckStateRole, Qt.Checked)
@@ -1514,7 +1517,8 @@ class MasterTree(QTreeWidget):
             if node_type == TYPE_SERVICE:
                 synced.add((TYPE_SERVICE,
                             str(item.data(0, ROLE_SET_ID) or ""),
-                            str(item.data(0, ROLE_INSTANCE_ID) or "")))
+                            str(item.data(0, ROLE_INSTANCE_ID) or ""),
+                            str(item.data(0, ROLE_INSTANCE_HASH) or "")))
             elif node_type == TYPE_PLUGIN and item.childCount() == 0:
                 # 10.08.2026 (Punkt 6): Plugin-Parents mit Varianten sind
                 # non-checkable - kein Haken-Sync (Konsistenz zum Reverse-
@@ -1538,21 +1542,29 @@ class MasterTree(QTreeWidget):
             leer).
         """
         result: List[Dict[str, str]] = []
-        for node_type, set_id, key_id in sorted(self._checked_items):
+        for entry in sorted(self._checked_items):
+            node_type = str(entry[0])
             if node_type == TYPE_SERVICE:
-                cfg = self.model.find_service(set_id, key_id) or {}
+                set_id = str(entry[1] or "")
+                instance_id = str(entry[2] or "")
+                # Runde 13 (Bugfix Dropdown-NoData): 4. Element = instance_hash
+                # der Set-Instanz-Variante (variantengenaue Einschraenkung).
+                instance_hash = str(entry[3] or "") if len(entry) > 3 else ""
+                cfg = self.model.find_service(set_id, instance_id) or {}
                 result.append({
                     "node_type": TYPE_SERVICE,
                     "set_id": set_id,
-                    "instance_id": key_id,
-                    "plugin_id": str(cfg.get("plugin_id") or key_id),
+                    "instance_id": instance_id,
+                    "plugin_id": str(cfg.get("plugin_id") or instance_id),
+                    "instance_hash": instance_hash,
                 })
             elif node_type == TYPE_PLUGIN:
                 result.append({
                     "node_type": TYPE_PLUGIN,
                     "set_id": "",
                     "instance_id": "",
-                    "plugin_id": key_id,
+                    "plugin_id": str(entry[2] or ""),
+                    "instance_hash": "",
                 })
             elif node_type == TYPE_CLONE:
                 # 20.04 (Q7): Clone-Haken -> feature_id ist die plugin_id
@@ -1561,8 +1573,9 @@ class MasterTree(QTreeWidget):
                 result.append({
                     "node_type": TYPE_CLONE,
                     "set_id": "",
-                    "instance_id": key_id,
-                    "plugin_id": set_id,
+                    "instance_id": str(entry[2] or ""),
+                    "plugin_id": str(entry[1] or ""),
+                    "instance_hash": str(entry[2] or ""),
                 })
         return result
 
@@ -1590,10 +1603,14 @@ class MasterTree(QTreeWidget):
         """
         hashes: List[str] = []
         for entry in self.checked_services():
-            if entry["node_type"] == TYPE_CLONE:
-                h = entry.get("instance_id") or ""
-                if h and h not in hashes:
-                    hashes.append(h)
+            # Runde 13 (Bugfix Dropdown-NoData): Hashes ALLER gecheckten
+            # Varianten sammeln - Clone-Knoten UND Set-Instanz-Varianten
+            # (vorher nur TYPE_CLONE; Set-Instanzen verloren ihren Hash in
+            # der Check-Sync-Kette und die Varianten-Einschraenkung blieb
+            # leer -> No-Data-Dropdown zeigte die falsche/erste Variante).
+            h = entry.get("instance_hash") or ""
+            if h and h not in hashes:
+                hashes.append(h)
         return hashes
 
     def checked_display_names(self) -> List[str]:
@@ -1681,12 +1698,23 @@ class MasterTree(QTreeWidget):
                 if node_type == TYPE_SERVICE:
                     set_id = str(item.data(0, ROLE_SET_ID) or "")
                     instance_id = str(item.data(0, ROLE_INSTANCE_ID) or "")
+                    instance_hash = str(item.data(0, ROLE_INSTANCE_HASH) or "")
                     cfg = self.model.find_service(set_id, instance_id) or {}
                     pid = str(cfg.get("plugin_id") or instance_id)
-                    checked = pid.lower() in wanted
+                    # Runde 13 (Bugfix Dropdown-NoData): Reverse-Mapping mit
+                    # Hash-Granularitaet auch fuer Set-Instanz-Varianten
+                    # (analog TYPE_CLONE) - sind instance_hashes gesetzt,
+                    # wird NUR die passende Instanz angehakt.
+                    if hash_restriction:
+                        checked = (pid.lower() in wanted
+                                   and instance_hash.strip().lower()
+                                   in wanted_hashes)
+                    else:
+                        checked = pid.lower() in wanted
                     if checked:
                         self._checked_items.add((TYPE_SERVICE, set_id,
-                                                 instance_id))
+                                                 instance_id,
+                                                 instance_hash))
                         checked_items.append(item)
                     item.setData(0, Qt.CheckStateRole,
                                  Qt.Checked if checked else Qt.Unchecked)
