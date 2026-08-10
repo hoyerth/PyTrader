@@ -1500,6 +1500,11 @@ Ein zentraler, dynamischer Filter-Builder erzeugt strukturierte Regelketten (Rul
 
 > **Status:** Konzeptualisiert & Freigegeben (Vermeidung von Event-Konflikten, Performance-Optimierung & Lückenloser Varianten-Persistenz)
 > **Ziel:** Vollständige Entkopplung von UI-Controls, State-Management und Canvas-Rendering zur Beseitigung von Timing-Races, Mehrfach-Rebuilds und UI-Flackern.
+> 
+Prämissen:
+- die gesamte speicher/restore historie der fenster, des workspaces, der profile muss eingehalten werden
+- änderungen in der UI durch den anwender sollen auf der Control-Schicht super schnell abgehandelt werden, unabhängig von grafik und dessen ladestatus
+- änderungenb an der grafik ui mit dort zugeordneten slidern und mausaktionen (zoom)  etc. ändern nur die grafik, nicht die anderen event-system
 
 ---
 
