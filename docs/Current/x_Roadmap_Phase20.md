@@ -2598,6 +2598,7 @@ gelaufen ist.
   als Regressionstest (gitignored).
 
 ---
+
 # 20.05 Architektur-Konzept: Ultra-Low-Latency Control & Rendering Pipeline
 
 > **Status:** Verbindlich neu gefasst für sofortige, latenzfreie UI-Bedienung.
