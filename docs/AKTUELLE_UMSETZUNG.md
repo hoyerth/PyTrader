@@ -28,7 +28,7 @@
 
 # 20.05 Architektur-Konzept: Ultra-Low-Latency Control & Rendering Pipeline
 
-> **Status:** Umgesetzt und headless validiert (Runden 11–15 der Analytics-Pipeline, Stand 10.08.2026). Rein konzeptionelles Kapitel – kein Arbeitsschrittplan; die Umsetzung ist in den Runden 11–15 vollständig realisiert (Runde 15: Performance-Diagnose Dropdown – Metadaten-Cache & QUERY_FEATURES-Leichtpfad).
+> **Status:** Umgesetzt und headless validiert (Runden 11–15c der Analytics-Pipeline, Stand 10.08.2026). Rein konzeptionelles Kapitel – kein Arbeitsschrittplan; die Umsetzung ist in den Runden 11–15c vollständig realisiert (Runde 15: Performance-Diagnose Dropdown – Metadaten-Cache & QUERY_FEATURES-Leichtpfad; Runden 15b/15c: Bugfix-Durchgänge Feld-Dropdown & Standalone-NoData, Kapitel 7/8).
 > **Primäres Ziel:** Absolut latenzfreie Bedienung aller Steuerelemente (Aggregationen, Dropdown-Checklisten, Profil-Speicherung, Workspace-Mechanismus, ServicePicker-Haken) unabhängig von Datenbank-Ladezeiten und Grafik-Rendern.
 
 Prämissen:
@@ -97,6 +97,7 @@ Prämissen:
 2. **Snapshot-Übergabe:** Das ViewModel übergibt einen leichten, rein im RAM liegenden Preset-Snapshot (`_no_data_presets_snapshot()`) an die Query-Parameter; die DB-Fakten (`available_instance_hashes` / `feature_keys_by_service`) ermittelt der Reader im Worker-Thread.
 3. **Varianten-Genauigkeit (Runde 13/13b):** Der Reader prüft über `active_hashes` *nur noch* die im ServicePicker tatsächlich aktivierten Varianten; bei aktiver Einschränkung liefert auch eine hash-lose Variante nie "(No Data)" – falsche "(No Data)"-Anzeigen oder das versehentliche Vorauswählen falscher Einträge im Dropdown sind damit physikalisch ausgeschlossen.
 4. **Alt-Bestand & leerer Filter (Runde 13c/14):** Ein leerer Datenquellen-Filter (`feature_ids=[]`) erzeugt keinerlei "(No Data)"-Einträge (der Button „Aktive Filter entfernen“ zeigt danach wieder alle Features ohne Rauschen); undifferenzierte Alt-Rows ohne `instance_hash` decken ausschließlich die Original-Variante einer `plugin_id` ab (z. B. `srv_proximity`-Altbestand) – weitere Varianten derselben `plugin_id` erscheinen weiterhin korrekt als "(No Data)", bis der erste Scan lief.
+5. **Standalone-Services (Runde 15c):** Registrierte Plugins ohne Presets/Clones UND ohne Set-Instanz (z. B. `srv_trend_breakout`) werden über die neue Snapshot-Sektion `standalone` als hash-lose Variante in die Auswertung aufgenommen – ein noch nie ausgeführter Standalone-Service erscheint damit korrekt als "(No Data)", bis der erste Scan Daten schreibt (siehe Kapitel 8).
 
 ---
 
@@ -140,4 +141,48 @@ Prämissen:
 * Regression: `check_round12.py` (23/23 – A5: `request_features()` vor `request_heatmap_generic()` in der Quelldatei), `check_round11.py` (35/35), `check_round9.py` (19/19), `check_round10.py` (34/34), `check_2004_bugfix3.py` (15/15), `check_round14.py` (8/8). `py_compile` aller geänderten Dateien OK.
 * `check_round13c.py` war während der Verifikation **nicht ausführbar**: `data/analytics.duckdb` war von der laufenden App exklusiv gesperrt (PID 32608, IO-Error „File is already open") – der Test liest die echte DB und wird nach App-Ende nachgeholt.
 * **Offen (manuell):** Funktions-/Latenztest des Dropdowns in der laufenden App durch den Anwender.
+
+---
+
+## 7. Implementierungs-Log – Runde 15b: Bugfix Feld-Dropdown (User-Meldung, 10.08.2026)
+
+**Problem (User-Symptome, 10.08.2026):**
+1. Check/Uncheck aus dem ServicePicker wird nicht im 'Feld'-Dropdown sichtbar.
+2. Versionen (Parameter-Varianten) werden nicht mehr verarbeitet und angezeigt.
+3. Services/Variationen mit NoData erscheinen nicht mit '(No Data)'.
+
+**Root Cause (Runde-15-Regression):** `_field_metadata` rief `feature_keys_by_service` MIT `instance_hashes` auf. Bei einer gecheckten NoData-Variante (Hash ohne DB-Rows) war `by_service` leer → der ungefilterte Fallback `avail` zeigte ALLE Keys aller Services OHNE Service-Prefix und ignorierte die Datenquellen-Auswahl. Zusätzlich aktualisierte `set_feature_ids` den QUERY_FEATURES-Leichtpfad nicht (Cache blieb auf dem letzten Payload).
+
+### Lösung (Fixes A/B)
+
+* **Fix A (`analytics_repository.py`, `_field_metadata`):** Die Feld-Struktur folgt den **Services** (`feature_ids`), nicht den Varianten (`instance_hashes`) – eine gecheckte NoData-Variante blendet den aktiven Service nicht mehr aus der Feld-Metadaten aus. Der defensive Fallback `avail` (alle Keys) greift NUR ohne aktiven Filter (bei aktivem Filter ist eine leere `by_service`-Menge ein legitimes Ergebnis).
+* **Fix B (`analytics_view_model.py`, `set_feature_ids`):** Refresht jetzt `(QUERY_FEATURES, QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC, QUERY_SCATTER, QUERY_DISTRIBUTION)` mit **QUERY_FEATURES zuerst** – das Dropdown bekommt `field_sources`/`no_data_variants` für die aktuellen Filter (kein Warten auf den Grafik-Payload).
+
+### Verifikation (headless, keine UI-Tests)
+
+* `test/check_round15b.py` (neu): **10/10 PASS** – Feld-Scope folgt den aktiven Services (kein ungefilterter Fallback bei aktivem Filter), NoData-Variante gecheckt liefert trotzdem die Felder des aktiven Services, Dropdown zeigt Service-Prefix-Items + '(No Data)'-Item, `set_feature_ids` stellt QUERY_FEATURES in die Puffer-Queue (Reihenfolge).
+* Regression: `check_round15_perf.py` (27/27), `check_round12.py` (23/23), `check_round11.py` (35/35), `check_round13c.py` (20/20), `check_round9.py` (19/19), `check_round10.py` (34/34), `check_2004_bugfix3.py` (15/15), `check_round14.py` (8/8). `py_compile` aller geänderten Dateien OK.
+* **Offen (manuell):** Dropdown-Verhalten in der laufenden App durch den Anwender.
+
+---
+
+## 8. Implementierungs-Log – Runde 15c: Standalone-Services in der NoData-Auswertung (10.08.2026)
+
+**Problem (User-Meldung, 10.08.2026):** Der Service `srv_trend_breakout` wird nicht im Dropdown erkannt und nicht in der noData-Sektion angezeigt.
+
+**Diagnose (echte DB, `test/_diag_trend.py`):** `srv_trend_breakout` ist ein **Standalone-Service** – registriertes Plugin, das weder Presets/Clones (`plugin_presets()`) noch eine Set-Instanz (`get_sets()`) besitzt und noch keine feature_store-Rows geschrieben hat (DISTINCT feature_ids: `native`, `srv_grid_lines`, `srv_proximity`, `srv_swing_volume_profile`).
+
+**Root Cause:** `_no_data_presets_snapshot()` sammelte NUR `model.plugin_presets()` (Clones) + `model.get_sets()` (Set-Instanzen). Reine Standalone-Services fielen komplett aus dem Snapshot → der Reader `resolve_no_data_variants()` konnte sie nie als '(No Data)' liefern.
+
+### Lösung (Fixes A/B)
+
+* **Fix A (`analytics_view_model.py`, `_no_data_presets_snapshot`):** Neue Snapshot-Sektion **`standalone`** – registrierte Plugins ohne Presets UND ohne Set-Instanz werden als hash-lose Variante (`preset_name 'Default'`) aufgenommen; `display_names["{pid}|Default"]` via `resolve_service_display_name` (→ 'Trend Breakout'). Ausgeschlossen sind Plugins mit Presets/Set-Instanzen (dort läuft die bestehende Preset-/Set-Auswertung) sowie – konsistent zu Runde 13b – alle Standalone-Einträge bei aktiver Varianten-Einschränkung (`instance_hashes`).
+* **Fix B (`feature_store_reader.py`, `resolve_no_data_variants`):** Verarbeitet die `standalone`-Sektion als hash-lose Variante (`_add(pid, "Default", "")`) – `_has_data(pid, "")` prüft direkt `pids_with_data` (kein Hash-/Alt-Bestand-Fallback nötig). Die Standalone-pids fließen zusätzlich in `active_pids` (Scope von `feature_keys_by_service`), damit ein Standalone-Service MIT Rows nicht fälschlich als '(No Data)' erscheint.
+
+### Verifikation (headless, keine UI-Tests)
+
+* `test/check_round15c.py` (neu): **19/19 PASS** (Temp-DB in `test/`) – Standalone ohne Rows → NoData-Variante (`instance_hash` leer, `preset_name 'Default'`, display_name 'Trend Breakout'); Standalone MIT Rows → KEINE NoData-Markierung; Payload (`get_available_features`) enthält die Standalone-NoData; Widget rendert 'Trend Breakout – (No Data)' im Feld-Dropdown; VM-Snapshot nimmt Standalone auf (nicht bei Set-Instanz/leerem Filter/aktiver Hash-Einschränkung).
+* **Echte DB (User-Szenario):** Snapshot `standalone=['srv_trend_breakout']`, `display_names['srv_trend_breakout|Default']='Trend Breakout'`, `no_data_variants` liefert `[{plugin_id: srv_trend_breakout, display_name: 'Trend Breakout', instance_hash: ''}]`.
+* Regression: `check_round15b.py` (10/10), `check_round15_perf.py` (27/27), `check_round12.py` (23/23), `check_round11.py` (35/35), `check_round13c.py` (20/20), `check_round9.py` (19/19), `check_round10.py` (34/34), `check_2004_bugfix3.py` (15/15), `check_round14.py` (8/8). `py_compile` der geänderten Dateien OK.
+* **Offen (manuell):** App-Test – `srv_trend_breakout` im ServicePicker checken → '(No Data)'-Hinweis im Feld-Dropdown; nach dem ersten Scan (Daten geschrieben) verschwindet der Hinweis.
 
