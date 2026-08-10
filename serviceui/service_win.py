@@ -1994,6 +1994,12 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             "lookback": lookback,
             "params": params,
             "version": getattr(plugin, "version", "0.0.0") or "0.0.0",
+            # Runde 13b (Bugfix Dropdown-NoData): instance_hash mit
+            # persistieren, damit NEUE Set-Instanzen von Anfang an die
+            # Varianten-Einschraenkung erfuellen (vorher fehlte der Hash
+            # beim regularen Hinzufuegen - der MasterTree berechnet ihn fuer
+            # Alt-Bestand on-the-fly, neue Instanzen tragen ihn direkt).
+            "instance_hash": generate_instance_hash(plugin_id, params),
         }
         order.append(iid)
         definition["execution_order"] = order

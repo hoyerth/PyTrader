@@ -1344,6 +1344,15 @@ class AnalyticsViewModel(QObject):
         # angehakte Services duerfen keine '(No Data)'-Hinweise liefern.
         active_ids = {str(f).strip().lower()
                       for f in (self._params.get("feature_ids") or [])}
+        # Runde 13c (Bugfix Dropdown-NoData, Kernwunsch): Leerer Filter
+        # (feature_ids=[]) = KEINE '(No Data)'-Eintraege. Ohne aktive
+        # Datenquellen-Auswahl wuerde der Snapshot ALLE Services enthalten
+        # und der Reader jede NoData-Variante im Feld-Dropdown anzeigen
+        # (der Button 'Aktive Filter entfernen' verspricht 'zeigt danach
+        # wieder alle Features' – ohne NoData-Rauschen).
+        if not active_ids:
+            return {"presets": {}, "sets": [], "display_names": {},
+                    "active_hashes": []}
         # Runde 13 (Bugfix Dropdown-NoData): Varianten-Einschraenkung mit
         # an den Reader geben - die '(No Data)'-Auswertung wird damit
         # variantengenau (nur im Picker gecheckte Varianten im Payload).
@@ -1357,6 +1366,16 @@ class AnalyticsViewModel(QObject):
                 clone_list: List[Dict[str, Any]] = []
                 for c in clones or []:
                     if not isinstance(c, dict):
+                        continue
+                    h_s = str(c.get("instance_hash") or "").strip().lower()
+                    # Runde 13b (Bugfix Dropdown-NoData): Harte Varianten-
+                    # Einschraenkung - sind Hashes gecheckt (active_hashes
+                    # nicht leer), duerfen NUR diese Varianten in den
+                    # Snapshot (bewusst OHNE `h_s and`-Guard: eine hash-lose
+                    # Variante ist bei aktiver Einschraenkung nie Teil der
+                    # Auswahl und darf kein '(No Data)' liefern - sonst
+                    # erscheinen ungecheckte Instanzen weiterhin).
+                    if active_hashes and h_s not in active_hashes:
                         continue
                     pname = str(c.get("preset_name") or "Default")
                     clone_list.append({

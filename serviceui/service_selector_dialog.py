@@ -92,6 +92,7 @@ from PySide6.QtWidgets import (
 )
 
 from analytics.engine.description_dialog import ServiceDescriptionDialog
+from analytics.engine.service_models import generate_instance_hash
 from analytics.engine.service_selector_model import ServiceSelectorModel
 from config.event_bus import event_bus
 from serviceui.master_tree import (
@@ -1093,6 +1094,9 @@ class ServiceSelectorDialog(QDialog):
             "lookback": lookback,
             "params": params,
             "version": getattr(plugin, "version", "0.0.0") or "0.0.0",
+            # Runde 13b (Bugfix Dropdown-NoData): instance_hash mit
+            # persistieren (analog service_win._add_service_to_set).
+            "instance_hash": generate_instance_hash(plugin_id, params),
         }
         order.append(iid)
         definition["execution_order"] = order

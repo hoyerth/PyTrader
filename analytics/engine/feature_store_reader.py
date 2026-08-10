@@ -1285,6 +1285,40 @@ class FeatureStoreReader:
                   f"fehlgeschlagen: {e}")
             return set()
 
+    def plugin_ids_with_hashes(
+        self, symbol: str, timeframe: str,
+    ) -> set:
+        """Plugin-IDs mit mindestens einer instance_hash-Zeile (Runde 13c).
+
+        Runde 13c (Bugfix Dropdown-NoData, Alt-Bestand): Der Reader muss
+        unterscheiden koennen, ob die Daten einer plugin_id VARIANTEN-
+        AUFGETEILT vorliegen (eigene instance_hash-Rows je Variante) oder
+        UNDIFFERENZIERT (Alt-Rows ohne Hash, gehoeren der plugin_id als
+        Ganzes). Diese Methode liefert die Mengen der plugin_ids, die
+        mindestens EINE Zeile mit gesetztem instance_hash besitzen
+        (rein lesend, kein SQL in der UI).
+
+        Returns:
+            set[str] – leer bei fehlender DB/Tabelle oder Fehlern
+            (defensiv, Invariante FeatureStoreReader: rein lesend).
+        """
+        if not symbol or not timeframe:
+            return set()
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT DISTINCT LOWER(TRIM(feature_id)) FROM feature_store
+                WHERE LOWER(symbol) = LOWER(?)
+                  AND LOWER(timeframe) = LOWER(?)
+                  AND feature_id IS NOT NULL AND TRIM(feature_id) != ''
+                  AND instance_hash IS NOT NULL AND instance_hash != ''
+            """, [symbol, timeframe]).fetchall()
+            return {str(r[0]) for r in rows if r[0] is not None}
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] plugin_ids_with_hashes "
+                  f"fehlgeschlagen: {e}")
+            return set()
+
     def resolve_no_data_variants(
         self,
         symbol: str,
@@ -1308,6 +1342,12 @@ class FeatureStoreReader:
         (nicht-gecheckte Instanzen derselben plugin_id erscheinen nicht
         mehr im '(No Data)'-Abschnitt; das Dropdown zeigt damit nicht mehr
         die erste Variante eines Services, wenn eine andere gecheckt ist).
+
+        Runde 13c (Alt-Bestand): Eine Variante ohne Hash-Treffer zaehlt
+        trotzdem als 'hat Daten', wenn die plugin_id ausschliesslich
+        undifferenzierte Alt-Rows OHNE instance_hash besitzt
+        (`plugin_ids_with_hashes`) – ihr Bestand gehoert der plugin_id
+        als Ganzes und deckt jede Variante ab.
 
         Eine Variante gilt als 'ohne Daten', wenn ihr instance_hash KEINE
         Zeilen besitzt (oder - bei Varianten ohne Hash - ihr plugin_id keine
@@ -1334,6 +1374,20 @@ class FeatureStoreReader:
             available = self.available_instance_hashes(symbol, timeframe)
         except Exception:
             available = set()
+        # Runde 13c (Bugfix Dropdown-NoData, Alt-Bestand): Plugin-IDs mit
+        # eigenem instance_hash-Bestand (Varianten-Aufteilung). Liegt die
+        # plugin_id NICHT in dieser Menge, stammt ihr gesamter Bestand aus
+        # undifferenzierten Alt-Rows OHNE Hash (z. B. srv_proximity: alle
+        # Rows instance_hash IS NULL) – dann deckt der Alt-Bestand jede
+        # Variante des Services ab (kein '(No Data)'-Fehlalarm fuer
+        # Varianten, deren berechneter Hash in keiner DB-Zeile steht).
+        # WICHTIG: pids_with_hashes=None bei Fehler (z. B. Fake/Temp-DB
+        # ohne Tabelle) - dann bleibt die Runde-10-Semantik konservativ
+        # erhalten (kein Alt-Bestand-Fallback auf unbekannter Basis).
+        try:
+            pids_with_hashes = self.plugin_ids_with_hashes(symbol, timeframe)
+        except Exception:
+            pids_with_hashes = None
         # Runde 12 (Option A, Performance): Die teure feature_keys_by_service-
         # Abfrage (laedt feature_data-JSONs) wird auf die AKTIVEN plugin_ids
         # des Snapshots eingeschraenkt (Preset-Keys + Set-Instanz-Services) -
@@ -1378,12 +1432,33 @@ class FeatureStoreReader:
             instance_hash zaehlt NUR, wenn GENAU dieser Hash Zeilen
             besitzt. Der pids_with_data-Fallback gilt nur noch fuer
             Varianten OHNE Hash (NULL/Alt-Bestand).
+
+            Runde 13c (Bugfix Dropdown-NoData, Alt-Bestand): Besitzt die
+            plugin_id KEINERLEI hash-differenzierte Zeilen (`pids_with_hashes`
+            leer), stammt ihr Bestand aus undifferenzierten Alt-Rows
+            (instance_hash IS NULL, z. B. srv_proximity vor der
+            feature_data-Migration). Dieser Alt-Bestand gehoert der
+            plugin_id als Ganzes und deckt JEDE Variante ab - sonst wuerde
+            z. B. die Set-Instanz 'srv_proximity' trotz 99K M1-Zeilen als
+            '(No Data)' gemeldet, weil ihr berechneter Hash
+            (generate_instance_hash) in keiner DB-Zeile steht. Der
+            Fallback greift NUR, wenn die Hash-Bestands-Abfrage ERFOLGREICH
+            war (pids_with_hashes ist None = Abfragefehler -> konservativ
+            Runde-10-Semantik, kein Fallback).
             """
             if not pid:
                 return True
             h_s = str(h or "").strip()
             if h_s:
-                return h_s.lower() in available_low
+                if h_s.lower() in available_low:
+                    return True
+                # Undifferenzierter Alt-Bestand (keine Hash-Zeilen der
+                # plugin_id bekannt): die plugin-weiten Daten decken jede
+                # Variante ab. Nur bei erfolgreicher Bestands-Abfrage.
+                if (pids_with_hashes is not None
+                        and str(pid).strip().lower() not in pids_with_hashes):
+                    return str(pid).strip().lower() in pids_with_data
+                return False
             return str(pid).strip().lower() in pids_with_data
 
         out: List[Dict[str, Any]] = []

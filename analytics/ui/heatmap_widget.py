@@ -1477,8 +1477,27 @@ class HeatmapWidget(QWidget):
         QUERY_FEATURES-Kompatibilitaetspfad ohne Hash-Filter). Die
         gewaehlte Variante ist in Runde 13 immer Teil des Abschnitts -
         die B4-5-Inline-Ergaenzung greift nur noch bei Defensiv-Luecken.
+
+        Runde 13c (Kernwunsch): Bei leerem feature_ids-Filter (leer =
+        kein Filter = alle Features) wird KEIN '(No Data)'-Abschnitt UND
+        kein No-Data-Fehlerhinweis gerendert - der Button 'Aktive Filter
+        entfernen' zeigt danach wieder alle Features ohne NoData-Rauschen
+        (der VM-Snapshot liefert bei leerem Filter bereits keine
+        Varianten; dieser Guard schuetzt zusaetzlich gegen Alt-/
+        Stale-Payloads).
         """
         if self._view_model is None:
+            return
+        p = self._view_model.params
+        # Runde 12 (Punkt 4) + Runde 13c (Kernwunsch): Nur Services im
+        # aktiven feature_ids-Filter duerfen NoData-Hinweise liefern.
+        # Leerer Filter (leer = kein Filter = alle Features) -> KEINE
+        # Hinweise (auch kein Fehler-/Loading-Hinweis), damit der Button
+        # 'Aktive Filter entfernen' alle Features ohne NoData-Rauschen
+        # zeigt.
+        active_ids = {str(f).strip().lower()
+                      for f in (p.get("feature_ids") or [])}
+        if not active_ids:
             return
         if self._no_data_variants_error:
             self._combo_field.add_disabled_item(
@@ -1486,13 +1505,6 @@ class HeatmapWidget(QWidget):
             return
         if self._no_data_variants is None:
             return  # Loading: Payload steht noch aus (kein Hinweis noetig)
-        p = self._view_model.params
-        # Runde 12 (Punkt 4): Nur Services im aktiven feature_ids-Filter
-        # (leer = kein Filter = alle) - nicht angehakte Services werden
-        # nicht als '(No Data)' angezeigt. Runde 13: defensiv (der Reader
-        # filtert bereits nach feature_ids).
-        active_ids = {str(f).strip().lower()
-                      for f in (p.get("feature_ids") or [])}
         # Runde 13: `instance_hashes` ist seit dem MasterTree-Fix auch fuer
         # Set-Instanz-Varianten (TYPE_SERVICE) gefuellt. Der Reader filtert
         # den Payload bereits danach - hier defensiv gegen Alt-Payloads.
@@ -1559,6 +1571,13 @@ class HeatmapWidget(QWidget):
         aktiv war - die Runde-12b-Einschraenkung (kein Fallback bei nicht
         leerem instance_hashes) war unvollstaendig, weil `instance_hashes`
         fuer Set-Instanz-Varianten bis Runde 13 leer blieb.
+
+        Runde 13c (Bug 1-Absicherung): Falls ein Payload aus einem Alt-/
+        Kompatibilitaetspfad doch mehrere No-Data-Varianten desselben
+        Services enthaelt, gewinnt DEFENSIV die im ServicePicker gecheckte
+        Variante (instance_hash in `instance_hashes`) statt der ersten
+        Liste. Erst ohne Hash-Match faellt die Auswahl auf den ersten
+        Service-Treffer zurueck (hash-lose Variante/kein Filter).
         """
         if not variants:
             return None
@@ -1581,6 +1600,22 @@ class HeatmapWidget(QWidget):
         # Feld-Services im Payload IST die ausgewaehlte - kein Fallback auf
         # die 'erste Variante' mehr (die gecheckte Variante gewinnt, weil
         # nur sie im Payload steht).
+        #
+        # Runde 13c (Bug 1-Absicherung): Bei mehreren No-Data-Varianten
+        # desselben Services gewinnt DEFENSIV die im ServicePicker gecheckte
+        # Variante (instance_hash in active_hashes) statt der ersten Liste
+        # - falls der Payload aus einem Alt-/Kompatibilitaetspfad doch
+        # mehrere Varianten enthaelt. Erst wenn kein Hash-Match vorliegt
+        # (hash-lose Variante/kein Filter), faellt die Auswahl auf den
+        # ersten Service-Treffer zurueck.
+        p_hashes = {str(h).strip().lower()
+                    for h in (p.get("instance_hashes") or [])}
+        if p_hashes:
+            for v in variants:
+                if (str(v.get("plugin_id") or "").strip().lower() == sid
+                        and str(v.get("instance_hash") or "").strip().lower()
+                        in p_hashes):
+                    return v
         for v in variants:
             if str(v.get("plugin_id") or "").strip().lower() == sid:
                 return v

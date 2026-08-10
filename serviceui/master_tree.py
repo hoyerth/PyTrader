@@ -74,6 +74,12 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem,
 )
 
+# 20.04 (Q2/Q4): Deterministischer Parameter-Hash. Runde 13b
+# (Bugfix Dropdown-NoData): on-the-fly-Fallback in _build_set_item fuer
+# Set-Instanzen, deren Set-Definition beim regularen Hinzufuegen keinen
+# instance_hash persistiert hat (Alt-Bestand).
+from analytics.engine.service_models import generate_instance_hash
+
 # 18.01.03 (Dynamic Tree Management): MIME-Typ fuer den internen
 # Kategorie-Drag & Drop. Die MIME-Daten kodieren den gezogenen Knoten als
 # JSON: {"node_type": "set|plugin|category", "group": "sets|plugins",
@@ -571,8 +577,28 @@ class MasterTree(QTreeWidget):
             svc_item.setData(0, ROLE_SET_ID, child.get("set_id") or "")
             svc_item.setData(0, ROLE_INSTANCE_ID, svc.get("instance_id") or "")
             svc_item.setData(0, ROLE_PLUGIN_ID, plugin_id)
-            svc_item.setData(0, ROLE_INSTANCE_HASH,
-                             str(svc.get("instance_hash") or ""))
+            # Runde 13b (Bugfix Dropdown-NoData): Set-Instanzen werden beim
+            # regularen Hinzufuegen OHNE instance_hash in der Set-Definition
+            # gespeichert (nur _duplicate_set_instance persistiert ihn) -
+            # daraus blieb `instance_hashes` fuer Set-Instanzen leer und die
+            # '(No Data)'-Varianten-Einschraenkung des Readers griff nicht
+            # (Dropdown zeigte die erste/falsche Variante und ungecheckte
+            # Instanzen). Hier wird der fehlende Hash on-the-fly aus den
+            # Params berechnet (identisch zum Reader-Set-Pfad
+            # generate_instance_hash(pid, params)) - heilt Alt-Bestand ohne
+            # DB-Migration.
+            svc_hash = str(svc.get("instance_hash") or "")
+            if not svc_hash and self.model is not None:
+                try:
+                    cfg = self.model.find_service(
+                        str(child.get("set_id") or ""),
+                        str(svc.get("instance_id") or "")) or {}
+                    svc_hash = generate_instance_hash(
+                        str(cfg.get("plugin_id") or plugin_id),
+                        cfg.get("params") or {}) or ""
+                except Exception:
+                    svc_hash = ""
+            svc_item.setData(0, ROLE_INSTANCE_HASH, svc_hash)
             if svc_archived or archived_set:
                 svc_item.setData(0, ROLE_ARCHIVED, True)
             # 15.03-E (Multi-Select): Service-Knoten anhakbar – Zustand aus
@@ -582,7 +608,7 @@ class MasterTree(QTreeWidget):
                 key = (TYPE_SERVICE,
                        str(child.get("set_id") or ""),
                        str(svc.get("instance_id") or ""),
-                       str(svc.get("instance_hash") or ""))
+                       svc_hash)
                 state = (Qt.Checked if key in self._checked_items
                          else Qt.Unchecked)
                 svc_item.setData(0, Qt.CheckStateRole, state)
