@@ -625,6 +625,10 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         tree.delete_complete_requested.connect(self._on_delete_complete)
         tree.doc_log_requested.connect(self._on_doc_log_requested)
         tree.duplicate_variant_requested.connect(self._on_duplicate_variant)
+        # 10.08.2026 (Bugfix): 'Variante umbenennen' (Clone/Preset) – der
+        # MasterTree fragt den neuen Namen ab; dieser Handler persistiert
+        # den Rename in indicator_presets (indicator_id, preset_name).
+        tree.rename_variant_requested.connect(self._on_rename_variant)
 
     @Slot(str)
     def _toolbar_add_service(self, plugin_id: str,
@@ -2543,6 +2547,54 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             return
         self.log("Als Variante duplizieren: keine Ziel-Instanz.")
 
+    @Slot(str, str, str)
+    def _on_rename_variant(self, plugin_id: str, instance_hash: str,
+                           new_name: str) -> None:
+        """'Variante umbenennen' (10.08.2026, Bugfix).
+
+        Benennt ein Plugin-Preset (Clone/Variante) in indicator_presets um.
+        Kollisionspruefung gegen die UEBRIGEN Presets des Plugins; die
+        Feature-Store-Daten (Spalte instance_hash) bleiben unberuehrt
+        (der Hash haengt an den Parametern, nicht am Namen).
+        """
+        preset = self._find_preset_for_hash(plugin_id, instance_hash)
+        if preset is None:
+            self.log(f"Preset zu #{instance_hash} nicht gefunden – "
+                     f"Umbenennen abgebrochen.")
+            return
+        old_name = str(preset.get("preset_name") or "Default")
+        indicator_id = str(preset.get("indicator_id") or "")
+        if not indicator_id:
+            self.log("Preset hat keine indicator_id – Umbenennen abgebrochen.")
+            return
+        clean = (new_name or "").strip()
+        if not clean or clean == old_name:
+            return
+        sm = getattr(self, "_state_manager", None)
+        if sm is None:
+            self.log("Umbenennen nicht moeglich (kein StateManager).")
+            return
+        try:
+            existing = {str(p.get("preset_name") or "")
+                        for p in (sm.list_plugin_presets(plugin_id) or [])
+                        if isinstance(p, dict)}
+        except Exception as e:
+            self.log(f"FEHLER beim Laden der Preset-Namen: {e}")
+            return
+        if clean in existing:
+            QMessageBox.warning(
+                self, "Name vergeben",
+                f"Eine andere Variante von '{plugin_id}' heisst bereits "
+                f"'{clean}'.")
+            return
+        try:
+            sm.rename_indicator_preset(indicator_id, old_name, clean)
+        except Exception as e:
+            self.log(f"FEHLER beim Umbenennen der Variante: {e}")
+            return
+        self.log(f"Variante '{old_name}' umbenannt zu '{clean}'.")
+        event_bus.service_set_changed.emit()
+
     def _duplicate_set_instance(self, set_id: str, service_id: str) -> None:
         """Dupliziert eine Service-Instanz in ihrem Set (Q8)."""
         try:
@@ -2624,7 +2676,30 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             is_active = True
         if not indicator_id:
             indicator_id = plugin_id
-        new_name = self._next_preset_copy_name(sm, plugin_id, base)
+        # 10.08.2026 (Bugfix): Beim Anlegen einer neuen Variante MUSS ein
+        # neuer Name vergeben werden – kein stummes Auto-Schema
+        # ('<base> (Kopie)'). Der Dialog ist mit dem freien Kopiernamen
+        # vorbelegt; Kollisionen werden abgefangen.
+        suggested = self._next_preset_copy_name(sm, plugin_id, base)
+        new_name, ok = QInputDialog.getText(
+            self, "Variante anlegen",
+            f"Name für die neue Variante (aus '{base}'):", text=suggested)
+        new_name = (new_name or "").strip()
+        if not ok or not new_name:
+            self.log("Variante nicht dupliziert (Name fehlt/abgebrochen).")
+            return
+        try:
+            existing = {str(p.get("preset_name") or "")
+                        for p in (sm.list_plugin_presets(plugin_id) or [])
+                        if isinstance(p, dict)}
+        except Exception:
+            existing = set()
+        if new_name in existing:
+            QMessageBox.warning(
+                self, "Name vergeben",
+                f"Eine andere Variante von '{plugin_id}' heisst bereits "
+                f"'{new_name}'.")
+            return
         try:
             sm.save_indicator_preset(
                 indicator_id, new_name, params,

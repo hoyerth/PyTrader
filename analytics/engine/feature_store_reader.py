@@ -1143,6 +1143,53 @@ class FeatureStoreReader:
                 continue
         return out
 
+    def fetch_last_execution_dates_by_hash(
+        self,
+    ) -> Dict[str, Dict[str, str]]:
+        """Neuester Schreib-Zeitpunkt je (feature_id, instance_hash).
+
+        Bugfix 10.08.2026 (Varianten-Ausfuehrungsdatum): Varianten/Clones
+        (indicator_presets) haben EIGENE Feature-Store-Rows (Spalte
+        `instance_hash`, 20.04 Q9). Fuer die MasterTree-Anzeige
+        '<Preset> (DD.MM.JJ)' wird das Datum der letzten Ausfuehrung je
+        Parameter-Variante benoetigt – nicht das der plugin_id insgesamt.
+
+        Quelle: MAX(created_at) GROUP BY feature_id + instance_hash ueber
+        ALLE Symbole/Timeframes. Case-insensitiv/whitespace-tolerant wie
+        `fetch_last_execution_dates`; Rows ohne instance_hash (nicht
+        Varianten-gesteuerte Services) und ohne created_at werden
+        uebersprungen.
+
+        Returns:
+            Dict feature_id (lower) -> {instance_hash: 'DD.MM.JJ'} – leer
+            bei fehlender DB/Tabelle oder Fehler (defensiv).
+        """
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT LOWER(TRIM(feature_id)) AS fid, instance_hash,
+                       MAX(created_at)
+                FROM feature_store
+                WHERE feature_id IS NOT NULL AND TRIM(feature_id) != ''
+                  AND feature_id != ?
+                  AND instance_hash IS NOT NULL AND instance_hash != ''
+                GROUP BY LOWER(TRIM(feature_id)), instance_hash
+            """, [SENTINEL_NATIVE]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] "
+                  f"fetch_last_execution_dates_by_hash fehlgeschlagen: {e}")
+            return {}
+        out: Dict[str, Dict[str, str]] = {}
+        for r in rows:
+            if r[0] is None or r[1] is None or r[2] is None:
+                continue
+            try:
+                out.setdefault(str(r[0]), {})[str(r[1])] = r[2].strftime(
+                    "%d.%m.%y")
+            except (AttributeError, ValueError):
+                continue
+        return out
+
     # ------------------------------------------------------------------
     # Lesen: Metadaten
     # ------------------------------------------------------------------

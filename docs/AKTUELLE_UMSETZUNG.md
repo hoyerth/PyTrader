@@ -443,3 +443,94 @@ Restore-Verlust entstand in der UI-Sync-Schicht.
 nicht ausfuehrbar, weil die laufende App `data/app_data.duckdb` haelt
 (DB-Lock, rein umgebungsbedingt). Sie liefen in derselben Sitzung vor der
 Umsetzung gruen und sind von dieser additiven Aenderung unberuehrt.
+---
+
+## 8c. Implementierungs-Log – Bugfix Varianten-Anzeige/-Anlage/-Umbenennung (10.08.2026)
+
+**Problem (User-Bugreport 10.08.2026, analytics_win / Service-Picker):** Drei
+Schwaechen im MasterTree-Varianten-Konzept (20.04):
+
+1. **Varianten-Anzeige:** Clone-Zeilen zeigten die technische ID (`#<hash>`)
+   statt des letzten Ausfuehrungsdatums; der Plugin-Parent-Knoten trug
+   zusaetzlich ein eigenes Ausfuehrungsdatum, das mit den Varianten-Daten
+   verwechselbar war.
+2. **Varianten-Anlage:** 'Als Variante duplizieren' vergab den Namen stumm
+   ueber das Auto-Schema ('<base> (Kopie)') – ein neuer Name MUSS vom User
+   vergeben werden.
+3. **Varianten-Rename:** Es fehlte eine 'Variante umbenennen'-Aktion im
+   Kontextmenue (UPDATE auf den Primaerschluessel `(indicator_id,
+   preset_name)`).
+
+**Anforderungen (verbindlich, Anwender 10.08.2026):**
+
+| # | Anforderung |
+|---|---|
+| V1 | Existiert eine Variante, haengt das letzte Ausfuehrungsdatum am Varianten-Namen (`<Preset> (DD.MM.JJ)`); die ID (`#hash`) entfaellt aus dem Label; der Plugin-Parent-Knoten zeigt KEIN Ausfuehrungsdatum mehr. |
+| V2 | Beim Anlegen einer neuen Variante MUSS ein neuer Name eingegeben werden (kein stummes Auto-Naming). |
+| V3 | Kontextmenue-Aktion 'Variante umbenennen' vorhanden. |
+
+### Aenderungen je Datei
+
+* **`analytics/engine/feature_store_reader.py`** (V1):
+  * Neu (read-only, nach `fetch_last_execution_dates`):
+    `fetch_last_execution_dates_by_hash() -> Dict[feature_id_lower,
+    {instance_hash: 'DD.MM.JJ'}]` – `MAX(created_at) GROUP BY
+    feature_id + instance_hash` ueber alle Symbole/Timeframes. Rows ohne
+    `instance_hash` und der Sentinel `'native'` werden uebersprungen;
+    case-insensitiv/whitespace-tolerant wie die Plugin-Variante. Defensiv:
+    Fehler/Tabelle fehlt -> `{}`.
+
+* **`analytics/engine/service_selector_model.py`** (V1):
+  * Neuer State `_last_execution_dates_by_hash` (`Dict[pid_lower,
+    {hash: date}]`), geladen in `refresh()` NACH den Plugin-Daten
+    (`_load_last_execution_dates_by_hash()` delegiert an den
+    FeatureStoreReader; Fehler -> `{}`).
+  * `_load_plugin_presets()`: jedes Clone-Dict erhaelt
+    `last_execution` (per-Hash-Datum, Fallback `'--.--.--'`).
+  * Neu (public): `last_execution_date_for_hash(plugin_id, instance_hash)`
+    -> `'DD.MM.JJ'` oder `'--.--.--'`.
+
+* **`serviceui/master_tree.py`** (V1/V3):
+  * Neue Rolle `ROLE_PRESET_NAME` (UserRole+6) traegt den Anzeigenamen eines
+    Clone-Knotens (fuer den Rename-Dialog ohne DB-Lookup).
+  * `_build_plugin_item`: Hat das Plugin Clones, ist das Parent-Label nur die
+    Plugin-ID (KEIN Datum); flache Blaetter behalten `pid (DD.MM.JJ)`.
+  * `_build_clone_item`: Label `🟢/🔹 <Preset> (DD.MM.JJ)` – Hash entfaellt,
+    Datum der letzten Ausfuehrung dieser Variante direkt am Namen.
+  * Neues Signal `rename_variant_requested(plugin_id, instance_hash,
+    new_name)`; `_on_rename_clone(item)` fragt den neuen Namen via
+    `QInputDialog` ab (vorbelegt mit `ROLE_PRESET_NAME`) und emittiert das
+    Signal. Kontextmenue-Branch TYPE_CLONE: Aktion 'Variante umbenennen'
+    (bei archivierten deaktiviert).
+
+* **`state_manager.py`** (V3):
+  * Neu: `rename_indicator_preset(indicator_id, old_name, new_name)` –
+    `UPDATE indicator_presets SET preset_name = ? WHERE indicator_id = ?
+    AND preset_name = ?`. Alle weiteren Spalten bleiben unangetastet; der
+    Aufrufer prueft vorher auf Kollisionen (Unique-Constraint).
+
+* **`serviceui/service_win.py`** (V2/V3):
+  * Verbindung `rename_variant_requested` -> neuer Handler `_on_rename_variant`
+    (Kollisionspruefung via `list_plugin_presets`, Persistenz via
+    `rename_indicator_preset`, Live-Sync via `event_bus.service_set_changed`).
+  * `_duplicate_preset`: `QInputDialog` 'Name fuer die neue Variante (aus
+    '<base>')' – vorbelegt mit dem freien Kopiernamen; Leer-/Abbruch-Guard
+    und Kollisionspruefung vor `save_indicator_preset`.
+
+* **`serviceui/service_selector_dialog.py`** (V2/V3):
+  * Gleiche Verkabelung fuer den Analytics-Datenquellen-Picker:
+    `_on_rename_variant` (QMessageBox-basiert) + Namensdialog in
+    `_duplicate_preset`.
+
+### Verifikation (headless, keine UI-Tests)
+
+* `test/check_variant_bugfix.py`: **17/17 PASS** – per-Hash-Daten (1a-1d),
+  Clone-`last_execution` im Baum (2a-2c), MasterTree-Labels (3a-3e:
+  Parent ohne Datum, Clone mit Datum ohne Hash, ROLE_PRESET_NAME, flaches
+  Blatt-Regression, Archiv-Clone), `rename_indicator_preset`-Persistenz
+  (4a-4d). Temp-Verzeichnisse danach entfernt.
+* Real-Modell-Integration (offscreen): `ServiceSelectorModel` laedt Presets
+  mit `last_execution` aus dem echten Feature-Store (z. B.
+  `srv_swing_volume_profile` -> 'Default'/'Default (Kopie)' mit
+  `exec=10.08.26`).
+* `py_compile` + CRLF-Konsistenz (0 lone LF) aller geaenderten Dateien.

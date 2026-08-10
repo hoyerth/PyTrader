@@ -425,6 +425,24 @@ class StateManager:
             [indicator_id, preset_name]
         )
 
+    def rename_indicator_preset(self, indicator_id: str, old_name: str,
+                                new_name: str) -> None:
+        """Benennt ein Indikator-/Plugin-Preset um (10.08.2026, Bugfix).
+
+        'Variante umbenennen' im MasterTree-Kontextmenue (Clone/Preset):
+        Der Primaerschluessel von indicator_presets ist (indicator_id,
+        preset_name) – der Rename ist ein UPDATE des preset_name. Alle
+        weiteren Spalten (params, plugin_id, version, is_active_batch,
+        doc_log) bleiben unangetastet. Der Aufrufer muss zuvor auf
+        Namenskollisionen pruefen (sonst Unique-Constraint-Fehler).
+        """
+        con = self._get_connection()
+        con.execute(
+            "UPDATE indicator_presets SET preset_name = ? "
+            "WHERE indicator_id = ? AND preset_name = ?",
+            [new_name, indicator_id, old_name]
+        )
+
     def list_plugin_presets(self, plugin_id: str) -> List[Dict[str, Any]]:
         """Liefert alle Presets eines Plugins (20.04, Q7).
 

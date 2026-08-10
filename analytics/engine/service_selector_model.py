@@ -137,6 +137,11 @@ class ServiceSelectorModel(QObject):
         self._active_indicator_ids: Set[str] = set()
         # 05.08.2026: Datum der letzten Ausfuehrung je feature_id (DD.MM.JJ)
         self._last_execution_dates: Dict[str, str] = {}
+        # 10.08.2026 (Varianten-Ausfuehrungsdatum): Datum der letzten
+        # Ausfuehrung je (feature_id, instance_hash) – Grundlage der
+        # MasterTree-Varianten-Anzeige '<Preset> (DD.MM.JJ)'. Quelle:
+        # FeatureStoreReader.fetch_last_execution_dates_by_hash().
+        self._last_execution_dates_by_hash: Dict[str, Dict[str, str]] = {}
         # 18.01.03 (E1): Kategorie-Overrides je Plugin (global_settings,
         # Key 'plugin_category_<pid>'). Ein gesetzter Override UEBERSCHREIBT
         # metadata['category'] (auch "" = Root-Ebene); ohne Override gilt das
@@ -180,6 +185,12 @@ class ServiceSelectorModel(QObject):
         # wird nach jedem Service-Run (ServiceRunWorker -> EventBus) neu
         # gelesen, damit der MasterTree das Datum live aktualisiert.
         self._last_execution_dates = self._load_last_execution_dates()
+        # 10.08.2026 (Varianten-Ausfuehrungsdatum): Datum der letzten
+        # Ausfuehrung je (feature_id, instance_hash) – Grundlage der
+        # MasterTree-Varianten-Anzeige '<Preset> (DD.MM.JJ)'. Wird NACH den
+        # Plugin-Ausfuehrungsdaten gelesen, damit _load_plugin_presets() die
+        # Hash-Daten je Clone mitgeben kann.
+        self._last_execution_dates_by_hash = self._load_last_execution_dates_by_hash()
         # 18.01.03 (E1): Kategorie-Overrides (plugin_category_<pid>) laden –
         # einmalig pro Refresh, damit _category_parts() ohne DB-Zugriff
         # auswertet (Baum-Aufbau bleibt rein lesend aus dem RAM).
@@ -275,12 +286,21 @@ class ServiceSelectorModel(QObject):
                     if not isinstance(p, dict):
                         continue
                     params = p.get("params") or {}
+                    instance_hash = generate_instance_hash(pid, params)
+                    per_hash = self._last_execution_dates_by_hash.get(
+                        str(pid).lower(), {}) or {}
                     clones.append({
                         "preset_name": str(p.get("preset_name") or "Default"),
                         "params": params,
-                        "instance_hash": generate_instance_hash(pid, params),
+                        "instance_hash": instance_hash,
                         "is_archived": not bool(p.get("is_active_batch")),
                         "doc_log": str(p.get("doc_log") or ""),
+                        # 10.08.2026: Datum der letzten Ausfuehrung dieser
+                        # Parameter-Variante (Feature-Store, Spalte
+                        # instance_hash) – fuer die MasterTree-Anzeige
+                        # '<Preset> (DD.MM.JJ)'. Fallback '--.--.--'.
+                        "last_execution": per_hash.get(
+                            instance_hash, "--.--.--"),
                     })
                 if clones:
                     result[str(pid).lower()] = clones
@@ -321,6 +341,39 @@ class ServiceSelectorModel(QObject):
             return "--.--.--"
         return self._last_execution_dates.get(
             str(plugin_id).lower(), "--.--.--")
+
+    def last_execution_date_for_hash(
+        self, plugin_id: str, instance_hash: str
+    ) -> str:
+        """Datum der letzten Ausfuehrung einer Parameter-Variante.
+
+        10.08.2026 (Varianten-Ausfuehrungsdatum): Varianten/Clones haben
+        EIGENE Feature-Store-Rows (Spalte instance_hash). Formatiert als
+        'DD.MM.JJ' – Fallback '--.--.--' ohne Eintraege (bzw. ohne
+        instance_hash). Rueckgabewert ohne Klammern (MasterTree-Wrapper).
+        """
+        if not plugin_id or not instance_hash:
+            return "--.--.--"
+        per_hash = self._last_execution_dates_by_hash.get(
+            str(plugin_id).lower(), {}) or {}
+        return per_hash.get(str(instance_hash), "--.--.--")
+
+    def _load_last_execution_dates_by_hash(
+        self,
+    ) -> Dict[str, Dict[str, str]]:
+        """Liest die Varianten-Ausfuehrungsdaten je (feature_id, hash).
+
+        10.08.2026: Delegate an den FeatureStoreReader
+        (fetch_last_execution_dates_by_hash). Defensiv: Fehler -> leer
+        (Clones zeigen dann den Fallback '(--.--.--)').
+        """
+        try:
+            raw = self.feature_store_reader.fetch_last_execution_dates_by_hash() or {}
+        except Exception as e:
+            print(f"WARN [ServiceSelectorModel] Varianten-Ausfuehrungsdaten "
+                  f"nicht lesbar: {e}")
+            return {}
+        return {str(k).lower(): v for k, v in raw.items()}
 
     def _collect_active_indicator_ids(self) -> Set[str]:
         """Sammelt alle indicator_ids/plugin_ids, die in offenen Chart-

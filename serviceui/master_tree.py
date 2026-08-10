@@ -100,6 +100,10 @@ ROLE_PLUGIN_ID = Qt.UserRole + 3
 # markiert archivierte Knoten (non-checkable, Archiv-Safety).
 ROLE_INSTANCE_HASH = Qt.UserRole + 4
 ROLE_ARCHIVED = Qt.UserRole + 5
+# 10.08.2026 (Bugfix): ROLE_PRESET_NAME traegt den Anzeigenamen eines
+# Clone-/Preset-Knotens (fuer den 'Variante umbenennen'-Dialog, ohne
+# DB-Lookup im MasterTree).
+ROLE_PRESET_NAME = Qt.UserRole + 6
 
 # 15.03-E (Multi-Select): Klickzone der Checkbox-Indikatoren in Spalte 0.
 # Klicks links dieser Zone (innerhalb der Item-Zeile) werden dem Qt-Default
@@ -285,6 +289,12 @@ class MasterTree(QTreeWidget):
     delete_complete_requested = Signal(str, str, str, str)
     doc_log_requested = Signal(str, str, str, str)
     duplicate_variant_requested = Signal(str, str, str, str)
+    # 10.08.2026 (Bugfix): 'Variante umbenennen' (Clone/Preset-Kontextmenue).
+    # Der MasterTree fragt den neuen Namen ab (vorbelegt) und emittiert
+    # rename_variant_requested(plugin_id, instance_hash, new_name) – der
+    # Orchestrator (ServiceWindow / ServiceSelectorDialog) persistiert den
+    # Preset-Rename in indicator_presets (indicator_id, preset_name).
+    rename_variant_requested = Signal(str, str, str)
 
     def __init__(self, model, parent=None) -> None:
         super().__init__(parent)
@@ -580,7 +590,12 @@ class MasterTree(QTreeWidget):
         last_exec = str(child.get("last_execution") or "--.--.--")
         clones = child.get("clones") or []
         archived_parent = bool(child.get("archived"))
-        plugin_item = QTreeWidgetItem([f"{pid} ({last_exec})", ""])
+        # 10.08.2026 (Varianten-Ausfuehrungsdatum): Hat ein Plugin Varianten
+        # (Clones), haengt das Datum der letzten Ausfuehrung an der Variante
+        # (Clone-Zeile) – der Parent-Knoten zeigt nur noch die Plugin-ID
+        # (kein Ausfuehrungsdatum mehr im Knoten darueber).
+        plugin_label = pid if clones else f"{pid} ({last_exec})"
+        plugin_item = QTreeWidgetItem([plugin_label, ""])
         plugin_item.setData(0, ROLE_NODE_TYPE, TYPE_PLUGIN)
         plugin_item.setData(0, ROLE_SET_ID, group)
         plugin_item.setData(0, ROLE_PLUGIN_ID, pid)
@@ -617,12 +632,18 @@ class MasterTree(QTreeWidget):
         preset_name = str(clone.get("preset_name") or "Default")
         instance_hash = str(clone.get("instance_hash") or "")
         archived = bool(clone.get("is_archived"))
-        hash_suffix = f" (#{instance_hash})" if instance_hash else ""
+        # 10.08.2026 (Bugfix, Varianten-Ausfuehrungsdatum): Die ID (#hash)
+        # entfaellt aus dem Label – stattdessen haengt das Datum der letzten
+        # Ausfuehrung dieser Variante direkt am Varianten-Namen:
+        # '🟢 <Preset> (DD.MM.JJ)' (ohne Eintrag '(--.--.--)').
+        last_exec = str(clone.get("last_execution") or "--.--.--")
         prefix = "🔹" if archived else "🟢"
-        clone_item = QTreeWidgetItem([f"{prefix} {preset_name}{hash_suffix}", ""])
+        clone_item = QTreeWidgetItem(
+            [f"{prefix} {preset_name} ({last_exec})", ""])
         clone_item.setData(0, ROLE_NODE_TYPE, TYPE_CLONE)
         clone_item.setData(0, ROLE_PLUGIN_ID, plugin_id)
         clone_item.setData(0, ROLE_INSTANCE_HASH, instance_hash)
+        clone_item.setData(0, ROLE_PRESET_NAME, preset_name)
         if archived:
             clone_item.setData(0, ROLE_ARCHIVED, True)
         # Tooltip: Plugin/Preset + Parameter + Doc-Log (Negativ-Wissen).
@@ -953,6 +974,31 @@ class MasterTree(QTreeWidget):
         parts = old_path.split("/")
         new_path = "/".join(parts[:-1] + [new_name])
         self.rename_folder_requested.emit(str(group), old_path, new_path)
+
+    def _on_rename_clone(self, item) -> None:
+        """Kontextmenue 'Variante umbenennen' (10.08.2026, Bugfix).
+
+        Fragt den neuen Preset-Namen ab (vorbelegt mit dem aktuellen Namen)
+        und emittiert `rename_variant_requested(plugin_id, instance_hash,
+        new_name)` – der Orchestrator (ServiceWindow/ServiceSelectorDialog)
+        persistiert den Rename in indicator_presets und emittiert den
+        EventBus (Live-Sync aller MasterTrees).
+        """
+        if item is None or not isValid(item):
+            return
+        plugin_id = str(item.data(0, ROLE_PLUGIN_ID) or "")
+        instance_hash = str(item.data(0, ROLE_INSTANCE_HASH) or "")
+        old_name = str(item.data(0, ROLE_PRESET_NAME) or "")
+        if not plugin_id or not instance_hash:
+            return
+        new_name, ok = QInputDialog.getText(
+            self, "Variante umbenennen",
+            "Neuer Name der Variante:", text=old_name)
+        new_name = (new_name or "").strip()
+        if not ok or not new_name or new_name == old_name:
+            return
+        self.rename_variant_requested.emit(
+            plugin_id, instance_hash, new_name)
 
     # -------------------------------------------------------------------------
     # 18.01.03 (Bugfix 08.08.2026): Expansion-Erhaltung ueber _populate()
@@ -1804,6 +1850,14 @@ class MasterTree(QTreeWidget):
                 act_variant.triggered.connect(
                     lambda _=False, p=plugin_id, h=instance_hash:
                     self.duplicate_variant_requested.emit("", "", p, h))
+                # 10.08.2026 (Bugfix): 'Variante umbenennen' – Fragt den
+                # neuen Preset-Namen ab (Namensdialog im MasterTree) und
+                # emittiert rename_variant_requested (Orchestrator persistiert).
+                act_rename = menu.addAction("Variante umbenennen")
+                act_rename.setEnabled(not archived)
+                act_rename.triggered.connect(
+                    lambda _=False, it=item:
+                    self._on_rename_clone(it))
                 act_doclog = menu.addAction("Doc Log bearbeiten")
                 act_doclog.setEnabled(not archived)
                 act_doclog.triggered.connect(

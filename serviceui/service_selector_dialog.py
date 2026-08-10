@@ -456,6 +456,11 @@ class ServiceSelectorDialog(QDialog):
             tree.doc_log_requested.connect(self._on_doc_log_requested)
             tree.duplicate_variant_requested.connect(
                 self._on_duplicate_variant)
+            # 10.08.2026 (Bugfix): 'Variante umbenennen' (Clone/Preset) –
+            # der MasterTree fragt den neuen Namen ab; dieser Handler
+            # persistiert den Rename in indicator_presets.
+            tree.rename_variant_requested.connect(
+                self._on_rename_variant)
         # Live-Sync: Modell-Refresh (EventBus -> data_changed) baut den Baum
         # neu; das Panel wird mit dem zuletzt geklickten Scope nachgezogen.
         self.model.data_changed.connect(self._on_model_data_changed)
@@ -696,6 +701,55 @@ class ServiceSelectorDialog(QDialog):
         except (RuntimeError, AttributeError):
             pass
 
+    @Slot(str, str, str)
+    def _on_rename_variant(self, plugin_id: str, instance_hash: str,
+                           new_name: str) -> None:
+        """'Variante umbenennen' (10.08.2026, Bugfix) – Picker-Variante.
+
+        Persistiert den Rename in indicator_presets (indicator_id,
+        preset_name) mit Kollisionspruefung. Die Feature-Store-Daten
+        (Spalte instance_hash) bleiben unberuehrt. Der Picker nutzt
+        QMessageBox-Warnungen statt des ServiceWindow-Loggings.
+        """
+        try:
+            sm = self.model.state_manager
+        except Exception:
+            return
+        preset = self._find_preset_for_hash(plugin_id, instance_hash)
+        if preset is None:
+            QMessageBox.warning(
+                self, "Umbenennen",
+                f"Preset zu #{instance_hash} nicht gefunden.")
+            return
+        old_name = str(preset.get("preset_name") or "Default")
+        indicator_id = str(preset.get("indicator_id") or "")
+        if not indicator_id:
+            QMessageBox.warning(
+                self, "Umbenennen",
+                "Preset hat keine indicator_id – Umbenennen abgebrochen.")
+            return
+        clean = (new_name or "").strip()
+        if not clean or clean == old_name:
+            return
+        try:
+            existing = {str(p.get("preset_name") or "")
+                        for p in (sm.list_plugin_presets(plugin_id) or [])
+                        if isinstance(p, dict)}
+        except Exception:
+            existing = set()
+        if clean in existing:
+            QMessageBox.warning(
+                self, "Name vergeben",
+                f"Eine andere Variante von '{plugin_id}' heisst bereits "
+                f"'{clean}'.")
+            return
+        try:
+            sm.rename_indicator_preset(indicator_id, old_name, clean)
+        except Exception as e:
+            QMessageBox.warning(self, "Fehler", str(e))
+            return
+        event_bus.service_set_changed.emit()
+
     def _next_preset_copy_name(self, plugin_id: str, base: str) -> str:
         """Naechster freier Preset-Name '<base> (Kopie)', '(Kopie 2)', ..."""
         try:
@@ -775,7 +829,28 @@ class ServiceSelectorDialog(QDialog):
                 raw = {}
             params = dict(raw.get("params") or {})
             version = raw.get("version") or "1.0.0"
-        new_name = self._next_preset_copy_name(plugin_id, base)
+        # 10.08.2026 (Bugfix): Beim Anlegen einer neuen Variante MUSS ein
+        # neuer Name vergeben werden – der Dialog ist mit dem freien
+        # Kopiernamen vorbelegt; Kollisionen werden abgefangen.
+        suggested = self._next_preset_copy_name(plugin_id, base)
+        new_name, ok = QInputDialog.getText(
+            self, "Variante anlegen",
+            f"Name für die neue Variante (aus '{base}'):", text=suggested)
+        new_name = (new_name or "").strip()
+        if not ok or not new_name:
+            return
+        try:
+            existing = {str(p.get("preset_name") or "")
+                        for p in (sm.list_plugin_presets(plugin_id) or [])
+                        if isinstance(p, dict)}
+        except Exception:
+            existing = set()
+        if new_name in existing:
+            QMessageBox.warning(
+                self, "Name vergeben",
+                f"Eine andere Variante von '{plugin_id}' heisst bereits "
+                f"'{new_name}'.")
+            return
         try:
             sm.save_indicator_preset(
                 indicator_id, new_name, params,
