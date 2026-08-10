@@ -1210,3 +1210,51 @@ fort, weil der Reader die Datenlage anders beurteilte als die DB:
 
 ---
 
+## 8m. Implementierungs-Log - Bugfix Runde 14: Dropdown-NoData zeigt nichts mehr fuer zweite Variante ohne Daten (10.08.2026)
+
+**Problem (User-Bugreport 10.08.2026, direkt nach Runde 13c):** Das
+'(No Data)'-Dropdown zeigte GAR KEINE NoData-Anzeige mehr, obwohl eine
+gecheckte Version (zweiter Eintrag) ohne Daten existierte.
+
+**Root Cause:** Der Runde-13c-Alt-Bestand-Fallback in
+`resolve_no_data_variants` war zu grob: Liegen die `feature_store`-Daten
+einer plugin_id ausschliesslich als undifferenzierte Alt-Rows vor
+(`instance_hash IS NULL`, z. B. `srv_proximity` mit 593K Rows), galt
+**JEDE** Variante des Services als 'hat Daten'. Eine neu erzeugte zweite
+Variante (anderer Hash, noch nie berechnet) wurde damit faelschlich als
+datenreich eingestuft -> kein '(No Data)'-Eintrag, obwohl sie nie
+gelaufen ist.
+
+### Loesung
+
+* `analytics/engine/feature_store_reader.py`:
+  * Der Alt-Bestand-Fallback greift jetzt NUR fuer die ERSTE aktive
+    Variante je plugin_id im Snapshot (`first_hash_by_pid`, Reihenfolge
+    wie im ServicePicker: Presets/Clones zuerst, dann Set-Instanzen mit
+    on-the-fly `generate_instance_hash`). Der undifferenzierte
+    Alt-Bestand gehoert der Original-Instanz, die ihn vor der Hash-Aera
+    geschrieben hat.
+  * Weitere Varianten derselben plugin_id brauchen einen echten
+    `instance_hash`-Treffer in `available_instance_hashes`, sonst
+    erscheinen sie als '(No Data)'.
+  * Docstrings praezisiert ('ORIGINAL-Variante' statt 'jede Variante').
+
+### Verifikation (headless, keine UI-Tests)
+
+* `test/check_round14.py` (neu, echte DB `data/analytics.duckdb`):
+  **8/8 PASS** - V1 (Original, Hash `a392915e`) mit Alt-Bestand ->
+  kein NoData; V2 (Kopie, anderer Hash, nie gelaufen) -> '(No Data)'
+  (auch wenn nur V2 gecheckt); einzige Variante + Alt-Bestand -> kein
+  NoData (Regression 13c); Fake-DB ohne Tabelle -> konservative
+  Runde-10-Semantik (beide Varianten NoData).
+* Regressionen: `test/check_round13c.py` **20/20 PASS**,
+  `test/check_round12.py` **23/23 PASS**, `test/check_round11.py`
+  **35/35 PASS**, `test/check_round13b.py` **9/9 PASS**,
+  `test/_verify_mastertree.py` **ALL OK**.
+* `py_compile`: EXIT=0.
+* Cleanup: Diagnose-/Fix-Skripte (`_diag_round14*.py`,
+  `_fix_reader_docstring.py`) entfernt; `check_round14.py` bleibt
+  als Regressionstest (gitignored).
+
+---
+
