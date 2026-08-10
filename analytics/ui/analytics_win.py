@@ -481,6 +481,13 @@ class AnalyticsWindow(PersistentWindow):
                 self.heatmap_page.set_mode(str(heatmap_mode))
         except Exception as e:
             print(f"WARN [AnalyticsWindow] Heatmap-Modus-Restore: {e}")
+        # 10.08.2026 (Bugfix Runde 7, Bug 2): ServicePicker nach einem
+        # Profilwechsel wieder oeffnen, falls das Layout es verlangt.
+        try:
+            if (self._vm.workspace_layout or {}).get("service_picker_open"):
+                self._open_service_dialog()
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] ServicePicker-Restore: {e}")
         self._sync_profile_filters()
         self._sync_service_filter_button()
 
@@ -901,6 +908,11 @@ class AnalyticsWindow(PersistentWindow):
             if hasattr(self, "sidebar") else 0,
             "heatmap_mode": self.heatmap_page.mode_id
             if hasattr(self, "heatmap_page") else "standard",
+            # 10.08.2026 (Bugfix Runde 7, Bug 2): Picker-Offen-Zustand auch
+            # im Profil-Payload persistieren (Muster _save_workspace).
+            "service_picker_open": bool(
+                self._service_dialog is not None
+                and self._service_dialog.isVisible()),
         }
 
     @Slot()
@@ -999,6 +1011,13 @@ class AnalyticsWindow(PersistentWindow):
                     # (standard | generic) im Workspace mitpersistieren.
                     "heatmap_mode": self.heatmap_page.mode_id
                     if hasattr(self, "heatmap_page") else "standard",
+                    # 10.08.2026 (Bugfix Runde 7, Bug 2): War der
+                    # ServicePicker beim Schliessen offen? _save_workspace
+                    # laeuft VOR dem close() des Dialogs im closeEvent,
+                    # damit der Zustand hier noch sichtbar ist.
+                    "service_picker_open": bool(
+                        self._service_dialog is not None
+                        and self._service_dialog.isVisible()),
                 },
             }
             self.state_manager.save_workspace_state(
@@ -1042,6 +1061,14 @@ class AnalyticsWindow(PersistentWindow):
             self.edit_limit.setText(
                 str(int(self._vm.params.get("limit")
                         or self._default_limit)))
+        # 10.08.2026 (Bugfix Runde 7, Bug 2): War der ServicePicker beim
+        # Schliessen offen, wird er nach dem Restore wieder geoeffnet (die
+        # Position stellt der Dialog selbst aus global_settings wieder her).
+        try:
+            if (self._vm.workspace_layout or {}).get("service_picker_open"):
+                self._open_service_dialog()
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] ServicePicker-Restore: {e}")
 
     def _initial_load(self) -> None:
         # VM mit dem aktuellen Combo-Zustand starten (Fix 15.03, idempotent):
@@ -1083,6 +1110,10 @@ class AnalyticsWindow(PersistentWindow):
             self._vm.shutdown()
         except Exception:
             pass
+        # 10.08.2026 (Bugfix Runde 7, Bug 2): Der Workspace wird VOR dem
+        # Schliessen des ServicePickers gespeichert, damit `service_picker_
+        # open` den Zustand des noch sichtbaren Dialogs erfasst.
+        self._save_workspace()
         # 10.08.2026 (Bugfix, Punkt 3): Den ServicePicker-Singleton mit
         # schliessen, wenn das AnalyticsWindow geschlossen wird - sonst
         # bleibt der frei bewegliche Dialog als Waisenfenster haengen.
@@ -1092,5 +1123,4 @@ class AnalyticsWindow(PersistentWindow):
                 self._service_dialog.close()
         except (RuntimeError, AttributeError):
             pass
-        self._save_workspace()
         super().closeEvent(event)

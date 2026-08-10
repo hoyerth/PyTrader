@@ -723,3 +723,87 @@ Check/Uncheck aktualisiert Dropdowns, ServicePicker-Waisenfenster).
 
 ---
 
+## 8f. Implementierungs-Log - Bugfix Kerzen-Overlay, ServicePicker-Restore, Dropdown-Sync (10.08.2026)
+
+**Problem (User-Bugreport 10.08.2026, Runde 7):** 5 Punkte - Kerzen-Overlay
+nur bei Datum auf einer Achse, ServicePicker-Position nicht in Historie
+gemerkt (restore fails), Ergebnisparameter-Dropdown nicht restored, Dropdown
+nicht aktualisiert bei Check/Uncheck, Check/Uncheck nicht in Historie
+gemerkt (restore fails). Der Runde-6-Fix (Klick-Pfad entfernt) war korrekt,
+deckte die echten Ursachen aber nicht ab: Der Checkbox-Pfad und die
+VM-Speicherkette funktionieren (headless verifiziert); die Wurzeln lagen in
+der Heatmap-UI-Sync (Stale-Payloads), zwei konkurrierenden feature_ids-
+Quellen (Picker vs. 'Feld'-Dropdown) und fehlender Picker-Open-Persistenz.
+
+### Bug 1 (Kerzen-Overlay nur bei Datum auf einer Achse)
+
+* `analytics/ui/heatmap_widget.py`: `_update_controls()` erlaubt das Overlay
+  jetzt bei `date` auf der X- ODER Y-Achse (vorher hart `can_overlay =
+  x_dim == "date"`). `_on_config_changed()` schaltet das Overlay nur noch
+  aus, wenn `date` auf KEINER Achse liegt. `_render_overlay()` zeichnet
+  vertikale Candles bei X=date (Preis auf der rechten Achse) und
+  horizontale Candles bei Y=date (Preis auf einer NEUEN zweiten unteren
+  Preis-Achse, `_price_axis_bottom` via `plotItem.layout.addItem(axis, 4,
+  1)`); `pg.BarGraphItem` nutzt `x0`/`width` fuer horizontale Dochte/Bodies.
+  Der Preis-ViewBox-Link folgt der Date-Achse (XLink vs. YLink),
+  `_update_price_view()` benachrichtigt die passende Achse.
+
+### Bug 2 (ServicePicker-Position/Restore)
+
+* `analytics/ui/analytics_win.py`: `_save_workspace()` persistiert
+  `layout.service_picker_open` (Dialog noch offen?); `closeEvent()` speichert
+  den Workspace VOR dem Schliessen des Dialogs (der Zustand muss noch
+  sichtbar sein). `_current_ui_layout()` persistiert den Picker-Offen-Zustand
+  auch im Profil-Payload. `_restore_workspace()` und
+  `_sync_ui_from_restored_params()` oeffnen den Picker nach dem Restore
+  wieder - die Position stellt der Dialog selbst aus global_settings wieder
+  her (Roundtrip war bereits korrekt, es fehlte nur das Wieder-Oeffnen).
+
+### Bug 3 (Ergebnisparameter-Dropdown nicht restored)
+
+* `analytics/ui/heatmap_widget.py` `_sync_combos_from_payload()`: Die
+  Prioritaet wurde gedreht - die RESTAURIERTEN VM-Params (Workspace/Profil)
+  gewinnen jetzt gegen einen Stale-Payload (Query lief VOR dem Restore mit
+  Default-Params), der Payload bestaetigt nur noch die tatsaechlich
+  verwendeten Werte (`agg`/`prev_field`). Der E6-Loop ueberschreibt
+  `heatmap_field` nicht mehr, wenn ein gueltiger Restore-Wert im aktuellen
+  Datensatz existiert (`_find_field_index`).
+
+### Bug 4 (Dropdown nicht aktualisiert bei Check/Uncheck)
+
+* Root Cause: ZWEI konkurrierende `feature_ids`-Quellen - ServicePicker-
+  Checkboxen (`checked_changed` -> `selection_ids_requested`) UND das
+  'Feld'-CheckableComboBox (`_on_field_selection_changed` ->
+  `set_feature_ids`). Loesung (Single Source of Truth = Picker): Die
+  `selection_changed`-Verbindung ist ENTFERNT (Bestandscode bleibt),
+  `_sync_combos_from_payload()` leitet die initialen CheckStates aus dem
+  aktiven `feature_ids`-Filter ab - nur Services aus dem Filter erscheinen
+  angehakt; Shared-Keys nutzen die XOR-Regel (Sammel-Eintrag ALL|key deckt
+  alle aktiven Quellen ab, sonst Einzel-Eintraege).
+
+### Bug 5 (Check/Uncheck nicht in Historie gemerkt)
+
+* Durch den Bug-4-Fix (kein feature_ids-Write-Back des Feld-Dropdowns) kann
+  der Restore die gespeicherten `feature_ids` nicht mehr ueberschreiben; der
+  Picker wird nach dem Restore wieder geoeffnet (Bug 2) und zeigt die
+  restaurierten Haken.
+
+### Verifikation (headless, keine UI-Tests)
+
+* `test/check_round7_fixes.py` (neu): **28/28 PASS** - Overlay X=date UND
+  Y=date (Candles, Achsen-Sichtbarkeit, ViewBox-Link, Auto-Abschaltung ohne
+  date-Achse), Stale-Payload kloppt VM-Params nicht (agg/field bleiben),
+  Feld-Dropdown-CheckStates folgen feature_ids (srv_a / srv_a+srv_b /
+  XOR-Sammel), kein feature_ids-Write-Back, Picker-Persistenz-Quell-Marker.
+* `test/check_round7_picker_runtime.py` (neu): **PASS** - echtes
+  AnalyticsWindow mit Temp-DBs: Picker open -> save -> restore -> wieder
+  sichtbar.
+* Regressionen: `test/check_restore_pipeline_round2.py` **29/29 PASS**,
+  `test/check_restore_pipeline_round3.py` **17/17 PASS**,
+  `test/check_2004_ctxmenu.py` **34/34 PASS**,
+  `test/check_variant_bugfix.py` **OK**, `test/check_ui3_bugfix.py`
+  **19/19 PASS**, `test/check_2004_timing.py` **3/3 PASS**.
+* `py_compile` aller geaenderten Dateien + CRLF-Konsistenz.
+
+---
+

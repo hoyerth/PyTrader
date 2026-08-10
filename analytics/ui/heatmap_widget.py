@@ -576,6 +576,15 @@ class HeatmapWidget(QWidget):
         self._price_vb.setZValue(10)  # ueber der Heatmap zeichnen
         self._price_vb.setVisible(False)
         self._plot_hm.getAxis("right").setVisible(False)
+        # 10.08.2026 (Bugfix Runde 7, Bug 1): Zweite untere Preis-Achse fuer
+        # horizontale Candles, wenn 'Datum' auf der Y-Achse liegt (die
+        # regulare untere Achse traegt dann die X-Dimension).
+        self._price_axis_bottom = pg.AxisItem("bottom",
+                                              parent=self._plot_hm.plotItem)
+        self._price_axis_bottom.setLabel("Preis")
+        self._plot_hm.plotItem.layout.addItem(self._price_axis_bottom, 4, 1)
+        self._price_axis_bottom.linkToView(self._price_vb)
+        self._price_axis_bottom.setVisible(False)
         self._plot_hm.plotItem.vb.sigResized.connect(self._update_price_view)
 
         lay = QVBoxLayout(self)
@@ -589,8 +598,14 @@ class HeatmapWidget(QWidget):
         self._combo_agg.currentIndexChanged.connect(self._on_agg_changed)
         self._combo_field.currentIndexChanged.connect(self._on_config_changed)
         # 20.03.02 (F1c): CheckState-Wechsel im 'Feld'-Dropdown -> Filter.
-        self._combo_field.selection_changed.connect(
-            self._on_field_selection_changed)
+        # 10.08.2026 (Bugfix Runde 7, Bug 4/5): Die Verbindung ist ENTFERNT -
+        # das 'Feld'-Dropdown schreibt KEIN feature_ids mehr (kein
+        # Ueberschreiben der ServicePicker-Auswahl bzw. des Restores). Die
+        # Haken spiegeln den aktiven Filter (_sync_combos_from_payload); die
+        # Feld-Auswahl (Current-Item) steuert heatmap_field weiterhin ueber
+        # currentIndexChanged -> _on_config_changed.
+        # self._combo_field.selection_changed.connect(
+        #     self._on_field_selection_changed)
         self._chk_candle.toggled.connect(self._on_candle_toggled)
         self._slider_zoom_x.valueChanged.connect(self._on_zoom_x_changed)
         self._slider_zoom_y.valueChanged.connect(self._on_zoom_y_changed)
@@ -705,6 +720,7 @@ class HeatmapWidget(QWidget):
         if self._view_model is None:
             return
         x_dim = str(self._combo_x.currentData() or "")
+        y_dim = str(self._combo_y.currentData() or "")
         agg = str(self._combo_agg.currentData() or "")
         self._slider_zoom_x.setEnabled(True)
         self._slider_zoom_y.setEnabled(True)
@@ -717,25 +733,39 @@ class HeatmapWidget(QWidget):
             self._combo_field.setToolTip(
                 "Nur fuer AVG/SUM/MIN/MAX relevant (E6); COUNT/CONFLUENCE "
                 "ignorieren das Feld.")
-        can_overlay = x_dim == "date"
+        # 10.08.2026 (Bugfix Runde 7, Bug 1): 'Datum' darf auf der X- ODER
+        # Y-Achse liegen - X=date zeichnet vertikale Candles (Preis rechts),
+        # Y=date horizontale Candles (Preis unten).
+        date_on_x = x_dim == "date"
+        can_overlay = (x_dim == "date" or y_dim == "date")
         self._chk_candle.setEnabled(can_overlay)
         if can_overlay:
             self._chk_candle.setToolTip(
-                "Tages-Ohlc ueber der Heatmap (gleicher Canvas, rechte "
-                "Preis-Achse), horizontal synchronisiert (Bugfix 1).")
+                "Tages-Ohlc ueber der Heatmap (gleicher Canvas), "
+                "Datum auf X- oder Y-Achse (Bugfix 1).")
         else:
             self._chk_candle.setToolTip(
-                "Kerzen-Overlay nur bei X-Achse 'Datum' verfuegbar (E9).")
-        # 20.02.01 (E7): Overlay-Zoom-Lock – die Preis-ViewBox ist NUR bei
-        # X=date UND aktivem Overlay an die Heatmap-ViewBox gekoppelt
-        # (setXLink). Bei allen anderen X-Dimensionen (oder ausgeschaltetem
-        # Overlay) wird der Link entfernt – Zoom-Sync vollstaendig entkoppelt.
-        linked = self._price_vb.linkedView(pg.ViewBox.XAxis)
+                "Kerzen-Overlay nur mit 'Datum' auf der X- oder Y-Achse "
+                "verfuegbar.")
+        # 10.08.2026 (Bugfix Runde 7, Bug 1): Der Overlay-Link folgt der
+        # DATE-Achse - X=date koppelt die Preis-VB an die X-Achse, Y=date
+        # an die Y-Achse. Ohne Overlay werden beide Links entfernt.
         link = can_overlay and self._chk_candle.isChecked()
-        if link and linked is None:
+        linked_x = self._price_vb.linkedView(pg.ViewBox.XAxis)
+        linked_y = self._price_vb.linkedView(pg.ViewBox.YAxis)
+        if link and date_on_x and linked_x is None:
             self._price_vb.setXLink(self._plot_hm.plotItem.vb)
-        if not link and linked is not None:
+        if link and not date_on_x and linked_y is None:
+            self._price_vb.setYLink(self._plot_hm.plotItem.vb)
+        if link and date_on_x and linked_y is not None:
+            self._price_vb.setYLink(None)
+        if link and not date_on_x and linked_x is not None:
             self._price_vb.setXLink(None)
+        if not link:
+            if linked_x is not None:
+                self._price_vb.setXLink(None)
+            if linked_y is not None:
+                self._price_vb.setYLink(None)
 
     # ------------------------------------------------------------------
     # Konfiguration -> ViewModel (Debounce -> Worker)
@@ -754,6 +784,7 @@ class HeatmapWidget(QWidget):
                 self._syncing = False
         # Overlay nur bei X=date (E9) – sonst ausschalten.
         if (self._combo_x.currentData() != "date"
+                and self._combo_y.currentData() != "date"
                 and self._chk_candle.isChecked()):
             self._chk_candle.setChecked(False)
         self._update_controls()
@@ -819,7 +850,14 @@ class HeatmapWidget(QWidget):
     # die Aggregation nutzt GENAU EIN aktives Hauptfeld).
     # ------------------------------------------------------------------
     def _on_field_selection_changed(self, _checked: List[str]) -> None:
-        """CheckState-Wechsel im 'Feld'-Dropdown -> feature_ids-Filter.
+        """CheckState-Wechsel im 'Feld'-Dropdown (nicht mehr verbunden).
+
+        10.08.2026 (Bugfix Runde 7, Bug 4/5): Die Verbindung
+        selection_changed -> dieser Handler wurde in __init__ entfernt - das
+        'Feld'-Dropdown schreibt KEIN feature_ids mehr (Single Source of
+        Truth = ServicePicker; kein Ueberschreiben des Restores). Der Handler
+        bleibt als Bestandscode erhalten.
+        -> feature_ids-Filter.
 
         Die angehakten Items bestimmen die Datenquellen (`set_feature_ids`);
         `set_feature_ids` stoesst den Debounce-Refresh der generischen
@@ -1003,10 +1041,17 @@ class HeatmapWidget(QWidget):
             self._y_min + lo * span, self._y_min + hi * span, padding=0)
 
     def _update_price_view(self) -> None:
-        """Synchronisiert die Preis-ViewBox-Geometrie mit der Heatmap."""
+        """Synchronisiert die Preis-ViewBox-Geometrie mit der Heatmap.
+
+        10.08.2026 (Bugfix Runde 7, Bug 1): Je nach gekoppelter Date-Achse
+        (X oder Y) wird die passende Achse benachrichtigt.
+        """
         vb = self._plot_hm.plotItem.vb
         self._price_vb.setGeometry(vb.sceneBoundingRect())
-        self._price_vb.linkedViewChanged(vb, self._price_vb.XAxis)
+        if self._price_vb.linkedView(pg.ViewBox.XAxis) is not None:
+            self._price_vb.linkedViewChanged(vb, self._price_vb.XAxis)
+        if self._price_vb.linkedView(pg.ViewBox.YAxis) is not None:
+            self._price_vb.linkedViewChanged(vb, self._price_vb.YAxis)
 
     # ------------------------------------------------------------------
     # Datenfluss (UI rendert, KEIN SQL)
@@ -1228,20 +1273,17 @@ class HeatmapWidget(QWidget):
             str(k): [str(s) for s in (v or [])]
             for k, v in field_sources.items()
         }
-        # 20.04-Timing-Fix (A+B): `agg` und `prev_field` BEVORZUGEN den
-        # Daten-Payload (tatsaechlich verwendete Werte), dann die
-        # restaurierten VM-Params und erst am Ende den Combo-Zustand.
-        # Beim App-Start laeuft attach_view_model() VOR restore_workspace() –
-        # der Combo kann beim ersten Daten-Payload noch leer/Default sein,
-        # wodurch Aggregation und Feld zurueckgesetzt wurden statt auf die
-        # im Workspace/Profil gespeicherten Werte (User-Bugreport 09.08.2026).
-        agg = (str(data.get("agg") or "")
-               or str(self._view_model.params.get("heatmap_agg") or "")
+        # 10.08.2026 (Bugfix Runde 7, Bug 3): Die restaurierten
+        # VM-Params (Workspace/Profil) GEWINNEN gegen einen Stale-Payload
+        # (Query lief VOR dem Restore mit Default-Params). Der Daten-Payload
+        # bestaetigt nur noch die tatsaechlich verwendeten Werte.
+        agg = (str(self._view_model.params.get("heatmap_agg") or "")
+               or str(data.get("agg") or "")
                or str(self._combo_agg.currentData() or ""))
         # 20.03.02: userData = '{service_id}|{key}' – fuer den Vergleich mit
         # den Payload-Keys nur den Key-Teil verwenden.
-        prev_field = (str(data.get("field") or "")
-                      or str(self._view_model.params.get("heatmap_field") or "")
+        prev_field = (str(self._view_model.params.get("heatmap_field") or "")
+                      or str(data.get("field") or "")
                       or self._field_key(self._combo_field.currentData()))
         self._syncing = True
         try:
@@ -1255,31 +1297,48 @@ class HeatmapWidget(QWidget):
             # Quellen (100 % Eindeutigkeit).
             shared = sorted(k for k in keys
                             if len(self._field_sources.get(k) or []) >= 2)
+            # 10.08.2026 (Bugfix Runde 7, Bug 4/5): Die initialen CheckStates
+            # folgen dem aktiven feature_ids-Filter (ServicePicker) - nur
+            # Services aus dem Filter erscheinen angehakt. Das 'Feld'-
+            # Dropdown ist damit ein read-only Spiegel der Datenquellen-
+            # Auswahl (Single Source of Truth = Picker; das Write-Back der
+            # Feld-Haken wurde entfernt, siehe __init__).
+            active_ids = {str(f).strip().lower() for f in
+                          (self._view_model.params.get("feature_ids") or [])}
+            no_filter = not active_ids
             if shared:
                 self._combo_field.add_header_item(
                     "🌐 Gleiche Parameter (alle aktiven Services):")
                 for k in shared:
+                    src = self._field_sources.get(k) or []
                     self._combo_field.add_checkable_item(
-                        f"Alle Services / {k}", f"ALL|{k}", checked=True)
+                        f"Alle Services / {k}", f"ALL|{k}",
+                        checked=no_filter or all(
+                            s.lower() in active_ids for s in src))
             if keys:
                 self._combo_field.add_header_item("🔌 Einzelservices:")
             for k in sorted(keys):
                 sids = self._field_sources.get(k) or []
                 if len(sids) == 1:
-                    # Eindeutiger Service: Einzel-Eintrag initial angehakt.
+                    # Eindeutiger Service: Einzel-Eintrag nur angehakt, wenn
+                    # der Service im aktiven Filter liegt (oder kein Filter).
                     self._combo_field.add_checkable_item(
                         self._field_label(k, sids), f"{sids[0]}|{k}",
-                        checked=True)
+                        checked=no_filter or sids[0].lower() in active_ids)
                 elif not sids:
                     # Legacy ohne field_sources (roher Key, defensiv).
                     self._combo_field.add_checkable_item(k, k, checked=True)
                 else:
                     # Shared Key: je Quelle ein Einzel-Eintrag, initial NICHT
                     # angehakt (der Sammel-Eintrag deckt die Quellen ab, Q5).
+                    all_active = all(s.lower() in active_ids
+                                       for s in sids)
                     for sid in sids:
                         self._combo_field.add_checkable_item(
                             self._field_label(k, [sid]), f"{sid}|{k}",
-                            checked=False)
+                            checked=no_filter
+                            or (sid.lower() in active_ids
+                                and not all_active))
             if prev_field in keys:
                 self._combo_field.setCurrentIndex(
                     self._find_field_index(prev_field))
@@ -1319,24 +1378,44 @@ class HeatmapWidget(QWidget):
         # und Konfiguration nachreichen (einmaliger Query-Loop). 20.03.03:
         # Vergleich ueber den KEY-Teil (params haelt den reinen Key, das
         # userData traegt '{service_id}|{key}' bzw. 'ALL|{key}').
+        vm_field = str(self._view_model.params.get("heatmap_field") or "")
         if (agg in _VALUE_AGGS and self._combo_field.currentData()
-                and self._view_model.params.get("heatmap_field")
-                != self._field_key(self._combo_field.currentData())):
-            self._apply_config()
+                and vm_field != self._field_key(
+                    self._combo_field.currentData())):
+            # 10.08.2026 (Bugfix Runde 7, Bug 3): Ein restaurierter
+            # heatmap_field (Workspace/Profil) darf NICHT durch einen
+            # Payload-Fallback ueberschrieben werden. Nur wenn das VM-Feld
+            # leer oder im aktuellen Datensatz nicht verfuegbar ist, wird
+            # der erste verfuegbare Key uebernommen.
+            if vm_field and vm_field in keys:
+                fidx = self._find_field_index(vm_field)
+                if fidx >= 0:
+                    self._combo_field.setCurrentIndex(fidx)
+            else:
+                self._apply_config()
 
     def _render_overlay(self, data: Dict[str, Any]) -> None:
         """Zeichnet Tages-Ohlc ueber die Heatmap (selbes Canvas, Bugfix 1).
 
-        Die Candles liegen in der Preis-ViewBox (rechte Y-Achse = Preis),
-        X = Wanduhr-Mitternachts-Epoch je Tag – exakt die Spalten der
-        date-Heatmap. Alpha 0.3-0.5 (E9).
+        Die Candles liegen in der Preis-ViewBox. 10.08.2026 (Bugfix Runde 7,
+        Bug 1): 'Datum' darf auf der X- ODER Y-Achse liegen - X=date zeichnet
+        vertikale Candles (Preis auf der rechten Achse), Y=date horizontale
+        Candles (Preis auf der unteren Preis-Achse). Die Spalten der
+        date-Achse sind Wanduhr-Mitternachts-Epochs. Alpha 0.3-0.5 (E9).
         """
         self._clear_overlay()
         bars = data.get("bars") or []
-        if not bars or not self._x_axis:
+        x_dim = str(self._combo_x.currentData() or "date")
+        y_dim = str(self._combo_y.currentData() or "hour")
+        # 10.08.2026 (Bugfix Runde 7, Bug 1): 'Datum' darf auf X oder Y
+        # liegen - die Candles werden in der Orientierung der Date-Achse
+        # gezeichnet (vertikal bei X=date, horizontal bei Y=date).
+        date_on_x = x_dim == "date"
+        date_axis = self._x_axis if date_on_x else self._y_axis
+        if not bars or not date_axis:
             return
         # Spalten-Index je Wanduhr-Tag (Mitternachts-Epoch).
-        epoch_to_col = {int(round(e)): i for i, e in enumerate(self._x_axis)}
+        epoch_to_col = {int(round(e)): i for i, e in enumerate(date_axis)}
         candles: List[tuple] = []
         for b in bars:
             t = b.get("time")
@@ -1362,33 +1441,52 @@ class HeatmapWidget(QWidget):
             candles.append((t, o, h, l, c))
         if not candles:
             return
-        ymin = min(c[3] for c in candles)
-        ymax = max(c[2] for c in candles)
-        if ymin == ymax:
-            ymin -= 1.0
-            ymax += 1.0
-        pad = (ymax - ymin) * 0.05
-        self._price_vb.setYRange(ymin - pad, ymax + pad, padding=0)
-        # Candles: x = Mitternachts-Epoch, Breite in Tages-Sekunden.
+        pmin = min(c[3] for c in candles)
+        pmax = max(c[2] for c in candles)
+        if pmin == pmax:
+            pmin -= 1.0
+            pmax += 1.0
+        pad = (pmax - pmin) * 0.05
+        if date_on_x:
+            self._price_vb.setYRange(pmin - pad, pmax + pad, padding=0)
+        else:
+            self._price_vb.setXRange(pmin - pad, pmax + pad, padding=0)
+        # Candles: x = Mitternachts-Epoch (X=date) bzw. y = Mitternachts-
+        # Epoch (Y=date), Breite/Hoehe in Tages-Sekunden.
         for t, o, h, l, c in candles:
             up = c >= o
             color = pg.mkColor(0, 180, 0, 140) if up \
                 else pg.mkColor(220, 30, 30, 140)
-            # Bugfix 08.08.2026: pg.BarGraphItem kennt KEIN top/bottom –
-            # die pyqtgraph-API verlangt y0 + height.
-            wick = pg.BarGraphItem(
-                x=[float(t)], width=_DAY_SECONDS * 0.12,
-                y0=l, height=max(h - l, 1e-9), brush=color, pen=color)
-            body = pg.BarGraphItem(
-                x=[float(t)], width=_DAY_SECONDS * 0.7,
-                y0=min(o, c),
-                height=max(max(o, c) - min(o, c), 1e-9),
-                brush=color, pen=color)
+            if date_on_x:
+                # Vertikale Candles (Preis auf der rechten Achse).
+                wick = pg.BarGraphItem(
+                    x=[float(t)], width=_DAY_SECONDS * 0.12,
+                    y0=l, height=max(h - l, 1e-9), brush=color, pen=color)
+                body = pg.BarGraphItem(
+                    x=[float(t)], width=_DAY_SECONDS * 0.7,
+                    y0=min(o, c),
+                    height=max(max(o, c) - min(o, c), 1e-9),
+                    brush=color, pen=color)
+            else:
+                # Horizontale Candles (Preis auf der unteren Achse).
+                wick = pg.BarGraphItem(
+                    x0=l, width=max(h - l, 1e-9),
+                    y0=float(t) - _DAY_SECONDS * 0.06,
+                    height=_DAY_SECONDS * 0.12, brush=color, pen=color)
+                body = pg.BarGraphItem(
+                    x0=min(o, c), width=max(max(o, c) - min(o, c), 1e-9),
+                    y0=float(t) - _DAY_SECONDS * 0.35,
+                    height=_DAY_SECONDS * 0.7, brush=color, pen=color)
             self._price_vb.addItem(wick)
             self._price_vb.addItem(body)
             self._candle_items.extend((wick, body))
         self._price_vb.setVisible(True)
-        self._plot_hm.getAxis("right").setVisible(True)
+        if date_on_x:
+            self._plot_hm.getAxis("right").setVisible(True)
+            self._price_axis_bottom.setVisible(False)
+        else:
+            self._price_axis_bottom.setVisible(True)
+            self._plot_hm.getAxis("right").setVisible(False)
         self._update_price_view()
 
     def _clear_overlay(self) -> None:
@@ -1401,3 +1499,4 @@ class HeatmapWidget(QWidget):
         self._candle_items = []
         self._price_vb.setVisible(False)
         self._plot_hm.getAxis("right").setVisible(False)
+        self._price_axis_bottom.setVisible(False)
