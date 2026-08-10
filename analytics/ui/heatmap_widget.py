@@ -660,10 +660,9 @@ class HeatmapWidget(QWidget):
         if self._view_model is None:
             return
         self._view_model.request_heatmap_generic()
-        # Runde 11 (Bug 4, B4-1): Die No-Data-Varianten kommen als
-        # QUERY_FEATURES-Payload vom Worker (Auswertung im Worker-Thread) -
-        # bei jeder Datenanforderung mit anstossen (Debounce buegelt ab).
-        self._view_model.request_features()
+        # Runde 12 (Option A): Die No-Data-Varianten kommen IM SELBEN
+        # QUERY_HEATMAP_GENERIC-Payload (kein separater QUERY_FEATURES-
+        # Roundtrip mehr) - das Dropdown aktualisiert sich mit der Grafik.
         if self._chk_candle.isChecked():
             self._view_model.request_daily_ohlc()
 
@@ -1081,39 +1080,56 @@ class HeatmapWidget(QWidget):
     # ------------------------------------------------------------------
     def _on_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
         if kind == QUERY_HEATMAP_GENERIC:
+            # Runde 12 (Option A): No-Data-Varianten aus dem HEATMAP-Payload
+            # uebernehmen (Generation-Guard) VOR dem Render - die
+            # '(No Data)'-Items erscheinen im selben Durchlauf wie die Grafik.
+            self._cache_no_data_from_payload(data)
             self._render_generic(data)
         elif kind == QUERY_DAILY_OHLC:
             self._render_overlay(data)
         elif kind == QUERY_FEATURES:
-            # Runde 11 (Bug 4, B4-3): No-Data-Varianten aus dem
-            # QUERY_FEATURES-Payload uebernehmen (Generation-Guard gegen
-            # Stale-Payloads) und das 'Feld'-Dropdown neu rendern.
+            # Runde 11 (Bug 4, B4-3): Kompatibilitaets-Pfad (z. B. der
+            # refresh_all() der Initial-Ladung stoesst QUERY_FEATURES an).
             self._on_features_ready(data)
 
-    def _on_features_ready(self, data: Dict[str, Any]) -> None:
-        """Uebernimmt die No-Data-Varianten aus dem QUERY_FEATURES-Payload.
+    def _cache_no_data_from_payload(self, data: Dict[str, Any]) -> bool:
+        """Uebernimmt no_data_variants aus einem Payload (Generation-Guard).
 
-        Runde 11 (Bug 4, B4-2/B4-3): Der Payload-Vertrag garantiert
-        `no_data_variants` (Liste) - IMMER vorhanden; `no_data_variants_
-        error` markiert einen fehlgeschlagenen Check. Payloads aelterer
-        Restore-Generation werden verworfen (Stale-Guard, Muster
-        _sync_combos_from_payload). Danach wird das 'Feld'-Dropdown aus dem
-        Cache neu abgeleitet (die '(No Data)'-Items erscheinen/verschwinden).
+        Runde 12 (Option A): Gemeinsamer Cache-Pfad fuer den
+        QUERY_HEATMAP_GENERIC-Payload (No-Data im selben Datenfluss) und
+        den QUERY_FEATURES-Kompatibilitaets-Payload. Returns False, wenn
+        kein No-Data-Anteil im Payload ist (dann bleibt der Cache
+        unveraendert) oder der Payload stale ist (aeltere Generation).
         """
         if self._view_model is None:
-            return
+            return False
         vm = self._view_model
         payload_gen = data.get("restore_generation")
         if (payload_gen is not None
                 and str(payload_gen) != str(
                     getattr(vm, "restore_generation", 0))):
-            return  # Stale-Payload (Query lief VOR dem letzten Restore)
+            return False  # Stale-Payload (Query lief VOR dem letzten Restore)
+        if "no_data_variants" not in data:
+            return False  # Payload ohne No-Data-Anteil (z. B. Alt-Payload)
         variants = data.get("no_data_variants")
         self._no_data_variants = (
             [dict(v) for v in variants] if isinstance(variants, list)
             else [])
         self._no_data_variants_error = bool(
             data.get("no_data_variants_error"))
+        return True
+
+    def _on_features_ready(self, data: Dict[str, Any]) -> None:
+        """Uebernimmt die No-Data-Varianten aus einem QUERY_FEATURES-Payload.
+
+        Runde 11 (Bug 4, B4-2/B4-3): Payload-Vertrag `no_data_variants`
+        IMMER vorhanden; `no_data_variants_error` markiert einen
+        fehlgeschlagenen Check. Stale-Payloads werden verworfen
+        (Generation-Guard). Danach wird das 'Feld'-Dropdown aus dem Cache
+        neu abgeleitet (die '(No Data)'-Items erscheinen/verschwinden).
+        """
+        if not self._cache_no_data_from_payload(data):
+            return
         self._rebuild_field_dropdown(self._field_keys, self._field_sources)
 
     def _on_query_failed(self, kind: str, _error: str) -> None:
@@ -1464,12 +1480,21 @@ class HeatmapWidget(QWidget):
         if self._no_data_variants is None:
             return  # Loading: Payload steht noch aus (kein Hinweis noetig)
         p = self._view_model.params
+        # Runde 12 (Punkt 4): Nur Services im aktiven feature_ids-Filter
+        # (leer = kein Filter = alle) - nicht angehakte Services werden
+        # nicht als '(No Data)' angezeigt.
+        active_ids = {str(f).strip().lower()
+                      for f in (p.get("feature_ids") or [])}
         active_hashes = {str(h).strip().lower()
                          for h in (p.get("instance_hashes") or [])}
         variants = [dict(v) for v in self._no_data_variants]
         filtered = variants
+        if active_ids:
+            filtered = [v for v in filtered
+                        if str(v.get("plugin_id") or "").strip().lower()
+                        in active_ids]
         if active_hashes:
-            filtered = [v for v in variants
+            filtered = [v for v in filtered
                         if str(v.get("instance_hash") or "").strip().lower()
                         in active_hashes]
         if not filtered and self._selected_no_data_variant(variants) is None:
@@ -1501,18 +1526,50 @@ class HeatmapWidget(QWidget):
     ) -> Optional[Dict[str, Any]]:
         """No-Data-Variante des aktuell gewaehlten Feld-Items (oder None).
 
-        Das userData eines Feld-Items traegt '{service_id}|{key}' - die
-        service_id wird mit den plugin_ids der No-Data-Varianten verglichen
-        (case-insensitiv, B4-5).
+        Runde 12 (Punkt 3): Das Feld-Item-userData traegt '{service_id}|{key}'
+        (ein Feld-Item repraesentiert einen SERVICE, nicht eine Variante) -
+        die GEWAEHLTE Variante wird ueber den aktiven instance_hashes-Filter
+        des ServicePickers identifiziert: Liefert der Service mehrere
+        No-Data-Varianten, gewinnt die gecheckte Variante (exakter Hash-
+        Match) statt immer der ersten. Runde 12 (Punkt 4): Services, die
+        NICHT im aktiven feature_ids-Filter liegen, werden ignoriert
+        (None - keine Inline-Markierung fuer nicht gecheckte Services).
         """
         if not variants:
             return None
+        if self._view_model is None:
+            return None
+        p = self._view_model.params
         data = self._combo_field.currentData()
         sid = None
         if isinstance(data, str) and "|" in data:
             sid = data.split("|", 1)[0].strip().lower()
         if not sid:
             return None
+        # Punkt 4: Nur Services im aktiven feature_ids-Filter (leer = alle).
+        active_ids = {str(f).strip().lower()
+                      for f in (p.get("feature_ids") or [])}
+        if active_ids and sid not in active_ids:
+            return None
+        # Punkt 3: Gecheckte Variante (instance_hashes) gewinnt.
+        active_hashes = {str(h).strip().lower()
+                         for h in (p.get("instance_hashes") or [])}
+        for v in variants:
+            if (str(v.get("plugin_id") or "").strip().lower() == sid
+                    and str(v.get("instance_hash") or "").strip().lower()
+                    in active_hashes):
+                return v
+        # Bugfix 10.08.2026 (Runde 12b, Dropdown-NoData): Bei AKTIVER
+        # Varianten-Einschraenkung (instance_hashes nicht leer) KEIN
+        # plugin_id-only-Fallback - sonst wuerde bei einem nicht gecheckten
+        # Hash die ERSTE Variante des Services angezeigt (falsche Variante,
+        # z. B. 'V1' obwohl V2 gewaehlt wurde und V1 nicht gecheckt ist).
+        # Konsistent mit _render_no_data_items, das `filtered` ebenfalls
+        # nach instance_hashes filtert. Ohne Hash-Einschraenkung bleibt der
+        # Fallback (erste Variante des Services) sinnvoll.
+        if active_hashes:
+            return None
+        # Fallback: erste Variante des gewaehlten (aktiven) Services.
         for v in variants:
             if str(v.get("plugin_id") or "").strip().lower() == sid:
                 return v

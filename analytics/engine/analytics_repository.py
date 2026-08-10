@@ -130,6 +130,10 @@ class AnalyticsRepository:
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        # Runde 12 (Option A): Preset-Modell-Snapshot fuer die No-Data-
+        # Auswertung im selben Worker (kein separater QUERY_FEATURES-
+        # Roundtrip mehr; Payload-Attribut no_data_variants).
+        presets_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Generische 2D-Matrix (freie Dimensionen + Aggregationen, 20.02).
 
@@ -192,6 +196,24 @@ class AnalyticsRepository:
                 x_dim, y_dim, use_agg, use_field or None, symbol, timeframe)
         result["metrics"] = metrics
         result["field_sources"] = field_sources
+        # Runde 12 (Option A): No-Data-Varianten im SELBEN Payload wie die
+        # Grafik (kein zweiter Worker-Roundtrip). Payload-Vertrag (Runde 11,
+        # B4-2): no_data_variants IMMER vorhanden; no_data_variants_error
+        # markiert einen fehlgeschlagenen Check.
+        no_data_error = False
+        try:
+            variants = self.reader.resolve_no_data_variants(
+                symbol, timeframe, presets_data or {})
+        except Exception as e:
+            print(f"WARN [AnalyticsRepository] get_generic_heatmap "
+                  f"no_data_variants: {e}")
+            variants = []
+            no_data_error = True
+        if isinstance(variants, list):
+            result["no_data_variants"] = [dict(v) for v in variants]
+        else:
+            result["no_data_variants"] = []
+        result["no_data_variants_error"] = no_data_error
         return result
 
     # ------------------------------------------------------------------

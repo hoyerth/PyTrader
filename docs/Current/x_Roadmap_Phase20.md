@@ -1493,3 +1493,93 @@ Ein zentraler, dynamischer Filter-Builder erzeugt strukturierte Regelketten (Rul
 * [ ] Empty-Rule Fallback: Leere Filter-Regeln liefern vollständigen Datensatz.
 * [ ] Profil v2.1: Speicherung & Wiederherstellung der `filters`-Sektion im Payload.
 
+
+---
+
+# 20.07 Architektur-Konzept: Analytics-System (Abarbeitungs- & Event-Pipeline)
+
+> **Status:** Konzeptualisiert & Freigegeben (Vermeidung von Event-Konflikten, Performance-Optimierung & Lückenloser Varianten-Persistenz)
+> **Ziel:** Vollständige Entkopplung von UI-Controls, State-Management und Canvas-Rendering zur Beseitigung von Timing-Races, Mehrfach-Rebuilds und UI-Flackern.
+
+---
+
+## 1. Kern-Architektur: Die 3-Kapsel-Pipeline
+
+Das Analytics-System trennt Datenfluss und Steuerung strikt in drei voneinander isolierte Event-Welten. Direkte Querbeziehungen (z. B. UI-Control löst direkt Canvas-Render aus) sind aufgehoben.
+
+```
+ ┌───────────────────────────────────────────────────────────┐
+ │ 1. USER-INPUT-WELT (UI Controls & ServicePicker)          │
+ │    - Nimmt Benutzer-Aktionen entgegen (Combos, Haken)     │
+ │    - Ruft ausschließlich Setter im ViewModel auf          │
+ └─────────────────────────────┬─────────────────────────────┘
+                               │ (set_params, set_feature_ids)
+                               ▼
+ ┌───────────────────────────────────────────────────────────┐
+ │ 2. SYSTEM-STATE-WELT (AnalyticsViewModel & Repositories)  │
+ │    - Führt State, Normalisierung & Async-Worker           │
+ │    - Feuert KEIN automatisches refresh_all() mehr         │
+ └─────────────────────────────┬─────────────────────────────┘
+                               │ (params_restored, QUERY_FEATURES)
+                               ▼
+ ┌───────────────────────────────────────────────────────────┐
+ │ 3. RENDERING-WELT (Canvas & UI-Pages)                     │
+ │    - Reiner Empfang von fertigen Payloads (Passive View)   │
+ │    - Ausführung nur bei sichtbarem Tab (Lazy Rendering)   │
+ └───────────────────────────────────────────────────────────┘
+
+```
+
+---
+
+## 2. Deterministischer Zustandsautomat: „Erst Controls, dann Canvas“
+
+Jeder Lade-, Restore-, Profilwechsel- oder Umschalt-Vorgang läuft nach einer garantierten, ununterbrechbaren 4-Phasen-Sequenz ab:
+
+$$\text{VM-Params setzen} \xrightarrow{\text{Phase 1}} \text{Single-Pass UI-Control-Sync} \xrightarrow{\text{Phase 2}} \text{Gezielte Query (Sichtbare Seite)} \xrightarrow{\text{Phase 3}} \text{Canvas-Render (Lazy)}$$
+
+### Ablauf-Regeln:
+
+1. **Phase 1 (VM State):** ViewModel aktualisiert seine `_params` im Speicher. Es emittiert ausschließlich `params_restored` (kein automatisches `refresh_all()` mehr im ViewModel!).
+2. **Phase 2 (Control-Sync):** Die Window-Ebene führt `_sync_all_pages_from_params()` genau **1×** aus.
+* *Invariante:* Während des gesamten Setzens der Controls (Combos, Slider, Picker-Haken) werden Qt-Signale konsequent über `blockSignals(True)` stummgeschaltet, um Rückkopplungen ins ViewModel zu verhindern.
+
+
+3. **Phase 3 (Gezielte Datenabfrage):** Erst wenn alle Controls 100 % konsistent sind, fordert das Window Daten via `request_data()` an – **ausschließlich für die aktuell sichtbare Seite**.
+4. **Phase 4 (Canvas-Rendering):** `_sync_combos_from_payload` wird darauf reduziert, ausschließlich dynamische Feld-Metadaten und den Canvas-Render zu verarbeiten. Controls werden durch den Payload *niemals* überschrieben.
+
+---
+
+## 3. Lösungsbausteine für Bugs 3 & 4
+
+### Bug 3: Varianten-Persistenz (Clones & `instance_hashes`)
+
+* **Ursache:** `_current_payload()` hat `instance_hashes` im Profil-Payload ausgelassen. `_apply_profile()` und `restore_workspace()` haben bei fehlendem Key alte In-Memory-Hashes beibehalten.
+* **Lösung:**
+1. `_current_payload()` sichert `instance_hashes` explizit in der `sources`-Sektion ab.
+2. `_apply_profile()` und `restore_workspace()` setzen `instance_hashes` garantiert auf `[]` zurück, wenn der Key im Payload fehlt (Alt-Profile/Workspaces).
+3. `_save_workspace` speichert eine flache Kopie (`dict(self._vm.params)`) mit duplizierten Listen (`list(...)`), um Aliasing zu verhindern.
+
+
+
+### Bug 4: Asynchrone "(No Data)"-Anzeige im Dropdown
+
+* **Ursache:** `resolve_no_data_variants()` wurde synchron im UI-Hauptthread bei jedem Dropdown-Rebuild aufgerufen. Bei DB-Locks (z. B. durch Hintergrund-Scans) wurden Fehler verschluckt und der Hinweis-Block verschwand lautlos.
+* **Lösung:**
+1. **Anti-Pattern auflösen:** Die No-Data-Ermittlung wandert vollständig in den asynchronen `QUERY_FEATURES`-Worker (eigener Thread, eigene DB-Verbindung via `DbPool`).
+2. **Payload-Rückgabe:** Das Repository liefert `no_data_variants` als Bestandteil des Feature-Payloads an das UI-Widget.
+3. **Fallback & UX:** Bei Lade-Latenzen wird kurz ein "Lade..."-Status im Dropdown gezeigt. Tritt ein Fehler auf, wird auf Basis von `plugin_presets()` ein transparenter Fallback-Hinweis gerendert.
+4. **Gezielte Anzeige:** Es werden nur die selektierten No-Data-Varianten (Schnittmenge mit aktiven `instance_hashes`) angezeigt oder direkt als deaktiviertes Item `(No Data)` im Dropdown geführt.
+
+
+
+---
+
+## 4. Implementierungs- & Abarbeitungsplan
+
+| Schritt | Modul / Bereich | Beschreibung | Begründung |
+| --- | --- | --- | --- |
+| **1. Persistenz-Fix (Bug 3)** | `analytics_view_model.py`, `analytics_win.py` | Ergänzung von `instance_hashes` in `_current_payload()`, expliziter Hash-Reset in `_apply_profile()` + `restore_workspace()`, Beseitigung von Dict-Aliasing. | Erzeugt die verlässliche Daten- und State-Basis für alle weiteren Schritte. |
+| **2. Asynchrone No-Data-Pipeline (Bug 4)** | `feature_store_reader.py`, `analytics_worker.py`, `heatmap_widget.py` | Verlagerung von `resolve_no_data_variants` in den `QUERY_FEATURES`-Worker. Entfernen der synchronen Hauptthread-DB-Queries aus `_rebuild_field_dropdown`. | Beseitigt die Ursache für UI-Hänger und verschwindende Dropdown-Items. |
+| **3. Pipeline-Harmonisierung (Pkt. 1 & 2)** | `analytics_win.py`, `analytics_view_model.py`, Pages | Entfernen von `refresh_all()` aus VM-Restores. Einführung von `_sync_all_pages_from_params()` mit `blockSignals(True)`. Umstellung von `_on_page_changed` auf Erst-Sync-dann-Laden & Lazy-Canvas-Render. | Beseitigt Doppel-Passes, Flackern und Event-Schleifen. |
+| **4. Verifikation (Headless)** | `test/check_round11.py` | Statische Syntax-Prüfung (`py_compile`), reine Backend-/Logik-Tests (Profil-/Workspace-Roundtrip mit Hashes, Async-Payload, Event-Order). **Keine GUI-Tests.** | Absicherung der Regelkonformität und Regressionsfreiheit. |

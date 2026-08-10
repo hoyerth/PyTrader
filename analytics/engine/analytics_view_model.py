@@ -640,6 +640,12 @@ class AnalyticsViewModel(QObject):
             base["y_dim"] = p["heatmap_y_dim"]
             base["field"] = p.get("heatmap_field") or None
             base["agg"] = p["heatmap_agg"]
+            # Runde 12 (Option A): Preset-Modell-Snapshot fuer die
+            # No-Data-Auswertung IM SELBEN Datenfluss wie die Grafik
+            # (kein zweiter serieller QUERY_FEATURES-Worker-Roundtrip -
+            # das Dropdown aktualisiert sich mit/knapp nach der Grafik
+            # statt erst danach). Der Snapshot ist in-memory (kein DB).
+            base["presets_data"] = self._no_data_presets_snapshot()
         elif kind == QUERY_OHLCV:
             # 20.02 (E9): OHLCV-Snapshot – limit=None => Reader-Default
             # (OHLCV_SNAPSHOT_LIMIT); kein feature_ids-Filter noetig.
@@ -1325,9 +1331,16 @@ class AnalyticsViewModel(QObject):
         presets: Dict[str, Any] = {}
         sets: List[Any] = []
         display_names: Dict[str, str] = {}
+        # Runde 12 (Punkt 4): Nur GE CHECKTE Services in den Snapshot
+        # aufnehmen (feature_ids-Filter; leer = kein Filter = alle). Nicht
+        # angehakte Services duerfen keine '(No Data)'-Hinweise liefern.
+        active_ids = {str(f).strip().lower()
+                      for f in (self._params.get("feature_ids") or [])}
         try:
             for pid, clones in (model.plugin_presets() or {}).items():
                 pid_s = str(pid)
+                if active_ids and pid_s.strip().lower() not in active_ids:
+                    continue
                 clone_list: List[Dict[str, Any]] = []
                 for c in clones or []:
                     if not isinstance(c, dict):
@@ -1348,7 +1361,14 @@ class AnalyticsViewModel(QObject):
                 services = s.get("services")
                 if not isinstance(services, dict):
                     continue
-                sets.append({"services": services})
+                if active_ids:
+                    services = {
+                        k: svc for k, svc in services.items()
+                        if isinstance(svc, dict)
+                        and str(svc.get("plugin_id") or "").strip().lower()
+                        in active_ids}
+                if services:
+                    sets.append({"services": services})
         except Exception:
             pass
         return {

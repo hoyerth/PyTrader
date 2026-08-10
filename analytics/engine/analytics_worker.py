@@ -197,6 +197,10 @@ class AnalyticsAsyncWorker(QThread):
                 feature_ids=feature_ids,
                 instance_hashes=instance_hashes,
                 limit=cap_lookback_limit(p.get("limit")),
+                # Runde 12 (Option A): Preset-Snapshot fuer die No-Data-
+                # Auswertung im selben Worker (kein separater
+                # QUERY_FEATURES-Roundtrip mehr).
+                presets_data=p.get("presets_data") or None,
             )
         if self._query_kind == QUERY_OHLCV:
             # 20.02 (E9): OHLCV-Snapshot fuer das Candle-Overlay – limit=None

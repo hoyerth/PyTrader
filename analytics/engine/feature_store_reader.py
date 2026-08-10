@@ -1320,8 +1320,30 @@ class FeatureStoreReader:
             available = self.available_instance_hashes(symbol, timeframe)
         except Exception:
             available = set()
+        # Runde 12 (Option A, Performance): Die teure feature_keys_by_service-
+        # Abfrage (laedt feature_data-JSONs) wird auf die AKTIVEN plugin_ids
+        # des Snapshots eingeschraenkt (Preset-Keys + Set-Instanz-Services) -
+        # bei leerem Snapshot (keine aktiven Presets) genuegt eine leere
+        # pids_with_data-Menge. Vorher scannte die Abfrage ALLE Zeilen des
+        # Symbols (Hauptgrund fuer das langsame Dropdown-Update).
+        active_pids: List[str] = []
+        for _pid in (presets or {}).keys():
+            active_pids.append(str(_pid))
+        for _s in sets or []:
+            _services = _s.get("services") if isinstance(_s, dict) else None
+            if not isinstance(_services, dict):
+                continue
+            for _svc in _services.values():
+                if isinstance(_svc, dict) and str(
+                        _svc.get("plugin_id") or "").strip():
+                    active_pids.append(str(_svc["plugin_id"]))
+        active_pids = list(dict.fromkeys(active_pids))
         try:
-            keys_by_service = self.feature_keys_by_service(symbol, timeframe)
+            if active_pids:
+                keys_by_service = self.feature_keys_by_service(
+                    symbol, timeframe, feature_ids=active_pids)
+            else:
+                keys_by_service = {}
             pids_with_data = {str(k).strip().lower()
                               for k in (keys_by_service or {})}
         except Exception:
