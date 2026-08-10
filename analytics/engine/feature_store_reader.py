@@ -1346,8 +1346,11 @@ class FeatureStoreReader:
         Runde 13c (Alt-Bestand): Eine Variante ohne Hash-Treffer zaehlt
         trotzdem als 'hat Daten', wenn die plugin_id ausschliesslich
         undifferenzierte Alt-Rows OHNE instance_hash besitzt
-        (`plugin_ids_with_hashes`) – ihr Bestand gehoert der plugin_id
-        als Ganzes und deckt jede Variante ab.
+        (`plugin_ids_with_hashes`) � dieser Alt-Bestand gehoert der
+        ORIGINAL-Variante (der ERSTEN aktiven Variante der plugin_id im
+        Snapshot). Runde 14: Weitere Varianten derselben plugin_id werden
+        NICHT vom Alt-Bestand abgedeckt - eine neu erzeugte zweite Variante
+        ohne Daten muss als '(No Data)' erscheinen.
 
         Eine Variante gilt als 'ohne Daten', wenn ihr instance_hash KEINE
         Zeilen besitzt (oder - bei Varianten ohne Hash - ihr plugin_id keine
@@ -1453,13 +1456,61 @@ class FeatureStoreReader:
                 if h_s.lower() in available_low:
                     return True
                 # Undifferenzierter Alt-Bestand (keine Hash-Zeilen der
-                # plugin_id bekannt): die plugin-weiten Daten decken jede
-                # Variante ab. Nur bei erfolgreicher Bestands-Abfrage.
+                # plugin_id bekannt): die plugin-weiten Daten decken die
+                # ORIGINAL-Variante ab (die ERSTE aktive Variante im
+                # Snapshot - ihr gehoert der Alt-Bestand, der vor der
+                # Hash-Aera von genau dieser Instanz geschrieben wurde).
+                # Nur bei erfolgreicher Bestands-Abfrage. Runde 14: Der
+                # Fallback gilt NICHT fuer weitere Varianten derselben
+                # plugin_id - eine neu erzeugte zweite Variante (anderer
+                # Hash, noch nie berechnet) hat KEINE Daten und muss als
+                # '(No Data)' erscheinen.
                 if (pids_with_hashes is not None
-                        and str(pid).strip().lower() not in pids_with_hashes):
+                        and str(pid).strip().lower() not in pids_with_hashes
+                        and h_s == first_hash_by_pid.get(
+                            str(pid).strip().lower(), "")):
                     return str(pid).strip().lower() in pids_with_data
                 return False
             return str(pid).strip().lower() in pids_with_data
+
+        # Runde 14 (Bugfix Dropdown-NoData, 2. Variante ohne Daten):
+        # Bestimme die ERSTE aktive Variante je plugin_id im Snapshot
+        # (Reihenfolge wie im ServicePicker: Presets/Clones zuerst, dann
+        # Set-Instanzen). Nur dieser Original-Variante darf der
+        # Alt-Bestand-Fallback (undifferenzierte NULL-Hash-Rows) zugeordnet
+        # werden - der Bestand wurde vor der Hash-Aera von genau der
+        # ersten/originalen Instanz geschrieben.
+        first_hash_by_pid: Dict[str, str] = {}
+
+        def _collect_first(pid: str, h: str) -> None:
+            k = str(pid or "").strip().lower()
+            if not k:
+                return
+            if k not in first_hash_by_pid:
+                first_hash_by_pid[k] = str(h or "").strip()
+
+        for _pid, _clones in presets.items():
+            if not isinstance(_clones, list):
+                continue
+            for _clone in _clones:
+                if not isinstance(_clone, dict) or _clone.get("is_archived"):
+                    continue
+                _collect_first(str(_pid),
+                               str(_clone.get("instance_hash") or ""))
+        for _s in sets or []:
+            _services = _s.get("services") if isinstance(_s, dict) else None
+            if not isinstance(_services, dict):
+                continue
+            for _svc in _services.values():
+                if not isinstance(_svc, dict) or _svc.get("is_archived"):
+                    continue
+                _pid = str(_svc.get("plugin_id") or "").strip()
+                if not _pid:
+                    continue
+                _h = ""
+                if generate_instance_hash is not None:
+                    _h = generate_instance_hash(_pid, _svc.get("params") or {})
+                _collect_first(_pid, _h)
 
         out: List[Dict[str, Any]] = []
         seen: Set[Tuple[str, str]] = set()
