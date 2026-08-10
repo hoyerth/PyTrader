@@ -127,8 +127,13 @@ PyTrader/
         trash_dialog.py
     test/
         _append_20_03_bugfix.py
+        _apply_mastertree_fix.py
+        _apply_r13b.py
+        _apply_r13b_dialog.py
+        _check_r13b_state.py
         _fix_ws1.py
         _tmp_find_src.py
+        _verify_mastertree.py
         check_2004_bugfix3.py
         check_2004_ctxmenu.py
         check_2004_dlg.py
@@ -160,6 +165,9 @@ PyTrader/
         check_restore_pipeline_round2.py
         check_restore_pipeline_round3.py
         check_round10.py
+        check_round11.py
+        check_round12.py
+        check_round13b.py
         check_round7_fixes.py
         check_round7_picker_runtime.py
         check_round8_bug345.py
@@ -4418,6 +4426,10 @@ class AnalyticsRepository:
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        # Runde 12 (Option A): Preset-Modell-Snapshot fuer die No-Data-
+        # Auswertung im selben Worker (kein separater QUERY_FEATURES-
+        # Roundtrip mehr; Payload-Attribut no_data_variants).
+        presets_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Generische 2D-Matrix (freie Dimensionen + Aggregationen, 20.02).
 
@@ -4480,6 +4492,24 @@ class AnalyticsRepository:
                 x_dim, y_dim, use_agg, use_field or None, symbol, timeframe)
         result["metrics"] = metrics
         result["field_sources"] = field_sources
+        # Runde 12 (Option A): No-Data-Varianten im SELBEN Payload wie die
+        # Grafik (kein zweiter Worker-Roundtrip). Payload-Vertrag (Runde 11,
+        # B4-2): no_data_variants IMMER vorhanden; no_data_variants_error
+        # markiert einen fehlgeschlagenen Check.
+        no_data_error = False
+        try:
+            variants = self.reader.resolve_no_data_variants(
+                symbol, timeframe, presets_data or {})
+        except Exception as e:
+            print(f"WARN [AnalyticsRepository] get_generic_heatmap "
+                  f"no_data_variants: {e}")
+            variants = []
+            no_data_error = True
+        if isinstance(variants, list):
+            result["no_data_variants"] = [dict(v) for v in variants]
+        else:
+            result["no_data_variants"] = []
+        result["no_data_variants_error"] = no_data_error
         return result
 
     # ------------------------------------------------------------------
@@ -4708,10 +4738,37 @@ class AnalyticsRepository:
         return self.reader.get_available_timeframes(symbol)
 
     def get_available_features(
-        self, symbol: str, timeframe: str
+        self,
+        symbol: str,
+        timeframe: str,
+        presets_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Verfuegbare Plugin-IDs, JSON-Keys und Zeilenzahl."""
-        return self.reader.get_available_features(symbol, timeframe)
+        """Verfuegbare Plugin-IDs, JSON-Keys, Zeilenzahl + No-Data-Varianten.
+
+        Runde 11 (Bug 4, B4-1/B4-2): `no_data_variants` ist IMMER Teil des
+        Payload-Vertrags (leere Liste, wenn keine Varianten ohne Daten
+        existieren oder die Auswertung fehlschlaegt; `no_data_variants_error`
+        markiert einen Fehlschlag). Die Auswertung laeuft hier (Worker-
+        Thread), nicht im UI-Hauptthread.
+        """
+        result = self.reader.get_available_features(symbol, timeframe)
+        if not isinstance(result, dict):
+            result = {}
+        no_data_error = False
+        try:
+            variants = self.reader.resolve_no_data_variants(
+                symbol, timeframe, presets_data or {})
+        except Exception as e:
+            print(f"WARN [AnalyticsRepository] no_data_variants "
+                  f"fehlgeschlagen: {e}")
+            variants = []
+            no_data_error = True
+        if isinstance(variants, list):
+            result["no_data_variants"] = [dict(v) for v in variants]
+        else:
+            result["no_data_variants"] = []
+        result["no_data_variants_error"] = no_data_error
+        return result
 
     def available_heatmap_metrics(
         self, symbol: str, timeframe: str
@@ -5391,6 +5448,12 @@ class AnalyticsViewModel(QObject):
             base["y_dim"] = p["heatmap_y_dim"]
             base["field"] = p.get("heatmap_field") or None
             base["agg"] = p["heatmap_agg"]
+            # Runde 12 (Option A): Preset-Modell-Snapshot fuer die
+            # No-Data-Auswertung IM SELBEN Datenfluss wie die Grafik
+            # (kein zweiter serieller QUERY_FEATURES-Worker-Roundtrip -
+            # das Dropdown aktualisiert sich mit/knapp nach der Grafik
+            # statt erst danach). Der Snapshot ist in-memory (kein DB).
+            base["presets_data"] = self._no_data_presets_snapshot()
         elif kind == QUERY_OHLCV:
             # 20.02 (E9): OHLCV-Snapshot – limit=None => Reader-Default
             # (OHLCV_SNAPSHOT_LIMIT); kein feature_ids-Filter noetig.
@@ -5408,6 +5471,12 @@ class AnalyticsViewModel(QObject):
             base["column"] = p["distribution_column"]
             base["bins"] = p["bins"]
             base["limit"] = p["limit"]
+        elif kind == QUERY_FEATURES:
+            # Runde 11 (Bug 4, B4-1): Preset-Modell-Snapshot fuer die
+            # No-Data-Auswertung im QUERY_FEATURES-Worker (kein synchroner
+            # DB-Zugriff im UI-Hauptthread). Der Worker/Repo berechnet
+            # `no_data_variants` als Payload-Attribut (B4-2).
+            base["presets_data"] = self._no_data_presets_snapshot()
         return base
 
     # ------------------------------------------------------------------
@@ -5552,9 +5621,10 @@ class AnalyticsViewModel(QObject):
         layout = payload.get("layout")
         if isinstance(layout, dict):
             self._workspace_layout.update(dict(layout))
-        for key in list(self._params.keys()):
-            if key in flat and flat[key] is not None:
-                self._params[key] = flat[key]
+        # Runde 11 (Bug 3, B3-2): Gemeinsamer Restore-Helper (Replace-
+        # Semantik inkl. instance_hashes -> garantiert leer bei fehlendem
+        # Payload-Key statt des alten Werts).
+        self._restore_params_from_payload(flat)
         # 15.03-E (Profil-Migration): Alt-Payloads speicherten den Filter als
         # Einzelwert `feature_id` (String) – in `feature_ids` (Liste) wandeln.
         if "feature_ids" not in flat and flat.get("feature_id"):
@@ -5591,12 +5661,12 @@ class AnalyticsViewModel(QObject):
         # Profilwechsel gestartet wurden).
         self._restore_generation += 1
         # Runde 10 (Bug 4): REIHENFOLGE - erst die UI-Combos synchronisieren
-        # (params_restored), DANN refresh_all(). Vorher starteten die
-        # Queries mit leeren/alten Controls (leere Combos ->
-        # _current_params() None -> Queries uebersprungen bzw. doppelte/
-        # stale Requests beim Restore).
+        # (params_restored), DANN die Daten anfordern. Runde 11 (A1): KEIN
+        # refresh_all() mehr im Restore-Pfad - das AnalyticsWindow
+        # orchestriert die Queries zentral (A6: Sync -> Query-Key-Pruefung
+        # -> request_data). Ein expliziter User-Refresh (Button) darf
+        # weiterhin refresh_all() nutzen.
         self.params_restored.emit()
-        self.refresh_all()
 
     def _apply_heatmap_section(self, heat: Any) -> None:
         """Loest die verschachtelte `charts.heatmap`-Sektion auf (20.02).
@@ -5626,6 +5696,27 @@ class AnalyticsViewModel(QObject):
             self._params["zoom_y_range"] = self._clamp_zoom(
                 heat["zoom_y_range"])
 
+    def _restore_params_from_payload(self, flat: Dict[str, Any]) -> None:
+        """Uebernimmt flache Payload-Params per Replace-Semantik (B3-2).
+
+        Runde 11 (Bug 3, B3-2): Gemeinsamer Restore-Pfad fuer
+        `_apply_profile()` und `restore_workspace()`. Bekannte `_params`-Keys
+        werden UEBERSCHRIEBEN, sofern der Payload einen nicht-None-Wert
+        liefert (additiv, wie bisher). Der Varianten-Filter `instance_hashes`
+        folgt echter Replace-Semantik: Fehlt der Key im Payload (Alt-Payloads
+        ohne Varianten-Angabe), ist er garantiert leer ([]) statt des
+        vorherigen Werts - ein gespeicherter Zustand OHNE Varianten-Ein-
+        schraenkung darf nicht stillschweigend den alten Filter uebernehmen.
+        Andere Keys (z. B. heatmap-Konfiguration, table-Settings) werden
+        NICHT generell geleert - nur vorhandene Payload-Werte zaehlen
+        (additiv, kein Datenverlust).
+        """
+        for key in list(self._params.keys()):
+            if key in flat and flat[key] is not None:
+                self._params[key] = flat[key]
+        if "instance_hashes" not in flat or not flat.get("instance_hashes"):
+            self._params["instance_hashes"] = []
+
     def set_ui_layout(self, layout: Optional[Dict[str, Any]] = None) -> None:
         """Uebernimmt das aktuelle UI-Layout fuer die Profil-Persistenz.
 
@@ -5653,6 +5744,10 @@ class AnalyticsViewModel(QObject):
                 "symbol": p.get("symbol"),
                 "timeframe": p.get("timeframe"),
                 "feature_ids": list(p.get("feature_ids") or []),
+                # Runde 11 (Bug 3, B3-1): Varianten-Einschraenkung im
+                # Profil-Payload persistieren (Replace-Semantik beim
+                # Restore: fehlt der Key -> garantiert leer, B3-2).
+                "instance_hashes": list(p.get("instance_hashes") or []),
             },
             "charts": {
                 "heatmap_metric": p.get("heatmap_metric"),
@@ -5711,9 +5806,10 @@ class AnalyticsViewModel(QObject):
         params = workspace.get("params")
         if not isinstance(params, dict):
             return
-        for key in list(self._params.keys()):
-            if key in params and params[key] is not None:
-                self._params[key] = params[key]
+        # Runde 11 (Bug 3, B3-2): Gemeinsamer Restore-Helper (Replace-
+        # Semantik inkl. instance_hashes -> garantiert leer bei fehlendem
+        # Payload-Key statt des alten Werts).
+        self._restore_params_from_payload(params)
         # 20.02.01 (E6): Alt-Workspaces mit `dow_hour` -> "hour" (Tageszeit).
         for _hk in ("heatmap_x_dim", "heatmap_y_dim"):
             if self._params.get(_hk) == "dow_hour":
@@ -5745,12 +5841,11 @@ class AnalyticsViewModel(QObject):
         # Workspace-Restore gestartet wurden).
         self._restore_generation += 1
         # Runde 10 (Bug 4): REIHENFOLGE - erst die UI-Combos synchronisieren
-        # (params_restored), DANN refresh_all(). Vorher starteten die
-        # Queries mit leeren/alten Controls (leere Combos ->
-        # _current_params() None -> Queries uebersprungen bzw. doppelte/
-        # stale Requests beim Restore).
+        # (params_restored), DANN die Daten anfordern. Runde 11 (A1): KEIN
+        # refresh_all() mehr im Restore-Pfad - das AnalyticsWindow
+        # orchestriert die Queries zentral (A6: Sync -> Query-Key-Pruefung
+        # -> request_data).
         self.params_restored.emit()
-        self.refresh_all()
 
     @staticmethod
     def _emit_profile_changed(name: str) -> None:
@@ -6019,6 +6114,100 @@ class AnalyticsViewModel(QObject):
         except Exception:
             pass
         return result
+
+    def _no_data_presets_snapshot(self) -> Dict[str, Any]:
+        """Serialisiert die Preset-Modell-Daten fuer die No-Data-Auswertung.
+
+        Runde 11 (Bug 4, B4-1): Die '(No Data)'-Auswertung laeuft im
+        QUERY_FEATURES-Worker (Repo, Worker-Thread) - dort ist das
+        ServiceSelectorModel nicht verfuegbar. Der ViewModel reicht eine
+        reine Daten-Snapshot (in-memory, KEIN SQL) ueber die Query-Params:
+            {"presets": {pid: [{"preset_name", "instance_hash",
+                                "is_archived"}]},
+             "sets": [{"services": {instance_id: {"plugin_id", "params",
+                                                   "is_archived"}}}],
+             "display_names": {"{pid}|{pname}": "Anzeigename"},
+             "active_hashes": [instance_hash der im Picker gecheckten
+                               Varianten (leer = keine Einschraenkung)]}
+        Der Reader kombiniert den Snapshot mit den DB-Fakten
+        (available_instance_hashes / feature_keys_by_service) im Worker-
+        Thread und liefert `no_data_variants` als Payload-Attribut (B4-2).
+
+        Runde 13 (Bugfix Dropdown-NoData): `active_hashes` macht den Payload
+        VARIANTEN-GENAU - der Reader `resolve_no_data_variants()` liefert
+        damit nur noch die im ServicePicker gecheckten Varianten als
+        '(No Data)' (nicht-gecheckte Instanzen derselben plugin_id erscheinen
+        nicht mehr; das Dropdown zeigt nicht mehr die erste Variante).
+        """
+        model = self._selector_model
+        if model is None:
+            from analytics.engine.service_selector_model import ServiceSelectorModel
+            model = ServiceSelectorModel(parent=self)
+            self._selector_model = model
+        presets: Dict[str, Any] = {}
+        sets: List[Any] = []
+        display_names: Dict[str, str] = {}
+        # Runde 12 (Punkt 4): Nur GE CHECKTE Services in den Snapshot
+        # aufnehmen (feature_ids-Filter; leer = kein Filter = alle). Nicht
+        # angehakte Services duerfen keine '(No Data)'-Hinweise liefern.
+        active_ids = {str(f).strip().lower()
+                      for f in (self._params.get("feature_ids") or [])}
+        # Runde 13 (Bugfix Dropdown-NoData): Varianten-Einschraenkung mit
+        # an den Reader geben - die '(No Data)'-Auswertung wird damit
+        # variantengenau (nur im Picker gecheckte Varianten im Payload).
+        active_hashes = {str(h).strip().lower()
+                         for h in (self._params.get("instance_hashes") or [])}
+        try:
+            for pid, clones in (model.plugin_presets() or {}).items():
+                pid_s = str(pid)
+                if active_ids and pid_s.strip().lower() not in active_ids:
+                    continue
+                clone_list: List[Dict[str, Any]] = []
+                for c in clones or []:
+                    if not isinstance(c, dict):
+                        continue
+                    h_s = str(c.get("instance_hash") or "").strip().lower()
+                    # Runde 13b (Bugfix Dropdown-NoData): Harte Varianten-
+                    # Einschraenkung - sind Hashes gecheckt (active_hashes
+                    # nicht leer), duerfen NUR diese Varianten in den
+                    # Snapshot (bewusst OHNE `h_s and`-Guard: eine hash-lose
+                    # Variante ist bei aktiver Einschraenkung nie Teil der
+                    # Auswahl und darf kein '(No Data)' liefern - sonst
+                    # erscheinen ungecheckte Instanzen weiterhin).
+                    if active_hashes and h_s not in active_hashes:
+                        continue
+                    pname = str(c.get("preset_name") or "Default")
+                    clone_list.append({
+                        "preset_name": pname,
+                        "instance_hash": str(c.get("instance_hash") or ""),
+                        "is_archived": bool(c.get("is_archived")),
+                    })
+                    display_names[f"{pid_s}|{pname}"] = \
+                        self.resolve_service_display_name(pid_s, pname)
+                if clone_list:
+                    presets[pid_s] = clone_list
+            for s in model.get_sets() or []:
+                if not isinstance(s, dict):
+                    continue
+                services = s.get("services")
+                if not isinstance(services, dict):
+                    continue
+                if active_ids:
+                    services = {
+                        k: svc for k, svc in services.items()
+                        if isinstance(svc, dict)
+                        and str(svc.get("plugin_id") or "").strip().lower()
+                        in active_ids}
+                if services:
+                    sets.append({"services": services})
+        except Exception:
+            pass
+        return {
+            "presets": presets,
+            "sets": sets,
+            "display_names": display_names,
+            "active_hashes": sorted(active_hashes),
+        }
 
     def resolve_no_data_variants(self, symbol: str,
                                 timeframe: str) -> List[Dict[str, Any]]:
@@ -6375,6 +6564,10 @@ class AnalyticsAsyncWorker(QThread):
                 feature_ids=feature_ids,
                 instance_hashes=instance_hashes,
                 limit=cap_lookback_limit(p.get("limit")),
+                # Runde 12 (Option A): Preset-Snapshot fuer die No-Data-
+                # Auswertung im selben Worker (kein separater
+                # QUERY_FEATURES-Roundtrip mehr).
+                presets_data=p.get("presets_data") or None,
             )
         if self._query_kind == QUERY_OHLCV:
             # 20.02 (E9): OHLCV-Snapshot fuer das Candle-Overlay – limit=None
@@ -6412,7 +6605,13 @@ class AnalyticsAsyncWorker(QThread):
                 limit=cap_lookback_limit(p.get("limit")),
             )
         if self._query_kind == QUERY_FEATURES:
-            return repo.get_available_features(symbol, timeframe)
+            # Runde 11 (Bug 4, B4-1): Preset-Snapshot aus den Query-Params
+            # fuer die No-Data-Auswertung (Repo berechnet no_data_variants
+            # im Worker-Thread; kein DB-Zugriff im UI-Hauptthread).
+            return repo.get_available_features(
+                symbol, timeframe,
+                presets_data=p.get("presets_data") or None,
+            )
 
         raise ValueError(
             f"[AnalyticsAsyncWorker] Unbekannte Abfrage '{self._query_kind}' – "
@@ -6823,7 +7022,7 @@ import os
 from datetime import datetime as _dt_datetime
 from datetime import timezone as _dt_timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -8073,6 +8272,185 @@ class FeatureStoreReader:
             print(f"WARN [FeatureStoreReader] available_instance_hashes "
                   f"fehlgeschlagen: {e}")
             return set()
+
+    def resolve_no_data_variants(
+        self,
+        symbol: str,
+        timeframe: str,
+        presets_data: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Plugin-Varianten ohne feature_store-Daten (Runde 11, B4-1).
+
+        Runde 11 (Bug 4): Die '(No Data)'-Auswertung wurde aus dem
+        UI-Hauptthread in den QUERY_FEATURES-Worker verlagert. Der
+        ViewModel liefert die Preset-Modell-Daten als Snapshot
+        (`presets_data`: {"presets": {pid: [...]}, "sets": [...],
+        "display_names": {"{pid}|{pname}": str},
+        "active_hashes": [gecheckte Varianten-Hashes]}); diese Methode
+        kombiniert sie mit den DB-Fakten (`available_instance_hashes` /
+        `feature_keys_by_service`) im Worker-Thread.
+
+        Runde 13 (Bugfix Dropdown-NoData): `active_hashes` (nicht leer =
+        Varianten-Einschraenkung) macht die Auswertung VARIANTEN-GENAU -
+        es werden NUR die im ServicePicker gecheckten Varianten geliefert
+        (nicht-gecheckte Instanzen derselben plugin_id erscheinen nicht
+        mehr im '(No Data)'-Abschnitt; das Dropdown zeigt damit nicht mehr
+        die erste Variante eines Services, wenn eine andere gecheckt ist).
+
+        Eine Variante gilt als 'ohne Daten', wenn ihr instance_hash KEINE
+        Zeilen besitzt (oder - bei Varianten ohne Hash - ihr plugin_id keine
+        feature_store-Zeilen liefert). Archivierte Presets sind bewusst
+        unsichtbar (Q6/Q7).
+
+        Returns:
+            Liste von {"plugin_id", "preset_name", "instance_hash",
+            "display_name"} - leer, wenn alle Varianten Daten besitzen
+            (defensiv, rein lesend).
+        """
+        if not symbol or not timeframe:
+            return []
+        presets = (presets_data or {}).get("presets") or {}
+        sets = (presets_data or {}).get("sets") or []
+        display_names = (presets_data or {}).get("display_names") or {}
+        # Runde 13 (Bugfix Dropdown-NoData): Varianten-Einschraenkung aus dem
+        # Snapshot - leer = KEINE Einschraenkung (alle Varianten der aktiven
+        # Services), nicht leer = nur die gecheckten Varianten.
+        active_hashes = {str(h).strip().lower()
+                         for h in ((presets_data or {}).get("active_hashes")
+                                   or [])}
+        try:
+            available = self.available_instance_hashes(symbol, timeframe)
+        except Exception:
+            available = set()
+        # Runde 12 (Option A, Performance): Die teure feature_keys_by_service-
+        # Abfrage (laedt feature_data-JSONs) wird auf die AKTIVEN plugin_ids
+        # des Snapshots eingeschraenkt (Preset-Keys + Set-Instanz-Services) -
+        # bei leerem Snapshot (keine aktiven Presets) genuegt eine leere
+        # pids_with_data-Menge. Vorher scannte die Abfrage ALLE Zeilen des
+        # Symbols (Hauptgrund fuer das langsame Dropdown-Update).
+        active_pids: List[str] = []
+        for _pid in (presets or {}).keys():
+            active_pids.append(str(_pid))
+        for _s in sets or []:
+            _services = _s.get("services") if isinstance(_s, dict) else None
+            if not isinstance(_services, dict):
+                continue
+            for _svc in _services.values():
+                if isinstance(_svc, dict) and str(
+                        _svc.get("plugin_id") or "").strip():
+                    active_pids.append(str(_svc["plugin_id"]))
+        active_pids = list(dict.fromkeys(active_pids))
+        try:
+            if active_pids:
+                keys_by_service = self.feature_keys_by_service(
+                    symbol, timeframe, feature_ids=active_pids)
+            else:
+                keys_by_service = {}
+            pids_with_data = {str(k).strip().lower()
+                              for k in (keys_by_service or {})}
+        except Exception:
+            pids_with_data = set()
+        try:
+            from analytics.engine.service_models import generate_instance_hash
+        except Exception:
+            generate_instance_hash = None
+        # Runde 10 (Bug 2): available case-insensitiv indexieren (einmalig).
+        available_low = {str(x).strip().lower()
+                         for x in (available or set())}
+
+        def _has_data(pid: str, h: str) -> bool:
+            """True, wenn die Variante feature_store-Daten besitzt.
+
+            Runde 10 (Bug 2): Differenzierung statt grobem
+            pids_with_data-Fallback - eine benannte Variante mit eigenem
+            instance_hash zaehlt NUR, wenn GENAU dieser Hash Zeilen
+            besitzt. Der pids_with_data-Fallback gilt nur noch fuer
+            Varianten OHNE Hash (NULL/Alt-Bestand).
+            """
+            if not pid:
+                return True
+            h_s = str(h or "").strip()
+            if h_s:
+                return h_s.lower() in available_low
+            return str(pid).strip().lower() in pids_with_data
+
+        out: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str]] = set()
+
+        def _add(pid: str, pname: str, h: str) -> None:
+            pid_s = str(pid or "").strip()
+            if not pid_s:
+                return
+            h_s = str(h or "").strip()
+            # Runde 13 (Bugfix Dropdown-NoData): Varianten-Einschraenkung -
+            # ist eine Hash-Auswahl aktiv (active_hashes nicht leer), werden
+            # NUR die gecheckten Varianten geliefert. Nicht-gecheckte
+            # Instanzen derselben plugin_id erscheinen nicht mehr als
+            # '(No Data)' (vorher wurde hier die ERSTE Variante des Services
+            # angezeigt bzw. ungecheckte Instanzen mit aufgefuehrt).
+            if active_hashes and h_s.lower() not in active_hashes:
+                return
+            key = (pid_s.lower(), h_s)
+            if key in seen:
+                return
+            seen.add(key)
+            if _has_data(pid_s, h_s):
+                return
+            pname_s = str(pname or "Default")
+            out.append({
+                "plugin_id": pid_s,
+                "preset_name": pname_s,
+                "instance_hash": h_s,
+                "display_name": str(
+                    display_names.get(f"{pid_s}|{pname_s}")
+                    or self._no_data_fallback_name(pid_s, pname_s)),
+            })
+
+        for pid, clones in presets.items():
+            if not isinstance(clones, list):
+                continue
+            for clone in clones:
+                if not isinstance(clone, dict):
+                    continue
+                if clone.get("is_archived"):
+                    continue
+                _add(str(pid),
+                     str(clone.get("preset_name") or "Default"),
+                     str(clone.get("instance_hash") or ""))
+        # Runde 9 (Bug 2): Set-Instanz-Varianten ebenfalls erfassen.
+        for s in sets or []:
+            services = s.get("services") if isinstance(s, dict) else None
+            if not isinstance(services, dict):
+                continue
+            for instance_id, svc in services.items():
+                if not isinstance(svc, dict):
+                    continue
+                if svc.get("is_archived"):
+                    continue
+                pid = str(svc.get("plugin_id") or "").strip()
+                if not pid:
+                    continue
+                if generate_instance_hash is not None:
+                    h = generate_instance_hash(pid, svc.get("params") or {})
+                else:
+                    h = ""
+                _add(pid, f"{pid} [{instance_id}]", h)
+        return out
+
+    @staticmethod
+    def _no_data_fallback_name(pid: str, pname: str) -> str:
+        """Lesbarer Fallback-Anzeigename (ohne Modell-Zugriff im Reader).
+
+        Runde 11 (Bug 4, B4-1): Der Reader kennt das ServiceSelectorModel
+        nicht - der ViewModel liefert die Anzeigenamen ueber den Snapshot
+        (`display_names`); dieser Fallback greift nur bei fehlendem
+        Snapshot-Eintrag (defensiv, identisch zur VM-Logik).
+        """
+        pretty = (pid.replace("srv_", "").replace("ind_", "")
+                  .replace("_", " ").title())
+        if not pretty:
+            pretty = pid
+        return f"{pretty} ({pname})"
 
     def get_available_features(
         self, symbol: str, timeframe: str
@@ -16969,6 +17347,27 @@ def migrate_statistics_persistence(
     return migrated
 
 
+def _params_signature(params: Dict[str, Any]) -> tuple:
+    """Deterministische, hashbare Signatur der VM-Params (Runde 11, A6).
+
+    Wird fuer die Query-Key-Pruefung in _on_page_changed genutzt: identische
+    Seite + gleiche Restore-Generation + gleiche Params -> kein redundanter
+    Re-Query (die Daten sind bereits frisch). Dicts/Listen werden rekursiv
+    in sortierte Tupel normalisiert (deterministisch, hashbar).
+    """
+
+    def _norm(v: Any) -> Any:
+        if isinstance(v, dict):
+            return tuple(sorted((str(k), _norm(val))
+                                for k, val in v.items()))
+        if isinstance(v, (list, tuple)):
+            return tuple(_norm(x) for x in v)
+        return v
+
+    return tuple(sorted((str(k), _norm(v))
+                        for k, v in params.items()))
+
+
 @register_persistent_window()
 class AnalyticsWindow(PersistentWindow):
     """Analytics-Hauptfenster (win_analytics, 1280 x 800, nicht-modal)."""
@@ -17326,14 +17725,14 @@ class AnalyticsWindow(PersistentWindow):
                 # changed feuert nicht; ohne setCurrentIndex bleibt die
                 # alte Seite sichtbar).
                 self.pages_stack.setCurrentIndex(page_index)
-                page = self.pages_stack.widget(page_index)
-                if page is not None and hasattr(page, "_sync_from_params"):
-                    try:
-                        page._sync_from_params()
-                    except (RuntimeError, AttributeError):
-                        pass
         except (RuntimeError, AttributeError):
             pass
+        # Runde 11 (Architektur, A3/A6): Zentraler Seiten-Sync NACH dem
+        # VM-Param-Setzen (genau EIN Durchgang; die Einzel-Verbindungen der
+        # Widgets auf params_restored entfallen). Danach die Daten der
+        # aktiven Seite anfordern (A6: Query-Key-Pruefung -> request_data).
+        self._sync_all_pages_from_params()
+        self._request_current_page_data()
         # 10.08.2026 (Punkt 3): Ansichts-Modus der Heatmap-Seite auch aus
         # dem Profil-Restore uebernehmen (workspace_layout wird von
         # _apply_profile befuellt). Muster _restore_workspace.
@@ -17555,6 +17954,42 @@ class AnalyticsWindow(PersistentWindow):
         self.combo_symbol.blockSignals(False)
 
     # ------------------------------------------------------------------
+    # Runde 11 (Architektur, A3/A6): Zentraler Seiten-Sync + Query-
+    # Orchestrierung
+    # ------------------------------------------------------------------
+    def _sync_all_pages_from_params(self) -> None:
+        """Synchronisiert ALLE Seiten-Controls aus den VM-Params (A3).
+
+        Runde 11 (Architektur, A3): Zentraler Sync nach restore_workspace()/
+        _apply_profile() - genau EIN Durchgang mit blockSignals (page-intern
+        via _syncing/_set_combo_data). Die direkte params_restored-
+        Verbindung des HeatmapWidgets (attach_view_model) entfaellt - das
+        Window orchestriert hier.
+        """
+        for page in (self.table_page, self.heatmap_page, self.scatter_page,
+                     self.distribution_page, self.equity_page):
+            if hasattr(page, "_sync_from_params"):
+                try:
+                    page._sync_from_params()
+                except (RuntimeError, AttributeError):
+                    pass
+        # 20.02: Das generische HeatmapWidget syncen seine Combos separat
+        # (es ist ein Unter-Widget der HeatmapPage, keine eigene Page).
+        try:
+            generic = getattr(self.heatmap_page, "_generic", None)
+            if generic is not None and hasattr(generic, "_sync_from_params"):
+                generic._sync_from_params()
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _request_current_page_data(self) -> None:
+        """Fordert die Daten der aktiven Seite an (A6: sync -> key -> query)."""
+        row = self.sidebar.currentRow()
+        if not (0 <= row < self.pages_stack.count()):
+            return
+        self._on_page_changed(row)
+
+    # ------------------------------------------------------------------
     # Datenfluss (MVVM): Feature-Dropdown, Seiten, Status
     # ------------------------------------------------------------------
     def _on_page_changed(self, row: int) -> None:
@@ -17565,8 +18000,16 @@ class AnalyticsWindow(PersistentWindow):
             # sichtbar. Jetzt: Stack auf die geklickte Seite + lazy request.
             self.pages_stack.setCurrentIndex(row)
             page = self.pages_stack.widget(row)
-            if hasattr(page, "request_data"):
-                page.request_data()
+            # Runde 11 (A6): Query-Key-Pruefung - identische Seite + gleiche
+            # Restore-Generation + gleiche Params -> KEIN redundanter
+            # Re-Query (die Daten sind bereits frisch; z. B. doppelter
+            # Aufruf aus _initial_load/_request_current_page_data).
+            key = (row, self._vm.restore_generation,
+                   _params_signature(self._vm.params))
+            if key != getattr(self, "_last_request_key", None):
+                self._last_request_key = key
+                if hasattr(page, "request_data"):
+                    page.request_data()
 
     @Slot(str, str)
     def _on_query_failed(self, kind: str, error: str) -> None:
@@ -17856,6 +18299,26 @@ class AnalyticsWindow(PersistentWindow):
     # ------------------------------------------------------------------
     # Workspace-Persistenz (20.01, E1/E7): vm.params + UI-Layout
     # ------------------------------------------------------------------
+    @staticmethod
+    def _snapshot_params(params: Dict[str, Any]) -> Dict[str, Any]:
+        """Flache, entkoppelte Kopie der VM-Params (kein Aliasing, B3-3).
+
+        Runde 11 (Bug 3, B3-3): Die Workspace-Persistenz darf die
+        ViewModel-Referenz nicht weiterreichen - Listen/Dicts
+        (feature_ids, instance_hashes, Zoom-Bereiche, table_column_widths)
+        werden als Kopien uebernommen (mutierende Aufrufer aendern sonst
+        die Live-Params des ViewModel).
+        """
+        out: Dict[str, Any] = {}
+        for k, v in params.items():
+            if isinstance(v, list):
+                out[k] = list(v)
+            elif isinstance(v, dict):
+                out[k] = dict(v)
+            else:
+                out[k] = v
+        return out
+
     def _save_workspace(self) -> None:
         """Persistiert den Analytics-Workspace (VM-Parameter + Layout).
 
@@ -17865,8 +18328,12 @@ class AnalyticsWindow(PersistentWindow):
         (E1: _keep_history_on_close = True).
         """
         try:
+            # Runde 11 (Bug 3, B3-3): Entkoppelte Kopie statt Referenz -
+            # der ViewModel._params wuerde sonst mit dem Workspace-Payload
+            # aliasen (mutierende Aufrufer aendern die Live-Params).
+            params_snapshot = self._snapshot_params(self._vm.params)
             payload = {
-                "params": self._vm.params,
+                "params": params_snapshot,
                 "layout": {
                     "page_index": self.sidebar.currentRow()
                     if hasattr(self, "sidebar") else 0,
@@ -18876,6 +19343,7 @@ from PySide6.QtWidgets import (
 from analytics.engine.analytics_worker import (
     QUERY_HEATMAP_GENERIC,
     QUERY_DAILY_OHLC,
+    QUERY_FEATURES,
 )
 from analytics.engine.feature_store_reader import (
     DOW_LABELS,
@@ -19259,6 +19727,13 @@ class HeatmapWidget(QWidget):
         # Query-Round-Trip. Wird bei jedem Daten-Payload aktualisiert;
         # _sync_from_params/feature_ids_changed bauen daraus Items/Haken.
         self._field_keys: List[str] = []
+        # Runde 11 (Bug 4, B4-2): Cache der No-Data-Varianten aus dem
+        # QUERY_FEATURES-Payload. None = noch kein Payload (Loading);
+        # [] = Erfolg ohne Varianten; Liste = Erfolg mit Varianten.
+        # `_no_data_variants_error` markiert einen fehlgeschlagenen
+        # No-Data-Check (Payload-Vertrag B4-2, 'Pruefung fehlgeschlagen').
+        self._no_data_variants: Optional[List[Dict[str, Any]]] = None
+        self._no_data_variants_error: bool = False
 
         # --- Steuerung (Zeile 1: Dimensionen/Aggregation/Feld) ---
         self._combo_x = QComboBox()
@@ -19392,15 +19867,13 @@ class HeatmapWidget(QWidget):
     def attach_view_model(self, view_model: Any) -> None:
         self._view_model = view_model
         view_model.data_ready.connect(self._on_data_ready)
-        # 20.04-Timing-Fix (D): Nach restore_workspace()/_apply_profile()
-        # emittiert der ViewModel `params_restored` – die Combos werden dann
-        # explizit aus den restaurierten Params synchronisiert (sonst kann
-        # der erste Daten-Payload bzw. _apply_config die restaurierten
-        # Aggregations-/Feld-Werte ueberschreiben). Defensiv per hasattr
-        # (Test-Mocks ohne Signal). _sync_from_params() blockt Signale und
-        # stoesst keinen Query an (kein Loop).
-        if hasattr(view_model, "params_restored"):
-            view_model.params_restored.connect(self._sync_from_params)
+        # Runde 11 (Architektur, A3): KEINE direkte params_restored-
+        # Verbindung mehr - das AnalyticsWindow orchestriert den Seiten-Sync
+        # zentral via _sync_all_pages_from_params() (genau EIN Durchgang
+        # nach dem VM-Param-Setzen). _sync_from_params() wird vom Window
+        # explizit aufgerufen (heatmap_page._generic). Die Initial-Sync
+        # unten (self._sync_from_params()) bleibt fuer den Attach-Zeitpunkt.
+
         # Runde 8 (Bugfix 4): feature_ids-Aenderungen (ServicePicker
         # Check/Uncheck) -> das 'Feld'-Dropdown wird SOFORT synchron neu
         # abgeleitet (kein Debounce/Query-Round-Trip). Defensiv per hasattr
@@ -19408,6 +19881,11 @@ class HeatmapWidget(QWidget):
         if hasattr(view_model, "feature_ids_changed"):
             view_model.feature_ids_changed.connect(
                 self._on_feature_ids_changed)
+        # Runde 11 (Bug 4, B4-2): Fehlerzustand des No-Data-Checks
+        # (QUERY_FEATURES) -> 'Pruefung fehlgeschlagen'-Hinweis im
+        # Feld-Dropdown (Payload-Vertrag; vorher verschluckte Fehler).
+        if hasattr(view_model, "query_failed"):
+            view_model.query_failed.connect(self._on_query_failed)
         self._sync_from_params()
 
     def is_candle_projection_enabled(self) -> bool:
@@ -19419,6 +19897,9 @@ class HeatmapWidget(QWidget):
         if self._view_model is None:
             return
         self._view_model.request_heatmap_generic()
+        # Runde 12 (Option A): Die No-Data-Varianten kommen IM SELBEN
+        # QUERY_HEATMAP_GENERIC-Payload (kein separater QUERY_FEATURES-
+        # Roundtrip mehr) - das Dropdown aktualisiert sich mit der Grafik.
         if self._chk_candle.isChecked():
             self._view_model.request_daily_ohlc()
 
@@ -19836,9 +20317,70 @@ class HeatmapWidget(QWidget):
     # ------------------------------------------------------------------
     def _on_data_ready(self, kind: str, data: Dict[str, Any]) -> None:
         if kind == QUERY_HEATMAP_GENERIC:
+            # Runde 12 (Option A): No-Data-Varianten aus dem HEATMAP-Payload
+            # uebernehmen (Generation-Guard) VOR dem Render - die
+            # '(No Data)'-Items erscheinen im selben Durchlauf wie die Grafik.
+            self._cache_no_data_from_payload(data)
             self._render_generic(data)
         elif kind == QUERY_DAILY_OHLC:
             self._render_overlay(data)
+        elif kind == QUERY_FEATURES:
+            # Runde 11 (Bug 4, B4-3): Kompatibilitaets-Pfad (z. B. der
+            # refresh_all() der Initial-Ladung stoesst QUERY_FEATURES an).
+            self._on_features_ready(data)
+
+    def _cache_no_data_from_payload(self, data: Dict[str, Any]) -> bool:
+        """Uebernimmt no_data_variants aus einem Payload (Generation-Guard).
+
+        Runde 12 (Option A): Gemeinsamer Cache-Pfad fuer den
+        QUERY_HEATMAP_GENERIC-Payload (No-Data im selben Datenfluss) und
+        den QUERY_FEATURES-Kompatibilitaets-Payload. Returns False, wenn
+        kein No-Data-Anteil im Payload ist (dann bleibt der Cache
+        unveraendert) oder der Payload stale ist (aeltere Generation).
+        """
+        if self._view_model is None:
+            return False
+        vm = self._view_model
+        payload_gen = data.get("restore_generation")
+        if (payload_gen is not None
+                and str(payload_gen) != str(
+                    getattr(vm, "restore_generation", 0))):
+            return False  # Stale-Payload (Query lief VOR dem letzten Restore)
+        if "no_data_variants" not in data:
+            return False  # Payload ohne No-Data-Anteil (z. B. Alt-Payload)
+        variants = data.get("no_data_variants")
+        self._no_data_variants = (
+            [dict(v) for v in variants] if isinstance(variants, list)
+            else [])
+        self._no_data_variants_error = bool(
+            data.get("no_data_variants_error"))
+        return True
+
+    def _on_features_ready(self, data: Dict[str, Any]) -> None:
+        """Uebernimmt die No-Data-Varianten aus einem QUERY_FEATURES-Payload.
+
+        Runde 11 (Bug 4, B4-2/B4-3): Payload-Vertrag `no_data_variants`
+        IMMER vorhanden; `no_data_variants_error` markiert einen
+        fehlgeschlagenen Check. Stale-Payloads werden verworfen
+        (Generation-Guard). Danach wird das 'Feld'-Dropdown aus dem Cache
+        neu abgeleitet (die '(No Data)'-Items erscheinen/verschwinden).
+        """
+        if not self._cache_no_data_from_payload(data):
+            return
+        self._rebuild_field_dropdown(self._field_keys, self._field_sources)
+
+    def _on_query_failed(self, kind: str, _error: str) -> None:
+        """Runde 11 (Bug 4, B4-2): Fehlerzustand des No-Data-Checks.
+
+        Schlaegt die QUERY_FEATURES-Abfrage fehl (kein Payload), zeigt das
+        Feld-Dropdown den 'Pruefung fehlgeschlagen'-Hinweis statt stumm zu
+        bleiben (verschluckte Fehler, User-Analyse Punkt 2).
+        """
+        if kind == QUERY_FEATURES:
+            self._no_data_variants = []
+            self._no_data_variants_error = True
+            self._rebuild_field_dropdown(self._field_keys,
+                                         self._field_sources)
 
     def _render_generic(self, data: Dict[str, Any]) -> None:
         matrix = np.asarray(data.get("matrix") or [], dtype=float)
@@ -20130,25 +20672,12 @@ class HeatmapWidget(QWidget):
                     prev_field, prev_field, checked=True)
                 self._combo_field.setCurrentIndex(
                     self._combo_field.count() - 1)
-            # Runde 10 (Bug 2): '(No Data)'-Hinweis-Eintraege zentral HIER
-            # rendern - deckt auch den Cache-Rebuild-Pfad (_sync_from_params
-            # / _on_feature_ids_changed) ab, nicht nur den Payload-Pfad. Eine
-            # Variante ohne Daten wird dadurch sichtbar, sobald sie gewaehlt
-            # wurde (vorher blieb der Hinweis nach einem Rebuild ohne frischen
-            # Payload verschwunden).
-            try:
-                no_data = self._view_model.resolve_no_data_variants(
-                    str(p.get("symbol") or ""),
-                    str(p.get("timeframe") or ""))
-            except Exception:
-                no_data = []
-            if no_data:
-                self._combo_field.add_header_item(
-                    "🕓 Noch ohne Daten (erster Scan ausstehend):")
-                for nd in no_data:
-                    self._combo_field.add_disabled_item(
-                        f"{nd.get('display_name') or nd.get('plugin_id')} "
-                        f"({nd.get('preset_name')}) – (No Data)")
+            # Runde 11 (Bug 4, B4-1): '(No Data)'-Hinweise kommen jetzt als
+            # Payload-Attribut `no_data_variants` vom QUERY_FEATURES-Worker
+            # (Cache self._no_data_variants) - KEIN synchroner DB-Zugriff
+            # mehr im UI-Hauptthread. Die Anzeige unterscheidet Loading/
+            # Erfolg/Fehler und filtert nach aktiven instance_hashes (B4-5).
+            self._render_no_data_items()
         finally:
             self._combo_field.blockSignals(False)
         self._update_controls()
@@ -20165,6 +20694,134 @@ class HeatmapWidget(QWidget):
                     self._combo_field.setCurrentIndex(fidx)
             else:
                 self._apply_config()
+
+    def _render_no_data_items(self) -> None:
+        """Rendert die No-Data-Hinweise aus dem Payload-Cache (B4-2/B4-5).
+
+        Runde 11 (Bug 4): Die '(No Data)'-Varianten kommen vom
+        QUERY_FEATURES-Worker (`no_data_variants` im Payload) - kein
+        synchroner DB-Zugriff mehr. Die Anzeige unterscheidet:
+          * Payload ausstehend (self._no_data_variants is None) -> nichts
+          * Payload-Fehler   -> '⚠️ No-Data-Prüfung ...' (deaktiviert)
+          * Erfolg + Liste   -> '(No Data)'-Abschnitt (deaktivierte Items)
+
+        Runde 13 (Bugfix Dropdown-NoData): Der Payload ist seit dem
+        Reader-Hash-Filter bereits VARIANTEN-GENAU - `no_data_variants`
+        enthaelt nur noch die im ServicePicker gecheckten Varianten
+        (und nur Services aus `feature_ids`). Die Widget-seitigen Filter
+        (active_ids/active_hashes) sind damit redundant, bleiben aber
+        DEFENSIV aktiv (schuetzt z. B. gegen Alt-Payloads vom
+        QUERY_FEATURES-Kompatibilitaetspfad ohne Hash-Filter). Die
+        gewaehlte Variante ist in Runde 13 immer Teil des Abschnitts -
+        die B4-5-Inline-Ergaenzung greift nur noch bei Defensiv-Luecken.
+        """
+        if self._view_model is None:
+            return
+        if self._no_data_variants_error:
+            self._combo_field.add_disabled_item(
+                "⚠️ No-Data-Prüfung konnte nicht durchgeführt werden")
+            return
+        if self._no_data_variants is None:
+            return  # Loading: Payload steht noch aus (kein Hinweis noetig)
+        p = self._view_model.params
+        # Runde 12 (Punkt 4): Nur Services im aktiven feature_ids-Filter
+        # (leer = kein Filter = alle) - nicht angehakte Services werden
+        # nicht als '(No Data)' angezeigt. Runde 13: defensiv (der Reader
+        # filtert bereits nach feature_ids).
+        active_ids = {str(f).strip().lower()
+                      for f in (p.get("feature_ids") or [])}
+        # Runde 13: `instance_hashes` ist seit dem MasterTree-Fix auch fuer
+        # Set-Instanz-Varianten (TYPE_SERVICE) gefuellt. Der Reader filtert
+        # den Payload bereits danach - hier defensiv gegen Alt-Payloads.
+        active_hashes = {str(h).strip().lower()
+                         for h in (p.get("instance_hashes") or [])}
+        variants = [dict(v) for v in self._no_data_variants]
+        filtered = variants
+        if active_ids:
+            filtered = [v for v in filtered
+                        if str(v.get("plugin_id") or "").strip().lower()
+                        in active_ids]
+        if active_hashes:
+            filtered = [v for v in filtered
+                        if str(v.get("instance_hash") or "").strip().lower()
+                        in active_hashes]
+        if not filtered and self._selected_no_data_variant(variants) is None:
+            return
+        self._combo_field.add_header_item(
+            "🕓 Noch ohne Daten (erster Scan ausstehend):")
+        rendered: set = set()
+        for nd in filtered:
+            rendered.add((str(nd.get("plugin_id") or "").strip().lower(),
+                          str(nd.get("instance_hash") or "").strip().lower()))
+            # Runde 11 (B4-2): display_name enthaelt den Preset bereits
+            # (resolve_service_display_name/Reader-Fallback) - keine
+            # doppelte '(preset)'-Ergaenzung im Item-Text.
+            self._combo_field.add_disabled_item(
+                f"{nd.get('display_name') or nd.get('plugin_id')} – (No Data)")
+        # B4-5 (Runde 13): Die gewaehlte Variante bleibt zusaetzlich inline
+        # sichtbar (ausgegraut) - defensiv: nur wenn die Widget-Filter sie
+        # wider Erwarten nicht im Abschnitt haetten (Reader-Hash-Filter
+        # und Widget-Filter koennen nicht divergieren, solange beide auf
+        # `instance_hashes` basieren).
+        sel = self._selected_no_data_variant(variants)
+        if sel is not None:
+            key = (str(sel.get("plugin_id") or "").strip().lower(),
+                   str(sel.get("instance_hash") or "").strip().lower())
+            if key not in rendered:
+                self._combo_field.add_disabled_item(
+                    f"→ {sel.get('display_name') or sel.get('plugin_id')} – (No Data)")
+
+    def _selected_no_data_variant(
+        self, variants: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """No-Data-Variante des aktuell gewaehlten Feld-Items (oder None).
+
+        Runde 12 (Punkt 3): Das Feld-Item-userData traegt '{service_id}|{key}'
+        (ein Feld-Item repraesentiert einen SERVICE, nicht eine Variante) -
+        die GEWAEHLTE Variante wird ueber den aktiven instance_hashes-Filter
+        des ServicePickers identifiziert: Liefert der Service mehrere
+        No-Data-Varianten, gewinnt die gecheckte Variante (exakter Hash-
+        Match) statt immer der ersten. Runde 12 (Punkt 4): Services, die
+        NICHT im aktiven feature_ids-Filter liegen, werden ignoriert
+        (None - keine Inline-Markierung fuer nicht gecheckte Services).
+
+        Runde 13 (Bugfix Dropdown-NoData): Der Payload (`no_data_variants`)
+        ist seit dem Reader-Hash-Filter bereits VARIANTEN-GENAU - er enthaelt
+        nur noch die im ServicePicker gecheckten Varianten. Die ausgewaehlte
+        No-Data-Variante des aktuellen Feld-Services ist damit EINDEUTIG
+        bestimmt (hoechstens eine Variante pro Service uebrig). Der alte
+        'erste Variante des Services'-Fallback ist ersatzlos entfernt: Er
+        zeigte bei aktiver Varianten-Einschraenkung faelschlich die ERSTE
+        Variante (V1), obwohl eine andere (V2) gecheckt und V1 gar nicht
+        aktiv war - die Runde-12b-Einschraenkung (kein Fallback bei nicht
+        leerem instance_hashes) war unvollstaendig, weil `instance_hashes`
+        fuer Set-Instanz-Varianten bis Runde 13 leer blieb.
+        """
+        if not variants:
+            return None
+        if self._view_model is None:
+            return None
+        p = self._view_model.params
+        data = self._combo_field.currentData()
+        sid = None
+        if isinstance(data, str) and "|" in data:
+            sid = data.split("|", 1)[0].strip().lower()
+        if not sid:
+            return None
+        # Punkt 4: Nur Services im aktiven feature_ids-Filter (leer = alle).
+        active_ids = {str(f).strip().lower()
+                      for f in (p.get("feature_ids") or [])}
+        if active_ids and sid not in active_ids:
+            return None
+        # Runde 13: Der Payload ist bereits variantengefiltert (Reader-
+        # Hash-Filter auf active_hashes). Die No-Data-Variante des aktuellen
+        # Feld-Services im Payload IST die ausgewaehlte - kein Fallback auf
+        # die 'erste Variante' mehr (die gecheckte Variante gewinnt, weil
+        # nur sie im Payload steht).
+        for v in variants:
+            if str(v.get("plugin_id") or "").strip().lower() == sid:
+                return v
+        return None
 
     def _on_feature_ids_changed(self) -> None:
         """Synchrones Neu-Ableiten des Feld-Dropdowns bei Check/Uncheck.
@@ -20204,33 +20861,23 @@ class HeatmapWidget(QWidget):
         stale = (payload_gen is not None
                  and str(payload_gen) != str(
                      getattr(vm, "restore_generation", 0)))
-        # x/y/agg mit VM-Prioritaet (Runde 7): restaurierte Werte gewinnen
-        # gegen einen Stale-Payload (Query lief VOR dem Restore mit
-        # Default-Params); erst wenn der VM leer ist, zaehlt der Payload.
-        x_dim = (str(vm.params.get("heatmap_x_dim") or "")
-                 or str(data.get("x_dim") or "date"))
-        y_dim = (str(vm.params.get("heatmap_y_dim") or "")
-                 or str(data.get("y_dim") or "hour"))
-        agg = (str(vm.params.get("heatmap_agg") or "")
-               or str(data.get("agg") or "")
-               or str(self._combo_agg.currentData() or ""))
+        # Runde 11 (Architektur, A5): Die x/y/agg-Combos werden NICHT mehr
+        # aus dem Payload synchronisiert - die Controls sind Single Source
+        # of Truth (Restore-/User-Auswahl gewinnt, kein Ueberschreiben).
         self._syncing = True
         try:
             if not stale:
                 # Feld-Metadaten uebernehmen + 'Feld'-Dropdown synchron neu
                 # ableiten (Items/Haken/Current; Runde 8, Bug 3/4). Bei
                 # stale Payloads bleibt der Zustand aus _sync_from_params
-                # (params_restored) unveraendert.
+                # unveraendert.
                 self._rebuild_field_dropdown(
                     keys, field_sources,
                     payload_agg=str(data.get("agg") or ""),
                     payload_field=str(data.get("field") or ""))
-            # Runde 10 (Bug 2): '(No Data)'-Hinweis-Eintraege werden zentral
-            # in _rebuild_field_dropdown() gerendert (deckt auch den
-            # Cache-Rebuild-Pfad ab) - hier nur noch x/y/agg synchronisieren.
-            self._set_combo_data(self._combo_x, x_dim)
-            self._set_combo_data(self._combo_y, y_dim)
-            self._set_combo_data(self._combo_agg, str(agg or "count"))
+            # Runde 11 (Bug 4, B4-1): '(No Data)'-Hinweise rendert
+            # _rebuild_field_dropdown() zentral aus dem Payload-Cache
+            # (self._no_data_variants aus QUERY_FEATURES).
         finally:
             self._syncing = False
         self._update_controls()
@@ -31476,6 +32123,12 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem,
 )
 
+# 20.04 (Q2/Q4): Deterministischer Parameter-Hash. Runde 13b
+# (Bugfix Dropdown-NoData): on-the-fly-Fallback in _build_set_item fuer
+# Set-Instanzen, deren Set-Definition beim regularen Hinzufuegen keinen
+# instance_hash persistiert hat (Alt-Bestand).
+from analytics.engine.service_models import generate_instance_hash
+
 # 18.01.03 (Dynamic Tree Management): MIME-Typ fuer den internen
 # Kategorie-Drag & Drop. Die MIME-Daten kodieren den gezogenen Knoten als
 # JSON: {"node_type": "set|plugin|category", "group": "sets|plugins",
@@ -31973,8 +32626,28 @@ class MasterTree(QTreeWidget):
             svc_item.setData(0, ROLE_SET_ID, child.get("set_id") or "")
             svc_item.setData(0, ROLE_INSTANCE_ID, svc.get("instance_id") or "")
             svc_item.setData(0, ROLE_PLUGIN_ID, plugin_id)
-            svc_item.setData(0, ROLE_INSTANCE_HASH,
-                             str(svc.get("instance_hash") or ""))
+            # Runde 13b (Bugfix Dropdown-NoData): Set-Instanzen werden beim
+            # regularen Hinzufuegen OHNE instance_hash in der Set-Definition
+            # gespeichert (nur _duplicate_set_instance persistiert ihn) -
+            # daraus blieb `instance_hashes` fuer Set-Instanzen leer und die
+            # '(No Data)'-Varianten-Einschraenkung des Readers griff nicht
+            # (Dropdown zeigte die erste/falsche Variante und ungecheckte
+            # Instanzen). Hier wird der fehlende Hash on-the-fly aus den
+            # Params berechnet (identisch zum Reader-Set-Pfad
+            # generate_instance_hash(pid, params)) - heilt Alt-Bestand ohne
+            # DB-Migration.
+            svc_hash = str(svc.get("instance_hash") or "")
+            if not svc_hash and self.model is not None:
+                try:
+                    cfg = self.model.find_service(
+                        str(child.get("set_id") or ""),
+                        str(svc.get("instance_id") or "")) or {}
+                    svc_hash = generate_instance_hash(
+                        str(cfg.get("plugin_id") or plugin_id),
+                        cfg.get("params") or {}) or ""
+                except Exception:
+                    svc_hash = ""
+            svc_item.setData(0, ROLE_INSTANCE_HASH, svc_hash)
             if svc_archived or archived_set:
                 svc_item.setData(0, ROLE_ARCHIVED, True)
             # 15.03-E (Multi-Select): Service-Knoten anhakbar – Zustand aus
@@ -31983,7 +32656,8 @@ class MasterTree(QTreeWidget):
                 svc_item.setFlags(svc_item.flags() | Qt.ItemIsUserCheckable)
                 key = (TYPE_SERVICE,
                        str(child.get("set_id") or ""),
-                       str(svc.get("instance_id") or ""))
+                       str(svc.get("instance_id") or ""),
+                       svc_hash)
                 state = (Qt.Checked if key in self._checked_items
                          else Qt.Unchecked)
                 svc_item.setData(0, Qt.CheckStateRole, state)
@@ -32706,7 +33380,8 @@ class MasterTree(QTreeWidget):
             if node_type == TYPE_SERVICE:
                 key = (TYPE_SERVICE,
                        str(item.data(0, ROLE_SET_ID) or ""),
-                       str(item.data(0, ROLE_INSTANCE_ID) or ""))
+                       str(item.data(0, ROLE_INSTANCE_ID) or ""),
+                       str(item.data(0, ROLE_INSTANCE_HASH) or ""))
                 # Kein echter Checkbox-Wechsel (z. B. Text-Refresh)? -> return.
                 expected = (Qt.Checked if key in self._checked_items
                             else Qt.Unchecked)
@@ -32773,7 +33448,8 @@ class MasterTree(QTreeWidget):
                     if child.data(0, ROLE_NODE_TYPE) != TYPE_SERVICE:
                         continue
                     key = (TYPE_SERVICE, set_id,
-                           str(child.data(0, ROLE_INSTANCE_ID) or ""))
+                           str(child.data(0, ROLE_INSTANCE_ID) or ""),
+                           str(child.data(0, ROLE_INSTANCE_HASH) or ""))
                     if state == Qt.Checked:
                         self._checked_items.add(key)
                         child.setData(0, Qt.CheckStateRole, Qt.Checked)
@@ -32916,7 +33592,8 @@ class MasterTree(QTreeWidget):
             if node_type == TYPE_SERVICE:
                 synced.add((TYPE_SERVICE,
                             str(item.data(0, ROLE_SET_ID) or ""),
-                            str(item.data(0, ROLE_INSTANCE_ID) or "")))
+                            str(item.data(0, ROLE_INSTANCE_ID) or ""),
+                            str(item.data(0, ROLE_INSTANCE_HASH) or "")))
             elif node_type == TYPE_PLUGIN and item.childCount() == 0:
                 # 10.08.2026 (Punkt 6): Plugin-Parents mit Varianten sind
                 # non-checkable - kein Haken-Sync (Konsistenz zum Reverse-
@@ -32940,21 +33617,29 @@ class MasterTree(QTreeWidget):
             leer).
         """
         result: List[Dict[str, str]] = []
-        for node_type, set_id, key_id in sorted(self._checked_items):
+        for entry in sorted(self._checked_items):
+            node_type = str(entry[0])
             if node_type == TYPE_SERVICE:
-                cfg = self.model.find_service(set_id, key_id) or {}
+                set_id = str(entry[1] or "")
+                instance_id = str(entry[2] or "")
+                # Runde 13 (Bugfix Dropdown-NoData): 4. Element = instance_hash
+                # der Set-Instanz-Variante (variantengenaue Einschraenkung).
+                instance_hash = str(entry[3] or "") if len(entry) > 3 else ""
+                cfg = self.model.find_service(set_id, instance_id) or {}
                 result.append({
                     "node_type": TYPE_SERVICE,
                     "set_id": set_id,
-                    "instance_id": key_id,
-                    "plugin_id": str(cfg.get("plugin_id") or key_id),
+                    "instance_id": instance_id,
+                    "plugin_id": str(cfg.get("plugin_id") or instance_id),
+                    "instance_hash": instance_hash,
                 })
             elif node_type == TYPE_PLUGIN:
                 result.append({
                     "node_type": TYPE_PLUGIN,
                     "set_id": "",
                     "instance_id": "",
-                    "plugin_id": key_id,
+                    "plugin_id": str(entry[2] or ""),
+                    "instance_hash": "",
                 })
             elif node_type == TYPE_CLONE:
                 # 20.04 (Q7): Clone-Haken -> feature_id ist die plugin_id
@@ -32963,8 +33648,9 @@ class MasterTree(QTreeWidget):
                 result.append({
                     "node_type": TYPE_CLONE,
                     "set_id": "",
-                    "instance_id": key_id,
-                    "plugin_id": set_id,
+                    "instance_id": str(entry[2] or ""),
+                    "plugin_id": str(entry[1] or ""),
+                    "instance_hash": str(entry[2] or ""),
                 })
         return result
 
@@ -32992,10 +33678,14 @@ class MasterTree(QTreeWidget):
         """
         hashes: List[str] = []
         for entry in self.checked_services():
-            if entry["node_type"] == TYPE_CLONE:
-                h = entry.get("instance_id") or ""
-                if h and h not in hashes:
-                    hashes.append(h)
+            # Runde 13 (Bugfix Dropdown-NoData): Hashes ALLER gecheckten
+            # Varianten sammeln - Clone-Knoten UND Set-Instanz-Varianten
+            # (vorher nur TYPE_CLONE; Set-Instanzen verloren ihren Hash in
+            # der Check-Sync-Kette und die Varianten-Einschraenkung blieb
+            # leer -> No-Data-Dropdown zeigte die falsche/erste Variante).
+            h = entry.get("instance_hash") or ""
+            if h and h not in hashes:
+                hashes.append(h)
         return hashes
 
     def checked_display_names(self) -> List[str]:
@@ -33083,12 +33773,23 @@ class MasterTree(QTreeWidget):
                 if node_type == TYPE_SERVICE:
                     set_id = str(item.data(0, ROLE_SET_ID) or "")
                     instance_id = str(item.data(0, ROLE_INSTANCE_ID) or "")
+                    instance_hash = str(item.data(0, ROLE_INSTANCE_HASH) or "")
                     cfg = self.model.find_service(set_id, instance_id) or {}
                     pid = str(cfg.get("plugin_id") or instance_id)
-                    checked = pid.lower() in wanted
+                    # Runde 13 (Bugfix Dropdown-NoData): Reverse-Mapping mit
+                    # Hash-Granularitaet auch fuer Set-Instanz-Varianten
+                    # (analog TYPE_CLONE) - sind instance_hashes gesetzt,
+                    # wird NUR die passende Instanz angehakt.
+                    if hash_restriction:
+                        checked = (pid.lower() in wanted
+                                   and instance_hash.strip().lower()
+                                   in wanted_hashes)
+                    else:
+                        checked = pid.lower() in wanted
                     if checked:
                         self._checked_items.add((TYPE_SERVICE, set_id,
-                                                 instance_id))
+                                                 instance_id,
+                                                 instance_hash))
                         checked_items.append(item)
                     item.setData(0, Qt.CheckStateRole,
                                  Qt.Checked if checked else Qt.Unchecked)
@@ -35191,6 +35892,7 @@ from PySide6.QtWidgets import (
 )
 
 from analytics.engine.description_dialog import ServiceDescriptionDialog
+from analytics.engine.service_models import generate_instance_hash
 from analytics.engine.service_selector_model import ServiceSelectorModel
 from config.event_bus import event_bus
 from serviceui.master_tree import (
@@ -36192,6 +36894,9 @@ class ServiceSelectorDialog(QDialog):
             "lookback": lookback,
             "params": params,
             "version": getattr(plugin, "version", "0.0.0") or "0.0.0",
+            # Runde 13b (Bugfix Dropdown-NoData): instance_hash mit
+            # persistieren (analog service_win._add_service_to_set).
+            "instance_hash": generate_instance_hash(plugin_id, params),
         }
         order.append(iid)
         definition["execution_order"] = order
@@ -39622,6 +40327,12 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             "lookback": lookback,
             "params": params,
             "version": getattr(plugin, "version", "0.0.0") or "0.0.0",
+            # Runde 13b (Bugfix Dropdown-NoData): instance_hash mit
+            # persistieren, damit NEUE Set-Instanzen von Anfang an die
+            # Varianten-Einschraenkung erfuellen (vorher fehlte der Hash
+            # beim regularen Hinzufuegen - der MasterTree berechnet ihn fuer
+            # Alt-Bestand on-the-fly, neue Instanzen tragen ihn direkt).
+            "instance_hash": generate_instance_hash(plugin_id, params),
         }
         order.append(iid)
         definition["execution_order"] = order
@@ -41156,6 +41867,572 @@ print("OK: 20.03-Bugfix-Testblock angehaengt")
 
 --------------------------------------------------
 
+### DATEI: test/_apply_mastertree_fix.py
+```py
+# test/_apply_mastertree_fix.py
+"""Runde 13 (Bugfix Dropdown-NoData): master_tree.py – instance_hash durch
+die Check-Sync-Kette fuer TYPE_SERVICE mitfuehren (Set-Instanz-Varianten).
+
+Fuehrt 7 praezise Textersetzungen durch (dry_run=True: nur Report).
+"""
+import sys
+from pathlib import Path
+
+PATH = Path(r"F:\Python\PyTrader\serviceui\master_tree.py")
+
+REPLACEMENTS = [
+    # ------------------------------------------------------------------
+    # E1: _build_set_item – Key um instance_hash erweitern (4. Element)
+    # ------------------------------------------------------------------
+    (
+        """                key = (TYPE_SERVICE,
+                       str(child.get("set_id") or ""),
+                       str(svc.get("instance_id") or ""))""",
+        """                key = (TYPE_SERVICE,
+                       str(child.get("set_id") or ""),
+                       str(svc.get("instance_id") or ""),
+                       str(svc.get("instance_hash") or ""))""",
+    ),
+    # ------------------------------------------------------------------
+    # E2: Check-Handler TYPE_SERVICE – Key um Hash erweitern
+    # ------------------------------------------------------------------
+    (
+        """                key = (TYPE_SERVICE,
+                       str(item.data(0, ROLE_SET_ID) or ""),
+                       str(item.data(0, ROLE_INSTANCE_ID) or ""))""",
+        """                key = (TYPE_SERVICE,
+                       str(item.data(0, ROLE_SET_ID) or ""),
+                       str(item.data(0, ROLE_INSTANCE_ID) or ""),
+                       str(item.data(0, ROLE_INSTANCE_HASH) or ""))""",
+    ),
+    # ------------------------------------------------------------------
+    # E3: TYPE_SET-Branch – Key um Hash erweitern
+    # ------------------------------------------------------------------
+    (
+        """                    key = (TYPE_SERVICE, set_id,
+                           str(child.data(0, ROLE_INSTANCE_ID) or ""))""",
+        """                    key = (TYPE_SERVICE, set_id,
+                           str(child.data(0, ROLE_INSTANCE_ID) or ""),
+                           str(child.data(0, ROLE_INSTANCE_HASH) or ""))""",
+    ),
+    # ------------------------------------------------------------------
+    # E4: _sync_checked_from_tree – Key um Hash erweitern
+    # ------------------------------------------------------------------
+    (
+        """                synced.add((TYPE_SERVICE,
+                            str(item.data(0, ROLE_SET_ID) or ""),
+                            str(item.data(0, ROLE_INSTANCE_ID) or "")))""",
+        """                synced.add((TYPE_SERVICE,
+                            str(item.data(0, ROLE_SET_ID) or ""),
+                            str(item.data(0, ROLE_INSTANCE_ID) or ""),
+                            str(item.data(0, ROLE_INSTANCE_HASH) or "")))""",
+    ),
+    # ------------------------------------------------------------------
+    # E5: checked_services – generisches Unpacking + instance_hash liefern
+    # ------------------------------------------------------------------
+    (
+        """        result: List[Dict[str, str]] = []
+        for node_type, set_id, key_id in sorted(self._checked_items):
+            if node_type == TYPE_SERVICE:
+                cfg = self.model.find_service(set_id, key_id) or {}
+                result.append({
+                    "node_type": TYPE_SERVICE,
+                    "set_id": set_id,
+                    "instance_id": key_id,
+                    "plugin_id": str(cfg.get("plugin_id") or key_id),
+                })
+            elif node_type == TYPE_PLUGIN:
+                result.append({
+                    "node_type": TYPE_PLUGIN,
+                    "set_id": "",
+                    "instance_id": "",
+                    "plugin_id": key_id,
+                })
+            elif node_type == TYPE_CLONE:
+                # 20.04 (Q7): Clone-Haken -> feature_id ist die plugin_id
+                # (im set_id-Slot gespeichert); instance_hash im
+                # instance_id-Slot fuer die Varianten-Aufloesung.
+                result.append({
+                    "node_type": TYPE_CLONE,
+                    "set_id": "",
+                    "instance_id": key_id,
+                    "plugin_id": set_id,
+                })
+        return result""",
+        """        result: List[Dict[str, str]] = []
+        for entry in sorted(self._checked_items):
+            node_type = str(entry[0])
+            if node_type == TYPE_SERVICE:
+                set_id = str(entry[1] or "")
+                instance_id = str(entry[2] or "")
+                # Runde 13 (Bugfix Dropdown-NoData): 4. Element = instance_hash
+                # der Set-Instanz-Variante (variantengenaue Einschraenkung).
+                instance_hash = str(entry[3] or "") if len(entry) > 3 else ""
+                cfg = self.model.find_service(set_id, instance_id) or {}
+                result.append({
+                    "node_type": TYPE_SERVICE,
+                    "set_id": set_id,
+                    "instance_id": instance_id,
+                    "plugin_id": str(cfg.get("plugin_id") or instance_id),
+                    "instance_hash": instance_hash,
+                })
+            elif node_type == TYPE_PLUGIN:
+                result.append({
+                    "node_type": TYPE_PLUGIN,
+                    "set_id": "",
+                    "instance_id": "",
+                    "plugin_id": str(entry[2] or ""),
+                    "instance_hash": "",
+                })
+            elif node_type == TYPE_CLONE:
+                # 20.04 (Q7): Clone-Haken -> feature_id ist die plugin_id
+                # (im set_id-Slot gespeichert); instance_hash im
+                # instance_id-Slot fuer die Varianten-Aufloesung.
+                result.append({
+                    "node_type": TYPE_CLONE,
+                    "set_id": "",
+                    "instance_id": str(entry[2] or ""),
+                    "plugin_id": str(entry[1] or ""),
+                    "instance_hash": str(entry[2] or ""),
+                })
+        return result""",
+    ),
+    # ------------------------------------------------------------------
+    # E6: checked_instance_hashes – alle gecheckten Varianten sammeln
+    # ------------------------------------------------------------------
+    (
+        """        hashes: List[str] = []
+        for entry in self.checked_services():
+            if entry["node_type"] == TYPE_CLONE:
+                h = entry.get("instance_id") or ""
+                if h and h not in hashes:
+                    hashes.append(h)
+        return hashes""",
+        """        hashes: List[str] = []
+        for entry in self.checked_services():
+            # Runde 13 (Bugfix Dropdown-NoData): Hashes ALLER gecheckten
+            # Varianten sammeln - Clone-Knoten UND Set-Instanz-Varianten
+            # (vorher nur TYPE_CLONE; Set-Instanzen verloren ihren Hash in
+            # der Check-Sync-Kette und die Varianten-Einschraenkung blieb
+            # leer -> No-Data-Dropdown zeigte die falsche/erste Variante).
+            h = entry.get("instance_hash") or ""
+            if h and h not in hashes:
+                hashes.append(h)
+        return hashes""",
+    ),
+    # ------------------------------------------------------------------
+    # E7: set_checked_feature_ids TYPE_SERVICE – Hash-Restriktion + 4er-Key
+    # ------------------------------------------------------------------
+    (
+        """                if node_type == TYPE_SERVICE:
+                    set_id = str(item.data(0, ROLE_SET_ID) or "")
+                    instance_id = str(item.data(0, ROLE_INSTANCE_ID) or "")
+                    cfg = self.model.find_service(set_id, instance_id) or {}
+                    pid = str(cfg.get("plugin_id") or instance_id)
+                    checked = pid.lower() in wanted
+                    if checked:
+                        self._checked_items.add((TYPE_SERVICE, set_id,
+                                                 instance_id))
+                        checked_items.append(item)
+                    item.setData(0, Qt.CheckStateRole,
+                                 Qt.Checked if checked else Qt.Unchecked)""",
+        """                if node_type == TYPE_SERVICE:
+                    set_id = str(item.data(0, ROLE_SET_ID) or "")
+                    instance_id = str(item.data(0, ROLE_INSTANCE_ID) or "")
+                    instance_hash = str(item.data(0, ROLE_INSTANCE_HASH) or "")
+                    cfg = self.model.find_service(set_id, instance_id) or {}
+                    pid = str(cfg.get("plugin_id") or instance_id)
+                    # Runde 13 (Bugfix Dropdown-NoData): Reverse-Mapping mit
+                    # Hash-Granularitaet auch fuer Set-Instanz-Varianten
+                    # (analog TYPE_CLONE) - sind instance_hashes gesetzt,
+                    # wird NUR die passende Instanz angehakt.
+                    if hash_restriction:
+                        checked = (pid.lower() in wanted
+                                   and instance_hash.strip().lower()
+                                   in wanted_hashes)
+                    else:
+                        checked = pid.lower() in wanted
+                    if checked:
+                        self._checked_items.add((TYPE_SERVICE, set_id,
+                                                 instance_id,
+                                                 instance_hash))
+                        checked_items.append(item)
+                    item.setData(0, Qt.CheckStateRole,
+                                 Qt.Checked if checked else Qt.Unchecked)""",
+    ),
+]
+
+
+def main() -> None:
+    dry = "--apply" not in sys.argv
+    content = PATH.read_text(encoding="utf-8", newline="")
+    # CRLF-Kompatibilitaet: Such-/Ersatzstrings auf das Datei-Format (LF/CRLF)
+    # normalisieren, damit die Ersetzungen zeilenend-treu bleiben.
+    if "\r\n" in content and "\n" in content.replace("\r\n", ""):
+        raise SystemExit("Datei hat gemischte Zeilenenden – Abbruch.")
+    nl = "\r\n" if "\r\n" in content else "\n"
+    repls = [(o.replace("\n", nl), n.replace("\n", nl))
+             for (o, n) in REPLACEMENTS]
+    print(f"Datei: {PATH}  ({len(content)} Zeichen, NL={nl!r})")
+    print("=" * 70)
+    ok_all = True
+    for i, (old, new) in enumerate(repls, 1):
+        count = content.count(old)
+        status = "OK" if count == 1 else f"WARN count={count}"
+        if count != 1:
+            ok_all = False
+        print(f"E{i}: {status}")
+        if count == 0:
+            # Zeige Kontext zum Debuggen
+            idx = content.find(old[:60])
+            if idx >= 0:
+                print(f"    -> Teil gefunden bei {idx}: {old[:60]!r}")
+            else:
+                print(f"    -> erster Teil NICHT gefunden: {old[:60]!r}")
+    print("=" * 70)
+    if not ok_all:
+        print("ABBRUCH: Nicht alle Ersetzungen eindeutig (dry_run).")
+        return
+    if dry:
+        print("Dry-Run OK – alle 7 Ersetzungen sind eindeutig. "
+              "Zum Anwenden dry=False setzen.")
+        return
+    for i, (old, new) in enumerate(repls, 1):
+        content = content.replace(old, new, 1)
+    PATH.write_text(content, encoding="utf-8", newline="")
+    print("Angewendet: 7 Ersetzungen geschrieben.")
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_apply_r13b.py
+```py
+# test/_apply_r13b.py
+"""Runde 13b (Bugfix Dropdown-NoData): 4 gezielte Ersetzungen.
+
+1. master_tree.py  (CRLF)  _build_set_item: on-the-fly-Hash fuer
+   Set-Instanzen OHNE instance_hash in der Set-Definition (Alt-Bestand).
+2. analytics_view_model.py (LF) _no_data_presets_snapshot: harte
+   Varianten-Einschraenkung in der Clone-Schleife (kein h_s-and-Guard).
+3. service_win.py  (LF)  _add_service_to_set: instance_hash persistieren.
+4. service_selector_dialog.py (CRLF) Add-Pfad: instance_hash persistieren.
+
+Alle Ersetzungen werden auf EINMALIGKEIT geprueft; die Zeilenenden
+(\r\n vs \n) der Zieldatei bleiben erhalten.
+"""
+import sys
+
+sys.stdout.reconfigure(encoding="utf-8")
+
+
+def patch(path: str, old: str, new: str, label: str) -> None:
+    raw = open(path, "rb").read()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        bom = True
+        raw = raw[3:]
+    else:
+        bom = False
+    text = raw.decode("utf-8")
+    nl = "\r\n" if text.count("\r\n") > text.count("\n") // 2 else "\n"
+    o = old.replace("\n", nl)
+    n = new.replace("\n", nl)
+    cnt = text.count(o)
+    if cnt != 1:
+        print(f"FAIL {label}: {cnt} Treffer (erwartet 1) in {path}")
+        sys.exit(1)
+    text = text.replace(o, n)
+    data = text.encode("utf-8")
+    if bom:
+        data = b"\xef\xbb\xbf" + data
+    open(path, "wb").write(data)
+    print(f"OK   {label}")
+
+
+# ---------------------------------------------------------------------------
+# 1) master_tree.py: Import + on-the-fly-Hash in _build_set_item
+# ---------------------------------------------------------------------------
+P = "serviceui/master_tree.py"
+
+patch(
+    P,
+    """from PySide6.QtWidgets import (
+    QHeaderView, QInputDialog, QMenu, QPushButton, QTreeWidget,
+    QTreeWidgetItem,
+)
+""",
+    """from PySide6.QtWidgets import (
+    QHeaderView, QInputDialog, QMenu, QPushButton, QTreeWidget,
+    QTreeWidgetItem,
+)
+
+# 20.04 (Q2/Q4): Deterministischer Parameter-Hash. Runde 13b
+# (Bugfix Dropdown-NoData): on-the-fly-Fallback in _build_set_item fuer
+# Set-Instanzen, deren Set-Definition beim regularen Hinzufuegen keinen
+# instance_hash persistiert hat (Alt-Bestand).
+from analytics.engine.service_models import generate_instance_hash
+""",
+    "master_tree Import generate_instance_hash",
+)
+
+patch(
+    P,
+    """            svc_item.setData(0, ROLE_PLUGIN_ID, plugin_id)
+            svc_item.setData(0, ROLE_INSTANCE_HASH,
+                             str(svc.get("instance_hash") or ""))""",
+    """            svc_item.setData(0, ROLE_PLUGIN_ID, plugin_id)
+            # Runde 13b (Bugfix Dropdown-NoData): Set-Instanzen werden beim
+            # regularen Hinzufuegen OHNE instance_hash in der Set-Definition
+            # gespeichert (nur _duplicate_set_instance persistiert ihn) -
+            # daraus blieb `instance_hashes` fuer Set-Instanzen leer und die
+            # '(No Data)'-Varianten-Einschraenkung des Readers griff nicht
+            # (Dropdown zeigte die erste/falsche Variante und ungecheckte
+            # Instanzen). Hier wird der fehlende Hash on-the-fly aus den
+            # Params berechnet (identisch zum Reader-Set-Pfad
+            # generate_instance_hash(pid, params)) - heilt Alt-Bestand ohne
+            # DB-Migration.
+            svc_hash = str(svc.get("instance_hash") or "")
+            if not svc_hash and self.model is not None:
+                try:
+                    cfg = self.model.find_service(
+                        str(child.get("set_id") or ""),
+                        str(svc.get("instance_id") or "")) or {}
+                    svc_hash = generate_instance_hash(
+                        str(cfg.get("plugin_id") or plugin_id),
+                        cfg.get("params") or {}) or ""
+                except Exception:
+                    svc_hash = ""
+            svc_item.setData(0, ROLE_INSTANCE_HASH, svc_hash)""",
+    "master_tree _build_set_item svc_hash on-the-fly",
+)
+
+patch(
+    P,
+    """                key = (TYPE_SERVICE,
+                       str(child.get("set_id") or ""),
+                       str(svc.get("instance_id") or ""),
+                       str(svc.get("instance_hash") or ""))""",
+    """                key = (TYPE_SERVICE,
+                       str(child.get("set_id") or ""),
+                       str(svc.get("instance_id") or ""),
+                       svc_hash)""",
+    "master_tree _build_set_item 4er-Key nutzt svc_hash",
+)
+
+# ---------------------------------------------------------------------------
+# 2) analytics_view_model.py: harte Varianten-Einschraenkung (Clone-Schleife)
+# ---------------------------------------------------------------------------
+P2 = "analytics/engine/analytics_view_model.py"
+patch(
+    P2,
+    """                for c in clones or []:
+                    if not isinstance(c, dict):
+                        continue
+                    pname = str(c.get("preset_name") or "Default")""",
+    """                for c in clones or []:
+                    if not isinstance(c, dict):
+                        continue
+                    h_s = str(c.get("instance_hash") or "").strip().lower()
+                    # Runde 13b (Bugfix Dropdown-NoData): Harte Varianten-
+                    # Einschraenkung - sind Hashes gecheckt (active_hashes
+                    # nicht leer), duerfen NUR diese Varianten in den
+                    # Snapshot (bewusst OHNE `h_s and`-Guard: eine hash-lose
+                    # Variante ist bei aktiver Einschraenkung nie Teil der
+                    # Auswahl und darf kein '(No Data)' liefern - sonst
+                    # erscheinen ungecheckte Instanzen weiterhin).
+                    if active_hashes and h_s not in active_hashes:
+                        continue
+                    pname = str(c.get("preset_name") or "Default")""",
+    "VM Snapshot Clone-Schleife Hash-Filter",
+)
+
+# ---------------------------------------------------------------------------
+# 3) service_win.py: _add_service_to_set persistiert instance_hash
+# ---------------------------------------------------------------------------
+P3 = "serviceui/service_win.py"
+patch(
+    P3,
+    """        services[iid] = {
+            "plugin_id": plugin_id,
+            "lookback": lookback,
+            "params": params,
+            "version": getattr(plugin, "version", "0.0.0") or "0.0.0",
+        }
+        order.append(iid)""",
+    """        services[iid] = {
+            "plugin_id": plugin_id,
+            "lookback": lookback,
+            "params": params,
+            "version": getattr(plugin, "version", "0.0.0") or "0.0.0",
+            # Runde 13b (Bugfix Dropdown-NoData): instance_hash mit
+            # persistieren, damit NEUE Set-Instanzen von Anfang an die
+            # Varianten-Einschraenkung erfuellen (vorher fehlte der Hash
+            # beim regularen Hinzufuegen - der MasterTree berechnet ihn fuer
+            # Alt-Bestand on-the-fly, neue Instanzen tragen ihn direkt).
+            "instance_hash": generate_instance_hash(plugin_id, params),
+        }
+        order.append(iid)""",
+    "service_win _add_service_to_set instance_hash",
+)
+
+# ---------------------------------------------------------------------------
+# 4) service_selector_dialog.py: Add-Pfad persistiert instance_hash
+# ---------------------------------------------------------------------------
+P4 = "serviceui/service_selector_dialog.py"
+patch(
+    P4,
+    """from analytics.engine.description_dialog import ServiceDescriptionDialog
+""",
+    """from analytics.engine.description_dialog import ServiceDescriptionDialog
+from analytics.engine.service_models import generate_instance_hash
+""",
+    "Dialog Import generate_instance_hash",
+)
+patch(
+    P4,
+    """        services[iid] = {
+            "plugin_id": plugin_id,
+            "lookback": lookback,
+            "params": params,
+            "version": getattr(plugin, "version", "0.0.0") or "0.0.0",
+        }
+        order.append(iid)""",
+    """        services[iid] = {
+            "plugin_id": plugin_id,
+            "lookback": lookback,
+            "params": params,
+            "version": getattr(plugin, "version", "0.0.0") or "0.0.0",
+            # Runde 13b (Bugfix Dropdown-NoData): instance_hash mit
+            # persistieren (analog service_win._add_service_to_set).
+            "instance_hash": generate_instance_hash(plugin_id, params),
+        }
+        order.append(iid)""",
+    "Dialog Add-Pfad instance_hash",
+)
+
+print("ALL OK")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_apply_r13b_dialog.py
+```py
+# test/_apply_r13b_dialog.py
+"""Wendet die 2 noch fehlenden Dialog-Patches (Runde 13b) an."""
+import sys
+
+sys.stdout.reconfigure(encoding="utf-8")
+
+
+def patch(path: str, old: str, new: str, label: str) -> None:
+    raw = open(path, "rb").read()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        bom = True
+        raw = raw[3:]
+    else:
+        bom = False
+    text = raw.decode("utf-8")
+    nl = "\r\n" if text.count("\r\n") > text.count("\n") // 2 else "\n"
+    o = old.replace("\n", nl)
+    n = new.replace("\n", nl)
+    cnt = text.count(o)
+    if cnt != 1:
+        print(f"FAIL {label}: {cnt} Treffer (erwartet 1) in {path}")
+        sys.exit(1)
+    text = text.replace(o, n)
+    data = text.encode("utf-8")
+    if bom:
+        data = b"\xef\xbb\xbf" + data
+    open(path, "wb").write(data)
+    print(f"OK   {label}")
+
+
+P4 = "serviceui/service_selector_dialog.py"
+patch(
+    P4,
+    """from analytics.engine.description_dialog import ServiceDescriptionDialog
+""",
+    """from analytics.engine.description_dialog import ServiceDescriptionDialog
+from analytics.engine.service_models import generate_instance_hash
+""",
+    "Dialog Import generate_instance_hash",
+)
+patch(
+    P4,
+    """        services[iid] = {
+            "plugin_id": plugin_id,
+            "lookback": lookback,
+            "params": params,
+            "version": getattr(plugin, "version", "0.0.0") or "0.0.0",
+        }
+        order.append(iid)""",
+    """        services[iid] = {
+            "plugin_id": plugin_id,
+            "lookback": lookback,
+            "params": params,
+            "version": getattr(plugin, "version", "0.0.0") or "0.0.0",
+            # Runde 13b (Bugfix Dropdown-NoData): instance_hash mit
+            # persistieren (analog service_win._add_service_to_set).
+            "instance_hash": generate_instance_hash(plugin_id, params),
+        }
+        order.append(iid)""",
+    "Dialog Add-Pfad instance_hash",
+)
+print("ALL OK")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_check_r13b_state.py
+```py
+# test/_check_r13b_state.py
+"""Prueft den Ist-Zustand der Runde-13b-Aenderungen (fuer _apply_r13b)."""
+import sys
+
+sys.stdout.reconfigure(encoding="utf-8")
+
+checks = [
+    ("master_tree svc_hash on-the-fly",
+     "serviceui/master_tree.py",
+     'svc_hash = str(svc.get("instance_hash") or "")',
+     "generate_instance_hash"),
+    ("master_tree 4er-Key svc_hash",
+     "serviceui/master_tree.py",
+     'str(svc.get("instance_id") or ""),\n                       svc_hash)',
+     None),
+    ("VM Hash-Filter",
+     "analytics/engine/analytics_view_model.py",
+     'h_s = str(c.get("instance_hash") or "").strip().lower()',
+     "if active_hashes and h_s not in active_hashes:"),
+    ("service_win Hash persistiert",
+     "serviceui/service_win.py",
+     '"instance_hash": generate_instance_hash(plugin_id, params)',
+     None),
+    ("Dialog Import",
+     "serviceui/service_selector_dialog.py",
+     "from analytics.engine.service_models import generate_instance_hash",
+     None),
+    ("Dialog Hash persistiert",
+     "serviceui/service_selector_dialog.py",
+     '"instance_hash": generate_instance_hash(plugin_id, params)',
+     None),
+]
+
+for name, path, needle, second in checks:
+    s = open(path, encoding="utf-8").read()
+    ok = needle in s and (second is None or second in s)
+    print(("OK   " if ok else "MISS "), name)
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/_fix_ws1.py
 ```py
 """Temporärer Helfer (wird nach Ausführung gelöscht): Root-Cause-Fix für das
@@ -41221,6 +42498,52 @@ for p in sorted(pathlib.Path(".").rglob("*.py")):
         continue
     if any(k in txt for k in ("FeatureStoreReader", "feature_store")):
         print(p)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_verify_mastertree.py
+```py
+# test/_verify_mastertree.py
+"""Verifiziert die Runde-13-Ersetzungen in master_tree.py."""
+from pathlib import Path
+
+c = Path(r"F:\Python\PyTrader\serviceui\master_tree.py").read_text(
+    encoding="utf-8", newline="")
+
+checks = [
+    # Runde 13b: Der 4er-Key in _build_set_item nutzt jetzt `svc_hash`
+    # (on-the-fly berechnet, wenn die Set-Definition keinen Hash hat).
+    ("E1 build_set_item 4er-Key",
+     "svc_item.setData(0, ROLE_INSTANCE_HASH, svc_hash)" in c
+     and "svc_hash)\n" in c.replace("\r\n", "\n")),
+    ("E1b build_set_item on-the-fly-Hash",
+     'svc_hash = str(svc.get("instance_hash") or "")' in c
+     and "svc_hash = generate_instance_hash(" in c),
+    ("E2 handler 4er-Key",
+     'str(item.data(0, ROLE_INSTANCE_HASH) or ""))' in c),
+    ("E3 set-branch 4er-Key",
+     'str(child.data(0, ROLE_INSTANCE_HASH) or ""))' in c),
+    ("E5 checked_services generic unpack",
+     "for entry in sorted(self._checked_items):" in c),
+    ("E5 instance_hash in result",
+     '"instance_hash": instance_hash' in c),
+    ("E6 checked_instance_hashes all",
+     'h = entry.get("instance_hash") or ""' in c),
+    ("E7 hash_restriction service",
+     "and instance_hash.strip().lower()" in c),
+    ("E7 4er add service",
+     "self._checked_items.add((TYPE_SERVICE, set_id," in c),
+    ("E4 sync_checked 4er",
+     "str(item.data(0, ROLE_INSTANCE_HASH) or \"\")))" in c),
+]
+fails = 0
+for name, ok in checks:
+    print(("OK  " if ok else "FAIL"), name)
+    if not ok:
+        fails += 1
+print("RESULT:", "ALL OK" if fails == 0 else f"{fails} FAILURES")
 
 ```
 
@@ -47018,6 +48341,10 @@ Verifikation Bugfix Runde 10 (10.08.2026) - Bug 1-5:
          gerendert (Cache-Rebuild-Pfad).
   Bug 4: Restore-Reihenfolge: params_restored (UI-Combos) VOR refresh_all()
          in _apply_profile UND restore_workspace.
+         Runde 11 (A1): refresh_all() wurde aus den Restore-Pfaden KOMPLETT
+         entfernt - das AnalyticsWindow orchestriert die Queries zentral
+         (A6). Der Test prueft daher: params_restored wird emittiert, aber
+         refresh_all() wird NICHT mehr aufgerufen (order == ["restored"]).
   Bug 5: Geometrie-Restore prueft gegen ALLE Screens (2. Monitor) statt
          nur primaryScreen - Position auf Monitor 2 bleibt erhalten.
 
@@ -47456,7 +48783,10 @@ check("B2) Variante ohne Hash + pid ohne Daten -> No-Data",
       str(no_data4))
 
 # ---------------------------------------------------------------------------
-# Bug 4: Restore-Reihenfolge - params_restored VOR refresh_all
+# Bug 4: Restore - params_restored wird emittiert, KEIN refresh_all mehr
+# (Runde 10: Reihenfolge restored->refresh; Runde 11 A1: refresh entfaellt
+# komplett - das AnalyticsWindow orchestriert die Queries zentral via
+# _request_current_page_data, nicht der ViewModel).
 # ---------------------------------------------------------------------------
 def _order_test(apply_fn):
     order = []
@@ -47485,11 +48815,11 @@ def _restore_ws(v):
 
 
 order_p = _order_test(_apply_profile)
-check("B4) _apply_profile: params_restored VOR refresh_all",
-      order_p == ["restored", "refresh"], str(order_p))
+check("B4) _apply_profile: params_restored ohne refresh_all (A1)",
+      order_p == ["restored"], str(order_p))
 order_w = _order_test(_restore_ws)
-check("B4) restore_workspace: params_restored VOR refresh_all",
-      order_w == ["restored", "refresh"], str(order_w))
+check("B4) restore_workspace: params_restored ohne refresh_all (A1)",
+      order_w == ["restored"], str(order_w))
 
 # ---------------------------------------------------------------------------
 # Bug 5: Geometrie-Restore gegen ALLE Screens (2. Monitor)
@@ -47600,6 +48930,1258 @@ sys.exit(1 if fails else 0)
 
 --------------------------------------------------
 
+### DATEI: test/check_round11.py
+```py
+# test/check_round11.py
+# -*- coding: utf-8 -*-
+"""
+Verifikation Runde 11 (10.08.2026) - Bug 3 + Bug 4 + Architektur A1-A6:
+
+  Bug 3 (Persistenz/Aliasing):
+    B3-1: instance_hashes werden im Profil-Payload persistiert
+          (sources.instance_hashes).
+    B3-2: Replace-Semantik beim Restore - Payload OHNE instance_hashes
+          -> garantiert [] (nicht der alte Wert), gemeinsamer Helper
+          _restore_params_from_payload (Profil + Workspace).
+    B3-3: _save_workspace kopiert die VM-Params (kein Aliasing).
+
+  Bug 4 (No-Data in den Worker):
+    B4-1: Kein synchroner resolve_no_data_variants()-Aufruf mehr im
+          UI-Hauptthread; QUERY_FEATURES liefert no_data_variants als
+          Payload-Attribut (VM-Snapshot -> Worker -> Repo -> Reader).
+    B4-2: Payload-Vertrag: no_data_variants IMMER vorhanden; UI
+          unterscheidet loading/success+[]/success+[x]/error.
+    B4-3: Generation-Guard (Stale-Payloads werden verworfen).
+    B4-5: UI filtert die No-Data-Liste nach aktiven instance_hashes;
+          gewaehlte Variante bleibt zusaetzlich sichtbar.
+
+  Architektur:
+    A1: refresh_all() nicht mehr in _apply_profile/restore_workspace.
+    A2: params_restored loest selbst keine Query aus (Window orchestriert).
+    A3: Zentraler _sync_all_pages_from_params; keine direkte
+        params_restored-Verbindung des HeatmapWidgets mehr.
+    A5: _sync_combos_from_payload schreibt x/y/agg-Combos nicht mehr.
+    A6: _on_page_changed mit Query-Key-Pruefung (kein redundanter Re-Query).
+
+KEINE GUI-Ausfuehrung (offscreen). Temp-DBs strikt in test/.
+"""
+import os
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import (  # noqa: E402
+    QApplication, QStackedWidget, QWidget, QListWidget,
+)
+from PySide6.QtCore import QObject, Signal  # noqa: E402
+
+app = QApplication.instance() or QApplication([])
+
+from analytics.engine.analytics_view_model import AnalyticsViewModel  # noqa: E402
+from analytics.engine.analytics_worker import (  # noqa: E402
+    QUERY_FEATURES, AnalyticsAsyncWorker,
+)
+from analytics.engine.analytics_repository import AnalyticsRepository  # noqa: E402
+from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
+from analytics.ui.heatmap_widget import HeatmapWidget  # noqa: E402
+from analytics.ui.analytics_win import AnalyticsWindow, _params_signature  # noqa: E402
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+# =========================================================================
+# TEIL A - Bug 3 (Persistenz / Aliasing)
+# =========================================================================
+vm = AnalyticsViewModel(AnalyticsRepository())
+vm._params["symbol"] = "SILVER"
+vm._params["timeframe"] = "M1"
+vm._params["instance_hashes"] = ["h1", "h2"]
+
+payload = vm._current_payload()
+check("B3-1) Profil-Payload enthaelt sources.instance_hashes",
+      isinstance((payload.get("sources") or {}).get("instance_hashes"), list)
+      and payload["sources"]["instance_hashes"] == ["h1", "h2"],
+      str((payload.get("sources") or {}).get("instance_hashes")))
+
+# Roundtrip: Payload -> _apply_profile -> gleiche Hashes
+vm2 = AnalyticsViewModel(AnalyticsRepository())
+vm2._params["symbol"] = "SILVER"
+vm2._params["timeframe"] = "M1"
+vm2._params["instance_hashes"] = ["h_alt"]
+vm2._apply_profile({"payload": payload}, mark_dirty=False)
+check("B3-2) Profil-Roundtrip stellt instance_hashes wieder her",
+      vm2.params.get("instance_hashes") == ["h1", "h2"],
+      str(vm2.params.get("instance_hashes")))
+
+# Alt-Payload OHNE instance_hashes -> garantiert [] (nicht Alt-Wert)
+vm3 = AnalyticsViewModel(AnalyticsRepository())
+vm3._params["symbol"] = "SILVER"
+vm3._params["timeframe"] = "M1"
+vm3._params["instance_hashes"] = ["h_alt"]
+old_payload = vm3._current_payload()
+del old_payload["sources"]["instance_hashes"]
+vm3._apply_profile({"payload": old_payload}, mark_dirty=False)
+check("B3-2) Profil-Restore ohne instance_hashes -> [] (Replace-Semantik)",
+      vm3.params.get("instance_hashes") == [],
+      str(vm3.params.get("instance_hashes")))
+
+# Workspace-Restore OHNE instance_hashes -> garantiert []
+vm4 = AnalyticsViewModel(AnalyticsRepository())
+vm4._params["symbol"] = "SILVER"
+vm4._params["timeframe"] = "M1"
+vm4._params["instance_hashes"] = ["h_alt"]
+vm4.restore_workspace({
+    "layout": {},
+    "params": {"symbol": "GOLD", "timeframe": "M5", "feature_ids": []},
+})
+check("B3-2) Workspace-Restore ohne instance_hashes -> [] (Replace-Semantik)",
+      vm4.params.get("instance_hashes") == []
+      and vm4.params.get("symbol") == "GOLD",
+      str(vm4.params.get("instance_hashes")))
+
+# Gemeinsamer Helper: beide Restore-Pfade rufen _restore_params_from_payload
+vm_src = open("analytics/engine/analytics_view_model.py", encoding="utf-8").read()
+check("B3-2) Gemeinsamer Helper in _apply_profile",
+      "self._restore_params_from_payload(flat)" in vm_src)
+check("B3-2) Gemeinsamer Helper in restore_workspace",
+      "self._restore_params_from_payload(params)" in vm_src)
+
+# B3-3: _save_workspace kopiert statt Referenz
+win_src = open("analytics/ui/analytics_win.py", encoding="utf-8").read()
+check("B3-3) _save_workspace nutzt _snapshot_params (kein Aliasing)",
+      "_snapshot_params(self._vm.params)" in win_src)
+snapshot = AnalyticsWindow._snapshot_params(
+    {"feature_ids": ["srv_a"], "zoom_x_range": [0.0, 1.0],
+     "table_column_widths": {"col": 120}, "symbol": "SILVER"})
+snapshot["feature_ids"].append("srv_b")
+snapshot["zoom_x_range"][0] = 0.5
+snapshot["table_column_widths"]["col"] = 99
+check("B3-3) _snapshot_params liefert unabhaengige Kopie",
+      snapshot["feature_ids"] == ["srv_a", "srv_b"]
+      and snapshot["zoom_x_range"] == [0.5, 1.0],
+      str(snapshot))
+
+# =========================================================================
+# TEIL B - Bug 4 (No-Data in den Worker)
+# =========================================================================
+
+# B4-1: statischer Check - kein synchroner resolve_no_data_variants in der UI
+hw_src = open("analytics/ui/heatmap_widget.py", encoding="utf-8").read()
+check("B4-1) Kein resolve_no_data_variants-Aufruf mehr in heatmap_widget.py",
+      "resolve_no_data_variants" not in hw_src,
+      "synchroner DB-Zugriff im UI-Hauptthread entfernt")
+
+# B4-1: VM liefert presets_data fuer QUERY_FEATURES
+vm5 = AnalyticsViewModel(AnalyticsRepository())
+vm5._params["symbol"] = "SILVER"
+vm5._params["timeframe"] = "M1"
+qparams = vm5._current_params(QUERY_FEATURES)
+snap = qparams.get("presets_data") or {}
+check("B4-1) QUERY_FEATURES-Params enthalten presets_data-Snapshot",
+      set(snap.keys()) >= {"presets", "sets", "display_names"},
+      str(sorted(snap.keys())))
+
+# B4-1: Worker reicht presets_data an das Repo
+class _CapturingRepo:
+    def __init__(self):
+        self.captured = None
+
+    def get_available_features(self, symbol, timeframe, presets_data=None):
+        self.captured = presets_data
+        return {"feature_ids": [], "columns": [], "total_rows": 0,
+                "no_data_variants": [], "no_data_variants_error": False}
+
+
+crepo = _CapturingRepo()
+wkr = AnalyticsAsyncWorker(
+    crepo, QUERY_FEATURES,
+    {"symbol": "SILVER", "timeframe": "M1",
+     "presets_data": {"presets": {"srv_a": []}, "sets": [], "display_names": {}}})
+wkr._execute()
+check("B4-1) Worker reicht presets_data an das Repo",
+      crepo.captured == {"presets": {"srv_a": []}, "sets": [], "display_names": {}},
+      str(crepo.captured))
+
+
+# B4-1/B4-2: Reader resolve_no_data_variants (Fake-DB)
+class _FakeReader(FeatureStoreReader):
+    def __init__(self, hashes=(), keys=None, fail=False):
+        super().__init__(os.path.join(os.path.dirname(__file__), "dummy.duckdb"))
+        self._hashes = {str(h) for h in hashes}
+        self._keys = dict(keys or {})
+        self._fail = fail
+
+    def available_instance_hashes(self, symbol, timeframe):
+        return set(self._hashes)
+
+    def feature_keys_by_service(self, symbol, timeframe, **kw):
+        return dict(self._keys)
+
+    def get_available_features(self, symbol, timeframe):
+        return {"feature_ids": ["srv_a"], "columns": ["price"],
+                "total_rows": 10}
+
+    def resolve_no_data_variants(self, symbol, timeframe, presets_data=None):
+        if self._fail:
+            raise RuntimeError("db kaputt")
+        return super().resolve_no_data_variants(
+            symbol, timeframe, presets_data)
+
+
+presets_data = {
+    "presets": {
+        "srv_a": [
+            {"preset_name": "Default", "instance_hash": "h_a1",
+             "is_archived": False},
+            {"preset_name": "Variante 2", "instance_hash": "h_a2",
+             "is_archived": False},
+            {"preset_name": "Alt-Archiv", "instance_hash": "h_arch",
+             "is_archived": True},
+            {"preset_name": "Ohne Hash", "instance_hash": "",
+             "is_archived": False},
+        ]
+    },
+    "sets": [
+        {"services": {"inst1": {"plugin_id": "srv_b", "is_archived": False,
+                                "params": {"p": 1}}}},
+    ],
+    "display_names": {
+        "srv_a|Default": "A (Default)",
+        "srv_a|Variante 2": "A (Variante 2)",
+        "srv_a|Ohne Hash": "A (Ohne Hash)",
+        "srv_b|srv_b [inst1]": "B (srv_b [inst1])",
+    },
+}
+
+# h_a1 + srv_a haben Daten -> h_a2 ist 'No Data' (Hash fehlt im Datensatz);
+# archiviert entfaellt; 'Ohne Hash' hat Daten (pid in keys); srv_b
+# (Set-Instanz) generiert einen Hash, der nicht in available liegt -> 'No Data'
+reader = _FakeReader(hashes=["h_a1"], keys={"srv_a": ["price"]})
+variants = reader.resolve_no_data_variants("SILVER", "M1", presets_data)
+hashes_out = [v.get("instance_hash") for v in variants]
+check("B4-1) Reader: h_a2 (kein Hash-Datensatz) als No Data gelistet",
+      "h_a2" in hashes_out, str(hashes_out))
+check("B4-1) Reader: display_name aus Snapshot uebernommen",
+      any(v.get("display_name") == "A (Variante 2)" for v in variants),
+      str([v.get("display_name") for v in variants]))
+check("B4-1) Reader: archivierte Presets unsichtbar",
+      all(v.get("instance_hash") != "h_arch" for v in variants))
+# Ohne Hash + pid hat Daten -> NICHT als No Data (Runde-10-Logik)
+check("B4-1) Reader: Variante ohne Hash mit pid-Daten nicht gelistet",
+      all(v.get("instance_hash") != "" for v in variants))
+# Set-Instanz: generierter Hash (srv_b-Params) liegt nicht in available
+set_variants = [v for v in variants
+                if str(v.get("preset_name", "")).startswith("srv_b")]
+check("B4-1) Reader: Set-Instanz ohne Hash-Datensatz als No Data gelistet",
+      len(set_variants) == 1
+      and set_variants[0].get("display_name") == "B (srv_b [inst1])",
+      str([v.get("display_name") for v in variants]))
+
+# B4-2: Repo-Payload-Vertrag - no_data_variants IMMER vorhanden
+repo = AnalyticsRepository(reader=_FakeReader(hashes=["h_a1"]))
+res = repo.get_available_features("SILVER", "M1", presets_data)
+check("B4-2) Repo-Payload enthaelt no_data_variants (Vertrag)",
+      isinstance(res.get("no_data_variants"), list)
+      and res.get("no_data_variants_error") is False,
+      str(res.get("no_data_variants")))
+
+# B4-2: Repo-Fehler -> leere Liste + error-Flag
+repo_err = AnalyticsRepository(reader=_FakeReader(fail=True))
+res_err = repo_err.get_available_features("SILVER", "M1", presets_data)
+check("B4-2) Repo-Fehler -> no_data_variants=[] + error=True",
+      res_err.get("no_data_variants") == []
+      and res_err.get("no_data_variants_error") is True,
+      str(res_err.get("no_data_variants_error")))
+
+
+# -------------------------------------------------------------------------
+# Widget-Tests (offscreen)
+# -------------------------------------------------------------------------
+class _MockVM(QObject):
+    data_ready = Signal(str, dict)
+    feature_ids_changed = Signal()
+    query_failed = Signal(str, str)
+
+    def __init__(self, params=None, gen=0):
+        super().__init__()
+        self._params = dict(params or {
+            "symbol": "SILVER", "timeframe": "M1",
+            "feature_ids": [], "instance_hashes": [],
+            "heatmap_x_dim": "date", "heatmap_y_dim": "hour",
+            "heatmap_agg": "confluence_count", "heatmap_field": "",
+            "candle_projection_enabled": False,
+            "zoom_x_range": [0.0, 1.0], "zoom_y_range": [0.0, 1.0],
+        })
+        self._gen = gen
+
+    @property
+    def params(self):
+        return dict(self._params)
+
+    @property
+    def restore_generation(self):
+        return self._gen
+
+
+def _combo_disabled_texts(widget):
+    """Alle Item-Texte des Feld-Dropdowns (auch disabled/Header)."""
+    out = []
+    model = widget._combo_field.model()
+    for i in range(model.rowCount()):
+        item = model.item(i)
+        if item is not None:
+            out.append(str(item.text() or ""))
+    return out
+
+
+mock = _MockVM(gen=3)
+w = HeatmapWidget()
+w.attach_view_model(mock)
+
+# B4-2: Loading-Zustand (noch kein Payload)
+check("B4-2) Widget-Loading: _no_data_variants ist None (kein Hinweis)",
+      w._no_data_variants is None and w._no_data_variants_error is False)
+
+# B4-3: Stale-Payload wird verworfen (aeltere Generation)
+w._on_features_ready({
+    "no_data_variants": [{"plugin_id": "srv_x", "preset_name": "V1",
+                          "instance_hash": "hx", "display_name": "X (V1)"}],
+    "no_data_variants_error": False,
+    "restore_generation": 1,  # aelter als mock._gen=3
+})
+check("B4-3) Stale-Payload (Generation 1 < 3) wird verworfen",
+      w._no_data_variants is None,
+      str(w._no_data_variants))
+
+# B4-2/B4-3: frischer Payload -> Cache + No-Data-Items im Dropdown
+w._on_features_ready({
+    "no_data_variants": [
+        {"plugin_id": "srv_x", "preset_name": "V1",
+         "instance_hash": "hx", "display_name": "X (V1)"},
+        {"plugin_id": "srv_y", "preset_name": "Default",
+         "instance_hash": "hy", "display_name": "Y (Default)"},
+    ],
+    "no_data_variants_error": False,
+    "restore_generation": 3,
+})
+texts = _combo_disabled_texts(w)
+check("B4-2) Frischer Payload: Cache uebernommen (2 Varianten)",
+      len(w._no_data_variants) == 2 and not w._no_data_variants_error)
+check("B4-2) Frischer Payload: (No Data)-Items im Dropdown",
+      any("(No Data)" in t for t in texts), str(texts[-4:]))
+
+# B4-5: Filter nach aktiven instance_hashes (nur hy sichtbar).
+# Voll-Rebuild (clear + re-render) - der reale Aufrufpfad von
+# _rebuild_field_dropdown; _render_no_data_items haengt nur an.
+mock._params["instance_hashes"] = ["hy"]
+w._syncing = True
+try:
+    w._rebuild_field_dropdown([], {})
+finally:
+    w._syncing = False
+texts2 = _combo_disabled_texts(w)
+hy_visible = any("Y (Default)" in t and "(No Data)" in t for t in texts2)
+hx_hidden = not any("X (V1)" in t for t in texts2)
+check("B4-5) Aktive instance_hashes filtert die No-Data-Liste",
+      hy_visible and hx_hidden, str(texts2[-5:]))
+mock._params["instance_hashes"] = []
+
+# B4-2: Fehler-Zustand -> Warn-Item
+w_err = HeatmapWidget()
+w_err.attach_view_model(_MockVM(gen=0))
+w_err._on_query_failed("features", "boom")
+w_err._syncing = True
+try:
+    w_err._render_no_data_items()
+finally:
+    w_err._syncing = False
+err_texts = _combo_disabled_texts(w_err)
+check("B4-2) Fehlerzustand zeigt 'Pruefung fehlgeschlagen'-Hinweis",
+      w_err._no_data_variants_error and any(
+          "Prüfung konnte nicht durchgeführt" in t for t in err_texts),
+      str(err_texts[-3:]))
+
+# B4-2: Erfolg ohne Varianten -> kein Abschnitt
+w_ok = HeatmapWidget()
+w_ok.attach_view_model(_MockVM(gen=0))
+w_ok._on_features_ready({"no_data_variants": [],
+                         "no_data_variants_error": False,
+                         "restore_generation": 0})
+w_ok._syncing = True
+try:
+    w_ok._render_no_data_items()
+finally:
+    w_ok._syncing = False
+ok_texts = _combo_disabled_texts(w_ok)
+check("B4-2) Erfolg ohne Varianten -> kein (No Data)-Abschnitt",
+      w_ok._no_data_variants == []
+      and not any("(No Data)" in t for t in ok_texts))
+
+# =========================================================================
+# TEIL C - Architektur (A1-A6)
+# =========================================================================
+
+# A1: kein refresh_all() in den Restore-Pfaden (VM)
+vm_src2 = open("analytics/engine/analytics_view_model.py", encoding="utf-8").read()
+check("A1) Kein self.refresh_all() mehr im ViewModel",
+      "self.refresh_all()" not in vm_src2)
+
+# A3: HeatmapWidget verbindet params_restored nicht mehr
+check("A3) Keine params_restored-Verbindung im HeatmapWidget",
+      "params_restored.connect" not in hw_src)
+
+# A5: _sync_combos_from_payload schreibt x/y/agg-Combos nicht mehr
+m = hw_src.index("def _sync_combos_from_payload")
+end = hw_src.index("def _render_overlay", m)
+body = hw_src[m:end]
+check("A5) Payload ueberschreibt x/y/agg-Combos nicht mehr",
+      "_set_combo_data(self._combo_x" not in body
+      and "_set_combo_data(self._combo_y" not in body
+      and "_set_combo_data(self._combo_agg" not in body)
+
+# A3/A6: Window-Handler + Methoden vorhanden
+check("A3) Window: _sync_all_pages_from_params + _request_current_page_data",
+      "_sync_all_pages_from_params()" in win_src
+      and "_request_current_page_data()" in win_src)
+check("A6) Window: _on_page_changed enthaelt Query-Key-Pruefung",
+      "_params_signature(self._vm.params)" in win_src)
+
+# A6: _params_signature deterministisch (Key-Reihenfolge egal, gleiche Werte)
+s1 = _params_signature({"a": [1, 2], "b": {"x": 1}, "c": "z"})
+s2 = _params_signature({"c": "z", "b": {"x": 1}, "a": [1, 2]})
+check("A6) _params_signature deterministisch (Key-Reihenfolge egal)",
+      s1 == s2)
+
+
+# A3: _sync_all_pages_from_params ruft generic-Sync genau einmal
+class _P:
+    def __init__(self):
+        self.sync_calls = 0
+
+    def _sync_from_params(self):
+        self.sync_calls += 1
+
+
+class _HP:
+    def __init__(self):
+        self._generic = _P()
+
+
+win2 = AnalyticsWindow.__new__(AnalyticsWindow)
+win2.table_page = _P()
+win2.heatmap_page = _HP()
+win2.scatter_page = _P()
+win2.distribution_page = _P()
+win2.equity_page = _P()
+win2._sync_all_pages_from_params()
+check("A3) Zentraler Seiten-Sync: generic._sync_from_params genau 1x",
+      win2.heatmap_page._generic.sync_calls == 1,
+      str(win2.heatmap_page._generic.sync_calls))
+
+
+# A6: _on_page_changed - Query-Key-Pruefung verhindert redundante Queries
+class _PageVM(QObject):
+    def __init__(self, gen):
+        super().__init__()
+        self._gen = gen
+
+    @property
+    def restore_generation(self):
+        return self._gen
+
+    @property
+    def params(self):
+        return {"symbol": "SILVER", "timeframe": "M1", "feature_ids": []}
+
+
+class _ReqPage(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def request_data(self):
+        self.calls += 1
+
+
+win3 = AnalyticsWindow.__new__(AnalyticsWindow)
+win3._vm = _PageVM(gen=1)
+win3.pages_stack = QStackedWidget()
+page_obj = _ReqPage()
+win3.pages_stack.addWidget(page_obj)
+win3.sidebar = QListWidget()
+win3.sidebar.addItem("Tabelle")
+win3.sidebar.setCurrentRow(0)
+win3._last_request_key = None
+
+win3._on_page_changed(0)
+calls_1 = page_obj.calls
+win3._on_page_changed(0)  # gleiche Seite + Gen + Params -> kein Re-Query
+check("A6) Query-Key-Pruefung: identischer Key -> kein Re-Query",
+      calls_1 == 1 and page_obj.calls == 1,
+      f"calls={page_obj.calls}")
+
+win3._vm._gen = 2  # Restore hat die Generation erhoeht
+win3._on_page_changed(0)
+check("A6) Restore (neue Generation) -> frischer Query",
+      page_obj.calls == 2, f"calls={page_obj.calls}")
+
+# A2: params_restored loest selbst keine Query aus (kein refresh_all im VM)
+check("A2) Restore-Pfade emittieren params_restored OHNE refresh_all",
+      "params_restored.emit()" in vm_src2 and "self.refresh_all()" not in vm_src2)
+
+# -------------------------------------------------------------------------
+print()
+total = len(PASS)
+failed = [p for p in PASS if not p[1]]
+print(f"Runde 11: {total - len(failed)}/{total} Checks bestanden")
+if failed:
+    for name, _ok, info in failed:
+        print("  FAIL:", name, "|", info)
+    sys.exit(1)
+print("ALL PASS")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_round12.py
+```py
+# test/check_round12.py
+# -*- coding: utf-8 -*-
+"""
+Verifikation Runde 12 (10.08.2026) - Option A + Punkte 3/4,
+aktualisiert auf Runde 13 (Bugfix Dropdown-NoData, 10.08.2026):
+
+  Option A (Issue 1): No-Data-Auswertung im QUERY_HEATMAP_GENERIC-Worker
+    (Payload liefert no_data_variants im selben Datenfluss wie die Grafik;
+    KEIN separater QUERY_FEATURES-Roundtrip mehr im Widget). Zusaetzlich
+    wird die teure feature_keys_by_service-Abfrage der No-Data-Pruefung
+    auf die AKTIVEN plugin_ids eingeschraenkt (Performance).
+
+  Runde 13 (Bugfix Dropdown-NoData): Der Reader filtert den Payload
+    VARIANTEN-GENAU nach `active_hashes` (nur die im ServicePicker
+    gecheckten Varianten; Bug 2) - das Widget nimmt die (einzige)
+    Variante des aktuellen Feld-Services OHNE 'erste Variante'-Fallback
+    (Bug 1). `active_hashes` stammt aus dem VM-Snapshot
+    (instance_hashes, jetzt auch fuer Set-Instanz-Varianten befuellt).
+
+  Punkt 3 (Issue 3): _selected_no_data_variant markiert die GEWAEHLTE
+    Variante (gecheckter instance_hash) statt immer der ersten.
+
+  Punkt 4 (Issue 4): Nur gecheckte Services/Varianten werden als
+    '(No Data)' angezeigt (Snapshot + Reader + Widget filter).
+
+KEINE GUI-Ausfuehrung (offscreen). Temp-DBs strikt in test/.
+"""
+import os
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import (  # noqa: E402
+    QApplication, QWidget, QStackedWidget, QListWidget,
+)
+from PySide6.QtCore import QObject, Signal  # noqa: E402
+
+app = QApplication.instance() or QApplication([])
+
+from analytics.engine.analytics_view_model import AnalyticsViewModel  # noqa: E402
+from analytics.engine.analytics_worker import (  # noqa: E402
+    QUERY_HEATMAP_GENERIC, QUERY_FEATURES, AnalyticsAsyncWorker,
+)
+from analytics.engine.analytics_repository import AnalyticsRepository  # noqa: E402
+from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
+from analytics.ui.heatmap_widget import HeatmapWidget  # noqa: E402
+from analytics.ui.analytics_win import AnalyticsWindow  # noqa: E402
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+# =========================================================================
+# TEIL A - Option A (No-Data im QUERY_HEATMAP_GENERIC-Worker)
+# =========================================================================
+
+# A1: VM - QUERY_HEATMAP_GENERIC-Params enthalten presets_data-Snapshot
+vm = AnalyticsViewModel(AnalyticsRepository())
+vm._params["symbol"] = "SILVER"
+vm._params["timeframe"] = "M1"
+qparams = vm._current_params(QUERY_HEATMAP_GENERIC)
+snap = qparams.get("presets_data") or {}
+check("A1) QUERY_HEATMAP_GENERIC-Params enthalten presets_data-Snapshot",
+      set(snap.keys()) >= {"presets", "sets", "display_names"},
+      str(sorted(snap.keys())))
+
+# A2: Worker reicht presets_data an get_generic_heatmap durch
+class _CapturingRepo:
+    def __init__(self):
+        self.captured = None
+        self.calls = []
+
+    def get_generic_heatmap(self, *a, **kw):
+        self.captured = kw.get("presets_data")
+        self.calls.append(kw)
+        return {"matrix": [], "x_dim": "date", "y_dim": "hour",
+                "agg": "count", "field": "", "no_data_variants": [],
+                "no_data_variants_error": False}
+
+
+crepo = _CapturingRepo()
+wkr = AnalyticsAsyncWorker(
+    crepo, QUERY_HEATMAP_GENERIC,
+    {"symbol": "SILVER", "timeframe": "M1",
+     "x_dim": "date", "y_dim": "hour", "agg": "count", "field": None,
+     "presets_data": {"presets": {"srv_a": []}, "sets": [],
+                      "display_names": {}}})
+wkr._execute()
+check("A2) Worker reicht presets_data an get_generic_heatmap durch",
+      crepo.captured == {"presets": {"srv_a": []}, "sets": [],
+                         "display_names": {}},
+      str(crepo.captured))
+# Ohne presets_data -> None (kein Crash)
+crepo2 = _CapturingRepo()
+wkr2 = AnalyticsAsyncWorker(
+    crepo2, QUERY_HEATMAP_GENERIC,
+    {"symbol": "SILVER", "timeframe": "M1",
+     "x_dim": "date", "y_dim": "hour", "agg": "count", "field": None})
+wkr2._execute()
+check("A2) Worker ohne presets_data -> None (defensiv)",
+      crepo2.captured is None, str(crepo2.captured))
+
+
+# A3: Repo - get_generic_heatmap liefert no_data_variants im Payload
+class _FakeReaderR(FeatureStoreReader):
+    """Reader-Mock mit echten DB-Methoden (available/keys gemockt).
+
+    resolve_no_data_variants delegiert an den echten Super-Pfad (der die
+    gemockten available_instance_hashes/feature_keys_by_service nutzt) -
+    nur mit resolve_fail=True wird er direkt zum Werfen gezwungen (fuer den
+    Repo-Fehlerfall, da der Reader sonst alle DB-Fehler selbst abfaengt).
+    """
+
+    def __init__(self, available_hashes=(), resolve_fail=False):
+        super().__init__(os.path.join(os.path.dirname(__file__), "dummy.duckdb"))
+        self._available = {str(h) for h in available_hashes}
+        self._resolve_fail = resolve_fail
+        self.keys_called_with = None
+
+    def available_feature_keys(self, *a, **kw):
+        return ["price"]
+
+    def available_instance_hashes(self, symbol, timeframe):
+        return set(self._available)
+
+    def feature_keys_by_service(self, symbol, timeframe, **kw):
+        self.keys_called_with = kw.get("feature_ids")
+        return {"srv_a": ["price"]}
+
+    def fetch_generic_heatmap(self, *a, **kw):
+        return {"matrix": [], "x_dim": "date", "y_dim": "hour",
+                "agg": "count", "field": "", "symbol": "SILVER",
+                "timeframe": "M1"}
+
+    def resolve_no_data_variants(self, symbol, timeframe, presets_data=None):
+        if self._resolve_fail:
+            raise RuntimeError("resolve kaputt")
+        return super().resolve_no_data_variants(
+            symbol, timeframe, presets_data)
+
+
+reader_ok = _FakeReaderR()
+repo = AnalyticsRepository(reader=reader_ok)
+res = repo.get_generic_heatmap(
+    "SILVER", "M1", "date", "hour", presets_data={
+        "presets": {"srv_x": [{"preset_name": "V2", "instance_hash": "h2"}]},
+        "sets": [], "display_names": {}})
+check("A3) get_generic_heatmap-Payload enthaelt no_data_variants",
+      isinstance(res.get("no_data_variants"), list)
+      and res.get("no_data_variants")[0].get("instance_hash") == "h2"
+      and res.get("no_data_variants_error") is False,
+      str(res.get("no_data_variants")))
+
+repo_err = AnalyticsRepository(reader=_FakeReaderR(resolve_fail=True))
+res_err = repo_err.get_generic_heatmap(
+    "SILVER", "M1", "date", "hour", presets_data={})
+check("A3) Fehler -> no_data_variants=[] + error=True",
+      res_err.get("no_data_variants") == []
+      and res_err.get("no_data_variants_error") is True,
+      str(res_err.get("no_data_variants_error")))
+
+
+# A4: Reader - feature_keys_by_service wird mit aktiven pids aufgerufen
+reader_active = _FakeReaderR()
+repo4 = AnalyticsRepository(reader=reader_active)
+repo4.get_generic_heatmap(
+    "SILVER", "M1", "date", "hour", presets_data={
+        "presets": {"srv_a": [{"preset_name": "V1", "instance_hash": "h1"}],
+                    "srv_b": []},
+        "sets": [{"services": {"i1": {"plugin_id": "srv_c"}}}],
+        "display_names": {}})
+check("A4) feature_keys_by_service nur mit aktiven pids",
+      set(reader_active.keys_called_with or []) == {"srv_a", "srv_b", "srv_c"},
+      str(reader_active.keys_called_with))
+
+
+# A5: Widget - request_data ruft request_features NICHT mehr auf
+hw_src = open("analytics/ui/heatmap_widget.py", encoding="utf-8").read()
+check("A5) Widget request_data ohne request_features (kein Extra-Roundtrip)",
+      "request_features" not in hw_src)
+
+
+# A6: Widget - QUERY_HEATMAP_GENERIC-Payload setzt No-Data-Cache + Items
+class _MockVM(QObject):
+    data_ready = Signal(str, dict)
+    feature_ids_changed = Signal()
+    query_failed = Signal(str, str)
+
+    def __init__(self, params=None, gen=0):
+        super().__init__()
+        self._params = dict(params or {
+            "symbol": "SILVER", "timeframe": "M1",
+            "feature_ids": [], "instance_hashes": [],
+            "heatmap_x_dim": "date", "heatmap_y_dim": "hour",
+            "heatmap_agg": "confluence_count", "heatmap_field": "",
+            "candle_projection_enabled": False,
+            "zoom_x_range": [0.0, 1.0], "zoom_y_range": [0.0, 1.0],
+        })
+        self._gen = gen
+
+    @property
+    def params(self):
+        return dict(self._params)
+
+    @property
+    def restore_generation(self):
+        return self._gen
+
+
+def _combo_texts(widget):
+    out = []
+    model = widget._combo_field.model()
+    for i in range(model.rowCount()):
+        item = model.item(i)
+        if item is not None:
+            out.append(str(item.text() or ""))
+    return out
+
+
+mock6 = _MockVM(gen=2)
+w6 = HeatmapWidget()
+w6.attach_view_model(mock6)
+# Heatmap-Payload mit No-Data-Anteil (Option A: selber Datenfluss)
+w6._on_data_ready("heatmap_generic", {
+    "matrix": [[1.0]], "x_dim": "date", "y_dim": "hour",
+    "agg": "confluence_count", "field": "",
+    "metrics": ["count", "confluence_count"],
+    "field_sources": {},
+    "restore_generation": 2,
+    "no_data_variants": [
+        {"plugin_id": "srv_x", "preset_name": "V1", "instance_hash": "h1",
+         "display_name": "X (V1)"},
+    ],
+    "no_data_variants_error": False,
+})
+texts6 = _combo_texts(w6)
+check("A6) Heatmap-Payload setzt No-Data-Cache",
+      w6._no_data_variants is not None
+      and len(w6._no_data_variants) == 1 and not w6._no_data_variants_error)
+check("A6) Heatmap-Payload rendert (No Data)-Item im selben Durchlauf",
+      any("(No Data)" in t for t in texts6), str(texts6[-3:]))
+
+# Alt-Payload OHNE no_data_variants -> Cache bleibt unveraendert
+w6._on_data_ready("heatmap_generic", {
+    "matrix": [[1.0]], "x_dim": "date", "y_dim": "hour",
+    "agg": "confluence_count", "field": "",
+    "metrics": ["count", "confluence_count"], "field_sources": {},
+    "restore_generation": 2,
+})
+check("A6) Alt-Payload ohne no_data_variants aendert Cache nicht",
+      w6._no_data_variants is not None and len(w6._no_data_variants) == 1,
+      str(w6._no_data_variants))
+
+# Stale-Heatmap-Payload (aeltere Generation) wird verworfen
+w6._on_data_ready("heatmap_generic", {
+    "matrix": [[1.0]], "x_dim": "date", "y_dim": "hour",
+    "agg": "confluence_count", "field": "",
+    "metrics": ["count", "confluence_count"], "field_sources": {},
+    "restore_generation": 1,  # aelter als mock6._gen=2
+    "no_data_variants": [{"plugin_id": "srv_stale", "preset_name": "S",
+                          "instance_hash": "hs", "display_name": "S (S)"}],
+    "no_data_variants_error": False,
+})
+check("A6) Stale-Heatmap-Payload (Gen 1 < 2) verwirft No-Data",
+      all(v.get("plugin_id") != "srv_stale"
+          for v in (w6._no_data_variants or [])),
+      str(w6._no_data_variants))
+
+# =========================================================================
+# TEIL B - Punkt 3 (exaktes No-Data-Matching: gewaehlte Variante)
+# Runde 13 (Bugfix Dropdown-NoData): Der Reader filtert den Payload
+# VARIANTEN-GENAU nach active_hashes - das Widget sieht nur noch die
+# gecheckte Variante eines Services und nimmt sie ohne Fallback.
+# =========================================================================
+mock3 = _MockVM(gen=0)
+mock3._params["feature_ids"] = ["srv_x"]
+mock3._params["instance_hashes"] = ["h2"]  # Variante 2 ist gecheckt
+w3 = HeatmapWidget()
+w3.attach_view_model(mock3)
+# Runde 13: variantengenauer Payload (Reader-Hash-Filter) - V1(h1) ist
+# NICHT mehr enthalten, weil h1 nie gecheckt wurde (Bug 1: das Dropdown
+# zeigte faelschlich immer die ERSTE Variante h1).
+variants3 = [
+    {"plugin_id": "srv_x", "preset_name": "V2", "instance_hash": "h2",
+     "display_name": "X (V2)"},
+]
+# Gewaehltes Feld-Item = Service srv_x (userData 'srv_x|price').
+# CheckableComboBox setzt nach addItem keinen Current-Index (custom Model);
+# blockSignals verhindert _on_config_changed -> set_heatmap_config (Mock fehlt).
+w3._combo_field.blockSignals(True)
+w3._combo_field.clear()
+w3._combo_field.addItem("X / price", "srv_x|price")
+w3._combo_field.setCurrentIndex(0)
+w3._combo_field.blockSignals(False)
+sel = w3._selected_no_data_variant(variants3)
+check("B3) Variantengenauer Payload: gecheckte Variante (h2) gewinnt",
+      sel is not None and sel.get("instance_hash") == "h2",
+      str(sel.get("instance_hash") if sel else None))
+
+# B3b (Runde 13): Gecheckte Variante h2 hat bereits Daten -> der
+# variantengenaue Payload enthaelt KEINE srv_x-Variante mehr -> None
+# (kein falscher Fallback auf V1, das nie gecheckt war; Runde-12b-
+# Erwartung bleibt: kein plugin_id-only-Fallback).
+sel_nomatch = w3._selected_no_data_variant([])
+check("B3b) Payload ohne srv_x-Variante -> None (kein V1-Fallback)",
+      sel_nomatch is None, str(sel_nomatch))
+
+# Defensiv: Alt-Payload OHNE Reader-Filter (2 Varianten eines Services) ->
+# deterministisch erste Treffer-Variante des Services (Service-Match bleibt;
+# der Runde-13-Hash-Filter liegt im Reader, das Widget vertraut dem Payload).
+mock3._params["instance_hashes"] = []
+sel_fb = w3._selected_no_data_variant([
+    {"plugin_id": "srv_x", "preset_name": "V1", "instance_hash": "h1",
+     "display_name": "X (V1)"},
+    {"plugin_id": "srv_x", "preset_name": "V2", "instance_hash": "h2",
+     "display_name": "X (V2)"},
+])
+check("B3) Mehrere Varianten im Alt-Payload -> erster Service-Match",
+      sel_fb is not None and sel_fb.get("instance_hash") == "h1",
+      str(sel_fb.get("instance_hash") if sel_fb else None))
+
+# Nicht aktiver Service (feature_ids ohne srv_x) -> None (Punkt 4)
+mock3._params["feature_ids"] = ["srv_y"]
+sel_na = w3._selected_no_data_variant(variants3)
+check("B3/B4) Nicht gecheckter Service -> keine Inline-Markierung",
+      sel_na is None, str(sel_na))
+mock3._params["feature_ids"] = ["srv_x"]
+
+# =========================================================================
+# TEIL C - Punkt 4 (nur gecheckte Services/Varianten)
+# =========================================================================
+
+# C1: VM-Snapshot filtert nach feature_ids
+class _FakeModel(QObject):
+    data_changed = Signal()
+
+    def __init__(self, presets, sets=None):
+        super().__init__()
+        self._presets = presets
+        self._sets = sets or []
+
+    def plugin_presets(self):
+        return dict(self._presets)
+
+    def get_sets(self):
+        return list(self._sets)
+
+    def resolve_service_display_name(self, pid, pname=""):
+        return f"{pid} ({pname})"
+
+
+presets_model = {
+    "srv_checked": [
+        {"preset_name": "V1", "instance_hash": "h1", "is_archived": False},
+    ],
+    "srv_unchecked": [
+        {"preset_name": "V1", "instance_hash": "hx", "is_archived": False},
+    ],
+}
+sets_model = [
+    {"services": {
+        "i1": {"plugin_id": "srv_set_checked", "is_archived": False},
+        "i2": {"plugin_id": "srv_set_unchecked", "is_archived": False},
+    }},
+]
+vm_c = AnalyticsViewModel(
+    AnalyticsRepository(),
+    selector_model=_FakeModel(presets_model, sets_model))
+vm_c._params["feature_ids"] = ["srv_checked", "srv_set_checked"]
+snap_c = vm_c._no_data_presets_snapshot()
+check("C1) Snapshot-Presets nur gecheckte Services",
+      set(snap_c.get("presets", {}).keys()) == {"srv_checked"},
+      str(sorted(snap_c.get("presets", {}).keys())))
+set_svcs = set()
+for s in snap_c.get("sets", []):
+    for svc in s.get("services", {}).values():
+        set_svcs.add(str(svc.get("plugin_id") or ""))
+check("C1) Snapshot-Set-Services nur gecheckte",
+      set_svcs == {"srv_set_checked"}, str(set_svcs))
+
+# Kein Filter (feature_ids leer) -> alle Services
+vm_c._params["feature_ids"] = []
+snap_all = vm_c._no_data_presets_snapshot()
+check("C1) Ohne Filter -> alle Presets (Semantik 'kein Filter = alle')",
+      set(snap_all.get("presets", {}).keys())
+      == {"srv_checked", "srv_unchecked"},
+      str(sorted(snap_all.get("presets", {}).keys())))
+
+# C2: Widget _render_no_data_items filtert nach feature_ids
+mock_c = _MockVM(gen=0)
+mock_c._params["feature_ids"] = ["srv_x"]  # nur srv_x gecheckt
+w_c = HeatmapWidget()
+w_c.attach_view_model(mock_c)
+w_c._on_features_ready({
+    "no_data_variants": [
+        {"plugin_id": "srv_x", "preset_name": "V1", "instance_hash": "h1",
+         "display_name": "X (V1)"},
+        {"plugin_id": "srv_y", "preset_name": "V1", "instance_hash": "hy",
+         "display_name": "Y (V1)"},
+    ],
+    "no_data_variants_error": False,
+    "restore_generation": 0,
+})
+w_c._syncing = True
+try:
+    w_c._rebuild_field_dropdown([], {})
+finally:
+    w_c._syncing = False
+texts_c = _combo_texts(w_c)
+check("C2) Nur gecheckter Service (srv_x) im (No Data)-Abschnitt",
+      any("X (V1)" in t and "(No Data)" in t for t in texts_c)
+      and not any("Y (V1)" in t for t in texts_c),
+      str(texts_c[-4:]))
+
+# C3: Reader - resolve_no_data_variants respektiert gefilterten Snapshot
+# (nur die pids im Snapshot werden geprueft - Verhalten via FakeReader:
+# feature_keys_by_service wird mit genau den Snapshot-pids aufgerufen)
+reader_c = _FakeReaderR()
+repo_c = AnalyticsRepository(reader=reader_c)
+repo_c.get_generic_heatmap(
+    "SILVER", "M1", "date", "hour", presets_data={
+        "presets": {"srv_x": [{"preset_name": "V1", "instance_hash": "h1"}]},
+        "sets": [], "display_names": {}})
+check("C3) Reader feature_keys_by_service nur mit Snapshot-pids",
+      (reader_c.keys_called_with or []) == ["srv_x"],
+      str(reader_c.keys_called_with))
+
+# C4 (Runde 13, Bugfix Dropdown-NoData): Reader filtert den Payload
+# VARIANTEN-GENAU nach active_hashes (nur gecheckte Varianten; Bug 2:
+# ungecheckte Instanzen erscheinen nicht mehr als '(No Data)').
+reader13 = _FakeReaderR(available_hashes={"h1"})  # h2 hat keine Daten
+res13 = reader13.resolve_no_data_variants("SILVER", "M1", presets_data={
+    "presets": {
+        "srv_x": [
+            {"preset_name": "V1", "instance_hash": "h1", "is_archived": False},
+            {"preset_name": "V2", "instance_hash": "h2", "is_archived": False},
+        ],
+    },
+    "sets": [],
+    "display_names": {},
+    "active_hashes": ["h2"],  # NUR V2 ist im ServicePicker gecheckt
+})
+hashes13 = [v.get("instance_hash") for v in res13]
+check("C4) Reader active_hashes: nur gecheckte Variante h2 geliefert",
+      hashes13 == ["h2"], str(hashes13))
+# active_hashes leer -> KEINE Einschraenkung (alle No-Data-Varianten,
+# h1 hat Daten -> nur h2 ohne Daten)
+res13b = reader13.resolve_no_data_variants("SILVER", "M1", presets_data={
+    "presets": {
+        "srv_x": [
+            {"preset_name": "V1", "instance_hash": "h1", "is_archived": False},
+            {"preset_name": "V2", "instance_hash": "h2", "is_archived": False},
+        ],
+    },
+    "sets": [],
+    "display_names": {},
+})
+hashes13b = [v.get("instance_hash") for v in res13b]
+check("C4) Reader ohne active_hashes -> alle No-Data-Varianten (h2)",
+      hashes13b == ["h2"], str(hashes13b))
+
+# C5 (Runde 13): MasterTree checked_instance_hashes liefert Hashes ALLER
+# gecheckten Varianten (TYPE_SERVICE Set-Instanzen + TYPE_CLONE Presets) -
+# die Grundlage von active_hashes im VM-Snapshot. Statischer Vertrag:
+# VM-_no_data_presets_snapshot schreibt active_hashes in presets_data.
+snap13 = vm_c._no_data_presets_snapshot()
+check("C5) VM-Snapshot enthaelt active_hashes-Schluessel",
+      "active_hashes" in snap13
+      and isinstance(snap13.get("active_hashes"), list),
+      str(sorted(snap13.keys())))
+
+# =========================================================================
+# Ergebnis
+# =========================================================================
+print()
+total = len(PASS)
+failed = [p for p in PASS if not p[1]]
+print(f"Runde 12: {total - len(failed)}/{total} Checks bestanden")
+if failed:
+    for name, _ok, info in failed:
+        print("  FAIL:", name, "|", info)
+    sys.exit(1)
+print("ALL PASS")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_round13b.py
+```py
+# test/check_round13b.py
+# -*- coding: utf-8 -*-
+"""
+Verifikation Runde 13b (10.08.2026) - Bugfix Dropdown-NoData (Wurzel):
+
+  Bug 1 (falsche Variante) + Bug 2 (ungecheckte Services im Dropdown)
+  entstehen durch LEERE `instance_hashes` fuer Set-Instanzen: Beim
+  regularen Hinzufuegen einer Instanz zum Set wird KEIN `instance_hash`
+  in der Set-Definition persistiert (nur _duplicate_set_instance tut
+  das). Der Runde-13-Reader-Filter (active_hashes) und der VM-Snapshot-
+  Hash-Filter greifen deshalb nicht.
+
+  Runde 13b behebt die WURZEL:
+  T1/T2: MasterTree._build_set_item berechnet fehlende Set-Instanz-Hashes
+         on-the-fly aus `generate_instance_hash(pid, params)` (heilt
+         Alt-Bestand ohne DB-Migration); vorhandene Hashes bleiben.
+  T3:    Der 4er-Key (TYPE_SERVICE, set_id, instance_id, svc_hash) traegt
+         den on-the-fly-Hash -> checked_instance_hashes() liefert ihn.
+  T4/T5: VM._no_data_presets_snapshot filtert die Clone-Schleife hart nach
+         active_hashes (ohne h_s-and-Guard).
+  T6/T7: service_win._add_service_to_set + Picker-Add persistieren den
+         Hash fuer NEUE Instanzen (statischer Quell-Marker).
+
+KEINE GUI-Ausfuehrung (offscreen). Temp-DBs strikt in test/.
+"""
+import os
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtCore import QObject, Signal  # noqa: E402
+
+app = QApplication.instance() or QApplication([])
+
+from analytics.engine.analytics_view_model import AnalyticsViewModel  # noqa: E402
+from analytics.engine.analytics_repository import AnalyticsRepository  # noqa: E402
+from analytics.engine.service_models import generate_instance_hash  # noqa: E402
+from serviceui.master_tree import (  # noqa: E402
+    ROLE_INSTANCE_HASH,
+    ROLE_NODE_TYPE,
+    TYPE_SERVICE,
+    MasterTree,
+)
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+# =========================================================================
+# T1/T2/T3 - MasterTree._build_set_item on-the-fly-Hash
+# =========================================================================
+class _FakeModel(QObject):
+    """Minimales ServiceSelectorModel-Fake fuer _build_set_item."""
+
+    data_changed = Signal()
+
+    def __init__(self, services_by_set):
+        super().__init__()
+        self._services = services_by_set
+
+    def build_tree(self):
+        # Der MasterTree-Konstruktor ruft _populate -> model.build_tree().
+        return []
+
+    def find_service(self, set_id, instance_id):
+        return (self._services.get(set_id) or {}).get(instance_id)
+
+    def belongs_to_indicator(self, plugin_id):
+        return False
+
+    def get_indicator_display_name(self, plugin_id):
+        return ""
+
+    def is_active_in_chart(self, plugin_id):
+        return False
+
+    def get_set_indicator_names(self, definition):
+        return []
+
+    def is_set_active(self, definition):
+        return False
+
+
+def _build_set_item(model, set_id, svc_dicts):
+    tree = MasterTree(model)
+    child = {
+        "set_id": set_id,
+        "display_name": "TestSet",
+        "services": svc_dicts,
+    }
+    return tree._build_set_item(child)
+
+
+# T1: Set-Instanz OHNE instance_hash in der Definition -> on-the-fly-Hash
+params_t1 = {"mode": "x", "threshold": 42}
+svc_t1 = {"instance_id": "srv_a", "plugin_id": "srv_a"}
+model_t1 = _FakeModel({"set1": {"srv_a": {
+    "plugin_id": "srv_a", "params": params_t1}}})
+item_t1 = _build_set_item(model_t1, "set1", [svc_t1])
+svc_child_t1 = item_t1.child(0)
+hash_t1 = str(svc_child_t1.data(0, ROLE_INSTANCE_HASH) or "")
+expected_t1 = generate_instance_hash("srv_a", params_t1)
+check("T1) Set-Instanz ohne Hash -> on-the-fly-Hash gesetzt",
+      hash_t1 == expected_t1,
+      f"{hash_t1} != {expected_t1}")
+
+# T2: Set-Instanz MIT instance_hash in der Definition -> bleibt erhalten
+params_t2 = {"mode": "y"}
+svc_t2 = {"instance_id": "srv_b", "plugin_id": "srv_b",
+          "instance_hash": "h_existing"}
+model_t2 = _FakeModel({"set1": {"srv_b": {
+    "plugin_id": "srv_b", "params": params_t2,
+    "instance_hash": "h_existing"}}})
+item_t2 = _build_set_item(model_t2, "set1", [svc_t2])
+hash_t2 = str(item_t2.child(0).data(0, ROLE_INSTANCE_HASH) or "")
+check("T2) Vorhandener instance_hash bleibt unveraendert",
+      hash_t2 == "h_existing", hash_t2)
+
+# T3: 4er-Key traegt den on-the-fly-Hash -> checked_instance_hashes liefert
+tree_t3 = MasterTree(model_t1)
+tree_t3.set_checkable(True)
+child_t3 = {
+    "set_id": "set1",
+    "display_name": "TestSet",
+    "services": [svc_t1],
+}
+set_item_t3 = tree_t3._build_set_item(child_t3)
+svc_item_t3 = set_item_t3.child(0)
+svc_item_t3.setData(0, __import__("PySide6.QtCore", fromlist=["Qt"]).Qt.CheckStateRole,
+                    __import__("PySide6.QtCore", fromlist=["Qt"]).Qt.Checked)
+tree_t3._on_item_changed(svc_item_t3, 0)
+hashes_t3 = tree_t3.checked_instance_hashes()
+check("T3) checked_instance_hashes liefert on-the-fly-Hash",
+      hashes_t3 == [expected_t1], str(hashes_t3))
+
+# =========================================================================
+# T4/T5 - VM._no_data_presets_snapshot harte Hash-Einschraenkung
+# =========================================================================
+class _FakeSelectorModel:
+    def __init__(self, presets):
+        self._presets = presets
+
+    def plugin_presets(self):
+        return dict(self._presets)
+
+    def get_sets(self):
+        return []
+
+    def resolve_service_display_name(self, pid, pname=""):
+        return f"{pid} ({pname})"
+
+
+presets_t = {
+    "srv_x": [
+        {"preset_name": "V1", "instance_hash": "h1", "is_archived": False},
+        {"preset_name": "V2", "instance_hash": "h2", "is_archived": False},
+    ],
+}
+
+# T4: active_hashes = {"h2"} -> nur V2 in den Snapshot
+vm_t4 = AnalyticsViewModel(AnalyticsRepository(),
+                           selector_model=_FakeSelectorModel(presets_t))
+vm_t4._params["feature_ids"] = ["srv_x"]
+vm_t4._params["instance_hashes"] = ["h2"]
+snap_t4 = vm_t4._no_data_presets_snapshot()
+snap_hashes_t4 = [c.get("instance_hash")
+                  for c in (snap_t4.get("presets", {}).get("srv_x") or [])]
+check("T4) Snapshot-Clones nur gecheckte Variante (h2)",
+      snap_hashes_t4 == ["h2"], str(snap_hashes_t4))
+check("T4) Snapshot active_hashes korrekt",
+      snap_t4.get("active_hashes") == ["h2"],
+      str(snap_t4.get("active_hashes")))
+
+# T4b: active_hashes leer -> alle Clones (keine Einschraenkung)
+vm_t5 = AnalyticsViewModel(AnalyticsRepository(),
+                           selector_model=_FakeSelectorModel(presets_t))
+vm_t5._params["feature_ids"] = ["srv_x"]
+vm_t5._params["instance_hashes"] = []
+snap_t5 = vm_t5._no_data_presets_snapshot()
+snap_hashes_t5 = [c.get("instance_hash")
+                  for c in (snap_t5.get("presets", {}).get("srv_x") or [])]
+check("T5) Snapshot ohne active_hashes -> alle Clones (h1, h2)",
+      sorted(snap_hashes_t5) == ["h1", "h2"], str(snap_hashes_t5))
+
+# =========================================================================
+# T6/T7 - statische Marker: neue Instanzen persistieren den Hash
+# =========================================================================
+sw_src = open("serviceui/service_win.py", encoding="utf-8").read()
+check("T6) service_win._add_service_to_set persistiert instance_hash",
+      '"instance_hash": generate_instance_hash(plugin_id, params)'
+      in sw_src)
+
+dlg_src = open("serviceui/service_selector_dialog.py", encoding="utf-8").read()
+check("T7) Dialog: Add-Pfad persistiert instance_hash",
+      '"instance_hash": generate_instance_hash(plugin_id, params)'
+      in dlg_src)
+check("T7) Dialog: Modul-Import generate_instance_hash",
+      "from analytics.engine.service_models import generate_instance_hash"
+      in dlg_src)
+
+# =========================================================================
+# Ergebnis
+# =========================================================================
+print()
+total = len(PASS)
+failed = [p for p in PASS if not p[1]]
+print(f"Runde 13b: {total - len(failed)}/{total} Checks bestanden")
+if failed:
+    for name, _ok, info in failed:
+        print("  FAIL:", name, "|", info)
+    sys.exit(1)
+print("ALL PASS")
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/check_round7_fixes.py
 ```py
 # test/check_round7_fixes.py
@@ -47690,6 +50272,13 @@ class _VM:
     def request_daily_ohlc(self):
         self.calls.append(("request_daily_ohlc",))
 
+    def request_features(self):
+        self.calls.append(("request_features",))
+
+    def set_candle_projection(self, enabled):
+        self.calls.append(("set_candle_projection", bool(enabled)))
+        self.params["candle_projection_enabled"] = bool(enabled)
+
     def resolve_no_data_variants(self, symbol, timeframe):
         return []
 
@@ -47773,10 +50362,13 @@ w1.deleteLater()
 vm3 = _VM()
 w3 = HeatmapWidget()
 w3.attach_view_model(vm3)
-# Restore-Simulation: params setzen + params_restored
+# Restore-Simulation: params setzen + Widget-Sync. Runde 11 (A3): die
+# direkte params_restored-Verbindung des Widgets ist entfallen - das
+# AnalyticsWindow orchestriert via _sync_all_pages_from_params() und ruft
+# hier _sync_from_params() (der Test simuliert genau diesen Aufruf).
 vm3.params["heatmap_agg"] = "avg"
 vm3.params["heatmap_field"] = "visit_pct"
-vm3.params_restored.emit()
+w3._sync_from_params()
 app.processEvents()
 check("B3) Restore: Agg-Combo 'avg'", w3._combo_agg.currentData() == "avg")
 check("B3) Restore: Feld-Combo 'visit_pct'",
@@ -48095,6 +50687,9 @@ class _VM:
     def request_daily_ohlc(self):
         self.calls.append(("request_daily_ohlc",))
 
+    def request_features(self):
+        self.calls.append(("request_features",))
+
     def resolve_no_data_variants(self, symbol, timeframe):
         return []
 
@@ -48163,10 +50758,13 @@ w4.deleteLater()
 vm3 = _VM(generation=1)
 w3 = HeatmapWidget()
 w3.attach_view_model(vm3)
-# Restore: Feld + Agg restaurieren (Generation wurde von 0 -> 1 erhoeht)
+# Restore: Feld + Agg restaurieren (Generation wurde von 0 -> 1 erhoeht).
+# Runde 11 (A3): die direkte params_restored-Verbindung des Widgets ist
+# entfallen - das Window orchestriert via _sync_all_pages_from_params()
+# (Test simuliert den Sync-Aufruf direkt).
 vm3.params["heatmap_field"] = "visit_pct"
 vm3.params["heatmap_agg"] = "avg"
-vm3.params_restored.emit()
+w3._sync_from_params()
 app.processEvents()
 check("B3) Restore: Feld-Combo 'visit_pct'",
       w3._field_key(w3._combo_field.currentData()) == "visit_pct",
