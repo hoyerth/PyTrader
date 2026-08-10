@@ -165,12 +165,15 @@ class AnalyticsAsyncWorker(QThread):
         feature_ids = p.get("feature_ids")
         if not feature_ids and p.get("feature_id"):
             feature_ids = [p["feature_id"]]
+        # Runde 10 (Bug 1): Varianten-Einschraenkung an die Repo-Methoden.
+        instance_hashes = p.get("instance_hashes") or []
 
         if self._query_kind == QUERY_TABLE:
             return repo.get_table(
                 symbol, timeframe,
                 feature_id=p.get("feature_id"),
                 feature_ids=feature_ids,
+                instance_hashes=instance_hashes,
                 limit=cap_lookback_limit(p.get("limit")),
             )
         if self._query_kind == QUERY_HEATMAP:
@@ -179,6 +182,7 @@ class AnalyticsAsyncWorker(QThread):
                 metric=str(p.get("metric", "count") or "count"),
                 feature_id=p.get("feature_id"),
                 feature_ids=feature_ids,
+                instance_hashes=instance_hashes,
             )
         if self._query_kind == QUERY_HEATMAP_GENERIC:
             # 20.02 (additiv): Generische 2D-Heatmap – Parameter x_dim/y_dim/
@@ -191,6 +195,7 @@ class AnalyticsAsyncWorker(QThread):
                 agg=str(p.get("agg", "count") or "count"),
                 feature_id=p.get("feature_id"),
                 feature_ids=feature_ids,
+                instance_hashes=instance_hashes,
                 limit=cap_lookback_limit(p.get("limit")),
             )
         if self._query_kind == QUERY_OHLCV:
@@ -215,6 +220,7 @@ class AnalyticsAsyncWorker(QThread):
                 y_column=p.get("y_column") or None,
                 feature_id=p.get("feature_id"),
                 feature_ids=feature_ids,
+                instance_hashes=instance_hashes,
                 limit=cap_lookback_limit(p.get("limit")),
             )
         if self._query_kind == QUERY_DISTRIBUTION:
@@ -224,6 +230,7 @@ class AnalyticsAsyncWorker(QThread):
                 bins=p.get("bins", 20),
                 feature_id=p.get("feature_id"),
                 feature_ids=feature_ids,
+                instance_hashes=instance_hashes,
                 limit=cap_lookback_limit(p.get("limit")),
             )
         if self._query_kind == QUERY_FEATURES:

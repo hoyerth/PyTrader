@@ -153,10 +153,19 @@ class PersistentWindow(QMainWindow):
             width = geom.get("width") or self.width()
             height = geom.get("height") or self.height()
 
-            screen_geo = QApplication.primaryScreen().availableGeometry()
+            # Runde 10 (Bug 5): Gegen ALLE Screens pruefen - eine Position
+            # auf dem 2. Monitor ist NICHT off-screen (Fallback nur, wenn
+            # sie auf KEINEM Screen liegt). Vorher wurde nur der Primary-
+            # Screen geprueft -> Position auf Monitor 2 fiel auf (100,100)
+            # zurueck.
+            screens = [s.availableGeometry()
+                       for s in QApplication.screens()]
             if pos_x is not None and pos_y is not None:
-                if pos_x < screen_geo.x() - 100 or pos_x > screen_geo.right() or \
-                   pos_y < screen_geo.y() - 100 or pos_y > screen_geo.bottom():
+                on_screen = any(
+                    (scr.x() - 100 <= pos_x <= scr.right())
+                    and (scr.y() - 100 <= pos_y <= scr.bottom())
+                    for scr in screens)
+                if not on_screen:
                     pos_x, pos_y = 100, 100
                 self.move(pos_x, pos_y)
                 self.resize(width, height)

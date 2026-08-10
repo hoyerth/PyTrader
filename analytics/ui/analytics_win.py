@@ -375,10 +375,25 @@ class AnalyticsWindow(PersistentWindow):
             # 18.01.01 (E-4): Live-Filter bei Klick auf eine Baum-Zeile.
             self._service_dialog.selection_ids_requested.connect(
                 self._on_picker_ids_selected)
+            # Runde 10 (Bug 1): Varianten-Hashes -> VM (zusaetzlich zu
+            # feature_ids; der Slot liest die aktuellen ids aus dem VM).
+            self._service_dialog.selection_hashes_requested.connect(
+                self._on_picker_hashes_selected)
             self._service_dialog.destroyed.connect(
                 self._on_service_dialog_destroyed)
+        # Runde 9 (Bug 1): Modell explizit refreshen, damit der Baum
+        # sicher aufgebaut ist - das initiale data_changed des Modells
+        # lief VOR der Dialog-Erstellung (Dialog ist lazy), ein leerer
+        # Baum wuerde die restaurierten Haken sonst verlieren. Der
+        # MasterTree faengt ein zwischenzeitlich leeres Set ueber
+        # _pending_feature_ids ab (set_checked_feature_ids merkt sie).
+        try:
+            self._selector_model.refresh()
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] Picker-Modell-Refresh: {e}")
         self._service_dialog.apply_feature_ids(
-            self._vm.params.get("feature_ids") or [])
+            self._vm.params.get("feature_ids") or [],
+            self._vm.params.get("instance_hashes") or [])
         self._service_dialog.show()
         self._service_dialog.raise_()
         self._service_dialog.activateWindow()
@@ -387,6 +402,20 @@ class AnalyticsWindow(PersistentWindow):
     def _on_service_dialog_destroyed(self) -> None:
         """Setzt die Dialog-Referenz zurueck (zerstoert mit dem Parent)."""
         self._service_dialog = None
+
+    @Slot(list)
+    def _on_picker_hashes_selected(self, instance_hashes: List[str]) -> None:
+        """Runde 10 (Bug 1): Varianten-Hashes aus dem Picker uebernehmen.
+
+        feature_ids (plugin_ids) bleiben unveraendert - nur die
+        Varianten-Einschraenkung wird aktualisiert. Dadurch ist ein
+        Check/Uncheck EINER Variante im Datenfilter sichtbar.
+        """
+        self._vm.set_feature_ids(
+            self._vm.params.get("feature_ids") or [],
+            list(instance_hashes or []))
+        self._sync_service_filter_button()
+        self.label_missing_warning.setVisible(False)
 
     @Slot(list)
     def _on_picker_ids_selected(self, feature_ids: List[str]) -> None:
@@ -1071,12 +1100,17 @@ class AnalyticsWindow(PersistentWindow):
             print(f"WARN [AnalyticsWindow] ServicePicker-Restore: {e}")
 
     def _initial_load(self) -> None:
-        # VM mit dem aktuellen Combo-Zustand starten (Fix 15.03, idempotent):
-        # restore_state (t=0) bzw. _apply_profile koennen bereits Werte gesetzt
-        # haben; ohne Historie/Profil sorgt das hier dafuer, dass die Ansicht
-        # sofort Daten fuer das sichtbare Symbol/Timeframe laedt.
-        self._vm.set_symbol(self.combo_symbol.currentText())
-        self._vm.set_timeframe(self.combo_tf.currentText())
+        # Runde 10 (Bug 3): Deterministischer Initial-Load - die Symbol-Combo
+        # wird hier nochmals gefuellt (idempotent, erhaelt die aktuelle
+        # Auswahl), damit sie NICHT leer sein kann, wenn restore_state (t=0)
+        # noch kein Symbol gesetzt hat. Leere Combos wurden sonst per
+        # set_symbol("")/set_timeframe("") in die VM-Params uebernommen ->
+        # _current_params() lieferte None -> Initial-Queries uebersprungen.
+        self._refresh_symbol_combo()
+        if self.combo_symbol.currentText():
+            self._vm.set_symbol(self.combo_symbol.currentText())
+        if self.combo_tf.currentText():
+            self._vm.set_timeframe(self.combo_tf.currentText())
         self._vm.load_profiles()
         # Bugfix 08.08.2026 (symbol/tf-Profil-Restore): load_profiles()
         # emittiert active_profile_changed NICHT (nur set_active_profile/
@@ -1095,6 +1129,15 @@ class AnalyticsWindow(PersistentWindow):
         # Sitzungszustand gewinnt. Fehlende Services -> Warn-Label.
         self._restore_workspace()
         self._on_page_changed(self.sidebar.currentRow())
+        # Runde 9 (Bug 4): Finalen Refresh sicherstellen - falls weder ein
+        # aktives Profil (load_profiles) noch ein Workspace (restore_workspace)
+        # existierte, wurde ggf. keine Query gestartet (set_symbol/
+        # set_timeframe waren idempotent). refresh_all() stoesst die
+        # Initial-Queries mit den finalen Parametern an (der Debounce
+        # buegelt doppelte Refreshes ab). Der Datenquellen-Button wird
+        # ebenfalls nachgezogen (fehlte nach reinem Profil-/Workspace-Start).
+        self._vm.refresh_all()
+        self._sync_service_filter_button()
         # 15.03-E: QUERY_FEATURES speiste das entfernte combo_feature-Dropdown –
         # ohne Feature-Dropdown ist keine Features-Metadaten-Abfrage noetig.
 

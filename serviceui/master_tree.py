@@ -453,6 +453,17 @@ class MasterTree(QTreeWidget):
         # (build_tree mischt die persistierten tree_folders_<group>-Pfade
         # ein) – ein separater UI-Zustand ist nicht mehr noetig.
         pass
+        # Runde 9 (Bug 1): Pending-Haken aus set_checked_feature_ids (wurde
+        # auf einem noch leeren Baum aufgerufen, z.B. Picker-Oeffnen vor dem
+        # ersten data_changed) jetzt auf den fertigen Baum anwenden. Emittiert
+        # KEIN checked_changed (Bug-5-Fix), damit der Restore-Filter nicht
+        # ueberschrieben wird.
+        pending = getattr(self, "_pending_feature_ids", None)
+        if pending is not None:
+            pending_hashes = getattr(self, "_pending_instance_hashes", None)
+            self._pending_feature_ids = None
+            self._pending_instance_hashes = None
+            self.set_checked_feature_ids(pending, pending_hashes)
 
     def _safe_current_selection(self) -> Dict[str, str]:
         """Liess die aktuelle Auswahl defensiv (isValid-Guard gegen zerstoerte
@@ -1306,12 +1317,12 @@ class MasterTree(QTreeWidget):
                     self._expand_ancestors(item)
                 else:
                     self._checked_items.discard(key)
-                    # Bugfix 10.08.2026 (Bug 4/5): Alle Zeilen derselben
-                    # plugin_id abhaengen (Standalone-/Clone-Haken aus
-                    # set_checked_feature_ids) - sonst bliebe die plugin_id
-                    # ueber einen anderen Zeilen-Typ im Filter aktiv.
-                    self._uncheck_plugin_rows(
-                        str(item.data(0, ROLE_PLUGIN_ID) or ""))
+                    # Runde 9 (Bug 3): KEIN _uncheck_plugin_rows mehr - das
+                    # Abhaengen ALLER Zeilen einer plugin_id hat beim Uncheck
+                    # einer Variante auch die anderen Clones abgehaengt
+                    # (falsch). checked_feature_ids() dedupliziert ohnehin
+                    # auf plugin_id: Der Filter bleibt aktiv, solange
+                    # mindestens eine Zeile gecheckt ist.
                 parent = item.parent()
                 if parent is not None and isValid(parent):
                     self._apply_set_state(parent)
@@ -1329,8 +1340,8 @@ class MasterTree(QTreeWidget):
                     self._expand_ancestors(item)
                 else:
                     self._checked_items.discard(key)
-                    self._uncheck_plugin_rows(
-                        str(item.data(0, ROLE_PLUGIN_ID) or ""))
+                    # Runde 9 (Bug 3): _uncheck_plugin_rows entfernt (siehe
+                    # TYPE_SERVICE) - nur diesen einen Key abhaengen.
             elif node_type == TYPE_CLONE:
                 # 20.04 (Q7): Clone-Haken -> feature_id ist die plugin_id
                 # des Plugin-Parents (WHERE feature_id IN (plugin_ids)).
@@ -1346,8 +1357,8 @@ class MasterTree(QTreeWidget):
                     self._expand_ancestors(item)
                 else:
                     self._checked_items.discard(key)
-                    self._uncheck_plugin_rows(
-                        str(item.data(0, ROLE_PLUGIN_ID) or ""))
+                    # Runde 9 (Bug 3): _uncheck_plugin_rows entfernt (siehe
+                    # TYPE_SERVICE) - nur diesen einen Key abhaengen.
             elif node_type == TYPE_SET:
                 set_id = str(item.data(0, ROLE_SET_ID) or "")
                 # Nur bei ECHTEM Wechsel verarbeiten (Tri-State-Ableitung).
@@ -1367,11 +1378,9 @@ class MasterTree(QTreeWidget):
                     else:
                         self._checked_items.discard(key)
                         child.setData(0, Qt.CheckStateRole, Qt.Unchecked)
-                        # Bugfix 10.08.2026 (Bug 4/5): Auch die Standalone-/
-                        # Clone-Haken dieser plugin_id abhaengen, damit das
-                        # Set-Uncheck den kompletten Feature-Haken entfernt.
-                        self._uncheck_plugin_rows(
-                            str(child.data(0, ROLE_PLUGIN_ID) or ""))
+                        # Runde 9 (Bug 3): _uncheck_plugin_rows entfernt
+                        # (siehe TYPE_SERVICE) - nur diesen einen Key
+                        # abhaengen, nicht alle Zeilen der plugin_id.
                 self._apply_set_state(item)
                 # Bugfix 08.08.2026: Auch beim Set-Anhaken die Eltern-Kette
                 # des Sets aufklappen (Set in Kategorie-Ordner sichtbar).
@@ -1380,55 +1389,58 @@ class MasterTree(QTreeWidget):
         finally:
             self._updating_checks = False
 
-    def _uncheck_plugin_rows(self, plugin_id: str) -> None:
-        """Haengt ALLE Zeilen einer plugin_id ab (Bugfix 10.08.2026).
+    # Runde 9 (Bug 3): _uncheck_plugin_rows ist ENTFERNT/AUSKOMMENTIERT -
+    # das Abhaengen ALLER Zeilen einer plugin_id beim Uncheck einer
+    # Variante hat auch die anderen Clones abgehaengt (falsch). Siehe
+    # _on_item_changed (nur den einen Key abhaengen).
+    #     def _uncheck_plugin_rows(self, plugin_id: str) -> None:
+    #         """Haengt ALLE Zeilen einer plugin_id ab (Bugfix 10.08.2026).
 
-        `checked_feature_ids()` dedupliziert die Haken auf
-        plugin_id-Ebene (eine plugin_id == eine feature_id fuer
-        `WHERE feature_id IN (...)`). Beim Restore
-        (`set_checked_feature_ids`) koennen deshalb mehrere Zeilen-
-        Typen derselben plugin_id angehakt sein: die Service-Zeile im
-        Set, das Standalone-Plugin-Blatt (TYPE_PLUGIN) und ggf.
-        Clones. Ein Uncheck NUR einer Zeile wuerde die plugin_id
-        ueber die anderen Zeilen im Filter belassen (Dropdown/
-        Historie reagieren nicht) - deshalb werden hier alle Zeilen
-        mit derselben plugin_id abgehaengt und ihre Keys aus
-        `_checked_items` entfernt. Wird aus den Uncheck-Zweigen von
-        `_on_item_changed` gerufen (laeuft unter `_updating_checks
-        == True`, d. h. die setData-Aufrufe feuern keine spurious
-        Events).
-        """
-        pid = str(plugin_id or "").lower()
-        if not pid:
-            return
-        for item in TreeItemIterator(self):
-            if item is None or not isValid(item):
-                continue
-            node_type = item.data(0, ROLE_NODE_TYPE)
-            if node_type not in (TYPE_SERVICE, TYPE_PLUGIN, TYPE_CLONE):
-                continue
-            if str(item.data(0, ROLE_PLUGIN_ID) or "").lower() != pid:
-                continue
-            if item.checkState(0) != Qt.Checked:
-                continue
-            if node_type == TYPE_SERVICE:
-                key = (TYPE_SERVICE,
-                       str(item.data(0, ROLE_SET_ID) or ""),
-                       str(item.data(0, ROLE_INSTANCE_ID) or ""))
-            elif node_type == TYPE_PLUGIN:
-                key = (TYPE_PLUGIN, "",
-                       str(item.data(0, ROLE_PLUGIN_ID) or ""))
-            else:
-                key = (TYPE_CLONE,
-                       str(item.data(0, ROLE_PLUGIN_ID) or ""),
-                       str(item.data(0, ROLE_INSTANCE_HASH) or ""))
-            self._checked_items.discard(key)
-            item.setData(0, Qt.CheckStateRole, Qt.Unchecked)
-            parent = item.parent()
-            if (parent is not None and isValid(parent)
-                    and parent.data(0, ROLE_NODE_TYPE) == TYPE_SET):
-                self._apply_set_state(parent)
-
+    #         `checked_feature_ids()` dedupliziert die Haken auf
+    #         plugin_id-Ebene (eine plugin_id == eine feature_id fuer
+    #         `WHERE feature_id IN (...)`). Beim Restore
+    #         (`set_checked_feature_ids`) koennen deshalb mehrere Zeilen-
+    #         Typen derselben plugin_id angehakt sein: die Service-Zeile im
+    #         Set, das Standalone-Plugin-Blatt (TYPE_PLUGIN) und ggf.
+    #         Clones. Ein Uncheck NUR einer Zeile wuerde die plugin_id
+    #         ueber die anderen Zeilen im Filter belassen (Dropdown/
+    #         Historie reagieren nicht) - deshalb werden hier alle Zeilen
+    #         mit derselben plugin_id abgehaengt und ihre Keys aus
+    #         `_checked_items` entfernt. Wird aus den Uncheck-Zweigen von
+    #         `_on_item_changed` gerufen (laeuft unter `_updating_checks
+    #         == True`, d. h. die setData-Aufrufe feuern keine spurious
+    #         Events).
+    #         """
+    #         pid = str(plugin_id or "").lower()
+    #         if not pid:
+    #             return
+    #         for item in TreeItemIterator(self):
+    #             if item is None or not isValid(item):
+    #                 continue
+    #             node_type = item.data(0, ROLE_NODE_TYPE)
+    #             if node_type not in (TYPE_SERVICE, TYPE_PLUGIN, TYPE_CLONE):
+    #                 continue
+    #             if str(item.data(0, ROLE_PLUGIN_ID) or "").lower() != pid:
+    #                 continue
+    #             if item.checkState(0) != Qt.Checked:
+    #                 continue
+    #             if node_type == TYPE_SERVICE:
+    #                 key = (TYPE_SERVICE,
+    #                        str(item.data(0, ROLE_SET_ID) or ""),
+    #                        str(item.data(0, ROLE_INSTANCE_ID) or ""))
+    #             elif node_type == TYPE_PLUGIN:
+    #                 key = (TYPE_PLUGIN, "",
+    #                        str(item.data(0, ROLE_PLUGIN_ID) or ""))
+    #             else:
+    #                 key = (TYPE_CLONE,
+    #                        str(item.data(0, ROLE_PLUGIN_ID) or ""),
+    #                        str(item.data(0, ROLE_INSTANCE_HASH) or ""))
+    #             self._checked_items.discard(key)
+    #             item.setData(0, Qt.CheckStateRole, Qt.Unchecked)
+    #             parent = item.parent()
+    #             if (parent is not None and isValid(parent)
+    #                     and parent.data(0, ROLE_NODE_TYPE) == TYPE_SET):
+    #                 self._apply_set_state(parent)
     def _derive_set_state(self, set_item) -> int:
         """Erwarteter Tri-State eines Set-Knotens aus seinen Service-Kindern.
 
@@ -1567,6 +1579,23 @@ class MasterTree(QTreeWidget):
                 ids.append(pid)
         return ids
 
+    def checked_instance_hashes(self) -> List[str]:
+        """Deduplizierte instance_hashes aller gecheckten Clone-Varianten.
+
+        Runde 10 (Bug 1): Der Filter ist damit varianten-granular - ein
+        Check/Uncheck EINER Variante (Clone) aendert den Datenfilter
+        sichtbar (feature_ids bleibt plugin_id-granular fuer die
+        IN-Klausel, instance_hashes schraenkt auf die gewaehlten
+        Varianten ein). Leere Liste = keine Varianten-Einschraenkung.
+        """
+        hashes: List[str] = []
+        for entry in self.checked_services():
+            if entry["node_type"] == TYPE_CLONE:
+                h = entry.get("instance_id") or ""
+                if h and h not in hashes:
+                    hashes.append(h)
+        return hashes
+
     def checked_display_names(self) -> List[str]:
         """Lesbare Namen fuer die Button-Anzeige (Top-Bar).
 
@@ -1610,7 +1639,8 @@ class MasterTree(QTreeWidget):
             self._updating_checks = False
         self.checked_changed.emit()
 
-    def set_checked_feature_ids(self, feature_ids) -> None:
+    def set_checked_feature_ids(self, feature_ids,
+                               instance_hashes=None) -> None:
         """Setzt die Haken anhand von plugin_ids (Reverse-Mapping).
 
         Wird beim Oeffnen des Dialogs aufgerufen, damit die aktuelle
@@ -1621,7 +1651,23 @@ class MasterTree(QTreeWidget):
         if not self._checkable:
             return
         wanted = {str(f).strip().lower() for f in (feature_ids or []) if str(f).strip()}
+        # Runde 9 (Bug 1): Ist der Baum noch NICHT aufgebaut (das initiale
+        # data_changed des Modells lief VOR der Dialog-Erstellung, der Baum
+        # bleibt sonst leer), werden die gewuenschten IDs gemerkt und beim
+        # naechsten _populate() automatisch angewendet - sonst gingen die
+        # restaurierten Haken verloren ('restore fails wenn offen').
+        if self.topLevelItemCount() == 0:
+            self._pending_feature_ids = [str(f) for f in (feature_ids or [])]
+            self._pending_instance_hashes = [
+                str(h) for h in (instance_hashes or []) if str(h).strip()]
+            return
         self._updating_checks = True
+        # Runde 10 (Bug 1): instance_hashes is None = KEINE
+        # Varianten-Einschraenkung (alle Clones der wanted plugin_ids);
+        # leere Liste = explizit KEINE Variante angehakt.
+        hash_restriction = instance_hashes is not None
+        wanted_hashes = {str(h).strip().lower()
+                         for h in (instance_hashes or []) if str(h).strip()}
         # Bugfix 08.08.2026 (Bug 2): Angehakte Items merken, um danach ihre
         # Eltern-Kette aufzuklappen (der Baum startet eingeklappt – ohne
         # Expansion bleiben die aktivierten Services/Plugins unsichtbar).
@@ -1659,9 +1705,17 @@ class MasterTree(QTreeWidget):
                 elif node_type == TYPE_CLONE:
                     # 20.04 (Q7): Clone-Haken folgen der plugin_id (feature-
                     # id des Filters); instance_hash unterscheidet Varianten.
+                    # Runde 10 (Bug 1): Reverse-Mapping mit Hash-Granularitaet
+                    # - sind instance_hashes gesetzt, wird NUR die passende
+                    # Variante angehakt (sonst alle der plugin_id).
                     pid = str(item.data(0, ROLE_PLUGIN_ID) or "")
                     instance_hash = str(item.data(0, ROLE_INSTANCE_HASH) or "")
-                    checked = pid.lower() in wanted
+                    if hash_restriction:
+                        checked = (pid.lower() in wanted
+                                   and instance_hash.strip().lower()
+                                   in wanted_hashes)
+                    else:
+                        checked = pid.lower() in wanted
                     if checked:
                         self._checked_items.add(
                             (TYPE_CLONE, pid, instance_hash))

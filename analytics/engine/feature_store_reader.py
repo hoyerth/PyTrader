@@ -164,6 +164,7 @@ class FeatureStoreReader:
         feature_id: Optional[str],
         conditions: List[str],
         params: List[Any],
+        instance_hashes: Optional[List[str]] = None,
     ) -> None:
         """Erweitert WHERE um einen feature_id-Filter (IN-Clause bzw. Einzel-ID).
 
@@ -192,6 +193,20 @@ class FeatureStoreReader:
         elif feature_id:
             conditions.append("LOWER(TRIM(feature_id)) = LOWER(TRIM(?))")
             params.append(feature_id)
+        # Runde 10 (Bug 1): Varianten-Einschraenkung - werden
+        # instance_hashes uebergeben, bleiben NUR die Rows der gewaehlten
+        # Varianten (exakter Hash-Match, case-insensitiv) plus Alt-Bestand
+        # OHNE Hash (NULL) - letztere gehoeren der plugin_id als Ganzes
+        # und werden nie durch die Varianten-Auswahl ausgeblendet.
+        if instance_hashes:
+            hashes = [str(h).strip().lower() for h in instance_hashes
+                      if str(h).strip()]
+            if hashes:
+                placeholders = ", ".join("?" for _ in hashes)
+                conditions.append(
+                    f"(instance_hash IS NULL OR "
+                    f"LOWER(TRIM(instance_hash)) IN ({placeholders}))")
+                params.extend(hashes)
 
     # ------------------------------------------------------------------
     # Lesen: Roh-Zeilen
@@ -202,6 +217,8 @@ class FeatureStoreReader:
         timeframe: str,
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Liefert Feature-Store-Zeilen als Dicts (vom NEUESTEN Stand abwaerts).
@@ -235,7 +252,9 @@ class FeatureStoreReader:
             limit = 1000
         conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
         params: List[Any] = [symbol, timeframe]
-        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
+        self._apply_feature_filter(
+            feature_ids, feature_id, conditions, params,
+            instance_hashes=instance_hashes)
 
         con = self._get_connection()
         try:
@@ -428,6 +447,8 @@ class FeatureStoreReader:
         numeric_only: bool = False,
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
     ) -> Dict[str, List[str]]:
         """feature_data-JSON-Keys je feature_id (20.02.01, Feld-Dropdown).
 
@@ -459,7 +480,9 @@ class FeatureStoreReader:
         # 09.08.2026 (User-Meldung Feld-Dropdown): feature_id/feature_ids-
         # Filter anwenden, damit abgewaehlte Services nicht im Dropdown
         # erscheinen (Root Cause 2).
-        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
+        self._apply_feature_filter(
+            feature_ids, feature_id, conditions, params,
+            instance_hashes=instance_hashes)
 
         con = self._get_connection()
         try:
@@ -511,6 +534,8 @@ class FeatureStoreReader:
         columns: List[str],
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> List[Dict[str, float]]:
         """Liefert numerische Werte angeforderter feature_data-JSON-Keys.
@@ -547,7 +572,9 @@ class FeatureStoreReader:
             limit = 1000
         conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
         params: List[Any] = [symbol, timeframe]
-        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
+        self._apply_feature_filter(
+            feature_ids, feature_id, conditions, params,
+            instance_hashes=instance_hashes)
 
         con = self._get_connection()
         try:
@@ -590,6 +617,8 @@ class FeatureStoreReader:
         metric: str = "count",
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Aggregiert eine 2D-Matrix (X: Wochentage, Y: Tagesstunden).
@@ -648,7 +677,9 @@ class FeatureStoreReader:
 
         conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
         params: List[Any] = [symbol, timeframe]
-        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
+        self._apply_feature_filter(
+            feature_ids, feature_id, conditions, params,
+            instance_hashes=instance_hashes)
 
         con = self._get_connection()
         try:
@@ -714,6 +745,8 @@ class FeatureStoreReader:
         agg: str = "count",
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Aggregiert eine generische 2D-Matrix ueber zwei Dimensionen.
@@ -804,7 +837,9 @@ class FeatureStoreReader:
 
         conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
         params: List[Any] = [symbol, timeframe]
-        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
+        self._apply_feature_filter(
+            feature_ids, feature_id, conditions, params,
+            instance_hashes=instance_hashes)
         # 20.02.01 (E5): `dow`-Achse strikt Montag-Freitag (DuckDB Mo=1..Fr=5).
         if x_key == "dow" or y_key == "dow":
             conditions.append(
@@ -1293,6 +1328,8 @@ class FeatureStoreReader:
         timeframe: str,
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
     ) -> Optional[int]:
         """Neuester Wanduhr-Epoch (int) der Feature-Rows (oder None).
 
@@ -1308,7 +1345,9 @@ class FeatureStoreReader:
             return None
         conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
         params: List[Any] = [symbol, timeframe]
-        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
+        self._apply_feature_filter(
+            feature_ids, feature_id, conditions, params,
+            instance_hashes=instance_hashes)
         con = self._get_connection()
         try:
             row = con.execute(f"""
@@ -1332,6 +1371,8 @@ class FeatureStoreReader:
         hour: int,
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
     ) -> Optional[int]:
         """Neuester Wanduhr-Epoch einer (dow, hour)-Heatmap-Zelle (oder None).
 
@@ -1360,7 +1401,9 @@ class FeatureStoreReader:
             "EXTRACT(HOUR FROM bar_time AT TIME ZONE 'UTC')::INTEGER = ?",
         ]
         params: List[Any] = [symbol, timeframe, dow, hour]
-        self._apply_feature_filter(feature_ids, feature_id, conditions, params)
+        self._apply_feature_filter(
+            feature_ids, feature_id, conditions, params,
+            instance_hashes=instance_hashes)
         con = self._get_connection()
         try:
             row = con.execute(f"""

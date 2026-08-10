@@ -56,6 +56,8 @@ class AnalyticsRepository:
         timeframe: str,
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = 1000,
     ) -> Dict[str, Any]:
         """Rohe Feature-Zeilen fuer die Tabellen-Seite.
@@ -65,7 +67,7 @@ class AnalyticsRepository:
         """
         rows = self.reader.fetch_rows(
             symbol, timeframe, feature_id=feature_id, feature_ids=feature_ids,
-            limit=limit)
+            instance_hashes=instance_hashes, limit=limit)
         return {"rows": rows, "total": len(rows)}
 
     # ------------------------------------------------------------------
@@ -78,6 +80,8 @@ class AnalyticsRepository:
         metric: str = "count",
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """2D-Matrix (Wochentag x Tagesstunde) fuer die Heatmap-Seite.
 
@@ -105,7 +109,7 @@ class AnalyticsRepository:
         use_metric = metric if metric in metrics else "count"
         result = self.reader.fetch_heatmap(
             symbol, timeframe, metric=use_metric, feature_id=feature_id,
-            feature_ids=feature_ids
+            feature_ids=feature_ids, instance_hashes=instance_hashes
         )
         result["metrics"] = metrics
         return result
@@ -123,6 +127,8 @@ class AnalyticsRepository:
         agg: str = "count",
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Generische 2D-Matrix (freie Dimensionen + Aggregationen, 20.02).
@@ -149,7 +155,8 @@ class AnalyticsRepository:
         # Rows des Symbol/Timeframe).
         by_service = self.reader.feature_keys_by_service(
             symbol, timeframe, numeric_only=True,
-            feature_id=feature_id, feature_ids=feature_ids)
+            feature_id=feature_id, feature_ids=feature_ids,
+            instance_hashes=instance_hashes)
         field_sources: Dict[str, List[str]] = {}
         for fid, keys in by_service.items():
             if not fid:
@@ -177,7 +184,7 @@ class AnalyticsRepository:
             result = self.reader.fetch_generic_heatmap(
                 symbol, timeframe, x_dim, y_dim, field=use_field or None,
                 agg=use_agg, feature_id=feature_id, feature_ids=feature_ids,
-                limit=limit,
+                instance_hashes=instance_hashes, limit=limit,
             )
         except ValueError as e:
             print(f"WARN [AnalyticsRepository] get_generic_heatmap: {e}")
@@ -242,6 +249,8 @@ class AnalyticsRepository:
         y_column: Optional[str] = None,
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         """X/Y-Paare zweier feature_data-JSON-Keys fuer die Scatter-Seite.
@@ -271,7 +280,8 @@ class AnalyticsRepository:
 
         rows = self.reader.fetch_columns(
             symbol, timeframe, [x_col, y_col],
-            feature_id=feature_id, feature_ids=feature_ids, limit=limit,
+            feature_id=feature_id, feature_ids=feature_ids,
+            instance_hashes=instance_hashes, limit=limit,
         )
         points: List[Dict[str, float]] = []
         for r in rows:
@@ -303,6 +313,8 @@ class AnalyticsRepository:
         bins: int = 20,
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Histogramm eines feature_data-JSON-Keys fuer die Verteilungs-Seite.
@@ -333,7 +345,8 @@ class AnalyticsRepository:
 
         rows = self.reader.fetch_columns(
             symbol, timeframe, [col], feature_id=feature_id,
-            feature_ids=feature_ids, limit=limit,
+            feature_ids=feature_ids, instance_hashes=instance_hashes,
+            limit=limit,
         )
         values = [r[col] for r in rows if r.get(col) is not None]
         values = [v for v in values if np.isfinite(v)]
@@ -363,6 +376,8 @@ class AnalyticsRepository:
         timeframe: str,
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
     ) -> Optional[int]:
         """Neuester Wanduhr-Epoch (int) der Feature-Rows (oder None).
 
@@ -370,7 +385,8 @@ class AnalyticsRepository:
         das Chart an der neuesten Feature-Bar des Symbol/Timeframe).
         """
         return self.reader.fetch_latest_bar_time(
-            symbol, timeframe, feature_id=feature_id, feature_ids=feature_ids
+            symbol, timeframe, feature_id=feature_id, feature_ids=feature_ids,
+            instance_hashes=instance_hashes
         )
 
     def get_recent_bar_time_for_cell(
@@ -381,6 +397,8 @@ class AnalyticsRepository:
         hour: int,
         feature_id: Optional[str] = None,
         feature_ids: Optional[List[str]] = None,
+        # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
+        instance_hashes: Optional[List[str]] = None,
     ) -> Optional[int]:
         """Neuester Wanduhr-Epoch einer (dow, hour)-Heatmap-Zelle (oder None).
 
@@ -390,7 +408,8 @@ class AnalyticsRepository:
         """
         return self.reader.fetch_recent_bar_time_for_cell(
             symbol, timeframe, dow, hour,
-            feature_id=feature_id, feature_ids=feature_ids
+            feature_id=feature_id, feature_ids=feature_ids,
+            instance_hashes=instance_hashes
         )
 
     # ------------------------------------------------------------------

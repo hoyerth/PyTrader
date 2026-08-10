@@ -110,6 +110,10 @@ class AnalyticsViewModel(QObject):
             # 15.03-E (Multi-Select): feature_ids = Liste der plugin_ids
             # (Datenquellen-Filter, `WHERE feature_id IN (...)`); leer = alle.
             "feature_ids": [],
+            # Runde 10 (Bug 1): Varianten-Einschraenkung (instance_hashes
+            # der gecheckten Clone-Varianten; leer = alle Varianten der
+            # gewaehlten plugin_ids).
+            "instance_hashes": [],
             # 19.02 (Cleanup): Keine festen Legacy-Spalten-Defaults mehr –
             # scatter_x/scatter_y/distribution_column werden beim ersten
             # Daten-Payload auf die verfuegbaren feature_data-JSON-Keys
@@ -258,29 +262,67 @@ class AnalyticsViewModel(QObject):
         """Kompatibilitaets-Alias (Legacy): Einzel-ID -> Multi-Liste."""
         self.set_feature_ids([feature_id] if feature_id else [])
 
-    def set_feature_ids(self, feature_ids) -> None:
+    def set_feature_ids(self, feature_ids, instance_hashes=None) -> None:
         """Setzt die Multi-Auswahl der Datenquellen (15.03-E).
 
         `feature_ids` sind die plugin_ids des Feature-Store (z. B.
         ["srv_grid_lines", "srv_proximity"]); leer = kein Filter (alle Features).
         Typen-/Duplikat-normalisiert; ohne Aenderung wird kein Refresh
         ausgeloest (idempotent, wie set_symbol/set_timeframe).
+
+        Runde 10 (Bug 1): `instance_hashes` schraenkt die gewaehlten
+        plugin_ids auf bestimmte Varianten (Clones) ein - None/leer =
+        KEINE Varianten-Einschraenkung (alle Varianten der plugin_ids).
+        None bedeutet ausserdem: bestehende Hash-Einschraenkung bleibt
+        erhalten (z. B. bei reinen feature_ids-Aenderungen durch das
+        Feld-Dropdown). Die Hashes fliessen als zusaetzliche
+        WHERE-Bedingung in die Reader-Queries
+        (`(instance_hash IS NULL OR instance_hash IN (...))`).
         """
         ids = self._normalize_feature_ids(feature_ids)
-        if ids == self._params.get("feature_ids"):
+        hashes_changed = instance_hashes is not None
+        if hashes_changed:
+            hashes = self._normalize_instance_hashes(instance_hashes)
+        else:
+            # None = bestehende Einschraenkung beibehalten (kein
+            # versehentliches Leeren durch Alt-Aufrufer).
+            hashes = self._params.get("instance_hashes") or []
+        if (ids == self._params.get("feature_ids")
+                and (not hashes_changed
+                     or hashes == self._params.get("instance_hashes"))):
             return
+        ids_changed = ids != self._params.get("feature_ids")
         self._params["feature_ids"] = ids
+        if hashes_changed:
+            self._params["instance_hashes"] = hashes
         self._mark_dirty()
-        # Runde 8 (Bugfix 4): Die UI leitet ihr 'Feld'-Dropdown SYNCHRON neu
-        # ab (kein Query-Round-Trip) - das HeatmapWidget verbindet
-        # feature_ids_changed und baut Items/Haken/Current sofort neu.
-        self.feature_ids_changed.emit()
+        if ids_changed:
+            # Runde 8 (Bugfix 4): Die UI leitet ihr 'Feld'-Dropdown
+            # SYNCHRON neu ab (kein Query-Round-Trip) - das
+            # HeatmapWidget verbindet feature_ids_changed und baut
+            # Items/Haken/Current sofort neu. (Nur bei feature_ids-
+            # Aenderung; reine Hash-Aenderung laesst das Feld-Dropdown
+            # unveraendert.)
+            self.feature_ids_changed.emit()
         self._refresh((QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC,
                        QUERY_SCATTER, QUERY_DISTRIBUTION))
 
     @staticmethod
     def _normalize_feature_ids(value) -> List[str]:
         """Normalisiert feature_ids (Liste[str], dedupliziert, getrimmt)."""
+        if not value:
+            return []
+        out: List[str] = []
+        for v in value:
+            s = str(v).strip()
+            if s and s not in out:
+                out.append(s)
+        return out
+
+    @staticmethod
+    def _normalize_instance_hashes(value) -> List[str]:
+        """Normalisiert instance_hashes (Liste[str], dedupliziert,
+        getrimmt) - Runde 10 (Bug 1, Varianten-Einschraenkung)."""
         if not value:
             return []
         out: List[str] = []
@@ -576,6 +618,9 @@ class AnalyticsViewModel(QObject):
             "symbol": p["symbol"],
             "timeframe": p["timeframe"],
             "feature_ids": p["feature_ids"],
+            # Runde 10 (Bug 1): Varianten-Einschraenkung in die
+            # Query-Params (leer = alle Varianten der feature_ids).
+            "instance_hashes": p.get("instance_hashes") or [],
             # Runde 8 (Bugfix 3): Generation in die Worker-Params - der
             # Worker spiegelt sie ins Ergebnis-Dict, die UI erkennt damit
             # Stale-Payloads (Queries vor dem letzten Restore).
@@ -775,11 +820,16 @@ class AnalyticsViewModel(QObject):
                 self._params[_hk] = "hour"
         self._params["feature_ids"] = self._normalize_feature_ids(
             self._params.get("feature_ids"))
-        # 20.01 (E5): Fehlende Services isolieren – valide IDs direkt setzen.
-        valid, missing = self._resolve_feature_ids(self._params["feature_ids"])
-        self._params["feature_ids"] = valid
-        if missing:
-            self.missing_services_detected.emit(list(missing))
+        # Runde 10 (Bug 1): instance_hashes genauso normalisieren.
+        self._params["instance_hashes"] = self._normalize_instance_hashes(
+            self._params.get("instance_hashes"))
+        # 20.01 (E5) + Runde 9 (Bug 1): Fehlende Services NUR melden -
+        # die IDs bleiben im Filter (kein stilles Kuerzen des restaurierten
+        # Filters; die DB liefert fuer unbekannte IDs keine Zeilen).
+        if self._params["feature_ids"]:
+            _, missing = self._resolve_feature_ids(self._params["feature_ids"])
+            if missing:
+                self.missing_services_detected.emit(list(missing))
         self._params["bins"] = self._clamp_bins(self._params.get("bins"))
         self._params["limit"] = self._clamp_limit(self._params.get("limit"))
         if not mark_dirty:
@@ -789,9 +839,13 @@ class AnalyticsViewModel(QObject):
         # Stale-Payloads aelterer Generation (Queries, die VOR diesem
         # Profilwechsel gestartet wurden).
         self._restore_generation += 1
-        self.refresh_all()
-        # 20.04-Timing-Fix (D): UI-Combos nach dem Restore synchronisieren.
+        # Runde 10 (Bug 4): REIHENFOLGE - erst die UI-Combos synchronisieren
+        # (params_restored), DANN refresh_all(). Vorher starteten die
+        # Queries mit leeren/alten Controls (leere Combos ->
+        # _current_params() None -> Queries uebersprungen bzw. doppelte/
+        # stale Requests beim Restore).
         self.params_restored.emit()
+        self.refresh_all()
 
     def _apply_heatmap_section(self, heat: Any) -> None:
         """Loest die verschachtelte `charts.heatmap`-Sektion auf (20.02).
@@ -922,19 +976,30 @@ class AnalyticsViewModel(QObject):
             self._apply_heatmap_section(params.get("heatmap"))
         self._params["feature_ids"] = self._normalize_feature_ids(
             self._params.get("feature_ids"))
-        valid, missing = self._resolve_feature_ids(self._params["feature_ids"])
-        self._params["feature_ids"] = valid
-        if missing:
-            self.missing_services_detected.emit(list(missing))
+        # Runde 10 (Bug 1): instance_hashes genauso normalisieren.
+        self._params["instance_hashes"] = self._normalize_instance_hashes(
+            self._params.get("instance_hashes"))
+        # Runde 9 (Bug 1): Fehlende Services NUR melden, NICHT aus dem
+        # Filter entfernen - der Resolver wuerde sonst den restaurierten
+        # Filter stillschweigend kuerzen (die DB liefert fuer unbekannte
+        # IDs einfach keine Zeilen; Graceful Degradation ohne Datenverlust).
+        if self._params["feature_ids"]:
+            _, missing = self._resolve_feature_ids(self._params["feature_ids"])
+            if missing:
+                self.missing_services_detected.emit(list(missing))
         self._params["bins"] = self._clamp_bins(self._params.get("bins"))
         self._params["limit"] = self._clamp_limit(self._params.get("limit"))
         # Runde 8 (Bugfix 3): Generation erhoehen - die UI verwirft
         # Stale-Payloads aelterer Generation (Queries, die VOR diesem
         # Workspace-Restore gestartet wurden).
         self._restore_generation += 1
-        self.refresh_all()
-        # 20.04-Timing-Fix (D): UI-Combos nach dem Restore synchronisieren.
+        # Runde 10 (Bug 4): REIHENFOLGE - erst die UI-Combos synchronisieren
+        # (params_restored), DANN refresh_all(). Vorher starteten die
+        # Queries mit leeren/alten Controls (leere Combos ->
+        # _current_params() None -> Queries uebersprungen bzw. doppelte/
+        # stale Requests beim Restore).
         self.params_restored.emit()
+        self.refresh_all()
 
     @staticmethod
     def _emit_profile_changed(name: str) -> None:
@@ -1234,15 +1299,75 @@ class AnalyticsViewModel(QObject):
         try:
             presets = model.plugin_presets() or {}
         except Exception:
-            return []
-        if not presets:
-            return []
+            presets = {}
+        # Runde 9 (Bug 2): Der strikte Hash-Vergleich war falsch - wenn
+        # die Daten einer Variante unter einem anderen/veralteten Hash
+        # oder ohne Hash (NULL, Alt-Bestand) geschrieben wurden, wurde
+        # sie faelschlich als '(No Data)' markiert. Zusaetzlich fehlten
+        # Set-Instanz-Varianten komplett (nur indicator_presets wurden
+        # geprueft). Beides wird hier korrigiert.
         try:
             available = self._repo.reader.available_instance_hashes(
                 symbol, timeframe)
         except Exception:
             available = set()
+        # feature_id-Ebene: plugin_ids, die UEBERHAUPT feature_store-Daten
+        # besitzen (egal unter welchem instance_hash / ohne Hash).
+        try:
+            keys_by_service = self._repo.reader.feature_keys_by_service(
+                symbol, timeframe)
+            pids_with_data = {str(k).strip().lower() for k in (keys_by_service or {})}
+        except Exception:
+            pids_with_data = set()
+        try:
+            from analytics.engine.service_models import generate_instance_hash
+        except Exception:
+            generate_instance_hash = None
+
+        # Runde 10 (Bug 2): available case-insensitiv indexieren (einmalig).
+        available_low = {str(x).strip().lower()
+                         for x in (available or set())}
+
+        def _has_data(pid: str, h: str) -> bool:
+            """True, wenn die Variante Daten besitzt.
+
+            Runde 10 (Bug 2): Differenzierung statt grobem
+            pids_with_data-Fallback - eine benannte Variante mit eigenem
+            instance_hash zaehlt NUR, wenn GENAU dieser Hash Zeilen
+            besitzt (sonst waere '(No Data)' nie sichtbar, sobald eine
+            andere Variante desselben Services bereits Daten hat). Der
+            pids_with_data-Fallback gilt nur noch fuer Varianten OHNE
+            Hash (NULL/Alt-Bestand, nicht unterscheidbar)."""
+            if not pid:
+                return True
+            h_s = str(h or "").strip()
+            if h_s:
+                return h_s.lower() in available_low
+            return str(pid).strip().lower() in pids_with_data
+
         out: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str]] = set()
+
+        def _add(pid: str, pname: str, h: str) -> None:
+            pid_s = str(pid or "").strip()
+            if not pid_s:
+                return
+            h_s = str(h or "").strip()
+            key = (pid_s.lower(), h_s)
+            if key in seen:
+                return
+            seen.add(key)
+            if _has_data(pid_s, h_s):
+                return
+            pname_s = str(pname or "Default")
+            out.append({
+                "plugin_id": pid_s,
+                "preset_name": pname_s,
+                "instance_hash": h_s,
+                "display_name": self.resolve_service_display_name(
+                    pid_s, pname_s),
+            })
+
         for pid, clones in presets.items():
             if not clones or not isinstance(clones, list):
                 continue
@@ -1251,17 +1376,30 @@ class AnalyticsViewModel(QObject):
                     continue
                 if clone.get("is_archived"):
                     continue
-                h = str(clone.get("instance_hash") or "").strip()
-                if not h or h in available:
+                _add(str(pid), str(clone.get("preset_name") or "Default"),
+                     str(clone.get("instance_hash") or ""))
+        # Runde 9 (Bug 2): Set-Instanz-Varianten (Services in Sets mit
+        # eigenen Parametern) ebenfalls erfassen - vorher fehlten sie.
+        try:
+            for s in model.get_sets() or []:
+                services = s.get("services") if isinstance(s, dict) else None
+                if not isinstance(services, dict):
                     continue
-                pname = str(clone.get("preset_name") or "Default")
-                out.append({
-                    "plugin_id": str(pid),
-                    "preset_name": pname,
-                    "instance_hash": h,
-                    "display_name": self.resolve_service_display_name(
-                        str(pid), pname),
-                })
+                for instance_id, svc in services.items():
+                    if not isinstance(svc, dict):
+                        continue
+                    if svc.get("is_archived"):
+                        continue
+                    pid = str(svc.get("plugin_id") or "").strip()
+                    if not pid:
+                        continue
+                    if generate_instance_hash is not None:
+                        h = generate_instance_hash(pid, svc.get("params") or {})
+                    else:
+                        h = ""
+                    _add(pid, f"{pid} [{instance_id}]", h)
+        except Exception:
+            pass
         return out
 
     @property

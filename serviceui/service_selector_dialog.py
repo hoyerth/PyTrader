@@ -345,6 +345,9 @@ class ServiceSelectorDialog(QDialog):
     #: emittiert dieses Signal NICHT mehr (nur das Read-Only-Panel folgt
     #: dem Klick, Punkte 1-7).
     selection_ids_requested = Signal(list)
+    # Runde 10 (Bug 1): Varianten-granularer Filter - instance_hashes der
+    # gecheckten Clone-Varianten (parallel zu selection_ids_requested).
+    selection_hashes_requested = Signal(list)
 
     def __init__(
         self,
@@ -541,15 +544,20 @@ class ServiceSelectorDialog(QDialog):
     # ------------------------------------------------------------------
     # Oeffentliche API
     # ------------------------------------------------------------------
-    def apply_feature_ids(self, feature_ids: List[str]) -> None:
+    def apply_feature_ids(self, feature_ids: List[str],
+                          instance_hashes=None) -> None:
         """Spiegelt die aktuelle ViewModel-Auswahl im Baum (Reverse-Mapping).
 
         Wird beim Oeffnen des Dialogs gerufen, damit ein restauriertes
         Profil bzw. der aktive Filter im Checkbox-Baum sichtbar ist.
+        Runde 10 (Bug 1): instance_hashes (Varianten) werden ebenfalls
+        auf den Baum gemappt - nur die passenden Clone-Varianten werden
+        angehakt (Hash-Granularitaet).
         """
         tree = self.selector.master_tree
         if tree is not None:
-            tree.set_checked_feature_ids(list(feature_ids or []))
+            tree.set_checked_feature_ids(
+                list(feature_ids or []), list(instance_hashes or []))
 
     def current_display_names(self) -> List[str]:
         tree = self.selector.master_tree
@@ -1372,9 +1380,11 @@ class ServiceSelectorDialog(QDialog):
             return
         try:
             ids = list(tree.checked_feature_ids() or [])
+            hashes = list(tree.checked_instance_hashes() or [])
         except (RuntimeError, AttributeError):
             return
         self.selection_ids_requested.emit(ids)
+        self.selection_hashes_requested.emit(hashes)
 
     def _on_tree_selection_details(self, node_type: str, set_id: str,
                                    service_id: str, plugin_id: str) -> None:
@@ -1809,10 +1819,18 @@ class ServiceSelectorDialog(QDialog):
             pos_y = geom.get("pos_y")
             w = geom.get("width")
             h = geom.get("height")
-            screen = QApplication.primaryScreen().availableGeometry()
+            # Runde 10 (Bug 5): Gegen ALLE Screens pruefen - eine Position
+            # auf dem 2. Monitor ist NICHT off-screen (Fallback nur, wenn
+            # sie auf KEINEM Screen liegt). Vorher wurde nur der Primary-
+            # Screen geprueft -> Position auf Monitor 2 wurde verworfen.
+            screens = [s.availableGeometry()
+                       for s in QApplication.screens()]
             if pos_x is not None and pos_y is not None:
-                if (pos_x < screen.x() - 100 or pos_x > screen.right() or
-                        pos_y < screen.y() - 100 or pos_y > screen.bottom()):
+                on_screen = any(
+                    (scr.x() - 100 <= pos_x <= scr.right())
+                    and (scr.y() - 100 <= pos_y <= scr.bottom())
+                    for scr in screens)
+                if not on_screen:
                     pos_x = pos_y = None
                 else:
                     self.move(pos_x, pos_y)

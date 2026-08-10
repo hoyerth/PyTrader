@@ -1360,6 +1360,25 @@ class HeatmapWidget(QWidget):
                     prev_field, prev_field, checked=True)
                 self._combo_field.setCurrentIndex(
                     self._combo_field.count() - 1)
+            # Runde 10 (Bug 2): '(No Data)'-Hinweis-Eintraege zentral HIER
+            # rendern - deckt auch den Cache-Rebuild-Pfad (_sync_from_params
+            # / _on_feature_ids_changed) ab, nicht nur den Payload-Pfad. Eine
+            # Variante ohne Daten wird dadurch sichtbar, sobald sie gewaehlt
+            # wurde (vorher blieb der Hinweis nach einem Rebuild ohne frischen
+            # Payload verschwunden).
+            try:
+                no_data = self._view_model.resolve_no_data_variants(
+                    str(p.get("symbol") or ""),
+                    str(p.get("timeframe") or ""))
+            except Exception:
+                no_data = []
+            if no_data:
+                self._combo_field.add_header_item(
+                    "🕓 Noch ohne Daten (erster Scan ausstehend):")
+                for nd in no_data:
+                    self._combo_field.add_disabled_item(
+                        f"{nd.get('display_name') or nd.get('plugin_id')} "
+                        f"({nd.get('preset_name')}) – (No Data)")
         finally:
             self._combo_field.blockSignals(False)
         self._update_controls()
@@ -1436,24 +1455,9 @@ class HeatmapWidget(QWidget):
                     keys, field_sources,
                     payload_agg=str(data.get("agg") or ""),
                     payload_field=str(data.get("field") or ""))
-            # 20.04-Q8-Fix (User-Bugreport 09.08.2026, Option 'No Data'):
-            # Neue Plugin-Varianten (Clones/Presets) ohne feature_store-Daten
-            # sofort als deaktivierte Hinweis-Eintraege zeigen ('(No Data)').
-            # Nur im Datenpfad (der Payload kennt symbol/timeframe).
-            no_data = []
-            try:
-                no_data = vm.resolve_no_data_variants(
-                    str(data.get("symbol") or ""),
-                    str(data.get("timeframe") or ""))
-            except Exception:
-                no_data = []
-            if no_data:
-                self._combo_field.add_header_item(
-                    "🕓 Noch ohne Daten (erster Scan ausstehend):")
-                for nd in no_data:
-                    self._combo_field.add_disabled_item(
-                        f"{nd.get('display_name') or nd.get('plugin_id')} "
-                        f"({nd.get('preset_name')}) – (No Data)")
+            # Runde 10 (Bug 2): '(No Data)'-Hinweis-Eintraege werden zentral
+            # in _rebuild_field_dropdown() gerendert (deckt auch den
+            # Cache-Rebuild-Pfad ab) - hier nur noch x/y/agg synchronisieren.
             self._set_combo_data(self._combo_x, x_dim)
             self._set_combo_data(self._combo_y, y_dim)
             self._set_combo_data(self._combo_agg, str(agg or "count"))
