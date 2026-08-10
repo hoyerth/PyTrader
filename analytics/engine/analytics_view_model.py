@@ -79,6 +79,15 @@ class AnalyticsViewModel(QObject):
     # VM-Params (kein UI-Import im ViewModel, MVVM-Invariante 4).
     params_restored = Signal()
 
+    # Runde 8 (Bugfix 4, 10.08.2026): feature_ids-Aenderungen (ServicePicker
+    # Check/Uncheck) SYNCHRON an die UI – das HeatmapWidget leitet sein
+    # 'Feld'-Dropdown sofort aus den gecachten Feld-Metadaten + den neuen
+    # feature_ids neu ab (kein Debounce/Query-Round-Trip noetig). Wird in
+    # set_feature_ids() NACH der Uebernahme emittiert (idempotent: nur bei
+    # echter Aenderung). Restore-Pfade setzen _params["feature_ids"] DIREKT
+    # und emittieren stattdessen params_restored (kein Dirty/Doppel-Refresh).
+    feature_ids_changed = Signal()
+
     def __init__(
         self,
         analytics_repo: Optional[AnalyticsRepository] = None,
@@ -153,6 +162,14 @@ class AnalyticsViewModel(QObject):
         # abgelegt (die UI liest sie dort - identischer Pfad wie der
         # Workspace-Restore).
         self._ui_layout: Dict[str, Any] = {}
+        # Runde 8 (Bugfix 3, 10.08.2026): Generations-Token gegen
+        # Stale-Payloads - wird bei JEDEM restore_workspace()/
+        # _apply_profile() erhoeht und wandert ueber _current_params() in
+        # die Worker-Params. Der Worker spiegelt es ins Ergebnis-Dict
+        # (data["restore_generation"]); die UI verwirft Payloads aelterer
+        # Generation (Queries, die VOR dem Restore gestartet wurden,
+        # duerfen den synchron restaurierten Zustand nicht ueberschreiben).
+        self._restore_generation: int = 0
 
         # Debounce-QTimer (200-300 ms, 15.03-Spezifikation)
         self._debounce = QTimer(self)
@@ -254,6 +271,10 @@ class AnalyticsViewModel(QObject):
             return
         self._params["feature_ids"] = ids
         self._mark_dirty()
+        # Runde 8 (Bugfix 4): Die UI leitet ihr 'Feld'-Dropdown SYNCHRON neu
+        # ab (kein Query-Round-Trip) - das HeatmapWidget verbindet
+        # feature_ids_changed und baut Items/Haken/Current sofort neu.
+        self.feature_ids_changed.emit()
         self._refresh((QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC,
                        QUERY_SCATTER, QUERY_DISTRIBUTION))
 
@@ -555,6 +576,10 @@ class AnalyticsViewModel(QObject):
             "symbol": p["symbol"],
             "timeframe": p["timeframe"],
             "feature_ids": p["feature_ids"],
+            # Runde 8 (Bugfix 3): Generation in die Worker-Params - der
+            # Worker spiegelt sie ins Ergebnis-Dict, die UI erkennt damit
+            # Stale-Payloads (Queries vor dem letzten Restore).
+            "restore_generation": self._restore_generation,
         }
         if kind == QUERY_TABLE:
             base["limit"] = p["limit"]
@@ -760,6 +785,10 @@ class AnalyticsViewModel(QObject):
         if not mark_dirty:
             self._dirty = False
             self.dirty_changed.emit(False)
+        # Runde 8 (Bugfix 3): Generation erhoehen - die UI verwirft
+        # Stale-Payloads aelterer Generation (Queries, die VOR diesem
+        # Profilwechsel gestartet wurden).
+        self._restore_generation += 1
         self.refresh_all()
         # 20.04-Timing-Fix (D): UI-Combos nach dem Restore synchronisieren.
         self.params_restored.emit()
@@ -899,6 +928,10 @@ class AnalyticsViewModel(QObject):
             self.missing_services_detected.emit(list(missing))
         self._params["bins"] = self._clamp_bins(self._params.get("bins"))
         self._params["limit"] = self._clamp_limit(self._params.get("limit"))
+        # Runde 8 (Bugfix 3): Generation erhoehen - die UI verwirft
+        # Stale-Payloads aelterer Generation (Queries, die VOR diesem
+        # Workspace-Restore gestartet wurden).
+        self._restore_generation += 1
         self.refresh_all()
         # 20.04-Timing-Fix (D): UI-Combos nach dem Restore synchronisieren.
         self.params_restored.emit()
@@ -988,6 +1021,19 @@ class AnalyticsViewModel(QObject):
         abgefragt (kein `_params`-Key).
         """
         return dict(self._workspace_layout)
+
+    @property
+    def restore_generation(self) -> int:
+        """Generations-Token des letzten Restores (Runde 8, Stale-Guard).
+
+        Wird bei jedem restore_workspace()/_apply_profile() erhoeht und vom
+        Worker in jedes Ergebnis-Dict gespiegelt (`data["restore_"]`
+        generation). Die UI vergleicht den Payload-Wert mit diesem Token und
+        verwirft Payloads aelterer Generation (Queries, die VOR dem Restore
+        gestartet wurden, ueberschreiben den synchron restaurierten Zustand
+        nicht mehr).
+        """
+        return self._restore_generation
 
     def heatmap_metrics(self, symbol: str, timeframe: str) -> List[str]:
         """Verfuegbare Heatmap-Metriken fuer ein Symbol/Timeframe (19.02).

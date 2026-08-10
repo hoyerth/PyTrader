@@ -483,6 +483,12 @@ class HeatmapWidget(QWidget):
         # 20.03.03 (Q2): Key -> aktive Quellen-Services aus dem Payload
         # (`field_sources`) fuer die ALL-Expansion der Sammel-Eintraege.
         self._field_sources: Dict[str, List[str]] = {}
+        # Runde 8 (Bugfix 3/4, 10.08.2026): Cache der zuletzt verfuegbaren
+        # Feld-Keys (Payload-Metadaten) - Grundlage des SYNCHRONEN
+        # Feld-Dropdown-Rebuilds (_rebuild_field_dropdown) ohne
+        # Query-Round-Trip. Wird bei jedem Daten-Payload aktualisiert;
+        # _sync_from_params/feature_ids_changed bauen daraus Items/Haken.
+        self._field_keys: List[str] = []
 
         # --- Steuerung (Zeile 1: Dimensionen/Aggregation/Feld) ---
         self._combo_x = QComboBox()
@@ -625,6 +631,13 @@ class HeatmapWidget(QWidget):
         # stoesst keinen Query an (kein Loop).
         if hasattr(view_model, "params_restored"):
             view_model.params_restored.connect(self._sync_from_params)
+        # Runde 8 (Bugfix 4): feature_ids-Aenderungen (ServicePicker
+        # Check/Uncheck) -> das 'Feld'-Dropdown wird SOFORT synchron neu
+        # abgeleitet (kein Debounce/Query-Round-Trip). Defensiv per hasattr
+        # (Test-Mocks ohne Signal).
+        if hasattr(view_model, "feature_ids_changed"):
+            view_model.feature_ids_changed.connect(
+                self._on_feature_ids_changed)
         self._sync_from_params()
 
     def is_candle_projection_enabled(self) -> bool:
@@ -655,19 +668,14 @@ class HeatmapWidget(QWidget):
             self._set_combo_data(
                 self._combo_agg,
                 str(p.get("heatmap_agg") or "confluence_count"))
-            field = str(p.get("heatmap_field") or "")
-            if field:
-                # 20.03.02: Index ueber den Key-Teil des userData suchen
-                # ('{service_id}|{key}'); unbekanntes Feld als checkbares
-                # Item anlegen (Restore-Fallback).
-                fidx = self._find_field_index(field)
-                if fidx < 0:
-                    self._combo_field.add_checkable_item(field, field,
-                                                         checked=True)
-                    fidx = self._combo_field.count() - 1
-                self._combo_field.blockSignals(True)
-                self._combo_field.setCurrentIndex(fidx)
-                self._combo_field.blockSignals(False)
+            # Runde 8 (Bugfix 3): Das 'Feld'-Dropdown wird aus den gecachten
+            # Feld-Metadaten (self._field_keys/self._field_sources) + den
+            # aktuellen VM-Params SYNCHRON neu abgeleitet (Items, Haken,
+            # Current). Ein restaurierter heatmap_field bleibt dadurch auch
+            # ohne frischen Daten-Payload sichtbar (Fallback-Roh-Item, wenn
+            # noch keine Payload-Metadaten vorliegen).
+            self._rebuild_field_dropdown(self._field_keys,
+                                         self._field_sources)
             self._chk_candle.setChecked(bool(
                 p.get("candle_projection_enabled")))
             self._set_zoom_slider(self._slider_zoom_x,
@@ -1259,53 +1267,53 @@ class HeatmapWidget(QWidget):
                 return f"{name} / {str(key)}"
         return str(key)
 
-    def _sync_combos_from_payload(self, data: Dict[str, Any]) -> None:
-        """Synchronisiert die Combos mit dem tatsaechlichen Payload."""
+    def _rebuild_field_dropdown(
+        self,
+        keys: List[str],
+        field_sources: Dict[str, List[str]],
+        payload_agg: Optional[str] = None,
+        payload_field: Optional[str] = None,
+    ) -> None:
+        """Baut das 'Feld'-Dropdown aus Feld-Metadaten + VM-Params (Runde 8).
+
+        Single Source of Truth:
+          * Items      -> `keys`/`field_sources` (Payload-Metadaten bzw.
+                          Widget-Cache `self._field_keys/_field_sources`)
+          * Haken      -> `feature_ids` (ServicePicker, aktiver Filter)
+          * Current    -> `heatmap_field` (Restore/Workspace gewinnt)
+
+        SYNCHRON (kein Query-Round-Trip): wird aus dem Datenpfad
+        (_sync_combos_from_payload) UND dem VM-Pfad (_sync_from_params /
+        _on_feature_ids_changed) gerufen. Ein restaurierter
+        Ergebnisparameter (Bug 3) bleibt dadurch auch ohne frischen Payload
+        sichtbar; ein Check/Uncheck im ServicePicker (Bug 4) aktualisiert
+        das Dropdown sofort. Die Runde-7-Prioritaet (VM-Params gewinnen
+        gegen einen Stale-Payload) wird hier zentral angewendet.
+        """
         if self._view_model is None:
             return
-        metrics = [str(m) for m in (data.get("metrics") or [])]
-        keys = [m for m in metrics if m not in ("count", "confluence_count")]
-        # 20.02.01 (User-Meldung 3b): Key -> Services, die ihn liefern
-        # (Repository `field_sources`); Anzeige '{Service} / {Key}'.
-        field_sources = data.get("field_sources") or {}
-        # 20.03.03 (Q2): Quellen je Key fuer die ALL-Expansion merken.
+        p = self._view_model.params
+        # Cache aktualisieren (Payload-Metadaten bzw. uebergebene Werte).
+        self._field_keys = [str(k) for k in (keys or [])]
         self._field_sources = {
             str(k): [str(s) for s in (v or [])]
-            for k, v in field_sources.items()
+            for k, v in (field_sources or {}).items()
         }
-        # 10.08.2026 (Bugfix Runde 7, Bug 3): Die restaurierten
-        # VM-Params (Workspace/Profil) GEWINNEN gegen einen Stale-Payload
-        # (Query lief VOR dem Restore mit Default-Params). Der Daten-Payload
-        # bestaetigt nur noch die tatsaechlich verwendeten Werte.
-        agg = (str(self._view_model.params.get("heatmap_agg") or "")
-               or str(data.get("agg") or "")
+        # Agg/Feld: restaurierte VM-Params gewinnen; erst wenn der VM leer
+        # ist, zaehlen Payload-Fallback bzw. aktueller Combo-Wert (Runde 7).
+        agg = (str(p.get("heatmap_agg") or "") or str(payload_agg or "")
                or str(self._combo_agg.currentData() or ""))
-        # 20.03.02: userData = '{service_id}|{key}' – fuer den Vergleich mit
-        # den Payload-Keys nur den Key-Teil verwenden.
-        prev_field = (str(self._view_model.params.get("heatmap_field") or "")
-                      or str(data.get("field") or "")
+        prev_field = (str(p.get("heatmap_field") or "")
+                      or str(payload_field or "")
                       or self._field_key(self._combo_field.currentData()))
-        self._syncing = True
+        active_ids = {str(f).strip().lower()
+                      for f in (p.get("feature_ids") or [])}
+        no_filter = not active_ids
         try:
             self._combo_field.blockSignals(True)
             self._combo_field.clear()
-            # 20.03.03 (Q1/Q4/Q5): 2-stufige Struktur – gemeinsame Keys
-            # (2+ Quellen) als Sammel-Eintrag 'Alle Services / {Key}' an der
-            # Spitze (initial angehakt), dann je Quelle ein EINDEUTIGER
-            # Eintrag '{Service-Name} / {Key}'. Sektions-Header sind
-            # deaktivierte Trennzeilen. Der rohe Key entfaellt bei bekannten
-            # Quellen (100 % Eindeutigkeit).
-            shared = sorted(k for k in keys
+            shared = sorted(k for k in self._field_keys
                             if len(self._field_sources.get(k) or []) >= 2)
-            # 10.08.2026 (Bugfix Runde 7, Bug 4/5): Die initialen CheckStates
-            # folgen dem aktiven feature_ids-Filter (ServicePicker) - nur
-            # Services aus dem Filter erscheinen angehakt. Das 'Feld'-
-            # Dropdown ist damit ein read-only Spiegel der Datenquellen-
-            # Auswahl (Single Source of Truth = Picker; das Write-Back der
-            # Feld-Haken wurde entfernt, siehe __init__).
-            active_ids = {str(f).strip().lower() for f in
-                          (self._view_model.params.get("feature_ids") or [])}
-            no_filter = not active_ids
             if shared:
                 self._combo_field.add_header_item(
                     "🌐 Gleiche Parameter (alle aktiven Services):")
@@ -1315,13 +1323,13 @@ class HeatmapWidget(QWidget):
                         f"Alle Services / {k}", f"ALL|{k}",
                         checked=no_filter or all(
                             s.lower() in active_ids for s in src))
-            if keys:
+            if self._field_keys:
                 self._combo_field.add_header_item("🔌 Einzelservices:")
-            for k in sorted(keys):
+            for k in sorted(self._field_keys):
                 sids = self._field_sources.get(k) or []
                 if len(sids) == 1:
-                    # Eindeutiger Service: Einzel-Eintrag nur angehakt, wenn
-                    # der Service im aktiven Filter liegt (oder kein Filter).
+                    # Eindeutiger Service: nur angehakt, wenn der Service im
+                    # aktiven Filter liegt (oder kein Filter).
                     self._combo_field.add_checkable_item(
                         self._field_label(k, sids), f"{sids[0]}|{k}",
                         checked=no_filter or sids[0].lower() in active_ids)
@@ -1331,29 +1339,110 @@ class HeatmapWidget(QWidget):
                 else:
                     # Shared Key: je Quelle ein Einzel-Eintrag, initial NICHT
                     # angehakt (der Sammel-Eintrag deckt die Quellen ab, Q5).
-                    all_active = all(s.lower() in active_ids
-                                       for s in sids)
+                    all_active = all(s.lower() in active_ids for s in sids)
                     for sid in sids:
                         self._combo_field.add_checkable_item(
                             self._field_label(k, [sid]), f"{sid}|{k}",
                             checked=no_filter
-                            or (sid.lower() in active_ids
-                                and not all_active))
-            if prev_field in keys:
+                            or (sid.lower() in active_ids and not all_active))
+            if prev_field in self._field_keys:
                 self._combo_field.setCurrentIndex(
                     self._find_field_index(prev_field))
-            elif keys:
+            elif self._field_keys:
                 # 20.03.03 (Q4): Index 0 kann ein Header sein -> ersten
                 # auswaehlbaren Eintrag waehlen.
                 self._combo_field.setCurrentIndex(self._first_field_index())
+            elif prev_field:
+                # Kein Payload/Cache (Restore vor dem ersten Datenpaket):
+                # Roh-Item anlegen, damit der restaurierte Wert sichtbar
+                # und ausgewaehlt bleibt (Muster _sync_from_params).
+                self._combo_field.add_checkable_item(
+                    prev_field, prev_field, checked=True)
+                self._combo_field.setCurrentIndex(
+                    self._combo_field.count() - 1)
+        finally:
+            self._combo_field.blockSignals(False)
+        self._update_controls()
+        # E6: Wert-Aggregation mit leerem/abweichendem Feld -> restauriertes
+        # Feld gewinnt (falls im Datensatz verfuegbar), sonst ersten Key
+        # uebernehmen und Konfiguration nachreichen (einmaliger Query-Loop).
+        vm_field = str(p.get("heatmap_field") or "")
+        if (agg in _VALUE_AGGS and self._combo_field.currentData()
+                and vm_field != self._field_key(
+                    self._combo_field.currentData())):
+            if vm_field and vm_field in self._field_keys:
+                fidx = self._find_field_index(vm_field)
+                if fidx >= 0:
+                    self._combo_field.setCurrentIndex(fidx)
+            else:
+                self._apply_config()
+
+    def _on_feature_ids_changed(self) -> None:
+        """Synchrones Neu-Ableiten des Feld-Dropdowns bei Check/Uncheck.
+
+        Runde 8 (Bugfix 4): `set_feature_ids()` emittiert
+        feature_ids_changed, sobald der ServicePicker-Haken geaendert wird -
+        Items/Haken/Current werden SOFORT aus den gecachten Feld-Metadaten
+        und den aktuellen feature_ids neu abgeleitet (Single Source of
+        Truth = Picker; kein Debounce/Query-Round-Trip noetig).
+        """
+        if self._syncing or self._view_model is None:
+            return
+        self._syncing = True
+        try:
+            self._rebuild_field_dropdown(self._field_keys,
+                                         self._field_sources)
+        finally:
+            self._syncing = False
+
+    def _sync_combos_from_payload(self, data: Dict[str, Any]) -> None:
+        """Synchronisiert die Combos mit dem tatsaechlichen Payload."""
+        if self._view_model is None:
+            return
+        vm = self._view_model
+        metrics = [str(m) for m in (data.get("metrics") or [])]
+        keys = [m for m in metrics if m not in ("count", "confluence_count")]
+        # 20.02.01 (User-Meldung 3b): Key -> Services, die ihn liefern
+        # (Repository `field_sources`); Anzeige '{Service} / {Key}'.
+        field_sources = data.get("field_sources") or {}
+        # Runde 8 (Bugfix 3): Stale-Payload-Guard. Der Worker spiegelt die
+        # Generation der Query-Params ins Ergebnis-Dict - Queries, die VOR
+        # dem letzten restore_workspace()/_apply_profile() gestartet wurden,
+        # tragen eine aeltere Generation. Deren Feld-Metadaten duerfen den
+        # synchron restaurierten Zustand NICHT ueberschreiben (die x/y/agg-
+        # Combos werden trotzdem mit VM-Prioritaet bestaetigt).
+        payload_gen = data.get("restore_generation")
+        stale = (payload_gen is not None
+                 and str(payload_gen) != str(
+                     getattr(vm, "restore_generation", 0)))
+        # x/y/agg mit VM-Prioritaet (Runde 7): restaurierte Werte gewinnen
+        # gegen einen Stale-Payload (Query lief VOR dem Restore mit
+        # Default-Params); erst wenn der VM leer ist, zaehlt der Payload.
+        x_dim = (str(vm.params.get("heatmap_x_dim") or "")
+                 or str(data.get("x_dim") or "date"))
+        y_dim = (str(vm.params.get("heatmap_y_dim") or "")
+                 or str(data.get("y_dim") or "hour"))
+        agg = (str(vm.params.get("heatmap_agg") or "")
+               or str(data.get("agg") or "")
+               or str(self._combo_agg.currentData() or ""))
+        self._syncing = True
+        try:
+            if not stale:
+                # Feld-Metadaten uebernehmen + 'Feld'-Dropdown synchron neu
+                # ableiten (Items/Haken/Current; Runde 8, Bug 3/4). Bei
+                # stale Payloads bleibt der Zustand aus _sync_from_params
+                # (params_restored) unveraendert.
+                self._rebuild_field_dropdown(
+                    keys, field_sources,
+                    payload_agg=str(data.get("agg") or ""),
+                    payload_field=str(data.get("field") or ""))
             # 20.04-Q8-Fix (User-Bugreport 09.08.2026, Option 'No Data'):
             # Neue Plugin-Varianten (Clones/Presets) ohne feature_store-Daten
-            # sofort als deaktivierte Hinweis-Eintraege zeigen ('(No Data)'),
-            # damit der Anwender nach dem Duplizieren ein sichtbares Ergebnis
-            # hat, bevor der erste Scan/LiveRun Daten liefert.
+            # sofort als deaktivierte Hinweis-Eintraege zeigen ('(No Data)').
+            # Nur im Datenpfad (der Payload kennt symbol/timeframe).
             no_data = []
             try:
-                no_data = self._view_model.resolve_no_data_variants(
+                no_data = vm.resolve_no_data_variants(
                     str(data.get("symbol") or ""),
                     str(data.get("timeframe") or ""))
             except Exception:
@@ -1365,34 +1454,12 @@ class HeatmapWidget(QWidget):
                     self._combo_field.add_disabled_item(
                         f"{nd.get('display_name') or nd.get('plugin_id')} "
                         f"({nd.get('preset_name')}) – (No Data)")
-            self._combo_field.blockSignals(False)
-            self._set_combo_data(
-                self._combo_x, str(data.get("x_dim") or "date"))
-            self._set_combo_data(
-                self._combo_y, str(data.get("y_dim") or "hour"))
+            self._set_combo_data(self._combo_x, x_dim)
+            self._set_combo_data(self._combo_y, y_dim)
             self._set_combo_data(self._combo_agg, str(agg or "count"))
         finally:
             self._syncing = False
         self._update_controls()
-        # E6: Wert-Aggregation mit noch leerem Feld -> ersten Key uebernehmen
-        # und Konfiguration nachreichen (einmaliger Query-Loop). 20.03.03:
-        # Vergleich ueber den KEY-Teil (params haelt den reinen Key, das
-        # userData traegt '{service_id}|{key}' bzw. 'ALL|{key}').
-        vm_field = str(self._view_model.params.get("heatmap_field") or "")
-        if (agg in _VALUE_AGGS and self._combo_field.currentData()
-                and vm_field != self._field_key(
-                    self._combo_field.currentData())):
-            # 10.08.2026 (Bugfix Runde 7, Bug 3): Ein restaurierter
-            # heatmap_field (Workspace/Profil) darf NICHT durch einen
-            # Payload-Fallback ueberschrieben werden. Nur wenn das VM-Feld
-            # leer oder im aktuellen Datensatz nicht verfuegbar ist, wird
-            # der erste verfuegbare Key uebernommen.
-            if vm_field and vm_field in keys:
-                fidx = self._find_field_index(vm_field)
-                if fidx >= 0:
-                    self._combo_field.setCurrentIndex(fidx)
-            else:
-                self._apply_config()
 
     def _render_overlay(self, data: Dict[str, Any]) -> None:
         """Zeichnet Tages-Ohlc ueber die Heatmap (selbes Canvas, Bugfix 1).

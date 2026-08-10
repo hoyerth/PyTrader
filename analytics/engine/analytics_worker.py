@@ -126,6 +126,16 @@ class AnalyticsAsyncWorker(QThread):
             # zurueck und die App haengt nach vielen Abfragen (TF-Wechsel).
             self._release_thread_connections()
         if not self._cancelled:
+            # Runde 8 (Bugfix 3): Das Generations-Token aus den Worker-Params
+            # ins Ergebnis-Dict spiegeln - die UI verwirft damit Stale-Payloads
+            # (Queries, die VOR dem letzten restore_workspace()/_apply_profile()
+            # gestartet wurden).
+            try:
+                if isinstance(result, dict):
+                    result["restore_generation"] = self._params.get(
+                        "restore_generation")
+            except Exception:
+                pass
             self.finished_ok.emit(self, self._query_kind, result)
 
     def _release_thread_connections(self) -> None:
