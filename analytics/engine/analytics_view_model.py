@@ -657,6 +657,12 @@ class AnalyticsViewModel(QObject):
             base["column"] = p["distribution_column"]
             base["bins"] = p["bins"]
             base["limit"] = p["limit"]
+        elif kind == QUERY_FEATURES:
+            # Runde 11 (Bug 4, B4-1): Preset-Modell-Snapshot fuer die
+            # No-Data-Auswertung im QUERY_FEATURES-Worker (kein synchroner
+            # DB-Zugriff im UI-Hauptthread). Der Worker/Repo berechnet
+            # `no_data_variants` als Payload-Attribut (B4-2).
+            base["presets_data"] = self._no_data_presets_snapshot()
         return base
 
     # ------------------------------------------------------------------
@@ -801,9 +807,10 @@ class AnalyticsViewModel(QObject):
         layout = payload.get("layout")
         if isinstance(layout, dict):
             self._workspace_layout.update(dict(layout))
-        for key in list(self._params.keys()):
-            if key in flat and flat[key] is not None:
-                self._params[key] = flat[key]
+        # Runde 11 (Bug 3, B3-2): Gemeinsamer Restore-Helper (Replace-
+        # Semantik inkl. instance_hashes -> garantiert leer bei fehlendem
+        # Payload-Key statt des alten Werts).
+        self._restore_params_from_payload(flat)
         # 15.03-E (Profil-Migration): Alt-Payloads speicherten den Filter als
         # Einzelwert `feature_id` (String) – in `feature_ids` (Liste) wandeln.
         if "feature_ids" not in flat and flat.get("feature_id"):
@@ -840,12 +847,12 @@ class AnalyticsViewModel(QObject):
         # Profilwechsel gestartet wurden).
         self._restore_generation += 1
         # Runde 10 (Bug 4): REIHENFOLGE - erst die UI-Combos synchronisieren
-        # (params_restored), DANN refresh_all(). Vorher starteten die
-        # Queries mit leeren/alten Controls (leere Combos ->
-        # _current_params() None -> Queries uebersprungen bzw. doppelte/
-        # stale Requests beim Restore).
+        # (params_restored), DANN die Daten anfordern. Runde 11 (A1): KEIN
+        # refresh_all() mehr im Restore-Pfad - das AnalyticsWindow
+        # orchestriert die Queries zentral (A6: Sync -> Query-Key-Pruefung
+        # -> request_data). Ein expliziter User-Refresh (Button) darf
+        # weiterhin refresh_all() nutzen.
         self.params_restored.emit()
-        self.refresh_all()
 
     def _apply_heatmap_section(self, heat: Any) -> None:
         """Loest die verschachtelte `charts.heatmap`-Sektion auf (20.02).
@@ -875,6 +882,27 @@ class AnalyticsViewModel(QObject):
             self._params["zoom_y_range"] = self._clamp_zoom(
                 heat["zoom_y_range"])
 
+    def _restore_params_from_payload(self, flat: Dict[str, Any]) -> None:
+        """Uebernimmt flache Payload-Params per Replace-Semantik (B3-2).
+
+        Runde 11 (Bug 3, B3-2): Gemeinsamer Restore-Pfad fuer
+        `_apply_profile()` und `restore_workspace()`. Bekannte `_params`-Keys
+        werden UEBERSCHRIEBEN, sofern der Payload einen nicht-None-Wert
+        liefert (additiv, wie bisher). Der Varianten-Filter `instance_hashes`
+        folgt echter Replace-Semantik: Fehlt der Key im Payload (Alt-Payloads
+        ohne Varianten-Angabe), ist er garantiert leer ([]) statt des
+        vorherigen Werts - ein gespeicherter Zustand OHNE Varianten-Ein-
+        schraenkung darf nicht stillschweigend den alten Filter uebernehmen.
+        Andere Keys (z. B. heatmap-Konfiguration, table-Settings) werden
+        NICHT generell geleert - nur vorhandene Payload-Werte zaehlen
+        (additiv, kein Datenverlust).
+        """
+        for key in list(self._params.keys()):
+            if key in flat and flat[key] is not None:
+                self._params[key] = flat[key]
+        if "instance_hashes" not in flat or not flat.get("instance_hashes"):
+            self._params["instance_hashes"] = []
+
     def set_ui_layout(self, layout: Optional[Dict[str, Any]] = None) -> None:
         """Uebernimmt das aktuelle UI-Layout fuer die Profil-Persistenz.
 
@@ -902,6 +930,10 @@ class AnalyticsViewModel(QObject):
                 "symbol": p.get("symbol"),
                 "timeframe": p.get("timeframe"),
                 "feature_ids": list(p.get("feature_ids") or []),
+                # Runde 11 (Bug 3, B3-1): Varianten-Einschraenkung im
+                # Profil-Payload persistieren (Replace-Semantik beim
+                # Restore: fehlt der Key -> garantiert leer, B3-2).
+                "instance_hashes": list(p.get("instance_hashes") or []),
             },
             "charts": {
                 "heatmap_metric": p.get("heatmap_metric"),
@@ -960,9 +992,10 @@ class AnalyticsViewModel(QObject):
         params = workspace.get("params")
         if not isinstance(params, dict):
             return
-        for key in list(self._params.keys()):
-            if key in params and params[key] is not None:
-                self._params[key] = params[key]
+        # Runde 11 (Bug 3, B3-2): Gemeinsamer Restore-Helper (Replace-
+        # Semantik inkl. instance_hashes -> garantiert leer bei fehlendem
+        # Payload-Key statt des alten Werts).
+        self._restore_params_from_payload(params)
         # 20.02.01 (E6): Alt-Workspaces mit `dow_hour` -> "hour" (Tageszeit).
         for _hk in ("heatmap_x_dim", "heatmap_y_dim"):
             if self._params.get(_hk) == "dow_hour":
@@ -994,12 +1027,11 @@ class AnalyticsViewModel(QObject):
         # Workspace-Restore gestartet wurden).
         self._restore_generation += 1
         # Runde 10 (Bug 4): REIHENFOLGE - erst die UI-Combos synchronisieren
-        # (params_restored), DANN refresh_all(). Vorher starteten die
-        # Queries mit leeren/alten Controls (leere Combos ->
-        # _current_params() None -> Queries uebersprungen bzw. doppelte/
-        # stale Requests beim Restore).
+        # (params_restored), DANN die Daten anfordern. Runde 11 (A1): KEIN
+        # refresh_all() mehr im Restore-Pfad - das AnalyticsWindow
+        # orchestriert die Queries zentral (A6: Sync -> Query-Key-Pruefung
+        # -> request_data).
         self.params_restored.emit()
-        self.refresh_all()
 
     @staticmethod
     def _emit_profile_changed(name: str) -> None:
@@ -1268,6 +1300,62 @@ class AnalyticsViewModel(QObject):
         except Exception:
             pass
         return result
+
+    def _no_data_presets_snapshot(self) -> Dict[str, Any]:
+        """Serialisiert die Preset-Modell-Daten fuer die No-Data-Auswertung.
+
+        Runde 11 (Bug 4, B4-1): Die '(No Data)'-Auswertung laeuft im
+        QUERY_FEATURES-Worker (Repo, Worker-Thread) - dort ist das
+        ServiceSelectorModel nicht verfuegbar. Der ViewModel reicht eine
+        reine Daten-Snapshot (in-memory, KEIN SQL) ueber die Query-Params:
+            {"presets": {pid: [{"preset_name", "instance_hash",
+                                "is_archived"}]},
+             "sets": [{"services": {instance_id: {"plugin_id", "params",
+                                                   "is_archived"}}}],
+             "display_names": {"{pid}|{pname}": "Anzeigename"}}
+        Der Reader kombiniert den Snapshot mit den DB-Fakten
+        (available_instance_hashes / feature_keys_by_service) im Worker-
+        Thread und liefert `no_data_variants` als Payload-Attribut (B4-2).
+        """
+        model = self._selector_model
+        if model is None:
+            from analytics.engine.service_selector_model import ServiceSelectorModel
+            model = ServiceSelectorModel(parent=self)
+            self._selector_model = model
+        presets: Dict[str, Any] = {}
+        sets: List[Any] = []
+        display_names: Dict[str, str] = {}
+        try:
+            for pid, clones in (model.plugin_presets() or {}).items():
+                pid_s = str(pid)
+                clone_list: List[Dict[str, Any]] = []
+                for c in clones or []:
+                    if not isinstance(c, dict):
+                        continue
+                    pname = str(c.get("preset_name") or "Default")
+                    clone_list.append({
+                        "preset_name": pname,
+                        "instance_hash": str(c.get("instance_hash") or ""),
+                        "is_archived": bool(c.get("is_archived")),
+                    })
+                    display_names[f"{pid_s}|{pname}"] = \
+                        self.resolve_service_display_name(pid_s, pname)
+                if clone_list:
+                    presets[pid_s] = clone_list
+            for s in model.get_sets() or []:
+                if not isinstance(s, dict):
+                    continue
+                services = s.get("services")
+                if not isinstance(services, dict):
+                    continue
+                sets.append({"services": services})
+        except Exception:
+            pass
+        return {
+            "presets": presets,
+            "sets": sets,
+            "display_names": display_names,
+        }
 
     def resolve_no_data_variants(self, symbol: str,
                                 timeframe: str) -> List[Dict[str, Any]]:

@@ -234,7 +234,13 @@ class AnalyticsAsyncWorker(QThread):
                 limit=cap_lookback_limit(p.get("limit")),
             )
         if self._query_kind == QUERY_FEATURES:
-            return repo.get_available_features(symbol, timeframe)
+            # Runde 11 (Bug 4, B4-1): Preset-Snapshot aus den Query-Params
+            # fuer die No-Data-Auswertung (Repo berechnet no_data_variants
+            # im Worker-Thread; kein DB-Zugriff im UI-Hauptthread).
+            return repo.get_available_features(
+                symbol, timeframe,
+                presets_data=p.get("presets_data") or None,
+            )
 
         raise ValueError(
             f"[AnalyticsAsyncWorker] Unbekannte Abfrage '{self._query_kind}' – "

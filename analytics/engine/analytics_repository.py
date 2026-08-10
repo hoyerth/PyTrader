@@ -420,10 +420,37 @@ class AnalyticsRepository:
         return self.reader.get_available_timeframes(symbol)
 
     def get_available_features(
-        self, symbol: str, timeframe: str
+        self,
+        symbol: str,
+        timeframe: str,
+        presets_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Verfuegbare Plugin-IDs, JSON-Keys und Zeilenzahl."""
-        return self.reader.get_available_features(symbol, timeframe)
+        """Verfuegbare Plugin-IDs, JSON-Keys, Zeilenzahl + No-Data-Varianten.
+
+        Runde 11 (Bug 4, B4-1/B4-2): `no_data_variants` ist IMMER Teil des
+        Payload-Vertrags (leere Liste, wenn keine Varianten ohne Daten
+        existieren oder die Auswertung fehlschlaegt; `no_data_variants_error`
+        markiert einen Fehlschlag). Die Auswertung laeuft hier (Worker-
+        Thread), nicht im UI-Hauptthread.
+        """
+        result = self.reader.get_available_features(symbol, timeframe)
+        if not isinstance(result, dict):
+            result = {}
+        no_data_error = False
+        try:
+            variants = self.reader.resolve_no_data_variants(
+                symbol, timeframe, presets_data or {})
+        except Exception as e:
+            print(f"WARN [AnalyticsRepository] no_data_variants "
+                  f"fehlgeschlagen: {e}")
+            variants = []
+            no_data_error = True
+        if isinstance(variants, list):
+            result["no_data_variants"] = [dict(v) for v in variants]
+        else:
+            result["no_data_variants"] = []
+        result["no_data_variants_error"] = no_data_error
+        return result
 
     def available_heatmap_metrics(
         self, symbol: str, timeframe: str

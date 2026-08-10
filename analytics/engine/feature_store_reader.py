@@ -34,7 +34,7 @@ import os
 from datetime import datetime as _dt_datetime
 from datetime import timezone as _dt_timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -1284,6 +1284,141 @@ class FeatureStoreReader:
             print(f"WARN [FeatureStoreReader] available_instance_hashes "
                   f"fehlgeschlagen: {e}")
             return set()
+
+    def resolve_no_data_variants(
+        self,
+        symbol: str,
+        timeframe: str,
+        presets_data: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Plugin-Varianten ohne feature_store-Daten (Runde 11, B4-1).
+
+        Runde 11 (Bug 4): Die '(No Data)'-Auswertung wurde aus dem
+        UI-Hauptthread in den QUERY_FEATURES-Worker verlagert. Der
+        ViewModel liefert die Preset-Modell-Daten als Snapshot
+        (`presets_data`: {"presets": {pid: [...]}, "sets": [...],
+        "display_names": {"{pid}|{pname}": str}}); diese Methode kombiniert
+        sie mit den DB-Fakten (`available_instance_hashes` /
+        `feature_keys_by_service`) im Worker-Thread.
+
+        Eine Variante gilt als 'ohne Daten', wenn ihr instance_hash KEINE
+        Zeilen besitzt (oder - bei Varianten ohne Hash - ihr plugin_id keine
+        feature_store-Zeilen liefert). Archivierte Presets sind bewusst
+        unsichtbar (Q6/Q7).
+
+        Returns:
+            Liste von {"plugin_id", "preset_name", "instance_hash",
+            "display_name"} - leer, wenn alle Varianten Daten besitzen
+            (defensiv, rein lesend).
+        """
+        if not symbol or not timeframe:
+            return []
+        presets = (presets_data or {}).get("presets") or {}
+        sets = (presets_data or {}).get("sets") or []
+        display_names = (presets_data or {}).get("display_names") or {}
+        try:
+            available = self.available_instance_hashes(symbol, timeframe)
+        except Exception:
+            available = set()
+        try:
+            keys_by_service = self.feature_keys_by_service(symbol, timeframe)
+            pids_with_data = {str(k).strip().lower()
+                              for k in (keys_by_service or {})}
+        except Exception:
+            pids_with_data = set()
+        try:
+            from analytics.engine.service_models import generate_instance_hash
+        except Exception:
+            generate_instance_hash = None
+        # Runde 10 (Bug 2): available case-insensitiv indexieren (einmalig).
+        available_low = {str(x).strip().lower()
+                         for x in (available or set())}
+
+        def _has_data(pid: str, h: str) -> bool:
+            """True, wenn die Variante feature_store-Daten besitzt.
+
+            Runde 10 (Bug 2): Differenzierung statt grobem
+            pids_with_data-Fallback - eine benannte Variante mit eigenem
+            instance_hash zaehlt NUR, wenn GENAU dieser Hash Zeilen
+            besitzt. Der pids_with_data-Fallback gilt nur noch fuer
+            Varianten OHNE Hash (NULL/Alt-Bestand).
+            """
+            if not pid:
+                return True
+            h_s = str(h or "").strip()
+            if h_s:
+                return h_s.lower() in available_low
+            return str(pid).strip().lower() in pids_with_data
+
+        out: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str]] = set()
+
+        def _add(pid: str, pname: str, h: str) -> None:
+            pid_s = str(pid or "").strip()
+            if not pid_s:
+                return
+            h_s = str(h or "").strip()
+            key = (pid_s.lower(), h_s)
+            if key in seen:
+                return
+            seen.add(key)
+            if _has_data(pid_s, h_s):
+                return
+            pname_s = str(pname or "Default")
+            out.append({
+                "plugin_id": pid_s,
+                "preset_name": pname_s,
+                "instance_hash": h_s,
+                "display_name": str(
+                    display_names.get(f"{pid_s}|{pname_s}")
+                    or self._no_data_fallback_name(pid_s, pname_s)),
+            })
+
+        for pid, clones in presets.items():
+            if not isinstance(clones, list):
+                continue
+            for clone in clones:
+                if not isinstance(clone, dict):
+                    continue
+                if clone.get("is_archived"):
+                    continue
+                _add(str(pid),
+                     str(clone.get("preset_name") or "Default"),
+                     str(clone.get("instance_hash") or ""))
+        # Runde 9 (Bug 2): Set-Instanz-Varianten ebenfalls erfassen.
+        for s in sets or []:
+            services = s.get("services") if isinstance(s, dict) else None
+            if not isinstance(services, dict):
+                continue
+            for instance_id, svc in services.items():
+                if not isinstance(svc, dict):
+                    continue
+                if svc.get("is_archived"):
+                    continue
+                pid = str(svc.get("plugin_id") or "").strip()
+                if not pid:
+                    continue
+                if generate_instance_hash is not None:
+                    h = generate_instance_hash(pid, svc.get("params") or {})
+                else:
+                    h = ""
+                _add(pid, f"{pid} [{instance_id}]", h)
+        return out
+
+    @staticmethod
+    def _no_data_fallback_name(pid: str, pname: str) -> str:
+        """Lesbarer Fallback-Anzeigename (ohne Modell-Zugriff im Reader).
+
+        Runde 11 (Bug 4, B4-1): Der Reader kennt das ServiceSelectorModel
+        nicht - der ViewModel liefert die Anzeigenamen ueber den Snapshot
+        (`display_names`); dieser Fallback greift nur bei fehlendem
+        Snapshot-Eintrag (defensiv, identisch zur VM-Logik).
+        """
+        pretty = (pid.replace("srv_", "").replace("ind_", "")
+                  .replace("_", " ").title())
+        if not pretty:
+            pretty = pid
+        return f"{pretty} ({pname})"
 
     def get_available_features(
         self, symbol: str, timeframe: str

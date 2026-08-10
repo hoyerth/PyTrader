@@ -135,6 +135,27 @@ def migrate_statistics_persistence(
     return migrated
 
 
+def _params_signature(params: Dict[str, Any]) -> tuple:
+    """Deterministische, hashbare Signatur der VM-Params (Runde 11, A6).
+
+    Wird fuer die Query-Key-Pruefung in _on_page_changed genutzt: identische
+    Seite + gleiche Restore-Generation + gleiche Params -> kein redundanter
+    Re-Query (die Daten sind bereits frisch). Dicts/Listen werden rekursiv
+    in sortierte Tupel normalisiert (deterministisch, hashbar).
+    """
+
+    def _norm(v: Any) -> Any:
+        if isinstance(v, dict):
+            return tuple(sorted((str(k), _norm(val))
+                                for k, val in v.items()))
+        if isinstance(v, (list, tuple)):
+            return tuple(_norm(x) for x in v)
+        return v
+
+    return tuple(sorted((str(k), _norm(v))
+                        for k, v in params.items()))
+
+
 @register_persistent_window()
 class AnalyticsWindow(PersistentWindow):
     """Analytics-Hauptfenster (win_analytics, 1280 x 800, nicht-modal)."""
@@ -492,14 +513,14 @@ class AnalyticsWindow(PersistentWindow):
                 # changed feuert nicht; ohne setCurrentIndex bleibt die
                 # alte Seite sichtbar).
                 self.pages_stack.setCurrentIndex(page_index)
-                page = self.pages_stack.widget(page_index)
-                if page is not None and hasattr(page, "_sync_from_params"):
-                    try:
-                        page._sync_from_params()
-                    except (RuntimeError, AttributeError):
-                        pass
         except (RuntimeError, AttributeError):
             pass
+        # Runde 11 (Architektur, A3/A6): Zentraler Seiten-Sync NACH dem
+        # VM-Param-Setzen (genau EIN Durchgang; die Einzel-Verbindungen der
+        # Widgets auf params_restored entfallen). Danach die Daten der
+        # aktiven Seite anfordern (A6: Query-Key-Pruefung -> request_data).
+        self._sync_all_pages_from_params()
+        self._request_current_page_data()
         # 10.08.2026 (Punkt 3): Ansichts-Modus der Heatmap-Seite auch aus
         # dem Profil-Restore uebernehmen (workspace_layout wird von
         # _apply_profile befuellt). Muster _restore_workspace.
@@ -721,6 +742,42 @@ class AnalyticsWindow(PersistentWindow):
         self.combo_symbol.blockSignals(False)
 
     # ------------------------------------------------------------------
+    # Runde 11 (Architektur, A3/A6): Zentraler Seiten-Sync + Query-
+    # Orchestrierung
+    # ------------------------------------------------------------------
+    def _sync_all_pages_from_params(self) -> None:
+        """Synchronisiert ALLE Seiten-Controls aus den VM-Params (A3).
+
+        Runde 11 (Architektur, A3): Zentraler Sync nach restore_workspace()/
+        _apply_profile() - genau EIN Durchgang mit blockSignals (page-intern
+        via _syncing/_set_combo_data). Die direkte params_restored-
+        Verbindung des HeatmapWidgets (attach_view_model) entfaellt - das
+        Window orchestriert hier.
+        """
+        for page in (self.table_page, self.heatmap_page, self.scatter_page,
+                     self.distribution_page, self.equity_page):
+            if hasattr(page, "_sync_from_params"):
+                try:
+                    page._sync_from_params()
+                except (RuntimeError, AttributeError):
+                    pass
+        # 20.02: Das generische HeatmapWidget syncen seine Combos separat
+        # (es ist ein Unter-Widget der HeatmapPage, keine eigene Page).
+        try:
+            generic = getattr(self.heatmap_page, "_generic", None)
+            if generic is not None and hasattr(generic, "_sync_from_params"):
+                generic._sync_from_params()
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _request_current_page_data(self) -> None:
+        """Fordert die Daten der aktiven Seite an (A6: sync -> key -> query)."""
+        row = self.sidebar.currentRow()
+        if not (0 <= row < self.pages_stack.count()):
+            return
+        self._on_page_changed(row)
+
+    # ------------------------------------------------------------------
     # Datenfluss (MVVM): Feature-Dropdown, Seiten, Status
     # ------------------------------------------------------------------
     def _on_page_changed(self, row: int) -> None:
@@ -731,8 +788,16 @@ class AnalyticsWindow(PersistentWindow):
             # sichtbar. Jetzt: Stack auf die geklickte Seite + lazy request.
             self.pages_stack.setCurrentIndex(row)
             page = self.pages_stack.widget(row)
-            if hasattr(page, "request_data"):
-                page.request_data()
+            # Runde 11 (A6): Query-Key-Pruefung - identische Seite + gleiche
+            # Restore-Generation + gleiche Params -> KEIN redundanter
+            # Re-Query (die Daten sind bereits frisch; z. B. doppelter
+            # Aufruf aus _initial_load/_request_current_page_data).
+            key = (row, self._vm.restore_generation,
+                   _params_signature(self._vm.params))
+            if key != getattr(self, "_last_request_key", None):
+                self._last_request_key = key
+                if hasattr(page, "request_data"):
+                    page.request_data()
 
     @Slot(str, str)
     def _on_query_failed(self, kind: str, error: str) -> None:
@@ -1022,6 +1087,26 @@ class AnalyticsWindow(PersistentWindow):
     # ------------------------------------------------------------------
     # Workspace-Persistenz (20.01, E1/E7): vm.params + UI-Layout
     # ------------------------------------------------------------------
+    @staticmethod
+    def _snapshot_params(params: Dict[str, Any]) -> Dict[str, Any]:
+        """Flache, entkoppelte Kopie der VM-Params (kein Aliasing, B3-3).
+
+        Runde 11 (Bug 3, B3-3): Die Workspace-Persistenz darf die
+        ViewModel-Referenz nicht weiterreichen - Listen/Dicts
+        (feature_ids, instance_hashes, Zoom-Bereiche, table_column_widths)
+        werden als Kopien uebernommen (mutierende Aufrufer aendern sonst
+        die Live-Params des ViewModel).
+        """
+        out: Dict[str, Any] = {}
+        for k, v in params.items():
+            if isinstance(v, list):
+                out[k] = list(v)
+            elif isinstance(v, dict):
+                out[k] = dict(v)
+            else:
+                out[k] = v
+        return out
+
     def _save_workspace(self) -> None:
         """Persistiert den Analytics-Workspace (VM-Parameter + Layout).
 
@@ -1031,8 +1116,12 @@ class AnalyticsWindow(PersistentWindow):
         (E1: _keep_history_on_close = True).
         """
         try:
+            # Runde 11 (Bug 3, B3-3): Entkoppelte Kopie statt Referenz -
+            # der ViewModel._params wuerde sonst mit dem Workspace-Payload
+            # aliasen (mutierende Aufrufer aendern die Live-Params).
+            params_snapshot = self._snapshot_params(self._vm.params)
             payload = {
-                "params": self._vm.params,
+                "params": params_snapshot,
                 "layout": {
                     "page_index": self.sidebar.currentRow()
                     if hasattr(self, "sidebar") else 0,

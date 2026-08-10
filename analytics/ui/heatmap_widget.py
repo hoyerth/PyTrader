@@ -106,6 +106,7 @@ from PySide6.QtWidgets import (
 from analytics.engine.analytics_worker import (
     QUERY_HEATMAP_GENERIC,
     QUERY_DAILY_OHLC,
+    QUERY_FEATURES,
 )
 from analytics.engine.feature_store_reader import (
     DOW_LABELS,
@@ -489,6 +490,13 @@ class HeatmapWidget(QWidget):
         # Query-Round-Trip. Wird bei jedem Daten-Payload aktualisiert;
         # _sync_from_params/feature_ids_changed bauen daraus Items/Haken.
         self._field_keys: List[str] = []
+        # Runde 11 (Bug 4, B4-2): Cache der No-Data-Varianten aus dem
+        # QUERY_FEATURES-Payload. None = noch kein Payload (Loading);
+        # [] = Erfolg ohne Varianten; Liste = Erfolg mit Varianten.
+        # `_no_data_variants_error` markiert einen fehlgeschlagenen
+        # No-Data-Check (Payload-Vertrag B4-2, 'Pruefung fehlgeschlagen').
+        self._no_data_variants: Optional[List[Dict[str, Any]]] = None
+        self._no_data_variants_error: bool = False
 
         # --- Steuerung (Zeile 1: Dimensionen/Aggregation/Feld) ---
         self._combo_x = QComboBox()
@@ -622,15 +630,13 @@ class HeatmapWidget(QWidget):
     def attach_view_model(self, view_model: Any) -> None:
         self._view_model = view_model
         view_model.data_ready.connect(self._on_data_ready)
-        # 20.04-Timing-Fix (D): Nach restore_workspace()/_apply_profile()
-        # emittiert der ViewModel `params_restored` – die Combos werden dann
-        # explizit aus den restaurierten Params synchronisiert (sonst kann
-        # der erste Daten-Payload bzw. _apply_config die restaurierten
-        # Aggregations-/Feld-Werte ueberschreiben). Defensiv per hasattr
-        # (Test-Mocks ohne Signal). _sync_from_params() blockt Signale und
-        # stoesst keinen Query an (kein Loop).
-        if hasattr(view_model, "params_restored"):
-            view_model.params_restored.connect(self._sync_from_params)
+        # Runde 11 (Architektur, A3): KEINE direkte params_restored-
+        # Verbindung mehr - das AnalyticsWindow orchestriert den Seiten-Sync
+        # zentral via _sync_all_pages_from_params() (genau EIN Durchgang
+        # nach dem VM-Param-Setzen). _sync_from_params() wird vom Window
+        # explizit aufgerufen (heatmap_page._generic). Die Initial-Sync
+        # unten (self._sync_from_params()) bleibt fuer den Attach-Zeitpunkt.
+
         # Runde 8 (Bugfix 4): feature_ids-Aenderungen (ServicePicker
         # Check/Uncheck) -> das 'Feld'-Dropdown wird SOFORT synchron neu
         # abgeleitet (kein Debounce/Query-Round-Trip). Defensiv per hasattr
@@ -638,6 +644,11 @@ class HeatmapWidget(QWidget):
         if hasattr(view_model, "feature_ids_changed"):
             view_model.feature_ids_changed.connect(
                 self._on_feature_ids_changed)
+        # Runde 11 (Bug 4, B4-2): Fehlerzustand des No-Data-Checks
+        # (QUERY_FEATURES) -> 'Pruefung fehlgeschlagen'-Hinweis im
+        # Feld-Dropdown (Payload-Vertrag; vorher verschluckte Fehler).
+        if hasattr(view_model, "query_failed"):
+            view_model.query_failed.connect(self._on_query_failed)
         self._sync_from_params()
 
     def is_candle_projection_enabled(self) -> bool:
@@ -649,6 +660,10 @@ class HeatmapWidget(QWidget):
         if self._view_model is None:
             return
         self._view_model.request_heatmap_generic()
+        # Runde 11 (Bug 4, B4-1): Die No-Data-Varianten kommen als
+        # QUERY_FEATURES-Payload vom Worker (Auswertung im Worker-Thread) -
+        # bei jeder Datenanforderung mit anstossen (Debounce buegelt ab).
+        self._view_model.request_features()
         if self._chk_candle.isChecked():
             self._view_model.request_daily_ohlc()
 
@@ -1069,6 +1084,50 @@ class HeatmapWidget(QWidget):
             self._render_generic(data)
         elif kind == QUERY_DAILY_OHLC:
             self._render_overlay(data)
+        elif kind == QUERY_FEATURES:
+            # Runde 11 (Bug 4, B4-3): No-Data-Varianten aus dem
+            # QUERY_FEATURES-Payload uebernehmen (Generation-Guard gegen
+            # Stale-Payloads) und das 'Feld'-Dropdown neu rendern.
+            self._on_features_ready(data)
+
+    def _on_features_ready(self, data: Dict[str, Any]) -> None:
+        """Uebernimmt die No-Data-Varianten aus dem QUERY_FEATURES-Payload.
+
+        Runde 11 (Bug 4, B4-2/B4-3): Der Payload-Vertrag garantiert
+        `no_data_variants` (Liste) - IMMER vorhanden; `no_data_variants_
+        error` markiert einen fehlgeschlagenen Check. Payloads aelterer
+        Restore-Generation werden verworfen (Stale-Guard, Muster
+        _sync_combos_from_payload). Danach wird das 'Feld'-Dropdown aus dem
+        Cache neu abgeleitet (die '(No Data)'-Items erscheinen/verschwinden).
+        """
+        if self._view_model is None:
+            return
+        vm = self._view_model
+        payload_gen = data.get("restore_generation")
+        if (payload_gen is not None
+                and str(payload_gen) != str(
+                    getattr(vm, "restore_generation", 0))):
+            return  # Stale-Payload (Query lief VOR dem letzten Restore)
+        variants = data.get("no_data_variants")
+        self._no_data_variants = (
+            [dict(v) for v in variants] if isinstance(variants, list)
+            else [])
+        self._no_data_variants_error = bool(
+            data.get("no_data_variants_error"))
+        self._rebuild_field_dropdown(self._field_keys, self._field_sources)
+
+    def _on_query_failed(self, kind: str, _error: str) -> None:
+        """Runde 11 (Bug 4, B4-2): Fehlerzustand des No-Data-Checks.
+
+        Schlaegt die QUERY_FEATURES-Abfrage fehl (kein Payload), zeigt das
+        Feld-Dropdown den 'Pruefung fehlgeschlagen'-Hinweis statt stumm zu
+        bleiben (verschluckte Fehler, User-Analyse Punkt 2).
+        """
+        if kind == QUERY_FEATURES:
+            self._no_data_variants = []
+            self._no_data_variants_error = True
+            self._rebuild_field_dropdown(self._field_keys,
+                                         self._field_sources)
 
     def _render_generic(self, data: Dict[str, Any]) -> None:
         matrix = np.asarray(data.get("matrix") or [], dtype=float)
@@ -1360,25 +1419,12 @@ class HeatmapWidget(QWidget):
                     prev_field, prev_field, checked=True)
                 self._combo_field.setCurrentIndex(
                     self._combo_field.count() - 1)
-            # Runde 10 (Bug 2): '(No Data)'-Hinweis-Eintraege zentral HIER
-            # rendern - deckt auch den Cache-Rebuild-Pfad (_sync_from_params
-            # / _on_feature_ids_changed) ab, nicht nur den Payload-Pfad. Eine
-            # Variante ohne Daten wird dadurch sichtbar, sobald sie gewaehlt
-            # wurde (vorher blieb der Hinweis nach einem Rebuild ohne frischen
-            # Payload verschwunden).
-            try:
-                no_data = self._view_model.resolve_no_data_variants(
-                    str(p.get("symbol") or ""),
-                    str(p.get("timeframe") or ""))
-            except Exception:
-                no_data = []
-            if no_data:
-                self._combo_field.add_header_item(
-                    "🕓 Noch ohne Daten (erster Scan ausstehend):")
-                for nd in no_data:
-                    self._combo_field.add_disabled_item(
-                        f"{nd.get('display_name') or nd.get('plugin_id')} "
-                        f"({nd.get('preset_name')}) – (No Data)")
+            # Runde 11 (Bug 4, B4-1): '(No Data)'-Hinweise kommen jetzt als
+            # Payload-Attribut `no_data_variants` vom QUERY_FEATURES-Worker
+            # (Cache self._no_data_variants) - KEIN synchroner DB-Zugriff
+            # mehr im UI-Hauptthread. Die Anzeige unterscheidet Loading/
+            # Erfolg/Fehler und filtert nach aktiven instance_hashes (B4-5).
+            self._render_no_data_items()
         finally:
             self._combo_field.blockSignals(False)
         self._update_controls()
@@ -1395,6 +1441,82 @@ class HeatmapWidget(QWidget):
                     self._combo_field.setCurrentIndex(fidx)
             else:
                 self._apply_config()
+
+    def _render_no_data_items(self) -> None:
+        """Rendert die No-Data-Hinweise aus dem Payload-Cache (B4-2/B4-5).
+
+        Runde 11 (Bug 4): Die '(No Data)'-Varianten kommen vom
+        QUERY_FEATURES-Worker (`no_data_variants` im Payload) - kein
+        synchroner DB-Zugriff mehr. Die Anzeige unterscheidet:
+          * Payload ausstehend (self._no_data_variants is None) -> nichts
+          * Payload-Fehler   -> '⚠️ No-Data-Prüfung ...' (deaktiviert)
+          * Erfolg + Liste   -> '(No Data)'-Abschnitt (deaktivierte Items)
+        Bei aktiver Varianten-Einschraenkung (instance_hashes) werden nur
+        die betroffenen Varianten gezeigt (B4-5); die gewaehlte Variante
+        bleibt zusaetzlich als ausgegrautes '(No Data)'-Item sichtbar.
+        """
+        if self._view_model is None:
+            return
+        if self._no_data_variants_error:
+            self._combo_field.add_disabled_item(
+                "⚠️ No-Data-Prüfung konnte nicht durchgeführt werden")
+            return
+        if self._no_data_variants is None:
+            return  # Loading: Payload steht noch aus (kein Hinweis noetig)
+        p = self._view_model.params
+        active_hashes = {str(h).strip().lower()
+                         for h in (p.get("instance_hashes") or [])}
+        variants = [dict(v) for v in self._no_data_variants]
+        filtered = variants
+        if active_hashes:
+            filtered = [v for v in variants
+                        if str(v.get("instance_hash") or "").strip().lower()
+                        in active_hashes]
+        if not filtered and self._selected_no_data_variant(variants) is None:
+            return
+        self._combo_field.add_header_item(
+            "🕓 Noch ohne Daten (erster Scan ausstehend):")
+        rendered: set = set()
+        for nd in filtered:
+            rendered.add((str(nd.get("plugin_id") or "").strip().lower(),
+                          str(nd.get("instance_hash") or "").strip().lower()))
+            # Runde 11 (B4-2): display_name enthaelt den Preset bereits
+            # (resolve_service_display_name/Reader-Fallback) - keine
+            # doppelte '(preset)'-Ergaenzung im Item-Text.
+            self._combo_field.add_disabled_item(
+                f"{nd.get('display_name') or nd.get('plugin_id')} – (No Data)")
+        # B4-5: Die gewaehlte No-Data-Variante bleibt zusaetzlich inline
+        # sichtbar (ausgegraut), auch wenn die Varianten-Einschraenkung sie
+        # aus dem Abschnitt gefiltert haette.
+        sel = self._selected_no_data_variant(variants)
+        if sel is not None:
+            key = (str(sel.get("plugin_id") or "").strip().lower(),
+                   str(sel.get("instance_hash") or "").strip().lower())
+            if key not in rendered:
+                self._combo_field.add_disabled_item(
+                    f"→ {sel.get('display_name') or sel.get('plugin_id')} – (No Data)")
+
+    def _selected_no_data_variant(
+        self, variants: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """No-Data-Variante des aktuell gewaehlten Feld-Items (oder None).
+
+        Das userData eines Feld-Items traegt '{service_id}|{key}' - die
+        service_id wird mit den plugin_ids der No-Data-Varianten verglichen
+        (case-insensitiv, B4-5).
+        """
+        if not variants:
+            return None
+        data = self._combo_field.currentData()
+        sid = None
+        if isinstance(data, str) and "|" in data:
+            sid = data.split("|", 1)[0].strip().lower()
+        if not sid:
+            return None
+        for v in variants:
+            if str(v.get("plugin_id") or "").strip().lower() == sid:
+                return v
+        return None
 
     def _on_feature_ids_changed(self) -> None:
         """Synchrones Neu-Ableiten des Feld-Dropdowns bei Check/Uncheck.
@@ -1434,33 +1556,23 @@ class HeatmapWidget(QWidget):
         stale = (payload_gen is not None
                  and str(payload_gen) != str(
                      getattr(vm, "restore_generation", 0)))
-        # x/y/agg mit VM-Prioritaet (Runde 7): restaurierte Werte gewinnen
-        # gegen einen Stale-Payload (Query lief VOR dem Restore mit
-        # Default-Params); erst wenn der VM leer ist, zaehlt der Payload.
-        x_dim = (str(vm.params.get("heatmap_x_dim") or "")
-                 or str(data.get("x_dim") or "date"))
-        y_dim = (str(vm.params.get("heatmap_y_dim") or "")
-                 or str(data.get("y_dim") or "hour"))
-        agg = (str(vm.params.get("heatmap_agg") or "")
-               or str(data.get("agg") or "")
-               or str(self._combo_agg.currentData() or ""))
+        # Runde 11 (Architektur, A5): Die x/y/agg-Combos werden NICHT mehr
+        # aus dem Payload synchronisiert - die Controls sind Single Source
+        # of Truth (Restore-/User-Auswahl gewinnt, kein Ueberschreiben).
         self._syncing = True
         try:
             if not stale:
                 # Feld-Metadaten uebernehmen + 'Feld'-Dropdown synchron neu
                 # ableiten (Items/Haken/Current; Runde 8, Bug 3/4). Bei
                 # stale Payloads bleibt der Zustand aus _sync_from_params
-                # (params_restored) unveraendert.
+                # unveraendert.
                 self._rebuild_field_dropdown(
                     keys, field_sources,
                     payload_agg=str(data.get("agg") or ""),
                     payload_field=str(data.get("field") or ""))
-            # Runde 10 (Bug 2): '(No Data)'-Hinweis-Eintraege werden zentral
-            # in _rebuild_field_dropdown() gerendert (deckt auch den
-            # Cache-Rebuild-Pfad ab) - hier nur noch x/y/agg synchronisieren.
-            self._set_combo_data(self._combo_x, x_dim)
-            self._set_combo_data(self._combo_y, y_dim)
-            self._set_combo_data(self._combo_agg, str(agg or "count"))
+            # Runde 11 (Bug 4, B4-1): '(No Data)'-Hinweise rendert
+            # _rebuild_field_dropdown() zentral aus dem Payload-Cache
+            # (self._no_data_variants aus QUERY_FEATURES).
         finally:
             self._syncing = False
         self._update_controls()
