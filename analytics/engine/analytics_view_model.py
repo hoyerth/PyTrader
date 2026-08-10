@@ -145,6 +145,14 @@ class AnalyticsViewModel(QObject):
         # 20.01 (E7): UI-Layout-Anteil des zuletzt restaurierten Workspace
         # (z. B. {"page_index": 2}) – von der UI abfragbar, kein _params-Key.
         self._workspace_layout: Dict[str, Any] = {}
+        # 10.08.2026 (Punkte 3/4): UI-Layout-Anteil fuer die PROFIL-
+        # Persistenz (page_index, heatmap_mode) - die UI uebergibt ihn vor
+        # jedem save_profile()/create_profile() via set_ui_layout(); die
+        # Werte wandern ueber _current_payload() (Sektion "layout") in den
+        # Profil-Payload und werden in _apply_profile() in _workspace_layout
+        # abgelegt (die UI liest sie dort - identischer Pfad wie der
+        # Workspace-Restore).
+        self._ui_layout: Dict[str, Any] = {}
 
         # Debounce-QTimer (200-300 ms, 15.03-Spezifikation)
         self._debounce = QTimer(self)
@@ -717,6 +725,12 @@ class AnalyticsViewModel(QObject):
         self._active_profile = dict(profile)
         payload = profile.get("payload") or {}
         flat = self._flatten_payload(payload)
+        # 10.08.2026 (Punkte 3/4): UI-Layout (page_index/heatmap_mode) aus
+        # dem Profil-Payload uebernehmen - die UI liest es ueber
+        # workspace_layout (identischer Pfad wie restore_workspace).
+        layout = payload.get("layout")
+        if isinstance(layout, dict):
+            self._workspace_layout.update(dict(layout))
         for key in list(self._params.keys()):
             if key in flat and flat[key] is not None:
                 self._params[key] = flat[key]
@@ -778,6 +792,19 @@ class AnalyticsViewModel(QObject):
             self._params["zoom_y_range"] = self._clamp_zoom(
                 heat["zoom_y_range"])
 
+    def set_ui_layout(self, layout: Optional[Dict[str, Any]] = None) -> None:
+        """Uebernimmt das aktuelle UI-Layout fuer die Profil-Persistenz.
+
+        10.08.2026 (Punkte 3/4): Der ViewModel kennt keine UI-Widgets
+        (MVVM-Invariante 4) - das AnalyticsWindow uebergibt page_index und
+        heatmap_mode vor jedem save_profile()/create_profile(); die Werte
+        wandern ueber _current_payload() (Sektion "layout") in den
+        Profil-Payload und werden beim _apply_profile() in
+        _workspace_layout restauriert (die UI liest sie dort ueber
+        workspace_layout).
+        """
+        self._ui_layout = dict(layout or {})
+
     def _current_payload(self) -> Dict[str, Any]:
         """Profil-Payload aus den aktuellen Ansichtsparametern (v2, sectioned).
 
@@ -824,6 +851,9 @@ class AnalyticsViewModel(QObject):
                 "table_sort_order": p.get("table_sort_order"),
             },
             "styling": {},
+            # 10.08.2026 (Punkte 3/4): UI-Layout-Anteil (page_index,
+            # heatmap_mode) additiv - von der UI via set_ui_layout() gesetzt.
+            "layout": dict(self._ui_layout or {}),
         }
 
     def restore_workspace(self, workspace: Dict[str, Any]) -> None:

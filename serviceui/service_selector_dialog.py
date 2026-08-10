@@ -338,8 +338,12 @@ class ServiceSelectorDialog(QDialog):
     #: (display_names, feature_ids) – beim 'Anwenden & Schliessen' bzw.
     #: leere Listen beim 'Aktive Filter entfernen'.
     services_selected = Signal(list, list)
-    #: 18.01.01 (E-4): Live-Filter bei Klick auf eine Baum-Zeile –
-    #: aufgeloeste feature_ids (plugin_ids), sofort an das AnalyticsWindow.
+    #: 18.01.01 (E-4): Live-Filter - aufgeloeste feature_ids (plugin_ids),
+    #: sofort an das AnalyticsWindow. 10.08.2026 (Bugfix, Punkt 1+2): Der
+    #: Filter folgt AUSSCHLIESSLICH den Checkboxen (checked_changed ->
+    #: _on_checked_changed -> checked_feature_ids()); der Zeilen-Klick
+    #: emittiert dieses Signal NICHT mehr (nur das Read-Only-Panel folgt
+    #: dem Klick, Punkte 1-7).
     selection_ids_requested = Signal(list)
 
     def __init__(
@@ -1390,17 +1394,23 @@ class ServiceSelectorDialog(QDialog):
             Plugins-Ordner die Plugin-Spalten (category_plugin_ids).
           * Gruppen-/sonstige Zeilen -> KEIN Service (Punkt 7).
 
-        18.01.01 (E-4): Zusaetzlich wird der LIVE-Filter gesetzt –
-        `selection_ids_requested(feature_ids)` informiert das AnalyticsWindow
-        sofort (ohne 'Anwenden'). Standalone-Services (belongs_to_indicator
-        == False) sind editierbar (plugin_params_<id>), alle anderen Zeilen
-        bleiben read-only.
+        10.08.2026 (Bugfix, Punkt 1+2): Der LIVE-FILTER folgt
+        AUSSCHLIESSLICH den Checkboxen (`checked_changed` ->
+        `_on_checked_changed` -> `selection_ids_requested` mit
+        `checked_feature_ids()`) - der Zeilen-Klick steuert NUR das Panel.
+        Vorher emittierte dieser Handler beim Klick zusaetzlich
+        `selection_ids_requested` mit dem Zeilen-Scope und ueberschrieb
+        damit den angehakten Filter (feature_ids der Historie/des Profils
+        entsprach dem letzten Klick statt den Haken; die
+        Ergebnisparameter-Dropdowns folgten dem Klick statt den Haken).
+        Standalone-Services (belongs_to_indicator == False) sind editierbar
+        (plugin_params_<id>), alle anderen Zeilen bleiben read-only.
         """
         self._last_scope = (node_type, set_id, service_id, plugin_id)
-        ids = self._resolve_selection_ids(node_type, set_id, service_id,
-                                          plugin_id)
-        if ids:
-            self.selection_ids_requested.emit(ids)
+        # 10.08.2026 (Bugfix, Punkt 1+2): KEIN selection_ids_requested mehr -
+        # der Filter folgt den Checkboxen (checked_changed), nicht dem Klick.
+        # Ein Klick darf den angehakten Filter nicht ueberschreiben (sonst
+        # speichern Historie/Profil den letzten Klick statt der Haken).
         editable = None
         if node_type in (TYPE_PLUGIN, TYPE_CLONE) and plugin_id:
             if not self.model.belongs_to_indicator(str(plugin_id)):

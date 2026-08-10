@@ -638,3 +638,88 @@ Aenderung noetig - nur verifiziert.
 * `test/check_2004_ctxmenu.py`: **34/34 PASS**, `test/check_2004_restore.py`:
   **4/4 PASS** (Regression Restore-Pipeline).
 * `py_compile` aller geaenderten Dateien + CRLF-Konsistenz.
+## 8e. Implementierungs-Log - Bugfix UI-Layout-Persistenz & Klick-Konflikt (10.08.2026)
+
+**Problem (User-Bugreport 10.08.2026, Runden 5+6):** Fuenf Punkte aus den
+Analytics-UI-Bugfix-Runden nach 20.04 (heatmap_mode im Profil, page_index
+im Profil, Muster-/Live-Filter bei Plugin-Parent ohne Checkbox) sowie drei
+Punkte der Restore-Pipeline (angehakte Services in Historie/Profil,
+Check/Uncheck aktualisiert Dropdowns, ServicePicker-Waisenfenster).
+
+### Runde 5: UI-Layout-Persistenz (3 Punkte)
+
+* **Punkt 3 (heatmap_mode im Profil):** Der Ansichts-Modus der Heatmap-
+  Seite (standard/delta) wurde beim Speichern eines Profils nicht
+  persistiert und beim Restore nicht wiederhergestellt.
+  `analytics/engine/analytics_view_model.py`: Neue Methode
+  `set_ui_layout(layout)` (uebernimmt die UI-Layout-Sektion in
+  `_workspace_layout`); `_current_payload()` erhaelt die Sektion
+  `"layout"`; `_apply_profile()` legt sie in `_workspace_layout`.
+  `analytics/ui/analytics_win.py`: Neue Methode `_current_ui_layout()`
+  (liefert `page_index` + `heatmap_mode`); `set_ui_layout(...)` wird vor
+  `save_profile()`/`create_profile()` aufgerufen; der Sync-Handler
+  `_sync_ui_from_restored_params` setzt `heatmap_page.set_mode(...)`
+  aus `workspace_layout.heatmap_mode` (Muster `_restore_workspace`).
+
+* **Punkt 4 (page_index im Profil):** Die aktive Sidebar-Seite wurde im
+  Profil nicht gespeichert/wiederhergestellt.
+  Gleicher Mechanismus wie Punkt 3 (Sektion `"layout"` enthaelt
+  `page_index`). Im Sync-Handler wird die Seite jetzt EXPLIZIT via
+  `self.pages_stack.setCurrentIndex(page_index)` umgeschaltet
+  (blockSignals unterdrueckt `currentRowChanged` -> `_on_page_changed`;
+  ohne `setCurrentIndex` bliebe die alte Seite sichtbar).
+
+* **Punkt 6 (Plugin-Parent ohne Checkbox):** Ein Plugin-Knoten OHNE
+  Kinder (nur ein Plugin, keine Varianten) hatte keine Checkbox, konnte
+  aber via Muster-/Live-Filter nicht mehr angesprochen werden.
+  `serviceui/master_tree.py`: `childCount() == 0`-Guard in
+  `set_checked_feature_ids` und `_sync_checked_items` - bei kinderlosen
+  Plugin-Knoten wird das Item selbst statt der Kinder gesetzt (die
+  `setCheckState`-Semantik mit `childCount()` schlug sonst fehl).
+
+### Runde 6: Klick-Konflikt in der Restore-Pipeline (3 Punkte)
+
+* **Bug 1+2 (GEMEINSAME ROOT CAUSE - Klick ueberschrieb Checkboxen):**
+  Der ServicePicker hatte zwei konkurrierende Live-Filter-Pfade:
+  (1) Checkbox-Pfad (seit Runde 4): `checked_changed` ->
+  `_on_checked_changed` -> `selection_ids_requested(checked_feature_ids())`
+  - korrekt. (2) Klick-Pfad: `master_tree.mousePressEvent` emittierte bei
+  JEDEM Mausklick `selection_details` -> `_on_tree_selection_details`
+  emittierte zusaetzlich `selection_ids_requested(ids)` mit dem
+  Zeilen-Scope und ueberschrieb damit den angehakten Filter. Folge:
+  Nach dem Anhaken von A+B genuegte ein Klick auf eine Zeile, und die
+  Historie/das Profil speicherten den letzten Klick-Scope statt der Haken
+  (Bug 1); die Ergebnisparameter-Dropdowns folgten dem Klick statt den
+  Haken (Bug 2).
+  `serviceui/service_selector_dialog.py`: Der Klick-Handler emittiert
+  KEIN `selection_ids_requested` mehr (der Filter folgt ausschliesslich
+  den Checkboxen); das Read-Only-Panel folgt weiterhin dem Klick
+  (Punkte 1-7 unveraendert). `_resolve_selection_ids` bleibt als
+  ungenutzter Bestandscode erhalten.
+
+* **Bug 3 (ServicePicker-Waisenfenster):** Der ServicePicker-Singleton
+  (`_service_dialog`, kein WA_DeleteOnClose) blieb beim Schliessen des
+  AnalyticsWindow als frei bewegliches Waisenfenster haengen.
+  `analytics/ui/analytics_win.py`: `closeEvent` schliesst
+  `self._service_dialog.close()` vor `_save_workspace()`; das
+  `destroyed`-Signal setzt die Referenz via `_on_service_dialog_destroyed`
+  zurueck (RuntimeError/AttributeError abgefangen).
+
+### Verifikation (headless, keine UI-Tests)
+
+* `test/check_restore_pipeline_round2.py` (neu, Runde 5): **29/29 PASS** -
+  Workspace- und Profil-Restore mit feature_ids, Layout-Sektion
+  (heatmap_mode + page_index) in Profil-Payload und Restore, Plugin-Parent
+  ohne Kinder setzt CheckState korrekt (Muster-/Live-Filter).
+* `test/check_restore_pipeline_round3.py` (neu, Runde 6): **17/17 PASS** -
+  Zeilen-Klick emittiert KEIN selection_ids_requested, Checkbox-Anhaken
+  emittiert `[pid]`, Abhaken emittiert `[]`, Clone-Klick ohne Filter-Emit,
+  destroyed-Mechanismus (Referenz auf None) + close()-Semantik ohne
+  Waisenfenster, Quell-Marker fuer alle drei Fixes.
+* Regressionen: `test/check_2004_ctxmenu.py` **34/34 PASS**,
+  `test/check_variant_bugfix.py` **OK**, `test/check_ui3_bugfix.py`
+  **19/19 PASS**.
+* `py_compile` aller geaenderten Dateien + CRLF-Konsistenz.
+
+---
+

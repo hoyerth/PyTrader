@@ -1439,7 +1439,10 @@ class MasterTree(QTreeWidget):
                 synced.add((TYPE_SERVICE,
                             str(item.data(0, ROLE_SET_ID) or ""),
                             str(item.data(0, ROLE_INSTANCE_ID) or "")))
-            elif node_type == TYPE_PLUGIN:
+            elif node_type == TYPE_PLUGIN and item.childCount() == 0:
+                # 10.08.2026 (Punkt 6): Plugin-Parents mit Varianten sind
+                # non-checkable - kein Haken-Sync (Konsistenz zum Reverse-
+                # Mapping in set_checked_feature_ids).
                 synced.add((TYPE_PLUGIN, "",
                             str(item.data(0, ROLE_PLUGIN_ID) or "")))
             elif node_type == TYPE_CLONE:
@@ -1577,7 +1580,11 @@ class MasterTree(QTreeWidget):
                         checked_items.append(item)
                     item.setData(0, Qt.CheckStateRole,
                                  Qt.Checked if checked else Qt.Unchecked)
-                elif node_type == TYPE_PLUGIN:
+                elif node_type == TYPE_PLUGIN and item.childCount() == 0:
+                    # 10.08.2026 (Punkt 6): Plugin-Parents MIT Varianten/
+                    # Clones sind Template-Knoten OHNE Checkbox (sie tragen
+                    # nur die Clone-Haken) - beim Reverse-Mapping werden sie
+                    # uebersprungen; nur flache Blaetter bleiben anhakbar.
                     pid = str(item.data(0, ROLE_PLUGIN_ID) or "")
                     checked = pid.lower() in wanted
                     if checked:

@@ -458,14 +458,29 @@ class AnalyticsWindow(PersistentWindow):
                     self.sidebar.blockSignals(True)
                     self.sidebar.setCurrentRow(page_index)
                     self.sidebar.blockSignals(False)
-            page = self.pages_stack.currentWidget()
-            if page is not None and hasattr(page, "_sync_from_params"):
-                try:
-                    page._sync_from_params()
-                except (RuntimeError, AttributeError):
-                    pass
+                # 10.08.2026 (Punkt 4): Seiten-Stack EXPLIZIT umschalten
+                # (blockSignals unterdrueckt currentRowChanged -> _on_page_
+                # changed feuert nicht; ohne setCurrentIndex bleibt die
+                # alte Seite sichtbar).
+                self.pages_stack.setCurrentIndex(page_index)
+                page = self.pages_stack.widget(page_index)
+                if page is not None and hasattr(page, "_sync_from_params"):
+                    try:
+                        page._sync_from_params()
+                    except (RuntimeError, AttributeError):
+                        pass
         except (RuntimeError, AttributeError):
             pass
+        # 10.08.2026 (Punkt 3): Ansichts-Modus der Heatmap-Seite auch aus
+        # dem Profil-Restore uebernehmen (workspace_layout wird von
+        # _apply_profile befuellt). Muster _restore_workspace.
+        try:
+            heatmap_mode = (self._vm.workspace_layout or {}).get(
+                "heatmap_mode")
+            if heatmap_mode:
+                self.heatmap_page.set_mode(str(heatmap_mode))
+        except Exception as e:
+            print(f"WARN [AnalyticsWindow] Heatmap-Modus-Restore: {e}")
         self._sync_profile_filters()
         self._sync_service_filter_button()
 
@@ -878,6 +893,16 @@ class AnalyticsWindow(PersistentWindow):
         self.setWindowTitle(
             WINDOW_TITLE_BASE + (" *" if dirty else ""))
 
+    def _current_ui_layout(self) -> Dict[str, Any]:
+        """Aktuelles UI-Layout (Seite + Heatmap-Modus) fuer die
+        Profil-Persistenz (10.08.2026, Punkte 3/4)."""
+        return {
+            "page_index": self.sidebar.currentRow()
+            if hasattr(self, "sidebar") else 0,
+            "heatmap_mode": self.heatmap_page.mode_id
+            if hasattr(self, "heatmap_page") else "standard",
+        }
+
     @Slot()
     def _on_profile_new(self) -> None:
         name, ok = QInputDialog.getText(self, "Neues Profil", "Profil-Name:")
@@ -888,6 +913,9 @@ class AnalyticsWindow(PersistentWindow):
             self, "Neues Profil", "Beschreibung (optional):")
         if not ok2:
             desc = ""
+        # 10.08.2026 (Punkte 3/4): UI-Layout (Seite + Heatmap-Modus) im
+        # neuen Profil persistieren (create_profile ruft _current_payload).
+        self._vm.set_ui_layout(self._current_ui_layout())
         try:
             self._vm.create_profile(name, desc or "")
         except ValueError as e:
@@ -907,6 +935,9 @@ class AnalyticsWindow(PersistentWindow):
             name=self.edit_profile_name.text(),
             description=self.edit_profile_desc.text(),
         )
+        # 10.08.2026 (Punkte 3/4): UI-Layout (Seite + Heatmap-Modus) in das
+        # Profil persistieren (save_profile ruft _current_payload).
+        self._vm.set_ui_layout(self._current_ui_layout())
         self._vm.save_profile()
 
     @Slot()
@@ -1051,6 +1082,15 @@ class AnalyticsWindow(PersistentWindow):
         try:
             self._vm.shutdown()
         except Exception:
+            pass
+        # 10.08.2026 (Bugfix, Punkt 3): Den ServicePicker-Singleton mit
+        # schliessen, wenn das AnalyticsWindow geschlossen wird - sonst
+        # bleibt der frei bewegliche Dialog als Waisenfenster haengen.
+        # Das `destroyed`-Signal setzt self._service_dialog zurueck.
+        try:
+            if self._service_dialog is not None:
+                self._service_dialog.close()
+        except (RuntimeError, AttributeError):
             pass
         self._save_workspace()
         super().closeEvent(event)
