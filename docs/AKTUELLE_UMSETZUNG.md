@@ -1085,3 +1085,128 @@ nicht per Hash filtern (Fehler 2). Zusaetzlich filterte der
 
 ---
 
+## 8k. Implementierungs-Log - Runde 13b: MasterTree-On-the-fly-Hash & Hash-Persistenz (10.08.2026)
+
+**Problem (aus Runde 13b-Analyse, 10.08.2026):** Die Runde-13-Entscheidung
+(8j) lieferte `instance_hashes` fuer Set-Instanz-Varianten (TYPE_SERVICE),
+aber zwei Luecken blieben offen:
+
+1. **On-the-fly-Hash:** Set-Instanz-Varianten OHNE gespeicherten
+   `instance_hash` (z. B. Altsets, deren `service_sets`-Definition noch
+   keinen Hash traegt) bekamen keinen Hash zugewiesen - die
+   Hash-Restriktion (`set_checked_feature_ids`) und
+   `checked_instance_hashes()` konnten sie nicht erfassen. Damit fehlte
+   eine stabile Varianten-Identitaet fuer den Reader-Filter.
+2. **Hash-Persistenz:** Neue/gespeicherte Set-Instanzen persistierten den
+   `instance_hash` nicht in der Set-Definition (`_add_service_to_set` und
+   der Dialog-Add-Pfad schrieben die Instanz ohne Hash in `service_sets`) -
+   die Hash-Identitaet ging beim naechsten Laden verloren.
+
+### Loesung
+
+* `serviceui/master_tree.py`:
+  * `_build_set_item`: Set-Instanz ohne `instance_hash` erhaelt einen
+    on-the-fly-Hash via `generate_instance_hash(plugin_id, params)`
+    (deterministisch, Q3/Q4 - gleicher Hash wie der Writer).
+  * `checked_instance_hashes()` und die Check-Sync-Kette nutzen diesen
+    on-the-fly-Hash auch dann, wenn die Instanz keinen gespeicherten Hash
+    traegt (Hash-Restriktion greift damit auch fuer Altsets).
+* `serviceui/service_win.py`: `_add_service_to_set` persistiert den
+  `instance_hash` der neuen Set-Instanz in die Set-Definition.
+* `serviceui/service_selector_dialog.py`: Der Add-Pfad des
+  Service-Pickers persistiert den `instance_hash` analog.
+
+### Verifikation (headless, keine UI-Tests)
+
+* `test/check_round13b.py` (neu): **9/9 PASS** - T1/T2 (On-the-fly-Hash
+  gesetzt / vorhandener Hash unveraendert), T3 (`checked_instance_hashes`
+  liefert on-the-fly-Hash), T4 (Snapshot-Clones nur gecheckte Variante +
+  `active_hashes`), T5 (Snapshot ohne active_hashes -> alle Clones),
+  T6/T7 (Hash-Persistenz in `_add_service_to_set` und Dialog-Add-Pfad,
+  Modul-Import `generate_instance_hash`).
+* `test/_verify_mastertree.py` (aktualisiert): **ALL OK** - E1b
+  (build_set_item on-the-fly-Hash), E7 (4er add service) u. a.
+* `py_compile` aller 3 geaenderten Dateien: EXIT=0.
+
+---
+
+## 8l. Implementierungs-Log - Runde 13c: feature_data-Migration, Alt-Bestand-Fallback & Kernwunsch leeres Snapshot (10.08.2026)
+
+**Problem (User-Freigabe 10.08.2026):** Die Runde-13-Fixes (8j) waren
+korrekt, aber die zwei urspruenglichen Dropdown-Bugs bestanden empirisch
+fort, weil der Reader die Datenlage anders beurteilte als die DB:
+
+1. **Falsche Variante bei (No Data):** `srv_proximity` (6 Timeframes,
+   ~593K Rows) und `native` (3000 Rows) hatten in `feature_store`
+   **befuellte Alt-Spalten** (`ema_diff`, `atr_normalized`,
+   `grid_nearest_level`, `grid_dist_abs`, `grid_dist_pct`,
+   `is_time_window_active`), aber **`feature_data` = NULL**. Der Reader
+   definiert 'hat Daten' aber ausschliesslich ueber `feature_data`
+   (19.02-Kanon) - die Set-Instanz `proximity` (Hash `a392915e`) matchte
+   nichts und wurde faelschlich als '(No Data)' gemeldet, obwohl 99K
+   M1-Zeilen vorhanden waren.
+2. **Phantom-Eintraege:** Bei leerem Filter ('kein Filter = alle') lieferte
+   der leere `feature_ids`-Filter ALLE NoData-Varianten des
+   Service-Modells in den Payload - ungecheckte Services erschienen
+   trotz Runde-13-Filter im Dropdown.
+
+### Loesung
+
+* **Migration (Daten-Bestand):** `test/_migrate_feature_data.py` fuehrt
+  `UPDATE feature_store SET feature_data = json_object(...)` (6 Keys +
+  `schema_version`) fuer alle Rows mit `feature_data IS NULL` aus -
+  Alt-Spalten-Bestand wird damit in den kanonischen JSON-Vertrag
+  ueberfuehrt. Backup vor der Migration:
+  `test/backup_analytics_before_fd_migration.duckdb`. Ergebnis:
+  **573.468 srv_proximity + 3.000 native migriert; 0 Rows mit NULL.**
+  Dry-Run vorab auf `test/_migrate_test_copy.duckdb` verifiziert.
+* `analytics/engine/feature_store_reader.py`:
+  * Neu (read-only): `plugin_ids_with_hashes(symbol, timeframe)` ->
+    Set der plugin_ids mit mind. einer `instance_hash`-Zeile; faengt
+    DB-Fehler intern ab und liefert `set()` (Invariante: rein lesend).
+  * `resolve_no_data_variants()`: `_has_data`-Fallback fuer Alt-Bestand -
+    liegt die plugin_id NICHT in `pids_with_hashes` (Bestands-Abfrage
+    erfolgreich), stammt ihr gesamter Bestand aus undifferenzierten
+    Alt-Rows ohne Hash und deckt JEDE Variante ab (`has_data=True`).
+    `pids_with_hashes is None` (Abfragefehler) behaelt die konservative
+    Runde-10-Semantik (kein Fallback auf unbekannter Basis).
+* `analytics/engine/analytics_view_model.py`: `_no_data_presets_snapshot()`
+  liefert bei leerem `feature_ids`-Filter sofort
+  `{"presets": {}, "sets": [], "display_names": {}, "active_hashes": []}`
+  (Kernwunsch: 'Aktive Filter entfernen' zeigt danach alle Features OHNE
+  NoData-Rauschen).
+* `analytics/ui/heatmap_widget.py`:
+  * `_render_no_data_items()`: `active_ids`-Check ganz oben - bei leerem
+    Filter wird weder der No-Data-Abschnitt noch der Fehler-/Loading-
+    Hinweis gerendert (Guard gegen Alt-/Stale-Payloads).
+  * `_selected_no_data_variant()` (Bug-1-Absicherung): Bei Payloads mit
+    mehreren No-Data-Varianten desselben Services gewinnt DEFENSIV die
+    im ServicePicker gecheckte Variante (instance_hash in
+    `instance_hashes`); erst ohne Hash-Match faellt die Auswahl auf den
+    ersten Service-Treffer zurueck.
+
+### Verifikation (headless, keine UI-Tests)
+
+* `test/check_round13c.py` (neu): **20/20 PASS** - A: Migration (keine
+  NULL-Rows mehr, JSON-Keys, Schema-Version), B: Reader-Fallback
+  (Alt-Bestand deckt jede Variante ab; Abfragefehler -> konservativ),
+  C: Kernwunsch (leerer Filter -> leeres Snapshot), D: UI-Logik
+  (render-Guard, Hash-Match in `_selected_no_data_variant`).
+* Regressionen:
+  * `test/check_round11.py`: **35/35 PASS** (`_FakeReader` overridet
+    `plugin_ids_with_hashes` -> `{"srv_a"}`; Widget-Tests 'frischer
+    Payload'/'Fehlerzustand' mit aktivem Filter).
+  * `test/check_round12.py`: **23/23 PASS** (A6 mit aktivem Filter,
+    C1 auf Kernwunsch-Semantik umgestellt: leerer Filter -> leeres
+    Snapshot statt 'alle Presets').
+  * `test/check_round13b.py`: **9/9 PASS**, `test/_verify_mastertree.py`:
+    **ALL OK**.
+* `py_compile` aller 6 geaenderten Quelldateien + aller betroffenen
+  Testdateien: EXIT=0.
+* Cleanup: Diagnose-Skripte (`_diag_*.py`, `_dryrun_migration.py`) und
+  `_migrate_test_copy.duckdb` entfernt; `_migrate_feature_data.py`
+  (Migrationswerkzeug), `check_round13c.py` und das Backup bleiben in
+  `test/` (Testdateien gitignored).
+
+---
+
