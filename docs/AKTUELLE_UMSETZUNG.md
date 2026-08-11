@@ -1,8 +1,8 @@
-﻿# Phase 19: Analytics-Finalisierung
+﻿# Phase 20: Analytics-Finalisierung
 
-## 1. Allgemeine GrundsÃ¤tze & Architektur-Invarianten (Phase 19)
+## 1. Allgemeine GrundsÃ¤tze & Architektur-Invarianten (Phase 20)
 
-1. **Git-Backup vor jedem Schritt:** Vor Beginn jedes Teilkapitels automatischen Git-Commit/Tag setzen (`phase19_step1`, `phase19_step2` usw.).
+1. **Git-Backup vor jedem Schritt:** Vor Beginn jedes Teilkapitels automatischen Git-Commit/Tag setzen (`phase20_step1`, `phase20_step2` usw.).
 2. **Headless-Validierung (Keine UI-Tests):** Validierungen erfolgen rein headless (kein `QApplication.exec()`) Ã¼ber gezielte PyTest-/Python-Skripte im Unterordner `test/`.
 3. **Codebase-Formatierung:** Exakt **4 Leerzeichen** EinrÃ¼ckung (PEP8-Standard) und **exakt 1 Leerzeile** Spacing zwischen Methoden und FunktionsblÃ¶cken. Kein Umformatieren unbeteiligter Altbestand-Dateien.
 4. **Strikte Trennung & MVVM (Kein SQL in UI):** UI-Klassen enthalten **keine SQL-Queries**. Datenfluss: `DuckDB` $\rightarrow$ `FeatureStoreReader` / `Repositories` $\rightarrow$ `Worker/ViewModel` $\rightarrow$ `UI-Pages`. `MasterTree`-Selektionen Ã¼bergeben aufgelÃ¶ste `feature_ids` direkt an `view_model.set_feature_ids()`.
@@ -236,3 +236,43 @@ Prämissen:
 * Regressionstests nur auf ausdrückliche Anweisung.
 * **Offen (manuell):** App-Test – Mischcheck im ServicePicker, NoData-Abschnitt, Layout (Aggregation/Feld in Zoom-Y-Zeile), Dropdown-Format.
 
+
+---
+
+## 10. Implementierungs-Log - Bugfix Runde 16c: Ausfuehrungsdatum hinter Services ohne Varianten (11.08.2026)
+
+**Problem (User-Meldung, 11.08.2026):** Im Feld-Dropdown soll auch hinter **Services ohne Versionen** (Standalone-Services wie `srv_trend_breakout` - kein Preset, keine Set-Instanz) das Ausfuehrungsdatum angezeigt werden: `Checkbox + ' ' + Service-Name (ohne `src_`-Praefix) + '/ ' + DD.MM.JJ HH:MM` (z. B. `23.04.26 22:14`), sofern vorhanden.
+
+**Root Cause:** `checked_variant()` (Runde 16) liefert fuer Standalone-Services (keine Presets/Clones) konsequent `None` - der Anzeige-Anhang in `_field_label()` blieb leer. Das Ausfuehrungsdatum eines hash-losen Services lag zwar im Modell vor (`last_execution_date`, nur Datum ohne Uhrzeit), wurde aber nicht im Dropdown genutzt.
+
+### Loesung (Fixes 1-4)
+
+* **Fix 1 (`feature_store_reader.py`):** Neue Methode `fetch_last_execution_datetimes()` - neuester Schreib-Zeitpunkt je feature_id **MIT Uhrzeit** als `'DD.MM.JJ HH:MM'` (identische SQL-Basis wie `fetch_last_execution_dates`; MAX(created_at) GROUP BY feature_id ueber alle Symbole/Timeframes).
+* **Fix 2 (`service_selector_model.py`):** Neuer Cache `_last_execution_datetimes` (in `refresh()` geladen) + Methode `last_execution_datetime(plugin_id)` (Fallback `'--.--.-- --:--'`).
+* **Fix 3 (`analytics_view_model.py`):** Neue Methode `service_execution_datetime(plugin_id)` - Delegate an das Modell (rein lesend, defensiv).
+* **Fix 4 (`heatmap_widget.py`, `_field_label`):** Else-Branch - liefert `checked_variant()` `None` (Service ohne Varianten), wird das Service-Datum+Uhrzeit angehaengt: `Trend Breakout / price / 10.08.26 14:03`. Aufruf defensiv via `getattr` (Fake-/Alt-ViewModels ohne die Methode ergeben keinen Anhang).
+
+### Verifikation (headless, keine UI-Tests)
+
+* `py_compile` aller geaenderten Dateien (EXIT=0).
+* Echte DB (analytics.duckdb): Reader liefert 6 Services mit `'DD.MM.JJ HH:MM'` (Format-Check gruen); Modell-Cache + Fallback `--.--.-- --:--` korrekt; `_field_label("open", ["srv_grid_lines"])` -> `Grid Lines / open / 10.08.26 14:03`; `srv_trend_breakout` (keine Daten) -> `Trend Breakout / price` (ohne Datum); Fake-VM ohne neue Methode -> kein Crash.
+* **Offen (manuell):** App-Test - Standalone-Service im Feld-Dropdown zeigt Ausfuehrungsdatum nach dem ersten Scan.
+
+---
+
+## 11. Abschluss Phase 20.05: Ultra-Low-Latency Control & Rendering Pipeline (11.08.2026)
+
+Mit den Runden 16 (Mischbetrieb NoData & Dropdown-Anzeige) und 16c (Ausfuehrungsdatum hinter Services ohne Varianten) ist die **Phase 20.05 abgeschlossen** - alle User-Meldungen 0-6 der Runde 16 sowie die Nachmeldung zu Standalone-Daten sind umgesetzt, committet und headless verifiziert:
+
+1. **Dropdown-Anzeige:** Checkbox + Service-Name (ohne `src_`/`srv_`/`ind_`-Praefix) + `{Preset}` (nur bei Versionen) + `/ DD.MM.JJ HH:MM` (Ausfuehrungsdatum, wenn vorhanden - fuer Versionen und Standalone-Services).
+2. **Layout:** Aggregation rechts neben Zoom Y (mit Abstand), Feld-Dropdown rechts daneben bis zum Canvas-Ende (Expanding-Policy).
+3. **NoData:** Versionen (auch mehrere) und Standalone-Services erscheinen korrekt - auch im Mischbetrieb (Fixes 1-3).
+4. **Latenzfreiheit:** Alle 4 Praemissen der 20.05-Architektur bleiben erfuellt (kein synchroner DB-Zugriff im UI-Hauptthread; die neuen Datums-Lookups laufen ueber die gecachten Modell-Caches in `refresh()`).
+
+**Abschliessender Stand (Commits `d70462d` + `8ecf2b3`):**
+* `analytics/engine/analytics_view_model.py` - Fix 1 (Standalone-Guard), Fix 5c (`exec_date`, `src_`-Strip, `checked_variant`), Fix 3 (16c: `service_execution_datetime`)
+* `analytics/engine/feature_store_reader.py` - Fix 2 (`and h_s`-Guard), Fix 5a (`fetch_last_execution_datetimes_by_hash`), Fix 5e (Fallback `Name / Preset`), Fix 1 (16c: `fetch_last_execution_datetimes`)
+* `analytics/engine/service_selector_model.py` - Fix 5b (Cache + `last_execution_datetime_for_hash`), Fix 2 (16c: Cache + `last_execution_datetime`)
+* `analytics/ui/heatmap_widget.py` - Fix 3 (Widget-Hash-Filter), Fix 4 (Layout Zoom-Y-Zeile), Fix 5d (`_field_label` defensiv), Fix 4 (16c: Standalone-Datum)
+
+**Verbleibend (manuell durch den Anwender):** Funktionstest der UI (ServicePicker-Mischcheck, NoData-Abschnitt, Layout, Dropdown-Format inkl. Ausfuehrungsdatum).
