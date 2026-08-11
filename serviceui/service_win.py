@@ -580,21 +580,26 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.resize(new_w, new_h)
 
     def apply_screen_cap(self) -> None:
-        """11.08.2026 (Bugfix, Maximize): Ausgegrauter Maximize-Button."
+        """11.08.2026 (Bugfix Runde 17d2, User-Meldung 1): KEIN setMaximumSize.
 
-        Das Basis-Mixin setzte setMaximumSize(screen.size()) - sobald das
-        Fenster auf exakt dieser Groesse lag (z. B. Inhalt >= Screen oder
-        kleinere Aufloesung als die .ui-Default-Geometrie), graute Windows
-        den Maximize-Button aus (max == size -> nicht mehr vergroesserbar).
-        Das Maximum wird jetzt GROSSZUEGIG bemessen (2x Screen): Der
-        Maximize-Button bleibt IMMER aktiv. Das exakt-fit-Reflow
-        (resize_to_clamped_content) klemmt die DEFAULT-Groesse weiterhin auf
-        den Screen; der Anwender kann danach frei maximieren bzw. das Fenster
-        groesser ziehen (Inhalt scrollt in der ContentScrollArea).
+        Qt's Windows-QPA zeigt/aktiviert den Maximize-Button NUR, wenn
+        maximumSize() == QWINDOWSIZE_MAX (16777215) ist (oder
+        Qt::CustomizeWindowHint gesetzt ist) - siehe qwindowswindow.cpp,
+        shouldShowMaximizeButton(): 'return (flags & Qt::CustomizeWindowHint)
+        || w->maximumSize() == QSize(QWINDOWSIZE_MAX, QWINDOWSIZE_MAX);'.
+
+        Das bisherige setMaximumSize(screen.size()) (Runde 17b) bzw.
+        setMaximumSize(screen.size()*2) (Runde 17c) war NIE gleich
+        QWINDOWSIZE_MAX -> Windows graute den Maximize-Button weiterhin aus.
+
+        Mit widgetResizable=True + _exact_fit_to_content=False ist die
+        Screen-Klemme der DEFAULT-Groesse Aufgabe des Reflows
+        (resize_to_clamped_content klemmt auf availableGeometry). Ein
+        OS-seitiges Maximum ist nicht noetig: Das Fenster behaelt die
+        Qt-Defaults (max = QWINDOWSIZE_MAX) und kann frei maximiert werden
+        (der Inhalt folgt via ContentScrollArea).
         """
-        screen = QApplication.primaryScreen().availableGeometry()
-        self.setMaximumSize(
-            QSize(screen.width() * 2, screen.height() * 2))
+        pass  # bewusst KEIN setMaximumSize - Maximize-Button bleibt aktiv
 
     def get_persistent_symbol(self) -> str:
         return self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
