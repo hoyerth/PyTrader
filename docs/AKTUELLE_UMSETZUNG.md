@@ -276,3 +276,27 @@ Mit den Runden 16 (Mischbetrieb NoData & Dropdown-Anzeige) und 16c (Ausfuehrungs
 * `analytics/ui/heatmap_widget.py` - Fix 3 (Widget-Hash-Filter), Fix 4 (Layout Zoom-Y-Zeile), Fix 5d (`_field_label` defensiv), Fix 4 (16c: Standalone-Datum)
 
 **Verbleibend (manuell durch den Anwender):** Funktionstest der UI (ServicePicker-Mischcheck, NoData-Abschnitt, Layout, Dropdown-Format inkl. Ausfuehrungsdatum).
+---
+
+## 12. Implementierungs-Log - Bugfix Runde 17b: Log-Hoehe 6 Zeilen & Maximize-Button aktiv (11.08.2026)
+
+**Problem (User-Nachtrag nach Runde 17, 11.08.2026):**
+1. Das Log-Fenster im ServiceWindow soll noch **2 Zeilen hoeher** (4 -> 6 Zeilen).
+2. Der **Maximize-Button ist weiterhin ausgegraut** - trotz `resize_to_clamped_content`-Schutz aus Runde 17.
+
+**Root Cause Maximize (Analyse 11.08.2026):** `apply_screen_cap()` in `scrollable_content.py` setzt `setMaximumSize(screen.size())`. Der exakt-fit-Reflow (`resize_to_clamped_content`) bringt das Fenster auf genau diese Groesse. Liegt `maximumSize == size` vor (z. B. Inhalt >= Screen oder kleinere Aufloesung als die .ui-Default-Geometrie), graut Windows den Maximize-Button aus (Fenster ist nicht mehr vergroesserbar).
+
+### Loesung (Fixes 1-3)
+
+* **Fix 1 (`serviceui/service_win.py`, Log-Hoehe):** `setMaximumHeight`/`setMinimumHeight` von `fm.lineSpacing() * 4 + 12` auf `* 6 + 12` erhoeht (User-Nachtrag: 2 Zeilen hoeher als die 4-Zeilen-Stufe).
+* **Fix 2 (`serviceui/service_win.py`, `apply_screen_cap()`-Override):** ServiceWindow ueberschreibt die Basis-Methode und setzt das Maximum grosszuegig auf **2x Screen** (`QSize(screen.width() * 2, screen.height() * 2)`, `QSize`-Import ergaenzt). Der Maximize-Button bleibt damit IMMER aktiv (`max > size`). Das exakt-fit-Reflow klemmt weiterhin die DEFAULT-Groesse auf den Screen; der Anwender kann danach frei maximieren bzw. das Fenster groesser ziehen (Inhalt scrollt in der ContentScrollArea).
+* **Fix 3 (`persistent_win.py`, `_fix_window_flags`):** Sichert zusaetzlich explizit `Qt.WindowMaximizeButtonHint | Qt.WindowMinimizeButtonHint` (Flags werden nur bei Bedarf neu gesetzt - `if wanted != flags:`) - fehlt der Maximize-Hint (z. B. durch QUiLoader/setWindowFlags-Fallstricke), ist der Maximize-Button ausgegraut.
+
+### Verifikation (headless, keine UI-Tests)
+
+* `test/check_ui3_bugfix.py` (aktualisiert): **31/31 PASS** - B4: Log 6 Zeilen (`* 6 + 12` max/min, kein `* 4 + 12`); B6: `apply_screen_cap`-Override vorhanden, Maximum `screen.width() * 2`/`screen.height() * 2`, kein exakt-fit-`setMaximumSize(screen.size())`-Code, `Qt.WindowMaximizeButtonHint`/`Qt.WindowMinimizeButtonHint` in `persistent_win.py`, Guard `if wanted != flags:`.
+* `test/check_r17b_construct.py` (neu, offscreen): **11/11 PASS** - echtes `ServiceWindow()` konstruiert: `maximumSize()` == 2x Screen, Maximize-/Minimize-Hint + `Qt.Window` gesetzt, Log min/max == `lineSpacing()*6+12`.
+* `py_compile` der geaenderten Dateien (EXIT=0).
+* **Offen (manuell):** App-Test - Maximize-Button klickbar, Log-Fenster 6 Zeilen hoch.
+
+---
