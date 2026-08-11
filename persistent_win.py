@@ -114,25 +114,33 @@ class PersistentWindow(QMainWindow):
     def _fix_window_flags(self) -> None:
         """Stellt sicher, dass das Fenster als normales Top-Level-Fenster
         (Qt.Window) konfiguriert ist und nicht als Tool/Dialog.
-        
+
         Wichtig: Qt.Dialog | Qt.Tool sind bei QMainWindow immer gesetzt
         und können nicht entfernt werden. Das ist normales Qt-Verhalten.
         Ein Fenster ohne Parent hat automatisch einen Taskleisten-Eintrag.
         """
-        # Nur prüfen, ob Qt.Window gesetzt ist (sollte immer der Fall sein)
-        flags = self.windowFlags()
-        # 11.08.2026 (Bugfix, Maximize): Explizit die Standard-Fenster-Buttons
-        # sicherstellen - fehlt der Maximize-Hint (z. B. durch QUiLoader/
-        # setWindowFlags-Fallstricke), ist der Maximize-Button ausgegraut.
-        wanted = (flags | Qt.Window | Qt.WindowMaximizeButtonHint
-                  | Qt.WindowMinimizeButtonHint)
-        # 11.08.2026 (Bugfix Runde 17c, User-Meldung 3): MSWindowsFixedSize-
-        # DialogHint EXPLIZIT entfernen – dieses Flag deaktiviert den Maximize-
-        # Button auf Windows (Fenster gilt als fest gross). Qt setzt es ggf.
-        # automatisch, wenn das Fenster zeitweise als fixed erkannt wurde.
-        wanted &= ~Qt.MSWindowsFixedSizeDialogHint
+        # 11.08.2026 (Bugfix Runde 17d, User-Meldung 3): Int-basierte
+        # Flag-Arithmetik (PySide6-Flag-Operatoren droppen Bits ausserhalb
+        # des Enum-Domains, z. B. 0x08000000 bei '& ~WindowType_Mask').
+        # 1) Typ explizit auf Qt.Window setzen: Qt.Dialog-/Qt.Tool-Fenster
+        #    haben unter Windows KEINE Minimize/Maximize-Buttons.
+        # 2) VOLLSTAENDIGEN Standard-Button-Satz setzen (Title, SystemMenu,
+        #    Minimize, Maximize, Close) - fehlt ein Hint, graut Windows den
+        #    Maximize-Button aus bzw. zeigt ihn gar nicht.
+        # 3) MSWindowsFixedSizeDialogHint entfernen - dieses Flag deaktiviert
+        #    den Maximize-Button auf Windows (Fenster gilt als fest gross).
+        #    Qt setzt es ggf. automatisch, wenn das Fenster zeitweise als
+        #    fixed erkannt wurde.
+        flags = int(self.windowFlags())
+        type_mask = 0xFF
+        wanted = (flags & ~type_mask) | int(Qt.Window)
+        wanted |= (int(Qt.WindowTitleHint) | int(Qt.WindowSystemMenuHint)
+                   | int(Qt.WindowMinimizeButtonHint)
+                   | int(Qt.WindowMaximizeButtonHint)
+                   | int(Qt.WindowCloseButtonHint))
+        wanted &= ~int(Qt.MSWindowsFixedSizeDialogHint)
         if wanted != flags:
-            self.setWindowFlags(wanted)
+            self.setWindowFlags(Qt.WindowFlags(int(wanted)))
 
     @property
     def state_manager(self) -> StateManager:

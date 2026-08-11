@@ -351,7 +351,15 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # jedem Reflow explizit auf die aktuelle Layout-Größe (ContentScrollMixin).
         if self.central_layout is not None:
             self.central_layout.setSpacing(6)
-            self.central_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+            # 11.08.2026 (Bugfix Runde 17d, User-Meldungen 4+5): KEIN
+            # setAlignment(AlignTop|AlignLeft) mehr - es HIELT die Layout-
+            # Verteilung an: Der QSplitter (MasterTree | Parameter-Box) blieb
+            # auf seiner Mindest-Hoehe stehen, obwohl das Fenster groesser
+            # gezogen/maximiert wurde (extra Raum blieb als Leerflaeche
+            # unterhalb des Splitters). Mit widgetResizable=True +
+            # _exact_fit_to_content=False folgt der INHALT dem FENSTER: Der
+            # Splitter faengt das Wachstum ab und verteilt es an MasterTree
+            # (Hoehe!) und Parameter-Box (Breite + Hoehe).
         self._service_param_controls: Dict[Any, QWidget] = {}
         # Phase 14 P14-01: Beschreibungs-Eingabefelder der Service-Instanzen
         self._service_desc_controls: Dict[str, QWidget] = {}
