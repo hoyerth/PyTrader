@@ -130,11 +130,9 @@ class HeatmapPage(QWidget):
         # verbindet eigene data_ready-Slots (QUERY_HEATMAP_GENERIC/
         # QUERY_DAILY_OHLC, Bugfix 09.08.2026).
         self._generic.attach_view_model(view_model)
-        # 21.01 (E4, 11.08.2026): Preset-Klick im generischen Widget
-        # schaltet die Heatmap-Ansicht sicher in den generischen Modus
-        # (idempotent – das Widget ist nur dort sichtbar, der Guard deckt
-        # dennoch den Randfall eines Standard-Modus-Wechsels ab).
-        self._generic.preset_clicked.connect(self._on_preset_clicked)
+        # 21.01 (E7, 11.08.2026): Die `preset_clicked`-Verbindung wurde
+        # entfernt – das generische Widget hat keine Preset-Buttons mehr
+        # (Smart-Presets laufen ausschliesslich ueber das Ansicht-Dropdown).
         params = view_model.params
         # 19.02 (Cleanup): Metriken = "count" + numerische feature_data-
         # JSON-Keys (dynamisch). Prefill fuer das aktuelle Symbol/Timeframe;
@@ -188,15 +186,6 @@ class HeatmapPage(QWidget):
             self._combo_mode.setCurrentIndex(idx)
             self._combo_mode.blockSignals(False)
         self._stack_modes.setCurrentIndex(1)
-
-    # 21.01 (E4, 11.08.2026): Preset-Klick aus dem generischen Widget –
-    # das Ansicht-Dropdown wird auf die gewaehlte Preset-Option synchroni-
-    # siert (set_mode blockt Signale, keine Doppel-Anwendung des Presets).
-    def _on_preset_clicked(self, preset: str) -> None:
-        mid = (f"preset_{preset}"
-               if preset in ("confluence", "session", "intensity", "timeframe")
-               else "generic")
-        self.set_mode(mid)
 
     def _on_mode_changed(self, _index: int) -> None:
         """Wechselt die Ansicht: Preset anwenden bzw. generisch laden.
