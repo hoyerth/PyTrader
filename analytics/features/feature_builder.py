@@ -45,6 +45,35 @@ DB_MARKET = str(DATA_DIR / "market_data.duckdb")
 DB_ANALYTICS = str(DATA_DIR / "analytics.duckdb")
 
 
+def _feature_store_conflict_target(con) -> str:
+    """Liefert den ON CONFLICT-Zielspalten-String passend zum aktuellen PK
+    der feature_store-Tabelle (11.08.2026, Bugfix Varianten-Kollision):
+
+    * PK (symbol, timeframe, bar_time, feature_id, instance_hash) nach der
+      Migration -> 5-Spalten-Target (Varianten koexistieren pro Bar).
+    * Alt-PK (4 Spalten, Migration nicht gelaufen) -> 4-Spalten-Target
+      (Bestandsverhalten, kein Write-Bruch).
+
+    Defensiv: Fehler -> 4-Spalten-Target.
+    """
+    try:
+        rows = con.execute(
+            "SELECT constraint_column_indexes FROM duckdb_constraints() "
+            "WHERE table_name='feature_store' "
+            "AND constraint_type='PRIMARY KEY'").fetchall()
+        if rows:
+            idxs = rows[0][0] or []
+            cols = [r[0].lower() for r in con.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='feature_store' ORDER BY ordinal_position"
+            ).fetchall()]
+            if any(cols[i].lower() == "instance_hash" for i in idxs):
+                return "(symbol, timeframe, bar_time, feature_id, instance_hash)"
+    except Exception:
+        pass
+    return "(symbol, timeframe, bar_time, feature_id)"
+
+
 def _timestamp_to_epoch(value: Any) -> int:
     """Konvertiert pandas Timestamp / datetime in epoch-Sekunden (int).
     Int/Float-Werte (bereits epoch-Sekunden) werden unveraendert uebernommen."""
@@ -596,7 +625,7 @@ class FeatureBuilder:
                 INSERT INTO feature_store ({insert_cols})
                 SELECT {select_cols}
                 FROM df_temp
-                ON CONFLICT (symbol, timeframe, bar_time, feature_id) DO UPDATE SET
+                ON CONFLICT {_feature_store_conflict_target(con)} DO UPDATE SET
                     {set_clause}
             """
             con.execute(sql)
@@ -658,7 +687,8 @@ class FeatureBuilder:
                 dt_val = _to_utc_datetime(rec["bar_time"])
                 data = {k: v for k, v in rec.items() if k != "bar_time"}
                 rows.append((symbol, timeframe, dt_val, feature_id,
-                             plugin_version, json.dumps(data), instance_hash))
+                             plugin_version, json.dumps(data),
+                             instance_hash or ""))
             if not rows:
                 return 0
 
@@ -695,14 +725,14 @@ class FeatureBuilder:
                 # 20.04 (Q9): instance_hash wird beim Upsert mitgeschrieben;
                 # COALESCE verhindert, dass ein NULL (Aufrufer ohne Hash) einen
                 # bestehenden Varianten-Hash ueberschreibt.
-                con.execute("""
+                con.execute(f"""
                     INSERT INTO feature_store
                         (symbol, timeframe, bar_time, feature_id,
                          plugin_version, feature_data, instance_hash, created_at)
                     SELECT symbol, timeframe, bar_time, feature_id,
                            plugin_version, feature_data, instance_hash, now()
                     FROM df_temp
-                    ON CONFLICT (symbol, timeframe, bar_time, feature_id) DO UPDATE SET
+                    ON CONFLICT {_feature_store_conflict_target(con)} DO UPDATE SET
                         feature_id = EXCLUDED.feature_id,
                         plugin_version = EXCLUDED.plugin_version,
                         feature_data = EXCLUDED.feature_data,

@@ -239,15 +239,18 @@ class MasterTree(QTreeWidget):
     run_service_requested = Signal(str, str)
     run_set_requested = Signal(str)
     # 17.01.02 (Bugfix-Runde): Run-/Info-Aktionen fuer die Services-Gruppe.
-    #   run_plugin_requested(plugin_id)  – '▶️ Diesen Service ausführen'
-    #                                      (Einzel-Plugin-Zeile, ohne Set)
+    #   run_plugin_requested(plugin_id, instance_hash) – '▶️ Diesen Service
+    #      ausführen' (Einzel-Plugin-Zeile, ohne Set). 11.08.2026 (Bugfixing):
+    #      Clone-Zeilen liefern den instance_hash der Variante mit (NUR diese
+    #      Variante laeuft mit ihren Parametern); Plugin-Zeilen senden '' (mit
+    #      Presets laufen alle aktiven Varianten, sonst Basis-Parameter).
     #   run_category_requested(group, path) – '▶️ Alle Services ausführen'
     #                                      (Kategorie-Ordner, rekursiv; path
     #                                      z.B. 'Swing Points/Geometrie';
     #                                      group = 'sets' | 'plugins',
     #                                      18.01.03: Sets-Ordner moeglich)
     #   category_info_requested(group, path) – Info-Button auf Kategorie-Ordnern
-    run_plugin_requested = Signal(str)
+    run_plugin_requested = Signal(str, str)
     run_category_requested = Signal(str, str)
     category_info_requested = Signal(str, str)
     # 18.01.03 (Dynamic Tree Management): Ordner-CRUD & Kategorie-Drag&Drop.
@@ -565,7 +568,8 @@ class MasterTree(QTreeWidget):
             # Ausfuehrung (DD.MM.JJ, aus dem feature_store) haengt direkt am
             # Service-Namen: 'prox_1 (05.08.26)' – ohne Eintrag '(--.--.--)'.
             plugin_id = svc.get("plugin_id") or ""
-            last_exec = str(svc.get("last_execution") or "--.--.--")
+            last_exec = str(svc.get("last_execution") or "")
+            last_exec = last_exec if last_exec and last_exec != "--.--.--" else "nie"
             svc_label = f"{svc.get('instance_id')} ({last_exec})"
             # 20.04 (Q6): Einzeln archivierte Instanzen tragen im Archiv
             # eine Kennzeichnung (is_archived=True -> non-checkable).
@@ -625,14 +629,19 @@ class MasterTree(QTreeWidget):
         # 05.08.2026 (Punkt 4): Das Datum der letzten Ausfuehrung (DD.MM.JJ,
         # aus dem feature_store) haengt auch an Standalone-/Plugin-Zeilen:
         # 'srv_proximity (02.08.26)' – ohne Eintrag '(--.--.--)'.
-        last_exec = str(child.get("last_execution") or "--.--.--")
+        last_exec = str(child.get("last_execution") or "")
+        last_exec = last_exec if last_exec and last_exec != "--.--.--" else "nie"
         clones = child.get("clones") or []
         archived_parent = bool(child.get("archived"))
         # 10.08.2026 (Varianten-Ausfuehrungsdatum): Hat ein Plugin Varianten
         # (Clones), haengt das Datum der letzten Ausfuehrung an der Variante
         # (Clone-Zeile) – der Parent-Knoten zeigt nur noch die Plugin-ID
         # (kein Ausfuehrungsdatum mehr im Knoten darueber).
-        plugin_label = pid if clones else f"{pid} ({last_exec})"
+        # 11.08.2026 (Bugfix, Kosmetik): 'srv_'-Praefix der Plugin-ID wird
+        # im Label abgeschnitten (Konsistenz zur Sets-Gruppe mit
+        # instance_ids; ROLE_PLUGIN_ID bleibt die echte plugin_id).
+        display_pid = pid[4:] if pid.startswith("srv_") else pid
+        plugin_label = display_pid if clones else f"{display_pid} ({last_exec})"
         plugin_item = QTreeWidgetItem([plugin_label, ""])
         plugin_item.setData(0, ROLE_NODE_TYPE, TYPE_PLUGIN)
         plugin_item.setData(0, ROLE_SET_ID, group)
@@ -674,7 +683,8 @@ class MasterTree(QTreeWidget):
         # entfaellt aus dem Label – stattdessen haengt das Datum der letzten
         # Ausfuehrung dieser Variante direkt am Varianten-Namen:
         # '🟢 <Preset> (DD.MM.JJ)' (ohne Eintrag '(--.--.--)').
-        last_exec = str(clone.get("last_execution") or "--.--.--")
+        last_exec = str(clone.get("last_execution") or "")
+        last_exec = last_exec if last_exec and last_exec != "--.--.--" else "nie"
         prefix = "🔹" if archived else "🟢"
         clone_item = QTreeWidgetItem(
             [f"{prefix} {preset_name} ({last_exec})", ""])
@@ -2028,8 +2038,8 @@ class MasterTree(QTreeWidget):
                 act_run = menu.addAction("▶️ Diesen Service ausführen")
                 act_run.setEnabled(not archived)
                 act_run.triggered.connect(
-                    lambda _=False, p=plugin_id:
-                    self.run_plugin_requested.emit(p))
+                    lambda _=False, p=plugin_id, h=instance_hash:
+                    self.run_plugin_requested.emit(p, h))
                 menu.addSeparator()
                 act_info = menu.addAction("Service-Info anzeigen")
                 act_info.setEnabled(not archived)
@@ -2081,7 +2091,7 @@ class MasterTree(QTreeWidget):
                 act_run = menu.addAction("▶️ Diesen Service ausführen")
                 act_run.triggered.connect(
                     lambda _=False, p=plugin_id:
-                    self.run_plugin_requested.emit(p))
+                    self.run_plugin_requested.emit(p, ""))
                 menu.addSeparator()
                 act_info = menu.addAction("Service-Info anzeigen")
                 act_info.triggered.connect(

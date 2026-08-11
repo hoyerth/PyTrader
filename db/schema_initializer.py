@@ -80,7 +80,9 @@ def check_and_init_databases() -> None:
             feature_id  VARCHAR NOT NULL DEFAULT 'native',
             plugin_version VARCHAR,
             feature_data JSON,
-            PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
+            instance_hash VARCHAR NOT NULL DEFAULT '',
+            PRIMARY KEY (symbol, timeframe, bar_time, feature_id,
+                         instance_hash)
         );
     """)
 
@@ -99,6 +101,50 @@ def check_and_init_databases() -> None:
     # (purge_instance_data, Q5), ohne die feature_id (plugin_id) anzutasten.
     # Bestehende Rows bleiben NULL; feature_id bleibt plugin_id (Zero-Regression).
     con_analytics.execute("ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS instance_hash VARCHAR;")
+    # 11.08.2026 (Bugfix Varianten-Kollision): Der feature_store-PK wird um
+    # instance_hash erweitert - (symbol, timeframe, bar_time, feature_id,
+    # instance_hash). Damit koexistieren Parameter-Varianten eines Plugins
+    # auf derselben Bar (vorher ueberschrieb der letzte Lauf die gemeinsame
+    # Row; Kontextmenue-Run + Ausfuehrungsdatum trafen alle Varianten
+    # gemeinsam). DuckDB 1.5.5 kann PRIMARY KEY nicht AENDERN - Migration als
+    # Table-Rewrite (CREATE TABLE AS + EXCLUDE/COALESCE) + ALTER SET NOT
+    # NULL/SET DEFAULT + ALTER ADD PRIMARY KEY + DROP/RENAME. Idempotent:
+    # laeuft nur, wenn der aktuelle PK noch KEIN instance_hash enthaelt.
+    try:
+        _pk_rows = con_analytics.execute(
+            "SELECT constraint_column_indexes FROM duckdb_constraints() "
+            "WHERE table_name='feature_store' "
+            "AND constraint_type='PRIMARY KEY'").fetchall()
+        _fs_cols = [r[0].lower() for r in con_analytics.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name='feature_store' ORDER BY ordinal_position"
+        ).fetchall()]
+        # duckdb_constraints liefert pro Zeile ein Tupel (index_list,) -
+        # der Spalten-Index liegt in Zeile[0].
+        _pk_has_hash = any(
+            _fs_cols[i].lower() == "instance_hash"
+            for _row in _pk_rows for i in (_row[0] or []))
+        if not _pk_has_hash:
+            con_analytics.execute("""
+                CREATE TABLE feature_store_pk2 AS
+                SELECT * EXCLUDE (instance_hash),
+                       COALESCE(instance_hash, '') AS instance_hash
+                FROM feature_store
+            """)
+            con_analytics.execute(
+                "ALTER TABLE feature_store_pk2 ALTER instance_hash SET NOT NULL")
+            con_analytics.execute(
+                "ALTER TABLE feature_store_pk2 ALTER instance_hash SET DEFAULT ''")
+            con_analytics.execute(
+                "ALTER TABLE feature_store_pk2 ADD PRIMARY KEY "
+                "(symbol, timeframe, bar_time, feature_id, instance_hash)")
+            con_analytics.execute("DROP TABLE feature_store")
+            con_analytics.execute(
+                "ALTER TABLE feature_store_pk2 RENAME TO feature_store")
+            print("MIGRATION: feature_store-PK um instance_hash erweitert.")
+    except Exception as e:
+        print(f"MIGRATION WARNUNG: feature_store-PK-Migration "
+              f"fehlgeschlagen: {e}")
     # Bugfix 07.08.2026 (Phase 17 Bugfix-Runde 2): Der Spalten-DEFAULT von
     # created_at wurde durch die PK-Migration (17.01 E-1, test/migrate_pk.py –
     # Table-Rewrite + RENAME) entfernt. Seitdem bleiben NEUE feature_store-Rows

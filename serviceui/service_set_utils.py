@@ -9,9 +9,79 @@ Verhalten unverändert.
 from typing import Any, Dict, List, Optional
 
 
+# ---------------------------------------------------------------------------
+# 11.08.2026 (Bugfixing-Modus): Varianten-/Clone-Aufloesung fuer Runs
+# ---------------------------------------------------------------------------
+def variant_run_entries(
+    plugin_id: str,
+    state_manager,
+    base_config_fn,
+) -> List[tuple]:
+    """Erzeugt die ausfuehrbaren Eintraege (instance_id, config) eines Plugins.
+
+    Bugfix 11.08.2026 (User-Meldung 2): 'Kontextmenue auf eine Variante wird
+    faelschlicherweise bei allen Varianten ausgefuehrt/angezeigt'. Ein Clone-
+    Run muss mit den PARAMETERN DER VARIANTE + deren instance_hash laufen,
+    damit (a) die richtigen Parameter berechnet werden und (b) das Datum im
+    Baum an der Variante (per Hash) aktualisiert wird (Bug 1).
+
+    * Plugin MIT aktiven Presets: je aktivem Preset ein Eintrag
+      (instance_id = '{plugin_id}#{instance_hash}') – Parameter = Preset-
+      Parameter, instance_hash = deterministischer Hash daraus. Die Config
+      traegt zusaetzlich 'preset_name' (fuer Dialog/Anzeige).
+    * Plugin OHNE aktive Presets: ein Basis-Eintrag (plugin_id,
+      base_config_fn(plugin_id)) – Bestandsverhalten.
+
+    Returns:
+        Liste von (instance_id, config)-Tupeln; leer, wenn plugin_id leer.
+    """
+    plugin_id = str(plugin_id or "")
+    if not plugin_id:
+        return []
+    presets: List[Dict[str, Any]] = []
+    if state_manager is not None:
+        try:
+            presets = list(state_manager.list_plugin_presets(plugin_id) or [])
+        except Exception:
+            presets = []
+    active = [p for p in presets if isinstance(p, dict)
+              and bool(p.get("is_active_batch"))]
+    if active:
+        from analytics.engine.service_models import generate_instance_hash
+        entries: List[tuple] = []
+        for p in active:
+            params = dict(p.get("params") or {})
+            # 11.08.2026 (Bugfix Varianten-Kollision): Der Hash eines
+            # Presets fliesst inkl. preset_name ein (identisch zum
+            # ServiceSelectorModel) – Presets mit identischen Parametern aber
+            # unterschiedlichen Namen erhalten UNTERSCHIEDLICHE Hashes.
+            # Dadurch matcht der Kontextmenue-Filter ('Kontextmenue auf eine
+            # Variante') GENAU EINE Variante (vorher: Hash-Kollision -> alle
+            # Varianten wurden ausgefuehrt/angezeigt).
+            preset_name = str(p.get("preset_name") or "Default")
+            inst_hash = generate_instance_hash(
+                plugin_id, params, preset_name=preset_name)
+            cfg: Dict[str, Any] = {
+                "plugin_id": plugin_id,
+                "lookback": 1000,
+                "params": params,
+                "version": str(p.get("version") or "0.0.0"),
+                "instance_hash": inst_hash,
+                "preset_name": preset_name,
+            }
+            entries.append((f"{plugin_id}#{inst_hash}", cfg))
+        return entries
+    base = base_config_fn(plugin_id)
+    if not isinstance(base, dict):
+        base = {"plugin_id": plugin_id}
+    return [(plugin_id, base)]
+
+
+# ==========================================================================
 # 18.01.03 (E1): Separater global_settings-Key fuer den Kategorie-Override
 # eines Standalone-Plugins (NICHT plugin_params_<id> – das bleibt exklusiv
 # dem Parameter-Preset vorbehalten; siehe Entscheidung E1 im Prüfprotokoll).
+# ==========================================================================
 PLUGIN_CATEGORY_KEY = "plugin_category_{}"
 
 # 18.01.03 (E3-revidiert, Bugfixing-Modus 08.08.2026): Persistenz leerer

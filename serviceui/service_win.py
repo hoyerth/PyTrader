@@ -54,7 +54,11 @@ from scrollable_content import ContentScrollArea, ContentScrollMixin
 from chart.widgets.named_item_actions import NamedItemActionsMixin
 
 # Phase 15 U15-D1: Submodule der Service-UI
-from serviceui.service_set_utils import _available_plugin_ids, _sets_using_plugin
+from serviceui.service_set_utils import (
+    _available_plugin_ids,
+    _sets_using_plugin,
+    variant_run_entries,
+)
 from serviceui.param_columns import ServiceParamColumnsMixin
 from serviceui.trash_dialog import ServiceSetTrashDialog
 from serviceui.new_set_dialog import NewServiceSetDialog
@@ -1192,9 +1196,9 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             return
         self._start_run_worker(set_id, definition, instance_id=None)
 
-    @Slot(str)
-    def _on_run_plugin(self, plugin_id: str) -> None:
-        """'▶️ Diesen Service ausführen' (Plugin-Zeile unter 📦 Services).
+    @Slot(str, str)
+    def _on_run_plugin(self, plugin_id: str, instance_hash: str = "") -> None:
+        """'▶️ Diesen Service ausführen' (Plugin-/Clone-Zeile unter 📦 Services).
 
         17.01.02 (Bugfix-Runde): Einzel-Services ausserhalb von Sets (z.B.
         unter Kategorie-Ordnern) erhalten dieselbe Run-Aktion wie die
@@ -1202,32 +1206,62 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         aktuell gewaehlten Symbol/Timeframe, danach gezielter Single-Run via
         ServiceRunWorker mit einer Ad-hoc-Mini-Definition (nur dieser
         Service; prepare_worker_definition loest ggf. dependencies auf).
+
+        11.08.2026 (Bugfixing, Varianten-Run): `instance_hash` wird vom
+        MasterTree-Kontextmenue mitgeliefert:
+          * Clone-Zeile  -> hash der Variante: NUR diese Variante laeuft mit
+                            ihren EIGENEN Parametern + Hash (Datum im Baum
+                            aktualisiert sich an der Variante, Bug 1).
+          * Plugin-Zeile -> leer: mit Presets laufen ALLE aktiven Varianten,
+                            sonst Basis-Parameter (Bestandsverhalten).
         """
         if not plugin_id:
             return
+        sm = getattr(self, "_state_manager", None)
+        entries = variant_run_entries(plugin_id, sm, self._plugin_config)
+        if not entries:
+            return
+        if instance_hash:
+            entries = [e for e in entries
+                       if e[1].get("instance_hash") == instance_hash]
+            if not entries:
+                # Variante nicht (mehr) vorhanden -> Basis-Fallback.
+                entries = [(plugin_id, self._plugin_config(plugin_id))]
         symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
         # U15-E: Timeframe-Control der Filterleiste (combo_tf) – kann auch
         # 'ALLE Timeframes' sein (Multi-TF-Ausfuehrung im Worker).
         timeframe = self.combo_tf.currentText() if self.combo_tf else "H1"
+        single = len(entries) == 1
+        if single:
+            _iid, _cfg = entries[0]
+            _name = str(_cfg.get("preset_name") or plugin_id)
+            title = "Service ausführen"
+            text = (f"Service '{plugin_id}' (Variante '{_name}') ausführen?\n\n"
+                    f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+                    f"Der erzeugte Feature-Store-Payload wird in analytics.duckdb "
+                    f"geschrieben.")
+        else:
+            title = "Alle Varianten ausführen"
+            text = (f"Alle Varianten ({len(entries)}) von '{plugin_id}' "
+                    f"ausführen?\n\n"
+                    f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+                    f"Die erzeugten Feature-Store-Payloads werden in "
+                    f"analytics.duckdb geschrieben.")
         reply = QMessageBox.question(
-            self, "Service ausführen",
-            f"Service '{plugin_id}' ausführen?\n\n"
-            f"Symbol: {symbol}   Timeframe: {timeframe}\n"
-            f"Der erzeugte Feature-Store-Payload wird in analytics.duckdb "
-            f"geschrieben.",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            self, title, text, QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No)
         if reply != QMessageBox.Yes:
             self.log("Ausführung abgebrochen.")
             return
         definition = {
             "set_id": f"plugin_{plugin_id}",
             "display_name": plugin_id,
-            "execution_order": [plugin_id],
-            # 17.01.04: Gespeicherte Plugin-Parameter (global_settings)
-            # verwenden, falls vorhanden – sonst Registry-Defaults.
-            "services": {plugin_id: self._plugin_config(plugin_id)},
+            "execution_order": [e[0] for e in entries],
+            "services": {e[0]: e[1] for e in entries},
         }
-        self._start_run_worker(plugin_id, definition, instance_id=plugin_id)
+        self._start_run_worker(
+            plugin_id, definition,
+            instance_id=entries[0][0] if single else None)
 
     @Slot(str, str)
     def _on_run_category(self, group: str, category_path: str) -> None:
@@ -1253,11 +1287,20 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.log(f"Kategorie '{category_path}' hat keine Services – "
                      f"Ausführung abgebrochen.")
             return
+        # 11.08.2026 (Bugfixing, Bug 3): Plugins MIT Presets werden zu ALLEN
+        # aktiven Varianten expandiert (jede mit eigenen Parametern + Hash),
+        # damit 'Alle Services ausführen' auch die Varianten ausfuehrt.
+        sm = getattr(self, "_state_manager", None)
+        entries_all: List[tuple] = []
+        for pid in plugin_ids:
+            entries_all.extend(variant_run_entries(pid, sm, self._plugin_config))
+        if not entries_all:
+            return
         symbol = self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
         # U15-E: Timeframe-Control der Filterleiste (combo_tf) – kann auch
         # 'ALLE Timeframes' sein (Multi-TF-Ausfuehrung im Worker).
         timeframe = self.combo_tf.currentText() if self.combo_tf else "H1"
-        count = len(plugin_ids)
+        count = len(entries_all)
         reply = QMessageBox.question(
             self, "Alle Services ausführen",
             f"Alle Services ({count}) der Kategorie '{category_path}' "
@@ -1272,10 +1315,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         definition = {
             "set_id": f"category_{category_path}",
             "display_name": category_path,
-            "execution_order": list(plugin_ids),
+            "execution_order": [e[0] for e in entries_all],
             # 17.01.04: Gespeicherte Plugin-Parameter je Service verwenden
-            # (falls vorhanden), sonst Registry-Defaults.
-            "services": {pid: self._plugin_config(pid) for pid in plugin_ids},
+            # (falls vorhanden), sonst Registry-Defaults. Varianten tragen
+            # Preset-Parameter + instance_hash.
+            "services": {e[0]: e[1] for e in entries_all},
         }
         self._start_run_worker(category_path, definition, instance_id=None)
 
@@ -2522,7 +2566,16 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
                 if not isinstance(p, dict):
                     continue
                 params = p.get("params") or {}
-                if generate_instance_hash(plugin_id, params) == instance_hash:
+                # 11.08.2026 (Bugfix Varianten-Kollision): Der Hash eines
+                # Presets fliesst inkl. preset_name ein (identisch zum
+                # ServiceSelectorModel / variant_run_entries). Fallback auf
+                # den Legacy-Params-only-Hash fuer Alt-Bestand.
+                preset_name = str(p.get("preset_name") or "Default")
+                if (generate_instance_hash(plugin_id, params,
+                                           preset_name=preset_name)
+                        == instance_hash
+                        or generate_instance_hash(plugin_id, params)
+                        == instance_hash):
                     return p
         except Exception as e:
             self.log(f"Preset-Suche fehlgeschlagen: {e}")
@@ -3024,7 +3077,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         except Exception as e:
             self.log(f"FEHLER beim Duplizieren der Variante: {e}")
             return
-        new_hash = generate_instance_hash(plugin_id, params)
+        # 11.08.2026 (Bugfix Varianten-Kollision): Der Hash der neuen
+        # Variante fliesst inkl. des NEUEN Preset-Namens ein (identisch zum
+        # ServiceSelectorModel) - sonst kollidieren Params-only-Hashes.
+        new_hash = generate_instance_hash(plugin_id, params,
+                                          preset_name=new_name)
         self.log(f"Variante '{new_name}' dupliziert aus '{base}' "
                  f"(#{new_hash}).")
         event_bus.service_set_changed.emit()

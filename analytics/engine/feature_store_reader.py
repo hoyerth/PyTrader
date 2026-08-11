@@ -360,7 +360,7 @@ class FeatureStoreReader:
             if hashes:
                 placeholders = ", ".join("?" for _ in hashes)
                 conditions.append(
-                    f"(instance_hash IS NULL OR "
+                    f"(instance_hash IS NULL OR instance_hash = '' OR "
                     f"LOWER(TRIM(instance_hash)) IN ({placeholders}))")
                 params.extend(hashes)
 

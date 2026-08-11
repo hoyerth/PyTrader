@@ -106,6 +106,7 @@ from serviceui.service_selector_widget import ServiceSelectorWidget
 # 21.01b (11.08.2026): Run im Picker (TF-Zeile + Pill-Strip, User-Entscheid).
 from serviceui.common_widgets import TfStatusBadgeBar
 from serviceui.run_worker import ALL_TIMEFRAMES, ServiceRunWorker
+from serviceui.service_set_utils import variant_run_entries
 
 #: Geometrie-Key fuer Position/Groesse des Datenquellen-Dialogs
 #: (global_settings, Muster IndicatorSettingsDialog).
@@ -779,8 +780,17 @@ class ServiceSelectorDialog(QDialog):
                     continue
                 from analytics.engine.service_models import (
                     generate_instance_hash)
-                if generate_instance_hash(
-                        plugin_id, preset.get("params") or {}) == instance_hash:
+                # 11.08.2026 (Bugfix Varianten-Kollision): Hash eines
+                # Presets inkl. preset_name (identisch zu Modell/Run);
+                # Legacy-Fallback fuer Alt-Bestand.
+                preset_name = str(preset.get("preset_name") or "Default")
+                if (generate_instance_hash(plugin_id,
+                                           preset.get("params") or {},
+                                           preset_name=preset_name)
+                        == instance_hash
+                        or generate_instance_hash(
+                            plugin_id, preset.get("params") or {})
+                        == instance_hash):
                     return preset
         except Exception:
             pass
@@ -1697,28 +1707,57 @@ class ServiceSelectorDialog(QDialog):
             return
         self._start_run_worker(set_id, definition, instance_id=None)
 
-    def _on_run_plugin(self, plugin_id: str) -> None:
-        """'▶️ Diesen Service ausführen' (Plugin-/Clone-Zeile)."""
+    def _on_run_plugin(self, plugin_id: str, instance_hash: str = "") -> None:
+        """'▶️ Diesen Service ausführen' (Plugin-/Clone-Zeile).
+
+        11.08.2026 (Bugfixing, Varianten-Run): `instance_hash` wird vom
+        MasterTree-Kontextmenue mitgeliefert – Clone-Zeilen laufen NUR mit
+        den Parametern + Hash der Variante; Plugin-Zeilen mit Presets
+        laufen ALLE aktiven Varianten (Bug 1/2/3).
+        """
         if not plugin_id:
             return
+        sm = getattr(self, "_state_manager", None)
+        entries = variant_run_entries(plugin_id, sm, self._plugin_config)
+        if not entries:
+            return
+        if instance_hash:
+            entries = [e for e in entries
+                       if e[1].get("instance_hash") == instance_hash]
+            if not entries:
+                entries = [(plugin_id, self._plugin_config(plugin_id))]
         symbol = self._run_symbol()
         timeframe = self._run_timeframe()
+        single = len(entries) == 1
+        if single:
+            _iid, _cfg = entries[0]
+            _name = str(_cfg.get("preset_name") or plugin_id)
+            title = "Service ausführen"
+            text = (f"Service '{plugin_id}' (Variante '{_name}') ausführen?\n\n"
+                    f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+                    f"Der erzeugte Feature-Store-Payload wird in analytics.duckdb "
+                    f"geschrieben.")
+        else:
+            title = "Alle Varianten ausführen"
+            text = (f"Alle Varianten ({len(entries)}) von '{plugin_id}' "
+                    f"ausführen?\n\n"
+                    f"Symbol: {symbol}   Timeframe: {timeframe}\n"
+                    f"Die erzeugten Feature-Store-Payloads werden in "
+                    f"analytics.duckdb geschrieben.")
         reply = QMessageBox.question(
-            self, "Service ausführen",
-            f"Service '{plugin_id}' ausführen?\n\n"
-            f"Symbol: {symbol}   Timeframe: {timeframe}\n"
-            f"Der erzeugte Feature-Store-Payload wird in analytics.duckdb "
-            f"geschrieben.",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            self, title, text, QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
         definition = {
             "set_id": f"plugin_{plugin_id}",
             "display_name": plugin_id,
-            "execution_order": [plugin_id],
-            "services": {plugin_id: self._plugin_config(plugin_id)},
+            "execution_order": [e[0] for e in entries],
+            "services": {e[0]: e[1] for e in entries},
         }
-        self._start_run_worker(plugin_id, definition, instance_id=plugin_id)
+        self._start_run_worker(
+            plugin_id, definition,
+            instance_id=entries[0][0] if single else None)
 
     def _on_run_category(self, group: str, category_path: str) -> None:
         """'▶️ Alle Services ausführen' (Kategorie-Ordner, rekursiv)."""
@@ -1733,9 +1772,17 @@ class ServiceSelectorDialog(QDialog):
                 self, "Alle Services ausführen",
                 f"Kategorie '{category_path}' hat keine Services.")
             return
+        # 11.08.2026 (Bugfixing, Bug 3): Plugins MIT Presets -> ALLE aktiven
+        # Varianten werden ausgefuehrt (jede mit eigenen Parametern + Hash).
+        sm = getattr(self, "_state_manager", None)
+        entries_all: List[tuple] = []
+        for pid in plugin_ids:
+            entries_all.extend(variant_run_entries(pid, sm, self._plugin_config))
+        if not entries_all:
+            return
         symbol = self._run_symbol()
         timeframe = self._run_timeframe()
-        count = len(plugin_ids)
+        count = len(entries_all)
         reply = QMessageBox.question(
             self, "Alle Services ausführen",
             f"Alle Services ({count}) der Kategorie '{category_path}' "
@@ -1749,8 +1796,8 @@ class ServiceSelectorDialog(QDialog):
         definition = {
             "set_id": f"category_{category_path}",
             "display_name": category_path,
-            "execution_order": list(plugin_ids),
-            "services": {pid: self._plugin_config(pid) for pid in plugin_ids},
+            "execution_order": [e[0] for e in entries_all],
+            "services": {e[0]: e[1] for e in entries_all},
         }
         self._start_run_worker(category_path, definition, instance_id=None)
 

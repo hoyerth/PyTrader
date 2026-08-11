@@ -218,8 +218,13 @@ class ServiceRunWorker(QThread):
             cfg = svc_cfgs.get(iid) or {}
             pid = str(cfg.get("plugin_id") or iid)
             params = cfg.get("params") or {}
+            # 11.08.2026 (Bugfix Varianten-Kollision): Fallback-Hash inkl.
+            # preset_name berechnen (identisch zum ServiceSelectorModel) –
+            # die cfg.instance_hash (aus variant_run_entries) hat Vorrang.
+            preset_name = str(cfg.get("preset_name") or "") or None
             instance_hash = str(cfg.get("instance_hash") or "") or \
-                generate_instance_hash(pid, params)
+                generate_instance_hash(pid, params,
+                                       preset_name=preset_name)
             fb.store_plugin_payload(self.symbol, tf, payload,
                                     instance_hash=instance_hash)
             stored += len(records)

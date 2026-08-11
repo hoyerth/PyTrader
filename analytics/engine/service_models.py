@@ -55,7 +55,9 @@ def _sanitize_for_hash(value: Any) -> Any:
 
 
 def generate_instance_hash(
-    plugin_id: str, params: Optional[Dict[str, Any]] = None
+    plugin_id: str,
+    params: Optional[Dict[str, Any]] = None,
+    preset_name: Optional[str] = None,
 ) -> str:
     """8-stelliger deterministischer SHA256-Short-Hash einer Instanz (20.04).
 
@@ -67,9 +69,21 @@ def generate_instance_hash(
     * **Q4:** `_sanitize_for_hash` überführt numpy-Werte/None/verschachtelte
       Dicts vorher in native Python-Typen; `sort_keys=True` macht die
       Serialisierung kanonisch (unabhängig von der Speicherreihenfolge).
+
+    **11.08.2026 (Bugfix Varianten-Kollision):** Optionaler `preset_name`
+    (Varianten-/Clone-Pfad). Wird er mitgegeben, fließt er als `__preset`-
+    Schlüssel in die kanonische Serialisierung ein – Presets mit IDENTISCHEN
+    Parametern aber unterschiedlichen Namen erhalten dadurch unterschiedliche
+    Hashes (vorher kollidierten z.B. `params={}`-Presets, womit Kontextmenü-
+    Runs und Ausführungsdaten im MasterTree alle Varianten gemeinsam trafen).
+    Ohne `preset_name` (Set-Instanzen) bleibt der Hash exakt wie bisher
+    (Backward-Compat zu Alt-Bestand).
     """
+    input_params: Dict[str, Any] = dict(params or {})
+    if preset_name is not None:
+        input_params["__preset"] = str(preset_name)
     canonical = json.dumps(
-        _sanitize_for_hash(params or {}),
+        _sanitize_for_hash(input_params),
         sort_keys=True,
         ensure_ascii=False,
         separators=(",", ":"),
