@@ -750,7 +750,8 @@ class FeatureBuilder:
             if own_connection:
                 con.close()
 
-    def purge_instance_data(self, instance_hash: str) -> int:
+    def purge_instance_data(self, instance_hash: str, plugin_id: str = "",
+                            params: Optional[Dict[str, Any]] = None) -> int:
         """Loescht alle feature_store-Rows einer Parameter-Variante (20.04, Q5).
 
         `DELETE FROM feature_store WHERE instance_hash = ?` – ausschliesslich
@@ -761,8 +762,24 @@ class FeatureBuilder:
         und wird NICHT geloescht, Q1; andere Varianten/Instanzen bleiben
         unangetastet).
 
+        11.08.2026 (Bugfix Runde 5): Zusaetzlich werden bei uebergebenem
+        plugin_id + params die LEGACY-Pool-Rows der Variante geloescht.
+        Alt-Rows aus Runs VOR der Preset-Hash-Umstellung liegen unter dem
+        reinen Params-only-Hash `generate_instance_hash(plugin_id, params)`
+        (ohne preset_name) und sind keiner Variante eindeutig zuordenbar
+        (Kollisions-Pool). Sie wurden ueber den (inzwischen entfernten)
+        Legacy-Anzeige-Fallback an ALLEN kollidierenden Varianten angezeigt
+        und liessen das Ausfuehrungsdatum nach 'Data Only Loeschen' nicht
+        zuruecksetzen. Mit plugin_id + params werden diese Alt-Rows jetzt
+        zusammen mit den Varianten-Rows geloescht, damit das Datum im
+        MasterTree wirklich auf 'nie' zurueckgesetzt wird.
+
         Args:
-            instance_hash: 8-stelliger Parameter-Hash (generate_instance_hash).
+            instance_hash: 8-stelliger Parameter-Hash (generate_instance_hash,
+                inkl. preset_name seit dem Varianten-Kollisions-Bugfix).
+            plugin_id: Plugin-ID (optional) – noetig fuer den Legacy-Purge.
+            params: Parameter-Dict der Variante (optional) – Grundlage des
+                Params-only-Legacy-Hashes fuer den Legacy-Purge.
 
         Returns:
             Anzahl der geloeschten Rows (0 bei leerem Hash/keinem Treffer).
@@ -774,12 +791,37 @@ class FeatureBuilder:
         # bei DbPool.get; ein close() wuerde die Pool-Connection korrumpieren).
         con = DbPool.get(DB_ANALYTICS)
         try:
+            deleted = 0
+            # 1) Varianten-eigene Rows (Preset-eindeutiger Hash inkl.
+            #    preset_name, seit Bugfix Varianten-Kollision).
             result = con.execute(
                 "DELETE FROM feature_store WHERE instance_hash = ? "
                 "RETURNING feature_id",
                 [instance_hash])
             rows = result.fetchall() if result is not None else []
-            return len(rows or [])
+            deleted += len(rows or [])
+            # 2) Legacy-Pool-Rows (Params-only-Hash aus Runs vor der
+            #    Preset-Hash-Umstellung, 11.08.2026). Der Params-only-Hash
+            #    ist aus dem Preset-Hash (inkl. preset_name) nicht umkehrbar
+            #    – er wird hier aus plugin_id + params neu berechnet.
+            if plugin_id and params is not None:
+                try:
+                    from analytics.engine.service_models import (
+                        generate_instance_hash)
+                    legacy_hash = generate_instance_hash(plugin_id, params)
+                    if legacy_hash and legacy_hash != instance_hash:
+                        result2 = con.execute(
+                            "DELETE FROM feature_store "
+                            "WHERE feature_id = ? AND instance_hash = ? "
+                            "RETURNING feature_id",
+                            [plugin_id, legacy_hash])
+                        rows2 = (result2.fetchall()
+                                 if result2 is not None else [])
+                        deleted += len(rows2 or [])
+                except Exception:
+                    # Defensiv: Legacy-Purge ist optional – kein Abbruch.
+                    pass
+            return deleted
         except Exception:
             # Defensiv: keine Exception in den UI-Pfad durchreichen.
             return 0

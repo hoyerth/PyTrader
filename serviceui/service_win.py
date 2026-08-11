@@ -2620,18 +2620,27 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
           oder bei Alt-Daten aus den aktuellen Params neu berechnet.
         * Clone/Preset: Hash direkt aus ROLE_INSTANCE_HASH.
         """
+        params = None
         if not instance_hash:
             if set_id and service_id:
                 model = getattr(self.service_selector, "model", None)
                 cfg = model.find_service(set_id, service_id) if model else None
                 if cfg:
+                    params = cfg.get("params") or {}
                     instance_hash = generate_instance_hash(
-                        cfg.get("plugin_id") or service_id,
-                        cfg.get("params") or {})
+                        cfg.get("plugin_id") or service_id, params)
             if not instance_hash:
                 self.log("Kein instance_hash fuer 'Data Only Löschen' "
                          "verfuegbar.")
                 return
+        # 11.08.2026 (Bugfix Runde 5): Parameter der Variante ermitteln
+        # – Grundlage fuer den Legacy-Pool-Purge (Params-only-Hash) im
+        # FeatureBuilder – sonst bleiben die Alt-Rows und das Datum
+        # setzt nach dem Purge nicht auf 'nie' zurueck.
+        if params is None:
+            preset = self._find_preset_for_hash(plugin_id, instance_hash)
+            if preset:
+                params = preset.get("params") or {}
         label = service_id or f"{plugin_id} (#{instance_hash})"
         reply = QMessageBox.question(
             self, "Data Only Löschen",
@@ -2644,7 +2653,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             return
         try:
             from analytics.features.feature_builder import FeatureBuilder
-            n = FeatureBuilder().purge_instance_data(instance_hash)
+            n = FeatureBuilder().purge_instance_data(
+                instance_hash, plugin_id, params)
         except Exception as e:
             self.log(f"FEHLER beim Purgen der Feature-Daten: {e}")
             return
@@ -2731,7 +2741,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         if hash_:
             try:
                 from analytics.features.feature_builder import FeatureBuilder
-                n = FeatureBuilder().purge_instance_data(hash_)
+                n = FeatureBuilder().purge_instance_data(
+                    hash_, pid, cfg.get("params") or {})
             except Exception as e:
                 n = 0
                 self.log(f"WARN: Feature-Daten-Purge fehlgeschlagen: {e}")
@@ -2776,7 +2787,8 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         if instance_hash:
             try:
                 from analytics.features.feature_builder import FeatureBuilder
-                n = FeatureBuilder().purge_instance_data(instance_hash)
+                n = FeatureBuilder().purge_instance_data(
+                    instance_hash, plugin_id, preset.get("params") or {})
             except Exception as e:
                 n = 0
                 self.log(f"WARN: Feature-Daten-Purge fehlgeschlagen: {e}")

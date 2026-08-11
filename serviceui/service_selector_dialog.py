@@ -980,6 +980,20 @@ class ServiceSelectorDialog(QDialog):
         """'Data Only Löschen' (Q5): Feature-Daten purgen, Struktur bleibt."""
         if not instance_hash:
             return
+        # 11.08.2026 (Bugfix Runde 5): Parameter der Variante ermitteln
+        # – Grundlage fuer den Legacy-Pool-Purge (Params-only-Hash).
+        params = None
+        if set_id and service_id:
+            try:
+                _cfg = self.model.find_service(set_id, service_id)
+                if isinstance(_cfg, dict):
+                    params = _cfg.get("params") or {}
+            except Exception:
+                pass
+        if params is None:
+            preset = self._find_preset_for_hash(plugin_id, instance_hash)
+            if preset:
+                params = preset.get("params") or {}
         reply = QMessageBox.question(
             self, "Data Only Löschen",
             f"Feature-Daten der Variante #{instance_hash} löschen?\n"
@@ -989,7 +1003,8 @@ class ServiceSelectorDialog(QDialog):
             return
         try:
             from analytics.features.feature_builder import FeatureBuilder
-            FeatureBuilder().purge_instance_data(instance_hash)
+            FeatureBuilder().purge_instance_data(
+                instance_hash, plugin_id, params)
         except Exception:
             pass
         event_bus.service_set_changed.emit()
@@ -1035,7 +1050,10 @@ class ServiceSelectorDialog(QDialog):
                 try:
                     from analytics.features.feature_builder import (
                         FeatureBuilder)
-                    FeatureBuilder().purge_instance_data(instance_hash)
+                    FeatureBuilder().purge_instance_data(
+                        instance_hash,
+                        plugin_id or (cfg.get("plugin_id") or ""),
+                        cfg.get("params") or {})
                 except Exception:
                     pass
             event_bus.service_set_changed.emit()
@@ -1063,7 +1081,8 @@ class ServiceSelectorDialog(QDialog):
                 try:
                     from analytics.features.feature_builder import (
                         FeatureBuilder)
-                    FeatureBuilder().purge_instance_data(instance_hash)
+                    FeatureBuilder().purge_instance_data(
+                        instance_hash, plugin_id, preset.get("params") or {})
                 except Exception:
                     pass
             event_bus.service_set_changed.emit()

@@ -174,12 +174,6 @@ class ServiceSelectorModel(QObject):
         # im MasterTree (Services-Gruppe); Plugins ohne Presets bleiben
         # flache Blaetter (Zero-Regression). Wird in refresh() geladen.
         self._plugin_presets: Dict[str, List[Dict[str, Any]]] = {}
-        # 11.08.2026 (Bugfix Varianten-Kollision): Alias-Map (plugin_id.lower(),
-        # neuer Preset-Hash) -> Legacy-Params-only-Hash. Damit zeigen die
-        # Analytics-Dropdown-Methoden (last_execution_*_for_hash) fuer noch
-        # nicht neu gelaufene Varianten das Datum ihrer Legacy-Rows im Store
-        # (Konsistenz zum MasterTree-Label-Fallback in _load_plugin_presets).
-        self._preset_hash_aliases: Dict[Tuple[str, str], str] = {}
 
         # Initialbefuellung + Live-Sync (schwellenfrei via EventBus)
         self.refresh()
@@ -302,8 +296,6 @@ class ServiceSelectorModel(QObject):
         leere Dicts (kein Baum-Rendering, keine Regression in Tests).
         """
         result: Dict[str, List[Dict[str, Any]]] = {}
-        # Frische Alias-Map je Refresh (keine Stale-Eintraege).
-        self._preset_hash_aliases = {}
         try:
             for pid in sorted(self.get_plugins().keys()):
                 raw = self.state_manager.list_plugin_presets(pid)
@@ -315,21 +307,15 @@ class ServiceSelectorModel(QObject):
                         continue
                     params = p.get("params") or {}
                     # 11.08.2026 (Bugfix Varianten-Kollision): Der
-                    # instance_hash eines Presets wird JETZT inkl. preset_name
+                    # instance_hash eines Presets wird inkl. preset_name
                     # berechnet (generate_instance_hash mit preset_name) –
                     # Presets mit identischen Parametern aber unterschiedlichen
                     # Namen erhalten dadurch UNTERSCHIEDLICHE Hashes (vorher
                     # kollidierten sie: Runs/Ausfuehrungsdatum trafen alle
-                    # Varianten gemeinsam). `legacy_hash` dient als
-                    # Anzeige-Fallback fuer Alt-Bestand (Rows unter dem alten
-                    # Params-only-Hash bis zum naechsten Lauf).
+                    # Varianten gemeinsam).
                     preset_name = str(p.get("preset_name") or "Default")
                     instance_hash = generate_instance_hash(
                         pid, params, preset_name=preset_name)
-                    legacy_hash = generate_instance_hash(pid, params)
-                    # Alias fuer den Analytics-Dropdown-Fallback (11.08.2026).
-                    self._preset_hash_aliases[
-                        (str(pid).lower(), instance_hash)] = legacy_hash
                     per_hash = self._last_execution_dates_by_hash.get(
                         str(pid).lower(), {}) or {}
                     clones.append({
@@ -342,10 +328,14 @@ class ServiceSelectorModel(QObject):
                         # Parameter-Variante (Feature-Store, Spalte
                         # instance_hash) – fuer die MasterTree-Anzeige
                         # '<Preset> (DD.MM.JJ)'. Fallback '--.--.--'.
-                        "last_execution": (
-                            per_hash.get(instance_hash)
-                            or per_hash.get(legacy_hash)
-                            or "--.--.--"),
+                        # 11.08.2026 (Runde 2): KEIN Legacy-Fallback mehr –
+                        # Alt-Rows unter dem alten Params-only-Hash sind keiner
+                        # Variante eindeutig zuordenbar (Pool) und wuerden sonst
+                        # an ALLEN kollidierenden Varianten dasselbe Datum
+                        # zeigen (User-Meldung). Eine Variante zeigt ein Datum
+                        # erst, wenn sie unter ihrem EIGENEN Hash gelaufen ist.
+                        "last_execution": per_hash.get(
+                            instance_hash, "--.--.--"),
                     })
                 if clones:
                     result[str(pid).lower()] = clones
@@ -427,20 +417,15 @@ class ServiceSelectorModel(QObject):
         EIGENE Feature-Store-Rows (Spalte instance_hash). Formatiert als
         'DD.MM.JJ' – Fallback '--.--.--' ohne Eintraege (bzw. ohne
         instance_hash). Rueckgabewert ohne Klammern (MasterTree-Wrapper).
+
+        11.08.2026 (Runde 2): KEIN Legacy-Fallback – das Datum kommt NUR aus
+        Rows unter dem EIGENEN (Preset-eindeutigen) Hash der Variante.
         """
         if not plugin_id or not instance_hash:
             return "--.--.--"
         per_hash = self._last_execution_dates_by_hash.get(
             str(plugin_id).lower(), {}) or {}
-        val = per_hash.get(str(instance_hash))
-        if not val:
-            # 11.08.2026 (Varianten-Kollision): Fallback auf den Legacy-
-            # Params-only-Hash (Alt-Rows im Store bis zum naechsten Lauf).
-            legacy = self._preset_hash_aliases.get(
-                (str(plugin_id).lower(), str(instance_hash)))
-            if legacy:
-                val = per_hash.get(legacy)
-        return val if val else "--.--.--"
+        return per_hash.get(str(instance_hash), "--.--.--")
 
     def _load_last_execution_dates_by_hash(
         self,
@@ -486,20 +471,15 @@ class ServiceSelectorModel(QObject):
         11.08.2026 (Bugfix Runde 16, Dropdown-Anzeige): Format 'DD.MM.JJ HH:MM'
         (z. B. '23.04.26 22:14') - Fallback '--.--.-- --:--' ohne Eintraege
         (bzw. ohne instance_hash). Rein lesend aus dem Refresh-Zustand.
+
+        11.08.2026 (Runde 2): KEIN Legacy-Fallback – das Datum kommt NUR aus
+        Rows unter dem EIGENEN (Preset-eindeutigen) Hash der Variante.
         """
         if not plugin_id or not instance_hash:
             return "--.--.-- --:--"
         per_hash = self._last_execution_datetimes_by_hash.get(
             str(plugin_id).lower(), {}) or {}
-        val = per_hash.get(str(instance_hash))
-        if not val:
-            # 11.08.2026 (Varianten-Kollision): Fallback auf den Legacy-
-            # Params-only-Hash (Alt-Rows im Store bis zum naechsten Lauf).
-            legacy = self._preset_hash_aliases.get(
-                (str(plugin_id).lower(), str(instance_hash)))
-            if legacy:
-                val = per_hash.get(legacy)
-        return val if val else "--.--.-- --:--"
+        return per_hash.get(str(instance_hash), "--.--.-- --:--")
 
     def _collect_active_indicator_ids(self) -> Set[str]:
         """Sammelt alle indicator_ids/plugin_ids, die in offenen Chart-
