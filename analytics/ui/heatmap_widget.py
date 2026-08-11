@@ -108,9 +108,9 @@ from analytics.engine.analytics_worker import (
     QUERY_HEATMAP_GENERIC,
     QUERY_DAILY_OHLC,
     QUERY_FEATURES,
+    QUERY_OHLCV,
 )
 from analytics.engine.feature_store_reader import (
-    DOW_LABELS,
     DOW_WEEK_LABELS,
     HEATMAP_AGGREGATIONS,
     HEATMAP_DIMENSIONS,
@@ -118,10 +118,12 @@ from analytics.engine.feature_store_reader import (
 )
 from analytics.ui.common import CheckableComboBox
 
-# E7: Konfluenz-Farbskala (0 = weiss/transparent, 1-2 = gelb/cyan,
-# 3-4 = orange, 5+ = dunkelrot) – Positionen 0..1 (Levels 0..5).
+# E7: Konfluenz-Farbskala (0 = grau, 1-2 = gelb/cyan, 3-4 = orange,
+# 5+ = dunkelrot) – Positionen 0..1 (Levels 0..5).
+# 21.01 (Bugfix 2, 11.08.2026): 0 = HELLGRAU statt Weiss – weisse
+# 0-Treffer-Zellen waren auf dem weissen Plot-Hintergrund unsichtbar.
 _CONFLUENCE_COLORS = [
-    "#ffffff", "#ffff00", "#00ffff", "#ff8c00", "#ff6600", "#8b0000",
+    "#d9d9d9", "#ffff00", "#00ffff", "#ff8c00", "#ff6600", "#8b0000",
 ]
 _CONFLUENCE_POS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
 _CONFLUENCE_LEVELS = (0.0, 5.0)
@@ -136,6 +138,12 @@ _HALF_DAY = 43200.0
 # 20.02.01 (E1): Stufen-Schwellen des Datums-Formatters (Monat/Jahr).
 _MONTH_SECONDS = 2_592_000
 _YEAR_SECONDS = 31_536_000
+# 21.01 (Bugfix 5, 11.08.2026): Timeframe -> Sekunden fuer das adaptive
+# Candle-Overlay (OHLCV im Original-TF statt Tages-Aggregation).
+_TF_SECONDS = {
+    "M1": 60, "M5": 300, "M15": 900, "M30": 1800,
+    "H1": 3600, "H4": 14400, "D1": 86400, "W1": 604800,
+}
 
 # 20.02.01 (User-Meldung 2): LWC-v5-adaptierte Datums-Skala.
 # Zielabstand zwischen zwei Tick-Labels in Pixel (Lightweight Charts:
@@ -143,9 +151,12 @@ _YEAR_SECONDS = 31_536_000
 # 5*16/8*8 = 80 px). Die Tick-Auswahl haelt diesen Abstand ein: Zoom-In
 # => feinere Variante, Zoom-Out => groebere Variante (keine Ueberlappung,
 # keine Riesensprünge). Weight-Hierarchie wie LWC v5:
-#   70 = Jahreswechsel (Label: '2026'), 60 = Monatswechsel ('Feb 26'),
-#   55 = Wochenanfang Mo (ISO-Woche '08.25'), 50 = Tageswechsel
-#   ('Mo. 07.08.25'), 30 = Stundenmarke ('14:00'), 20 = Minutenmarke ('14:23').
+#   70 = Jahreswechsel, 60 = Monatswechsel, 55 = Wochenanfang Mo,
+#   50 = Tageswechsel, 30 = Stundenmarke, 20 = Minutenmarke.
+# 21.01 (Bugfix 4): Die LABELS folgen seitdem 1:1 der App-JS
+# (TT.MM.JJ fuer Tages-Marken, HH:MM fuer Sub-Tag-Marken) - die alte
+# 5-Format-Beschriftung ('2026'/'Feb 26'/'08.25'/'Di. 03.02.26') ist
+# ersetzt, weil sie von der Chartfenster-Anzeige abwich.
 _DATE_TARGET_PX = 80.0
 _MONTHS_SHORT = ("Jan", "Feb", "Mrz", "Apr", "Mai", "Jun",
                  "Jul", "Aug", "Sep", "Okt", "Nov", "Dez")
@@ -218,8 +229,8 @@ class _HeatmapAxis(pg.AxisItem):
     Die Achse traegt NATUERLICHE Werte (date -> Wanduhr-Epochs,
     hour/dow -> Ganzzahlen, kategorial -> Indizes) und formatiert die
     Tick-Beschriftung abhaengig vom sichtbaren Bereich:
-      - date:  5 Format-Stufen je Zoom (Jahr/Monat/Tag/Stunde/Minute,
-               20.02.01 E1)
+      - date:  2 Formate je Zoom (TT.MM.JJ / HH:MM), 21.01 Bugfix 4 –
+               1:1 mit der App-JS (Lightweight Charts tickMarkFormatter)
       - hour/dow: ganzzahlige Schritte, beim Zoom mehr Zwischenwerte
       - kategorial: Labels aus der zugehoerigen Liste
     """
@@ -251,8 +262,10 @@ class _HeatmapAxis(pg.AxisItem):
         ragt der sichtbare Viewport ueber die Skala hinaus – die Ticks
         duerfen DANN nicht ausserhalb liegen (keine -/+ Werte ausserhalb
         00:00-23:59 bzw. Mo-Fr). Der Tick-Bereich wird daher auf die
-        Skala geclampt. `date`/kategorial bleiben unbegrenzt (daten- bzw.
-        listenbasiert).
+        Skala geclampt. `date` bleibt unbegrenzt (datenbasiert); seit
+        21.01 Bugfix 1 werden auch kategoriale Achsen (service_id/
+        timeframe/symbol) auf 0..n-1 geclampt (keine Gespenster-Ticks
+        -1/+2 ausserhalb des festen Wertebereichs, User-Meldung).
         """
         lo = float(minVal)
         hi = float(maxVal)
@@ -262,6 +275,14 @@ class _HeatmapAxis(pg.AxisItem):
         elif self._dim == "dow":
             lo = max(lo, 1.0)
             hi = min(hi, 1.0 + float(len(DOW_WEEK_LABELS)))
+        elif self._dim not in ("date",):
+            # 21.01 (Bugfix 1): Kategoriale Achsen haben einen FESTEN
+            # Wertebereich 0..n-1 (n = Anzahl Labels). Beim Rauszoomen
+            # (Mausrad) ragt der Viewport ueber die Skala hinaus - die
+            # Ticks duerfen DANN nicht ausserhalb liegen.
+            n = len(self._labels)
+            lo = max(lo, -0.5)
+            hi = min(hi, float(max(0, n)) - 0.5)
         return lo, hi
 
     def tickValues(self, minVal, maxVal, maxTicks=5):
@@ -418,32 +439,21 @@ class _HeatmapAxis(pg.AxisItem):
     # ------------------------------------------------------------------
     def _format(self, v: float, spacing: float) -> str:
         if self._dim == "date":
-            # 20.02.01 (User-Meldung 2): Per-Tick-Format nach der
-            # LWC-v5-Weight-Hierarchie (nicht mehr nach Spacing):
-            #   - Jahreswechsel (1.1.)  -> '2026'      (Weight 70)
-            #   - Monatswechsel (1. des Monats) -> 'Feb 26' (Weight 60)
-            #   - Wochenanfang Mo       -> '08.25'     (ISO-Woche, Weight 55)
-            #   - sonstiger Tag         -> 'Mo. 07.08.25' (Weight 50)
-            #   - Stundenmarke          -> '14:00'     (Weight 30)
-            #   - Minutenmarke          -> '14:23'     (Weight 20)
+            # 21.01 (Bugfix 4 + Runde 3, 11.08.2026): Datums-Format:
+            #   - Tages-/Monats-/Jahres-Marken (Mitternacht) -> 'Mo. 12.06.26'
+            #     (Runde 3: Wochentag + Datum, User-Wunsch wie chart_win)
+            #   - Stunden-/Minuten-Marken (Sub-Tag)          -> 'HH:MM'
+            # Die urspruengliche 5-Format-Weight-Hierarchie (Jahreszahl
+            # '2026', Monatskuerzel 'Feb 26', ISO-Woche '08.25') ist ersetzt.
             # Wanduhr-Garantie via UTC-Darstellung der (Wanduhr-encoded)
-            # Epoch (Invariante 7, KEIN Berlin-Offset). Monats-/Wochen-
-            # marken eines groben Zooms tragen ihre eigene Beschriftung
-            # (Jahreszahl/Feb/Mrz/...), feine Marken die Uhrzeit.
+            # Epoch (Invariante 7, KEIN Berlin-Offset). `weekday()`:
+            # 0=Mo..6=So -> Index in die deutschen Wochentage.
             dt = datetime.fromtimestamp(v, tz=dt_timezone.utc)
             if dt.hour != 0 or dt.minute != 0 or dt.second != 0:
-                if dt.minute == 0 and dt.second == 0:
-                    return f"{dt.hour:02d}:00"   # Stundenmarke
-                return f"{dt.hour:02d}:{dt.minute:02d}"  # Minutenmarke
-            weekday = DOW_LABELS[(dt.weekday() + 1) % 7]
-            if dt.month == 1 and dt.day == 1:
-                return str(dt.year)               # Jahreswechsel
-            if dt.day == 1:
-                return f"{_MONTHS_SHORT[dt.month - 1]} {dt.year % 100:02d}"
-            if dt.weekday() == 0:
-                iso = dt.isocalendar()
-                return f"{iso[1]:02d}.{dt.year % 100:02d}"  # ISO-Woche
-            return f"{weekday}. {dt.day:02d}.{dt.month:02d}.{dt.year % 100:02d}"
+                return f"{dt.hour:02d}:{dt.minute:02d}"  # Sub-Tag '14:30'
+            days = ("Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa.", "So.")
+            return (f"{days[dt.weekday()]} {dt.day:02d}.{dt.month:02d}."
+                    f"{dt.year % 100:02d}")
         if self._dim == "hour":
             # 20.02.01 (User-Meldung 1): KEIN `% 24`-Wrap mehr – Werte
             # ausserhalb der festen Skala 00:00-23:59 werden leer gelassen
@@ -461,7 +471,9 @@ class _HeatmapAxis(pg.AxisItem):
         idx = int(round(v))
         if 0 <= idx < len(self._labels):
             return str(self._labels[idx])
-        return str(int(round(v)))
+        # 21.01 (Bugfix 1): Ausserhalb des festen Wertebereichs -> leer
+        # (das tickValues-Clamping verhindert sie bereits; defensiv).
+        return ""
 
 
 class HeatmapWidget(QWidget):
@@ -603,6 +615,41 @@ class HeatmapWidget(QWidget):
             colorMap=self._cmap_viridis, values=(0.0, 1.0))
         self._colorbar.setImageItem(self._image)
 
+        # 21.01 (Bugfix 2, 11.08.2026): Diskrete Schwellwert-Legende oben
+        # rechts auf der Grafik (User: 'welche Farbe bedeutet was?'; spaeter
+        # konfigurierbar). Wird in _update_legend je Aggregation befuellt.
+        self._legend = pg.LegendItem(
+            offset=(-10, 10), labelTextColor="k",
+            pen=pg.mkPen("#b0b0b0"), brush=pg.mkBrush(255, 255, 255, 210))
+        self._legend.setParentItem(self._plot_hm.plotItem)
+        self._legend.hide()
+        # 21.01 (Bugfix 3, 11.08.2026): Fadenkreuz wie im Chartfenster
+        # (LWC-Crosshair) - zwei gestrichelte InfiniteLine, folgen dem
+        # Mauszeiger ueber der Heatmap (sigMouseMoved).
+        self._cross_x = pg.InfiniteLine(
+            angle=90, movable=False,
+            pen=pg.mkPen("#808080", width=1, style=Qt.DashLine))
+        self._cross_y = pg.InfiniteLine(
+            angle=0, movable=False,
+            pen=pg.mkPen("#808080", width=1, style=Qt.DashLine))
+        self._cross_x.setZValue(20)
+        self._cross_y.setZValue(20)
+        self._cross_x.setVisible(False)
+        self._cross_y.setVisible(False)
+        self._plot_hm.addItem(self._cross_x, ignoreBounds=True)
+        self._plot_hm.addItem(self._cross_y, ignoreBounds=True)
+        self._plot_hm.scene().sigMouseMoved.connect(self._on_mouse_moved)
+
+        # 21.01 (Bugfix-Runde 3, Entscheidung 2a, 11.08.2026): Senkrechte
+        # Teiler je Dateneinheit (Bar-Intervall des TFs, z. B. H1 -> jede
+        # Stunde). Als EIN PlotCurveItem mit connect='pairs' (schnell),
+        # ueber der Heatmap aber unter dem Candle-Overlay (price_vb 10).
+        self._grid_lines = pg.PlotCurveItem(
+            connect="pairs", pen=pg.mkPen("#c0c0c0", width=1))
+        self._grid_lines.setZValue(5)
+        self._grid_lines.setVisible(False)
+        self._plot_hm.addItem(self._grid_lines)
+
         # Kerzen-Overlay: zweite Y-Achse (Preis) rechts im selben Canvas,
         # ViewBox teilt die X-Achse mit der Heatmap (Bugfix 1).
         self._plot_hm.showAxis("right")
@@ -680,7 +727,11 @@ class HeatmapWidget(QWidget):
         return self._chk_candle.isChecked()
 
     def request_data(self) -> None:
-        """Fordert generische Heatmap (+ Tages-Ohlc bei Overlay) an.
+        """Fordert generische Heatmap (+ OHLCV-Overlay bei Overlay) an.
+
+        21.01 (Bugfix 5, 11.08.2026): Das Overlay laedt den OHLCV-Snapshot
+        IM HEATMAP-TIMEFRAME (adaptiv fuer alle TFs) statt der festen
+        Tages-Aggregation (fetch_daily_ohlc).
 
         Runde 15 (Ultra-Low-Latency, Fix 1): QUERY_FEATURES wird VOR der
         Grafik in die Puffer-Queue gelegt – der leichte Metadaten-Pfad
@@ -695,8 +746,9 @@ class HeatmapWidget(QWidget):
         self._view_model.request_heatmap_generic()
         # Runde 12 (Option A): Zusaetzlich kommen die No-Data-Varianten im
         # QUERY_HEATMAP_GENERIC-Payload (Konsistenz nach dem Render).
+        # 21.01 (Bugfix 5): Overlay-Bars im Heatmap-TF (OHLCV-Snapshot).
         if self._chk_candle.isChecked():
-            self._view_model.request_daily_ohlc()
+            self._view_model.request_ohlcv_snapshot()
 
     # ------------------------------------------------------------------
     # Sync aus den ViewModel-_params (Profil/Workspace-Restore)
@@ -1036,7 +1088,9 @@ class HeatmapWidget(QWidget):
         # 20.02.01 (E7): Link-Zustand an den Overlay-Zustand koppeln.
         self._update_controls()
         if checked:
-            self._view_model.request_daily_ohlc()
+            # 21.01 (Bugfix 5): OHLCV im Heatmap-TF (adaptiv) statt
+            # Tages-Aggregation.
+            self._view_model.request_ohlcv_snapshot()
         else:
             self._clear_overlay()
 
@@ -1124,7 +1178,10 @@ class HeatmapWidget(QWidget):
             # '(No Data)'-Items erscheinen im selben Durchlauf wie die Grafik.
             self._cache_no_data_from_payload(data)
             self._render_generic(data)
-        elif kind == QUERY_DAILY_OHLC:
+        elif kind in (QUERY_DAILY_OHLC, QUERY_OHLCV):
+            # 21.01 (Bugfix 5): QUERY_OHLCV liefert die Bars im Heatmap-TF
+            # (adaptives Overlay); QUERY_DAILY_OHLC bleibt als
+            # Kompatibilitaets-Pfad erhalten.
             self._render_overlay(data)
         elif kind == QUERY_FEATURES:
             # Runde 11 (Bug 4, B4-3): Kompatibilitaets-Pfad (z. B. der
@@ -1228,6 +1285,8 @@ class HeatmapWidget(QWidget):
             self._y_axis = []
             self._image.clear()
             self._label_info.setText("Keine Daten")
+            self._legend.hide()  # 21.01 Bugfix 2: keine Legende ohne Daten
+            self._grid_lines.setData([], [])  # 21.01 R3: keine Teiler
             self._clear_overlay()
             return
 
@@ -1281,6 +1340,10 @@ class HeatmapWidget(QWidget):
             self._image.setImage(matrix, levels=(vmin, vmax))
             self._colorbar.setLevels((vmin, vmax))
 
+        # 21.01 (Bugfix 2): Diskrete Schwellwert-Legende (oben rechts)
+        # an die aktuelle Colormap/Levels anpassen.
+        self._update_legend()
+
         # ImageItem exakt auf die natuerlichen Koordinaten mappen (Bugfix 3):
         # date-Spalten = Tage (zentriert auf Mitternacht), hour/dow =
         # ganzzahlige Werte (feste Skalen, E3/E5), kategorial = Indizes.
@@ -1290,6 +1353,10 @@ class HeatmapWidget(QWidget):
         self._image.setRect(QRectF(
             self._x_min, self._y_min,
             self._x_max - self._x_min, self._y_max - self._y_min))
+
+        # 21.01 (Bugfix-Runde 3, Entscheidung 2a): Senkrechte Teiler je
+        # Dateneinheit (TF-Bar-Intervall) an der X-Achse (date).
+        self._update_grid_lines()
 
         # 20.02.01 (E8): service_id-Achsen-Labels ueber den ViewModel-
         # Resolver ({Kategorie} / {Name}, `srv_`-Prefix entfaellt).
@@ -1334,9 +1401,10 @@ class HeatmapWidget(QWidget):
         self._apply_y_range()
         self._label_info.setText(f"{self._n_rows} x {self._n_cols}")
 
-        # Bugfix 1/2: Bei aktivem Overlay den Tages-Ohlc-Snapshot laden.
+        # Bugfix 1/2 + 21.01 Bugfix 5: Bei aktivem Overlay den OHLCV-
+        # Snapshot IM HEATMAP-TIMEFRAME laden (adaptiv fuer alle TFs).
         if self._chk_candle.isChecked() and self._view_model is not None:
-            self._view_model.request_daily_ohlc()
+            self._view_model.request_ohlcv_snapshot()
 
     @staticmethod
     def _axis_bounds(axis: List[float], dim: str):
@@ -1797,12 +1865,19 @@ class HeatmapWidget(QWidget):
         self._update_controls()
 
     def _render_overlay(self, data: Dict[str, Any]) -> None:
-        """Zeichnet Tages-Ohlc ueber die Heatmap (selbes Canvas, Bugfix 1).
+        """Zeichnet OHLCV-Bars ueber die Heatmap (selbes Canvas, Bugfix 1).
 
-        Die Candles liegen in der Preis-ViewBox. 10.08.2026 (Bugfix Runde 7,
-        Bug 1): 'Datum' darf auf der X- ODER Y-Achse liegen - X=date zeichnet
-        vertikale Candles (Preis auf der rechten Achse), Y=date horizontale
-        Candles (Preis auf der unteren Preis-Achse). Die Spalten der
+        21.01 (Bugfix 5, 11.08.2026): Das Overlay nutzt die Bars IM
+        HEATMAP-TIMEFRAME (OHLCV-Snapshot, adaptiv fuer alle TFs) statt der
+        festen Tages-Aggregation. Die Candle-Breite folgt dem Bar-Intervall
+        (_bar_interval_seconds). Bars werden ueber ihren Wanduhr-Tag
+        (Mitternachts-Epoch) dem Heatmap-Zeitraum zugeordnet und an ihrer
+        ECHTEN Bar-Zeit positioniert (H1-Kerzen liegen damit korrekt in der
+        jeweiligen Tageszelle).
+
+        Die Candles liegen in der Preis-ViewBox. 'Datum' liegt auf der
+        X-Achse (Y=date ist keine offizielle Overlay-Ansicht mehr, der
+        horizontale Zweig bleibt defensiv erhalten). Die Spalten der
         date-Achse sind Wanduhr-Mitternachts-Epochs. Alpha 0.3-0.5 (E9).
         """
         self._clear_overlay()
@@ -1816,7 +1891,10 @@ class HeatmapWidget(QWidget):
         date_axis = self._x_axis if date_on_x else self._y_axis
         if not bars or not date_axis:
             return
-        # Spalten-Index je Wanduhr-Tag (Mitternachts-Epoch).
+        # Spalten-Index je Wanduhr-Tag (Mitternachts-Epoch) - dient als
+        # Filter, dass die Bar im Heatmap-Zeitraum liegt. OHLCV-Bars tragen
+        # ihre ECHTE Bar-Zeit (z. B. H1 14:00) - der Wanduhr-Tag wird per
+        # UTC-Division auf Mitternacht zurueckgefuehrt (Bugfix 5).
         epoch_to_col = {int(round(e)): i for i, e in enumerate(date_axis)}
         candles: List[tuple] = []
         for b in bars:
@@ -1827,7 +1905,8 @@ class HeatmapWidget(QWidget):
                 t = int(t)
             except (TypeError, ValueError):
                 continue
-            col = epoch_to_col.get(t)
+            day = int(t // _DAY_SECONDS) * _DAY_SECONDS
+            col = epoch_to_col.get(day)
             if col is None:
                 continue  # Tag nicht in der Heatmap (Ausschnitt)
             try:
@@ -1853,35 +1932,61 @@ class HeatmapWidget(QWidget):
             self._price_vb.setYRange(pmin - pad, pmax + pad, padding=0)
         else:
             self._price_vb.setXRange(pmin - pad, pmax + pad, padding=0)
-        # Candles: x = Mitternachts-Epoch (X=date) bzw. y = Mitternachts-
-        # Epoch (Y=date), Breite/Hoehe in Tages-Sekunden.
-        for t, o, h, l, c in candles:
-            up = c >= o
-            color = pg.mkColor(0, 180, 0, 140) if up \
-                else pg.mkColor(220, 30, 30, 140)
-            if date_on_x:
-                # Vertikale Candles (Preis auf der rechten Achse).
-                wick = pg.BarGraphItem(
-                    x=[float(t)], width=_DAY_SECONDS * 0.12,
-                    y0=l, height=max(h - l, 1e-9), brush=color, pen=color)
-                body = pg.BarGraphItem(
-                    x=[float(t)], width=_DAY_SECONDS * 0.7,
-                    y0=min(o, c),
-                    height=max(max(o, c) - min(o, c), 1e-9),
-                    brush=color, pen=color)
-            else:
-                # Horizontale Candles (Preis auf der unteren Achse).
-                wick = pg.BarGraphItem(
-                    x0=l, width=max(h - l, 1e-9),
-                    y0=float(t) - _DAY_SECONDS * 0.06,
-                    height=_DAY_SECONDS * 0.12, brush=color, pen=color)
-                body = pg.BarGraphItem(
-                    x0=min(o, c), width=max(max(o, c) - min(o, c), 1e-9),
-                    y0=float(t) - _DAY_SECONDS * 0.35,
-                    height=_DAY_SECONDS * 0.7, brush=color, pen=color)
-            self._price_vb.addItem(wick)
-            self._price_vb.addItem(body)
-            self._candle_items.extend((wick, body))
+        # 21.01 (Bugfix 5): Candle-Breite/Hoehe folgt dem Bar-Intervall
+        # des Heatmap-TFs (z. B. 3600s bei H1, 86400s bei D1) statt fest
+        # einem Tag. x = echte Bar-Epoch (X=date) bzw. y = Bar-Epoch
+        # (Y=date, defensiver Zweig).
+        # 21.01 (Bugfix-Runde 3, Bug 1, 11.08.2026): NumPy-vektorisiertes
+        # Rendering - statt 2 Qt-Items JE BAR nur noch 3 batched Items
+        # (Wick + Bull-Koerper + Bear-Koerper) fuer ALLE Bars (vorher bei
+        # 5000 Bars = 10.000 Einzel-Items -> Pan/Zoom rueckelte). Die
+        # Daten werden als numpy-Arrays an BarGraphItem uebergeben.
+        bar_sec = self._bar_interval_seconds()
+        times = np.asarray([c[0] for c in candles], dtype=np.float64)
+        opens = np.asarray([c[1] for c in candles], dtype=np.float64)
+        highs = np.asarray([c[2] for c in candles], dtype=np.float64)
+        lows = np.asarray([c[3] for c in candles], dtype=np.float64)
+        closes = np.asarray([c[4] for c in candles], dtype=np.float64)
+        bull = closes >= opens
+        bear = ~bull
+        wick_color = pg.mkColor(128, 128, 128, 140)
+        bull_color = pg.mkColor(0, 180, 0, 140)
+        bear_color = pg.mkColor(220, 30, 30, 140)
+        if date_on_x:
+            # Vertikale Candles (Preis auf der rechten Achse).
+            wick = pg.BarGraphItem(
+                x=times, width=bar_sec * 0.12,
+                y0=lows, height=np.maximum(highs - lows, 1e-9),
+                brush=wick_color, pen=wick_color)
+            body_bull = pg.BarGraphItem(
+                x=times[bull], width=bar_sec * 0.7,
+                y0=opens[bull],
+                height=np.maximum(closes[bull] - opens[bull], 1e-9),
+                brush=bull_color, pen=bull_color)
+            body_bear = pg.BarGraphItem(
+                x=times[bear], width=bar_sec * 0.7,
+                y0=closes[bear],
+                height=np.maximum(opens[bear] - closes[bear], 1e-9),
+                brush=bear_color, pen=bear_color)
+        else:
+            # Horizontale Candles (Preis auf der unteren Achse, defensiv).
+            wick = pg.BarGraphItem(
+                x0=lows, width=np.maximum(highs - lows, 1e-9),
+                y=times, height=bar_sec * 0.12,
+                brush=wick_color, pen=wick_color)
+            body_bull = pg.BarGraphItem(
+                x0=opens[bull], width=np.maximum(
+                    closes[bull] - opens[bull], 1e-9),
+                y=times[bull], height=bar_sec * 0.7,
+                brush=bull_color, pen=bull_color)
+            body_bear = pg.BarGraphItem(
+                x0=closes[bear], width=np.maximum(
+                    opens[bear] - closes[bear], 1e-9),
+                y=times[bear], height=bar_sec * 0.7,
+                brush=bear_color, pen=bear_color)
+        self._candle_items = [wick, body_bull, body_bear]
+        for _item in self._candle_items:
+            self._price_vb.addItem(_item)
         self._price_vb.setVisible(True)
         if date_on_x:
             self._plot_hm.getAxis("right").setVisible(True)
@@ -1902,3 +2007,166 @@ class HeatmapWidget(QWidget):
         self._price_vb.setVisible(False)
         self._plot_hm.getAxis("right").setVisible(False)
         self._price_axis_bottom.setVisible(False)
+
+    # ------------------------------------------------------------------
+    # 21.01 Bugfix-Runde 3 (Entscheidung 2a): Senkrechte Teiler je
+    # Dateneinheit (Bar-Intervall des Timeframes) an der X-Achse (date)
+    # ------------------------------------------------------------------
+    def _update_grid_lines(self) -> None:
+        """Setzt die senkrechten Teiler je Dateneinheit (Bugfix 2a).
+
+        Nur bei X=date. Der Abstand ist das Bar-Intervall des Heatmap-TFs
+        (_bar_interval_seconds, z. B. H1 -> jede volle Stunde, D1 -> jede
+        Tagesgrenze). Die Positionen sind daten-konsistent (Epochs sind
+        Vielfache von 60s; Mitternachts-Epochs Vielfache von 86400s). Ein
+        Dichte-Cap (max ~2000 Linien) verhindert ueberladene Raster bei
+        sehr grossen Zeitraeumen (dann wird der Abstand skaliert).
+        """
+        x_dim = str(self._combo_x.currentData() or "date")
+        if x_dim != "date" or not self._x_axis:
+            self._grid_lines.setData([], [])
+            self._grid_lines.setVisible(False)
+            return
+        bar_sec = self._bar_interval_seconds()
+        lo = float(self._x_axis[0])
+        hi = float(self._x_axis[-1]) + _DAY_SECONDS
+        start = int(math.floor(lo / bar_sec)) * bar_sec
+        step = 1
+        max_lines = 2000
+        while int((hi - lo) / (bar_sec * step)) > max_lines:
+            step += 1
+        positions = np.arange(start, hi, bar_sec * step)
+        if positions.size == 0:
+            self._grid_lines.setData([], [])
+            self._grid_lines.setVisible(False)
+            return
+        y0, y1 = self._y_min, self._y_max
+        n = positions.size
+        xs = np.empty(n * 2, dtype=np.float64)
+        xs[0::2] = positions
+        xs[1::2] = positions
+        ys = np.empty(n * 2, dtype=np.float64)
+        ys[0::2] = y0
+        ys[1::2] = y1
+        self._grid_lines.setData(x=xs, y=ys, connect="pairs")
+        self._grid_lines.setVisible(True)
+
+    # ------------------------------------------------------------------
+    # 21.01 Bugfix 5: Adaptives Overlay (OHLCV im Heatmap-Timeframe)
+    # ------------------------------------------------------------------
+    def _bar_interval_seconds(self) -> float:
+        """Bar-Intervall des Heatmap-Timeframes in Sekunden (Bugfix 5).
+
+        Liest `params["timeframe"]` des ViewModels (z. B. 'H1' -> 3600) und
+        liefert einen Fallback (3600s), falls der TF unbekannt/leer ist.
+        """
+        tf = ""
+        if self._view_model is not None:
+            tf = str(self._view_model.params.get("timeframe") or "")
+        return float(_TF_SECONDS.get(tf.strip().upper(), 3600.0))
+
+    # ------------------------------------------------------------------
+    # 21.01 Bugfix 3: Fadenkreuz + Zellwert-Info
+    # ------------------------------------------------------------------
+    def _on_mouse_moved(self, pos) -> None:
+        """Bewegt das Fadenkreuz ueber die Heatmap (Bugfix 3).
+
+        `pos` ist ein QPointF in SCENE-Koordinaten (pyqtgraph
+        `sigMouseMoved`). Nur innerhalb des Plot-Viewports wird das Kreuz
+        gezeigt; sonst versteckt (Maus ueber den Steuerleisten).
+        """
+        if self._view_model is None:
+            return
+        vb = self._plot_hm.plotItem.vb
+        rect = vb.sceneBoundingRect()
+        if rect is None or not rect.contains(pos):
+            self._cross_x.setVisible(False)
+            self._cross_y.setVisible(False)
+            return
+        try:
+            p = vb.mapSceneToView(pos)
+        except Exception:
+            return
+        self._cross_x.setPos(p.x())
+        self._cross_y.setPos(p.y())
+        self._cross_x.setVisible(True)
+        self._cross_y.setVisible(True)
+        self._update_cell_info(p.x(), p.y())
+
+    def _update_cell_info(self, x: float, y: float) -> None:
+        """Zeigt genaue Datum/Zeit + Matrix-Wert am Fadenkreuz (Bug 4)."""
+        if self._n_rows <= 0 or self._n_cols <= 0:
+            return
+        img = getattr(self._image, "image", None)
+        if img is None or img.size == 0:
+            return
+        sx = (self._x_max - self._x_min) or 1.0
+        sy = (self._y_max - self._y_min) or 1.0
+        col = int((x - self._x_min) / sx * self._n_cols)
+        row = int((y - self._y_min) / sy * self._n_rows)
+        if not (0 <= col < self._n_cols and 0 <= row < self._n_rows):
+            return
+        try:
+            v = float(img[row, col])
+        except (TypeError, ValueError, IndexError):
+            return
+        # 21.01 (Bugfix-Runde 3, Bug 4): Genaue Datum/Zeit am Fadenkreuz
+        # (wie chart_win). Bei X=date wird die Cursor-Position als
+        # Wanduhr-Zeit formatiert; der Zellwert folgt danach.
+        time_txt = ""
+        if str(self._combo_x.currentData() or "date") == "date":
+            try:
+                dt = datetime.fromtimestamp(float(x), tz=dt_timezone.utc)
+                days = ("Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa.", "So.")
+                time_txt = (f"{days[dt.weekday()]} {dt.day:02d}."
+                            f"{dt.month:02d}.{dt.year % 100:02d} "
+                            f"{dt.hour:02d}:{dt.minute:02d}  ·  ")
+            except (TypeError, ValueError, OverflowError):
+                time_txt = ""
+        self._label_info.setText(f"{time_txt}Zelle({row},{col}) = {v:g}")
+
+    # ------------------------------------------------------------------
+    # 21.01 Bugfix 2: Diskrete Schwellwert-Legende (oben rechts)
+    # ------------------------------------------------------------------
+    def _update_legend(self) -> None:
+        """Befuellt die Schwellwert-Legende je Colormap/Levels.
+
+        Confluence (diskret): je ganzzahligem Treffer-Wert 0..5 ein Farbfeld
+        mit der AKTUELL daten-gebundenen Farbe (Levels 0..vmax), '5+' fuer
+        alles darueber. Wert-Aggregationen (viridis, kontinuierlich): 5
+        Stichproben min..max mit den tatsaechlichen Werten als Label.
+        """
+        cmap = (self._cmap_confluence
+                if self._colormap_mode == "confluence"
+                else self._cmap_viridis)
+        levels = getattr(self._image, "levels", None)
+        if levels is None or len(levels) != 2:
+            self._legend.hide()
+            return
+        vmin = float(levels[0])
+        vmax = float(levels[1])
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+        self._legend.clear()
+        if self._colormap_mode == "confluence":
+            max_count = max(1, int(math.ceil(vmax)))
+            for c in range(0, min(max_count, 5) + 1):
+                frac = (c - vmin) / (vmax - vmin)
+                frac = max(0.0, min(1.0, frac))
+                color = cmap.map(frac, mode="qcolor")
+                label = str(c) if c < 5 else "5+"
+                self._add_legend_swatch(color, label)
+        else:
+            for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+                val = vmin + frac * (vmax - vmin)
+                color = cmap.map(frac, mode="qcolor")
+                self._add_legend_swatch(color, f"{val:.2g}")
+        self._legend.show()
+
+    def _add_legend_swatch(self, color, label: str) -> None:
+        """Fuegt ein Farbfeld + Label zur Legende hinzu (Bugfix 2)."""
+        item = pg.PlotDataItem(
+            [0], [0], pen=None,
+            symbol="s", symbolSize=10,
+            symbolBrush=pg.mkColor(color), symbolPen=pg.mkPen(None))
+        self._legend.addItem(item, str(label))
