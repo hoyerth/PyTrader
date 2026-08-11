@@ -131,9 +131,24 @@ PyTrader/
         _apply_r13b.py
         _apply_r13b_dialog.py
         _check_r13b_state.py
+        _diag_cb2.py
+        _diag_colorbar.py
+        _diag_e2e.py
+        _diag_overlay.py
+        _diag_overlay_e2e.py
+        _diag_presets.py
+        _diag_render.py
+        _diag_std_cb.py
+        _diag_widget.py
+        _doc_update_2101.py
+        _fix_quote.py
+        _fix_quote2.py
         _fix_ws1.py
         _migrate_feature_data.py
         _patch_ui3.py
+        _t39_nos39.py
+        _t39_strip.py
+        _tmp_aktiere_vorher.md
         _tmp_find_src.py
         _verify_mastertree.py
         check_2004_bugfix3.py
@@ -160,7 +175,9 @@ PyTrader/
         check_bugfix_0808.py
         check_dialog_host.py
         check_heatmap_200201.py
+        check_heatmap_2101.py
         check_heatmap_bugfix.py
+        check_orientation_2101.py
         check_output_schema.py
         check_page_nav.py
         check_r17b_construct.py
@@ -4579,12 +4596,20 @@ class AnalyticsRepository:
         # Auswertung im selben Worker (kein separater QUERY_FEATURES-
         # Roundtrip mehr; Payload-Attribut no_data_variants).
         presets_data: Optional[Dict[str, Any]] = None,
+        # 21.01 (E1, 11.08.2026): TF-Freigabe fuer Timeframe-Matrizen
+        # (Preset `[📊 Service-Timeframe]`) – wird an den Reader gereicht.
+        all_timeframes: bool = False,
     ) -> Dict[str, Any]:
         """Generische 2D-Matrix (freie Dimensionen + Aggregationen, 20.02).
 
         Additiv zur bestehenden get_heatmap() (Dow×Stunde bleibt Standard).
         Wanduhr-Garantie (Invariante 7 / E4) wie fetch_heatmap – die
         Extraktion erfolgt im Reader mit `bar_time AT TIME ZONE 'UTC'`.
+
+        21.01 (E1): `all_timeframes=True` entfaellt die TF-WHERE-Bedingung –
+        Grundlage des Presets `[📊 Service-Timeframe]` (X = `timeframe`,
+        Y = `service_id`, agg = `count`). `timeframe` bleibt fuer den
+        Normalpfad erhalten.
 
         Returns:
             {
@@ -4620,6 +4645,7 @@ class AnalyticsRepository:
                 symbol, timeframe, x_dim, y_dim, field=use_field or None,
                 agg=use_agg, feature_id=feature_id, feature_ids=feature_ids,
                 instance_hashes=instance_hashes, limit=limit,
+                all_timeframes=all_timeframes,
             )
         except ValueError as e:
             print(f"WARN [AnalyticsRepository] get_generic_heatmap: {e}")
@@ -5096,6 +5122,11 @@ class AnalyticsViewModel(QObject):
             "heatmap_y_dim": "hour",
             "heatmap_field": "",
             "heatmap_agg": "confluence_count",
+            # 21.01 (E1, 11.08.2026): TF-Freigabe – True entfaellt die
+            # TF-WHERE-Bedingung der generischen Heatmap (Preset
+            # `[📊 Service-Timeframe]`: alle Zeitebenen M1..D1 in EINER
+            # Query). Persistiert im Profil-Payload (charts.heatmap).
+            "heatmap_all_timeframes": False,
             "candle_projection_enabled": False,
             "zoom_x_range": [0.0, 1.0],
             "zoom_y_range": [0.0, 1.0],
@@ -5380,6 +5411,105 @@ class AnalyticsViewModel(QObject):
         self._mark_dirty()
         self._refresh((QUERY_HEATMAP_GENERIC,))
 
+    # ------------------------------------------------------------------
+    # 21.01: Smart-Presets (E4, 11.08.2026)
+    # ------------------------------------------------------------------
+    def _set_heatmap_all_timeframes(self, enabled: bool) -> None:
+        """Setzt die TF-Freigabe der generischen Heatmap (21.01, E1).
+
+        Idempotent ohne Aenderung; Dirty-Flag + Refresh nur bei echtem
+        Wechsel (Muster set_heatmap_config).
+        """
+        enabled = bool(enabled)
+        if enabled == self._params.get("heatmap_all_timeframes"):
+            return
+        self._params["heatmap_all_timeframes"] = enabled
+        self._mark_dirty()
+        self._refresh((QUERY_HEATMAP_GENERIC,))
+
+    def apply_smart_preset_confluence(self) -> None:
+        """`[⚡ Signal-Confluence]`: X=date, Y=service_id, count(DISTINCT fid).
+
+        Chronologische Lichtsaeulen zeitgleicher Signale (Hauptansicht).
+        Konfiguration + Dirty-Flag (Option B), KEIN Auto-Save (E4).
+        """
+        self._set_heatmap_all_timeframes(False)
+        self.set_heatmap_config("date", "service_id", "", "confluence_count")
+
+    def apply_smart_preset_session(self) -> None:
+        """`[🕒 Session-Hotspots]`: X=dow (Mo-Fr), Y=hour, count(DISTINCT fid).
+
+        Tageszeit-/Wochentag-Muster im Handelsverlauf (Wanduhr, E5-Phase 20).
+        Konfiguration + Dirty-Flag (Option B), KEIN Auto-Save (E4).
+        """
+        self._set_heatmap_all_timeframes(False)
+        self.set_heatmap_config("dow", "hour", "", "confluence_count")
+
+    def apply_smart_preset_intensity(self, x_dim: str = "date") -> None:
+        """`[📏 Wert-Intensität]`: X=date (Standard) oder dow (E2), Y=hour.
+
+        Auspraegung von Messwerten (z. B. distance_pip, atr) – AVG/Max ueber
+        den ersten verfuegbaren numerischen feature_data-JSON-Key (Repo-
+        Fallback, wenn keiner existiert). `x_dim` akzeptiert "date" (Default)
+        oder "dow" (E2). Konfiguration + Dirty-Flag (Option B), KEIN
+        Auto-Save (E4).
+        """
+        x_key = "dow" if str(x_dim or "").strip().lower() == "dow" else "date"
+        # Erster verfuegbarer numerischer Key (Muster Repo-E6-Fallback) –
+        # bei leeren Daten bleibt field="" (Repo faellt defensiv zurueck).
+        try:
+            avail = self._repo.available_feature_columns(
+                str(self._params.get("symbol") or ""),
+                str(self._params.get("timeframe") or "M1"))
+            field = avail[0] if avail else ""
+        except Exception:
+            field = ""
+        self._set_heatmap_all_timeframes(False)
+        self.set_heatmap_config(x_key, "hour", field, "avg")
+
+    def apply_smart_preset_timeframe(self) -> None:
+        """`[📊 Service-Timeframe]`: X=timeframe (ALLE TFs), Y=service_id.
+
+        Verteilung der Services ueber Zeitebenen (E1: `all_timeframes=True`
+        entfaellt die TF-WHERE-Bedingung – alle M1..D1 in EINER Query).
+        Konfiguration + Dirty-Flag (Option B), KEIN Auto-Save (E4).
+        """
+        self._set_heatmap_all_timeframes(True)
+        self.set_heatmap_config("timeframe", "service_id", "", "count")
+
+    # ------------------------------------------------------------------
+    # 21.01 (E3): Auto-Namensgenerator fuer neue Profile (DEUTSCH)
+    # ------------------------------------------------------------------
+    def generate_profile_name_suggestion(self) -> str:
+        """Sprechender Profilname – Formel `[Symbol] [TF] - [Modus] ([Kontext])`.
+
+        E3 (11.08.2026): Sprache DEUTSCH, z. B.
+        `SILVER M1 - Confluence Zeitachse (3 Services)`.
+        * Kontext-Klammer = Anzahl der selektierten Services (feature_ids);
+          bei 0 Auswahlen `(Alle Services)` statt `(0 Services)`.
+        * Fehlendes Symbol/Timeframe -> Platzhalter `ALLE`
+          (z. B. `ALLE M1 - Confluence Zeitachse (3 Services)`).
+        * Modus-Ableitung aus der AKTUELLEN Heatmap-Konfiguration
+          (Confluence/Session/Intensitaet/TF-Matrix) – der Vorschlag passt
+          zum eingestellten Ansichts-Szenario.
+        """
+        symbol = str(self._params.get("symbol") or "").strip() or "ALLE"
+        timeframe = str(self._params.get("timeframe") or "").strip() or "ALLE"
+        x_dim = str(self._params.get("heatmap_x_dim") or "").lower()
+        y_dim = str(self._params.get("heatmap_y_dim") or "").lower()
+        agg = str(self._params.get("heatmap_agg") or "").lower()
+        if x_dim == "timeframe":
+            mode = "Service-Zeitebenen"
+        elif x_dim == "dow" and y_dim == "hour":
+            mode = "Session-Hotspots"
+        elif agg in ("avg", "sum", "min", "max"):
+            mode = "Wert-Intensität"
+        else:
+            mode = "Confluence Zeitachse"
+        n = len(self._params.get("feature_ids") or [])
+        context = f"{n} Services" if n > 0 else "Alle Services"
+        return f"{symbol} {timeframe} - {mode} ({context})"
+
     def set_heatmap_zoom(self, x_range, y_range) -> None:
         """Setzt die normalisierten Viewport-Anteile [0,1] (20.02, E8).
 
@@ -5610,6 +5740,10 @@ class AnalyticsViewModel(QObject):
             base["y_dim"] = p["heatmap_y_dim"]
             base["field"] = p.get("heatmap_field") or None
             base["agg"] = p["heatmap_agg"]
+            # 21.01 (E1): TF-Freigabe in die Worker-Params – True entfaellt
+            # im Reader die TF-WHERE-Bedingung (Preset `[📊 Service-Timeframe]`).
+            base["all_timeframes"] = bool(
+                p.get("heatmap_all_timeframes", False))
             # Runde 12 (Option A): Preset-Modell-Snapshot fuer die
             # No-Data-Auswertung IM SELBEN Datenfluss wie die Grafik
             # (kein zweiter serieller QUERY_FEATURES-Worker-Roundtrip -
@@ -5848,6 +5982,10 @@ class AnalyticsViewModel(QObject):
             self._params["heatmap_agg"] = str(heat["agg"]).lower()
         if heat.get("field") is not None:
             self._params["heatmap_field"] = str(heat["field"])
+        # 21.01 (E1): TF-Freigabe aus dem Payload restaurieren.
+        if heat.get("all_timeframes") is not None:
+            self._params["heatmap_all_timeframes"] = bool(
+                heat["all_timeframes"])
         if heat.get("candle_projection_enabled") is not None:
             self._params["candle_projection_enabled"] = bool(
                 heat["candle_projection_enabled"])
@@ -5925,6 +6063,8 @@ class AnalyticsViewModel(QObject):
                     "y_dim": p.get("heatmap_y_dim"),
                     "field": p.get("heatmap_field"),
                     "agg": p.get("heatmap_agg"),
+                    # 21.01 (E1): TF-Freigabe additiv persistieren.
+                    "all_timeframes": p.get("heatmap_all_timeframes"),
                     "candle_projection_enabled": p.get(
                         "candle_projection_enabled"),
                     "zoom_x_range": list(p.get("zoom_x_range")
@@ -6773,6 +6913,9 @@ class AnalyticsAsyncWorker(QThread):
                 # Auswertung im selben Worker (kein separater
                 # QUERY_FEATURES-Roundtrip mehr).
                 presets_data=p.get("presets_data") or None,
+                # 21.01 (E1, 11.08.2026): TF-Freigabe fuer Timeframe-Matrizen
+                # (Preset `[📊 Service-Timeframe]`) – Bool aus den Params.
+                all_timeframes=bool(p.get("all_timeframes", False)),
             )
         if self._query_kind == QUERY_OHLCV:
             # 20.02 (E9): OHLCV-Snapshot fuer das Candle-Overlay – limit=None
@@ -8070,6 +8213,14 @@ class FeatureStoreReader:
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        # 21.01 (E1, 11.08.2026): TF-Freigabe fuer Timeframe-Matrizen.
+        # Bei `all_timeframes=True` entfaellt die WHERE-Bedingung
+        # `LOWER(timeframe) = LOWER(?)` – DuckDB liest ALLE Zeitebenen
+        # (M1..D1) des Symbols in EINER Query. Der `timeframe`-Parameter
+        # bleibt fuer den Normalpfad erhalten (Kapitel-Vorgabe `timeframe=""`
+        # ist VERWORFEN: der alte Guard `if not symbol or not timeframe:`
+        # brach damit mit einer leeren Matrix ab).
+        all_timeframes: bool = False,
     ) -> Dict[str, Any]:
         """Aggregiert eine generische 2D-Matrix ueber zwei Dimensionen.
 
@@ -8081,6 +8232,12 @@ class FeatureStoreReader:
         fetch_heatmap). HIT_RATE entfaellt in V1 (E5: kein Schwellwert
         spezifiziert). 20.02.01 (E5): `dow`-Achsen sind strikt Montag-Freitag
         (zusätzliche WHERE-Bedingung `BETWEEN 1 AND 5`, DuckDB Mo=1..Fr=5).
+
+        21.01 (E1, 11.08.2026): `all_timeframes=True` entfaellt die
+        TF-WHERE-Bedingung – Grundlage des Presets `[📊 Service-Timeframe]`
+        (X = `timeframe`, Y = `service_id`, agg = `count`). Der
+        `timeframe`-Guard wird dabei uebersprungen (leerer/aktueller
+        Timeframe erlaubt), `symbol` bleibt Pflicht.
 
         Wanduhr-Garantie (Invariante 7 / E4): date/dow/hour werden
         mit `bar_time AT TIME ZONE 'UTC'` extrahiert (die gespeicherten Werte
@@ -8096,7 +8253,8 @@ class FeatureStoreReader:
         deterministisch auf die letzten Sortierwerte begrenzt.
 
         Args:
-            symbol/timeframe: Filter (case-insensitive)
+            symbol/timeframe: Filter (case-insensitive). Bei
+                `all_timeframes=True` ist `timeframe` optional (alle TFs).
             x_dim/y_dim: Dimensions-Keys aus DIM_MAPPINGS (case-insensitiv)
             field: Numerischer feature_data-JSON-Key (Pflicht nur fuer
                 AVG/SUM/MIN/MAX; bei COUNT/CONFLUENCE_COUNT ignoriert, E6)
@@ -8105,6 +8263,7 @@ class FeatureStoreReader:
             feature_ids: Optionaler Multi-Filter (`WHERE feature_id IN (...)`).
                 Leere Liste/None = kein Filter.
             limit: Max. Bars des Aggregations-Ausschnitts (neueste zuerst).
+            all_timeframes: True = TF-WHERE-Bedingung entfaellt (E1).
 
         Returns:
             {
@@ -8122,7 +8281,7 @@ class FeatureStoreReader:
             ValueError: bei unbekannter Dimension/Aggregation oder fehlendem
                 `field` fuer AVG/SUM/MIN/MAX (defensiv im Repository gefangen).
         """
-        if not symbol or not timeframe:
+        if not symbol or (not timeframe and not all_timeframes):
             return self._empty_generic_heatmap(
                 x_dim, y_dim, agg, field, symbol, timeframe)
         x_key = str(x_dim or "").lower()
@@ -8157,8 +8316,14 @@ class FeatureStoreReader:
                 f"erlaubt: {', '.join(HEATMAP_AGGREGATIONS)}."
             )
 
-        conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
-        params: List[Any] = [symbol, timeframe]
+        conditions = ["LOWER(symbol) = LOWER(?)"]
+        params: List[Any] = [symbol]
+        # 21.01 (E1): TF-Freigabe – bei `all_timeframes=True` entfaellt die
+        # TF-WHERE-Bedingung, sodass alle Zeitebenen (M1..D1) in EINER Query
+        # aggregiert werden (Preset `[📊 Service-Timeframe]`).
+        if not all_timeframes:
+            conditions.append("LOWER(timeframe) = LOWER(?)")
+            params.append(timeframe)
         self._apply_feature_filter(
             feature_ids, feature_id, conditions, params,
             instance_hashes=instance_hashes)
@@ -17909,6 +18074,9 @@ from PySide6.QtCore import QTimer, Qt, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -17918,6 +18086,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QStackedWidget,
     QVBoxLayout,
@@ -18136,18 +18305,20 @@ class AnalyticsWindow(PersistentWindow):
         root.setSpacing(6)
 
         # --- Top-Bar: Profil-CRUD (Option B – Explicit Save) ---
+        # 21.01 (E5, 11.08.2026): combo_profile dehnbar (Expanding,
+        # min. 560 px - User-Meldung 1, editierbar); Namens-/Beschreibungs-
+        # Felder wandern in den separaten Speicher-Dialog (_on_profile_save)
+        # bzw. breiten Neu-Dialog (_on_profile_new). label_dirty + Buttons
+        # streng rechtsbuendig (addStretch davor).
         top = QHBoxLayout()
         self.combo_profile = QComboBox()
-        self.combo_profile.setMinimumWidth(160)
-        self.edit_profile_name = QLineEdit()
-        self.edit_profile_name.setPlaceholderText("Profil-Name")
-        self.edit_profile_name.setMaximumWidth(180)
-        self.edit_profile_desc = QLineEdit()
-        self.edit_profile_desc.setPlaceholderText("Beschreibung (optional)")
-        self.edit_profile_desc.setMaximumWidth(200)
-        self.btn_profile_new = QPushButton("Neu")
-        self.btn_profile_save = QPushButton("💾 Save")
-        self.btn_profile_delete = QPushButton("Löschen")
+        self.combo_profile.setMinimumWidth(560)
+        self.combo_profile.setEditable(True)
+        self.combo_profile.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.btn_profile_new = QPushButton("➕ Neu")
+        self.btn_profile_save = QPushButton("💾 Speichern")
+        self.btn_profile_delete = QPushButton("🗑️ Löschen")
         self.label_dirty = QLabel("")
         self.label_dirty.setStyleSheet("color: #e65100; font-weight: bold;")
         self.progress_busy = QProgressBar()
@@ -18156,14 +18327,12 @@ class AnalyticsWindow(PersistentWindow):
         self.progress_busy.setVisible(False)
 
         top.addWidget(QLabel("Profil:"))
-        top.addWidget(self.combo_profile)
-        top.addWidget(self.edit_profile_name)
-        top.addWidget(self.edit_profile_desc)
+        top.addWidget(self.combo_profile, 1)
+        top.addStretch(1)
+        top.addWidget(self.label_dirty)
         top.addWidget(self.btn_profile_new)
         top.addWidget(self.btn_profile_save)
         top.addWidget(self.btn_profile_delete)
-        top.addWidget(self.label_dirty)
-        top.addStretch(1)
         top.addWidget(self.progress_busy)
         root.addLayout(top)
 
@@ -18783,14 +18952,12 @@ class AnalyticsWindow(PersistentWindow):
     def _on_active_profile_changed(
         self, profile: Optional[Dict[str, Any]]
     ) -> None:
+        # 21.01 (E5): Name-/Beschreibungs-Felder leben im Speicher-Dialog
+        # (kein Header-Edit mehr) – hier nur noch die Combo + Filter-Sync.
         if profile is None:
-            self.edit_profile_name.clear()
-            self.edit_profile_desc.clear()
             self._active_display_names = []
             self._sync_service_filter_button()
             return
-        self.edit_profile_name.setText(profile.get("name") or "")
-        self.edit_profile_desc.setText(profile.get("description") or "")
         pid = profile.get("profile_id")
         idx = self.combo_profile.findData(pid)
         if idx >= 0 and self.combo_profile.currentIndex() != idx:
@@ -18850,26 +19017,33 @@ class AnalyticsWindow(PersistentWindow):
         self._refresh_timeframe_combo(symbol)
 
     def _sync_profile_editor(self) -> None:
-        """Synchronisiert Name-/Beschreibungs-/Limit-Felder mit dem VM (Bugfix).
+        """Synchronisiert das Limit-Feld mit dem VM (Bugfix).
 
         Wird beim App-Start nach `load_profiles()` gerufen: Dort emittiert der
         ViewModel KEIN `active_profile_changed` (nur set_active_profile/
-        create_profile) – die edit-Felder blieben sonst leer. Ein leerer
-        `edit_profile_name` wuerde beim ersten Save als `name=''` persistiert
-        werden (die Combo zeigt dann '?'). Ohne aktives Profil werden die
-        Felder geleert; das Limit-Feld wird mit dem VM-Wert synchronisiert.
+        create_profile) – das Limit-Feld bliebe sonst auf dem Default, obwohl
+        das aktive Profil einen abweichenden Wert haben kann.
+        21.01 (E5): Die Namens-/Beschreibungs-Felder existieren nicht mehr im
+        Header – Name/Beschreibung werden ausschliesslich im Speicher-Dialog
+        editiert (dort mit den aktuellen Profilwerten vorbelegt).
         """
-        active = self._vm.active_profile
-        if active:
-            self.edit_profile_name.setText(active.get("name") or "")
-            self.edit_profile_desc.setText(active.get("description") or "")
-        else:
-            self.edit_profile_name.clear()
-            self.edit_profile_desc.clear()
         if hasattr(self, "edit_limit"):
             self.edit_limit.setText(
                 str(int(self._vm.params.get("limit")
                         or self._default_limit)))
+
+    @staticmethod
+    def _resolve_save_name(name: str, current_name: str) -> str:
+        """Leerer Name beim Speichern -> aktueller Profilname (E5).
+
+        21.01 (E5): Die Header-Namensfelder sind entfernt; der Speicher-
+        Dialog wird mit dem aktuellen Profilnamen vorbelegt. Laesst der
+        Anwender das Feld leer (bzw. nur Whitespace), bleibt der
+        bestehende Profilname erhalten – kein '?'-Verlust in der Combo
+        (Bugfix 19.05/19.06-Semantik, jetzt im Dialog statt Header-Feld).
+        """
+        return (str(name or "").strip()
+                or str(current_name or "").strip() or "")
 
     @Slot(bool)
     def _on_dirty_changed(self, dirty: bool) -> None:
@@ -18895,36 +19069,84 @@ class AnalyticsWindow(PersistentWindow):
 
     @Slot()
     def _on_profile_new(self) -> None:
-        name, ok = QInputDialog.getText(self, "Neues Profil", "Profil-Name:")
-        name = (name or "").strip()
-        if not ok or not name:
+        # 21.01 (E3 + User-Meldung 1, 11.08.2026): Der Neu-Dialog ist ein
+        # BREITER QDialog (Fenster min. 560 px, Namensfeld min. 420 px) mit
+        # Name + Beschreibung in EINEM Formular (vorher zwei schmale
+        # QInputDialog-Instanzen hintereinander). Der Auto-Namensgenerator
+        # fuellt das Namensfeld vor (deutsch, Fallbacks; kein leeres Feld).
+        suggested = ""
+        try:
+            suggested = self._vm.generate_profile_name_suggestion() or ""
+        except Exception:
+            suggested = ""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Neues Profil")
+        dialog.setMinimumWidth(560)
+        form = QFormLayout(dialog)
+        edit_name = QLineEdit(suggested)
+        edit_name.setMinimumWidth(420)
+        edit_name.setPlaceholderText("Profil-Name")
+        edit_desc = QLineEdit()
+        edit_desc.setPlaceholderText("Beschreibung (optional)")
+        form.addRow("Name:", edit_name)
+        form.addRow("Beschreibung:", edit_desc)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Anlegen")
+        form.addRow(buttons)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        if dialog.exec() != QDialog.Accepted:
             return
-        desc, ok2 = QInputDialog.getText(
-            self, "Neues Profil", "Beschreibung (optional):")
-        if not ok2:
-            desc = ""
+        name = (edit_name.text() or "").strip()
+        if not name:
+            return
+        desc = (edit_desc.text() or "").strip()
         # 10.08.2026 (Punkte 3/4): UI-Layout (Seite + Heatmap-Modus) im
         # neuen Profil persistieren (create_profile ruft _current_payload).
         self._vm.set_ui_layout(self._current_ui_layout())
         try:
-            self._vm.create_profile(name, desc or "")
+            self._vm.create_profile(name, desc)
         except ValueError as e:
             QMessageBox.warning(self, "Profil anlegen", str(e))
 
     @Slot()
     def _on_profile_save(self) -> None:
-        """Explicit Save: Name/Beschreibung + aktuelle Parameter persistieren."""
+        """Explicit Save: Name/Beschreibung + aktuelle Parameter persistieren.
+
+        21.01 (E5): Name und Beschreibung werden im SEPARATEN Speicher-Dialog
+        mit den aktuellen Profilwerten vorbelegt (die Header-Edit-Felder sind
+        entfernt). Ohne Namensaenderung bleibt der bestehende Name erhalten
+        (kein '?'-Verlust).
+        """
         if self._vm.active_profile is None:
             return
         # 20.01: save_profile() bestaetigt die aktuelle Datenquellen-Wahl ->
         # Warn-Label (fehlende Services) zuruecksetzen.
         self.label_missing_warning.setVisible(False)
         pid = self._vm.active_profile["profile_id"]
-        self._vm.update_profile(
-            pid,
-            name=self.edit_profile_name.text(),
-            description=self.edit_profile_desc.text(),
-        )
+        current_name = (self._vm.active_profile.get("name") or "").strip()
+        current_desc = (self._vm.active_profile.get("description")
+                        or "").strip()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Profil speichern")
+        form = QFormLayout(dialog)
+        edit_name = QLineEdit(current_name)
+        edit_desc = QLineEdit(current_desc)
+        edit_desc.setPlaceholderText("Beschreibung (optional)")
+        form.addRow("Name:", edit_name)
+        form.addRow("Beschreibung:", edit_desc)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Speichern")
+        form.addRow(buttons)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        name = self._resolve_save_name(edit_name.text(), current_name)
+        desc = (edit_desc.text() or "").strip()
+        self._vm.update_profile(pid, name=name, description=desc)
         # 10.08.2026 (Punkte 3/4): UI-Layout (Seite + Heatmap-Modus) in das
         # Profil persistieren (save_profile ruft _current_payload).
         self._vm.set_ui_layout(self._current_ui_layout())
@@ -19805,11 +20027,19 @@ class HeatmapPage(QWidget):
         content = QWidget(self)
         lay = QVBoxLayout(content)
 
-        # 20.02 (additiv): Ansichts-Modus – Standard (Wochentag x Stunde)
-        # bleibt der Default; "Generisch" bettet den HeatmapWidget ein.
+        # 21.01 (User-Meldung 2, 11.08.2026): Das "Ansicht"-Dropdown enthaelt
+        # jetzt die 4 Smart-Presets; "Wochentag × Stunde" entfaellt (der
+        # Standard-Modus bleibt als Legacy-Code fuer Restores erhalten, ist
+        # aber KEIN Dropdown-Eintrag mehr). "Generisch" ist die Basis-Ansicht
+        # (Index 0); jede Preset-Option wendet das Preset an (Meldung 3: die
+        # Bedien-Controls des generischen Widgets bleiben dabei sichtbar).
         self._combo_mode = QComboBox()
-        self._combo_mode.addItem("Wochentag × Stunde", "standard")
         self._combo_mode.addItem("Generisch", "generic")
+        self._combo_mode.addItem("⚡ Signal-Confluence", "preset_confluence")
+        self._combo_mode.addItem("🕒 Session-Hotspots", "preset_session")
+        self._combo_mode.addItem("📏 Wert-Intensität", "preset_intensity")
+        self._combo_mode.addItem("📊 Service-Timeframe", "preset_timeframe")
+        self._combo_mode.setCurrentIndex(0)
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Ansicht:"))
         mode_row.addWidget(self._combo_mode)
@@ -19852,6 +20082,9 @@ class HeatmapPage(QWidget):
         # verbindet eigene data_ready-Slots (QUERY_HEATMAP_GENERIC/
         # QUERY_DAILY_OHLC, Bugfix 09.08.2026).
         self._generic.attach_view_model(view_model)
+        # 21.01 (E7, 11.08.2026): Die `preset_clicked`-Verbindung wurde
+        # entfernt – das generische Widget hat keine Preset-Buttons mehr
+        # (Smart-Presets laufen ausschliesslich ueber das Ansicht-Dropdown).
         params = view_model.params
         # 19.02 (Cleanup): Metriken = "count" + numerische feature_data-
         # JSON-Keys (dynamisch). Prefill fuer das aktuelle Symbol/Timeframe;
@@ -19873,35 +20106,74 @@ class HeatmapPage(QWidget):
     def request_data(self) -> None:
         if self._view_model is None:
             return
-        # 20.02: Modus-abhaengig – Standard (Dow x Stunde) oder Generisch
-        # (+ OHLCV-Snapshot bei aktivem Kerzen-Overlay, E9).
-        if self._combo_mode.currentData() == "generic":
-            self._generic.request_data()
-        else:
-            self._view_model.request_heatmap()
+        # 21.01 (Meldung 2): Die Heatmap-Ansicht ist seit dem Entfall von
+        # "Wochentag × Stunde" IMMER generisch – die Daten kommen immer
+        # aus dem generischen Widget (+ OHLCV-Snapshot bei aktivem Overlay, E9).
+        self._generic.request_data()
 
     # ------------------------------------------------------------------
     # 20.02: Ansichts-Modus (Workspace-Persistenz, E2)
     # ------------------------------------------------------------------
     @property
     def mode_id(self) -> str:
-        """Aktueller Modus ("standard" | "generic") fuer die Workspace-Speicherung."""
-        return str(self._combo_mode.currentData() or "standard")
+        """Aktueller Modus ("generic" | "preset_*") fuer die Workspace-Speicherung."""
+        return str(self._combo_mode.currentData() or "generic")
 
     def set_mode(self, mode_id: str) -> None:
-        """Stellt den Ansichts-Modus wieder her (Workspace-Restore)."""
-        idx = self._combo_mode.findData(str(mode_id or "").lower())
+        """Stellt den Ansichts-Modus wieder her (Workspace/Profil-Restore).
+
+        21.01 (Meldung 2): Legacy-Modi ("standard"/"wochentag") werden auf
+        "generic" gemappt. Signale blockiert (kein Dirty/Query beim Restore);
+        der Stack zeigt immer das generische Widget (Meldung 3).
+        """
+        mid = str(mode_id or "").lower()
+        if mid in ("standard", "wochentag", "wochentag_x_stunde",
+                   "wochentag x stunde"):
+            mid = "generic"
+        idx = self._combo_mode.findData(mid)
         if idx < 0:
             idx = 0
         if self._combo_mode.currentIndex() != idx:
+            self._combo_mode.blockSignals(True)
             self._combo_mode.setCurrentIndex(idx)
-        else:
-            self._stack_modes.setCurrentIndex(idx)
+            self._combo_mode.blockSignals(False)
+        self._stack_modes.setCurrentIndex(1)
 
     def _on_mode_changed(self, _index: int) -> None:
-        """Wechselt den Modus-Stack und fordert die passenden Daten an."""
-        self._stack_modes.setCurrentIndex(
-            1 if self._combo_mode.currentData() == "generic" else 0)
+        """Wechselt die Ansicht: Preset anwenden bzw. generisch laden.
+
+        21.01 (Meldung 2+3): Die Bedien-Controls (generisches Widget)
+        bleiben bei JEDEM Preset-Wechsel sichtbar (Stack zeigt immer
+        Seite 1). Eine Preset-Option wendet das Smart-Preset an.
+        """
+        mid = str(self._combo_mode.currentData() or "generic")
+        self._stack_modes.setCurrentIndex(1)
+        if mid.startswith("preset_"):
+            self._apply_selected_preset(mid)
+        else:
+            self.request_data()
+
+    def _apply_selected_preset(self, mid: str) -> None:
+        """Wendet das im Ansicht-Dropdown gewaehlte Smart-Preset an.
+
+        Bugfix-Muster 21.01 (Meldung 4/6): Nach dem VM-Preset werden die
+        Combos des generischen Widgets via _sync_from_params nachgezogen
+        (keine STALE-Combos), danach wird neu gerendert.
+        """
+        if self._view_model is None:
+            return
+        fn = {
+            "preset_confluence": self._view_model.apply_smart_preset_confluence,
+            "preset_session": self._view_model.apply_smart_preset_session,
+            "preset_intensity": self._view_model.apply_smart_preset_intensity,
+            "preset_timeframe": self._view_model.apply_smart_preset_timeframe,
+        }.get(mid)
+        if fn is None:
+            return
+        fn()
+        generic = getattr(self, "_generic", None)
+        if generic is not None and hasattr(generic, "_sync_from_params"):
+            generic._sync_from_params()
         self.request_data()
 
     # ------------------------------------------------------------------
@@ -20090,7 +20362,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QRectF, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -20106,9 +20378,9 @@ from analytics.engine.analytics_worker import (
     QUERY_HEATMAP_GENERIC,
     QUERY_DAILY_OHLC,
     QUERY_FEATURES,
+    QUERY_OHLCV,
 )
 from analytics.engine.feature_store_reader import (
-    DOW_LABELS,
     DOW_WEEK_LABELS,
     HEATMAP_AGGREGATIONS,
     HEATMAP_DIMENSIONS,
@@ -20116,10 +20388,12 @@ from analytics.engine.feature_store_reader import (
 )
 from analytics.ui.common import CheckableComboBox
 
-# E7: Konfluenz-Farbskala (0 = weiss/transparent, 1-2 = gelb/cyan,
-# 3-4 = orange, 5+ = dunkelrot) – Positionen 0..1 (Levels 0..5).
+# E7: Konfluenz-Farbskala (0 = grau, 1-2 = gelb/cyan, 3-4 = orange,
+# 5+ = dunkelrot) – Positionen 0..1 (Levels 0..5).
+# 21.01 (Bugfix 2, 11.08.2026): 0 = HELLGRAU statt Weiss – weisse
+# 0-Treffer-Zellen waren auf dem weissen Plot-Hintergrund unsichtbar.
 _CONFLUENCE_COLORS = [
-    "#ffffff", "#ffff00", "#00ffff", "#ff8c00", "#ff6600", "#8b0000",
+    "#d9d9d9", "#ffff00", "#00ffff", "#ff8c00", "#ff6600", "#8b0000",
 ]
 _CONFLUENCE_POS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
 _CONFLUENCE_LEVELS = (0.0, 5.0)
@@ -20134,6 +20408,12 @@ _HALF_DAY = 43200.0
 # 20.02.01 (E1): Stufen-Schwellen des Datums-Formatters (Monat/Jahr).
 _MONTH_SECONDS = 2_592_000
 _YEAR_SECONDS = 31_536_000
+# 21.01 (Bugfix 5, 11.08.2026): Timeframe -> Sekunden fuer das adaptive
+# Candle-Overlay (OHLCV im Original-TF statt Tages-Aggregation).
+_TF_SECONDS = {
+    "M1": 60, "M5": 300, "M15": 900, "M30": 1800,
+    "H1": 3600, "H4": 14400, "D1": 86400, "W1": 604800,
+}
 
 # 20.02.01 (User-Meldung 2): LWC-v5-adaptierte Datums-Skala.
 # Zielabstand zwischen zwei Tick-Labels in Pixel (Lightweight Charts:
@@ -20141,9 +20421,12 @@ _YEAR_SECONDS = 31_536_000
 # 5*16/8*8 = 80 px). Die Tick-Auswahl haelt diesen Abstand ein: Zoom-In
 # => feinere Variante, Zoom-Out => groebere Variante (keine Ueberlappung,
 # keine Riesensprünge). Weight-Hierarchie wie LWC v5:
-#   70 = Jahreswechsel (Label: '2026'), 60 = Monatswechsel ('Feb 26'),
-#   55 = Wochenanfang Mo (ISO-Woche '08.25'), 50 = Tageswechsel
-#   ('Mo. 07.08.25'), 30 = Stundenmarke ('14:00'), 20 = Minutenmarke ('14:23').
+#   70 = Jahreswechsel, 60 = Monatswechsel, 55 = Wochenanfang Mo,
+#   50 = Tageswechsel, 30 = Stundenmarke, 20 = Minutenmarke.
+# 21.01 (Bugfix 4): Die LABELS folgen seitdem 1:1 der App-JS
+# (TT.MM.JJ fuer Tages-Marken, HH:MM fuer Sub-Tag-Marken) - die alte
+# 5-Format-Beschriftung ('2026'/'Feb 26'/'08.25'/'Di. 03.02.26') ist
+# ersetzt, weil sie von der Chartfenster-Anzeige abwich.
 _DATE_TARGET_PX = 80.0
 _MONTHS_SHORT = ("Jan", "Feb", "Mrz", "Apr", "Mai", "Jun",
                  "Jul", "Aug", "Sep", "Okt", "Nov", "Dez")
@@ -20216,8 +20499,8 @@ class _HeatmapAxis(pg.AxisItem):
     Die Achse traegt NATUERLICHE Werte (date -> Wanduhr-Epochs,
     hour/dow -> Ganzzahlen, kategorial -> Indizes) und formatiert die
     Tick-Beschriftung abhaengig vom sichtbaren Bereich:
-      - date:  5 Format-Stufen je Zoom (Jahr/Monat/Tag/Stunde/Minute,
-               20.02.01 E1)
+      - date:  2 Formate je Zoom (TT.MM.JJ / HH:MM), 21.01 Bugfix 4 –
+               1:1 mit der App-JS (Lightweight Charts tickMarkFormatter)
       - hour/dow: ganzzahlige Schritte, beim Zoom mehr Zwischenwerte
       - kategorial: Labels aus der zugehoerigen Liste
     """
@@ -20249,8 +20532,10 @@ class _HeatmapAxis(pg.AxisItem):
         ragt der sichtbare Viewport ueber die Skala hinaus – die Ticks
         duerfen DANN nicht ausserhalb liegen (keine -/+ Werte ausserhalb
         00:00-23:59 bzw. Mo-Fr). Der Tick-Bereich wird daher auf die
-        Skala geclampt. `date`/kategorial bleiben unbegrenzt (daten- bzw.
-        listenbasiert).
+        Skala geclampt. `date` bleibt unbegrenzt (datenbasiert); seit
+        21.01 Bugfix 1 werden auch kategoriale Achsen (service_id/
+        timeframe/symbol) auf 0..n-1 geclampt (keine Gespenster-Ticks
+        -1/+2 ausserhalb des festen Wertebereichs, User-Meldung).
         """
         lo = float(minVal)
         hi = float(maxVal)
@@ -20260,6 +20545,14 @@ class _HeatmapAxis(pg.AxisItem):
         elif self._dim == "dow":
             lo = max(lo, 1.0)
             hi = min(hi, 1.0 + float(len(DOW_WEEK_LABELS)))
+        elif self._dim not in ("date",):
+            # 21.01 (Bugfix 1): Kategoriale Achsen haben einen FESTEN
+            # Wertebereich 0..n-1 (n = Anzahl Labels). Beim Rauszoomen
+            # (Mausrad) ragt der Viewport ueber die Skala hinaus - die
+            # Ticks duerfen DANN nicht ausserhalb liegen.
+            n = len(self._labels)
+            lo = max(lo, -0.5)
+            hi = min(hi, float(max(0, n)) - 0.5)
         return lo, hi
 
     def tickValues(self, minVal, maxVal, maxTicks=5):
@@ -20416,32 +20709,21 @@ class _HeatmapAxis(pg.AxisItem):
     # ------------------------------------------------------------------
     def _format(self, v: float, spacing: float) -> str:
         if self._dim == "date":
-            # 20.02.01 (User-Meldung 2): Per-Tick-Format nach der
-            # LWC-v5-Weight-Hierarchie (nicht mehr nach Spacing):
-            #   - Jahreswechsel (1.1.)  -> '2026'      (Weight 70)
-            #   - Monatswechsel (1. des Monats) -> 'Feb 26' (Weight 60)
-            #   - Wochenanfang Mo       -> '08.25'     (ISO-Woche, Weight 55)
-            #   - sonstiger Tag         -> 'Mo. 07.08.25' (Weight 50)
-            #   - Stundenmarke          -> '14:00'     (Weight 30)
-            #   - Minutenmarke          -> '14:23'     (Weight 20)
+            # 21.01 (Bugfix 4 + Runde 3, 11.08.2026): Datums-Format:
+            #   - Tages-/Monats-/Jahres-Marken (Mitternacht) -> 'Mo. 12.06.26'
+            #     (Runde 3: Wochentag + Datum, User-Wunsch wie chart_win)
+            #   - Stunden-/Minuten-Marken (Sub-Tag)          -> 'HH:MM'
+            # Die urspruengliche 5-Format-Weight-Hierarchie (Jahreszahl
+            # '2026', Monatskuerzel 'Feb 26', ISO-Woche '08.25') ist ersetzt.
             # Wanduhr-Garantie via UTC-Darstellung der (Wanduhr-encoded)
-            # Epoch (Invariante 7, KEIN Berlin-Offset). Monats-/Wochen-
-            # marken eines groben Zooms tragen ihre eigene Beschriftung
-            # (Jahreszahl/Feb/Mrz/...), feine Marken die Uhrzeit.
+            # Epoch (Invariante 7, KEIN Berlin-Offset). `weekday()`:
+            # 0=Mo..6=So -> Index in die deutschen Wochentage.
             dt = datetime.fromtimestamp(v, tz=dt_timezone.utc)
             if dt.hour != 0 or dt.minute != 0 or dt.second != 0:
-                if dt.minute == 0 and dt.second == 0:
-                    return f"{dt.hour:02d}:00"   # Stundenmarke
-                return f"{dt.hour:02d}:{dt.minute:02d}"  # Minutenmarke
-            weekday = DOW_LABELS[(dt.weekday() + 1) % 7]
-            if dt.month == 1 and dt.day == 1:
-                return str(dt.year)               # Jahreswechsel
-            if dt.day == 1:
-                return f"{_MONTHS_SHORT[dt.month - 1]} {dt.year % 100:02d}"
-            if dt.weekday() == 0:
-                iso = dt.isocalendar()
-                return f"{iso[1]:02d}.{dt.year % 100:02d}"  # ISO-Woche
-            return f"{weekday}. {dt.day:02d}.{dt.month:02d}.{dt.year % 100:02d}"
+                return f"{dt.hour:02d}:{dt.minute:02d}"  # Sub-Tag '14:30'
+            days = ("Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa.", "So.")
+            return (f"{days[dt.weekday()]} {dt.day:02d}.{dt.month:02d}."
+                    f"{dt.year % 100:02d}")
         if self._dim == "hour":
             # 20.02.01 (User-Meldung 1): KEIN `% 24`-Wrap mehr – Werte
             # ausserhalb der festen Skala 00:00-23:59 werden leer gelassen
@@ -20459,11 +20741,18 @@ class _HeatmapAxis(pg.AxisItem):
         idx = int(round(v))
         if 0 <= idx < len(self._labels):
             return str(self._labels[idx])
-        return str(int(round(v)))
+        # 21.01 (Bugfix 1): Ausserhalb des festen Wertebereichs -> leer
+        # (das tickValues-Clamping verhindert sie bereits; defensiv).
+        return ""
 
 
 class HeatmapWidget(QWidget):
     """Generische 2D-Heatmap mit Confluence-Matrix, Zoom & Candle-Overlay."""
+
+    # 21.01 (E7, 11.08.2026): Das Signal bleibt als Vertrag erhalten, wird
+    # aber NICHT mehr emittiert – die Smart-Presets laufen ausschliesslich
+    # ueber das 'Ansicht'-Dropdown der HeatmapPage (keine Preset-Buttons).
+    preset_clicked = Signal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -20533,6 +20822,10 @@ class HeatmapWidget(QWidget):
         ctrl.addWidget(self._combo_x)
         ctrl.addWidget(QLabel("Y-Achse:"))
         ctrl.addWidget(self._combo_y)
+        # 21.01 (E7, 11.08.2026): Die 4 Smart-Preset-Buttons wurden
+        # ENTFERNT – die Presets sind ausschliesslich ueber das
+        # 'Ansicht'-Dropdown der HeatmapPage erreichbar (heatmap_page.py,
+        # _combo_mode / _apply_selected_preset).
         ctrl.addStretch(1)
 
         # --- Steuerung (Zeile 2: Overlay + Zoom) ---
@@ -20577,6 +20870,12 @@ class HeatmapWidget(QWidget):
         self._plot_hm.plotItem.setAxisItems(
             {"bottom": self._axis_x, "left": self._axis_y})
         self._image = pg.ImageItem()
+        # 21.01 (E8, 11.08.2026): pyqtgraph rendert ImageItem-Daten per
+        # Default TRANSPONIERT (axisOrder='col-major') – die (rows=Services,
+        # cols=Zeiten)-Matrix erschien dadurch als N duenne Y-Streifen
+        # (Screenshot-Kritik Punkt 1). row-major legt die Daten 1:1 auf die
+        # Zellen (Zeile = Y-Zeile = Service, Spalte = X = Zeitpunkt).
+        self._image.setOpts(axisOrder="row-major")
         self._plot_hm.addItem(self._image)
         self._cmap_viridis = pg.colormap.get(_VIRIDIS)
         self._cmap_confluence = pg.ColorMap(
@@ -20585,6 +20884,41 @@ class HeatmapWidget(QWidget):
         self._colorbar = pg.ColorBarItem(
             colorMap=self._cmap_viridis, values=(0.0, 1.0))
         self._colorbar.setImageItem(self._image)
+
+        # 21.01 (Bugfix 2, 11.08.2026): Diskrete Schwellwert-Legende oben
+        # rechts auf der Grafik (User: 'welche Farbe bedeutet was?'; spaeter
+        # konfigurierbar). Wird in _update_legend je Aggregation befuellt.
+        self._legend = pg.LegendItem(
+            offset=(-10, 10), labelTextColor="k",
+            pen=pg.mkPen("#b0b0b0"), brush=pg.mkBrush(255, 255, 255, 210))
+        self._legend.setParentItem(self._plot_hm.plotItem)
+        self._legend.hide()
+        # 21.01 (Bugfix 3, 11.08.2026): Fadenkreuz wie im Chartfenster
+        # (LWC-Crosshair) - zwei gestrichelte InfiniteLine, folgen dem
+        # Mauszeiger ueber der Heatmap (sigMouseMoved).
+        self._cross_x = pg.InfiniteLine(
+            angle=90, movable=False,
+            pen=pg.mkPen("#808080", width=1, style=Qt.DashLine))
+        self._cross_y = pg.InfiniteLine(
+            angle=0, movable=False,
+            pen=pg.mkPen("#808080", width=1, style=Qt.DashLine))
+        self._cross_x.setZValue(20)
+        self._cross_y.setZValue(20)
+        self._cross_x.setVisible(False)
+        self._cross_y.setVisible(False)
+        self._plot_hm.addItem(self._cross_x, ignoreBounds=True)
+        self._plot_hm.addItem(self._cross_y, ignoreBounds=True)
+        self._plot_hm.scene().sigMouseMoved.connect(self._on_mouse_moved)
+
+        # 21.01 (Bugfix-Runde 3, Entscheidung 2a, 11.08.2026): Senkrechte
+        # Teiler je Dateneinheit (Bar-Intervall des TFs, z. B. H1 -> jede
+        # Stunde). Als EIN PlotCurveItem mit connect='pairs' (schnell),
+        # ueber der Heatmap aber unter dem Candle-Overlay (price_vb 10).
+        self._grid_lines = pg.PlotCurveItem(
+            connect="pairs", pen=pg.mkPen("#c0c0c0", width=1))
+        self._grid_lines.setZValue(5)
+        self._grid_lines.setVisible(False)
+        self._plot_hm.addItem(self._grid_lines)
 
         # Kerzen-Overlay: zweite Y-Achse (Preis) rechts im selben Canvas,
         # ViewBox teilt die X-Achse mit der Heatmap (Bugfix 1).
@@ -20663,7 +20997,11 @@ class HeatmapWidget(QWidget):
         return self._chk_candle.isChecked()
 
     def request_data(self) -> None:
-        """Fordert generische Heatmap (+ Tages-Ohlc bei Overlay) an.
+        """Fordert generische Heatmap (+ OHLCV-Overlay bei Overlay) an.
+
+        21.01 (Bugfix 5, 11.08.2026): Das Overlay laedt den OHLCV-Snapshot
+        IM HEATMAP-TIMEFRAME (adaptiv fuer alle TFs) statt der festen
+        Tages-Aggregation (fetch_daily_ohlc).
 
         Runde 15 (Ultra-Low-Latency, Fix 1): QUERY_FEATURES wird VOR der
         Grafik in die Puffer-Queue gelegt – der leichte Metadaten-Pfad
@@ -20678,8 +21016,9 @@ class HeatmapWidget(QWidget):
         self._view_model.request_heatmap_generic()
         # Runde 12 (Option A): Zusaetzlich kommen die No-Data-Varianten im
         # QUERY_HEATMAP_GENERIC-Payload (Konsistenz nach dem Render).
+        # 21.01 (Bugfix 5): Overlay-Bars im Heatmap-TF (OHLCV-Snapshot).
         if self._chk_candle.isChecked():
-            self._view_model.request_daily_ohlc()
+            self._view_model.request_ohlcv_snapshot()
 
     # ------------------------------------------------------------------
     # Sync aus den ViewModel-_params (Profil/Workspace-Restore)
@@ -20705,8 +21044,14 @@ class HeatmapWidget(QWidget):
             # noch keine Payload-Metadaten vorliegen).
             self._rebuild_field_dropdown(self._field_keys,
                                          self._field_sources)
+            # 21.01 (User-Meldung 5, 11.08.2026): Das Kerzen-Overlay wird
+            # NUR wiederhergestellt, wenn die X-Achse = 'date' ist. Bei
+            # Y=date/anderen Achsen bleibt die Checkbox aus (verhindert
+            # ein ungewolltes Dirty-Setzen via _update_controls beim
+            # Profil-/Workspace-Restore).
             self._chk_candle.setChecked(bool(
-                p.get("candle_projection_enabled")))
+                p.get("candle_projection_enabled"))
+                and str(p.get("heatmap_x_dim") or "date") == "date")
             self._set_zoom_slider(self._slider_zoom_x,
                                   p.get("zoom_x_range") or [0.0, 1.0])
             self._set_zoom_slider(self._slider_zoom_y,
@@ -20770,34 +21115,35 @@ class HeatmapWidget(QWidget):
             self._combo_field.setToolTip(
                 "Nur fuer AVG/SUM/MIN/MAX relevant (E6); COUNT/CONFLUENCE "
                 "ignorieren das Feld.")
-        # 10.08.2026 (Bugfix Runde 7, Bug 1): 'Datum' darf auf der X- ODER
-        # Y-Achse liegen - X=date zeichnet vertikale Candles (Preis rechts),
-        # Y=date horizontale Candles (Preis unten).
+        # 21.01 (User-Meldung 5, 11.08.2026): Das Kerzen-Overlay ist NUR
+        # bei X-Achse = 'date' aktivierbar (Y=date/vertikale Anordnungen
+        # sind keine offiziellen Ansichten mehr). Bei Y=date wird die
+        # Checkbox hier deaktiviert und zurueckgesetzt (Restore-Fall).
         date_on_x = x_dim == "date"
-        can_overlay = (x_dim == "date" or y_dim == "date")
+        can_overlay = date_on_x
         self._chk_candle.setEnabled(can_overlay)
         if can_overlay:
             self._chk_candle.setToolTip(
                 "Tages-Ohlc ueber der Heatmap (gleicher Canvas), "
-                "Datum auf X- oder Y-Achse (Bugfix 1).")
+                "Datum auf der X-Achse.")
         else:
             self._chk_candle.setToolTip(
-                "Kerzen-Overlay nur mit 'Datum' auf der X- oder Y-Achse "
+                "Kerzen-Overlay nur mit 'Datum' auf der X-Achse "
                 "verfuegbar.")
-        # 10.08.2026 (Bugfix Runde 7, Bug 1): Der Overlay-Link folgt der
-        # DATE-Achse - X=date koppelt die Preis-VB an die X-Achse, Y=date
-        # an die Y-Achse. Ohne Overlay werden beide Links entfernt.
+            # Meldung 5: Reste eines Overlays entfernen (loest
+            # _on_candle_toggled(False) aus -> set_candle_projection(False)
+            # + _clear_overlay im ViewModel/Widget).
+            if self._chk_candle.isChecked():
+                self._chk_candle.setChecked(False)
+        # Meldung 5: Der Overlay-Link folgt NUR noch der X-Achse (date).
+        # Ohne Overlay werden beide Links entfernt.
         link = can_overlay and self._chk_candle.isChecked()
         linked_x = self._price_vb.linkedView(pg.ViewBox.XAxis)
         linked_y = self._price_vb.linkedView(pg.ViewBox.YAxis)
-        if link and date_on_x and linked_x is None:
+        if link and linked_x is None:
             self._price_vb.setXLink(self._plot_hm.plotItem.vb)
-        if link and not date_on_x and linked_y is None:
-            self._price_vb.setYLink(self._plot_hm.plotItem.vb)
-        if link and date_on_x and linked_y is not None:
+        if link and linked_y is not None:
             self._price_vb.setYLink(None)
-        if link and not date_on_x and linked_x is not None:
-            self._price_vb.setXLink(None)
         if not link:
             if linked_x is not None:
                 self._price_vb.setXLink(None)
@@ -20819,9 +21165,9 @@ class HeatmapWidget(QWidget):
                 self._set_combo_data(self._combo_y, fallback)
             finally:
                 self._syncing = False
-        # Overlay nur bei X=date (E9) – sonst ausschalten.
+        # Overlay nur bei X=date (E9 / 21.01 User-Meldung 5) – sonst
+        # ausschalten (Y=date ist keine offizielle Overlay-Ansicht mehr).
         if (self._combo_x.currentData() != "date"
-                and self._combo_y.currentData() != "date"
                 and self._chk_candle.isChecked()):
             self._chk_candle.setChecked(False)
         self._update_controls()
@@ -21012,7 +21358,9 @@ class HeatmapWidget(QWidget):
         # 20.02.01 (E7): Link-Zustand an den Overlay-Zustand koppeln.
         self._update_controls()
         if checked:
-            self._view_model.request_daily_ohlc()
+            # 21.01 (Bugfix 5): OHLCV im Heatmap-TF (adaptiv) statt
+            # Tages-Aggregation.
+            self._view_model.request_ohlcv_snapshot()
         else:
             self._clear_overlay()
 
@@ -21100,7 +21448,10 @@ class HeatmapWidget(QWidget):
             # '(No Data)'-Items erscheinen im selben Durchlauf wie die Grafik.
             self._cache_no_data_from_payload(data)
             self._render_generic(data)
-        elif kind == QUERY_DAILY_OHLC:
+        elif kind in (QUERY_DAILY_OHLC, QUERY_OHLCV):
+            # 21.01 (Bugfix 5): QUERY_OHLCV liefert die Bars im Heatmap-TF
+            # (adaptives Overlay); QUERY_DAILY_OHLC bleibt als
+            # Kompatibilitaets-Pfad erhalten.
             self._render_overlay(data)
         elif kind == QUERY_FEATURES:
             # Runde 11 (Bug 4, B4-3): Kompatibilitaets-Pfad (z. B. der
@@ -21204,6 +21555,8 @@ class HeatmapWidget(QWidget):
             self._y_axis = []
             self._image.clear()
             self._label_info.setText("Keine Daten")
+            self._legend.hide()  # 21.01 Bugfix 2: keine Legende ohne Daten
+            self._grid_lines.setData([], [])  # 21.01 R3: keine Teiler
             self._clear_overlay()
             return
 
@@ -21223,8 +21576,21 @@ class HeatmapWidget(QWidget):
                 except Exception:
                     pass
                 self._colormap_mode = "confluence"
-            self._image.setImage(matrix, levels=_CONFLUENCE_LEVELS)
-            self._colorbar.setLevels(_CONFLUENCE_LEVELS)
+            # 21.01 (User-Meldung 7, 11.08.2026): Die festen Levels
+            # (0.0, 5.0) passten nicht zu echten Daten (Max ~1) - die
+            # Farbgraduierung blieb stumpf (fast nur Weiss/Gelb). Die
+            # Levels werden jetzt DATEN-GEBUNDEN gesetzt: 0 (keine
+            # Konfluenz) = weiss, vmax = staerkste Farbe (dunkelrot).
+            finite = matrix[np.isfinite(matrix)]
+            if finite.size:
+                vmax = float(finite.max())
+                vmin = min(0.0, float(finite.min()))
+            else:
+                vmin, vmax = 0.0, 1.0
+            if vmax <= vmin:
+                vmax = vmin + 1.0
+            self._image.setImage(matrix, levels=(vmin, vmax))
+            self._colorbar.setLevels((vmin, vmax))
         else:
             if self._colormap_mode != _VIRIDIS:
                 self._image.setColorMap(self._cmap_viridis)
@@ -21244,6 +21610,10 @@ class HeatmapWidget(QWidget):
             self._image.setImage(matrix, levels=(vmin, vmax))
             self._colorbar.setLevels((vmin, vmax))
 
+        # 21.01 (Bugfix 2): Diskrete Schwellwert-Legende (oben rechts)
+        # an die aktuelle Colormap/Levels anpassen.
+        self._update_legend()
+
         # ImageItem exakt auf die natuerlichen Koordinaten mappen (Bugfix 3):
         # date-Spalten = Tage (zentriert auf Mitternacht), hour/dow =
         # ganzzahlige Werte (feste Skalen, E3/E5), kategorial = Indizes.
@@ -21253,6 +21623,10 @@ class HeatmapWidget(QWidget):
         self._image.setRect(QRectF(
             self._x_min, self._y_min,
             self._x_max - self._x_min, self._y_max - self._y_min))
+
+        # 21.01 (Bugfix-Runde 3, Entscheidung 2a): Senkrechte Teiler je
+        # Dateneinheit (TF-Bar-Intervall) an der X-Achse (date).
+        self._update_grid_lines()
 
         # 20.02.01 (E8): service_id-Achsen-Labels ueber den ViewModel-
         # Resolver ({Kategorie} / {Name}, `srv_`-Prefix entfaellt).
@@ -21297,9 +21671,10 @@ class HeatmapWidget(QWidget):
         self._apply_y_range()
         self._label_info.setText(f"{self._n_rows} x {self._n_cols}")
 
-        # Bugfix 1/2: Bei aktivem Overlay den Tages-Ohlc-Snapshot laden.
+        # Bugfix 1/2 + 21.01 Bugfix 5: Bei aktivem Overlay den OHLCV-
+        # Snapshot IM HEATMAP-TIMEFRAME laden (adaptiv fuer alle TFs).
         if self._chk_candle.isChecked() and self._view_model is not None:
-            self._view_model.request_daily_ohlc()
+            self._view_model.request_ohlcv_snapshot()
 
     @staticmethod
     def _axis_bounds(axis: List[float], dim: str):
@@ -21760,12 +22135,19 @@ class HeatmapWidget(QWidget):
         self._update_controls()
 
     def _render_overlay(self, data: Dict[str, Any]) -> None:
-        """Zeichnet Tages-Ohlc ueber die Heatmap (selbes Canvas, Bugfix 1).
+        """Zeichnet OHLCV-Bars ueber die Heatmap (selbes Canvas, Bugfix 1).
 
-        Die Candles liegen in der Preis-ViewBox. 10.08.2026 (Bugfix Runde 7,
-        Bug 1): 'Datum' darf auf der X- ODER Y-Achse liegen - X=date zeichnet
-        vertikale Candles (Preis auf der rechten Achse), Y=date horizontale
-        Candles (Preis auf der unteren Preis-Achse). Die Spalten der
+        21.01 (Bugfix 5, 11.08.2026): Das Overlay nutzt die Bars IM
+        HEATMAP-TIMEFRAME (OHLCV-Snapshot, adaptiv fuer alle TFs) statt der
+        festen Tages-Aggregation. Die Candle-Breite folgt dem Bar-Intervall
+        (_bar_interval_seconds). Bars werden ueber ihren Wanduhr-Tag
+        (Mitternachts-Epoch) dem Heatmap-Zeitraum zugeordnet und an ihrer
+        ECHTEN Bar-Zeit positioniert (H1-Kerzen liegen damit korrekt in der
+        jeweiligen Tageszelle).
+
+        Die Candles liegen in der Preis-ViewBox. 'Datum' liegt auf der
+        X-Achse (Y=date ist keine offizielle Overlay-Ansicht mehr, der
+        horizontale Zweig bleibt defensiv erhalten). Die Spalten der
         date-Achse sind Wanduhr-Mitternachts-Epochs. Alpha 0.3-0.5 (E9).
         """
         self._clear_overlay()
@@ -21779,7 +22161,10 @@ class HeatmapWidget(QWidget):
         date_axis = self._x_axis if date_on_x else self._y_axis
         if not bars or not date_axis:
             return
-        # Spalten-Index je Wanduhr-Tag (Mitternachts-Epoch).
+        # Spalten-Index je Wanduhr-Tag (Mitternachts-Epoch) - dient als
+        # Filter, dass die Bar im Heatmap-Zeitraum liegt. OHLCV-Bars tragen
+        # ihre ECHTE Bar-Zeit (z. B. H1 14:00) - der Wanduhr-Tag wird per
+        # UTC-Division auf Mitternacht zurueckgefuehrt (Bugfix 5).
         epoch_to_col = {int(round(e)): i for i, e in enumerate(date_axis)}
         candles: List[tuple] = []
         for b in bars:
@@ -21790,7 +22175,8 @@ class HeatmapWidget(QWidget):
                 t = int(t)
             except (TypeError, ValueError):
                 continue
-            col = epoch_to_col.get(t)
+            day = int(t // _DAY_SECONDS) * _DAY_SECONDS
+            col = epoch_to_col.get(day)
             if col is None:
                 continue  # Tag nicht in der Heatmap (Ausschnitt)
             try:
@@ -21816,35 +22202,61 @@ class HeatmapWidget(QWidget):
             self._price_vb.setYRange(pmin - pad, pmax + pad, padding=0)
         else:
             self._price_vb.setXRange(pmin - pad, pmax + pad, padding=0)
-        # Candles: x = Mitternachts-Epoch (X=date) bzw. y = Mitternachts-
-        # Epoch (Y=date), Breite/Hoehe in Tages-Sekunden.
-        for t, o, h, l, c in candles:
-            up = c >= o
-            color = pg.mkColor(0, 180, 0, 140) if up \
-                else pg.mkColor(220, 30, 30, 140)
-            if date_on_x:
-                # Vertikale Candles (Preis auf der rechten Achse).
-                wick = pg.BarGraphItem(
-                    x=[float(t)], width=_DAY_SECONDS * 0.12,
-                    y0=l, height=max(h - l, 1e-9), brush=color, pen=color)
-                body = pg.BarGraphItem(
-                    x=[float(t)], width=_DAY_SECONDS * 0.7,
-                    y0=min(o, c),
-                    height=max(max(o, c) - min(o, c), 1e-9),
-                    brush=color, pen=color)
-            else:
-                # Horizontale Candles (Preis auf der unteren Achse).
-                wick = pg.BarGraphItem(
-                    x0=l, width=max(h - l, 1e-9),
-                    y0=float(t) - _DAY_SECONDS * 0.06,
-                    height=_DAY_SECONDS * 0.12, brush=color, pen=color)
-                body = pg.BarGraphItem(
-                    x0=min(o, c), width=max(max(o, c) - min(o, c), 1e-9),
-                    y0=float(t) - _DAY_SECONDS * 0.35,
-                    height=_DAY_SECONDS * 0.7, brush=color, pen=color)
-            self._price_vb.addItem(wick)
-            self._price_vb.addItem(body)
-            self._candle_items.extend((wick, body))
+        # 21.01 (Bugfix 5): Candle-Breite/Hoehe folgt dem Bar-Intervall
+        # des Heatmap-TFs (z. B. 3600s bei H1, 86400s bei D1) statt fest
+        # einem Tag. x = echte Bar-Epoch (X=date) bzw. y = Bar-Epoch
+        # (Y=date, defensiver Zweig).
+        # 21.01 (Bugfix-Runde 3, Bug 1, 11.08.2026): NumPy-vektorisiertes
+        # Rendering - statt 2 Qt-Items JE BAR nur noch 3 batched Items
+        # (Wick + Bull-Koerper + Bear-Koerper) fuer ALLE Bars (vorher bei
+        # 5000 Bars = 10.000 Einzel-Items -> Pan/Zoom rueckelte). Die
+        # Daten werden als numpy-Arrays an BarGraphItem uebergeben.
+        bar_sec = self._bar_interval_seconds()
+        times = np.asarray([c[0] for c in candles], dtype=np.float64)
+        opens = np.asarray([c[1] for c in candles], dtype=np.float64)
+        highs = np.asarray([c[2] for c in candles], dtype=np.float64)
+        lows = np.asarray([c[3] for c in candles], dtype=np.float64)
+        closes = np.asarray([c[4] for c in candles], dtype=np.float64)
+        bull = closes >= opens
+        bear = ~bull
+        wick_color = pg.mkColor(128, 128, 128, 140)
+        bull_color = pg.mkColor(0, 180, 0, 140)
+        bear_color = pg.mkColor(220, 30, 30, 140)
+        if date_on_x:
+            # Vertikale Candles (Preis auf der rechten Achse).
+            wick = pg.BarGraphItem(
+                x=times, width=bar_sec * 0.12,
+                y0=lows, height=np.maximum(highs - lows, 1e-9),
+                brush=wick_color, pen=wick_color)
+            body_bull = pg.BarGraphItem(
+                x=times[bull], width=bar_sec * 0.7,
+                y0=opens[bull],
+                height=np.maximum(closes[bull] - opens[bull], 1e-9),
+                brush=bull_color, pen=bull_color)
+            body_bear = pg.BarGraphItem(
+                x=times[bear], width=bar_sec * 0.7,
+                y0=closes[bear],
+                height=np.maximum(opens[bear] - closes[bear], 1e-9),
+                brush=bear_color, pen=bear_color)
+        else:
+            # Horizontale Candles (Preis auf der unteren Achse, defensiv).
+            wick = pg.BarGraphItem(
+                x0=lows, width=np.maximum(highs - lows, 1e-9),
+                y=times, height=bar_sec * 0.12,
+                brush=wick_color, pen=wick_color)
+            body_bull = pg.BarGraphItem(
+                x0=opens[bull], width=np.maximum(
+                    closes[bull] - opens[bull], 1e-9),
+                y=times[bull], height=bar_sec * 0.7,
+                brush=bull_color, pen=bull_color)
+            body_bear = pg.BarGraphItem(
+                x0=closes[bear], width=np.maximum(
+                    opens[bear] - closes[bear], 1e-9),
+                y=times[bear], height=bar_sec * 0.7,
+                brush=bear_color, pen=bear_color)
+        self._candle_items = [wick, body_bull, body_bear]
+        for _item in self._candle_items:
+            self._price_vb.addItem(_item)
         self._price_vb.setVisible(True)
         if date_on_x:
             self._plot_hm.getAxis("right").setVisible(True)
@@ -21865,6 +22277,169 @@ class HeatmapWidget(QWidget):
         self._price_vb.setVisible(False)
         self._plot_hm.getAxis("right").setVisible(False)
         self._price_axis_bottom.setVisible(False)
+
+    # ------------------------------------------------------------------
+    # 21.01 Bugfix-Runde 3 (Entscheidung 2a): Senkrechte Teiler je
+    # Dateneinheit (Bar-Intervall des Timeframes) an der X-Achse (date)
+    # ------------------------------------------------------------------
+    def _update_grid_lines(self) -> None:
+        """Setzt die senkrechten Teiler je Dateneinheit (Bugfix 2a).
+
+        Nur bei X=date. Der Abstand ist das Bar-Intervall des Heatmap-TFs
+        (_bar_interval_seconds, z. B. H1 -> jede volle Stunde, D1 -> jede
+        Tagesgrenze). Die Positionen sind daten-konsistent (Epochs sind
+        Vielfache von 60s; Mitternachts-Epochs Vielfache von 86400s). Ein
+        Dichte-Cap (max ~2000 Linien) verhindert ueberladene Raster bei
+        sehr grossen Zeitraeumen (dann wird der Abstand skaliert).
+        """
+        x_dim = str(self._combo_x.currentData() or "date")
+        if x_dim != "date" or not self._x_axis:
+            self._grid_lines.setData([], [])
+            self._grid_lines.setVisible(False)
+            return
+        bar_sec = self._bar_interval_seconds()
+        lo = float(self._x_axis[0])
+        hi = float(self._x_axis[-1]) + _DAY_SECONDS
+        start = int(math.floor(lo / bar_sec)) * bar_sec
+        step = 1
+        max_lines = 2000
+        while int((hi - lo) / (bar_sec * step)) > max_lines:
+            step += 1
+        positions = np.arange(start, hi, bar_sec * step)
+        if positions.size == 0:
+            self._grid_lines.setData([], [])
+            self._grid_lines.setVisible(False)
+            return
+        y0, y1 = self._y_min, self._y_max
+        n = positions.size
+        xs = np.empty(n * 2, dtype=np.float64)
+        xs[0::2] = positions
+        xs[1::2] = positions
+        ys = np.empty(n * 2, dtype=np.float64)
+        ys[0::2] = y0
+        ys[1::2] = y1
+        self._grid_lines.setData(x=xs, y=ys, connect="pairs")
+        self._grid_lines.setVisible(True)
+
+    # ------------------------------------------------------------------
+    # 21.01 Bugfix 5: Adaptives Overlay (OHLCV im Heatmap-Timeframe)
+    # ------------------------------------------------------------------
+    def _bar_interval_seconds(self) -> float:
+        """Bar-Intervall des Heatmap-Timeframes in Sekunden (Bugfix 5).
+
+        Liest `params["timeframe"]` des ViewModels (z. B. 'H1' -> 3600) und
+        liefert einen Fallback (3600s), falls der TF unbekannt/leer ist.
+        """
+        tf = ""
+        if self._view_model is not None:
+            tf = str(self._view_model.params.get("timeframe") or "")
+        return float(_TF_SECONDS.get(tf.strip().upper(), 3600.0))
+
+    # ------------------------------------------------------------------
+    # 21.01 Bugfix 3: Fadenkreuz + Zellwert-Info
+    # ------------------------------------------------------------------
+    def _on_mouse_moved(self, pos) -> None:
+        """Bewegt das Fadenkreuz ueber die Heatmap (Bugfix 3).
+
+        `pos` ist ein QPointF in SCENE-Koordinaten (pyqtgraph
+        `sigMouseMoved`). Nur innerhalb des Plot-Viewports wird das Kreuz
+        gezeigt; sonst versteckt (Maus ueber den Steuerleisten).
+        """
+        if self._view_model is None:
+            return
+        vb = self._plot_hm.plotItem.vb
+        rect = vb.sceneBoundingRect()
+        if rect is None or not rect.contains(pos):
+            self._cross_x.setVisible(False)
+            self._cross_y.setVisible(False)
+            return
+        try:
+            p = vb.mapSceneToView(pos)
+        except Exception:
+            return
+        self._cross_x.setPos(p.x())
+        self._cross_y.setPos(p.y())
+        self._cross_x.setVisible(True)
+        self._cross_y.setVisible(True)
+        self._update_cell_info(p.x(), p.y())
+
+    def _update_cell_info(self, x: float, y: float) -> None:
+        """Zeigt genaue Datum/Zeit + Matrix-Wert am Fadenkreuz (Bug 4)."""
+        if self._n_rows <= 0 or self._n_cols <= 0:
+            return
+        img = getattr(self._image, "image", None)
+        if img is None or img.size == 0:
+            return
+        sx = (self._x_max - self._x_min) or 1.0
+        sy = (self._y_max - self._y_min) or 1.0
+        col = int((x - self._x_min) / sx * self._n_cols)
+        row = int((y - self._y_min) / sy * self._n_rows)
+        if not (0 <= col < self._n_cols and 0 <= row < self._n_rows):
+            return
+        try:
+            v = float(img[row, col])
+        except (TypeError, ValueError, IndexError):
+            return
+        # 21.01 (Bugfix-Runde 3, Bug 4): Genaue Datum/Zeit am Fadenkreuz
+        # (wie chart_win). Bei X=date wird die Cursor-Position als
+        # Wanduhr-Zeit formatiert; der Zellwert folgt danach.
+        time_txt = ""
+        if str(self._combo_x.currentData() or "date") == "date":
+            try:
+                dt = datetime.fromtimestamp(float(x), tz=dt_timezone.utc)
+                days = ("Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa.", "So.")
+                time_txt = (f"{days[dt.weekday()]} {dt.day:02d}."
+                            f"{dt.month:02d}.{dt.year % 100:02d} "
+                            f"{dt.hour:02d}:{dt.minute:02d}  ·  ")
+            except (TypeError, ValueError, OverflowError):
+                time_txt = ""
+        self._label_info.setText(f"{time_txt}Zelle({row},{col}) = {v:g}")
+
+    # ------------------------------------------------------------------
+    # 21.01 Bugfix 2: Diskrete Schwellwert-Legende (oben rechts)
+    # ------------------------------------------------------------------
+    def _update_legend(self) -> None:
+        """Befuellt die Schwellwert-Legende je Colormap/Levels.
+
+        Confluence (diskret): je ganzzahligem Treffer-Wert 0..5 ein Farbfeld
+        mit der AKTUELL daten-gebundenen Farbe (Levels 0..vmax), '5+' fuer
+        alles darueber. Wert-Aggregationen (viridis, kontinuierlich): 5
+        Stichproben min..max mit den tatsaechlichen Werten als Label.
+        """
+        cmap = (self._cmap_confluence
+                if self._colormap_mode == "confluence"
+                else self._cmap_viridis)
+        levels = getattr(self._image, "levels", None)
+        if levels is None or len(levels) != 2:
+            self._legend.hide()
+            return
+        vmin = float(levels[0])
+        vmax = float(levels[1])
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+        self._legend.clear()
+        if self._colormap_mode == "confluence":
+            max_count = max(1, int(math.ceil(vmax)))
+            for c in range(0, min(max_count, 5) + 1):
+                frac = (c - vmin) / (vmax - vmin)
+                frac = max(0.0, min(1.0, frac))
+                color = cmap.map(frac, mode="qcolor")
+                label = str(c) if c < 5 else "5+"
+                self._add_legend_swatch(color, label)
+        else:
+            for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+                val = vmin + frac * (vmax - vmin)
+                color = cmap.map(frac, mode="qcolor")
+                self._add_legend_swatch(color, f"{val:.2g}")
+        self._legend.show()
+
+    def _add_legend_swatch(self, color, label: str) -> None:
+        """Fuegt ein Farbfeld + Label zur Legende hinzu (Bugfix 2)."""
+        item = pg.PlotDataItem(
+            [0], [0], pen=None,
+            symbol="s", symbolSize=10,
+            symbolBrush=pg.mkColor(color), symbolPen=pg.mkPen(None))
+        self._legend.addItem(item, str(label))
 
 ```
 
@@ -43426,6 +44001,936 @@ for name, path, needle, second in checks:
 
 --------------------------------------------------
 
+### DATEI: test/_diag_cb2.py
+```py
+# test/_diag_cb2.py - ColorBarItem interne Werte + Achsen-Labels
+"""Bugfixing-Modus: Was zeigt der Farbbalken wirklich an?"""
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+from PySide6.QtWidgets import QApplication
+_app = QApplication.instance() or QApplication(sys.argv)
+
+from analytics.engine.feature_store_reader import FeatureStoreReader
+from analytics.engine.analytics_repository import AnalyticsRepository
+from analytics.ui.heatmap_widget import HeatmapWidget
+
+DB = r"F:\Python\PyTrader\data\analytics.duckdb"
+repo = AnalyticsRepository(FeatureStoreReader(DB))
+sym, tf = "SILVER", "M1"
+
+
+class FakeVM:
+    def __init__(self):
+        self.params = {
+            "symbol": sym, "timeframe": tf,
+            "feature_ids": [], "instance_hashes": [],
+            "heatmap_x_dim": "date", "heatmap_y_dim": "hour",
+            "heatmap_field": "", "heatmap_agg": "confluence_count",
+            "heatmap_all_timeframes": False,
+            "candle_projection_enabled": False,
+            "zoom_x_range": [0.0, 1.0], "zoom_y_range": [0.0, 1.0],
+        }
+
+    def data_ready(self, *a):
+        pass
+
+    def request_features(self):
+        pass
+
+    def request_heatmap_generic(self):
+        pass
+
+    def request_daily_ohlc(self):
+        pass
+
+    def resolve_service_label(self, pid):
+        return pid
+
+    def resolve_service_display_name(self, pid):
+        return pid
+
+
+vm = FakeVM()
+w = HeatmapWidget()
+w._view_model = vm
+w._field_keys = ["atr_normalized"]
+w._field_sources = {"atr_normalized": ["srv_proximity"]}
+
+presets = [
+    ("confluence", dict(x_dim="date", y_dim="service_id", field="", agg="confluence_count", atf=False)),
+    ("session", dict(x_dim="dow", y_dim="hour", field="", agg="confluence_count", atf=False)),
+    ("intensity", dict(x_dim="date", y_dim="hour", field="atr_normalized", agg="avg", atf=False)),
+    ("timeframe", dict(x_dim="timeframe", y_dim="service_id", field="", agg="count", atf=True)),
+]
+for name, p in presets:
+    data = repo.get_generic_heatmap(
+        sym, tf, x_dim=p["x_dim"], y_dim=p["y_dim"],
+        field=p["field"] or None, agg=p["agg"], all_timeframes=p["atf"])
+    w._render_generic(data)
+    cb = w._colorbar
+    vals = cb.levels() if callable(cb.levels) else cb.levels
+    img_levels = w._image.getLevels() if hasattr(w._image, "getLevels") else None
+    try:
+        ax_range = cb.axis.range
+    except Exception as e:
+        ax_range = f"ERR {e}"
+    try:
+        ticks = cb.axis.tickValues(cb.axis.range[0], cb.axis.range[1], 5)
+    except Exception as e:
+        ticks = f"ERR {e}"
+    print(f"{name}: cb.values={vals} img.getLevels={img_levels} ax_range={ax_range} ticks={ticks}")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_diag_colorbar.py
+```py
+# test/_diag_colorbar.py - Diagnose ColorBarItem-Levels nach Presets
+"""Bugfixing-Modus: Farbbalken-Levels + Stale-Combo-Theorie."""
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+from PySide6.QtWidgets import QApplication
+_app = QApplication.instance() or QApplication(sys.argv)
+
+import pyqtgraph as pg
+from analytics.engine.feature_store_reader import FeatureStoreReader
+from analytics.engine.analytics_repository import AnalyticsRepository
+from analytics.ui.heatmap_widget import HeatmapWidget
+
+DB = r"F:\Python\PyTrader\data\analytics.duckdb"
+repo = AnalyticsRepository(FeatureStoreReader(DB))
+sym, tf = "SILVER", "M1"
+
+
+class FakeVM:
+    def __init__(self):
+        self.params = {
+            "symbol": sym, "timeframe": tf,
+            "feature_ids": [], "instance_hashes": [],
+            "heatmap_x_dim": "date", "heatmap_y_dim": "hour",
+            "heatmap_field": "", "heatmap_agg": "confluence_count",
+            "heatmap_all_timeframes": False,
+            "candle_projection_enabled": False,
+            "zoom_x_range": [0.0, 1.0], "zoom_y_range": [0.0, 1.0],
+        }
+
+    def data_ready(self, *a):
+        pass
+
+    def request_features(self):
+        pass
+
+    def request_heatmap_generic(self):
+        pass
+
+    def request_daily_ohlc(self):
+        pass
+
+    def resolve_service_label(self, pid):
+        return pid
+
+    def resolve_service_display_name(self, pid):
+        return pid
+
+
+vm = FakeVM()
+w = HeatmapWidget()
+w._view_model = vm
+w._field_keys = ["atr_normalized"]
+w._field_sources = {"atr_normalized": ["srv_proximity"]}
+
+presets = [
+    ("confluence", dict(x_dim="date", y_dim="service_id", field="", agg="confluence_count", atf=False)),
+    ("session", dict(x_dim="dow", y_dim="hour", field="", agg="confluence_count", atf=False)),
+    ("intensity", dict(x_dim="date", y_dim="hour", field="atr_normalized", agg="avg", atf=False)),
+    ("timeframe", dict(x_dim="timeframe", y_dim="service_id", field="", agg="count", atf=True)),
+]
+for name, p in presets:
+    data = repo.get_generic_heatmap(
+        sym, tf, x_dim=p["x_dim"], y_dim=p["y_dim"],
+        field=p["field"] or None, agg=p["agg"], all_timeframes=p["atf"])
+    w._render_generic(data)
+    try:
+        cb_levels = w._colorbar.levels
+    except Exception as e:
+        cb_levels = f"ERR {e}"
+    print(f"{name}: colormap_mode={w._colormap_mode} colorbar_levels={cb_levels} "
+          f"image_levels={getattr(w._image, 'levels', '?')}")
+
+# Stale-Combo-Theorie pruefen: Was zeigt _combo_x/_combo_y nach Presets?
+vm2 = FakeVM()
+w2 = HeatmapWidget()
+w2._view_model = vm2
+print("\nStale-Combo-Check (Presets AENDERN die VM-Params, NICHT die Combos):")
+print("vorher: x=", w2._combo_x.currentData(), "y=", w2._combo_y.currentData(),
+      "agg=", w2._combo_agg.currentData())
+
+# Simuliere apply_smart_preset_confluence auf einem echten VM-artigen Objekt
+class RealLikeVM(FakeVM):
+    def apply_smart_preset_confluence(self):
+        self.params["heatmap_x_dim"] = "date"
+        self.params["heatmap_y_dim"] = "service_id"
+        self.params["heatmap_agg"] = "confluence_count"
+
+w2._view_model = RealLikeVM()
+w2._on_preset_confluence()
+print("nach confluence-preset: x=", w2._combo_x.currentData(), "y=", w2._combo_y.currentData(),
+      "agg=", w2._combo_agg.currentData(), "| VM: x=", w2._view_model.params["heatmap_x_dim"],
+      "y=", w2._view_model.params["heatmap_y_dim"])
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_diag_e2e.py
+```py
+# test/_diag_e2e.py - End-to-End: Preset-Button -> VM -> Worker -> Widget-Render
+"""Bugfixing-Modus: E2E-Diagnose Preset-/Aggregations-Aenderung."""
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QEventLoop, QTimer
+
+_app = QApplication.instance() or QApplication(sys.argv)
+
+from analytics.engine.feature_store_reader import FeatureStoreReader
+from analytics.engine.analytics_repository import AnalyticsRepository
+from analytics.engine.analytics_view_model import AnalyticsViewModel
+from analytics.ui.heatmap_widget import HeatmapWidget
+
+DB = r"F:\Python\PyTrader\data\analytics.duckdb"
+repo = AnalyticsRepository(FeatureStoreReader(DB))
+vm = AnalyticsViewModel(analytics_repo=repo)
+
+vm.set_symbol("SILVER")
+vm.set_timeframe("M1")
+vm.set_feature_ids(["srv_grid_lines", "srv_proximity", "srv_swing_momentum",
+                    "srv_swing_structure", "srv_trend_hma_pivot"])
+
+w = HeatmapWidget()
+w._view_model = vm
+vm.data_ready.connect(w._on_data_ready)
+w._sync_from_params()
+
+
+def pump(ms=800):
+    loop = QEventLoop()
+    QTimer.singleShot(ms, loop.quit)
+    loop.exec()
+    _app.processEvents()
+
+
+def snapshot(label):
+    import numpy as np
+    m = np.asarray(w._image.image) if w._image.image is not None else np.asarray([])
+    print(f"{label}: image shape={m.shape} x_axis[:2]={w._x_axis[:2]} y_axis[:2]={w._y_axis[:2]} "
+          f"axis_x={w._axis_x._dim} axis_y={w._axis_y._dim} agg_combo={w._combo_agg.currentData()} "
+          f"vm_cfg=({vm.params.get('heatmap_x_dim')},{vm.params.get('heatmap_y_dim')},{vm.params.get('heatmap_agg')})")
+
+
+# Initial (generic default: date x hour confluence)
+w.request_data()
+pump()
+snapshot("INIT")
+
+# Preset Session-Hotspots via Button
+w._btn_preset_session.click()
+pump()
+snapshot("AFTER session-preset")
+
+# Preset Signal-Confluence via Button
+w._btn_preset_confluence.click()
+pump()
+snapshot("AFTER confluence-preset")
+
+# Aggregation aendern: combo auf avg setzen (wie User)
+w._combo_agg.setCurrentIndex(w._combo_agg.findData("avg"))
+pump()
+snapshot("AFTER agg->avg")
+
+# agg zurueck auf confluence
+w._combo_agg.setCurrentIndex(w._combo_agg.findData("confluence_count"))
+pump()
+snapshot("AFTER agg->confluence_count")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_diag_overlay.py
+```py
+# test/_diag_overlay.py - Candle-Overlay Flow pruefen
+"""Bugfixing-Modus: Kerzen-Overlay Datenfluss."""
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QEventLoop, QTimer
+
+_app = QApplication.instance() or QApplication(sys.argv)
+
+from analytics.engine.feature_store_reader import FeatureStoreReader
+from analytics.engine.analytics_repository import AnalyticsRepository
+from analytics.ui.heatmap_widget import HeatmapWidget
+
+DB = r"F:\Python\PyTrader\data\analytics.duckdb"
+repo = AnalyticsRepository(FeatureStoreReader(DB))
+sym, tf = "SILVER", "M1"
+
+
+class FakeVM:
+    def __init__(self):
+        self.params = {
+            "symbol": sym, "timeframe": tf,
+            "feature_ids": [], "instance_hashes": [],
+            "heatmap_x_dim": "date", "heatmap_y_dim": "hour",
+            "heatmap_field": "", "heatmap_agg": "confluence_count",
+            "heatmap_all_timeframes": False,
+            "candle_projection_enabled": False,
+            "zoom_x_range": [0.0, 1.0], "zoom_y_range": [0.0, 1.0],
+        }
+        self.ohlc = None
+
+    def data_ready(self, *a):
+        pass
+
+    def request_features(self):
+        pass
+
+    def request_heatmap_generic(self):
+        pass
+
+    def request_daily_ohlc(self):
+        self.ohlc = repo.get_daily_ohlc(sym, tf)
+
+    def set_candle_projection(self, enabled):
+        self.params["candle_projection_enabled"] = bool(enabled)
+
+    def resolve_service_label(self, pid):
+        return pid
+
+    def resolve_service_display_name(self, pid):
+        return pid
+
+
+vm = FakeVM()
+w = HeatmapWidget()
+w._view_model = vm
+w._field_keys = ["atr_normalized"]
+w._field_sources = {"atr_normalized": ["srv_proximity"]}
+w._sync_from_params()
+
+print("checkbox enabled bei x=date,y=hour:", w._chk_candle.isEnabled())
+
+# Heatmap-Payload rendern (date x service_id oder date x hour)
+data = repo.get_generic_heatmap(sym, tf, x_dim="date", y_dim="hour",
+                                field=None, agg="confluence_count")
+w._render_generic(data)
+print("nach render: x_axis[:2]=", w._x_axis[:2], "x_min=", w._x_min, "x_max=", w._x_max)
+
+# Overlay an
+w._chk_candle.setChecked(True)
+print("checked:", w._chk_candle.isChecked(), "vm param:", vm.params["candle_projection_enabled"])
+print("price_vb sichtbar:", w._price_vb.isVisible())
+print("right axis sichtbar:", w._plot_hm.getAxis("right").isVisible())
+print("candle_items:", len(w._candle_items))
+print("ohlc bars:", len(vm.ohlc["bars"]) if vm.ohlc else "NONE")
+print("X-Link:", w._price_vb.linkedView(0) is not None)
+
+# y auf service_id umstellen -> checkbox muss enabled bleiben (x=date) und overlay weiter aktiv
+w._combo_y.setCurrentIndex(w._combo_y.findData("service_id"))
+print("nach y->service_id: checkbox enabled:", w._chk_candle.isEnabled(), "checked:", w._chk_candle.isChecked())
+
+# x auf dow umstellen -> checkbox muss DEAKTIVIERT werden
+w._combo_x.setCurrentIndex(w._combo_x.findData("dow"))
+print("nach x->dow: checkbox enabled:", w._chk_candle.isEnabled(), "checked:", w._chk_candle.isChecked())
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_diag_overlay_e2e.py
+```py
+# test/_diag_overlay_e2e.py - Overlay E2E mit echtem ViewModel
+"""Bugfixing-Modus: Kerzen-Overlay komplett durchspielen."""
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QEventLoop, QTimer
+
+_app = QApplication.instance() or QApplication(sys.argv)
+
+from analytics.engine.feature_store_reader import FeatureStoreReader
+from analytics.engine.analytics_repository import AnalyticsRepository
+from analytics.engine.analytics_view_model import AnalyticsViewModel
+from analytics.ui.heatmap_widget import HeatmapWidget
+
+DB = r"F:\Python\PyTrader\data\analytics.duckdb"
+repo = AnalyticsRepository(FeatureStoreReader(DB))
+vm = AnalyticsViewModel(analytics_repo=repo)
+vm.set_symbol("SILVER")
+vm.set_timeframe("M1")
+
+w = HeatmapWidget()
+w._view_model = vm
+vm.data_ready.connect(w._on_data_ready)
+w._sync_from_params()
+
+
+def pump(ms=900):
+    loop = QEventLoop()
+    QTimer.singleShot(ms, loop.quit)
+    loop.exec()
+    _app.processEvents()
+
+
+# Heatmap + Overlay laden
+w.request_data()
+pump()
+print("nach init: image shape=", w._image.image.shape if w._image.image is not None else "empty",
+      "candle_items=", len(w._candle_items))
+
+# Overlay aktivieren
+w._chk_candle.setChecked(True)
+pump()
+print("nach overlay an: checked=", w._chk_candle.isChecked(),
+      "candle_items=", len(w._candle_items),
+      "price_vb_visible=", w._price_vb.isVisible(),
+      "right_axis_visible=", w._plot_hm.getAxis("right").isVisible())
+
+# Neue Heatmap nach Overlay (render_generic sollte OHLC erneut anfordern)
+w._btn_preset_session.click()
+pump()
+print("nach session-preset (x=dow): candle_items=", len(w._candle_items),
+      "checked=", w._chk_candle.isChecked())
+
+# Zurueck zu date x hour fuer Overlay
+w._btn_preset_confluence.click()
+pump()
+print("nach confluence-preset (x=date,y=service_id): checked=", w._chk_candle.isChecked(),
+      "candle_items=", len(w._candle_items),
+      "price_vb_visible=", w._price_vb.isVisible(),
+      "right_axis_visible=", w._plot_hm.getAxis("right").isVisible())
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_diag_presets.py
+```py
+# test/_diag_presets.py - Diagnose der Preset-/Aggregations-Payloads
+"""Bugfixing-Modus: Diagnose der generischen Heatmap-Queries."""
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+from analytics.engine.feature_store_reader import FeatureStoreReader
+from analytics.engine.analytics_repository import AnalyticsRepository
+
+DB = r"F:\Python\PyTrader\data\analytics.duckdb"
+
+r = FeatureStoreReader(DB)
+repo = AnalyticsRepository(r)
+c = r._get_connection()
+try:
+    syms = c.execute("SELECT DISTINCT symbol FROM feature_store LIMIT 10").fetchall()
+    print("symbols:", [x[0] for x in syms])
+    tfs = c.execute("SELECT DISTINCT timeframe FROM feature_store LIMIT 30").fetchall()
+    print("tfs:", [x[0] for x in tfs])
+    fids = c.execute("SELECT DISTINCT feature_id FROM feature_store LIMIT 30").fetchall()
+    print("fids:", [x[0] for x in fids])
+    sym = "XAGUSD" if any(x[0] == "XAGUSD" for x in syms) else (syms[0][0] if syms else "SILVER")
+    tf = "M1"
+    try:
+        cnt = c.execute(
+            "SELECT COUNT(1) FROM feature_store WHERE LOWER(symbol)=LOWER(?) AND LOWER(timeframe)=LOWER(?)",
+            [sym, tf]).fetchone()[0]
+        print(f"count {sym}/{tf}: {cnt}")
+    except Exception as e:
+        print("count ERR", e)
+except Exception as e:
+    print("ERR", e)
+    sys.exit(1)
+
+# Presets auf dem realen Repo abfragen
+presets = [
+    ("confluence", dict(x_dim="date", y_dim="service_id", field="", agg="confluence_count", all_timeframes=False)),
+    ("session", dict(x_dim="dow", y_dim="hour", field="", agg="confluence_count", all_timeframes=False)),
+    ("intensity", dict(x_dim="date", y_dim="hour", field="", agg="avg", all_timeframes=False)),
+    ("timeframe", dict(x_dim="timeframe", y_dim="service_id", field="", agg="count", all_timeframes=True)),
+]
+for name, p in presets:
+    try:
+        res = repo.get_generic_heatmap(
+            sym, tf, x_dim=p["x_dim"], y_dim=p["y_dim"], field=p["field"] or None,
+            agg=p["agg"], all_timeframes=p["all_timeframes"])
+        import numpy as np
+        m = np.asarray(res.get("matrix") or [])
+        finite = m[np.isfinite(m)]
+        print(f"--- {name}: x_dim={res.get('x_dim')} y_dim={res.get('y_dim')} agg={res.get('agg')} field={res.get('field')} shape={m.shape} "
+              f"min={finite.min() if finite.size else 'NA'} max={finite.max() if finite.size else 'NA'} "
+              f"x_labels[:3]={res.get('x_labels')[:3]} y_labels[:3]={res.get('y_labels')[:3]}")
+    except Exception as e:
+        print(f"--- {name}: ERR {e}")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_diag_render.py
+```py
+# test/_diag_render.py - Widget rendern + Farben der Zellen pruefen
+"""Bugfixing-Modus: Pixel-Farben vs. Datenwerte verifizieren."""
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+import numpy as np
+from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QPixmap, QPainter
+from PySide6.QtCore import QRectF
+
+_app = QApplication.instance() or QApplication(sys.argv)
+
+import pyqtgraph as pg
+from analytics.engine.feature_store_reader import FeatureStoreReader
+from analytics.engine.analytics_repository import AnalyticsRepository
+from analytics.ui.heatmap_widget import HeatmapWidget
+
+DB = r"F:\Python\PyTrader\data\analytics.duckdb"
+repo = AnalyticsRepository(FeatureStoreReader(DB))
+sym, tf = "SILVER", "M1"
+
+
+class FakeVM:
+    def __init__(self):
+        self.params = {
+            "symbol": sym, "timeframe": tf,
+            "feature_ids": [], "instance_hashes": [],
+            "heatmap_x_dim": "date", "heatmap_y_dim": "hour",
+            "heatmap_field": "", "heatmap_agg": "confluence_count",
+            "heatmap_all_timeframes": False,
+            "candle_projection_enabled": False,
+            "zoom_x_range": [0.0, 1.0], "zoom_y_range": [0.0, 1.0],
+        }
+
+    def data_ready(self, *a):
+        pass
+
+    def request_features(self):
+        pass
+
+    def request_heatmap_generic(self):
+        pass
+
+    def request_daily_ohlc(self):
+        pass
+
+    def resolve_service_label(self, pid):
+        return pid
+
+    def resolve_service_display_name(self, pid):
+        return pid
+
+
+vm = FakeVM()
+w = HeatmapWidget()
+w._view_model = vm
+w._field_keys = ["atr_normalized"]
+w._field_sources = {"atr_normalized": ["srv_proximity"]}
+w.resize(900, 600)
+w.show()
+_app.processEvents()
+
+data = repo.get_generic_heatmap(
+    sym, tf, x_dim="dow", y_dim="hour", field=None, agg="confluence_count",
+    all_timeframes=False)
+w._render_generic(data)
+_app.processEvents()
+
+pm = w.grab()
+img = pm.toImage()
+print("image size:", img.width(), "x", img.height())
+
+# Bild-Koordinaten des ImageItem-Bereichs bestimmen
+vb = w._plot_hm.plotItem.vb
+rect = vb.sceneBoundingRect()
+print("scene rect:", rect)
+
+# Mapping: Daten (x,y) -> Bild-Pixel. x: dow 1..6, y: hour 0..24
+def data_to_pixel(xval, yval):
+    sx = w._x_min + (xval - w._x_min) / (w._x_max - w._x_min) * (w._x_max - w._x_min)
+    # view -> scene
+    p = vb.mapFromViewToScene(pg.QtCore.QPointF(xval, yval))
+    return int(p.x() - rect.x()), int(p.y() - rect.y())
+
+m = np.asarray(data["matrix"])
+print("matrix[0,0]=", m[0, 0], "matrix[23,4]=", m[23, 4])
+# Werte der Matrix ausgeben, um die Farben zu pruefen
+vals = sorted(set(m[np.isfinite(m)].tolist()))
+print("unique values:", vals)
+# pixelfarbe an zwei Zellen
+for (y, x) in [(0, 0), (23, 4), (12, 2)]:
+    px, py = data_to_pixel(float(x + 1), float(y))
+    # Map scene point to image coords
+    sx = float(x + 1)
+    sy = float(y)
+    sc = vb.mapFromViewToScene(pg.QtCore.QPointF(sx, sy))
+    ixx = int(sc.x()) - int(rect.x())
+    iyy = int(sc.y()) - int(rect.y())
+    if 0 <= ixx < img.width() and 0 <= iyy < img.height():
+        col = img.pixelColor(ixx, iyy)
+        print(f"cell y={y} x={x} val={m[y, x]} pixel=({ixx},{iyy}) color=({col.red()},{col.green()},{col.blue()},{col.alpha()})")
+    else:
+        print(f"cell y={y} x={x} val={m[y, x]} pixel OOB ({ixx},{iyy})")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_diag_std_cb.py
+```py
+# test/_diag_std_cb.py - Standard-Modus Farbbalken
+"""Bugfixing-Modus: Standard-Modus (Dow x Stunde) Farbbalken-Check."""
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+from PySide6.QtWidgets import QApplication
+_app = QApplication.instance() or QApplication(sys.argv)
+
+import numpy as np
+from analytics.ui.heatmap_page import HeatmapPage
+
+page = HeatmapPage()
+# 24x7 Matrix mit echten Werten
+m = np.zeros((24, 7), dtype=float)
+for h in range(24):
+    for d in range(7):
+        m[h][d] = (h * 7 + d) % 30
+page._render(m)
+cb = page._colorbar
+print("std: cb.values=", cb.levels())
+print("std: img.getLevels=", page._image.getLevels())
+try:
+    print("std: ax_range=", cb.axis.range)
+except Exception as e:
+    print("ax_range ERR", e)
+# Leere Matrix
+page._render(np.full((24, 7), float("nan")))
+print("empty: cb.values=", cb.levels())
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_diag_widget.py
+```py
+# test/_diag_widget.py - Diagnose: rendert das HeatmapWidget Presets korrekt?
+"""Bugfixing-Modus: Headless-Render-Test des HeatmapWidget fuer die Presets."""
+import os
+import sys
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+from PySide6.QtWidgets import QApplication
+_app = QApplication.instance() or QApplication(sys.argv)
+
+from analytics.engine.feature_store_reader import FeatureStoreReader
+from analytics.engine.analytics_repository import AnalyticsRepository
+from analytics.ui.heatmap_widget import HeatmapWidget
+
+DB = r"F:\Python\PyTrader\data\analytics.duckdb"
+repo = AnalyticsRepository(FeatureStoreReader(DB))
+sym, tf = "SILVER", "M1"
+
+
+class FakeVM:
+    """Minimal-VM: spiegelt params + liefert die Preset-Methoden."""
+    def __init__(self, repo):
+        self._repo = repo
+        self.params = {
+            "symbol": sym, "timeframe": tf,
+            "feature_ids": [], "instance_hashes": [],
+            "heatmap_x_dim": "date", "heatmap_y_dim": "hour",
+            "heatmap_field": "", "heatmap_agg": "confluence_count",
+            "heatmap_all_timeframes": False,
+            "candle_projection_enabled": False,
+            "zoom_x_range": [0.0, 1.0], "zoom_y_range": [0.0, 1.0],
+            "limit": 5000,
+        }
+        self.calls = []
+
+    def data_ready(self, *a):
+        pass
+
+    def request_features(self):
+        pass
+
+    def request_heatmap_generic(self):
+        self.calls.append("hm")
+
+    def request_daily_ohlc(self):
+        pass
+
+    def set_heatmap_config(self, x_dim, y_dim, field, agg):
+        self.params["heatmap_x_dim"] = x_dim
+        self.params["heatmap_y_dim"] = y_dim
+        self.params["heatmap_field"] = field
+        self.params["heatmap_agg"] = agg
+        self.calls.append(("cfg", x_dim, y_dim, agg))
+
+    def apply_smart_preset_confluence(self):
+        self.set_heatmap_config("date", "service_id", "", "confluence_count")
+
+    def apply_smart_preset_session(self):
+        self.set_heatmap_config("dow", "hour", "", "confluence_count")
+
+    def apply_smart_preset_intensity(self):
+        self.set_heatmap_config("date", "hour", "atr_normalized", "avg")
+
+    def apply_smart_preset_timeframe(self):
+        self.params["heatmap_all_timeframes"] = True
+        self.set_heatmap_config("timeframe", "service_id", "", "count")
+
+    def resolve_service_label(self, pid):
+        return pid
+
+    def resolve_service_display_name(self, pid):
+        return pid
+
+    def _on_preset_payload(self):
+        pass
+
+
+vm = FakeVM(repo)
+w = HeatmapWidget()
+w._view_model = vm
+w._sync_from_params()
+
+# Verfuegbare Felder / field_sources simulieren (fuer intensity)
+w._field_keys = ["atr_normalized"]
+w._field_sources = {"atr_normalized": ["srv_proximity"]}
+
+# Jetzt die 4 Presets durchspielen: config setzen, Payload holen, rendern
+presets = [
+    ("confluence", dict(x_dim="date", y_dim="service_id", field="", agg="confluence_count", atf=False)),
+    ("session", dict(x_dim="dow", y_dim="hour", field="", agg="confluence_count", atf=False)),
+    ("intensity", dict(x_dim="date", y_dim="hour", field="atr_normalized", agg="avg", atf=False)),
+    ("timeframe", dict(x_dim="timeframe", y_dim="service_id", field="", agg="count", atf=True)),
+]
+for name, p in presets:
+    try:
+        vm.set_heatmap_config(p["x_dim"], p["y_dim"], p["field"], p["agg"])
+        if p["atf"]:
+            vm.params["heatmap_all_timeframes"] = True
+        data = repo.get_generic_heatmap(
+            sym, tf, x_dim=p["x_dim"], y_dim=p["y_dim"],
+            field=p["field"] or None, agg=p["agg"],
+            all_timeframes=p["atf"])
+        w._render_generic(data)
+        import numpy as np
+        m = np.asarray(w._image.image) if w._image.image is not None else np.asarray([])
+        print(f"OK   {name}: image shape={m.shape} x_axis[:2]={w._x_axis[:2]} y_axis[:2]={w._y_axis[:2]} "
+              f"x_min={w._x_min} x_max={w._x_max} y_min={w._y_min} y_max={w._y_max} "
+              f"axis_x_dim={w._axis_x._dim} axis_y_dim={w._axis_y._dim} "
+              f"plot_label={w._plot_hm.getAxis('bottom').labelText}")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"ERR  {name}: {e}")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_doc_update_2101.py
+```py
+# -*- coding: utf-8 -*-
+"""Doku-Update 21.01 - Analyse der Heatmap-Kritik + Entscheidungen E7-E10.
+Wird per Python geschrieben (UTF-8, CRLF erhalten wie Bestandsdatei).
+"""
+import io
+import sys
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+p = r"F:\Python\PyTrader\docs\AKTUELLE_UMSETZUNG.md"
+raw = open(p, "rb").read()
+assert raw.count(b"\r\n") == raw.count(b"\n"), "unexpected LF"
+text = raw.decode("utf-8")
+
+# --- Sektion 5: Entscheidungen E7-E10 ergaenzen ----------------------------
+old_e5 = "| **E6** | Icons 1:1 übernehmen: `[➕ Neu]`, `[💾 Speichern]`, `[🗑️ Löschen]`, `[⚡ Signal-Confluence]`, `[🕒 Session-Hotspots]`, `[📏 Wert-Intensität]`, `[📊 Service-Timeframe]`. |"
+assert old_e5 in text, "E6-Zeile nicht gefunden"
+new_e5 = old_e5 + "\r\n" + "\r\n".join([
+    "| **E7** | User-Anweisung (11.08.2026): Die **4 Preset-Buttons im `HeatmapWidget` werden ENTFERNT** – die Smart-Presets sind ab jetzt ausschließlich über das „Ansicht“-Dropdown der `HeatmapPage` erreichbar (`preset_confluence`/`preset_session`/`preset_intensity`/`preset_timeframe`). Die zugehörigen Handler `_on_preset_*` und die `preset_clicked`-Emit-Aufrufe im Widget entfallen; das Signal selbst darf bleiben (wird aber von der Page nicht mehr konsumiert). |",
+    "| **E8** | Screenshot-Analyse (Kritik-Punkt 1, empirisch bestätigt): pyqtgraph `ImageItem` rendert mit Default `axisOrder='col-major'` die `(rows=Services, cols=Zeiten)`-Matrix **transponiert** (Beweis: `width()==2, height()==3` bei einer 2×3-Matrix → Services in X, Zeiten als N dünne Y-Streifen). Fix: `self._image.setOpts(axisOrder='row-major')` im `HeatmapWidget`. |",
+    "| **E9** | Kritik-Punkt 2 („X-Achse homogen“): **kein SQL-Fehler** – `DIM_MAPPINGS[\"date\"] = \"CAST(bar_time AT TIME ZONE 'UTC' AS DATE)\"` (1 Spalte/Tag) ist Design E4. Die Homogenität ist Folge der Transposition E8 (ein Service quer gestreckt). Der Kritik-Vorschlag (volle `bar_time`-Granularität) ist **verworfen** (Pivot-Explosion: zehntausende Spalten bei M1, Pivot-Deckel greift, Achse unlesbar). Eine feinere Zeitauflösung wäre eine separate Design-Entscheidung. |",
+    "| **E10** | Kritik-Punkt 3 („Farbe = Y-Position“): **visuelle Täuschung durch E8, kein Code-Bug** – die Farben sind daten-gebunden (Levels `(vmin, vmax)` seit Meldung-7-Fix). Optionale Verbesserung (kein Pflicht-Fix): Confluence-LUT feiner stufen (pro Trefferzahl) für bessere Unterscheidung bei 0..3 Werten. |",
+])
+text = text.replace(old_e5, new_e5, 1)
+
+# --- Sektion 6: Implementierungs-Log ergaenzen ------------------------------
+old_log = "* **11.08.2026 – 21.01 Umsetzung (Coding, E1–E6):** Alle 7 Dateien umgesetzt und per `test/test.py` verifiziert (Sektion 39, 31 Checks AK1–AK7/Presets/Namensgenerator/Widget/Page – alle PASS; keine neuen Fehler gegenüber der 25er-Baseline aus Teil 1/25/32/35/36/37/20.03). Änderungen: `feature_store_reader.py` (`fetch_generic_heatmap` + `all_timeframes`, Guard ohne TF-Freigabe), `analytics_repository.py` / `analytics_worker.py` (Parameter-Durchreichung, QUERY ohne `LOWER(timeframe)=` bei `all_timeframes=True`), `analytics_view_model.py` (`heatmap_all_timeframes`, `apply_smart_preset_*`, `generate_profile_name_suggestion()` deutsch inkl. Fallbacks `(Alle Services)`/`ALLE`, Persistenz unter `charts.heatmap.all_timeframes`), `heatmap_widget.py` (Signal `preset_clicked` + 4 Preset-Buttons in `ctrl`), `heatmap_page.py` (generischer Modus als Standard-Ansicht), `analytics_win.py` (Header-Redesign E5: `combo_profile` dehnbar/editierbar, Namens-/Beschreibungs-Felder in separatem Speicher-Dialog, `_resolve_save_name`-Helfer gegen '?'-Verlust, Auto-Name im Neu-Dialog). Test 35 Z2b/Z2c an E5-Kontrakt angepasst (kein Header-Namensfeld mehr; `_resolve_save_name` direkt getestet)."
+assert old_log in text, "Log-Eintrag 21.01 nicht gefunden"
+new_log = old_log + "\r\n\r\n" + "\r\n".join([
+    "* **11.08.2026 – Bugfix-Runde 21.01 User-Meldungen 1–7 (Coding, Commit `28249a2`):** Meldung 1 (Profil-Neu-Dialog breit, QDialog min. 560 px, `combo_profile` min. 560 px), Meldung 2 (Ansicht-Dropdown = Generisch + 4 Presets, „Wochentag × Stunde“ entfernt, Legacy-`standard`→`generic`-Mapping), Meldung 3 (Bedien-Controls bleiben bei jedem Preset-Wechsel sichtbar, Stack immer Seite 1, `_apply_selected_preset()`), Meldung 4/6 (Stale-Combo-Fix: Preset-Handler synchronisieren Combos via `_sync_from_params()`/`_update_controls()`), Meldung 5 (Kerzen-Overlay nur bei X=date, Restore-Guard `heatmap_x_dim == \"date\"`), Meldung 7 (Confluence-Levels daten-gebunden `(vmin, vmax)` statt fest `(0, 5)`). Verifikation: `test/check_heatmap_2101.py` (10/10 OK, headless). **Noch nicht vom Anwender als funktionierend bestätigt** – die Screenshot-Kritik (E7–E10) schließt direkt an.",
+    "* **11.08.2026 – Heatmap-Darstellung Screenshot-Kritik (Analyse, KEIN Coding):** Anweisung des Anwenders: „Bugfixing – 4 Preset-Buttons entfernen (jetzt im Dropdown) / Kritik prüfen + Fix erstellen / erst Meinung + Doku, dann warten auf Befehl“. Analyse-Ergebnisse: **(1)** Y-Streifen = reale Transposition (`axisOrder='col-major'`, empirisch via `test/check_orientation_2101.py`: `width()==2/height()==3` bei 2×3-Matrix) → Fix E8 `axisOrder='row-major'`. **(2)** Homogene X-Achse = Symptom der Transposition, kein SQL-Fehler (E9). **(3)** „Farbe = Y-Position“ = visuelle Täuschung, Farben daten-gebunden (E10). **Geplante Fixes (Codierung wartet auf ausdrücklichen Befehl):** E7 Buttons entfernen (`_btn_preset_*` + Handler + Emits), E8 `axisOrder='row-major'`, Anpassung `test/test.py` Sektion 39 (j1/j2-Button-Checks entfernen, Orientierungs-Check ergänzen) + `test/check_heatmap_2101.py`. Offener Verifikationspunkt beim Fix: Tick-Label-Position der kategorialen Y-Achse (Services) vs. Zeilen-Mitte nach row-major.",
+])
+text = text.replace(old_log, new_log, 1)
+
+open(p, "w", encoding="utf-8", newline="").write(text)
+print("Doku-Update OK")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_fix_quote.py
+```py
+# -*- coding: utf-8 -*-
+"""Korrigiert das Quoting in _doc_update_2101.py (ASCII-" -> typografisch)."""
+import io
+import sys
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+p = r"F:\Python\PyTrader\test\_doc_update_2101.py"
+s = open(p, encoding="utf-8").read()
+
+# Der Fehler: `„Ansicht"-Dropdown` - ASCII-Double-Quote beendet den String.
+old = "\u201eAnsicht\"-Dropdown"
+new = "\u201eAnsicht\u201c-DDropdown"  # Platzhalter, wird gleich korrigiert
+# sauber: ASCII-" -> U+201C (schliessende deutsche Anfuehrung)
+s = s.replace("Ansicht\"-Dropdown", "Ansicht\u201c-DDropdown")
+s = s.replace("-DDropdown", "-Dropdown")
+
+open(p, "w", encoding="utf-8").write(s)
+
+import ast
+
+try:
+    ast.parse(s)
+    print("SYNTAX OK")
+except SyntaxError as e:
+    print("SYNTAX ERROR:", e)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_fix_quote2.py
+```py
+# -*- coding: utf-8 -*-
+"""Korrigiert verbleibende ASCII-Quote in _doc_update_2101.py."""
+import io
+import sys
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+p = r"F:\Python\PyTrader\test\_doc_update_2101.py"
+s = open(p, encoding="utf-8").read()
+
+repl = [
+    ("homogen\"):", "homogen\u201c):"),
+    ("Y-Position\"):", "Y-Position\u201c):"),
+    ("Stunde\" entfernt", "Stunde\u201c entfernt"),
+    ("Befehl\". Analyse-Ergebnisse", "Befehl\u201c. Analyse-Ergebnisse"),
+    ("Y-Position\" = visuelle", "Y-Position\u201c = visuelle"),
+    ("Befehl\". Codierung", "Befehl\u201c. Codierung"),
+]
+for old, new in repl:
+    if old in s:
+        s = s.replace(old, new, 1)
+        print("OK:", old[:40])
+    else:
+        print("NICHT GEFUNDEN:", old[:40])
+
+open(p, "w", encoding="utf-8").write(s)
+
+import ast
+
+try:
+    ast.parse(s)
+    print("SYNTAX OK")
+except SyntaxError as e:
+    print("SYNTAX ERROR:", e)
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/_fix_ws1.py
 ```py
 """Temporärer Helfer (wird nach Ausführung gelöscht): Root-Cause-Fix für das
@@ -43689,6 +45194,5975 @@ else:
 with open(p, "w", encoding="utf-8", newline="") as f:
     f.write(s)
 print("check_ui3 aktualisiert:", changed)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_t39_nos39.py
+```py
+# test/test.py
+"""
+Bugfixing-Modus: Isolierter Backend-Check fuer
+  1) Persistenz der FensterPOSITION (restore -> Reflow ueberschreibt nicht)
+     + Fenstergroesse folgt exakt dem Inhalt (_exact_fit_to_content, auch
+     schrumpfend; NUR die Position wird persistiert, 05.08.2026)
+  2) MasterTree-Klick-Sturm (Access-Violation-Kandidat)
+  3) Fenster-Historie: ServiceWindow hält die Position auch bei MANUELLEM
+     Schliessen (_keep_history_on_close=True); auto_restore=True stellt das
+     Fenster beim App-Start wieder her (Save & Restore wie die anderen
+     PersistentWindow-Fenster – Bugfix 05.08.2026).
+  4) Chart-Circles: FixedGridProximityIndicator liefert hit_circles wieder
+     (Pipeline-Fallback, wenn der feature_store leer ist).
+
+KEINE GUI-Ausfuehrung (kein exec_ im Produktivpfad).
+"""
+import os
+import sys
+import tempfile
+
+sys.path.insert(0, r"F:\Python\PyTrader")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+# UTF-8-Konsole erzwingen (wie main.py): unter Windows cp1252 wuerde die
+# Ausgabe bei Unicode-Zeichen (z.B. 'ℹ', '✏️') mit UnicodeEncodeError brechen.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtCore import QEventLoop, QTimer  # noqa: E402
+
+_app = QApplication.instance() or QApplication(sys.argv)
+
+from state_manager import StateManager  # noqa: E402
+from analytics.engine.service_set_repository import ServiceSetRepository  # noqa: E402
+from serviceui.service_win import ServiceWindow  # noqa: E402
+from persistent_win import PersistentWindow, register_persistent_window  # noqa: E402
+
+FAILURES = []
+
+
+def check(name, cond, detail=""):
+    s = "PASS" if cond else "FAIL"
+    print(f"[{s}] {name}" + (f" - {detail}" if detail and not cond else ""))
+    if not cond:
+        FAILURES.append(name)
+
+
+def pump():
+    _app.processEvents()
+    # WICHTIG: QEventLoop statt QApplication.quit() – quit() setzt intern
+    # den Quit-Flag und versteckt auf dem offscreen-Platform-Fenster alle
+    # Top-Level-Widgets (isVisible() -> False). Das QEventLoop-Muster lässt
+    # die Fenster sichtbar und verhält sich wie die echte GUI.
+    loop = QEventLoop()
+    QTimer.singleShot(0, loop.quit)
+    loop.exec()
+    _app.processEvents()
+
+
+tmp = tempfile.mkdtemp(prefix="bf_")
+db_app = os.path.join(tmp, "app_data.duckdb")
+db_set = os.path.join(tmp, "sets.duckdb")
+
+sm = StateManager(db_path=db_app)
+repo = ServiceSetRepository(db_path=db_set)
+
+# --- Isolation gegen die laufende App ---------------------------------------
+# Die echten DBs (data/app_data.duckdb usw.) sind durch die offene
+# PyTrader-Instanz gesperrt (DuckDB: Single-Writer). Daher werden ALLE
+# Repository-/StateManager-Zugriffe der Fenster auf die Test-DBs umgeleitet.
+# WICHTIG: Die __init__-Methoden werden direkt gepatcht (nicht Modul-Attribute),
+# weil z. B. ServiceSelectorModel.__init__ die Klassen per In-Funktion-Import
+# neu bindet und Modul-Patches sonst ueberschrieben wuerden.
+import symbol_repository as _symrepo  # noqa: E402
+_symrepo.get_symbol_repository = lambda: _symrepo.SymbolRepository(db_path=db_app)
+import serviceui.service_win as _sw  # noqa: E402
+_sw.get_symbol_repository = _symrepo.get_symbol_repository
+
+import analytics.engine.service_set_repository as _ssr_mod  # noqa: E402
+_orig_ssr_init = _ssr_mod.ServiceSetRepository.__init__
+def _patched_ssr_init(self, db_path=None, *a, **kw):
+    _orig_ssr_init(self, db_path or db_set, *a, **kw)
+_ssr_mod.ServiceSetRepository.__init__ = _patched_ssr_init
+
+import state_manager as _sm_mod  # noqa: E402
+_orig_sm_init = _sm_mod.StateManager.__init__
+def _patched_sm_init(self, db_path=None, *a, **kw):
+    _orig_sm_init(self, db_path or db_app, *a, **kw)
+_sm_mod.StateManager.__init__ = _patched_sm_init
+
+repo.save_set({
+    "set_id": "set_1",
+    "display_name": "Drei Services",
+    "execution_order": ["grid_1", "prox_1", "grid_2"],
+    "services": {
+        "grid_1": {"plugin_id": "srv_grid_lines", "lookback": 1000, "params": {"step_size": 0.5}},
+        "prox_1": {"plugin_id": "srv_proximity", "lookback": 500, "params": {"prox_level1": 1.0}},
+        "grid_2": {"plugin_id": "srv_grid_lines", "lookback": 2000, "params": {"step_size": 0.25}},
+    },
+})
+
+# ---------------------------------------------------------------------------
+# Teil 1: Persistenz – die FensterPOSITION wird wiederhergestellt; die
+#         FensterGROESSE folgt exakt dem Inhalt (nicht der DB-Groesse).
+# ---------------------------------------------------------------------------
+print("\n=== Teil 1: Position-Persistenz & Exact-Fit ===")
+sm.save_window_geometry("win_service", 150, 120, 640, 400, False)
+sm.save_instance_state("win_service", "SILVER", "H1")
+
+
+class _Parent:
+    state_manager = sm
+
+
+w = ServiceWindow(parent=_Parent(), service_set_repo=repo)
+# ServiceSelector nutzt das GLEICHE Test-Repo (sonst echte app_data.duckdb)
+w.service_selector.model.set_repo = repo
+w.service_selector.model.refresh()
+w.show()
+pump()
+pump()
+screen = _app.primaryScreen().availableGeometry()
+print(f"   Screen offscreen: {screen.width()}x{screen.height()}")
+pos = w.pos()
+size = w.size()
+print(f"   nach Restore+Reflow: pos=({pos.x()},{pos.y()}) size={size.width()}x{size.height()}")
+check("P1) Position wiederhergestellt (150,120)", pos.x() == 150 and pos.y() == 120,
+      f"({pos.x()},{pos.y()})")
+check("P2) Groesse folgt dem Inhalt, NICHT der DB-Groesse 640x400",
+      (size.width(), size.height()) != (640, 400)
+      and size.width() >= 1300, f"{size.width()}x{size.height()}")
+
+# Exact-Fit (05.08.2026): Inhalt-Aenderung setzt das Fenster exakt auf den
+# Inhalt – auch SCHRUMPFEND (Punkt 3+4: rechts = Box-Rand, unten = Log).
+w.resize(w.width(), 900)   # User zieht groesser
+pump()
+pump()
+print(f"   nach User-Resize 900: size={w.width()}x{w.height()}")
+check("P3) Exact-Fit: Reflow setzt Fenster zurueck auf Inhaltsgroesse",
+      w.height() < 900, f"{w.height()}")
+
+w.move(200, 180)
+w.save_state()
+geom = sm.get_window_geometry("win_service")
+print(f"   nach save_state: {geom}")
+check("P4) save_state speichert User-Position (200,180)",
+      geom and geom["pos_x"] == 200 and geom["pos_y"] == 180, str(geom))
+check("P5) save_state speichert die Position (Groesse ist nur Beiwerk)",
+      geom is not None and geom["width"] >= 1000, str(geom))
+
+# ---------------------------------------------------------------------------
+# Teil 2: Klick-Sturm auf Services (MasterTree -> _on_master_selection ->
+#         load_set_into_editor -> _clear_service_columns -> deleteLater).
+# ---------------------------------------------------------------------------
+print("\n=== Teil 2: Klick-Sturm ===")
+mt = w.service_selector.master_tree
+set_group = mt.topLevelItem(0)
+svc_count = set_group.child(0).childCount() if set_group and set_group.childCount() else 0
+print(f"   Set-Knoten: {svc_count} Services")
+crash = None
+for i in range(40):
+    try:
+        svc = set_group.child(0).child(i % max(svc_count, 1))
+        mt.setCurrentItem(svc)
+        pump()
+        if hasattr(w, "_on_master_selection"):
+            sel = mt.current_selection()
+            w._on_master_selection(sel["set_id"], sel["service_id"])
+            pump()
+    except Exception as e:  # noqa: BLE001
+        crash = f"{type(e).__name__}: {e}"
+        break
+check("K1) 40 schnelle Service-Klicks ohne Absturz", crash is None, crash)
+check("K2) Fenster noch lebendig", w.isVisible(), "")
+
+# ---------------------------------------------------------------------------
+# Teil 3: Fenster-Historie – ServiceWindow haelt die Position auch bei
+#         MANUELLEM Schliessen (Punkt 1: _keep_history_on_close=True);
+#         auto_restore=True (Bugfix 05.08.2026): War das Fenster beim
+#         Beenden offen, wird es beim App-Start wiederhergestellt.
+# ---------------------------------------------------------------------------
+print("\n=== Teil 3: Fenster-Historie ===")
+check("H1) auto_restore aktiv (Registry)",
+      PersistentWindow.get_registered_class("win_service") is ServiceWindow,
+      str(PersistentWindow.get_registered_class("win_service")))
+check("H2) should_auto_restore('win_service') == True (Auto-Restore beim Start)",
+      PersistentWindow.should_auto_restore("win_service") is True)
+check("H3) _keep_history_on_close == False (Historie intakt seit Runde 17)",
+      getattr(ServiceWindow, "_keep_history_on_close", True) is False)
+
+# Geometrie liegt in der DB (P4/P5). Fenster MANUELL schliessen (nicht
+# App-Ende) -> Eintrag wird ENTFERNT (Runde 17: _keep_history_on_close=False)
+# -> beim naechsten App-Start wird das Fenster NICHT wiederhergestellt.
+# Die Position ueberlebt via global_settings (DIALOG_GEOMETRY_KEY).
+w.close()
+pump()
+geom_after_close = sm.get_window_geometry("win_service")
+check("H4) Geometrie-Eintrag nach close() ENTFERNT (kein Restore beim Start)",
+      geom_after_close is None, str(geom_after_close))
+inst_after_close = [i for i in sm.load_all_instances() if i.get("instance_id") == "win_service"]
+check("H5) Instanz-Eintrag nach close() ENTFERNT (Historie intakt)",
+      len(inst_after_close) == 0, str(inst_after_close))
+dg_after_close = sm.get_dialog_geometry("win_service")
+check("H5b) Positions-Fallback in global_settings ueberlebt (200,180)",
+      dg_after_close is not None
+      and dg_after_close["pos_x"] == 200 and dg_after_close["pos_y"] == 180,
+      str(dg_after_close))
+
+# "Neustart-Simulation": Position (333,222) wird wiederhergestellt; die
+# Groesse folgt dem Inhalt (NICHT der DB-Groesse 900x600).
+sm.save_window_geometry("win_service", 333, 222, 900, 600, False)
+sm.save_instance_state("win_service", "SILVER", "H1")
+w2 = ServiceWindow(parent=_Parent(), service_set_repo=repo)
+w2.service_selector.model.set_repo = repo
+w2.service_selector.model.refresh()
+w2.show()
+pump()
+pump()
+pos2 = w2.pos()
+size2 = w2.size()
+print(f"   nach Restore: pos=({pos2.x()},{pos2.y()}) size={size2.width()}x{size2.height()}")
+check("H6) Position nach Neustart-Simulation (333,222)",
+      pos2.x() == 333 and pos2.y() == 222, f"({pos2.x()},{pos2.y()})")
+check("H7) Groesse folgt dem Inhalt (nicht DB-Groesse 900x600)",
+      (size2.width(), size2.height()) != (900, 600)
+      and size2.width() >= 1300, f"{size2.width()}x{size2.height()}")
+w2.close()
+pump()
+
+# 11.08.2026 (Runde 17e): AnalyticsWindow wird beim MANUELLEN Schliessen
+# aus der Historie entfernt (kein Wiedererscheinen beim Neustart). Der
+# Workspace ueberlebt via global_settings-Backup ("analytics_workspace").
+from analytics.ui.analytics_win import AnalyticsWindow  # noqa: E402
+check("H8) AnalyticsWindow Historie intakt (keep_history=False, Runde 17e)",
+      getattr(AnalyticsWindow, "_keep_history_on_close", True) is False)
+check("H9) AnalyticsWindow auto_restore aktiv (offen beim App-Ende)",
+      PersistentWindow.should_auto_restore("win_analytics"))
+
+try:
+    os.remove(db_app)
+    os.remove(db_set)
+    os.rmdir(tmp)
+except OSError:
+    pass
+
+# ---------------------------------------------------------------------------
+# Teil 4: Chart-Circles – FixedGridProximityIndicator liefert hit_circles wieder
+#         (Pipeline-Fallback, wenn der feature_store leer ist).
+# ---------------------------------------------------------------------------
+print("\n=== Teil 4: Chart-Circles (Pipeline-Fallback) ===")
+import pandas as pd  # noqa: E402
+from chart.indicators.ind_fixed_grid_proximity import FixedGridProximityIndicator  # noqa: E402
+
+# Synthetischer OHLCV-DataFrame (H1), Preis stabil um 30.0 -> Grid-Level 30
+# wird bei jedem Bar (high/low in der 5%-visit-Bandbreite) getroffen.
+_n = 200
+_base = 1600000000
+df_synth = pd.DataFrame({
+    "time": [_base + i * 3600 for i in range(_n)],
+    "open": [30.0] * _n,
+    "high": [30.1] * _n,
+    "low": [29.9] * _n,
+    "close": [30.0] * _n,
+})
+
+# 1) Feature-Store-Lesepfad liefert fuer das Test-Symbol garantiert [] (leer).
+#    Eigene leere Temp-DB (analytics) – unabhaengig vom Zustand von tmp.
+ind = FixedGridProximityIndicator()
+ind.set_context("TEST_SYM_NO_FEATURES", "H1")
+tmp4 = tempfile.mkdtemp(prefix="bf4_")
+empty_db = os.path.join(tmp4, "analytics.duckdb")
+import duckdb  # noqa: E402
+_con4 = duckdb.connect(empty_db)
+_con4.execute("CREATE TABLE IF NOT EXISTS feature_store (symbol VARCHAR, timeframe VARCHAR, bar_time TIMESTAMPTZ, feature_id VARCHAR, feature_data JSON)")
+_con4.close()
+store_empty = ind.read_proximity_from_feature_store(
+    "TEST_SYM_NO_FEATURES", "H1", limit=1000, db_path=empty_db)
+check("C1) Feature-Store leer (kein DB-Feeding noetig)",
+      len(store_empty) == 0, f"{len(store_empty)} Eintraege")
+
+# 2) calculate() mit leerem Store -> Pipeline-Fallback liefert hit_circles.
+params = {
+    "grid_step": 1.0,
+    "steps_around": 4,
+    "proximity_threshold": 5.0,   # visit_pct 5%
+    "use_time_filter": True,
+    "time_window_mins": 5,
+    "show_lines": True,
+    "show_circles": True,
+    "circle_color_std": "#FFEB3B",
+    "circle_color_active": "#E91E63",
+    "lookback": 200,
+}
+res = ind.calculate(df_synth, params)
+circles = res.get("hit_circles") or []
+print(f"   hit_circles aus calculate(): {len(circles)}")
+check("C2) hit_circles wieder gefuellt (Fallback aktiv)", len(circles) > 0,
+      f"{len(circles)}")
+check("C3) Circles tragen Farbe (Indikator-Schema)",
+      all(c.get("color") in ("#FFEB3B", "#E91E63") for c in circles),
+      str([c.get("color") for c in circles[:3]]))
+check("C4) Circles tragen time + price",
+      all(isinstance(c.get("time"), int) and isinstance(c.get("price"), float)
+          for c in circles),
+      str(circles[0] if circles else None))
+
+# 3) show_circles=False -> keine Circles (Anzeige-Parameter wird respektiert)
+params_off = dict(params, show_circles=False)
+res_off = ind.calculate(df_synth, params_off)
+circles_off = res_off.get("hit_circles") or []
+check("C5) show_circles=False -> keine Circles", len(circles_off) == 0,
+      f"{len(circles_off)}")
+
+# ---------------------------------------------------------------------------
+# Teil 5: MasterTree-Layout (Bugfix 04.08.2026/05.08.2026):
+#   - Ebene 0 startet ganz links (rootIsDecorated=False, keine Branch-
+#     Einrueckung); Untereintraege ruecken per setIndentation(LEVEL_INDENT) ein.
+#   - Schmale Status-Spalte rechts (Fixed + INFO_BUTTON_WIDTH, seit
+#     05.08.2026 auf Button-Breite verkleinert), Spalte 0 ist Stretch ->
+#     Status fest am RECHTEN Rand.
+#   - Aufklapp-Marker: '>'-Symbol vor dem Namen aufklappbarer Knoten (kein
+#     Branch-Dreieck mehr); Klick in die BRANCH_ZONE_WIDTH-Zone togglet.
+#   - Info-Button statt Badge-Text (Bugfix 05.08.2026): jede Service-/Set-/
+#     Plugin-Zeile traegt in Spalte 1 einen echten QPushButton ("ℹ"); Tooltip
+#     der Spalte 1 zeigt den Indikator-Namen ('aktiv/im <Indikator>').
+# ---------------------------------------------------------------------------
+print("\n=== Teil 5: MasterTree Layout ===")
+from analytics.engine.service_selector_model import ServiceSelectorModel  # noqa: E402
+from serviceui.master_tree import (  # noqa: E402
+    MasterTree, TreeItemIterator, MAX_BADGE_CELL_CHARS, BADGE_TRUNCATE_ICON,
+    ROLE_PLUGIN_ID, ROLE_NODE_TYPE, TYPE_PLUGIN,
+    BADGE_COLUMN_WIDTH, BRANCH_ZONE_WIDTH, LEVEL_INDENT, INFO_BUTTON_WIDTH,
+    INFO_BUTTON_TEXT, INFO_BUTTON_SIZE,
+)
+from PySide6.QtWidgets import QHeaderView, QPushButton  # noqa: E402
+from PySide6.QtCore import Qt, QPoint  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
+
+tmp5 = tempfile.mkdtemp(prefix="bf5_")
+repo5 = ServiceSetRepository(db_path=os.path.join(tmp5, "sets.duckdb"))
+repo5.save_set({
+    "set_id": "set_5",
+    "display_name": "Layout-Set",
+    "execution_order": ["g1", "p1"],
+    "services": {
+        "g1": {"plugin_id": "srv_grid_lines", "lookback": 1000, "params": {}},
+        "p1": {"plugin_id": "srv_proximity", "lookback": 500, "params": {}},
+    },
+})
+model5 = ServiceSelectorModel()
+model5.set_repo = repo5
+model5.refresh()
+tree5 = MasterTree(model5)
+tree5.show()
+tree5.expandAll()
+pump()
+
+set_group5 = tree5.topLevelItem(0)
+set_item5 = set_group5.child(0) if set_group5 and set_group5.childCount() else None
+svc_items5 = ([set_item5.child(i) for i in range(set_item5.childCount())]
+              if set_item5 is not None else [])
+print(f"   Service-Items: {len(svc_items5)}")
+check("T1) Service-Items vorhanden", len(svc_items5) >= 2, f"{len(svc_items5)}")
+
+# 2.0: Service-Zeilen ohne fuehrende Leerzeichen
+no_indent5 = all(
+    it is not None and it.text(0) and not it.text(0).startswith(" ")
+    for it in svc_items5
+)
+check("T2) Service-Zeilen ohne Einrueckung (kein fuehrender Whitespace)",
+      no_indent5, str([it.text(0) if it else None for it in svc_items5]))
+
+# 2.0: Plugin-Zeilen (Gruppe 3) ebenfalls ohne fuehrende Leerzeichen.
+# 16.08 (P16.08): grid_lines/proximity tragen category='Grid' -> die
+# Plugin-Blaetter liegen seit 16.08 in einem '📁 Grid'-Ordner. Daher werden
+# sie rekursiv ueber TreeItemIterator gesammelt statt als direkte Kinder
+# der Gruppe.
+plugins_group5 = tree5.topLevelItem(2)
+plugin_items5 = ([it for it in TreeItemIterator(tree5)
+                  if it is not None
+                  and it.data(0, ROLE_NODE_TYPE) == TYPE_PLUGIN]
+                 if plugins_group5 is not None else [])
+no_indent_pl5 = all(
+    it is not None and it.text(0) and not it.text(0).startswith(" ")
+    for it in plugin_items5
+)
+check("T3) Plugin-Zeilen ohne Einrueckung", no_indent_pl5,
+      str([it.text(0) if it else None for it in plugin_items5[:5]]))
+
+# 3.0 (aktualisiert 04.08.2026): Ebene 0 startet ganz links
+# (rootIsDecorated=False -> group x=0, KEINE zusaetzliche Branch-Einrueckung);
+# Untereintraege (set/svc) ruecken je Ebene um LEVEL_INDENT ein.
+_xs = {}
+for _name, _it in [("group", set_group5), ("set", set_item5)]:
+    if _it is not None:
+        _xs[_name] = tree5.visualItemRect(_it).x()
+_x_svc = [tree5.visualItemRect(it).x() for it in svc_items5 if it is not None]
+hier5 = (
+    _xs.get("group", -1) == 0                       # Ebene 0 ganz links
+    and _xs.get("set", -1) >= LEVEL_INDENT           # L1 eingerueckt
+    and all(x >= _xs.get("set", -1) for x in _x_svc)  # L2 mind. wie L1
+)
+check("T7) Ebene 0 ganz links + Untereintraege eingerueckt (LEVEL_INDENT)",
+      hier5, f"{_xs} svc={_x_svc}")
+
+# 3.0: schmale Status-Spalte rechts (Fixed; seit 05.08.2026 auf die
+# Info-Button-Breite INFO_BUTTON_WIDTH verkleinert)
+header5 = tree5.header()
+_w_status5 = header5.sectionSize(1) if header5 is not None else -1
+_fixed5 = (header5.sectionResizeMode(1) == QHeaderView.Fixed
+           if header5 is not None else False)
+check("T8) Status-Spalte schmal + Fixed (rechts)",
+      _fixed5 and 0 < _w_status5 <= BADGE_COLUMN_WIDTH + 10,
+      f"mode-fixed={_fixed5} w={_w_status5}")
+check("T8b) Status-Spalte auf Button-Breite verkleinert (INFO_BUTTON_WIDTH)",
+      header5 is not None
+      and header5.sectionSize(1) == INFO_BUTTON_WIDTH
+      and INFO_BUTTON_WIDTH < BADGE_COLUMN_WIDTH,
+      f"w={header5.sectionSize(1) if header5 else -1}")
+
+# 04.08.2026: Aufklapp-Marker statt Branch-Dreieck. Die Set-Zeile (hat
+# Kinder) traegt ein '>'-Symbol vor dem Namen; die BRANCH_ZONE_WIDTH-Zone
+# ist Klickzone (kein Branch-Dreieck).
+def _click_toggles(tree, item):
+    """Sendet einen Klick in die BRANCH_ZONE_WIDTH-Zone der Zeile und
+    liefert True, wenn sich der Auf-/Zuklapp-Zustand danach geaendert hat.
+
+    Robustheit (05.08.2026): QTest.mouseClick statt manueller QMouseEvent-
+    Sendungen – die synthetische Press/Release-Emulation ist auf dem
+    offscreen-Platform-Fenster gegen Timing-Flakiness anfaellig (T9b/T10
+    schlugen sporadisch fehl, obwohl itemAt/SetExpanded korrekt waren).
+    """
+    if item is None:
+        return False
+    before = item.isExpanded()
+    x = tree.visualItemRect(item).left() + BRANCH_ZONE_WIDTH // 2
+    y = tree.visualItemRect(item).center().y()
+    QTest.mouseClick(tree.viewport(), Qt.LeftButton, Qt.NoModifier, QPoint(x, y))
+    pump()
+    return item.isExpanded() != before
+
+# Nach expandAll() ist der Set-Knoten expandiert -> Marker '⌄'; das Symbol
+# muss dem IST-Zustand folgen ('>' eingeklappt / '⌄' ausgeklappt).
+_marker_ok5 = (
+    set_item5 is not None
+    and (
+        (set_item5.isExpanded() and set_item5.text(0).startswith("\u2304 "))
+        or (not set_item5.isExpanded() and set_item5.text(0).startswith("> "))
+    )
+)
+check("T9a) Set-Knoten traegt Auf-/Zuklapp-Marker",
+      _marker_ok5,
+      repr(set_item5.text(0)) if set_item5 else "set_item5=None")
+tree5.clearSelection()
+tree5.resize(600, 400)
+pump()
+check("T9b) Klick in die Zeilen-Zone togglet auf/zu (Set-Zeile)",
+      _click_toggles(tree5, set_item5),
+      f"expanded={set_item5.isExpanded()}")
+set_item5.setExpanded(True)  # fuer die restlichen Checks wieder aufklappen
+
+# 3.1: Klick in die Zeilen-Zone togglet auf/zu (Gruppen-Knoten).
+_grp5 = tree5.topLevelItem(0)
+_grp5.setExpanded(True)
+pump()
+check("T10) Klick in die Zeilen-Zone togglet auf/zu (Gruppen-Knoten)",
+      _click_toggles(tree5, _grp5),
+      f"expanded={_grp5.isExpanded()}")
+_grp5.setExpanded(True)  # fuer die restlichen Checks wieder aufklappen
+
+# 3.1 (04.08.2026, Punkt 1): KEIN Icon auf Zeilen - Ebene 0 startet ganz
+#      links an der Linie der umschliessenden Box; die Einrueckung der
+#      Untereintraege kommt aus setIndentation(LEVEL_INDENT).
+_no_icon5 = all(
+    it is not None and it.icon(0).isNull()
+    for it in list(svc_items5) + list(plugin_items5)
+)
+check("T11) Kein Icon auf Zeilen (Ebene 0 ganz links, buendige Texte)",
+      _no_icon5, "")
+
+# 05.08.2026 (Info-Button statt Badge-Text): JEDE Service-/Set-/Plugin-Zeile
+# traegt in Spalte 1 einen echten Info-Button (QPushButton "ℹ"); KEIN Badge-
+# Text mehr (Zelle leer); Tooltip der Spalte 1 und des Buttons zeigen IMMER
+# den Indikator-Namen ('aktiv/im <Indikator>').
+def _badge_ok(items, model):
+    for it in items:
+        if it is None:
+            continue
+        pid = it.data(0, ROLE_PLUGIN_ID)
+        cell = it.text(1)
+        tip = it.toolTip(1)
+        name = model.get_indicator_display_name(pid)
+        expected_tip = (f"aktiv {name}" if model.is_active_in_chart(pid)
+                        else f"im {name}")
+        if tip != expected_tip:
+            return False, f"{pid}: tooltip='{tip}' != '{expected_tip}'"
+        tree = it.treeWidget()
+        btn = tree.itemWidget(it, 1) if tree is not None else None
+        if not isinstance(btn, QPushButton):
+            return False, f"{pid}: kein Info-Button (Spalte 1)"
+        if btn.text() != INFO_BUTTON_TEXT or btn.width() > INFO_BUTTON_SIZE + 4:
+            return False, (f"{pid}: Button text='{btn.text()}' w={btn.width()}")
+        if btn.toolTip() != expected_tip:
+            return False, (f"{pid}: Button-Tooltip='{btn.toolTip()}'"
+                           f" != '{expected_tip}'")
+        if cell != "":
+            return False, f"{pid}: Zell-Text='{cell}' (soll leer sein)"
+    return True, ""
+
+ok_svc, detail_svc = _badge_ok(svc_items5, model5)
+check("T4) Service-Zeilen: Info-Button (ℹ) + Indikator-Tooltip",
+      ok_svc, detail_svc)
+ok_pl, detail_pl = _badge_ok(plugin_items5, model5)
+check("T5) Plugin-Zeilen: Info-Button (ℹ) + Indikator-Tooltip",
+      ok_pl, detail_pl)
+
+# Mindestens ein Relationstext ist tatsaechlich lang (Badge-Text vorhanden)
+any_long = any(
+    it is not None and len(model5.badge_for(it.data(0, ROLE_PLUGIN_ID)))
+    > MAX_BADGE_CELL_CHARS
+    for it in list(svc_items5) + list(plugin_items5)
+)
+check("T6) Mindestens ein langer Relationstext getestet", any_long)
+
+# Bugfix 05.08.2026: info_requested-Signal (Set-Zeile -> set_id, "", "")
+_info_signals5 = []
+tree5.info_requested.connect(
+    lambda s, svc, p: _info_signals5.append((s, svc, p)))
+_btn_set5 = tree5.itemWidget(set_item5, 1) if set_item5 is not None else None
+if isinstance(_btn_set5, QPushButton):
+    _btn_set5.click()
+check("T12) info_requested emittiert (Set-Zeile)",
+      _info_signals5 and _info_signals5[-1][0] == "set_5"
+      and _info_signals5[-1][1:] == ("", ""), str(_info_signals5))
+
+tree5.hide()
+pump()
+import shutil  # noqa: E402
+shutil.rmtree(tmp5, ignore_errors=True)
+shutil.rmtree(tmp4, ignore_errors=True)
+
+# ---------------------------------------------------------------------------
+# Teil 6 (U15-E, 05.08.2026): Timeframe-Control (combo_tf) & Multi-TF-Run
+#   - Filterleiste: combo_tf existiert, Index 0 = 'ALLE Timeframes' (Sentinel),
+#     danach alle get_timeframes()-Werte (Fallback TF_SECONDS_MAP).
+#   - get_persistent_timeframe()/save_state()/restore_state() runden den
+#     Sentinel 1:1 (Persistenz des 'ALLE Timeframes'-Modus).
+#   - ServiceRunWorker._resolve_timeframes(): Single vs. ALL (Sentinel).
+#   - grid_lines feature_store_payload: bar_time/grid_nearest_level/grid_step/
+#     upper_level/lower_level mathematisch korrekt (close 30.1, step 0.5).
+# ---------------------------------------------------------------------------
+print("\n=== Teil 6: U15-E Timeframe-Control & Multi-TF ===")
+from serviceui.run_worker import ALL_TIMEFRAMES, ServiceRunWorker  # noqa: E402
+
+expected_tfs = []
+try:
+    from db_service import TF_SECONDS_MAP, get_timeframes
+    try:
+        expected_tfs = list(get_timeframes().keys())
+    except Exception:
+        expected_tfs = list(TF_SECONDS_MAP.keys())
+except Exception:
+    expected_tfs = ["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
+
+# 6.1 combo_tf in der Filterleiste (frische ServiceWindow-Instanz)
+sm.save_window_geometry("win_service", 150, 120, 640, 400, False)
+sm.save_instance_state("win_service", "SILVER", "M1")
+w3 = ServiceWindow(parent=_Parent(), service_set_repo=repo)
+w3.service_selector.model.set_repo = repo
+w3.service_selector.model.refresh()
+w3.show()
+pump()
+pump()
+
+ctf = getattr(w3, "combo_tf", None)
+check("U1) combo_tf existiert in der Filterleiste", ctf is not None)
+check("U2) Index 0 = Sentinel 'ALLE Timeframes'",
+      ctf is not None and ctf.itemText(0) == ALL_TIMEFRAMES,
+      ctf.itemText(0) if ctf else "combo_tf=None")
+missing_tfs = [tf for tf in expected_tfs if ctf is not None and ctf.findText(tf) < 0]
+check("U3) Alle Timeframes im Dropdown enthalten", ctf is not None and not missing_tfs,
+      f"fehlend={missing_tfs}")
+idx_m1 = ctf.findText("M1") if ctf else -1
+check("U4) Default-Auswahl = M1",
+      ctf is not None and ctf.currentIndex() == idx_m1 and idx_m1 >= 0,
+      f"current={ctf.currentText() if ctf else None}")
+
+if ctf is not None:
+    ctf.setCurrentText(ALL_TIMEFRAMES)
+    pump()
+    check("U5) get_persistent_timeframe() liefert Sentinel",
+          w3.get_persistent_timeframe() == ALL_TIMEFRAMES,
+          w3.get_persistent_timeframe())
+    w3.save_state()
+    inst = [i for i in sm.load_all_instances() if i.get("instance_id") == "win_service"]
+    stored_tf = inst[0].get("timeframe") if inst else None
+    check("U6) save_state persistiert 'ALLE Timeframes'",
+          stored_tf == ALL_TIMEFRAMES, str(stored_tf))
+    # "App-Ende mit OFFENEM Fenster": w3 bleibt offen (save_state OHNE close),
+    # die Neustart-Simulation (w4) stellt den Sentinel wieder her.
+    w4 = ServiceWindow(parent=_Parent(), service_set_repo=repo)
+    w4.service_selector.model.set_repo = repo
+    w4.service_selector.model.refresh()
+    w4.show()
+    pump()
+    pump()
+    check("U7) restore_state stellt 'ALLE Timeframes' wieder her",
+          getattr(w4, "combo_tf", None) is not None
+          and w4.combo_tf.currentText() == ALL_TIMEFRAMES,
+          w4.combo_tf.currentText() if getattr(w4, "combo_tf", None) else None)
+    w4.close()
+    pump()
+    w3.close()
+    pump()
+else:
+    for _u in ("U5", "U6", "U7"):
+        check(_u, False, "combo_tf fehlt")
+
+# 6.2 ServiceRunWorker._resolve_timeframes (Single vs. Multi-TF)
+w_worker_def = {
+    "set_id": "set_1", "display_name": "Drei Services",
+    "execution_order": ["grid_1", "prox_1", "grid_2"],
+    "services": {},
+}
+wk_single = ServiceRunWorker(None, "SILVER", "M1", w_worker_def)
+check("U8) Single-TF: _resolve_timeframes -> ['M1']",
+      wk_single._resolve_timeframes() == ["M1"],
+      str(wk_single._resolve_timeframes()))
+wk_all = ServiceRunWorker(None, "SILVER", ALL_TIMEFRAMES, w_worker_def)
+tfs_all = wk_all._resolve_timeframes()
+check("U9) Multi-TF: _resolve_timeframes liefert ALLE Timeframes (ohne Sentinel)",
+      len(tfs_all) >= len(expected_tfs) and ALL_TIMEFRAMES not in tfs_all,
+      f"{len(tfs_all)} TFs")
+check("U10) Multi-TF: Reihenfolge = get_timeframes() (MN1..M1)",
+      tfs_all == expected_tfs, str(tfs_all))
+
+# 6.3 grid_lines feature_store_payload (Mathematik U15-E)
+from analytics.features.definitions.srv_grid_lines import GridLinesService  # noqa: E402
+gl = GridLinesService()
+df_gl = pd.DataFrame({
+    "time": [1600000000, 1600000360],
+    "open": [30.0, 30.2],
+    "high": [30.15, 30.4],
+    "low": [29.85, 30.1],
+    "close": [30.1, 30.25],
+})
+res_gl = gl.calculate(df_gl, {"step_size": 0.5, "steps_around": 4})
+payload_gl = res_gl.get("feature_store_payload") or {}
+recs = payload_gl.get("records") or []
+check("U11) grid_lines feature_store_payload gefuellt",
+      bool(recs) and payload_gl.get("feature_id") == "srv_grid_lines",
+      f"records={len(recs)}")
+check("U12) grid_lines records je Bar (bar_time + Levels)",
+      len(recs) == 2 and all(
+          {"bar_time", "grid_nearest_level", "grid_step",
+           "upper_level", "lower_level"} <= set(r) for r in recs),
+      str(recs))
+if recs:
+    # close 30.1 / step 0.5 -> center 30.0, upper 30.5, lower 29.5
+    r0 = recs[0]
+    check("U13) Level-Mathematik korrekt (center 30.0, +- step)",
+          abs(r0["grid_nearest_level"] - 30.0) < 1e-9
+          and abs(r0["upper_level"] - 30.5) < 1e-9
+          and abs(r0["lower_level"] - 29.5) < 1e-9,
+          str(r0))
+
+# ---------------------------------------------------------------------------
+# Teil 6.4: Multi-TF run()-Schleife (gekapselt: Fake-FeatureBuilder &
+#           Fake-Evaluator, KEINE echte DB – kein Schreiben in data/).
+# ---------------------------------------------------------------------------
+print("\n=== Teil 6.4: Multi-TF run()-Schleife (gekapselt) ===")
+import analytics.features.feature_builder as _fbm  # noqa: E402
+
+
+class _FakeFB:
+    """Immitiert FeatureBuilder: liefert OHLCV nur fuer M1/H1, sonst None
+    (keine Daten) – M30 wird uebersprungen. store_plugin_payload() zeichnet
+    die Aufrufe nur auf (kein DB-Zugriff)."""
+
+    def __init__(self):
+        self.calls = []
+        self._df = pd.DataFrame({
+            "bar_time": pd.to_datetime([1600000000, 1600000360], unit="s", utc=True),
+            "open": [30.0, 30.2],
+            "high": [30.15, 30.4],
+            "low": [29.85, 30.1],
+            "close": [30.1, 30.25],
+        })
+
+    def load_ohlcv(self, symbol, tf, limit=None):
+        return self._df if tf in ("M1", "H1") else None
+
+    def store_plugin_payload(self, symbol, tf, payload, instance_hash=None):
+        self.calls.append((symbol, tf, payload))
+
+
+class _FakeEval:
+    def execute_set(self, definition, df_plugin, context=None):
+        return {"g1": {"feature_store_payload": {
+            "feature_id": "srv_grid_lines", "plugin_version": "1.0.0",
+            "records": [{"bar_time": 1600000000}]}}}
+
+
+fb_fake = _FakeFB()
+_orig_fb_cls = _fbm.FeatureBuilder
+_fbm.FeatureBuilder = lambda: fb_fake
+try:
+    logs = []
+    finish = []
+    fail = []
+
+    # Multi-TF: ALLE Timeframes -> M1+H1 gespeichert, M30 (keine Daten) uebersprungen
+    wk = ServiceRunWorker(_FakeEval(), "SILVER", ALL_TIMEFRAMES, w_worker_def)
+    wk.log_message.connect(lambda m: logs.append(m))
+    wk.run_finished.connect(lambda sid, n: finish.append((sid, n)))
+    wk.run_failed.connect(lambda sid, e: fail.append((sid, e)))
+    wk.run()  # direkt im Haupt-Thread (kein start()) – deterministisch
+    check("U14) Multi-TF run() -> genau 1x run_finished, kein run_failed",
+          len(finish) == 1 and not fail, f"finish={finish} fail={fail}")
+    check("U15) Multi-TF summiert Feature-Rows (M1+H1 je 1)",
+          bool(finish) and finish[0][1] == 2, str(finish))
+    check("U16) Multi-TF storet pro Timeframe (nur M1, H1)",
+          sorted(c[1] for c in fb_fake.calls) == ["H1", "M1"],
+          str([c[1] for c in fb_fake.calls]))
+
+    # Single-TF mit Daten -> run_finished
+    finish_s = []
+    wk_s = ServiceRunWorker(_FakeEval(), "SILVER", "M1", w_worker_def)
+    wk_s.run_finished.connect(lambda sid, n: finish_s.append((sid, n)))
+    wk_s.run()
+    check("U17) Single-TF mit Daten -> run_finished",
+          len(finish_s) == 1 and finish_s[0][1] == 1, str(finish_s))
+
+    # Single-TF ohne Daten -> run_failed (bisheriges Fehlerverhalten erhalten)
+    fail_s = []
+    wk_e = ServiceRunWorker(_FakeEval(), "SILVER", "M30", w_worker_def)
+    wk_e.run_failed.connect(lambda sid, e: fail_s.append((sid, e)))
+    wk_e.run()
+    check("U18) Single-TF ohne Daten -> run_failed",
+          len(fail_s) == 1 and "Keine OHLCV-Daten" in fail_s[0][1], str(fail_s))
+finally:
+    _fbm.FeatureBuilder = _orig_fb_cls
+
+# ---------------------------------------------------------------------------
+# Teil 7 (Phase 16, 05.08.2026): Service-Beschreibungs-Editor (modales
+#         Editier-Fenster) & Concurrency-Guard (45s-Sync-Timer) & Numpy-
+#         Vektorisierung der Service-Berechnungen (Parität + Performance).
+# ---------------------------------------------------------------------------
+print("\n=== Teil 7: Phase 16 – Editor, Sync-Guard, Vektorisierung ===")
+import time  # noqa: E402
+import numpy as np  # noqa: E402
+from datetime import datetime, timezone as dt_timezone  # noqa: E402
+from PySide6.QtWidgets import QDialog, QTextEdit  # noqa: E402
+from analytics.engine.description_dialog import ServiceDescriptionEditDialog  # noqa: E402
+from analytics.features.definitions.srv_proximity import (  # noqa: E402
+    ProximityService, _bar_utc_minutes,
+)
+from analytics.features.plugins.base_plugin import PluginContext  # noqa: E402
+from analytics.features.definitions.grid_math import (  # noqa: E402
+    f_round_to_custom_step, f_in_window_around, f_strip_trailing_zeros,
+)
+from config.event_bus import event_bus  # noqa: E402
+
+# 7.1 ServiceDescriptionEditDialog – headless + save_requested-Signal
+_edit_dlg = ServiceDescriptionEditDialog(
+    instance_id="grid_1", plugin_id="srv_grid_lines",
+    header_line="im Ind_FixedGridProximity", description="Alt-Text",
+)
+_edit_editor = _edit_dlg.findChild(QTextEdit)
+check("D1) Editor: QTextEdit vorhanden + vorbelegt",
+      _edit_editor is not None and _edit_editor.toPlainText() == "Alt-Text", "")
+_saved_desc = []
+_edit_dlg.save_requested.connect(lambda t: _saved_desc.append(t))
+_edit_editor.setPlainText("Neue Instanz-Beschreibung")
+_edit_dlg._on_save()
+check("D2) [Speichern] emittiert save_requested mit neuem Text",
+      _saved_desc == ["Neue Instanz-Beschreibung"], str(_saved_desc))
+check("D3) [Speichern] schliesst Dialog mit accept()",
+      _edit_dlg.result() == QDialog.Accepted, str(_edit_dlg.result()))
+
+# 7.2 Concurrency-Guard: ServiceWindow-Referenzzaehler -> EventBus
+_started_c, _finished_c = [], []
+event_bus.service_run_started.connect(lambda: _started_c.append(1))
+event_bus.service_run_finished.connect(lambda: _finished_c.append(1))
+
+
+class _GuardHost:
+    def __init__(self):
+        self._sync_guard_count = 0
+
+
+_gh = _GuardHost()
+_gh._begin_sync_guard = ServiceWindow._begin_sync_guard.__get__(_gh, _GuardHost)
+_gh._end_sync_guard = ServiceWindow._end_sync_guard.__get__(_gh, _GuardHost)
+_gh._begin_sync_guard()
+check("S1) service_run_started genau 1x (0->1)", len(_started_c) == 1,
+      str(len(_started_c)))
+_gh._begin_sync_guard()  # zweiter paralleler Run
+check("S2) kein zweites started (Referenzzaehler)", len(_started_c) == 1,
+      str(len(_started_c)))
+_gh._end_sync_guard()
+check("S3) noch kein finished (ein Run laeuft weiter)", len(_finished_c) == 0,
+      str(len(_finished_c)))
+_gh._end_sync_guard()
+check("S4) finished genau 1x nach letztem Abschluss (1->0)",
+      len(_finished_c) == 1, str(len(_finished_c)))
+_gh._end_sync_guard()  # Unterlauf -> keine Negativ-Emission
+check("S5) finished bleibt 1x (Zaehler=0)", len(_finished_c) == 1,
+      str(len(_finished_c)))
+
+# 7.2b MainWindow-Guard: sync_timer stoppen/starten (echte Slot-Methoden,
+#      Instanz via __new__ – kein App-Start). Import von main.py nur moeglich,
+#      wenn MetaTrader5 verfuegbar ist (venv); sonst wird der Check uebersprungen.
+_mw_ok = True
+try:
+    import main as _main_mod  # noqa: E402
+except Exception as _e:  # pragma: no cover
+    _mw_ok = False
+    print(f"   (MainWindow-Guard-Test uebersprungen: {_e})")
+if _mw_ok:
+    _mw = _main_mod.MainWindow.__new__(_main_mod.MainWindow)
+
+
+    class _TimerStub:
+        def __init__(self):
+            self.active = True
+            self.stopped = 0
+            self.started = 0
+
+        def isActive(self):
+            return self.active
+
+        def stop(self):
+            self.active = False
+            self.stopped += 1
+
+        def start(self):
+            self.active = True
+            self.started += 1
+
+
+    _mw._sync_pause_count = 0
+    _mw.sync_timer = _TimerStub()
+    _mw._on_service_run_started()
+    _mw._on_service_run_started()
+    check("S6) 2x started -> Timer genau 1x gestoppt",
+          not _mw.sync_timer.active and _mw.sync_timer.stopped == 1,
+          f"active={_mw.sync_timer.active} stopped={_mw.sync_timer.stopped}")
+    _mw._on_service_run_finished()
+    check("S7) 1x finished -> Timer bleibt gestoppt (1 Run offen)",
+          not _mw.sync_timer.active, f"active={_mw.sync_timer.active}")
+    _mw._on_service_run_finished()
+    check("S8) 2x finished -> Timer wieder gestartet",
+          _mw.sync_timer.active and _mw.sync_timer.started == 1,
+          f"active={_mw.sync_timer.active} started={_mw.sync_timer.started}")
+
+# 7.3 Numpy-Vektorisierung: GridLinesService (Parität zur Alt-Loop)
+def _grid_ref(df, step_size):
+    rows = []
+    for _i, row in df.iterrows():
+        try:
+            close_val = float(row["close"])
+            center = f_round_to_custom_step(close_val, step_size)
+        except (TypeError, ValueError, KeyError):
+            continue
+        bar_ts = row.get("time")
+        if bar_ts is None:
+            continue
+        try:
+            bar_ts_int = int(bar_ts)
+        except (TypeError, ValueError):
+            continue
+        rows.append({
+            "bar_time": bar_ts_int,
+            "grid_nearest_level": center,
+            "grid_step": step_size,
+            "upper_level": round(center + step_size, 6),
+            "lower_level": round(center - step_size, 6),
+        })
+    return rows
+
+
+_df_gl = pd.DataFrame({
+    "time": [1600000000 + i * 60 for i in range(120)],
+    "open": [30.0] * 120,
+    "high": [30.15] * 120,
+    "low": [29.85] * 120,
+    "close": [30.0 + 0.1 * (i % 7) for i in range(120)],
+})
+_df_gl.loc[50, "close"] = float("nan")  # Alt-Pfad: round(NaN) -> skip
+_gl_res = gl.calculate(_df_gl, {"step_size": 0.5, "steps_around": 4})
+_gl_recs = (_gl_res.get("feature_store_payload") or {}).get("records") or []
+_gl_ref = _grid_ref(_df_gl, 0.5)
+check("V1) grid_lines: Anzahl Records = Referenz (inkl. NaN-Skip)",
+      len(_gl_recs) == len(_gl_ref), f"{len(_gl_recs)} vs {len(_gl_ref)}")
+if len(_gl_recs) == len(_gl_ref):
+    _gl_parity = all(
+        r["bar_time"] == ref["bar_time"]
+        and abs(r["grid_nearest_level"] - ref["grid_nearest_level"]) < 1e-9
+        and abs(r["upper_level"] - ref["upper_level"]) < 1e-9
+        and abs(r["lower_level"] - ref["lower_level"]) < 1e-9
+        for r, ref in zip(_gl_recs, _gl_ref)
+    )
+    check("V2) grid_lines: volle Paritaet zur Alt-Loop", _gl_parity,
+          str(_gl_recs[:2]))
+
+# datetime-Spalte -> Zeilen-Fallback (Parität)
+_df_dt = pd.DataFrame({
+    "time": pd.to_datetime([1600000000, 1600000360], unit="s", utc=True),
+    "open": [30.0, 30.2], "high": [30.15, 30.4],
+    "low": [29.85, 30.1], "close": [30.1, 30.25],
+})
+_res_dt = gl.calculate(_df_dt, {"step_size": 0.5, "steps_around": 4})
+_recs_dt = (_res_dt.get("feature_store_payload") or {}).get("records") or []
+_ref_dt = _grid_ref(_df_dt, 0.5)
+check("V3) grid_lines: datetime-Spalte -> Fallback-Paritaet",
+      len(_recs_dt) == len(_ref_dt) and all(
+          r["bar_time"] == ref["bar_time"]
+          for r, ref in zip(_recs_dt, _ref_dt)),
+      f"{len(_recs_dt)} vs {len(_ref_dt)}")
+
+# 7.4 Numpy-Vektorisierung: ProximityService (Parität zur Alt-Loop)
+def _prox_ref(df, lines_payload, visit_pct, time_window_mins, use_time_filter):
+    tracked_levels = [float(l["price"]) for l in lines_payload]
+    hit_circles, active_hits, feature_rows = [], [], []
+    minutes_ref = []
+    for t in df["time"]:
+        try:
+            minutes_ref.append(
+                datetime.fromtimestamp(int(t), tz=dt_timezone.utc).minute)
+        except (TypeError, ValueError, OSError):
+            minutes_ref.append(0)
+    last_idx = df.index[-1] if len(df) else None
+    for pos, (idx, row) in enumerate(df.iterrows()):
+        time_val = int(row["time"])
+        c_high = float(row["high"])
+        c_low = float(row["low"])
+        row_m = minutes_ref[pos]
+        row_in_time = (f_in_window_around(row_m, 0, time_window_mins)
+                       or f_in_window_around(row_m, 30, time_window_mins))
+        levels_hit = []
+        for lvl in tracked_levels:
+            visit_min = lvl * (1.0 - visit_pct / 100.0)
+            visit_max = lvl * (1.0 + visit_pct / 100.0)
+            touch_high = visit_min <= c_high <= visit_max
+            touch_low = visit_min <= c_low <= visit_max
+            pierce = c_low <= lvl and c_high >= lvl
+            if touch_high or touch_low or pierce:
+                levels_hit.append(lvl)
+                hit_circles.append({
+                    "time": time_val, "price": lvl,
+                    "in_window": bool(row_in_time),
+                })
+                if last_idx is not None and idx == last_idx:
+                    active_hits.append(f_strip_trailing_zeros(lvl))
+        feature_rows.append({
+            "bar_time": time_val, "levels_hit": levels_hit,
+            "is_hit": bool(levels_hit), "in_time_window": bool(row_in_time),
+            "time_window_mins": time_window_mins,
+            "use_time_filter": use_time_filter, "visit_pct": visit_pct,
+        })
+    return feature_rows, hit_circles, active_hits
+
+
+prox = ProximityService()
+_df_prox = pd.DataFrame({
+    "time": [1600000000 + i * 60 for i in range(90)],
+    "open": [30.0] * 90,
+    "high": [30.1] * 90,
+    "low": [29.9] * 90,
+    "close": [30.0] * 90,
+})
+_lines = [{"price": 30.0}, {"price": 30.5}, {"price": 29.5}]
+_ctx = PluginContext(
+    symbol="SILVER", timeframe="M1", mode="batch",
+    shared_state={"g1": _lines}, depends_on=["g1"], instance_id="p1",
+)
+_params_prox = {"visit_pct": 0.05, "time_window_mins": 5,
+                "use_time_filter": True}
+_res_prox = prox.calculate(_df_prox, _params_prox, context=_ctx)
+_rows_p = (_res_prox.get("feature_store_payload") or {}).get("records") or []
+_meta_p = (_res_prox.get("feature_store_payload") or {}).get("metadata") or {}
+_stats_p = _meta_p.get("statistics") or {}
+_active_p = _stats_p.get("active_hits") or []
+_ref_rows, _ref_circ, _ref_act = _prox_ref(_df_prox, _lines, 0.05, 5, True)
+check("V4) proximity: #Feature-Rows = Referenz", len(_rows_p) == len(_ref_rows),
+      f"{len(_rows_p)} vs {len(_ref_rows)}")
+# P16.01 (Architektur-Entkopplung): Der Service liefert KEINEN
+# chart_render_payload mehr – hit_circles/status_info baut der Indikator
+# (build_chart_render_payload) aus den Rohdaten (E4/E5).
+check("V5) proximity: KEIN chart_render_payload mehr (P16.01)",
+      "chart_render_payload" not in _res_prox,
+      f"keys={list(_res_prox.keys())}")
+check("V6) proximity: active_hits = Referenz (metadata.statistics, E4)",
+      _active_p == _ref_act,
+      f"{_active_p} vs {_ref_act}")
+_rows_ok = all(
+    r["bar_time"] == ref["bar_time"]
+    and r["levels_hit"] == ref["levels_hit"]
+    and r["is_hit"] == ref["is_hit"]
+    and r["in_time_window"] == ref["in_time_window"]
+    for r, ref in zip(_rows_p, _ref_rows)
+)
+check("V7) proximity: Feature-Rows vollstaendige Paritaet", _rows_ok, "")
+# P16.01: hit_circles aus den ROHDATEN via build_chart_render_payload
+# (Prioritaet 10, in_window-Flag, Paritaet zur Referenz).
+from chart.indicators.ind_fixed_grid_proximity import FixedGridProximityIndicator  # noqa: E402
+_indi = FixedGridProximityIndicator()
+_circ_p = (_indi.build_chart_render_payload(
+    {"grid_levels": _lines, "proximity_records": _rows_p,
+     "status_info": _stats_p},
+    {"show_lines": True, "line_color": "", "show_circles": True,
+     "circle_color_std": "#FFEB3B", "circle_color_active": "#E91E63",
+     "use_time_filter": True},
+) or {}).get("hit_circles") or []
+check("V8) proximity: hit_circles (build_chart_render_payload) = Referenz",
+      len(_circ_p) == len(_ref_circ)
+      and all(
+          c["time"] == ref["time"] and c["price"] == ref["price"]
+          and c["in_window"] == ref["in_window"]
+          and c.get("priority") == 10
+          for c, ref in zip(_circ_p, _ref_circ)
+      ),
+      f"{len(_circ_p)} vs {len(_ref_circ)}")
+
+# 7.5 _bar_utc_minutes: vektorisiert vs. datetime-basiert (inkl. neg. Zeiten)
+_ts_m = list(range(1600000000, 1600000000 + 7200, 60)) + [-1, -3600, 0]
+_df_m = pd.DataFrame({"time": _ts_m})
+_check_min = _bar_utc_minutes(_df_m)
+_ref_min = [datetime.fromtimestamp(int(t), tz=dt_timezone.utc).minute
+            for t in _ts_m]
+check("V9) _bar_utc_minutes vektorisiert = datetime-basiert",
+      _check_min == _ref_min, f"{_check_min[:5]} vs {_ref_min[:5]}")
+
+# 7.6 Performance: 10k Bars (Ziel: wenige Millisekunden)
+_big = pd.DataFrame({
+    "time": [1600000000 + i * 60 for i in range(10000)],
+    "open": [30.0] * 10000, "high": [30.1] * 10000,
+    "low": [29.9] * 10000, "close": [30.0] * 10000,
+})
+_ctx_big = PluginContext(
+    symbol="SILVER", timeframe="M1", mode="batch",
+    shared_state={"g1": _lines}, depends_on=["g1"], instance_id="p1",
+)
+_t0 = time.perf_counter()
+prox.calculate(_big, _params_prox, context=_ctx_big)
+_dt_prox = time.perf_counter() - _t0
+_t0 = time.perf_counter()
+gl.calculate(_big, {"step_size": 0.5, "steps_around": 4})
+_dt_gl = time.perf_counter() - _t0
+print(f"   Proximity 10k Bars: {_dt_prox*1000:.1f} ms | "
+      f"grid_lines 10k: {_dt_gl*1000:.1f} ms")
+check("V10) Proximity 10k Bars < 1s (vektorisiert)", _dt_prox < 1.0,
+      f"{_dt_prox:.3f}s")
+check("V11) grid_lines 10k Bars < 1s (vektorisiert)", _dt_gl < 1.0,
+      f"{_dt_gl:.3f}s")
+
+# ---------------------------------------------------------------------------
+# Teil 8 (Phase 16.05, 06.08.2026): Prework Render-Engine – gezielte Logik-
+#   Tests (F2-Beschluss, permanent in test/test.py statt Check-Skripten):
+#   T1) fetch_historical_candles liefert tick_volume (None -> 0, F3/P-D4)
+#   T2) _collect_render_payload aggregiert generisch lines/price_lines/
+#       hit_circles ueber ALLE aktiven Indikatoren (P-D1/F1) inkl. Zeit-
+#       Mapping real->kontinuierlich und Inaktiv-Ueberspringung
+#   T3) FixedGridProximityIndicator liefert price_lines statt lines (F1)
+# ---------------------------------------------------------------------------
+print("\n=== Teil 8: P16.05 Prework (Payload-Aggregation, tick_volume, price_lines) ===")
+from PySide6.QtWidgets import QMainWindow  # noqa: E402
+from chart.chart_win import PyTraderChartWindow  # noqa: E402
+from db_service import MarketDataRepository  # noqa: E402
+
+# --- T1: tick_volume-Spalte (F3/P-D4) -----------------------------------------
+_p1605_tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp_p1605_db")
+os.makedirs(_p1605_tmp, exist_ok=True)
+_p1605_db = os.path.join(_p1605_tmp, "tv_test.duckdb")
+if os.path.exists(_p1605_db):
+    os.remove(_p1605_db)
+try:
+    _con = duckdb.connect(_p1605_db)
+    _con.execute("""
+        CREATE TABLE ohlcv_bars (
+            symbol VARCHAR NOT NULL,
+            timeframe VARCHAR NOT NULL,
+            time TIMESTAMPTZ NOT NULL,
+            open DOUBLE NOT NULL,
+            high DOUBLE NOT NULL,
+            low DOUBLE NOT NULL,
+            close DOUBLE NOT NULL,
+            tick_volume BIGINT,
+            spread INTEGER,
+            real_volume BIGINT,
+            PRIMARY KEY (symbol, timeframe, time)
+        );
+    """)
+    _con.execute("""
+        INSERT INTO ohlcv_bars (symbol, timeframe, time, open, high, low, close, tick_volume)
+        VALUES ('TESTTV', 'M1', TIMESTAMPTZ '2026-01-01 00:00:00+00', 10.0, 11.0, 9.0, 10.5, 100),
+               ('TESTTV', 'M1', TIMESTAMPTZ '2026-01-01 00:01:00+00', 10.5, 11.5, 10.0, 11.0, NULL),
+               ('TESTTV', 'M1', TIMESTAMPTZ '2026-01-01 00:02:00+00', 11.0, 12.0, 10.5, 11.5, 250);
+    """)
+    _con.close()
+    _repo_tv = MarketDataRepository(_p1605_db)
+    _candles_tv, _prec_tv = _repo_tv.fetch_historical_candles(
+        "TESTTV", "M1", limit=10)
+    check("P16.05 T1) tick_volume-Spalte geliefert (alle Candles)",
+          len(_candles_tv) == 3 and all("tick_volume" in c for c in _candles_tv),
+          f"{len(_candles_tv)} Candles")
+    check("P16.05 T1) tick_volume None -> 0 (F3)",
+          any(c["tick_volume"] == 0.0 for c in _candles_tv), "")
+    check("P16.05 T1) tick_volume Werte erhalten",
+          any(c["tick_volume"] == 100.0 for c in _candles_tv)
+          and any(c["tick_volume"] == 250.0 for c in _candles_tv), "")
+finally:
+    shutil.rmtree(_p1605_tmp, ignore_errors=True)
+
+# --- T2: _collect_render_payload (P-D1/F1/P-C2) --------------------------------
+class _P1605Harness(QMainWindow):
+    """Minimaler headless Host fuer _collect_render_payload (kein Chart-UI)."""
+
+    def __init__(self):
+        super().__init__()
+        self.indicators = {}
+        self.indicators_state = {}
+        self.df_data = pd.DataFrame({"time": [1000]})
+        self.current_symbol = "SILVER"
+        self.current_tf = "M1"
+        self._time_real_to_cont = {1000: 5000}
+        self._resolve_indicator_params = lambda ind_id, st: {}
+
+
+class _P1605FakeGrid:
+    def set_context(self, s, tf):
+        pass
+
+    def calculate(self, df, params):
+        return {"price_lines": [{"price": 24.5, "color": "#2196F3", "width": 1,
+                                 "style": "solid", "is_custom": False}],
+                "hit_circles": [{"time": 1000, "price": 24.5,
+                                 "color": "#FFEB3B"}]}
+
+
+class _P1605FakeMA:
+    def set_context(self, s, tf):
+        pass
+
+    def calculate(self, df, params):
+        return {"lines": [{"id": "ma1",
+                           "data": [{"time": 1000, "value": 24.4,
+                                     "color": "#26A69A"}],
+                           "width": 2, "style": "solid", "title": "MA1"}]}
+
+
+_win_p1605 = _P1605Harness()
+_win_p1605.indicators = {"ind_grid": _P1605FakeGrid(), "ind_ma": _P1605FakeMA()}
+_win_p1605.indicators_state = {
+    "ind_grid": {"active": True}, "ind_ma": {"active": True}}
+_payload_p1605 = PyTraderChartWindow._collect_render_payload(_win_p1605)
+check("P16.05 T2) Payload-Keys lines/price_lines/hit_circles",
+      set(_payload_p1605) == {"lines", "price_lines", "hit_circles"},
+      str(sorted(_payload_p1605)))
+check("P16.05 T2) price_lines geroutet (Grid)",
+      len(_payload_p1605["price_lines"]) == 1, "")
+check("P16.05 T2) lines geroutet (MA)",
+      len(_payload_p1605["lines"]) == 1, "")
+check("P16.05 T2) hit_circles geroutet (Grid)",
+      len(_payload_p1605["hit_circles"]) == 1, "")
+check("P16.05 T2) Zeit-Mapping real->kontinuierlich (hit_circles)",
+      _payload_p1605["hit_circles"][0]["time"] == 5000, "")
+check("P16.05 T2) Zeit-Mapping real->kontinuierlich (lines)",
+      _payload_p1605["lines"][0]["data"][0]["time"] == 5000, "")
+_win_p1605.indicators_state["ind_ma"]["active"] = False
+_payload_p1605b = PyTraderChartWindow._collect_render_payload(_win_p1605)
+check("P16.05 T2) inaktiver Indikator wird uebersprungen",
+      len(_payload_p1605b["lines"]) == 0, "")
+
+# --- T3: price_lines-Key in fixed_grid_proximity (F1) ---------------------------
+_pl_p1605 = _indi.build_chart_render_payload(
+    {"grid_levels": [{"price": 24.5}], "proximity_records": [],
+     "status_info": {}},
+    {"show_lines": True, "line_color": "#2196F3", "show_circles": True,
+     "circle_color_std": "#FFEB3B", "circle_color_active": "#E91E63",
+     "use_time_filter": True, "line_width": 1, "line_style": "solid",
+     "circle_shape_std": "circle", "circle_shape_active": "circle",
+     "circle_size_std": 6, "circle_size_active": 6})
+check("P16.05 T3) price_lines-Key vorhanden (F1)",
+      "price_lines" in _pl_p1605, "")
+check("P16.05 T3) kein lines-Key mehr (F1)",
+      "lines" not in _pl_p1605, "")
+check("P16.05 T3) price_lines Inhalt",
+      len(_pl_p1605.get("price_lines") or []) == 1, "")
+
+# ---------------------------------------------------------------------------
+# Teil 9 (Phase 16.05, 06.08.2026; Bugfix 07.08.2026; Vertrag C 07.08.2026):
+# Multi-MA-Indikator – gezielte Logik-Tests (F2-Beschluss, permanent in
+# test/test.py statt Check-Skripten):
+#   M1) Schema-Vollstaendigkeit (50 Parameter) + Defaults MA1/MA2..8 (D4/D7,
+#       maX_smoothing statt smooth_type/smooth_length, Vertrag C)
+#   M2) Payload MA1 dual_color=True vs False (Farbumschlag korrekt, E6)
+#   M3) Alle 8 MAs einzeln + kombiniert (show an/aus)
+#   M4) crop_dataframe auf chart_candle_limit (Daten-Zuschnitt)
+#   M5) LWC-Konformitaet (time int, value float, color str)
+#   M6) VWMA mit tick_volume aus df_data (P-D4/F3)
+#   M7) Glaettung (Vertrag C): smoothing<=1 = Roh-MA (Bypass);
+#       smoothing>1 = EMA-Doppelpass in der Engine, Titel ' | S <Laenge>'
+# ---------------------------------------------------------------------------
+print("\n=== Teil 9: P16.05 Multi-MA-Indikator ===")
+from chart.indicators.ind_moving_averages import (  # noqa: E402
+    MultiMovingAverageIndicator, _MA_COLORS, _MA1_BEAR_COLOR,
+    _MA_SMOOTHING_DEFAULT,
+)
+from chart.indicators.utils.ma_template import MATemplateEngine  # noqa: E402
+
+_ma_ind = MultiMovingAverageIndicator()
+_ma_schema = _ma_ind.parameter_schema
+_ma_defaults = _ma_ind.default_params
+
+# M1: Schema-Vollstaendigkeit (MA1: 8 UI-Keys, MA2..8: je 6 UI-Keys = 50,
+# Vertrag C) + Phase 16.06: +16 Sibling-Defaults (MA1: bull_width/bull_style,
+# MA2..8: width/style) -> 66 Schema-Keys. Die Sibling-Keys sind NICHT in
+# parameter_order -> werden nicht als eigene Controls gerendert.
+check("M1) Schema 66 Keys (50 UI + 16 Sibling-Defaults, 16.06)",
+      len(_ma_schema) == 66, str(len(_ma_schema)))
+check("M1) Sibling-Defaults im Schema (16.06)",
+      "ma1_bull_width" in _ma_schema and "ma1_bull_style" in _ma_schema
+      and all(f"ma{x}_width" in _ma_schema and f"ma{x}_style" in _ma_schema
+              for x in range(2, 9)),
+      "")
+check("M1) Sibling-Defaults Werte (MA1 Breite 2/solid, MA2..8 Breite 1/solid)",
+      _ma_defaults.get("ma1_bull_width") == 2
+      and _ma_defaults.get("ma1_bull_style") == "solid"
+      and all(_ma_defaults.get(f"ma{x}_width") == 1
+              and _ma_defaults.get(f"ma{x}_style") == "solid"
+              for x in range(2, 9)),
+      str({k: _ma_defaults.get(k)
+           for k in ("ma1_bull_width", "ma1_bull_style", "ma2_width", "ma2_style")}))
+check("M1) MA1-Defaults (EHMA/4/dual=False, D7)",
+      _ma_defaults.get("ma1_type") == "EHMA"
+      and _ma_defaults.get("ma1_period") == 4
+      and _ma_defaults.get("ma1_dual_color") is False
+      and _ma_defaults.get("show_ma1") is True,
+      str({k: _ma_defaults.get(k) for k in ("ma1_type", "ma1_period",
+                                             "ma1_dual_color", "show_ma1")}))
+check("M1) MA2..8-Defaults (EMA/10*X/show=False, D7)",
+      all(_ma_defaults.get(f"ma{x}_type") == "EMA"
+          and _ma_defaults.get(f"ma{x}_period") == 10 * x
+          and _ma_defaults.get(f"show_ma{x}") is False
+          for x in range(2, 9)),
+      str({f"ma{x}_period": _ma_defaults.get(f"ma{x}_period")
+           for x in range(2, 9)}))
+check("M1) Kontrastfarben D4 (MA2..8)",
+      all(_ma_defaults.get(f"ma{x}_color") == _MA_COLORS[x]
+          for x in range(2, 9)),
+      str({f"ma{x}": _ma_defaults.get(f"ma{x}_color") for x in range(2, 9)}))
+check("M1) MA1 bull/bear Defaults (D7)",
+      _ma_defaults.get("ma1_bull_color") == "#26A69A"
+      and _ma_defaults.get("ma1_bear_color") == _MA1_BEAR_COLOR, "")
+check("M1) kein smooth_type/smooth_length im Schema (Vertrag C)",
+      "ma1_smooth_type" not in _ma_schema
+      and "ma1_smooth_length" not in _ma_schema
+      and "ma4_smooth_length" not in _ma_schema, "")
+check("M1) maX_smoothing im Schema (int, Def 10, min 0, max 500, Vertrag C)",
+      all(f"ma{x}_smoothing" in _ma_schema for x in range(1, 9))
+      and all(_ma_defaults.get(f"ma{x}_smoothing") == _MA_SMOOTHING_DEFAULT == 10
+              for x in range(1, 9))
+      and all(_ma_schema[f"ma{x}_smoothing"]["min"] == 0
+              and _ma_schema[f"ma{x}_smoothing"]["max"] == 500
+              for x in range(1, 9)),
+      str({f"ma{x}": _ma_defaults.get(f"ma{x}_smoothing")
+           for x in range(1, 9)}))
+
+# Synthetischer OHLCV-DataFrame mit tick_volume (VWMA-Test M6).
+_ma_n = 120
+_ma_base = 1700000000
+_df_ma = pd.DataFrame({
+    "time": [_ma_base + i * 60 for i in range(_ma_n)],
+    "open": [30.0] * _ma_n,
+    "high": [30.1] * _ma_n,
+    "low": [29.9] * _ma_n,
+    "close": [30.0 + 0.1 * (i % 5) for i in range(_ma_n)],
+    "tick_volume": [100 + i for i in range(_ma_n)],
+})
+
+# M5: LWC-Konformitaet des Basis-Payloads (nur MA1 aktiv)
+_pay_ma = _ma_ind.calculate(_df_ma, _ma_defaults)
+_ma1_line = _pay_ma["lines"][0]
+_lwc_ok = (
+    _ma1_line["id"] == "ma1"
+    and isinstance(_ma1_line["data"], list)
+    and all(isinstance(p["time"], int) and isinstance(p["value"], float)
+            and isinstance(p["color"], str) for p in _ma1_line["data"])
+)
+check("M5) LWC-Konformitaet (time int, value float, color str)",
+      _lwc_ok, "")
+check("M5) Warmup-NaNs uebersprungen (Payload kuerzer als DF)",
+      len(_ma1_line["data"]) < _ma_n
+      and len(_ma1_line["data"]) > 0,
+      f"{len(_ma1_line['data'])} Punkte")
+check("M5) nur MA1 aktiv (Default), lines-Laenge 1",
+      len(_pay_ma["lines"]) == 1 and _ma1_line["width"] == 2, "")
+
+# M2: dual_color=True vs False (Farbumschlag E6)
+_params_dual = dict(_ma_defaults, ma1_dual_color=True)
+_pay_dual = _ma_ind.calculate(_df_ma, _params_dual)
+_line_dual = _pay_dual["lines"][0]
+_params_plain = dict(_ma_defaults, ma1_dual_color=False)
+_pay_plain = _ma_ind.calculate(_df_ma, _params_plain)
+_line_plain = _pay_plain["lines"][0]
+_colors_dual = set(p["color"] for p in _line_dual["data"])
+_colors_plain = set(p["color"] for p in _line_plain["data"])
+check("M2) dual_color=True liefert bull UND bear",
+      "#26A69A" in _colors_dual and _MA1_BEAR_COLOR in _colors_dual,
+      str(sorted(_colors_dual)))
+check("M2) dual_color=False durchgehend bull",
+      _colors_plain == {"#26A69A"}, str(_colors_plain))
+
+# M3: Alle 8 MAs einzeln + kombiniert (show an/aus)
+for _x in range(1, 9):
+    _params_one = dict(_ma_defaults)
+    for _y in range(1, 9):
+        _params_one[f"show_ma{_y}"] = (_y == _x)
+    _pay_one = _ma_ind.calculate(_df_ma, _params_one)
+    check(f"M3) Nur MA{_x} aktiv -> genau 1 Linie",
+          len(_pay_one["lines"]) == 1
+          and _pay_one["lines"][0]["id"] == f"ma{_x}", "")
+_params_all = dict(_ma_defaults)
+for _x in range(1, 9):
+    _params_all[f"show_ma{_x}"] = True
+_pay_all = _ma_ind.calculate(_df_ma, _params_all)
+check("M3) Alle 8 MAs aktiv -> 8 Linien (ma1..ma8)",
+      len(_pay_all["lines"]) == 8
+      and [l["id"] for l in _pay_all["lines"]] == [f"ma{x}" for x in range(1, 9)],
+      str([l["id"] for l in _pay_all["lines"]]))
+check("M3) MA2..8 width=1, MA1 width=2",
+      all(l["width"] == 1 for l in _pay_all["lines"][1:])
+      and _pay_all["lines"][0]["width"] == 2, "")
+
+# M4: crop_dataframe auf chart_candle_limit (Daten-Zuschnitt)
+_df_ma_big = pd.DataFrame({
+    "time": [_ma_base + i * 60 for i in range(200)],
+    "open": [30.0] * 200, "high": [30.1] * 200,
+    "low": [29.9] * 200, "close": [30.0] * 200,
+    "tick_volume": [100] * 200,
+})
+_params_limit = dict(_ma_defaults, show_ma2=True)
+_cropped = MATemplateEngine.crop_dataframe(_df_ma_big, 3000)
+check("M4) crop_dataframe: kleiner als Limit -> unveraendert",
+      len(_cropped) == 200, str(len(_cropped)))
+_cropped_small = MATemplateEngine.crop_dataframe(_df_ma_big, 50)
+check("M4) crop_dataframe: tail(50) bei Limit 50",
+      len(_cropped_small) == 50, str(len(_cropped_small)))
+# Settings-Injection: chart_candle_limit wird beim Payload-Bau genutzt.
+
+
+class _P1605Settings:
+    chart_candle_limit = 60
+
+
+_ma_ind2 = MultiMovingAverageIndicator()
+_ma_ind2.set_settings(_P1605Settings())
+_pay_limit = _ma_ind2.calculate(_df_ma_big, dict(_ma_defaults, show_ma2=True))
+check("M4) chart_candle_limit=60 via set_settings wirkt (crop)",
+      len(_pay_limit["lines"]) == 2
+      and len(_pay_limit["lines"][0]["data"]) <= 60,
+      str([len(l["data"]) for l in _pay_limit["lines"]]))
+
+# M6: VWMA mit tick_volume (P-D4/F3) – kein SMA-Fallback bei gueltigem Volumen
+_params_vwma = dict(_ma_defaults, show_ma2=True, ma2_type="VWMA")
+_pay_vwma = _ma_ind.calculate(_df_ma, _params_vwma)
+_vwma_line = [l for l in _pay_vwma["lines"] if l["id"] == "ma2"]
+check("M6) VWMA liefert Linie mit tick_volume (kein Crash/leer)",
+      len(_vwma_line) == 1 and len(_vwma_line[0]["data"]) > 0,
+      str(len(_vwma_line[0]["data"]) if _vwma_line else 0))
+# VWMA ist gewichtet (erster definierter Wert != erster close-Wert bei
+# steigendem Volumen) – Referenz via Engine direkt.
+_vwma_ref = MATemplateEngine.calculate_ma(
+    _df_ma["close"], "VWMA", 10, alpha_factor=2.0,
+    volume=_df_ma["tick_volume"],
+)
+_first_valid = _vwma_ref.dropna().iloc[0]
+check("M6) VWMA-Referenz erste gueltige Werte vorhanden (period warmup)",
+      pd.notna(_first_valid), str(_first_valid))
+
+# M7 (Vertrag C, 07.08.2026): Glaettung laeuft in der Engine.
+#   a) smoothing<=1 (Bypass) -> Linie identisch zur Roh-MA (Engine-Referenz)
+#   b) smoothing>1 -> EMA-Doppelpass in der Engine, Linie veraendert,
+#      Titel traegt ' | S <Laenge>' (kein Typ mehr)
+_params_sm = dict(_ma_defaults, show_ma2=True, ma2_type="SMA", ma2_period=4,
+                  ma2_smoothing=1)
+_pay_sm_none = _ma_ind.calculate(_df_ma, _params_sm)
+_line_sm_none = [l for l in _pay_sm_none["lines"] if l["id"] == "ma2"][0]
+_ref_sm = MATemplateEngine.calculate_ma(_df_ma["close"], "SMA", 4)
+_pay_sm_ref = MATemplateEngine.build_chart_payload(
+    _df_ma["time"], _ref_sm, ["#2962FF"])
+check("M7) smoothing=1 (Bypass) = exakt Roh-MA (SMA 4)",
+      [p["value"] for p in _line_sm_none["data"]]
+      == [p["value"] for p in _pay_sm_ref],
+      f"{len(_line_sm_none['data'])} vs {len(_pay_sm_ref)} Punkte")
+check("M7) Titel OHNE Glaettung (smoothing=1)",
+      _line_sm_none["title"] == "MA2 SMA 4", _line_sm_none["title"])
+# smoothing=10 (Vertrag-C-Default) -> Engine-Doppelpass, Linie veraendert.
+_params_sm_on = dict(_params_sm, ma2_smoothing=10)
+_pay_sm_on = _ma_ind.calculate(_df_ma, _params_sm_on)
+_line_sm_on = [l for l in _pay_sm_on["lines"] if l["id"] == "ma2"][0]
+check("M7) smoothing=10 aendert die Linie (sichtbarer Einfluss)",
+      [p["value"] for p in _line_sm_on["data"]]
+      != [p["value"] for p in _line_sm_none["data"]],
+      "")
+check("M7) Titel traegt Glaettung '| S 10' (ohne Typ)",
+      _line_sm_on["title"].startswith("MA2 SMA 4")
+      and "| S 10" in _line_sm_on["title"],
+      _line_sm_on["title"])
+# Smoothing per Engine-Referenz: EMA(EMA(SMA4, span=10), alpha=0.4).
+_alpha_calc_m7 = 2.0 / (4 + 1)  # 0.4
+_ema_first_m7 = pd.Series(_ref_sm).ewm(span=10, adjust=False).mean()
+_ema_second_m7 = _ema_first_m7.ewm(alpha=_alpha_calc_m7, adjust=False).mean()
+_pay_sm_ref2 = MATemplateEngine.build_chart_payload(
+    _df_ma["time"], _ema_second_m7, ["#2962FF"])
+check("M7) smoothing-Werte = Engine-Referenz EMA(EMA(SMA4,span=10),alpha=0.4)",
+      [p["value"] for p in _line_sm_on["data"]]
+      == [p["value"] for p in _pay_sm_ref2], "")
+
+# M8 (16.04 Vertrag B, 07.08.2026): Engine-Smoothing-Pass in
+# MATemplateEngine.calculate_ma(..., smoothing=...).
+#   a) smoothing <= 1 -> Bypass (Basis-Serie exakt unveraendert)
+#   b) smoothing > 1 -> EMA(EMA(base, span=smoothing), alpha=alpha_calc)
+#      mit alpha_calc = alpha_factor / (period + 1) – Referenz via pandas ewm
+#   c) Default (kein kwarg) = smoothing 1 = Bypass
+_tpl_schema = MATemplateEngine.get_ma_parameter_schema()
+check("M8) Template-Schema 7 Keys (smoothing statt smooth_type/smooth_length)",
+      len(_tpl_schema) == 7
+      and "smoothing" in _tpl_schema
+      and "smooth_type" not in _tpl_schema
+      and "smooth_length" not in _tpl_schema,
+      str(sorted(_tpl_schema.keys())))
+check("M8) Template-Schema smoothing-Default 10 (min 0, max 500)",
+      _tpl_schema["smoothing"]["default"] == 10
+      and _tpl_schema["smoothing"]["min"] == 0
+      and _tpl_schema["smoothing"]["max"] == 500,
+      str(_tpl_schema["smoothing"]))
+
+_src_ma = _df_ma["close"]
+_ref_sma4_t = MATemplateEngine.calculate_ma(_src_ma, "SMA", 4)
+_sm_off = MATemplateEngine.calculate_ma(_src_ma, "SMA", 4, smoothing=1)
+_sm_off0 = MATemplateEngine.calculate_ma(_src_ma, "SMA", 4, smoothing=0)
+_sm_def = MATemplateEngine.calculate_ma(_src_ma, "SMA", 4)
+check("M8) smoothing<=1 = Bypass (Basis-MA exakt unveraendert)",
+      _sm_off.equals(_ref_sma4_t) and _sm_off0.equals(_ref_sma4_t), "")
+check("M8) Default (kein kwarg) = smoothing 1 = Bypass",
+      _sm_def.equals(_ref_sma4_t), "")
+
+_sm_on = MATemplateEngine.calculate_ma(
+    _src_ma, "SMA", 4, alpha_factor=2.0, smoothing=10)
+_alpha_calc_t = 2.0 / (4 + 1)  # 0.4
+_base4_t = _ref_sma4_t.to_numpy()
+_ema_first_t = pd.Series(_base4_t).ewm(span=10, adjust=False).mean().to_numpy()
+_ema_second_t = pd.Series(_ema_first_t).ewm(
+    alpha=_alpha_calc_t, adjust=False).mean().to_numpy()
+_ref_smT = pd.Series(_ema_second_t, index=_src_ma.index)
+check("M8) smoothing=10 = EMA(EMA(SMA4, span=10), alpha=0.4)",
+      np.allclose(_sm_on.to_numpy(), _ref_smT.to_numpy(), equal_nan=True),
+      f"max-abweichung={np.nanmax(np.abs(_sm_on.to_numpy()-_ref_smT.to_numpy())) if len(_sm_on) else 'n/a'}")
+
+# ---------------------------------------------------------------------------
+# Teil 10 (Phase 16.05, 06.08.2026; Bugfix 07.08.2026; Vertrag C 07.08.2026):
+# Bugfixing-Modus - Indikator-Dialog Multi-MA (OHNE Services). Anwender-
+# anforderungen:
+#   1) keine Services -> Service-UI komplett ausblenden
+#   2) Farb-Parameter = reiner Farbwaehler (color_only, KEINE 'sichtbar'-
+#      Checkbox im Composite; nur die show_maX-Anzeige-Checkbox ist korrekt)
+#   3) fehlende MA-Parameter jetzt sichtbar: Typ, Periode (Laenge),
+#      Smoothing (maX_smoothing, Label 'Smooth', Vertrag C), Alpha - mit den
+#      Defaults (D7)
+# D1) _get_plugin erkennt den Indikator als Plugin (parameter_schema+plugin_id)
+# D2) _indicator_service_ids leer -> keine Service-Attribute (combo_service_set,
+#     edit_set_name, group_expert existieren NICHT)
+# D3) ALLE 50 Parameter in param_controls (vorher fehlende inklusive)
+# D4) Farb-Controls = StylePickerWidget mit color_only=True
+# D5) Preset-Payload: logic_params (Typ/Periode/Smoothing/Alpha)
+#     + display_params (show_*/Farben), ohne Sibling-Keys (maX_style/maX_width)
+# D6) Kontrolle: Grid-Indikator (MIT Services) behaelt den Service-Pfad
+# ---------------------------------------------------------------------------
+print("\n=== Teil 10: P16.05 Dialog-Bugfix (Multi-MA ohne Services) ===")
+from chart.indicators.ind_moving_averages import (  # noqa: E402
+    MultiMovingAverageIndicator,
+)
+from chart.indicators.ind_fixed_grid_proximity import FixedGridProximityIndicator  # noqa: E402
+from chart.indicator_dialog import IndicatorSettingsDialog  # noqa: E402
+from chart.widgets.style_picker_widget import StylePickerWidget  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QSpinBox,
+)
+
+_dlg_results: list = []
+
+
+def _dlg_cb(payload, preset):
+    _dlg_results.append((payload, preset))
+
+
+_ma_ind_dlg = MultiMovingAverageIndicator()
+_dlg_ma = IndicatorSettingsDialog(
+    _ma_ind_dlg,
+    dict(_ma_ind_dlg.default_params),
+    "Default",
+    sm,
+    _dlg_cb,
+    symbol="SILVER", timeframe="H1",
+    service_set_repo=repo,
+)
+
+check("D1) _get_plugin liefert den Indikator selbst",
+      _dlg_ma._get_plugin() is _ma_ind_dlg, "")
+check("D1) _indicator_service_ids leer (keine Services)",
+      _dlg_ma._indicator_service_ids() == [], "")
+
+# D2: Service-UI komplett ausgeblendet (Anforderung 1)
+check("D2) Kein Service-UI (combo_service_set is None)",
+      _dlg_ma.combo_service_set is None, "")
+check("D2) Kein Service-UI (edit_set_name is None)",
+      _dlg_ma.edit_set_name is None, "")
+check("D2) Kein Service-UI (group_expert is None)",
+      _dlg_ma.group_expert is None, "")
+
+# D3: Alle 50 UI-Parameter gerendert (Anforderung 3, Vertrag C). Die 16
+# Sibling-Defaults (Phase 16.06) sind NICHT in parameter_order -> keine
+# Controls, daher 50 gerenderte bei 66 Schema-Keys.
+_schema10 = _ma_ind_dlg.parameter_schema
+_ui_keys10 = [k for k in _schema10
+              if not (k.endswith("_style") or k.endswith("_width"))]
+_all_in_controls = all(k in _dlg_ma.param_controls for k in _ui_keys10)
+check("D3) Alle 50 UI-Parameter in param_controls (Sibling-Keys nicht gerendert)",
+      len(_dlg_ma.param_controls) == 50 == len(_ui_keys10) and _all_in_controls,
+      f"{len(_dlg_ma.param_controls)}/{len(_ui_keys10)}/{len(_schema10)}")
+
+# D4 (Phase 16.06, 07.08.2026): Farb-Controls = StylePickerWidget.
+# ma1_bull_color + maX_color (2..8) sind VOLLE LineStyle-Picker
+# (color_only=False, show_visibility=False -> KEINE 'sichtbar'-Checkbox,
+# weil die Sichtbarkeit ueber show_maX laeuft). ma1_bear_color bleibt
+# reiner Farbwaehler (color_only=True - Breite/Art steuert der bull-Picker).
+_line_picker_keys10 = (["ma1_bull_color"] + [f"ma{x}_color" for x in range(2, 9)])
+_line_picker_ok = all(
+    isinstance(_dlg_ma.param_controls[k], StylePickerWidget)
+    and not _dlg_ma.param_controls[k].color_only
+    and not _dlg_ma.param_controls[k].show_visibility
+    for k in _line_picker_keys10
+)
+check("D4) ma1_bull_color/maX_color = volle LineStyle-Picker ohne Checkbox (16.06)",
+      _line_picker_ok, "")
+_bear_ctrl10 = _dlg_ma.param_controls["ma1_bear_color"]
+check("D4) ma1_bear_color bleibt color_only (nur Farbe, 16.06)",
+      isinstance(_bear_ctrl10, StylePickerWidget) and _bear_ctrl10.color_only,
+      "")
+# Picker zeigen die Sibling-Defaults (MA1 Breite 2/solid, MA2..8 Breite 1/solid)
+_picker_defaults_ok = (
+    _dlg_ma.param_controls["ma1_bull_color"].get_style().width == 2
+    and _dlg_ma.param_controls["ma1_bull_color"].get_style().style == "solid"
+    and _dlg_ma.param_controls["ma2_color"].get_style().width == 1
+    and _dlg_ma.param_controls["ma2_color"].get_style().style == "solid"
+)
+check("D4) Picker zeigen Sibling-Defaults (MA1 w2/solid, MA2 w1/solid)",
+      _picker_defaults_ok, "")
+
+# D3: Die zuvor fehlenden Parametertypen (Anforderung 3)
+_type_ok = all(isinstance(_dlg_ma.param_controls[f"ma{x}_type"], QComboBox)
+               for x in range(1, 9))
+_period_ok = all(isinstance(_dlg_ma.param_controls[f"ma{x}_period"], QSpinBox)
+                 for x in range(1, 9))
+_alpha_ok = all(isinstance(_dlg_ma.param_controls[f"ma{x}_alpha"], QDoubleSpinBox)
+                for x in range(1, 9))
+_smooth_spin_ok = all(
+    isinstance(_dlg_ma.param_controls[f"ma{x}_smoothing"], QSpinBox)
+    for x in range(1, 9))
+check("D3) maX_type = ComboBox (alle 8)", _type_ok, "")
+check("D3) maX_period / maX_smoothing = SpinBox (alle 8)",
+      _period_ok and _smooth_spin_ok, "")
+check("D3) maX_alpha = DoubleSpinBox (alle 8)", _alpha_ok, "")
+check("D3) kein maX_smooth_type-Control (Combo entfaellt, Vertrag C)",
+      all(f"ma{x}_smooth_type" not in _dlg_ma.param_controls
+          for x in range(1, 9)), "")
+
+# D3: Defaults der Parameter im Control (D7; Vertrag C: smoothing 10)
+check("D3) Defaults MA1 (EHMA / Periode 4 / Smoothing 10 / Alpha 2.0)",
+      _dlg_ma.param_controls["ma1_type"].currentText() == "EHMA"
+      and _dlg_ma.param_controls["ma1_period"].value() == 4
+      and _dlg_ma.param_controls["ma1_smoothing"].value() == 10
+      and abs(_dlg_ma.param_controls["ma1_alpha"].value() - 2.0) < 1e-9,
+      "")
+check("D3) Defaults MA2 (EMA / Periode 20 / Smoothing 10 / Alpha 2.0)",
+      _dlg_ma.param_controls["ma2_type"].currentText() == "EMA"
+      and _dlg_ma.param_controls["ma2_period"].value() == 20
+      and _dlg_ma.param_controls["ma2_smoothing"].value() == 10
+      and abs(_dlg_ma.param_controls["ma2_alpha"].value() - 2.0) < 1e-9,
+      "")
+
+# D5: Preset-Payload - Logik (Typ/Periode/Smoothing/Alpha) vs Darstellung
+_payload10 = _dlg_ma._build_preset_payload()
+_logic10 = _payload10.get("logic_params") or {}
+_display10 = _payload10.get("display_params") or {}
+_logic_keys10 = [f"ma{x}_{s}" for x in range(1, 9)
+                 for s in ("type", "period", "smoothing", "alpha")]
+check("D5) logic_params enthaelt maX_type/period/smoothing/alpha",
+      all(k in _logic10 for k in _logic_keys10),
+      str(sorted(_logic10.keys())))
+check("D5) display_params enthaelt show_maX + Farben",
+      all(f"show_ma{x}" in _display10 for x in range(1, 9))
+      and "ma1_bull_color" in _display10 and "ma1_bear_color" in _display10
+      and all(f"ma{x}_color" in _display10 for x in range(2, 9)),
+      str(sorted(_display10.keys())))
+# Phase 16.06 (07.08.2026): display_params enthaelt JETZT die Sibling-Keys der
+# LineStyle-Picker (ma1_bull_style/ma1_bull_width + maX_style/maX_width), damit
+# Breite/Linienart aus dem Picker im Preset round-trippen. ma1_bear_color
+# (color_only) hat KEINE Siblings.
+_sibling10 = {k: _display10.get(k) for k in
+              ["ma1_bull_style", "ma1_bull_width"]
+              + [f"ma{x}_style" for x in range(2, 9)]
+              + [f"ma{x}_width" for x in range(2, 9)]}
+check("D5) Sibling-Keys (maX_style/maX_width) in display_params (16.06)",
+      all(v is not None for v in _sibling10.values())
+      and _display10.get("ma1_bull_width") == 2
+      and _display10.get("ma1_bull_style") == "solid"
+      and all(_display10.get(f"ma{x}_width") == 1
+              and _display10.get(f"ma{x}_style") == "solid"
+              for x in range(2, 9)),
+      str(_sibling10))
+check("D5) ma1_bear_color ohne Sibling-Keys (color_only)",
+      "ma1_bear_style" not in _display10
+      and "ma1_bear_width" not in _display10, "")
+
+# D6: Grid-Indikator (MIT Services) behaelt den Service-Pfad unveraendert.
+_dlg_grid = IndicatorSettingsDialog(
+    FixedGridProximityIndicator(),
+    dict(FixedGridProximityIndicator().default_params),
+    "Default",
+    sm,
+    _dlg_cb,
+    symbol="SILVER", timeframe="H1",
+    service_set_repo=repo,
+)
+check("D6) Grid-Indikator (mit Services): Service-UI bleibt erhalten",
+      hasattr(_dlg_grid, "combo_service_set")
+      and hasattr(_dlg_grid, "edit_set_name")
+      and hasattr(_dlg_grid, "group_expert"),
+      "")
+
+# D7 (Vertrag C + Bugfix 07.08.2026): Layout - 3-Spalten-Grid. Preset-Box
+# Zeile 0 Spalten 0-1 (span 2 = so breit wie MA1+MA2); Schliessen-Button
+# Zeile 0 Spalte 2 (rechts mittig neben der Preset-Box); Zeile 1 = MA1 (Sp.0)
+# + MA2 (Sp.1); danach je 3 Boxen pro Zeile (Zeile 2 = MA3/MA4/MA5, Zeile 3 =
+# MA6/MA7/MA8); Zeile 4 leer -> kompaktes Fenster (~900px), nichts unterhalb
+# der letzten Boxen-Zeile.
+from PySide6.QtWidgets import QGridLayout, QGroupBox, QPushButton  # noqa: E402
+
+_main_lay10 = _dlg_ma._content_widget.layout()
+_grid_lay10 = None
+for _i10 in range(_main_lay10.count()):
+    _sub10 = _main_lay10.itemAt(_i10).layout()
+    if isinstance(_sub10, QGridLayout):
+        _grid_lay10 = _sub10
+        break
+
+check("D7) Grid-Layout im Inhalt gefunden", _grid_lay10 is not None, "")
+
+# Zeile 0 Spalten 0-1 = Preset-Box (span 2, bis zum Ende von MA2).
+_item00 = _grid_lay10.itemAtPosition(0, 0)
+_item01 = _grid_lay10.itemAtPosition(0, 1)
+_preset10 = _item00.widget() if _item00 is not None else None
+_w01 = _item01.widget() if _item01 is not None else None
+check("D7) Preset-Box Zeile 0 Spalten 0-1 (span 2, bis MA2-Ende)",
+      isinstance(_preset10, QGroupBox) and _preset10.title() == "Preset"
+      and isinstance(_w01, QGroupBox) and _w01.title() == "Preset", "")
+
+# Zeile 0 Spalte 2 = Schliessen-Button (rechts mittig neben der Preset-Box).
+_btn10 = None
+_item02 = _grid_lay10.itemAtPosition(0, 2)
+if _item02 is not None:
+    _w02 = _item02.widget()
+    if isinstance(_w02, QPushButton):
+        _btn10 = _w02
+check("D7) Schliessen-Button Zeile 0 Spalte 2 (rechts mittig neben Preset)",
+      isinstance(_btn10, QPushButton) and _btn10.text() == "Schließen", "")
+check("D7) Kein separater Button unterhalb (nur Grid im Inhalt)",
+      _main_lay10.count() == 1, str(_main_lay10.count()))
+
+# 3-Spalten-Grid: (1,0)=MA1 (1,1)=MA2 | (2,0)=MA3 (2,1)=MA4 (2,2)=MA5 |
+# (3,0)=MA6 (3,1)=MA7 (3,2)=MA8.
+def _grid_title10(r, c):
+    if _grid_lay10 is None or _grid_lay10.itemAtPosition(r, c) is None:
+        return None
+    w = _grid_lay10.itemAtPosition(r, c).widget()
+    return w.title() if isinstance(w, QGroupBox) else w.text()
+
+_titles_exp10 = {
+    (1, 0): "MA 1 (Führung)", (1, 1): "MA 2",
+    (2, 0): "MA 3", (2, 1): "MA 4", (2, 2): "MA 5",
+    (3, 0): "MA 6", (3, 1): "MA 7", (3, 2): "MA 8",
+}
+_grid_ok10 = all(
+    _grid_title10(r, c) == title for (r, c), title in _titles_exp10.items())
+check("D7) MA-Boxen 3-Spalten-Grid (MA1/2, MA3/4/5, MA6/7/8)",
+      _grid_ok10, str({k: _grid_title10(*k) for k in _titles_exp10}))
+
+# Nichts unterhalb der letzten Boxen-Zeile (Zeile 4 leer) -> Fenster endet
+# exakt am unteren Rand von MA6/MA7/MA8.
+check("D7) Nichts unterhalb MA6/MA7/MA8 (Zeile 4 leer)",
+      _grid_lay10.itemAtPosition(4, 0) is None
+      and _grid_lay10.itemAtPosition(4, 1) is None
+      and _grid_lay10.itemAtPosition(4, 2) is None, "")
+
+# ---------------------------------------------------------------------------
+# Teil 11 (Phase 16.06, 07.08.2026): StylePicker-Integration FixedGridProximity
+#   - Die Einzelfeld-Deklarationen line_style/line_width/circle_shape_*/
+#     circle_size_* sind aus dem Schema ENTFERNT (Bedienung ausschliesslich
+#     ueber den StylePicker / Sibling-Keys).
+#   - line_color = LineStyle-Picker, circle_color_* = MarkerStyle-Picker,
+#     jeweils show_visibility=False (Sichtbarkeit ueber show_lines/show_circles).
+#   - Preset-Payload persistiert die Sibling-Keys (line_style/line_width/...).
+#   - Render (build_chart_render_payload) wendet die Sibling-Keys an
+#     (price_lines width/style, hit_circles shape/size) - Current-Presets ohne
+#     Sibling-Keys fallen auf Defaults zurueck.
+# ---------------------------------------------------------------------------
+print("\n=== Teil 11: P16.06 StylePicker-Integration (FixedGridProximity) ===")
+from chart.indicators.ind_fixed_grid_proximity import (  # noqa: E402
+    _FIXED_GRID_PROXIMITY_SCHEMA,
+)
+
+# G1: Einzelfeld-Deklarationen entfernt (Phase 16.06)
+_gone_schema11 = [k for k in ("line_style", "line_width",
+                              "circle_shape_std", "circle_shape_active",
+                              "circle_size_std", "circle_size_active")
+                  if k in _FIXED_GRID_PROXIMITY_SCHEMA]
+check("G1) Einzelfeld-Schema entfernt (line_style/line_width/shape/size)",
+      not _gone_schema11, str(_gone_schema11))
+
+# G2: Picker-Typen + show_visibility=False (Sichtbarkeit via show_lines/
+#     show_circles)
+_line_picker11 = _dlg_grid.param_controls["line_color"]
+_marker_std11 = _dlg_grid.param_controls["circle_color_std"]
+_marker_act11 = _dlg_grid.param_controls["circle_color_active"]
+check("G2) line_color = LineStyle-Picker (show_visibility=False)",
+      isinstance(_line_picker11, StylePickerWidget)
+      and _line_picker11.style_type == "line"
+      and not _line_picker11.color_only
+      and not _line_picker11.show_visibility, "")
+check("G2) circle_color_std/_active = MarkerStyle-Picker (show_visibility=False)",
+      isinstance(_marker_std11, StylePickerWidget)
+      and isinstance(_marker_act11, StylePickerWidget)
+      and _marker_std11.style_type == "marker"
+      and _marker_act11.style_type == "marker"
+      and not _marker_std11.show_visibility
+      and not _marker_act11.show_visibility, "")
+check("G2) Keine eigenen Controls fuer line_style/line_width/shape/size",
+      not any(k in _dlg_grid.param_controls
+              for k in ("line_style", "line_width",
+                        "circle_shape_std", "circle_shape_active",
+                        "circle_size_std", "circle_size_active")), "")
+
+# G3: Preset-Payload persistiert Sibling-Keys (line_style/line_width + shape/size)
+_payload11 = _dlg_grid._build_preset_payload()
+_display11 = _payload11.get("display_params") or {}
+_siblings_grid11 = {k: _display11.get(k) for k in (
+    "line_style", "line_width",
+    "circle_shape_std", "circle_shape_active",
+    "circle_size_std", "circle_size_active")}
+check("G3) display_params enthaelt Sibling-Keys (16.06)",
+      all(v is not None for v in _siblings_grid11.values())
+      and _display11.get("line_style") == "solid"
+      and _display11.get("line_width") == 1
+      and _display11.get("circle_shape_std") == "circle"
+      and _display11.get("circle_size_std") == 6,
+      str(_siblings_grid11))
+
+# G4: Render wendet Sibling-Keys an (price_lines width/style, hit_circles
+#     shape/size) - wie sie der StylePicker liefert (line_width=3, dashed,
+#     circle_shape_std=square, circle_size_std=8).
+_g4_recs = [{"bar_time": 1600000000, "levels_hit": [24.5], "is_hit": True,
+             "in_time_window": True}]
+_g4_payload = _indi.build_chart_render_payload(
+    {"grid_levels": [{"price": 24.5}], "proximity_records": _g4_recs,
+     "status_info": {}},
+    {"show_lines": True, "line_color": "#2196F3", "line_width": 3,
+     "line_style": "dashed",
+     "show_circles": True, "circle_color_std": "#FFEB3B",
+     "circle_shape_std": "square", "circle_size_std": 8,
+     "circle_color_active": "#E91E63",
+     "circle_shape_active": "arrowUp", "circle_size_active": 10,
+     "use_time_filter": True})
+_pl_g4 = _g4_payload.get("price_lines") or []
+_circ_g4 = _g4_payload.get("hit_circles") or []
+check("G4) price_lines: width/style aus Picker (3/dashed)",
+      len(_pl_g4) == 1 and _pl_g4[0]["width"] == 3
+      and _pl_g4[0]["style"] == "dashed",
+      str(_pl_g4))
+check("G4) hit_circles: shape/size aus Picker (std square/8)",
+      bool(_circ_g4) and all(c["shape"] == "square" and c["size"] == 8
+                             for c in _circ_g4),
+      str(_circ_g4[:2]))
+
+# G5: Current-Presets ohne Sibling-Keys -> Defaults (solid/1, circle/6)
+_g5_payload = _indi.build_chart_render_payload(
+    {"grid_levels": [{"price": 24.5}], "proximity_records": _g4_recs,
+     "status_info": {}},
+    {"show_lines": True, "line_color": "#2196F3", "show_circles": True,
+     "circle_color_std": "#FFEB3B", "circle_color_active": "#E91E63",
+     "use_time_filter": True})
+_pl_g5 = _g5_payload.get("price_lines") or []
+_circ_g5 = _g5_payload.get("hit_circles") or []
+check("G5) Current-Preset-Fallback: width 1 / solid / circle / size 6",
+      _pl_g5 and _pl_g5[0]["width"] == 1 and _pl_g5[0]["style"] == "solid"
+      and _circ_g5 and all(c["shape"] == "circle" and c["size"] == 6
+                           for c in _circ_g5),
+      f"pl={_pl_g5[:1]} circ={_circ_g5[:1]}")
+
+# ---------------------------------------------------------------------------
+# Teil 12 (Phase 16.07, 07.08.2026): Two-Tier Caching & Dynamic Range
+# Management (D1–D10). Headless Backend-/Logik-Tests:
+#   T1) fetch_historical_candles(before_epoch=...) – Chunk-Nachladen (D4)
+#   T2) ChartDataBuffer.load_initial – M/Warmup, Tier-1-Fenster, cont-Maps
+#   T3) serve_older – RAM-Serve (0 ms I/O, D3/D4) + Erschöpfung
+#   T4) merge_older – Prepend, cont-Erhalt, Warmup, Kapazitäts-Trim (D2/D6/D8)
+#   T5) _compute_warmup – period*4 + smoothing*3, nur aktive MAs (D6)
+#   T6) _resolve_visible_logical_range – D10 (Offset-Format vs. Alt-Format)
+#   T7) _collect_render_payload Zeitfenster-Filter (D1/D5)
+# ---------------------------------------------------------------------------
+print("\n=== Teil 12: P16.07 Two-Tier Caching (ChartDataBuffer, D1–D10) ===")
+
+from chart.indicators.utils.chart_data_buffer import ChartDataBuffer  # noqa: E402
+
+_p1607_tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp_p1607")
+os.makedirs(_p1607_tmp, exist_ok=True)
+_p1607_db = os.path.join(_p1607_tmp, "tt_test.duckdb")
+if os.path.exists(_p1607_db):
+    os.remove(_p1607_db)
+
+# --- T1: before_epoch (D4) -------------------------------------------------
+try:
+    import duckdb as _ddb7
+    _c7 = _ddb7.connect(_p1607_db)
+    _c7.execute("""
+        CREATE TABLE ohlcv_bars (
+            symbol VARCHAR NOT NULL, timeframe VARCHAR NOT NULL,
+            time TIMESTAMPTZ NOT NULL, open DOUBLE NOT NULL, high DOUBLE NOT NULL,
+            low DOUBLE NOT NULL, close DOUBLE NOT NULL, tick_volume BIGINT,
+            PRIMARY KEY (symbol, timeframe, time)
+        );
+    """)
+    _base7 = 2_000_000_000
+    for _i7 in range(200):
+        _c7.execute("""
+            INSERT INTO ohlcv_bars (symbol, timeframe, time, open, high, low, close, tick_volume)
+            VALUES ('TT', 'M1', to_timestamp(?), 10.0, 11.0, 9.0, 10.5, 100)
+        """, [_base7 + _i7 * 60])
+    _c7.close()
+    _repo7 = MarketDataRepository(_p1607_db)
+    _all7, _prec7 = _repo7.fetch_historical_candles("TT", "M1", limit=500)
+    check("P16.07 T1) fetch gesamt (200 Kerzen, aufsteigend)",
+          len(_all7) == 200 and _all7[0]["time"] == _base7
+          and _all7[-1]["time"] == _base7 + 199 * 60, str(len(_all7)))
+    _old7, _ = _repo7.fetch_historical_candles("TT", "M1", limit=500,
+                                               before_epoch=_base7 + 100 * 60)
+    check("P16.07 T1) before_epoch liefert NUR aeltere Kerzen",
+          len(_old7) == 100 and _old7[0]["time"] == _base7
+          and _old7[-1]["time"] == _base7 + 99 * 60,
+          f"n={len(_old7)}, first={_old7[0]['time'] if _old7 else None}")
+    _old7b, _ = _repo7.fetch_historical_candles("TT", "M1", limit=500,
+                                                before_epoch=_base7)
+    check("P16.07 T1) before_epoch an der aeltesten Kante -> 0 Kerzen",
+          len(_old7b) == 0, str(len(_old7b)))
+finally:
+    if os.path.exists(_p1607_db):
+        os.remove(_p1607_db)
+
+# --- T2–T4: ChartDataBuffer (D2/D3/D6/D8) ---------------------------------
+try:
+    _c7b = _ddb7.connect(_p1607_db)
+    _c7b.execute("""
+        CREATE TABLE ohlcv_bars (
+            symbol VARCHAR NOT NULL, timeframe VARCHAR NOT NULL,
+            time TIMESTAMPTZ NOT NULL, open DOUBLE NOT NULL, high DOUBLE NOT NULL,
+            low DOUBLE NOT NULL, close DOUBLE NOT NULL, tick_volume BIGINT,
+            PRIMARY KEY (symbol, timeframe, time)
+        );
+    """)
+    _base7b = 3_000_000_000
+    for _i7b in range(1200):
+        _c7b.execute("""
+            INSERT INTO ohlcv_bars (symbol, timeframe, time, open, high, low, close, tick_volume)
+            VALUES ('TT', 'M1', to_timestamp(?), 10.0, 11.0, 9.0, 10.5, 100)
+        """, [_base7b + _i7b * 60])
+    _c7b.close()
+    _repo7b = MarketDataRepository(_p1607_db)
+    _buf = ChartDataBuffer(market_repo=_repo7b)
+    _buf.TIER2_CAPACITY = 1000
+    _buf.load_initial("TT", "M1", warmup=10, limit=1000)
+
+    # --- T2: load_initial + Tier-1-Fenster + cont-Maps ---------------------
+    check("P16.07 T2) load_initial: served=1000 + warmup=10",
+          len(_buf.candles) == 1000 and len(_buf._warmup_candles) == 10,
+          f"served={len(_buf.candles)} warmup={len(_buf._warmup_candles)}")
+    check("P16.07 T2) has_more_history True (DB laenger, D8)",
+          _buf.has_more_history is True, str(_buf.has_more_history))
+    _win7 = _buf.window_candles(ChartDataBuffer.TIER1_WINDOW)
+    check("P16.07 T2) window_candles = letzte N (Tier-1, D1)",
+          len(_win7) == ChartDataBuffer.TIER1_WINDOW, str(len(_win7)))
+    check("P16.07 T2) cont-Zeiten monoton & lueckenlos (tf_sec-Raster)",
+          all(_win7[i]["time"] == _win7[0]["time"] + i * 60
+              for i in range(len(_win7))), "")
+    check("P16.07 T2) timeMap bijektiv (cont<->real)",
+          all(_buf.time_real_to_cont[_buf.time_cont_to_real[k]] == k
+              for k in _buf.time_cont_to_real), "")
+    check("P16.07 T2) df = warmup + served (1010 Zeilen, D5)",
+          _buf.df is not None and len(_buf.df) == 1010,
+          str(len(_buf.df) if _buf.df is not None else None))
+
+    # --- T3: serve_older RAM-Serve + Erschoepfung (D3/D4) ------------------
+    _left_real7 = _buf.candles[-500]["time"]
+    _res7 = _buf.serve_older(_left_real7, 100)
+    check("P16.07 T3) serve_older RAM: 100 Kerzen aelter als from_epoch",
+          _res7 is not None and len(_res7[0]) == 100
+          and _res7[0][0]["time"] < _buf.time_real_to_cont[_left_real7],
+          f"n={len(_res7[0]) if _res7 else None}")
+    check("P16.07 T3) serve_older window_right = Puffer-Rechtskante",
+          _res7 is not None and _res7[1] == _buf.candles[-1]["time"],
+          str(_res7[1] if _res7 else None))
+    _res7b = _buf.serve_older(_buf.candles[0]["time"], 100)
+    check("P16.07 T3) serve_older erschoepft (None) an Puffer-Linkskante",
+          _res7b is None, str(_res7b))
+
+    # --- T4: merge_older Prepend + cont-Erhalt + Trim (D2/D6/D8) -----------
+    _prev_oldest7 = _buf.candles[0]["time"]
+    _prev_min_cont7 = min(_buf.time_cont_to_real.keys())
+    _prev_max_cont7 = max(_buf.time_cont_to_real.keys())
+    _fetched7 = [{"time": _prev_oldest7 - (110 - _i7c) * 60, "open": 10.0,
+                  "high": 11.0, "low": 9.0, "close": 10.5, "tick_volume": 100}
+                 for _i7c in range(110)]
+    _new7, _wr7, _hm7 = _buf.merge_older(_fetched7, serve_count=100, warmup=10)
+    check("P16.07 T4) merge_older: 100 served + 10 warmup",
+          len(_new7) == 100 and len(_buf._warmup_candles) == 10,
+          f"new={len(_new7)} warmup={len(_buf._warmup_candles)}")
+    check("P16.07 T4) alte cont-Zeiten bleiben unveraendert (Prepend)",
+          _buf.time_real_to_cont[_prev_oldest7] == _prev_min_cont7
+          and _buf.time_cont_to_real[_prev_min_cont7] == _prev_oldest7,
+          f"{_buf.time_real_to_cont.get(_prev_oldest7)} != {_prev_min_cont7}")
+    # Sliding-Window (D2): Der Kapazitaets-Trim wirft die RECHTESTEN
+    # (neuesten) Kerzen ab und entfernt ihre Map-Eintraege. _prev_max_cont7
+    # ist die rechte Kante -> muss nach dem Trim aus der Map entfernt sein.
+    check("P16.07 T4) Trim entfernt rechteste Kerze samt Map-Eintrag (D2)",
+          _prev_max_cont7 not in _buf.time_cont_to_real,
+          str(_prev_max_cont7))
+    # Eine VERBLIEBENE Alt-Kerze (Original-Index 500 -> jetzt Puffer-Index
+    # 600, da 100 neue Kerzen vorne stehen) behaelt ihre cont-Zeit.
+    _kept_real7 = _buf.candles[600]["time"]
+    check("P16.07 T4) verbliebene Alt-Kerzen behalten cont (Prepend)",
+          _buf.time_real_to_cont.get(_kept_real7) == _prev_min_cont7 + 500 * 60,
+          f"{_buf.time_real_to_cont.get(_kept_real7)} != {_prev_min_cont7 + 500 * 60}")
+    check("P16.07 T4) neue Kerzen cont unterhalb des alten Minimums",
+          _new7[0]["time"] < _prev_min_cont7, str(_new7[0]["time"]))
+    check("P16.07 T4) has_more True (fetch >= serve+warmup, D8)",
+          _hm7 is True, str(_hm7))
+    check("P16.07 T4) Kapazitaets-Trim (served <= M=1000, D2)",
+          len(_buf.candles) == 1000, str(len(_buf.candles)))
+    _fetched7b = []
+    _new7b, _wr7b, _hm7b = _buf.merge_older(_fetched7b, serve_count=100, warmup=10)
+    check("P16.07 T4) merge_older leerer Fetch -> has_more False (D8)",
+          len(_new7b) == 0 and _hm7b is False, f"hm={_hm7b}")
+finally:
+    if os.path.exists(_p1607_db):
+        os.remove(_p1607_db)
+
+# --- T5: _compute_warmup (D6) ----------------------------------------------
+class _P1607WarmupHost:
+    def __init__(self, ind_state, params):
+        self.indicators_state = ind_state
+        self._params = params
+
+    def _resolve_indicator_params(self, ind_id, st):
+        return self._params
+
+
+_h7 = _P1607WarmupHost({"ind_moving_averages": {"active": True}},
+                       {"show_ma1": True, "ma1_period": 4, "ma1_smoothing": 10,
+                        "show_ma2": False, "ma2_period": 10, "ma2_smoothing": 10,
+                        "show_ma3": True, "ma3_period": 20, "ma3_smoothing": 15})
+_w7 = PyTraderChartWindow._compute_warmup(_h7)
+check("P16.07 T5) Warmup = max(period*4 + smoothing*3) nur aktive MAs (D6)",
+      _w7 == max(4 * 4 + 10 * 3, 20 * 4 + 15 * 3), str(_w7))
+_h7b = _P1607WarmupHost({"ind_moving_averages": {"active": False}}, {})
+check("P16.07 T5) Warmup = 0 bei inaktivem MA (Grid/Proximity, D6)",
+      PyTraderChartWindow._compute_warmup(_h7b) == 0, "")
+
+# --- T6: _resolve_visible_logical_range (D10) ------------------------------
+class _P1607RangeHost:
+    def __init__(self, vf, vt):
+        self.visible_from = vf
+        self.visible_to = vt
+
+
+# Neues Offset-Format (from > to): total=1000, Viewport [200,800]
+# -> Abstand-von-rechts from=800, to=200 (D10, umbruchfest).
+_r7 = PyTraderChartWindow._resolve_visible_logical_range(_P1607RangeHost(800, 200), 1000)
+check("P16.07 T6) D10 Offset-Restore (new format) -> [200,800]",
+      _r7 == (200, 800), str(_r7))
+# Alt-Format (absolute Indizes, from < to) wird unveraendert uebernommen.
+_r7b = PyTraderChartWindow._resolve_visible_logical_range(_P1607RangeHost(100, 900), 1000)
+check("P16.07 T6) Alt-Format absolute -> [100,900]",
+      _r7b == (100, 900), str(_r7b))
+# Alt-Format mit Indizes > Fensterlaenge wird geklemmt.
+_r7c = PyTraderChartWindow._resolve_visible_logical_range(_P1607RangeHost(2000, 4000), 1000)
+check("P16.07 T6) Alt-Format ueber total geklemmt",
+      _r7c == (999, 1000), str(_r7c))
+_r7d = PyTraderChartWindow._resolve_visible_logical_range(_P1607RangeHost(None, None), 1000)
+check("P16.07 T6) None visible -> (None, None)",
+      _r7d == (None, None), str(_r7d))
+
+# --- T7: _collect_render_payload Zeitfenster-Filter (D1/D5) ----------------
+class _P1607FakeLine:
+    def set_context(self, s, tf):
+        pass
+
+    def calculate(self, df, params):
+        return {"lines": [{"id": "ma1", "data": [
+            {"time": 1000, "value": 1.0, "color": "#fff"},
+            {"time": 2000, "value": 2.0, "color": "#fff"},
+            {"time": 3000, "value": 3.0, "color": "#fff"}]}]}
+
+
+class _P1607FilterHarness(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.indicators = {"ind_ma": _P1607FakeLine()}
+        self.indicators_state = {"ind_ma": {"active": True}}
+        self.df_data = pd.DataFrame({"time": [1000, 2000, 3000]})
+        self.current_symbol = "TT"
+        self.current_tf = "M1"
+        self._time_real_to_cont = {1000: 5000, 2000: 6000, 3000: 7000}
+        self._resolve_indicator_params = lambda ind_id, st: {}
+
+
+_pf7 = _P1607FilterHarness()
+_pf7_payload = PyTraderChartWindow._collect_render_payload(
+    _pf7, time_from=2000, time_to=3000)
+check("P16.07 T7) Render-Payload Zeitfenster-Filter (lines, D1/D5)",
+      len(_pf7_payload["lines"]) == 1
+      and len(_pf7_payload["lines"][0]["data"]) == 2
+      and _pf7_payload["lines"][0]["data"][0]["time"] == 6000,
+      str(_pf7_payload["lines"]))
+
+if os.path.isdir(_p1607_tmp):
+    shutil.rmtree(_p1607_tmp, ignore_errors=True)
+
+# ---------------------------------------------------------------------------
+# Teil 13 (Phase 16.08, 07.08.2026): Meta-Ordner im MasterTree (Dynamic
+# Category Trees, Entscheidungen K1–K10). Headless-Logik-Tests mit
+# Duck-Typ-Registry-Stub (kein PluginRegistry, keine echte DB):
+#   T1) Plugin mit category='A/B/C' -> Ordner A -> B -> C, Blatt im tiefsten
+#       Ordner; Blatt-Dict unveraendert ({plugin_id, badge, last_execution})
+#   T2) ohne/leere/'General'-Kategorie -> oberste Ebene (K1)
+#   T3) Ordner-vor-Blatt-Sortierung, alphabetisch case-insensitiv (K8)
+#   T4) keine leeren Ordner (K9)
+#   T5) MasterTree (offscreen): Ordner nicht auswaehlbar (K3), kein
+#       Info-Button (K5), nicht anhakbar im Checkbox-Modus (K4),
+#       Plugin-Blatt in Ordner bleibt checked_services-faehig,
+#       Ordner-Selektion -> Default (K7)
+# ---------------------------------------------------------------------------
+print("\n=== Teil 13: P16.08 Meta-Ordner im MasterTree (K1–K10) ===")
+from analytics.engine.service_selector_model import ServiceSelectorModel  # noqa: E402
+from serviceui.master_tree import (  # noqa: E402
+    MasterTree, TreeItemIterator, TYPE_CATEGORY, ROLE_NODE_TYPE,
+    ROLE_PLUGIN_ID,
+)
+from PySide6.QtCore import Qt  # noqa: E402
+
+
+class _P1608Plugin:
+    """Duck-Typ-Plugin-Stub (PluginFeature-Interface, das das Modell nutzt)."""
+
+    def __init__(self, plugin_id, category=None):
+        self._plugin_id = plugin_id
+        self.capabilities = {"chart": False}
+        self.metadata = {"category": category} if category else {}
+
+    @property
+    def plugin_id(self):
+        return self._plugin_id
+
+
+class _P1608Registry:
+    """Duck-Typ-Registry-Stub (plugins-Dict + get(), case-insensitiv)."""
+
+    def __init__(self, plugins):
+        self.plugins = {pid.lower(): p for pid, p in plugins.items()}
+
+    def get(self, plugin_id):
+        return self.plugins[plugin_id.lower()]
+
+
+class _P1608SetRepo:
+    def list_sets(self):
+        return []
+
+
+class _P1608StateMgr:
+    def load_all_instances(self):
+        return []
+
+
+class _P1608FSReader:
+    def fetch_last_execution_dates(self):
+        return {}
+
+
+def _p1608_model(plugins):
+    return ServiceSelectorModel(
+        set_repo=_P1608SetRepo(), state_manager=_P1608StateMgr(),
+        registry=_P1608Registry(plugins), feature_store_reader=_P1608FSReader())
+
+
+def _p1608_group(tree, group):
+    for g in tree:
+        if g.get("group") == group:
+            return g
+    return None
+
+
+def _p1608_no_empty(nodes):
+    """Rekursiv: jeder Ordner hat mindestens ein Kind (K9)."""
+    for n in nodes:
+        if n.get("group") == ServiceSelectorModel.GROUP_CATEGORY:
+            if not n.get("children"):
+                return False
+            if not _p1608_no_empty(n["children"]):
+                return False
+    return True
+
+
+# --- T1: verschachtelte Kategorie (A/B/C) -----------------------------------
+_tree13 = _p1608_model(
+    {"plugin_a": _P1608Plugin("plugin_a", category="A/B/C")}).build_tree()
+_plugs13 = _p1608_group(_tree13, ServiceSelectorModel.GROUP_PLUGINS)
+_children13 = _plugs13["children"] if _plugs13 else []
+check("P16.08 T1) Ordner A (category_node, Label '📁 A')",
+      len(_children13) == 1
+      and _children13[0].get("group") == ServiceSelectorModel.GROUP_CATEGORY
+      and _children13[0].get("label") == "📁 A", str(_children13))
+_lvl_b13 = _children13[0]["children"] if _children13 else []
+check("P16.08 T1) Ordner B unter A",
+      len(_lvl_b13) == 1 and _lvl_b13[0].get("label") == "📁 B", "")
+_lvl_c13 = _lvl_b13[0]["children"] if _lvl_b13 else []
+check("P16.08 T1) Ordner C unter B",
+      len(_lvl_c13) == 1 and _lvl_c13[0].get("label") == "📁 C", "")
+_leaf13 = _lvl_c13[0]["children"] if _lvl_c13 else []
+check("P16.08 T1) Blatt im tiefsten Ordner (C)",
+      len(_leaf13) == 1 and _leaf13[0].get("plugin_id") == "plugin_a",
+      str(_leaf13))
+check("P16.08 T1) Blatt-Dict unveraendert (plugin_id/badge/last_execution)",
+      bool(_leaf13) and set(_leaf13[0]) == {"plugin_id", "badge",
+                                            "last_execution"},
+      str(_leaf13[0] if _leaf13 else None))
+
+# --- T2: ohne/leere/'General'-Kategorie -> oberste Ebene (K1) ----------------
+_plugs13b = _p1608_group(_p1608_model({
+    "no_cat": _P1608Plugin("no_cat"),
+    "empty_cat": _P1608Plugin("empty_cat", category="   "),
+    "general_cat": _P1608Plugin("general_cat", category="General"),
+}).build_tree(), ServiceSelectorModel.GROUP_PLUGINS)
+_ch13b = _plugs13b["children"] if _plugs13b else []
+check("P16.08 T2) ohne/leere/General-Kategorie -> oberste Ebene (K1)",
+      all(c.get("group") != ServiceSelectorModel.GROUP_CATEGORY
+          for c in _ch13b)
+      and {c.get("plugin_id") for c in _ch13b}
+      == {"no_cat", "empty_cat", "general_cat"}, str(_ch13b))
+
+# --- T3: Ordner vor Blaettern, alphabetisch case-insensitiv (K8) ------------
+_ch13c = _p1608_group(_p1608_model({
+    "zeta": _P1608Plugin("zeta", category="Grid"),
+    "alpha": _P1608Plugin("alpha", category="abc"),
+    "middle": _P1608Plugin("middle"),
+    "beta": _P1608Plugin("beta", category="Trend"),
+}).build_tree(), ServiceSelectorModel.GROUP_PLUGINS)
+_ch13c = _ch13c["children"] if _ch13c else []
+_folders13c = [c.get("label") for c in _ch13c
+               if c.get("group") == ServiceSelectorModel.GROUP_CATEGORY]
+_leaves13c = [c.get("plugin_id") for c in _ch13c if c.get("plugin_id")]
+check("P16.08 T3) Ordner vor Blaettern, alphabetisch (K8)",
+      _folders13c == ["📁 abc", "📁 Grid", "📁 Trend"]
+      and _leaves13c == ["middle"],
+      f"folders={_folders13c} leaves={_leaves13c}")
+
+# --- T4: keine leeren Ordner (K9) -------------------------------------------
+check("P16.08 T4) keine leeren Ordner (K9)",
+      _p1608_no_empty(_ch13c) and _p1608_no_empty(_children13), "")
+
+# --- T5: MasterTree-Verhalten (K3/K4/K5/K7) ---------------------------------
+_tree13d = MasterTree(_p1608_model({
+    "plugin_a": _P1608Plugin("plugin_a", category="A/B"),
+    "plain": _P1608Plugin("plain"),
+}))
+_tree13d.expandAll()
+pump()
+_cat_items13 = [i for i in TreeItemIterator(_tree13d)
+                if i is not None
+                and i.data(0, ROLE_NODE_TYPE) == TYPE_CATEGORY]
+# 17.01.01: plugin_a mit Kategorie 'A/B' erscheint NUR noch in der
+# Services-Gruppe (Standalone-Gruppe entfaellt) -> 1 Baum x 2 Ordner
+# (A, B) = 2 Ordner-Knoten.
+check("P16.08 T5) Ordner-Knoten im Baum vorhanden",
+      len(_cat_items13) == 2, str(len(_cat_items13)))
+if _cat_items13:
+    _cat13 = _cat_items13[0]
+    check("P16.08 T5) Ordner nicht auswaehlbar (K3)",
+          not (_cat13.flags() & Qt.ItemIsSelectable), "")
+    # 17.01.02 (Bugfix-Runde): Kategorie-Ordner tragen jetzt einen
+# Info-Button (wie Set-Zeilen) – emittiert category_info_requested.
+check("P16.08 T5) Ordner MIT Info-Button (17.01.02)",
+      _tree13d.itemWidget(_cat13, 1) is not None, "")
+# Checkbox-Modus: Ordner nicht anhakbar (K4); Plugin-Blatt in Ordner bleibt
+# checked_services-faehig.
+_tree13d.set_checkable(True)
+pump()
+_cat_items13b = [i for i in TreeItemIterator(_tree13d)
+                 if i is not None
+                 and i.data(0, ROLE_NODE_TYPE) == TYPE_CATEGORY]
+if _cat_items13b:
+    check("P16.08 T5) Ordner nicht anhakbar im Checkbox-Modus (K4)",
+          all(not (i.flags() & Qt.ItemIsUserCheckable)
+              for i in _cat_items13b), "")
+_tree13d.set_checked_feature_ids(["plugin_a"])
+_svcs13 = _tree13d.checked_services()
+check("P16.08 T5) Plugin-Blatt in Ordner bleibt checked_services-faehig",
+      any(s.get("plugin_id") == "plugin_a" for s in _svcs13), str(_svcs13))
+if _cat_items13b:
+    _tree13d.setCurrentItem(_cat_items13b[0])
+    check("P16.08 T5) Ordner-Selektion -> Default (K7)",
+          _tree13d.current_selection() == {"set_id": "", "service_id": ""},
+          str(_tree13d.current_selection()))
+_tree13d.hide()
+pump()
+
+
+# ---------------------------------------------------------------------------
+# Teil 14 (Phase 17.01, 07.08.2026): Grouped Swing Services (E-1..E-8).
+#   T1) PluginRegistry enthaelt srv_swing_structure / _momentum / _volume_profile
+#   T2) MasterTree-Kategorien (build_tree, echte Plugin-Instanzen + Duck-Typ-
+#       Stubs wie Teil 13): 'Swing Points/Geometrie', 'Swing Points/Dynamik &
+#       Filter', 'Swing Points/Volumen & Grid'
+#   T3) PK-Migration: 2 Services koexistieren auf derselben Bar
+#       (store_plugin_payload, 4-Spalten-Upsert auf Test-DB)
+#   T4) Negativtest: 3-Spalten-ON CONFLICT wirft nach Migration BinderException
+# ---------------------------------------------------------------------------
+print("\n=== Teil 14: Phase 17.01 Swing Services (E-1..E-8) ===")
+from analytics.features.feature_builder import (  # noqa: E402
+    PluginRegistry, FeatureBuilder,
+)
+
+# --- T1: Registry-Registrierung --------------------------------------------
+_reg1701 = PluginRegistry()
+_p1701_ids = [
+    "srv_swing_structure",
+    "srv_swing_momentum",
+    "srv_swing_volume_profile",
+]
+_p1701_plugins = {}
+for _pid1701 in _p1701_ids:
+    try:
+        _p1701_plugins[_pid1701] = _reg1701.get(_pid1701)
+        check(f"17.01 T1) Registry {_pid1701}", True, "")
+    except KeyError:
+        check(f"17.01 T1) Registry {_pid1701}", False, "nicht registriert")
+
+# --- T2: MasterTree-Kategorien (build_tree, echte Plugins) ------------------
+_p1701_model = ServiceSelectorModel(
+    set_repo=_P1608SetRepo(), state_manager=_P1608StateMgr(),
+    registry=_P1608Registry(_p1701_plugins), feature_store_reader=_P1608FSReader())
+_p1701_tree = _p1701_model.build_tree()
+_p1701_group = _p1608_group(_p1701_tree, ServiceSelectorModel.GROUP_PLUGINS)
+
+
+def _p1701_categories(node, prefix, acc):
+    """Sammelt rekursiv alle Ordner-Pfade (z. B. 'Swing Points/Geometrie')."""
+    for n in node.get("children") or []:
+        if n.get("group") == ServiceSelectorModel.GROUP_CATEGORY:
+            label = n.get("label", "").replace("📁 ", "").strip()
+            full = f"{prefix}/{label}" if prefix else label
+            acc.append(full)
+            _p1701_categories(n, full, acc)
+
+
+_p1701_paths = []
+_p1701_categories(_p1701_group or {}, "", _p1701_paths)
+for _cat1701 in ["Swing Points/Geometrie", "Swing Points/Dynamik & Filter",
+                 "Swing Points/Volumen & Grid"]:
+    check(f"17.01 T2) Kategorie '{_cat1701}' im MasterTree",
+          any(_cat1701.lower() == p.lower() for p in _p1701_paths),
+          f"paths={_p1701_paths}")
+
+# --- T3/T4: PK-Migration – Koexistenz + Negativtest (Test-DB) ---------------
+_p1701_tmp = tempfile.mkdtemp(prefix="p1701_")
+_p1701_db = os.path.join(_p1701_tmp, "analytics_17.duckdb")
+_p1701_db = os.path.join(_p1701_tmp, "analytics_17.duckdb")
+# ACHTUNG: store_plugin_payload() schliesst eine uebergebene Connection
+# (Bestandsverhalten own_connection=True) -> pro Aufruf frisch oeffnen.
+_p1701_con = duckdb.connect(_p1701_db)
+_p1701_con.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR NOT NULL,
+        timeframe VARCHAR NOT NULL,
+        bar_time TIMESTAMPTZ NOT NULL,
+        ema_diff DOUBLE,
+        rsi_14 DOUBLE,
+        atr_normalized DOUBLE,
+        created_at TIMESTAMP DEFAULT current_timestamp,
+        feature_id VARCHAR NOT NULL DEFAULT 'native',
+        plugin_version VARCHAR,
+        instance_hash VARCHAR,
+        feature_data JSON,
+        PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
+    )
+""")
+_p1701_con.close()
+_p1701_fb = object.__new__(FeatureBuilder)  # ohne __init__ (kein StateManager)
+_p1701_payload1 = {
+    "feature_id": "srv_swing_structure",
+    "plugin_version": "1.0.0",
+    "records": [{"bar_time": 1770000000, "is_swing_high": True}],
+}
+_p1701_payload2 = {
+    "feature_id": "srv_swing_momentum",
+    "plugin_version": "1.0.0",
+    "records": [{"bar_time": 1770000000, "is_swing_high": False}],
+}
+_p1701_con = duckdb.connect(_p1701_db)
+_n1701_1 = FeatureBuilder.store_plugin_payload(
+    _p1701_fb, "XAGUSD", "M1", _p1701_payload1, con=_p1701_con)
+_p1701_con = duckdb.connect(_p1701_db)
+_n1701_2 = FeatureBuilder.store_plugin_payload(
+    _p1701_fb, "XAGUSD", "M1", _p1701_payload2, con=_p1701_con)
+_p1701_con = duckdb.connect(_p1701_db)
+_p1701_rows = _p1701_con.execute("""
+    SELECT feature_id FROM feature_store
+    WHERE LOWER(symbol)='xagusd' AND LOWER(timeframe)='m1'
+      AND EXTRACT('epoch' FROM bar_time)::BIGINT = 1770000000
+    ORDER BY feature_id
+""").fetchall()
+_p1701_fids = [r[0] for r in _p1701_rows]
+check("17.01 T3) Zwei Services koexistieren auf derselben Bar",
+      _n1701_1 == 1 and _n1701_2 == 1 and set(_p1701_fids) == {
+          "srv_swing_structure", "srv_swing_momentum"},
+      f"rows={_p1701_fids}")
+try:
+    _p1701_con.execute("""
+        INSERT INTO feature_store (symbol, timeframe, bar_time, feature_id, feature_data)
+        VALUES ('XAGUSD','M1', to_timestamp(1770000000), 'srv_grid_lines', '{"x":1}')
+        ON CONFLICT (symbol, timeframe, bar_time) DO UPDATE SET
+            feature_data = EXCLUDED.feature_data
+    """)
+    check("17.01 T4) 3-Spalten-ON CONFLICT wirft nach Migration",
+          False, "kein Fehler geworfen")
+except duckdb.BinderException:
+    check("17.01 T4) 3-Spalten-ON CONFLICT wirft nach Migration", True, "")
+_p1701_con.close()
+import shutil  # noqa: E402
+shutil.rmtree(_p1701_tmp, ignore_errors=True)
+
+# ---------------------------------------------------------------------------
+# Teil 15 (Phase 17.01.01, 07.08.2026): MasterTree Refactoring.
+#   T1) GROUP_STANDALONE existiert nicht mehr (Konstante entfernt)
+#   T2) build_tree liefert genau 2 Root-Gruppen ('📁 Sets', '📦 Services')
+#   T3) Keine Gruppe 'standalone' mehr in der Hierarchie
+#   T4) Swing-Services (Teil 14) wandern in die Hauptgruppe: Kategorie-Ordner
+#       'Swing Points/...' + flache Blaetter koexistieren (K9: keine leeren)
+# ---------------------------------------------------------------------------
+print("\n=== Teil 15: Phase 17.01.01 MasterTree Refactoring ===")
+
+# --- T1: GROUP_STANDALONE entfernt ----------------------------------------
+check("17.01.01 T1) GROUP_STANDALONE existiert nicht mehr",
+      not hasattr(ServiceSelectorModel, "GROUP_STANDALONE"), "")
+
+# --- T2: Genau 2 Root-Gruppen mit kompakten Labels -------------------------
+_p170101_tree = _p1701_model.build_tree()
+_p170101_labels = [(g.get("group"), g.get("label")) for g in _p170101_tree]
+check("17.01.01 T2) Genau 2 Root-Gruppen (Sets/Services)",
+      len(_p170101_tree) == 2
+      and _p170101_labels == [
+          (ServiceSelectorModel.GROUP_SETS, "📁 Sets"),
+          (ServiceSelectorModel.GROUP_PLUGINS, "📦 Services")],
+      str(_p170101_labels))
+
+# --- T3: Keine Standalone-Gruppe in der Hierarchie -------------------------
+check("17.01.01 T3) Keine Gruppe 'standalone' in build_tree",
+      all(g.get("group") != "standalone" for g in _p170101_tree),
+      str(_p170101_labels))
+
+# --- T4: Swing-Services in der Hauptgruppe (Ordner + flache Blaetter) ------
+_p170101_group = _p1608_group(_p170101_tree, ServiceSelectorModel.GROUP_PLUGINS)
+_p170101_paths15 = []
+_p1701_categories(_p170101_group or {}, "", _p170101_paths15)
+_p170101_ids = set()
+
+
+def _p170101_collect_ids(node, acc):
+    for n in node.get("children") or []:
+        if n.get("group") == ServiceSelectorModel.GROUP_CATEGORY:
+            _p170101_collect_ids(n, acc)
+        else:
+            acc.add(n.get("plugin_id"))
+
+
+_p170101_collect_ids(_p170101_group or {}, _p170101_ids)
+check("17.01.01 T4) Swing-Services in Hauptgruppe (Ordner + Blaetter)",
+      "Swing Points/Geometrie" in _p170101_paths15
+      and set(_p1701_ids) <= _p170101_ids
+      and _p1608_no_empty(_p170101_group["children"]),
+      f"paths={_p170101_paths15} ids={sorted(_p170101_ids)}")
+
+# ---------------------------------------------------------------------------
+# Teil 16 (Phase 17.01.02, 07.08.2026): Services-Gruppen-Funktionalitaet.
+#   T1) ServiceSelectorModel.category_plugin_ids(): rekursiv (Praefix-Pfad),
+#       deterministisch sortiert, case-insensitiv.
+#   T2) Kategorie-Ordner tragen einen Info-Button und emittieren
+#       category_info_requested mit dem vollen Kategorie-Pfad.
+#   T3) run_plugin_requested / run_category_requested-Signale vorhanden.
+#   T4) Ad-hoc-Definitionen (Plugin-/Kategorie-Run) sind evaluator-tauglich:
+#       execution_order/services-konsistent + prepare_worker_definition ok.
+# ---------------------------------------------------------------------------
+print("\n=== Teil 16: Phase 17.01.02 Services-Gruppen-Funktionalitaet ===")
+
+# --- T1: category_plugin_ids (rekursiv) -------------------------------------
+_p170102_model = _p1608_model({
+    "srv_a": _P1608Plugin("srv_a", category="Swing Points/Geometrie"),
+    "srv_b": _P1608Plugin("srv_b", category="Swing Points/Dynamik & Filter"),
+    "srv_c": _P1608Plugin("srv_c", category="Swing Points/Geometrie"),
+    "srv_flat": _P1608Plugin("srv_flat", category="Grid"),
+    "srv_none": _P1608Plugin("srv_none", category=""),
+})
+check("17.01.02 T1) category_plugin_ids('Swing Points/Geometrie')",
+      _p170102_model.category_plugin_ids("Swing Points/Geometrie")
+      == ["srv_a", "srv_c"],
+      str(_p170102_model.category_plugin_ids("Swing Points/Geometrie")))
+check("17.01.02 T1) category_plugin_ids('Swing Points') rekursiv",
+      _p170102_model.category_plugin_ids("Swing Points")
+      == ["srv_a", "srv_b", "srv_c"],
+      str(_p170102_model.category_plugin_ids("Swing Points")))
+check("17.01.02 T1) category_plugin_ids case-insensitiv",
+      _p170102_model.category_plugin_ids("swing points/geometrie")
+      == ["srv_a", "srv_c"],
+      str(_p170102_model.category_plugin_ids("swing points/geometrie")))
+check("17.01.02 T1) category_plugin_ids leer -> []",
+      _p170102_model.category_plugin_ids("") == [])
+
+# --- T2: Ordner-Info-Button + category_info_requested -----------------------
+_p170102_tree = MasterTree(_p170102_model)
+_p170102_tree.expandAll()
+pump()
+_p170102_cat_items = [i for i in TreeItemIterator(_p170102_tree)
+                      if i is not None
+                      and i.data(0, ROLE_NODE_TYPE) == TYPE_CATEGORY]
+_p170102_cat_sigs = []
+# 18.01.03 (L3): category_info_requested traegt (group, path).
+_p170102_tree.category_info_requested.connect(
+    lambda _g, _p: _p170102_cat_sigs.append((_g, _p)))
+_cat_btn_ok = False
+_cat_path_ok = False
+for _ci in _p170102_cat_items:
+    _btn = _p170102_tree.itemWidget(_ci, 1)
+    if isinstance(_btn, QPushButton):
+        _cat_btn_ok = True
+        _btn.click()
+        if _p170102_cat_sigs:
+            _cat_path_ok = (len(_p170102_cat_sigs[-1]) == 2
+                            and _p170102_cat_sigs[-1][1]
+                            == "Swing Points/Geometrie")
+check("17.01.02 T2) Ordner-Info-Button vorhanden",
+      _cat_btn_ok, "")
+check("17.01.02 T2) category_info_requested Pfad korrekt",
+      _cat_path_ok, "sigs=" + str(_p170102_cat_sigs))
+check("17.01.02 T2) category_plugin_ids stimmt mit Pfad ueberein",
+      _p170102_cat_sigs and _p170102_model.category_plugin_ids(
+          _p170102_cat_sigs[-1][1]) == ["srv_a", "srv_c"],
+      "sigs=" + str(_p170102_cat_sigs))
+
+# --- T3: Run-Signale vorhanden ----------------------------------------------
+_p170102_plugin_items = [i for i in TreeItemIterator(_p170102_tree)
+                         if i is not None
+                         and i.data(0, ROLE_NODE_TYPE) == TYPE_PLUGIN]
+check("17.01.02 T3) Plugin-Zeilen vorhanden",
+      any(i.data(0, ROLE_PLUGIN_ID) == "srv_a"
+          for i in _p170102_plugin_items), "")
+check("17.01.02 T3) run_plugin_requested-Signal vorhanden",
+      hasattr(_p170102_tree, "run_plugin_requested"), "")
+check("17.01.02 T3) run_category_requested-Signal vorhanden",
+      hasattr(_p170102_tree, "run_category_requested"), "")
+check("17.01.02 T3) category_info_requested-Signal vorhanden",
+      hasattr(_p170102_tree, "category_info_requested"), "")
+
+# --- T4: Ad-hoc-Definitionen evaluator-tauglich -----------------------------
+from serviceui.service_set_utils import prepare_worker_definition  # noqa: E402
+_p170102_def_plugin = {
+    "set_id": "plugin_srv_a",
+    "display_name": "srv_a",
+    "execution_order": ["srv_a"],
+    "services": {"srv_a": {"plugin_id": "srv_a"}},
+}
+_p170102_def_cat = {
+    "set_id": "category_Swing Points/Geometrie",
+    "display_name": "Swing Points/Geometrie",
+    "execution_order": ["srv_a", "srv_c"],
+    "services": {
+        "srv_a": {"plugin_id": "srv_a"},
+        "srv_c": {"plugin_id": "srv_c"},
+    },
+}
+for _label, _def in (("Plugin", _p170102_def_plugin),
+                     ("Kategorie", _p170102_def_cat)):
+    _order = _def["execution_order"]
+    _ok = (bool(_order)
+           and all(iid in _def["services"] for iid in _order)
+           and all((_def["services"][iid].get("plugin_id"))
+                   for iid in _order))
+    check("17.01.02 T4) " + _label + "-Definition konsistent", _ok,
+          str(_def))
+    _prep = prepare_worker_definition(dict(_def), 100000)
+    check("17.01.02 T4) " + _label + "-Definition prepare_worker ok",
+          _prep["execution_order"] == _def["execution_order"]
+          and set(_prep["services"]) == set(_def["services"]), "")
+
+_p170102_tree.hide()
+pump()
+
+
+# ===========================================================================
+# Teil 17: Phase 17.01.02 - srv_swing_structure echte Swing-Erkennung
+#   T1) Alle 6 Erkennungs-Modi liefern einen dichten Record-Satz
+#       (1 Record/Bar, Datenvertrag 17.01 §4) mit Swing-Highs/Lows,
+#       kausalen Zeitstempeln (confirmation >= event) und
+#       INSUFFICIENT_DATA am Serienanfang (Lookback-Modi).
+#   T2) store_plugin_payload persistiert den Payload in einer Test-DuckDB
+#       (feature_store, 4-Spalten-PK) -> Rows > 0
+#       (Bugfix '0 Feature-Row(s)' im Store, SILVER).
+# ===========================================================================
+print("\n=== Teil 17: Phase 17.01.02 Swing-Erkennung srv_swing_structure ===")
+
+from analytics.features.definitions.srv_swing_structure import SrvSwingStructure  # noqa: E402
+from analytics.features.feature_builder import FeatureBuilder  # noqa: E402
+import json as _json17  # noqa: E402
+
+_srv_sw = SrvSwingStructure()
+check("17 T0) plugin_id", _srv_sw.plugin_id == "srv_swing_structure",
+      _srv_sw.plugin_id)
+check("17 T0) capability feature_store",
+      bool(_srv_sw.capabilities.get("feature_store")), "")
+
+# --- Synthetische OHLCV-Serie (3 Tage M5, 864 Bars) mit klaren Swings ------
+# Sinusfoermige Preisbewegung (Amplitude 1.5) + kleines Wobble -> Fraktal-,
+# Pivot-, Gann-, ZigZag- und Period-Extrema-Swings sind garantiert erkennbar.
+_p17_n = 864
+_p17_period = 300  # M5
+_p17_t0 = 1700000000  # 2023-11-14, UTC
+_p17_ts = _p17_t0 + np.arange(_p17_n) * _p17_period
+_p17_ph = np.linspace(0.0, 6.0 * np.pi, _p17_n)
+_p17_close = 30.0 + 1.5 * np.sin(_p17_ph) + 0.02 * np.sin(_p17_ph * 7.0)
+_p17_open = _p17_close - 0.02  # konstanter Gap: high/low folgen
+                              # streng dem close -> Fraktal-Plateaus vermeiden
+_p17_high = np.maximum(_p17_open, _p17_close) + 0.08
+_p17_low = np.minimum(_p17_open, _p17_close) - 0.08
+_p17_df = pd.DataFrame({
+    "time": _p17_ts.astype(np.int64),
+    "open": _p17_open,
+    "high": _p17_high,
+    "low": _p17_low,
+    "close": _p17_close,
+})
+
+# --- T1: Alle Erkennungs-Modi -------------------------------------------------
+_p17_modes = [
+    ("Williams_Fractal", {"mode": "Williams_Fractal", "left_bars": 2, "right_bars": 2}),
+    ("Standard_Pivot", {"mode": "Standard_Pivot", "left_bars": 3, "right_bars": 3}),
+    ("Gann_Mechanical", {"mode": "Gann_Mechanical", "left_bars": 2, "right_bars": 2}),
+    ("ZigZag_ATR", {"mode": "ZigZag_ATR", "atr_period": 14, "atr_mult": 1.5}),
+    ("ZigZag_Pct", {"mode": "ZigZag_Pct", "change_pct": 0.5}),
+    ("Period_Extrema/Current", {"mode": "Period_Extrema", "period_extrema_type": "CURRENT_DEVELOPING"}),
+    ("Period_Extrema/PrevClosed", {"mode": "Period_Extrema", "period_extrema_type": "PREVIOUS_CLOSED"}),
+]
+_p17_payloads = {}
+for _label, _params in _p17_modes:
+    _res = _srv_sw.calculate(_p17_df, dict(_params))
+    _payload = _res.get("feature_store_payload") or {}
+    _recs = _payload.get("records") or []
+    _p17_payloads[_label] = _payload
+    check("17 T1) " + _label + ": records dicht",
+          len(_recs) == _p17_n, f"{len(_recs)}/{_p17_n}")
+    _n_hi = sum(1 for r in _recs if r["is_swing_high"])
+    _n_lo = sum(1 for r in _recs if r["is_swing_low"])
+    check("17 T1) " + _label + ": swing highs > 0", _n_hi > 0, str(_n_hi))
+    check("17 T1) " + _label + ": swing lows > 0", _n_lo > 0, str(_n_lo))
+    check("17 T1) " + _label + ": kausale Zeitstempel",
+          all(int(r["confirmation_bar_time"]) >= int(r["event_bar_time"])
+              for r in _recs), "")
+    _meta = _payload.get("metadata") or {}
+    check("17 T1) " + _label + ": schema_version",
+          _meta.get("schema_version") == "1.0.0",
+          str(_meta.get("schema_version")))
+    check("17 T1) " + _label + ": Metadata totals",
+          _meta.get("total_swing_highs") == _n_hi
+          and _meta.get("total_swing_lows") == _n_lo,
+          str(_meta))
+
+# INSUFFICIENT_DATA am Serienanfang (nur Lookback-Modi / Period-Extrema)
+for _label in ("Williams_Fractal", "Standard_Pivot", "Gann_Mechanical",
+               "ZigZag_ATR", "Period_Extrema/Current",
+               "Period_Extrema/PrevClosed"):
+    _recs = (_p17_payloads.get(_label) or {}).get("records") or []
+    _st = str(_recs[0]["calculation_status"]) if _recs else "no records"
+    check("17 T1) " + _label + ": Start INSUFFICIENT_DATA",
+          bool(_recs) and _recs[0]["calculation_status"] == "INSUFFICIENT_DATA",
+          _st)
+
+# --- T2: store_plugin_payload auf Test-DuckDB (feature_store) ----------------
+# Test-DB im test/-Ordner (Regel: Test-Datenbanken nie im Projekt-Root/data).
+_p17_db = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "test_p17_swing.duckdb")
+if os.path.exists(_p17_db):
+    os.remove(_p17_db)
+_con17 = duckdb.connect(_p17_db)
+_con17.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR NOT NULL,
+        timeframe VARCHAR NOT NULL,
+        bar_time TIMESTAMPTZ NOT NULL,
+        ema_diff DOUBLE,
+        rsi_14 DOUBLE,
+        atr_normalized DOUBLE,
+        created_at TIMESTAMP DEFAULT current_timestamp,
+        feature_id VARCHAR NOT NULL DEFAULT 'native',
+        plugin_version VARCHAR,
+        instance_hash VARCHAR,
+        feature_data JSON,
+        PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
+    )
+""")
+_fb17 = FeatureBuilder()
+_p17_payload = _p17_payloads["Williams_Fractal"]
+_n_written = _fb17.store_plugin_payload("SILVER_TEST", "M5", _p17_payload,
+                                        con=_con17)
+# store_plugin_payload schliesst uebergebene Conns selbst (own_connection) ->
+# fuer die Verifikation neu verbinden.
+_con17_check = duckdb.connect(_p17_db)
+_p17_rows = _con17_check.execute(
+    "SELECT count(*) FROM feature_store WHERE symbol='SILVER_TEST' "
+    "AND timeframe='M5' AND feature_id='srv_swing_structure'"
+).fetchone()[0]
+_p17_feat = _con17_check.execute(
+    "SELECT feature_data FROM feature_store WHERE symbol='SILVER_TEST' "
+    "AND timeframe='M5' AND feature_id='srv_swing_structure' LIMIT 1"
+).fetchone()
+_con17_check.close()
+check("17 T2) store_plugin_payload rows > 0", _n_written == _p17_n,
+      str(_n_written))
+check("17 T2) feature_store rows == bars", _p17_rows == _p17_n,
+      str(_p17_rows))
+check("17 T2) feature_data ist JSON mit result_type",
+      bool(_p17_feat)
+      and _json17.loads(_p17_feat[0]).get("result_type") == "SWING",
+      str(_p17_feat[0] if _p17_feat else None)[:120])
+
+# Cleanup der Test-DB
+try:
+    os.remove(_p17_db)
+except OSError as _e17:
+    print("  [17] Cleanup Test-DB uebersprungen:", _e17)
+
+
+# ===========================================================================
+# Teil 18: Phase 17.01.02 - srv_swing_momentum + srv_swing_volume_profile
+#   T1) srv_swing_momentum (3 Modi, alle 12 MA-Typen) liefert dichte
+#       Record-Saetze mit Swing-Highs/Lows, kausalen Zeitstempeln,
+#       schema_version und INSUFFICIENT_DATA am Serienanfang (MA-/ATR-
+#       Warmup). Bugfix: Warmup-NaN darf die Hysterese-Erkennung nicht
+#       blockieren (vorher 0 Swings fuer SMA/WMA/HMA/...).
+#   T2) srv_swing_volume_profile (3 Modi) liefert dichte Record-Saetze mit
+#       den modus-spezifischen Zusatzfeldern (17.01 §4.2) und kausalen
+#       Zeitstempeln.
+#   T3) store_plugin_payload persistiert beide Payloads in einer
+#       Test-DuckDB (feature_store, 4-Spalten-PK) -> Rows == bars je
+#       feature_id (konfliktfreie Koexistenz auf derselben Kerze).
+#   T4) Bugfix 'Keine OHLCV-Daten'-Meldung (run_worker.py): Daten vorhanden
+#       + 0 Records -> praezise Meldung 'Kein Feature-Store-Payload';
+#       nur wenn die Quelle leer ist -> 'Keine OHLCV-Daten' (U18 bleibt).
+# ===========================================================================
+print("\n=== Teil 18: Phase 17.01.02 Momentum- + Volume-Profile-Erkennung ===")
+
+from analytics.features.definitions.srv_swing_momentum import SrvSwingMomentum  # noqa: E402
+from analytics.features.definitions.srv_swing_volume_profile import SrvSwingVolumeProfile  # noqa: E402
+
+_srv_mom = SrvSwingMomentum()
+_srv_vp = SrvSwingVolumeProfile()
+check("18 T0) plugin_ids", _srv_mom.plugin_id == "srv_swing_momentum"
+      and _srv_vp.plugin_id == "srv_swing_volume_profile",
+      _srv_mom.plugin_id + "/" + _srv_vp.plugin_id)
+check("18 T0) capability feature_store",
+      bool(_srv_mom.capabilities.get("feature_store"))
+      and bool(_srv_vp.capabilities.get("feature_store")), "")
+
+# --- Synthetische OHLCV-Serie (3 Tage M5, 864 Bars) mit Volumen -----------
+_p18_n = 864
+_p18_period = 300
+_p18_t0 = 1700000000
+_p18_ts = _p18_t0 + np.arange(_p18_n) * _p18_period
+_p18_ph = np.linspace(0.0, 6.0 * np.pi, _p18_n)
+_p18_close = 30.0 + 1.5 * np.sin(_p18_ph) + 0.02 * np.sin(_p18_ph * 7.0)
+_p18_open = _p18_close - 0.02
+_p18_high = np.maximum(_p18_open, _p18_close) + 0.08
+_p18_low = np.minimum(_p18_open, _p18_close) - 0.08
+_p18_vol = (1000.0 + 500.0 * np.abs(np.sin(_p18_ph * 3.0)) + 50.0).astype(np.int64)
+_p18_df = pd.DataFrame({
+    "time": _p18_ts.astype(np.int64),
+    "open": _p18_open,
+    "high": _p18_high,
+    "low": _p18_low,
+    "close": _p18_close,
+    "tick_volume": _p18_vol,
+})
+
+# --- T1: srv_swing_momentum -------------------------------------------------
+_p18_mom_modes = [
+    ("MA_Peak_Hysteresis",
+     {"mode": "MA_Peak_Hysteresis", "ma_type": "EMA", "period": 10,
+      "piv_maxMaMovePct": 0.1}),
+    ("MA_Slope_Change",
+     {"mode": "MA_Slope_Change", "ma_type": "SMA", "period": 10}),
+    ("Chande_Kroll_Ratchet",
+     {"mode": "Chande_Kroll_Ratchet", "chande_lookback": 10, "x_atr": 1.5,
+      "period": 14}),
+]
+_p18_mom_payloads = {}
+for _label, _params in _p18_mom_modes:
+    _payload = _srv_mom.calculate(_p18_df, dict(_params)).get(
+        "feature_store_payload") or {}
+    _recs = _payload.get("records") or []
+    _p18_mom_payloads[_label] = _payload
+    check("18 T1) mom " + _label + ": records dicht",
+          len(_recs) == _p18_n, f"{len(_recs)}/{_p18_n}")
+    _hi = sum(1 for r in _recs if r["is_swing_high"])
+    _lo = sum(1 for r in _recs if r["is_swing_low"])
+    check("18 T1) mom " + _label + ": highs > 0", _hi > 0, str(_hi))
+    check("18 T1) mom " + _label + ": lows > 0", _lo > 0, str(_lo))
+    check("18 T1) mom " + _label + ": kausale Zeitstempel",
+          all(int(r["confirmation_bar_time"]) >= int(r["event_bar_time"])
+              for r in _recs), "")
+    check("18 T1) mom " + _label + ": schema_version",
+          (_payload.get("metadata") or {}).get("schema_version") == "1.0.0",
+          str((_payload.get("metadata") or {}).get("schema_version")))
+
+# Alle 12 MA-Typen im MA_Peak_Hysteresis-Modus (Bugfix 0-Swings bei
+# Warmup-NaN, z. B. SMA/WMA/HMA/EHMA/ZLEMA/KAMA/ALMA/VWMA).
+_p18_ma_types = ["SMA", "EMA", "WMA", "DEMA", "TEMA", "HMA", "EHMA",
+                 "ZLEMA", "RMA", "KAMA", "ALMA", "VWMA"]
+for _mt in _p18_ma_types:
+    _payload = _srv_mom.calculate(_p18_df, {
+        "mode": "MA_Peak_Hysteresis", "ma_type": _mt, "period": 10,
+        "piv_maxMaMovePct": 0.1}).get("feature_store_payload") or {}
+    _recs = _payload.get("records") or []
+    _hi = sum(1 for r in _recs if r["is_swing_high"])
+    check("18 T1) mom MA-Typ " + _mt + ": highs > 0",
+          _hi > 0, f"{_hi}/{len(_recs)}")
+
+# Start-Status: Warmup-MA/ATR -> INSUFFICIENT_DATA am Serienanfang.
+_p18_start_mom = _srv_mom.calculate(_p18_df, {
+    "mode": "MA_Slope_Change", "ma_type": "SMA", "period": 10}).get(
+    "feature_store_payload") or {}
+_p18_start_recs = _p18_start_mom.get("records") or []
+check("18 T1) mom MA_Slope_Change/SMA: Start INSUFFICIENT_DATA",
+      bool(_p18_start_recs)
+      and _p18_start_recs[0]["calculation_status"] == "INSUFFICIENT_DATA",
+      str(_p18_start_recs[0]["calculation_status"]) if _p18_start_recs else "")
+_p18_start_ck = _srv_mom.calculate(_p18_df, {
+    "mode": "Chande_Kroll_Ratchet", "chande_lookback": 10, "x_atr": 1.5,
+    "period": 14}).get("feature_store_payload") or {}
+_p18_start_ck_recs = _p18_start_ck.get("records") or []
+check("18 T1) mom Chande_Kroll: Start INSUFFICIENT_DATA",
+      bool(_p18_start_ck_recs)
+      and _p18_start_ck_recs[0]["calculation_status"] == "INSUFFICIENT_DATA",
+      str(_p18_start_ck_recs[0]["calculation_status"])
+      if _p18_start_ck_recs else "")
+
+# --- T2: srv_swing_volume_profile -------------------------------------------
+_p18_vp_modes = [
+    ("Volume_Profile",
+     {"mode": "Volume_Profile", "profile_period": "Sessions",
+      "value_area_pct": 0.7, "lvn_sensitivity": 0.2,
+      "volume_source": "tick_volume"}),
+    ("Grid_Proximity", {"mode": "Grid_Proximity", "grid_step": 0.5}),
+    ("Anchored_VWAP",
+     {"mode": "Anchored_VWAP", "vwap_anchor": "Session_Start",
+      "vwap_band_mult": 2.0}),
+]
+_p18_vp_payloads = {}
+for _label, _params in _p18_vp_modes:
+    _payload = _srv_vp.calculate(_p18_df, dict(_params)).get(
+        "feature_store_payload") or {}
+    _recs = _payload.get("records") or []
+    _p18_vp_payloads[_label] = _payload
+    check("18 T2) vp " + _label + ": records dicht",
+          len(_recs) == _p18_n, f"{len(_recs)}/{_p18_n}")
+    check("18 T2) vp " + _label + ": kausale Zeitstempel",
+          all(int(r["confirmation_bar_time"]) >= int(r["event_bar_time"])
+              for r in _recs), "")
+    check("18 T2) vp " + _label + ": schema_version",
+          (_payload.get("metadata") or {}).get("schema_version") == "1.0.0",
+          str((_payload.get("metadata") or {}).get("schema_version")))
+    _ok = [r for r in _recs if r["calculation_status"] == "OK"]
+    check("18 T2) vp " + _label + ": OK-Bars vorhanden",
+          len(_ok) > 0, str(len(_ok)))
+    if _label == "Volume_Profile":
+        check("18 T2) vp Volume_Profile: Felder §4.2",
+              all({"poc_price", "vah_price", "val_price", "lvn_price",
+                   "is_lvn_swing", "volume_source"} <= set(r)
+                  for r in _ok), "")
+        check("18 T2) vp Volume_Profile: POC/VAH/VAL numerisch",
+              all(r["poc_price"] is not None and r["vah_price"] is not None
+                  and r["val_price"] is not None for r in _ok), "")
+        check("18 T2) vp Volume_Profile: VA-Grenzen konsistent",
+              all(r["vah_price"] >= r["poc_price"] >= r["val_price"]
+                  for r in _ok), "")
+        check("18 T2) vp Volume_Profile: LVN-Swings + Preis-Swings > 0",
+              any(r["is_lvn_swing"] for r in _ok)
+              and any(r["is_swing_high"] for r in _ok)
+              and any(r["is_swing_low"] for r in _ok), "")
+    elif _label == "Grid_Proximity":
+        check("18 T2) vp Grid_Proximity: grid_price-Feld",
+              all("grid_price" in r for r in _ok), "")
+        check("18 T2) vp Grid_Proximity: Crossings > 0",
+              any(r["is_swing_high"] for r in _recs)
+              and any(r["is_swing_low"] for r in _recs), "")
+    else:  # Anchored_VWAP
+        check("18 T2) vp Anchored_VWAP: vwap-Felder §4.2",
+              all({"vwap_price", "vwap_upper", "vwap_lower"} <= set(r)
+                  for r in _ok), "")
+        check("18 T2) vp Anchored_VWAP: upper >= vwap >= lower",
+              all(r["vwap_upper"] >= r["vwap_price"] >= r["vwap_lower"]
+                  for r in _ok), "")
+        check("18 T2) vp Anchored_VWAP: event=Anker <= confirmation",
+              all(int(r["event_bar_time"]) <= int(r["confirmation_bar_time"])
+                  for r in _recs), "")
+
+# --- T3: store_plugin_payload auf Test-DuckDB --------------------------------
+_p18_db = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "test_p18_swing.duckdb")
+if os.path.exists(_p18_db):
+    os.remove(_p18_db)
+_con18 = duckdb.connect(_p18_db)
+_con18.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR NOT NULL,
+        timeframe VARCHAR NOT NULL,
+        bar_time TIMESTAMPTZ NOT NULL,
+        ema_diff DOUBLE,
+        rsi_14 DOUBLE,
+        atr_normalized DOUBLE,
+        created_at TIMESTAMP DEFAULT current_timestamp,
+        feature_id VARCHAR NOT NULL DEFAULT 'native',
+        plugin_version VARCHAR,
+        instance_hash VARCHAR,
+        feature_data JSON,
+        PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
+    )
+""")
+_fb18 = FeatureBuilder()
+_p18_store_payloads = [
+    ("srv_swing_momentum", _p18_mom_payloads["MA_Peak_Hysteresis"]),
+    ("srv_swing_volume_profile", _p18_vp_payloads["Volume_Profile"]),
+]
+for _fid18, _payload18 in _p18_store_payloads:
+    # store_plugin_payload schliesst uebergebene Conns selbst
+    # (own_connection=True) -> pro Store eine frische Connection.
+    _con18 = duckdb.connect(_p18_db)
+    _n18 = _fb18.store_plugin_payload("SILVER_TEST", "H1", _payload18,
+                                      con=_con18)
+    check("18 T3) store " + _fid18 + " rows == bars", _n18 == _p18_n,
+          str(_n18))
+_con18_check = duckdb.connect(_p18_db)
+for _fid18 in ("srv_swing_momentum", "srv_swing_volume_profile"):
+    _cnt18 = _con18_check.execute(
+        "SELECT count(*) FROM feature_store WHERE symbol='SILVER_TEST' "
+        "AND timeframe='H1' AND feature_id='" + _fid18 + "'").fetchone()[0]
+    check("18 T3) DB rows " + _fid18, _cnt18 == _p18_n, str(_cnt18))
+_con18_check.close()
+try:
+    os.remove(_p18_db)
+except OSError as _e18:
+    print("  [18] Cleanup Test-DB uebersprungen:", _e18)
+
+# --- T4: Worker-Meldung differenzieren (Bugfix run_worker.py) ---------------
+class _FB18:
+    """Fake-FeatureBuilder mit Daten (H1/M30) – kein DB-Zugriff."""
+
+    def __init__(self):
+        self.calls = []
+
+    def load_ohlcv(self, symbol, tf, limit=None):
+        return _p18_df.copy() if tf in ("H1", "M30") else None
+
+    def store_plugin_payload(self, symbol, tf, payload):
+        self.calls.append((symbol, tf, payload))
+
+
+class _Eval18Empty:
+    """Fake-Evaluator: Service liefert 0 Records (wie Scaffold)."""
+
+    def execute_set(self, definition, df_plugin, context=None):
+        return {"srv_a": {"feature_store_payload": {
+            "feature_id": "srv_a", "plugin_version": "1.0.0",
+            "records": []}}}
+
+
+import analytics.features.feature_builder as _fbm18  # noqa: E402
+_orig_fb18 = _fbm18.FeatureBuilder
+_fbm18.FeatureBuilder = lambda: _FB18()
+try:
+    # Daten vorhanden + 0 Records -> praezise Meldung, KEIN 'Keine OHLCV'
+    _fail18 = []
+    _wk18 = ServiceRunWorker(_Eval18Empty(), "SILVER", "H1", w_worker_def)
+    _wk18.run_failed.connect(lambda sid, e: _fail18.append((sid, e)))
+    _wk18.run()
+    check("18 T4) Daten + 0 Records -> 'Kein Feature-Store-Payload'",
+          len(_fail18) == 1
+          and "Kein Feature-Store-Payload" in _fail18[0][1]
+          and "Keine OHLCV-Daten" not in _fail18[0][1], str(_fail18))
+finally:
+    _fbm18.FeatureBuilder = _orig_fb18
+
+print("-" * 60)
+
+# ===========================================================================
+# Teil 19 (Bugfix-Runde 2, 07.08.2026):
+#   T1) i-Button Plugin-Zeilen unter 'Services' – _on_tree_info_requested
+#       ohne NameError (fehlender PluginRegistry-Import in _resolve_info_plugin)
+#   T2) store_plugin_payload setzt created_at auch fuer NEUE Rows
+#       (PK-Migration hatte den Spalten-DEFAULT entfernt -> 'Datum letzter
+#       Run' im MasterTree blieb '--.--.--'; Fix 1 + Fix 2)
+# ===========================================================================
+print("\n=== Teil 19: Bugfix i-Button Plugin-Zeilen + Datum letzter Run ===")
+
+# --- 19 T1: Plugin-Info-Dialog (Bug a) --------------------------------------
+from analytics.engine.description_dialog import (  # noqa: E402
+    ServiceDescriptionEditDialog,
+)
+
+_p19_dlg_calls = []
+
+
+def _fake_exec19(self):
+    _p19_dlg_calls.append(self.windowTitle())
+    return 1  # QDialog.Accepted
+
+
+_orig_exec19 = ServiceDescriptionEditDialog.exec
+ServiceDescriptionEditDialog.exec = _fake_exec19
+try:
+    _p19_plugin_id = "srv_grid_lines"
+    # Signal-Handler-Pfad: info_requested("", "", plugin_id) -> Plugin-Zweig
+    w._on_tree_info_requested("", "", _p19_plugin_id)
+    check("19 T1) i-Button Plugin-Zeile oeffnet Dialog (kein NameError)",
+          len(_p19_dlg_calls) == 1
+          and "Service-Beschreibung bearbeiten" in _p19_dlg_calls[0],
+          str(_p19_dlg_calls))
+    # Regressionskontrolle: _resolve_info_plugin liefert das Plugin direkt
+    _p19_pl = w._resolve_info_plugin(_p19_plugin_id)
+    check("19 T1) _resolve_info_plugin liefert Plugin",
+          _p19_pl is not None
+          and getattr(_p19_pl, "plugin_id", "") == _p19_plugin_id,
+          str(_p19_pl))
+finally:
+    ServiceDescriptionEditDialog.exec = _orig_exec19
+
+# --- 19 T2: created_at fuer NEUE Rows (Bug b) --------------------------------
+_p19_db = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "test_p19_created_at.duckdb")
+if os.path.exists(_p19_db):
+    os.remove(_p19_db)
+_p19_con = duckdb.connect(_p19_db)
+# Tabelle OHNE created_at-DEFAULT (simuliert den Zustand nach der PK-Migration
+# 17.01 E-1 – der Table-Rewrite hat den Spalten-DEFAULT entfernt).
+_p19_con.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR NOT NULL,
+        timeframe VARCHAR NOT NULL,
+        bar_time TIMESTAMPTZ NOT NULL,
+        ema_diff DOUBLE,
+        rsi_14 DOUBLE,
+        atr_normalized DOUBLE,
+        created_at TIMESTAMP,
+        feature_id VARCHAR NOT NULL DEFAULT 'native',
+        plugin_version VARCHAR,
+        instance_hash VARCHAR,
+        feature_data JSON,
+        PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
+    )
+""")
+_p19_con.close()
+
+# Fix 2: Idempotente Schema-Reparatur (check_and_init_databases-Pfad)
+_p19_con = duckdb.connect(_p19_db)
+_p19_con.execute(
+    "ALTER TABLE feature_store ALTER created_at SET DEFAULT current_timestamp")
+_p19_def19 = _p19_con.execute(
+    "SELECT column_default FROM information_schema.columns "
+    "WHERE table_name='feature_store' AND column_name='created_at'").fetchone()
+_p19_con.close()
+check("19 T2) created_at-Default wiederhergestellt (ALTER SET DEFAULT)",
+      _p19_def19 and str(_p19_def19[0]).lower() == "current_timestamp",
+      str(_p19_def19))
+
+# Fix 1: store_plugin_payload schreibt created_at=now() auch fuer NEUE Rows
+_p19_payload = {
+    "feature_id": "srv_swing_momentum",
+    "plugin_version": "1.0.0",
+    "records": [{"bar_time": 1750000000, "mom": 2.0}],
+}
+_p19_con = duckdb.connect(_p19_db)
+_p19_n = FeatureBuilder().store_plugin_payload("SILVER", "M1", _p19_payload,
+                                               con=_p19_con)
+check("19 T2) store_plugin_payload schreibt 1 Row",
+      _p19_n == 1, str(_p19_n))
+
+from analytics.engine.feature_store_reader import (  # noqa: E402
+    FeatureStoreReader,
+)
+_p19_dates = FeatureStoreReader(_p19_db).fetch_last_execution_dates()
+check("19 T2) Datum der letzten Ausfuehrung lesbar (created_at gesetzt)",
+      bool(_p19_dates.get("srv_swing_momentum")),
+      str(_p19_dates))
+
+_p19_con = duckdb.connect(_p19_db)
+_p19_ca = _p19_con.execute(
+    "SELECT created_at FROM feature_store "
+    "WHERE feature_id='srv_swing_momentum'").fetchone()
+_p19_con.close()
+check("19 T2) created_at in DB nicht NULL",
+      _p19_ca is not None and _p19_ca[0] is not None, str(_p19_ca))
+
+try:
+    os.remove(_p19_db)
+except OSError as _e19:
+    print("  [19] Cleanup Test-DB uebersprungen:", _e19)
+
+# ===========================================================================
+# Teil 20 (Bugfix 07.08.2026): Dynamic Parameter Schema Exposure fuer die
+#   3 Swing-Services (srv_swing_structure / srv_swing_momentum /
+#   srv_swing_volume_profile).
+#   - `full_parameter_schema()` liefert das vollstaendige Schema (Basis-
+#     Parameter wie lookback + plugin-spezifisch) inkl. Min/Max/Typ.
+#   - `default_params` ist befuellt (Plugin-Parameter; lookback ist eine
+#     Instanz-Einstellung und gehoert NICHT in params, vgl. UI-Spalten).
+# ===========================================================================
+print("\n=== Teil 20: Dynamic Parameter Schema Exposure (Swing Services) ===")
+
+from analytics.features.feature_builder import PluginRegistry  # noqa: E402
+
+_p20_reg = PluginRegistry()
+_p20_cases = [
+    ("srv_swing_structure", "left_bars"),
+    ("srv_swing_momentum", "period"),
+    ("srv_swing_volume_profile", "grid_step"),
+]
+for _p20_pid, _p20_key in _p20_cases:
+    _p20_p = _p20_reg.get(_p20_pid)
+    _p20_schema = _p20_p.full_parameter_schema()
+    _p20_defaults = _p20_p.default_params
+    check(f"20 T1) {_p20_pid}: full_parameter_schema nicht leer",
+          len(_p20_schema) > 0, str(list(_p20_schema.keys())))
+    check(f"20 T2) {_p20_pid}: default_params befuellt ('{_p20_key}')",
+          _p20_key in _p20_defaults, str(list(_p20_defaults.keys())))
+    # Basisklassen-Vertrag: lookback bleibt im VOLLSTAENDIGEN Schema erhalten
+    # (SchemaMigrator.migrate_instance_config verlaesst sich darauf), gehoert
+    # aber nicht in default_params (Instanz-Einstellung cfg['lookback']).
+    check(f"20 T3) {_p20_pid}: lookback im full-Schema enthalten",
+          "lookback" in _p20_schema, str("lookback" in _p20_schema))
+    check(f"20 T4) {_p20_pid}: lookback NICHT in default_params",
+          "lookback" not in _p20_defaults, str("lookback" in _p20_defaults))
+
+# ===========================================================================
+# Teil 21 (Bugfix 17.01.04, 07.08.2026): Standalone-Plugin-Editor im
+#   ServiceWindow - Klick auf eine Plugin-Zeile unter 'Services' (auch in
+#   Kategorie-Ordnern) laedt die Parameter editierbar in die rechte Spalte.
+#   Persistenz laeuft ueber global_settings (Key 'plugin_params_<pid>'),
+#   nicht ueber ServiceSetRepository; Run-Aktionen verwenden die
+#   gespeicherten Werte. Abgedeckt:
+#     * _on_master_selection_details(node_type='plugin') -> _load_plugin_editor
+#     * Guard: selection_changed mit leeren IDs leert den Editor NICHT
+#     * _save_plugin_params() -> global_settings (lookback/params/description)
+#     * _plugin_config() liefert gespeicherte Werte (Merge ueber Defaults)
+#     * _save_and_run_from_panel() / _on_run_plugin() nutzen die Config
+#     * Nicht-Plugin-Zeile beendet den Plugin-Modus
+# ===========================================================================
+print("\n=== Teil 21: Standalone-Plugin-Editor (ServiceWindow) ===")
+
+from PySide6.QtWidgets import (  # noqa: E402
+    QMessageBox, QCheckBox, QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox)
+from serviceui.master_tree import (  # noqa: E402
+    ROLE_NODE_TYPE, ROLE_PLUGIN_ID, TYPE_PLUGIN)
+
+
+def _find_plugin_item(item, plugin_id):
+    """Rekursive Suche nach der Plugin-Zeile mit plugin_id im MasterTree."""
+    for _k in range(item.childCount()):
+        _ch = item.child(_k)
+        if (_ch.data(0, ROLE_NODE_TYPE) == TYPE_PLUGIN
+                and str(_ch.data(0, ROLE_PLUGIN_ID) or "") == plugin_id):
+            return _ch
+        _hit = _find_plugin_item(_ch, plugin_id)
+        if _hit is not None:
+            return _hit
+    return None
+
+
+_p21 = "srv_swing_structure"
+
+# Frisches, isoliertes Fenster (Patches lenken auf Test-DBs um).
+w5 = ServiceWindow(parent=_Parent(), service_set_repo=repo)
+w5.service_selector.model.set_repo = repo
+w5.service_selector.model.refresh()
+w5.show()
+pump()
+pump()
+
+# --- 1) Default-Config ohne gespeicherte Werte -----------------------------
+_cfg21 = w5._plugin_config(_p21)
+check("21 T1) _plugin_config Defaults: params befuellt",
+      bool(_cfg21.get("params")), str(_cfg21.get("params")))
+check("21 T2) _plugin_config Defaults: lookback == 1000",
+      _cfg21.get("lookback") == 1000, str(_cfg21.get("lookback")))
+check("21 T3) _plugin_config Defaults: plugin_id + version",
+      _cfg21.get("plugin_id") == _p21 and bool(_cfg21.get("version")),
+      str(_cfg21))
+
+# --- 2) Plugin-Zeile im MasterTree finden (Kategorie-Ordner) ---------------
+_plugin_item21 = None
+for _gi21 in range(w5.service_selector.master_tree.topLevelItemCount()):
+    _hit21 = _find_plugin_item(
+        w5.service_selector.master_tree.topLevelItem(_gi21), _p21)
+    if _hit21 is not None:
+        _plugin_item21 = _hit21
+        break
+check("21 T4) Plugin-Zeile 'srv_swing_structure' im MasterTree",
+      _plugin_item21 is not None,
+      str(w5.service_selector.master_tree.topLevelItemCount()))
+
+# --- 3) Klick-Simulation: selection_details(node_type='plugin') ------------
+if _plugin_item21 is not None:
+    w5.service_selector.master_tree._emit_selection_details(_plugin_item21)
+check("21 T5) _current_plugin_editing gesetzt",
+      w5._current_plugin_editing == _p21, str(w5._current_plugin_editing))
+_def21 = w5._current_set_definition or {}
+check("21 T6) Editor geladen (execution_order = nur das Plugin)",
+      list(_def21.get("execution_order") or []) == [_p21],
+      str(_def21.get("execution_order")))
+check("21 T7) Parameter-Spalten aufgebaut (Controls vorhanden)",
+      bool(w5._service_param_controls),
+      str(list(w5._service_param_controls.keys())[:4]))
+
+# --- 4) Guard: selection_changed mit leeren IDs leert den Editor NICHT ----
+w5._on_master_selection("", "")
+check("21 T8) Guard: leere selection_changed leert Plugin-Editor nicht",
+      w5._current_plugin_editing == _p21, str(w5._current_plugin_editing))
+
+# --- 5) Parameter aendern (User-Pfad) -> Dirty-Buttons sichtbar ------------
+_ctrl_key21 = next(iter(w5._service_param_controls), None)
+_ctrl21 = w5._service_param_controls.get(_ctrl_key21) if _ctrl_key21 else None
+check("21 T9) Editor-Control vorhanden", _ctrl21 is not None,
+      str(_ctrl_key21))
+_after = None
+if _ctrl21 is not None:
+    _before = w5._ctrl_value(_ctrl21)
+    # Typ-abhaengig einen Wert setzen (setValue/setCurrentText feuern das
+    # Aenderungs-Signal -> _on_param_changed -> Dirty + Buttons sichtbar).
+    if isinstance(_ctrl21, QComboBox):
+        _items = [_ctrl21.itemText(i) for i in range(_ctrl21.count())]
+        _new_val = (_items[1] if len(_items) > 1 and _items[1] != _before
+                    else _items[0])
+        _ctrl21.setCurrentText(_new_val)
+    elif isinstance(_ctrl21, QCheckBox):
+        _ctrl21.setChecked(not _before)
+    elif isinstance(_ctrl21, (QSpinBox, QDoubleSpinBox)):
+        _new_val = (_ctrl21.minimum() if _before != _ctrl21.minimum()
+                    else _ctrl21.maximum())
+        _ctrl21.setValue(_new_val)
+    elif isinstance(_ctrl21, QLineEdit):
+        _ctrl21.setText(str(_before) + "x")
+    _after = w5._ctrl_value(_ctrl21)
+    check("21 T10) Parameter-Wert geaendert", _after != _before,
+          f"{_before} -> {_after}")
+    check("21 T11) Dirty: Speichern-Buttons sichtbar",
+          w5.btn_save_params is not None and w5.btn_save_params.isVisible()
+          and w5.btn_save_run_params is not None
+          and w5.btn_save_run_params.isVisible(), "")
+
+# --- 6) Speichern via _save_plugin_params (global_settings) ----------------
+_ok21 = w5._save_plugin_params()
+check("21 T12) _save_plugin_params() liefert True", _ok21 is True, str(_ok21))
+_saved21 = sm.get_global_value(f"plugin_params_{_p21}", None)
+check("21 T13) global_settings: plugin_params_<pid> gespeichert",
+      isinstance(_saved21, dict) and _saved21.get("plugin_id") == _p21,
+      str(_saved21))
+check("21 T14) gespeicherte params enthalten den geaenderten Wert",
+      isinstance(_saved21, dict) and _ctrl_key21 is not None
+      and _saved21.get("params", {}).get(_ctrl_key21[1]) == _after,
+      str(_saved21))
+_cfg21b = w5._plugin_config(_p21)
+check("21 T15) _plugin_config liefert gespeicherte Werte (Merge)",
+      isinstance(_saved21, dict)
+      and _cfg21b.get("params") == _saved21.get("params"),
+      str(_cfg21b.get("params")))
+
+# --- 7) Speichern & Ausfuehren (Plugin-Modus) -------------------------------
+_captured21: dict = {}
+
+
+def _fake_start_run_worker(scope_id, set_definition, instance_id=None):
+    _captured21["scope_id"] = scope_id
+    _captured21["definition"] = set_definition
+    _captured21["instance_id"] = instance_id
+
+
+w5._start_run_worker = _fake_start_run_worker
+_orig_question21 = QMessageBox.question
+try:
+    QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
+    w5._save_and_run_from_panel()
+finally:
+    QMessageBox.question = _orig_question21
+
+check("21 T16) Speichern&Ausfuehren: Worker mit plugin_id gestartet",
+      _captured21.get("scope_id") == _p21, str(_captured21.get("scope_id")))
+_run_def21 = _captured21.get("definition") or {}
+_run_cfg21 = (_run_def21.get("services") or {}).get(_p21) or {}
+check("21 T17) Run-Definition: lookback aus global_settings",
+      _run_cfg21.get("lookback") == (_saved21 or {}).get("lookback"),
+      str(_run_cfg21.get("lookback")))
+
+# --- 8) _on_run_plugin nutzt gespeicherte Params ----------------------------
+_captured21.clear()
+try:
+    QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
+    w5._on_run_plugin(_p21)
+finally:
+    QMessageBox.question = _orig_question21
+_run_def21b = _captured21.get("definition") or {}
+_run_cfg21b = (_run_def21b.get("services") or {}).get(_p21) or {}
+check("21 T18) _on_run_plugin nutzt gespeicherte Params",
+      _run_cfg21b.get("params") == (_saved21 or {}).get("params"),
+      str(_run_cfg21b.get("params")))
+
+# --- 9) Nicht-Plugin-Zeile beendet den Plugin-Modus -------------------------
+w5._on_master_selection_details("set", "set_1", "", "")
+check("21 T19) Nicht-Plugin-Zeile beendet Plugin-Modus",
+      w5._current_plugin_editing is None, str(w5._current_plugin_editing))
+
+# ===========================================================================
+# Teil 22 (Bugfix 17.01.05, 07.08.2026): UI-Dropdown-Extension +
+#   Conditional Visibility fuer die Swing-Services.
+#   - Schema-Parameter mit `options` werden als QComboBox gerendert
+#     (unabhaengig vom type-Wert; vorher NUR bei type=="choice" -> die
+#     Swing-Services mit type=="str"+options zeigten QLineEdit statt Dropdown).
+#   - Parameter mit `visible_when: {"mode": [...]}` werden beim Mode-Wechsel
+#     ein-/ausgeblendet (Control + Label), damit beim Auswaehlen eines
+#     Algorithmus nur seine relevanten Parameter sichtbar/editierbar sind.
+# ===========================================================================
+print("\n=== Teil 22: UI-Dropdown + Conditional Visibility (Swing Services) ===")
+
+from PySide6.QtWidgets import QComboBox as _QComboBox22  # noqa: E402
+
+_p22_reg = PluginRegistry()
+_p22_cases = [
+    ("srv_swing_structure", "mode", "ZigZag_ATR"),
+    ("srv_swing_momentum", "mode", "Chande_Kroll_Ratchet"),
+    ("srv_swing_volume_profile", "mode", "Grid_Proximity"),
+]
+for _p22_pid, _p22_key, _p22_opt in _p22_cases:
+    _p22_p = _p22_reg.get(_p22_pid)
+    _p22_schema = _p22_p.full_parameter_schema()
+    _p22_opts = _p22_schema.get(_p22_key, {}).get("options")
+    check(f"22 T1) {_p22_pid}: options fuer '{_p22_key}' als Liste",
+          isinstance(_p22_opts, (list, tuple)) and len(_p22_opts) > 0,
+          str(_p22_opts))
+    _p22_vw = [k for k, s in _p22_schema.items()
+               if isinstance(s.get("visible_when"), dict)
+               and "mode" in s["visible_when"]]
+    check(f"22 T2) {_p22_pid}: visible_when-Deklarationen vorhanden",
+          len(_p22_vw) > 0, str(_p22_vw))
+
+# _create_param_control: options -> QComboBox (auch bei type=='str')
+_p22_spec = _p22_reg.get("srv_swing_structure").full_parameter_schema()["mode"]
+w6 = ServiceWindow(parent=_Parent(), service_set_repo=repo)
+w6.service_selector.model.set_repo = repo
+w6.service_selector.model.refresh()
+_ctrl22 = w6._create_param_control("mode", "ZigZag_ATR", _p22_spec)
+check("22 T3) _create_param_control(mode) -> QComboBox",
+      isinstance(_ctrl22, _QComboBox22)
+      and _ctrl22.currentText() == "ZigZag_ATR",
+      str(type(_ctrl22).__name__))
+
+# Plugin-Editor laden (srv_swing_structure) -> Dropdown + Visibility
+_p22_pid = "srv_swing_structure"
+w6.show()
+pump()
+w6._load_plugin_editor(_p22_pid)
+pump()
+_iid22 = _p22_pid
+_mode_ctrl22 = w6._service_param_controls.get((_iid22, "mode"))
+check("22 T4) Plugin-Editor: mode-Control ist QComboBox",
+      isinstance(_mode_ctrl22, _QComboBox22),
+      str(type(_mode_ctrl22).__name__))
+if isinstance(_mode_ctrl22, _QComboBox22):
+    _opts22 = [_mode_ctrl22.itemText(i)
+               for i in range(_mode_ctrl22.count())]
+    check("22 T5) Dropdown enthaelt alle Algo-Optionen",
+          "Williams_Fractal" in _opts22 and "ZigZag_ATR" in _opts22
+          and "Period_Extrema" in _opts22, str(_opts22))
+
+# Initial (Default-Mode Williams_Fractal): left sichtbar, atr ausgeblendet
+_left22 = w6._service_param_controls.get((_iid22, "left_bars"))
+_atr22 = w6._service_param_controls.get((_iid22, "atr_period"))
+_chg22 = w6._service_param_controls.get((_iid22, "change_pct"))
+check("22 T6) Default Williams_Fractal: left_bars sichtbar",
+      _left22 is not None and _left22.isVisible(), "")
+check("22 T7) Default Williams_Fractal: atr_period ausgeblendet",
+      _atr22 is not None and not _atr22.isVisible(), "")
+
+# Mode-Wechsel -> ZigZag_ATR (Signal-Pfad: currentTextChanged -> Visibility)
+if isinstance(_mode_ctrl22, _QComboBox22):
+    _mode_ctrl22.setCurrentText("ZigZag_ATR")
+    pump()
+check("22 T8) Mode=ZigZag_ATR: atr_period sichtbar",
+      _atr22 is not None and _atr22.isVisible(), "")
+check("22 T9) Mode=ZigZag_ATR: left_bars ausgeblendet",
+      _left22 is not None and not _left22.isVisible(), "")
+check("22 T10) Mode=ZigZag_ATR: change_pct ausgeblendet",
+      _chg22 is not None and not _chg22.isVisible(), "")
+
+# Mode-Wechsel -> Period_Extrema: period_extrema_type sichtbar
+_pe22 = w6._service_param_controls.get((_iid22, "period_extrema_type"))
+if isinstance(_mode_ctrl22, _QComboBox22):
+    _mode_ctrl22.setCurrentText("Period_Extrema")
+    pump()
+check("22 T11) Mode=Period_Extrema: period_extrema_type sichtbar",
+      _pe22 is not None and _pe22.isVisible(), "")
+check("22 T12) Mode=Period_Extrema: atr_period ausgeblendet",
+      _atr22 is not None and not _atr22.isVisible(), "")
+
+# collect_set_definition liefert den geaenderten mode (editierbar/speicherbar)
+_def22 = w6.collect_set_definition()
+_cfg22 = (_def22.get("services") or {}).get(_iid22, {})
+check("22 T13) collect_set_definition: mode aktualisiert (Period_Extrema)",
+      (_cfg22.get("params") or {}).get("mode") == "Period_Extrema",
+      str((_cfg22.get("params") or {}).get("mode")))
+
+# ===========================================================================
+# Teil 23 (Bugfix 17.01.05, 07.08.2026): Read-only Info-Label unter dem
+#   individuellen Beschreibungsfeld – zeigt die in der Definition
+#   vorgefuellte Service-Beschreibung + die Beschreibung des aktuell
+#   gewaehlten Algorithmus (mode). Rein informativ (kein Input), wird beim
+#   Mode-Wechsel live aktualisiert.
+# ===========================================================================
+print("\n=== Teil 23: Read-only Service-/Algo-Beschreibungs-Label ===")
+
+from PySide6.QtWidgets import QComboBox as _QComboBox23  # noqa: E402
+from PySide6.QtWidgets import QTextEdit as _QTextEdit23  # noqa: E402
+from PySide6.QtCore import Qt as _Qt23  # noqa: E402
+
+_p23_pid = "srv_swing_structure"
+w7 = ServiceWindow(parent=_Parent(), service_set_repo=repo)
+w7.service_selector.model.set_repo = repo
+w7.service_selector.model.refresh()
+w7.show()
+pump()
+w7._load_plugin_editor(_p23_pid)
+pump()
+
+_iid23 = _p23_pid
+_info23 = w7._service_info_labels.get(_iid23)
+check("23 T1) Info-Anzeige je Instanz vorhanden (QTextEdit)",
+      isinstance(_info23, _QTextEdit23), str(type(_info23).__name__))
+
+if isinstance(_info23, _QTextEdit23):
+    _text23 = _info23.toPlainText() or ""
+    _mode_ctrl23 = w7._service_param_controls.get((_iid23, "mode"))
+    _mode_val23 = (str(_mode_ctrl23.currentText())
+                   if isinstance(_mode_ctrl23, _QComboBox23) else "")
+    check("23 T2) Label enthaelt display_name (Swing Structure Service)",
+          "Swing Structure Service" in _text23, _text23[:120])
+    check("23 T3) Label enthaelt Service-Beschreibung (description_long)",
+          "lokale Extrema" in _text23, _text23[:120])
+    check("23 T4) Label enthaelt aktuell gewaehlten Algorithmus (mode)",
+          bool(_mode_val23) and _mode_val23 in _text23,
+          f"mode={_mode_val23!r} -> {_text23[:120]}")
+    # Mode-Wechsel -> Anzeige aktualisiert sich (Algo-Beschreibung)
+    if isinstance(_mode_ctrl23, _QComboBox23):
+        _mode_ctrl23.setCurrentText("Period_Extrema")
+        pump()
+        _text23b = _info23.toPlainText() or ""
+        check("23 T5) Mode-Wechsel aktualisiert Label (Period_Extrema)",
+              "Period_Extrema" in _text23b
+              and "Williams_Fractal" not in _text23b,
+              _text23b[:120])
+        check("23 T6) Algo-Beschreibung im Label (PDH/PWH)",
+              "PDH/PWH" in _text23b, _text23b[:160])
+    # Anzeige ist read-only und informativ
+    check("23 T7) Anzeige sichtbar", _info23.isVisible(), "")
+    check("23 T8) Anzeige ist read-only (kein Edit)",
+          _info23.isReadOnly(), "")
+    check("23 T9) vertikale Scrollbar bei Bedarf (Policy AsNeeded)",
+          _info23.verticalScrollBarPolicy() == _Qt23.ScrollBarAsNeeded,
+          str(_info23.verticalScrollBarPolicy()))
+    # Deferred Scroll-oben-Reset (QTimer singleShot 0) abarbeiten lassen,
+    # bevor die Scrollposition geprueft wird.
+    pump()
+    pump()
+    # Initial-Scrollposition ganz oben (erste Zeile lesbar)
+    _sb23 = _info23.verticalScrollBar()
+    check("23 T9b) Scrollbar initial ganz oben (value == 0)",
+          _sb23 is not None and _sb23.value() == 0,
+          str(_sb23.value()) if _sb23 is not None else "None")
+    # Auch NACH Mode-Wechsel bleibt die Anzeige oben (setHtml -> Scroll 0)
+    _sb23b = _info23.verticalScrollBar()
+    check("23 T9c) nach Mode-Wechsel weiterhin oben (value == 0)",
+          _sb23b is not None and _sb23b.value() == 0,
+          str(_sb23b.value()) if _sb23b is not None else "None")
+
+# Mehrere Services nebeneinander: auch fuer srv_swing_momentum vorhanden
+w7._load_plugin_editor("srv_swing_momentum")
+pump()
+_info23b = w7._service_info_labels.get("srv_swing_momentum")
+check("23 T10) Info-Anzeige auch fuer srv_swing_momentum",
+      isinstance(_info23b, _QTextEdit23)
+      and "Swing Momentum Service" in (_info23b.toPlainText() or ""),
+      (_info23b.toPlainText() or "")[:120])
+
+# ===========================================================================
+# Teil 24 (Phase 17.02, 07.08.2026): Trend Services Validation
+#   srv_trend_regime (LinReg/ADX/Z-Score), srv_trend_breakout
+#   (Supertrend/Donchian/Keltner), srv_trend_hma_pivot (HMA_Peak_Toleranz).
+#   - Registry-Discovery + Kategorien im MasterTree (build_tree).
+#   - Dichte Records (len(records) == len(df)), schema_version in
+#     Metadata+Records, kausale Zeitstempel, Warmup-INSUFFICIENT_DATA.
+#   - Records flach: KEIN symbol/timeframe/feature_id (setzt
+#     store_plugin_payload selbst, Datenvertrag 17.02 E-2).
+#   - 4-Spalten-PK-Store auf test/test_p17_trend.duckdb (wird geloescht,
+#     Invariante 10).
+# ===========================================================================
+print("\n=== Teil 24: Phase 17.02 Trend Services Validation ===")
+
+from analytics.features.feature_builder import (  # noqa: E402
+    PluginRegistry as _P24_REG_CLS,
+)
+from analytics.features.definitions.srv_trend_regime import SrvTrendRegime  # noqa: E402
+from analytics.features.definitions.srv_trend_breakout import SrvTrendBreakout  # noqa: E402
+from analytics.features.definitions.srv_trend_hma_pivot import SrvTrendHmaPivot  # noqa: E402
+
+_p24_reg = _P24_REG_CLS()
+_p24_ids = ("srv_trend_regime", "srv_trend_breakout", "srv_trend_hma_pivot")
+for _p24_pid in _p24_ids:
+    check(f"24 T1) Registry {_p24_pid}",
+          _p24_reg.get(_p24_pid) is not None, "")
+
+_p24_objs = (SrvTrendRegime(), SrvTrendBreakout(), SrvTrendHmaPivot())
+for _p24_o in _p24_objs:
+    check(f"24 T1) {_p24_o.plugin_id}: capability feature_store",
+          bool(_p24_o.capabilities.get("feature_store")), "")
+    check(f"24 T1) {_p24_o.plugin_id}: category Trend & Reversal",
+          str(_p24_o.metadata.get("category", "")).startswith("Trend & Reversal"),
+          str(_p24_o.metadata.get("category")))
+    _fps = _p24_o.full_parameter_schema()
+    check(f"24 T1) {_p24_o.plugin_id}: lookback im full_parameter_schema",
+          "lookback" in _fps, "")
+    check(f"24 T1) {_p24_o.plugin_id}: visible_when deklariert",
+          any(isinstance(s.get("visible_when"), dict) for s in _fps.values()),
+          "")
+
+# build_tree: 3 neue Kategorien unter 'Trend & Reversal'
+from analytics.engine.service_selector_model import ServiceSelectorModel  # noqa: E402
+_p24_tree = ServiceSelectorModel().build_tree()
+_p24_tree_txt = str(_p24_tree)
+for _cat in ("Regime & Staerke", "Breakout & Kanal", "Hysteresis & Pivots"):
+    check(f"24 T2) build_tree enthaelt Kategorie '{_cat}'",
+          _cat in _p24_tree_txt, "")
+
+# --- Synthetische OHLCV-Serie: 6 Phasen (Range/Breakout up/Range/Breakout
+#     down/Range/Breakout up) -> Trend- und Breakout-Signale garantiert.
+_p24_n = 864
+_p24_period = 300  # M5
+_p24_t0 = 1700000000
+_p24_ts = _p24_t0 + np.arange(_p24_n) * _p24_period
+_p24_rng = np.random.default_rng(42)
+_p24_seg = 144
+_p24_cl = []
+for _i, _trend in enumerate([0.0, 0.10, 0.0, -0.10, 0.0, 0.08]):
+    _idx = np.arange(_i * _p24_seg, (_i + 1) * _p24_seg)
+    _p24_cl.append(np.linspace(0, _trend, _p24_seg)
+                   + _p24_rng.normal(0, 0.0015, _p24_seg))
+_p24_close = np.concatenate(_p24_cl)
+_p24_open = np.concatenate([[_p24_close[0]], _p24_close[:-1]])
+_p24_high = np.maximum(_p24_open, _p24_close) + _p24_rng.uniform(0.0005, 0.002, _p24_n)
+_p24_low = np.minimum(_p24_open, _p24_close) - _p24_rng.uniform(0.0005, 0.002, _p24_n)
+_p24_vol = (100.0 + (_p24_ts % 50)).astype(np.float64)
+_p24_df = pd.DataFrame({
+    "time": _p24_ts.astype(np.int64),
+    "open": _p24_open,
+    "high": _p24_high,
+    "low": _p24_low,
+    "close": _p24_close,
+    "tick_volume": _p24_vol,
+})
+
+# --- T3: srv_trend_regime (alle 3 Modi) --------------------------------------
+_p24_regime = SrvTrendRegime()
+_p24_r_payloads = {}
+for _mode, _params in (
+        ("Linear_Regression_Slope", {"mode": "Linear_Regression_Slope"}),
+        ("ADX_DMI", {"mode": "ADX_DMI"}),
+        ("ZScore_Mean_Distance", {"mode": "ZScore_Mean_Distance"}),
+):
+    _res = _p24_regime.calculate(_p24_df, dict(_params))
+    _payload = _res.get("feature_store_payload") or {}
+    _recs = _payload.get("records") or []
+    _p24_r_payloads[_mode] = _payload
+    check(f"24 T3) regime.{_mode}: records dicht",
+          len(_recs) == _p24_n, f"{len(_recs)}/{_p24_n}")
+    check(f"24 T3) regime.{_mode}: schema_version",
+          (_payload.get("metadata") or {}).get("schema_version") == "1.0.0",
+          str((_payload.get("metadata") or {}).get("schema_version")))
+    check(f"24 T3) regime.{_mode}: kausale Zeitstempel",
+          all(int(r["confirmation_bar_time"]) >= int(r["event_bar_time"])
+              for r in _recs), "")
+    check(f"24 T3) regime.{_mode}: Records flach (kein symbol/timeframe/feature_id)",
+          all(("symbol" not in r and "timeframe" not in r and "feature_id" not in r)
+              for r in _recs), "")
+    _up = sum(1 for r in _recs if r["is_trend_up"])
+    _down = sum(1 for r in _recs if r["is_trend_down"])
+    _rev = sum(1 for r in _recs if r["is_reversal_up"] or r["is_reversal_down"])
+    check(f"24 T3) regime.{_mode}: Signale erzeugt (up/down/rev)",
+          _up + _down + _rev > 0, f"up={_up}, down={_down}, rev={_rev}")
+    check(f"24 T3) regime.{_mode}: Start INSUFFICIENT_DATA",
+          bool(_recs) and _recs[0]["calculation_status"] == "INSUFFICIENT_DATA",
+          str(_recs[0]["calculation_status"]) if _recs else "no records")
+
+# --- T4: srv_trend_breakout (Supertrend + Donchian + Keltner) ----------------
+_p24_breakout = SrvTrendBreakout()
+for _mode, _params in (
+        ("Supertrend_ATR", {"mode": "Supertrend_ATR"}),
+        ("Donchian", {"mode": "Donchian_Keltner_Breakout", "channel_type": "Donchian"}),
+        ("Keltner", {"mode": "Donchian_Keltner_Breakout", "channel_type": "Keltner"}),
+):
+    _res = _p24_breakout.calculate(_p24_df, dict(_params))
+    _payload = _res.get("feature_store_payload") or {}
+    _recs = _payload.get("records") or []
+    check(f"24 T4) breakout.{_mode}: records dicht",
+          len(_recs) == _p24_n, f"{len(_recs)}/{_p24_n}")
+    check(f"24 T4) breakout.{_mode}: schema_version",
+          (_payload.get("metadata") or {}).get("schema_version") == "1.0.0",
+          str((_payload.get("metadata") or {}).get("schema_version")))
+    check(f"24 T4) breakout.{_mode}: kausale Zeitstempel",
+          all(int(r["confirmation_bar_time"]) >= int(r["event_bar_time"])
+              for r in _recs), "")
+    _up = sum(1 for r in _recs if r["is_trend_up"])
+    _down = sum(1 for r in _recs if r["is_trend_down"])
+    check(f"24 T4) breakout.{_mode}: Signale erzeugt (up/down)",
+          _up + _down > 0, f"up={_up}, down={_down}")
+
+# --- T5: srv_trend_hma_pivot -------------------------------------------------
+_p24_hma = SrvTrendHmaPivot()
+_res = _p24_hma.calculate(_p24_df, {"mode": "HMA_Peak_Toleranz"})
+_payload = _res.get("feature_store_payload") or {}
+_recs = _payload.get("records") or []
+check("24 T5) hma_pivot: records dicht", len(_recs) == _p24_n,
+      f"{len(_recs)}/{_p24_n}")
+check("24 T5) hma_pivot: schema_version",
+      (_payload.get("metadata") or {}).get("schema_version") == "1.0.0",
+      str((_payload.get("metadata") or {}).get("schema_version")))
+check("24 T5) hma_pivot: kausale Zeitstempel",
+      all(int(r["confirmation_bar_time"]) >= int(r["event_bar_time"])
+          for r in _recs), "")
+_up = sum(1 for r in _recs if r["is_trend_up"])
+_down = sum(1 for r in _recs if r["is_trend_down"])
+check("24 T5) hma_pivot: Signale erzeugt (up/down)",
+      _up + _down > 0, f"up={_up}, down={_down}")
+check("24 T5) hma_pivot: Zusatzfeld ma_value/pending_extreme_value",
+      bool(_recs)
+      and ("ma_value" in _recs[-1] and "pending_extreme_value" in _recs[-1]),
+      str(sorted(_recs[-1].keys()))[:160] if _recs else "")
+
+# --- T6: store_plugin_payload auf Test-DuckDB (4-Spalten-PK) ----------------
+_p24_db = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "test_p17_trend.duckdb")
+if os.path.exists(_p24_db):
+    os.remove(_p24_db)
+_con24 = duckdb.connect(_p24_db)
+_con24.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR NOT NULL,
+        timeframe VARCHAR NOT NULL,
+        bar_time TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMP DEFAULT current_timestamp,
+        feature_id VARCHAR NOT NULL DEFAULT 'native',
+        plugin_version VARCHAR,
+        instance_hash VARCHAR,
+        feature_data JSON,
+        PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
+    )
+""")
+_fb24 = FeatureBuilder()
+# 3 Services auf derselben Bar koexistieren (konfliktfreier Upsert).
+# Hinweis: store_plugin_payload schliesst uebergebene Conns selbst
+# (own_connection=True) -> pro Aufruf eine frische Connection oeffnen.
+_p24_store = [
+    ("SILVER_TEST", "M5", "srv_trend_regime", _p24_r_payloads["Linear_Regression_Slope"]),
+    ("SILVER_TEST", "M5", "srv_trend_breakout",
+     SrvTrendBreakout().calculate(_p24_df, {"mode": "Supertrend_ATR"})
+     .get("feature_store_payload") or {}),
+    ("SILVER_TEST", "M5", "srv_trend_hma_pivot",
+     SrvTrendHmaPivot().calculate(_p24_df, {"mode": "HMA_Peak_Toleranz"})
+     .get("feature_store_payload") or {}),
+]
+for _sym, _tf, _fid, _payload in _p24_store:
+    _con24_w = duckdb.connect(_p24_db)
+    _n_w = _fb24.store_plugin_payload(_sym, _tf, _payload, con=_con24_w)
+    check(f"24 T6) {_fid}: store rows == bars", _n_w == _p24_n, str(_n_w))
+_con24_check = duckdb.connect(_p24_db)
+_n_rows = _con24_check.execute(
+    "SELECT count(*) FROM feature_store WHERE symbol='SILVER_TEST' "
+    "AND timeframe='M5'").fetchone()[0]
+_con24_check.close()
+check("24 T6) 3 Services koexistieren auf derselben Bar (3x bars)",
+      _n_rows == 3 * _p24_n, str(_n_rows))
+
+# Cleanup der Test-DB (Invariante 10) - inkl. WAL-Rest (DuckDB schreibt
+# beim Upsert eine -wal-Datei, die nicht Teil der Test-DB ist).
+for _p24_cf in (_p24_db, _p24_db + ".wal"):
+    try:
+        os.remove(_p24_cf)
+    except OSError:
+        pass
+
+
+# ===========================================================================
+# Teil 25 (Bugfix 07.08.2026, Mode-Wechsel): Die HOEHE der Service-Parameter-
+#   BOX (widget_service_columns) muss der wechselnden Anzahl sichtbarer
+#   modus-abhaengiger Parameter folgen - NICHT die Hoehe der Einzelfelder.
+#   Regression: Vor dem Fix blendete _apply_conditional_visibility die
+#   Controls/Labels zwar ein/aus, stiess aber KEIN updateGeometry()/_reflow()
+#   an (Qt 6.11 QWidgetItemV2-Cache blieb stale) - die Box behielt ihre alte
+#   Hoehe und der QFormLayout streckte die verbliebenen Zeilen.
+#   Referenz-Muster: _setup_collapsible/_build_service_columns.
+# ===========================================================================
+print("\n=== Teil 25: Box-Hoehe folgt wechselnder Parameterzahl (Mode) ===")
+
+from PySide6.QtWidgets import QComboBox as _QComboBox25  # noqa: E402
+from PySide6.QtWidgets import QGroupBox as _QGroupBox25  # noqa: E402
+
+w25 = ServiceWindow(parent=_Parent(), service_set_repo=repo)
+w25.show()
+pump()
+w25._load_plugin_editor("srv_swing_structure")
+pump()
+
+_iid25 = "srv_swing_structure"
+_mode25 = w25._service_param_controls.get((_iid25, "mode"))
+_box25 = w25.widget_service_columns
+_col25 = _mode25.parentWidget() if _mode25 is not None else None
+check("25 T1) Plugin-Editor geladen + Spalte verfuegbar",
+      _mode25 is not None and isinstance(_col25, _QGroupBox25),
+      str(type(_col25).__name__) if _col25 else "None")
+
+
+def _box_wish25():
+    """Layout-Wunschhoehe der Box (unabhaengig von Cache/Deferred-Resize)."""
+    if _box25.layout() is None:
+        return 0
+    return _box25.layout().sizeHint().height()
+
+
+def _visible_ctrls25():
+    """Hoehen der aktuell SICHTBAREN Formular-Controls (sollen stabil sein)."""
+    out = {}
+    for _k, _spec in w25._mode_schemas.get(_iid25, {}).items():
+        if _spec.get("expert") or w25._is_visual_key(_k):
+            continue
+        _c = w25._service_param_controls.get((_iid25, _k))
+        if _c is not None and _c.isVisible():
+            out[_k] = _c.height()
+    return out
+
+
+# --- Messung 1: Period_Extrema (2 sichtbare Nicht-Mode-Parameter) ---
+if isinstance(_mode25, _QComboBox25):
+    _mode25.setCurrentText("Period_Extrema")
+pump()
+pump()  # deferred Reflow (QTimer singleShot 0) sicher verarbeitet
+_h_pe_wish = _box_wish25()
+_h_pe_act = _box25.height()
+_ctrls_pe = _visible_ctrls25()
+check("25 T2) Period_Extrema: Box-Hoehe == Layout-sizeHint (Reflow lief)",
+      abs(_h_pe_act - _h_pe_wish) <= 2,
+      f"act={_h_pe_act} wish={_h_pe_wish}")
+check("25 T3) Period_Extrema: genau 1 sichtbarer Nicht-Mode-Parameter",
+      sum(1 for _k in _ctrls_pe if _k != "mode") == 1,
+      str(sorted(_ctrls_pe)))
+
+# --- Messung 2: ZigZag_ATR (3 sichtbare Nicht-Mode-Parameter) ---
+if isinstance(_mode25, _QComboBox25):
+    _mode25.setCurrentText("ZigZag_ATR")
+pump()
+pump()
+_h_zz_wish = _box_wish25()
+_h_zz_act = _box25.height()
+_ctrls_zz = _visible_ctrls25()
+check("25 T4) ZigZag_ATR: Box-Hoehe == Layout-sizeHint (Reflow lief)",
+      abs(_h_zz_act - _h_zz_wish) <= 2,
+      f"act={_h_zz_act} wish={_h_zz_wish}")
+check("25 T5) ZigZag_ATR: genau 2 sichtbare Nicht-Mode-Parameter",
+      sum(1 for _k in _ctrls_zz if _k != "mode") == 2,
+      str(sorted(_ctrls_zz)))
+check("25 T6) BOX-WACHSTUM: ZigZag_ATR(3 Params) > Period_Extrema(2)",
+      _h_zz_act > _h_pe_act,
+      f"zz={_h_zz_act} pe={_h_pe_act}")
+
+# --- Messung 3: zurueck zu Period_Extrema (Box MUSS wieder schrumpfen) ---
+if isinstance(_mode25, _QComboBox25):
+    _mode25.setCurrentText("Period_Extrema")
+pump()
+pump()
+_h_pe2_act = _box25.height()
+check("25 T7) BOX-SCHRUMPF: Period_Extrema(2) < ZigZag_ATR(3)",
+      _h_pe2_act < _h_zz_act,
+      f"pe2={_h_pe2_act} zz={_h_zz_act}")
+check("25 T8) Rueckwechsel konsistent (Hoehe wie Messung 1)",
+      abs(_h_pe2_act - _h_pe_act) <= 2,
+      f"pe2={_h_pe2_act} pe1={_h_pe_act}")
+
+# --- Einzelfelder: Hoehe ueber Mode-Wechsel stabil (kein Strecken) ---
+_common25 = sorted(set(_ctrls_pe) & set(_ctrls_zz))
+_ok25 = len(_common25) > 0 and all(
+    abs(_ctrls_pe[_k] - _ctrls_zz[_k]) <= 4 for _k in _common25)
+check("25 T9) Einzelfeld-Hoehen stabil ueber Mode-Wechsel (Tol. 4px)",
+      _ok25,
+      str({_k: (_ctrls_pe.get(_k), _ctrls_zz.get(_k))
+           for _k in _common25}))
+
+
+# --- 07.08.2026 (User-Anweisung): Fensterhoehe stabil, Canvas-Scrollbox,
+#     Tree eigene Scrollbar (kein Fenster-/Canvas-Versatz mehr) ---
+from PySide6.QtCore import Qt as _Qt25  # noqa: E402
+
+# T10/T11: Die FENSTERHOEHE darf sich beim Mode-Wechsel NICHT aendern
+# (Regression: vorher rief _apply_conditional_visibility self._reflow() ->
+# resize_to_clamped_content, _exact_fit_to_content -> Fensterhoehe folgte
+# der Box-Hoehe; jetzt wird NUR die Box resized, die ScrollArea uebernimmt).
+_h_win25_pe = w25.height()
+if isinstance(_mode25, _QComboBox25):
+    _mode25.setCurrentText("ZigZag_ATR")
+pump()
+pump()
+_h_win25_zz = w25.height()
+check("25 T10) Fensterhoehe stabil beim Mode-Wechsel (PE->ZZ)",
+      _h_win25_zz == _h_win25_pe,
+      f"pe={_h_win25_pe} zz={_h_win25_zz}")
+if isinstance(_mode25, _QComboBox25):
+    _mode25.setCurrentText("Period_Extrema")
+pump()
+pump()
+_h_win25_pe2 = w25.height()
+check("25 T11) Fensterhoehe stabil beim Rueckwechsel (ZZ->PE)",
+      _h_win25_pe2 == _h_win25_pe,
+      f"pe1={_h_win25_pe} pe2={_h_win25_pe2}")
+
+# T12/T13: Canvas-Scrollbox (Param-ScrollArea) ist der Mechanismus fuer
+# Ueberhoehe der Service-Parameter-Box (User-Anweisung Punkt 2).
+_scroll25 = getattr(w25, "_param_scroll", None)
+check("25 T12) Param-ScrollArea vorhanden (Canvas-Scrollbox)",
+      _scroll25 is not None, str(type(_scroll25).__name__) if _scroll25 else "None")
+if _scroll25 is not None:
+    check("25 T13) Param-ScrollArea vertikale Scrollbar AsNeeded",
+          _scroll25.verticalScrollBarPolicy() == _Qt25.ScrollBarAsNeeded,
+          str(_scroll25.verticalScrollBarPolicy()))
+    check("25 T13b) Param-ScrollArea widgetResizable=False (Box behaelt Groesse)",
+          not _scroll25.widgetResizable(), str(_scroll25.widgetResizable()))
+
+# T14: Der Baum (MasterTree) bekommt eine EIGENE Scrollbar und passt seine
+# Hoehe NICHT an die Service-Parameter an (User-Anweisung Punkt 3).
+_tree25 = w25.service_selector.master_tree
+check("25 T14) Tree vertikale Scrollbar-Policy AsNeeded (eigene Scrollbar)",
+      _tree25 is not None and _tree25.verticalScrollBarPolicy()
+      == _Qt25.ScrollBarAsNeeded,
+      str(_tree25.verticalScrollBarPolicy()) if _tree25 else "None")
+
+# T15: Scrollbox aktivierbar - wird die Box hoeher als der Viewport, erhaelt
+# die vertikale Scrollbar einen Range (> 0).
+if _scroll25 is not None and _box25 is not None:
+    _old_h25 = _box25.height()
+    _box25.resize(_box25.width(), _old_h25 + 600)
+    pump()
+    _range25 = (_scroll25.verticalScrollBar().maximum()
+                - _scroll25.verticalScrollBar().minimum())
+    check("25 T15) Scrollbox aktiviert sich bei Ueberhoehe (Range > 0)",
+          _range25 > 0,
+          f"range={_range25} viewport_h={_scroll25.viewport().height()} "
+          f"box_h={_box25.height()}")
+    _box25.resize(_box25.width(), _old_h25)
+    pump()
+
+w25.close()
+pump()
+
+# ---------------------------------------------------------------------------
+# Teil 26: 18.01.03 Dynamic Tree Management – Sets-Kategorien, Kategorie-
+#          Persistenz (E2), Plugin-Override (E1), Rename & rekursive
+#          Aufloesung (L3). Rein headless (kein Drag&Drop-UI, nur Modell).
+# ---------------------------------------------------------------------------
+print("\n=== Teil 26: 18.01.03 Sets-Kategorien & Kategorie-Persistenz ===")
+from analytics.engine.service_selector_model import ServiceSelectorModel  # noqa: E402
+from serviceui.service_set_utils import (  # noqa: E402
+    _replace_prefix, rename_category, set_plugin_category, set_set_category,
+    create_empty_folder, delete_empty_folder, list_empty_folders)
+
+# E2: save_set persistiert das category-Feld additiv im Payload.
+repo.save_set({
+    "set_id": "set_cat_1",
+    "display_name": "Kategorien-Set A",
+    "category": "Swing Points/Geometrie",
+    "execution_order": ["grid_1"],
+    "services": {"grid_1": {"plugin_id": "srv_grid_lines", "lookback": 1000, "params": {}}},
+})
+repo.save_set({
+    "set_id": "set_cat_2",
+    "display_name": "Kategorien-Set B",
+    "category": "Swing Points",
+    "execution_order": ["prox_1"],
+    "services": {"prox_1": {"plugin_id": "srv_proximity", "lookback": 500, "params": {}}},
+})
+repo.save_set({
+    "set_id": "set_cat_3",
+    "display_name": "Kategorien-Set C",
+    "execution_order": [],
+    "services": {},
+})
+_loaded_cat = repo.get_set("set_cat_1")
+check("26 A1) save_set persistiert category-Feld",
+      bool(_loaded_cat) and _loaded_cat.get("category") == "Swing Points/Geometrie",
+      str(_loaded_cat and _loaded_cat.get("category")))
+
+_model_cat = ServiceSelectorModel(set_repo=repo, state_manager=sm)
+_model_cat.refresh()
+_ids_geo = _model_cat.category_set_ids("Swing Points/Geometrie")
+check("26 A2) category_set_ids exakter Unterordner",
+      "set_cat_1" in _ids_geo and "set_cat_2" not in _ids_geo, str(_ids_geo))
+_ids_sp = _model_cat.category_set_ids("Swing Points")
+check("26 A3) category_set_ids rekursiv (Unterordner inklusive)",
+      set(_ids_sp) >= {"set_cat_1", "set_cat_2"}, str(_ids_sp))
+check("26 A4) Sets ohne Kategorie sind in keinem Pfad",
+      "set_cat_3" not in _ids_sp, str(_ids_sp))
+
+# build_tree: Die Sets-Gruppe enthaelt Kategorie-Ordner (gruppen-agnostisch).
+_tree_cat = _model_cat.build_tree()
+_sets_group = next(g for g in _tree_cat if g["group"] == _model_cat.GROUP_SETS)
+
+
+def _find_folder(nodes, name):
+    for n in nodes or []:
+        if n.get("group") == _model_cat.GROUP_CATEGORY:
+            if (n.get("label") or "").replace("📁 ", "") == name:
+                return n
+            sub = _find_folder(n.get("children") or [], name)
+            if sub:
+                return sub
+    return None
+
+
+_fsp = _find_folder(_sets_group["children"], "Swing Points")
+_fgeo = _find_folder(_sets_group["children"], "Geometrie")
+check("26 A5) build_tree: Sets-Ordner 'Swing Points' vorhanden",
+      _fsp is not None)
+check("26 A6) build_tree: Unterordner 'Geometrie' rekursiv",
+      _fgeo is not None)
+if _fsp is not None:
+    _ids_in_folder = [c.get("set_id") for c in _fsp.get("children", [])]
+    check("26 A7) Set-Dicts in Ordnern (set_id-Schluessel)",
+          "set_cat_2" in _ids_in_folder, str(_ids_in_folder))
+_root_sets = [c for c in _sets_group["children"]
+              if c.get("group") != _model_cat.GROUP_CATEGORY]
+_root_ids = [c.get("set_id") for c in _root_sets]
+check("26 A8) Set ohne Kategorie bleibt Root-Blatt",
+      "set_cat_3" in _root_ids, str(_root_ids))
+
+# E1: Plugin-Kategorie-Override (plugin_category_<id>).
+_pid26 = "srv_grid_lines"
+_orig_path = _model_cat.plugin_category_path(_pid26)
+check("26 B1) set_plugin_category speichert Override",
+      set_plugin_category(sm, _pid26, "Meine Ordner/Unter"))
+_model_cat.refresh()
+check("26 B2) Override aendert plugin_category_path",
+      _model_cat.plugin_category_path(_pid26) == "Meine Ordner/Unter",
+      f"orig={_orig_path} -> {_model_cat.plugin_category_path(_pid26)}")
+_pl_ids = _model_cat.category_plugin_ids("Meine Ordner")
+check("26 B3) category_plugin_ids nutzt Override (rekursiv)",
+      _pid26 in _pl_ids, str(_pl_ids))
+# Override aufheben -> metadata['category'] gilt wieder.
+sm.save_global_value(f"plugin_category_{_pid26}", None)
+_model_cat.refresh()
+check("26 B4) Override aufgehoben -> metadata-Pfad wiederhergestellt",
+      _model_cat.plugin_category_path(_pid26) == _orig_path,
+      f"{_orig_path}")
+
+# Rename (String-Replace aller Kinder) fuer Sets-Ordner.
+_cnt_ren = rename_category(_model_cat, repo, sm, "sets",
+                           "Swing Points", "Bewegte Punkte")
+check("26 C1) rename_category sets liefert Anzahl betroffener Sets",
+      _cnt_ren == 2, str(_cnt_ren))
+_l1 = repo.get_set("set_cat_1")
+check("26 C2) Sets-Pfad-Update Unterordner",
+      bool(_l1) and _l1.get("category") == "Bewegte Punkte/Geometrie",
+      str(_l1 and _l1.get("category")))
+_l2 = repo.get_set("set_cat_2")
+check("26 C3) Sets-Pfad-Update exakter Treffer",
+      bool(_l2) and _l2.get("category") == "Bewegte Punkte",
+      str(_l2 and _l2.get("category")))
+_model_cat.refresh()
+check("26 C4) category_set_ids nach Rename",
+      _model_cat.category_set_ids("Bewegte Punkte/Geometrie") == ["set_cat_1"],
+      str(_model_cat.category_set_ids("Bewegte Punkte/Geometrie")))
+
+# Pfad-Grenzen (kein Prefix-Ersatz von 'AB' durch 'A').
+check("26 D1) _replace_prefix exakter Treffer",
+      _replace_prefix("A/B", "A", "X") == "X/B")
+check("26 D2) _replace_prefix respektiert Ordner-Grenzen",
+      _replace_prefix("AB/C", "A", "X") == "AB/C")
+
+# L3: category_service_plugin_ids (gruppenspezifische Aufloesung).
+_srv_ids = _model_cat.category_service_plugin_ids("sets", "Bewegte Punkte")
+check("26 E1) Sets-Ordner -> Service-plugin_ids (rekursiv)",
+      "srv_grid_lines" in _srv_ids and "srv_proximity" in _srv_ids, str(_srv_ids))
+check("26 E2) Plugins-Ordner Root-Pfad -> [] (defensiv)",
+      _model_cat.category_service_plugin_ids("plugins", "") == [], "")
+
+# ---------------------------------------------------------------------------
+# Teil 27: 18.01.03 (E3-revidiert, 08.08.2026) – Persistenz leerer Ordner.
+# Leere Ordner verschwinden NICHT beim Refresh; sie werden in global_settings
+# (Key 'tree_folders_<group>') persistiert und nur bei manueller Loeschung
+# ('Ordner löschen') entfernt. Rein headless (Modell + global_settings).
+# ---------------------------------------------------------------------------
+print("\n=== Teil 27: 18.01.03 E3-revidiert \u2013 Persistenz leerer Ordner ===")
+
+# create/list/delete Helfer (service_set_utils, DRY mit service_win/dialog).
+check("27 A1) create_empty_folder persistiert Pfad",
+      create_empty_folder(sm, "sets", "Leere Ordner"))
+check("27 A2) list_empty_folders liefert den Pfad",
+      "Leere Ordner" in list_empty_folders(sm, "sets"),
+      str(list_empty_folders(sm, "sets")))
+check("27 A3) create_empty_folder idempotent (kein Duplikat)",
+      create_empty_folder(sm, "sets", "Leere Ordner") is False,
+      str(list_empty_folders(sm, "sets")))
+
+_model_e3 = ServiceSelectorModel(set_repo=repo, state_manager=sm)
+_model_e3.refresh()
+check("27 A4) empty_folder_paths lesend (Modell)",
+      "Leere Ordner" in _model_e3.empty_folder_paths("sets"),
+      str(_model_e3.empty_folder_paths("sets")))
+
+# build_tree: leerer Ordner erscheint in der Sets-Gruppe (ohne Kinder).
+_tree_e3 = _model_e3.build_tree()
+_sets_e3 = next(g for g in _tree_e3 if g["group"] == _model_e3.GROUP_SETS)
+_fleer = _find_folder(_sets_e3["children"], "Leere Ordner")
+check("27 B1) build_tree enthaelt leeren Ordner (Sets)",
+      _fleer is not None)
+if _fleer is not None:
+    check("27 B2) leerer Ordner hat keine Kinder",
+          not _fleer.get("children"), str(_fleer.get("children")))
+    check("27 B3) leerer Ordner ist GROUP_CATEGORY",
+          _fleer.get("group") == _model_e3.GROUP_CATEGORY,
+          str(_fleer.get("group")))
+
+# Persistenz: ueberlebt einen weiteren build_tree-Aufruf (frischer Refresh).
+_sets_e3b = next(g for g in _model_e3.build_tree()
+                 if g["group"] == _model_e3.GROUP_SETS)
+check("27 C1) leerer Ordner ueberlebt Refresh",
+      _find_folder(_sets_e3b["children"], "Leere Ordner") is not None)
+
+# Auch in der Plugins-Gruppe (tree_folders_plugins).
+create_empty_folder(sm, "plugins", "Meine Plugins")
+_model_e3.refresh()
+_pl_e3 = next(g for g in _model_e3.build_tree()
+              if g["group"] == _model_e3.GROUP_PLUGINS)
+_fpl = _find_folder(_pl_e3["children"], "Meine Plugins")
+check("27 D1) leerer Ordner in Plugins-Gruppe",
+      _fpl is not None and not _fpl.get("children"))
+
+# Verschachtelter leerer Ordner erzeugt die Eltern-Kette.
+create_empty_folder(sm, "sets", "Eltern/Unter")
+_model_e3.refresh()
+_sets_e3c = next(g for g in _model_e3.build_tree()
+                 if g["group"] == _model_e3.GROUP_SETS)
+check("27 E1) verschachtelter leerer Ordner: Elternkette erzeugt",
+      _find_folder(_sets_e3c["children"], "Eltern") is not None
+      and _find_folder(_sets_e3c["children"], "Unter") is not None)
+
+# Kein Duplikat, wenn ein REALER Ordner (Blatt-Kategorie) existiert:
+# Set mit category 'Leere Ordner' -> Ordner wird wiederverwendet.
+repo.save_set({
+    "set_id": "set_e3_real",
+    "display_name": "E3-Realset",
+    "category": "Leere Ordner",
+    "execution_order": ["grid_1"],
+    "services": {"grid_1": {"plugin_id": "srv_grid_lines", "lookback": 1000,
+                            "params": {}}},
+})
+_model_e3.refresh()
+_sets_e3d = next(g for g in _model_e3.build_tree()
+                 if g["group"] == _model_e3.GROUP_SETS)
+_fmix = _find_folder(_sets_e3d["children"], "Leere Ordner")
+_cnt_leer = sum(1 for n in _sets_e3d["children"]
+                if n.get("group") == _model_e3.GROUP_CATEGORY
+                and _model_e3._cat_key(n.get("label")) == "leere ordner")
+check("27 F1) realer Ordner + leerer Eintrag -> kein Duplikat",
+      _cnt_leer == 1, f"count={_cnt_leer}")
+if _fmix is not None:
+    _real_ids = [n.get("set_id") for n in _fmix.get("children", [])]
+    check("27 F2) realer Ordner behaelt sein Blatt",
+          "set_e3_real" in _real_ids, str(_real_ids))
+
+# Rename (String-Replace) verschiebt auch persistierte leere Ordner.
+create_empty_folder(sm, "sets", "Leere Ordner/Unterleer")
+_model_e3.refresh()
+_cnt_ren_e3 = rename_category(_model_e3, repo, sm, "sets",
+                              "Leere Ordner", "Rename-Ordner")
+check("27 G1) rename_category erfasst leere Ordner mit",
+      _cnt_ren_e3 >= 2, str(_cnt_ren_e3))
+check("27 G2) leere-Ordner-Pfade nach Rename verschoben",
+      "Rename-Ordner" in list_empty_folders(sm, "sets")
+      and "Rename-Ordner/Unterleer" in list_empty_folders(sm, "sets"),
+      str(list_empty_folders(sm, "sets")))
+
+# Manuelle Loeschung (delete_empty_folder) entfernt den Ordner endgueltig.
+check("27 H1) delete_empty_folder entfernt Pfad",
+      delete_empty_folder(sm, "sets", "Rename-Ordner/Unterleer"))
+_model_e3.refresh()
+_sets_e3e = next(g for g in _model_e3.build_tree()
+                 if g["group"] == _model_e3.GROUP_SETS)
+check("27 H2) geloeschter leerer Ordner aus build_tree verschwunden",
+      _find_folder(_sets_e3e["children"], "Unterleer") is None)
+check("27 H3) delete_empty_folder bei fehlendem Pfad -> False",
+      delete_empty_folder(sm, "sets", "Gibt es nicht") is False)
+
+# ---------------------------------------------------------------------------
+# Teil 28: 18.01.03 (Bugfix 08.08.2026) – Quell-Ordner bleiben beim
+# Herausziehen sichtbar (Punkt 1) + Expansion-Erhaltung ueber _populate()
+# (Punkt 3). Rein headless (Modell + global_settings; MasterTree offscreen
+# fuer die Expansion-Logik, kein exec).
+# ---------------------------------------------------------------------------
+print("\n=== Teil 28: 18.01.03 Bugfix - Quell-Ordner erhalten & Expansion ===")
+from serviceui.service_set_utils import ensure_folder_path  # noqa: E402
+from serviceui.master_tree import TYPE_CATEGORY  # noqa: E402
+
+
+def _find_cat_item(tree, path):
+    """Kategorie-Item mit vollem Pfad `path` im MasterTree (oder None)."""
+    for _it in TreeItemIterator(tree):
+        if _it is None:
+            continue
+        if _it.data(0, ROLE_NODE_TYPE) != TYPE_CATEGORY:
+            continue
+        if tree._category_path_of(_it) == path:
+            return _it
+    return None
+
+
+# A) ensure_folder_path: Kette idempotent persistieren.
+check("28 A1) ensure_folder_path persistiert Kette",
+      ensure_folder_path(sm, "sets", "Eltern/Unter"))
+check("28 A2) Kettenglieder in Liste",
+      "Eltern" in list_empty_folders(sm, "sets")
+      and "Eltern/Unter" in list_empty_folders(sm, "sets"),
+      str(list_empty_folders(sm, "sets")))
+check("28 A3) idempotent (keine Duplikate)",
+      ensure_folder_path(sm, "sets", "Eltern/Unter") is True
+      and list_empty_folders(sm, "sets").count("Eltern/Unter") == 1,
+      str(list_empty_folders(sm, "sets")))
+check("28 A4) None-state_manager -> False",
+      ensure_folder_path(None, "sets", "Eltern") is False)
+
+# B) Move-out: letztes Set aus einem Ordner gezogen -> Ordner bleibt sichtbar.
+repo.save_set({
+    "set_id": "set_e3_move",
+    "display_name": "E3-Move-Set",
+    "category": "Bewegte Punkte/Geometrie",
+    "execution_order": ["grid_1"],
+    "services": {"grid_1": {"plugin_id": "srv_grid_lines", "lookback": 1000,
+                            "params": {}}},
+})
+_model_e3b = ServiceSelectorModel(set_repo=repo, state_manager=sm)
+_model_e3b.refresh()
+_tree_b = _model_e3b.build_tree()
+_sets_b = next(g for g in _tree_b if g["group"] == _model_e3b.GROUP_SETS)
+check("28 B1) Ordner vor Move vorhanden",
+      _find_folder(_sets_b["children"], "Geometrie") is not None)
+# Verschieben auf Root (category "") – der Orchestrator-Handler
+# (_on_folder_item_moved) ruft danach ensure_folder_path fuer den
+# Quell-Pfad (Punkt 1).
+set_set_category(repo, "set_e3_move", "")
+ensure_folder_path(sm, "sets", "Bewegte Punkte/Geometrie")
+_model_e3b.refresh()
+_sets_b2 = next(g for g in _model_e3b.build_tree()
+                if g["group"] == _model_e3b.GROUP_SETS)
+check("28 B2) Quell-Ordner 'Geometrie' bleibt sichtbar (leer)",
+      _find_folder(_sets_b2["children"], "Geometrie") is not None)
+check("28 B3) Elternkette 'Bewegte Punkte' bleibt sichtbar",
+      _find_folder(_sets_b2["children"], "Bewegte Punkte") is not None)
+_root_b = [n.get("set_id") for n in _sets_b2["children"]
+           if n.get("group") != _model_e3b.GROUP_CATEGORY]
+check("28 B4) Set ist Root-Blatt",
+      "set_e3_move" in _root_b, str(_root_b))
+_fgeo_b = _find_folder(_sets_b2["children"], "Geometrie")
+if _fgeo_b is not None:
+    _geo_ids = [c.get("set_id") for c in _fgeo_b.get("children", [])]
+    check("28 B5) verschobenes Set aus Quell-Ordner entfernt",
+          "set_e3_move" not in _geo_ids, str(_geo_ids))
+
+# C) Ordner-Move (rename_category) erhaelt den Quell-Ordner.
+ensure_folder_path(sm, "sets", "Quell-A")
+repo.save_set({
+    "set_id": "set_e3_src",
+    "display_name": "E3-Quell-Set",
+    "category": "Quell-A",
+    "execution_order": ["grid_1"],
+    "services": {"grid_1": {"plugin_id": "srv_grid_lines", "lookback": 1000,
+                            "params": {}}},
+})
+_model_e3c = ServiceSelectorModel(set_repo=repo, state_manager=sm)
+_cnt_ren_c = rename_category(_model_e3c, repo, sm, "sets",
+                             "Quell-A", "Ziel-B")
+check("28 C1) rename_category verschiebt Kind",
+      _cnt_ren_c >= 1, str(_cnt_ren_c))
+_after_c = list_empty_folders(sm, "sets")
+check("28 C2) Ziel-Pfad 'Ziel-B' in Liste",
+      "Ziel-B" in _after_c, str(_after_c))
+check("28 C3) Quell-Ordner 'Quell-A' bleibt erhalten (leer)",
+      "Quell-A" in _after_c, str(_after_c))
+
+# D) Expansion-Erhaltung ueber _populate (Punkt 3, offscreen MasterTree).
+ensure_folder_path(sm, "sets", "Expand/Unter")
+_model_e3d = ServiceSelectorModel(set_repo=repo, state_manager=sm)
+_tree_w = MasterTree(_model_e3d)
+_xd = _find_cat_item(_tree_w, "Expand")
+_yd = _find_cat_item(_tree_w, "Expand/Unter")
+check("28 D1) Ordner im Tree vorhanden",
+      _xd is not None and _yd is not None)
+if _xd is not None and _yd is not None:
+    _xd.setExpanded(True)
+    _yd.setExpanded(True)
+    _tree_w._populate()
+    _xd2 = _find_cat_item(_tree_w, "Expand")
+    _yd2 = _find_cat_item(_tree_w, "Expand/Unter")
+    check("28 D2) Expansion bleibt ueber _populate erhalten",
+          _xd2 is not None and _yd2 is not None
+          and _xd2.isExpanded() and _yd2.isExpanded())
+# Einmal-Expansion (_mark_expand, z.B. nach Ordner-Erstellung/Drop).
+ensure_folder_path(sm, "sets", "Frisch/Neu")
+_model_e3d.refresh()  # data_changed -> _populate (Ordner wird gebaut)
+_tree_w._mark_expand("sets", "Frisch/Neu")
+_tree_w._populate()
+_fd1 = _find_cat_item(_tree_w, "Frisch")
+_fd2 = _find_cat_item(_tree_w, "Frisch/Neu")
+check("28 D3) _mark_expand klappt Ziel-Kette nach _populate auf",
+      _fd1 is not None and _fd2 is not None
+      and _fd1.isExpanded() and _fd2.isExpanded())
+check("28 D4) _expand_after_rebuild geleert",
+      not _tree_w._expand_after_rebuild)
+
+# ---------------------------------------------------------------------------
+# Teil 29: 08.08.2026 Bugfix – 1) Picker-Start (setSizeConstraint-Crash) und
+# 2) Hoehe fix bei Set-/Service-Klicks (_build_service_columns ohne
+# Fenster-Reflow). Rein headless (offscreen, kein exec).
+# ---------------------------------------------------------------------------
+print("\n=== Teil 29: 08.08.2026 Bugfix - Picker-Start & Hoehe fix ===")
+from PySide6.QtWidgets import (  # noqa: E402
+    QGroupBox, QHBoxLayout, QLayout, QScrollArea,
+)
+from serviceui.param_columns import ServiceParamColumnsMixin  # noqa: E402
+from serviceui.service_selector_dialog import ServiceSelectorDialog  # noqa: E402
+
+# Bug 2: ServiceSelectorDialog darf beim Oeffnen nicht mehr crashen
+# (self.setSizeConstraint gehoerte zum Layout, nicht zum QDialog).
+_model_picker = ServiceSelectorModel(set_repo=repo, state_manager=sm)
+try:
+    _dlg = ServiceSelectorDialog(model=_model_picker)
+    check("29 A1) ServiceSelectorDialog startet ohne Crash", _dlg is not None)
+    check("29 A2) root-Layout SetNoConstraint (Hoehe fix)",
+          _dlg.layout().sizeConstraint() == QLayout.SetNoConstraint,
+          str(_dlg.layout().sizeConstraint()))
+    _dlg.close()
+except Exception as _e:
+    check(f"29 A1) ServiceSelectorDialog startet ohne Crash", False, str(_e))
+
+# Bug 1: _build_service_columns darf KEINEN Fenster-Reflow mehr ausloesen.
+# Duck-Typ-Host OHNE _schedule_reflow/_apply_reflow_size – vor dem Fix haette
+# der _reflow()-Aufruf (-> _schedule_reflow) einen AttributeError ausgeloest.
+class _DummyParamHost29(ServiceParamColumnsMixin):
+    def __init__(self):
+        self._service_param_controls = {}
+        self._service_desc_controls = {}
+        self._mode_schemas = {}
+        self._service_param_labels = {}
+        self._service_info_labels = {}
+        self._service_info_pids = {}
+        self._symbol_precision = None
+        self.combo_symbol = None
+        self.combo_tf = None
+        self.main_splitter = None
+        self.service_columns_layout = QHBoxLayout()
+        self.widget_service_columns = QGroupBox("Service-Parameter")
+        self.widget_service_columns.setLayout(self.service_columns_layout)
+        self._param_scroll = QScrollArea()
+        self._param_scroll.setWidget(self.widget_service_columns)
+
+    def _service_lock(self, plugin_id):
+        return "", ""
+
+    def _mark_service_dirty(self, iid):
+        pass
+
+    def _open_service_desc_editor(self, instance_id):
+        pass
+
+    def collect_set_definition(self):
+        return {}
+
+
+_host29 = _DummyParamHost29()
+try:
+    _host29._build_service_columns({
+        "execution_order": ["grid_1", "prox_1"],
+        "services": {
+            "grid_1": {"plugin_id": "srv_grid_lines", "lookback": 1000,
+                       "params": {}},
+            "prox_1": {"plugin_id": "srv_proximity", "lookback": 500,
+                       "params": {}},
+        },
+    })
+    check("29 B1) _build_service_columns ohne Fenster-Reflow (kein Crash)",
+          True)
+    check("29 B2) Service-Spalten gebaut",
+          _host29.service_columns_layout.count() >= 2,
+          str(_host29.service_columns_layout.count()))
+    check("29 B3) kein _apply_reflow_size-QTimer geplant",
+          not hasattr(_host29, "_apply_reflow_size"))
+except Exception as _e:
+    check(f"29 B1) _build_service_columns ohne Fenster-Reflow", False,
+          str(_e))
+
+
+print(chr(10) + '=== Teil 30: 18.01.02 Refactoring & Modularisierung (E1-E8) ===')
+import io as _io30
+import db_service as _db_facade
+from db.db_pool import DbPool as _DbPool30, db_connect as _dbc30, _LockedConnection as _lock30, with_db_lock as _wdl30
+from db.db_utils import _parse_json_field as _pjf30, _ensure_epoch as _ee30
+from db.schema_initializer import check_and_init_databases as _ci30
+from data_sync.mt5_sync_service import (sync_market_data as _smd30, get_timeframes as _gtf30,
+                                         check_mt5_connection as _cmc30, get_latest_timestamp as _glt30,
+                                         TF_SECONDS_MAP as _tfs30, MT5_LOCK as _ml30, SYMBOLS as _sym30)
+from repositories.market_data_repository import MarketDataRepository as _mdr30, get_symbol_precision as _gsp30
+
+# --- A: Fassade db_service re-exportiert alle E2-Namen (Identitaet) ---
+_facade30 = {
+    'DbPool': _db_facade.DbPool, '_LockedConnection': _db_facade._LockedConnection,
+    'db_connect': _db_facade.db_connect, 'with_db_lock': _db_facade.with_db_lock,
+    '_parse_json_field': _db_facade._parse_json_field, '_ensure_epoch': _db_facade._ensure_epoch,
+    'check_and_init_databases': _db_facade.check_and_init_databases,
+    'sync_market_data': _db_facade.sync_market_data, 'get_timeframes': _db_facade.get_timeframes,
+    'check_mt5_connection': _db_facade.check_mt5_connection,
+    'get_latest_timestamp': _db_facade.get_latest_timestamp,
+    'TF_SECONDS_MAP': _db_facade.TF_SECONDS_MAP, 'MT5_LOCK': _db_facade.MT5_LOCK,
+    'SYMBOLS': _db_facade.SYMBOLS, 'MarketDataRepository': _db_facade.MarketDataRepository,
+    'get_symbol_precision': _db_facade.get_symbol_precision,
+    'DATA_DIR': _db_facade.DATA_DIR, 'DB_MARKET_DATA': _db_facade.DB_MARKET_DATA,
+    'DB_ANALYTICS': _db_facade.DB_ANALYTICS, 'DB_APP_DATA': _db_facade.DB_APP_DATA,
+}
+check('30 A1) Fassade re-exportiert alle E2-Namen',
+      all(_facade30.values()) and len(_facade30) == 20, str(list(_facade30.keys())))
+check('30 A2) DbPool-Identitaet (db_service == db.db_pool)', _db_facade.DbPool is _DbPool30)
+check('30 A3) MarketDataRepository-Identitaet', _db_facade.MarketDataRepository is _mdr30)
+check('30 A4) _parse_json_field-Identitaet', _db_facade._parse_json_field is _pjf30)
+check('30 A5) sync_market_data-Identitaet', _db_facade.sync_market_data is _smd30)
+check('30 A6) get_timeframes-Identitaet', _db_facade.get_timeframes is _gtf30)
+
+# --- B: Kein Zirkularitaets-Verstoes (E4) ---
+_new_modules30 = ['db/db_pool.py', 'db/db_utils.py', 'db/schema_initializer.py',
+                  'data_sync/mt5_sync_service.py', 'repositories/market_data_repository.py',
+                  'workers/data_sync_worker.py', 'workers/live_tick_worker.py',
+                  'ui/window_manager.py', 'analytics/engine/tree_builder.py']
+_bad30 = []
+for _rel30 in _new_modules30:
+    _txt30 = _io30.open(os.path.join(r'F:\Python\PyTrader', _rel30), encoding='utf-8').read()
+    for _banned30 in ('import main', 'from main import', 'from db_service import',
+                      'import db_service'):
+        if _banned30 in _txt30:
+            _bad30.append(_rel30 + ': ' + _banned30)
+check('30 B1) neue Module importieren main/db_service NICHT (E4)', not _bad30, str(_bad30))
+_tb_src30 = _io30.open(os.path.join(r'F:\Python\PyTrader',
+                                    'analytics/engine/tree_builder.py'), encoding='utf-8').read()
+check('30 B2) tree_builder importiert ServiceSelectorModel NICHT (E6)',
+      'from analytics.engine.service_selector_model' not in _tb_src30
+      and 'import service_selector_model' not in _tb_src30)
+
+# --- C: Worker-Instanziierung (E7) ---
+from workers.data_sync_worker import DataSyncWorker
+from workers.live_tick_worker import LiveTickWorker
+_ws30 = DataSyncWorker()
+check('30 C1) DataSyncWorker instanziierbar', isinstance(_ws30, DataSyncWorker))
+_wt30 = LiveTickWorker(lambda: set())
+check('30 C2) LiveTickWorker instanziierbar', isinstance(_wt30, LiveTickWorker))
+check('30 C3) LiveTickWorker-Callback liefert leere Paare',
+      _wt30.get_active_pairs() == set())
+
+# --- D: WindowManager (E5, IoC ohne MainWindow) ---
+from ui.window_manager import WindowManager
+class _DummyParent30:
+    pass
+_wm30 = WindowManager(parent=_DummyParent30(), state_manager=_P1608StateMgr(),
+                      chart_windows=[], persistent_sub_windows=[])
+check('30 D1) WindowManager instanziierbar (IoC, kein main-Import)', isinstance(_wm30, WindowManager))
+check('30 D2) get_currently_active_pairs leer', _wm30.get_currently_active_pairs() == set())
+
+# --- E: tree_builder-Delegation (E6) ---
+from analytics.engine.tree_builder import (build_tree as _tbb30, category_plugin_ids as _tbcpid30,
+                                            category_set_ids as _tbcsid30, plugin_category_path as _tbp30,
+                                            category_service_plugin_ids as _tbcsp30, _cat_key as _tbck30)
+check('30 E1) Modell._cat_key delegiert an tree_builder',
+      ServiceSelectorModel._cat_key('📁 Trend') == 'trend' == _tbck30('📁 Trend'))
+_plugs30 = {'a': _P1608Plugin('a', category='Swing Points/Geometrie'),
+            'b': _P1608Plugin('b', category='Swing Points'),
+            'c': _P1608Plugin('c', category='')}
+_model30 = _p1608_model(_plugs30)
+_tree_model30 = _model30.build_tree()
+_plugins30 = _model30.get_plugins()
+_badges30 = {pid: _model30.badge_for(pid) for pid in _plugins30}
+_exec30 = {pid: _model30.last_execution_date(pid) for pid in _plugins30}
+_tree_direct30 = _tbb30(_model30.get_sets(), _plugins30,
+                        _model30._plugin_category_overrides,
+                        _model30._empty_folder_paths, _badges30, _exec30)
+check('30 E2) build_tree Modell == tree_builder direkt', _tree_model30 == _tree_direct30, '')
+check('30 E3) category_plugin_ids-Delegation',
+      _model30.category_plugin_ids('Swing Points')
+      == _tbcpid30(_plugins30, _model30._plugin_category_overrides, 'Swing Points')
+      == ['a', 'b'])
+check('30 E4) plugin_category_path-Delegation',
+      _model30.plugin_category_path('a')
+      == _tbp30('a', _plugins30.get('a'), _model30._plugin_category_overrides)
+      == 'Swing Points/Geometrie')
+check('30 E5) category_set_ids leer -> [] (Delegation)',
+      _model30.category_set_ids('Swing Points')
+      == _tbcsid30([], 'Swing Points') == [])
+check('30 E6) category_service_plugin_ids Plugins-Ordner (Delegation)',
+      _model30.category_service_plugin_ids('plugins', 'Swing Points')
+      == _tbcsp30('plugins', _model30.get_sets(), _plugins30,
+                  _model30._plugin_category_overrides, 'Swing Points')
+      == ['a', 'b'])
+check('30 E7) Baum-Logik aus dem Modell ausgelagert (keine Methoden mehr)',
+      not hasattr(ServiceSelectorModel, '_category_parts')
+      and not hasattr(ServiceSelectorModel, '_insert_into_category_tree')
+      and not hasattr(ServiceSelectorModel, '_sort_category_nodes')
+      and not hasattr(ServiceSelectorModel, '_category_nodes')
+      and not hasattr(ServiceSelectorModel, '_ensure_category_path')
+      and not hasattr(ServiceSelectorModel, '_set_category_parts')
+      and not hasattr(ServiceSelectorModel, '_insert_set_into_category_tree'))
+
+
+print("\n=== Teil 31: 19.01 Analytics UI - Status-Feedback & Multi-Service Table ===")
+import duckdb  # noqa: E402
+from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
+from analytics.engine.analytics_repository import AnalyticsRepository  # noqa: E402
+from analytics.ui.table_page import TablePage  # noqa: E402
+
+# Eigene Temp-DB (analytics) – unabhaengig vom echten Datenbestand.
+_tmp31 = tempfile.mkdtemp(prefix="p1901_")
+_db31 = os.path.join(_tmp31, "analytics.duckdb")
+_con31 = duckdb.connect(_db31)
+_con31.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR, timeframe VARCHAR, bar_time TIMESTAMPTZ,
+        ema_diff DOUBLE, rsi_14 DOUBLE, atr_normalized DOUBLE,
+        created_at TIMESTAMPTZ, feature_id VARCHAR, plugin_version VARCHAR,
+        feature_data JSON
+    )
+""")
+_con31.execute("""
+    INSERT INTO feature_store VALUES
+    ('XAGUSD','M1', '2026-08-01 10:00:00+00', 0.5, 60.0, 1.0,
+     '2026-08-01 10:01:00+00', 'srv_a', '1.0.0',
+     '{"schema_version":"1.0.0","grid_step":1.0}'),
+    ('XAGUSD','M1', '2026-08-01 10:01:00+00', 0.6, 55.0, 1.1,
+     '2026-08-01 10:02:00+00', 'srv_b', '1.0.0',
+     '{"schema_version":"1.0.0","lookback":200}'),
+    ('XAGUSD','M1', '2026-08-01 10:02:00+00', 0.7, 58.0, 1.2,
+     '2026-08-01 10:03:00+00', 'srv_a', '1.0.0',
+     '{"schema_version":"1.0.0","grid_step":2.0}'),
+    ('XAGUSD','M1', '2026-08-01 10:03:00+00', 0.8, 61.0, 1.3,
+     '2026-08-01 10:04:00+00', 'srv_b', '1.0.0',
+     '{"schema_version":"1.0.0","lookback":100}')
+""")
+_con31.close()
+
+_reader31 = FeatureStoreReader(_db31)
+_repo31 = AnalyticsRepository(_reader31)
+
+# Testfall A: Abfrage fuer ungescannte Symbole/Services liefert total == 0.
+_a31 = _repo31.get_table("EURUSD", "M1")
+check("31 A1) Ungescanntes Symbol liefert total == 0",
+      _a31["total"] == 0 and _a31["rows"] == [],
+      f"total={_a31['total']}")
+
+# Testfall B: Multi-feature_ids-Abfrage liefert gemischte Ergebnissaetze.
+_b31 = _repo31.get_table("XAGUSD", "M1", feature_ids=["srv_a", "srv_b"])
+check("31 B1) Multi-feature_ids liefert alle Rows",
+      _b31["total"] == 4, f"total={_b31['total']}")
+_fids31 = sorted({r["feature_id"] for r in _b31["rows"]})
+check("31 B2) Gemischte Services (srv_a + srv_b)",
+      _fids31 == ["srv_a", "srv_b"], str(_fids31))
+_only_a31 = _repo31.get_table("XAGUSD", "M1", feature_ids=["srv_a"])
+check("31 B3) Einzel-Filter srv_a liefert nur srv_a",
+      _only_a31["total"] == 2
+      and all(r["feature_id"] == "srv_a" for r in _only_a31["rows"]),
+      f"total={_only_a31['total']}")
+
+# TablePage: Multi-Service-Darstellung (Spalte 1 = Service, absteigende
+# Chronologie, JSON-Union-Spalten, Fehlwerte "-").
+_page31 = TablePage()
+_page31.set_name_resolver(lambda ids: [f"Name({i})" for i in ids])
+_page31._populate(_b31["rows"])
+_times31 = [int(r["time"]) for r in _page31._current_rows]
+check("31 C1) Tabelle absteigend nach bar_time sortiert",
+      _times31 == sorted(_times31, reverse=True), str(_times31))
+_svc31 = _page31._table.item(0, 1).text()
+check("31 C2) Spalte 1 = Service-Anzeigename (neueste Row = srv_b)",
+      _svc31 == "Name(srv_b)", f"svc={_svc31}")
+_headers31 = [_page31._table.horizontalHeaderItem(i).text()
+              for i in range(_page31._table.columnCount())]
+check("31 C3) JSON-Union-Spalten (grid_step, lookback, schema_version)",
+      "grid_step" in _headers31 and "lookback" in _headers31
+      and "schema_version" in _headers31, str(_headers31))
+_lb_idx31 = _headers31.index("lookback")
+_found_a31 = False
+for _r31 in range(_page31._table.rowCount()):
+    if _page31._current_rows[_r31]["feature_id"] == "srv_a":
+        _val31 = _page31._table.item(_r31, _lb_idx31).text()
+        check("31 C4) Fehlwert bei abweichendem Service -> '-'",
+              _val31 == "-", f"val={_val31}")
+        _found_a31 = True
+        break
+check("31 C5) srv_a-Row im TablePage gefunden (Union-Kontrollzeile)",
+      _found_a31, "")
+shutil.rmtree(_tmp31, ignore_errors=True)
+
+print("\n=== Teil 32: 19.02 Cleanup - Native-Spalten entfernt, dynamische JSON-Achsen ===")
+# Deterministische Temp-DB (Neuschema OHNE ema_diff/rsi_14/atr_normalized).
+_tmp32 = tempfile.mkdtemp(prefix="p1902_")
+_db32 = os.path.join(_tmp32, "analytics.duckdb")
+_con32 = duckdb.connect(_db32)
+_con32.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR, timeframe VARCHAR, bar_time TIMESTAMPTZ,
+        created_at TIMESTAMPTZ, feature_id VARCHAR, plugin_version VARCHAR,
+        feature_data JSON
+    )
+""")
+_con32.execute("""
+    INSERT INTO feature_store VALUES
+    ('XAGUSD','M1', '2026-08-01 10:00:00+00', '2026-08-01 10:01:00+00',
+     'srv_a', '1.0.0', '{"schema_version":"1.0.0","grid_step":1.0,"grid_nearest_level":1.5,"visit_pct":2.0}'),
+    ('XAGUSD','M1', '2026-08-01 10:01:00+00', '2026-08-01 10:02:00+00',
+     'srv_b', '1.0.0', '{"schema_version":"1.0.0","lookback":200,"visit_pct":2.5}'),
+    ('XAGUSD','M1', '2026-08-01 10:02:00+00', '2026-08-01 10:03:00+00',
+     'srv_a', '1.0.0', '{"schema_version":"1.0.0","grid_step":2.0,"grid_nearest_level":3.0,"visit_pct":4.0}'),
+    ('XAGUSD','M1', '2026-08-01 10:03:00+00', '2026-08-01 10:04:00+00',
+     'srv_b', '1.0.0', '{"schema_version":"1.0.0","lookback":100,"visit_pct":1.5,"is_hit":true,"grid_nearest_level":2.5}'),
+    ('XAGUSD','M1', '2026-08-01 10:04:00+00', '2026-08-01 10:05:00+00',
+     'srv_b', '1.0.0', NULL)
+""")
+_con32.close()
+_reader32 = FeatureStoreReader(_db32)
+_repo32 = AnalyticsRepository(_reader32)
+
+# Reader: dynamische JSON-Keys statt nativer Spalten.
+_keys32 = _reader32.available_feature_keys("XAGUSD", "M1")
+check("32 A1) Alle JSON-Keys inkl. bool is_hit",
+      set(_keys32) == {"grid_step", "grid_nearest_level", "lookback",
+                       "visit_pct", "is_hit"}, str(_keys32))
+_keys_num32 = _reader32.available_feature_keys("XAGUSD", "M1",
+                                               numeric_only=True)
+check("32 A2) numeric_only (kein bool/str/schema_version)",
+      set(_keys_num32) == {"grid_step", "grid_nearest_level", "lookback",
+                           "visit_pct"}, str(_keys_num32))
+_rows32 = _reader32.fetch_rows("XAGUSD", "M1")
+check("32 A3) fetch_rows ohne Legacy-Spalten",
+      len(_rows32) == 5
+      and all("ema_diff" not in r and "rsi_14" not in r
+              and "atr_normalized" not in r for r in _rows32),
+      f"n={len(_rows32)}")
+check("32 A4) NULL-feature_data -> schema_version-Default",
+      len(_rows32) == 5
+      and any(r["feature_data"] == {"schema_version": "1.0.0"}
+              for r in _rows32),
+      str([r["feature_data"] for r in _rows32]))
+_cols32 = _reader32.fetch_columns("XAGUSD", "M1",
+                                  ["grid_nearest_level", "visit_pct"])
+check("32 A5) fetch_columns extrahiert JSON-Keys",
+      len(_cols32) == 3
+      and all("grid_nearest_level" in c and "visit_pct" in c
+              for c in _cols32), str(_cols32))
+check("32 A6) fetch_rows DESC (neuestes zuerst, bis Limit)",
+      [r["time"] for r in _rows32]
+      == sorted([r["time"] for r in _rows32], reverse=True)
+      and [r["time"] for r in _reader32.fetch_rows(
+          "XAGUSD", "M1", limit=2)]
+      == sorted([r["time"] for r in _rows32], reverse=True)[:2],
+      str([r["time"] for r in _rows32]))
+
+# Repository: Defaults dynamisch (keine Legacy-Achsen).
+_sc32 = _repo32.get_scatter("XAGUSD", "M1")
+check("32 B1) Scatter-Defaults dynamisch (x != y, aus JSON)",
+      _sc32["total"] > 0 and _sc32["x_label"] in _sc32["columns"]
+      and _sc32["y_label"] in _sc32["columns"]
+      and _sc32["x_label"] != _sc32["y_label"],
+      f"x={_sc32['x_label']} y={_sc32['y_label']} n={_sc32['total']}")
+_sc32b = _repo32.get_scatter("XAGUSD", "M1", x_column="grid_nearest_level",
+                             y_column="visit_pct")
+check("32 B2) Scatter explizite Keys", _sc32b["total"] == 3,
+      f"n={_sc32b['total']}")
+_dist32 = _repo32.get_distribution("XAGUSD", "M1")
+check("32 B3) Distribution-Default dynamisch", _dist32["total"] > 0
+      and _dist32["column"] in _dist32["columns"],
+      f"col={_dist32['column']} n={_dist32['total']}")
+_hm32 = _repo32.get_heatmap("XAGUSD", "M1", metric="grid_nearest_level")
+check("32 B4) Heatmap JSON-Metrik + Fallback count",
+      _hm32["metric"] == "grid_nearest_level"
+      and _repo32.get_heatmap("XAGUSD", "M1",
+                              metric="quatsch")["metric"] == "count"
+      and _repo32.get_heatmap("XAGUSD", "M1")["metric"] == "count",
+      f"metrics={_hm32.get('metrics')}")
+
+# ViewModel: keine Legacy-Defaults mehr.
+from analytics.engine.analytics_view_model import AnalyticsViewModel  # noqa: E402
+_vm32 = AnalyticsViewModel(analytics_repo=_repo32)
+check("32 C1) Keine Legacy-Achsen-Defaults",
+      _vm32.params["scatter_x"] == "" and _vm32.params["scatter_y"] == ""
+      and _vm32.params["distribution_column"] == ""
+      and _vm32.params["heatmap_metric"] == "count", str(_vm32.params))
+check("32 C2) Dynamische Achsen-/Metrik-Aufloesung",
+      "grid_nearest_level" in _vm32.available_feature_columns("XAGUSD", "M1")
+      and _vm32.heatmap_metrics("XAGUSD", "M1")[0] == "count"
+      and "visit_pct" in _vm32.heatmap_metrics("XAGUSD", "M1"), "")
+
+# TablePage: Schrift <=9pt, Basis [Zeit, Service], JSON-Union, keine Legacy.
+_page32 = TablePage()
+_font32 = _page32._table.font()
+_hdr32 = _page32._table.horizontalHeader().font()
+check("32 D1) Kleinere Schrift (Tabelle + Header, <= 9pt, Header fett)",
+      _font32.pointSize() <= 9 and _hdr32.pointSize() <= 9 and _hdr32.bold(),
+      f"t={_font32.pointSize()} h={_hdr32.pointSize()} b={_hdr32.bold()}")
+_page32._populate(_rows32)
+_headers32 = [_page32._table.horizontalHeaderItem(i).text()
+              for i in range(_page32._table.columnCount())]
+check("32 D2) Basis-Spalten [Zeit (Wanduhr), Service] + keine Legacy",
+      _headers32[:2] == ["Zeit (Wanduhr)", "Service"]
+      and "ema_diff" not in _headers32 and "rsi_14" not in _headers32
+      and "atr_normalized" not in _headers32, str(_headers32[:4]))
+check("32 D3) JSON-Union inkl. schema_version",
+      {"grid_step", "lookback", "visit_pct", "is_hit", "schema_version"}
+      <= set(_headers32), str(_headers32))
+shutil.rmtree(_tmp32, ignore_errors=True)
+
+print("\n=== Teil 33: 19.03 TablePage - Resizing, In-Memory-Sorting & Profil-Persistenz ===")
+from datetime import datetime  # noqa: E402
+from PySide6.QtCore import Qt  # noqa: E402
+from analytics_profile_repository import AnalyticsProfileRepository  # noqa: E402
+from analytics.ui.table_page import _SortableTimeItem  # noqa: E402
+
+# Deterministische Temp-DBs (app_data fuer Profile, analytics leer).
+_tmp33 = tempfile.mkdtemp(prefix="p1903_")
+_db33_profile = os.path.join(_tmp33, "app_data.duckdb")
+_db33_ana = os.path.join(_tmp33, "analytics.duckdb")
+for _p33 in (_db33_profile, _db33_ana):
+    _c33 = duckdb.connect(_p33)
+    _c33.execute("CREATE TABLE t (x INTEGER)")
+    _c33.close()
+_reader33 = FeatureStoreReader(_db33_ana)
+_repo33 = AnalyticsRepository(_reader33)
+_profile_repo33 = AnalyticsProfileRepository(_db33_profile)
+
+# R1: VM set_table_settings (Dirty + kein Query-Refresh).
+_vm33 = AnalyticsViewModel(analytics_repo=_repo33, profile_repo=_profile_repo33)
+_vm33.create_profile("P33", "desc")
+_dirty33 = []
+_vm33.dirty_changed.connect(lambda d: _dirty33.append(d))
+_vm33.set_table_settings(widths={"Zeit (Wanduhr)": 200, "grid_step": 111},
+                         row_height=30, sort_column=2, sort_order=0)
+_p33 = _vm33.params
+check("33 R1a) table_column_widths gesetzt",
+      _p33["table_column_widths"] == {"Zeit (Wanduhr)": 200, "grid_step": 111},
+      str(_p33["table_column_widths"]))
+check("33 R1b) row_height/sort gesetzt",
+      _p33["table_row_height"] == 30 and _p33["table_sort_column"] == 2
+      and _p33["table_sort_order"] == 0, str(_p33))
+check("33 R1c) dirty-Flag gesetzt + kein Query-Refresh",
+      _vm33.is_dirty and _vm33._pending_kinds == []
+      and not _vm33._debounce.isActive(), "")
+_vm33.set_table_settings(widths={"Zeit (Wanduhr)": 200, "grid_step": 111},
+                         row_height=30, sort_column=2, sort_order=0)
+check("33 R1d) idempotent (kein weiteres Dirty-Signal)",
+      _dirty33 == [True], str(_dirty33))
+
+# R2: Profil-Payload additiv (Repo-Roundtrip, schema_version: 1).
+_pid33 = _profile_repo33.create_profile(
+    "P33b", payload={"symbol": "XAGUSD",
+                     "table_column_widths": {"Zeit": 199},
+                     "table_row_height": 25, "table_sort_column": 1,
+                     "table_sort_order": 0})
+_p2_33 = _profile_repo33.get_profile(_pid33)
+check("33 R2a) Tabellen-Keys im Payload (v2-Section 'table')",
+      (_p2_33["payload"].get("table") or {}).get("table_column_widths") == {"Zeit": 199}
+      and (_p2_33["payload"].get("table") or {}).get("table_row_height") == 25
+      and (_p2_33["payload"].get("table") or {}).get("table_sort_column") == 1
+      and (_p2_33["payload"].get("table") or {}).get("table_sort_order") == 0,
+      str(_p2_33["payload"]))
+check("33 R2b) schema_version auf 2 migriert",
+      _p2_33["payload"].get("schema_version") == 2,
+      str(_p2_33["payload"].get("schema_version")))
+
+# R3: Profil-Laden uebernimmt Tabellen-Keys (_apply_profile).
+_vm33b = AnalyticsViewModel(analytics_repo=_repo33, profile_repo=_profile_repo33)
+_vm33b.set_active_profile(_pid33)
+_p3_33 = _vm33b.params
+check("33 R3a) _apply_profile uebernimmt Keys",
+      _p3_33["table_column_widths"] == {"Zeit": 199}
+      and _p3_33["table_row_height"] == 25
+      and _p3_33["table_sort_column"] == 1
+      and _p3_33["table_sort_order"] == 0,
+      str({k: _p3_33[k] for k in ("table_column_widths", "table_row_height",
+                                  "table_sort_column", "table_sort_order")}))
+
+# R4: Numerische Sortierung der Zeitspalte (_SortableTimeItem).
+_e_jan33 = int(datetime(2026, 1, 31, 10, 0).timestamp())
+_e_dec33 = int(datetime(2026, 12, 1, 10, 0).timestamp())
+_i_jan33 = _SortableTimeItem("So 31.01.26 10:00")
+_i_jan33.setData(Qt.UserRole, _e_jan33)
+_i_dec33 = _SortableTimeItem("Di 01.12.26 10:00")
+_i_dec33.setData(Qt.UserRole, _e_dec33)
+check("33 R4a) numerischer Zeitvergleich (Jan < Dez)",
+      _i_jan33.__lt__(_i_dec33) and not _i_dec33.__lt__(_i_jan33),
+      "")
+check("33 R4b) Text-Sortierung waere falsch (Gegenprobe)",
+      not _i_dec33.__lt__(_i_jan33), "")
+
+# T1: TablePage wendet Settings an (Breiten/Hoehe/Sortierung).
+_t1_33 = int(datetime(2026, 1, 31, 10, 0).timestamp())
+_t2_33 = int(datetime(2026, 3, 15, 10, 0).timestamp())
+_t3_33 = int(datetime(2026, 5, 20, 10, 0).timestamp())
+_rows33 = [
+    {"time": _t1_33, "symbol": "XAGUSD", "timeframe": "M1", "feature_id": "srv_a",
+     "plugin_version": "1.0.0",
+     "feature_data": {"schema_version": "1.0.0", "grid_step": 1.0}},
+    {"time": _t2_33, "symbol": "XAGUSD", "timeframe": "M1", "feature_id": "srv_b",
+     "plugin_version": "1.0.0",
+     "feature_data": {"schema_version": "1.0.0", "lookback": 200}},
+    {"time": _t3_33, "symbol": "XAGUSD", "timeframe": "M1", "feature_id": "srv_a",
+     "plugin_version": "1.0.0",
+     "feature_data": {"schema_version": "1.0.0", "grid_step": 2.0}},
+]
+_vm33c = AnalyticsViewModel(analytics_repo=_repo33, profile_repo=_profile_repo33)
+_vm33c.set_table_settings(widths={"Zeit (Wanduhr)": 200, "Service": 250,
+                                  "grid_step": 111},
+                          row_height=30, sort_column=0, sort_order=1)
+_page33 = TablePage()
+_page33.attach_view_model(_vm33c)
+_emitted33 = []
+_page33.table_settings_changed.connect(lambda s: _emitted33.append(s))
+_page33._populate(_rows33)
+_hdr33 = [_page33._table.horizontalHeaderItem(i).text()
+          for i in range(_page33._table.columnCount())]
+_gi33 = _hdr33.index("grid_step")
+check("33 T1a) Spaltenbreiten aus Settings",
+      _page33._table.columnWidth(0) == 200
+      and _page33._table.columnWidth(1) == 250
+      and _page33._table.columnWidth(_gi33) == 111,
+      f"w0={_page33._table.columnWidth(0)} w1={_page33._table.columnWidth(1)} "
+      f"w_grid={_page33._table.columnWidth(_gi33)}")
+check("33 T1b) Zeilenhoehe als Default-Section-Size",
+      _page33._table.verticalHeader().defaultSectionSize() == 30,
+      f"h={_page33._table.verticalHeader().defaultSectionSize()}")
+check("33 T1c) Sortierung aktiv + Zeit absteigend",
+      _page33._table.isSortingEnabled()
+      and _page33._table.item(0, 0).data(Qt.UserRole) == _t3_33,
+      f"enabled={_page33._table.isSortingEnabled()} "
+      f"z0={_page33._table.item(0, 0).data(Qt.UserRole)}")
+check("33 T1d) kein Settings-Emit waehrend _populate (E4)",
+      len(_emitted33) == 0, str(_emitted33))
+
+# T2: Jump-to-Chart-Row-Mapping nach User-Sortierung (E7).
+_captured33 = []
+_page33.set_navigation_handler(
+    lambda s, tf, bt: _captured33.append((s, tf, bt)))
+_page33._table.sortItems(0, Qt.AscendingOrder)
+_idx_t1_33 = [r["time"] for r in _page33._current_rows].index(_t1_33)
+check("33 T2a) Roh-Row-Index im UserRole+1 (Zeile 0 = aelteste)",
+      _page33._table.item(0, 0).data(Qt.UserRole + 1) == _idx_t1_33,
+      f"idx={_page33._table.item(0, 0).data(Qt.UserRole + 1)}")
+_page33._on_double_clicked(_page33._table.item(0, 0))
+check("33 T2b) Jump-to-Chart trifft Roh-Row (t1, nicht Anzeige-Zeile)",
+      len(_captured33) == 1 and _captured33[0] == ("XAGUSD", "M1", _t1_33),
+      str(_captured33))
+_captured33.clear()
+_page33._table.sortItems(0, Qt.DescendingOrder)
+_page33._on_double_clicked(_page33._table.item(0, 0))
+check("33 T2c) Absteigend trifft neueste Roh-Row (t3)",
+      len(_captured33) == 1 and _captured33[0] == ("XAGUSD", "M1", _t3_33),
+      str(_captured33))
+
+# T3: E8 – ungueltiger Sortier-Index wird beim Anwenden auf 0 geklemmt.
+_vm33d = AnalyticsViewModel(analytics_repo=_repo33, profile_repo=_profile_repo33)
+_vm33d.set_table_settings(widths={}, row_height=0, sort_column=99,
+                          sort_order=1)
+_page33b = TablePage()
+_page33b.attach_view_model(_vm33d)
+_page33b._populate(_rows33)
+check("33 T3a) sort_col=99 -> Fallback Spalte 0 (Zeit absteigend)",
+      _page33b._table.isSortingEnabled()
+      and _page33b._table.item(0, 0).data(Qt.UserRole) == _t3_33,
+      "")
+shutil.rmtree(_tmp33, ignore_errors=True)
+
+print("\n=== Teil 34: 19.04 TablePage-Paging + Profil-symbol/tf-Sync (Bugfix) ===")
+from analytics.ui.analytics_win import AnalyticsWindow  # noqa: E402
+
+# Deterministische Temp-DBs (app_data fuer Profile, analytics leer).
+_tmp34 = tempfile.mkdtemp(prefix="p1904_")
+_db34_profile = os.path.join(_tmp34, "app_data.duckdb")
+_db34_ana = os.path.join(_tmp34, "analytics.duckdb")
+for _p34 in (_db34_profile, _db34_ana):
+    _c34 = duckdb.connect(_p34)
+    _c34.execute("CREATE TABLE t (x INTEGER)")
+    _c34.close()
+_reader34 = FeatureStoreReader(_db34_ana)
+_repo34 = AnalyticsRepository(_reader34)
+_profile_repo34 = AnalyticsProfileRepository(_db34_profile)
+
+# P1: Paging-Zustand (headless, kein DB-Zugriff).
+_t34 = int(datetime(2026, 8, 8, 10, 0).timestamp())
+_rows34 = [
+    {"time": _t34 - i * 60, "symbol": "XAGUSD", "timeframe": "M1",
+     "feature_id": f"srv_{i % 3}", "plugin_version": "1.0.0",
+     "feature_data": {"schema_version": "1.0.0", "grid_step": float(i)}}
+    for i in range(250)
+]
+_vm34 = AnalyticsViewModel(analytics_repo=_repo34, profile_repo=_profile_repo34)
+_page34 = TablePage()
+_page34.attach_view_model(_vm34)
+# set_page_size vor dem ersten Befuellen (wie _wire_view_model).
+_page34.set_page_size(100)
+check("34 P1a) Default-PageSize 100",
+      _page34._page_size == 100, str(_page34._page_size))
+_page34._populate(_rows34)
+check("34 P1b) _populate setzt Seite 0, total_pages=3 (250/100)",
+      _page34._current_page == 0 and _page34._total_pages == 3,
+      f"p={_page34._current_page} tp={_page34._total_pages}")
+check("34 P1c) Seite 0 zeigt 100 Zeilen mit globalen Indizes 0..99",
+      _page34._table.rowCount() == 100
+      and _page34._table.item(0, 0).data(Qt.UserRole + 1) == 0
+      and _page34._table.item(99, 0).data(Qt.UserRole + 1) == 99,
+      f"rows={_page34._table.rowCount()} "
+      f"i0={_page34._table.item(0, 0).data(Qt.UserRole + 1)} "
+      f"i99={_page34._table.item(99, 0).data(Qt.UserRole + 1)}")
+check("34 P1d) btn_prev disabled, btn_next enabled",
+      not _page34.btn_prev.isEnabled() and _page34.btn_next.isEnabled(),
+      f"prev={_page34.btn_prev.isEnabled()} "
+      f"next={_page34.btn_next.isEnabled()}")
+_page34._next_page()
+check("34 P1e) naechste Seite: p=1, Start 100, Indizes 100..199",
+      _page34._current_page == 1 and _page34._table.rowCount() == 100
+      and _page34._table.item(0, 0).data(Qt.UserRole + 1) == 100
+      and _page34._table.item(99, 0).data(Qt.UserRole + 1) == 199,
+      f"p={_page34._current_page} rows={_page34._table.rowCount()} "
+      f"i0={_page34._table.item(0, 0).data(Qt.UserRole + 1)} "
+      f"i99={_page34._table.item(99, 0).data(Qt.UserRole + 1)}")
+_cap34 = []
+_page34.set_navigation_handler(lambda s, tf, bt: _cap34.append((s, tf, bt)))
+_page34._on_double_clicked(_page34._table.item(0, 0))
+check("34 P1f) Jump-to-Chart trifft globale Row 100 (nicht Anzeige-Seite)",
+      len(_cap34) == 1 and _cap34[0] == ("XAGUSD", "M1",
+                                          int(_rows34[100]["time"])),
+      str(_cap34))
+_page34._next_page()
+_page34._next_page()
+check("34 P1g) letzte Seite: p=2, 50 Zeilen, Indizes 200..249, btn_next disabled",
+      _page34._current_page == 2 and _page34._table.rowCount() == 50
+      and _page34._table.item(0, 0).data(Qt.UserRole + 1) == 200
+      and _page34._table.item(49, 0).data(Qt.UserRole + 1) == 249
+      and not _page34.btn_next.isEnabled(),
+      f"p={_page34._current_page} rows={_page34._table.rowCount()} "
+      f"i0={_page34._table.item(0, 0).data(Qt.UserRole + 1)} "
+      f"i49={_page34._table.item(49, 0).data(Qt.UserRole + 1)} "
+      f"next={_page34.btn_next.isEnabled()}")
+_page34._next_page()  # bleibt auf letzter Seite
+check("34 P1h) _next_page klemmt auf letzter Seite",
+      _page34._current_page == 2, f"p={_page34._current_page}")
+_page34._prev_page()
+check("34 P1i) _prev_page -> p=1",
+      _page34._current_page == 1, f"p={_page34._current_page}")
+# set_page_size mit geladenen Daten -> Seite 0, total_pages=5 (250/50).
+_page34.set_page_size(50)
+check("34 P1j) set_page_size(50) -> p=0, total_pages=5, 50 Zeilen",
+      _page34._page_size == 50 and _page34._current_page == 0
+      and _page34._total_pages == 5 and _page34._table.rowCount() == 50,
+      f"ps={_page34._page_size} p={_page34._current_page} "
+      f"tp={_page34._total_pages} rows={_page34._table.rowCount()}")
+check("34 P1k) Seitenlabel zeigt Seite/Gesamt + Zeilen",
+      "Seite 1 / 5" in _page34.label_page.text()
+      and "250 Zeilen" in _page34.label_page.text(),
+      _page34.label_page.text())
+_page34.set_page_size(-5)
+check("34 P1l) set_page_size(-5) faellt auf 100 zurueck",
+      _page34._page_size == 100, str(_page34._page_size))
+_page34._current_page = 2
+_page34._populate(_rows34[:150])
+check("34 P1m) neues _populate setzt Seite 0, total_pages=2",
+      _page34._current_page == 0 and _page34._total_pages == 2,
+      f"p={_page34._current_page} tp={_page34._total_pages}")
+
+# P2: Profil-Payload symbol/timeframe + _sync_profile_filters (Bugfix).
+_pid34 = _profile_repo34.create_profile(
+    "P34", payload={"symbol": "EURUSD", "timeframe": "H4", "limit": 1234})
+_vm34b = AnalyticsViewModel(analytics_repo=_repo34,
+                            profile_repo=_profile_repo34)
+_vm34b.set_active_profile(_pid34)
+_p34b = _vm34b.params
+check("34 P2a) _apply_profile uebernimmt symbol/timeframe aus Payload",
+      _p34b["symbol"] == "EURUSD" and _p34b["timeframe"] == "H4",
+      str({k: _p34b[k] for k in ("symbol", "timeframe")}))
+
+
+class _DummyCombo34:
+    """Minimaler Combo-Ersatz fuer den _sync_profile_filters-Test."""
+
+    def __init__(self, items):
+        self._items = list(items)
+        self._cur = 0
+        self._block_log = []
+
+    def blockSignals(self, b):
+        self._block_log.append(bool(b))
+
+    def findText(self, t):
+        for i, (txt, _d) in enumerate(self._items):
+            if txt == t:
+                return i
+        return -1
+
+    def addItem(self, txt, data):
+        self._items.append((txt, data))
+
+    def setCurrentIndex(self, idx):
+        if 0 <= idx < len(self._items):
+            self._cur = idx
+
+    def currentText(self):
+        return self._items[self._cur][0]
+
+
+_dummy34 = type("DummyWin34", (), {})()
+_dummy34.combo_symbol = _DummyCombo34([("XAGUSD", "XAGUSD")])
+_dummy34.combo_tf = _DummyCombo34([("M1", "M1"), ("M15", "M15"), ("H4", "H4")])
+_dummy34._vm = AnalyticsViewModel(analytics_repo=_repo34,
+                                  profile_repo=_profile_repo34)
+_dummy34._vm._params["symbol"] = "EURUSD"
+_dummy34._vm._params["timeframe"] = "H4"
+_dummy34._refresh_timeframe_combo = lambda symbol: None
+AnalyticsWindow._sync_profile_filters(_dummy34)
+check("34 P2b) _sync_profile_filters setzt Combos auf VM-Parameter",
+      _dummy34.combo_symbol.currentText() == "EURUSD"
+      and _dummy34.combo_tf.currentText() == "H4",
+      f"s={_dummy34.combo_symbol.currentText()} "
+      f"tf={_dummy34.combo_tf.currentText()}")
+check("34 P2c) Sync lief blockiert (blockSignals-Log endet mit False)",
+      len(_dummy34.combo_symbol._block_log) >= 2
+      and _dummy34.combo_symbol._block_log[-1] is False
+      and True in _dummy34.combo_symbol._block_log,
+      str(_dummy34.combo_symbol._block_log))
+# Unbekanntes Symbol wird in die Combo aufgenommen (Muster
+# _apply_persistent_filters) – kein Favorit noetig.
+_dummy34.combo_symbol = _DummyCombo34([("XAGUSD", "XAGUSD")])
+_dummy34._vm._params["symbol"] = "BTCUSD"
+_dummy34._vm._params["timeframe"] = "M15"
+AnalyticsWindow._sync_profile_filters(_dummy34)
+check("34 P2d) unbekanntes Symbol wird in die Combo aufgenommen",
+      _dummy34.combo_symbol.currentText() == "BTCUSD"
+      and _dummy34.combo_symbol.findText("BTCUSD") >= 0,
+      _dummy34.combo_symbol.currentText())
+# Leeres Symbol -> frueher Return, Combo bleibt unveraendert.
+_dummy34._vm._params["symbol"] = ""
+AnalyticsWindow._sync_profile_filters(_dummy34)
+check("34 P2e) leeres Symbol -> kein Eingriff",
+      _dummy34.combo_symbol.currentText() == "BTCUSD"
+      and _dummy34.combo_tf.currentText() == "M15",
+      f"s={_dummy34.combo_symbol.currentText()} "
+      f"tf={_dummy34.combo_tf.currentText()}")
+shutil.rmtree(_tmp34, ignore_errors=True)
+
+print("\n=== Teil 35: 19.06 Bugfix - Zeilenhoehe->GANZE Tabelle live + Profilname-Sync ===")
+from PySide6.QtWidgets import QHeaderView, QLineEdit  # noqa: E402
+from analytics.ui.analytics_win import AnalyticsWindow  # noqa: E402
+
+# Deterministische Temp-DBs (app_data fuer Profile, analytics leer).
+_tmp35 = tempfile.mkdtemp(prefix="p1906_")
+_db35_profile = os.path.join(_tmp35, "app_data.duckdb")
+_db35_ana = os.path.join(_tmp35, "analytics.duckdb")
+for _p35 in (_db35_profile, _db35_ana):
+    _c35 = duckdb.connect(_p35)
+    _c35.execute("CREATE TABLE t (x INTEGER)")
+    _c35.close()
+_reader35 = FeatureStoreReader(_db35_ana)
+_repo35 = AnalyticsRepository(_reader35)
+_profile_repo35 = AnalyticsProfileRepository(_db35_profile)
+
+# Z1: Zeilenhöhe -> GANZE Tabelle live (Bugfix 19.06).
+_t35 = int(datetime(2026, 8, 8, 10, 0).timestamp())
+_rows35 = [
+    {"time": _t35 - i * 60, "symbol": "XAGUSD", "timeframe": "M1",
+     "feature_id": "srv_a", "plugin_version": "1.0.0",
+     "feature_data": {"schema_version": "1.0.0", "grid_step": float(i)}}
+    for i in range(5)
+]
+_vm35 = AnalyticsViewModel(analytics_repo=_repo35, profile_repo=_profile_repo35)
+_vm35.create_profile("P35")
+_page35 = TablePage()
+_page35.attach_view_model(_vm35)
+_page35.set_page_size(100)
+_page35._populate(_rows35)
+_vh35 = _page35._table.verticalHeader()
+_default35 = _vh35.defaultSectionSize()
+# User zieht Zeile 2 auf 45 -> _on_vertical_section_resized uebernimmt die
+# neue Hoehe LIVE auf ALLE Zeilen (Signal ist nach _populate aktiv).
+_vh35.resizeSection(2, 45)
+check("35 Z1a) Live: Ziehen einer Zeile setzt ALLE Zeilen auf 45",
+      _vh35.sectionSize(0) == 45 and _vh35.sectionSize(1) == 45
+      and _vh35.sectionSize(2) == 45 and _vh35.sectionSize(3) == 45
+      and _vh35.defaultSectionSize() == 45,
+      f"sizes={[_vh35.sectionSize(i) for i in range(5)]}")
+_emit35 = []
+_page35.table_settings_changed.connect(lambda s: _emit35.append(s))
+_page35._on_vertical_section_resized(2, _default35, 45)
+_s35 = _emit35[-1]
+check("35 Z1b) Emit: row_height=45, KEIN row_heights",
+      _s35["row_height"] == 45 and "row_heights" not in _s35,
+      f"rh={_s35['row_height']}")
+_vm35.set_table_settings(widths={}, row_height=45,
+                         sort_column=0, sort_order=1)
+check("35 Z1c) VM speichert table_row_height=45 (kein table_row_heights)",
+      _vm35.params["table_row_height"] == 45
+      and "table_row_heights" not in _vm35.params,
+      str(_vm35.params.get("table_row_height")))
+_page35._populate(_rows35)
+check("35 Z1d) nach Refresh: ALLE Zeilen = 45 (globale Hoehe angewendet)",
+      _vh35.sectionSize(0) == 45 and _vh35.sectionSize(1) == 45
+      and _vh35.sectionSize(2) == 45 and _vh35.sectionSize(3) == 45,
+      f"sizes={[_vh35.sectionSize(i) for i in range(5)]}")
+_vm35.save_profile()
+_pay35 = _profile_repo35.get_profile(_vm35.active_profile["profile_id"])["payload"]
+check("35 Z1e) table_row_height im Profil-Payload (v2-Section 'table')",
+      (_pay35.get("table") or {}).get("table_row_height") == 45,
+      str(_pay35.get("table")))
+_vm35b = AnalyticsViewModel(analytics_repo=_repo35, profile_repo=_profile_repo35)
+_vm35b.set_active_profile(_vm35.active_profile["profile_id"])
+check("35 Z1f) _apply_profile uebernimmt table_row_height",
+      _vm35b.params.get("table_row_height") == 45,
+      str(_vm35b.params.get("table_row_height")))
+
+# Z2: Profilname nach load_profiles (Bugfix 19.05/19.06) - '?' verhindern.
+_pid35 = _profile_repo35.create_profile("MeinProfil",
+                                        payload={"symbol": "XAGUSD",
+                                                 "limit": 777})
+_profile_repo35.set_active(_pid35)
+_vm35c = AnalyticsViewModel(analytics_repo=_repo35,
+                            profile_repo=_profile_repo35)
+_vm35c.load_profiles()
+check("35 Z2a) load_profiles setzt aktives Profil (Name 'MeinProfil')",
+      _vm35c.active_profile is not None
+      and _vm35c.active_profile["name"] == "MeinProfil",
+      str(_vm35c.active_profile.get("name")
+          if _vm35c.active_profile else None))
+
+
+class _DummyWin35:
+    """Minimales Window-Stub fuer _sync_profile_editor (Bugfix 19.05)."""
+
+    def __init__(self, vm, default_limit=10_000):
+        self._vm = vm
+        self._default_limit = default_limit
+        self.edit_profile_name = QLineEdit("")
+        self.edit_profile_desc = QLineEdit("")
+        self.edit_limit = QLineEdit("")
+
+
+_dummy35 = _DummyWin35(_vm35c)
+AnalyticsWindow._sync_profile_editor(_dummy35)
+check("35 Z2b) _sync_profile_editor fuellt Name/Limit aus aktivem Profil",
+      _dummy35.edit_profile_name.text() == "MeinProfil"
+      and _dummy35.edit_limit.text() == "777",
+      f"name={_dummy35.edit_profile_name.text()!r} "
+      f"limit={_dummy35.edit_limit.text()!r}")
+check("35 Z2c) Name nicht leer -> Save loescht den Profilnamen NICHT",
+      _dummy35.edit_profile_name.text() != "", "")
+# Ohne aktives Profil -> Felder geleert (kein Haenger).
+_dummy35b = _DummyWin35(AnalyticsViewModel(analytics_repo=_repo35,
+                                           profile_repo=_profile_repo35))
+AnalyticsWindow._sync_profile_editor(_dummy35b)
+check("35 Z2d) ohne aktives Profil: Felder leer",
+      _dummy35b.edit_profile_name.text() == ""
+      and _dummy35b.edit_profile_desc.text() == "",
+      f"name={_dummy35b.edit_profile_name.text()!r}")
+
+shutil.rmtree(_tmp35, ignore_errors=True)
+
+print("\n=== Teil 36: Phase 20.01 - Workspace-Restore & Fault-Tolerant Resolver ===")
+from analytics.engine.analytics_view_model import AnalyticsViewModel as _VM36  # noqa: E402
+from analytics_profile_repository import AnalyticsProfileRepository as _APR36  # noqa: E402
+from analytics.engine.service_selector_model import ServiceSelectorModel as _SSM36  # noqa: E402
+
+# --- W8: Klassen-Check _keep_history_on_close (Runde 17e) ------------------
+check("36 W8) AnalyticsWindow._keep_history_on_close is False (Historie intakt)",
+      AnalyticsWindow._keep_history_on_close is False,
+      str(AnalyticsWindow._keep_history_on_close))
+
+# --- W1/W2: workspace_state-Spalte + Roundtrip (E6, NOT-NULL-konform) ------
+_tmp36 = tempfile.mkdtemp(prefix="p2001_")
+_db36_app = os.path.join(_tmp36, "app_data.duckdb")
+_db36_ana = os.path.join(_tmp36, "analytics.duckdb")
+for _p36f in (_db36_app, _db36_ana):
+    _c36 = duckdb.connect(_p36f)
+    _c36.execute("CREATE TABLE t (x INTEGER)")
+    _c36.close()
+_sm36 = StateManager(_db36_app)
+_cols36 = [r[0] for r in _sm36._get_connection().execute(
+    "SELECT column_name FROM information_schema.columns "
+    "WHERE table_name = 'instance_states'").fetchall()]
+check("36 W1a) workspace_state-Spalte idempotent angelegt",
+      "workspace_state" in _cols36, str(_cols36))
+_sm36b = StateManager(_db36_app)  # zweiter Aufruf -> ALTER ist No-op
+check("36 W1b) workspace_state-Spalte idempotent (2. Aufruf)",
+      "workspace_state" in [r[0] for r in _sm36b._get_connection().execute(
+          "SELECT column_name FROM information_schema.columns "
+          "WHERE table_name = 'instance_states'").fetchall()], "")
+
+# Roundtrip OHNE vorherige instance_states-Row (E6: Fallback ''/'M1').
+_ws36 = {"params": {"symbol": "XAGUSD", "limit": 1234},
+         "layout": {"page_index": 2}}
+_sm36.save_workspace_state("win_analytics", _ws36)
+check("36 W2a) save/get_workspace_state Roundtrip (ohne existierende Row)",
+      _sm36.get_workspace_state("win_analytics") == _ws36,
+      str(_sm36.get_workspace_state("win_analytics")))
+_row36 = _sm36._get_connection().execute(
+    "SELECT symbol, timeframe FROM instance_states "
+    "WHERE instance_id = 'win_analytics'").fetchone()
+check("36 W2b) NOT-NULL-Fallback: symbol/timeframe der Row gesetzt",
+      _row36 is not None and str(_row36[0]) == ""
+      and str(_row36[1]) == "M1", str(_row36))
+_ws36b = {"params": {"symbol": "EURUSD"}, "layout": {"page_index": 3}}
+_sm36.save_workspace_state("win_analytics", _ws36b)
+check("36 W2c) Upsert aktualisiert workspace_state",
+      _sm36.get_workspace_state("win_analytics") == _ws36b,
+      str(_sm36.get_workspace_state("win_analytics")))
+_row36b = _sm36._get_connection().execute(
+    "SELECT symbol, timeframe FROM instance_states "
+    "WHERE instance_id = 'win_analytics'").fetchone()
+check("36 W2d) Upsert laesst symbol/timeframe der Row unberuehrt",
+      _row36b is not None and str(_row36b[1]) == "M1", str(_row36b))
+check("36 W2e) get_workspace_state fuer unbekannte Instanz -> None",
+      _sm36.get_workspace_state("win_unbekannt") is None, "")
+
+# --- W3: v1 -> v2 Migration verlustfrei (E3) -------------------------------
+_v1_36 = {
+    "schema_version": 1,
+    "symbol": "XAGUSD",
+    "timeframe": "H1",
+    "feature_id": "srv_grid_lines",
+    "limit": 777,
+    "table_row_height": 30,
+    "custom_extra": {"a": 1},
+}
+_v2_36 = _APR36._migrate_v1_to_v2(dict(_v1_36))
+check("36 W3a) v1->v2: schema_version == 2",
+      _v2_36.get("schema_version") == 2, str(_v2_36))
+check("36 W3b) v1->v2: Sektionen sources/charts/table/styling",
+      (_v2_36.get("sources") or {}).get("symbol") == "XAGUSD"
+      and (_v2_36.get("sources") or {}).get("timeframe") == "H1"
+      and (_v2_36.get("table") or {}).get("limit") == 777
+      and (_v2_36.get("table") or {}).get("table_row_height") == 30
+      and _v2_36.get("styling") == {},
+      str(_v2_36))
+check("36 W3c) v1->v2: feature_id -> feature_ids (Liste)",
+      (_v2_36.get("sources") or {}).get("feature_ids") == ["srv_grid_lines"]
+      and "feature_id" not in (_v2_36.get("sources") or {}),
+      str(_v2_36.get("sources")))
+check("36 W3d) v1->v2: unbekannte Top-Level-Keys verlustfrei erhalten",
+      _v2_36.get("custom_extra") == {"a": 1},
+      str(_v2_36.get("custom_extra")))
+check("36 W3e) v2-Payload wird nicht doppelt migriert (Idempotenz)",
+      _APR36._migrate_v1_to_v2(dict(_v2_36)) == _v2_36, "")
+
+# --- W4: _ensure_schema_version migriert v1-Flat beim Schreiben (E4) -------
+_profile_repo36 = _APR36(_db36_app)
+_pid36 = _profile_repo36.create_profile(
+    "P36", payload={"symbol": "XAGUSD", "limit": 99})
+_p36 = _profile_repo36.get_profile(_pid36)
+check("36 W4a) create_profile migriert v1-Flat -> v2-Sections",
+      _p36["payload"].get("schema_version") == 2
+      and (_p36["payload"].get("sources") or {}).get("symbol") == "XAGUSD"
+      and (_p36["payload"].get("table") or {}).get("limit") == 99,
+      str(_p36["payload"]))
+
+# --- W5: Resolver valid/missing + 'native' -> missing (B7) -----------------
+_model36 = _p1608_model({
+    "srv_a": _P1608Plugin("srv_a"),
+    "srv_b": _P1608Plugin("srv_b"),
+})
+_res36 = _model36.resolve_valid_feature_ids(
+    ["srv_a", "srv_b", "srv_gone", "native", "SRV_A"])
+check("36 W5a) Resolver: valid = registrierte (case-insensitiv, dedupliziert)",
+      _res36[0] == ["srv_a", "srv_b"], str(_res36[0]))
+check("36 W5b) Resolver: missing = nicht registrierte + 'native' (B7)",
+      _res36[1] == ["srv_gone", "native"], str(_res36[1]))
+check("36 W5c) Resolver: leere Liste -> ([], [])",
+      _model36.resolve_valid_feature_ids([]) == ([], []), "")
+
+# --- W6: _apply_profile v2 -> flache _params, kein Dirty (E5) --------------
+_repo36 = AnalyticsRepository(FeatureStoreReader(_db36_ana))
+_vm36 = AnalyticsViewModel(analytics_repo=_repo36, profile_repo=_profile_repo36,
+                           selector_model=_model36)
+_missing36 = []
+_vm36.missing_services_detected.connect(lambda m: _missing36.append(list(m)))
+_pid36b = _profile_repo36.create_profile(
+    "P36b", payload={
+        "schema_version": 1,
+        "symbol": "XAGUSD",
+        "timeframe": "M15",
+        "feature_id": "srv_a",
+        "limit": 4321,
+    })
+_vm36.set_active_profile(_pid36b)
+check("36 W6a) _apply_profile: feature_ids nur valide",
+      _vm36.params.get("feature_ids") == ["srv_a"],
+      str(_vm36.params.get("feature_ids")))
+check("36 W6b) _apply_profile: kein Dirty-Flag beim Profilwechsel",
+      _vm36.is_dirty is False, str(_vm36.is_dirty))
+check("36 W6c) _apply_profile: v2-Sections flach uebernommen",
+      _vm36.params.get("symbol") == "XAGUSD"
+      and _vm36.params.get("timeframe") == "M15"
+      and _vm36.params.get("limit") == 4321,
+      str({k: _vm36.params.get(k)
+           for k in ("symbol", "timeframe", "limit")}))
+
+# v1-Flat-Payload MIT fehlendem Service -> Emit + Filter
+_pid36c = _profile_repo36.create_profile(
+    "P36c", payload={"symbol": "XAGUSD", "feature_id": "srv_gone"})
+_vm36b = AnalyticsViewModel(analytics_repo=_repo36, profile_repo=_profile_repo36,
+                            selector_model=_model36)
+_missing36b = []
+_vm36b.missing_services_detected.connect(lambda m: _missing36b.append(list(m)))
+_vm36b.set_active_profile(_pid36c)
+check("36 W6d) missing_services_detected emittiert fehlende ID",
+      _missing36b and _missing36b[-1] == ["srv_gone"], str(_missing36b))
+check("36 W6e) fehlende ID wird aus _params entfernt",
+      _vm36b.params.get("feature_ids") == [],
+      str(_vm36b.params.get("feature_ids")))
+
+# --- W7: restore_workspace: params + layout.page_index, kein Dirty (E7) ----
+_vm36c = AnalyticsViewModel(analytics_repo=_repo36, profile_repo=_profile_repo36,
+                            selector_model=_model36)
+_missing36c = []
+_vm36c.missing_services_detected.connect(lambda m: _missing36c.append(list(m)))
+_ws36c = {
+    "params": {"symbol": "EURUSD", "timeframe": "H4", "limit": 888,
+               "feature_ids": ["srv_b", "srv_gone"]},
+    "layout": {"page_index": 2},
+}
+_vm36c.restore_workspace(_ws36c)
+check("36 W7a) restore_workspace: params uebernommen (Workspace gewinnt)",
+      _vm36c.params.get("symbol") == "EURUSD"
+      and _vm36c.params.get("timeframe") == "H4"
+      and _vm36c.params.get("limit") == 888,
+      str({k: _vm36c.params.get(k)
+           for k in ("symbol", "timeframe", "limit")}))
+check("36 W7b) restore_workspace: feature_ids gefiltert + Emit",
+      _vm36c.params.get("feature_ids") == ["srv_b"]
+      and _missing36c and _missing36c[-1] == ["srv_gone"],
+      str(_vm36c.params.get("feature_ids")))
+check("36 W7c) restore_workspace: kein Dirty-Flag",
+      _vm36c.is_dirty is False, str(_vm36c.is_dirty))
+check("36 W7d) workspace_layout (page_index) verfuegbar",
+      (_vm36c.workspace_layout or {}).get("page_index") == 2,
+      str(_vm36c.workspace_layout))
+check("36 W7e) restore_workspace mit None -> kein Fehler",
+      _vm36c.restore_workspace(None) is None, "")
+
+shutil.rmtree(_tmp36, ignore_errors=True)
+
+# ============================================================================
+# 37) 20.02: Generische 2D-Heatmap-Engine + Candle-Overlay (headless Logik)
+from analytics.engine.analytics_worker import QUERY_HEATMAP_GENERIC  # noqa: E402
+#     Reader.fetch_generic_heatmap / Reader.fetch_ohlcv_snapshot /
+#     Repository.get_generic_heatmap / ViewModel heatmap_*-Params & Payload
+# ----------------------------------------------------------------------------
+_tmp37 = tempfile.mkdtemp(prefix="p2002_",
+                          dir=os.path.dirname(os.path.abspath(__file__)))
+_db37_ana = os.path.join(_tmp37, "analytics.duckdb")
+_db37_mkt = os.path.join(_tmp37, "market_data.duckdb")
+
+# --- Testdaten: feature_store (2 Services x 3 Tage x 2 Stunden) ------------
+_c37 = duckdb.connect(_db37_ana)
+_c37.execute("""
+    CREATE TABLE feature_store (
+        symbol TEXT, timeframe TEXT, bar_time TIMESTAMPTZ,
+        feature_id TEXT, plugin_version TEXT, feature_data JSON,
+        created_at TIMESTAMPTZ
+    )
+""")
+_days37 = [
+    datetime(2026, 8, 3, tzinfo=dt_timezone.utc),   # Mo
+    datetime(2026, 8, 4, tzinfo=dt_timezone.utc),   # Di
+    datetime(2026, 8, 5, tzinfo=dt_timezone.utc),   # Mi
+]
+_vals37 = {"srv_a": {"visit_pct": 50.0, "grid_dist": 1.5},
+           "srv_b": {"visit_pct": 25.0, "grid_dist": 2.5}}
+for _d37 in _days37:
+    for _h37 in (10, 11):
+        _bt37i = _d37.replace(hour=_h37)
+        for _sid37, _fd37 in _vals37.items():
+            _c37.execute(
+                "INSERT INTO feature_store VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ["XAGUSD", "M1", _bt37i, _sid37, "1.0.0",
+                 _json17.dumps(_fd37), _bt37i])
+_c37.close()
+
+# --- Testdaten: ohlcv_bars (3 M1-Bars) -------------------------------------
+_c37m = duckdb.connect(_db37_mkt)
+_c37m.execute("""
+    CREATE TABLE ohlcv_bars (
+        symbol TEXT, timeframe TEXT, "time" TIMESTAMPTZ,
+        open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
+        tick_volume INTEGER
+    )
+""")
+_bt37 = datetime(2026, 8, 3, 10, 0, tzinfo=dt_timezone.utc)
+for _i37, _close in enumerate((10.0, 10.5, 10.2), start=1):
+    _c37m.execute(
+        "INSERT INTO ohlcv_bars VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ["XAGUSD", "M1", _bt37.replace(minute=_i37 - 1),
+         10.0, max(10.0, _close), 9.5, _close, 100 + _i37])
+_c37m.close()
+
+_reader37 = FeatureStoreReader(_db37_ana)
+_repo37 = AnalyticsRepository(_reader37)
+
+# --- Reader: count (x=date, y=hour) ---------------------------------------
+_g37 = _reader37.fetch_generic_heatmap(
+    "XAGUSD", "M1", x_dim="date", y_dim="hour", agg="count")
+check("37 a1) count: Matrix-Form (2 Stunden x 3 Tage)",
+      np.asarray(_g37["matrix"]).shape == (2, 3),
+      str(np.asarray(_g37["matrix"]).shape))
+check("37 a2) count: jede Zelle = 2 Rows (srv_a + srv_b)",
+      all(v == 2.0 for row in _g37["matrix"] for v in row),
+      str(_g37["matrix"]))
+check("37 a3) count: x_labels = Tage (TT.MM.)",
+      _g37["x_labels"] == ["03.08.", "04.08.", "05.08."],
+      str(_g37["x_labels"]))
+check("37 a4) count: y_labels = Stunden (HH:00)",
+      _g37["y_labels"] == ["10:00", "11:00"],
+      str(_g37["y_labels"]))
+check("37 a5) count: x_values = ISO-Daten (Candle-Overlay, E9)",
+      _g37["x_values"] == ["2026-08-03", "2026-08-04", "2026-08-05"],
+      str(_g37["x_values"]))
+check("37 a6) count: min/max = 2.0",
+      _g37["min_val"] == 2.0 and _g37["max_val"] == 2.0,
+      str((_g37["min_val"], _g37["max_val"])))
+
+# --- Reader: confluence_count (COUNT DISTINCT feature_id) -----------------
+_g37b = _reader37.fetch_generic_heatmap(
+    "XAGUSD", "M1", x_dim="date", y_dim="hour", agg="confluence_count")
+check("37 b1) confluence: jede Zelle = 2 (srv_a+srv_b)",
+      all(v == 2.0 for row in _g37b["matrix"] for v in row),
+      str(_g37b["matrix"]))
+
+# --- Reader: avg ueber JSON-Key field --------------------------------------
+_g37c = _reader37.fetch_generic_heatmap(
+    "XAGUSD", "M1", x_dim="date", y_dim="hour",
+    field="visit_pct", agg="avg")
+check("37 c1) avg(visit_pct) je Zelle = 37.5",
+      all(abs(v - 37.5) < 1e-9 for row in _g37c["matrix"] for v in row),
+      str(_g37c["matrix"]))
+
+# --- Reader: dow (20.02.01 E5: strikt Montag-Freitag, DuckDB Mo=1..Fr=5) --
+_g37d = _reader37.fetch_generic_heatmap(
+    "XAGUSD", "M1", x_dim="date", y_dim="dow", agg="count")
+check("37 d1) dow: 3 sortierte Label (Mo, Di, Mi)",
+      _g37d["y_labels"] == ["Mo", "Di", "Mi"],
+      str(_g37d["y_labels"]))
+check("37 d2) dow: y_axis = 1..3 (Mo=1..Fr=5)",
+      _g37d["y_axis"] == [1.0, 2.0, 3.0],
+      str(_g37d["y_axis"]))
+# Wochenend-Ausschluss (E5): Nur-Sonntag-Daten -> leere dow-Matrix
+_tmp37w = tempfile.mkdtemp(prefix="p2002w_",
+                           dir=os.path.dirname(os.path.abspath(__file__)))
+_db37w = os.path.join(_tmp37w, "analytics.duckdb")
+_c37w = duckdb.connect(_db37w)
+_c37w.execute("""
+    CREATE TABLE feature_store (
+        symbol TEXT, timeframe TEXT, bar_time TIMESTAMPTZ,
+        feature_id TEXT, plugin_version TEXT, feature_data JSON,
+        created_at TIMESTAMPTZ
+    )
+""")
+_c37w.execute(
+    "INSERT INTO feature_store VALUES (?, ?, ?, ?, ?, ?, ?)",
+    ["XAGUSD", "M1",
+     datetime(2026, 8, 2, 10, 0, tzinfo=dt_timezone.utc),  # So 02.08.26
+     "srv_w", "1.0.0", _json17.dumps({"visit_pct": 1.0}),
+     datetime(2026, 8, 2, 10, 0, tzinfo=dt_timezone.utc)])
+_c37w.close()
+_reader37w = FeatureStoreReader(_db37w)
+_g37dw = _reader37w.fetch_generic_heatmap(
+    "XAGUSD", "M1", x_dim="date", y_dim="dow", agg="count")
+check("37 d3) dow: Sonntag-Daten ausgeschlossen (leere Matrix)",
+      np.asarray(_g37dw["matrix"]).size == 0
+      and _g37dw["y_labels"] == [],
+      str((np.asarray(_g37dw["matrix"]).shape, _g37dw["y_labels"])))
+shutil.rmtree(_tmp37w, ignore_errors=True)
+
+# --- Reader: service_id-Dimension + feature_ids-Filter ----------------------
+_g37e = _reader37.fetch_generic_heatmap(
+    "XAGUSD", "M1", x_dim="date", y_dim="service_id",
+    agg="count", feature_ids=["srv_a"])
+check("37 e1) service_id x date, Filter srv_a: nur 1 Zeile",
+      np.asarray(_g37e["matrix"]).shape == (1, 3)
+      and _g37e["y_labels"] == ["srv_a"],
+      str((np.asarray(_g37e["matrix"]).shape, _g37e["y_labels"])))
+
+# --- Reader: ValueError bei unbekannter Dimension --------------------------
+_try37 = None
+try:
+    _reader37.fetch_generic_heatmap(
+        "XAGUSD", "M1", x_dim="quatsch", y_dim="hour", agg="count")
+except ValueError as _e37:
+    _try37 = str(_e37)
+check("37 f1) unbekannte Dimension -> ValueError",
+      _try37 is not None and "Dimension" in _try37, str(_try37))
+
+# --- Repository: get_generic_heatmap (metrics + defensive Fallbacks) -------
+_g37r = _repo37.get_generic_heatmap(
+    "XAGUSD", "M1", x_dim="date", y_dim="hour", agg="avg",
+    field="visit_pct")
+check("37 g1) Repository: metrics = count/confluence_count + JSON-Keys",
+      _g37r.get("metrics") == ["count", "confluence_count",
+                               "grid_dist", "visit_pct"],
+      str(_g37r.get("metrics")))
+check("37 g2) Repository: avg-Fallback auf ersten JSON-Key bei leerem Feld",
+      np.asarray(_g37r["matrix"]).shape == (2, 3), "")
+_g37r2 = _repo37.get_generic_heatmap(
+    "XAGUSD", "M1", x_dim="date", y_dim="hour", agg="avg", field="")
+check("37 g3) Repository: field='' -> Fallback-Key grid_dist (1.5/2.5 -> 2.0)",
+      all(abs(v - 2.0) < 1e-9 for row in _g37r2["matrix"] for v in row),
+      str(_g37r2["matrix"]))
+
+# --- Reader: fetch_ohlcv_snapshot (Candle-Overlay, E9) ---------------------
+_g37o = _reader37.fetch_ohlcv_snapshot(
+    "XAGUSD", "M1", market_db_path=_db37_mkt)
+check("37 h1) OHLCV-Snapshot: 3 Bars aufsteigend",
+      len(_g37o["bars"]) == 3
+      and _g37o["bars"][0]["time"] < _g37o["bars"][1]["time"]
+      and _g37o["bars"][1]["time"] < _g37o["bars"][2]["time"],
+      str([b["time"] for b in _g37o["bars"]]))
+check("37 h2) OHLCV-Snapshot: erster Bar = Wanduhr-Epoch 03.08. 10:00",
+      _g37o["bars"][0]["time"] == _bt37.timestamp(),
+      str(_g37o["bars"][0]["time"]))
+check("37 h3) OHLCV-Snapshot: OHLC-Werte korrekt",
+      _g37o["bars"][0]["open"] == 10.0
+      and _g37o["bars"][0]["close"] == 10.0
+      and _g37o["bars"][2]["close"] == 10.2,
+      str(_g37o["bars"]))
+
+# --- ViewModel: heatmap_*-Params, Payload & Profil-Roundtrip ---------------
+_vm37 = AnalyticsViewModel(analytics_repo=_repo37)
+check("37 i1) VM-Defaults (Kapitel: Confluence auf Datum x Stunde)",
+      _vm37.params.get("heatmap_x_dim") == "date"
+      and _vm37.params.get("heatmap_y_dim") == "hour"
+      and _vm37.params.get("heatmap_agg") == "confluence_count"
+      and _vm37.params.get("heatmap_field") == ""
+      and _vm37.params.get("candle_projection_enabled") is False
+      and _vm37.params.get("zoom_x_range") == [0.0, 1.0],
+      str({k: _vm37.params.get(k) for k in (
+          "heatmap_x_dim", "heatmap_y_dim", "heatmap_agg",
+          "heatmap_field", "candle_projection_enabled", "zoom_x_range")}))
+_vm37.set_heatmap_config("hour", "dow", "visit_pct", "avg")
+check("37 i2) set_heatmap_config setzt + lower-cased",
+      _vm37.params.get("heatmap_x_dim") == "hour"
+      and _vm37.params.get("heatmap_y_dim") == "dow"
+      and _vm37.params.get("heatmap_agg") == "avg"
+      and _vm37.params.get("heatmap_field") == "visit_pct",
+      "")
+check("37 i3) set_heatmap_config feuert QUERY_HEATMAP_GENERIC",
+      QUERY_HEATMAP_GENERIC in _vm37._pending_kinds,
+      str(_vm37._pending_kinds))
+_vm37.set_heatmap_zoom([1.5, 0.5], [0.0, 1.0])   # ungueltig -> geclampt [0,1]
+check("37 i4a) set_heatmap_zoom clampt ungueltig auf [0,1]",
+      _vm37.params.get("zoom_x_range") == [0.0, 1.0],
+      str(_vm37.params.get("zoom_x_range")))
+_vm37.set_heatmap_zoom([0.25, 0.75], [0.0, 1.0])  # gueltig -> uebernommen
+check("37 i4b) set_heatmap_zoom uebernimmt gueltigen Bereich",
+      _vm37.params.get("zoom_x_range") == [0.25, 0.75]
+      and _vm37.params.get("zoom_y_range") == [0.0, 1.0],
+      str((_vm37.params.get("zoom_x_range"),
+           _vm37.params.get("zoom_y_range"))))
+_vm37.set_candle_projection(True)
+check("37 i5) set_candle_projection an",
+      _vm37.params.get("candle_projection_enabled") is True, "")
+_pay37 = _vm37._current_payload()
+check("37 i6) Payload: charts.heatmap (additiv, Schema v2 bleibt)",
+      _pay37.get("schema_version") == 2
+      and (_pay37.get("charts") or {}).get("heatmap") is not None
+      and (_pay37["charts"]["heatmap"].get("agg") == "avg")
+      and (_pay37["charts"]["heatmap"].get("zoom_x_range") == [0.25, 0.75]),
+      str((_pay37.get("schema_version"),
+           (_pay37.get("charts") or {}).get("heatmap"))))
+_vm37b = AnalyticsViewModel(analytics_repo=_repo37)
+_vm37b._apply_profile({"payload": _pay37}, mark_dirty=False)
+check("37 i7) _apply_profile loest charts.heatmap auf (Luecke 5.3-6)",
+      _vm37b.params.get("heatmap_x_dim") == "hour"
+      and _vm37b.params.get("heatmap_agg") == "avg"
+      and _vm37b.params.get("heatmap_field") == "visit_pct"
+      and _vm37b.params.get("candle_projection_enabled") is True
+      and _vm37b.params.get("zoom_x_range") == [0.25, 0.75],
+      str({k: _vm37b.params.get(k) for k in (
+          "heatmap_x_dim", "heatmap_agg", "heatmap_field",
+          "candle_projection_enabled", "zoom_x_range")}))
+
+# --- Worker: Dispatch fuer die neuen Query-Kinds (20.02) --------------------
+from analytics.engine.analytics_worker import (  # noqa: E402
+    AnalyticsAsyncWorker, QUERY_OHLCV,
+)
+_w37 = AnalyticsAsyncWorker(_repo37, QUERY_HEATMAP_GENERIC, {
+    "symbol": "XAGUSD", "timeframe": "M1",
+    "x_dim": "date", "y_dim": "hour", "field": "visit_pct",
+    "agg": "avg", "feature_ids": [],
+})
+_g37w = _w37._execute()
+check("37 j1) Worker QUERY_HEATMAP_GENERIC: avg-Matrix (2x3)",
+      np.asarray(_g37w["matrix"]).shape == (2, 3)
+      and all(abs(v - 37.5) < 1e-9
+              for row in _g37w["matrix"] for v in row),
+      str(np.asarray(_g37w["matrix"]).shape))
+_w37o = AnalyticsAsyncWorker(_repo37, QUERY_OHLCV, {
+    "symbol": "XAGUSD", "timeframe": "M1", "limit": None,
+})
+_g37wo = _w37o._execute()
+check("37 j2) Worker QUERY_OHLCV: liefert OHLCV-Payload",
+      isinstance(_g37wo.get("bars"), list)
+      and _g37wo.get("symbol") == "XAGUSD"
+      and _g37wo.get("timeframe") == "M1",
+      str(type(_g37wo.get("bars"))))
+
+shutil.rmtree(_tmp37, ignore_errors=True)
+
+# ---------------------------------------------------------------------------
+# Teil 38 (Bugfix 08.08.2026, Bug 1 + Bug 2 der User-Meldung):
+#   a) ViewModel-Refresh-Gap (20.02): set_symbol/set_timeframe/set_feature_ids
+#      muessen auch QUERY_HEATMAP_GENERIC (und bei Symbol/TF QUERY_OHLCV)
+#      refreshen - sonst aktualisiert sich die generische Heatmap nach einer
+#      Datenquellen-/Symbol-/TF-Aenderung nicht.
+#   b) FeatureStoreReader._apply_feature_filter: case-insensitiv +
+#      whitespace-tolerant (LOWER(TRIM(feature_id))) - sonst matcht der
+#      Datenquellen-Filter nichts und Tabelle/Heatmap bleiben leer.
+#   c) MasterTree.set_checked_feature_ids/_on_item_changed: Eltern-Kette der
+#      angehakten Items aufklappen - sonst sind die aktivierten Services in
+#      eingeklappten Sets/Ordnern unsichtbar (Bug 2).
+# ---------------------------------------------------------------------------
+print("\n=== Teil 38: Bugfix 08.08.2026 (Filter-Anzeige + Tree-Expansion) ===")
+from analytics.engine.analytics_worker import (  # noqa: E402
+    QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC, QUERY_OHLCV,
+)
+from serviceui.master_tree import (  # noqa: E402
+    TYPE_SET, TYPE_SERVICE, ROLE_SET_ID, ROLE_INSTANCE_ID,
+)
+
+# --- a) ViewModel-Refresh-Tupel ---------------------------------------------
+_vm38 = AnalyticsViewModel(analytics_repo=_repo37)
+_vm38._pending_kinds.clear()
+_vm38.set_symbol("XAGUSD")
+_kinds38a = list(_vm38._pending_kinds)
+check("38 a1) set_symbol refresht generische Heatmap + OHLCV (Bug 1)",
+      QUERY_HEATMAP_GENERIC in _kinds38a and QUERY_OHLCV in _kinds38a,
+      str(_kinds38a))
+_vm38._pending_kinds.clear()
+_vm38.set_timeframe("H1")
+_kinds38b = list(_vm38._pending_kinds)
+check("38 a2) set_timeframe refresht generische Heatmap + OHLCV (Bug 1)",
+      QUERY_HEATMAP_GENERIC in _kinds38b and QUERY_OHLCV in _kinds38b,
+      str(_kinds38b))
+_vm38._pending_kinds.clear()
+_vm38.set_feature_ids(["srv_a"])
+_kinds38c = list(_vm38._pending_kinds)
+check("38 a3) set_feature_ids refresht generische Heatmap (Bug 1)",
+      QUERY_HEATMAP_GENERIC in _kinds38c
+      and QUERY_TABLE in _kinds38c
+      and QUERY_HEATMAP in _kinds38c,
+      str(_kinds38c))
+_vm38.shutdown()
+
+# --- b) Case-insensitiv + whitespace-toleranter feature_id-Filter ------------
+_conds38, _params38 = [], []
+FeatureStoreReader._apply_feature_filter(
+    ["  SrV_A ", "SRV_B", ""], None, _conds38, _params38)
+check("38 b1) IN-Clause case-insensitiv + getrimmt (Bug 1)",
+      _conds38 == ["LOWER(TRIM(feature_id)) IN (?, ?)"]
+      and _params38 == ["srv_a", "srv_b"],
+      str((_conds38, _params38)))
+_conds38b, _params38b = [], []
+FeatureStoreReader._apply_feature_filter(
+    None, "  SrV_A ", _conds38b, _params38b)
+check("38 b2) Einzel-ID case-insensitiv (LOWER(TRIM)) (Bug 1)",
+      _conds38b == ["LOWER(TRIM(feature_id)) = LOWER(TRIM(?))"]
+      and _params38b == ["  SrV_A "],
+      str((_conds38b, _params38b)))
+_conds38c, _params38c = [], []
+FeatureStoreReader._apply_feature_filter([], None, _conds38c, _params38c)
+check("38 b3) leere Liste = kein Filter (unchanged)",
+      _conds38c == [] and _params38c == [], "")
+
+# --- c) MasterTree-Expansion der angehakten Items (Bug 2) -------------------
+class _P38SetRepo:
+    """Duck-Typ-Set-Repo mit einer Set-Definition."""
+
+    def __init__(self, sets):
+        self._sets = sets
+
+    def list_sets(self):
+        return list(self._sets)
+
+
+class _P38StateMgr:
+    """Duck-Typ-StateManager (kein Live-Status, keine Overrides)."""
+
+    def load_all_instances(self):
+        return []
+
+    def get_global_value(self, key, default=None):
+        return default
+
+
+_set38 = {
+    "set_id": "set_grid",
+    "display_name": "Grid-Set",
+    "description": "",
+    "execution_order": ["grid_1"],
+    "services": {
+        "grid_1": {
+            "plugin_id": "srv_grid_lines",
+            "lookback": 1000,
+            "params": {},
+            "version": "1.0.0",
+        },
+    },
+}
+_model38 = ServiceSelectorModel(
+    set_repo=_P38SetRepo([_set38]),
+    state_manager=_P38StateMgr(),
+    registry=_P1608Registry({
+        "srv_grid_lines": _P1608Plugin("srv_grid_lines", category=None),
+    }),
+    feature_store_reader=_P1608FSReader(),
+)
+_tree38 = MasterTree(_model38)
+_tree38.set_checkable(True)
+pump()
+_set_nodes38 = [i for i in TreeItemIterator(_tree38)
+                if i is not None
+                and i.data(0, ROLE_NODE_TYPE) == TYPE_SET]
+check("38 c1) Set-Knoten existiert und ist initial eingeklappt",
+      len(_set_nodes38) == 1 and not _set_nodes38[0].isExpanded(),
+      str(len(_set_nodes38)))
+_tree38.set_checked_feature_ids(["srv_grid_lines"])
+check("38 c2) set_checked_feature_ids klappt das Set auf (Bug 2)",
+      len(_set_nodes38) == 1 and _set_nodes38[0].isExpanded(),
+      str([n.isExpanded() for n in _set_nodes38]))
+_svc_nodes38 = [i for i in TreeItemIterator(_tree38)
+                if i is not None
+                and i.data(0, ROLE_NODE_TYPE) == TYPE_SERVICE]
+check("38 c3) Service gecheckt + checked_feature_ids-Roundtrip (Bug 2)",
+      len(_svc_nodes38) == 1
+      and _svc_nodes38[0].checkState(0) == Qt.Checked
+      and _tree38.checked_feature_ids() == ["srv_grid_lines"],
+      str((len(_svc_nodes38),
+           _svc_nodes38[0].checkState(0) if _svc_nodes38 else None,
+           _tree38.checked_feature_ids())))
+_tree38.hide()
+pump()
+
+
+_tree38.hide()
+pump()
+
+
+# ============================================================================
+# 20.03 (Kapitel 20.03 Step 4): output_schema aller registrierten Plugins
+# Headless (keine UI): Registry + Property-Retrieval pruefen.
+# ============================================================================
+try:
+    from analytics.features.feature_builder import PluginRegistry
+    from analytics.features.plugins.base_plugin import PluginFeature
+
+    _reg20_3 = PluginRegistry()
+    _output_expected = [
+        "srv_grid_lines", "srv_proximity", "srv_swing_momentum",
+        "srv_swing_structure", "srv_swing_volume_profile",
+        "srv_trend_breakout", "srv_trend_hma_pivot", "srv_trend_regime",
+    ]
+    for _pid20_3 in _output_expected:
+        _schema20_3 = _reg20_3.get(_pid20_3).output_schema
+        check(f"20.03 a) output_schema nicht leer: {_pid20_3}",
+              bool(_schema20_3), str(len(_schema20_3)))
+        for _fn, _fs in _schema20_3.items():
+            check(f"20.03 b) Feld-Vertrag: {_pid20_3}.{_fn}",
+                  isinstance(_fs, dict) and bool(_fs.get("type"))
+                  and bool(_fs.get("description")), str(_fs))
+            check(f"20.03 c) kein bar_time: {_pid20_3}.{_fn}",
+                  _fn != "bar_time", _fn)
+    check("20.03 d) Basis-Default bleibt leer",
+          PluginFeature.output_schema.fget(None) == {})
+except Exception as _e20_3:
+    check("20.03 output_schema-Check", False, str(_e20_3))
+
+
+# ============================================================================
+# 20.03-Bugfix (09.08.2026): Info-Button-Text ASCII + Main/Tech-Split
+# Headless (keine UI): Konstante pruefen + Split-Logik der Resultatfelder-
+# Sektion (main vs. technical) gegen die Registry-Daten verifizieren.
+# ============================================================================
+try:
+    from serviceui.master_tree import INFO_BUTTON_TEXT
+    check("20.03-Bugfix a) INFO_BUTTON_TEXT ist ASCII 'i' (kein U+2139)",
+          INFO_BUTTON_TEXT == "i" and "\u2139" not in INFO_BUTTON_TEXT,
+          repr(INFO_BUTTON_TEXT))
+    _reg20_3b = PluginRegistry()
+    for _pid20_3b in _output_expected:
+        _schema20_3b = _reg20_3b.get(_pid20_3b).output_schema or {}
+        _main20_3b = [f for f, s in _schema20_3b.items()
+                      if not (s or {}).get("technical")]
+        _tech20_3b = [f for f, s in _schema20_3b.items()
+                      if (s or {}).get("technical")]
+        check(f"20.03-Bugfix b) Main/Tech-Split vollstaendig: {_pid20_3b}",
+              len(_main20_3b) + len(_tech20_3b) == len(_schema20_3b)
+              and bool(_main20_3b),
+              f"{len(_main20_3b)} main / {len(_tech20_3b)} tech")
+        check(f"20.03-Bugfix c) Tech-Felder tragen Beschreibung: {_pid20_3b}",
+              all(bool((_schema20_3b[f] or {}).get("description"))
+                  for f in _tech20_3b), str(_tech20_3b))
+except Exception as _e20_3b:
+    check("20.03-Bugfix-Check", False, str(_e20_3b))
+
+
+# ============================================================================
+# 20.03.02 (09.08.2026, F1-F7): CheckableComboBox, native-Fallback (F3),
+# Header-Format (F5), set_heatmap_config-Signatur (F2), Widget-Re-Emission
+# (F4). Headless (offscreen, kein exec_).
+# ============================================================================
+try:
+    from PySide6.QtWidgets import QComboBox  # noqa: E402
+    from analytics.ui.common import CheckableComboBox  # noqa: E402
+
+    _cbo = CheckableComboBox()
+    _cbo.add_checkable_item("Grid Lines / open", "srv_grid_lines|open", True)
+    _cbo.add_checkable_item("Proximity / visit_pct",
+                            "srv_proximity|visit_pct", False)
+    _cbo.add_checkable_item("Preis (mehrere)", "price", True)
+    check("20.03.02 a) checked_data nur angehakte userData",
+          _cbo.checked_data() == ["srv_grid_lines|open", "price"],
+          str(_cbo.checked_data()))
+    _cbo.set_checked_data(["srv_proximity|visit_pct", "price"])
+    check("20.03.02 b) set_checked_data wechselt CheckStates",
+          _cbo.checked_data() == ["srv_proximity|visit_pct", "price"],
+          str(_cbo.checked_data()))
+    check("20.03.02 c) CheckableComboBox ist QComboBox (headless)",
+          isinstance(_cbo, QComboBox))
+except Exception as _e203a:
+    check("20.03.02 CheckableComboBox-Check", False, str(_e203a))
+
+try:
+    from analytics.engine.analytics_view_model import AnalyticsViewModel  # noqa: E402
+    _vm203 = AnalyticsViewModel(selector_model=None)
+    check("20.03.02 d) native -> 'Allgemein' (F3)",
+          _vm203.resolve_service_display_name("native") == "Allgemein",
+          _vm203.resolve_service_display_name("native"))
+    check("20.03.02 e) native_* -> 'Allgemein' (F3)",
+          _vm203.resolve_service_display_name("native_foo") == "Allgemein",
+          _vm203.resolve_service_display_name("native_foo"))
+    check("20.03.02 f) none/leer -> 'Allgemein' (F3)",
+          _vm203.resolve_service_display_name("none") == "Allgemein"
+          and _vm203.resolve_service_display_name("") == "Allgemein",
+          _vm203.resolve_service_display_name("none"))
+except Exception as _e203d:
+    check("20.03.02 F3-Check", False, str(_e203d))
+
+try:
+    import inspect  # noqa: E402
+    from analytics.engine.analytics_view_model import AnalyticsViewModel as _VM203  # noqa: E402
+    _sig203 = inspect.signature(_VM203.set_heatmap_config)
+    _params203 = list(_sig203.parameters)
+    check("20.03.02 g) set_heatmap_config-Signatur unveraendert (F2)",
+          _params203 == ["self", "x_dim", "y_dim", "field", "agg"],
+          str(_params203))
+    from analytics.ui.heatmap_widget import HeatmapWidget  # noqa: E402
+    check("20.03.02 h) _field_key extrahiert JSON-Key (F2)",
+          HeatmapWidget._field_key("srv_proximity|visit_pct") == "visit_pct"
+          and HeatmapWidget._field_key("price") == "price",
+          HeatmapWidget._field_key("srv_proximity|visit_pct"))
+except Exception as _e203g:
+    check("20.03.02 F2-Check", False, str(_e203g))
+
+try:
+    from serviceui.service_selector_dialog import ServiceSelectorDialog  # noqa: E402
+
+    class _FakeHeaderModel:
+        """Mini-Model fuer die F5-Header-Konvention (nur die benoetigten
+        Methoden; keine DB)."""
+
+        def belongs_to_indicator(self, pid):
+            return pid == "srv_grid_lines"
+
+        def get_indicator_display_name(self, pid):
+            return "Ind_FixedGridProximity"
+
+        def is_active_in_chart(self, pid):
+            return True
+
+        def get_set_indicator_names(self, set_def):
+            return ["Ind_A", "Ind_B"]
+
+        def is_set_active(self, set_def):
+            return False
+
+    _dlg203 = ServiceSelectorDialog.__new__(ServiceSelectorDialog)
+    _dlg203.model = _FakeHeaderModel()
+    _h203 = _dlg203._info_header_line("srv_grid_lines")
+    check("20.03.02 i) Header-Format aktiv (F5)",
+          _h203 == "📌 im Ind_FixedGridProximity | 🟢 aktiv in "
+                   "Ind_FixedGridProximity",
+          _h203)
+    _h203b = _dlg203._info_header_line("unbekannt")
+    check("20.03.02 j) Header leer ohne Indikator (F5)",
+          _h203b == "", repr(_h203b))
+    _h203c = _dlg203._info_set_header_line({})
+    check("20.03.02 k) Set-Header inaktiv mit + (F5)",
+          _h203c == "📌 im Ind_A + Ind_B | ⚪ inaktiv", _h203c)
+except Exception as _e203i:
+    check("20.03.02 F5-Check", False, str(_e203i))
+
+try:
+    from serviceui.service_selector_widget import ServiceSelectorWidget  # noqa: E402
+    check("20.03.02 l) Widget re-emittiert category_info_requested (F4)",
+          hasattr(ServiceSelectorWidget, "category_info_requested"),
+          "Signal fehlt")
+except Exception as _e203l:
+    check("20.03.02 F4-Check", False, str(_e203l))
+
+try:
+    # F1-Filter (Regression, Commit 4648399): feature_keys_by_service mit
+    # feature_ids liefert NUR die Keys der selektierten Services. Nutzt
+    # _reader37/_db37_ana aus dem 37er-Block (Services srv_a + srv_b).
+    _keys20 = _reader37.feature_keys_by_service(
+        "XAGUSD", "M1", feature_ids=["srv_a"])
+    check("20.03.02 m) Filter-Check (F1): feature_ids=['srv_a'] -> KEINE srv_b-Keys",
+          "srv_a" in _keys20 and "srv_b" not in _keys20, str(_keys20))
+    _keys20b = _reader37.feature_keys_by_service(
+        "XAGUSD", "M1", feature_ids=["srv_b"])
+    check("20.03.02 n) Filter-Check (F1): feature_ids=['srv_b'] -> KEINE srv_a-Keys",
+          "srv_b" in _keys20b and "srv_a" not in _keys20b, str(_keys20b))
+except Exception as _e203m:
+    check("20.03.02 F1-Filter-Check", False, str(_e203m))
+
+try:
+    from analytics.ui.heatmap_widget import _VALUE_AGGS  # noqa: E402
+    check("20.03.02 o) F7: count/confluence_count NICHT in _VALUE_AGGS (Combo disabled)",
+          "count" not in _VALUE_AGGS and "confluence_count" not in _VALUE_AGGS
+          and "avg" in _VALUE_AGGS, str(_VALUE_AGGS))
+except Exception as _e203o:
+    check("20.03.02 F7-Check", False, str(_e203o))
+
+# ============================================================================
+# 20.03.03 (09.08.2026, Q1-Q5): Dropdown-Eindeutigkeit & Sammel-Auswahl im
+# 'Feld'-Dropdown der generischen Heatmap. Headless (offscreen, kein exec_).
+# ============================================================================
+
+
+class _FakeVM200303:
+    """Mini-ViewModel fuer den 20.03.03-Block (nur benoetigte Member)."""
+
+    def __init__(self):
+        self.data_ready = None
+        self.params = {}
+        self.calls = []
+
+    def set_heatmap_config(self, x_dim, y_dim, field, agg):
+        self.calls.append(("config", x_dim, y_dim, field, agg))
+        self.params.update(heatmap_x_dim=x_dim, heatmap_y_dim=y_dim,
+                           heatmap_agg=agg, heatmap_field=field)
+
+    def set_feature_ids(self, ids):
+        self.calls.append(("feature_ids", list(ids)))
+        self.params["feature_ids"] = list(ids)
+
+    def set_candle_projection(self, v):
+        pass
+
+    def request_daily_ohlc(self):
+        pass
+
+    def request_heatmap_generic(self):
+        pass
+
+    def resolve_service_display_name(self, pid):
+        return {"srv_proximity": "Proximity",
+                "srv_grid_lines": "Grid Lines",
+                "srv_volume_profile": "Volume Profile"}.get(str(pid), str(pid))
+
+
+try:
+    from analytics.ui.common import CheckableComboBox  # noqa: E402
+    from analytics.ui.heatmap_widget import HeatmapWidget  # noqa: E402
+
+    # Q4: add_header_item (deaktivierte Trennzeile, userData None)
+    _cbo203 = CheckableComboBox()
+    _cbo203.add_checkable_item("A", "srv_a|k", True)
+    _cbo203.add_header_item("🌐 HEADER")
+    _hdr203 = _cbo203.model().item(1)
+    check("20.03.03 a) Header Qt.NoItemFlags + userData None (Q4)",
+          not (_hdr203.flags() & Qt.ItemIsEnabled)
+          and _hdr203.data(Qt.UserRole) is None, str(_hdr203.flags()))
+    check("20.03.03 b) checked_data() ignoriert Header (Q4)",
+          _cbo203.checked_data() == ["srv_a|k"], str(_cbo203.checked_data()))
+
+    # Q1/Q2/Q5: Payload-Sync (shared is_hit + unique Keys)
+    _w203 = HeatmapWidget()
+    _w203._view_model = _FakeVM200303()
+    _w203._view_model.params["heatmap_field"] = "is_hit"
+    _payload203 = {
+        "metrics": ["count", "confluence_count", "is_hit", "steps_around",
+                    "visit_pct", "volume_ratio"],
+        "field_sources": {
+            "is_hit": ["srv_proximity", "srv_grid_lines"],
+            "steps_around": ["srv_grid_lines"],
+            "visit_pct": ["srv_proximity"],
+            "volume_ratio": ["srv_volume_profile"],
+        },
+        "agg": "avg", "x_dim": "date", "y_dim": "hour",
+    }
+    _w203._sync_combos_from_payload(_payload203)
+    _cf203 = _w203._combo_field
+    _labels203 = [_cf203.itemText(i) for i in range(_cf203.count())]
+    _uds203 = [str(_cf203.itemData(i)) for i in range(_cf203.count())]
+    check("20.03.03 c) KEIN roher Key 'is_hit' im Dropdown (Q1)",
+          "is_hit" not in _uds203 and "ALL|is_hit" in _uds203, str(_uds203))
+    check("20.03.03 d) Einzel-Eintraege pro Service (Q1)",
+          "Proximity / is_hit" in _labels203
+          and "Grid Lines / is_hit" in _labels203, str(_labels203))
+    _cd203 = _cf203.checked_data()
+    check("20.03.03 e) Initial: Sammel + unique angehakt, shared-Einzel nicht (Q5)",
+          set(_cd203) == {"ALL|is_hit", "srv_grid_lines|steps_around",
+                          "srv_proximity|visit_pct",
+                          "srv_volume_profile|volume_ratio"}, str(_cd203))
+    check("20.03.03 f) ALL|is_hit expandiert auf beide Quellen (Q2)",
+          _w203._checked_field_service_ids()
+          == ["srv_proximity", "srv_grid_lines", "srv_volume_profile"],
+          str(_w203._checked_field_service_ids()))
+
+    # Q5 XOR (Klick-Tracking): Klick auf Einzel -> Sammel abgewaehlt
+    _cf203._last_click_index = 3
+    _cf203.set_checked_data(["ALL|is_hit", "srv_proximity|is_hit"])
+    _w203._reconcile_sammel_checks()
+    check("20.03.03 g) XOR: Klick Einzel -> Sammel abgewaehlt (Q5)",
+          "ALL|is_hit" not in _cf203.checked_data()
+          and "srv_proximity|is_hit" in _cf203.checked_data(),
+          str(_cf203.checked_data()))
+    # Q5 XOR umgekehrt: Klick auf Sammel -> Einzel abgewaehlt
+    _cf203._last_click_index = 1
+    _cf203.set_checked_data(["ALL|is_hit", "srv_proximity|is_hit"])
+    _w203._reconcile_sammel_checks()
+    check("20.03.03 h) XOR: Klick Sammel -> Einzel abgewaehlt (Q5)",
+          "ALL|is_hit" in _cf203.checked_data()
+          and "srv_proximity|is_hit" not in _cf203.checked_data(),
+          str(_cf203.checked_data()))
+
+    # E6-Loop: params haelt reinen Key -> KEIN ueberfluessiger config-Call
+    _cf203.setCurrentIndex(1)
+    _w203._view_model.calls.clear()
+    _w203._view_model.params["heatmap_field"] = "is_hit"
+    _w203._sync_combos_from_payload(_payload203)
+    _configs203 = [c for c in _w203._view_model.calls if c[0] == "config"]
+    check("20.03.03 i) E6-Loop: sync mit heatmap_field='is_hit' ohne config-Call",
+          len(_configs203) == 0, str(_configs203))
+except Exception as _e2033:
+    check("20.03.03-Check", False, str(_e2033))
+
+
+if FAILURES:
+
+    print(f"FEHLER: {len(FAILURES)}: {FAILURES}")
+    sys.exit(1)
+print("ALLE PRUEFUNGEN BESTANDEN (OK)")
+sys.exit(0)
+
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_t39_strip.py
+```py
+# -*- coding: utf-8 -*-
+"""Erstellt eine Kopie von test/test.py OHNE Sektion 39 (Vorbelastungs-Check)."""
+import pathlib
+
+p = pathlib.Path("test/test.py")
+src = p.read_text(encoding="utf-8")
+start_marker = "# ============================================================================\n# 39) 21.01 Analytics - Refactor & Smart Presets"
+end_marker = "shutil.rmtree(_tmp39, ignore_errors=True)\n\n\nif FAILURES:"
+i = src.find(start_marker)
+assert i >= 0, "Start-Marker fehlt"
+j = src.find(end_marker, i)
+assert j >= 0, "End-Marker fehlt"
+j += len("shutil.rmtree(_tmp39, ignore_errors=True)\n\n\n")
+head = src[:i]
+tail = src[j:]
+# Kopf bis vor den Start-Marker: endet auf 'check("20.03.03-Check"...)' + Blankzeilen
+out = head.rstrip() + "\n\n\n" + tail
+pathlib.Path("test/_t39_nos39.py").write_text(out, encoding="utf-8")
+print("OK geschrieben, Zeilen:", len(out.splitlines()))
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_tmp_aktiere_vorher.md
+```md
+# Fehler beim Lesen der Datei: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte
 
 ```
 
@@ -47856,6 +55330,417 @@ sys.exit(0 if not failures else 1)
 
 --------------------------------------------------
 
+### DATEI: test/check_heatmap_2101.py
+```py
+# -*- coding: utf-8 -*-
+"""
+check_heatmap_2101.py - Fokussierter Logik-Check fuer die 21.01-Bugfixes
+(Meldungen 1-7, 11.08.2026) in der Analytics-Heatmap.
+
+Nur die BETROFFENEN Widget-/Page-Logiken (headless, offscreen, keine GUI):
+  * Meldung 2/3: "Ansicht"-Dropdown = Generisch + 4 Presets (ohne
+    "Wochentag × Stunde"); Preset-Dropdown wendet das Preset an und die
+    Bedien-Controls bleiben sichtbar (Stack Index 1).
+  * Meldung 4/6: Stale-Combo-Sync - Preset-Anwendung zieht die Combos
+    aus den VM-Params nach (_sync_from_params), kein Ueberschreiben durch
+    spaetere Combo-Wechsel.
+  * Meldung 5: Kerzen-Overlay NUR bei X-Achse = date aktivierbar
+    (deaktiviert/aus bei X!=date; Restore mit Overlay+Y=date -> aus).
+  * Meldung 7: Confluence-Levels daten-gebunden (0..vmax) statt fest 0..5.
+
+KEIN UI-Test, KEIN Regressionstest: die echte test/test.py-Pipeline wird
+hier nicht ausgefuehrt.
+"""
+import os
+import sys
+import io
+
+sys.path.insert(0, os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..")))
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+import numpy as np  # noqa: E402
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+_app = QApplication.instance() or QApplication(sys.argv)
+
+FAILURES = []
+
+
+def check(name, ok, info=""):
+    status = "OK " if ok else "FAIL"
+    print(f"[{status}] {name}")
+    if not ok:
+        FAILURES.append(name)
+        if info:
+            print(f"         -> {info}")
+
+
+import pyqtgraph as pg  # noqa: E402
+from analytics.ui.heatmap_widget import HeatmapWidget  # noqa: E402
+from analytics.ui.heatmap_page import HeatmapPage  # noqa: E402
+
+
+class _FakeVM:
+    """Mini-ViewModel fuer die Widget-/Page-Checks (nur benoetigte Member)."""
+
+    class _Sig:
+        def connect(self, slot):
+            pass
+
+    data_ready = _Sig()
+
+    def __init__(self):
+        self.calls = []
+        self.params = {
+            "heatmap_x_dim": "date", "heatmap_y_dim": "hour",
+            "heatmap_agg": "confluence_count", "heatmap_field": "",
+            "candle_projection_enabled": False,
+            "zoom_x_range": [0.0, 1.0], "zoom_y_range": [0.0, 1.0],
+            "feature_ids": [], "instance_hashes": [],
+        }
+
+    def heatmap_metrics(self, symbol, timeframe):
+        return ["count", "confluence_count"]
+
+    def request_features(self):
+        pass
+
+    def request_heatmap_generic(self):
+        pass
+
+    def request_daily_ohlc(self):
+        pass
+
+    def request_ohlcv_snapshot(self):
+        pass
+
+    def set_candle_projection(self, enabled):
+        self.params["candle_projection_enabled"] = bool(enabled)
+
+    def set_heatmap_config(self, x_dim, y_dim, field, agg):
+        self.params.update({
+            "heatmap_x_dim": x_dim, "heatmap_y_dim": y_dim,
+            "heatmap_field": field, "heatmap_agg": agg})
+
+    def apply_smart_preset_confluence(self):
+        self.calls.append("confluence")
+        self.params.update({"heatmap_x_dim": "date",
+                            "heatmap_y_dim": "service_id",
+                            "heatmap_agg": "confluence_count",
+                            "heatmap_field": ""})
+
+    def apply_smart_preset_session(self):
+        self.calls.append("session")
+        self.params.update({"heatmap_x_dim": "dow",
+                            "heatmap_y_dim": "hour",
+                            "heatmap_agg": "confluence_count",
+                            "heatmap_field": ""})
+
+    def apply_smart_preset_intensity(self):
+        self.calls.append("intensity")
+        self.params.update({"heatmap_x_dim": "date",
+                            "heatmap_y_dim": "hour",
+                            "heatmap_agg": "avg",
+                            "heatmap_field": "grid_dist"})
+
+    def apply_smart_preset_timeframe(self):
+        self.calls.append("timeframe")
+        self.params.update({"heatmap_x_dim": "timeframe",
+                            "heatmap_y_dim": "service_id",
+                            "heatmap_agg": "count",
+                            "heatmap_field": ""})
+
+
+# ------------------------------------------------------------------
+# 1) Meldung 2: Ansicht-Dropdown-Kontrakt
+# ------------------------------------------------------------------
+try:
+    _vm = _FakeVM()
+    _page = HeatmapPage()
+    _page.attach_view_model(_vm)
+    _d = [_page._combo_mode.itemData(i)
+          for i in range(_page._combo_mode.count())]
+    check("Meldung 2: Dropdown = Generisch + 4 Presets, ohne 'standard'",
+          _d == ["generic", "preset_confluence", "preset_session",
+                 "preset_intensity", "preset_timeframe"]
+          and _page._combo_mode.findData("standard") < 0,
+          str(_d))
+    _page.set_mode("standard")
+    check("Meldung 2: set_mode('standard') -> generic (Legacy-Mapping)",
+          _page.mode_id == "generic"
+          and _page._stack_modes.currentIndex() == 1,
+          str(_page.mode_id))
+    _page.set_mode("preset_session")
+    check("Meldung 2: set_mode('preset_session') -> Dropdown+Stack (kein Query)",
+          _page.mode_id == "preset_session"
+          and _page._stack_modes.currentIndex() == 1
+          and _vm.calls == [],
+          str((_page.mode_id, _vm.calls)))
+except Exception as e:
+    check("Dropdown-Check", False, str(e))
+
+# ------------------------------------------------------------------
+# 2) Meldung 3+4/6: Preset-Dropdown wendet Preset an, Combos synchron
+# ------------------------------------------------------------------
+try:
+    _vm2 = _FakeVM()
+    _page2 = HeatmapPage()
+    _page2.attach_view_model(_vm2)
+    _page2._combo_mode.setCurrentIndex(
+        _page2._combo_mode.findData("preset_session"))
+    check("Meldung 3/4/6: Preset-Dropdown -> VM-Preset + Combos synchron",
+          _vm2.calls[-1] == "session"
+          and _page2.mode_id == "preset_session"
+          and _page2._stack_modes.currentIndex() == 1
+          and _page2._generic._combo_x.currentData() == "dow"
+          and _page2._generic._combo_y.currentData() == "hour"
+          and _page2._generic._combo_agg.currentData()
+          == "confluence_count",
+          str((_vm2.calls, _page2.mode_id,
+               _page2._generic._combo_x.currentData(),
+               _page2._generic._combo_y.currentData(),
+               _page2._generic._combo_agg.currentData())))
+except Exception as e:
+    check("Preset-Dropdown-Check", False, str(e))
+
+# ------------------------------------------------------------------
+# 3) E7/E8 (11.08.2026): Preset-Buttons entfernt + row-major-Orientierung
+# ------------------------------------------------------------------
+try:
+    _w = HeatmapWidget()
+    check("E7: 4 Preset-Buttons entfernt (nur noch Ansicht-Dropdown)",
+          not hasattr(_w, "_btn_preset_confluence")
+          and not hasattr(_w, "_btn_preset_session")
+          and not hasattr(_w, "_btn_preset_intensity")
+          and not hasattr(_w, "_btn_preset_timeframe"),
+          "Preset-Buttons duerfen nicht mehr existieren")
+    check("E8: ImageItem axisOrder='row-major' (keine Transposition)",
+          _w._image.axisOrder == "row-major",
+          str(getattr(_w._image, "axisOrder", None)))
+    # E8-Empirie: 2 Zeilen (Services) x 3 Spalten (Zeiten) -> width()==3
+    # (Zeiten), height()==2 (Services). Bei col-major waren sie vertauscht
+    # (width()==2/height()==3 = das Screenshot-Fehlbild der Kritik).
+    _w._view_model = _FakeVM()
+    _w._render_generic({
+        "matrix": [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]],
+        "x_dim": "date", "y_dim": "hour",
+        "x_axis": [1775606400.0, 1775692800.0, 1775779200.0],
+        "y_axis": [0.0, 1.0],
+        "x_values": ["2026-04-08", "2026-04-09", "2026-04-10"],
+        "agg": "confluence_count",
+        "metrics": ["count", "confluence_count"],
+        "field_sources": {},
+    })
+    check("E8: ImageItem-Geometrie row-major (3 Spalten x 2 Zeilen)",
+          _w._image.width() == 3 and _w._image.height() == 2,
+          str((_w._image.width(), _w._image.height())))
+    # E7: Die Page konsumiert `preset_clicked` nicht mehr (keine Buttons).
+    _vmk = _FakeVM()
+    _pagek = HeatmapPage()
+    _pagek.attach_view_model(_vmk)
+    _pagek.set_mode("standard")  # -> generic (Legacy-Mapping)
+    _pagek._generic.preset_clicked.emit("timeframe")
+    check("E7: Page konsumiert preset_clicked nicht mehr (Modus bleibt)",
+          _pagek.mode_id == "generic"
+          and _pagek._stack_modes.currentIndex() == 1
+          and _vmk.calls == [],
+          str((_pagek.mode_id, _vmk.calls)))
+except Exception as e:
+    check("Preset-Button-Check", False, str(e))
+
+# ------------------------------------------------------------------
+# 4) Meldung 5: Kerzen-Overlay NUR bei X=date
+# ------------------------------------------------------------------
+try:
+    _w5 = HeatmapWidget()
+    _w5._view_model = _FakeVM()
+    _w5._set_combo_data(_w5._combo_x, "date")
+    _w5._set_combo_data(_w5._combo_y, "hour")
+    _w5._update_controls()
+    _ok_xdate = _w5._chk_candle.isEnabled()
+    _w5._chk_candle.setChecked(True)
+    _w5._set_combo_data(_w5._combo_x, "hour")   # X verlaesst date
+    _w5._set_combo_data(_w5._combo_y, "date")
+    _w5._on_config_changed()
+    check("Meldung 5: Overlay nur X=date - sonst deaktiviert/aus",
+          _ok_xdate
+          and not _w5._chk_candle.isEnabled()
+          and not _w5._chk_candle.isChecked()
+          and _w5._price_vb.linkedView(pg.ViewBox.XAxis) is None,
+          str((_ok_xdate, _w5._chk_candle.isEnabled(),
+               _w5._chk_candle.isChecked())))
+    # Restore-Fall: params mit Overlay + Y=date -> Checkbox bleibt aus
+    _vm5 = _FakeVM()
+    _vm5.params.update({"heatmap_x_dim": "hour", "heatmap_y_dim": "date",
+                        "candle_projection_enabled": True})
+    _w5s = HeatmapWidget()
+    _w5s._view_model = _vm5
+    _w5s._sync_from_params()
+    check("Meldung 5: Restore Overlay+Y=date -> Checkbox aus",
+          not _w5s._chk_candle.isChecked()
+          and not _w5s._chk_candle.isEnabled(),
+          str((_w5s._chk_candle.isChecked(), _w5s._chk_candle.isEnabled())))
+except Exception as e:
+    check("Overlay-Check", False, str(e))
+
+# ------------------------------------------------------------------
+# 5) Meldung 7: Confluence-Levels daten-gebunden (0..vmax)
+# ------------------------------------------------------------------
+try:
+    _w7 = HeatmapWidget()
+    _w7._view_model = _FakeVM()
+    _w7._render_generic({
+        "matrix": [[0.0, 1.0, 2.0], [0.5, 0.0, 3.0]],
+        "x_dim": "date", "y_dim": "hour",
+        "x_axis": [1720000000.0, 1720086400.0, 1720172800.0],
+        "y_axis": [0.0, 1.0],
+        "x_values": ["2026-08-03", "2026-08-04", "2026-08-05"],
+        "agg": "confluence_count",
+        "metrics": ["count", "confluence_count"],
+        "field_sources": {},
+    })
+    _lev = tuple(float(x) for x in _w7._image.levels)
+    check("Meldung 7: Confluence-Levels daten-gebunden (0..vmax=3)",
+          _lev == (0.0, 3.0), str(_lev))
+    # Nur-Null-Daten: Fallback 0..1 (kein degenerierter Level-Bereich)
+    _w7b = HeatmapWidget()
+    _w7b._view_model = _FakeVM()
+    _w7b._render_generic({
+        "matrix": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        "x_dim": "date", "y_dim": "hour",
+        "x_axis": [1720000000.0, 1720086400.0, 1720172800.0],
+        "y_axis": [0.0, 1.0],
+        "x_values": ["2026-08-03", "2026-08-04", "2026-08-05"],
+        "agg": "confluence_count",
+        "metrics": ["count", "confluence_count"],
+        "field_sources": {},
+    })
+    _levb = tuple(float(x) for x in _w7b._image.levels)
+    check("Meldung 7: Confluence-Levels Fallback bei nur-Null (0..1)",
+          _levb == (0.0, 1.0), str(_levb))
+except Exception as e:
+    check("Confluence-Levels-Check", False, str(e))
+
+# ------------------------------------------------------------------
+# 6) 21.01 Bugfix-Runde 2 (11.08.2026): Clamping/Legende/Crosshair/
+#    Datumsformate + adaptives OHLCV-Overlay
+# ------------------------------------------------------------------
+try:
+    from datetime import datetime as _dt6, timezone as _dt_tz6
+    from analytics.ui.heatmap_widget import (
+        _HeatmapAxis, _CONFLUENCE_COLORS)
+
+    # Bug 1: Kategoriale Achse clampt (keine -1/+2-Gespenster-Ticks)
+    _ax6 = _HeatmapAxis("left")
+    _ax6.configure("service_id", ["srv_a", "srv_b"])
+    _res6 = _ax6.tickValues(-1.5, 2.5, 800)
+    _vals6 = _res6[0][1] if _res6 else []
+    _str6 = _ax6.tickStrings(_vals6, 1.0, 1.0)
+    check("Bugfix2 B1: Kategoriale Achse clampt (nur 0..n-1)",
+          _vals6 == [0.0, 1.0] and _str6 == ["srv_a", "srv_b"],
+          str((_vals6, _str6)))
+
+    # Bug 2: 0 = grau; Legende nach Confluence-Render gefuellt
+    check("Bugfix2 B2: Confluence-0-Farbe = grau",
+          _CONFLUENCE_COLORS[0] == "#d9d9d9",
+          str(_CONFLUENCE_COLORS[0]))
+    _w6 = HeatmapWidget()
+    _w6._view_model = _FakeVM()
+    _w6._render_generic({
+        "matrix": [[0.0, 1.0, 2.0], [0.5, 0.0, 3.0]],
+        "x_dim": "date", "y_dim": "hour",
+        "x_axis": [1720000000.0, 1720086400.0, 1720172800.0],
+        "y_axis": [0.0, 1.0],
+        "x_values": ["2026-08-03", "2026-08-04", "2026-08-05"],
+        "agg": "confluence_count",
+        "metrics": ["count", "confluence_count"],
+        "field_sources": {},
+    })
+    check("Bugfix2 B2b: Schwellwert-Legende gefuellt (4 Eintraege)",
+          len(_w6._legend.items) == 4 and _w6._legend.isVisible(),
+          str((len(_w6._legend.items), _w6._legend.isVisible())))
+
+    # Bug 4: Datumsformate 1:1 mit der App-JS (TT.MM.JJ / HH:MM)
+    _ax6d = _HeatmapAxis("bottom")
+    _ax6d.configure("date", [])
+    def _e6(y, m, d, h=0, mi=0):
+        return _dt6(y, m, d, h, mi, tzinfo=_dt_tz6.utc).timestamp()
+    _days6 = ("Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa.", "So.")
+    def _fmt6(y, m, d):
+        dt6 = _dt6(y, m, d, tzinfo=_dt_tz6.utc)
+        return f"{_days6[dt6.weekday()]} {d:02d}.{m:02d}.{y % 100:02d}"
+    check("Bugfix-R3 B3: Tag-Format 'Mo. 12.06.26'",
+          _ax6d._format(_e6(2026, 1, 1), 1.0) == _fmt6(2026, 1, 1)
+          and _ax6d._format(_e6(2026, 2, 1), 1.0) == _fmt6(2026, 2, 1)
+          and _ax6d._format(_e6(2026, 2, 2), 1.0) == _fmt6(2026, 2, 2),
+          str([_ax6d._format(_e6(2026, m, d), 1.0)
+               for (m, d) in [(1, 1), (2, 1), (2, 2)]]))
+    check("Bugfix2 B4b: Sub-Tag HH:MM (JS-konform)",
+          _ax6d._format(_e6(2026, 2, 3, 14, 0), 1.0) == "14:00"
+          and _ax6d._format(_e6(2026, 2, 3, 14, 30), 1.0) == "14:30",
+          str([_ax6d._format(_e6(2026, 2, 3, 14, m), 1.0)
+               for m in (0, 30)]))
+
+    # Bug 3: Fadenkreuz vorhanden + initial versteckt
+    _w6c = HeatmapWidget()
+    check("Bugfix2 B3: Fadenkreuz-Linien (initial versteckt)",
+          hasattr(_w6c, "_cross_x") and hasattr(_w6c, "_cross_y")
+          and not _w6c._cross_x.isVisible()
+          and not _w6c._cross_y.isVisible())
+
+    # Bug 5: Adaptives OHLCV-Overlay (H1 -> 3600s)
+    _w6b = HeatmapWidget()
+    _w6b._view_model = _FakeVM()
+    _w6b._view_model.params["timeframe"] = "H1"
+    check("Bugfix2 B5: Bar-Intervall H1 = 3600s (adaptiv)",
+          _w6b._bar_interval_seconds() == 3600.0,
+          str(_w6b._bar_interval_seconds()))
+    _w6b._render_generic({
+        "matrix": [[0.0, 1.0], [2.0, 3.0]],
+        "x_dim": "date", "y_dim": "hour",
+        "x_axis": [1775606400.0, 1775692800.0],
+        "y_axis": [0.0, 1.0],
+        "x_values": ["2026-04-08", "2026-04-09"],
+        "agg": "confluence_count",
+        "metrics": ["count", "confluence_count"],
+        "field_sources": {},
+    })
+    _w6b._render_overlay({
+        "bars": [{"time": int(1775606400 + h * 3600),
+                   "open": 100.0, "high": 102.0,
+                   "low": 99.0, "close": 101.0}
+                  for h in range(0, 4)]})
+    check("Bugfix-R3 B1: H1-Overlay batched (3 Items, numpy)",
+          len(_w6b._candle_items) == 3
+          and len(_w6b._candle_items[0].opts["x"]) == 4
+          and _w6b._price_vb.isVisible(),
+          str((len(_w6b._candle_items),
+               _w6b._candle_items[0].opts["x"]
+               if _w6b._candle_items else None,
+               _w6b._price_vb.isVisible())))
+    # Bugfix 2a: Senkrechte Teiler je Dateneinheit (H1 -> 3600s)
+    _gd6 = _w6b._grid_lines.getData()
+    check("Bugfix-R3 B2a: Senkrechte Teiler vorhanden (H1)",
+          _w6b._grid_lines.isVisible()
+          and _gd6[0] is not None and len(_gd6[0]) >= 4,
+          str(_gd6[0].size if _gd6[0] is not None else 0))
+    _w6b._clear_overlay()
+except Exception as e:
+    check("Bugfix-Runde-2-Check", False, str(e))
+
+# ------------------------------------------------------------------
+if FAILURES:
+    print(f"\nFEHLER: {len(FAILURES)}: {FAILURES}")
+    sys.exit(1)
+print("\nALLE PRUEFUNGEN BESTANDEN (OK)")
+sys.exit(0)
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/check_heatmap_bugfix.py
 ```py
 """Tests fuer die Heatmap-Bugfixes 09.08.2026 (Punkte 1-6 + Meldungen 1-3).
@@ -48403,6 +56288,7 @@ if fs:
 lab = w._field_label("open", ["srv_grid_lines"])
 check("meldung3b: _field_label ohne ViewModel -> Roh-Key (defensiv)",
       lab == "open", f"{lab!r}")
+
 try:
     from analytics.engine.analytics_view_model import AnalyticsViewModel
     from analytics.engine.service_selector_model import ServiceSelectorModel
@@ -48581,6 +56467,106 @@ app.processEvents()
 
 print(f"\n{'ALLE PRUEFUNGEN BESTANDEN (OK)' if not failures else 'FEHLER: ' + str(failures)}")
 sys.exit(0 if not failures else 1)
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_orientation_2101.py
+```py
+# -*- coding: utf-8 -*-
+"""
+check_orientation_2101.py - Diagnose: Bild-Orientierung/Transposition des
+HeatmapWidget (Kritik-Punkt 1, 11.08.2026).
+
+Hypothese: pyqtgraph ImageItem Default axisOrder='col-major' transponiert
+die (rows=Services, cols=Zeiten)-Matrix -> Services erscheinen in X, Zeiten
+als N duenne Y-Streifen (Screenshot-Fehlbild).
+
+Beweis ohne Pixel-Lesen:
+  ImageItem.width()  = shape[0] bei col-major (erste Achse = X)
+  ImageItem.height() = shape[1]
+Eine korrekte (2x3)-Matrix (2 Services, 3 Zeiten) muss width()==3 und
+height()==2 liefern (X=Zeiten, Y=Services). Bei col-major liefert sie
+width()==2, height()==3 -> transponiert.
+"""
+import os
+import sys
+import io
+
+sys.path.insert(0, os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..")))
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+_app = QApplication.instance() or QApplication(sys.argv)
+
+from analytics.ui.heatmap_widget import HeatmapWidget  # noqa: E402
+
+
+class _FakeVM:
+    class _Sig:
+        def connect(self, slot):
+            pass
+
+    data_ready = _Sig()
+
+    def __init__(self):
+        self.params = {
+            "heatmap_x_dim": "date", "heatmap_y_dim": "service_id",
+            "heatmap_agg": "confluence_count", "heatmap_field": "",
+            "candle_projection_enabled": False,
+            "zoom_x_range": [0.0, 1.0], "zoom_y_range": [0.0, 1.0],
+            "feature_ids": [], "instance_hashes": [],
+        }
+
+    def request_daily_ohlc(self):
+        pass
+
+    def resolve_service_label(self, label):
+        return label
+
+    def request_features(self):
+        pass
+
+    def request_heatmap_generic(self):
+        pass
+
+    def set_heatmap_config(self, *a):
+        pass
+
+
+# 2 Services x 3 Tage: row0 = Service A [0,1,2], row1 = Service B [3,4,5]
+payload = {
+    "matrix": [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]],
+    "x_dim": "date", "y_dim": "service_id",
+    "x_axis": [1775606400.0, 1775692800.0, 1775779200.0],
+    "y_axis": [0.0, 1.0],
+    "x_values": ["2026-04-08", "2026-04-09", "2026-04-10"],
+    "x_labels": ["Mi 08.04.", "Do 09.04.", "Fr 10.04."],
+    "y_labels": ["srv_a", "srv_b"],
+    "agg": "confluence_count",
+    "metrics": ["count", "confluence_count"],
+    "field_sources": {},
+}
+
+w = HeatmapWidget()
+w._view_model = _FakeVM()
+w._render_generic(payload)
+
+print(f"ImageItem axisOrder        : {w._image.axisOrder!r}")
+print(f"ImageItem.image.shape      : {w._image.image.shape}")
+print(f"ImageItem.width()          : {w._image.width()}   (Soll: 3 = Zeiten)")
+print(f"ImageItem.height()         : {w._image.height()}  (Soll: 2 = Services)")
+print(f"image.levels               : {tuple(float(x) for x in w._image.levels)}")
+print()
+print("Interpretation:")
+print("  width()==2/height()==3 -> MATRIX TRANSPONIERT (Services in X, Zeiten")
+print("  als Y-Streifen) - genau das Screenshot-Fehlbild der Kritik.")
+print("  width()==3/height()==2 -> korrekte Ausrichtung (X=Zeiten, Y=Services).")
+sys.exit(0)
 
 ```
 
@@ -61670,28 +69656,32 @@ class _DummyWin35:
     def __init__(self, vm, default_limit=10_000):
         self._vm = vm
         self._default_limit = default_limit
-        self.edit_profile_name = QLineEdit("")
-        self.edit_profile_desc = QLineEdit("")
         self.edit_limit = QLineEdit("")
 
 
 _dummy35 = _DummyWin35(_vm35c)
 AnalyticsWindow._sync_profile_editor(_dummy35)
-check("35 Z2b) _sync_profile_editor fuellt Name/Limit aus aktivem Profil",
-      _dummy35.edit_profile_name.text() == "MeinProfil"
-      and _dummy35.edit_limit.text() == "777",
-      f"name={_dummy35.edit_profile_name.text()!r} "
+check("35 Z2b) _sync_profile_editor fuellt Limit aus aktivem Profil",
+      _dummy35.edit_limit.text() == "777",
       f"limit={_dummy35.edit_limit.text()!r}")
-check("35 Z2c) Name nicht leer -> Save loescht den Profilnamen NICHT",
-      _dummy35.edit_profile_name.text() != "", "")
-# Ohne aktives Profil -> Felder geleert (kein Haenger).
+# E5 (21.01): Name-/Beschreibungs-Felder sind aus dem Header entfernt;
+# Name/Beschreibung werden ausschliesslich im Speicher-Dialog editiert.
+# _resolve_save_name garantiert, dass ein leerer Name beim Speichern den
+# aktuellen Profilnamen erhaelt (kein '?'-Verlust).
+check("35 Z2c) Name nicht leer -> _resolve_save_name behaelt aktuellen Namen",
+      AnalyticsWindow._resolve_save_name("", "MeinProfil") == "MeinProfil"
+      and AnalyticsWindow._resolve_save_name("   ", "MeinProfil") == "MeinProfil"
+      and AnalyticsWindow._resolve_save_name("Neu", "MeinProfil") == "Neu",
+      "")
+# Ohne aktives Profil -> Limit auf Default (kein Haenger).
 _dummy35b = _DummyWin35(AnalyticsViewModel(analytics_repo=_repo35,
                                            profile_repo=_profile_repo35))
 AnalyticsWindow._sync_profile_editor(_dummy35b)
-check("35 Z2d) ohne aktives Profil: Felder leer",
-      _dummy35b.edit_profile_name.text() == ""
-      and _dummy35b.edit_profile_desc.text() == "",
-      f"name={_dummy35b.edit_profile_name.text()!r}")
+# Ohne aktives Profil gilt der VM-Default-Limit (DEFAULT_LIMIT=5000),
+# nicht der Stub-Fallback (der greift nur bei fehlendem params-Eintrag).
+check("35 Z2d) ohne aktives Profil: Limit auf VM-Default (5000)",
+      _dummy35b.edit_limit.text() == "5000",
+      f"limit={_dummy35b.edit_limit.text()!r}")
 
 shutil.rmtree(_tmp35, ignore_errors=True)
 
@@ -62583,7 +70573,621 @@ except Exception as _e2033:
     check("20.03.03-Check", False, str(_e2033))
 
 
+# ============================================================================
+# 39) 21.01 Analytics - Refactor & Smart Presets (11.08.2026)
+#     AK1 Mischfilter (Hash-Variante + Standalone) / AK2 NoData (Runde 16) /
+#     AK3+AK6 Namensgenerator (deutsch, E3) / AK4+AK7 TF-Matrix (E1) /
+#     AK5 Smart-Presets (E4/E6, kein Auto-Save) / Widget-Buttons (E6)
+# ----------------------------------------------------------------------------
+print("\n=== Teil 39: 21.01 Analytics - Refactor & Smart Presets ===")
+from analytics.engine.analytics_worker import (  # noqa: E402
+    AnalyticsAsyncWorker, QUERY_HEATMAP_GENERIC,
+)
+from analytics_profile_repository import (  # noqa: E402
+    AnalyticsProfileRepository as _APR39,
+)
+
+_tmp39 = tempfile.mkdtemp(prefix="p2101_",
+                          dir=os.path.dirname(os.path.abspath(__file__)))
+_db39_ana = os.path.join(_tmp39, "analytics.duckdb")
+_db39_app = os.path.join(_tmp39, "app_data.duckdb")
+
+# --- Testdaten: feature_store MIT instance_hash-Spalte (reales Schema) ------
+_c39 = duckdb.connect(_db39_ana)
+_c39.execute("""
+    CREATE TABLE feature_store (
+        symbol TEXT, timeframe TEXT, bar_time TIMESTAMPTZ,
+        feature_id TEXT, plugin_version TEXT, feature_data JSON,
+        created_at TIMESTAMPTZ, instance_hash TEXT
+    )
+""")
+#   srv_hash       -> Hash-Variante (instance_hash aabbccdd), M1
+#   srv_standalone -> Standalone (instance_hash NULL), M1 + M5 + H1
+#   srv_unflashed  -> registriert, aber KEINE Rows (NoData-Kandidat, AK2)
+_bt39 = datetime(2026, 8, 3, 10, 0, tzinfo=dt_timezone.utc)
+for _sid39, _fd39 in (("srv_hash", {"visit_pct": 50.0}),
+                      ("srv_standalone", {"grid_dist": 1.5})):
+    _h39 = "aabbccdd" if _sid39 == "srv_hash" else None
+    _c39.execute(
+        "INSERT INTO feature_store VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ["XAGUSD", "M1", _bt39, _sid39, "1.0.0",
+         _json17.dumps(_fd39), _bt39, _h39])
+# Standalone zusaetzlich M5 + H1 (fuer die TF-Matrix mit all_timeframes, E1).
+for _tf39 in ("M5", "H1"):
+    _c39.execute(
+        "INSERT INTO feature_store VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ["XAGUSD", _tf39, _bt39, "srv_standalone", "1.0.0",
+         _json17.dumps({"grid_dist": 1.5}), _bt39, None])
+_c39.close()
+
+_reader39 = FeatureStoreReader(_db39_ana)
+_repo39 = AnalyticsRepository(_reader39)
+_profile_repo39 = _APR39(_db39_app)
+
+# --- AK1: Mischfilter (Hash-Variante + Standalone in EINER Query) -----------
+_rows39 = _reader39.fetch_rows(
+    "XAGUSD", "M1",
+    feature_ids=["srv_hash", "srv_standalone"],
+    instance_hashes=["aabbccdd"])
+_fids39 = sorted({r["feature_id"] for r in _rows39})
+check("39 a1) AK1 Mischfilter: Hash-Variante + Standalone liefern beide Rows",
+      len(_rows39) == 2 and _fids39 == ["srv_hash", "srv_standalone"],
+      str(_fids39))
+
+# --- AK2: NoData (ungeflashtes Plugin trotz gecheckter Hashes, Runde 16) ----
+_nd39 = _reader39.resolve_no_data_variants(
+    "XAGUSD", "M1", {
+        "presets": {"srv_hash": [
+            {"preset_name": "V1", "instance_hash": "aabbccdd",
+             "is_archived": False}]},
+        "sets": [],
+        "standalone": ["srv_unflashed", "srv_standalone"],
+        "display_names": {"srv_hash|V1": "Hash / V1",
+                          "srv_unflashed|Default": "Unflashed",
+                          "srv_standalone|Default": "Standalone"},
+        "active_hashes": ["aabbccdd"],
+    })
+_nd_fids39 = sorted({v["plugin_id"] for v in _nd39})
+check("39 b1) AK2 NoData: ungeflashtes Plugin trotz aktiver Hashes als NoData",
+      "srv_unflashed" in _nd_fids39
+      and "srv_hash" not in _nd_fids39
+      and "srv_standalone" not in _nd_fids39,
+      str(_nd_fids39))
+check("39 b2) AK2 NoData: Standalone MIT Daten NICHT als NoData (Runde 16)",
+      "srv_standalone" not in _nd_fids39, str(_nd39))
+
+# --- AK4+AK7: TF-Matrix (E1: all_timeframes=True, EINE Query) ---------------
+_g39 = _repo39.get_generic_heatmap(
+    "XAGUSD", "M1", x_dim="timeframe", y_dim="service_id",
+    agg="count", all_timeframes=True)
+check("39 c1) AK7 TF-Matrix: all_timeframes liefert alle Zeitebenen (M1..H1)",
+      _g39["x_labels"] == ["h1", "m1", "m5"]
+      and sorted(_g39["y_labels"]) == ["srv_hash", "srv_standalone"],
+      str((_g39["x_labels"], _g39["y_labels"])))
+# Matrix: rows = y (service_id), cols = x (timeframe). srv_hash nur M1.
+_m39 = np.asarray(_g39["matrix"])
+check("39 c2) AK7 TF-Matrix: srv_hash nur M1-Zelle (1.0), Rest 0",
+      _m39[0].tolist() == [0.0, 1.0, 0.0],
+      str(_m39.tolist()))
+check("39 c3) AK7 TF-Matrix: srv_standalone in allen 3 TFs",
+      _m39[1].tolist() == [1.0, 1.0, 1.0], str(_m39.tolist()))
+# Reader direkt + Guard (E1): all_timeframes=True erlaubt leeren timeframe.
+_g39r = _reader39.fetch_generic_heatmap(
+    "XAGUSD", "M1", x_dim="timeframe", y_dim="service_id",
+    agg="count", all_timeframes=True)
+check("39 c4) AK7 Reader: all_timeframes=True -> 3 TFs in x_labels",
+      _g39r["x_labels"] == ["h1", "m1", "m5"], str(_g39r["x_labels"]))
+_g39r2 = _reader39.fetch_generic_heatmap(
+    "XAGUSD", "M1", x_dim="timeframe", y_dim="service_id",
+    agg="count", all_timeframes=False)
+check("39 c5) AK4 Reader: all_timeframes=False -> NUR M1",
+      _g39r2["x_labels"] == ["m1"], str(_g39r2["x_labels"]))
+_g39r3 = _reader39.fetch_generic_heatmap(
+    "XAGUSD", "", x_dim="timeframe", y_dim="service_id",
+    agg="count", all_timeframes=True)
+check("39 c6) AK7 E1: timeframe='' + all_timeframes=True kein Guard-Break",
+      _g39r3["x_labels"] == ["h1", "m1", "m5"], str(_g39r3["x_labels"]))
+
+# --- Worker-Dispatch: all_timeframes wird durchgereicht (E1) ----------------
+_w39 = AnalyticsAsyncWorker(_repo39, QUERY_HEATMAP_GENERIC, {
+    "symbol": "XAGUSD", "timeframe": "M1",
+    "x_dim": "timeframe", "y_dim": "service_id",
+    "agg": "count", "feature_ids": [], "all_timeframes": True,
+})
+_g39w = _w39._execute()
+check("39 c7) Worker: all_timeframes=True erreicht die Query (alle TFs)",
+      _g39w.get("x_labels") == ["h1", "m1", "m5"],
+      str(_g39w.get("x_labels")))
+
+# --- AK5: Smart-Presets (E4: Config + Dirty, KEIN Auto-Save) ----------------
+_vm39 = AnalyticsViewModel(analytics_repo=_repo39,
+                           profile_repo=_profile_repo39)
+_vm39.set_symbol("XAGUSD")
+_vm39.set_timeframe("M1")
+_vm39.set_feature_ids(["srv_hash", "srv_standalone"])
+_vm39.create_profile("P2101", "21.01 Testprofil")
+_pid39 = _vm39.active_profile["profile_id"]
+_pay_before39 = _profile_repo39.get_profile(_pid39)["payload"]
+
+# [⚡ Signal-Confluence]
+_vm39._pending_kinds.clear()
+_vm39._dirty = False
+_vm39.apply_smart_preset_confluence()
+_p39 = _vm39.params
+check("39 d1) AK5 Confluence: X=date, Y=service_id, confluence_count, TF an",
+      _p39["heatmap_x_dim"] == "date"
+      and _p39["heatmap_y_dim"] == "service_id"
+      and _p39["heatmap_agg"] == "confluence_count"
+      and _p39["heatmap_field"] == ""
+      and _p39["heatmap_all_timeframes"] is False,
+      str({k: _p39[k] for k in ("heatmap_x_dim", "heatmap_y_dim",
+                                "heatmap_agg", "heatmap_field",
+                                "heatmap_all_timeframes")}))
+check("39 d2) AK5 Confluence: Dirty-Flag + QUERY_HEATMAP_GENERIC gefeuert",
+      _vm39.is_dirty and QUERY_HEATMAP_GENERIC in _vm39._pending_kinds,
+      str((_vm39.is_dirty, _vm39._pending_kinds)))
+check("39 d3) AK5 kein Auto-Save: Profil-Payload unveraendert (Option B)",
+      _profile_repo39.get_profile(_pid39)["payload"] == _pay_before39, "")
+
+# [🕒 Session-Hotspots]
+_vm39._pending_kinds.clear()
+_vm39.apply_smart_preset_session()
+_p39 = _vm39.params
+check("39 e1) AK5 Session: X=dow, Y=hour, confluence_count, TF an",
+      _p39["heatmap_x_dim"] == "dow"
+      and _p39["heatmap_y_dim"] == "hour"
+      and _p39["heatmap_agg"] == "confluence_count"
+      and _p39["heatmap_all_timeframes"] is False,
+      str({k: _p39[k] for k in ("heatmap_x_dim", "heatmap_y_dim",
+                                "heatmap_agg", "heatmap_all_timeframes")}))
+
+# [📏 Wert-Intensität] (E2: X=date Standard, dow via Parameter)
+_vm39._pending_kinds.clear()
+_vm39.apply_smart_preset_intensity()
+_p39 = _vm39.params
+check("39 f1) AK5 Intensitaet: X=date, Y=hour, avg + erster numerischer Key",
+      _p39["heatmap_x_dim"] == "date"
+      and _p39["heatmap_y_dim"] == "hour"
+      and _p39["heatmap_agg"] == "avg"
+      and _p39["heatmap_field"] in ("grid_dist", "visit_pct")
+      and _p39["heatmap_all_timeframes"] is False,
+      str({k: _p39[k] for k in ("heatmap_x_dim", "heatmap_y_dim",
+                                "heatmap_agg", "heatmap_field",
+                                "heatmap_all_timeframes")}))
+_vm39.apply_smart_preset_intensity("dow")
+check("39 f2) AK5 E2: Intensitaet x_dim='dow' -> X=dow",
+      _vm39.params["heatmap_x_dim"] == "dow",
+      str(_vm39.params["heatmap_x_dim"]))
+
+# [📊 Service-Timeframe]
+_vm39._pending_kinds.clear()
+_vm39.apply_smart_preset_timeframe()
+_p39 = _vm39.params
+check("39 g1) AK5 Timeframe: X=timeframe, Y=service_id, count, all TFs an",
+      _p39["heatmap_x_dim"] == "timeframe"
+      and _p39["heatmap_y_dim"] == "service_id"
+      and _p39["heatmap_agg"] == "count"
+      and _p39["heatmap_field"] == ""
+      and _p39["heatmap_all_timeframes"] is True,
+      str({k: _p39[k] for k in ("heatmap_x_dim", "heatmap_y_dim",
+                                "heatmap_agg", "heatmap_field",
+                                "heatmap_all_timeframes")}))
+# Idempotenz (E4): erneuter Preset-Klick ohne echte Aenderung -> kein Dirty
+_vm39._pending_kinds.clear()
+_vm39._dirty = False
+_vm39.apply_smart_preset_timeframe()
+check("39 g2) AK5 idempotent: gleicher Preset -> kein Dirty/Refresh",
+      not _vm39.is_dirty and _vm39._pending_kinds == [],
+      str((_vm39.is_dirty, _vm39._pending_kinds)))
+# Payload-Persistenz (Option B: erst nach explizitem Save)
+_pay39 = _vm39._current_payload()
+check("39 g3) AK5 Payload: all_timeframes unter charts.heatmap persistiert",
+      (_pay39.get("charts") or {}).get("heatmap", {}).get(
+          "all_timeframes") is True,
+      str((_pay39.get("charts") or {}).get("heatmap")))
+check("39 g4) AK5 Payload: no data in Payload vor Save (kein Auto-Save)",
+      (_pay_before39.get("charts") or {}).get("heatmap", {}).get(
+          "all_timeframes") is not True,
+      str((_pay_before39.get("charts") or {}).get("heatmap")))
+_vm39.save_profile()
+_pay39s = _profile_repo39.get_profile(_pid39)["payload"]
+check("39 g5) AK5 Save: all_timeframes + TF-Matrix nach explizitem Save",
+      (_pay39s.get("charts") or {}).get("heatmap", {}).get(
+          "all_timeframes") is True
+      and (_pay39s.get("charts") or {}).get("heatmap", {}).get(
+          "x_dim") == "timeframe",
+      str((_pay39s.get("charts") or {}).get("heatmap")))
+# Restore-Roundtrip
+_vm39b = AnalyticsViewModel(analytics_repo=_repo39,
+                            profile_repo=_profile_repo39)
+_vm39b.set_active_profile(_pid39)
+_p39b = _vm39b.params
+check("39 g6) AK5 Restore: TF-Matrix-Config aus Profil restauriert",
+      _p39b["heatmap_all_timeframes"] is True
+      and _p39b["heatmap_x_dim"] == "timeframe"
+      and _p39b["heatmap_y_dim"] == "service_id",
+      str({k: _p39b.get(k) for k in ("heatmap_x_dim", "heatmap_y_dim",
+                                     "heatmap_agg",
+                                     "heatmap_all_timeframes")}))
+_vm39.shutdown()
+_vm39b.shutdown()
+
+# --- AK3+AK6: Auto-Namensgenerator (E3, DEUTSCH inkl. Fallbacks) ------------
+_vm_name39 = AnalyticsViewModel(analytics_repo=_repo39,
+                                profile_repo=_profile_repo39)
+_vm_name39.set_symbol("SILVER")
+_vm_name39.set_timeframe("M1")
+_vm_name39.set_feature_ids(["srv_a", "srv_b", "srv_c"])
+check("39 h1) AK3 Namensgenerator: Confluence Zeitachse (3 Services)",
+      _vm_name39.generate_profile_name_suggestion()
+      == "SILVER M1 - Confluence Zeitachse (3 Services)",
+      _vm_name39.generate_profile_name_suggestion())
+_vm_name39.apply_smart_preset_session()
+check("39 h2) AK3 Namensgenerator: Session-Hotspots-Modus",
+      _vm_name39.generate_profile_name_suggestion()
+      == "SILVER M1 - Session-Hotspots (3 Services)",
+      _vm_name39.generate_profile_name_suggestion())
+_vm_name39.apply_smart_preset_intensity()
+check("39 h3) AK3 Namensgenerator: Wert-Intensität-Modus",
+      _vm_name39.generate_profile_name_suggestion()
+      == "SILVER M1 - Wert-Intensität (3 Services)",
+      _vm_name39.generate_profile_name_suggestion())
+_vm_name39.apply_smart_preset_timeframe()
+check("39 h4) AK3 Namensgenerator: Service-Zeitebenen-Modus",
+      _vm_name39.generate_profile_name_suggestion()
+      == "SILVER M1 - Service-Zeitebenen (3 Services)",
+      _vm_name39.generate_profile_name_suggestion())
+# AK6: 0 Auswahlen -> (Alle Services); fehlendes Symbol/TF -> ALLE
+_vm_name39.set_feature_ids([])
+check("39 i1) AK6 Namensgenerator: 0 Auswahlen -> '(Alle Services)'",
+      _vm_name39.generate_profile_name_suggestion()
+      == "SILVER M1 - Service-Zeitebenen (Alle Services)",
+      _vm_name39.generate_profile_name_suggestion())
+_vm_name39._params["symbol"] = ""
+_vm_name39._params["timeframe"] = ""
+check("39 i2) AK6 Namensgenerator: fehlendes Symbol/TF -> 'ALLE ALLE'",
+      _vm_name39.generate_profile_name_suggestion()
+      == "ALLE ALLE - Service-Zeitebenen (Alle Services)",
+      _vm_name39.generate_profile_name_suggestion())
+_vm_name39.shutdown()
+
+# --- E7/E8: Preset-Buttons entfernt + row-major-Orientierung (11.08.2026)
+try:
+    from analytics.ui.heatmap_widget import HeatmapWidget  # noqa: E402
+
+    _w39e = HeatmapWidget()
+    check("39 j1) E7: 4 Preset-Buttons entfernt (nur Ansicht-Dropdown)",
+          not hasattr(_w39e, "_btn_preset_confluence")
+          and not hasattr(_w39e, "_btn_preset_session")
+          and not hasattr(_w39e, "_btn_preset_intensity")
+          and not hasattr(_w39e, "_btn_preset_timeframe"),
+          "Preset-Buttons duerfen nicht mehr existieren")
+    # E8: row-major -> (rows=Services, cols=Zeiten) 1:1 auf die Zellen
+    # (width()=Spalten, height()=Zeilen; col-major haette sie vertauscht).
+    check("39 j2) E8: ImageItem axisOrder='row-major' (keine Transposition)",
+          _w39e._image.axisOrder == "row-major",
+          str(getattr(_w39e._image, "axisOrder", None)))
+except Exception as _e39j:
+    check("39 j-Check", False, str(_e39j))
+
+# --- E4: Preset-Klick wechselt in den generischen Modus (HeatmapPage) -------
+try:
+    from analytics.ui.heatmap_page import HeatmapPage  # noqa: E402
+
+    _page39 = HeatmapPage()
+
+    class _FakeVM2101b:
+        """Mini-ViewModel fuer die HeatmapPage (attach_view_model-Bedarf)."""
+
+        class _Sig:
+            def connect(self, slot):
+                pass
+
+        data_ready = _Sig()
+
+        def __init__(self):
+            self.params = {
+                "heatmap_x_dim": "date", "heatmap_y_dim": "hour",
+                "heatmap_agg": "confluence_count",
+                "heatmap_field": "", "heatmap_metric": "count",
+                "candle_projection_enabled": False,
+                "zoom_x_range": [0.0, 1.0], "zoom_y_range": [0.0, 1.0],
+                "feature_ids": [], "instance_hashes": [],
+            }
+
+        def heatmap_metrics(self, symbol, timeframe):
+            return ["count"]
+
+        def request_heatmap(self):
+            pass
+
+        def request_heatmap_generic(self):
+            pass
+
+        def request_ohlcv_snapshot(self):
+            pass
+
+    _page39.attach_view_model(_FakeVM2101b())
+    _page39.set_mode("standard")
+    # 21.01 (Meldung 2): Legacy-"standard" wird auf "generic" gemappt.
+    check("39 k0) Meldung 2: set_mode('standard') -> generic (Legacy-Mapping)",
+          _page39.mode_id == "generic"
+          and _page39._stack_modes.currentIndex() == 1,
+          str(_page39.mode_id))
+    # E7 (11.08.2026): Das Signal wird von der Page nicht mehr konsumiert
+    # (keine Preset-Buttons mehr im Widget) - ein (theoretischer) Emit
+    # aendert den Modus NICHT mehr.
+    _page39._generic.preset_clicked.emit("timeframe")
+    check("39 k1) E7: preset_clicked wird von der Page nicht konsumiert",
+          _page39.mode_id == "generic"
+          and _page39._stack_modes.currentIndex() == 1,
+          str(_page39.mode_id))
+except Exception as _e39k:
+    check("39 k-Check", False, str(_e39k))
+
+# --- 21.01 User-Meldungen 2-7: Ansicht-Dropdown, Preset-Anwendung, --------
+#     Overlay-nur-X=date, daten-gebundene Confluence-Levels (11.08.2026)
+try:
+    import pyqtgraph as pg  # noqa: E402
+    from analytics.ui.heatmap_widget import HeatmapWidget  # noqa: E402
+    from analytics.ui.heatmap_page import HeatmapPage  # noqa: E402
+
+    class _FakeVM2101c:
+        """Mini-ViewModel fuer Dropdown-/Render-Checks (Meldungen 2-7)."""
+
+        class _Sig:
+            def connect(self, slot):
+                pass
+
+        data_ready = _Sig()
+
+        def __init__(self):
+            self.calls = []
+            self.params = {
+                "heatmap_x_dim": "date", "heatmap_y_dim": "hour",
+                "heatmap_agg": "confluence_count", "heatmap_field": "",
+                "candle_projection_enabled": False,
+                "zoom_x_range": [0.0, 1.0], "zoom_y_range": [0.0, 1.0],
+                "feature_ids": [], "instance_hashes": [],
+            }
+
+        def heatmap_metrics(self, symbol, timeframe):
+            return ["count", "confluence_count"]
+
+        def request_features(self):
+            pass
+
+        def request_heatmap_generic(self):
+            pass
+
+        def request_daily_ohlc(self):
+            pass
+
+        def request_ohlcv_snapshot(self):
+            pass
+
+        def set_candle_projection(self, enabled):
+            self.params["candle_projection_enabled"] = bool(enabled)
+
+        def set_heatmap_config(self, x_dim, y_dim, field, agg):
+            self.params.update({
+                "heatmap_x_dim": x_dim, "heatmap_y_dim": y_dim,
+                "heatmap_field": field, "heatmap_agg": agg})
+
+        def apply_smart_preset_confluence(self):
+            self.calls.append("confluence")
+            self.params.update({"heatmap_x_dim": "date",
+                                "heatmap_y_dim": "service_id",
+                                "heatmap_agg": "confluence_count",
+                                "heatmap_field": ""})
+
+        def apply_smart_preset_session(self):
+            self.calls.append("session")
+            self.params.update({"heatmap_x_dim": "dow",
+                                "heatmap_y_dim": "hour",
+                                "heatmap_agg": "confluence_count",
+                                "heatmap_field": ""})
+
+        def apply_smart_preset_intensity(self):
+            self.calls.append("intensity")
+            self.params.update({"heatmap_x_dim": "date",
+                                "heatmap_y_dim": "hour",
+                                "heatmap_agg": "avg",
+                                "heatmap_field": "grid_dist"})
+
+        def apply_smart_preset_timeframe(self):
+            self.calls.append("timeframe")
+            self.params.update({"heatmap_x_dim": "timeframe",
+                                "heatmap_y_dim": "service_id",
+                                "heatmap_agg": "count",
+                                "heatmap_field": ""})
+
+    _vm39c = _FakeVM2101c()
+    _page39b = HeatmapPage()
+    _page39b.attach_view_model(_vm39c)
+    # m1) Meldung 2: Dropdown-Kontrakt = Generisch + 4 Presets, kein Standard
+    _d39 = [_page39b._combo_mode.itemData(i)
+            for i in range(_page39b._combo_mode.count())]
+    check("39 m1) Meldung 2: Ansicht-Dropdown = Generisch + 4 Presets",
+          _d39 == ["generic", "preset_confluence", "preset_session",
+                   "preset_intensity", "preset_timeframe"]
+          and _page39b._combo_mode.findData("standard") < 0,
+          str(_d39))
+    # m2) Meldung 3: Preset-Dropdown wendet Preset an, Controls bleiben sichtbar
+    _page39b._combo_mode.setCurrentIndex(
+        _page39b._combo_mode.findData("preset_session"))
+    check("39 m2) Meldung 3: Preset-Dropdown + Stale-Combo-Sync (4/6-Fix)",
+          _vm39c.calls[-1] == "session"
+          and _page39b.mode_id == "preset_session"
+          and _page39b._stack_modes.currentIndex() == 1
+          and _page39b._generic._combo_x.currentData() == "dow"
+          and _page39b._generic._combo_y.currentData() == "hour"
+          and _page39b._generic._combo_agg.currentData()
+          == "confluence_count",
+          str((_vm39c.calls, _page39b.mode_id,
+               _page39b._generic._combo_x.currentData(),
+               _page39b._generic._combo_y.currentData(),
+               _page39b._generic._combo_agg.currentData())))
+    # m3) Meldung 5: Kerzen-Overlay nur bei X=date aktivierbar
+    _w39m = HeatmapWidget()
+    _w39m._view_model = _FakeVM2101c()
+    _w39m._set_combo_data(_w39m._combo_x, "date")
+    _w39m._set_combo_data(_w39m._combo_y, "hour")
+    _w39m._update_controls()
+    _ok39_xdate = _w39m._chk_candle.isEnabled()
+    _w39m._chk_candle.setChecked(True)
+    _w39m._set_combo_data(_w39m._combo_x, "hour")   # X verlaesst date
+    _w39m._set_combo_data(_w39m._combo_y, "date")
+    _w39m._on_config_changed()                      # Guard: unchecken + Link weg
+    check("39 m3) Meldung 5: Overlay nur bei X=date - sonst deaktiviert/aus",
+          _ok39_xdate
+          and not _w39m._chk_candle.isEnabled()
+          and not _w39m._chk_candle.isChecked()
+          and _w39m._price_vb.linkedView(pg.ViewBox.XAxis) is None,
+          str((_ok39_xdate, _w39m._chk_candle.isEnabled(),
+               _w39m._chk_candle.isChecked())))
+    # m4) Meldung 7: Confluence-Levels daten-gebunden (0..vmax statt 0..5)
+    _w39r = HeatmapWidget()
+    _w39r._view_model = _FakeVM2101c()
+    _w39r._render_generic({
+        "matrix": [[0.0, 1.0, 2.0], [0.5, 0.0, 3.0]],
+        "x_dim": "date", "y_dim": "hour",
+        "x_axis": [1720000000.0, 1720086400.0, 1720172800.0],
+        "y_axis": [0.0, 1.0],
+        "x_values": ["2026-08-03", "2026-08-04", "2026-08-05"],
+        "agg": "confluence_count",
+        "metrics": ["count", "confluence_count"],
+        "field_sources": {},
+    })
+    _lev39 = tuple(float(x) for x in _w39r._image.levels)
+    check("39 m4) Meldung 7: Confluence-Levels daten-gebunden (0..vmax=3)",
+          _lev39 == (0.0, 3.0), str(_lev39))
+    # m4b) Meldung 7: Nur-Null-Daten -> Fallback-Levels 0..1
+    _w39r2 = HeatmapWidget()
+    _w39r2._view_model = _FakeVM2101c()
+    _w39r2._render_generic({
+        "matrix": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        "x_dim": "date", "y_dim": "hour",
+        "x_axis": [1720000000.0, 1720086400.0, 1720172800.0],
+        "y_axis": [0.0, 1.0],
+        "x_values": ["2026-08-03", "2026-08-04", "2026-08-05"],
+        "agg": "confluence_count",
+        "metrics": ["count", "confluence_count"],
+        "field_sources": {},
+    })
+    _lev39b = tuple(float(x) for x in _w39r2._image.levels)
+    check("39 m4b) Meldung 7: Confluence-Levels Fallback bei nur-Null (0..1)",
+          _lev39b == (0.0, 1.0), str(_lev39b))
+    # m5) Meldung 5+7: Restore mit candle_projection + Y=date -> Checkbox aus
+    _vm39d = _FakeVM2101c()
+    _vm39d.params.update({"heatmap_x_dim": "hour", "heatmap_y_dim": "date",
+                          "candle_projection_enabled": True})
+    _w39s = HeatmapWidget()
+    _w39s._view_model = _vm39d
+    _w39s._sync_from_params()
+    check("39 m5) Meldung 5: Restore Overlay+Y=date -> Checkbox aus",
+          not _w39s._chk_candle.isChecked()
+          and not _w39s._chk_candle.isEnabled(),
+          str((_w39s._chk_candle.isChecked(),
+               _w39s._chk_candle.isEnabled())))
+except Exception as _e39m:
+    check("39 m-Check", False, str(_e39m))
+
+shutil.rmtree(_tmp39, ignore_errors=True)
+
+# --- 21.01 Bugfix-Runde 2 (11.08.2026): Clamping/Legende/Crosshair/ -----
+#     Datumsformate 1:1 LWC-JS + adaptives OHLCV-Overlay
+try:
+    from datetime import datetime as _dt40, timezone as _dt_tz40
+    from analytics.ui.heatmap_widget import (
+        HeatmapWidget, _HeatmapAxis, _CONFLUENCE_COLORS)
+
+    # Bug 1: Kategoriale Achse clampt (keine -1/+2-Gespenster-Ticks)
+    _ax40 = _HeatmapAxis("left")
+    _ax40.configure("service_id", ["srv_a", "srv_b"])
+    _res40 = _ax40.tickValues(-1.5, 2.5, 800)
+    _vals40 = _res40[0][1] if _res40 else []
+    _str40 = _ax40.tickStrings(_vals40, 1.0, 1.0)
+    check("40 b1) Bug 1: Kategoriale Achse clampt (nur 0..n-1)",
+          _vals40 == [0.0, 1.0] and _str40 == ["srv_a", "srv_b"],
+          str((_vals40, _str40)))
+
+    # Bug 2: 0 = grau (sichtbar auf weiss)
+    check("40 b2) Bug 2: Confluence-0-Farbe = grau",
+          _CONFLUENCE_COLORS[0] == "#d9d9d9",
+          str(_CONFLUENCE_COLORS[0]))
+
+    # Bug 4: Datumsformate 1:1 mit der App-JS (TT.MM.JJ / HH:MM)
+    _ax40d = _HeatmapAxis("bottom")
+    _ax40d.configure("date", [])
+    def _e40(y, m, d, h=0, mi=0):
+        return _dt40(y, m, d, h, mi, tzinfo=_dt_tz40.utc).timestamp()
+    _days40 = ("Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa.", "So.")
+    def _fmt40(y, m, d):
+        dt40 = _dt40(y, m, d, tzinfo=_dt_tz40.utc)
+        return f"{_days40[dt40.weekday()]} {d:02d}.{m:02d}.{y % 100:02d}"
+    check("40 b4) R3: Tag-Format 'Mo. 12.06.26'",
+          _ax40d._format(_e40(2026, 1, 1), 1.0) == _fmt40(2026, 1, 1)
+          and _ax40d._format(_e40(2026, 2, 1), 1.0) == _fmt40(2026, 2, 1)
+          and _ax40d._format(_e40(2026, 2, 2), 1.0) == _fmt40(2026, 2, 2),
+          str([_ax40d._format(_e40(2026, m, d), 1.0)
+               for (m, d) in [(1, 1), (2, 1), (2, 2)]]))
+    check("40 b4b) Bug 4: Sub-Tag HH:MM (JS-konform)",
+          _ax40d._format(_e40(2026, 2, 3, 14, 0), 1.0) == "14:00"
+          and _ax40d._format(_e40(2026, 2, 3, 14, 30), 1.0) == "14:30",
+          str([_ax40d._format(_e40(2026, 2, 3, 14, m), 1.0)
+               for m in (0, 30)]))
+
+    # Bug 3: Fadenkreuz vorhanden + initial versteckt
+    _w40c = HeatmapWidget()
+    check("40 b3) Bug 3: Fadenkreuz-Linien (initial versteckt)",
+          hasattr(_w40c, "_cross_x") and hasattr(_w40c, "_cross_y")
+          and not _w40c._cross_x.isVisible()
+          and not _w40c._cross_y.isVisible())
+
+    # Bug 5: Adaptives OHLCV-Overlay (H1 -> 3600s)
+    _w40b = HeatmapWidget()
+    _w40b._view_model = _FakeVM2101c()
+    _w40b._view_model.params["timeframe"] = "H1"
+    check("40 b5) Bug 5: Bar-Intervall H1 = 3600s (adaptiv)",
+          _w40b._bar_interval_seconds() == 3600.0,
+          str(_w40b._bar_interval_seconds()))
+    _w40b._render_generic({
+        "matrix": [[0.0, 1.0], [2.0, 3.0]],
+        "x_dim": "date", "y_dim": "hour",
+        "x_axis": [1775606400.0, 1775692800.0],
+        "y_axis": [0.0, 1.0],
+        "x_values": ["2026-04-08", "2026-04-09"],
+        "agg": "confluence_count",
+        "metrics": ["count", "confluence_count"],
+        "field_sources": {},
+    })
+    _w40b._render_overlay({
+        "bars": [{"time": int(1775606400 + h * 3600),
+                   "open": 100.0, "high": 102.0,
+                   "low": 99.0, "close": 101.0}
+                  for h in range(0, 4)]})
+    check("40 b5b) R3: H1-Overlay batched (3 Items, numpy)",
+          len(_w40b._candle_items) == 3
+          and len(_w40b._candle_items[0].opts["x"]) == 4
+          and _w40b._price_vb.isVisible(),
+          str((len(_w40b._candle_items),
+               _w40b._candle_items[0].opts["x"]
+               if _w40b._candle_items else None,
+               _w40b._price_vb.isVisible())))
+    # Bugfix 2a: Senkrechte Teiler je Dateneinheit (H1 -> 3600s)
+    _gd40 = _w40b._grid_lines.getData()
+    check("40 b2a) R3: Senkrechte Teiler vorhanden (H1)",
+          _w40b._grid_lines.isVisible()
+          and _gd40[0] is not None and len(_gd40[0]) >= 4,
+          str(_gd40[0].size if _gd40[0] is not None else 0))
+    _w40b._clear_overlay()
+except Exception as _e40:
+    check("40-Check", False, str(_e40))
+
+
 if FAILURES:
+
     print(f"FEHLER: {len(FAILURES)}: {FAILURES}")
     sys.exit(1)
 print("ALLE PRUEFUNGEN BESTANDEN (OK)")
