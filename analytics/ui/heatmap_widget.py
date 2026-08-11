@@ -92,12 +92,13 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QRectF, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QHBoxLayout,
     QLabel,
+    QPushButton,
     QSizePolicy,
     QSlider,
     QVBoxLayout,
@@ -467,6 +468,10 @@ class _HeatmapAxis(pg.AxisItem):
 class HeatmapWidget(QWidget):
     """Generische 2D-Heatmap mit Confluence-Matrix, Zoom & Candle-Overlay."""
 
+    # 21.01 (E4, 11.08.2026): Preset-Klick – die HeatmapPage schaltet damit
+    # sicher in den generischen Modus (idempotent, siehe heatmap_page.py).
+    preset_clicked = Signal(str)
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._view_model = None
@@ -535,7 +540,23 @@ class HeatmapWidget(QWidget):
         ctrl.addWidget(self._combo_x)
         ctrl.addWidget(QLabel("Y-Achse:"))
         ctrl.addWidget(self._combo_y)
+        # 21.01 (E4/E6, 11.08.2026): Smart-Preset-Buttons DIREKT in der
+        # ctrl-Zeile (Ist-Zustand: keine QToolBar), rechtsbuendig hinter
+        # dem Stretch. Icons/Labels 1:1 (E6). Die Buttons rufen die
+        # ViewModel-Preset-Methoden auf (Konfiguration + Dirty-Flag, Option
+        # B) und emittieren `preset_clicked` (die HeatmapPage wechselt
+        # damit in den generischen Modus).
         ctrl.addStretch(1)
+        self._btn_preset_confluence = QPushButton("⚡ Signal-Confluence")
+        self._btn_preset_session = QPushButton("🕒 Session-Hotspots")
+        self._btn_preset_intensity = QPushButton("📏 Wert-Intensität")
+        self._btn_preset_timeframe = QPushButton("📊 Service-Timeframe")
+        for _b in (self._btn_preset_confluence, self._btn_preset_session,
+                   self._btn_preset_intensity, self._btn_preset_timeframe):
+            _b.setToolTip("1-Klick-Belegung der Heatmap-Achsen/"
+                          "Aggregationen (Smart Preset, Option B – "
+                          "kein Auto-Save).")
+            ctrl.addWidget(_b)
 
         # --- Steuerung (Zeile 2: Overlay + Zoom) ---
         self._chk_candle = QCheckBox("Kerzen-Overlay")
@@ -632,6 +653,47 @@ class HeatmapWidget(QWidget):
         self._chk_candle.toggled.connect(self._on_candle_toggled)
         self._slider_zoom_x.valueChanged.connect(self._on_zoom_x_changed)
         self._slider_zoom_y.valueChanged.connect(self._on_zoom_y_changed)
+        # 21.01 (E4, 11.08.2026): Smart-Preset-Buttons -> ViewModel.
+        self._btn_preset_confluence.clicked.connect(
+            self._on_preset_confluence)
+        self._btn_preset_session.clicked.connect(self._on_preset_session)
+        self._btn_preset_intensity.clicked.connect(self._on_preset_intensity)
+        self._btn_preset_timeframe.clicked.connect(self._on_preset_timeframe)
+
+    # ------------------------------------------------------------------
+    # 21.01 (E4/E6): Smart-Preset-Buttons
+    # ------------------------------------------------------------------
+    def _on_preset_confluence(self) -> None:
+        """`[⚡ Signal-Confluence]` – siehe ViewModel-Methode (E4)."""
+        if self._view_model is None:
+            return
+        self.preset_clicked.emit("confluence")
+        self._view_model.apply_smart_preset_confluence()
+        self.request_data()
+
+    def _on_preset_session(self) -> None:
+        """`[🕒 Session-Hotspots]` – siehe ViewModel-Methode (E4)."""
+        if self._view_model is None:
+            return
+        self.preset_clicked.emit("session")
+        self._view_model.apply_smart_preset_session()
+        self.request_data()
+
+    def _on_preset_intensity(self) -> None:
+        """`[📏 Wert-Intensität]` – X=date (Standard), Y=hour (E2/E4)."""
+        if self._view_model is None:
+            return
+        self.preset_clicked.emit("intensity")
+        self._view_model.apply_smart_preset_intensity()
+        self.request_data()
+
+    def _on_preset_timeframe(self) -> None:
+        """`[📊 Service-Timeframe]` – alle Zeitebenen M1..D1 (E1/E4)."""
+        if self._view_model is None:
+            return
+        self.preset_clicked.emit("timeframe")
+        self._view_model.apply_smart_preset_timeframe()
+        self.request_data()
 
     # ------------------------------------------------------------------
     # MVVM-Anbindung (von der HeatmapPage gesetzt)

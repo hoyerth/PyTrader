@@ -201,6 +201,9 @@ class AnalyticsAsyncWorker(QThread):
                 # Auswertung im selben Worker (kein separater
                 # QUERY_FEATURES-Roundtrip mehr).
                 presets_data=p.get("presets_data") or None,
+                # 21.01 (E1, 11.08.2026): TF-Freigabe fuer Timeframe-Matrizen
+                # (Preset `[📊 Service-Timeframe]`) – Bool aus den Params.
+                all_timeframes=bool(p.get("all_timeframes", False)),
             )
         if self._query_kind == QUERY_OHLCV:
             # 20.02 (E9): OHLCV-Snapshot fuer das Candle-Overlay – limit=None

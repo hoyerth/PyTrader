@@ -31,6 +31,9 @@ from PySide6.QtCore import QTimer, Qt, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -40,6 +43,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QStackedWidget,
     QVBoxLayout,
@@ -258,18 +262,19 @@ class AnalyticsWindow(PersistentWindow):
         root.setSpacing(6)
 
         # --- Top-Bar: Profil-CRUD (Option B – Explicit Save) ---
+        # 21.01 (E5, 11.08.2026): combo_profile dehnbar (Expanding,
+        # min. 350 px, editierbar); Namens-/Beschreibungs-Felder wandern in
+        # den separaten Speicher-Dialog (_on_profile_save). label_dirty +
+        # Buttons streng rechtsbuendig (addStretch davor).
         top = QHBoxLayout()
         self.combo_profile = QComboBox()
-        self.combo_profile.setMinimumWidth(160)
-        self.edit_profile_name = QLineEdit()
-        self.edit_profile_name.setPlaceholderText("Profil-Name")
-        self.edit_profile_name.setMaximumWidth(180)
-        self.edit_profile_desc = QLineEdit()
-        self.edit_profile_desc.setPlaceholderText("Beschreibung (optional)")
-        self.edit_profile_desc.setMaximumWidth(200)
-        self.btn_profile_new = QPushButton("Neu")
-        self.btn_profile_save = QPushButton("💾 Save")
-        self.btn_profile_delete = QPushButton("Löschen")
+        self.combo_profile.setMinimumWidth(350)
+        self.combo_profile.setEditable(True)
+        self.combo_profile.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.btn_profile_new = QPushButton("➕ Neu")
+        self.btn_profile_save = QPushButton("💾 Speichern")
+        self.btn_profile_delete = QPushButton("🗑️ Löschen")
         self.label_dirty = QLabel("")
         self.label_dirty.setStyleSheet("color: #e65100; font-weight: bold;")
         self.progress_busy = QProgressBar()
@@ -278,14 +283,12 @@ class AnalyticsWindow(PersistentWindow):
         self.progress_busy.setVisible(False)
 
         top.addWidget(QLabel("Profil:"))
-        top.addWidget(self.combo_profile)
-        top.addWidget(self.edit_profile_name)
-        top.addWidget(self.edit_profile_desc)
+        top.addWidget(self.combo_profile, 1)
+        top.addStretch(1)
+        top.addWidget(self.label_dirty)
         top.addWidget(self.btn_profile_new)
         top.addWidget(self.btn_profile_save)
         top.addWidget(self.btn_profile_delete)
-        top.addWidget(self.label_dirty)
-        top.addStretch(1)
         top.addWidget(self.progress_busy)
         root.addLayout(top)
 
@@ -905,14 +908,12 @@ class AnalyticsWindow(PersistentWindow):
     def _on_active_profile_changed(
         self, profile: Optional[Dict[str, Any]]
     ) -> None:
+        # 21.01 (E5): Name-/Beschreibungs-Felder leben im Speicher-Dialog
+        # (kein Header-Edit mehr) – hier nur noch die Combo + Filter-Sync.
         if profile is None:
-            self.edit_profile_name.clear()
-            self.edit_profile_desc.clear()
             self._active_display_names = []
             self._sync_service_filter_button()
             return
-        self.edit_profile_name.setText(profile.get("name") or "")
-        self.edit_profile_desc.setText(profile.get("description") or "")
         pid = profile.get("profile_id")
         idx = self.combo_profile.findData(pid)
         if idx >= 0 and self.combo_profile.currentIndex() != idx:
@@ -972,26 +973,33 @@ class AnalyticsWindow(PersistentWindow):
         self._refresh_timeframe_combo(symbol)
 
     def _sync_profile_editor(self) -> None:
-        """Synchronisiert Name-/Beschreibungs-/Limit-Felder mit dem VM (Bugfix).
+        """Synchronisiert das Limit-Feld mit dem VM (Bugfix).
 
         Wird beim App-Start nach `load_profiles()` gerufen: Dort emittiert der
         ViewModel KEIN `active_profile_changed` (nur set_active_profile/
-        create_profile) – die edit-Felder blieben sonst leer. Ein leerer
-        `edit_profile_name` wuerde beim ersten Save als `name=''` persistiert
-        werden (die Combo zeigt dann '?'). Ohne aktives Profil werden die
-        Felder geleert; das Limit-Feld wird mit dem VM-Wert synchronisiert.
+        create_profile) – das Limit-Feld bliebe sonst auf dem Default, obwohl
+        das aktive Profil einen abweichenden Wert haben kann.
+        21.01 (E5): Die Namens-/Beschreibungs-Felder existieren nicht mehr im
+        Header – Name/Beschreibung werden ausschliesslich im Speicher-Dialog
+        editiert (dort mit den aktuellen Profilwerten vorbelegt).
         """
-        active = self._vm.active_profile
-        if active:
-            self.edit_profile_name.setText(active.get("name") or "")
-            self.edit_profile_desc.setText(active.get("description") or "")
-        else:
-            self.edit_profile_name.clear()
-            self.edit_profile_desc.clear()
         if hasattr(self, "edit_limit"):
             self.edit_limit.setText(
                 str(int(self._vm.params.get("limit")
                         or self._default_limit)))
+
+    @staticmethod
+    def _resolve_save_name(name: str, current_name: str) -> str:
+        """Leerer Name beim Speichern -> aktueller Profilname (E5).
+
+        21.01 (E5): Die Header-Namensfelder sind entfernt; der Speicher-
+        Dialog wird mit dem aktuellen Profilnamen vorbelegt. Laesst der
+        Anwender das Feld leer (bzw. nur Whitespace), bleibt der
+        bestehende Profilname erhalten – kein '?'-Verlust in der Combo
+        (Bugfix 19.05/19.06-Semantik, jetzt im Dialog statt Header-Feld).
+        """
+        return (str(name or "").strip()
+                or str(current_name or "").strip() or "")
 
     @Slot(bool)
     def _on_dirty_changed(self, dirty: bool) -> None:
@@ -1017,7 +1025,15 @@ class AnalyticsWindow(PersistentWindow):
 
     @Slot()
     def _on_profile_new(self) -> None:
-        name, ok = QInputDialog.getText(self, "Neues Profil", "Profil-Name:")
+        # 21.01 (E3): Auto-Namensgenerator – das Eingabefeld wird mit dem
+        # Vorschlag vorausgefuellt (deutsch, Fallbacks; kein leeres Feld).
+        suggested = ""
+        try:
+            suggested = self._vm.generate_profile_name_suggestion() or ""
+        except Exception:
+            suggested = ""
+        name, ok = QInputDialog.getText(
+            self, "Neues Profil", "Profil-Name:", text=suggested)
         name = (name or "").strip()
         if not ok or not name:
             return
@@ -1035,18 +1051,41 @@ class AnalyticsWindow(PersistentWindow):
 
     @Slot()
     def _on_profile_save(self) -> None:
-        """Explicit Save: Name/Beschreibung + aktuelle Parameter persistieren."""
+        """Explicit Save: Name/Beschreibung + aktuelle Parameter persistieren.
+
+        21.01 (E5): Name und Beschreibung werden im SEPARATEN Speicher-Dialog
+        mit den aktuellen Profilwerten vorbelegt (die Header-Edit-Felder sind
+        entfernt). Ohne Namensaenderung bleibt der bestehende Name erhalten
+        (kein '?'-Verlust).
+        """
         if self._vm.active_profile is None:
             return
         # 20.01: save_profile() bestaetigt die aktuelle Datenquellen-Wahl ->
         # Warn-Label (fehlende Services) zuruecksetzen.
         self.label_missing_warning.setVisible(False)
         pid = self._vm.active_profile["profile_id"]
-        self._vm.update_profile(
-            pid,
-            name=self.edit_profile_name.text(),
-            description=self.edit_profile_desc.text(),
-        )
+        current_name = (self._vm.active_profile.get("name") or "").strip()
+        current_desc = (self._vm.active_profile.get("description")
+                        or "").strip()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Profil speichern")
+        form = QFormLayout(dialog)
+        edit_name = QLineEdit(current_name)
+        edit_desc = QLineEdit(current_desc)
+        edit_desc.setPlaceholderText("Beschreibung (optional)")
+        form.addRow("Name:", edit_name)
+        form.addRow("Beschreibung:", edit_desc)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Speichern")
+        form.addRow(buttons)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        name = self._resolve_save_name(edit_name.text(), current_name)
+        desc = (edit_desc.text() or "").strip()
+        self._vm.update_profile(pid, name=name, description=desc)
         # 10.08.2026 (Punkte 3/4): UI-Layout (Seite + Heatmap-Modus) in das
         # Profil persistieren (save_profile ruft _current_payload).
         self._vm.set_ui_layout(self._current_ui_layout())

@@ -209,12 +209,20 @@ class AnalyticsRepository:
         # Auswertung im selben Worker (kein separater QUERY_FEATURES-
         # Roundtrip mehr; Payload-Attribut no_data_variants).
         presets_data: Optional[Dict[str, Any]] = None,
+        # 21.01 (E1, 11.08.2026): TF-Freigabe fuer Timeframe-Matrizen
+        # (Preset `[📊 Service-Timeframe]`) – wird an den Reader gereicht.
+        all_timeframes: bool = False,
     ) -> Dict[str, Any]:
         """Generische 2D-Matrix (freie Dimensionen + Aggregationen, 20.02).
 
         Additiv zur bestehenden get_heatmap() (Dow×Stunde bleibt Standard).
         Wanduhr-Garantie (Invariante 7 / E4) wie fetch_heatmap – die
         Extraktion erfolgt im Reader mit `bar_time AT TIME ZONE 'UTC'`.
+
+        21.01 (E1): `all_timeframes=True` entfaellt die TF-WHERE-Bedingung –
+        Grundlage des Presets `[📊 Service-Timeframe]` (X = `timeframe`,
+        Y = `service_id`, agg = `count`). `timeframe` bleibt fuer den
+        Normalpfad erhalten.
 
         Returns:
             {
@@ -250,6 +258,7 @@ class AnalyticsRepository:
                 symbol, timeframe, x_dim, y_dim, field=use_field or None,
                 agg=use_agg, feature_id=feature_id, feature_ids=feature_ids,
                 instance_hashes=instance_hashes, limit=limit,
+                all_timeframes=all_timeframes,
             )
         except ValueError as e:
             print(f"WARN [AnalyticsRepository] get_generic_heatmap: {e}")

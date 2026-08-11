@@ -136,6 +136,11 @@ class AnalyticsViewModel(QObject):
             "heatmap_y_dim": "hour",
             "heatmap_field": "",
             "heatmap_agg": "confluence_count",
+            # 21.01 (E1, 11.08.2026): TF-Freigabe – True entfaellt die
+            # TF-WHERE-Bedingung der generischen Heatmap (Preset
+            # `[📊 Service-Timeframe]`: alle Zeitebenen M1..D1 in EINER
+            # Query). Persistiert im Profil-Payload (charts.heatmap).
+            "heatmap_all_timeframes": False,
             "candle_projection_enabled": False,
             "zoom_x_range": [0.0, 1.0],
             "zoom_y_range": [0.0, 1.0],
@@ -420,6 +425,105 @@ class AnalyticsViewModel(QObject):
         self._mark_dirty()
         self._refresh((QUERY_HEATMAP_GENERIC,))
 
+    # ------------------------------------------------------------------
+    # 21.01: Smart-Presets (E4, 11.08.2026)
+    # ------------------------------------------------------------------
+    def _set_heatmap_all_timeframes(self, enabled: bool) -> None:
+        """Setzt die TF-Freigabe der generischen Heatmap (21.01, E1).
+
+        Idempotent ohne Aenderung; Dirty-Flag + Refresh nur bei echtem
+        Wechsel (Muster set_heatmap_config).
+        """
+        enabled = bool(enabled)
+        if enabled == self._params.get("heatmap_all_timeframes"):
+            return
+        self._params["heatmap_all_timeframes"] = enabled
+        self._mark_dirty()
+        self._refresh((QUERY_HEATMAP_GENERIC,))
+
+    def apply_smart_preset_confluence(self) -> None:
+        """`[⚡ Signal-Confluence]`: X=date, Y=service_id, count(DISTINCT fid).
+
+        Chronologische Lichtsaeulen zeitgleicher Signale (Hauptansicht).
+        Konfiguration + Dirty-Flag (Option B), KEIN Auto-Save (E4).
+        """
+        self._set_heatmap_all_timeframes(False)
+        self.set_heatmap_config("date", "service_id", "", "confluence_count")
+
+    def apply_smart_preset_session(self) -> None:
+        """`[🕒 Session-Hotspots]`: X=dow (Mo-Fr), Y=hour, count(DISTINCT fid).
+
+        Tageszeit-/Wochentag-Muster im Handelsverlauf (Wanduhr, E5-Phase 20).
+        Konfiguration + Dirty-Flag (Option B), KEIN Auto-Save (E4).
+        """
+        self._set_heatmap_all_timeframes(False)
+        self.set_heatmap_config("dow", "hour", "", "confluence_count")
+
+    def apply_smart_preset_intensity(self, x_dim: str = "date") -> None:
+        """`[📏 Wert-Intensität]`: X=date (Standard) oder dow (E2), Y=hour.
+
+        Auspraegung von Messwerten (z. B. distance_pip, atr) – AVG/Max ueber
+        den ersten verfuegbaren numerischen feature_data-JSON-Key (Repo-
+        Fallback, wenn keiner existiert). `x_dim` akzeptiert "date" (Default)
+        oder "dow" (E2). Konfiguration + Dirty-Flag (Option B), KEIN
+        Auto-Save (E4).
+        """
+        x_key = "dow" if str(x_dim or "").strip().lower() == "dow" else "date"
+        # Erster verfuegbarer numerischer Key (Muster Repo-E6-Fallback) –
+        # bei leeren Daten bleibt field="" (Repo faellt defensiv zurueck).
+        try:
+            avail = self._repo.available_feature_columns(
+                str(self._params.get("symbol") or ""),
+                str(self._params.get("timeframe") or "M1"))
+            field = avail[0] if avail else ""
+        except Exception:
+            field = ""
+        self._set_heatmap_all_timeframes(False)
+        self.set_heatmap_config(x_key, "hour", field, "avg")
+
+    def apply_smart_preset_timeframe(self) -> None:
+        """`[📊 Service-Timeframe]`: X=timeframe (ALLE TFs), Y=service_id.
+
+        Verteilung der Services ueber Zeitebenen (E1: `all_timeframes=True`
+        entfaellt die TF-WHERE-Bedingung – alle M1..D1 in EINER Query).
+        Konfiguration + Dirty-Flag (Option B), KEIN Auto-Save (E4).
+        """
+        self._set_heatmap_all_timeframes(True)
+        self.set_heatmap_config("timeframe", "service_id", "", "count")
+
+    # ------------------------------------------------------------------
+    # 21.01 (E3): Auto-Namensgenerator fuer neue Profile (DEUTSCH)
+    # ------------------------------------------------------------------
+    def generate_profile_name_suggestion(self) -> str:
+        """Sprechender Profilname – Formel `[Symbol] [TF] - [Modus] ([Kontext])`.
+
+        E3 (11.08.2026): Sprache DEUTSCH, z. B.
+        `SILVER M1 - Confluence Zeitachse (3 Services)`.
+        * Kontext-Klammer = Anzahl der selektierten Services (feature_ids);
+          bei 0 Auswahlen `(Alle Services)` statt `(0 Services)`.
+        * Fehlendes Symbol/Timeframe -> Platzhalter `ALLE`
+          (z. B. `ALLE M1 - Confluence Zeitachse (3 Services)`).
+        * Modus-Ableitung aus der AKTUELLEN Heatmap-Konfiguration
+          (Confluence/Session/Intensitaet/TF-Matrix) – der Vorschlag passt
+          zum eingestellten Ansichts-Szenario.
+        """
+        symbol = str(self._params.get("symbol") or "").strip() or "ALLE"
+        timeframe = str(self._params.get("timeframe") or "").strip() or "ALLE"
+        x_dim = str(self._params.get("heatmap_x_dim") or "").lower()
+        y_dim = str(self._params.get("heatmap_y_dim") or "").lower()
+        agg = str(self._params.get("heatmap_agg") or "").lower()
+        if x_dim == "timeframe":
+            mode = "Service-Zeitebenen"
+        elif x_dim == "dow" and y_dim == "hour":
+            mode = "Session-Hotspots"
+        elif agg in ("avg", "sum", "min", "max"):
+            mode = "Wert-Intensität"
+        else:
+            mode = "Confluence Zeitachse"
+        n = len(self._params.get("feature_ids") or [])
+        context = f"{n} Services" if n > 0 else "Alle Services"
+        return f"{symbol} {timeframe} - {mode} ({context})"
+
     def set_heatmap_zoom(self, x_range, y_range) -> None:
         """Setzt die normalisierten Viewport-Anteile [0,1] (20.02, E8).
 
@@ -650,6 +754,10 @@ class AnalyticsViewModel(QObject):
             base["y_dim"] = p["heatmap_y_dim"]
             base["field"] = p.get("heatmap_field") or None
             base["agg"] = p["heatmap_agg"]
+            # 21.01 (E1): TF-Freigabe in die Worker-Params – True entfaellt
+            # im Reader die TF-WHERE-Bedingung (Preset `[📊 Service-Timeframe]`).
+            base["all_timeframes"] = bool(
+                p.get("heatmap_all_timeframes", False))
             # Runde 12 (Option A): Preset-Modell-Snapshot fuer die
             # No-Data-Auswertung IM SELBEN Datenfluss wie die Grafik
             # (kein zweiter serieller QUERY_FEATURES-Worker-Roundtrip -
@@ -888,6 +996,10 @@ class AnalyticsViewModel(QObject):
             self._params["heatmap_agg"] = str(heat["agg"]).lower()
         if heat.get("field") is not None:
             self._params["heatmap_field"] = str(heat["field"])
+        # 21.01 (E1): TF-Freigabe aus dem Payload restaurieren.
+        if heat.get("all_timeframes") is not None:
+            self._params["heatmap_all_timeframes"] = bool(
+                heat["all_timeframes"])
         if heat.get("candle_projection_enabled") is not None:
             self._params["candle_projection_enabled"] = bool(
                 heat["candle_projection_enabled"])
@@ -965,6 +1077,8 @@ class AnalyticsViewModel(QObject):
                     "y_dim": p.get("heatmap_y_dim"),
                     "field": p.get("heatmap_field"),
                     "agg": p.get("heatmap_agg"),
+                    # 21.01 (E1): TF-Freigabe additiv persistieren.
+                    "all_timeframes": p.get("heatmap_all_timeframes"),
                     "candle_projection_enabled": p.get(
                         "candle_projection_enabled"),
                     "zoom_x_range": list(p.get("zoom_x_range")

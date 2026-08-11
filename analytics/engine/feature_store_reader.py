@@ -872,6 +872,14 @@ class FeatureStoreReader:
         # Runde 10 (Bug 1): Varianten-Einschraenkung (optional).
         instance_hashes: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        # 21.01 (E1, 11.08.2026): TF-Freigabe fuer Timeframe-Matrizen.
+        # Bei `all_timeframes=True` entfaellt die WHERE-Bedingung
+        # `LOWER(timeframe) = LOWER(?)` – DuckDB liest ALLE Zeitebenen
+        # (M1..D1) des Symbols in EINER Query. Der `timeframe`-Parameter
+        # bleibt fuer den Normalpfad erhalten (Kapitel-Vorgabe `timeframe=""`
+        # ist VERWORFEN: der alte Guard `if not symbol or not timeframe:`
+        # brach damit mit einer leeren Matrix ab).
+        all_timeframes: bool = False,
     ) -> Dict[str, Any]:
         """Aggregiert eine generische 2D-Matrix ueber zwei Dimensionen.
 
@@ -883,6 +891,12 @@ class FeatureStoreReader:
         fetch_heatmap). HIT_RATE entfaellt in V1 (E5: kein Schwellwert
         spezifiziert). 20.02.01 (E5): `dow`-Achsen sind strikt Montag-Freitag
         (zusätzliche WHERE-Bedingung `BETWEEN 1 AND 5`, DuckDB Mo=1..Fr=5).
+
+        21.01 (E1, 11.08.2026): `all_timeframes=True` entfaellt die
+        TF-WHERE-Bedingung – Grundlage des Presets `[📊 Service-Timeframe]`
+        (X = `timeframe`, Y = `service_id`, agg = `count`). Der
+        `timeframe`-Guard wird dabei uebersprungen (leerer/aktueller
+        Timeframe erlaubt), `symbol` bleibt Pflicht.
 
         Wanduhr-Garantie (Invariante 7 / E4): date/dow/hour werden
         mit `bar_time AT TIME ZONE 'UTC'` extrahiert (die gespeicherten Werte
@@ -898,7 +912,8 @@ class FeatureStoreReader:
         deterministisch auf die letzten Sortierwerte begrenzt.
 
         Args:
-            symbol/timeframe: Filter (case-insensitive)
+            symbol/timeframe: Filter (case-insensitive). Bei
+                `all_timeframes=True` ist `timeframe` optional (alle TFs).
             x_dim/y_dim: Dimensions-Keys aus DIM_MAPPINGS (case-insensitiv)
             field: Numerischer feature_data-JSON-Key (Pflicht nur fuer
                 AVG/SUM/MIN/MAX; bei COUNT/CONFLUENCE_COUNT ignoriert, E6)
@@ -907,6 +922,7 @@ class FeatureStoreReader:
             feature_ids: Optionaler Multi-Filter (`WHERE feature_id IN (...)`).
                 Leere Liste/None = kein Filter.
             limit: Max. Bars des Aggregations-Ausschnitts (neueste zuerst).
+            all_timeframes: True = TF-WHERE-Bedingung entfaellt (E1).
 
         Returns:
             {
@@ -924,7 +940,7 @@ class FeatureStoreReader:
             ValueError: bei unbekannter Dimension/Aggregation oder fehlendem
                 `field` fuer AVG/SUM/MIN/MAX (defensiv im Repository gefangen).
         """
-        if not symbol or not timeframe:
+        if not symbol or (not timeframe and not all_timeframes):
             return self._empty_generic_heatmap(
                 x_dim, y_dim, agg, field, symbol, timeframe)
         x_key = str(x_dim or "").lower()
@@ -959,8 +975,14 @@ class FeatureStoreReader:
                 f"erlaubt: {', '.join(HEATMAP_AGGREGATIONS)}."
             )
 
-        conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
-        params: List[Any] = [symbol, timeframe]
+        conditions = ["LOWER(symbol) = LOWER(?)"]
+        params: List[Any] = [symbol]
+        # 21.01 (E1): TF-Freigabe – bei `all_timeframes=True` entfaellt die
+        # TF-WHERE-Bedingung, sodass alle Zeitebenen (M1..D1) in EINER Query
+        # aggregiert werden (Preset `[📊 Service-Timeframe]`).
+        if not all_timeframes:
+            conditions.append("LOWER(timeframe) = LOWER(?)")
+            params.append(timeframe)
         self._apply_feature_filter(
             feature_ids, feature_id, conditions, params,
             instance_hashes=instance_hashes)
