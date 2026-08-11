@@ -75,12 +75,18 @@ class HeatmapPage(QWidget):
         content = QWidget(self)
         lay = QVBoxLayout(content)
 
-        # 20.02 (additiv): Ansichts-Modus – "Generisch" ist seit 21.01
-        # (E4, 11.08.2026) die STANDARD-Ansicht der Heatmap; "Wochentag ×
-        # Stunde" bleibt als klassischer Modus erhalten.
+        # 21.01 (User-Meldung 2, 11.08.2026): Das "Ansicht"-Dropdown enthaelt
+        # jetzt die 4 Smart-Presets; "Wochentag × Stunde" entfaellt (der
+        # Standard-Modus bleibt als Legacy-Code fuer Restores erhalten, ist
+        # aber KEIN Dropdown-Eintrag mehr). "Generisch" ist die Basis-Ansicht
+        # (Index 0); jede Preset-Option wendet das Preset an (Meldung 3: die
+        # Bedien-Controls des generischen Widgets bleiben dabei sichtbar).
         self._combo_mode = QComboBox()
         self._combo_mode.addItem("Generisch", "generic")
-        self._combo_mode.addItem("Wochentag × Stunde", "standard")
+        self._combo_mode.addItem("⚡ Signal-Confluence", "preset_confluence")
+        self._combo_mode.addItem("🕒 Session-Hotspots", "preset_session")
+        self._combo_mode.addItem("📏 Wert-Intensität", "preset_intensity")
+        self._combo_mode.addItem("📊 Service-Timeframe", "preset_timeframe")
         self._combo_mode.setCurrentIndex(0)
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Ansicht:"))
@@ -150,41 +156,83 @@ class HeatmapPage(QWidget):
     def request_data(self) -> None:
         if self._view_model is None:
             return
-        # 20.02: Modus-abhaengig – Standard (Dow x Stunde) oder Generisch
-        # (+ OHLCV-Snapshot bei aktivem Kerzen-Overlay, E9).
-        if self._combo_mode.currentData() == "generic":
-            self._generic.request_data()
-        else:
-            self._view_model.request_heatmap()
+        # 21.01 (Meldung 2): Die Heatmap-Ansicht ist seit dem Entfall von
+        # "Wochentag × Stunde" IMMER generisch – die Daten kommen immer
+        # aus dem generischen Widget (+ OHLCV-Snapshot bei aktivem Overlay, E9).
+        self._generic.request_data()
 
     # ------------------------------------------------------------------
     # 20.02: Ansichts-Modus (Workspace-Persistenz, E2)
     # ------------------------------------------------------------------
     @property
     def mode_id(self) -> str:
-        """Aktueller Modus ("standard" | "generic") fuer die Workspace-Speicherung."""
-        return str(self._combo_mode.currentData() or "standard")
+        """Aktueller Modus ("generic" | "preset_*") fuer die Workspace-Speicherung."""
+        return str(self._combo_mode.currentData() or "generic")
 
     def set_mode(self, mode_id: str) -> None:
-        """Stellt den Ansichts-Modus wieder her (Workspace-Restore)."""
-        idx = self._combo_mode.findData(str(mode_id or "").lower())
+        """Stellt den Ansichts-Modus wieder her (Workspace/Profil-Restore).
+
+        21.01 (Meldung 2): Legacy-Modi ("standard"/"wochentag") werden auf
+        "generic" gemappt. Signale blockiert (kein Dirty/Query beim Restore);
+        der Stack zeigt immer das generische Widget (Meldung 3).
+        """
+        mid = str(mode_id or "").lower()
+        if mid in ("standard", "wochentag", "wochentag_x_stunde",
+                   "wochentag x stunde"):
+            mid = "generic"
+        idx = self._combo_mode.findData(mid)
         if idx < 0:
             idx = 0
         if self._combo_mode.currentIndex() != idx:
+            self._combo_mode.blockSignals(True)
             self._combo_mode.setCurrentIndex(idx)
-        else:
-            self._stack_modes.setCurrentIndex(idx)
+            self._combo_mode.blockSignals(False)
+        self._stack_modes.setCurrentIndex(1)
 
     # 21.01 (E4, 11.08.2026): Preset-Klick aus dem generischen Widget –
-    # die Heatmap-Ansicht wechselt damit sicher in den generischen Modus
-    # (die neue Standard-Ansicht, Index 0).
-    def _on_preset_clicked(self, _preset: str) -> None:
-        self.set_mode("generic")
+    # das Ansicht-Dropdown wird auf die gewaehlte Preset-Option synchroni-
+    # siert (set_mode blockt Signale, keine Doppel-Anwendung des Presets).
+    def _on_preset_clicked(self, preset: str) -> None:
+        mid = (f"preset_{preset}"
+               if preset in ("confluence", "session", "intensity", "timeframe")
+               else "generic")
+        self.set_mode(mid)
 
     def _on_mode_changed(self, _index: int) -> None:
-        """Wechselt den Modus-Stack und fordert die passenden Daten an."""
-        self._stack_modes.setCurrentIndex(
-            1 if self._combo_mode.currentData() == "generic" else 0)
+        """Wechselt die Ansicht: Preset anwenden bzw. generisch laden.
+
+        21.01 (Meldung 2+3): Die Bedien-Controls (generisches Widget)
+        bleiben bei JEDEM Preset-Wechsel sichtbar (Stack zeigt immer
+        Seite 1). Eine Preset-Option wendet das Smart-Preset an.
+        """
+        mid = str(self._combo_mode.currentData() or "generic")
+        self._stack_modes.setCurrentIndex(1)
+        if mid.startswith("preset_"):
+            self._apply_selected_preset(mid)
+        else:
+            self.request_data()
+
+    def _apply_selected_preset(self, mid: str) -> None:
+        """Wendet das im Ansicht-Dropdown gewaehlte Smart-Preset an.
+
+        Bugfix-Muster 21.01 (Meldung 4/6): Nach dem VM-Preset werden die
+        Combos des generischen Widgets via _sync_from_params nachgezogen
+        (keine STALE-Combos), danach wird neu gerendert.
+        """
+        if self._view_model is None:
+            return
+        fn = {
+            "preset_confluence": self._view_model.apply_smart_preset_confluence,
+            "preset_session": self._view_model.apply_smart_preset_session,
+            "preset_intensity": self._view_model.apply_smart_preset_intensity,
+            "preset_timeframe": self._view_model.apply_smart_preset_timeframe,
+        }.get(mid)
+        if fn is None:
+            return
+        fn()
+        generic = getattr(self, "_generic", None)
+        if generic is not None and hasattr(generic, "_sync_from_params"):
+            generic._sync_from_params()
         self.request_data()
 
     # ------------------------------------------------------------------

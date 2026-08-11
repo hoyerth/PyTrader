@@ -669,6 +669,15 @@ class HeatmapWidget(QWidget):
             return
         self.preset_clicked.emit("confluence")
         self._view_model.apply_smart_preset_confluence()
+        # Bugfix 21.01 (11.08.2026, User-Meldung 4/6): Die X/Y/Agg-Combos
+        # wurden nach einem Preset-Klick NICHT synchronisiert – sie zeigten
+        # weiter die alte Konfiguration. Ein anschliessender manueller
+        # Combo-Wechsel (z. B. Aggregation) hat dann die STALE-Combos in den
+        # ViewModel geschrieben und den Preset-Zustand wieder verworfen
+        # ("Presets zeigen gleiche Grafik" / "Aggregation aendert nichts").
+        # _sync_from_params() zieht die Combos aus den VM-Params nach.
+        self._sync_from_params()
+        self._update_controls()
         self.request_data()
 
     def _on_preset_session(self) -> None:
@@ -677,6 +686,8 @@ class HeatmapWidget(QWidget):
             return
         self.preset_clicked.emit("session")
         self._view_model.apply_smart_preset_session()
+        self._sync_from_params()
+        self._update_controls()
         self.request_data()
 
     def _on_preset_intensity(self) -> None:
@@ -685,6 +696,8 @@ class HeatmapWidget(QWidget):
             return
         self.preset_clicked.emit("intensity")
         self._view_model.apply_smart_preset_intensity()
+        self._sync_from_params()
+        self._update_controls()
         self.request_data()
 
     def _on_preset_timeframe(self) -> None:
@@ -693,6 +706,8 @@ class HeatmapWidget(QWidget):
             return
         self.preset_clicked.emit("timeframe")
         self._view_model.apply_smart_preset_timeframe()
+        self._sync_from_params()
+        self._update_controls()
         self.request_data()
 
     # ------------------------------------------------------------------
@@ -769,8 +784,14 @@ class HeatmapWidget(QWidget):
             # noch keine Payload-Metadaten vorliegen).
             self._rebuild_field_dropdown(self._field_keys,
                                          self._field_sources)
+            # 21.01 (User-Meldung 5, 11.08.2026): Das Kerzen-Overlay wird
+            # NUR wiederhergestellt, wenn die X-Achse = 'date' ist. Bei
+            # Y=date/anderen Achsen bleibt die Checkbox aus (verhindert
+            # ein ungewolltes Dirty-Setzen via _update_controls beim
+            # Profil-/Workspace-Restore).
             self._chk_candle.setChecked(bool(
-                p.get("candle_projection_enabled")))
+                p.get("candle_projection_enabled"))
+                and str(p.get("heatmap_x_dim") or "date") == "date")
             self._set_zoom_slider(self._slider_zoom_x,
                                   p.get("zoom_x_range") or [0.0, 1.0])
             self._set_zoom_slider(self._slider_zoom_y,
@@ -834,34 +855,35 @@ class HeatmapWidget(QWidget):
             self._combo_field.setToolTip(
                 "Nur fuer AVG/SUM/MIN/MAX relevant (E6); COUNT/CONFLUENCE "
                 "ignorieren das Feld.")
-        # 10.08.2026 (Bugfix Runde 7, Bug 1): 'Datum' darf auf der X- ODER
-        # Y-Achse liegen - X=date zeichnet vertikale Candles (Preis rechts),
-        # Y=date horizontale Candles (Preis unten).
+        # 21.01 (User-Meldung 5, 11.08.2026): Das Kerzen-Overlay ist NUR
+        # bei X-Achse = 'date' aktivierbar (Y=date/vertikale Anordnungen
+        # sind keine offiziellen Ansichten mehr). Bei Y=date wird die
+        # Checkbox hier deaktiviert und zurueckgesetzt (Restore-Fall).
         date_on_x = x_dim == "date"
-        can_overlay = (x_dim == "date" or y_dim == "date")
+        can_overlay = date_on_x
         self._chk_candle.setEnabled(can_overlay)
         if can_overlay:
             self._chk_candle.setToolTip(
                 "Tages-Ohlc ueber der Heatmap (gleicher Canvas), "
-                "Datum auf X- oder Y-Achse (Bugfix 1).")
+                "Datum auf der X-Achse.")
         else:
             self._chk_candle.setToolTip(
-                "Kerzen-Overlay nur mit 'Datum' auf der X- oder Y-Achse "
+                "Kerzen-Overlay nur mit 'Datum' auf der X-Achse "
                 "verfuegbar.")
-        # 10.08.2026 (Bugfix Runde 7, Bug 1): Der Overlay-Link folgt der
-        # DATE-Achse - X=date koppelt die Preis-VB an die X-Achse, Y=date
-        # an die Y-Achse. Ohne Overlay werden beide Links entfernt.
+            # Meldung 5: Reste eines Overlays entfernen (loest
+            # _on_candle_toggled(False) aus -> set_candle_projection(False)
+            # + _clear_overlay im ViewModel/Widget).
+            if self._chk_candle.isChecked():
+                self._chk_candle.setChecked(False)
+        # Meldung 5: Der Overlay-Link folgt NUR noch der X-Achse (date).
+        # Ohne Overlay werden beide Links entfernt.
         link = can_overlay and self._chk_candle.isChecked()
         linked_x = self._price_vb.linkedView(pg.ViewBox.XAxis)
         linked_y = self._price_vb.linkedView(pg.ViewBox.YAxis)
-        if link and date_on_x and linked_x is None:
+        if link and linked_x is None:
             self._price_vb.setXLink(self._plot_hm.plotItem.vb)
-        if link and not date_on_x and linked_y is None:
-            self._price_vb.setYLink(self._plot_hm.plotItem.vb)
-        if link and date_on_x and linked_y is not None:
+        if link and linked_y is not None:
             self._price_vb.setYLink(None)
-        if link and not date_on_x and linked_x is not None:
-            self._price_vb.setXLink(None)
         if not link:
             if linked_x is not None:
                 self._price_vb.setXLink(None)
@@ -883,9 +905,9 @@ class HeatmapWidget(QWidget):
                 self._set_combo_data(self._combo_y, fallback)
             finally:
                 self._syncing = False
-        # Overlay nur bei X=date (E9) – sonst ausschalten.
+        # Overlay nur bei X=date (E9 / 21.01 User-Meldung 5) – sonst
+        # ausschalten (Y=date ist keine offizielle Overlay-Ansicht mehr).
         if (self._combo_x.currentData() != "date"
-                and self._combo_y.currentData() != "date"
                 and self._chk_candle.isChecked()):
             self._chk_candle.setChecked(False)
         self._update_controls()
@@ -1287,8 +1309,21 @@ class HeatmapWidget(QWidget):
                 except Exception:
                     pass
                 self._colormap_mode = "confluence"
-            self._image.setImage(matrix, levels=_CONFLUENCE_LEVELS)
-            self._colorbar.setLevels(_CONFLUENCE_LEVELS)
+            # 21.01 (User-Meldung 7, 11.08.2026): Die festen Levels
+            # (0.0, 5.0) passten nicht zu echten Daten (Max ~1) - die
+            # Farbgraduierung blieb stumpf (fast nur Weiss/Gelb). Die
+            # Levels werden jetzt DATEN-GEBUNDEN gesetzt: 0 (keine
+            # Konfluenz) = weiss, vmax = staerkste Farbe (dunkelrot).
+            finite = matrix[np.isfinite(matrix)]
+            if finite.size:
+                vmax = float(finite.max())
+                vmin = min(0.0, float(finite.min()))
+            else:
+                vmin, vmax = 0.0, 1.0
+            if vmax <= vmin:
+                vmax = vmin + 1.0
+            self._image.setImage(matrix, levels=(vmin, vmax))
+            self._colorbar.setLevels((vmin, vmax))
         else:
             if self._colormap_mode != _VIRIDIS:
                 self._image.setColorMap(self._cmap_viridis)

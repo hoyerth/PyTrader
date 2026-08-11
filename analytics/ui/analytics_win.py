@@ -263,12 +263,13 @@ class AnalyticsWindow(PersistentWindow):
 
         # --- Top-Bar: Profil-CRUD (Option B – Explicit Save) ---
         # 21.01 (E5, 11.08.2026): combo_profile dehnbar (Expanding,
-        # min. 350 px, editierbar); Namens-/Beschreibungs-Felder wandern in
-        # den separaten Speicher-Dialog (_on_profile_save). label_dirty +
-        # Buttons streng rechtsbuendig (addStretch davor).
+        # min. 560 px - User-Meldung 1, editierbar); Namens-/Beschreibungs-
+        # Felder wandern in den separaten Speicher-Dialog (_on_profile_save)
+        # bzw. breiten Neu-Dialog (_on_profile_new). label_dirty + Buttons
+        # streng rechtsbuendig (addStretch davor).
         top = QHBoxLayout()
         self.combo_profile = QComboBox()
-        self.combo_profile.setMinimumWidth(350)
+        self.combo_profile.setMinimumWidth(560)
         self.combo_profile.setEditable(True)
         self.combo_profile.setSizePolicy(
             QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -1025,27 +1026,44 @@ class AnalyticsWindow(PersistentWindow):
 
     @Slot()
     def _on_profile_new(self) -> None:
-        # 21.01 (E3): Auto-Namensgenerator – das Eingabefeld wird mit dem
-        # Vorschlag vorausgefuellt (deutsch, Fallbacks; kein leeres Feld).
+        # 21.01 (E3 + User-Meldung 1, 11.08.2026): Der Neu-Dialog ist ein
+        # BREITER QDialog (Fenster min. 560 px, Namensfeld min. 420 px) mit
+        # Name + Beschreibung in EINEM Formular (vorher zwei schmale
+        # QInputDialog-Instanzen hintereinander). Der Auto-Namensgenerator
+        # fuellt das Namensfeld vor (deutsch, Fallbacks; kein leeres Feld).
         suggested = ""
         try:
             suggested = self._vm.generate_profile_name_suggestion() or ""
         except Exception:
             suggested = ""
-        name, ok = QInputDialog.getText(
-            self, "Neues Profil", "Profil-Name:", text=suggested)
-        name = (name or "").strip()
-        if not ok or not name:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Neues Profil")
+        dialog.setMinimumWidth(560)
+        form = QFormLayout(dialog)
+        edit_name = QLineEdit(suggested)
+        edit_name.setMinimumWidth(420)
+        edit_name.setPlaceholderText("Profil-Name")
+        edit_desc = QLineEdit()
+        edit_desc.setPlaceholderText("Beschreibung (optional)")
+        form.addRow("Name:", edit_name)
+        form.addRow("Beschreibung:", edit_desc)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Anlegen")
+        form.addRow(buttons)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        if dialog.exec() != QDialog.Accepted:
             return
-        desc, ok2 = QInputDialog.getText(
-            self, "Neues Profil", "Beschreibung (optional):")
-        if not ok2:
-            desc = ""
+        name = (edit_name.text() or "").strip()
+        if not name:
+            return
+        desc = (edit_desc.text() or "").strip()
         # 10.08.2026 (Punkte 3/4): UI-Layout (Seite + Heatmap-Modus) im
         # neuen Profil persistieren (create_profile ruft _current_payload).
         self._vm.set_ui_layout(self._current_ui_layout())
         try:
-            self._vm.create_profile(name, desc or "")
+            self._vm.create_profile(name, desc)
         except ValueError as e:
             QMessageBox.warning(self, "Profil anlegen", str(e))
 
