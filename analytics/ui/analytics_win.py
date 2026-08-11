@@ -164,14 +164,20 @@ class AnalyticsWindow(PersistentWindow):
     # Bugfix 04.08.2026 (Fenster-Historie): auto_restore=True – das Fenster
     # wird beim App-Start wiederhergestellt, wenn es beim Beenden der App
     # OFFEN war.
-    # 20.01 (E1): _keep_history_on_close = True – der Analytics-Workspace
-    # (vm.params + Layout) wird in instance_states.workspace_state
-    # persistiert und muss das manuelle Schliessen ueberleben
-    # (PersistentWindow.closeEvent loescht bei False den DB-Eintrag).
-    # Trade-off: ein manuell geschlossenes Analytics-Fenster wird beim
-    # naechsten Start wiederhergestellt (Dashboard-Fenster, kein Wegwerf-
-    # Fenster; Semantik bewusst abweichend von chart_win).
-    _keep_history_on_close = True
+    # 11.08.2026 (Bugfix Runde 17e, User-Meldung 2): _keep_history_on_close
+    # jetzt False – ein MANUELL geschlossenes Analytics-Fenster wird aus
+    # der Fenster-Historie entfernt (delete_instance) und beim naechsten
+    # App-Start NICHT wiederhergestellt (Historie intakt, konsistent mit
+    # ServiceWindow). Der Analytics-Workspace (vm.params + Layout)
+    # ueberlebt das manuelle Schliessen ueber ein global_settings-Backup
+    # ("analytics_workspace") und wird beim naechsten manuellen Oeffnen
+    # wiederhergestellt (siehe _save_workspace/_restore_workspace); die
+    # Fenster-Position ueberlebt ueber DIALOG_GEOMETRY_KEY (Muster
+    # ServiceWindow).
+    _keep_history_on_close = False
+    #: Geometrie-Key fuer die POSITION, die ein manuelles Schliessen
+    #: ueberlebt (global_settings, vgl. ServiceWindow-Muster).
+    DIALOG_GEOMETRY_KEY = "win_analytics"
 
     def __init__(
         self,
@@ -1111,9 +1117,11 @@ class AnalyticsWindow(PersistentWindow):
         """Persistiert den Analytics-Workspace (VM-Parameter + Layout).
 
         20.01: Payload = {"params": vm.params, "layout": {"page_index": ...}}.
-        Wird im closeEvent VOR super().closeEvent() ausgefuehrt, damit die
-        instance_states-Zeile (inkl. workspace_state) das Fenster ueberlebt
-        (E1: _keep_history_on_close = True).
+        Wird im closeEvent VOR super().closeEvent() ausgefuehrt. Seit Runde
+        17e (_keep_history_on_close=False) wird die instance_states-Zeile
+        beim manuellen Schliessen zwar geloescht - das Workspace-Backup in
+        global_settings ("analytics_workspace") ueberlebt und wird beim
+        naechsten manuellen Oeffnen wiederhergestellt.
         """
         try:
             # Runde 11 (Bug 3, B3-3): Entkoppelte Kopie statt Referenz -
@@ -1140,6 +1148,16 @@ class AnalyticsWindow(PersistentWindow):
             }
             self.state_manager.save_workspace_state(
                 self.INSTANCE_ID, payload)
+            # 11.08.2026 (Bugfix Runde 17e, User-Meldung 2): Zusaetzliches
+            # Backup in global_settings - es ueberlebt das MANUELLE
+            # Schliessen (delete_instance loescht die instance_states-Zeile)
+            # und wird beim naechsten manuellen Oeffnen wiederhergestellt
+            # (Fallback in _restore_workspace).
+            try:
+                self.state_manager.save_global_value(
+                    "analytics_workspace", payload)
+            except Exception:
+                pass
         except Exception as e:
             print(f"WARN [AnalyticsWindow] Workspace-Save fehlgeschlagen: {e}")
 
@@ -1156,6 +1174,15 @@ class AnalyticsWindow(PersistentWindow):
         except Exception as e:
             print(f"WARN [AnalyticsWindow] Workspace-Restore fehlgeschlagen: {e}")
             return
+        # 11.08.2026 (Bugfix Runde 17e, User-Meldung 2): Nach einem MANUELLEN
+        # Schliessen ist die instance_states-Zeile geloescht - Fallback auf
+        # das global_settings-Backup aus _save_workspace.
+        if not payload:
+            try:
+                payload = self.state_manager.get_global_value(
+                    "analytics_workspace")
+            except Exception:
+                payload = None
         if not payload:
             return
         self._vm.restore_workspace(payload)
@@ -1230,13 +1257,81 @@ class AnalyticsWindow(PersistentWindow):
         # 15.03-E: QUERY_FEATURES speiste das entfernte combo_feature-Dropdown –
         # ohne Feature-Dropdown ist keine Features-Metadaten-Abfrage noetig.
 
+    def save_state(self) -> None:
+        """Persistiert Fenster-POSITION und -GROESSE (inkl. Dialog-Fallback).
+
+        11.08.2026 (Bugfix Runde 17e, User-Meldung 2): Neben window_instances
+        wird die Geometrie zusaetzlich in global_settings gesichert
+        (DIALOG_GEOMETRY_KEY) – sie ueberlebt damit das manuelle Schliessen
+        (delete_instance loescht window_instances/instance_states) und wird
+        beim naechsten manuellen Oeffnen ueber den Fallback in
+        restore_state() wiederhergestellt (Muster ServiceWindow).
+        """
+        inst_id = self.get_instance_id()
+        if not inst_id:
+            return
+        try:
+            p = self.pos()
+            self._state_manager.save_dialog_geometry(
+                self.DIALOG_GEOMETRY_KEY, p.x(), p.y(),
+                self.width(), self.height())
+        except Exception:
+            pass
+        # Basis-Teil: window_instances-Geometrie + instance_states
+        # (Symbol/Timeframe via get_persistent_symbol/timeframe).
+        super().save_state()
+
+    def restore_state(self) -> None:
+        """Stellt Geometrie + Filter wieder her (inkl. Dialog-Fallback).
+
+        11.08.2026 (Bugfix Runde 17e, User-Meldung 2): Nach einem MANUELLEN
+        Schliessen existiert kein window_instances-Eintrag mehr – die
+        Position wird dann aus global_settings (DIALOG_GEOMETRY_KEY)
+        wiederhergestellt (Muster ServiceWindow). Der Rest (Symbol/
+        Timeframe/Workspace) laeuft ueber super().restore_state() bzw.
+        _initial_load -> _restore_workspace().
+        """
+        inst_id = self.get_instance_id()
+        if not inst_id:
+            return
+        # Window-Flags korrigieren (NUR bei unsichtbarem Fenster –
+        # setWindowFlags() auf sichtbarem Fenster bricht die Layout-
+        # Geometrie-Verwaltung, Bugfix Runde 17c).
+        if not self.isVisible():
+            self._fix_window_flags()
+        geom = self._state_manager.get_window_geometry(inst_id)
+        if not geom:
+            try:
+                geom = self._state_manager.get_dialog_geometry(
+                    self.DIALOG_GEOMETRY_KEY)
+            except Exception:
+                geom = None
+        if geom:
+            pos_x = geom.get("pos_x")
+            pos_y = geom.get("pos_y")
+            width = geom.get("width")
+            height = geom.get("height")
+            screen_geo = QApplication.primaryScreen().availableGeometry()
+            if width and height:
+                self.resize(max(int(width), 640), max(int(height), 480))
+            if pos_x is not None and pos_y is not None:
+                if pos_x < screen_geo.x() - 100 or pos_x > screen_geo.right() or \
+                   pos_y < screen_geo.y() - 100 or pos_y > screen_geo.bottom():
+                    pos_x, pos_y = 100, 100
+                self.move(pos_x, pos_y)
+            self._restored_is_maximized = bool(geom.get("is_maximized", False))
+        # Symbol/Timeframe (instance_states) ueber die Basis wiederherstellen.
+        super().restore_state()
+
     def closeEvent(self, event) -> None:
         """Stoppt Debounce + Worker und persistiert den Workspace.
 
-        Der Fenster-Historie-Eintrag bleibt dank _keep_history_on_close =
-        True erhalten, damit Symbol/Timeframe UND Workspace
-        (instance_states.workspace_state) beim naechsten Oeffnen
-        wiederhergestellt werden (20.01 E1).
+        11.08.2026 (Bugfix Runde 17e, User-Meldung 2): _keep_history_on_close
+        = False – der Fenster-Historie-Eintrag wird beim MANUELLEN
+        Schliessen entfernt (kein Wiedererscheinen beim Neustart). Der
+        Workspace (instance_states.workspace_state + global_settings-Backup)
+        wird hier VOR super().closeEvent() gespeichert und beim naechsten
+        manuellen Oeffnen wiederhergestellt.
         """
         try:
             self._vm.shutdown()
