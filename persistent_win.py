@@ -161,8 +161,15 @@ class PersistentWindow(QMainWindow):
             return
 
         # Window-Flags korrigieren (QUiLoader setzt oft Qt.Tool | Qt.Dialog,
-        # was Taskleisten-Eintrag unterdrückt und Fenster über Parent hält)
-        self._fix_window_flags()
+        # was Taskleisten-Eintrag unterdrückt und Fenster über Parent hält).
+        # 11.08.2026 (Bugfix Runde 17c): NUR wenn das Fenster noch NICHT
+        # sichtbar ist – setWindowFlags() auf einem sichtbaren Fenster bricht
+        # die Layout-Geometrie-Verwaltung (Inhalt folgt dem Resize nicht
+        # mehr). Die Flags werden seit Runde 17c bereits im Konstruktor
+        # (PersistentWindow.__init__, Fenster unsichtbar) gesetzt; dieser
+        # Aufruf ist nur noch eine defensive Wiederholung.
+        if not self.isVisible():
+            self._fix_window_flags()
 
         # Geometrie
         geom = self._state_manager.get_window_geometry(inst_id)
