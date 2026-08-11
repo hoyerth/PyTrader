@@ -3,22 +3,22 @@
 ## 1. Allgemeine Grundsätze & Architektur-Invarianten (Phase 20)
 
 1. **Git-Backup vor jedem Schritt:** Vor Beginn jedes Teilkapitels automatischen Git-Commit/Tag setzen (`phase20_step1`, `phase20_step2` usw.).
-2. **Headless-Validierung (Keine UI-Tests):** Validierungen erfolgen rein headless (kein `QApplication.exec()`) über gezielte PyTest-/Python-Skripte im Unterordner `test/`.
+2. **Headless-Validierung (Keine UI-Tests):** Validierungen erfolgen rein headless (kein `QApplication.exec()`) über gezielte PyTest-/Python-Skripte im Unterordner `../../test`.
 3. **Codebase-Formatierung:** Exakt **4 Leerzeichen** Einrückung (PEP8-Standard) und **exakt 1 Leerzeile** Spacing zwischen Methoden und Funktionsblöcken. Kein Umformatieren unbeteiligter Altbestand-Dateien.
 4. **Strikte Trennung & MVVM (Kein SQL in UI):** UI-Klassen enthalten **keine SQL-Queries**. Datenfluss: `DuckDB` $\rightarrow$ `FeatureStoreReader` / `Repositories` $\rightarrow$ `Worker/ViewModel` $\rightarrow$ `UI-Pages`. `MasterTree`-Selektionen übergeben aufgelöste `feature_ids` direkt an `view_model.set_feature_ids()`.
 5. **Zentraler `EventBus`:** Fenster und Worker kommunizieren schwellenfrei über Events (`favorites_changed`, `profile_changed`, `service_set_changed`), um zirkuläre Abhängigkeiten zu vermeiden.
-6. **Thread-Safety & DbPool:** DB-Zugriff erfolgt lock-frei über den Thread-local `DbPool` (`db/db_pool.py`) – eine Verbindung pro Thread und DB-Datei. Die Fassade `db_service.py` bleibt als Re-Export-Wrapper für bestehende Caller erhalten.
+6. **Thread-Safety & DbPool:** DB-Zugriff erfolgt lock-frei über den Thread-local `DbPool` (`../../db/db_pool.py`) – eine Verbindung pro Thread und DB-Datei. Die Fassade `../../db_service.py` bleibt als Re-Export-Wrapper für bestehende Caller erhalten.
 7. **Tree-Persistenz & Kollisionsschutz (18.01.03):** 
    - Standalone-Service-Parameter nutzen exklusiv `plugin_params_<id>`.
    - Ordner-Kategorie-Overrides für Plugins nutzen exklusiv `plugin_category_<id>`.
    - Ordner-Kategorien für Service-Sets werden additiv im `category`-Feld der `ServiceSetDefinition` / des `save_set()`-Payloads persistiert.
 8. **Wanduhr-Garantie:** Achsen, Zeitfilter und Visualisierungen formatieren streng die Berliner Wanduhrzeit aus MT5-Epochs ohne doppelte UTC-Offsets.
 9. **Concurrency-Guard & Timer-Pausierung:** Solange im ServiceWindow intensive Service-Berechnungen laufen (`ServiceRunWorker` / `HistoricalScanner`), wird der 45s-`sync_timer` entkoppelt via `EventBus` pausiert, um Locking-Konflikte und UI-Ruckler zu verhindern.
-10. **Isolierter Test-Workspace & Cleanup:** Neue Test-Skripte und temporäre `*.duckdb`-Dateien gehören strikt nach `test/`. Nach Abschluss jedes Phasenkapitels wird `test/` aufgeräumt – es verbleibt nur der Test-Harness `test/test.py`.
+10. **Isolierter Test-Workspace & Cleanup:** Neue Test-Skripte und temporäre `*.duckdb`-Dateien gehören strikt nach `../../test`. Nach Abschluss jedes Phasenkapitels wird `../../test` aufgeräumt – es verbleibt nur der Test-Harness `../../test/test.py`.
 11. **Open/Closed-Principle & Code-Preserving:** Erweiterungen erfolgen strikt additiv durch neue Dateien. Auskommentierter Bestandscode darf nicht gelöscht werden; bestehende Kern-Klassen bleiben geschützt.
 12. **Naming Conventions & PineScript-Input-Zone:** 
-    - Services in `analytics/features/definitions/` nutzen strikt das Präfix `srv_` (`plugin_id = "srv_..."`).
-    - Indikatoren in `chart/indicators/` nutzen strikt das Präfix `ind_` (`indicator_id = "ind_..."`).
+    - Services in `../../analytics/features/definitions` nutzen strikt das Präfix `srv_` (`plugin_id = "srv_..."`).
+    - Indikatoren in `../../chart/indicators` nutzen strikt das Präfix `ind_` (`indicator_id = "ind_..."`).
     - Füllwörter (`service`, `plugin`, `indicator`) entfallen im Dateinamen.
     - Das `parameter_schema` liegt direkt am Dateianfang unter dem Header-Docstring.
     - Jedes Service-Plugin deklariert `metadata["category"]` für die dynamische Kategorie-Ordner-Struktur im MasterTree.
@@ -29,19 +29,19 @@
 
 ## 1. Architektur-Regeln
 * **Code-Style:** Exakt 4 Leerzeichen Einrückung, 1 Leerzeile zwischen Methoden.
-* **Testing:** Headless via `py_compile` & `test/test.py` (UI-Exec STRIKT VERBOTEN).
+* **Testing:** Headless via `py_compile` & `../../test/test.py` (UI-Exec STRIKT VERBOTEN).
 * **Entkopplung:** MVVM & IoC. Kein SQL in UI, ViewModel/Repository-Brücke nutzen.
 
 ---
 
 ## 2. DB-Schicht & Repositories
 
-### `window_state_repository.py` & `state_manager.py`
+### `../../window_state_repository.py` & `../../state_manager.py`
 - Additive Spalte `workspace_state JSON` in `instance_states` (`ALTER TABLE IF NOT EXISTS`).
 - `save_workspace_state(instance_id: str, state: dict)` -> Upsert `workspace_state`.
 - `get_workspace_state(instance_id: str) -> Optional[dict]` -> Liest `workspace_state`.
 
-### `analytics_profile_repository.py`
+### `../../analytics_profile_repository.py`
 - `SCHEMA_VERSION_DEFAULT = 2`.
 - In `_row_to_profile()`: Wenn Payload `schema_version == 1`, nutze `_migrate_v1_to_v2(payload)`.
 
@@ -49,12 +49,12 @@
 
 ## 3. Core-Logik & ViewModel
 
-### `analytics/engine/service_selector_model.py`
+### `../../analytics/engine/service_selector_model.py`
 - Methode `resolve_valid_feature_ids(feature_ids: List[str]) -> Tuple[List[str], List[str]]`:
   - Prüft `feature_ids` gegen `PluginRegistry`.
   - Returns `(valid_ids, missing_ids)`.
 
-### `analytics/engine/analytics_view_model.py`
+### `../../analytics/engine/analytics_view_model.py`
 - Additiv Signal: `missing_services_detected = Signal(list)`.
 - Methode `_migrate_v1_to_v2(payload: dict) -> dict`:
   - Wandelt altes flaches Dict verlustfrei in Sections (`sources`, `table`, `charts`, `styling`).
@@ -66,7 +66,7 @@
 
 ---
 
-## 4. UI-Integration (`analytics/ui/analytics_win.py`)
+## 4. UI-Integration (`../../analytics/ui/analytics_win.py`)
 
 ### Workspace-Persistence
 - Klasse behält `_keep_history_on_close = True`.
@@ -81,7 +81,7 @@
 
 ---
 
-## 5. Verification Checklist (`test/test.py`)
+## 5. Verification Checklist (`../../test/test.py`)
 - [ ] DB: `workspace_state` Spalten-Anlage idempotent.
 - [ ] Schema: Payload-Migration v1 -> v2 verlustfrei.
 - [ ] Resolver: Fehlende IDs werden isoliert gefiltert, bestehende geladen.
@@ -100,17 +100,17 @@
 
 **A) Noch nicht implementiert – Plan-Ziele sind gültig und additiv anzulegen:**
 - `workspace_state`-Spalte: existiert nirgends (geprüft: `state_manager._init_db()`,
-  `db/schema_initializer.py`, `window_state_repository.py`). → neu.
+  `../../db/schema_initializer.py`, `../../window_state_repository.py`). → neu.
 - `save_workspace_state` / `get_workspace_state`: nicht vorhanden. → neu.
-- `resolve_valid_feature_ids()`: fehlt in `analytics/engine/service_selector_model.py`. → neu.
-- Signal `missing_services_detected`: fehlt in `analytics/engine/analytics_view_model.py`. → neu.
-- `label_missing_warning` / `_on_missing_services`: fehlen in `analytics/ui/analytics_win.py`. → neu.
+- `resolve_valid_feature_ids()`: fehlt in `../../analytics/engine/service_selector_model.py`. → neu.
+- Signal `missing_services_detected`: fehlt in `../../analytics/engine/analytics_view_model.py`. → neu.
+- `label_missing_warning` / `_on_missing_services`: fehlen in `../../analytics/ui/analytics_win.py`. → neu.
 - `_save_workspace` / `_restore_workspace`: fehlen. → neu.
 
 **B) Inkonsistenzen & Lücken (geprüft gegen Ist-Code):**
 
 - **B1 – `_keep_history_on_close`-Widerspruch (kritisch):** Plan sagt „Klasse behält
-  `_keep_history_on_close = True`“. Ist-Code: `persistent_win.py` deklariert den
+  `_keep_history_on_close = True`“. Ist-Code: `../../persistent_win.py` deklariert den
   Klassen-Default `False`; `AnalyticsWindow` setzt KEIN eigenes Klassen-Attribut; der
   Klassen-Kommentar (Bugfix 04.08.2026) hält EXPLIZIT an `False` fest (Semantik wie
   `chart_win`). **Kritische Wechselwirkung:** `PersistentWindow.closeEvent()` ruft bei
@@ -129,7 +129,7 @@
   fälschliches `*`-Flag beim Profilwechsel. → **E5.**
 - **B5 – Registry-Zugriff im ViewModel fehlt:** `_apply_profile()` (VM) hat keinen Zugriff
   auf `ServiceSelectorModel`/`PluginRegistry`; der Plan spezifiziert keine Injektion. → **E5.**
-- **B6 – Bestehende Tests brechen:** `test/test.py` Teil 33 (R2a: flacher Payload-Zugriff,
+- **B6 – Bestehende Tests brechen:** `../../test/test.py` Teil 33 (R2a: flacher Payload-Zugriff,
   R2b: `schema_version == 1`) und Teil 35 (Z1e: `table_row_height` im flachen Payload)
   müssen auf das v2-Sectioned-Schema umgestellt werden – in der Plan-Checklist nicht
   enthalten. → **E7.**
@@ -206,11 +206,11 @@
   Reihenfolge im `_initial_load()`: `restore_state()` (Historie, t=0) → `load_profiles()`
   (aktives Profil) → `restore_workspace()` (letzter Sitzungszustand gewinnt).
 
-### 6.3 Angepasste Verification Checklist (`test/test.py`, neue Teil 36)
+### 6.3 Angepasste Verification Checklist (`../../test/test.py`, neue Teil 36)
 
 - [ ] Bestandstests umgestellt: Teil 33 R2a/R2b (Sections + `schema_version == 2`),
       Teil 35 Z1e (`payload["table"]["table_row_height"]`).
-- [ ] DB: `workspace_state`-Spalte idempotent (ALTER) auf Temp-DB in `test/`.
+- [ ] DB: `workspace_state`-Spalte idempotent (ALTER) auf Temp-DB in `../../test`.
 - [ ] Roundtrip `save_workspace_state`/`get_workspace_state` – auch ohne vorherige
       `instance_states`-Row (NOT-NULL-Fallback E6).
 - [ ] Schema: v1→v2 verlustfrei (Sektionen + unbekannte Top-Level-Keys erhalten).
@@ -227,27 +227,27 @@
 
 **Implementiert (additiv, kein Bestandscode überschrieben):**
 
-- `state_manager.py`:
+- `../../state_manager.py`:
   - `instance_states` um Spalte `workspace_state JSON` erweitert (CREATE + idempotentes
     `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`).
   - Fassaden-Methoden `save_workspace_state(instance_id, state)` und
     `get_workspace_state(instance_id)` (Delegation an das WindowStateRepository,
     Muster 15.04).
-- `window_state_repository.py`:
+- `../../window_state_repository.py`:
   - `save_workspace_state()` (E6, NOT-NULL-konform: liest bestehende
     symbol/timeframe der Row, Fallback `''`/`'M1'`; ON CONFLICT aktualisiert nur
     `workspace_state` + `updated_at`).
   - `get_workspace_state()` -> Optional[dict] (JSON geparst).
-- `analytics_profile_repository.py`:
+- `../../analytics_profile_repository.py`:
   - `SCHEMA_VERSION_DEFAULT = 2`; Sektions-Schema v2 (sources/charts/table/styling, E3).
   - `_migrate_v1_to_v2(payload)` (statisch, verlustfrei: bekannte Keys in Sektionen,
     `feature_id` -> `feature_ids`, unbekannte Top-Level-Keys bleiben erhalten).
   - `_row_to_profile()` migriert beim Lesen (E2, Single Source of Truth im Repo);
     `_ensure_schema_version()` migriert beim Schreiben (E4) -> keine neuen v1-Rows.
-- `analytics/engine/service_selector_model.py`:
+- `../../analytics/engine/service_selector_model.py`:
   - `resolve_valid_feature_ids(feature_ids) -> (valid, missing)` (E5, case-insensitiv,
     dedupliziert; `'native'`-Sentinel gilt als missing, B7).
-- `analytics/engine/analytics_view_model.py`:
+- `../../analytics/engine/analytics_view_model.py`:
   - Additives Signal `missing_services_detected = Signal(list)`.
   - `selector_model`-Injektion (lazy Default); `_resolve_feature_ids()` / `_flatten_payload()`.
   - `_apply_profile()`: flacht v2-Sections verlustfrei, Resolver isoliert fehlende
@@ -256,7 +256,7 @@
   - `_current_payload()` baut das v2-Sectioned-Payload (E3).
   - `restore_workspace(payload)` (E7: params + layout, kein Dirty, Resolver-Pfad,
     refresh_all) + Property `workspace_layout`.
-- `analytics/ui/analytics_win.py`:
+- `../../analytics/ui/analytics_win.py`:
   - `_keep_history_on_close = True` (E1, Dashboard-Fenster-Semantik; Kommentar des
     Bugfix 04.08.2026 angepasst).
   - Selector-Modell wird VOR dem VM erzeugt und injiziert (E5).
@@ -266,7 +266,7 @@
     `closeEvent()` ruft `_save_workspace()`; `_initial_load()` ruft nach `load_profiles()`
     `_restore_workspace()` (E7-Reihenfolge: Historie -> Profil -> Workspace).
 
-**Validierung (headless, `test/test.py`):**
+**Validierung (headless, `../../test/test.py`):**
 - Neuer Teil 36: W1a/b Spalte idempotent, W2a-e Roundtrip + NOT-NULL-Fallback,
   W3a-e v1->v2 verlustfrei, W4a Schreib-Migration, W5a-c Resolver (inkl. `native`),
   W6a-e `_apply_profile` (kein Dirty/Doppel-Refresh, Emit), W7a-e `restore_workspace`,
@@ -292,7 +292,7 @@
 - **Standalone Field**: Candle-Overlay operates on local chart field context, completely isolated from global header dropdowns.
 - **Full Lifecycle Integration**: Auto-persists into active profile (Schema v2.1) on profile change, window close (`closeEvent`), or app exit.
 
-## 2. Core DB Layer (`analytics/engine/feature_store_reader.py`)
+## 2. Core DB Layer (`../../analytics/engine/feature_store_reader.py`)
 - **Dimension Mapping Whitelist (`DIM_MAPPINGS`)**:
   - `date`: `CAST(bar_time AS DATE)`
   - `dow`: `EXTRACT(DOW FROM bar_time AT TIME ZONE 'UTC')::INTEGER`
@@ -304,7 +304,7 @@
   - **Aggregations**: `COUNT`, `AVG`, `SUM`, `MIN`, `MAX`, `HIT_RATE`, `CONFLUENCE_COUNT` (`COUNT(DISTINCT feature_id)`).
   - **Return**: `{"matrix": List[List[float]], "x_labels": List[str], "y_labels": List[str], "min_val": float, "max_val": float}`
 
-## 3. ViewModel Layer (`analytics/engine/analytics_view_model.py`)
+## 3. ViewModel Layer (`../../analytics/engine/analytics_view_model.py`)
 - **State Parameters (`_params`)**: `heatmap_x_dim` ("date"), `heatmap_y_dim` ("hour"), `heatmap_field` ("confluence"), `heatmap_agg` ("CONFLUENCE_COUNT"), `candle_projection_enabled` (False), `zoom_x_range` ([0.0, 1.0]), `zoom_y_range` ([0.0, 1.0]), `selected_feature_ids` (List[str]).
 - **Methods**: `set_heatmap_config()`, `set_heatmap_zoom()`, `set_candle_projection()`, `serialize_state()` (for profile/snapshot persistence).
 
@@ -316,12 +316,12 @@
 
 # Implementation Step-by-Step Guide
 
-### Step 1: SQL Matrix Engine (`analytics/engine/feature_store_reader.py`)
+### Step 1: SQL Matrix Engine (`../../analytics/engine/feature_store_reader.py`)
 1. Add `DIM_MAPPINGS` dict covering `date`, `dow`, `hour`, `dow_hour`, `timeframe`, `service_id`, `symbol`.
 2. Implement `fetch_generic_heatmap(...)` with SQL `GROUP BY x_val, y_val` using DuckDB JSON extract (`feature_data->>'target_field'`) or `COUNT(DISTINCT feature_id)` for `CONFLUENCE_COUNT`.
 3. Format output as dense N x M pivot matrix with bounds (`min_val`, `max_val`).
 
-### Step 2: ViewModel Logic & State Management (`analytics/engine/analytics_view_model.py`)
+### Step 2: ViewModel Logic & State Management (`../../analytics/engine/analytics_view_model.py`)
 1. Extend `_params` dictionary with Heatmap configuration keys, zoom ranges, and selection filters.
 2. Implement `set_heatmap_config(x_dim, y_dim, field, agg)`, `set_heatmap_zoom(x_range, y_range)`, and `set_candle_projection(enabled)` to trigger async data refresh.
 3. Update `export_profile_payload()` and `import_profile_payload()` to read/write under `charts.heatmap` (Schema v2.1).
@@ -339,32 +339,32 @@
 ### Step 5: Profile Persistence & Lifecycle Wiring (`analytics/analytics_window.py`)
 1. Connect `closeEvent` and `QApplication.aboutToQuit` to trigger automatic `save_last_snapshot()`.
 2. Ensure Profile load/save cycle correctly restores and applies `charts.heatmap` settings.
-3. Validate via headless tests (`py_compile` and `test/test.py`).
+3. Validate via headless tests (`py_compile` and `../../test/test.py`).
 
 ---
 
 ## 5. Review 09.08.2026: Konsistenz-, Vollständigkeits- & Korrektheits-Analyse
 
 **Grundlage:** Abgleich des Kapitels 20.02 gegen den verbindlichen Ist-Code
-(kein `docs/x_Exports.md`). Geprüfte Dateien: `analytics/engine/feature_store_reader.py`,
-`analytics/engine/analytics_repository.py`, `analytics/engine/analytics_view_model.py`,
-`analytics/engine/analytics_worker.py`, `analytics/ui/heatmap_page.py`,
-`analytics/ui/analytics_win.py`, `analytics_profile_repository.py`,
-`analytics/features/feature_builder.py` (OHLCV-Quelle).
+(kein `../x_Exports.md`). Geprüfte Dateien: `../../analytics/engine/feature_store_reader.py`,
+`../../analytics/engine/analytics_repository.py`, `../../analytics/engine/analytics_view_model.py`,
+`../../analytics/engine/analytics_worker.py`, `../../analytics/ui/heatmap_page.py`,
+`../../analytics/ui/analytics_win.py`, `../../analytics_profile_repository.py`,
+`../../analytics/features/feature_builder.py` (OHLCV-Quelle).
 
 ### 5.1 Ist-Code-Abgleich (Befunde)
 
 | # | Kapitel-Angabe 20.02 | Ist-Code (verbindlich) | Befund |
 |---|----------------------|------------------------|--------|
-| A1 | `analytics/gui/heatmap_widget.py` (§3/§4) | `analytics/ui/heatmap_page.py` (`HeatmapPage`, pyqtgraph `ImageItem`, viridis, Jump-to-Chart). Verzeichnis `analytics/gui/` existiert **nicht**. | **Pfadfehler** → E1 |
-| A2 | `analytics/analytics_window.py` (§5) | `analytics/ui/analytics_win.py` (`AnalyticsWindow`, `PersistentWindow`, `INSTANCE_ID="win_analytics"`). | **Pfadfehler** → E1 |
+| A1 | `analytics/gui/heatmap_widget.py` (§3/§4) | `../../analytics/ui/heatmap_page.py` (`HeatmapPage`, pyqtgraph `ImageItem`, viridis, Jump-to-Chart). Verzeichnis `analytics/gui/` existiert **nicht**. | **Pfadfehler** → E1 |
+| A2 | `analytics/analytics_window.py` (§5) | `../../analytics/ui/analytics_win.py` (`AnalyticsWindow`, `PersistentWindow`, `INSTANCE_ID="win_analytics"`). | **Pfadfehler** → E1 |
 | A3 | `DIM_MAPPINGS` + `fetch_generic_heatmap(...)` (§2) | existiert nicht. Ist: `fetch_heatmap(symbol, timeframe, metric, feature_id, feature_ids, limit)` mit **festen** Achsen DOW×Stunde (7×24), Metrik `"count"` \| numerischer JSON-Key (AVG via `TRY_CAST`). | **Neuimplementierung** (additiv) → E1 |
 | A4 | VM-`_params` `heatmap_x_dim/y_dim/field/agg`, `candle_projection_enabled`, `zoom_x_range/y_range`, `selected_feature_ids` (§3) | existieren nicht. Ist-`_params` nur `heatmap_metric` + `feature_ids` (Liste). | **Neuimplementierung** (additiv); `selected_feature_ids` ist Redundanz zu `feature_ids` → E10 |
 | A5 | `set_heatmap_config/set_heatmap_zoom/set_candle_projection/serialize_state()` (§3) | existieren nicht. Ist: `set_heatmap_metric()`; Persistenz via `_current_payload()` / `_apply_profile()` (+ `_flatten_payload`). | Methoden neu; `serialize_state()` = `_current_payload()`-Erweiterung |
 | A6 | `export_profile_payload()` / `import_profile_payload()` (§5 Schritt 2) | existieren nicht. Ist: `_current_payload()` (v2, sectioned) / `_apply_profile()`. | Namenskorrektur → E1 |
 | A7 | `chk_candle_projection`, `slider_zoom_x/y` (§4) | existieren nicht (HeatmapPage: nur Metrik-Combo + Doppelklick-Jump-to-Chart). | **Neuimplementierung** → E1/E8/E9 |
 | A8 | "Auto-persists into active profile ... on profile change, window close, app exit" (§1) | Profil = **Option B – Explicit Save** (Persistenz NUR auf explizites `save_profile()`); automatisch persistiert wird nur der Workspace im `closeEvent` (`_save_workspace()`, 20.01 E1). | **Widerspruch** → E2 |
-| A9 | "Schema v2.1" (§1) | `SCHEMA_VERSION_DEFAULT = 2` (`analytics_profile_repository.py`); es existiert KEINE v2.1. | Kein Bump nötig → E3 |
+| A9 | "Schema v2.1" (§1) | `SCHEMA_VERSION_DEFAULT = 2` (`../../analytics_profile_repository.py`); es existiert KEINE v2.1. | Kein Bump nötig → E3 |
 | A10 | `DIM_MAPPINGS["date"] = CAST(bar_time AS DATE)` (§2) | Wanduhr-Garantie (Invariante 7): `bar_time` ist Berlin-Wanduhr-encoded; DuckDB rechnet TIMESTAMPTZ in die Session-TZ (Berlin +1/+2h) um. | **DST-fragil**: Wanduhr 23:00–23:59 (Sommer) → Folgetag 01:00 → falsches Datum → E4 |
 | A11 | `dow`/`hour`/`dow_hour` mit `bar_time AT TIME ZONE 'UTC'` (§2) | exakt das Muster von `fetch_heatmap()` / `fetch_recent_bar_time_for_cell()`. | **konsistent** ✓ |
 | A12 | `feature_ids`-Filter (`WHERE feature_id IN (...)`) | `_apply_feature_filter()` (15.03-E) vorhanden. | **konsistent** ✓ |
@@ -375,12 +375,12 @@
 
 - **E1 – Additive Implementierung & korrigierte Pfade:** Alle Ergänzungen erfolgen additiv
   (Open/Closed, Code-Preserving). Bestehende `fetch_heatmap()`/`get_heatmap()`/`HeatmapPage`
-  bleiben unangetastet. Dateien: `analytics/engine/feature_store_reader.py` (additiv),
-  `analytics/engine/analytics_repository.py` (additiv), `analytics/engine/analytics_view_model.py`
-  (additiv), `analytics/engine/analytics_worker.py` (**neuer Query-Kind `QUERY_HEATMAP_GENERIC`**,
+  bleiben unangetastet. Dateien: `../../analytics/engine/feature_store_reader.py` (additiv),
+  `../../analytics/engine/analytics_repository.py` (additiv), `../../analytics/engine/analytics_view_model.py`
+  (additiv), `../../analytics/engine/analytics_worker.py` (**neuer Query-Kind `QUERY_HEATMAP_GENERIC`**,
   bestehender `QUERY_HEATMAP` bleibt unverändert → kein Regressionsrisiko), neue UI-Datei
-  **`analytics/ui/heatmap_widget.py`** (Korrektur: nicht `analytics/gui/`), Lifecycle in
-  `analytics/ui/analytics_win.py`. Methodenbenennung wie Kapitel (`set_heatmap_config()` usw.)
+  **`../../analytics/ui/heatmap_widget.py`** (Korrektur: nicht `analytics/gui/`), Lifecycle in
+  `../../analytics/ui/analytics_win.py`. Methodenbenennung wie Kapitel (`set_heatmap_config()` usw.)
   statt der nicht existenten `export/import_profile_payload()`.
 - **E2 – Persistenz-Semantik (Kapitel-Korrektur):** Es gibt KEIN Auto-Save ins aktive Profil
   (Option B – Explicit Save bleibt verbindlich). Die Heatmap-Config wird
@@ -449,7 +449,7 @@
 
 ### 5.4 Korrigierte Implementierungs-Schrittliste (verbindlich ab 09.08.2026)
 
-1. **Schritt 1 (SQL-Matrix-Engine):** additiv in `analytics/engine/feature_store_reader.py`
+1. **Schritt 1 (SQL-Matrix-Engine):** additiv in `../../analytics/engine/feature_store_reader.py`
    – `DIM_MAPPINGS` (date/dow/hour/dow_hour/timeframe/service_id/symbol; E4 beachten) +
    `fetch_generic_heatmap(symbol, timeframe, x_dim, y_dim, field, agg, feature_ids, limit)`
    mit Pivot-Ausgabe und `min_val`/`max_val`.
@@ -460,16 +460,16 @@
    `set_heatmap_config()/set_heatmap_zoom()/set_candle_projection()`,
    `_current_payload()`-Erweiterung (`charts.heatmap`, E2/E3), Auflösung in
    `_apply_profile()`/`restore_workspace()` (Lücke 5.3-6).
-3. **Schritt 3 (Heatmap/Confluence-Rendering):** NEUE Datei `analytics/ui/heatmap_widget.py`
+3. **Schritt 3 (Heatmap/Confluence-Rendering):** NEUE Datei `../../analytics/ui/heatmap_widget.py`
    – diskrete Konfluenz-Skala (E7), viridis für Wert-Metriken, Einbettung als Modus in die
-   bestehende `analytics/ui/heatmap_page.py` (additiv, Dow×Hour bleibt Standard-Modus),
+   bestehende `../../analytics/ui/heatmap_page.py` (additiv, Dow×Hour bleibt Standard-Modus),
    Slider-Bindung an `setXRange`/`setYRange` (E8).
 4. **Schritt 4 (Candle-Overlay):** `get_ohlcv_snapshot()` (E9), `chk_candle_projection`
    nur bei X=`date` aktiv, semi-transparente Candles an die Heatmap-Spalten gebunden.
-5. **Schritt 5 (Lifecycle):** `analytics/ui/analytics_win.py` – Erweiterung von
+5. **Schritt 5 (Lifecycle):** `../../analytics/ui/analytics_win.py` – Erweiterung von
    `_save_workspace()`/`_restore_workspace()` um die Heatmap-Config; KEIN
    `aboutToQuit`/`save_last_snapshot`-Neu-Hook (E2); Validierung headless via
-   `py_compile` + `test/test.py` (Logik-/DB-Tests, keine UI-Tests).
+   `py_compile` + `../../test/test.py` (Logik-/DB-Tests, keine UI-Tests).
 
 ---
 
@@ -479,14 +479,14 @@
 
 | Datei | Änderung |
 |-------|----------|
-| `analytics/engine/feature_store_reader.py` | + `DB_MARKET`, `DIM_MAPPINGS`, `HEATMAP_DIMENSIONS`, `HEATMAP_AGGREGATIONS`, `MAX_HEATMAP_CELLS`, `OHLCV_SNAPSHOT_LIMIT`, `_format_dim_value()`, `fetch_generic_heatmap()`, `_empty_generic_heatmap()`, `fetch_ohlcv_snapshot()` |
-| `analytics/engine/analytics_repository.py` | + `get_generic_heatmap()` (inkl. `metrics` + defensives `field`-Fallback), `get_ohlcv_snapshot()` |
-| `analytics/engine/analytics_worker.py` | + `QUERY_HEATMAP_GENERIC`, `QUERY_OHLCV` + Dispatch |
-| `analytics/engine/analytics_view_model.py` | + `_params`: `heatmap_x_dim/y_dim/field/agg`, `candle_projection_enabled`, `zoom_x_range/y_range`; + `request_heatmap_generic()`, `request_ohlcv_snapshot()`, `set_heatmap_config()`, `set_heatmap_zoom()`, `set_candle_projection()`, `_clamp_zoom()`, `_apply_heatmap_section()`; `refresh_all()` + `QUERY_HEATMAP_GENERIC`; `_current_payload()` + `charts.heatmap`; `_current_params()`-Zweige |
-| `analytics/ui/heatmap_widget.py` | **NEU:** `HeatmapWidget` – generische Heatmap (dims/agg/field), diskrete Konfluenz-Skala (E7), viridis für Wert-Metriken, Zoom-Slider (E8), Preis-Strip (E9) |
-| `analytics/ui/heatmap_page.py` | + Modus-Combo (`standard` \| `generic`), `QStackedWidget`, `mode_id`/`set_mode()`, `request_data()` modus-abhängig |
-| `analytics/ui/analytics_win.py` | `_save_workspace()` + `layout.heatmap_mode`; `_restore_workspace()` wendet `heatmap_mode` an |
-| `test/test.py` | + Tests 37 a1–j2 (Reader/Repository/Worker/ViewModel, headless, temporäre DuckDBs in `test/`) |
+| `../../analytics/engine/feature_store_reader.py` | + `DB_MARKET`, `DIM_MAPPINGS`, `HEATMAP_DIMENSIONS`, `HEATMAP_AGGREGATIONS`, `MAX_HEATMAP_CELLS`, `OHLCV_SNAPSHOT_LIMIT`, `_format_dim_value()`, `fetch_generic_heatmap()`, `_empty_generic_heatmap()`, `fetch_ohlcv_snapshot()` |
+| `../../analytics/engine/analytics_repository.py` | + `get_generic_heatmap()` (inkl. `metrics` + defensives `field`-Fallback), `get_ohlcv_snapshot()` |
+| `../../analytics/engine/analytics_worker.py` | + `QUERY_HEATMAP_GENERIC`, `QUERY_OHLCV` + Dispatch |
+| `../../analytics/engine/analytics_view_model.py` | + `_params`: `heatmap_x_dim/y_dim/field/agg`, `candle_projection_enabled`, `zoom_x_range/y_range`; + `request_heatmap_generic()`, `request_ohlcv_snapshot()`, `set_heatmap_config()`, `set_heatmap_zoom()`, `set_candle_projection()`, `_clamp_zoom()`, `_apply_heatmap_section()`; `refresh_all()` + `QUERY_HEATMAP_GENERIC`; `_current_payload()` + `charts.heatmap`; `_current_params()`-Zweige |
+| `../../analytics/ui/heatmap_widget.py` | **NEU:** `HeatmapWidget` – generische Heatmap (dims/agg/field), diskrete Konfluenz-Skala (E7), viridis für Wert-Metriken, Zoom-Slider (E8), Preis-Strip (E9) |
+| `../../analytics/ui/heatmap_page.py` | + Modus-Combo (`standard` \| `generic`), `QStackedWidget`, `mode_id`/`set_mode()`, `request_data()` modus-abhängig |
+| `../../analytics/ui/analytics_win.py` | `_save_workspace()` + `layout.heatmap_mode`; `_restore_workspace()` wendet `heatmap_mode` an |
+| `../../test/test.py` | + Tests 37 a1–j2 (Reader/Repository/Worker/ViewModel, headless, temporäre DuckDBs in `../../test`) |
 
 **Umsetzungs-Nachtraege (Präzisierungen der Review-Entscheidungen E1–E10):**
 
@@ -514,8 +514,8 @@
    (`closeEvent` → `_save_workspace()`, inkl. `heatmap_mode`).
 
 **Validierung (headless, 09.08.2026):**
-- `py_compile` auf allen 7 geänderten Python-Dateien + `test/test.py`: PASS.
-- `test/test.py`: **30 neue Checks 37 a1–j2 alle PASS** (Matrix-Form/-Werte,
+- `py_compile` auf allen 7 geänderten Python-Dateien + `../../test/test.py`: PASS.
+- `../../test/test.py`: **30 neue Checks 37 a1–j2 alle PASS** (Matrix-Form/-Werte,
   Confluence, AVG-JSON-Key, dow_hour-Labels, feature_ids-Filter, ValueError,
   Repository-Fallbacks, OHLCV-Snapshot inkl. Wanduhr-Epoch, VM-Params,
   Payload-`charts.heatmap`, Profil-Roundtrip via `_apply_heatmap_section`,
@@ -542,7 +542,7 @@ bestehende Strukturen und Logik blieben unverändert.
 | A1 | Analytics-Tabelle zeigt keine Einträge, obwohl Services im MasterTree angehakt sind | `_apply_feature_filter` (analytics/engine/analytics_view_model.py) filterte case-sensitiv und nicht whitespace-tolerant – `feature_id`-Vergleich schlug bei Groß-/Kleinschreibung fehl | Filter case-insensitiv + whitespace-tolerant: `LOWER(TRIM(feature_id))`; VM-Setter refreshen auch `QUERY_HEATMAP_GENERIC`/`QUERY_OHLCV` |
 | A2 | MasterTree-Knoten (Set/Service/Plugin) bleiben nach Anhaken aufgeklappt / kollabieren ungewollt | fehlende Expansion der Vorfahren beim Setzen der Checkboxen | `master_tree.py`: neue `_expand_ancestors()` in `set_checked_feature_ids` + `_on_item_changed` |
 
-**Validierung:** `test/check_bugfix_0808.py` 9/9 PASS; `test/test.py` Block 38 (9 Checks) ergänzt.
+**Validierung:** `../../test/check_bugfix_0808.py` 9/9 PASS; `../../test/test.py` Block 38 (9 Checks) ergänzt.
 
 ### Bugfix B (09.08.2026, Commit `3e7c220`): Seiten-Navigation zeigt immer nur die Tabelle
 
@@ -550,7 +550,7 @@ bestehende Strukturen und Logik blieben unverändert.
 |---|---------|---------|-----|
 | B1 | Egal welcher Menüeintrag im Analytics-Fenster (Tabelle/Heatmap/Verteilung/Scatter) – sichtbar blieb immer die Tabelle | Alt-Bug seit Phase 15.03: `AnalyticsWindow._on_page_changed` rief nur `page.request_data()` auf, **ohne** `self.pages_stack.setCurrentIndex(row)` – der Stack blieb dauerhaft auf Index 0 | `_on_page_changed` (analytics/ui/analytics_win.py): `self.pages_stack.setCurrentIndex(row)` VOR `request_data()`; ungültige Rows bleiben ohne Crash |
 
-**Validierung:** `test/check_page_nav.py` 7/7 PASS (Stack folgt Row 1/3/0/2, ungültige Row kein Crash, `request_data` je Page genau 1x).
+**Validierung:** `../../test/check_page_nav.py` 7/7 PASS (Stack folgt Row 1/3/0/2, ungültige Row kein Crash, `request_data` je Page genau 1x).
 
 ### Bugfix C (09.08.2026, Commit `3e7c220`): Traceback in der Heatmap-Candle-Projektion
 
@@ -586,11 +586,11 @@ bestehende Strukturen und Logik blieben unverändert.
 ## 2. Analyse 09.08.2026: Ist-Code-Abgleich
 
 **Grundlage:** Abgleich der Kapitel-Vorgabe 20.02.01 gegen den verbindlichen Ist-Code
-(kein `docs/x_Exports.md`, keine `docs/Current`). Geprüfte Dateien:
-`analytics/engine/feature_store_reader.py`, `analytics/engine/analytics_view_model.py`,
-`analytics/ui/heatmap_widget.py`, `analytics/ui/heatmap_page.py`,
-`analytics/engine/service_selector_model.py`, `serviceui/service_selector_dialog.py`,
-`analytics/ui/analytics_win.py`.
+(kein `../x_Exports.md`, keine `../Current`). Geprüfte Dateien:
+`../../analytics/engine/feature_store_reader.py`, `../../analytics/engine/analytics_view_model.py`,
+`../../analytics/ui/heatmap_widget.py`, `../../analytics/ui/heatmap_page.py`,
+`../../analytics/engine/service_selector_model.py`, `../../serviceui/service_selector_dialog.py`,
+`../../analytics/ui/analytics_win.py`.
 
 ### 2.1 Befunde
 
@@ -640,7 +640,7 @@ bestehende Strukturen und Logik blieben unverändert.
   `set_heatmap_config` (ViewModel) mappen `"dow_hour"` defensiv auf `"hour"` – sonst würde
   `_set_combo_data` (additives Hinzufügen unbekannter Werte) die entfernte Dimension in
   Alt-Profilen/Workspaces wieder in die Combo aufnehmen. Tests anpassen:
-  `test/test.py` Block 37 d1/d2 (dow_hour) und `test/check_heatmap_bugfix.py`
+  `../../test/test.py` Block 37 d1/d2 (dow_hour) und `../../test/check_heatmap_bugfix.py`
   (dow_hour-Achsen) auf die neue feste Skala (`dow`/`hour`) umstellen.
 - **E7 – Overlay-Zoom-Lock vervollständigen:** Bei X ≠ `date` →
   `_clear_overlay()` + `_price_vb.setXLink(None)` (Entkopplung der Zoom-Sync) + Checkbox
@@ -662,16 +662,16 @@ bestehende Strukturen und Logik blieben unverändert.
 
 | Datei | Änderung |
 |-------|----------|
-| `analytics/engine/feature_store_reader.py` | `dow_hour` entfernen (DIM_MAPPINGS/HEATMAP_DIMENSIONS/_format_dim_value/_axis_coords/Docstrings); Mo–Fr-Filter für `dow` in `fetch_generic_heatmap`; `DOW_WEEK_LABELS` |
-| `analytics/ui/heatmap_widget.py` | Datums-Formatter 5 Stufen (E1); `_DIM_LABELS["hour"]="Tageszeit"` (E2); feste Skalen hour `[0,24)` / dow `[1,6)` (E3/E5); UTC-Offset-Label (E4); `dow_hour` entfernen (E6); Overlay-Zoom-Lock via `setXLink` (E7); Service-Label-Resolver + Combo-Mindestbreite (E8) |
-| `analytics/engine/analytics_view_model.py` | `_sanitize_dim()` (dow_hour → hour) in `_apply_heatmap_section`/`restore_workspace`/`set_heatmap_config` (E6); `resolve_service_label()` (lazy `_selector_model`, E8) |
-| `test/test.py` | Block 37 d1/d2 (dow_hour) → neue feste Skalen-Checks |
-| `test/check_heatmap_bugfix.py` | dow_hour-Checks ersetzen/anpassen |
+| `../../analytics/engine/feature_store_reader.py` | `dow_hour` entfernen (DIM_MAPPINGS/HEATMAP_DIMENSIONS/_format_dim_value/_axis_coords/Docstrings); Mo–Fr-Filter für `dow` in `fetch_generic_heatmap`; `DOW_WEEK_LABELS` |
+| `../../analytics/ui/heatmap_widget.py` | Datums-Formatter 5 Stufen (E1); `_DIM_LABELS["hour"]="Tageszeit"` (E2); feste Skalen hour `[0,24)` / dow `[1,6)` (E3/E5); UTC-Offset-Label (E4); `dow_hour` entfernen (E6); Overlay-Zoom-Lock via `setXLink` (E7); Service-Label-Resolver + Combo-Mindestbreite (E8) |
+| `../../analytics/engine/analytics_view_model.py` | `_sanitize_dim()` (dow_hour → hour) in `_apply_heatmap_section`/`restore_workspace`/`set_heatmap_config` (E6); `resolve_service_label()` (lazy `_selector_model`, E8) |
+| `../../test/test.py` | Block 37 d1/d2 (dow_hour) → neue feste Skalen-Checks |
+| `../../test/check_heatmap_bugfix.py` | dow_hour-Checks ersetzen/anpassen |
 
 ### 2.4 Validierung (headless, nach Freigabe)
 
 - `py_compile` auf den geänderten Python-Dateien.
-- `test/test.py` Block 37 (angepasst) + isolierter Check in `test/`.
+- `../../test/test.py` Block 37 (angepasst) + isolierter Check in `../../test`.
 - Keine UI-Tests (harte Regel 4); manueller Funktionstest der GUI durch den Anwender.
 
 ---
@@ -694,7 +694,7 @@ User-Meldungen 1–3 (Abschnitt 5.9) wurden zusammen committet (Commit `86f0527`
 | E8 | Service-Anzeige | `resolve_service_label()` im ViewModel (`{Kategorie} / {Name}`, `srv_`-Prefix entfällt, lazy `_selector_model`); `service_id`-Achsen-Labels via Resolver; X/Y-Combo-Mindestbreite 160 px |
 
 **Validierung (headless):** `py_compile` auf allen geänderten Dateien; die
-E1–E8-Checks sind in `test/check_heatmap_bugfix.py` integriert (feste Skalen,
+E1–E8-Checks sind in `../../test/check_heatmap_bugfix.py` integriert (feste Skalen,
 Mo–Fr-Labels, 5-Stufen-Datumsformat, UTC-Offset, `dow_hour`-Sanitizer via
 `_axis_bounds`, Overlay-Zoom-Lock); Details in Abschnitt 5.9.
 ---
@@ -717,17 +717,17 @@ Commit: `01229b1`.
 | H4 | **Natürliche Achsen-Werte** (Punkte 3+4) | Reader liefert neue `x_axis`/`y_axis` im generischen Payload: `date` → Wanduhr-Mitternachts-Epochs (Sekunden), `hour`/`dow`/`dow_hour` → Ganzzahlen (0–23 bzw. 0–167), kategorial → Indizes. `ImageItem` wird per `setRect` exakt auf den Bereich gemappt (date: ± halber Tag um Mitternacht; ganzzahlig: ±0,5; kategorial: −0,5..n−0,5) → nichts wird über die Tagesgrenze gezeichnet; Achsen-Zuordnung explizit (x_dim→X, y_dim→Y), kein Vertauschen |
 | H5 | **Dynamische Achsen-Ticks** (Punkte 5+6) | Neue `_HeatmapAxis(pg.AxisItem)` mit `configure(dim, labels)` + überschriebenen `tickValues`/`tickStrings`. `date`: Schrittwahl via `_pick_time_step()` (1s…1J) → je Zoom-Level Tage → Stunden → Minuten (TradingView-Stil); Formatierung nach Spacing (`TT.MM.JJ` / `TT.MM. HH:MM` / `HH:MM`). `hour`/`dow`/`dow_hour`: ganzzahlige Schritte (`_nice_int_step`) → mehr Zwischenwerte beim Zoom. Kategorial: Labels aus Payload |
 | H6 | **Zoom für alle Maßstäbe** (Punkt 6) | `_ZOOMABLE_DIMS` (nur `date`) entfernt – Zoom-Slider X/Y sind immer aktiv und wirken auf alle Dimensionen. `_apply_x_range`/`_apply_y_range` rechnen mit natürlichen `_x_min/_x_max`-Bounds statt Zell-Indizes |
-| H7 | **WAL-Guard** (Start-Abbruch, Zusatz) | `DbPool._open_with_wal_recovery()`: bei `duckdb.InternalException` mit "Failure while replaying WAL" wird die korrupte WAL unter `*.duckdb.wal.corrupt_<Zeitstempel>` weggesichert und der Connect erneut versucht (wiederkehrendes Start-Problem unter Windows nach hartem Beenden). `.gitignore` um `*.duckdb.wal.corrupt_*` erweitert |
+| H7 | **WAL-Guard** (Start-Abbruch, Zusatz) | `DbPool._open_with_wal_recovery()`: bei `duckdb.InternalException` mit "Failure while replaying WAL" wird die korrupte WAL unter `*.duckdb.wal.corrupt_<Zeitstempel>` weggesichert und der Connect erneut versucht (wiederkehrendes Start-Problem unter Windows nach hartem Beenden). `../../.gitignore` um `*.duckdb.wal.corrupt_*` erweitert |
 
 ### Bewusst NICHT geändert
 - `fetch_ohlcv_snapshot()` / `QUERY_OHLCV` (Alt-Aufrufer/Tests)
 - `HeatmapPage`-Standard-Modus (Dow×Stunde) unangetastet
-- `docs/x_Exports.md` (nicht committet)
+- `../x_Exports.md` (nicht committet)
 
 ### Validierung (headless, keine UI-Tests)
 - `py_compile` auf allen 8 geänderten Dateien: PASS
-- `test/check_heatmap_bugfix.py`: **34/34 PASS** (Reader x_axis/y_axis inkl. Mitternachts-Epochs + Tagesabständen, `fetch_daily_ohlc` mit Wanduhr-Mitternacht + OHLC-Konsistenz, `limit=None` → alle Daten/2083 Tage, Worker-Dispatch `QUERY_DAILY_OHLC`, Axis-Ticks date 100T/3h/90s → 1T/1h/30s + Format TT.MM.JJ/HH:MM, hour/dow_hour/kategorial-Ticks, Widget-Offscreen: Overlay im selben Canvas, X-Bounds = Epochs ± halber Tag, Y-Bounds = −0,5..1,5, Cleanup)
-- `test/test.py` Blöcke 37/38: alle PASS (nur 6 bekannte offscreen-Geometrie-Fehler P2/P5/H3–H5/H7, unabhängig von dieser Umsetzung)
+- `../../test/check_heatmap_bugfix.py`: **34/34 PASS** (Reader x_axis/y_axis inkl. Mitternachts-Epochs + Tagesabständen, `fetch_daily_ohlc` mit Wanduhr-Mitternacht + OHLC-Konsistenz, `limit=None` → alle Daten/2083 Tage, Worker-Dispatch `QUERY_DAILY_OHLC`, Axis-Ticks date 100T/3h/90s → 1T/1h/30s + Format TT.MM.JJ/HH:MM, hour/dow_hour/kategorial-Ticks, Widget-Offscreen: Overlay im selben Canvas, X-Bounds = Epochs ± halber Tag, Y-Bounds = −0,5..1,5, Cleanup)
+- `../../test/test.py` Blöcke 37/38: alle PASS (nur 6 bekannte offscreen-Geometrie-Fehler P2/P5/H3–H5/H7, unabhängig von dieser Umsetzung)
 - Manueller Funktionstest der GUI erfolgt durch den Anwender.
 
 ---
@@ -748,8 +748,8 @@ unangetastet.
 
 **Validierung (headless, keine UI-Tests):**
 - `py_compile` auf allen 4 geänderten Dateien: PASS.
-- `test/check_heatmap_bugfix.py`: **59/59 PASS** – DB-Tests auf **synthetische
-  DuckDBs in `test/`** umgestellt (`tmp_hm_*.duckdb`), da die echten
+- `../../test/check_heatmap_bugfix.py`: **59/59 PASS** – DB-Tests auf **synthetische
+  DuckDBs in `../../test`** umgestellt (`tmp_hm_*.duckdb`), da die echten
   `data/*.duckdb` bei laufender App exklusiv gesperrt sind (Windows-Lock).
   Neue Checks: Meldung 1 (hour-Ticks in `[0, 24)` bei Rauszoom, kein
   24er-Duplikat, `_format(-1/24)` leer, Teilbereich unverändert), Meldung 2
@@ -757,7 +757,7 @@ unangetastet.
   `feature_keys_by_service`, `field_sources` inkl. geteiltem Key → beide
   Services, `_field_label` ohne `srv_`, Combo-Text `'{Name} / {Key}'`,
   Combo-DATA = Roh-Key).
-- `test/test.py`: unverändert (kein Kontakt zu dieser Umsetzung; 6 bekannte
+- `../../test/test.py`: unverändert (kein Kontakt zu dieser Umsetzung; 6 bekannte
   offscreen-Geometrie-Fehler P2/P5/H3–H5/H7 unabhängig).
 - Manueller Funktionstest der GUI erfolgt durch den Anwender.
 
@@ -777,16 +777,16 @@ bestehende Strukturen blieben unangetastet.
 | M3c | Feld-Dropdown zeigt Kategorie-Pfad '{Kategorie} / {Name} / {Key}' (z. B. 'Grid / Grid Lines / open') | `_field_label` nutzte `resolve_service_label` (E8-Resolver mit Kategorie-Pfad) | Neuer ViewModel-Resolver `resolve_service_display_name(plugin_id)` (nur `display_name`, `srv_`-Prefix entfällt, **ohne** Kategorie-Pfad) → `_field_label` liefert `'{Name} / {Key}'` (z. B. 'Grid Lines / open'). Die **E8-Achsen-Labels** der service_id-Dimension behalten weiterhin `{Kategorie} / {Name}` (`resolve_service_label` unverändert) |
 
 **Betroffene Dateien:**
-- `analytics/ui/heatmap_widget.py` – LWC-Datums-Skala (`_DATE_TARGET_PX`,
+- `../../analytics/ui/heatmap_widget.py` – LWC-Datums-Skala (`_DATE_TARGET_PX`,
   `_MONTHS_SHORT`, `_lwc_date_ticks`, `_date_marks`, `_select_date_marks`,
   Per-Tick-`_format`), `_field_label` → `resolve_service_display_name`
-- `analytics/engine/analytics_view_model.py` – neuer Resolver
+- `../../analytics/engine/analytics_view_model.py` – neuer Resolver
   `resolve_service_display_name()` (lazy `_selector_model`, Muster
   `resolve_service_label`)
 
 **Validierung (headless, keine UI-Tests):**
 - `py_compile` auf beiden geänderten Python-Dateien: PASS.
-- `test/check_heatmap_bugfix.py`: **alle PASS** – alte Spacing-Format-Checks
+- `../../test/check_heatmap_bugfix.py`: **alle PASS** – alte Spacing-Format-Checks
   durch Per-Tick-Formate ersetzt (Jahr/Monat/ISO-Woche/Tag/Stunde/Minute),
   neue LWC-Selektions-Checks: Jahres-Zoom → min_gap 36,5 d + nur Tagesmarken
   (7 Ticks), 2-Tage-Zoom → min_gap 4,8 h + Stunden-Ticks, 3h-Zoom →
@@ -817,21 +817,21 @@ blieben unangetastet.
 | D1 | Datums-Achse zeigte 'Datum (EXP)' bzw. 'Datum (x1e+09)' als Beschriftung | pyqtgraph `setLabel(text)` mit `units=None` → leere Einheit → Default-SI-Ranges `((0.,1.), (1e9, inf))`; die date-Epochs (~1.7e9) fallen in (1e9, inf) → `autoSIPrefixScale = 1e-9` → Suffix `(x1e+09)` angehängt. Die Ticks werden ohnehin von `tickStrings` formatiert (Scale ignoriert) – das Suffix war irreführend | `_HeatmapAxis.__init__`: **`enableAutoSIPrefix(False)`** (unterdrückt das EXP-Suffix für X- und Y-Achse); Label der date-Achse jetzt **'Datum/Zeit'** (`_render_generic`, X und Y; `_DIM_LABELS`-Dropdown bleibt 'Datum') |
 
 **Betroffene Dateien:**
-- `analytics/engine/feature_store_reader.py` – `feature_keys_by_service()`:
+- `../../analytics/engine/feature_store_reader.py` – `feature_keys_by_service()`:
   neue `feature_id`/`feature_ids`-Parameter + `_apply_feature_filter`
-- `analytics/engine/analytics_repository.py` – `get_generic_heatmap()`:
+- `../../analytics/engine/analytics_repository.py` – `get_generic_heatmap()`:
   feature_ids-Filter für `metrics`/`field_sources` (`avail_filtered`,
   Fallback ungefiltert bei leer)
-- `analytics/engine/analytics_view_model.py` – `resolve_service_display_name()`
+- `../../analytics/engine/analytics_view_model.py` – `resolve_service_display_name()`
   (Service-Name direkt aus `plugin_id`, Pretty-Fallbacks)
-- `analytics/ui/heatmap_widget.py` – `_field_label` (1 Service → Name;
+- `../../analytics/ui/heatmap_widget.py` – `_field_label` (1 Service → Name;
   mehrere Services → Roh-Key), Zoom-Richtung (`_set_zoom_range`/
   `_set_zoom_slider`/Initialwert/Tooltip), date-Label 'Datum/Zeit' +
   `enableAutoSIPrefix(False)` in `_HeatmapAxis`
 
 **Validierung (headless, keine UI-Tests):**
 - `py_compile` auf allen 4 geänderten Python-Dateien: PASS.
-- `test/check_heatmap_bugfix.py`: **alle PASS** – `resolve_service_display_name`
+- `../../test/check_heatmap_bugfix.py`: **alle PASS** – `resolve_service_display_name`
   ('Grid Lines'/'Proximity'/'Swing Momentum'/'Swing Volume Profile'/
   Unbekannt→'Unbekannter Service'/'native'→'Native'/leer→'Allgemein'),
   `_field_label` bei geteiltem Key = Roh-Key (kein 'Pfad'), Feld-Combo ohne
@@ -843,7 +843,7 @@ blieben unangetastet.
   X=date → labelText 'Datum/Zeit' + labelString ohne '(x1e…)/(x…',
   Y=date-Regression ebenfalls 'Datum/Zeit', hour-Achse 'Tageszeit (UTC+X)'
   ohne EXP.
-- `test/test.py`: unverändert (kein Kontakt zu dieser Umsetzung).
+- `../../test/test.py`: unverändert (kein Kontakt zu dieser Umsetzung).
 - Manueller Funktionstest der GUI erfolgt durch den Anwender.
 
 
@@ -858,10 +858,10 @@ blieben unangetastet.
 - **Typen (E5)**: Freie String-Typen unterstützen (z. B. `"bool"`, `"float"`, `"list[float]"`).
 
 ## 2. Abdeckung Core-Plugins (E6)
-Befüllung der Modul-Konstante `_*_OUTPUT_SCHEMA` in allen 8 aktiven Services unter `analytics/features/definitions/`:
+Befüllung der Modul-Konstante `_*_OUTPUT_SCHEMA` in allen 8 aktiven Services unter `../../analytics/features/definitions`:
 - `srv_grid_lines.py`, `srv_proximity.py`, `srv_swing_structure.py`, `srv_swing_momentum.py`, `srv_swing_volume_profile.py`, `srv_trend_breakout.py`, `srv_trend_hma_pivot.py`, `srv_trend_regime.py`.
 
-## 3. UI-Anzeige im Parameter-Panel (E2, E7) (`serviceui/param_columns.py`)
+## 3. UI-Anzeige im Parameter-Panel (E2, E7) (`../../serviceui/param_columns.py`)
 - **Verortung (E7)**: Integration in `_update_service_info_label` / `_build_service_column` unterhalb der allgemeinen Beschreibung.
 - **Gruppierung/Filter (E2)**:
   - **Haupt-Resultatfelder**: Standardmäßig eingerückt anzeigen (`└── 🔹 {field_name} ({type}): {description}`).
@@ -869,10 +869,10 @@ Befüllung der Modul-Konstante `_*_OUTPUT_SCHEMA` in allen 8 aktiven Services un
 - **Read-Only**: Strikte schreibgeschützte Formatierung.
 
 ## 4. Implementation Steps
-1. **Base-Plugin (`analytics/features/plugins/base_plugin.py`)**: Add `@property def output_schema`.
+1. **Base-Plugin (`../../analytics/features/plugins/base_plugin.py`)**: Add `@property def output_schema`.
 2. **Plugins (`analytics/features/definitions/srv_*.py`)**: Define `_*_OUTPUT_SCHEMA` & property across all 8 plugins.
-3. **UI (`serviceui/param_columns.py`)**: Render `output_schema` indented below description text field.
-4. **Validation (`test/test.py`)**: Headless Test verifying `output_schema` retrieval for all registered plugins + `py_compile`.
+3. **UI (`../../serviceui/param_columns.py`)**: Render `output_schema` indented below description text field.
+4. **Validation (`../../test/test.py`)**: Headless Test verifying `output_schema` retrieval for all registered plugins + `py_compile`.
 
 
 ---
@@ -894,7 +894,7 @@ Befüllung der Modul-Konstante `_*_OUTPUT_SCHEMA` in allen 8 aktiven Services un
    Beschreibung in einem Fenster zeigt.
 
 ## 2. Umsetzung (Commit `1f40783`, Tag `20.03_bugfix`)
-- **`serviceui/param_columns.py`**:
+- **`../../serviceui/param_columns.py`**:
   - Output-Schema-Block aus `_update_service_info_label` entfernt (Punkt 1).
   - Neue Sektion **UNTER** dem Info-Label in `_build_service_column`: Header
     `📊 Resultatfelder (Output-Schema):`, je Haupt-Resultatfeld eine Zeile
@@ -904,13 +904,13 @@ Befüllung der Modul-Konstante `_*_OUTPUT_SCHEMA` in allen 8 aktiven Services un
     `🔧 System-Metrik: …` (Semikolon-getrennt, ohne Beschreibung).
   - Neues State-Dict `self._service_output_schemas[iid]` (Reset in
     `_clear_service_columns`); `QDialog`-Import ergänzt.
-- **`serviceui/master_tree.py`**: `INFO_BUTTON_TEXT` von `"ℹ"` (U+2139) zurück auf
+- **`../../serviceui/master_tree.py`**: `INFO_BUTTON_TEXT` von `"ℹ"` (U+2139) zurück auf
   ASCII `"i"` (Punkt 3) – inkl. Begründungskommentar.
 
 ## 3. Validierung (headless, keine UI)
 - `py_compile` auf beiden geänderten Dateien: OK.
-- `test/check_output_schema.py`: ALL CHECKS PASSED (8 Services, Main/Tech-Split).
-- Neuer Testblock `20.03-Bugfix` in `test/test.py`: `INFO_BUTTON_TEXT` = ASCII `'i'`
+- `../../test/check_output_schema.py`: ALL CHECKS PASSED (8 Services, Main/Tech-Split).
+- Neuer Testblock `20.03-Bugfix` in `../../test/test.py`: `INFO_BUTTON_TEXT` = ASCII `'i'`
   (kein U+2139) + Main/Tech-Split vollständig + alle Tech-Felder tragen eine
   Beschreibung – alle PASS.
 - Hinweis: Die 6 bestehenden Fehlschläge (P2/P5/H3–H7, Fenster-Persistenz-Geometrie)
@@ -930,7 +930,7 @@ Plain-Object (kein QWidget) hostet:
      Output-Schema-Umbau neue `_service_output_schemas`.
    - Fix: `self._service_output_schemas: Dict[str, Any] = {}` im `__init__` von
      `_DialogParamHost` ergänzt (analog `_mode_schemas`, 08.08.2026).
-   - Neuer headless Regressions-Test `test/check_dialog_host.py` (Host-Spaltenbau
+   - Neuer headless Regressions-Test `../../test/check_dialog_host.py` (Host-Spaltenbau
      inkl. Resultatfelder-Header/System-Metrik/i-Buttons): PASS.
 
 2. **`b772c93` – 'QDialog.__init__ called with wrong argument types' beim
@@ -939,7 +939,7 @@ Plain-Object (kein QWidget) hostet:
      Dialog-Kontext der `_DialogParamHost` (kein QWidget) → TypeError.
    - Fix: Eltern-Widget robust aufgelöst: `self` falls QWidget, sonst
      `self._dialog` (echtes Dialog-Fenster des Hosts), sonst `None`.
-   - `test/check_dialog_host.py` erweitert (mockt `QDialog.exec`, prüft
+   - `../../test/check_dialog_host.py` erweitert (mockt `QDialog.exec`, prüft
      Eltern-Auflösung + None-Fallback): ALL PASS.
 
 
@@ -950,9 +950,9 @@ Plain-Object (kein QWidget) hostet:
 ## 1. Regeln & Invarianten
 * **Code-Style:** Exakt **4 Leerzeichen** Einrückung, **1 Leerzeile** zwischen
   Methoden/Funktionen (PEP8, Phase-19-Invariante 3).
-* **Testing:** **STRIKT HEADLESS** via `py_compile` & `test/test.py`
+* **Testing:** **STRIKT HEADLESS** via `py_compile` & `../../test/test.py`
   (`QApplication.exec()` STRIKT VERBOTEN – Phase-19-Invariante 2). Alle neuen
-  Test-Skripte/Test-DBs gehören nach `test/` (Invariante 10).
+  Test-Skripte/Test-DBs gehören nach `../../test` (Invariante 10).
 * **Entkopplung:** MVVM & IoC (Invariante 4/5). Kein SQL in UI; strikter
   Lese-Pfad über `AnalyticsRepository` / `FeatureStoreReader`.
 * **Open/Closed (Invariante 11):** Nur additive Ergänzungen; keine
@@ -979,15 +979,15 @@ Plain-Object (kein QWidget) hostet:
 
 | Schritt | Datei | Status | Befund |
 |---|---|---|---|
-| 2 | `analytics/engine/feature_store_reader.py` | ✅ VORHANDEN | `feature_keys_by_service()` nimmt `feature_ids` (Z. 430) und wendet `_apply_feature_filter` an (Z. 462). Commit `4648399`. |
-| 3 | `analytics/engine/analytics_repository.py` | ✅ VORHANDEN | `get_generic_heatmap()` baut `field_sources` + `avail_filtered` strikt über `feature_ids` (Z. 150–176). Commit `4648399`. |
-| 4 | `analytics/engine/analytics_view_model.py` | 🟡 DELTA | Leer/`"none"` → `"Allgemein"`, Title-Case-Fallback ✅. **`"native"` → `"Native"` (Plan: `"Allgemein"`)** – Erweiterung offen (F3). |
-| 5 | `analytics/engine/description_dialog.py` | ✅ VORHANDEN | `_render_html()` rendert `header_line` fett + `<p>&nbsp;</p>` (Z. 285–290); `ServiceDescriptionEditDialog` ebenso. |
-| 6 | `serviceui/master_tree.py` + `service_selector_widget.py` | 🟡 DELTA | Emit + Re-Emit vorhanden (ASCII `"i"`). **`service_selector_dialog.py` verbindet `info_requested` NICHT** → i-Button im ServicePicker wirkungslos. |
-| 6b | `serviceui/param_columns.py` | 🔴 NEU | UI-Umbau Resultatfelder (einzelner `btn_output_params_info` statt Per-Zeile-i-Buttons) – betrifft auch `_DialogParamHost`. |
-| 1 | `analytics/ui/common.py` | 🔴 NEU | `CheckableComboBox` fehlt vollständig. |
-| 7 | `analytics/ui/heatmap_widget.py` | 🟡 KORRIGIERT | **`combo_field` liegt in `heatmap_widget.py` (Z. 496), NICHT in `heatmap_page.py`** – Plan-Verortung angepasst. |
-| 7b | `analytics/engine/analytics_view_model.py` | ✅ ENTSCHIEDEN | `set_heatmap_config()` bleibt Einzel-Feld (`field: str`); Multi-Select steuert `feature_ids` (F1c/F2, §6). |
+| 2 | `../../analytics/engine/feature_store_reader.py` | ✅ VORHANDEN | `feature_keys_by_service()` nimmt `feature_ids` (Z. 430) und wendet `_apply_feature_filter` an (Z. 462). Commit `4648399`. |
+| 3 | `../../analytics/engine/analytics_repository.py` | ✅ VORHANDEN | `get_generic_heatmap()` baut `field_sources` + `avail_filtered` strikt über `feature_ids` (Z. 150–176). Commit `4648399`. |
+| 4 | `../../analytics/engine/analytics_view_model.py` | 🟡 DELTA | Leer/`"none"` → `"Allgemein"`, Title-Case-Fallback ✅. **`"native"` → `"Native"` (Plan: `"Allgemein"`)** – Erweiterung offen (F3). |
+| 5 | `../../analytics/engine/description_dialog.py` | ✅ VORHANDEN | `_render_html()` rendert `header_line` fett + `<p>&nbsp;</p>` (Z. 285–290); `ServiceDescriptionEditDialog` ebenso. |
+| 6 | `../../serviceui/master_tree.py` + `service_selector_widget.py` | 🟡 DELTA | Emit + Re-Emit vorhanden (ASCII `"i"`). **`service_selector_dialog.py` verbindet `info_requested` NICHT** → i-Button im ServicePicker wirkungslos. |
+| 6b | `../../serviceui/param_columns.py` | 🔴 NEU | UI-Umbau Resultatfelder (einzelner `btn_output_params_info` statt Per-Zeile-i-Buttons) – betrifft auch `_DialogParamHost`. |
+| 1 | `../../analytics/ui/common.py` | 🔴 NEU | `CheckableComboBox` fehlt vollständig. |
+| 7 | `../../analytics/ui/heatmap_widget.py` | 🟡 KORRIGIERT | **`combo_field` liegt in `heatmap_widget.py` (Z. 496), NICHT in `heatmap_page.py`** – Plan-Verortung angepasst. |
+| 7b | `../../analytics/engine/analytics_view_model.py` | ✅ ENTSCHIEDEN | `set_heatmap_config()` bleibt Einzel-Feld (`field: str`); Multi-Select steuert `feature_ids` (F1c/F2, §6). |
 
 ## 4. Architektur & Datenfluss
 
@@ -1009,7 +1009,7 @@ Plain-Object (kein QWidget) hostet:
 
 ## 5. Schritt-für-Schritt Umsetzung (inkl. Entscheidungen)
 
-### Schritt 1: `analytics/ui/common.py` – `CheckableComboBox` (NEU)
+### Schritt 1: `../../analytics/ui/common.py` – `CheckableComboBox` (NEU)
 * `class CheckableComboBox(QComboBox)`: `setEditable(True)`,
   `lineEdit().setReadOnly(True)`, LineEdit-Placeholder (z. B. `"Felder wählen…"`).
 * **Pop-up offen halten:** `eventFilter` auf `lineEdit()`/`view()` – Mausklick in
@@ -1024,7 +1024,7 @@ Plain-Object (kein QWidget) hostet:
 
 ### Schritt 2 + 3: Reader/Repository-Filterung
 **Bereits umgesetzt (Commit `4648399`) – kein Handlungsbedarf**, nur
-Regressions-Absicherung in `test/test.py` (Filter-Check).
+Regressions-Absicherung in `../../test/test.py` (Filter-Check).
 
 ### Schritt 4: `resolve_service_display_name()` – natives Handling (DELTA, F3 ✅)
 * **Entscheidung F3:** `"native"` und `native_*`-Keys werden wie leere/`"none"`-
@@ -1065,7 +1065,7 @@ Regressions-Absicherung in `test/test.py` (Filter-Check).
   * `_DialogParamHost`-Kompatibilität (Eltern-Auflösung `self`/`self._dialog`,
     Bugfix `b772c93`) beibehalten; `_service_output_schemas` bleibt.
 
-### Schritt 7: `analytics/ui/heatmap_widget.py` (KORRIGIERTE Verortung + F1c/F2/F7 ✅)
+### Schritt 7: `../../analytics/ui/heatmap_widget.py` (KORRIGIERTE Verortung + F1c/F2/F7 ✅)
 * `_combo_field` (Z. 496) durch `CheckableComboBox` ersetzen.
 * **Multi-Select-Semantik (F1c/F2):** Die Multi-Auswahl steuert
   AUSSCHLIESSLICH den Datenquellen-Filter `feature_ids: List[str]`
@@ -1096,13 +1096,13 @@ Regressions-Absicherung in `test/test.py` (Filter-Check).
 | F6 | **System-Metriken:** `technical: True`-Felder unterhalb der Haupt-Resultatfelder in separater, kleinerer Sektion `🔧 System-Metriken`. |
 | F7 | **UI-Behavior:** Feld-Auswahl bei `COUNT`/`CONFLUENCE_COUNT` strikt deaktiviert (`setEnabled(False)`). |
 
-## 7. Verification Checklist (`test/test.py`, headless)
+## 7. Verification Checklist (`../../test/test.py`, headless)
 
 - [x] **Syntax-Check:** `py_compile` auf allen geänderten Dateien
       (`common.py`, `analytics_view_model.py`, `param_columns.py`,
       `service_selector_widget.py`, `service_selector_dialog.py`,
-      `service_win.py`, `heatmap_widget.py`, `test/check_dialog_host.py`,
-      `test/test.py`) – OK. Unveränderte Dateien (`feature_store_reader.py`,
+      `service_win.py`, `heatmap_widget.py`, `../../test/check_dialog_host.py`,
+      `../../test/test.py`) – OK. Unveränderte Dateien (`feature_store_reader.py`,
       `analytics_repository.py`, `description_dialog.py`, `master_tree.py`)
       wurden nicht angefasst.
 - [x] **Filter-Check (F1):** `feature_keys_by_service(feature_ids=['srv_a'])`
@@ -1127,7 +1127,7 @@ Regressions-Absicherung in `test/test.py` (Filter-Check).
       `btn_output_params_info` (hinter „Resultatfelder"), keine Per-Zeile-i-
       Buttons mehr; `technical: True`-Felder als separate Sektion
       `🔧 System-Metriken` im Sammel-Info-Window; `_DialogParamHost`-
-      Spaltenbau fehlerfrei (Regressions-`test/check_dialog_host.py`,
+      Spaltenbau fehlerfrei (Regressions-`../../test/check_dialog_host.py`,
       16 Checks – ALLE PASS).
 - [x] **Picker-i-Button (F4):** Signal-Re-Emission `category_info_requested`
       im `ServiceSelectorWidget` (beide Modi) + Verdrahtung
@@ -1142,42 +1142,42 @@ Regressions-Absicherung in `test/test.py` (Filter-Check).
       `_update_controls`-Inspektion).
 
 ## 8. Hinweise
-* Die 6 vorbestehenden Fehlschläge in `test/test.py` (P2/P5/H3–H7,
+* Die 6 vorbestehenden Fehlschläge in `../../test/test.py` (P2/P5/H3–H7,
   Fenster-Persistenz-Geometrie) sind NICHT Bestandteil dieser Phase.
 * Entscheidungen F1–F7 sind vom Anwender am 09.08.2026, 20:21 bestätigt und
   in §6 verbindlich dokumentiert.
 
 ## 9. Implementierungs-Log (09.08.2026, ~20:55; Commit `1324d95`, Tag `20.03.02`)
-* **`analytics/ui/common.py`** – `CheckableComboBox` (NEU, F1): `QComboBox` mit
+* **`../../analytics/ui/common.py`** – `CheckableComboBox` (NEU, F1): `QComboBox` mit
   `QStandardItemModel`, Checkbox-Spalte, EventFilter hält Pop-up bei
   Checkbox-Klick offen; API `add_checkable_item(display_text, user_data,
   checked)`, `checked_data() -> List[str]`, `set_checked_data()`, Signal
   `selection_changed(list)`.
-* **`analytics/engine/analytics_view_model.py`** – F3: `resolve_service_display_name`
+* **`../../analytics/engine/analytics_view_model.py`** – F3: `resolve_service_display_name`
   mappt `"native"`/`native_*`/`"none"`/leer → `"Allgemein"` (statt Title-Case-
   Fallback für `native`).
-* **`serviceui/service_win.py`** – F5: Info-Badge-Header vereinheitlicht
+* **`../../serviceui/service_win.py`** – F5: Info-Badge-Header vereinheitlicht
   (`📌 im … | 🟢 aktiv in …` bzw. `⚪ inaktiv`, Sets mit ` + `).
-* **`serviceui/service_selector_dialog.py`** – F4: Import + Verdrahtung
+* **`../../serviceui/service_selector_dialog.py`** – F4: Import + Verdrahtung
   `info_requested`/`category_info_requested` des eingebetteten Widgets;
   Slots `_on_info_requested`/`_on_category_info_requested` öffnen Read-Only
   `ServiceDescriptionDialog.from_plugin()`/`from_set()` mit
   `_info_header_line`/`_info_set_header_line`.
-* **`serviceui/service_selector_widget.py`** – F4: neues Signal
+* **`../../serviceui/service_selector_widget.py`** – F4: neues Signal
   `category_info_requested` + Re-Emission in beiden Modi (Achtung: gemischte
   Line-Endings, nur per Python-Skript editierbar).
-* **`serviceui/param_columns.py`** – F6: Per-Zeile-i-Buttons entfernt, EIN
+* **`../../serviceui/param_columns.py`** – F6: Per-Zeile-i-Buttons entfernt, EIN
   `btn_output_params_info` hinter `📊 Resultatfelder:`; neuer Slot
   `_show_output_params_info()` zeigt Hauptfelder + Sektion
   `🔧 System-Metriken` (`technical: True`); `_DialogParamHost`-Kompatibilität
   beibehalten.
-* **`analytics/ui/heatmap_widget.py`** – F1c/F2/F7: `_combo_field` ist jetzt
+* **`../../analytics/ui/heatmap_widget.py`** – F1c/F2/F7: `_combo_field` ist jetzt
   `CheckableComboBox`, userData `"{service_id}|{key}"`; Multi-Select →
   `set_feature_ids(...)` (Quellen-Filter); `set_heatmap_config`-Signatur
   unverändert; Feld-Combo bei `COUNT`/`CONFLUENCE_COUNT` deaktiviert.
 * **Validierung:** `py_compile` auf allen geänderten Dateien OK; neuer
-  20.03.02-Testblock in `test/test.py` (Checks `a`–`o`, 15 Stück);
-  `test/check_dialog_host.py` (16 Checks); isolierte Verifikationsskripte
+  20.03.02-Testblock in `../../test/test.py` (Checks `a`–`o`, 15 Stück);
+  `../../test/check_dialog_host.py` (16 Checks); isolierte Verifikationsskripte
   (danach gelöscht, test/-Cleanup) – ALLE PASS. Kein Regressionstest, keine
   UI-Ausführung (Phase-19-Invariante 2).
 
@@ -1188,9 +1188,9 @@ Regressions-Absicherung in `test/test.py` (Filter-Check).
 ## 1. Regeln & Invarianten
 * **Code-Style:** Exakt 4 Leerzeichen, 1 Leerzeile zwischen Methoden (PEP8,
   Phase-19-Invariante 3). Additive Aenderungen (Invariante 11).
-* **Testing:** STRIKT HEADLESS via `py_compile` & `test/test.py`
+* **Testing:** STRIKT HEADLESS via `py_compile` & `../../test/test.py`
   (`QApplication.exec()` VERBOTEN – Invariante 2); neue Test-Skripte/DBs nach
-  `test/` (Invariante 10).
+  `../../test` (Invariante 10).
 
 ## 2. Problemstellung (User-Meldung 09.08.2026)
 Im Feld-Dropdown der generischen Heatmap sind Namens-Kollisionen nicht sauber
@@ -1236,7 +1236,7 @@ Die `CheckableComboBox.checked_data()` ueberspringt Header automatisch
 
 ## 5. Schritt-fuer-Schritt Umsetzung
 
-### Schritt 1: `analytics/ui/common.py` – `add_header_item()` (additiv)
+### Schritt 1: `../../analytics/ui/common.py` – `add_header_item()` (additiv)
 ```python
 def add_header_item(self, display_text: str) -> None:
     """Fuegt eine deaktivierte, nicht-auswaehlbare Trenn-/Kopfzeile hinzu
@@ -1252,7 +1252,7 @@ def add_header_item(self, display_text: str) -> None:
 ```
 (Import `QBrush`/`QColor` aus `PySide6.QtGui` ergaenzen.)
 
-### Schritt 2: `analytics/ui/heatmap_widget.py` – Befuellung (`_sync_combos_from_payload`)
+### Schritt 2: `../../analytics/ui/heatmap_widget.py` – Befuellung (`_sync_combos_from_payload`)
 * `self._field_sources = data.get("field_sources") or {}` merken (Attribut fuer
   die ALL-Expansion; im `__init__` mit `{}` vorinitialisieren).
 * `keys` in `shared` (2+ Quellen) und `unique` (genau 1 Quelle) gruppieren.
@@ -1303,10 +1303,10 @@ Vergleich auf `_field_key(self._combo_field.currentData())` umstellen (nur
 Kosmetik: `set_heatmap_config` ist idempotent, aber der falsche Vergleich
 loeste jedes Sync einen `_apply_config()`-Aufruf aus).
 
-## 6. Verification Checklist (`test/test.py`, headless)
+## 6. Verification Checklist (`../../test/test.py`, headless)
 
 - [x] **Syntax-Check:** `py_compile` auf `common.py`, `heatmap_widget.py` (und
-      `test/test.py`) – OK.
+      `../../test/test.py`) – OK.
 - [x] **Header-Check (Q4):** `add_header_item` fuegt ein Item mit `Qt.NoItemFlags`
       und `userData=None` hinzu; `checked_data()` ignoriert Header
       (20.03.03-Checks `a`/`b`).
@@ -1323,7 +1323,7 @@ loeste jedes Sync einen `_apply_config()`-Aufruf aus).
       shared Keys NICHT (20.03.03-Check `e`).
 - [x] **E6-Loop:** Vergleich laeuft ueber `_field_key(currentData())` – kein
       ueberfluessiger `config`-Call bei identischem Key (20.03.03-Check `i`).
-- [x] **Regression:** `test/check_dialog_host.py` bleibt PASS (16 Checks,
+- [x] **Regression:** `../../test/check_dialog_host.py` bleibt PASS (16 Checks,
       unveraenderte Pfade); 20.03.02-Checks `a`-`o` + `checked_data`/
       `set_checked_data`-API isoliert gruen (28 Checks).
 
@@ -1333,14 +1333,14 @@ loeste jedes Sync einen `_apply_config()`-Aufruf aus).
 * Keine UI-Tests, kein Regressionstest (Invariante 2).
 
 ## 8. Implementierungs-Log (09.08.2026, ~21:40; Commit `84f02df`, Tag `20.03.03`)
-* **`analytics/ui/common.py`**:
+* **`../../analytics/ui/common.py`**:
   * `add_header_item()` (Q4): deaktivierte, graue, fette Trenn-/Kopfzeile
     (`Qt.NoItemFlags`, `userData=None`) – erscheint weder auswaehlbar noch in
     `checked_data()`.
   * Klick-Tracking (Q5): `_last_click_index` im EventFilter (Popup-Viewport)
     + Getter `last_click_index()` – Grundlage der XOR-Aufloesung (Sammel vs.
     Einzel); `-1` = programmatischer Wechsel (keine Aufloesung).
-* **`analytics/ui/heatmap_widget.py`**:
+* **`../../analytics/ui/heatmap_widget.py`**:
   * `self._field_sources` (Key -> Quellen-Services) aus dem Payload gemerkt.
   * `_sync_combos_from_payload` (Q1/Q4/Q5): 2-stufige Struktur – Sektions-
     Header `🌐 Gleiche Parameter (alle aktiven Services):` + Sammel-Eintraege
@@ -1359,9 +1359,9 @@ loeste jedes Sync einen `_apply_config()`-Aufruf aus).
   * E6-Loop-Fix: Vergleich `params["heatmap_field"]` gegen
     `_field_key(currentData())` statt `currentData()` (behebt ueberfluessige
     `_apply_config()`-Aufrufe seit dem `{service_id}|{key}`-userData).
-* **Validierung:** 28 isolierte Checks in `test/` (Q1-Q5, E6, Randfaelle,
-  20.03.02-API-Regression) + `test/check_dialog_host.py` (16 Checks) – ALLE
-  PASS; neuer 20.03.03-Testblock (9 Checks `a`-`i`) in `test/test.py`;
+* **Validierung:** 28 isolierte Checks in `../../test` (Q1-Q5, E6, Randfaelle,
+  20.03.02-API-Regression) + `../../test/check_dialog_host.py` (16 Checks) – ALLE
+  PASS; neuer 20.03.03-Testblock (9 Checks `a`-`i`) in `../../test/test.py`;
   Temp-Skripte geloescht (test/-Cleanup). Kein UI-Test, kein Regressionstest.
 
 
@@ -1371,7 +1371,7 @@ loeste jedes Sync einen `_apply_config()`-Aufruf aus).
 
 ## 1. Architektur & Invarianten
 * **Code-Style:** Exakt 4 Leerzeichen EinrÃ¼ckung, 1 Leerzeile zwischen Methoden.
-* **Testing:** **STRIKT HEADLESS** via `py_compile` & `test/test.py` (`QApplication.exec()` STRIKT VERBOTEN).
+* **Testing:** **STRIKT HEADLESS** via `py_compile` & `../../test/test.py` (`QApplication.exec()` STRIKT VERBOTEN).
 * **Entkopplung:** MVVM & IoC. MasterTree im `ServiceWindow` gekoppelt via `EventBus` (20.02/20.03).
 * **Datenbank-Konsistenz:** Single Source of Truth im `ServiceSetRepository` / `FeatureStoreReader`.
 
@@ -1384,7 +1384,7 @@ Verifiziert gegen den tatsÃ¤chlichen Quellcode (keine UI-AusfÃ¼hrung):
 | Befund | Status | Details |
 |---|---|---|
 | Referenzierte Dateien existieren | âœ… | `service_models.py` (`ServiceInstanceConfig` TypedDict, total=False), `tree_builder.py` (`build_tree`), `service_selector_model.py` (`ServiceSelectorModel.build_tree`, `resolve_display_names`, `resolve_valid_feature_ids`), `analytics_view_model.py` (`resolve_service_display_name`, `set_feature_ids`), `feature_store_reader.py`, `master_tree.py`, `feature_builder.py` (`store_plugin_payload`). |
-| `indicator_presets` | âœ… | Existiert in `state_manager.py` (PK `indicator_id, preset_name` + `plugin_id`/`version`/`is_active_batch`). |
+| `indicator_presets` | âœ… | Existiert in `../../state_manager.py` (PK `indicator_id, preset_name` + `plugin_id`/`version`/`is_active_batch`). |
 | `service_sets` | âœ… | `ServiceSetRepository` (PK `set_id`, JSON-Definition, Trash/History-Tabellen). |
 | `feature_store`-Schema | âœ… | PK `(symbol, timeframe, bar_time, feature_id)`; `feature_id` = `plugin_id` (Sentinel `'native'`); `created_at` mit `now()` beim Upsert. **KEINE `instance_hash`-Spalte.** |
 | MasterTree-Node-Typen | âœ… | `TYPE_PLUGIN` / `TYPE_SERVICE` â€“ heute **keine** Parent-Child-Hierarchie (Service â†’ Clones); Plugins sind flache BlÃ¤tter. |
@@ -1413,7 +1413,7 @@ Verifiziert gegen den tatsÃ¤chlichen Quellcode (keine UI-AusfÃ¼hrung):
 | Q2 | **Dropdown:** `userData` primÃ¤r `{plugin_id}|{key}`; `instance_hash` optional im Label. Das ViewModel lÃ¶st selektierte Hashes transparent auf `feature_ids` (plugin_ids) auf. Anzeige: `{Service} ({Preset-Name}) / {Parameter}`. |
 | Q3 | **`lookback` BEWUSST NICHT im Hash** â€“ Ergebnis einer Kerze hÃ¤ngt nur von Algorithmus-Logik + `params` ab; `lookback` ist ein Laufzeit-Fenster (Performance) und kein Inhalts-IdentitÃ¤tsmerkmal. |
 | Q4 | **Typ-Sanitizer vor dem Hashing:** Rekursive Umwandlung in native Python-Typen (`int`, `float`, `str`, `bool`), `None`-Handling, dann `json.dumps(params, sort_keys=True)` (kanonisch). |
-| Q5 | **`purge_instance_data` in `analytics/features/feature_builder.py`** (Schreib-/Store-Kontext). `FeatureStoreReader` bleibt 100 % read-only. Kein neues Repository. |
+| Q5 | **`purge_instance_data` in `../../analytics/features/feature_builder.py`** (Schreib-/Store-Kontext). `FeatureStoreReader` bleibt 100 % read-only. Kein neues Repository. |
 | Q6 | **`is_archived: bool` in `ServiceInstanceConfig`** + dynamischer `ðŸ“ Archiv`-Ordner im `tree_builder` (`Qt.ItemIsUserCheckable = False`). Archiv-Einheit: einzelne Instanz/Clone ODER ganze Sets. |
 | Q7 | **Geltungsbereich:** PrimÃ¤r Service-Instanzen (`service_sets` + `feature_store`), additiv `indicator_presets` (Archivierung â‡’ `is_active_batch = False`, aus Scans isoliert). Â§5B adressiert beide Stores. |
 | Q8 | **Varianten-Erzeugung:** KontextmenÃ¼ `Als Variante duplizieren` (Service-Knoten) + Set-Editor `Service-Instanz clonen`. Neue `instance_id`, kopierte Params, Ã¶ffnet Parameter-Editor, berechnet neuen `instance_hash`. |
@@ -1479,7 +1479,7 @@ Verifiziert gegen den tatsÃ¤chlichen Quellcode (keine UI-AusfÃ¼hrung):
 
 * LÃ¶scht in `analytics.duckdb` alle `feature_store`-Rows mit `instance_hash = <hash>`
   (Q1: neue Spalte; `feature_id` bleibt `plugin_id` und wird NICHT gelÃ¶scht).
-* Implementierung in `analytics/features/feature_builder.py`
+* Implementierung in `../../analytics/features/feature_builder.py`
   (`purge_instance_data(instance_hash)`, Q5) â€“ `FeatureStoreReader` bleibt 100 %
   read-only (MVVM-Invariante).
 * BehÃ¤lt MasterTree-Struktur, Parameter-Settings und `doc_log` vollstÃ¤ndig bei.
@@ -1499,18 +1499,18 @@ Verifiziert gegen den tatsÃ¤chlichen Quellcode (keine UI-AusfÃ¼hrung):
 
 ## 6. Schritt-fÃ¼r-Schritt Implementierung
 
-### Schritt 0: DB-Schema (`db/schema_initializer.py`) â€“ Q1
+### Schritt 0: DB-Schema (`../../db/schema_initializer.py`) â€“ Q1
 * Additive Spalte: `ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS instance_hash VARCHAR;`
   (idempotent, bestehende Rows bleiben unangetastet â€“ `feature_id` bleibt `plugin_id`).
 
-### Schritt 1: Model-Erweiterung (`analytics/engine/service_models.py`)
+### Schritt 1: Model-Erweiterung (`../../analytics/engine/service_models.py`)
 
 * Erweitere `ServiceInstanceConfig` TypedDict um:
 * `doc_log: Optional[str]`
 * `instance_hash: Optional[str]`
 * `is_archived: bool` (Q6, Default False)
 
-### Schritt 2: Hash-Gen & Baumaufbau (`analytics/engine/tree_builder.py` & `service_selector_model.py`)
+### Schritt 2: Hash-Gen & Baumaufbau (`../../analytics/engine/tree_builder.py` & `service_selector_model.py`)
 
 * `generate_instance_hash(plugin_id, params) -> str`: Erzeuge 8-stelligen SHA256-Short-Hash
   (Q3: ohne `lookback`; Q4: Typ-Sanitizer + `json.dumps(sort_keys=True)` kanonisch).
@@ -1519,7 +1519,7 @@ Verifiziert gegen den tatsÃ¤chlichen Quellcode (keine UI-AusfÃ¼hrung):
 * FÃ¼r Knoten mit `is_archived=True` bzw. im Pfad `/Archiv`: Setze Checkboxen auf non-checkable
   (Q6: `Qt.ItemIsUserCheckable = False`); dynamischer Ordner `ðŸ“ Archiv` statt statischem Pfad.
 
-### Schritt 3: Dropdown-Integration (`analytics/engine/analytics_view_model.py`)
+### Schritt 3: Dropdown-Integration (`../../analytics/engine/analytics_view_model.py`)
 
 * Erweitere `resolve_service_display_name()`:
 * BerÃ¼cksichtige Preset-Namen: `{Service} ({Preset_Name})`.
@@ -1527,7 +1527,7 @@ Verifiziert gegen den tatsÃ¤chlichen Quellcode (keine UI-AusfÃ¼hrung):
 * Neue Resolver-Methode `resolve_instance_hashes(hashes) -> feature_ids` (Q2):
   lÃ¶st selektierte `instance_hash`-Werte transparent auf `plugin_id`-Basis auf.
 
-### Schritt 4: Wartungs-Aktionen (`analytics/features/feature_builder.py` & `serviceui/master_tree.py`)
+### Schritt 4: Wartungs-Aktionen (`../../analytics/features/feature_builder.py` & `../../serviceui/master_tree.py`)
 
 * `FeatureBuilder.purge_instance_data(instance_hash)`: SQL
   `DELETE FROM feature_store WHERE instance_hash = ?` (Q5; NICHT im Reader).
@@ -1547,38 +1547,38 @@ Verifiziert gegen den tatsÃ¤chlichen Quellcode (keine UI-AusfÃ¼hrung):
 
 ---
 
-## 7. Verification Checklist (`test/test.py`) â€“ 20.04 VERIFIZIERT (09.08.2026)
+## 7. Verification Checklist (`../../test/test.py`) â€“ 20.04 VERIFIZIERT (09.08.2026)
 
 * [x] **Hash-Check:** `generate_instance_hash(plugin_id, params)` â€“ deterministischer
       8-stelliger SHA256-Short-Hash, Typ-Sanitizer (numpy/None/verschachtelt),
       `sort_keys=True`, ohne `lookback` (Q3/Q4). GeprÃ¼ft in
-      `test/check_2004_ctxmenu.py` (Q2/Q4) und `test/check_2004_tree.py` (Q4).
+      `../../test/check_2004_ctxmenu.py` (Q2/Q4) und `../../test/check_2004_tree.py` (Q4).
 * [x] **Schema-Check (Q1):** `instance_hash`-Spalte additiv/idempotent
       (`schema_initializer.py`); bestehende Rows `NULL`, `feature_id` bleibt
-      `plugin_id`. GeprÃ¼ft in `test/check_2004_schema.py` (7/7).
+      `plugin_id`. GeprÃ¼ft in `../../test/check_2004_schema.py` (7/7).
 * [x] **Hash-AuflÃ¶sung (Q2):** `resolve_instance_hashes(hashes)` liefert
       deduplizierte `plugin_ids`; Filter weiter `feature_id IN (â€¦)`.
-      GeprÃ¼ft in `test/check_2004_viewmodel.py` (7/7).
+      GeprÃ¼ft in `../../test/check_2004_viewmodel.py` (7/7).
 * [x] **Archive Safety (Q6):** Archivierte Knoten/Clones/Sets non-checkable;
       `run_worker` Ã¼berspringt archivierte Sets/Instanzen (Q6);
       `HistoricalScanner`/`LiveAnalyzer` filtern Ã¼ber `list_active_batch_presets`
-      (is_active_batch=False). GeprÃ¼ft in `test/check_2004_tree.py` (13/13) und
-      `test/check_2004_writers.py` (8/8).
+      (is_active_batch=False). GeprÃ¼ft in `../../test/check_2004_tree.py` (13/13) und
+      `../../test/check_2004_writers.py` (8/8).
 * [x] **Data-Purge Check (Q5):** `FeatureBuilder.purge_instance_data(instance_hash)`
       lÃ¶scht nur Rows mit dem Hash; Struktur/`doc_log` bleiben intakt;
       `FeatureStoreReader` bleibt read-only. GeprÃ¼ft in
-      `test/check_2004_purge.py` (8/8).
+      `../../test/check_2004_purge.py` (8/8).
 * [x] **Varianten-Erzeugung (Q8):** KontextmenÃ¼ `Als Variante duplizieren`
       (Service-/Clone-/Plugin-Zeile) erzeugt neue Instanz/Preset-Kopie,
       kopierte Params, neuen `instance_hash` (`_duplicate_set_instance` /
-      `_duplicate_preset`). GeprÃ¼ft in `test/check_2004_ctxmenu.py` (34/34).
+      `_duplicate_preset`). GeprÃ¼ft in `../../test/check_2004_ctxmenu.py` (34/34).
 * [x] **Writer-Ãœbergabe (Q9):** `store_plugin_payload(..., instance_hash)` schreibt
       den Hash in die neue Spalte; run_worker/HistoricalScanner/LiveAnalyzer
       Ã¼bergeben ihn. Archiv-Presets (`is_active_batch=False`) werden von Scans
-      ignoriert (Q7). GeprÃ¼ft in `test/check_2004_writers.py` (8/8) und
-      `test/check_2004_purge.py` (COALESCE).
+      ignoriert (Q7). GeprÃ¼ft in `../../test/check_2004_writers.py` (8/8) und
+      `../../test/check_2004_purge.py` (COALESCE).
 * [x] **Naming-Check:** Multi-Select Dropdown formatiert `{Service} ({Preset}) / {Parameter}`
-      fehlerfrei (`resolve_service_display_name`, `test/check_2004_viewmodel.py`).
+      fehlerfrei (`resolve_service_display_name`, `../../test/check_2004_viewmodel.py`).
 
 
 ---
@@ -1587,41 +1587,41 @@ Verifiziert gegen den tatsÃ¤chlichen Quellcode (keine UI-AusfÃ¼hrung):
 
 **Phase 20.04 â€“ Parameter-Varianten, Instanz-Hashes & Archivierung** â€“ alle 9
 Entscheidungen Q1â€“Q9 umgesetzt. Headless-Verifikation (keine UI-Tests):
-`py_compile` aller geÃ¤nderten Dateien, `test/test.py` (964 PASS / 6 Baseline-
+`py_compile` aller geÃ¤nderten Dateien, `../../test/test.py` (964 PASS / 6 Baseline-
 Geometrie-FAILs unverÃ¤ndert), temporÃ¤re Checks `test/check_2004_*.py`
 (alle PASS; Cleanup nach Abschluss der Phase).
 
 ### Ã„nderungen je Datei
 
-* **`analytics/engine/service_models.py`** (Schritt 1/2a):
+* **`../../analytics/engine/service_models.py`** (Schritt 1/2a):
   * `_sanitize_for_hash()` (rekursiv â†’ native Typen, Q4) +
     `generate_instance_hash(plugin_id, params)` (8-stelliger SHA256-Short-Hash,
     ohne `lookback` Q3, `sort_keys=True`).
   * `ServiceInstanceConfig` erweitert um `instance_hash`, `doc_log`, `is_archived`;
     `ServiceSetDefinition` um `is_archived` (Q6).
 
-* **`db/schema_initializer.py`** (Schritt 0, Q1):
+* **`../../db/schema_initializer.py`** (Schritt 0, Q1):
   * `ALTER TABLE feature_store ADD COLUMN IF NOT EXISTS instance_hash VARCHAR`
     (additiv/idempotent; `feature_id` bleibt `plugin_id`).
 
-* **`state_manager.py`** (Schritt 4b, Q7):
+* **`../../state_manager.py`** (Schritt 4b, Q7):
   * `indicator_presets` um Spalte `doc_log VARCHAR` erweitert (additiv).
   * `list_plugin_presets()` liefert zusÃ¤tzlich `doc_log`.
   * Neu: `set_plugin_preset_doc_log(indicator_id, preset_name, doc_log)`.
   * `save_indicator_preset()` akzeptiert optional `doc_log`.
 
-* **`analytics/engine/service_selector_model.py`** (Schritt 2b/3, Q2/Q7):
+* **`../../analytics/engine/service_selector_model.py`** (Schritt 2b/3, Q2/Q7):
   * `_plugin_presets` (plugin_id â†’ Clones aus `indicator_presets` via
     `StateManager.list_plugin_presets`), `_load_plugin_presets()` berechnet
     `instance_hash` + `is_archived = not is_active_batch`.
   * `build_tree()`/`plugin_presets()` reichen die Presets an den Baum durch.
 
-* **`analytics/engine/tree_builder.py`** (Schritt 2b, Q6/Q7):
+* **`../../analytics/engine/tree_builder.py`** (Schritt 2b, Q6/Q7):
   * `ARCHIVE_LABEL = "ðŸ“ Archiv"`; Archiv-Ordner ans Sortier-Ende.
   * Plugins MIT Presets â†’ Parent-Knoten mit Clone-Kindern (`_clones_for`);
     archivierte Clones/Sets wandern in den `ðŸ“ Archiv`-Ordner.
 
-* **`serviceui/master_tree.py`** (Schritt 2b/4b/5b, Q5/Q6/Q8):
+* **`../../serviceui/master_tree.py`** (Schritt 2b/4b/5b, Q5/Q6/Q8):
   * Neue Rollen `ROLE_INSTANCE_HASH` (UserRole+4), `ROLE_ARCHIVED` (UserRole+5);
     neuer Knotentyp `TYPE_CLONE`.
   * `_build_clone_item`: `ðŸŸ¢/ðŸ”¹ <Preset> (#<hash>)`; aktive anhakbar, archivierte
@@ -1631,7 +1631,7 @@ Geometrie-FAILs unverÃ¤ndert), temporÃ¤re Checks `test/check_2004_*.py`
     in den Branches TYPE_SERVICE / TYPE_CLONE / TYPE_PLUGIN; Archiv-Guards
     (archivierte Sets: Run/Umbenennen/HinzufÃ¼gen deaktiviert).
 
-* **`serviceui/service_win.py`** (Schritt 4b, Q5/Q6/Q8):
+* **`../../serviceui/service_win.py`** (Schritt 4b, Q5/Q6/Q8):
   * 4 verbundene Handler + Helfer: `_on_data_only_purge`,
     `_on_delete_complete`, `_on_doc_log_requested`, `_on_duplicate_variant`,
     `_find_preset_for_hash`, `_next_preset_copy_name`, `_save_instance_doc_log`,
@@ -1641,39 +1641,39 @@ Geometrie-FAILs unverÃ¤ndert), temporÃ¤re Checks `test/check_2004_*.py`
     mit 2-stufiger Sicherheitsabfrage + P14-04-E-Sperre; Doc Log Ã¼ber
     `ServiceDescriptionEditDialog`.
 
-* **`analytics/features/feature_builder.py`** (Schritt 4, Q5/Q9):
+* **`../../analytics/features/feature_builder.py`** (Schritt 4, Q5/Q9):
   * `store_plugin_payload(..., instance_hash=None)` schreibt den Hash in die
     neue Spalte; UPSERT erhÃ¤lt vorhandenen Hash via
     `COALESCE(EXCLUDED.instance_hash, feature_store.instance_hash)`.
   * Neu: `purge_instance_data(instance_hash) -> int` (Q5, FeatureBuilder,
     nicht im Reader).
 
-* **`analytics/engine/analytics_view_model.py`** (Schritt 3, Q2):
+* **`../../analytics/engine/analytics_view_model.py`** (Schritt 3, Q2):
   * `resolve_service_display_name(plugin_id, preset_name=None)` â†’
     `{Service} ({Preset})`; neu `resolve_instance_hashes(hashes)` â†’
     deduplizierte `plugin_ids`.
 
-* **`serviceui/run_worker.py`** (Schritt 5/5b, Q6/Q9):
+* **`../../serviceui/run_worker.py`** (Schritt 5/5b, Q6/Q9):
   * `instance_hash`-Ãœbergabe an `store_plugin_payload` (bevorzugt
     `cfg.instance_hash`, sonst `generate_instance_hash`).
   * Archiv-Guards: archivierte Sets/Instanzen werden mit Log +
     `run_finished(0)` Ã¼bersprungen.
 
-* **`analytics/background_workers/historical_scanner.py`** und
-  **`analytics/background_workers/live_analyzer.py`** (Schritt 5, Q7/Q9):
+* **`../../analytics/background_workers/historical_scanner.py`** und
+  **`../../analytics/background_workers/live_analyzer.py`** (Schritt 5, Q7/Q9):
   * `instance_hash` aus `generate_instance_hash(plugin_id, preset.params)` an
     `store_plugin_payload` Ã¼bergeben; Archiv-Ignoranz via
     `list_active_batch_presets()` (is_active_batch=False ausgeschlossen).
 
-* **`test/test.py`** (Test-Harness):
+* **`../../test/test.py`** (Test-Harness):
   * 5 `feature_store`-Temp-Tabellen um `instance_hash VARCHAR` ergÃ¤nzt;
     `_FakeFB.store_plugin_payload` um `instance_hash`-Kwarg erweitert.
 
 ### TemporÃ¤re Checks (nach Phasenabschluss Cleanup)
 
-* `test/check_2004_schema.py` (7/7), `test/check_2004_tree.py` (13/13),
-  `test/check_2004_viewmodel.py` (7/7), `test/check_2004_purge.py` (8/8),
-  `test/check_2004_ctxmenu.py` (34/34), `test/check_2004_writers.py` (8/8).
+* `../../test/check_2004_schema.py` (7/7), `../../test/check_2004_tree.py` (13/13),
+  `../../test/check_2004_viewmodel.py` (7/7), `../../test/check_2004_purge.py` (8/8),
+  `../../test/check_2004_ctxmenu.py` (34/34), `../../test/check_2004_writers.py` (8/8).
 
 ---
 
@@ -1691,13 +1691,13 @@ Clone-Pfad verifiziert), lieferte aber KEIN sichtbares Ergebnis:
 
 ### Ã„nderungen
 
-* **`serviceui/master_tree.py`**:
+* **`../../serviceui/master_tree.py`**:
   * Neu (public, nach `_restore_selection`): `select_instance(set_id, service_id)`
     und `select_clone(plugin_id, instance_hash)` plus gemeinsames
     `_select_by(predicate)` â€“ expandiert die Eltern-Kette (`_expand_ancestors`),
     selektiert unter `blockSignals` und scrollt in den sichtbaren Bereich.
 
-* **`serviceui/service_win.py`**:
+* **`../../serviceui/service_win.py`**:
   * `_duplicate_set_instance`: lÃ¤dt das Ziel-Set IMMER in den Parameter-Editor
     (statt nur wenn `_current_set_id == set_id`) und selektiert die neue Instanz
     via `tree.select_instance(...)`.
@@ -1710,12 +1710,12 @@ Clone-Pfad verifiziert), lieferte aber KEIN sichtbares Ergebnis:
 
 ### Verifikation (headless, keine UI-Tests)
 
-* `test/check_2004_dupl3.py`: **8/8 PASS** (Set-Instanz-Pfad, Editor-Spalte,
+* `../../test/check_2004_dupl3.py`: **8/8 PASS** (Set-Instanz-Pfad, Editor-Spalte,
   Baum-Selektion + Expansion, Clone-Pfad, Namens-Fix) â€“ danach Cleanup.
-* `test/test.py`: 964 PASS / 6 FAIL (nur vorbestehende Geometrie-Baseline
+* `../../test/test.py`: 964 PASS / 6 FAIL (nur vorbestehende Geometrie-Baseline
   P2/P5/H3-H7, unverÃ¤ndert).
-* `test/check_2004_ctxmenu.py` (34/34), `test/check_2004_writers.py` (8/8),
-  `test/check_2004_purge.py` (8/8).
+* `../../test/check_2004_ctxmenu.py` (34/34), `../../test/check_2004_writers.py` (8/8),
+  `../../test/check_2004_purge.py` (8/8).
 * `py_compile` + CRLF-Konsistenz (0 lone LF) aller geÃ¤nderten Dateien.
 ---
 
@@ -1752,19 +1752,19 @@ Restore-Verlust entstand in der UI-Sync-Schicht.
 
 **Loesung (Variante A + B + D, wie empfohlen):**
 
-* **`analytics/ui/heatmap_widget.py`** â€“ `_sync_combos_from_payload()` (A+B):
+* **`../../analytics/ui/heatmap_widget.py`** â€“ `_sync_combos_from_payload()` (A+B):
   `agg` und `prev_field` bevorzugen jetzt primaer den Daten-Payload
   (`data.get("agg")` / `data.get("field")`), sekundaer die restaurierten
   VM-Params (`heatmap_agg`/`heatmap_field`) und erst am Ende den
   Combo-Zustand. Der E6-Loop laesst einen restaurierten Wert unangetastet.
 
-* **`analytics/engine/analytics_view_model.py`** (D):
+* **`../../analytics/engine/analytics_view_model.py`** (D):
   Neues Signal `params_restored = Signal()` (MVVM-konform, kein UI-Import).
   Emission am Ende von `_apply_profile()` (deckt Profilwechsel +
   `load_profiles()`) und `restore_workspace()` (deckt Fenster-Schliessen/
   Wiederherstellen).
 
-* **`analytics/ui/heatmap_widget.py`** â€“ `attach_view_model()` (D):
+* **`../../analytics/ui/heatmap_widget.py`** â€“ `attach_view_model()` (D):
   Verbindet `params_restored` mit dem bereits vorhandenen
   `_sync_from_params()` (defensiv per `hasattr` fuer Test-Mocks). Dadurch
   stehen die UI-Combos sofort nach dem Restore synchron zu den
@@ -1772,16 +1772,16 @@ Restore-Verlust entstand in der UI-Sync-Schicht.
 
 **Verifikation (headless, keine UI-Tests):**
 
-* `test/check_2004_timing.py`: **3/3 PASS** (vorher 1/3 â€“ FAIL
+* `../../test/check_2004_timing.py`: **3/3 PASS** (vorher 1/3 â€“ FAIL
   `heatmap_field='is_hit'` nach Payload + E6-`_apply_config`-Ueberschreiben).
-* `test/check_2004_uiflow.py`: 6/6 PASS (User-Interaktion + Payload-Sync).
+* `../../test/check_2004_uiflow.py`: 6/6 PASS (User-Interaktion + Payload-Sync).
 * D-Wiring-Check (headless): X/Y/Aggregations/Feld-Combos korrekt aus den
   restaurierten Params nach `params_restored`-Emission.
 * `py_compile` + CRLF-Konsistenz (0 lone LF) beider geaenderten Dateien.
 
 **Hinweis:** Die DB-abhaengigen Regressionstests (`test.py`-Baseline 964/6,
 `check_2004_restore`/`snapshot`/`bugfix3`) waren zum Verifikationszeitpunkt
-nicht ausfuehrbar, weil die laufende App `data/app_data.duckdb` haelt
+nicht ausfuehrbar, weil die laufende App `../../data/app_data.duckdb` haelt
 (DB-Lock, rein umgebungsbedingt). Sie liefen in derselben Sitzung vor der
 Umsetzung gruen und sind von dieser additiven Aenderung unberuehrt.
 ---
@@ -1812,7 +1812,7 @@ Schwaechen im MasterTree-Varianten-Konzept (20.04):
 
 ### Aenderungen je Datei
 
-* **`analytics/engine/feature_store_reader.py`** (V1):
+* **`../../analytics/engine/feature_store_reader.py`** (V1):
   * Neu (read-only, nach `fetch_last_execution_dates`):
     `fetch_last_execution_dates_by_hash() -> Dict[feature_id_lower,
     {instance_hash: 'DD.MM.JJ'}]` â€“ `MAX(created_at) GROUP BY
@@ -1821,7 +1821,7 @@ Schwaechen im MasterTree-Varianten-Konzept (20.04):
     case-insensitiv/whitespace-tolerant wie die Plugin-Variante. Defensiv:
     Fehler/Tabelle fehlt -> `{}`.
 
-* **`analytics/engine/service_selector_model.py`** (V1):
+* **`../../analytics/engine/service_selector_model.py`** (V1):
   * Neuer State `_last_execution_dates_by_hash` (`Dict[pid_lower,
     {hash: date}]`), geladen in `refresh()` NACH den Plugin-Daten
     (`_load_last_execution_dates_by_hash()` delegiert an den
@@ -1831,7 +1831,7 @@ Schwaechen im MasterTree-Varianten-Konzept (20.04):
   * Neu (public): `last_execution_date_for_hash(plugin_id, instance_hash)`
     -> `'DD.MM.JJ'` oder `'--.--.--'`.
 
-* **`serviceui/master_tree.py`** (V1/V3):
+* **`../../serviceui/master_tree.py`** (V1/V3):
   * Neue Rolle `ROLE_PRESET_NAME` (UserRole+6) traegt den Anzeigenamen eines
     Clone-Knotens (fuer den Rename-Dialog ohne DB-Lookup).
   * `_build_plugin_item`: Hat das Plugin Clones, ist das Parent-Label nur die
@@ -1844,13 +1844,13 @@ Schwaechen im MasterTree-Varianten-Konzept (20.04):
     Signal. Kontextmenue-Branch TYPE_CLONE: Aktion 'Variante umbenennen'
     (bei archivierten deaktiviert).
 
-* **`state_manager.py`** (V3):
+* **`../../state_manager.py`** (V3):
   * Neu: `rename_indicator_preset(indicator_id, old_name, new_name)` â€“
     `UPDATE indicator_presets SET preset_name = ? WHERE indicator_id = ?
     AND preset_name = ?`. Alle weiteren Spalten bleiben unangetastet; der
     Aufrufer prueft vorher auf Kollisionen (Unique-Constraint).
 
-* **`serviceui/service_win.py`** (V2/V3):
+* **`../../serviceui/service_win.py`** (V2/V3):
   * Verbindung `rename_variant_requested` -> neuer Handler `_on_rename_variant`
     (Kollisionspruefung via `list_plugin_presets`, Persistenz via
     `rename_indicator_preset`, Live-Sync via `event_bus.service_set_changed`).
@@ -1858,14 +1858,14 @@ Schwaechen im MasterTree-Varianten-Konzept (20.04):
     '<base>')' â€“ vorbelegt mit dem freien Kopiernamen; Leer-/Abbruch-Guard
     und Kollisionspruefung vor `save_indicator_preset`.
 
-* **`serviceui/service_selector_dialog.py`** (V2/V3):
+* **`../../serviceui/service_selector_dialog.py`** (V2/V3):
   * Gleiche Verkabelung fuer den Analytics-Datenquellen-Picker:
     `_on_rename_variant` (QMessageBox-basiert) + Namensdialog in
     `_duplicate_preset`.
 
 ### Verifikation (headless, keine UI-Tests)
 
-* `test/check_variant_bugfix.py`: **17/17 PASS** â€“ per-Hash-Daten (1a-1d),
+* `../../test/check_variant_bugfix.py`: **17/17 PASS** â€“ per-Hash-Daten (1a-1d),
   Clone-`last_execution` im Baum (2a-2c), MasterTree-Labels (3a-3e:
   Parent ohne Datum, Clone mit Datum ohne Hash, ROLE_PRESET_NAME, flaches
   Blatt-Regression, Archiv-Clone), `rename_indicator_preset`-Persistenz
@@ -1892,10 +1892,10 @@ Restore, Profil-Restore).
   Variante) lud die GLOBALEN Standalone-Parameter statt der
   presetspezifischen Params; Save schrieb in global_settings statt in das
   Preset (indicator_presets).
-  * `serviceui/service_win.py`: `_current_preset_editing`,
+  * `../../serviceui/service_win.py`: `_current_preset_editing`,
     `_load_clone_editor()` (Clone-Klick -> presetparams laden), Save via
     `save_indicator_preset`.
-  * `serviceui/service_selector_dialog.py`: `_entries_for_scope` liefert
+  * `../../serviceui/service_selector_dialog.py`: `_entries_for_scope` liefert
     `preset_params` + `preset`; `_DialogParamHost._save_plugin_params`
     Preset-Branch (schreibt in indicator_presets statt
     plugin_params_<id>, is_active_batch/doc_log bleiben erhalten);
@@ -1903,7 +1903,7 @@ Restore, Profil-Restore).
 
 * **Bug 2 (CheckableComboBox-Hitbox):** Klick auf die LineEdit-Flaeche der
   CheckableComboBox oeffnete das Popup nicht (nur Pfeil/Rahmen).
-  `analytics/ui/common.py`: `lineEdit().installEventFilter(self)`,
+  `../../analytics/ui/common.py`: `lineEdit().installEventFilter(self)`,
   Event-Filter (LineEdit-Klick togglet das Popup) +
   `mousePressEvent`-Override (Box/Rahmen togglet ebenfalls).
 
@@ -1913,26 +1913,26 @@ Restore, Profil-Restore).
   minWidth 180, Panel rechts, Stretch-Faktoren 0/1, nicht kollabierbar)
   statt `setFixedWidth`; `_fit_dialog_width` misst die rechte Kante
   splitter-relativ (Tree-Breite + Handle + Panel-Minimum).
-  `analytics/ui/analytics_win.py`: `_body_splitter` (Sidebar minWidth 120 +
+  `../../analytics/ui/analytics_win.py`: `_body_splitter` (Sidebar minWidth 120 +
   Seiten-Stack, `setSizes([150, 1200])`).
 
 ### Runde 3: Save-Collapse, Slider, Log-Hoehe
 
 * **Punkt 1 (Save klappt Knoten zu):** Nach einem Speichern (EventBus-
   Refresh) kollabierte jeder zugeklappte Plugin-Knoten mit Clones.
-  `serviceui/master_tree.py`: `_collect_expanded_state`/`_apply_expanded_
+  `../../serviceui/master_tree.py`: `_collect_expanded_state`/`_apply_expanded_
   state` tracken jetzt auch `TYPE_PLUGIN`-Knoten MIT Kindern
   (`("plugin", plugin_id)`) - Expansion bleibt ueber Neuaufbauten erhalten.
 
 * **Punkt 3 (Slider service_win):** Das ServiceWindow war mit
-  `setMinimumWidth(960)` zu breit. `serviceui/service_win.py`:
+  `setMinimumWidth(960)` zu breit. `../../serviceui/service_win.py`:
   `setMinimumWidth(520)` statt 960, initiale Splitter-Sizes
   `main_splitter.setSizes([460, 820])`.
-  `serviceui/param_columns.py`: Grow-only-`setSizes` (beim Panel-Rebuild
+  `../../serviceui/param_columns.py`: Grow-only-`setSizes` (beim Panel-Rebuild
   waechst das Panel nur, der Tree bleibt an der User-Position).
 
 * **Punkt 4 (Log-Hoehe):** Das Scroll-Log war zwei Zeilen zu hoch.
-  `serviceui/service_win.py`: `lineSpacing() * 2 + 12` statt `* 4 + 12`.
+  `../../serviceui/service_win.py`: `lineSpacing() * 2 + 12` statt `* 4 + 12`.
 
 ### Runde 4: Save/Restore-Pipeline (4 Punkte)
 
@@ -1947,7 +1947,7 @@ Aenderung noetig - nur verifiziert.
   entfernt ("Punkte 1-7"), damit das Read-Only-Panel dem Klick folgt.
   Dadurch folgte aber AUCH der Live-Filter nicht mehr den Haken - die
   Resultatparameter-Dropdowns (heatmap field/agg) aktualisierten sich bei
-  Checkbox-Aenderungen nicht. `serviceui/service_selector_dialog.py`:
+  Checkbox-Aenderungen nicht. `../../serviceui/service_selector_dialog.py`:
   Verbindung `tree.checked_changed` -> neuer Handler `_on_checked_changed`,
   der `selection_ids_requested(checked_feature_ids())` emittiert ->
   AnalyticsWindow `_on_picker_ids_selected` -> `set_feature_ids()`.
@@ -1956,7 +1956,7 @@ Aenderung noetig - nur verifiziert.
 * **Punkt 3 (UI-Sync nach Restore):** `heatmap_widget.py` verband
   `params_restored` -> `_sync_from_params` bereits, aber die
   Fenster-Ebene (AnalyticsWindow) hatte keine Verbindung.
-  `analytics/ui/analytics_win.py`: `_wire_view_model()` verbindet
+  `../../analytics/ui/analytics_win.py`: `_wire_view_model()` verbindet
   `vm.params_restored` -> neuer Handler `_sync_ui_from_restored_params`
   (Sidebar-Seite via `workspace_layout.page_index` unter blockSignals,
   aktuelle Page falls `_sync_from_params` existiert, danach
@@ -1964,19 +1964,19 @@ Aenderung noetig - nur verifiziert.
 
 ### Verifikation (headless, keine UI-Tests)
 
-* `test/check_ui3_bugfix.py`: **19/19 PASS** (Save-Collapse-Fix
+* `../../test/check_ui3_bugfix.py`: **19/19 PASS** (Save-Collapse-Fix
   TYPE_PLUGIN-Expansion, service_win-Slider 520/Grow-only, Log-Hoehe
   2 Zeilen).
-* `test/check_variant_bugfix.py`: **17/17 PASS** (per-Hash-Daten,
+* `../../test/check_variant_bugfix.py`: **17/17 PASS** (per-Hash-Daten,
   Clone-Labels, Rename-Persistenz - Runde 1).
-* `test/check_variant_params_bugfix.py`: **29/29 PASS** (Varianten-Params,
+* `../../test/check_variant_params_bugfix.py`: **29/29 PASS** (Varianten-Params,
   CheckableComboBox-Hitbox, QSplitter in Picker/AnalyticsWindow).
-* `test/check_restore_pipeline_bugfix.py` (neu): **27/27 PASS** - P1/P4
+* `../../test/check_restore_pipeline_bugfix.py` (neu): **27/27 PASS** - P1/P4
   (nested heatmap + params_restored in restore_workspace/_apply_profile),
   P2 (Anhaken/Abhaken -> selection_ids_requested mit checked_feature_ids),
   P3 (params_restored -> Sidebar folgt page_index, Datenquellen-Button
   synchron).
-* `test/check_2004_ctxmenu.py`: **34/34 PASS**, `test/check_2004_restore.py`:
+* `../../test/check_2004_ctxmenu.py`: **34/34 PASS**, `../../test/check_2004_restore.py`:
   **4/4 PASS** (Regression Restore-Pipeline).
 * `py_compile` aller geaenderten Dateien + CRLF-Konsistenz.
 ## 8e. Implementierungs-Log - Bugfix UI-Layout-Persistenz & Klick-Konflikt (10.08.2026)
@@ -1992,11 +1992,11 @@ Check/Uncheck aktualisiert Dropdowns, ServicePicker-Waisenfenster).
 * **Punkt 3 (heatmap_mode im Profil):** Der Ansichts-Modus der Heatmap-
   Seite (standard/delta) wurde beim Speichern eines Profils nicht
   persistiert und beim Restore nicht wiederhergestellt.
-  `analytics/engine/analytics_view_model.py`: Neue Methode
+  `../../analytics/engine/analytics_view_model.py`: Neue Methode
   `set_ui_layout(layout)` (uebernimmt die UI-Layout-Sektion in
   `_workspace_layout`); `_current_payload()` erhaelt die Sektion
   `"layout"`; `_apply_profile()` legt sie in `_workspace_layout`.
-  `analytics/ui/analytics_win.py`: Neue Methode `_current_ui_layout()`
+  `../../analytics/ui/analytics_win.py`: Neue Methode `_current_ui_layout()`
   (liefert `page_index` + `heatmap_mode`); `set_ui_layout(...)` wird vor
   `save_profile()`/`create_profile()` aufgerufen; der Sync-Handler
   `_sync_ui_from_restored_params` setzt `heatmap_page.set_mode(...)`
@@ -2013,7 +2013,7 @@ Check/Uncheck aktualisiert Dropdowns, ServicePicker-Waisenfenster).
 * **Punkt 6 (Plugin-Parent ohne Checkbox):** Ein Plugin-Knoten OHNE
   Kinder (nur ein Plugin, keine Varianten) hatte keine Checkbox, konnte
   aber via Muster-/Live-Filter nicht mehr angesprochen werden.
-  `serviceui/master_tree.py`: `childCount() == 0`-Guard in
+  `../../serviceui/master_tree.py`: `childCount() == 0`-Guard in
   `set_checked_feature_ids` und `_sync_checked_items` - bei kinderlosen
   Plugin-Knoten wird das Item selbst statt der Kinder gesetzt (die
   `setCheckState`-Semantik mit `childCount()` schlug sonst fehl).
@@ -2032,7 +2032,7 @@ Check/Uncheck aktualisiert Dropdowns, ServicePicker-Waisenfenster).
   Historie/das Profil speicherten den letzten Klick-Scope statt der Haken
   (Bug 1); die Ergebnisparameter-Dropdowns folgten dem Klick statt den
   Haken (Bug 2).
-  `serviceui/service_selector_dialog.py`: Der Klick-Handler emittiert
+  `../../serviceui/service_selector_dialog.py`: Der Klick-Handler emittiert
   KEIN `selection_ids_requested` mehr (der Filter folgt ausschliesslich
   den Checkboxen); das Read-Only-Panel folgt weiterhin dem Klick
   (Punkte 1-7 unveraendert). `_resolve_selection_ids` bleibt als
@@ -2041,24 +2041,24 @@ Check/Uncheck aktualisiert Dropdowns, ServicePicker-Waisenfenster).
 * **Bug 3 (ServicePicker-Waisenfenster):** Der ServicePicker-Singleton
   (`_service_dialog`, kein WA_DeleteOnClose) blieb beim Schliessen des
   AnalyticsWindow als frei bewegliches Waisenfenster haengen.
-  `analytics/ui/analytics_win.py`: `closeEvent` schliesst
+  `../../analytics/ui/analytics_win.py`: `closeEvent` schliesst
   `self._service_dialog.close()` vor `_save_workspace()`; das
   `destroyed`-Signal setzt die Referenz via `_on_service_dialog_destroyed`
   zurueck (RuntimeError/AttributeError abgefangen).
 
 ### Verifikation (headless, keine UI-Tests)
 
-* `test/check_restore_pipeline_round2.py` (neu, Runde 5): **29/29 PASS** -
+* `../../test/check_restore_pipeline_round2.py` (neu, Runde 5): **29/29 PASS** -
   Workspace- und Profil-Restore mit feature_ids, Layout-Sektion
   (heatmap_mode + page_index) in Profil-Payload und Restore, Plugin-Parent
   ohne Kinder setzt CheckState korrekt (Muster-/Live-Filter).
-* `test/check_restore_pipeline_round3.py` (neu, Runde 6): **17/17 PASS** -
+* `../../test/check_restore_pipeline_round3.py` (neu, Runde 6): **17/17 PASS** -
   Zeilen-Klick emittiert KEIN selection_ids_requested, Checkbox-Anhaken
   emittiert `[pid]`, Abhaken emittiert `[]`, Clone-Klick ohne Filter-Emit,
   destroyed-Mechanismus (Referenz auf None) + close()-Semantik ohne
   Waisenfenster, Quell-Marker fuer alle drei Fixes.
-* Regressionen: `test/check_2004_ctxmenu.py` **34/34 PASS**,
-  `test/check_variant_bugfix.py` **OK**, `test/check_ui3_bugfix.py`
+* Regressionen: `../../test/check_2004_ctxmenu.py` **34/34 PASS**,
+  `../../test/check_variant_bugfix.py` **OK**, `../../test/check_ui3_bugfix.py`
   **19/19 PASS**.
 * `py_compile` aller geaenderten Dateien + CRLF-Konsistenz.
 
@@ -2078,7 +2078,7 @@ Quellen (Picker vs. 'Feld'-Dropdown) und fehlender Picker-Open-Persistenz.
 
 ### Bug 1 (Kerzen-Overlay nur bei Datum auf einer Achse)
 
-* `analytics/ui/heatmap_widget.py`: `_update_controls()` erlaubt das Overlay
+* `../../analytics/ui/heatmap_widget.py`: `_update_controls()` erlaubt das Overlay
   jetzt bei `date` auf der X- ODER Y-Achse (vorher hart `can_overlay =
   x_dim == "date"`). `_on_config_changed()` schaltet das Overlay nur noch
   aus, wenn `date` auf KEINER Achse liegt. `_render_overlay()` zeichnet
@@ -2091,7 +2091,7 @@ Quellen (Picker vs. 'Feld'-Dropdown) und fehlender Picker-Open-Persistenz.
 
 ### Bug 2 (ServicePicker-Position/Restore)
 
-* `analytics/ui/analytics_win.py`: `_save_workspace()` persistiert
+* `../../analytics/ui/analytics_win.py`: `_save_workspace()` persistiert
   `layout.service_picker_open` (Dialog noch offen?); `closeEvent()` speichert
   den Workspace VOR dem Schliessen des Dialogs (der Zustand muss noch
   sichtbar sein). `_current_ui_layout()` persistiert den Picker-Offen-Zustand
@@ -2102,7 +2102,7 @@ Quellen (Picker vs. 'Feld'-Dropdown) und fehlender Picker-Open-Persistenz.
 
 ### Bug 3 (Ergebnisparameter-Dropdown nicht restored)
 
-* `analytics/ui/heatmap_widget.py` `_sync_combos_from_payload()`: Die
+* `../../analytics/ui/heatmap_widget.py` `_sync_combos_from_payload()`: Die
   Prioritaet wurde gedreht - die RESTAURIERTEN VM-Params (Workspace/Profil)
   gewinnen jetzt gegen einen Stale-Payload (Query lief VOR dem Restore mit
   Default-Params), der Payload bestaetigt nur noch die tatsaechlich
@@ -2131,19 +2131,19 @@ Quellen (Picker vs. 'Feld'-Dropdown) und fehlender Picker-Open-Persistenz.
 
 ### Verifikation (headless, keine UI-Tests)
 
-* `test/check_round7_fixes.py` (neu): **28/28 PASS** - Overlay X=date UND
+* `../../test/check_round7_fixes.py` (neu): **28/28 PASS** - Overlay X=date UND
   Y=date (Candles, Achsen-Sichtbarkeit, ViewBox-Link, Auto-Abschaltung ohne
   date-Achse), Stale-Payload kloppt VM-Params nicht (agg/field bleiben),
   Feld-Dropdown-CheckStates folgen feature_ids (srv_a / srv_a+srv_b /
   XOR-Sammel), kein feature_ids-Write-Back, Picker-Persistenz-Quell-Marker.
-* `test/check_round7_picker_runtime.py` (neu): **PASS** - echtes
+* `../../test/check_round7_picker_runtime.py` (neu): **PASS** - echtes
   AnalyticsWindow mit Temp-DBs: Picker open -> save -> restore -> wieder
   sichtbar.
-* Regressionen: `test/check_restore_pipeline_round2.py` **29/29 PASS**,
-  `test/check_restore_pipeline_round3.py` **17/17 PASS**,
-  `test/check_2004_ctxmenu.py` **34/34 PASS**,
-  `test/check_variant_bugfix.py` **OK**, `test/check_ui3_bugfix.py`
-  **19/19 PASS**, `test/check_2004_timing.py` **3/3 PASS**.
+* Regressionen: `../../test/check_restore_pipeline_round2.py` **29/29 PASS**,
+  `../../test/check_restore_pipeline_round3.py` **17/17 PASS**,
+  `../../test/check_2004_ctxmenu.py` **34/34 PASS**,
+  `../../test/check_variant_bugfix.py` **OK**, `../../test/check_ui3_bugfix.py`
+  **19/19 PASS**, `../../test/check_2004_timing.py` **3/3 PASS**.
 * `py_compile` aller geaenderten Dateien + CRLF-Konsistenz.
 
 ---
@@ -2168,18 +2168,18 @@ kuerzten den Filter.
 
 ### Loesung (generisch, Single Source of Truth)
 
-* `analytics/engine/analytics_view_model.py`: Neues Signal
+* `../../analytics/engine/analytics_view_model.py`: Neues Signal
   `feature_ids_changed = Signal()` - `set_feature_ids()` emittiert es nach
   `_mark_dirty()`, vor `_refresh(...)`. Neues Generations-Token
   `_restore_generation: int` - wird in `_apply_profile()` und
   `restore_workspace()` erhoeht, in `_current_params()` als
   `"restore_generation"` mitgegeben. Neue Property `restore_generation`.
-* `analytics/engine/analytics_worker.py`: Spiegelt das Generations-Token
+* `../../analytics/engine/analytics_worker.py`: Spiegelt das Generations-Token
   aus den Worker-Params ins Ergebnis-Dict
   (`result["restore_generation"]`, try/except-defensiv) - die UI kann
   damit Queries, die VOR dem letzten Restore/Profil gestartet wurden, als
   stale erkennen.
-* `analytics/ui/heatmap_widget.py`: Neue zentrale Methode
+* `../../analytics/ui/heatmap_widget.py`: Neue zentrale Methode
   `_rebuild_field_dropdown(keys, field_sources, payload_agg, payload_field)`
   - Single Source of Truth fuer das 'Feld'-Dropdown: Items aus
   Feld-Metadaten-Cache (`_field_keys`/`_field_sources`), Haken aus
@@ -2192,7 +2192,7 @@ kuerzten den Filter.
   Agg-/Field-Metadaten bleiben unveraendert (nur x/y/agg mit VM-Prioritaet
   bestaetigt). `attach_view_model()` verbindet `feature_ids_changed` mit
   `_on_feature_ids_changed` (hasattr-Guard).
-* `serviceui/master_tree.py`: `set_checked_feature_ids()` emittiert KEIN
+* `../../serviceui/master_tree.py`: `set_checked_feature_ids()` emittiert KEIN
   `checked_changed` mehr (programmatisches Set beim Oeffnen des
   Picker-Dialogs darf keine Feedback-Schleife ausloesen: checked_changed
   -> selection_ids_requested -> set_feature_ids wuerde den restaurierten
@@ -2203,21 +2203,21 @@ kuerzten den Filter.
 
 ### Verifikation (headless, keine UI-Tests)
 
-* `test/check_round8_bug345.py` (neu): **20/20 PASS** - synchroner
+* `../../test/check_round8_bug345.py` (neu): **20/20 PASS** - synchroner
   Feld-Rebuild bei Check/Uncheck (srv_a / srv_a+srv_b / srv_b, XOR-
   Sammelregel), Stale-Payload mit alter Generation kloppt restauriertes
   Feld/Agg nicht, frischer Payload (Gen == aktuell) uebernimmt Feld-
   Metadaten, set_checked_feature_ids emittiert KEIN checked_changed,
   Reverse-Mapping erhaelt Filter ueber Clone-Haken (Plugin-Parent mit
   Clones non-checkable, 2 Clone-Haken), clear_checks emittiert weiterhin.
-* Regressionen: `test/check_round7_fixes.py` **28/28 PASS**,
-  `test/check_round7_picker_runtime.py` **PASS**,
-  `test/check_restore_pipeline_bugfix.py` **30/30 PASS** (P2-Testblock an
+* Regressionen: `../../test/check_round7_fixes.py` **28/28 PASS**,
+  `../../test/check_round7_picker_runtime.py` **PASS**,
+  `../../test/check_restore_pipeline_bugfix.py` **30/30 PASS** (P2-Testblock an
   die neue Semantik angepasst: programmatisches Set ohne Signal,
-  Nutzeraktion via _on_item_changed), `test/check_restore_pipeline_round2.py`
-  **29/29 PASS**, `test/check_restore_pipeline_round3.py` **19/19 PASS**
-  (P1+2 analog angepasst), `test/check_bug345_chain.py` **15/15 PASS**,
-  `test/check_bug345_stale_hook.py` **PASS**, `test/check_bugfix_0808.py`
+  Nutzeraktion via _on_item_changed), `../../test/check_restore_pipeline_round2.py`
+  **29/29 PASS**, `../../test/check_restore_pipeline_round3.py` **19/19 PASS**
+  (P1+2 analog angepasst), `../../test/check_bug345_chain.py` **15/15 PASS**,
+  `../../test/check_bug345_stale_hook.py` **PASS**, `../../test/check_bugfix_0808.py`
   **PASS**.
 * `py_compile` aller 4 geaenderten Dateien: EXIT=0.
 
@@ -2244,44 +2244,44 @@ Monitor 2 fielen auf den Fallback zurueck.
 
 ### Loesung
 
-* `serviceui/master_tree.py` + `serviceui/service_selector_dialog.py`:
+* `../../serviceui/master_tree.py` + `../../serviceui/service_selector_dialog.py`:
   Neue `selection_hashes_requested`-Kette (Runde 10, Bug 1) - der Dialog
   liefert die instance_hashes der gecheckten Clone-Varianten; das Window
   reicht sie an `set_feature_ids(ids, hashes)`.
-* `analytics/engine/analytics_view_model.py`: `instance_hashes` als
+* `../../analytics/engine/analytics_view_model.py`: `instance_hashes` als
   `_params`-Key + `_normalize_instance_hashes()`; `set_feature_ids()` mit
   optionalem `instance_hashes`-Parameter (None = bestehende Einschraenkung
   behalten); `_current_params()` gibt die Hashes in die Query-Params.
-* `analytics/engine/analytics_worker.py` + `analytics_repository.py`:
+* `../../analytics/engine/analytics_worker.py` + `analytics_repository.py`:
   reichen `instance_hashes` an alle 5 Daten-Repo-Methoden durch.
-* `analytics/engine/feature_store_reader.py`: `_apply_feature_filter()`
+* `../../analytics/engine/feature_store_reader.py`: `_apply_feature_filter()`
   baut die Hash-Bedingung `(instance_hash IS NULL OR LOWER(TRIM(instance_hash))
   IN (...))`; `available_instance_hashes()` liefert die Hash-Menge mit
   feature_data. `resolve_no_data_variants` differenziert (Bug 2): benannte
   Variante zaehlt NUR mit exaktem Hash-Match, pids_with_data-Fallback nur
   fuer NULL-Hash-Bestand; Set-Instanz-Varianten werden ueber
   generate_instance_hash erfasst.
-* `analytics/ui/heatmap_widget.py`: '(No Data)'-Hinweise zentral in
+* `../../analytics/ui/heatmap_widget.py`: '(No Data)'-Hinweise zentral in
   `_rebuild_field_dropdown()` gerendert (deckt Cache-Rebuild-Pfad ab);
   Hash-Filter im Payload-Pfad.
-* `analytics/engine/analytics_view_model.py` (Bug 4): REIHENFOLGE
+* `../../analytics/engine/analytics_view_model.py` (Bug 4): REIHENFOLGE
   `params_restored.emit()` VOR `refresh_all()` in `_apply_profile()` UND
   `restore_workspace()`.
-* `analytics/ui/analytics_win.py` (Bug 3): Deterministischer `_initial_load`
+* `../../analytics/ui/analytics_win.py` (Bug 3): Deterministischer `_initial_load`
   - Symbol-Combo wird vor dem Restore gefuellt (idempotent), Non-Empty-
   Guards, dann load_profiles()/restore_workspace()/_on_page_changed()/
   refresh_all().
-* `persistent_win.py` + `serviceui/service_selector_dialog.py` (Bug 5):
+* `../../persistent_win.py` + `../../serviceui/service_selector_dialog.py` (Bug 5):
   Geometrie-Restore prueft gegen ALLE Screens (`QApplication.screens()`),
   nicht nur primaryScreen.
 
 ### Verifikation (headless, keine UI-Tests)
 
-* `test/check_round10.py` (neu): **34/34 PASS** - Varianten-Filter-Kette
+* `../../test/check_round10.py` (neu): **34/34 PASS** - Varianten-Filter-Kette
   (MasterTree -> Dialog -> VM -> Worker -> Repo -> Reader-SQL),
   No-Data-Differenzierung (exakter Hash-Match), Restore-Reihenfolge,
   Multi-Screen-Geometrie.
-* Regressionen: `test/check_round9.py` **19/19 PASS**, Restore-Pipeline
+* Regressionen: `../../test/check_round9.py` **19/19 PASS**, Restore-Pipeline
   30/30+29/29+19/19 PASS, bug345-Kette 15/15 PASS, stale_hook PASS,
   check_round7_fixes 28/28 PASS, check_round8_bug345 20/20 PASS,
   picker_runtime PASS, check_bugfix_0808 PASS.
@@ -2340,16 +2340,16 @@ an mehreren Stellen, redundante Re-Queries).
 
 ### Verifikation (headless, keine UI-Tests)
 
-* `test/check_round11.py` (neu): **35/35 PASS** - B3-1..B3-3
+* `../../test/check_round11.py` (neu): **35/35 PASS** - B3-1..B3-3
   (Payload-Roundtrip, Replace-Semantik, Aliasing), B4-1..B4-5
   (No-Data-Kette, Payload-Vertrag, Generation-Guard, Hash-Filter),
   A1-A6 (kein refresh_all im VM, zentraler Seiten-Sync genau 1x,
   Payload schreibt keine Controls, Query-Key-Pruefung).
-* Regressionen (an neues Design angepasst): `test/check_round10.py`
+* Regressionen (an neues Design angepasst): `../../test/check_round10.py`
   **34/34 PASS** (B4-Assertions auf A1-Vertrag: params_restored ohne
-  refresh_all), `test/check_round9.py` **19/19 PASS**,
-  `test/check_round7_fixes.py` **28/28 PASS** +
-  `test/check_round8_bug345.py` **20/20 PASS** (Restore-Sync via
+  refresh_all), `../../test/check_round9.py` **19/19 PASS**,
+  `../../test/check_round7_fixes.py` **28/28 PASS** +
+  `../../test/check_round8_bug345.py` **20/20 PASS** (Restore-Sync via
   `_sync_from_params()` statt params_restored-Verbindung, A3; Mock-VMs um
   request_features ergaenzt), Restore-Pipeline 30/30+29/29+19/19 PASS,
   bug345-Kette 15/15 PASS, stale_hook PASS, picker_runtime PASS,
@@ -2384,7 +2384,7 @@ nicht per Hash filtern (Fehler 2). Zusaetzlich filterte der
 
 ### Loesung
 
-* `serviceui/master_tree.py` (E1-E7): Check-Keys der Set-Instanz-Varianten
+* `../../serviceui/master_tree.py` (E1-E7): Check-Keys der Set-Instanz-Varianten
   (TYPE_SERVICE) sind jetzt 4-elementig - inkl. `instance_hash`
   (`_build_set_item`, Check-Handler, TYPE_SET-Branch,
   `_sync_checked_from_tree`). `checked_services()` liefert `instance_hash`
@@ -2393,15 +2393,15 @@ nicht per Hash filtern (Fehler 2). Zusaetzlich filterte der
   (vorher nur TYPE_CLONE). `set_checked_feature_ids()` wendet die
   Hash-Restriktion jetzt auch auf TYPE_SERVICE an (analog TYPE_CLONE) und
   fuegt den 4er-Key hinzu.
-* `analytics/engine/analytics_view_model.py`: `_no_data_presets_snapshot()`
+* `../../analytics/engine/analytics_view_model.py`: `_no_data_presets_snapshot()`
   berechnet `active_hashes` aus `_params["instance_hashes"]` und liefert
   sie als neuen Snapshot-Schluessel.
-* `analytics/engine/feature_store_reader.py`: `resolve_no_data_variants()`
+* `../../analytics/engine/feature_store_reader.py`: `resolve_no_data_variants()`
   liest `active_hashes` aus dem Snapshot und filtert in `_add()`
   variantengenau (`if active_hashes and h_s.lower() not in active_hashes:
   return`) - der Payload enthaelt nur noch die im ServicePicker gecheckten
   Varianten.
-* `analytics/ui/heatmap_widget.py`: `_selected_no_data_variant()` - der
+* `../../analytics/ui/heatmap_widget.py`: `_selected_no_data_variant()` - der
   'erste Variante des Services'-Fallback ist ersatzlos entfernt; es wird
   nur noch die (einzige) Variante des aktuellen Feld-Services aus dem
   variantengefilterten Payload zurueckgegeben. `_render_no_data_items()`
@@ -2413,13 +2413,13 @@ nicht per Hash filtern (Fehler 2). Zusaetzlich filterte der
 
 * `test/_verify_mastertree.py` (neu): **9/9 PASS** - statische Checks der
   E1-E7-Ersetzungen in master_tree.py.
-* `test/check_round12.py` (aktualisiert, Runde-13-Semantik): **23/23 PASS**
+* `../../test/check_round12.py` (aktualisiert, Runde-13-Semantik): **23/23 PASS**
   - B3/B3b an den variantengenauen Payload angepasst (gecheckte Variante
   gewinnt statt erster Variante; Payload ohne srv_x-Variante -> kein
   V1-Fallback), neue C4/C5-Checks (Reader-`active_hashes`-Filter: nur
   gecheckte Variante h2 geliefert, ohne Einschraenkung alle; VM-Snapshot
   liefert `active_hashes`-Schluessel).
-* Regressionen: `test/check_round11.py` **35/35 PASS** (B3-1..B3-3,
+* Regressionen: `../../test/check_round11.py` **35/35 PASS** (B3-1..B3-3,
   B4-1..B4-5, A1-A6 unveraendert gruen).
 * `py_compile` aller 4 geaenderten Dateien (System- + venv-Python): EXIT=0.
 * Commit `8a72c8a` (Runde 13), Commit `993ad46` (Runde 12+12b).
@@ -2445,21 +2445,21 @@ aber zwei Luecken blieben offen:
 
 ### Loesung
 
-* `serviceui/master_tree.py`:
+* `../../serviceui/master_tree.py`:
   * `_build_set_item`: Set-Instanz ohne `instance_hash` erhaelt einen
     on-the-fly-Hash via `generate_instance_hash(plugin_id, params)`
     (deterministisch, Q3/Q4 - gleicher Hash wie der Writer).
   * `checked_instance_hashes()` und die Check-Sync-Kette nutzen diesen
     on-the-fly-Hash auch dann, wenn die Instanz keinen gespeicherten Hash
     traegt (Hash-Restriktion greift damit auch fuer Altsets).
-* `serviceui/service_win.py`: `_add_service_to_set` persistiert den
+* `../../serviceui/service_win.py`: `_add_service_to_set` persistiert den
   `instance_hash` der neuen Set-Instanz in die Set-Definition.
-* `serviceui/service_selector_dialog.py`: Der Add-Pfad des
+* `../../serviceui/service_selector_dialog.py`: Der Add-Pfad des
   Service-Pickers persistiert den `instance_hash` analog.
 
 ### Verifikation (headless, keine UI-Tests)
 
-* `test/check_round13b.py` (neu): **9/9 PASS** - T1/T2 (On-the-fly-Hash
+* `../../test/check_round13b.py` (neu): **9/9 PASS** - T1/T2 (On-the-fly-Hash
   gesetzt / vorhandener Hash unveraendert), T3 (`checked_instance_hashes`
   liefert on-the-fly-Hash), T4 (Snapshot-Clones nur gecheckte Variante +
   `active_hashes`), T5 (Snapshot ohne active_hashes -> alle Clones),
@@ -2498,10 +2498,10 @@ fort, weil der Reader die Datenlage anders beurteilte als die DB:
   `schema_version`) fuer alle Rows mit `feature_data IS NULL` aus -
   Alt-Spalten-Bestand wird damit in den kanonischen JSON-Vertrag
   ueberfuehrt. Backup vor der Migration:
-  `test/backup_analytics_before_fd_migration.duckdb`. Ergebnis:
+  `../../test/backup_analytics_before_fd_migration.duckdb`. Ergebnis:
   **573.468 srv_proximity + 3.000 native migriert; 0 Rows mit NULL.**
   Dry-Run vorab auf `test/_migrate_test_copy.duckdb` verifiziert.
-* `analytics/engine/feature_store_reader.py`:
+* `../../analytics/engine/feature_store_reader.py`:
   * Neu (read-only): `plugin_ids_with_hashes(symbol, timeframe)` ->
     Set der plugin_ids mit mind. einer `instance_hash`-Zeile; faengt
     DB-Fehler intern ab und liefert `set()` (Invariante: rein lesend).
@@ -2511,12 +2511,12 @@ fort, weil der Reader die Datenlage anders beurteilte als die DB:
     Alt-Rows ohne Hash und deckt JEDE Variante ab (`has_data=True`).
     `pids_with_hashes is None` (Abfragefehler) behaelt die konservative
     Runde-10-Semantik (kein Fallback auf unbekannter Basis).
-* `analytics/engine/analytics_view_model.py`: `_no_data_presets_snapshot()`
+* `../../analytics/engine/analytics_view_model.py`: `_no_data_presets_snapshot()`
   liefert bei leerem `feature_ids`-Filter sofort
   `{"presets": {}, "sets": [], "display_names": {}, "active_hashes": []}`
   (Kernwunsch: 'Aktive Filter entfernen' zeigt danach alle Features OHNE
   NoData-Rauschen).
-* `analytics/ui/heatmap_widget.py`:
+* `../../analytics/ui/heatmap_widget.py`:
   * `_render_no_data_items()`: `active_ids`-Check ganz oben - bei leerem
     Filter wird weder der No-Data-Abschnitt noch der Fehler-/Loading-
     Hinweis gerendert (Guard gegen Alt-/Stale-Payloads).
@@ -2528,26 +2528,26 @@ fort, weil der Reader die Datenlage anders beurteilte als die DB:
 
 ### Verifikation (headless, keine UI-Tests)
 
-* `test/check_round13c.py` (neu): **20/20 PASS** - A: Migration (keine
+* `../../test/check_round13c.py` (neu): **20/20 PASS** - A: Migration (keine
   NULL-Rows mehr, JSON-Keys, Schema-Version), B: Reader-Fallback
   (Alt-Bestand deckt jede Variante ab; Abfragefehler -> konservativ),
   C: Kernwunsch (leerer Filter -> leeres Snapshot), D: UI-Logik
   (render-Guard, Hash-Match in `_selected_no_data_variant`).
 * Regressionen:
-  * `test/check_round11.py`: **35/35 PASS** (`_FakeReader` overridet
+  * `../../test/check_round11.py`: **35/35 PASS** (`_FakeReader` overridet
     `plugin_ids_with_hashes` -> `{"srv_a"}`; Widget-Tests 'frischer
     Payload'/'Fehlerzustand' mit aktivem Filter).
-  * `test/check_round12.py`: **23/23 PASS** (A6 mit aktivem Filter,
+  * `../../test/check_round12.py`: **23/23 PASS** (A6 mit aktivem Filter,
     C1 auf Kernwunsch-Semantik umgestellt: leerer Filter -> leeres
     Snapshot statt 'alle Presets').
-  * `test/check_round13b.py`: **9/9 PASS**, `test/_verify_mastertree.py`:
+  * `../../test/check_round13b.py`: **9/9 PASS**, `test/_verify_mastertree.py`:
     **ALL OK**.
 * `py_compile` aller 6 geaenderten Quelldateien + aller betroffenen
   Testdateien: EXIT=0.
 * Cleanup: Diagnose-Skripte (`_diag_*.py`, `_dryrun_migration.py`) und
   `_migrate_test_copy.duckdb` entfernt; `_migrate_feature_data.py`
   (Migrationswerkzeug), `check_round13c.py` und das Backup bleiben in
-  `test/` (Testdateien gitignored).
+  `../../test` (Testdateien gitignored).
 
 ---
 
@@ -2568,7 +2568,7 @@ gelaufen ist.
 
 ### Loesung
 
-* `analytics/engine/feature_store_reader.py`:
+* `../../analytics/engine/feature_store_reader.py`:
   * Der Alt-Bestand-Fallback greift jetzt NUR fuer die ERSTE aktive
     Variante je plugin_id im Snapshot (`first_hash_by_pid`, Reihenfolge
     wie im ServicePicker: Presets/Clones zuerst, dann Set-Instanzen mit
@@ -2582,15 +2582,15 @@ gelaufen ist.
 
 ### Verifikation (headless, keine UI-Tests)
 
-* `test/check_round14.py` (neu, echte DB `data/analytics.duckdb`):
+* `../../test/check_round14.py` (neu, echte DB `../../data/analytics.duckdb`):
   **8/8 PASS** - V1 (Original, Hash `a392915e`) mit Alt-Bestand ->
   kein NoData; V2 (Kopie, anderer Hash, nie gelaufen) -> '(No Data)'
   (auch wenn nur V2 gecheckt); einzige Variante + Alt-Bestand -> kein
   NoData (Regression 13c); Fake-DB ohne Tabelle -> konservative
   Runde-10-Semantik (beide Varianten NoData).
-* Regressionen: `test/check_round13c.py` **20/20 PASS**,
-  `test/check_round12.py` **23/23 PASS**, `test/check_round11.py`
-  **35/35 PASS**, `test/check_round13b.py` **9/9 PASS**,
+* Regressionen: `../../test/check_round13c.py` **20/20 PASS**,
+  `../../test/check_round12.py` **23/23 PASS**, `../../test/check_round11.py`
+  **35/35 PASS**, `../../test/check_round13b.py` **9/9 PASS**,
   `test/_verify_mastertree.py` **ALL OK**.
 * `py_compile`: EXIT=0.
 * Cleanup: Diagnose-/Fix-Skripte (`_diag_round14*.py`,
@@ -2601,7 +2601,7 @@ gelaufen ist.
 
 # 20.05 Architektur-Konzept: Ultra-Low-Latency Control & Rendering Pipeline
 
-> **Status:** Verbindlich neu gefasst für sofortige, latenzfreie UI-Bedienung.
+> **Status:** Umgesetzt und headless validiert (Runden 11–15c der Analytics-Pipeline, Stand 10.08.2026). Rein konzeptionelles Kapitel – kein Arbeitsschrittplan; die Umsetzung ist in den Runden 11–15c vollständig realisiert (Runde 15: Performance-Diagnose Dropdown – Metadaten-Cache & QUERY_FEATURES-Leichtpfad; Runden 15b/15c: Bugfix-Durchgänge Feld-Dropdown & Standalone-NoData, Kapitel 7/8).
 > **Primäres Ziel:** Absolut latenzfreie Bedienung aller Steuerelemente (Aggregationen, Dropdown-Checklisten, Profil-Speicherung, Workspace-Mechanismus, ServicePicker-Haken) unabhängig von Datenbank-Ladezeiten und Grafik-Rendern.
 
 Prämissen:
@@ -2610,6 +2610,8 @@ Prämissen:
 2. **Vollständige Erhaltung der Historie:** Die gesamte Speicher-/Restore-Logik für Fenster, Workspaces und Profile bleibt über das State-Management (`StateManager`, Repositories) lückenlos intakt.
 3. **Isolierte Grafik-Welt:** Slider-Aktionen, Maus-Zooms oder Canvas-Neuaufbauten triggern *nur* die visuelle Darstellung (Rendering-Welt). Sie manipulieren niemals das State-Management oder die Event-Logik der Controls.
 4. **Asynchrone Datennachführung:** Daten-Queries und Canvas-Renderings laufen asynchron über Worker-Threads. Sie „beobachten“ den aktuellen Control-State, blockieren ihn aber zu keinem Zeitpunkt.
+
+> **Prämissen-Check (Codebasis, 10.08.2026):** Alle vier Prämissen sind in der Implementierung verifiziert: (1) `set_feature_ids()`/Picker-Haken schlagen sofort im VM-State durch und triggern nur den Debounce-Timer – kein Hauptthread-DB-Zugriff; (2) Profile (`_current_payload()` v2-sectioned inkl. `instance_hashes`) und Workspaces (`StateManager` → `WindowStateRepository.workspace_state`, `_keep_history_on_close=True`, `INSTANCE_ID="win_analytics"`) sind lückenlos persistent; (3) Grafik-Interaktionen (z. B. `set_heatmap_zoom()`) werden rein client-seitig angewandt – kein DB-Requery, keine Event-Logik der Controls; (4) alle Daten-Queries laufen über `AnalyticsAsyncWorker` (QThread) mit Debounce-Pufferung und DbPool-Connections.
 
 ---
 
@@ -2642,8 +2644,8 @@ Prämissen:
 
 ## 2. Die Regeln für latenzfreie Bedienelemente (Control-Logik)
 
-* **Keine Hauptthread-DB-Abfragen beim Klick:** Methoden wie `resolve_no_data_variants()` oder komplexe Validierungen laufen *niemals* synchron im Hauptthread, wenn der Anwender eine Checkbox klickt oder ein Dropdown bedient. Sie wurden in den asynchronen `QUERY_FEATURES`-Worker verlagert.
-* **Sofortige UI-S وَRTPU (Optimistic Local State):** Ein Klick im ServicePicker ändert *sofort* den internen Zustand im ViewModel und schaltet das Control um. Das ViewModel emittiert ein leichtgewichtiges Signal (`feature_ids_changed` oder `params_restored` mit blockierten Signalen via `blockSignals(True)`), damit verbundene Combos ohne Wartezeit aktualisiert werden.
+* **Keine Hauptthread-DB-Abfragen beim Klick:** Methoden wie die No-Data-Auswertung oder komplexe Validierungen laufen *niemals* synchron im Hauptthread, wenn der Anwender eine Checkbox klickt oder ein Dropdown bedient. Sie wurden in die asynchronen Worker-Abfragen verlagert – `QUERY_FEATURES` für das Feature-Dropdown sowie `QUERY_HEATMAP_GENERIC` für die generische Heatmap (Runde 12, Option A: No-Data-Auswertung im selben Grafik-Payload, kein zweiter serieller Roundtrip).
+* **Sofortige UI-Sync (Optimistic Local State):** Ein Klick im ServicePicker ändert *sofort* den internen Zustand im ViewModel und schaltet das Control um. Das ViewModel emittiert ein leichtgewichtiges Signal (`feature_ids_changed` oder `params_restored` mit blockierten Signalen via `blockSignals(True)`), damit verbundene Combos ohne Wartezeit aktualisiert werden.
 * **Getrennte Grafik-Interaktionen:** Interagiert der Anwender mit dem Canvas (z. B. Zoom, Ausschnitt verschieben, Chart-Skalierung), verarbeitet die Rendering-Welt das *lokal*. Das ViewModel bekommt davon nichts mit, es sei denn, es handelt sich um eine finale Bereichs-Auswahl. Das verhindert das gegenseitige Aufschaukeln von Event-Schleifen.
 
 ---
@@ -2663,120 +2665,326 @@ Prämissen:
 ### Bug 4: Asynchrone "(No Data)"-Erkennung ohne UI-Latenz
 
 * **Problem:** Der Versuch, fehlende Datenvarianten synchron während des UI-Aufbaus im Hauptthread zu berechnen, führte zu UI-Hängern und verdeckten Fehlern.
-* **Umsetzung:**
-1. **Worker-Auslagerung:** Die Ermittlung von `no_data_variants` läuft ausschließlich im asynchronen `QUERY_FEATURES`-Worker (eigener Thread, eigene DB-Connection).
-2. **Snapshot-Übergabe:** Das ViewModel übergibt einen leichten, rein im RAM liegenden Preset-Snapshot (`_no_data_presets_snapshot()`) an die Query-Parameter.
-3. **Varianten-Genauigkeit:** Der Reader prüft über `active_hashes` *nur noch* die im ServicePicker tatsächlich aktivierten Varianten, wodurch falsche "(No Data)"-Anzeigen oder das versehentliche Vorauswählen falscher Einträge im Dropdown physikalisch unmöglich werden.
+* **Umsetzung (Runden 11–14):**
+1. **Worker-Auslagerung (Runde 11, B4-1/B4-2):** Die Ermittlung von `no_data_variants` läuft ausschließlich im Worker-Thread (eigener Thread, eigene DB-Connection) – sowohl im `QUERY_FEATURES`-Pfad als auch im `QUERY_HEATMAP_GENERIC`-Pfad (Runde 12, Option A: Auswertung im selben Grafik-Payload, damit aktualisiert sich das Dropdown mit/knapp nach der Grafik statt erst nach einem zweiten seriellen Roundtrip).
+2. **Snapshot-Übergabe:** Das ViewModel übergibt einen leichten, rein im RAM liegenden Preset-Snapshot (`_no_data_presets_snapshot()`) an die Query-Parameter; die DB-Fakten (`available_instance_hashes` / `feature_keys_by_service`) ermittelt der Reader im Worker-Thread.
+3. **Varianten-Genauigkeit (Runde 13/13b):** Der Reader prüft über `active_hashes` *nur noch* die im ServicePicker tatsächlich aktivierten Varianten; bei aktiver Einschränkung liefert auch eine hash-lose Variante nie "(No Data)" – falsche "(No Data)"-Anzeigen oder das versehentliche Vorauswählen falscher Einträge im Dropdown sind damit physikalisch ausgeschlossen.
+4. **Alt-Bestand & leerer Filter (Runde 13c/14):** Ein leerer Datenquellen-Filter (`feature_ids=[]`) erzeugt keinerlei "(No Data)"-Einträge (der Button „Aktive Filter entfernen“ zeigt danach wieder alle Features ohne Rauschen); undifferenzierte Alt-Rows ohne `instance_hash` decken ausschließlich die Original-Variante einer `plugin_id` ab (z. B. `srv_proximity`-Altbestand) – weitere Varianten derselben `plugin_id` erscheinen weiterhin korrekt als "(No Data)", bis der erste Scan lief.
+5. **Standalone-Services (Runde 15c):** Registrierte Plugins ohne Presets/Clones UND ohne Set-Instanz (z. B. `srv_trend_breakout`) werden über die neue Snapshot-Sektion `standalone` als hash-lose Variante in die Auswertung aufgenommen – ein noch nie ausgeführter Standalone-Service erscheint damit korrekt als "(No Data)", bis der erste Scan Daten schreibt (siehe Kapitel 8).
 
 ---
 
-## 4. Verbindlicher Abarbeitungsplan
+## 4. Ergänzende Mechanismen der Latenzfreiheit (implementiert)
 
-| Schritt | Modul / Bereich | Beschreibung | Ziel / Auswirkung |
-| --- | --- | --- | --- |
-| **1. Persistenz-Sicherung (Bug 3)** | `analytics_view_model.py`, `analytics_win.py` | `instance_hashes` in `_current_payload()` aufnehmen; `_restore_params_from_payload()` für saubere Replace-Semantik bei Profilen & Workspaces; Aliasing-Schutz. | Gespeicherte Varianten-Filter überleben jeden Neustart und Profilwechsel fehlerfrei. |
-| **2. Asynchrone No-Data-Pipeline (Bug 4)** | `feature_store_reader.py`, `analytics_worker.py`, `analytics_view_model.py` | Verlagerung der No-Data-Prüfung in den Async-Worker mittels Snapshot. Beseitigung aller synchronen Hauptthread-DB-Queries bei Control-Rebuilds. | Dropdowns und ServicePicker bleiben beim Anklicken absolut latenzfrei und flackern nicht. |
-| **3. UI-Event-Entkopplung & Rendering** | `analytics_win.py`, Pages, Widgets | Entfernen von `refresh_all()` aus VM-Restores. Zentrales UI-Sync mit `blockSignals(True)`. Trennung von Grafik-Mausaktionen und Control-State. | Canvas-Neuaufbauten oder Zooms stören niemals die Steuerelemente; Seitenwechsel laden bedarfsgesteuert (Lazy). |
-| **4. Headless-Verifikation** | `test/check_round11.py` | Statische Syntax-Prüfung (`py_compile`), reine Backend-Logik-Tests für Profile, Hashes und Async-Payloads (**keine GUI-Tests**). | Technische Absicherung der Pipeline ohne UI-Overhead. |
+* **Debounce & Query-Pufferung:** Der ViewModel puffert angeforderte Queries in `_pending_kinds` und startet sie seriell über einen Single-Shot-`QTimer` (200–300 ms). Klick-Serien erzeugen keinen Query-Stau; ein laufender Worker wird durch den nächsten Start nie abgebrochen (Race-Guard `self._worker is worker` verwirft verspätete Ergebnisse alter Worker).
+* **`restore_generation` (Stale-Payload-Schutz):** Bei jedem `restore_workspace()`/`_apply_profile()` erhöht der ViewModel ein Generations-Token, das über die Query-Params in die Worker wandert und im Ergebnis gespiegelt wird. Die UI verwirft Payloads älterer Generation – Queries, die VOR einem Restore gestartet wurden, überschreiben den synchron restaurierten Zustand nicht.
+* **Query-Key-Deduplizierung:** Das AnalyticsWindow fordert Seitendaten nur an, wenn sich der Query-Key ändert (Seiten-Index + `restore_generation` + Params-Signatur) – identische Anforderungen lösen keinen redundanten Re-Query aus.
+* **Zentraler UI-Sync statt `refresh_all()` im Restore:** Nach `params_restored` synchronisiert das AnalyticsWindow die Seiten-Combos in genau einem Durchgang mit `blockSignals(True)` (`_sync_ui_from_restored_params` → `_sync_all_pages_from_params` → `_request_current_page_data`). `refresh_all()` bleibt nur dem expliziten User-Refresh vorbehalten.
+* **UI-Zustände ohne Query:** Reine UI-Settings (Tabellen-Spaltenbreiten, Zeilenhöhe, Sortierung, Zoom-Bereiche) markieren nur das Dirty-Flag bzw. werden client-seitig angewandt – kein DB-Requery, keine Worker-Runde.
+* **`busy_changed` & `missing_services_detected`:** Laufende Queries zeigen einen Spinner; fehlende (entfernte/umbenannte) Services im Restore werden gemeldet, ohne den restaurierten Filter stillschweigend zu kürzen (Graceful Degradation).
+
+## 5. Bekannte Grenzen (bewusst unverändert)
+
+* **Entfernter synchroner Altbestand (Runde 15):** Die ViewModel-Methode `resolve_no_data_variants(symbol, timeframe)` (synchroner Reader-Zugriff im aufrufenden Thread, zuletzt `analytics_view_model.py` ~Z. 1413) wurde in Runde 15 **entfernt** – sie hatte seit Runde 11 keinen einzigen Aufrufer mehr (der produktive Pfad läuft vollständig über den Worker-Snapshot `presets_data`). Die Open/Closed-Regel schützt aktive Logik; toter Code ohne Aufrufer ist davon ausdrücklich ausgenommen. Verifiziert über `check_round9.py`/`check_round10.py` (19/19, 34/34), die vollständig auf dem Reader-/Worker-Pfad laufen.
+* **Abgrenzung der Latenzgarantie:** Die Aussage „läuft niemals synchron im Hauptthread" gilt für den tatsächlich verdrahteten Pfad (Controls → VM → Debounce → Worker) als Code-Invariante – mit dem entfernten Altbestand existiert im Analytics-Pfad kein synchroner DB-Zugriff mehr.
+
+
+---
+
+## 6. Implementierungs-Log – Runde 15: Performance-Diagnose Dropdown (10.08.2026)
+
+**Problem (User-Meldung, 10.08.2026):** Das Analytics-'Feld'-Dropdown und die '(No Data)'-Hinweise brauchten beim Öffnen mehrere Sekunden – die Feature-Metadaten wurden erst NACH der teuren Heatmap-Pivot-Aggregation sichtbar.
+
+**Root-Cause-Analyse (4 Engpässe):**
+1. **Root Cause 1:** `QUERY_FEATURES` war deaktiviert; das Feld-Dropdown wartete auf das Grafik-Payload (`QUERY_HEATMAP_GENERIC` inkl. Pivot-Aggregation).
+2. **Root Cause 2:** `feature_keys_by_service` / `available_feature_keys` / `available_instance_hashes` / `plugin_ids_with_hashes` scannten den feature_store bis zu 6× pro Update (Voll-Scans inkl. feature_data-JSON-Parsing).
+3. **Root Cause 3:** Kein Caching der stabilen Metadaten (ändern sich nur bei `store_plugin_payload()`).
+4. **Root Cause 4:** `feature_keys_by_service` lief je Zyklus doppelt (Dropdown + No-Data-Auswertung).
+
+### Lösung (Fixes 1–3)
+
+* **Fix 3 (Metadaten-Cache, `feature_store_reader.py`):** Gemeinsamer Basis-Scan `_feature_meta_base(symbol, timeframe)` – **GENAU EIN** DuckDB-Zugriff für alle 4 Metadaten-Methoden. In-Memory-Cache (`_meta_cache` + `_meta_lock`, threadsicher für die gemeinsame Reader-Instanz) mit Invalidation via `feature_cache_last_invalidated` (feature_builder, Invariante 13 – wird bei jedem `store_plugin_payload()` aktualisiert); defensiver Notausgang `invalidate_meta_cache()`. Die `feature_ids`/`instance_hashes`-Filter laufen als Python-Filter auf dem Cache (Semantik identisch zur bisherigen SQL-IN-Clause: case-insensitiv, whitespace-tolerant, NULL-Hash-Pass-through – Runde-10/13c-Vertrag unverändert).
+* **Fix 1 (QUERY_FEATURES-Leichtpfad, `analytics_repository.py` / `analytics_worker.py` / `heatmap_widget.py`):** Neuer Helfer `_field_metadata(symbol, timeframe, feature_ids, instance_hashes)` → `(metrics, field_sources)`, genutzt von `get_generic_heatmap` UND `get_available_features`. Der QUERY_FEATURES-Payload trägt jetzt `metrics` + `field_sources` – das Feld-Dropdown + '(No Data)' kommen ohne die teure Heatmap-Pivot-Aggregation. `heatmap_widget.request_data()` reaktiviert `request_features()` **vor** `request_heatmap_generic()`.
+* **Fix 2 (durch Fix 3 abgedeckt):** Beide Aufrufer (`_field_metadata` / `resolve_no_data_variants`) teilen sich den gecachten Basis-Scan – keine doppelte Scan-Last mehr; kein Signatur-Umbau nötig.
+* **Code-Cleanup (separat committet):** Toter synchroner VM-Code `resolve_no_data_variants` (`analytics_view_model.py`, seit Runde 11 ohne Aufrufer) entfernt – siehe §5.
+
+### Verifikation (headless, keine UI-Tests)
+
+* `../../test/check_round15_perf.py` (neu): **27/27 PASS** – Basis-Scan = 1 DB-Zugriff für 4 Metadaten-Methoden, Zweitaufruf = 0 Zugriffe (Cache), Invalidation via `store_plugin_payload` (neuer Key sichtbar), Python-Filter-Semantik (case-insensitiv/whitespace, NULL-Hash-Pass-through, numeric_only-Trennung), No-Data-Semantik, QUERY_FEATURES-Leichtpfad (metrics/field_sources identisch zum Heatmap-Pfad), defensiver Notausgang.
+* Regression: `check_round12.py` (23/23 – A5: `request_features()` vor `request_heatmap_generic()` in der Quelldatei), `check_round11.py` (35/35), `check_round9.py` (19/19), `check_round10.py` (34/34), `check_2004_bugfix3.py` (15/15), `check_round14.py` (8/8). `py_compile` aller geänderten Dateien OK.
+* `check_round13c.py` war während der Verifikation **nicht ausführbar**: `../../data/analytics.duckdb` war von der laufenden App exklusiv gesperrt (PID 32608, IO-Error „File is already open") – der Test liest die echte DB und wird nach App-Ende nachgeholt.
+* **Offen (manuell):** Funktions-/Latenztest des Dropdowns in der laufenden App durch den Anwender.
+
+---
+
+## 7. Implementierungs-Log – Runde 15b: Bugfix Feld-Dropdown (User-Meldung, 10.08.2026)
+
+**Problem (User-Symptome, 10.08.2026):**
+1. Check/Uncheck aus dem ServicePicker wird nicht im 'Feld'-Dropdown sichtbar.
+2. Versionen (Parameter-Varianten) werden nicht mehr verarbeitet und angezeigt.
+3. Services/Variationen mit NoData erscheinen nicht mit '(No Data)'.
+
+**Root Cause (Runde-15-Regression):** `_field_metadata` rief `feature_keys_by_service` MIT `instance_hashes` auf. Bei einer gecheckten NoData-Variante (Hash ohne DB-Rows) war `by_service` leer → der ungefilterte Fallback `avail` zeigte ALLE Keys aller Services OHNE Service-Prefix und ignorierte die Datenquellen-Auswahl. Zusätzlich aktualisierte `set_feature_ids` den QUERY_FEATURES-Leichtpfad nicht (Cache blieb auf dem letzten Payload).
+
+### Lösung (Fixes A/B)
+
+* **Fix A (`analytics_repository.py`, `_field_metadata`):** Die Feld-Struktur folgt den **Services** (`feature_ids`), nicht den Varianten (`instance_hashes`) – eine gecheckte NoData-Variante blendet den aktiven Service nicht mehr aus der Feld-Metadaten aus. Der defensive Fallback `avail` (alle Keys) greift NUR ohne aktiven Filter (bei aktivem Filter ist eine leere `by_service`-Menge ein legitimes Ergebnis).
+* **Fix B (`analytics_view_model.py`, `set_feature_ids`):** Refresht jetzt `(QUERY_FEATURES, QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC, QUERY_SCATTER, QUERY_DISTRIBUTION)` mit **QUERY_FEATURES zuerst** – das Dropdown bekommt `field_sources`/`no_data_variants` für die aktuellen Filter (kein Warten auf den Grafik-Payload).
+
+### Verifikation (headless, keine UI-Tests)
+
+* `../../test/check_round15b.py` (neu): **10/10 PASS** – Feld-Scope folgt den aktiven Services (kein ungefilterter Fallback bei aktivem Filter), NoData-Variante gecheckt liefert trotzdem die Felder des aktiven Services, Dropdown zeigt Service-Prefix-Items + '(No Data)'-Item, `set_feature_ids` stellt QUERY_FEATURES in die Puffer-Queue (Reihenfolge).
+* Regression: `check_round15_perf.py` (27/27), `check_round12.py` (23/23), `check_round11.py` (35/35), `check_round13c.py` (20/20), `check_round9.py` (19/19), `check_round10.py` (34/34), `check_2004_bugfix3.py` (15/15), `check_round14.py` (8/8). `py_compile` aller geänderten Dateien OK.
+* **Offen (manuell):** Dropdown-Verhalten in der laufenden App durch den Anwender.
+
+---
+
+## 8. Implementierungs-Log – Runde 15c: Standalone-Services in der NoData-Auswertung (10.08.2026)
+
+**Problem (User-Meldung, 10.08.2026):** Der Service `srv_trend_breakout` wird nicht im Dropdown erkannt und nicht in der noData-Sektion angezeigt.
+
+**Diagnose (echte DB, `test/_diag_trend.py`):** `srv_trend_breakout` ist ein **Standalone-Service** – registriertes Plugin, das weder Presets/Clones (`plugin_presets()`) noch eine Set-Instanz (`get_sets()`) besitzt und noch keine feature_store-Rows geschrieben hat (DISTINCT feature_ids: `native`, `srv_grid_lines`, `srv_proximity`, `srv_swing_volume_profile`).
+
+**Root Cause:** `_no_data_presets_snapshot()` sammelte NUR `model.plugin_presets()` (Clones) + `model.get_sets()` (Set-Instanzen). Reine Standalone-Services fielen komplett aus dem Snapshot → der Reader `resolve_no_data_variants()` konnte sie nie als '(No Data)' liefern.
+
+### Lösung (Fixes A/B)
+
+* **Fix A (`analytics_view_model.py`, `_no_data_presets_snapshot`):** Neue Snapshot-Sektion **`standalone`** – registrierte Plugins ohne Presets UND ohne Set-Instanz werden als hash-lose Variante (`preset_name 'Default'`) aufgenommen; `display_names["{pid}|Default"]` via `resolve_service_display_name` (→ 'Trend Breakout'). Ausgeschlossen sind Plugins mit Presets/Set-Instanzen (dort läuft die bestehende Preset-/Set-Auswertung) sowie – konsistent zu Runde 13b – alle Standalone-Einträge bei aktiver Varianten-Einschränkung (`instance_hashes`).
+* **Fix B (`feature_store_reader.py`, `resolve_no_data_variants`):** Verarbeitet die `standalone`-Sektion als hash-lose Variante (`_add(pid, "Default", "")`) – `_has_data(pid, "")` prüft direkt `pids_with_data` (kein Hash-/Alt-Bestand-Fallback nötig). Die Standalone-pids fließen zusätzlich in `active_pids` (Scope von `feature_keys_by_service`), damit ein Standalone-Service MIT Rows nicht fälschlich als '(No Data)' erscheint.
+
+### Verifikation (headless, keine UI-Tests)
+
+* `../../test/check_round15c.py` (neu): **19/19 PASS** (Temp-DB in `../../test`) – Standalone ohne Rows → NoData-Variante (`instance_hash` leer, `preset_name 'Default'`, display_name 'Trend Breakout'); Standalone MIT Rows → KEINE NoData-Markierung; Payload (`get_available_features`) enthält die Standalone-NoData; Widget rendert 'Trend Breakout – (No Data)' im Feld-Dropdown; VM-Snapshot nimmt Standalone auf (nicht bei Set-Instanz/leerem Filter/aktiver Hash-Einschränkung).
+* **Echte DB (User-Szenario):** Snapshot `standalone=['srv_trend_breakout']`, `display_names['srv_trend_breakout|Default']='Trend Breakout'`, `no_data_variants` liefert `[{plugin_id: srv_trend_breakout, display_name: 'Trend Breakout', instance_hash: ''}]`.
+* Regression: `check_round15b.py` (10/10), `check_round15_perf.py` (27/27), `check_round12.py` (23/23), `check_round11.py` (35/35), `check_round13c.py` (20/20), `check_round9.py` (19/19), `check_round10.py` (34/34), `check_2004_bugfix3.py` (15/15), `check_round14.py` (8/8). `py_compile` der geänderten Dateien OK.
+* **Offen (manuell):** App-Test – `srv_trend_breakout` im ServicePicker checken → '(No Data)'-Hinweis im Feld-Dropdown; nach dem ersten Scan (Daten geschrieben) verschwindet der Hinweis.
+
+---
+
+## 9. Implementierungs-Log – Bugfix Runde 16: Mischbetrieb NoData & Dropdown-Anzeige (11.08.2026)
+
+**Problem (User-Meldungen 0–6, 11.08.2026):**
+
+1. Dropdown-Anzeige: Checkbox + ' ' + Service-Name (ohne `src_`-Präfix) + '/' + Versions-Name + '/ ' + Ausführungsdatum (z. B. `23.04.26 22:14`).
+2. Position Aggregation: rechts neben Zoom Y mit Abstand.
+3. Position Feld-Dropdown: rechts neben Aggregation in der Zoom-Y-Zeile, Länge bis zum rechten Canvas-Ende.
+4. NoData-Anzeige von Versionen fehlt komplett – auch MEHRERE Versionen müssen möglich sein.
+5. Mischbetrieb: sind NoData-Services UND Versionen gleichzeitig gecheckt, erscheinen die Services nicht (z. B. `srv_trend_breakout`).
+6. Services-Dropdown: nicht alle Services sichtbar, wenn Services und Versionen gemischt gecheckt sind.
+
+**Diagnose (echte DB + ServiceSelectorModel):** 
+* S1 (nur Standalone `srv_trend_breakout` gecheckt): NoData erscheint korrekt.
+* S2 (nur Version `Kopie 99`, Hash `7d636c36`, ohne Rows): NoData erscheint korrekt.
+* S3 (MIX `srv_trend_breakout` + Version `Kopie 99`): **NUR die Version erscheint, `srv_trend_breakout` fehlt.**
+
+**Root Cause (zentrale Routine):** Sobald eine `instance_hashes`-Auswahl aktiv ist, wird jede **hash-lose** Variante (Standalone-Services wie `srv_trend_breakout`/`srv_trend_regime` sowie NULL-Hash-Set-Instanzen) an DREI Stellen gleichzeitig weggefiltert:
+
+1. `analytics_view_model.py` – `_no_data_presets_snapshot()`: `if not active_hashes:` schließt die `standalone`-Snapshot-Sektion komplett aus, sobald irgendein Hash gecheckt ist (Runde-15c-Entscheidung, per User-Meldung 5/6 revidiert).
+2. `feature_store_reader.py` – `resolve_no_data_variants()._add()`: `if active_hashes and h_s.lower() not in active_hashes: return` verwirft hash-lose Varianten (`h_s == ""`).
+3. `heatmap_widget.py` – `_render_no_data_items()`: `if active_hashes:` filtert hash-lose Varianten (`instance_hash == ""`) erneut aus.
+
+**Bug 4** (gar keine NoData-Anzeige) ist derselbe Fall: Sind alle gecheckten Versionen mit Daten belegt UND zusätzlich ein Standalone-Service ohne Daten gecheckt, wird der Standalone-Service an allen 3 Stellen verworfen → Snapshot/Filter leer → `_render_no_data_items()` macht `early return` → **kein NoData-Abschnitt**.
+
+### Lösung (Fixes 1–3, Bugs 4/5/6)
+
+* **Fix 1 (`analytics_view_model.py`, `_no_data_presets_snapshot`):** Den `if not active_hashes:`-Guard um die `standalone`-Sektion entfernt – Standalone-Services werden IMMER (nur nach `active_ids` gefiltert) in den Snapshot aufgenommen. Die Annahme „hash-lose Variante ist nie Teil einer Hash-Auswahl" gilt für Standalone-Services NICHT: Sie werden über `feature_ids` gecheckt, nicht über Hashes.
+* **Fix 2 (`feature_store_reader.py`, `resolve_no_data_variants()._add`):** Der Varianten-Guard greift nur noch bei Varianten MIT Hash: `if active_hashes and h_s and h_s.lower() not in active_hashes: return`. Hash-lose Varianten (Standalone/Alt-Bestand) passieren weiterhin.
+* **Fix 3 (`heatmap_widget.py`, `_render_no_data_items`):** Derselbe Guard im defensiven Widget-Filter – hash-lose Varianten bleiben erhalten, nur hash-behaftete werden gegen `active_hashes` geprüft.
+
+### Lösung (Fix 4, Bugs 2/3 – Layout)
+
+* **Fix 4 (`heatmap_widget.py`, `__init__`):** Aggregation-Combo (+ Label) und Feld-Combo (+ Label) aus Zeile 1 (`ctrl`: X-/Y-Achse) in Zeile 2 (`ctrl2`: Overlay + Zoom) nach `_slider_zoom_y` verschoben: `addSpacing(15)` → Aggregation → `addSpacing(10)` → Feld. Das Feld-Dropdown erhält `QSizePolicy.Expanding` + `stretch=1` (reicht bis zum Canvas-Ende) und verliert sein `MaximumWidth(460)`-Limit. `QSizePolicy`-Import ergänzt.
+
+### Lösung (Fix 5, Bug 1 – Anzeige-Format)
+
+* **Fix 5a (`feature_store_reader.py`):** Neue Methode `fetch_last_execution_datetimes_by_hash()` – liefert je (feature_id, instance_hash) den neuesten Schreib-Zeitpunkt MIT Uhrzeit als `'DD.MM.JJ HH:MM'` (identische SQL-Basis wie `fetch_last_execution_dates_by_hash`).
+* **Fix 5b (`service_selector_model.py`):** Neuer Cache `_last_execution_datetimes_by_hash` (in `refresh()` geladen) + Methode `last_execution_datetime_for_hash(plugin_id, instance_hash)` (Fallback `'--.--.-- --:--'`).
+* **Fix 5c (`analytics_view_model.py`, `resolve_service_display_name`):** Neuer optionaler Parameter `exec_date`; Präfix-Strip um `src_` erweitert; Format umgestellt von `Name (Preset)` auf `Name / Preset / DD.MM.JJ HH:MM` (Preset `Default` und Datum-Fallback werden übersprungen). Neue Hilfsmethode `checked_variant(plugin_id)` liefert `{"preset_name", "instance_hash", "exec_datetime"}` der im Picker gecheckten Variante eines Services.
+* **Fix 5d (`heatmap_widget.py`, `_field_label`):** Feld-Einträge tragen jetzt die gecheckte Variante + Ausführungsdatum: `Swing Volume Profile / key / Kopie 99 / 23.04.26 22:14` (Format `{Name} / {Key} / {Preset} / {Datum}`; Preset `Default` und Datum-Fallback entfallen). Aufruf defensiv via `getattr` (`checked_variant` optional) - Fake-/Alt-ViewModels in Tests ohne die Methode ergeben keinen Anhang.
+* **Fix 5e (`feature_store_reader.py`, `_no_data_fallback_name`):** Fallback-Format auf `Name / Preset` umgestellt (Preset `Default` entfällt) – konsistent zur VM-Logik.
+
+### Verifikation (headless, keine UI-Tests)
+
+* `py_compile` aller geänderten Dateien.
+* Regressionstests nur auf ausdrückliche Anweisung.
+* **Offen (manuell):** App-Test – Mischcheck im ServicePicker, NoData-Abschnitt, Layout (Aggregation/Feld in Zoom-Y-Zeile), Dropdown-Format.
 
 
 ---
 
-# Phase 20.06: Generatives Filter- & Sortiersystem (Cross-View Filtering Engine)
+## 10. Implementierungs-Log - Bugfix Runde 16c: Ausfuehrungsdatum hinter Services ohne Varianten (11.08.2026)
 
-## 1. Architektur & Invarianten
-* **Code-Style:** Exakt 4 Leerzeichen Einrückung, 1 Leerzeile zwischen Methoden.
-* **Testing:** Headless via `py_compile` & `test/test.py` (UI-Exec STRIKT VERBOTEN).
-* **Entkopplung:** MVVM-Datenfluss via `AnalyticsViewModel`, dyn. SQL-Generation im `FeatureStoreReader`.
+**Problem (User-Meldung, 11.08.2026):** Im Feld-Dropdown soll auch hinter **Services ohne Versionen** (Standalone-Services wie `srv_trend_breakout` - kein Preset, keine Set-Instanz) das Ausfuehrungsdatum angezeigt werden: `Checkbox + ' ' + Service-Name (ohne `src_`-Praefix) + '/ ' + DD.MM.JJ HH:MM` (z. B. `23.04.26 22:14`), sofern vorhanden.
 
----
+**Root Cause:** `checked_variant()` (Runde 16) liefert fuer Standalone-Services (keine Presets/Clones) konsequent `None` - der Anzeige-Anhang in `_field_label()` blieb leer. Das Ausfuehrungsdatum eines hash-losen Services lag zwar im Modell vor (`last_execution_date`, nur Datum ohne Uhrzeit), wurde aber nicht im Dropdown genutzt.
 
-## 2. Kernkonzept: Generisches Rules-Based Filtering
+### Loesung (Fixes 1-4)
 
-Ein zentraler, dynamischer Filter-Builder erzeugt strukturierte Regelketten (Rules Tree / AST), die konsistent auf **alle** Analytics-Ansichten angewendet werden.
+* **Fix 1 (`feature_store_reader.py`):** Neue Methode `fetch_last_execution_datetimes()` - neuester Schreib-Zeitpunkt je feature_id **MIT Uhrzeit** als `'DD.MM.JJ HH:MM'` (identische SQL-Basis wie `fetch_last_execution_dates`; MAX(created_at) GROUP BY feature_id ueber alle Symbole/Timeframes).
+* **Fix 2 (`service_selector_model.py`):** Neuer Cache `_last_execution_datetimes` (in `refresh()` geladen) + Methode `last_execution_datetime(plugin_id)` (Fallback `'--.--.-- --:--'`).
+* **Fix 3 (`analytics_view_model.py`):** Neue Methode `service_execution_datetime(plugin_id)` - Delegate an das Modell (rein lesend, defensiv).
+* **Fix 4 (`heatmap_widget.py`, `_field_label`):** Else-Branch - liefert `checked_variant()` `None` (Service ohne Varianten), wird das Service-Datum+Uhrzeit angehaengt: `Trend Breakout / price / 10.08.26 14:03`. Aufruf defensiv via `getattr` (Fake-/Alt-ViewModels ohne die Methode ergeben keinen Anhang).
 
-### A. Regel-Spezifikation
-- **Ziel-Felder:** Jedes numerische, Boole’sche oder kategoriale Feld aus `feature_data` (JSON) sowie native DB-Spalten (`bar_time`, `feature_id`, `symbol`, `timeframe`).
-- **Operatoren:** `=`, `!=`, `>`, `>=`, `<`, `<=`, `BETWEEN`, `IN`, `LIKE`, `IS_HIT`.
-- **Verknüpfung:** `AND` / `OR` Logikblöcke.
+### Verifikation (headless, keine UI-Tests)
 
-### B. Wirkung auf die Ansichten (Cross-View Projection)
-- `TablePage`: Zeilen-Filtering & Multi-Column-Sortierung.
-- `HeatmapPage`: Vorauswahl/Filterung der Quell-Bars **vor** der Matrix-Aggregation.
-- `ScatterPage`: Ausblenden gefilterter Datenpunkte im Scatter-Plot.
-- `DistributionPage`: Dynamisches Re-Binning/Histogramm über den gefilterten Datensatz.
+* `py_compile` aller geaenderten Dateien (EXIT=0).
+* Echte DB (analytics.duckdb): Reader liefert 6 Services mit `'DD.MM.JJ HH:MM'` (Format-Check gruen); Modell-Cache + Fallback `--.--.-- --:--` korrekt; `_field_label("open", ["srv_grid_lines"])` -> `Grid Lines / open / 10.08.26 14:03`; `srv_trend_breakout` (keine Daten) -> `Trend Breakout / price` (ohne Datum); Fake-VM ohne neue Methode -> kein Crash.
+* **Offen (manuell):** App-Test - Standalone-Service im Feld-Dropdown zeigt Ausfuehrungsdatum nach dem ersten Scan.
 
 ---
 
-## 3. Datenfluss & Engine-Integration
+## 11. Abschluss Phase 20.05: Ultra-Low-Latency Control & Rendering Pipeline (11.08.2026)
 
-```text
-[AnalyticsWindow (Filter-UI / Rule-Editor)]
-                 │
-                 ▼
-[AnalyticsViewModel.set_filter_rules(rules)] ──► [_mark_dirty()]
-                 │
-                 ▼ (AsyncWorker)
-[FeatureStoreReader.build_dynamic_where(rules)]
-                 │
-                 ├── Generiert SQL: "WHERE feature_data->>'visit_pct' >= 0.05 AND ..."
-                 │
-                 └── Ausführung ──► Updates für Table / Heatmap / Scatter / Distribution
+Mit den Runden 16 (Mischbetrieb NoData & Dropdown-Anzeige) und 16c (Ausfuehrungsdatum hinter Services ohne Varianten) ist die **Phase 20.05 abgeschlossen** - alle User-Meldungen 0-6 der Runde 16 sowie die Nachmeldung zu Standalone-Daten sind umgesetzt, committet und headless verifiziert:
 
+1. **Dropdown-Anzeige:** Checkbox + Service-Name (ohne `src_`/`srv_`/`ind_`-Praefix) + `{Preset}` (nur bei Versionen) + `/ DD.MM.JJ HH:MM` (Ausfuehrungsdatum, wenn vorhanden - fuer Versionen und Standalone-Services).
+2. **Layout:** Aggregation rechts neben Zoom Y (mit Abstand), Feld-Dropdown rechts daneben bis zum Canvas-Ende (Expanding-Policy).
+3. **NoData:** Versionen (auch mehrere) und Standalone-Services erscheinen korrekt - auch im Mischbetrieb (Fixes 1-3).
+4. **Latenzfreiheit:** Alle 4 Praemissen der 20.05-Architektur bleiben erfuellt (kein synchroner DB-Zugriff im UI-Hauptthread; die neuen Datums-Lookups laufen ueber die gecachten Modell-Caches in `refresh()`).
+
+**Abschliessender Stand (Commits `d70462d` + `8ecf2b3`):**
+* `../../analytics/engine/analytics_view_model.py` - Fix 1 (Standalone-Guard), Fix 5c (`exec_date`, `src_`-Strip, `checked_variant`), Fix 3 (16c: `service_execution_datetime`)
+* `../../analytics/engine/feature_store_reader.py` - Fix 2 (`and h_s`-Guard), Fix 5a (`fetch_last_execution_datetimes_by_hash`), Fix 5e (Fallback `Name / Preset`), Fix 1 (16c: `fetch_last_execution_datetimes`)
+* `../../analytics/engine/service_selector_model.py` - Fix 5b (Cache + `last_execution_datetime_for_hash`), Fix 2 (16c: Cache + `last_execution_datetime`)
+* `../../analytics/ui/heatmap_widget.py` - Fix 3 (Widget-Hash-Filter), Fix 4 (Layout Zoom-Y-Zeile), Fix 5d (`_field_label` defensiv), Fix 4 (16c: Standalone-Datum)
+
+**Verbleibend (manuell durch den Anwender):** Funktionstest der UI (ServicePicker-Mischcheck, NoData-Abschnitt, Layout, Dropdown-Format inkl. Ausfuehrungsdatum).
+---
+
+## 12. Implementierungs-Log - Bugfix Runde 17b: Log-Hoehe 6 Zeilen & Maximize-Button aktiv (11.08.2026)
+
+**Problem (User-Nachtrag nach Runde 17, 11.08.2026):**
+1. Das Log-Fenster im ServiceWindow soll noch **2 Zeilen hoeher** (4 -> 6 Zeilen).
+2. Der **Maximize-Button ist weiterhin ausgegraut** - trotz `resize_to_clamped_content`-Schutz aus Runde 17.
+
+**Root Cause Maximize (Analyse 11.08.2026):** `apply_screen_cap()` in `../../scrollable_content.py` setzt `setMaximumSize(screen.size())`. Der exakt-fit-Reflow (`resize_to_clamped_content`) bringt das Fenster auf genau diese Groesse. Liegt `maximumSize == size` vor (z. B. Inhalt >= Screen oder kleinere Aufloesung als die .ui-Default-Geometrie), graut Windows den Maximize-Button aus (Fenster ist nicht mehr vergroesserbar).
+
+### Loesung (Fixes 1-3)
+
+* **Fix 1 (`../../serviceui/service_win.py`, Log-Hoehe):** `setMaximumHeight`/`setMinimumHeight` von `fm.lineSpacing() * 4 + 12` auf `* 6 + 12` erhoeht (User-Nachtrag: 2 Zeilen hoeher als die 4-Zeilen-Stufe).
+* **Fix 2 (`../../serviceui/service_win.py`, `apply_screen_cap()`-Override):** ServiceWindow ueberschreibt die Basis-Methode und setzt das Maximum grosszuegig auf **2x Screen** (`QSize(screen.width() * 2, screen.height() * 2)`, `QSize`-Import ergaenzt). Der Maximize-Button bleibt damit IMMER aktiv (`max > size`). Das exakt-fit-Reflow klemmt weiterhin die DEFAULT-Groesse auf den Screen; der Anwender kann danach frei maximieren bzw. das Fenster groesser ziehen (Inhalt scrollt in der ContentScrollArea).
+* **Fix 3 (`../../persistent_win.py`, `_fix_window_flags`):** Sichert zusaetzlich explizit `Qt.WindowMaximizeButtonHint | Qt.WindowMinimizeButtonHint` (Flags werden nur bei Bedarf neu gesetzt - `if wanted != flags:`) - fehlt der Maximize-Hint (z. B. durch QUiLoader/setWindowFlags-Fallstricke), ist der Maximize-Button ausgegraut.
+
+### Verifikation (headless, keine UI-Tests)
+
+* `../../test/check_ui3_bugfix.py` (aktualisiert): **31/31 PASS** - B4: Log 6 Zeilen (`* 6 + 12` max/min, kein `* 4 + 12`); B6: `apply_screen_cap`-Override vorhanden, Maximum `screen.width() * 2`/`screen.height() * 2`, kein exakt-fit-`setMaximumSize(screen.size())`-Code, `Qt.WindowMaximizeButtonHint`/`Qt.WindowMinimizeButtonHint` in `../../persistent_win.py`, Guard `if wanted != flags:`.
+* `../../test/check_r17b_construct.py` (neu, offscreen): **11/11 PASS** - echtes `ServiceWindow()` konstruiert: `maximumSize()` == 2x Screen, Maximize-/Minimize-Hint + `Qt.Window` gesetzt, Log min/max == `lineSpacing()*6+12`.
+* `py_compile` der geaenderten Dateien (EXIT=0).
+* **Offen (manuell):** App-Test - Maximize-Button klickbar, Log-Fenster 6 Zeilen hoch.
+
+---
+
+## 13. Implementierungs-Log - Bugfix Runde 17c: Maximize aktiv, Inhalt folgt Fenster, Param-Box waechst mit (11.08.2026)
+
+**Problem (User-Meldungen 3/4/5, 11.08.2026):**
+3. Der **Maximize-Button im service_win ist immer noch ausgegraut**.
+4. Manuelles Grossziehen (Rahmen/Ecke) ohne Inhalt-Anpassung.
+5. Die Parameter-Box soll sich der Fenstergroesse anpassen (ggf. auch die Hoehe des MasterTrees).
+
+**Root Cause 3+4 (offscreen verifiziert, Commit `8e2841b`):** `_fix_window_flags()` rief `setWindowFlags()` DEFERRED NACH `win.show()` auf. `setWindowFlags()` auf einem SICHTBAREN Fenster bricht die Layout-Geometrie-Verwaltung des QMainWindow-Layouts - die ContentScrollArea 'friert' auf der alten Groesse ein und folgt dem manuellen Resize/Maximize nicht mehr (Ursache Meldung 4). Zusaetzlich war `self.ui` ein eingebettetes QMainWindow (Qt verlangt QMainWindow nur als Top-Level) - es wuchs ebenfalls nicht mit.
+
+### Loesung (Fixes 1-4)
+
+* **Fix 1 (`../../persistent_win.py`):** `_fix_window_flags()` wird jetzt im KONSTRUKTOR gerufen (Fenster unsichtbar -> `setWindowFlags` sicher); `restore_state` ruft es nur noch, wenn das Fenster unsichtbar ist. `MSWindowsFixedSizeDialogHint` wird explizit entfernt (deaktiviert den Maximize-Button). Nachtrag (Commit `289b634`): auch die Basis-`restore_state` setzt Flags nur noch bei unsichtbarem Fenster (Schutz fuer AnalyticsWindow/StatisticWindow).
+* **Fix 2 (`../../ui/service_win.ui`):** Root von QMainWindow auf QWidget umgestellt (hatte nur ein centralwidget, keine menubar/statusbar) - Layout direkt im Root.
+* **Fix 3 (`../../serviceui/service_win.py`):** `content_widget = self.ui` (kein `centralWidget()` mehr), `install_content_scroll` setzt die ScrollArea DIREKT als CentralWidget von `self`. `_exact_fit_to_content=False` (Inhalt folgt Fenster, nur wachsen). `content_scroll` + `param_scroll` auf `widgetResizable=True` (Inhalt waechst mit dem Fenster). Kein 1000x1240-Cap der Param-Box mehr. `restore_state` wendet die gespeicherte Fenster-Groesse an. `resize_to_clamped_content()`-Override resizet das Inhalt-Widget nicht mehr manuell (wuerde `widgetResizable` brechen) sondern fuehrt nur die Fenster-Groesse nach.
+* **Fix 4 (`../../serviceui/param_columns.py`):** `box.resize` nur noch bei `widgetResizable=False` (ScrollArea uebernimmt die Streckung).
+
+### Verifikation (headless, keine UI-Tests)
+
+* `../../test/check_r17c_resize.py`: **19/19 PASS** (R1/D1-D4: widgetResizable True, kein 1000/1240-Cap, MSFixedSizeHint weg, MaxHint gesetzt, Inhalt waechst mit, Reflow schrumpft nicht).
+* `../../test/check_ui3_bugfix.py`: **32/32 PASS**; `../../test/check_r17b_construct.py`: **11/11 PASS**; `py_compile` OK.
+* **Offen (manuell):** App-Test Maximize-Button + Grossziehen.
+
+---
+
+## 14. Implementierungs-Log - Bugfix Runde 17d: ServiceWindow waechst mit dem Fenster, Maximize-Button sicher (11.08.2026)
+
+**Problem (Fortsetzung nach Pause, User-Meldungen 3/4/5, 11.08.2026):** Der Maximize-Button blieb ausgegraut; das manuelle Grossziehen zeigte weiterhin keine Inhalt-Anpassung.
+
+**Root Cause 4+5 (dynamisch verifiziert, Commit `4414fc5`):** `self.central_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)` in `service_win.py` HIELT die QBoxLayout-Verteilung an: Der QSplitter (MasterTree | Parameter-Box) blieb auf seiner Mindest-Hoehe stehen, obwohl das Fenster groesser gezogen/maximiert wurde (Extra-Raum blieb als Leerflaeche unter dem Splitter). Die Breite wuchs nur die Param-Box; in der Hoehe gar nichts.
+
+### Loesung (Fixes 1-2)
+
+* **Fix 1 (`../../serviceui/service_win.py`):** `setAlignment(AlignTop | AlignLeft)` auf dem `central_layout` ENTFERNT. Mit `widgetResizable=True` + `_exact_fit_to_content=False` folgt der Inhalt dem Fenster: Splitter, MasterTree (Hoehe!) und Param-Box (Breite + Hoehe) wachsen beim Grossziehen/Maximieren mit.
+* **Fix 2 (`../../persistent_win.py`):** `_fix_window_flags()` auf int-basierte Flag-Arithmetik umgestellt (PySide6-Flag-Operatoren droppen Bits ausserhalb des Enum-Domains, z. B. `0x08000000` bei `& ~WindowType_Mask`). Typ wird explizit auf `Qt.Window` gesetzt (Dialog/Tool-Typen haben unter Windows keine Min/Max-Buttons) und der VOLLSTAENDIGE Standard-Button-Satz (Title, SystemMenu, Minimize, Maximize, Close) sichergestellt.
+
+### Verifikation (headless, keine UI-Tests)
+
+* `../../test/check_r17d_resize.py` (neu): **18/18 PASS** - ECHTE Widget-Baum-Proben: Tree-Hoehe 634->1048, Param-Box 520x736->814x1150 bei +600x400, Maximize-Bleibt-Maximiert (Reflow wirft nicht aus dem Maximize-Zustand).
+* `../../test/check_r17c_resize.py` (R3-Check auf neue Flag-Arithmetik angepasst): **19/19 PASS**.
+* `../../test/check_r17b_construct.py` **11/11**, `../../test/check_ui3_bugfix.py` **31/31**, AnalyticsWindow/StatisticWindow mit vollem Button-Satz `0x800f001` konstruierbar, `py_compile` OK.
+* **Offen (manuell):** App-Test Grossziehen/Maximieren des service_win.
+
+---
+
+## 15. Implementierungs-Log - Bugfix Runde 17d2: Maximize-Button deaktiviert - setMaximumSize entfernt (11.08.2026)
+
+**Problem (User-Meldung 1, 11.08.2026):** Der Maximize-Button im service_win ist IMMER NOCH ausgegraut und nicht bedienbar - auch nach Runden 17b/c/d.
+
+**Root Cause (Qt-Quelle `qwindowswindow.cpp`, `shouldShowMaximizeButton()`, Commit `77be253`):**
+
+```cpp
+return (flags & Qt::CustomizeWindowHint) || w->maximumSize() == QSize(QWINDOWSIZE_MAX, QWINDOWSIZE_MAX);
 ```
 
----
+Windows zeigt/aktiviert den Maximize-Button NUR wenn `maximumSize() == QWINDOWSIZE_MAX` (**16777215**) ist (oder `Qt::CustomizeWindowHint` gesetzt ist). Das bisherige `setMaximumSize(screen.size())` (17b) bzw. `setMaximumSize(screen.size()*2)` (17c) war NIE gleich 16777215 -> Windows graute den Button weiterhin aus. Die '2x Screen'-Annahme von Runde 17b war falsch.
 
-## 4. Profil-Payload Schema v2.1 (Sektion `filters`)
+### Loesung (Fix 1)
 
-```json
-{
-  "schema_version": "2.1.0",
-  "filters": {
-    "logic": "AND",
-    "rules": [
-      { "field": "visit_pct", "op": ">=", "val": 0.05 },
-      { "field": "is_hit", "op": "==", "val": true },
-      { "field": "feature_id", "op": "IN", "val": ["srv_grid_lines", "srv_proximity"] }
-    ],
-    "sort": [
-      { "field": "bar_time", "order": "DESC" },
-      { "field": "visit_pct", "order": "ASC" }
-    ]
-  }
-}
+* **Fix 1 (`../../serviceui/service_win.py`, `apply_screen_cap()`-Override):** `setMaximumSize` ENTFERNT. Das Fenster behaelt die Qt-Defaults (`max = 16777215 = QWINDOWSIZE_MAX`) -> Maximize-Button wieder aktiv. Die Screen-Klemme der DEFAULT-Groesse uebernimmt weiterhin `resize_to_clamped_content` (auf `availableGeometry`); ein OS-seitiges Maximum ist bei `widgetResizable=True` + `_exact_fit_to_content=False` nicht noetig.
 
-```
+### Verifikation (headless, keine UI-Tests)
+
+* `../../test/check_r17b_construct.py`: **11/11 PASS** (D1 prueft jetzt `max == 16777215`).
+* `../../test/check_r17c_resize.py`: **19/19 PASS** (D3 prueft `max == 16777215`).
+* `../../test/check_ui3_bugfix.py`: **32/32 PASS** (B6 prueft: KEIN `setMaximumSize`).
+* `../../test/check_r17d_resize.py`: **19/19 PASS** (A4 prueft `max == 16777215`); `py_compile` OK.
+* **Offen (manuell):** App-Test - Maximize-Button klickbar.
 
 ---
 
-## 5. Verification Checklist (`test/test.py`)
+## 16. Implementierungs-Log - Bugfix Runde 17e: AnalyticsWindow-Historie intakt (11.08.2026)
 
-* [ ] Safe SQL-Builder: Sichere Generierung von `WHERE`-Clauses aus Filter-Regeln (SQL-Injection-Schutz).
-* [ ] Multi-View Cross-Check: Filterergebnis ist identisch über Table, Heatmap und Scatter.
-* [ ] Empty-Rule Fallback: Leere Filter-Regeln liefern vollständigen Datensatz.
-* [ ] Profil v2.1: Speicherung & Wiederherstellung der `filters`-Sektion im Payload.
+**Problem (User-Meldung 2, 11.08.2026):** 'Fenster-Historie nicht mehr intakt - Analytics geschlossen, Anwendung geschlossen, bei Neustart ist Analytics wieder da.'
 
+**Root Cause (Commit `d0eaa16`):** `AnalyticsWindow` hatte seit Phase 20.01 (E1) `_keep_history_on_close = True`. Der Fenster-Historie-Eintrag wurde beim MANUELLEN Schliessen (X) nicht geloescht -> `restore_all_windows` stellte das Fenster beim naechsten App-Start wieder her, obwohl der User es bewusst geschlossen hatte.
+
+### Loesung (Fixes 1-5, `../../analytics/ui/analytics_win.py`)
+
+* **Fix 1:** `_keep_history_on_close = False` - MANUELL geschlossenes Fenster wird aus der Historie entfernt (`delete_instance`) und beim Neustart NICHT wiederhergestellt (konsistent mit ServiceWindow).
+* **Fix 2:** `DIALOG_GEOMETRY_KEY = "win_analytics"` + `save_state()`-Override: Position/Groesse zusaetzlich in `global_settings` (`save_dialog_geometry`) - ueberlebt das manuelle Schliessen (Muster ServiceWindow).
+* **Fix 3:** `restore_state()`-Override: Fallback auf `get_dialog_geometry`, wenn kein `window_instances`-Eintrag mehr existiert (manuelles Wiederoeffnen).
+* **Fix 4:** `_save_workspace()`: zusaetzliches Workspace-Backup in `global_settings` (`"analytics_workspace"`) - ueberlebt `delete_instance`.
+* **Fix 5:** `_restore_workspace()`: Fallback auf das `global_settings`-Backup.
+
+**Resultierendes Verhalten:** Offen beim App-Ende -> beim Start wiederhergestellt (auto_restore). Manuell geschlossen -> NICHT beim Start; Position + Workspace werden beim naechsten manuellen Oeffnen (Button) wiederhergestellt.
+
+### Verifikation (headless, keine UI-Tests)
+
+* `../../test/check_r17e_history.py` (neu, Temp-DB in `../../test`): **15/15 PASS** - D2: kein Eintrag nach manuellem Schliessen; D5: Geometrie-Fallback ueberlebt; D6/D7: Workspace-Backup + Restore-Fallback; D8: offen beim App-Ende -> Eintrag bleibt.
+* `../../test/test.py`-Assertions H3/H4/H5/H8 + Teil 36 W8 an die neue Semantik angepasst (Runde 17/17e: `_keep_history_on_close=False`).
+* `py_compile` OK; `check_r17d_resize.py` 19/19; `check_r17b_construct.py` 11/11.
+* **Offen (manuell):** App-Test - Analytics schliessen -> App beenden -> Neustart: Analytics darf NICHT erscheinen; Position + Workspace beim manuellen Oeffnen wiederhergestellt.
 
 ---
 
-# 20.07 Multi-DB Architecture & Data Management
-## Strategy: Domain-Driven Split via DuckDB
-Split storage into 4 isolated `.db` files to prevent file-locking, maximize IOPS, and isolate test data. Native cross-DB joins via `ATTACH DATABASE`.
-## DB Schema Split
-1. `master_config.db` (Lightweight): Mastertree hierarchy, service configs, parameter presets, instance hashes, archive text logs.
-2. `market_data.db` (Static Read-Only): Raw OHLCV (M1-Daily), tick histories, L2 DOM snapshots.
-3. `analytics_runs.db` (High-Volume Dynamic): Generated signals, sweep results, metrics, heatmap densities. Targeted by "Delete Data Only".
-4. `ml_feature_store.db` (ML Optimized): Fractional diffs, Z-scores, Garman-Klass vols, trained probability matrices.
-## Text Architecture: 20.05
-                   [PyTrader Core / Execution Engine]
-                                   │
-      ┌────────────────┬───────────┴───────────┬────────────────┐
-      ▼                ▼                       ▼                ▼
-┌──────────────┐┌──────────────┐       ┌──────────────┐ ┌──────────────┐
-│ market_data  ││master_config │       │analytics_runs│ │ml_feature_st │
-│     .db      ││     .db      │       │     .db      │ │     .db      │
-└──────────────┘└──────────────┘       └──────────────┘ └──────────────┘
- (OHLCV/Ticks)  (Tree/Configs/          (Signals/Sweeps/ (ML Features/
-                 Archive Logs)           Data Clear)      Prob-Matrices)
+## 17. Abschluss Phase 20: Analytics-Finalisierung (11.08.2026)
+
+Mit den Bugfix-Runden 16, 16c, 17, 17b, 17c, 17d, 17d2 und 17e ist die **Phase 20 (Analytics-Finalisierung) abgeschlossen**. Alle offenen User-Meldungen der Runden 16-17e sind umgesetzt, committet und headless verifiziert:
+
+1. **ServiceWindow-Bedienung (Runden 17-17d2):** Slider-Spielraum (Splitter-Minima + `_min_window_width=1100`), Log-Hoehe 6 Zeilen, Maximize-Button aktiv (`max == QWINDOWSIZE_MAX`, kein `setMaximumSize`), Inhalt folgt der Fenstergroesse (widgetResizable + kein AlignTop-AlignLeft) - MasterTree-Hoehe und Param-Box wachsen beim Grossziehen/Maximieren mit.
+2. **Fenster-Historie (Runde 17e):** AnalyticsWindow wird beim MANUELLEN Schliessen aus der Historie entfernt und beim Neustart NICHT wiederhergestellt; Position + Workspace ueberleben via `global_settings`-Backup und werden beim manuellen Oeffnen wiederhergestellt.
+3. **20.05-Architektur:** Alle vier Praemissen der Ultra-Low-Latency-Pipeline bleiben erfuellt (kein synchroner DB-Zugriff im UI-Hauptthread, lueckenlose Persistenz, isolierte Grafik-Welt, asynchrone Daten-Nachfuehrung).
+
+**Abschliessender Stand (Commits `cb0412b`..`d0eaa16`):**
+* `../../persistent_win.py` - Flags im Konstruktor, int-basierte Flag-Arithmetik, volle Button-Hints
+* `../../scrollable_content.py` - Maximize-Schutz im Reflow, Inhalt folgt Fensterbreite
+* `../../serviceui/service_win.py` - Slider-Spielraum, Log 6 Zeilen, `_exact_fit_to_content=False`, widgetResizable, kein AlignTop-AlignLeft, `apply_screen_cap` ohne `setMaximumSize`
+* `../../serviceui/param_columns.py` - box.resize nur bei widgetResizable=False
+* `../../ui/service_win.ui` - Root QWidget statt QMainWindow
+* `../../analytics/ui/analytics_win.py` - `_keep_history_on_close=False`, Geometrie-/Workspace-Fallback, DIALOG_GEOMETRY_KEY
+
+**Verbleibend (manuell durch den Anwender):** Funktionstest der UI (ServiceWindow Maximize/Grossziehen, AnalyticsWindow-Historie, Dropdown-/NoData-Anzeige). Offene Kapitel werden manuell in die naechste Phase uebernommen.
+
 

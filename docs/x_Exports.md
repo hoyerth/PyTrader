@@ -132,6 +132,8 @@ PyTrader/
         _apply_r13b_dialog.py
         _check_r13b_state.py
         _fix_ws1.py
+        _migrate_feature_data.py
+        _patch_ui3.py
         _tmp_find_src.py
         _verify_mastertree.py
         check_2004_bugfix3.py
@@ -161,6 +163,10 @@ PyTrader/
         check_heatmap_bugfix.py
         check_output_schema.py
         check_page_nav.py
+        check_r17b_construct.py
+        check_r17c_resize.py
+        check_r17d_resize.py
+        check_r17e_history.py
         check_restore_pipeline_bugfix.py
         check_restore_pipeline_round2.py
         check_restore_pipeline_round3.py
@@ -168,6 +174,11 @@ PyTrader/
         check_round11.py
         check_round12.py
         check_round13b.py
+        check_round13c.py
+        check_round14.py
+        check_round15_perf.py
+        check_round15b.py
+        check_round15c.py
         check_round7_fixes.py
         check_round7_picker_runtime.py
         check_round8_bug345.py
@@ -212,6 +223,9 @@ PyTrader/
         dbg_xwu8rdux/
         p20_07_picker_lpyvmzub/
         p20_07_picker_xqxueh9l/
+        pytrader_round15b_s94b6f12/
+        pytrader_round15c_b2_y2_u2/
+        pytrader_round15_2oaibavr/
         pytrader_var_an6q2o2g/
         pytrader_var_bmy8a4m6/
         pytrader_var_fji0r6sx/
@@ -1506,6 +1520,14 @@ class PersistentWindow(QMainWindow):
 
         # In Registry eintragen
         _open_windows.add(self)
+        # 11.08.2026 (Bugfix Runde 17c, User-Meldungen 3+4): Window-Flags
+        # HIER setzen - das Fenster ist zu diesem Zeitpunkt noch NICHT
+        # sichtbar. setWindowFlags() auf einem SICHTBAREN Fenster bricht die
+        # Layout-Geometrie-Verwaltung des QMainWindow-Layouts: Die
+        # ContentScrollArea 'friert' auf der alten Groesse ein und folgt dem
+        # manuellen Grossziehen/Maximieren nicht mehr. Der deferred Aufruf in
+        # restore_state() ist damit nur noch eine defensive Wiederholung.
+        self._fix_window_flags()
 
     @classmethod
     def get_registered_class(cls, instance_id: str) -> Optional[Type['PersistentWindow']]:
@@ -1539,14 +1561,33 @@ class PersistentWindow(QMainWindow):
     def _fix_window_flags(self) -> None:
         """Stellt sicher, dass das Fenster als normales Top-Level-Fenster
         (Qt.Window) konfiguriert ist und nicht als Tool/Dialog.
-        
+
         Wichtig: Qt.Dialog | Qt.Tool sind bei QMainWindow immer gesetzt
         und können nicht entfernt werden. Das ist normales Qt-Verhalten.
         Ein Fenster ohne Parent hat automatisch einen Taskleisten-Eintrag.
         """
-        # Nur prüfen, ob Qt.Window gesetzt ist (sollte immer der Fall sein)
-        if not (self.windowFlags() & Qt.Window):
-            self.setWindowFlags(self.windowFlags() | Qt.Window)
+        # 11.08.2026 (Bugfix Runde 17d, User-Meldung 3): Int-basierte
+        # Flag-Arithmetik (PySide6-Flag-Operatoren droppen Bits ausserhalb
+        # des Enum-Domains, z. B. 0x08000000 bei '& ~WindowType_Mask').
+        # 1) Typ explizit auf Qt.Window setzen: Qt.Dialog-/Qt.Tool-Fenster
+        #    haben unter Windows KEINE Minimize/Maximize-Buttons.
+        # 2) VOLLSTAENDIGEN Standard-Button-Satz setzen (Title, SystemMenu,
+        #    Minimize, Maximize, Close) - fehlt ein Hint, graut Windows den
+        #    Maximize-Button aus bzw. zeigt ihn gar nicht.
+        # 3) MSWindowsFixedSizeDialogHint entfernen - dieses Flag deaktiviert
+        #    den Maximize-Button auf Windows (Fenster gilt als fest gross).
+        #    Qt setzt es ggf. automatisch, wenn das Fenster zeitweise als
+        #    fixed erkannt wurde.
+        flags = int(self.windowFlags())
+        type_mask = 0xFF
+        wanted = (flags & ~type_mask) | int(Qt.Window)
+        wanted |= (int(Qt.WindowTitleHint) | int(Qt.WindowSystemMenuHint)
+                   | int(Qt.WindowMinimizeButtonHint)
+                   | int(Qt.WindowMaximizeButtonHint)
+                   | int(Qt.WindowCloseButtonHint))
+        wanted &= ~int(Qt.MSWindowsFixedSizeDialogHint)
+        if wanted != flags:
+            self.setWindowFlags(Qt.WindowFlags(int(wanted)))
 
     @property
     def state_manager(self) -> StateManager:
@@ -1575,8 +1616,15 @@ class PersistentWindow(QMainWindow):
             return
 
         # Window-Flags korrigieren (QUiLoader setzt oft Qt.Tool | Qt.Dialog,
-        # was Taskleisten-Eintrag unterdrückt und Fenster über Parent hält)
-        self._fix_window_flags()
+        # was Taskleisten-Eintrag unterdrückt und Fenster über Parent hält).
+        # 11.08.2026 (Bugfix Runde 17c): NUR wenn das Fenster noch NICHT
+        # sichtbar ist – setWindowFlags() auf einem sichtbaren Fenster bricht
+        # die Layout-Geometrie-Verwaltung (Inhalt folgt dem Resize nicht
+        # mehr). Die Flags werden seit Runde 17c bereits im Konstruktor
+        # (PersistentWindow.__init__, Fenster unsichtbar) gesetzt; dieser
+        # Aufruf ist nur noch eine defensive Wiederholung.
+        if not self.isVisible():
+            self._fix_window_flags()
 
         # Geometrie
         geom = self._state_manager.get_window_geometry(inst_id)
@@ -2004,12 +2052,38 @@ class ContentScrollMixin:
             # schrumpfen, wenn der Inhalt kleiner wird (Punkte 3+4).
             new_w = min(desired.width(), screen.width())
             new_h = min(desired.height(), screen.height())
+            # 11.08.2026 (Bugfix, Slider-Spielraum): Optionales
+            # `_min_window_width` (z. B. ServiceWindow=1100) garantiert dem
+            # QSplitter eine Mindest-Breite ueber der Minima-Summe
+            # (Tree 400 + Panel 520 = 920) – der Slider bleibt damit IMMER
+            # beweglich, auch wenn der Inhalt schmal ist. Screen-Klemme.
+            min_w = getattr(self, '_min_window_width', 0) or 0
+            if min_w:
+                new_w = max(new_w, min(min_w, screen.width()))
         else:
             # Nur wachsen, nie schrumpfen (unter aktuelle Größe) + Screen-Klemme.
             current = self.size()
             new_w = min(max(desired.width(), current.width()), screen.width())
             new_h = min(max(desired.height(), current.height()), screen.height())
-        self.resize(new_w, new_h)
+        # 11.08.2026 (Bugfix, Maximize): Ein MAXIMIERTES Fenster darf durch
+        # den Reflow nicht auf die Inhaltsgroesse zurueckgesetzt werden
+        # (der Maximize-Button wuerde sonst wirkungslos – das Fenster
+        # springt nach jedem Reflow aus dem Maximize-Zustand zurueck).
+        # Der Inhalt wird trotzdem angepasst (siehe unten).
+        if not self.isMaximized():
+            self.resize(new_w, new_h)
+        # 11.08.2026 (Bugfix, Slider-Spielraum): Das Inhalt-Widget an die
+        # aktuelle Fenstergroesse anpassen, damit ein QSplitter darin die
+        # volle verfuegbare Breite nutzt (sonst klebt er an den SizeHints
+        # und der Slider bleibt bei schmalem Inhalt fixiert). Nur aktiv,
+        # wenn `_min_window_width` gesetzt ist (ServiceWindow) – alle
+        # anderen Mixin-Nutzer behalten ihr bisheriges Verhalten.
+        if getattr(self, '_min_window_width', 0) and self._content_widget is not None:
+            f = self.frameGeometry().size() - self.size()
+            w = max(self.width() - f.width(), 0)
+            h = max(self.height() - f.height(), 0)
+            if w and h:
+                self._content_widget.resize(w, h)
 
     def _invalidate_content_caches(self) -> None:
         """Invalidiert QWidgetItemV2- und Layout-Caches entlang der Hierarchie.
@@ -4411,6 +4485,81 @@ class AnalyticsRepository:
         return result
 
     # ------------------------------------------------------------------
+    # Feld-Metadaten (Runde 15, Fix 1/3): metrics + field_sources fuer das
+    # 'Feld'-Dropdown – gemeinsamer Pfad fuer QUERY_HEATMAP_GENERIC und den
+    # leichten QUERY_FEATURES-Payload. `feature_keys_by_service` wird im
+    # Reader gecacht (EIN DB-Scan, Invalidation via Invariante 13), damit
+    # beide Aufrufer identische Metadaten OHNE Doppel-Abfrage erhalten.
+    # ------------------------------------------------------------------
+    def _field_metadata(
+        self,
+        symbol: str,
+        timeframe: str,
+        feature_id: Optional[str] = None,
+        feature_ids: Optional[List[str]] = None,
+        instance_hashes: Optional[List[str]] = None,
+    ) -> tuple:
+        """Verfuegbare Feld-Metriken + Quellen-Zuordnung (Feld-Dropdown).
+
+        09.08.2026 (User-Meldung Feld-Dropdown, Root Cause 2): Die
+        Feldquellen werden STRENG ueber den feature_ids-Filter bestimmt –
+        abgewaehlte Services (z. B. Grid-Lines) duerfen ihre Keys nicht
+        mehr ins 'Feld'-Dropdown liefern.
+
+        Runde 15b (Bugfix Dropdown, User-Meldung 10.08.2026): Die
+        Feld-Struktur gehoert zu den SERVICES (feature_ids), NICHT zu den
+        Varianten (instance_hashes) – eine gecheckte NoData-Variante
+        (Hash ohne DB-Rows) darf den aktiven Service NICHT aus der
+        Feld-Metadaten ausblenden (sonst greift der ungefilterte Fallback
+        und das Dropdown zeigt alle Keys aller Services ohne Prefix).
+        `instance_hashes` bleibt fuer die DATEN-Queries (Table/Heatmap)
+        bestehen; die NoData-Variante wird separat im Payload markiert.
+        Zusaetzlich greift der defensive Fallback `avail` (alle Keys)
+        NUR ohne aktiven feature_ids/feature_id-Filter – bei aktivem
+        Filter ist eine leere by_service-Menge ein LEGITIMES Ergebnis
+        (z. B. nur String-Services selektiert) und darf nicht zu einem
+        ungefilterten Dropdown fuehren.
+
+        Returns:
+            (metrics, field_sources)
+              metrics:      ["count", "confluence_count"] + numerische Keys
+                            der SELEKTIERTEN Services
+              field_sources:{Key: [service_id...]} (nur selektierte Services)
+        """
+        try:
+            avail = self.reader.available_feature_keys(
+                symbol, timeframe, numeric_only=True)
+        except Exception:
+            avail = []
+        try:
+            # Runde 15b: KEIN instance_hashes-Filter hier (siehe oben) –
+            # die Feld-Struktur folgt den aktiven Services, nicht den
+            # Varianten-Hashes.
+            by_service = self.reader.feature_keys_by_service(
+                symbol, timeframe, numeric_only=True,
+                feature_id=feature_id, feature_ids=feature_ids)
+        except Exception:
+            by_service = {}
+        field_sources: Dict[str, List[str]] = {}
+        for fid, keys in by_service.items():
+            if not fid:
+                continue  # Legacy-Rows ohne feature_id -> kein Service-Prefix
+            for k in keys:
+                field_sources.setdefault(k, []).append(fid)
+        # Nur die Keys der SELEKTIERTEN Services in der Metrik-/Feldliste –
+        # das HeatmapWidget baut das 'Feld'-Dropdown aus `metrics` auf
+        # (_sync_combos_from_payload); ohne diese Begrenzung erschienen
+        # abgewaehlte Keys weiterhin (nur ohne Service-Prefix).
+        avail_filtered = sorted({k for keys in by_service.values()
+                                 for k in keys})
+        # Runde 15b: Fallback nur ohne aktiven Filter (echte Leer-Datenlage
+        # bei 'alle Features'). Bei aktivem Filter gilt: kein Service matcht
+        # -> konsistent leere Feld-Liste (kein ungefiltertes Dropdown).
+        if not avail_filtered and not feature_ids and not feature_id:
+            avail_filtered = avail  # defensiv: ohne Filter -> ungefiltert
+        return (["count", "confluence_count"] + avail_filtered, field_sources)
+
+    # ------------------------------------------------------------------
     # Generische 2D-Heatmap (20.02, additiv – Kapitel §2 / Review E1/E5/E6)
     # ------------------------------------------------------------------
     def get_generic_heatmap(
@@ -4446,32 +4595,18 @@ class AnalyticsRepository:
               "symbol", "timeframe",
             }
         """
-        avail = self.reader.available_feature_keys(
-            symbol, timeframe, numeric_only=True)
-        # 09.08.2026 (User-Meldung Feld-Dropdown, Root Cause 2): Die
-        # Feldquellen werden STRENG ueber den feature_ids-Filter bestimmt –
-        # abgewaehlte Services (z. B. Grid-Lines) duerfen ihre Keys nicht
-        # mehr ins 'Feld'-Dropdown liefern (vorher ungefiltert ueber ALLE
-        # Rows des Symbol/Timeframe).
-        by_service = self.reader.feature_keys_by_service(
-            symbol, timeframe, numeric_only=True,
-            feature_id=feature_id, feature_ids=feature_ids,
+        # Runde 15 (Fix 1/3): Gemeinsamer Feld-Metadaten-Pfad
+        # (_field_metadata) – metrics + field_sources kommen aus dem
+        # gecachten Reader-Basis-Scan (EIN DB-Scan; der QUERY_FEATURES-
+        # Leichtpfad liefert identische Metadaten OHNE die teure
+        # Heatmap-Pivot-Aggregation).
+        metrics, field_sources = self._field_metadata(
+            symbol, timeframe, feature_id=feature_id, feature_ids=feature_ids,
             instance_hashes=instance_hashes)
-        field_sources: Dict[str, List[str]] = {}
-        for fid, keys in by_service.items():
-            if not fid:
-                continue  # Legacy-Rows ohne feature_id -> kein Service-Prefix
-            for k in keys:
-                field_sources.setdefault(k, []).append(fid)
-        # Nur die Keys der SELEKTIERTEN Services in der Metrik-/Feldliste –
-        # das HeatmapWidget baut das 'Feld'-Dropdown aus `metrics` auf
-        # (_sync_combos_from_payload); ohne diese Begrenzung erschienen
-        # abgewaehlte Keys weiterhin (nur ohne Service-Prefix).
-        avail_filtered = sorted({k for keys in by_service.values()
-                                 for k in keys})
-        if not avail_filtered:
-            avail_filtered = avail  # defensiv: ohne Quellen -> ungefiltert
-        metrics = ["count", "confluence_count"] + avail_filtered
+        # Numerische Keys aus den Metadaten (ohne count/confluence_count) –
+        # Grundlage des E6-Fallbacks fuer Wert-Aggregationen.
+        avail_filtered = [m for m in metrics
+                          if m not in ("count", "confluence_count")]
         use_agg = str(agg or "count").lower()
         use_field = str(field or "")
         # E6: Bei Wert-Aggregationen (AVG/SUM/MIN/MAX) ist `field` ein
@@ -4742,6 +4877,10 @@ class AnalyticsRepository:
         symbol: str,
         timeframe: str,
         presets_data: Optional[Dict[str, Any]] = None,
+        # Runde 15 (Fix 1): feature_ids/instance_hashes fuer die Feld-
+        # Metadaten (metrics/field_sources) im QUERY_FEATURES-Leichtpfad.
+        feature_ids: Optional[List[str]] = None,
+        instance_hashes: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Verfuegbare Plugin-IDs, JSON-Keys, Zeilenzahl + No-Data-Varianten.
 
@@ -4750,10 +4889,23 @@ class AnalyticsRepository:
         existieren oder die Auswertung fehlschlaegt; `no_data_variants_error`
         markiert einen Fehlschlag). Die Auswertung laeuft hier (Worker-
         Thread), nicht im UI-Hauptthread.
+
+        Runde 15 (Fix 1, Ultra-Low-Latency): Zusaetzlich traegt der Payload
+        `metrics` + `field_sources` (Feld-Metadaten, identisch zu
+        get_generic_heatmap) – das 'Feld'-Dropdown + die '(No Data)'-Hinweise
+        kommen damit ueber den LEICHTEN Metadaten-Query (Reader-Cache, kein
+        Heatmap-Pivot), getrennt von der Grafik.
         """
         result = self.reader.get_available_features(symbol, timeframe)
         if not isinstance(result, dict):
             result = {}
+        # Runde 15 (Fix 1): Feld-Metadaten (metrics/field_sources) ueber
+        # denselben Reader-Basis-Scan wie die Heatmap (cache-served).
+        metrics, field_sources = self._field_metadata(
+            symbol, timeframe, feature_ids=feature_ids,
+            instance_hashes=instance_hashes)
+        result["metrics"] = metrics
+        result["field_sources"] = field_sources
         no_data_error = False
         try:
             variants = self.reader.resolve_no_data_variants(
@@ -5112,8 +5264,18 @@ class AnalyticsViewModel(QObject):
             # Aenderung; reine Hash-Aenderung laesst das Feld-Dropdown
             # unveraendert.)
             self.feature_ids_changed.emit()
-        self._refresh((QUERY_TABLE, QUERY_HEATMAP, QUERY_HEATMAP_GENERIC,
-                       QUERY_SCATTER, QUERY_DISTRIBUTION))
+        # Runde 15b (Bugfix Dropdown, User-Meldung 10.08.2026): QUERY_FEATURES
+        # gehoert in den Refresh - der leichte Metadaten-Pfad liefert die
+        # field_sources/no_data_variants fuer die AKTUELLEN feature_ids +
+        # instance_hashes (Feld-Dropdown + NoData-Hinweise). Ohne den
+        # Refresh bliebe das Dropdown auf dem Cache-Stand des letzten
+        # Payloads (z. B. ein zuvor gefilterter Satz ohne die neu gecheckten
+        # Services) - Check/Uncheck waere erst nach einem Seitenwechsel
+        # sichtbar. Die Queue-Reihenfolge (QUERY_FEATURES zuerst) spiegelt
+        # die Runde-15-Prioritaet: leichtes Dropdown-Update VOR der Grafik.
+        self._refresh((QUERY_FEATURES, QUERY_TABLE, QUERY_HEATMAP,
+                       QUERY_HEATMAP_GENERIC, QUERY_SCATTER,
+                       QUERY_DISTRIBUTION))
 
     @staticmethod
     def _normalize_feature_ids(value) -> List[str]:
@@ -6010,7 +6172,8 @@ class AnalyticsViewModel(QObject):
             return key
 
     def resolve_service_display_name(self, plugin_id: str,
-                                     preset_name: Optional[str] = None) -> str:
+                                     preset_name: Optional[str] = None,
+                                     exec_date: Optional[str] = None) -> str:
         """Service-Name OHNE Kategorie-Pfad, direkt aus dem Service-Objekt.
 
         09.08.2026 (User-Meldung 'Feld'-Dropdown): Der Name wird DIREKT aus
@@ -6028,6 +6191,12 @@ class AnalyticsViewModel(QObject):
         ' ({Preset_Name})' – Anzeige-Format '{Service} ({Preset}) /
         {Parameter}' fuer Parameter-Varianten (Clones). Ohne preset_name
         bleibt das Label unveraendert (Zero-Regression).
+
+        Runde 16 (Bugfix 1, 11.08.2026): Format-Vereinheitlichung auf
+        '{Name} / {Preset} / {Datum}' (Schraegstrich statt Klammern;
+        'Default' als Platzhalter-Preset wird uebersprungen). Optionaler
+        `exec_date` haengt Datum+Uhrzeit der letzten Ausfuehrung an
+        ('DD.MM.JJ HH:MM') - Grundlage der Feld-Dropdown-Anzeige.
         """
         key = str(plugin_id or "").strip()
         if not key or key.lower() in ("none", "native") \
@@ -6049,25 +6218,124 @@ class AnalyticsViewModel(QObject):
                 # 09.08.2026 (Root Cause 3): Unbekannte/abgewaehlte Keys
                 # (z. B. Native-Rows) -> lesbarer Pretty-Fallback statt
                 # Rohwert/Leerstring ('native' -> 'Native').
-                pretty = (key.replace("srv_", "").replace("ind_", "")
-                          .replace("_", " ").title())
+                pretty = (key.replace("src_", "").replace("srv_", "")
+                          .replace("ind_", "").replace("_", " ").title())
                 return pretty or key
             pid = str(getattr(plugin, "plugin_id", None) or key)
             name = pid
-            for prefix in ("srv_", "ind_"):
+            for prefix in ("src_", "srv_", "ind_"):
                 if name.lower().startswith(prefix):
                     name = name[len(prefix):]
                     break
             pretty = name.replace("_", " ").title()
             if not pretty:
                 pretty = key
-            # 20.04 (Q2): Preset-Name (Variante) in Klammern ergaenzen.
+            # Runde 16 (Bugfix 1): Preset-Name + Ausfuehrungsdatum per
+            # Schraegstrich anhaengen ('{Name} / {Preset} / DD.MM.JJ HH:MM').
+            # 'Default' ist ein Platzhalter-Preset (Standalone-Services) und
+            # wird uebersprungen.
             preset = str(preset_name or "").strip()
-            if preset:
-                pretty = f"{pretty} ({preset})"
+            if preset and preset.lower() != "default":
+                pretty = f"{pretty} / {preset}"
+            exec_d = str(exec_date or "").strip()
+            if exec_d:
+                pretty = f"{pretty} / {exec_d}"
             return pretty
         except Exception:
             return key
+
+    def checked_variant(
+        self, plugin_id: str
+    ) -> Optional[Dict[str, str]]:
+        """Aktuell gecheckte Variante eines Services inkl. Ausfuehrungsdatum.
+
+        Runde 16 (Bugfix 1, 11.08.2026): Grundlage der Feld-Dropdown-
+        Anzeige '{Name} / {Preset} / DD.MM.JJ HH:MM' - das Dropdown haengt
+        an Feld-Eintraege die im ServicePicker gecheckte Variante (Preset)
+        und das Datum+Uhrzeit ihrer letzten Ausfuehrung an.
+
+        Auswahl-Semantik (identisch zum Reader/Snapshot):
+          * Ist `instance_hashes` aktiv (Varianten-Einschraenkung), gewinnt
+            die gecheckte Variante (exakter Hash-Match).
+          * Ohne Hash-Auswahl zaehlt die ERSTE aktive (nicht archivierte)
+            Variante des Services - ist der Service ein reiner Standalone
+            (keine Presets), bleibt das Ergebnis None (kein Preset-Anhang).
+          * Datum+Uhrzeit: Varianten mit Hash ueber
+            `last_execution_datetime_for_hash` ('DD.MM.JJ HH:MM'), hash-lose
+            Services ueber `last_execution_date` (nur Datum). Ohne Eintraege
+            liefern beide den '--...'-Fallback (die Anzeige laesst ihn aus).
+
+        Returns:
+            {"preset_name", "instance_hash", "exec_datetime"} oder None
+            (unbekannter Service / keine Presets / Fehler - defensiv).
+        """
+        key = str(plugin_id or "").strip()
+        if not key:
+            return None
+        model = self._selector_model
+        if model is None:
+            from analytics.engine.service_selector_model import ServiceSelectorModel
+            model = ServiceSelectorModel(parent=self)
+            self._selector_model = model
+        try:
+            active_hashes = {str(h).strip().lower()
+                             for h in (self._params.get("instance_hashes")
+                                       or [])}
+            clones = (model.plugin_presets() or {}).get(key.lower()) or []
+            chosen = None
+            if active_hashes:
+                for c in clones:
+                    if not isinstance(c, dict):
+                        continue
+                    h = str(c.get("instance_hash") or "").strip()
+                    if h and h.lower() in active_hashes:
+                        chosen = c
+                        break
+            else:
+                for c in clones:
+                    if isinstance(c, dict) and not c.get("is_archived"):
+                        chosen = c
+                        break
+                if chosen is None and clones:
+                    chosen = clones[0]
+            if chosen is None or not isinstance(chosen, dict):
+                return None
+            h = str(chosen.get("instance_hash") or "").strip()
+            if h:
+                exec_date = model.last_execution_datetime_for_hash(key, h)
+            else:
+                exec_date = model.last_execution_date(key)
+            return {
+                "preset_name": str(chosen.get("preset_name") or "Default"),
+                "instance_hash": h,
+                "exec_datetime": exec_date,
+            }
+        except Exception:
+            return None
+
+    def service_execution_datetime(self, plugin_id: str) -> str:
+        """Datum+Uhrzeit der letzten Ausfuehrung eines Services.
+
+        Runde 16c (Bugfix 1, 11.08.2026, User-Meldung): Das Feld-Dropdown
+        haengt an Services OHNE Varianten (Standalone, z. B.
+        srv_trend_breakout - kein Preset/keine Set-Instanz) das
+        Ausfuehrungsdatum an ('{Name} / {Key} / DD.MM.JJ HH:MM', z. B.
+        '23.04.26 22:14'). Rein lesend ueber das ServiceSelectorModel
+        (`last_execution_datetime`); Fallback '--.--.-- --:--' ohne
+        Eintraege oder bei Fehlern (defensiv).
+        """
+        key = str(plugin_id or "").strip()
+        if not key:
+            return "--.--.-- --:--"
+        model = self._selector_model
+        if model is None:
+            from analytics.engine.service_selector_model import ServiceSelectorModel
+            model = ServiceSelectorModel(parent=self)
+            self._selector_model = model
+        try:
+            return model.last_execution_datetime(key)
+        except Exception:
+            return "--.--.-- --:--"
 
     def resolve_instance_hashes(self,
                                 hashes: Iterable[str]) -> List[str]:
@@ -6126,6 +6394,9 @@ class AnalyticsViewModel(QObject):
                                 "is_archived"}]},
              "sets": [{"services": {instance_id: {"plugin_id", "params",
                                                    "is_archived"}}}],
+             "standalone": [plugin_id der registrierten Plugins ohne
+                            Presets und ohne Set-Instanz (hash-lose
+                            Variante, 15c)],
              "display_names": {"{pid}|{pname}": "Anzeigename"},
              "active_hashes": [instance_hash der im Picker gecheckten
                                Varianten (leer = keine Einschraenkung)]}
@@ -6138,6 +6409,15 @@ class AnalyticsViewModel(QObject):
         damit nur noch die im ServicePicker gecheckten Varianten als
         '(No Data)' (nicht-gecheckte Instanzen derselben plugin_id erscheinen
         nicht mehr; das Dropdown zeigt nicht mehr die erste Variante).
+
+        Runde 15c (Bugfix Standalone, User-Meldung 10.08.2026): Reine
+        Standalone-Services (registrierte Plugins OHNE Presets/Clones UND
+        OHNE Set-Instanz, z. B. srv_trend_breakout) wurden nie in den
+        Snapshot aufgenommen - der Reader konnte sie daher nie als
+        '(No Data)' markieren, obwohl der feature_store noch keine Rows
+        ihrer plugin_id besitzt. Die neue Snapshot-Sektion `standalone`
+        listet genau diese Plugins als hash-lose Variante (preset_name
+        'Default'); der Reader prueft sie gegen `pids_with_data`.
         """
         model = self._selector_model
         if model is None:
@@ -6147,11 +6427,23 @@ class AnalyticsViewModel(QObject):
         presets: Dict[str, Any] = {}
         sets: List[Any] = []
         display_names: Dict[str, str] = {}
+        # Runde 15c (Bugfix Standalone): Registrierte Plugins ohne Presets
+        # und ohne Set-Instanz als hash-lose '(No Data)'-Kandidaten.
+        standalone: List[str] = []
         # Runde 12 (Punkt 4): Nur GE CHECKTE Services in den Snapshot
         # aufnehmen (feature_ids-Filter; leer = kein Filter = alle). Nicht
         # angehakte Services duerfen keine '(No Data)'-Hinweise liefern.
         active_ids = {str(f).strip().lower()
                       for f in (self._params.get("feature_ids") or [])}
+        # Runde 13c (Bugfix Dropdown-NoData, Kernwunsch): Leerer Filter
+        # (feature_ids=[]) = KEINE '(No Data)'-Eintraege. Ohne aktive
+        # Datenquellen-Auswahl wuerde der Snapshot ALLE Services enthalten
+        # und der Reader jede NoData-Variante im Feld-Dropdown anzeigen
+        # (der Button 'Aktive Filter entfernen' verspricht 'zeigt danach
+        # wieder alle Features' – ohne NoData-Rauschen).
+        if not active_ids:
+            return {"presets": {}, "sets": [], "display_names": {},
+                    "active_hashes": []}
         # Runde 13 (Bugfix Dropdown-NoData): Varianten-Einschraenkung mit
         # an den Reader geben - die '(No Data)'-Auswertung wird damit
         # variantengenau (nur im Picker gecheckte Varianten im Payload).
@@ -6200,147 +6492,60 @@ class AnalyticsViewModel(QObject):
                         in active_ids}
                 if services:
                     sets.append({"services": services})
+            # Runde 15c (Bugfix Standalone, User-Meldung 10.08.2026):
+            # Registrierte Plugins, die weder Presets/Clones noch eine
+            # Set-Instanz besitzen (z. B. srv_trend_breakout), sind reine
+            # Standalone-Services. Als hash-lose Variante (preset_name
+            # 'Default') geprueft, erscheinen sie im Feld-Dropdown, sobald
+            # der feature_store noch keine Rows ihrer plugin_id besitzt.
+            # Beim Vorhandensein von Daten (pids_with_data) bleibt der
+            # NoData-Hinweis aus (Reader-Semantik). Ausgeschlossen sind
+            # Plugins mit Presets oder Set-Instanzen (dort laeuft die
+            # bestehende Preset-/Set-Auswertung).
+            # Runde 16 (Bugfix Mischbetrieb, User-Meldung 5/6, 11.08.2026):
+            # Der Runde-15c-Guard `if not active_hashes:` ist ENTFERNT - er
+            # schloss die Standalone-Sektion aus, sobald eine Hash-Auswahl
+            # aktiv war (Mischbetrieb Service + Version). Standalone-
+            # Services werden UEBER `feature_ids` gecheckt, NICHT ueber
+            # Hashes - eine aktive Varianten-Einschraenkung darf sie daher
+            # nicht aus der NoData-Auswertung verwerfen.
+            try:
+                all_presets = model.plugin_presets() or {}
+                preset_keys = {str(k).strip().lower()
+                               for k in all_presets}
+                set_pids: Set[str] = set()
+                for _s in model.get_sets() or []:
+                    _services = (_s.get("services")
+                                 if isinstance(_s, dict) else None)
+                    if not isinstance(_services, dict):
+                        continue
+                    for _svc in _services.values():
+                        if isinstance(_svc, dict) and str(
+                                _svc.get("plugin_id") or "").strip():
+                            set_pids.add(
+                                str(_svc["plugin_id"]).strip().lower())
+                for _pid in (model.get_plugins() or {}).keys():
+                    _pid_l = str(_pid).strip().lower()
+                    if not _pid_l:
+                        continue
+                    if active_ids and _pid_l not in active_ids:
+                        continue
+                    if _pid_l in preset_keys or _pid_l in set_pids:
+                        continue
+                    standalone.append(_pid)
+                    display_names[f"{_pid}|Default"] = \
+                        self.resolve_service_display_name(_pid)
+            except Exception:
+                pass
         except Exception:
             pass
         return {
             "presets": presets,
             "sets": sets,
+            "standalone": standalone,
             "display_names": display_names,
             "active_hashes": sorted(active_hashes),
         }
-
-    def resolve_no_data_variants(self, symbol: str,
-                                timeframe: str) -> List[Dict[str, Any]]:
-        """Plugin-Varianten (Clones/Presets) OHNE feature_store-Daten (Q8-Fix).
-
-        (No Data)-Unterstuetzung (User-Bugreport 09.08.2026): Neue Varianten
-        eines Services erscheinen im Analytics-Feld-Dropdown erst, nachdem
-        sie mindestens EINMAL berechnet wurden (`feature_keys_by_service`
-        filtert `WHERE feature_data IS NOT NULL`). Diese Methode liefert die
-        Varianten, die es im ServiceSelectorModel (plugin_presets) bereits
-        gibt, deren `instance_hash` aber noch KEINE Zeilen besitzt – die UI
-        zeigt sie als '(No Data)'-Hinweis an, bis der erste Scan lief.
-
-        Nur aktive Presets (is_archived=False / is_active_batch=True) werden
-        geliefert – archivierte Varianten sind bewusst unsichtbar (Q6/Q7).
-
-        Returns:
-            Liste von {"plugin_id", "preset_name", "instance_hash",
-            "display_name"} – leer bei fehlendem Model/Reader oder wenn alle
-            Varianten Daten besitzen (defensiv, rein lesend).
-        """
-        if not symbol or not timeframe:
-            return []
-        model = self._selector_model
-        if model is None:
-            from analytics.engine.service_selector_model import ServiceSelectorModel
-            model = ServiceSelectorModel(parent=self)
-            self._selector_model = model
-        try:
-            presets = model.plugin_presets() or {}
-        except Exception:
-            presets = {}
-        # Runde 9 (Bug 2): Der strikte Hash-Vergleich war falsch - wenn
-        # die Daten einer Variante unter einem anderen/veralteten Hash
-        # oder ohne Hash (NULL, Alt-Bestand) geschrieben wurden, wurde
-        # sie faelschlich als '(No Data)' markiert. Zusaetzlich fehlten
-        # Set-Instanz-Varianten komplett (nur indicator_presets wurden
-        # geprueft). Beides wird hier korrigiert.
-        try:
-            available = self._repo.reader.available_instance_hashes(
-                symbol, timeframe)
-        except Exception:
-            available = set()
-        # feature_id-Ebene: plugin_ids, die UEBERHAUPT feature_store-Daten
-        # besitzen (egal unter welchem instance_hash / ohne Hash).
-        try:
-            keys_by_service = self._repo.reader.feature_keys_by_service(
-                symbol, timeframe)
-            pids_with_data = {str(k).strip().lower() for k in (keys_by_service or {})}
-        except Exception:
-            pids_with_data = set()
-        try:
-            from analytics.engine.service_models import generate_instance_hash
-        except Exception:
-            generate_instance_hash = None
-
-        # Runde 10 (Bug 2): available case-insensitiv indexieren (einmalig).
-        available_low = {str(x).strip().lower()
-                         for x in (available or set())}
-
-        def _has_data(pid: str, h: str) -> bool:
-            """True, wenn die Variante Daten besitzt.
-
-            Runde 10 (Bug 2): Differenzierung statt grobem
-            pids_with_data-Fallback - eine benannte Variante mit eigenem
-            instance_hash zaehlt NUR, wenn GENAU dieser Hash Zeilen
-            besitzt (sonst waere '(No Data)' nie sichtbar, sobald eine
-            andere Variante desselben Services bereits Daten hat). Der
-            pids_with_data-Fallback gilt nur noch fuer Varianten OHNE
-            Hash (NULL/Alt-Bestand, nicht unterscheidbar)."""
-            if not pid:
-                return True
-            h_s = str(h or "").strip()
-            if h_s:
-                return h_s.lower() in available_low
-            return str(pid).strip().lower() in pids_with_data
-
-        out: List[Dict[str, Any]] = []
-        seen: Set[Tuple[str, str]] = set()
-
-        def _add(pid: str, pname: str, h: str) -> None:
-            pid_s = str(pid or "").strip()
-            if not pid_s:
-                return
-            h_s = str(h or "").strip()
-            key = (pid_s.lower(), h_s)
-            if key in seen:
-                return
-            seen.add(key)
-            if _has_data(pid_s, h_s):
-                return
-            pname_s = str(pname or "Default")
-            out.append({
-                "plugin_id": pid_s,
-                "preset_name": pname_s,
-                "instance_hash": h_s,
-                "display_name": self.resolve_service_display_name(
-                    pid_s, pname_s),
-            })
-
-        for pid, clones in presets.items():
-            if not clones or not isinstance(clones, list):
-                continue
-            for clone in clones:
-                if not isinstance(clone, dict):
-                    continue
-                if clone.get("is_archived"):
-                    continue
-                _add(str(pid), str(clone.get("preset_name") or "Default"),
-                     str(clone.get("instance_hash") or ""))
-        # Runde 9 (Bug 2): Set-Instanz-Varianten (Services in Sets mit
-        # eigenen Parametern) ebenfalls erfassen - vorher fehlten sie.
-        try:
-            for s in model.get_sets() or []:
-                services = s.get("services") if isinstance(s, dict) else None
-                if not isinstance(services, dict):
-                    continue
-                for instance_id, svc in services.items():
-                    if not isinstance(svc, dict):
-                        continue
-                    if svc.get("is_archived"):
-                        continue
-                    pid = str(svc.get("plugin_id") or "").strip()
-                    if not pid:
-                        continue
-                    if generate_instance_hash is not None:
-                        h = generate_instance_hash(pid, svc.get("params") or {})
-                    else:
-                        h = ""
-                    _add(pid, f"{pid} [{instance_id}]", h)
-        except Exception:
-            pass
-        return out
 
     @property
     def max_lookback_limit(self) -> int:
@@ -6608,9 +6813,14 @@ class AnalyticsAsyncWorker(QThread):
             # Runde 11 (Bug 4, B4-1): Preset-Snapshot aus den Query-Params
             # fuer die No-Data-Auswertung (Repo berechnet no_data_variants
             # im Worker-Thread; kein DB-Zugriff im UI-Hauptthread).
+            # Runde 15 (Fix 1): feature_ids/instance_hashes fuer die Feld-
+            # Metadaten (metrics/field_sources) im leichten QUERY_FEATURES-
+            # Pfad (Feld-Dropdown OHNE Heatmap-Pivot).
             return repo.get_available_features(
                 symbol, timeframe,
                 presets_data=p.get("presets_data") or None,
+                feature_ids=feature_ids,
+                instance_hashes=instance_hashes,
             )
 
         raise ValueError(
@@ -7019,6 +7229,8 @@ die DB-Zeile bleibt unveraendert (Lesen ist rein).
 """
 
 import os
+import threading
+import time
 from datetime import datetime as _dt_datetime
 from datetime import timezone as _dt_timezone
 from pathlib import Path
@@ -7114,6 +7326,160 @@ class FeatureStoreReader:
 
     def __init__(self, db_path: str = DB_ANALYTICS) -> None:
         self.db_path = db_path
+        # Runde 15 (Ultra-Low-Latency, Performance-Fix 3): In-Memory-Cache
+        # der STABILEN Metadaten (feature_data-JSON-Keys je Service,
+        # instance_hash-Fakten). Schlüssel = (symbol.lower(), timeframe.lower()).
+        # Die Metadaten aendern sich nur bei store_plugin_payload()-Writes –
+        # die bestehende `feature_cache_last_invalidated`-Mechanik
+        # (feature_builder.py, Invariante 13) markiert solche Writes. Ohne
+        # den Cache scannen `available_feature_keys`/`feature_keys_by_service`/
+        # `available_instance_hashes`/`plugin_ids_with_hashes` den Store
+        # mehrmals pro Update (bis zu 6 Voll-Scans -> Dropdown-Verzoegerung).
+        # Thread-Lock, weil der Reader von Worker-Threads gemeinsam genutzt
+        # wird (MVVM: ein Repository/Reader pro ViewModel).
+        self._meta_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._meta_lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Interna: Metadaten-Cache (Runde 15, Performance-Fix 3)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _meta_key(symbol: str, timeframe: str) -> Tuple[str, str]:
+        """Cache-Schluessel (symbol/timeframe normalisiert, case-insensitiv)."""
+        return (str(symbol or "").strip().lower(),
+                str(timeframe or "").strip().lower())
+
+    def _meta_cache_valid(self, key: Tuple[str, str]) -> bool:
+        """True, wenn der Cache-Eintrag fuer (symbol, timeframe) gueltig ist.
+
+        Invalidation (Invariante 13 / P14-03): `feature_cache_last_invalidated`
+        wird bei JEDEM `store_plugin_payload()` fuer (symbol, timeframe)
+        aktualisiert. Ein Eintrag ist genau dann gueltig, wenn nach seiner
+        Erstellung (ts) KEINE Invalidation registriert wurde. Lazy Import
+        (kein pandas-Load beim Reader-Modul-Import; feature_builder laedt
+        schwergewichtigere Abhaengigkeiten). Fehlt der Mechanismus (Tests/
+        Standalone), bleibt der Eintrag bis zur expliziten Invalidation
+        gueltig (der Writer-Pfad liegt im selben Prozess und aktualisiert
+        die Invalidation IMMER mit).
+        """
+        entry = self._meta_cache.get(key)
+        if entry is None:
+            return False
+        try:
+            from analytics.features.feature_builder import (
+                feature_cache_last_invalidated,
+            )
+            last_inv = feature_cache_last_invalidated(*key)
+        except Exception:
+            last_inv = None
+        return last_inv is None or last_inv < float(entry.get("ts") or 0.0)
+
+    def _meta_get(self, key: Tuple[str, str]) -> Optional[Dict[str, Any]]:
+        """Liefert den gueltigen Cache-Eintrag (oder None bei Miss/Stale)."""
+        with self._meta_lock:
+            if not self._meta_cache_valid(key):
+                return None
+            return self._meta_cache.get(key)
+
+    def _meta_put(self, key: Tuple[str, str], entry: Dict[str, Any]) -> None:
+        """Legt den Cache-Eintrag mit aktuellem Zeitstempel ab."""
+        entry["ts"] = time.time()
+        with self._meta_lock:
+            self._meta_cache[key] = dict(entry)
+
+    def invalidate_meta_cache(
+        self, symbol: Optional[str] = None, timeframe: Optional[str] = None
+    ) -> None:
+        """Loescht den Metadaten-Cache (ganz oder je symbol/timeframe).
+
+        Defensiver Notausgang (z. B. Tests, die ohne
+        feature_cache_last_invalidated schreiben). Im Produktivpfad
+        invalidiert `store_plugin_payload()` automatisch via Invariante 13.
+        """
+        with self._meta_lock:
+            if symbol is None or timeframe is None:
+                self._meta_cache.clear()
+                return
+            self._meta_cache.pop(self._meta_key(symbol, timeframe), None)
+
+    def _feature_meta_base(
+        self, symbol: str, timeframe: str
+    ) -> Optional[Dict[str, Any]]:
+        """Einmaliger Basis-Scan der feature_store-Metadaten (gedacht).
+
+        Liefert – aus dem Cache ODER frisch per GENAU EINER DuckDB-Abfrage
+        (alle 4 Metadaten-Methoden teilen sich diesen Scan; vorher liefen
+        bis zu 6 Voll-Scans pro Update):
+            {
+              "types_by_service": {fid: {key: set(Typ-Str)}},   # ungefiltert
+              "hashes_by_service": {fid_lower: set(nicht-leere Hashes)},
+              "null_hash_pids":    {fid_lower},  # fids mit NULL-Hash-Zeilen
+            }
+        None bei fehlender DB/Tabelle oder Fehler (defensiv, wird NICHT
+        gecacht – ein spaeter erfolgreicher Versuch bleibt moeglich).
+
+        Semantik identisch zu den bisherigen Einzelabfragen:
+          * `schema_version`-Key und leere Keys werden ignoriert (E-3).
+          * Rows ohne feature_id landen unter "" (Legacy/native).
+          * NULL-Hash-Zeilen = undifferenzierter Alt-Bestand
+            (gehoert der plugin_id als Ganzes, Runde 13c).
+        """
+        if not symbol or not timeframe:
+            return None
+        key = self._meta_key(symbol, timeframe)
+        entry = self._meta_get(key)
+        if entry is not None and "types_by_service" in entry:
+            return entry
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT DISTINCT feature_id, instance_hash, feature_data
+                FROM feature_store
+                WHERE LOWER(symbol) = LOWER(?)
+                  AND LOWER(timeframe) = LOWER(?)
+                  AND feature_data IS NOT NULL
+            """, [symbol, timeframe]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] _feature_meta_base "
+                  f"fehlgeschlagen: {e}")
+            return None
+
+        types_by_service: Dict[str, Dict[str, set]] = {}
+        hashes_by_service: Dict[str, set] = {}
+        null_hash_pids: Set[str] = set()
+        for fid, hash_raw, raw in rows:
+            data = self._normalize_feature_data(raw)
+            if not isinstance(data, dict):
+                continue
+            service = str(fid) if fid is not None else ""
+            bucket = types_by_service.setdefault(service, {})
+            for k, v in data.items():
+                if k == "schema_version" or not str(k).strip():
+                    continue
+                key_str = str(k)
+                if isinstance(v, bool):
+                    t = "bool"
+                elif isinstance(v, (int, float)):
+                    t = "num"
+                elif v is None:
+                    t = "null"
+                else:
+                    t = "str"
+                bucket.setdefault(key_str, set()).add(t)
+            # Hash-Zuordnung (nicht-leere Hashes getrennt vom NULL-Bestand).
+            svc_l = str(service).strip().lower()
+            h_s = str(hash_raw or "").strip()
+            if h_s:
+                hashes_by_service.setdefault(svc_l, set()).add(h_s)
+            else:
+                null_hash_pids.add(svc_l)
+        entry = {
+            "types_by_service": types_by_service,
+            "hashes_by_service": hashes_by_service,
+            "null_hash_pids": null_hash_pids,
+        }
+        self._meta_put(key, entry)
+        return entry
 
     # ------------------------------------------------------------------
     # Interna
@@ -7377,6 +7743,13 @@ class FeatureStoreReader:
         aus; pro Struktur werden die Keys gesammelt. `schema_version`
         (Pflichtfeld, E-3) wird ignoriert.
 
+        Runde 15 (Performance-Fix 3): Die Auswertung laeuft ueber den
+        gemeinsamen Metadaten-Basis-Scan `_feature_meta_base` (EIN Scan fuer
+        available_feature_keys/feature_keys_by_service/available_instance_
+        hashes/plugin_ids_with_hashes; Invalidation via
+        `feature_cache_last_invalidated`, Invariante 13). Ergebnis
+        identisch zur bisherigen Einzelabfrage.
+
         Args:
             symbol/timeframe: Filter (case-insensitive)
             numeric_only: True => nur Keys, deren Wert in ALLEN Vorkommen
@@ -7389,39 +7762,13 @@ class FeatureStoreReader:
         """
         if not symbol or not timeframe:
             return []
-        con = self._get_connection()
-        try:
-            rows = con.execute("""
-                SELECT DISTINCT feature_data
-                FROM feature_store
-                WHERE LOWER(symbol) = LOWER(?)
-                  AND LOWER(timeframe) = LOWER(?)
-                  AND feature_data IS NOT NULL
-            """, [symbol, timeframe]).fetchall()
-        except Exception as e:
-            print(f"WARN [FeatureStoreReader] available_feature_keys "
-                  f"fehlgeschlagen: {e}")
+        base = self._feature_meta_base(symbol, timeframe)
+        if base is None:
             return []
-
         key_types: Dict[str, set] = {}
-        for (raw,) in rows:
-            data = self._normalize_feature_data(raw)
-            if not isinstance(data, dict):
-                continue
-            for k, v in data.items():
-                if k == "schema_version" or not str(k).strip():
-                    continue
-                key = str(k)
-                if isinstance(v, bool):
-                    t = "bool"
-                elif isinstance(v, (int, float)):
-                    t = "num"
-                elif v is None:
-                    t = "null"
-                else:
-                    t = "str"
-                key_types.setdefault(key, set()).add(t)
-
+        for bucket in base["types_by_service"].values():
+            for k, types in bucket.items():
+                key_types.setdefault(k, set()).update(types)
         keys = sorted(key_types.keys())
         if not numeric_only:
             return keys
@@ -7463,51 +7810,38 @@ class FeatureStoreReader:
         """
         if not symbol or not timeframe:
             return {}
-        conditions = ["LOWER(symbol) = LOWER(?)", "LOWER(timeframe) = LOWER(?)"]
-        params: List[Any] = [symbol, timeframe]
+        base = self._feature_meta_base(symbol, timeframe)
+        if base is None:
+            return {}
+        types_by_service = base["types_by_service"]
+        hashes_by_service = base["hashes_by_service"]
+        null_hash_pids = base["null_hash_pids"]
         # 09.08.2026 (User-Meldung Feld-Dropdown): feature_id/feature_ids-
         # Filter anwenden, damit abgewaehlte Services nicht im Dropdown
-        # erscheinen (Root Cause 2).
-        self._apply_feature_filter(
-            feature_ids, feature_id, conditions, params,
-            instance_hashes=instance_hashes)
-
-        con = self._get_connection()
-        try:
-            rows = con.execute(f"""
-                SELECT DISTINCT feature_id, feature_data
-                FROM feature_store
-                WHERE {' AND '.join(conditions)}
-                  AND feature_data IS NOT NULL
-            """, params).fetchall()
-        except Exception as e:
-            print(f"WARN [FeatureStoreReader] feature_keys_by_service "
-                  f"fehlgeschlagen: {e}")
-            return {}
-
-        key_types: Dict[str, Dict[str, set]] = {}
-        for fid, raw in rows:
-            data = self._normalize_feature_data(raw)
-            if not isinstance(data, dict):
-                continue
-            service = str(fid) if fid is not None else ""
-            bucket = key_types.setdefault(service, {})
-            for k, v in data.items():
-                if k == "schema_version" or not str(k).strip():
-                    continue
-                key = str(k)
-                if isinstance(v, bool):
-                    t = "bool"
-                elif isinstance(v, (int, float)):
-                    t = "num"
-                elif v is None:
-                    t = "null"
-                else:
-                    t = "str"
-                bucket.setdefault(key, set()).add(t)
+        # erscheinen (Root Cause 2). Runde 15: Die Filterung erfolgt in
+        # Python auf dem gecachten Basis-Scan (identische Semantik zur
+        # bisherigen SQL-IN-Clause: case-insensitiv + whitespace-tolerant).
+        wanted = {str(i).strip().lower() for i in (feature_ids or [])
+                  if str(i).strip()}
+        if not wanted and feature_id:
+            wanted = {str(feature_id).strip().lower()}
+        # Runde 10 (Bug 1): Varianten-Einschraenkung – NULL-Hash-Zeilen
+        # (Alt-Bestand) passieren IMMER, sonst muss ein nicht-leerer Hash
+        # der gewaehlten Variante treffen (exakter Hash-Match, case-insensitiv).
+        hashes = set()
+        if instance_hashes:
+            hashes = {str(h).strip().lower() for h in instance_hashes
+                      if str(h).strip()}
 
         out: Dict[str, List[str]] = {}
-        for service, bucket in key_types.items():
+        for service, bucket in types_by_service.items():
+            svc_l = str(service).strip().lower()
+            if wanted and svc_l not in wanted:
+                continue
+            if hashes:
+                svc_hashes = hashes_by_service.get(svc_l, set())
+                if not (svc_l in null_hash_pids or (svc_hashes & hashes)):
+                    continue
             keys = sorted(bucket.keys())
             if numeric_only:
                 keys = [k for k in keys if bucket[k] == {"num"}]
@@ -8213,6 +8547,93 @@ class FeatureStoreReader:
                 continue
         return out
 
+    def fetch_last_execution_datetimes_by_hash(
+        self,
+    ) -> Dict[str, Dict[str, str]]:
+        """Neuester Schreib-Zeitpunkt je (feature_id, instance_hash) mit Uhrzeit.
+
+        Bugfix 11.08.2026 (Dropdown-Anzeige, User-Meldung 1): Das
+        Feld-Dropdown haengt an gecheckte Varianten das Datum+Uhrzeit der
+        letzten Ausfuehrung an ('{Name} / {Preset} / DD.MM.JJ HH:MM').
+        `fetch_last_execution_dates_by_hash` liefert nur das Datum - diese
+        Methode ergaenzt die Uhrzeit (Format 'DD.MM.JJ HH:MM', z. B.
+        '23.04.26 22:14'). Quelle/Filter/Semantik identisch zur
+        Datums-Variante (MAX(created_at) GROUP BY feature_id +
+        instance_hash ueber ALLE Symbole/Timeframes; case-insensitiv/
+        whitespace-tolerant; Rows ohne instance_hash/created_at werden
+        uebersprungen).
+
+        Returns:
+            Dict feature_id (lower) -> {instance_hash: 'DD.MM.JJ HH:MM'} -
+            leer bei fehlender DB/Tabelle oder Fehler (defensiv).
+        """
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT LOWER(TRIM(feature_id)) AS fid, instance_hash,
+                       MAX(created_at)
+                FROM feature_store
+                WHERE feature_id IS NOT NULL AND TRIM(feature_id) != ''
+                  AND feature_id != ?
+                  AND instance_hash IS NOT NULL AND instance_hash != ''
+                GROUP BY LOWER(TRIM(feature_id)), instance_hash
+            """, [SENTINEL_NATIVE]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] "
+                  f"fetch_last_execution_datetimes_by_hash fehlgeschlagen: "
+                  f"{e}")
+            return {}
+        out: Dict[str, Dict[str, str]] = {}
+        for r in rows:
+            if r[0] is None or r[1] is None or r[2] is None:
+                continue
+            try:
+                out.setdefault(str(r[0]), {})[str(r[1])] = r[2].strftime(
+                    "%d.%m.%y %H:%M")
+            except (AttributeError, ValueError):
+                continue
+        return out
+
+    def fetch_last_execution_datetimes(self) -> Dict[str, str]:
+        """Neuester Schreib-Zeitpunkt je feature_id MIT Uhrzeit.
+
+        Bugfix 11.08.2026 (Runde 16c, Dropdown-Anzeige, User-Meldung):
+        Das Feld-Dropdown haengt an Services OHNE Varianten (Standalone,
+        z. B. srv_trend_breakout) das Datum+Uhrzeit der letzten Ausfuehrung
+        an ('{Name} / {Key} / DD.MM.JJ HH:MM', z. B. '23.04.26 22:14').
+        `fetch_last_execution_dates` liefert nur das Datum - diese Methode
+        ergaenzt die Uhrzeit. Quelle/Filter/Semantik identisch zur
+        Datums-Variante (MAX(created_at) GROUP BY feature_id ueber ALLE
+        Symbole/Timeframes; case-insensitiv/whitespace-tolerant; Rows ohne
+        created_at werden uebersprungen).
+
+        Returns:
+            Dict feature_id (lower) -> 'DD.MM.JJ HH:MM' - leer bei
+            fehlender DB/Tabelle oder Fehler (defensiv).
+        """
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT LOWER(TRIM(feature_id)) AS fid, MAX(created_at)
+                FROM feature_store
+                WHERE feature_id IS NOT NULL AND TRIM(feature_id) != ''
+                  AND feature_id != ?
+                GROUP BY LOWER(TRIM(feature_id))
+            """, [SENTINEL_NATIVE]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_last_execution_datetimes "
+                  f"fehlgeschlagen: {e}")
+            return {}
+        out: Dict[str, str] = {}
+        for r in rows:
+            if r[0] is None or r[1] is None:
+                continue
+            try:
+                out[str(r[0])] = r[1].strftime("%d.%m.%y %H:%M")
+            except (AttributeError, ValueError):
+                continue
+        return out
+
     # ------------------------------------------------------------------
     # Lesen: Metadaten
     # ------------------------------------------------------------------
@@ -8258,20 +8679,43 @@ class FeatureStoreReader:
         """
         if not symbol or not timeframe:
             return set()
-        con = self._get_connection()
-        try:
-            rows = con.execute("""
-                SELECT DISTINCT instance_hash FROM feature_store
-                WHERE LOWER(symbol) = LOWER(?)
-                  AND LOWER(timeframe) = LOWER(?)
-                  AND instance_hash IS NOT NULL
-                  AND instance_hash != ''
-            """, [symbol, timeframe]).fetchall()
-            return {str(r[0]) for r in rows if r[0] is not None}
-        except Exception as e:
-            print(f"WARN [FeatureStoreReader] available_instance_hashes "
-                  f"fehlgeschlagen: {e}")
+        base = self._feature_meta_base(symbol, timeframe)
+        if base is None:
             return set()
+        out: Set[str] = set()
+        for hashes in base["hashes_by_service"].values():
+            out.update(hashes)
+        return out
+
+    def plugin_ids_with_hashes(
+        self, symbol: str, timeframe: str,
+    ) -> set:
+        """Plugin-IDs mit mindestens einer instance_hash-Zeile (Runde 13c).
+
+        Runde 13c (Bugfix Dropdown-NoData, Alt-Bestand): Der Reader muss
+        unterscheiden koennen, ob die Daten einer plugin_id VARIANTEN-
+        AUFGETEILT vorliegen (eigene instance_hash-Rows je Variante) oder
+        UNDIFFERENZIERT (Alt-Rows ohne Hash, gehoeren der plugin_id als
+        Ganzes). Diese Methode liefert die Mengen der plugin_ids, die
+        mindestens EINE Zeile mit gesetztem instance_hash besitzen
+        (rein lesend, kein SQL in der UI).
+
+        Runde 15 (Performance-Fix 3): Abgeleitet aus dem gemeinsamen
+        Metadaten-Basis-Scan `_feature_meta_base` (keine separate Abfrage;
+        Identitaet = unter "" gruppierte Legacy/native-Rows ohne feature_id
+        werden ausgeschlossen, wie bisher).
+
+        Returns:
+            set[str] – leer bei fehlender DB/Tabelle oder Fehlern
+            (defensiv, Invariante FeatureStoreReader: rein lesend).
+        """
+        if not symbol or not timeframe:
+            return set()
+        base = self._feature_meta_base(symbol, timeframe)
+        if base is None:
+            return set()
+        return {k for k in base["hashes_by_service"]
+                if k and str(k).strip() != ""}
 
     def resolve_no_data_variants(
         self,
@@ -8285,10 +8729,20 @@ class FeatureStoreReader:
         UI-Hauptthread in den QUERY_FEATURES-Worker verlagert. Der
         ViewModel liefert die Preset-Modell-Daten als Snapshot
         (`presets_data`: {"presets": {pid: [...]}, "sets": [...],
-        "display_names": {"{pid}|{pname}": str},
+        "standalone": [pid...], "display_names": {"{pid}|{pname}": str},
         "active_hashes": [gecheckte Varianten-Hashes]}); diese Methode
         kombiniert sie mit den DB-Fakten (`available_instance_hashes` /
         `feature_keys_by_service`) im Worker-Thread.
+
+        Runde 15c (Bugfix Standalone, User-Meldung 10.08.2026): Die neue
+        Snapshot-Sektion `standalone` listet registrierte Plugins ohne
+        Presets und ohne Set-Instanz (z. B. srv_trend_breakout) als
+        hash-lose Variante (preset_name 'Default'). Eine Standalone-Variante
+        gilt als 'ohne Daten', wenn ihre plugin_id keine feature_store-Zeilen
+        besitzt (`_has_data` prueft `pids_with_data` direkt - kein
+        Hash-/Alt-Bestand-Fallback noetig). Dadurch erscheint ein
+        registrierter, aber noch nie ausgeführter Service korrekt als
+        '(No Data)' im Feld-Dropdown.
 
         Runde 13 (Bugfix Dropdown-NoData): `active_hashes` (nicht leer =
         Varianten-Einschraenkung) macht die Auswertung VARIANTEN-GENAU -
@@ -8296,6 +8750,15 @@ class FeatureStoreReader:
         (nicht-gecheckte Instanzen derselben plugin_id erscheinen nicht
         mehr im '(No Data)'-Abschnitt; das Dropdown zeigt damit nicht mehr
         die erste Variante eines Services, wenn eine andere gecheckt ist).
+
+        Runde 13c (Alt-Bestand): Eine Variante ohne Hash-Treffer zaehlt
+        trotzdem als 'hat Daten', wenn die plugin_id ausschliesslich
+        undifferenzierte Alt-Rows OHNE instance_hash besitzt
+        (`plugin_ids_with_hashes`) � dieser Alt-Bestand gehoert der
+        ORIGINAL-Variante (der ERSTEN aktiven Variante der plugin_id im
+        Snapshot). Runde 14: Weitere Varianten derselben plugin_id werden
+        NICHT vom Alt-Bestand abgedeckt - eine neu erzeugte zweite Variante
+        ohne Daten muss als '(No Data)' erscheinen.
 
         Eine Variante gilt als 'ohne Daten', wenn ihr instance_hash KEINE
         Zeilen besitzt (oder - bei Varianten ohne Hash - ihr plugin_id keine
@@ -8312,6 +8775,13 @@ class FeatureStoreReader:
         presets = (presets_data or {}).get("presets") or {}
         sets = (presets_data or {}).get("sets") or []
         display_names = (presets_data or {}).get("display_names") or {}
+        # Runde 15c (Bugfix Standalone, User-Meldung 10.08.2026):
+        # Registrierte Plugins ohne Presets und ohne Set-Instanz
+        # (z. B. srv_trend_breakout) - der ViewModel markiert sie ueber
+        # die Snapshot-Sektion "standalone" als hash-lose Variante. Sie
+        # gelten als '(No Data)', solange der feature_store keine Rows
+        # ihrer plugin_id besitzt (Reader prueft `pids_with_data`).
+        standalone = (presets_data or {}).get("standalone") or []
         # Runde 13 (Bugfix Dropdown-NoData): Varianten-Einschraenkung aus dem
         # Snapshot - leer = KEINE Einschraenkung (alle Varianten der aktiven
         # Services), nicht leer = nur die gecheckten Varianten.
@@ -8322,6 +8792,20 @@ class FeatureStoreReader:
             available = self.available_instance_hashes(symbol, timeframe)
         except Exception:
             available = set()
+        # Runde 13c (Bugfix Dropdown-NoData, Alt-Bestand): Plugin-IDs mit
+        # eigenem instance_hash-Bestand (Varianten-Aufteilung). Liegt die
+        # plugin_id NICHT in dieser Menge, stammt ihr gesamter Bestand aus
+        # undifferenzierten Alt-Rows OHNE Hash (z. B. srv_proximity: alle
+        # Rows instance_hash IS NULL) – dann deckt der Alt-Bestand jede
+        # Variante des Services ab (kein '(No Data)'-Fehlalarm fuer
+        # Varianten, deren berechneter Hash in keiner DB-Zeile steht).
+        # WICHTIG: pids_with_hashes=None bei Fehler (z. B. Fake/Temp-DB
+        # ohne Tabelle) - dann bleibt die Runde-10-Semantik konservativ
+        # erhalten (kein Alt-Bestand-Fallback auf unbekannter Basis).
+        try:
+            pids_with_hashes = self.plugin_ids_with_hashes(symbol, timeframe)
+        except Exception:
+            pids_with_hashes = None
         # Runde 12 (Option A, Performance): Die teure feature_keys_by_service-
         # Abfrage (laedt feature_data-JSONs) wird auf die AKTIVEN plugin_ids
         # des Snapshots eingeschraenkt (Preset-Keys + Set-Instanz-Services) -
@@ -8339,6 +8823,14 @@ class FeatureStoreReader:
                 if isinstance(_svc, dict) and str(
                         _svc.get("plugin_id") or "").strip():
                     active_pids.append(str(_svc["plugin_id"]))
+        # Runde 15c: Standalone-Services ebenfalls in die Abfrage-Scope
+        # aufnehmen - `pids_with_data` muss deren Datenlage kennen, sonst
+        # wuerde ein Standalone-Service MIT Rows faelschlich als '(No Data)'
+        # geliefert (feature_keys_by_service scannt nur die aktiven pids).
+        for _pid in standalone or []:
+            _s = str(_pid or "").strip()
+            if _s:
+                active_pids.append(_s)
         active_pids = list(dict.fromkeys(active_pids))
         try:
             if active_pids:
@@ -8366,13 +8858,82 @@ class FeatureStoreReader:
             instance_hash zaehlt NUR, wenn GENAU dieser Hash Zeilen
             besitzt. Der pids_with_data-Fallback gilt nur noch fuer
             Varianten OHNE Hash (NULL/Alt-Bestand).
+
+            Runde 13c (Bugfix Dropdown-NoData, Alt-Bestand): Besitzt die
+            plugin_id KEINERLEI hash-differenzierte Zeilen (`pids_with_hashes`
+            leer), stammt ihr Bestand aus undifferenzierten Alt-Rows
+            (instance_hash IS NULL, z. B. srv_proximity vor der
+            feature_data-Migration). Dieser Alt-Bestand gehoert der
+            plugin_id als Ganzes und deckt JEDE Variante ab - sonst wuerde
+            z. B. die Set-Instanz 'srv_proximity' trotz 99K M1-Zeilen als
+            '(No Data)' gemeldet, weil ihr berechneter Hash
+            (generate_instance_hash) in keiner DB-Zeile steht. Der
+            Fallback greift NUR, wenn die Hash-Bestands-Abfrage ERFOLGREICH
+            war (pids_with_hashes ist None = Abfragefehler -> konservativ
+            Runde-10-Semantik, kein Fallback).
             """
             if not pid:
                 return True
             h_s = str(h or "").strip()
             if h_s:
-                return h_s.lower() in available_low
+                if h_s.lower() in available_low:
+                    return True
+                # Undifferenzierter Alt-Bestand (keine Hash-Zeilen der
+                # plugin_id bekannt): die plugin-weiten Daten decken die
+                # ORIGINAL-Variante ab (die ERSTE aktive Variante im
+                # Snapshot - ihr gehoert der Alt-Bestand, der vor der
+                # Hash-Aera von genau dieser Instanz geschrieben wurde).
+                # Nur bei erfolgreicher Bestands-Abfrage. Runde 14: Der
+                # Fallback gilt NICHT fuer weitere Varianten derselben
+                # plugin_id - eine neu erzeugte zweite Variante (anderer
+                # Hash, noch nie berechnet) hat KEINE Daten und muss als
+                # '(No Data)' erscheinen.
+                if (pids_with_hashes is not None
+                        and str(pid).strip().lower() not in pids_with_hashes
+                        and h_s == first_hash_by_pid.get(
+                            str(pid).strip().lower(), "")):
+                    return str(pid).strip().lower() in pids_with_data
+                return False
             return str(pid).strip().lower() in pids_with_data
+
+        # Runde 14 (Bugfix Dropdown-NoData, 2. Variante ohne Daten):
+        # Bestimme die ERSTE aktive Variante je plugin_id im Snapshot
+        # (Reihenfolge wie im ServicePicker: Presets/Clones zuerst, dann
+        # Set-Instanzen). Nur dieser Original-Variante darf der
+        # Alt-Bestand-Fallback (undifferenzierte NULL-Hash-Rows) zugeordnet
+        # werden - der Bestand wurde vor der Hash-Aera von genau der
+        # ersten/originalen Instanz geschrieben.
+        first_hash_by_pid: Dict[str, str] = {}
+
+        def _collect_first(pid: str, h: str) -> None:
+            k = str(pid or "").strip().lower()
+            if not k:
+                return
+            if k not in first_hash_by_pid:
+                first_hash_by_pid[k] = str(h or "").strip()
+
+        for _pid, _clones in presets.items():
+            if not isinstance(_clones, list):
+                continue
+            for _clone in _clones:
+                if not isinstance(_clone, dict) or _clone.get("is_archived"):
+                    continue
+                _collect_first(str(_pid),
+                               str(_clone.get("instance_hash") or ""))
+        for _s in sets or []:
+            _services = _s.get("services") if isinstance(_s, dict) else None
+            if not isinstance(_services, dict):
+                continue
+            for _svc in _services.values():
+                if not isinstance(_svc, dict) or _svc.get("is_archived"):
+                    continue
+                _pid = str(_svc.get("plugin_id") or "").strip()
+                if not _pid:
+                    continue
+                _h = ""
+                if generate_instance_hash is not None:
+                    _h = generate_instance_hash(_pid, _svc.get("params") or {})
+                _collect_first(_pid, _h)
 
         out: List[Dict[str, Any]] = []
         seen: Set[Tuple[str, str]] = set()
@@ -8388,7 +8949,13 @@ class FeatureStoreReader:
             # Instanzen derselben plugin_id erscheinen nicht mehr als
             # '(No Data)' (vorher wurde hier die ERSTE Variante des Services
             # angezeigt bzw. ungecheckte Instanzen mit aufgefuehrt).
-            if active_hashes and h_s.lower() not in active_hashes:
+            # Runde 16 (Bugfix Mischbetrieb, User-Meldung 5/6, 11.08.2026):
+            # Der Guard greift nur noch bei Varianten MIT Hash (`h_s and`) -
+            # hash-lose Varianten (Standalone-Services wie srv_trend_breakout
+            # und NULL-Hash-Alt-Bestand) werden UEBER `feature_ids` gecheckt
+            # und duerfen von einer aktiven Hash-Auswahl nicht verworfen
+            # werden (sonst verschwinden Services im Mischbetrieb).
+            if active_hashes and h_s and h_s.lower() not in active_hashes:
                 return
             key = (pid_s.lower(), h_s)
             if key in seen:
@@ -8435,6 +9002,14 @@ class FeatureStoreReader:
                 else:
                     h = ""
                 _add(pid, f"{pid} [{instance_id}]", h)
+        # Runde 15c (Bugfix Standalone, User-Meldung 10.08.2026): Reine
+        # Standalone-Services als hash-lose Variante (preset_name 'Default')
+        # erfassen - `_has_data(pid, "")` prueft direkt `pids_with_data`
+        # (kein Hash-/Alt-Bestand-Fallback noetig). Ein Standalone-Service
+        # ohne feature_store-Rows erscheint damit als '(No Data)' im
+        # Feld-Dropdown; sobald Daten existieren, bleibt der Hinweis aus.
+        for pid in standalone or []:
+            _add(str(pid), "Default", "")
         return out
 
     @staticmethod
@@ -8450,7 +9025,13 @@ class FeatureStoreReader:
                   .replace("_", " ").title())
         if not pretty:
             pretty = pid
-        return f"{pretty} ({pname})"
+        # Runde 16 (Bugfix 1, 11.08.2026): Anzeige-Format auf
+        # '{Name} / {Preset}' umgestellt (identisch zum ViewModel-Format;
+        # vorher '{Name} ({Preset})'). 'Default' wird als Platzhalter-
+        # Preset uebersprungen (Standalone-Services ohne echten Preset).
+        if pname and str(pname).strip().lower() != "default":
+            return f"{pretty} / {str(pname).strip()}"
+        return pretty
 
     def get_available_features(
         self, symbol: str, timeframe: str
@@ -9047,11 +9628,22 @@ class ServiceSelectorModel(QObject):
         self._active_indicator_ids: Set[str] = set()
         # 05.08.2026: Datum der letzten Ausfuehrung je feature_id (DD.MM.JJ)
         self._last_execution_dates: Dict[str, str] = {}
+        # 11.08.2026 (Bugfix Runde 16c, Dropdown-Anzeige): Datum+Uhrzeit der
+        # letzten Ausfuehrung je feature_id ('DD.MM.JJ HH:MM') – Grundlage der
+        # Feld-Dropdown-Anzeige '{Name} / {Key} / DD.MM.JJ HH:MM' fuer
+        # Services OHNE Varianten (Standalone). Quelle:
+        # FeatureStoreReader.fetch_last_execution_datetimes().
+        self._last_execution_datetimes: Dict[str, str] = {}
         # 10.08.2026 (Varianten-Ausfuehrungsdatum): Datum der letzten
         # Ausfuehrung je (feature_id, instance_hash) – Grundlage der
         # MasterTree-Varianten-Anzeige '<Preset> (DD.MM.JJ)'. Quelle:
         # FeatureStoreReader.fetch_last_execution_dates_by_hash().
         self._last_execution_dates_by_hash: Dict[str, Dict[str, str]] = {}
+        # 11.08.2026 (Bugfix Runde 16, Dropdown-Anzeige): Datum+Uhrzeit der
+        # letzten Ausfuehrung je (feature_id, instance_hash) – Grundlage der
+        # Feld-Dropdown-Anzeige '{Name} / {Preset} / DD.MM.JJ HH:MM'.
+        # Quelle: FeatureStoreReader.fetch_last_execution_datetimes_by_hash().
+        self._last_execution_datetimes_by_hash: Dict[str, Dict[str, str]] = {}
         # 18.01.03 (E1): Kategorie-Overrides je Plugin (global_settings,
         # Key 'plugin_category_<pid>'). Ein gesetzter Override UEBERSCHREIBT
         # metadata['category'] (auch "" = Root-Ebene); ohne Override gilt das
@@ -9095,12 +9687,21 @@ class ServiceSelectorModel(QObject):
         # wird nach jedem Service-Run (ServiceRunWorker -> EventBus) neu
         # gelesen, damit der MasterTree das Datum live aktualisiert.
         self._last_execution_dates = self._load_last_execution_dates()
+        # 11.08.2026 (Bugfix Runde 16c, Dropdown-Anzeige): Datum+Uhrzeit der
+        # letzten Ausfuehrung je feature_id – Grundlage der Feld-Dropdown-
+        # Anzeige fuer Services OHNE Varianten ('{Name} / {Key} / DD.MM.JJ HH:MM').
+        self._last_execution_datetimes = self._load_last_execution_datetimes()
         # 10.08.2026 (Varianten-Ausfuehrungsdatum): Datum der letzten
         # Ausfuehrung je (feature_id, instance_hash) – Grundlage der
         # MasterTree-Varianten-Anzeige '<Preset> (DD.MM.JJ)'. Wird NACH den
         # Plugin-Ausfuehrungsdaten gelesen, damit _load_plugin_presets() die
         # Hash-Daten je Clone mitgeben kann.
         self._last_execution_dates_by_hash = self._load_last_execution_dates_by_hash()
+        # 11.08.2026 (Bugfix Runde 16, Dropdown-Anzeige): Datum+Uhrzeit der
+        # letzten Ausfuehrung je (feature_id, instance_hash) – Grundlage der
+        # Feld-Dropdown-Anzeige '{Name} / {Preset} / DD.MM.JJ HH:MM'.
+        self._last_execution_datetimes_by_hash = (
+            self._load_last_execution_datetimes_by_hash())
         # 18.01.03 (E1): Kategorie-Overrides (plugin_category_<pid>) laden –
         # einmalig pro Refresh, damit _category_parts() ohne DB-Zugriff
         # auswertet (Baum-Aufbau bleibt rein lesend aus dem RAM).
@@ -9233,6 +9834,37 @@ class ServiceSelectorModel(QObject):
         # 'srv_proximity' – Registry-IDs sind case-insensitiv).
         return {str(k).lower(): v for k, v in raw.items()}
 
+    def _load_last_execution_datetimes(self) -> Dict[str, str]:
+        """Liest Datum+Uhrzeit der letzten Ausfuehrung je feature_id.
+
+        11.08.2026 (Bugfix Runde 16c, Dropdown-Anzeige): Delegate an den
+        FeatureStoreReader (fetch_last_execution_datetimes) – das
+        Feld-Dropdown haengt an Services OHNE Varianten (Standalone) das
+        Ausfuehrungsdatum an ('DD.MM.JJ HH:MM'). Defensiv: Fehler -> leer
+        (Eintraege zeigen dann keinen Datums-Anhang).
+        """
+        try:
+            raw = self.feature_store_reader.fetch_last_execution_datetimes() or {}
+        except Exception as e:
+            print(f"WARN [ServiceSelectorModel] Ausfuehrungsdaten "
+                  f"(Datum+Uhrzeit) nicht lesbar: {e}")
+            return {}
+        return {str(k).lower(): v for k, v in raw.items()}
+
+    def last_execution_datetime(self, plugin_id: str) -> str:
+        """Datum+Uhrzeit der letzten Ausfuehrung eines Services.
+
+        11.08.2026 (Bugfix Runde 16c, Dropdown-Anzeige): Format 'DD.MM.JJ HH:MM'
+        (z. B. '23.04.26 22:14') – Fallback '--.--.-- --:--' ohne Eintraege.
+        Quelle: MAX(created_at) des feature_store fuer die feature_id
+        (Plugin-ID) des Services ueber ALLE Varianten/Symbole/Timeframes.
+        Rein lesend aus dem Refresh-Zustand.
+        """
+        if not plugin_id:
+            return "--.--.-- --:--"
+        return self._last_execution_datetimes.get(
+            str(plugin_id).lower(), "--.--.-- --:--")
+
     def last_execution_date(self, plugin_id: str) -> str:
         """Formatiertes Datum der letzten Ausfuehrung eines Services
         ('DD.MM.JJ', z.B. '05.08.26') – Fallback '--.--.--' ohne Eintraege.
@@ -9284,6 +9916,40 @@ class ServiceSelectorModel(QObject):
                   f"nicht lesbar: {e}")
             return {}
         return {str(k).lower(): v for k, v in raw.items()}
+
+    def _load_last_execution_datetimes_by_hash(
+        self,
+    ) -> Dict[str, Dict[str, str]]:
+        """Liest die Varianten-Ausfuehrungsdaten je (feature_id, hash) mit Uhrzeit.
+
+        11.08.2026 (Bugfix Runde 16, Dropdown-Anzeige): Delegate an den
+        FeatureStoreReader (fetch_last_execution_datetimes_by_hash) - die
+        Feld-Dropdown-Anzeige '{Name} / {Preset} / DD.MM.JJ HH:MM' braucht
+        Datum+Uhrzeit der letzten Ausfuehrung. Defensiv: Fehler -> leer
+        (Eintraege zeigen dann keinen Datums-Anhang).
+        """
+        try:
+            raw = self.feature_store_reader.fetch_last_execution_datetimes_by_hash() or {}
+        except Exception as e:
+            print(f"WARN [ServiceSelectorModel] Varianten-Ausfuehrungsdaten "
+                  f"(Datum+Uhrzeit) nicht lesbar: {e}")
+            return {}
+        return {str(k).lower(): v for k, v in raw.items()}
+
+    def last_execution_datetime_for_hash(
+        self, plugin_id: str, instance_hash: str
+    ) -> str:
+        """Datum+Uhrzeit der letzten Ausfuehrung einer Parameter-Variante.
+
+        11.08.2026 (Bugfix Runde 16, Dropdown-Anzeige): Format 'DD.MM.JJ HH:MM'
+        (z. B. '23.04.26 22:14') - Fallback '--.--.-- --:--' ohne Eintraege
+        (bzw. ohne instance_hash). Rein lesend aus dem Refresh-Zustand.
+        """
+        if not plugin_id or not instance_hash:
+            return "--.--.-- --:--"
+        per_hash = self._last_execution_datetimes_by_hash.get(
+            str(plugin_id).lower(), {}) or {}
+        return per_hash.get(str(instance_hash), "--.--.-- --:--")
 
     def _collect_active_indicator_ids(self) -> Set[str]:
         """Sammelt alle indicator_ids/plugin_ids, die in offenen Chart-
@@ -17376,14 +18042,20 @@ class AnalyticsWindow(PersistentWindow):
     # Bugfix 04.08.2026 (Fenster-Historie): auto_restore=True – das Fenster
     # wird beim App-Start wiederhergestellt, wenn es beim Beenden der App
     # OFFEN war.
-    # 20.01 (E1): _keep_history_on_close = True – der Analytics-Workspace
-    # (vm.params + Layout) wird in instance_states.workspace_state
-    # persistiert und muss das manuelle Schliessen ueberleben
-    # (PersistentWindow.closeEvent loescht bei False den DB-Eintrag).
-    # Trade-off: ein manuell geschlossenes Analytics-Fenster wird beim
-    # naechsten Start wiederhergestellt (Dashboard-Fenster, kein Wegwerf-
-    # Fenster; Semantik bewusst abweichend von chart_win).
-    _keep_history_on_close = True
+    # 11.08.2026 (Bugfix Runde 17e, User-Meldung 2): _keep_history_on_close
+    # jetzt False – ein MANUELL geschlossenes Analytics-Fenster wird aus
+    # der Fenster-Historie entfernt (delete_instance) und beim naechsten
+    # App-Start NICHT wiederhergestellt (Historie intakt, konsistent mit
+    # ServiceWindow). Der Analytics-Workspace (vm.params + Layout)
+    # ueberlebt das manuelle Schliessen ueber ein global_settings-Backup
+    # ("analytics_workspace") und wird beim naechsten manuellen Oeffnen
+    # wiederhergestellt (siehe _save_workspace/_restore_workspace); die
+    # Fenster-Position ueberlebt ueber DIALOG_GEOMETRY_KEY (Muster
+    # ServiceWindow).
+    _keep_history_on_close = False
+    #: Geometrie-Key fuer die POSITION, die ein manuelles Schliessen
+    #: ueberlebt (global_settings, vgl. ServiceWindow-Muster).
+    DIALOG_GEOMETRY_KEY = "win_analytics"
 
     def __init__(
         self,
@@ -18323,9 +18995,11 @@ class AnalyticsWindow(PersistentWindow):
         """Persistiert den Analytics-Workspace (VM-Parameter + Layout).
 
         20.01: Payload = {"params": vm.params, "layout": {"page_index": ...}}.
-        Wird im closeEvent VOR super().closeEvent() ausgefuehrt, damit die
-        instance_states-Zeile (inkl. workspace_state) das Fenster ueberlebt
-        (E1: _keep_history_on_close = True).
+        Wird im closeEvent VOR super().closeEvent() ausgefuehrt. Seit Runde
+        17e (_keep_history_on_close=False) wird die instance_states-Zeile
+        beim manuellen Schliessen zwar geloescht - das Workspace-Backup in
+        global_settings ("analytics_workspace") ueberlebt und wird beim
+        naechsten manuellen Oeffnen wiederhergestellt.
         """
         try:
             # Runde 11 (Bug 3, B3-3): Entkoppelte Kopie statt Referenz -
@@ -18352,6 +19026,16 @@ class AnalyticsWindow(PersistentWindow):
             }
             self.state_manager.save_workspace_state(
                 self.INSTANCE_ID, payload)
+            # 11.08.2026 (Bugfix Runde 17e, User-Meldung 2): Zusaetzliches
+            # Backup in global_settings - es ueberlebt das MANUELLE
+            # Schliessen (delete_instance loescht die instance_states-Zeile)
+            # und wird beim naechsten manuellen Oeffnen wiederhergestellt
+            # (Fallback in _restore_workspace).
+            try:
+                self.state_manager.save_global_value(
+                    "analytics_workspace", payload)
+            except Exception:
+                pass
         except Exception as e:
             print(f"WARN [AnalyticsWindow] Workspace-Save fehlgeschlagen: {e}")
 
@@ -18368,6 +19052,15 @@ class AnalyticsWindow(PersistentWindow):
         except Exception as e:
             print(f"WARN [AnalyticsWindow] Workspace-Restore fehlgeschlagen: {e}")
             return
+        # 11.08.2026 (Bugfix Runde 17e, User-Meldung 2): Nach einem MANUELLEN
+        # Schliessen ist die instance_states-Zeile geloescht - Fallback auf
+        # das global_settings-Backup aus _save_workspace.
+        if not payload:
+            try:
+                payload = self.state_manager.get_global_value(
+                    "analytics_workspace")
+            except Exception:
+                payload = None
         if not payload:
             return
         self._vm.restore_workspace(payload)
@@ -18442,13 +19135,81 @@ class AnalyticsWindow(PersistentWindow):
         # 15.03-E: QUERY_FEATURES speiste das entfernte combo_feature-Dropdown –
         # ohne Feature-Dropdown ist keine Features-Metadaten-Abfrage noetig.
 
+    def save_state(self) -> None:
+        """Persistiert Fenster-POSITION und -GROESSE (inkl. Dialog-Fallback).
+
+        11.08.2026 (Bugfix Runde 17e, User-Meldung 2): Neben window_instances
+        wird die Geometrie zusaetzlich in global_settings gesichert
+        (DIALOG_GEOMETRY_KEY) – sie ueberlebt damit das manuelle Schliessen
+        (delete_instance loescht window_instances/instance_states) und wird
+        beim naechsten manuellen Oeffnen ueber den Fallback in
+        restore_state() wiederhergestellt (Muster ServiceWindow).
+        """
+        inst_id = self.get_instance_id()
+        if not inst_id:
+            return
+        try:
+            p = self.pos()
+            self._state_manager.save_dialog_geometry(
+                self.DIALOG_GEOMETRY_KEY, p.x(), p.y(),
+                self.width(), self.height())
+        except Exception:
+            pass
+        # Basis-Teil: window_instances-Geometrie + instance_states
+        # (Symbol/Timeframe via get_persistent_symbol/timeframe).
+        super().save_state()
+
+    def restore_state(self) -> None:
+        """Stellt Geometrie + Filter wieder her (inkl. Dialog-Fallback).
+
+        11.08.2026 (Bugfix Runde 17e, User-Meldung 2): Nach einem MANUELLEN
+        Schliessen existiert kein window_instances-Eintrag mehr – die
+        Position wird dann aus global_settings (DIALOG_GEOMETRY_KEY)
+        wiederhergestellt (Muster ServiceWindow). Der Rest (Symbol/
+        Timeframe/Workspace) laeuft ueber super().restore_state() bzw.
+        _initial_load -> _restore_workspace().
+        """
+        inst_id = self.get_instance_id()
+        if not inst_id:
+            return
+        # Window-Flags korrigieren (NUR bei unsichtbarem Fenster –
+        # setWindowFlags() auf sichtbarem Fenster bricht die Layout-
+        # Geometrie-Verwaltung, Bugfix Runde 17c).
+        if not self.isVisible():
+            self._fix_window_flags()
+        geom = self._state_manager.get_window_geometry(inst_id)
+        if not geom:
+            try:
+                geom = self._state_manager.get_dialog_geometry(
+                    self.DIALOG_GEOMETRY_KEY)
+            except Exception:
+                geom = None
+        if geom:
+            pos_x = geom.get("pos_x")
+            pos_y = geom.get("pos_y")
+            width = geom.get("width")
+            height = geom.get("height")
+            screen_geo = QApplication.primaryScreen().availableGeometry()
+            if width and height:
+                self.resize(max(int(width), 640), max(int(height), 480))
+            if pos_x is not None and pos_y is not None:
+                if pos_x < screen_geo.x() - 100 or pos_x > screen_geo.right() or \
+                   pos_y < screen_geo.y() - 100 or pos_y > screen_geo.bottom():
+                    pos_x, pos_y = 100, 100
+                self.move(pos_x, pos_y)
+            self._restored_is_maximized = bool(geom.get("is_maximized", False))
+        # Symbol/Timeframe (instance_states) ueber die Basis wiederherstellen.
+        super().restore_state()
+
     def closeEvent(self, event) -> None:
         """Stoppt Debounce + Worker und persistiert den Workspace.
 
-        Der Fenster-Historie-Eintrag bleibt dank _keep_history_on_close =
-        True erhalten, damit Symbol/Timeframe UND Workspace
-        (instance_states.workspace_state) beim naechsten Oeffnen
-        wiederhergestellt werden (20.01 E1).
+        11.08.2026 (Bugfix Runde 17e, User-Meldung 2): _keep_history_on_close
+        = False – der Fenster-Historie-Eintrag wird beim MANUELLEN
+        Schliessen entfernt (kein Wiedererscheinen beim Neustart). Der
+        Workspace (instance_states.workspace_state + global_settings-Backup)
+        wird hier VOR super().closeEvent() gespeichert und beim naechsten
+        manuellen Oeffnen wiederhergestellt.
         """
         try:
             self._vm.shutdown()
@@ -19335,6 +20096,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
     QLabel,
+    QSizePolicy,
     QSlider,
     QVBoxLayout,
     QWidget,
@@ -19757,7 +20519,11 @@ class HeatmapWidget(QWidget):
         # 20.02.01 (User-Meldung 3a): 'Feld' deutlich laenger (Eintraege
         # tragen seit Meldung 3b den Service-Prefix '{Service} / {Key}').
         self._combo_field.setMinimumWidth(320)
-        self._combo_field.setMaximumWidth(460)
+        # Runde 16 (Bugfix 3, 11.08.2026): Kein MaximumWidth mehr - das
+        # Feld-Dropdown darf in der Zoom-Y-Zeile bis zum Canvas-Ende
+        # wachsen (Expanding-Policy + Layout-Stretch).
+        self._combo_field.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed)
         # Popup-Dropdown an den laengsten Eintrag anpassen (vollstaendige
         # '{Service} / {Key}'-Texte sichtbar statt Ellipsis).
         self._combo_field.setSizeAdjustPolicy(QComboBox.AdjustToContents)
@@ -19767,10 +20533,6 @@ class HeatmapWidget(QWidget):
         ctrl.addWidget(self._combo_x)
         ctrl.addWidget(QLabel("Y-Achse:"))
         ctrl.addWidget(self._combo_y)
-        ctrl.addWidget(QLabel("Aggregation:"))
-        ctrl.addWidget(self._combo_agg)
-        ctrl.addWidget(QLabel("Feld:"))
-        ctrl.addWidget(self._combo_field)
         ctrl.addStretch(1)
 
         # --- Steuerung (Zeile 2: Overlay + Zoom) ---
@@ -19795,8 +20557,16 @@ class HeatmapWidget(QWidget):
         ctrl2.addWidget(self._slider_zoom_x)
         ctrl2.addWidget(QLabel("Zoom Y:"))
         ctrl2.addWidget(self._slider_zoom_y)
+        # Runde 16 (Bugfix 2/3, 11.08.2026): Aggregation + Feld sind aus
+        # Zeile 1 in die Zoom-Y-Zeile gewandert (rechts neben Zoom Y, mit
+        # Abstand; 'Feld' stretcht bis zum Canvas-Ende).
+        ctrl2.addSpacing(15)
+        ctrl2.addWidget(QLabel("Aggregation:"))
+        ctrl2.addWidget(self._combo_agg)
+        ctrl2.addSpacing(10)
+        ctrl2.addWidget(QLabel("Feld:"))
+        ctrl2.addWidget(self._combo_field, 1)
         ctrl2.addWidget(self._label_info)
-        ctrl2.addStretch(1)
 
         # --- Plot: Heatmap + Kerzen-Overlay im SELBEN Canvas (Bugfix 1) ---
         self._plot_hm = pg.PlotWidget()
@@ -19893,13 +20663,21 @@ class HeatmapWidget(QWidget):
         return self._chk_candle.isChecked()
 
     def request_data(self) -> None:
-        """Fordert generische Heatmap (+ Tages-Ohlc bei Overlay) an."""
+        """Fordert generische Heatmap (+ Tages-Ohlc bei Overlay) an.
+
+        Runde 15 (Ultra-Low-Latency, Fix 1): QUERY_FEATURES wird VOR der
+        Grafik in die Puffer-Queue gelegt – der leichte Metadaten-Pfad
+        (Reader-Cache, KEIN Heatmap-Pivot) fuellt das 'Feld'-Dropdown und
+        die '(No Data)'-Hinweise, waehrend die teure Pivot-Aggregation
+        danach in einem separaten Worker laeuft. Das Dropdown blockiert
+        damit nicht mehr mehrere Sekunden auf der Grafik.
+        """
         if self._view_model is None:
             return
+        self._view_model.request_features()
         self._view_model.request_heatmap_generic()
-        # Runde 12 (Option A): Die No-Data-Varianten kommen IM SELBEN
-        # QUERY_HEATMAP_GENERIC-Payload (kein separater QUERY_FEATURES-
-        # Roundtrip mehr) - das Dropdown aktualisiert sich mit der Grafik.
+        # Runde 12 (Option A): Zusaetzlich kommen die No-Data-Varianten im
+        # QUERY_HEATMAP_GENERIC-Payload (Konsistenz nach dem Render).
         if self._chk_candle.isChecked():
             self._view_model.request_daily_ohlc()
 
@@ -20364,10 +21142,26 @@ class HeatmapWidget(QWidget):
         fehlgeschlagenen Check. Stale-Payloads werden verworfen
         (Generation-Guard). Danach wird das 'Feld'-Dropdown aus dem Cache
         neu abgeleitet (die '(No Data)'-Items erscheinen/verschwinden).
+
+        Runde 15 (Fix 1, Ultra-Low-Latency): Der QUERY_FEATURES-Payload
+        traegt jetzt zusaetzlich `metrics`/`field_sources` (Feld-Metadaten,
+        Repository `_field_metadata`) – das 'Feld'-Dropdown wird damit
+        BEREITS aus dem leichten Metadaten-Query gefuellt (KEIN Warten auf
+        die teure Heatmap-Pivot-Aggregation).
         """
         if not self._cache_no_data_from_payload(data):
             return
-        self._rebuild_field_dropdown(self._field_keys, self._field_sources)
+        # Runde 15 (Fix 1): Feld-Metadaten aus dem Leicht-Payload uebernehmen
+        # (falls vorhanden) – sonst bleibt der bestehende Widget-Cache.
+        keys = [str(m) for m in (data.get("metrics") or [])
+                if m not in ("count", "confluence_count")]
+        field_sources = data.get("field_sources")
+        if keys or field_sources:
+            self._rebuild_field_dropdown(
+                keys,
+                field_sources if isinstance(field_sources, dict) else {})
+        else:
+            self._rebuild_field_dropdown(self._field_keys, self._field_sources)
 
     def _on_query_failed(self, kind: str, _error: str) -> None:
         """Runde 11 (Bug 4, B4-2): Fehlerzustand des No-Data-Checks.
@@ -20576,7 +21370,48 @@ class HeatmapWidget(QWidget):
             name = self._view_model.resolve_service_display_name(
                 str(service_ids[0]))
             if name:
-                return f"{name} / {str(key)}"
+                label = f"{name} / {str(key)}"
+                # Runde 16 (Bugfix 1, 11.08.2026): Gecheckte Variante +
+                # Datum der letzten Ausfuehrung an den Eintrag anhaengen
+                # ('{Name} / {Key} / {Preset} / DD.MM.JJ HH:MM' - der
+                # Service-Name ohne `srv_`-Praefix, Preset 'Default' wird
+                # uebersprungen, Datum ohne Eintraege wird ausgelassen).
+                # Defensiv via getattr: Fake-/Alt-ViewModels (z. B. in
+                # Tests) ohne `checked_variant` ergeben keinen Anhang.
+                variant = None
+                _cv = getattr(self._view_model, "checked_variant", None)
+                if callable(_cv):
+                    try:
+                        variant = _cv(str(service_ids[0]))
+                    except Exception:
+                        variant = None
+                if variant:
+                    preset = str(variant.get("preset_name") or "").strip()
+                    if preset and preset.lower() != "default":
+                        label = f"{label} / {preset}"
+                    exec_date = str(
+                        variant.get("exec_datetime") or "").strip()
+                    if exec_date and not exec_date.startswith("--."):
+                        label = f"{label} / {exec_date}"
+                else:
+                    # Runde 16c (Bugfix 1, 11.08.2026, User-Meldung):
+                    # Services OHNE Varianten (Standalone, keine Presets)
+                    # bekommen das Datum+Uhrzeit der letzten Ausfuehrung
+                    # angehaengt ('{Name} / {Key} / DD.MM.JJ HH:MM', z. B.
+                    # '23.04.26 22:14'), wenn vorhanden. Defensiv via
+                    # getattr: Fake-/Alt-ViewModels ohne die Methode
+                    # ergeben keinen Anhang.
+                    _sd = getattr(self._view_model,
+                                  "service_execution_datetime", None)
+                    if callable(_sd):
+                        try:
+                            exec_date = str(
+                                _sd(str(service_ids[0])) or "").strip()
+                            if exec_date and not exec_date.startswith("--."):
+                                label = f"{label} / {exec_date}"
+                        except Exception:
+                            pass
+                return label
         return str(key)
 
     def _rebuild_field_dropdown(
@@ -20714,8 +21549,27 @@ class HeatmapWidget(QWidget):
         QUERY_FEATURES-Kompatibilitaetspfad ohne Hash-Filter). Die
         gewaehlte Variante ist in Runde 13 immer Teil des Abschnitts -
         die B4-5-Inline-Ergaenzung greift nur noch bei Defensiv-Luecken.
+
+        Runde 13c (Kernwunsch): Bei leerem feature_ids-Filter (leer =
+        kein Filter = alle Features) wird KEIN '(No Data)'-Abschnitt UND
+        kein No-Data-Fehlerhinweis gerendert - der Button 'Aktive Filter
+        entfernen' zeigt danach wieder alle Features ohne NoData-Rauschen
+        (der VM-Snapshot liefert bei leerem Filter bereits keine
+        Varianten; dieser Guard schuetzt zusaetzlich gegen Alt-/
+        Stale-Payloads).
         """
         if self._view_model is None:
+            return
+        p = self._view_model.params
+        # Runde 12 (Punkt 4) + Runde 13c (Kernwunsch): Nur Services im
+        # aktiven feature_ids-Filter duerfen NoData-Hinweise liefern.
+        # Leerer Filter (leer = kein Filter = alle Features) -> KEINE
+        # Hinweise (auch kein Fehler-/Loading-Hinweis), damit der Button
+        # 'Aktive Filter entfernen' alle Features ohne NoData-Rauschen
+        # zeigt.
+        active_ids = {str(f).strip().lower()
+                      for f in (p.get("feature_ids") or [])}
+        if not active_ids:
             return
         if self._no_data_variants_error:
             self._combo_field.add_disabled_item(
@@ -20723,13 +21577,6 @@ class HeatmapWidget(QWidget):
             return
         if self._no_data_variants is None:
             return  # Loading: Payload steht noch aus (kein Hinweis noetig)
-        p = self._view_model.params
-        # Runde 12 (Punkt 4): Nur Services im aktiven feature_ids-Filter
-        # (leer = kein Filter = alle) - nicht angehakte Services werden
-        # nicht als '(No Data)' angezeigt. Runde 13: defensiv (der Reader
-        # filtert bereits nach feature_ids).
-        active_ids = {str(f).strip().lower()
-                      for f in (p.get("feature_ids") or [])}
         # Runde 13: `instance_hashes` ist seit dem MasterTree-Fix auch fuer
         # Set-Instanz-Varianten (TYPE_SERVICE) gefuellt. Der Reader filtert
         # den Payload bereits danach - hier defensiv gegen Alt-Payloads.
@@ -20741,9 +21588,16 @@ class HeatmapWidget(QWidget):
             filtered = [v for v in filtered
                         if str(v.get("plugin_id") or "").strip().lower()
                         in active_ids]
+        # Runde 16 (Bugfix Mischbetrieb, User-Meldung 5/6, 11.08.2026):
+        # Hash-lose Varianten (Standalone-Services wie srv_trend_breakout
+        # und NULL-Hash-Alt-Bestand) werden UEBER `feature_ids` gecheckt -
+        # eine aktive Hash-Auswahl darf sie nicht aus dem '(No Data)'-
+        # Abschnitt werfen (sonst verschwinden Services im Mischbetrieb
+        # aus dem Feld-Dropdown, obwohl sie gecheckt sind).
         if active_hashes:
             filtered = [v for v in filtered
-                        if str(v.get("instance_hash") or "").strip().lower()
+                        if not str(v.get("instance_hash") or "").strip()
+                        or str(v.get("instance_hash") or "").strip().lower()
                         in active_hashes]
         if not filtered and self._selected_no_data_variant(variants) is None:
             return
@@ -20796,6 +21650,13 @@ class HeatmapWidget(QWidget):
         aktiv war - die Runde-12b-Einschraenkung (kein Fallback bei nicht
         leerem instance_hashes) war unvollstaendig, weil `instance_hashes`
         fuer Set-Instanz-Varianten bis Runde 13 leer blieb.
+
+        Runde 13c (Bug 1-Absicherung): Falls ein Payload aus einem Alt-/
+        Kompatibilitaetspfad doch mehrere No-Data-Varianten desselben
+        Services enthaelt, gewinnt DEFENSIV die im ServicePicker gecheckte
+        Variante (instance_hash in `instance_hashes`) statt der ersten
+        Liste. Erst ohne Hash-Match faellt die Auswahl auf den ersten
+        Service-Treffer zurueck (hash-lose Variante/kein Filter).
         """
         if not variants:
             return None
@@ -20818,6 +21679,22 @@ class HeatmapWidget(QWidget):
         # Feld-Services im Payload IST die ausgewaehlte - kein Fallback auf
         # die 'erste Variante' mehr (die gecheckte Variante gewinnt, weil
         # nur sie im Payload steht).
+        #
+        # Runde 13c (Bug 1-Absicherung): Bei mehreren No-Data-Varianten
+        # desselben Services gewinnt DEFENSIV die im ServicePicker gecheckte
+        # Variante (instance_hash in active_hashes) statt der ersten Liste
+        # - falls der Payload aus einem Alt-/Kompatibilitaetspfad doch
+        # mehrere Varianten enthaelt. Erst wenn kein Hash-Match vorliegt
+        # (hash-lose Variante/kein Filter), faellt die Auswahl auf den
+        # ersten Service-Treffer zurueck.
+        p_hashes = {str(h).strip().lower()
+                    for h in (p.get("instance_hashes") or [])}
+        if p_hashes:
+            for v in variants:
+                if (str(v.get("plugin_id") or "").strip().lower() == sid
+                        and str(v.get("instance_hash") or "").strip().lower()
+                        in p_hashes):
+                    return v
         for v in variants:
             if str(v.get("plugin_id") or "").strip().lower() == sid:
                 return v
@@ -35144,8 +36021,16 @@ class ServiceParamColumnsMixin:
             return
         try:
             box.updateGeometry()
-            box.resize(box.layout().sizeHint())
+            # 11.08.2026 (Bugfix Runde 17c, User-Meldung 5): Bei einer
+            # _param_scroll mit widgetResizable=True streckt die ScrollArea
+            # die Box automatisch auf den Viewport – ein manuelles resize auf
+            # die Layout-Groesse wuerde sie wieder zuruecksetzen. NUR bei
+            # widgetResizable=False (Alt-Verhalten) wird die Box weiterhin
+            # explizit auf ihre Layout-Groesse gesetzt. _DialogParamHost hat
+            # keinen _param_scroll -> resize bleibt aktiv (Layout streckt).
             scroll = getattr(self, "_param_scroll", None)
+            if scroll is None or not scroll.widgetResizable():
+                box.resize(box.layout().sizeHint())
             if scroll is not None:
                 scroll.updateGeometry()
             # Bugfix 05.08.2026 (Punkt 1): Der QSplitter fixiert die
@@ -38357,7 +39242,7 @@ Diese Datei re-exportiert die öffentliche API, damit bestehende Aufrufe
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from PySide6.QtCore import QFile, QIODevice, QTimer, Qt, Slot
+from PySide6.QtCore import QFile, QIODevice, QSize, QTimer, Qt, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QGroupBox, QHBoxLayout,
@@ -38427,10 +39312,21 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
     #: Geometrie-Key fuer die POSITION, die ein manuelles Schliessen
     #: ueberlebt (global_settings, vgl. IndicatorSettingsDialog-Muster).
     DIALOG_GEOMETRY_KEY = "win_service"
-    # 05.08.2026: Die FensterGROESSE folgt immer exakt dem Inhalt (auch
-    # schrumpfen) – NUR die Position wird persistiert (save_state/restore_state
-    # Overrides weiter unten). Ermoeglicht durch ContentScrollMixin.
-    _exact_fit_to_content = True
+    # 05.08.2026: Die FensterGROESSE folgte exakt dem Inhalt (auch schrumpfen).
+    # 11.08.2026 (Bugfix Runde 17c, User-Meldung 4/5): Umgestellt – der INHALT
+    # folgt jetzt dem FENSTER (normales resizable Fenster): _exact_fit_to_content
+    # = False bedeutet 'nur wachsen, nie schrumpfen' (Mixin-Pfad). Das Fenster
+    # kann manuell grossgezogen und maximiert werden; widgetResizable=True
+    # streckt den Inhalt auf den Viewport (Splitter, MasterTree, Param-Box).
+    _exact_fit_to_content = False
+    # 11.08.2026 (Bugfix, Slider): Mindest-Breite des FENSTERS ueber der
+    # Splitter-Minima-Summe (Tree 400 + Panel 520 = 920). Dadurch hat der
+    # QSplitter IMMER Spielraum - der Slider zwischen den beiden Hauptrahmen
+    # bleibt beweglich, auch wenn der Inhalt schmal ist (vorher klebte das
+    # Fenster exakt am Inhalt und der Slider war fixiert). ContentScrollMixin
+    # resizet das Inhalt-Widget dabei auf die Fensterbreite (Splitter fuellt
+    # den Spielraum). Screen-Klemme schuetzt kleine Bildschirme.
+    _min_window_width = 1100
 
     def __init__(self, parent=None, service_set_repo: Optional[ServiceSetRepository] = None):
         super().__init__(parent)
@@ -38496,10 +39392,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # unter dem Log (siehe right_panel-Aufbau weiter unten).
         if self.text_log:
             fm = self.text_log.fontMetrics()
-            # 10.08.2026 (Bugfix): Log-Hoehe von 4 auf 2 Zeilen reduziert
-            # (zwei Zeilen hoeher als der Default war ein Fehler).
-            self.text_log.setMaximumHeight(fm.lineSpacing() * 2 + 12)
-            self.text_log.setMinimumHeight(fm.lineSpacing() * 2 + 12)
+            # 11.08.2026 (User-Nachtrag): Log-Hoehe 6 Zeilen = 2 Zeilen
+            # HOEHER als die 4-Zeilen-Stufe (die 10.08.-Reduktion auf 2 ist
+            # damit zweifach ueberholt).
+            self.text_log.setMaximumHeight(fm.lineSpacing() * 6 + 12)
+            self.text_log.setMinimumHeight(fm.lineSpacing() * 6 + 12)
 
         # Phase 13 5.4 Schritt 1: Dynamische Service-Spalten (Breite/Höhe aus
         # dem Inhalt – KEINE fixen Pixelwerte). Das Inhalt-Layout erhält
@@ -38517,9 +39414,15 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self.widget_service_columns.setObjectName("widget_service_columns")
         self.service_columns_layout = QHBoxLayout(self.widget_service_columns)
         self.service_columns_layout.setSpacing(6)
-        # Inhalt-Widget + Layout VOR dem Scroll-Wrapper referenzieren
-        # (install_content_scroll ersetzt das CentralWidget von self.ui).
-        self.content_widget = self.ui.centralWidget()
+        # Inhalt-Widget + Layout VOR dem Scroll-Wrapper referenzieren.
+        # 11.08.2026 (Bugfix Runde 17c, User-Meldung 4): self.ui ist seit der
+        # .ui-Umstellung (QMainWindow -> QWidget) das WIDGET mit dem Layout
+        # selbst (kein centralwidget-Zwischenschritt mehr). Das frueher hier
+        # eingebettete QMainWindow wuchs NICHT mit dem Fenster (Qt verlangt
+        # QMainWindow nur als Top-Level) - Ursache fuer 'Grossziehen ohne
+        # Anpassung'. install_content_scroll setzt die ScrollArea jetzt direkt
+        # als CentralWidget von self (siehe unten).
+        self.content_widget = self.ui
         self.central_layout = self.content_widget.layout() if self.content_widget else None
         if self.central_layout is not None:
             # Bugfix 05.08.2026 (Layout-Bereinigung Phase 13): ZWEI-SPALTEN-
@@ -38585,10 +39488,12 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             # horizontalen Scrollbalken passen - bei mehr Services/Spalten
             # scrollt die ContentScrollArea.
             self._param_scroll = ContentScrollArea()
-            self._param_scroll.setWidgetResizable(False)
+            # 11.08.2026 (Bugfix Runde 17c, User-Meldung 5): widgetResizable
+            # = True + KEINE max. Breite/Hoehe mehr – die Service-Parameter-
+            # Box passt sich der Fenstergroesse an (vorher auf 1000x1240
+            # gedeckelt; beim Grossziehen blieb sie stehen).
+            self._param_scroll.setWidgetResizable(True)
             self._param_scroll.setWidget(self.widget_service_columns)
-            self._param_scroll.setMaximumHeight(1240)
-            self._param_scroll.setMaximumWidth(1000)
             param_layout.addWidget(self._param_scroll, 1)
             # Aktions-Leiste direkt UNTER der Parameter-Box - [Speichern]
             # persistiert die Parameter-Aenderungen ohne Neuberechnung;
@@ -38617,11 +39522,16 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.main_splitter = QSplitter(Qt.Horizontal)
             self.main_splitter.addWidget(self.right_panel)
             self.main_splitter.addWidget(self._param_panel)
-            self.main_splitter.setStretchFactor(0, 3)
-            self.main_splitter.setStretchFactor(1, 2)
+            # 11.08.2026 (Bugfix, Slider): KEINE setStretchFactor-Aufrufe mehr -
+            # die 3:2-Faktoren erzwangen bei jedem Fenster-Reflow die Verteilung
+            # und machten den Slider zaeh (die Anwenderposition sprang zurueck).
+            # Der QSplitter behaelt jetzt die vom Anwender gezogene Position.
             # Keine Spalte unter ihre Mindestgroesse kollabieren lassen.
             self.main_splitter.setCollapsible(0, False)
             self.main_splitter.setCollapsible(1, False)
+            # 11.08.2026 (Bugfix, Slider): Der Handle wird dicker (8px statt
+            # 4px Default) - besser greifbar/ziehbar.
+            self.main_splitter.setHandleWidth(8)
             # 10.08.2026 (Bugfix, Slider): Startgroessen einmalig setzen -
             # danach behaelt der QSplitter die Position des Anwenders
             # (_resize_param_box_deferred waechst nur noch, siehe
@@ -38639,7 +39549,15 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # (ContentScrollMixin). Der Inhalt behält seine natürliche Größe; das
         # Fenster wird auf den Bildschirm geklemmt (Scrollbars erscheinen erst,
         # wenn der Inhalt den Viewport übersteigt).
-        self.install_content_scroll(self.content_widget, install_to=self.ui)
+        self.install_content_scroll(self.content_widget, install_to=self)
+        # 11.08.2026 (Bugfix Runde 17c, User-Meldung 4): widgetResizable=True
+        # – die ContentScrollArea streckt das Inhalt-Widget auf den Viewport.
+        # Beim manuellen Grossziehen (Rahmen/Ecke) wachsen Splitter, MasterTree
+        # und Param-Box mit (vorher widgetResizable=False: Inhalt blieb stehen,
+        # das Fenster wurde nur leer groesser). Nur ServiceWindow; der
+        # IndicatorSettingsDialog (anderer Mixin-Nutzer) bleibt unveraendert.
+        if self.content_scroll is not None:
+            self.content_scroll.setWidgetResizable(True)
         self.main_layout = self.ui.layout()
         # KEIN SetFixedSize auf dem QMainWindowLayout: das würde die
         # Fenstergröße auf den Inhalt fixieren und das Bildschirm-Cap
@@ -38651,7 +39569,15 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # jedem Reflow explizit auf die aktuelle Layout-Größe (ContentScrollMixin).
         if self.central_layout is not None:
             self.central_layout.setSpacing(6)
-            self.central_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+            # 11.08.2026 (Bugfix Runde 17d, User-Meldungen 4+5): KEIN
+            # setAlignment(AlignTop|AlignLeft) mehr - es HIELT die Layout-
+            # Verteilung an: Der QSplitter (MasterTree | Parameter-Box) blieb
+            # auf seiner Mindest-Hoehe stehen, obwohl das Fenster groesser
+            # gezogen/maximiert wurde (extra Raum blieb als Leerflaeche
+            # unterhalb des Splitters). Mit widgetResizable=True +
+            # _exact_fit_to_content=False folgt der INHALT dem FENSTER: Der
+            # Splitter faengt das Wachstum ab und verteilt es an MasterTree
+            # (Hoehe!) und Parameter-Box (Breite + Hoehe).
         self._service_param_controls: Dict[Any, QWidget] = {}
         # Phase 14 P14-01: Beschreibungs-Eingabefelder der Service-Instanzen
         self._service_desc_controls: Dict[str, QWidget] = {}
@@ -38728,12 +39654,12 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
     # --- PersistentWindow-Interface ---
 
     def save_state(self) -> None:
-        """Persistiert die Fenster-POSITION (05.08.2026, Punkt 1).
+        """Persistiert Fenster-POSITION und -GROESSE (05.08.2026, Punkt 1).
 
-        Die Fenster-GROESSE wird bewusst NICHT wiederhergestellt – sie folgt
-        immer exakt dem Inhalt (resize_to_clamped_content, _exact_fit_to_content).
-        Ein fester Groessenwert wuerde das exakte Anpassen an Tree/Log/Box
-        (Punkte 3+4) unterlaufen. Position + Symbol/Timeframe bleiben erhalten.
+        11.08.2026 (Bugfix Runde 17c): Seit _exact_fit_to_content=False folgt
+        der Inhalt dem Fenster – die GROESSE wird jetzt wiederhergestellt
+        (restore_state), damit die manuell gezogene/Maximize-Groesse des Users
+        erhalten bleibt. Position + Symbol/Timeframe bleiben weiterhin erhalten.
 
         06.08.2026 (History-Bug): Die POSITION wird zusaetzlich in
         global_settings gesichert (save_dialog_geometry). Beim manuellen
@@ -38779,7 +39705,13 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         if not inst_id:
             return
         # Window-Flags korrigieren (QUiLoader setzt oft Qt.Tool | Qt.Dialog).
-        self._fix_window_flags()
+        # 11.08.2026 (Bugfix Runde 17c): Nur wenn das Fenster noch NICHT
+        # sichtbar ist - setWindowFlags() auf einem sichtbaren Fenster bricht
+        # die Layout-Geometrie-Verwaltung (Inhalt folgt dem Resize nicht
+        # mehr). Die Flags werden seit Runde 17c bereits im Konstruktor
+        # (PersistentWindow.__init__) gesetzt, wo das Fenster unsichtbar ist.
+        if not self.isVisible():
+            self._fix_window_flags()
         geom = self._state_manager.get_window_geometry(inst_id)
         if not geom:
             try:
@@ -38790,7 +39722,14 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         if geom:
             pos_x = geom.get("pos_x")
             pos_y = geom.get("pos_y")
+            width = geom.get("width")
+            height = geom.get("height")
             screen_geo = QApplication.primaryScreen().availableGeometry()
+            # 11.08.2026 (Bugfix Runde 17c, User-Meldung 4): Fenster-GROESSE
+            # wiederherstellen – vorher bewusst ignoriert (exakt-fit-to-content).
+            # Mit _exact_fit_to_content=False bleibt die User-Groesse erhalten.
+            if width and height:
+                self.resize(max(int(width), 640), max(int(height), 480))
             if pos_x is not None and pos_y is not None:
                 if pos_x < screen_geo.x() - 100 or pos_x > screen_geo.right() or \
                    pos_y < screen_geo.y() - 100 or pos_y > screen_geo.bottom():
@@ -38825,6 +39764,60 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             sp.updateGeometry()
             self._invalidate_content_caches()
         super()._apply_reflow_size()
+
+    def resize_to_clamped_content(self) -> None:
+        """11.08.2026 (Bugfix Runde 17c, User-Meldung 4): Override.
+
+        Das Basis-Mixin resizet das Inhalt-Widget MANUELL (auf sizeHint bzw.
+        auf die Fensterbreite). Mit widgetResizable=True (Runde 17c) verwaltet
+        die ContentScrollArea das Inhalt-Widget aber selbst - das manuelle
+        resize() brach die Layout-Verwaltung und 'fror' die ScrollArea auf der
+        alten Groesse ein (Inhalt folgte dem Fenster-Resize nicht mehr).
+
+        Daher wird hier NUR die FENSTER-Groesse nachgefuehrt:
+          * nur wachsen, nie schrumpfen (User darf frei ziehen/verkleinern),
+          * Screen-Klemme (max. verfuegbare Flaeche),
+          * _min_window_width (Splitter-Spielraum, ServiceWindow=1100).
+        Das Inhalt-Widget (Splitter, MasterTree, Param-Box) folgt der
+        ScrollArea automatisch (widgetResizable=True).
+        """
+        if self._content_widget is None:
+            return
+        content = self.clamped_content_size()
+        frame = self.frameGeometry().size() - self.size()
+        desired = QSize(content.width() + frame.width(),
+                        content.height() + frame.height())
+        screen = QApplication.primaryScreen().availableGeometry()
+        current = self.size()
+        new_w = min(max(desired.width(), current.width()), screen.width())
+        new_h = min(max(desired.height(), current.height()), screen.height())
+        min_w = getattr(self, '_min_window_width', 0) or 0
+        if min_w:
+            new_w = max(new_w, min(min_w, screen.width()))
+        if not self.isMaximized():
+            self.resize(new_w, new_h)
+
+    def apply_screen_cap(self) -> None:
+        """11.08.2026 (Bugfix Runde 17d2, User-Meldung 1): KEIN setMaximumSize.
+
+        Qt's Windows-QPA zeigt/aktiviert den Maximize-Button NUR, wenn
+        maximumSize() == QWINDOWSIZE_MAX (16777215) ist (oder
+        Qt::CustomizeWindowHint gesetzt ist) - siehe qwindowswindow.cpp,
+        shouldShowMaximizeButton(): 'return (flags & Qt::CustomizeWindowHint)
+        || w->maximumSize() == QSize(QWINDOWSIZE_MAX, QWINDOWSIZE_MAX);'.
+
+        Das bisherige setMaximumSize(screen.size()) (Runde 17b) bzw.
+        setMaximumSize(screen.size()*2) (Runde 17c) war NIE gleich
+        QWINDOWSIZE_MAX -> Windows graute den Maximize-Button weiterhin aus.
+
+        Mit widgetResizable=True + _exact_fit_to_content=False ist die
+        Screen-Klemme der DEFAULT-Groesse Aufgabe des Reflows
+        (resize_to_clamped_content klemmt auf availableGeometry). Ein
+        OS-seitiges Maximum ist nicht noetig: Das Fenster behaelt die
+        Qt-Defaults (max = QWINDOWSIZE_MAX) und kann frei maximiert werden
+        (der Inhalt folgt via ContentScrollArea).
+        """
+        pass  # bewusst KEIN setMaximumSize - Maximize-Button bleibt aktiv
 
     def get_persistent_symbol(self) -> str:
         return self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
@@ -42483,6 +43476,224 @@ print("OK - heatmap_widget: prev_field aus restaurierten params")
 
 --------------------------------------------------
 
+### DATEI: test/_migrate_feature_data.py
+```py
+# test/_migrate_feature_data.py
+"""EINMALIGE Migration: feature_data-JSON aus Alt-Spalten befuellen.
+
+Hintergrund (Bugfix Dropdown-NoData, Runde 13c, 10.08.2026): Der Reader
+definiert 'hat Daten' AUSSCHLIESSLICH ueber die feature_data-JSON-Spalte
+(seit dem 19.02-Cleanup; die nativen Legacy-Spalten sind nur noch
+Alt-Restbestand). Die Alt-Rows von srv_proximity (SILVER M1-M30, ~593K)
+und native (3000) tragen ihre Werte NUR in den Alt-Spalten
+(ema_diff/atr_normalized/grid_nearest_level/grid_dist_abs/grid_dist_pct/
+is_time_window_active) – feature_data ist NULL. Dadurch meldet der Reader
+fuer diese Services '(No Data)', obwohl 99K M1-Zeilen existieren.
+
+Diese Migration fuehrt die Alt-Spalten 1:1 in feature_data-JSON-Keys ueber
+(verlustfrei; identische Key-Namen wie die Spalten) plus das Pflichtfeld
+schema_version '1.0.0' (E-3, Reader-Default). Damit werden die Alt-Rows
+fuer den Reader/analytics (feature_keys_by_service, fetch_columns,
+generische Heatmap) sichtbar.
+
+Nur Zeilen mit feature_data IS NULL werden angefasst. Es wird VORHER ein
+Backup unter test/backup_analytics_before_fd_migration.duckdb erstellt.
+
+Aufruf:
+    .venv\\Scripts\\python.exe test\\_migrate_feature_data.py
+"""
+import shutil
+import sys
+import os
+from pathlib import Path
+
+sys.stdout.reconfigure(encoding="utf-8")
+
+BASE = Path(__file__).resolve().parent.parent
+DB = BASE / "data" / "analytics.duckdb"
+BACKUP = BASE / "test" / "backup_analytics_before_fd_migration.duckdb"
+
+# Spalten-Mapping: feature_data-JSON-Key -> Alt-Spalte (nur Spalten, die
+# in der DB tatsaechlich befuellt vorkommen; diag _diag_migrate.py).
+COLUMN_MAPPING = {
+    "ema_diff": "ema_diff",
+    "atr_normalized": "atr_normalized",
+    "grid_nearest_level": "grid_nearest_level",
+    "grid_dist_abs": "grid_dist_abs",
+    "grid_dist_pct": "grid_dist_pct",
+    "is_time_window_active": "is_time_window_active",
+}
+
+
+def main() -> None:
+    if not DB.exists():
+        print(f"FEHLER: DB {DB} nicht gefunden.")
+        sys.exit(1)
+
+    import duckdb
+
+    # --- Backup (nur einmal; existierendes Backup nicht ueberschreiben) ---
+    if not BACKUP.exists():
+        shutil.copy2(DB, BACKUP)
+        print(f"Backup erstellt: {BACKUP}")
+    else:
+        print(f"Backup existiert bereits: {BACKUP} (nicht ueberschrieben)")
+
+    con = duckdb.connect(str(DB))
+
+    # --- Bestand vorher ---
+    before = con.execute("""
+        SELECT feature_id, COUNT(*) FROM feature_store
+        WHERE feature_data IS NULL
+        GROUP BY 1 ORDER BY 1
+    """).fetchall()
+    print("=== Rows mit feature_data IS NULL (vorher) ===")
+    for fid, n in before:
+        print(f"  {fid:26s} {n}")
+
+    # --- SQL: je Zeile ein JSON-Objekt aus den nicht-NULL Alt-Spalten ---
+    # DuckDB json_object baut aus key/value-Paaren. Fuer 'nur nicht-NULL'
+    # bauen wir dynamisch: json_object wird ueber CASE je Spalte ergaenzt.
+    json_expr = (
+        "json_object("
+        + ", ".join(
+            f"'{key}', {col}" for key, col in COLUMN_MAPPING.items()
+        )
+        + ", 'schema_version', '1.0.0')"
+    )
+    # Hinweis: json_object mit NULL-Werten erzeugt JSON 'null' fuer die
+    # Spalte. Damit die Keys nur bei befuellten Spalten stehen, wird je
+    # Spalte ein Filter verwendet:
+    #   json_object_keep_null ist nicht noetig – wir bauen das Objekt aus
+    #   einer Liste der befuellten Paare via array + json_object.
+    # DuckDB bietet dazu: json_object(key, val, ...) haengt bei NULL einen
+    # JSON-null-Wert an. Stattdessen bauen wir das Objekt dynamisch pro
+    # Zeile mit `json_object(array(...))`? DuckDB hat keinen direkten
+    # Builder aus Arrays. Einfachster verlustfreier Weg: alle Mapping-Spalten
+    # als Keys mit ggf. JSON null - der Reader/_normalize_feature_data
+    # toleriert null-Werte (available_feature_keys ignoriert sie bei
+    # numeric_only). KEYS sind damit stabil und die Werte numerisch.
+    print()
+    print("=== Migration (UPDATE ... WHERE feature_data IS NULL) ===")
+    try:
+        cur = con.execute(f"""
+            UPDATE feature_store
+            SET feature_data = {json_expr}
+            WHERE feature_data IS NULL
+              AND (ema_diff IS NOT NULL OR atr_normalized IS NOT NULL
+                   OR grid_nearest_level IS NOT NULL
+                   OR grid_dist_abs IS NOT NULL OR grid_dist_pct IS NOT NULL
+                   OR is_time_window_active IS NOT NULL)
+        """)
+        print(f"  UPDATE ... OK ({cur.rowcount} Zeilen)")
+    except Exception as e:
+        print(f"  FEHLER: {e}")
+        con.close()
+        sys.exit(1)
+
+    # --- Verifikation ---
+    after = con.execute("""
+        SELECT feature_id, COUNT(*) FROM feature_store
+        WHERE feature_data IS NULL
+        GROUP BY 1 ORDER BY 1
+    """).fetchall()
+    print()
+    print("=== Rows mit feature_data IS NULL (nachher) ===")
+    if not after:
+        print("  (keine mehr - vollstaendig migriert)")
+    for fid, n in after:
+        print(f"  {fid:26s} {n}")
+
+    print()
+    print("=== Stichprobe srv_proximity (migrierte JSON-Keys) ===")
+    rows = con.execute("""
+        SELECT feature_data FROM feature_store
+        WHERE feature_id = 'srv_proximity' AND feature_data IS NOT NULL
+        LIMIT 3
+    """).fetchall()
+    for (fd,) in rows:
+        print("  ", str(fd)[:200])
+
+    con.close()
+    print()
+    print("FERTIG. Backup: test/backup_analytics_before_fd_migration.duckdb")
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/_patch_ui3.py
+```py
+# -*- coding: utf-8 -*-
+"""Temporaer: check_ui3_bugfix.py B4/B5 fuer Runde 17b aktualisieren."""
+import io
+
+p = r"F:\Python\PyTrader\test\check_ui3_bugfix.py"
+s = io.open(p, encoding="utf-8", newline=None).read()
+changed = 0
+
+old4 = """# ---------------------------------------------------------------------------
+# Bug 4) Log-Hoehe 4 Zeilen (User 11.08.2026: 2 Zeilen HOEHER als Default)
+# ---------------------------------------------------------------------------
+check("B4) Log-Hoehe 4 Zeilen (2 Zeilen hoeher als Default, max)",
+      "setMaximumHeight(fm.lineSpacing() * 4 + 12)" in sw_src)
+check("B4) Log-Hoehe 4 Zeilen (2 Zeilen hoeher als Default, min)",
+      "setMinimumHeight(fm.lineSpacing() * 4 + 12)" in sw_src)
+check("B4) Keine 2-Zeilen-Hoehe mehr",
+      "fm.lineSpacing() * 2 + 12" not in sw_src)"""
+new4 = """# ---------------------------------------------------------------------------
+# Bug 4) Log-Hoehe 6 Zeilen (User 11.08.2026-Nachtrag: 2 Zeilen HOEHER als 4)
+# ---------------------------------------------------------------------------
+check("B4) Log-Hoehe 6 Zeilen (2 Zeilen hoeher als 4, max)",
+      "setMaximumHeight(fm.lineSpacing() * 6 + 12)" in sw_src)
+check("B4) Log-Hoehe 6 Zeilen (2 Zeilen hoeher als 4, min)",
+      "setMinimumHeight(fm.lineSpacing() * 6 + 12)" in sw_src)
+check("B4) Keine 4-Zeilen-Hoehe mehr",
+      "fm.lineSpacing() * 4 + 12" not in sw_src)"""
+if old4 in s:
+    s = s.replace(old4, new4, 1)
+    changed += 1
+else:
+    print("B4-Anker nicht gefunden")
+
+old5 = """check("B5) Maximize-Schutz: Reflow resizet maximiertes Fenster nicht",
+      "if not self.isMaximized():" in sc_src)
+check("B5) Inhalt folgt der Fensterbreite (Splitter fuellt Spielraum)",
+      "self._content_widget.resize(w, h)" in sc_src)"""
+new5 = """check("B5) Maximize-Schutz: Reflow resizet maximiertes Fenster nicht",
+      "if not self.isMaximized():" in sc_src)
+check("B5) Inhalt folgt der Fensterbreite (Splitter fuellt Spielraum)",
+      "self._content_widget.resize(w, h)" in sc_src)
+
+# ---------------------------------------------------------------------------
+# Bug 6) 11.08.2026-Nachtrag: Maximize-Button ausgegraut
+# ---------------------------------------------------------------------------
+pw_src = open("persistent_win.py", encoding="utf-8").read()
+check("B6) apply_screen_cap-Override im ServiceWindow (grosszuegiges Max)",
+      "def apply_screen_cap(self) -> None:" in sw_src)
+check("B6) Maximum 2x Screen (max > size -> Button aktiv)",
+      "screen.width() * 2, screen.height() * 2" in sw_src)
+check("B6) Window-Flags sichern Maximize/Minimize-Hints",
+      "Qt.WindowMaximizeButtonHint" in pw_src
+      and "Qt.WindowMinimizeButtonHint" in pw_src)"""
+if old5 in s:
+    s = s.replace(old5, new5, 1)
+    changed += 1
+else:
+    print("B5-Anker nicht gefunden")
+
+with open(p, "w", encoding="utf-8", newline="") as f:
+    f.write(s)
+print("check_ui3 aktualisiert:", changed)
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/_tmp_find_src.py
 ```py
 # test/_tmp_find_src.py - temporärer Suchhelfer (darf gelöscht werden)
@@ -42557,8 +43768,11 @@ Analytics-Dropdown:
 
 1) feature_store_reader.available_instance_hashes(symbol, timeframe) –
    rein lesend, liefert die Menge der Hashes MIT Daten.
-2) AnalyticsViewModel.resolve_no_data_variants(symbol, timeframe) –
-   liefert aktive Presets/Clones ohne Daten (mit display_name).
+2) FeatureStoreReader.resolve_no_data_variants(symbol, timeframe,
+   presets_data) – liefert aktive Presets/Clones ohne Daten (mit
+   display_name). 20.05: Die synchrone AnalyticsViewModel-Methode wurde
+   als toter Altbestand entfernt - die Auswertung liegt im Reader
+   (Worker-Pfad).
 3) CheckableComboBox.add_disabled_item() – grauer Hinweis-Eintrag.
 4) heatmap_widget: _sync_combos_from_payload ergänzt No-Data-Einträge.
 
@@ -42602,41 +43816,22 @@ class _FakeReader:
     def available_instance_hashes(self, symbol, timeframe):
         return set(self._hashes)
 
+    def feature_keys_by_service(self, symbol, timeframe, feature_ids=None):
+        return {}
 
-class _Plugin:
-    def __init__(self, plugin_id):
-        self._plugin_id = plugin_id
-        self.capabilities = {"chart": False}
-        self.metadata = {}
+    def plugin_ids_with_hashes(self, symbol, timeframe):
+        # Keine Bestands-Info -> None => konservative Runde-10-Semantik
+        # (kein Alt-Bestand-Fallback, Runde 13c/14).
+        return None
 
-    @property
-    def plugin_id(self):
-        return self._plugin_id
-
-
-class _SelectorModel:
-    def __init__(self, presets):
-        self._presets = presets
-        self._plugins = {
-            "srv_swing_pivot": _Plugin("srv_swing_pivot"),
-        }
-
-    def plugin_presets(self):
-        return dict(self._presets)
-
-    def get_plugin(self, plugin_id):
-        p = self._plugins.get(str(plugin_id).lower())
-        if p is None:
-            raise KeyError(plugin_id)
-        return p
-
-    def resolve_valid_feature_ids(self, ids):
-        return list(ids), []
-
-
-class _FakeRepo:
-    def __init__(self, hashes):
-        self.reader = _FakeReader(hashes)
+    @staticmethod
+    def _no_data_fallback_name(pid, pname):
+        # Identisch zur Reader-Logik (B4-1-Fallback-Anzeigename).
+        pretty = (pid.replace("srv_", "").replace("ind_", "")
+                  .replace("_", " ").title())
+        if not pretty:
+            pretty = pid
+        return f"{pretty} ({pname})"
 
 
 def test_reader_method() -> None:
@@ -42656,25 +43851,29 @@ def test_reader_method() -> None:
 
 
 def test_view_model_variants() -> None:
-    from analytics.engine.analytics_view_model import AnalyticsViewModel
-    presets = {
-        "srv_swing_pivot": [
-            {"preset_name": "M15_Fast", "params": {"p": 1},
-             "instance_hash": "aaaa1111", "is_archived": False,
-             "doc_log": ""},
-            {"preset_name": "H1_Slow", "params": {"p": 2},
-             "instance_hash": "bbbb2222", "is_archived": False,
-             "doc_log": ""},
-            {"preset_name": "Alte_Variante", "params": {"p": 3},
-             "instance_hash": "cccc3333", "is_archived": True,
-             "doc_log": ""},
-        ],
+    # 20.05: No-Data-Auswertung liegt im FeatureStoreReader (Worker-Pfad,
+    # presets_data-Snapshot) - die synchrone AnalyticsViewModel-Methode
+    # wurde als toter Altbestand entfernt.
+    from analytics.engine.feature_store_reader import FeatureStoreReader
+    presets_data = {
+        "presets": {
+            "srv_swing_pivot": [
+                {"preset_name": "M15_Fast", "instance_hash": "aaaa1111",
+                 "is_archived": False},
+                {"preset_name": "H1_Slow", "instance_hash": "bbbb2222",
+                 "is_archived": False},
+                {"preset_name": "Alte_Variante", "instance_hash": "cccc3333",
+                 "is_archived": True},
+            ],
+        },
+        "sets": [],
+        "display_names": {},
+        "active_hashes": [],
     }
-    model = _SelectorModel(presets)
     # Hash bbbb2222 hat bereits Daten -> nur aaaa1111 ist 'No Data'.
-    vm = AnalyticsViewModel(analytics_repo=_FakeRepo(["bbbb2222"]),
-                            selector_model=model)
-    out = vm.resolve_no_data_variants("SILVER", "H1")
+    reader = _FakeReader(["bbbb2222"])
+    out = FeatureStoreReader.resolve_no_data_variants(
+        reader, "SILVER", "H1", presets_data)
     check("VM) liefert genau die Variante ohne Daten",
           len(out) == 1, f"-> {[(o.get('preset_name')) for o in out]}")
     check("VM) No-Data-Variante ist M15_Fast",
@@ -42682,17 +43881,19 @@ def test_view_model_variants() -> None:
     check("VM) display_name enthaelt Preset-Name",
           out and "M15_Fast" in str(out[0].get("display_name")))
     check("VM) archivierte Variante wird nicht geliefert",
-          out and not any(o.get("preset_name") == "Alte_Variante" for o in out))
+          out and not any(o.get("preset_name") == "Alte_Variante"
+                          for o in out))
 
     # Alle Hashes vorhanden -> leer
-    vm2 = AnalyticsViewModel(analytics_repo=_FakeRepo(
-        ["aaaa1111", "bbbb2222", "cccc3333"]), selector_model=model)
+    reader2 = _FakeReader(["aaaa1111", "bbbb2222", "cccc3333"])
     check("VM) alle Varianten mit Daten -> leer",
-          vm2.resolve_no_data_variants("SILVER", "H1") == [])
+          FeatureStoreReader.resolve_no_data_variants(
+              reader2, "SILVER", "H1", presets_data) == [])
 
     # Ohne Symbol/Timeframe -> leer (defensiv)
     check("VM) ohne symbol/timeframe -> leer",
-          vm.resolve_no_data_variants("", "") == [])
+          FeatureStoreReader.resolve_no_data_variants(
+              reader, "", "", presets_data) == [])
 
 
 def test_common_disabled_item() -> None:
@@ -42716,12 +43917,16 @@ def test_widget_integration() -> None:
     import inspect
     import analytics.ui.heatmap_widget as hw
     src = inspect.getsource(hw.HeatmapWidget._sync_combos_from_payload)
-    check("Widget) _sync_combos_from_payload ruft resolve_no_data_variants",
-          "resolve_no_data_variants" in src)
+    # 20.05: Das Widget konsumiert no_data_variants aus dem Worker-Payload
+    # (kein direkter Aufruf einer resolve-Methode mehr). Die No-Data-Hinweise
+    # rendert zentral _render_no_data_items() (Runde 11, B4-3).
+    check("Widget) _sync_combos_from_payload nutzt no_data_variants-Payload",
+          "no_data_variants" in src)
+    render = inspect.getsource(hw.HeatmapWidget._render_no_data_items)
     check("Widget) add_disabled_item wird fuer No-Data genutzt",
-          "add_disabled_item" in src)
+          "add_disabled_item" in render)
     check("Widget) '(No Data)'-Label vorhanden",
-          "(No Data)" in src)
+          "(No Data)" in render)
 
 
 if __name__ == "__main__":
@@ -47564,6 +48769,590 @@ sys.exit(0)
 
 --------------------------------------------------
 
+### DATEI: test/check_r17b_construct.py
+```py
+# test/check_r17b_construct.py
+# -*- coding: utf-8 -*-
+"""
+11.08.2026 (Runde 17b/17d2): Offscreen-Konstruktionstest fuer ServiceWindow.
+Prueft:
+  1) apply_screen_cap()-Override setzt KEIN Maximum -> Qt-Default
+     16777215 (QWINDOWSIZE_MAX) -> Maximize-Button bleibt aktiv (17d2).
+  2) _fix_window_flags sichert MaximizeButtonHint | MinimizeButtonHint.
+  3) Log-Hoehe = 6 Zeilen.
+
+KEINE GUI-Ausfuehrung (offscreen, kein exec_).
+ACHTUNG: Schlaegt fehl, wenn app_data.duckdb von der laufenden App
+gesperrt ist (DbPool-Lock) - dann nur die statischen Checks sinnvoll.
+"""
+import os
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+
+app = QApplication.instance() or QApplication([])
+
+from PySide6.QtCore import Qt  # noqa: E402
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+# --- Statische Checks (unabhaengig von DB) --------------------------------
+sw_src = open("serviceui/service_win.py", encoding="utf-8").read()
+check("S1) apply_screen_cap Override vorhanden",
+      "def apply_screen_cap(self)" in sw_src)
+# Runde 17d2: KEIN setMaximumSize mehr - Windows zeigt den Maximize-Button
+# nur bei maximumSize() == QWINDOWSIZE_MAX (16777215), qwindowswindow.cpp:
+# shouldShowMaximizeButton(). 2x Screen (17b/c) war NICHT gleich MAX.
+check("S1) KEIN setMaximumSize (Max bleibt QWINDOWSIZE_MAX)",
+      "self.setMaximumSize(" not in sw_src)
+
+pw_src = open("persistent_win.py", encoding="utf-8").read()
+check("S2) MaximizeButtonHint wird gesichert",
+      "Qt.WindowMaximizeButtonHint" in pw_src)
+check("S2) MinimizeButtonHint wird gesichert",
+      "Qt.WindowMinimizeButtonHint" in pw_src)
+
+# --- Dynamischer Konstruktionstest (kann an DB-Lock scheitern) ------------
+try:
+    from serviceui.service_win import ServiceWindow
+
+    win = ServiceWindow()
+    win.apply_screen_cap()
+    maxsz = win.maximumSize()
+    check("D1) ServiceWindow konstruierbar", True)
+    # Runde 17d2: apply_screen_cap() setzt KEIN Maximum -> Qt-Default
+    # 16777215 (QWINDOWSIZE_MAX) -> Windows Maximize-Button aktiv.
+    check("D1) Maximum = QWINDOWSIZE_MAX 16777215 (Button aktiv)",
+          maxsz.width() == 16777215 and maxsz.height() == 16777215,
+          f"max={maxsz.width()}x{maxsz.height()}")
+    flags = win.windowFlags()
+    check("D2) Maximize-Hint gesetzt",
+          bool(flags & Qt.WindowMaximizeButtonHint))
+    check("D2) Minimize-Hint gesetzt",
+          bool(flags & Qt.WindowMinimizeButtonHint))
+    check("D2) Qt.Window gesetzt", bool(flags & Qt.Window))
+
+    if win.text_log:
+        fm = win.text_log.fontMetrics()
+        h_max = win.text_log.maximumHeight()
+        h_min = win.text_log.minimumHeight()
+        check("D3) Log max = 6 Zeilen",
+              h_max == fm.lineSpacing() * 6 + 12, f"h_max={h_max}")
+        check("D3) Log min = 6 Zeilen",
+              h_min == fm.lineSpacing() * 6 + 12, f"h_min={h_min}")
+    else:
+        check("D3) Log-Widget vorhanden", False, "text_log ist None")
+    win.close()
+    win.deleteLater()
+except Exception as exc:
+    check("D1) ServiceWindow konstruierbar", False, repr(exc))
+    print(f"      -> Hinweis: DB-Lock (App laeuft?) oder Qt-Fehler. "
+          f"Statische Checks S1/S2 bleiben gueltig.")
+
+print(f"\n{sum(1 for _, ok, _ in PASS if ok)}/{len(PASS)} Checks PASS")
+fail = [n for n, ok, _ in PASS if not ok]
+if fail:
+    print("FAILS:", fail)
+    sys.exit(1)
+print("ALLE R17B-KONSTRUKTIONS-PRUEFUNGEN BESTANDEN (OK)")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_r17c_resize.py
+```py
+# test/check_r17c_resize.py
+# -*- coding: utf-8 -*-
+"""
+11.08.2026 (Bugfix Runde 17c, User-Meldungen 3/4/5):
+  3) Maximize-Button aktiv (nicht ausgegraut)
+  4) Manuelles Grossziehen -> Inhalt passt sich dem Fenster an
+  5) Param-Box folgt der Fenstergroesse, MasterTree-Hoehe waechst mit
+
+Verifiziert (offscreen, kein exec_):
+  - widgetResizable=True auf content_scroll UND param_scroll
+  - _exact_fit_to_content = False (Fenster schrumpft nicht mehr auf Inhalt)
+  - Kein 1000x1240-Cap der Param-Box mehr (Max-Begrenzungen entfernt)
+  - MSWindowsFixedSizeDialogHint wird entfernt (Maximize-Button)
+  - restore_state wendet die gespeicherte Fenster-Groesse an
+  - content_widget folgt der Fenstergroesse (Resize-Simulation)
+"""
+import os
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+
+app = QApplication.instance() or QApplication([])
+
+from PySide6.QtCore import Qt, QSize  # noqa: E402
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+# --- Statische Checks ------------------------------------------------------
+sw_src = open("serviceui/service_win.py", encoding="utf-8").read()
+check("R1) _exact_fit_to_content = False (Inhalt folgt Fenster)",
+      "_exact_fit_to_content = False" in sw_src)
+check("R1) content_scroll wird auf widgetResizable=True gesetzt",
+      "self.content_scroll.setWidgetResizable(True)" in sw_src)
+check("R1) param_scroll auf widgetResizable=True gesetzt",
+      "self._param_scroll.setWidgetResizable(True)" in sw_src)
+check("R1) Kein 1240er-Maximum der Param-Box mehr",
+      "setMaximumHeight(1240)" not in sw_src)
+check("R1) Kein 1000er-Maximum der Param-Box mehr",
+      "setMaximumWidth(1000)" not in sw_src)
+check("R1) restore_state wendet Fenster-Groesse an",
+      "self.resize(max(int(width), 640)" in sw_src)
+check("R1) Kein setAlignment(AlignTop|AlignLeft) auf dem central_layout (17d)",
+      "self.central_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)" not in sw_src)
+
+pw_src = open("persistent_win.py", encoding="utf-8").read()
+check("R3) MSWindowsFixedSizeDialogHint wird entfernt (Maximize-Button)",
+      "wanted &= ~int(Qt.MSWindowsFixedSizeDialogHint)" in pw_src
+      or "wanted &= ~Qt.MSWindowsFixedSizeDialogHint" in pw_src)
+check("R3) Vollstaendiger Button-Satz wird gesetzt (Title/SystemMenu/Min/Max/Close)",
+      "WindowCloseButtonHint" in pw_src and "WindowMaximizeButtonHint" in pw_src
+      and "WindowMinimizeButtonHint" in pw_src)
+
+pc_src = open("serviceui/param_columns.py", encoding="utf-8").read()
+check("R5) box.resize nur noch bei widgetResizable=False",
+      "if scroll is None or not scroll.widgetResizable():" in pc_src)
+
+# --- Dynamischer Konstruktionstest ----------------------------------------
+try:
+    from serviceui.service_win import ServiceWindow
+
+    win = ServiceWindow()
+    win.show()
+    for _ in range(5):
+        app.processEvents()
+
+    check("D1) ServiceWindow konstruierbar", True)
+
+    # content_scroll
+    cs = win.content_scroll
+    check("D2) content_scroll.widgetResizable == True",
+          cs is not None and cs.widgetResizable())
+    # param_scroll
+    ps = win._param_scroll
+    check("D2) param_scroll.widgetResizable == True",
+          ps is not None and ps.widgetResizable())
+    check("D2) param_scroll ohne 1000/1240-Cap",
+          ps.maximumWidth() > 100000 and ps.maximumHeight() > 100000,
+          f"maxW={ps.maximumWidth()} maxH={ps.maximumHeight()}")
+
+    # Fenster-Flags: MSWindowsFixedSizeDialogHint muss weg sein
+    f = int(win.windowFlags())
+    check("D3) MSWindowsFixedSizeDialogHint NICHT gesetzt",
+          not (f & int(Qt.MSWindowsFixedSizeDialogHint)))
+    check("D3) Maximize-Hint gesetzt", bool(f & int(Qt.WindowMaximizeButtonHint)))
+    # Maximum: Qt-Default 16777215 (QWINDOWSIZE_MAX) -> Windows zeigt den
+    # Maximize-Button NUR bei max == QWINDOWSIZE_MAX (qwindowswindow.cpp:
+    # shouldShowMaximizeButton). KEIN setMaximumSize() mehr (Runde 17d2).
+    check("D3) maximumSize == QWINDOWSIZE_MAX 16777215 (Button aktiv)",
+          win.maximumSize().width() == 16777215
+          and win.maximumSize().height() == 16777215,
+          f"max={win.maximumSize().width()}x{win.maximumSize().height()} "
+          f"size={win.size().width()}x{win.size().height()}")
+
+    # R4: Inhalt folgt Fenster - Fenster vergroessern, content_widget pruefen
+    old_cw = win.content_scroll.widget().size().width()
+    win.resize(win.width() + 200, win.height() + 150)
+    for _ in range(5):
+        app.processEvents()
+    new_cw = win.content_scroll.widget().size().width()
+    check("D4) content_widget waechst mit dem Fenster mit",
+          new_cw > old_cw, f"old={old_cw} new={new_cw}")
+
+    # R4: Reflow schrumpft das Fenster NICHT unter die aktuelle Groesse
+    #     (Fenster <= Screen; groesser als Inhalt -> bleibt groesser).
+    #     Ueber dem Screen-Cap klemmt der Reflow korrekt auf den Screen.
+    screen = app.primaryScreen().availableGeometry()
+    win.resize(min(1000, screen.width()), min(850, screen.height()))
+    for _ in range(3):
+        app.processEvents()
+    before = win.size()
+    win._invalidate_content_caches()
+    win.resize_to_clamped_content()
+    for _ in range(3):
+        app.processEvents()
+    after = win.size()
+    check("D4) Reflow schrumpft nicht unter die aktuelle Groesse (<= Screen)",
+          after.width() >= before.width() and after.height() >= before.height(),
+          f"before={before.width()}x{before.height()} "
+          f"after={after.width()}x{after.height()}")
+
+    win.close()
+    win.deleteLater()
+except Exception as exc:
+    import traceback
+    traceback.print_exc()
+    check("D1) ServiceWindow konstruierbar", False, repr(exc))
+
+print(f"\n{sum(1 for _, ok, _ in PASS if ok)}/{len(PASS)} Checks PASS")
+fail = [n for n, ok, _ in PASS if not ok]
+if fail:
+    print("FAILS:", fail)
+    sys.exit(1)
+print("ALLE R17C-PRUEFUNGEN BESTANDEN (OK)")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_r17d_resize.py
+```py
+# test/check_r17d_resize.py
+# -*- coding: utf-8 -*-
+"""Bugfix Runde 17d (11.08.2026): ECHTE Widget-Baum-Struktur des ServiceWindow
+nach dem Konstruieren + Resize – nicht nur statische Strings.
+
+Fragestellungen (User-Meldungen 3/4/5 vom 11.08.2026):
+  3) Maximize-Button ausgegraut?
+  4) Manuelles Grossziehen (Rahmen/Ecke) ohne Inhalt-Anpassung?
+  5) Param-Box + MasterTree-Hoehe passen sich der Fenstergroesse an?
+
+Root-Cause 17d: self.central_layout.setAlignment(Qt.AlignTop|Qt.AlignLeft)
+hielt die Layout-Verteilung an - der QSplitter blieb auf Mindest-Hoehe
+(Extra-Raum als Leerflaeche unter dem Splitter). Entfernt; die Proben
+C1-C9 verifizieren das Wachstum dynamisch.
+"""
+import os
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+
+app = QApplication.instance() or QApplication([])
+
+from PySide6.QtCore import Qt, QSize  # noqa: E402
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+from serviceui.service_win import ServiceWindow
+
+win = ServiceWindow()
+win.show()
+for _ in range(8):
+    app.processEvents()
+
+# --- 1. Fenster-Flags ------------------------------------------------------
+f = int(win.windowFlags())
+check("A1) top-level QMainWindow: Qt.Window gesetzt", bool(f & int(Qt.Window)))
+check("A2) MSWindowsFixedSizeDialogHint weg", not (f & int(Qt.MSWindowsFixedSizeDialogHint)))
+check("A3) WindowMaximizeButtonHint gesetzt", bool(f & int(Qt.WindowMaximizeButtonHint)))
+check("A4) window min/max: max > min",
+      win.maximumSize().width() > win.minimumSize().width()
+      and win.maximumSize().height() > win.minimumSize().height(),
+      f"min={win.minimumSize().width()}x{win.minimumSize().height()} "
+      f"max={win.maximumSize().width()}x{win.maximumSize().height()}")
+check("A4) max == QWINDOWSIZE_MAX 16777215 (Windows Maximize-Button aktiv)",
+      win.maximumSize().width() == 16777215
+      and win.maximumSize().height() == 16777215,
+      f"max={win.maximumSize().width()}x{win.maximumSize().height()}")
+
+# --- 2. self.ui: hat es noch Qt.Window-Flag? -------------------------------
+ui = win.ui
+uf = int(ui.windowFlags())
+check("B1) self.ui KEIN Qt.Window mehr (Kind der ScrollArea)",
+      not (uf & int(Qt.Window)), f"flags={hex(uf)}")
+check("B2) self.ui ist Kind des content_scroll-Viewports",
+      ui.parent() is win.content_scroll.viewport() or ui.parent() is win.content_scroll,
+      f"parent={ui.parent() and ui.parent().__class__.__name__}")
+
+# --- 3. Grundgroessen vor dem Resize ----------------------------------------
+def sizes():
+    return {
+        "win": win.size(),
+        "cw": win.content_scroll.widget().size(),
+        "splitter": win.main_splitter.size(),
+        "tree": win.service_selector.master_tree.size(),
+        "params": win._param_panel.size(),
+        "param_scroll": win._param_scroll.size(),
+        "columns": win.widget_service_columns.size(),
+    }
+
+
+s0 = sizes()
+print("\nGroessen VOR Resize:")
+for k, v in s0.items():
+    print(f"  {k}: {v.width()}x{v.height()}")
+
+# --- 4. Fenster vergroessern ------------------------------------------------
+w_add, h_add = 300, 200
+win.resize(win.width() + w_add, win.height() + h_add)
+for _ in range(8):
+    app.processEvents()
+s1 = sizes()
+print("\nGroessen NACH Resize (+300x200):")
+for k, v in s1.items():
+    print(f"  {k}: {v.width()}x{v.height()}")
+
+check("C1) content_widget waechst mit dem Fenster (Breite)",
+      s1["cw"].width() > s0["cw"].width(),
+      f"{s0['cw'].width()} -> {s1['cw'].width()}")
+check("C2) content_widget waechst mit dem Fenster (Hoehe)",
+      s1["cw"].height() > s0["cw"].height(),
+      f"{s0['cw'].height()} -> {s1['cw'].height()}")
+check("C3) Splitter waechst in der Breite",
+      s1["splitter"].width() > s0["splitter"].width(),
+      f"{s0['splitter'].width()} -> {s1['splitter'].width()}")
+check("C4) MasterTree waechst in der Hoehe (Splitterspalte streckt sich)",
+      s1["tree"].height() > s0["tree"].height(),
+      f"{s0['tree'].height()} -> {s1['tree'].height()}")
+check("C5) Param-Panel waechst in der Breite",
+      s1["params"].width() > s0["params"].width(),
+      f"{s0['params'].width()} -> {s1['params'].width()}")
+check("C6) MasterTree waechst in der Hoehe",
+      s1["tree"].height() > s0["tree"].height(),
+      f"{s0['tree'].height()} -> {s1['tree'].height()}")
+check("C7) Param-Panel waechst in der Hoehe",
+      s1["params"].height() > s0["params"].height(),
+      f"{s0['params'].height()} -> {s1['params'].height()}")
+check("C8) Param-Scrollarea waechst in der Hoehe",
+      s1["param_scroll"].height() > s0["param_scroll"].height(),
+      f"{s0['param_scroll'].height()} -> {s1['param_scroll'].height()}")
+
+# C9: QSplitter gibt die erste Breiten-Zugabe der Param-Box (User-Prioritaet),
+# der MasterTree waechst erst bei deutlich breiterem Fenster mit.
+win.resize(win.width() + 300, win.height())
+for _ in range(8):
+    app.processEvents()
+s3 = sizes()
+check("C9) MasterTree waechst in der Breite bei deutlich breiterem Fenster",
+      s3["tree"].width() > s0["tree"].width(),
+      f"{s0['tree'].width()} -> {s3['tree'].width()} "
+      f"(Splitter {s0['splitter'].width()} -> {s3['splitter'].width()})")
+
+# --- 5. Maximize-Verhalten offscreen (showMaximized) -------------------------
+try:
+    win.showMaximized()
+    for _ in range(5):
+        app.processEvents()
+    check("D1) showMaximized setzt isMaximized (offscreen)",
+          win.isMaximized(), f"isMaximized={win.isMaximized()}")
+    s2 = sizes()
+    print("\nGroessen NACH showMaximized (offscreen-Geometrie ggf. kleiner):")
+    for k, v in s2.items():
+        print(f"  {k}: {v.width()}x{v.height()}")
+    # Reflow darf ein MAXIMIERTES Fenster nicht aus dem Maximize-Zustand
+    # werfen und nicht auf Inhaltsgroesse zuruecksetzen (Bugfix 17).
+    max_before = (win.size().width(), win.size().height())
+    win._invalidate_content_caches()
+    win.resize_to_clamped_content()
+    for _ in range(5):
+        app.processEvents()
+    check("D2) Reflow laesst maximiertes Fenster maximiert",
+          win.isMaximized(),
+          f"isMaximized={win.isMaximized()}")
+    check("D2) Reflow veraendert die Maximize-Geometrie nicht",
+          (win.size().width(), win.size().height()) == max_before,
+          f"{max_before} -> {(win.size().width(), win.size().height())}")
+    win.showNormal()
+    for _ in range(5):
+        app.processEvents()
+except Exception as exc:
+    import traceback
+    traceback.print_exc()
+    check("D1) showMaximized", False, repr(exc))
+
+win.close()
+win.deleteLater()
+
+print(f"\n{sum(1 for _, ok, _ in PASS if ok)}/{len(PASS)} Checks PASS")
+fail = [n for n, ok, _ in PASS if not ok]
+if fail:
+    print("FAILS:", fail)
+    sys.exit(1)
+print("ALLE R17D-CHECKS BESTANDEN (OK)")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_r17e_history.py
+```py
+# test/check_r17e_history.py
+# -*- coding: utf-8 -*-
+"""
+11.08.2026 (Bugfix Runde 17e, User-Meldung 2):
+  "Fenster-Historie nicht mehr intakt - Analytics geschlossen, Anwendung
+   geschlossen, bei Neustart ist Analytics wieder da."
+
+Fix: _keep_history_on_close = False fuer AnalyticsWindow (wie ServiceWindow):
+  - MANUELL geschlossenes Analytics-Fenster -> delete_instance -> beim
+    Neustart NICHT wiederhergestellt.
+  - Fenster-POSITION ueberlebt via global_settings (DIALOG_GEOMETRY_KEY).
+  - Workspace (vm.params + Layout) ueberlebt via global_settings-Backup
+    ("analytics_workspace").
+
+Verifiziert (offscreen, KEINE GUI, Temp-DB in test/):
+  * Statische Checks auf analytics/ui/analytics_win.py
+  * DB-Flow: open -> save -> manual close (delete) -> restart (restore)
+"""
+import os
+import sys
+import pathlib
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication
+
+app = QApplication.instance() or QApplication([])
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+# --- Statische Checks ------------------------------------------------------
+src = open("analytics/ui/analytics_win.py", encoding="utf-8").read()
+check("S1) _keep_history_on_close = False (Historie intakt)",
+      "_keep_history_on_close = False" in src)
+check("S2) DIALOG_GEOMETRY_KEY = win_analytics",
+      'DIALOG_GEOMETRY_KEY = "win_analytics"' in src)
+check("S3) save_state sichert Dialog-Geometrie",
+      "save_dialog_geometry" in src and "DIALOG_GEOMETRY_KEY" in src)
+check("S4) restore_state nutzt Dialog-Geometrie-Fallback",
+      "get_dialog_geometry" in src and "DIALOG_GEOMETRY_KEY" in src)
+check("S5) _save_workspace schreibt global_settings-Backup",
+      "save_global_value" in src and "analytics_workspace" in src)
+check("S6) _restore_workspace liest global_settings-Backup",
+      "get_global_value" in src and "analytics_workspace" in src)
+check("S7) closeEvent ruft Basis-closeEvent (delete-Mechanik bleibt)",
+      "super().closeEvent(event)" in src)
+
+# --- DB-Flow (Temp-DB in test/) --------------------------------------------
+BASE = pathlib.Path(__file__).parent
+TMP_DB = BASE / "_tmp_r17e_app.duckdb"
+if TMP_DB.exists():
+    TMP_DB.unlink()
+
+from state_manager import StateManager  # noqa: E402
+
+try:
+    sm = StateManager(str(TMP_DB))
+
+    workspace = {
+        "params": {"symbol": "SILVER", "timeframe": "H1", "limit": 500},
+        "layout": {"page_index": 2, "heatmap_mode": "generic"},
+    }
+
+    # --- Phase 1: Analytics OFFEN, App beendet ------------------------------
+    sm.save_window_geometry("win_analytics", 120, 80, 1280, 800, False)
+    sm.save_instance_state("win_analytics", "SILVER", "H1")
+    sm.save_workspace_state("win_analytics", workspace)
+    # Positions-Backup (save_state-Override, Muster ServiceWindow)
+    sm.save_dialog_geometry("win_analytics", 120, 80, 1280, 800)
+    # Workspace-Backup (closeEvent -> _save_workspace)
+    sm.save_global_value("analytics_workspace", workspace)
+
+    insts = sm.load_all_instances()
+    check("D1) Eintrag beim App-Ende vorhanden (wird restauriert)",
+          any(i.get("instance_id") == "win_analytics" for i in insts))
+
+    # --- Phase 2: MANUELLES Schliessen (X) ---------------------------------
+    sm.delete_instance("win_analytics")
+    insts2 = sm.load_all_instances()
+    check("D2) Nach manuellem Schliessen: KEIN Eintrag mehr (Historie intakt)",
+          not any(i.get("instance_id") == "win_analytics" for i in insts2))
+    check("D3) window_instances-Primaerquelle weg (get_window_geometry=None)",
+          sm.get_window_geometry("win_analytics") is None)
+    check("D4) workspace-Primaerquelle weg (get_workspace_state=None)",
+          sm.get_workspace_state("win_analytics") is None)
+
+    # --- Phase 3: Neustart -> restore_all_windows wuerde nichts finden ----
+    # load_all_instances ist die Quelle von restore_all_windows (D2 erledigt).
+
+    # --- Phase 4: MANUELLES Wiederoeffnen (Button) --------------------------
+    geom = sm.get_dialog_geometry("win_analytics")
+    check("D5) Geometrie-Fallback ueberlebt (get_dialog_geometry)",
+          geom is not None and geom.get("width") == 1280, f"geom={geom}")
+    ws = sm.get_global_value("analytics_workspace")
+    check("D6) Workspace-Backup ueberlebt (get_global_value)",
+          ws is not None and ws.get("layout", {}).get("page_index") == 2)
+
+    # restore_state-Fallback-Logik nachbilden (wie im AnalyticsWindow)
+    payload = sm.get_workspace_state("win_analytics")
+    if not payload:
+        payload = sm.get_global_value("analytics_workspace")
+    check("D7) Restore-Fallback liefert den Workspace",
+          payload is not None and payload.get("params", {}).get("limit") == 500)
+
+    # --- Phase 5: Erneutes Beenden mit OFFENEM Fenster ----------------------
+    # (App-Ende speichert den Eintrag neu -> naechster Start restauriert)
+    sm.save_window_geometry("win_analytics", 10, 10, 900, 600, False)
+    sm.save_workspace_state("win_analytics", workspace)
+    insts3 = sm.load_all_instances()
+    check("D8) Nach App-Ende mit offenem Fenster: Eintrag da (Restore gewollt)",
+          any(i.get("instance_id") == "win_analytics" for i in insts3))
+
+except Exception as exc:
+    import traceback
+    traceback.print_exc()
+    check("DB-Flow", False, repr(exc))
+
+finally:
+    if TMP_DB.exists():
+        TMP_DB.unlink()
+
+print(f"\n{sum(1 for _, ok, _ in PASS if ok)}/{len(PASS)} Checks PASS")
+fail = [n for n, ok, _ in PASS if not ok]
+if fail:
+    print("FAILS:", fail)
+    sys.exit(1)
+print("ALLE R17E-CHECKS BESTANDEN (OK)")
+
+```
+
+--------------------------------------------------
+
 ### DATEI: test/check_restore_pipeline_bugfix.py
 ```py
 # test/check_restore_pipeline_bugfix.py
@@ -48531,6 +50320,20 @@ class _FakeReader:
     def feature_keys_by_service(self, *a, **kw):
         return dict(self.keys_by_service)
 
+    def plugin_ids_with_hashes(self, symbol, timeframe):
+        # Keine Bestands-Info -> None => konservative Runde-10-Semantik
+        # (kein Alt-Bestand-Fallback, Runde 13c/14).
+        return None
+
+    @staticmethod
+    def _no_data_fallback_name(pid, pname):
+        # Identisch zur Reader-Logik (B4-1-Fallback-Anzeigename).
+        pretty = (pid.replace("srv_", "").replace("ind_", "")
+                  .replace("_", " ").title())
+        if not pretty:
+            pretty = pid
+        return f"{pretty} ({pname})"
+
     def fetch_rows(self, *a, **kw):
         self.calls.append(("rows", kw))
         return []
@@ -48717,46 +50520,33 @@ check("B1-Repo) feature_keys_by_service erhaelt instance_hashes",
 
 # ---------------------------------------------------------------------------
 # Bug 2: resolve_no_data_variants differenziert (Hash-Match statt PID-Fallback)
+# 20.05: Die No-Data-Auswertung liegt produktiv im FeatureStoreReader
+# (Worker-Pfad, presets_data-Snapshot) - die synchrone VM-Methode wurde als
+# toter Altbestand entfernt. Der Test laeuft daher ueber die Reader-Methode
+# mit einem Fake-Reader (kein DB-Zugriff).
 # ---------------------------------------------------------------------------
-class _SelModel(QObject):
-    data_changed = Signal()
-
-    def __init__(self, presets, sets=None):
-        super().__init__()
-        self._presets = presets
-        self._sets = sets or []
-
-    def plugin_presets(self):
-        return self._presets
-
-    def get_sets(self):
-        return list(self._sets)
-
-    def resolve_valid_feature_ids(self, ids):
-        return list(ids), []
-
-    def resolve_service_display_name(self, pid, pname=""):
-        return str(pid) if not pname else f"{pid} ({pname})"
-
 
 # available: nur Hash hA hat Daten; BEIDE pids haben feature_store-Daten
 reader2 = _FakeReader(available={"hA"},
                       keys_by_service={"srv_x": ["k1"], "srv_y": ["k1"]})
-sel2 = _SelModel({
-    "srv_x": [
-        {"preset_name": "v1", "instance_hash": "hA", "is_archived": False},
-        {"preset_name": "v2", "instance_hash": "hB", "is_archived": False},
-    ],
-    "srv_y": [
-        {"preset_name": "def", "instance_hash": "", "is_archived": False},
-    ],
-})
-vm3 = AnalyticsViewModel(
-    analytics_repo=_FakeRepo(reader=reader2),
-    profile_repo=_FakeProfileRepo(),
-    selector_model=sel2,
-)
-no_data = vm3.resolve_no_data_variants("SILVER", "M1")
+no_data = FeatureStoreReader.resolve_no_data_variants(
+    reader2, "SILVER", "M1", {
+        "presets": {
+            "srv_x": [
+                {"preset_name": "v1", "instance_hash": "hA",
+                 "is_archived": False},
+                {"preset_name": "v2", "instance_hash": "hB",
+                 "is_archived": False},
+            ],
+            "srv_y": [
+                {"preset_name": "def", "instance_hash": "",
+                 "is_archived": False},
+            ],
+        },
+        "sets": [],
+        "display_names": {},
+        "active_hashes": [],
+    })
 keys = {(nd["plugin_id"], nd["instance_hash"]) for nd in no_data}
 check("B2) hB (pid hat Daten) wird trotzdem als No-Data markiert",
       ("srv_x", "hB") in keys, str(sorted(keys)))
@@ -48767,17 +50557,18 @@ check("B2) NULL-Hash-Bestand (pid hat Daten) NICHT als No-Data",
 
 # Variante ohne Hash + pid OHNE Daten -> No-Data
 reader3 = _FakeReader(available=set(), keys_by_service={"srv_other": ["k1"]})
-sel3 = _SelModel({
-    "srv_z": [
-        {"preset_name": "def", "instance_hash": "", "is_archived": False},
-    ],
-})
-vm4 = AnalyticsViewModel(
-    analytics_repo=_FakeRepo(reader=reader3),
-    profile_repo=_FakeProfileRepo(),
-    selector_model=sel3,
-)
-no_data4 = vm4.resolve_no_data_variants("SILVER", "M1")
+no_data4 = FeatureStoreReader.resolve_no_data_variants(
+    reader3, "SILVER", "M1", {
+        "presets": {
+            "srv_z": [
+                {"preset_name": "def", "instance_hash": "",
+                 "is_archived": False},
+            ],
+        },
+        "sets": [],
+        "display_names": {},
+        "active_hashes": [],
+    })
 check("B2) Variante ohne Hash + pid ohne Daten -> No-Data",
       any(nd["plugin_id"] == "srv_z" for nd in no_data4),
       str(no_data4))
@@ -49096,7 +50887,8 @@ class _CapturingRepo:
     def __init__(self):
         self.captured = None
 
-    def get_available_features(self, symbol, timeframe, presets_data=None):
+    def get_available_features(self, symbol, timeframe, presets_data=None,
+                               feature_ids=None, instance_hashes=None):
         self.captured = presets_data
         return {"feature_ids": [], "columns": [], "total_rows": 0,
                 "no_data_variants": [], "no_data_variants_error": False}
@@ -49123,6 +50915,13 @@ class _FakeReader(FeatureStoreReader):
 
     def available_instance_hashes(self, symbol, timeframe):
         return set(self._hashes)
+
+    def plugin_ids_with_hashes(self, symbol, timeframe):
+        # Runde 13c: Konsistente Stub-API. srv_a besitzt Hash-Daten
+        # (h_a1) -> srv_a ist hash-differenziert (kein Alt-Bestand-
+        # Fallback fuer ihre Varianten). Alle anderen pids haben nur
+        # undifferenzierten Bestand.
+        return {"srv_a"}
 
     def feature_keys_by_service(self, symbol, timeframe, **kw):
         return dict(self._keys)
@@ -49264,6 +51063,11 @@ check("B4-3) Stale-Payload (Generation 1 < 3) wird verworfen",
       str(w._no_data_variants))
 
 # B4-2/B4-3: frischer Payload -> Cache + No-Data-Items im Dropdown
+# Runde 13c (Kernwunsch): Leerer feature_ids-Filter rendert KEINE
+# NoData-Hinweise - fuer diesen Widget-Test wird ein AKTIVER Filter
+# gesetzt (entspricht dem realen VM-Snapshot-Verhalten: leerer Filter
+# liefert bereits keine Varianten).
+mock._params["feature_ids"] = ["srv_x", "srv_y"]
 w._on_features_ready({
     "no_data_variants": [
         {"plugin_id": "srv_x", "preset_name": "V1",
@@ -49297,8 +51101,17 @@ check("B4-5) Aktive instance_hashes filtert die No-Data-Liste",
 mock._params["instance_hashes"] = []
 
 # B4-2: Fehler-Zustand -> Warn-Item
+# Runde 13c: aktiver Filter noetig (leerer Filter unterdrueckt auch
+# den Fehlerhinweis).
 w_err = HeatmapWidget()
-w_err.attach_view_model(_MockVM(gen=0))
+w_err.attach_view_model(_MockVM(gen=0, params={
+    "symbol": "SILVER", "timeframe": "M1",
+    "feature_ids": ["srv_x"], "instance_hashes": [],
+    "heatmap_x_dim": "date", "heatmap_y_dim": "hour",
+    "heatmap_agg": "confluence_count", "heatmap_field": "",
+    "candle_projection_enabled": False,
+    "zoom_x_range": [0.0, 1.0], "zoom_y_range": [0.0, 1.0],
+}))
 w_err._on_query_failed("features", "boom")
 w_err._syncing = True
 try:
@@ -49641,10 +51454,16 @@ check("A4) feature_keys_by_service nur mit aktiven pids",
       str(reader_active.keys_called_with))
 
 
-# A5: Widget - request_data ruft request_features NICHT mehr auf
+# A5 (Runde 15, Fix 1): Widget request_data stösst QUERY_FEATURES VOR der
+# Grafik an - das 'Feld'-Dropdown + die No-Data-Hinweise kommen ueber den
+# LEICHTEN Metadaten-Pfad (Reader-Cache, KEIN Heatmap-Pivot) und warten
+# nicht mehr auf die teure Pivot-Aggregation (Ultra-Low-Latency-Fix).
 hw_src = open("analytics/ui/heatmap_widget.py", encoding="utf-8").read()
-check("A5) Widget request_data ohne request_features (kein Extra-Roundtrip)",
-      "request_features" not in hw_src)
+_i_f = hw_src.find("self._view_model.request_features()")
+_i_h = hw_src.find("self._view_model.request_heatmap_generic()")
+check("A5) Widget request_data: QUERY_FEATURES VOR der Grafik (Fix 1)",
+      _i_f >= 0 and _i_h >= 0 and _i_f < _i_h,
+      f"request_features@{_i_f} / heatmap_generic@{_i_h}")
 
 
 # A6: Widget - QUERY_HEATMAP_GENERIC-Payload setzt No-Data-Cache + Items
@@ -49685,6 +51504,7 @@ def _combo_texts(widget):
 
 
 mock6 = _MockVM(gen=2)
+mock6._params["feature_ids"] = ["srv_x"]  # Runde 13c: leerer Filter rendert nichts
 w6 = HeatmapWidget()
 w6.attach_view_model(mock6)
 # Heatmap-Payload mit No-Data-Anteil (Option A: selber Datenfluss)
@@ -49845,13 +51665,16 @@ for s in snap_c.get("sets", []):
 check("C1) Snapshot-Set-Services nur gecheckte",
       set_svcs == {"srv_set_checked"}, str(set_svcs))
 
-# Kein Filter (feature_ids leer) -> alle Services
+# Kein Filter (feature_ids leer) -> LEERES Snapshot (Runde 13c Kernwunsch:
+# bei leerem Filter wird gar kein No-Data-Block gerendert; die alte
+# Semantik 'kein Filter = alle' ist damit bewusst ersetzt).
 vm_c._params["feature_ids"] = []
 snap_all = vm_c._no_data_presets_snapshot()
-check("C1) Ohne Filter -> alle Presets (Semantik 'kein Filter = alle')",
-      set(snap_all.get("presets", {}).keys())
-      == {"srv_checked", "srv_unchecked"},
-      str(sorted(snap_all.get("presets", {}).keys())))
+check("C1) Ohne Filter -> leeres Snapshot (Runde 13c Kernwunsch)",
+      snap_all.get("presets") == {}
+      and snap_all.get("sets") == []
+      and snap_all.get("active_hashes") == [],
+      str({k: snap_all.get(k) for k in ("presets", "sets", "active_hashes")}))
 
 # C2: Widget _render_no_data_items filtert nach feature_ids
 mock_c = _MockVM(gen=0)
@@ -50172,6 +51995,1494 @@ print()
 total = len(PASS)
 failed = [p for p in PASS if not p[1]]
 print(f"Runde 13b: {total - len(failed)}/{total} Checks bestanden")
+if failed:
+    for name, _ok, info in failed:
+        print("  FAIL:", name, "|", info)
+    sys.exit(1)
+print("ALL PASS")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_round13c.py
+```py
+# test/check_round13c.py
+# -*- coding: utf-8 -*-
+"""
+Verifikation Runde 13c (10.08.2026) - Bugfix Dropdown-NoData (Wurzel):
+
+  Die Alt-Rows von srv_proximity (SILVER M1-M30, ~573K) und native (3000)
+  trugen ihre Werte NUR in den Legacy-Spalten (ema_diff/atr_normalized/
+  grid_nearest_level/grid_dist_abs/grid_dist_pct/is_time_window_active) -
+  feature_data war NULL. Der Reader definiert 'hat Daten' AUSSCHLIESSLICH
+  ueber feature_data-JSON (19.02-Cleanup), deshalb meldete er fuer diese
+  Services '(No Data)' trotz 99K M1-Zeilen (Bug 1: falsche Variante,
+  Bug 2: ungecheckte Services als Phantom-Eintraege).
+
+  Runde 13c loest die Wurzel sauber:
+  A) Migration (test/_migrate_feature_data.py): Alt-Spalten 1:1 in
+     feature_data-JSON-Keys ueberfuehrt (Backup in test/).
+  B) Reader: _has_data-Fallback fuer undifferenzierten Alt-Bestand
+     (plugin_ids_with_hashes): Besitzt eine plugin_id KEINE hash-
+     differenzierte Zeile (instance_hash IS NULL), deckt ihr Bestand
+     JEDE Variante ab (Set-Instanz srv_proximity mit berechnetem Hash
+     a392915e gilt damit als 'hat Daten').
+  C) Kernwunsch: Leerer feature_ids-Filter ([] = kein Filter) liefert
+     KEINE '(No Data)'-Eintraege - VM-Snapshot leer + UI-Guard.
+  D) Bug 1-Absicherung: _selected_no_data_variant waehlt bei mehreren
+     Varianten die im ServicePicker gecheckte (instance_hash-Match).
+
+KEINE GUI-Ausfuehrung (offscreen). Temp-DBs strikt in test/.
+"""
+import os
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+app = QApplication.instance() or QApplication([])
+
+from analytics.engine.analytics_view_model import AnalyticsViewModel  # noqa: E402
+from analytics.engine.analytics_repository import AnalyticsRepository  # noqa: E402
+from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
+from analytics.engine.service_models import generate_instance_hash  # noqa: E402
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+# =========================================================================
+# A) Migration: Alt-Spalten -> feature_data-JSON (echte DB, read-only)
+# =========================================================================
+reader = FeatureStoreReader("data/analytics.duckdb")
+con = reader._get_connection()
+
+# A1: Keine feature_data-IS-NULL-Rows mehr (Migration vollstaendig)
+null_rows = con.execute("""
+    SELECT COUNT(*) FROM feature_store WHERE feature_data IS NULL
+""").fetchone()[0]
+check("A1) Keine Rows mit feature_data IS NULL (Migration vollstaendig)",
+      null_rows == 0, f"noch {null_rows}")
+
+# A2: srv_proximity SILVER/M1 ist fuer den Reader sichtbar (feature_keys)
+keys = reader.feature_keys_by_service("SILVER", "M1")
+prox_keys = keys.get("srv_proximity") or []
+check("A2) srv_proximity M1 liefert feature_data-JSON-Keys",
+      "grid_nearest_level" in prox_keys and "atr_normalized" in prox_keys
+      and "grid_dist_pct" in prox_keys,
+      str(prox_keys))
+
+# A3: native ebenfalls migriert
+native_keys = keys.get("native") or []
+check("A3) native liefert feature_data-JSON-Keys (ema_diff/atr_normalized)",
+      "ema_diff" in native_keys and "atr_normalized" in native_keys,
+      str(native_keys))
+
+# A4: Migrierte Werte numerisch abrufbar (fetch_columns)
+cols = reader.fetch_columns(
+    "SILVER", "M1", ["grid_nearest_level", "grid_dist_pct"],
+    feature_ids=["srv_proximity"], limit=100)
+check("A4) fetch_columns liefert migrierte Alt-Werte",
+      len(cols) > 0 and all(
+          "grid_nearest_level" in c and "grid_dist_pct" in c for c in cols),
+      f"{len(cols)} Zeilen")
+
+# =========================================================================
+# B) Reader: _has_data-Fallback (undifferenzierter Alt-Bestand)
+# =========================================================================
+# B1: plugin_ids_with_hashes - srv_proximity hat KEINE Hash-Zeilen
+pids_h = reader.plugin_ids_with_hashes("SILVER", "M1")
+check("B1) plugin_ids_with_hashes: srv_proximity NICHT enthalten "
+      "(undifferenzierter Alt-Bestand)",
+      "srv_proximity" not in pids_h, str(sorted(pids_h)))
+check("B1b) plugin_ids_with_hashes: srv_grid_lines/srv_swing_volume_profile "
+      "enthalten",
+      "srv_grid_lines" in pids_h and "srv_swing_volume_profile" in pids_h,
+      str(sorted(pids_h)))
+
+# B2: resolve_no_data_variants - Set-Instanz srv_proximity (Hash a392915e,
+#     gecheckt) wird NICHT als '(No Data)' gemeldet (Alt-Bestand deckt sie ab)
+params_prox = {"visit_pct": 0.045, "time_window_mins": 5,
+               "use_time_filter": True, "lookback": 1000}
+h_prox = generate_instance_hash("srv_proximity", params_prox)
+presets_data_set = {
+    "presets": {},
+    "sets": [{"services": {"proximity": {
+        "plugin_id": "srv_proximity", "params": params_prox,
+        "is_archived": False}}}],
+    "display_names": {},
+    "active_hashes": [h_prox],
+}
+variants_set = reader.resolve_no_data_variants("SILVER", "M1",
+                                               presets_data_set)
+prox_in_variants = any(
+    str(v.get("plugin_id") or "").strip().lower() == "srv_proximity"
+    for v in variants_set)
+check("B2) Set-Instanz srv_proximity (gecheckt) ist KEIN '(No Data)'",
+      not prox_in_variants,
+      f"hash={h_prox} variants={variants_set}")
+
+# B3: srv_swing_volume_profile 'Kopie 99' (Hash 7d636c36) IST '(No Data)'
+#     (Plugin hat hash-differenzierte Zeilen, Hash existiert nicht)
+presets_data_swp = {
+    "presets": {"srv_swing_volume_profile": [
+        {"preset_name": "Kopie 99", "instance_hash": "7d636c36",
+         "is_archived": False}]},
+    "sets": [],
+    "display_names": {"srv_swing_volume_profile|Kopie 99": "Kopie 99"},
+    "active_hashes": ["7d636c36"],
+}
+variants_swp = reader.resolve_no_data_variants("SILVER", "M1",
+                                               presets_data_swp)
+swp_in_variants = any(
+    str(v.get("plugin_id") or "").strip().lower()
+    == "srv_swing_volume_profile"
+    for v in variants_swp)
+check("B3) srv_swing_volume_profile 'Kopie 99' IST weiterhin '(No Data)'",
+      swp_in_variants, str(variants_swp))
+
+# B4: Nicht-gecheckte Varianten (active_hashes != deren Hash) erscheinen
+#     nicht (Runde 13-Variantengenauigkeit bleibt erhalten)
+presets_data_other = {
+    "presets": {},
+    "sets": [{"services": {"proximity": {
+        "plugin_id": "srv_proximity", "params": params_prox,
+        "is_archived": False}}}],
+    "display_names": {},
+    "active_hashes": ["some_other_hash"],
+}
+variants_other = reader.resolve_no_data_variants("SILVER", "M1",
+                                                 presets_data_other)
+check("B4) Nicht-gecheckte Instanz erscheint nicht (active_hashes-Mismatch)",
+      not any(str(v.get("plugin_id") or "").strip().lower()
+              == "srv_proximity" for v in variants_other),
+      str(variants_other))
+
+# =========================================================================
+# C) Kernwunsch: Leerer feature_ids-Filter -> KEINE '(No Data)'-Eintraege
+# =========================================================================
+class _FakeSelectorModel:
+    def __init__(self, presets):
+        self._presets = presets
+
+    def plugin_presets(self):
+        return dict(self._presets)
+
+    def get_sets(self):
+        return []
+
+    def resolve_service_display_name(self, pid, pname=""):
+        return f"{pid} ({pname})"
+
+
+presets_t = {
+    "srv_x": [
+        {"preset_name": "V1", "instance_hash": "h1", "is_archived": False},
+        {"preset_name": "V2", "instance_hash": "h2", "is_archived": False},
+    ],
+}
+
+# C1: feature_ids=[] -> Snapshot ist leer (presets/sets/active_hashes)
+vm_c1 = AnalyticsViewModel(AnalyticsRepository(),
+                           selector_model=_FakeSelectorModel(presets_t))
+vm_c1._params["feature_ids"] = []
+vm_c1._params["instance_hashes"] = ["h2"]
+snap_c1 = vm_c1._no_data_presets_snapshot()
+check("C1) Leerer Filter -> Snapshot presets leer",
+      not snap_c1.get("presets"), str(snap_c1.get("presets")))
+check("C1b) Leerer Filter -> Snapshot sets leer",
+      not snap_c1.get("sets"), str(snap_c1.get("sets")))
+check("C1c) Leerer Filter -> Snapshot active_hashes leer",
+      snap_c1.get("active_hashes") == [], str(snap_c1.get("active_hashes")))
+
+# C2: Mit aktivem Filter bleibt der Snapshot gefuellt (gecheckte Variante)
+vm_c2 = AnalyticsViewModel(AnalyticsRepository(),
+                           selector_model=_FakeSelectorModel(presets_t))
+vm_c2._params["feature_ids"] = ["srv_x"]
+vm_c2._params["instance_hashes"] = ["h2"]
+snap_c2 = vm_c2._no_data_presets_snapshot()
+snap_h = [c.get("instance_hash")
+          for c in (snap_c2.get("presets", {}).get("srv_x") or [])]
+check("C2) Aktiver Filter -> Snapshot enthaelt gecheckte Variante (h2)",
+      snap_h == ["h2"], str(snap_h))
+
+# C3: Reader liefert bei leerem Snapshot keine Varianten
+variants_empty = reader.resolve_no_data_variants(
+    "SILVER", "M1", {"presets": {}, "sets": [], "display_names": {},
+                     "active_hashes": []})
+check("C3) Leeres Snapshot -> Reader liefert keine NoData-Varianten",
+      variants_empty == [], str(variants_empty))
+
+# =========================================================================
+# D) UI-Logik (reine Methoden, kein Widget-Render)
+# =========================================================================
+import analytics.ui.heatmap_widget as hm  # noqa: E402
+
+
+class _FakeCombo:
+    def __init__(self):
+        self.items = []
+        self._current = ""
+
+    def add_disabled_item(self, text):
+        self.items.append(("disabled", text))
+
+    def add_header_item(self, text):
+        self.items.append(("header", text))
+
+    def currentData(self):
+        return self._current
+
+
+def _new_widget():
+    """HeatmapWidget ohne __init__ (nur Methoden-Test, kein Qt-Render)."""
+    return hm.HeatmapWidget.__new__(hm.HeatmapWidget)
+
+
+# D1: _render_no_data_items bei leerem Filter -> NICHTS gerendert
+vm_d1 = AnalyticsViewModel(AnalyticsRepository(),
+                           selector_model=_FakeSelectorModel(presets_t))
+vm_d1._params["feature_ids"] = []
+vm_d1._params["instance_hashes"] = ["h2"]
+w_d1 = _new_widget()
+w_d1._view_model = vm_d1
+w_d1._combo_field = _FakeCombo()
+w_d1._no_data_variants = [
+    {"plugin_id": "srv_x", "preset_name": "V2", "instance_hash": "h2",
+     "display_name": "X (V2)"}]
+w_d1._no_data_variants_error = False
+w_d1._render_no_data_items()
+check("D1) Leerer Filter -> _render_no_data_items rendert nichts",
+      len(w_d1._combo_field.items) == 0, str(w_d1._combo_field.items))
+
+# D1b: Auch der Fehlerhinweis wird bei leerem Filter unterdrueckt
+w_d1b = _new_widget()
+w_d1b._view_model = vm_d1
+w_d1b._combo_field = _FakeCombo()
+w_d1b._no_data_variants = []
+w_d1b._no_data_variants_error = True
+w_d1b._render_no_data_items()
+check("D1b) Leerer Filter -> auch Fehlerhinweis unterdrueckt",
+      len(w_d1b._combo_field.items) == 0, str(w_d1b._combo_field.items))
+
+# D1c: Mit aktivem Filter wird der NoData-Abschnitt gerendert
+vm_d1c = AnalyticsViewModel(AnalyticsRepository(),
+                            selector_model=_FakeSelectorModel(presets_t))
+vm_d1c._params["feature_ids"] = ["srv_x"]
+vm_d1c._params["instance_hashes"] = ["h2"]
+w_d1c = _new_widget()
+w_d1c._view_model = vm_d1c
+w_d1c._combo_field = _FakeCombo()
+w_d1c._combo_field._current = "srv_x|grid_dist_pct"
+w_d1c._no_data_variants = [
+    {"plugin_id": "srv_x", "preset_name": "V2", "instance_hash": "h2",
+     "display_name": "X (V2)"}]
+w_d1c._no_data_variants_error = False
+w_d1c._render_no_data_items()
+rendered_text = " | ".join(t for _, t in w_d1c._combo_field.items)
+check("D1c) Aktiver Filter -> NoData-Abschnitt gerendert",
+      "(No Data)" in rendered_text, rendered_text)
+
+# D2: _selected_no_data_variant waehlt die gecheckte Variante (Hash-Match)
+vm_d2 = AnalyticsViewModel(AnalyticsRepository(),
+                           selector_model=_FakeSelectorModel(presets_t))
+vm_d2._params["feature_ids"] = ["srv_x"]
+vm_d2._params["instance_hashes"] = ["h2"]
+w_d2 = _new_widget()
+w_d2._view_model = vm_d2
+w_d2._combo_field = _FakeCombo()
+w_d2._combo_field._current = "srv_x|key"
+variants_d2 = [
+    {"plugin_id": "srv_x", "preset_name": "V1", "instance_hash": "h1",
+     "display_name": "X (V1)"},
+    {"plugin_id": "srv_x", "preset_name": "V2", "instance_hash": "h2",
+     "display_name": "X (V2)"},
+]
+sel_d2 = w_d2._selected_no_data_variant(variants_d2)
+check("D2) Gecheckte Variante (h2) gewinnt statt erster (h1)",
+      (sel_d2 or {}).get("instance_hash") == "h2", str(sel_d2))
+
+# D3: Ohne active_hashes -> erster Service-Treffer (h1) bleibt
+vm_d3 = AnalyticsViewModel(AnalyticsRepository(),
+                           selector_model=_FakeSelectorModel(presets_t))
+vm_d3._params["feature_ids"] = ["srv_x"]
+vm_d3._params["instance_hashes"] = []
+w_d3 = _new_widget()
+w_d3._view_model = vm_d3
+w_d3._combo_field = _FakeCombo()
+w_d3._combo_field._current = "srv_x|key"
+sel_d3 = w_d3._selected_no_data_variant(variants_d2)
+check("D3) Ohne active_hashes -> erster Treffer (h1)",
+      (sel_d3 or {}).get("instance_hash") == "h1", str(sel_d3))
+
+# D4: Anderer Service im Feld -> None (keine falsche Zuordnung)
+w_d4 = _new_widget()
+w_d4._view_model = vm_d2
+w_d4._combo_field = _FakeCombo()
+w_d4._combo_field._current = "srv_other|key"
+sel_d4 = w_d4._selected_no_data_variant(variants_d2)
+check("D4) Fremder Service -> None", sel_d4 is None, str(sel_d4))
+
+# =========================================================================
+# Ergebnis
+# =========================================================================
+print()
+total = len(PASS)
+failed = [p for p in PASS if not p[1]]
+print(f"Runde 13c: {total - len(failed)}/{total} Checks bestanden")
+if failed:
+    for name, _ok, info in failed:
+        print("  FAIL:", name, "|", info)
+    sys.exit(1)
+print("ALL PASS")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_round14.py
+```py
+# test/check_round14.py
+# -*- coding: utf-8 -*-
+"""
+Verifikation Runde 14 (Bugfix 10.08.2026): Dropdown-NoData zeigt nichts mehr,
+obwohl eine gecheckte Version (zweiter Eintrag) ohne Daten existiert.
+
+Root Cause (Runde 13c): Der Alt-Bestand-Fallback in _has_data deckt ALLE
+Varianten einer plugin_id ab, deren feature_store-Bestand ausschliesslich
+NULL-Hash-Rows besitzt (z. B. srv_proximity: 593K Rows, instance_hash IS
+NULL). Damit gilt auch eine NEU erzeugte zweite Variante (anderer Hash,
+noch nie gelaufen) als 'hat Daten' -> kein '(No Data)'-Eintrag.
+
+Fix (Runde 14): Der Alt-Bestand-Fallback greift NUR fuer die ERSTE aktive
+Variante der plugin_id im Snapshot (die originale Instanz, deren Alt-Daten
+der Bestand tatsaechlich gehoert). Alle weiteren Varianten brauchen einen
+echten instance_hash-Treffer in available_instance_hashes.
+
+KEINE GUI-Ausfuehrung. Temp-DBs strikt in test/.
+"""
+import os
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
+from analytics.engine.service_models import generate_instance_hash  # noqa: E402
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+# =========================================================================
+# Gemeinsame Basis: echte srv_proximity-Params (Set 'test', Instanz
+# 'proximity') -> Hash a392915e; zweite Variante mit geaenderten Params.
+# =========================================================================
+PARAMS_V1 = {
+    "lookback": 1000,
+    "time_window_mins": 5,
+    "use_time_filter": True,
+    "visit_pct": 0.045,
+}
+PARAMS_V2 = dict(PARAMS_V1)
+PARAMS_V2["visit_pct"] = 0.07  # andere Params -> anderer Hash (neue Variante)
+
+HASH_V1 = generate_instance_hash("srv_proximity", PARAMS_V1)
+HASH_V2 = generate_instance_hash("srv_proximity", PARAMS_V2)
+check("Grundlagen: V1/V2-Hashes verschieden",
+      HASH_V1 != HASH_V2 and HASH_V1 == "a392915e",
+      f"{HASH_V1} vs {HASH_V2}")
+
+# =========================================================================
+# 1) Reader (echte DB data/analytics.duckdb): beide Varianten im Snapshot,
+#    beide gecheckt (active_hashes = [V1, V2]).
+# =========================================================================
+DB = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data",
+                                  "analytics.duckdb"))
+reader = FeatureStoreReader(DB)
+
+snapshot = {
+    "presets": {},
+    "sets": [{
+        "services": {
+            "proximity": {
+                "plugin_id": "srv_proximity",
+                "params": PARAMS_V1,
+                "is_archived": False,
+            },
+            "proximity_kopie": {
+                "plugin_id": "srv_proximity",
+                "params": PARAMS_V2,
+                "is_archived": False,
+            },
+        },
+    }],
+    "display_names": {},
+    "active_hashes": [HASH_V1, HASH_V2],
+}
+res = reader.resolve_no_data_variants("SILVER", "M1", snapshot)
+by_hash = {v.get("instance_hash"): v for v in res}
+check("1a) V2 (Kopie, ohne Daten) wird als (No Data) geliefert",
+      HASH_V2 in by_hash,
+      f"no_data_variants={[v.get('instance_hash') for v in res]}")
+check("1b) V1 (Original, Alt-Bestand) hat Daten -> NICHT im Payload",
+      HASH_V1 not in by_hash,
+      f"no_data_variants={[v.get('instance_hash') for v in res]}")
+
+# 2) Nur V2 gecheckt -> V2 als NoData, V1 gar nicht betrachtet
+res2 = reader.resolve_no_data_variants("SILVER", "M1", {
+    "presets": {}, "sets": snapshot["sets"], "display_names": {},
+    "active_hashes": [HASH_V2],
+})
+by_hash2 = {v.get("instance_hash"): v for v in res2}
+check("2a) Nur V2 gecheckt -> V2 als (No Data)",
+      HASH_V2 in by_hash2,
+      f"no_data_variants={[v.get('instance_hash') for v in res2]}")
+check("2b) Nur V2 gecheckt -> V1 nicht im Payload",
+      HASH_V1 not in by_hash2,
+      f"no_data_variants={[v.get('instance_hash') for v in res2]}")
+
+# 3) Nur V1 gecheckt -> V1 hat Alt-Bestand -> kein (No Data) (Regression 13c)
+res3 = reader.resolve_no_data_variants("SILVER", "M1", {
+    "presets": {}, "sets": snapshot["sets"], "display_names": {},
+    "active_hashes": [HASH_V1],
+})
+by_hash3 = {v.get("instance_hash"): v for v in res3}
+check("3) Nur V1 gecheckt -> kein (No Data) (Alt-Bestand deckt Original)",
+      HASH_V1 not in by_hash3 and res3 == [],
+      f"no_data_variants={[v.get('instance_hash') for v in res3]}")
+
+# 4) EINZIGE Variante eines Services mit Alt-Bestand (nur V1 im Set) ->
+#    Fallback greift (Regression Runde 13c: proximity nicht mehr NoData)
+snapshot_single = {
+    "presets": {},
+    "sets": [{
+        "services": {
+            "proximity": {
+                "plugin_id": "srv_proximity",
+                "params": PARAMS_V1,
+                "is_archived": False,
+            },
+        },
+    }],
+    "display_names": {},
+    "active_hashes": [HASH_V1],
+}
+res4 = reader.resolve_no_data_variants("SILVER", "M1", snapshot_single)
+check("4) Einzige Variante + Alt-Bestand -> kein (No Data)",
+      res4 == [], f"no_data_variants={res4}")
+
+# 5) Fallback greift nicht bei Abfragefehler (Fake-DB ohne Tabelle):
+#    pids_with_hashes None -> konservative Runde-10-Semantik
+fake = FeatureStoreReader(os.path.join(os.path.dirname(__file__),
+                                       "dummy.duckdb"))
+res5 = fake.resolve_no_data_variants("SILVER", "M1", {
+    "presets": {}, "sets": snapshot["sets"], "display_names": {},
+    "active_hashes": [HASH_V1, HASH_V2],
+})
+check("5) Fake-DB (Abfragefehler) -> konservativ: beide Varianten NoData",
+      any(v.get("instance_hash") == HASH_V2 for v in res5),
+      f"no_data_variants={[v.get('instance_hash') for v in res5]}")
+
+# =========================================================================
+# Ergebnis
+# =========================================================================
+print()
+total = len(PASS)
+failed = [p for p in PASS if not p[1]]
+print(f"Runde 14: {total - len(failed)}/{total} Checks bestanden")
+if failed:
+    for name, _ok, info in failed:
+        print("  FAIL:", name, "|", info)
+    sys.exit(1)
+print("ALL PASS")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_round15_perf.py
+```py
+# test/check_round15_perf.py
+# -*- coding: utf-8 -*-
+"""
+Verifikation Runde 15 (Ultra-Low-Latency Control & Rendering Pipeline) –
+Performance-Fixes 1 + 3 (Dropdown-Verzoegerung mehrere Sekunden):
+
+  Fix 3 (Reader-Metadaten-Cache): available_feature_keys /
+         feature_keys_by_service / available_instance_hashes /
+         plugin_ids_with_hashes teilen sich GENAU EINEN Basis-Scan
+         (_feature_meta_base) pro (symbol, timeframe). Invalidation via
+         `feature_cache_last_invalidated` (feature_builder, Invariante 13),
+         die bei jedem store_plugin_payload() getriggert wird. Vorher liefen
+         bis zu 6 Voll-Scans pro Update (Root Cause 2).
+  Fix 1 (QUERY_FEATURES-Leichtpfad): get_available_features liefert
+         `metrics` + `field_sources` (Feld-Metadaten, identisch zur
+         Heatmap) – das 'Feld'-Dropdown + '(No Data)' kommen OHNE die teure
+         Heatmap-Pivot-Aggregation (Root Cause 1).
+
+  Zusaetzlich: Semantik-Gleichheit der Python-Filter (feature_ids /
+  instance_hashes / numeric_only) gegenueber der bisherigen SQL-Clause –
+  insbesondere Services mit NUR nicht-numerischen Keys (numeric_only-Trennung).
+
+KEINE GUI-Ausfuehrung. Temp-DBs strikt in test/.
+"""
+import os
+import sys
+import tempfile
+
+import duckdb  # noqa: E402
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from db_service import DbPool  # noqa: E402
+from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
+from analytics.engine.analytics_repository import AnalyticsRepository  # noqa: E402
+from analytics.features.feature_builder import (  # noqa: E402
+    feature_cache_last_invalidated,
+)
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+class _CountingCon:
+    """Proxy um die DuckDB-Connection (zaehlt execute-Aufrufe).
+
+    DuckDB-Connection-Attribute sind read-only – der Reader-Zugriff wird
+    daher ueber eine ersetzte `_get_connection`-Methode gezahlt.
+    """
+
+    def __init__(self, con):
+        self._con = con
+        self.executes = 0
+
+    def execute(self, sql, params=None):
+        self.executes += 1
+        return self._con.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._con, name)
+
+
+# =========================================================================
+# Temp-DB in test/ aufbauen (Schema-Muster check_variant_bugfix)
+# =========================================================================
+tmpdir = tempfile.mkdtemp(prefix="pytrader_round15_", dir=os.path.dirname(__file__))
+db_path = os.path.join(tmpdir, "check_round15.duckdb")
+con = DbPool.get(db_path)
+con.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR, timeframe VARCHAR, bar_time TIMESTAMPTZ,
+        feature_id VARCHAR, instance_hash VARCHAR, created_at TIMESTAMP,
+        feature_data JSON, plugin_version VARCHAR,
+        PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
+    )
+""")
+from datetime import datetime, timezone as dt_tz  # noqa: E402
+
+_ROWS = [
+    # srv_grid_lines: numerische Keys, teils Hash, teils NULL (Alt-Bestand)
+    ("SILVER", "M1", "srv_grid_lines", "aaaa1111",
+     '{"schema_version": "1.0.0", "open": 30.1, "close": 30.2}'),
+    ("SILVER", "M1", "srv_grid_lines", None,
+     '{"schema_version": "1.0.0", "open": 30.3, "close": 30.4}'),
+    # srv_proximity: numerische Keys, ALLE Rows NULL-Hash (undifferenziert)
+    ("SILVER", "M1", "srv_proximity", None,
+     '{"schema_version": "1.0.0", "price": 30.5, "visit_pct": 0.045}'),
+    # srv_strings: NUR nicht-numerische Keys -> numeric_only-Trennung
+    ("SILVER", "M1", "srv_strings", "cccc3333",
+     '{"schema_version": "1.0.0", "label": "abc", "mode": "x"}'),
+    # srv_other: andere TF (darf NICHT ins SILVER/M1-Ergebnis)
+    ("SILVER", "H1", "srv_grid_lines", None,
+     '{"schema_version": "1.0.0", "open": 31.0, "close": 31.1}'),
+]
+for i, (sym, tf, fid, h, data) in enumerate(_ROWS):
+    con.execute("""
+        INSERT INTO feature_store
+            (symbol, timeframe, bar_time, feature_id, instance_hash,
+             created_at, feature_data)
+        VALUES (?, ?, ?, ?, ?, now(), ?)
+    """, [sym, tf,
+          datetime(2026, 8, 10, 10, i, tzinfo=dt_tz.utc), fid, h, data])
+
+reader = FeatureStoreReader(db_path=db_path)
+
+# =========================================================================
+# 1) Basis-Scan: GENAU EIN DB-Zugriff fuer alle 4 Metadaten-Methoden
+# =========================================================================
+counting = _CountingCon(con)
+reader._get_connection = lambda: counting  # nur fuer den Test-Zeitraum
+
+# Erstaufruf: EIN Basis-Scan fuer alle 4 Metadaten-Methoden
+counting.executes = 0
+keys = reader.available_feature_keys("SILVER", "M1")
+k_numeric = reader.available_feature_keys("SILVER", "M1", numeric_only=True)
+by_svc = reader.feature_keys_by_service("SILVER", "M1")
+hashes = reader.available_instance_hashes("SILVER", "M1")
+pids_h = reader.plugin_ids_with_hashes("SILVER", "M1")
+scans_first = counting.executes
+
+check("1a) available_feature_keys (alle Keys)",
+      set(keys) == {"open", "close", "price", "visit_pct", "label", "mode"},
+      str(keys))
+check("1b) numeric_only trennt String-Service",
+      set(k_numeric) == {"open", "close", "price", "visit_pct"},
+      str(k_numeric))
+check("1c) feature_keys_by_service gruppiert",
+      set(by_svc) == {"srv_grid_lines", "srv_proximity", "srv_strings"},
+      str(sorted(by_svc)))
+check("1d) available_instance_hashes",
+      hashes == {"aaaa1111", "cccc3333"}, str(hashes))
+check("1e) plugin_ids_with_hashes (nur hash-differenzierte)",
+      pids_h == {"srv_grid_lines", "srv_strings"}, str(pids_h))
+check("1f) Basis-Scan = EIN DB-Zugriff fuer die 4 Methoden",
+      scans_first == 1, f"scans={scans_first}")
+
+# Zweitaufruf (Cache-Hit): KEIN weiterer DB-Zugriff
+counting.executes = 0
+_again = reader.available_feature_keys("SILVER", "M1")
+_again_num = reader.feature_keys_by_service("SILVER", "M1", numeric_only=True)
+_again_h = reader.available_instance_hashes("SILVER", "M1")
+_again_p = reader.plugin_ids_with_hashes("SILVER", "M1")
+check("1g) Zweitaufruf komplett aus dem Cache (0 DB-Zugriffe)",
+      counting.executes == 0, f"scans={counting.executes}")
+
+# =========================================================================
+# 2) Python-Filter-Semantik: feature_ids / instance_hashes / numeric_only
+# =========================================================================
+by_grid = reader.feature_keys_by_service(
+    "SILVER", "M1", feature_ids=["srv_grid_lines"])
+check("2a) feature_ids-Filter",
+      set(by_grid) == {"srv_grid_lines"}
+      and set(by_grid["srv_grid_lines"]) == {"open", "close"},
+      str(by_grid))
+by_hashes = reader.feature_keys_by_service(
+    "SILVER", "M1", instance_hashes=["aaaa1111"])
+check("2b) instance_hashes-Filter inkl. NULL-Bestand",
+      set(by_hashes) == {"srv_grid_lines", "srv_proximity"},
+      str(sorted(by_hashes)))
+by_hashes2 = reader.feature_keys_by_service(
+    "SILVER", "M1", instance_hashes=["cccc3333"])
+check("2c) instance_hashes-Filter: exakte Treffer + NULL-Bestand",
+      set(by_hashes2) == {"srv_grid_lines", "srv_proximity", "srv_strings"},
+      str(sorted(by_hashes2)))
+# case-insensitive + whitespace-tolerant (Muster _apply_feature_filter)
+by_ci = reader.feature_keys_by_service(
+    "SILVER", "M1", feature_ids=["  SRV_GRID_LINES "])
+check("2d) feature_ids case-insensitiv/whitespace-tolerant",
+      set(by_ci) == {"srv_grid_lines"}, str(sorted(by_ci)))
+# numeric_only + feature_ids kombiniert
+by_num_grid = reader.feature_keys_by_service(
+    "SILVER", "M1", feature_ids=["srv_strings"], numeric_only=True)
+check("2e) numeric_only entfernt String-Service bei Filter",
+      by_num_grid == {}, str(by_num_grid))
+
+# =========================================================================
+# 3) Invalidation via store_plugin_payload / feature_cache_last_invalidated
+#
+# WICHTIG: store_plugin_payload schliesst eine uebergebene Connection selbst
+# (`own_connection=True`, `finally: con.close()`). Fuer den Write wird daher
+# eine SEPARATE Wegwerf-Connection verwendet, damit die vom Reader genutzte
+# DbPool-Connection (und der _CountingCon-Proxy) offen bleibt.
+# =========================================================================
+from analytics.features.feature_builder import FeatureBuilder  # noqa: E402
+builder = FeatureBuilder()
+con_write = duckdb.connect(db_path)  # wegwerfbar (wird von store_... geschlossen)
+payload = {
+    "feature_id": "srv_grid_lines",
+    "plugin_version": "2.0.0",
+    "records": [
+        {"bar_time": datetime(2026, 8, 10, 12, 0, tzinfo=dt_tz.utc),
+         "open": 40.0, "close": 41.0, "new_key": 1.0},
+    ],
+}
+written = builder.store_plugin_payload(
+    "SILVER", "M1", payload, con=con_write, instance_hash="aaaa1111")
+check("3a) store_plugin_payload schreibt Zeile",
+      written == 1, str(written))
+check("3b) Invalidation registriert (Invariante 13)",
+      feature_cache_last_invalidated("SILVER", "M1") is not None)
+
+# Nach Invalidation: Cache ist stale -> erneuter Basis-Scan liefert new_key
+new_keys = reader.available_feature_keys("SILVER", "M1")
+check("3c) Nach Invalidation: neuer Key sichtbar (Cache invalidiert)",
+      "new_key" in new_keys, str(new_keys))
+by_svc_after = reader.feature_keys_by_service(
+    "SILVER", "M1", feature_ids=["srv_grid_lines"])
+check("3d) Nach Invalidation: srv_grid_lines traegt new_key",
+      "new_key" in by_svc_after.get("srv_grid_lines", []),
+      str(by_svc_after.get("srv_grid_lines")))
+
+# Zweiter Lauf nach Invalidation wieder cache-served (0 DB-Zugriffe)
+counting.executes = 0
+_after = reader.available_feature_keys("SILVER", "M1")
+_after2 = reader.available_instance_hashes("SILVER", "M1")
+check("3e) Nach Re-Scan wieder Cache-Hits",
+      counting.executes == 0, f"scans={counting.executes}")
+
+# =========================================================================
+# 4) No-Data-Semantik: String-Service hat Daten (kein Fehlalarm)
+# =========================================================================
+res = reader.resolve_no_data_variants("SILVER", "M1", {
+    "presets": {"srv_strings": [
+        {"preset_name": "V1", "instance_hash": "cccc3333",
+         "is_archived": False}]},
+    "sets": [], "display_names": {}, "active_hashes": ["cccc3333"],
+})
+check("4a) srv_strings (Daten) NICHT als (No Data)",
+      not any(v.get("plugin_id") == "srv_strings" for v in res),
+      str(res))
+res_new = reader.resolve_no_data_variants("SILVER", "M1", {
+    "presets": {"srv_strings": [
+        {"preset_name": "V2", "instance_hash": "dddd4444",
+         "is_archived": False}]},
+    "sets": [], "display_names": {}, "active_hashes": ["dddd4444"],
+})
+check("4b) Neue Variante ohne Daten weiterhin (No Data)",
+      any(v.get("instance_hash") == "dddd4444" for v in res_new),
+      str(res_new))
+
+# =========================================================================
+# 5) QUERY_FEATURES-Leichtpfad (Fix 1): metrics/field_sources im Payload
+# =========================================================================
+repo = AnalyticsRepository(reader=reader)
+feat = repo.get_available_features(
+    "SILVER", "M1",
+    presets_data={"presets": {}, "sets": [], "display_names": {}},
+    feature_ids=["srv_grid_lines", "srv_proximity"],
+)
+check("5a) Payload traegt metrics",
+      isinstance(feat.get("metrics"), list)
+      and "count" in feat.get("metrics")
+      and "confluence_count" in feat.get("metrics")
+      and set(feat.get("metrics")) >= {"open", "close", "price", "visit_pct",
+                                       "new_key"},
+      str(feat.get("metrics")))
+check("5b) metrics enthalten KEINE String-Service-Keys",
+      "label" not in (feat.get("metrics") or []),
+      str(feat.get("metrics")))
+check("5c) field_sources vorhanden und gefiltert",
+      isinstance(feat.get("field_sources"), dict)
+      and set(feat["field_sources"].get("open") or []) == {"srv_grid_lines"}
+      and set(feat["field_sources"].get("price") or []) == {"srv_proximity"},
+      str(feat.get("field_sources")))
+check("5d) No-Data-Vertrag erhalten",
+      isinstance(feat.get("no_data_variants"), list)
+      and feat.get("no_data_variants_error") is False,
+      str(feat.get("no_data_variants_error")))
+
+# Konsistenz: identische Metadaten ueber Heatmap-Pfad
+hm = repo.get_generic_heatmap(
+    "SILVER", "M1", "date", "hour",
+    feature_ids=["srv_grid_lines", "srv_proximity"],
+    presets_data={"presets": {}, "sets": [], "display_names": {}})
+check("5e) Heatmap-Pfad liefert identische metrics",
+      (hm.get("metrics") or []) == (feat.get("metrics") or []),
+      "")
+check("5f) Heatmap-Pfad liefert identische field_sources",
+      (hm.get("field_sources") or {}) == (feat.get("field_sources") or {}),
+      "")
+
+# =========================================================================
+# 6) Invalidation ohne Writer (defensiver Notausgang)
+# =========================================================================
+reader.invalidate_meta_cache("SILVER", "M1")
+counting.executes = 0
+_after_inv = reader.available_feature_keys("SILVER", "M1")
+check("6a) invalidate_meta_cache erzwingt Re-Scan",
+      counting.executes == 1 and "new_key" in _after_inv,
+      f"scans={counting.executes}")
+reader.invalidate_meta_cache()
+check("6b) invalidate_meta_cache() (ganz) leert den Cache",
+      reader._meta_cache == {}, str(len(reader._meta_cache)))
+
+# Aufraeumen: DbPool-Connections des Test-Threads freigeben (Muster Worker)
+try:
+    DbPool.close_all()
+except Exception:
+    pass
+
+# =========================================================================
+# Ergebnis
+# =========================================================================
+print()
+total = len(PASS)
+failed = [p for p in PASS if not p[1]]
+print(f"Runde 15 (Perf): {total - len(failed)}/{total} Checks bestanden")
+if failed:
+    for name, _ok, info in failed:
+        print("  FAIL:", name, "|", info)
+    sys.exit(1)
+print("ALL PASS")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_round15b.py
+```py
+# test/check_round15b.py
+# -*- coding: utf-8 -*-
+"""
+Verifikation Runde 15b (Bugfix Dropdown, User-Meldung 10.08.2026):
+
+  User-Symptome:
+    1) Check/Uncheck aus dem ServicePicker wird nicht im 'Feld'-Dropdown
+       sichtbar.
+    2) Versionen (Parameter-Varianten) werden nicht mehr verarbeitet und
+       angezeigt.
+    3) Services/Variationen mit NoData erscheinen nicht mit '(No Data)'.
+
+  Root Cause (Runde-15-Regression):
+    `_field_metadata` rief `feature_keys_by_service` MIT `instance_hashes`
+    auf und fiel bei leerem `by_service` (gecheckte NoData-Variante ohne
+    DB-Rows) auf die UNGEFILTERTE `avail`-Key-Liste zurueck -> Dropdown
+    zeigte ALLE Keys aller Services OHNE Service-Prefix und ignorierte die
+    Datenquellen-Auswahl. Zusaetzlich aktualisierte `set_feature_ids` den
+    QUERY_FEATURES-Leichtpfad nicht (Cache blieb auf dem letzten Payload).
+
+  Fixes:
+    A) `_field_metadata`: Feld-Struktur folgt den SERVICES (feature_ids),
+       nicht den Varianten (instance_hashes); ungefilterter Fallback nur
+       ohne aktiven Filter.
+    B) `set_feature_ids` refesht QUERY_FEATURES (zuerst) -> das Dropdown
+       bekommt field_sources/no_data_variants fuer die aktuellen Filter.
+
+KEINE GUI-Ausfuehrung (offscreen). Temp-DB strikt in test/.
+"""
+import os
+import sys
+import tempfile
+
+import duckdb  # noqa: E402
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from datetime import datetime, timezone as dt_tz  # noqa: E402
+
+from PySide6.QtCore import QObject, Signal  # noqa: E402
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+app = QApplication.instance() or QApplication([])
+
+from analytics.engine.analytics_repository import AnalyticsRepository  # noqa: E402
+from analytics.engine.analytics_view_model import AnalyticsViewModel  # noqa: E402
+from analytics.engine.analytics_worker import QUERY_FEATURES  # noqa: E402
+from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
+from analytics.ui.heatmap_widget import HeatmapWidget  # noqa: E402
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+# =========================================================================
+# Temp-DB: srv_grid_lines (Hash aaaa1111) + srv_swing_volume_profile
+# (Hash bbbb2222); Variante 'Kopie 99' (cccc3333) hat KEINE Rows -> NoData
+# =========================================================================
+tmpdir = tempfile.mkdtemp(prefix="pytrader_round15b_", dir=os.path.dirname(__file__))
+db_path = os.path.join(tmpdir, "check_round15b.duckdb")
+con = duckdb.connect(db_path)
+con.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR, timeframe VARCHAR, bar_time TIMESTAMPTZ,
+        feature_id VARCHAR, instance_hash VARCHAR, created_at TIMESTAMP,
+        feature_data JSON, plugin_version VARCHAR,
+        PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
+    )
+""")
+_ROWS = [
+    ("SILVER", "M1", "srv_grid_lines", "aaaa1111",
+     '{"schema_version": "1.0.0", "grid_step": 0.5, "lower_level": 28.0, '
+     '"upper_level": 32.0, "grid_nearest_level": 30.1}'),
+    ("SILVER", "M1", "srv_swing_volume_profile", "bbbb2222",
+     '{"schema_version": "1.0.0", "price": 30.5, "strength_value": 0.8, '
+     '"confirmation_bar_time": 1780000000}'),
+]
+for i, (sym, tf, fid, h, data) in enumerate(_ROWS):
+    con.execute("""
+        INSERT INTO feature_store
+            (symbol, timeframe, bar_time, feature_id, instance_hash,
+             created_at, feature_data)
+        VALUES (?, ?, ?, ?, ?, now(), ?)
+    """, [sym, tf, datetime(2026, 8, 10, 10, i, tzinfo=dt_tz.utc), fid, h, data])
+con.close()
+
+
+class _MockVM(QObject):
+    """Minimal-Mock: params + restore_generation + Name-Resolver."""
+
+    data_ready = Signal(str, dict)
+    feature_ids_changed = Signal()
+
+    def __init__(self, params):
+        super().__init__()
+        self._params = dict(params)
+        self._gen = 0
+
+    @property
+    def params(self):
+        return dict(self._params)
+
+    @property
+    def restore_generation(self):
+        return self._gen
+
+    def resolve_service_display_name(self, plugin_id, preset_name=None):
+        pid = str(plugin_id or "").strip()
+        if not pid or pid.lower() in ("none", "native") \
+                or pid.lower().startswith("native_"):
+            return "Allgemein"
+        pretty = pid.replace("srv_", "").replace("ind_", "").replace("_", " ").title()
+        if preset_name:
+            pretty = f"{pretty} ({preset_name})"
+        return pretty or pid
+
+
+def _mk_widget(feature_ids, instance_hashes=None):
+    params = {
+        "symbol": "SILVER", "timeframe": "M1",
+        "feature_ids": list(feature_ids or []),
+        "instance_hashes": list(instance_hashes or []),
+        "heatmap_x_dim": "date", "heatmap_y_dim": "hour",
+        "heatmap_agg": "confluence_count", "heatmap_field": "",
+        "candle_projection_enabled": False,
+        "zoom_x_range": [0.0, 1.0], "zoom_y_range": [0.0, 1.0],
+    }
+    vm = _MockVM(params)
+    w = HeatmapWidget()
+    w.attach_view_model(vm)
+    return vm, w
+
+
+def _combo_texts(w):
+    out = []
+    m = w._combo_field.model()
+    for i in range(m.rowCount()):
+        item = m.item(i)
+        if item is not None:
+            out.append(str(item.text() or ""))
+    return out
+
+
+repo = AnalyticsRepository(reader=FeatureStoreReader(db_path=db_path))
+
+# =========================================================================
+# S1) Symptom 1: Check srv_grid_lines -> field_sources NUR der aktive Service
+# =========================================================================
+feat = repo.get_available_features(
+    "SILVER", "M1",
+    presets_data={"presets": {}, "sets": [], "display_names": {}},
+    feature_ids=["srv_grid_lines"],
+)
+fs = feat.get("field_sources") or {}
+check("S1) field_sources nur srv_grid_lines (kein Fallback)",
+      set(fs) == {"grid_step", "lower_level", "upper_level", "grid_nearest_level"}
+      and all(v == ["srv_grid_lines"] for v in fs.values()),
+      str(fs))
+check("S1) metrics ohne Fremd-Keys (price/strength_value fehlen)",
+      "price" not in (feat.get("metrics") or [])
+      and "strength_value" not in (feat.get("metrics") or []),
+      str(feat.get("metrics")))
+
+# =========================================================================
+# S2) Symptom 2: NoData-Variante (cccc3333) gecheckt -> aktiver Service
+# liefert seine Felder MIT Prefix (kein ungefilterter Fallback)
+# =========================================================================
+feat2 = repo.get_available_features(
+    "SILVER", "M1",
+    presets_data={
+        "presets": {"srv_swing_volume_profile": [
+            {"preset_name": "Kopie 99", "instance_hash": "cccc3333",
+             "is_archived": False}]},
+        "sets": [], "display_names": {},
+        "active_hashes": ["cccc3333"],
+    },
+    feature_ids=["srv_swing_volume_profile"],
+    instance_hashes=["cccc3333"],
+)
+fs2 = feat2.get("field_sources") or {}
+check("S2) field_sources enthalten die Felder des AKTIVEN Services",
+      set(fs2) == {"price", "strength_value", "confirmation_bar_time"}
+      and fs2.get("price") == ["srv_swing_volume_profile"],
+      str(fs2))
+check("S2) KEINE Fremd-Keys (grid_step etc. fehlen trotz Fallback-Kandidat)",
+      "grid_step" not in (feat2.get("metrics") or [])
+      and "lower_level" not in (feat2.get("metrics") or []),
+      str(feat2.get("metrics")))
+nd2 = feat2.get("no_data_variants") or []
+check("S2) NoData-Variante 'Kopie 99' geliefert",
+      any(v.get("instance_hash") == "cccc3333" for v in nd2), str(nd2))
+
+# Widget: Dropdown zeigt Prefix-Items + NoData-Item
+vm, w = _mk_widget(["srv_swing_volume_profile"], ["cccc3333"])
+w._on_features_ready(feat2)
+texts = _combo_texts(w)
+check("S3) Dropdown zeigt 'Swing Volume Profile / price' (mit Prefix)",
+      any(t == "Swing Volume Profile / price" for t in texts), str(texts))
+check("S3) Dropdown zeigt '(No Data)'-Variante",
+      any("Swing Volume Profile (Kopie 99)" in t and "(No Data)" in t
+          for t in texts),
+      str(texts[-3:]))
+
+# =========================================================================
+# S4) Symptom 1: kein aktiver Filter -> alle Services (Fallback erlaubt)
+# =========================================================================
+feat_all = repo.get_available_features("SILVER", "M1")
+check("S4) Ohne Filter: alle numerischen Keys",
+      "grid_step" in (feat_all.get("metrics") or [])
+      and "price" in (feat_all.get("metrics") or []),
+      str(feat_all.get("metrics")))
+
+# =========================================================================
+# S5) set_feature_ids refresht QUERY_FEATURES (VM-Pfad)
+# =========================================================================
+real_vm = AnalyticsViewModel(analytics_repo=repo)
+real_vm._params["symbol"] = "SILVER"
+real_vm._params["timeframe"] = "M1"
+real_vm.set_feature_ids(["srv_grid_lines"])
+check("S5) set_feature_ids stellt QUERY_FEATURES in die Puffer-Queue",
+      QUERY_FEATURES in real_vm._pending_kinds,
+      str(real_vm._pending_kinds))
+check("S5) QUERY_FEATURES vor der Grafik (Queue-Reihenfolge)",
+      real_vm._pending_kinds[0] == QUERY_FEATURES,
+      str(real_vm._pending_kinds))
+
+# =========================================================================
+# Ergebnis
+# =========================================================================
+print()
+total = len(PASS)
+failed = [p for p in PASS if not p[1]]
+print(f"Runde 15b (Bugfix Dropdown): {total - len(failed)}/{total} Checks bestanden")
+if failed:
+    for name, _ok, info in failed:
+        print("  FAIL:", name, "|", info)
+    sys.exit(1)
+print("ALL PASS")
+
+```
+
+--------------------------------------------------
+
+### DATEI: test/check_round15c.py
+```py
+# test/check_round15c.py
+# -*- coding: utf-8 -*-
+"""
+Verifikation Runde 15c (Bugfix Standalone-Service, User-Meldung 10.08.2026):
+
+  User-Symptom:
+    'srv_trend_breakout' Service wird nicht im Dropdown erkannt und nicht
+    in der noData-Section angezeigt.
+
+  Root Cause:
+    `_no_data_presets_snapshot()` (ViewModel) sammelte NUR Presets/Clones
+    (`model.plugin_presets()`) und Set-Instanzen (`model.get_sets()`).
+    Reine Standalone-Services (registrierte Plugins OHNE Presets UND OHNE
+    Set-Instanz) fielen komplett aus dem Snapshot -> der Reader
+    `resolve_no_data_variants()` konnte sie nie als '(No Data)' liefern,
+    obwohl der feature_store noch keine Rows ihrer plugin_id besitzt.
+
+  Fixes:
+    A) ViewModel `_no_data_presets_snapshot`: Neue Snapshot-Sektion
+       `standalone` mit den registrierten Plugins ohne Presets/Set-Instanz
+       (hash-lose Variante, preset_name 'Default', display_name via
+       resolve_service_display_name).
+    B) Reader `resolve_no_data_variants`: Verarbeitet `standalone` als
+       hash-lose Variante - `_has_data(pid, "")` prueft direkt
+       `pids_with_data` (kein Hash-/Alt-Bestand-Fallback noetig). Die
+       Standalone-pids sind Teil von `active_pids` (feature_keys_by_service-
+       Scope), damit ein Standalone-Service MIT Rows nicht faelschlich als
+       '(No Data)' erscheint.
+
+KEINE GUI-Ausfuehrung (offscreen). Temp-DB strikt in test/.
+"""
+import os
+import sys
+import tempfile
+
+import duckdb  # noqa: E402
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+from datetime import datetime, timezone as dt_tz  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from PySide6.QtCore import QObject, Signal  # noqa: E402
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+app = QApplication.instance() or QApplication([])
+
+from analytics.engine.analytics_repository import AnalyticsRepository  # noqa: E402
+from analytics.engine.analytics_view_model import AnalyticsViewModel  # noqa: E402
+from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
+from analytics.ui.heatmap_widget import HeatmapWidget  # noqa: E402
+
+PASS = []
+
+
+def check(name, ok, info=""):
+    PASS.append((name, bool(ok), info))
+    print(("PASS" if ok else "FAIL"), "-", name, ("" if ok else f" | {info}"))
+
+
+# =========================================================================
+# Temp-DB: srv_grid_lines (aaaa1111) + srv_swing_volume_profile (bbbb2222)
+# HABEN Daten; srv_trend_breakout (Standalone) hat KEINE Rows.
+# =========================================================================
+tmpdir = tempfile.mkdtemp(prefix="pytrader_round15c_", dir=os.path.dirname(__file__))
+db_path = os.path.join(tmpdir, "check_round15c.duckdb")
+con = duckdb.connect(db_path)
+con.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR, timeframe VARCHAR, bar_time TIMESTAMPTZ,
+        feature_id VARCHAR, instance_hash VARCHAR, created_at TIMESTAMP,
+        feature_data JSON, plugin_version VARCHAR,
+        PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
+    )
+""")
+_ROWS = [
+    ("SILVER", "M1", "srv_grid_lines", "aaaa1111",
+     '{"schema_version": "1.0.0", "grid_step": 0.5, "lower_level": 28.0, '
+     '"upper_level": 32.0, "grid_nearest_level": 30.1}'),
+    ("SILVER", "M1", "srv_swing_volume_profile", "bbbb2222",
+     '{"schema_version": "1.0.0", "price": 30.5, "strength_value": 0.8, '
+     '"confirmation_bar_time": 1780000000}'),
+]
+for i, (sym, tf, fid, h, data) in enumerate(_ROWS):
+    con.execute("""
+        INSERT INTO feature_store
+            (symbol, timeframe, bar_time, feature_id, instance_hash,
+             created_at, feature_data)
+        VALUES (?, ?, ?, ?, ?, now(), ?)
+    """, [sym, tf, datetime(2026, 8, 10, 10, i, tzinfo=dt_tz.utc), fid, h, data])
+con.close()
+
+reader = FeatureStoreReader(db_path=db_path)
+repo = AnalyticsRepository(reader=reader)
+
+_SNAPSHOT = {
+    "presets": {
+        "srv_grid_lines": [
+            {"preset_name": "Default", "instance_hash": "aaaa1111",
+             "is_archived": False}],
+        "srv_swing_volume_profile": [
+            {"preset_name": "Default", "instance_hash": "bbbb2222",
+             "is_archived": False}],
+    },
+    "sets": [],
+    "standalone": ["srv_trend_breakout"],
+    "display_names": {
+        "srv_grid_lines|Default": "Grid Lines",
+        "srv_swing_volume_profile|Default": "Swing Volume Profile",
+        "srv_trend_breakout|Default": "Trend Breakout",
+    },
+    "active_hashes": [],
+}
+
+# =========================================================================
+# S1) Reader: Standalone-Service ohne Rows -> '(No Data)'-Variante
+# =========================================================================
+nd = reader.resolve_no_data_variants("SILVER", "M1", dict(_SNAPSHOT))
+trend = [v for v in nd
+         if str(v.get("plugin_id") or "").strip() == "srv_trend_breakout"]
+check("S1) Standalone srv_trend_breakout wird als NoData-Variante geliefert",
+      len(trend) == 1, str(nd))
+check("S1) instance_hash leer (hash-lose Variante), preset_name 'Default'",
+      trend and trend[0].get("instance_hash") == ""
+      and trend[0].get("preset_name") == "Default", str(trend))
+check("S1) display_name 'Trend Breakout'",
+      trend and trend[0].get("display_name") == "Trend Breakout",
+      str(trend))
+check("S1) Preset-Services MIT Daten NICHT in NoData-Liste",
+      all(str(v.get("plugin_id")) != "srv_grid_lines" for v in nd)
+      and all(str(v.get("plugin_id")) != "srv_swing_volume_profile" for v in nd),
+      str(nd))
+
+# =========================================================================
+# S2) Reader: nur srv_trend_breakout aktiv -> genau diese NoData-Variante
+# =========================================================================
+nd2 = reader.resolve_no_data_variants("SILVER", "M1", {
+    "presets": {}, "sets": [], "standalone": ["srv_trend_breakout"],
+    "display_names": {"srv_trend_breakout|Default": "Trend Breakout"},
+    "active_hashes": [],
+})
+check("S2) nur Standalone -> genau 1 NoData-Eintrag",
+      len(nd2) == 1
+      and nd2[0].get("plugin_id") == "srv_trend_breakout", str(nd2))
+
+# =========================================================================
+# S3) Repo-Payload: no_data_variants im get_available_features-Payload
+# =========================================================================
+feat = repo.get_available_features(
+    "SILVER", "M1",
+    presets_data=dict(_SNAPSHOT),
+    feature_ids=["srv_grid_lines", "srv_swing_volume_profile",
+                 "srv_trend_breakout"],
+)
+nd_payload = feat.get("no_data_variants") or []
+check("S3) Payload enthaelt Standalone-NoData",
+      any(str(v.get("plugin_id")) == "srv_trend_breakout" for v in nd_payload),
+      str(nd_payload))
+check("S3) Payload: grid/volume NICHT in NoData",
+      all(str(v.get("plugin_id")) in ("srv_trend_breakout",)
+          for v in nd_payload), str(nd_payload))
+check("S3) field_sources NUR von Services mit Rows",
+      set((feat.get("field_sources") or {}).keys()) == {
+          "grid_step", "lower_level", "upper_level", "grid_nearest_level",
+          "price", "strength_value", "confirmation_bar_time"},
+      str(feat.get("field_sources")))
+check("S3) keine Fehler-Markierung",
+      feat.get("no_data_variants_error") is False,
+      str(feat.get("no_data_variants_error")))
+
+# =========================================================================
+# S4) Widget: Dropdown zeigt 'Trend Breakout – (No Data)' + Feld-Items
+# =========================================================================
+class _MockVM(QObject):
+    """Minimal-Mock: params + restore_generation + Name-Resolver."""
+
+    data_ready = Signal(str, dict)
+    feature_ids_changed = Signal()
+
+    def __init__(self, params):
+        super().__init__()
+        self._params = dict(params)
+        self._gen = 0
+
+    @property
+    def params(self):
+        return dict(self._params)
+
+    @property
+    def restore_generation(self):
+        return self._gen
+
+    def resolve_service_display_name(self, plugin_id, preset_name=None):
+        pid = str(plugin_id or "").strip()
+        pretty = pid.replace("srv_", "").replace("ind_", "").replace("_", " ").title()
+        if preset_name:
+            pretty = f"{pretty} ({preset_name})"
+        return pretty or pid
+
+
+def _combo_texts(w):
+    out = []
+    m = w._combo_field.model()
+    for i in range(m.rowCount()):
+        item = m.item(i)
+        if item is not None:
+            out.append(str(item.text() or ""))
+    return out
+
+
+params = {
+    "symbol": "SILVER", "timeframe": "M1",
+    "feature_ids": ["srv_grid_lines", "srv_swing_volume_profile",
+                    "srv_trend_breakout"],
+    "instance_hashes": [],
+    "heatmap_x_dim": "date", "heatmap_y_dim": "hour",
+    "heatmap_agg": "confluence_count", "heatmap_field": "",
+    "candle_projection_enabled": False,
+    "zoom_x_range": [0.0, 1.0], "zoom_y_range": [0.0, 1.0],
+}
+vm = _MockVM(params)
+w = HeatmapWidget()
+w.attach_view_model(vm)
+w._on_features_ready(feat)
+texts = _combo_texts(w)
+check("S4) Dropdown zeigt 'Trend Breakout – (No Data)'",
+      any("Trend Breakout" in t and "(No Data)" in t for t in texts),
+      str(texts))
+check("S4) Dropdown zeigt normale Feld-Items mit Service-Prefix",
+      any(t == "Grid Lines / grid_step" for t in texts)
+      and any(t == "Swing Volume Profile / price" for t in texts),
+      str(texts))
+
+# Nur-Standalone-Filter: kein Feld-Key, aber NoData-Item sichtbar
+params_only = dict(params)
+params_only["feature_ids"] = ["srv_trend_breakout"]
+vm2 = _MockVM(params_only)
+w2 = HeatmapWidget()
+w2.attach_view_model(vm2)
+feat_only = repo.get_available_features(
+    "SILVER", "M1",
+    presets_data={"presets": {}, "sets": [],
+                  "standalone": ["srv_trend_breakout"],
+                  "display_names": {"srv_trend_breakout|Default": "Trend Breakout"},
+                  "active_hashes": []},
+    feature_ids=["srv_trend_breakout"],
+)
+w2._on_features_ready(feat_only)
+texts2 = _combo_texts(w2)
+check("S4) Nur-Standalone: 'Trend Breakout – (No Data)' sichtbar",
+      any("Trend Breakout" in t and "(No Data)" in t for t in texts2),
+      str(texts2))
+
+# =========================================================================
+# S5) Standalone MIT Daten -> KEINE NoData-Markierung
+# =========================================================================
+db2_path = os.path.join(tmpdir, "check_round15c_with_data.duckdb")
+con2 = duckdb.connect(db2_path)
+con2.execute("""
+    CREATE TABLE feature_store (
+        symbol VARCHAR, timeframe VARCHAR, bar_time TIMESTAMPTZ,
+        feature_id VARCHAR, instance_hash VARCHAR, created_at TIMESTAMP,
+        feature_data JSON, plugin_version VARCHAR,
+        PRIMARY KEY (symbol, timeframe, bar_time, feature_id)
+    )
+""")
+con2.execute("""
+    INSERT INTO feature_store
+        (symbol, timeframe, bar_time, feature_id, instance_hash,
+         created_at, feature_data)
+    VALUES (?, ?, ?, ?, NULL, now(), ?)
+""", ["SILVER", "M1", datetime(2026, 8, 10, 10, 0, tzinfo=dt_tz.utc),
+      "srv_trend_breakout",
+      '{"schema_version": "1.0.0", "is_trend_up": true, '
+      '"trend_strength": 1.2, "reference_price": 30.0}'])
+con2.close()
+reader2 = FeatureStoreReader(db_path=db2_path)
+nd3 = reader2.resolve_no_data_variants("SILVER", "M1", dict(_SNAPSHOT))
+check("S5) Standalone MIT Rows -> KEINE NoData-Variante",
+      all(str(v.get("plugin_id")) != "srv_trend_breakout" for v in nd3),
+      str(nd3))
+
+# =========================================================================
+# S6) VM-Snapshot: Standalone-Plugin wird in `standalone` aufgenommen
+# =========================================================================
+class _FakeModel:
+    """Fake ServiceSelectorModel: get_plugins/get_plugin/plugin_presets/get_sets."""
+
+    def __init__(self, plugins, presets=None, sets=None):
+        self._plugins = {str(p).lower(): SimpleNamespace(plugin_id=str(p))
+                         for p in plugins}
+        self._presets = presets or {}
+        self._sets = sets or []
+
+    def get_plugins(self):
+        return dict(self._plugins)
+
+    def get_plugin(self, plugin_id):
+        return self._plugins.get(str(plugin_id or "").lower())
+
+    def plugin_presets(self):
+        return dict(self._presets)
+
+    def get_sets(self):
+        return list(self._sets)
+
+
+real_vm = AnalyticsViewModel(analytics_repo=repo)
+real_vm._params["symbol"] = "SILVER"
+real_vm._params["timeframe"] = "M1"
+real_vm._selector_model = _FakeModel(
+    plugins=["srv_grid_lines", "srv_trend_breakout"],
+    presets={"srv_grid_lines": [
+        {"preset_name": "Default", "instance_hash": "aaaa1111",
+         "is_archived": False}]},
+)
+real_vm._params["feature_ids"] = ["srv_grid_lines", "srv_trend_breakout"]
+real_vm._params["instance_hashes"] = []
+snap = real_vm._no_data_presets_snapshot()
+check("S6) Snapshot-standalone enthaelt srv_trend_breakout (nicht grid_lines)",
+      list(snap.get("standalone") or []) == ["srv_trend_breakout"],
+      str(snap.get("standalone")))
+check("S6) Snapshot-display_name 'Trend Breakout'",
+      (snap.get("display_names") or {}).get("srv_trend_breakout|Default")
+      == "Trend Breakout", str(snap.get("display_names")))
+check("S6) Presets-Sektion unveraendert (grid_lines)",
+      "srv_grid_lines" in (snap.get("presets") or {}), str(snap.get("presets")))
+
+# Standalone MIT Set-Instanz -> NICHT standalone (Set deckt ab)
+real_vm2 = AnalyticsViewModel(analytics_repo=repo)
+real_vm2._params["symbol"] = "SILVER"
+real_vm2._params["timeframe"] = "M1"
+real_vm2._selector_model = _FakeModel(
+    plugins=["srv_proximity"],
+    sets=[{"services": {"inst1": {"plugin_id": "srv_proximity",
+                                  "params": {}}}}],
+)
+real_vm2._params["feature_ids"] = ["srv_proximity"]
+real_vm2._params["instance_hashes"] = []
+snap2 = real_vm2._no_data_presets_snapshot()
+check("S6) Set-Service srv_proximity NICHT in standalone",
+      list(snap2.get("standalone") or []) == [], str(snap2.get("standalone")))
+
+# Leerer Filter -> leerer Snapshot (13c-Kernwunsch, keine NoData-Rauschen)
+real_vm3 = AnalyticsViewModel(analytics_repo=repo)
+real_vm3._params["symbol"] = "SILVER"
+real_vm3._params["timeframe"] = "M1"
+real_vm3._selector_model = _FakeModel(plugins=["srv_trend_breakout"])
+real_vm3._params["feature_ids"] = []
+real_vm3._params["instance_hashes"] = []
+snap3 = real_vm3._no_data_presets_snapshot()
+check("S6) Leerer Filter -> leerer Snapshot (kein NoData-Rauschen)",
+      snap3 == {"presets": {}, "sets": [], "display_names": {},
+                "active_hashes": []},
+      str(snap3))
+
+# Aktive Hash-Einschraenkung -> Standalone NICHT im Snapshot (hash-lose
+# Variante kann nie Teil einer Varianten-Auswahl sein)
+real_vm4 = AnalyticsViewModel(analytics_repo=repo)
+real_vm4._params["symbol"] = "SILVER"
+real_vm4._params["timeframe"] = "M1"
+real_vm4._selector_model = _FakeModel(plugins=["srv_trend_breakout"])
+real_vm4._params["feature_ids"] = ["srv_trend_breakout"]
+real_vm4._params["instance_hashes"] = ["bbbb2222"]
+snap4 = real_vm4._no_data_presets_snapshot()
+check("S6) Aktive Hash-Einschraenkung -> Standalone NICHT im Snapshot",
+      list(snap4.get("standalone") or []) == [], str(snap4.get("standalone")))
+
+# =========================================================================
+# Ergebnis
+# =========================================================================
+print()
+total = len(PASS)
+failed = [p for p in PASS if not p[1]]
+print(f"Runde 15c (Bugfix Standalone): {total - len(failed)}/{total} Checks bestanden")
 if failed:
     for name, _ok, info in failed:
         print("  FAIL:", name, "|", info)
@@ -51136,8 +54447,11 @@ check("B1b) Kein 'feature_ids = valid' Kuerz-Code mehr",
 # ---------------------------------------------------------------------------
 # Bug 2: resolve_no_data_variants - feature_id-Fallback + Set-Instanzen
 # ---------------------------------------------------------------------------
-from analytics.engine.analytics_view_model import AnalyticsViewModel  # noqa: E402
-from analytics.engine.analytics_repository import AnalyticsRepository  # noqa: E402
+# 20.05: Die No-Data-Auswertung liegt produktiv im FeatureStoreReader
+# (Worker-Pfad, presets_data-Snapshot) - die synchrone VM-Methode wurde
+# als toter Altbestand entfernt. Der Test laeuft daher ueber die Reader-
+# Methode mit einem Fake-Reader (kein DB-Zugriff).
+from analytics.engine.feature_store_reader import FeatureStoreReader  # noqa: E402
 
 
 class _Reader:
@@ -51145,44 +54459,26 @@ class _Reader:
         # Keine Hashes mit Daten -> sonst waeren alle mit exaktem Hash weg
         return set()
 
-    def feature_keys_by_service(self, symbol, timeframe):
+    def feature_keys_by_service(self, symbol, timeframe, feature_ids=None):
         # 'srv_with_data' hat unter einem ANDEREN Hash/NULL Daten - die
         # benannte Variante mit dem eigenen Hash "aaaaaaaa" hat aber keine
         # eigenen Daten -> Runde 10 (Bug 2): sie zaehlt NICHT ueber den
         # pid-Fallback, sondern wird als No Data markiert (differenziert).
         return {"srv_with_data": ["price"], "srv_preset_data": ["price"]}
 
+    def plugin_ids_with_hashes(self, symbol, timeframe):
+        # Keine Bestands-Info -> None => konservative Runde-10-Semantik
+        # (kein Alt-Bestand-Fallback, Runde 13c/14).
+        return None
 
-class _Model2:
-    def __init__(self):
-        self._sets = [
-            {"set_id": "s1", "services": {
-                "inst_a": {"plugin_id": "srv_set_var",
-                           "params": {"p": 1}, "is_archived": False},
-                "inst_arch": {"plugin_id": "srv_archived",
-                              "params": {}, "is_archived": True},
-            }},
-        ]
-
-    def plugin_presets(self):
-        return {
-            # Runde 10 (Bug 2): Kein exakter Hash-Match, pid hat Daten unter
-            # anderem Hash/NULL -> Variante OHNE eigene Daten = No Data.
-            "srv_with_data": [{"preset_name": "v1", "params": {},
-                               "instance_hash": "aaaaaaaa",
-                               "is_archived": False}],
-            # Kein Hash-Match, pid ohne Daten -> No Data
-            "srv_nodata": [{"preset_name": "v1", "params": {},
-                            "instance_hash": "bbbbbbbb",
-                            "is_archived": False}],
-            # Archiviert -> nie No Data
-            "srv_arch": [{"preset_name": "old", "params": {},
-                          "instance_hash": "cccccccc",
-                          "is_archived": True}],
-        }
-
-    def get_sets(self):
-        return self._sets
+    @staticmethod
+    def _no_data_fallback_name(pid, pname):
+        # Identisch zur Reader-Logik (B4-1-Fallback-Anzeigename).
+        pretty = (pid.replace("srv_", "").replace("ind_", "")
+                  .replace("_", " ").title())
+        if not pretty:
+            pretty = pid
+        return f"{pretty} ({pname})"
 
 
 class _Repo:
@@ -51190,9 +54486,30 @@ class _Repo:
         self.reader = _Reader()
 
 
-vm2 = AnalyticsViewModel(analytics_repo=_Repo())
-vm2._selector_model = _Model2()
-no_data = vm2.resolve_no_data_variants("SILVER", "H1")
+# presets_data im Format des VM-Snapshots (_no_data_presets_snapshot).
+presets_data = {
+    "presets": {
+        "srv_with_data": [{"preset_name": "v1", "instance_hash": "aaaaaaaa",
+                           "is_archived": False}],
+        "srv_nodata": [{"preset_name": "v1", "instance_hash": "bbbbbbbb",
+                        "is_archived": False}],
+        "srv_arch": [{"preset_name": "old", "instance_hash": "cccccccc",
+                      "is_archived": True}],
+    },
+    "sets": [
+        {"services": {
+            "inst_a": {"plugin_id": "srv_set_var", "params": {"p": 1},
+                       "is_archived": False},
+            "inst_arch": {"plugin_id": "srv_archived", "params": {},
+                          "is_archived": True},
+        }},
+    ],
+    "display_names": {},
+    "active_hashes": [],
+}
+reader_obj = _Reader()
+no_data = FeatureStoreReader.resolve_no_data_variants(
+    reader_obj, "SILVER", "H1", presets_data)
 nd_by_pid = {str(x.get("plugin_id")): x for x in no_data}
 check("B2) pid mit Daten (anderer Hash), Variante ohne eigene Daten -> No Data",
       "srv_with_data" in nd_by_pid, str(sorted(nd_by_pid)))
@@ -51231,7 +54548,7 @@ print("RUNDE-9 (BUG 1-4) VERIFIZIERT (OK)")
 
 ### DATEI: test/check_ui3_bugfix.py
 ```py
-# test/check_ui3_bugfix.py
+﻿# test/check_ui3_bugfix.py
 # -*- coding: utf-8 -*-
 """
 Bugfix 10.08.2026 (Runde 2):
@@ -51415,14 +54732,60 @@ check("B3) Panel waechst bei groesserem Bedarf (Tree bleibt)",
       grow_only([300, 900], [400, 942]) == [300, 942])
 
 # ---------------------------------------------------------------------------
-# Bug 4) Log-Hoehe 2 Zeilen (Default)
+# Bug 4) Log-Hoehe 6 Zeilen (User 11.08.2026 Nachtrag: 2 Zeilen HOEHER als
+#        die 4-Zeilen-Stufe)
 # ---------------------------------------------------------------------------
-check("B4) Log-Hoehe auf 2 Zeilen reduziert (max)",
-      "setMaximumHeight(fm.lineSpacing() * 2 + 12)" in sw_src)
-check("B4) Log-Hoehe auf 2 Zeilen reduziert (min)",
-      "setMinimumHeight(fm.lineSpacing() * 2 + 12)" in sw_src)
+check("B4) Log-Hoehe 6 Zeilen (User-Nachtrag, max)",
+      "setMaximumHeight(fm.lineSpacing() * 6 + 12)" in sw_src)
+check("B4) Log-Hoehe 6 Zeilen (User-Nachtrag, min)",
+      "setMinimumHeight(fm.lineSpacing() * 6 + 12)" in sw_src)
 check("B4) Keine 4-Zeilen-Hoehe mehr",
       "fm.lineSpacing() * 4 + 12" not in sw_src)
+
+# ---------------------------------------------------------------------------
+# Bug 5) 11.08.2026: Slider-Spielraum + Maximize-Schutz
+# ---------------------------------------------------------------------------
+sc_src = open("scrollable_content.py", encoding="utf-8").read()
+check("B5) Fenster-Mindestbreite fuer Slider-Spielraum gesetzt",
+      "_min_window_width = 1100" in sw_src)
+check("B5) Mindestbreite ueber Minima-Summe (1100 > 920) - Slider beweglich",
+      1100 > 400 + 520)
+check("B5) Kein setStretchFactor mehr (Reflow erzwang 3:2-Verteilung)",
+      "setStretchFactor(0, 3)" not in sw_src)
+check("B5) Handle dicker (8px) - besser ziehbar",
+      "setHandleWidth(8)" in sw_src)
+check("B5) Maximize-Schutz: Reflow resizet maximiertes Fenster nicht",
+      "if not self.isMaximized():" in sc_src)
+check("B5) Inhalt folgt der Fensterbreite (Splitter fuellt Spielraum)",
+      "self._content_widget.resize(w, h)" in sc_src)
+
+# ---------------------------------------------------------------------------
+# Bug 6) 11.08.2026: Ausgegrauter Maximize-Button (Root Cause:
+#        setMaximumSize(...) + exakt-fit-Reflow -> max != QWINDOWSIZE_MAX)
+#        Qt-Windows-QPA (qwindowswindow.cpp: shouldShowMaximizeButton):
+#        Button nur aktiv, wenn maximumSize() == 16777215 (QWINDOWSIZE_MAX)
+#        oder CustomizeWindowHint gesetzt ist.
+# ---------------------------------------------------------------------------
+check("B6) ServiceWindow ueberschreibt apply_screen_cap()",
+      "def apply_screen_cap(self)" in sw_src)
+check("B6) KEIN setMaximumSize in apply_screen_cap (Max = QWINDOWSIZE_MAX)",
+      "self.setMaximumSize(" not in sw_src
+      and "apply_screen_cap" in sw_src)
+check("B6) QWINDOWSIZE_MAX-Begruendung dokumentiert",
+      "QWINDOWSIZE_MAX" in sw_src)
+check("B6) Kein exakt-fit-Maximum im Code (nur Kommentar-Referenz)",
+      not any(
+          l.strip().startswith("self.setMaximumSize(screen.size())")
+          for l in sw_src.splitlines()
+      ))
+
+pw_src = open("persistent_win.py", encoding="utf-8").read()
+check("B6) _fix_window_flags sichert MaximizeButtonHint",
+      "Qt.WindowMaximizeButtonHint" in pw_src)
+check("B6) _fix_window_flags sichert MinimizeButtonHint",
+      "Qt.WindowMinimizeButtonHint" in pw_src)
+check("B6) Flags werden nur bei Bedarf neu gesetzt (kein Restore-Verlust)",
+      "if wanted != flags:" in pw_src)
 
 # ---------------------------------------------------------------------------
 print(f"\n{sum(1 for _, ok, _ in PASS if ok)}/{len(PASS)} Checks PASS")
@@ -51431,7 +54794,6 @@ if fail:
     print("FAILS:", fail)
     sys.exit(1)
 print("ALLE UI3-PRUEFUNGEN BESTANDEN (OK)")
-
 ```
 
 --------------------------------------------------
@@ -53491,21 +56853,26 @@ check("H1) auto_restore aktiv (Registry)",
       str(PersistentWindow.get_registered_class("win_service")))
 check("H2) should_auto_restore('win_service') == True (Auto-Restore beim Start)",
       PersistentWindow.should_auto_restore("win_service") is True)
-check("H3) _keep_history_on_close == True (Position bleibt bei X)",
-      getattr(ServiceWindow, "_keep_history_on_close", False) is True)
+check("H3) _keep_history_on_close == False (Historie intakt seit Runde 17)",
+      getattr(ServiceWindow, "_keep_history_on_close", True) is False)
 
 # Geometrie liegt in der DB (P4/P5). Fenster MANUELL schliessen (nicht
-# App-Ende) -> Eintrag BLEIBT (Position fuer die naechste Wiedereroeffnung).
+# App-Ende) -> Eintrag wird ENTFERNT (Runde 17: _keep_history_on_close=False)
+# -> beim naechsten App-Start wird das Fenster NICHT wiederhergestellt.
+# Die Position ueberlebt via global_settings (DIALOG_GEOMETRY_KEY).
 w.close()
 pump()
 geom_after_close = sm.get_window_geometry("win_service")
-check("H4) Geometrie-Eintrag nach close() bleibt (Position 200,180)",
-      geom_after_close is not None
-      and geom_after_close["pos_x"] == 200 and geom_after_close["pos_y"] == 180,
-      str(geom_after_close))
+check("H4) Geometrie-Eintrag nach close() ENTFERNT (kein Restore beim Start)",
+      geom_after_close is None, str(geom_after_close))
 inst_after_close = [i for i in sm.load_all_instances() if i.get("instance_id") == "win_service"]
-check("H5) Instanz-Eintrag nach close() bleibt (Symbol/Timeframe gemerkt)",
-      len(inst_after_close) == 1, str(inst_after_close))
+check("H5) Instanz-Eintrag nach close() ENTFERNT (Historie intakt)",
+      len(inst_after_close) == 0, str(inst_after_close))
+dg_after_close = sm.get_dialog_geometry("win_service")
+check("H5b) Positions-Fallback in global_settings ueberlebt (200,180)",
+      dg_after_close is not None
+      and dg_after_close["pos_x"] == 200 and dg_after_close["pos_y"] == 180,
+      str(dg_after_close))
 
 # "Neustart-Simulation": Position (333,222) wird wiederhergestellt; die
 # Groesse folgt dem Inhalt (NICHT der DB-Groesse 900x600).
@@ -53528,11 +56895,12 @@ check("H7) Groesse folgt dem Inhalt (nicht DB-Groesse 900x600)",
 w2.close()
 pump()
 
-# 20.01 (E1): AnalyticsWindow ist ein Dashboard-Fenster - der Workspace
-# (instance_states.workspace_state) muss das manuelle Schliessen ueberleben.
+# 11.08.2026 (Runde 17e): AnalyticsWindow wird beim MANUELLEN Schliessen
+# aus der Historie entfernt (kein Wiedererscheinen beim Neustart). Der
+# Workspace ueberlebt via global_settings-Backup ("analytics_workspace").
 from analytics.ui.analytics_win import AnalyticsWindow  # noqa: E402
-check("H8) AnalyticsWindow behaelt History (keep_history=True, 20.01 E1)",
-      getattr(AnalyticsWindow, "_keep_history_on_close", False) is True)
+check("H8) AnalyticsWindow Historie intakt (keep_history=False, Runde 17e)",
+      getattr(AnalyticsWindow, "_keep_history_on_close", True) is False)
 check("H9) AnalyticsWindow auto_restore aktiv (offen beim App-Ende)",
       PersistentWindow.should_auto_restore("win_analytics"))
 
@@ -58332,9 +61700,9 @@ from analytics.engine.analytics_view_model import AnalyticsViewModel as _VM36  #
 from analytics_profile_repository import AnalyticsProfileRepository as _APR36  # noqa: E402
 from analytics.engine.service_selector_model import ServiceSelectorModel as _SSM36  # noqa: E402
 
-# --- W8: Klassen-Check _keep_history_on_close (E1) -------------------------
-check("36 W8) AnalyticsWindow._keep_history_on_close is True (E1)",
-      AnalyticsWindow._keep_history_on_close is True,
+# --- W8: Klassen-Check _keep_history_on_close (Runde 17e) ------------------
+check("36 W8) AnalyticsWindow._keep_history_on_close is False (Historie intakt)",
+      AnalyticsWindow._keep_history_on_close is False,
       str(AnalyticsWindow._keep_history_on_close))
 
 # --- W1/W2: workspace_state-Spalte + Roundtrip (E6, NOT-NULL-konform) ------
@@ -59708,7 +63076,7 @@ Kein Import von main.py (IoC – der WindowManager kennt MainWindow nicht).
 <?xml version="1.0" encoding="UTF-8"?>
 <ui version="4.0">
  <class>ServiceWindow</class>
- <widget class="QMainWindow" name="ServiceWindow">
+ <widget class="QWidget" name="ServiceWindow">
   <property name="geometry">
    <rect>
     <x>0</x>
@@ -59720,7 +63088,6 @@ Kein Import von main.py (IoC – der WindowManager kennt MainWindow nicht).
   <property name="windowTitle">
    <string>PyTrader - Service Kontrolle</string>
   </property>
-  <widget class="QWidget" name="centralwidget">
    <layout class="QVBoxLayout" name="verticalLayout">
     <item>
      <layout class="QHBoxLayout" name="layout_symbol">
@@ -59817,7 +63184,6 @@ Kein Import von main.py (IoC – der WindowManager kennt MainWindow nicht).
      </widget>
     </item>
    </layout>
-  </widget>
  </widget>
  <resources/>
  <connections/>
