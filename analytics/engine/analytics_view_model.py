@@ -1353,6 +1353,30 @@ class AnalyticsViewModel(QObject):
         except Exception:
             return None
 
+    def service_execution_datetime(self, plugin_id: str) -> str:
+        """Datum+Uhrzeit der letzten Ausfuehrung eines Services.
+
+        Runde 16c (Bugfix 1, 11.08.2026, User-Meldung): Das Feld-Dropdown
+        haengt an Services OHNE Varianten (Standalone, z. B.
+        srv_trend_breakout - kein Preset/keine Set-Instanz) das
+        Ausfuehrungsdatum an ('{Name} / {Key} / DD.MM.JJ HH:MM', z. B.
+        '23.04.26 22:14'). Rein lesend ueber das ServiceSelectorModel
+        (`last_execution_datetime`); Fallback '--.--.-- --:--' ohne
+        Eintraege oder bei Fehlern (defensiv).
+        """
+        key = str(plugin_id or "").strip()
+        if not key:
+            return "--.--.-- --:--"
+        model = self._selector_model
+        if model is None:
+            from analytics.engine.service_selector_model import ServiceSelectorModel
+            model = ServiceSelectorModel(parent=self)
+            self._selector_model = model
+        try:
+            return model.last_execution_datetime(key)
+        except Exception:
+            return "--.--.-- --:--"
+
     def resolve_instance_hashes(self,
                                 hashes: Iterable[str]) -> List[str]:
         """Loest instance_hash-Werte transparent auf plugin_ids auf (20.04, Q2).

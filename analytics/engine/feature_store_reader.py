@@ -1396,6 +1396,46 @@ class FeatureStoreReader:
                 continue
         return out
 
+    def fetch_last_execution_datetimes(self) -> Dict[str, str]:
+        """Neuester Schreib-Zeitpunkt je feature_id MIT Uhrzeit.
+
+        Bugfix 11.08.2026 (Runde 16c, Dropdown-Anzeige, User-Meldung):
+        Das Feld-Dropdown haengt an Services OHNE Varianten (Standalone,
+        z. B. srv_trend_breakout) das Datum+Uhrzeit der letzten Ausfuehrung
+        an ('{Name} / {Key} / DD.MM.JJ HH:MM', z. B. '23.04.26 22:14').
+        `fetch_last_execution_dates` liefert nur das Datum - diese Methode
+        ergaenzt die Uhrzeit. Quelle/Filter/Semantik identisch zur
+        Datums-Variante (MAX(created_at) GROUP BY feature_id ueber ALLE
+        Symbole/Timeframes; case-insensitiv/whitespace-tolerant; Rows ohne
+        created_at werden uebersprungen).
+
+        Returns:
+            Dict feature_id (lower) -> 'DD.MM.JJ HH:MM' - leer bei
+            fehlender DB/Tabelle oder Fehler (defensiv).
+        """
+        con = self._get_connection()
+        try:
+            rows = con.execute("""
+                SELECT LOWER(TRIM(feature_id)) AS fid, MAX(created_at)
+                FROM feature_store
+                WHERE feature_id IS NOT NULL AND TRIM(feature_id) != ''
+                  AND feature_id != ?
+                GROUP BY LOWER(TRIM(feature_id))
+            """, [SENTINEL_NATIVE]).fetchall()
+        except Exception as e:
+            print(f"WARN [FeatureStoreReader] fetch_last_execution_datetimes "
+                  f"fehlgeschlagen: {e}")
+            return {}
+        out: Dict[str, str] = {}
+        for r in rows:
+            if r[0] is None or r[1] is None:
+                continue
+            try:
+                out[str(r[0])] = r[1].strftime("%d.%m.%y %H:%M")
+            except (AttributeError, ValueError):
+                continue
+        return out
+
     # ------------------------------------------------------------------
     # Lesen: Metadaten
     # ------------------------------------------------------------------

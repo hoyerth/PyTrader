@@ -137,6 +137,12 @@ class ServiceSelectorModel(QObject):
         self._active_indicator_ids: Set[str] = set()
         # 05.08.2026: Datum der letzten Ausfuehrung je feature_id (DD.MM.JJ)
         self._last_execution_dates: Dict[str, str] = {}
+        # 11.08.2026 (Bugfix Runde 16c, Dropdown-Anzeige): Datum+Uhrzeit der
+        # letzten Ausfuehrung je feature_id ('DD.MM.JJ HH:MM') – Grundlage der
+        # Feld-Dropdown-Anzeige '{Name} / {Key} / DD.MM.JJ HH:MM' fuer
+        # Services OHNE Varianten (Standalone). Quelle:
+        # FeatureStoreReader.fetch_last_execution_datetimes().
+        self._last_execution_datetimes: Dict[str, str] = {}
         # 10.08.2026 (Varianten-Ausfuehrungsdatum): Datum der letzten
         # Ausfuehrung je (feature_id, instance_hash) – Grundlage der
         # MasterTree-Varianten-Anzeige '<Preset> (DD.MM.JJ)'. Quelle:
@@ -190,6 +196,10 @@ class ServiceSelectorModel(QObject):
         # wird nach jedem Service-Run (ServiceRunWorker -> EventBus) neu
         # gelesen, damit der MasterTree das Datum live aktualisiert.
         self._last_execution_dates = self._load_last_execution_dates()
+        # 11.08.2026 (Bugfix Runde 16c, Dropdown-Anzeige): Datum+Uhrzeit der
+        # letzten Ausfuehrung je feature_id – Grundlage der Feld-Dropdown-
+        # Anzeige fuer Services OHNE Varianten ('{Name} / {Key} / DD.MM.JJ HH:MM').
+        self._last_execution_datetimes = self._load_last_execution_datetimes()
         # 10.08.2026 (Varianten-Ausfuehrungsdatum): Datum der letzten
         # Ausfuehrung je (feature_id, instance_hash) – Grundlage der
         # MasterTree-Varianten-Anzeige '<Preset> (DD.MM.JJ)'. Wird NACH den
@@ -332,6 +342,37 @@ class ServiceSelectorModel(QObject):
         # Case-insensitive Zuordnung (feature_id ist die Plugin-ID, z.B.
         # 'srv_proximity' – Registry-IDs sind case-insensitiv).
         return {str(k).lower(): v for k, v in raw.items()}
+
+    def _load_last_execution_datetimes(self) -> Dict[str, str]:
+        """Liest Datum+Uhrzeit der letzten Ausfuehrung je feature_id.
+
+        11.08.2026 (Bugfix Runde 16c, Dropdown-Anzeige): Delegate an den
+        FeatureStoreReader (fetch_last_execution_datetimes) – das
+        Feld-Dropdown haengt an Services OHNE Varianten (Standalone) das
+        Ausfuehrungsdatum an ('DD.MM.JJ HH:MM'). Defensiv: Fehler -> leer
+        (Eintraege zeigen dann keinen Datums-Anhang).
+        """
+        try:
+            raw = self.feature_store_reader.fetch_last_execution_datetimes() or {}
+        except Exception as e:
+            print(f"WARN [ServiceSelectorModel] Ausfuehrungsdaten "
+                  f"(Datum+Uhrzeit) nicht lesbar: {e}")
+            return {}
+        return {str(k).lower(): v for k, v in raw.items()}
+
+    def last_execution_datetime(self, plugin_id: str) -> str:
+        """Datum+Uhrzeit der letzten Ausfuehrung eines Services.
+
+        11.08.2026 (Bugfix Runde 16c, Dropdown-Anzeige): Format 'DD.MM.JJ HH:MM'
+        (z. B. '23.04.26 22:14') – Fallback '--.--.-- --:--' ohne Eintraege.
+        Quelle: MAX(created_at) des feature_store fuer die feature_id
+        (Plugin-ID) des Services ueber ALLE Varianten/Symbole/Timeframes.
+        Rein lesend aus dem Refresh-Zustand.
+        """
+        if not plugin_id:
+            return "--.--.-- --:--"
+        return self._last_execution_datetimes.get(
+            str(plugin_id).lower(), "--.--.-- --:--")
 
     def last_execution_date(self, plugin_id: str) -> str:
         """Formatiertes Datum der letzten Ausfuehrung eines Services

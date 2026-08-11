@@ -1395,6 +1395,24 @@ class HeatmapWidget(QWidget):
                         variant.get("exec_datetime") or "").strip()
                     if exec_date and not exec_date.startswith("--."):
                         label = f"{label} / {exec_date}"
+                else:
+                    # Runde 16c (Bugfix 1, 11.08.2026, User-Meldung):
+                    # Services OHNE Varianten (Standalone, keine Presets)
+                    # bekommen das Datum+Uhrzeit der letzten Ausfuehrung
+                    # angehaengt ('{Name} / {Key} / DD.MM.JJ HH:MM', z. B.
+                    # '23.04.26 22:14'), wenn vorhanden. Defensiv via
+                    # getattr: Fake-/Alt-ViewModels ohne die Methode
+                    # ergeben keinen Anhang.
+                    _sd = getattr(self._view_model,
+                                  "service_execution_datetime", None)
+                    if callable(_sd):
+                        try:
+                            exec_date = str(
+                                _sd(str(service_ids[0])) or "").strip()
+                            if exec_date and not exec_date.startswith("--."):
+                                label = f"{label} / {exec_date}"
+                        except Exception:
+                            pass
                 return label
         return str(key)
 
