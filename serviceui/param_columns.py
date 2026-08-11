@@ -597,8 +597,16 @@ class ServiceParamColumnsMixin:
             return
         try:
             box.updateGeometry()
-            box.resize(box.layout().sizeHint())
+            # 11.08.2026 (Bugfix Runde 17c, User-Meldung 5): Bei einer
+            # _param_scroll mit widgetResizable=True streckt die ScrollArea
+            # die Box automatisch auf den Viewport – ein manuelles resize auf
+            # die Layout-Groesse wuerde sie wieder zuruecksetzen. NUR bei
+            # widgetResizable=False (Alt-Verhalten) wird die Box weiterhin
+            # explizit auf ihre Layout-Groesse gesetzt. _DialogParamHost hat
+            # keinen _param_scroll -> resize bleibt aktiv (Layout streckt).
             scroll = getattr(self, "_param_scroll", None)
+            if scroll is None or not scroll.widgetResizable():
+                box.resize(box.layout().sizeHint())
             if scroll is not None:
                 scroll.updateGeometry()
             # Bugfix 05.08.2026 (Punkt 1): Der QSplitter fixiert die

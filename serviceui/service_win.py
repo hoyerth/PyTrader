@@ -94,10 +94,13 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
     #: Geometrie-Key fuer die POSITION, die ein manuelles Schliessen
     #: ueberlebt (global_settings, vgl. IndicatorSettingsDialog-Muster).
     DIALOG_GEOMETRY_KEY = "win_service"
-    # 05.08.2026: Die FensterGROESSE folgt immer exakt dem Inhalt (auch
-    # schrumpfen) – NUR die Position wird persistiert (save_state/restore_state
-    # Overrides weiter unten). Ermoeglicht durch ContentScrollMixin.
-    _exact_fit_to_content = True
+    # 05.08.2026: Die FensterGROESSE folgte exakt dem Inhalt (auch schrumpfen).
+    # 11.08.2026 (Bugfix Runde 17c, User-Meldung 4/5): Umgestellt – der INHALT
+    # folgt jetzt dem FENSTER (normales resizable Fenster): _exact_fit_to_content
+    # = False bedeutet 'nur wachsen, nie schrumpfen' (Mixin-Pfad). Das Fenster
+    # kann manuell grossgezogen und maximiert werden; widgetResizable=True
+    # streckt den Inhalt auf den Viewport (Splitter, MasterTree, Param-Box).
+    _exact_fit_to_content = False
     # 11.08.2026 (Bugfix, Slider): Mindest-Breite des FENSTERS ueber der
     # Splitter-Minima-Summe (Tree 400 + Panel 520 = 920). Dadurch hat der
     # QSplitter IMMER Spielraum - der Slider zwischen den beiden Hauptrahmen
@@ -193,9 +196,15 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         self.widget_service_columns.setObjectName("widget_service_columns")
         self.service_columns_layout = QHBoxLayout(self.widget_service_columns)
         self.service_columns_layout.setSpacing(6)
-        # Inhalt-Widget + Layout VOR dem Scroll-Wrapper referenzieren
-        # (install_content_scroll ersetzt das CentralWidget von self.ui).
-        self.content_widget = self.ui.centralWidget()
+        # Inhalt-Widget + Layout VOR dem Scroll-Wrapper referenzieren.
+        # 11.08.2026 (Bugfix Runde 17c, User-Meldung 4): self.ui ist seit der
+        # .ui-Umstellung (QMainWindow -> QWidget) das WIDGET mit dem Layout
+        # selbst (kein centralwidget-Zwischenschritt mehr). Das frueher hier
+        # eingebettete QMainWindow wuchs NICHT mit dem Fenster (Qt verlangt
+        # QMainWindow nur als Top-Level) - Ursache fuer 'Grossziehen ohne
+        # Anpassung'. install_content_scroll setzt die ScrollArea jetzt direkt
+        # als CentralWidget von self (siehe unten).
+        self.content_widget = self.ui
         self.central_layout = self.content_widget.layout() if self.content_widget else None
         if self.central_layout is not None:
             # Bugfix 05.08.2026 (Layout-Bereinigung Phase 13): ZWEI-SPALTEN-
@@ -261,10 +270,12 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             # horizontalen Scrollbalken passen - bei mehr Services/Spalten
             # scrollt die ContentScrollArea.
             self._param_scroll = ContentScrollArea()
-            self._param_scroll.setWidgetResizable(False)
+            # 11.08.2026 (Bugfix Runde 17c, User-Meldung 5): widgetResizable
+            # = True + KEINE max. Breite/Hoehe mehr – die Service-Parameter-
+            # Box passt sich der Fenstergroesse an (vorher auf 1000x1240
+            # gedeckelt; beim Grossziehen blieb sie stehen).
+            self._param_scroll.setWidgetResizable(True)
             self._param_scroll.setWidget(self.widget_service_columns)
-            self._param_scroll.setMaximumHeight(1240)
-            self._param_scroll.setMaximumWidth(1000)
             param_layout.addWidget(self._param_scroll, 1)
             # Aktions-Leiste direkt UNTER der Parameter-Box - [Speichern]
             # persistiert die Parameter-Aenderungen ohne Neuberechnung;
@@ -320,7 +331,15 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # (ContentScrollMixin). Der Inhalt behält seine natürliche Größe; das
         # Fenster wird auf den Bildschirm geklemmt (Scrollbars erscheinen erst,
         # wenn der Inhalt den Viewport übersteigt).
-        self.install_content_scroll(self.content_widget, install_to=self.ui)
+        self.install_content_scroll(self.content_widget, install_to=self)
+        # 11.08.2026 (Bugfix Runde 17c, User-Meldung 4): widgetResizable=True
+        # – die ContentScrollArea streckt das Inhalt-Widget auf den Viewport.
+        # Beim manuellen Grossziehen (Rahmen/Ecke) wachsen Splitter, MasterTree
+        # und Param-Box mit (vorher widgetResizable=False: Inhalt blieb stehen,
+        # das Fenster wurde nur leer groesser). Nur ServiceWindow; der
+        # IndicatorSettingsDialog (anderer Mixin-Nutzer) bleibt unveraendert.
+        if self.content_scroll is not None:
+            self.content_scroll.setWidgetResizable(True)
         self.main_layout = self.ui.layout()
         # KEIN SetFixedSize auf dem QMainWindowLayout: das würde die
         # Fenstergröße auf den Inhalt fixieren und das Bildschirm-Cap
@@ -409,12 +428,12 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
     # --- PersistentWindow-Interface ---
 
     def save_state(self) -> None:
-        """Persistiert die Fenster-POSITION (05.08.2026, Punkt 1).
+        """Persistiert Fenster-POSITION und -GROESSE (05.08.2026, Punkt 1).
 
-        Die Fenster-GROESSE wird bewusst NICHT wiederhergestellt – sie folgt
-        immer exakt dem Inhalt (resize_to_clamped_content, _exact_fit_to_content).
-        Ein fester Groessenwert wuerde das exakte Anpassen an Tree/Log/Box
-        (Punkte 3+4) unterlaufen. Position + Symbol/Timeframe bleiben erhalten.
+        11.08.2026 (Bugfix Runde 17c): Seit _exact_fit_to_content=False folgt
+        der Inhalt dem Fenster – die GROESSE wird jetzt wiederhergestellt
+        (restore_state), damit die manuell gezogene/Maximize-Groesse des Users
+        erhalten bleibt. Position + Symbol/Timeframe bleiben weiterhin erhalten.
 
         06.08.2026 (History-Bug): Die POSITION wird zusaetzlich in
         global_settings gesichert (save_dialog_geometry). Beim manuellen
@@ -460,7 +479,13 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         if not inst_id:
             return
         # Window-Flags korrigieren (QUiLoader setzt oft Qt.Tool | Qt.Dialog).
-        self._fix_window_flags()
+        # 11.08.2026 (Bugfix Runde 17c): Nur wenn das Fenster noch NICHT
+        # sichtbar ist - setWindowFlags() auf einem sichtbaren Fenster bricht
+        # die Layout-Geometrie-Verwaltung (Inhalt folgt dem Resize nicht
+        # mehr). Die Flags werden seit Runde 17c bereits im Konstruktor
+        # (PersistentWindow.__init__) gesetzt, wo das Fenster unsichtbar ist.
+        if not self.isVisible():
+            self._fix_window_flags()
         geom = self._state_manager.get_window_geometry(inst_id)
         if not geom:
             try:
@@ -471,7 +496,14 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         if geom:
             pos_x = geom.get("pos_x")
             pos_y = geom.get("pos_y")
+            width = geom.get("width")
+            height = geom.get("height")
             screen_geo = QApplication.primaryScreen().availableGeometry()
+            # 11.08.2026 (Bugfix Runde 17c, User-Meldung 4): Fenster-GROESSE
+            # wiederherstellen – vorher bewusst ignoriert (exakt-fit-to-content).
+            # Mit _exact_fit_to_content=False bleibt die User-Groesse erhalten.
+            if width and height:
+                self.resize(max(int(width), 640), max(int(height), 480))
             if pos_x is not None and pos_y is not None:
                 if pos_x < screen_geo.x() - 100 or pos_x > screen_geo.right() or \
                    pos_y < screen_geo.y() - 100 or pos_y > screen_geo.bottom():
@@ -507,8 +539,40 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self._invalidate_content_caches()
         super()._apply_reflow_size()
 
+    def resize_to_clamped_content(self) -> None:
+        """11.08.2026 (Bugfix Runde 17c, User-Meldung 4): Override.
+
+        Das Basis-Mixin resizet das Inhalt-Widget MANUELL (auf sizeHint bzw.
+        auf die Fensterbreite). Mit widgetResizable=True (Runde 17c) verwaltet
+        die ContentScrollArea das Inhalt-Widget aber selbst - das manuelle
+        resize() brach die Layout-Verwaltung und 'fror' die ScrollArea auf der
+        alten Groesse ein (Inhalt folgte dem Fenster-Resize nicht mehr).
+
+        Daher wird hier NUR die FENSTER-Groesse nachgefuehrt:
+          * nur wachsen, nie schrumpfen (User darf frei ziehen/verkleinern),
+          * Screen-Klemme (max. verfuegbare Flaeche),
+          * _min_window_width (Splitter-Spielraum, ServiceWindow=1100).
+        Das Inhalt-Widget (Splitter, MasterTree, Param-Box) folgt der
+        ScrollArea automatisch (widgetResizable=True).
+        """
+        if self._content_widget is None:
+            return
+        content = self.clamped_content_size()
+        frame = self.frameGeometry().size() - self.size()
+        desired = QSize(content.width() + frame.width(),
+                        content.height() + frame.height())
+        screen = QApplication.primaryScreen().availableGeometry()
+        current = self.size()
+        new_w = min(max(desired.width(), current.width()), screen.width())
+        new_h = min(max(desired.height(), current.height()), screen.height())
+        min_w = getattr(self, '_min_window_width', 0) or 0
+        if min_w:
+            new_w = max(new_w, min(min_w, screen.width()))
+        if not self.isMaximized():
+            self.resize(new_w, new_h)
+
     def apply_screen_cap(self) -> None:
-        """11.08.2026 (Bugfix, Maximize): Ausgegrauter Maximize-Button.
+        """11.08.2026 (Bugfix, Maximize): Ausgegrauter Maximize-Button."
 
         Das Basis-Mixin setzte setMaximumSize(screen.size()) - sobald das
         Fenster auf exakt dieser Groesse lag (z. B. Inhalt >= Screen oder

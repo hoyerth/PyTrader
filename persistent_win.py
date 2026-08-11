@@ -73,6 +73,14 @@ class PersistentWindow(QMainWindow):
 
         # In Registry eintragen
         _open_windows.add(self)
+        # 11.08.2026 (Bugfix Runde 17c, User-Meldungen 3+4): Window-Flags
+        # HIER setzen - das Fenster ist zu diesem Zeitpunkt noch NICHT
+        # sichtbar. setWindowFlags() auf einem SICHTBAREN Fenster bricht die
+        # Layout-Geometrie-Verwaltung des QMainWindow-Layouts: Die
+        # ContentScrollArea 'friert' auf der alten Groesse ein und folgt dem
+        # manuellen Grossziehen/Maximieren nicht mehr. Der deferred Aufruf in
+        # restore_state() ist damit nur noch eine defensive Wiederholung.
+        self._fix_window_flags()
 
     @classmethod
     def get_registered_class(cls, instance_id: str) -> Optional[Type['PersistentWindow']]:
@@ -118,6 +126,11 @@ class PersistentWindow(QMainWindow):
         # setWindowFlags-Fallstricke), ist der Maximize-Button ausgegraut.
         wanted = (flags | Qt.Window | Qt.WindowMaximizeButtonHint
                   | Qt.WindowMinimizeButtonHint)
+        # 11.08.2026 (Bugfix Runde 17c, User-Meldung 3): MSWindowsFixedSize-
+        # DialogHint EXPLIZIT entfernen – dieses Flag deaktiviert den Maximize-
+        # Button auf Windows (Fenster gilt als fest gross). Qt setzt es ggf.
+        # automatisch, wenn das Fenster zeitweise als fixed erkannt wurde.
+        wanted &= ~Qt.MSWindowsFixedSizeDialogHint
         if wanted != flags:
             self.setWindowFlags(wanted)
 

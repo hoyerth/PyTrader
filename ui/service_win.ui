@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <ui version="4.0">
  <class>ServiceWindow</class>
- <widget class="QMainWindow" name="ServiceWindow">
+ <widget class="QWidget" name="ServiceWindow">
   <property name="geometry">
    <rect>
     <x>0</x>
@@ -13,7 +13,6 @@
   <property name="windowTitle">
    <string>PyTrader - Service Kontrolle</string>
   </property>
-  <widget class="QWidget" name="centralwidget">
    <layout class="QVBoxLayout" name="verticalLayout">
     <item>
      <layout class="QHBoxLayout" name="layout_symbol">
@@ -110,7 +109,6 @@
      </widget>
     </item>
    </layout>
-  </widget>
  </widget>
  <resources/>
  <connections/>
