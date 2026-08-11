@@ -300,3 +300,116 @@ Mit den Runden 16 (Mischbetrieb NoData & Dropdown-Anzeige) und 16c (Ausfuehrungs
 * **Offen (manuell):** App-Test - Maximize-Button klickbar, Log-Fenster 6 Zeilen hoch.
 
 ---
+
+## 13. Implementierungs-Log - Bugfix Runde 17c: Maximize aktiv, Inhalt folgt Fenster, Param-Box waechst mit (11.08.2026)
+
+**Problem (User-Meldungen 3/4/5, 11.08.2026):**
+3. Der **Maximize-Button im service_win ist immer noch ausgegraut**.
+4. Manuelles Grossziehen (Rahmen/Ecke) ohne Inhalt-Anpassung.
+5. Die Parameter-Box soll sich der Fenstergroesse anpassen (ggf. auch die Hoehe des MasterTrees).
+
+**Root Cause 3+4 (offscreen verifiziert, Commit `8e2841b`):** `_fix_window_flags()` rief `setWindowFlags()` DEFERRED NACH `win.show()` auf. `setWindowFlags()` auf einem SICHTBAREN Fenster bricht die Layout-Geometrie-Verwaltung des QMainWindow-Layouts - die ContentScrollArea 'friert' auf der alten Groesse ein und folgt dem manuellen Resize/Maximize nicht mehr (Ursache Meldung 4). Zusaetzlich war `self.ui` ein eingebettetes QMainWindow (Qt verlangt QMainWindow nur als Top-Level) - es wuchs ebenfalls nicht mit.
+
+### Loesung (Fixes 1-4)
+
+* **Fix 1 (`persistent_win.py`):** `_fix_window_flags()` wird jetzt im KONSTRUKTOR gerufen (Fenster unsichtbar -> `setWindowFlags` sicher); `restore_state` ruft es nur noch, wenn das Fenster unsichtbar ist. `MSWindowsFixedSizeDialogHint` wird explizit entfernt (deaktiviert den Maximize-Button). Nachtrag (Commit `289b634`): auch die Basis-`restore_state` setzt Flags nur noch bei unsichtbarem Fenster (Schutz fuer AnalyticsWindow/StatisticWindow).
+* **Fix 2 (`ui/service_win.ui`):** Root von QMainWindow auf QWidget umgestellt (hatte nur ein centralwidget, keine menubar/statusbar) - Layout direkt im Root.
+* **Fix 3 (`serviceui/service_win.py`):** `content_widget = self.ui` (kein `centralWidget()` mehr), `install_content_scroll` setzt die ScrollArea DIREKT als CentralWidget von `self`. `_exact_fit_to_content=False` (Inhalt folgt Fenster, nur wachsen). `content_scroll` + `param_scroll` auf `widgetResizable=True` (Inhalt waechst mit dem Fenster). Kein 1000x1240-Cap der Param-Box mehr. `restore_state` wendet die gespeicherte Fenster-Groesse an. `resize_to_clamped_content()`-Override resizet das Inhalt-Widget nicht mehr manuell (wuerde `widgetResizable` brechen) sondern fuehrt nur die Fenster-Groesse nach.
+* **Fix 4 (`serviceui/param_columns.py`):** `box.resize` nur noch bei `widgetResizable=False` (ScrollArea uebernimmt die Streckung).
+
+### Verifikation (headless, keine UI-Tests)
+
+* `test/check_r17c_resize.py`: **19/19 PASS** (R1/D1-D4: widgetResizable True, kein 1000/1240-Cap, MSFixedSizeHint weg, MaxHint gesetzt, Inhalt waechst mit, Reflow schrumpft nicht).
+* `test/check_ui3_bugfix.py`: **32/32 PASS**; `test/check_r17b_construct.py`: **11/11 PASS**; `py_compile` OK.
+* **Offen (manuell):** App-Test Maximize-Button + Grossziehen.
+
+---
+
+## 14. Implementierungs-Log - Bugfix Runde 17d: ServiceWindow waechst mit dem Fenster, Maximize-Button sicher (11.08.2026)
+
+**Problem (Fortsetzung nach Pause, User-Meldungen 3/4/5, 11.08.2026):** Der Maximize-Button blieb ausgegraut; das manuelle Grossziehen zeigte weiterhin keine Inhalt-Anpassung.
+
+**Root Cause 4+5 (dynamisch verifiziert, Commit `4414fc5`):** `self.central_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)` in `service_win.py` HIELT die QBoxLayout-Verteilung an: Der QSplitter (MasterTree | Parameter-Box) blieb auf seiner Mindest-Hoehe stehen, obwohl das Fenster groesser gezogen/maximiert wurde (Extra-Raum blieb als Leerflaeche unter dem Splitter). Die Breite wuchs nur die Param-Box; in der Hoehe gar nichts.
+
+### Loesung (Fixes 1-2)
+
+* **Fix 1 (`serviceui/service_win.py`):** `setAlignment(AlignTop | AlignLeft)` auf dem `central_layout` ENTFERNT. Mit `widgetResizable=True` + `_exact_fit_to_content=False` folgt der Inhalt dem Fenster: Splitter, MasterTree (Hoehe!) und Param-Box (Breite + Hoehe) wachsen beim Grossziehen/Maximieren mit.
+* **Fix 2 (`persistent_win.py`):** `_fix_window_flags()` auf int-basierte Flag-Arithmetik umgestellt (PySide6-Flag-Operatoren droppen Bits ausserhalb des Enum-Domains, z. B. `0x08000000` bei `& ~WindowType_Mask`). Typ wird explizit auf `Qt.Window` gesetzt (Dialog/Tool-Typen haben unter Windows keine Min/Max-Buttons) und der VOLLSTAENDIGE Standard-Button-Satz (Title, SystemMenu, Minimize, Maximize, Close) sichergestellt.
+
+### Verifikation (headless, keine UI-Tests)
+
+* `test/check_r17d_resize.py` (neu): **18/18 PASS** - ECHTE Widget-Baum-Proben: Tree-Hoehe 634->1048, Param-Box 520x736->814x1150 bei +600x400, Maximize-Bleibt-Maximiert (Reflow wirft nicht aus dem Maximize-Zustand).
+* `test/check_r17c_resize.py` (R3-Check auf neue Flag-Arithmetik angepasst): **19/19 PASS**.
+* `test/check_r17b_construct.py` **11/11**, `test/check_ui3_bugfix.py` **31/31**, AnalyticsWindow/StatisticWindow mit vollem Button-Satz `0x800f001` konstruierbar, `py_compile` OK.
+* **Offen (manuell):** App-Test Grossziehen/Maximieren des service_win.
+
+---
+
+## 15. Implementierungs-Log - Bugfix Runde 17d2: Maximize-Button deaktiviert - setMaximumSize entfernt (11.08.2026)
+
+**Problem (User-Meldung 1, 11.08.2026):** Der Maximize-Button im service_win ist IMMER NOCH ausgegraut und nicht bedienbar - auch nach Runden 17b/c/d.
+
+**Root Cause (Qt-Quelle `qwindowswindow.cpp`, `shouldShowMaximizeButton()`, Commit `77be253`):**
+
+```cpp
+return (flags & Qt::CustomizeWindowHint) || w->maximumSize() == QSize(QWINDOWSIZE_MAX, QWINDOWSIZE_MAX);
+```
+
+Windows zeigt/aktiviert den Maximize-Button NUR wenn `maximumSize() == QWINDOWSIZE_MAX` (**16777215**) ist (oder `Qt::CustomizeWindowHint` gesetzt ist). Das bisherige `setMaximumSize(screen.size())` (17b) bzw. `setMaximumSize(screen.size()*2)` (17c) war NIE gleich 16777215 -> Windows graute den Button weiterhin aus. Die '2x Screen'-Annahme von Runde 17b war falsch.
+
+### Loesung (Fix 1)
+
+* **Fix 1 (`serviceui/service_win.py`, `apply_screen_cap()`-Override):** `setMaximumSize` ENTFERNT. Das Fenster behaelt die Qt-Defaults (`max = 16777215 = QWINDOWSIZE_MAX`) -> Maximize-Button wieder aktiv. Die Screen-Klemme der DEFAULT-Groesse uebernimmt weiterhin `resize_to_clamped_content` (auf `availableGeometry`); ein OS-seitiges Maximum ist bei `widgetResizable=True` + `_exact_fit_to_content=False` nicht noetig.
+
+### Verifikation (headless, keine UI-Tests)
+
+* `test/check_r17b_construct.py`: **11/11 PASS** (D1 prueft jetzt `max == 16777215`).
+* `test/check_r17c_resize.py`: **19/19 PASS** (D3 prueft `max == 16777215`).
+* `test/check_ui3_bugfix.py`: **32/32 PASS** (B6 prueft: KEIN `setMaximumSize`).
+* `test/check_r17d_resize.py`: **19/19 PASS** (A4 prueft `max == 16777215`); `py_compile` OK.
+* **Offen (manuell):** App-Test - Maximize-Button klickbar.
+
+---
+
+## 16. Implementierungs-Log - Bugfix Runde 17e: AnalyticsWindow-Historie intakt (11.08.2026)
+
+**Problem (User-Meldung 2, 11.08.2026):** 'Fenster-Historie nicht mehr intakt - Analytics geschlossen, Anwendung geschlossen, bei Neustart ist Analytics wieder da.'
+
+**Root Cause (Commit `d0eaa16`):** `AnalyticsWindow` hatte seit Phase 20.01 (E1) `_keep_history_on_close = True`. Der Fenster-Historie-Eintrag wurde beim MANUELLEN Schliessen (X) nicht geloescht -> `restore_all_windows` stellte das Fenster beim naechsten App-Start wieder her, obwohl der User es bewusst geschlossen hatte.
+
+### Loesung (Fixes 1-5, `analytics/ui/analytics_win.py`)
+
+* **Fix 1:** `_keep_history_on_close = False` - MANUELL geschlossenes Fenster wird aus der Historie entfernt (`delete_instance`) und beim Neustart NICHT wiederhergestellt (konsistent mit ServiceWindow).
+* **Fix 2:** `DIALOG_GEOMETRY_KEY = "win_analytics"` + `save_state()`-Override: Position/Groesse zusaetzlich in `global_settings` (`save_dialog_geometry`) - ueberlebt das manuelle Schliessen (Muster ServiceWindow).
+* **Fix 3:** `restore_state()`-Override: Fallback auf `get_dialog_geometry`, wenn kein `window_instances`-Eintrag mehr existiert (manuelles Wiederoeffnen).
+* **Fix 4:** `_save_workspace()`: zusaetzliches Workspace-Backup in `global_settings` (`"analytics_workspace"`) - ueberlebt `delete_instance`.
+* **Fix 5:** `_restore_workspace()`: Fallback auf das `global_settings`-Backup.
+
+**Resultierendes Verhalten:** Offen beim App-Ende -> beim Start wiederhergestellt (auto_restore). Manuell geschlossen -> NICHT beim Start; Position + Workspace werden beim naechsten manuellen Oeffnen (Button) wiederhergestellt.
+
+### Verifikation (headless, keine UI-Tests)
+
+* `test/check_r17e_history.py` (neu, Temp-DB in `test/`): **15/15 PASS** - D2: kein Eintrag nach manuellem Schliessen; D5: Geometrie-Fallback ueberlebt; D6/D7: Workspace-Backup + Restore-Fallback; D8: offen beim App-Ende -> Eintrag bleibt.
+* `test/test.py`-Assertions H3/H4/H5/H8 + Teil 36 W8 an die neue Semantik angepasst (Runde 17/17e: `_keep_history_on_close=False`).
+* `py_compile` OK; `check_r17d_resize.py` 19/19; `check_r17b_construct.py` 11/11.
+* **Offen (manuell):** App-Test - Analytics schliessen -> App beenden -> Neustart: Analytics darf NICHT erscheinen; Position + Workspace beim manuellen Oeffnen wiederhergestellt.
+
+---
+
+## 17. Abschluss Phase 20: Analytics-Finalisierung (11.08.2026)
+
+Mit den Bugfix-Runden 16, 16c, 17, 17b, 17c, 17d, 17d2 und 17e ist die **Phase 20 (Analytics-Finalisierung) abgeschlossen**. Alle offenen User-Meldungen der Runden 16-17e sind umgesetzt, committet und headless verifiziert:
+
+1. **ServiceWindow-Bedienung (Runden 17-17d2):** Slider-Spielraum (Splitter-Minima + `_min_window_width=1100`), Log-Hoehe 6 Zeilen, Maximize-Button aktiv (`max == QWINDOWSIZE_MAX`, kein `setMaximumSize`), Inhalt folgt der Fenstergroesse (widgetResizable + kein AlignTop-AlignLeft) - MasterTree-Hoehe und Param-Box wachsen beim Grossziehen/Maximieren mit.
+2. **Fenster-Historie (Runde 17e):** AnalyticsWindow wird beim MANUELLEN Schliessen aus der Historie entfernt und beim Neustart NICHT wiederhergestellt; Position + Workspace ueberleben via `global_settings`-Backup und werden beim manuellen Oeffnen wiederhergestellt.
+3. **20.05-Architektur:** Alle vier Praemissen der Ultra-Low-Latency-Pipeline bleiben erfuellt (kein synchroner DB-Zugriff im UI-Hauptthread, lueckenlose Persistenz, isolierte Grafik-Welt, asynchrone Daten-Nachfuehrung).
+
+**Abschliessender Stand (Commits `cb0412b`..`d0eaa16`):**
+* `persistent_win.py` - Flags im Konstruktor, int-basierte Flag-Arithmetik, volle Button-Hints
+* `scrollable_content.py` - Maximize-Schutz im Reflow, Inhalt folgt Fensterbreite
+* `serviceui/service_win.py` - Slider-Spielraum, Log 6 Zeilen, `_exact_fit_to_content=False`, widgetResizable, kein AlignTop-AlignLeft, `apply_screen_cap` ohne `setMaximumSize`
+* `serviceui/param_columns.py` - box.resize nur bei widgetResizable=False
+* `ui/service_win.ui` - Root QWidget statt QMainWindow
+* `analytics/ui/analytics_win.py` - `_keep_history_on_close=False`, Geometrie-/Workspace-Fallback, DIALOG_GEOMETRY_KEY
+
+**Verbleibend (manuell durch den Anwender):** Funktionstest der UI (ServiceWindow Maximize/Grossziehen, AnalyticsWindow-Historie, Dropdown-/NoData-Anzeige). Offene Kapitel werden manuell in die naechste Phase uebernommen.
