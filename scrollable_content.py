@@ -208,12 +208,38 @@ class ContentScrollMixin:
             # schrumpfen, wenn der Inhalt kleiner wird (Punkte 3+4).
             new_w = min(desired.width(), screen.width())
             new_h = min(desired.height(), screen.height())
+            # 11.08.2026 (Bugfix, Slider-Spielraum): Optionales
+            # `_min_window_width` (z. B. ServiceWindow=1100) garantiert dem
+            # QSplitter eine Mindest-Breite ueber der Minima-Summe
+            # (Tree 400 + Panel 520 = 920) – der Slider bleibt damit IMMER
+            # beweglich, auch wenn der Inhalt schmal ist. Screen-Klemme.
+            min_w = getattr(self, '_min_window_width', 0) or 0
+            if min_w:
+                new_w = max(new_w, min(min_w, screen.width()))
         else:
             # Nur wachsen, nie schrumpfen (unter aktuelle Größe) + Screen-Klemme.
             current = self.size()
             new_w = min(max(desired.width(), current.width()), screen.width())
             new_h = min(max(desired.height(), current.height()), screen.height())
-        self.resize(new_w, new_h)
+        # 11.08.2026 (Bugfix, Maximize): Ein MAXIMIERTES Fenster darf durch
+        # den Reflow nicht auf die Inhaltsgroesse zurueckgesetzt werden
+        # (der Maximize-Button wuerde sonst wirkungslos – das Fenster
+        # springt nach jedem Reflow aus dem Maximize-Zustand zurueck).
+        # Der Inhalt wird trotzdem angepasst (siehe unten).
+        if not self.isMaximized():
+            self.resize(new_w, new_h)
+        # 11.08.2026 (Bugfix, Slider-Spielraum): Das Inhalt-Widget an die
+        # aktuelle Fenstergroesse anpassen, damit ein QSplitter darin die
+        # volle verfuegbare Breite nutzt (sonst klebt er an den SizeHints
+        # und der Slider bleibt bei schmalem Inhalt fixiert). Nur aktiv,
+        # wenn `_min_window_width` gesetzt ist (ServiceWindow) – alle
+        # anderen Mixin-Nutzer behalten ihr bisheriges Verhalten.
+        if getattr(self, '_min_window_width', 0) and self._content_widget is not None:
+            f = self.frameGeometry().size() - self.size()
+            w = max(self.width() - f.width(), 0)
+            h = max(self.height() - f.height(), 0)
+            if w and h:
+                self._content_widget.resize(w, h)
 
     def _invalidate_content_caches(self) -> None:
         """Invalidiert QWidgetItemV2- und Layout-Caches entlang der Hierarchie.

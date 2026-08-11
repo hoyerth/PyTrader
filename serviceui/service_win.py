@@ -98,6 +98,14 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
     # schrumpfen) – NUR die Position wird persistiert (save_state/restore_state
     # Overrides weiter unten). Ermoeglicht durch ContentScrollMixin.
     _exact_fit_to_content = True
+    # 11.08.2026 (Bugfix, Slider): Mindest-Breite des FENSTERS ueber der
+    # Splitter-Minima-Summe (Tree 400 + Panel 520 = 920). Dadurch hat der
+    # QSplitter IMMER Spielraum - der Slider zwischen den beiden Hauptrahmen
+    # bleibt beweglich, auch wenn der Inhalt schmal ist (vorher klebte das
+    # Fenster exakt am Inhalt und der Slider war fixiert). ContentScrollMixin
+    # resizet das Inhalt-Widget dabei auf die Fensterbreite (Splitter fuellt
+    # den Spielraum). Screen-Klemme schuetzt kleine Bildschirme.
+    _min_window_width = 1100
 
     def __init__(self, parent=None, service_set_repo: Optional[ServiceSetRepository] = None):
         super().__init__(parent)
@@ -163,10 +171,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # unter dem Log (siehe right_panel-Aufbau weiter unten).
         if self.text_log:
             fm = self.text_log.fontMetrics()
-            # 10.08.2026 (Bugfix): Log-Hoehe von 4 auf 2 Zeilen reduziert
-            # (zwei Zeilen hoeher als der Default war ein Fehler).
-            self.text_log.setMaximumHeight(fm.lineSpacing() * 2 + 12)
-            self.text_log.setMinimumHeight(fm.lineSpacing() * 2 + 12)
+            # 11.08.2026 (User-Anforderung): Log-Hoehe 4 Zeilen = 2 Zeilen
+            # HOEHER als der Default von 2 Zeilen (die 10.08.-Reduktion von
+            # 4 auf 2 wird damit zurueckgenommen).
+            self.text_log.setMaximumHeight(fm.lineSpacing() * 4 + 12)
+            self.text_log.setMinimumHeight(fm.lineSpacing() * 4 + 12)
 
         # Phase 13 5.4 Schritt 1: Dynamische Service-Spalten (Breite/Höhe aus
         # dem Inhalt – KEINE fixen Pixelwerte). Das Inhalt-Layout erhält
@@ -284,11 +293,16 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             self.main_splitter = QSplitter(Qt.Horizontal)
             self.main_splitter.addWidget(self.right_panel)
             self.main_splitter.addWidget(self._param_panel)
-            self.main_splitter.setStretchFactor(0, 3)
-            self.main_splitter.setStretchFactor(1, 2)
+            # 11.08.2026 (Bugfix, Slider): KEINE setStretchFactor-Aufrufe mehr -
+            # die 3:2-Faktoren erzwangen bei jedem Fenster-Reflow die Verteilung
+            # und machten den Slider zaeh (die Anwenderposition sprang zurueck).
+            # Der QSplitter behaelt jetzt die vom Anwender gezogene Position.
             # Keine Spalte unter ihre Mindestgroesse kollabieren lassen.
             self.main_splitter.setCollapsible(0, False)
             self.main_splitter.setCollapsible(1, False)
+            # 11.08.2026 (Bugfix, Slider): Der Handle wird dicker (8px statt
+            # 4px Default) - besser greifbar/ziehbar.
+            self.main_splitter.setHandleWidth(8)
             # 10.08.2026 (Bugfix, Slider): Startgroessen einmalig setzen -
             # danach behaelt der QSplitter die Position des Anwenders
             # (_resize_param_box_deferred waechst nur noch, siehe
