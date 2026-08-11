@@ -112,8 +112,14 @@ class PersistentWindow(QMainWindow):
         Ein Fenster ohne Parent hat automatisch einen Taskleisten-Eintrag.
         """
         # Nur prüfen, ob Qt.Window gesetzt ist (sollte immer der Fall sein)
-        if not (self.windowFlags() & Qt.Window):
-            self.setWindowFlags(self.windowFlags() | Qt.Window)
+        flags = self.windowFlags()
+        # 11.08.2026 (Bugfix, Maximize): Explizit die Standard-Fenster-Buttons
+        # sicherstellen - fehlt der Maximize-Hint (z. B. durch QUiLoader/
+        # setWindowFlags-Fallstricke), ist der Maximize-Button ausgegraut.
+        wanted = (flags | Qt.Window | Qt.WindowMaximizeButtonHint
+                  | Qt.WindowMinimizeButtonHint)
+        if wanted != flags:
+            self.setWindowFlags(wanted)
 
     @property
     def state_manager(self) -> StateManager:

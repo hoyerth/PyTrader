@@ -24,7 +24,7 @@ Diese Datei re-exportiert die öffentliche API, damit bestehende Aufrufe
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from PySide6.QtCore import QFile, QIODevice, QTimer, Qt, Slot
+from PySide6.QtCore import QFile, QIODevice, QSize, QTimer, Qt, Slot
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QGroupBox, QHBoxLayout,
@@ -171,11 +171,11 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
         # unter dem Log (siehe right_panel-Aufbau weiter unten).
         if self.text_log:
             fm = self.text_log.fontMetrics()
-            # 11.08.2026 (User-Anforderung): Log-Hoehe 4 Zeilen = 2 Zeilen
-            # HOEHER als der Default von 2 Zeilen (die 10.08.-Reduktion von
-            # 4 auf 2 wird damit zurueckgenommen).
-            self.text_log.setMaximumHeight(fm.lineSpacing() * 4 + 12)
-            self.text_log.setMinimumHeight(fm.lineSpacing() * 4 + 12)
+            # 11.08.2026 (User-Nachtrag): Log-Hoehe 6 Zeilen = 2 Zeilen
+            # HOEHER als die 4-Zeilen-Stufe (die 10.08.-Reduktion auf 2 ist
+            # damit zweifach ueberholt).
+            self.text_log.setMaximumHeight(fm.lineSpacing() * 6 + 12)
+            self.text_log.setMinimumHeight(fm.lineSpacing() * 6 + 12)
 
         # Phase 13 5.4 Schritt 1: Dynamische Service-Spalten (Breite/Höhe aus
         # dem Inhalt – KEINE fixen Pixelwerte). Das Inhalt-Layout erhält
@@ -506,6 +506,23 @@ class ServiceWindow(ServiceParamColumnsMixin, ContentScrollMixin, NamedItemActio
             sp.updateGeometry()
             self._invalidate_content_caches()
         super()._apply_reflow_size()
+
+    def apply_screen_cap(self) -> None:
+        """11.08.2026 (Bugfix, Maximize): Ausgegrauter Maximize-Button.
+
+        Das Basis-Mixin setzte setMaximumSize(screen.size()) - sobald das
+        Fenster auf exakt dieser Groesse lag (z. B. Inhalt >= Screen oder
+        kleinere Aufloesung als die .ui-Default-Geometrie), graute Windows
+        den Maximize-Button aus (max == size -> nicht mehr vergroesserbar).
+        Das Maximum wird jetzt GROSSZUEGIG bemessen (2x Screen): Der
+        Maximize-Button bleibt IMMER aktiv. Das exakt-fit-Reflow
+        (resize_to_clamped_content) klemmt die DEFAULT-Groesse weiterhin auf
+        den Screen; der Anwender kann danach frei maximieren bzw. das Fenster
+        groesser ziehen (Inhalt scrollt in der ContentScrollArea).
+        """
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.setMaximumSize(
+            QSize(screen.width() * 2, screen.height() * 2))
 
     def get_persistent_symbol(self) -> str:
         return self.combo_symbol.currentText() if self.combo_symbol else "SILVER"
